@@ -35,6 +35,10 @@ out/linux-x86_64/debug/bin/mach fmt .
 The tree is canonical: `mach fmt .` must leave it unchanged before a pull
 request is opened (`mach fmt --check .` reports what differs).
 
+`bash test/run.sh` runs the codegen corpus against the external decoders and
+the C reference, and `bash test/run.sh --link` the link cases; see
+[test/README.md](test/README.md).
+
 
 ## Branching
 

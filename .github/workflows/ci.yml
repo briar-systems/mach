@@ -1,538 +1,363 @@
 name: CI
 
+# a pull request proves the primary hosts: the self-host fixpoint, the unit suite
+# in both profiles, the formatter, the cross-compiles, the golden disassembly of
+# every ISA and the differential execution on the host. a push to main proves
+# everything else: qemu, spirv, riscv32, the link cases on every leg, the dwarf
+# verify and the darwin hosts natively. `workflow_dispatch` pulls one heavy job
+# onto a dev build when a change touched it.
+#
+# until 5.0.0 is tagged the build job seeds through the audited stage chain in
+# .github/actions/setup-mach; the day the tag exists the seed is the published
+# binary, downloaded in one step.
+
 on:
-  push:
-    branches: [dev]
   pull_request:
+  push:
     branches: [dev, main]
   workflow_dispatch:
+    inputs:
+      heavy:
+        description: run one of the main-only jobs on this ref
+        type: choice
+        default: none
+        options: [none, qemu, spirv, riscv32, link, dwarf, darwin, all]
 
 permissions:
   contents: read
 
-# every native host gets these checks: "build <target>" proves the most recent
-# release builds the pinned bridge, which builds the project to a self-host fixpoint. "test <target>"
-# reuses that fixpoint compiler to run the in-source corpus. "incremental
-# <target>" proves the warm/incremental build path matches a clean build both at
-# rest and after an edit (the query engine's invalidation, unexercised by the
-# from-scratch fixpoint). "release <target>" repeats the fixpoint under the opt=2
-# release profile so -O2 codegen regressions surface on PRs, not only at tag time.
-#
-# darwin is the exception: it gates the dev -> main release merge only, not every
-# PR into dev, since the macOS runners are slow and metered. see the "darwin"
-# job below and darwin-lane.yml (shared with cd.yml, so the gate can never drift
-# from the lane CD actually runs).
-jobs:
-  # a repo-hygiene check, deliberately not attached to a build: it costs seconds, needs
-  # no toolchain, and answers on a pull request whose only change is a changelog entry.
-  # what it catches is invisible in a diff - see the script's own header.
-  changelog:
-    name: changelog headings
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-      - name: one [Unreleased], and it comes first
-        run: bash .github/scripts/check-changelog.sh
+env:
+  # apt.llvm.org serves one build per major on amd64 and arm64; the goldens are
+  # blessed with this major and test/run.sh warns on any other
+  LLVM_MAJOR: 22
 
-  build-linux:
+jobs:
+  build:
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-linux
-            runs-on: ubuntu-latest
-          - target: aarch64-linux
-            runs-on: ubuntu-24.04-arm
+          - { target: x86_64-linux,   runs-on: ubuntu-latest }
+          - { target: aarch64-linux,  runs-on: ubuntu-24.04-arm }
+          - { target: x86_64-windows, runs-on: windows-latest }
     steps:
       - uses: actions/checkout@v6
-
-      - name: bootstrap audited mach
+      - name: seed
         uses: ./.github/actions/setup-mach
-
-      - name: build fixpoint
+      - name: fixpoint
+        shell: bash
         run: |
           set -euo pipefail
-
+          exe=; [ "$RUNNER_OS" = Windows ] && exe=.exe
           mach dep pull .
-          mach build . -o a
+          mach build . -o a$exe
+          ./a$exe build . -o b$exe
+          ./b$exe build . -o c$exe
+          cmp b$exe c$exe || { echo "::error::build did not converge to the fixpoint"; exit 1; }
+          mkdir -p artifact && cp c$exe artifact/mach$exe
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mach-${{ matrix.target }}
+          path: artifact/mach*
+          if-no-files-found: error
+          retention-days: 1
+
+  test:
+    name: test ${{ matrix.target }}
+    needs: build
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-linux,   runs-on: ubuntu-latest }
+          - { target: aarch64-linux,  runs-on: ubuntu-24.04-arm }
+          - { target: x86_64-windows, runs-on: windows-latest }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: mach-${{ matrix.target }}
+          path: artifact
+      # the release profile is linux-only until #3325: the fuzz corpus replay
+      # overflows the stack at O2 on windows
+      - name: unit suite, debug and release
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x artifact/mach*
+          m=$PWD/artifact/mach; [ "$RUNNER_OS" = Windows ] && m=$m.exe
+          "$m" dep pull .
+          "$m" test .
+          [ "$RUNNER_OS" = Windows ] || "$m" test . --profile release
+      - name: formatter
+        shell: bash
+        run: |
+          m=$PWD/artifact/mach; [ "$RUNNER_OS" = Windows ] && m=$m.exe
+          "$m" fmt --check .
+      - name: cross-compile the compiler
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          for t in darwin-aarch64 darwin-x86_64 linux-riscv64; do
+            ./artifact/mach build . --target "$t" --profile release -o "out/cross-$t"
+          done
+
+  # the golden disassembly of every ISA and the differential execution on the
+  # host. one linux runner decodes every column; the arm runner adds the aarch64
+  # differential natively, since qemu is compute evidence and not ABI evidence.
+  codegen:
+    name: codegen ${{ matrix.target }}
+    needs: build
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-linux,  runs-on: ubuntu-latest,    targets: "--target x86_64-linux --target aarch64-linux --target riscv64-linux --target x86_64-windows --target x86_64-darwin --target aarch64-darwin" }
+          - { target: aarch64-linux, runs-on: ubuntu-24.04-arm, targets: "--target aarch64-linux" }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: mach-${{ matrix.target }}
+          path: artifact
+      - name: install llvm
+        run: |
+          set -euo pipefail
+          curl -fsSL https://apt.llvm.org/llvm.sh | sudo bash -s -- $LLVM_MAJOR
+          echo "/usr/lib/llvm-$LLVM_MAJOR/bin" >> "$GITHUB_PATH"
+      - name: goldens and differential
+        run: |
+          set -euo pipefail
+          chmod +x artifact/mach
+          ./artifact/mach dep pull .
+          MACH=$PWD/artifact/mach bash test/run.sh ${{ matrix.targets }}
+
+  # the riscv64 differential under qemu-user
+  qemu:
+    name: qemu riscv64
+    needs: build
+    if: github.ref == 'refs/heads/main' || inputs.heavy == 'qemu' || inputs.heavy == 'all'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: mach-x86_64-linux
+          path: artifact
+      - name: install llvm and qemu
+        run: |
+          set -euo pipefail
+          curl -fsSL https://apt.llvm.org/llvm.sh | sudo bash -s -- $LLVM_MAJOR
+          echo "/usr/lib/llvm-$LLVM_MAJOR/bin" >> "$GITHUB_PATH"
+          sudo apt-get install -y qemu-user
+      - name: riscv64 differential
+        run: |
+          set -euo pipefail
+          chmod +x artifact/mach
+          ./artifact/mach dep pull .
+          MACH=$PWD/artifact/mach bash test/run.sh --qemu --target riscv64-linux
+
+  # the spirv column: build, spirv-val, spirv-dis golden. the pinned spirv-tools
+  # (2026.3) ships in the Vulkan SDK for linux x86_64 only, which bounds this job
+  # to that runner.
+  spirv:
+    name: spirv
+    needs: build
+    if: github.ref == 'refs/heads/main' || inputs.heavy == 'spirv' || inputs.heavy == 'all'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      VULKAN_SDK_VERSION: 1.4.357.0
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: mach-x86_64-linux
+          path: artifact
+      - name: install spirv-tools from the Vulkan SDK
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://sdk.lunarg.com/sdk/download/$VULKAN_SDK_VERSION/linux/vulkansdk-linux-x86_64-$VULKAN_SDK_VERSION.tar.xz" \
+            | sudo tar -xJf - -C /usr/local/bin --strip-components=3 "$VULKAN_SDK_VERSION/x86_64/bin/spirv-dis" "$VULKAN_SDK_VERSION/x86_64/bin/spirv-val"
+          spirv-val --version
+      - name: spirv goldens
+        run: |
+          set -euo pipefail
+          chmod +x artifact/mach
+          ./artifact/mach dep pull .
+          MACH=$PWD/artifact/mach bash test/run.sh --target spirv
+
+  # the riscv32 freestanding column. every case is declared away in its SKIPS
+  # today (the backend does not legalize 64-bit values), so this job is the place
+  # the column opens when that lands.
+  riscv32:
+    name: riscv32
+    needs: build
+    if: github.ref == 'refs/heads/main' || inputs.heavy == 'riscv32' || inputs.heavy == 'all'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: mach-x86_64-linux
+          path: artifact
+      - name: install llvm
+        run: |
+          set -euo pipefail
+          curl -fsSL https://apt.llvm.org/llvm.sh | sudo bash -s -- $LLVM_MAJOR
+          echo "/usr/lib/llvm-$LLVM_MAJOR/bin" >> "$GITHUB_PATH"
+      - name: riscv32 goldens
+        run: |
+          set -euo pipefail
+          chmod +x artifact/mach
+          ./artifact/mach dep pull .
+          MACH=$PWD/artifact/mach bash test/run.sh --target riscv32
+
+  # the link cases on every leg. the linux x86_64 leg carries every cross-built
+  # format (PE, Mach-O, raw, spirv) and the riscv64 cases under qemu; the arm and
+  # windows legs run what executes natively there.
+  link:
+    name: link ${{ matrix.target }}
+    needs: build
+    if: github.ref == 'refs/heads/main' || inputs.heavy == 'link' || inputs.heavy == 'all'
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-linux,   runs-on: ubuntu-latest }
+          - { target: aarch64-linux,  runs-on: ubuntu-24.04-arm }
+          - { target: x86_64-windows, runs-on: windows-latest }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: mach-${{ matrix.target }}
+          path: artifact
+      - name: install the readers
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          curl -fsSL https://apt.llvm.org/llvm.sh | sudo bash -s -- $LLVM_MAJOR
+          echo "/usr/lib/llvm-$LLVM_MAJOR/bin" >> "$GITHUB_PATH"
+          sudo apt-get install -y binutils gdb
+      - name: install qemu, the riscv64 libc headers and spirv-tools
+        if: matrix.target == 'x86_64-linux'
+        env:
+          VULKAN_SDK_VERSION: 1.4.357.0
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y qemu-user libc6-dev-riscv64-cross
+          curl -fsSL "https://sdk.lunarg.com/sdk/download/$VULKAN_SDK_VERSION/linux/vulkansdk-linux-x86_64-$VULKAN_SDK_VERSION.tar.xz" \
+            | sudo tar -xJf - -C /usr/local/bin --strip-components=3 "$VULKAN_SDK_VERSION/x86_64/bin/spirv-dis" "$VULKAN_SDK_VERSION/x86_64/bin/spirv-val"
+          spirv-val --version
+      - name: link cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x artifact/mach*
+          m=$PWD/artifact/mach; [ "$RUNNER_OS" = Windows ] && m=$m.exe
+          "$m" dep pull .
+          qemu=; [ "${{ matrix.target }}" = x86_64-linux ] && qemu=--qemu
+          MACH=$m bash test/run.sh --link $qemu
+
+  # every case built with -g through llvm-dwarfdump --verify on the ELF and
+  # Mach-O targets
+  dwarf:
+    name: dwarf
+    needs: build
+    if: github.ref == 'refs/heads/main' || inputs.heavy == 'dwarf' || inputs.heavy == 'all'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: mach-x86_64-linux
+          path: artifact
+      - name: install llvm
+        run: |
+          set -euo pipefail
+          curl -fsSL https://apt.llvm.org/llvm.sh | sudo bash -s -- $LLVM_MAJOR
+          echo "/usr/lib/llvm-$LLVM_MAJOR/bin" >> "$GITHUB_PATH"
+      - name: dwarf verify
+        run: |
+          set -euo pipefail
+          chmod +x artifact/mach
+          ./artifact/mach dep pull .
+          MACH=$PWD/artifact/mach bash test/run.sh --dwarf --target x86_64-linux --target aarch64-linux --target riscv64-linux --target x86_64-darwin --target aarch64-darwin
+
+  # the darwin hosts natively, on the metered runners: linux cross-builds the
+  # seed, each host reaches its own fixpoint and runs the unit suite. this is
+  # the release gate.
+  darwin-seed:
+    name: darwin seed
+    needs: build
+    if: github.ref == 'refs/heads/main' || inputs.heavy == 'darwin' || inputs.heavy == 'all'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: mach-x86_64-linux
+          path: artifact
+      - name: cross-build the darwin seeds
+        run: |
+          set -euo pipefail
+          chmod +x artifact/mach
+          ./artifact/mach dep pull .
+          mkdir -p seed
+          ./artifact/mach build . --target darwin-aarch64 --profile release -o seed/mach-aarch64-darwin
+          ./artifact/mach build . --target darwin-x86_64 --profile release -o seed/mach-x86_64-darwin
+      - uses: actions/upload-artifact@v7
+        with:
+          name: darwin-seed
+          path: seed/
+          if-no-files-found: error
+          retention-days: 1
+
+  darwin:
+    name: darwin ${{ matrix.target }}
+    needs: darwin-seed
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64-darwin must self-host on real Intel silicon: under Rosetta 2
+          # mach's raw bsdthread_create worker threads crash (#2104)
+          - { target: aarch64-darwin, runs-on: macos-15,       machine: arm64 }
+          - { target: x86_64-darwin,  runs-on: macos-15-intel, machine: x86_64 }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: darwin-seed
+          path: seed
+      - name: fixpoint and unit suite
+        env:
+          WANT: ${{ matrix.machine }}
+        run: |
+          set -euo pipefail
+          got=$(uname -m); translated=$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)
+          [ "$got" = "$WANT" ] && [ "$translated" = 0 ] || { echo "::error::the $WANT lane landed on a $got host (proc_translated=$translated)"; exit 1; }
+          chmod +x seed/mach-${{ matrix.target }}
+          ./seed/mach-${{ matrix.target }} dep pull .
+          ./seed/mach-${{ matrix.target }} build . -o a
           ./a build . -o b
           ./b build . -o c
-
-          # compare b and c to identify non-determinism
-          if ! cmp -s b c; then
-            echo "::error::build did not converge to the fixpoint"
-            exit 1
-          fi
-
-          bash test/version-vendor.sh ./b .
-
-          # hand the fixpoint binary to the test job
-          mkdir -p artifact
-          cp c artifact/mach
-
-      - name: upload fixpoint result
-        uses: actions/upload-artifact@v7
-        with:
-          name: mach-${{ matrix.target }}
-          path: artifact/mach
-          if-no-files-found: error
-          retention-days: 1
-
-  test-linux:
-    name: test ${{ matrix.target }}
-    needs: build-linux
-    runs-on: ${{ matrix.runs-on }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-linux
-            runs-on: ubuntu-latest
-          - target: aarch64-linux
-            runs-on: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: download the fixpoint result
-        uses: actions/download-artifact@v8
-        with:
-          name: mach-${{ matrix.target }}
-          path: artifact
-
-      - name: self test
-        run: |
-          set -euo pipefail
-          chmod +x artifact/mach
-          ./artifact/mach dep pull .
-          ./artifact/mach test .
-
-      - name: checked type boundaries
-        run: MACH_CHECKED_COMPILER="$PWD/artifact/mach" bash test/checked-types/verify.sh
-
-      # the tree is canonical: every source, test and fixture file is formatted
-      - name: formatting
-        run: ./artifact/mach fmt --check .
-
-      - name: structural censuses
-        run: |
-          set -euo pipefail
-          bash test/census.sh | tee census.log
-          grep -q '^census b-be-7: ok$' census.log
-          grep -q '^census b-fs-1: ok$' census.log
-
-      # the reference agrees with the binary (help, manifest keys, scaffolds,
-      # keywords) and every exercised example of doc/language compiles as documented
-      - name: documentation agreement and examples
-        run: |
-          set -euo pipefail
-          MACH_DOC_MACH="$PWD/artifact/mach" python3 test/doc-agreement.py
-          MACH_DOC_MACH="$PWD/artifact/mach" python3 test/doc-examples.py
-
-  incremental-linux:
-    name: incremental ${{ matrix.target }}
-    needs: build-linux
-    runs-on: ${{ matrix.runs-on }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-linux
-            runs-on: ubuntu-latest
-          - target: aarch64-linux
-            runs-on: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: download the fixpoint result
-        uses: actions/download-artifact@v8
-        with:
-          name: mach-${{ matrix.target }}
-          path: artifact
-
-      - name: incremental determinism
-        run: |
-          set -euo pipefail
-          chmod +x artifact/mach
-          ./artifact/mach dep pull .
-          bash test/determinism.sh ./artifact/mach . | tee determinism.log
-          grep -q '^determinism: warm no-op and post-edit incremental builds both match clean$' determinism.log
-          grep -q '^determinism: manifest-only incremental build matches clean$' determinism.log
-
-  release-linux:
-    name: release ${{ matrix.target }}
-    runs-on: ${{ matrix.runs-on }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-linux
-            runs-on: ubuntu-latest
-          - target: aarch64-linux
-            runs-on: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: bootstrap audited mach
-        uses: ./.github/actions/setup-mach
-
-      - name: build release fixpoint
-        run: |
-          set -euo pipefail
-          mach dep pull .
-          mach build . --profile release -o a
-          ./a build . --profile release -o b
-          ./b build . --profile release -o c
-
-          # the opt=2 compiler must rebuild itself byte-identically
-          if ! cmp -s b c; then
-            echo "::error::release build did not converge to the fixpoint"
-            exit 1
-          fi
-
-      - name: self test
-        run: |
-          set -euo pipefail
+          cmp b c || { echo "::error::darwin build did not converge to the fixpoint"; exit 1; }
           ./c test .
-
-  build-windows:
-    name: build ${{ matrix.target }}
-    runs-on: ${{ matrix.runs-on }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-windows
-            runs-on: windows-latest
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: bootstrap audited mach
-        uses: ./.github/actions/setup-mach
-
-      - name: build fixpoint
-        run: |
-          mach.exe dep pull .
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          mach.exe build . -o a.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./a.exe build . -o b.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./b.exe build . -o c.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          # compare b and c to identify non-determinism (no cmp in pwsh)
-          if ((Get-FileHash b.exe).Hash -ne (Get-FileHash c.exe).Hash) {
-            Write-Error 'build did not converge to the fixpoint'
-            exit 1
-          }
-
-          # hand the fixpoint binary to the test job
-          New-Item -ItemType Directory -Path artifact -Force | Out-Null
-          Copy-Item c.exe artifact/mach.exe -Force
-
-      - name: upload fixpoint result
-        uses: actions/upload-artifact@v7
-        with:
-          name: mach-${{ matrix.target }}
-          path: artifact/mach.exe
-          if-no-files-found: error
-          retention-days: 1
-
-  test-windows:
-    name: test ${{ matrix.target }}
-    needs: build-windows
-    runs-on: ${{ matrix.runs-on }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-windows
-            runs-on: windows-latest
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: download the fixpoint result
-        uses: actions/download-artifact@v8
-        with:
-          name: mach-${{ matrix.target }}
-          path: artifact
-
-      - name: self test
-        run: |
-          ./artifact/mach.exe dep pull .
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./artifact/mach.exe test .
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-  release-windows:
-    name: release ${{ matrix.target }}
-    runs-on: ${{ matrix.runs-on }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-windows
-            runs-on: windows-latest
-    defaults:
-      run:
-        shell: pwsh
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: bootstrap audited mach
-        uses: ./.github/actions/setup-mach
-
-      - name: build release fixpoint
-        run: |
-          mach.exe dep pull .
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          mach.exe build . --profile release -o a.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./a.exe build . --profile release -o b.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./b.exe build . --profile release -o c.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          # the opt=2 compiler must rebuild itself byte-identically (no cmp in pwsh)
-          if ((Get-FileHash b.exe).Hash -ne (Get-FileHash c.exe).Hash) {
-            Write-Error 'release build did not converge to the fixpoint'
-            exit 1
-          }
-
-      - name: self test
-        run: |
-          ./c.exe test .
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-  # the leg set is data-driven from test/engines.conf: this setup job turns the
-  # pr-cadence rows into the include list the suites matrix over, so registering a
-  # target is one row and no workflow edit - which is what that file's header has
-  # always promised and what CI was the last place to make false.
-  #
-  # a leg is a RUNNER, not a target row, and the runner column is what assigns rows to
-  # it: the four ubuntu-latest rows (x86_64-linux, riscv64-linux, riscv32, spirv)
-  # are one job covering all four rather than four jobs each rebuilding the
-  # same compiler. that list is handed to the suites rather than re-derived by them,
-  # which is the one rule #2948 settled. ci-legs.sh refuses a runner whose
-  # rows disagree about cadence instead of silently picking one.
-  test-legs:
-    name: test legs
-    runs-on: ubuntu-latest
-    outputs:
-      include: ${{ steps.gen.outputs.include }}
-    steps:
-      - uses: actions/checkout@v6
-      - name: corpus contract tests
-        run: python3 test/test-corpus.py
-      - id: gen
-        run: echo "include=$(bash test/ci-legs.sh pr)" >> "$GITHUB_OUTPUT"
-
-  # one job per pr-cadence runner: build a from-source compiler on that host, then
-  # run both suites over the targets it serves. the corpus answers what the compiler
-  # computes and the link suite answers what it emits and links, and neither can see
-  # the other's defects, so a leg runs both or covers neither half.
-  test-targets:
-    name: targets on ${{ matrix.runner }}
-    needs: test-legs
-    runs-on: ${{ matrix.runner }}
-    # the query and cache work landed by PR #3247 roughly doubled per-build cost (#2299);
-    # the fixes on feat/3218 (digest memo, surface decode) follow in their own PR
-    timeout-minutes: 50
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJSON(needs.test-legs.outputs.include) }}
-    steps:
-      - uses: actions/checkout@v6
-
-      # the qemu interpreters this runner's own engine columns name, and nothing
-      # more: a runner installs the emulator for the rows it carries.
-      - name: install qemu-user
-        if: matrix.qemu != ''
-        uses: ./.github/actions/apt-install
-        with:
-          packages: qemu-user
-
-      # a cross build needs the target's libc headers as soon as a case's C probe
-      # includes one, and riscv64-linux is the only row whose runner is not its own
-      # ISA. keyed on the leg list rather than on qemu: this package is riscv64's,
-      # and a future qemu row of another ISA needs its own, not this one. cc.sh names
-      # the same path in its --sysroot and refuses loudly without it (#2741, #2771).
-      - name: install riscv64 cross libc headers
-        if: contains(matrix.legs, 'riscv64-linux')
-        uses: ./.github/actions/apt-install
-        with:
-          packages: libc6-dev-riscv64-cross
-
-      # gdb and binutils are the runner's own, read by the link suite's debug-info and
-      # symbol-table cases. tools.lock pins neither, so apt's is the record.
-      - name: install the unpinned host tools
-        if: runner.os == 'Linux'
-        uses: ./.github/actions/apt-install
-        with:
-          packages: binutils gdb
-
-      # the pinned external oracles both suites are grounded in, at the versions
-      # test/tools.lock names and from the sources it records. the runner images carry
-      # neither (llvm 18 and spirv-tools 2025.1 on ubuntu, llvm 20 and no spirv-tools
-      # on windows) against pins of llvm 22 and spirv-tools 2026.3, so all three legs
-      # refused to start (#2948). ci-tools.sh asks the driver which rows THIS RUNNER
-      # owns and installs exactly those, so the workflow holds no copy of a version
-      # and cannot install one thing while the driver demands another.
-      - name: install the pinned oracles
-        shell: bash
-        run: bash test/ci-tools.sh ${{ matrix.runner }}
-
-      # the verified bridge lands on PATH after setup completes
-      - name: bootstrap audited mach
-        uses: ./.github/actions/setup-mach
-
-      - name: build the from-source compiler
-        if: runner.os != 'Windows'
-        run: |
-          set -euo pipefail
-          mach dep pull .
-          mach build . -o m
-
-      - name: build the from-source compiler (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          mach.exe dep pull .
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          mach.exe build . -o m.exe
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: name the compiler under test
-        shell: bash
-        run: |
-          set -euo pipefail
-          m=./m; [ -f ./m.exe ] && m=./m.exe
-          echo "MACH_CORPUS_MACH=$PWD/${m#./}" >> "$GITHUB_ENV"
-          echo "MACH_LINK_MACH=$PWD/${m#./}" >> "$GITHUB_ENV"
-          echo "MACH_VECROWS_MACH=$PWD/${m#./}" >> "$GITHUB_ENV"
-
-      # THE REGISTRY DECIDES WHAT A LEG COVERS. the driver used to select by host
-      # CAPABILITY, and a target with `engine none` needs no execution host at all, so
-      # spirv and riscv32 were recomputed on every runner - including windows,
-      # where the pinned spirv-tools has no build to install (#2948). "can this machine
-      # serve it" and "which leg carries it" are different questions and only the
-      # runner column answers the second.
-      #
-      # the workflow names THE RUNNER IT IS RUNNING ON and nothing else. it does not
-      # name a target list, because a workflow that names a leg is a workflow that can
-      # claim a leg it never ran: the driver reads engines.conf itself, covers the rows
-      # assigned to that label, and refuses loudly naming any row this host cannot
-      # serve rather than silently substituting a set it can.
-      - name: codegen corpus
-        shell: bash
-        run: bash test/run.sh --runner "${{ matrix.runner }}"
-
-      # the rows this runner READS without executing: a format whose own leg runs at
-      # release cadence still gets an external parser on the lane that gates merges
-      # into dev (#2957). layers A and B only - the darwin objects are cross-built here
-      # and decoded here, and nothing pretends they ran.
-      #
-      # COFF is why this is not theoretical: x86_64-windows had a leg that had never
-      # once started, and the first layer A run over it found a section-name form llvm
-      # rejected outright, making every object with a constant pool unreadable (#2952).
-      - name: codegen corpus (decode-only rows)
-        if: matrix.decode != ''
-        shell: bash
-        run: bash test/run.sh --decode "${{ matrix.runner }}"
-
-      # the vector rows: every declared (operation, lane kind, lane width) cell of
-      # each target this runner executes, decoded by the pinned external decoder and
-      # run against a per-lane scalar reference (#3120). same selection rule as the
-      # corpus: the runner label, read from engines.conf by the driver itself. the
-      # rows cover the linux legs only, so a runner with none assigned reports that
-      # and exits clean rather than substituting a set it can serve.
-      - name: vector rows
-        if: runner.os == 'Linux'
-        shell: bash
-        run: bash test/vecrows/run.sh --runner "${{ matrix.runner }}"
-
-      # no --leg for the link suite: its own selection already agrees with the
-      # registry, because it declines a row whose os and isa no host matches and that
-      # is every `engine none` row. its spirv cases are declared `legs: x86_64-linux`
-      # with `target: spirv`, which is the same statement the runner column makes.
-      #
-      # the pr lane floats explicitly (`--deps float`, the leg's default is pin):
-      # resolving mach-std's branch tip fresh is what catches a downstream break on
-      # the pull request that would first trip over it. the release gate pins.
-      - name: link suite
-        shell: bash
-        run: bash test/link/run.sh --deps float
-
-      # both matrices, uploaded whether the run passed or failed: a red run's
-      # coverage is the more interesting of the two, and "which cells did it even
-      # reach" is not answerable from a log line.
-      - name: upload the coverage matrices
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: matrix-${{ matrix.runner }}
-          path: |
-            test/out/matrix.tsv
-            test/link/out/matrix.tsv
-            test/link/out/deps.txt
-          if-no-files-found: warn
-
-  # the pinned lane, on the runner that carries every case with a dependency.
-  #
-  # `--deps pin` is what the release gate (test-main.yml) and any bisect over mach
-  # commits run, so it has to work on an ordinary day, not only on the day someone
-  # needs it. it did not: #2729 sat unnoticed because the only pinned run in CI was
-  # the main-cadence darwin one, and the cases that broke it were not in that leg
-  # set. a lane exercised only where the gap cannot appear is not exercised.
-  #
-  # a SEPARATE job rather than a second run inside the linux leg: two runs in one
-  # checkout would have the second overwrite the first's deps.txt, and the record of
-  # what the float lane resolved is the artifact #2592 added.
-  link-pin:
-    name: link pinned (linux)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v6
-      - name: install the unpinned host tools
-        uses: ./.github/actions/apt-install
-        with:
-          packages: binutils gdb
-      # the runner label, same as the leg jobs: engines.conf gives ubuntu-latest the
-      # spirv row, and the link suite's spirv cases are declared `legs: x86_64-linux`
-      # with `target: spirv`, which is the same statement. so this job needs the pinned
-      # spirv-tools and gets it from the registry rather than from a list written here.
-      - name: install the pinned oracles
-        run: bash test/ci-tools.sh ubuntu-latest
-      - name: bootstrap audited mach
-        uses: ./.github/actions/setup-mach
-      - name: build the from-source compiler
-        run: |
-          set -euo pipefail
-          mach dep pull .
-          mach build . -o m
-      - name: run the link suite pinned
-        run: MACH_LINK_MACH=$PWD/m bash test/link/run.sh --deps pin --leg x86_64-linux
-      - name: upload the dependency resolution
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: link-deps-pin-linux
-          path: test/link/out/deps.txt
-          if-no-files-found: warn
-
-  # the release gate: only PRs targeting main (the dev -> main release merge) get
-  # a macOS runner. every other PR base schedules nothing here. #2179.
-  darwin:
-    name: darwin (release gate)
-    if: github.base_ref == 'main'
-    uses: ./.github/workflows/darwin-lane.yml
+          ./c test . --profile release
