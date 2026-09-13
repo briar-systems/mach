@@ -1,0 +1,216 @@
+# jump threading over a boolean phi
+#
+# a block that holds nothing but a phi of a condition and a conditional branch
+# on it is the join the lowering emits for `a && b` and `a || b`: each
+# predecessor arrives knowing the outcome, either as a constant or as the
+# compare it just computed, and then re-tests it. every predecessor that
+# reaches the join with an unconditional branch is redirected to the branch's
+# target directly, or branches on its own compare, and the join keeps only the
+# predecessors that could not be threaded.
+
+use mach.lang.fail;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mach.lang.me.ir;
+use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.refs;
+use mach.lang.me.ir.value;
+use mach.lang.me.scratch;
+
+pub fun run_in(m: *ir.Module, workspace: *scratch.Workspace) res[bool, fail.Fail] {
+    var changed: bool = false;
+    var i:       u32  = 0;
+    for (i < m.function_len) {
+        val fn: *ir.Function = ?m.functions[i];
+        if ((fn.flags & ir.FN_FLAG_EXTERN) == 0) {
+            var work:      scratch.Function     = scratch.Function{module: m, body: fn};
+            val changed_r: res[bool, fail.Fail] = scratch.run[scratch.Function, bool](workspace, m.alloc, ?work, thread_function);
+            if (sel changed_r.err) { ret changed_r; }
+            if (changed_r.ok)      { changed = true; }
+        }
+        i = i + 1;
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+fun thread_function(request: *scratch.Function, alloc: *A.Allocator) res[bool, fail.Fail] {
+    val m:       *ir.Module   = request.module;
+    val fn:      *ir.Function = request.body;
+    var changed: bool         = false;
+    var bi:      u32          = 0;
+    for (bi < fn.block_count) {
+        val r: res[bool, fail.Fail] = thread_block(m, fn, bi::id.BlockId);
+        if (sel r.err) { ret r; }
+        if (r.ok)      { changed = true; }
+        bi = bi + 1;
+    }
+    if (changed) {
+        val rp: err[fail.Fail] = ir.preds_rebuild(m, fn);
+        if (sel rp.err) { ret res[bool, fail.Fail].err{rp.err}; }
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+fun terminator_of(fn: *ir.Function, bid: id.BlockId) opt[*instruction.Instruction] {
+    val blk: *ir.Block = ?fn.blocks[bid::u32];
+    if (blk.terminator == id.INSTR_NIL) { ret opt[*instruction.Instruction].none{}; }
+    ret ir.instruction_get(fn, blk.terminator);
+}
+
+fun thread_block(m: *ir.Module, fn: *ir.Function, bid: id.BlockId) res[bool, fail.Fail] {
+    val blk: *ir.Block = ?fn.blocks[bid::u32];
+    if (blk.instr_count != 0 || blk.phi_count != 1) { ret res[bool, fail.Fail].ok{false}; }
+
+    val topt: opt[*instruction.Instruction] = terminator_of(fn, bid);
+    if (!sel topt.some) { ret res[bool, fail.Fail].ok{false}; }
+    val term: *instruction.Instruction = topt.some;
+    if (term.kind != instruction.OP_CBR || term.operand_count != 3) { ret res[bool, fail.Fail].ok{false}; }
+
+    val cond: value.Value = term.operands[0];
+    if (cond.kind != value.VAL_INSTR || cond.data.instr != blk.phis[0]) { ret res[bool, fail.Fail].ok{false}; }
+    val popt: opt[*instruction.Instruction] = ir.instruction_get(fn, blk.phis[0]);
+    if (!sel popt.some) { ret res[bool, fail.Fail].ok{false}; }
+    val phi: *instruction.Instruction = popt.some;
+
+    val on_true:  id.BlockId = ir.block_target(term.operands[1]);
+    val on_false: id.BlockId = ir.block_target(term.operands[2]);
+    if (on_true == bid || on_false == bid || on_true == on_false) { ret res[bool, fail.Fail].ok{false}; }
+
+    var changed: bool = false;
+    var o:       u32  = 0;
+    for (o + 1 < phi.operand_count) {
+        val pred: id.BlockId  = ir.block_target(phi.operands[o]);
+        val v:    value.Value = phi.operands[o + 1];
+        if (pred == bid) {
+            o = o + 2;
+            cnt;
+        }
+        val ptopt: opt[*instruction.Instruction] = terminator_of(fn, pred);
+        if (!sel ptopt.some) {
+            o = o + 2;
+            cnt;
+        }
+        val pterm: *instruction.Instruction = ptopt.some;
+
+        # the arm of a conditional predecessor that enters the join knows the
+        # outcome when the incoming is a constant or the predecessor's own
+        # condition; an unconditional predecessor knows it for any value
+        var to_true:  bool = false;
+        var to_false: bool = false;
+        var arm:      u32  = 0;
+        if (pterm.kind == instruction.OP_BR && pterm.operand_count == 1 && ir.block_target(pterm.operands[0]) == bid) {
+            if (v.kind == value.VAL_CONST_INT) {
+                if (v.data.int_lit != 0) { to_true = true; }
+                or                      { to_false = true; }
+            }
+            or (v.kind == value.VAL_INSTR || v.kind == value.VAL_PARAM) {
+                to_true  = true;
+                to_false = true;
+            }
+        }
+        or (pterm.kind == instruction.OP_CBR && pterm.operand_count == 3) {
+            val t1: bool = ir.block_target(pterm.operands[1]) == bid;
+            val t2: bool = ir.block_target(pterm.operands[2]) == bid;
+            if (t1 != t2) {
+                if (t1) { arm = 1; }
+                or      { arm = 2; }
+                var known: opt[bool] = opt[bool].none{};
+                if (v.kind == value.VAL_CONST_INT) { known = opt[bool].some{v.data.int_lit != 0}; }
+                or (v.kind == value.VAL_INSTR && pterm.operands[0].kind == value.VAL_INSTR
+                    && v.data.instr == pterm.operands[0].data.instr) {
+                    known = opt[bool].some{arm == 1};
+                }
+                if (sel known.some) {
+                    if (known.some) { to_true = true; }
+                    or              { to_false = true; }
+                }
+            }
+        }
+        if (!to_true && !to_false) {
+            o = o + 2;
+            cnt;
+        }
+
+        if (to_true) {
+            val r: err[fail.Fail] = extend_phis(m, fn, on_true, bid, pred, blk.phis[0], v);
+            if (sel r.err) { ret res[bool, fail.Fail].err{r.err}; }
+        }
+        if (to_false) {
+            val r: err[fail.Fail] = extend_phis(m, fn, on_false, bid, pred, blk.phis[0], v);
+            if (sel r.err) { ret res[bool, fail.Fail].err{r.err}; }
+        }
+
+        if (to_true && to_false) {
+            val ra: res[ir.OperandArray, fail.Fail] = ir.operands_alloc(m, 3);
+            if (sel ra.err) { ret res[bool, fail.Fail].err{ra.err}; }
+            val arr: ir.OperandArray = ra.ok;
+            arr.ops[0] = v;
+            arr.ops[1] = term.operands[1];
+            arr.ops[2] = term.operands[2];
+            pterm.kind = instruction.OP_CBR;
+            ir.instr_replace_operands(m, pterm, arr);
+        }
+        or {
+            var dest: id.BlockId = on_false;
+            if (to_true) { dest = on_true; }
+            if (arm == 0) { pterm.operands[0].data.int_lit = dest::u64; }
+            or            { pterm.operands[arm].data.int_lit = dest::u64; }
+        }
+
+        remove_incoming(phi, o);
+        changed = true;
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+# every phi in `target` that took a value from `join` also takes one from
+# `pred` now: the same value, or the threaded predecessor's own incoming when
+# the value was the join's condition phi
+fun extend_phis(m: *ir.Module, fn: *ir.Function, target: id.BlockId, join: id.BlockId, pred: id.BlockId, cond: id.InstructionId, incoming: value.Value) err[fail.Fail] {
+    val tb: *ir.Block = ?fn.blocks[target::u32];
+    var pi: u32       = 0;
+    for (pi < tb.phi_count) {
+        val popt: opt[*instruction.Instruction] = ir.instruction_get(fn, tb.phis[pi]);
+        if (sel popt.some) {
+            val phi: *instruction.Instruction = popt.some;
+            var w:   value.Value;
+            var has: bool = false;
+            var o:   u32  = 0;
+            for (o + 1 < phi.operand_count) {
+                if (ir.block_target(phi.operands[o]) == join) {
+                    w   = phi.operands[o + 1];
+                    has = true;
+                }
+                o = o + 2;
+            }
+            if (has) {
+                if (w.kind == value.VAL_INSTR && w.data.instr == cond) {
+                    w = value.retype(incoming, w.ty);
+                }
+                val r: err[fail.Fail] = ir.phi_append_incoming(m, phi, pred, w);
+                if (sel r.err) { ret r; }
+            }
+        }
+        pi = pi + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun remove_incoming(phi: *instruction.Instruction, at: u32) {
+    var o: u32 = at;
+    for (o + 2 < phi.operand_count) {
+        phi.operands[o]     = phi.operands[o + 2];
+        phi.operands[o + 1] = phi.operands[o + 3];
+        o                   = o + 2;
+    }
+    phi.operand_count = phi.operand_count - 2;
+}
