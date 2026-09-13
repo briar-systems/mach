@@ -49,7 +49,7 @@ argument forwarding.
 | `dep`   | realize, verify, and change the project's dependencies under `dep/` |
 | `init`  | scaffold a new project |
 | `doc`   | generate Markdown reference docs from source docstrings |
-| `info`  | print compiler version, build host, and registered target capabilities |
+| `info`  | print the compiler version and host target, or every supported target |
 | `help`  | print usage; `mach help <command>` for detail |
 
 ## Global flags
@@ -1074,30 +1074,50 @@ Exit codes: `0` ok, `1` user error, `2` internal error.
 mach info [--version | targets]
 ```
 
-Prints an at-a-glance identity of the binary: its version, the host (`os/isa`)
-it was built for, and the registered capability surface — the instruction sets,
-operating systems, ABIs, and object formats it can compose into a target. This
-needs no project (it runs from anywhere, with or without a `mach.toml`). The
-output is line-oriented and stable for scripts:
+Prints the identity of the binary and the **host target**: its version and the
+target it resolves for the machine it runs on, which is the same tuple a
+`[target.*]` table naming the host with no explicit fields, or a `native`
+selection, resolves to. This needs no project (it runs from anywhere, with or
+without a `mach.toml`). The output is line-oriented and stable for scripts:
 
 ```
 mach 5.0.0
-host: linux/x86_64
-isa: x86_64 aarch64 riscv64 riscv32 spirv
-os: linux darwin windows freestanding
-abi: sysv64 win64 aapcs64 lp64 lp64f lp64d ilp32 ilp32f ilp32d spirv
-object: elf coff macho raw spv
+host: linux-x86_64
+isa: x86_64
+os: linux
+abi: sysv64
+object: elf
 ```
 
-The version line (the compiler's own version string) and `host:` line fold at
-compile time; the four capability lines are read from the binary's target
-registries, so they report exactly what this build can target. `mach info --version` prints the version string alone
-on one line, for tooling.
+Every field is the resolved host target's own value, read through
+`target.resolve` over the host request, so a build on an unusual host prints
+what the compiler would actually use: an aarch64 linux host prints `aapcs64`
+and `elf`, a windows host `win64` and `coff`, a darwin host `macho`. `mach info
+--version` prints the version string alone on one line, for tooling.
 
-`mach info targets` prints the **supported target-tuple matrix** — one
-`<os>-<isa>` per line — for exactly the tuples this binary can compose and emit
-end-to-end. Run the command to see the current set; it is *derived*, never
-curated, so a snapshot printed here would only drift.
+`mach info targets` prints the **full combinatorial list of supported
+targets**: every target the registries compose end-to-end, one full tuple per
+line with every dimension spelled, so nothing is left to inference. Each line
+is the `<os>-<isa>` name followed by `key=value` pairs for scripts, with the
+columns whitespace-aligned for humans:
+
+```
+linux-x86_64          isa=x86_64    os=linux         abi=sysv64   object=elf
+linux-aarch64         isa=aarch64   os=linux         abi=aapcs64  object=elf
+linux-riscv64         isa=rv64gc    os=linux         abi=lp64d    object=elf
+...
+freestanding-riscv32  isa=rv32imac  os=freestanding  abi=ilp32    object=elf
+freestanding-riscv32  isa=rv32imac  os=freestanding  abi=ilp32    object=raw
+```
+
+A tuple appears once per (os, isa, abi, object) cell that `target.tuple_capability`
+accepts, in registry order, so an ISA with several calling conventions or an OS
+with several object formats lists every cell. The `isa=` value is the canonical
+selection string the row's registered name selects (`riscv64` is `rv64gc`,
+`riscv32` is `rv32imac`), and a RISC-V row is judged on that selection, so a
+calling convention its default extension set cannot carry is absent. Run the
+command to see the current set; it is *derived*, never curated, so a snapshot
+printed here would only drift.
 
 Each dimension is orthogonal on its own, but the joint cells are not: an
 instruction set emits only with a wired code generator, a calling convention is
@@ -1105,23 +1125,21 @@ per-ISA, an object format relocates and writes only the ISAs it declares, an
 operating system runs on only the ISAs it was ported to and links and loads only
 its own object formats, and an object format's emission shape must match the
 instruction set's back half — a whole-module emitter needs a format that carries
-finished modules, a register machine one that carries linkable objects. `mach info
-targets` keeps a `<os>-<isa>` tuple only when some registered calling convention and
-object format compose an emittable full tuple — so `windows-aarch64` is absent (COFF
-covers x86-64 only) and `darwin-riscv64` is absent (Mach-O covers x86-64 and
-aarch64), while freestanding tuples appear for every ISA with an encoder.
-Selecting an uncovered tuple fails at composition naming the missing capability
-(for example `object format 'coff' does not cover aarch64 relocations` or
-`operating system 'windows' does not support object format 'elf'`) rather than
-deep in codegen or link. Adding a capability declaration to a vtable is the only
-step needed for a new tuple to appear.
+finished modules, a register machine one that carries linkable objects. So
+`windows-aarch64` is absent (COFF covers x86-64 only) and `darwin-riscv64` is
+absent (Mach-O covers x86-64 and aarch64), while freestanding tuples appear for
+every ISA with an encoder. Selecting an uncovered tuple fails at composition
+naming the missing capability (for example `object format 'coff' does not cover
+aarch64 relocations` or `operating system 'windows' does not support object
+format 'elf'`) rather than deep in codegen or link. Adding a capability
+declaration to a vtable is the only step needed for a new tuple to appear.
 
 | Argument    | Value | Effect |
 |-------------|-------|--------|
 | `--version` | —     | print the version string alone, on one line |
-| `targets`   | —     | print the supported target-tuple matrix, one `<os>-<isa>` per line |
+| `targets`   | —     | print every supported target, one full `(os, isa, abi, object)` tuple per line |
 
-Exit codes: `0` ok, `2` internal error.
+Exit codes: `0` ok, `1` user error, `2` internal error.
 
 ## `mach help`
 

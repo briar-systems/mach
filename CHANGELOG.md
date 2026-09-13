@@ -93,6 +93,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `mach info` prints the version and the host target this binary resolves for the machine it runs on (`host:`, `isa:`, `os:`, `abi:`, `object:`), every value taken from `target.resolve` over the host request, and the four registry capability lines are dropped; `mach info targets` prints every supported target as one full `(os, isa, abi, object)` tuple per line, `name` then `key=value` pairs, whitespace-aligned, one line per cell `tuple_capability` accepts in registry order, with a RISC-V row judged on and spelled as the selection its registered name resolves to (#3320).
 - A declared `subsystem`, from `--subsystem` or an artifact `subsystem` key, is refused as unsupported on a target whose image format has no such field (ELF, Mach-O, flat image), naming the declaration, target and format rather than being accepted and unread (#3124).
 - An omitted subsystem key remains the console default everywhere (#3124).
 - An artifact that needs the subsystem key on Windows and also targets a Linux or Darwin cell must declare one artifact per format (#3124).
