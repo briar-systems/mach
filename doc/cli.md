@@ -1036,21 +1036,24 @@ mach doc <path> [options]
 ```
 
 Loads the project's module graph and generates Markdown reference docs from
-source docstrings — one page per module, for the project and its
-dependencies, plus an index. Every `pub` declaration is rendered whether or
+source docstrings — one page per module of the project itself, never of a
+dependency, plus an index at `doc/README.md`. Each page is
+`doc/<module path>.md`. Every `pub` declaration is rendered whether or
 not it is documented; a documented one carries the docstring attached to it
 (see [language/documentation.md](language/documentation.md)). Pages are
-written through the atomic publication path. The hand-written `doc/`
-material is never touched.
+written through the atomic publication path, with its control files kept
+under `out/.mach-txn`. Hand-written pages live beside the generated ones
+and are never touched: they never use `doc/README.md` or a path under the
+project's module tree.
 
 ```
 $ mach doc .
-documented 613 public entities across 36 modules -> /home/me/p1/doc/api
+documented 613 public entities across 36 modules -> /home/me/p1/doc
 ```
 
 | Flag             | Value | Effect |
 |------------------|-------|--------|
-| `--out <dir>`    | dir   | output directory: a relative path is rooted at the project, an absolute path is used as given (default `doc/api`) |
+| `--out <dir>`    | dir   | output directory: a relative path is rooted at the project, an absolute path is used as given (default `doc`) |
 | `--target <name>`| name  | select a `[target.<name>]` for module discovery |
 | `--quiet`, `-q`  | —     | suppress non-error output |
 | `--bin <name>`   | name  | document one binary artifact |

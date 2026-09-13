@@ -75,7 +75,7 @@ only. "`doclint` clean" means a build of the tree prints none of its three
 warnings.
 
 `mach doc` renders every `pub` declaration of every module to
-`doc/api/<module path>.md`: a `##` heading with the declaration's name, the
+`doc/<module path>.md`: a `##` heading with the declaration's name, the
 signature up to its body in a code block, the summary, and the component
 lines as `name: description`. The form above is the form that renderer
 reads. Text a declaration needs beyond it, such as a usage example or a
