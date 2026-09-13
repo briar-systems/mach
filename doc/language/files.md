@@ -41,7 +41,7 @@ is irrelevant, so `fun entry(...)` tagged `#[symbol("main")]` works identically.
 
 The project manifest. It declares the project's identity, its targets, its
 profiles, its artifacts, and its dependencies; every table is required to be
-complete. The full reference is [manifest.md](../manifest.md). A minimal
+complete. The full reference is [manifest.md](manifest.md). A minimal
 binary project, as `mach init` writes it for one target:
 
 ```toml

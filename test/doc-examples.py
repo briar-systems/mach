@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """exercise the behavioral examples of the language reference.
 
-every fenced `mach` block under doc/language, and in doc/migration-v5.md, is
-either a display fragment or an exercised example. an exercised fence names its expectation after the language:
+every fenced `mach` block under doc/language is either a display fragment or
+an exercised example. an exercised fence names its expectation after the language:
 
     ```mach accept              compiles with no diagnostic at all
     ```mach reject "text"       is refused; a diagnostic contains `text`
@@ -26,7 +26,7 @@ output.
 
 usage: doc-examples.py [--mach <path>] [--page <file.md>]... [--out <dir>] [--only <file.md>] [--list]
 
-`--page` replaces the default page set (doc/language/*.md and doc/migration-v5.md).
+`--page` replaces the default page set (doc/language/*.md).
 
 environment:
   MACH_DOC_MACH   the compiler under test (default the checkout's out/<host>/debug/bin/mach)
@@ -115,9 +115,7 @@ def split_files(body):
 
 def default_pages():
     lang = os.path.join(REPO, "doc", "language")
-    pages = [os.path.join(lang, n) for n in sorted(os.listdir(lang)) if n.endswith(".md")]
-    pages.append(os.path.join(REPO, "doc", "migration-v5.md"))
-    return pages
+    return [os.path.join(lang, n) for n in sorted(os.listdir(lang)) if n.endswith(".md")]
 
 
 def extract(paths, only):

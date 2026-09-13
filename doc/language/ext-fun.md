@@ -283,7 +283,7 @@ ext fun WSAStartup(ver: u16, data: *u8) i32;
 - A symbol with **no `ext` declaration at all** — one a linked static archive
   leaves undefined — has nothing to decorate. Its provider is named from the
   manifest instead, by the `symbols` key on the `[link.X]` entry that supplies
-  it; see [manifest.md](../manifest.md#linkname--link-requirements). The two
+  it; see [manifest.md](manifest.md#linkname--link-requirements). The two
   declarations write the same attribution, so a symbol may be claimed only once.
   A claim is spelled like the source name, not like the object symbol: both routes
   key on the link name, and Mach applies the target's C symbol prefix to the
@@ -431,8 +431,8 @@ are both included; a name that cannot be resolved is a hard error.
 Loose `.o` relocatable objects and static `.a` archives are linked **statically**.
 An archive contributes only the members that define a symbol left undefined by
 the objects and members before it, selected to a fixed point within that
-archive, so a vendored archive costs the binary exactly the members it uses (see
-[cli.md](../cli.md#static-vs-dynamic-resolution)). A shared `.so`, `.dylib`, framework,
+archive, so a vendored archive costs the binary exactly the members it uses
+(`mach help build` states the resolution rules). A shared `.so`, `.dylib`, framework,
 or `.dll` is a **dynamic** dependency: its format-specific canonical loader name
 is recorded and undefined `ext` functions become run-time imports. A shared
 input is validated before it is recorded: a `.so` that is not a loadable ELF

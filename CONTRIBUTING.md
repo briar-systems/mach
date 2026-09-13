@@ -13,9 +13,21 @@ community like family.
   library can adopt it, so a breaking syntax change cannot be built by the
   compiler that preceded it. Install a 5.0
   [release](https://github.com/briar-systems/mach/releases), or build one from
-  the published 4.26.5 seed through the pinned bootstrap chain in
-  [doc/tooling/bootstrap.md](doc/tooling/bootstrap.md), which is also how CI
-  builds its compiler.
+  the published 4.26.5 seed through the pinned bootstrap chain.
+
+The chain is `.github/actions/setup-mach/bootstrap.py`, and `STAGES` in it is
+the list of pins; CI runs it on every native host. The published 4.26.5
+compiler builds a pinned bridge; the bridge builds the audited 4.30 source to
+a fixpoint; that compiler builds the v5 migration stage to a fixpoint; the
+stage compiler builds the development tree. Every source commit it names is
+reachable from `main`, and no binary other than the 4.26.5 seed enters it.
+The 4.30.0 public release and tag were withdrawn, so the version a stage
+compiler prints is the version of its source, not evidence of a release.
+Run the script, or transcribe its stages by hand: clone each pinned commit
+with `--no-checkout`, check it out detached, initialize its submodule, and
+build it with the previous stage's output using `--profile debug` (the old
+seed's memory use stays within runner limits that way), comparing the last
+two generations of each fixpoint stage byte for byte.
 
 The standard library lives in its own repository
 ([mach-std](https://github.com/briar-systems/mach-std)). `[dep.std]` in
@@ -23,7 +35,7 @@ The standard library lives in its own repository
 submodule, and the committed gitlink at `dep/std` pins the exact revision.
 `mach dep pull .` checks that pin out in place; a build verifies it and never
 fetches or moves it. `mach dep update` is the one command that moves a pin.
-See [doc/manifest.md](doc/manifest.md#depid) and [doc/cli.md](doc/cli.md#mach-dep).
+See [doc/language/manifest.md](doc/language/manifest.md#depid) and `mach help dep`.
 
 ## Building
 
@@ -59,7 +71,7 @@ Run every check through the compiler you just built, never the seed on
 | changelog shape | `bash .github/scripts/check-changelog.sh` |
 | codegen corpus and link suite | `test/run.sh` and `test/link/run.sh`; see [test/README.md](test/README.md) |
 
-`doc-agreement.py` holds `doc/cli.md`, `doc/manifest.md`, the `mach init`
+`doc-agreement.py` holds `doc/language/manifest.md`, the `mach init`
 scaffolds and the grammar's keyword list to the compiler under test, and
 `doc-examples.py` compiles every exercised example of the language reference.
 Both read `MACH_DOC_MACH` or the checkout's `out/<host>/debug/bin/mach`. CI
@@ -113,16 +125,18 @@ contract at every axis the compiler grows along.
 ## Documentation
 
 Every fact has one home. A docstring on a declaration says what it is and
-how it is used; a module's docstring states the contract the module holds
-its callers to; the references under `doc/` say what the user sees; and
-`CHANGELOG.md` says when something changed. The docstring form is in
+how it is used, and a module's docstring states the contract the module
+holds its callers to; the language reference under `doc/language/` (the
+language, `mach.toml` and the docstring form) says what the user sees; and
+`CHANGELOG.md` says when something changed. `doc/` holds nothing else:
+`mach --help` and `mach help <command>` are the command-line reference, and
+`mach doc .` renders the docstrings to `doc/api/`, which is generated and
+never committed. The docstring form is in
 [doc/language/documentation.md](doc/language/documentation.md).
 
 Docstring coverage is a property of the supported surface, not a quota. The
-supported, source-stable surface is the editor API (`mach.lang.editor`,
-[doc/tooling/editor-api.md](doc/tooling/editor-api.md)), the command line
-([doc/cli.md](doc/cli.md)) and the manifest schema
-([doc/manifest.md](doc/manifest.md)); every `pub` declaration of that
+supported, source-stable surface is the editor API (`mach.lang.editor`), the
+command line and the manifest schema; every `pub` declaration of that
 surface carries a docstring stating its ownership, lifetime and error
 contract (who frees what, how long a borrowed product stays valid, which
 outcome case means what). Everything else under `src/` is internal: a `pub`
@@ -152,15 +166,14 @@ repository.
 A release bump updates both `[project].version` in `mach.toml` and
 `MACH_VERSION` in `src/lang/version.mach`; CI and the tag workflow require
 the two to match. Tags are created on `main` after the integration merge
-from `dev`. [doc/migration-v5.md](doc/migration-v5.md) is the migration
-from 4.x.
+from `dev`.
 
 ## Project structure
 
 ```
 mach/
 ├── dep/std/           # standard library, pinned by a committed gitlink
-├── doc/               # language, command, manifest and tooling references
+├── doc/language/      # the language reference, mach.toml included
 ├── src/               # the self-hosting compiler
 ├── test/              # censuses, the codegen corpus, the link suite, doc checks
 ├── out/               # ignored build output, grouped by target and profile

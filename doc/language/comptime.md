@@ -45,7 +45,7 @@ used for `$mach.{os,arch,abi}.*` comparison. Flat `$project.version` is the whol
 version **string** (`"2.0.0"`); the structured `$project.version.{major,minor,
 patch}` folds its integer components — both are available. `[project]` has
 exactly the keys `id`, `version`, `src`, and `out`
-([manifest.md](../manifest.md#project)). `$project.name` and
+([manifest.md](manifest.md#project)). `$project.name` and
 `$project.description` read the 4.26.x keys of the same names and were removed
 with them in 5.0.0: each is refused at its use site by name (`` `$project.name`
 was removed in 5.0.0 with the `[project] name` manifest key ``), not re-sourced

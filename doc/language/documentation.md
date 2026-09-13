@@ -224,4 +224,4 @@ comment as `# [...]`.
 - [rec.md](rec.md), [uni.md](uni.md), [tag.md](tag.md), [def.md](def.md) - type forms
 - [val-var.md](val-var.md) - binding declarations
 - [modules.md](modules.md) - module structure and file layout
-- [../cli.md](../cli.md#mach-doc) - mach doc command, which renders docstrings
+- `mach help doc` - the command that renders docstrings

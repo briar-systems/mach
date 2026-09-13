@@ -72,7 +72,7 @@ value placed in memory and worked one lane at a time when it does not; and
 per-lane scalar code on a target with no vector unit (rv64gc today). All three
 compute identical lanes — the expansion is a fixed unroll, never a reassociation
 — so only performance varies. The `simd` manifest lever (see
-[manifest.md](../manifest.md)) reports or refuses the scalar cases if a project
+[manifest.md](manifest.md)) reports or refuses the scalar cases if a project
 cannot afford them.
 
 A target that gains wider vector registers therefore gets **better code**, not
@@ -139,7 +139,7 @@ There are no scalar↔vector casts in this increment: neither an implicit
 scalar-to-vector conversion nor a `1.0::f32x4` reinterpret is legal. The
 lane-wise operators and the comparison-to-mask rule are in
 [operators.md](operators.md); what a target without hardware SIMD does with a
-vector operator is the `simd` profile lever ([manifest.md](../manifest.md),
+vector operator is the `simd` profile lever ([manifest.md](manifest.md),
 [policy.md](policy.md)).
 
 ## Handles

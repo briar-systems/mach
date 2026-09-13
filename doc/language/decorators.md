@@ -514,7 +514,7 @@ A `#[scalar]` function is also declined by the inliner, so the opt-out survives
 inlining — it cannot be lost by the body moving into an unflagged caller. Use it
 for a scalar reference twin in a differential test, or where vectorized codegen
 is undesirable for a specific function. The project-wide equivalent is the
-`vectorize` profile key (see [manifest.md](../manifest.md#profilename)).
+`vectorize` profile key (see [manifest.md](manifest.md#profilename)).
 
 ### `naked` — no prologue, no epilogue, body as written
 
@@ -603,7 +603,7 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
   requires through the manifest's `need`, and resolves against the **project
   root** rather than the declaring file's directory; the required artifact is
   built first. No other template variable may appear in an `embed` path. See
-  [manifest.md](../manifest.md#artifact-requirements).
+  [manifest.md](manifest.md#artifact-requirements).
 - The annotation must be `[_]u8` or `[N]u8`; the element type must be `u8`.
   `[_]` is an inferred array length, legal **only** on an `#[embed]`
   declaration — written anywhere else it is rejected (see
@@ -630,7 +630,7 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
 - The embedded file is a build input: its content digest feeds the embedding
   module's incremental cutoff, so editing the asset invalidates that module
   and an untouched asset stays a cache hit — see
-  [manifest.md](../manifest.md#stepname--build-steps) for the equivalent
+  [manifest.md](manifest.md#stepname--build-steps) for the equivalent
   guarantee on `[step]` `in` entries.
 
 ### `stage(str)` — GPU pipeline stage
@@ -988,4 +988,4 @@ The set is closed. New directives require a compiler change.
 - [val-var.md](val-var.md) — `val` / `var` bindings, and the `embed` exemption to `val`'s initializer requirement
 - [grammar.md](grammar.md#types) — the `[_]` inferred array length `embed` introduces
 - [types.md](types.md) — the SIMD vector types a shader stage computes over and `op` operates on, and the handle types `handle` declares
-- [../manifest.md](../manifest.md) — the `vectorize` profile key `scalar` opts out of, and content-fingerprinted build inputs (`embed`, `[step]` `in`)
+- [manifest.md](manifest.md) — the `vectorize` profile key `scalar` opts out of, and content-fingerprinted build inputs (`embed`, `[step]` `in`)

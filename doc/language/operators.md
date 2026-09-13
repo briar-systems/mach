@@ -218,7 +218,7 @@ Integer `*` is where this is most visible today:
 | `i64x2 * i64x2` | scalar expansion | scalar expansion (NEON has no `.2d` multiply) | scalar expansion |
 
 A project that cannot afford a scalar expansion sets `simd = "require"` in its
-profile (see [../manifest.md](../manifest.md)), which turns the shortfall into a
+profile (see [manifest.md](manifest.md)), which turns the shortfall into a
 build error naming the operation, its lane width, the function and the target.
 
 A comparison produces the same-shape **unsigned mask** vector — one lane per input

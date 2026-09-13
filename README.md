@@ -65,10 +65,11 @@ Precompiled binaries are also available directly on the [releases](https://githu
 
 Mach builds itself. The development source is Mach 5 source and pins std
 2.0.0, so it needs a 5.0 compiler: a 4.x release cannot read it. Install a
-5.0 release, or build one from the published 4.26.5 seed through the
-[pinned source bootstrap chain](doc/tooling/bootstrap.md), which is also how
-CI builds its compiler. A project moving from 4.x reads
-[doc/migration-v5.md](doc/migration-v5.md).
+5.0 release, or build one from the published 4.26.5 seed through the pinned
+source bootstrap chain, `.github/actions/setup-mach/bootstrap.py`, which is
+how CI builds its compiler on every native host; [CONTRIBUTING.md](CONTRIBUTING.md)
+describes it. A project moving from 4.x follows the `CHANGELOG.md` entry for
+5.0.0, which names every removed form and its replacement.
 
 ```bash
 git clone https://github.com/briar-systems/mach
@@ -147,14 +148,11 @@ fun main(argc: i64, argv: **u8) i64 {
 
 # Documentation
 
-The full language reference is in [`doc/language/`](doc/language/README.md). The
-build system is documented in:
-
-- [`doc/manifest.md`](doc/manifest.md): the `mach.toml` manifest reference
-- [`doc/cli.md`](doc/cli.md): the `mach` command-line reference
-- [`doc/distribution.md`](doc/distribution.md): shipping an application to users
-- [`doc/migration-v5.md`](doc/migration-v5.md): moving a 4.x project to Mach 5
-- [`doc/tooling/`](doc/tooling/bootstrap.md): the bootstrap chain, the editor API and the test JSON stream
+The full language reference is in [`doc/language/`](doc/language/README.md),
+including [`doc/language/manifest.md`](doc/language/manifest.md), the
+`mach.toml` reference. The command line is documented by the compiler itself:
+`mach --help` lists the commands and `mach help <command>` describes each one.
+`mach doc .` renders a project's docstrings to `doc/api/`.
 
 
 # Credit

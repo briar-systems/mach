@@ -7,8 +7,7 @@ This directory is the authoritative reference for the Mach 5 dialect. Each
 file is a focused doc with grammar, examples, and neighboring links; start
 from the index below. Examples whose fence carries an expectation (`accept`,
 `reject`, `warn`, `run`) are compiled by `test/doc-examples.py` against the
-compiler in the tree; see [Exercised examples](#exercised-examples). Users
-moving from 4.x read [../migration-v5.md](../migration-v5.md) first.
+compiler in the tree; see [Exercised examples](#exercised-examples).
 
 ## Files and structure
 
@@ -68,21 +67,13 @@ moving from 4.x read [../migration-v5.md](../migration-v5.md) first.
 
 ## Build system
 
-- [../manifest.md](../manifest.md) — the `mach.toml` manifest reference
-- [../cli.md](../cli.md) — the `mach` command-line reference
-- [../distribution.md](../distribution.md) — shipping an application to users
-- [../migration-v5.md](../migration-v5.md) — moving a 4.x project to 5.0
+- [manifest.md](manifest.md) — the `mach.toml` manifest reference
+- `mach --help` and `mach help <command>` — the command-line reference
 
-## Tooling
-
-- [../tooling/editor-api.md](../tooling/editor-api.md) — the editor query
-  surface (`mach.lang.editor`) a language server binds to
-- [../tooling/test-json.md](../tooling/test-json.md) — the `mach test
-  --format json` event schema
-
-The supported, source-stable surface of the compiler is the editor API, the
-command line, and the manifest schema. Everything else under `src/` is
-internal. Source API authors can mark deprecated declarations with
+The supported, source-stable surface of the compiler is the editor API
+(`mach.lang.editor`, documented by its docstrings and rendered by
+`mach doc`), the command line, and the manifest schema. Everything else
+under `src/` is internal. Source API authors can mark deprecated declarations with
 [`#[deprecated]`](decorators.md#deprecated--deprecatedstr--source-use-notice), which warns on external use.
 
 ## Exercised examples

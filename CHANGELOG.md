@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   canonical layout, or with `--check` reports the files that differ and writes
   nothing. The formatter re-emits the parsed token stream, so a formatted file
   keeps its tokens, tree, comments, doc runs and inline assembly, and is a
-  fixed point; the layout is documented in `doc/cli.md` and has no
+  fixed point; the layout is the one `mach fmt` emits and has no
   configuration. Only the manifest's `project.src` is visited, through held
   directory capabilities that refuse symlinks and the dependency tree, and a
   rewrite goes through the publication boundary on the object that was read,
@@ -140,20 +140,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counts, checking every generated executable's output and the worker-count
   image identity; with a control compiler the two alternate over identical
   inputs. The `compiler memory` workflow runs it on demand, never on the PR
-  lane. The 2026-09-06 archive measurements it replaces are preserved in
-  `doc/design/2299-archive-inventory.md` (#2299).
+  lane. The 2026-09-06 archive measurements it replaces are preserved on
+  PR #3262 (#2299).
 - `test/memory.py` runs every cell uncached, cache-cold (publishing) and
   cache-warm, and requires a warm build to restore every module, so OS
   file-cache warmth never counts as reuse; it holds the compiler under test
   to a peak-memory ceiling per workload and profile derived from the measured
-  curves in `doc/design/r2-measurements.md`, and fails above it. The child
+  curves recorded on PR #3302, and fails above it. The child
   runs with transparent huge pages disabled and the sampler tracks swap-out,
   which were the two apparatus effects that made a deterministic serial build
   read anywhere between 1542 and 1997 MiB; the host's THP mode, load average
   and available memory are recorded beside every process. A control that
   cannot build the checkout takes `--control-checkout` for its own tree, and
   the self-build runs serial and at the host's CPU count (#2299).
-- `doc/design/r2-measurements.md` records the final peak-memory and time
+- PR #3302 records the final peak-memory and time
   curves for the many-module, dense-function, large-aggregate, blocks and
   self-build workloads on dev, uncached and cached, serial and parallel, at
   both profiles, against the 4.30.0 seed and the preserved 2026-09-06
@@ -179,15 +179,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scalarized silently. `test/vecrows` probes every declared row on x86_64,
   aarch64 and riscv64 against the external decoder and execution (#3120).
 
-- `doc/migration-v5.md` walks a 4.x project to 5.0: the compiler it needs
-  first, the refused manifest keys and spellings with their diagnostics, the
-  `Result`/`Option`/`Void` to `res`/`opt`/`err` translation and the guard
-  rules that bite, and the std 2.0.0 outcome forms by domain.
-  `test/doc-examples.py` compiles every language-reference example that
+- `test/doc-examples.py` compiles every language-reference example that
   carries an expectation (`accept`, `reject`, `warn`, `run`, `test`) against
-  the compiler under test, and `test/doc-agreement.py` holds `doc/cli.md`,
-  `doc/manifest.md`, the `mach init` scaffolds and the grammar's keyword
-  list to the generated help, the manifest parser and the token table
+  the compiler under test, and `test/doc-agreement.py` holds
+  `doc/language/manifest.md`, the `mach init` scaffolds and the grammar's
+  keyword list to the manifest parser, the scaffolds and the token table
   (#3131).
 
 ### Fixed
@@ -201,8 +197,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatcher folds a run-time result outside the range to `255` before it
   exits, so it is a failure on every host with the same status reported. Four
   tests in the tree that accumulated more than eight failure bits now return
-  the ordinal of the first failing check. The decision is recorded in
-  `doc/design/test-status-range.md`. (#3241)
+  the ordinal of the first failing check. The decision is recorded on
+  PR #3297. (#3241)
 - A comment that shares its line with code is no longer taken as the doc run
   of the declaration on the next line, and never joins the comment on the
   following line into one run. (#3225)
@@ -457,11 +453,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   definition once per sema or lower computation, and verifies a field graph once
   per type projection. On one 43-module artifact with the debug compiler, sema
   drops from 212 ms to 75 ms and lower from 261 ms to 117 ms (37 ms and 82 ms
-  before the query work of #3247); the log is `doc/design/build-overhead-3218.md`
-  (#2299).
+  before the query work of #3247); the log is on PR #3252 (#2299).
 - Editor analysis returns an owned diagnostic/source snapshot with explicit phase and target selection. Raw products have checked serial-view lifetimes. Closing a buffer retires its overlay, source payload and cached dependents while retaining its FileId. Buffer slots are reused, and checked editor teardown preserves owners on preparation failure (#2999).
 
 ### Removed
+
+- Everything under `doc/` except the language reference. `doc/manifest.md`
+  is `doc/language/manifest.md`, since `mach.toml` is part of the language;
+  `doc/cli.md` is gone because `mach --help` and `mach help <command>` are
+  the command-line reference; `doc/distribution.md`, `doc/migration-v5.md`,
+  `doc/tooling/` and the `doc/design/` records are gone, the records to the
+  agent-report archive and all of them to git history. Internal contracts
+  live on the module docstrings that hold them; `mach doc .` renders to
+  `doc/api/`, which is generated and ignored. `test/doc-agreement.py` no
+  longer checks a command-line page. (#3112)
 
 - `isa.Inst.clobbers`. The field had one writer (`inst_blank`, `= 0`) and no
   reader; implicit writes come from `asm.Mnemonic.implicit` and the opcode
