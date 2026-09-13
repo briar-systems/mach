@@ -164,7 +164,7 @@ pub fun emit_alias_guard(b: *builder.Builder, d: *dep.DepInfo, init: value.Value
                         have_guard = true;
                     }
                     or {
-                        val ra: res[value.Value, fail.Fail] = builder.emit_and(b, guard, pair);
+                        val ra: res[value.Value, fail.Fail] = emit_and_fold(b, guard, pair);
                         if (sel ra.err) {
                             guard_free3(m, part, starts, ends, n);
                             ret ra;
@@ -222,6 +222,138 @@ fun const_in_range(v: value.Value, check_lo: bool, lo: u64, hi: u64, use_signed:
     ret opt[bool].some{ok};
 }
 
+# a signed interval a value is proven to stay inside, built from constants,
+# counted-loop induction variables with constant limits, and the sums,
+# differences, products and left shifts of those; anything else is unknown
+rec Range {
+    lo: i64;
+    hi: i64;
+}
+
+# ranges are kept far inside i64 so the arithmetic below cannot itself wrap
+val RANGE_LIMIT: i64 = 0x10000000000;
+val RANGE_DEPTH: u32 = 8;
+
+fun range_ok(r: Range) bool {
+    ret r.lo >= 0 - RANGE_LIMIT && r.hi <= RANGE_LIMIT && r.lo <= r.hi;
+}
+
+fun range_min(a: i64, b: i64) i64 {
+    if (a < b) { ret a; }
+    ret b;
+}
+
+fun range_max(a: i64, b: i64) i64 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+fun range_mul(a: Range, b: Range) Range {
+    val p0: i64 = a.lo * b.lo;
+    val p1: i64 = a.lo * b.hi;
+    val p2: i64 = a.hi * b.lo;
+    val p3: i64 = a.hi * b.hi;
+    var r:  Range;
+    r.lo = range_min(range_min(p0, p1), range_min(p2, p3));
+    r.hi = range_max(range_max(p0, p1), range_max(p2, p3));
+    ret r;
+}
+
+fun range_of_iv(la: *loops.LoopAnalysis, phi: id.InstructionId) opt[Range] {
+    var li: u32 = 0;
+    for (li < la.loop_len) {
+        val lp: *loops.Loop = ?la.loops[li];
+        if (lp.has_iv && lp.is_counted && lp.iv.phi == phi) {
+            if (lp.iv.init.kind != value.VAL_CONST_INT)       { ret opt[Range].none{}; }
+            if (lp.counted.bound.kind != value.VAL_CONST_INT) { ret opt[Range].none{}; }
+            val init:  i64 = lp.iv.init.data.int_lit:~i64;
+            val bound: i64 = lp.counted.bound.data.int_lit:~i64;
+            var r:     Range;
+            r.lo = range_min(init, bound);
+            r.hi = range_max(init, bound);
+            if (!range_ok(r)) { ret opt[Range].none{}; }
+            ret opt[Range].some{r};
+        }
+        li = li + 1;
+    }
+    ret opt[Range].none{};
+}
+
+fun range_of(fn: *ir.Function, la: *loops.LoopAnalysis, v: value.Value, depth: u32) opt[Range] {
+    if (v.kind == value.VAL_CONST_INT) {
+        var r: Range;
+        r.lo = v.data.int_lit:~i64;
+        r.hi = r.lo;
+        if (!range_ok(r)) { ret opt[Range].none{}; }
+        ret opt[Range].some{r};
+    }
+    if (v.kind != value.VAL_INSTR || depth >= RANGE_DEPTH) { ret opt[Range].none{}; }
+    if (v.data.instr::u32 >= fn.instr_len)                  { ret opt[Range].none{}; }
+    val ins: *instruction.Instruction = ?fn.instrs[v.data.instr::u32];
+    if (ins.kind == instruction.OP_PHI) { ret range_of_iv(la, v.data.instr); }
+    if (ins.operand_count != 2)         { ret opt[Range].none{}; }
+    if (ins.kind != instruction.OP_ADD && ins.kind != instruction.OP_SUB
+        && ins.kind != instruction.OP_MUL && ins.kind != instruction.OP_SHL) {
+        ret opt[Range].none{};
+    }
+    val ra: opt[Range] = range_of(fn, la, ins.operands[0], depth + 1);
+    if (!sel ra.some) { ret opt[Range].none{}; }
+    val rb: opt[Range] = range_of(fn, la, ins.operands[1], depth + 1);
+    if (!sel rb.some) { ret opt[Range].none{}; }
+    val a: Range = ra.some;
+    val b: Range = rb.some;
+    var r: Range;
+    if (ins.kind == instruction.OP_ADD) {
+        r.lo = a.lo + b.lo;
+        r.hi = a.hi + b.hi;
+    }
+    or (ins.kind == instruction.OP_SUB) {
+        r.lo = a.lo - b.hi;
+        r.hi = a.hi - b.lo;
+    }
+    or (ins.kind == instruction.OP_MUL) {
+        r = range_mul(a, b);
+    }
+    or {
+        if (b.lo != b.hi || b.lo < 0 || b.lo > 40) { ret opt[Range].none{}; }
+        var f: Range;
+        f.lo = (1::i64) << (b.lo::u32);
+        f.hi = f.lo;
+        r    = range_mul(a, f);
+    }
+    if (!range_ok(r)) { ret opt[Range].none{}; }
+    ret opt[Range].some{r};
+}
+
+# true when the value is proven inside [lo, hi] without a runtime test
+fun proven_in_range(fn: *ir.Function, la: *loops.LoopAnalysis, v: value.Value, check_lo: bool, lo: u64, hi: u64, use_signed: bool) bool {
+    val cst: opt[bool] = const_in_range(v, check_lo, lo, hi, use_signed);
+    if (sel cst.some) { ret cst.some; }
+    val rr: opt[Range] = range_of(fn, la, v, 0);
+    if (!sel rr.some) { ret false; }
+    val r: Range = rr.some;
+    if (use_signed) {
+        if (check_lo && r.lo < (lo:~i64)) { ret false; }
+        ret r.hi <= (hi:~i64);
+    }
+    if (r.lo < 0) { ret false; }
+    if (check_lo && (r.lo:~u64) < lo) { ret false; }
+    ret (r.hi:~u64) <= hi;
+}
+
+fun is_const_bit(v: value.Value, bit: u64) bool {
+    ret v.kind == value.VAL_CONST_INT && v.data.int_lit == bit;
+}
+
+# a conjunction with a constant term needs no instruction
+fun emit_and_fold(b: *builder.Builder, x: value.Value, y: value.Value) res[value.Value, fail.Fail] {
+    if (is_const_bit(x, 1)) { ret res[value.Value, fail.Fail].ok{y}; }
+    if (is_const_bit(y, 1)) { ret res[value.Value, fail.Fail].ok{x}; }
+    if (is_const_bit(x, 0)) { ret res[value.Value, fail.Fail].ok{x}; }
+    if (is_const_bit(y, 0)) { ret res[value.Value, fail.Fail].ok{y}; }
+    ret builder.emit_and(b, x, y);
+}
+
 fun in_range(b: *builder.Builder, v: value.Value, check_lo: bool, lo: u64, hi: u64, use_signed: bool) res[value.Value, fail.Fail] {
     val ri8: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?b.m.types, 8);
     if (sel ri8.err) { ret res[value.Value, fail.Fail].err{ri8.err}; }
@@ -246,15 +378,30 @@ fun in_range(b: *builder.Builder, v: value.Value, check_lo: bool, lo: u64, hi: u
     if (use_signed)  { rlo = builder.emit_cmp_le_s(b, lo_v, v); }
     or               { rlo = builder.emit_cmp_le_u(b, lo_v, v); }
     if (sel rlo.err) { ret rlo; }
-    ret builder.emit_and(b, rlo.ok, rhi.ok);
+    ret emit_and_fold(b, rlo.ok, rhi.ok);
 }
 
-pub fun magnitude_safe(b: *builder.Builder, v: value.Value, is_unsigned: bool) res[value.Value, fail.Fail] {
-    if (is_unsigned) { ret in_range(b, v, false, 0, VER_U64_MAX - VER_MAGNITUDE_MARGIN, false); }
+pub fun magnitude_safe(b: *builder.Builder, fn: *ir.Function, la: *loops.LoopAnalysis, v: value.Value, is_unsigned: bool) res[value.Value, fail.Fail] {
+    val ri8: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?b.m.types, 8);
+    if (sel ri8.err) { ret res[value.Value, fail.Fail].err{ri8.err}; }
+    if (is_unsigned) {
+        if (proven_in_range(fn, la, v, false, 0, VER_U64_MAX - VER_MAGNITUDE_MARGIN, false)) {
+            ret res[value.Value, fail.Fail].ok{value.const_int(1, ri8.ok)};
+        }
+        ret in_range(b, v, false, 0, VER_U64_MAX - VER_MAGNITUDE_MARGIN, false);
+    }
+    if (proven_in_range(fn, la, v, true, VER_I64_SMIN + VER_MAGNITUDE_MARGIN, VER_I64_SMAX - VER_MAGNITUDE_MARGIN, true)) {
+        ret res[value.Value, fail.Fail].ok{value.const_int(1, ri8.ok)};
+    }
     ret in_range(b, v, true, VER_I64_SMIN + VER_MAGNITUDE_MARGIN, VER_I64_SMAX - VER_MAGNITUDE_MARGIN, true);
 }
 
-pub fun offset_safe(b: *builder.Builder, off: value.Value) res[value.Value, fail.Fail] {
+pub fun offset_safe(b: *builder.Builder, fn: *ir.Function, la: *loops.LoopAnalysis, off: value.Value) res[value.Value, fail.Fail] {
+    val ri8: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?b.m.types, 8);
+    if (sel ri8.err) { ret res[value.Value, fail.Fail].err{ri8.err}; }
+    if (proven_in_range(fn, la, off, true, 0 - VER_MAGNITUDE_MARGIN, VER_MAGNITUDE_MARGIN, true)) {
+        ret res[value.Value, fail.Fail].ok{value.const_int(1, ri8.ok)};
+    }
     ret in_range(b, off, true, 0 - VER_MAGNITUDE_MARGIN, VER_MAGNITUDE_MARGIN, true);
 }
 
@@ -378,18 +525,18 @@ pub fun version_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, l
     }
     val bound_ex: value.Value = rbe.ok;
 
-    val rbs: res[value.Value, fail.Fail] = magnitude_safe(?b, lp.counted.bound, is_unsigned);
+    val rbs: res[value.Value, fail.Fail] = magnitude_safe(?b, fn, la, lp.counted.bound, is_unsigned);
     if (sel rbs.err) {
         free2(m, body, fast_blocks, body_len);
         ret res[VersionResult, fail.Fail].err{rbs.err};
     }
     var safe: value.Value                 = rbs.ok;
-    val ris:  res[value.Value, fail.Fail] = magnitude_safe(?b, lp.iv.init, is_unsigned);
+    val ris:  res[value.Value, fail.Fail] = magnitude_safe(?b, fn, la, lp.iv.init, is_unsigned);
     if (sel ris.err) {
         free2(m, body, fast_blocks, body_len);
         ret res[VersionResult, fail.Fail].err{ris.err};
     }
-    val ra1: res[value.Value, fail.Fail] = builder.emit_and(?b, safe, ris.ok);
+    val ra1: res[value.Value, fail.Fail] = emit_and_fold(?b, safe, ris.ok);
     if (sel ra1.err) {
         free2(m, body, fast_blocks, body_len);
         ret res[VersionResult, fail.Fail].err{ra1.err};
@@ -397,12 +544,12 @@ pub fun version_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, l
     safe = ra1.ok;
     var oi: u32 = 0;
     for (oi < d.access_count) {
-        val ros: res[value.Value, fail.Fail] = offset_safe(?b, d.accesses[oi].off);
+        val ros: res[value.Value, fail.Fail] = offset_safe(?b, fn, la, d.accesses[oi].off);
         if (sel ros.err) {
             free2(m, body, fast_blocks, body_len);
             ret res[VersionResult, fail.Fail].err{ros.err};
         }
-        val ra2: res[value.Value, fail.Fail] = builder.emit_and(?b, safe, ros.ok);
+        val ra2: res[value.Value, fail.Fail] = emit_and_fold(?b, safe, ros.ok);
         if (sel ra2.err) {
             free2(m, body, fast_blocks, body_len);
             ret res[VersionResult, fail.Fail].err{ra2.err};
@@ -416,7 +563,7 @@ pub fun version_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, l
         free2(m, body, fast_blocks, body_len);
         ret res[VersionResult, fail.Fail].err{rge.err};
     }
-    val ragf: res[value.Value, fail.Fail] = builder.emit_and(?b, safe, rge.ok);
+    val ragf: res[value.Value, fail.Fail] = emit_and_fold(?b, safe, rge.ok);
     if (sel ragf.err) {
         free2(m, body, fast_blocks, body_len);
         ret res[VersionResult, fail.Fail].err{ragf.err};
