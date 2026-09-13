@@ -5,10 +5,7 @@ read the index below or follow `see also` links to navigate.
 
 This directory is the authoritative reference for the Mach 5 dialect. Each
 file is a focused doc with grammar, examples, and neighboring links; start
-from the index below. Examples whose fence carries an expectation (`accept`,
-`reject`, `warn`, `run`) state how the compiler in the tree answers them; see
-[Exercised examples](#exercised-examples). Users
-moving from 4.x read [../migration-v5.md](../migration-v5.md) first.
+from the index below.
 
 ## Files and structure
 
@@ -68,37 +65,11 @@ moving from 4.x read [../migration-v5.md](../migration-v5.md) first.
 
 ## Build system
 
-- [../manifest.md](../manifest.md) — the `mach.toml` manifest reference
-- [../cli.md](../cli.md) — the `mach` command-line reference
-- [../distribution.md](../distribution.md) — shipping an application to users
-- [../migration-v5.md](../migration-v5.md) — moving a 4.x project to 5.0
+- [manifest.md](manifest.md) — the `mach.toml` manifest reference
+- `mach --help` and `mach help <command>` — the command-line reference
 
-## Tooling
-
-- [../tooling/editor-api.md](../tooling/editor-api.md) — the editor query
-  surface (`mach.lang.editor`) a language server binds to
-- [../tooling/test-json.md](../tooling/test-json.md) — the `mach test
-  --format json` event schema
-
-The supported, source-stable surface of the compiler is the editor API, the
-command line, and the manifest schema. Everything else under `src/` is
-internal. Source API authors can mark deprecated declarations with
+The supported, source-stable surface of the compiler is the editor API
+(`mach.lang.editor`, documented by its docstrings and rendered by
+`mach doc`), the command line, and the manifest schema. Everything else
+under `src/` is internal. Source API authors can mark deprecated declarations with
 [`#[deprecated]`](decorators.md#deprecated--deprecatedstr--source-use-notice), which warns on external use.
-
-## Exercised examples
-
-A fenced `mach` block in this directory is either a display fragment or an
-exercised example. An exercised fence names its expectation after the
-language: `mach accept` must compile clean, `mach reject "text"` must be
-refused with a diagnostic containing `text`, `mach warn "text"` must compile
-with a warning containing `text`, `mach run "text"` must build, run and
-print `text`, and `mach test "text"` must pass under `mach test` with `text`
-in the report. A block may hold several files, each introduced by a line
-`# file: <path>` (the first file is `src/root.mach` when no line names it).
-A fence with no expectation is a fragment.
-
-## Design
-
-- [../design/](../design/) — why the compiler is shaped the way it is: the
-  dependency model, the release shape, the IR operation descriptor,
-  publication, and the closed failure kind

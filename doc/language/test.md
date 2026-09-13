@@ -23,7 +23,7 @@ test is never part of a module's public surface.
 
 ## Examples
 
-```mach test "2 passed"
+```mach
 use std.runtime;
 use std.types.bool.bool;
 
@@ -115,8 +115,8 @@ in-tree. `--filter` narrows the run by test name in either mode.
 selected test as its own process (`<exe> <index>`), captures its output, times
 it, and renders a per-module readout — collapsing all-passing modules to a
 single roll-up line and expanding any module with a failure to show the
-failing test's captured output and location. The full flag reference is in
-[cli.md](../cli.md#mach-test); the options that select and shape a run are:
+failing test's captured output and location. The full flag reference is
+`mach help test`; the options that select and shape a run are:
 
 ```
 --jobs <n>               run up to n test processes at once (default: host CPUs)
@@ -178,8 +178,8 @@ flag leaves every test unbounded.
 `--format json` replaces the readout with one JSON object per line on stdout
 (`run_start`, one `test` per result, `summary`; `case` under `--list`), with
 build diagnostics kept on stderr. A timed-out test reports `"kind":"timeout"`
-with its bound in `timeout_seconds`. The schema is versioned and documented in
-[tooling/test-json.md](../tooling/test-json.md).
+with its bound in `timeout_seconds`. The schema is versioned (`"schema":1`
+on every event) and its writer is `mach.cli.cmd.testing`.
 
 ## The runner
 
@@ -214,5 +214,3 @@ automatically, with no separate corpus project.
   statements a test body uses
 - [files.md](files.md) — project layout the build (and `mach test`)
   discovers
-- [../cli.md](../cli.md#mach-test) — every `mach test` flag
-- [../tooling/test-json.md](../tooling/test-json.md) — the `--format json` schema

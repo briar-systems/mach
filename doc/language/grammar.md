@@ -8,10 +8,9 @@ is called out inline. Productions that could not be fully pinned to the
 parser are marked `(* approximate, verify *)`.
 
 The tag productions (`tag-decl`, `tag-literal`, `sel-expr`, the `$cases`
-sequence and the `.[desc]` projection) implement the
-[v5 tagged-value contract](../design/tagged-values.md); see [tag.md](tag.md)
-for the semantic restrictions the parser does not enforce (guards, places,
-payload arity). `test/doc-agreement.py` checks the keyword list below against
+sequence and the `.[desc]` projection) are the syntax of the tagged-value
+contract; see [tag.md](tag.md) for the semantic restrictions the parser does
+not enforce (guards, places, payload arity). `test/doc-agreement.py` checks the keyword list below against
 the parser's `token.mach`.
 
 This is a reference grammar, not the parser's exact control flow. The

@@ -1,28 +1,26 @@
 MACH
 ===
 
-![CI](https://github.com/briar-systems/mach/actions/workflows/ci.yml/badge.svg?branch=dev)
+[![CI](https://github.com/briar-systems/mach/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/briar-systems/mach/actions/workflows/ci.yml?query=branch%3Amain)
 ![License](https://img.shields.io/github/license/briar-systems/mach)
 ![Code Size](https://img.shields.io/github/languages/code-size/briar-systems/mach)
-![Last Commit](https://img.shields.io/github/last-commit/briar-systems/mach)
+![Last Commit](https://img.shields.io/github/last-commit/briar-systems/mach/main)
 ![Issues](https://img.shields.io/github/issues/briar-systems/mach)
 
 We have an official [Discord](https://discord.com/invite/dfWG9NhGj7)!
 
 # Overview
 
-Mach is a self hosted, statically-typed, compiled systems language designed to be simple, fast, verbose, and intuitive. Mach was created for projects like compilers, runtimes, operating systems, tooling, and embedded systems -- anywhere performance is a requirement and hidden behavior is a liability. The language is deliberately small and explicit: what you read is what executes, every cost is visible in the code that incurs it.
+Mach is a self hosted, statically-typed, compiled systems language designed to be simple, fast, verbose, and intuitive. Mach was created for projects like compilers, runtimes, operating systems, tooling, games, and embedded systems -- anywhere performance is a requirement and hidden behavior is a liability. The language is deliberately small and explicit: what you read is what executes, every cost is visible in the code that incurs it.
 
-The compiler, code generators, and linker are written in native Mach, with no
-LLVM or external assembler or linker. Ordinary Linux programs using the
-standard library need no libc. The standard library uses platform libraries
-where required, including libSystem on Darwin and Windows system DLLs.
+The compiler, code generators, and linker are written in native Mach, with no external dependencies whatsoever.
+The standard library uses platform libraries where required, including libSystem on Darwin and Windows system DLLs.
 
-Memory is managed manually. There is no garbage collector and no hidden allocation. Memory flows through allocators that you create and pass explicitly, and the standard library is built around that style end to end: anything that allocates takes an allocator, and anything that doesn't never will. 
+Memory is managed manually. There is no garbage collector and no hidden allocation.
 
 Batteries are not included. Many ways to do the same thing are not provided, and the language will not stop you from doing dangerous things. Safety is a decision made by the programmer, not a restriction imposed upon them.
 
-Use Mach when you want C's reach with one coherent toolchain: a single binary that builds, links (no external linker), tests, vendors dependencies, and cross-compiles.
+Use Mach when you want C's reach with one coherent toolchain: a single binary that builds, links, tests, formats, vendors dependencies, and cross-compiles (it cooks and cleans if you ask nicely too!).
 
 
 # Getting Started
@@ -32,7 +30,7 @@ Read the [language reference](doc/language/README.md) before installing. The doc
 
 ## Installing Mach
 
-Install the latest release with one line:
+Install the latest published release with one line:
 
 ```bash
 curl -fsSL https://machlang.org/install.sh | sh
@@ -47,97 +45,38 @@ irm https://machlang.org/install.ps1 | iex
 Precompiled binaries are also available directly on the [releases](https://github.com/briar-systems/mach/releases) page.
 
 
-## Building Mach
-
-Mach builds itself. The development source is Mach 5 source and pins std
-2.0.0, so it needs a 5.0 compiler: a 4.x release cannot read it. Install a
-5.0 release, or build one from the published 4.26.5 seed through the
-[pinned source bootstrap chain](doc/tooling/bootstrap.md), which is also how
-CI builds its compiler. A project moving from 4.x reads
-[doc/migration-v5.md](doc/migration-v5.md).
-
-```bash
-git clone https://github.com/briar-systems/mach
-cd mach
-git submodule update --init --recursive
-mach build .
-```
-
-The compiler is written to `out/<target>/<profile>/bin/mach`, or `bin/mach.exe`
-on Windows. A default Linux x86_64 build writes
-`out/linux-x86_64/debug/bin/mach`.
-
-
-# Examples
-
-The following examples require the standard library as a dependency. For a standalone starting point, see the [Mach Sieve](https://github.com/octalide/mach-sieve) project, or run `mach init` to scaffold one.
-
-
 ## Hello World
 
-```mach
-use          std.runtime;
-use print:   std.print;
+Create a new mach project:
 
-#[symbol("main")]
-fun main(argc: i64, argv: **u8) i64 {
-    print.println("Hello, World!");
-    ret 0;
-}
+```bash
+mach init <project_name>
+cd <project_name>
 ```
 
+You will find the source code for a simple "Hello World" program in `src/main.mach`. Build and run it:
 
-## Fibonacci
-
-```mach
-use          std.runtime;
-use print:   std.print;
-
-fun fibr(n: u64) u64 {
-    if (n < 2) {
-        ret n;
-    }
-    ret fibr(n - 1) + fibr(n - 2);
-}
-
-#[symbol("main")]
-fun main(argc: i64, argv: **u8) i64 {
-    print.printf("fib({}) = {}\n", 10::i64, fibr(10));
-    ret 0;
-}
+```bash
+mach build .
+mach run .
 ```
 
+> NOTE: `mach build .` and `mach run .` are *separate commands*. `mach run .` does not build the project first, so you must run `mach build .` before running the program.
 
-## Factorial
 
-```mach
-use          std.runtime;
-use print:   std.print;
+# Targets
 
-fun fact(n: u64) u64 {
-    if (n == 0) {
-        ret 1;
-    }
-    ret n * fact(n - 1);
-}
-
-#[symbol("main")]
-fun main(argc: i64, argv: **u8) i64 {
-    print.printf("fact({}) = {}\n", 10::i64, fact(10));
-    ret 0;
-}
-```
+Mach compiles to a LOT of combinatorial targets. Run `mach info targets` to see the full list of targets your installed compiler version supports.
 
 
 # Documentation
 
-The full language reference is in [`doc/language/`](doc/language/README.md). The
-build system is documented in:
+`doc/` contains language documentation ([`doc/language/`](doc/language/README.md)) as well as generated documentation for the compiler project itself.
 
-- [`doc/manifest.md`](doc/manifest.md): the `mach.toml` manifest reference
-- [`doc/cli.md`](doc/cli.md): the `mach` command-line reference
-- [`doc/distribution.md`](doc/distribution.md): shipping an application to users
 
+## Contributing
+
+We welcome contributions to Mach! If you would like to contribute, please read our [contributing guidelines](CONTRIBUTING.md) first.
 
 # Credit
 
@@ -150,14 +89,6 @@ Direct inspiration for the compiler itself comes from a few specific sources:
 - [Zig](https://ziglang.org/)
 - [Rust](https://www.rust-lang.org/)
 
-Mach stands on the shoulders of countless giants that have contributed to the development of these languages either directly or by proxy. It is out of respect for their work that Mach will always be fully open source. Thank you all.
-
-
-## Contributing
-
-We welcome contributions to Mach! If you would like to contribute, please read our [contributing guidelines](CONTRIBUTING.md) first.
-
-
-# License
-
 Mach is licensed under the [MIT License](LICENSE).
+
+Mach stands on the shoulders of countless giants that have contributed to the development of these languages either directly or by proxy. It is out of respect for their work that Mach will always be fully open source. Thank you all.
