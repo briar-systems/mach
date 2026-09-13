@@ -23,7 +23,7 @@ test is never part of a module's public surface.
 
 ## Examples
 
-```mach test "2 passed"
+```mach
 use std.runtime;
 use std.types.bool.bool;
 

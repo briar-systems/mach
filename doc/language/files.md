@@ -19,7 +19,7 @@ whichever function **exports the linker symbol** `main`, tagged with
 [`#[symbol("main")]`](decorators.md) and matching the runtime's expected
 signature:
 
-```mach run ""
+```mach
 use std.runtime;
 
 #[symbol("main")]

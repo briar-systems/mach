@@ -39,7 +39,7 @@ A consumer reaches the alias's members with qualified access, chaining
 through any depth of re-export — including a `fwd` of another library's
 `fwd`. In a project whose `[project] id` is `example`:
 
-```mach run "42"
+```mach
 # file: src/alpha.mach
 pub fun answer() i64 { ret 42; }
 

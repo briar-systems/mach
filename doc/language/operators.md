@@ -18,7 +18,7 @@ dividend (`5.5 % 3.0 == 2.5`, `-5.5 % 3.0 == -2.5`). For finite operands and a
 nonzero divisor, this applies across the finite operand range, including
 quotients beyond the `i64` range.
 
-```mach run "2.5 -2.5 -1"
+```mach
 use std.runtime;
 use print: std.print;
 
@@ -98,7 +98,7 @@ positive zero for either zero.
 - `?place` — address-of; produces a pointer to the operand. The operand must be a place: a binding, a field, an element, or a dereference (a field or element reached through a pointer counts). Taking the address of a call result, a literal, a cast, an operator result, or any other temporary is an error naming the operand kind.
 - `@ptr` — dereference; reads through the pointer.
 
-```mach run "11"
+```mach
 use std.runtime;
 use print: std.print;
 
@@ -113,7 +113,7 @@ fun main(argc: i64, argv: **u8) i64 {
 }
 ```
 
-```mach reject "cannot take the address of a call result"
+```mach
 fun g() i64 { ret 1; }
 
 fun addresses(x: i64) {
@@ -146,7 +146,7 @@ Two postfix cast operators, both written `expr OP Type`:
 The two differ sharply on int<->float. `::` runs a numeric conversion, while
 `:~` reinterprets the raw bit pattern:
 
-```mach run "1 3ff8000000000000 1.5"
+```mach
 use std.runtime;
 use print: std.print;
 

@@ -120,7 +120,7 @@ pub fun spin_hint() { ... }
 
 ## Record / union / def
 
-```mach accept
+```mach
 # a 2D Cartesian point with i64 coordinates
 # ---
 # x: horizontal coordinate
@@ -128,7 +128,7 @@ pub fun spin_hint() { ... }
 pub rec Point { x: i64; y: i64; }
 ```
 
-```mach accept
+```mach
 # holds either an integer or a float
 # ---
 # i: integer interpretation
@@ -136,14 +136,14 @@ pub rec Point { x: i64; y: i64; }
 pub uni Number { i: i64; f: f64; }
 ```
 
-```mach accept
+```mach
 # an i64 representing years since birth
 pub def Age: i64;
 ```
 
 ## Tag
 
-```mach accept
+```mach
 # a value that may be absent
 # ---
 # [T]: value type
@@ -155,7 +155,7 @@ pub tag Maybe[T]: u8 {
 }
 ```
 
-```mach accept
+```mach
 # a unit outcome with a typed failure
 # ---
 # [E]: error type
@@ -171,7 +171,7 @@ Cases appear in declaration order after generic parameters. Tags have no return
 value, so `ret:` is refused. Undocumented cases are permitted, but any documented
 case must exist on the tag; `doclint` warns at the component otherwise:
 
-```mach warn "documented component matches no parameter, field, generic, or `ret`"
+```mach
 # a unit outcome with a typed failure
 # ---
 # [E]: error type

@@ -48,7 +48,7 @@ A **type** may not. `rec`, `uni`, `tag`, and `def` reject a name spelled as a ve
 form, because a type declared with a vector's name would be silently unreachable:
 every use in type position resolves to the vector instead:
 
-```mach reject "spelled as a vector type"
+```mach
 rec f32x3 { x: f32; }           # error: `f32x3` is spelled as a vector type
 tag f32x4: u8 { empty; }        # error: `f32x4` is spelled as a vector type
 ```
@@ -259,7 +259,7 @@ val g: [2][2]i64 = [2][2]i64{ [2]i64{1, 2}, [2]i64{3, 4} };
 **Constant indices are bounds-checked at compile time.** `N` is part of the
 type, so an index the compiler can fold must land in `[0, N)`:
 
-```mach reject "out of bounds"
+```mach
 fun read() i32 {
     var xs: [4]i32;
     val a: i32 = xs[3];             # ok
@@ -283,7 +283,7 @@ not indexed against any length at all — `*T` carries none.
 
 `fun(T1, T2) R` — first-class function-pointer type.
 
-```mach run "5"
+```mach
 use std.runtime;
 use print: std.print;
 

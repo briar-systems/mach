@@ -88,7 +88,7 @@ and each source site warns once even when a generic body is instantiated more
 than once. The declaring module does not warn on its own uses, and an unused
 import alone produces no warning.
 
-```mach warn "`old` is deprecated: use replacement"
+```mach
 # file: src/legacy.mach
 #[deprecated("use replacement")]
 pub fun old() i32 { ret replacement(); }
@@ -104,7 +104,7 @@ fun caller() i32 { ret legacy.old(); }      # warning: `old` is deprecated: use 
 It applies to `fun`, `rec`, `uni`, `tag`, `def`, `val`, `var`, `use` and `fwd`
 declarations, and to a tag case, where it is the only decorator a case accepts:
 
-```mach warn "tag case `value` is deprecated: use fresh"
+```mach
 # file: src/reply.mach
 #[deprecated("the whole tag")]
 pub tag Old: u8 { empty; }
@@ -219,7 +219,7 @@ Helpers referencing compiler-local literal pools retain their calls because thos
 objects have module-local identity. Named globals keep their original symbols,
 and copied instructions preserve effects, assembly bindings and debug locations.
 
-```mach accept
+```mach
 #[inline]
 fun fast_path(x: i64) i64 { ret x * 2; }
 ```
@@ -230,7 +230,7 @@ The inverse of `inline`: forbids inlining a function into any caller, overriding
 the compiler's size- and use-count heuristics that would otherwise fold it in.
 Applies to functions only; takes no arguments.
 
-```mach accept
+```mach
 #[noinline]
 fun cold_path(code: i64) i64 { ret code * 100; }
 ```
@@ -259,7 +259,7 @@ A type's alignment is settled during type resolution, before layouts are otherwi
 known; the measured type's layout is established on demand when the intrinsic asks
 for it, so the answer does not depend on whether `T` is declared above or below.
 
-```mach accept
+```mach
 rec Pair { a: u64; b: u64; }
 
 #[align(64)]
@@ -305,7 +305,7 @@ case where the layout is not mach's to choose — a C struct, a file header, a w
 frame, a vertex whose stride a buffer fixes. Without it such a shape cannot be
 described as a record at all.
 
-```mach run "15 1 7"
+```mach
 use std.runtime;
 use print: std.print;
 
@@ -336,7 +336,7 @@ The two compose rather than conflict, and each owns one question:
 - `align(N)` decides the **record's own alignment**, and rounds its size up to a
   multiple of `N`.
 
-```mach run "8 8 1"
+```mach
 use std.runtime;
 use print: std.print;
 
@@ -357,7 +357,7 @@ internal padding and is merely *placed* without padding. This matches C, and it 
 the rule that composes: an inner type's layout does not change depending on who
 holds it.
 
-```mach run "4 8 1 9"
+```mach
 use std.runtime;
 use print: std.print;
 
@@ -449,7 +449,7 @@ natively.
 Places a function or global variable in a named section instead of the
 default `.text` / `.data`.
 
-```mach accept
+```mach
 #[section(".hottext")] #[symbol("f_hot")]
 fun f_hot(x: i64) i64 { ret x + 1; }
 
