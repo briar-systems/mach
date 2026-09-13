@@ -315,7 +315,7 @@ file names every member of that catalog (10 recorded partitions). It reports
 `ok (130 catalogs, 10 recorded partitions)`; `test/census/catalog-exceptions.txt`
 is empty. Its mutation controls: appending a two-arm function on any catalog
 fails it; deleting a member name from a partition test fails it naming the
-member; adding a member to `BinOp` fails it for the three `BinOp` partition
+member; adding a member to `BinOp` fails it for the two `BinOp` partition
 tests until they classify the member.
 
 ## Tests
