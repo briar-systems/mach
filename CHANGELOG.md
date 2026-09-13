@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.0.0] - 2026-09-13
+
 ### Added
 
 - `mach fmt <path> [--check]` rewrites the project source in one canonical layout, or with `--check` reports the files that differ and writes nothing (#3225).
