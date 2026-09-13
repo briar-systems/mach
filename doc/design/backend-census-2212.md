@@ -384,6 +384,22 @@ Which of "immutable ownership" or "a generation stamp" closes item 1 is the
 owner's call named in #2212 ("choose immutable ownership rather than a redundant
 version scheme where sufficient"); section 9 records it as non-mechanical.
 
+Landed 2026-09-12 (section 10 item 5, immutable ownership, no stamp): the
+registry is `mach.lang.target.registry.TargetRegistry`, born by `registry_new`
+(heap, one allocator for the block and every entry) or `registry_init` (in
+place, fixtures), published once by `register_all`, released once by
+`registry_dnit`, which is terminal: a released registry refuses `register_all`
+and `resolve`, so re-initialization under a borrower cannot happen. `Session`
+holds it by pointer and `pcg_worker_init`'s session copy borrows that pointer,
+which closes item 2 by construction and makes item 3 moot. `resolved.Target`
+records `registry`, `resolved.live` refuses a borrow whose registry is released,
+and `isel.run`, `encode.run`, `codegen_unit` and the four link entries run it
+before following a vtable (`backend_target` panics rather than follow a dead
+borrow). Item 4 stands as written: the fixture form is in place because the
+lane-locked `regalloc.mach`/`verify.mach` fixtures hold it, and a copy of an
+in-place registry is still expressible; retiring `registry_init` for
+`registry_new` at every fixture is the follow-up that removes that.
+
 ## 8. Gap tally per ISA
 
 Counts are of distinct sites or site families named in sections 2 to 7.
@@ -455,6 +471,7 @@ owner decision or a proven bar beyond "goldens unchanged".
    the by-value copy at `engine.mach:1181` becomes impossible. #2212 prefers the
    second where sufficient; it is sufficient here. Bar: the fail-at-N allocator
    leak check and a fail-closed test for a target used after `registry_dnit`.
+   Landed 2026-09-12 as the second form; section 7.3 records the shape.
 6. **riscv admission on the codegen path.** `inst.admits` guards only inline
    asm; the MIR path relies on width arithmetic. One admission point, and the
    `has_compressed` claim (`EF_RISCV_RVC`, `c2p0`) removed until an emitter
