@@ -23,7 +23,7 @@ if (cond) {
 An `if`/`or` arm whose condition is exactly `sel P.c` guards the payload place
 `P.c` inside its block:
 
-```mach accept
+```mach
 tag Reply: u8 { empty; value: i64; }
 
 fun read(reply: Reply) i64 {
@@ -44,7 +44,7 @@ untested. See [tag.md](tag.md).
 
 A single condition-loop form. There is no for-each.
 
-```mach run "10"
+```mach
 use std.runtime;
 use print: std.print;
 
@@ -61,7 +61,7 @@ fun main(argc: i64, argv: **u8) i64 {
 
 A `for` with no condition loops until a `brk` or a `ret` leaves it:
 
-```mach run "3"
+```mach
 use std.runtime;
 use print: std.print;
 
@@ -89,7 +89,7 @@ ret;                        # return from a void function
 Loop control: `brk` exits the enclosing `for`; `cnt` continues to the
 next iteration.
 
-```mach run "1 2 4 5 6 7 8"
+```mach
 use std.runtime;
 use print: std.print;
 
@@ -119,7 +119,7 @@ loop that also uses bare `cnt;` for control flow.
 order of declaration. Useful for cleanup that should happen regardless of how
 the scope exits.
 
-```mach run "5 9"
+```mach
 use std.runtime;
 use print: std.print;
 
@@ -166,7 +166,7 @@ whose target loop encloses the fin. A loop fully inside the fin body uses
 `fin` requires a block body (`fin { ... }`). The bare single-statement form
 (`fin stmt;`) is rejected, and so is a `ret` inside a `fin` body:
 
-```mach reject "fin"
+```mach
 fun leave() i64 {
     fin { ret 1; }
     ret 0;
@@ -202,7 +202,7 @@ A function that can fail returns a tag. The caller tests the case with `sel`
 and exits the arm that handles the failure; the exiting chain guards the
 success payload for the rest of the block:
 
-```mach accept
+```mach
 use std.types.result.res;
 use std.types.error.err;
 

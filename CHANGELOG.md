@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `mach fmt <path> [--check]` rewrites the project source in one canonical layout, or with `--check` reports the files that differ and writes nothing (#3225).
 - The formatter re-emits the parsed token stream, so a formatted file keeps its tokens, tree, comments, doc runs and inline assembly, and is a fixed point (#3225).
-- Formatter layout is documented in `doc/cli.md` and has no configuration (#3225).
+- Formatter layout is the one `mach fmt` emits and has no configuration (#3225).
 - The formatter visits only the manifest `project.src`, through held directory capabilities that refuse symlinks and the dependency tree (#3225).
 - Source rewriting goes through the publication boundary on the object that was read, keeping its permission bits (#3225).
 - A malformed file is reported with located diagnostics and left unchanged (#3225).
@@ -71,28 +71,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `test/memory.py` measures compiler peak resident memory and wall time over a cold self-build and three synthetic workload families (many modules, one dense module, a large by-value aggregate) at both profiles and two worker counts, checking every generated executable output and the worker-count image identity (#2299).
 - With a control compiler, `test/memory.py` alternates executions over identical inputs (#2299).
 - The `compiler memory` workflow runs `test/memory.py` on demand, never on the PR lane (#2299).
-- Historical measurements from 2026-09-06 replaced by `test/memory.py` are preserved in `doc/design/2299-archive-inventory.md` (#2299).
+- Historical measurements from 2026-09-06 replaced by `test/memory.py` are preserved on PR #3262 (#2299).
 - `test/memory.py` runs every cell uncached, cache-cold (publishing) and cache-warm, requiring a warm build to restore every module so OS file-cache warmth never counts as reuse (#2299).
-- `test/memory.py` holds the compiler under test to a peak-memory ceiling per workload and profile derived from measured curves in `doc/design/r2-measurements.md`, and fails above it (#2299).
+- `test/memory.py` holds the compiler under test to a peak-memory ceiling per workload and profile derived from measured curves recorded on PR #3302, and fails above it (#2299).
 - Workload child processes run with transparent huge pages disabled and the sampler tracks swap-out to eliminate run-to-run variation that caused a deterministic serial build to read anywhere between 1542 and 1997 MiB (#2299).
 - Host transparent huge page mode, load average and available memory are recorded beside every benchmarked process (#2299).
 - A control compiler that cannot build the checkout takes `--control-checkout` for its own tree (#2299).
 - The self-build memory benchmark runs both serially and at the host CPU count (#2299).
-- `doc/design/r2-measurements.md` records final peak-memory and time curves for many-module, dense-function, large-aggregate, blocks and self-build workloads on dev, uncached and cached, serial and parallel, at both profiles, against the 4.30.0 seed and preserved 2026-09-06 curves (#2299, #3221).
-- `doc/design/r2-measurements.md` records object cache storage and resident bounds measured past the 512 MiB store limit alongside the four re-run scratch-ownership mutation anchors (#2299, #3221).
-- Growth of the debug self-build since 4.30.0 is attributed to #3247 plus two quadratic cliffs (dense liveness sets and the verifier predecessor check in one large function, and DWARF emission in one module of many functions) reported with their causes in `doc/design/r2-measurements.md` (#2299, #3221).
+- PR #3302 records final peak-memory and time curves for many-module, dense-function, large-aggregate, blocks and self-build workloads on dev, uncached and cached, serial and parallel, at both profiles, against the 4.30.0 seed and preserved 2026-09-06 curves (#2299, #3221).
+- PR #3302 records object cache storage and resident bounds measured past the 512 MiB store limit alongside the four re-run scratch-ownership mutation anchors (#2299, #3221).
+- Growth of the debug self-build since 4.30.0 is attributed to #3247 plus two quadratic cliffs (dense liveness sets and the verifier predecessor check in one large function, and DWARF emission in one module of many functions) reported with their causes in PR #3302 (#2299, #3221).
 - Every RISC-V selection refusal names what it refused: the offending letter or token and the selection string for an unknown extension, a noncanonical or duplicated order, an unsupported version, the E base and a trailing separator (#3127).
 - A RISC-V selection refusal names the missing F or D extension when a calling convention needs float registers (#3127).
 - Using a floating-point type on a RISC-V selection without F is refused with a diagnostic naming the missing extension, not only the selection (#3127).
 - Each ISA with a vector unit declares every retained (operation, lane kind, lane width) cell as a packed instruction or the documented scalar expansion, and registration refuses a catalog that leaves a cell undeclared (#3120).
 - A vector operator whose lane shape the catalog does not name is refused with a diagnostic naming the operation, shape, function and target in every `simd` mode, and is never scalarized silently (#3120).
 - `test/vecrows` probes every declared vector row on x86_64, aarch64 and riscv64 against the external decoder and execution (#3120).
-- `doc/migration-v5.md` walks a 4.x project to 5.0: the compiler it needs first, refused manifest keys and spellings with their diagnostics, the `Result`/`Option`/`Void` to `res`/`opt`/`err` translation alongside active guard rules, and std 2.0.0 outcome forms by domain (#3131).
 - `test/doc-examples.py` compiles every language-reference example that carries an expectation (`accept`, `reject`, `warn`, `run`, `test`) against the compiler under test (#3131).
-- `test/doc-agreement.py` holds `doc/cli.md`, `doc/manifest.md`, `mach init` scaffolds and the grammar keyword list to the generated help, the manifest parser and the token table (#3131).
+- `test/doc-agreement.py` holds `doc/language/manifest.md`, the `mach init` scaffolds and the grammar keyword list to the manifest parser, the scaffolds and the token table (#3131).
 
 ### Changed
 
+- `doc/` holds the language reference under `doc/language/` (the manifest reference moved there as `doc/language/manifest.md`, since `mach.toml` is part of the language) and the `mach doc` output; `doc/cli.md` (`mach --help` and `mach help <command>` are the command-line reference), `doc/distribution.md`, `doc/migration-v5.md`, `doc/tooling/` and `doc/design/` are removed, the design records to git history and the agent-report archive (#3112).
+- CONTRIBUTING is rewritten for the 5.0 tree with the `type(#N): description` commit format, and README is refreshed with the 5.0 facts (#3112).
 - A declared `subsystem`, from `--subsystem` or an artifact `subsystem` key, is refused as unsupported on a target whose image format has no such field (ELF, Mach-O, flat image), naming the declaration, target and format rather than being accepted and unread (#3124).
 - An omitted subsystem key remains the console default everywhere (#3124).
 - An artifact that needs the subsystem key on Windows and also targets a Linux or Darwin cell must declare one artifact per format (#3124).
@@ -158,7 +159,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Resolution results are remapped once per operation (#2299).
 - Semantic analysis and lowering computations acquire origin definitions once per phase (#2299).
 - Record and union field graphs are verified once per type projection (#2299).
-- Performance log and benchmark results showing sema dropping from 212 ms to 75 ms and lower from 261 ms to 117 ms on a 43-module artifact are recorded in `doc/design/build-overhead-3218.md` (#2299).
+- Performance log and benchmark results showing sema dropping from 212 ms to 75 ms and lower from 261 ms to 117 ms on a 43-module artifact are recorded on PR #3252 (#2299).
 - Editor analysis returns an owned diagnostic and source snapshot with explicit phase and target selection (#2999).
 - Raw query products enforce checked serial-view lifetimes in editor sessions (#2999).
 - Closing a buffer retires its overlay, source payload, and cached dependents while retaining its `FileId` (#2999).
@@ -170,7 +171,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A literal-shaped `ret` outside `0..255` in a test body is a compile error at the `ret` naming the value, such as `test result 256 is outside the status range 0..255` (#3241).
 - The test dispatcher folds runtime results outside `0..255` to `255` before exiting, ensuring failure reporting with identical status across every host (#3241).
 - In-tree tests that previously accumulated more than eight failure bits now return the ordinal of the first failing check (#3241).
-- The test status range decision is recorded in `doc/design/test-status-range.md` (#3241).
+- The test status range decision is recorded on PR #3297 (#3241).
 - Comments sharing a line with code are no longer taken as the doc run of the declaration on the next line (#3225).
 - Inline code comments never join with comments on following lines into a single doc run (#3225).
 - `#[deprecated]` warnings on dotted type paths split by line comments containing dots use the trivia-skipping path reader to place the warning directly on the identifier at its own line and column rather than inside the comment with a span extending onto the next line (#3129, the #3229 obligation).

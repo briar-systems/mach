@@ -28,7 +28,7 @@ precede it.
 element and re-typed to that element's concrete type per instantiation.
 This is the only way to consume a pack.
 
-```mach run "6 30 0"
+```mach
 use std.runtime;
 use print: std.print;
 
@@ -53,7 +53,7 @@ fun main(argc: i64, argv: **u8) i64 {
 Because each element has its own concrete type at monomorphization, the body
 can handle heterogeneous packs:
 
-```mach run "1257"
+```mach
 use std.runtime;
 use print: std.print;
 
@@ -81,7 +81,7 @@ iterations — each iteration reads where the previous one left off.
 
 `va.len` folds to the instance's element count at compile time.
 
-```mach run "3 0"
+```mach
 use std.runtime;
 use print: std.print;
 
@@ -99,7 +99,7 @@ fun main(argc: i64, argv: **u8) i64 {
 Inside a pack instance, `g(va...)` forwards the whole pack to another
 pack-tailed function, which is monomorphized for the forwarded type-list.
 
-```mach run "6 106"
+```mach
 use std.runtime;
 use print: std.print;
 
@@ -199,7 +199,7 @@ iteration handles one format argument in order, with `$type_of` dispatch
 selecting the right writer per element type. A reduced version of the same
 shape, answering `res[usize, FormatError]` the way std's does:
 
-```mach run "n=7 s=hi"
+```mach
 use std.runtime;
 use std.types.size.usize;
 use std.types.string.str;

@@ -41,7 +41,7 @@ The members above are the whole subtree, and no manifest key adds one. A
 (`` unknown `$mach.*` path ``). A project's own configuration constants are
 ordinary `val`s selected with `$if` over the facts above.
 
-```mach reject "unknown `$mach.*` path"
+```mach
 val TRACING: u64 = $mach.build.TRACING;
 ```
 
@@ -63,7 +63,7 @@ $mach.compiler.version          # live; same value as $mach.version
 
 ### `$mach.project.*` — values from mach.toml (stubs)
 
-```mach reject "`$mach.project.*` is not yet available"
+```mach
 val root: u64 = $mach.project.root;
 ```
 
@@ -75,7 +75,7 @@ val root: u64 = $mach.project.root;
 
 ### `$mach.source.*` — current source position (stubs)
 
-```mach reject "`$mach.source.*` is not yet available"
+```mach
 val line: u64 = $mach.source.line;
 ```
 
@@ -129,7 +129,7 @@ $if ($mach.build.arch == $mach.arch.x86_64) { ... }
 A `$mach.*` read can initialize a runtime binding. The compiler folds the
 RHS at compile time:
 
-```mach accept
+```mach
 use std.types.string.str;
 
 pub val IS_LINUX: u8   = $mach.build.os == $mach.os.linux;

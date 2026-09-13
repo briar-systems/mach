@@ -5,8 +5,8 @@ platforms it targets, the artifacts it produces, the build variants it offers, i
 external link requirements, the build steps that produce them, and its
 dependencies. Every `mach` subcommand takes the project explicitly — a directory
 (whose `mach.toml` is read) or a manifest file directly — so the manifest a build
-uses is never guessed from the working directory. See [cli.md](cli.md) for the
-path argument.
+uses is never guessed from the working directory. `mach help <command>`
+describes the path argument.
 
 The manifest is built from `[category.name]` tables in seven sections —
 `[project]`, `[target.X]`, `[profile.X]`, `[artifact.X]`, `[link.X]`, `[step.X]`,
@@ -21,8 +21,7 @@ error: no mach.toml in the project directory
 ```
 
 Nothing is inferred from the directory layout. `mach init` writes a complete
-manifest so a new project never starts from that error (see
-[cli.md](cli.md#mach-init)).
+manifest so a new project never starts from that error (`mach help init`).
 
 A table you *declare*, you declare completely. Every field of a declared table is
 required; a missing field is a strict-parse error, not a silent default. This is
@@ -52,7 +51,7 @@ error: dep 'std': mach.toml: unknown key 'bogus' in [project]
 
 What a consumer *uses* from a dependency's manifest is its export surface: the
 project id, the module a bare `use <id>;` binds (see
-[language/modules.md](language/modules.md#bare-project-id-imports)), its
+[modules.md](modules.md#bare-project-id-imports)), its
 `export = true` link entries, and the steps those entries demand. A dependency's
 `[profile.*]` and `[target.*]` tables are never read to build the consumer.
 
@@ -450,8 +449,8 @@ fallback was removed in 5.0.0):
 error: mach.toml: several profiles are declared and none is marked `default = true`; no profile is selected by table order: mark exactly one [profile.<name>] with `default = true` or select one with --profile
 ```
 Emission of the human-readable IR and assembly side-artifacts is **not** a profile
-concern — it is controlled only by the `--emit-ir` / `--emit-asm` CLI flags (see
-[cli.md](cli.md)).
+concern — it is controlled only by the `--emit-ir` / `--emit-asm` flags of
+`mach build`.
 
 The `vectorize` lever only ever *subtracts*. The pass it gates runs in the release
 pipeline on targets that report 128-bit vector support (SSE2 on x86-64, NEON on
@@ -460,7 +459,7 @@ independence — element-wise maps behind a runtime alias guard, and associative
 integer reductions. A loop it cannot prove safe stays scalar, and a target without
 hardware vectors (riscv64) never enters the pass, so `vectorize = false` changes
 performance and never semantics. For a single function, the `#[scalar]` decorator is
-the finer-grained opt-out (see [language/decorators.md](language/decorators.md)).
+the finer-grained opt-out (see [decorators.md](decorators.md)).
 
 `float_reassoc` is the one lever here that *adds*, and the only profile key that can
 change a program's computed answer. It widens that same pass to float reductions and
@@ -651,8 +650,7 @@ the way `[link.X]` entries carry `os`/`isa`/`abi` axes: the manifest never
 carries a declaration a build silently ignores.
 
 `--subsystem console|gui` overrides the key for one invocation and is refused
-the same way on a target whose format has no subsystem; see
-[cli.md](cli.md#mach-build).
+the same way on a target whose format has no subsystem (`mach help build`).
 
 ### `icon` / `manifest` — Windows executable resources
 
@@ -802,9 +800,8 @@ and PE `.dll` inputs are recorded using their format's canonical loader name.
 An `@rpath/` Mach-O install name also retains the directory where resolution found
 the dylib, which the executable records as `LC_RPATH`. Darwin frameworks use a
 version-independent system framework path. See
-[cli.md](cli.md#static-vs-dynamic-resolution) for the resolution rules and
-[language/ext-fun.md](language/ext-fun.md#linking-external-objects) for the
-`ext fun` workflow that consumes these inputs.
+[ext-fun.md](ext-fun.md#linking-external-objects) for the `ext fun` workflow
+that consumes these inputs.
 
 ## `[step.<name>]` — build steps
 
@@ -850,7 +847,7 @@ The bound is not part of the step's cache key: changing it does not invalidate
 a cached step, because it cannot change what the step produces.
 
 A source file's `#[embed(...)]` decorator (see
-[decorators.md](language/decorators.md#embedstr--compile-time-file-embedding))
+[decorators.md](decorators.md#embedstr--compile-time-file-embedding))
 is a build input under the same content-based principle, by a different
 mechanism: it has no `[step]` stanza of its own. The embedded file's content
 digest is published into a `Q_EMBED_FILE` query input that the embedding
@@ -1039,11 +1036,10 @@ declares the identity; otherwise agreement among the requirers is taken;
 otherwise the command stops, prints both chains, and names the root
 declaration that would decide (the diagnostic above). A consumed
 dependency's own gitlink records a tested commit, readable without initializing
-that dependency's `dep/`. It is not an automatic compatibility floor. The earlier
-proposal to select the highest same-major release is not accepted for v5.
-[The approved coordinator decision](design/v5-release-contract.md#dependency-selection)
-retains explicit selection for v5. Future compatibility-range selection requires
-a separate decision.
+that dependency's `dep/`. It is not an automatic compatibility floor: a
+tested commit establishes neither an ordering constraint nor permission to
+substitute a later release, so selection is explicit (#3112). A
+compatibility-range selection would be a separate decision.
 
 ### Removed forms
 
@@ -1064,7 +1060,7 @@ Three older forms that 4.30.0 accepted with a migration note were removed in
 - `mach.lock`, refused as above.
 
 Command-line usage (`pull`, `verify`, `add`, `update`, `remove`, `list`) is
-documented in [cli.md](cli.md#mach-dep).
+documented by `mach help dep`.
 
 A dependency's export surface — all a consumer sees — is its source module tree
 (addressed by the dep's id), the module a bare `use <id>;` binds, its
@@ -1519,7 +1515,6 @@ fetching nothing.
 
 ## See also
 
-- [cli.md](cli.md) — the `mach` command-line reference
-- [language/files.md](language/files.md) — file layout and `lib.mach` / `main.mach`
-- [language/modules.md](language/modules.md) — how files map to module paths
-- [language/ext-fun.md](language/ext-fun.md) — linking against external symbols
+- [files.md](files.md) — file layout and `lib.mach` / `main.mach`
+- [modules.md](modules.md) — how files map to module paths
+- [ext-fun.md](ext-fun.md) — linking against external symbols

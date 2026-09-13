@@ -4,11 +4,17 @@
 # stdout, which run.sh diffs against the golden. the producer is the only thing
 # that varies between verification modes; the golden-diff core does not change.
 #
-# CHOOSING ONE. this list says what each producer observes. doc/design/test-observability.md says
-# what running a program structurally CANNOT observe, maps each of those classes to
-# the surface that can, and states which of them needed an integration test at all -
-# most of the historical cases did not. most producers below exist because of one of
-# its entries, so read the two together, and read it first before adding a case.
+# CHOOSING ONE. this list says what each producer observes. running a program
+# structurally CANNOT observe: loader or image layout the program never consults
+# (assert a property over the emitted headers), a self-consistent format error
+# (use a foreign toolchain's artifact or an external oracle), a wrong value that
+# is still a value (carry an independently known answer, never another target's
+# output), a failure the success path swallows (assert the effect, not the
+# return), a leg that never executed (run natively, or keep a two-way known-
+# failures list), and emitted shape where the answer is unchanged (assert what
+# was emitted). most producers below exist because of one of those classes, and
+# an integration case earns its place only when the fact it asserts is owned by
+# something outside this repo; everything else is a unit test.
 #
 # producers:
 #   exec        — run the program, observe its stdout (native / qemu).

@@ -15,7 +15,7 @@ fun NAME(fixed, va: ...) RET { ... }    # variadic pack parameter
 
 ## Examples
 
-```mach accept
+```mach
 rec Pair[T, U] { left: T; right: U; }
 var counter: i64 = 0;
 
@@ -94,7 +94,7 @@ variable number of trailing arguments. The compiler monomorphizes the
 function once per distinct call-site type-list; the pack is consumed by
 `$each a in va` at compile time — there is no runtime `va_list`.
 
-```mach run "60 61"
+```mach
 use std.runtime;
 use print: std.print;
 
