@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.0.4] - 2026-09-13
+
 ### Fixed
 
 - A path dependency copy leaves the source's build output behind, and the realized dependencies and build output of every project nested inside it, so re-pulling a path dependency produces the same copy as the first pull and a symlink under the source's `out/` no longer refuses the copy (#3356).
