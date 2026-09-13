@@ -291,7 +291,7 @@ today, and the 2026-09-06 archive's modules-150 debug serial cell was 52.1
 MiB (CI runner) against 57.9 here and 52.9 for the seed. Wall is linear in
 `modules` (1.57 s at 400) and, at release, in `dense` (1.34 s at 400).
 
-### Two cliffs, reported with their cause (not fixed here)
+### Two cliffs, reported with their cause (addressed below)
 
 **blocks: memory and time quadratic in one function's size.** Peak per
 doubling of N: 2.58x, 3.32x, 3.71x (approaching 4x; 970 MiB for one
@@ -332,6 +332,136 @@ functions of one module. The synthetic profile has `debug = true`; the
 compiler's own profiles do not, which is why the self-build does not show
 it. The fix is one sweep over the offset-sorted symbols and rows per module
 (or a binary search into a function table sorted by offset).
+
+### Cliffs addressed
+
+Branch `fix/2299-cliffs` on dev `278dc07e5` (std `248b6e77a`), 2026-09-12,
+the debug-profile compiler built by the v5 stage (`out/audit/mach`) against
+the same tree built by the dev compiler (`out/base/mach`, the "before"
+column); every cell a fresh process on this host with the other lanes'
+load as given. Every fix is an index or a propagation over the structure
+the scan walked, and none changes an output: corpus layer B goldens on
+x86_64, aarch64 and riscv64 are byte-identical, the compiler's own debug,
+release and release `-g` self-builds by the before and after compilers are
+byte-identical (so the sparse liveness makes the same allocation decisions,
+not fewer spills: no golden moved), the `-g` debuginfo fixture at both
+profiles on the three ISAs is byte-identical, and the x86_64 link leg
+passes its 142 cells.
+
+**1. Dense liveness (`regalloc.extend_liveness`).** The four
+`block_count x vreg_count` matrices are gone; liveness is a backward
+reachability per register over grouped use blocks, definition blocks and
+predecessor edges (`fad388ec5`). The dense equations survive as the test
+oracle for sixteen small graphs.
+
+blocks, peak RSS MiB (wait4) / wall s, jobs 1, uncached, debug:
+
+| N | before | after (sparse liveness only) | after (whole series) |
+|---|---|---|---|
+| 500 | 33.1 / 0.85 | 20.8 / 0.78 | 19.4 / 0.05 |
+| 1000 | 81.9 / 3.31 | 27.8 / 3.00 | 26.2 / 0.09 |
+| 2000 | 262.8 / 12.88 | 41.6 / 11.79 | 41.3 / 0.17 |
+| 4000 | 973.3 / 51.13 | 56.9 / 48.01 (69.4 and 68.7 on repetition, THP `always`) | 70.1 / 0.33 |
+
+The harness's own cells (jobs 1 and 4, off, cold and warm, one
+repetition, `test/out/memory-blocks`) put the largest peak at 18.1 / 24.9
+/ 38.7 / 65.8 MiB debug and 17.9 / 24.3 / 37.2 / 63.0 release at 500 /
+1000 / 2000 / 4000: 1.37x, 1.55x and 1.70x per doubling against 2.58x,
+3.32x and 3.71x, an intercept near the spawner floor and about 13 MiB per
+1000 conditionals. Wall at release: 0.06 / 0.12 / 0.23 / 0.47 s against
+1.59 / 6.48 / 24.77 / 99.49.
+
+**2. Verifier (`verify.check_pred_consistency`).** One successor sweep
+groups the actual edges by target and each block settles its declared
+list against its own group; `check_phi_coverage` had the same
+reset-per-phi shape and settles the same way (`776926442`). A
+declared-only predecessor, which only the declared side of the multiset
+check can see, gains a test.
+
+| workload | before | after |
+|---|---|---|
+| blocks-2000 debug wall (sparse liveness in both) | 11.93 s | 1.24 s |
+
+The remaining 1.24 s was three more quadratic shapes in the same
+function, each addressed at its cause and each output-identical:
+`looprotate` cost a sweep of the function per candidate header
+(confinement of the header's definitions and the in-loop marks are
+indexed once per function, the body walk is bounded to the header's
+strongly connected component, `6262368b8`), `mutate.erase_marked`
+salvaged the dbg_values of each erased instruction by a scan of the
+function (one pass, `7d4370fd8`), `loops.dominates` walked the idom chain
+per query on a dominator tree as deep as the chain (interval numbering,
+`5970ec8de`), and `encode.block_offset` and `mir.lower`'s block lookup
+scanned per branch fixup and per phi predecessor (keyed, `d17b11ac4`).
+
+| blocks-4000 debug wall | 51.13 s (dev) | 4.6 s (verifier fixed) | 1.24 s (looprotate) | 0.43 s (salvage, dominance) | 0.33 s (block keys) |
+|---|---|---|---|---|---|
+
+**3. DWARF (`dwarf.ir_function_at`, `build_line`, `first_row_loc`,
+`gather_vars`).** One `FuncIndex` per module: the text section's function
+symbols by offset (ties by symbol index, the order the stable sort
+produced), a first-per-name mir function table, and the rows, variable
+locations and inline pcs grouped per function in their own order; the
+function holding a pc is a binary search, with the first symbol of an
+offset group for `ir_function_at` and the last for the sized `DwFunc`, as
+the scans answered. The string table carries an open-addressed index and
+the relocation install keys the image's symbols by name once
+(`0d011f987`). The two name lookups left in the profile, codegen's
+`function_defined_get` per emitted symbol and the linker's
+`module_weak_function_ref_is_dead` per debug relocation, go through the
+IR's `fn_by_name` table and a first-defined-per-name map per module
+(`5dd89e7da`). A refused DWARF buffer now fails the section install
+instead of copying a truncated section.
+
+dense at debug (`debug = true`, 16 functions per group), wall s, jobs 1:
+
+| groups (functions) | before | after |
+|---|---|---|
+| 50 (802) | | 0.13 |
+| 150 (2402) | 1.22 | 0.36 |
+| 400 (6402) | 7.25 to 7.34 | 0.97 |
+
+150 to 400 is 2.7x the time for 2.67x the functions (7.8x before). The
+`-g` bytes are identical as stated above.
+
+**4. Store (`store.make_room`).** The store keeps a journal
+(`.mach-store-index`) beside its entries under the lock: an add record
+ahead of every entry write, a remove record behind every unlink, a seal
+with the directory's modification time after each publication. A
+publication reads the journal for the total and the oldest-first order
+and stats only its victims. Every entry write follows its add record and
+every remove record follows its unlink, so an interrupted step can only
+leave the journal listing more than the directory holds, never less: a
+sealed journal whose seal matches the directory's time on arrival (taken
+before the lock's own housekeeping moves it) is taken as is, otherwise
+one listing without stats counts the entries, an equal count settles it,
+and a discrepancy reconciles and rewrites. A missing or malformed journal
+is rebuilt from the directory inventory, a foreign name still refuses the
+directory, and a journal past twice its live entries is compacted
+(`6dbecfba4`). The eviction policy and its tests are unchanged.
+
+Publish build of the compiler's own tree (debug, 280 publications, each
+round a distinct comment in `src/lang/version.mach`), btrfs, the store
+at 6,210 entries and 536,845,552 bytes ("full", evicting on every
+publication) or holding only the previous round ("small"):
+
+| store | before | after |
+|---|---|---|
+| full | 25.9, 26.3, 25.9, 26.3 s | 23.7, 23.9, 23.1, 23.1 s |
+| small | 21.6, 21.7, 21.4, 21.4 s | 20.5, 20.6, 20.4, 20.4 s |
+| full minus small | 4.3 s (1.75 million stats) | 2.7 s |
+
+The store never exceeded its limit in any round (536,845,552 bytes after
+each). Of the remaining 2.7 s, `strace -c` and `perf` put 0.5 s in the
+journal parse (6,210 records per publication through the debug
+compiler) and the rest in the transaction layer's own recovery scan,
+which lists the whole directory on every lock acquisition (`std`,
+`transaction.recover`, ten `getdents64` calls per access at this size);
+that scan is the next cliff and belongs to mach-std.
+
+**Bar.** `blocks` is linear in memory and time, `dense` at debug is
+linear in time, the full-store publication no longer stats the
+directory; the thresholds below carry the new `blocks` ceilings.
 
 ## Storage bounds (#3221)
 
@@ -457,15 +587,18 @@ multiple:
   with more margin.
 - **synthetic families, 1.5x with a 32 MiB minimum**: modules 41 / 88 /
   201 MiB at 50 / 150 / 400, dense 50 / 118 / 279 debug and 48 / 111 / 260
-  release, blocks 47 / 119 / 393 at 500 / 1000 / 2000, and 32 MiB for
-  every cell within a few MiB of the spawner floor (modules-10, dense-10,
-  the aggregate family). The multiple is wider than the self-build's
+  release, and 32 MiB for every cell within a few MiB of the spawner
+  floor (modules-10, dense-10, the aggregate family). The blocks ceilings
+  were 47 / 119 / 393 at 500 / 1000 / 2000 under the dense liveness sets
+  and are from the sparse liveness (above) now: 32 / 37 / 58 / 99 debug
+  and 32 / 36 / 56 / 94 release at 500 / 1000 / 2000 / 4000 for measured
+  peaks of 18.1 / 24.9 / 38.7 / 65.8 and 17.9 / 24.3 / 37.2 / 63.0, and
+  4000 is a default size of the harness. The multiple is wider than the self-build's
   because these peaks are 10 to 200 MiB, where the mapped executable's
   resident share (up to 4 MiB between staging filesystems) and the spawner
   floor are a visible fraction; 1.5x still catches a return of the July
   slope (0.84 against 0.31 MiB/module would be 2.7x at 400 modules) and a
-  doubling of any family. The blocks ceilings describe the dense liveness
-  sets above and come down when they are replaced.
+  doubling of any family.
 - **no wall-time thresholds.** Wall on this host moved up to 20 percent
   with the other lanes' load (the load column is beside every row), and a
   CI runner is a different machine; time is recorded per cell and read

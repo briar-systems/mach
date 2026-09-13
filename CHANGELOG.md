@@ -349,6 +349,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carry a `Result` to their callers, and the `catalog-defaults` census in
   `test/census.sh` covers every catalog under `src/` with an empty
   exception list. (#3124)
+- The target registry is one heap-owned immutable object. `Session` creates
+  it through `target.registry_new` over its own allocator, holds it by
+  pointer and releases it once in `dnit`; the parallel codegen workers' session
+  copies borrow that pointer instead of aliasing an inline registry. A
+  registry is published once by `register_all` and released once by
+  `registry_dnit`, which is terminal: a released registry refuses
+  `register_all` and `resolve`. A resolved target records the registry it was
+  resolved against, and `isel`, the encoder, `codegen_unit` and every link
+  entry refuse a target whose registry has been released as a typed error
+  rather than following a dead vtable. A fail-at-N probe walk over
+  build/publish/resolve/release proves the registry releases everything at
+  every refusal ordinal. (#2212)
+
+- MIR register identities are nominal. `mir.VRegId` and `mir.PRegId` are
+  single-field records, not `def` aliases, so a virtual register cannot be
+  handed where a physical one is meant (or the reverse) and neither indexes a
+  table without naming the unwrap; `MIR_PREG_NIL` joins `MIR_VREG_NIL` so a
+  physical slot never borrows the virtual sentinel. They thread through
+  `MirOperand`, `MirVReg.assigned`, `MirInstr.declassified`, `MirAbiInput.reg`,
+  `abi.ParamSlot.reg` and `ParamPiece.reg`, the lowering context, the
+  allocator and every ISA's operand translation, where `mir.preg_regid` is
+  the one conversion back to an isa regid. A memory operand's index is a tag
+  (`none`, `vreg`, `preg`) in place of `index` plus `index_is_preg`, read under
+  a `sel` guard. Emitted bytes are unchanged on every target. (#2212)
 
 - The compiler builds against std 2.0 (std dev `e204cb81f`) and CI
   bootstraps it through the v5 migration stage (mach `2a2918b23` with std
@@ -438,6 +462,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Editor analysis returns an owned diagnostic/source snapshot with explicit phase and target selection. Raw products have checked serial-view lifetimes. Closing a buffer retires its overlay, source payload and cached dependents while retaining its FileId. Buffer slots are reused, and checked editor teardown preserves owners on preparation failure (#2999).
 
 ### Removed
+
+- `isa.Inst.clobbers`. The field had one writer (`inst_blank`, `= 0`) and no
+  reader; implicit writes come from `asm.Mnemonic.implicit` and the opcode
+  descriptors, so a future reader can no longer inherit a zero-filled effect
+  that reads as "no clobbers" for every instruction. (#2212)
 
 - The `try` production the parser still carried from the withdrawn
   2026-09-08 design. `try` was never a released form; it is an ordinary

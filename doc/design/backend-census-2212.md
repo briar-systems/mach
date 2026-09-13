@@ -138,13 +138,13 @@ Files: `src/lang/target/isa/x64.mach`, `x64/{encode,printer,register,reloc,rules
 | aspect | authoritative site | duplicates / derived | gap |
 |---|---|---|---|
 | opcode set | `x64.mach:54 def Opcode: u16`, `:56-194` 135 constants (`^pub val [A-Z0-9_]*: *Opcode`) | `x64/printer.mach:257 mnemonic_of` (134 arms), `x64/encode.mach:1616 encode_inst_one` (49 arms), `x64/encode.mach:4096 X64_MNEMONICS` (60 rows, asm parser only) | DUP x3 |
-| instruction form / operand shape | none as data; only the 33 per-opcode encoder functions `(mi: *isa.Inst, buf)` in `x64/encode.mach` | range predicates `x64.mach:205 is_fp_opcode`, `x64/encode.mach:362 is_jcc`, `:366 is_setcc`, `:381 is_sse_mov`, `:385 is_sse_alu` depend on hand-assigned contiguity (`SETP/SETNP` already break it, `:367`) | ADM |
+| instruction form / operand shape | `x64.mach` `rec OpDesc { form; shape; arity; mem; cls }` and `describe(op)`, one row per opcode (134 rows, `FORM_NONE` for `ASM_BLOCK` and anything outside the catalog); `Form` is the encoder family with its operand shape stated per constant, `Shape` the role pattern, `arity` the positions taken (closed 2026-09-12, #2212 remainder item 2) | the family predicates `x64/encode.mach is_jcc`, `is_setcc`, `is_alu`, `is_sse_mov`, `is_sse_alu`, `is_cvt` and `x64.is_fp_opcode` read `describe(op).form`; `encode_inst_one` refuses a `FORM_NONE` row and a memory operand on a row without `MEM_OPERAND`/`MEM_ADDR`; census `asm_ct_class:every_notifiable_opcode_has_a_row` fails the build for an opcode without a complete, self-consistent row | ok |
 | instruction value | `isa.Inst` consumed by encoder and printer alike (`x64/printer.mach:45 note_inst(buf, mi: *isa.Inst)`) | none | ok |
 | encoding | 66 `fun encode_*` + 41 `fun emit_*` in `x64/encode.mach`; entry `:2169 encode_x64` → `:2198 encode_function` → `:3981 mir_to_inst` → `:1581 encode_inst` | SSE opcode-byte selection stated 4 ways: `:1431 sse_alu_opcode`+`:1439 sse_alu_prefix`, `:2530 float_alu_opcode`, `:3230 packed_prefix66`+`:3236 packed_opbyte`, `:3425 packed_arith_opcode` | DUP |
 | width ladder | none | `x64/encode.mach:93 size_to_w`, `:3969 effective_width`+`:3974 width_flags`, `:4917 width_flags_for`, `:4250 x64_size_keyword`, `x64/printer.mach:248 size_prefix` (five copies; the last two disagree on the 16-byte row) | DUP |
 | condition codes | none | `x64/encode.mach:346 cc_to_x86`, `:2449 mir_setcc_opcode`, `:3135 float_setcc_opcode`, `:3519 i64_ordering_setcc`, `:3911 fused_jcc_opcode`, `x64/printer.mach:279-300` (six copies) | DUP |
-| flags effect (codegen path) | none; `x64/encode.mach:2458 emit_flag_cmp` / `:2490 encode_compare` / `:3859 encode_cbr` / `:3920 encode_fused_cbr` assume the adjacent CMP set the flags | asm path: `x64/encode.mach:6910 asm_ct_class` (53 opcodes), `:7073 probed_rows` (26 measured rows), `x64/probe.mach:28 run` (26 asm bodies) | ADM (codegen), DUP x3 (asm) |
-| memory effect | none anywhere in the x64 tree (`is_load`/`is_store`/`MIRF_MEMORY`: 0 hits); inferred from `Operand.kind == OPK_MEM` at `x64/encode.mach:113` | asm: `Mnemonic.implicit_mem` on 4 rows (`push/pop/pushfq/popfq`) only | ADM |
+| flags effect (codegen path) | `x64.describe(op).cls` (the `ct.AsmClass` column of the one row); `asm_ct_class(code, flags)` is its reader. every producer/consumer pair the codegen path emits (`emit_flag_cmp` → `encode_compare`/`encode_fused_cbr`, `encode_cbr`, `emit_stack_probe`, `emit_u64_to_fp`, the fp→u64 bound check, `encode_float_cmp` with its parity `setcc`) passes `flags_pair(producer, consumer)` and `flags_kept(between)`, table reads that refuse before the consumer is emitted | asm: `probed_rows` (26 measured rows), `x64/probe.mach run` (26 asm bodies) remain the independent control | ok (codegen), DUP x2 (asm control) |
+| memory effect | `x64.describe(op).mem` (`MEM_OPERAND`, `MEM_ADDR`, `MEM_STACK`, `MEM_STRING` as bits): the direction of an operand access is that position's role from `shape`; `inst_effects` derives `implicit_mem` from `MEM_STACK` and `implicit_addr` from `MEM_STRING`; the mem-mem staging in `encode_inst` reads `MEM_OPERAND`/`FORM_SHIFT`/`SHAPE_SWAP` instead of an opcode list | asm: `Mnemonic.implicit_mem` on 4 rows, pinned to the table's `MEM_STACK` rows by `describe:grammar_implicit_mem_matches_stack_rows` | ok |
 | sub-register aliasing | none as data; width rides `Operand.size` (`x64/encode.mach:108 needs_rex_for_byte_reg`, `:242 emit_prefix_reg`) and the allocator sees one 16-entry GP file (`x64/register.mach:119`) | naming only: `x64.mach:212 reg_name` (64 rows) vs `x64/encode.mach:4166 x64_reg_region` (56 rows) | ADM, DUP |
 | clobbers | `Inst.clobbers` never written (see 1.1); asm: `x64/encode.mach:4900 asm_clobbers` over `Mnemonic.implicit` | — | ADM |
 | latency provenance | codegen: catalog `ct_class` (1.2); asm: `asm_ct_class` | — | ok |
@@ -384,6 +384,22 @@ Which of "immutable ownership" or "a generation stamp" closes item 1 is the
 owner's call named in #2212 ("choose immutable ownership rather than a redundant
 version scheme where sufficient"); section 9 records it as non-mechanical.
 
+Landed 2026-09-12 (section 10 item 5, immutable ownership, no stamp): the
+registry is `mach.lang.target.registry.TargetRegistry`, born by `registry_new`
+(heap, one allocator for the block and every entry) or `registry_init` (in
+place, fixtures), published once by `register_all`, released once by
+`registry_dnit`, which is terminal: a released registry refuses `register_all`
+and `resolve`, so re-initialization under a borrower cannot happen. `Session`
+holds it by pointer and `pcg_worker_init`'s session copy borrows that pointer,
+which closes item 2 by construction and makes item 3 moot. `resolved.Target`
+records `registry`, `resolved.live` refuses a borrow whose registry is released,
+and `isel.run`, `encode.run`, `codegen_unit` and the four link entries run it
+before following a vtable (`backend_target` panics rather than follow a dead
+borrow). Item 4 stands as written: the fixture form is in place because the
+lane-locked `regalloc.mach`/`verify.mach` fixtures hold it, and a copy of an
+in-place registry is still expressible; retiring `registry_init` for
+`registry_new` at every fixture is the follow-up that removes that.
+
 ## 8. Gap tally per ISA
 
 Counts are of distinct sites or site families named in sections 2 to 7.
@@ -433,12 +449,30 @@ owner decision or a proven bar beyond "goldens unchanged".
    word only if `isa.Inst` grows a fourth operand or aarch64 keeps a form byte;
    that is #2212's open question 1 (per-ISA shape vs one generic type) and needs
    the owner's ruling before code.
+   *Landed 2026-09-12 (#2212, "one instruction representation").* Ruled as one
+   generic `isa.Inst` (`src3` from N5). The private record, its 22 form bytes and
+   the `to_inst` translation are gone: `arm64/inst.mach:Form` is one row per
+   `MachOp` (spelling, `Layout`, base word and immediate-form base, `WidthRule`,
+   `LaneClass`, alias flag); `inst.assemble(*isa.Inst)` packs the word from the row
+   and the operands, `inst.spell` renames an encoding to the alias an assembler
+   reads back (the notification carries the spelled form), and `arm64/printer.mach`
+   renders from `isa.Inst` alone. The layout is the old form byte as a row column;
+   `FLAG_SP`, `FLAG_LABEL_LOCAL/FWD/SKIP` carry what the record's `target`/`sym_mod`
+   fields did (the symbol modifier is now `isa.Operand.sym_mod`). Three members
+   were added for encodings that shared a spelling: `FMOV_GEN`, `FMOV_IMM`,
+   `INS_EL`. `inst.form:every_member_has_a_complete_row` is the opcode-space
+   census; an instruction the table cannot hold emits nothing and refuses the
+   buffer (`encode.buf_refuse`, reported at the function boundary).
 2. **Per-opcode description tables where none exist** (ADM rows above):
-   x86_64 form/flags/memory for the codegen path; a riscv `inst.mach` table
+   x86_64 form/flags/memory for the codegen path (landed 2026-09-12:
+   `x64.describe`, section 2); a riscv `inst.mach` table
    (format, opcode7, funct3, funct7, xlen mask, mnemonic, load/store) that
    `rv_fields`, `classify_*`, `shape_of`, `printer.mnemonic` and `RV_MNEMONICS.code`
    all read; an aarch64 base-word table. The #2766 access rows are the template.
    Bar: byte-identical corpus plus `llvm-mc` conformance per #2118's acceptance.
+   *aarch64 landed 2026-09-12* with item 1: the base-word table is the `Form` row,
+   the access rows (`encode.mach:A64Access`) now name members instead of words,
+   and the packer unit tests state their expectations through `inst.assemble`.
 3. **`isa.Inst.clobbers`.** Either delete the field or make every encoder
    populate it and add a reader; leaving a zero-filled effect field for N5 to
    discover is the fail-open shape #2212 forbids. N5 should rule.
@@ -455,6 +489,7 @@ owner decision or a proven bar beyond "goldens unchanged".
    the by-value copy at `engine.mach:1181` becomes impossible. #2212 prefers the
    second where sufficient; it is sufficient here. Bar: the fail-at-N allocator
    leak check and a fail-closed test for a target used after `registry_dnit`.
+   Landed 2026-09-12 as the second form; section 7.3 records the shape.
 6. **riscv admission on the codegen path.** `inst.admits` guards only inline
    asm; the MIR path relies on width arithmetic. One admission point, and the
    `has_compressed` claim (`EF_RISCV_RVC`, `c2p0`) removed until an emitter
@@ -462,6 +497,11 @@ owner decision or a proven bar beyond "goldens unchanged".
 7. **SPIR-V opcode table.** An `OpDef`-shaped row (opcode, arity, result-type)
    for the ~60 `emit_instr` arms, so word counts and the int/float pairing are
    data. Sequenced after N4 so the value ABI is not rebuilt twice.
+   *Landed 2026-09-12.* `spirv/ops.mach`: `CoreOp` (opcode, name, arity; every
+   row typed) and `MirMap` (MIR opcode, emitter shape, int/float opcode, source
+   class). `emit_instr` dispatches by the mapping row; `emit_binary`/`unary`/
+   `compare`/`convert` size the word from the core row and refuse an opcode whose
+   arity is not the shape's. The N4 value ABI is untouched.
 
 ## 11. Frozen interfaces for N3 to N6
 
@@ -549,7 +589,17 @@ link admission any other way without a second capability channel.
   `abi.AggLayout`, `abi.ClassifyFn`/`ArgPassingFn`/`RetPassingFn`
   (`src/lang/target/abi.mach:93-140`) and `abi/spirv.mach` `classify_arg`/
   `classify_return`/`arg_regs`: the contract N4 replaces with a value-oriented
-  one. Register machines keep the `reg: i32` carrier unchanged.
+  one. Register machines keep the `reg: i32` carrier unchanged. Amended
+  2026-09-12 (item 10.4): `ParamSlot.reg` and `ParamPiece.reg` are `mir.PRegId`,
+  the nominal physical register, and `MIR_PREG_NIL` stands where `-1` stood; the
+  constructors (`make_slot`, `make_piece`, `make_slot_pair`, `make_slot_hfa`)
+  still take the isa regid the packs select, so no pack changes, and
+  `mir.preg_regid` is the one way back to the `i32`. Same amendment: the MIR
+  register carriers `mir.VRegId` / `mir.PRegId` (single-field records, not
+  `def` aliases), `mir.MirOperand.index: MirIndex` (a `tag` with `none`, `vreg`
+  and `preg` cases replacing `index` plus `index_is_preg`), `MirVReg.assigned`,
+  `MirInstr.declassified` and `MirAbiInput.reg` typed by them; every ISA reads
+  a physical register through `mir.preg_regid(op.preg)`.
 - `src/lang/be/codegen/mir/abi.mach:45 abi_gp_arg_reg` and `MAX_GP_ARG_REGS`:
   the shared consumer that must stop reading a bank for emitters.
 - `isa.TargetDefs`/`OpDef`/`TypeDef`/`TypeRefuseFn`, `isa.with_defs`,
@@ -572,13 +622,27 @@ link admission any other way without a second capability channel.
   (`isa.mach:283-287`), `asm.Grammar.ct_class: CtClassFn`, `asm.Mnemonic`
   (`writes`, `implicit`, `implicit_mem`), and each ISA's `asm_ct_class(code,
   flags)`: the closed per-instruction effect description inline asm uses.
+  Amended 2026-09-12 (#2212 remainder item 2, x86_64): the x86_64 row behind
+  `asm_ct_class` is `x64.OpDesc { form; shape; arity; mem; cls }` from
+  `x64.describe(op)`; `asm_ct_class` returns its `cls` column and
+  `inst_effects` projects the whole row onto the operands present. The
+  encoder's family predicates and the codegen flags pairing read the same row.
+  `ct.InstEffects` is unchanged: form, shape and memory class are ISA vocabulary
+  and stay on the ISA's row, and the walk keeps reading roles and the implicit
+  sets. A second x86_64 opcode-keyed table is a census failure by construction
+  (`asm_ct_class:every_notifiable_opcode_has_a_row` pins every notifiable opcode
+  to one complete, self-consistent row).
 - `isa.Inst`, `isa.Operand`, `isa.inst_blank`, `regid_make/class/index`: the
   physical-register stream after allocation; the `clobbers` field is frozen as
   **unpopulated** until item 10.3 rules. Amended 2026-09-12 (#3126, accepted as
   additive like N3's): `isa.Inst.src3`, blank by `inst_blank`, because aarch64
   `madd`/`msub` read three registers (Rn, Rm, Ra) and a notification that drops
   the fourth register cannot be walked soundly; no existing reader changes,
-  x86_64 and riscv64 never set it.
+  x86_64 and riscv64 never set it. Amended 2026-09-12 (item 10.3, N5 ruled):
+  `isa.Inst.clobbers` is deleted. Implicit writes come from `asm.Mnemonic.implicit`
+  and the per-opcode `MirOpDescriptor` effect columns; the field had one writer
+  (`inst_blank`, `= 0`) and no reader, so its removal changes no byte and closes
+  the fail-open shape that a future reader would have inherited.
 - `mir.MirInstr.writes_secret`, `memory_flags`, `mir.MirVReg.secret`,
   `mir.MirOperand.required_bank`, `regalloc.verify_rewritten_operands`
   (`regalloc.mach:2322`): the post-rewrite facts N5 validates against.

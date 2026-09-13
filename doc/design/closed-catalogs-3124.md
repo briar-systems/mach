@@ -166,7 +166,7 @@ before it is reached.
 | --- | --- | --- | --- | --- | --- |
 | `x64.Opcode`, `arm64.Opcode`, `riscv.Opcode` | `target/isa/x64.mach:54`, `arm64.mach:82`, `riscv.mach:97` | 135, 31, 18 | internal (selector) | encoder fallthrough `encode.opcode_failure` (above) | internal |
 | `mos6502.Opcode` (deleted) | was `target/isa/mos6502.mach:40` | was 6 | none | the withdrawn MOS 6502 target was deleted under #3226 with its instruction set, ABI, registry rows, OS row and `arch` id 4 (`arch.MOS6502_WITHDRAWN`, carried by no catalog row); `mos6502` as an isa or abi spelling is refused by name at target resolution (`target.WITHDRAWN_MOS6502_MSG`), and the `b-be-7` census no longer lists `ARCH_MOS6502` | removed |
-| `riscv.MachOp` | `target/isa/riscv/inst.mach:4` | 142 | internal (riscv encoder) | `shape_of`, `invert_branch`, `rv_fields`, `rv_amo_funct5`, `required_extensions` and `mnemonic` are `opt` lookups (totality tests walk `MOP_LAST`); `xlens` is a recorded partition; the encoder's notification gate refuses an opcode without a shape | internal |
+| `riscv.MachOp` | `target/isa/riscv/inst.mach:4` | 142 | internal (riscv encoder) | every per-opcode fact is a `ROWS` table read (#2212) answering the blank row outside the catalog; `invert_branch` and `mnemonic` are `opt` lookups | internal |
 | `isa.OperandKind` | `target/isa.mach:48` | 6 | internal (encoder-built `isa.Inst`) | encoders return a zero-length encoding for an operand shape they do not encode and the driver reports the opcode; the constant-time validator refuses an operand kind outside the machine-operand catalog (`ctvalidate.mach` RANGE_OPERAND_KIND_DETAIL) | internal |
 | `isa.SymModifier` | `target/isa.mach:65` | 5 | internal | `riscv/printer.mach` `modifier_text` names every member and answers `opt[str]`; the emitter refuses an absent one | internal |
 | `isa.VecOp`, `isa.VectorForm` | `target/isa.mach:121,151` | 13, 3 | internal; the ISA declares which cells it packs | `isa.mach:1568` registration refuses an ISA that declares neither a packed form nor the scalar expansion for a retained cell; `me/vecform.mach` `vec_op_name` answers `opt[str]` | unsupported (declared per ISA) |
@@ -261,8 +261,10 @@ second slice (#3124, `fix/3124-residual`):
   (`ExprKind`), `coerce.is_value_preserving_binop` and
   `infer.scalar_binop_ct_op` (`BinOp`), `generics.kind_is_public_leaf` and
   `type.float_width_of` (`TypeKind`), `manifest.key_removed` (`TableKind`),
-  `ct.target_provides` (`CtCap`), `x64.encode.is_selected_vector_alu`
-  (`MirOpcode`) and `riscv.inst.xlens` (`MachOp`);
+  `ct.target_provides` (`CtCap`) and `x64.encode.is_selected_vector_alu`
+  (`MirOpcode`); `arm64.encode.neon_3same_refusal` (the one NEON opcode
+  without a size-3 arrangement) is enumerated the same way although its
+  fallthrough is an absence;
 - **name helpers** answer `opt[str]` and every caller names an absent member
   through the policy or a static text naming the catalog: `token.kind_str`,
   `lexer.error_message`, `fuzz.parser.fail_kind_name`,
@@ -270,7 +272,8 @@ second slice (#3124, `fix/3124-residual`):
   `manifest.dep_key_name`, `vecform.vec_op_name`, `verify.describe`, the
   arm64 and riscv `mnemonic` (the `MnemonicFn` hook is `fun(u16) opt[str]` on
   every ISA and the printers refuse by name), `ctvalidate.ct_op_detail`,
-  `mir.lower.secret_ct_op_unsupported`, `riscv.printer.modifier_text`;
+  `mir.lower.secret_ct_op_unsupported`, `riscv.printer.modifier_text`,
+  `arm64.printer.sym_mod_prefix`;
 - **true defaults** are `opt` lookups whose impossible arm the caller reports
   as `unknown <Catalog> tag n`: `grammar.bin_op_from_kind` (a parser ICE),
   `project.map_opt` (`outcome.unknown_catalog` at both callers),
@@ -279,8 +282,9 @@ second slice (#3124, `fix/3124-residual`):
   `eval_float_arith` and `algebraic.simplify_binary` (the folder and the
   simplifier carry `res[bool, fail.Fail]` through `opdesc.unknown_kind`),
   `mir.lower.float_cmp_cc` and the float-op dispatch, `linker.mode_needs_loader`
-  and `mode_allocates_commons`, riscv `shape_of`, `invert_branch`, `rv_fields`,
-  `rv_amo_funct5`, `required_extensions` (totality tests walk `MOP_LAST`),
+  and `mode_allocates_commons`, riscv `invert_branch` (the riscv `shape_of`,
+  `xlens` and `required_extensions` became reads of the `ROWS` table under
+  #2212 and answer the blank row outside the catalog), `spirv.ops.shape_arity`,
   `macho.recover_addend` (a declared kind it recovers no addend for is
   `RelocKind <name> is unsupported by macho x86_64 addend recovery`);
 - the sema `infer_vector_binary` names `BIN_AND`, `BIN_OR` and `BIN_ASSIGN`
@@ -307,12 +311,12 @@ build accepts and is recorded in the CHANGELOG and `doc/manifest.md`.
 
 ## Census
 
-`test/census.sh` `catalog-defaults` derives the catalogs from `src/` (130 at
+`test/census.sh` `catalog-defaults` derives the catalogs from `src/` (136 at
 this commit), fails on any production function that takes one of those types,
 branches on it, and ends in an unconditional literal return, bare or wrapped
 in `opt.some` / `res.ok`, unless a `<fn>:partition_<Catalog>` test in the same
-file names every member of that catalog (10 recorded partitions). It reports
-`ok (130 catalogs, 10 recorded partitions)`; `test/census/catalog-exceptions.txt`
+file names every member of that catalog (9 recorded partitions). It reports
+`ok (136 catalogs, 9 recorded partitions)`; `test/census/catalog-exceptions.txt`
 is empty. Its mutation controls: appending a two-arm function on any catalog
 fails it; deleting a member name from a partition test fails it naming the
 member; adding a member to `BinOp` fails it for the two `BinOp` partition
