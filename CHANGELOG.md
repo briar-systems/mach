@@ -167,6 +167,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `mach fmt` and `mach init` keep the transaction layer's lock sentinel, claims directory and backup container under `out/.mach-txn/<relative path>` instead of beside the sources they rewrite, so a formatted tree gains no `.mach-txn-lock` or `.machtxn.*` entries (#3310).
+- `mach fmt --check` locks nothing and creates no control home, and `mach init` into an absent destination locks through an ephemeral home under the temporary directory so the parent directory receives no sentinel (#3310).
+- `.gitignore` covers `.mach-txn-lock` and `.machtxn.*` against a pre-fix formatter (#3310).
+- `mach doc` publishes each page through the project's control home, so `doc/` and every directory under it gains no `.mach-txn-lock`, claims directory or backup; an `--out` outside the project is rooted as before (#3310).
+- `mach doc` documents only the root project's modules: a dependency's pages and index rows are no longer generated into the consumer's tree (#3321).
+- `mach doc` writes under `doc/` rather than `doc/api/`: the index is `doc/README.md` and each page is `doc/<module path>.md`; `--out <dir>` is unchanged (#3321).
 - The dependency conflict diagnostic's example `[dep.<id>]` table escapes its `git`, `ref` and `path` values as the manifest writer does, so a host path with backslashes reparses as written (#3317).
 - Four unit tests that encoded an x86_64-linux host (a two-target union fixture with no default, an absolute out probed through a host-invalid joined path, and a fixture path written into a scaffolded `mach.toml` unescaped) are host-independent, and the aarch64-linux and x86_64-windows test legs pass again (#3317).
 - Test return values are constrained to a status in `0..255` across test protocols, preventing return codes of 256 or multiples of 256 from being masked as passing exit status 0 on Linux and Darwin (#3241).
