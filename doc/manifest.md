@@ -1039,11 +1039,10 @@ declares the identity; otherwise agreement among the requirers is taken;
 otherwise the command stops, prints both chains, and names the root
 declaration that would decide (the diagnostic above). A consumed
 dependency's own gitlink records a tested commit, readable without initializing
-that dependency's `dep/`. It is not an automatic compatibility floor. The earlier
-proposal to select the highest same-major release is not accepted for v5.
-[The approved coordinator decision](design/v5-release-contract.md#dependency-selection)
-retains explicit selection for v5. Future compatibility-range selection requires
-a separate decision.
+that dependency's `dep/`. It is not an automatic compatibility floor: a
+tested commit establishes neither an ordering constraint nor permission to
+substitute a later release, so selection is explicit (#3112). A
+compatibility-range selection would be a separate decision.
 
 ### Removed forms
 

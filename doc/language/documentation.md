@@ -6,9 +6,11 @@ component block. `mach doc` renders them, and the compiler's docstring lint
 checks the component block of every `pub fun`, `pub rec`, `pub uni`, and `pub tag`
 against the declaration it documents.
 
-A docstring states **what** a declaration is and **how** it is used. Why a
-design is the way it is belongs in `doc/design/`; when something changed
-belongs in the changelog. Documentation never changes generated code.
+A docstring states **what** a declaration is and **how** it is used, and a
+module's docstring states the contract the module holds its callers to. The
+language, command and manifest references under `doc/` say what the user
+sees; when something changed belongs in the changelog. Documentation never
+changes generated code.
 
 ## Grammar
 

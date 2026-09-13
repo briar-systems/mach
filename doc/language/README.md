@@ -99,9 +99,3 @@ in the report. A block may hold several files, each introduced by a line
 with the compiler under test against the pinned `dep/std`, checks the
 expectation, and reports how many fences exist and how many are exercised.
 A fence with no expectation is a fragment and is counted, never compiled.
-
-## Design
-
-- [../design/](../design/) — why the compiler is shaped the way it is: the
-  dependency model, the release shape, the IR operation descriptor,
-  publication, and the closed failure kind

@@ -542,8 +542,8 @@ fun cross(p: Pair, q: Pair) i64 {
 
 ## Tag reflection: `$cases` and `$discriminant_of`
 
-The intrinsics described here implement the accepted Mach v5 tagged value design
-in [the accepted contract](../design/tagged-values.md).
+The intrinsics described here are the reflection half of the tagged-value
+contract in [tag.md](tag.md).
 
 `$cases(T)` produces a comptime sequence of owner-qualified case descriptors for
 a tag type `T`, in declaration order:

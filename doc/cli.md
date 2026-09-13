@@ -232,9 +232,9 @@ The cache is opt-in. A warm hit is about 2.6 times faster than an uncached
 build (about 175 ms against 460 ms on a 42-module project), but publishing costs
 an uncached build 4 to 7 percent and a cell misses as a whole, so an edit and
 rebuild loop would pay the publication on every build and hit on none; the
-default flips when a module's key no longer spans the whole cell
-(`doc/design/object-cache-3221.md`). A build without `--cache` executes no
-cache code.
+default flips when a module's key no longer spans the whole cell, which
+needs stable module identities in the typed products (#3221). A build without
+`--cache` executes no cache code.
 
 `mach build . --no-cache` and `mach test . --no-cache` neither read nor write
 persistent object entries or build-step stamps, and force every declared build
@@ -515,7 +515,7 @@ passed.
 
 The primary artifact is selected as `mach doc` selects it (`--bin`/`--lib`,
 else the sole artifact supporting the target, else `default = true`; several
-with none marked warn in 4.30.0 and are refused in 5.0.0). A selector that
+with none marked are refused). A selector that
 resolves to nothing fails at planning, before anything builds, with the
 selector's own message: `no artifact supports the selected target (bin p1,
 bin p1-windows)`, `no bin named 'nosuch'`, `no profile named 'nosuch'`.

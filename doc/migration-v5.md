@@ -6,9 +6,9 @@ record with a kind beside a union; the manifest and the comptime channel lose
 the keys and paths 4.x accepted and never read; std spells every fallible or
 absent outcome with three tags declared in `std.types.result`, `std.types.option` and `std.types.error`. This page is
 the order of operations for a project that builds with 4.30 today. The
-normative language contract is [design/tagged-values.md](design/tagged-values.md)
-and the reference is [language/](language/README.md); std's own inventory is
-its `MIGRATION.md` at the repository root of `mach-std`.
+language contract for tagged values is [language/tag.md](language/tag.md)
+and the reference index is [language/](language/README.md); std's own
+inventory is its `MIGRATION.md` at the repository root of `mach-std`.
 
 Every example below with an expectation on its fence is compiled by
 `test/doc-examples.py` against the compiler in the tree; see

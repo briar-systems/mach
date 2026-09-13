@@ -4,11 +4,12 @@ A `tag` is a discriminated aggregate value that represents exactly one active
 case at any moment. Each case has a name and either one explicitly typed payload
 or no payload at all.
 
-This page is the language reference for the
-[v5 tagged-value contract](../design/tagged-values.md): declarations with an
+This page is the tagged-value contract (#3217): declarations with an
 explicit discriminator, `Type.case{payload}` construction, `sel` case tests,
 lexical payload guards, the debug-profile discriminator trap, checked layout
-and the reflection intrinsics.
+and the reflection intrinsics. There is no flow-sensitive analysis, no `try`
+expression and no compiler-known failure type: `res`, `opt` and `err` are
+ordinary std tags.
 
 ## Grammar
 
