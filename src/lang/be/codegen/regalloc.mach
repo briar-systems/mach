@@ -47,6 +47,7 @@ rec LiveRange {
     start:        i64;
     end_pos:      i64;
     use_count:    u32;
+    use_weight:   i64;
     reg_class:    u32;
     crosses_call: bool;
 }
@@ -100,6 +101,7 @@ rec AllocCtx {
     block_id_index:       *u32;
     block_id_index_cap:   u32;
     block_spans:          *BlockSpan;
+    block_depth:          *u32;
     vreg_slot_flag:       *bool;
     hints:                *CopyHint;
     anchor_until:         *i64;
@@ -259,6 +261,12 @@ fun alloc_function(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) 
         ret bs;
     }
 
+    val bd: err[fail.Fail] = build_loop_depth(?ctx);
+    if (sel bd.err) {
+        ctx_dnit(?ctx);
+        ret bd;
+    }
+
     build_ranges(?ctx);
 
     val lv: err[fail.Fail] = extend_liveness(?ctx);
@@ -353,6 +361,7 @@ fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.Mir
     ctx.block_id_index       = nil;
     ctx.block_id_index_cap   = 0;
     ctx.block_spans          = nil;
+    ctx.block_depth          = nil;
     ctx.vreg_slot_flag       = nil;
     ctx.hints                = nil;
     ctx.anchor_until         = nil;
@@ -374,6 +383,7 @@ fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.Mir
         ctx.ranges[vi].start        = POS_MAX;
         ctx.ranges[vi].end_pos      = -1;
         ctx.ranges[vi].use_count    = 0;
+        ctx.ranges[vi].use_weight   = 0;
         ctx.ranges[vi].reg_class    = f.vregs[vi].class;
         ctx.ranges[vi].crosses_call = false;
         vi                          = vi + 1;
@@ -569,6 +579,10 @@ fun ctx_dnit(ctx: *AllocCtx) {
     if (ctx.block_spans != nil && ctx.f.block_count > 0) {
         A.deallocate[BlockSpan](ctx.alloc, ctx.block_spans, ctx.f.block_count::usize);
         ctx.block_spans = nil;
+    }
+    if (ctx.block_depth != nil && ctx.f.block_count > 0) {
+        A.deallocate[u32](ctx.alloc, ctx.block_depth, ctx.f.block_count::usize);
+        ctx.block_depth = nil;
     }
     if (ctx.vreg_slot_flag != nil && ctx.f.vreg_count > 0) {
         A.deallocate[bool](ctx.alloc, ctx.vreg_slot_flag, ctx.f.vreg_count::usize);
@@ -908,6 +922,19 @@ fun flat_instr(ctx: *AllocCtx, pos: u32) *mir.MirInstr {
     ret ?ctx.f.blocks[fi.block].instrs[fi.instr];
 }
 
+# a use inside a loop is worth eight times one at the depth outside it, so a
+# value live across a loop and read inside it outranks the short temporaries
+# the loop's guard needs when a register has to be given up
+val LOOP_WEIGHT_SHIFT: u32 = 3;
+val LOOP_DEPTH_MAX:    u32 = 8;
+
+fun use_weight_at(ctx: *AllocCtx, pos: u32) i64 {
+    if (ctx.block_depth == nil) { ret 1; }
+    var depth: u32 = ctx.block_depth[ctx.flat[pos].block];
+    if (depth > LOOP_DEPTH_MAX) { depth = LOOP_DEPTH_MAX; }
+    ret (1::i64) << (depth * LOOP_WEIGHT_SHIFT);
+}
+
 fun touch(ctx: *AllocCtx, v: mir.VRegId, pos: u32) {
     if (v.n >= ctx.f.vreg_count) {
         panic("regalloc: out-of-range vreg id in a MIR operand\n");
@@ -915,7 +942,45 @@ fun touch(ctx: *AllocCtx, v: mir.VRegId, pos: u32) {
     val lr: *LiveRange = ?ctx.ranges[v.n];
     if (pos::i64 < lr.start)   { lr.start = pos::i64; }
     if (pos::i64 > lr.end_pos) { lr.end_pos = pos::i64; }
-    lr.use_count = lr.use_count + 1;
+    lr.use_count  = lr.use_count + 1;
+    lr.use_weight = lr.use_weight + use_weight_at(ctx, pos);
+}
+
+# loop nesting depth per block from the reverse-postorder layout: a
+# predecessor placed at or after its successor closes a loop, and every block
+# between the header and that latch lies inside it
+fun build_loop_depth(ctx: *AllocCtx) err[fail.Fail] {
+    val f: *mir.MirFunction = ctx.f;
+    val n: u32              = f.block_count;
+    if (n == 0) { ret err[fail.Fail].ok{}; }
+
+    val r: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, n::usize);
+    if (sel r.err) { ret err[fail.Fail].err{fail.refused(r.err)}; }
+    ctx.block_depth = r.ok;
+
+    var i: u32 = 0;
+    for (i < n) {
+        ctx.block_depth[i] = 0;
+        i                  = i + 1;
+    }
+    var b: u32 = 0;
+    for (b < n) {
+        val blk: *mir.MirBlock = ?f.blocks[b];
+        var pi:  u32           = 0;
+        for (pi < blk.pred_count) {
+            val p: u32 = block_index_of(ctx, blk.preds[pi]);
+            if (p != RANGE_NIL && p >= b) {
+                var k: u32 = b;
+                for (k <= p) {
+                    ctx.block_depth[k] = ctx.block_depth[k] + 1;
+                    k                  = k + 1;
+                }
+            }
+            pi = pi + 1;
+        }
+        b = b + 1;
+    }
+    ret err[fail.Fail].ok{};
 }
 
 fun build_ranges(ctx: *AllocCtx) {
@@ -2331,9 +2396,12 @@ fun remove_active(ctx: *AllocCtx, v: mir.VRegId) {
     ctx.active_count = write;
 }
 
+# the victim is the active range with the least loop-weighted use, so the
+# value read inside the hottest loop keeps its register; a range's plain
+# density would charge a loop-invariant for the span of the loop it serves
 fun find_spill_victim(ctx: *AllocCtx, reg_class: u32) mir.VRegId {
     var best:         mir.VRegId = mir.MIR_VREG_NIL;
-    var best_density: i64        = POS_MAX;
+    var best_weight:  i64        = POS_MAX;
     var best_crosses: bool       = true;
     var ai:           u32        = 0;
     for (ai < ctx.active_count) {
@@ -2348,19 +2416,15 @@ fun find_spill_victim(ctx: *AllocCtx, reg_class: u32) mir.VRegId {
             cnt;
         }
 
-        val span:    i64 = lr.end_pos - lr.start;
-        var density: i64 = lr.use_count::i64 * 1000;
-        if (span > 0) { density = density / span; }
-
         var better: bool = false;
         if (!lr.crosses_call && best_crosses) {
             better = true;
         }
-        or (lr.crosses_call == best_crosses && density < best_density) {
+        or (lr.crosses_call == best_crosses && lr.use_weight < best_weight) {
             better = true;
         }
         if (better) {
-            best_density = density;
+            best_weight  = lr.use_weight;
             best_crosses = lr.crosses_call;
             best         = mir.vreg_id(v);
         }
