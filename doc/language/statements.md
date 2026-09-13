@@ -20,14 +20,60 @@ if (cond) {
 - A trailing `or { ... }` is the catch-all.
 - Bodies are blocks; there is no one-statement-without-braces form.
 
+An `if`/`or` arm whose condition is exactly `sel P.c` guards the payload place
+`P.c` inside its block:
+
+```mach
+tag Reply: u8 { empty; value: i64; }
+
+fun read(reply: Reply) i64 {
+    if (sel reply.value) {
+        ret reply.value;            # guarded by the arm condition
+    }
+    or {
+        ret 0;                      # reply holds empty on this path
+    }
+}
+```
+
+A guard is a lexical region, not a flow fact. A chain whose every arm exits
+guards the remainder of the enclosing block for the case the chain left
+untested. See [tag.md](tag.md).
+
 ## `for`
 
 A single condition-loop form. There is no for-each.
 
 ```mach
-var i: i64 = 0;
-for (i < 10) {
-    i = i + 1;
+use std.runtime;
+use print: std.print;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var i: i64 = 0;
+    for (i < 10) {
+        i = i + 1;
+    }
+    print.printlnf("{}", i);
+    ret 0;
+}
+```
+
+A `for` with no condition loops until a `brk` or a `ret` leaves it:
+
+```mach
+use std.runtime;
+use print: std.print;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var i: i64 = 0;
+    for {
+        i = i + 1;
+        if (i == 3) { brk; }
+    }
+    print.printlnf("{}", i);
+    ret 0;
 }
 ```
 
@@ -44,10 +90,21 @@ Loop control: `brk` exits the enclosing `for`; `cnt` continues to the
 next iteration.
 
 ```mach
-for (i < 10) {
-    i = i + 1;
-    if (i == 3) { cnt; }
-    if (i == 8) { brk; }
+use std.runtime;
+use print: std.print;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var i: i64 = 0;
+    for (i < 10) {
+        i = i + 1;
+        if (i == 3) { cnt; }
+        print.printf("{}", i);
+        if (i == 8) { brk; }
+        print.print(" ");
+    }
+    print.println("");
+    ret 0;
 }
 ```
 
@@ -63,13 +120,24 @@ order of declaration. Useful for cleanup that should happen regardless of how
 the scope exits.
 
 ```mach
-{
-    fin { counter = counter - 1; }
-    fin { counter = counter * 2; }
+use std.runtime;
+use print: std.print;
 
-    # ... code ...
+var counter: i64 = 0;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    {
+        fin { counter = counter - 1; }
+        fin { counter = counter * 2; }
+
+        counter = 5;
+        print.printf("{} ", counter);
+    }
+    # at block exit, in reverse order: counter * 2 runs first, then counter - 1
+    print.printlnf("{}", counter);
+    ret 0;
 }
-# at block exit, in reverse order: counter * 2 runs first, then counter - 1
 ```
 
 `fin` is block-scoped: it belongs to the block that declares it and covers
@@ -96,7 +164,14 @@ whose target loop encloses the fin. A loop fully inside the fin body uses
 `brk` / `cnt` normally.
 
 `fin` requires a block body (`fin { ... }`). The bare single-statement form
-(`fin stmt;`) is rejected.
+(`fin stmt;`) is rejected, and so is a `ret` inside a `fin` body:
+
+```mach
+fun leave() i64 {
+    fin { ret 1; }
+    ret 0;
+}
+```
 
 ## Block
 
@@ -110,8 +185,48 @@ in order. Blocks can stand alone:
 }
 ```
 
+## Expression statements
+
+An expression followed by a semicolon executes as a statement:
+
+```mach
+compute();
+```
+
+Assignment is an expression (`x = y;` is an expression statement whose top
+operator is `=`), and so is a call whose result is discarded.
+
+## Failure handling
+
+A function that can fail returns a tag. The caller tests the case with `sel`
+and exits the arm that handles the failure; the exiting chain guards the
+success payload for the rest of the block:
+
+```mach
+use std.types.result.res;
+use std.types.error.err;
+
+tag WriteError: u8 { closed; full; }
+
+fun flush() err[WriteError] { ret err[WriteError].ok{}; }
+fun parse(input: u8) res[i64, WriteError] { ret res[i64, WriteError].ok{input::i64}; }
+
+fun increment(input: u8) res[i64, WriteError] {
+    val flushed: err[WriteError] = flush();
+    if (sel flushed.err) { ret res[i64, WriteError].err{flushed.err}; }
+    val r: res[i64, WriteError] = parse(input);
+    if (sel r.err) { ret res[i64, WriteError].err{r.err}; }
+    ret res[i64, WriteError].ok{r.ok + 1};      # r.ok is guarded: the chain above exits
+}
+```
+
+Every reachable path through the failure arm must leave the block, with `ret`,
+or with `brk` or `cnt` targeting a loop that encloses the chain; an arm that
+falls through opens no guard, and the payload read after it is rejected. See
+[tag.md](tag.md) for the guard rules.
+
 ## See also
 
-- [expressions.md](expressions.md) — what goes into the right side of `=`
-  etc.
-- [comptime-control.md](comptime-control.md) — the comptime counterpart
+- [expressions.md](expressions.md) - expressions and literals
+- [tag.md](tag.md) - tagged values, `sel` and guards
+- [comptime-control.md](comptime-control.md) - the comptime counterpart

@@ -19,7 +19,17 @@ nonzero divisor, this applies across the finite operand range, including
 quotients beyond the `i64` range.
 
 ```mach
-val r: f64 = 5.5 % 3.0;      # 2.5
+use std.runtime;
+use print: std.print;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    val r: f64 = 5.5 % 3.0;      # 2.5
+    val s: f64 = -5.5 % 3.0;     # -2.5
+    val t: i64 = -7 % 3;         # -1
+    print.printlnf("{} {} {}", r, s, t);
+    ret 0;
+}
 ```
 
 ## Bitwise
@@ -51,12 +61,15 @@ A pointer-like value — a pointer or a function — may be compared against `ni
 (the null-address literal). On the seeded vector types, a comparison produces a
 same-shape unsigned **mask** vector (lane-wise) — see [SIMD vectors](#simd-vectors).
 
-`==` / `!=` on an **aggregate value** (a `rec` or `uni`) is a compile error.
+`==` / `!=` on an **aggregate value** (a `rec`, `uni`, or whole `tag`) is a compile error.
 Comparing representations would silently relate padding bytes and unwritten union
-variants, so no structural equality is implied; write an explicit field-wise
-comparison. Comparing pointers *to* aggregates is unaffected, and the rejection
-applies to a generic instantiated at an aggregate type as well as to a concrete
-one.
+variants, so no whole-value structural equality is provided. Write an explicit field-wise
+comparison for records. Comparing pointers to aggregates is unaffected, and the rejection
+applies to a generic instantiated at an aggregate type as well as to a concrete one.
+
+For tagged values, `==` and `!=` are rejected entirely: there is no whole-tag
+equality, no payload equality and no ordering. Test which case is active with the
+`sel place.case` expression instead. See [tag.md](tag.md).
 
 ## Logical
 
@@ -86,17 +99,29 @@ positive zero for either zero.
 - `@ptr` — dereference; reads through the pointer.
 
 ```mach
-var x: i64  = 9;
-var p: *i64 = ?x;
-@p = 11;                    # write through
-val v: i64  = @p;           # read through
+use std.runtime;
+use print: std.print;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var x: i64  = 9;
+    var p: *i64 = ?x;
+    @p = 11;                    # write through
+    val v: i64  = @p;           # read through
+    print.printlnf("{}", v);
+    ret 0;
+}
 ```
 
 ```mach
-val b: *i64 = ?g();         # error: cannot take the address of a call result
-val c: *i64 = ?42;          # error: cannot take the address of a literal
-val d: *u64 = ?(x::u64);    # error: cannot take the address of a cast result
-val e: *i64 = ?(x + 1);     # error: cannot take the address of an operator result
+fun g() i64 { ret 1; }
+
+fun addresses(x: i64) {
+    val b: *i64 = ?g();         # error: cannot take the address of a call result
+    val c: *i64 = ?42;          # error: cannot take the address of a literal
+    val d: *u64 = ?(x::u64);    # error: cannot take the address of a cast result
+    val e: *i64 = ?(x + 1);     # error: cannot take the address of an operator result
+}
 ```
 
 Each of those reads, in full, `cannot take the address of a call result: `?`
@@ -109,7 +134,10 @@ Two postfix cast operators, both written `expr OP Type`:
 
 - `expr::Type` — **value conversion**. Resizes integers (sign- or zero-extend,
   truncate), converts between integer and float (a numeric `CVT`), and is the
-  identity on a same-type operand. Value-preserving where representable.
+  identity on a same-type operand. Value-preserving where representable. When
+  either type is nonnumeric, equal sizes are required and the bits are reinterpreted.
+  Constant expressions follow these rules at every nesting depth, including casts
+  through type aliases.
 - `expr:~Type` — **bit reinterpret**. Reads the operand's exact bits as the
   target type with no conversion. Legal only when `Type` has the same byte size
   as the operand's type (a size mismatch is a compile error). The `~` recalls
@@ -119,17 +147,30 @@ The two differ sharply on int<->float. `::` runs a numeric conversion, while
 `:~` reinterprets the raw bit pattern:
 
 ```mach
-val a: u64 = some_i64::u64;     # value conversion (resize)
-val p: *u8 = some_ptr::*u8;     # pointer value, retyped
+use std.runtime;
+use print: std.print;
 
-val n: u64 = 1.5::u64;          # 1                  (float -> int conversion)
-val b: u64 = 1.5:~u64;          # 0x3FF8000000000000 (raw IEEE-754 bits)
-val f: f64 = b:~f64;            # 1.5                (bits read back as a float)
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    val some_i64: i64 = -1;
+    val a: u64 = some_i64::u64;     # value conversion (resize)
+    val p: *u8 = argv::*u8;         # pointer value, retyped
+
+    val n: u64 = 1.5::u64;          # 1                  (float -> int conversion)
+    val b: u64 = 1.5:~u64;          # 0x3FF8000000000000 (raw IEEE-754 bits)
+    val f: f64 = b:~f64;            # 1.5                (bits read back as a float)
+    print.printlnf("{} {:x} {}", n, b, f);
+    ret 0;
+}
 ```
 
 Neither `::` nor `:~` may add or drop the `^` secret qualifier, and neither can
-erase a secret-welded pointer to `ptr`. The only downgrade is the `:>T` strip
-cast. See [secrecy.md](secrecy.md).
+erase a secret-welded pointer to `ptr`. Representation-changing `::` and `:~` casts
+are rejected when either by-value representation contains a tag, including through
+records, arrays, or union variants. Transparent aliases preserve the tag type.
+The only secrecy downgrade is the `:>T` strip cast, which removes outer secrecy
+from `^Tag` without altering the active case or inner payload qualifiers.
+See [secrecy.md](secrecy.md) and [tag.md](tag.md).
 
 ## SIMD vectors
 
@@ -142,17 +183,22 @@ the two differ only in how they are realized.
 | Lane family | `+` `-` | `*` | `/` | `%` | `& \| ^ ~` | `<< >>` | `== != < > <= >=` |
 |---|---|---|---|---|---|---|---|
 | float — `f32x4`, `f64x2` | yes | yes | yes | no | — | no | → same-shape unsigned mask |
-| integer — `i8x16` `i16x8` `i32x4` `i64x2` (+ unsigned) | yes | yes | no | no | yes | no | → same-shape unsigned mask |
+| integer — `i8x16` `i16x8` `i32x4` `i64x2` (+ unsigned) | yes | yes | yes | no | yes | no | → same-shape unsigned mask |
 
 Both operands of a binary operator must be the **same** vector shape: there is no
 implicit scalar↔vector mixing and no cross-shape widening. Anything the table
 marks `no` is a compile error, not a silent fallback:
 
 - no vector `%` on any lane type;
-- no integer vector `/` — division is float lanes only;
 - bitwise `& | ^ ~` require integer lanes; the shifts `<< >>` are not in this
   increment (a per-lane variable shift is AVX2-only on x86_64, with no 8-bit
   packed form).
+
+Integer division uses each lane's signedness and scalar division behavior, including
+truncation toward zero for signed quotients and the scalar behavior for division by
+zero or signed overflow. A secret dividend or divisor is rejected because integer
+division has variable latency. x86_64 and aarch64 realize integer vector division
+as scalar lane operations, as does RISC-V without a vector unit.
 
 ### Legality is target-independent; realization is not
 
@@ -172,7 +218,7 @@ Integer `*` is where this is most visible today:
 | `i64x2 * i64x2` | scalar expansion | scalar expansion (NEON has no `.2d` multiply) | scalar expansion |
 
 A project that cannot afford a scalar expansion sets `simd = "require"` in its
-profile (see [../manifest.md](../manifest.md)), which turns the shortfall into a
+profile (see [manifest.md](manifest.md)), which turns the shortfall into a
 build error naming the operation, its lane width, the function and the target.
 
 A comparison produces the same-shape **unsigned mask** vector — one lane per input

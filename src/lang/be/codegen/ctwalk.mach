@@ -1,0 +1,1064 @@
+use mach.lang.fail;
+use std.format;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+
+use codegen_frame: mach.lang.be.codegen.frame;
+use mach.lang.be.codegen.mir;
+use mach.lang.be.codegen.notes;
+use mach.lang.ct;
+use mach.lang.target.isa;
+
+# the post-expansion secrecy walk (#3126 phase 2 part 4): after allocation,
+# frame insertion, encoding expansion and relaxation, the instruction
+# notification stream of one oblivious function is walked in emission order
+# with register taint keyed by regid, a flags bit where the machine declares
+# a flags class, slot-granular memory taint for frame extents and the inline
+# asm walk's monotone bit for memory with no address. every effect comes from
+# the ISA's closed per-instruction description (ct.InstEffects, built on the
+# same asm_ct_class table inline asm uses); an instruction without a row is
+# refused. block targets make the walk a forward fixpoint over the layout,
+# so a loop-carried secret is seen at the loop head
+
+pub def DescribeFn: fun(*isa.Inst, *ct.InstEffects);
+# absent for an opcode the ISA does not spell, which the render names by tag
+pub def MnemonicFn: fun(u16) opt[str];
+pub def RegNameFn:  fun(i32, u8) str;
+
+# the per-ISA half of the effect description, declared beside the encoder
+pub rec IsaEffects {
+    describe: DescribeFn;
+    mnemonic: MnemonicFn;
+    reg_name: RegNameFn;
+    # general-purpose register indexes that never carry a value: the zero
+    # register, and the stack pointer where it shares an index with it
+    const_regs: u64;
+}
+
+pub fun isa_effects_none() IsaEffects {
+    var e: IsaEffects;
+    e.describe   = nil;
+    e.mnemonic   = nil;
+    e.reg_name   = nil;
+    e.const_regs = 0;
+    ret e;
+}
+
+# a refusal names the notification it stopped at; the detail is allocated
+# with the walk's allocator and released by refusal_free
+pub rec Refusal {
+    index:  u32;
+    detail: str;
+}
+
+pub fun refusal_free(alloc: *A.Allocator, r: *Refusal) {
+    if (r.detail == nil) { ret; }
+    A.deallocate[u8](alloc, r.detail, str_len(r.detail) + 1);
+    r.detail = nil;
+}
+
+rec Extent {
+    base: i32;
+    lo:   i64;
+    hi:   i64;
+}
+
+rec State {
+    reachable: bool;
+    gp:        u64;
+    fp:        u64;
+    flags:     bool;
+    mem:       bool;
+    ext:       *Extent;
+    ext_count: u32;
+    ext_cap:   u32;
+}
+
+rec Entry {
+    index: u32;
+    state: State;
+}
+
+rec Walker {
+    f:     *mir.MirFunction;
+    notes: *notes.AsmNote;
+    count: u32;
+    eff:   *IsaEffects;
+    tgt:   *isa.BackendTarget;
+    alloc: *A.Allocator;
+
+    has_flags:   bool;
+    trust_mul:   bool;
+    trust_shift: bool;
+    callee_gp:   u64;
+    callee_fp:   u64;
+    fp_reg:      i32;
+    sp_reg:      i32;
+    const_regs:  u64;
+
+    # note index of every block label, by block id
+    block_note: *u32;
+    block_cap:  u32;
+    # join targets: block labels and expansion regions a local branch enters
+    entries:     *Entry;
+    entry_count: u32;
+    entry_cap:   u32;
+    # the entry of every note index, NO_NOTE when it is not a join target
+    entry_of: *u32;
+    # regions with a local branch keep taint monotone, like the asm walk
+    monotone: *bool;
+}
+
+val NO_NOTE:    u32 = 0xFFFFFFFF;
+val PASS_BOUND: u32 = 4096;
+
+fun state_bottom() State {
+    var s: State;
+    s.reachable = false;
+    s.gp        = 0;
+    s.fp        = 0;
+    s.flags     = false;
+    s.mem       = false;
+    s.ext       = nil;
+    s.ext_count = 0;
+    s.ext_cap   = 0;
+    ret s;
+}
+
+fun state_free(alloc: *A.Allocator, s: *State) {
+    if (s.ext != nil) { A.deallocate[Extent](alloc, s.ext, s.ext_cap::usize); }
+    s.ext       = nil;
+    s.ext_count = 0;
+    s.ext_cap   = 0;
+}
+
+fun state_clear(s: *State) {
+    s.reachable = false;
+    s.gp        = 0;
+    s.fp        = 0;
+    s.flags     = false;
+    s.mem       = false;
+    s.ext_count = 0;
+}
+
+fun extent_contained(s: *State, base: i32, lo: i64, hi: i64) bool {
+    var i: u32 = 0;
+    for (i < s.ext_count) {
+        val e: *Extent = ?s.ext[i];
+        if (e.base == base && e.lo <= lo && e.hi >= hi) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun extent_tainted(s: *State, base: i32, lo: i64, hi: i64) bool {
+    var i: u32 = 0;
+    for (i < s.ext_count) {
+        val e: *Extent = ?s.ext[i];
+        if (e.base == base && e.lo < hi && lo < e.hi) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun extent_add(alloc: *A.Allocator, s: *State, base: i32, lo: i64, hi: i64) res[bool, fail.Fail] {
+    if (extent_contained(s, base, lo, hi)) { ret res[bool, fail.Fail].ok{false}; }
+    if (s.ext_count >= s.ext_cap) {
+        var cap: u32 = 16;
+        if (s.ext_cap != 0) { cap = s.ext_cap * 2; }
+        if (s.ext == nil) {
+            val ra: res[*Extent, A.Error] = A.allocate[Extent](alloc, cap::usize);
+            if (sel ra.err) { ret res[bool, fail.Fail].err{fail.refused(ra.err)}; }
+            s.ext = ra.ok;
+        }
+        or {
+            val rr: res[*Extent, A.Error] = A.reallocate[Extent](alloc, s.ext, s.ext_cap::usize, cap::usize);
+            if (sel rr.err) { ret res[bool, fail.Fail].err{fail.refused(rr.err)}; }
+            s.ext = rr.ok;
+        }
+        s.ext_cap = cap;
+    }
+    s.ext[s.ext_count].base = base;
+    s.ext[s.ext_count].lo   = lo;
+    s.ext[s.ext_count].hi   = hi;
+    s.ext_count             = s.ext_count + 1;
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# a public store kills the extents it covers whole; a partial overwrite
+# leaves the extent tainted
+fun extent_clear(s: *State, base: i32, lo: i64, hi: i64) {
+    var i: u32 = 0;
+    for (i < s.ext_count) {
+        val e: *Extent = ?s.ext[i];
+        if (e.base == base && lo <= e.lo && e.hi <= hi) {
+            s.ext[i]    = s.ext[s.ext_count - 1];
+            s.ext_count = s.ext_count - 1;
+        }
+        or {
+            i = i + 1;
+        }
+    }
+}
+
+fun state_assign(alloc: *A.Allocator, dst: *State, src: *State) err[fail.Fail] {
+    dst.reachable = src.reachable;
+    dst.gp        = src.gp;
+    dst.fp        = src.fp;
+    dst.flags     = src.flags;
+    dst.mem       = src.mem;
+    dst.ext_count = 0;
+    var i: u32 = 0;
+    for (i < src.ext_count) {
+        val ra: res[bool, fail.Fail] = extent_add(alloc, dst, src.ext[i].base, src.ext[i].lo, src.ext[i].hi);
+        if (sel ra.err) { ret err[fail.Fail].err{ra.err}; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the lattice join; true when dst grew
+fun state_join(alloc: *A.Allocator, dst: *State, src: *State) res[bool, fail.Fail] {
+    if (!src.reachable) { ret res[bool, fail.Fail].ok{false}; }
+    var changed: bool = !dst.reachable;
+    dst.reachable = true;
+    if ((src.gp & ~dst.gp) != 0) { changed = true; }
+    if ((src.fp & ~dst.fp) != 0) { changed = true; }
+    if (src.flags && !dst.flags) { changed = true; }
+    if (src.mem && !dst.mem)     { changed = true; }
+    dst.gp    = dst.gp | src.gp;
+    dst.fp    = dst.fp | src.fp;
+    dst.flags = dst.flags || src.flags;
+    dst.mem   = dst.mem || src.mem;
+    var i: u32 = 0;
+    for (i < src.ext_count) {
+        val ra: res[bool, fail.Fail] = extent_add(alloc, dst, src.ext[i].base, src.ext[i].lo, src.ext[i].hi);
+        if (sel ra.err) { ret ra; }
+        if (ra.ok)      { changed = true; }
+        i = i + 1;
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+fun entry_lookup(w: *Walker, index: u32) *Entry {
+    if (index >= w.count || w.entry_of[index] == NO_NOTE) { ret nil; }
+    ret ?w.entries[w.entry_of[index]];
+}
+
+fun entry_get(w: *Walker, index: u32) res[*Entry, fail.Fail] {
+    if (index >= w.count) { ret res[*Entry, fail.Fail].err{fail.message("ctwalk: join target outside the notification stream")}; }
+    val found: *Entry = entry_lookup(w, index);
+    if (found != nil) { ret res[*Entry, fail.Fail].ok{found}; }
+    if (w.entry_count >= w.entry_cap) {
+        var cap: u32 = 16;
+        if (w.entry_cap != 0) { cap = w.entry_cap * 2; }
+        if (w.entries == nil) {
+            val ra: res[*Entry, A.Error] = A.allocate[Entry](w.alloc, cap::usize);
+            if (sel ra.err) { ret res[*Entry, fail.Fail].err{fail.refused(ra.err)}; }
+            w.entries = ra.ok;
+        }
+        or {
+            val rr: res[*Entry, A.Error] = A.reallocate[Entry](w.alloc, w.entries, w.entry_cap::usize, cap::usize);
+            if (sel rr.err) { ret res[*Entry, fail.Fail].err{fail.refused(rr.err)}; }
+            w.entries = rr.ok;
+        }
+        w.entry_cap = cap;
+    }
+    val e: *Entry = ?w.entries[w.entry_count];
+    e.index           = index;
+    e.state           = state_bottom();
+    w.entry_of[index] = w.entry_count;
+    w.entry_count     = w.entry_count + 1;
+    ret res[*Entry, fail.Fail].ok{e};
+}
+
+fun reg_index_ok(regid: i32) bool {
+    val cls: i32 = isa.regid_class(regid);
+    ret (cls == isa.REG_CLASS_ID_GP || cls == isa.REG_CLASS_ID_XMM) && isa.regid_index(regid) < 64;
+}
+
+fun reg_secret(w: *Walker, s: *State, regid: i32) bool {
+    val idx: i32 = isa.regid_index(regid);
+    if (isa.regid_class(regid) == isa.REG_CLASS_ID_GP) {
+        if ((w.const_regs & ct.reg_bit(idx)) != 0) { ret false; }
+        ret (s.gp & ct.reg_bit(idx)) != 0;
+    }
+    ret (s.fp & ct.reg_bit(idx)) != 0;
+}
+
+fun set_reg(w: *Walker, s: *State, regid: i32, secret: bool, mono: bool) {
+    val idx: i32 = isa.regid_index(regid);
+    val bit: u64 = ct.reg_bit(idx);
+    if (isa.regid_class(regid) == isa.REG_CLASS_ID_GP) {
+        if ((w.const_regs & bit) != 0) { ret; }
+        if (secret)                    { s.gp = s.gp | bit; }
+        or (!mono)                     { s.gp = s.gp & ~bit; }
+        ret;
+    }
+    if (secret) { s.fp = s.fp | bit; }
+    or (!mono)  { s.fp = s.fp & ~bit; }
+}
+
+fun operand_at(mi: *isa.Inst, k: u32) *isa.Operand {
+    if (k == 0) { ret ?mi.dst; }
+    if (k == 1) { ret ?mi.src1; }
+    if (k == 2) { ret ?mi.src2; }
+    ret ?mi.src3;
+}
+
+fun role_reads(role: ct.OperandRole) bool {
+    ret role == ct.ROLE_READ || role == ct.ROLE_RW;
+}
+
+fun role_writes(role: ct.OperandRole) bool {
+    ret role == ct.ROLE_WRITE || role == ct.ROLE_RW;
+}
+
+# a frame extent: a memory operand whose base is the frame or stack pointer
+# with no index. everything else is an address the IR declared public and
+# whose contents the IR declares through the seeds
+fun slot_operand(w: *Walker, op: *isa.Operand) bool {
+    if (op.kind != isa.OPK_MEM) { ret false; }
+    if (op.index >= 0)          { ret false; }
+    ret op.base == w.fp_reg || op.base == w.sp_reg;
+}
+
+fun mem_bytes(mi: *isa.Inst, op: *isa.Operand, e: *ct.InstEffects) i64 {
+    if (e.mem_bytes != 0) { ret e.mem_bytes::i64; }
+    if (op.size != 0)     { ret op.size::i64; }
+    if (mi.size != 0)     { ret mi.size::i64; }
+    ret 16;
+}
+
+fun instr_defines(mi: *mir.MirInstr) bool {
+    if (mi == nil) { ret false; }
+    ret mi.operand_count > 0 && mir.instr_defines_shape(mi);
+}
+
+# the declared secrecy of a register read: a source operand of the MirInstr
+# that was rewritten to this register carries a secret seed
+fun seed_read(seeds: *notes.NoteSeeds, mi: *mir.MirInstr, regid: i32) bool {
+    if (mi == nil) { ret false; }
+    val defines: bool = instr_defines(mi);
+    var k:       u32  = 0;
+    for (k < seeds.count && k < mi.operand_count) {
+        if (!(k == 0 && defines)) {
+            val op: *mir.MirOperand = ?mi.operands[k];
+            if (op.kind == mir.MIR_OP_PREG && mir.preg_regid(op.preg) == regid && seeds.secret[k]) { ret true; }
+        }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# the declared secrecy of a register definition: the MirInstr's destination
+# was rewritten to this register and is a secret seed (or a writes_secret load)
+fun seed_write(seeds: *notes.NoteSeeds, mi: *mir.MirInstr, regid: i32) bool {
+    if (!instr_defines(mi) || seeds.count == 0) { ret false; }
+    val op: *mir.MirOperand = ?mi.operands[0];
+    ret op.kind == mir.MIR_OP_PREG && mir.preg_regid(op.preg) == regid && seeds.secret[0];
+}
+
+fun seed_mem_read(seeds: *notes.NoteSeeds, mi: *mir.MirInstr) bool {
+    if (mi == nil) { ret false; }
+    val defines: bool = instr_defines(mi);
+    var k:       u32  = 0;
+    for (k < seeds.count && k < mi.operand_count) {
+        if (!(k == 0 && defines) && mi.operands[k].kind == mir.MIR_OP_MEM && seeds.secret[k]) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+fun seed_mem_write(seeds: *notes.NoteSeeds, mi: *mir.MirInstr) bool {
+    if (!instr_defines(mi) || seeds.count == 0) { ret false; }
+    ret mi.operands[0].kind == mir.MIR_OP_MEM && seeds.secret[0];
+}
+
+fun clear_vreg_home(w: *Walker, s: *State, v: mir.VRegId) {
+    if (mir.vreg_is_nil(v) || v.n >= w.f.vreg_count) { ret; }
+    val vr: *mir.MirVReg = ?w.f.vregs[v.n];
+    if (!mir.preg_is_nil(vr.assigned)) { set_reg(w, s, mir.preg_regid(vr.assigned), false, false); }
+    if (vr.spill_slot != -1) {
+        var disp: i64 = 0;
+        var size: u32 = 0;
+        if (codegen_frame.slot_extent(?w.f.frame, v.n, ?disp, ?size)) {
+            var base: i32 = w.fp_reg;
+            if (codegen_frame.slots_from_sp(?w.f.frame)) { base = w.sp_reg; }
+            extent_clear(s, base, disp, disp + size::i64);
+        }
+    }
+}
+
+# the declassify barrier: the named carrier is public from here
+fun apply_barrier(w: *Walker, s: *State, n: *notes.AsmNote) {
+    var seeds: notes.NoteSeeds;
+    notes.note_seeds(w.f, n, ?seeds);
+    if (!seeds.barrier || seeds.count == 0) { ret; }
+    val mi: *mir.MirInstr = n.mi;
+    if (mi.operand_count > 0) {
+        val op: *mir.MirOperand = ?mi.operands[0];
+        if (op.kind == mir.MIR_OP_PREG) {
+            set_reg(w, s, mir.preg_regid(op.preg), false, false);
+            ret;
+        }
+        if (op.kind == mir.MIR_OP_MEM) {
+            clear_vreg_home(w, s, op.vreg);
+            ret;
+        }
+        ret;
+    }
+    clear_vreg_home(w, s, seeds.origin[0]);
+}
+
+# the taint at entry: the ABI inputs the function declared secret
+fun initial_state(w: *Walker, s: *State) err[fail.Fail] {
+    state_clear(s);
+    s.reachable = true;
+    val f: *mir.MirFunction = w.f;
+    var i: usize            = 0;
+    for (i < f.abi_input_count) {
+        val in: *mir.MirAbiInput = ?f.abi_inputs[i];
+        if (!in.secret) {
+            i = i + 1;
+            cnt;
+        }
+        if (in.location == mir.ABI_INPUT_REGISTER) {
+            if (reg_index_ok(mir.preg_regid(in.reg))) { set_reg(w, s, mir.preg_regid(in.reg), true, false); }
+        }
+        or (in.location == mir.ABI_INPUT_ARG_STACK && !f.frame.omit) {
+            val lo: i64                  = w.tgt.model.incoming_arg_base + in.offset;
+            val ra: res[bool, fail.Fail] = extent_add(w.alloc, s, w.fp_reg, lo, lo + in.width::i64);
+            if (sel ra.err) { ret err[fail.Fail].err{ra.err}; }
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+rec Step {
+    secret_in:    bool;
+    count_secret: bool;
+    addr_secret:  bool;
+    flags_in:     bool;
+    bad_reg:      bool;
+}
+
+fun read_step(w: *Walker, s: *State, n: *notes.AsmNote, e: *ct.InstEffects, seeds: *notes.NoteSeeds, st: *Step) {
+    st.secret_in    = false;
+    st.count_secret = false;
+    st.addr_secret  = false;
+    st.flags_in     = false;
+    st.bad_reg      = false;
+    val mi: *isa.Inst = ?n.inst;
+    var k:  u32       = 0;
+    for (k < ct.INST_OPERANDS) {
+        val op:   *isa.Operand   = operand_at(mi, k);
+        val role: ct.OperandRole = e.roles[k];
+        if (op.kind == isa.OPK_REG && role != ct.ROLE_NONE) {
+            if (!reg_index_ok(op.reg)) { st.bad_reg = true; }
+            or {
+                val t: bool = reg_secret(w, s, op.reg) || seed_read(seeds, n.mi, op.reg);
+                if (role_reads(role)) {
+                    if (t)                         { st.secret_in = true; }
+                    if (t && k::i8 == e.count_pos) { st.count_secret = true; }
+                }
+            }
+        }
+        if (op.kind == isa.OPK_MEM && role != ct.ROLE_NONE) {
+            var at: bool = false;
+            if (op.base >= 0) {
+                if (!reg_index_ok(op.base))    { st.bad_reg = true; }
+                or (reg_secret(w, s, op.base)) { at = true; }
+            }
+            if (op.index >= 0) {
+                if (!reg_index_ok(op.index))    { st.bad_reg = true; }
+                or (reg_secret(w, s, op.index)) { at = true; }
+            }
+            if (role == ct.ROLE_ADDR) {
+                if (at) { st.secret_in = true; }
+            }
+            or {
+                if (at) { st.addr_secret = true; }
+                if (role_reads(role)) {
+                    var t: bool = seed_mem_read(seeds, n.mi);
+                    if (slot_operand(w, op)) {
+                        val lo: i64 = op.disp::i64;
+                        if (extent_tainted(s, op.base, lo, lo + mem_bytes(mi, op, e))) { t = true; }
+                    }
+                    if (t) { st.secret_in = true; }
+                }
+            }
+        }
+        k = k + 1;
+    }
+    if ((s.gp & e.implicit_reads & ~w.const_regs) != 0) { st.secret_in = true; }
+    if ((s.gp & e.implicit_addr & ~w.const_regs) != 0)  { st.addr_secret = true; }
+    if (e.implicit_mem && s.mem)                        { st.secret_in = true; }
+    if (e.cls.reads_flags && s.flags)                   { st.flags_in = true; }
+}
+
+fun write_step(w: *Walker, s: *State, n: *notes.AsmNote, e: *ct.InstEffects, seeds: *notes.NoteSeeds,
+    st: *Step, mono: bool) err[fail.Fail] {
+    val secret_in: bool      = st.secret_in || st.flags_in;
+    val out:       bool      = secret_in && !e.zero_idiom;
+    val mi:        *isa.Inst = ?n.inst;
+
+    if (e.xfer == ct.XFER_CALL) {
+        # the callee's registers are a boundary: caller-saved taint dies,
+        # flags are whatever the callee left, the result is re-seeded by the
+        # declared secrecy at its first use
+        if (!mono) {
+            s.gp = s.gp & w.callee_gp;
+            s.fp = s.fp & w.callee_fp;
+        }
+        if (w.has_flags) { s.flags = true; }
+    }
+
+    var k: u32 = 0;
+    for (k < ct.INST_OPERANDS) {
+        val op:   *isa.Operand   = operand_at(mi, k);
+        val role: ct.OperandRole = e.roles[k];
+        if (!role_writes(role)) {
+            k = k + 1;
+            cnt;
+        }
+        if (op.kind == isa.OPK_REG) {
+            set_reg(w, s, op.reg, out || seed_write(seeds, n.mi, op.reg), mono);
+        }
+        or (op.kind == isa.OPK_MEM && slot_operand(w, op)) {
+            val lo: i64 = op.disp::i64;
+            val hi: i64 = lo + mem_bytes(mi, op, e);
+            if (out || seed_mem_write(seeds, n.mi)) {
+                val ra: res[bool, fail.Fail] = extent_add(w.alloc, s, op.base, lo, hi);
+                if (sel ra.err) { ret err[fail.Fail].err{ra.err}; }
+            }
+            or (!mono) { extent_clear(s, op.base, lo, hi); }
+        }
+        k = k + 1;
+    }
+    var idx: i32 = 0;
+    for (idx < 64) {
+        if ((e.implicit_writes & ct.reg_bit(idx)) != 0) {
+            set_reg(w, s, isa.regid_make(isa.REG_CLASS_ID_GP, idx), out, mono);
+        }
+        idx = idx + 1;
+    }
+    if (e.implicit_mem && secret_in) { s.mem = true; }
+
+    if (w.has_flags) {
+        if (e.cls.opaque_flags)                         { s.flags = true; }
+        or (e.cls.writes_flags && secret_in)            { s.flags = true; }
+        or (e.cls.defines_flags && !secret_in && !mono) { s.flags = false; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun falls_through(x: ct.Transfer) bool {
+    ret x != ct.XFER_JUMP && x != ct.XFER_RET && x != ct.XFER_TRAP;
+}
+
+fun join_into(w: *Walker, index: u32, s: *State, changed: *bool) err[fail.Fail] {
+    val er: res[*Entry, fail.Fail] = entry_get(w, index);
+    if (sel er.err) { ret err[fail.Fail].err{er.err}; }
+    val jr: res[bool, fail.Fail] = state_join(w.alloc, ?er.ok.state, s);
+    if (sel jr.err) { ret err[fail.Fail].err{jr.err}; }
+    if (jr.ok)      { @changed = true; }
+    ret err[fail.Fail].ok{};
+}
+
+fun join_all_blocks(w: *Walker, s: *State, changed: *bool) err[fail.Fail] {
+    var b: u32 = 0;
+    for (b < w.block_cap) {
+        if (w.block_note[b] != NO_NOTE) {
+            val jr: err[fail.Fail] = join_into(w, w.block_note[b], s, changed);
+            if (sel jr.err) { ret jr; }
+        }
+        b = b + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun make_refusal(alloc: *A.Allocator, index: u32, msg: str) Refusal {
+    var r: Refusal;
+    r.index  = index;
+    r.detail = nil;
+    val rs: res[str, format.FormatError] = format.sprint(alloc, "{}", msg);
+    if (sel rs.ok) { r.detail = rs.ok; }
+    ret r;
+}
+
+fun err_refusal(alloc: *A.Allocator, index: u32, msg: str) res[bool, Refusal] {
+    ret res[bool, Refusal].err{make_refusal(alloc, index, msg)};
+}
+
+fun instr_refusal(w: *Walker, index: u32, n: *notes.AsmNote, what: str) res[bool, Refusal] {
+    var text: [256]u8;
+    val len:  usize = render(w, n, ?text[0], 255);
+    text[len] = 0;
+    var r: Refusal;
+    r.index  = index;
+    r.detail = nil;
+    var rs: res[str, format.FormatError];
+    if (n.inline_site != 0) {
+        rs = format.sprint(w.alloc, "{} at the emitted instruction `{}` (inlined, site {})", what, (?text[0])::str, n.inline_site);
+    }
+    or {
+        rs = format.sprint(w.alloc, "{} at the emitted instruction `{}`", what, (?text[0])::str);
+    }
+    if (sel rs.ok) { r.detail = rs.ok; }
+    ret res[bool, Refusal].err{r};
+}
+
+fun put(dst: *u8, cap: usize, at: *usize, s: str) {
+    if (s == nil) { ret; }
+    var i: usize = 0;
+    for (s[i] != 0 && @at < cap) {
+        dst[@at] = s[i]::u8;
+        @at      = @at + 1;
+        i        = i + 1;
+    }
+}
+
+fun put_i64(dst: *u8, cap: usize, at: *usize, v: i64) {
+    var n: i64 = v;
+    if (n < 0) {
+        put(dst, cap, at, "-");
+        n = 0 - n;
+    }
+    var tmp: [24]u8;
+    var len: usize = 0;
+    if (n == 0) {
+        tmp[0] = '0'::u8;
+        len    = 1;
+    }
+    for (n > 0) {
+        tmp[len] = ('0'::i64 + (n % 10))::u8;
+        n        = n / 10;
+        len      = len + 1;
+    }
+    for (len > 0 && @at < cap) {
+        dst[@at] = tmp[len - 1];
+        @at      = @at + 1;
+        len      = len - 1;
+    }
+}
+
+fun put_reg(w: *Walker, dst: *u8, cap: usize, at: *usize, regid: i32, size: u8) {
+    if (w.eff.reg_name == nil) {
+        put(dst, cap, at, "r");
+        put_i64(dst, cap, at, regid::i64);
+        ret;
+    }
+    put(dst, cap, at, w.eff.reg_name(regid, size));
+}
+
+# the instruction as a diagnostic names it: the ISA's mnemonic and the
+# operands the notification carries, in position order
+fun render(w: *Walker, n: *notes.AsmNote, dst: *u8, cap: usize) usize {
+    var at:      usize     = 0;
+    val mi:      *isa.Inst = ?n.inst;
+    var spelled: opt[str]  = opt[str].none{};
+    if (w.eff.mnemonic != nil) { spelled = w.eff.mnemonic(mi.opcode); }
+    if (sel spelled.some)      { put(dst, cap, ?at, spelled.some); }
+    or {
+        put(dst, cap, ?at, "opcode ");
+        put_i64(dst, cap, ?at, mi.opcode::i64);
+    }
+    var printed: u32 = 0;
+    var k:       u32 = 0;
+    for (k < ct.INST_OPERANDS) {
+        val op: *isa.Operand = operand_at(mi, k);
+        if (op.kind == isa.OPK_NONE) {
+            k = k + 1;
+            cnt;
+        }
+        if (printed == 0) { put(dst, cap, ?at, " "); }
+        or                { put(dst, cap, ?at, ", "); }
+        printed = printed + 1;
+        var size: u8 = op.size;
+        if (size == 0)              { size = mi.size; }
+        if (size == 0)              { size = 8; }
+        if (op.kind == isa.OPK_REG) { put_reg(w, dst, cap, ?at, op.reg, size); }
+        or (op.kind == isa.OPK_IMM) { put_i64(dst, cap, ?at, op.imm); }
+        or (op.kind == isa.OPK_LABEL) {
+            if (op.label != nil) { put(dst, cap, ?at, op.label); }
+            or (isa.label_is_block(op)) {
+                put(dst, cap, ?at, ".");
+                put_i64(dst, cap, ?at, op.imm);
+            }
+            or { put(dst, cap, ?at, "<local>"); }
+        }
+        or (op.kind == isa.OPK_SYM) { put(dst, cap, ?at, "<symbol>"); }
+        or (op.kind == isa.OPK_MEM) {
+            put(dst, cap, ?at, "[");
+            if (op.base >= 0) { put_reg(w, dst, cap, ?at, op.base, 8); }
+            or                { put(dst, cap, ?at, "pc"); }
+            if (op.index >= 0) {
+                put(dst, cap, ?at, " + ");
+                put_reg(w, dst, cap, ?at, op.index, 8);
+                if (op.scale > 1) {
+                    put(dst, cap, ?at, "*");
+                    put_i64(dst, cap, ?at, op.scale::i64);
+                }
+            }
+            if (op.disp != 0) {
+                if (op.disp > 0) {
+                    put(dst, cap, ?at, " + ");
+                    put_i64(dst, cap, ?at, op.disp::i64);
+                }
+                or {
+                    put(dst, cap, ?at, " - ");
+                    put_i64(dst, cap, ?at, 0 - op.disp::i64);
+                }
+            }
+            put(dst, cap, ?at, "]");
+        }
+        k = k + 1;
+    }
+    ret at;
+}
+
+val MSG_DATA:         str = "contains a data directive inside an #[oblivious] function; its payload can encode any instruction, so it cannot be verified constant-time";
+val MSG_BRANCH_FLAGS: str = "branches on a secret value; the condition rides the flags register, which a preceding instruction filled from a secret, so the branch's timing reveals the secret. select branch-free over public data, or `:>T`-declassify when disclosure is intended";
+val MSG_BRANCH_REG:   str = "branches on or transfers control through a secret value; the taken path, hence its timing, reveals the secret. select branch-free over public data, or `:>T`-declassify when disclosure is intended";
+val MSG_ADDRESS:      str = "addresses memory with a secret value; the access pattern reveals the secret through the cache. index with public data, or `:>T`-declassify when disclosure is intended";
+val MSG_VARLAT:       str = "performs a variable-latency operation on a secret value; its latency depends on the operand, so its timing reveals the secret. use a constant-time sequence, or `:>T`-declassify when disclosure is intended";
+val MSG_BAD_REG:      str = "names a register outside the walk's catalog, so its secrecy cannot be decided; the machine program is malformed";
+val MSG_CAP:          str = "uses an instruction whose constant-time class is outside the catalog; it cannot be verified, so it is refused";
+
+fun unknown_refusal(w: *Walker, index: u32, n: *notes.AsmNote) res[bool, Refusal] {
+    var r: Refusal;
+    r.index  = index;
+    r.detail = nil;
+    val rs: res[str, format.FormatError] = format.sprint(w.alloc,
+        "emits an instruction whose effects this compiler does not model (opcode {} on {}); unknown effects are neither public nor constant-time, so it is refused",
+        n.inst.opcode, w.tgt.identity.arch_name);
+    if (sel rs.ok) { r.detail = rs.ok; }
+    ret res[bool, Refusal].err{r};
+}
+
+fun bottom(s: *State) {
+    state_clear(s);
+}
+
+# one pass over the stream. with check false it only grows the join states
+# and reports whether any grew; with check true it refuses at the first
+# violation. taint updates read every source before any destination
+fun pass(w: *Walker, check: bool) res[bool, Refusal] {
+    var state: State = state_bottom();
+    fin { state_free(w.alloc, ?state); }
+    var pending: State = state_bottom();
+    fin { state_free(w.alloc, ?pending); }
+    val ir: err[fail.Fail] = initial_state(w, ?state);
+    if (sel ir.err) { ret err_refusal(w.alloc, 0, fail.describe(ir.err)); }
+
+    var changed:        bool          = false;
+    var pending_active: bool          = false;
+    var region_start:   u32           = 0;
+    var region_mi:      *mir.MirInstr = nil;
+    var in_region:      bool          = false;
+    var last_falls:     bool          = true;
+
+    var i: u32 = 0;
+    for (i < w.count) {
+        val n: *notes.AsmNote = ?w.notes[i];
+        if (n.kind == notes.ASM_NOTE_FUNC) {
+            i = i + 1;
+            cnt;
+        }
+
+        if (n.kind == notes.ASM_NOTE_BLOCK) {
+            val er: res[*Entry, fail.Fail] = entry_get(w, i);
+            if (sel er.err) { ret err_refusal(w.alloc, i, fail.describe(er.err)); }
+            val e: *Entry = er.ok;
+            if (last_falls) {
+                val jr: res[bool, fail.Fail] = state_join(w.alloc, ?e.state, ?state);
+                if (sel jr.err) { ret err_refusal(w.alloc, i, fail.describe(jr.err)); }
+                if (jr.ok)      { changed = true; }
+            }
+            val ar: err[fail.Fail] = state_assign(w.alloc, ?state, ?e.state);
+            if (sel ar.err) { ret err_refusal(w.alloc, i, fail.describe(ar.err)); }
+            last_falls     = true;
+            in_region      = false;
+            pending_active = false;
+            i              = i + 1;
+            cnt;
+        }
+
+        if (n.kind == notes.ASM_NOTE_BYTES) {
+            if (check) { ret err_refusal(w.alloc, i, MSG_DATA); }
+            i = i + 1;
+            cnt;
+        }
+
+        if (n.kind == notes.ASM_NOTE_BARRIER) {
+            apply_barrier(w, ?state, n);
+            i = i + 1;
+            cnt;
+        }
+
+        # an instruction: first of its region when the MirInstr changes
+        if (!in_region || n.mi != region_mi || !last_falls) {
+            region_start   = i;
+            region_mi      = n.mi;
+            in_region      = true;
+            pending_active = false;
+        }
+        # a join target inside the layout: a region entry a local loop
+        # reaches, or the landing point of a resolved forward skip
+        val re: *Entry = entry_lookup(w, i);
+        if (re != nil) {
+            val jr: res[bool, fail.Fail] = state_join(w.alloc, ?state, ?re.state);
+            if (sel jr.err) { ret err_refusal(w.alloc, i, fail.describe(jr.err)); }
+        }
+        val mono: bool = w.monotone[region_start];
+        if (pending_active) {
+            val jr: res[bool, fail.Fail] = state_join(w.alloc, ?state, ?pending);
+            if (sel jr.err) { ret err_refusal(w.alloc, i, fail.describe(jr.err)); }
+        }
+
+        var e: ct.InstEffects;
+        w.eff.describe(?n.inst, ?e);
+        if (!e.cls.known) {
+            if (check) { ret unknown_refusal(w, i, n); }
+            i = i + 1;
+            cnt;
+        }
+        var seeds: notes.NoteSeeds;
+        notes.note_seeds(w.f, n, ?seeds);
+
+        var st: Step;
+        read_step(w, ?state, n, ?e, ?seeds, ?st);
+
+        if (check) {
+            if (st.bad_reg)                                         { ret instr_refusal(w, i, n, MSG_BAD_REG); }
+            if (e.cls.cond_flags && state.flags)                    { ret instr_refusal(w, i, n, MSG_BRANCH_FLAGS); }
+            if (e.cls.cond_reg && (st.secret_in || st.addr_secret)) { ret instr_refusal(w, i, n, MSG_BRANCH_REG); }
+            if (st.addr_secret)                                     { ret instr_refusal(w, i, n, MSG_ADDRESS); }
+            if (e.cls.op != ct.CT_OP_NONE) {
+                val declared: opt[ct.CtCap] = ct.ct_cap(e.cls.op);
+                if (sel declared.none) { ret instr_refusal(w, i, n, MSG_CAP); }
+                if (!ct.target_provides(w.trust_mul, w.trust_shift, declared.some)) {
+                    var offending: bool = st.secret_in || st.flags_in;
+                    if (ct.ct_op_gates_count_only(e.cls.op)) { offending = st.count_secret; }
+                    if (offending)                           { ret instr_refusal(w, i, n, MSG_VARLAT); }
+                }
+            }
+        }
+
+        val wr: err[fail.Fail] = write_step(w, ?state, n, ?e, ?seeds, ?st, mono);
+        if (sel wr.err) { ret err_refusal(w.alloc, i, fail.describe(wr.err)); }
+
+        if (e.xfer != ct.XFER_NONE) {
+            if (e.target == ct.TARGET_BLOCK) {
+                if (e.target_block < w.block_cap && w.block_note[e.target_block] != NO_NOTE) {
+                    val jr: err[fail.Fail] = join_into(w, w.block_note[e.target_block], ?state, ?changed);
+                    if (sel jr.err) { ret err_refusal(w.alloc, i, fail.describe(jr.err)); }
+                }
+                or (e.xfer != ct.XFER_CALL) {
+                    val jr: err[fail.Fail] = join_all_blocks(w, ?state, ?changed);
+                    if (sel jr.err) { ret err_refusal(w.alloc, i, fail.describe(jr.err)); }
+                }
+            }
+            or (e.target == ct.TARGET_LOCAL_FWD) {
+                # a skip ahead: the state at the branch reaches its landing
+                # instruction when the encoder recorded the displacement,
+                # else every later instruction of the expansion
+                val landing: u32 = forward_landing(w, i, e.local_disp);
+                if (landing != NO_NOTE) {
+                    val jr: err[fail.Fail] = join_into(w, landing, ?state, ?changed);
+                    if (sel jr.err) { ret err_refusal(w.alloc, i, fail.describe(jr.err)); }
+                }
+                or {
+                    val pr: res[bool, fail.Fail] = state_join(w.alloc, ?pending, ?state);
+                    if (sel pr.err) { ret err_refusal(w.alloc, i, fail.describe(pr.err)); }
+                    pending_active = true;
+                }
+            }
+            or (e.target == ct.TARGET_LOCAL) {
+                # a loop inside the expansion, or a direction the encoder did
+                # not state: the state reaches the expansion's entry and the
+                # expansion keeps its taint monotone, like the asm walk
+                val jr: err[fail.Fail] = join_into(w, region_start, ?state, ?changed);
+                if (sel jr.err) { ret err_refusal(w.alloc, i, fail.describe(jr.err)); }
+                val pr: res[bool, fail.Fail] = state_join(w.alloc, ?pending, ?state);
+                if (sel pr.err) { ret err_refusal(w.alloc, i, fail.describe(pr.err)); }
+                pending_active = true;
+                if (!w.monotone[region_start]) {
+                    w.monotone[region_start] = true;
+                    changed                  = true;
+                }
+            }
+            or (e.target == ct.TARGET_REGISTER && e.xfer == ct.XFER_JUMP) {
+                val jr: err[fail.Fail] = join_all_blocks(w, ?state, ?changed);
+                if (sel jr.err) { ret err_refusal(w.alloc, i, fail.describe(jr.err)); }
+            }
+        }
+        # a jump to a local target lands inside this expansion: the code
+        # after it stays reachable through the label, so its state flows on
+        last_falls = falls_through(e.xfer)
+            || (e.xfer == ct.XFER_JUMP && (e.target == ct.TARGET_LOCAL || e.target == ct.TARGET_LOCAL_FWD));
+        if (!last_falls) { bottom(?state); }
+        i = i + 1;
+    }
+    ret res[bool, Refusal].ok{changed};
+}
+
+# the note a forward skip lands on: the instruction at the branch's offset
+# plus the displacement, ahead of the branch. NO_NOTE when unrecorded or
+# when no instruction starts there
+fun forward_landing(w: *Walker, at: u32, disp: i32) u32 {
+    if (disp <= 0) { ret NO_NOTE; }
+    val target: u32 = w.notes[at].off + disp::u32;
+    var j:      u32 = at + 1;
+    for (j < w.count) {
+        val n: *notes.AsmNote = ?w.notes[j];
+        if (n.kind == notes.ASM_NOTE_INST) {
+            if (n.off == target) { ret j; }
+            if (n.off > target)  { ret NO_NOTE; }
+        }
+        j = j + 1;
+    }
+    ret NO_NOTE;
+}
+
+fun fill_callee_saved(w: *Walker) {
+    w.callee_gp = 0;
+    w.callee_fp = 0;
+    if (w.tgt.abi.callee_saved == nil) { ret; }
+    var regs: [64]isa.Register;
+    val n:    i32 = w.tgt.abi.callee_saved(?regs[0]);
+    var i:    i32 = 0;
+    for (i < n && i < 64) {
+        val id: i32 = regs[i].id;
+        if (isa.regid_class(id) == isa.REG_CLASS_ID_GP) { w.callee_gp = w.callee_gp | ct.reg_bit(isa.regid_index(id)); }
+        or                                              { w.callee_fp = w.callee_fp | ct.reg_bit(isa.regid_index(id)); }
+        i = i + 1;
+    }
+    # the frame and stack pointers are preserved by every callee
+    w.callee_gp = w.callee_gp | ct.reg_bit(isa.regid_index(w.fp_reg)) | ct.reg_bit(isa.regid_index(w.sp_reg));
+}
+
+fun declares_flags(m: *isa.MachineModel) bool {
+    var i: u32 = 0;
+    for (i < m.reg_class_len) {
+        if (m.reg_classes[i].kind == isa.RC_FLAGS) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun walker_free(w: *Walker) {
+    var i: u32 = 0;
+    for (i < w.entry_count) {
+        state_free(w.alloc, ?w.entries[i].state);
+        i = i + 1;
+    }
+    if (w.entries != nil)    { A.deallocate[Entry](w.alloc, w.entries, w.entry_cap::usize); }
+    if (w.block_note != nil) { A.deallocate[u32](w.alloc, w.block_note, w.block_cap::usize); }
+    if (w.monotone != nil)   { A.deallocate[bool](w.alloc, w.monotone, w.count::usize); }
+    if (w.entry_of != nil)   { A.deallocate[u32](w.alloc, w.entry_of, w.count::usize); }
+}
+
+# validates one oblivious function's notification stream. a non-oblivious
+# function is accepted without a walk; a stream with no effect description
+# is refused, never walked as public
+pub fun walk(f: *mir.MirFunction, ns: *notes.AsmNote, count: u32, eff: *IsaEffects,
+    tgt: *isa.BackendTarget, alloc: *A.Allocator) err[Refusal] {
+    if (f == nil || !f.oblivious) { ret err[Refusal].ok{}; }
+    if (eff == nil || eff.describe == nil || tgt == nil) {
+        ret err[Refusal].err{make_refusal(alloc, 0,
+            "cannot be validated after encoding: the target supplied no per-instruction effect description")};
+    }
+    if (count == 0) { ret err[Refusal].ok{}; }
+
+    var w: Walker;
+    w.f           = f;
+    w.notes       = ns;
+    w.count       = count;
+    w.eff         = eff;
+    w.tgt         = tgt;
+    w.alloc       = alloc;
+    w.has_flags   = declares_flags(?tgt.model);
+    w.trust_mul   = tgt.model.ct_trust_mul;
+    w.trust_shift = tgt.model.ct_trust_var_shift;
+    w.fp_reg      = tgt.model.frame_ptr_reg;
+    w.sp_reg      = tgt.model.stack_ptr_reg;
+    w.const_regs  = eff.const_regs;
+    w.entries     = nil;
+    w.entry_count = 0;
+    w.entry_cap   = 0;
+    w.block_note  = nil;
+    w.block_cap   = 0;
+    w.monotone    = nil;
+    w.entry_of    = nil;
+    fin { walker_free(?w); }
+    fill_callee_saved(?w);
+
+    var max_block: u32 = 0;
+    var i:         u32 = 0;
+    for (i < count) {
+        if (ns[i].kind == notes.ASM_NOTE_BLOCK && ns[i].id + 1 > max_block) { max_block = ns[i].id + 1; }
+        i = i + 1;
+    }
+    if (max_block > 0) {
+        val rb: res[*u32, A.Error] = A.allocate[u32](alloc, max_block::usize);
+        if (sel rb.err) {
+            ret err[Refusal].err{make_refusal(alloc, 0, fail.describe(fail.refused(rb.err)))};
+        }
+        w.block_note = rb.ok;
+        w.block_cap  = max_block;
+        i            = 0;
+        for (i < max_block) {
+            w.block_note[i] = NO_NOTE;
+            i               = i + 1;
+        }
+        i = 0;
+        for (i < count) {
+            if (ns[i].kind == notes.ASM_NOTE_BLOCK) { w.block_note[ns[i].id] = i; }
+            i = i + 1;
+        }
+    }
+    val rm: res[*bool, A.Error] = A.allocate[bool](alloc, count::usize);
+    if (sel rm.err) {
+        ret err[Refusal].err{make_refusal(alloc, 0, fail.describe(fail.refused(rm.err)))};
+    }
+    w.monotone = rm.ok;
+    val re: res[*u32, A.Error] = A.allocate[u32](alloc, count::usize);
+    if (sel re.err) {
+        ret err[Refusal].err{make_refusal(alloc, 0, fail.describe(fail.refused(re.err)))};
+    }
+    w.entry_of = re.ok;
+    i          = 0;
+    for (i < count) {
+        w.monotone[i] = false;
+        w.entry_of[i] = NO_NOTE;
+        i             = i + 1;
+    }
+
+    var rounds:  u32  = 0;
+    var changed: bool = true;
+    for (changed) {
+        if (rounds >= PASS_BOUND) {
+            ret err[Refusal].err{make_refusal(alloc, 0,
+                "cannot be validated after encoding: the taint fixpoint over the emitted stream did not settle")};
+        }
+        rounds = rounds + 1;
+        val pr: res[bool, Refusal] = pass(?w, false);
+        if (sel pr.err) { ret err[Refusal].err{pr.err}; }
+        changed = pr.ok;
+    }
+    val fr: res[bool, Refusal] = pass(?w, true);
+    if (sel fr.err) { ret err[Refusal].err{fr.err}; }
+    ret err[Refusal].ok{};
+}

@@ -1,11 +1,17 @@
 # Mach grammar (EBNF)
 
-A formal grammar for the **implemented** Mach dialect, derived from the
+A formal grammar for the Mach dialect, derived from the
 parser (`src/lang/fe/lexer.mach`, `src/lang/fe/token.mach`, and
 `src/lang/fe/parser/`) and cross-checked against the per-element docs in
 this directory. Where the live parser diverges from a doc, the divergence
 is called out inline. Productions that could not be fully pinned to the
 parser are marked `(* approximate, verify *)`.
+
+The tag productions (`tag-decl`, `tag-literal`, `sel-expr`, the `$cases`
+sequence and the `.[desc]` projection) are the syntax of the tagged-value
+contract; see [tag.md](tag.md) for the semantic restrictions the parser does
+not enforce (guards, places, payload arity). `test/doc-agreement.py` checks the keyword list below against
+the parser's `token.mach`.
 
 This is a reference grammar, not the parser's exact control flow. The
 parser is a hybrid recursive-descent / Pratt climber that is
@@ -49,9 +55,9 @@ token ::= IDENT
         | ERROR    (* emitted for an unexpected character, see below *)
 
 punctuation ::= "(" | ")" | "{" | "}" | "[" | "]"
-              | ";" | ":" | "," | "." | "?" | "@" | "$" | "`"
+              | ";" | ":" | "," | "." | "?" | "@" | "$"
               | "#["    (* attribute-open: "#" immediately followed by "[" *)
-              | "::" | ":~" | ":^" | ":>" | "..."
+              | "::" | ":~" | ":>" | "..."
 
 operator ::= "+" | "-" | "*" | "/" | "%"
            | "&" | "|" | "^" | "~"
@@ -94,12 +100,15 @@ ident-char  ::= ident-start | '0'..'9'
 The reserved keywords (matched as `IDENT` text by the parser) are:
 
 ```
-asm  brk  cnt  def  ext  fin  for  fun  fwd  if
-nil  or   pub  rec  ret  test uni  use  val  var
+asm  brk  cnt  def  each error ext  fin  for  fun
+fwd  if   in   nil  or   pub  rec  ret  sel  tag
+test uni  use  val  var
 ```
 
-`nil` is an expression literal; the rest are statement/declaration/type
-introducers. Note these are *contextual*: nothing in the lexer prevents a
+`nil` is an expression literal and `sel` is a prefix expression operator.
+`each`, `error` and `in` are recognized only in the comptime forms that spell
+them (`$each x in ...`, `$error(...)`; see [Statements](#statements)). The
+rest are statement, declaration, or type introducers. Note these are *contextual*: nothing in the lexer prevents a
 binding or field from being named after one, but the parser will treat the
 keyword in its keyword position. The operand-less statement keywords `brk`
 and `cnt` are keywords only in their bare form (`brk;` / `cnt;`); the same
@@ -199,11 +208,9 @@ none of the token forms above is an **unexpected character**. The lexer
 records a `LEX_ERR_UNEXPECTED_CHAR`, emits a one-byte `ERROR` token
 (`KIND_ERROR`) for it, and continues.
 
-The backtick `` ` `` is a real punctuation token (`KIND_BACKTICK`) but has no
-grammar production: it delimited decorators through v2.3.0 and was removed in
-v2.4.0, so a backtick at decorator position is now a migration error. `#[` is the
-two-byte attribute-open token (`KIND_ATTR_OPEN`) that opens a decorator (see
-[Decorators](#decorators) below).
+The backtick `` ` `` is not a token: it is an unexpected character wherever it
+appears. `#[` is the two-byte attribute-open token (`KIND_ATTR_OPEN`) that
+opens a decorator (see [Decorators](#decorators) below).
 
 
 ## Module
@@ -237,8 +244,8 @@ decorated-decl ::= { decorator } decl
   full list (`symbol`, `library`, `inline`, `noinline`, `align`, `packed`,
   `section`, `oblivious`, `scalar`, `naked`, `embed`, and the shader and
   target-type directives) is in [decorators.md](decorators.md).
-- A backtick form (`` `name(args)` ``) existed through v2.3.0 and was removed in
-  v2.4.0; a backtick at decorator position is a migration error.
+- `#[...]` is the only decorator surface; a backtick is an unexpected
+  character.
 
 
 ## Declarations
@@ -250,6 +257,7 @@ decl ::= comptime-decl
                | fun-decl
                | rec-decl
                | uni-decl
+               | tag-decl
                | bind-decl
                | def-decl
                | test-decl )
@@ -290,6 +298,20 @@ field-block ::= "{" { typed-name ";" } "}"
 `rec` is a struct (sequential layout); `uni` is a raw union (overlapping
 layout). Both may be generic and both share the same field-block grammar.
 
+### `tag` - tagged value
+
+```ebnf
+tag-decl ::= "tag" IDENT [ generic-params ] ":" discriminator "{" { tag-case ";" } "}"
+
+discriminator ::= "u8" | "u16" | "u32" | "u64"
+
+tag-case ::= IDENT [ ":" type ]
+```
+
+`tag` defines a discriminated aggregate value with one active case at any time.
+Each case specifies a name and either one payload type or no payload. The
+discriminator type is mandatory and must be able to number every case.
+
 ### `fun` — function
 
 ```ebnf
@@ -320,9 +342,10 @@ typed-name ::= [ "$" ] IDENT ":" type
   parameters are the fixed arity and a call may pass further arguments, placed by
   the target's C variadic rules (see
   [ext-fun.md](ext-fun.md#c-variadic-imports)). It is accepted only on an `ext`
-  declaration and only after at least one fixed parameter. Anywhere else it is the
-  C-style marker **removed in v2.0.0**, rejected with a migration diagnostic that
-  names both surviving forms. (A function *pointer type* also carries `...`; see
+  declaration and only after at least one fixed parameter. On any other
+  declaration a bare `...` is not a parameter and the parser reports the
+  missing parameter name; a comptime variadic pack is a named parameter
+  (`va: ...`). (A function *pointer type* also carries `...`; see
   `fun-type-params` below.)
 - A leading `$` on a `typed-name` marks it a **comptime value parameter**.
 
@@ -383,12 +406,11 @@ comptime-directive ::= expr-no-assign ";"
 ```
 
 - `comptime-directive` is a bare **comptime intrinsic / directive call**
-  (`$error("msg");`). The legacy attribute-write setter (`$sym.attr = value;`)
-  was removed in v2.0.0 — per-declaration codegen attributes are written as
-  `#[...]` decorators now (see [decorators.md](decorators.md)) — so a stray `=`
-  after the target is a parse error. The target is parsed at a binding power
-  above assignment so that `=` is detected rather than swallowed into the
-  expression.
+  (`$error("msg");`). Per-declaration codegen attributes are written as
+  `#[...]` decorators (see [decorators.md](decorators.md)); a directive takes
+  no `=`, so a stray one after the target is a parse error at the directive's
+  `;`. The target is parsed at a binding power above assignment so that `=`
+  is never swallowed into the expression.
 - `expr-no-assign` is `expr` parsed with the assignment operator excluded
   at the top level (binding power >= 2; see [Expressions](#expressions)). It
   still begins with the leading `$` because the first prefix atom is a
@@ -467,10 +489,11 @@ Notes:
 - Anonymous inline `rec {...}` / `uni {...}` types use a field block whose
   entries do **not** accept the leading `$` comptime marker.
 
-There is **no `?T` option-type sugar and no Result sugar in the grammar.**
-`?` is exclusively the prefix address-of operator (below). `Option` and
-`Result` are ordinary stdlib generic types written `Option[T]` /
-`Result[T, E]`.
+There is **no `?T` option-type sugar and no special Result keyword sugar in the grammar.**
+`?` is exclusively the prefix address-of operator (below). The std failure tags
+`res[T, E]`, `opt[T]`, and `err[E]` are ordinary `named-type` generic
+instantiations of declarations imported from `std.types.result`, `std.types.option` and `std.types.error`; the parser
+and the compiler know nothing of the three names.
 
 
 ## Expressions
@@ -492,9 +515,13 @@ prefix ::= LIT_INT | LIT_FLOAT | LIT_CHAR | LIT_STR
          | IDENT
          | comptime-ident
          | typed-literal
+         | tag-literal
          | array-literal
+         | sel-expr
          | unary-op prefix { postfix }
          | "(" expr ")"
+
+sel-expr ::= "sel" prefix { postfix }
 
 comptime-ident ::= "$" IDENT
 
@@ -507,6 +534,10 @@ unary-op ::= "-"      (* numeric negation *)
 
 - A unary operator binds its operand as `prefix` followed by any postfix
   chain, so `@p.field` and `?arr[i]` apply member/index *inside* the unary.
+- `sel` binds the same way and requires the result to be a member access or
+  a descriptor projection (`sel r.ok`, `sel v.[c]`), so `sel r.ok && r.ok > 3`
+  parses as `(sel r.ok) && (r.ok > 3)`; any other operand is a parse error
+  (`` `sel` tests one case of a place: write `sel place.case` or `sel place.[case]` ``).
 - `(expr)` is a plain grouping; there is no tuple form.
 
 ### Postfix
@@ -527,7 +558,6 @@ member       ::= "." IDENT
 project      ::= "." "[" expr "]"          (* v.[f]: comptime field projection *)
 cast         ::= ( "::" | ":~" ) type
               | ":>" type                  (* secret-qualifier strip cast *)
-              | ":^" [ named-type ]        (* deprecated strip spellings *)
 ```
 
 `::` is a value conversion and `:~` a same-size bit reinterpret; see
@@ -537,10 +567,9 @@ operand's type, producing a new public value (#1643, [secrecy.md](secrecy.md)).
 Its target type is required and names the operand's stripped public type; a bare
 `:>` is a parse error, and `:>` never reinterprets storage.
 
-The deprecated spellings `:^` and `:^Type` produce the same node and are
-accepted through 4.30.0, rejected in 5.0.0. A bare `:^` needs no target, and a
-non-`named-type` lead (`*`, `[`, ...) after `:^` leaves a bare strip so it still
-binds as a multiply/index on the stripped value. All bind as postfix.
+`:^` is not a token: `x:^u32` lexes as `x`, `:`, `^`, `u32`, the postfix
+chain stops at the colon, and the enclosing statement reports its own
+terminator error there. All casts bind as postfix.
 
 Disambiguating a postfix `[`: the bracket may open a generic argument list
 (`callee[T, U](args)`, or `f[T]` naming an instance as a value) or be an index
@@ -549,7 +578,7 @@ grammars overlap — a bare name is both a type and a value — so the parser ca
 decide locally. It probes the payload against both grammars, and the same four
 outcomes apply whether or not a `(` follows the `]`:
 - reads cleanly **only** as a type list (`*T`, `[N]T`, a comma list, or a
-  nested generic like `Result[bool, str]`) → generic arguments;
+  nested generic like `res[bool, ParseError]`) → generic arguments;
 - reads cleanly **only** as an expression (`i + 1`, `f(x)`, a literal) → an
   index, so `table[0]()` and `table[i + 1]()` are index-then-call;
 - reads cleanly as **both** (a bare identifier, a dotted path, a generic
@@ -572,18 +601,28 @@ outcomes apply whether or not a `(` follows the `]`:
 ### Literals with a type prefix
 
 ```ebnf
-typed-literal ::= named-type "{" [ field-init { "," field-init } [ "," ] ] "}"
+typed-literal ::= named-type "{" [ member-init { "," member-init } [ "," ] ] "}"
+tag-literal   ::= named-type ( "." IDENT | "." "[" expr "]" ) "{" [ expr ] "}"
 array-literal ::= array-type "{" [ expr { "," expr } [ "," ] ] "}"
 
-field-init ::= IDENT ":" expr
+member-init ::= IDENT ":" expr | expr
 ```
 
-- `typed-literal` is a record/union (struct) literal: a named type
-  (optionally generic) followed by a brace-delimited list of `field: value`
-  initializers (`Point{ x: 1, y: 2 }`, `Pair[i64, u8]{ left: 5, right: 6u8 }`).
-  The parser commits to this form via a lookahead
-  (`Name (.Name)* ([...])? {`).
-- `array-literal` is `[N]T{ e0, e1, ... }` — an array type followed by a
+- `typed-literal` is a record or union literal: a named type (optionally
+  generic) followed by a brace-delimited initializer list, where each member is a
+  `field: value` pair (`Point{ x: 1, y: 2 }`, `Pair[i64, u8]{ left: 5, right: 6u8 }`).
+  Numeric vector types use positional expressions, as in `f32x4{1.0, 2.0, 3.0, 4.0}`.
+- `tag-literal` names the type, the case and the payload (`Reply.value{42}`,
+  `Reply.empty{}`, `res[i64, E].ok{42}`). The payload is positional and exactly
+  one; a payloadless case takes empty braces. The descriptor form `T.[case]{...}`
+  names the case through a comptime case descriptor bound by `$each` and obeys
+  the same single-case rule after specialization. The parser commits to a
+  literal via a lookahead (`Name (.Name)* ([...])? (.Name | .[...])? {`); where
+  the head reads as `A.b` the resolver decides whether `b` is a case name or the
+  final segment of a type path. The parser accepts named, positional and bare
+  initializers in every literal; sema enforces that a tag literal carries at
+  most one positional payload and a record literal names its fields.
+- `array-literal` is `[N]T{ e0, e1, ... }`, an array type followed by a
   brace-delimited positional element list.
 
 ### Operator precedence
@@ -665,8 +704,8 @@ comptime-each-stmt ::= "$" "each" IDENT "in" expr stmt-branch-body
 ```
 
 `$each` is a compile-time unroll: the body is duplicated once per element of
-the sequence, which must be `$fields(T)`, a variadic pack identifier, or a
-comptime-constant array `val` (see
+the sequence, which must be `$fields(T)`, `$cases(T)`, a variadic pack
+identifier, or a comptime-constant array `val` (see
 [comptime-intrinsics.md](comptime-intrinsics.md)). `in` is a contextual keyword.
 
 Notes:
@@ -719,17 +758,19 @@ mach-read      ::= comptime-ident { member }        (* $mach.build.os, $mach.arc
 ```
 
 - Intrinsic calls (`$size_of(T)`, `$length_of(T)`, `$align_of(T)`,
-  `$offset_of(T, field)`, `$type_of(e)`, `$fields(T)`, `$is_record(T)`,
+  `$offset_of(T, field)`, `$type_of(e)`, `$fields(T)`, `$cases(T)`,
+  `$discriminant_of(T)`, `$is_tag(T)`, `$is_record(T)`,
   `$is_union(T)`, `$is_pointer(T)`, `$is_secret(T)`, `$type_name(T)`,
   `$error("msg")`) are syntactically a `comptime-ident` callee with `call-args`.
 - The **type-taking** intrinsics — `$size_of`, `$length_of`, `$align_of`,
-  `$offset_of`, `$fields`, and the four predicates with `$type_name` — parse their
+  `$offset_of`, `$fields`, `$cases`, `$discriminant_of`, and the five predicates
+  with `$type_name` — parse their
   **first argument with the `type` production**, not the
   expression grammar, so the whole type language is spellable there:
   `$fields(Box[T])`, `$size_of(Pair[A, B])`, `$size_of(*T)`, `$size_of([4]u16)`,
   `$size_of(^u32)`, `$fields(mod.Rec)`. Every other argument is an ordinary
   expression; `$offset_of`'s second is a bare field name resolved against the
-  record. `$type_of(e)` takes a value expression and produces a comptime type
+  record or tag payload case. `$type_of(e)` takes a value expression and produces a comptime type
   value.
 - A **type comparison** operand (`$type_of(x) == Name`) is the one type spelling
   read with the expression grammar, because the comparison is only recognizable
@@ -758,30 +799,30 @@ disambiguated from a regular member access `v.name` by the `[` lookahead:
 Productions verified directly against the parser source:
 
 - **Lexical grammar** — `lexer.mach` / `token.mach`: token set (incl.
-  `KIND_BACKTICK` and `KIND_ATTR_OPEN`), operator maximal-munch,
+  `KIND_ATTR_OPEN`), operator maximal-munch,
   number/char/string scanning and escapes, comment and whitespace handling
   (incl. the `#[` attribute-open exception), the "keywords are `IDENT`s" model.
 - **Precedence ladder** — `token.infix_precedence` / `token.is_right_assoc`
   (the table is a direct transcription; only `=` is right-associative).
-- **Decorators** — `parser/decl.mach` `parse_decorators` / `parse_one_decorator`:
-  leading `#[name(args)]` clauses (one Decorator node); a backtick at decorator
-  position is rejected as the removed surface (v2.4.0), closed directive set.
-- **Declarations** — `parser/decl.mach`: `use`, `fwd` (incl. `pub fwd`
+- **Decorators** — `parser/grammar.mach` `parse_decorators` / `parse_one_decorator`:
+  leading `#[name(args)]` clauses (one Decorator node), closed directive set.
+- **Declarations** — `parser/grammar.mach`: `use`, `fwd` (incl. `pub fwd`
   rejection), `fun` (generics, params, variadic `...`, named pack `name: ...`,
   comptime `$` params, optional return type, block-or-`;` body), `rec`, `uni`,
+  `tag` (mandatory discriminator, cases with an optional payload type),
   `val`/`var` (type annotation required; `val x = 42;` is rejected), `def`, `test`, `flags`
   (`pub`/`ext` any order/count), the decl-scope `$if`/`$or` chain, and the
   `comptime-directive` (attribute-write vs. bare directive) form.
-- **Statements** — `parser/decl.mach`: `block`, `if`/`or` chain, `for`
+- **Statements** — `parser/grammar.mach`: `block`, `if`/`or` chain, `for`
   (optional condition), `ret`/`brk`/`cnt`/`fin`, local `val`/`var`, the
   stmt-scope `$if`/`$or` chain, `$each … in … { }`, and `expr-stmt`.
-- **Expressions** — `parser/expr.mach`: prefix atoms, all five unary
-  prefix operators (`-`, `!`, `~`, `?`, `@`), the postfix chain
+- **Expressions** — `parser/grammar.mach`: prefix atoms, `sel`, all five
+  unary prefix operators (`-`, `!`, `~`, `?`, `@`), the postfix chain
   (call with optional `...` spread on arguments, generic-call, index,
-  member, field projection `.[f]`, cast), struct/array literals and the
+  member, field projection `.[f]`, cast), struct/array/tag literals and the
   typed-literal lookahead, the generic-call-vs-index `[` disambiguation,
   and `comptime-ident`.
-- **Types** — `parser/expr.mach`: `*T`, `[N]T`, `fun(...) R` (with variadic,
+- **Types** — `parser/grammar.mach`: `*T`, `[N]T`, `fun(...) R` (with variadic,
   pack `name: ...`, and optional return), anonymous `rec {...}` / `uni {...}`,
   and named types with generic args / dotted paths.
 - **Inline asm** — `parser/iasm.mach`: mandatory ISA tag, raw brace-balanced
@@ -798,7 +839,8 @@ Doc-only (intended surface, not a distinct parser production):
   the closed sets are enforced later (see [asm.md](asm.md),
   [comptime-mach.md](comptime-mach.md)).
 - The closed intrinsic set (`$size_of`, `$length_of`, `$align_of`, `$offset_of`,
-  `$type_of`, `$fields`, `$is_record`, `$is_union`, `$is_pointer`, `$is_secret`,
+  `$type_of`, `$fields`, `$cases`, `$discriminant_of`, `$is_tag`, `$is_record`,
+  `$is_union`, `$is_pointer`, `$is_secret`,
   `$type_name`, `$error`) — syntactically indistinguishable from any other
   `comptime-ident` call.
 - The closed decorator directive set ([decorators.md](decorators.md)) — the

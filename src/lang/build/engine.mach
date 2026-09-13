@@ -1,72 +1,73 @@
+use mach.lang.alloc;
 use std.allocator.arena;
 use std.allocator.page;
-use fs: std.filesystem;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use fs:       std.filesystem;
+use io_error: std.io.error;
 use std.memory;
-use std.types.path;
 use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.path;
+use std.types.result.res;
 use std.types.size.usize;
-use std.collections.vector;
-use std.collections.vector.Vector;
 use std.types.string.str;
 use std.types.string.str_contains;
 use std.types.string.str_equals;
 
-use A: std.allocator;
-use O: std.types.option;
-use R: std.types.result;
-use ctime: std.chrono.time;
+use A:     std.allocator;
 use cdur:  std.chrono.duration;
+use ctime: std.chrono.time;
 use std.sync.atomic;
 use std.sync.thread;
 
-use btest: mach.lang.build.testing;
+use mach.lang.be.codegen;
+use mach.lang.be.linker;
+use mach.lang.be.obj;
 use mach.lang.build.emit;
 use mach.lang.build.fingerprint;
 use mach.lang.build.outcome;
 use mach.lang.build.plan;
-use mach.lang.publication;
-use txn: std.filesystem.transaction;
 use mach.lang.build.request;
-use dq: mach.lang.driver.query;
-use mach.lang.be.codegen;
-use mach.lang.be.linker;
-use mach.lang.be.obj;
+use btest: mach.lang.build.testing;
 use mach.lang.diagnostic;
 use mach.lang.driver;
+use persistent: mach.lang.driver.cache;
+use mach.lang.driver.passes;
+use mach.lang.driver.project;
+use dq: mach.lang.driver.query;
+use mach.lang.fail;
 use mach.lang.intern;
 use mach.lang.manifest;
 use mach.lang.me.ir;
+use mach.lang.me.lower.testrunner;
+use mach.lang.publication;
 use mach.lang.query;
 use mach.lang.readout;
 use mach.lang.session;
 use mach.lang.target.isa;
 use mach.lang.target.of;
-use mach.lang.fail;
+use txn: std.filesystem.transaction;
 
 rec UnitState {
-    irs:          *ir.Module;
-    ir_ready:     *bool;
-    images:       *of.ObjectImage;
-    image_ready:  *bool;
+    obj_paths:  **u8;
+    obj_len:    u32;
+    dynlibs:    *of.DynLib;
+    dynlib_len: u32;
 
-    obj_paths:    **u8;
-    obj_len:      u32;
-    dynlibs:      *of.DynLib;
-    dynlib_len:   u32;
-
-    out_path:     *u8;
-    scope:        btest.TestScope;
-    outputs:      publication.Plan;
-    objects:      **publication.Destination;
-    ir_outputs:   **publication.Destination;
-    asm_outputs:  **publication.Destination;
-    artifact:     *publication.Destination;
-    dispatcher:   *publication.Destination;
+    out_path:    *u8;
+    scope:       btest.TestScope;
+    outputs:     publication.Plan;
+    objects:     **publication.Destination;
+    ir_outputs:  **publication.Destination;
+    asm_outputs: **publication.Destination;
+    artifact:    *publication.Destination;
+    dispatcher:  *publication.Destination;
 }
-
 
 fun blocking_requirement(failed: *Vector[str], u: *plan.BuildUnit) str {
     var i: usize = 0;
@@ -82,102 +83,116 @@ fun blocking_requirement(failed: *Vector[str], u: *plan.BuildUnit) str {
 }
 
 fun record_blocked_unit(bo: *outcome.BuildOutcome, oa: *A.Allocator, failed: *Vector[str],
-                        u: *plan.BuildUnit, blocked_by: str) R.Result[R.Void, str] {
+    u: *plan.BuildUnit, blocked_by: str) err[outcome.Fail] {
     var f: outcome.Fail = outcome.user(plan.join_msg(oa,
         "artifact '", u.sel_artifact, "' was not built: it requires artifact '", blocked_by,
         "', which failed to build"));
-    val fail_r: R.Result[R.Void, str] = outcome.record_fail(bo, ?f);
-    if (R.is_err[R.Void, str](fail_r)) { ret fail_r; }
+    val fail_r: err[A.Error] = outcome.record_fail(bo, ?f);
+    if (sel fail_r.err) { ret err[outcome.Fail].err{outcome.internal(alloc.text(fail_r.err))}; }
     outcome.fold_fail(bo, ?f);
-    val pr: R.Result[usize, str] = vector.push[str](failed, u.sel_artifact);
-    if (R.is_err[usize, str](pr)) { ret R.err[R.Void, str]("out of memory"); }
-    ret R.ok_void[str]();
+    val pr: res[usize, A.Error] = vector.push[str](failed, u.sel_artifact);
+    if (sel pr.err) { ret err[outcome.Fail].err{outcome.refused(pr.err)}; }
+    ret err[outcome.Fail].ok{};
 }
 
+# run every planned cell cold: each unit gets its own session and arena over `backing`
+# and is torn down when it finishes, so nothing of one unit's frontend survives into the
+# next. a unit whose requirement failed is recorded as blocked and skipped; a unit that
+# fails is recorded and the remaining units still run. ok is the outcome of the whole
+# plan, its severity the worst unit's; err is a failure of the engine itself, never of a
+# unit
+# ---
+# bp:      the plan, read only
+# backing: the allocator each unit's arena grows from; released per unit
+# oa:      owns the returned outcome and every path, event and text in it
+# ev:      progress sink for the readout; nil for none
+# ret:     the outcome, released with outcome.outcome_dnit, or an engine failure whose text
+#          `oa` owns
 pub fun execute(bp: *plan.BuildPlan, backing: *A.Allocator, oa: *A.Allocator,
-                ev: *readout.Progress) R.Result[outcome.BuildOutcome, outcome.Fail] {
-    var bo: outcome.BuildOutcome = outcome.outcome_init(oa);
-    var failed: Vector[str] = vector.init[str](oa);
+    ev: *readout.Progress) res[outcome.BuildOutcome, outcome.Fail] {
+    var bo:     outcome.BuildOutcome = outcome.outcome_init(oa);
+    var failed: Vector[str]          = vector.init[str](oa);
 
     var i: usize = 0;
     for (i < bp.units.len) {
-        val unit: *plan.BuildUnit = ?bp.units.data[i];
-        val event_r: R.Result[R.Void, str] = outcome.record_unit(?bo, unit.sel_artifact, unit.sel_target, unit.has_artifact);
-        if (R.is_err[R.Void, str](event_r)) {
+        val unit:    *plan.BuildUnit = ?bp.units.data[i];
+        val event_r: err[A.Error]    = outcome.record_unit(?bo, unit.sel_artifact, unit.sel_target, unit.has_artifact);
+        if (sel event_r.err) {
             outcome.outcome_dnit(?bo);
-            ret R.err[outcome.BuildOutcome, outcome.Fail](outcome.internal("failed to record build unit"));
+            ret res[outcome.BuildOutcome, outcome.Fail].err{outcome.internal("failed to record build unit")};
         }
 
         val blocked_by: str = blocking_requirement(?failed, unit);
         if (blocked_by != nil) {
-            val br: R.Result[R.Void, str] = record_blocked_unit(?bo, oa, ?failed, unit, blocked_by);
-            if (R.is_err[R.Void, str](br)) {
+            val br: err[outcome.Fail] = record_blocked_unit(?bo, oa, ?failed, unit, blocked_by);
+            if (sel br.err) {
                 outcome.outcome_dnit(?bo);
-                ret R.err[outcome.BuildOutcome, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](br)));
+                ret res[outcome.BuildOutcome, outcome.Fail].err{br.err};
             }
             i = i + 1;
             cnt;
         }
         readout.unit_begin(ev);
 
-        val ur: R.Result[outcome.BuildOutcome, outcome.Fail] = execute_unit_cold(bp, i, backing, oa, ev);
-        if (R.is_err[outcome.BuildOutcome, outcome.Fail](ur)) {
-            var f: outcome.Fail = R.unwrap_err[outcome.BuildOutcome, outcome.Fail](ur);
-            val fail_r: R.Result[R.Void, str] = outcome.record_fail(?bo, ?f);
-            if (R.is_err[R.Void, str](fail_r)) {
+        val ur: res[outcome.BuildOutcome, outcome.Fail] = execute_unit_cold(bp, i, backing, oa, ev);
+        if (sel ur.err) {
+            var f:      outcome.Fail = ur.err;
+            val fail_r: err[A.Error] = outcome.record_fail(?bo, ?f);
+            if (sel fail_r.err) {
                 outcome.outcome_dnit(?bo);
-                ret R.err[outcome.BuildOutcome, outcome.Fail](outcome.internal("failed to record build failure"));
+                ret res[outcome.BuildOutcome, outcome.Fail].err{outcome.internal("failed to record build failure")};
             }
             outcome.fold_fail(?bo, ?f);
-            val pr: R.Result[usize, str] = vector.push[str](?failed, unit.sel_artifact);
-            if (R.is_err[usize, str](pr)) {
+            val pr: res[usize, A.Error] = vector.push[str](?failed, unit.sel_artifact);
+            if (sel pr.err) {
                 outcome.outcome_dnit(?bo);
-                ret R.err[outcome.BuildOutcome, outcome.Fail](outcome.internal("out of memory"));
+                ret res[outcome.BuildOutcome, outcome.Fail].err{outcome.internal("out of memory")};
             }
         }
-        or {
-            var ubo: outcome.BuildOutcome = R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](ur);
+        if (sel ur.ok) {
+            var ubo: outcome.BuildOutcome = ur.ok;
             if (ubo.severity != outcome.BUILD_OK) {
-                val fr: R.Result[usize, str] = vector.push[str](?failed, unit.sel_artifact);
-                if (R.is_err[usize, str](fr)) {
+                val fr: res[usize, A.Error] = vector.push[str](?failed, unit.sel_artifact);
+                if (sel fr.err) {
                     outcome.outcome_dnit(?ubo);
                     outcome.outcome_dnit(?bo);
-                    ret R.err[outcome.BuildOutcome, outcome.Fail](outcome.internal("out of memory"));
+                    ret res[outcome.BuildOutcome, outcome.Fail].err{outcome.internal("out of memory")};
                 }
             }
-            val mr: R.Result[R.Void, str] = outcome.merge(?bo, ?ubo);
-            if (R.is_err[R.Void, str](mr)) {
+            val mr: err[A.Error] = outcome.merge(?bo, ?ubo);
+            if (sel mr.err) {
                 outcome.outcome_dnit(?ubo);
                 outcome.outcome_dnit(?bo);
-                ret R.err[outcome.BuildOutcome, outcome.Fail](outcome.internal("failed to merge build outcome"));
+                ret res[outcome.BuildOutcome, outcome.Fail].err{outcome.internal("failed to merge build outcome")};
             }
         }
         i = i + 1;
     }
-    ret R.ok[outcome.BuildOutcome, outcome.Fail](bo);
+    ret res[outcome.BuildOutcome, outcome.Fail].ok{bo};
 }
 
 fun execute_unit_cold(bp: *plan.BuildPlan, unit_index: usize, backing: *A.Allocator,
-                      oa: *A.Allocator, ev: *readout.Progress)
-                      R.Result[outcome.BuildOutcome, outcome.Fail] {
-    var u_ar: arena.Arena;
-    if (O.is_some[str](arena.init(?u_ar, backing, 0))) {
+    oa: *A.Allocator, ev: *readout.Progress) res[outcome.BuildOutcome, outcome.Fail] {
+    var u_ar:   arena.Arena;
+    val init_r: err[A.Error] = arena.init(?u_ar, backing, 0);
+    if (sel init_r.err) {
         ret cold_fail(oa, outcome.internal("failed to initialise allocator"));
     }
     var u_alloc: A.Allocator;
-    if (O.is_some[str](arena.make(?u_alloc, ?u_ar))) {
+    val make_r:  err[A.Error] = arena.make(?u_alloc, ?u_ar);
+    if (sel make_r.err) {
         arena.dnit(?u_ar);
         ret cold_fail(oa, outcome.internal("failed to initialise allocator"));
     }
 
-    var r: R.Result[outcome.BuildOutcome, outcome.Fail];
-    val res_session: R.Result[session.Session, str] = session.init(?u_alloc);
-    if (R.is_err[session.Session, str](res_session)) {
-        val f: outcome.Fail = outcome.internal(plan.join_msg(?u_alloc, "failed to initialise compiler session: ", R.unwrap_err[session.Session, str](res_session)));
+    var r:           res[outcome.BuildOutcome, outcome.Fail];
+    val res_session: res[session.Session, fail.Fail] = session.init(?u_alloc);
+    if (sel res_session.err) {
+        val f: outcome.Fail = outcome.internal(plan.join_msg(?u_alloc, "failed to initialise compiler session: ", fail.describe(res_session.err)));
         r = cold_fail(oa, f);
     }
-    or {
-        var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
+    if (sel res_session.ok) {
+        var s: session.Session = res_session.ok;
         r = execute_warm(bp, unit_index, ?s, oa, ev);
         session.dnit(?s);
     }
@@ -186,7 +201,7 @@ fun execute_unit_cold(bp: *plan.BuildPlan, unit_index: usize, backing: *A.Alloca
     ret r;
 }
 
-fun cold_fail(oa: *A.Allocator, f: outcome.Fail) R.Result[outcome.BuildOutcome, outcome.Fail] {
+fun cold_fail(oa: *A.Allocator, f: outcome.Fail) res[outcome.BuildOutcome, outcome.Fail] {
     var bo: outcome.BuildOutcome = outcome.outcome_init(oa);
     ret warm_fail(?bo, f);
 }
@@ -197,14 +212,14 @@ rec PoisonState {
     calls:   usize;
 }
 
-fun poison_allocate(ctx: ptr, size: usize, align: usize) O.Option[ptr] {
+fun poison_allocate(ctx: ptr, size: usize, align: usize) opt[ptr] {
     val st: *PoisonState = ctx::*PoisonState;
     st.calls = st.calls + 1;
-    if (st.fail_at != 0 && st.calls == st.fail_at) { ret O.none[ptr](); }
+    if (st.fail_at != 0 && st.calls == st.fail_at) { ret opt[ptr].none{}; }
     ret st.real.fn_allocate(st.real.ctx, size, align);
 }
 
-fun poison_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) O.Option[ptr] {
+fun poison_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) opt[ptr] {
     val st: *PoisonState = ctx::*PoisonState;
     ret st.real.fn_reallocate(st.real.ctx, p, old_size, new_size, align);
 }
@@ -212,14 +227,27 @@ fun poison_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align:
 fun poison_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64 {
     if (p != nil && size > 0) {
         var i: usize = 0;
-        for (i < size) { (p::*u8)[i] = 0xAA::u8; i = i + 1; }
+        for (i < size) {
+            (p::*u8)[i] = 0xAA::u8;
+            i           = i + 1;
+        }
     }
     ret 0;
 }
 
+# the recorded failure is internal, owns live (unpoisoned) text, and names the cause
+fun t_event_internal_text_contains(ev: *outcome.BuildEvent, needle: str) bool {
+    if (!sel ev.fail)                           { ret false; }
+    if (!sel ev.fail.internal)                  { ret false; }
+    if (ev.fail.internal == nil)                { ret false; }
+    if ((ev.fail.internal::*u8)[0] == 0xAA::u8) { ret false; }
+    ret str_contains(ev.fail.internal, needle);
+}
+
 test "mach.lang.build.engine.execute_unit_cold:session_init_failure_message_survives_arena_teardown" {
-    var real: A.Allocator;
-    if (O.is_some[str](page.make(?real))) { ret 1; }
+    var real:   A.Allocator;
+    val make_r: err[A.Error] = page.make(?real);
+    if (sel make_r.err) { ret 1; }
     var st: PoisonState;
     st.real    = real;
     st.fail_at = 1;
@@ -230,28 +258,38 @@ test "mach.lang.build.engine.execute_unit_cold:session_init_failure_message_surv
     backing.fn_reallocate = poison_reallocate;
     backing.fn_deallocate = poison_deallocate;
 
-    var oa: A.Allocator;
-    if (O.is_some[str](page.make(?oa))) { ret 2; }
+    var oa:      A.Allocator;
+    val make_r2: err[A.Error] = page.make(?oa);
+    if (sel make_r2.err) { ret 2; }
 
     var bp: plan.BuildPlan;
-    val r: R.Result[outcome.BuildOutcome, outcome.Fail] = execute_unit_cold(?bp, 0::usize, ?backing, ?oa, nil);
-    if (R.is_err[outcome.BuildOutcome, outcome.Fail](r)) { ret 3; }
+    val r:  res[outcome.BuildOutcome, outcome.Fail] = execute_unit_cold(?bp, 0::usize, ?backing, ?oa, nil);
+    if (sel r.err) { ret 3; }
 
-    var bo: outcome.BuildOutcome = R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](r);
-    var bad: i32 = 0;
-    if (bo.severity != outcome.BUILD_INTERNAL || bo.events.len != 1) { bad = 1; }
-    or (bo.events.data[0].kind != outcome.BUILD_EVENT_FAIL)          { bad = 1; }
-    or (bo.events.data[0].data.fail.message == nil)                  { bad = 1; }
-    or ((bo.events.data[0].data.fail.message::*u8)[0] == 0xAA::u8)   { bad = 1; }
-    or (!str_contains(bo.events.data[0].data.fail.message, "failed to initialise compiler session")) { bad = 1; }
+    var bo:  outcome.BuildOutcome = r.ok;
+    var bad: i32                  = 0;
+    if (bo.severity != outcome.BUILD_INTERNAL || bo.events.len != 1)                                  { bad = 1; }
+    or (!t_event_internal_text_contains(?bo.events.data[0], "failed to initialise compiler session")) { bad = 1; }
     outcome.outcome_dnit(?bo);
     ret bad;
 }
 
+# run one planned cell through a caller-owned session, reusing its query cache, source
+# overlays and typed surface across calls (the editor's build path). the session's
+# diagnostic store is replaced for the call and its build allocator is a per-call arena
+# restored on return, so every raw product a caller borrowed from the session before the
+# call is expired by it
+# ---
+# bp:         the plan, read only
+# unit_index: the cell to run; out of range is an internal failure
+# s:          the warm session; its registry, sources and queries carry over between calls
+# oa:         owns the returned outcome
+# ev:         progress sink for the readout; nil for none
+# ret:        the outcome of that one unit, released with outcome.outcome_dnit, or an engine failure
 pub fun execute_warm(bp: *plan.BuildPlan, unit_index: usize, s: *session.Session, oa: *A.Allocator,
-                     ev: *readout.Progress) R.Result[outcome.BuildOutcome, outcome.Fail] {
+    ev: *readout.Progress) res[outcome.BuildOutcome, outcome.Fail] {
     if (unit_index >= bp.units.len) {
-        ret R.err[outcome.BuildOutcome, outcome.Fail](outcome.internal("build unit index out of range"));
+        ret res[outcome.BuildOutcome, outcome.Fail].err{outcome.internal("build unit index out of range")};
     }
     val planned: *plan.BuildUnit = ?bp.units.data[unit_index];
 
@@ -261,15 +299,18 @@ pub fun execute_warm(bp: *plan.BuildPlan, unit_index: usize, s: *session.Session
     s.diags = diagnostic.store_init(s.alloc);
 
     var call_backing: A.Allocator;
-    if (O.is_some[str](page.make(?call_backing))) {
+    val make_r:       err[A.Error] = page.make(?call_backing);
+    if (sel make_r.err) {
         ret warm_fail(?bo, outcome.internal("failed to initialise allocator"));
     }
     var call_ar: arena.Arena;
-    if (O.is_some[str](arena.init(?call_ar, ?call_backing, 0))) {
+    val init_r:  err[A.Error] = arena.init(?call_ar, ?call_backing, 0);
+    if (sel init_r.err) {
         ret warm_fail(?bo, outcome.internal("failed to initialise allocator"));
     }
     var call_alloc: A.Allocator;
-    if (O.is_some[str](arena.make(?call_alloc, ?call_ar))) {
+    val make_r2:    err[A.Error] = arena.make(?call_alloc, ?call_ar);
+    if (sel make_r2.err) {
         arena.dnit(?call_ar);
         ret warm_fail(?bo, outcome.internal("failed to initialise allocator"));
     }
@@ -281,429 +322,489 @@ pub fun execute_warm(bp: *plan.BuildPlan, unit_index: usize, s: *session.Session
         arena.dnit(?call_ar);
     }
 
-    val res_register: R.Result[R.Void, str] = driver.setup_registry(?s.registry);
-    if (R.is_err[R.Void, str](res_register)) {
-        val r: R.Result[outcome.BuildOutcome, outcome.Fail] = warm_fail(?bo, outcome.internal(R.unwrap_err[R.Void, str](res_register)));
+    val res_register: err[outcome.Fail] = driver.setup_registry(s.registry);
+    if (sel res_register.err) {
+        val r: res[outcome.BuildOutcome, outcome.Fail] = warm_fail(?bo, res_register.err);
         ret r;
     }
 
-    val res_manifest: R.Result[manifest.Manifest, str] = driver.load_manifest(s, bp.request.project_root);
-    if (R.is_err[manifest.Manifest, str](res_manifest)) {
-        val r: R.Result[outcome.BuildOutcome, outcome.Fail] = warm_fail(?bo, outcome.user(R.unwrap_err[manifest.Manifest, str](res_manifest)));
+    val res_manifest: res[manifest.Manifest, outcome.Fail] = driver.load_manifest(s, bp.request.project_root);
+    if (sel res_manifest.err) {
+        val r: res[outcome.BuildOutcome, outcome.Fail] = warm_fail(?bo, res_manifest.err);
         ret r;
     }
-    var m: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](res_manifest);
+    var m: manifest.Manifest = res_manifest.ok;
 
     var req: request.BuildRequest =
         request.for_cell(?bp.request, planned.sel_target, planned.sel_artifact, planned.want_lib,
-                         planned.subsystem, planned.goal);
+        planned.subsystem, planned.goal);
 
-    val replan_r: R.Result[plan.BuildUnit, outcome.Fail] =
-        plan.replan_unit(?call_alloc, ?s.interner, ?s.registry, ?m, ?req, planned);
-    if (R.is_err[plan.BuildUnit, outcome.Fail](replan_r)) {
-        val r: R.Result[outcome.BuildOutcome, outcome.Fail] = warm_fail(?bo, R.unwrap_err[plan.BuildUnit, outcome.Fail](replan_r));
+    val replan_r: res[plan.BuildUnit, outcome.Fail] = plan.replan_unit(?call_alloc, ?s.interner, s.registry, ?m, ?req, planned);
+    if (sel replan_r.err) {
+        val r: res[outcome.BuildOutcome, outcome.Fail] = warm_fail(?bo, replan_r.err);
         ret r;
     }
-    var cell: plan.BuildUnit = R.unwrap_ok[plan.BuildUnit, outcome.Fail](replan_r);
+    var cell: plan.BuildUnit  = replan_r.ok;
     val unit: *plan.BuildUnit = ?cell;
 
-    val begin_r: R.Result[driver.Project, outcome.Fail] = driver.begin_build(s, ?m, ?req, ev);
-    if (R.is_err[driver.Project, outcome.Fail](begin_r)) {
-        val r: R.Result[outcome.BuildOutcome, outcome.Fail] = warm_fail(?bo, R.unwrap_err[driver.Project, outcome.Fail](begin_r));
-        ret r;
+    val begin_r: res[driver.Project, outcome.Fail] = driver.begin_build(s, ?m, ?req, ev);
+    if (sel begin_r.err) {
+        val diags_r: err[outcome.Fail] = outcome.record_diagnostics(?bo, ?s.sources, ?s.diags);
+        if (sel diags_r.err) {
+            outcome.outcome_dnit(?bo);
+            ret res[outcome.BuildOutcome, outcome.Fail].err{outcome.internal("failed to snapshot build diagnostics")};
+        }
+        ret warm_fail(?bo, begin_r.err);
     }
-    var p: driver.Project = R.unwrap_ok[driver.Project, outcome.Fail](begin_r);
+    var p: driver.Project = begin_r.ok;
 
     var st: UnitState;
-    st.irs          = nil;
-    st.ir_ready     = nil;
-    st.images       = nil;
-    st.image_ready  = nil;
-    st.obj_paths    = nil;
-    st.obj_len      = 0;
-    st.dynlibs      = nil;
-    st.dynlib_len   = 0;
-    st.out_path     = nil;
+    st.obj_paths     = nil;
+    st.obj_len       = 0;
+    st.dynlibs       = nil;
+    st.dynlib_len    = 0;
+    st.out_path      = nil;
     st.scope.have    = false;
-    st.scope.sel     = nil;
+    st.scope.pick    = nil;
     st.scope.sel_len = 0;
     st.scope.skipped = 0;
 
-    var result: R.Result[R.Void, outcome.Fail] = R.ok_void[outcome.Fail]();
-    var pi: usize = 0;
+    var result: err[outcome.Fail] = err[outcome.Fail].ok{};
+    var pi:     usize             = 0;
     for (pi < unit.phases.len) {
         result = run_phase(unit.phases.data[pi], ?p, unit, ?st, ?bo, oa, ev);
-        if (R.is_err[R.Void, outcome.Fail](result)) { brk; }
+        if (sel result.err) { brk; }
         pi = pi + 1;
     }
 
-    if (R.is_ok[R.Void, outcome.Fail](result) && req.goal == request.GOAL_TEST_LIST) {
+    val result_ok3: bool = sel result.ok && req.goal == request.GOAL_TEST_LIST;
+    if (result_ok3) {
         result = list_tests(?p, ?st, ?bo, oa);
     }
 
-    if (R.is_ok[R.Void, outcome.Fail](result)) {
+    val result_ok4: bool = sel result.ok;
+    if (result_ok4) {
         result = record_artifact(?p, unit, ?st, ?bo);
     }
 
     if (st.out_path != nil) { st.out_path = unit.out_path::*u8; }
-    val released: O.Option[txn.Error] = release_outputs(?p, ?st);
-    var event_error: str = nil;
-    if (R.is_err[R.Void, outcome.Fail](result)) {
-        var f: outcome.Fail = R.unwrap_err[R.Void, outcome.Fail](result);
-        val fail_r: R.Result[R.Void, str] = outcome.record_fail(?bo, ?f);
-        if (R.is_err[R.Void, str](fail_r)) { event_error = "failed to record build failure"; }
+    val released:    err[txn.Error]    = release_outputs(?p, ?st);
+    val refreshed:   err[outcome.Fail] = driver.refresh_diagnostics(?p);
+    var event_error: str               = nil;
+    if (sel result.err) {
+        var f:      outcome.Fail = result.err;
+        val fail_r: err[A.Error] = outcome.record_fail(?bo, ?f);
+        if (sel fail_r.err) { event_error = "failed to record build failure"; }
     }
-    if (O.is_some[txn.Error](released)) {
-        val error: txn.Error = O.unwrap[txn.Error](released);
-        val detail: str = plan.join_msg(p.alloc, "publication cleanup: ", txn.error_message(error));
+    if (sel refreshed.err) {
+        var failure:  outcome.Fail = refreshed.err;
+        val recorded: err[A.Error] = outcome.record_fail(?bo, ?failure);
+        if (sel recorded.err) { event_error = "failed to record diagnostic refresh failure"; }
+        outcome.fold_fail(?bo, ?failure);
+        val result_ok: bool = sel result.ok;
+        if (result_ok) { result = refreshed; }
+    }
+    if (sel released.err) {
+        val error:   txn.Error    = released.err;
+        val detail:  str          = plan.join_msg(p.alloc, "publication cleanup: ", txn.error_message(error));
         var cleanup: outcome.Fail = outcome.environment(detail);
         if (error.kind == txn.INVALID) { cleanup = outcome.internal(detail); }
-        val recorded: R.Result[R.Void, str] = outcome.record_fail(?bo, ?cleanup);
-        if (R.is_err[R.Void, str](recorded)) { event_error = "failed to record publication cleanup failure"; }
+        val recorded: err[A.Error] = outcome.record_fail(?bo, ?cleanup);
+        if (sel recorded.err) { event_error = "failed to record publication cleanup failure"; }
         outcome.fold_fail(?bo, ?cleanup);
-        if (R.is_ok[R.Void, outcome.Fail](result)) { result = R.err[R.Void, outcome.Fail](cleanup); }
+        val result_ok2: bool = sel result.ok;
+        if (result_ok2) { result = err[outcome.Fail].err{cleanup}; }
     }
-    if (R.is_ok[R.Void, outcome.Fail](result) && ev != nil) {
+    if (sel result.ok && ev != nil && req.goal != request.GOAL_CHECK) {
         emit_unit_summary(?p, ?st, ev);
     }
 
     if (event_error == nil) {
-        val diags_r: R.Result[R.Void, str] = outcome.record_diagnostics(?bo, ?s.sources, ?s.diags);
-        if (R.is_err[R.Void, str](diags_r)) { event_error = "failed to snapshot build diagnostics"; }
+        val diags_r: err[outcome.Fail] = outcome.record_diagnostics(?bo, ?s.sources, ?s.diags);
+        if (sel diags_r.err) { event_error = "failed to snapshot build diagnostics"; }
     }
     btest.free_scope(?p, ?st.scope);
     pcg_sweep_staged(?p);
-    driver.lower_sweep_staged(?p);
     driver.dnit_project(?p);
 
     if (event_error != nil) {
         outcome.outcome_dnit(?bo);
-        ret R.err[outcome.BuildOutcome, outcome.Fail](outcome.internal(event_error));
+        ret res[outcome.BuildOutcome, outcome.Fail].err{outcome.internal(event_error)};
     }
 
-    if (R.is_err[R.Void, outcome.Fail](result)) {
-        var f: outcome.Fail = R.unwrap_err[R.Void, outcome.Fail](result);
+    if (sel result.err) {
+        var f: outcome.Fail = result.err;
         outcome.fold_fail(?bo, ?f);
     }
-    ret R.ok[outcome.BuildOutcome, outcome.Fail](bo);
+    ret res[outcome.BuildOutcome, outcome.Fail].ok{bo};
 }
 
+# execute_warm over every planned cell in order, merged into one outcome the way
+# execute merges its cold units: blocked units recorded and skipped, a failed unit
+# recorded and the rest still run, the severity the worst unit's
+# ---
+# bp:  the plan, read only
+# s:   the warm session
+# oa:  owns the returned outcome
+# ev:  progress sink for the readout; nil for none
+# ret: the merged outcome, released with outcome.outcome_dnit, or an engine failure
 pub fun execute_warm_all(bp: *plan.BuildPlan, s: *session.Session, oa: *A.Allocator,
-                         ev: *readout.Progress) R.Result[outcome.BuildOutcome, outcome.Fail] {
-    var bo: outcome.BuildOutcome = outcome.outcome_init(oa);
-    var failed: Vector[str] = vector.init[str](oa);
+    ev: *readout.Progress) res[outcome.BuildOutcome, outcome.Fail] {
+    var bo:     outcome.BuildOutcome = outcome.outcome_init(oa);
+    var failed: Vector[str]          = vector.init[str](oa);
 
     var i: usize = 0;
     for (i < bp.units.len) {
-        val unit: *plan.BuildUnit = ?bp.units.data[i];
-        val event_r: R.Result[R.Void, str] = outcome.record_unit(?bo, unit.sel_artifact, unit.sel_target, unit.has_artifact);
-        if (R.is_err[R.Void, str](event_r)) {
+        val unit:    *plan.BuildUnit = ?bp.units.data[i];
+        val event_r: err[A.Error]    = outcome.record_unit(?bo, unit.sel_artifact, unit.sel_target, unit.has_artifact);
+        if (sel event_r.err) {
             outcome.outcome_dnit(?bo);
-            ret R.err[outcome.BuildOutcome, outcome.Fail](outcome.internal("failed to record build unit"));
+            ret res[outcome.BuildOutcome, outcome.Fail].err{outcome.internal("failed to record build unit")};
         }
 
         val blocked_by: str = blocking_requirement(?failed, unit);
         if (blocked_by != nil) {
-            val br: R.Result[R.Void, str] = record_blocked_unit(?bo, oa, ?failed, unit, blocked_by);
-            if (R.is_err[R.Void, str](br)) {
+            val br: err[outcome.Fail] = record_blocked_unit(?bo, oa, ?failed, unit, blocked_by);
+            if (sel br.err) {
                 outcome.outcome_dnit(?bo);
-                ret R.err[outcome.BuildOutcome, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](br)));
+                ret res[outcome.BuildOutcome, outcome.Fail].err{br.err};
             }
             i = i + 1;
             cnt;
         }
         readout.unit_begin(ev);
 
-        val ur: R.Result[outcome.BuildOutcome, outcome.Fail] = execute_warm(bp, i, s, oa, ev);
-        if (R.is_err[outcome.BuildOutcome, outcome.Fail](ur)) {
-            var f: outcome.Fail = R.unwrap_err[outcome.BuildOutcome, outcome.Fail](ur);
-            val fail_r: R.Result[R.Void, str] = outcome.record_fail(?bo, ?f);
-            if (R.is_err[R.Void, str](fail_r)) {
+        val ur: res[outcome.BuildOutcome, outcome.Fail] = execute_warm(bp, i, s, oa, ev);
+        if (sel ur.err) {
+            var f:      outcome.Fail = ur.err;
+            val fail_r: err[A.Error] = outcome.record_fail(?bo, ?f);
+            if (sel fail_r.err) {
                 outcome.outcome_dnit(?bo);
-                ret R.err[outcome.BuildOutcome, outcome.Fail](outcome.internal("failed to record build failure"));
+                ret res[outcome.BuildOutcome, outcome.Fail].err{outcome.internal("failed to record build failure")};
             }
             outcome.fold_fail(?bo, ?f);
-            val pr: R.Result[usize, str] = vector.push[str](?failed, unit.sel_artifact);
-            if (R.is_err[usize, str](pr)) {
+            val pr: res[usize, A.Error] = vector.push[str](?failed, unit.sel_artifact);
+            if (sel pr.err) {
                 outcome.outcome_dnit(?bo);
-                ret R.err[outcome.BuildOutcome, outcome.Fail](outcome.internal("out of memory"));
+                ret res[outcome.BuildOutcome, outcome.Fail].err{outcome.internal("out of memory")};
             }
         }
-        or {
-            var ubo: outcome.BuildOutcome = R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](ur);
+        if (sel ur.ok) {
+            var ubo: outcome.BuildOutcome = ur.ok;
             if (ubo.severity != outcome.BUILD_OK) {
-                val fr: R.Result[usize, str] = vector.push[str](?failed, unit.sel_artifact);
-                if (R.is_err[usize, str](fr)) {
+                val fr: res[usize, A.Error] = vector.push[str](?failed, unit.sel_artifact);
+                if (sel fr.err) {
                     outcome.outcome_dnit(?ubo);
                     outcome.outcome_dnit(?bo);
-                    ret R.err[outcome.BuildOutcome, outcome.Fail](outcome.internal("out of memory"));
+                    ret res[outcome.BuildOutcome, outcome.Fail].err{outcome.internal("out of memory")};
                 }
             }
-            val mr: R.Result[R.Void, str] = outcome.merge(?bo, ?ubo);
-            if (R.is_err[R.Void, str](mr)) {
+            val mr: err[A.Error] = outcome.merge(?bo, ?ubo);
+            if (sel mr.err) {
                 outcome.outcome_dnit(?ubo);
                 outcome.outcome_dnit(?bo);
-                ret R.err[outcome.BuildOutcome, outcome.Fail](outcome.internal("failed to merge build outcome"));
+                ret res[outcome.BuildOutcome, outcome.Fail].err{outcome.internal("failed to merge build outcome")};
             }
         }
         i = i + 1;
     }
-    ret R.ok[outcome.BuildOutcome, outcome.Fail](bo);
+    ret res[outcome.BuildOutcome, outcome.Fail].ok{bo};
 }
 
 fun pcg_sweep_staged(p: *driver.Project) {
-    var i: u32 = 0;
-    for (i < p.module_len) {
-        val m: *driver.ModuleEntry = ?p.modules[i];
-        if (m.staged_image != nil) {
-            obj.dnit(m.staged_image);
-            A.deallocate[of.ObjectImage](p.s.alloc, m.staged_image, 1::usize);
-            m.staged_image = nil;
-        }
-        i = i + 1;
-    }
+    project.release_all_staged(p);
 }
 
-fun warm_fail(bo: *outcome.BuildOutcome, f: outcome.Fail) R.Result[outcome.BuildOutcome, outcome.Fail] {
-    var fv: outcome.Fail = f;
-    val fail_r: R.Result[R.Void, str] = outcome.record_fail(bo, ?fv);
-    if (R.is_err[R.Void, str](fail_r)) {
+fun warm_fail(bo: *outcome.BuildOutcome, f: outcome.Fail) res[outcome.BuildOutcome, outcome.Fail] {
+    var fv:     outcome.Fail = f;
+    val fail_r: err[A.Error] = outcome.record_fail(bo, ?fv);
+    if (sel fail_r.err) {
         outcome.outcome_dnit(bo);
-        ret R.err[outcome.BuildOutcome, outcome.Fail](outcome.internal("failed to record build failure"));
+        ret res[outcome.BuildOutcome, outcome.Fail].err{outcome.internal("failed to record build failure")};
     }
     outcome.fold_fail(bo, ?fv);
-    ret R.ok[outcome.BuildOutcome, outcome.Fail](@bo);
+    ret res[outcome.BuildOutcome, outcome.Fail].ok{@bo};
 }
 
-fun plan_module_outputs(p: *driver.Project, outputs: *publication.Plan, base: str, suffix: str)
-                        R.Result[**publication.Destination, outcome.Fail] {
-    if (p.emit_len == 0) { ret R.ok[**publication.Destination, outcome.Fail](nil); }
-    val allocated: R.Result[**publication.Destination, str] = A.allocate[*publication.Destination](p.alloc, p.emit_len::usize);
-    if (R.is_err[**publication.Destination, str](allocated)) {
-        ret R.err[**publication.Destination, outcome.Fail](outcome.internal(R.unwrap_err[**publication.Destination, str](allocated)));
+fun plan_module_outputs(p: *driver.Project, outputs: *publication.Plan, base: str, suffix: str) res[**publication.Destination, outcome.Fail] {
+    if (p.emit_len == 0) { ret res[**publication.Destination, outcome.Fail].ok{nil}; }
+    val allocated: res[**publication.Destination, A.Error] = A.allocate[*publication.Destination](p.alloc, p.emit_len::usize);
+    if (sel allocated.err) {
+        ret res[**publication.Destination, outcome.Fail].err{outcome.refused(allocated.err)};
     }
-    val destinations: **publication.Destination = R.unwrap_ok[**publication.Destination, str](allocated);
-    var complete: bool = false;
-    fin { if (!complete) { A.deallocate[*publication.Destination](p.alloc, destinations, p.emit_len::usize); } }
+    val destinations: **publication.Destination = allocated.ok;
+    var complete:     bool                      = false;
+    fin {
+        if (!complete) { A.deallocate[*publication.Destination](p.alloc, destinations, p.emit_len::usize); }
+    }
     var i: u32 = 0;
     for (i < p.emit_len) {
-        val m: *driver.ModuleEntry = ?p.modules[p.topo[i]::u32];
-        val fqn: O.Option[str] = intern.lookup(?p.s.interner, m.fqn);
-        if (O.is_none[str](fqn)) {
-            ret R.err[**publication.Destination, outcome.Fail](outcome.internal("module FQN not interned"));
+        val m:   *driver.ModuleEntry = ?p.modules[p.topo[i]::u32];
+        val fqn: opt[str]            = intern.lookup(?p.s.interner, m.fqn);
+        if (sel fqn.none) {
+            ret res[**publication.Destination, outcome.Fail].err{outcome.internal("module FQN not interned")};
         }
-        val name_r: R.Result[str, str] = emit.mirror_fqn(p.alloc, base, O.unwrap[str](fqn), suffix);
-        if (R.is_err[str, str](name_r)) {
-            ret R.err[**publication.Destination, outcome.Fail](outcome.internal(R.unwrap_err[str, str](name_r)));
+        val name_r: res[str, outcome.Fail] = emit.mirror_fqn(p.alloc, base, fqn.some, suffix);
+        if (sel name_r.err) {
+            ret res[**publication.Destination, outcome.Fail].err{name_r.err};
         }
-        val name: str = R.unwrap_ok[str, str](name_r);
-        val reserved: R.Result[*publication.Destination, str] = publication.plan_add(outputs, name, true);
+        val name:     str                                         = name_r.ok;
+        val reserved: res[*publication.Destination, outcome.Fail] = publication.plan_add(outputs, name, true);
         str_free(p.alloc, name);
-        if (R.is_err[*publication.Destination, str](reserved)) {
-            ret R.err[**publication.Destination, outcome.Fail](outcome.environment(R.unwrap_err[*publication.Destination, str](reserved)));
+        if (sel reserved.err) {
+            ret res[**publication.Destination, outcome.Fail].err{reserved.err};
         }
-        destinations[i] = R.unwrap_ok[*publication.Destination, str](reserved);
-        i = i + 1;
+        destinations[i] = reserved.ok;
+        i               = i + 1;
     }
     complete = true;
-    ret R.ok[**publication.Destination, outcome.Fail](destinations);
+    ret res[**publication.Destination, outcome.Fail].ok{destinations};
 }
 
-fun plan_outputs(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState) R.Result[R.Void, outcome.Fail] {
-    val initialized: O.Option[txn.Error] = publication.plan_init(?st.outputs, p.alloc);
-    if (O.is_some[txn.Error](initialized)) {
-        ret R.err[R.Void, outcome.Fail](outcome.internal(txn.error_message(O.unwrap[txn.Error](initialized))));
+fun plan_outputs(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState) err[outcome.Fail] {
+    val initialized: err[txn.Error] = publication.plan_init(?st.outputs, p.alloc);
+    if (sel initialized.err) {
+        ret err[outcome.Fail].err{outcome.internal(txn.error_message(initialized.err))};
     }
-    val goal: request.BuildGoal = p.req.goal;
-    val flat: bool = p.target.of != nil && p.target.of.produces_image;
-    val objects: bool = (goal == request.GOAL_EXECUTE && !flat)
+    val goal:    request.BuildGoal = p.req.goal;
+    val flat:    bool              = p.target.of != nil && p.target.of.produces_image;
+    val objects: bool              = (goal == request.GOAL_EXECUTE && !flat)
         || goal == request.GOAL_OBJECTS || goal == request.GOAL_TESTS;
     if (objects) {
-        val planned: R.Result[**publication.Destination, outcome.Fail] = plan_module_outputs(p, ?st.outputs, unit.obj_dir, p.target.of.object_ext);
-        if (R.is_err[**publication.Destination, outcome.Fail](planned)) { ret R.void_of[**publication.Destination, outcome.Fail](planned); }
-        st.objects = R.unwrap_ok[**publication.Destination, outcome.Fail](planned);
+        val planned: res[**publication.Destination, outcome.Fail] = plan_module_outputs(p, ?st.outputs, unit.obj_dir, p.target.of.object_ext);
+        if (sel planned.err) { ret err[outcome.Fail].err{planned.err}; }
+        st.objects = planned.ok;
     }
     if (p.req.emit_ir) {
-        val planned: R.Result[**publication.Destination, outcome.Fail] = plan_module_outputs(p, ?st.outputs, unit.ir_dir, "ir");
-        if (R.is_err[**publication.Destination, outcome.Fail](planned)) { ret R.void_of[**publication.Destination, outcome.Fail](planned); }
-        st.ir_outputs = R.unwrap_ok[**publication.Destination, outcome.Fail](planned);
+        val planned: res[**publication.Destination, outcome.Fail] = plan_module_outputs(p, ?st.outputs, unit.ir_dir, "ir");
+        if (sel planned.err) { ret err[outcome.Fail].err{planned.err}; }
+        st.ir_outputs = planned.ok;
     }
     if (p.req.emit_asm) {
-        val planned: R.Result[**publication.Destination, outcome.Fail] = plan_module_outputs(p, ?st.outputs, unit.asm_dir, "s");
-        if (R.is_err[**publication.Destination, outcome.Fail](planned)) { ret R.void_of[**publication.Destination, outcome.Fail](planned); }
-        st.asm_outputs = R.unwrap_ok[**publication.Destination, outcome.Fail](planned);
+        val planned: res[**publication.Destination, outcome.Fail] = plan_module_outputs(p, ?st.outputs, unit.asm_dir, "s");
+        if (sel planned.err) { ret err[outcome.Fail].err{planned.err}; }
+        st.asm_outputs = planned.ok;
     }
     if ((goal == request.GOAL_EXECUTE && !plan.finished_modules(?p.target)) || goal == request.GOAL_TESTS) {
-        val planned: R.Result[*publication.Destination, str] = publication.plan_add(?st.outputs, unit.out_path, true);
-        if (R.is_err[*publication.Destination, str](planned)) {
-            ret R.err[R.Void, outcome.Fail](outcome.environment(R.unwrap_err[*publication.Destination, str](planned)));
+        val planned: res[*publication.Destination, outcome.Fail] = publication.plan_add(?st.outputs, unit.out_path, true);
+        if (sel planned.err) {
+            ret err[outcome.Fail].err{planned.err};
         }
-        st.artifact = R.unwrap_ok[*publication.Destination, str](planned);
+        st.artifact = planned.ok;
     }
     if (goal == request.GOAL_TESTS) {
-        val name_r: R.Result[str, str] = path.join(p.alloc, unit.obj_dir, "__mach_test_dispatch.o");
-        if (R.is_err[str, str](name_r)) { ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[str, str](name_r))); }
-        val name: str = R.unwrap_ok[str, str](name_r);
-        val planned: R.Result[*publication.Destination, str] = publication.plan_add(?st.outputs, name, true);
+        val name_r: res[str, A.Error] = path.join(p.alloc, unit.obj_dir, "__mach_test_dispatch.o");
+        if (sel name_r.err) { ret err[outcome.Fail].err{outcome.refused(name_r.err)}; }
+        val name:    str                                         = name_r.ok;
+        val planned: res[*publication.Destination, outcome.Fail] = publication.plan_add(?st.outputs, name, true);
         str_free(p.alloc, name);
-        if (R.is_err[*publication.Destination, str](planned)) {
-            ret R.err[R.Void, outcome.Fail](outcome.environment(R.unwrap_err[*publication.Destination, str](planned)));
+        if (sel planned.err) {
+            ret err[outcome.Fail].err{planned.err};
         }
-        st.dispatcher = R.unwrap_ok[*publication.Destination, str](planned);
+        st.dispatcher = planned.ok;
     }
-    val sealed: O.Option[txn.Error] = publication.plan_seal(?st.outputs);
-    if (O.is_some[txn.Error](sealed)) {
-        ret R.err[R.Void, outcome.Fail](outcome.environment(txn.error_message(O.unwrap[txn.Error](sealed))));
+    val sealed: err[txn.Error] = publication.plan_seal(?st.outputs);
+    if (sel sealed.err) {
+        ret err[outcome.Fail].err{outcome.environment(txn.error_message(sealed.err))};
     }
-    ret R.ok_void[outcome.Fail]();
+    ret err[outcome.Fail].ok{};
 }
 
-fun release_outputs(p: *driver.Project, st: *UnitState) O.Option[txn.Error] {
-    if (st.objects != nil) { A.deallocate[*publication.Destination](p.alloc, st.objects, p.emit_len::usize); st.objects = nil; }
-    if (st.ir_outputs != nil) { A.deallocate[*publication.Destination](p.alloc, st.ir_outputs, p.emit_len::usize); st.ir_outputs = nil; }
-    if (st.asm_outputs != nil) { A.deallocate[*publication.Destination](p.alloc, st.asm_outputs, p.emit_len::usize); st.asm_outputs = nil; }
+fun release_outputs(p: *driver.Project, st: *UnitState) err[txn.Error] {
+    if (st.objects != nil) {
+        A.deallocate[*publication.Destination](p.alloc, st.objects, p.emit_len::usize);
+        st.objects = nil;
+    }
+    if (st.ir_outputs != nil) {
+        A.deallocate[*publication.Destination](p.alloc, st.ir_outputs, p.emit_len::usize);
+        st.ir_outputs = nil;
+    }
+    if (st.asm_outputs != nil) {
+        A.deallocate[*publication.Destination](p.alloc, st.asm_outputs, p.emit_len::usize);
+        st.asm_outputs = nil;
+    }
     ret publication.plan_dnit(?st.outputs);
 }
 
 fun run_phase(ph: plan.PhaseKind, p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
-              bo: *outcome.BuildOutcome, oa: *A.Allocator,
-              ev: *readout.Progress) R.Result[R.Void, outcome.Fail] {
-    var result: R.Result[R.Void, outcome.Fail] = R.err[R.Void, outcome.Fail](outcome.internal("unknown build phase"));
+    bo: *outcome.BuildOutcome, oa: *A.Allocator,
+    ev: *readout.Progress) err[outcome.Fail] {
+    val phase_name_r: opt[str] = plan.phase_name(ph);
+    if (sel phase_name_r.none) {
+        ret err[outcome.Fail].err{plan.unknown_phase(oa, ph)};
+    }
+    var result: err[outcome.Fail] = err[outcome.Fail].err{outcome.internal("unknown build phase")};
     if (ph == plan.PH_STEPS)     { result = driver.run_steps_phase(p); }
     if (ph == plan.PH_DEP_STEPS) { result = driver.run_dep_steps_phase(p); }
     if (ph == plan.PH_LOAD)      { result = load_phase(p); }
-    if (ph == plan.PH_SEMA)      { result = sema_phase(p, st); }
+    if (ph == plan.PH_SEMA)      { result = driver.run_sema_pass(p); }
     if (ph == plan.PH_LOWER)     { result = lower_phase(p, st, bo, ev); }
     if (ph == plan.PH_CODEGEN) {
         result = plan_outputs(p, unit, st);
-        if (R.is_ok[R.Void, outcome.Fail](result)) { result = codegen_phase(p, st, ev); }
+        val result_ok: bool = sel result.ok;
+        if (result_ok) { result = codegen_phase(p, st, ev); }
     }
-    if (ph == plan.PH_EMIT)      { result = emit_phase(p, unit, st, bo, ev); }
-    if (ph == plan.PH_LINK)      { result = link_phase(p, unit, st, bo, oa, ev); }
+    if (ph == plan.PH_EMIT) { result = emit_phase(p, unit, st, bo, ev); }
+    if (ph == plan.PH_LINK) { result = link_phase(p, unit, st, bo, oa, ev); }
 
-    if (R.is_err[R.Void, outcome.Fail](result)) { ret result; }
+    if (sel result.err) { ret result; }
     if (ph == plan.PH_LOAD || ph == plan.PH_SEMA) {
         val status: fail.PhaseStatus = driver.frontend_status(p);
-        if (status.kind != fail.ACCEPTED) { ret R.err[R.Void, outcome.Fail](outcome.from_fail(fail.phase_failure(status))); }
+        if (!sel status.kind.accepted) { ret err[outcome.Fail].err{outcome.from_fail(fail.phase_failure(status))}; }
     }
     ret result;
 }
 
-fun load_phase(p: *driver.Project) R.Result[R.Void, outcome.Fail] {
-    val lr: R.Result[R.Void, outcome.Fail] = driver.run_load_phase(p);
-    if (R.is_err[R.Void, outcome.Fail](lr)) { ret lr; }
-    if (p.module_len == 0) {
-        ret R.err[R.Void, outcome.Fail](outcome.user("project graph is empty; the entrypoint loaded no modules"));
-    }
-    ret R.ok_void[outcome.Fail]();
+test "mach.lang.build.engine.run_phase:unknown_catalog_member_is_internal_before_execution" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val link: opt[str] = plan.phase_name(plan.PH_LINK);
+    if (sel link.none)                  { ret 2; }
+    if (!str_equals(link.some, "link")) { ret 2; }
+    val phase_name_r: opt[str] = plan.phase_name(255::plan.PhaseKind);
+    if (sel phase_name_r.some) { ret 3; }
+    val result: err[outcome.Fail] = run_phase(255::plan.PhaseKind, nil, nil, nil, nil, ?a, nil);
+    if (sel result.ok) { ret 4; }
+    val failure: outcome.Fail = result.err;
+    fin { outcome.release_text(?a, failure); }
+    if (!sel failure.internal)                                 { ret 5; }
+    if (!str_contains(outcome.describe(failure), "PhaseKind")) { ret 5; }
+    if (!str_contains(outcome.describe(failure), "255"))       { ret 5; }
+    ret 0;
 }
 
-fun ensure_views(p: *driver.Project, st: *UnitState) R.Result[R.Void, outcome.Fail] {
-    if (st.irs != nil) { ret R.ok_void[outcome.Fail](); }
-    val n: usize = p.module_len::usize;
+fun load_phase(p: *driver.Project) err[outcome.Fail] {
+    val lr: err[outcome.Fail] = driver.run_load_phase(p);
+    if (sel lr.err) { ret lr; }
+    if (p.module_len == 0) {
+        ret err[outcome.Fail].err{outcome.user("project graph is empty; the entrypoint loaded no modules")};
+    }
+    ret err[outcome.Fail].ok{};
+}
 
-    val res_irs: R.Result[*ir.Module, str] = A.allocate[ir.Module](p.alloc, n);
-    if (R.is_err[*ir.Module, str](res_irs)) { ret R.err[R.Void, outcome.Fail](outcome.internal("out of memory")); }
-    st.irs = R.unwrap_ok[*ir.Module, str](res_irs);
-
-    val res_ir_ready: R.Result[*bool, str] = A.allocate[bool](p.alloc, n);
-    if (R.is_err[*bool, str](res_ir_ready)) { ret R.err[R.Void, outcome.Fail](outcome.internal("out of memory")); }
-    st.ir_ready = R.unwrap_ok[*bool, str](res_ir_ready);
-
-    val res_images: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](p.alloc, n);
-    if (R.is_err[*of.ObjectImage, str](res_images)) { ret R.err[R.Void, outcome.Fail](outcome.internal("out of memory")); }
-    st.images = R.unwrap_ok[*of.ObjectImage, str](res_images);
-
-    val res_image_ready: R.Result[*bool, str] = A.allocate[bool](p.alloc, n);
-    if (R.is_err[*bool, str](res_image_ready)) { ret R.err[R.Void, outcome.Fail](outcome.internal("out of memory")); }
-    st.image_ready = R.unwrap_ok[*bool, str](res_image_ready);
-
-    var i: u32 = 0;
+# tests are gathered in module order from the lowered ir, or from the facts a
+# restored object carries, so a cached test build lists the same tests in the
+# same order as a clean one
+fun collect_test_scope(p: *driver.Project, st: *UnitState) err[outcome.Fail] {
+    var col: testrunner.Collected = testrunner.collected_init();
+    var i:   u32                  = 0;
     for (i < p.module_len) {
-        st.ir_ready[i]    = false;
-        st.image_ready[i] = false;
-        st.irs[i].function_len = 0;
+        val gathered: err[fail.Fail] = persistent.collect_tests(p, ?p.modules[i], i, ?col);
+        if (sel gathered.err) {
+            testrunner.free(p.s, ?col);
+            ret err[outcome.Fail].err{outcome.from_fail(gathered.err)};
+        }
         i = i + 1;
     }
-    ret R.ok_void[outcome.Fail]();
+    ret btest.collect_scope(p, col, ?st.scope);
 }
 
-fun sema_phase(p: *driver.Project, st: *UnitState) R.Result[R.Void, outcome.Fail] {
-    val vr: R.Result[R.Void, outcome.Fail] = ensure_views(p, st);
-    if (R.is_err[R.Void, outcome.Fail](vr)) { ret vr; }
-
-    ret driver.run_sema_pass(p);
+fun current_image_headers(p: *driver.Project) res[*of.ObjectImage, outcome.Fail] {
+    val allocated: res[*of.ObjectImage, A.Error] = A.zallocate[of.ObjectImage](p.alloc, p.module_len::usize);
+    if (sel allocated.err) {
+        ret res[*of.ObjectImage, outcome.Fail].err{outcome.refused(allocated.err)};
+    }
+    val headers: *of.ObjectImage = allocated.ok;
+    var i:       u32             = 0;
+    for (i < p.emit_len) {
+        val mid:     session.ModuleId = p.topo[i];
+        val current: *of.ObjectImage  = p.modules[mid::u32].object_image;
+        if (current == nil) {
+            A.deallocate[of.ObjectImage](p.alloc, headers, p.module_len::usize);
+            ret res[*of.ObjectImage, outcome.Fail].err{outcome.internal("image publication requires a current codegen module")};
+        }
+        headers[mid::u32] = @current;
+        i                 = i + 1;
+    }
+    ret res[*of.ObjectImage, outcome.Fail].ok{headers};
 }
 
-fun lower_phase(p: *driver.Project, st: *UnitState, bo: *outcome.BuildOutcome, ev: *readout.Progress) R.Result[R.Void, outcome.Fail] {
+fun lower_phase(p: *driver.Project, st: *UnitState, bo: *outcome.BuildOutcome, ev: *readout.Progress) err[outcome.Fail] {
     readout.phase_begin(ev, readout.PH_LOWER);
     readout.phase_begin(ev, readout.PH_OPTIMIZE);
     readout.phase_carved(ev, readout.PH_OPTIMIZE);
 
-    val res_lower: R.Result[R.Void, outcome.Fail] = driver.run_lower_pass(p);
-    if (R.is_err[R.Void, outcome.Fail](res_lower)) { ret res_lower; }
+    val res_lower: err[outcome.Fail] = driver.run_lower_pass(p);
+    if (sel res_lower.err) { ret res_lower; }
 
     var total: u32 = 0;
-    var i: u32 = 0;
+    var i:     u32 = 0;
     for (i < p.emit_len) {
         val mid: session.ModuleId    = p.topo[i];
         val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
-        total = total + m.ir_module.vector_ops_scalarized;
-        i = i + 1;
+        total = total + persistent.scalarized(p, m);
+        i     = i + 1;
     }
     if (total > 0) {
-        val note_r: R.Result[R.Void, str] = outcome.record_note(bo, total);
-        if (R.is_err[R.Void, str](note_r)) {
-            ret R.err[R.Void, outcome.Fail](outcome.internal("failed to record scalarization note"));
+        val note_r: err[A.Error] = outcome.record_note(bo, total);
+        if (sel note_r.err) {
+            ret err[outcome.Fail].err{outcome.internal("failed to record scalarization note")};
         }
     }
 
-    i = 0;
-    for (i < p.emit_len) {
-        val mid: session.ModuleId    = p.topo[i];
-        val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
-        val irm: *ir.Module          = m.ir_module;
-        st.irs[mid::u32]      = @irm;
-        st.ir_ready[mid::u32] = true;
-        i = i + 1;
+    if (p.req.goal == request.GOAL_TESTS || p.req.goal == request.GOAL_TEST_LIST) {
+        val collected: err[outcome.Fail] = collect_test_scope(p, st);
+        if (sel collected.err) { ret collected; }
+        bo.tests_skipped = st.scope.skipped;
     }
 
     readout.phase_end(ev, readout.PH_LOWER, p.emit_len, "module", "modules");
     readout.phase_end(ev, readout.PH_OPTIMIZE, p.emit_len, "module", "modules");
-    ret R.ok_void[outcome.Fail]();
+    ret err[outcome.Fail].ok{};
 }
 
-fun codegen_phase(p: *driver.Project, st: *UnitState, ev: *readout.Progress) R.Result[R.Void, outcome.Fail] {
+fun codegen_phase(p: *driver.Project, st: *UnitState, ev: *readout.Progress) err[outcome.Fail] {
     readout.phase_begin(ev, readout.PH_CODEGEN);
+    val prepared: err[outcome.Fail] = passes.prepare_codegen_pass(p);
+    if (sel prepared.err) { ret prepared; }
 
-    if (pcg_enabled(p)) {
-        val rp: R.Result[R.Void, fail.Fail] = run_codegen_parallel(p);
-        if (R.is_err[R.Void, fail.Fail](rp)) {
-            ret R.err[R.Void, outcome.Fail](outcome.from_fail(R.unwrap_err[R.Void, fail.Fail](rp)));
-        }
-    }
-
-    val res_codegen: R.Result[R.Void, outcome.Fail] = driver.run_codegen_pass(p);
-    if (R.is_err[R.Void, outcome.Fail](res_codegen)) { ret res_codegen; }
-
+    var roots: Vector[query.QueryKey] = vector.init[query.QueryKey](p.alloc);
+    fin { vector.dnit[query.QueryKey](?roots); }
+    val frontend: err[outcome.Fail] = driver.append_frontend_roots(p, ?roots);
+    if (sel frontend.err) { ret frontend; }
     var i: u32 = 0;
     for (i < p.emit_len) {
-        val mid: session.ModuleId    = p.topo[i];
-        val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
-        val img: *of.ObjectImage     = m.object_image;
-        st.images[mid::u32]      = @img;
-        st.image_ready[mid::u32] = true;
+        val m:       *driver.ModuleEntry = ?p.modules[p.topo[i]::u32];
+        val key:     u64                 = passes.back_half_key_for(p, m);
+        val lowered: res[usize, A.Error] = vector.push[query.QueryKey](?roots,
+            query.QueryKey{kind: query.Q_LOWER, key: key});
+        if (sel lowered.err) {
+            ret err[outcome.Fail].err{outcome.refused(lowered.err)};
+        }
+        val emitted: res[usize, A.Error] = vector.push[query.QueryKey](?roots,
+            query.QueryKey{kind: query.Q_CODEGEN, key: key});
+        if (sel emitted.err) {
+            ret err[outcome.Fail].err{outcome.refused(emitted.err)};
+        }
         i = i + 1;
     }
+    val started: res[query.Operation, outcome.Fail] = driver.begin_query_phase(p);
+    if (sel started.err) {
+        ret err[outcome.Fail].err{started.err};
+    }
+    val operation:  query.Operation   = started.ok;
+    var result:     err[outcome.Fail] = passes.acquire_codegen_inputs(p);
+    val result_ok3: bool              = sel result.ok && pcg_enabled(p);
+    if (result_ok3) {
+        val parallel: err[fail.Fail] = run_codegen_parallel(p);
+        if (sel parallel.err) {
+            result = err[outcome.Fail].err{outcome.from_fail(parallel.err)};
+        }
+    }
+    val result_ok2: bool = sel result.ok;
+    if (result_ok2) { result = passes.run_codegen_pass(p); }
+    val result2: err[outcome.Fail] = driver.finish_query_phase(p, operation, roots.data, roots.len, result);
+    if (sel result2.err) { ret result2; }
 
     readout.phase_end(ev, readout.PH_CODEGEN, p.emit_len, "module", "modules");
-    ret R.ok_void[outcome.Fail]();
+    ret err[outcome.Fail].ok{};
 }
 
 fun emit_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
-               bo: *outcome.BuildOutcome, ev: *readout.Progress) R.Result[R.Void, outcome.Fail] {
+    bo: *outcome.BuildOutcome, ev: *readout.Progress) err[outcome.Fail] {
     val goal: request.BuildGoal = p.req.goal;
-    val flat: bool = p.target.of != nil && p.target.of.produces_image;
+    val flat: bool              = p.target.of != nil && p.target.of.produces_image;
 
     readout.phase_begin(ev, readout.PH_EMIT);
 
@@ -712,16 +813,17 @@ fun emit_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
         for (i < p.emit_len) {
             val mid: session.ModuleId    = p.topo[i];
             val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
+            if (m.ir_module == nil) { ret err[outcome.Fail].err{outcome.internal("ir and asm emission require a current lowered module")}; }
             if (p.req.emit_ir) {
-                val res_ir: R.Result[R.Void, str] = emit.emit_ir(p, st.ir_outputs[i], m.ir_module);
-                if (R.is_err[R.Void, str](res_ir)) {
-                    ret R.err[R.Void, outcome.Fail](outcome.environment(R.unwrap_err[R.Void, str](res_ir)));
+                val res_ir: err[outcome.Fail] = emit.emit_ir(p, st.ir_outputs[i], m.ir_module);
+                if (sel res_ir.err) {
+                    ret err[outcome.Fail].err{res_ir.err};
                 }
             }
             if (p.req.emit_asm) {
-                val res_asm: R.Result[R.Void, str] = emit.emit_asm(p, st.asm_outputs[i], m.ir_module);
-                if (R.is_err[R.Void, str](res_asm)) {
-                    ret R.err[R.Void, outcome.Fail](outcome.environment(R.unwrap_err[R.Void, str](res_asm)));
+                val res_asm: err[outcome.Fail] = emit.emit_asm(p, st.asm_outputs[i], m.ir_module);
+                if (sel res_asm.err) {
+                    ret err[outcome.Fail].err{res_asm.err};
                 }
             }
             i = i + 1;
@@ -729,25 +831,22 @@ fun emit_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
     }
 
     if (goal == request.GOAL_OBJECTS && flat) {
-        ret R.err[R.Void, outcome.Fail](outcome.user("a flat-image object format produces only executables; library and '--emit obj' outputs are unsupported"));
+        ret err[outcome.Fail].err{outcome.user("a flat-image object format produces only executables; library and '--emit obj' outputs are unsupported")};
     }
 
     if (goal == request.GOAL_TESTS && plan.finished_modules(?p.target)) {
-        ret R.err[R.Void, outcome.Fail](outcome.user("a finished-module object format produces no executable; this target cannot build or run tests"));
+        ret err[outcome.Fail].err{outcome.user("a finished-module object format produces no executable; this target cannot build or run tests")};
     }
 
     if (plan.finished_modules(?p.target) && p.target_entry != nil
         && p.target_entry.mode == driver.MODE_LIBRARY) {
-        ret R.err[R.Void, outcome.Fail](outcome.user("a finished-module object format has no archive or shared-library form; each module is its own artifact"));
+        ret err[outcome.Fail].err{outcome.user("a finished-module object format has no archive or shared-library form; each module is its own artifact")};
     }
 
     if (goal == request.GOAL_TESTS) {
-        val cr: R.Result[R.Void, outcome.Fail] = btest.collect_scope(p, st.irs, ?st.scope);
-        if (R.is_err[R.Void, outcome.Fail](cr)) { ret cr; }
-        bo.tests_skipped = st.scope.skipped;
         if (st.scope.sel_len == 0) {
             readout.phase_end(ev, readout.PH_EMIT, 0, "object", "objects");
-            ret R.ok_void[outcome.Fail]();
+            ret err[outcome.Fail].ok{};
         }
     }
 
@@ -755,8 +854,12 @@ fun emit_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
         || goal == request.GOAL_OBJECTS
         || goal == request.GOAL_TESTS;
     if (objects) {
-        val oc: R.Result[R.Void, outcome.Fail] = emit.write_objects(p, st.images, st.objects, ?st.obj_paths);
-        if (R.is_err[R.Void, outcome.Fail](oc)) { ret oc; }
+        val borrowed: res[*of.ObjectImage, outcome.Fail] = current_image_headers(p);
+        if (sel borrowed.err) { ret err[outcome.Fail].err{borrowed.err}; }
+        val images: *of.ObjectImage = borrowed.ok;
+        fin { A.deallocate[of.ObjectImage](p.alloc, images, p.module_len::usize); }
+        val oc: err[outcome.Fail] = emit.write_objects(p, images, st.objects, ?st.obj_paths);
+        if (sel oc.err) { ret oc; }
         st.obj_len = p.emit_len;
     }
 
@@ -767,270 +870,295 @@ fun emit_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
 
     if (objects) { readout.phase_end(ev, readout.PH_EMIT, st.obj_len, "object", "objects"); }
     or           { readout.phase_end(ev, readout.PH_EMIT, p.emit_len, "module", "modules"); }
-    ret R.ok_void[outcome.Fail]();
+    ret err[outcome.Fail].ok{};
 }
 
-fun artifact_digest(path: *u8, out: *u8) R.Result[R.Void, outcome.Fail] {
-    val rr: R.Result[R.Void, str] = fingerprint.file_sha256(path::str, out);
-    if (R.is_err[R.Void, str](rr)) {
-        ret R.err[R.Void, outcome.Fail](outcome.environment(R.unwrap_err[R.Void, str](rr)));
+fun artifact_digest(path: *u8, out: *u8) err[outcome.Fail] {
+    val rr: err[outcome.Fail] = fingerprint.file_sha256(path::str, out);
+    if (sel rr.err) {
+        ret err[outcome.Fail].err{rr.err};
     }
-    ret R.ok_void[outcome.Fail]();
+    ret err[outcome.Fail].ok{};
 }
 
 fun artifact_reusable(s: *session.Session, artifact: *u8, revision: query.Revision) bool {
-    if (!fs.is_file(artifact::str)) { ret false; }
+    val is_file_r: res[bool, io_error.Error] = fs.is_file(artifact::str);
+    if (!(sel is_file_r.ok && is_file_r.ok)) { ret false; }
     var recorded: [32]u8;
     if (!session.lookup_link_publication(s, artifact::str, revision, ?recorded)) { ret false; }
     var cur: [32]u8;
-    val d_r: R.Result[R.Void, outcome.Fail] = artifact_digest(artifact, ?cur[0]);
-    if (R.is_err[R.Void, outcome.Fail](d_r)) { ret false; }
+    val d_r: err[outcome.Fail] = artifact_digest(artifact, ?cur[0]);
+    if (sel d_r.err) { ret false; }
     ret memory.raw_equal((?cur[0])::ptr, (?recorded[0])::ptr, 32::usize);
 }
 
-fun record_artifact_publication(s: *session.Session, artifact: *u8, revision: query.Revision) R.Result[R.Void, outcome.Fail] {
+fun record_artifact_publication(s: *session.Session, artifact: *u8, revision: query.Revision) err[outcome.Fail] {
     if (query.peek_revision(?s.queries, query.Q_LINK, 0) != revision) {
-        ret R.err[R.Void, outcome.Fail](outcome.internal("the link query's revision moved while the artifact was being written"));
+        ret err[outcome.Fail].err{outcome.internal("the link query's revision moved while the artifact was being written")};
     }
-    var d: [32]u8;
-    val d_r: R.Result[R.Void, outcome.Fail] = artifact_digest(artifact, ?d[0]);
-    if (R.is_err[R.Void, outcome.Fail](d_r)) { ret d_r; }
-    val rec_r: R.Result[R.Void, str] = session.record_link_publication(s, artifact::str, revision, ?d);
-    if (R.is_err[R.Void, str](rec_r)) { ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](rec_r))); }
-    ret R.ok_void[outcome.Fail]();
+    var d:   [32]u8;
+    val d_r: err[outcome.Fail] = artifact_digest(artifact, ?d[0]);
+    if (sel d_r.err) { ret d_r; }
+    val rec_r: err[fail.Fail] = session.record_link_publication(s, artifact::str, revision, ?d);
+    if (sel rec_r.err) { ret err[outcome.Fail].err{outcome.from_fail(rec_r.err)}; }
+    ret err[outcome.Fail].ok{};
 }
 
 fun link_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
-               bo: *outcome.BuildOutcome, oa: *A.Allocator, ev: *readout.Progress) R.Result[R.Void, outcome.Fail] {
+    bo: *outcome.BuildOutcome, oa: *A.Allocator, ev: *readout.Progress) err[outcome.Fail] {
     val goal: request.BuildGoal = p.req.goal;
 
     readout.phase_begin(ev, readout.PH_LINK);
-    val t_link: ctime.Time = readout.item_begin(ev);
+    val t_link: readout.Instant = readout.item_begin(ev);
 
     if (goal == request.GOAL_TESTS) {
         if (st.scope.sel_len == 0) {
             readout.phase_end(ev, readout.PH_LINK, 0, "binary", "binaries");
-            ret R.ok_void[outcome.Fail]();
+            ret err[outcome.Fail].ok{};
         }
-        val dr: R.Result[R.Void, outcome.Fail] = link_dispatch_phase(p, unit, st, ev, t_link);
-        if (R.is_err[R.Void, outcome.Fail](dr)) { ret dr; }
-        val rr: R.Result[R.Void, outcome.Fail] = btest.record_tests(p, ?st.scope, unit.out_path::*u8, bo, oa);
-        if (R.is_err[R.Void, outcome.Fail](rr)) { ret rr; }
+        val dr: err[outcome.Fail] = link_dispatch_phase(p, unit, st, ev, t_link);
+        if (sel dr.err) { ret dr; }
+        val rr: err[outcome.Fail] = btest.record_tests(p, ?st.scope, unit.out_path::*u8, bo, oa);
+        if (sel rr.err) { ret rr; }
         st.out_path = unit.out_path::*u8;
         readout.item(ev, readout.PH_LINK, unit.out_path, t_link);
         readout.phase_end(ev, readout.PH_LINK, 1, "binary", "binaries");
-        ret R.ok_void[outcome.Fail]();
+        ret err[outcome.Fail].ok{};
     }
 
     val te: *driver.TargetEntry = p.target_entry;
-    if (te == nil) { ret R.err[R.Void, outcome.Fail](outcome.internal("no target selected")); }
+    if (te == nil) { ret err[outcome.Fail].err{outcome.internal("no target selected")}; }
 
     if (p.target.of != nil && p.target.of.produces_image) {
         if (te.mode == driver.MODE_LIBRARY) {
-            ret R.err[R.Void, outcome.Fail](outcome.user("a flat-image object format produces only executables; library and '--emit obj' outputs are unsupported"));
+            ret err[outcome.Fail].err{outcome.user("a flat-image object format produces only executables; library and '--emit obj' outputs are unsupported")};
         }
         ret link_flat(p, unit, st, ev, t_link);
     }
 
     if (te.mode == driver.MODE_LIBRARY) {
         if (te.lib_kind == manifest.LIBKIND_STATIC) {
-            val arc_r: R.Result[R.Void, outcome.Fail] = emit.emit_static_archive(p, st.artifact, st.images, st.obj_paths, ?st.out_path);
-            if (R.is_err[R.Void, outcome.Fail](arc_r)) { ret arc_r; }
+            val borrowed: res[*of.ObjectImage, outcome.Fail] = current_image_headers(p);
+            if (sel borrowed.err) { ret err[outcome.Fail].err{borrowed.err}; }
+            val images: *of.ObjectImage = borrowed.ok;
+            fin { A.deallocate[of.ObjectImage](p.alloc, images, p.module_len::usize); }
+            val arc_r: err[outcome.Fail] = emit.emit_static_archive(p, st.artifact, images, st.obj_paths, ?st.out_path);
+            if (sel arc_r.err) { ret arc_r; }
             readout.phase_end(ev, readout.PH_LINK, 1, "archive", "archives");
-            ret R.ok_void[outcome.Fail]();
+            ret err[outcome.Fail].ok{};
         }
         if (te.lib_kind == manifest.LIBKIND_SHARED) {
-            val ext_r: R.Result[R.Void, outcome.Fail] = emit.append_external_inputs(p, unit, ?st.obj_paths, ?st.obj_len, ?st.dynlibs, ?st.dynlib_len);
-            if (R.is_err[R.Void, outcome.Fail](ext_r)) { ret ext_r; }
-            val so_r: R.Result[R.Void, outcome.Fail] = emit.emit_shared_library(p, st.artifact, st.obj_paths, st.obj_len, st.dynlibs, st.dynlib_len, ?st.out_path);
-            if (R.is_err[R.Void, outcome.Fail](so_r)) { ret so_r; }
+            val ext_r: err[outcome.Fail] = emit.append_external_inputs(p, unit, ?st.obj_paths, ?st.obj_len, ?st.dynlibs, ?st.dynlib_len);
+            if (sel ext_r.err) { ret ext_r; }
+            val so_r: err[outcome.Fail] = emit.emit_shared_library(p, st.artifact, st.obj_paths, st.obj_len, st.dynlibs, st.dynlib_len, ?st.out_path);
+            if (sel so_r.err) { ret so_r; }
             readout.phase_end(ev, readout.PH_LINK, 1, "library", "libraries");
-            ret R.ok_void[outcome.Fail]();
+            ret err[outcome.Fail].ok{};
         }
         st.out_path = unit.obj_dir::*u8;
         readout.phase_end(ev, readout.PH_LINK, st.obj_len, "object", "objects");
-        ret R.ok_void[outcome.Fail]();
+        ret err[outcome.Fail].ok{};
     }
 
-    val ext_r: R.Result[R.Void, outcome.Fail] = emit.append_external_inputs(p, unit, ?st.obj_paths, ?st.obj_len, ?st.dynlibs, ?st.dynlib_len);
-    if (R.is_err[R.Void, outcome.Fail](ext_r)) { ret ext_r; }
+    val ext_r: err[outcome.Fail] = emit.append_external_inputs(p, unit, ?st.obj_paths, ?st.obj_len, ?st.dynlibs, ?st.dynlib_len);
+    if (sel ext_r.err) { ret ext_r; }
 
     val artifact: str = unit.out_path;
 
-    val ext_from:  u32 = p.emit_len;
-    val ext_count: u32 = st.obj_len - p.emit_len;
-    val loaded_r: R.Result[emit.LoadedImageOptions, outcome.Fail] =
-        emit.load_image_options(p, linker.LINK_EXE, artifact::*u8);
-    if (R.is_err[emit.LoadedImageOptions, outcome.Fail](loaded_r)) {
-        ret R.err[R.Void, outcome.Fail](R.unwrap_err[emit.LoadedImageOptions, outcome.Fail](loaded_r));
+    val ext_from:  u32                                        = p.emit_len;
+    val ext_count: u32                                        = st.obj_len - p.emit_len;
+    val loaded_r:  res[emit.LoadedImageOptions, outcome.Fail] = emit.load_image_options(p, linker.LINK_EXE, artifact::*u8);
+    if (sel loaded_r.err) {
+        ret err[outcome.Fail].err{loaded_r.err};
     }
-    var loaded: emit.LoadedImageOptions = R.unwrap_ok[emit.LoadedImageOptions, outcome.Fail](loaded_r);
+    var loaded: emit.LoadedImageOptions = loaded_r.ok;
 
-    val cfg_r: R.Result[R.Void, outcome.Fail] = set_link_config_input(p, artifact::*u8, emit.artifact_product_name(p), linker.LINK_EXE::u32,
-                                                                    ?st.obj_paths[ext_from], ext_count, st.dynlibs, st.dynlib_len, ?loaded);
-    if (R.is_err[R.Void, outcome.Fail](cfg_r)) { emit.dnit_image_options(p.alloc, ?loaded); ret cfg_r; }
-    val relink_r: R.Result[bool, outcome.Fail] = driver.run_link_pass(p);
-    if (R.is_err[bool, outcome.Fail](relink_r)) { emit.dnit_image_options(p.alloc, ?loaded); ret R.void_of[bool, outcome.Fail](relink_r); }
+    val cfg_r: err[outcome.Fail] = set_link_config_input(p, artifact::*u8, emit.artifact_product_name(p), linker.LINK_EXE::u32,
+        ?st.obj_paths[ext_from], ext_count, st.dynlibs, st.dynlib_len, ?loaded);
+    if (sel cfg_r.err) {
+        emit.dnit_image_options(p.alloc, ?loaded);
+        ret cfg_r;
+    }
+    val relink_r: res[bool, outcome.Fail] = driver.run_link_pass(p);
+    if (sel relink_r.err) {
+        emit.dnit_image_options(p.alloc, ?loaded);
+        ret err[outcome.Fail].err{relink_r.err};
+    }
     val link_rev: query.Revision = query.peek_revision(?p.s.queries, query.Q_LINK, 0);
-    if (!R.unwrap_ok[bool, outcome.Fail](relink_r) && artifact_reusable(p.s, artifact::*u8, link_rev)) {
+    if (!relink_r.ok && artifact_reusable(p.s, artifact::*u8, link_rev)) {
         st.out_path = artifact::*u8;
         readout.item(ev, readout.PH_LINK, artifact, t_link);
         readout.phase_end(ev, readout.PH_LINK, 1, "binary", "binaries");
         emit.dnit_image_options(p.alloc, ?loaded);
-        ret R.ok_void[outcome.Fail]();
+        ret err[outcome.Fail].ok{};
     }
 
-    val from_image: bool = p.target.of.links_from_image;
-    var res_link: R.Result[R.Void, outcome.Fail] = R.ok_void[outcome.Fail]();
+    val from_image: bool              = p.target.of.links_from_image;
+    var res_link:   err[outcome.Fail] = err[outcome.Fail].ok{};
     if (from_image) {
-        res_link = emit.link_mixed_images(p, st.images, ?st.obj_paths[ext_from], ext_count, st.dynlibs, st.dynlib_len, st.artifact, loaded.options);
+        val borrowed: res[*of.ObjectImage, outcome.Fail] = current_image_headers(p);
+        if (sel borrowed.err) {
+            emit.dnit_image_options(p.alloc, ?loaded);
+            ret err[outcome.Fail].err{borrowed.err};
+        }
+        val images: *of.ObjectImage = borrowed.ok;
+        fin { A.deallocate[of.ObjectImage](p.alloc, images, p.module_len::usize); }
+        res_link = emit.link_mixed_images(p, images, ?st.obj_paths[ext_from], ext_count, st.dynlibs, st.dynlib_len, st.artifact, loaded.options);
     }
     if (!from_image) {
         res_link = emit.link_executable(p, st.obj_paths, st.obj_len, st.dynlibs, st.dynlib_len, st.artifact, loaded.options);
     }
     emit.dnit_image_options(p.alloc, ?loaded);
-    if (R.is_err[R.Void, outcome.Fail](res_link)) { ret res_link; }
+    if (sel res_link.err) { ret res_link; }
 
-    val publish_r: R.Result[R.Void, outcome.Fail] = record_artifact_publication(p.s, artifact::*u8, link_rev);
-    if (R.is_err[R.Void, outcome.Fail](publish_r)) { ret publish_r; }
+    val publish_r: err[outcome.Fail] = record_artifact_publication(p.s, artifact::*u8, link_rev);
+    if (sel publish_r.err) { ret publish_r; }
 
     st.out_path = artifact::*u8;
     readout.item(ev, readout.PH_LINK, artifact, t_link);
     readout.phase_end(ev, readout.PH_LINK, 1, "binary", "binaries");
-    ret R.ok_void[outcome.Fail]();
+    ret err[outcome.Fail].ok{};
 }
 
 fun link_dispatch_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
-                        ev: *readout.Progress, t_link: ctime.Time) R.Result[R.Void, outcome.Fail] {
+    ev: *readout.Progress, t_link: readout.Instant) err[outcome.Fail] {
     val artifact: str = unit.out_path;
 
-    val in_r: R.Result[btest.DispatchInputs, outcome.Fail] = btest.collect_dispatch_inputs(p, unit, st.obj_paths);
-    if (R.is_err[btest.DispatchInputs, outcome.Fail](in_r)) {
-        ret R.err[R.Void, outcome.Fail](R.unwrap_err[btest.DispatchInputs, outcome.Fail](in_r));
+    val in_r: res[btest.DispatchInputs, outcome.Fail] = btest.collect_dispatch_inputs(p, unit, st.obj_paths);
+    if (sel in_r.err) {
+        ret err[outcome.Fail].err{in_r.err};
     }
-    var di: btest.DispatchInputs = R.unwrap_ok[btest.DispatchInputs, outcome.Fail](in_r);
+    var di: btest.DispatchInputs = in_r.ok;
 
-    val ext_from:  u32 = p.emit_len;
-    val ext_count: u32 = di.shared_len - p.emit_len;
+    val ext_from:  u32  = p.emit_len;
+    val ext_count: u32  = di.shared_len - p.emit_len;
     var ext_paths: **u8 = nil;
     if (ext_count > 0) { ext_paths = ?di.shared[ext_from]; }
 
-    val cfg_r: R.Result[R.Void, outcome.Fail] = set_dispatch_config_input(p, artifact::*u8,
+    val cfg_r: err[outcome.Fail] = set_dispatch_config_input(p, artifact::*u8,
         ext_paths, ext_count, di.dynlibs, di.dynlib_len, ?st.scope);
-    if (R.is_err[R.Void, outcome.Fail](cfg_r)) { btest.free_dispatch_inputs(p, ?di); ret cfg_r; }
-
-    val relink_r: R.Result[bool, outcome.Fail] = driver.run_link_pass(p);
-    if (R.is_err[bool, outcome.Fail](relink_r)) { btest.free_dispatch_inputs(p, ?di); ret R.void_of[bool, outcome.Fail](relink_r); }
-    val link_rev: query.Revision = query.peek_revision(?p.s.queries, query.Q_LINK, 0);
-    if (!R.unwrap_ok[bool, outcome.Fail](relink_r) && artifact_reusable(p.s, artifact::*u8, link_rev)) {
+    if (sel cfg_r.err) {
         btest.free_dispatch_inputs(p, ?di);
-        ret R.ok_void[outcome.Fail]();
+        ret cfg_r;
     }
 
-    val lr: R.Result[R.Void, outcome.Fail] = btest.link_dispatcher(p, unit, ?st.scope, ?di, st.dispatcher, st.artifact);
+    val relink_r: res[bool, outcome.Fail] = driver.run_link_pass(p);
+    if (sel relink_r.err) {
+        btest.free_dispatch_inputs(p, ?di);
+        ret err[outcome.Fail].err{relink_r.err};
+    }
+    val link_rev: query.Revision = query.peek_revision(?p.s.queries, query.Q_LINK, 0);
+    if (!relink_r.ok && artifact_reusable(p.s, artifact::*u8, link_rev)) {
+        btest.free_dispatch_inputs(p, ?di);
+        ret err[outcome.Fail].ok{};
+    }
+
+    val lr: err[outcome.Fail] = btest.link_dispatcher(p, unit, ?st.scope, ?di, st.dispatcher, st.artifact);
     btest.free_dispatch_inputs(p, ?di);
-    if (R.is_err[R.Void, outcome.Fail](lr)) { ret lr; }
+    if (sel lr.err) { ret lr; }
 
     ret record_artifact_publication(p.s, artifact::*u8, link_rev);
 }
 
 fun set_dispatch_config_input(p: *driver.Project, out_path: *u8,
-                              ext_paths: **u8, ext_count: u32,
-                              dynlibs: *of.DynLib, dynlib_count: u32,
-                              sc: *btest.TestScope) R.Result[R.Void, outcome.Fail] {
+    ext_paths: **u8, ext_count: u32,
+    dynlibs: *of.DynLib, dynlib_count: u32,
+    sc: *btest.TestScope) err[outcome.Fail] {
     var fb: dq.FpBuf;
     fb.alloc = p.alloc;
     fb.buf   = nil;
     fb.len   = 0;
     fb.cap   = 0;
 
-    var w: R.Result[R.Void, str] = write_link_config(?fb, p, out_path, emit.artifact_product_name(p),
+    var w: err[outcome.Fail] = write_link_config(?fb, p, out_path, emit.artifact_product_name(p),
         linker.LINK_EXE::u32, ext_paths, ext_count, dynlibs, dynlib_count, nil);
-    if (R.is_ok[R.Void, str](w)) { w = btest.fingerprint_scope(?fb, p, sc); }
-    if (R.is_err[R.Void, str](w)) {
+    val w_ok: bool = sel w.ok;
+    if (w_ok) { w = btest.fingerprint_scope(?fb, p, sc); }
+    if (sel w.err) {
         if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](p.alloc, fb.buf, fb.cap::usize); }
-        ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](w)));
+        ret err[outcome.Fail].err{w.err};
     }
 
-    val fl: R.Result[u32, str] = dq.fp_input_len(?fb);
-    if (R.is_err[u32, str](fl)) {
+    val fl: res[u32, fail.Fail] = dq.fp_input_len(?fb);
+    if (sel fl.err) {
         dq.fp_free(?fb);
-        ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[u32, str](fl)));
+        ret err[outcome.Fail].err{outcome.from_fail(fl.err)};
     }
-    val si: R.Result[R.Void, str] = query.set_input(?p.s.queries, query.Q_LINK_CONFIG, 0, fb.buf, R.unwrap_ok[u32, str](fl));
+    val si: err[fail.Fail] = query.set_input(?p.s.queries, query.Q_LINK_CONFIG, 0, fb.buf, fl.ok);
     if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](p.alloc, fb.buf, fb.cap::usize); }
-    if (R.is_err[R.Void, str](si)) { ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](si))); }
-    ret R.ok_void[outcome.Fail]();
+    if (sel si.err)                  { ret err[outcome.Fail].err{outcome.from_fail(si.err)}; }
+    ret err[outcome.Fail].ok{};
 }
 
-fun link_flat(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState, ev: *readout.Progress, t_link: ctime.Time) R.Result[R.Void, outcome.Fail] {
+fun link_flat(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState, ev: *readout.Progress, t_link: readout.Instant) err[outcome.Fail] {
     val artifact: str = unit.out_path;
 
-    val cfg_r: R.Result[R.Void, outcome.Fail] = set_link_config_input(p, artifact::*u8, emit.artifact_product_name(p), linker.LINK_EXE::u32, nil, 0, nil, 0, nil);
-    if (R.is_err[R.Void, outcome.Fail](cfg_r)) { ret cfg_r; }
-    val relink_r: R.Result[bool, outcome.Fail] = driver.run_link_pass(p);
-    if (R.is_err[bool, outcome.Fail](relink_r)) { ret R.void_of[bool, outcome.Fail](relink_r); }
+    val cfg_r: err[outcome.Fail] = set_link_config_input(p, artifact::*u8, emit.artifact_product_name(p), linker.LINK_EXE::u32, nil, 0, nil, 0, nil);
+    if (sel cfg_r.err) { ret cfg_r; }
+    val relink_r: res[bool, outcome.Fail] = driver.run_link_pass(p);
+    if (sel relink_r.err) { ret err[outcome.Fail].err{relink_r.err}; }
     val link_rev: query.Revision = query.peek_revision(?p.s.queries, query.Q_LINK, 0);
-    if (!R.unwrap_ok[bool, outcome.Fail](relink_r) && artifact_reusable(p.s, artifact::*u8, link_rev)) {
+    if (!relink_r.ok && artifact_reusable(p.s, artifact::*u8, link_rev)) {
         st.out_path = artifact::*u8;
         readout.item(ev, readout.PH_LINK, artifact, t_link);
         readout.phase_end(ev, readout.PH_LINK, 1, "binary", "binaries");
-        ret R.ok_void[outcome.Fail]();
+        ret err[outcome.Fail].ok{};
     }
 
-    val res_link: R.Result[R.Void, outcome.Fail] = emit.link_flat_images(p, st.images, st.artifact,
+    val borrowed: res[*of.ObjectImage, outcome.Fail] = current_image_headers(p);
+    if (sel borrowed.err) { ret err[outcome.Fail].err{borrowed.err}; }
+    val images: *of.ObjectImage = borrowed.ok;
+    fin { A.deallocate[of.ObjectImage](p.alloc, images, p.module_len::usize); }
+    val res_link: err[outcome.Fail] = emit.link_flat_images(p, images, st.artifact,
         of.image_options_default(p.req.subsystem));
-    if (R.is_err[R.Void, outcome.Fail](res_link)) { ret res_link; }
+    if (sel res_link.err) { ret res_link; }
 
-    val publish_r: R.Result[R.Void, outcome.Fail] = record_artifact_publication(p.s, artifact::*u8, link_rev);
-    if (R.is_err[R.Void, outcome.Fail](publish_r)) { ret publish_r; }
+    val publish_r: err[outcome.Fail] = record_artifact_publication(p.s, artifact::*u8, link_rev);
+    if (sel publish_r.err) { ret publish_r; }
 
     st.out_path = artifact::*u8;
     readout.item(ev, readout.PH_LINK, artifact, t_link);
     readout.phase_end(ev, readout.PH_LINK, 1, "binary", "binaries");
-    ret R.ok_void[outcome.Fail]();
+    ret err[outcome.Fail].ok{};
 }
 
-fun list_tests(p: *driver.Project, st: *UnitState, bo: *outcome.BuildOutcome, oa: *A.Allocator) R.Result[R.Void, outcome.Fail] {
-    val cr: R.Result[R.Void, outcome.Fail] = btest.collect_scope(p, st.irs, ?st.scope);
-    if (R.is_err[R.Void, outcome.Fail](cr)) { ret cr; }
-    bo.tests_skipped = st.scope.skipped;
+fun list_tests(p: *driver.Project, st: *UnitState, bo: *outcome.BuildOutcome, oa: *A.Allocator) err[outcome.Fail] {
     ret btest.record_tests(p, ?st.scope, nil, bo, oa);
 }
 
-fun record_artifact(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState, bo: *outcome.BuildOutcome) R.Result[R.Void, outcome.Fail] {
-    if (st.out_path == nil) { ret R.ok_void[outcome.Fail](); }
+fun record_artifact(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState, bo: *outcome.BuildOutcome) err[outcome.Fail] {
+    if (st.out_path == nil) { ret err[outcome.Fail].ok{}; }
 
     var kind: outcome.ArtifactKind = outcome.ART_BINARY;
     if (p.req.goal == request.GOAL_OBJECTS) { kind = outcome.ART_OBJECTS; }
     or (p.req.goal == request.GOAL_TESTS)   { kind = outcome.ART_TESTS; }
-    or (plan.finished_modules(?p.target))     { kind = outcome.ART_OBJECTS; }
+    or (plan.finished_modules(?p.target))   { kind = outcome.ART_OBJECTS; }
     or (p.target_entry != nil && p.target_entry.mode == driver.MODE_LIBRARY) {
         kind = outcome.ART_OBJECTS;
         if (p.target_entry.lib_kind == manifest.LIBKIND_STATIC) { kind = outcome.ART_ARCHIVE; }
         if (p.target_entry.lib_kind == manifest.LIBKIND_SHARED) { kind = outcome.ART_SHARED; }
     }
 
-    val rec_r: R.Result[R.Void, str] = outcome.record_artifact(bo, kind, st.out_path::str);
-    if (R.is_err[R.Void, str](rec_r)) { ret R.err[R.Void, outcome.Fail](outcome.internal("out of memory")); }
-    ret R.ok_void[outcome.Fail]();
+    val rec_r: err[A.Error] = outcome.record_artifact(bo, kind, st.out_path::str);
+    if (sel rec_r.err) { ret err[outcome.Fail].err{outcome.refused(rec_r.err)}; }
+    ret err[outcome.Fail].ok{};
 }
 
 fun emit_unit_summary(p: *driver.Project, st: *UnitState, ev: *readout.Progress) {
     var out_str: str = "<output>";
     if (st.out_path != nil) { out_str = st.out_path::str; }
 
-    val te: *driver.TargetEntry = p.target_entry;
-    val emit_obj: bool = p.req.goal == request.GOAL_OBJECTS;
-    val is_lib: bool = emit_obj || plan.finished_modules(?p.target)
+    val te:       *driver.TargetEntry = p.target_entry;
+    val emit_obj: bool                = p.req.goal == request.GOAL_OBJECTS;
+    val is_lib:   bool                = emit_obj || plan.finished_modules(?p.target)
         || (te != nil && te.mode == driver.MODE_LIBRARY);
 
     if (!is_lib && st.out_path != nil) {
-        val fi_r: R.Result[fs.Metadata, str] = fs.metadata(st.out_path::str);
-        if (R.is_ok[fs.Metadata, str](fi_r)) {
-            val fi: fs.Metadata = R.unwrap_ok[fs.Metadata, str](fi_r);
-            var unit_s: str = "B";
-            val mag: i64 = readout.size_split(fi.size, ?unit_s);
+        val fi_r: res[fs.Metadata, io_error.Error] = fs.metadata(st.out_path::str);
+        if (sel fi_r.ok) {
+            val fi:     fs.Metadata = fi_r.ok;
+            var unit_s: str         = "B";
+            val mag:    i64         = readout.size_split(fi.size, ?unit_s);
             readout.summary(ev, out_str, p.emit_len, mag, unit_s, true);
             ret;
         }
@@ -1042,77 +1170,148 @@ fun pcg_enabled(p: *driver.Project) bool {
     ret p.req.jobs >= 1 && p.emit_len > 0;
 }
 
+# publish the link configuration of a project as the Q_LINK_CONFIG query input: the
+# output path, product name, link kind, external inputs, dynamic libraries with their
+# provider policy, and the loaded-image options, fingerprinted so an unchanged
+# configuration keeps its revision and any change invalidates the link
+# ---
+# p:   the project whose session holds the query db
+# ret: ok, or the fingerprint or query failure
 pub fun set_link_config_input(p: *driver.Project, out_path: *u8, product: *u8, out_kind: u32,
-                              ext_paths: **u8, ext_count: u32,
-                              dynlibs: *of.DynLib, dynlib_count: u32,
-                              image: *emit.LoadedImageOptions) R.Result[R.Void, outcome.Fail] {
+    ext_paths: **u8, ext_count: u32,
+    dynlibs: *of.DynLib, dynlib_count: u32,
+    image: *emit.LoadedImageOptions) err[outcome.Fail] {
     var fb: dq.FpBuf;
     fb.alloc = p.alloc;
     fb.buf   = nil;
     fb.len   = 0;
     fb.cap   = 0;
 
-    val w: R.Result[R.Void, str] = write_link_config(?fb, p, out_path, product, out_kind, ext_paths, ext_count, dynlibs, dynlib_count, image);
-    if (R.is_err[R.Void, str](w)) {
+    val w: err[outcome.Fail] = write_link_config(?fb, p, out_path, product, out_kind, ext_paths, ext_count, dynlibs, dynlib_count, image);
+    if (sel w.err) {
         if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](p.alloc, fb.buf, fb.cap::usize); }
-        ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](w)));
+        ret err[outcome.Fail].err{w.err};
     }
 
-    val fl: R.Result[u32, str] = dq.fp_input_len(?fb);
-    if (R.is_err[u32, str](fl)) {
+    val fl: res[u32, fail.Fail] = dq.fp_input_len(?fb);
+    if (sel fl.err) {
         dq.fp_free(?fb);
-        ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[u32, str](fl)));
+        ret err[outcome.Fail].err{outcome.from_fail(fl.err)};
     }
-    val si: R.Result[R.Void, str] = query.set_input(?p.s.queries, query.Q_LINK_CONFIG, 0, fb.buf, R.unwrap_ok[u32, str](fl));
+    val si: err[fail.Fail] = query.set_input(?p.s.queries, query.Q_LINK_CONFIG, 0, fb.buf, fl.ok);
     if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](p.alloc, fb.buf, fb.cap::usize); }
-    if (R.is_err[R.Void, str](si)) { ret R.err[R.Void, outcome.Fail](outcome.internal(R.unwrap_err[R.Void, str](si))); }
-    ret R.ok_void[outcome.Fail]();
+    if (sel si.err)                  { ret err[outcome.Fail].err{outcome.from_fail(si.err)}; }
+    ret err[outcome.Fail].ok{};
 }
 
 fun write_link_config(fb: *dq.FpBuf, p: *driver.Project, out_path: *u8, product: *u8, out_kind: u32,
-                      ext_paths: **u8, ext_count: u32,
-                      dynlibs: *of.DynLib, dynlib_count: u32,
-                      image: *emit.LoadedImageOptions) R.Result[R.Void, str] {
-    val a0: R.Result[R.Void, str] = dq.fp_u32(fb, out_kind);            if (R.is_err[R.Void, str](a0)) { ret a0; }
+    ext_paths: **u8, ext_count: u32,
+    dynlibs: *of.DynLib, dynlib_count: u32,
+    image: *emit.LoadedImageOptions) err[outcome.Fail] {
+    val a0: err[fail.Fail] = dq.fp_u32(fb, out_kind);
+    if (sel a0.err) { ret err[outcome.Fail].err{outcome.from_fail(a0.err)}; }
     var pie_axis: u32 = 0;
     if (p.req.pie) { pie_axis = 1; }
-    val a1: R.Result[R.Void, str] = dq.fp_u32(fb, pie_axis);            if (R.is_err[R.Void, str](a1)) { ret a1; }
-    val a2: R.Result[R.Void, str] = dq.fp_cstr(fb, out_path);           if (R.is_err[R.Void, str](a2)) { ret a2; }
-    val a3: R.Result[R.Void, str] = dq.fp_cstr(fb, product);            if (R.is_err[R.Void, str](a3)) { ret a3; }
-    val a6: R.Result[R.Void, str] = dq.fp_domain_u8(fb, fingerprint.DOMAIN_SUBSYSTEM,
+    val a1: err[fail.Fail] = dq.fp_u32(fb, pie_axis);
+    if (sel a1.err) { ret err[outcome.Fail].err{outcome.from_fail(a1.err)}; }
+    val a2: err[fail.Fail] = dq.fp_cstr(fb, out_path);
+    if (sel a2.err) { ret err[outcome.Fail].err{outcome.from_fail(a2.err)}; }
+    val a3: err[fail.Fail] = dq.fp_cstr(fb, product);
+    if (sel a3.err) { ret err[outcome.Fail].err{outcome.from_fail(a3.err)}; }
+    val a6: err[fail.Fail] = dq.fp_domain_u8(fb, fingerprint.DOMAIN_SUBSYSTEM,
         of.SUBSYSTEM_CATALOG_VERSION, of.subsystem_fingerprint_tag(p.req.subsystem));
-    if (R.is_err[R.Void, str](a6)) { ret a6; }
+    if (sel a6.err) { ret err[outcome.Fail].err{outcome.from_fail(a6.err)}; }
 
     var has_resources: u32 = 0;
     if (image != nil && image.resource != nil) { has_resources = 1; }
-    val ar0: R.Result[R.Void, str] = dq.fp_u32(fb, has_resources); if (R.is_err[R.Void, str](ar0)) { ret ar0; }
+    val ar0: err[fail.Fail] = dq.fp_u32(fb, has_resources);
+    if (sel ar0.err) { ret err[outcome.Fail].err{outcome.from_fail(ar0.err)}; }
     if (has_resources != 0) {
-        val ar1: R.Result[R.Void, str] = dq.fp_cstr(fb, image.icon_path::*u8); if (R.is_err[R.Void, str](ar1)) { ret ar1; }
-        val ar2: R.Result[R.Void, str] = dq.fp_content(fb, image.icon_bytes.data, image.icon_bytes.len); if (R.is_err[R.Void, str](ar2)) { ret ar2; }
-        val ar3: R.Result[R.Void, str] = dq.fp_cstr(fb, image.manifest_path::*u8); if (R.is_err[R.Void, str](ar3)) { ret ar3; }
-        val ar4: R.Result[R.Void, str] = dq.fp_content(fb, image.manifest_bytes.data, image.manifest_bytes.len); if (R.is_err[R.Void, str](ar4)) { ret ar4; }
-        val ar5: R.Result[R.Void, str] = dq.fp_cstr(fb, image.resource.version::*u8); if (R.is_err[R.Void, str](ar5)) { ret ar5; }
-        val ar6: R.Result[R.Void, str] = dq.fp_cstr(fb, image.resource.internal_name::*u8); if (R.is_err[R.Void, str](ar6)) { ret ar6; }
-        val ar7: R.Result[R.Void, str] = dq.fp_cstr(fb, image.resource.original_filename::*u8); if (R.is_err[R.Void, str](ar7)) { ret ar7; }
-        val ar8: R.Result[R.Void, str] = dq.fp_cstr(fb, image.resource.product_name::*u8); if (R.is_err[R.Void, str](ar8)) { ret ar8; }
+        val ar1: err[fail.Fail] = dq.fp_cstr(fb, image.icon_path::*u8);
+        if (sel ar1.err) { ret err[outcome.Fail].err{outcome.from_fail(ar1.err)}; }
+        val ar2: err[fail.Fail] = dq.fp_content(fb, image.icon_bytes.data, image.icon_bytes.len);
+        if (sel ar2.err) { ret err[outcome.Fail].err{outcome.from_fail(ar2.err)}; }
+        val ar3: err[fail.Fail] = dq.fp_cstr(fb, image.manifest_path::*u8);
+        if (sel ar3.err) { ret err[outcome.Fail].err{outcome.from_fail(ar3.err)}; }
+        val ar4: err[fail.Fail] = dq.fp_content(fb, image.manifest_bytes.data, image.manifest_bytes.len);
+        if (sel ar4.err) { ret err[outcome.Fail].err{outcome.from_fail(ar4.err)}; }
+        val ar5: err[fail.Fail] = dq.fp_cstr(fb, image.resource.version::*u8);
+        if (sel ar5.err) { ret err[outcome.Fail].err{outcome.from_fail(ar5.err)}; }
+        val ar6: err[fail.Fail] = dq.fp_cstr(fb, image.resource.internal_name::*u8);
+        if (sel ar6.err) { ret err[outcome.Fail].err{outcome.from_fail(ar6.err)}; }
+        val ar7: err[fail.Fail] = dq.fp_cstr(fb, image.resource.original_filename::*u8);
+        if (sel ar7.err) { ret err[outcome.Fail].err{outcome.from_fail(ar7.err)}; }
+        val ar8: err[fail.Fail] = dq.fp_cstr(fb, image.resource.product_name::*u8);
+        if (sel ar8.err) { ret err[outcome.Fail].err{outcome.from_fail(ar8.err)}; }
     }
 
-    val a4: R.Result[R.Void, str] = dq.fp_u32(fb, ext_count);           if (R.is_err[R.Void, str](a4)) { ret a4; }
+    val a4: err[fail.Fail] = dq.fp_u32(fb, ext_count);
+    if (sel a4.err) { ret err[outcome.Fail].err{outcome.from_fail(a4.err)}; }
     var i: u32 = 0;
     for (i < ext_count) {
-        val ap: R.Result[R.Void, str] = dq.fp_cstr(fb, ext_paths[i]);          if (R.is_err[R.Void, str](ap)) { ret ap; }
-        val ah: R.Result[R.Void, str] = dq.fp_file_content(fb, ext_paths[i]); if (R.is_err[R.Void, str](ah)) { ret ah; }
+        val ap: err[fail.Fail] = dq.fp_cstr(fb, ext_paths[i]);
+        if (sel ap.err) { ret err[outcome.Fail].err{outcome.from_fail(ap.err)}; }
+        val ah: err[fail.Fail] = dq.fp_file_content(fb, ext_paths[i]);
+        if (sel ah.err) { ret err[outcome.Fail].err{outcome.from_fail(ah.err)}; }
         i = i + 1;
     }
-    val a5: R.Result[R.Void, str] = dq.fp_u32(fb, dynlib_count);        if (R.is_err[R.Void, str](a5)) { ret a5; }
+    val a5: err[fail.Fail] = dq.fp_u32(fb, dynlib_count);
+    if (sel a5.err) { ret err[outcome.Fail].err{outcome.from_fail(a5.err)}; }
     var j: u32 = 0;
     for (j < dynlib_count) {
-        val an: R.Result[R.Void, str] = dq.fp_u32(fb, dynlibs[j].name::u32);   if (R.is_err[R.Void, str](an)) { ret an; }
-        val as: R.Result[R.Void, str] = dq.fp_u32(fb, dynlibs[j].soname::u32); if (R.is_err[R.Void, str](as)) { ret as; }
-        val ar: R.Result[R.Void, str] = dq.fp_u32(fb, dynlibs[j].rpath::u32);  if (R.is_err[R.Void, str](ar)) { ret ar; }
+        val an: err[fail.Fail] = dq.fp_name(fb, ?p.s.interner, dynlibs[j].name);
+        if (sel an.err) { ret err[outcome.Fail].err{outcome.from_fail(an.err)}; }
+        val as: err[fail.Fail] = dq.fp_name(fb, ?p.s.interner, dynlibs[j].soname);
+        if (sel as.err) { ret err[outcome.Fail].err{outcome.from_fail(as.err)}; }
+        val ar: err[fail.Fail] = dq.fp_name(fb, ?p.s.interner, dynlibs[j].rpath);
+        if (sel ar.err) { ret err[outcome.Fail].err{outcome.from_fail(ar.err)}; }
+        var referenced: u8 = 0;
+        if (dynlibs[j].include_referenced) { referenced = 1; }
+        val ai: err[fail.Fail] = dq.fp_u8(fb, referenced);
+        if (sel ai.err) { ret err[outcome.Fail].err{outcome.from_fail(ai.err)}; }
         j = j + 1;
     }
-    ret R.ok_void[str]();
+    ret err[outcome.Fail].ok{};
+}
+
+test "mach.lang.build.engine.link_config:provider_policy_invalidates_without_changing_names" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val initialized: res[session.Session, fail.Fail] = session.init(?a);
+    if (sel initialized.err) { ret 2; }
+    var s: session.Session = initialized.ok;
+    fin { session.dnit(?s); }
+    var p: driver.Project;
+    project.init_project(?p, ?s);
+    fin { driver.dnit_project(?p); }
+    val name: res[intern.StrId, A.Error] = intern.intern(?s.interner, "provider");
+    if (sel name.err) { ret 3; }
+    var lib: of.DynLib = of.DynLib{
+        name:   name.ok,
+        soname: name.ok,
+        rpath:  intern.STR_NIL, include_referenced: false
+    };
+    val set_link_config_input_r: err[outcome.Fail] = set_link_config_input(?p, "app", "app", linker.LINK_EXE::u32,
+        nil, 0, ?lib, 1, nil);
+    if (sel set_link_config_input_r.err) { ret 4; }
+    val baseline: query.Revision = query.peek_revision(?s.queries, query.Q_LINK_CONFIG, 0);
+    if (baseline == 0) { ret 5; }
+    val set_link_config_input_r2: err[outcome.Fail] = set_link_config_input(?p, "app", "app", linker.LINK_EXE::u32,
+        nil, 0, ?lib, 1, nil);
+    if (sel set_link_config_input_r2.err)                                    { ret 6; }
+    if (query.peek_revision(?s.queries, query.Q_LINK_CONFIG, 0) != baseline) { ret 7; }
+    lib.include_referenced = true;
+    val set_link_config_input_r3: err[outcome.Fail] = set_link_config_input(?p, "app", "app", linker.LINK_EXE::u32,
+        nil, 0, ?lib, 1, nil);
+    if (sel set_link_config_input_r3.err) { ret 8; }
+    val changed: query.Revision = query.peek_revision(?s.queries, query.Q_LINK_CONFIG, 0);
+    if (changed == baseline) { ret 9; }
+    val set_link_config_input_r4: err[outcome.Fail] = set_link_config_input(?p, "app", "app", linker.LINK_EXE::u32,
+        nil, 0, ?lib, 1, nil);
+    if (sel set_link_config_input_r4.err)                                   { ret 10; }
+    if (query.peek_revision(?s.queries, query.Q_LINK_CONFIG, 0) != changed) { ret 11; }
+    ret 0;
 }
 
 rec PcgWorker {
@@ -1144,17 +1343,25 @@ rec ParallelCodegen {
     dbg:        codegen.DebugInfo;
 }
 
-fun pcg_worker_init(w: *PcgWorker, p: *driver.Project) O.Option[str] {
+fun pcg_worker_init(w: *PcgWorker, p: *driver.Project) err[outcome.Fail] {
     w.active = false;
-    if (O.is_some[str](page.make(?w.backing)))          { ret O.some[str]("parallel codegen: worker backing alloc failed"); }
-    if (O.is_some[str](arena.init(?w.ar, ?w.backing, 0))) { ret O.some[str]("parallel codegen: worker arena init failed"); }
-    if (O.is_some[str](arena.make(?w.alloc, ?w.ar)))     { arena.dnit(?w.ar); ret O.some[str]("parallel codegen: worker arena bind failed"); }
+    val make_r: err[A.Error] = page.make(?w.backing);
+    if (sel make_r.err) { ret err[outcome.Fail].err{outcome.internal("parallel codegen: worker backing alloc failed")}; }
+    val init_r: err[A.Error] = arena.init(?w.ar, ?w.backing, 0);
+    if (sel init_r.err) { ret err[outcome.Fail].err{outcome.internal("parallel codegen: worker arena init failed")}; }
+    val make_r2: err[A.Error] = arena.make(?w.alloc, ?w.ar);
+    if (sel make_r2.err) {
+        arena.dnit(?w.ar);
+        ret err[outcome.Fail].err{outcome.internal("parallel codegen: worker arena bind failed")};
+    }
 
+    # the worker's session view borrows the project's registry by pointer;
+    # the project session is its one owner and outlives every worker
     w.sess          = @p.s;
     w.sess.alloc    = ?w.alloc;
     w.sess.interner = intern.make_child(?p.s.interner, ?w.alloc);
     w.active        = true;
-    ret O.none[str]();
+    ret err[outcome.Fail].ok{};
 }
 
 fun pcg_worker_teardown(w: *PcgWorker) {
@@ -1164,10 +1371,10 @@ fun pcg_worker_teardown(w: *PcgWorker) {
 }
 
 fun pcg_stable_err(p: *driver.Project, msg: str) str {
-    val ir: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, msg);
-    if (R.is_ok[intern.StrId, str](ir)) {
-        val nm: O.Option[str] = intern.lookup(?p.s.interner, R.unwrap_ok[intern.StrId, str](ir));
-        if (O.is_some[str](nm)) { ret O.unwrap[str](nm); }
+    val ir: res[intern.StrId, A.Error] = intern.intern(?p.s.interner, msg);
+    if (sel ir.ok) {
+        val nm: opt[str] = intern.lookup(?p.s.interner, ir.ok);
+        if (sel nm.some) { ret nm.some; }
     }
     ret "parallel codegen failed, and re-homing its diagnostic off the worker arena failed in turn (allocation failure)";
 }
@@ -1177,8 +1384,8 @@ fun pcg_worker_main(arg: *u8) {
     if (pc == nil) { ret; }
     val wid_raw: i64 = atomic.fetch_add(?pc.worker_seq, 1::i64);
     if (wid_raw < 0 || wid_raw >= pc.nworkers::i64) { ret; }
-    val wid: u32 = wid_raw::u32;
-    val w: *PcgWorker = ?pc.workers[wid::usize];
+    val wid: u32        = wid_raw::u32;
+    val w:   *PcgWorker = ?pc.workers[wid::usize];
 
     for (true) {
         if (atomic.load(?pc.stop) != 0) { ret; }
@@ -1186,114 +1393,128 @@ fun pcg_worker_main(arg: *u8) {
         if (idx_raw >= pc.stale_len::i64) { ret; }
         val idx: u32 = idx_raw::u32;
 
-        val mid:  session.ModuleId = pc.p.topo[pc.stale[idx::usize]];
-        val m:    *driver.ModuleEntry     = ?pc.p.modules[mid::u32];
-        val slot: *PcgSlot         = ?pc.slots[idx::usize];
+        val mid:  session.ModuleId    = pc.p.topo[pc.stale[idx::usize]];
+        val m:    *driver.ModuleEntry = ?pc.p.modules[mid::u32];
+        val slot: *PcgSlot            = ?pc.slots[idx::usize];
         slot.worker = wid;
 
-        val t0: ctime.Time = ctime.monotonic();
+        val t0: readout.Instant = readout.sample();
 
-        val srcs_r: R.Result[driver.CodeSources, str] = driver.code_sources(pc.p, mid, ?w.alloc);
-        if (R.is_err[driver.CodeSources, str](srcs_r)) {
-            slot.fail   = fail.message(R.unwrap_err[driver.CodeSources, str](srcs_r));
+        val srcs_r: res[driver.CodeSources, fail.Fail] = driver.code_sources(pc.p, mid, ?w.alloc);
+        if (sel srcs_r.err) {
+            slot.fail   = srcs_r.err;
             slot.failed = true;
-            slot.image = nil;
+            slot.image  = nil;
             atomic.store(?pc.stop, 1::i64);
             ret;
         }
-        var srcs: driver.CodeSources = R.unwrap_ok[driver.CodeSources, str](srcs_r);
+        var srcs: driver.CodeSources = srcs_r.ok;
 
-        val r: R.Result[of.ObjectImage, fail.Fail] = codegen.codegen_module(?w.sess, ?pc.p.target, m.ir_module, srcs.set, nil, pc.p.req.placement_policy, pc.dbg);
+        val r: res[of.ObjectImage, fail.Fail] = codegen.codegen_unit(?w.sess, ?pc.p.target, m.ir_module, srcs.set, nil, pc.p.req.placement_policy, pc.dbg);
         driver.sources_dnit(?w.alloc, ?srcs);
-        slot.d = ctime.time_sub(ctime.monotonic(), t0);
-        if (R.is_err[of.ObjectImage, fail.Fail](r)) {
-            slot.fail   = R.unwrap_err[of.ObjectImage, fail.Fail](r);
+        slot.d = readout.elapsed(t0);
+        if (sel r.err) {
+            slot.fail   = r.err;
             slot.failed = true;
-            slot.image = nil;
+            slot.image  = nil;
             atomic.store(?pc.stop, 1::i64);
             ret;
         }
-        var img: of.ObjectImage = R.unwrap_ok[of.ObjectImage, fail.Fail](r);
-        val br: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](?w.alloc, 1::usize);
-        if (R.is_err[*of.ObjectImage, str](br)) {
+        var img: of.ObjectImage                = r.ok;
+        val br:  res[*of.ObjectImage, A.Error] = A.allocate[of.ObjectImage](?w.alloc, 1::usize);
+        if (sel br.err) {
             slot.fail   = fail.message("parallel codegen: worker image box allocation failed");
             slot.failed = true;
-            slot.image = nil;
+            slot.image  = nil;
             atomic.store(?pc.stop, 1::i64);
             ret;
         }
-        val box: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](br);
-        box[0]     = img;
-        slot.image = box;
+        val box: *of.ObjectImage = br.ok;
+        box[0]      = img;
+        slot.image  = box;
         slot.failed = false;
     }
 }
 
-fun run_codegen_parallel(p: *driver.Project) R.Result[R.Void, fail.Fail] {
+fun run_codegen_parallel(p: *driver.Project) err[fail.Fail] {
     val emit_len: u32 = p.emit_len;
-    if (emit_len == 0) { ret R.ok_void[fail.Fail](); }
+    if (emit_len == 0) { ret err[fail.Fail].ok{}; }
 
-    val rstale: R.Result[*u32, str] = A.allocate[u32](p.alloc, emit_len::usize);
-    if (R.is_err[*u32, str](rstale)) { ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*u32, str](rstale))); }
-    val stale: *u32 = R.unwrap_ok[*u32, str](rstale);
-    var stale_len: u32 = 0;
-    var ti: u32 = 0;
+    val rstale: res[*u32, A.Error] = A.allocate[u32](p.alloc, emit_len::usize);
+    if (sel rstale.err) { ret err[fail.Fail].err{fail.refused(rstale.err)}; }
+    val stale:     *u32 = rstale.ok;
+    var stale_len: u32  = 0;
+    var ti:        u32  = 0;
     for (ti < emit_len) {
-        if (!driver.codegen_reusable(p, p.topo[ti])) {
+        val reusable: res[bool, fail.Fail] = passes.codegen_reusable(p, p.topo[ti]);
+        if (sel reusable.err) {
+            A.deallocate[u32](p.alloc, stale, emit_len::usize);
+            ret err[fail.Fail].err{reusable.err};
+        }
+        if (!reusable.ok) {
             stale[stale_len] = ti;
-            stale_len = stale_len + 1;
+            stale_len        = stale_len + 1;
         }
         ti = ti + 1;
     }
     if (stale_len <= 1) {
         A.deallocate[u32](p.alloc, stale, emit_len::usize);
-        ret R.ok_void[fail.Fail]();
+        ret err[fail.Fail].ok{};
     }
 
     var nworkers: u32 = p.req.jobs;
-    if (nworkers == 0)         { nworkers = 1; }
-    if (nworkers > stale_len)  { nworkers = stale_len; }
+    if (nworkers == 0)        { nworkers = 1; }
+    if (nworkers > stale_len) { nworkers = stale_len; }
 
     if (nworkers <= 1) {
         A.deallocate[u32](p.alloc, stale, emit_len::usize);
-        ret R.ok_void[fail.Fail]();
+        ret err[fail.Fail].ok{};
     }
 
-    val rslots: R.Result[*PcgSlot, str] = A.allocate[PcgSlot](p.alloc, stale_len::usize);
-    if (R.is_err[*PcgSlot, str](rslots)) {
+    val rslots: res[*PcgSlot, A.Error] = A.allocate[PcgSlot](p.alloc, stale_len::usize);
+    if (sel rslots.err) {
         A.deallocate[u32](p.alloc, stale, emit_len::usize);
-        ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*PcgSlot, str](rslots)));
+        ret err[fail.Fail].err{fail.refused(rslots.err)};
     }
-    val slots: *PcgSlot = R.unwrap_ok[*PcgSlot, str](rslots);
-    var si: u32 = 0;
-    for (si < stale_len) { slots[si].image = nil; slots[si].worker = 0; slots[si].failed = false; slots[si].d = 0; si = si + 1; }
+    val slots: *PcgSlot = rslots.ok;
+    var si:    u32      = 0;
+    for (si < stale_len) {
+        slots[si].image  = nil;
+        slots[si].worker = 0;
+        slots[si].failed = false;
+        slots[si].d      = 0;
+        si               = si + 1;
+    }
 
-    val rdbg: R.Result[codegen.DebugInfo, str] = driver.debug_info_of(p);
-    if (R.is_err[codegen.DebugInfo, str](rdbg)) {
+    val rdbg: res[codegen.DebugInfo, fail.Fail] = driver.debug_info_of(p);
+    if (sel rdbg.err) {
         A.deallocate[PcgSlot](p.alloc, slots, stale_len::usize);
         A.deallocate[u32](p.alloc, stale, emit_len::usize);
-        ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[codegen.DebugInfo, str](rdbg)));
+        ret err[fail.Fail].err{rdbg.err};
     }
-    val dbg: codegen.DebugInfo = R.unwrap_ok[codegen.DebugInfo, str](rdbg);
+    val dbg: codegen.DebugInfo = rdbg.ok;
 
-    val rworkers: R.Result[*PcgWorker, str] = A.allocate[PcgWorker](p.alloc, nworkers::usize);
-    if (R.is_err[*PcgWorker, str](rworkers)) {
+    val rworkers: res[*PcgWorker, A.Error] = A.allocate[PcgWorker](p.alloc, nworkers::usize);
+    if (sel rworkers.err) {
         A.deallocate[PcgSlot](p.alloc, slots, stale_len::usize);
         A.deallocate[u32](p.alloc, stale, emit_len::usize);
-        ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*PcgWorker, str](rworkers)));
+        ret err[fail.Fail].err{fail.refused(rworkers.err)};
     }
-    val workers: *PcgWorker = R.unwrap_ok[*PcgWorker, str](rworkers);
+    val workers: *PcgWorker = rworkers.ok;
 
     var wi: u32 = 0;
     for (wi < nworkers) {
-        val io: O.Option[str] = pcg_worker_init(?workers[wi], p);
-        if (O.is_some[str](io)) {
+        val io: err[outcome.Fail] = pcg_worker_init(?workers[wi], p);
+        if (sel io.err) {
             var wj: u32 = 0;
-            for (wj < wi) { pcg_worker_teardown(?workers[wj]); wj = wj + 1; }
+            for (wj < wi) {
+                pcg_worker_teardown(?workers[wj]);
+                wj = wj + 1;
+            }
             A.deallocate[PcgWorker](p.alloc, workers, nworkers::usize);
             A.deallocate[PcgSlot](p.alloc, slots, stale_len::usize);
             A.deallocate[u32](p.alloc, stale, emit_len::usize);
-            ret R.err[R.Void, fail.Fail](fail.message(O.unwrap[str](io)));
+            ret err[fail.Fail].err{fail.message(outcome.describe(io.err))};
         }
         wi = wi + 1;
     }
@@ -1311,20 +1532,26 @@ fun run_codegen_parallel(p: *driver.Project) R.Result[R.Void, fail.Fail] {
     ctx.dbg        = dbg;
 
     var threads: *thread.Thread = nil;
-    val extra: u32 = nworkers - 1;
+    val extra:   u32            = nworkers - 1;
     if (extra > 0) {
-        val rt: R.Result[*thread.Thread, str] = A.allocate[thread.Thread](p.alloc, extra::usize);
-        if (R.is_err[*thread.Thread, str](rt)) {
+        val rt: res[*thread.Thread, A.Error] = A.allocate[thread.Thread](p.alloc, extra::usize);
+        if (sel rt.err) {
             var wk: u32 = 0;
-            for (wk < nworkers) { pcg_worker_teardown(?workers[wk]); wk = wk + 1; }
+            for (wk < nworkers) {
+                pcg_worker_teardown(?workers[wk]);
+                wk = wk + 1;
+            }
             A.deallocate[PcgWorker](p.alloc, workers, nworkers::usize);
             A.deallocate[PcgSlot](p.alloc, slots, stale_len::usize);
             A.deallocate[u32](p.alloc, stale, emit_len::usize);
-            ret R.err[R.Void, fail.Fail](fail.message(R.unwrap_err[*thread.Thread, str](rt)));
+            ret err[fail.Fail].err{fail.refused(rt.err)};
         }
-        threads = R.unwrap_ok[*thread.Thread, str](rt);
+        threads = rt.ok;
         var k: u32 = 0;
-        for (k < extra) { thread.spawn_with(pcg_worker_main, (?ctx)::*u8, ?threads[k]); k = k + 1; }
+        for (k < extra) {
+            thread.spawn_with(pcg_worker_main, (?ctx)::*u8, ?threads[k]);
+            k = k + 1;
+        }
     }
 
     pcg_worker_main((?ctx)::*u8);
@@ -1349,79 +1576,83 @@ fun run_codegen_parallel(p: *driver.Project) R.Result[R.Void, fail.Fail] {
     var ei: u32 = 0;
     for (ei < stale_len) {
         if (slots[ei].failed) {
-            val msg: str = pcg_stable_err(p, slots[ei].fail.message);
-            var wk: u32 = 0;
-            for (wk < nworkers) { pcg_worker_teardown(?workers[wk]); wk = wk + 1; }
+            val msg: str = pcg_stable_err(p, fail.describe(slots[ei].fail));
+            var wk:  u32 = 0;
+            for (wk < nworkers) {
+                pcg_worker_teardown(?workers[wk]);
+                wk = wk + 1;
+            }
             A.deallocate[PcgWorker](p.alloc, workers, nworkers::usize);
             A.deallocate[PcgSlot](p.alloc, slots, stale_len::usize);
             A.deallocate[u32](p.alloc, stale, emit_len::usize);
-            ret R.err[R.Void, fail.Fail](fail.message(msg));
+            ret err[fail.Fail].err{fail.message(msg)};
         }
         ei = ei + 1;
     }
 
-    val cr: R.Result[R.Void, str] = pcg_collect(p, ?ctx);
+    val cr: err[outcome.Fail] = pcg_collect(p, ?ctx);
 
     var wk: u32 = 0;
-    for (wk < nworkers) { pcg_worker_teardown(?workers[wk]); wk = wk + 1; }
+    for (wk < nworkers) {
+        pcg_worker_teardown(?workers[wk]);
+        wk = wk + 1;
+    }
     A.deallocate[PcgWorker](p.alloc, workers, nworkers::usize);
     A.deallocate[PcgSlot](p.alloc, slots, stale_len::usize);
     A.deallocate[u32](p.alloc, stale, emit_len::usize);
-    ret fail.lift[R.Void](cr);
+    if (sel cr.err) { ret err[fail.Fail].err{fail.message(outcome.describe(cr.err))}; }
+    ret err[fail.Fail].ok{};
 }
 
-fun pcg_collect(p: *driver.Project, ctx: *ParallelCodegen) R.Result[R.Void, str] {
+fun pcg_collect(p: *driver.Project, ctx: *ParallelCodegen) err[outcome.Fail] {
     val nworkers: u32 = ctx.nworkers;
 
-    val rmaps: R.Result[*intern.ReinternMap, str] =
-        A.allocate[intern.ReinternMap](p.alloc, nworkers::usize);
-    if (R.is_err[*intern.ReinternMap, str](rmaps)) {
-        ret R.err[R.Void, str](R.unwrap_err[*intern.ReinternMap, str](rmaps));
+    val rmaps: res[*intern.ReinternMap, A.Error] = A.allocate[intern.ReinternMap](p.alloc, nworkers::usize);
+    if (sel rmaps.err) {
+        ret err[outcome.Fail].err{outcome.refused(rmaps.err)};
     }
-    val remaps: *intern.ReinternMap = R.unwrap_ok[*intern.ReinternMap, str](rmaps);
+    val remaps: *intern.ReinternMap = rmaps.ok;
 
     var wi: u32 = 0;
     for (wi < nworkers) {
-        val rr: R.Result[intern.ReinternMap, str] =
-            intern.reintern_child(?workers_at(ctx, wi).sess.interner, p.alloc);
-        if (R.is_err[intern.ReinternMap, str](rr)) {
+        val rr: res[intern.ReinternMap, A.Error] = intern.reintern_child(?workers_at(ctx, wi).sess.interner, p.alloc);
+        if (sel rr.err) {
             pcg_free_remaps(p, remaps, wi);
             A.deallocate[intern.ReinternMap](p.alloc, remaps, nworkers::usize);
-            ret R.err[R.Void, str](R.unwrap_err[intern.ReinternMap, str](rr));
+            ret err[outcome.Fail].err{outcome.refused(rr.err)};
         }
-        remaps[wi] = R.unwrap_ok[intern.ReinternMap, str](rr);
-        wi = wi + 1;
+        remaps[wi] = rr.ok;
+        wi         = wi + 1;
     }
 
     var i: u32 = 0;
     for (i < ctx.stale_len) {
-        val slot: *PcgSlot = ?ctx.slots[i::usize];
-        val rehomed: R.Result[of.ObjectImage, str] =
-            obj.rehome_remap(p.s.alloc, ?p.s.interner, slot.image, remaps[slot.worker]);
-        if (R.is_err[of.ObjectImage, str](rehomed)) {
+        val slot:    *PcgSlot                       = ?ctx.slots[i::usize];
+        val rehomed: res[of.ObjectImage, fail.Fail] = obj.rehome(p.s.alloc, ?p.s.interner, slot.image, remaps[slot.worker]);
+        if (sel rehomed.err) {
             pcg_free_remaps(p, remaps, nworkers);
             A.deallocate[intern.ReinternMap](p.alloc, remaps, nworkers::usize);
-            ret R.err[R.Void, str](R.unwrap_err[of.ObjectImage, str](rehomed));
+            ret err[outcome.Fail].err{outcome.from_fail(rehomed.err)};
         }
-        val rbox: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](p.s.alloc, 1::usize);
-        if (R.is_err[*of.ObjectImage, str](rbox)) {
-            var tmp: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](rehomed);
+        val rbox: res[*of.ObjectImage, A.Error] = A.allocate[of.ObjectImage](p.s.alloc, 1::usize);
+        if (sel rbox.err) {
+            var tmp: of.ObjectImage = rehomed.ok;
             obj.dnit(?tmp);
             pcg_free_remaps(p, remaps, nworkers);
             A.deallocate[intern.ReinternMap](p.alloc, remaps, nworkers::usize);
-            ret R.err[R.Void, str](R.unwrap_err[*of.ObjectImage, str](rbox));
+            ret err[outcome.Fail].err{outcome.refused(rbox.err)};
         }
-        val box: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](rbox);
-        box[0] = R.unwrap_ok[of.ObjectImage, str](rehomed);
+        val box: *of.ObjectImage = rbox.ok;
+        box[0] = rehomed.ok;
 
         val mid: session.ModuleId = p.topo[ctx.stale[i::usize]];
         p.modules[mid::u32].staged_image = box;
-        i = i + 1;
+        i                                = i + 1;
     }
 
     pcg_free_remaps(p, remaps, nworkers);
     A.deallocate[intern.ReinternMap](p.alloc, remaps, nworkers::usize);
-    ret R.ok_void[str]();
+    ret err[outcome.Fail].ok{};
 }
 
 fun workers_at(ctx: *ParallelCodegen, wi: u32) *PcgWorker {

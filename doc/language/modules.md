@@ -16,19 +16,23 @@ syntactically uniform regardless of where it appears.
 ## Bare project-id imports
 
 A one-segment `use`/`fwd` path equal to a resolvable project id — a dependency's
-id or the current project's own id — binds that project's **public module**,
-the module its artifacts enter at. For a dependency that is the `entry` its
-artifacts share: `std` declares one `static` artifact with
-`entry = "lib/libstd.mach"`, so `use std;` binds the module `std.lib.libstd`.
-For the current project it is the selected artifact's entry. A dependency
-whose artifacts name different entries has no single public module, and a
-bare import of it is an error (`project 'x' has no public module because its
-artifacts name different entries; import a full path, or give every
-[artifact.*] table in its manifest the same entry`). Longer paths are
-unaffected. A dependency that declares no artifact at all falls back to
-`lib.mach` (`dep 'lib1' mach.toml: default entry names no file` when that
-file is absent); the fallback is removed in 5.0.0, so a library should
-declare its artifact.
+id or the current project's own id — binds that project's **public module**.
+For a dependency that is the `entry` shared by its library artifacts marked
+`default = true`: a library that declares one `static` artifact with
+`default = true` and `entry = "lib/libstd.mach"` gives `use std;` the module
+`std.lib.libstd`. Several default `static`/`shared` artifacts may share that
+entry; a `bin` never publishes one. For the current project it is the selected
+artifact's entry. A dependency with no default library artifact, or whose
+default library artifacts name different entries, has no public module, and a
+bare import of it is an error (`project 'x' has no public module: a bare
+import binds the entry shared by its library artifacts marked `default =
+true`; import a full path, or mark one static or shared [artifact.*] table (or
+several sharing one entry) default = true in its manifest`). Longer paths are
+unaffected: `use std.print;` needs no default artifact. A dependency that
+declares no artifact at all has no public module either, and the refusal says
+so (`project 'x' declares no artifact, so it has no public module: import a
+full path, or declare a static or shared [artifact.*] table marked default =
+true in its manifest`), so a library declares its artifact.
 
 ## Shadow-module pattern
 
@@ -47,6 +51,31 @@ myproj/
 The surface loads each split with `use myproj.foo.a;` and re-exports its
 public symbols with `fwd a.X;`. Consumers `use myproj.foo;` and access
 symbols through the surface — they never name the split files directly.
+
+```mach
+# file: src/foo/a.mach
+pub fun one() i64 { ret 1; }
+
+# file: src/foo/b.mach
+pub fun two() i64 { ret 2; }
+
+# file: src/foo.mach
+use example.foo.a;
+use example.foo.b;
+fwd a.one;
+fwd b.two;
+
+# file: src/root.mach
+use std.runtime;
+use print: std.print;
+use example.foo;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.printlnf("{}", foo.one() + foo.two());
+    ret 0;
+}
+```
 
 Two common uses:
 

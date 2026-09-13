@@ -1,173 +1,110 @@
 # Contributing to Mach
 
-Thank you for your interest in contributing to Mach!
+Thank you for your interest in contributing to Mach. Be respectful,
+constructive, and professional: treat Mach like a passion project and its
+community like family.
 
----
 
-## Code of Conduct
+## Building
 
-Be respectful, constructive, and professional. Treat Mach like a passion project and its community like family.
-
----
-
-## Getting Started
-
-### Prerequisites
-
-- Git
-- An existing `mach` binary. Mach is self-hosting, so building from source needs one. Install the latest [release](https://github.com/briar-systems/mach/releases).
-
-### Building
-
-Mach builds its own source with an existing `mach`:
+Mach is self-hosting, so building it needs an existing Mach compiler, which is available as a precompiled binary on the [releases](https://github.com/briar-systems/mach/releases) page.
 
 ```bash
 git clone https://github.com/briar-systems/mach.git
 cd mach
-mach dep pull
+mach dep pull .
 mach build .
 ```
 
-The compiler is written to `out/<target>/<profile>/bin/mach`, or `bin/mach.exe`
-on Windows. A default Linux x86_64 build writes
+The compiler is written to `out/<target>/<profile>/bin/mach`, or
+`bin/mach.exe` on Windows. A default Linux x86_64 build writes
 `out/linux-x86_64/debug/bin/mach`.
 
-The installed compiler is the seed. Build generation A with the seed, B with
-A, and C with B. Release verification requires B and C to be byte-identical.
-A can differ from B while the installed seed carries an older code generator.
-See the [release shape](doc/design/release-shape.md) for the seed transition.
 
----
+## Testing and formatting
 
-## Branching Strategy
+Run the tests and the formatter through the compiler you just built, never
+the seed on `PATH`:
 
-We use a two-branch model:
+```bash
+out/linux-x86_64/debug/bin/mach test .
+out/linux-x86_64/debug/bin/mach test . --profile release
+out/linux-x86_64/debug/bin/mach fmt .
+```
 
-- **`main`**: Stable branch. Tagged releases only.
-- **`dev`**: Development branch. Integration point for features and fixes.
+The tree is canonical: `mach fmt .` must leave it unchanged before a pull
+request is opened (`mach fmt --check .` reports what differs).
 
-Features and fixes branch off `dev` and return through a pull request. Releases integrate `dev` into `main` and tag the merge commit. A hotfix branches off `main` and merges into both long-lived branches.
+`bash test/run.sh` runs the codegen corpus against the external decoders and
+the C reference, and `bash test/run.sh --link` the link cases; see
+[test/README.md](test/README.md).
 
-### Branch Naming
 
-- `feat/<issue>`: New features
-- `fix/<issue>`: Fixes, including documentation corrections
-- `hotfix/<issue>`: Urgent release fixes
+## Branching
 
-### Contributing Changes
+- `main` holds tagged releases only. It takes integration merges from `dev`.
+- `dev` is the integration branch and the target of every pull request.
+- `feat/<issue>` and `fix/<issue>` branch off `dev` and return to it.
+- `hotfix/<issue>` branches off `main` and merges into both `main` and `dev`.
 
-1. **Fork the repository**
-2. **Create a feature branch from `dev`:**
-   ```bash
-   git checkout dev
-   git pull origin dev
-   git checkout -b feat/1234
-   ```
-3. **Make your changes** following the coding standards below
-4. **Make small, self-contained conventional commits:**
-   ```
-   fix(component): brief description
 
-   Longer explanation if needed.
-   ```
-5. **Push to your fork:**
-   ```bash
-   git push origin feat/1234
-   ```
-6. **Open a draft Pull Request** targeting `dev`, then mark it ready when complete
+## Commits
 
-Replace `1234` with the issue number. Use `fix/1234` for a fix.
+Commits are small, self-contained, and conventional. The issue number is the
+scope:
 
-**Pull Request Guidelines:**
+```
+fix(#1234): brief description
 
-- Target `dev` branch (not `main`)
-- Provide clear description of changes
-- Link the issue with `Closes #N`
-- Verify compiler changes from a detached checkout of the committed tip
-- Ensure the compiler builds and reaches the B/C byte-identical fixpoint
-- Run the built compiler's test suite in both debug and release profiles
-- Follow coding standards
-- Merge with a merge commit, without rebasing or fast-forwarding
-- Close the linked issue after a merge to a non-default branch
+Longer explanation if needed.
+```
+
+The types are `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, and
+`style`. A change with no issue uses `chore: ...` with no scope.
+
+If no related issue exists, just supply a type without the scope, e.g:
+
+```
+chore: update dependencies
+```
+
+
+## Pull requests
+
+- Open as a draft targeting `dev`; mark it ready when it is done.
+- Link the issue with `Closes #N`.
+- Add a line to the `## [Unreleased]` section of `CHANGELOG.md` under the
+  matching heading (`Added`, `Changed`, `Fixed`, `Removed`) for anything a
+  user can observe.
+- Put the verification evidence in the body: the fixpoint and the test
+  counts in both profiles.
+- Merge with a merge commit. Never rebase or fast-forward.
+- When the target is not the default branch, close the linked issue by hand
+  after the merge.
+
+
+## Issues
+
+File issues through the templates. Each template names the sidebar fields a
+template cannot set: the type label, the `area:*` labels, a `target:*` label
+when the work is target-specific, and the milestone.
+
 
 ## Versioning
 
-Mach uses [Semantic Versioning](https://semver.org/) (`vMAJOR.MINOR.PATCH`):
-
-- **MAJOR**: Breaking changes to the supported compiler surface
-- **MINOR**: New features and backward-compatible additions
-- **PATCH**: Bug fixes, documentation, and internal improvements
-
-Tags are created and pushed on `main` after merging from `dev`. The standard
-library is versioned separately in its own repository. The
-[4.30.0 / 5.0.0 release shape](doc/design/release-shape.md) records the current
-migration window and the compatibility limits of the transition release.
+Mach uses [semantic versioning](https://semver.org/) (`vMAJOR.MINOR.PATCH`):
+MAJOR for breaking changes to the supported compiler surface, MINOR for
+backward-compatible additions, PATCH for fixes, documentation, and internal
+improvements. The standard library is versioned separately in its own
+repository.
 
 A release bump updates both `[project].version` in `mach.toml` and
-`MACH_VERSION` in `src/lang/version.mach`. CI and the tag workflow require the
-two values to match.
+`MACH_VERSION` in `src/lang/version.mach`; CI and the tag workflow require
+the two to match. Tags are created on `main` after the integration merge
+from `dev`.
 
-### Release Flow
-
-```
-dev (ongoing work)
- └─► merge to main
-      └─► tag vX.Y.Z on main
-```
-
----
-
-## Reporting Issues
-
-**Bugs:**
-- Check existing issues first
-- Provide minimal reproduction case
-- Include version info, OS, error messages
-- Attach relevant files if applicable
-
-**Enhancements:**
-- Align with Mach's philosophy (simplicity, explicitness, predictability)
-- Provide concrete use cases
-- Consider if it can be a library instead
-
----
-
-## Coding Standards
-
-### Mach Code (in `src/` and `dep/std/`)
-
-Mach coding standards are in flux while syntax stabilizes and the userbase grows. Follow existing patterns and refer to the [language reference](doc/language/README.md) for language features.
-
----
-
-## Project Structure
-
-```
-mach/
-├── dep/               # dependency realizations
-│   └── std/           # standard library, pinned by a committed gitlink
-├── doc/               # documentation
-├── src/               # self-hosting mach compiler
-├── out/               # ignored build output, grouped by target and profile
-└── mach.toml          # project configuration
-```
-
-The standard library lives in a separate repository
-([mach-std](https://github.com/briar-systems/mach-std)). `[dep.std]` declares
-its source and selector in `mach.toml`, `.gitmodules` records its submodule
-location, and the committed gitlink at `dep/std` pins the exact revision.
-`mach dep pull` initializes that pin in place. Builds verify the dependency
-without fetching or advancing its selector. See the
-[dependency model](doc/design/dependency-model.md).
-
-Building from source uses an existing `mach` (the latest release). See [Getting Started](#getting-started). The original bootstrap seed ([mach-boot](https://github.com/briar-systems/mach-boot)) is no longer part of the build. It remains only as a from-scratch cold-start hatch.
-
----
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the [MIT License](LICENSE).
-
----
-
-Thank you for contributing to Mach!
+By contributing, you agree that your contributions will be licensed under the
+[MIT License](LICENSE).

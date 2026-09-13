@@ -37,12 +37,25 @@ fwd deep: demo.deep.beta;   # re-exports module under 'deep'
 
 A consumer reaches the alias's members with qualified access, chaining
 through any depth of re-export — including a `fwd` of another library's
-`fwd`:
+`fwd`. In a project whose `[project] id` is `example`:
 
 ```mach
-use demo.lib;               # lib.mach contains `fwd demo.alpha;`
+# file: src/alpha.mach
+pub fun answer() i64 { ret 42; }
 
-lib.alpha.answer();         # resolves through the module re-export
+# file: src/lib.mach
+fwd example.alpha;          # re-exports module 'alpha'
+
+# file: src/root.mach
+use std.runtime;
+use print: std.print;
+use example.lib;            # lib.mach contains `fwd example.alpha;`
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.printlnf("{}", lib.alpha.answer());   # resolves through the module re-export
+    ret 0;
+}
 ```
 
 As with `use`, a module alias is not a value; only its members can be

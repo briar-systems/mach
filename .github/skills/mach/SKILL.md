@@ -1,6 +1,6 @@
 ---
 name: mach
-description: Use when writing, editing, or reviewing Mach (.mach) source files. Covers the full language: project/module structure, use/fwd imports and re-exports, the shadow-module pattern, all declaration forms (def, rec, uni, fun, ext fun, val/var, test), the type grammar with the ^ secret qualifier, literals, operators and casts, statements, docstring conventions, stdlib idioms (Result/Option, std.print), the comptime channel ($mach.*/$project.*/$bin.* reads, $if/$or, $each, intrinsics, comptime parameters, variadic packs), #[...] decorators, and inline assembly (asm x86_64/aarch64/riscv64).
+description: Use when writing, editing, or reviewing Mach (.mach) source files. Covers the full Mach 5 language: project/module structure, use/fwd imports and re-exports, the shadow-module pattern, all declaration forms (def, rec, uni, tag, fun, ext fun, val/var, test), tagged values with sel and lexical guards, the std failure tags res/opt/err, the type grammar with the ^ secret qualifier, literals, operators and casts, statements, docstring conventions, stdlib idioms (std.print), the comptime channel ($mach.*/$project.*/$bin.* reads, $if/$or, $each, intrinsics, comptime parameters, variadic packs), #[...] decorators including #[deprecated], and inline assembly (asm x86_64/aarch64/riscv64).
 ---
 
 # Mach
@@ -33,9 +33,15 @@ authoritative reference and wins on any disagreement.
 - **Strings are `*u8`, single-line.** `"hello"` is a pointer to null-terminated
   bytes. No fat-pointer string type (`str` is `def str: *char;`); no multi-line
   string literal - use `\n` escapes.
-- **No tagged unions, no `match`.** A discriminated value is a `rec` carrying a
-  discriminator plus a payload `uni`; consumers branch with `if`/`or`. This is
-  exactly how stdlib `Result[T, E]` is built.
+- **Tagged values are `tag`, tested with `sel`, read under a guard.** A
+  discriminated value is `tag Name: u8 { case; case: T; }`, constructed as
+  `Name.case{payload}`, tested with `sel place.case`, and its payload
+  `place.case` is readable only inside a lexical guard (the `if` arm whose
+  condition is exactly `sel place.case`, the rest of the block after a chain
+  whose every arm exits, or the right operand of `&&`). There is no `match`
+  and no `==` on a tag. std 2.0.0's `res[T, E]`, `opt[T]` and `err[E]` are
+  ordinary tags imported from `std.types.result`, `std.types.option` and `std.types.error`.
+- **`sel` is a keyword.** Never name a binding, field or function `sel`.
 - **No compound assignment.** `+=` etc. do not exist; write `x = x + 1;`.
 - **`fwd` is bare and always public** (no `pub fwd`). `ext fun` is the only
   body-less function form.
@@ -46,9 +52,9 @@ A project has a `mach.toml` at its root; `[project] id` roots every module
 path. A file at `src/foo/bar.mach` in project `id = "myproj"` is the module
 `myproj.foo.bar`. There is no `this.` self-prefix - always use the full
 project-rooted path, including for sibling modules. A one-segment `use <id>;`
-resolves only when that project declares a `[project] module` surface file
-(e.g. a library `glfw` imported as `use glfw;`); `std` does not - always
-import full `std.*` paths.
+binds the entry shared by that project's library artifacts marked
+`default = true` (e.g. a library `glfw` imported as `use glfw;`); std 2.0.0
+marks none, so always import full `std.*` paths.
 
 An artifact build roots its module graph at `[artifact.*].entry` and compiles only
 that module plus its active transitive `use`/`fwd` dependencies. A sibling source
@@ -105,11 +111,13 @@ fwd impl.page_size;
 
 ## Entrypoint and output
 
-An artifact's `out` is literal across every target it names. A cross-platform
-executable therefore uses disjoint artifacts for extension conventions:
-`out = "bin/app"` for non-Windows targets and `out = "bin/app.exe"` for Windows.
-`mach init` emits that split for binary projects. Do not use one `targets = ["*"]`
-artifact when its output must be directly executable on Windows and elsewhere.
+An artifact's `out` expands `{artifact.suffix}` using its selected target's naming
+rules. `out = "bin/app{artifact.suffix}"` gives `app.exe` on Windows and `app` on
+Linux/Darwin with one stable artifact identity. Literal output paths stay literal.
+`mach init` emits one artifact with this placeholder. `need` entries are qualified:
+`step.generate`, `artifact.support`, or globs such as `artifact.shader-*`. A root
+manifest declares at least one `[profile.<name>]`, and every declared profile
+states all five policy keys: `opt`, `debug`, `simd`, `vectorize`, `float_reassoc`.
 
 The stdlib provides the platform `_start`, which calls whatever function
 exports the linker symbol `main`. `use std.runtime;` is required to link it in
@@ -130,8 +138,9 @@ fun main(argc: i64, argv: **u8) i64 {
 It exposes `print`/`println` (stdout), `eprint`/`eprintln` (stderr), and the
 format family `printf`/`printlnf`/`eprintf`/`eprintlnf` - pack-variadic, with
 `{}` holes filled in argument order plus `{:x}`-style specs (`{:X}`, `{:c}`,
-`{:5}`, `{:<5}`, `{:08x}`; `{{`/`}}` for literal braces). All return
-`Result[usize, str]`.
+`{:5}`, `{:<5}`, `{:08x}`; `{{`/`}}` for literal braces). `print`/`println`
+return `res[usize, WriteError]`, the format family `res[usize, FormatError]`;
+a call whose result is discarded is fine.
 
 ### Windows executable resources
 
@@ -164,8 +173,8 @@ print.printlnf("built {} in {}ms", name, elapsed);
 ## Declarations
 
 Modifiers: `pub` (public surface; without it a declaration is file-private)
-applies to `fun`, `rec`, `uni`, `def`, `val`, `var`; `ext` (C-ABI external)
-applies to functions only.
+applies to `fun`, `rec`, `uni`, `tag`, `def`, `val`, `var`; `ext` (C-ABI
+external) applies to functions and globals.
 
 ### `def` - type alias
 
@@ -185,18 +194,56 @@ pub rec Pair[T, U] { left: T; right: U; }      # generic
 pub uni Number { i: i64; f: f64; }              # fields overlap; size of largest
 ```
 
-The compiler does not track which `uni` field is live. The sum-type idiom
-(stdlib `Result[T, E]` verbatim):
+The compiler does not track which `uni` field is live; a `uni` is raw
+overlapping storage for bit views and foreign formats. A value with one
+active alternative is a `tag`, below. `#[packed]` removes padding and
+`#[align(N)]` raises a type's or global's alignment.
+
+### `tag` - tagged value
 
 ```mach
-pub rec Result[T, E] {
-    tag:   bool;
-    value: uni { ok: T; err: E; };
+pub tag Reply: u8 { empty; value: i64; }        # explicit u8/u16/u32/u64 discriminator
+pub tag ParseError: u8 { invalid; overflow; }
+pub tag Tree[T]: u8 { leaf: T; empty; }         # generic
+
+val r0: Reply = Reply.empty{};                   # payloadless case: empty braces
+val r1: Reply = Reply.value{42};                 # one positional payload
+var r2: Reply;                                   # zero: the first declared case
+
+fun read(reply: Reply) i64 {
+    if (sel reply.value) { ret reply.value; }    # the arm guards reply.value
+    ret 0;                                       # reply.value here is a compile error
 }
 ```
 
-Packed layout is not available; `#[align(N)]` raises a type's or global's
-alignment.
+`sel place.case` is a `bool` reading only the discriminator; the operand is a
+place (binding, field, index, dereference, or a pointer to a tag, auto-
+dereferenced), never a call: bind the call first. A guard is lexical, not a
+flow fact: the `or` arm of `if (sel r.err)` does not guard `r.ok`; `||` opens
+no guard; after a chain whose every arm exits (`ret`, or `brk`/`cnt` of an
+enclosing loop) the untested case is guarded for the rest of the block, and
+the guarded place cannot be whole-assigned there (rebind a fresh `val`). The
+debug profile traps a guarded read whose case changed; release does not.
+Whole-tag `==`, `.kind` and `match` do not exist. Reflection: `$is_tag(T)`,
+`$cases(T)` walked with `$each c in $cases(T)` (`sel v.[c]`, `v.[c]`,
+`T.[c]{...}`), `$discriminant_of(T)`.
+
+The std failure tags, declared in `std.types.result`, `std.types.option` and `std.types.error` and imported like any
+declaration (`use std.types.result.res;`):
+
+```mach
+pub tag res[T, E]: u8 { err: E; ok: T; }        # err first: a zero res is a zero err
+pub tag opt[T]: u8    { none; some: T; }
+pub tag err[E]: u8    { err: E; ok; }           # unit success; not opt[E]
+```
+
+```mach
+fun increment(input: str) res[i64, ParseError] {
+    val r: res[i64, ParseError] = parse(input);
+    if (sel r.err) { ret res[i64, ParseError].err{r.err}; }
+    ret res[i64, ParseError].ok{r.ok + 1};       # r.ok guarded: the chain exits
+}
+```
 
 ### `fun`
 
@@ -298,11 +345,17 @@ enumerates.
 Compiler-seeded primitives (the complete set): `u8 u16 u32 u64`,
 `i8 i16 i32 i64`, `f32 f64`, and the untyped pointer `ptr`.
 
-Ten 128-bit SIMD vector types are also seeded: `f32x4 f64x2`, `i8x16 i16x8
-i32x4 i64x2`, and `u8x16 u16x8 u32x4 u64x2` — a single `x`, no other shapes.
-Literals are full-arity (`f32x4{1.0, 2.0, 3.0, 4.0}`), lane access `v[i]` takes
+SIMD vector types are a spelling, not a list: any primitive numeric element,
+a single `x` and a lane count from 2 to 65535 (`f32x4`, `i32x8`, `f32x3`);
+the 128-bit shapes `f32x4 f64x2 i8x16 i16x8 i32x4 i64x2 u8x16 u16x8 u32x4
+u64x2` fill a vector register and the rest are realized piecewise or
+per-lane. A `rec`, `uni`, `tag` or `def` may not take a vector spelling as
+its name. Literals are full-arity (`f32x4{1.0, 2.0, 3.0, 4.0}`), lane access `v[i]` takes
 a comptime-constant index, and the operators apply lane-wise with a comparison
-producing a same-shape unsigned mask. See `doc/language/types.md`.
+producing a same-shape unsigned mask. Integer vector `/` follows scalar division
+per lane using the lane type's signedness. It scalarizes where packed integer
+division is unavailable, and secret dividends or divisors are rejected. Vector
+`%` and shifts remain unsupported. See `doc/language/types.md`.
 
 ```mach
 *T                  # pointer          ?x address-of, @p dereference
@@ -321,7 +374,7 @@ is walked). A `fun(...)` type may carry a trailing `...` for FFI only.
 and be stored but may never reach an observable position: a branch or loop
 condition, the left operand of `&&`/`||`, a memory index, or a `/`/`%`
 operand - each is a compile error. Public flows up to secret implicitly; the
-**only** downgrade is the explicit strip cast `x:>T` (the result type is required; `x:^` and `x:^T` are deprecated spellings accepted through 4.30.0). Any operation
+**only** downgrade is the explicit strip cast `x:>T` (the result type is required; the 4.30 spellings `x:^` and `x:^T` were removed in 5.0.0 and are refused with a diagnostic naming `:>T`). Any operation
 with a secret operand yields a secret result; `uni` variants must agree on
 secrecy; a secret-welded pointer (`*^T`) cannot be erased to `ptr`. Also
 rejected: a secret float operand, a secret integer multiply or variable shift
@@ -390,16 +443,20 @@ unroll) also appear in statement position - see Comptime below.
 
 ## Stdlib idioms
 
-- `Result[T, E]` with `ok`/`err` constructors and `is_ok`/`is_err`/
-  `unwrap_ok`/`unwrap_err`; `Option[T]` with `some`/`none`/`is_some`/`unwrap`.
-  Generic arguments are always explicit at call sites:
+- Every fallible std API answers `res[T, E]` with a closed error tag `E` per
+  domain (`allocator.Error`, `FormatError`, `io_error.Error`, `FsError`, ...),
+  a unit outcome `err[E]`, and absence `opt[T]`; there are no `unwrap`,
+  `is_ok` or constructor helpers. Bind, test with `sel`, read under the guard:
 
 ```mach
-val r: Result[usize, str] = parse(s);
-if (is_err[usize, str](r)) { ret r; }
-val n: usize = unwrap_ok[usize, str](r);
+val got: res[*T, A.Error] = A.allocate[T](a, n);
+if (sel got.err) { ret res[*T, A.Error].err{got.err}; }
+val p: *T = got.ok;
 ```
 
+- Address-bound owners (allocators, sinks, runtime registrations) are
+  initialized in place, `init(?storage, ...) err[E]`, never returned inside a
+  `res`.
 - `str` is `*char` (null-terminated). `std.types.string` provides `str_len`
   and comparison. `std.types.view.View { data, len }` borrows a length-counted
   slice and owns no storage.
@@ -459,7 +516,6 @@ All reads, all comptime constants, closed tree:
 $mach.build.os / .arch / .abi / .mode   # live; compare against the tag tables
 $mach.build.pointer_width               # live; integer byte count (8 on 64-bit)
 $mach.build.pie                         # live; 1 when building position-independent
-$mach.build.<NAME>                      # live; manifest `defines` lookup (see below)
 $mach.version / .major / .minor / .patch    # live; compiler version
 $mach.compiler.name / .version              # live
 
@@ -480,9 +536,9 @@ $if ($mach.build.os == $mach.os.linux) { ... }
 $if ($mach.build.arch == $mach.arch.riscv64) { ... }
 ```
 
-A `$mach.build.<NAME>` that names none of the reserved facts resolves to the
-manifest's per-target comptime `defines` (`defines = ["TRACING", "DEPTH=4"]`
-in a `[target.*]` stanza); an undeclared name is a loud error.
+A `$mach.build.<NAME>` that names none of the reserved facts is a compile
+error (`no manifest define named`); no manifest key declares one. Spell a
+project constant as a `val` selected with `$if` over the facts above.
 
 A `$mach.*` read can fold into a runtime binding - the binding still declares
 its type:
@@ -495,28 +551,32 @@ pub val COMPILER: *u8 = $mach.compiler.name;
 ### `$project.*` / `$bin.*` - manifest state
 
 ```mach
-$project.id / .version / .name / .description   # [project] metadata
+$project.id / .version                          # [project] metadata
 $project.version.major / .minor / .patch        # folded integer components
 $project.target.os / .arch / .abi               # the selected target's declared *strings*
 $bin.name                                       # the artifact being built
 ```
 
 `$project.target.*` carries the manifest's string spellings (`"linux"`,
-`"x86_64"`) - distinct from `$mach.build.*`'s numeric tags. A field the
-manifest does not declare is reported unavailable, not folded to `""`.
+`"x86_64"`) - distinct from `$mach.build.*`'s numeric tags. `$project.name`
+and `$project.description` were removed in 5.0.0 with their manifest keys and
+are refused by name. A field the manifest does not declare is reported
+unavailable, not folded to `""`.
 
 ### Decorators - `#[...]`
 
-Codegen directives on the line(s) above a declaration (after the docstring).
+Declaration metadata on the line(s) above a declaration (after the docstring).
 One clause each, stackable on one line or several; they attach only to the
 immediately following declaration. Closed set:
 
 | Decorator | Applies to | Argument | Purpose |
 |---|---|---|---|
+| `#[deprecated]` / `#[deprecated("message")]` | fun, ext fun, rec, uni, tag, def, val/var, use, fwd, tag case | zero or one literal string | warn once per external use, preserving re-export notice ownership |
 | `#[symbol("name")]` | fun, ext fun, val/var | string | linker name override |
 | `#[library("name")]` | ext import | string | dynamic import dependency pin |
 | `#[inline]` | fun | none | force inlining |
-| `#[align(expr)]` | val/var, rec/uni | comptime int | alignment override |
+| `#[align(expr)]` | val/var, rec/uni/tag | comptime int | alignment override |
+| `#[packed]` | rec/uni/tag | none | no padding; payload straight after a tag's discriminator |
 | `#[section(".name")]` | fun, ext fun, val/var | string | object section placement |
 | `#[oblivious]` | fun | none | constant-time boundary (see `^` above) |
 | `#[scalar]` | fun | none | opt out of auto-vectorization |
@@ -548,7 +608,7 @@ known open disclosure path - do not write production crypto against it.
 `#[scalar]` excludes a function from loop auto-vectorization (which runs in the
 release pipeline on targets with 128-bit vectors) and also blocks inlining, so
 the opt-out survives. The project-wide lever is the `vectorize` profile key in
-`mach.toml`, optional and default-on.
+`mach.toml`, stated by every profile.
 
 `#[naked]` emits the body exactly as written - no frame record, no stack
 allocation, no argument moves, and no return. The body may hold only inline
@@ -585,7 +645,7 @@ are stdlib functions with per-arch `asm` bodies.
 storage type (`pub val POINT_SIZE: i64 = $size_of(Point);`):
 
 ```mach
-$size_of(T)   $align_of(T)   $offset_of(T, field)
+$size_of(T)   $length_of(T)   $align_of(T)   $offset_of(T, field_or_case)
 ```
 
 **`$type_of(expr)`** produces a comptime type value, comparable with
@@ -614,16 +674,16 @@ fun sum_fields(p: Pair) i64 {
 ```
 
 **`$each`** is statement-scope only. The body is spliced once per element -
-not a runtime loop. Two sequence forms: `$each f in $fields(T)` and
-`$each a in va` (packs). Enclosing runtime variables thread across the
+not a runtime loop. Four sequence forms: `$each f in $fields(T)`,
+`$each c in $cases(T)`, `$each a in va` (packs) and `$each x in ARR` (a
+comptime-constant array `val`). Enclosing runtime variables thread across the
 unrolled copies; nesting is allowed.
 
 **Diagnostics.** `$error("msg")` fails the build when **reached** -
 unconditional position or a selected `$if`/`$or` arm. A `$error` in a
 discarded arm never fires, making it the natural exhaustiveness fallback for
 target and type dispatch. Valid at declaration and statement scope.
-**`$assert` parses but is not yet evaluated** - write
-`$if (!cond) { $error("msg"); }` instead.
+There is no `$assert` intrinsic - write `$if (!cond) { $error("msg"); }`.
 
 ### `$if` / `$or` - conditional compilation
 
@@ -788,7 +848,12 @@ instructions) is entirely on you.
 
 The authoritative per-feature reference lives in the Mach repository under
 [`doc/language/`](https://github.com/briar-systems/mach/tree/dev/doc/language)
-- including the full EBNF in `grammar.md`, `variadics.md`, `secrecy.md`,
-`decorators.md`, the `comptime-*.md` set, `asm.md`, and `policy.md` (the
-compiler-vs-stdlib boundary). When this skill and the reference disagree, the
-reference wins.
+- including `tag.md`, the full EBNF in `grammar.md`, `variadics.md`,
+`secrecy.md`, `decorators.md`, the `comptime-*.md` set, `asm.md`, and
+`policy.md` (the compiler-vs-stdlib boundary) and `manifest.md` (the
+`mach.toml` reference); the 5.0.0 changelog entry maps every 4.x form to its
+5.0 spelling. When this skill and the reference
+disagree, the reference wins. Tooling: `mach check <path>` runs the frontend
+alone (the inner loop), `mach build <path> --plan` prints the effective build
+without running it; `mach fmt` is in a parallel lane and is not documented
+here until it merges.

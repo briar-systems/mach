@@ -16,8 +16,8 @@ this channel.
 
 > Per-declaration codegen attributes (symbol rename, library pin, inline,
 > align, section) are written as **`#[...]` decorators**, not `$`-comptime
-> shapes — see [decorators.md](decorators.md). The legacy `$sym.attr = value`
-> attribute setters were removed in v2.0.0.
+> shapes — see [decorators.md](decorators.md). A comptime directive takes no
+> `=`; a stray one is a parse error at the directive's terminator.
 
 The parser distinguishes these by structure:
 
@@ -45,8 +45,10 @@ used for `$mach.{os,arch,abi}.*` comparison. Flat `$project.version` is the whol
 version **string** (`"2.0.0"`); the structured `$project.version.{major,minor,
 patch}` folds its integer components — both are available. `[project]` has
 exactly the keys `id`, `version`, `src`, and `out`
-([manifest.md](../manifest.md#project)), so `$project.name` and
-`$project.description` do not exist and are compile errors. See
+([manifest.md](manifest.md#project)), and `$project.*` carries exactly `id`
+and `version`. A path the root does not carry, `$project.name` and
+`$project.description` included, reports `` unknown `$project.*` path `` at
+the path. See
 [comptime-mach.md](comptime-mach.md) for the `$mach.*` subtree.
 
 ```mach
@@ -95,6 +97,9 @@ A binding marked `$` — a comptime value parameter, an `$each` loop variable �
 same way. Inside the `$each` below the name `N` is the element, not the 9:
 
 ```mach
+use std.runtime;
+use print: std.print;
+
 val N:  i64    = 9;
 val ES: [2]i64 = [2]i64{1, 2};
 
@@ -102,6 +107,12 @@ fun g() i64 {
     var s: i64 = 0;
     $each N in ES { s = s + N; }   # 3, not 18
     ret s;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.printlnf("{}", g());
+    ret 0;
 }
 ```
 

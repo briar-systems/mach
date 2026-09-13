@@ -1,0 +1,780 @@
+use std.allocator.arena;
+use std.allocator.page;
+use std.collections.sort;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.data.toml;
+use fs:  std.filesystem;
+use txn: std.filesystem.transaction;
+use std.format;
+use io_error: std.io.error;
+use std.io.writer;
+use std.print;
+use std.system.os;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.path;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_copy_slice;
+use std.types.string.str_ends_with;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_replace;
+
+$if ($mach.build.os == $mach.os.linux)  { use nofollow: std.system.os.linux; }
+$or ($mach.build.os == $mach.os.darwin) { use nofollow: std.system.os.darwin; }
+
+use A: std.allocator;
+
+use mach.cli.args;
+use cli_diag: mach.cli.diagnostic;
+use mach.cli.util;
+use mach.lang.build.outcome;
+use mach.lang.diagnostic;
+use mach.lang.fail;
+use formatter: mach.lang.format;
+use mach.lang.intern;
+use mach.lang.manifest;
+use mach.lang.publication;
+use mach.lang.source;
+
+# `mach fmt`: the project's own source in the one canonical layout
+# ---
+# visited:   source files read
+# differing: files whose layout is not canonical (rewritten, or listed by --check)
+# malformed: files that do not parse; each was reported and left unchanged
+pub rec Report {
+    visited:   usize;
+    differing: usize;
+    malformed: usize;
+}
+
+# the deepest source directory nesting the walk follows
+val MAX_DEPTH: usize = 256;
+
+fun environment(a: *A.Allocator, name: str, detail: str) outcome.Fail {
+    val text: res[str, format.FormatError] = format.sprint(a, "{}: {}", name, detail);
+    if (sel text.err) { ret outcome.environment(detail); }
+    ret outcome.environment(text.ok);
+}
+
+fun os_failure(a: *A.Allocator, name: str, code: i64) outcome.Fail {
+    ret environment(a, name, os.message(code));
+}
+
+fun txn_failure(a: *A.Allocator, name: str, error: txn.Error) outcome.Fail {
+    if (error.kind == txn.MEMORY)  { ret outcome.internal(txn.error_message(error)); }
+    if (error.kind == txn.INVALID) { ret outcome.internal(txn.error_message(error)); }
+    val text: res[str, format.FormatError] = format.sprint(a, "{}: {}", name, txn.error_message(error));
+    if (sel text.err) { ret outcome.environment(txn.error_message(error)); }
+    var message: str = text.ok;
+    if (error.code < 0) {
+        val with_code: res[str, format.FormatError] = format.sprint(a, "{} ({})", message, os.message(error.code));
+        if (sel with_code.ok) { message = with_code.ok; }
+    }
+    ret outcome.environment(message);
+}
+
+fun finish_root(a: *A.Allocator, root: *txn.Root, name: str, result: err[outcome.Fail]) err[outcome.Fail] {
+    val closed: err[txn.Error] = txn.root_dnit(root);
+    if (sel closed.err) {
+        if (sel result.err) { ret result; }
+        ret err[outcome.Fail].err{txn_failure(a, name, closed.err)};
+    }
+    ret result;
+}
+
+# open a regular file under a root without following a symlink at the leaf
+fun open_file(root: *txn.Root, leaf: str) i64 {
+    var info:    os.stat_t;
+    val checked: i64 = os.stat_path(txn.root_fd(root), leaf, ?info, os.AT_SYMLINK_NOFOLLOW);
+    if (checked < 0)                                     { ret checked; }
+    if ((os.stat_mode(?info) & os.S_IFMT) != os.S_IFREG) { ret os.EINVAL; }
+    var flags: i32 = os.O_RDONLY;
+    $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
+        flags = flags | nofollow.O_NOFOLLOW | nofollow.O_NONBLOCK;
+    }
+    ret os.open(txn.root_fd(root), leaf, flags, 0);
+}
+
+# the whole file as one nul-terminated string; a nul byte inside is refused
+# since the formatter reads its input as a nul-terminated string
+fun read_text(a: *A.Allocator, fd: i32, name: str) res[str, outcome.Fail] {
+    var bytes: Vector[u8] = vector.init[u8](a);
+    fin { vector.dnit[u8](?bytes); }
+    var chunk: [4096]u8;
+    for {
+        val count: i64 = os.read(fd, ?chunk[0], 4096);
+        if (count < 0)  { ret res[str, outcome.Fail].err{os_failure(a, name, count)}; }
+        if (count == 0) { brk; }
+        val room: res[usize, A.Error] = vector.reserve[u8](?bytes, count::usize);
+        if (sel room.err) { ret res[str, outcome.Fail].err{outcome.refused(room.err)}; }
+        var i: usize = 0;
+        for (i < count::usize) {
+            if (chunk[i] == 0) { ret res[str, outcome.Fail].err{environment(a, name, "source contains a nul byte")}; }
+            bytes.data[bytes.len] = chunk[i];
+            bytes.len             = bytes.len + 1;
+            i                     = i + 1;
+        }
+    }
+    val copied: res[str, StrError] = str_copy_slice(a, bytes.data::str, 0, bytes.len);
+    if (sel copied.err) { ret res[str, outcome.Fail].err{outcome.user(outcome.str_text(copied.err))}; }
+    ret res[str, outcome.Fail].ok{copied.ok};
+}
+
+# render the file's diagnostics the way every command does, located by path,
+# line and column through a source map holding this one file
+fun report_malformed(a: *A.Allocator, name: str, text: str, diags: *diagnostic.DiagnosticStore) err[outcome.Fail] {
+    var sources: source.SourceMap = source.init(a);
+    fin { source.dnit(?sources); }
+    val added: res[source.FileId, fail.Fail] = source.add(?sources, name, text);
+    if (sel added.err) { ret err[outcome.Fail].err{outcome.from_fail(added.err)}; }
+    var w: writer.Writer = fs.writer(fs.STDERR);
+    cli_diag.flush_sources(?w, ?sources, diags);
+    ret err[outcome.Fail].ok{};
+}
+
+# format one open file. in check mode the name is printed when the layout
+# differs; otherwise the canonical text replaces the file through the
+# publication boundary, on the object that was read, with its permission bits
+fun format_open_file(a: *A.Allocator, owned: *i32, claim: *txn.Claim, name: str, check: bool, report: *Report) err[outcome.Fail] {
+    val fd:      i32 = @owned;
+    var info:    os.stat_t;
+    val checked: i64 = os.stat(fd, ?info);
+    if (checked < 0) { ret err[outcome.Fail].err{os_failure(a, name, checked)}; }
+    if ((os.stat_mode(?info) & os.S_IFMT) != os.S_IFREG) {
+        ret err[outcome.Fail].err{environment(a, name, "source must be a regular file")};
+    }
+    var identity: txn.Identity;
+    if (!check) {
+        val identified: i64 = os.file_identity(fd, ?identity);
+        if (identified < 0) { ret err[outcome.Fail].err{os_failure(a, name, identified)}; }
+    }
+    val read: res[str, outcome.Fail] = read_text(a, fd, name);
+    if (sel read.err) { ret err[outcome.Fail].err{read.err}; }
+    val text: str = read.ok;
+    fin { str_free(a, text); }
+    report.visited = report.visited + 1;
+    var diags: diagnostic.DiagnosticStore = diagnostic.store_init(a);
+    fin { diagnostic.store_dnit(?diags); }
+    val formatted: res[str, fail.Fail] = formatter.format_source(a, text, 1, ?diags);
+    if (sel formatted.err) {
+        if (fail.is_reported(formatted.err)) {
+            report.malformed = report.malformed + 1;
+            ret report_malformed(a, name, text, ?diags);
+        }
+        ret err[outcome.Fail].err{outcome.from_fail(formatted.err)};
+    }
+    val output: str = formatted.ok;
+    fin { str_free(a, output); }
+    if (str_equals(text, output)) { ret err[outcome.Fail].ok{}; }
+    report.differing = report.differing + 1;
+    if (check) {
+        print.println(name);
+        ret err[outcome.Fail].ok{};
+    }
+    var exact_mode: bool = false;
+    $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) { exact_mode = true; }
+    val replaced: err[txn.Error] = publication.replace_source(a, claim, owned, identity,
+        output, str_len(output), (os.stat_mode(?info) & 0o7777)::i32, exact_mode);
+    if (sel replaced.err) { ret err[outcome.Fail].err{txn_failure(a, name, replaced.err)}; }
+    print.println(name);
+    ret err[outcome.Fail].ok{};
+}
+
+fun format_file(backing: *A.Allocator, root: *txn.Root, held: *txn.Lock, leaf: str, name: str, check: bool, report: *Report) err[outcome.Fail] {
+    var ar:     arena.Arena;
+    val init_r: err[A.Error] = arena.init(?ar, backing, 0);
+    if (sel init_r.err) { ret err[outcome.Fail].err{outcome.refused(init_r.err)}; }
+    fin { arena.dnit(?ar); }
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = arena.make(?a, ?ar);
+    if (sel make_r.err) { ret err[outcome.Fail].err{outcome.refused(make_r.err)}; }
+    var claim: txn.Claim;
+    if (!check) {
+        val recovered: res[usize, txn.Error] = txn.recover(?a, held, leaf);
+        if (sel recovered.err) { ret err[outcome.Fail].err{txn_failure(?a, name, recovered.err)}; }
+        val reserved: err[txn.Error] = txn.claim(?claim, ?a, held, leaf);
+        if (sel reserved.err) { ret err[outcome.Fail].err{txn_failure(?a, name, reserved.err)}; }
+    }
+    val opened: i64               = open_file(root, leaf);
+    var result: err[outcome.Fail] = err[outcome.Fail].ok{};
+    if (opened < 0) { result = err[outcome.Fail].err{os_failure(?a, name, opened)}; }
+    or {
+        var fd: i32 = opened::i32;
+        result = format_open_file(?a, ?fd, ?claim, name, check, report);
+        if (fd >= 0) {
+            val closed: i64 = os.close(fd);
+            if (closed < 0 && sel result.ok) { result = err[outcome.Fail].err{os_failure(?a, name, closed)}; }
+        }
+    }
+    if (!check) {
+        val released: err[txn.Error] = txn.release_claim(?claim);
+        if (sel released.err) {
+            val clean: bool = sel result.ok;
+            if (clean) { result = err[outcome.Fail].err{txn_failure(?a, name, released.err)}; }
+        }
+    }
+    ret result;
+}
+
+fun visit(a: *A.Allocator, root: *txn.Root, held: *txn.Lock, leaf: str, name: str, check: bool, depth: usize, report: *Report) err[outcome.Fail] {
+    val probed: res[txn.EntryProbe, txn.Error] = txn.entry_probe(root, leaf);
+    if (sel probed.err) { ret err[outcome.Fail].err{txn_failure(a, name, probed.err)}; }
+    val entry: txn.EntryProbe = probed.ok;
+    if (entry.is_directory) {
+        var child:  txn.Root;
+        val opened: err[txn.Error] = txn.root_open_child(?child, root, leaf);
+        if (sel opened.err) { ret err[outcome.Fail].err{txn_failure(a, name, opened.err)}; }
+        ret finish_root(a, ?child, name, walk(a, ?child, name, check, depth + 1, report));
+    }
+    if (!entry.is_regular) {
+        ret err[outcome.Fail].err{environment(a, name, "symlinks and other non-regular source entries are refused")};
+    }
+    if (!str_ends_with(leaf, ".mach")) { ret err[outcome.Fail].ok{}; }
+    ret format_file(a, root, held, leaf, name, check, report);
+}
+
+fun name_compare(a: *str, b: *str) i64 {
+    val left:  str   = @a;
+    val right: str   = @b;
+    var i:     usize = 0;
+    for (true) {
+        val l: u8 = left[i];
+        val r: u8 = right[i];
+        if (l != r) {
+            if (l < r) { ret -1; }
+            ret 1;
+        }
+        if (l == 0) { ret 0; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# every entry of one directory in name order; the directory is locked for the
+# duration of a rewriting walk so a claim per file is the only reservation taken
+fun walk(a: *A.Allocator, root: *txn.Root, name: str, check: bool, depth: usize, report: *Report) err[outcome.Fail] {
+    if (depth >= MAX_DEPTH) { ret err[outcome.Fail].err{environment(a, name, "source directory nesting exceeds 256")}; }
+    var held: txn.Lock;
+    if (!check) {
+        val locked: err[txn.Error] = txn.lock(?held, root);
+        if (sel locked.err) { ret err[outcome.Fail].err{txn_failure(a, name, locked.err)}; }
+    }
+    var names: Vector[str] = vector.init[str](a);
+    fin {
+        var i: usize = 0;
+        for (i < names.len) {
+            str_free(a, names.data[i]);
+            i = i + 1;
+        }
+        vector.dnit[str](?names);
+    }
+    var cursor:      os.DirectoryCursor     = os.DirectoryCursor{};
+    val initialized: os.DirectoryInitResult = os.directory_init(?cursor, txn.root_fd(root));
+    var result:      err[outcome.Fail]      = err[outcome.Fail].ok{};
+    if (initialized.code < 0) { result = err[outcome.Fail].err{os_failure(a, name, initialized.code)}; }
+    or {
+        for {
+            var entry: os.DirectoryEntry;
+            val next:  i64 = os.directory_next(?cursor, ?entry);
+            if (next < 0) {
+                result = err[outcome.Fail].err{os_failure(a, name, next)};
+                brk;
+            }
+            if (next == 0) { brk; }
+            if (str_equals(entry.name, ".") || str_equals(entry.name, "..") || txn.coordinator_entry(entry.name)
+                || str_equals(entry.name, ".machtxn.backup")) { cnt; }
+            val copied: res[str, StrError] = str_copy_slice(a, entry.name, 0, entry.length);
+            if (sel copied.err) {
+                result = err[outcome.Fail].err{outcome.user(outcome.str_text(copied.err))};
+                brk;
+            }
+            val leaf:   str                 = copied.ok;
+            val pushed: res[usize, A.Error] = vector.push[str](?names, leaf);
+            if (sel pushed.err) {
+                str_free(a, leaf);
+                result = err[outcome.Fail].err{outcome.refused(pushed.err)};
+                brk;
+            }
+        }
+        val closed: i64 = os.directory_close(?cursor);
+        if (closed < 0 && sel result.ok) { result = err[outcome.Fail].err{os_failure(a, name, closed)}; }
+    }
+    val listed: bool = sel result.ok;
+    if (listed) {
+        sort.sort[str](names.data, names.len, name_compare);
+        var i: usize = 0;
+        for (i < names.len) {
+            val joined: res[str, A.Error] = path.join(a, name, names.data[i]);
+            if (sel joined.err) {
+                result = err[outcome.Fail].err{outcome.refused(joined.err)};
+                brk;
+            }
+            val display: str = joined.ok;
+            result = visit(a, root, ?held, names.data[i], display, check, depth, report);
+            str_free(a, display);
+            if (sel result.err) { brk; }
+            i = i + 1;
+        }
+    }
+    if (!check) {
+        val unlocked: err[txn.Error] = txn.unlock(?held);
+        if (sel unlocked.err) {
+            val clean: bool = sel result.ok;
+            if (clean) { result = err[outcome.Fail].err{txn_failure(a, name, unlocked.err)}; }
+        }
+    }
+    ret result;
+}
+
+# descend the manifest's source path one component at a time through held
+# directory capabilities, so a symlinked component is refused rather than
+# followed; the first component is compared against the dependency tree's
+# identity so an alias of `dep` cannot be selected as the source
+fun source_walk(a: *A.Allocator, root: *txn.Root, rel: str, start: usize, name: str, check: bool, depth: usize, exclude: *txn.Identity, report: *Report) err[outcome.Fail] {
+    if (depth >= MAX_DEPTH) { ret err[outcome.Fail].err{environment(a, name, "source directory nesting exceeds 256")}; }
+    var end:    usize = start;
+    val length: usize = str_len(rel);
+    for (end < length && rel[end] != '/') { end = end + 1; }
+    val copied: res[str, StrError] = str_copy_slice(a, rel, start, end - start);
+    if (sel copied.err) { ret err[outcome.Fail].err{outcome.user(outcome.str_text(copied.err))}; }
+    val leaf: str = copied.ok;
+    fin { str_free(a, leaf); }
+    var child:  txn.Root;
+    val opened: err[txn.Error] = txn.root_open_child(?child, root, leaf);
+    if (sel opened.err) { ret err[outcome.Fail].err{txn_failure(a, name, opened.err)}; }
+    if (exclude != nil) {
+        val identity: res[txn.Identity, txn.Error] = txn.root_identity(?child);
+        if (sel identity.err) {
+            ret finish_root(a, ?child, name, err[outcome.Fail].err{txn_failure(a, name, identity.err)});
+        }
+        if (txn.identity_equal(@exclude, identity.ok)) {
+            ret finish_root(a, ?child, name, err[outcome.Fail].err{outcome.user("project source cannot be the dependency tree")});
+        }
+    }
+    var result: err[outcome.Fail] = err[outcome.Fail].ok{};
+    if (end == length) { result = walk(a, ?child, name, check, 0, report); }
+    or                 { result = source_walk(a, ?child, rel, end + 1, name, check, depth + 1, nil, report); }
+    ret finish_root(a, ?child, name, result);
+}
+
+# the manifest's `project.src`, cleaned, relative to the project root
+fun source_dir(a: *A.Allocator, manifest_path: str) res[str, outcome.Fail] {
+    val bytes_r: res[Vector[u8], fs.FsError] = fs.read_bytes(a, manifest_path);
+    if (sel bytes_r.err) {
+        ret res[str, outcome.Fail].err{environment(a, manifest_path, outcome.fs_text(bytes_r.err))};
+    }
+    var bytes: Vector[u8] = bytes_r.ok;
+    fin { vector.dnit[u8](?bytes); }
+    val source_r: err[outcome.Fail] = manifest.validate_source_bytes(bytes.data, bytes.len);
+    if (sel source_r.err) { ret res[str, outcome.Fail].err{source_r.err}; }
+    val room: res[usize, A.Error] = vector.reserve[u8](?bytes, 1);
+    if (sel room.err) { ret res[str, outcome.Fail].err{outcome.refused(room.err)}; }
+    bytes.data[bytes.len] = 0;
+    val tbl_r: res[toml.Table, toml.TomlError] = toml.parse(a, bytes.data::str);
+    if (sel tbl_r.err) {
+        ret res[str, outcome.Fail].err{outcome.user(outcome.toml_text(tbl_r.err))};
+    }
+    var tbl: toml.Table = tbl_r.ok;
+    fin { toml.dnit(a, ?tbl); }
+    var itn: intern.Interner = intern.init(a);
+    fin { intern.dnit(?itn); }
+    val man_r: res[manifest.Manifest, outcome.Fail] = manifest.parse(a, ?itn, ?tbl, true);
+    if (sel man_r.err) { ret res[str, outcome.Fail].err{man_r.err}; }
+    var m: manifest.Manifest = man_r.ok;
+    fin { manifest.dnit(?m, a); }
+    val found: opt[str] = intern.lookup(?itn, m.src);
+    if (sel found.none) { ret res[str, outcome.Fail].err{outcome.internal("the manifest's source directory is not interned")}; }
+    val cleaned: res[str, A.Error] = path.clean(a, found.some);
+    if (sel cleaned.err) { ret res[str, outcome.Fail].err{outcome.refused(cleaned.err)}; }
+    ret res[str, outcome.Fail].ok{cleaned.ok};
+}
+
+# the dependency tree is identified through `root` so the walk, rooted at
+# `walked`, can never select it
+fun walk_project(a: *A.Allocator, backing: *A.Allocator, root: *txn.Root, walked: *txn.Root, rel: str, check: bool, report: *Report) err[outcome.Fail] {
+    val probed: res[txn.EntryProbe, txn.Error] = txn.entry_probe(root, "dep");
+    if (sel probed.err)          { ret err[outcome.Fail].err{txn_failure(a, "dep", probed.err)}; }
+    if (!probed.ok.is_directory) { ret source_walk(backing, walked, rel, 0, rel, check, 0, nil, report); }
+    var dependency:      txn.Root;
+    val dependency_open: err[txn.Error] = txn.root_open_child(?dependency, root, "dep");
+    if (sel dependency_open.err) { ret err[outcome.Fail].err{txn_failure(a, "dep", dependency_open.err)}; }
+    var result:   err[outcome.Fail]            = err[outcome.Fail].ok{};
+    val identity: res[txn.Identity, txn.Error] = txn.root_identity(?dependency);
+    if (sel identity.err) { result = err[outcome.Fail].err{txn_failure(a, "dep", identity.err)}; }
+    or (sel identity.ok) {
+        val excluded: txn.Identity = identity.ok;
+        result = source_walk(backing, walked, rel, 0, rel, check, 0, ?excluded, report);
+    }
+    ret finish_root(a, ?dependency, "dep", result);
+}
+
+# format or check one project: the manifest names the source directory, the
+# dependency tree is identified so it can never be selected, and the walk
+# visits only the source tree
+pub fun format_project(a: *A.Allocator, backing: *A.Allocator, project_root: str, manifest_path: str, check: bool) res[Report, outcome.Fail] {
+    var report: Report                 = Report{visited: 0, differing: 0, malformed: 0};
+    val rel_r:  res[str, outcome.Fail] = source_dir(a, manifest_path);
+    if (sel rel_r.err) { ret res[Report, outcome.Fail].err{rel_r.err}; }
+    val rel: str = rel_r.ok;
+    fin { str_free(a, rel); }
+    var root:   txn.Root;
+    val opened: err[txn.Error] = txn.root_open(?root, project_root, "");
+    if (sel opened.err) { ret res[Report, outcome.Fail].err{txn_failure(a, project_root, opened.err)}; }
+    var result: err[outcome.Fail] = err[outcome.Fail].ok{};
+    if (check) { result = walk_project(a, backing, ?root, ?root, rel, check, ?report); }
+    or {
+        # a rewriting walk roots the source tree with its control home under
+        # the build output, so every directory it locks keeps its sentinel and
+        # claims there instead of beside the sources
+        var home:     txn.Root;
+        var homed:    txn.Root;
+        val prepared: err[txn.Error] = publication.project_root(?homed, ?home, project_root, "");
+        if (sel prepared.err) { result = err[outcome.Fail].err{txn_failure(a, project_root, prepared.err)}; }
+        or {
+            result = walk_project(a, backing, ?root, ?homed, rel, check, ?report);
+            result = finish_root(a, ?homed, project_root, result);
+            result = finish_root(a, ?home, publication.HOME_LEAF, result);
+        }
+    }
+    result = finish_root(a, ?root, project_root, result);
+    if (sel result.err) { ret res[Report, outcome.Fail].err{result.err}; }
+    ret res[Report, outcome.Fail].ok{report};
+}
+
+# `mach fmt <path> [--check]`
+# ---
+# argv: the full process arguments
+# inv:  the parsed invocation for this command
+# ret:  0 every file is canonical (or was made so), 1 a file differs under
+#       --check, a file is malformed, or the invocation is a user error, 2 internal
+#       failure, 3 filesystem failure
+pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64 {
+    if (args.reject_unknown_from_invocation(inv, argv, "mach fmt")) { ret 1; }
+    if (inv.positional_count != 1) {
+        val f: outcome.Fail = outcome.user("mach fmt expects one project path");
+        ret cli_diag.render_fail(?f);
+    }
+    var backing: A.Allocator;
+    val make_r:  err[A.Error] = page.make(?backing);
+    if (sel make_r.err) {
+        val f: outcome.Fail = outcome.internal("failed to initialise allocator");
+        ret cli_diag.render_fail(?f);
+    }
+    var ar:     arena.Arena;
+    val init_r: err[A.Error] = arena.init(?ar, ?backing, 0);
+    if (sel init_r.err) {
+        val f: outcome.Fail = outcome.internal("failed to initialise allocator");
+        ret cli_diag.render_fail(?f);
+    }
+    fin { arena.dnit(?ar); }
+    var a:       A.Allocator;
+    val make_r2: err[A.Error] = arena.make(?a, ?ar);
+    if (sel make_r2.err) {
+        val f: outcome.Fail = outcome.internal("failed to initialise allocator");
+        ret cli_diag.render_fail(?f);
+    }
+    val loc_r: res[util.ProjectLocation, outcome.Fail] = util.resolve_project_location(?a, argv[inv.positional_idx]);
+    if (sel loc_r.err) {
+        val f: outcome.Fail = loc_r.err;
+        ret cli_diag.render_fail(?f);
+    }
+    val loc:      util.ProjectLocation      = loc_r.ok;
+    val check:    bool                      = args.invocation_flag(args.CMD_FMT, inv, "--check");
+    val report_r: res[Report, outcome.Fail] = format_project(?a, ?backing, loc.root, loc.manifest, check);
+    if (sel report_r.err) {
+        val f: outcome.Fail = report_r.err;
+        ret cli_diag.render_fail(?f);
+    }
+    val report: Report = report_r.ok;
+    if (report.malformed != 0)          { ret 1; }
+    if (check && report.differing != 0) { ret 1; }
+    ret 0;
+}
+
+use fixture: mach.lang.publication.testing;
+
+fun t_write(a: *A.Allocator, root: str, rel: str, text: str, mode: i32) bool {
+    val joined: res[str, A.Error] = path.join(a, root, rel);
+    if (sel joined.err) { ret false; }
+    val name: str = joined.ok;
+    fin { str_free(a, name); }
+    val written: err[fs.FsError] = fs.write_bytes(name, text, str_len(text), mode);
+    ret sel written.ok;
+}
+
+fun t_same(a: *A.Allocator, root: str, rel: str, expected: str) bool {
+    val joined: res[str, A.Error] = path.join(a, root, rel);
+    if (sel joined.err) { ret false; }
+    val name: str = joined.ok;
+    fin { str_free(a, name); }
+    val read: res[str, fs.FsError] = fs.read_string(a, name);
+    if (sel read.err) { ret false; }
+    val text: str = read.ok;
+    fin { str_free(a, text); }
+    ret str_equals(text, expected);
+}
+
+fun t_run(a: *A.Allocator, root: str, check: bool) i64 {
+    var argv:  [4]*u8 = [4]*u8{"mach", "fmt", root, "--check"};
+    var count: usize  = 3;
+    if (check) { count = 4; }
+    val parsed: res[args.ParsedInvocation, outcome.Fail] = args.parse_invocation(a, count, ?argv[0]);
+    if (sel parsed.err) { ret 2; }
+    var inv: args.ParsedInvocation = parsed.ok;
+    fin { args.dnit_invocation(a, ?inv); }
+    ret run(?argv[0], ?inv);
+}
+
+fun t_present(root: *txn.Root, leaf: str) bool {
+    val probed: res[txn.EntryProbe, txn.Error] = txn.entry_probe(root, leaf);
+    if (sel probed.err) { ret true; }
+    ret probed.ok.present;
+}
+
+val T_MANIFEST: str = "[project]\nid=\"fmtfixture\"\nversion=\"0.0.0\"\nsrc=\"src\"\nout=\"out\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n[artifact.main]\nkind=\"bin\"\nentry=\"src/main.mach\"\nout=\"bin/main{artifact.suffix}\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n";
+
+test "mach.cli.cmd.fmt:check_is_read_only_and_formatting_preserves_modes_and_excludes_dependencies" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val created: res[fixture.Output, outcome.Fail] = fixture.create(?a, "mach-fmt");
+    if (sel created.err) { ret 2; }
+    var owner: fixture.Output = created.ok;
+    fin { fixture.dnit(?owner); }
+    var root:   txn.Root;
+    val root_r: err[txn.Error] = txn.root_open(?root, owner.directory, "");
+    if (sel root_r.err) { ret 3; }
+    fin { txn.root_dnit(?root); }
+    if (os.make_dir(txn.root_fd(?root), "src", 0o700) < 0 || os.make_dir(txn.root_fd(?root), "dep", 0o700) < 0) { ret 4; }
+    var src:   txn.Root;
+    val src_r: err[txn.Error] = txn.root_open_child(?src, ?root, "src");
+    if (sel src_r.err) { ret 6; }
+    fin { txn.root_dnit(?src); }
+    if (os.make_dir(txn.root_fd(?src), "nested", 0o700) < 0) { ret 4; }
+    val original:  str = "fun main()i32{ret 0;}";
+    val canonical: str = "fun main() i32 {\n    ret 0;\n}\n";
+    if (!t_write(?a, owner.directory, "mach.toml", T_MANIFEST, 0o600)
+        || !t_write(?a, owner.directory, "src/main.mach", original, 0o751)
+        || !t_write(?a, owner.directory, "src/nested/leaf.mach", canonical, 0o600)
+        || !t_write(?a, owner.directory, "src/notes.txt", original, 0o600)
+        || !t_write(?a, owner.directory, "dep/untouched.mach", "fun broken(", 0o600)) { ret 5; }
+    $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
+        val mode_fd: i64 = open_file(?src, "main.mach");
+        if (mode_fd < 0) { ret 16; }
+        val changed: i64 = os.set_mode(mode_fd::i32, 0o774);
+        val closed:  i64 = os.close(mode_fd::i32);
+        if (changed < 0 || closed < 0) { ret 17; }
+    }
+    var before: os.stat_t;
+    if (os.stat_path(txn.root_fd(?src), "main.mach", ?before, os.AT_SYMLINK_NOFOLLOW) < 0)                  { ret 7; }
+    if (t_run(?a, owner.directory, true) != 1 || !t_same(?a, owner.directory, "src/main.mach", original))   { ret 8; }
+    if (t_present(?src, txn.LOCK_LEAF))                                                                     { ret 9; }
+    if (t_run(?a, owner.directory, false) != 0 || !t_same(?a, owner.directory, "src/main.mach", canonical)) { ret 10; }
+    var after: os.stat_t;
+    if (os.stat_path(txn.root_fd(?src), "main.mach", ?after, os.AT_SYMLINK_NOFOLLOW) < 0
+        || (os.stat_mode(?before) & 0o7777) != (os.stat_mode(?after) & 0o7777)) { ret 11; }
+    if (t_run(?a, owner.directory, true) != 0 || t_run(?a, owner.directory, false) != 0) { ret 12; }
+    if (!t_same(?a, owner.directory, "dep/untouched.mach", "fun broken(")
+        || !t_same(?a, owner.directory, "src/notes.txt", original)
+        || !t_same(?a, owner.directory, "src/nested/leaf.mach", canonical)
+        || !t_same(?a, owner.directory, "mach.toml", T_MANIFEST)) { ret 13; }
+    if (!t_write(?a, owner.directory, "src/main.mach", "fun broken(", 0o600))                                   { ret 14; }
+    if (t_run(?a, owner.directory, false) != 1 || !t_same(?a, owner.directory, "src/main.mach", "fun broken(")) { ret 15; }
+    if (t_run(?a, owner.directory, true) != 1 || !t_same(?a, owner.directory, "src/main.mach", "fun broken("))  { ret 18; }
+    ret 0;
+}
+
+fun t_read_tree(a: *A.Allocator, root: str, out: *Vector[u8]) bool {
+    val entries: [4]str = [4]str{"mach.toml", "src/main.mach", "src/nested/leaf.mach", "src/notes.txt"};
+    var i:       usize  = 0;
+    for (i < 4) {
+        val joined: res[str, A.Error] = path.join(a, root, entries[i]);
+        if (sel joined.err) { ret false; }
+        val name: str = joined.ok;
+        fin { str_free(a, name); }
+        val read: res[Vector[u8], fs.FsError] = fs.read_bytes(a, name);
+        if (sel read.err) { ret false; }
+        var bytes: Vector[u8] = read.ok;
+        fin { vector.dnit[u8](?bytes); }
+        var b: usize = 0;
+        for (b < bytes.len) {
+            val pushed: res[usize, A.Error] = vector.push[u8](out, bytes.data[b]);
+            if (sel pushed.err) { ret false; }
+            b = b + 1;
+        }
+        val mark: res[usize, A.Error] = vector.push[u8](out, 0);
+        if (sel mark.err) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+test "mach.cli.cmd.fmt:check_leaves_every_byte_of_the_tree_in_place" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val created: res[fixture.Output, outcome.Fail] = fixture.create(?a, "mach-fmt-check");
+    if (sel created.err) { ret 2; }
+    var owner: fixture.Output = created.ok;
+    fin { fixture.dnit(?owner); }
+    var root:   txn.Root;
+    val root_r: err[txn.Error] = txn.root_open(?root, owner.directory, "");
+    if (sel root_r.err) { ret 3; }
+    fin { txn.root_dnit(?root); }
+    if (os.make_dir(txn.root_fd(?root), "src", 0o700) < 0) { ret 4; }
+    var src:   txn.Root;
+    val src_r: err[txn.Error] = txn.root_open_child(?src, ?root, "src");
+    if (sel src_r.err) { ret 12; }
+    fin { txn.root_dnit(?src); }
+    if (os.make_dir(txn.root_fd(?src), "nested", 0o700) < 0) { ret 4; }
+    if (!t_write(?a, owner.directory, "mach.toml", T_MANIFEST, 0o600)
+        || !t_write(?a, owner.directory, "src/main.mach", "fun main()i32{ret 0;}", 0o600)
+        || !t_write(?a, owner.directory, "src/nested/leaf.mach", "fun f(){ # note\n}", 0o600)
+        || !t_write(?a, owner.directory, "src/notes.txt", "fun main()i32{ret 0;}", 0o600)) { ret 5; }
+    var before: Vector[u8] = vector.init[u8](?a);
+    fin { vector.dnit[u8](?before); }
+    if (!t_read_tree(?a, owner.directory, ?before)) { ret 6; }
+    if (t_run(?a, owner.directory, true) != 1)      { ret 7; }
+    var after: Vector[u8] = vector.init[u8](?a);
+    fin { vector.dnit[u8](?after); }
+    if (!t_read_tree(?a, owner.directory, ?after)) { ret 8; }
+    if (before.len != after.len)                   { ret 9; }
+    var i: usize = 0;
+    for (i < before.len) {
+        if (before.data[i] != after.data[i]) { ret 10; }
+        i = i + 1;
+    }
+    if (t_present(?src, txn.LOCK_LEAF)) { ret 13; }
+    ret 0;
+}
+
+fun t_exists(a: *A.Allocator, root: str, rel: str) bool {
+    val joined: res[str, A.Error] = path.join(a, root, rel);
+    if (sel joined.err) { ret false; }
+    val name: str = joined.ok;
+    fin { str_free(a, name); }
+    var st: os.stat_t;
+    ret os.stat_path(os.AT_FDCWD, name, ?st, os.AT_SYMLINK_NOFOLLOW) >= 0;
+}
+
+test "mach.cli.cmd.fmt:a_rewrite_keeps_its_control_files_under_the_build_output" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val created: res[fixture.Output, outcome.Fail] = fixture.create(?a, "mach-fmt-home");
+    if (sel created.err) { ret 2; }
+    var owner: fixture.Output = created.ok;
+    fin { fixture.dnit(?owner); }
+    var root:   txn.Root;
+    val root_r: err[txn.Error] = txn.root_open(?root, owner.directory, "");
+    if (sel root_r.err) { ret 3; }
+    fin { txn.root_dnit(?root); }
+    if (os.make_dir(txn.root_fd(?root), "src", 0o700) < 0) { ret 4; }
+    var src:   txn.Root;
+    val src_r: err[txn.Error] = txn.root_open_child(?src, ?root, "src");
+    if (sel src_r.err) { ret 5; }
+    fin { txn.root_dnit(?src); }
+    if (os.make_dir(txn.root_fd(?src), "nested", 0o700) < 0) { ret 6; }
+    if (!t_write(?a, owner.directory, "mach.toml", T_MANIFEST, 0o600)
+        || !t_write(?a, owner.directory, "src/main.mach", "fun main()i32{ret 0;}", 0o600)
+        || !t_write(?a, owner.directory, "src/nested/leaf.mach", "fun f(){ # note\n}", 0o600)) { ret 7; }
+    # a check creates no home
+    if (t_run(?a, owner.directory, true) != 1 || t_exists(?a, owner.directory, "out")) { ret 8; }
+    if (t_run(?a, owner.directory, false) != 0)                                        { ret 9; }
+    # the source tree holds nothing but source, walked to the leaves
+    val src_dir: res[str, A.Error] = path.join(?a, owner.directory, "src");
+    if (sel src_dir.err) { ret 10; }
+    fin { str_free(?a, src_dir.ok); }
+    if (!fixture.control_free(?a, src_dir.ok)) { ret 11; }
+    # every locked directory has its sentinel and claims in the home, keyed by
+    # its relative path
+    if (!t_exists(?a, owner.directory, "out/.mach-txn/src/.mach-txn-lock")
+        || !t_exists(?a, owner.directory, "out/.mach-txn/src/.machtxn.claims")
+        || !t_exists(?a, owner.directory, "out/.mach-txn/src/nested/.mach-txn-lock")) { ret 12; }
+    # a second rewrite through the same home is a fixed point
+    if (t_run(?a, owner.directory, false) != 0 || !fixture.control_free(?a, src_dir.ok)) { ret 13; }
+    # a relative project spelling is homed the same way
+    val relative: str = "./mach_fmt_relative_home";
+    fs.remove_all(?a, relative);
+    fin { fs.remove_all(?a, relative); }
+    if (fs_failed(fs.create_dir_all(?a, "./mach_fmt_relative_home/src/nested", 0o700))) { ret 14; }
+    if (!t_write(?a, relative, "mach.toml", T_MANIFEST, 0o600)
+        || !t_write(?a, relative, "src/main.mach", "fun main()i32{ret 0;}", 0o600)
+        || !t_write(?a, relative, "src/nested/leaf.mach", "fun f(){ # note\n}", 0o600)) { ret 15; }
+    if (t_run(?a, relative, false) != 0 || !fixture.control_free(?a, "./mach_fmt_relative_home/src")) { ret 16; }
+    if (!t_exists(?a, relative, "out/.mach-txn/src/nested/.mach-txn-lock"))                           { ret 17; }
+    ret 0;
+}
+
+fun fs_failed(r: err[fs.FsError]) bool {
+    ret sel r.err;
+}
+
+test "mach.cli.cmd.fmt:rejects_symlink_source_without_rewriting_its_target" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val created: res[fixture.Output, outcome.Fail] = fixture.create(?a, "mach-fmt-link");
+    if (sel created.err) { ret 2; }
+    var owner: fixture.Output = created.ok;
+    fin { fixture.dnit(?owner); }
+    val joined: res[str, A.Error] = path.join(?a, owner.directory, "src");
+    if (sel joined.err) { ret 3; }
+    val src: str = joined.ok;
+    fin { str_free(?a, src); }
+    val made: err[io_error.Error] = fs.create_dir(src, 0o700);
+    if (sel made.err || !t_write(?a, owner.directory, "mach.toml", T_MANIFEST, 0o600)
+        || !t_write(?a, owner.directory, "outside.mach", "fun main()i32{ret 0;}", 0o600)) { ret 4; }
+    val link_r: res[str, A.Error] = path.join(?a, src, "main.mach");
+    if (sel link_r.err) { ret 5; }
+    val link: str = link_r.ok;
+    fin { str_free(?a, link); }
+    val linked: err[io_error.Error] = fs.symlink("../outside.mach", link);
+    if (sel linked.err)                                                                  { ret 6; }
+    if (t_run(?a, owner.directory, true) != 3 || t_run(?a, owner.directory, false) != 3) { ret 7; }
+    if (!t_same(?a, owner.directory, "outside.mach", "fun main()i32{ret 0;}"))           { ret 8; }
+    val unlinked: err[io_error.Error] = fs.remove_file(link);
+    if (sel unlinked.err) { ret 9; }
+    val removed: err[fs.FsError] = fs.remove_all(?a, src);
+    if (sel removed.err) { ret 9; }
+    val aliased: err[io_error.Error] = fs.symlink(".", src);
+    if (sel aliased.err)                       { ret 10; }
+    if (t_run(?a, owner.directory, true) != 3) { ret 11; }
+    ret 0;
+}
+
+test "mach.cli.cmd.fmt:source_aliases_cannot_select_the_dependency_directory" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val created: res[fixture.Output, outcome.Fail] = fixture.create(?a, "mach-fmt-dep");
+    if (sel created.err) { ret 2; }
+    var owner: fixture.Output = created.ok;
+    fin { fixture.dnit(?owner); }
+    var root:   txn.Root;
+    val root_r: err[txn.Error] = txn.root_open(?root, owner.directory, "");
+    if (sel root_r.err) { ret 3; }
+    fin { txn.root_dnit(?root); }
+    var source_setting: str = "src=\"dep\"";
+    $if ($mach.build.os == $mach.os.windows)                                                 { source_setting = "src=\"DEP\""; }
+    if (os.make_dir(txn.root_fd(?root), "dep", 0o700) < 0)                                   { ret 4; }
+    if (!t_write(?a, owner.directory, "dep/untouched.mach", "fun main()i32{ret 0;}", 0o600)) { ret 6; }
+    val invalid_r: res[str, StrError] = str_replace(?a, T_MANIFEST, "src=\"src\"", source_setting);
+    if (sel invalid_r.err) { ret 7; }
+    val invalid: str = invalid_r.ok;
+    fin { str_free(?a, invalid); }
+    if (!t_write(?a, owner.directory, "mach.toml", invalid, 0o600)
+        || t_run(?a, owner.directory, true) != 1 || t_run(?a, owner.directory, false) != 1) { ret 8; }
+    if (!t_same(?a, owner.directory, "dep/untouched.mach", "fun main()i32{ret 0;}")) { ret 9; }
+    ret 0;
+}

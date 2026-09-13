@@ -1,12 +1,11 @@
 # Decorators
 
-A decorator is a codegen directive attached to a declaration. It expresses
-metadata that influences how the compiler emits the symbol: its linker name,
+A decorator attaches metadata to a declaration. It can provide source-use
+notices or influence how the compiler emits the symbol: its linker name,
 alignment, section placement, inlining, dynamic import attribution, constant-time
 obligations, or exclusion from auto-vectorization.
 
-Decorators are **codegen-only**. Visibility (`pub` / `ext`) is separate and
-unaffected by decorators.
+Visibility (`pub` / `ext`) is separate and unaffected by decorators.
 
 ## Surface
 
@@ -17,9 +16,8 @@ A decorator is written as an attribute:
 #[name(args)]      # directive with comptime-expr arguments
 ```
 
-> A backtick form (`` `name(args)` ``) existed through v2.3.0 and was removed in
-> v2.4.0; a backtick at decorator position is now a migration error. `#[...]` is
-> the only decorator surface.
+> `#[...]` is the only decorator surface. A backtick is not a token: one
+> anywhere in source is a lexer error.
 
 > One caveat the attribute form introduces: a line comment that begins `#[`
 > (with no space) opens an attribute. Write such a comment with a separating
@@ -28,6 +26,8 @@ A decorator is written as an attribute:
 ## Grammar
 
 ```
+#[deprecated]        # external uses warn
+#[deprecated("msg")] # external uses warn with this message
 #[symbol("name")]    # linker name override
 #[library("dep")]    # dynamic import attribution (ext only)
 #[inline]            # force inlining (no arguments)
@@ -72,6 +72,71 @@ expressions.
 
 ## Directives
 
+### `deprecated` / `deprecated(str)` — source-use notice
+
+Marks a declaration deprecated. The optional argument is one string literal
+carrying a message, decoded with the ordinary literal escapes; repeating the
+attribute or giving it more than one argument, or a non-literal argument, is an
+error. The attribute changes nothing about visibility, type identity, ABI or
+codegen.
+
+A use of the deprecated declaration from another source module warns at the
+identifier, carrying the message. Value references, calls and type references
+are covered, including through imports, re-exports and generic instantiation,
+and each source site warns once even when a generic body is instantiated more
+than once. The declaring module does not warn on its own uses, and an unused
+import alone produces no warning.
+
+```mach
+# file: src/legacy.mach
+#[deprecated("use replacement")]
+pub fun old() i32 { ret replacement(); }
+
+pub fun replacement() i32 { ret 1; }
+
+# file: src/root.mach
+use example.legacy;
+
+fun caller() i32 { ret legacy.old(); }      # warning: `old` is deprecated: use replacement
+```
+
+It applies to `fun`, `rec`, `uni`, `tag`, `def`, `val`, `var`, `use` and `fwd`
+declarations, and to a tag case, where it is the only decorator a case accepts:
+
+```mach
+# file: src/reply.mach
+#[deprecated("the whole tag")]
+pub tag Old: u8 { empty; }
+
+pub tag Reply: u8 {
+    empty;
+    #[deprecated("use fresh")] value: i64;
+    fresh: i64;
+}
+
+# file: src/root.mach
+use example.reply;
+
+fun read(r: reply.Reply) i64 {
+    if (sel r.value) { ret r.value; }        # both sites warn: tag case `value` is deprecated: use fresh
+    ret 0;
+}
+
+fun make() reply.Reply { ret reply.Reply.value{1}; }   # construction warns too
+fun stale() reply.Old { ret reply.Old.empty{}; }        # warning: `Old` is deprecated: the whole tag
+```
+
+A deprecated case warns at every external use that names it: `Reply.value{...}`
+construction, the `sel place.value` test and the `place.value` payload place.
+Descriptor forms that name no case in source (`Reply.[c]{...}`, `sel v.[c]`,
+`v.[c]`) warn nowhere.
+
+Notices follow imported symbols and re-exports. A `#[deprecated]` on a `use`
+alias or a `fwd` re-export belongs to the forwarding module and replaces any
+inherited notice for that exported name; a clean alias of the same canonical
+definition keeps no notice. `test` blocks and comptime directives reject the
+attribute because they declare no externally usable name.
+
 ### `symbol(str)` — linker name
 
 Overrides the emitted or imported symbol name. Applies to functions and
@@ -92,7 +157,7 @@ it (Darwin's underscore prefix, nothing elsewhere; see
 platform prefix applied to it.
 
 A mangled name is the source FQN, dotted, with generic arguments after a `$`:
-`std.types.string.str_len`, `std.types.option.unwrap$ptr`. Each argument is
+`std.types.string.str_len`, `std.collections.vector.push$ptr`. Each argument is
 introduced by a run of `$` whose length is its nesting depth, so a nested
 argument closes without a bracket — `f[Map[Vec[i64], str], u8]` is
 `m.f$m.Map$$m.Vec$$$i64$$str$u8`. `p$u8` is `*u8`, `sec$u32` is `^u32`,
@@ -130,7 +195,28 @@ ext fun wsa_startup(ver: u16, data: *u8) i32;
 ### `inline` — force inlining
 
 Marks a function for inlining at every call site, overriding the compiler's
-size- and use-count heuristics. Applies to functions only; takes no arguments.
+size and use-count heuristics. Applies to functions only and takes no arguments.
+The optimization pipeline must enable inlining. Indirect calls and recursive
+call cycles are not expanded by this attribute. Taking a function's address
+retains its callable identity even when direct calls are inlined.
+
+Release optimization makes small ordinary helper bodies available across source
+modules without emitting extra definitions. A helper is small when its body has
+fewer than 25 live instructions after promotion, debug annotations excluded, so
+`-g` never moves the decision. Extraction, import and per-caller expansion each
+have a limit of 1024 copied IR instructions and 256 KiB of owned payload.
+`inline` overrides size and use-count heuristics within those limits. An
+`oblivious` function is expanded only into another `oblivious` function, so
+its instructions never leave a constant-time validated body; a `naked` or
+`noinline` function, a recursive cycle and an indirect call are never expanded.
+A remaining call or taken address still names the original defining function.
+Generic, comptime and pack specializations keep their existing shared weak
+linkage. When several modules materialize that same specialization, body import
+uses an already available definition or the first acquired provider of that
+linkage, and tracks that provider as a query dependency.
+Helpers referencing compiler-local literal pools retain their calls because those
+objects have module-local identity. Named globals keep their original symbols,
+and copied instructions preserve effects, assembly bindings and debug locations.
 
 ```mach
 #[inline]
@@ -145,7 +231,7 @@ Applies to functions only; takes no arguments.
 
 ```mach
 #[noinline]
-fun cold_path(code: i64) i64 { panic("unreachable state"); }
+fun cold_path(code: i64) i64 { ret code * 100; }
 ```
 
 Use it to keep a function's frame and symbol real — for a profiler or stack
@@ -159,8 +245,8 @@ caller's instruction cache, or to hold code size down on a constrained target.
 - Purely a hint to the inliner; it does not otherwise change codegen. It binds
   at every optimization level — the debug pipeline runs no inlining pass at
   all, so `noinline` is inert (and unnecessary) there — and it will bind
-  identically to any future cross-module or LTO inlining path, which is not a
-  separate mechanism exempt from it.
+  identically when a callee body is available from another module. Recursive
+  peeling also respects `noinline` and `scalar`.
 
 ### `align(expr)` — alignment override
 
@@ -173,6 +259,8 @@ known; the measured type's layout is established on demand when the intrinsic as
 for it, so the answer does not depend on whether `T` is declared above or below.
 
 ```mach
+rec Pair { a: u64; b: u64; }
+
 #[align(64)]
 pub var cache_line: u8 = 0;
 
@@ -217,6 +305,9 @@ frame, a vertex whose stride a buffer fixes. Without it such a shape cannot be
 described as a record at all.
 
 ```mach
+use std.runtime;
+use print: std.print;
+
 #[packed]
 rec Header {
     magic:    u8;    # offset 0
@@ -224,6 +315,12 @@ rec Header {
     length:   u32;   # offset 3
     checksum: u64;   # offset 7
 }                    # $size_of == 15, $align_of == 1
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.printlnf("{} {} {}", $size_of(Header), $align_of(Header), $offset_of(Header, checksum));
+    ret 0;
+}
 ```
 
 Naturally the same shape is 24 bytes. `$size_of`, `$align_of` and `$offset_of` all
@@ -239,8 +336,17 @@ The two compose rather than conflict, and each owns one question:
   multiple of `N`.
 
 ```mach
+use std.runtime;
+use print: std.print;
+
 #[packed] #[align(8)]
 rec Frame { a: u8; b: u32; }   # fields at 0 and 1; $align_of == 8, $size_of == 8
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.printlnf("{} {} {}", $size_of(Frame), $align_of(Frame), $offset_of(Frame, b));
+    ret 0;
+}
 ```
 
 #### Packing is not transitive
@@ -251,10 +357,19 @@ the rule that composes: an inner type's layout does not change depending on who
 holds it.
 
 ```mach
+use std.runtime;
+use print: std.print;
+
 rec Point { x: u8; y: u32; }   # natural: y at 4, size 8
 
 #[packed]
 rec Msg { tag: u8; p: Point; } # p at offset 1, still 8 bytes; $size_of(Msg) == 9
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.printlnf("{} {} {} {}", $offset_of(Point, y), $size_of(Point), $offset_of(Msg, p), $size_of(Msg));
+    ret 0;
+}
 ```
 
 A transitive rule would make `Msg` 6 bytes and silently change `Point`'s meaning
@@ -398,7 +513,7 @@ A `#[scalar]` function is also declined by the inliner, so the opt-out survives
 inlining — it cannot be lost by the body moving into an unflagged caller. Use it
 for a scalar reference twin in a differential test, or where vectorized codegen
 is undesirable for a specific function. The project-wide equivalent is the
-`vectorize` profile key (see [manifest.md](../manifest.md#profilename)).
+`vectorize` profile key (see [manifest.md](manifest.md#profilename)).
 
 ### `naked` — no prologue, no epilogue, body as written
 
@@ -478,14 +593,15 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
   `symbol` and `section` — the path is taken as written.
 - The path resolves relative to the **declaring source file's** directory. An
   absolute path is taken as written. The resolved file must lie inside the
-  project root: in 4.30.0 an embed that escapes it (`../../outside.txt` from
-  `src/`) is a **warning** naming the path, and 5.0.0 rejects it. Keep assets
-  under the project.
+  project root: an embed that escapes it (`../../outside.txt` from `src/`) is
+  refused at the decorator (`` `embed` path escapes the project root; an
+  embedded file must live inside the project and the file is not read ``) and
+  the file outside is never read. Keep assets under the project.
 - A path holding `{artifact.<id>.out}` names the output of an artifact this one
   requires through the manifest's `need`, and resolves against the **project
   root** rather than the declaring file's directory; the required artifact is
   built first. No other template variable may appear in an `embed` path. See
-  [manifest.md](../manifest.md#artifact-requirements).
+  [manifest.md](manifest.md#artifact-requirements).
 - The annotation must be `[_]u8` or `[N]u8`; the element type must be `u8`.
   `[_]` is an inferred array length, legal **only** on an `#[embed]`
   declaration — written anywhere else it is rejected (see
@@ -512,7 +628,7 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
 - The embedded file is a build input: its content digest feeds the embedding
   module's incremental cutoff, so editing the asset invalidates that module
   and an untouched asset stays a cache hit — see
-  [manifest.md](../manifest.md#stepname--build-steps) for the equivalent
+  [manifest.md](manifest.md#stepname--build-steps) for the equivalent
   guarantee on `[step]` `in` entries.
 
 ### `stage(str)` — GPU pipeline stage
@@ -830,6 +946,7 @@ in it.
 
 | Directive   | `fun` | `ext fun` | `val` / `var` | `rec` / `uni` |
 |-------------|:-----:|:---------:|:-------------:|:-------------:|
+| `deprecated`|  yes  |    yes    |      yes      |      yes      |
 | `symbol`    |  yes  |    yes    |      yes      |      no       |
 | `library`   |  no   |    yes    |      no       |      no       |
 | `inline`    |  yes  |    no     |      no       |      no       |
@@ -854,6 +971,8 @@ in it.
 
 The `val` / `var` column is shared, but `embed` accepts only `val` — a `var`
 is refused (see [`embed`](#embedstr--compile-time-file-embedding) above).
+`deprecated` also applies to `tag`, `def`, `use` and `fwd` declarations and to a
+tag case, none of which the table columns cover.
 
 The set is closed. New directives require a compiler change.
 
@@ -867,4 +986,4 @@ The set is closed. New directives require a compiler change.
 - [val-var.md](val-var.md) — `val` / `var` bindings, and the `embed` exemption to `val`'s initializer requirement
 - [grammar.md](grammar.md#types) — the `[_]` inferred array length `embed` introduces
 - [types.md](types.md) — the SIMD vector types a shader stage computes over and `op` operates on, and the handle types `handle` declares
-- [../manifest.md](../manifest.md) — the `vectorize` profile key `scalar` opts out of, and content-fingerprinted build inputs (`embed`, `[step]` `in`)
+- [manifest.md](manifest.md) — the `vectorize` profile key `scalar` opts out of, and content-fingerprinted build inputs (`embed`, `[step]` `in`)

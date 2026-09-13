@@ -153,14 +153,24 @@ fun publish(a: ^u32) u32 { ret a:>u32; }
 fun publish2(a: ^*u8) *u8 { ret a:>*u8; }
 ```
 
+`:^` is no operator; the parse stops at the colon:
+
+```mach
+fun publish(a: ^u32) u32 { ret a:^u32; }
+```
+
 `:>T` peels exactly the outer qualifier, so it can never launder a welded pointee
 (`*^T` stays `*^T`). `::` and `:~` may neither add nor drop `^`. Promotion needs
 no operator of its own: a public value coerces up to secret implicitly, and a
 cast to a secret type (`x::^u16`) is an ordinary cast.
 
-The older spellings `:^` (bare, no target) and `:^T` mean the same thing and are
-accepted through 4.30.0. They are rejected in 5.0.0 with a diagnostic naming
-`:>T`, so new code writes `:>T`.
+`:>T` is the only declassification and there is no untyped form: `:^` is not
+an operator, so `x:^` and `x:^T` are parse errors at the colon. Inside a
+generic body the operand may be typed by a
+parameter (`fun show[U](s: U) u32 { ret s:>u32; }`): the template cannot decide
+whether `u32` is `U` stripped, so it checks only that the target is public and
+each instance settles the equality under its concrete arguments, the way every
+other secrecy gate is checked against the instance.
 
 ## Welded-storage pointers
 
@@ -532,8 +542,9 @@ is refused rather than assumed.
 
 ## See also
 
-- [types.md](types.md) — the compound type grammar `^` qualifies
-- [comptime-intrinsics.md](comptime-intrinsics.md) — `$is_secret` and the rest of the type-predicate family
-- [operators.md](operators.md) — the `::` / `:~` casts that preserve secrecy
-- [decorators.md](decorators.md) — the `#[oblivious]` decorator reference
-- [grammar.md](grammar.md) — the formal grammar of `^` and `:>T`
+- [types.md](types.md) - the compound type grammar ^ qualifies
+- [tag.md](tag.md) - tagged values and outer-secret ^Tag rules
+- [comptime-intrinsics.md](comptime-intrinsics.md) - $is_secret and the rest of the type-predicate family
+- [operators.md](operators.md) - the :: / :~ casts that preserve secrecy and :>T
+- [decorators.md](decorators.md) - the #[oblivious] decorator reference
+- [grammar.md](grammar.md) - the formal grammar of ^ and :>T

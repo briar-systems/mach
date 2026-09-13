@@ -44,12 +44,13 @@ be named `f32x4` without colliding with the type:
 val f32x4: i64 = 7;             # fine: values are a different position
 ```
 
-A **type** may not. `rec`, `uni`, and `def` reject a name spelled as a vector
-form, because a type declared with a vector's name would be silently unreachable
-— every use in type position resolves to the vector instead:
+A **type** may not. `rec`, `uni`, `tag`, and `def` reject a name spelled as a vector
+form, because a type declared with a vector's name would be silently unreachable:
+every use in type position resolves to the vector instead:
 
 ```mach
 rec f32x3 { x: f32; }           # error: `f32x3` is spelled as a vector type
+tag f32x4: u8 { empty; }        # error: `f32x4` is spelled as a vector type
 ```
 
 This holds for any well-formed spelling, so the name cannot be claimed by a type
@@ -71,7 +72,7 @@ value placed in memory and worked one lane at a time when it does not; and
 per-lane scalar code on a target with no vector unit (rv64gc today). All three
 compute identical lanes — the expansion is a fixed unroll, never a reassociation
 — so only performance varies. The `simd` manifest lever (see
-[manifest.md](../manifest.md)) reports or refuses the scalar cases if a project
+[manifest.md](manifest.md)) reports or refuses the scalar cases if a project
 cannot afford them.
 
 A target that gains wider vector registers therefore gets **better code**, not
@@ -138,7 +139,7 @@ There are no scalar↔vector casts in this increment: neither an implicit
 scalar-to-vector conversion nor a `1.0::f32x4` reinterpret is legal. The
 lane-wise operators and the comparison-to-mask rule are in
 [operators.md](operators.md); what a target without hardware SIMD does with a
-vector operator is the `simd` profile lever ([manifest.md](../manifest.md),
+vector operator is the `simd` profile lever ([manifest.md](manifest.md),
 [policy.md](policy.md)).
 
 ## Handles
@@ -259,10 +260,13 @@ val g: [2][2]i64 = [2][2]i64{ [2]i64{1, 2}, [2]i64{3, 4} };
 type, so an index the compiler can fold must land in `[0, N)`:
 
 ```mach
-var xs: [4]i32;
-val a: i32 = xs[3];             # ok
-val b: i32 = xs[4];             # error: index 4 is out of bounds for `[4]i32` of length 4
-val c: i32 = xs[-1];            # error: index -1 is out of bounds ...
+fun read() i32 {
+    var xs: [4]i32;
+    val a: i32 = xs[3];             # ok
+    val b: i32 = xs[4];             # error: index 4 is out of bounds for `[4]i32` of length 4
+    val c: i32 = xs[-1];            # error: index -1 is out of bounds ...
+    ret a + b + c;
+}
 ```
 
 The rule is keyed on the length the type carries, not on how the array was
@@ -280,15 +284,60 @@ not indexed against any length at all — `*T` carries none.
 `fun(T1, T2) R` — first-class function-pointer type.
 
 ```mach
+use std.runtime;
+use print: std.print;
+
+fun add(a: i64, b: i64) i64 { ret a + b; }
+
 def BinOp: fun(i64, i64) i64;
 val op: BinOp = add;
-val r:  i64   = op(2, 3);
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    val r: i64 = op(2, 3);
+    print.printlnf("{}", r);
+    ret 0;
+}
 ```
 
 ## Record and union types
 
 `rec` and `uni` declarations produce named types. See [rec.md](rec.md) and
 [uni.md](uni.md).
+
+## Tag types and the std failure tags
+
+A `tag` declaration introduces a named tagged value type that holds exactly one
+active case, selected by an explicitly typed discriminator. A case may be
+payloadless or carry one explicitly typed payload:
+
+```mach
+tag Reply: u8 {
+    empty;
+    value: i64;
+}
+```
+
+The failure types every std API answers with are three ordinary std tags with
+fixed generic arities, declared in `std.types.result`, `std.types.option` and `std.types.error` and imported like any
+other declaration (`use std.types.result.res;`):
+
+- `res[T, E]` is an outcome with error case `err: E` first and success case `ok: T` second
+- `opt[T]` is presence with payloadless `none` first and `some: T` second
+- `err[E]` is an outcome with error case `err: E` first and payloadless success `ok` second
+
+`err[E]` is not an alias of `opt[E]`. There are no defaulted generic
+arguments, no general type inference and no dummy success types; the compiler
+has no knowledge of the three names, so a module that imports none of them
+cannot spell them, and a module may declare its own.
+
+The case names `ok`, `err`, `some`, and `none` are members of their tags, not
+keywords.
+
+Numeric vector spellings such as `f32x4` denote SIMD vector types and require
+full-lane initialization, whereas a tag value names one case and its payload
+(`Reply.empty{}` or `res[i64, ParseError].ok{42}`). Construction, the `sel`
+case test and the lexical payload guards are in [tag.md](tag.md).
 
 ## Type aliases
 

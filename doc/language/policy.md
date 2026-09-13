@@ -20,7 +20,7 @@ Things that need to feel like the language:
   scalar expansion** of the same operator — scalarize operators, never
   algorithms — and reports the scalarization at build time. What to do on
   an incapable target is the `simd` profile lever (see
-  [manifest.md](../manifest.md)), not a compiler default.
+  [manifest.md](manifest.md)), not a compiler default.
 - **`asm` parsing, encoding, and operand allocation** for each supported
   ISA.
 - **The comptime channel** — `$mach.*` reads, the closed intrinsic set,

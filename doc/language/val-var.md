@@ -20,8 +20,13 @@ val n:  i64 = 42;
 var counter: i64 = 0;
 var buf:     [256]u8;               # default-initialized to zero
 
-counter = counter + 1;              # var is reassignable
-n = 43;                             # ERROR — `n` is a val
+fun bump() { counter = counter + 1; }   # var is reassignable
+```
+
+```mach
+val n: i64 = 42;
+
+fun change() { n = 43; }            # ERROR: `n` is a val
 ```
 
 ## Immutability

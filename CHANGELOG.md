@@ -5,6 +5,291 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [5.0.0] - 2026-09-13
+
+### Added
+
+- `mach fmt <path> [--check]` rewrites the project source in one canonical layout, or with `--check` reports the files that differ and writes nothing (#3225).
+- The formatter re-emits the parsed token stream, so a formatted file keeps its tokens, tree, comments, doc runs and inline assembly, and is a fixed point (#3225).
+- Formatter layout is the one `mach fmt` emits and has no configuration (#3225).
+- The formatter visits only the manifest `project.src`, through held directory capabilities that refuse symlinks and the dependency tree (#3225).
+- Source rewriting goes through the publication boundary on the object that was read, keeping its permission bits (#3225).
+- A malformed file is reported with located diagnostics and left unchanged (#3225).
+- Every `#[oblivious]` function is validated a second time on its final instruction stream, after register allocation, frame insertion, encoding expansion and riscv64 branch relaxation, on x86_64, aarch64 and riscv64 (#3126, N5 phase 2 parts 3 to 5).
+- The physical validation walk re-derives secrecy over physical registers (keyed by register id, so sub-register aliases are free), the flags register where the machine declares one, frame slots as byte extents, and memory with no address as one monotone bit, seeded from declared ABI inputs and from the secrecy each register operand kept through allocation (#3126, N5 phase 2 parts 3 to 5).
+- Block targets make the physical validation walk a fixpoint over the emitted layout, so a loop-carried secret is seen at the loop head (#3126, N5 phase 2 parts 3 to 5).
+- The physical validation walk refuses a branch on tainted flags, a branch or indirect transfer through a tainted register, a load or store whose base or index is tainted, a variable-latency instruction on a tainted operand the target does not trust, a data directive, and any emitted instruction without a row in the closed effect table, each with a located diagnostic naming the emitted instruction (#3126, N5 phase 2 parts 3 to 5).
+- Closed effect table rows extend the inline-asm grammar `asm_ct_class` table for every opcode the encoders emit (x86_64 `imul`/`idiv`/`div`, SSE scalar and packed sets, `cvt*`, `ucomis*`, `setcc`, `movabs`, aarch64 `b.cond`, `mul`/`madd`/`msub`, `sdiv`/`udiv`, FP and NEON sets, riscv64 F and D sets and `fcvt.*`), pinned by a per-ISA census ensuring every notifiable opcode has a row (#3126, N5 phase 2 parts 3 to 5).
+- `ctvalidate.run` stays as the early diagnostic, and the physical validation walk never changes emitted bytes (#3126, N5 phase 2 parts 3 to 5).
+- An ISA that declares no notification stream refuses an oblivious function the way the whole-module emitter does (#3126, N5 phase 2 parts 3 to 5).
+- Mutation controls on x86_64, aarch64 and riscv64 seed a secret after allocation, where only the physical walk can see it, into a late branch, a late address through the reload scratch of a spilled secret (and, on riscv64, a relaxed jump trampoline), and a late multiply (#3126, N5 phase 2 parts 3 to 5).
+- `tag Name: u8 { ... }` declares a discriminated value with an explicit `u8`, `u16`, `u32` or `u64` discriminator, where a case has one typed payload or none (Mach v5, #3218, #3219).
+- `Type.case{payload}` and `Type.case{}` are the only construction forms for tagged values (Mach v5, #3218, #3219).
+- `sel place.case` performs the case test, reading only the discriminator (Mach v5, #3218, #3219).
+- Payload places `place.case` are legal only under a lexical guard: a chain arm whose condition is exactly `sel P.c`, the rest of a block after a chain whose every arm exits, and the right operand of `&&` after a `sel` (Mach v5, #3218, #3219).
+- Whole-value assignment to a guarded place is refused (Mach v5, #3218, #3219).
+- The debug profile checks the discriminator at every guarded access and traps on a mismatch, while the release profile emits no check, and both profiles accept and reject the same programs (Mach v5, #3218, #3219).
+- Tag layout puts the discriminator at offset zero and every payload at one common offset, with `#[packed]` and `#[align(N)]` applying (Mach v5, #3218, #3219).
+- Reflection functions `$is_tag`, `$cases` (walked with `$each`, with `sel v.[c]`, `v.[c]` and `T.[c]{}` through a descriptor) and `$discriminant_of` reflect a tag, while `$size_of`, `$align_of` and `$offset_of` answer from the checked layout (Mach v5, #3218, #3219).
+- Representation-changing casts that contain a tag are refused (Mach v5, #3218, #3219).
+- Tags are carried by value through every native convention, through SPIR-V as a per-case composite, and by the editor type, resolve and recovery products (Mach v5, #3218, #3219).
+- The canonical `res`, `opt` and `err` are std tags declared by std 2.0.0, the compiler has no knowledge of their names, and a module may declare its own (#3226, mach-std#617).
+- The test corpus gains a `tag` group of nine cases with C references (Mach v5, #3218, #3219).
+- `#[deprecated]` and `#[deprecated("msg")]` are accepted on `fun`, `ext fun`, `rec`, `uni`, `tag`, `def`, `val`, `var`, `use`, `fwd` and on a tag case (#3129).
+- Every use of a deprecated declaration from another source module warns once with the message, while the declaring module is silent (#3129).
+- Deprecation notices follow re-exports and are owned by the forwarding declaration (#3129).
+- `mach build --cache` and `mach test --cache` reuse object images across compiler processes from `.mach-cache` under the output directory, keyed on the running compiler content, the build configuration, the whole active source graph, dependency identity, embedded bytes and executed build steps, with bounded storage and atomic publication (#3221).
+- Object caching is off by default in this phase (#3221).
+- `--no-cache` forces a genuinely uncached build with no build-step reuse (#3221).
+- Every linked image carries a build id derived from its own content: an ELF `.note.gnu.build-id` note under `PT_NOTE` holding the SHA-256 of the loaded image (so `-g` leaves it unchanged), an `LC_UUID` in every Mach-O executable and a `.buildid` CodeView record in every PE image, both the first sixteen bytes of the content hash shaped as a version 4 uuid (#3221).
+- The object cache identifies the running compiler by that content build id read from its own mapped headers at startup, and hashes the executable only when it carries none (#3221).
+- Every Mach-O executable now writes the content-derived `LC_UUID`, which was previously written only under `--pie` and derived from the artifact name (#3221).
+- The object cache asks the store before lowering: a module whose object it holds skips lower, optimize and codegen (#3221).
+- Object cache entries carry the module scalarization count and test declarations so a cached test build lists the same tests (#3221).
+- A warm cache hit builds a 42-module project in about 175 ms against 460 ms uncached (#3221).
+- Cache paths are keyed canonically, so `mach build .` and `mach build /abs/project` share entries unless `-g` puts the spelling into the line tables (#3221).
+- Cache eviction removes the least recently published entries first and never evicts an entry the current build restored or published (#3221).
+- The linked artifact is not cached by the object cache (#3221).
+- The object cache stays opt-in: an edit misses the whole cell, so a default-on cache would pay publication overhead on every edit and hit only on unchanged rebuilds (#3221).
+- `mach check <path>` runs load, resolve and sema over the source reachable from the artifacts `mach build` would select, through the same driver, queries and phase outcomes (#3224).
+- `mach check` exits with the frontend classification: 0 accepted, 1 rejected or user error, 2 internal, 3 environment (#3224).
+- In `mach check`, no step runs, and nothing is lowered, generated, linked or written (#3224).
+- A generated or embedded input that does not exist yet is reported by `mach check` as missing rather than produced (#3224).
+- `mach build <path> --plan` prints the effective build through the normal planner and exits, replacing `--explain` (#3223).
+- The printed plan reports per cell the project, target, profile, artifact, entry, output paths, dependency and project prerequisite steps in execution order, artifact requirements, and manifest, dependency-export and command-line link requirements (#3223).
+- The plan is configured against the realized dependency closure the way a build is, so an unrealized dependency, an invalid dependency manifest or a dependency cycle is reported with the build diagnostic (#3223).
+- Build planning fetches, generates, compiles, links and writes nothing (#3223).
+- A cell with prerequisites reports its generated inputs as unresolved during `--plan` execution (#3223).
+- `{artifact.suffix}` in an artifact `out` expands to the conventional filename suffix for the artifact kind on the selected target (`.exe`/`.lib`/`.dll` on Windows, `.a`/`.so` on Linux, `.a`/`.dylib` on Darwin, `.spv` for a SPIR-V module), so one artifact names its output on every target while its identity and `$bin.name` stay the table key (#3222).
+- Literal paths in artifact `out` stay literal without expansion (#3222).
+- Output collisions are checked after suffix expansion among the artifacts selected for a target (#3222).
+- Library forms that an object format lacks are refused (#3222).
+- `mach init` writes one artifact using `{artifact.suffix}` instead of a per-extension split (#3222).
+- Manifest `isa` accepts a canonical RISC-V extension string (`rv32imc`, `rv64imafd`, `rv64gc`) over the retained I, M, A, F, D, C, Zicsr and Zifencei vocabulary (#3127).
+- RISC-V `isa` selection declares the machine multiply and float facts, bounds the instructions the compiler and named inline assembly may emit, and is written into the object `Tag_RISCV_arch` attribute (#3127).
+- An unknown RISC-V extension, another version, a noncanonical string or the E base is refused rather than rounded up to the default machine (#3127).
+- `test/memory.py` measures compiler peak resident memory and wall time over a cold self-build and three synthetic workload families (many modules, one dense module, a large by-value aggregate) at both profiles and two worker counts, checking every generated executable output and the worker-count image identity (#2299).
+- With a control compiler, `test/memory.py` alternates executions over identical inputs (#2299).
+- The `compiler memory` workflow runs `test/memory.py` on demand, never on the PR lane (#2299).
+- Historical measurements from 2026-09-06 replaced by `test/memory.py` are preserved on PR #3262 (#2299).
+- `test/memory.py` runs every cell uncached, cache-cold (publishing) and cache-warm, requiring a warm build to restore every module so OS file-cache warmth never counts as reuse (#2299).
+- `test/memory.py` holds the compiler under test to a peak-memory ceiling per workload and profile derived from measured curves recorded on PR #3302, and fails above it (#2299).
+- Workload child processes run with transparent huge pages disabled and the sampler tracks swap-out to eliminate run-to-run variation that caused a deterministic serial build to read anywhere between 1542 and 1997 MiB (#2299).
+- Host transparent huge page mode, load average and available memory are recorded beside every benchmarked process (#2299).
+- A control compiler that cannot build the checkout takes `--control-checkout` for its own tree (#2299).
+- The self-build memory benchmark runs both serially and at the host CPU count (#2299).
+- PR #3302 records final peak-memory and time curves for many-module, dense-function, large-aggregate, blocks and self-build workloads on dev, uncached and cached, serial and parallel, at both profiles, against the 4.30.0 seed and preserved 2026-09-06 curves (#2299, #3221).
+- PR #3302 records object cache storage and resident bounds measured past the 512 MiB store limit alongside the four re-run scratch-ownership mutation anchors (#2299, #3221).
+- Growth of the debug self-build since 4.30.0 is attributed to #3247 plus two quadratic cliffs (dense liveness sets and the verifier predecessor check in one large function, and DWARF emission in one module of many functions) reported with their causes in PR #3302 (#2299, #3221).
+- Every RISC-V selection refusal names what it refused: the offending letter or token and the selection string for an unknown extension, a noncanonical or duplicated order, an unsupported version, the E base and a trailing separator (#3127).
+- A RISC-V selection refusal names the missing F or D extension when a calling convention needs float registers (#3127).
+- Using a floating-point type on a RISC-V selection without F is refused with a diagnostic naming the missing extension, not only the selection (#3127).
+- Each ISA with a vector unit declares every retained (operation, lane kind, lane width) cell as a packed instruction or the documented scalar expansion, and registration refuses a catalog that leaves a cell undeclared (#3120).
+- A vector operator whose lane shape the catalog does not name is refused with a diagnostic naming the operation, shape, function and target in every `simd` mode, and is never scalarized silently (#3120).
+- `test/vecrows` probes every declared vector row on x86_64, aarch64 and riscv64 against the external decoder and execution (#3120).
+- `test/doc-examples.py` compiles every language-reference example that carries an expectation (`accept`, `reject`, `warn`, `run`, `test`) against the compiler under test (#3131).
+- `test/doc-agreement.py` holds `doc/language/manifest.md`, the `mach init` scaffolds and the grammar keyword list to the manifest parser, the scaffolds and the token table (#3131).
+
+### Changed
+
+- `test/run.sh` is the one test driver, in plain shell: it loops the codegen cases over the targets, builds, decodes with `llvm-objdump`, diffs against the goldens, and compares O0 and O2 execution with the C reference; `--link` runs the link cases, `--dwarf` the `-g` builds through `llvm-dwarfdump --verify`, `--qemu` the foreign linux targets, `--bless` writes instead of diffing (#3316).
+- The vector rows are ordinary cases under `test/cases/vec/rows_*`, one `#[noinline]` probe per operation, signedness and predicate of each lane width, folded through the corpus checksum and witnessed by the golden (#3316).
+- A link case is checked by its own `check.sh` or a shared reader under `test/link/check/`, and declares the checkout's `dep/std` as a path dependency (#3316).
+- CI is two workflows: `ci.yml` proves the primary hosts on every pull request (fixpoint, unit suite in both profiles, formatter, cross-compiles, every golden, the host differential) and runs qemu, spirv, riscv32, the link legs, dwarf and darwin on a push to main or by `workflow_dispatch`; `cd.yml` builds and publishes a tag (#3316).
+- `mach info` prints the version and the host target this binary resolves for the machine it runs on (`host:`, `isa:`, `os:`, `abi:`, `object:`), every value taken from `target.resolve` over the host request, and the four registry capability lines are dropped; `mach info targets` prints every supported target as one full `(os, isa, abi, object)` tuple per line, `name` then `key=value` pairs, whitespace-aligned, one line per cell `tuple_capability` accepts in registry order, with a RISC-V row judged on and spelled as the selection its registered name resolves to (#3320).
+- An operating system declares the calling conventions it accepts per instruction set (`OsVTable.accepted_abis`, native first; `freestanding` declares itself unconstrained), replacing the single `native_abi`: `linux`/`darwin` with `win64` and `windows` with `sysv64` are refused at composition with `operating system '<os>' accepts calling convention '<abi>' on instruction set '<isa>', not '<abi>'` (tuple code `os_abi`, naming the whole set when it has several members), `linux` keeps `lp64d`, `lp64` and `lp64f` on `riscv64`, and `freestanding` keeps every convention the instruction set covers (#3320).
+- `doc/` holds the language reference under `doc/language/` (the manifest reference moved there as `doc/language/manifest.md`, since `mach.toml` is part of the language) and the `mach doc` output; `doc/cli.md` (`mach --help` and `mach help <command>` are the command-line reference), `doc/distribution.md`, `doc/migration-v5.md`, `doc/tooling/` and `doc/design/` are removed, the design records to git history and the agent-report archive (#3112).
+- CONTRIBUTING is rewritten for the 5.0 tree with the `type(#N): description` commit format, and README is refreshed with the 5.0 facts (#3112).
+- A declared `subsystem`, from `--subsystem` or an artifact `subsystem` key, is refused as unsupported on a target whose image format has no such field (ELF, Mach-O, flat image), naming the declaration, target and format rather than being accepted and unread (#3124).
+- An omitted subsystem key remains the console default everywhere (#3124).
+- An artifact that needs the subsystem key on Windows and also targets a Linux or Darwin cell must declare one artifact per format (#3124).
+- Every dispatch over a closed catalog is now a total lookup, returning `opt` from a name helper or caller-matched default (#3124).
+- Type spelling parsing passes and MIR operand lowering carry `Result` to their callers instead of panicking on unhandled catalog entries (#3124).
+- Catalog completeness is recorded by partition tests naming every member, and the `catalog-defaults` census in `test/census.sh` covers every catalog under `src/` with an empty exception list (#3124).
+- The target registry is one heap-owned immutable object created by `Session` through `target.registry_new` over its own allocator, held by pointer and released once during `dnit` (#2212).
+- Parallel codegen worker session copies borrow the target registry pointer instead of aliasing an inline registry (#2212).
+- The target registry is published once by `register_all` and released terminally by `registry_dnit`, after which `register_all` and `resolve` are refused (#2212).
+- A resolved target records the registry it was resolved against, and `isel`, the encoder, `codegen_unit` and every link entry refuse a target whose registry has been released as a typed error rather than following a dead vtable (#2212).
+- A fail-at-N probe walk over build, publish, resolve and release proves the target registry releases everything at every refusal ordinal (#2212).
+- MIR register identities `mir.VRegId` and `mir.PRegId` are nominal single-field records rather than `def` aliases, preventing virtual and physical registers from being interchanged and requiring explicit unwrapping to index tables (#2212).
+- `MIR_PREG_NIL` joins `MIR_VREG_NIL` so physical slots never borrow the virtual sentinel (#2212).
+- Nominal register wrappers thread through `MirOperand`, `MirVReg.assigned`, `MirInstr.declassified`, `MirAbiInput.reg`, `abi.ParamSlot.reg`, `ParamPiece.reg`, lowering contexts, register allocation and ISA translations, with `mir.preg_regid` as the conversion back to an ISA regid (#2212).
+- A memory operand index is a tag (`none`, `vreg`, `preg`) read under a `sel` guard in place of `index` plus `index_is_preg` (#2212).
+- Emitted machine code bytes are unchanged on every target (#2212).
+- The compiler builds against std 2.0 (std dev `e204cb81f`) and CI bootstraps it through the v5 migration stage (mach `2a2918b23` with std 1.0.1) after the audited 4.30 fixpoint (#3226, lane C1).
+- The language layer `fail.Fail` is `tag Fail: u8 { reported, message: str }` (#3226, lane C1).
+- The driver `outcome.Fail` is `tag Fail: u8 { reported, user: str, internal: str, environment: str }` (#3226, lane C1).
+- Phase statuses carry internal diagnostic text on their `PhaseKind` case (#3226, lane C1).
+- Closed-catalog faults and build events (`unit`, `note`, `fail`, `diagnostics`) are represented as tags (#3226, lane C1).
+- Every `record_*` method on a build outcome answers `err[allocator.Error]`, and `record_diagnostics` answers `err[outcome.Fail]` (#3226, lane C1).
+- `mach.lang.alloc` serves as the compiler allocation layer (#3226, lane C1).
+- Every std consumer not yet migrated compiles through `mach.lang.legacy` facades presenting the 1.x shape over 2.0 implementations (#3226, lane C1).
+- Migration lanes C2 to C4 remove `mach.lang.legacy` facade imports as consumers migrate, and C5 deletes the directory (#3226, lane C1).
+- Subprocess supervisors record cancellation reasons using `subprocess.Request` kinds with 1.x codes, directory scans use std directory cursors, and event sources and writer sinks report typed outcomes (#3226, lane C1).
+- A reported failure carries no message instead of a nil one (#3226, lane C1).
+- Every build of a module containing an `#[oblivious]` function records an instruction notification for each emitted machine instruction on x86_64, aarch64 and riscv64 without rendering assembly text (#3126, N5 phase 2 parts 1 and 2).
+- Each instruction notification names the originating MIR instruction, and register operands preserve their pre-allocation virtual registers so validators can inspect secret registers and frame slots at every instruction (#3126, N5 phase 2 parts 1 and 2).
+- AArch64 adds a machine-opcode space shared between its assembly printer and inline-asm grammar (#3126, N5 phase 2 parts 1 and 2).
+- Emitted machine code bytes are unchanged, with cost limited to one notification record per instruction in oblivious modules and zero overhead elsewhere (#3126, N5 phase 2 parts 1 and 2).
+- ELF, COFF and Mach-O writers size and serialize every file from one checked plan, placing each region once with alignment, offset and extent checked through shared layout primitives (#3113).
+- Sections, tables and addresses that would overflow, misalign or exceed format field widths are refused before any buffer is allocated (#3113).
+- Serialized regions whose written bytes do not end on their planned extent refuse publication instead of shipping (#3113).
+- Section identity in object records, deferred relocations and format writers uses nominal `SectionId`, preventing implicit use as symbols, segments or table indices (#3113).
+- Valid output remains byte-identical, including RV32 static and relocatable images (#3113).
+- Identifiers named `sel` across the codebase are renamed ahead of introducing `sel` as a v5 keyword (#3219).
+- Root project manifests must declare at least one `[profile.<name>]` table (#3222).
+- Every declared profile in root and dependency manifests must state `opt`, `debug`, `simd`, `vectorize` and `float_reassoc` (#3222).
+- Built-in `debug` and `release` profiles are synthesized only for dependencies that declare no profiles (#3222).
+- `mach init` writes both `debug` and `release` profiles in full, with `debug` marked `default = true` (#3222).
+- Artifact and step requirements are category-qualified, with `need` naming `step.<name>`, `artifact.<name>`, or category globs such as `artifact.shader-*` (#3222).
+- Steps and artifacts may share identical names (#3222).
+- Bare requirement entries, entries matching nothing in their category, self-requirements, artifacts named as requirements by steps, and step cycles are reported as manifest parse errors (#3222).
+- A bare `use <id>` dependency import binds the entry shared by its library artifacts marked `default = true` (#3222).
+- Multiple default library artifacts may share an entry, `bin` artifacts never publish one, and full-path imports need no default (#3222).
+- `mach init --lib` marks its single `static` artifact `default = true` so the scaffolded library provides the defaulted public entry bound by bare `use <id>` imports, leaving the rest of the scaffold unchanged (#3226).
+- Vector operations require an explicit target capability row, with each ISA declaring supported (operation, lane kind, lane width) rows positively (#3120).
+- Missing or malformed vector operations and lane shapes no longer default to packed instruction support (#3120).
+- `riscv32` defaults to documented `rv32imac`, accepting `ilp32` and refusing `ilp32f` and `ilp32d` conventions (#3127).
+- Hardware float on RV32 requires explicitly configuring `rv32imafdc` (#3127).
+- Linking refuses RISC-V objects whose attributes or header flags require extensions absent from the selected target (#3127).
+- Mach RISC-V object attributes declare `zicsr` and `zifencei` alongside selected single-letter extensions (#3127).
+- Every dependency action selects its project with `mach dep <action> <path>`, using `.` for the current project.
+- Dependency names follow the project path argument, and missing or extra operands are refused.
+- `mach dep pull` retains existing local copies while `mach dep update` refreshes them.
+- Dependency commands preserve repository Git history.
+- Query products validate their inputs transitively before reuse, own their diagnostics, and release replaced or failed candidates through their finalizers (#3220).
+- Equal recomputed dependencies keep their revision, while changed diagnostics with equal bytes stay observable (#3220).
+- External revisions and target changes invalidate dependent queries, ensuring a failed dependency never leaves a stale successful product (#3220).
+- Importers depend on a dependency public surface, allowing body-only edits to reuse cached typed results (#3220).
+- Builds decode each origin module typed surface once per surface being built (#2299).
+- Resolution results are remapped once per operation (#2299).
+- Semantic analysis and lowering computations acquire origin definitions once per phase (#2299).
+- Record and union field graphs are verified once per type projection (#2299).
+- Performance log and benchmark results showing sema dropping from 212 ms to 75 ms and lower from 261 ms to 117 ms on a 43-module artifact are recorded on PR #3252 (#2299).
+- Editor analysis returns an owned diagnostic and source snapshot with explicit phase and target selection (#2999).
+- Raw query products enforce checked serial-view lifetimes in editor sessions (#2999).
+- Closing a buffer retires its overlay, source payload, and cached dependents while retaining its `FileId` (#2999).
+- Buffer slots are reused, and checked editor teardown preserves resource ownership on preparation failures (#2999).
+
+### Fixed
+
+- The windows-x86_64 target reserves a 16 MiB stack, so the parser's 2048-level nesting bound (8.2 MiB of win64 release frames) is answered with a diagnostic instead of `STATUS_STACK_OVERFLOW`, and the release-profile unit suite runs on windows in CI again (#3325).
+- `mach fmt` and `mach init` keep the transaction layer's lock sentinel, claims directory and backup container under `out/.mach-txn/<relative path>` instead of beside the sources they rewrite, so a formatted tree gains no `.mach-txn-lock` or `.machtxn.*` entries (#3310).
+- `mach fmt --check` locks nothing and creates no control home, and `mach init` into an absent destination locks through an ephemeral home under the temporary directory so the parent directory receives no sentinel (#3310).
+- `.gitignore` covers `.mach-txn-lock` and `.machtxn.*` against a pre-fix formatter (#3310).
+- `mach doc` publishes each page through the project's control home, so `doc/` and every directory under it gains no `.mach-txn-lock`, claims directory or backup; an `--out` outside the project is rooted as before (#3310).
+- `mach doc` documents only the root project's modules: a dependency's pages and index rows are no longer generated into the consumer's tree (#3321).
+- A narrow integer divide or remainder is widened to the target's declared ALU floor rather than a fixed 32 bits, so the spirv target divides 8-bit and 16-bit lanes at their own width and the quotient keeps the lane type; `vec/rows_i8` and `vec/rows_i16` leave `test/golden/spirv/SKIPS` and carry the column (#3318).
+- `mach doc` writes under `doc/` rather than `doc/api/`: the index is `doc/README.md` and each page is `doc/<module path>.md`; `--out <dir>` is unchanged (#3321).
+- The dependency conflict diagnostic's example `[dep.<id>]` table escapes its `git`, `ref` and `path` values as the manifest writer does, so a host path with backslashes reparses as written (#3317).
+- Four unit tests that encoded an x86_64-linux host (a two-target union fixture with no default, an absolute out probed through a host-invalid joined path, and a fixture path written into a scaffolded `mach.toml` unescaped) are host-independent, and the aarch64-linux and x86_64-windows test legs pass again (#3317).
+- Test return values are constrained to a status in `0..255` across test protocols, preventing return codes of 256 or multiples of 256 from being masked as passing exit status 0 on Linux and Darwin (#3241).
+- A literal-shaped `ret` outside `0..255` in a test body is a compile error at the `ret` naming the value, such as `test result 256 is outside the status range 0..255` (#3241).
+- The test dispatcher folds runtime results outside `0..255` to `255` before exiting, ensuring failure reporting with identical status across every host (#3241).
+- In-tree tests that previously accumulated more than eight failure bits now return the ordinal of the first failing check (#3241).
+- The test status range decision is recorded on PR #3297 (#3241).
+- Comments sharing a line with code are no longer taken as the doc run of the declaration on the next line (#3225).
+- Inline code comments never join with comments on following lines into a single doc run (#3225).
+- `#[deprecated]` warnings on dotted type paths split by line comments containing dots use the trivia-skipping path reader to place the warning directly on the identifier at its own line and column rather than inside the comment with a span extending onto the next line (#3129, the #3229 obligation).
+- AArch64 inline assembly parsing retags register-count forms of `lsl`, `lsr` and `asr` to the `lslv`/`lsrv`/`asrv` variable-shift class instead of parsing them under the immediate-shift row (#3126).
+- Constant-time validation classes AArch64 register-count shifts as variable shifts rather than assuming they require no trust, without changing verdicts on current targets (#3126).
+- Release builds inline qualifying small helpers and `#[inline]` functions across module boundaries, acquiring bodies into importer-owned lowering storage and expanding them in place (#3110).
+- Lowered dependency modules yield a `Q_INLINE_BODIES` product containing qualifying bodies under the size threshold that are not recursive, `noinline`, `scalar` or naked (#3110).
+- Cross-module inlining emits no copy, leaves remaining calls and taken addresses naming the provider symbol, preserves assembly payloads, effect flags, secrecy and debug metadata, and charges growth in live instructions and owned bytes (#3110).
+- `#[inline]` functions are no longer monomorphized into importing modules and are no longer part of the lowered module surface (#3110).
+- Provider body edits reach importers through `Q_INLINE_BODIES`, halting invalidation propagation when extracted inline bodies are unchanged (#3110).
+- An `#[oblivious]` function body is expanded only into an `#[oblivious]` caller so its instructions never leave a constant-time validated function (#3110).
+- System V x86-64 argument and return classification treats padding-only eightbytes in aggregates as NO_CLASS so empty eightbytes consume no register, matching GCC and Clang (#3263).
+- Over-aligned aggregates such as `#[align(16)] rec { a: u8 }` pass and return only in populated registers, preventing C callees from reading subsequent arguments from wrong registers and preventing returned objects from copying leftover register garbage into tail padding (#3263).
+- System V x86-64 argument stores zero every logical byte that no register piece delivers (#3263).
+- The System V x86-64 eightbyte walk flags struct members and array elements positioned at unaligned offsets and classifies the aggregate as MEMORY class, passing it on the stack and returning via hidden pointer to match GCC and Clang (#3266).
+- A `#[packed]` record whose fields happen to sit at naturally aligned offsets retains register classification under System V x86-64 (#3266).
+- Packed record ABI classification on Win64 (passing non-power-of-two sizes by reference) and AAPCS64 (classifying records by size alone) remains unchanged (#3266).
+- Secrecy provenance for by-value aggregates attaches to individual byte ranges rather than treating the aggregate home storage address as secret (#3263).
+- Call arguments, returned values and parameters carry the union of the aggregate object secret byte ranges, and aggregate homes are never seeded secret (#3263).
+- Aggregate transport runs with the object secrecy so that every carrier and caller copy is secret (#3263).
+- Release profile scalar replacement taints each field slot from the typed accesses to that field rather than from the whole object, keeping a public field of a record with a secret field public in both profiles (#3263).
+- Memory for table names collected while parsing `default = true` entries in `[target.*]` and `[profile.*]` tables is released after manifest parsing (#3222).
+- Bracket syntax following an imported name resolves according to the imported declaration own kind (#3121).
+- An imported value retains its subscript interpretation across dependency changes without requiring parse tree rewrites (#3121).
+- Name resolution reports one phase row per build instead of re-reporting every module for each deferred comptime pass (#3231).
+- Module resolution times accumulate across deferred comptime passes (#3231).
+- Comptime evaluation distinguishes unknown internal tags from unsupported values.
+- Comptime evaluation rejects comparisons of reflection descriptors that lack equality semantics.
+- Native encoder failures preserve full opcode values and report owned diagnostics.
+- Selected target instructions are validated within their own opcode domains.
+- Unknown syntax, operator, IR operand, backend instruction, operand and register class tags report internal failures with their catalog name and numeric value.
+- Verifier diagnostics own their text and propagate allocation failures without losing tag or source location information.
+- Constant expressions evaluate nested scalar casts while preserving integer widths and signedness (#3122).
+- A failed global initializer rejects compilation instead of publishing a zero value or caching a successful lowered product (#3122).
+- Integer vector division `/` is supported end to end, with each lane following scalar division and preserving signedness (#3122).
+- Vector division rejects secret operands during constant-time validation (#3122).
+- Target architectures lacking packed integer divide instructions automatically scalarize vector division (#3122).
+- Test listing stops immediately after collecting tests without generating or linking machine code or producing a test executable (#3230).
+- Dotted import, re-export and type names resolve identically with spacing or comments around dots (#3229).
+- Diagnostics on dotted paths retain original source spans when spacing or comments surround dots (#3229).
+- Unresolved imports report diagnostics at their own source coordinates instead of emitting an unlocated message (#3229).
+- Internal module load failures remain classified as internal errors instead of collapsing into user rejection diagnostics (#3229).
+- Relocatable linking preserves native sections, symbols, imports, attributes and relocation relations across ELF, Mach-O and COFF (#3119).
+- Final linking resolves absolute symbol definitions separately from image-relative symbols (#3119).
+- Closed catalogs reject unknown members under one policy that names the catalog and member, distinguishing malformed input, a declared capability a target or format does not honor, and an impossible internal state (#3124).
+- Build planning, driver setup and request hashing reject unknown request catalog values before use (#3124).
+- Object images, cache entries and query surfaces refuse a section kind, relocation kind, constant kind or symbol kind outside its catalog as malformed input (#3124).
+- A relocation kind that an image format lacks is reported as unsupported by that format, never as an internal failure (#3124).
+- Section and relocation kinds are defined via descriptor tables that every format and the linker derive from, allowing new kinds to be added as rows rather than fallback defaults (#3124).
+- An unknown constant-time operation class is refused instead of answering as needing no capability (#3124).
+- The CLI, editor and x86-64 packed encoder return structured errors rather than panicking on a kind outside their catalog (#3124).
+- An automated census keeps the default-picking site count for boundary-crossing catalogs at zero (#3124).
+- Instruction selection preserves each register operand required register bank.
+- Post-allocation verification independently rejects wrong-bank operands, including conversions, moves, and memory addresses.
+- Memory promotion removes unreachable blocks before rewriting locals, preserving valid IR when an unconditional loop leaves a dead cleanup or return path.
+- The COFF weak-body linker test publishes into private temporary directories, preventing contention with parallel publication tests and reporting the failing stage.
+- Instruction-selection guards read the selected machine model.
+- RV32 full-register conversions are recognized as copies and removed by register coalescing, including when RV32 and RV64 targets are selected in the same process.
+- CI rebuilds its audited compiler from published 4.26.5 artifacts and source commits reachable from main after withdrawal of the 4.30.0 release.
+
+### Removed
+
+- The python corpus driver (`test/lib/`), `engines.conf`, `tools.lock`, `ci-legs.sh`, `ci-tools.sh`, `test-corpus.py`, `test/vecrows/`, `test/link/run.sh` and its `lib/`, `test/memory.py`, `test/census.sh` and `test/census/`, `doc-agreement.py`, `doc-examples.py`, `determinism.sh`, `test/checked-types/`, `version-vendor.sh`, the fuzz runner, `.github/scripts/`, and the `test-main`, `darwin-lane` and `compiler-memory` workflows (#3316).
+- The `clobbers` field on `isa.Inst` is removed (#2212).
+- Implicit instruction writes derive from `asm.Mnemonic.implicit` and opcode descriptors, eliminating zero-filled effects that read as having no clobbers for every instruction (#2212).
+- The unreleased `try` grammar production from the withdrawn 2026-09-08 design is removed from the parser, restoring `try` as an ordinary identifier (#3131).
+- Source programs using the withdrawn `try` syntax produce a parse error instead of an internal compiler failure (#3131).
+- `doc/language/try.md` and all references to flow-sensitive proofs, compiler-known `res`/`opt`/`err` tags, and function-scope `def` declarations are removed from the language reference (#3131).
+- The `:^` and `:^T` declassification spellings are removed in favor of `expr:>T` which always names its public result type (#3226, #3112).
+- `:^` is no token: `x:^` and `x:^u32` lex as a colon followed by a caret and fail at the enclosing statement's terminator check (#3226, #3112, #3324).
+- Declassifying an operand typed by a generic parameter defers target-type equality checks from the template to each concrete instance (#3226, #3112).
+- The `$mach.abi.sysv` comptime reflection alias is removed; the ABI is spelled `$mach.abi.sysv64` and `sysv` is an unknown tag (#3226, #3112, #3324).
+- Comptime path evaluation removes the diagnostic store previously maintained for `$mach.abi.sysv` deprecation warnings (#3226, #3112).
+- Manifest keys `name`, `description` and `mach` under `[project]` are removed and are unknown keys in root and dependency manifests alike (#3226, #3112, #3324).
+- Manifest keys `emit_ir` and `emit_asm` under `[profile.*]` are removed and are unknown keys in root and dependency manifests alike (#3226, #3112, #3324).
+- The manifest parser no longer records deprecated keys and the driver emits no deprecation warnings for them (#3226, #3112).
+- Comptime reflection properties `$project.name` and `$project.description` are removed and are unknown `$project.*` paths (#3226, #3112, #3128, #3324).
+- A rejected rooted comptime path reports the path own error message at the path instead of falling through to generic errors on the root identifier (#3226, #3112, #3128).
+- First-declared target, profile and artifact fallbacks are removed, prohibiting any selection by table order (#3226, #3112, #3222).
+- Manifests declaring multiple targets without a host match, multiple profiles, or multiple matching artifacts with none marked `default = true` are refused when a command must select one (#3226, #3112, #3222).
+- Selection refusal messages name the configuration axis, the required `default = true` key, and the selecting command-line flag (#3226, #3112, #3222).
+- Internal build requests no longer carry a by-table-order selection bit (#3226, #3112, #3222).
+- An `#[embed]` decorator whose resolved path escapes the project root is refused with an error rather than read with a warning, and the driver skips the path so files outside the project are never opened (#3226, #3112).
+- The embed path containment check compares the project root and resolved file in a unified coordinate system, preventing false escape refusals when running `mach build .` with relative paths (#3226, #3112).
+- Alias dependency keys are removed: a `[dep.<key>]` whose realized project declares a different id is refused by `pull`, `verify` and build commands, requiring the manifest key, directory under `dep/` and project id to match (#3226, #3112).
+- Realized nested dependency directories `dep/<id>/dep/<x>/mach.toml` are refused with a diagnostic naming the directory to delete, while empty gitlink directories continue to pass (#3226, #3112).
+- `mach.lock` is removed: a file of that name in the project root is an unrelated file no command reads; the committed gitlinks under `dep/` are the pins (#3226, #3112, #3324).
+- The driver content-conflict diagnostic for two keys realizing one id is removed as unreachable with aliases gone, while selector clashes continue to be reported by `mach dep` (#3226, #3112).
+- The implicit `lib.mach` entry for an artifact-less dependency is removed (#3226, #3112).
+- A bare `use <id>` import of a dependency declaring no artifacts is refused because it has no public module, while full-path imports remain supported without artifacts (#3226, #3112).
+- Support for the MOS 6502 target architecture is removed, deleting its instruction set (`target/isa/mos6502/`), ABI member, registry rows, freestanding OS row, `$mach.arch.mos6502` tag, the `target_unavailable` tuple capability, golden corpus column, and fuzz seed (#3226, #3112).
+- A `[target.*]` manifest table naming `mos6502` as its `isa` or `abi` is refused as an unregistered name at target resolution (#3226, #3112, #3324).
+- The architecture catalog is updated to version 2, reserving arch id 4 as `MOS6502_WITHDRAWN` (#3226, #3112).
+- The width legalization pass driven by the MOS 6502 target is retained as shared infrastructure for targets such as riscv32 (#3226, #3112).
+- The comptime manifest defines table, its binding step, and its slot in the build fingerprint are removed (#3131).
+- Unrecognized `$mach.build.*` property paths are refused at the use site as unknown paths (#3131).
+- The compiler no longer recognizes any pre-5.0 spelling by name: the migration diagnostics for `:^`, `$project.name`, `$project.description`, `$mach.abi.sysv`, the unread manifest keys, `mos6502`, `mach.lock`, backtick decorators, comptime attribute setters and C-style variadic `...` are deleted, and each form fails at its site with that site's ordinary diagnostic (#3324).
+- `mach dep sync`, the alias of `mach dep pull`, is removed along with the `DepActionSpec.alias_of` slot; `sync` is an unknown dep action (#3324).
+- The unused `classify` slot on `AbiVTable` and `abi.with_legacy_classifier` are removed (#3324, #3124).
+
 ## [4.30.0] - 2026-09-07
 
 The transition release that becomes the seed for 5.0.0. Replacement language

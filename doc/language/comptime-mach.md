@@ -5,13 +5,14 @@ context, the compiler identity, and source position. All reads, all comptime
 constants. The tags `$mach.{os,arch,abi,mode}.*` exist for path-value
 comparison against the resolved-build facts.
 
-> **Implementation status.** The resolved-build facts (`$mach.build.{os,arch,
-> abi,pointer_width,mode,pie}`), the tag tables (`$mach.{os,arch,abi,mode}.*`),
+> **Live and reserved paths.** The resolved-build facts (`$mach.build.{os,arch,
+> abi,pointer_width,mode,pie,platform}`), the tag tables (`$mach.{os,arch,abi,mode}.*`),
 > the compiler version (`$mach.version` and `$mach.version.{major,minor,patch}`),
 > and `$mach.compiler.{name,version}` are live. The `$mach.build.{timestamp,
 > host}`, `$mach.build.git.*`, `$mach.project.*`, and `$mach.source.*` paths are
-> reserved stubs — reading one is a compile error ("not yet available"). Each
-> subtree below notes its status.
+> reserved: the spelling is held for a later release and reading one is a
+> compile error naming the subtree (`` `$mach.source.*` is not yet available ``).
+> Each subtree below notes which it is.
 
 ## Subtrees
 
@@ -28,15 +29,21 @@ $mach.build.abi                 # live; compared against $mach.abi.* tags
 $mach.build.pointer_width       # live; integer count of bytes
 $mach.build.mode                # live; compared against $mach.mode.* tags
 $mach.build.pie                 # live; 1 when building position-independent, else 0
+$mach.build.platform            # live; the target's open platform tag as a string, "" when unset
 $mach.build.timestamp           # stub — not yet available
 $mach.build.host                # stub — not yet available
 $mach.build.git.commit          # stub — not yet available
 $mach.build.git.dirty           # stub — not yet available
 ```
 
-A bare `$mach.build.<name>` that names none of the reserved facts resolves to
-the manifest comptime define of that name, or is a compile error when no such
-define was declared.
+The members above are the whole subtree, and no manifest key adds one. A
+`$mach.build.<name>` that names none of them is a compile error at the use site
+(`` unknown `$mach.*` path ``). A project's own configuration constants are
+ordinary `val`s selected with `$if` over the facts above.
+
+```mach
+val TRACING: u64 = $mach.build.TRACING;
+```
 
 ### `$mach.version` — the compiler version
 
@@ -57,13 +64,11 @@ $mach.compiler.version          # live; same value as $mach.version
 ### `$mach.project.*` — values from mach.toml (stubs)
 
 ```mach
-$mach.project.name
-$mach.project.version
-$mach.project.root
+val root: u64 = $mach.project.root;
 ```
 
 > Project metadata lives at the top-level `$project.*` root
-> (`$project.{id,version,name,description}` and the declared target tuple
+> (`$project.{id,version}` and the declared target tuple
 > `$project.target.{os,arch,abi}`), fed from `[project]` / `[target.*]` in
 > `mach.toml` — see [comptime.md](comptime.md). These `$mach.project.*` paths
 > remain reserved stubs.
@@ -71,10 +76,7 @@ $mach.project.root
 ### `$mach.source.*` — current source position (stubs)
 
 ```mach
-$mach.source.file
-$mach.source.line
-$mach.source.module
-$mach.source.function
+val line: u64 = $mach.source.line;
 ```
 
 ### `$mach.os.*`, `$mach.arch.*`, `$mach.abi.*`, `$mach.mode.*` — tag values
@@ -106,11 +108,9 @@ The tag names are the target registries' own spellings, read from them
 directly; there is no second list to keep in step. A tag name the registry
 does not carry is a compile error, never a silent fold.
 
-One spelling survives from before the registries were the source: `$mach.abi.sysv`
-still resolves in 4.30.0, to the same value as `$mach.abi.sysv64`, and warns that
-the registry spells this ABI `sysv64`. 5.0.0 rejects it, so write
-`$mach.abi.sysv64`. `$mach.arch.mos6502` likewise still resolves in 4.30.0 for
-the withdrawn MOS 6502 target and is gone in 5.0.0.
+The x86-64 System V ABI is spelled `sysv64`, as the registry spells it;
+`$mach.abi.sysv` is an unknown tag, as is any other name the registry does not
+carry.
 
 ## Comparison
 
@@ -128,8 +128,13 @@ A `$mach.*` read can initialize a runtime binding. The compiler folds the
 RHS at compile time:
 
 ```mach
+use std.types.string.str;
+
 pub val IS_LINUX: u8   = $mach.build.os == $mach.os.linux;
 pub val COMPILER: *u8  = $mach.compiler.name;
+pub val VERSION:  str  = $mach.version;
+pub val MAJOR:    u64  = $mach.version.major;
+pub val WIDTH:    u64  = $mach.build.pointer_width;
 ```
 
 ## See also

@@ -1,0 +1,156 @@
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+
+use mach.lang.be.codegen.mir;
+use mach.lang.intern;
+use mach.lang.source;
+use mach.lang.target.isa;
+
+# the instruction notification stream: what an encoder records for every
+# emitted instruction and what the post-expansion walk consumes. one record
+# per notification, one seed set per notification
+
+pub val ASM_NOTE_INST:  u8 = 0;
+pub val ASM_NOTE_FUNC:  u8 = 1;
+pub val ASM_NOTE_BLOCK: u8 = 2;
+pub val ASM_NOTE_BYTES: u8 = 3;
+# a declassify barrier: no bytes, the MirInstr names the register it downgrades
+pub val ASM_NOTE_BARRIER: u8 = 4;
+
+pub val ASM_NOTE_BYTES_WIDTH: usize = 4;
+
+pub rec AsmNote {
+    kind:        u8;
+    off:         u32;
+    byte_len:    u32;
+    loc:         source.SrcLoc;
+    inline_site: u32;
+    # the MirInstr whose encoding emitted this note, nil for bytes with no MIR origin
+    mi:    *mir.MirInstr;
+    inst:  isa.Inst;
+    name:  intern.StrId;
+    id:    u32;
+    bytes: [ASM_NOTE_BYTES_WIDTH]u8;
+}
+
+pub fun note_blank() AsmNote {
+    var n: AsmNote;
+    n.byte_len    = 0;
+    n.loc         = source.loc_nil();
+    n.inline_site = 0;
+    n.mi          = nil;
+    n.kind        = ASM_NOTE_INST;
+    n.off         = 0;
+    n.inst        = isa.inst_blank();
+    n.name        = intern.STR_NIL;
+    n.id          = 0;
+    ret n;
+}
+
+pub val NOTE_SEED_MAX: u32 = 16;
+
+# the secrecy seeds a notification carries, per operand of the MirInstr it
+# encodes: the origin vreg each register or slot operand was rewritten from
+# and that vreg's declared secrecy. per operand, not per register: one
+# register can carry a dying secret source and a born public destination in
+# the same instruction, so a set keyed by register cannot say which
+pub rec NoteSeeds {
+    count:  u32;
+    origin: [NOTE_SEED_MAX]mir.VRegId;
+    secret: [NOTE_SEED_MAX]bool;
+    # a writes_secret load: operand 0 is secret by declaration
+    dst_secret: bool;
+    # an ASM_NOTE_BARRIER: operand 0 is public after this point
+    barrier: bool;
+}
+
+pub fun note_seeds_clear(out: *NoteSeeds) {
+    out.count      = 0;
+    out.dst_secret = false;
+    out.barrier    = false;
+}
+
+# every seed the walk needs at one notification. a note without a MirInstr
+# (prologue, epilogue, relaxation) carries no seed. operands past
+# NOTE_SEED_MAX are not described; no MIR instruction has that many.
+pub fun note_seeds(f: *mir.MirFunction, n: *AsmNote, out: *NoteSeeds) {
+    note_seeds_clear(out);
+    if (f == nil || n == nil || n.mi == nil) { ret; }
+    val mi: *mir.MirInstr = n.mi;
+    out.barrier = n.kind == ASM_NOTE_BARRIER;
+    if (out.barrier && mi.operand_count == 0) {
+        # a dropped self-copy: the downgraded vreg names its own carrier
+        out.count     = 1;
+        out.origin[0] = mi.declassified;
+        out.secret[0] = !mir.vreg_is_nil(mi.declassified) && mi.declassified.n < f.vreg_count
+            && f.vregs[mi.declassified.n].secret;
+        ret;
+    }
+    val defines: bool = mi.operand_count > 0 && mir.instr_defines_shape(mi);
+    var k:       u32  = 0;
+    for (k < mi.operand_count && k < NOTE_SEED_MAX) {
+        val op: *mir.MirOperand = ?mi.operands[k];
+        out.origin[k] = mir.operand_origin(op);
+        out.secret[k] = mir.operand_seed_secret(f, op);
+        if (k == 0 && defines && mi.writes_secret && op.kind == mir.MIR_OP_PREG) {
+            out.dst_secret = true;
+            out.secret[k]  = true;
+        }
+        k = k + 1;
+    }
+    out.count = k;
+}
+
+test "mach.lang.be.codegen.notes.note_seeds:declared_destination_slot_key_and_no_origin" {
+    var vregs: [2]mir.MirVReg;
+    vregs[0]            = mir.vreg(0, 0, false, false);
+    vregs[1]            = mir.vreg(1, 0, false, true);
+    vregs[1].spill_slot = 0;
+    var f: mir.MirFunction;
+    f.vregs      = ?vregs[0];
+    f.vreg_count = 2;
+
+    var ops: [2]mir.MirOperand;
+    ops[0] = mir.op_preg_of(mir.preg_id(3), mir.vreg_id(0));
+    ops[1] = mir.op_mem_preg(mir.preg_id(5), 16);
+    var load: mir.MirInstr = mir.instr(mir.MIR_LOAD, ?ops[0], 2, 8, 8);
+    load.writes_secret = true;
+    var n: AsmNote = note_blank();
+    n.mi = ?load;
+    var seeds: NoteSeeds;
+    note_seeds(?f, ?n, ?seeds);
+    if (seeds.count != 2 || !seeds.dst_secret || seeds.barrier) { ret 1; }
+    if (seeds.origin[0].n != 0 || !seeds.secret[0])             { ret 2; }
+    if (!mir.vreg_is_nil(seeds.origin[1]) || seeds.secret[1])   { ret 3; }
+
+    # without the declaration a public origin stays public
+    load.writes_secret = false;
+    note_seeds(?f, ?n, ?seeds);
+    if (seeds.dst_secret || seeds.secret[0]) { ret 4; }
+
+    var sops: [2]mir.MirOperand;
+    sops[0] = mir.op_mem_slot(mir.vreg_id(1), 0);
+    sops[1] = mir.op_preg(mir.preg_id(9));
+    var store: mir.MirInstr = mir.instr(mir.MIR_MOV, ?sops[0], 2, 8, 8);
+    n.mi = ?store;
+    note_seeds(?f, ?n, ?seeds);
+    if (seeds.count != 2 || seeds.dst_secret)                 { ret 5; }
+    if (seeds.origin[0].n != 1 || !seeds.secret[0])           { ret 6; }
+    if (!mir.vreg_is_nil(seeds.origin[1]) || seeds.secret[1]) { ret 7; }
+
+    var iops: [2]mir.MirOperand;
+    iops[0] = mir.op_preg_of(mir.preg_id(3), mir.vreg_id(1));
+    iops[1] = mir.op_imm(4);
+    var mov: mir.MirInstr = mir.instr(mir.MIR_MOV, ?iops[0], 2, 8, 8);
+    n.mi = ?mov;
+    note_seeds(?f, ?n, ?seeds);
+    if (seeds.count != 2 || seeds.origin[0].n != 1 || !seeds.secret[0] || !mir.vreg_is_nil(seeds.origin[1])) { ret 8; }
+
+    n.mi = nil;
+    note_seeds(?f, ?n, ?seeds);
+    if (seeds.count != 0 || seeds.barrier || seeds.dst_secret) { ret 9; }
+    ret 0;
+}

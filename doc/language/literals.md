@@ -39,7 +39,7 @@ of a pack tail, where nothing else constrains them:
 
 ```mach
 fun sink(va: ...) u32 { var acc: u32 = 0; $each a in va { acc = acc + a; } ret acc; }
-val total: u32 = sink(7u32, 8u32);
+fun total() u32 { ret sink(7u32, 8u32); }
 ```
 
 A literal outside the range of the type its suffix declares is rejected,
@@ -104,7 +104,7 @@ def F: fun(u32);
 var p: *i64 = nil;          # null pointer
 var cb: fun(u32) = nil;     # null function pointer
 var k:  F = nil::F;         # the cast spelling works too
-val absent: u8 = p == nil;  # nil compares against any pointer-like value
+fun absent() u8 { ret p == nil; }  # nil compares against any pointer-like value
 ```
 
 nil coerces only to pointer-like targets; assigning it to a non-pointer slot
@@ -112,12 +112,12 @@ nil coerces only to pointer-like targets; assigning it to a non-pointer slot
 
 ## Backticks
 
-The backtick (`` ` ``) is a real token with no grammar production. It
-delimited decorators through v2.3.0, so a backtick at decorator position is
-a migration error naming `#[...]`; anywhere else it is a syntax error. See
-[grammar.md](grammar.md#unexpected-characters).
+The backtick (`` ` ``) is not a token: it is an unexpected character wherever
+it appears. See [grammar.md](grammar.md#unexpected-characters).
 
 ## See also
 
-- [types.md](types.md) — what these literals are typed as
-- [val-var.md](val-var.md) — using literals as binding initializers
+- [types.md](types.md) - what these literals are typed as
+- [expressions.md](expressions.md) - record, array, union, and tag literals
+- [tag.md](tag.md) - tagged value construction
+- [val-var.md](val-var.md) - using literals as binding initializers

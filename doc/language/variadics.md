@@ -29,6 +29,9 @@ element and re-typed to that element's concrete type per instantiation.
 This is the only way to consume a pack.
 
 ```mach
+use std.runtime;
+use print: std.print;
+
 fun sum(va: ...) i64 {
     var t: i64 = 0;
     $each a in va {
@@ -37,15 +40,23 @@ fun sum(va: ...) i64 {
     ret t;
 }
 
-sum(1, 2, 3)       # 6
-sum(10, 20)        # 30
-sum()              # 0 — empty pack, body never runs
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.printlnf("{} {} {}",
+        sum(1, 2, 3),       # 6
+        sum(10, 20),        # 30
+        sum());             # 0 — empty pack, body never runs
+    ret 0;
+}
 ```
 
 Because each element has its own concrete type at monomorphization, the body
 can handle heterogeneous packs:
 
 ```mach
+use std.runtime;
+use print: std.print;
+
 fun sumc(va: ...) i64 {
     var t: i64 = 0;
     $each a in va {
@@ -54,7 +65,11 @@ fun sumc(va: ...) i64 {
     ret t;
 }
 
-sumc(1000, 50::i32, 7::u8, 200::i16)   # 1257
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.printlnf("{}", sumc(1000, 50::i32, 7::u8, 200::i16));   # 1257
+    ret 0;
+}
 ```
 
 A `$each` body is a normal statement block; it may nest arbitrarily, call
@@ -67,10 +82,16 @@ iterations — each iteration reads where the previous one left off.
 `va.len` folds to the instance's element count at compile time.
 
 ```mach
+use std.runtime;
+use print: std.print;
+
 fun count(va: ...) i64 { ret va.len::i64; }
 
-count(1, 2, 3)   # 3
-count()          # 0
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.printlnf("{} {}", count(1, 2, 3), count());   # 3 0
+    ret 0;
+}
 ```
 
 ## `va...` — forwarding a whole pack
@@ -79,17 +100,27 @@ Inside a pack instance, `g(va...)` forwards the whole pack to another
 pack-tailed function, which is monomorphized for the forwarded type-list.
 
 ```mach
-fun outer(va: ...) i64 { ret sum(va...); }
+use std.runtime;
+use print: std.print;
 
-outer(1, 2, 3)   # forwards (1, 2, 3) to sum → 6
+fun sum(va: ...) i64 { var t: i64 = 0; $each a in va { t = t + a; } ret t; }
+
+fun outer(va: ...) i64 { ret sum(va...); }
+fun fwdpre(base: i64, va: ...) i64 { ret base + sum(va...); }
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.printlnf("{} {}",
+        outer(1, 2, 3),          # forwards (1, 2, 3) to sum → 6
+        fwdpre(100, 1, 2, 3));   # 106
+    ret 0;
+}
 ```
 
 Leading fixed arguments may precede the spread at the call site:
 
 ```mach
 fun fwdpre(base: i64, va: ...) i64 { ret base + sum(va...); }
-
-fwdpre(100, 1, 2, 3)   # 106
 ```
 
 `va...` is valid **only as the sole trailing argument of a pack-tailed
@@ -165,21 +196,42 @@ fun sumdbl(va: ...) i64 {
 
 The standard library's `vformat` is a pack-tailed function. Each `$each`
 iteration handles one format argument in order, with `$type_of` dispatch
-selecting the right writer per element type:
+selecting the right writer per element type. A reduced version of the same
+shape, answering `res[usize, FormatError]` the way std's does:
 
 ```mach
-pub fun vformat(w: *Writer, fmt: str, va: ...) Result[usize, str] {
+use std.runtime;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.result.res;
+use print: std.print;
+
+tag FormatError: u8 { few_holes; }
+
+fun write_byte(b: u8) { var one: [2]u8 = [2]u8{b, 0}; print.print(?one[0]); }
+fun write_str(s: str) { print.print(s); }
+fun write_i64(n: i64) { print.printf("{}", n); }
+
+fun vformat(fmt: str, va: ...) res[usize, FormatError] {
     var i: usize = 0;
     $each arg in va {
-        for (fmt[i] != 0 && fmt[i] != '{') { write_byte(w, fmt[i]); i = i + 1; }
-        if (fmt[i] != '{') { ret err[usize, str](ERR_FEW_HOLES); }
+        for (fmt[i] != 0 && fmt[i] != '{') { write_byte(fmt[i]); i = i + 1; }
+        if (fmt[i] != '{') { ret res[usize, FormatError].err{FormatError.few_holes{}}; }
         i = i + 2;
-        $if ($type_of(arg) == str) { write_str(w, arg); }
-        $or ($type_of(arg) == i64) { write_i64(w, arg); }
+        $if ($type_of(arg) == str) { write_str(arg); }
+        $or ($type_of(arg) == i64) { write_i64(arg); }
         $or { $error("no writer for this argument type"); }
     }
-    for (fmt[i] != 0) { write_byte(w, fmt[i]); i = i + 1; }
-    ret ok[usize, str](i);
+    for (fmt[i] != 0) { write_byte(fmt[i]); i = i + 1; }
+    ret res[usize, FormatError].ok{i};
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    val hi: str = "hi";
+    val r: res[usize, FormatError] = vformat("n={} s={}\n", 7, hi);
+    if (sel r.err) { ret 1; }
+    ret 0;
 }
 ```
 

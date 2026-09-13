@@ -1,18 +1,25 @@
+use mach.lang.fail;
 use std.allocator.page;
-use std.format;
 use std.collections.vector;
 use std.collections.vector.Vector;
 use std.data.toml;
 use fs: std.filesystem;
+use std.format;
+use io_error: std.io.error;
 use std.memory;
 use std.print;
 use std.process.env;
+use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.char.char;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.path;
+use std.types.result.res;
 use std.types.size.usize;
-use std.text.string.str_free;
+use std.types.string;
 use std.types.string.str;
 use std.types.string.str_contains;
 use std.types.string.str_copy;
@@ -23,50 +30,52 @@ use std.types.string.str_join;
 use std.types.string.str_len;
 use std.types.string.str_replace;
 use std.types.string.str_starts_with;
-use std.types.path;
 
 use A: std.allocator;
-use O: std.types.option;
-use R: std.types.result;
 
 use mach.lang.target.of.ar;
 use mach.lang.target.of.bin;
 use mach.lang.target.of.coff;
 use mach.lang.target.of.elf;
 use mach.lang.target.of.macho;
+use std.io.writer;
+
 use mach.lang.build.outcome;
 use mach.lang.build.request;
+use mach.lang.driver;
+use dcfg: mach.lang.driver.config;
 use mach.lang.driver.project;
 use mach.lang.intern;
 use mach.lang.manifest;
 use mach.lang.me.pipeline;
+use mach.lang.session;
 use mach.lang.target;
-use target_testing: mach.lang.target.testing;
 use mach.lang.target.isa;
 use mach.lang.target.of;
+use target_testing: mach.lang.target.testing;
 use mach.lang.textbuild;
 
 pub def PhaseKind: u8;
 
 pub val PH_DEP_STEPS: PhaseKind = 0;
 
-pub val PH_LOAD:      PhaseKind = 1;
+pub val PH_LOAD: PhaseKind = 1;
 
-pub val PH_STEPS:     PhaseKind = 2;
+pub val PH_STEPS: PhaseKind = 2;
 
-pub val PH_SEMA:      PhaseKind = 3;
+pub val PH_SEMA: PhaseKind = 3;
 
-pub val PH_LOWER:     PhaseKind = 4;
+pub val PH_LOWER: PhaseKind = 4;
 
-pub val PH_CODEGEN:   PhaseKind = 5;
+pub val PH_CODEGEN: PhaseKind = 5;
 
-pub val PH_EMIT:      PhaseKind = 6;
+pub val PH_EMIT: PhaseKind = 6;
 
-pub val PH_LINK:      PhaseKind = 7;
+pub val PH_LINK: PhaseKind = 7;
 
 pub def LinkInputKind: u8;
 
-pub val LINK_STATIC:  LinkInputKind = 0;
+pub val LINK_STATIC: LinkInputKind = 0;
 
 pub val LINK_DYNAMIC: LinkInputKind = 1;
 
@@ -78,18 +87,32 @@ pub rec LinkInput {
     include_referenced: bool;
 }
 
+# one planned cell: an artifact on a target for a profile, with every decision
+# the engine executes. `plan` fills everything the root manifest decides; `configure`
+# adds what the realized dependency closure decides
+# ---
+# steps:        the root manifest's prerequisite steps in execution order, by name
+# dep_steps:    exported dependency steps in execution order as `<dep id>.<step>`;
+#               empty until `configure`
+# export_links: the dependency closure's exported link requirements for this
+#               cell, in link order; empty until `configure`
+# configured:   `configure` ran, so `dep_steps` and `export_links` are effective
 pub rec BuildUnit {
-    target_entry: *project.TargetEntry;
-    profile:      str;
-    opt_level:    u8;
+    target_entry:     *project.TargetEntry;
+    profile:          str;
+    opt_level:        u8;
     placement_policy: u32;
-    goal:         request.BuildGoal;
-    out_path:     str;
-    obj_dir:      str;
-    ir_dir:       str;
-    asm_dir:      str;
-    link_inputs:  Vector[LinkInput];
-    phases:       Vector[PhaseKind];
+    goal:             request.BuildGoal;
+    out_path:         str;
+    obj_dir:          str;
+    ir_dir:           str;
+    asm_dir:          str;
+    link_inputs:      Vector[LinkInput];
+    phases:           Vector[PhaseKind];
+    steps:            Vector[str];
+    dep_steps:        Vector[str];
+    export_links:     Vector[manifest.LinkRequirement];
+    configured:       bool;
 
     sel_target:   str;
     sel_artifact: str;
@@ -102,90 +125,98 @@ pub rec BuildUnit {
 
 pub def BuildRequest: request.BuildRequest;
 
+# project: the root manifest's `[project].id`
 pub rec BuildPlan {
     request: BuildRequest;
+    project: str;
     units:   Vector[BuildUnit];
 }
 
 pub fun plan(a: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry,
-             m: *manifest.Manifest, owned_req: request.BuildRequest) R.Result[BuildPlan, outcome.Fail] {
+    m: *manifest.Manifest, owned_req: request.BuildRequest) res[BuildPlan, outcome.Fail] {
+    val valid: err[outcome.Fail] = request.validate(a, ?owned_req);
+    if (sel valid.err) {
+        ret res[BuildPlan, outcome.Fail].err{valid.err};
+    }
     var bp: BuildPlan;
     bp.request = owned_req;
     bp.units   = vector.init[BuildUnit](a);
+    bp.project = entry_name(itn, m.id);
     val req: *request.BuildRequest = ?bp.request;
 
     if (request.test_goal(req.goal)) {
-        var sel: manifest.Selection;
-        sel.target       = req.target;
-        sel.profile      = req.profile;
-        sel.artifact     = req.artifact;
-        sel.want_lib     = req.want_lib;
-        sel.has_artifact = !str_empty(req.artifact);
-        sel.legacy_default = false;
-        val psr: R.Result[R.Void, str] = manifest.select_primary_artifact(a, itn, m, ?sel);
-        if (R.is_err[R.Void, str](psr)) {
-            ret R.err[BuildPlan, outcome.Fail](outcome.user(R.unwrap_err[R.Void, str](psr)));
+        var pick: manifest.Selection;
+        pick.target       = req.target;
+        pick.profile      = req.profile;
+        pick.artifact     = req.artifact;
+        pick.want_lib     = req.want_lib;
+        pick.has_artifact = !str_empty(req.artifact);
+        val psr: err[outcome.Fail] = manifest.select_primary_artifact(a, itn, m, ?pick);
+        if (sel psr.err) {
+            ret res[BuildPlan, outcome.Fail].err{psr.err};
         }
-        bp.request.artifact = sel.artifact;
-        bp.request.want_lib = sel.want_lib;
-        bp.request.artifact_by_table_order = sel.legacy_default;
-        val cr: R.Result[R.Void, outcome.Fail] = plan_cell(a, itn, reg, m, req, ?bp,
+        bp.request.artifact = pick.artifact;
+        bp.request.want_lib = pick.want_lib;
+        val cr: err[outcome.Fail] = plan_cell(a, itn, reg, m, req, ?bp,
             req.target, req.artifact, req.want_lib, !str_empty(req.artifact), false);
-        if (R.is_err[R.Void, outcome.Fail](cr)) {
-            ret R.err[BuildPlan, outcome.Fail](R.unwrap_err[R.Void, outcome.Fail](cr));
+        if (sel cr.err) {
+            ret res[BuildPlan, outcome.Fail].err{cr.err};
         }
-        ret R.ok[BuildPlan, outcome.Fail](bp);
+        ret res[BuildPlan, outcome.Fail].ok{bp};
     }
 
     val expand_targets: bool = req.all_targets && str_empty(req.target);
-    var tn: u32 = 1;
+    var tn:             u32  = 1;
     if (expand_targets) { tn = m.target_count; }
     if (tn == 0) {
-        ret R.err[BuildPlan, outcome.Fail](outcome.user("mach.toml: --all-targets but no [target.*] declared"));
+        ret res[BuildPlan, outcome.Fail].err{outcome.user("mach.toml: --all-targets but no [target.*] declared")};
     }
 
     val expand_artifacts: bool = str_empty(req.artifact);
-    var an: u32 = 1;
+    var an:               u32  = 1;
     if (expand_artifacts) { an = m.artifact_count; }
     if (an == 0) {
-        ret R.err[BuildPlan, outcome.Fail](outcome.user("mach.toml: no [artifact.*] artifacts declared"));
+        ret res[BuildPlan, outcome.Fail].err{outcome.user("mach.toml: no [artifact.*] artifacts declared")};
     }
 
     var ti: u32 = 0;
     for (ti < tn) {
         var tname: str = req.target;
         if (expand_targets) {
-            val to: O.Option[str] = intern.lookup(itn, m.targets[ti].name);
-            if (O.is_none[str](to)) {
-                ret R.err[BuildPlan, outcome.Fail](outcome.user("internal: target name not interned"));
+            val to: opt[str] = intern.lookup(itn, m.targets[ti].name);
+            if (sel to.none) {
+                ret res[BuildPlan, outcome.Fail].err{outcome.user("internal: target name not interned")};
             }
-            tname = O.unwrap[str](to);
+            tname = to.some;
         }
         var ai: u32 = 0;
         for (ai < an) {
             var aname:    str  = req.artifact;
             var want_lib: bool = req.want_lib;
             if (expand_artifacts) {
-                val ao: O.Option[str] = intern.lookup(itn, m.artifacts[ai].name);
-                if (O.is_none[str](ao)) {
-                    ret R.err[BuildPlan, outcome.Fail](outcome.user("internal: artifact name not interned"));
+                val ao: opt[str] = intern.lookup(itn, m.artifacts[ai].name);
+                if (sel ao.none) {
+                    ret res[BuildPlan, outcome.Fail].err{outcome.user("internal: artifact name not interned")};
                 }
-                aname    = O.unwrap[str](ao);
+                aname    = ao.some;
                 want_lib = m.artifacts[ai].is_lib;
             }
 
             if (expand_targets || expand_artifacts) {
-                val supported_r: R.Result[bool, str] = cell_declared(a, itn, m, tname, aname, want_lib);
-                if (R.is_err[bool, str](supported_r)) {
-                    ret R.err[BuildPlan, outcome.Fail](outcome.user(R.unwrap_err[bool, str](supported_r)));
+                val supported_r: res[bool, outcome.Fail] = cell_declared(a, itn, m, tname, aname, want_lib);
+                if (sel supported_r.err) {
+                    ret res[BuildPlan, outcome.Fail].err{supported_r.err};
                 }
-                if (!R.unwrap_ok[bool, str](supported_r)) { ai = ai + 1; cnt; }
+                if (!supported_r.ok) {
+                    ai = ai + 1;
+                    cnt;
+                }
             }
 
-            val cr: R.Result[R.Void, outcome.Fail] = plan_cell(a, itn, reg, m, req, ?bp,
+            val cr: err[outcome.Fail] = plan_cell(a, itn, reg, m, req, ?bp,
                 tname, aname, want_lib, true, false);
-            if (R.is_err[R.Void, outcome.Fail](cr)) {
-                ret R.err[BuildPlan, outcome.Fail](R.unwrap_err[R.Void, outcome.Fail](cr));
+            if (sel cr.err) {
+                ret res[BuildPlan, outcome.Fail].err{cr.err};
             }
             ai = ai + 1;
         }
@@ -193,13 +224,87 @@ pub fun plan(a: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry
     }
 
     if (bp.units.len == 0) {
-        ret R.err[BuildPlan, outcome.Fail](outcome.user(no_cells_msg(a, itn, m, req.target)));
+        ret res[BuildPlan, outcome.Fail].err{outcome.user(no_cells_msg(a, itn, m, req.target))};
     }
 
     if (!str_empty(req.out) && selected_unit_count(?bp) > 1) {
-        ret R.err[BuildPlan, outcome.Fail](outcome.user(out_conflict_msg(a, ?bp)));
+        ret res[BuildPlan, outcome.Fail].err{outcome.user(out_conflict_msg(a, ?bp))};
     }
-    ret R.ok[BuildPlan, outcome.Fail](bp);
+    ret res[BuildPlan, outcome.Fail].ok{bp};
+}
+
+# resolve every planned cell against the realized dependency closure, filling in
+# the exported dependency steps and export link requirements each cell consumes.
+# it configures projects through the same `driver.begin_build` a build runs, so a
+# missing realization, an invalid dependency manifest or a dependency cycle is
+# reported here exactly as the build would report it. nothing is fetched, no step
+# runs and no output is written
+# ---
+# s:   the session the plan was made in
+# m:   the root manifest
+# bp:  the plan, mutated in place; each unit becomes `configured`
+# ret: ok; the configuration failure of the first cell that has one
+pub fun configure(s: *session.Session, m: *manifest.Manifest, bp: *BuildPlan) err[outcome.Fail] {
+    var i: usize = 0;
+    for (i < bp.units.len) {
+        val u:   *BuildUnit           = ?bp.units.data[i];
+        var req: request.BuildRequest = request.for_cell(?bp.request, u.sel_target,
+            u.sel_artifact, u.want_lib, u.subsystem, u.goal);
+        val begun: res[project.Project, outcome.Fail] = driver.begin_build(s, m, ?req, nil);
+        if (sel begun.err) {
+            ret err[outcome.Fail].err{begun.err};
+        }
+        var p:         project.Project   = begun.ok;
+        val collected: err[outcome.Fail] = collect_dependency_plan(?p, u);
+        project.dnit_project(?p);
+        if (sel collected.err) { ret collected; }
+        u.configured = true;
+        i            = i + 1;
+    }
+    ret err[outcome.Fail].ok{};
+}
+
+fun collect_dependency_plan(p: *project.Project, u: *BuildUnit) err[outcome.Fail] {
+    val itn:     *intern.Interner                               = ?p.s.interner;
+    val planned: res[Vector[dcfg.DependencyStep], outcome.Fail] = dcfg.plan_dep_steps(p,
+        entry_name(itn, u.target_entry.isa_name), entry_name(itn, u.target_entry.os_name),
+        entry_name(itn, u.target_entry.abi_name));
+    if (sel planned.err) {
+        ret err[outcome.Fail].err{planned.err};
+    }
+    var steps: Vector[dcfg.DependencyStep] = planned.ok;
+    fin { vector.dnit[dcfg.DependencyStep](?steps); }
+
+    var i: usize = 0;
+    for (i < steps.len) {
+        val selected: dcfg.DependencyStep          = steps.data[i];
+        val dm:       *manifest.Manifest           = ?p.config.deps[selected.dependency].manifest;
+        val labelled: res[str, format.FormatError] = format.sprint(u.dep_steps.a, "{}.{}",
+            entry_name(itn, dm.id), entry_name(itn, dm.steps[selected.step].name));
+        if (sel labelled.err) {
+            ret err[outcome.Fail].err{outcome.internal(outcome.format_text(labelled.err))};
+        }
+        val pushed: res[usize, A.Error] = vector.push[str](?u.dep_steps, labelled.ok);
+        if (sel pushed.err) {
+            ret err[outcome.Fail].err{outcome.refused(pushed.err)};
+        }
+        i = i + 1;
+    }
+
+    # the claimed-symbol array belongs to the project config and dies with it; the
+    # plan keeps only the interned identity it displays
+    var li: u32 = 0;
+    for (li < p.config.cascade_lib_count) {
+        var retained: manifest.LinkRequirement = p.config.cascade_libs[li];
+        retained.symbols      = nil;
+        retained.symbol_count = 0;
+        val pushed: res[usize, A.Error] = vector.push[manifest.LinkRequirement](?u.export_links, retained);
+        if (sel pushed.err) {
+            ret err[outcome.Fail].err{outcome.refused(pushed.err)};
+        }
+        li = li + 1;
+    }
+    ret err[outcome.Fail].ok{};
 }
 
 fun selected_unit_count(bp: *BuildPlan) usize {
@@ -224,54 +329,54 @@ fun unit_already_planned(bp: *BuildPlan, aname: str, tgt: intern.StrId, want_lib
 }
 
 fun plan_cell(a: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry,
-              m: *manifest.Manifest, req: *request.BuildRequest, bp: *BuildPlan,
-              tname: str, aname: str, want_lib: bool, has_artifact: bool,
-              is_required: bool) R.Result[R.Void, outcome.Fail] {
+    m: *manifest.Manifest, req: *request.BuildRequest, bp: *BuildPlan,
+    tname: str, aname: str, want_lib: bool, has_artifact: bool,
+    is_required: bool) err[outcome.Fail] {
     var cell_req: request.BuildRequest = @req;
-    if (is_required) { cell_req.goal = request.GOAL_EXECUTE; }
-    val ur: R.Result[BuildUnit, outcome.Fail] = plan_unit(a, itn, reg, m, ?cell_req,
+    if (is_required && req.goal != request.GOAL_CHECK) { cell_req.goal = request.GOAL_EXECUTE; }
+    val ur: res[BuildUnit, outcome.Fail] = plan_unit(a, itn, reg, m, ?cell_req,
         tname, aname, want_lib, has_artifact, is_required);
-    if (R.is_err[BuildUnit, outcome.Fail](ur)) {
-        ret R.err[R.Void, outcome.Fail](R.unwrap_err[BuildUnit, outcome.Fail](ur));
+    if (sel ur.err) {
+        ret err[outcome.Fail].err{ur.err};
     }
-    var u: BuildUnit = R.unwrap_ok[BuildUnit, outcome.Fail](ur);
+    var u: BuildUnit = ur.ok;
     if (unit_already_planned(bp, u.sel_artifact, u.target_entry.name, u.want_lib)) {
-        ret R.ok_void[outcome.Fail]();
+        ret err[outcome.Fail].ok{};
     }
 
     var ri: usize = 0;
     for (ri < u.requires.len) {
-        val rname: str = u.requires.data[ri];
-        val ra: *manifest.ArtifactDef = manifest.find_artifact(itn, m, rname);
+        val rname: str                   = u.requires.data[ri];
+        val ra:    *manifest.ArtifactDef = manifest.find_artifact(itn, m, rname);
         if (ra == nil) {
-            ret R.err[R.Void, outcome.Fail](outcome.internal("internal: a required artifact is not declared"));
+            ret err[outcome.Fail].err{outcome.internal("internal: a required artifact is not declared")};
         }
         var reached: bool = false;
-        var ti: u32 = 0;
+        var ti:      u32  = 0;
         for (ti < m.target_count) {
             if (manifest.required_artifact_uses_target(itn, ra, u.target_entry.name, ?m.targets[ti])) {
-                val tn: O.Option[str] = intern.lookup(itn, m.targets[ti].name);
-                if (O.is_none[str](tn)) {
-                    ret R.err[R.Void, outcome.Fail](outcome.internal("internal: target name not interned"));
+                val tn: opt[str] = intern.lookup(itn, m.targets[ti].name);
+                if (sel tn.none) {
+                    ret err[outcome.Fail].err{outcome.internal("internal: target name not interned")};
                 }
-                val rr: R.Result[R.Void, outcome.Fail] = plan_cell(a, itn, reg, m, ?cell_req, bp,
-                    O.unwrap[str](tn), rname, ra.is_lib, true, true);
-                if (R.is_err[R.Void, outcome.Fail](rr)) { ret rr; }
+                val rr: err[outcome.Fail] = plan_cell(a, itn, reg, m, ?cell_req, bp,
+                    tn.some, rname, ra.is_lib, true, true);
+                if (sel rr.err) { ret rr; }
                 reached = true;
             }
             ti = ti + 1;
         }
         if (!reached) {
-            ret R.err[R.Void, outcome.Fail](outcome.user(join_msg(a,
+            ret err[outcome.Fail].err{outcome.user(join_msg(a,
                 "mach.toml: artifact '", u.sel_artifact, "' requires artifact '", rname,
-                "', which declares no target this build can produce")));
+                "', which declares no target this build can produce"))};
         }
         ri = ri + 1;
     }
 
-    val pr: R.Result[usize, str] = vector.push[BuildUnit](?bp.units, u);
-    if (R.is_err[usize, str](pr)) { ret R.err[R.Void, outcome.Fail](outcome.internal("out of memory")); }
-    ret R.ok_void[outcome.Fail]();
+    val pr: res[usize, A.Error] = vector.push[BuildUnit](?bp.units, u);
+    if (sel pr.err) { ret err[outcome.Fail].err{outcome.refused(pr.err)}; }
+    ret err[outcome.Fail].ok{};
 }
 
 fun no_cells_msg(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest, tsel: str) str {
@@ -279,25 +384,25 @@ fun no_cells_msg(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest, 
     if (!str_empty(tsel)) { tname = join_msg(a, "target '", tsel, "'"); }
 
     var nb: textbuild.TextBuilder = textbuild.tb_init(a);
-    var i: u32 = 0;
+    var i:  u32                   = 0;
     for (i < m.artifact_count) {
-        val ao: O.Option[str] = intern.lookup(itn, m.artifacts[i].name);
-        if (O.is_some[str](ao)) {
+        val ao: opt[str] = intern.lookup(itn, m.artifacts[i].name);
+        if (sel ao.some) {
             if (textbuild.tb_len(?nb) > 0) { textbuild.tb_append(?nb, ", "); }
-            textbuild.tb_append(?nb, O.unwrap[str](ao));
+            textbuild.tb_append(?nb, ao.some);
         }
         i = i + 1;
     }
-    val names_r: R.Result[str, str] = textbuild.tb_finish(?nb);
-    var names: str = "<message unavailable: allocation failed>";
-    if (R.is_ok[str, str](names_r)) { names = R.unwrap_ok[str, str](names_r); }
+    val names_r: res[str, textbuild.Error] = textbuild.tb_finish(?nb);
+    var names:   str                       = "<message unavailable: allocation failed>";
+    if (sel names_r.ok) { names = names_r.ok; }
     textbuild.tb_dnit(?nb);
     ret join_msg(a, "mach.toml: no artifact declares ", tname, "; declared artifacts: ", names);
 }
 
 fun out_conflict_msg(a: *A.Allocator, bp: *BuildPlan) str {
     var cb: textbuild.TextBuilder = textbuild.tb_init(a);
-    var i: usize = 0;
+    var i:  usize                 = 0;
     for (i < bp.units.len) {
         if (textbuild.tb_len(?cb) > 0) { textbuild.tb_append(?cb, ", "); }
         var tlabel: str = "the default target";
@@ -307,59 +412,65 @@ fun out_conflict_msg(a: *A.Allocator, bp: *BuildPlan) str {
         textbuild.tb_append(?cb, tlabel);
         i = i + 1;
     }
-    val cells_r: R.Result[str, str] = textbuild.tb_finish(?cb);
-    var cells: str = "<message unavailable: allocation failed>";
-    if (R.is_ok[str, str](cells_r)) { cells = R.unwrap_ok[str, str](cells_r); }
+    val cells_r: res[str, textbuild.Error] = textbuild.tb_finish(?cb);
+    var cells:   str                       = "<message unavailable: allocation failed>";
+    if (sel cells_r.ok) { cells = cells_r.ok; }
     textbuild.tb_dnit(?cb);
     ret join_msg(a, "-o names a single output but the selection resolves to several build units (",
         cells, "); narrow it with --bin/--lib and --target");
 }
 
-fun oom_plan() R.Result[BuildPlan, outcome.Fail] {
-    ret R.err[BuildPlan, outcome.Fail](outcome.internal("out of memory"));
+fun oom_plan() res[BuildPlan, outcome.Fail] {
+    ret res[BuildPlan, outcome.Fail].err{outcome.internal("out of memory")};
 }
 
 fun cell_declared(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
-                  tname: str, aname: str, want_lib: bool) R.Result[bool, str] {
-    var sel: manifest.Selection;
-    sel.target       = tname;
-    sel.profile      = "";
-    sel.artifact     = aname;
-    sel.want_lib     = want_lib;
-    sel.has_artifact = true;
-    ret manifest.cell_supported(a, itn, m, sel);
+    tname: str, aname: str, want_lib: bool) res[bool, outcome.Fail] {
+    var pick: manifest.Selection;
+    pick.target       = tname;
+    pick.profile      = "";
+    pick.artifact     = aname;
+    pick.want_lib     = want_lib;
+    pick.has_artifact = true;
+    ret manifest.cell_supported(a, itn, m, pick);
 }
 
 pub fun replan_unit(a: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry,
-                    m: *manifest.Manifest, req: *request.BuildRequest,
-                    prior: *BuildUnit) R.Result[BuildUnit, outcome.Fail] {
-    val ur: R.Result[BuildUnit, outcome.Fail] = plan_unit(a, itn, reg, m, req,
+    m: *manifest.Manifest, req: *request.BuildRequest,
+    prior: *BuildUnit) res[BuildUnit, outcome.Fail] {
+    val ur: res[BuildUnit, outcome.Fail] = plan_unit(a, itn, reg, m, req,
         prior.sel_target, prior.sel_artifact, prior.want_lib, prior.has_artifact,
         prior.is_required);
-    if (R.is_err[BuildUnit, outcome.Fail](ur)) { ret ur; }
-    var u: BuildUnit = R.unwrap_ok[BuildUnit, outcome.Fail](ur);
+    if (sel ur.err) { ret ur; }
+    var u: BuildUnit = ur.ok;
     if (!unit_decisions_equal(?u, prior)) {
-        ret R.err[BuildUnit, outcome.Fail](outcome.user(
-            "the manifest changed after this build was planned; re-run the build"));
+        ret res[BuildUnit, outcome.Fail].err{outcome.user(
+            "the manifest changed after this build was planned; re-run the build")};
     }
-    ret R.ok[BuildUnit, outcome.Fail](u);
+    ret res[BuildUnit, outcome.Fail].ok{u};
 }
 
 fun unit_decisions_equal(a: *BuildUnit, b: *BuildUnit) bool {
-    if (!str_equals(a.profile, b.profile))   { ret false; }
-    if (a.opt_level != b.opt_level)          { ret false; }
+    if (!str_equals(a.profile, b.profile))        { ret false; }
+    if (a.opt_level != b.opt_level)               { ret false; }
     if (a.placement_policy != b.placement_policy) { ret false; }
-    if (a.goal != b.goal)                    { ret false; }
-    if (a.subsystem != b.subsystem)          { ret false; }
-    if (a.want_lib != b.want_lib)            { ret false; }
-    if (a.has_artifact != b.has_artifact)    { ret false; }
-    if (a.is_required != b.is_required)      { ret false; }
+    if (a.goal != b.goal)                         { ret false; }
+    if (a.subsystem != b.subsystem)               { ret false; }
+    if (a.want_lib != b.want_lib)                 { ret false; }
+    if (a.has_artifact != b.has_artifact)         { ret false; }
+    if (a.is_required != b.is_required)           { ret false; }
 
     if (a.requires.len != b.requires.len) { ret false; }
     var ri: usize = 0;
     for (ri < a.requires.len) {
         if (!str_equals(a.requires.data[ri], b.requires.data[ri])) { ret false; }
         ri = ri + 1;
+    }
+    if (a.steps.len != b.steps.len) { ret false; }
+    var si: usize = 0;
+    for (si < a.steps.len) {
+        if (!str_equals(a.steps.data[si], b.steps.data[si])) { ret false; }
+        si = si + 1;
     }
     if (!str_equals(a.out_path, b.out_path)) { ret false; }
     if (!str_equals(a.obj_dir, b.obj_dir))   { ret false; }
@@ -388,69 +499,93 @@ fun unit_decisions_equal(a: *BuildUnit, b: *BuildUnit) bool {
     ret true;
 }
 
+# `where` names the declaration (the flag, or the manifest key of artifact
+# `aname`) so the refusal is located; the text is the catalog policy's
+fun subsystem_admitted(a: *A.Allocator, tgt: *target.Target, tname: str, sub: of.Subsystem, where: str, aname: str) err[outcome.Fail] {
+    if (tgt.of.carries_subsystem) { ret err[outcome.Fail].ok{}; }
+    val text: res[str, format.FormatError] = fail.catalog_text(a, fail.unsupported_member("Subsystem", of.subsystem_name(sub), tgt.of.name));
+    if (sel text.err) { ret err[outcome.Fail].err{outcome.internal("subsystem refusal could not be formatted")}; }
+    fin { str_free(a, text.ok); }
+    var located: res[str, format.FormatError];
+    if (str_len(aname) == 0) { located = format.sprint(a, "{}: {} (target '{}' produces a {} image, which declares no subsystem)", where, text.ok, tname, tgt.of.name); }
+    or                       { located = format.sprint(a, "{}.{}.subsystem: {} (target '{}' produces a {} image, which declares no subsystem)", where, aname, text.ok, tname, tgt.of.name); }
+    if (sel located.err)     { ret err[outcome.Fail].err{outcome.internal("subsystem refusal could not be formatted")}; }
+    ret err[outcome.Fail].err{outcome.user(located.ok)};
+}
+
 fun plan_unit(a: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry,
-              m: *manifest.Manifest, req: *request.BuildRequest,
-              tname: str, aname: str, want_lib: bool, has_artifact: bool,
-              is_required: bool) R.Result[BuildUnit, outcome.Fail] {
-    var sel: manifest.Selection;
-    sel.target       = tname;
-    sel.profile      = req.profile;
-    sel.artifact     = aname;
-    sel.want_lib     = want_lib;
-    sel.has_artifact = has_artifact;
+    m: *manifest.Manifest, req: *request.BuildRequest,
+    tname: str, aname: str, want_lib: bool, has_artifact: bool,
+    is_required: bool) res[BuildUnit, outcome.Fail] {
+    var pick: manifest.Selection;
+    pick.target       = tname;
+    pick.profile      = req.profile;
+    pick.artifact     = aname;
+    pick.want_lib     = want_lib;
+    pick.has_artifact = has_artifact;
 
-    val ur: R.Result[manifest.BuildUnit, str] = manifest.resolve_build_unit(a, itn, m, sel);
-    if (R.is_err[manifest.BuildUnit, str](ur)) {
-        ret R.err[BuildUnit, outcome.Fail](outcome.user(R.unwrap_err[manifest.BuildUnit, str](ur)));
+    val ur: res[manifest.BuildUnit, outcome.Fail] = manifest.resolve_build_unit(a, itn, reg, m, pick);
+    if (sel ur.err) {
+        ret res[BuildUnit, outcome.Fail].err{ur.err};
     }
-    val bu: manifest.BuildUnit = R.unwrap_ok[manifest.BuildUnit, str](ur);
+    val bu: manifest.BuildUnit = ur.ok;
 
-    val os_opt: O.Option[str] = intern.lookup(itn, bu.target.os);
-    if (O.is_none[str](os_opt)) { ret R.err[BuildUnit, outcome.Fail](outcome.user("target os name not interned")); }
-    val os_s: str = O.unwrap[str](os_opt);
-    val isa_opt: O.Option[str] = intern.lookup(itn, bu.target.isa);
-    if (O.is_none[str](isa_opt)) { ret R.err[BuildUnit, outcome.Fail](outcome.user("target isa name not interned")); }
-    val isa_s: str = O.unwrap[str](isa_opt);
-    val abi_opt: O.Option[str] = intern.lookup(itn, bu.target.abi);
-    if (O.is_none[str](abi_opt)) { ret R.err[BuildUnit, outcome.Fail](outcome.user("target abi name not interned")); }
-    val abi_s: str = O.unwrap[str](abi_opt);
-    var of_s: str = "";
-    val of_opt: O.Option[str] = intern.lookup(itn, bu.target.of);
-    if (O.is_some[str](of_opt)) { of_s = O.unwrap[str](of_opt); }
+    val os_opt: opt[str] = intern.lookup(itn, bu.target.os);
+    if (sel os_opt.none) { ret res[BuildUnit, outcome.Fail].err{outcome.user("target os name not interned")}; }
+    val os_s:    str      = os_opt.some;
+    val isa_opt: opt[str] = intern.lookup(itn, bu.target.isa);
+    if (sel isa_opt.none) { ret res[BuildUnit, outcome.Fail].err{outcome.user("target isa name not interned")}; }
+    val isa_s:   str      = isa_opt.some;
+    val abi_opt: opt[str] = intern.lookup(itn, bu.target.abi);
+    if (sel abi_opt.none) { ret res[BuildUnit, outcome.Fail].err{outcome.user("target abi name not interned")}; }
+    val abi_s:  str      = abi_opt.some;
+    var of_s:   str      = "";
+    val of_opt: opt[str] = intern.lookup(itn, bu.target.of);
+    if (sel of_opt.some) { of_s = of_opt.some; }
 
-    val tr: R.Result[target.Target, str] = target.select_of(reg, isa_s, os_s, abi_s, of_s);
-    if (R.is_err[target.Target, str](tr)) {
-        ret R.err[BuildUnit, outcome.Fail](outcome.user(R.unwrap_err[target.Target, str](tr)));
+    val tr: res[target.Target, fail.Fail] = target.select_of(reg, isa_s, os_s, abi_s, of_s);
+    if (sel tr.err) {
+        ret res[BuildUnit, outcome.Fail].err{outcome.user_fail(tr.err)};
     }
-    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+    var tgt: target.Target = tr.ok;
 
     var u: BuildUnit;
-    u.goal         = req.goal;
-    u.opt_level    = req.opt;
+    u.goal             = req.goal;
+    u.opt_level        = req.opt;
     u.placement_policy = req.placement_policy;
-    u.sel_target   = tname;
-    u.sel_artifact = aname;
-    u.want_lib     = want_lib;
-    u.has_artifact = has_artifact;
-    u.is_required  = is_required;
+    u.sel_target       = tname;
+    u.sel_artifact     = aname;
+    u.want_lib         = want_lib;
+    u.has_artifact     = has_artifact;
+    u.is_required      = is_required;
 
-    val rq_r: R.Result[R.Void, outcome.Fail] = collect_requires(a, itn, m, req, ?bu, tname, ?u);
-    if (R.is_err[R.Void, outcome.Fail](rq_r)) {
-        ret R.err[BuildUnit, outcome.Fail](R.unwrap_err[R.Void, outcome.Fail](rq_r));
+    val rq_r: err[outcome.Fail] = collect_requires(a, itn, m, req, ?bu, tname, ?u);
+    if (sel rq_r.err) {
+        ret res[BuildUnit, outcome.Fail].err{rq_r.err};
     }
 
+    # a declared subsystem is a capability only a format whose header carries
+    # one honors; on any other it is refused as unsupported, never read silently
     u.subsystem = of.SUBSYSTEM_CONSOLE;
-    if (bu.artifact != nil) { u.subsystem = bu.artifact.subsystem; }
-    val flag_subsystem: O.Option[of.Subsystem] = request.subsystem_from_flag(req.subsystem_flag);
-    if (O.is_some[of.Subsystem](flag_subsystem)) { u.subsystem = O.unwrap[of.Subsystem](flag_subsystem); }
+    if (bu.artifact != nil && bu.artifact.subsystem_declared) {
+        val declared: err[outcome.Fail] = subsystem_admitted(a, ?tgt, tname, bu.artifact.subsystem, "mach.toml: artifact", aname);
+        if (sel declared.err) { ret res[BuildUnit, outcome.Fail].err{declared.err}; }
+        u.subsystem = bu.artifact.subsystem;
+    }
+    val flag_subsystem: opt[of.Subsystem] = request.subsystem_from_flag(req.subsystem_flag);
+    if (sel flag_subsystem.some) {
+        val admitted: err[outcome.Fail] = subsystem_admitted(a, ?tgt, tname, flag_subsystem.some, "--subsystem", "");
+        if (sel admitted.err) { ret res[BuildUnit, outcome.Fail].err{admitted.err}; }
+        u.subsystem = flag_subsystem.some;
+    }
 
-    val pn_opt: O.Option[str] = intern.lookup(itn, bu.profile_name);
-    if (O.is_none[str](pn_opt)) { ret R.err[BuildUnit, outcome.Fail](outcome.user("internal: profile name not interned")); }
-    u.profile = O.unwrap[str](pn_opt);
+    val pn_opt: opt[str] = intern.lookup(itn, bu.profile_name);
+    if (sel pn_opt.none) { ret res[BuildUnit, outcome.Fail].err{outcome.user("internal: profile name not interned")}; }
+    u.profile = pn_opt.some;
 
-    val ter: R.Result[*project.TargetEntry, str] = A.allocate[project.TargetEntry](a, 1::usize);
-    if (R.is_err[*project.TargetEntry, str](ter)) { ret oom_unit(); }
-    val te: *project.TargetEntry = R.unwrap_ok[*project.TargetEntry, str](ter);
+    val ter: res[*project.TargetEntry, A.Error] = A.allocate[project.TargetEntry](a, 1::usize);
+    if (sel ter.err) { ret oom_unit(); }
+    val te: *project.TargetEntry = ter.ok;
     te.name       = bu.target_name;
     te.os_name    = bu.target.os;
     te.isa_name   = bu.target.isa;
@@ -459,108 +594,112 @@ fun plan_unit(a: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistr
     te.entrypoint = bu.entry;
     te.mode       = project.MODE_EXECUTABLE;
     if (bu.is_lib) { te.mode = project.MODE_LIBRARY; }
-    te.lib_kind   = bu.kind;
-    te.opt        = project.map_opt(bu.opt);
-    te.libs       = bu.libs;
-    te.lib_count  = bu.lib_count;
+    te.lib_kind = bu.kind;
+    val opt_level: opt[project.TargetOpt] = project.map_opt(bu.opt);
+    if (sel opt_level.none) { ret res[BuildUnit, outcome.Fail].err{outcome.unknown_catalog(a, "MOpt", bu.opt::u32)}; }
+    te.opt         = opt_level.some;
+    te.libs        = bu.libs;
+    te.lib_count   = bu.lib_count;
     u.target_entry = te;
 
     val root: str = req.project_root;
 
-    val ob_r: R.Result[str, outcome.Fail] = join_template(a, itn, root, bu.obj_root, "project obj output dir: ");
-    if (R.is_err[str, outcome.Fail](ob_r)) { ret R.err[BuildUnit, outcome.Fail](R.unwrap_err[str, outcome.Fail](ob_r)); }
-    u.obj_dir = R.unwrap_ok[str, outcome.Fail](ob_r);
+    val ob_r: res[str, outcome.Fail] = join_template(a, itn, root, bu.obj_root, "project obj output dir: ");
+    if (sel ob_r.err) { ret res[BuildUnit, outcome.Fail].err{ob_r.err}; }
+    u.obj_dir = ob_r.ok;
 
     u.ir_dir = "";
     if (req.emit_ir) {
-        val ib_r: R.Result[str, outcome.Fail] = join_template(a, itn, root, bu.ir_root, "project ir output dir: ");
-        if (R.is_err[str, outcome.Fail](ib_r)) { ret R.err[BuildUnit, outcome.Fail](R.unwrap_err[str, outcome.Fail](ib_r)); }
-        u.ir_dir = R.unwrap_ok[str, outcome.Fail](ib_r);
+        val ib_r: res[str, outcome.Fail] = join_template(a, itn, root, bu.ir_root, "project ir output dir: ");
+        if (sel ib_r.err) { ret res[BuildUnit, outcome.Fail].err{ib_r.err}; }
+        u.ir_dir = ib_r.ok;
     }
     u.asm_dir = "";
     if (req.emit_asm) {
-        val ab_r: R.Result[str, outcome.Fail] = join_template(a, itn, root, bu.asm_root, "project asm output dir: ");
-        if (R.is_err[str, outcome.Fail](ab_r)) { ret R.err[BuildUnit, outcome.Fail](R.unwrap_err[str, outcome.Fail](ab_r)); }
-        u.asm_dir = R.unwrap_ok[str, outcome.Fail](ab_r);
+        val ab_r: res[str, outcome.Fail] = join_template(a, itn, root, bu.asm_root, "project asm output dir: ");
+        if (sel ab_r.err) { ret res[BuildUnit, outcome.Fail].err{ab_r.err}; }
+        u.asm_dir = ab_r.ok;
     }
 
-    val op_r: R.Result[str, outcome.Fail] = unit_out_path(a, itn, m, req, ?bu, ?tgt, u.obj_dir, is_required);
-    if (R.is_err[str, outcome.Fail](op_r)) { ret R.err[BuildUnit, outcome.Fail](R.unwrap_err[str, outcome.Fail](op_r)); }
-    u.out_path = R.unwrap_ok[str, outcome.Fail](op_r);
+    val op_r: res[str, outcome.Fail] = unit_out_path(a, itn, m, req, ?bu, ?tgt, u.obj_dir, is_required);
+    if (sel op_r.err) { ret res[BuildUnit, outcome.Fail].err{op_r.err}; }
+    u.out_path = op_r.ok;
 
-    u.link_inputs = vector.init[LinkInput](a);
+    u.link_inputs  = vector.init[LinkInput](a);
+    u.dep_steps    = vector.init[str](a);
+    u.export_links = vector.init[manifest.LinkRequirement](a);
+    u.configured   = false;
     var ti: usize = 0;
     for (ti < req.link_tokens.len) {
-        val token: str = req.link_tokens.data[ti].text;
-        val lr: R.Result[LinkInput, outcome.Fail] =
-            resolve_token(a, ?tgt, ?req.lib_dirs, root, token::*u8);
-        if (R.is_err[LinkInput, outcome.Fail](lr)) {
-            ret R.err[BuildUnit, outcome.Fail](R.unwrap_err[LinkInput, outcome.Fail](lr));
+        val token: str                          = req.link_tokens.data[ti].text;
+        val lr:    res[LinkInput, outcome.Fail] = resolve_token(a, ?tgt, ?req.lib_dirs, root, token::*u8);
+        if (sel lr.err) {
+            ret res[BuildUnit, outcome.Fail].err{lr.err};
         }
-        var input: LinkInput = R.unwrap_ok[LinkInput, outcome.Fail](lr);
+        var input: LinkInput = lr.ok;
         if (!request.is_object_path(token::*u8) && !is_shared_path(token::*u8)
             && !is_dll_path(token::*u8) && !is_dylib_path(token::*u8)) {
             input.library = token;
         }
-        val pr: R.Result[usize, str] = vector.push[LinkInput](?u.link_inputs, input);
-        if (R.is_err[usize, str](pr)) { ret oom_unit(); }
+        val pr: res[usize, A.Error] = vector.push[LinkInput](?u.link_inputs, input);
+        if (sel pr.err) { ret oom_unit(); }
         ti = ti + 1;
     }
 
-    val ph_r: R.Result[R.Void, outcome.Fail] = derive_phases(a, itn, m, req, ?bu, ?tgt, ?u);
-    if (R.is_err[R.Void, outcome.Fail](ph_r)) {
-        ret R.err[BuildUnit, outcome.Fail](R.unwrap_err[R.Void, outcome.Fail](ph_r));
+    val ph_r: err[outcome.Fail] = derive_phases(a, itn, m, req, ?bu, ?tgt, ?u);
+    if (sel ph_r.err) {
+        ret res[BuildUnit, outcome.Fail].err{ph_r.err};
     }
-    ret R.ok[BuildUnit, outcome.Fail](u);
+    ret res[BuildUnit, outcome.Fail].ok{u};
 }
 
 fun collect_requires(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
-                     req: *request.BuildRequest, bu: *manifest.BuildUnit,
-                     tname: str, u: *BuildUnit) R.Result[R.Void, outcome.Fail] {
+    req: *request.BuildRequest, bu: *manifest.BuildUnit,
+    tname: str, u: *BuildUnit) err[outcome.Fail] {
     u.requires = vector.init[str](a);
 
-    val whole_project: bool = request.test_goal(req.goal);
-    val consumer: *manifest.ArtifactDef = bu.artifact;
-    if (consumer == nil && !whole_project) { ret R.ok_void[outcome.Fail](); }
+    val whole_project: bool                  = request.test_goal(req.goal);
+    val consumer:      *manifest.ArtifactDef = bu.artifact;
+    if (consumer == nil && !whole_project) { ret err[outcome.Fail].ok{}; }
 
     var j: u32 = 0;
     for (j < m.artifact_count) {
         if (requires_artifact(itn, m, consumer, ?m.artifacts[j], whole_project)) {
-            val no: O.Option[str] = intern.lookup(itn, m.artifacts[j].name);
-            if (O.is_none[str](no)) {
-                ret R.err[R.Void, outcome.Fail](outcome.internal("internal: artifact name not interned"));
+            val no: opt[str] = intern.lookup(itn, m.artifacts[j].name);
+            if (sel no.none) {
+                ret err[outcome.Fail].err{outcome.internal("internal: artifact name not interned")};
             }
-            val pr: R.Result[usize, str] = vector.push[str](?u.requires, O.unwrap[str](no));
-            if (R.is_err[usize, str](pr)) {
-                ret R.err[R.Void, outcome.Fail](outcome.internal("out of memory"));
+            val pr: res[usize, A.Error] = vector.push[str](?u.requires, no.some);
+            if (sel pr.err) {
+                ret err[outcome.Fail].err{outcome.internal("out of memory")};
             }
         }
         j = j + 1;
     }
-    ret R.ok_void[outcome.Fail]();
+    ret err[outcome.Fail].ok{};
 }
 
 fun requires_artifact(itn: *intern.Interner, m: *manifest.Manifest, consumer: *manifest.ArtifactDef,
-                      ra: *manifest.ArtifactDef, whole_project: bool) bool {
-    if (whole_project) { ret manifest.artifact_required_by_any(itn, m, ra); }
+    ra: *manifest.ArtifactDef, whole_project: bool) bool {
+    if (whole_project)   { ret manifest.artifact_required_by_any(itn, m, ra); }
     if (consumer == nil) { ret false; }
     ret manifest.artifact_needs_artifact(itn, consumer, ra);
 }
 
-fun oom_unit() R.Result[BuildUnit, outcome.Fail] {
-    ret R.err[BuildUnit, outcome.Fail](outcome.internal("out of memory"));
+fun oom_unit() res[BuildUnit, outcome.Fail] {
+    ret res[BuildUnit, outcome.Fail].err{outcome.internal("out of memory")};
 }
 
-fun join_template(a: *A.Allocator, itn: *intern.Interner, root: str, dir_id: intern.StrId, what: str) R.Result[str, outcome.Fail] {
-    val opt_tmpl: O.Option[str] = intern.lookup(itn, dir_id);
-    if (O.is_none[str](opt_tmpl)) {
-        ret R.err[str, outcome.Fail](outcome.internal(join_msg(a, what, "template not interned", "")));
+fun join_template(a: *A.Allocator, itn: *intern.Interner, root: str, dir_id: intern.StrId, what: str) res[str, outcome.Fail] {
+    val opt_tmpl: opt[str] = intern.lookup(itn, dir_id);
+    if (sel opt_tmpl.none) {
+        ret res[str, outcome.Fail].err{outcome.internal(join_msg(a, what, "template not interned", ""))};
     }
-    val jr: R.Result[str, str] = path.join(a, root, O.unwrap[str](opt_tmpl));
-    if (R.is_err[str, str](jr)) {
-        ret R.err[str, outcome.Fail](outcome.internal(join_msg(a, what, R.unwrap_err[str, str](jr), "")));
+    val jr: res[str, A.Error] = path.join(a, root, opt_tmpl.some);
+    if (sel jr.err) {
+        ret res[str, outcome.Fail].err{outcome.internal(join_msg(a, what, outcome.alloc_text(jr.err), ""))};
     }
-    ret R.ok[str, outcome.Fail](R.unwrap_ok[str, str](jr));
+    ret res[str, outcome.Fail].ok{jr.ok};
 }
 
 pub fun finished_modules(tgt: *target.Target) bool {
@@ -568,177 +707,207 @@ pub fun finished_modules(tgt: *target.Target) bool {
 }
 
 fun unit_out_path(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
-                  req: *request.BuildRequest, bu: *manifest.BuildUnit,
-                  tgt: *target.Target, obj_dir: str, is_required: bool) R.Result[str, outcome.Fail] {
-    if (req.goal == request.GOAL_OBJECTS)   { ret R.ok[str, outcome.Fail](obj_dir); }
-    if (req.goal == request.GOAL_TEST_LIST) { ret R.ok[str, outcome.Fail](""); }
+    req: *request.BuildRequest, bu: *manifest.BuildUnit,
+    tgt: *target.Target, obj_dir: str, is_required: bool) res[str, outcome.Fail] {
+    if (req.goal == request.GOAL_CHECK)     { ret res[str, outcome.Fail].ok{""}; }
+    if (req.goal == request.GOAL_OBJECTS)   { ret res[str, outcome.Fail].ok{obj_dir}; }
+    if (req.goal == request.GOAL_TEST_LIST) { ret res[str, outcome.Fail].ok{""}; }
     if (req.goal == request.GOAL_EXECUTE && finished_modules(tgt)) {
-        ret R.ok[str, outcome.Fail](obj_dir);
+        ret res[str, outcome.Fail].ok{obj_dir};
     }
 
     if (req.goal == request.GOAL_TESTS) {
         var name: str = "";
         if (bu.artifact != nil) {
-            val an_opt: O.Option[str] = intern.lookup(itn, bu.artifact.name);
-            if (O.is_some[str](an_opt)) { name = O.unwrap[str](an_opt); }
+            val an_opt: opt[str] = intern.lookup(itn, bu.artifact.name);
+            if (sel an_opt.some) { name = an_opt.some; }
         }
         if (str_empty(name)) {
-            val id_opt: O.Option[str] = intern.lookup(itn, m.id);
-            if (O.is_some[str](id_opt)) { name = O.unwrap[str](id_opt); }
+            val id_opt: opt[str] = intern.lookup(itn, m.id);
+            if (sel id_opt.some) { name = id_opt.some; }
         }
         if (str_empty(name)) { name = "tests"; }
 
-        val tmpl_opt: O.Option[str] = intern.lookup(itn, bu.test_root);
-        if (O.is_none[str](tmpl_opt)) { ret test_exe_fail(); }
-        val rel_r: R.Result[str, str] = str_replace(a, O.unwrap[str](tmpl_opt), "{name}", name);
-        if (R.is_err[str, str](rel_r)) { ret test_exe_fail(); }
-        val full_r: R.Result[str, str] = path.join(a, req.project_root, R.unwrap_ok[str, str](rel_r));
-        if (R.is_err[str, str](full_r)) { ret test_exe_fail(); }
-        ret R.ok[str, outcome.Fail](R.unwrap_ok[str, str](full_r));
+        val tmpl_opt: opt[str] = intern.lookup(itn, bu.test_root);
+        if (sel tmpl_opt.none) { ret test_exe_fail(); }
+        val rel_r: res[str, string.StrError] = str_replace(a, tmpl_opt.some, "{name}", name);
+        if (sel rel_r.err) { ret test_exe_fail(); }
+        val full_r: res[str, A.Error] = path.join(a, req.project_root, rel_r.ok);
+        if (sel full_r.err) { ret test_exe_fail(); }
+        ret res[str, outcome.Fail].ok{full_r.ok};
     }
 
     if (!str_empty(req.out) && !is_required) {
         if (!manifest.is_project_path(req.out)) {
-            ret R.err[str, outcome.Fail](outcome.user("-o must name a canonical path inside the project root"));
+            ret res[str, outcome.Fail].err{outcome.user("-o must name a canonical path inside the project root")};
         }
-        val op_r: R.Result[str, str] = path.resolve(a, req.project_root, req.out);
-        if (R.is_err[str, str](op_r)) { ret R.err[str, outcome.Fail](outcome.internal("out of memory")); }
-        ret R.ok[str, outcome.Fail](R.unwrap_ok[str, str](op_r));
+        val op_r: res[str, A.Error] = path.resolve(a, req.project_root, req.out);
+        if (sel op_r.err) { ret res[str, outcome.Fail].err{outcome.refused(op_r.err)}; }
+        ret res[str, outcome.Fail].ok{op_r.ok};
     }
-    val bin_opt: O.Option[str] = intern.lookup(itn, bu.bin_path);
-    if (O.is_none[str](bin_opt) || str_empty(O.unwrap[str](bin_opt))) {
-        ret R.err[str, outcome.Fail](outcome.user("selected artifact has no output path; set the `out` template in mach.toml"));
+    val bin_opt: opt[str] = intern.lookup(itn, bu.bin_path);
+    if (sel bin_opt.none) {
+        ret res[str, outcome.Fail].err{outcome.user("selected artifact has no output path; set the `out` template in mach.toml")};
     }
-    val op_r: R.Result[str, str] = path.join(a, req.project_root, O.unwrap[str](bin_opt));
-    if (R.is_err[str, str](op_r)) { ret R.err[str, outcome.Fail](outcome.internal("out of memory")); }
-    ret R.ok[str, outcome.Fail](R.unwrap_ok[str, str](op_r));
+    if (str_empty(bin_opt.some)) {
+        ret res[str, outcome.Fail].err{outcome.user("selected artifact has no output path; set the `out` template in mach.toml")};
+    }
+    val op_r: res[str, A.Error] = path.join(a, req.project_root, bin_opt.some);
+    if (sel op_r.err) { ret res[str, outcome.Fail].err{outcome.refused(op_r.err)}; }
+    ret res[str, outcome.Fail].ok{op_r.ok};
 }
 
-fun test_exe_fail() R.Result[str, outcome.Fail] {
-    ret R.err[str, outcome.Fail](outcome.internal("failed to resolve the test executable path; check the `tests` template in mach.toml"));
+fun test_exe_fail() res[str, outcome.Fail] {
+    ret res[str, outcome.Fail].err{outcome.internal("failed to resolve the test executable path; check the `tests` template in mach.toml")};
 }
 
 fun derive_phases(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
-                  req: *request.BuildRequest, bu: *manifest.BuildUnit,
-                  tgt: *target.Target, u: *BuildUnit) R.Result[R.Void, outcome.Fail] {
+    req: *request.BuildRequest, bu: *manifest.BuildUnit,
+    tgt: *target.Target, u: *BuildUnit) err[outcome.Fail] {
     u.phases = vector.init[PhaseKind](a);
+    u.steps  = vector.init[str](a);
+    if (req.goal == request.GOAL_CHECK) {
+        val loaded: err[outcome.Fail] = push_phase(u, PH_LOAD);
+        if (sel loaded.err) { ret loaded; }
+        ret push_phase(u, PH_SEMA);
+    }
 
-    val demanded_r: R.Result[bool, outcome.Fail] = steps_demanded(a, itn, m, req, bu);
-    if (R.is_err[bool, outcome.Fail](demanded_r)) { ret R.void_of[bool, outcome.Fail](demanded_r); }
+    val demanded_r: res[bool, outcome.Fail] = steps_demanded(a, itn, m, req, bu, ?u.steps);
+    if (sel demanded_r.err) { ret err[outcome.Fail].err{demanded_r.err}; }
     if (m.dep_count > 0) {
-        val r1: R.Result[R.Void, outcome.Fail] = push_phase(u, PH_DEP_STEPS);
-        if (R.is_err[R.Void, outcome.Fail](r1)) { ret r1; }
+        val r1: err[outcome.Fail] = push_phase(u, PH_DEP_STEPS);
+        if (sel r1.err) { ret r1; }
     }
-    if (R.unwrap_ok[bool, outcome.Fail](demanded_r)) {
-        val r2: R.Result[R.Void, outcome.Fail] = push_phase(u, PH_STEPS);
-        if (R.is_err[R.Void, outcome.Fail](r2)) { ret r2; }
+    if (demanded_r.ok) {
+        val r2: err[outcome.Fail] = push_phase(u, PH_STEPS);
+        if (sel r2.err) { ret r2; }
     }
 
-    val r3: R.Result[R.Void, outcome.Fail] = push_phase(u, PH_LOAD);
-    if (R.is_err[R.Void, outcome.Fail](r3)) { ret r3; }
-    val r4: R.Result[R.Void, outcome.Fail] = push_phase(u, PH_SEMA);
-    if (R.is_err[R.Void, outcome.Fail](r4)) { ret r4; }
-    val r5: R.Result[R.Void, outcome.Fail] = push_phase(u, PH_LOWER);
-    if (R.is_err[R.Void, outcome.Fail](r5)) { ret r5; }
-    val r6: R.Result[R.Void, outcome.Fail] = push_phase(u, PH_CODEGEN);
-    if (R.is_err[R.Void, outcome.Fail](r6)) { ret r6; }
+    val r3: err[outcome.Fail] = push_phase(u, PH_LOAD);
+    if (sel r3.err) { ret r3; }
+    val r4: err[outcome.Fail] = push_phase(u, PH_SEMA);
+    if (sel r4.err) { ret r4; }
+    val r5: err[outcome.Fail] = push_phase(u, PH_LOWER);
+    if (sel r5.err)                         { ret r5; }
+    if (req.goal == request.GOAL_TEST_LIST) { ret err[outcome.Fail].ok{}; }
+    val r6: err[outcome.Fail] = push_phase(u, PH_CODEGEN);
+    if (sel r6.err) { ret r6; }
 
-    val flat: bool = tgt.of != nil && tgt.of.produces_image;
+    val flat:    bool = tgt.of != nil && tgt.of.produces_image;
     var objects: bool = false;
     if (req.goal == request.GOAL_EXECUTE && !flat) { objects = true; }
     if (req.goal == request.GOAL_OBJECTS)          { objects = true; }
     if (req.goal == request.GOAL_TESTS)            { objects = true; }
     if (objects || req.emit_ir || req.emit_asm) {
-        val r7: R.Result[R.Void, outcome.Fail] = push_phase(u, PH_EMIT);
-        if (R.is_err[R.Void, outcome.Fail](r7)) { ret r7; }
+        val r7: err[outcome.Fail] = push_phase(u, PH_EMIT);
+        if (sel r7.err) { ret r7; }
     }
     if ((req.goal == request.GOAL_EXECUTE && !finished_modules(tgt)) || req.goal == request.GOAL_TESTS) {
-        val r8: R.Result[R.Void, outcome.Fail] = push_phase(u, PH_LINK);
-        if (R.is_err[R.Void, outcome.Fail](r8)) { ret r8; }
+        val r8: err[outcome.Fail] = push_phase(u, PH_LINK);
+        if (sel r8.err) { ret r8; }
     }
-    ret R.ok_void[outcome.Fail]();
+    ret err[outcome.Fail].ok{};
 }
 
-fun push_phase(u: *BuildUnit, k: PhaseKind) R.Result[R.Void, outcome.Fail] {
-    val pr: R.Result[usize, str] = vector.push[PhaseKind](?u.phases, k);
-    if (R.is_err[usize, str](pr)) { ret R.err[R.Void, outcome.Fail](outcome.internal("out of memory")); }
-    ret R.ok_void[outcome.Fail]();
+fun push_phase(u: *BuildUnit, k: PhaseKind) err[outcome.Fail] {
+    val pr: res[usize, A.Error] = vector.push[PhaseKind](?u.phases, k);
+    if (sel pr.err) { ret err[outcome.Fail].err{outcome.refused(pr.err)}; }
+    ret err[outcome.Fail].ok{};
 }
 
+# the root manifest's prerequisite steps this cell demands, appended to `steps`
+# in execution order. the same `manifest.plan_steps` the driver runs, so the
+# displayed order is the executed order
 fun steps_demanded(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
-                   req: *request.BuildRequest, bu: *manifest.BuildUnit) R.Result[bool, outcome.Fail] {
-    if (m.step_count == 0) { ret R.ok[bool, outcome.Fail](false); }
+    req: *request.BuildRequest, bu: *manifest.BuildUnit,
+    steps: *Vector[str]) res[bool, outcome.Fail] {
+    if (m.step_count == 0) { ret res[bool, outcome.Fail].ok{false}; }
 
-    val pn_opt: O.Option[str] = intern.lookup(itn, bu.profile_name);
-    if (O.is_none[str](pn_opt)) { ret R.ok[bool, outcome.Fail](false); }
-    var v: manifest.TmplVars = manifest.tmpl_vars_of(itn, bu.target, O.unwrap[str](pn_opt));
+    val pn_opt: opt[str] = intern.lookup(itn, bu.profile_name);
+    if (sel pn_opt.none) { ret res[bool, outcome.Fail].ok{false}; }
+    var v: manifest.TmplVars = manifest.tmpl_vars_of(itn, bu.target, pn_opt.some);
 
-    val ot_opt: O.Option[str] = intern.lookup(itn, m.out_tmpl);
-    if (O.is_none[str](ot_opt)) { ret R.ok[bool, outcome.Fail](false); }
-    val po_r: R.Result[str, str] = manifest.expand_project_path(a, O.unwrap[str](ot_opt), "", ?v, "[project].out");
-    if (R.is_err[str, str](po_r)) { ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[str, str](po_r))); }
-    val proj_out: str = R.unwrap_ok[str, str](po_r);
+    val ot_opt: opt[str] = intern.lookup(itn, m.out_tmpl);
+    if (sel ot_opt.none) { ret res[bool, outcome.Fail].ok{false}; }
+    val po_r: res[str, outcome.Fail] = manifest.expand_project_path(a, ot_opt.some, "", ?v, "[project].out");
+    if (sel po_r.err) { ret res[bool, outcome.Fail].err{po_r.err}; }
+    val proj_out: str = po_r.ok;
 
     var names:  *intern.StrId = nil;
     var ncount: u32           = 0;
     var owned:  bool          = false;
     if (request.test_goal(req.goal) && m.artifact_count > 0) {
-        val ar: R.Result[*intern.StrId, str] = A.allocate[intern.StrId](a, m.artifact_count::usize);
-        if (R.is_err[*intern.StrId, str](ar)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
-        names = R.unwrap_ok[*intern.StrId, str](ar);
+        val ar: res[*intern.StrId, A.Error] = A.allocate[intern.StrId](a, m.artifact_count::usize);
+        if (sel ar.err) { ret res[bool, outcome.Fail].err{outcome.refused(ar.err)}; }
+        names = ar.ok;
         owned = true;
         var i: u32 = 0;
-        for (i < m.artifact_count) { names[i] = m.artifacts[i].name; i = i + 1; }
+        for (i < m.artifact_count) {
+            names[i] = m.artifacts[i].name;
+            i        = i + 1;
+        }
         ncount = m.artifact_count;
     }
     or {
-        if (bu.artifact == nil) { ret R.ok[bool, outcome.Fail](false); }
+        if (bu.artifact == nil) { ret res[bool, outcome.Fail].ok{false}; }
         names  = ?bu.artifact.name;
         ncount = 1;
     }
 
-    var order: *u32 = nil;
-    var count: u32  = 0;
-    val r: R.Result[R.Void, str] = manifest.plan_steps(a, itn, m, names, ncount, bu.target, proj_out, ?v, ?order, ?count);
+    var order: *u32              = nil;
+    var count: u32               = 0;
+    val r:     err[outcome.Fail] = manifest.plan_steps(a, itn, m, names, ncount, bu.target, proj_out, ?v, ?order, ?count);
     if (owned) { A.deallocate[intern.StrId](a, names, m.artifact_count::usize); }
     str_free(a, proj_out);
-    if (R.is_err[R.Void, str](r)) {
-        ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[R.Void, str](r)));
+    if (sel r.err) {
+        ret res[bool, outcome.Fail].err{r.err};
     }
-    if (order != nil && count > 0) { A.deallocate[u32](a, order, count::usize); }
-    ret R.ok[bool, outcome.Fail](count > 0);
+    fin {
+        if (order != nil && count > 0) { A.deallocate[u32](a, order, count::usize); }
+    }
+    var i: u32 = 0;
+    for (i < count) {
+        val named: opt[str] = intern.lookup(itn, m.steps[order[i]].name);
+        if (sel named.none) { ret res[bool, outcome.Fail].err{outcome.internal("planned step name is not interned")}; }
+        val pushed: res[usize, A.Error] = vector.push[str](steps, named.some);
+        if (sel pushed.err) { ret res[bool, outcome.Fail].err{outcome.refused(pushed.err)}; }
+        i = i + 1;
+    }
+    ret res[bool, outcome.Fail].ok{count > 0};
 }
 
 pub fun resolve_token(a: *A.Allocator, tgt: *target.Target, dirs: *Vector[str],
-                      root: str, tok: *u8) R.Result[LinkInput, outcome.Fail] {
+    root: str, tok: *u8) res[LinkInput, outcome.Fail] {
     if (is_dll_path(tok)) {
         if (!str_equals(tgt.of.shared_input_ext, ".dll")) {
-            ret R.err[LinkInput, outcome.Fail](outcome.user(join_msg(a, "'", tok::str, "' is a Windows DLL; .dll inputs require a PE/COFF target")));
+            ret res[LinkInput, outcome.Fail].err{outcome.user(join_msg(a, "'", tok::str, "' is a Windows DLL; .dll inputs require a PE/COFF target"))};
         }
-        var actual: *u8 = tok;
-        var rooted: str = "";
-        var exists: bool = fs.is_file(tok);
+        var actual:    *u8                       = tok;
+        var rooted:    str                       = "";
+        val is_file_r: res[bool, io_error.Error] = fs.is_file(tok);
+        var exists:    bool                      = (sel is_file_r.ok && is_file_r.ok);
         if (!exists && tok[0] != '/') {
-            val cand_r: R.Result[str, str] = path.join(a, root, tok::str);
-            if (R.is_ok[str, str](cand_r)) {
-                rooted = R.unwrap_ok[str, str](cand_r);
-                if (fs.is_file(rooted)) {
+            val cand_r: res[str, A.Error] = path.join(a, root, tok::str);
+            if (sel cand_r.ok) {
+                rooted = cand_r.ok;
+                val is_file_r2: res[bool, io_error.Error] = fs.is_file(rooted);
+                if ((sel is_file_r2.ok && is_file_r2.ok)) {
                     actual = rooted::*u8;
                     exists = true;
                 }
             }
         }
         if (exists) {
-            val res_read: R.Result[Vector[u8], str] = fs.read_bytes(a, actual);
-            if (R.is_err[Vector[u8], str](res_read)) {
-                ret R.err[LinkInput, outcome.Fail](outcome.user(join_msg(a, "cannot read link input '", actual::str, "'")));
+            val res_read: res[Vector[u8], fs.FsError] = fs.read_bytes(a, actual);
+            if (sel res_read.err) {
+                ret res[LinkInput, outcome.Fail].err{outcome.user(join_msg(a, "cannot read link input '", actual::str, "'"))};
             }
-            var b: Vector[u8] = R.unwrap_ok[Vector[u8], str](res_read);
-            val good: bool = coff.looks_like_dll(b.data, b.len, coff.machine_for_arch(tgt.arch_id));
+            var b:    Vector[u8] = res_read.ok;
+            val good: bool       = coff.looks_like_dll(b.data, b.len, coff.machine_for_arch(tgt.arch_id));
             vector.dnit[u8](?b);
             if (!good) {
-                ret R.err[LinkInput, outcome.Fail](outcome.user(join_msg(a, "'", actual::str,
-                    "' is not a loadable PE DLL for the selected architecture")));
+                ret res[LinkInput, outcome.Fail].err{outcome.user(join_msg(a, "'", actual::str,
+                    "' is not a loadable PE DLL for the selected architecture"))};
             }
         }
         ret dyn_copy(a, dll_basename(tok));
@@ -746,16 +915,18 @@ pub fun resolve_token(a: *A.Allocator, tgt: *target.Target, dirs: *Vector[str],
 
     if (is_dylib_path(tok)) {
         if (!str_equals(tgt.of.shared_input_ext, ".dylib")) {
-            ret R.err[LinkInput, outcome.Fail](outcome.user(join_msg(a, "'", tok::str, "' is a Mach-O dylib; .dylib inputs require a Mach-O target")));
+            ret res[LinkInput, outcome.Fail].err{outcome.user(join_msg(a, "'", tok::str, "' is a Mach-O dylib; .dylib inputs require a Mach-O target"))};
         }
-        var actual: *u8 = tok;
-        var rooted: str = "";
-        var exists: bool = fs.is_file(tok);
+        var actual:     *u8                       = tok;
+        var rooted:     str                       = "";
+        val is_file_r3: res[bool, io_error.Error] = fs.is_file(tok);
+        var exists:     bool                      = (sel is_file_r3.ok && is_file_r3.ok);
         if (!exists && tok[0] != '/') {
-            val cand_r: R.Result[str, str] = path.join(a, root, tok::str);
-            if (R.is_ok[str, str](cand_r)) {
-                rooted = R.unwrap_ok[str, str](cand_r);
-                if (fs.is_file(rooted)) {
+            val cand_r: res[str, A.Error] = path.join(a, root, tok::str);
+            if (sel cand_r.ok) {
+                rooted = cand_r.ok;
+                val is_file_r4: res[bool, io_error.Error] = fs.is_file(rooted);
+                if ((sel is_file_r4.ok && is_file_r4.ok)) {
                     actual = rooted::*u8;
                     exists = true;
                 }
@@ -766,30 +937,31 @@ pub fun resolve_token(a: *A.Allocator, tgt: *target.Target, dirs: *Vector[str],
             if (read_dylib_install_name(a, actual, tgt.arch_id, ?install_name[0], 4096)) {
                 ret dylib_copy(a, actual, ?install_name[0]);
             }
-            ret R.err[LinkInput, outcome.Fail](outcome.user(join_msg(a, "'", actual::str,
-                "' is not a loadable Mach-O dylib for the selected architecture")));
+            ret res[LinkInput, outcome.Fail].err{outcome.user(join_msg(a, "'", actual::str,
+                "' is not a loadable Mach-O dylib for the selected architecture"))};
         }
         if (str_starts_with(tok::str, "@rpath/")) {
-            ret R.err[LinkInput, outcome.Fail](outcome.user(
-                "an @rpath dylib input must resolve to an existing file so its runtime search path can be retained"));
+            ret res[LinkInput, outcome.Fail].err{outcome.user(
+                "an @rpath dylib input must resolve to an existing file so its runtime search path can be retained")};
         }
         ret dyn_copy(a, tok);
     }
 
     if (is_shared_path(tok) && !str_equals(tgt.of.shared_input_ext, ".so")) {
-        ret R.err[LinkInput, outcome.Fail](outcome.user(join_msg(a, "'", tok::str,
-            "' is an ELF shared object; .so inputs require an ELF target")));
+        ret res[LinkInput, outcome.Fail].err{outcome.user(join_msg(a, "'", tok::str,
+            "' is an ELF shared object; .so inputs require an ELF target"))};
     }
 
-    var buf: [4096]u8;
+    var buf:   [4096]u8;
     var found: bool = resolve_input_into(tok, dirs, ?buf[0], 4096,
         str_equals(tgt.of.shared_input_ext, ".dll"));
 
     if (!found && (request.is_object_path(tok) || is_shared_path(tok)) && tok[0] != '/') {
-        val cand_r: R.Result[str, str] = path.join(a, root, tok::str);
-        if (R.is_ok[str, str](cand_r)) {
-            val cand: str = R.unwrap_ok[str, str](cand_r);
-            if (fs.is_file(cand) && str_len(cand) + 1 <= 4096) {
+        val cand_r: res[str, A.Error] = path.join(a, root, tok::str);
+        if (sel cand_r.ok) {
+            val cand:       str                       = cand_r.ok;
+            val is_file_r5: res[bool, io_error.Error] = fs.is_file(cand);
+            if ((sel is_file_r5.ok && is_file_r5.ok) && str_len(cand) + 1 <= 4096) {
                 memory.raw_copy((?buf[0])::ptr, cand::ptr, str_len(cand) + 1);
                 found = true;
             }
@@ -801,8 +973,8 @@ pub fun resolve_token(a: *A.Allocator, tgt: *target.Target, dirs: *Vector[str],
         if (read_so_soname(a, ?buf[0], tgt.arch_id, ?sname[0], 4096)) {
             ret dyn_copy(a, ?sname[0]);
         }
-        ret R.err[LinkInput, outcome.Fail](outcome.user(join_msg(a, "'", (?buf[0])::str,
-            "' is not a loadable ELF shared object for the selected architecture")));
+        ret res[LinkInput, outcome.Fail].err{outcome.user(join_msg(a, "'", (?buf[0])::str,
+            "' is not a loadable ELF shared object for the selected architecture"))};
     }
 
     if (!found && !request.is_object_path(tok) && !is_shared_path(tok)) {
@@ -810,74 +982,72 @@ pub fun resolve_token(a: *A.Allocator, tgt: *target.Target, dirs: *Vector[str],
         var rpath: [4096]u8;
         rpath[0] = 0;
         if (resolve_shared_into(a, tgt, dirs, tok, ?sname[0], 4096,
-                                ?rpath[0], 4096)) {
+            ?rpath[0], 4096)) {
             ret dyn_copy_with_rpath(a, ?sname[0], ?rpath[0]);
         }
     }
 
     if (!found) {
-        ret R.err[LinkInput, outcome.Fail](outcome.user(join_msg(a, "cannot find link input '", tok::str, "'")));
+        ret res[LinkInput, outcome.Fail].err{outcome.user(join_msg(a, "cannot find link input '", tok::str, "'"))};
     }
 
-    val res_static: R.Result[Vector[u8], str] = fs.read_bytes(a, ?buf[0]);
-    if (R.is_err[Vector[u8], str](res_static)) {
-        ret R.err[LinkInput, outcome.Fail](outcome.user(join_msg(a, "cannot read link input '", (?buf[0])::str, "'")));
+    val res_static: res[Vector[u8], fs.FsError] = fs.read_bytes(a, ?buf[0]);
+    if (sel res_static.err) {
+        ret res[LinkInput, outcome.Fail].err{outcome.user(join_msg(a, "cannot read link input '", (?buf[0])::str, "'"))};
     }
-    var sb: Vector[u8] = R.unwrap_ok[Vector[u8], str](res_static);
-    val sb_ok: bool = ar.is_archive(sb.data, sb.len) || object_matches_target(sb.data, sb.len, tgt);
+    var sb:    Vector[u8] = res_static.ok;
+    val sb_ok: bool       = ar.is_archive(sb.data, sb.len) || object_matches_target(sb.data, sb.len, tgt);
     vector.dnit[u8](?sb);
     if (!sb_ok) {
-        ret R.err[LinkInput, outcome.Fail](outcome.user(join_msg(a, "'", (?buf[0])::str,
-            "' is not a valid object or archive for the selected target")));
+        ret res[LinkInput, outcome.Fail].err{outcome.user(join_msg(a, "'", (?buf[0])::str,
+            "' is not a valid object or archive for the selected target"))};
     }
 
-    val dup_r: R.Result[str, str] = str_copy(a, ?buf[0]);
-    if (R.is_err[str, str](dup_r)) { ret R.err[LinkInput, outcome.Fail](outcome.internal("out of memory")); }
+    val dup_r: res[str, string.StrError] = str_copy(a, ?buf[0]);
+    if (sel dup_r.err) { ret res[LinkInput, outcome.Fail].err{outcome.internal("out of memory")}; }
     var li: LinkInput;
-    li.kind = LINK_STATIC;
-    li.text = R.unwrap_ok[str, str](dup_r);
+    li.kind    = LINK_STATIC;
+    li.text    = dup_r.ok;
     li.library = "";
-    li.rpath = "";
-    ret R.ok[LinkInput, outcome.Fail](li);
+    li.rpath   = "";
+    ret res[LinkInput, outcome.Fail].ok{li};
 }
 
 pub fun resolve_requirement(a: *A.Allocator, itn: *intern.Interner, tgt: *target.Target,
-                            dirs: *Vector[str], root: str,
-                            req: *manifest.LinkRequirement) R.Result[LinkInput, outcome.Fail] {
-    val text_opt: O.Option[str] = intern.lookup(itn, req.text);
-    if (O.is_none[str](text_opt)) {
-        ret R.err[LinkInput, outcome.Fail](outcome.internal("link requirement text not interned"));
+    dirs: *Vector[str], root: str,
+    req: *manifest.LinkRequirement) res[LinkInput, outcome.Fail] {
+    val text_opt: opt[str] = intern.lookup(itn, req.text);
+    if (sel text_opt.none) {
+        ret res[LinkInput, outcome.Fail].err{outcome.internal("link requirement text not interned")};
     }
-    val text: str = O.unwrap[str](text_opt);
-    val library_opt: O.Option[str] = intern.lookup(itn, req.library);
-    if (O.is_none[str](library_opt)) {
-        ret R.err[LinkInput, outcome.Fail](outcome.internal("link requirement library not interned"));
+    val text:        str      = text_opt.some;
+    val library_opt: opt[str] = intern.lookup(itn, req.library);
+    if (sel library_opt.none) {
+        ret res[LinkInput, outcome.Fail].err{outcome.internal("link requirement library not interned")};
     }
-    val library: str = O.unwrap[str](library_opt);
+    val library: str = library_opt.some;
     if (req.source == manifest.LINK_FRAMEWORK) {
-        val fr: R.Result[LinkInput, outcome.Fail] =
-            resolve_framework(a, tgt, text::*u8);
-        if (R.is_err[LinkInput, outcome.Fail](fr)) { ret fr; }
-        var fi: LinkInput = R.unwrap_ok[LinkInput, outcome.Fail](fr);
-        fi.library = library;
+        val fr: res[LinkInput, outcome.Fail] = resolve_framework(a, tgt, text::*u8);
+        if (sel fr.err) { ret fr; }
+        var fi: LinkInput = fr.ok;
+        fi.library            = library;
         fi.include_referenced = req.include_referenced;
-        ret R.ok[LinkInput, outcome.Fail](fi);
+        ret res[LinkInput, outcome.Fail].ok{fi};
     }
-    var r: R.Result[LinkInput, outcome.Fail] =
-        resolve_token(a, tgt, dirs, root, text::*u8);
-    if (R.is_err[LinkInput, outcome.Fail](r)) { ret r; }
-    var li: LinkInput = R.unwrap_ok[LinkInput, outcome.Fail](r);
-    li.library = library;
+    var r: res[LinkInput, outcome.Fail] = resolve_token(a, tgt, dirs, root, text::*u8);
+    if (sel r.err) { ret r; }
+    var li: LinkInput = r.ok;
+    li.library            = library;
     li.include_referenced = req.include_referenced;
-    ret R.ok[LinkInput, outcome.Fail](li);
+    ret res[LinkInput, outcome.Fail].ok{li};
 }
 
 fun resolve_framework(a: *A.Allocator, tgt: *target.Target,
-                      name: *u8) R.Result[LinkInput, outcome.Fail] {
+    name: *u8) res[LinkInput, outcome.Fail] {
     if (tgt.os == nil || !str_equals(tgt.os.name, "darwin")
         || !str_equals(tgt.of.shared_input_ext, ".dylib")) {
-        ret R.err[LinkInput, outcome.Fail](outcome.user(
-            join_msg(a, "framework link input '", name::str, "' requires a Darwin Mach-O target")));
+        ret res[LinkInput, outcome.Fail].err{outcome.user(
+            join_msg(a, "framework link input '", name::str, "' requires a Darwin Mach-O target"))};
     }
     val install_name: str = join_msg(a, "/System/Library/Frameworks/", name::str,
         ".framework/", name::str);
@@ -886,41 +1056,41 @@ fun resolve_framework(a: *A.Allocator, tgt: *target.Target,
     li.text    = install_name;
     li.library = "";
     li.rpath   = "";
-    ret R.ok[LinkInput, outcome.Fail](li);
+    ret res[LinkInput, outcome.Fail].ok{li};
 }
 
-fun dyn_copy(a: *A.Allocator, name: *u8) R.Result[LinkInput, outcome.Fail] {
+fun dyn_copy(a: *A.Allocator, name: *u8) res[LinkInput, outcome.Fail] {
     ret dyn_copy_with_rpath(a, name, ""::*u8);
 }
 
 fun dyn_copy_with_rpath(a: *A.Allocator, name: *u8,
-                        rpath: *u8) R.Result[LinkInput, outcome.Fail] {
-    val dup_r: R.Result[str, str] = str_copy(a, name);
-    if (R.is_err[str, str](dup_r)) { ret R.err[LinkInput, outcome.Fail](outcome.internal("out of memory")); }
+    rpath: *u8) res[LinkInput, outcome.Fail] {
+    val dup_r: res[str, string.StrError] = str_copy(a, name);
+    if (sel dup_r.err) { ret res[LinkInput, outcome.Fail].err{outcome.internal("out of memory")}; }
     var run_path: str = "";
     if (rpath != nil && !str_empty(rpath::str)) {
-        val rp_r: R.Result[str, str] = str_copy(a, rpath);
-        if (R.is_err[str, str](rp_r)) { ret R.err[LinkInput, outcome.Fail](outcome.internal("out of memory")); }
-        run_path = R.unwrap_ok[str, str](rp_r);
+        val rp_r: res[str, string.StrError] = str_copy(a, rpath);
+        if (sel rp_r.err) { ret res[LinkInput, outcome.Fail].err{outcome.internal("out of memory")}; }
+        run_path = rp_r.ok;
     }
     var li: LinkInput;
     li.kind    = LINK_DYNAMIC;
-    li.text    = R.unwrap_ok[str, str](dup_r);
+    li.text    = dup_r.ok;
     li.library = "";
     li.rpath   = run_path;
-    ret R.ok[LinkInput, outcome.Fail](li);
+    ret res[LinkInput, outcome.Fail].ok{li};
 }
 
 fun dylib_copy(a: *A.Allocator, actual: *u8,
-               install_name: *u8) R.Result[LinkInput, outcome.Fail] {
+    install_name: *u8) res[LinkInput, outcome.Fail] {
     if (!str_starts_with(install_name::str, "@rpath/")) {
         ret dyn_copy(a, install_name);
     }
-    val rp_r: R.Result[str, str] = dylib_rpath(a, actual, install_name);
-    if (R.is_err[str, str](rp_r)) {
-        ret R.err[LinkInput, outcome.Fail](outcome.user(R.unwrap_err[str, str](rp_r)));
+    val rp_r: res[str, outcome.Fail] = dylib_rpath(a, actual, install_name);
+    if (sel rp_r.err) {
+        ret res[LinkInput, outcome.Fail].err{rp_r.err};
     }
-    ret dyn_copy_with_rpath(a, install_name, R.unwrap_ok[str, str](rp_r)::*u8);
+    ret dyn_copy_with_rpath(a, install_name, rp_r.ok::*u8);
 }
 
 fun object_matches_target(buf: *u8, len: usize, tgt: *target.Target) bool {
@@ -947,22 +1117,26 @@ fun object_matches_target(buf: *u8, len: usize, tgt: *target.Target) bool {
 }
 
 pub fun join_msg(al: *A.Allocator, va: ...) str {
-    val r: R.Result[str, str] = str_join(al, va...);
-    if (R.is_err[str, str](r)) { ret "<message unavailable: allocation failed>"; }
-    ret R.unwrap_ok[str, str](r);
+    val r: res[str, string.StrError] = str_join(al, va...);
+    if (sel r.err) { ret "<message unavailable: allocation failed>"; }
+    ret r.ok;
 }
 
 fun resolve_input_into(tok: *u8, dirs: *Vector[str], buf: *u8, cap: usize,
-                       coff_names: bool) bool {
+    coff_names: bool) bool {
     if (tok == nil || str_empty(tok::str)) { ret false; }
 
     if (request.is_object_path(tok)) {
         val n: usize = str_len(tok::str);
         if (n + 1 > cap) { ret false; }
         var i: usize = 0;
-        for (i < n) { buf[i] = tok[i]; i = i + 1; }
+        for (i < n) {
+            buf[i] = tok[i];
+            i      = i + 1;
+        }
         buf[n] = 0;
-        ret fs.is_file(buf);
+        val is_file_r: res[bool, io_error.Error] = fs.is_file(buf);
+        ret (sel is_file_r.ok && is_file_r.ok);
     }
 
     var i: usize = 0;
@@ -975,23 +1149,28 @@ fun resolve_input_into(tok: *u8, dirs: *Vector[str], buf: *u8, cap: usize,
 }
 
 fun try_named_object(dir: *u8, name: *u8, buf: *u8, cap: usize,
-                     coff_names: bool) bool {
-    if (write_named_candidate(dir, "lib", name, "o", buf, cap) && fs.is_file(buf)) { ret true; }
-    if (write_named_candidate(dir, "", name, "o", buf, cap) && fs.is_file(buf))    { ret true; }
-    if (coff_names && write_named_candidate(dir, "lib", name, "obj", buf, cap) && fs.is_file(buf)) { ret true; }
-    if (coff_names && write_named_candidate(dir, "", name, "obj", buf, cap) && fs.is_file(buf))    { ret true; }
-    if (write_named_candidate(dir, "lib", name, "a", buf, cap) && fs.is_file(buf)) { ret true; }
-    if (write_named_candidate(dir, "", name, "a", buf, cap) && fs.is_file(buf))    { ret true; }
-    if (coff_names && write_named_candidate(dir, "lib", name, "lib", buf, cap) && fs.is_file(buf)) { ret true; }
-    if (coff_names && write_named_candidate(dir, "", name, "lib", buf, cap) && fs.is_file(buf))    { ret true; }
+    coff_names: bool) bool {
+    if (write_named_candidate(dir, "lib", name, "o", buf, cap) && file_present(buf))                 { ret true; }
+    if (write_named_candidate(dir, "", name, "o", buf, cap) && file_present(buf))                    { ret true; }
+    if (coff_names && write_named_candidate(dir, "lib", name, "obj", buf, cap) && file_present(buf)) { ret true; }
+    if (coff_names && write_named_candidate(dir, "", name, "obj", buf, cap) && file_present(buf))    { ret true; }
+    if (write_named_candidate(dir, "lib", name, "a", buf, cap) && file_present(buf))                 { ret true; }
+    if (write_named_candidate(dir, "", name, "a", buf, cap) && file_present(buf))                    { ret true; }
+    if (coff_names && write_named_candidate(dir, "lib", name, "lib", buf, cap) && file_present(buf)) { ret true; }
+    if (coff_names && write_named_candidate(dir, "", name, "lib", buf, cap) && file_present(buf))    { ret true; }
     ret false;
 }
 
+fun file_present(p: *u8) bool {
+    val r: res[bool, io_error.Error] = fs.is_file(p);
+    ret sel r.ok && r.ok;
+}
+
 fun write_named_candidate(dir: *u8, prefix: *u8, name: *u8, ext: *u8, buf: *u8, cap: usize) bool {
-    val dl: usize = str_len(dir);
-    val pl: usize = str_len(prefix::str);
-    val nl: usize = str_len(name::str);
-    val el: usize = str_len(ext::str);
+    val dl:   usize = str_len(dir);
+    val pl:   usize = str_len(prefix::str);
+    val nl:   usize = str_len(name::str);
+    val el:   usize = str_len(ext::str);
     var need: usize = dl;
     if (dl > 0) { need = need + 1; }
     need = need + pl + nl + 1 + el + 1;
@@ -1000,26 +1179,46 @@ fun write_named_candidate(dir: *u8, prefix: *u8, name: *u8, ext: *u8, buf: *u8, 
     var k: usize = 0;
     var i: usize = 0;
     if (dir != nil) {
-        for (i < dl) { buf[k] = dir[i]; k = k + 1; i = i + 1; }
-        if (k > 0 && buf[k - 1] != '/') { buf[k] = '/'; k = k + 1; }
+        for (i < dl) {
+            buf[k] = dir[i];
+            k      = k + 1;
+            i      = i + 1;
+        }
+        if (k > 0 && buf[k - 1] != '/') {
+            buf[k] = '/';
+            k      = k + 1;
+        }
     }
     i = 0;
-    for (i < pl) { buf[k] = prefix[i]; k = k + 1; i = i + 1; }
+    for (i < pl) {
+        buf[k] = prefix[i];
+        k      = k + 1;
+        i      = i + 1;
+    }
     i = 0;
-    for (i < nl) { buf[k] = name[i]; k = k + 1; i = i + 1; }
-    buf[k] = '.'; k = k + 1;
-    i = 0;
-    for (i < el) { buf[k] = ext[i]; k = k + 1; i = i + 1; }
+    for (i < nl) {
+        buf[k] = name[i];
+        k      = k + 1;
+        i      = i + 1;
+    }
+    buf[k] = '.';
+    k      = k + 1;
+    i      = 0;
+    for (i < el) {
+        buf[k] = ext[i];
+        k      = k + 1;
+        i      = i + 1;
+    }
     buf[k] = 0;
     ret true;
 }
 
 fun read_so_soname(a: *A.Allocator, so_path: *u8, arch_id: u32, out: *u8, cap: usize) bool {
-    val res_read: R.Result[Vector[u8], str] = fs.read_bytes(a, so_path);
-    if (R.is_err[Vector[u8], str](res_read)) { ret false; }
-    var b: Vector[u8] = R.unwrap_ok[Vector[u8], str](res_read);
-    var ok: bool = false;
-    val want_machine: u16 = elf.machine_for_arch(arch_id);
+    val res_read: res[Vector[u8], fs.FsError] = fs.read_bytes(a, so_path);
+    if (sel res_read.err) { ret false; }
+    var b:            Vector[u8] = res_read.ok;
+    var ok:           bool       = false;
+    val want_machine: u16        = elf.machine_for_arch(arch_id);
     if (want_machine != 0 && b.len >= 64 && b.data[0] == 0x7F && b.data[1] == 0x45 && b.data[2] == 0x4C
         && b.data[3] == 0x46 && b.data[4] == 2 && b.data[5] == 1 && b.data[6] == 1
         && bin.read_u16_le(b.data, 16) == 3
@@ -1044,7 +1243,7 @@ fun extract_soname(buf: *u8, len: usize, out: *u8, cap: usize) bool {
     var dyn_off:    usize = 0;
     var dyn_size:   usize = 0;
     var dynstr_off: usize = 0;
-    var sh: usize = 0;
+    var sh:         usize = 0;
     for (sh < e_shnum) {
         val so: usize = e_shoff + sh * e_shentsize;
         if (so + 64 > len) { ret false; }
@@ -1069,10 +1268,10 @@ fun extract_soname(buf: *u8, len: usize, out: *u8, cap: usize) bool {
         if (tag == 0) { ret false; }
         if (tag == 14) {
             val str_at: usize = dynstr_off + bin.read_u64_le(buf, eo + 8)::usize;
-            var k: usize = 0;
+            var k:      usize = 0;
             for (str_at + k < len && buf[str_at + k] != 0 && k + 1 < cap) {
                 out[k] = buf[str_at + k];
-                k = k + 1;
+                k      = k + 1;
             }
             out[k] = 0;
             ret k > 0;
@@ -1083,13 +1282,16 @@ fun extract_soname(buf: *u8, len: usize, out: *u8, cap: usize) bool {
 }
 
 fun read_dylib_install_name(a: *A.Allocator, dylib_path: *u8, arch_id: u32,
-                            out: *u8, cap: usize) bool {
-    val res_read: R.Result[Vector[u8], str] = fs.read_bytes(a, dylib_path);
-    if (R.is_err[Vector[u8], str](res_read)) { ret false; }
-    var b: Vector[u8] = R.unwrap_ok[Vector[u8], str](res_read);
-    var ok: bool = false;
-    val cpu_type: u32 = macho.machine_for_arch(arch_id);
-    if (cpu_type == 0) { vector.dnit[u8](?b); ret false; }
+    out: *u8, cap: usize) bool {
+    val res_read: res[Vector[u8], fs.FsError] = fs.read_bytes(a, dylib_path);
+    if (sel res_read.err) { ret false; }
+    var b:        Vector[u8] = res_read.ok;
+    var ok:       bool       = false;
+    val cpu_type: u32        = macho.machine_for_arch(arch_id);
+    if (cpu_type == 0) {
+        vector.dnit[u8](?b);
+        ret false;
+    }
     if (b.len >= 4 && bin.read_u32_le(b.data, 0) == 0xFEEDFACF) {
         ok = extract_dylib_id(b.data, b.len, 0, b.len, cpu_type, out, cap);
     }
@@ -1104,22 +1306,22 @@ fun read_dylib_install_name(a: *A.Allocator, dylib_path: *u8, arch_id: u32,
 }
 
 fun extract_dylib_id(buf: *u8, len: usize, base: usize, slice_len: usize,
-                     cpu_type: u32, out: *u8, cap: usize) bool {
+    cpu_type: u32, out: *u8, cap: usize) bool {
     if (base > len || slice_len > len - base || slice_len < 32) { ret false; }
     val end: usize = base + slice_len;
-    if (bin.read_u32_le(buf, base) != 0xFEEDFACF) { ret false; }
+    if (bin.read_u32_le(buf, base) != 0xFEEDFACF)   { ret false; }
     if (bin.read_u32_le(buf, base + 4) != cpu_type) { ret false; }
-    if (bin.read_u32_le(buf, base + 12) != 6)     { ret false; }
-    val ncmds: u32 = bin.read_u32_le(buf, base + 16);
+    if (bin.read_u32_le(buf, base + 12) != 6)       { ret false; }
+    val ncmds:      u32   = bin.read_u32_le(buf, base + 16);
     val sizeofcmds: usize = bin.read_u32_le(buf, base + 20)::usize;
     if (sizeofcmds > end - (base + 32)) { ret false; }
     val cmds_end: usize = base + 32 + sizeofcmds;
 
     var off: usize = base + 32;
-    var i: u32 = 0;
+    var i:   u32   = 0;
     for (i < ncmds) {
         if (off + 8 > cmds_end) { ret false; }
-        val cmd: u32 = bin.read_u32_le(buf, off);
+        val cmd:     u32   = bin.read_u32_le(buf, off);
         val cmdsize: usize = bin.read_u32_le(buf, off + 4)::usize;
         if (cmdsize < 8 || cmdsize > cmds_end - off) { ret false; }
         if (cmd == 0xD) {
@@ -1127,32 +1329,32 @@ fun extract_dylib_id(buf: *u8, len: usize, base: usize, slice_len: usize,
             val name_off: usize = bin.read_u32_le(buf, off + 8)::usize;
             if (name_off < 24 || name_off >= cmdsize) { ret false; }
             val at: usize = off + name_off;
-            var k: usize = 0;
+            var k:  usize = 0;
             for (at + k < off + cmdsize && buf[at + k] != 0 && k + 1 < cap) {
                 out[k] = buf[at + k];
-                k = k + 1;
+                k      = k + 1;
             }
             if (at + k >= off + cmdsize || buf[at + k] != 0 || k == 0) { ret false; }
             out[k] = 0;
             ret true;
         }
         off = off + cmdsize;
-        i = i + 1;
+        i   = i + 1;
     }
     ret false;
 }
 
 fun extract_fat_dylib_id(buf: *u8, len: usize, wide: bool,
-                         cpu_type: u32, out: *u8, cap: usize) bool {
-    val nfat: usize = bin.read_u32_be(buf, 4)::usize;
+    cpu_type: u32, out: *u8, cap: usize) bool {
+    val nfat:     usize = bin.read_u32_be(buf, 4)::usize;
     var ent_size: usize = 20;
-    if (wide) { ent_size = 32; }
+    if (wide)                        { ent_size = 32; }
     if (nfat > (len - 8) / ent_size) { ret false; }
 
     var i: usize = 0;
     for (i < nfat) {
-        val ent: usize = 8 + i * ent_size;
-        var off: usize = bin.read_u32_be(buf, ent + 8)::usize;
+        val ent:  usize = 8 + i * ent_size;
+        var off:  usize = bin.read_u32_be(buf, ent + 8)::usize;
         var size: usize = bin.read_u32_be(buf, ent + 12)::usize;
         if (wide) {
             off  = read_u64_be(buf, ent + 8)::usize;
@@ -1199,9 +1401,9 @@ fun is_dylib_path(tok: *u8) bool {
 }
 
 fun dll_basename(path: *u8) *u8 {
-    val n: usize = str_len(path::str);
+    val n:    usize = str_len(path::str);
     var last: usize = 0;
-    var i: usize = 0;
+    var i:    usize = 0;
     for (i < n) {
         if (path[i] == '/' || path[i] == '\\') { last = i + 1; }
         i = i + 1;
@@ -1210,8 +1412,8 @@ fun dll_basename(path: *u8) *u8 {
 }
 
 fun resolve_shared_into(a: *A.Allocator, tgt: *target.Target, dirs: *Vector[str],
-                        name: *u8, buf: *u8, cap: usize,
-                        rpath: *u8, rpath_cap: usize) bool {
+    name: *u8, buf: *u8, cap: usize,
+    rpath: *u8, rpath_cap: usize) bool {
     if (str_equals(tgt.of.shared_input_ext, ".dylib")) {
         ret resolve_dylib_into(a, tgt, dirs, name, buf, cap, rpath, rpath_cap);
     }
@@ -1220,7 +1422,7 @@ fun resolve_shared_into(a: *A.Allocator, tgt: *target.Target, dirs: *Vector[str]
 }
 
 fun resolve_elf_shared_into(a: *A.Allocator, tgt: *target.Target, dirs: *Vector[str],
-                            name: *u8, buf: *u8, cap: usize) bool {
+    name: *u8, buf: *u8, cap: usize) bool {
     var i: usize = 0;
     for (i < dirs.len) {
         if (try_shared_in_dir(a, dirs.data[i]::*u8, name, tgt.arch_id, buf, cap)) { ret true; }
@@ -1236,27 +1438,27 @@ fun resolve_elf_shared_into(a: *A.Allocator, tgt: *target.Target, dirs: *Vector[
 }
 
 fun resolve_dylib_into(a: *A.Allocator, tgt: *target.Target, dirs: *Vector[str],
-                       name: *u8, buf: *u8, cap: usize,
-                       rpath: *u8, rpath_cap: usize) bool {
+    name: *u8, buf: *u8, cap: usize,
+    rpath: *u8, rpath_cap: usize) bool {
     var i: usize = 0;
     for (i < dirs.len) {
         if (try_dylib_in_dir(a, dirs.data[i]::*u8, name, tgt.arch_id, buf, cap,
-                             rpath, rpath_cap)) { ret true; }
+            rpath, rpath_cap)) { ret true; }
         i = i + 1;
     }
     var li: u32 = 0;
     for (li < tgt.fs_policy.libdir_len) {
         val ld: str = tgt.fs_policy.libdirs[li];
         if (!str_empty(ld) && try_dylib_in_dir(a, ld::*u8, name, tgt.arch_id, buf, cap,
-                                               rpath, rpath_cap)) { ret true; }
+            rpath, rpath_cap)) { ret true; }
         li = li + 1;
     }
     ret false;
 }
 
 fun try_dylib_in_dir(a: *A.Allocator, dir: *u8, name: *u8,
-                     arch_id: u32, buf: *u8, cap: usize,
-                     rpath: *u8, rpath_cap: usize) bool {
+    arch_id: u32, buf: *u8, cap: usize,
+    rpath: *u8, rpath_cap: usize) bool {
     var cand: [4096]u8;
     if (write_named_candidate(dir, "lib", name, "dylib", ?cand[0], 4096)
         && accept_dylib(a, ?cand[0], arch_id, buf, cap)) {
@@ -1274,74 +1476,123 @@ fun try_dylib_in_dir(a: *A.Allocator, dir: *u8, name: *u8,
 }
 
 fun dylib_rpath_into(a: *A.Allocator, candidate: *u8, install_name: *u8,
-                     out: *u8, cap: usize) bool {
+    out: *u8, cap: usize) bool {
     if (out == nil || cap == 0) { ret false; }
     out[0] = 0;
     if (!str_starts_with(install_name::str, "@rpath/")) { ret true; }
-    val rp_r: R.Result[str, str] = dylib_rpath(a, candidate, install_name);
-    if (R.is_err[str, str](rp_r)) { ret false; }
-    val rp: str = R.unwrap_ok[str, str](rp_r);
-    val n: usize = str_len(rp);
+    val rp_r: res[str, outcome.Fail] = dylib_rpath(a, candidate, install_name);
+    if (sel rp_r.err) { ret false; }
+    val rp: str   = rp_r.ok;
+    val n:  usize = str_len(rp);
     if (n + 1 > cap) { ret false; }
     memory.raw_copy(out::ptr, rp::ptr, n + 1);
     ret true;
 }
 
+# an install name is always darwin-flavoured, so its separators are '/', while
+# the candidate has been resolved through the host's native separators
+fun ends_with_install_suffix(abs: str, suffix: str) bool {
+    val abs_len:    usize = str_len(abs);
+    val suffix_len: usize = str_len(suffix);
+    if (suffix_len > abs_len) { ret false; }
+    val at: usize = abs_len - suffix_len;
+    var i:  usize = 0;
+    for (i < suffix_len) {
+        val have: u8 = abs[at + i];
+        val want: u8 = suffix[i];
+        if (have != want && !(path.is_separator(have) && path.is_separator(want))) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
 fun dylib_rpath(a: *A.Allocator, candidate: *u8,
-                install_name: *u8) R.Result[str, str] {
-    val abs_r: R.Result[str, str] = resolve_from_cwd(a, candidate::str);
-    if (R.is_err[str, str](abs_r)) { ret abs_r; }
-    val abs: str = R.unwrap_ok[str, str](abs_r);
+    install_name: *u8) res[str, outcome.Fail] {
+    val abs_r: res[str, outcome.Fail] = resolve_from_cwd(a, candidate::str);
+    if (sel abs_r.err) { ret abs_r; }
+    val abs:    str = abs_r.ok;
     val suffix: str = (install_name::usize + 7)::str;
-    if (!str_contains(suffix, "/")) { ret path.parent(a, abs); }
-    val abs_len: usize = str_len(abs);
+    if (!str_contains(suffix, "/")) {
+        val parent_r: res[path.Path, A.Error] = path.parent(a, abs);
+        if (sel parent_r.err) { ret res[str, outcome.Fail].err{outcome.refused(parent_r.err)}; }
+        ret res[str, outcome.Fail].ok{parent_r.ok};
+    }
+    val abs_len:    usize = str_len(abs);
     val suffix_len: usize = str_len(suffix);
     if (suffix_len == 0 || suffix[0] == '/' || abs_len <= suffix_len
-        || !str_ends_with(abs, suffix)) {
-        ret R.err[str, str](
-            "the selected dylib path does not match its @rpath install-name suffix");
+        || !ends_with_install_suffix(abs, suffix)) {
+        ret res[str, outcome.Fail].err{outcome.user("the selected dylib path does not match its @rpath install-name suffix")};
     }
     var cut: usize = abs_len - suffix_len;
-    if (abs[cut - 1] != '/') {
-        ret R.err[str, str](
-            "the selected dylib path does not match its @rpath install-name suffix");
+    if (!path.is_separator(abs[cut - 1])) {
+        ret res[str, outcome.Fail].err{outcome.user("the selected dylib path does not match its @rpath install-name suffix")};
     }
     if (cut > 1) { cut = cut - 1; }
     (abs::*u8)[cut] = 0;
-    ret R.ok[str, str](abs);
+    ret res[str, outcome.Fail].ok{abs};
 }
 
-fun resolve_from_cwd(a: *A.Allocator, p: str) R.Result[str, str] {
-    if (path.is_abs(p)) { ret path.clone(a, p); }
-    val cwd_r: R.Result[str, str] = env.current_dir(a);
-    if (R.is_err[str, str](cwd_r)) { ret R.err[str, str](R.unwrap_err[str, str](cwd_r)); }
-    ret path.resolve(a, R.unwrap_ok[str, str](cwd_r), p);
+fun resolve_from_cwd(a: *A.Allocator, p: str) res[str, outcome.Fail] {
+    if (path.is_abs(p)) {
+        val clone_r: res[path.Path, A.Error] = path.clone(a, p);
+        if (sel clone_r.err) { ret res[str, outcome.Fail].err{outcome.refused(clone_r.err)}; }
+        ret res[str, outcome.Fail].ok{clone_r.ok};
+    }
+    val cwd_r: res[string.OwnedString, env.EnvError] = env.current_dir(a);
+    if (sel cwd_r.err) { ret res[str, outcome.Fail].err{outcome.user(outcome.env_text(cwd_r.err))}; }
+    var cwd:       string.OwnedString      = cwd_r.ok;
+    val resolve_r: res[path.Path, A.Error] = path.resolve(a, cwd.data, p);
+    string.owned_release(?cwd);
+    if (sel resolve_r.err) { ret res[str, outcome.Fail].err{outcome.refused(resolve_r.err)}; }
+    ret res[str, outcome.Fail].ok{resolve_r.ok};
 }
 
 fun accept_dylib(a: *A.Allocator, cand: *u8, arch_id: u32,
-                 buf: *u8, cap: usize) bool {
-    if (!fs.is_file(cand)) { ret false; }
+    buf: *u8, cap: usize) bool {
+    val is_file_r: res[bool, io_error.Error] = fs.is_file(cand);
+    if (!(sel is_file_r.ok && is_file_r.ok)) { ret false; }
     ret read_dylib_install_name(a, cand, arch_id, buf, cap);
 }
 
 fun write_named_dylib_version(dir: *u8, name: *u8, v: u32,
-                              buf: *u8, cap: usize) bool {
+    buf: *u8, cap: usize) bool {
     if (v > 9) { ret false; }
-    val dl: usize = str_len(dir);
-    val nl: usize = str_len(name::str);
+    val dl:   usize = str_len(dir);
+    val nl:   usize = str_len(name::str);
     val need: usize = dl + 1 + 3 + nl + 1 + 1 + 6 + 1;
     if (need > cap) { ret false; }
     var k: usize = 0;
     var i: usize = 0;
-    for (i < dl) { buf[k] = dir[i]; k = k + 1; i = i + 1; }
-    if (k > 0 && buf[k - 1] != '/') { buf[k] = '/'; k = k + 1; }
-    buf[k] = 'l'; buf[k + 1] = 'i'; buf[k + 2] = 'b'; k = k + 3;
-    i = 0;
-    for (i < nl) { buf[k] = name[i]; k = k + 1; i = i + 1; }
-    buf[k] = '.'; buf[k + 1] = ('0'::u32 + v)::u8; buf[k + 2] = '.'; k = k + 3;
+    for (i < dl) {
+        buf[k] = dir[i];
+        k      = k + 1;
+        i      = i + 1;
+    }
+    if (k > 0 && buf[k - 1] != '/') {
+        buf[k] = '/';
+        k      = k + 1;
+    }
+    buf[k]     = 'l';
+    buf[k + 1] = 'i';
+    buf[k + 2] = 'b';
+    k          = k + 3;
+    i          = 0;
+    for (i < nl) {
+        buf[k] = name[i];
+        k      = k + 1;
+        i      = i + 1;
+    }
+    buf[k]     = '.';
+    buf[k + 1] = ('0'::u32 + v)::u8;
+    buf[k + 2] = '.';
+    k          = k + 3;
     val ext: str = "dylib";
     i = 0;
-    for (i < 5) { buf[k] = ext[i]; k = k + 1; i = i + 1; }
+    for (i < 5) {
+        buf[k] = ext[i];
+        k      = k + 1;
+        i      = i + 1;
+    }
     buf[k] = 0;
     ret true;
 }
@@ -1358,7 +1609,8 @@ fun try_shared_in_dir(a: *A.Allocator, dir: *u8, name: *u8, arch_id: u32, buf: *
 }
 
 fun accept_shared(a: *A.Allocator, cand: *u8, arch_id: u32, buf: *u8, cap: usize) bool {
-    if (!fs.is_file(cand)) { ret false; }
+    val is_file_r: res[bool, io_error.Error] = fs.is_file(cand);
+    if (!(sel is_file_r.ok && is_file_r.ok))        { ret false; }
     if (read_so_soname(a, cand, arch_id, buf, cap)) { ret true; }
     ret false;
 }
@@ -1374,49 +1626,109 @@ fun write_named_versioned(dir: *u8, name: *u8, v: u32, buf: *u8, cap: usize) boo
     ret true;
 }
 
-pub fun explain(p: *BuildPlan, itn: *intern.Interner) {
-    print.printf("plan: {}\n", p.request.project_root);
-    print.printf("units: {}\n", p.units.len::i64);
+# render the effective plan: one block per selected cell, naming the project,
+# target, profile, artifact, entry, output paths, ordered prerequisite steps and
+# link requirements. a plan the caller never configured says so instead of
+# claiming an empty dependency closure. a phase outside the catalog is an
+# internal failure whose message `a` owns
+# ---
+# w:   the sink; `explain` passes stdout
+# p:   the plan
+# itn: resolves interned names
+pub fun render(a: *A.Allocator, w: *writer.Writer, p: *BuildPlan, itn: *intern.Interner) err[outcome.Fail] {
+    format.format(w, "plan:    {}\n", p.request.project_root);
+    format.format(w, "project: {}\n", p.project);
+    format.format(w, "units:   {}\n", p.units.len::i64);
 
     var i: usize = 0;
     for (i < p.units.len) {
         val u: *BuildUnit = ?p.units.data[i];
-        print.print("\n");
-        print.printf("unit {}: {} ({})  target {}  profile {}\n",
+        format.write_str(w, "\n");
+        format.format(w, "unit {}: {} ({})  target {}  profile {}\n",
             (i + 1)::i64, unit_artifact_label(u), unit_kind_label(u),
             entry_name(itn, u.target_entry.name), u.profile);
-        print.printf("  goal    {}\n", request.goal_name(u.goal));
-        print.printf("  tuple   {}-{}-{}\n",
+        format.format(w, "  goal    {}\n", request.goal_name(u.goal));
+        format.format(w, "  tuple   {}-{}-{}\n",
             entry_name(itn, u.target_entry.isa_name),
             entry_name(itn, u.target_entry.os_name),
             entry_name(itn, u.target_entry.abi_name));
-        print.printf("  opt     {}\n", opt_name(u.opt_level));
-        if (!str_empty(u.out_path)) { print.printf("  out     {}\n", u.out_path); }
-        print.printf("  obj     {}\n", u.obj_dir);
-        if (!str_empty(u.ir_dir))  { print.printf("  ir      {}\n", u.ir_dir); }
-        if (!str_empty(u.asm_dir)) { print.printf("  asm     {}\n", u.asm_dir); }
+        format.format(w, "  opt     {}\n", opt_name(u.opt_level));
+        format.format(w, "  entry   {}\n", entry_name(itn, u.target_entry.entrypoint));
+        if (!str_empty(u.out_path)) { format.format(w, "  out     {}\n", u.out_path); }
+        format.format(w, "  obj     {}\n", u.obj_dir);
+        if (!str_empty(u.ir_dir))  { format.format(w, "  ir      {}\n", u.ir_dir); }
+        if (!str_empty(u.asm_dir)) { format.format(w, "  asm     {}\n", u.asm_dir); }
 
+        var ri: usize = 0;
+        for (ri < u.requires.len) {
+            format.format(w, "  need    artifact {}\n", u.requires.data[ri]);
+            ri = ri + 1;
+        }
+        var di: usize = 0;
+        for (di < u.dep_steps.len) {
+            format.format(w, "  step    dependency {}\n", u.dep_steps.data[di]);
+            di = di + 1;
+        }
+        var si: usize = 0;
+        for (si < u.steps.len) {
+            format.format(w, "  step    project {}\n", u.steps.data[si]);
+            si = si + 1;
+        }
+
+        var mi: u32 = 0;
+        for (mi < u.target_entry.lib_count) {
+            format.format(w, "  link    manifest {}\n", link_requirement_label(itn, ?u.target_entry.libs[mi]));
+            mi = mi + 1;
+        }
+        var ei: usize = 0;
+        for (ei < u.export_links.len) {
+            format.format(w, "  link    dependency export {}\n", link_requirement_label(itn, ?u.export_links.data[ei]));
+            ei = ei + 1;
+        }
         var li: usize = 0;
         for (li < u.link_inputs.len) {
             val inp: *LinkInput = ?u.link_inputs.data[li];
-            if (inp.kind == LINK_STATIC) { print.printf("  link    static  {}\n", inp.text); }
+            if (inp.kind == LINK_STATIC) { format.format(w, "  link    static  {}\n", inp.text); }
             or {
-                print.printf("  link    dynamic {}\n", inp.text);
-                if (!str_empty(inp.rpath)) { print.printf("  rpath   {}\n", inp.rpath); }
+                format.format(w, "  link    dynamic {}\n", inp.text);
+                if (!str_empty(inp.rpath)) { format.format(w, "  rpath   {}\n", inp.rpath); }
             }
             li = li + 1;
         }
 
-        print.print("  phases  ");
+        format.write_str(w, "  phases  ");
         var pi: usize = 0;
         for (pi < u.phases.len) {
-            if (pi > 0) { print.print(" -> "); }
-            print.print(phase_name(u.phases.data[pi]));
+            if (pi > 0) { format.write_str(w, " -> "); }
+            val name: opt[str] = phase_name(u.phases.data[pi]);
+            if (sel name.none) {
+                ret err[outcome.Fail].err{unknown_phase(a, u.phases.data[pi])};
+            }
+            format.write_str(w, name.some);
             pi = pi + 1;
         }
-        print.print("\n");
+        format.write_str(w, "\n");
+
+        if (!u.configured) {
+            format.write_str(w, "  deps    not resolved: this plan was not configured against the dependency closure\n");
+        }
+        if (u.dep_steps.len != 0 || u.steps.len != 0 || u.requires.len != 0) {
+            format.write_str(w, "  inputs  generated bytes are unresolved until the prerequisites above run\n");
+        }
         i = i + 1;
     }
+    format.write_str(w, "\nthis plan reports the selected build. it does not read generated bytes, and it does not claim the link succeeds\n");
+    ret err[outcome.Fail].ok{};
+}
+
+pub fun explain(a: *A.Allocator, p: *BuildPlan, itn: *intern.Interner) err[outcome.Fail] {
+    var w: writer.Writer = fs.writer(fs.STDOUT);
+    ret render(a, ?w, p, itn);
+}
+
+fun link_requirement_label(itn: *intern.Interner, l: *manifest.LinkRequirement) str {
+    if (l.source == manifest.LINK_LOCAL) { ret entry_name(itn, l.text); }
+    ret entry_name(itn, l.library);
 }
 
 fun unit_artifact_label(u: *BuildUnit) str {
@@ -1433,8 +1745,8 @@ fun unit_kind_label(u: *BuildUnit) str {
 }
 
 fun entry_name(itn: *intern.Interner, id: intern.StrId) str {
-    val o: O.Option[str] = intern.lookup(itn, id);
-    if (O.is_some[str](o)) { ret O.unwrap[str](o); }
+    val o: opt[str] = intern.lookup(itn, id);
+    if (sel o.some) { ret o.some; }
     ret "(default)";
 }
 
@@ -1443,49 +1755,60 @@ fun opt_name(level: u8) str {
     ret "debug";
 }
 
-fun phase_name(k: PhaseKind) str {
-    if (k == PH_DEP_STEPS) { ret "dep steps"; }
-    if (k == PH_LOAD)      { ret "load"; }
-    if (k == PH_STEPS)     { ret "steps"; }
-    if (k == PH_SEMA)      { ret "sema"; }
-    if (k == PH_LOWER)     { ret "lower"; }
-    if (k == PH_CODEGEN)   { ret "codegen"; }
-    if (k == PH_EMIT)      { ret "emit"; }
-    ret "link";
+# the name of a declared build phase, absent for an unknown catalog member
+pub fun phase_name(k: PhaseKind) opt[str] {
+    if (k == PH_DEP_STEPS) { ret opt[str].some{"dep steps"}; }
+    if (k == PH_LOAD)      { ret opt[str].some{"load"}; }
+    if (k == PH_STEPS)     { ret opt[str].some{"steps"}; }
+    if (k == PH_SEMA)      { ret opt[str].some{"sema"}; }
+    if (k == PH_LOWER)     { ret opt[str].some{"lower"}; }
+    if (k == PH_CODEGEN)   { ret opt[str].some{"codegen"}; }
+    if (k == PH_EMIT)      { ret opt[str].some{"emit"}; }
+    if (k == PH_LINK)      { ret opt[str].some{"link"}; }
+    ret opt[str].none{};
+}
+
+# an internal catalog failure with a caller-owned message
+pub fun unknown_phase(a: *A.Allocator, k: PhaseKind) outcome.Fail {
+    ret outcome.unknown_catalog(a, "PhaseKind", k::u32);
 }
 
 fun ut_manifest_src(a: *A.Allocator, itn: *intern.Interner, src: str, out_m: *manifest.Manifest) bool {
-    val source_r: R.Result[R.Void, str] = manifest.validate_source_text(src);
-    if (R.is_err[R.Void, str](source_r)) { ret false; }
-    val tr: R.Result[toml.Table, str] = toml.parse(a, src);
-    if (R.is_err[toml.Table, str](tr)) { ret false; }
-    var t: toml.Table = R.unwrap_ok[toml.Table, str](tr);
-    val mr: R.Result[manifest.Manifest, str] = manifest.parse(a, itn, ?t, true);
+    val source_r: err[outcome.Fail] = manifest.validate_source_text(src);
+    if (sel source_r.err) { ret false; }
+    val tr: res[toml.Table, toml.TomlError] = toml.parse(a, src);
+    if (sel tr.err) { ret false; }
+    var t:  toml.Table                           = tr.ok;
+    val mr: res[manifest.Manifest, outcome.Fail] = manifest.parse(a, itn, ?t, true);
     toml.dnit(a, ?t);
-    if (R.is_err[manifest.Manifest, str](mr)) { ret false; }
-    @out_m = R.unwrap_ok[manifest.Manifest, str](mr);
+    if (sel mr.err) { ret false; }
+    @out_m = mr.ok;
     ret true;
 }
 
 fun ut_manifest(a: *A.Allocator, itn: *intern.Interner, out_m: *manifest.Manifest) bool {
-    ret ut_manifest_src(a, itn, "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.ta]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[target.tb]\nisa = \"aarch64\"\nos = \"linux\"\nabi = \"aapcs64\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n[artifact.appa]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/appa\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[artifact.libb]\nkind = \"static\"\nentry = \"lib.mach\"\nout = \"lib/libb.a\"\ntargets = [\"*\"]\nlink = []\nneed = []\n", out_m);
+    ret ut_manifest_src(a, itn, "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.ta]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[target.tb]\nisa = \"aarch64\"\nos = \"linux\"\nabi = \"aapcs64\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n[artifact.appa]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/appa\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[artifact.libb]\nkind = \"static\"\nentry = \"lib.mach\"\nout = \"lib/libb.a\"\ntargets = [\"*\"]\nlink = []\nneed = []\n", out_m);
 }
 
 fun ut_scaffold(alloc: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry, m: *manifest.Manifest) bool {
-    if (O.is_some[str](page.make(alloc)))              { ret false; }
+    val make_r: err[A.Error] = page.make(alloc);
+    if (sel make_r.err) { ret false; }
     @itn = intern.init(alloc);
     @reg = target.registry_init();
-    if (R.is_err[R.Void, str](target.register_all(reg, target_testing.debug_descriptor))) { ret false; }
-    if (!ut_manifest(alloc, itn, m))                   { ret false; }
+    val register_all_r: err[fail.Fail] = target.register_all(reg, target_testing.debug_descriptor);
+    if (sel register_all_r.err)      { ret false; }
+    if (!ut_manifest(alloc, itn, m)) { ret false; }
     ret true;
 }
 
 fun ut_scaffold_src(alloc: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry, m: *manifest.Manifest, src: str) bool {
-    if (O.is_some[str](page.make(alloc)))              { ret false; }
+    val make_r: err[A.Error] = page.make(alloc);
+    if (sel make_r.err) { ret false; }
     @itn = intern.init(alloc);
     @reg = target.registry_init();
-    if (R.is_err[R.Void, str](target.register_all(reg, target_testing.debug_descriptor))) { ret false; }
-    if (!ut_manifest_src(alloc, itn, src, m))          { ret false; }
+    val register_all_r: err[fail.Fail] = target.register_all(reg, target_testing.debug_descriptor);
+    if (sel register_all_r.err)               { ret false; }
+    if (!ut_manifest_src(alloc, itn, src, m)) { ret false; }
     ret true;
 }
 
@@ -1509,14 +1832,18 @@ fun ut_path_eq(a: str, b: str) bool {
 
 fun ut_write_dylib(path_: str, install_name: str, cpu_type: u32) bool {
     var buf: [160]u8;
-    var i: usize = 0;
-    for (i < 160) { buf[i] = 0; i = i + 1; }
+    var i:   usize = 0;
+    for (i < 160) {
+        buf[i] = 0;
+        i      = i + 1;
+    }
     if (!ut_fill_dylib(?buf[0], 0, install_name, cpu_type)) { ret false; }
-    ret O.is_none[str](fs.write_bytes(path_, ?buf[0], 128, 420));
+    val write_bytes_r: err[fs.FsError] = fs.write_bytes(path_, ?buf[0], 128, 420);
+    ret sel write_bytes_r.ok;
 }
 
 fun ut_fill_dylib(buf: *u8, off: usize, install_name: str,
-                  cpu_type: u32) bool {
+    cpu_type: u32) bool {
     val name_len: usize = str_len(install_name);
     if (name_len + 1 > 72) { ret false; }
 
@@ -1533,40 +1860,46 @@ fun ut_fill_dylib(buf: *u8, off: usize, install_name: str,
     ret true;
 }
 
-fun ut_temp_dir(a: *A.Allocator) R.Result[str, str] {
-    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(a, "mach_plan_dylib");
-    if (R.is_err[fs.TempFile, str](tf_r)) { ret R.err[str, str](R.unwrap_err[fs.TempFile, str](tf_r)); }
-    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
-    val root_r: R.Result[str, str] = str_copy(a, fs.temp_path(?tf)::*u8);
+fun ut_temp_dir(a: *A.Allocator) res[str, outcome.Fail] {
+    val tf_r: res[fs.TempFile, fs.FsError] = fs.temp_create(a, "mach_plan_dylib");
+    if (sel tf_r.err) { ret res[str, outcome.Fail].err{outcome.user(outcome.fs_text(tf_r.err))}; }
+    var tf:     fs.TempFile               = tf_r.ok;
+    val root_r: res[str, string.StrError] = str_copy(a, fs.temp_path(?tf)::*u8);
     fs.temp_close_and_remove(?tf);
-    if (R.is_err[str, str](root_r)) { ret root_r; }
-    val root: str = R.unwrap_ok[str, str](root_r);
-    val mk: O.Option[str] = fs.create_dir_all(a, root, 493);
-    if (O.is_some[str](mk)) { ret R.err[str, str](O.unwrap[str](mk)); }
-    ret R.ok[str, str](root);
+    if (sel root_r.err) { ret res[str, outcome.Fail].err{outcome.user(outcome.str_text(root_r.err))}; }
+    val root: str             = root_r.ok;
+    val mk:   err[fs.FsError] = fs.create_dir_all(a, root, 493);
+    if (sel mk.err) { ret res[str, outcome.Fail].err{outcome.user(outcome.fs_text(mk.err))}; }
+    ret res[str, outcome.Fail].ok{root};
 }
 
 test "mach.lang.build.plan.resolve_input_into:coff_static_suffixes" {
-    var alloc: A.Allocator;
-    if (O.is_some[str](page.make(?alloc))) { ret 1; }
-    val root_r: R.Result[str, str] = ut_temp_dir(?alloc);
-    if (R.is_err[str, str](root_r)) { ret 1; }
-    val root: str = R.unwrap_ok[str, str](root_r);
-    val lib_r: R.Result[str, str] = path.join(?alloc, root, "libmingw32.lib");
-    if (R.is_err[str, str](lib_r)) { fs.remove_all(?alloc, root); ret 1; }
-    val lib: str = R.unwrap_ok[str, str](lib_r);
-    if (O.is_some[str](fs.write_bytes(lib, "!<arch>\n", 8, 420))) {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val root_r: res[str, outcome.Fail] = ut_temp_dir(?alloc);
+    if (sel root_r.err) { ret 1; }
+    val root:  str               = root_r.ok;
+    val lib_r: res[str, A.Error] = path.join(?alloc, root, "libmingw32.lib");
+    if (sel lib_r.err) {
+        fs.remove_all(?alloc, root);
+        ret 1;
+    }
+    val lib:           str             = lib_r.ok;
+    val write_bytes_r: err[fs.FsError] = fs.write_bytes(lib, "!<arch>\n", 8, 420);
+    if (sel write_bytes_r.err) {
         fs.remove_all(?alloc, root);
         ret 1;
     }
 
-    var dirs: Vector[str] = vector.init[str](?alloc);
-    if (R.is_err[usize, str](vector.push[str](?dirs, root))) {
+    var dirs:   Vector[str]         = vector.init[str](?alloc);
+    val push_r: res[usize, A.Error] = vector.push[str](?dirs, root);
+    if (sel push_r.err) {
         fs.remove_all(?alloc, root);
         ret 1;
     }
-    var buf: [4096]u8;
-    val named: bool = resolve_input_into("mingw32"::*u8, ?dirs, ?buf[0], 4096, true);
+    var buf:      [4096]u8;
+    val named:    bool = resolve_input_into("mingw32"::*u8, ?dirs, ?buf[0], 4096, true);
     val explicit: bool = resolve_input_into(lib::*u8, ?dirs, ?buf[0], 4096, false);
     fs.remove_all(?alloc, root);
     if (!named || !explicit) { ret 1; }
@@ -1574,383 +1907,474 @@ test "mach.lang.build.plan.resolve_input_into:coff_static_suffixes" {
 }
 
 test "mach.lang.build.plan.resolve_token:linux_ignores_bare_coff_lib" {
-    var alloc: A.Allocator;
-    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
     var reg: target.TargetRegistry = target.registry_init();
     fin { target.registry_dnit(?reg); }
-    if (R.is_err[R.Void, str](target.register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
-    val tr: R.Result[target.Target, str] =
-        target.select(?reg, "x86_64", "linux", "sysv64");
-    if (R.is_err[target.Target, str](tr)) { ret 1; }
-    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+    val register_all_r: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel register_all_r.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] = target.select(?reg, "x86_64", "linux", "sysv64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
 
-    val root_r: R.Result[str, str] = ut_temp_dir(?alloc);
-    if (R.is_err[str, str](root_r)) { ret 1; }
-    val root: str = R.unwrap_ok[str, str](root_r);
-    val lib_r: R.Result[str, str] = path.join(?alloc, root, "libfoo.lib");
-    val so_r: R.Result[str, str] = path.join(?alloc, root, "libfoo.so");
-    if (R.is_err[str, str](lib_r) || R.is_err[str, str](so_r)) {
-        fs.remove_all(?alloc, root); ret 1;
+    val root_r: res[str, outcome.Fail] = ut_temp_dir(?alloc);
+    if (sel root_r.err) { ret 1; }
+    val root:  str               = root_r.ok;
+    val lib_r: res[str, A.Error] = path.join(?alloc, root, "libfoo.lib");
+    val so_r:  res[str, A.Error] = path.join(?alloc, root, "libfoo.so");
+    if (sel lib_r.err) {
+        fs.remove_all(?alloc, root);
+        ret 1;
     }
-    val lib: str = R.unwrap_ok[str, str](lib_r);
-    val so: str = R.unwrap_ok[str, str](so_r);
-    if (O.is_some[str](fs.write_bytes(lib, "!<arch>\n", 8, 420))
-        || !ut_write_elf_object(so, 62, true)) {
-        fs.remove_all(?alloc, root); ret 1;
+    if (sel so_r.err) {
+        fs.remove_all(?alloc, root);
+        ret 1;
+    }
+    val lib:           str             = lib_r.ok;
+    val so:            str             = so_r.ok;
+    val write_bytes_r: err[fs.FsError] = fs.write_bytes(lib, "!<arch>\n", 8, 420);
+    if (sel write_bytes_r.err) {
+        fs.remove_all(?alloc, root);
+        ret 1;
+    }
+    if (!ut_write_elf_object(so, 62, true)) {
+        fs.remove_all(?alloc, root);
+        ret 1;
     }
 
-    var dirs: Vector[str] = vector.init[str](?alloc);
-    if (R.is_err[usize, str](vector.push[str](?dirs, root))) {
-        fs.remove_all(?alloc, root); ret 1;
+    var dirs:   Vector[str]         = vector.init[str](?alloc);
+    val push_r: res[usize, A.Error] = vector.push[str](?dirs, root);
+    if (sel push_r.err) {
+        fs.remove_all(?alloc, root);
+        ret 1;
     }
-    val rr: R.Result[LinkInput, outcome.Fail] =
-        resolve_token(?alloc, ?tgt, ?dirs, "", "foo"::*u8);
+    val rr:           res[LinkInput, outcome.Fail] = resolve_token(?alloc, ?tgt, ?dirs, "", "foo"::*u8);
     var explicit_buf: [4096]u8;
-    val explicit: bool =
+    val explicit:     bool                         =
         resolve_input_into(lib::*u8, ?dirs, ?explicit_buf[0], 4096, false);
     fs.remove_all(?alloc, root);
-    if (R.is_err[LinkInput, outcome.Fail](rr) || !explicit) { ret 1; }
-    val input: LinkInput = R.unwrap_ok[LinkInput, outcome.Fail](rr);
+    if (sel rr.err) { ret 1; }
+    if (!explicit)  { ret 1; }
+    val input: LinkInput = rr.ok;
     if (input.kind != LINK_DYNAMIC || !str_equals(input.text, "libfoo.so")) { ret 1; }
     ret 0;
 }
 
 test "mach.lang.build.plan.resolve_token:elf_shared_machine_matches_target" {
-    var alloc: A.Allocator;
-    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
     var reg: target.TargetRegistry = target.registry_init();
     fin { target.registry_dnit(?reg); }
-    if (R.is_err[R.Void, str](target.register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
-    val tr: R.Result[target.Target, str] =
-        target.select(?reg, "aarch64", "linux", "aapcs64");
-    if (R.is_err[target.Target, str](tr)) { ret 1; }
-    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+    val register_all_r: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel register_all_r.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] = target.select(?reg, "aarch64", "linux", "aapcs64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
 
-    val root_r: R.Result[str, str] = ut_temp_dir(?alloc);
-    if (R.is_err[str, str](root_r)) { ret 1; }
-    val root: str = R.unwrap_ok[str, str](root_r);
-    val host_r: R.Result[str, str] = path.join(?alloc, root, "libfoo.so");
-    val target_r: R.Result[str, str] = path.join(?alloc, root, "libfoo.so.6");
-    if (R.is_err[str, str](host_r) || R.is_err[str, str](target_r)) {
+    val root_r: res[str, outcome.Fail] = ut_temp_dir(?alloc);
+    if (sel root_r.err) { ret 1; }
+    val root:     str               = root_r.ok;
+    val host_r:   res[str, A.Error] = path.join(?alloc, root, "libfoo.so");
+    val target_r: res[str, A.Error] = path.join(?alloc, root, "libfoo.so.6");
+    if (sel host_r.err) {
         fs.remove_all(?alloc, root);
         ret 1;
     }
-    val host: str = R.unwrap_ok[str, str](host_r);
-    val target_so: str = R.unwrap_ok[str, str](target_r);
+    if (sel target_r.err) {
+        fs.remove_all(?alloc, root);
+        ret 1;
+    }
+    val host:      str = host_r.ok;
+    val target_so: str = target_r.ok;
     if (!ut_write_elf_object(host, 62, true) || !ut_write_elf_object(target_so, 183, true)) {
         fs.remove_all(?alloc, root);
         ret 1;
     }
 
-    var dirs: Vector[str] = vector.init[str](?alloc);
-    if (R.is_err[usize, str](vector.push[str](?dirs, root))) {
+    var dirs:   Vector[str]         = vector.init[str](?alloc);
+    val push_r: res[usize, A.Error] = vector.push[str](?dirs, root);
+    if (sel push_r.err) {
         fs.remove_all(?alloc, root);
         ret 1;
     }
-    val named: R.Result[LinkInput, outcome.Fail] =
-        resolve_token(?alloc, ?tgt, ?dirs, "", "foo"::*u8);
-    val explicit: R.Result[LinkInput, outcome.Fail] =
-        resolve_token(?alloc, ?tgt, ?dirs, "", host::*u8);
+    val named:    res[LinkInput, outcome.Fail] = resolve_token(?alloc, ?tgt, ?dirs, "", "foo"::*u8);
+    val explicit: res[LinkInput, outcome.Fail] = resolve_token(?alloc, ?tgt, ?dirs, "", host::*u8);
     fs.remove_all(?alloc, root);
-    if (R.is_err[LinkInput, outcome.Fail](named)
-        || R.is_ok[LinkInput, outcome.Fail](explicit)) { ret 1; }
-    val input: LinkInput = R.unwrap_ok[LinkInput, outcome.Fail](named);
+    if (sel named.err)   { ret 1; }
+    if (sel explicit.ok) { ret 1; }
+    val input: LinkInput = named.ok;
     if (input.kind != LINK_DYNAMIC || !str_equals(input.text, "libfoo.so.6")) { ret 1; }
     ret 0;
 }
 
 test "mach.lang.build.plan.resolve_token:darwin_dylib_install_name" {
-    var alloc: A.Allocator;
-    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
     var reg: target.TargetRegistry = target.registry_init();
     fin { target.registry_dnit(?reg); }
-    if (R.is_err[R.Void, str](target.register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
-    val tr: R.Result[target.Target, str] = target.select(?reg, "x86_64", "darwin", "sysv64");
-    val ar: R.Result[target.Target, str] = target.select(?reg, "aarch64", "darwin", "aapcs64");
-    if (R.is_err[target.Target, str](tr) || R.is_err[target.Target, str](ar)) { ret 1; }
-    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
-    var arm: target.Target = R.unwrap_ok[target.Target, str](ar);
+    val register_all_r: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel register_all_r.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] = target.select(?reg, "x86_64", "darwin", "sysv64");
+    val ar: res[target.Target, fail.Fail] = target.select(?reg, "aarch64", "darwin", "aapcs64");
+    if (sel tr.err) { ret 1; }
+    if (sel ar.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
+    var arm: target.Target = ar.ok;
 
-    val root_r: R.Result[str, str] = ut_temp_dir(?alloc);
-    if (R.is_err[str, str](root_r)) { ret 1; }
-    val root: str = R.unwrap_ok[str, str](root_r);
-    val dylib_r: R.Result[str, str] = path.join(?alloc, root, "libglfw.dylib");
-    val elf_r: R.Result[str, str] = path.join(?alloc, root, "libhostonly.so");
-    if (R.is_err[str, str](dylib_r) || R.is_err[str, str](elf_r)) {
+    val root_r: res[str, outcome.Fail] = ut_temp_dir(?alloc);
+    if (sel root_r.err) { ret 1; }
+    val root:    str               = root_r.ok;
+    val dylib_r: res[str, A.Error] = path.join(?alloc, root, "libglfw.dylib");
+    val elf_r:   res[str, A.Error] = path.join(?alloc, root, "libhostonly.so");
+    if (sel dylib_r.err) {
         fs.remove_all(?alloc, root);
         ret 1;
     }
-    val dylib: str = R.unwrap_ok[str, str](dylib_r);
-    val elf: str = R.unwrap_ok[str, str](elf_r);
-    if (!ut_write_dylib(dylib, "@rpath/libglfw.3.dylib", 0x01000007)
-        || O.is_some[str](fs.write_bytes(elf, "ELF", 3, 420))) {
+    if (sel elf_r.err) {
+        fs.remove_all(?alloc, root);
+        ret 1;
+    }
+    val dylib:         str             = dylib_r.ok;
+    val elf:           str             = elf_r.ok;
+    val write_bytes_r: err[fs.FsError] = fs.write_bytes(elf, "ELF", 3, 420);
+    if (!ut_write_dylib(dylib, "@rpath/libglfw.3.dylib", 0x01000007)) {
+        fs.remove_all(?alloc, root);
+        ret 1;
+    }
+    if (sel write_bytes_r.err) {
         fs.remove_all(?alloc, root);
         ret 1;
     }
 
-    var dirs: Vector[str] = vector.init[str](?alloc);
-    if (R.is_err[usize, str](vector.push[str](?dirs, root))) {
+    var dirs:   Vector[str]         = vector.init[str](?alloc);
+    val push_r: res[usize, A.Error] = vector.push[str](?dirs, root);
+    if (sel push_r.err) {
         fs.remove_all(?alloc, root);
         ret 1;
     }
-    val rr: R.Result[LinkInput, outcome.Fail] =
-        resolve_token(?alloc, ?tgt, ?dirs, "", "glfw"::*u8);
-    if (R.is_err[LinkInput, outcome.Fail](rr)) {
+    val rr: res[LinkInput, outcome.Fail] = resolve_token(?alloc, ?tgt, ?dirs, "", "glfw"::*u8);
+    if (sel rr.err) {
         fs.remove_all(?alloc, root);
         ret 1;
     }
-    val li: LinkInput = R.unwrap_ok[LinkInput, outcome.Fail](rr);
+    val li: LinkInput = rr.ok;
     if (li.kind != LINK_DYNAMIC || !str_equals(li.text, "@rpath/libglfw.3.dylib")
         || !str_equals(li.rpath, root)) {
         fs.remove_all(?alloc, root);
         ret 1;
     }
 
-    val wrong_arch: R.Result[LinkInput, outcome.Fail] =
-        resolve_token(?alloc, ?arm, ?dirs, "", "glfw"::*u8);
-    if (R.is_ok[LinkInput, outcome.Fail](wrong_arch)) {
+    val wrong_arch: res[LinkInput, outcome.Fail] = resolve_token(?alloc, ?arm, ?dirs, "", "glfw"::*u8);
+    if (sel wrong_arch.ok) {
         fs.remove_all(?alloc, root);
         ret 1;
     }
 
-    val wrong_format: R.Result[LinkInput, outcome.Fail] =
-        resolve_token(?alloc, ?tgt, ?dirs, "", elf::*u8);
-    if (R.is_ok[LinkInput, outcome.Fail](wrong_format)) {
+    val wrong_format: res[LinkInput, outcome.Fail] = resolve_token(?alloc, ?tgt, ?dirs, "", elf::*u8);
+    if (sel wrong_format.ok) {
         fs.remove_all(?alloc, root);
         ret 1;
     }
 
-    val host_only: R.Result[LinkInput, outcome.Fail] =
-        resolve_token(?alloc, ?tgt, ?dirs, "", "hostonly"::*u8);
+    val host_only: res[LinkInput, outcome.Fail] = resolve_token(?alloc, ?tgt, ?dirs, "", "hostonly"::*u8);
     fs.remove_all(?alloc, root);
-    if (R.is_ok[LinkInput, outcome.Fail](host_only)) { ret 1; }
+    if (sel host_only.ok) { ret 1; }
     ret 0;
 }
 
 fun ut_write_elf_object(path_: str, machine: u16, is_shared: bool) bool {
     var buf: [64]u8;
-    var i: usize = 0;
-    for (i < 64) { buf[i] = 0; i = i + 1; }
-    buf[0] = 0x7F; buf[1] = 0x45; buf[2] = 0x4C; buf[3] = 0x46;
-    buf[4] = 2; buf[5] = 1; buf[6] = 1;
+    var i:   usize = 0;
+    for (i < 64) {
+        buf[i] = 0;
+        i      = i + 1;
+    }
+    buf[0] = 0x7F;
+    buf[1] = 0x45;
+    buf[2] = 0x4C;
+    buf[3] = 0x46;
+    buf[4] = 2;
+    buf[5] = 1;
+    buf[6] = 1;
     var e_type: u16 = 1;
     if (is_shared) { e_type = 3; }
     bin.write_u16_le(?buf[0], 16, e_type);
     bin.write_u16_le(?buf[0], 18, machine);
     bin.write_u16_le(?buf[0], 52, 64);
-    ret O.is_none[str](fs.write_bytes(path_, ?buf[0], 64, 420));
+    val write_bytes_r: err[fs.FsError] = fs.write_bytes(path_, ?buf[0], 64, 420);
+    ret sel write_bytes_r.ok;
 }
 
 fun ut_write_dll(path_: str, machine: u16, is_dll: bool) bool {
     var buf: [128]u8;
-    var i: usize = 0;
-    for (i < 128) { buf[i] = 0; i = i + 1; }
-    buf[0] = 'M'; buf[1] = 'Z';
+    var i:   usize = 0;
+    for (i < 128) {
+        buf[i] = 0;
+        i      = i + 1;
+    }
+    buf[0] = 'M';
+    buf[1] = 'Z';
     bin.write_u32_le(?buf[0], 0x3C, 64);
     bin.write_u32_le(?buf[0], 64, 0x00004550);
     bin.write_u16_le(?buf[0], 68, machine);
     var characteristics: u16 = 0;
     if (is_dll) { characteristics = 0x2000; }
     bin.write_u16_le(?buf[0], 86, characteristics);
-    ret O.is_none[str](fs.write_bytes(path_, ?buf[0], 128, 420));
+    val write_bytes_r: err[fs.FsError] = fs.write_bytes(path_, ?buf[0], 128, 420);
+    ret sel write_bytes_r.ok;
 }
 
 test "mach.lang.build.plan.resolve_token:elf_shared_object_wrong_architecture_refused" {
-    var alloc: A.Allocator;
-    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
     var reg: target.TargetRegistry = target.registry_init();
     fin { target.registry_dnit(?reg); }
-    if (R.is_err[R.Void, str](target.register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
-    val tr: R.Result[target.Target, str] = target.select(?reg, "x86_64", "linux", "sysv64");
-    if (R.is_err[target.Target, str](tr)) { ret 1; }
-    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+    val register_all_r: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel register_all_r.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] = target.select(?reg, "x86_64", "linux", "sysv64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
 
-    val root_r: R.Result[str, str] = ut_temp_dir(?alloc);
-    if (R.is_err[str, str](root_r)) { ret 1; }
-    val root: str = R.unwrap_ok[str, str](root_r);
-    val so_r: R.Result[str, str] = path.join(?alloc, root, "libwrong.so");
-    if (R.is_err[str, str](so_r)) { fs.remove_all(?alloc, root); ret 1; }
-    val so: str = R.unwrap_ok[str, str](so_r);
+    val root_r: res[str, outcome.Fail] = ut_temp_dir(?alloc);
+    if (sel root_r.err) { ret 1; }
+    val root: str               = root_r.ok;
+    val so_r: res[str, A.Error] = path.join(?alloc, root, "libwrong.so");
+    if (sel so_r.err) {
+        fs.remove_all(?alloc, root);
+        ret 1;
+    }
+    val so: str = so_r.ok;
     if (!ut_write_elf_object(so, elf.machine_for_arch(isa.ARCH_AARCH64), true)) {
-        fs.remove_all(?alloc, root); ret 1;
+        fs.remove_all(?alloc, root);
+        ret 1;
     }
 
-    var dirs: Vector[str] = vector.init[str](?alloc);
-    if (R.is_err[usize, str](vector.push[str](?dirs, root))) {
-        fs.remove_all(?alloc, root); ret 1;
+    var dirs:   Vector[str]         = vector.init[str](?alloc);
+    val push_r: res[usize, A.Error] = vector.push[str](?dirs, root);
+    if (sel push_r.err) {
+        fs.remove_all(?alloc, root);
+        ret 1;
     }
-    val wrong: R.Result[LinkInput, outcome.Fail] =
-        resolve_token(?alloc, ?tgt, ?dirs, "", "wrong"::*u8);
+    val wrong: res[LinkInput, outcome.Fail] = resolve_token(?alloc, ?tgt, ?dirs, "", "wrong"::*u8);
     fs.remove_all(?alloc, root);
-    if (R.is_ok[LinkInput, outcome.Fail](wrong)) { ret 1; }
+    if (sel wrong.ok) { ret 1; }
     ret 0;
 }
 
 test "mach.lang.build.plan.resolve_token:static_object_wrong_architecture_refused" {
-    var alloc: A.Allocator;
-    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
     var reg: target.TargetRegistry = target.registry_init();
     fin { target.registry_dnit(?reg); }
-    if (R.is_err[R.Void, str](target.register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
-    val tr: R.Result[target.Target, str] = target.select(?reg, "x86_64", "linux", "sysv64");
-    if (R.is_err[target.Target, str](tr)) { ret 1; }
-    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+    val register_all_r: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel register_all_r.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] = target.select(?reg, "x86_64", "linux", "sysv64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
 
-    val root_r: R.Result[str, str] = ut_temp_dir(?alloc);
-    if (R.is_err[str, str](root_r)) { ret 1; }
-    val root: str = R.unwrap_ok[str, str](root_r);
-    val obj_r: R.Result[str, str] = path.join(?alloc, root, "wrong.o");
-    val ok_r: R.Result[str, str] = path.join(?alloc, root, "right.o");
-    if (R.is_err[str, str](obj_r) || R.is_err[str, str](ok_r)) {
-        fs.remove_all(?alloc, root); ret 1;
+    val root_r: res[str, outcome.Fail] = ut_temp_dir(?alloc);
+    if (sel root_r.err) { ret 1; }
+    val root:  str               = root_r.ok;
+    val obj_r: res[str, A.Error] = path.join(?alloc, root, "wrong.o");
+    val ok_r:  res[str, A.Error] = path.join(?alloc, root, "right.o");
+    if (sel obj_r.err) {
+        fs.remove_all(?alloc, root);
+        ret 1;
     }
-    val obj: str = R.unwrap_ok[str, str](obj_r);
-    val ok_path: str = R.unwrap_ok[str, str](ok_r);
+    if (sel ok_r.err) {
+        fs.remove_all(?alloc, root);
+        ret 1;
+    }
+    val obj:     str = obj_r.ok;
+    val ok_path: str = ok_r.ok;
     if (!ut_write_elf_object(obj, elf.machine_for_arch(isa.ARCH_AARCH64), false)
         || !ut_write_elf_object(ok_path, elf.machine_for_arch(isa.ARCH_X86_64), false)) {
-        fs.remove_all(?alloc, root); ret 1;
+        fs.remove_all(?alloc, root);
+        ret 1;
     }
 
-    var dirs: Vector[str] = vector.init[str](?alloc);
-    val wrong: R.Result[LinkInput, outcome.Fail] =
-        resolve_token(?alloc, ?tgt, ?dirs, "", obj::*u8);
-    val right: R.Result[LinkInput, outcome.Fail] =
-        resolve_token(?alloc, ?tgt, ?dirs, "", ok_path::*u8);
+    var dirs:  Vector[str]                  = vector.init[str](?alloc);
+    val wrong: res[LinkInput, outcome.Fail] = resolve_token(?alloc, ?tgt, ?dirs, "", obj::*u8);
+    val right: res[LinkInput, outcome.Fail] = resolve_token(?alloc, ?tgt, ?dirs, "", ok_path::*u8);
     fs.remove_all(?alloc, root);
-    if (R.is_ok[LinkInput, outcome.Fail](wrong)) { ret 1; }
-    if (R.is_err[LinkInput, outcome.Fail](right)) { ret 1; }
-    val ri: LinkInput = R.unwrap_ok[LinkInput, outcome.Fail](right);
+    if (sel wrong.ok)  { ret 1; }
+    if (sel right.err) { ret 1; }
+    val ri: LinkInput = right.ok;
     if (ri.kind != LINK_STATIC) { ret 1; }
     ret 0;
 }
 
 test "mach.lang.build.plan.resolve_token:dll_content_validated_against_target" {
-    var alloc: A.Allocator;
-    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
     var reg: target.TargetRegistry = target.registry_init();
     fin { target.registry_dnit(?reg); }
-    if (R.is_err[R.Void, str](target.register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
-    val tr: R.Result[target.Target, str] = target.select(?reg, "x86_64", "windows", "win64");
-    if (R.is_err[target.Target, str](tr)) { ret 1; }
-    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+    val register_all_r: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel register_all_r.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] = target.select(?reg, "x86_64", "windows", "win64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
 
-    val root_r: R.Result[str, str] = ut_temp_dir(?alloc);
-    if (R.is_err[str, str](root_r)) { ret 1; }
-    val root: str = R.unwrap_ok[str, str](root_r);
-    val bad_r: R.Result[str, str] = path.join(?alloc, root, "bad.dll");
-    val good_r: R.Result[str, str] = path.join(?alloc, root, "good.dll");
-    if (R.is_err[str, str](bad_r) || R.is_err[str, str](good_r)) {
-        fs.remove_all(?alloc, root); ret 1;
+    val root_r: res[str, outcome.Fail] = ut_temp_dir(?alloc);
+    if (sel root_r.err) { ret 1; }
+    val root:   str               = root_r.ok;
+    val bad_r:  res[str, A.Error] = path.join(?alloc, root, "bad.dll");
+    val good_r: res[str, A.Error] = path.join(?alloc, root, "good.dll");
+    if (sel bad_r.err) {
+        fs.remove_all(?alloc, root);
+        ret 1;
     }
-    val bad: str = R.unwrap_ok[str, str](bad_r);
-    val good: str = R.unwrap_ok[str, str](good_r);
+    if (sel good_r.err) {
+        fs.remove_all(?alloc, root);
+        ret 1;
+    }
+    val bad:  str = bad_r.ok;
+    val good: str = good_r.ok;
     if (!ut_write_dll(bad, coff.machine_for_arch(isa.ARCH_X86_64), false)
         || !ut_write_dll(good, coff.machine_for_arch(isa.ARCH_X86_64), true)) {
-        fs.remove_all(?alloc, root); ret 1;
+        fs.remove_all(?alloc, root);
+        ret 1;
     }
 
-    var dirs: Vector[str] = vector.init[str](?alloc);
-    val bad_rr: R.Result[LinkInput, outcome.Fail] =
-        resolve_token(?alloc, ?tgt, ?dirs, root, bad::*u8);
-    val good_rr: R.Result[LinkInput, outcome.Fail] =
-        resolve_token(?alloc, ?tgt, ?dirs, root, good::*u8);
+    var dirs:    Vector[str]                  = vector.init[str](?alloc);
+    val bad_rr:  res[LinkInput, outcome.Fail] = resolve_token(?alloc, ?tgt, ?dirs, root, bad::*u8);
+    val good_rr: res[LinkInput, outcome.Fail] = resolve_token(?alloc, ?tgt, ?dirs, root, good::*u8);
     fs.remove_all(?alloc, root);
-    if (R.is_ok[LinkInput, outcome.Fail](bad_rr)) { ret 1; }
-    if (R.is_err[LinkInput, outcome.Fail](good_rr)) { ret 1; }
+    if (sel bad_rr.ok)   { ret 1; }
+    if (sel good_rr.err) { ret 1; }
     ret 0;
 }
 
 test "mach.lang.build.plan.resolve_token:archive_content_validated_not_suffix" {
-    var alloc: A.Allocator;
-    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
     var reg: target.TargetRegistry = target.registry_init();
     fin { target.registry_dnit(?reg); }
-    if (R.is_err[R.Void, str](target.register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
-    val tr: R.Result[target.Target, str] = target.select(?reg, "x86_64", "linux", "sysv64");
-    if (R.is_err[target.Target, str](tr)) { ret 1; }
-    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+    val register_all_r: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel register_all_r.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] = target.select(?reg, "x86_64", "linux", "sysv64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
 
-    val root_r: R.Result[str, str] = ut_temp_dir(?alloc);
-    if (R.is_err[str, str](root_r)) { ret 1; }
-    val root: str = R.unwrap_ok[str, str](root_r);
-    val real_r: R.Result[str, str] = path.join(?alloc, root, "libreal.a");
-    val fake_r: R.Result[str, str] = path.join(?alloc, root, "libfake.a");
-    if (R.is_err[str, str](real_r) || R.is_err[str, str](fake_r)) {
-        fs.remove_all(?alloc, root); ret 1;
+    val root_r: res[str, outcome.Fail] = ut_temp_dir(?alloc);
+    if (sel root_r.err) { ret 1; }
+    val root:   str               = root_r.ok;
+    val real_r: res[str, A.Error] = path.join(?alloc, root, "libreal.a");
+    val fake_r: res[str, A.Error] = path.join(?alloc, root, "libfake.a");
+    if (sel real_r.err) {
+        fs.remove_all(?alloc, root);
+        ret 1;
     }
-    val real: str = R.unwrap_ok[str, str](real_r);
-    val fake: str = R.unwrap_ok[str, str](fake_r);
-    if (O.is_some[str](fs.write_bytes(real, "!<arch>\n", 8, 420))
-        || O.is_some[str](fs.write_bytes(fake, "not an archive at all!!", 23, 420))) {
-        fs.remove_all(?alloc, root); ret 1;
+    if (sel fake_r.err) {
+        fs.remove_all(?alloc, root);
+        ret 1;
+    }
+    val real:           str             = real_r.ok;
+    val fake:           str             = fake_r.ok;
+    val write_bytes_r2: err[fs.FsError] = fs.write_bytes(real, "!<arch>\n", 8, 420);
+    val write_bytes_r:  err[fs.FsError] = fs.write_bytes(fake, "not an archive at all!!", 23, 420);
+    if (sel write_bytes_r2.err) {
+        fs.remove_all(?alloc, root);
+        ret 1;
+    }
+    if (sel write_bytes_r.err) {
+        fs.remove_all(?alloc, root);
+        ret 1;
     }
 
-    var dirs: Vector[str] = vector.init[str](?alloc);
-    val real_rr: R.Result[LinkInput, outcome.Fail] =
-        resolve_token(?alloc, ?tgt, ?dirs, "", real::*u8);
-    val fake_rr: R.Result[LinkInput, outcome.Fail] =
-        resolve_token(?alloc, ?tgt, ?dirs, "", fake::*u8);
+    var dirs:    Vector[str]                  = vector.init[str](?alloc);
+    val real_rr: res[LinkInput, outcome.Fail] = resolve_token(?alloc, ?tgt, ?dirs, "", real::*u8);
+    val fake_rr: res[LinkInput, outcome.Fail] = resolve_token(?alloc, ?tgt, ?dirs, "", fake::*u8);
     fs.remove_all(?alloc, root);
-    if (R.is_err[LinkInput, outcome.Fail](real_rr)) { ret 1; }
-    if (R.is_ok[LinkInput, outcome.Fail](fake_rr)) { ret 1; }
+    if (sel real_rr.err) { ret 1; }
+    if (sel fake_rr.ok)  { ret 1; }
     ret 0;
 }
 
 test "mach.lang.build.plan.resolve_token:truncated_object_refused_not_oob" {
-    var alloc: A.Allocator;
-    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
     var reg: target.TargetRegistry = target.registry_init();
     fin { target.registry_dnit(?reg); }
-    if (R.is_err[R.Void, str](target.register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
-    val tr: R.Result[target.Target, str] = target.select(?reg, "x86_64", "linux", "sysv64");
-    if (R.is_err[target.Target, str](tr)) { ret 1; }
-    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+    val register_all_r: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel register_all_r.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] = target.select(?reg, "x86_64", "linux", "sysv64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
 
-    val root_r: R.Result[str, str] = ut_temp_dir(?alloc);
-    if (R.is_err[str, str](root_r)) { ret 1; }
-    val root: str = R.unwrap_ok[str, str](root_r);
-    val obj_r: R.Result[str, str] = path.join(?alloc, root, "short.o");
-    if (R.is_err[str, str](obj_r)) { fs.remove_all(?alloc, root); ret 1; }
-    val obj: str = R.unwrap_ok[str, str](obj_r);
+    val root_r: res[str, outcome.Fail] = ut_temp_dir(?alloc);
+    if (sel root_r.err) { ret 1; }
+    val root:  str               = root_r.ok;
+    val obj_r: res[str, A.Error] = path.join(?alloc, root, "short.o");
+    if (sel obj_r.err) {
+        fs.remove_all(?alloc, root);
+        ret 1;
+    }
+    val obj: str   = obj_r.ok;
     var buf: [19]u8;
-    var i: usize = 0;
-    for (i < 19) { buf[i] = 0; i = i + 1; }
-    buf[0] = 0x7F; buf[1] = 0x45; buf[2] = 0x4C; buf[3] = 0x46;
-    if (O.is_some[str](fs.write_bytes(obj, ?buf[0], 19, 420))) {
-        fs.remove_all(?alloc, root); ret 1;
+    var i:   usize = 0;
+    for (i < 19) {
+        buf[i] = 0;
+        i      = i + 1;
+    }
+    buf[0] = 0x7F;
+    buf[1] = 0x45;
+    buf[2] = 0x4C;
+    buf[3] = 0x46;
+    val write_bytes_r: err[fs.FsError] = fs.write_bytes(obj, ?buf[0], 19, 420);
+    if (sel write_bytes_r.err) {
+        fs.remove_all(?alloc, root);
+        ret 1;
     }
 
-    var dirs: Vector[str] = vector.init[str](?alloc);
-    val rr: R.Result[LinkInput, outcome.Fail] =
-        resolve_token(?alloc, ?tgt, ?dirs, "", obj::*u8);
+    var dirs: Vector[str]                  = vector.init[str](?alloc);
+    val rr:   res[LinkInput, outcome.Fail] = resolve_token(?alloc, ?tgt, ?dirs, "", obj::*u8);
     fs.remove_all(?alloc, root);
-    if (R.is_ok[LinkInput, outcome.Fail](rr)) { ret 1; }
+    if (sel rr.ok) { ret 1; }
     ret 0;
 }
 
 test "mach.lang.build.plan.object_matches_target:declared_length_governs_the_machine_read" {
     var reg: target.TargetRegistry = target.registry_init();
     fin { target.registry_dnit(?reg); }
-    if (R.is_err[R.Void, str](target.register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
-    val tr: R.Result[target.Target, str] = target.select(?reg, "x86_64", "linux", "sysv64");
-    if (R.is_err[target.Target, str](tr)) { ret 1; }
-    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+    val register_all_r: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel register_all_r.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] = target.select(?reg, "x86_64", "linux", "sysv64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
 
     var buf: [20]u8;
-    var i: usize = 0;
-    for (i < 20) { buf[i] = 0; i = i + 1; }
-    buf[0] = 0x7F; buf[1] = 0x45; buf[2] = 0x4C; buf[3] = 0x46;
+    var i:   usize = 0;
+    for (i < 20) {
+        buf[i] = 0;
+        i      = i + 1;
+    }
+    buf[0] = 0x7F;
+    buf[1] = 0x45;
+    buf[2] = 0x4C;
+    buf[3] = 0x46;
     bin.write_u16_le(?buf[0], 18, elf.machine_for_arch(isa.ARCH_X86_64));
 
-    if (object_matches_target(?buf[0], 19, ?tgt)) { ret 1; }
+    if (object_matches_target(?buf[0], 19, ?tgt))  { ret 1; }
     if (!object_matches_target(?buf[0], 20, ?tgt)) { ret 1; }
     ret 0;
 }
 
 test "mach.lang.build.plan.extract_fat_dylib_id:selects_target_slice" {
     var buf: [320]u8;
-    var i: usize = 0;
-    for (i < 320) { buf[i] = 0; i = i + 1; }
+    var i:   usize = 0;
+    for (i < 320) {
+        buf[i] = 0;
+        i      = i + 1;
+    }
     bin.write_u32_be(?buf[0], 0, 0xCAFEBABE);
     bin.write_u32_be(?buf[0], 4, 2);
 
@@ -1983,58 +2407,69 @@ test "mach.lang.build.plan.extract_fat_dylib_id:selects_target_slice" {
 }
 
 test "mach.lang.build.plan.dylib_rpath:matches_install_name_suffix" {
-    var alloc: A.Allocator;
-    if (O.is_some[str](page.make(?alloc))) { ret 1; }
-    val base: R.Result[str, str] =
-        dylib_rpath(?alloc, "/opt/lib/libfoo.dylib"::*u8,
-                    "@rpath/libfoo.3.dylib"::*u8);
-    val nested: R.Result[str, str] =
-        dylib_rpath(?alloc, "/opt/lib/sub/libfoo.dylib"::*u8,
-                    "@rpath/sub/libfoo.dylib"::*u8);
-    val mismatch: R.Result[str, str] =
-        dylib_rpath(?alloc, "/opt/lib/libfoo.dylib"::*u8,
-                    "@rpath/sub/libfoo.dylib"::*u8);
-    if (R.is_err[str, str](base) || R.is_err[str, str](nested)
-        || R.is_ok[str, str](mismatch)) { ret 1; }
-    if (!str_equals(R.unwrap_ok[str, str](base), "/opt/lib")
-        || !str_equals(R.unwrap_ok[str, str](nested), "/opt/lib")) { ret 1; }
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val base: res[str, outcome.Fail] = dylib_rpath(?alloc, "/opt/lib/libfoo.dylib"::*u8,
+        "@rpath/libfoo.3.dylib"::*u8);
+    val nested: res[str, outcome.Fail] = dylib_rpath(?alloc, "/opt/lib/sub/libfoo.dylib"::*u8,
+        "@rpath/sub/libfoo.dylib"::*u8);
+    val mismatch: res[str, outcome.Fail] = dylib_rpath(?alloc, "/opt/lib/libfoo.dylib"::*u8,
+        "@rpath/sub/libfoo.dylib"::*u8);
+    if (sel base.err)    { ret 1; }
+    if (sel nested.err)  { ret 1; }
+    if (sel mismatch.ok) { ret 1; }
+    if (!str_equals(base.ok, "/opt/lib")
+        || !str_equals(nested.ok, "/opt/lib")) { ret 1; }
+    val native: res[str, outcome.Fail] = dylib_rpath(?alloc, "sub\\libfoo.dylib"::*u8, "@rpath/sub/libfoo.dylib"::*u8);
+    $if ($mach.build.os == $mach.os.windows) {
+        if (sel native.err) { ret 6; }
+    }
+    $or {
+        if (sel native.ok) { ret 7; }
+    }
     ret 0;
 }
 
 test "mach.lang.build.plan.resolve_requirement:darwin_framework" {
-    var alloc: A.Allocator;
-    if (O.is_some[str](page.make(?alloc))) { ret 1; }
-    var itn: intern.Interner = intern.init(?alloc);
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var itn: intern.Interner       = intern.init(?alloc);
     var reg: target.TargetRegistry = target.registry_init();
     fin { target.registry_dnit(?reg); }
-    if (R.is_err[R.Void, str](target.register_all(?reg, target_testing.debug_descriptor))) { ret 1; }
-    val xr: R.Result[target.Target, str] = target.select(?reg, "x86_64", "darwin", "sysv64");
-    val ar: R.Result[target.Target, str] = target.select(?reg, "aarch64", "darwin", "aapcs64");
-    val lr: R.Result[target.Target, str] = target.select(?reg, "x86_64", "linux", "sysv64");
-    if (R.is_err[target.Target, str](xr) || R.is_err[target.Target, str](ar)
-        || R.is_err[target.Target, str](lr)) { ret 1; }
-    var xt: target.Target = R.unwrap_ok[target.Target, str](xr);
-    var at: target.Target = R.unwrap_ok[target.Target, str](ar);
-    var lt: target.Target = R.unwrap_ok[target.Target, str](lr);
+    val register_all_r: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel register_all_r.err) { ret 1; }
+    val xr: res[target.Target, fail.Fail] = target.select(?reg, "x86_64", "darwin", "sysv64");
+    val ar: res[target.Target, fail.Fail] = target.select(?reg, "aarch64", "darwin", "aapcs64");
+    val lr: res[target.Target, fail.Fail] = target.select(?reg, "x86_64", "linux", "sysv64");
+    if (sel xr.err) { ret 1; }
+    if (sel ar.err) { ret 1; }
+    if (sel lr.err) { ret 1; }
+    var xt: target.Target = xr.ok;
+    var at: target.Target = ar.ok;
+    var lt: target.Target = lr.ok;
 
     var req: manifest.LinkRequirement;
     req.source = manifest.LINK_FRAMEWORK;
-    req.text = R.unwrap_ok[intern.StrId, str](intern.intern(?itn, "AppKit"));
-    req.library = R.unwrap_ok[intern.StrId, str](intern.intern(?itn, "appkit"));
+    val intern_r: res[intern.StrId, A.Error] = intern.intern(?itn, "AppKit");
+    if (sel intern_r.err) { ret 99; }
+    req.text = intern_r.ok;
+    val intern_r2: res[intern.StrId, A.Error] = intern.intern(?itn, "appkit");
+    if (sel intern_r2.err) { ret 99; }
+    req.library = intern_r2.ok;
     var dirs: Vector[str] = vector.init[str](?alloc);
 
-    val x: R.Result[LinkInput, outcome.Fail] =
-        resolve_requirement(?alloc, ?itn, ?xt, ?dirs, "", ?req);
-    val a: R.Result[LinkInput, outcome.Fail] =
-        resolve_requirement(?alloc, ?itn, ?at, ?dirs, "", ?req);
-    val l: R.Result[LinkInput, outcome.Fail] =
-        resolve_requirement(?alloc, ?itn, ?lt, ?dirs, "", ?req);
-    if (R.is_err[LinkInput, outcome.Fail](x) || R.is_err[LinkInput, outcome.Fail](a)
-        || R.is_ok[LinkInput, outcome.Fail](l)) { ret 1; }
-    val want: str = "/System/Library/Frameworks/AppKit.framework/AppKit";
-    val xi: LinkInput = R.unwrap_ok[LinkInput, outcome.Fail](x);
-    val ai: LinkInput = R.unwrap_ok[LinkInput, outcome.Fail](a);
-    if (!str_equals(xi.text, want) || !str_equals(ai.text, want)) { ret 1; }
+    val x: res[LinkInput, outcome.Fail] = resolve_requirement(?alloc, ?itn, ?xt, ?dirs, "", ?req);
+    val a: res[LinkInput, outcome.Fail] = resolve_requirement(?alloc, ?itn, ?at, ?dirs, "", ?req);
+    val l: res[LinkInput, outcome.Fail] = resolve_requirement(?alloc, ?itn, ?lt, ?dirs, "", ?req);
+    if (sel x.err) { ret 1; }
+    if (sel a.err) { ret 1; }
+    if (sel l.ok)  { ret 1; }
+    val want: str       = "/System/Library/Frameworks/AppKit.framework/AppKit";
+    val xi:   LinkInput = x.ok;
+    val ai:   LinkInput = a.ok;
+    if (!str_equals(xi.text, want) || !str_equals(ai.text, want))               { ret 1; }
     if (!str_equals(xi.library, "appkit") || !str_equals(ai.library, "appkit")) { ret 1; }
     ret 0;
 }
@@ -2050,32 +2485,85 @@ test "mach.lang.build.plan.plan:matrix_expands_targets_outer_artifacts_inner" {
     rq.project_root = "/r";
     rq.all_targets  = true;
 
-    val pr: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (R.is_err[BuildPlan, outcome.Fail](pr)) { ret 1; }
-    val bp: BuildPlan = R.unwrap_ok[BuildPlan, outcome.Fail](pr);
+    val pr: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pr.err) { ret 1; }
+    val bp: BuildPlan = pr.ok;
 
-    if (bp.units.len != 4)                                        { ret 1; }
-    if (!str_equals(bp.units.data[0].sel_target, "ta"))           { ret 1; }
-    if (!str_equals(bp.units.data[0].sel_artifact, "appa"))       { ret 1; }
-    if (!str_equals(bp.units.data[1].sel_target, "ta"))           { ret 1; }
-    if (!str_equals(bp.units.data[1].sel_artifact, "libb"))       { ret 1; }
-    if (!str_equals(bp.units.data[2].sel_target, "tb"))           { ret 1; }
-    if (!str_equals(bp.units.data[2].sel_artifact, "appa"))       { ret 1; }
-    if (!str_equals(bp.units.data[3].sel_artifact, "libb"))       { ret 1; }
+    if (bp.units.len != 4)                                  { ret 1; }
+    if (!str_equals(bp.units.data[0].sel_target, "ta"))     { ret 1; }
+    if (!str_equals(bp.units.data[0].sel_artifact, "appa")) { ret 1; }
+    if (!str_equals(bp.units.data[1].sel_target, "ta"))     { ret 1; }
+    if (!str_equals(bp.units.data[1].sel_artifact, "libb")) { ret 1; }
+    if (!str_equals(bp.units.data[2].sel_target, "tb"))     { ret 1; }
+    if (!str_equals(bp.units.data[2].sel_artifact, "appa")) { ret 1; }
+    if (!str_equals(bp.units.data[3].sel_artifact, "libb")) { ret 1; }
 
     if (!ut_path_eq(bp.units.data[0].out_path, "/r/out/ta/debug/bin/appa"))   { ret 1; }
     if (!ut_path_eq(bp.units.data[0].obj_dir, "/r/out/ta/debug/obj"))         { ret 1; }
     if (!ut_path_eq(bp.units.data[1].out_path, "/r/out/ta/debug/lib/libb.a")) { ret 1; }
     if (!ut_path_eq(bp.units.data[2].out_path, "/r/out/tb/debug/bin/appa"))   { ret 1; }
 
-    if (bp.units.data[0].target_entry.mode != project.MODE_EXECUTABLE) { ret 1; }
-    if (bp.units.data[1].target_entry.mode != project.MODE_LIBRARY)    { ret 1; }
+    if (bp.units.data[0].target_entry.mode != project.MODE_EXECUTABLE)     { ret 1; }
+    if (bp.units.data[1].target_entry.mode != project.MODE_LIBRARY)        { ret 1; }
     if (bp.units.data[1].target_entry.lib_kind != manifest.LIBKIND_STATIC) { ret 1; }
     ret 0;
 }
 
 fun ut_split_src() str {
-    ret "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.host]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[target.kern]\nisa = \"x86_64\"\nos = \"freestanding\"\nabi = \"sysv64\"\n[target.other]\nisa = \"aarch64\"\nos = \"linux\"\nabi = \"aapcs64\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n[artifact.tool]\nkind = \"bin\"\nentry = \"tool.mach\"\nout = \"bin/tool\"\ntargets = [\"host\"]\nlink = []\nneed = []\n[artifact.kernel]\nkind = \"bin\"\nentry = \"kernel.mach\"\nout = \"bin/kernel\"\ntargets = [\"kern\"]\nlink = []\nneed = []\n";
+    ret "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.host]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[target.kern]\nisa = \"x86_64\"\nos = \"freestanding\"\nabi = \"sysv64\"\n[target.other]\nisa = \"aarch64\"\nos = \"linux\"\nabi = \"aapcs64\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n[artifact.tool]\nkind = \"bin\"\nentry = \"tool.mach\"\nout = \"bin/tool\"\ntargets = [\"host\"]\nlink = []\nneed = []\n[artifact.kernel]\nkind = \"bin\"\nentry = \"kernel.mach\"\nout = \"bin/kernel\"\ntargets = [\"kern\"]\nlink = []\nneed = []\n";
+}
+
+fun ut_subsystem_src(key: str) str {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val head: str                          = "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.lin]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[target.win]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n[artifact.app]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
+    val r:    res[str, format.FormatError] = format.sprint(?alloc, "{}{}", head, key);
+    if (sel r.err) { ret head; }
+    ret r.ok;
+}
+
+# a declared subsystem is a capability only the PE format honors: on an ELF
+# unit the manifest key and the flag are each refused by name and location,
+# an omitted key stays the inert console default, and the PE unit still reads it
+test "mach.lang.build.plan.plan:a_declared_subsystem_on_a_format_without_one_is_unsupported_by_name" {
+    var alloc: A.Allocator;
+    var itn:   intern.Interner;
+    var reg:   target.TargetRegistry;
+    var m:     manifest.Manifest;
+    if (!ut_scaffold_src(?alloc, ?itn, ?reg, ?m, ut_subsystem_src("subsystem = \"gui\"\n"))) { ret 1; }
+
+    var rq: request.BuildRequest = request.defaults();
+    rq.project_root = "/r";
+    rq.target       = "lin";
+    val refused: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel refused.ok) { ret 2; }
+    val why: str = outcome.describe(refused.err);
+    if (!str_contains(why, "mach.toml: artifact.app.subsystem: Subsystem gui is unsupported by elf")) { ret 3; }
+    if (!str_contains(why, "target 'lin'"))                                                           { ret 4; }
+    if (!outcome.is_user(refused.err))                                                                { ret 5; }
+
+    rq.target = "win";
+    val honored: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel honored.err)                                                                     { ret 6; }
+    if (honored.ok.units.len != 1 || honored.ok.units.data[0].subsystem != of.SUBSYSTEM_GUI) { ret 7; }
+
+    var m2:     manifest.Manifest;
+    var itn2:   intern.Interner;
+    var reg2:   target.TargetRegistry;
+    var alloc2: A.Allocator;
+    if (!ut_scaffold_src(?alloc2, ?itn2, ?reg2, ?m2, ut_subsystem_src(""))) { ret 8; }
+    var rq2: request.BuildRequest = request.defaults();
+    rq2.project_root = "/r";
+    rq2.target       = "lin";
+    val inert: res[BuildPlan, outcome.Fail] = plan(?alloc2, ?itn2, ?reg2, ?m2, rq2);
+    if (sel inert.err)                                            { ret 9; }
+    if (inert.ok.units.data[0].subsystem != of.SUBSYSTEM_CONSOLE) { ret 10; }
+
+    rq2.subsystem_flag = request.SUBSYSTEM_FLAG_CONSOLE;
+    val flagged: res[BuildPlan, outcome.Fail] = plan(?alloc2, ?itn2, ?reg2, ?m2, rq2);
+    if (sel flagged.ok)                                                                                       { ret 11; }
+    if (!str_contains(outcome.describe(flagged.err), "--subsystem: Subsystem console is unsupported by elf")) { ret 12; }
+    ret 0;
 }
 
 test "mach.lang.build.plan.plan:artifacts_expand_filtered_by_target" {
@@ -2089,18 +2577,18 @@ test "mach.lang.build.plan.plan:artifacts_expand_filtered_by_target" {
     rq.project_root = "/r";
     rq.target       = "host";
 
-    val pr: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (R.is_err[BuildPlan, outcome.Fail](pr)) { ret 1; }
-    val bp: BuildPlan = R.unwrap_ok[BuildPlan, outcome.Fail](pr);
+    val pr: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pr.err) { ret 1; }
+    val bp: BuildPlan = pr.ok;
 
-    if (bp.units.len != 1)                                  { ret 1; }
-    if (!str_equals(bp.units.data[0].sel_artifact, "tool")) { ret 1; }
+    if (bp.units.len != 1)                                                    { ret 1; }
+    if (!str_equals(bp.units.data[0].sel_artifact, "tool"))                   { ret 1; }
     if (!ut_path_eq(bp.units.data[0].out_path, "/r/out/host/debug/bin/tool")) { ret 1; }
     ret 0;
 }
 
 fun ut_need_src() str {
-    ret "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.ta]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[target.tb]\nisa = \"aarch64\"\nos = \"linux\"\nabi = \"aapcs64\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n[artifact.shader-a]\nkind = \"static\"\nentry = \"s.mach\"\nout = \"lib/shader-a.a\"\ntargets = [\"tb\"]\nlink = []\nneed = []\n[artifact.shader-b]\nkind = \"static\"\nentry = \"s.mach\"\nout = \"lib/shader-b.a\"\ntargets = [\"tb\"]\nlink = []\nneed = []\n[artifact.app]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app\"\ntargets = [\"ta\"]\nlink = []\nneed = [\"shader-*\"]\n[artifact.app2]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app2\"\ntargets = [\"ta\"]\nlink = []\nneed = [\"shader-a\"]\n";
+    ret "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.ta]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[target.tb]\nisa = \"aarch64\"\nos = \"linux\"\nabi = \"aapcs64\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n[artifact.shader-a]\nkind = \"static\"\nentry = \"s.mach\"\nout = \"lib/shader-a.a\"\ntargets = [\"tb\"]\nlink = []\nneed = []\n[artifact.shader-b]\nkind = \"static\"\nentry = \"s.mach\"\nout = \"lib/shader-b.a\"\ntargets = [\"tb\"]\nlink = []\nneed = []\n[artifact.app]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app\"\ntargets = [\"ta\"]\nlink = []\nneed = [\"artifact.shader-*\"]\n[artifact.app2]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app2\"\ntargets = [\"ta\"]\nlink = []\nneed = [\"artifact.shader-a\"]\n";
 }
 
 test "mach.lang.build.plan.plan:required_artifacts_precede_their_consumer_on_their_own_target" {
@@ -2115,29 +2603,29 @@ test "mach.lang.build.plan.plan:required_artifacts_precede_their_consumer_on_the
     rq.target       = "ta";
     rq.artifact     = "app";
 
-    val pr: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (R.is_err[BuildPlan, outcome.Fail](pr)) { ret 1; }
-    val bp: BuildPlan = R.unwrap_ok[BuildPlan, outcome.Fail](pr);
+    val pr: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pr.err) { ret 1; }
+    val bp: BuildPlan = pr.ok;
 
-    if (bp.units.len != 3)                                    { ret 1; }
+    if (bp.units.len != 3)                                      { ret 1; }
     if (!str_equals(bp.units.data[0].sel_artifact, "shader-a")) { ret 1; }
     if (!str_equals(bp.units.data[1].sel_artifact, "shader-b")) { ret 1; }
     if (!str_equals(bp.units.data[2].sel_artifact, "app"))      { ret 1; }
 
-    if (!str_equals(bp.units.data[0].sel_target, "tb"))       { ret 1; }
-    if (!str_equals(bp.units.data[1].sel_target, "tb"))       { ret 1; }
-    if (!str_equals(bp.units.data[2].sel_target, "ta"))       { ret 1; }
+    if (!str_equals(bp.units.data[0].sel_target, "tb")) { ret 1; }
+    if (!str_equals(bp.units.data[1].sel_target, "tb")) { ret 1; }
+    if (!str_equals(bp.units.data[2].sel_target, "ta")) { ret 1; }
 
-    if (!bp.units.data[0].is_required)                        { ret 1; }
-    if (!bp.units.data[1].is_required)                        { ret 1; }
-    if (bp.units.data[2].is_required)                         { ret 1; }
+    if (!bp.units.data[0].is_required) { ret 1; }
+    if (!bp.units.data[1].is_required) { ret 1; }
+    if (bp.units.data[2].is_required)  { ret 1; }
 
     if (!ut_path_eq(bp.units.data[0].out_path, "/r/out/tb/debug/lib/shader-a.a")) { ret 1; }
     if (!ut_path_eq(bp.units.data[2].out_path, "/r/out/ta/debug/bin/app"))        { ret 1; }
 
-    if (bp.units.data[2].requires.len != 2)                   { ret 1; }
+    if (bp.units.data[2].requires.len != 2)                         { ret 1; }
     if (!str_equals(bp.units.data[2].requires.data[0], "shader-a")) { ret 1; }
-    if (bp.units.data[0].requires.len != 0)                   { ret 1; }
+    if (bp.units.data[0].requires.len != 0)                         { ret 1; }
     ret 0;
 }
 
@@ -2154,27 +2642,28 @@ test "mach.lang.build.plan.plan:a_test_build_builds_its_requirements_as_ordinary
     rq.artifact     = "app";
     rq.goal         = request.GOAL_TESTS;
 
-    val pr: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (R.is_err[BuildPlan, outcome.Fail](pr)) { ret 1; }
-    val bp: BuildPlan = R.unwrap_ok[BuildPlan, outcome.Fail](pr);
+    val pr: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pr.err) { ret 1; }
+    val bp: BuildPlan = pr.ok;
 
-    if (bp.units.len != 3)                                      { ret 1; }
-    if (!str_equals(bp.units.data[0].sel_artifact, "shader-a")) { ret 1; }
-    if (bp.units.data[0].goal != request.GOAL_EXECUTE)          { ret 1; }
-    if (bp.units.data[1].goal != request.GOAL_EXECUTE)          { ret 1; }
-    if (bp.units.data[2].goal != request.GOAL_TESTS)            { ret 1; }
+    if (bp.units.len != 3)                                                        { ret 1; }
+    if (!str_equals(bp.units.data[0].sel_artifact, "shader-a"))                   { ret 1; }
+    if (bp.units.data[0].goal != request.GOAL_EXECUTE)                            { ret 1; }
+    if (bp.units.data[1].goal != request.GOAL_EXECUTE)                            { ret 1; }
+    if (bp.units.data[2].goal != request.GOAL_TESTS)                              { ret 1; }
     if (!ut_path_eq(bp.units.data[0].out_path, "/r/out/tb/debug/lib/shader-a.a")) { ret 1; }
     ret 0;
 }
 
 fun ut_two_bins_src(defaults: str) str {
     var backing: A.Allocator;
-    if (O.is_some[str](page.make(?backing))) { ret ""; }
-    val head: str = "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.ta]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n[artifact.first]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/first\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
-    val second: str = "[artifact.second]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/second\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
-    val r: R.Result[str, str] = format.sprint(?backing, "{}{}{}{}", head, defaults, second, defaults);
-    if (R.is_err[str, str](r)) { ret ""; }
-    ret R.unwrap_ok[str, str](r);
+    val make_r:  err[A.Error] = page.make(?backing);
+    if (sel make_r.err) { ret ""; }
+    val head:   str                          = "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.ta]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n[artifact.first]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/first\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
+    val second: str                          = "[artifact.second]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/second\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
+    val r:      res[str, format.FormatError] = format.sprint(?backing, "{}{}{}{}", head, defaults, second, defaults);
+    if (sel r.err) { ret ""; }
+    ret r.ok;
 }
 
 test "mach.lang.build.plan.plan:a_test_goal_selection_error_fails_at_planning_with_the_selector_message_and_plans_nothing" {
@@ -2189,15 +2678,16 @@ test "mach.lang.build.plan.plan:a_test_goal_selection_error_fails_at_planning_wi
     rq.target       = "ta";
     rq.goal         = request.GOAL_TESTS;
 
-    val pr: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (R.is_ok[BuildPlan, outcome.Fail](pr)) { ret 1; }
-    val f: outcome.Fail = R.unwrap_err[BuildPlan, outcome.Fail](pr);
-    if (f.kind != outcome.FAIL_USER) { ret 2; }
-    if (!str_contains(f.message, "have 'default = true'; exactly one is allowed")) { ret 3; }
+    val pr: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pr.ok) { ret 1; }
+    val f: outcome.Fail = pr.err;
+    if (!sel f.user)                                                                         { ret 2; }
+    if (!str_contains(outcome.describe(f), "have 'default = true'; exactly one is allowed")) { ret 3; }
     ret 0;
 }
 
-test "mach.lang.build.plan.plan:a_test_goal_without_a_default_takes_the_first_declared_artifact_and_says_so_in_the_request" {
+# intentional removal test (#3226, #3112): the first-declared fallback is gone
+test "mach.lang.build.plan.plan:a_test_goal_without_a_default_among_several_artifacts_is_refused_naming_the_default_key" {
     var alloc: A.Allocator;
     var itn:   intern.Interner;
     var reg:   target.TargetRegistry;
@@ -2209,12 +2699,18 @@ test "mach.lang.build.plan.plan:a_test_goal_without_a_default_takes_the_first_de
     rq.target       = "ta";
     rq.goal         = request.GOAL_TESTS;
 
-    val pr: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (R.is_err[BuildPlan, outcome.Fail](pr)) { ret 1; }
-    val bp: BuildPlan = R.unwrap_ok[BuildPlan, outcome.Fail](pr);
-    if (bp.units.len != 1) { ret 2; }
-    if (!str_equals(bp.request.artifact, "first") || !bp.request.artifact_by_table_order) { ret 3; }
-    if (!str_equals(bp.units.data[0].sel_artifact, "first")) { ret 4; }
+    val pr: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pr.ok) { ret 1; }
+    val f: outcome.Fail = pr.err;
+    if (!sel f.user)                                                                                                             { ret 2; }
+    if (!str_contains(outcome.describe(f), "several artifacts support the selected target and none is marked `default = true`")) { ret 3; }
+    if (!str_contains(outcome.describe(f), "--bin/--lib"))                                                                       { ret 4; }
+
+    # naming the artifact selects it
+    rq.artifact = "second";
+    val er: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel er.err)                                              { ret 5; }
+    if (!str_equals(er.ok.units.data[0].sel_artifact, "second")) { ret 6; }
     ret 0;
 }
 
@@ -2229,13 +2725,13 @@ test "mach.lang.build.plan.plan:a_required_artifact_is_planned_once_for_every_co
     rq.project_root = "/r";
     rq.all_targets  = true;
 
-    val pr: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (R.is_err[BuildPlan, outcome.Fail](pr)) { ret 1; }
-    val bp: BuildPlan = R.unwrap_ok[BuildPlan, outcome.Fail](pr);
+    val pr: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pr.err) { ret 1; }
+    val bp: BuildPlan = pr.ok;
 
     if (bp.units.len != 4) { ret 1; }
-    var shader_a: u32 = 0;
-    var i: usize = 0;
+    var shader_a: u32   = 0;
+    var i:        usize = 0;
     for (i < bp.units.len) {
         if (str_equals(bp.units.data[i].sel_artifact, "shader-a")) { shader_a = shader_a + 1; }
         i = i + 1;
@@ -2260,15 +2756,15 @@ test "mach.lang.build.plan.plan:all_targets_keeps_declared_cells" {
     rq.project_root = "/r";
     rq.all_targets  = true;
 
-    val pr: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (R.is_err[BuildPlan, outcome.Fail](pr)) { ret 1; }
-    val bp: BuildPlan = R.unwrap_ok[BuildPlan, outcome.Fail](pr);
+    val pr: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pr.err) { ret 1; }
+    val bp: BuildPlan = pr.ok;
 
-    if (bp.units.len != 2)                                    { ret 1; }
-    if (!str_equals(bp.units.data[0].sel_target, "host"))     { ret 1; }
-    if (!str_equals(bp.units.data[0].sel_artifact, "tool"))   { ret 1; }
-    if (!str_equals(bp.units.data[1].sel_target, "kern"))     { ret 1; }
-    if (!str_equals(bp.units.data[1].sel_artifact, "kernel")) { ret 1; }
+    if (bp.units.len != 2)                                                      { ret 1; }
+    if (!str_equals(bp.units.data[0].sel_target, "host"))                       { ret 1; }
+    if (!str_equals(bp.units.data[0].sel_artifact, "tool"))                     { ret 1; }
+    if (!str_equals(bp.units.data[1].sel_target, "kern"))                       { ret 1; }
+    if (!str_equals(bp.units.data[1].sel_artifact, "kernel"))                   { ret 1; }
     if (!ut_path_eq(bp.units.data[1].out_path, "/r/out/kern/debug/bin/kernel")) { ret 1; }
     ret 0;
 }
@@ -2285,16 +2781,16 @@ test "mach.lang.build.plan.plan:explicit_selection_errors_enumerated_filters" {
     rq.artifact     = "kernel";
     rq.target       = "host";
 
-    val pr: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (!R.is_err[BuildPlan, outcome.Fail](pr)) { ret 1; }
-    var f: outcome.Fail = R.unwrap_err[BuildPlan, outcome.Fail](pr);
-    if (!str_contains(f.message, "artifact 'kernel' does not support target 'host'")) { ret 1; }
+    val pr: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pr.ok) { ret 1; }
+    var f: outcome.Fail = pr.err;
+    if (!str_contains(outcome.describe(f), "artifact 'kernel' does not support target 'host'")) { ret 1; }
 
     rq.target      = "";
     rq.all_targets = true;
-    val pa: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (R.is_err[BuildPlan, outcome.Fail](pa)) { ret 1; }
-    val bp: BuildPlan = R.unwrap_ok[BuildPlan, outcome.Fail](pa);
+    val pa: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pa.err) { ret 1; }
+    val bp: BuildPlan = pa.ok;
     if (bp.units.len != 1)                                { ret 1; }
     if (!str_equals(bp.units.data[0].sel_target, "kern")) { ret 1; }
     ret 0;
@@ -2311,11 +2807,11 @@ test "mach.lang.build.plan.plan:no_declared_cell_names_the_target" {
     rq.project_root = "/r";
     rq.target       = "other";
 
-    val pr: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (!R.is_err[BuildPlan, outcome.Fail](pr)) { ret 1; }
-    var f: outcome.Fail = R.unwrap_err[BuildPlan, outcome.Fail](pr);
-    if (!str_contains(f.message, "no artifact declares target 'other'")) { ret 1; }
-    if (!str_contains(f.message, "tool"))                                { ret 1; }
+    val pr: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pr.ok) { ret 1; }
+    var f: outcome.Fail = pr.err;
+    if (!str_contains(outcome.describe(f), "no artifact declares target 'other'")) { ret 1; }
+    if (!str_contains(outcome.describe(f), "tool"))                                { ret 1; }
     ret 0;
 }
 
@@ -2328,18 +2824,19 @@ test "mach.lang.build.plan.plan:out_override_requires_a_single_unit" {
 
     var rq: request.BuildRequest = request.defaults();
     rq.project_root = "/r";
+    rq.target       = "ta";
     rq.out          = "bin/custom";
 
-    val pr: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (!R.is_err[BuildPlan, outcome.Fail](pr)) { ret 1; }
-    var f: outcome.Fail = R.unwrap_err[BuildPlan, outcome.Fail](pr);
-    if (!str_contains(f.message, "-o names a single output")) { ret 1; }
+    val pr: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pr.ok) { ret 1; }
+    var f: outcome.Fail = pr.err;
+    if (!str_contains(outcome.describe(f), "-o names a single output")) { ret 1; }
 
     rq.artifact = "appa";
-    val pa: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (R.is_err[BuildPlan, outcome.Fail](pa)) { ret 1; }
-    val bp: BuildPlan = R.unwrap_ok[BuildPlan, outcome.Fail](pa);
-    if (bp.units.len != 1)                                  { ret 1; }
+    val pa: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pa.err) { ret 1; }
+    val bp: BuildPlan = pa.ok;
+    if (bp.units.len != 1)                                       { ret 1; }
     if (!ut_path_eq(bp.units.data[0].out_path, "/r/bin/custom")) { ret 1; }
     ret 0;
 }
@@ -2356,41 +2853,53 @@ test "mach.lang.build.plan.plan:phases_follow_goal" {
     rq.target       = "ta";
     rq.artifact     = "appa";
 
-    val pr: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (R.is_err[BuildPlan, outcome.Fail](pr)) { ret 1; }
-    val u0: *BuildUnit = ?R.unwrap_ok[BuildPlan, outcome.Fail](pr).units.data[0];
-    if (u0.phases.len != 6)                 { ret 1; }
-    if (u0.phases.data[0] != PH_LOAD)       { ret 1; }
-    if (u0.phases.data[1] != PH_SEMA)       { ret 1; }
-    if (u0.phases.data[2] != PH_LOWER)      { ret 1; }
-    if (u0.phases.data[3] != PH_CODEGEN)    { ret 1; }
-    if (u0.phases.data[4] != PH_EMIT)       { ret 1; }
-    if (u0.phases.data[5] != PH_LINK)       { ret 1; }
+    val pr: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pr.err) { ret 1; }
+    val u0: *BuildUnit = ?pr.ok.units.data[0];
+    if (u0.phases.len != 6)              { ret 1; }
+    if (u0.phases.data[0] != PH_LOAD)    { ret 1; }
+    if (u0.phases.data[1] != PH_SEMA)    { ret 1; }
+    if (u0.phases.data[2] != PH_LOWER)   { ret 1; }
+    if (u0.phases.data[3] != PH_CODEGEN) { ret 1; }
+    if (u0.phases.data[4] != PH_EMIT)    { ret 1; }
+    if (u0.phases.data[5] != PH_LINK)    { ret 1; }
 
     rq.goal = request.GOAL_OBJECTS;
-    val po: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (R.is_err[BuildPlan, outcome.Fail](po)) { ret 1; }
-    val uo: *BuildUnit = ?R.unwrap_ok[BuildPlan, outcome.Fail](po).units.data[0];
-    if (uo.phases.len != 5)                       { ret 1; }
-    if (uo.phases.data[4] != PH_EMIT)             { ret 1; }
-    if (!str_equals(uo.out_path, uo.obj_dir))     { ret 1; }
+    val po: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel po.err) { ret 1; }
+    val uo: *BuildUnit = ?po.ok.units.data[0];
+    if (uo.phases.len != 5)                   { ret 1; }
+    if (uo.phases.data[4] != PH_EMIT)         { ret 1; }
+    if (!str_equals(uo.out_path, uo.obj_dir)) { ret 1; }
 
     rq.goal = request.GOAL_TEST_LIST;
-    val pl: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (R.is_err[BuildPlan, outcome.Fail](pl)) { ret 1; }
-    val ul: *BuildUnit = ?R.unwrap_ok[BuildPlan, outcome.Fail](pl).units.data[0];
-    if (ul.phases.len != 4)               { ret 1; }
-    if (ul.phases.data[3] != PH_CODEGEN)  { ret 1; }
-    if (!str_empty(ul.out_path))          { ret 1; }
+    val pl: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pl.err) { ret 1; }
+    val ul: *BuildUnit = ?pl.ok.units.data[0];
+    if (ul.phases.len != 3)            { ret 1; }
+    if (ul.phases.data[0] != PH_LOAD)  { ret 1; }
+    if (ul.phases.data[1] != PH_SEMA)  { ret 1; }
+    if (ul.phases.data[2] != PH_LOWER) { ret 1; }
+    if (!str_empty(ul.out_path))       { ret 1; }
+
+    rq.emit_ir  = true;
+    rq.emit_asm = true;
+    val pe: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pe.err) { ret 1; }
+    val ue: *BuildUnit = ?pe.ok.units.data[0];
+    if (ue.phases.len != 3 || ue.phases.data[2] != PH_LOWER) { ret 1; }
+    if (!str_empty(ue.out_path))                             { ret 1; }
+    rq.emit_ir  = false;
+    rq.emit_asm = false;
 
     rq.goal = request.GOAL_TESTS;
-    val pt: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (R.is_err[BuildPlan, outcome.Fail](pt)) { ret 1; }
-    val bt: BuildPlan = R.unwrap_ok[BuildPlan, outcome.Fail](pt);
+    val pt: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pt.err) { ret 1; }
+    val bt: BuildPlan = pt.ok;
     if (bt.units.len != 1) { ret 1; }
     val ut: *BuildUnit = ?bt.units.data[0];
-    if (!ut_path_eq(ut.out_path, "/r/out/ta/debug/test/appa"))   { ret 1; }
-    if (ut.phases.data[ut.phases.len - 1] != PH_LINK)            { ret 1; }
+    if (!ut_path_eq(ut.out_path, "/r/out/ta/debug/test/appa")) { ret 1; }
+    if (ut.phases.data[ut.phases.len - 1] != PH_LINK)          { ret 1; }
     ret 0;
 }
 
@@ -2399,29 +2908,29 @@ test "mach.lang.build.plan.plan:finished_modules_end_at_emit" {
     var itn:   intern.Interner;
     var reg:   target.TargetRegistry;
     var m:     manifest.Manifest;
-    if (!ut_scaffold_src(?alloc, ?itn, ?reg, ?m, "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.gpu]\nisa = \"spirv\"\nos = \"freestanding\"\nabi = \"spirv\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n[artifact.appa]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/appa\"\ntargets = [\"*\"]\nlink = []\nneed = []\n")) { ret 1; }
+    if (!ut_scaffold_src(?alloc, ?itn, ?reg, ?m, "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.gpu]\nisa = \"spirv\"\nos = \"freestanding\"\nabi = \"spirv\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n[artifact.appa]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/appa\"\ntargets = [\"*\"]\nlink = []\nneed = []\n")) { ret 1; }
 
     var rq: request.BuildRequest = request.defaults();
     rq.project_root = "/r";
     rq.target       = "gpu";
     rq.artifact     = "appa";
 
-    val pe: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (R.is_err[BuildPlan, outcome.Fail](pe)) { ret 1; }
-    val ue: *BuildUnit = ?R.unwrap_ok[BuildPlan, outcome.Fail](pe).units.data[0];
+    val pe: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pe.err) { ret 1; }
+    val ue: *BuildUnit = ?pe.ok.units.data[0];
 
-    if (ue.goal != request.GOAL_EXECUTE)                         { ret 1; }
-    if (ue.phases.len != 5)                                      { ret 1; }
-    if (ue.phases.data[4] != PH_EMIT)                            { ret 1; }
-    if (!ut_path_eq(ue.out_path, "/r/out/gpu/debug/obj"))        { ret 1; }
-    if (!str_equals(ue.out_path, ue.obj_dir))                    { ret 1; }
+    if (ue.goal != request.GOAL_EXECUTE)                  { ret 1; }
+    if (ue.phases.len != 5)                               { ret 1; }
+    if (ue.phases.data[4] != PH_EMIT)                     { ret 1; }
+    if (!ut_path_eq(ue.out_path, "/r/out/gpu/debug/obj")) { ret 1; }
+    if (!str_equals(ue.out_path, ue.obj_dir))             { ret 1; }
 
     rq.goal = request.GOAL_OBJECTS;
-    val po: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (R.is_err[BuildPlan, outcome.Fail](po)) { ret 1; }
-    val uo: *BuildUnit = ?R.unwrap_ok[BuildPlan, outcome.Fail](po).units.data[0];
-    if (uo.phases.len != ue.phases.len)         { ret 1; }
-    if (!str_equals(uo.out_path, ue.out_path))  { ret 1; }
+    val po: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel po.err) { ret 1; }
+    val uo: *BuildUnit = ?po.ok.units.data[0];
+    if (uo.phases.len != ue.phases.len)        { ret 1; }
+    if (!str_equals(uo.out_path, ue.out_path)) { ret 1; }
 
     var mr: manifest.Manifest;
     if (!ut_manifest(?alloc, ?itn, ?mr)) { ret 1; }
@@ -2429,9 +2938,9 @@ test "mach.lang.build.plan.plan:finished_modules_end_at_emit" {
     rr.project_root = "/r";
     rr.target       = "ta";
     rr.artifact     = "appa";
-    val pr: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?mr, rr);
-    if (R.is_err[BuildPlan, outcome.Fail](pr)) { ret 1; }
-    val ur: *BuildUnit = ?R.unwrap_ok[BuildPlan, outcome.Fail](pr).units.data[0];
+    val pr: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?mr, rr);
+    if (sel pr.err) { ret 1; }
+    val ur: *BuildUnit = ?pr.ok.units.data[0];
     if (ur.phases.data[ur.phases.len - 1] != PH_LINK) { ret 1; }
 
     ret 0;
@@ -2442,21 +2951,21 @@ test "mach.lang.build.plan.plan:dep_steps_precede_project_steps" {
     var itn:   intern.Interner;
     var reg:   target.TargetRegistry;
     var m:     manifest.Manifest;
-    if (!ut_scaffold_src(?alloc, ?itn, ?reg, ?m, "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.ta]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n[step.s]\nargv = [\"true\"]\nin = []\nout = [\"gen/x\"]\nneed = []\n[dep.d]\npath = \"./vendor/d\"\n[artifact.appa]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/appa\"\ntargets = [\"*\"]\nlink = []\nneed = [\"s\"]\n")) { ret 1; }
+    if (!ut_scaffold_src(?alloc, ?itn, ?reg, ?m, "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.ta]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n[step.s]\nargv = [\"true\"]\nin = []\nout = [\"gen/x\"]\nneed = []\n[dep.d]\npath = \"./vendor/d\"\n[artifact.appa]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/appa\"\ntargets = [\"*\"]\nlink = []\nneed = [\"step.s\"]\n")) { ret 1; }
 
     var rq: request.BuildRequest = request.defaults();
     rq.project_root = "/r";
     rq.target       = "ta";
     rq.artifact     = "appa";
 
-    val pr: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (R.is_err[BuildPlan, outcome.Fail](pr)) { ret 1; }
-    val u0: *BuildUnit = ?R.unwrap_ok[BuildPlan, outcome.Fail](pr).units.data[0];
+    val pr: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pr.err) { ret 1; }
+    val u0: *BuildUnit = ?pr.ok.units.data[0];
 
-    if (u0.phases.len < 3)                  { ret 1; }
-    if (u0.phases.data[0] != PH_DEP_STEPS)  { ret 1; }
-    if (u0.phases.data[1] != PH_STEPS)      { ret 1; }
-    if (u0.phases.data[2] != PH_LOAD)       { ret 1; }
+    if (u0.phases.len < 3)                 { ret 1; }
+    if (u0.phases.data[0] != PH_DEP_STEPS) { ret 1; }
+    if (u0.phases.data[1] != PH_STEPS)     { ret 1; }
+    if (u0.phases.data[2] != PH_LOAD)      { ret 1; }
     ret 0;
 }
 
@@ -2473,42 +2982,46 @@ test "mach.lang.build.plan.plan:out_override_and_emission_dirs" {
     rq.artifact     = "appa";
     rq.out          = "bin/custom";
 
-    val pr: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (R.is_err[BuildPlan, outcome.Fail](pr)) { ret 1; }
-    val u0: *BuildUnit = ?R.unwrap_ok[BuildPlan, outcome.Fail](pr).units.data[0];
+    val pr: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pr.err) { ret 1; }
+    val u0: *BuildUnit = ?pr.ok.units.data[0];
     if (!ut_path_eq(u0.out_path, "/r/bin/custom")) { ret 1; }
     if (!str_empty(u0.ir_dir))                     { ret 1; }
     if (!str_empty(u0.asm_dir))                    { ret 1; }
 
-    rq.out     = "/abs/custom";
-    rq.emit_ir = true;
+    rq.out      = "/abs/custom";
+    rq.emit_ir  = true;
     rq.emit_asm = true;
-    val pa: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (R.is_ok[BuildPlan, outcome.Fail](pa)) { ret 1; }
-    var fail: outcome.Fail = R.unwrap_err[BuildPlan, outcome.Fail](pa);
-    if (!str_contains(fail.message, "inside the project root")) { ret 1; }
+    val pa: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pa.ok) { ret 1; }
+    val refused: outcome.Fail = pa.err;
+    if (!str_contains(outcome.describe(refused), "inside the project root")) { ret 1; }
 
     rq.out = "../custom";
-    val pp: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
-    if (R.is_ok[BuildPlan, outcome.Fail](pp)) { ret 1; }
+    val pp: res[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, rq);
+    if (sel pp.ok) { ret 1; }
     ret 0;
 }
 
 test "mach.lang.build.plan.no_cells_msg:joins_many_artifact_names_without_corruption" {
-    var alloc: A.Allocator;
-    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
     var itn: intern.Interner = intern.init(?alloc);
 
-    val name_r: R.Result[intern.StrId, str] = intern.intern(?itn, "widget");
-    if (R.is_err[intern.StrId, str](name_r)) { ret 1; }
-    val name_id: intern.StrId = R.unwrap_ok[intern.StrId, str](name_r);
+    val name_r: res[intern.StrId, A.Error] = intern.intern(?itn, "widget");
+    if (sel name_r.err) { ret 1; }
+    val name_id: intern.StrId = name_r.ok;
 
-    val n: u32 = 200;
-    val defs_r: R.Result[*manifest.ArtifactDef, str] = A.allocate[manifest.ArtifactDef](?alloc, n::usize);
-    if (R.is_err[*manifest.ArtifactDef, str](defs_r)) { ret 1; }
-    val defs: *manifest.ArtifactDef = R.unwrap_ok[*manifest.ArtifactDef, str](defs_r);
-    var i: u32 = 0;
-    for (i < n) { defs[i].name = name_id; i = i + 1; }
+    val n:      u32                                 = 200;
+    val defs_r: res[*manifest.ArtifactDef, A.Error] = A.allocate[manifest.ArtifactDef](?alloc, n::usize);
+    if (sel defs_r.err) { ret 1; }
+    val defs: *manifest.ArtifactDef = defs_r.ok;
+    var i:    u32                   = 0;
+    for (i < n) {
+        defs[i].name = name_id;
+        i            = i + 1;
+    }
 
     var m: manifest.Manifest;
     m.artifacts      = defs;
@@ -2524,18 +3037,19 @@ test "mach.lang.build.plan.no_cells_msg:joins_many_artifact_names_without_corrup
         textbuild.tb_append(?expect, "widget");
         i = i + 1;
     }
-    val expect_r: R.Result[str, str] = textbuild.tb_finish(?expect);
+    val expect_r: res[str, textbuild.Error] = textbuild.tb_finish(?expect);
     textbuild.tb_dnit(?expect);
-    if (R.is_err[str, str](expect_r)) { ret 1; }
-    if (!str_contains(msg, R.unwrap_ok[str, str](expect_r))) { ret 1; }
+    if (sel expect_r.err)                { ret 1; }
+    if (!str_contains(msg, expect_r.ok)) { ret 1; }
 
     A.deallocate[manifest.ArtifactDef](?alloc, defs, n::usize);
     ret 0;
 }
 
 test "mach.lang.build.plan.out_conflict_msg:joins_many_units_without_corruption" {
-    var alloc: A.Allocator;
-    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
 
     var bp: BuildPlan;
     bp.units = vector.init[BuildUnit](?alloc);
@@ -2544,23 +3058,23 @@ test "mach.lang.build.plan.out_conflict_msg:joins_many_units_without_corruption"
         var u: BuildUnit;
         u.sel_artifact = "appa";
         u.sel_target   = "linux-x86_64";
-        val pr: R.Result[usize, str] = vector.push[BuildUnit](?bp.units, u);
-        if (R.is_err[usize, str](pr)) { ret 1; }
+        val pr: res[usize, A.Error] = vector.push[BuildUnit](?bp.units, u);
+        if (sel pr.err) { ret 1; }
         i = i + 1;
     }
 
     val msg: str = out_conflict_msg(?alloc, ?bp);
-    if (!str_contains(msg, "resolves to several build units")) { ret 1; }
+    if (!str_contains(msg, "resolves to several build units"))              { ret 1; }
     if (!str_contains(msg, "appa for linux-x86_64, appa for linux-x86_64")) { ret 1; }
     ret 0;
 }
 
-fun plan_tb_probe_allocate(ctx: ptr, size: usize, align: usize) O.Option[ptr] {
-    ret O.none[ptr]();
+fun plan_tb_probe_allocate(ctx: ptr, size: usize, align: usize) opt[ptr] {
+    ret opt[ptr].none{};
 }
 
-fun plan_tb_probe_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) O.Option[ptr] {
-    ret O.none[ptr]();
+fun plan_tb_probe_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) opt[ptr] {
+    ret opt[ptr].none{};
 }
 
 fun plan_tb_probe_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64 {
@@ -2575,13 +3089,14 @@ test "mach.lang.build.plan.no_cells_msg:reports_the_sentinel_when_the_builder_fa
     probe_alloc.fn_deallocate = plan_tb_probe_deallocate;
 
     var real_alloc: A.Allocator;
-    if (O.is_some[str](page.make(?real_alloc))) { ret 1; }
-    var itn: intern.Interner = intern.init(?real_alloc);
-    val name_r: R.Result[intern.StrId, str] = intern.intern(?itn, "widget");
-    if (R.is_err[intern.StrId, str](name_r)) { ret 1; }
+    val make_r:     err[A.Error] = page.make(?real_alloc);
+    if (sel make_r.err) { ret 1; }
+    var itn:    intern.Interner            = intern.init(?real_alloc);
+    val name_r: res[intern.StrId, A.Error] = intern.intern(?itn, "widget");
+    if (sel name_r.err) { ret 1; }
 
     var def: manifest.ArtifactDef;
-    def.name = R.unwrap_ok[intern.StrId, str](name_r);
+    def.name = name_r.ok;
     var m: manifest.Manifest;
     m.artifacts      = ?def;
     m.artifact_count = 1;
@@ -2592,11 +3107,11 @@ test "mach.lang.build.plan.no_cells_msg:reports_the_sentinel_when_the_builder_fa
 }
 
 fun t_plan_from_local_request(alloc: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry,
-                              m: *manifest.Manifest) R.Result[BuildPlan, outcome.Fail] {
+    m: *manifest.Manifest) res[BuildPlan, outcome.Fail] {
     var rq: request.BuildRequest = request.defaults();
     rq.project_root = "/owned-by-the-plan";
     rq.all_targets  = true;
-    val pr: R.Result[BuildPlan, outcome.Fail] = plan(alloc, itn, reg, m, rq);
+    val pr: res[BuildPlan, outcome.Fail] = plan(alloc, itn, reg, m, rq);
     rq.project_root = "/clobbered-after-planning";
     rq.all_targets  = false;
     ret pr;
@@ -2608,10 +3123,26 @@ test "mach.lang.build.plan.plan:owns_its_request_beyond_the_planning_scope" {
     var reg:   target.TargetRegistry;
     var m:     manifest.Manifest;
     if (!ut_scaffold(?alloc, ?itn, ?reg, ?m)) { ret 1; }
-    val pr: R.Result[BuildPlan, outcome.Fail] = t_plan_from_local_request(?alloc, ?itn, ?reg, ?m);
-    if (R.is_err[BuildPlan, outcome.Fail](pr)) { ret 1; }
-    val bp: BuildPlan = R.unwrap_ok[BuildPlan, outcome.Fail](pr);
+    val pr: res[BuildPlan, outcome.Fail] = t_plan_from_local_request(?alloc, ?itn, ?reg, ?m);
+    if (sel pr.err) { ret 1; }
+    val bp: BuildPlan = pr.ok;
     if (!str_equals(bp.request.project_root, "/owned-by-the-plan")) { ret 1; }
-    if (!bp.request.all_targets) { ret 1; }
+    if (!bp.request.all_targets)                                    { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.build.plan.plan:unknown_request_goal_is_internal_before_manifest_access" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    var req: request.BuildRequest = request.defaults();
+    req.goal = 255;
+    val result: res[BuildPlan, outcome.Fail] = plan(?a, nil, nil, nil, req);
+    if (sel result.ok) { ret 2; }
+    val f: outcome.Fail = result.err;
+    fin { outcome.release_text(?a, f); }
+    if (!sel f.internal)                                 { ret 3; }
+    if (!str_contains(outcome.describe(f), "BuildGoal")) { ret 3; }
+    if (!str_contains(outcome.describe(f), "255"))       { ret 3; }
     ret 0;
 }

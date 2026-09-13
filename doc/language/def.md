@@ -19,7 +19,21 @@ pub def Choice: uni { a: i64; b: f64; };        # inline union
 ```
 
 Aliases may name any type: primitives, pointers, arrays, function types,
-records, unions, or other aliases.
+records, unions, tags, or other aliases. `def` is a module-scope declaration;
+there is no function-scope alias. An alias of a tag constructs, tests and
+copies as the tag:
+
+```mach
+use std.types.result.res;
+
+tag ParseError: u8 { invalid; overflow; }
+def R: res[i64, ParseError];
+
+fun parse(x: i64) R {
+    if (x < 0) { ret R.err{ParseError.invalid{}}; }
+    ret R.ok{x};
+}
+```
 
 ## Stdlib aliases
 
@@ -30,5 +44,5 @@ shorthand imports the appropriate stdlib module.
 
 ## See also
 
-- [types.md](types.md) — the type grammar `def` references
-- [rec.md](rec.md), [uni.md](uni.md) — record / union forms commonly aliased
+- [types.md](types.md) - the type grammar def references
+- [rec.md](rec.md), [uni.md](uni.md), [tag.md](tag.md) - aggregate forms commonly aliased

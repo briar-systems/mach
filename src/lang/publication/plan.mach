@@ -1,58 +1,155 @@
+use mach.lang.build.outcome;
+use A: std.allocator;
+use std.allocator.page;
+use fs:       std.filesystem;
+use txn:      std.filesystem.transaction;
+use io_error: std.io.error;
+use std.process.env;
+use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.path;
+use std.types.result.res;
 use std.types.size.usize;
+use std.types.string;
+use std.types.string.StrError;
 use std.types.string.str;
+use std.types.string.str_copy_slice;
 use std.types.string.str_equals;
-use std.allocator.page;
-use std.text.string.str_free;
-use A: std.allocator;
-use O: std.types.option;
-use R: std.types.result;
-use fs: std.filesystem;
-use path: std.types.path;
-use txn: std.filesystem.transaction;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
 
 rec Directory {
-    root: txn.Root;
-    held: txn.Lock;
+    root:     txn.Root;
+    held:     txn.Lock;
     identity: txn.Identity;
-    opened: bool;
-    locked: bool;
-    next: *Directory;
+    opened:   bool;
+    locked:   bool;
+    next:     *Directory;
 }
 
 pub rec Destination {
-    claim: txn.Claim;
-    path: str;
+    claim:     txn.Claim;
+    path:      str;
     directory: *Directory;
-    reserved: bool;
-    next: *Destination;
+    reserved:  bool;
+    next:      *Destination;
 }
 
-val PLANNING: u8 = 1;
+val PLANNING:  u8 = 1;
 val ADMITTING: u8 = 2;
-val READY: u8 = 3;
-val CLOSING: u8 = 4;
+val READY:     u8 = 3;
+val CLOSING:   u8 = 4;
+
+# a project root homed at its control home, with the cleaned absolute path
+# it was opened by: a plan given one roots every destination directory under
+# that path by descent from it, so each keeps its lock, claims and backup
+# under the home keyed by its relative path. directories outside the path
+# are rooted plainly, as they are without a home
+pub rec Home {
+    root: txn.Root;
+    home: txn.Root;
+    path: str;
+}
 
 pub rec Plan {
-    address: usize;
-    alloc: *A.Allocator;
-    directories: *Directory;
+    address:      usize;
+    alloc:        *A.Allocator;
+    home:         *Home;
+    directories:  *Directory;
     destinations: *Destination;
-    state: u8;
+    state:        u8;
 }
 
-pub fun init(out: *Plan, alloc: *A.Allocator) O.Option[txn.Error] {
+pub fun init(out: *Plan, alloc: *A.Allocator) err[txn.Error] {
+    ret init_homed(out, alloc, nil);
+}
+
+# `home` is borrowed for the plan's lifetime; nil plans without one
+pub fun init_homed(out: *Plan, alloc: *A.Allocator, home: *Home) err[txn.Error] {
     if (out == nil || alloc == nil || out.address != 0) {
-        ret O.some[txn.Error](txn.error(txn.INVALID, txn.OP_PREPARE));
+        ret err[txn.Error].err{txn.error(txn.INVALID, txn.OP_PREPARE)};
     }
-    out.alloc = alloc;
-    out.directories = nil;
+    out.alloc        = alloc;
+    out.home         = home;
+    out.directories  = nil;
     out.destinations = nil;
-    out.state = PLANNING;
-    out.address = out::usize;
-    ret O.none[txn.Error]();
+    out.state        = PLANNING;
+    out.address      = out::usize;
+    ret err[txn.Error].ok{};
+}
+
+# a path rooted at the working directory and cleaned: the home's path and a
+# planned directory are compared in one coordinate system, so a relative
+# project spelling (`mach doc .`) is contained the same as an absolute one
+pub fun absolute_clean(alloc: *A.Allocator, value: str) res[str, outcome.Fail] {
+    if (path.is_abs(value)) {
+        val cleaned: res[str, A.Error] = path.clean(alloc, value);
+        if (sel cleaned.err) { ret res[str, outcome.Fail].err{outcome.refused(cleaned.err)}; }
+        ret res[str, outcome.Fail].ok{cleaned.ok};
+    }
+    val cwd_r: res[string.OwnedString, env.EnvError] = env.current_dir(alloc);
+    if (sel cwd_r.err) { ret res[str, outcome.Fail].err{outcome.environment(outcome.env_text(cwd_r.err))}; }
+    var cwd:    string.OwnedString = cwd_r.ok;
+    val joined: res[str, A.Error]  = path.resolve(alloc, cwd.data, value);
+    string.owned_release(?cwd);
+    if (sel joined.err) { ret res[str, outcome.Fail].err{outcome.refused(joined.err)}; }
+    val cleaned: res[str, A.Error] = path.clean(alloc, joined.ok);
+    str_free(alloc, joined.ok);
+    if (sel cleaned.err) { ret res[str, outcome.Fail].err{outcome.refused(cleaned.err)}; }
+    ret res[str, outcome.Fail].ok{cleaned.ok};
+}
+
+# the part of `parent` beneath the home's path, none when it is not beneath
+# it; both are absolute and cleaned
+fun beneath_home(home: *Home, parent: str) opt[usize] {
+    val base: usize = str_len(home.path);
+    if (!str_starts_with(parent, home.path)) { ret opt[usize].none{}; }
+    if (str_len(parent) == base)             { ret opt[usize].some{base}; }
+    if (!path.is_separator(parent[base]))    { ret opt[usize].none{}; }
+    var start: usize = base;
+    for (start < str_len(parent) && path.is_separator(parent[start])) { start = start + 1; }
+    ret opt[usize].some{start};
+}
+
+# open `parent` by descent from the home's root, one component at a time,
+# so the directory is homed at home/<relative path>, created on demand
+fun open_homed(out: *txn.Root, alloc: *A.Allocator, home: *Home, parent: str, start: usize) err[txn.Error] {
+    val length: usize = str_len(parent);
+    if (start >= length) { ret txn.root_open_with_home(out, home.path, "", ?home.home); }
+    var hops:    [2]txn.Root;
+    var current: *txn.Root      = ?home.root;
+    var held:    usize          = 0;
+    var from:    usize          = start;
+    var failure: err[txn.Error] = err[txn.Error].ok{};
+    for (from < length && sel failure.ok) {
+        var end: usize = from;
+        for (end < length && !path.is_separator(parent[end])) { end = end + 1; }
+        val leaf: res[str, StrError] = str_copy_slice(alloc, parent, from, end - from);
+        if (sel leaf.err) {
+            failure = err[txn.Error].err{txn.error(txn.MEMORY, txn.OP_ROOT_OPEN)};
+            brk;
+        }
+        var next:  *txn.Root = ?hops[held % 2];
+        val final: bool      = end >= length;
+        if (final) { next = out; }
+        val opened: err[txn.Error] = txn.root_open_child(next, current, leaf.ok);
+        str_free(alloc, leaf.ok);
+        if (sel opened.err) {
+            failure = opened;
+            brk;
+        }
+        if (current != ?home.root) { txn.root_dnit(current); }
+        current = next;
+        held    = held + 1;
+        from    = end + 1;
+        for (from < length && path.is_separator(parent[from])) { from = from + 1; }
+    }
+    if (current != ?home.root && current != out) { txn.root_dnit(current); }
+    ret failure;
 }
 
 fun valid(plan: *Plan) bool {
@@ -60,122 +157,136 @@ fun valid(plan: *Plan) bool {
 }
 
 # roots are compared by held identity before acquiring their exclusive locks
-fun directory(plan: *Plan, parent: str, create: bool) R.Result[*Directory, str] {
+fun directory(plan: *Plan, parent: str, create: bool) res[*Directory, outcome.Fail] {
     if (create) {
-        val made: O.Option[str] = fs.create_dir_all(plan.alloc, parent, 0o755);
-        if (O.is_some[str](made)) { ret R.err[*Directory, str](O.unwrap[str](made)); }
+        val made: err[fs.FsError] = fs.create_dir_all(plan.alloc, parent, 0o755);
+        if (sel made.err) { ret res[*Directory, outcome.Fail].err{outcome.environment(outcome.fs_text(made.err))}; }
     }
-    val allocated: R.Result[*Directory, str] = A.zallocate[Directory](plan.alloc, 1);
-    if (R.is_err[*Directory, str](allocated)) { ret allocated; }
-    val item: *Directory = R.unwrap_ok[*Directory, str](allocated);
-    val opened: O.Option[txn.Error] = txn.root_open(?item.root, parent, "");
-    if (O.is_some[txn.Error](opened)) {
+    val allocated: res[*Directory, A.Error] = A.zallocate[Directory](plan.alloc, 1);
+    if (sel allocated.err) { ret res[*Directory, outcome.Fail].err{outcome.refused(allocated.err)}; }
+    val item:   *Directory     = allocated.ok;
+    var opened: err[txn.Error] = err[txn.Error].ok{};
+    var rel:    opt[usize]     = opt[usize].none{};
+    var homed:  str            = nil;
+    if (plan.home != nil) {
+        val absolute: res[str, outcome.Fail] = absolute_clean(plan.alloc, parent);
+        if (sel absolute.err) {
+            A.deallocate[Directory](plan.alloc, item, 1);
+            ret res[*Directory, outcome.Fail].err{absolute.err};
+        }
+        homed = absolute.ok;
+        rel   = beneath_home(plan.home, homed);
+    }
+    if (sel rel.some) { opened = open_homed(?item.root, plan.alloc, plan.home, homed, rel.some); }
+    or                { opened = txn.root_open(?item.root, parent, ""); }
+    if (homed != nil) { str_free(plan.alloc, homed); }
+    if (sel opened.err) {
         A.deallocate[Directory](plan.alloc, item, 1);
-        ret R.err[*Directory, str](txn.error_message(O.unwrap[txn.Error](opened)));
+        ret res[*Directory, outcome.Fail].err{outcome.environment(txn.error_message(opened.err))};
     }
     item.opened = true;
-    val observed: R.Result[txn.Identity, txn.Error] = txn.root_identity(?item.root);
-    if (R.is_err[txn.Identity, txn.Error](observed)) {
-        val closed: O.Option[txn.Error] = txn.root_dnit(?item.root);
+    val observed: res[txn.Identity, txn.Error] = txn.root_identity(?item.root);
+    if (sel observed.err) {
+        val closed: err[txn.Error] = txn.root_dnit(?item.root);
         A.deallocate[Directory](plan.alloc, item, 1);
-        if (O.is_some[txn.Error](closed)) { ret R.err[*Directory, str](txn.error_message(O.unwrap[txn.Error](closed))); }
-        ret R.err[*Directory, str](txn.error_message(R.unwrap_err[txn.Identity, txn.Error](observed)));
+        if (sel closed.err) { ret res[*Directory, outcome.Fail].err{outcome.environment(txn.error_message(closed.err))}; }
+        ret res[*Directory, outcome.Fail].err{outcome.environment(txn.error_message(observed.err))};
     }
-    item.identity = R.unwrap_ok[txn.Identity, txn.Error](observed);
+    item.identity = observed.ok;
     var existing: *Directory = plan.directories;
     for (existing != nil) {
         if (txn.identity_equal(existing.identity, item.identity)) {
-            val closed: O.Option[txn.Error] = txn.root_dnit(?item.root);
+            val closed: err[txn.Error] = txn.root_dnit(?item.root);
             A.deallocate[Directory](plan.alloc, item, 1);
-            if (O.is_some[txn.Error](closed)) { ret R.err[*Directory, str](txn.error_message(O.unwrap[txn.Error](closed))); }
-            ret R.ok[*Directory, str](existing);
+            if (sel closed.err) { ret res[*Directory, outcome.Fail].err{outcome.environment(txn.error_message(closed.err))}; }
+            ret res[*Directory, outcome.Fail].ok{existing};
         }
         existing = existing.next;
     }
-    item.next = plan.directories;
+    item.next        = plan.directories;
     plan.directories = item;
-    ret R.ok[*Directory, str](item);
+    ret res[*Directory, outcome.Fail].ok{item};
 }
 
-# destinations remain at their final addresses throughout planning and execution
-pub fun add(plan: *Plan, name: str, create_parents: bool) R.Result[*Destination, str] {
+pub fun add(plan: *Plan, name: str, create_parents: bool) res[*Destination, outcome.Fail] {
     if (!valid(plan) || plan.state != PLANNING) {
-        ret R.err[*Destination, str]("publication destinations require an open plan");
+        ret res[*Destination, outcome.Fail].err{outcome.environment("publication destinations require an open plan")};
     }
-    val cleaned: R.Result[str, str] = path.clean(plan.alloc, name);
-    if (R.is_err[str, str](cleaned)) { ret R.err[*Destination, str](R.unwrap_err[str, str](cleaned)); }
-    val spelling: str = R.unwrap_ok[str, str](cleaned);
+    val cleaned: res[str, A.Error] = path.clean(plan.alloc, name);
+    if (sel cleaned.err) { ret res[*Destination, outcome.Fail].err{outcome.refused(cleaned.err)}; }
+    val spelling: str  = cleaned.ok;
     var retained: bool = false;
-    fin { if (!retained) { str_free(plan.alloc, spelling); } }
-    val parent_r: R.Result[str, str] = path.parent(plan.alloc, spelling);
-    if (R.is_err[str, str](parent_r)) { ret R.err[*Destination, str](R.unwrap_err[str, str](parent_r)); }
-    val parent: str = R.unwrap_ok[str, str](parent_r);
+    fin {
+        if (!retained) { str_free(plan.alloc, spelling); }
+    }
+    val parent_r: res[str, A.Error] = path.parent(plan.alloc, spelling);
+    if (sel parent_r.err) { ret res[*Destination, outcome.Fail].err{outcome.refused(parent_r.err)}; }
+    val parent: str = parent_r.ok;
     fin { str_free(plan.alloc, parent); }
-    val owner_r: R.Result[*Directory, str] = directory(plan, parent, create_parents);
-    if (R.is_err[*Directory, str](owner_r)) { ret R.err[*Destination, str](R.unwrap_err[*Directory, str](owner_r)); }
-    val owner: *Directory = R.unwrap_ok[*Directory, str](owner_r);
+    val owner_r: res[*Directory, outcome.Fail] = directory(plan, parent, create_parents);
+    if (sel owner_r.err) { ret res[*Destination, outcome.Fail].err{owner_r.err}; }
+    val owner:    *Directory   = owner_r.ok;
     var existing: *Destination = plan.destinations;
     for (existing != nil) {
         if (existing.directory == owner && str_equals(path.filename(existing.path), path.filename(spelling))) {
-            ret R.ok[*Destination, str](existing);
+            ret res[*Destination, outcome.Fail].ok{existing};
         }
         existing = existing.next;
     }
-    val allocated: R.Result[*Destination, str] = A.zallocate[Destination](plan.alloc, 1);
-    if (R.is_err[*Destination, str](allocated)) { ret allocated; }
-    val item: *Destination = R.unwrap_ok[*Destination, str](allocated);
-    item.path = spelling;
-    item.directory = owner;
-    item.next = plan.destinations;
+    val allocated: res[*Destination, A.Error] = A.zallocate[Destination](plan.alloc, 1);
+    if (sel allocated.err) { ret res[*Destination, outcome.Fail].err{outcome.refused(allocated.err)}; }
+    val item: *Destination = allocated.ok;
+    item.path         = spelling;
+    item.directory    = owner;
+    item.next         = plan.destinations;
     plan.destinations = item;
-    retained = true;
-    ret R.ok[*Destination, str](item);
+    retained          = true;
+    ret res[*Destination, outcome.Fail].ok{item};
 }
 
-# recovery completes everywhere before the first reservation or worker admission
-pub fun seal(plan: *Plan) O.Option[txn.Error] {
+pub fun seal(plan: *Plan) err[txn.Error] {
     if (!valid(plan) || plan.state != PLANNING) {
-        ret O.some[txn.Error](txn.error(txn.INVALID, txn.OP_PREPARE));
+        ret err[txn.Error].err{txn.error(txn.INVALID, txn.OP_PREPARE)};
     }
     plan.state = ADMITTING;
     var owner: *Directory = plan.directories;
     for (owner != nil) {
-        val locked: O.Option[txn.Error] = txn.lock(?owner.held, ?owner.root);
-        if (O.is_some[txn.Error](locked)) { ret locked; }
+        val locked: err[txn.Error] = txn.lock(?owner.held, ?owner.root);
+        if (sel locked.err) { ret locked; }
         owner.locked = true;
-        owner = owner.next;
+        owner        = owner.next;
     }
     var item: *Destination = plan.destinations;
     for (item != nil) {
-        val recovered: R.Result[usize, txn.Error] = txn.recover(plan.alloc, ?item.directory.held, path.filename(item.path));
-        if (R.is_err[usize, txn.Error](recovered)) { ret O.some[txn.Error](R.unwrap_err[usize, txn.Error](recovered)); }
+        val recovered: res[usize, txn.Error] = txn.recover(plan.alloc, ?item.directory.held, path.filename(item.path));
+        if (sel recovered.err) { ret err[txn.Error].err{recovered.err}; }
         item = item.next;
     }
     item = plan.destinations;
     for (item != nil) {
-        val reserved: O.Option[txn.Error] = txn.claim(?item.claim, plan.alloc, ?item.directory.held, path.filename(item.path));
-        if (O.is_some[txn.Error](reserved)) { ret reserved; }
+        val reserved: err[txn.Error] = txn.claim(?item.claim, plan.alloc, ?item.directory.held, path.filename(item.path));
+        if (sel reserved.err) { ret reserved; }
         item.reserved = true;
-        item = item.next;
+        item          = item.next;
     }
     plan.state = READY;
-    ret O.none[txn.Error]();
+    ret err[txn.Error].ok{};
 }
 
-# live transaction misuse retains the remaining owners for an explicit retry
-pub fun dnit(plan: *Plan) O.Option[txn.Error] {
-    if (plan == nil) { ret O.some[txn.Error](txn.error(txn.INVALID, txn.OP_LOCK)); }
-    if (plan.address == 0) { ret O.none[txn.Error](); }
-    if (!valid(plan)) { ret O.some[txn.Error](txn.error(txn.INVALID, txn.OP_LOCK)); }
+pub fun dnit(plan: *Plan) err[txn.Error] {
+    if (plan == nil)       { ret err[txn.Error].err{txn.error(txn.INVALID, txn.OP_LOCK)}; }
+    if (plan.address == 0) { ret err[txn.Error].ok{}; }
+    if (!valid(plan))      { ret err[txn.Error].err{txn.error(txn.INVALID, txn.OP_LOCK)}; }
     plan.state = CLOSING;
-    var failure: O.Option[txn.Error] = O.none[txn.Error]();
+    var failure: err[txn.Error] = err[txn.Error].ok{};
     for (plan.destinations != nil) {
         val item: *Destination = plan.destinations;
         if (item.reserved) {
-            val released: O.Option[txn.Error] = txn.release_claim(?item.claim);
-            if (O.is_some[txn.Error](released)) {
-                if (O.unwrap[txn.Error](released).kind == txn.INVALID) { ret released; }
-                if (O.is_none[txn.Error](failure)) { failure = released; }
+            val released: err[txn.Error] = txn.release_claim(?item.claim);
+            if (sel released.err) {
+                if (released.err.kind == txn.INVALID) { ret released; }
+                val first_released: bool = sel failure.ok;
+                if (first_released) { failure = released; }
             }
         }
         plan.destinations = item.next;
@@ -185,90 +296,118 @@ pub fun dnit(plan: *Plan) O.Option[txn.Error] {
     for (plan.directories != nil) {
         val owner: *Directory = plan.directories;
         if (owner.locked) {
-            val released: O.Option[txn.Error] = txn.unlock(?owner.held);
-            if (O.is_some[txn.Error](released)) {
-                if (O.unwrap[txn.Error](released).kind == txn.INVALID) { ret released; }
-                if (O.is_none[txn.Error](failure)) { failure = released; }
+            val released: err[txn.Error] = txn.unlock(?owner.held);
+            if (sel released.err) {
+                if (released.err.kind == txn.INVALID) { ret released; }
+                val first_released: bool = sel failure.ok;
+                if (first_released) { failure = released; }
             }
             owner.locked = false;
         }
         if (owner.opened) {
-            val released: O.Option[txn.Error] = txn.root_dnit(?owner.root);
-            if (O.is_some[txn.Error](released)) {
-                if (O.unwrap[txn.Error](released).kind == txn.INVALID) { ret released; }
-                if (O.is_none[txn.Error](failure)) { failure = released; }
+            val released: err[txn.Error] = txn.root_dnit(?owner.root);
+            if (sel released.err) {
+                if (released.err.kind == txn.INVALID) { ret released; }
+                val first_released: bool = sel failure.ok;
+                if (first_released) { failure = released; }
             }
         }
         plan.directories = owner.next;
         A.deallocate[Directory](plan.alloc, owner, 1);
     }
     plan.address = 0;
-    plan.state = 0;
+    plan.state   = 0;
     ret failure;
 }
 
 fun t_plan_lifetime(conflict: bool) i32 {
-    var alloc: A.Allocator;
-    if (O.is_some[str](page.make(?alloc))) { ret 1; }
-    val temporary: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "mach-publication-plan");
-    if (R.is_err[fs.TempFile, str](temporary)) { ret 1; }
-    var temp: fs.TempFile = R.unwrap_ok[fs.TempFile, str](temporary);
-    val root: str = fs.temp_path(?temp);
-    if (O.is_some[str](fs.temp_close_and_remove(?temp))) { str_free(?alloc, root); ret 1; }
-    fin { fs.remove_all(?alloc, root); str_free(?alloc, root); }
-    if (O.is_some[str](fs.create_dir_all(?alloc, root, 0o755))) { ret 1; }
-    val first_r: R.Result[str, str] = path.join(?alloc, root, "first");
-    if (R.is_err[str, str](first_r)) { ret 1; }
-    val first: str = R.unwrap_ok[str, str](first_r);
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val temporary: res[fs.TempFile, fs.FsError] = fs.temp_create(?alloc, "mach-publication-plan");
+    if (sel temporary.err) { ret 1; }
+    var temp:                    fs.TempFile         = temporary.ok;
+    val root:                    str                 = fs.temp_path(?temp);
+    val temp_close_and_remove_r: err[io_error.Error] = fs.temp_close_and_remove(?temp);
+    if (sel temp_close_and_remove_r.err) {
+        str_free(?alloc, root);
+        ret 1;
+    }
+    fin {
+        fs.remove_all(?alloc, root);
+        str_free(?alloc, root);
+    }
+    val create_dir_all_r: err[fs.FsError] = fs.create_dir_all(?alloc, root, 0o755);
+    if (sel create_dir_all_r.err) { ret 1; }
+    val first_r: res[str, A.Error] = path.join(?alloc, root, "first");
+    if (sel first_r.err) { ret 1; }
+    val first: str = first_r.ok;
     fin { str_free(?alloc, first); }
     var second_leaf: str = "second";
     if (conflict) { second_leaf = ".machtxn.reserved"; }
-    val second_r: R.Result[str, str] = path.join(?alloc, root, second_leaf);
-    if (R.is_err[str, str](second_r)) { ret 1; }
-    val second: str = R.unwrap_ok[str, str](second_r);
+    val second_r: res[str, A.Error] = path.join(?alloc, root, second_leaf);
+    if (sel second_r.err) { ret 1; }
+    val second: str = second_r.ok;
     fin { str_free(?alloc, second); }
-    var plan: Plan;
-    if (O.is_some[txn.Error](init(?plan, ?alloc))) { ret 2; }
+    var plan:   Plan;
+    val init_r: err[txn.Error] = init(?plan, ?alloc);
+    if (sel init_r.err) { ret 2; }
     fin { dnit(?plan); }
-    val a: R.Result[*Destination, str] = add(?plan, first, false);
-    val b: R.Result[*Destination, str] = add(?plan, second, false);
-    if (R.is_err[*Destination, str](a) || R.is_err[*Destination, str](b)) { ret 2; }
-    val one: *Destination = R.unwrap_ok[*Destination, str](a);
-    val two: *Destination = R.unwrap_ok[*Destination, str](b);
+    val a: res[*Destination, outcome.Fail] = add(?plan, first, false);
+    val b: res[*Destination, outcome.Fail] = add(?plan, second, false);
+    if (sel a.err) { ret 2; }
+    if (sel b.err) { ret 2; }
+    val one: *Destination = a.ok;
+    val two: *Destination = b.ok;
     if (one == two || one.directory != two.directory) { ret 3; }
-    var copied: Plan = plan;
-    if (O.is_none[txn.Error](dnit(?copied))) { ret 4; }
-    val admitted: O.Option[txn.Error] = seal(?plan);
+    var copied: Plan           = plan;
+    val dnit_r: err[txn.Error] = dnit(?copied);
+    if (sel dnit_r.ok) { ret 4; }
+    val admitted: err[txn.Error] = seal(?plan);
     if (conflict) {
-        if (O.is_none[txn.Error](admitted)) { ret 5; }
-        if (fs.exists(first) || fs.exists(second)) { ret 6; }
-        if (O.is_some[txn.Error](dnit(?plan))) { ret 7; }
+        if (sel admitted.ok) { ret 5; }
+        val exists_r:  res[bool, io_error.Error] = fs.exists(first);
+        val exists_r2: res[bool, io_error.Error] = fs.exists(second);
+        if ((sel exists_r.ok && exists_r.ok))   { ret 6; }
+        if ((sel exists_r2.ok && exists_r2.ok)) { ret 6; }
+        val dnit_r2: err[txn.Error] = dnit(?plan);
+        if (sel dnit_r2.err) { ret 7; }
         ret 0;
     }
-    if (O.is_some[txn.Error](admitted)) { ret 5; }
+    if (sel admitted.err)               { ret 5; }
     if (!one.reserved || !two.reserved) { ret 6; }
-    if (R.is_ok[*Destination, str](add(?plan, first, false))) { ret 7; }
+    val add_r: res[*Destination, outcome.Fail] = add(?plan, first, false);
+    if (sel add_r.ok) { ret 7; }
     var competing_root: txn.Root;
-    if (O.is_some[txn.Error](txn.root_open(?competing_root, root, ""))) { ret 8; }
+    val root_open_r:    err[txn.Error] = txn.root_open(?competing_root, root, "");
+    if (sel root_open_r.err) { ret 8; }
     fin { txn.root_dnit(?competing_root); }
     var competing_lock: txn.Lock;
-    if (O.is_none[txn.Error](txn.lock(?competing_lock, ?competing_root))) {
+    val lock_r:         err[txn.Error] = txn.lock(?competing_lock, ?competing_root);
+    if (sel lock_r.ok) {
         txn.unlock(?competing_lock);
         ret 9;
     }
     var transaction: txn.Transaction;
-    val prepared: O.Option[txn.Error] = txn.prepare_bytes(?transaction, ?alloc, ?one.claim,
+    val prepared:    err[txn.Error] = txn.prepare_bytes(?transaction, ?alloc, ?one.claim,
         "content", 7, 0o600, false,
         txn.PrepareOptions{precondition: txn.PRE_ABSENT, durability: txn.durability_none()});
-    if (O.is_some[txn.Error](prepared)) { ret 10; }
-    val premature: O.Option[txn.Error] = dnit(?plan);
-    val aborted: O.Option[txn.Error] = txn.abort(?transaction);
-    if (O.is_none[txn.Error](premature) || O.unwrap[txn.Error](premature).kind != txn.INVALID) { ret 11; }
-    if (O.is_some[txn.Error](aborted)) { ret 12; }
-    if (O.is_some[txn.Error](dnit(?plan))) { ret 13; }
-    if (O.is_some[txn.Error](txn.lock(?competing_lock, ?competing_root))) { ret 14; }
-    if (O.is_some[txn.Error](txn.unlock(?competing_lock))) { ret 15; }
-    if (fs.exists(first) || fs.exists(second)) { ret 16; }
+    if (sel prepared.err) { ret 10; }
+    val premature: err[txn.Error] = dnit(?plan);
+    val aborted:   err[txn.Error] = txn.abort(?transaction);
+    if (sel premature.ok)                  { ret 11; }
+    if (premature.err.kind != txn.INVALID) { ret 11; }
+    if (sel aborted.err)                   { ret 12; }
+    val dnit_r3: err[txn.Error] = dnit(?plan);
+    if (sel dnit_r3.err) { ret 13; }
+    val lock_r2: err[txn.Error] = txn.lock(?competing_lock, ?competing_root);
+    if (sel lock_r2.err) { ret 14; }
+    val unlock_r: err[txn.Error] = txn.unlock(?competing_lock);
+    if (sel unlock_r.err) { ret 15; }
+    val exists_r3: res[bool, io_error.Error] = fs.exists(first);
+    val exists_r4: res[bool, io_error.Error] = fs.exists(second);
+    if ((sel exists_r3.ok && exists_r3.ok)) { ret 16; }
+    if ((sel exists_r4.ok && exists_r4.ok)) { ret 16; }
     ret 0;
 }
 
