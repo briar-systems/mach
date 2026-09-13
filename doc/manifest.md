@@ -251,7 +251,11 @@ float argument rides an integer register — while the `f` and `d` suffixes are
 means by "riscv64", and is the convention `mach init` scaffolds for a
 `riscv64`/`linux` target; a manifest that wants soft float, or the `f`-only
 convention, must name it explicitly, since `abi` has no default of its own
-(see [Totality](#totality)). `riscv32`
+(see [Totality](#totality)). `linux` accepts all three on `riscv64` because
+its kernel ABI is integer-only, whereas every operating system accepts only
+the conventions it declares per instruction set (`linux` and `darwin` refuse
+`win64` on `x86_64`, `windows` refuses `sysv64`) and `freestanding` accepts
+every convention the instruction set covers. `riscv32`
 currently only reaches a `freestanding` target — `mach info targets` lists
 `freestanding-riscv32` rows and no `linux`/`darwin` riscv32 row.
 

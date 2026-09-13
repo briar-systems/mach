@@ -1123,15 +1123,21 @@ Each dimension is orthogonal on its own, but the joint cells are not: an
 instruction set emits only with a wired code generator, a calling convention is
 per-ISA, an object format relocates and writes only the ISAs it declares, an
 operating system runs on only the ISAs it was ported to and links and loads only
-its own object formats, and an object format's emission shape must match the
-instruction set's back half — a whole-module emitter needs a format that carries
-finished modules, a register machine one that carries linkable objects. So
-`windows-aarch64` is absent (COFF covers x86-64 only) and `darwin-riscv64` is
-absent (Mach-O covers x86-64 and aarch64), while freestanding tuples appear for
-every ISA with an encoder. Selecting an uncovered tuple fails at composition
-naming the missing capability (for example `object format 'coff' does not cover
-aarch64 relocations` or `operating system 'windows' does not support object
-format 'elf'`) rather than deep in codegen or link. Adding a capability
+its own object formats, an operating system declares the calling conventions
+its platform can carry per instruction set (`linux` on `riscv64` carries the
+whole psABI float family, since the kernel ABI is integer-only, while
+`freestanding` declares itself unconstrained), and an object format's emission
+shape must match the instruction set's back half — a whole-module emitter needs
+a format that carries finished modules, a register machine one that carries
+linkable objects. So `windows-aarch64` is absent (COFF covers x86-64 only),
+`darwin-riscv64` is absent (Mach-O covers x86-64 and aarch64), and
+`linux-x86_64` lists only `sysv64`, while freestanding tuples appear for every
+ISA with an encoder and every convention the ISA covers. Selecting an
+uncovered tuple fails at composition naming the missing capability (for
+example `object format 'coff' does not cover aarch64 relocations`, `operating
+system 'windows' does not support object format 'elf'` or `operating system
+'linux' requires calling convention 'sysv64' on instruction set 'x86_64', not
+'win64'`) rather than deep in codegen or link. Adding a capability
 declaration to a vtable is the only step needed for a new tuple to appear.
 
 | Argument    | Value | Effect |
