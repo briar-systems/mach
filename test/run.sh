@@ -432,8 +432,8 @@ link_cell() {
     id=$(basename "$dir")
     label="$id [$leg/$profile]"
     build_target=${case_target:-$leg}
-    eng=$(engine "$leg")
-    case "$eng" in '') eng=native ;; *) eng="qemu:$eng" ;; esac
+    runner=$(engine "$leg")
+    case "$runner" in '') eng=native ;; *) eng="qemu:$runner" ;; esac
     tmp=$(mktemp -d)
     rm -rf "$dir/out/link"; mkdir -p "$dir/out/link"
     bin=$dir/out/link/prog$exe
@@ -479,7 +479,7 @@ link_cell() {
                     fail "$label check exit $rc"; sed 's/^/    /' "$tmp/err.txt"; rm -rf "$tmp"; return
                 fi
             elif [ "$case_run" = exec ]; then
-                ${eng#native} "$bin" >"$tmp/out.txt" 2>"$tmp/err.txt"; rc=$?
+                $runner "$bin" >"$tmp/out.txt" 2>"$tmp/err.txt"; rc=$?
                 if [ "$rc" -ne 0 ]; then
                     fail "$label exit $rc"; sed 's/^/    /' "$tmp/out.txt" "$tmp/err.txt"; rm -rf "$tmp"; return
                 fi
