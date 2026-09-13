@@ -166,6 +166,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `mach fmt` and `mach init` keep the transaction layer's lock sentinel, claims directory and backup container under `out/.mach-txn/<relative path>` instead of beside the sources they rewrite, so a formatted tree gains no `.mach-txn-lock` or `.machtxn.*` entries (#3310).
+- `mach fmt --check` locks nothing and creates no control home, and `mach init` into an absent destination locks through an ephemeral home under the temporary directory so the parent directory receives no sentinel (#3310).
+- `.gitignore` covers `.mach-txn-lock` and `.machtxn.*` against a pre-fix formatter (#3310).
 - Test return values are constrained to a status in `0..255` across test protocols, preventing return codes of 256 or multiples of 256 from being masked as passing exit status 0 on Linux and Darwin (#3241).
 - A literal-shaped `ret` outside `0..255` in a test body is a compile error at the `ret` naming the value, such as `test result 256 is outside the status range 0..255` (#3241).
 - The test dispatcher folds runtime results outside `0..255` to `255` before exiting, ensuring failure reporting with identical status across every host (#3241).
