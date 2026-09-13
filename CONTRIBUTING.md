@@ -4,14 +4,10 @@ Thank you for your interest in contributing to Mach. Be respectful,
 constructive, and professional: treat Mach like a passion project and its
 community like family.
 
+
 ## Building
 
-Mach is self-hosting, so building it needs an existing Mach 5 compiler: the
-development source is Mach 5 source pinned to std 2.0.0, and no 4.x release
-reads it. Install a 5.0 [release](https://github.com/briar-systems/mach/releases),
-or build one from the published 4.26.5 seed with
-`.github/actions/setup-mach/bootstrap.py`, the pinned chain CI runs on every
-native host.
+Mach is self-hosting, so building it needs an existing Mach compiler, which is available as a precompiled binary on the [releases](https://github.com/briar-systems/mach/releases) page.
 
 ```bash
 git clone https://github.com/briar-systems/mach.git
@@ -24,9 +20,6 @@ The compiler is written to `out/<target>/<profile>/bin/mach`, or
 `bin/mach.exe` on Windows. A default Linux x86_64 build writes
 `out/linux-x86_64/debug/bin/mach`.
 
-The installed compiler is the seed. Generation A is built by the seed, B by
-A, and C by B. B and C must be byte-identical; A may differ from B while the
-seed carries an older code generator.
 
 ## Testing and formatting
 
@@ -42,12 +35,14 @@ out/linux-x86_64/debug/bin/mach fmt .
 The tree is canonical: `mach fmt .` must leave it unchanged before a pull
 request is opened (`mach fmt --check .` reports what differs).
 
+
 ## Branching
 
 - `main` holds tagged releases only. It takes integration merges from `dev`.
 - `dev` is the integration branch and the target of every pull request.
 - `feat/<issue>` and `fix/<issue>` branch off `dev` and return to it.
 - `hotfix/<issue>` branches off `main` and merges into both `main` and `dev`.
+
 
 ## Commits
 
@@ -61,8 +56,14 @@ Longer explanation if needed.
 ```
 
 The types are `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, and
-`style`. A change with no issue uses `chore: ...` with no scope. Never add a
-`Co-Authored-By` trailer.
+`style`. A change with no issue uses `chore: ...` with no scope.
+
+If no related issue exists, just supply a type without the scope, e.g:
+
+```
+chore: update dependencies
+```
+
 
 ## Pull requests
 
@@ -77,11 +78,13 @@ The types are `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, and
 - When the target is not the default branch, close the linked issue by hand
   after the merge.
 
+
 ## Issues
 
 File issues through the templates. Each template names the sidebar fields a
 template cannot set: the type label, the `area:*` labels, a `target:*` label
 when the work is target-specific, and the milestone.
+
 
 ## Versioning
 
@@ -95,6 +98,7 @@ A release bump updates both `[project].version` in `mach.toml` and
 `MACH_VERSION` in `src/lang/version.mach`; CI and the tag workflow require
 the two to match. Tags are created on `main` after the integration merge
 from `dev`.
+
 
 ## License
 
