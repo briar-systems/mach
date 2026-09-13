@@ -336,6 +336,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A declared `subsystem`, from `--subsystem` or an artifact's `subsystem`
+  key, is refused as unsupported on a target whose image format has no such
+  field (ELF, Mach-O, a flat image), naming the declaration, the target and
+  the format; it was accepted and silently unread. An omitted key is still
+  the console default everywhere. An artifact that needs the key on windows
+  and also targets a linux or darwin cell declares one artifact per format.
+  Every dispatch over a closed catalog is now a total lookup: a name helper
+  or a caller-matched default answers `opt`, a partition is recorded by a
+  test that names every member of its catalog, the three remaining catalog
+  panics (the type spelling's two passes and the MIR operand lowering)
+  carry a `Result` to their callers, and the `catalog-defaults` census in
+  `test/census.sh` covers every catalog under `src/` with an empty
+  exception list. (#3124)
+
 - The compiler builds against std 2.0 (std dev `e204cb81f`) and CI
   bootstraps it through the v5 migration stage (mach `2a2918b23` with std
   1.0.1) after the audited 4.30 fixpoint (#3226, lane C1). The language
