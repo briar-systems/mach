@@ -265,9 +265,11 @@ dependency is rejected.
 precedence — the flag wins over the manifest, and the manifest over the `console`
 default. `gui` writes `IMAGE_SUBSYSTEM_WINDOWS_GUI` into the PE optional header so
 the Windows loader starts the process without attaching a console window; `console`
-is the default and what mach has always emitted. Only the PE writer reads it, so
-passing the flag on a non-windows target is accepted and changes nothing about the
-output — the same inertness the manifest key has.
+is the default and what mach has always emitted. Only the PE image carries the
+field, so passing the flag on a target whose format has none (ELF, Mach-O, a flat
+image) is refused as unsupported, naming the flag, the target and the format:
+`--subsystem: Subsystem gui is unsupported by elf (target 'host' produces a elf
+image, which declares no subsystem)`. The same holds for the manifest key.
 
 ### External link inputs
 

@@ -555,7 +555,7 @@ reads the selected artifact's name.
 | `targets` | yes | Array of declared target names this artifact builds for; `["*"]` means every declared target. |
 | `link`    | yes | Array of `[link.X]` names this artifact links (see below). `[]` for none. A name with no table is a manifest error naming the artifact and the declared tables (`[artifact.p1].link names no [link.*] table: 'nosuch' (declared: [link.kernel32])`). |
 | `need`    | yes | Array of category-qualified requirements such as `step.generate`, `artifact.support`, and `artifact.shader-*`. Each glob matches only its named category. `[]` for none. See [Artifact requirements](#artifact-requirements). |
-| `subsystem` | no | `"console"` (default) or `"gui"` — the environment a windows executable declares it runs under (see below). |
+| `subsystem` | no | `"console"` (default) or `"gui"` — the environment a windows executable declares it runs under; refused on a target whose image format has no subsystem (see below). |
 | `icon` | no | Project-root-relative `.ico` path embedded in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
 | `manifest` | no | Project-root-relative application-manifest path embedded byte-for-byte in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
 | `default` | no | `true` marks the artifact chosen when a command needs one artifact (`mach test`, `mach run`, the editor's union build) and several declared artifacts support the selected target. Exactly one of those candidates may carry it; an explicit `--bin`/`--lib` always wins, and a sole candidate needs no marker. |
@@ -636,14 +636,22 @@ has ever emitted declares, so an artifact that omits the key is byte-identical t
 one built before the key existed. A graphical application sets `"gui"` to stop an
 empty console from opening behind it on launch.
 
-The key takes no `os` filter, and it is not an error on a linux or darwin target.
-Only the PE writer consumes it — ELF, Mach-O, and flat images have no such field —
-so on any other target the key is accepted and inert, changing nothing about the
-output. That matches how `[link.X]` entries carry `os`/`isa`/`abi` axes on every
-declaration and simply do not apply to the cells they do not match: the manifest
-stays one declaration read by every build, rather than a per-platform file.
+Only a PE image carries the field. A key written on an artifact that is planned
+for a target whose format has none (ELF, Mach-O, a flat image) is refused as
+unsupported, naming the key, the target and the format:
 
-`--subsystem console|gui` overrides the key for one invocation; see
+```
+mach.toml: artifact.game.subsystem: Subsystem gui is unsupported by elf (target 'host' produces a elf image, which declares no subsystem)
+```
+
+An omitted key is the console default and is never refused, so an artifact
+that declares no subsystem still builds everywhere. An artifact that needs the
+key and also targets a non-windows cell declares two artifacts, one per format,
+the way `[link.X]` entries carry `os`/`isa`/`abi` axes: the manifest never
+carries a declaration a build silently ignores.
+
+`--subsystem console|gui` overrides the key for one invocation and is refused
+the same way on a target whose format has no subsystem; see
 [cli.md](cli.md#mach-build).
 
 ### `icon` / `manifest` — Windows executable resources
