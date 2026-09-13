@@ -29,10 +29,8 @@ import binds the entry shared by its library artifacts marked `default =
 true`; import a full path, or mark one static or shared [artifact.*] table (or
 several sharing one entry) default = true in its manifest`). Longer paths are
 unaffected: `use std.print;` needs no default artifact. A dependency that
-declares no artifact at all has no public module either; the 4.30 fallback to
-an implicit `lib.mach` was removed in 5.0.0 and the refusal says so
-(`project 'x' declares no artifact, so it has no public module; the implicit
-`lib.mach` entry of an artifact-less dependency was removed in 5.0.0: import a
+declares no artifact at all has no public module either, and the refusal says
+so (`project 'x' declares no artifact, so it has no public module: import a
 full path, or declare a static or shared [artifact.*] table marked default =
 true in its manifest`), so a library declares its artifact.
 

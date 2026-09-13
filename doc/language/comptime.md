@@ -16,8 +16,8 @@ this channel.
 
 > Per-declaration codegen attributes (symbol rename, library pin, inline,
 > align, section) are written as **`#[...]` decorators**, not `$`-comptime
-> shapes — see [decorators.md](decorators.md). The legacy `$sym.attr = value`
-> attribute setters were removed in v2.0.0.
+> shapes — see [decorators.md](decorators.md). A comptime directive takes no
+> `=`; a stray one is a parse error at the directive's terminator.
 
 The parser distinguishes these by structure:
 
@@ -45,12 +45,10 @@ used for `$mach.{os,arch,abi}.*` comparison. Flat `$project.version` is the whol
 version **string** (`"2.0.0"`); the structured `$project.version.{major,minor,
 patch}` folds its integer components — both are available. `[project]` has
 exactly the keys `id`, `version`, `src`, and `out`
-([manifest.md](manifest.md#project)). `$project.name` and
-`$project.description` read the 4.26.x keys of the same names and were removed
-with them in 5.0.0: each is refused at its use site by name (`` `$project.name`
-was removed in 5.0.0 with the `[project] name` manifest key ``), not re-sourced
-from another key. A path the root does not carry reports its own message
-(`` unknown `$project.*` path ``) at the path. See
+([manifest.md](manifest.md#project)), and `$project.*` carries exactly `id`
+and `version`. A path the root does not carry, `$project.name` and
+`$project.description` included, reports `` unknown `$project.*` path `` at
+the path. See
 [comptime-mach.md](comptime-mach.md) for the `$mach.*` subtree.
 
 ```mach

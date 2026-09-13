@@ -51,8 +51,8 @@ For generics, the type arguments appear in brackets before the body.
 
 A tag value names its type and its case, and carries a positional payload only
 when the case declares one. Omitting a required payload, supplying a payload to a
-payloadless case, supplying more than one, naming the payload, or using the
-withdrawn record-literal form is a compile error.
+payloadless case, supplying more than one, naming the payload, or writing the
+tag type before a brace (`Type{...}`, which names no case) is a compile error.
 
 Vector literals (`f32x4{ 1.0, 2.0, 3.0, 4.0 }`) follow the same brace shape, but
 require one positional initializer per lane. See [types.md](types.md#simd-vectors).

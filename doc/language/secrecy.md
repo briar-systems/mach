@@ -153,7 +153,7 @@ fun publish(a: ^u32) u32 { ret a:>u32; }
 fun publish2(a: ^*u8) *u8 { ret a:>*u8; }
 ```
 
-The 4.30 spellings are refused by name:
+`:^` is no operator; the parse stops at the colon:
 
 ```mach
 fun publish(a: ^u32) u32 { ret a:^u32; }
@@ -164,9 +164,9 @@ fun publish(a: ^u32) u32 { ret a:^u32; }
 no operator of its own: a public value coerces up to secret implicitly, and a
 cast to a secret type (`x::^u16`) is an ordinary cast.
 
-The 4.30 spellings `:^` (bare, no target) and `:^T` were removed in 5.0.0.
-Writing either is a parse error naming the removal and `:>T`; there is no
-untyped declassification. Inside a generic body the operand may be typed by a
+`:>T` is the only declassification and there is no untyped form: `:^` is not
+an operator, so `x:^` and `x:^T` are parse errors at the colon. Inside a
+generic body the operand may be typed by a
 parameter (`fun show[U](s: U) u32 { ret s:>u32; }`): the template cannot decide
 whether `u32` is `U` stripped, so it checks only that the target is public and
 each instance settles the equality under its concrete arguments, the way every
