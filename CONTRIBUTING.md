@@ -7,7 +7,10 @@ community like family.
 
 ## Building
 
-Mach is self-hosting, so building it needs an existing Mach compiler, which is available as a precompiled binary on the [releases](https://github.com/briar-systems/mach/releases) page.
+Mach is self-hosting, so building it needs an existing Mach compiler. Install
+the latest [release](https://github.com/briar-systems/mach/releases) for your
+host and put `mach` on `PATH`; CI seeds from the same archive
+(`.github/actions/seed-mach`).
 
 ```bash
 git clone https://github.com/briar-systems/mach.git
