@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.0.1] - 2026-09-13
+
+### Added
+
+- `driver.analyze_project_tolerant` answers the `Project` whenever the frontend ran, whatever its phases decided, with every module that reached a phase carrying that phase's product beside the diagnostics and the standing readable through `passes.frontend_status`; `err` is an operational failure only. `analyze_project` and `analyze_project_until` keep releasing the project on a rejected phase (#3337).
+
+### Fixed
+
+- A rejected frontend query operation no longer drops the trees, resolve results and sema results of the modules that reached the phase, and the resolve and sema passes publish a module's product on its entry before the export query that can reject it (#3337).
+
 ## [5.0.0] - 2026-09-13
 
 ### Added
