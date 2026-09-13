@@ -392,26 +392,28 @@ run_case() {
     passes=$((passes + 1))
 }
 
-for tool in llvm-objdump "${CC:-cc}"; do
-    command -v "$tool" >/dev/null 2>&1 || { echo "run.sh: $tool is not on PATH" >&2; exit 2; }
-done
-got_major=$(llvm-objdump --version | sed -n 's/.*LLVM version \([0-9]*\).*/\1/p' | head -n1)
-[ "$got_major" = "$objdump_major" ] ||
-    echo "run.sh: warning: llvm-objdump is major $got_major, the goldens were blessed with $objdump_major"
-
+# the tools the selected columns reach, checked before anything is built
+need_tool() { command -v "$1" >/dev/null 2>&1 || { echo "run.sh: $2 needs $1 on PATH" >&2; exit 2; }; }
 if [ "$link" -eq 0 ]; then
+for t in $targets; do
+    if [ "$(object_format "$t")" = spv ]; then
+        need_tool spirv-val "$t"; need_tool spirv-dis "$t"
+        spirv-val --version 2>/dev/null | grep -q "v$spirv_tools_version" ||
+            echo "run.sh: warning: spirv-tools is not $spirv_tools_version, the spirv goldens were blessed with it"
+    else
+        need_tool llvm-objdump "$t"
+        got_major=$(llvm-objdump --version | sed -n 's/.*LLVM version \([0-9]*\).*/\1/p' | head -n1)
+        [ "$got_major" = "$objdump_major" ] ||
+            echo "run.sh: warning: llvm-objdump is major $got_major, the goldens were blessed with $objdump_major"
+    fi
+    [ "$(engine "$t")" = - ] || need_tool "${CC:-cc}" "the $t differential"
+    [ "$dwarf" -eq 0 ] || need_tool llvm-dwarfdump --dwarf
+done
 echo "targets: $targets"
 echo "cases:   $(echo $cases | wc -w)"
 materialise
 for t in $targets; do
     fmt=$(object_format "$t")
-    if [ "$fmt" = spv ]; then
-        for tool in spirv-val spirv-dis; do
-            command -v $tool >/dev/null 2>&1 || { echo "run.sh: $t needs $tool on PATH" >&2; exit 2; }
-        done
-        $tool --version 2>/dev/null | grep -q "v$spirv_tools_version" ||
-            echo "run.sh: warning: spirv-tools is not $spirv_tools_version, the spirv goldens were blessed with it"
-    fi
     eng=$(engine "$t")
     case "$eng" in
         -) how="golden only" ;;
