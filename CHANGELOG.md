@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A path dependency copy leaves the source's build output behind, and the realized dependencies and build output of every project nested inside it, so re-pulling a path dependency produces the same copy as the first pull and a symlink under the source's `out/` no longer refuses the copy (#3356).
+
 ### Removed
 
 - The filesystem transaction layer behind every mutating command. Build outputs, cache entries and generated docs are written in place, and writes into the source tree (`mach fmt`, the `mach.toml` edits made by `dep` and `init`) go through a sibling `<file>.tmp` and rename. Nothing creates `.mach-txn-lock`, `.machtxn.claims/` or `out/.mach-txn/` any more, and `mach init` no longer needs those gitignore entries. Delete any stray `.mach-txn-lock`, `.machtxn.*` and `out/.mach-txn` left in existing checkouts (#3357).
