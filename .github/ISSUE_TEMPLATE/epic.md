@@ -2,14 +2,14 @@
 name: Epic
 about: Umbrella issue tracking a family of sub-issues
 title: "epic: "
-labels: ["epic"]
+labels: ["feature", "minor"]
 ---
 
 <!--
-Before submitting, set these in the sidebar, since a template cannot:
-  area:*    the dominant area or areas of the family
-  target:*  darwin, windows, or aarch64, only when the whole family is target-specific
-  milestone the track this epic represents
+Before submitting, adjust these in the sidebar:
+  magnitude minor or major
+  where     testing, tooling, or doc (leave blank for core compiler code)
+  flags     critical or blocked, when they apply
 Wire every child as a native sub-issue from the sidebar, and mirror the list in the
 ## Children checklist below so the body reads on its own. Write cross-repo children
 as owner/repo#N.

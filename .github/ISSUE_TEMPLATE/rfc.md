@@ -2,14 +2,13 @@
 name: RFC
 about: Design discussion or request for comment, direction not yet decided
 title: "RFC: "
-labels: ["rfc"]
+labels: ["discussion", "minor"]
 ---
 
 <!--
-Before submitting, set these in the sidebar, since a template cannot:
-  area:*    the area or areas the proposal touches
-  target:*  darwin, windows, or aarch64, only when the work is target-specific
-  milestone the track this belongs to, if any
+Before submitting, adjust these in the sidebar:
+  where     testing, tooling, or doc (leave blank for core compiler code)
+  flags     blocked, when it applies
 Put relationships in the body, like "Part of #N" or "Depends on #M".
 An RFC records an open question. Relabel or close it once the direction is decided and
 the implementation work is cut into feature or problem issues.
