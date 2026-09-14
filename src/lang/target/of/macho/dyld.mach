@@ -1,0 +1,679 @@
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.target.of;
+use mach.lang.target.of.bin;
+use mach.lang.target.of.macho.loadcmd;
+use mach.lang.target.of.macho.unwind;
+use A: std.allocator;
+use std.allocator.page;
+use std.collections.sort;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+pub rec MachoDynLayout {
+    hdr_span:      usize;
+    pagezero_size: u64;
+    text_va:       u64;
+
+    stubs_off:  usize;
+    stubs_va:   u64;
+    stubs_size: usize;
+
+    got_off:       usize;
+    got_va:        u64;
+    got_size:      usize;
+    got_seg_index: u32;
+
+    linkedit_off:  usize;
+    linkedit_va:   u64;
+    linkedit_size: usize;
+
+    rebase_off:  usize;
+    rebase_size: usize;
+    bind_off:    usize;
+    bind_size:   usize;
+    symtab_off:  usize;
+    strtab_off:  usize;
+    strtab_size: usize;
+}
+
+pub fun write_uleb(buf: *u8, off: usize, v: u64) usize {
+    var value: u64   = v;
+    var p:     usize = off;
+    var more:  bool  = true;
+    for (more) {
+        var byte: u8 = (value & 0x7F)::u8;
+        value = value >> 7;
+        if (value != 0) { byte = byte | 0x80; }
+        or              { more = false; }
+        buf[p] = byte;
+        p      = p + 1;
+    }
+    ret p;
+}
+
+pub fun uleb_size(v: u64) usize {
+    var value: u64   = v;
+    var n:     usize = 1;
+    for (value >= 0x80) {
+        value = value >> 7;
+        n     = n + 1;
+    }
+    ret n;
+}
+
+pub fun write_sleb(buf: *u8, off: usize, v: i64) usize {
+    var value: i64   = v;
+    var p:     usize = off;
+    var more:  bool  = true;
+    for (more) {
+        var byte: u8 = (value::u64 & 0x7F)::u8;
+        value = value >> 7;
+        val sign: bool = (byte & 0x40) != 0;
+        if ((value == 0 && !sign) || (value == -1 && sign)) { more = false; }
+        or                                                  { byte = byte | 0x80; }
+        buf[p] = byte;
+        p      = p + 1;
+    }
+    ret p;
+}
+
+pub fun sleb_size(v: i64) usize {
+    var value: i64   = v;
+    var n:     usize = 0;
+    var more:  bool  = true;
+    for (more) {
+        val sign: bool = (value & 0x40) != 0;
+        value = value >> 7;
+        n     = n + 1;
+        if ((value == 0 && !sign) || (value == -1 && sign)) { more = false; }
+    }
+    ret n;
+}
+
+pub fun func_import_count(dyn: *of.DynamicInfo) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < dyn.import_count) {
+        if (dyn.imports[i].is_func) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+pub fun import_has_addr_fixup(dyn: *of.DynamicInfo, import_index: u32) bool {
+    var i: u32 = 0;
+    for (i < dyn.import_addr_fixup_count) {
+        if (dyn.import_addr_fixups[i].kind != of.RK_ABS64
+            && dyn.import_addr_fixups[i].import_index == import_index) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+pub fun import_needs_got(dyn: *of.DynamicInfo, import_index: u32) bool {
+    if (import_index >= dyn.import_count) { ret false; }
+    ret dyn.imports[import_index].is_func || import_has_addr_fixup(dyn, import_index);
+}
+
+pub fun got_import_count(dyn: *of.DynamicInfo) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < dyn.import_count) {
+        if (import_needs_got(dyn, i)) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+pub fun macho_stub_size(arch_id: u32) usize {
+    if (loadcmd.arch_is_arm64(arch_id)) { ret loadcmd.MACHO_ARM64_STUB_SIZE; }
+    ret loadcmd.MACHO_X86_STUB_SIZE;
+}
+
+pub fun write_macho_stub(buf: *u8, arch_id: u32, stub_off: usize, stub_va: u64, slot_va: u64) {
+    if (loadcmd.arch_is_arm64(arch_id)) {
+        val slot_page: u64 = (slot_va >> 12) << 12;
+        val stub_page: u64 = (stub_va >> 12) << 12;
+        val delta:     i64 = (slot_page::i64) - (stub_page::i64);
+        val imm21:     u64 = ((delta >> 12)::u64) & 0x1FFFFF;
+        val immlo:     u32 = (imm21 & 0x3)::u32;
+        val immhi:     u32 = ((imm21 >> 2) & 0x7FFFF)::u32;
+        bin.write_u32_le(buf, stub_off, 0x90000000 | (immlo << 29) | (immhi << 5) | 16);
+        val imm12: u32 = (((slot_va & 0xFFF) >> 3) & 0xFFF)::u32;
+        bin.write_u32_le(buf, stub_off + 4, 0xF9400000 | (imm12 << 10) | (16 << 5) | 16);
+        bin.write_u32_le(buf, stub_off + 8, 0xD61F0200);
+        ret;
+    }
+    buf[stub_off]     = 0xFF;
+    buf[stub_off + 1] = 0x25;
+    val next: u64 = stub_va + 6;
+    bin.write_u32_le(buf, stub_off + 2, (slot_va - next)::u32);
+}
+
+pub fun dylib_ordinal_for(dyn: *of.DynamicInfo, import_index: u32) u32 {
+    val li: u32 = dyn.imports[import_index].lib_index;
+    if (li == of.DYNLIB_ANY) { ret loadcmd.DYNAMIC_LOOKUP_ORDINAL::u32; }
+    ret li + 1;
+}
+
+pub fun measure_bind_prefix(itn: *intern.Interner, dyn: *of.DynamicInfo, import_index: u32) usize {
+    var size: usize = 0;
+    val ord:  u32   = dylib_ordinal_for(dyn, import_index);
+    if (dyn.imports[import_index].lib_index == of.DYNLIB_ANY) { size = 1; }
+    or (ord <= 15)                                            { size = 1; }
+    or                                                        { size = 1 + uleb_size(ord::u64); }
+    val name: str   = bin.resolve_name(itn, dyn.imports[import_index].symbol);
+    var nl:   usize = 0;
+    if (name != nil) { nl = str_len(name); }
+    ret size + 1 + nl + 1 + 1;
+}
+
+pub fun write_bind_prefix(buf: *u8, off: usize, itn: *intern.Interner,
+    dyn: *of.DynamicInfo, import_index: u32) usize {
+    var p: usize = off;
+    if (dyn.imports[import_index].lib_index == of.DYNLIB_ANY) {
+        buf[p] = loadcmd.BIND_OPCODE_SET_DYLIB_SPECIAL_IMM | loadcmd.BIND_SPECIAL_DYLIB_FLAT_LOOKUP;
+        p      = p + 1;
+    }
+    or {
+        val ord: u32 = dylib_ordinal_for(dyn, import_index);
+        if (ord <= 15) {
+            buf[p] = loadcmd.BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | (ord::u8 & 0xF);
+            p      = p + 1;
+        }
+        or {
+            buf[p] = loadcmd.BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB;
+            p      = write_uleb(buf, p + 1, ord::u64);
+        }
+    }
+
+    buf[p] = loadcmd.BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM;
+    p      = p + 1 + bin.write_str(buf, p + 1, bin.resolve_name(itn, dyn.imports[import_index].symbol));
+
+    buf[p] = loadcmd.BIND_OPCODE_SET_TYPE_IMM | loadcmd.BIND_TYPE_POINTER;
+    ret p + 1;
+}
+
+pub fun measure_bind_info(itn: *intern.Interner, dyn: *of.DynamicInfo,
+    segs: *of.LoadSegment, text_va: u64, pz: u32) usize {
+    var size: usize = 0;
+    var n:    u32   = 0;
+    var f:    u32   = 0;
+    for (f < dyn.import_addr_fixup_count) {
+        val fx: *of.ImportAddrFixup = ?dyn.import_addr_fixups[f];
+        if (fx.kind == of.RK_ABS64) {
+            size = size + measure_bind_prefix(itn, dyn, fx.import_index);
+            if (fx.addend != 0) { size = size + 1 + sleb_size(fx.addend); }
+            var bseg: u32 = 0;
+            var boff: u64 = 0;
+            unwind.seg_offset_loc(dyn, fx.seg_index, fx.seg_offset, segs, text_va, pz, ?bseg, ?boff);
+            size = size + 1 + uleb_size(boff);
+            size = size + 1;
+            n    = n + 1;
+        }
+        f = f + 1;
+    }
+    var i: u32 = 0;
+    var g: u32 = 0;
+    for (i < dyn.import_count) {
+        if (import_needs_got(dyn, i)) {
+            size = size + measure_bind_prefix(itn, dyn, i);
+            size = size + 1 + uleb_size(g::u64 * 8);
+            size = size + 1;
+            g    = g + 1;
+            n    = n + 1;
+        }
+        i = i + 1;
+    }
+    if (n > 0) { size = size + 1; }
+    ret size;
+}
+
+pub fun write_bind_info(buf: *u8, off: usize, itn: *intern.Interner, dyn: *of.DynamicInfo,
+    segs: *of.LoadSegment, text_va: u64, pz: u32, got_seg_index: u32) usize {
+    var p: usize = off;
+    var n: u32   = 0;
+    var f: u32   = 0;
+    for (f < dyn.import_addr_fixup_count) {
+        val fx: *of.ImportAddrFixup = ?dyn.import_addr_fixups[f];
+        if (fx.kind == of.RK_ABS64) {
+            p = write_bind_prefix(buf, p, itn, dyn, fx.import_index);
+            if (fx.addend != 0) {
+                buf[p] = loadcmd.BIND_OPCODE_SET_ADDEND_SLIB_ULEB;
+                p      = write_sleb(buf, p + 1, fx.addend);
+            }
+            var bseg: u32 = 0;
+            var boff: u64 = 0;
+            unwind.seg_offset_loc(dyn, fx.seg_index, fx.seg_offset, segs, text_va, pz, ?bseg, ?boff);
+            buf[p] = loadcmd.BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (bseg::u8 & 0xF);
+            p      = write_uleb(buf, p + 1, boff);
+            buf[p] = loadcmd.BIND_OPCODE_DO_BIND;
+            p      = p + 1;
+            n      = n + 1;
+        }
+        f = f + 1;
+    }
+    var i: u32 = 0;
+    var g: u32 = 0;
+    for (i < dyn.import_count) {
+        if (import_needs_got(dyn, i)) {
+            p = write_bind_prefix(buf, p, itn, dyn, i);
+
+            buf[p] = loadcmd.BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (got_seg_index::u8 & 0xF);
+            p      = write_uleb(buf, p + 1, g::u64 * 8);
+
+            buf[p] = loadcmd.BIND_OPCODE_DO_BIND;
+            p      = p + 1;
+
+            g = g + 1;
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    if (n > 0) {
+        buf[p] = loadcmd.BIND_OPCODE_DONE;
+        p      = p + 1;
+    }
+    ret p;
+}
+
+pub fun base_reloc_cmp(a: *of.BaseReloc, b: *of.BaseReloc) i64 {
+    if (a.seg_index != b.seg_index) {
+        if (a.seg_index < b.seg_index) { ret -1; }
+        ret 1;
+    }
+    if (a.seg_offset < b.seg_offset) { ret -1; }
+    if (a.seg_offset > b.seg_offset) { ret 1; }
+    ret 0;
+}
+
+pub fun base_reloc_loc(dyn: *of.DynamicInfo, br: *of.BaseReloc, segs: *of.LoadSegment, text_va: u64, pz: u32,
+    out_seg: *u32, out_off: *u64) {
+    unwind.seg_offset_loc(dyn, br.seg_index, br.seg_offset, segs, text_va, pz, out_seg, out_off);
+}
+
+pub fun measure_rebase_info(dyn: *of.DynamicInfo, segs: *of.LoadSegment, text_va: u64, pz: u32) usize {
+    if (dyn.base_reloc_count == 0) { ret 0; }
+    var size: usize = 1;
+    var i:    u32   = 0;
+    for (i < dyn.base_reloc_count) {
+        var seg: u32 = 0;
+        var off: u64 = 0;
+        base_reloc_loc(dyn, ?dyn.base_relocs[i], segs, text_va, pz, ?seg, ?off);
+        size = size + 1 + uleb_size(off) + 1;
+        i    = i + 1;
+    }
+    size = size + 1;
+    ret size;
+}
+
+pub fun write_rebase_info(buf: *u8, off: usize, dyn: *of.DynamicInfo, segs: *of.LoadSegment,
+    text_va: u64, pz: u32) usize {
+    if (dyn.base_reloc_count == 0) { ret off; }
+    var p: usize = off;
+    buf[p] = loadcmd.REBASE_OPCODE_SET_TYPE_IMM | loadcmd.REBASE_TYPE_POINTER;
+    p      = p + 1;
+    var i: u32 = 0;
+    for (i < dyn.base_reloc_count) {
+        var seg:  u32 = 0;
+        var slot: u64 = 0;
+        base_reloc_loc(dyn, ?dyn.base_relocs[i], segs, text_va, pz, ?seg, ?slot);
+        buf[p] = loadcmd.REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (seg::u8 & 0xF);
+        p      = write_uleb(buf, p + 1, slot);
+        buf[p] = loadcmd.REBASE_OPCODE_DO_REBASE_IMM_TIMES | 1;
+        p      = p + 1;
+        i      = i + 1;
+    }
+    buf[p] = loadcmd.REBASE_OPCODE_DONE;
+    p      = p + 1;
+    ret p;
+}
+
+pub fun patch_macho_fixups(buf: *u8, arch_id: u32, lay: *MachoDynLayout, dyn: *of.DynamicInfo,
+    fixups: *of.PltFixup, fixup_count: u32, seg_offsets: *usize,
+    segs: *of.LoadSegment, seg_count: u32, nimp: u32) err[fail.Fail] {
+    if (nimp == 0) { ret err[fail.Fail].ok{}; }
+    val stub_sz: usize = macho_stub_size(arch_id);
+    var i:       u32   = 0;
+    for (i < fixup_count) {
+        val fx: *of.PltFixup = ?fixups[i];
+        if (fx.seg_index >= seg_count) {
+            ret err[fail.Fail].err{fail.message("macho: dynamic call-site fixup references an out-of-range segment")};
+        }
+        val n: u32 = macho_func_ordinal(dyn, fx.import_index);
+        if (n == 0xFFFFFFFF) {
+            ret err[fail.Fail].err{fail.message("macho: dynamic call-site fixup targets a non-function import")};
+        }
+        if (fx.seg_offset::usize + 4 > segs[fx.seg_index].filesz) {
+            ret err[fail.Fail].err{fail.message("macho: dynamic call-site fixup offset out of range")};
+        }
+
+        val stub_va:  u64   = lay.stubs_va + n::u64 * stub_sz::u64;
+        val disp:     i64   = (stub_va::i64) + fx.addend - (fx.patch_vaddr::i64);
+        val file_off: usize = seg_offsets[fx.seg_index] + fx.seg_offset::usize;
+
+        if (loadcmd.arch_is_arm64(arch_id)) {
+            val lim: i64 = 134217728;
+            if (disp < -lim || disp >= lim || (disp & 3) != 0) {
+                ret err[fail.Fail].err{fail.message("macho: dynamic call-site displacement overflows a 26-bit branch")};
+            }
+            val word:  u32 = bin.read_u32_le(buf, file_off);
+            val imm26: u32 = (((disp::u64) & 0x0FFFFFFC) >> 2)::u32;
+            bin.write_u32_le(buf, file_off, (word & 0xFC000000) | imm26);
+        }
+        or {
+            if (disp > 2147483647 || disp < -2147483648) {
+                ret err[fail.Fail].err{fail.message("macho: dynamic call-site displacement overflows 32 bits")};
+            }
+            bin.write_u32_le(buf, file_off, (disp::u64)::u32);
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+pub fun macho_pcrel_disp(target_va: u64, addend: i64,
+    patch_va: u64) res[i64, fail.Fail] {
+    val i64_max: i64 = 9223372036854775807;
+    val i64_min: i64 = -9223372036854775807 - 1;
+    if (target_va > i64_max::u64 || patch_va > i64_max::u64) {
+        ret res[i64, fail.Fail].err{fail.message("macho: pc-relative address exceeds the signed range")};
+    }
+    val delta: i64 = target_va::i64 - patch_va::i64;
+    if ((addend > 0 && delta > i64_max - addend)
+        || (addend < 0 && delta < i64_min - addend)) {
+        ret res[i64, fail.Fail].err{fail.message("macho: pc-relative signed arithmetic overflow")};
+    }
+    ret res[i64, fail.Fail].ok{delta + addend};
+}
+
+pub fun patch_macho_import_addr_fixups(buf: *u8, lay: *MachoDynLayout,
+    dyn: *of.DynamicInfo, seg_offsets: *usize,
+    segs: *of.LoadSegment,
+    seg_count: u32) err[fail.Fail] {
+    if (dyn.import_addr_fixup_count == 0) { ret err[fail.Fail].ok{}; }
+    if (buf == nil || seg_offsets == nil || segs == nil) {
+        ret err[fail.Fail].err{fail.message("macho: import-address fixup is missing output layout data")};
+    }
+    if (dyn.import_addr_fixups == nil) {
+        ret err[fail.Fail].err{fail.message("macho: nil import-address fixup array")};
+    }
+    if (dyn.import_count > 0 && dyn.imports == nil) {
+        ret err[fail.Fail].err{fail.message("macho: nil dynamic import array")};
+    }
+    var i: u32 = 0;
+    for (i < dyn.import_addr_fixup_count) {
+        val fx: *of.ImportAddrFixup = ?dyn.import_addr_fixups[i];
+        if (fx.kind == of.RK_ABS64) {
+            i = i + 1;
+            cnt;
+        }
+        if (fx.import_index >= dyn.import_count) {
+            ret err[fail.Fail].err{fail.message("macho: import-address fixup targets an out-of-range import")};
+        }
+        if (fx.seg_index >= seg_count) {
+            ret err[fail.Fail].err{fail.message("macho: import-address fixup references an out-of-range segment")};
+        }
+        var width: usize = 4;
+        if (fx.kind == of.RK_GOTPCREL64_NORELAX) { width = 8; }
+        or (fx.kind != of.RK_GOTPCREL && fx.kind != of.RK_GOTPCREL_NORELAX) {
+            ret err[fail.Fail].err{fail.message("macho: unsupported import-address relocation kind")};
+        }
+        if (fx.seg_offset::usize + width > segs[fx.seg_index].filesz) {
+            ret err[fail.Fail].err{fail.message("macho: import-address fixup offset out of range")};
+        }
+        val slot_n: u32 = macho_got_ordinal(dyn, fx.import_index);
+        if (slot_n == 0xFFFFFFFF || slot_n::usize * 8 + 8 > lay.got_size) {
+            ret err[fail.Fail].err{fail.message("macho: import-address fixup has no GOT slot")};
+        }
+        val slot_va: u64                 = lay.got_va + slot_n::u64 * 8;
+        val dr:      res[i64, fail.Fail] =
+            macho_pcrel_disp(slot_va, fx.addend, fx.patch_vaddr);
+        if (sel dr.err) {
+            ret err[fail.Fail].err{dr.err};
+        }
+        val disp:     i64   = dr.ok;
+        val file_off: usize = seg_offsets[fx.seg_index] + fx.seg_offset::usize;
+        if (width == 4) {
+            if (disp > 2147483647 || disp < -2147483648) {
+                ret err[fail.Fail].err{fail.message("macho: import-address displacement overflows 32 bits")};
+            }
+            bin.write_u32_le(buf, file_off, (disp::u64)::u32);
+        }
+        or {
+            bin.write_u64_le(buf, file_off, disp::u64);
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+pub fun macho_func_ordinal(dyn: *of.DynamicInfo, import_index: u32) u32 {
+    if (import_index >= dyn.import_count)   { ret 0xFFFFFFFF; }
+    if (!dyn.imports[import_index].is_func) { ret 0xFFFFFFFF; }
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < import_index) {
+        if (dyn.imports[i].is_func) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+pub fun macho_got_ordinal(dyn: *of.DynamicInfo, import_index: u32) u32 {
+    if (import_index >= dyn.import_count || !import_needs_got(dyn, import_index)) {
+        ret 0xFFFFFFFF;
+    }
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < import_index) {
+        if (import_needs_got(dyn, i)) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+test "mach.lang.target.of.macho.dyld:write_sleb" {
+    var buf:   [4]u8;
+    var cases: [9]i64;
+    cases[0] = 0;
+    cases[1] = 1;
+    cases[2] = -1;
+    cases[3] = 63;
+    cases[4] = 64;
+    cases[5] = -64;
+    cases[6] = -65;
+    cases[7] = 128;
+    cases[8] = -128;
+    var first: [9]u8;
+    first[0] = 0x00;
+    first[1] = 0x01;
+    first[2] = 0x7F;
+    first[3] = 0x3F;
+    first[4] = 0xC0;
+    first[5] = 0x40;
+    first[6] = 0xBF;
+    first[7] = 0x80;
+    first[8] = 0x80;
+    var second: [9]u8;
+    second[0] = 0xFF;
+    second[1] = 0xFF;
+    second[2] = 0xFF;
+    second[3] = 0xFF;
+    second[4] = 0x00;
+    second[5] = 0xFF;
+    second[6] = 0x7F;
+    second[7] = 0x01;
+    second[8] = 0x7F;
+    var sizes: [9]usize;
+    sizes[0] = 1;
+    sizes[1] = 1;
+    sizes[2] = 1;
+    sizes[3] = 1;
+    sizes[4] = 2;
+    sizes[5] = 1;
+    sizes[6] = 2;
+    sizes[7] = 2;
+    sizes[8] = 2;
+
+    var i: u32 = 0;
+    for (i < 9) {
+        var k: usize = 0;
+        for (k < 4) {
+            buf[k] = 0xEE;
+            k      = k + 1;
+        }
+        val end: usize = write_sleb(?buf[0], 0, cases[i]);
+        if (end != sizes[i] || sleb_size(cases[i]) != sizes[i]) { ret 1; }
+        if (buf[0] != first[i])                                 { ret 1; }
+        if (sizes[i] == 2 && buf[1] != second[i])               { ret 1; }
+        if (buf[end] != 0xEE)                                   { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.target.of.macho.dyld.write_bind_info:abs64_in_place_bind" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+
+    val ln: res[intern.StrId, A.Error] = intern.intern(?itn, "/usr/lib/libobjc.A.dylib");
+    val sn: res[intern.StrId, A.Error] = intern.intern(?itn, "__objc_empty_cache");
+    val cn: res[intern.StrId, A.Error] = intern.intern(?itn, "_objc_msgSend");
+    if (sel ln.err) { ret 1; }
+    if (sel sn.err) { ret 1; }
+    if (sel cn.err) { ret 1; }
+
+    var libs: [1]of.DynLib;
+    libs[0].name   = ln.ok;
+    libs[0].soname = libs[0].name;
+    libs[0].rpath  = intern.STR_NIL;
+
+    var imports: [2]of.DynImport;
+    imports[0].symbol     = sn.ok;
+    imports[0].lib_index  = 0;
+    imports[0].is_func    = false;
+    imports[0].ordinal    = 0;
+    imports[0].by_ordinal = false;
+    imports[1].symbol     = cn.ok;
+    imports[1].lib_index  = 0;
+    imports[1].is_func    = true;
+    imports[1].ordinal    = 0;
+    imports[1].by_ordinal = false;
+
+    var fixups: [2]of.ImportAddrFixup;
+    fixups[0].seg_index    = 2;
+    fixups[0].seg_offset   = 0x28;
+    fixups[0].import_index = 0;
+    fixups[0].patch_vaddr  = 0;
+    fixups[0].kind         = of.RK_ABS64;
+    fixups[0].addend       = 0;
+    fixups[1].seg_index    = 2;
+    fixups[1].seg_offset   = 0x38;
+    fixups[1].import_index = 0;
+    fixups[1].patch_vaddr  = 0;
+    fixups[1].kind         = of.RK_ABS64;
+    fixups[1].addend       = -8;
+
+    var segs: [3]of.LoadSegment;
+    segs[0].vaddr  = 0x1000;
+    segs[0].filesz = 0;
+    segs[0].memsz  = 0;
+    segs[0].flags  = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE;
+    segs[0].bytes  = nil;
+    segs[1].vaddr  = 0x2000;
+    segs[1].filesz = 0;
+    segs[1].memsz  = 0;
+    segs[1].flags  = of.SEG_FLAG_READ;
+    segs[1].bytes  = nil;
+    segs[2].vaddr  = 0x3000;
+    segs[2].filesz = 0;
+    segs[2].memsz  = 0;
+    segs[2].flags  = of.SEG_FLAG_READ | of.SEG_FLAG_WRITE;
+    segs[2].bytes  = nil;
+
+    var dyn: of.DynamicInfo;
+    dyn.libs                    = ?libs[0];
+    dyn.lib_count               = 1;
+    dyn.imports                 = ?imports[0];
+    dyn.import_count            = 2;
+    dyn.interp                  = intern.STR_NIL;
+    dyn.base_relocs             = nil::*of.BaseReloc;
+    dyn.base_reloc_count        = 0;
+    dyn.pie                     = true;
+    dyn.import_addr_fixups      = ?fixups[0];
+    dyn.import_addr_fixup_count = 2;
+
+    val want: usize = measure_bind_info(?itn, ?dyn, ?segs[0], 0x1000, 1);
+    var buf:  [128]u8;
+    var k:    usize = 0;
+    for (k < 128) {
+        buf[k] = 0xEE;
+        k      = k + 1;
+    }
+    val end: usize = write_bind_info(?buf[0], 0, ?itn, ?dyn, ?segs[0], 0x1000, 1, 4);
+    if (end != want) { ret 1; }
+
+    var p: usize = 0;
+    if (buf[p] != (loadcmd.BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | 1)) { ret 1; }
+    p = p + 1;
+    if (buf[p] != loadcmd.BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM) { ret 1; }
+    p = p + 1;
+    for (buf[p] != 0) { p = p + 1; }
+    p = p + 1;
+    if (buf[p] != (loadcmd.BIND_OPCODE_SET_TYPE_IMM | loadcmd.BIND_TYPE_POINTER)) { ret 1; }
+    p = p + 1;
+    if (buf[p] != (loadcmd.BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | 3)) { ret 1; }
+    p = p + 1;
+    if (buf[p] != 0x28) { ret 1; }
+    p = p + 1;
+    if (buf[p] != loadcmd.BIND_OPCODE_DO_BIND) { ret 1; }
+    p = p + 1;
+
+    if (buf[p] != (loadcmd.BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | 1)) { ret 1; }
+    p = p + 1;
+    if (buf[p] != loadcmd.BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM) { ret 1; }
+    p = p + 1;
+    for (buf[p] != 0) { p = p + 1; }
+    p = p + 1;
+    if (buf[p] != (loadcmd.BIND_OPCODE_SET_TYPE_IMM | loadcmd.BIND_TYPE_POINTER)) { ret 1; }
+    p = p + 1;
+    if (buf[p] != loadcmd.BIND_OPCODE_SET_ADDEND_SLIB_ULEB) { ret 1; }
+    p = p + 1;
+    if (buf[p] != 0x78) { ret 1; }
+    p = p + 1;
+    if (buf[p] != (loadcmd.BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | 3)) { ret 1; }
+    p = p + 1;
+    if (buf[p] != 0x38) { ret 1; }
+    p = p + 1;
+    if (buf[p] != loadcmd.BIND_OPCODE_DO_BIND) { ret 1; }
+    p = p + 1;
+
+    if (buf[p] != (loadcmd.BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | 1)) { ret 1; }
+    p = p + 1;
+    if (buf[p] != loadcmd.BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM) { ret 1; }
+    p = p + 1;
+    for (buf[p] != 0) { p = p + 1; }
+    p = p + 1;
+    if (buf[p] != (loadcmd.BIND_OPCODE_SET_TYPE_IMM | loadcmd.BIND_TYPE_POINTER)) { ret 1; }
+    p = p + 1;
+    if (buf[p] != (loadcmd.BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | 4)) { ret 1; }
+    p = p + 1;
+    if (buf[p] != 0x00) { ret 1; }
+    p = p + 1;
+    if (buf[p] != loadcmd.BIND_OPCODE_DO_BIND) { ret 1; }
+    p = p + 1;
+
+    if (buf[p] != loadcmd.BIND_OPCODE_DONE) { ret 1; }
+    p = p + 1;
+    if (p != end) { ret 1; }
+    ret 0;
+}
