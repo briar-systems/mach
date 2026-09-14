@@ -1,0 +1,640 @@
+use mach.lang.build.outcome;
+use mach.lang.fail;
+use fixture: mach.lang.output.testing;
+use std.allocator.page;
+use std.collections.vector.Vector;
+use fs: std.filesystem;
+use std.memory;
+use std.system.panic.panic;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+
+use mach.lang.intern;
+use mach.lang.layout;
+use mach.lang.target.isa;
+use mach.lang.target.of;
+use mach.lang.target.of.bin;
+use mach.lang.target.of.buildid;
+use mach.lang.target.of.plan;
+
+use std.crypto.hash.sha256;
+
+use mach.lang.target.of.macho;
+use mach.lang.target.of.macho.dyld;
+use mach.lang.target.of.macho.loadcmd;
+use mach.lang.target.of.macho.loadcmd.macho_page_size;
+use mach.lang.target.of.macho.parse;
+use mach.lang.target.of.macho.unwind;
+
+pub fun t_isa(id: u32) of.ObjectTarget {
+    var vt:  isa.IsaVTable = isa.machine_isa(id, "test", 0, 8, nil, nil, nil);
+    var out: of.ObjectTarget;
+    isa.object_target(?vt, ?out);
+    ret out;
+}
+
+pub fun t_intern(itn: *intern.Interner, s: str) intern.StrId {
+    val r: res[intern.StrId, A.Error] = intern.intern(itn, s);
+    if (sel r.err) { ret intern.STR_NIL; }
+    ret r.ok;
+}
+
+pub fun t_find_lc(buf: *u8, cmd: u32) usize {
+    val ncmds: u32   = bin.read_u32_le(buf, 16);
+    var off:   usize = loadcmd.MACH_HEADER_64_SIZE;
+    var c:     u32   = 0;
+    for (c < ncmds) {
+        if (bin.read_u32_le(buf, off) == cmd) { ret off; }
+        off = off + bin.read_u32_le(buf, off + 4)::usize;
+        c   = c + 1;
+    }
+    ret 0;
+}
+
+# the loadcmd.LC_UUID payload is the content hash: sha-256 over the signed range with
+# the uuid bytes as zero, shaped as a version 4 uuid. 0 when it is, else the
+# failing step
+pub fun t_uuid_matches_content(alloc: *A.Allocator, image: *Vector[u8]) u8 {
+    val uc: usize = t_find_lc(image.data, loadcmd.LC_UUID);
+    if (uc == 0)                                                           { ret 1; }
+    if (bin.read_u32_le(image.data, uc + 4) != loadcmd.UUID_CMD_SIZE::u32) { ret 2; }
+    val cs: usize = t_find_lc(image.data, loadcmd.LC_CODE_SIGNATURE);
+    if (cs == 0) { ret 3; }
+    val sig_off: usize = bin.read_u32_le(image.data, cs + 8)::usize;
+    if (sig_off > image.len || uc + loadcmd.UUID_CMD_SIZE > sig_off) { ret 4; }
+    val copy_r: res[*u8, A.Error] = A.allocate[u8](alloc, sig_off);
+    if (sel copy_r.err) { ret 5; }
+    val copy: *u8 = copy_r.ok;
+    fin { A.deallocate[u8](alloc, copy, sig_off); }
+    memory.raw_copy(copy::ptr, image.data::ptr, sig_off);
+    var k: usize = 0;
+    for (k < 16) {
+        copy[uc + 8 + k] = 0;
+        k                = k + 1;
+    }
+    var digest: [32]u8;
+    sha256.hash(copy, sig_off, ?digest[0]);
+    var want: [16]u8;
+    buildid.uuid_from_digest(?digest[0], ?want[0]);
+    if (!memory.raw_equal((image.data::usize + uc + 8)::ptr, (?want[0])::ptr, 16)) { ret 6; }
+    var zero: bool = true;
+    k = 0;
+    for (k < 16) {
+        if (want[k] != 0 && k != 6 && k != 8) { zero = false; }
+        k = k + 1;
+    }
+    if (zero) { ret 7; }
+    ret 0;
+}
+
+pub fun t_find_seg(buf: *u8, name: str) usize {
+    val ncmds: u32   = bin.read_u32_le(buf, 16);
+    var off:   usize = loadcmd.MACH_HEADER_64_SIZE;
+    var c:     u32   = 0;
+    for (c < ncmds) {
+        if (bin.read_u32_le(buf, off) == loadcmd.LC_SEGMENT_64 && loadcmd.fixed16_equals(buf, off + 8, name)) { ret off; }
+        off = off + bin.read_u32_le(buf, off + 4)::usize;
+        c   = c + 1;
+    }
+    ret 0;
+}
+
+pub fun t_bytes_contain(buf: *u8, start: usize, len: usize, needle: str) bool {
+    val nl: usize = str_len(needle);
+    if (nl == 0 || nl > len) { ret false; }
+    var i: usize = 0;
+    for (i + nl <= len) {
+        var j:   usize = 0;
+        var hit: bool  = true;
+        for (j < nl) {
+            if (buf[start + i + j] != needle[j]) {
+                hit = false;
+                brk;
+            }
+            j = j + 1;
+        }
+        if (hit) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+pub fun t_count_sg_read_only(buf: *u8) u32 {
+    val ncmds: u32   = bin.read_u32_le(buf, 16);
+    var off:   usize = loadcmd.MACH_HEADER_64_SIZE;
+    var n:     u32   = 0;
+    var c:     u32   = 0;
+    for (c < ncmds) {
+        if (bin.read_u32_le(buf, off) == loadcmd.LC_SEGMENT_64
+            && (bin.read_u32_le(buf, off + 68) & loadcmd.SG_READ_ONLY) != 0) { n = n + 1; }
+        off = off + bin.read_u32_le(buf, off + 4)::usize;
+        c   = c + 1;
+    }
+    ret n;
+}
+
+pub fun t_count_segs_named(buf: *u8, name: str) u32 {
+    val ncmds: u32   = bin.read_u32_le(buf, 16);
+    var off:   usize = loadcmd.MACH_HEADER_64_SIZE;
+    var n:     u32   = 0;
+    var c:     u32   = 0;
+    for (c < ncmds) {
+        if (bin.read_u32_le(buf, off) == loadcmd.LC_SEGMENT_64 && loadcmd.fixed16_equals(buf, off + 8, name)) { n = n + 1; }
+        off = off + bin.read_u32_le(buf, off + 4)::usize;
+        c   = c + 1;
+    }
+    ret n;
+}
+
+pub fun t_seg_ordinal(buf: *u8, name: str) u32 {
+    val ncmds: u32   = bin.read_u32_le(buf, 16);
+    var off:   usize = loadcmd.MACH_HEADER_64_SIZE;
+    var n:     u32   = 0;
+    var c:     u32   = 0;
+    for (c < ncmds) {
+        if (bin.read_u32_le(buf, off) == loadcmd.LC_SEGMENT_64) {
+            if (loadcmd.fixed16_equals(buf, off + 8, name)) { ret n; }
+            n = n + 1;
+        }
+        off = off + bin.read_u32_le(buf, off + 4)::usize;
+        c   = c + 1;
+    }
+    ret 0xFFFFFFFF;
+}
+
+pub fun t_sections_match_segname(buf: *u8) bool {
+    val ncmds: u32   = bin.read_u32_le(buf, 16);
+    var off:   usize = loadcmd.MACH_HEADER_64_SIZE;
+    var c:     u32   = 0;
+    for (c < ncmds) {
+        if (bin.read_u32_le(buf, off) == loadcmd.LC_SEGMENT_64) {
+            val nsects: u32   = bin.read_u32_le(buf, off + 64);
+            var sh:     usize = off + loadcmd.SEGMENT_CMD_64_SIZE;
+            var k:      u32   = 0;
+            for (k < nsects) {
+                var i: usize = 0;
+                for (i < 16) {
+                    if (buf[sh + 16 + i] != buf[off + 8 + i]) { ret false; }
+                    i = i + 1;
+                }
+                sh = sh + loadcmd.SECTION_64_SIZE;
+                k  = k + 1;
+            }
+        }
+        off = off + bin.read_u32_le(buf, off + 4)::usize;
+        c   = c + 1;
+    }
+    ret true;
+}
+
+pub fun t_rebase_vaddr(buf: *u8, nth: u32) u64 {
+    val info: usize = t_find_lc(buf, loadcmd.LC_DYLD_INFO_ONLY);
+    if (info == 0) { ret 0; }
+    val off:  usize = bin.read_u32_le(buf, info + 8)::usize;
+    val size: usize = bin.read_u32_le(buf, info + 12)::usize;
+    var p:    usize = off;
+    var n:    u32   = 0;
+    for (p < off + size) {
+        val op:  u8 = buf[p] & 0xF0;
+        val imm: u8 = buf[p] & 0x0F;
+        p = p + 1;
+        if (op == loadcmd.REBASE_OPCODE_DONE) { ret 0; }
+        if (op == loadcmd.REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB) {
+            var slot:  u64 = 0;
+            var shift: u32 = 0;
+            for (p < off + size) {
+                val b: u8 = buf[p];
+                p    = p + 1;
+                slot = slot | ((b & 0x7F)::u64 << shift::u64);
+                if ((b & 0x80) == 0) { brk; }
+                shift = shift + 7;
+            }
+            if (n == nth) {
+                val ncmds: u32   = bin.read_u32_le(buf, 16);
+                var so:    usize = loadcmd.MACH_HEADER_64_SIZE;
+                var si:    u32   = 0;
+                var c:     u32   = 0;
+                for (c < ncmds) {
+                    if (bin.read_u32_le(buf, so) == loadcmd.LC_SEGMENT_64) {
+                        if (si == imm::u32) { ret bin.read_u64_le(buf, so + 24) + slot; }
+                        si = si + 1;
+                    }
+                    so = so + bin.read_u32_le(buf, so + 4)::usize;
+                    c  = c + 1;
+                }
+                ret 0;
+            }
+            n = n + 1;
+        }
+    }
+    ret 0;
+}
+
+pub fun t_name_segs(alloc: *A.Allocator, itn: *intern.Interner, segs: *of.LoadSegment, seg_count: u32) u8 {
+    var i: u32 = 0;
+    for (i < seg_count) {
+        val ar: res[*of.LoadSection, A.Error] = A.zallocate[of.LoadSection](alloc, 1);
+        if (sel ar.err) { ret 1; }
+        val sec:  *of.LoadSection = ar.ok;
+        val zf:   bool            = segs[i].filesz == 0 && segs[i].memsz > 0;
+        var nm:   str             = "__const";
+        var kind: of.SectionKind  = of.SK_RODATA;
+        if ((segs[i].flags & of.SEG_FLAG_EXECUTE) != 0) {
+            nm   = "__text";
+            kind = of.SK_TEXT;
+        }
+        or (zf) {
+            nm   = "__bss";
+            kind = of.SK_BSS;
+        }
+        or ((segs[i].flags & of.SEG_FLAG_WRITE) != 0) {
+            nm   = "__data";
+            kind = of.SK_DATA;
+        }
+        sec.name              = t_intern(itn, nm);
+        sec.kind              = kind;
+        sec.offset            = 0;
+        sec.len               = segs[i].memsz::u32;
+        sec.align             = 8;
+        segs[i].sections      = sec;
+        segs[i].section_count = 1;
+        i                     = i + 1;
+    }
+    ret 0;
+}
+
+pub fun t_emit_dyn(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *of.ObjectTarget,
+    segs: *of.LoadSegment, seg_count: u32, dyn: *of.DynamicInfo,
+    entry: u64, base: u64) res[Vector[u8], fail.Fail] {
+    if (t_name_segs(alloc, itn, segs, seg_count) != 0) { ret res[Vector[u8], fail.Fail].err{fail.message("names")}; }
+    val tf_r: res[fixture.Output, outcome.Fail] = fixture.create(alloc, "macho_seg");
+    if (sel tf_r.err) { ret res[Vector[u8], fail.Fail].err{fail.message("temp")}; }
+    var tf: fixture.Output = tf_r.ok;
+    fin { fixture.dnit(?tf); }
+    val em: err[fail.Fail] = t_planned_emit_dyn_exec(alloc, itn, isa_vt, segs, seg_count,
+        0x4000, base, entry,
+        nil::*of.ExecFunction, 0, dyn, nil::*of.PltFixup, 0,
+        nil::*of.Section, 0, nil::*of.Section, 0,
+        nil::*of.SymtabEntry, 0,
+        fixture.path(?tf)::*u8, "machoseg"::*u8, of.image_options_default(of.SUBSYSTEM_CONSOLE));
+    if (sel em.err) {
+        ret res[Vector[u8], fail.Fail].err{em.err};
+    }
+    val rb: res[Vector[u8], fs.FsError] = fs.read_bytes(alloc, fixture.path(?tf));
+
+    if (sel rb.err) { ret res[Vector[u8], fail.Fail].err{fail.fs_refused(rb.err)}; }
+    ret res[Vector[u8], fail.Fail].ok{rb.ok};
+}
+
+pub fun t_frame_segs(buf: *u8, names: *usize, nsects: *u32, sect0: *usize, cap: u32) u32 {
+    val ncmds: u32   = bin.read_u32_le(buf, 16);
+    var off:   usize = loadcmd.MACH_HEADER_64_SIZE;
+    var n:     u32   = 0;
+    var c:     u32   = 0;
+    for (c < ncmds && n < cap) {
+        if (bin.read_u32_le(buf, off) == loadcmd.LC_SEGMENT_64) {
+            names[n]  = off + 8;
+            nsects[n] = bin.read_u32_le(buf, off + 64);
+            sect0[n]  = 0;
+            if (nsects[n] > 0) { sect0[n] = off + loadcmd.SEGMENT_CMD_64_SIZE; }
+            n = n + 1;
+        }
+        off = off + bin.read_u32_le(buf, off + 4)::usize;
+        c   = c + 1;
+    }
+    ret n;
+}
+
+pub fun t_fixed16_same(buf_a: *u8, off_a: usize, buf_b: *u8, off_b: usize) bool {
+    var i: usize = 0;
+    for (i < 16) {
+        if (buf_a[off_a + i] != buf_b[off_b + i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun t_emit_both(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *of.ObjectTarget,
+    segs: *of.LoadSegment, seg_count: u32, base: u64,
+    stat: *Vector[u8], dynb: *Vector[u8]) u8 {
+    val opts:  of.ImageOptions = of.image_options_default(of.SUBSYSTEM_CONSOLE);
+    val entry: u64             = segs[0].vaddr;
+
+    val sf: res[fixture.Output, outcome.Fail] = fixture.create(alloc, "macho_both_s");
+    if (sel sf.err) { ret 1; }
+    var stf: fixture.Output = sf.ok;
+    fin { fixture.dnit(?stf); }
+    val se: err[fail.Fail] = t_planned_emit_exec(alloc, itn, isa_vt, segs, seg_count,
+        macho_page_size(isa_vt.arch_id), base, entry,
+        nil::*of.ExecFunction, 0, nil::*of.Section, 0,
+        nil::*of.Section, 0, nil::*of.SymtabEntry, 0,
+        fixture.path(?stf)::*u8, "machoboth"::*u8, opts);
+    if (sel se.err) { ret 1; }
+    val sb: res[Vector[u8], fs.FsError] = fs.read_bytes(alloc, fixture.path(?stf));
+
+    if (sel sb.err) { ret 1; }
+
+    var dyn: of.DynamicInfo;
+    dyn.interp = intern.STR_NIL;
+    dyn.pie    = true;
+    val df: res[fixture.Output, outcome.Fail] = fixture.create(alloc, "macho_both_d");
+    if (sel df.err) { ret 1; }
+    var dtf: fixture.Output = df.ok;
+    fin { fixture.dnit(?dtf); }
+    val de: err[fail.Fail] = t_planned_emit_dyn_exec(alloc, itn, isa_vt, segs, seg_count,
+        macho_page_size(isa_vt.arch_id), base, entry,
+        nil::*of.ExecFunction, 0, ?dyn, nil::*of.PltFixup, 0,
+        nil::*of.Section, 0, nil::*of.Section, 0,
+        nil::*of.SymtabEntry, 0,
+        fixture.path(?dtf)::*u8, "machoboth"::*u8, opts);
+    if (sel de.err) { ret 1; }
+    val db: res[Vector[u8], fs.FsError] = fs.read_bytes(alloc, fixture.path(?dtf));
+
+    if (sel db.err) { ret 1; }
+
+    @stat = sb.ok;
+    @dynb = db.ok;
+    ret 0;
+}
+
+pub fun t_make_section_based(buf: *u8, sh: usize, address: u32, sect: u32) bool {
+    val e: usize = t_find_reloc(buf, sh, address);
+    if (e == 0) { ret false; }
+    bin.write_u32_le(buf, e + 4, (bin.read_u32_le(buf, e + 4) & 0xF7000000) | sect);
+    ret true;
+}
+
+pub fun t_find_reloc(buf: *u8, sh: usize, address: u32) usize {
+    val reloff: usize = bin.read_u32_le(buf, sh + 56)::usize;
+    val nreloc: u32   = bin.read_u32_le(buf, sh + 60);
+    var r:      u32   = 0;
+    for (r < nreloc) {
+        val e: usize = reloff + r::usize * loadcmd.RELOC_INFO_SIZE;
+        if (bin.read_u32_le(buf, e) == address) { ret e; }
+        r = r + 1;
+    }
+    ret 0;
+}
+
+pub fun t_set_reloc_type(buf: *u8, sh: usize, address: u32, r_type: u32) bool {
+    val e: usize = t_find_reloc(buf, sh, address);
+    if (e == 0) { ret false; }
+    bin.write_u32_le(buf, e + 4, (bin.read_u32_le(buf, e + 4) & 0x0FFFFFFF) | (r_type << 28));
+    ret true;
+}
+
+pub fun t_reloc_at(img: *of.ObjectImage, sec: u32, off: u32) *of.Relocation {
+    var r: u32 = 0;
+    for (r < img.reloc_count) {
+        if (of.section_index(img.relocations[r].section) == sec && img.relocations[r].offset == off) { ret ?img.relocations[r]; }
+        r = r + 1;
+    }
+    ret nil;
+}
+
+pub fun t_sym_named(img: *of.ObjectImage, name: intern.StrId) *of.Symbol {
+    var s: u32 = 0;
+    for (s < img.symbol_count) {
+        if (img.symbols[s].name == name) { ret ?img.symbols[s]; }
+        s = s + 1;
+    }
+    ret nil;
+}
+
+pub fun t_emit_x64_object(alloc: *A.Allocator, i: *intern.Interner, out: *Vector[u8]) bool {
+    var isa_vt: of.ObjectTarget = t_isa(isa.ARCH_X86_64);
+
+    var text_bytes: [24]u8;
+    var k:          usize = 0;
+    for (k < 24) {
+        text_bytes[k] = 0;
+        k             = k + 1;
+    }
+    text_bytes[0] = 0xE8;
+    var data_bytes: [8]u8;
+    k = 0;
+    for (k < 8) {
+        data_bytes[k] = 0;
+        k             = k + 1;
+    }
+
+    var secs: [2]of.Section;
+    secs[0].name  = t_intern(i, ".text");
+    secs[0].kind  = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0];
+    secs[0].len   = 24;
+    secs[0].align = 16;
+    secs[1].name  = t_intern(i, ".data");
+    secs[1].kind  = of.SK_DATA;
+    secs[1].bytes = ?data_bytes[0];
+    secs[1].len   = 8;
+    secs[1].align = 8;
+
+    var syms: [3]of.Symbol;
+    syms[0].name    = t_intern(i, "_main");
+    syms[0].section = of.section_id(0);
+    syms[0].offset  = 0;
+    syms[0].size    = 24;
+    syms[0].flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name    = t_intern(i, "g");
+    syms[1].section = of.section_id(1);
+    syms[1].offset  = 0;
+    syms[1].size    = 8;
+    syms[1].flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_OBJECT;
+    syms[2].name    = t_intern(i, "ext_func");
+    syms[2].section = of.external_section();
+    syms[2].offset  = 0;
+    syms[2].size    = 0;
+    syms[2].flags   = of.SYM_OBJ_FLAG_EXTERN;
+
+    var relocs: [3]of.Relocation;
+    relocs[0].section = of.section_id(0);
+    relocs[0].offset  = 1;
+    relocs[0].kind    = of.RK_PLT32;
+    relocs[0].sym     = 2;
+    relocs[0].addend  = -4;
+    relocs[1].section = of.section_id(0);
+    relocs[1].offset  = 8;
+    relocs[1].kind    = of.RK_PC32;
+    relocs[1].sym     = 1;
+    relocs[1].addend  = -4;
+    relocs[2].section = of.section_id(0);
+    relocs[2].offset  = 16;
+    relocs[2].kind    = of.RK_ABS64;
+    relocs[2].sym     = 1;
+    relocs[2].addend  = 0;
+
+    var img: of.ObjectImage;
+    img.alloc         = alloc;
+    img.interner      = i;
+    img.name          = t_intern(i, "test");
+    img.sections      = ?secs[0];
+    img.section_count = 2;
+    img.symbols       = ?syms[0];
+    img.symbol_count  = 3;
+    img.relocations   = ?relocs[0];
+    img.reloc_count   = 3;
+
+    val tf_r: res[fixture.Output, outcome.Fail] = fixture.create(alloc, "macho_sub");
+    if (sel tf_r.err) { ret false; }
+    var tf: fixture.Output = tf_r.ok;
+    fin { fixture.dnit(?tf); }
+    val tpath: str = fixture.path(?tf);
+
+    val em: err[fail.Fail] = t_planned_emit_object(?isa_vt, ?img, tpath::*u8);
+    if (sel em.err) { ret false; }
+
+    val rb: res[Vector[u8], fs.FsError] = fs.read_bytes(alloc, tpath);
+
+    if (sel rb.err) { ret false; }
+    @out = rb.ok;
+    ret true;
+}
+
+pub fun t_put_reloc(buf: *u8, reloff: usize, idx: u32, address: u32, symnum: u32,
+    pcrel: u32, length: u32, extn: u32, r_type: u32) {
+    val e: usize = reloff + idx::usize * loadcmd.RELOC_INFO_SIZE;
+    bin.write_u32_le(buf, e, address);
+    bin.write_u32_le(buf, e + 4, (symnum & 0xFFFFFF) | (pcrel << 24) | (length << 25)
+        | (extn << 27) | (r_type << 28));
+}
+
+pub fun t_first_reloff(buf: *u8, out_n: *u32) usize {
+    val ncmds: u32   = bin.read_u32_le(buf, 16);
+    var off:   usize = loadcmd.MACH_HEADER_64_SIZE;
+    var c:     u32   = 0;
+    for (c < ncmds) {
+        val cmd:     u32   = bin.read_u32_le(buf, off);
+        val cmdsize: usize = bin.read_u32_le(buf, off + 4)::usize;
+        if (cmd == loadcmd.LC_SEGMENT_64) {
+            val nsects: u32 = bin.read_u32_le(buf, off + 64);
+            if (nsects > 0) {
+                val sh: usize = off + loadcmd.SEGMENT_CMD_64_SIZE;
+                @out_n = bin.read_u32_le(buf, sh + 60);
+                ret bin.read_u32_le(buf, sh + 56)::usize;
+            }
+        }
+        off = off + cmdsize;
+        c   = c + 1;
+    }
+    @out_n = 0;
+    ret 0;
+}
+
+pub fun t_symtab(buf: *u8, out_n: *u32) usize {
+    val ncmds: u32   = bin.read_u32_le(buf, 16);
+    var off:   usize = loadcmd.MACH_HEADER_64_SIZE;
+    var c:     u32   = 0;
+    for (c < ncmds) {
+        val cmd:     u32   = bin.read_u32_le(buf, off);
+        val cmdsize: usize = bin.read_u32_le(buf, off + 4)::usize;
+        if (cmd == loadcmd.LC_SYMTAB) {
+            @out_n = bin.read_u32_le(buf, off + 12);
+            ret bin.read_u32_le(buf, off + 8)::usize;
+        }
+        off = off + cmdsize;
+        c   = c + 1;
+    }
+    @out_n = 0;
+    ret 0;
+}
+
+pub fun t_planned_emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *of.ObjectTarget, segs: *of.LoadSegment,
+    seg_count: u32, page_size: u64, image_base: u64, entry: u64,
+    funcs: *of.ExecFunction, func_count: u32,
+    dyn: *of.DynamicInfo, fixups: *of.PltFixup, fixup_count: u32,
+    exceptions: *of.Section, exception_count: u32,
+    debug: *of.Section, debug_count: u32,
+    symtab: *of.SymtabEntry, symtab_count: u32,
+    path: *u8, name: *u8,
+    image_options: of.ImageOptions) err[fail.Fail] {
+    if (path == nil) { ret macho.emit_dyn_exec(alloc, itn, isa_vt, segs, seg_count, page_size, image_base, entry, funcs, func_count, dyn, fixups, fixup_count, exceptions, exception_count, debug, debug_count, symtab, symtab_count, nil, name, image_options); }
+    ret macho.emit_dyn_exec(alloc, itn, isa_vt, segs, seg_count, page_size, image_base, entry, funcs, func_count, dyn, fixups, fixup_count, exceptions, exception_count, debug, debug_count, symtab, symtab_count, path::str, name, image_options);
+}
+
+pub fun t_planned_emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *of.ObjectTarget, segs: *of.LoadSegment,
+    seg_count: u32, page_size: u64, image_base: u64, entry: u64,
+    funcs: *of.ExecFunction, func_count: u32,
+    exceptions: *of.Section, exception_count: u32,
+    debug: *of.Section, debug_count: u32,
+    symtab: *of.SymtabEntry, symtab_count: u32, path: *u8, name: *u8,
+    image_options: of.ImageOptions) err[fail.Fail] {
+    if (path == nil) { ret macho.emit_exec(alloc, itn, isa_vt, segs, seg_count, page_size, image_base, entry, funcs, func_count, exceptions, exception_count, debug, debug_count, symtab, symtab_count, nil, name, image_options); }
+    ret macho.emit_exec(alloc, itn, isa_vt, segs, seg_count, page_size, image_base, entry, funcs, func_count, exceptions, exception_count, debug, debug_count, symtab, symtab_count, path::str, name, image_options);
+}
+
+pub fun t_planned_emit_object(isa_vt: *of.ObjectTarget, img: *of.ObjectImage, path: *u8) err[fail.Fail] {
+    if (path == nil) { ret macho.emit_object(isa_vt, img, nil); }
+    ret macho.emit_object(isa_vt, img, path::str);
+}
+
+pub fun t_untouched(alloc: *A.Allocator, path: str) bool {
+    val rb: res[Vector[u8], fs.FsError] = fs.read_bytes(alloc, path);
+    if (sel rb.err) { ret false; }
+    ret rb.ok.len == 0;
+}
+
+pub fun t_emit_object_to_bytes(alloc: *A.Allocator, isa_vt: *of.ObjectTarget, img: *of.ObjectImage, name: str) res[Vector[u8], fail.Fail] {
+    val tf_r: res[fixture.Output, outcome.Fail] = fixture.create(alloc, name);
+    if (sel tf_r.err) { ret res[Vector[u8], fail.Fail].err{fail.message("fixture create failed")}; }
+    var tf: fixture.Output = tf_r.ok;
+    fin { fixture.dnit(?tf); }
+    val tpath: str = fixture.path(?tf);
+
+    val em: err[fail.Fail] = t_planned_emit_object(isa_vt, img, tpath::*u8);
+    if (sel em.err) { ret res[Vector[u8], fail.Fail].err{em.err}; }
+
+    val rb: res[Vector[u8], fs.FsError] = fs.read_bytes(alloc, tpath);
+    if (sel rb.err) { ret res[Vector[u8], fail.Fail].err{fail.message("fixture read failed")}; }
+    ret res[Vector[u8], fail.Fail].ok{rb.ok};
+}
+
+pub fun t_emit_exec_to_bytes(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *of.ObjectTarget, segs: *of.LoadSegment,
+    seg_count: u32, page_size: u64, image_base: u64, entry: u64,
+    funcs: *of.ExecFunction, func_count: u32,
+    exceptions: *of.Section, exception_count: u32,
+    debug: *of.Section, debug_count: u32,
+    symtab: *of.SymtabEntry, symtab_count: u32, name: str, opts: of.ImageOptions) res[Vector[u8], fail.Fail] {
+    val tf_r: res[fixture.Output, outcome.Fail] = fixture.create(alloc, name);
+    if (sel tf_r.err) { ret res[Vector[u8], fail.Fail].err{fail.message("fixture create failed")}; }
+    var tf: fixture.Output = tf_r.ok;
+    fin { fixture.dnit(?tf); }
+    val tpath: str = fixture.path(?tf);
+
+    val em: err[fail.Fail] = t_planned_emit_exec(alloc, itn, isa_vt, segs, seg_count, page_size, image_base, entry, funcs, func_count, exceptions, exception_count, debug, debug_count, symtab, symtab_count, tpath::*u8, name::*u8, opts);
+    if (sel em.err) { ret res[Vector[u8], fail.Fail].err{em.err}; }
+
+    val rb: res[Vector[u8], fs.FsError] = fs.read_bytes(alloc, tpath);
+    if (sel rb.err) { ret res[Vector[u8], fail.Fail].err{fail.message("fixture read failed")}; }
+    ret res[Vector[u8], fail.Fail].ok{rb.ok};
+}
+
+pub fun t_emit_dyn_exec_to_bytes(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *of.ObjectTarget, segs: *of.LoadSegment,
+    seg_count: u32, page_size: u64, image_base: u64, entry: u64,
+    funcs: *of.ExecFunction, func_count: u32,
+    dyn: *of.DynamicInfo, fixups: *of.PltFixup, fixup_count: u32,
+    exceptions: *of.Section, exception_count: u32,
+    debug: *of.Section, debug_count: u32,
+    symtab: *of.SymtabEntry, symtab_count: u32, name: str, opts: of.ImageOptions) res[Vector[u8], fail.Fail] {
+    val tf_r: res[fixture.Output, outcome.Fail] = fixture.create(alloc, name);
+    if (sel tf_r.err) { ret res[Vector[u8], fail.Fail].err{fail.message("fixture create failed")}; }
+    var tf: fixture.Output = tf_r.ok;
+    fin { fixture.dnit(?tf); }
+    val tpath: str = fixture.path(?tf);
+
+    val em: err[fail.Fail] = t_planned_emit_dyn_exec(alloc, itn, isa_vt, segs, seg_count, page_size, image_base, entry, funcs, func_count, dyn, fixups, fixup_count, exceptions, exception_count, debug, debug_count, symtab, symtab_count, tpath::*u8, name::*u8, opts);
+    if (sel em.err) { ret res[Vector[u8], fail.Fail].err{em.err}; }
+
+    val rb: res[Vector[u8], fs.FsError] = fs.read_bytes(alloc, tpath);
+    if (sel rb.err) { ret res[Vector[u8], fail.Fail].err{fail.message("fixture read failed")}; }
+    ret res[Vector[u8], fail.Fail].ok{rb.ok};
+}
