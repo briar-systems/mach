@@ -7,11 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A `#[testing]` decorator marks a declaration that exists only for tests. It is resolved and type-checked in every build, omitted from ordinary builds and `mach doc`, and emitted under `mach test`. Only a `test` body or another `#[testing]` declaration may reference it, and a `fwd` of one must be marked too. It refuses `ext`, `symbol`, `section`, `stage` and the shader interface decorators (#3402).
+
 ### Fixed
 
+- A `bin` artifact on a `spirv` target delivers its entry module at the resolved `out`, or `-o`, so `{artifact.<id>.out}` names a file that exists and a host binary can `#[embed]` the shader artifact it requires. The per-module objects are still written under `obj/` (#3397).
 - A SPIR-V module whose `env` pins a version below 1.4 lists only its Input and Output variables in `OpEntryPoint`, and below 1.3 declares a `#[storage]` binding as a `Uniform` variable over a `BufferBlock` block, so `vulkan1.0` and `vulkan1.1` modules with descriptors pass `spirv-val` for their environment (#3399).
 - A failed Git command in `mach dep` or build-time dependency verification names the command, its exit status and Git's own message, where it reported only `Git dependency inspection command failed` (#3389).
 - Only a directory under `dep/` named by a valid project id is a dependency slot, so a file such as the `.DS_Store` Finder writes no longer draws a stray note from `mach dep pull` or fails `mach dep verify` (#3391).
+- `mach dep pull`, `add` and `update` realize a Git dependency from everything its slot holds (the checkout, the staged gitlink, its `.gitmodules` entry and a retained module store) rather than from whether `dep/<id>` exists. A deleted checkout whose gitlink is staged is initialized again instead of failing in `git submodule add`, a missing `.gitmodules` entry is restored from the manifest, a clean unregistered checkout is registered where pull used to exit 0 without recording it, and re-adding a removed dependency reuses the checkout or module store Git kept instead of refusing (#3390).
 
 ## [5.0.4] - 2026-09-13
 

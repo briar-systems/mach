@@ -1,0 +1,1105 @@
+use mach.lang.build.outcome;
+use fixture: mach.lang.output.testing;
+use std.allocator.page;
+use std.collections.map;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use fs: std.filesystem;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_contains;
+use std.types.string.str_empty;
+use std.types.string.str_join;
+use std.types.string.str_starts_with;
+
+use A: std.allocator;
+
+use mach.lang.be.obj;
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.layout;
+use mach.lang.session;
+use mach.lang.target;
+use mach.lang.target.of;
+use mach.lang.target.of.ar;
+use target_testing: mach.lang.target.testing;
+
+use mach.lang.be.linker.common.GmTrackEntry;
+use mach.lang.be.linker.common.GmTracker;
+use mach.lang.be.linker.common.GrowProbe;
+use mach.lang.be.linker.common.gm_track_allocate;
+use mach.lang.be.linker.common.gm_track_deallocate;
+use mach.lang.be.linker.common.gm_track_reallocate;
+use mach.lang.be.linker.common.grow_probe_allocate;
+use mach.lang.be.linker.common.grow_probe_deallocate;
+use mach.lang.be.linker.common.grow_probe_reallocate;
+use mach.lang.be.linker.common.join2;
+use mach.lang.be.linker.common.join3;
+use mach.lang.be.linker.common.lt_image;
+use mach.lang.be.linker.common.lt_name;
+use mach.lang.be.linker.resolve.is_undefined_extern;
+use mach.lang.be.linker.resolve.weak_fallback_name;
+
+rec ArchiveResolution {
+    providers:  map.Map[intern.StrId, u32];
+    unresolved: map.Map[intern.StrId, u32];
+}
+
+pub fun validate_link_inputs(images: *of.ObjectImage, count: u32) err[fail.Fail] {
+    if (count > 0 && images == nil) {
+        ret err[fail.Fail].err{fail.message("link: nil input object collection")};
+    }
+    var i: u32 = 0;
+    for (i < count) {
+        val valid: err[fail.Fail] = of.validate_object_view(?images[i]);
+        if (sel valid.err) {
+            ret valid;
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+pub fun read_objects(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
+    obj_count: u32, seed: *of.ObjectImage, seed_count: u32,
+    required: intern.StrId,
+    module_count: *u32) res[*of.ObjectImage, fail.Fail] {
+    @module_count = 0;
+    if (tgt.of.parse_object == nil) {
+        ret res[*of.ObjectImage, fail.Fail].err{fail.message("link: object format has no parser")};
+    }
+    val seed_valid: err[fail.Fail] = validate_link_inputs(seed, seed_count);
+    if (sel seed_valid.err) {
+        ret res[*of.ObjectImage, fail.Fail].err{seed_valid.err};
+    }
+    val alloc: *A.Allocator = s.alloc;
+
+    var modules: *of.ObjectImage = nil;
+    var count:   u32             = 0;
+    var cap:     u32             = 0;
+
+    var state: ArchiveResolution;
+    init_archive_resolution(alloc, ?state);
+    if (required != intern.STR_NIL) {
+        val rr: err[fail.Fail] = archive_require(?state, required);
+        if (sel rr.err) {
+            free_archive_resolution(?state);
+            ret res[*of.ObjectImage, fail.Fail].err{rr.err};
+        }
+    }
+    var si: u32 = 0;
+    for (si < seed_count) {
+        val nr: err[fail.Fail] = archive_note_image(
+            s, tgt.of.import_address_prefix, ?state, ?seed[si]);
+        if (sel nr.err) {
+            free_archive_resolution(?state);
+            ret res[*of.ObjectImage, fail.Fail].err{nr.err};
+        }
+        si = si + 1;
+    }
+
+    var i: u32 = 0;
+    for (i < obj_count) {
+        if (obj_paths[i] == nil) {
+            free_archive_resolution(?state);
+            free_modules_to(alloc, modules, count, cap);
+            ret res[*of.ObjectImage, fail.Fail].err{fail.message("link: nil object path")};
+        }
+
+        val path: str = obj_paths[i]::str;
+
+        val rb: res[Vector[u8], fs.FsError] = fs.read_bytes(alloc, path);
+        if (sel rb.err) {
+            free_archive_resolution(?state);
+            free_modules_to(alloc, modules, count, cap);
+            ret res[*of.ObjectImage, fail.Fail].err{fail.message(read_message(s, path, fail.describe(fail.fs_refused(rb.err))))};
+        }
+        var buf: Vector[u8] = rb.ok;
+
+        var input_r: err[fail.Fail];
+        if (ar.is_archive(buf.data, buf.len)) {
+            input_r = parse_archive(s, tgt, path, buf.data, buf.len,
+                ?state, ?modules, ?count, ?cap);
+        }
+        or {
+            val loose: err[fail.Fail] = parse_loose(alloc, ?s.interner, tgt, path, buf.data, buf.len, ?modules, ?count, ?cap);
+            input_r = loose;
+            if (sel loose.ok) {
+                val accepted: *of.ObjectImage = modules;
+                input_r = archive_note_image(
+                    s, tgt.of.import_address_prefix, ?state, ?accepted[count - 1]);
+            }
+        }
+
+        vector.dnit[u8](?buf);
+        if (sel input_r.err) {
+            free_archive_resolution(?state);
+            free_modules_to(alloc, modules, count, cap);
+            ret res[*of.ObjectImage, fail.Fail].err{input_r.err};
+        }
+
+        i = i + 1;
+    }
+
+    if (cap > count) {
+        val sr: res[*of.ObjectImage, A.Error] =
+            A.reallocate[of.ObjectImage](alloc, modules, cap::usize, count::usize);
+        if (sel sr.err) {
+            free_archive_resolution(?state);
+            free_modules_to(alloc, modules, count, cap);
+            ret res[*of.ObjectImage, fail.Fail].err{fail.refused(sr.err)};
+        }
+        modules = sr.ok;
+    }
+
+    free_archive_resolution(?state);
+    @module_count = count;
+    ret res[*of.ObjectImage, fail.Fail].ok{modules};
+}
+
+fun init_archive_resolution(alloc: *A.Allocator, state: *ArchiveResolution) {
+    state.providers  = map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
+    state.unresolved = map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
+}
+
+fun free_archive_resolution(state: *ArchiveResolution) {
+    map.dnit[intern.StrId, u32](?state.providers);
+    map.dnit[intern.StrId, u32](?state.unresolved);
+}
+
+fun archive_require(state: *ArchiveResolution,
+    name: intern.StrId) err[fail.Fail] {
+    if (map.contains[intern.StrId, u32](?state.providers, ?name)) {
+        ret err[fail.Fail].ok{};
+    }
+    val inserted: res[bool, A.Error] = map.insert[intern.StrId, u32](?state.unresolved, name, 1);
+    if (sel inserted.err) { ret err[fail.Fail].err{fail.refused(inserted.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun archive_symbol_provides(img: *of.ObjectImage, sym: *of.Symbol) bool {
+    if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0) { ret false; }
+    if (of.section_is_external(sym.section)) {
+        ret (sym.flags & (of.SYM_OBJ_FLAG_FALLBACK | of.SYM_OBJ_FLAG_ALIAS))
+            == (of.SYM_OBJ_FLAG_FALLBACK | of.SYM_OBJ_FLAG_ALIAS);
+    }
+    if (of.section_index(sym.section) < img.section_count
+        && img.sections[of.section_index(sym.section)].kind == of.SK_DEBUG) { ret false; }
+    ret true;
+}
+
+fun archive_import_alias(s: *session.Session, prefix: str,
+    symbol: intern.StrId) res[intern.StrId, fail.Fail] {
+    if (str_empty(prefix)) { ret res[intern.StrId, fail.Fail].ok{symbol}; }
+    val no: opt[str] = intern.lookup(?s.interner, symbol);
+    if (sel no.none) { ret res[intern.StrId, fail.Fail].err{fail.message("link: import name not interned")}; }
+    val name: str = no.some;
+    if (str_starts_with(name, prefix)) { ret res[intern.StrId, fail.Fail].ok{symbol}; }
+    val jr: res[str, StrError] = str_join(s.alloc, prefix, name);
+    if (sel jr.err) { ret res[intern.StrId, fail.Fail].err{fail.str_refused(jr.err)}; }
+    val joined: str                        = jr.ok;
+    val ir:     res[intern.StrId, A.Error] = intern.intern(?s.interner, joined);
+    str_free(s.alloc, joined);
+    if (sel ir.err) { ret res[intern.StrId, fail.Fail].err{fail.refused(ir.err)}; }
+    ret res[intern.StrId, fail.Fail].ok{ir.ok};
+}
+
+fun archive_note_provider(state: *ArchiveResolution,
+    name: intern.StrId) err[fail.Fail] {
+    val ir: res[bool, A.Error] =
+        map.insert[intern.StrId, u32](?state.providers, name, 1);
+    if (sel ir.err) { ret err[fail.Fail].err{fail.refused(ir.err)}; }
+    map.remove[intern.StrId, u32](?state.unresolved, ?name);
+    ret err[fail.Fail].ok{};
+}
+
+fun archive_note_image(s: *session.Session, import_address_prefix: str,
+    state: *ArchiveResolution,
+    img: *of.ObjectImage) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < img.symbol_count) {
+        val sym: *of.Symbol = ?img.symbols[i];
+        if (archive_symbol_provides(img, sym)) {
+            val nr: err[fail.Fail] = archive_note_provider(state, sym.name);
+            if (sel nr.err) { ret nr; }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < img.import_count) {
+        val nr: err[fail.Fail] = archive_note_provider(state, img.imports[i].symbol);
+        if (sel nr.err) { ret nr; }
+        val ar: res[intern.StrId, fail.Fail] =
+            archive_import_alias(s, import_address_prefix, img.imports[i].symbol);
+        if (sel ar.err) {
+            ret err[fail.Fail].err{ar.err};
+        }
+        val an: err[fail.Fail] =
+            archive_note_provider(state, ar.ok);
+        if (sel an.err) { ret an; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < img.symbol_count) {
+        val sym: *of.Symbol = ?img.symbols[i];
+        if (!is_undefined_extern(sym)) {
+            i = i + 1;
+            cnt;
+        }
+        if ((sym.flags & of.SYM_OBJ_FLAG_FALLBACK) != 0) {
+            val fr: res[intern.StrId, fail.Fail] = weak_fallback_name(img, sym);
+            if (sel fr.err) {
+                ret err[fail.Fail].err{fr.err};
+            }
+            val rr: err[fail.Fail] =
+                archive_require(state, fr.ok);
+            if (sel rr.err) { ret rr; }
+            if ((sym.flags & of.SYM_OBJ_FLAG_SEARCH) != 0) {
+                val sr: err[fail.Fail] = archive_require(state, sym.name);
+                if (sel sr.err) { ret sr; }
+            }
+        }
+        or ((sym.flags & of.SYM_OBJ_FLAG_WEAK) == 0) {
+            val ur: err[fail.Fail] = archive_require(state, sym.name);
+            if (sel ur.err) { ret ur; }
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun archive_image_needed(s: *session.Session, import_address_prefix: str,
+    state: *ArchiveResolution,
+    img: *of.ObjectImage) res[bool, fail.Fail] {
+    var i: u32 = 0;
+    for (i < img.symbol_count) {
+        val sym: *of.Symbol = ?img.symbols[i];
+        if (archive_symbol_provides(img, sym)
+            && map.contains[intern.StrId, u32](?state.unresolved, ?sym.name)) {
+            ret res[bool, fail.Fail].ok{true};
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < img.import_count) {
+        if (map.contains[intern.StrId, u32](?state.unresolved, ?img.imports[i].symbol)) {
+            ret res[bool, fail.Fail].ok{true};
+        }
+        val ar: res[intern.StrId, fail.Fail] =
+            archive_import_alias(s, import_address_prefix, img.imports[i].symbol);
+        if (sel ar.err) {
+            ret res[bool, fail.Fail].err{ar.err};
+        }
+        val alias: intern.StrId = ar.ok;
+        if (map.contains[intern.StrId, u32](?state.unresolved, ?alias)) {
+            ret res[bool, fail.Fail].ok{true};
+        }
+        i = i + 1;
+    }
+    ret res[bool, fail.Fail].ok{false};
+}
+
+fun grow_modules(alloc: *A.Allocator, modules: **of.ObjectImage, count: *u32, cap: *u32) res[u32, fail.Fail] {
+    val old: u32 = @count;
+    if (old == @cap) {
+        val current:    layout.CheckedCount[of.ObjectImage]                         = layout.count[of.ObjectImage]((@cap)::usize);
+        val required_r: res[layout.CheckedCount[of.ObjectImage], layout.CheckCause] =
+            layout.count_add[of.ObjectImage](current, layout.count[of.ObjectImage](1::usize));
+        if (sel required_r.err) {
+            ret res[u32, fail.Fail].err{fail.message("linker: module table growth count overflow")};
+        }
+        val required: layout.CheckedCount[of.ObjectImage]                         = required_r.ok;
+        val grown_r:  res[layout.CheckedCount[of.ObjectImage], layout.CheckCause] =
+            layout.count_grow[of.ObjectImage](current, required);
+        if (sel grown_r.err) {
+            ret res[u32, fail.Fail].err{fail.message("linker: module table growth count overflow")};
+        }
+        val new_cap_fits: res[u32, layout.CheckCause] = layout.usize_to_u32(
+            grown_r.ok.value);
+        if (sel new_cap_fits.err) {
+            ret res[u32, fail.Fail].err{fail.message("linker: module table capacity exceeds the u32 limit")};
+        }
+        val new_cap: u32                           = new_cap_fits.ok;
+        val gr:      res[*of.ObjectImage, A.Error] =
+            A.reallocate[of.ObjectImage](alloc, @modules, (@cap)::usize, new_cap::usize);
+        if (sel gr.err) {
+            ret res[u32, fail.Fail].err{fail.refused(gr.err)};
+        }
+        @modules = gr.ok;
+        @cap     = new_cap;
+    }
+
+    val arr:  *of.ObjectImage = @modules;
+    val slot: *of.ObjectImage = ?arr[old];
+    @slot = of.object_image_init(alloc, nil, intern.STR_NIL);
+
+    @count = old + 1;
+    ret res[u32, fail.Fail].ok{old};
+}
+
+test "mach.lang.be.linker.grow_modules:fresh_slot_is_fully_nil_and_destructible" {
+    var page_alloc: A.Allocator;
+    page.make(?page_alloc);
+
+    var tracker:     GmTracker;
+    val res_entries: res[*GmTrackEntry, A.Error] = A.allocate[GmTrackEntry](?page_alloc, 64::usize);
+    if (sel res_entries.err) { ret 1; }
+    tracker.entries  = res_entries.ok;
+    tracker.cap      = 64;
+    tracker.count    = 0;
+    tracker.live     = 0;
+    tracker.mismatch = false;
+
+    var tp:    *GmTracker = ?tracker;
+    var alloc: A.Allocator;
+    alloc.ctx           = tp::ptr;
+    alloc.fn_allocate   = gm_track_allocate;
+    alloc.fn_reallocate = gm_track_reallocate;
+    alloc.fn_deallocate = gm_track_deallocate;
+
+    var modules: *of.ObjectImage     = nil;
+    var count:   u32                 = 0;
+    var cap:     u32                 = 0;
+    val gr:      res[u32, fail.Fail] = grow_modules(?alloc, ?modules, ?count, ?cap);
+    if (sel gr.err) { ret 1; }
+    val ix:   u32             = gr.ok;
+    val slot: *of.ObjectImage = ?modules[ix];
+
+    if (slot.interner != nil)     { ret 1; }
+    if (slot.frames != nil)       { ret 1; }
+    if (slot.frame_count != 0)    { ret 1; }
+    if (slot.machine_flags != 0)  { ret 1; }
+    if (slot.attributes != nil)   { ret 1; }
+    if (slot.attributes_len != 0) { ret 1; }
+
+    obj.dnit(slot);
+    A.deallocate[of.ObjectImage](?alloc, modules, cap::usize);
+
+    if (tracker.mismatch)  { ret 1; }
+    if (tracker.live != 0) { ret 1; }
+
+    A.deallocate[GmTrackEntry](?page_alloc, tracker.entries, 64::usize);
+    ret 0;
+}
+
+fun parse_loose(alloc: *A.Allocator, itn: *intern.Interner, tgt: *target.Target,
+    path: str, buf: *u8, buf_len: usize,
+    modules: **of.ObjectImage, count: *u32, cap: *u32) err[fail.Fail] {
+    val gr: res[u32, fail.Fail] = grow_modules(alloc, modules, count, cap);
+    if (sel gr.err) { ret err[fail.Fail].err{gr.err}; }
+    val ix:  u32             = gr.ok;
+    val arr: *of.ObjectImage = @modules;
+    val pr:  err[fail.Fail]  = tgt.of.parse_object(alloc, itn, buf, buf_len, ?arr[ix]);
+    if (sel pr.err) { ret pr; }
+    val nr: res[intern.StrId, A.Error] = intern.intern(itn, path);
+    if (sel nr.ok) { arr[ix].name = nr.ok; }
+    ret err[fail.Fail].ok{};
+}
+
+fun parse_archive(s: *session.Session, tgt: *target.Target, path: str, buf: *u8, buf_len: usize,
+    state: *ArchiveResolution, modules: **of.ObjectImage,
+    count: *u32, cap: *u32) err[fail.Fail] {
+    val alloc:           *A.Allocator    = s.alloc;
+    var candidates:      *of.ObjectImage = nil;
+    var candidate_count: u32             = 0;
+    var candidate_cap:   u32             = 0;
+    var pos:             usize           = ar.first_member();
+    for (true) {
+        val st: ar.Step = ar.next_member(buf, buf_len, pos);
+        if (!st.ok) {
+            free_modules_to(alloc, candidates, candidate_count, candidate_cap);
+            ret err[fail.Fail].err{fail.message(read_message(s, path, "malformed archive member header"))};
+        }
+        if (st.done) { brk; }
+
+        if (!ar.is_special(st.member)) {
+            val gr: res[u32, fail.Fail] =
+                grow_modules(alloc, ?candidates, ?candidate_count, ?candidate_cap);
+            if (sel gr.err) {
+                free_modules_to(alloc, candidates, candidate_count, candidate_cap);
+                ret err[fail.Fail].err{gr.err};
+            }
+            val ix: u32            = gr.ok;
+            val pr: err[fail.Fail] =
+                tgt.of.parse_object(alloc, ?s.interner, st.member.data, st.member.len,
+                ?candidates[ix]);
+            if (sel pr.err) {
+                free_modules_to(alloc, candidates, candidate_count, candidate_cap);
+                ret pr;
+            }
+        }
+
+        pos = st.next;
+    }
+
+    if (candidate_count == 0) {
+        free_modules_to(alloc, candidates, candidate_count, candidate_cap);
+        ret err[fail.Fail].ok{};
+    }
+    val sr: res[*bool, A.Error] = A.zallocate[bool](alloc, candidate_count::usize);
+    if (sel sr.err) {
+        free_modules_to(alloc, candidates, candidate_count, candidate_cap);
+        ret err[fail.Fail].err{fail.refused(sr.err)};
+    }
+    val selected: *bool = sr.ok;
+
+    var progress: bool = true;
+    for (progress) {
+        progress = false;
+        var i: u32 = 0;
+        for (i < candidate_count) {
+            if (selected[i]) {
+                i = i + 1;
+                cnt;
+            }
+            val needed_r: res[bool, fail.Fail] =
+                archive_image_needed(
+                s, tgt.of.import_address_prefix, state, ?candidates[i]);
+            if (sel needed_r.err) {
+                free_archive_candidates(alloc, candidates, candidate_count,
+                    candidate_cap, selected);
+                ret err[fail.Fail].err{needed_r.err};
+            }
+            if (!needed_r.ok) {
+                i = i + 1;
+                cnt;
+            }
+
+            val gr: res[u32, fail.Fail] = grow_modules(alloc, modules, count, cap);
+            if (sel gr.err) {
+                free_archive_candidates(alloc, candidates, candidate_count,
+                    candidate_cap, selected);
+                ret err[fail.Fail].err{gr.err};
+            }
+            val dst:      u32             = gr.ok;
+            val accepted: *of.ObjectImage = @modules;
+            accepted[dst] = candidates[i];
+            selected[i]   = true;
+            val nr: err[fail.Fail] = archive_note_image(
+                s, tgt.of.import_address_prefix, state, ?accepted[dst]);
+            if (sel nr.err) {
+                free_archive_candidates(alloc, candidates, candidate_count,
+                    candidate_cap, selected);
+                ret nr;
+            }
+            progress = true;
+            i        = i + 1;
+        }
+    }
+
+    free_archive_candidates(alloc, candidates, candidate_count,
+        candidate_cap, selected);
+    ret err[fail.Fail].ok{};
+}
+
+fun free_archive_candidates(alloc: *A.Allocator, candidates: *of.ObjectImage,
+    count: u32, cap: u32, selected: *bool) {
+    var i: u32 = 0;
+    for (i < count) {
+        if (!selected[i]) { obj.dnit(?candidates[i]); }
+        i = i + 1;
+    }
+    A.deallocate[bool](alloc, selected, count::usize);
+    A.deallocate[of.ObjectImage](alloc, candidates, cap::usize);
+}
+
+fun read_message(s: *session.Session, path: str, reason: str) str {
+    val pre: str = join3(s, "cannot read object '", path, "': ", "cannot read object");
+    ret join2(s, pre, reason, pre);
+}
+
+pub fun free_modules(alloc: *A.Allocator, modules: *of.ObjectImage, module_count: u32) {
+    free_modules_to(alloc, modules, module_count, module_count);
+}
+
+fun free_modules_to(alloc: *A.Allocator, modules: *of.ObjectImage, n: u32, cap: u32) {
+    if (modules == nil) { ret; }
+    var i: u32 = 0;
+    for (i < n) {
+        obj.dnit(?modules[i]);
+        i = i + 1;
+    }
+    if (cap > 0) {
+        A.deallocate[of.ObjectImage](alloc, modules, cap::usize);
+    }
+}
+
+test "mach.lang.be.linker.validate_link_inputs:checks_each_borrowed_image_before_use" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+
+    var bytes:   [4]u8;
+    var section: of.Section;
+    section.name  = lt_name(?s, ".text");
+    section.kind  = of.SK_TEXT;
+    section.bytes = ?bytes[0];
+    section.len   = 4;
+    section.align = 4;
+    section.flags = 0;
+
+    var image: of.ObjectImage = lt_image(
+        ?s, lt_name(?s, "input"), ?section, 1,
+        nil::*of.Symbol, 0, nil::*of.Relocation, 0);
+    val validate_link_inputs_r: err[fail.Fail] = validate_link_inputs(?image, 1);
+    if (sel validate_link_inputs_r.err) { ret 1; }
+    val validate_link_inputs_r2: err[fail.Fail] = validate_link_inputs(nil::*of.ObjectImage, 0);
+    if (sel validate_link_inputs_r2.err) { ret 1; }
+    val validate_link_inputs_r3: err[fail.Fail] = validate_link_inputs(nil::*of.ObjectImage, 1);
+    if (sel validate_link_inputs_r3.ok) { ret 1; }
+
+    section.align = 3;
+    val invalid: err[fail.Fail] = validate_link_inputs(?image, 1);
+    if (sel invalid.ok)                                         { ret 1; }
+    if (!str_contains(fail.describe(invalid.err), "alignment")) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.be.linker.archive_resolution:ordered_fixed_point" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:       session.Session = sr.ok;
+    val root:    intern.StrId    = lt_name(?s, "root");
+    val dep:     intern.StrId    = lt_name(?s, "dependency");
+    val common:  intern.StrId    = lt_name(?s, "common_data");
+    val startup: intern.StrId    = lt_name(?s, "WinMainCRTStartup");
+    if (root == intern.STR_NIL || dep == intern.STR_NIL || common == intern.STR_NIL
+        || startup == intern.STR_NIL) {
+        session.dnit(?s);
+        ret 1;
+    }
+
+    val undef_flags: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN;
+    val def_flags:   u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var seed_syms:   [2]of.Symbol;
+    seed_syms[0].name    = root;
+    seed_syms[0].section = of.external_section();
+    seed_syms[0].offset  = 0;
+    seed_syms[0].size    = 0;
+    seed_syms[0].flags   = undef_flags;
+    seed_syms[1].name    = common;
+    seed_syms[1].section = of.external_section();
+    seed_syms[1].offset  = 8;
+    seed_syms[1].size    = 8;
+    seed_syms[1].flags   = undef_flags | of.SYM_OBJ_FLAG_OBJECT;
+    var seed: of.ObjectImage = lt_image(?s, lt_name(?s, "seed"),
+        nil::*of.Section, 0, ?seed_syms[0], 2, nil::*of.Relocation, 0);
+
+    var early_sym: of.Symbol;
+    early_sym.name    = dep;
+    early_sym.section = of.section_id(0);
+    early_sym.offset  = 0;
+    early_sym.size    = 0;
+    early_sym.flags   = def_flags | of.SYM_OBJ_FLAG_WEAK;
+    var early: of.ObjectImage = lt_image(?s, lt_name(?s, "early"),
+        nil::*of.Section, 0, ?early_sym, 1, nil::*of.Relocation, 0);
+
+    var late_syms: [3]of.Symbol;
+    late_syms[0].name    = root;
+    late_syms[0].section = of.section_id(0);
+    late_syms[0].offset  = 0;
+    late_syms[0].size    = 0;
+    late_syms[0].flags   = def_flags;
+    late_syms[1].name    = dep;
+    late_syms[1].section = of.external_section();
+    late_syms[1].offset  = 0;
+    late_syms[1].size    = 0;
+    late_syms[1].flags   = undef_flags;
+    late_syms[2].name    = root;
+    late_syms[2].section = of.external_section();
+    late_syms[2].offset  = 0;
+    late_syms[2].size    = 0;
+    late_syms[2].flags   = undef_flags;
+    var late: of.ObjectImage = lt_image(?s, lt_name(?s, "late"),
+        nil::*of.Section, 0, ?late_syms[0], 3, nil::*of.Relocation, 0);
+
+    var common_sym: of.Symbol;
+    common_sym.name    = common;
+    common_sym.section = of.section_id(0);
+    common_sym.offset  = 0;
+    common_sym.size    = 8;
+    common_sym.flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_OBJECT;
+    var common_def: of.ObjectImage = lt_image(?s, lt_name(?s, "common-def"),
+        nil::*of.Section, 0, ?common_sym, 1, nil::*of.Relocation, 0);
+
+    var unused_sym: of.Symbol;
+    unused_sym.name    = startup;
+    unused_sym.section = of.section_id(0);
+    unused_sym.offset  = 0;
+    unused_sym.size    = 0;
+    unused_sym.flags   = def_flags;
+    var unused: of.ObjectImage = lt_image(?s, lt_name(?s, "startup"),
+        nil::*of.Section, 0, ?unused_sym, 1, nil::*of.Relocation, 0);
+
+    var dbg_sec: of.Section;
+    dbg_sec.name  = lt_name(?s, ".debug_info");
+    dbg_sec.kind  = of.SK_DEBUG;
+    dbg_sec.bytes = nil;
+    dbg_sec.len   = 0;
+    dbg_sec.align = 1;
+    var dbg_sym:    of.Symbol      = late_syms[0];
+    var debug_only: of.ObjectImage = lt_image(?s, lt_name(?s, "debug"),
+        ?dbg_sec, 1, ?dbg_sym, 1, nil::*of.Relocation, 0);
+
+    var state: ArchiveResolution;
+    init_archive_resolution(?alloc, ?state);
+    val archive_note_image_r: err[fail.Fail] = archive_note_image(?s, "", ?state, ?seed);
+    if (sel archive_note_image_r.err) { ret 1; }
+    val e0: res[bool, fail.Fail] = archive_image_needed(?s, "", ?state, ?early);
+    val u0: res[bool, fail.Fail] = archive_image_needed(?s, "", ?state, ?unused);
+    val d0: res[bool, fail.Fail] = archive_image_needed(?s, "", ?state, ?debug_only);
+    val l0: res[bool, fail.Fail] = archive_image_needed(?s, "", ?state, ?late);
+    if (sel e0.err) { ret 1; }
+    if (e0.ok)      { ret 1; }
+    if (sel u0.err) { ret 1; }
+    if (u0.ok)      { ret 1; }
+    if (sel d0.err) { ret 1; }
+    if (d0.ok)      { ret 1; }
+    if (sel l0.err) { ret 1; }
+    if (!l0.ok)     { ret 1; }
+    val archive_note_image_r2: err[fail.Fail] = archive_note_image(?s, "", ?state, ?late);
+    if (sel archive_note_image_r2.err) { ret 1; }
+    val e1: res[bool, fail.Fail] = archive_image_needed(?s, "", ?state, ?early);
+    val c1: res[bool, fail.Fail] = archive_image_needed(?s, "", ?state, ?common_def);
+    if (sel e1.err) { ret 1; }
+    if (!e1.ok)     { ret 1; }
+    if (sel c1.err) { ret 1; }
+    if (!c1.ok)     { ret 1; }
+    val archive_note_image_r3: err[fail.Fail] = archive_note_image(?s, "", ?state, ?early);
+    if (sel archive_note_image_r3.err) { ret 1; }
+    val archive_note_image_r4: err[fail.Fail] = archive_note_image(?s, "", ?state, ?common_def);
+    if (sel archive_note_image_r4.err) { ret 1; }
+    var duplicate: of.ObjectImage = late;
+    duplicate.symbols      = ?late_syms[1];
+    duplicate.symbol_count = 1;
+    late_syms[1].section   = of.section_id(0);
+    late_syms[1].flags     = def_flags;
+    val dupe: res[bool, fail.Fail] = archive_image_needed(?s, "", ?state, ?duplicate);
+    if (sel dupe.err)              { ret 1; }
+    if (dupe.ok)                   { ret 1; }
+    if (state.unresolved.len != 0) { ret 1; }
+
+    free_archive_resolution(?state);
+    session.dnit(?s);
+    ret 0;
+}
+
+test "mach.lang.be.linker.archive_resolution:entry_root" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:     session.Session = sr.ok;
+    val entry: intern.StrId    = lt_name(?s, "mainCRTStartup");
+    var sym:   of.Symbol;
+    sym.name    = entry;
+    sym.section = of.section_id(0);
+    sym.offset  = 0;
+    sym.size    = 0;
+    sym.flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var member: of.ObjectImage = lt_image(?s, lt_name(?s, "entry-member"),
+        nil::*of.Section, 0, ?sym, 1, nil::*of.Relocation, 0);
+
+    var state: ArchiveResolution;
+    init_archive_resolution(?alloc, ?state);
+    val archive_require_r: err[fail.Fail] = archive_require(?state, entry);
+    if (sel archive_require_r.err) { ret 1; }
+    val needed: res[bool, fail.Fail] = archive_image_needed(?s, "", ?state, ?member);
+    if (sel needed.err) { ret 1; }
+    if (!needed.ok)     { ret 1; }
+    val archive_note_image_r: err[fail.Fail] = archive_note_image(?s, "", ?state, ?member);
+    if (sel archive_note_image_r.err) { ret 1; }
+    if (state.unresolved.len != 0)    { ret 1; }
+
+    free_archive_resolution(?state);
+    session.dnit(?s);
+    ret 0;
+}
+
+test "mach.lang.be.linker.archive_resolution:undefined_weak_does_not_extract" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:        session.Session = sr.ok;
+    val name:     intern.StrId    = lt_name(?s, "optional_hook");
+    val undef:    u32             = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN;
+    var weak_ref: of.Symbol;
+    weak_ref.name    = name;
+    weak_ref.section = of.external_section();
+    weak_ref.offset  = 0;
+    weak_ref.size    = 0;
+    weak_ref.flags   = undef | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+    var provider: of.Symbol;
+    provider.name    = name;
+    provider.section = of.section_id(0);
+    provider.offset  = 0;
+    provider.size    = 0;
+    provider.flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var weak_img: of.ObjectImage = lt_image(?s, lt_name(?s, "weak-user"),
+        nil::*of.Section, 0, ?weak_ref, 1, nil::*of.Relocation, 0);
+    var provider_img: of.ObjectImage = lt_image(?s, lt_name(?s, "provider"),
+        nil::*of.Section, 0, ?provider, 1, nil::*of.Relocation, 0);
+
+    var state: ArchiveResolution;
+    init_archive_resolution(?alloc, ?state);
+    val archive_note_image_r: err[fail.Fail] = archive_note_image(?s, "", ?state, ?weak_img);
+    if (sel archive_note_image_r.err) { ret 1; }
+    val optional: res[bool, fail.Fail] = archive_image_needed(?s, "", ?state, ?provider_img);
+    if (sel optional.err)          { ret 1; }
+    if (optional.ok)               { ret 1; }
+    if (state.unresolved.len != 0) { ret 1; }
+
+    weak_ref.flags = undef | of.SYM_OBJ_FLAG_FUNCTION;
+    val archive_note_image_r2: err[fail.Fail] = archive_note_image(?s, "", ?state, ?weak_img);
+    if (sel archive_note_image_r2.err) { ret 1; }
+    val required: res[bool, fail.Fail] = archive_image_needed(?s, "", ?state, ?provider_img);
+    if (sel required.err) { ret 1; }
+    if (!required.ok)     { ret 1; }
+
+    free_archive_resolution(?state);
+    session.dnit(?s);
+    ret 0;
+}
+
+test "mach.lang.be.linker.archive_resolution:weak_fallback_modes" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:        session.Session = sr.ok;
+    val public:   intern.StrId    = lt_name(?s, "weak_public");
+    val fallback: intern.StrId    = lt_name(?s, "weak_fallback");
+    val ext:      u32             = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN;
+    var syms:     [2]of.Symbol;
+    syms[0].name     = public;
+    syms[0].section  = of.external_section();
+    syms[0].offset   = 0;
+    syms[0].size     = 0;
+    syms[0].fallback = 1;
+    syms[1].name     = fallback;
+    syms[1].section  = of.external_section();
+    syms[1].offset   = 0;
+    syms[1].size     = 0;
+    syms[1].flags    = ext;
+    syms[1].fallback = of.SYMBOL_NONE;
+    var img: of.ObjectImage = lt_image(?s, lt_name(?s, "weak-user"),
+        nil::*of.Section, 0, ?syms[0], 2, nil::*of.Relocation, 0);
+
+    var modes: [3]u32;
+    modes[0] = 0;
+    modes[1] = of.SYM_OBJ_FLAG_SEARCH;
+    modes[2] = of.SYM_OBJ_FLAG_ALIAS;
+    var mi: u32 = 0;
+    for (mi < 3) {
+        syms[0].flags = ext | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FALLBACK
+            | modes[mi];
+        var state: ArchiveResolution;
+        init_archive_resolution(?alloc, ?state);
+        if (mi == 2) {
+            val required: err[fail.Fail] = archive_require(?state, public);
+            if (sel required.err) { ret 1; }
+        }
+        val archive_note_image_r: err[fail.Fail] = archive_note_image(?s, "", ?state, ?img);
+        if (sel archive_note_image_r.err)                                   { ret 1; }
+        if (!map.contains[intern.StrId, u32](?state.unresolved, ?fallback)) { ret 1; }
+        val wants_public: bool =
+            map.contains[intern.StrId, u32](?state.unresolved, ?public);
+        val provides_public: bool =
+            map.contains[intern.StrId, u32](?state.providers, ?public);
+        if (wants_public != (mi == 1) || provides_public != (mi == 2)) { ret 1; }
+        free_archive_resolution(?state);
+        mi = mi + 1;
+    }
+
+    syms[0].fallback = 99;
+    var malformed: ArchiveResolution;
+    init_archive_resolution(?alloc, ?malformed);
+    val mr: err[fail.Fail] = archive_note_image(?s, "", ?malformed, ?img);
+    free_archive_resolution(?malformed);
+    session.dnit(?s);
+    if (!sel mr.err) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.be.linker.read_objects:ordered_archive_end_to_end" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:   session.Session       = sr.ok;
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val r_8708: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_8708.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] =
+        target.select(?reg, "x86_64", "windows", "win64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
+
+    val root:      intern.StrId = lt_name(?s, "archive_entry");
+    val dep:       intern.StrId = lt_name(?s, "earlier_dependency");
+    val late:      intern.StrId = lt_name(?s, "late_requirement");
+    val call:      intern.StrId = lt_name(?s, "loose_call");
+    val startup:   intern.StrId = lt_name(?s, "WinMainCRTStartup");
+    val text_name: intern.StrId = lt_name(?s, ".text");
+    if (root == intern.STR_NIL || dep == intern.STR_NIL || late == intern.STR_NIL
+        || call == intern.STR_NIL || startup == intern.STR_NIL
+        || text_name == intern.STR_NIL) { ret 1; }
+
+    var code: [1]u8;
+    code[0] = 0xC3;
+    var sec: of.Section;
+    sec.name  = text_name;
+    sec.kind  = of.SK_TEXT;
+    sec.bytes = ?code[0];
+    sec.len   = 1;
+    sec.align = 1;
+    val def:   u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    val undef: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+        | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var early_sym: of.Symbol;
+    early_sym.name    = dep;
+    early_sym.section = of.section_id(0);
+    early_sym.offset  = 0;
+    early_sym.size    = 1;
+    early_sym.flags   = def;
+    var root_syms: [2]of.Symbol;
+    root_syms[0].name    = root;
+    root_syms[0].section = of.section_id(0);
+    root_syms[0].offset  = 0;
+    root_syms[0].size    = 1;
+    root_syms[0].flags   = def;
+    root_syms[1].name    = dep;
+    root_syms[1].section = of.external_section();
+    root_syms[1].offset  = 0;
+    root_syms[1].size    = 0;
+    root_syms[1].flags   = undef;
+    var late_sym: of.Symbol;
+    late_sym.name    = late;
+    late_sym.section = of.section_id(0);
+    late_sym.offset  = 0;
+    late_sym.size    = 1;
+    late_sym.flags   = def;
+    var startup_sym: of.Symbol;
+    startup_sym.name    = startup;
+    startup_sym.section = of.section_id(0);
+    startup_sym.offset  = 0;
+    startup_sym.size    = 1;
+    startup_sym.flags   = def;
+
+    var images: [4]of.ObjectImage;
+    images[0] = lt_image(?s, lt_name(?s, "early"), ?sec, 1,
+        ?early_sym, 1, nil::*of.Relocation, 0);
+    images[1] = lt_image(?s, lt_name(?s, "root"), ?sec, 1,
+        ?root_syms[0], 2, nil::*of.Relocation, 0);
+    images[2] = lt_image(?s, lt_name(?s, "late"), ?sec, 1,
+        ?late_sym, 1, nil::*of.Relocation, 0);
+    images[3] = lt_image(?s, lt_name(?s, "startup"), ?sec, 1,
+        ?startup_sym, 1, nil::*of.Relocation, 0);
+
+    var member_bytes: [4]Vector[u8];
+    var mi:           u32 = 0;
+    for (mi < 4) {
+        val tf_r: res[fixture.Output, outcome.Fail] = fixture.create(?alloc, "archive_member");
+        if (sel tf_r.err) { ret 1; }
+        var tf: fixture.Output = tf_r.ok;
+        fin { fixture.dnit(?tf); }
+        val er: err[fail.Fail] = tgt.of.emit_object(?tgt.object, ?images[mi], fixture.path(?tf));
+        if (sel er.err) { ret 1; }
+        val br: res[Vector[u8], fs.FsError] = fs.read_bytes(?alloc, fixture.path(?tf));
+
+        if (sel br.err) { ret 1; }
+        member_bytes[mi] = br.ok;
+        mi               = mi + 1;
+    }
+    var n0: [1]str;
+    n0[0] = "earlier_dependency";
+    var n1: [1]str;
+    n1[0] = "archive_entry";
+    var n2: [1]str;
+    n2[0] = "late_requirement";
+    var n3: [1]str;
+    n3[0] = "WinMainCRTStartup";
+    var members: [4]ar.ArMember;
+    members[0].name      = "early.o";
+    members[0].data      = member_bytes[0].data;
+    members[0].len       = member_bytes[0].len;
+    members[0].sym_names = ?n0[0];
+    members[0].sym_count = 1;
+    members[1].name      = "root.o";
+    members[1].data      = member_bytes[1].data;
+    members[1].len       = member_bytes[1].len;
+    members[1].sym_names = ?n1[0];
+    members[1].sym_count = 1;
+    members[2].name      = "late.o";
+    members[2].data      = member_bytes[2].data;
+    members[2].len       = member_bytes[2].len;
+    members[2].sym_names = ?n2[0];
+    members[2].sym_count = 1;
+    members[3].name      = "startup.o";
+    members[3].data      = member_bytes[3].data;
+    members[3].len       = member_bytes[3].len;
+    members[3].sym_names = ?n3[0];
+    members[3].sym_count = 1;
+
+    val at_r: res[fixture.Output, outcome.Fail] = fixture.create(?alloc, "ordered_archive");
+    if (sel at_r.err) { ret 1; }
+    var at: fixture.Output = at_r.ok;
+    fin { fixture.dnit(?at); }
+    val archive_r: err[fail.Fail] = ar.write_archive(?alloc, ?members[0], 4, fixture.path(?at));
+    if (sel archive_r.err) {
+        ret 1;
+    }
+
+    var loose_syms: [2]of.Symbol;
+    loose_syms[0].name    = call;
+    loose_syms[0].section = of.section_id(0);
+    loose_syms[0].offset  = 0;
+    loose_syms[0].size    = 1;
+    loose_syms[0].flags   = def;
+    loose_syms[1].name    = late;
+    loose_syms[1].section = of.external_section();
+    loose_syms[1].offset  = 0;
+    loose_syms[1].size    = 0;
+    loose_syms[1].flags   = undef;
+    var loose: of.ObjectImage = lt_image(?s, lt_name(?s, "loose"), ?sec, 1,
+        ?loose_syms[0], 2, nil::*of.Relocation, 0);
+    val lt_r: res[fixture.Output, outcome.Fail] = fixture.create(?alloc, "late_loose");
+    if (sel lt_r.err) { ret 1; }
+    var lt: fixture.Output = lt_r.ok;
+    fin { fixture.dnit(?lt); }
+    val object_r: err[fail.Fail] = tgt.of.emit_object(?tgt.object, ?loose, fixture.path(?lt));
+    if (sel object_r.err) {
+        ret 1;
+    }
+
+    var paths: [2]*u8;
+    paths[0] = fixture.path(?at)::*u8;
+    paths[1] = fixture.path(?lt)::*u8;
+    var module_count: u32                             = 0;
+    val rr:           res[*of.ObjectImage, fail.Fail] = read_objects(?s, ?tgt, ?paths[0], 2,
+        nil::*of.ObjectImage, 0, root, ?module_count);
+
+    mi = 0;
+    for (mi < 4) {
+        vector.dnit[u8](?member_bytes[mi]);
+        mi = mi + 1;
+    }
+    if (sel rr.err)        { ret 1; }
+    if (module_count != 3) { ret 1; }
+    val modules: *of.ObjectImage = rr.ok;
+
+    var saw_root:    bool = false;
+    var saw_early:   bool = false;
+    var saw_late:    bool = false;
+    var saw_startup: bool = false;
+    mi = 0;
+    for (mi < module_count) {
+        var si: u32 = 0;
+        for (si < modules[mi].symbol_count) {
+            val sym: *of.Symbol = ?modules[mi].symbols[si];
+            if (!of.section_is_external(sym.section)) {
+                if (sym.name == root)    { saw_root = true; }
+                if (sym.name == dep)     { saw_early = true; }
+                if (sym.name == late)    { saw_late = true; }
+                if (sym.name == startup) { saw_startup = true; }
+            }
+            si = si + 1;
+        }
+        mi = mi + 1;
+    }
+    free_modules(?alloc, modules, module_count);
+    session.dnit(?s);
+    if (!saw_root || !saw_early || saw_late || saw_startup) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.be.linker.archive_resolution:import_address_alias" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:        session.Session = sr.ok;
+    val public:   intern.StrId    = lt_name(?s, "Sleep");
+    val indirect: intern.StrId    = lt_name(?s, "__imp_Sleep");
+    val dll:      intern.StrId    = lt_name(?s, "kernel32.dll");
+    if (public == intern.STR_NIL || indirect == intern.STR_NIL
+        || dll == intern.STR_NIL) {
+        session.dnit(?s);
+        ret 1;
+    }
+
+    var sym: of.Symbol;
+    sym.name    = indirect;
+    sym.section = of.external_section();
+    sym.offset  = 0;
+    sym.size    = 0;
+    sym.flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_OBJECT;
+    var seed: of.ObjectImage = lt_image(?s, lt_name(?s, "dll-user"),
+        nil::*of.Section, 0, ?sym, 1, nil::*of.Relocation, 0);
+    var decl: of.ImportDecl;
+    decl.symbol      = public;
+    decl.import_name = public;
+    decl.library     = dll;
+    decl.ordinal     = 0;
+    decl.by_name     = true;
+    decl.is_code     = true;
+    var record: of.ObjectImage = lt_image(?s, lt_name(?s, "import-record"),
+        nil::*of.Section, 0, nil::*of.Symbol, 0, nil::*of.Relocation, 0);
+    record.imports      = ?decl;
+    record.import_count = 1;
+
+    var state: ArchiveResolution;
+    init_archive_resolution(?alloc, ?state);
+    val archive_note_image_r: err[fail.Fail] = archive_note_image(?s, "__imp_", ?state, ?seed);
+    if (sel archive_note_image_r.err) { ret 1; }
+    val needed: res[bool, fail.Fail] = archive_image_needed(?s, "__imp_", ?state, ?record);
+    if (sel needed.err) { ret 1; }
+    if (!needed.ok)     { ret 1; }
+    val archive_note_image_r2: err[fail.Fail] = archive_note_image(?s, "__imp_", ?state, ?record);
+    if (sel archive_note_image_r2.err) { ret 1; }
+    if (state.unresolved.len != 0
+        || !map.contains[intern.StrId, u32](?state.providers, ?public)
+        || !map.contains[intern.StrId, u32](?state.providers, ?indirect)) { ret 1; }
+
+    free_archive_resolution(?state);
+    session.dnit(?s);
+    ret 0;
+}
+
+test "mach.lang.be.linker.grow_modules:refuses_capacity_overflow_before_reallocating" {
+    var probe: GrowProbe;
+    probe.reallocate_calls = 0;
+    var pp:    *GrowProbe = ?probe;
+    var alloc: A.Allocator;
+    alloc.ctx           = pp::ptr;
+    alloc.fn_allocate   = grow_probe_allocate;
+    alloc.fn_reallocate = grow_probe_reallocate;
+    alloc.fn_deallocate = grow_probe_deallocate;
+
+    var modules: *of.ObjectImage     = nil;
+    var count:   u32                 = 0xFFFFFFFF;
+    var cap:     u32                 = 0xFFFFFFFF;
+    val r:       res[u32, fail.Fail] = grow_modules(?alloc, ?modules, ?count, ?cap);
+
+    var bad: i32 = 0;
+    if (sel r.ok)                    { bad = 1; }
+    if (probe.reallocate_calls != 0) { bad = 2; }
+    if (cap != 0xFFFFFFFF)           { bad = 3; }
+    ret bad;
+}
