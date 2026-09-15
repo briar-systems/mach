@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A failed Git command in `mach dep` or build-time dependency verification names the command, its exit status and Git's own message, where it reported only `Git dependency inspection command failed` (#3389).
+
 ## [5.0.4] - 2026-09-13
 
 ### Fixed
