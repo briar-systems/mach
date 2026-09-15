@@ -1,0 +1,1187 @@
+use std.allocator.page;
+use std.collections.map;
+use std.collections.sort;
+use fs: std.filesystem;
+use std.memory;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_contains;
+
+use A: std.allocator;
+use std.format;
+
+use enc: mach.lang.be.codegen.encode;
+use mach.lang.be.obj;
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.layout;
+use mach.lang.session;
+use src: mach.lang.source;
+use mach.lang.target;
+use mach.lang.target.of;
+use mach.lang.target.of.ar;
+use target_testing: mach.lang.target.testing;
+
+use mach.lang.be.linker.atoms.ATOM_OWNS;
+use mach.lang.be.linker.atoms.AtomPlan;
+use mach.lang.be.linker.atoms.atom_live_len;
+use mach.lang.be.linker.atoms.atom_live_offset;
+use mach.lang.be.linker.atoms.atom_offset_dead;
+use mach.lang.be.linker.atoms.copy_live_section;
+use mach.lang.be.linker.atoms.free_atom_plan;
+use mach.lang.be.linker.atoms.init_atom_plan;
+use mach.lang.be.linker.atoms.plan_atom_coalescing;
+use mach.lang.be.linker.common.add_u32_counts;
+use mach.lang.be.linker.common.fill_section_bases;
+use mach.lang.be.linker.common.grow_cap;
+use mach.lang.be.linker.common.is_loadable_kind;
+use mach.lang.be.linker.common.join3;
+use mach.lang.be.linker.common.lt_image;
+use mach.lang.be.linker.common.lt_name;
+use mach.lang.be.linker.common.named_message;
+use mach.lang.be.linker.common.total_sections;
+use mach.lang.be.linker.debug.StrMerge;
+use mach.lang.be.linker.debug.debug_abbrev_tables_equal;
+use mach.lang.be.linker.debug.free_str_merge;
+use mach.lang.be.linker.debug.module_debug_is_linkable;
+
+pub val MERGED_KIND_COUNT: u32 = of.SK_COUNT;
+
+rec MergedSectionCountUnit {}
+
+rec FrameCountUnit {}
+
+pub rec Placement {
+    merged_index: u32;
+    offset:       u32;
+    vaddr:        u64;
+    extent:       u32;
+}
+
+pub rec MergedSection {
+    kind:  of.SectionKind;
+    name:  intern.StrId;
+    align: u32;
+    len:   u32;
+    vaddr: u64;
+    used:  bool;
+}
+
+rec SectionGroup {
+    name:   intern.StrId;
+    slot:   u32;
+    flags:  u32;
+    align:  u32;
+    len:    u32;
+    base:   u32;
+    cursor: u32;
+}
+
+pub rec SectionGroups {
+    items: *SectionGroup;
+    count: u32;
+    cap:   u32;
+}
+
+pub fun init_section_groups(g: *SectionGroups) {
+    g.items = nil;
+    g.count = 0;
+    g.cap   = 0;
+}
+
+pub fun free_section_groups(alloc: *A.Allocator, g: *SectionGroups) {
+    if (g.items != nil && g.cap > 0) { A.deallocate[SectionGroup](alloc, g.items, g.cap::usize); }
+    init_section_groups(g);
+}
+
+fun section_group_index(g: *SectionGroups, slot: u32, name: intern.StrId, flags: u32) u32 {
+    var i: u32 = 0;
+    for (i < g.count) {
+        if (g.items[i].slot == slot && g.items[i].name == name
+            && g.items[i].flags == flags) { ret i; }
+        i = i + 1;
+    }
+    ret 0xFFFFFFFF;
+}
+
+pub fun section_group_add(alloc: *A.Allocator, g: *SectionGroups, slot: u32,
+    name: intern.StrId, flags: u32) res[u32, fail.Fail] {
+    if (g.count == g.cap) {
+        val grown: err[fail.Fail] = grow_cap[SectionGroup](alloc, ?g.items, ?g.cap, 8);
+        if (sel grown.err) { ret res[u32, fail.Fail].err{grown.err}; }
+    }
+    val i: u32 = g.count;
+    g.items[i].name   = name;
+    g.items[i].slot   = slot;
+    g.items[i].flags  = flags;
+    g.items[i].align  = 1;
+    g.items[i].len    = 0;
+    g.items[i].base   = 0;
+    g.items[i].cursor = 0;
+    g.count           = i + 1;
+    ret res[u32, fail.Fail].ok{i};
+}
+
+fun plan_section_groups(alloc: *A.Allocator, modules: *of.ObjectImage, module_count: u32,
+    merged: *MergedSection, atoms: *AtomPlan, sec_base: *u32,
+    dup: *u32, groups: *SectionGroups) err[fail.Fail] {
+    var m: u32 = 0;
+    for (m < module_count) {
+        var sc: u32 = 0;
+        for (sc < modules[m].section_count) {
+            val sec: *of.Section = ?modules[m].sections[sc];
+            if (sec.kind::u32 >= MERGED_KIND_COUNT) {
+                sc = sc + 1;
+                cnt;
+            }
+            if (!is_loadable_kind(sec.kind)) {
+                sc = sc + 1;
+                cnt;
+            }
+            if (dup != nil && dup[sec_base[m] + sc] != ATOM_OWNS) {
+                sc = sc + 1;
+                cnt;
+            }
+
+            val slot: u32 = sec.kind::u32;
+            var gi:   u32 = section_group_index(groups, slot, sec.name, sec.flags & of.SEC_FLAG_IMAGE_MASK);
+            if (gi == 0xFFFFFFFF) {
+                val ar: res[u32, fail.Fail] = section_group_add(alloc, groups, slot, sec.name, sec.flags & of.SEC_FLAG_IMAGE_MASK);
+                if (sel ar.err) { ret err[fail.Fail].err{ar.err}; }
+                gi = ar.ok;
+            }
+            var a: u32 = sec.align;
+            if (a == 0)                     { a = 1; }
+            if (a > groups.items[gi].align) { groups.items[gi].align = a; }
+            val off_r: res[u64, fail.Fail] = align_up_u64_checked(groups.items[gi].len::u64, a::u64);
+            if (sel off_r.err) { ret err[fail.Fail].err{off_r.err}; }
+            val off64: u64 = off_r.ok;
+            val end:   u64 = off64 + atom_live_len(atoms, sec_base[m] + sc, sec.len)::u64;
+            if (end > 0xFFFFFFFF) {
+                ret err[fail.Fail].err{fail.message("linker: merged section group exceeds the 4 GiB u32 limit")};
+            }
+            groups.items[gi].len = end::u32;
+            sc                   = sc + 1;
+        }
+        m = m + 1;
+    }
+
+    var slot: u32 = 0;
+    for (slot < MERGED_KIND_COUNT) {
+        if (!is_loadable_kind(slot::u8)) {
+            slot = slot + 1;
+            cnt;
+        }
+        var run: u64 = 0;
+        var i:   u32 = 0;
+        for (i < groups.count) {
+            if (groups.items[i].slot == slot) {
+                val run_r: res[u64, fail.Fail] = align_up_u64_checked(run, groups.items[i].align::u64);
+                if (sel run_r.err) { ret err[fail.Fail].err{run_r.err}; }
+                run = run_r.ok;
+                if (run + groups.items[i].len::u64 > 0xFFFFFFFF) {
+                    ret err[fail.Fail].err{fail.message("linker: merged section exceeds the 4 GiB u32 limit")};
+                }
+                groups.items[i].base   = run::u32;
+                groups.items[i].cursor = run::u32;
+                run                    = run + groups.items[i].len::u64;
+            }
+            i = i + 1;
+        }
+        slot = slot + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+pub fun init_merged(merged: *MergedSection, debug_names: *intern.StrId, debug_count: u32) {
+    var i: u32 = 0;
+    for (i < MERGED_KIND_COUNT) {
+        merged[i].kind  = i::u8;
+        merged[i].name  = intern.STR_NIL;
+        merged[i].align = 1;
+        merged[i].len   = 0;
+        merged[i].vaddr = 0;
+        merged[i].used  = false;
+        i               = i + 1;
+    }
+    var d: u32 = 0;
+    for (d < debug_count) {
+        val slot: u32 = MERGED_KIND_COUNT + d;
+        merged[slot].kind  = of.SK_DEBUG;
+        merged[slot].name  = debug_names[d];
+        merged[slot].align = 1;
+        merged[slot].len   = 0;
+        merged[slot].vaddr = 0;
+        merged[slot].used  = false;
+        d                  = d + 1;
+    }
+}
+
+pub fun merged_section_count(debug_count: u32) res[u32, fail.Fail] {
+    val total_r: res[u32, layout.CheckCause] = add_u32_counts[MergedSectionCountUnit](MERGED_KIND_COUNT, debug_count);
+    if (sel total_r.err) {
+        ret res[u32, fail.Fail].err{fail.message("linker: merged section count overflow")};
+    }
+    ret res[u32, fail.Fail].ok{total_r.ok};
+}
+
+fun total_frames(modules: *of.ObjectImage, module_count: u32) res[u32, fail.Fail] {
+    var total: layout.CheckedCount[FrameCountUnit] =
+        layout.count[FrameCountUnit](0::usize);
+    var module_index: u32 = 0;
+    for (module_index < module_count) {
+        val added_r: res[layout.CheckedCount[FrameCountUnit], layout.CheckCause] =
+            layout.count_add[FrameCountUnit](total,
+            layout.count[FrameCountUnit](modules[module_index].frame_count::usize));
+        if (sel added_r.err) {
+            ret res[u32, fail.Fail].err{fail.message("linker: total input frame count overflow")};
+        }
+        total        = added_r.ok;
+        module_index = module_index + 1;
+    }
+    val total32_r: res[u32, layout.CheckCause] = layout.usize_to_u32(total.value);
+    if (sel total32_r.err) {
+        ret res[u32, fail.Fail].err{fail.message("linker: total input frame count exceeds the u32 limit")};
+    }
+    ret res[u32, fail.Fail].ok{total32_r.ok};
+}
+
+pub fun accumulate_sections(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
+    merged: *MergedSection, debug_names: *intern.StrId, debug_count: u32,
+    placements: *Placement, sec_base: *u32, strm: *StrMerge,
+    atoms: *AtomPlan, groups: *SectionGroups) err[fail.Fail] {
+    val fsb_r: err[fail.Fail] = fill_section_bases(modules, module_count, sec_base);
+    if (sel fsb_r.err) { ret fsb_r; }
+    val sec_total_r: res[u32, fail.Fail] = total_sections(modules, module_count);
+    if (sel sec_total_r.err) { ret err[fail.Fail].err{sec_total_r.err}; }
+    val sec_total: u32                  = sec_total_r.ok;
+    val dr:        res[*u32, fail.Fail] =
+        plan_atom_coalescing(s.alloc, modules, module_count, sec_base, sec_total, atoms);
+    if (sel dr.err) { ret err[fail.Fail].err{dr.err}; }
+    val dup: *u32 = dr.ok;
+    fin {
+        if (dup != nil && sec_total > 0) { A.deallocate[u32](s.alloc, dup, sec_total::usize); }
+    }
+    val gp: err[fail.Fail] =
+        plan_section_groups(s.alloc, modules, module_count, merged, atoms, sec_base, dup, groups);
+    if (sel gp.err) { ret gp; }
+
+    val an_r: res[intern.StrId, A.Error] = intern.intern(?s.interner, ".debug_abbrev");
+    if (sel an_r.err) { ret err[fail.Fail].err{fail.refused(an_r.err)}; }
+    val abbrev_name:           intern.StrId = an_r.ok;
+    var abbrev_representative: *of.Section  = nil;
+
+    var flat: u32 = 0;
+    var m:    u32 = 0;
+    for (m < module_count) {
+        val debug_linkable: bool = module_debug_is_linkable(modules, m);
+        var sc:             u32  = 0;
+        for (sc < modules[m].section_count) {
+            val sec: *of.Section = ?modules[m].sections[sc];
+            if (sec.kind::u32 >= MERGED_KIND_COUNT) {
+                ret err[fail.Fail].err{fail.message(malformed_input_member(s, "SectionKind", sec.kind::u32, modules[m].name))};
+            }
+            var ki:       u32  = sec.kind::u32;
+            var dedup:    bool = false;
+            var str_slot: bool = false;
+            if (sec.kind == of.SK_DEBUG) {
+                var found: bool = false;
+                var di:    u32  = 0;
+                for (di < debug_count) {
+                    if (debug_names[di] == sec.name) {
+                        ki    = MERGED_KIND_COUNT + di;
+                        found = true;
+                    }
+                    di = di + 1;
+                }
+                if (!found) { ret err[fail.Fail].err{fail.message("linker: debug section name not registered in the merge")}; }
+                if (sec.name == abbrev_name
+                    && debug_abbrev_tables_equal(abbrev_representative, sec)) {
+                    dedup = true;
+                }
+                if (strm.active && sec.name == strm.name) { str_slot = true; }
+            }
+
+            if (sec.kind == of.SK_DEBUG && !debug_linkable) {
+                placements[flat].merged_index = ki;
+                placements[flat].offset       = 0;
+                placements[flat].vaddr        = 0;
+                placements[flat].extent       = 0;
+                flat                          = flat + 1;
+                sc                            = sc + 1;
+                cnt;
+            }
+
+            if (sec.kind == of.SK_DEBUG && sec.name == abbrev_name && sec.len > 0
+                && abbrev_representative == nil) {
+                abbrev_representative = sec;
+            }
+
+            if (str_slot) {
+                var a: u32 = sec.align;
+                if (a == 0)               { a = 1; }
+                if (a > merged[ki].align) { merged[ki].align = a; }
+                merged[ki].len                = strm.buf.len::u32;
+                merged[ki].used               = true;
+                placements[flat].merged_index = ki;
+                placements[flat].offset       = 0;
+                placements[flat].vaddr        = 0;
+                placements[flat].extent       = 0;
+            }
+            or (dedup) {
+                var a: u32 = sec.align;
+                if (a == 0)               { a = 1; }
+                if (a > merged[ki].align) { merged[ki].align = a; }
+                placements[flat].merged_index = ki;
+                placements[flat].offset       = 0;
+                placements[flat].vaddr        = 0;
+                placements[flat].extent       = 0;
+            }
+            or (dup != nil && dup[flat] != ATOM_OWNS) {
+                placements[flat]        = placements[dup[flat]];
+                placements[flat].extent = 0;
+            }
+            or {
+                var a: u32 = sec.align;
+                if (sec.kind == of.SK_EXCEPTION) { a = 4; }
+                if (a == 0)                      { a = 1; }
+                if (a > merged[ki].align)        { merged[ki].align = a; }
+
+                var cursor: u64 = merged[ki].len::u64;
+                var gi:     u32 = 0xFFFFFFFF;
+                if (is_loadable_kind(sec.kind)) {
+                    gi = section_group_index(groups, ki, sec.name, sec.flags & of.SEC_FLAG_IMAGE_MASK);
+                    if (gi == 0xFFFFFFFF) { ret err[fail.Fail].err{fail.message("linker: section group not registered in the merge")}; }
+                    cursor = groups.items[gi].cursor::u64;
+                }
+                val off_r: res[u64, fail.Fail] = align_up_u64_checked(cursor, a::u64);
+                if (sel off_r.err) { ret err[fail.Fail].err{off_r.err}; }
+                val off64:            u64 = off_r.ok;
+                val contribution_len: u32 = atom_live_len(atoms, flat, sec.len);
+                val newlen:           u64 = off64 + contribution_len::u64;
+                if (newlen > 0xFFFFFFFF) {
+                    ret err[fail.Fail].err{fail.message(named_message(s, "linker: merged section '", merged_section_name(s, sec.kind), "' exceeds the 4 GiB u32 limit", "linker: merged section size exceeds the 4 GiB u32 limit"))};
+                }
+
+                placements[flat].merged_index = ki;
+                placements[flat].offset       = off64::u32;
+                placements[flat].vaddr        = 0;
+                placements[flat].extent       = contribution_len;
+
+                if (gi != 0xFFFFFFFF) {
+                    groups.items[gi].cursor = newlen::u32;
+                    if (newlen::u32 > merged[ki].len) { merged[ki].len = newlen::u32; }
+                }
+                or { merged[ki].len = newlen::u32; }
+                merged[ki].used = true;
+                if (sec.kind == of.SK_EXCEPTION && merged[ki].name == intern.STR_NIL) {
+                    merged[ki].name = sec.name;
+                }
+            }
+
+            flat = flat + 1;
+            sc   = sc + 1;
+        }
+        m = m + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+rec Contribution {
+    merged_index: u32;
+    offset:       u32;
+    extent:       u32;
+    flat:         u32;
+}
+
+fun contribution_order(a: *Contribution, b: *Contribution) i64 {
+    if (a.merged_index < b.merged_index) { ret -1; }
+    if (a.merged_index > b.merged_index) { ret 1; }
+    if (a.offset < b.offset)             { ret -1; }
+    if (a.offset > b.offset)             { ret 1; }
+    if (a.flat < b.flat)                 { ret -1; }
+    if (a.flat > b.flat)                 { ret 1; }
+    ret 0;
+}
+
+fun contribution_name(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
+    sec_base: *u32, flat: u32) str {
+    var m: u32 = 0;
+    for (m < module_count) {
+        val base: u32 = sec_base[m];
+        if (flat >= base && flat < base + modules[m].section_count) {
+            var mod: str      = "?";
+            var sec: str      = "?";
+            val mn:  opt[str] = intern.lookup(?s.interner, modules[m].name);
+            val sn:  opt[str] = intern.lookup(?s.interner, modules[m].sections[flat - base].name);
+            if (sel mn.some) { mod = mn.some; }
+            if (sel sn.some) { sec = sn.some; }
+            ret join3(s, mod, ":", sec, "?");
+        }
+        m = m + 1;
+    }
+    ret "?";
+}
+
+val OVERLAP_FALLBACK: str = "linker: two section contributions claim overlapping ranges of one merged output section";
+
+fun overlap_message(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
+    sec_base: *u32, a: *Contribution, b: *Contribution) str {
+    val an: str                          = contribution_name(s, modules, module_count, sec_base, a.flat);
+    val bn: str                          = contribution_name(s, modules, module_count, sec_base, b.flat);
+    val r:  res[str, format.FormatError] = format.sprint(s.alloc,
+        "linker: '{}' claims bytes {} through {} of a merged output section and '{}' claims bytes {} through {}; two contributions cannot occupy the same output range",
+        an, a.offset::u64, a.offset::u64 + a.extent::u64,
+        bn, b.offset::u64, b.offset::u64 + b.extent::u64);
+    if (sel r.err) { ret OVERLAP_FALLBACK; }
+    val buf: str                        = r.ok;
+    val ir:  res[intern.StrId, A.Error] = intern.intern(?s.interner, buf);
+    str_free(s.alloc, buf);
+    if (sel ir.err) { ret OVERLAP_FALLBACK; }
+    val nm: opt[str] = intern.lookup(?s.interner, ir.ok);
+    if (sel nm.some) { ret nm.some; }
+    ret OVERLAP_FALLBACK;
+}
+
+pub fun validate_no_contribution_overlap(s: *session.Session, modules: *of.ObjectImage,
+    module_count: u32, sec_base: *u32,
+    placements: *Placement, sec_total: u32) err[fail.Fail] {
+    if (sec_total < 2) { ret err[fail.Fail].ok{}; }
+
+    val ar: res[*Contribution, A.Error] = A.allocate[Contribution](s.alloc, sec_total::usize);
+    if (sel ar.err) {
+        ret err[fail.Fail].err{fail.refused(ar.err)};
+    }
+    val items: *Contribution = ar.ok;
+    fin { A.deallocate[Contribution](s.alloc, items, sec_total::usize); }
+
+    var n:    usize = 0;
+    var flat: u32   = 0;
+    for (flat < sec_total) {
+        if (placements[flat].extent != 0) {
+            items[n].merged_index = placements[flat].merged_index;
+            items[n].offset       = placements[flat].offset;
+            items[n].extent       = placements[flat].extent;
+            items[n].flat         = flat;
+            n                     = n + 1;
+        }
+        flat = flat + 1;
+    }
+    if (n < 2) { ret err[fail.Fail].ok{}; }
+
+    sort.sort[Contribution](items, n, contribution_order);
+
+    var i: usize = 1;
+    for (i < n) {
+        val prev: *Contribution = ?items[i - 1];
+        val cur:  *Contribution = ?items[i];
+        if (prev.merged_index == cur.merged_index
+            && prev.offset::u64 + prev.extent::u64 > cur.offset::u64) {
+            ret err[fail.Fail].err{fail.message(overlap_message(s, modules, module_count, sec_base, prev, cur))};
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# one alignment for the whole linker, over the same primitive the object
+# writers' file plan uses
+pub fun align_up_u64_checked(value: u64, alignment: u64) res[u64, fail.Fail] {
+    val aligned: res[u64, layout.CheckCause] = layout.align_u64_up(value, alignment);
+    if (sel aligned.err) {
+        if (aligned.err == layout.CHECK_ADD_OVERFLOW) {
+            ret res[u64, fail.Fail].err{fail.message("linker: layout alignment overflows the address space")};
+        }
+        ret res[u64, fail.Fail].err{fail.message("linker: layout alignment is not a nonzero power of two")};
+    }
+    ret res[u64, fail.Fail].ok{aligned.ok};
+}
+
+pub fun reorder_flat_entry_first(modules: *of.ObjectImage, module_count: u32,
+    merged: *MergedSection, placements: *Placement, sec_base: *u32,
+    atoms: *AtomPlan, entry_name: intern.StrId) err[fail.Fail] {
+    var entry_flat: u32 = 0xFFFFFFFF;
+    var m:          u32 = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym: *of.Symbol = ?modules[m].symbols[sy];
+            if (sym.name == entry_name && !of.section_is_external(sym.section)
+                && of.section_index(sym.section) < modules[m].section_count
+                && modules[m].sections[of.section_index(sym.section)].kind == of.SK_TEXT) {
+                entry_flat = sec_base[m] + of.section_index(sym.section);
+            }
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+    if (entry_flat == 0xFFFFFFFF) { ret err[fail.Fail].ok{}; }
+
+    val text_slot: u32 = of.SK_TEXT::u32;
+
+    var run:  u64 = 0;
+    var pass: u32 = 0;
+    for (pass < 2) {
+        m = 0;
+        for (m < module_count) {
+            var sc: u32 = 0;
+            for (sc < modules[m].section_count) {
+                val flat: u32 = sec_base[m] + sc;
+                if (placements[flat].merged_index == text_slot) {
+                    val is_entry: bool = flat == entry_flat;
+                    if ((pass == 0 && is_entry) || (pass == 1 && !is_entry)) {
+                        var a: u32 = modules[m].sections[sc].align;
+                        if (a == 0) { a = 1; }
+                        val aligned_r: res[u64, fail.Fail] = align_up_u64_checked(run, a::u64);
+                        if (sel aligned_r.err) {
+                            ret err[fail.Fail].err{aligned_r.err};
+                        }
+                        val aligned:      u64 = aligned_r.ok;
+                        val contribution: u64 =
+                            atom_live_len(atoms, flat, modules[m].sections[sc].len)::u64;
+                        if (aligned > 0xFFFFFFFFFFFFFFFF - contribution) {
+                            ret err[fail.Fail].err{fail.message("linker: entry-first text layout overflows the address space")};
+                        }
+                        val next: u64 = aligned + contribution;
+                        if (next > 0xFFFFFFFF) {
+                            ret err[fail.Fail].err{fail.message("linker: entry-first text layout exceeds the 4 GiB u32 limit")};
+                        }
+                        placements[flat].offset = aligned::u32;
+                        run                     = next;
+                    }
+                }
+                sc = sc + 1;
+            }
+            m = m + 1;
+        }
+        pass = pass + 1;
+    }
+
+    merged[text_slot].len = run::u32;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun assign_section_vaddrs(tgt: *target.Target, merged: *MergedSection,
+    reserve: u64) err[fail.Fail] {
+    val base: u64 = os_base_addr(tgt);
+    val page: u64 = os_page_size(tgt);
+    if (page == 0 || (page & (page - 1)) != 0) {
+        ret err[fail.Fail].err{fail.message("linker: target page size is not a nonzero power of two")};
+    }
+    if (base > 0xFFFFFFFFFFFFFFFF - reserve) {
+        ret err[fail.Fail].err{fail.message("linker: image base and header reserve overflow the address space")};
+    }
+
+    var va: u64 = base + reserve;
+    var i:  u32 = 0;
+    for (i < MERGED_KIND_COUNT) {
+        if (merged[i].used && is_loadable_kind(merged[i].kind)) {
+            var seg_align: u64 = merged[i].align::u64;
+            if (seg_align < page) { seg_align = page; }
+            val aligned_r: res[u64, fail.Fail] = align_up_u64_checked(va, seg_align);
+            if (sel aligned_r.err) {
+                ret err[fail.Fail].err{aligned_r.err};
+            }
+            val aligned: u64 = aligned_r.ok;
+            if (aligned > 0xFFFFFFFFFFFFFFFF - merged[i].len::u64) {
+                ret err[fail.Fail].err{fail.message("linker: section virtual address range overflows the address space")};
+            }
+            merged[i].vaddr = aligned;
+            va              = aligned + merged[i].len::u64;
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+pub fun finalize_placement_vaddrs(merged: *MergedSection, placements: *Placement, sec_total: u32) {
+    var i: u32 = 0;
+    for (i < sec_total) {
+        val ki: u32 = placements[i].merged_index;
+        placements[i].vaddr = merged[ki].vaddr + placements[i].offset::u64;
+        i                   = i + 1;
+    }
+}
+
+pub fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
+    modules: *of.ObjectImage, module_count: u32,
+    merged: *MergedSection, merged_count: u32, placements: *Placement, sec_base: *u32,
+    merged_to_out: *u32, sym_base: *u32, sym_out: *u32, strm: *StrMerge,
+    atoms: *AtomPlan) err[fail.Fail] {
+    val alloc:         *A.Allocator        = s.alloc;
+    val frame_total_r: res[u32, fail.Fail] = total_frames(modules, module_count);
+    if (sel frame_total_r.err) {
+        ret err[fail.Fail].err{frame_total_r.err};
+    }
+    val frame_total: u32 = frame_total_r.ok;
+
+    var k: u32 = 0;
+    for (k < merged_count) {
+        merged_to_out[k] = 0xFFFFFFFF;
+        k                = k + 1;
+    }
+
+    k = 0;
+    for (k < merged_count) {
+        if (!merged[k].used || merged[k].len == 0) {
+            k = k + 1;
+            cnt;
+        }
+
+        var bytes: *u8 = nil;
+        if (merged[k].kind != of.SK_BSS) {
+            val zr: res[*u8, A.Error] = A.zallocate[u8](alloc, merged[k].len::usize);
+            if (sel zr.err) { ret err[fail.Fail].err{fail.refused(zr.err)}; }
+            bytes = zr.ok;
+
+            if (strm.active && merged[k].kind == of.SK_DEBUG && merged[k].name == strm.name
+                && strm.buf.len > 0) {
+                memory.copy[u8](bytes, strm.buf.data, strm.buf.len);
+            }
+        }
+
+        var sec: of.Section;
+        if (merged[k].name == intern.STR_NIL) { sec.name = merged_section_name(s, merged[k].kind); }
+        or                                    { sec.name = merged[k].name; }
+        sec.kind  = merged[k].kind;
+        sec.bytes = bytes;
+        sec.len   = merged[k].len;
+        sec.align = merged[k].align;
+        sec.flags = 0;
+
+        val add_r: res[u32, fail.Fail] = obj.section_install(out_img, ?sec);
+        if (sel add_r.err) {
+            ret err[fail.Fail].err{add_r.err};
+        }
+        merged_to_out[k] = add_r.ok;
+        k                = k + 1;
+    }
+
+    var m: u32 = 0;
+    for (m < module_count) {
+        val debug_linkable: bool = module_debug_is_linkable(modules, m);
+        var sc:             u32  = 0;
+        for (sc < modules[m].section_count) {
+            val src: *of.Section = ?modules[m].sections[sc];
+            if (src.kind == of.SK_BSS || src.bytes == nil || src.len == 0) {
+                sc = sc + 1;
+                cnt;
+            }
+            if (strm.active && src.kind == of.SK_DEBUG && src.name == strm.name) {
+                sc = sc + 1;
+                cnt;
+            }
+            if (src.kind == of.SK_DEBUG && !debug_linkable) {
+                sc = sc + 1;
+                cnt;
+            }
+
+            val flat:   u32 = sec_base[m] + sc;
+            val ki:     u32 = placements[flat].merged_index;
+            val out_ix: u32 = merged_to_out[ki];
+            if (out_ix == 0xFFFFFFFF) {
+                sc = sc + 1;
+                cnt;
+            }
+
+            val dst: *u8 = out_img.sections[out_ix].bytes;
+            val off: u32 = placements[flat].offset;
+            if (atom_live_len(atoms, flat, src.len) > 0) {
+                copy_live_section(?dst[off], src.bytes, src.len, atoms, flat);
+            }
+
+            sc = sc + 1;
+        }
+        m = m + 1;
+    }
+
+    m = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            if (sym_out != nil) { sym_out[sym_base[m] + sy] = of.SYMBOL_NONE; }
+            val isym: *of.Symbol = ?modules[m].symbols[sy];
+            if (of.section_is_absolute(isym.section)) {
+                val added: res[u32, fail.Fail] = obj.symbol_add(out_img, @isym);
+                if (sel added.err)  { ret err[fail.Fail].err{added.err}; }
+                if (sym_out != nil) { sym_out[sym_base[m] + sy] = added.ok; }
+                sy = sy + 1;
+                cnt;
+            }
+            if (of.section_is_external(isym.section) || of.section_index(isym.section) >= modules[m].section_count) {
+                sy = sy + 1;
+                cnt;
+            }
+
+            val flat: u32 = sec_base[m] + of.section_index(isym.section);
+            if (atom_offset_dead(atoms, flat, isym.offset)) {
+                sy = sy + 1;
+                cnt;
+            }
+            val ki:     u32 = placements[flat].merged_index;
+            val out_ix: u32 = merged_to_out[ki];
+            if (out_ix == 0xFFFFFFFF) {
+                sy = sy + 1;
+                cnt;
+            }
+
+            var osym: of.Symbol = @isym;
+            osym.section = of.section_id(out_ix);
+            osym.offset  = placements[flat].offset
+                + atom_live_offset(atoms, flat, isym.offset);
+
+            val sa: res[u32, fail.Fail] = obj.symbol_add(out_img, osym);
+            if (sel sa.err) { ret err[fail.Fail].err{sa.err}; }
+            if (sym_out != nil) {
+                sym_out[sym_base[m] + sy] = sa.ok;
+            }
+
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+
+    if (frame_total > 0) {
+        val fa: res[*of.FrameUnwind, A.Error] = A.allocate[of.FrameUnwind](out_img.alloc, frame_total::usize);
+        if (sel fa.err) { ret err[fail.Fail].err{fail.refused(fa.err)}; }
+        var out_frames: *of.FrameUnwind = fa.ok;
+        var fn:         u32             = 0;
+        m = 0;
+        for (m < module_count) {
+            var fi: u32 = 0;
+            for (fi < modules[m].frame_count) {
+                val ifr: *of.FrameUnwind = ?modules[m].frames[fi];
+                if (of.section_index(ifr.section) >= modules[m].section_count) {
+                    fi = fi + 1;
+                    cnt;
+                }
+                val flat: u32 = sec_base[m] + of.section_index(ifr.section);
+                if (atom_offset_dead(atoms, flat, ifr.offset)) {
+                    fi = fi + 1;
+                    cnt;
+                }
+                val ki:     u32 = placements[flat].merged_index;
+                val out_ix: u32 = merged_to_out[ki];
+                if (out_ix == 0xFFFFFFFF) {
+                    fi = fi + 1;
+                    cnt;
+                }
+
+                out_frames[fn]         = @ifr;
+                out_frames[fn].section = of.section_id(out_ix);
+                out_frames[fn].offset  = placements[flat].offset
+                    + atom_live_offset(atoms, flat, ifr.offset);
+                fn = fn + 1;
+                fi = fi + 1;
+            }
+            m = m + 1;
+        }
+        if (fn == 0) {
+            A.deallocate[of.FrameUnwind](out_img.alloc, out_frames, frame_total::usize);
+        }
+        or {
+            if (fn < frame_total) {
+                val fs: res[*of.FrameUnwind, A.Error] =
+                    A.reallocate[of.FrameUnwind](out_img.alloc, out_frames, frame_total::usize, fn::usize);
+                if (sel fs.err) {
+                    A.deallocate[of.FrameUnwind](out_img.alloc, out_frames, frame_total::usize);
+                    ret err[fail.Fail].err{fail.refused(fs.err)};
+                }
+                out_frames = fs.ok;
+            }
+            out_img.frames      = out_frames;
+            out_img.frame_count = fn;
+            out_img.frame_cap   = fn;
+        }
+    }
+
+    ret err[fail.Fail].ok{};
+}
+
+pub fun segment_index_for(out_img: *of.ObjectImage, out_ix: u32) u32 {
+    var seg: u32 = 0;
+    var i:   u32 = 0;
+    for (i < out_ix && i < out_img.section_count) {
+        if (is_loadable_kind(out_img.sections[i].kind)) { seg = seg + 1; }
+        i = i + 1;
+    }
+    ret seg;
+}
+
+pub fun final_section_location_for(format: *of.OfVTable, image_base: u64,
+    out_img: *of.ObjectImage, out_ix: u32,
+    content_vaddr: u64) of.ExecutableSectionLocation {
+    var loc: of.ExecutableSectionLocation;
+    loc.vaddr   = content_vaddr;
+    loc.ordinal = 0;
+    if (out_ix >= out_img.section_count || !is_loadable_kind(out_img.sections[out_ix].kind)) {
+        ret loc;
+    }
+
+    val seg_index: u32 = segment_index_for(out_img, out_ix);
+    loc.ordinal = seg_index + 1;
+    if (format != nil && format.executable_section_location != nil) {
+        ret format.executable_section_location(image_base, content_vaddr, seg_index);
+    }
+    ret loc;
+}
+
+pub fun intern_or_nil(s: *session.Session, name: str) intern.StrId {
+    val r: res[intern.StrId, A.Error] = intern.intern(?s.interner, name);
+    if (sel r.err) { ret intern.STR_NIL; }
+    ret r.ok;
+}
+
+fun merged_section_name(s: *session.Session, kind: of.SectionKind) intern.StrId {
+    if (kind == of.SK_TEXT)   { ret intern_or_nil(s, ".text"); }
+    if (kind == of.SK_RODATA) { ret intern_or_nil(s, ".rodata"); }
+    if (kind == of.SK_RELRO)  { ret intern_or_nil(s, ".data.rel.ro"); }
+    if (kind == of.SK_DATA)   { ret intern_or_nil(s, ".data"); }
+    if (kind == of.SK_BSS)    { ret intern_or_nil(s, ".bss"); }
+    if (kind == of.SK_DEBUG)  { ret intern_or_nil(s, ".debug"); }
+    ret intern_or_nil(s, ".exception");
+}
+
+pub fun os_base_addr(tgt: *target.Target) u64 {
+    if (tgt.base != 0) { ret tgt.base; }
+    ret tgt.os.base_addr;
+}
+
+pub fun os_page_size(tgt: *target.Target) u64 {
+    ret tgt.page_size;
+}
+
+# a catalog member an input object carries that its catalog does not declare:
+# malformed input, named with the object it came from
+fun malformed_input_member(s: *session.Session, catalog: str, tag: u32, object_name: intern.StrId) str {
+    var where: str      = "";
+    val nm:    opt[str] = intern.lookup(?s.interner, object_name);
+    if (sel nm.some) { where = nm.some; }
+    ret fail.catalog_message(?s.interner, s.alloc, fail.malformed_member_in(catalog, tag, where));
+}
+
+pub fun free_placements(alloc: *A.Allocator, placements: *Placement, sec_total: u32) {
+    if (placements != nil && sec_total > 0) {
+        A.deallocate[Placement](alloc, placements, sec_total::usize);
+    }
+}
+
+test "mach.lang.be.linker.contribution_overlap:two_claims_on_one_range_are_named" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+
+    val text_name:   intern.StrId = lt_name(?s, ".text");
+    var left_bytes:  [8]u8;
+    var right_bytes: [8]u8;
+    var sections:    [2]of.Section;
+    sections[0].name  = text_name;
+    sections[0].kind  = of.SK_TEXT;
+    sections[0].bytes = ?left_bytes[0];
+    sections[0].len   = 8;
+    sections[0].align = 1;
+    sections[0].flags = 0;
+    sections[1].name  = text_name;
+    sections[1].kind  = of.SK_TEXT;
+    sections[1].bytes = ?right_bytes[0];
+    sections[1].len   = 8;
+    sections[1].align = 1;
+    sections[1].flags = 0;
+
+    var modules: [2]of.ObjectImage;
+    modules[0] = lt_image(?s, lt_name(?s, "left.o"), ?sections[0], 1,
+        nil::*of.Symbol, 0, nil::*of.Relocation, 0);
+    modules[1] = lt_image(?s, lt_name(?s, "right.o"), ?sections[1], 1,
+        nil::*of.Symbol, 0, nil::*of.Relocation, 0);
+
+    val merged_count_r: res[u32, fail.Fail] = merged_section_count(0);
+    if (sel merged_count_r.err) { ret 2; }
+    val merged_count: u32                          = merged_count_r.ok;
+    val merged_r:     res[*MergedSection, A.Error] =
+        A.zallocate[MergedSection](?alloc, merged_count::usize);
+    if (sel merged_r.err) { ret 3; }
+    val merged: *MergedSection = merged_r.ok;
+    init_merged(merged, nil::*intern.StrId, 0);
+
+    var placements: [2]Placement;
+    var sec_base:   [2]u32;
+    var strm:       StrMerge;
+    strm.buf    = enc.buf_init(?alloc);
+    strm.offs   = map.init[intern.StrId, u32](?alloc, map.hash_u32, map.eq_u32);
+    strm.name   = intern.STR_NIL;
+    strm.active = false;
+    var atoms: AtomPlan;
+    init_atom_plan(?atoms);
+    var groups: SectionGroups;
+    init_section_groups(?groups);
+
+    val acc: err[fail.Fail] = accumulate_sections(
+        ?s, ?modules[0], 2, merged, nil::*intern.StrId, 0,
+        ?placements[0], ?sec_base[0], ?strm, ?atoms, ?groups);
+    var bad: i32 = 0;
+    if (sel acc.err)               { bad = 4; }
+    or (placements[0].extent != 8) { bad = 5; }
+    or (placements[1].extent != 8) { bad = 6; }
+    or (placements[1].offset != 8) { bad = 7; }
+    if (bad != 0)                  { ret bad; }
+
+    val clean: err[fail.Fail] = validate_no_contribution_overlap(
+        ?s, ?modules[0], 2, ?sec_base[0], ?placements[0], 2);
+    if (sel clean.err) { ret 8; }
+
+    placements[1].offset = 4;
+    val clash: err[fail.Fail] = validate_no_contribution_overlap(
+        ?s, ?modules[0], 2, ?sec_base[0], ?placements[0], 2);
+    if (!sel clash.err) { ret 9; }
+    val msg: str = fail.describe(clash.err);
+    if (!str_contains(msg, "left.o:.text"))  { ret 10; }
+    if (!str_contains(msg, "right.o:.text")) { ret 11; }
+
+    placements[1].offset = 8;
+    placements[1].extent = 0;
+    placements[0].extent = 32;
+    val aliased: err[fail.Fail] = validate_no_contribution_overlap(
+        ?s, ?modules[0], 2, ?sec_base[0], ?placements[0], 2);
+    if (sel aliased.err) { ret 12; }
+    ret 0;
+}
+
+test "mach.lang.be.linker.debug_abbrev_merge:deduplicates_only_equal_tables" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val session_r: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel session_r.err) { ret 1; }
+    var s: session.Session = session_r.ok;
+
+    val abbrev_name: intern.StrId = lt_name(?s, ".debug_abbrev");
+    var first_bytes: [2]u8;
+    first_bytes[0] = 0x11;
+    first_bytes[1] = 0;
+    var distinct_bytes: [3]u8;
+    distinct_bytes[0] = 0x22;
+    distinct_bytes[1] = 0x33;
+    distinct_bytes[2] = 0;
+    var equal_bytes: [2]u8;
+    equal_bytes[0] = 0x11;
+    equal_bytes[1] = 0;
+
+    var sections: [3]of.Section;
+    sections[0].name  = abbrev_name;
+    sections[0].kind  = of.SK_DEBUG;
+    sections[0].bytes = ?first_bytes[0];
+    sections[0].len   = 2;
+    sections[0].align = 1;
+    sections[0].flags = 0;
+    sections[1].name  = abbrev_name;
+    sections[1].kind  = of.SK_DEBUG;
+    sections[1].bytes = ?distinct_bytes[0];
+    sections[1].len   = 3;
+    sections[1].align = 1;
+    sections[1].flags = 0;
+    sections[2].name  = abbrev_name;
+    sections[2].kind  = of.SK_DEBUG;
+    sections[2].bytes = ?equal_bytes[0];
+    sections[2].len   = 2;
+    sections[2].align = 2;
+    sections[2].flags = 0;
+
+    var modules: [3]of.ObjectImage;
+    modules[0] = lt_image(?s, lt_name(?s, "first.o"), ?sections[0], 1,
+        nil::*of.Symbol, 0, nil::*of.Relocation, 0);
+    modules[1] = lt_image(?s, lt_name(?s, "distinct.o"), ?sections[1], 1,
+        nil::*of.Symbol, 0, nil::*of.Relocation, 0);
+    modules[2] = lt_image(?s, lt_name(?s, "equal.o"), ?sections[2], 1,
+        nil::*of.Symbol, 0, nil::*of.Relocation, 0);
+
+    val merged_count_r: res[u32, fail.Fail] = merged_section_count(1);
+    if (sel merged_count_r.err) {
+        session.dnit(?s);
+        ret 2;
+    }
+    val merged_count: u32                          = merged_count_r.ok;
+    val merged_r:     res[*MergedSection, A.Error] =
+        A.zallocate[MergedSection](?alloc, merged_count::usize);
+    if (sel merged_r.err) {
+        session.dnit(?s);
+        ret 3;
+    }
+    val merged:      *MergedSection = merged_r.ok;
+    var debug_names: [1]intern.StrId;
+    debug_names[0] = abbrev_name;
+    init_merged(merged, ?debug_names[0], 1);
+
+    var placements: [3]Placement;
+    var sec_base:   [3]u32;
+    var strm:       StrMerge;
+    strm.buf    = enc.buf_init(?alloc);
+    strm.offs   = map.init[intern.StrId, u32](?alloc, map.hash_u32, map.eq_u32);
+    strm.name   = intern.STR_NIL;
+    strm.active = false;
+    var atoms: AtomPlan;
+    init_atom_plan(?atoms);
+    var groups: SectionGroups;
+    init_section_groups(?groups);
+
+    val accumulated_r: err[fail.Fail] = accumulate_sections(
+        ?s, ?modules[0], 3, merged, ?debug_names[0], 1,
+        ?placements[0], ?sec_base[0], ?strm, ?atoms, ?groups);
+    var bad:  i32 = 0;
+    val slot: u32 = MERGED_KIND_COUNT;
+    if (sel accumulated_r.err)     { bad = 4; }
+    or (placements[0].offset != 0) { bad = 5; }
+    or (placements[1].offset != 2) { bad = 6; }
+    or (placements[2].offset != 0) { bad = 7; }
+    or (merged[slot].len != 5)     { bad = 8; }
+    or (merged[slot].align != 2)   { bad = 9; }
+
+    free_section_groups(?alloc, ?groups);
+    free_atom_plan(?alloc, ?atoms);
+    free_str_merge(?strm);
+    A.deallocate[MergedSection](?alloc, merged, merged_count::usize);
+    session.dnit(?s);
+    ret bad;
+}
+
+test "mach.lang.be.linker.os_base_addr:manifest_base_override" {
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val r_10114: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_10114.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] = target.select(?reg, "x86_64", "freestanding", "sysv64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
+
+    if (tgt.base != 0)                          { ret 1; }
+    if (os_base_addr(?tgt) != tgt.os.base_addr) { ret 1; }
+    if (os_base_addr(?tgt) != 0)                { ret 1; }
+
+    tgt.base = 0xFFFF800000000000;
+    if (os_base_addr(?tgt) != 0xFFFF800000000000) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.be.linker.merged_section_count:refuses_debug_count_overflow" {
+    val overflow_r: res[u32, fail.Fail] = merged_section_count(0xFFFFFFFF);
+    if (sel overflow_r.ok) { ret 1; }
+
+    val normal_r: res[u32, fail.Fail] = merged_section_count(2);
+    if (sel normal_r.err)                     { ret 2; }
+    if (normal_r.ok != MERGED_KIND_COUNT + 2) { ret 3; }
+    ret 0;
+}
+
+test "mach.lang.be.linker.total_frames:refuses_flattened_count_overflow" {
+    var mods: [2]of.ObjectImage;
+    mods[0].frame_count = 0xFFFFFFFF;
+    mods[1].frame_count = 1;
+    val overflow_r: res[u32, fail.Fail] = total_frames(?mods[0], 2);
+    if (sel overflow_r.ok) { ret 1; }
+
+    mods[0].frame_count = 2;
+    mods[1].frame_count = 3;
+    val normal_r: res[u32, fail.Fail] = total_frames(?mods[0], 2);
+    if (sel normal_r.err) { ret 2; }
+    if (normal_r.ok != 5) { ret 3; }
+    ret 0;
+}
+
+test "mach.lang.be.linker.reorder_flat_entry_first:refuses_u32_layout_overflow" {
+    var sections: [2]of.Section;
+    sections[0].name  = 1::intern.StrId;
+    sections[0].kind  = of.SK_TEXT;
+    sections[0].bytes = nil;
+    sections[0].len   = 1;
+    sections[0].align = 32;
+    sections[0].flags = 0;
+    sections[1].name  = 2::intern.StrId;
+    sections[1].kind  = of.SK_TEXT;
+    sections[1].bytes = nil;
+    sections[1].len   = 0xFFFFFFF0;
+    sections[1].align = 1;
+    sections[1].flags = 0;
+
+    var entry: of.Symbol;
+    entry.name     = 77::intern.StrId;
+    entry.section  = of.section_id(1);
+    entry.offset   = 0;
+    entry.size     = 1;
+    entry.flags    = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    entry.fallback = of.SYMBOL_NONE;
+    entry.align    = 1;
+
+    var image: of.ObjectImage;
+    image.sections      = ?sections[0];
+    image.section_count = 2;
+    image.symbols       = ?entry;
+    image.symbol_count  = 1;
+
+    var merged: [MERGED_KIND_COUNT]MergedSection;
+    merged[of.SK_TEXT::u32].kind = of.SK_TEXT;
+    merged[of.SK_TEXT::u32].len  = 0xFFFFFFF1;
+    merged[of.SK_TEXT::u32].used = true;
+    var placements: [2]Placement;
+    placements[0].merged_index = of.SK_TEXT::u32;
+    placements[1].merged_index = of.SK_TEXT::u32;
+    var sec_base: [1]u32;
+    sec_base[0] = 0;
+
+    val r: err[fail.Fail] = reorder_flat_entry_first(
+        ?image, 1, ?merged[0], ?placements[0], ?sec_base[0], nil::*AtomPlan, entry.name);
+    if (sel r.ok) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.be.linker.assign_section_vaddrs:checks_page_and_address_ranges" {
+    var tgt: target.Target;
+    tgt.base      = 0xFFFFFFFFFFFFFFF0;
+    tgt.page_size = 16;
+
+    var merged: [MERGED_KIND_COUNT]MergedSection;
+    merged[of.SK_TEXT::u32].kind  = of.SK_TEXT;
+    merged[of.SK_TEXT::u32].align = 16;
+    merged[of.SK_TEXT::u32].len   = 32;
+    merged[of.SK_TEXT::u32].used  = true;
+    val assign_section_vaddrs_r: err[fail.Fail] = assign_section_vaddrs(?tgt, ?merged[0], 0);
+    if (sel assign_section_vaddrs_r.ok) { ret 1; }
+
+    tgt.base      = 0x1000;
+    tgt.page_size = 3;
+    val assign_section_vaddrs_r2: err[fail.Fail] = assign_section_vaddrs(?tgt, ?merged[0], 0);
+    if (sel assign_section_vaddrs_r2.ok) { ret 2; }
+
+    tgt.page_size = 0x1000;
+    val assign_section_vaddrs_r3: err[fail.Fail] = assign_section_vaddrs(?tgt, ?merged[0], 0);
+    if (sel assign_section_vaddrs_r3.err)        { ret 3; }
+    if (merged[of.SK_TEXT::u32].vaddr != 0x1000) { ret 4; }
+    ret 0;
+}
+
+test "mach.lang.be.linker.section_group_add:refuses_a_group_count_at_the_u32_sentinel" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var dummy: SectionGroup;
+    var g:     SectionGroups;
+    g.items = ?dummy;
+    g.count = 0xFFFFFFFF;
+    g.cap   = 0xFFFFFFFF;
+
+    val result: res[u32, fail.Fail] = section_group_add(?alloc, ?g, 0, 0::intern.StrId, 0);
+    if (!sel result.err) {
+        g.items = nil;
+        g.count = 0;
+        g.cap   = 0;
+        ret 1;
+    }
+    if (g.count != 0xFFFFFFFF) { ret 1; }
+    ret 0;
+}
