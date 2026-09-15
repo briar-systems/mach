@@ -310,6 +310,14 @@ abi = "spirv"
 mach build . --target gpu     # writes out/gpu/<profile>/obj/<module>.spv
 ```
 
+With `debug` on, each module carries its debug information inside it, written as core
+instructions that need no capability or extension and so fit every `env`: `OpString`
+and `OpSource` name the source files, `OpName` names functions, interface variables and
+locals, `OpName` and `OpMemberName` name a uniform or storage block's record and its
+fields, and `OpLine` attributes each instruction to its source line and column. A
+required shader artifact built for a consumer's debug profile therefore builds, and
+validation layers and capture tools report names and source lines.
+
 `env` is a general target key whose values are owned by the target's isa; a
 `spirv` target uses it to declare the environment its modules are consumed in.
 The environment fixes the SPIR-V version word and the capability ceiling:
@@ -341,14 +349,6 @@ os  = "freestanding"
 abi = "spirv"
 env = "vulkan1.2"
 ```
-
-With `debug` on, each module carries its debug information inside it, written as core
-instructions that need no capability or extension and so fit every `env`: `OpString`
-and `OpSource` name the source files, `OpName` names functions, interface variables and
-locals, `OpName` and `OpMemberName` name a uniform or storage block's record and its
-fields, and `OpLine` attributes each instruction to its source line and column. A
-required shader artifact built for a consumer's debug profile therefore builds, and
-validation layers and capture tools report names and source lines.
 
 The artifact's `out` template and `-o` name a linked binary, which such a target
 has none of; the module tree is delivered instead. A `static` or `shared`
