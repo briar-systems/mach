@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A profile with `debug = true` builds `windows` targets, where it refused them for having no debug model. COFF objects and PE images carry DWARF in `.debug_*` sections with section-relative offsets, which gdb, lldb and the LLVM tools resolve to functions and source lines. The reference no longer claims CodeView (#3408).
 - A failed Git command in `mach dep` or build-time dependency verification names the command, its exit status and Git's own message, where it reported only `Git dependency inspection command failed` (#3389).
 - Only a directory under `dep/` named by a valid project id is a dependency slot, so a file such as the `.DS_Store` Finder writes no longer draws a stray note from `mach dep pull` or fails `mach dep verify` (#3391).
 - `mach dep pull`, `add` and `update` realize a Git dependency from everything its slot holds (the checkout, the staged gitlink, its `.gitmodules` entry and a retained module store) rather than from whether `dep/<id>` exists. A deleted checkout whose gitlink is staged is initialized again instead of failing in `git submodule add`, a missing `.gitmodules` entry is restored from the manifest, a clean unregistered checkout is registered where pull used to exit 0 without recording it, and re-adding a removed dependency reuses the checkout or module store Git kept instead of refusing (#3390).
