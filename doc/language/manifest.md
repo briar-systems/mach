@@ -294,9 +294,11 @@ tuple that would emit nothing.
 ### Finished-module targets
 
 A `spirv` target's object output is a complete, self-contained module rather than
-a link input. The build therefore delivers the **module tree** — one
-`<out>/obj/<fqn-as-path>.spv` per module — and runs no link phase, so a default
-build and `--emit obj` produce the same files:
+a link input. Each module is written to `<out>/obj/<fqn-as-path>.spv` like any
+other target's objects, and the entry module already carries every function its
+stages reach, so it is the whole deliverable. A `bin` artifact therefore needs no
+linker: the build publishes the entry module at the artifact's resolved `out` (or
+`-o`), and `--emit obj` stops at the module tree:
 
 ```toml
 [target.gpu]
@@ -307,7 +309,7 @@ abi = "spirv"
 ```
 
 ```
-mach build . --target gpu     # writes out/gpu/<profile>/obj/<module>.spv
+mach build . --target gpu     # writes the entry module at the artifact's out, and out/gpu/<profile>/obj/<module>.spv
 ```
 
 With `debug` on, each module carries its debug information inside it, written as core
@@ -350,10 +352,11 @@ abi = "spirv"
 env = "vulkan1.2"
 ```
 
-The artifact's `out` template and `-o` name a linked binary, which such a target
-has none of; the module tree is delivered instead. A `static` or `shared`
-artifact kind, and `mach test`, are refused by name — there is no archive, shared
-object, or executable form for a module.
+The artifact's `out` template and `-o` name that delivered module, so
+`{artifact.suffix}` gives it `.spv`, and `{artifact.<id>.out}` names it for a
+consumer that embeds it (see [Artifact requirements](#artifact-requirements)). A
+`static` or `shared` artifact kind, and `mach test`, are refused by name, since
+there is no archive, shared object, or executable form for a module.
 
 ### Platform targets (bare metal)
 
@@ -576,7 +579,8 @@ is what lets one project declare host and accelerator artifacts with disjoint ta
 sets. `mach test` is the deliberate whole-source exception: it roots collection at
 every module in the current project's `src` tree.
 
-- **`bin`** links an executable at the resolved `out` path.
+- **`bin`** links an executable at the resolved `out` path. On a finished-module
+  target such as `spirv` it is the entry module, written there unlinked.
 - **`static`** materialises a real `ar` archive at the resolved `out` path — the
   per-module objects with an archive symbol index, the deliverable a consumer links
   as a `.a` (#1997).
@@ -616,8 +620,9 @@ inspection use the same expansion.
 | SPIR-V module | `.spv` | unsupported | unsupported |
 
 The selected object format supplies the naming rules, including explicit target
-format overrides. Unsupported library forms are errors. Module-producing backends
-retain their existing per-module output behavior.
+format overrides. Unsupported library forms are errors. A SPIR-V `bin` artifact is
+its entry module, delivered at `out` with the per-module objects still written under
+`obj/` (see [Finished-module targets](#finished-module-targets)).
 
 `{artifact.suffix}` is available only in an artifact output template. It does not
 expand in project output roots, link paths, step arguments or source embeds.
