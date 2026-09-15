@@ -1,0 +1,1099 @@
+use mach.lang.build.outcome;
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.output;
+use fixture: mach.lang.output.testing;
+use mach.lang.target.isa;
+use mach.lang.target.of;
+use mach.lang.target.of.bin;
+use mach.lang.target.of.macho.format;
+use relocation: mach.lang.target.of.macho.reloc;
+use mach.lang.target.of.plan;
+use A: std.allocator;
+use std.allocator.page;
+use T: std.allocator.testing;
+use std.collections.vector.Vector;
+use fs: std.filesystem;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_contains;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+# arm64 Mach-O carries a nonzero addend in its own ARM64_RELOC_ADDEND entry for
+# every relocation type but UNSIGNED, whose field holds the addend in place
+fun needs_addend_entry(arch_id: u32, mr: *relocation.MachoReloc, addend: i64) bool {
+    ret format.arch_is_arm64(arch_id) && addend != 0 && mr.r_type != format.ARM64_RELOC_UNSIGNED;
+}
+
+# the relocation entries a section's relocations write: one each, plus a
+# subtractor entry for a difference and an addend entry where needs_addend_entry
+# says so. a kind Mach-O does not honor fails here, before any layout
+fun reloc_entries_for_section(img: *of.ObjectImage, sec_idx: u32, arch_id: u32) res[u32, fail.Fail] {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < img.reloc_count) {
+        if (of.section_index(img.relocations[i].section) == sec_idx) {
+            n = n + 1;
+            if (of.is_difference(img.relocations[i].kind)) { n = n + 1; }
+            or {
+                val mr: res[relocation.MachoReloc, fail.Fail] = relocation.macho_reloc_for(img.interner, img.alloc, arch_id, img.relocations[i].kind);
+                if (sel mr.err) { ret res[u32, fail.Fail].err{mr.err}; }
+                val resolved: relocation.MachoReloc = mr.ok;
+                if (needs_addend_entry(arch_id, ?resolved, img.relocations[i].addend)) { n = n + 1; }
+            }
+        }
+        i = i + 1;
+    }
+    ret res[u32, fail.Fail].ok{n};
+}
+
+fun reloc_sym_index(img: *of.ObjectImage, r: *of.Relocation) res[u32, fail.Fail] {
+    if (r.sym < img.symbol_count) { ret res[u32, fail.Fail].ok{r.sym}; }
+    ret res[u32, fail.Fail].err{fail.message(bin.name_message(img.interner, img.alloc, "macho: unresolved relocation symbol: ",
+        bin.resolve_name(img.interner, of.reloc_symbol_name(img, r)), "macho: relocation references an unresolved symbol"))};
+}
+
+fun validate_reloc_symbols(img: *of.ObjectImage) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < img.reloc_count) {
+        val r: res[u32, fail.Fail] = reloc_sym_index(img, ?img.relocations[i]);
+        if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun validate_reloc_kinds(img: *of.ObjectImage, arch_id: u32) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < img.reloc_count) {
+        var kind: of.RelocKind = img.relocations[i].kind;
+        if (of.is_difference(kind)) {
+            if (img.relocations[i].sym2 >= img.symbol_count) {
+                ret err[fail.Fail].err{fail.message("macho: difference relocation has no second symbol")};
+            }
+            if (kind == of.RK_DIFF64) { kind = of.RK_ABS64; }
+            or                        { kind = of.RK_ABS32; }
+        }
+        val r: res[relocation.MachoReloc, fail.Fail] = relocation.macho_reloc_for(img.interner, img.alloc, arch_id, kind);
+        if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+        val reloc: *of.Relocation = ?img.relocations[i];
+        val width: u32            = 1 << r.ok.length;
+        if (of.section_index(reloc.section) >= img.section_count || img.sections[of.section_index(reloc.section)].bytes == nil
+            || reloc.offset > img.sections[of.section_index(reloc.section)].len || width > img.sections[of.section_index(reloc.section)].len - reloc.offset) {
+            ret err[fail.Fail].err{fail.message("macho: relocation field is outside its section bytes")};
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun strtab_size(img: *of.ObjectImage) usize {
+    var len: usize = 1;
+    var i:   u32   = 0;
+    for (i < img.symbol_count) {
+        val name: str = bin.resolve_name(img.interner, img.symbols[i].name);
+        if (name != nil) { len = len + str_len(name) + 1; }
+        or               { len = len + 1; }
+        i = i + 1;
+    }
+    ret len;
+}
+
+fun is_local_sym(sym: *of.Symbol) bool {
+    if (of.section_is_external(sym.section))       { ret false; }
+    if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0) { ret false; }
+    ret true;
+}
+
+fun is_extdef_sym(sym: *of.Symbol) bool {
+    if (of.section_is_external(sym.section))       { ret false; }
+    if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0) { ret false; }
+    ret true;
+}
+
+fun write_nlist(buf: *u8, sym_off: usize, str_base: usize, str_pos: *usize,
+    img: *of.ObjectImage, idx: u32, sec_addr: *u64, sec_out: *u32) {
+    val sym:      *of.Symbol = ?img.symbols[idx];
+    val name:     str        = bin.resolve_name(img.interner, sym.name);
+    var n_strx:   u32        = 0;
+    val name_pos: usize      = @str_pos;
+    if (name != nil) {
+        n_strx   = name_pos::u32;
+        @str_pos = name_pos + bin.write_str(buf, str_base + name_pos, name);
+    }
+    or {
+        buf[str_base + name_pos] = 0;
+        @str_pos                 = name_pos + 1;
+    }
+    bin.write_u32_le(buf, sym_off, n_strx);
+
+    var n_type:  u8  = format.N_UNDF;
+    var n_sect:  u8  = 0;
+    var n_desc:  u16 = 0;
+    var n_value: u64 = 0;
+    if (!of.section_is_external(sym.section) && of.section_index(sym.section) < img.section_count) {
+        n_type  = format.N_SECT;
+        n_sect  = (sec_out[of.section_index(sym.section)] + 1)::u8;
+        n_value = sec_addr[of.section_index(sym.section)] + sym.offset::u64;
+        if ((sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0) { n_desc = format.N_WEAK_DEF; }
+    }
+    or ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0) {
+        n_desc = format.REFERENCE_FLAG_UNDEFINED_LAZY;
+    }
+    if (of.section_is_external(sym.section) && (sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0) { n_desc = n_desc | format.N_WEAK_REF; }
+    if ((sym.flags & of.SYM_OBJ_FLAG_COMMON) != 0) {
+        n_value = sym.size::u64;
+        n_desc  = n_desc | (format.align_log2(sym.align)::u16 << 8);
+    }
+    if (of.section_is_absolute(sym.section)) {
+        n_type  = format.N_ABS;
+        n_value = sym.absolute_value;
+    }
+    if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0 || of.section_is_external(sym.section)) {
+        n_type = n_type | format.N_EXT;
+    }
+    if (sym.native.format == of.OF_MACHO) {
+        n_type = n_type | (sym.native.kind::u8 & ~(format.N_TYPE | format.N_EXT));
+        n_desc = sym.native.flags::u16;
+    }
+    buf[sym_off + 4] = n_type;
+    buf[sym_off + 5] = n_sect;
+    bin.write_u16_le(buf, sym_off + 6, n_desc);
+    bin.write_u64_le(buf, sym_off + 8, n_value);
+}
+
+fun fold_inplace_addend(buf: *u8, field: usize, arch_id: u32, kind: of.RelocKind, addend: i64) {
+    if (kind == of.RK_ABS64 || kind == of.RK_DIFF64) {
+        if (addend != 0) {
+            bin.write_u64_le(buf, field,
+                relocation.add_u64_mod(bin.read_u64_le(buf, field), addend::u64));
+        }
+        ret;
+    }
+    if (kind == of.RK_ABS32 || kind == of.RK_DIFF32) {
+        if (addend != 0) { bin.write_u32_le(buf, field, bin.read_u32_le(buf, field) + (addend::u64)::u32); }
+        ret;
+    }
+    if (kind == of.RK_GOTPCREL64_NORELAX) {
+        val eff64: u64 = relocation.add_u64_mod(addend::u64, 8);
+        if (eff64 != 0) {
+            bin.write_u64_le(buf, field,
+                relocation.add_u64_mod(bin.read_u64_le(buf, field), eff64));
+        }
+        ret;
+    }
+    if (format.arch_is_arm64(arch_id)) { ret; }
+    val eff: i64 = addend + 4;
+    if (eff != 0) { bin.write_u32_le(buf, field, bin.read_u32_le(buf, field) + (eff::u64)::u32); }
+}
+
+fun write_reloc_info(buf: *u8, off: usize, address: u32, symnum: u32, pcrel: u32, length: u32, extn: u32, r_type: u32) {
+    bin.write_u32_le(buf, off, address);
+    val word: u32 = (symnum & 0xFFFFFF) | (pcrel << 24) | (length << 25) | (extn << 27) | (r_type << 28);
+    bin.write_u32_le(buf, off + 4, word);
+}
+
+rec MachoOutSec {
+    kind:          of.SectionKind;
+    srcsec:        u32;
+    addr:          u64;
+    size:          u64;
+    fileo:         usize;
+    align:         u32;
+    reloff:        usize;
+    nrel:          u32;
+    indirect_base: u32;
+}
+
+fun generated_section_group(img: *of.ObjectImage, index: u32) u32 {
+    val sec: *of.Section = ?img.sections[index];
+    if (sec.native.format != 0 || (sec.flags & of.SEC_FLAG_COALESCE) == 0) { ret index; }
+    var i: u32 = 0;
+    for (i < index) {
+        val prior: *of.Section = ?img.sections[i];
+        if (prior.native.format == 0 && prior.flags == sec.flags && prior.kind == sec.kind
+            && prior.name == sec.name && prior.align == sec.align) { ret i; }
+        i = i + 1;
+    }
+    ret index;
+}
+
+fun generated_section_count(img: *of.ObjectImage) res[u32, fail.Fail] {
+    var count: u32 = 0;
+    var size:  u64 = 0;
+    var i:     u32 = 0;
+    for (i < img.section_count) {
+        val padded: u64 = img.sections[i].len::u64 + img.sections[i].align::u64 - 1;
+        if (size > 0xFFFFFFFFFFFFFFFF - padded) { ret res[u32, fail.Fail].err{fail.message("macho: generated section layout overflows")}; }
+        size = size + padded;
+        if (generated_section_group(img, i) == i) { count = count + 1; }
+        i = i + 1;
+    }
+    ret res[u32, fail.Fail].ok{count};
+}
+
+fun plan_generated_sections(img: *of.ObjectImage, out: *MachoOutSec, sec_to_out: *u32) {
+    var count: u32 = 0;
+    var i:     u32 = 0;
+    for (i < img.section_count) {
+        val representative: u32 = generated_section_group(img, i);
+        if (representative != i) { sec_to_out[i] = sec_to_out[representative]; }
+        or {
+            out[count].kind   = img.sections[i].kind;
+            out[count].srcsec = i;
+            sec_to_out[i]     = count;
+            count             = count + 1;
+        }
+        i = i + 1;
+    }
+}
+
+pub fun validate_indirects(img: *of.ObjectImage) err[fail.Fail] {
+    var entry:   u32 = 0;
+    var section: u32 = 0;
+    for (section < img.section_count) {
+        val planned: res[u32, fail.Fail] = format.indirect_slots(?img.sections[section]);
+        if (sel planned.err) { ret err[fail.Fail].err{planned.err}; }
+        val count: u32 = planned.ok;
+        if (count > img.indirect_count - entry) { ret err[fail.Fail].err{fail.message("macho: indirect section is missing symbol slots")}; }
+        var slot: u32 = 0;
+        for (slot < count) {
+            if (of.section_index(img.indirects[entry].section) != section || img.indirects[entry].slot != slot) {
+                ret err[fail.Fail].err{fail.message("macho: indirect slots must be complete and ordered by section")};
+            }
+            entry = entry + 1;
+            slot  = slot + 1;
+        }
+        section = section + 1;
+    }
+    if (entry != img.indirect_count) { ret err[fail.Fail].err{fail.message("macho: indirect symbol has no native slot")}; }
+    ret err[fail.Fail].ok{};
+}
+
+rec ObjectScratch {
+    sec_addr:   *u64;
+    data_off:   *usize;
+    sec_to_out: *u32;
+    out:        *MachoOutSec;
+    reloc_rows: *u32;
+    remap:      *u32;
+    num_secs:   u32;
+    num_out:    u32;
+    num_syms:   u32;
+}
+
+fun object_scratch_free(alloc: *A.Allocator, s: *ObjectScratch) {
+    if (s.sec_addr != nil)   { A.deallocate[u64](alloc, s.sec_addr, (s.num_secs + 1)::usize); }
+    if (s.data_off != nil)   { A.deallocate[usize](alloc, s.data_off, (s.num_secs + 1)::usize); }
+    if (s.sec_to_out != nil) { A.deallocate[u32](alloc, s.sec_to_out, (s.num_secs + 1)::usize); }
+    if (s.out != nil)        { A.deallocate[MachoOutSec](alloc, s.out, s.num_out::usize); }
+    if (s.reloc_rows != nil) { A.deallocate[u32](alloc, s.reloc_rows, (s.num_out + 1)::usize); }
+    if (s.remap != nil)      { A.deallocate[u32](alloc, s.remap, s.num_syms::usize); }
+    s.sec_addr   = nil;
+    s.data_off   = nil;
+    s.sec_to_out = nil;
+    s.out        = nil;
+    s.reloc_rows = nil;
+    s.remap      = nil;
+}
+
+pub fun emit_object(isa_vt: *of.ObjectTarget, img: *of.ObjectImage, destination: str) err[fail.Fail] {
+    if (isa_vt == nil || img == nil || destination == nil) {
+        ret err[fail.Fail].err{fail.message("macho: nil writer argument")};
+    }
+    if (img.import_count != 0) { ret err[fail.Fail].err{fail.message("macho: attributed imports are not representable in a Mach-O relocatable object")}; }
+    val arch_id: u32                 = isa_vt.arch_id;
+    val ct:      res[u32, fail.Fail] = format.cpu_type_for(arch_id);
+    if (sel ct.err) { ret err[fail.Fail].err{ct.err}; }
+
+    val vrs: err[fail.Fail] = validate_reloc_symbols(img);
+    if (sel vrs.err) { ret vrs; }
+    val vrk: err[fail.Fail] = validate_reloc_kinds(img, arch_id);
+    if (sel vrk.err) { ret vrk; }
+
+    val alloc:        *A.Allocator   = img.alloc;
+    val num_secs:     u32            = img.section_count;
+    val num_syms:     u32            = img.symbol_count;
+    val native_valid: err[fail.Fail] = of.validate_native_sections(img, of.OF_MACHO);
+    if (sel native_valid.err) { ret native_valid; }
+    val indirect_valid: err[fail.Fail] = validate_indirects(img);
+    if (sel indirect_valid.err) { ret indirect_valid; }
+    var common_i: u32 = 0;
+    for (common_i < num_syms) {
+        val symbol: *of.Symbol = ?img.symbols[common_i];
+        if ((symbol.flags & of.SYM_OBJ_FLAG_COMMON) != 0
+            && (symbol.size == 0 || symbol.align > 32768
+            || (symbol.align != 0 && (symbol.align & (symbol.align - 1)) != 0))) {
+            ret err[fail.Fail].err{fail.message("macho: common size or alignment is not natively representable")};
+        }
+        common_i = common_i + 1;
+    }
+    val planned_out: res[u32, fail.Fail] = generated_section_count(img);
+    if (sel planned_out.err) { ret err[fail.Fail].err{planned_out.err}; }
+    val num_out: u32 = planned_out.ok;
+    var name_i:  u32 = 0;
+    for (name_i < num_secs) {
+        val section: *of.Section = ?img.sections[name_i];
+        val named:   str         = bin.resolve_name(img.interner, section.name);
+        if (section.native.format == 0 && section.kind != of.SK_DEBUG
+            && named != nil && str_len(named) > 16) {
+            ret err[fail.Fail].err{fail.message("macho: section name exceeds the native sixteen-byte field")};
+        }
+        name_i = name_i + 1;
+    }
+    if (num_out > 255 || num_syms > 0x1000000) {
+        ret err[fail.Fail].err{fail.message("macho: section or relocation symbol ordinal exceeds its native width")};
+    }
+
+    val seg_cmd_size: usize = format.SEGMENT_CMD_64_SIZE + num_out::usize * format.SECTION_64_SIZE;
+    val sizeofcmds:   usize = seg_cmd_size + format.SYMTAB_CMD_SIZE + format.DYSYMTAB_CMD_SIZE;
+    val header_end:   usize = format.MACH_HEADER_64_SIZE + sizeofcmds;
+
+    var scratch: ObjectScratch;
+    scratch.sec_addr   = nil;
+    scratch.data_off   = nil;
+    scratch.sec_to_out = nil;
+    scratch.out        = nil;
+    scratch.reloc_rows = nil;
+    scratch.remap      = nil;
+    scratch.num_secs   = num_secs;
+    scratch.num_out    = num_out;
+    scratch.num_syms   = num_syms;
+    fin { object_scratch_free(alloc, ?scratch); }
+
+    val res_addr: res[*u64, A.Error] = A.zallocate[u64](alloc, (num_secs + 1)::usize);
+    if (sel res_addr.err) { ret err[fail.Fail].err{fail.message("macho: section address table alloc failed")}; }
+    scratch.sec_addr = res_addr.ok;
+    val sec_addr: *u64 = scratch.sec_addr;
+
+    val res_doff: res[*usize, A.Error] = A.zallocate[usize](alloc, (num_secs + 1)::usize);
+    if (sel res_doff.err) { ret err[fail.Fail].err{fail.message("macho: section offset table alloc failed")}; }
+    scratch.data_off = res_doff.ok;
+    val data_off: *usize = scratch.data_off;
+
+    val res_s2o: res[*u32, A.Error] = A.zallocate[u32](alloc, (num_secs + 1)::usize);
+    if (sel res_s2o.err) { ret err[fail.Fail].err{fail.message("macho: section map alloc failed")}; }
+    scratch.sec_to_out = res_s2o.ok;
+    val sec_to_out: *u32 = scratch.sec_to_out;
+
+    val res_out: res[*MachoOutSec, A.Error] = A.zallocate[MachoOutSec](alloc, num_out::usize);
+    if (sel res_out.err) { ret err[fail.Fail].err{fail.message("macho: output section table alloc failed")}; }
+    scratch.out = res_out.ok;
+    val out: *MachoOutSec = scratch.out;
+
+    val res_rrows: res[*u32, A.Error] = A.zallocate[u32](alloc, (num_out + 1)::usize);
+    if (sel res_rrows.err) { ret err[fail.Fail].err{fail.message("macho: relocation row table alloc failed")}; }
+    scratch.reloc_rows = res_rrows.ok;
+    val reloc_rows: *u32 = scratch.reloc_rows;
+
+    plan_generated_sections(img, out, sec_to_out);
+    var indirect_base:    u32 = 0;
+    var indirect_section: u32 = 0;
+    for (indirect_section < num_out) {
+        out[indirect_section].indirect_base = indirect_base;
+        val indirect_base_r: res[u32, fail.Fail] = format.indirect_slots(?img.sections[out[indirect_section].srcsec]);
+        if (sel indirect_base_r.err) { ret err[fail.Fail].err{indirect_base_r.err}; }
+        indirect_base    = indirect_base + indirect_base_r.ok;
+        indirect_section = indirect_section + 1;
+    }
+
+    # the segment's address space is planned like a file: one page-less plan
+    # whose offsets are the section addresses
+    val vp_r: res[plan.FilePlan, fail.Fail] = plan.init(alloc, img.interner, "macho", plan.limit_64());
+    if (sel vp_r.err) { ret err[fail.Fail].err{vp_r.err}; }
+    var vp: plan.FilePlan = vp_r.ok;
+    fin { plan.dnit(?vp); }
+
+    var s:  u32 = 0;
+    var ko: u32 = 0;
+    for (ko < num_out) {
+        var a_sec: u32 = 1;
+        var sp:    u32 = 0;
+        for (sp < num_secs) {
+            if (sec_to_out[sp] == ko && img.sections[sp].align > a_sec) { a_sec = img.sections[sp].align; }
+            sp = sp + 1;
+        }
+        out[ko].align = a_sec;
+        val padded: err[fail.Fail] = plan.pad(?vp, "section address", a_sec::usize);
+        if (sel padded.err) { ret padded; }
+        out[ko].addr = plan.cursor(?vp)::u64;
+        sp           = 0;
+        for (sp < num_secs) {
+            if (sec_to_out[sp] != ko) {
+                sp = sp + 1;
+                cnt;
+            }
+            var a: u32 = img.sections[sp].align;
+            if (a < 1) { a = 1; }
+            val row: res[u32, fail.Fail] = plan.place(?vp, "section address", of.section_id(sp), a::usize, img.sections[sp].len::usize);
+            if (sel row.err) { ret err[fail.Fail].err{row.err}; }
+            sec_addr[sp] = plan.offset(?vp, row.ok)::u64;
+            sp           = sp + 1;
+        }
+        out[ko].size = plan.cursor(?vp)::u64 - out[ko].addr;
+        ko           = ko + 1;
+    }
+    val seg_vm: res[usize, fail.Fail] = plan.seal(?vp);
+    if (sel seg_vm.err) { ret err[fail.Fail].err{seg_vm.err}; }
+    val seg_vmsize: u64 = seg_vm.ok::u64;
+
+    val fp_r: res[plan.FilePlan, fail.Fail] = plan.init(alloc, img.interner, "macho", plan.LIMIT_32);
+    if (sel fp_r.err) { ret err[fail.Fail].err{fp_r.err}; }
+    var fp: plan.FilePlan = fp_r.ok;
+    fin { plan.dnit(?fp); }
+
+    val header_r: res[u32, fail.Fail] = plan.place_at(?fp, "mach header and load commands", of.no_section(), 0, header_end);
+    if (sel header_r.err) { ret err[fail.Fail].err{header_r.err}; }
+    val seg_padded: err[fail.Fail] = plan.pad(?fp, "segment alignment", 8);
+    if (sel seg_padded.err) { ret seg_padded; }
+    val seg_fileoff: usize = plan.cursor(?fp);
+    ko = 0;
+    for (ko < num_out) {
+        var sp: u32 = 0;
+        if (out[ko].kind == of.SK_BSS) {
+            out[ko].fileo = 0;
+            for (sp < num_secs) {
+                if (img.sections[sp].kind == of.SK_BSS) { data_off[sp] = 0; }
+                sp = sp + 1;
+            }
+            ko = ko + 1;
+            cnt;
+        }
+        val row: res[u32, fail.Fail] = plan.place(?fp, "section data", of.section_id(out[ko].srcsec), out[ko].align::usize, out[ko].size::usize);
+        if (sel row.err) { ret err[fail.Fail].err{row.err}; }
+        out[ko].fileo = plan.offset(?fp, row.ok);
+        for (sp < num_secs) {
+            if (sec_to_out[sp] != ko) {
+                sp = sp + 1;
+                cnt;
+            }
+            data_off[sp] = out[ko].fileo + (sec_addr[sp] - out[ko].addr)::usize;
+            sp           = sp + 1;
+        }
+        ko = ko + 1;
+    }
+    val seg_filesize: usize = plan.cursor(?fp) - seg_fileoff;
+
+    val reloc_padded: err[fail.Fail] = plan.pad(?fp, "relocation alignment", 4);
+    if (sel reloc_padded.err) { ret reloc_padded; }
+    ko = 0;
+    for (ko < num_out) {
+        var n:  u32 = 0;
+        var sp: u32 = 0;
+        for (sp < num_secs) {
+            if (sec_to_out[sp] == ko) {
+                val entries: res[u32, fail.Fail] = reloc_entries_for_section(img, sp, arch_id);
+                if (sel entries.err) { ret err[fail.Fail].err{entries.err}; }
+                val grown: res[u32, fail.Fail] = plan.count_u32(?fp, "relocation entries", n, entries.ok);
+                if (sel grown.err) { ret err[fail.Fail].err{grown.err}; }
+                n = grown.ok;
+            }
+            sp = sp + 1;
+        }
+        out[ko].nrel   = n;
+        reloc_rows[ko] = plan.NO_ROW;
+        out[ko].reloff = 0;
+        if (n > 0) {
+            val bytes: res[usize, fail.Fail] = plan.table(?fp, "relocations", n::usize, format.RELOC_INFO_SIZE);
+            if (sel bytes.err) { ret err[fail.Fail].err{bytes.err}; }
+            val row: res[u32, fail.Fail] = plan.place(?fp, "relocations", of.section_id(out[ko].srcsec), 4, bytes.ok);
+            if (sel row.err) { ret err[fail.Fail].err{row.err}; }
+            reloc_rows[ko] = row.ok;
+            out[ko].reloff = plan.offset(?fp, reloc_rows[ko]);
+        }
+        ko = ko + 1;
+    }
+
+    val indirect_bytes: res[usize, fail.Fail] = plan.table(?fp, "indirect symbols", img.indirect_count::usize, 4);
+    if (sel indirect_bytes.err) { ret err[fail.Fail].err{indirect_bytes.err}; }
+    val indirect_r: res[u32, fail.Fail] = plan.place(?fp, "indirect symbols", of.no_section(), 4, indirect_bytes.ok);
+    if (sel indirect_r.err) { ret err[fail.Fail].err{indirect_r.err}; }
+    val indirect_off: usize                 = plan.offset(?fp, indirect_r.ok);
+    val symtab_bytes: res[usize, fail.Fail] = plan.table(?fp, "symbol table", num_syms::usize, format.NLIST_64_SIZE);
+    if (sel symtab_bytes.err) { ret err[fail.Fail].err{symtab_bytes.err}; }
+    val symtab_r: res[u32, fail.Fail] = plan.place(?fp, "symbol table", of.no_section(), 8, symtab_bytes.ok);
+    if (sel symtab_r.err) { ret err[fail.Fail].err{symtab_r.err}; }
+    val symtab_row: u32                 = symtab_r.ok;
+    val symtab_off: usize               = plan.offset(?fp, symtab_row);
+    val strtab_r:   res[u32, fail.Fail] = plan.place(?fp, "string table", of.no_section(), 1, strtab_size(img));
+    if (sel strtab_r.err) { ret err[fail.Fail].err{strtab_r.err}; }
+    val strtab_row: u32   = strtab_r.ok;
+    val strtab_off: usize = plan.offset(?fp, strtab_row);
+    val strtab_sz:  usize = plan.size(?fp, strtab_row);
+
+    val sealed: res[usize, fail.Fail] = plan.seal(?fp);
+    if (sel sealed.err) { ret err[fail.Fail].err{sealed.err}; }
+    val total_size: usize = sealed.ok;
+
+    if (num_syms > 0) {
+        val res_remap: res[*u32, A.Error] = A.zallocate[u32](alloc, num_syms::usize);
+        if (sel res_remap.err) { ret err[fail.Fail].err{fail.message("macho: symbol remap alloc failed")}; }
+        scratch.remap = res_remap.ok;
+    }
+    val remap: *u32 = scratch.remap;
+
+    val res_buf: res[*u8, A.Error] = A.zallocate[u8](alloc, total_size);
+    if (sel res_buf.err) { ret err[fail.Fail].err{fail.message("macho: output buffer alloc failed")}; }
+    var buf: *u8 = res_buf.ok;
+    fin { A.deallocate[u8](alloc, buf, total_size); }
+
+    val sizeofcmds_field: res[u32, fail.Fail] = plan.field_u32(?fp, sizeofcmds, "sizeofcmds");
+    if (sel sizeofcmds_field.err) { ret err[fail.Fail].err{sizeofcmds_field.err}; }
+    bin.write_u32_le(buf, 0, format.MH_MAGIC_64);
+    bin.write_u32_le(buf, 4, ct.ok);
+    bin.write_u32_le(buf, 8, format.cpu_subtype_for(arch_id));
+    bin.write_u32_le(buf, 12, format.MH_OBJECT);
+    bin.write_u32_le(buf, 16, 3);
+    bin.write_u32_le(buf, 20, sizeofcmds_field.ok);
+    bin.write_u32_le(buf, 24, 0);
+    bin.write_u32_le(buf, 28, 0);
+
+    var lc: usize = format.MACH_HEADER_64_SIZE;
+    bin.write_u32_le(buf, lc, format.LC_SEGMENT_64);
+    bin.write_u32_le(buf, lc + 4, seg_cmd_size::u32);
+    format.write_fixed16(buf, lc + 8, nil);
+    bin.write_u64_le(buf, lc + 24, 0);
+    bin.write_u64_le(buf, lc + 32, seg_vmsize);
+    bin.write_u64_le(buf, lc + 40, seg_fileoff::u64);
+    bin.write_u64_le(buf, lc + 48, seg_filesize::u64);
+    bin.write_u32_le(buf, lc + 56, format.VM_PROT_READ | format.VM_PROT_WRITE | format.VM_PROT_EXECUTE);
+    bin.write_u32_le(buf, lc + 60, format.VM_PROT_READ | format.VM_PROT_WRITE | format.VM_PROT_EXECUTE);
+    bin.write_u32_le(buf, lc + 64, num_out);
+    bin.write_u32_le(buf, lc + 68, 0);
+
+    var sh: usize = lc + format.SEGMENT_CMD_64_SIZE;
+    ko = 0;
+    for (ko < num_out) {
+        val section:   *of.Section                   = ?img.sections[out[ko].srcsec];
+        val placement: opt[*format.MachoSectionDesc] = format.macho_section(section.kind);
+        val canon:     opt[str]                      = of.canonical_section_name(section.kind);
+        if (sel placement.none) { ret err[fail.Fail].err{fail.message(of.section_kind_rejection(img.interner, img.alloc, section.kind))}; }
+        if (sel canon.none)     { ret err[fail.Fail].err{fail.message(of.section_kind_rejection(img.interner, img.alloc, section.kind))}; }
+        val native: *format.MachoSectionDesc = placement.some;
+        if (section.native.format == of.OF_MACHO) {
+            memory.raw_copy((buf::usize + sh)::ptr, (?section.native.name[0])::ptr, 16);
+            memory.raw_copy((buf::usize + sh + 16)::ptr, (?section.native.segment[0])::ptr, 16);
+        }
+        or {
+            val named: str = bin.resolve_name(img.interner, section.name);
+            if (section.kind == of.SK_DEBUG)   { format.write_dwarf_sectname(buf, sh, named); }
+            or (str_equals(named, canon.some)) { format.write_fixed16(buf, sh, native.sectname); }
+            or                                 { format.write_fixed16(buf, sh, named); }
+            format.write_fixed16(buf, sh + 16, native.segname);
+        }
+        bin.write_u64_le(buf, sh + 32, out[ko].addr);
+        bin.write_u64_le(buf, sh + 40, out[ko].size);
+        var foff: u32 = 0;
+        if (out[ko].kind != of.SK_BSS) {
+            val foff_field: res[u32, fail.Fail] = plan.field_u32(?fp, out[ko].fileo, "section offset");
+            if (sel foff_field.err) { ret err[fail.Fail].err{foff_field.err}; }
+            foff = foff_field.ok;
+        }
+        bin.write_u32_le(buf, sh + 48, foff);
+        bin.write_u32_le(buf, sh + 52, format.align_log2(out[ko].align));
+        val reloff_field: res[u32, fail.Fail] = plan.field_u32(?fp, out[ko].reloff, "relocation offset");
+        if (sel reloff_field.err) { ret err[fail.Fail].err{reloff_field.err}; }
+        bin.write_u32_le(buf, sh + 56, reloff_field.ok);
+        bin.write_u32_le(buf, sh + 60, out[ko].nrel);
+        var flags: u32 = native.flags;
+        if ((section.flags & of.SEC_FLAG_INIT_FUNCS) != 0) {
+            flags = (flags & ~format.SECTION_TYPE) | format.S_MOD_INIT_FUNC_POINTERS;
+        }
+        if (section.native.format == of.OF_MACHO) { flags = section.native.flags::u32; }
+        bin.write_u32_le(buf, sh + 64, flags);
+        var reserved1: u32                 = section.native.reserved1;
+        val r_1061:    res[u32, fail.Fail] = format.indirect_slots(section);
+        if (sel r_1061.err) { ret err[fail.Fail].err{r_1061.err}; }
+        if (r_1061.ok != 0) { reserved1 = out[ko].indirect_base; }
+        bin.write_u32_le(buf, sh + 68, reserved1);
+        bin.write_u32_le(buf, sh + 72, section.native.reserved2);
+        bin.write_u32_le(buf, sh + 76, section.native.reserved3);
+        sh = sh + format.SECTION_64_SIZE;
+        ko = ko + 1;
+    }
+    if (sh != lc + seg_cmd_size) { ret err[fail.Fail].err{fail.message("macho: section commands drifted from their plan")}; }
+
+    var n_local:  u32 = 0;
+    var n_extdef: u32 = 0;
+    var n_undef:  u32 = 0;
+    var symi:     u32 = 0;
+    for (symi < num_syms) {
+        if (is_local_sym(?img.symbols[symi]))  { n_local = n_local + 1; }
+        or (is_extdef_sym(?img.symbols[symi])) { n_extdef = n_extdef + 1; }
+        or                                     { n_undef = n_undef + 1; }
+        symi = symi + 1;
+    }
+
+    val symtab_field: res[u32, fail.Fail] = plan.field_u32(?fp, symtab_off, "symbol table offset");
+    if (sel symtab_field.err) { ret err[fail.Fail].err{symtab_field.err}; }
+    val strtab_field: res[u32, fail.Fail] = plan.field_u32(?fp, strtab_off, "string table offset");
+    if (sel strtab_field.err) { ret err[fail.Fail].err{strtab_field.err}; }
+    val strsize_field: res[u32, fail.Fail] = plan.field_u32(?fp, strtab_sz, "string table size");
+    if (sel strsize_field.err) { ret err[fail.Fail].err{strsize_field.err}; }
+    val indirect_field: res[u32, fail.Fail] = plan.field_u32(?fp, indirect_off, "indirect table offset");
+    if (sel indirect_field.err) { ret err[fail.Fail].err{indirect_field.err}; }
+
+    val symtab_lc: usize = sh;
+    bin.write_u32_le(buf, symtab_lc, format.LC_SYMTAB);
+    bin.write_u32_le(buf, symtab_lc + 4, format.SYMTAB_CMD_SIZE::u32);
+    bin.write_u32_le(buf, symtab_lc + 8, symtab_field.ok);
+    bin.write_u32_le(buf, symtab_lc + 12, num_syms);
+    bin.write_u32_le(buf, symtab_lc + 16, strtab_field.ok);
+    bin.write_u32_le(buf, symtab_lc + 20, strsize_field.ok);
+
+    val dysym_lc: usize = symtab_lc + format.SYMTAB_CMD_SIZE;
+    bin.write_u32_le(buf, dysym_lc, format.LC_DYSYMTAB);
+    bin.write_u32_le(buf, dysym_lc + 4, format.DYSYMTAB_CMD_SIZE::u32);
+    bin.write_u32_le(buf, dysym_lc + 8, 0);
+    bin.write_u32_le(buf, dysym_lc + 12, n_local);
+    bin.write_u32_le(buf, dysym_lc + 16, n_local);
+    bin.write_u32_le(buf, dysym_lc + 20, n_extdef);
+    bin.write_u32_le(buf, dysym_lc + 24, n_local + n_extdef);
+    bin.write_u32_le(buf, dysym_lc + 28, n_undef);
+    if (img.indirect_count != 0) { bin.write_u32_le(buf, dysym_lc + 56, indirect_field.ok); }
+    bin.write_u32_le(buf, dysym_lc + 60, img.indirect_count);
+    if (dysym_lc + format.DYSYMTAB_CMD_SIZE != header_end) { ret err[fail.Fail].err{fail.message("macho: load commands drifted from their plan")}; }
+
+    s = 0;
+    for (s < num_secs) {
+        if (img.sections[s].kind != of.SK_BSS && img.sections[s].bytes != nil && img.sections[s].len > 0) {
+            memory.raw_copy((buf::usize + data_off[s])::ptr, img.sections[s].bytes::ptr, img.sections[s].len::usize);
+        }
+        s = s + 1;
+    }
+
+    var fi: u32 = 0;
+    for (fi < img.reloc_count) {
+        val rsec: u32 = of.section_index(img.relocations[fi].section);
+        if (rsec < num_secs && img.sections[rsec].kind != of.SK_BSS) {
+            val field: usize = data_off[rsec] + img.relocations[fi].offset::usize;
+            fold_inplace_addend(buf, field, arch_id, img.relocations[fi].kind, img.relocations[fi].addend);
+        }
+        fi = fi + 1;
+    }
+
+    var sym_off: usize = symtab_off;
+    var str_pos: usize = 1;
+    buf[strtab_off] = 0;
+    var nlist_idx: u32 = 0;
+    symi = 0;
+    for (symi < num_syms) {
+        if (!is_local_sym(?img.symbols[symi])) {
+            symi = symi + 1;
+            cnt;
+        }
+        if (remap != nil) { remap[symi] = nlist_idx; }
+        write_nlist(buf, sym_off, strtab_off, ?str_pos, img, symi, sec_addr, sec_to_out);
+        sym_off   = sym_off + format.NLIST_64_SIZE;
+        nlist_idx = nlist_idx + 1;
+        symi      = symi + 1;
+    }
+    symi = 0;
+    for (symi < num_syms) {
+        if (!is_extdef_sym(?img.symbols[symi])) {
+            symi = symi + 1;
+            cnt;
+        }
+        if (remap != nil) { remap[symi] = nlist_idx; }
+        write_nlist(buf, sym_off, strtab_off, ?str_pos, img, symi, sec_addr, sec_to_out);
+        sym_off   = sym_off + format.NLIST_64_SIZE;
+        nlist_idx = nlist_idx + 1;
+        symi      = symi + 1;
+    }
+    symi = 0;
+    for (symi < num_syms) {
+        if (!of.section_is_external(img.symbols[symi].section)) {
+            symi = symi + 1;
+            cnt;
+        }
+        if (remap != nil) { remap[symi] = nlist_idx; }
+        write_nlist(buf, sym_off, strtab_off, ?str_pos, img, symi, sec_addr, sec_to_out);
+        sym_off   = sym_off + format.NLIST_64_SIZE;
+        nlist_idx = nlist_idx + 1;
+        symi      = symi + 1;
+    }
+    val symtab_closed: err[fail.Fail] = plan.close(?fp, symtab_row, sym_off);
+    if (sel symtab_closed.err) { ret symtab_closed; }
+    val strtab_closed: err[fail.Fail] = plan.close_size(?fp, strtab_row, str_pos);
+    if (sel strtab_closed.err) { ret strtab_closed; }
+
+    var indirect_i: u32 = 0;
+    for (indirect_i < img.indirect_count) {
+        val entry: *of.NativeIndirect = ?img.indirects[indirect_i];
+        var value: u32                = entry.flags;
+        if (value == 0) { value = remap[entry.symbol]; }
+        val index: u32 = out[sec_to_out[of.section_index(entry.section)]].indirect_base + entry.slot;
+        if (index >= img.indirect_count) { ret err[fail.Fail].err{fail.message("macho: indirect slot lies outside the indirect table")}; }
+        bin.write_u32_le(buf, indirect_off + index::usize * 4, value);
+        indirect_i = indirect_i + 1;
+    }
+
+    ko = 0;
+    for (ko < num_out) {
+        if (reloc_rows[ko] == plan.NO_ROW) {
+            ko = ko + 1;
+            cnt;
+        }
+        var ro: usize = out[ko].reloff;
+        var sp: u32   = 0;
+        for (sp < num_secs) {
+            if (sec_to_out[sp] != ko) {
+                sp = sp + 1;
+                cnt;
+            }
+            val base_field: res[u32, fail.Fail] = plan.field_u64_u32(?fp, sec_addr[sp] - out[ko].addr, "relocation address base");
+            if (sel base_field.err) { ret err[fail.Fail].err{base_field.err}; }
+            val base: u32 = base_field.ok;
+            var ri:   u32 = 0;
+            for (ri < img.reloc_count) {
+                if (of.section_index(img.relocations[ri].section) == sp) {
+                    val radr_r: res[u32, fail.Fail] = plan.count_u32(?fp, "relocation address", base, img.relocations[ri].offset);
+                    if (sel radr_r.err) { ret err[fail.Fail].err{radr_r.err}; }
+                    val radr:  u32                 = radr_r.ok;
+                    val rsi_r: res[u32, fail.Fail] = reloc_sym_index(img, ?img.relocations[ri]);
+                    if (sel rsi_r.err) { ret err[fail.Fail].err{rsi_r.err}; }
+                    val rsi:         u32          = rsi_r.ok;
+                    val symnum:      u32          = remap[rsi];
+                    var output_kind: of.RelocKind = img.relocations[ri].kind;
+                    if (of.is_difference(output_kind)) {
+                        var subtractor: u32 = format.X86_64_RELOC_SUBTRACTOR;
+                        if (format.arch_is_arm64(arch_id)) { subtractor = format.ARM64_RELOC_SUBTRACTOR; }
+                        var width: u32 = 2;
+                        if (output_kind == of.RK_DIFF64) {
+                            width       = 3;
+                            output_kind = of.RK_ABS64;
+                        }
+                        or { output_kind = of.RK_ABS32; }
+                        write_reloc_info(buf, ro, radr, remap[img.relocations[ri].sym2], 0, width, 1, subtractor);
+                        ro = ro + format.RELOC_INFO_SIZE;
+                    }
+                    val mr_r: res[relocation.MachoReloc, fail.Fail] = relocation.macho_reloc_for(img.interner, alloc, arch_id, output_kind);
+                    if (sel mr_r.err) { ret err[fail.Fail].err{mr_r.err}; }
+                    val mr: relocation.MachoReloc = mr_r.ok;
+                    if (needs_addend_entry(arch_id, ?mr, img.relocations[ri].addend)) {
+                        val addend: i64 = img.relocations[ri].addend;
+                        if (addend > 0x7FFFFF || addend < -0x800000) {
+                            ret err[fail.Fail].err{fail.message("macho: ARM64 relocation addend exceeds the 24-bit addend entry")};
+                        }
+                        write_reloc_info(buf, ro, radr, (addend::u64)::u32 & 0xFFFFFF,
+                            0, 2, 0, format.ARM64_RELOC_ADDEND);
+                        ro = ro + format.RELOC_INFO_SIZE;
+                    }
+                    write_reloc_info(buf, ro, radr, symnum, mr.pcrel, mr.length, 1, mr.r_type);
+                    ro = ro + format.RELOC_INFO_SIZE;
+                }
+                ri = ri + 1;
+            }
+            sp = sp + 1;
+        }
+        val relocs_closed: err[fail.Fail] = plan.close(?fp, reloc_rows[ko], ro);
+        if (sel relocs_closed.err) { ret relocs_closed; }
+        ko = ko + 1;
+    }
+
+    ret write_file(img.interner, alloc, destination, buf, total_size, "macho: object");
+}
+
+fun write_file(itn: *intern.Interner, alloc: *A.Allocator, destination: str, buf: *u8, len: usize, label: str) err[fail.Fail] {
+    val r_1230: err[outcome.Fail] = output.bytes(itn, alloc, destination, buf, len, 0o755, false, label, "macho: could not publish output file");
+    if (sel r_1230.err) { ret err[fail.Fail].err{fail.message(outcome.describe(r_1230.err))}; }
+    ret err[fail.Fail].ok{};
+}
+
+test "mach.lang.target.of.macho.object.emit_object:planned_size_is_the_written_size" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i:      intern.Interner = intern.init(?alloc);
+    var isa_vt: of.ObjectTarget = format.t_isa(isa.ARCH_X86_64);
+
+    var text_bytes: [17]u8;
+    var k:          usize = 0;
+    for (k < 17) {
+        text_bytes[k] = 0x90;
+        k             = k + 1;
+    }
+    var data_bytes: [3]u8;
+    data_bytes[0] = 1;
+    data_bytes[1] = 2;
+    data_bytes[2] = 3;
+
+    var secs: [3]of.Section;
+    secs[0].name  = format.t_intern(?i, "__text");
+    secs[0].kind  = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0];
+    secs[0].len   = 17;
+    secs[0].align = 16;
+    secs[1].name  = format.t_intern(?i, "__data");
+    secs[1].kind  = of.SK_DATA;
+    secs[1].bytes = ?data_bytes[0];
+    secs[1].len   = 3;
+    secs[1].align = 8;
+    secs[2].name  = format.t_intern(?i, "__bss");
+    secs[2].kind  = of.SK_BSS;
+    secs[2].bytes = nil;
+    secs[2].len   = 64;
+    secs[2].align = 16;
+
+    var syms: [2]of.Symbol;
+    syms[0].name    = format.t_intern(?i, "_main");
+    syms[0].section = of.section_id(0);
+    syms[0].offset  = 0;
+    syms[0].size    = 17;
+    syms[0].flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name    = format.t_intern(?i, "_gvar");
+    syms[1].section = of.section_id(1);
+    syms[1].offset  = 0;
+    syms[1].size    = 3;
+    syms[1].flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_OBJECT;
+
+    var relocs: [1]of.Relocation;
+    relocs[0].section = of.section_id(0);
+    relocs[0].offset  = 1;
+    relocs[0].kind    = of.RK_PC32;
+    relocs[0].sym     = 1;
+    relocs[0].addend  = -4;
+
+    var img: of.ObjectImage;
+    img.alloc         = ?alloc;
+    img.interner      = ?i;
+    img.name          = format.t_intern(?i, "test");
+    img.sections      = ?secs[0];
+    img.section_count = 3;
+    img.symbols       = ?syms[0];
+    img.symbol_count  = 2;
+    img.relocations   = ?relocs[0];
+    img.reloc_count   = 1;
+
+    val tf_r: res[fixture.Output, outcome.Fail] = fixture.create(?alloc, "macho_size");
+    if (sel tf_r.err) { ret 1; }
+    var tf: fixture.Output = tf_r.ok;
+    fin { fixture.dnit(?tf); }
+    val tpath: str = fixture.path(?tf);
+
+    val em: err[fail.Fail] = t_planned_emit_object(?isa_vt, ?img, tpath::*u8);
+    if (sel em.err) { ret 2; }
+    val rb: res[Vector[u8], fs.FsError] = fs.read_bytes(?alloc, tpath);
+
+    if (sel rb.err) { ret 3; }
+    val buf: Vector[u8] = rb.ok;
+
+    val ncmds: u32   = bin.read_u32_le(buf.data, 16);
+    var lc:    usize = format.MACH_HEADER_64_SIZE;
+    var found: bool  = false;
+    var c:     u32   = 0;
+    for (c < ncmds) {
+        val cmd:  u32   = bin.read_u32_le(buf.data, lc);
+        val size: usize = bin.read_u32_le(buf.data, lc + 4)::usize;
+        if (size == 0) { ret 4; }
+        if (cmd == format.LC_SYMTAB) {
+            val stroff:  usize = bin.read_u32_le(buf.data, lc + 16)::usize;
+            val strsize: usize = bin.read_u32_le(buf.data, lc + 20)::usize;
+            if (stroff + strsize != buf.len) { ret 5; }
+            found = true;
+        }
+        lc = lc + size;
+        c  = c + 1;
+    }
+    if (!found) { ret 6; }
+    ret 0;
+}
+
+fun ts_unsupported_kind() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: of.ObjectTarget = format.t_isa(isa.ARCH_X86_64);
+
+    var text_bytes: [16]u8;
+    var k:          usize = 0;
+    for (k < 16) {
+        text_bytes[k] = 0x90;
+        k             = k + 1;
+    }
+
+    var secs: [1]of.Section;
+    secs[0].name  = format.t_intern(?i, ".text");
+    secs[0].kind  = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0];
+    secs[0].len   = 16;
+    secs[0].align = 16;
+
+    var syms: [1]of.Symbol;
+    syms[0].name    = format.t_intern(?i, "_main");
+    syms[0].section = of.section_id(0);
+    syms[0].offset  = 0;
+    syms[0].size    = 16;
+    syms[0].flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var relocs: [1]of.Relocation;
+    relocs[0].section = of.section_id(0);
+    relocs[0].offset  = 0;
+    relocs[0].kind    = of.RK_ADDR32NB;
+    relocs[0].sym     = 0;
+    relocs[0].addend  = 0;
+
+    var img: of.ObjectImage;
+    img.alloc         = ?alloc;
+    img.interner      = ?i;
+    img.name          = format.t_intern(?i, "test");
+    img.sections      = ?secs[0];
+    img.section_count = 1;
+    img.symbols       = ?syms[0];
+    img.symbol_count  = 1;
+    img.relocations   = ?relocs[0];
+    img.reloc_count   = 1;
+
+    val tf_r: res[fixture.Output, outcome.Fail] = fixture.create(?alloc, "macho_kind");
+    if (sel tf_r.err) { ret 1; }
+    var tf: fixture.Output = tf_r.ok;
+    fin { fixture.dnit(?tf); }
+    val tpath: str = fixture.path(?tf);
+
+    val em: err[fail.Fail] = t_planned_emit_object(?isa_vt, ?img, tpath::*u8);
+
+    if (!sel em.err)                                      { ret 1; }
+    if (!str_contains(fail.describe(em.err), "addr32nb")) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.of.macho.object:unsupported_relocation_kind" {
+    if (ts_unsupported_kind() != 0) { ret 1; }
+    ret 0;
+}
+
+pub fun t_planned_emit_object(isa_vt: *of.ObjectTarget, img: *of.ObjectImage, path: *u8) err[fail.Fail] {
+    if (path == nil) { ret emit_object(isa_vt, img, nil); }
+    ret emit_object(isa_vt, img, path::str);
+}
+
+test "mach.lang.target.of.macho.object.emit_object:refuses_section_past_the_field_width" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i:      intern.Interner = intern.init(?alloc);
+    var isa_vt: of.ObjectTarget = format.t_isa(isa.ARCH_X86_64);
+
+    var bytes: [16]u8;
+    var secs:  [2]of.Section;
+    secs[0].name  = format.t_intern(?i, ".text");
+    secs[0].kind  = of.SK_TEXT;
+    secs[0].bytes = ?bytes[0];
+    secs[0].len   = 0xFFFFFFF0;
+    secs[0].align = 16;
+    secs[0].flags = 0;
+    secs[1].name  = format.t_intern(?i, ".data");
+    secs[1].kind  = of.SK_DATA;
+    secs[1].bytes = ?bytes[0];
+    secs[1].len   = 0x100;
+    secs[1].align = 16;
+    secs[1].flags = 0;
+    var syms: [1]of.Symbol;
+    syms[0].name    = format.t_intern(?i, "_main");
+    syms[0].section = of.section_id(0);
+    syms[0].offset  = 0;
+    syms[0].size    = 16;
+    syms[0].flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var img: of.ObjectImage;
+    img.alloc         = ?alloc;
+    img.interner      = ?i;
+    img.name          = format.t_intern(?i, "oversize");
+    img.sections      = ?secs[0];
+    img.section_count = 2;
+    img.symbols       = ?syms[0];
+    img.symbol_count  = 1;
+    img.relocations   = nil;
+    img.reloc_count   = 0;
+
+    val tf_r: res[fixture.Output, outcome.Fail] = fixture.create(?alloc, "macho_oversize");
+    if (sel tf_r.err) { ret 1; }
+    var tf: fixture.Output = tf_r.ok;
+    fin { fixture.dnit(?tf); }
+    val tpath: str = fixture.path(?tf);
+
+    val em: err[fail.Fail] = t_planned_emit_object(?isa_vt, ?img, tpath::*u8);
+    if (sel em.ok)                                           { ret 2; }
+    if (!str_contains(fail.describe(em.err), "field width")) { ret 3; }
+    if (!format.t_untouched(?alloc, tpath))                  { ret 4; }
+    ret 0;
+}
+
+test "mach.lang.target.of.macho.object.emit_object:allocation_refusal_at_every_ordinal_is_typed" {
+    var backing: A.Allocator;
+    page.make(?backing);
+    var i:      intern.Interner = intern.init(?backing);
+    var isa_vt: of.ObjectTarget = format.t_isa(isa.ARCH_X86_64);
+
+    var text: [16]u8;
+    var secs: [2]of.Section;
+    secs[0].name  = format.t_intern(?i, ".text");
+    secs[0].kind  = of.SK_TEXT;
+    secs[0].bytes = ?text[0];
+    secs[0].len   = 16;
+    secs[0].align = 16;
+    secs[0].flags = 0;
+    secs[1].name  = format.t_intern(?i, ".data");
+    secs[1].kind  = of.SK_DATA;
+    secs[1].bytes = ?text[0];
+    secs[1].len   = 8;
+    secs[1].align = 8;
+    secs[1].flags = 0;
+    var syms: [2]of.Symbol;
+    syms[0].name    = format.t_intern(?i, "_main");
+    syms[0].section = of.section_id(0);
+    syms[0].offset  = 0;
+    syms[0].size    = 16;
+    syms[0].flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name    = format.t_intern(?i, "_gvar");
+    syms[1].section = of.section_id(1);
+    syms[1].offset  = 0;
+    syms[1].size    = 8;
+    syms[1].flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_OBJECT;
+    var relocs: [1]of.Relocation;
+    relocs[0].section = of.section_id(0);
+    relocs[0].offset  = 1;
+    relocs[0].kind    = of.RK_PC32;
+    relocs[0].sym     = 1;
+    relocs[0].addend  = -4;
+
+    val tf_r: res[fixture.Output, outcome.Fail] = fixture.create(?backing, "macho_failat");
+    if (sel tf_r.err) { ret 1; }
+    var tf: fixture.Output = tf_r.ok;
+    fin { fixture.dnit(?tf); }
+    val tpath: str = fixture.path(?tf);
+
+    var refused: u32   = 0;
+    var ordinal: usize = 1;
+    for (ordinal <= 24) {
+        var failing: T.Testing;
+        val r_7026:  err[A.Error] = T.make(?failing);
+        if (sel r_7026.err) { ret 2; }
+        T.fail_at_ordinal(?failing, ordinal);
+        var img: of.ObjectImage;
+        img.alloc         = T.allocator_of(?failing);
+        img.interner      = ?i;
+        img.name          = format.t_intern(?i, "failat");
+        img.sections      = ?secs[0];
+        img.section_count = 2;
+        img.symbols       = ?syms[0];
+        img.symbol_count  = 2;
+        img.relocations   = ?relocs[0];
+        img.reloc_count   = 1;
+        val em: err[fail.Fail] = t_planned_emit_object(?isa_vt, ?img, tpath::*u8);
+        if (T.leaked(?failing)) { ret 3; }
+        if (sel em.err) {
+            refused = refused + 1;
+            if (!format.t_untouched(?backing, tpath)) { ret 5; }
+        }
+        ordinal = ordinal + 1;
+    }
+    if (refused < 6) { ret 6; }
+    ret 0;
+}
