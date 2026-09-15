@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A `#[testing]` decorator marks a declaration that exists only for tests. It is resolved and type-checked in every build, omitted from ordinary builds and `mach doc`, and emitted under `mach test`. Only a `test` body or another `#[testing]` declaration may reference it, and a `fwd` of one must be marked too. It refuses `ext`, `symbol`, `section`, `stage` and the shader interface decorators (#3402).
+
 ### Fixed
 
 - A failed Git command in `mach dep` or build-time dependency verification names the command, its exit status and Git's own message, where it reported only `Git dependency inspection command failed` (#3389).
