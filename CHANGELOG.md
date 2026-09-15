@@ -7,9 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A `#[testing]` decorator marks a declaration that exists only for tests. It is resolved and type-checked in every build, omitted from ordinary builds and `mach doc`, and emitted under `mach test`. Only a `test` body or another `#[testing]` declaration may reference it, and a `fwd` of one must be marked too. It refuses `ext`, `symbol`, `section`, `stage` and the shader interface decorators (#3402).
+
 ### Fixed
 
+- A `bin` artifact on a `spirv` target delivers its entry module at the resolved `out`, or `-o`, so `{artifact.<id>.out}` names a file that exists and a host binary can `#[embed]` the shader artifact it requires. The per-module objects are still written under `obj/` (#3397).
+- A failed Git command in `mach dep` or build-time dependency verification names the command, its exit status and Git's own message, where it reported only `Git dependency inspection command failed` (#3389).
 - Only a directory under `dep/` named by a valid project id is a dependency slot, so a file such as the `.DS_Store` Finder writes no longer draws a stray note from `mach dep pull` or fails `mach dep verify` (#3391).
+- `mach dep pull`, `add` and `update` realize a Git dependency from everything its slot holds (the checkout, the staged gitlink, its `.gitmodules` entry and a retained module store) rather than from whether `dep/<id>` exists. A deleted checkout whose gitlink is staged is initialized again instead of failing in `git submodule add`, a missing `.gitmodules` entry is restored from the manifest, a clean unregistered checkout is registered where pull used to exit 0 without recording it, and re-adding a removed dependency reuses the checkout or module store Git kept instead of refusing (#3390).
 - A System V x86_64 tag of 9 to 16 bytes with more than sixteen members, most often one with many unit cases or a nested tag holding one, keeps its second eightbyte when passed or returned by value. The classifier used to drop every member past the sixteenth, so a payload in the second eightbyte rode no register and read back as zero or garbage (#3400).
 
 ## [5.0.4] - 2026-09-13

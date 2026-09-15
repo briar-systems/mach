@@ -1,4 +1,6 @@
 use mach.lang.build.outcome;
+use std.allocator.arena;
+use std.allocator.page;
 use std.data.toml;
 use std.text.string.str_free;
 use std.types.bool.bool;
@@ -21,9 +23,14 @@ use mach.lang.target.os;
 
 use mach.lang.manifest.artifact.TmplVars;
 use mach.lang.manifest.artifact.expand_project_path;
-use mach.lang.manifest.parse;
+use mach.lang.manifest.model.LINK_FRAMEWORK;
+use mach.lang.manifest.model.LINK_LOCAL;
+use mach.lang.manifest.model.LINK_SYSTEM;
+use mach.lang.manifest.model.LinkDef;
+use mach.lang.manifest.model.LinkSource;
+use mach.lang.manifest.model.Manifest;
+use mach.lang.manifest.model.TargetDef;
 use mach.lang.manifest.parse.StrArr;
-use mach.lang.manifest.parse.TK_LINK;
 use mach.lang.manifest.parse.check_keys;
 use mach.lang.manifest.parse.check_path;
 use mach.lang.manifest.parse.free_strarr;
@@ -33,34 +40,17 @@ use mach.lang.manifest.parse.is_valid_id;
 use mach.lang.manifest.parse.key_text;
 use mach.lang.manifest.parse.parse_str_array;
 use mach.lang.manifest.parse.sfmt;
-use mach.lang.manifest.project.TargetDef;
+use mach.lang.manifest.parse.tinit;
 
-pub def LinkSource: u8;
-pub val LINK_LOCAL:     LinkSource = 0;
-pub val LINK_SYSTEM:    LinkSource = 1;
-pub val LINK_FRAMEWORK: LinkSource = 2;
-
-pub rec LinkDef {
-    name:               intern.StrId;
-    source:             LinkSource;
-    library:            intern.StrId;
-    lib_name:           intern.StrId;
-    path:               intern.StrId;
-    symbols:            *intern.StrId;
-    symbol_count:       u32;
-    os:                 *intern.StrId;
-    os_count:           u32;
-    os_present:         bool;
-    isa:                *intern.StrId;
-    isa_count:          u32;
-    isa_present:        bool;
-    abi:                *intern.StrId;
-    abi_count:          u32;
-    abi_present:        bool;
-    export:             bool;
-    include_referenced: bool;
-}
-
+# a `[link.<name>]` entry resolved for one target, as the linker consumes it.
+# the symbol array is owned; release it with `free_link_claims`
+# ---
+# source:             copied from the link
+# text:               for a local source, the `path` expanded and interned; otherwise the link's `name`
+# library:            the link's logical `library` name
+# symbols:            an owned copy of the link's `symbols`, or nil when it has none
+# symbol_count:       length of `symbols`
+# include_referenced: copied from the link
 pub rec LinkRequirement {
     source:  LinkSource;
     text:    intern.StrId;
@@ -71,7 +61,7 @@ pub rec LinkRequirement {
     include_referenced: bool;
 }
 
-pub fun canonical_axis_value(key: str, value: str) bool {
+fun canonical_axis_value(key: str, value: str) bool {
     if (str_equals(value, "*")) { ret true; }
     if (str_equals(key, "os"))  { ret os.os_id_for(value) != os.OS_UNKNOWN; }
     if (str_equals(key, "isa")) { ret isa.arch_id_for(value) != isa.ARCH_UNKNOWN; }
@@ -79,7 +69,7 @@ pub fun canonical_axis_value(key: str, value: str) bool {
     ret false;
 }
 
-pub fun parse_filter_axis(alloc: *A.Allocator, itn: *intern.Interner, sub: *toml.Table, key: str, label: str, as_root: bool) res[StrArr, outcome.Fail] {
+fun parse_filter_axis(alloc: *A.Allocator, itn: *intern.Interner, sub: *toml.Table, key: str, label: str, as_root: bool) res[StrArr, outcome.Fail] {
     var out: StrArr;
     out.items   = nil;
     out.count   = 0;
@@ -128,10 +118,14 @@ pub fun parse_filter_axis(alloc: *A.Allocator, itn: *intern.Interner, sub: *toml
     ret res[StrArr, outcome.Fail].ok{out};
 }
 
-pub fun parse_links(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, as_root: bool,
-    out_links: **LinkDef, out_count: *u32) err[outcome.Fail] {
-    @out_links = nil;
-    @out_count = 0;
+fun link_key_known(k: str) bool {
+    ret str_equals(k, "source") || str_equals(k, "name") || str_equals(k, "path") || str_equals(k, "library")
+        || str_equals(k, "symbols")
+        || str_equals(k, "os") || str_equals(k, "isa") || str_equals(k, "abi") || str_equals(k, "export")
+        || str_equals(k, "include");
+}
+
+pub fun parse_links(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, as_root: bool) err[outcome.Fail] {
     val tab_o: opt[*toml.Table] = toml.get_table(t, "link");
     if (sel tab_o.none) { ret err[outcome.Fail].ok{}; }
     val tab: *toml.Table = tab_o.some;
@@ -140,13 +134,12 @@ pub fun parse_links(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, 
 
     val res_links: res[*LinkDef, A.Error] = A.allocate[LinkDef](alloc, n);
     if (sel res_links.err) { ret err[outcome.Fail].err{outcome.refused(res_links.err)}; }
-    val links: *LinkDef = res_links.ok;
-    @out_links = links;
-    @out_count = n::u32;
+    m.links      = res_links.ok;
+    m.link_count = n::u32;
 
     var initialized: usize = 0;
     for (initialized < n) {
-        val slot: *LinkDef = ?links[initialized];
+        val slot: *LinkDef = ?m.links[initialized];
         slot.symbols      = nil;
         slot.symbol_count = 0;
         slot.os           = nil;
@@ -179,10 +172,10 @@ pub fun parse_links(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, 
         }
         val sub: *toml.Table = ?v.data.table;
 
-        val res_keys: err[outcome.Fail] = check_keys(alloc, sub, label, TK_LINK, as_root);
+        val res_keys: err[outcome.Fail] = check_keys(alloc, sub, label, link_key_known);
         if (sel res_keys.err) { ret res_keys; }
 
-        val d: *LinkDef = ?links[i];
+        val d: *LinkDef = ?m.links[i];
         d.name = intern_unwrap(itn, name);
 
         val source_s: str = key_text(sub, "source");
@@ -336,6 +329,12 @@ pub fun parse_links(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, 
     ret err[outcome.Fail].ok{};
 }
 
+# free the symbol arrays of `count` requirements and nil them. the `items` array
+# itself is not freed
+# ---
+# alloc: the allocator the claims were made from
+# items: the requirements; nil is accepted
+# count: how many entries to release
 pub fun free_link_claims(alloc: *A.Allocator, items: *LinkRequirement, count: u32) {
     if (items == nil) { ret; }
     var i: u32 = 0;
@@ -347,6 +346,17 @@ pub fun free_link_claims(alloc: *A.Allocator, items: *LinkRequirement, count: u3
     }
 }
 
+# turn a partially filled requirement buffer into an exactly sized result, taking
+# ownership of the buffer
+# ---
+# alloc:     the buffer's allocator
+# items:     a buffer of `capacity` entries with the first `count` filled
+# capacity:  the buffer's allocated extent
+# count:     the filled prefix
+# out_items: receives the exact array, or nil when `count` is 0 or on error
+# out_count: receives `count`, or 0 when it is 0 or on error
+# ret:       ok; when `count` is 0 the buffer is freed. on a failed shrink the filled
+#            claims and the whole buffer are freed and the allocator's error is returned
 pub fun finish_link_requirements(alloc: *A.Allocator, items: *LinkRequirement,
     capacity: u32, count: u32,
     out_items: **LinkRequirement,
@@ -371,6 +381,14 @@ pub fun finish_link_requirements(alloc: *A.Allocator, items: *LinkRequirement,
     ret err[outcome.Fail].ok{};
 }
 
+# add every symbol of `src` that `dst` lacks to `dst`, keeping `dst` order first
+# and the new entries in `src` order. `src` is not modified
+# ---
+# alloc: the allocator of `dst.symbols`; the old array is freed and replaced
+# dst:   the requirement that grows
+# src:   the requirement whose symbols are added
+# ret:   ok, without allocating, when nothing is new; err on a symbol count
+#        overflow or allocation failure, leaving `dst` unchanged
 pub fun merge_link_claims(alloc: *A.Allocator, dst: *LinkRequirement,
     src: *LinkRequirement) err[outcome.Fail] {
     var added: u32 = 0;
@@ -438,7 +456,7 @@ pub fun merge_link_claims(alloc: *A.Allocator, dst: *LinkRequirement,
     ret err[outcome.Fail].ok{};
 }
 
-pub fun filter_matches(itn: *intern.Interner, items: *intern.StrId, count: u32, present: bool, target: intern.StrId) bool {
+fun filter_matches(itn: *intern.Interner, items: *intern.StrId, count: u32, present: bool, target: intern.StrId) bool {
     if (!present)   { ret true; }
     if (count == 0) { ret false; }
     val star: intern.StrId = intern_unwrap(itn, "*");
@@ -455,6 +473,13 @@ pub fun filter_matches(itn: *intern.Interner, items: *intern.StrId, count: u32, 
     ret false;
 }
 
+# whether a link's `os`, `isa` and `abi` filters all admit a target. an absent
+# axis admits everything, an empty one nothing, "*" everything
+# ---
+# itn: interns "*"
+# l:   the link
+# t:   the target
+# ret: true when all three axes admit `t`
 pub fun link_matches_target(itn: *intern.Interner, l: *LinkDef, t: *TargetDef) bool {
     if (!filter_matches(itn, l.os, l.os_count, l.os_present, t.os))     { ret false; }
     if (!filter_matches(itn, l.isa, l.isa_count, l.isa_present, t.isa)) { ret false; }
@@ -462,6 +487,16 @@ pub fun link_matches_target(itn: *intern.Interner, l: *LinkDef, t: *TargetDef) b
     ret true;
 }
 
+# resolve a link entry for one target into a `LinkRequirement`. a local `path`
+# is expanded with `expand_project_path` and interned; the symbols are copied
+# into an owned array
+# ---
+# alloc:    owns the symbol copy
+# itn:      interns the expanded path
+# l:        the link
+# proj_out: the expanded `[project].out`
+# v:        the template values
+# ret:      the requirement; on error nothing is left allocated
 pub fun link_requirement(alloc: *A.Allocator, itn: *intern.Interner, l: *LinkDef,
     proj_out: str, v: *TmplVars) res[LinkRequirement, outcome.Fail] {
     var req: LinkRequirement;
@@ -502,28 +537,284 @@ pub fun link_requirement(alloc: *A.Allocator, itn: *intern.Interner, l: *LinkDef
     ret res[LinkRequirement, outcome.Fail].ok{req};
 }
 
-pub fun find_link_by_name(links: *LinkDef, link_count: u32, name: intern.StrId) *LinkDef {
+pub fun find_link_by_name(m: *Manifest, name: intern.StrId) *LinkDef {
     var i: u32 = 0;
-    for (i < link_count) {
-        if (links[i].name == name) { ret ?links[i]; }
+    for (i < m.link_count) {
+        if (m.links[i].name == name) { ret ?m.links[i]; }
         i = i + 1;
     }
     ret nil;
 }
 
-pub fun find_link(itn: *intern.Interner, links: *LinkDef, link_count: u32, name: str) *LinkDef {
-    val res_id: res[intern.StrId, A.Error] = intern.intern(itn, name);
-    if (sel res_id.err) { ret nil; }
-    ret find_link_by_name(links, link_count, res_id.ok);
-}
-
-pub fun link_table_names(alloc: *A.Allocator, itn: *intern.Interner, links: *LinkDef, link_count: u32) str {
-    var s: str = "";
+pub fun find_link(itn: *intern.Interner, m: *Manifest, name: str) *LinkDef {
     var i: u32 = 0;
-    for (i < link_count) {
-        if (i > 0) { s = sfmt(alloc, "{}, ", s); }
-        s = sfmt(alloc, "{}[link.{}]", s, idstr(itn, links[i].name));
+    for (i < m.link_count) {
+        if (str_equals(idstr(itn, m.links[i].name), name)) { ret ?m.links[i]; }
         i = i + 1;
     }
-    ret s;
+    ret nil;
+}
+
+rec LinkFinishAllocProbe {
+    backing:       A.Allocator;
+    items:         ptr;
+    items_size:    usize;
+    claims:        ptr;
+    claims_size:   usize;
+    realloc_count: u32;
+    items_freed:   bool;
+    claims_freed:  bool;
+    mismatch:      bool;
+}
+
+fun link_finish_probe_allocate(ctx: ptr, size: usize, align: usize) opt[ptr] {
+    val p: *LinkFinishAllocProbe = ctx::*LinkFinishAllocProbe;
+    ret p.backing.fn_allocate(p.backing.ctx, size, align);
+}
+
+fun link_finish_probe_reallocate(ctx: ptr, item: ptr, old_size: usize,
+    new_size: usize, align: usize) opt[ptr] {
+    val p: *LinkFinishAllocProbe = ctx::*LinkFinishAllocProbe;
+    p.realloc_count = p.realloc_count + 1;
+    if (item != p.items || old_size != p.items_size
+        || new_size != $size_of(LinkRequirement)) { p.mismatch = true; }
+    ret opt[ptr].none{};
+}
+
+fun link_finish_probe_deallocate(ctx: ptr, item: ptr, size: usize, align: usize) i64 {
+    val p: *LinkFinishAllocProbe = ctx::*LinkFinishAllocProbe;
+    if (item == p.items) {
+        p.items_freed = true;
+        if (size != p.items_size) { p.mismatch = true; }
+    }
+    if (item == p.claims) {
+        p.claims_freed = true;
+        if (size != p.claims_size) { p.mismatch = true; }
+    }
+    ret p.backing.fn_deallocate(p.backing.ctx, item, size, align);
+}
+
+test "mach.lang.manifest.link_requirement:carries_include_referenced" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val k32_r: res[intern.StrId, A.Error] = intern.intern(?itn, "kernel32");
+    if (sel k32_r.err) {
+        arena.dnit(?ar);
+        ret 1;
+    }
+
+    var l: LinkDef;
+    l.source             = LINK_SYSTEM;
+    l.name               = k32_r.ok;
+    l.library            = k32_r.ok;
+    l.lib_name           = k32_r.ok;
+    l.path               = intern.STR_NIL;
+    l.symbols            = nil;
+    l.symbol_count       = 0;
+    l.include_referenced = true;
+
+    var v:     TmplVars;
+    val req_r: res[LinkRequirement, outcome.Fail] = link_requirement(?alloc, ?itn, ?l, "", ?v);
+    if (sel req_r.err) {
+        arena.dnit(?ar);
+        ret 1;
+    }
+    val req: LinkRequirement = req_r.ok;
+    if (!req.include_referenced) { code = 1; }
+
+    l.include_referenced = false;
+    val req2_r: res[LinkRequirement, outcome.Fail] = link_requirement(?alloc, ?itn, ?l, "", ?v);
+    if (sel req2_r.err) {
+        arena.dnit(?ar);
+        ret 1;
+    }
+    val req2: LinkRequirement = req2_r.ok;
+    if (req2.include_referenced) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.link_requirement:owns_its_claim_array" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val sleep_r: res[intern.StrId, A.Error] = intern.intern(?itn, "Sleep");
+    val k32_r:   res[intern.StrId, A.Error] = intern.intern(?itn, "kernel32");
+    if (sel sleep_r.err) {
+        arena.dnit(?ar);
+        ret 1;
+    }
+    if (sel k32_r.err) {
+        arena.dnit(?ar);
+        ret 1;
+    }
+    val sleep: intern.StrId = sleep_r.ok;
+
+    val owned_r: res[*intern.StrId, A.Error] = A.allocate[intern.StrId](?alloc, 1::usize);
+    if (sel owned_r.err) {
+        arena.dnit(?ar);
+        ret 1;
+    }
+    var l: LinkDef;
+    l.source       = LINK_SYSTEM;
+    l.name         = k32_r.ok;
+    l.library      = k32_r.ok;
+    l.lib_name     = k32_r.ok;
+    l.path         = intern.STR_NIL;
+    l.symbols      = owned_r.ok;
+    l.symbol_count = 1;
+    l.symbols[0]   = sleep;
+
+    var v:     TmplVars;
+    val req_r: res[LinkRequirement, outcome.Fail] = link_requirement(?alloc, ?itn, ?l, "", ?v);
+    if (sel req_r.err) {
+        arena.dnit(?ar);
+        ret 1;
+    }
+    var req: LinkRequirement = req_r.ok;
+
+    if (req.symbols == l.symbols)                         { code = 1; }
+    if (req.symbol_count != 1 || req.symbols[0] != sleep) { code = 1; }
+
+    free_strarr(?alloc, l.symbols, l.symbol_count);
+    l.symbols[0] = intern.STR_NIL;
+    if (req.symbols[0] != sleep) { code = 1; }
+
+    free_link_claims(?alloc, ?req, 1);
+    if (req.symbols != nil || req.symbol_count != 0) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.merge_link_claims:stable_owned_union" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val a_r: res[intern.StrId, A.Error] = intern.intern(?itn, "A");
+    val b_r: res[intern.StrId, A.Error] = intern.intern(?itn, "B");
+    val c_r: res[intern.StrId, A.Error] = intern.intern(?itn, "C");
+    if (sel a_r.err) {
+        arena.dnit(?ar);
+        ret 1;
+    }
+    if (sel b_r.err) {
+        arena.dnit(?ar);
+        ret 1;
+    }
+    if (sel c_r.err) {
+        arena.dnit(?ar);
+        ret 1;
+    }
+    val a: intern.StrId = a_r.ok;
+    val b: intern.StrId = b_r.ok;
+    val c: intern.StrId = c_r.ok;
+
+    val dst_r: res[*intern.StrId, A.Error] = A.allocate[intern.StrId](?alloc, 2::usize);
+    val src_r: res[*intern.StrId, A.Error] = A.allocate[intern.StrId](?alloc, 3::usize);
+    if (sel dst_r.err) {
+        arena.dnit(?ar);
+        ret 1;
+    }
+    if (sel src_r.err) {
+        arena.dnit(?ar);
+        ret 1;
+    }
+    var dst: LinkRequirement;
+    dst.symbols      = dst_r.ok;
+    dst.symbol_count = 2;
+    dst.symbols[0]   = a;
+    dst.symbols[1]   = b;
+    var src: LinkRequirement;
+    src.symbols      = src_r.ok;
+    src.symbol_count = 3;
+    src.symbols[0]   = b;
+    src.symbols[1]   = c;
+    src.symbols[2]   = c;
+    val src_symbols: *intern.StrId = src.symbols;
+
+    val merged: err[outcome.Fail] = merge_link_claims(?alloc, ?dst, ?src);
+    if (sel merged.err) { code = 1; }
+    if (sel merged.ok) {
+        if (dst.symbol_count != 3 || dst.symbols[0] != a
+            || dst.symbols[1] != b || dst.symbols[2] != c) { code = 1; }
+        if (dst.symbols == src_symbols) { code = 1; }
+        if (src.symbols != src_symbols || src.symbol_count != 3
+            || src.symbols[0] != b || src.symbols[1] != c
+            || src.symbols[2] != c) { code = 1; }
+
+        free_link_claims(?alloc, ?src, 1);
+        if (dst.symbol_count != 3 || dst.symbols[0] != a
+            || dst.symbols[1] != b || dst.symbols[2] != c) { code = 1; }
+    }
+    free_link_claims(?alloc, ?dst, 1);
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.finish_link_requirements:shrink_failure_frees_full_extent" {
+    var backing: A.Allocator;
+    val make_r:  err[A.Error] = page.make(?backing);
+    if (sel make_r.err) { ret 1; }
+
+    var probe: LinkFinishAllocProbe;
+    probe.backing       = backing;
+    probe.items         = nil;
+    probe.items_size    = 0;
+    probe.claims        = nil;
+    probe.claims_size   = 0;
+    probe.realloc_count = 0;
+    probe.items_freed   = false;
+    probe.claims_freed  = false;
+    probe.mismatch      = false;
+
+    var alloc:     A.Allocator;
+    var probe_ptr: *LinkFinishAllocProbe = ?probe;
+    alloc.ctx           = probe_ptr::ptr;
+    alloc.fn_allocate   = link_finish_probe_allocate;
+    alloc.fn_reallocate = link_finish_probe_reallocate;
+    alloc.fn_deallocate = link_finish_probe_deallocate;
+
+    val br: res[*LinkRequirement, A.Error] = A.allocate[LinkRequirement](?alloc, 2::usize);
+    if (sel br.err) { ret 1; }
+    val items: *LinkRequirement = br.ok;
+    probe.items      = items::ptr;
+    probe.items_size = $size_of(LinkRequirement) * 2;
+
+    val cr: res[*intern.StrId, A.Error] = A.allocate[intern.StrId](?alloc, 1::usize);
+    if (sel cr.err) {
+        A.deallocate[LinkRequirement](?alloc, items, 2::usize);
+        ret 1;
+    }
+    items[0].symbols      = cr.ok;
+    items[0].symbol_count = 1;
+    items[0].symbols[0]   = intern.STR_NIL;
+    probe.claims          = items[0].symbols::ptr;
+    probe.claims_size     = $size_of(intern.StrId);
+
+    var out_items: *LinkRequirement  = items;
+    var out_count: u32               = 0xFFFFFFFF;
+    val fr:        err[outcome.Fail] = finish_link_requirements(?alloc, items, 2, 1, ?out_items, ?out_count);
+
+    if (sel fr.ok)                                              { ret 1; }
+    if (!str_equals(outcome.describe(fr.err), "out of memory")) { ret 1; }
+    if (out_items != nil || out_count != 0)                     { ret 1; }
+    if (probe.realloc_count != 1 || probe.mismatch)             { ret 1; }
+    if (!probe.claims_freed || !probe.items_freed)              { ret 1; }
+    ret 0;
 }

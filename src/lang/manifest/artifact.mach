@@ -1,4 +1,6 @@
 use mach.lang.build.outcome;
+use std.allocator.arena;
+use alloc_test: std.allocator.testing;
 use std.data.toml;
 use std.format;
 use std.text.string.str_free;
@@ -24,60 +26,37 @@ use mach.lang.intern;
 use tgt: mach.lang.target;
 use mach.lang.target.of;
 
-use mach.lang.manifest.parse;
+use mach.lang.manifest.model.ArtifactDef;
+use mach.lang.manifest.model.Manifest;
+use mach.lang.manifest.model.TargetDef;
 use mach.lang.manifest.parse.StrArr;
-use mach.lang.manifest.parse.TK_ARTIFACT;
 use mach.lang.manifest.parse.check_keys;
 use mach.lang.manifest.parse.check_path;
 use mach.lang.manifest.parse.idstr;
 use mach.lang.manifest.parse.intern_unwrap;
 use mach.lang.manifest.parse.is_project_path;
 use mach.lang.manifest.parse.is_valid_id;
-use mach.lang.manifest.parse.join_path_canonical;
 use mach.lang.manifest.parse.key_text;
 use mach.lang.manifest.parse.must_lookup;
 use mach.lang.manifest.parse.need_matches;
 use mach.lang.manifest.parse.opt_value_text;
 use mach.lang.manifest.parse.parse_default_flag;
 use mach.lang.manifest.parse.parse_str_array;
-use mach.lang.manifest.parse.seg_dup;
 use mach.lang.manifest.parse.sfmt;
-use mach.lang.manifest.project;
-use mach.lang.manifest.project.TargetDef;
-use mach.lang.manifest.project.target_matches_host;
+use mach.lang.manifest.parse.tinit;
 
-pub def LibKind: u8;
-pub val LIBKIND_STATIC: LibKind = 0;
-pub val LIBKIND_SHARED: LibKind = 1;
-
-pub val TMPL_ARTIFACT_PREFIX:   str = "artifact.";
-pub val TMPL_ARTIFACT_SUFFIX:   str = ".out";
-pub val AMBIGUOUS_ARTIFACT_MSG: str = "mach.toml: several artifacts support the selected target and none is marked `default = true`; no artifact is selected by table order: mark exactly one [artifact.<name>] with `default = true` or select one with --bin/--lib";
-
-pub rec ArtifactReq {
-    name: str;
-    out:  str;
-}
-
-pub rec ArtifactDef {
-    name:               intern.StrId;
-    kind:               intern.StrId;
-    entry:              intern.StrId;
-    out:                intern.StrId;
-    targets:            *intern.StrId;
-    target_count:       u32;
-    link:               *intern.StrId;
-    link_count:         u32;
-    need:               *intern.StrId;
-    need_count:         u32;
-    is_lib:             bool;
-    is_default:         bool;
-    subsystem:          of.Subsystem;
-    subsystem_declared: bool;
-    icon:               intern.StrId;
-    app_manifest:       intern.StrId;
-}
-
+# the values a path template expands with; see `expand`
+# ---
+# target:          `{target.name}`
+# isa:             `{target.isa}`
+# os:              `{target.os}`
+# abi:             `{target.abi}`
+# profile:         `{profile.name}`
+# format:          the target's explicit `of` override, "" when the format is derived
+# artifact_suffix: `{artifact.suffix}`, set by `expand_artifact_output` for the
+#                  artifact being named; nil everywhere else, where the variable is refused
+# reqs:            the artifacts this expansion may name as `{artifact.<id>.out}`; nil when none
+# req_count:       length of `reqs`
 pub rec TmplVars {
     target:          str;
     isa:             str;
@@ -90,36 +69,18 @@ pub rec TmplVars {
     req_count:       u32;
 }
 
-pub tag TemplateError: u8 {
-    internal: str;
-    rejected: str;
+# one artifact another artifact requires, as `{artifact.<id>.out}` resolves it
+# ---
+# name: the required artifact's name
+# out:  its final output path when it builds for exactly one target here, or ""
+#       when it builds for several, which makes `{artifact.<id>.out}` an error
+pub rec ArtifactReq {
+    name: str;
+    out:  str;
 }
 
-pub fun template_internal(message: str) TemplateError {
-    ret TemplateError.internal{message};
-}
-
-pub fun template_error_dnit(alloc: *A.Allocator, e: TemplateError) {
-    if (sel e.rejected) { str_free(alloc, e.rejected); }
-}
-
-pub fun template_rejection(alloc: *A.Allocator, field: str, tmpl: str, reason: str) TemplateError {
-    val r: res[str, format.FormatError] = format.sprint(alloc, "{}: {}: '{}'", field, reason, tmpl);
-    if (sel r.err) { ret template_internal(outcome.format_text(r.err)); }
-    ret TemplateError.rejected{r.ok};
-}
-
-pub fun template_text(e: TemplateError) str {
-    if (sel e.internal) { ret e.internal; }
-    ret e.rejected;
-}
-
-fun subsystem_err(alloc: *A.Allocator, label: str, v: *toml.Value) str {
-    ret sfmt(alloc, "mach.toml: {}.subsystem must be \"console\" or \"gui\" (got {})",
-        label, opt_value_text(alloc, v));
-}
-
-pub fun parse_subsystem(alloc: *A.Allocator, label: str, sub: *toml.Table) res[opt[of.Subsystem], outcome.Fail] {
+# the declared subsystem, absent when the key is omitted
+fun parse_subsystem(alloc: *A.Allocator, label: str, sub: *toml.Table) res[opt[of.Subsystem], outcome.Fail] {
     val v_o: opt[*toml.Value] = toml.get(sub, "subsystem");
     if (sel v_o.none) { ret res[opt[of.Subsystem], outcome.Fail].ok{opt[of.Subsystem].none{}}; }
     val v: *toml.Value = v_o.some;
@@ -129,7 +90,12 @@ pub fun parse_subsystem(alloc: *A.Allocator, label: str, sub: *toml.Table) res[o
     ret res[opt[of.Subsystem], outcome.Fail].err{outcome.user(subsystem_err(alloc, label, v))};
 }
 
-pub fun parse_resource_path(alloc: *A.Allocator, itn: *intern.Interner, label: str,
+fun subsystem_err(alloc: *A.Allocator, label: str, v: *toml.Value) str {
+    ret sfmt(alloc, "mach.toml: {}.subsystem must be \"console\" or \"gui\" (got {})",
+        label, opt_value_text(alloc, v));
+}
+
+fun parse_resource_path(alloc: *A.Allocator, itn: *intern.Interner, label: str,
     sub: *toml.Table, key: str) res[intern.StrId, outcome.Fail] {
     val v_o: opt[*toml.Value] = toml.get(sub, key);
     if (sel v_o.none) { ret res[intern.StrId, outcome.Fail].ok{intern.STR_NIL}; }
@@ -147,13 +113,51 @@ pub fun parse_resource_path(alloc: *A.Allocator, itn: *intern.Interner, label: s
         ret res[intern.StrId, outcome.Fail].err{checked.err};
     }
     val interned: res[intern.StrId, A.Error] = intern.intern(itn, v.data.string);
-    if (sel interned.err) {
-        ret res[intern.StrId, outcome.Fail].err{outcome.refused(interned.err)};
-    }
+    if (sel interned.err) { ret res[intern.StrId, outcome.Fail].err{outcome.refused(interned.err)}; }
     ret res[intern.StrId, outcome.Fail].ok{interned.ok};
 }
 
-pub fun parse_one_artifact(alloc: *A.Allocator, itn: *intern.Interner, tab: *toml.Table, k: usize, as_root: bool, d: *ArtifactDef) err[outcome.Fail] {
+fun artifact_key_known(k: str) bool {
+    ret str_equals(k, "kind") || str_equals(k, "entry") || str_equals(k, "out")
+        || str_equals(k, "targets") || str_equals(k, "link") || str_equals(k, "need")
+        || str_equals(k, "default") || str_equals(k, "subsystem")
+        || str_equals(k, "icon") || str_equals(k, "manifest");
+}
+
+pub fun parse_artifacts(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, as_root: bool) err[outcome.Fail] {
+    val arts_o: opt[*toml.Table] = toml.get_table(t, "artifact");
+    if (sel arts_o.none) { ret err[outcome.Fail].ok{}; }
+    val arts: *toml.Table = arts_o.some;
+    val n:    usize       = toml.table_len(arts);
+    if (n == 0) { ret err[outcome.Fail].ok{}; }
+
+    val res_artifacts: res[*ArtifactDef, A.Error] = A.allocate[ArtifactDef](alloc, n);
+    if (sel res_artifacts.err) { ret err[outcome.Fail].err{outcome.refused(res_artifacts.err)}; }
+    m.artifacts      = res_artifacts.ok;
+    m.artifact_count = n::u32;
+
+    var initialized: usize = 0;
+    for (initialized < n) {
+        val slot: *ArtifactDef = ?m.artifacts[initialized];
+        slot.targets      = nil;
+        slot.target_count = 0;
+        slot.link         = nil;
+        slot.link_count   = 0;
+        slot.need         = nil;
+        slot.need_count   = 0;
+        initialized       = initialized + 1;
+    }
+
+    var i: usize = 0;
+    for (i < n) {
+        val res_artifact: err[outcome.Fail] = parse_one_artifact(alloc, itn, arts, i, as_root, ?m.artifacts[i]);
+        if (sel res_artifact.err) { ret res_artifact; }
+        i = i + 1;
+    }
+    ret err[outcome.Fail].ok{};
+}
+
+fun parse_one_artifact(alloc: *A.Allocator, itn: *intern.Interner, tab: *toml.Table, k: usize, as_root: bool, d: *ArtifactDef) err[outcome.Fail] {
     val name_o: opt[str] = toml.table_key(tab, k);
     if (sel name_o.none) { ret err[outcome.Fail].err{outcome.internal("mach.toml: [artifact] entry index is outside its table")}; }
     val name: str              = name_o.some;
@@ -173,7 +177,7 @@ pub fun parse_one_artifact(alloc: *A.Allocator, itn: *intern.Interner, tab: *tom
     }
     val sub: *toml.Table = ?v.data.table;
 
-    val res_keys: err[outcome.Fail] = check_keys(alloc, sub, label, TK_ARTIFACT, as_root);
+    val res_keys: err[outcome.Fail] = check_keys(alloc, sub, label, artifact_key_known);
     if (sel res_keys.err) { ret res_keys; }
 
     d.icon         = intern.STR_NIL;
@@ -288,43 +292,6 @@ pub fun parse_one_artifact(alloc: *A.Allocator, itn: *intern.Interner, tab: *tom
     ret err[outcome.Fail].ok{};
 }
 
-pub fun parse_artifacts(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, as_root: bool,
-    out_artifacts: **ArtifactDef, out_count: *u32) err[outcome.Fail] {
-    @out_artifacts = nil;
-    @out_count     = 0;
-    val arts_o: opt[*toml.Table] = toml.get_table(t, "artifact");
-    if (sel arts_o.none) { ret err[outcome.Fail].ok{}; }
-    val arts: *toml.Table = arts_o.some;
-    val n:    usize       = toml.table_len(arts);
-    if (n == 0) { ret err[outcome.Fail].ok{}; }
-
-    val res_artifacts: res[*ArtifactDef, A.Error] = A.allocate[ArtifactDef](alloc, n);
-    if (sel res_artifacts.err) { ret err[outcome.Fail].err{outcome.refused(res_artifacts.err)}; }
-    val artifacts: *ArtifactDef = res_artifacts.ok;
-    @out_artifacts = artifacts;
-    @out_count     = n::u32;
-
-    var initialized: usize = 0;
-    for (initialized < n) {
-        val slot: *ArtifactDef = ?artifacts[initialized];
-        slot.targets      = nil;
-        slot.target_count = 0;
-        slot.link         = nil;
-        slot.link_count   = 0;
-        slot.need         = nil;
-        slot.need_count   = 0;
-        initialized       = initialized + 1;
-    }
-
-    var i: usize = 0;
-    for (i < n) {
-        val res_artifact: err[outcome.Fail] = parse_one_artifact(alloc, itn, arts, i, as_root, ?artifacts[i]);
-        if (sel res_artifact.err) { ret res_artifact; }
-        i = i + 1;
-    }
-    ret err[outcome.Fail].ok{};
-}
-
 fun seg_eq(tmpl: str, start: usize, end: usize, lit: str) bool {
     val ll: usize = str_len(lit);
     if (end - start != ll) { ret false; }
@@ -335,6 +302,9 @@ fun seg_eq(tmpl: str, start: usize, end: usize, lit: str) bool {
     }
     ret true;
 }
+
+val TMPL_ARTIFACT_PREFIX: str = "artifact.";
+val TMPL_ARTIFACT_SUFFIX: str = ".out";
 
 fun region_eq_str(tmpl: str, start: usize, end: usize, s: str) bool {
     val n: usize = end - start;
@@ -457,6 +427,12 @@ fun tmpl_reserved(tmpl: str, start: usize, end: usize) bool {
         || tmpl_namespace(tmpl, start, end, "artifact");
 }
 
+# template variables for one target and profile, with no artifact requirements
+# ---
+# itn: resolves the target's interned strings
+# t:   the target
+# pn:  the profile name
+# ret: the variables; `reqs` is nil
 pub fun tmpl_vars_of(itn: *intern.Interner, t: *TargetDef, pn: str) TmplVars {
     var v: TmplVars;
     v.target  = idstr(itn, t.name);
@@ -474,24 +450,42 @@ pub fun tmpl_vars_of(itn: *intern.Interner, t: *TargetDef, pn: str) TmplVars {
 
 pub fun tmpl_vars_of_reqs(reqs: *ArtifactReq, req_count: u32) TmplVars {
     var v: TmplVars;
-    v.target          = "";
-    v.isa             = "";
-    v.os              = "";
-    v.abi             = "";
-    v.profile         = "";
-    v.format          = "";
-    v.artifact_suffix = nil;
-    v.reqs            = reqs;
-    v.req_count       = req_count;
-    ret v;
-}
-
-pub fun tmpl_vars_with_reqs(itn: *intern.Interner, t: *TargetDef, pn: str,
-    reqs: *ArtifactReq, req_count: u32) TmplVars {
-    var v: TmplVars = tmpl_vars_of(itn, t, pn);
+    v.target    = "";
+    v.isa       = "";
+    v.os        = "";
+    v.abi       = "";
+    v.profile   = "";
     v.reqs      = reqs;
     v.req_count = req_count;
     ret v;
+}
+
+# a template that could not be expanded: rejected names the template's own
+# fault in a message the caller's allocator owns (released by
+# template_error_dnit); internal carries the compiler's static text
+pub tag TemplateError: u8 {
+    internal: str;
+    rejected: str;
+}
+
+pub fun template_internal(message: str) TemplateError {
+    ret TemplateError.internal{message};
+}
+
+pub fun template_error_dnit(alloc: *A.Allocator, e: TemplateError) {
+    if (sel e.rejected) { str_free(alloc, e.rejected); }
+}
+
+pub fun template_rejection(alloc: *A.Allocator, field: str, tmpl: str, reason: str) TemplateError {
+    val r: res[str, format.FormatError] = format.sprint(alloc, "{}: {}: '{}'", field, reason, tmpl);
+    if (sel r.err) { ret template_internal(outcome.format_text(r.err)); }
+    ret TemplateError.rejected{r.ok};
+}
+
+# the message either case carries
+pub fun template_text(e: TemplateError) str {
+    if (sel e.internal) { ret e.internal; }
+    ret e.rejected;
 }
 
 fun artifact_path_value(alloc: *A.Allocator, tmpl: str, start: usize, end: usize,
@@ -579,6 +573,33 @@ pub fun expand_artifact_path(alloc: *A.Allocator, tmpl: str, reqs: *ArtifactReq,
     ret res[str, TemplateError].ok{buf::str};
 }
 
+# `tmpl_vars_of` with artifact requirements attached
+# ---
+# itn:       resolves the target's interned strings
+# t:         the target
+# pn:        the profile name
+# reqs:      the requirements `{artifact.<id>.out}` may name
+# req_count: length of `reqs`
+# ret:       the variables
+pub fun tmpl_vars_with_reqs(itn: *intern.Interner, t: *TargetDef, pn: str,
+    reqs: *ArtifactReq, req_count: u32) TmplVars {
+    var v: TmplVars = tmpl_vars_of(itn, t, pn);
+    v.reqs      = reqs;
+    v.req_count = req_count;
+    ret v;
+}
+
+# expand a path template. the placeholders are `{project.out}`, `{target.name}`,
+# `{target.isa}`, `{target.os}`, `{target.abi}`, `{profile.name}` and
+# `{artifact.<id>.out}`; nothing else is accepted
+# ---
+# alloc:       owns the returned string
+# tmpl:        the template
+# project_out: the expanded `[project].out`, or "" when expanding `[project].out`
+#              itself, in which case `{project.out}` is an error
+# v:           the values
+# ret:         the expanded string; err on an unterminated '{', an unknown placeholder,
+#              an artifact not in `v.reqs`, or an artifact whose output is ambiguous
 pub fun expand(alloc: *A.Allocator, tmpl: str, project_out: str,
     v: *TmplVars) res[str, outcome.Fail] {
     val n:     usize = str_len(tmpl);
@@ -635,6 +656,16 @@ pub fun expand(alloc: *A.Allocator, tmpl: str, project_out: str,
     ret res[str, outcome.Fail].ok{buf::str};
 }
 
+# expand a build step `argv` or `env` value. known placeholders expand as in
+# `expand`; a brace pair that is not a placeholder is copied verbatim, unless it
+# starts with `project`, `target`, `profile` or `artifact`, which is an error
+# ---
+# alloc:       owns the returned string
+# tmpl:        the value
+# project_out: the expanded `[project].out`
+# v:           the values
+# ret:         the expanded string; err for an unknown or unterminated reserved
+#              placeholder, the `expand` errors, or a result too large to size
 pub fun expand_step_value(alloc: *A.Allocator, tmpl: str, project_out: str,
     v: *TmplVars) res[str, outcome.Fail] {
     val n:     usize = str_len(tmpl);
@@ -699,16 +730,9 @@ pub fun expand_step_value(alloc: *A.Allocator, tmpl: str, project_out: str,
                 i = ii + 1;
             }
             or {
-                if (tmpl_reserved(tmpl, i + 1, ii)) {
-                    A.deallocate[u8](alloc, buf, total + 1);
-                    if (ii >= n) { ret res[str, outcome.Fail].err{outcome.user("mach.toml: unterminated reserved build step template")}; }
-                    ret res[str, outcome.Fail].err{outcome.user("mach.toml: unknown reserved build step template")};
-                }
-                or {
-                    buf[w] = tmpl[i];
-                    w      = w + 1;
-                    i      = i + 1;
-                }
+                buf[w] = tmpl[i];
+                w      = w + 1;
+                i      = i + 1;
             }
         }
         or {
@@ -721,6 +745,15 @@ pub fun expand_step_value(alloc: *A.Allocator, tmpl: str, project_out: str,
     ret res[str, outcome.Fail].ok{buf::str};
 }
 
+# `expand`, then require the result to satisfy `is_project_path`
+# ---
+# alloc:       owns the returned string
+# tmpl:        the template
+# project_out: as `expand`
+# v:           the values
+# field:       what the template is, for the error text
+# ret:         the expanded path; the `expand` errors, or err naming `field` when the
+#              result escapes the project root
 pub fun expand_project_path(alloc: *A.Allocator, tmpl: str, project_out: str,
     v: *TmplVars, field: str) res[str, outcome.Fail] {
     val res_expanded: res[str, outcome.Fail] = expand(alloc, tmpl, project_out, v);
@@ -734,71 +767,25 @@ pub fun expand_project_path(alloc: *A.Allocator, tmpl: str, project_out: str,
     ret res[str, outcome.Fail].ok{expanded};
 }
 
-pub fun find_artifact_by_name(artifacts: *ArtifactDef, artifact_count: u32, name: intern.StrId) *ArtifactDef {
+# look an artifact up by name
+# ---
+# itn:  interns the name
+# m:    the manifest
+# name: the artifact name
+# ret:  the artifact, or nil
+pub fun find_artifact(itn: *intern.Interner, m: *Manifest, name: str) *ArtifactDef {
+    val res_id: res[intern.StrId, A.Error] = intern.intern(itn, name);
+    if (sel res_id.err) { ret nil; }
+    ret find_artifact_by_name(m, res_id.ok);
+}
+
+pub fun find_artifact_by_name(m: *Manifest, name: intern.StrId) *ArtifactDef {
     var i: u32 = 0;
-    for (i < artifact_count) {
-        if (artifacts[i].name == name) { ret ?artifacts[i]; }
+    for (i < m.artifact_count) {
+        if (m.artifacts[i].name == name) { ret ?m.artifacts[i]; }
         i = i + 1;
     }
     ret nil;
-}
-
-pub fun find_artifact_index(artifacts: *ArtifactDef, artifact_count: u32, name: intern.StrId) i64 {
-    var i: u32 = 0;
-    for (i < artifact_count) {
-        if (artifacts[i].name == name) { ret i::i64; }
-        i = i + 1;
-    }
-    ret -1;
-}
-
-pub fun artifact_supports_target(itn: *intern.Interner, a: *ArtifactDef, tname: intern.StrId) bool {
-    val star: intern.StrId = intern_unwrap(itn, "*");
-    var i:    u32          = 0;
-    for (i < a.target_count) {
-        if (a.targets[i] == star || a.targets[i] == tname) { ret true; }
-        i = i + 1;
-    }
-    ret false;
-}
-
-pub fun artifact_pinned_target(itn: *intern.Interner, targets: *TargetDef, target_count: u32, a: *ArtifactDef) *TargetDef {
-    val host_os:   u32 = tgt.host_os_id();
-    val host_arch: u32 = tgt.host_arch_id();
-
-    var only:       *TargetDef = nil;
-    var count:      u32        = 0;
-    var host_first: *TargetDef = nil;
-    var host_count: u32        = 0;
-    var i:          u32        = 0;
-    for (i < target_count) {
-        if (artifact_supports_target(itn, a, targets[i].name)) {
-            if (count == 0) { only = ?targets[i]; }
-            count = count + 1;
-            if (target_matches_host(itn, ?targets[i], host_os, host_arch)) {
-                if (host_count == 0) { host_first = ?targets[i]; }
-                host_count = host_count + 1;
-            }
-        }
-        i = i + 1;
-    }
-    if (count == 1)      { ret only; }
-    if (host_count == 1) { ret host_first; }
-    ret nil;
-}
-
-pub fun artifact_target_names(alloc: *A.Allocator, itn: *intern.Interner, targets: *TargetDef, target_count: u32, a: *ArtifactDef) str {
-    var s: str = "";
-    var i: u32 = 0;
-    for (i < target_count) {
-        if (artifact_supports_target(itn, a, targets[i].name)) {
-            if (!str_empty(s)) { s = sfmt(alloc, "{}, ", s); }
-            val opt_name: opt[str] = intern.lookup(itn, targets[i].name);
-            if (sel opt_name.some) { s = sfmt(alloc, "{}{}", s, opt_name.some); }
-        }
-        i = i + 1;
-    }
-    ret s;
 }
 
 pub fun artifact_needs_artifact(itn: *intern.Interner, a: *ArtifactDef, other: *ArtifactDef) bool {
@@ -809,23 +796,6 @@ pub fun artifact_needs_artifact(itn: *intern.Interner, a: *ArtifactDef, other: *
         i = i + 1;
     }
     ret false;
-}
-
-pub fun required_artifact_uses_target(itn: *intern.Interner, req: *ArtifactDef,
-    consumer_target: intern.StrId, t: *TargetDef) bool {
-    if (artifact_supports_target(itn, req, consumer_target)) { ret t.name == consumer_target; }
-    ret artifact_supports_target(itn, req, t.name);
-}
-
-pub fun required_artifact_target_count(itn: *intern.Interner, targets: *TargetDef, target_count: u32, req: *ArtifactDef,
-    consumer_target: intern.StrId) u32 {
-    var n: u32 = 0;
-    var i: u32 = 0;
-    for (i < target_count) {
-        if (required_artifact_uses_target(itn, req, consumer_target, ?targets[i])) { n = n + 1; }
-        i = i + 1;
-    }
-    ret n;
 }
 
 pub fun expand_artifact_output(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt.TargetRegistry,
@@ -848,149 +818,387 @@ pub fun expand_artifact_output(alloc: *A.Allocator, itn: *intern.Interner, reg: 
     ret expand_project_path(alloc, tmpl, project_out, ?v, "an artifact output");
 }
 
-pub fun artifact_out_for_target(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt.TargetRegistry,
-    out_tmpl: intern.StrId,
-    a: *ArtifactDef, t: *TargetDef, profile: str) res[str, outcome.Fail] {
-    var v: TmplVars = tmpl_vars_of(itn, t, profile);
-
-    val out_tmpl_r: res[str, outcome.Fail] = must_lookup(itn, out_tmpl);
-    if (sel out_tmpl_r.err) { ret out_tmpl_r; }
-    val proj_out_r: res[str, outcome.Fail] = expand_project_path(alloc, out_tmpl_r.ok, "", ?v, "[project].out");
-    if (sel proj_out_r.err) { ret proj_out_r; }
-    val proj_out: str = proj_out_r.ok;
-
-    val art_out_r: res[str, outcome.Fail] = expand_artifact_output(alloc, itn, reg, a, proj_out, ?v);
-    if (sel art_out_r.err) {
-        str_free(alloc, proj_out);
-        ret art_out_r;
+fun need_cycle_chain(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
+    stack: *u32, depth: u32, from: u32, target: u32) str {
+    var s: str = "";
+    var i: u32 = from;
+    for (i < depth) {
+        if (str_empty(s)) { s = sfmt(alloc, "{}", idstr(itn, m.artifacts[stack[i]].name)); }
+        or                { s = sfmt(alloc, "{} -> {}", s, idstr(itn, m.artifacts[stack[i]].name)); }
+        i = i + 1;
     }
-    val art_out: str = art_out_r.ok;
-
-    val joined: str = join_path_canonical(alloc, proj_out, art_out);
-    str_free(alloc, art_out);
-    str_free(alloc, proj_out);
-    ret res[str, outcome.Fail].ok{joined};
+    ret sfmt(alloc, "{} -> {}", s, idstr(itn, m.artifacts[target].name));
 }
 
-pub fun artifact_required_by_any(itn: *intern.Interner, artifacts: *ArtifactDef, artifact_count: u32, ra: *ArtifactDef) bool {
+fun need_cycle_visit(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, idx: u32,
+    state: *u8, stack: *u32, depth: u32) err[outcome.Fail] {
+    if (state[idx] == 2) { ret err[outcome.Fail].ok{}; }
+    state[idx]   = 1;
+    stack[depth] = idx;
+
+    val a: *ArtifactDef = ?m.artifacts[idx];
+    var j: u32          = 0;
+    for (j < m.artifact_count) {
+        if (artifact_needs_artifact(itn, a, ?m.artifacts[j])) {
+            if (state[j] == 1) {
+                var from: u32 = 0;
+                for (from <= depth) {
+                    if (stack[from] == j) { brk; }
+                    from = from + 1;
+                }
+                if (from > depth) { from = 0; }
+                ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "mach.toml: artifact 'need' cycle: {}",
+                    need_cycle_chain(alloc, itn, m, stack, depth + 1, from, j)))};
+            }
+            val vr: err[outcome.Fail] = need_cycle_visit(alloc, itn, m, j, state, stack, depth + 1);
+            if (sel vr.err) { ret vr; }
+        }
+        j = j + 1;
+    }
+    state[idx] = 2;
+    ret err[outcome.Fail].ok{};
+}
+
+pub fun validate_need_cycles(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest) err[outcome.Fail] {
+    if (m.artifact_count == 0) { ret err[outcome.Fail].ok{}; }
+
+    val sr: res[*u8, A.Error] = A.allocate[u8](alloc, m.artifact_count::usize);
+    if (sel sr.err) { ret err[outcome.Fail].err{outcome.refused(sr.err)}; }
+    val state: *u8                = sr.ok;
+    val kr:    res[*u32, A.Error] = A.allocate[u32](alloc, m.artifact_count::usize);
+    if (sel kr.err) {
+        A.deallocate[u8](alloc, state, m.artifact_count::usize);
+        ret err[outcome.Fail].err{outcome.refused(kr.err)};
+    }
+    val stack: *u32 = kr.ok;
+
     var i: u32 = 0;
-    for (i < artifact_count) {
-        if (artifact_needs_artifact(itn, ?artifacts[i], ra)) { ret true; }
+    for (i < m.artifact_count) {
+        state[i] = 0;
+        i        = i + 1;
+    }
+
+    var result: err[outcome.Fail] = err[outcome.Fail].ok{};
+    i = 0;
+    for (i < m.artifact_count) {
+        result = need_cycle_visit(alloc, itn, m, i, state, stack, 0);
+        if (sel result.err) { brk; }
+        i = i + 1;
+    }
+    A.deallocate[u8](alloc, state, m.artifact_count::usize);
+    A.deallocate[u32](alloc, stack, m.artifact_count::usize);
+    ret result;
+}
+
+# whether an artifact's `targets` lists a target name or "*"
+# ---
+# itn:   interns "*"
+# a:     the artifact
+# tname: the target name
+# ret:   true when listed
+pub fun artifact_supports_target(itn: *intern.Interner, a: *ArtifactDef, tname: intern.StrId) bool {
+    val star: intern.StrId = intern_unwrap(itn, "*");
+    var i:    u32          = 0;
+    for (i < a.target_count) {
+        if (a.targets[i] == star || a.targets[i] == tname) { ret true; }
         i = i + 1;
     }
     ret false;
 }
 
-fun req_selected(itn: *intern.Interner, artifacts: *ArtifactDef, artifact_count: u32, consumer: *ArtifactDef,
-    ra: *ArtifactDef, whole_project: bool) bool {
-    if (whole_project)   { ret artifact_required_by_any(itn, artifacts, artifact_count, ra); }
-    if (consumer == nil) { ret false; }
-    ret artifact_needs_artifact(itn, consumer, ra);
+pub fun mk_tv(target: str, isa: str, os: str, abi: str, profile: str) TmplVars {
+    var v: TmplVars;
+    v.target    = target;
+    v.isa       = isa;
+    v.os        = os;
+    v.abi       = abi;
+    v.profile   = profile;
+    v.reqs      = nil;
+    v.req_count = 0;
+    ret v;
 }
 
-pub fun resolve_artifact_reqs(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt.TargetRegistry,
-    artifacts: *ArtifactDef, artifact_count: u32,
-    targets: *TargetDef, target_count: u32,
-    out_tmpl: intern.StrId,
-    consumer: *ArtifactDef, consumer_target: *TargetDef, profile: str,
-    whole_project: bool,
-    out_items: **ArtifactReq, out_count: *u32) err[outcome.Fail] {
-    @out_items = nil;
-    @out_count = 0;
-    if (artifact_count == 0)               { ret err[outcome.Fail].ok{}; }
-    if (consumer == nil && !whole_project) { ret err[outcome.Fail].ok{}; }
+test "mach.lang.manifest.expand_artifact_path:substitutes_only_the_artifact_vocabulary" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
 
-    var n: u32 = 0;
-    var j: u32 = 0;
-    for (j < artifact_count) {
-        if (req_selected(itn, artifacts, artifact_count, consumer, ?artifacts[j], whole_project)) { n = n + 1; }
-        j = j + 1;
-    }
-    if (n == 0) { ret err[outcome.Fail].ok{}; }
+    var items: [1]ArtifactReq;
+    items[0].name = "shader-a";
+    items[0].out  = "out/alt/debug/lib/shader-a.a";
 
-    val rr: res[*ArtifactReq, A.Error] = A.allocate[ArtifactReq](alloc, n::usize);
-    if (sel rr.err) { ret err[outcome.Fail].err{outcome.refused(rr.err)}; }
-    val items: *ArtifactReq = rr.ok;
-    var w:     u32          = 0;
-    j = 0;
-    for (j < artifact_count) {
-        val ra: *ArtifactDef = ?artifacts[j];
-        if (req_selected(itn, artifacts, artifact_count, consumer, ra, whole_project)) {
-            items[w].name = idstr(itn, ra.name);
-            items[w].out  = "";
-            var admitted: u32 = 0;
-            if (consumer_target != nil) {
-                admitted = required_artifact_target_count(itn, targets, target_count, ra, consumer_target.name);
-            }
-            or {
-                var ti: u32 = 0;
-                for (ti < target_count) {
-                    if (artifact_supports_target(itn, ra, targets[ti].name)) { admitted = admitted + 1; }
-                    ti = ti + 1;
-                }
-            }
-            if (admitted == 1) {
-                var chosen_target: *TargetDef = nil;
-                if (consumer_target != nil && required_artifact_uses_target(itn, ra, consumer_target.name, consumer_target)) {
-                    chosen_target = consumer_target;
-                }
-                or {
-                    var ti: u32 = 0;
-                    for (ti < target_count) {
-                        if (consumer_target != nil) {
-                            if (required_artifact_uses_target(itn, ra, consumer_target.name, ?targets[ti])) {
-                                chosen_target = ?targets[ti];
-                                brk;
-                            }
-                        }
-                        or {
-                            if (artifact_supports_target(itn, ra, targets[ti].name)) {
-                                chosen_target = ?targets[ti];
-                                brk;
-                            }
-                        }
-                        ti = ti + 1;
-                    }
-                }
-                if (chosen_target != nil) {
-                    val out_path_r: res[str, outcome.Fail] = artifact_out_for_target(alloc, itn, reg, out_tmpl, ra, chosen_target, profile);
-                    if (sel out_path_r.err) {
-                        var k: u32 = 0;
-                        for (k < w) {
-                            if (!str_empty(items[k].out)) { str_free(alloc, items[k].out); }
-                            k = k + 1;
-                        }
-                        A.deallocate[ArtifactReq](alloc, items, n::usize);
-                        ret err[outcome.Fail].err{out_path_r.err};
-                    }
-                    items[w].out = out_path_r.ok;
-                }
-            }
-            w = w + 1;
-        }
-        j = j + 1;
-    }
-    @out_items = items;
-    @out_count = n;
-    ret err[outcome.Fail].ok{};
+    val ok: res[str, TemplateError] = expand_artifact_path(?alloc, "{artifact.shader-a.out}", ?items[0], 1, "an `embed` path");
+    if (!(sel ok.ok && str_equals(ok.ok, "out/alt/debug/lib/shader-a.a"))) { code = 1; }
+
+    val plain: res[str, TemplateError] = expand_artifact_path(?alloc, "assets/logo.png", ?items[0], 1, "an `embed` path");
+    if (!(sel plain.ok && str_equals(plain.ok, "assets/logo.png"))) { code = 1; }
+
+    val other: res[str, TemplateError] = expand_artifact_path(?alloc, "{target.name}/x", ?items[0], 1, "an `embed` path");
+    if (!(sel other.err && str_contains(template_text(other.err), "only '{artifact.<id>.out}' may appear"))) { code = 1; }
+
+    val missing: res[str, TemplateError] = expand_artifact_path(?alloc, "{artifact.ghost.out}", ?items[0], 1, "an `embed` path");
+    if (!(sel missing.err && str_contains(template_text(missing.err), "does not require"))) { code = 1; }
+
+    val none_declared: res[str, TemplateError] = expand_artifact_path(?alloc, "{artifact.shader-a.out}", nil, 0, "an `embed` path");
+    if (!(sel none_declared.err && str_contains(template_text(none_declared.err), "does not require"))) { code = 1; }
+
+    val unterminated: res[str, TemplateError] = expand_artifact_path(?alloc, "{artifact.shader-a.out", ?items[0], 1, "an `embed` path");
+    if (sel unterminated.ok) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
 }
 
-pub fun resolve_artifact(itn: *intern.Interner, artifacts: *ArtifactDef, artifact_count: u32,
-    pick_has_artifact: bool, pick_artifact: str, pick_want_lib: bool) *ArtifactDef {
-    if (artifact_count == 0) { ret nil; }
+test "mach.lang.manifest.expand:project_out" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32      = 0;
+    var v:    TmplVars = mk_tv("linux", "x86_64", "linux", "sysv64", "release");
 
-    if (pick_has_artifact) {
-        val res_id: res[intern.StrId, A.Error] = intern.intern(itn, pick_artifact);
-        if (sel res_id.err) { ret nil; }
-        val id: intern.StrId = res_id.ok;
-        var i:  u32          = 0;
-        for (i < artifact_count) {
-            if (artifacts[i].name == id && artifacts[i].is_lib == pick_want_lib) { ret ?artifacts[i]; }
-            i = i + 1;
-        }
-        ret nil;
+    val r1: res[str, outcome.Fail] = expand(?alloc, "{project.out}/obj/x.o", "out/linux/release", ?v);
+    if (!(sel r1.ok && str_equals(r1.ok, "out/linux/release/obj/x.o"))) { code = 1; }
+
+    val r2: res[str, outcome.Fail] = expand(?alloc, "{project.out}/x", "", ?v);
+    if (!(sel r2.err && str_contains(outcome.describe(r2.err), "not available in [project].out"))) { code = 1; }
+
+    val r3: res[str, outcome.Fail] = expand(?alloc, "{bogus}", "o", ?v);
+    if (!(sel r3.err && str_contains(outcome.describe(r3.err), "unknown template variable"))) { code = 1; }
+
+    val r4: res[str, outcome.Fail] = expand(?alloc, "{target.isa}-{target.os}-{target.abi}", "o", ?v);
+    if (!(sel r4.ok && str_equals(r4.ok, "x86_64-linux-sysv64"))) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.expand_step_value:argv_env_bytes" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32      = 0;
+    var v:    TmplVars = mk_tv("linux", "x86_64", "linux", "sysv64", "release");
+
+    val argv_json: res[str, outcome.Fail] = expand_step_value(?alloc, "{\"x\":1}", "out/linux/release", ?v);
+    if (!(sel argv_json.ok && str_equals(argv_json.ok, "{\"x\":1}"))) { code = 1; }
+
+    val argv_adjacent: res[str, outcome.Fail] = expand_step_value(?alloc, "pre{target.name}{\"profile\":\"{profile.name}\"}post", "out/linux/release", ?v);
+    if (!(sel argv_adjacent.ok && str_equals(argv_adjacent.ok, "prelinux{\"profile\":\"release\"}post"))) { code = 1; }
+
+    val env_value: res[str, outcome.Fail] = expand_step_value(?alloc, "json={\"x\":1};out={project.out};literal={name};open={;close=}", "out/linux/release", ?v);
+    if (!(sel env_value.ok && str_equals(env_value.ok, "json={\"x\":1};out=out/linux/release;literal={name};open={;close=}"))) { code = 1; }
+
+    val target_typo: res[str, outcome.Fail] = expand_step_value(?alloc, "{target.nam}", "out", ?v);
+    if (!(sel target_typo.err && str_contains(outcome.describe(target_typo.err), "unknown reserved"))) { code = 1; }
+    val profile_unclosed: res[str, outcome.Fail] = expand_step_value(?alloc, "{profile.name", "out", ?v);
+    if (!(sel profile_unclosed.err && str_contains(outcome.describe(profile_unclosed.err), "unterminated reserved"))) { code = 1; }
+    val project_root: res[str, outcome.Fail] = expand_step_value(?alloc, "{project}", "out", ?v);
+    if (!(sel project_root.err && str_contains(outcome.describe(project_root.err), "unknown reserved"))) { code = 1; }
+    val target_extra: res[str, outcome.Fail] = expand_step_value(?alloc, "{target.name.extra}", "out", ?v);
+    if (!(sel target_extra.err && str_contains(outcome.describe(target_extra.err), "unknown reserved"))) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.expand_project_path:rejects_unsafe_substitutions" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32      = 0;
+    var v:    TmplVars = mk_tv("linux", "x86_64", "linux", "sysv64", "release");
+
+    v.target = "/tmp";
+    val absolute: res[str, outcome.Fail] = expand_project_path(?alloc, "{target.name}/app", "out", ?v, "test path");
+    if (!(sel absolute.err && str_contains(outcome.describe(absolute.err), "strict descendant"))) { code = 1; }
+
+    v.target = "../escape";
+    val parent: res[str, outcome.Fail] = expand_project_path(?alloc, "out/{target.name}/app", "out", ?v, "test path");
+    if (!(sel parent.err && str_contains(outcome.describe(parent.err), "strict descendant"))) { code = 1; }
+
+    v.target = "linux//debug";
+    val repeated: res[str, outcome.Fail] = expand_project_path(?alloc, "out/{target.name}/app", "out", ?v, "test path");
+    if (!(sel repeated.err && str_contains(outcome.describe(repeated.err), "strict descendant"))) { code = 1; }
+
+    v.target = "linux/./debug";
+    val dot: res[str, outcome.Fail] = expand_project_path(?alloc, "out/{target.name}/app", "out", ?v, "test path");
+    if (!(sel dot.err && str_contains(outcome.describe(dot.err), "strict descendant"))) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.expand:closed_set" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32      = 0;
+    var v:    TmplVars = mk_tv("linux", "x86_64", "linux", "sysv64", "release");
+
+    val ext: res[str, outcome.Fail] = expand(?alloc, "bin/app{ext}", "out", ?v);
+    if (!(sel ext.err && str_contains(outcome.describe(ext.err), "unknown template variable"))) { code = 1; }
+    val nm: res[str, outcome.Fail] = expand(?alloc, "test/{name}", "out", ?v);
+    if (!(sel nm.err && str_contains(outcome.describe(nm.err), "unknown template variable"))) { code = 1; }
+    val good: res[str, outcome.Fail] = expand(?alloc, "{project.out}/{target.name}/{profile.name}", "o", ?v);
+    if (!(sel good.ok && str_equals(good.ok, "o/linux/release"))) { code = 1; }
+    val tup: res[str, outcome.Fail] = expand(?alloc, "{target.isa}/{target.os}/{target.abi}", "o", ?v);
+    if (!(sel tup.ok && str_equals(tup.ok, "x86_64/linux/sysv64"))) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.expand_artifact_path:allocation_failure_is_internal_and_rejection_is_owned" {
+    var t:      alloc_test.Testing;
+    val make_r: err[A.Error] = alloc_test.make(?t);
+    if (sel make_r.err) { ret 1; }
+    fin { alloc_test.dnit(?t); }
+    val alloc: *A.Allocator = alloc_test.allocator_of(?t);
+    var items: [1]ArtifactReq;
+    items[0].name = "payload";
+    items[0].out  = "out/payload.bin";
+    alloc_test.fail_at_ordinal(?t, alloc_test.attempt_count(?t) + 1);
+    val valid: res[str, TemplateError] = expand_artifact_path(alloc,
+        "{artifact.payload.out}", ?items[0], 1, "embed");
+    if (sel valid.ok) {
+        str_free(alloc, valid.ok);
+        ret 2;
     }
+    val valid_error: TemplateError = valid.err;
+    if (!sel valid_error.internal) {
+        template_error_dnit(alloc, valid_error);
+        ret 3;
+    }
+    alloc_test.fail_at_ordinal(?t, alloc_test.attempt_count(?t) + 1);
+    val refused: res[str, TemplateError] = expand_artifact_path(alloc,
+        "{artifact.absent.out}", ?items[0], 1, "embed");
+    if (sel refused.ok) {
+        str_free(alloc, refused.ok);
+        ret 4;
+    }
+    val refused_error: TemplateError = refused.err;
+    if (!sel refused_error.internal) {
+        template_error_dnit(alloc, refused_error);
+        ret 5;
+    }
+    alloc_test.fail_at_ordinal(?t, 0);
+    val rejected: res[str, TemplateError] = expand_artifact_path(alloc,
+        "{artifact.absent.out}", ?items[0], 1, "embed");
+    if (sel rejected.ok) {
+        str_free(alloc, rejected.ok);
+        ret 6;
+    }
+    val rejected_error: TemplateError = rejected.err;
+    val was_rejected:   bool          = sel rejected_error.rejected;
+    template_error_dnit(alloc, rejected_error);
+    if (!was_rejected)                                                  { ret 7; }
+    if (alloc_test.leaked(?t) || alloc_test.double_free_count(?t) != 0) { ret 8; }
+    ret 0;
+}
 
-    if (artifact_count == 1) { ret ?artifacts[0]; }
-    ret nil;
+fun t_planner_template_owner(refuse: bool) i32 {
+    var t:      alloc_test.Testing;
+    val make_r: err[A.Error] = alloc_test.make(?t);
+    if (sel make_r.err) { ret 1; }
+    fin { alloc_test.dnit(?t); }
+    val alloc: *A.Allocator = alloc_test.allocator_of(?t);
+    var reqs:  [1]ArtifactReq;
+    reqs[0].name = "payload";
+    reqs[0].out  = "out/payload.bin";
+    var vars: TmplVars = tmpl_vars_of_reqs(?reqs[0], 1);
+    var i:    u32      = 0;
+    for (i < 2) {
+        val before: usize = alloc_test.attempt_count(?t);
+        if (refuse) { alloc_test.fail_at_ordinal(?t, before + 1); }
+        var result: res[str, outcome.Fail];
+        if (i == 0) { result = expand(alloc, "{artifact.payload.out}", "", ?vars); }
+        or          { result = expand_step_value(alloc, "{artifact.payload.out}", "", ?vars); }
+        if (refuse) {
+            if (sel result.ok) {
+                str_free(alloc, result.ok);
+                ret 2;
+            }
+            if (!str_equals(outcome.describe(result.err), "out of memory")) { ret 3; }
+        }
+        or {
+            if (sel result.err) { ret 4; }
+            val text:    str   = result.ok;
+            val correct: bool  = str_equals(text, reqs[0].out);
+            val live:    usize = alloc_test.live_count(?t);
+            str_free(alloc, text);
+            if (!correct)  { ret 5; }
+            if (live != 1) { ret 6; }
+        }
+        if (alloc_test.attempt_count(?t) != before + 1)                                                          { ret 7; }
+        if (alloc_test.leaked(?t) || alloc_test.double_free_count(?t) != 0 || alloc_test.tracking_exhausted(?t)) { ret 8; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.manifest.template_lookup:successful_expansion_owns_only_its_output" {
+    ret t_planner_template_owner(false);
+}
+
+test "mach.lang.manifest.template_lookup:output_allocation_refusal_is_not_overwritten" {
+    ret t_planner_template_owner(true);
+}
+
+test "mach.lang.manifest.template_lookup:diagnostics_release_temporary_identifiers" {
+    var t:      alloc_test.Testing;
+    val make_r: err[A.Error] = alloc_test.make(?t);
+    if (sel make_r.err) { ret 1; }
+    fin { alloc_test.dnit(?t); }
+    val alloc: *A.Allocator = alloc_test.allocator_of(?t);
+    var reqs:  [1]ArtifactReq;
+    reqs[0].name = "payload";
+    reqs[0].out  = "";
+    var vars:      TmplVars = tmpl_vars_of_reqs(?reqs[0], 1);
+    var templates: [3]str;
+    templates[0] = "{artifact.payload.out}";
+    templates[1] = "{artifact.absent.out}";
+    templates[2] = "{absent}";
+    var i: u32 = 0;
+    for (i < 3) {
+        val before: usize                  = alloc_test.attempt_count(?t);
+        val result: res[str, outcome.Fail] = expand(alloc, templates[i], "", ?vars);
+        if (sel result.ok) {
+            str_free(alloc, result.ok);
+            ret 2;
+        }
+        val message:     str   = outcome.describe(result.err);
+        val names_input: bool  = str_contains(message, templates[i]);
+        val live:        usize = alloc_test.live_count(?t);
+        str_free(alloc, message);
+        if (!names_input || live != 1 || alloc_test.leaked(?t)) { ret 3; }
+        val attempts: usize = alloc_test.attempt_count(?t) - before;
+        var ordinal:  usize = 1;
+        for (ordinal <= attempts) {
+            alloc_test.fail_at_ordinal(?t, alloc_test.attempt_count(?t) + ordinal);
+            val refused: res[str, outcome.Fail] = expand(alloc, templates[i], "", ?vars);
+            if (sel refused.ok) {
+                str_free(alloc, refused.ok);
+                ret 4;
+            }
+            val reason: str = outcome.describe(refused.err);
+            if (!str_equals(reason, "out of memory")) {
+                str_free(alloc, reason);
+                ret 5;
+            }
+            if (alloc_test.leaked(?t) || alloc_test.double_free_count(?t) != 0 || alloc_test.tracking_exhausted(?t)) { ret 6; }
+            ordinal = ordinal + 1;
+        }
+        alloc_test.fail_at_ordinal(?t, 0);
+        i = i + 1;
+    }
+    ret 0;
 }

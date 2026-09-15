@@ -1,5 +1,8 @@
 use mach.lang.build.outcome;
-use std.format;
+use std.allocator.arena;
+use std.allocator.page;
+use alloc_test: std.allocator.testing;
+use std.data.toml;
 use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -9,30 +12,31 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_contains;
 use std.types.string.str_empty;
 use std.types.string.str_equals;
+use std.types.string.str_len;
 
 use A: std.allocator;
 
+use mach.lang.fail;
 use mach.lang.intern;
 use tgt: mach.lang.target;
+use mach.lang.target.abi;
+use target_testing: mach.lang.target.testing;
 
-use mach.lang.manifest.artifact.AMBIGUOUS_ARTIFACT_MSG;
-use mach.lang.manifest.artifact.ArtifactDef;
-use mach.lang.manifest.artifact.LIBKIND_SHARED;
-use mach.lang.manifest.artifact.LIBKIND_STATIC;
-use mach.lang.manifest.artifact.LibKind;
+use mach.lang.manifest.artifact.ArtifactReq;
 use mach.lang.manifest.artifact.TmplVars;
-use mach.lang.manifest.artifact.artifact_pinned_target;
+use mach.lang.manifest.artifact.artifact_needs_artifact;
 use mach.lang.manifest.artifact.artifact_supports_target;
-use mach.lang.manifest.artifact.artifact_target_names;
+use mach.lang.manifest.artifact.expand;
 use mach.lang.manifest.artifact.expand_artifact_output;
 use mach.lang.manifest.artifact.expand_project_path;
+use mach.lang.manifest.artifact.find_artifact;
 use mach.lang.manifest.artifact.find_artifact_by_name;
-use mach.lang.manifest.artifact.resolve_artifact;
+use mach.lang.manifest.artifact.mk_tv;
 use mach.lang.manifest.artifact.tmpl_vars_of;
-use mach.lang.manifest.link.LINK_LOCAL;
-use mach.lang.manifest.link.LinkDef;
+use mach.lang.manifest.artifact.tmpl_vars_of_reqs;
 use mach.lang.manifest.link.LinkRequirement;
 use mach.lang.manifest.link.find_link_by_name;
 use mach.lang.manifest.link.finish_link_requirements;
@@ -40,26 +44,61 @@ use mach.lang.manifest.link.free_link_claims;
 use mach.lang.manifest.link.link_matches_target;
 use mach.lang.manifest.link.link_requirement;
 use mach.lang.manifest.link.merge_link_claims;
-use mach.lang.manifest.parse.free_strarr;
+use mach.lang.manifest.load.demo_src;
+use mach.lang.manifest.load.need_artifact;
+use mach.lang.manifest.load.need_err;
+use mach.lang.manifest.load.need_head;
+use mach.lang.manifest.load.parse;
+use mach.lang.manifest.load.tparse;
+use mach.lang.manifest.load.tparse_lenient;
+use mach.lang.manifest.model.ArtifactDef;
+use mach.lang.manifest.model.LINK_LOCAL;
+use mach.lang.manifest.model.LINK_SYSTEM;
+use mach.lang.manifest.model.LinkDef;
+use mach.lang.manifest.model.MOPT_DEBUG;
+use mach.lang.manifest.model.MOPT_RELEASE;
+use mach.lang.manifest.model.MOpt;
+use mach.lang.manifest.model.Manifest;
+use mach.lang.manifest.model.ProfileDef;
+use mach.lang.manifest.model.SIMD_REQUIRE;
+use mach.lang.manifest.model.SIMD_SCALARIZE;
+use mach.lang.manifest.model.SimdMode;
+use mach.lang.manifest.model.StepDef;
+use mach.lang.manifest.model.TargetDef;
+use mach.lang.manifest.model.dnit;
+use mach.lang.manifest.parse.PlanAllocProbe;
 use mach.lang.manifest.parse.idstr;
 use mach.lang.manifest.parse.intern_unwrap;
-use mach.lang.manifest.parse.join_path_canonical;
 use mach.lang.manifest.parse.must_lookup;
 use mach.lang.manifest.parse.need_matches;
+use mach.lang.manifest.parse.plan_probe_make;
 use mach.lang.manifest.parse.sfmt;
-use mach.lang.manifest.project.AMBIGUOUS_TARGET_MSG;
-use mach.lang.manifest.project.MOpt;
-use mach.lang.manifest.project.ProfileDef;
-use mach.lang.manifest.project.ResolvedProfile;
-use mach.lang.manifest.project.ResolvedTarget;
-use mach.lang.manifest.project.SimdMode;
-use mach.lang.manifest.project.TargetDef;
+use mach.lang.manifest.parse.tinit;
+use mach.lang.manifest.project.MISSING_PROFILE_MESSAGE;
+use mach.lang.manifest.project.builtin_profile;
 use mach.lang.manifest.project.find_target_by_name;
-use mach.lang.manifest.project.resolve_profile;
+use mach.lang.manifest.project.host_isa_name;
+use mach.lang.manifest.project.host_os_name;
 use mach.lang.manifest.project.target_matches_host;
-use mach.lang.manifest.step.StepDef;
-use mach.lang.manifest.step.step_producing_out;
+use mach.lang.manifest.step.plan_visit;
 
+# the library shape of a build unit, decoded from `[artifact.<name>].kind`
+pub def LibKind: u8;
+
+# `kind = "static"`; also the value a `bin` unit carries, so check `is_lib` first
+pub val LIBKIND_STATIC: LibKind = 0;
+# `kind = "shared"`
+pub val LIBKIND_SHARED: LibKind = 1;
+
+# what the caller asked to build: a target, a profile, and optionally an
+# artifact. empty strings mean "not selected"
+# ---
+# target:       a declared target name, or "" to resolve `native` (or the artifact's pinned target)
+# profile:      a declared profile name, or "" for the default profile
+# artifact:     an artifact name, read only when `has_artifact`
+# want_lib:     with `has_artifact`, whether the named artifact must be a library
+#               (true) or a `bin` (false); a name with the wrong shape does not match
+# has_artifact: whether `artifact` and `want_lib` are set
 pub rec Selection {
     target:       str;
     profile:      str;
@@ -68,6 +107,34 @@ pub rec Selection {
     has_artifact: bool;
 }
 
+# one resolved build cell: a target, a profile, and an artifact with every path
+# expanded. produced by `resolve_build_unit`; `libs` is owned by the unit
+# ---
+# target:        the resolved target; points into the manifest, except for the host
+#                target synthesized when the manifest declares no targets
+# artifact:      the resolved artifact, pointing into the manifest
+# target_name:   `target.name`
+# profile_name:  the resolved profile's name
+# entry:         the artifact's `entry`
+# bin_path:      the artifact's output: the expanded `[project].out` joined with the
+#                expanded artifact `out`
+# obj_root:      `<expanded project out>/obj`
+# ir_root:       `<expanded project out>/ir`
+# asm_root:      `<expanded project out>/asm`
+# test_root:     `<expanded project out>/test/{name}`, with `{name}` left literal for
+#                the test runner to fill
+# opt:           from the resolved profile
+# debug:         from the resolved profile
+# simd:          from the resolved profile
+# vectorize:     from the resolved profile
+# float_reassoc: from the resolved profile
+# is_lib:        the artifact's `is_lib`
+# kind:          LIBKIND_SHARED for `kind = "shared"`, LIBKIND_STATIC otherwise, including for a `bin`
+# libs:          the artifact's `link` entries that match the target, resolved in `link`
+#                order and sized exactly; a `link` name matching no `[link.*]` table is skipped
+# lib_count:     length of `libs`
+# warned:        `native` matched no declared target for the host and a declared target
+#                was chosen anyway; the driver prints the warning
 pub rec BuildUnit {
     target:        *TargetDef;
     artifact:      *ArtifactDef;
@@ -91,23 +158,103 @@ pub rec BuildUnit {
     warned:        bool;
 }
 
-rec ArtifactCandidates {
-    count:         u32;
-    sole:          *ArtifactDef;
-    first:         *ArtifactDef;
-    default_count: u32;
-    chosen:        *ArtifactDef;
+# the outcome of target resolution for a selection
+# ---
+# target: the chosen target; points into the manifest unless synthesized for a
+#         manifest with no `[target.*]`, in which case it is allocated and never freed by `dnit`
+# warned: `native` matched no host target and a declared target was chosen anyway
+# target borrows its manifest-owned declaration until manifest destruction
+pub rec ResolvedTarget {
+    target: *TargetDef;
+    warned: bool;
 }
 
-pub fun resolve_target(alloc: *A.Allocator, itn: *intern.Interner,
-    targets: *TargetDef, target_count: u32,
-    native_target: *TargetDef, default_target: intern.StrId,
-    selector: str, art: *ArtifactDef) res[ResolvedTarget, outcome.Fail] {
+# the profile a selection resolves to, copied out of its `ProfileDef`
+# ---
+# name:          the profile's name
+# opt:           as `ProfileDef`
+# debug:         as `ProfileDef`
+# simd:          as `ProfileDef`
+# vectorize:     as `ProfileDef`
+# float_reassoc: as `ProfileDef`
+pub rec ResolvedProfile {
+    name:          intern.StrId;
+    opt:           MOpt;
+    debug:         bool;
+    simd:          SimdMode;
+    vectorize:     bool;
+    float_reassoc: bool;
+}
+
+fun free_path_strings(alloc: *A.Allocator, paths: *str, count: u32) {
+    if (paths == nil) { ret; }
+    var i: u32 = 0;
+    for (i < count) {
+        if (paths[i] != nil) { str_free(alloc, paths[i]); }
+        i = i + 1;
+    }
+}
+
+fun seg_dup(alloc: *A.Allocator, tmpl: str, start: usize, end: usize) str {
+    val n:       usize             = end - start;
+    val res_buf: res[*u8, A.Error] = A.allocate[u8](alloc, n + 1);
+    if (sel res_buf.err) { ret ""; }
+    val buf: *u8   = res_buf.ok;
+    var i:   usize = 0;
+    for (i < n) {
+        buf[i] = tmpl[start + i];
+        i      = i + 1;
+    }
+    buf[n] = 0;
+    ret buf::str;
+}
+
+fun artifact_pinned_target(itn: *intern.Interner, m: *Manifest, a: *ArtifactDef) *TargetDef {
+    val host_os:   u32 = tgt.host_os_id();
+    val host_arch: u32 = tgt.host_arch_id();
+
+    var only:       *TargetDef = nil;
+    var count:      u32        = 0;
+    var host_first: *TargetDef = nil;
+    var host_count: u32        = 0;
+    var i:          u32        = 0;
+    for (i < m.target_count) {
+        if (artifact_supports_target(itn, a, m.targets[i].name)) {
+            if (count == 0) { only = ?m.targets[i]; }
+            count = count + 1;
+            if (target_matches_host(itn, ?m.targets[i], host_os, host_arch)) {
+                if (host_count == 0) { host_first = ?m.targets[i]; }
+                host_count = host_count + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (count == 1)      { ret only; }
+    if (host_count == 1) { ret host_first; }
+    ret nil;
+}
+
+fun artifact_target_names(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, a: *ArtifactDef) str {
+    var s: str = "";
+    var i: u32 = 0;
+    for (i < m.target_count) {
+        if (artifact_supports_target(itn, a, m.targets[i].name)) {
+            if (!str_empty(s)) { s = sfmt(alloc, "{}, ", s); }
+            val opt_name: opt[str] = intern.lookup(itn, m.targets[i].name);
+            if (sel opt_name.some) { s = sfmt(alloc, "{}{}", s, opt_name.some); }
+        }
+        i = i + 1;
+    }
+    ret s;
+}
+
+fun resolve_target(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, selector: str,
+    art: *ArtifactDef) res[ResolvedTarget, outcome.Fail] {
     val host_os:   u32 = tgt.host_os_id();
     val host_arch: u32 = tgt.host_arch_id();
 
     if (str_empty(selector) && art != nil) {
-        val pinned: *TargetDef = artifact_pinned_target(itn, targets, target_count, art);
+        val pinned: *TargetDef = artifact_pinned_target(itn, m, art);
         if (pinned != nil) {
             var rt: ResolvedTarget;
             rt.target = pinned;
@@ -118,13 +265,13 @@ pub fun resolve_target(alloc: *A.Allocator, itn: *intern.Interner,
 
     var name: str = selector;
     if (str_empty(name)) {
-        val opt_target: opt[str] = intern.lookup(itn, default_target);
+        val opt_target: opt[str] = intern.lookup(itn, m.default_target);
         if (sel opt_target.none) { ret res[ResolvedTarget, outcome.Fail].err{outcome.user("internal: default target not interned")}; }
         name = opt_target.some;
     }
 
     if (!str_equals(name, "native")) {
-        val d: *TargetDef = find_target_by_name(itn, targets, target_count, name);
+        val d: *TargetDef = find_target_by_name(itn, m, name);
         if (d == nil) { ret res[ResolvedTarget, outcome.Fail].err{outcome.user(sfmt(alloc, "mach.toml: no target named '{}'", name))}; }
         var rt: ResolvedTarget;
         rt.target = d;
@@ -136,11 +283,11 @@ pub fun resolve_target(alloc: *A.Allocator, itn: *intern.Interner,
     var match_count: u32        = 0;
     var names:       str        = "";
     var i:           u32        = 0;
-    for (i < target_count) {
-        if (target_matches_host(itn, ?targets[i], host_os, host_arch)) {
-            if (first_match == nil) { first_match = ?targets[i]; }
+    for (i < m.target_count) {
+        if (target_matches_host(itn, ?m.targets[i], host_os, host_arch)) {
+            if (first_match == nil) { first_match = ?m.targets[i]; }
             if (match_count > 0)    { names = sfmt(alloc, "{}, ", names); }
-            val opt_name: opt[str] = intern.lookup(itn, targets[i].name);
+            val opt_name: opt[str] = intern.lookup(itn, m.targets[i].name);
             if (sel opt_name.some) { names = sfmt(alloc, "{}{}", names, opt_name.some); }
             match_count = match_count + 1;
         }
@@ -156,14 +303,14 @@ pub fun resolve_target(alloc: *A.Allocator, itn: *intern.Interner,
         rt.warned = false;
         ret res[ResolvedTarget, outcome.Fail].ok{rt};
     }
-    if (target_count > 1) {
+    if (m.target_count > 1) {
         var chosen:        *TargetDef = nil;
         var default_count: u32        = 0;
         i = 0;
-        for (i < target_count) {
-            if (targets[i].is_default) {
+        for (i < m.target_count) {
+            if (m.targets[i].is_default) {
                 default_count = default_count + 1;
-                chosen        = ?targets[i];
+                chosen        = ?m.targets[i];
             }
             i = i + 1;
         }
@@ -177,28 +324,530 @@ pub fun resolve_target(alloc: *A.Allocator, itn: *intern.Interner,
         rt.warned = true;
         ret res[ResolvedTarget, outcome.Fail].ok{rt};
     }
-    if (target_count == 0) {
-        if (native_target == nil) { ret res[ResolvedTarget, outcome.Fail].err{outcome.user("internal: manifest has no native target owner")}; }
-        rt.target = native_target;
+    if (m.target_count == 0) {
+        if (m.native_target == nil) { ret res[ResolvedTarget, outcome.Fail].err{outcome.user("internal: manifest has no native target owner")}; }
+        rt.target = m.native_target;
         rt.warned = false;
         ret res[ResolvedTarget, outcome.Fail].ok{rt};
     }
-    rt.target = ?targets[0];
+    rt.target = ?m.targets[0];
     rt.warned = true;
     ret res[ResolvedTarget, outcome.Fail].ok{rt};
 }
 
-pub fun cell_supported(alloc: *A.Allocator, itn: *intern.Interner,
-    targets: *TargetDef, target_count: u32,
-    native_target: *TargetDef, default_target: intern.StrId,
-    artifacts: *ArtifactDef, artifact_count: u32,
-    pick: Selection) res[bool, outcome.Fail] {
-    val res_target: res[ResolvedTarget, outcome.Fail] = resolve_target(alloc, itn, targets, target_count, native_target, default_target, pick.target, nil);
+fun profile_resolved(pf: *ProfileDef) ResolvedProfile {
+    var rp: ResolvedProfile;
+    rp.name          = pf.name;
+    rp.opt           = pf.opt;
+    rp.debug         = pf.debug;
+    rp.simd          = pf.simd;
+    rp.vectorize     = pf.vectorize;
+    rp.float_reassoc = pf.float_reassoc;
+    ret rp;
+}
+
+# choose the profile a selection names. a named profile must be declared, except
+# that a dependency manifest with no profiles at all answers "debug" and
+# "release" with the synthesized ones. an empty name takes the sole declared
+# profile, else the one with `default = true`, else the synthesized debug
+# profile of a dependency manifest. several declared profiles with none marked
+# default are refused: no profile is ever selected by table order
+# ---
+# alloc: owns error text
+# itn:   interns the name
+# m:     the manifest
+# pick:  the profile name, or "" for the default
+# ret:   the profile; err "mach.toml: no profile named '<pick>'" or, with an empty
+#        name, an error when more than one profile is marked default
+pub fun resolve_profile(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, pick: str) res[ResolvedProfile, outcome.Fail] {
+    if (!str_empty(pick)) {
+        val res_id: res[intern.StrId, A.Error] = intern.intern(itn, pick);
+        if (sel res_id.err) { ret res[ResolvedProfile, outcome.Fail].err{outcome.refused(res_id.err)}; }
+        val id: intern.StrId = res_id.ok;
+        var i:  u32          = 0;
+        for (i < m.profile_count) {
+            if (m.profiles[i].name == id) { ret res[ResolvedProfile, outcome.Fail].ok{profile_resolved(?m.profiles[i])}; }
+            i = i + 1;
+        }
+        if (m.profile_count == 0 && str_equals(pick, "debug")) {
+            var debug: ProfileDef = builtin_profile(itn, "debug", MOPT_DEBUG, true, false, true);
+            ret res[ResolvedProfile, outcome.Fail].ok{profile_resolved(?debug)};
+        }
+        if (m.profile_count == 0 && str_equals(pick, "release")) {
+            var release: ProfileDef = builtin_profile(itn, "release", MOPT_RELEASE, false, true, false);
+            ret res[ResolvedProfile, outcome.Fail].ok{profile_resolved(?release)};
+        }
+        ret res[ResolvedProfile, outcome.Fail].err{outcome.user(sfmt(alloc, "mach.toml: no profile named '{}'", pick))};
+    }
+
+    if (m.profile_count == 1) {
+        ret res[ResolvedProfile, outcome.Fail].ok{profile_resolved(?m.profiles[0])};
+    }
+
+    if (m.profile_count > 1) {
+        var i:     u32         = 0;
+        var found: *ProfileDef = nil;
+        for (i < m.profile_count) {
+            if (m.profiles[i].is_default) {
+                if (found != nil) {
+                    ret res[ResolvedProfile, outcome.Fail].err{outcome.user("mach.toml: multiple declared profiles have 'default = true'; exactly one is allowed")};
+                }
+                found = ?m.profiles[i];
+            }
+            i = i + 1;
+        }
+        if (found == nil) {
+            ret res[ResolvedProfile, outcome.Fail].err{outcome.user(AMBIGUOUS_PROFILE_MSG)};
+        }
+        ret res[ResolvedProfile, outcome.Fail].ok{profile_resolved(found)};
+    }
+
+    var debug: ProfileDef = builtin_profile(itn, "debug", MOPT_DEBUG, true, false, true);
+    ret res[ResolvedProfile, outcome.Fail].ok{profile_resolved(?debug)};
+}
+
+# the artifact a selection names: with `has_artifact`, the one whose name and
+# `is_lib` both match `pick`; otherwise the sole declared artifact
+# ---
+# itn:  interns the name
+# m:    the manifest
+# pick: the selection
+# ret:  the artifact, or nil when none is declared, the name has no match of
+#       the requested shape, or several artifacts are declared and none was named
+pub fun resolve_artifact(itn: *intern.Interner, m: *Manifest, pick: Selection) *ArtifactDef {
+    if (m.artifact_count == 0) { ret nil; }
+
+    if (pick.has_artifact) {
+        val res_id: res[intern.StrId, A.Error] = intern.intern(itn, pick.artifact);
+        if (sel res_id.err) { ret nil; }
+        val id: intern.StrId = res_id.ok;
+        var i:  u32          = 0;
+        for (i < m.artifact_count) {
+            if (m.artifacts[i].name == id && m.artifacts[i].is_lib == pick.want_lib) { ret ?m.artifacts[i]; }
+            i = i + 1;
+        }
+        ret nil;
+    }
+
+    if (m.artifact_count == 1) { ret ?m.artifacts[0]; }
+    ret nil;
+}
+
+fun join_path_canonical(alloc: *A.Allocator, a: str, b: str) str {
+    if (str_empty(a)) { ret seg_dup(alloc, b, 0, str_len(b)); }
+    if (str_empty(b)) { ret seg_dup(alloc, a, 0, str_len(a)); }
+    val al:    usize = str_len(a);
+    var end_a: usize = al;
+    if (a[al - 1] == '/') { end_a = al - 1; }
+    var start_b: usize = 0;
+    if (b[0] == '/') { start_b = 1; }
+
+    val a_sub:  str = seg_dup(alloc, a, 0, end_a);
+    val b_sub:  str = seg_dup(alloc, b, start_b, str_len(b));
+    val joined: str = sfmt(alloc, "{}/{}", a_sub, b_sub);
+    str_free(alloc, a_sub);
+    str_free(alloc, b_sub);
+    ret joined;
+}
+
+# find the build step whose expanded `out` list contains a path
+# ---
+# alloc:         owns temporary expansions
+# itn:           resolves step strings
+# m:             the manifest
+# expanded_path: the path to match, already expanded
+# proj_out:      the expanded `[project].out`
+# v:             the template values
+# ret:           the index into `m.steps` of the first producing step, or -1. a step
+#                output that fails to expand is skipped
+fun step_producing_out(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
+    expanded_path: str, proj_out: str, v: *TmplVars) i64 {
+    var si: u32 = 0;
+    for (si < m.step_count) {
+        val s:  *StepDef = ?m.steps[si];
+        var oi: u32      = 0;
+        for (oi < s.out_count) {
+            val raw_out: str                    = idstr(itn, s.out[oi]);
+            val exp_r:   res[str, outcome.Fail] = expand_project_path(alloc, raw_out, proj_out, v, "a build step output");
+            if (sel exp_r.ok) {
+                val exp: str  = exp_r.ok;
+                val eq:  bool = str_equals(exp, expanded_path);
+                str_free(alloc, exp);
+                if (eq) { ret si::i64; }
+            }
+            oi = oi + 1;
+        }
+        si = si + 1;
+    }
+    ret -1;
+}
+
+# whether some build step produces a path; `step_producing_out` as a bool
+# ---
+# alloc:         owns temporary expansions
+# itn:           resolves step strings
+# m:             the manifest
+# expanded_path: the path to match, already expanded
+# proj_out:      the expanded `[project].out`
+# v:             the template values
+# ret:           true when a step lists the path in `out`
+pub fun local_path_demanded_by_step(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
+    expanded_path: str, proj_out: str, v: *TmplVars) bool {
+    ret step_producing_out(alloc, itn, m, expanded_path, proj_out, v) >= 0;
+}
+
+# whether a required artifact is built for a target when its consumer builds for
+# `consumer_target`: only that target when `req` supports it, otherwise every
+# target `req` supports
+# ---
+# itn:             interns "*"
+# req:             the required artifact
+# consumer_target: the consumer's target name
+# t:               the target asked about
+# ret:             true when `req` is built for `t` on behalf of that consumer
+pub fun required_artifact_uses_target(itn: *intern.Interner, req: *ArtifactDef,
+    consumer_target: intern.StrId, t: *TargetDef) bool {
+    if (artifact_supports_target(itn, req, consumer_target)) { ret t.name == consumer_target; }
+    ret artifact_supports_target(itn, req, t.name);
+}
+
+# how many declared targets `required_artifact_uses_target` admits for a requirement
+# ---
+# itn:             interns "*"
+# m:               the manifest
+# req:             the required artifact
+# consumer_target: the consumer's target name
+# ret:             the count; 1 means `{artifact.<id>.out}` has a single answer
+fun required_artifact_target_count(itn: *intern.Interner, m: *Manifest, req: *ArtifactDef,
+    consumer_target: intern.StrId) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < m.target_count) {
+        if (required_artifact_uses_target(itn, req, consumer_target, ?m.targets[i])) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+fun artifact_out_for_target(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt.TargetRegistry, m: *Manifest,
+    a: *ArtifactDef, t: *TargetDef, profile: str) res[str, outcome.Fail] {
+    var v: TmplVars = tmpl_vars_of(itn, t, profile);
+
+    val out_tmpl_r: res[str, outcome.Fail] = must_lookup(itn, m.out_tmpl);
+    if (sel out_tmpl_r.err) { ret out_tmpl_r; }
+    val proj_out_r: res[str, outcome.Fail] = expand_project_path(alloc, out_tmpl_r.ok, "", ?v, "[project].out");
+    if (sel proj_out_r.err) { ret proj_out_r; }
+    val proj_out: str = proj_out_r.ok;
+
+    val art_out_r: res[str, outcome.Fail] = expand_artifact_output(alloc, itn, reg, a, proj_out, ?v);
+    if (sel art_out_r.err) {
+        str_free(alloc, proj_out);
+        ret art_out_r;
+    }
+    val art_out: str = art_out_r.ok;
+
+    val joined: str = join_path_canonical(alloc, proj_out, art_out);
+    str_free(alloc, art_out);
+    str_free(alloc, proj_out);
+    ret res[str, outcome.Fail].ok{joined};
+}
+
+# whether any artifact's `need` selects `ra`
+# ---
+# itn: resolves the names
+# m:   the manifest
+# ra:  the candidate requirement
+# ret: true when some other artifact needs it
+pub fun artifact_required_by_any(itn: *intern.Interner, m: *Manifest, ra: *ArtifactDef) bool {
+    var i: u32 = 0;
+    for (i < m.artifact_count) {
+        if (artifact_needs_artifact(itn, ?m.artifacts[i], ra)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun req_selected(itn: *intern.Interner, m: *Manifest, consumer: *ArtifactDef,
+    ra: *ArtifactDef, whole_project: bool) bool {
+    if (whole_project)   { ret artifact_required_by_any(itn, m, ra); }
+    if (consumer == nil) { ret false; }
+    ret artifact_needs_artifact(itn, consumer, ra);
+}
+
+# list the artifacts a consumer requires, each with its output path when that
+# path is unique, for `{artifact.<id>.out}` expansion
+# ---
+# alloc:           owns the returned array and each non-empty `out` string
+# itn:             resolves names
+# m:               the manifest
+# consumer:        the requiring artifact; nil with `whole_project` false yields nothing
+# consumer_target: the consumer's target
+# profile:         the profile name the outputs expand with
+# whole_project:   select every artifact some artifact needs instead of `consumer`'s
+# out_items:       receives the array, or nil when nothing is required
+# out_count:       receives its length
+# ret:             ok; err from the output path expansion, with the array freed
+pub fun resolve_artifact_reqs(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt.TargetRegistry, m: *Manifest,
+    consumer: *ArtifactDef, consumer_target: *TargetDef, profile: str,
+    whole_project: bool,
+    out_items: **ArtifactReq, out_count: *u32) err[outcome.Fail] {
+    @out_items = nil;
+    @out_count = 0;
+    if (m.artifact_count == 0)             { ret err[outcome.Fail].ok{}; }
+    if (consumer == nil && !whole_project) { ret err[outcome.Fail].ok{}; }
+
+    var n: u32 = 0;
+    var j: u32 = 0;
+    for (j < m.artifact_count) {
+        if (req_selected(itn, m, consumer, ?m.artifacts[j], whole_project)) { n = n + 1; }
+        j = j + 1;
+    }
+    if (n == 0) { ret err[outcome.Fail].ok{}; }
+
+    val ir: res[*ArtifactReq, A.Error] = A.allocate[ArtifactReq](alloc, n::usize);
+    if (sel ir.err) { ret err[outcome.Fail].err{outcome.refused(ir.err)}; }
+    val items: *ArtifactReq = ir.ok;
+
+    var w: u32 = 0;
+    j = 0;
+    for (j < m.artifact_count) {
+        val ra: *ArtifactDef = ?m.artifacts[j];
+        if (req_selected(itn, m, consumer, ra, whole_project)) {
+            var item: ArtifactReq;
+            item.name = idstr(itn, ra.name);
+            item.out  = "";
+            if (required_artifact_target_count(itn, m, ra, consumer_target.name) == 1) {
+                var ti: u32 = 0;
+                for (ti < m.target_count) {
+                    if (required_artifact_uses_target(itn, ra, consumer_target.name, ?m.targets[ti])) {
+                        val pr: res[str, outcome.Fail] = artifact_out_for_target(alloc, itn, reg, m, ra, ?m.targets[ti], profile);
+                        if (sel pr.err) {
+                            var prior: u32 = 0;
+                            for (prior < w) {
+                                if (!str_empty(items[prior].out)) { str_free(alloc, items[prior].out); }
+                                prior = prior + 1;
+                            }
+                            A.deallocate[ArtifactReq](alloc, items, n::usize);
+                            ret err[outcome.Fail].err{pr.err};
+                        }
+                        item.out = pr.ok;
+                        brk;
+                    }
+                    ti = ti + 1;
+                }
+            }
+            items[w] = item;
+            w        = w + 1;
+        }
+        j = j + 1;
+    }
+    @out_items = items;
+    @out_count = w;
+    ret err[outcome.Fail].ok{};
+}
+
+# order the build steps the named artifacts demand: a step producing a local
+# link path that matches the target, every step a `need` names (globs match
+# step names), and transitively each step's own `need`, dependencies first
+# ---
+# alloc:     owns the returned order
+# itn:       resolves names
+# m:         the manifest
+# art_names: the artifacts to plan for; unknown names are skipped
+# art_count: length of `art_names`
+# t:         the target
+# proj_out:  the expanded `[project].out`
+# v:         the template values
+# out_order: receives the step indices in run order, sized exactly; nil when none
+# out_count: receives the length
+# ret:       ok; err on a step `need` cycle, a step `need` naming an unknown step, or
+#            a local link path that fails to expand
+pub fun plan_steps(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
+    art_names: *intern.StrId, art_count: u32, t: *TargetDef,
+    proj_out: str, v: *TmplVars,
+    out_order: **u32, out_count: *u32) err[outcome.Fail] {
+    @out_order = nil;
+    @out_count = 0;
+    if (m.step_count == 0) { ret err[outcome.Fail].ok{}; }
+
+    val sr: res[*u8, A.Error] = A.allocate[u8](alloc, m.step_count::usize);
+    if (sel sr.err) { ret err[outcome.Fail].err{outcome.refused(sr.err)}; }
+    val state: *u8 = sr.ok;
+    var i:     u32 = 0;
+    for (i < m.step_count) {
+        state[i] = 0;
+        i        = i + 1;
+    }
+
+    val or_: res[*u32, A.Error] = A.allocate[u32](alloc, m.step_count::usize);
+    if (sel or_.err) {
+        A.deallocate[u8](alloc, state, m.step_count::usize);
+        ret err[outcome.Fail].err{outcome.refused(or_.err)};
+    }
+    val order:     *u32 = or_.ok;
+    var order_len: u32  = 0;
+
+    var ai: u32 = 0;
+    for (ai < art_count) {
+        val a: *ArtifactDef = find_artifact_by_name(m, art_names[ai]);
+        if (a != nil) {
+            var li: u32 = 0;
+            for (li < a.link_count) {
+                val l: *LinkDef = find_link_by_name(m, a.link[li]);
+                if (l != nil && l.source == LINK_LOCAL && link_matches_target(itn, l, t)) {
+                    val exp_r: res[str, outcome.Fail] = expand_project_path(alloc, idstr(itn, l.path), proj_out, v, "a local link path");
+                    if (sel exp_r.err) {
+                        plan_free(alloc, state, order, m.step_count);
+                        ret err[outcome.Fail].err{exp_r.err};
+                    }
+                    val exp:  str = exp_r.ok;
+                    val sidx: i64 = step_producing_out(alloc, itn, m, exp, proj_out, v);
+                    str_free(alloc, exp);
+                    if (sidx >= 0) {
+                        val vr: err[outcome.Fail] = plan_visit(alloc, itn, m, sidx::u32, state, order, ?order_len);
+                        if (sel vr.err) {
+                            plan_free(alloc, state, order, m.step_count);
+                            ret vr;
+                        }
+                    }
+                }
+                li = li + 1;
+            }
+            var ni: u32 = 0;
+            for (ni < a.need_count) {
+                var si: u32 = 0;
+                for (si < m.step_count) {
+                    if (need_matches(idstr(itn, a.need[ni]), "step", idstr(itn, m.steps[si].name))) {
+                        val vr: err[outcome.Fail] = plan_visit(alloc, itn, m, si, state, order, ?order_len);
+                        if (sel vr.err) {
+                            plan_free(alloc, state, order, m.step_count);
+                            ret vr;
+                        }
+                    }
+                    si = si + 1;
+                }
+                ni = ni + 1;
+            }
+        }
+        ai = ai + 1;
+    }
+
+    ret plan_finish(alloc, state, order, m.step_count, order_len, out_order, out_count);
+}
+
+fun plan_free(alloc: *A.Allocator, state: *u8, order: *u32, n: u32) {
+    A.deallocate[u8](alloc, state, n::usize);
+    A.deallocate[u32](alloc, order, n::usize);
+}
+
+fun plan_finish(alloc: *A.Allocator, state: *u8, order: *u32, capacity: u32,
+    order_len: u32, out_order: **u32, out_count: *u32) err[outcome.Fail] {
+    A.deallocate[u8](alloc, state, capacity::usize);
+    if (order_len == 0) {
+        A.deallocate[u32](alloc, order, capacity::usize);
+        ret err[outcome.Fail].ok{};
+    }
+    if (order_len == capacity) {
+        @out_order = order;
+        @out_count = order_len;
+        ret err[outcome.Fail].ok{};
+    }
+    val compact_r: res[*u32, A.Error] = A.allocate[u32](alloc, order_len::usize);
+    if (sel compact_r.err) {
+        A.deallocate[u32](alloc, order, capacity::usize);
+        ret err[outcome.Fail].err{outcome.refused(compact_r.err)};
+    }
+    val compact: *u32 = compact_r.ok;
+    var i:       u32  = 0;
+    for (i < order_len) {
+        compact[i] = order[i];
+        i          = i + 1;
+    }
+    A.deallocate[u32](alloc, order, capacity::usize);
+    @out_order = compact;
+    @out_count = order_len;
+    ret err[outcome.Fail].ok{};
+}
+
+# order the build steps that produce an exported local link path matching the
+# target, with their transitive step `need`s; the steps a consumer of this
+# manifest must run
+# ---
+# alloc:     owns the returned order
+# itn:       resolves names
+# m:         the manifest
+# t:         the target
+# proj_out:  the expanded `[project].out`
+# v:         the template values
+# out_order: receives the step indices in run order, sized exactly; nil when none
+# out_count: receives the length
+# ret:       ok; the `plan_steps` errors
+pub fun plan_export_steps(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
+    t: *TargetDef, proj_out: str, v: *TmplVars,
+    out_order: **u32, out_count: *u32) err[outcome.Fail] {
+    @out_order = nil;
+    @out_count = 0;
+    if (m.step_count == 0) { ret err[outcome.Fail].ok{}; }
+
+    val sr: res[*u8, A.Error] = A.allocate[u8](alloc, m.step_count::usize);
+    if (sel sr.err) { ret err[outcome.Fail].err{outcome.refused(sr.err)}; }
+    val state: *u8 = sr.ok;
+    var i:     u32 = 0;
+    for (i < m.step_count) {
+        state[i] = 0;
+        i        = i + 1;
+    }
+
+    val or_: res[*u32, A.Error] = A.allocate[u32](alloc, m.step_count::usize);
+    if (sel or_.err) {
+        A.deallocate[u8](alloc, state, m.step_count::usize);
+        ret err[outcome.Fail].err{outcome.refused(or_.err)};
+    }
+    val order:     *u32 = or_.ok;
+    var order_len: u32  = 0;
+
+    var li: u32 = 0;
+    for (li < m.link_count) {
+        val l: *LinkDef = ?m.links[li];
+        if (l.export && l.source == LINK_LOCAL && link_matches_target(itn, l, t)) {
+            val exp_r: res[str, outcome.Fail] = expand_project_path(alloc, idstr(itn, l.path), proj_out, v, "a local link path");
+            if (sel exp_r.err) {
+                plan_free(alloc, state, order, m.step_count);
+                ret err[outcome.Fail].err{exp_r.err};
+            }
+            val exp:  str = exp_r.ok;
+            val sidx: i64 = step_producing_out(alloc, itn, m, exp, proj_out, v);
+            str_free(alloc, exp);
+            if (sidx >= 0) {
+                val vr: err[outcome.Fail] = plan_visit(alloc, itn, m, sidx::u32, state, order, ?order_len);
+                if (sel vr.err) {
+                    plan_free(alloc, state, order, m.step_count);
+                    ret vr;
+                }
+            }
+        }
+        li = li + 1;
+    }
+
+    ret plan_finish(alloc, state, order, m.step_count, order_len, out_order, out_count);
+}
+
+# whether the selection's artifact builds for the selection's target. the target
+# is resolved as `native` would be, never pinned by the artifact
+# ---
+# alloc: owns error text
+# itn:   resolves names
+# m:     the manifest
+# pick:  the selection
+# ret:   the support bit; err from target resolution, or when `resolve_artifact`
+#        finds nothing
+pub fun cell_supported(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, pick: Selection) res[bool, outcome.Fail] {
+    val res_target: res[ResolvedTarget, outcome.Fail] = resolve_target(alloc, itn, m, pick.target, nil);
     if (sel res_target.err) { ret res[bool, outcome.Fail].err{res_target.err}; }
     val rt: ResolvedTarget = res_target.ok;
 
-    val a: *ArtifactDef = resolve_artifact(itn, artifacts, artifact_count, pick.has_artifact, pick.artifact, pick.want_lib);
-    if (a == nil) { ret res[bool, outcome.Fail].err{outcome.user(artifact_err(alloc, itn, artifacts, artifact_count, pick))}; }
+    val a: *ArtifactDef = resolve_artifact(itn, m, pick);
+    if (a == nil) { ret res[bool, outcome.Fail].err{outcome.user(artifact_err(alloc, itn, m, pick))}; }
 
     ret res[bool, outcome.Fail].ok{artifact_supports_target(itn, a, rt.target.name)};
 }
@@ -215,10 +864,21 @@ fun set_selected_artifact(itn: *intern.Interner, a: *ArtifactDef,
     ret err[outcome.Fail].ok{};
 }
 
-fun artifact_candidates_for(alloc: *A.Allocator, itn: *intern.Interner,
-    targets: *TargetDef, target_count: u32,
-    native_target: *TargetDef, default_target: intern.StrId,
-    artifacts: *ArtifactDef, artifact_count: u32,
+# a selection several candidates could satisfy is refused where a command
+# must pick one; table order carries no meaning (#3222, #3226)
+pub val AMBIGUOUS_TARGET_MSG:   str = "mach.toml: several targets are declared, none matches the host and none is marked `default = true`; no target is selected by table order: mark exactly one [target.<name>] with `default = true` or select one with --target";
+pub val AMBIGUOUS_PROFILE_MSG:  str = "mach.toml: several profiles are declared and none is marked `default = true`; no profile is selected by table order: mark exactly one [profile.<name>] with `default = true` or select one with --profile";
+pub val AMBIGUOUS_ARTIFACT_MSG: str = "mach.toml: several artifacts support the selected target and none is marked `default = true`; no artifact is selected by table order: mark exactly one [artifact.<name>] with `default = true` or select one with --bin/--lib";
+
+rec ArtifactCandidates {
+    count:         u32;
+    sole:          *ArtifactDef;
+    first:         *ArtifactDef;
+    default_count: u32;
+    chosen:        *ArtifactDef;
+}
+
+fun artifact_candidates_for(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
     pick: *Selection, executables_only: bool) res[ArtifactCandidates, outcome.Fail] {
     var c: ArtifactCandidates;
     c.count         = 0;
@@ -226,13 +886,13 @@ fun artifact_candidates_for(alloc: *A.Allocator, itn: *intern.Interner,
     c.first         = nil;
     c.default_count = 0;
     c.chosen        = nil;
-    val tr: res[ResolvedTarget, outcome.Fail] = resolve_target(alloc, itn, targets, target_count, native_target, default_target, pick.target, nil);
+    val tr: res[ResolvedTarget, outcome.Fail] = resolve_target(alloc, itn, m, pick.target, nil);
     if (sel tr.err) { ret res[ArtifactCandidates, outcome.Fail].err{tr.err}; }
     val rt: ResolvedTarget = tr.ok;
 
     var i: u32 = 0;
-    for (i < artifact_count) {
-        val a: *ArtifactDef = ?artifacts[i];
+    for (i < m.artifact_count) {
+        val a: *ArtifactDef = ?m.artifacts[i];
         if ((!executables_only || !a.is_lib) && artifact_supports_target(itn, a, rt.target.name)) {
             c.sole = a;
             if (c.first == nil) { c.first = a; }
@@ -249,35 +909,50 @@ fun artifact_candidates_for(alloc: *A.Allocator, itn: *intern.Interner,
     ret res[ArtifactCandidates, outcome.Fail].ok{c};
 }
 
+# fill in `pick.artifact` when none was named and several artifacts are declared:
+# the sole artifact supporting the selected target, else the one marked
+# `default = true`; several candidates with none marked default are refused,
+# never selected by table order
+# ---
+# alloc: owns error text
+# itn:   resolves names
+# m:     the manifest
+# pick:  updated in place; untouched when it already names an artifact or fewer
+#        than two are declared
+# ret:   ok; err from target resolution, when no artifact supports the target,
+#        when more than one candidate is marked default, or when several are and none is
 pub fun select_primary_artifact(alloc: *A.Allocator, itn: *intern.Interner,
-    targets: *TargetDef, target_count: u32,
-    native_target: *TargetDef, default_target: intern.StrId,
-    artifacts: *ArtifactDef, artifact_count: u32,
-    pick: *Selection) err[outcome.Fail] {
-    if (pick.has_artifact || artifact_count < 2) { ret err[outcome.Fail].ok{}; }
+    m: *Manifest, pick: *Selection) err[outcome.Fail] {
+    if (pick.has_artifact || m.artifact_count < 2) { ret err[outcome.Fail].ok{}; }
 
-    val cr: res[ArtifactCandidates, outcome.Fail] = artifact_candidates_for(alloc, itn, targets, target_count, native_target, default_target, artifacts, artifact_count, pick, false);
+    val cr: res[ArtifactCandidates, outcome.Fail] = artifact_candidates_for(alloc, itn, m, pick, false);
     if (sel cr.err) { ret err[outcome.Fail].err{cr.err}; }
     val c: ArtifactCandidates = cr.ok;
     if (c.sole != nil)   { ret set_selected_artifact(itn, c.sole, pick); }
     if (c.chosen != nil) { ret set_selected_artifact(itn, c.chosen, pick); }
     if (c.count == 0) {
-        ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "mach.toml: no artifact supports the selected target ({})", artifact_candidates(alloc, itn, artifacts, artifact_count)))};
+        ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "mach.toml: no artifact supports the selected target ({})", artifact_candidates(alloc, itn, m)))};
     }
     if (c.default_count > 1) {
         ret err[outcome.Fail].err{outcome.user("mach.toml: multiple artifacts supporting the selected target have 'default = true'; exactly one is allowed")};
     }
-    ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "{} ({})", AMBIGUOUS_ARTIFACT_MSG, artifact_candidates(alloc, itn, artifacts, artifact_count)))};
+    ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "{} ({})", AMBIGUOUS_ARTIFACT_MSG, artifact_candidates(alloc, itn, m)))};
 }
 
+# `select_primary_artifact` without the fallback: fill in `pick.artifact` only
+# when the target leaves one candidate or one marked `default = true`, and stay
+# silent otherwise
+# ---
+# alloc: owns error text
+# itn:   resolves names
+# m:     the manifest
+# pick:  updated in place when a choice is clear
+# ret:   ok unless the artifact name cannot be looked up
 pub fun select_sole_target_artifact(alloc: *A.Allocator, itn: *intern.Interner,
-    targets: *TargetDef, target_count: u32,
-    native_target: *TargetDef, default_target: intern.StrId,
-    artifacts: *ArtifactDef, artifact_count: u32,
-    pick: *Selection) err[outcome.Fail] {
-    if (pick.has_artifact || artifact_count < 2) { ret err[outcome.Fail].ok{}; }
+    m: *Manifest, pick: *Selection) err[outcome.Fail] {
+    if (pick.has_artifact || m.artifact_count < 2) { ret err[outcome.Fail].ok{}; }
 
-    val cr: res[ArtifactCandidates, outcome.Fail] = artifact_candidates_for(alloc, itn, targets, target_count, native_target, default_target, artifacts, artifact_count, pick, false);
+    val cr: res[ArtifactCandidates, outcome.Fail] = artifact_candidates_for(alloc, itn, m, pick, false);
     if (sel cr.err) { ret err[outcome.Fail].ok{}; }
     val c: ArtifactCandidates = cr.ok;
     if (c.sole != nil)   { ret set_selected_artifact(itn, c.sole, pick); }
@@ -285,14 +960,19 @@ pub fun select_sole_target_artifact(alloc: *A.Allocator, itn: *intern.Interner,
     ret err[outcome.Fail].ok{};
 }
 
+# `select_sole_target_artifact` over `bin` artifacts only, so a bin beside a
+# library is chosen for `run` and `test`
+# ---
+# alloc: owns error text
+# itn:   resolves names
+# m:     the manifest
+# pick:  updated in place when a choice is clear
+# ret:   ok unless the artifact name cannot be looked up
 pub fun select_sole_executable_artifact(alloc: *A.Allocator, itn: *intern.Interner,
-    targets: *TargetDef, target_count: u32,
-    native_target: *TargetDef, default_target: intern.StrId,
-    artifacts: *ArtifactDef, artifact_count: u32,
-    pick: *Selection) err[outcome.Fail] {
-    if (pick.has_artifact || artifact_count < 2) { ret err[outcome.Fail].ok{}; }
+    m: *Manifest, pick: *Selection) err[outcome.Fail] {
+    if (pick.has_artifact || m.artifact_count < 2) { ret err[outcome.Fail].ok{}; }
 
-    val cr: res[ArtifactCandidates, outcome.Fail] = artifact_candidates_for(alloc, itn, targets, target_count, native_target, default_target, artifacts, artifact_count, pick, true);
+    val cr: res[ArtifactCandidates, outcome.Fail] = artifact_candidates_for(alloc, itn, m, pick, true);
     if (sel cr.err) { ret err[outcome.Fail].ok{}; }
     val c: ArtifactCandidates = cr.ok;
     if (c.sole != nil)   { ret set_selected_artifact(itn, c.sole, pick); }
@@ -300,53 +980,33 @@ pub fun select_sole_executable_artifact(alloc: *A.Allocator, itn: *intern.Intern
     ret err[outcome.Fail].ok{};
 }
 
-pub fun artifact_err(alloc: *A.Allocator, itn: *intern.Interner, artifacts: *ArtifactDef, artifact_count: u32, pick: Selection) str {
-    if (artifact_count == 0) { ret "mach.toml: no [artifact.*] artifacts declared"; }
-    if (pick.has_artifact) {
-        if (pick.want_lib) { ret sfmt(alloc, "mach.toml: no lib named '{}'", pick.artifact); }
-        ret sfmt(alloc, "mach.toml: no bin named '{}'", pick.artifact);
-    }
-    ret sfmt(alloc, "mach.toml: multiple artifacts declared; select one with --bin/--lib ({})",
-        artifact_candidates(alloc, itn, artifacts, artifact_count));
-}
-
-pub fun artifact_candidates(alloc: *A.Allocator, itn: *intern.Interner, artifacts: *ArtifactDef, artifact_count: u32) str {
-    var s: str = "";
-    var i: u32 = 0;
-    for (i < artifact_count) {
-        if (i > 0) { s = sfmt(alloc, "{}, ", s); }
-        var label: str = "bin ";
-        if (artifacts[i].is_lib) { label = "lib "; }
-        var name:     str      = "?";
-        val opt_name: opt[str] = intern.lookup(itn, artifacts[i].name);
-        if (sel opt_name.some) { name = opt_name.some; }
-        s = sfmt(alloc, "{}{}{}", s, label, name);
-        i = i + 1;
-    }
-    ret s;
-}
-
-pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt.TargetRegistry,
-    targets: *TargetDef, target_count: u32,
-    native_target: *TargetDef, default_target: intern.StrId,
-    profiles: *ProfileDef, profile_count: u32,
-    artifacts: *ArtifactDef, artifact_count: u32,
-    links: *LinkDef, link_count: u32,
-    out_tmpl: intern.StrId,
-    pick: Selection) res[BuildUnit, outcome.Fail] {
+# resolve a selection into one `BuildUnit`. with no target named, an artifact
+# that supports exactly one declared target, or exactly one host-matching
+# target, pins it; otherwise `native` resolution applies. the profile comes
+# from `resolve_profile`, the artifact from `resolve_artifact`, and every path
+# is expanded with `expand_project_path`
+# ---
+# alloc: owns `libs` and temporary strings
+# itn:   interns the expanded paths
+# m:     the manifest
+# pick:  the selection
+# ret:   the unit; err from target, profile or artifact resolution, when the
+#        artifact does not support the target (naming the artifact's targets when
+#        none was selected), or from path expansion
+pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt.TargetRegistry, m: *Manifest, pick: Selection) res[BuildUnit, outcome.Fail] {
     var pin: *ArtifactDef = nil;
-    if (str_empty(pick.target)) { pin = resolve_artifact(itn, artifacts, artifact_count, pick.has_artifact, pick.artifact, pick.want_lib); }
+    if (str_empty(pick.target)) { pin = resolve_artifact(itn, m, pick); }
 
-    val res_target: res[ResolvedTarget, outcome.Fail] = resolve_target(alloc, itn, targets, target_count, native_target, default_target, pick.target, pin);
+    val res_target: res[ResolvedTarget, outcome.Fail] = resolve_target(alloc, itn, m, pick.target, pin);
     if (sel res_target.err) { ret res[BuildUnit, outcome.Fail].err{res_target.err}; }
     val rt: ResolvedTarget = res_target.ok;
 
-    val res_profile: res[ResolvedProfile, outcome.Fail] = resolve_profile(alloc, itn, profiles, profile_count, pick.profile);
+    val res_profile: res[ResolvedProfile, outcome.Fail] = resolve_profile(alloc, itn, m, pick.profile);
     if (sel res_profile.err) { ret res[BuildUnit, outcome.Fail].err{res_profile.err}; }
     val rp: ResolvedProfile = res_profile.ok;
 
-    val a: *ArtifactDef = resolve_artifact(itn, artifacts, artifact_count, pick.has_artifact, pick.artifact, pick.want_lib);
-    if (a == nil) { ret res[BuildUnit, outcome.Fail].err{outcome.user(artifact_err(alloc, itn, artifacts, artifact_count, pick))}; }
+    val a: *ArtifactDef = resolve_artifact(itn, m, pick);
+    if (a == nil) { ret res[BuildUnit, outcome.Fail].err{outcome.user(artifact_err(alloc, itn, m, pick))}; }
 
     if (!artifact_supports_target(itn, a, rt.target.name)) {
         val art_name: str = idstr(itn, a.name);
@@ -354,7 +1014,7 @@ pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt
         if (str_empty(pick.target)) {
             ret res[BuildUnit, outcome.Fail].err{outcome.user(sfmt(alloc,
                 "mach.toml: artifact '{}' declares no target for this host; select one with --target ({})",
-                art_name, artifact_target_names(alloc, itn, targets, target_count, a)))};
+                art_name, artifact_target_names(alloc, itn, m, a)))};
         }
         ret res[BuildUnit, outcome.Fail].err{outcome.user(sfmt(alloc, "mach.toml: artifact '{}' does not support target '{}'", art_name, tgt_name))};
     }
@@ -383,7 +1043,7 @@ pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt
     val pn: str      = res_profile_name.ok;
     var v:  TmplVars = tmpl_vars_of(itn, rt.target, pn);
 
-    val must_lookup_r: res[str, outcome.Fail] = must_lookup(itn, out_tmpl);
+    val must_lookup_r: res[str, outcome.Fail] = must_lookup(itn, m.out_tmpl);
     if (sel must_lookup_r.err) { ret res[BuildUnit, outcome.Fail].err{must_lookup_r.err}; }
     val res_project_out: res[str, outcome.Fail] = expand_project_path(alloc, must_lookup_r.ok, "", ?v, "[project].out");
     if (sel res_project_out.err) { ret res[BuildUnit, outcome.Fail].err{res_project_out.err}; }
@@ -404,9 +1064,9 @@ pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt
             val link_name: intern.StrId = a.link[li];
             var found_l:   *LinkDef     = nil;
             var lidx:      u32          = 0;
-            for (lidx < link_count) {
-                if (links[lidx].name == link_name) {
-                    found_l = ?links[lidx];
+            for (lidx < m.link_count) {
+                if (m.links[lidx].name == link_name) {
+                    found_l = ?m.links[lidx];
                 }
                 lidx = lidx + 1;
             }
@@ -503,18 +1163,29 @@ fun requirement_index(buf: *LinkRequirement, count: u32, req: *LinkRequirement) 
     ret -1;
 }
 
-pub fun resolve_test_libs(alloc: *A.Allocator, itn: *intern.Interner,
-    artifacts: *ArtifactDef, artifact_count: u32,
-    links: *LinkDef, link_count: u32,
-    t: *TargetDef, proj_out: str, v: *TmplVars,
+# the union of every artifact's link requirements for a target, for the test
+# binary. requirements equal in source, text and library merge with
+# `merge_link_claims`
+# ---
+# alloc:     owns the returned array
+# itn:       resolves names
+# m:         the manifest
+# t:         the target
+# proj_out:  the expanded `[project].out`
+# v:         the template values
+# out_items: receives the exact array, or nil when no artifact links anything
+# out_count: receives its length
+# ret:       ok; err from `link_requirement` or a merge, with everything freed
+pub fun resolve_test_libs(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, t: *TargetDef,
+    proj_out: str, v: *TmplVars,
     out_items: **LinkRequirement, out_count: *u32) err[outcome.Fail] {
     @out_items = nil;
     @out_count = 0;
 
     var max: u32 = 0;
     var ai:  u32 = 0;
-    for (ai < artifact_count) {
-        max = max + artifacts[ai].link_count;
+    for (ai < m.artifact_count) {
+        max = max + m.artifacts[ai].link_count;
         ai  = ai + 1;
     }
     if (max == 0) { ret err[outcome.Fail].ok{}; }
@@ -525,15 +1196,15 @@ pub fun resolve_test_libs(alloc: *A.Allocator, itn: *intern.Interner,
     var w:   u32              = 0;
 
     ai = 0;
-    for (ai < artifact_count) {
-        val a:  *ArtifactDef = ?artifacts[ai];
+    for (ai < m.artifact_count) {
+        val a:  *ArtifactDef = ?m.artifacts[ai];
         var li: u32          = 0;
         for (li < a.link_count) {
             val link_name: intern.StrId = a.link[li];
             var found_l:   *LinkDef     = nil;
             var lidx:      u32          = 0;
-            for (lidx < link_count) {
-                if (links[lidx].name == link_name) { found_l = ?links[lidx]; }
+            for (lidx < m.link_count) {
+                if (m.links[lidx].name == link_name) { found_l = ?m.links[lidx]; }
                 lidx = lidx + 1;
             }
             if (found_l != nil) {
@@ -570,42 +1241,66 @@ pub fun resolve_test_libs(alloc: *A.Allocator, itn: *intern.Interner,
     ret finish_link_requirements(alloc, buf, max, w, out_items, out_count);
 }
 
-pub fun free_path_strings(alloc: *A.Allocator, paths: *str, count: u32) {
-    if (paths == nil) { ret; }
-    var i: u32 = 0;
-    for (i < count) {
-        if (paths[i] != nil) { str_free(alloc, paths[i]); }
-        i = i + 1;
+fun artifact_err(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, pick: Selection) str {
+    if (m.artifact_count == 0) { ret "mach.toml: no [artifact.*] artifacts declared"; }
+    if (pick.has_artifact) {
+        if (pick.want_lib) { ret sfmt(alloc, "mach.toml: no lib named '{}'", pick.artifact); }
+        ret sfmt(alloc, "mach.toml: no bin named '{}'", pick.artifact);
     }
+    ret sfmt(alloc, "mach.toml: multiple artifacts declared; select one with --bin/--lib ({})",
+        artifact_candidates(alloc, itn, m));
 }
 
-pub fun check_collisions(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt.TargetRegistry,
-    artifacts: *ArtifactDef, artifact_count: u32,
-    out_tmpl: intern.StrId,
+fun artifact_candidates(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest) str {
+    var s: str = "";
+    var i: u32 = 0;
+    for (i < m.artifact_count) {
+        if (i > 0) { s = sfmt(alloc, "{}, ", s); }
+        var label: str = "bin ";
+        if (m.artifacts[i].is_lib) { label = "lib "; }
+        var name:     str      = "?";
+        val opt_name: opt[str] = intern.lookup(itn, m.artifacts[i].name);
+        if (sel opt_name.some) { name = opt_name.some; }
+        s = sfmt(alloc, "{}{}{}", s, label, name);
+        i = i + 1;
+    }
+    ret s;
+}
+
+# reject two artifacts whose `out` expands to the same path under one set of
+# template values
+# ---
+# alloc: owns temporary strings
+# itn:   resolves names
+# m:     the manifest; fewer than two artifacts always pass
+# v:     the template values
+# ret:   ok; err "mach.toml: artifacts 'a' and 'b' collide on output path '<p>'",
+#        or an expansion error
+pub fun check_collisions(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt.TargetRegistry, m: *Manifest,
     v: *TmplVars) err[outcome.Fail] {
-    if (artifact_count < 2) { ret err[outcome.Fail].ok{}; }
+    if (m.artifact_count < 2) { ret err[outcome.Fail].ok{}; }
     val target_id: res[intern.StrId, A.Error] = intern.intern(itn, v.target);
     if (sel target_id.err) { ret err[outcome.Fail].err{outcome.refused(target_id.err)}; }
 
-    val res_paths: res[*str, A.Error] = A.allocate[str](alloc, artifact_count::usize);
+    val res_paths: res[*str, A.Error] = A.allocate[str](alloc, m.artifact_count::usize);
     if (sel res_paths.err) { ret err[outcome.Fail].err{outcome.refused(res_paths.err)}; }
     val paths: *str = res_paths.ok;
 
-    val must_lookup_r: res[str, outcome.Fail] = must_lookup(itn, out_tmpl);
+    val must_lookup_r: res[str, outcome.Fail] = must_lookup(itn, m.out_tmpl);
     if (sel must_lookup_r.err) {
-        A.deallocate[str](alloc, paths, artifact_count::usize);
+        A.deallocate[str](alloc, paths, m.artifact_count::usize);
         ret err[outcome.Fail].err{must_lookup_r.err};
     }
     val res_project_out: res[str, outcome.Fail] = expand_project_path(alloc, must_lookup_r.ok, "", v, "[project].out");
     if (sel res_project_out.err) {
-        A.deallocate[str](alloc, paths, artifact_count::usize);
+        A.deallocate[str](alloc, paths, m.artifact_count::usize);
         ret err[outcome.Fail].err{res_project_out.err};
     }
     val proj_out: str = res_project_out.ok;
 
     var i: u32 = 0;
-    for (i < artifact_count) {
-        val a: *ArtifactDef = ?artifacts[i];
+    for (i < m.artifact_count) {
+        val a: *ArtifactDef = ?m.artifacts[i];
         paths[i] = nil;
         if (!artifact_supports_target(itn, a, target_id.ok)) {
             i = i + 1;
@@ -614,7 +1309,7 @@ pub fun check_collisions(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt.T
         val res_art_out: res[str, outcome.Fail] = expand_artifact_output(alloc, itn, reg, a, proj_out, v);
         if (sel res_art_out.err) {
             free_path_strings(alloc, paths, i);
-            A.deallocate[str](alloc, paths, artifact_count::usize);
+            A.deallocate[str](alloc, paths, m.artifact_count::usize);
             str_free(alloc, proj_out);
             ret err[outcome.Fail].err{res_art_out.err};
         }
@@ -627,12 +1322,12 @@ pub fun check_collisions(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt.T
     var code: bool = true;
     var msg:  str  = "";
     i = 0;
-    for (i < artifact_count && code) {
+    for (i < m.artifact_count && code) {
         var j: u32 = i + 1;
-        for (j < artifact_count && code) {
+        for (j < m.artifact_count && code) {
             if (paths[i] != nil && paths[j] != nil && str_equals(paths[i], paths[j])) {
-                val an0: opt[str] = intern.lookup(itn, artifacts[i].name);
-                val an1: opt[str] = intern.lookup(itn, artifacts[j].name);
+                val an0: opt[str] = intern.lookup(itn, m.artifacts[i].name);
+                val an1: opt[str] = intern.lookup(itn, m.artifacts[j].name);
                 if (sel an0.some) {
                     if (sel an1.some) {
                         msg = sfmt(alloc, "mach.toml: artifacts '{}' and '{}' collide on output path '{}'", an0.some, an1.some, paths[i]);
@@ -645,196 +1340,1510 @@ pub fun check_collisions(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt.T
         i = i + 1;
     }
 
-    free_path_strings(alloc, paths, artifact_count);
-    A.deallocate[str](alloc, paths, artifact_count::usize);
+    free_path_strings(alloc, paths, m.artifact_count);
+    A.deallocate[str](alloc, paths, m.artifact_count::usize);
     str_free(alloc, proj_out);
     if (!code) { ret err[outcome.Fail].err{outcome.user(msg)}; }
     ret err[outcome.Fail].ok{};
 }
 
-pub fun plan_visit(alloc: *A.Allocator, itn: *intern.Interner,
-    steps: *StepDef, step_count: u32,
-    idx: u32, state: *u8, order: *u32, order_len: *u32) err[outcome.Fail] {
-    if (state[idx] == 2) { ret err[outcome.Fail].ok{}; }
-    if (state[idx] == 1) { ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "mach.toml: build step '{}' is part of a 'need' cycle", idstr(itn, steps[idx].name)))}; }
-    state[idx] = 1;
-    val s:  *StepDef = ?steps[idx];
-    var ni: u32      = 0;
-    for (ni < s.need_count) {
-        var j: u32 = 0;
-        for (j < step_count) {
-            if (j != idx && need_matches(idstr(itn, s.need[ni]), "step", idstr(itn, steps[j].name))) {
-                val vr: err[outcome.Fail] = plan_visit(alloc, itn, steps, step_count, j, state, order, order_len);
-                if (sel vr.err) { ret vr; }
-            }
-            j = j + 1;
-        }
-        ni = ni + 1;
-    }
-    state[idx]        = 2;
-    order[@order_len] = idx;
-    @order_len        = @order_len + 1;
-    ret err[outcome.Fail].ok{};
+fun host_target_stanza(alloc: *A.Allocator, name: str) str {
+    ret sfmt(alloc, "[target.{}]\nisa = \"{}\"\nos = \"{}\"\nabi = \"{}\"\n", name, host_isa_name(), host_os_name(), abi.abi_name_for(tgt.host_abi_id()));
 }
 
-pub fun plan_steps(alloc: *A.Allocator, itn: *intern.Interner,
-    steps: *StepDef, step_count: u32,
-    artifacts: *ArtifactDef, artifact_count: u32,
-    links: *LinkDef, link_count: u32,
-    art_names: *intern.StrId, art_count: u32, t: *TargetDef,
-    proj_out: str, v: *TmplVars,
-    out_order: **u32, out_count: *u32) err[outcome.Fail] {
-    @out_order = nil;
-    @out_count = 0;
-    if (step_count == 0) { ret err[outcome.Fail].ok{}; }
-
-    val sr: res[*u8, A.Error] = A.allocate[u8](alloc, step_count::usize);
-    if (sel sr.err) { ret err[outcome.Fail].err{outcome.refused(sr.err)}; }
-    val state: *u8 = sr.ok;
-    var i:     u32 = 0;
-    for (i < step_count) {
-        state[i] = 0;
-        i        = i + 1;
+fun requirement_has(itn: *intern.Interner, items: *LinkRequirement, count: u32, lit: str) bool {
+    var i: u32 = 0;
+    for (i < count) {
+        if (str_equals(idstr(itn, items[i].text), lit)) { ret true; }
+        i = i + 1;
     }
+    ret false;
+}
 
-    val or_: res[*u32, A.Error] = A.allocate[u32](alloc, step_count::usize);
-    if (sel or_.err) {
-        A.deallocate[u8](alloc, state, step_count::usize);
-        ret err[outcome.Fail].err{outcome.refused(or_.err)};
+fun mk_sel(target: str, profile: str, artifact: str, want_lib: bool, has_artifact: bool) Selection {
+    var s: Selection;
+    s.target       = target;
+    s.profile      = profile;
+    s.artifact     = artifact;
+    s.want_lib     = want_lib;
+    s.has_artifact = has_artifact;
+    ret s;
+}
+
+test "mach.lang.manifest.validate_needs:accepts_artifact_ids_globs_and_step_ids" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val src: str = sfmt(?alloc, "{}{}{}{}{}", need_head(),
+        need_artifact(?alloc, "shader-a", "a", ""),
+        need_artifact(?alloc, "shader-b", "b", ""),
+        "[step.gen]\nargv=[\"true\"]\nin=[]\nout=[]\nneed=[]\n[step.shader-a]\nargv=[\"never\"]\nin=[]\nout=[]\nneed=[]\n",
+        "[artifact.app]\nkind=\"bin\"\nentry=\"m.mach\"\nout=\"bin/app\"\ntargets=[\"host\"]\nlink=[]\nneed=[\"artifact.shader-*\",\"step.gen\",\"artifact.shader-b\"]\n");
+    val r: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, src);
+    if (sel r.err) { code = 1; }
+    if (sel r.ok) {
+        var m:   Manifest     = r.ok;
+        val app: *ArtifactDef = find_artifact_by_name(?m, intern_unwrap(?itn, "app"));
+        val sa:  *ArtifactDef = find_artifact_by_name(?m, intern_unwrap(?itn, "shader-a"));
+        if (app == nil || sa == nil) { code = 1; }
+        or {
+            if (!artifact_needs_artifact(?itn, app, sa)) { code = 1; }
+            if (artifact_needs_artifact(?itn, sa, app))  { code = 1; }
+            if (artifact_needs_artifact(?itn, app, app)) { code = 1; }
+            var order:   *u32              = nil;
+            var count:   u32               = 0;
+            var vars:    TmplVars          = tmpl_vars_of(?itn, ?m.targets[0], "debug");
+            val planned: err[outcome.Fail] = plan_steps(?alloc, ?itn, ?m, ?app.name, 1,
+                ?m.targets[0], "out/host", ?vars, ?order, ?count);
+            if (sel planned.err || count != 1)                           { code = 1; }
+            or (!str_equals(idstr(?itn, m.steps[order[0]].name), "gen")) { code = 1; }
+        }
     }
-    val order:     *u32 = or_.ok;
-    var order_len: u32  = 0;
+    arena.dnit(?ar);
+    ret code;
+}
 
-    var ai: u32 = 0;
-    for (ai < art_count) {
-        val a: *ArtifactDef = find_artifact_by_name(artifacts, artifact_count, art_names[ai]);
-        if (a != nil) {
-            var li: u32 = 0;
-            for (li < a.link_count) {
-                val l: *LinkDef = find_link_by_name(links, link_count, a.link[li]);
-                if (l != nil && l.source == LINK_LOCAL && link_matches_target(itn, l, t)) {
-                    val exp_r: res[str, outcome.Fail] = expand_project_path(alloc, idstr(itn, l.path), proj_out, v, "a local link path");
-                    if (sel exp_r.err) {
-                        plan_free(alloc, state, order, step_count);
-                        ret err[outcome.Fail].err{exp_r.err};
-                    }
-                    val exp:  str = exp_r.ok;
-                    val sidx: i64 = step_producing_out(alloc, itn, steps, step_count, exp, proj_out, v);
-                    str_free(alloc, exp);
-                    if (sidx >= 0) {
-                        val vr: err[outcome.Fail] = plan_visit(alloc, itn, steps, step_count, sidx::u32, state, order, ?order_len);
-                        if (sel vr.err) {
-                            plan_free(alloc, state, order, step_count);
-                            ret vr;
-                        }
-                    }
-                }
-                li = li + 1;
-            }
-            var ni: u32 = 0;
-            for (ni < a.need_count) {
-                var si: u32 = 0;
-                for (si < step_count) {
-                    if (need_matches(idstr(itn, a.need[ni]), "step", idstr(itn, steps[si].name))) {
-                        val vr: err[outcome.Fail] = plan_visit(alloc, itn, steps, step_count, si, state, order, ?order_len);
-                        if (sel vr.err) {
-                            plan_free(alloc, state, order, step_count);
-                            ret vr;
-                        }
-                    }
-                    si = si + 1;
-                }
-                ni = ni + 1;
+fun need_two_target_head() str {
+    ret "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}/{profile.name}\"\n[target.host]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[target.alt]\nisa=\"aarch64\"\nos=\"linux\"\nabi=\"aapcs64\"\n[target.alt2]\nisa=\"riscv64\"\nos=\"linux\"\nabi=\"lp64d\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+}
+
+test "mach.lang.manifest.resolve_artifact_reqs:resolves_the_required_output_on_its_own_target" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val src: str = sfmt(?alloc, "{}{}{}", need_two_target_head(),
+        "[artifact.shader-a]\nkind=\"static\"\nentry=\"s.mach\"\nout=\"lib/shader-a.a\"\ntargets=[\"alt\"]\nlink=[]\nneed=[]\n",
+        "[artifact.app]\nkind=\"bin\"\nentry=\"m.mach\"\nout=\"bin/app\"\ntargets=[\"host\"]\nlink=[]\nneed=[\"artifact.shader-*\"]\n");
+    val r: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, src);
+    if (sel r.err) { code = 1; }
+    if (sel r.ok) {
+        var m:     Manifest          = r.ok;
+        val app:   *ArtifactDef      = find_artifact(?itn, ?m, "app");
+        val host:  *TargetDef        = find_target_by_name(?itn, ?m, "host");
+        var items: *ArtifactReq      = nil;
+        var count: u32               = 0;
+        val rr:    err[outcome.Fail] = t_resolve_artifact_reqs(?alloc, ?itn, ?m, app, host, "debug", false, ?items, ?count);
+        if (sel rr.err) { code = 1; }
+        or {
+            if (count != 1) { code = 1; }
+            or {
+                if (!str_equals(items[0].name, "shader-a"))                    { code = 1; }
+                if (!str_equals(items[0].out, "out/alt/debug/lib/shader-a.a")) { code = 1; }
             }
         }
-        ai = ai + 1;
     }
-
-    ret plan_finish(alloc, state, order, step_count, order_len, out_order, out_count);
+    arena.dnit(?ar);
+    ret code;
 }
 
-pub fun plan_free(alloc: *A.Allocator, state: *u8, order: *u32, n: u32) {
-    A.deallocate[u8](alloc, state, n::usize);
-    A.deallocate[u32](alloc, order, n::usize);
-}
+test "mach.lang.manifest.resolve_artifact_reqs:a_requirement_with_two_targets_has_no_single_output" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
 
-pub fun plan_finish(alloc: *A.Allocator, state: *u8, order: *u32, capacity: u32,
-    order_len: u32, out_order: **u32, out_count: *u32) err[outcome.Fail] {
-    A.deallocate[u8](alloc, state, capacity::usize);
-    if (order_len == 0) {
-        A.deallocate[u32](alloc, order, capacity::usize);
-        ret err[outcome.Fail].ok{};
-    }
-    if (order_len == capacity) {
-        @out_order = order;
-        @out_count = order_len;
-        ret err[outcome.Fail].ok{};
-    }
-    val compact_r: res[*u32, A.Error] = A.allocate[u32](alloc, order_len::usize);
-    if (sel compact_r.err) {
-        A.deallocate[u32](alloc, order, capacity::usize);
-        ret err[outcome.Fail].err{outcome.refused(compact_r.err)};
-    }
-    val compact: *u32 = compact_r.ok;
-    var i:       u32  = 0;
-    for (i < order_len) {
-        compact[i] = order[i];
-        i          = i + 1;
-    }
-    A.deallocate[u32](alloc, order, capacity::usize);
-    @out_order = compact;
-    @out_count = order_len;
-    ret err[outcome.Fail].ok{};
-}
-
-pub fun plan_export_steps(alloc: *A.Allocator, itn: *intern.Interner,
-    steps: *StepDef, step_count: u32,
-    links: *LinkDef, link_count: u32,
-    t: *TargetDef, proj_out: str, v: *TmplVars,
-    out_order: **u32, out_count: *u32) err[outcome.Fail] {
-    @out_order = nil;
-    @out_count = 0;
-    if (step_count == 0) { ret err[outcome.Fail].ok{}; }
-
-    val sr: res[*u8, A.Error] = A.allocate[u8](alloc, step_count::usize);
-    if (sel sr.err) { ret err[outcome.Fail].err{outcome.refused(sr.err)}; }
-    val state: *u8 = sr.ok;
-    var i:     u32 = 0;
-    for (i < step_count) {
-        state[i] = 0;
-        i        = i + 1;
-    }
-
-    val or_: res[*u32, A.Error] = A.allocate[u32](alloc, step_count::usize);
-    if (sel or_.err) {
-        A.deallocate[u8](alloc, state, step_count::usize);
-        ret err[outcome.Fail].err{outcome.refused(or_.err)};
-    }
-    val order:     *u32 = or_.ok;
-    var order_len: u32  = 0;
-
-    var li: u32 = 0;
-    for (li < link_count) {
-        val l: *LinkDef = ?links[li];
-        if (l.export && l.source == LINK_LOCAL && link_matches_target(itn, l, t)) {
-            val exp_r: res[str, outcome.Fail] = expand_project_path(alloc, idstr(itn, l.path), proj_out, v, "a local link path");
-            if (sel exp_r.err) {
-                plan_free(alloc, state, order, step_count);
-                ret err[outcome.Fail].err{exp_r.err};
+    val src: str = sfmt(?alloc, "{}{}{}", need_two_target_head(),
+        "[artifact.shader-a]\nkind=\"static\"\nentry=\"s.mach\"\nout=\"lib/shader-a.a\"\ntargets=[\"alt\",\"alt2\"]\nlink=[]\nneed=[]\n",
+        "[artifact.app]\nkind=\"bin\"\nentry=\"m.mach\"\nout=\"bin/app\"\ntargets=[\"host\"]\nlink=[]\nneed=[\"artifact.shader-a\"]\n");
+    val r: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, src);
+    if (sel r.err) { code = 1; }
+    if (sel r.ok) {
+        var m:     Manifest          = r.ok;
+        val app:   *ArtifactDef      = find_artifact(?itn, ?m, "app");
+        val host:  *TargetDef        = find_target_by_name(?itn, ?m, "host");
+        var items: *ArtifactReq      = nil;
+        var count: u32               = 0;
+        val rr:    err[outcome.Fail] = t_resolve_artifact_reqs(?alloc, ?itn, ?m, app, host, "debug", false, ?items, ?count);
+        if (sel rr.err) { code = 1; }
+        or {
+            if (count != 1) { code = 1; }
+            or {
+                if (!str_empty(items[0].out)) { code = 1; }
+                var v:  TmplVars               = tmpl_vars_of_reqs(items, count);
+                val er: res[str, outcome.Fail] = expand(?alloc, "{artifact.shader-a.out}", "", ?v);
+                if (!(sel er.err && str_contains(outcome.describe(er.err), "is ambiguous"))) { code = 1; }
             }
-            val exp:  str = exp_r.ok;
-            val sidx: i64 = step_producing_out(alloc, itn, steps, step_count, exp, proj_out, v);
-            str_free(alloc, exp);
-            if (sidx >= 0) {
-                val vr: err[outcome.Fail] = plan_visit(alloc, itn, steps, step_count, sidx::u32, state, order, ?order_len);
-                if (sel vr.err) {
-                    plan_free(alloc, state, order, step_count);
-                    ret vr;
+        }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.resolve_build_unit:an_artifact_out_template_cannot_name_another_artifact" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val src: str = sfmt(?alloc, "{}{}{}", need_two_target_head(),
+        "[artifact.shader-a]\nkind=\"static\"\nentry=\"s.mach\"\nout=\"lib/shader-a.a\"\ntargets=[\"alt\"]\nlink=[]\nneed=[]\n",
+        "[artifact.app]\nkind=\"bin\"\nentry=\"m.mach\"\nout=\"bin/{artifact.shader-a.out}\"\ntargets=[\"host\"]\nlink=[]\nneed=[\"artifact.shader-a\"]\n");
+    val r: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, src);
+    if (sel r.err) { code = 1; }
+    if (sel r.ok) {
+        var m: Manifest                     = r.ok;
+        val u: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("host", "", "app", false, true));
+        if (!(sel u.err && str_contains(outcome.describe(u.err), "does not require"))) { code = 1; }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:float_reassoc_is_read_and_validated" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+    val head: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n";
+
+    val a: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[profile.p]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n"));
+    if (sel a.err) { code = 1; }
+    if (sel a.ok) {
+        var ma: Manifest = a.ok;
+        if (ma.profiles[0].float_reassoc) { code = 1; }
+        val ra: res[ResolvedProfile, outcome.Fail] = resolve_profile(?alloc, ?itn, ?ma, "p");
+        if (sel ra.err) { code = 1; }
+        if (sel ra.ok) {
+            if (ra.ok.float_reassoc) { code = 1; }
+        }
+    }
+
+    val b: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[profile.p]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nfloat_reassoc=true\nvectorize=true\n"));
+    if (sel b.err) { code = 1; }
+    if (sel b.ok) {
+        var mb: Manifest = b.ok;
+        if (!mb.profiles[0].float_reassoc) { code = 1; }
+        val rb: res[ResolvedProfile, outcome.Fail] = resolve_profile(?alloc, ?itn, ?mb, "p");
+        if (sel rb.err) { code = 1; }
+        if (sel rb.ok) {
+            if (!rb.ok.float_reassoc) { code = 1; }
+        }
+    }
+
+    val c: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[profile.p]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nfloat_reassoc=false\nvectorize=true\n"));
+    if (sel c.err) { code = 1; }
+    if (sel c.ok) {
+        if (c.ok.profiles[0].float_reassoc) { code = 1; }
+    }
+
+    val d: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[profile.p]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nfloat_reassoc=\"yes\"\nvectorize=true\n"));
+    if (!(sel d.err && str_contains(outcome.describe(d.err), "float_reassoc must be a boolean"))) { code = 1; }
+
+    val e: res[Manifest, outcome.Fail] = tparse_lenient(?alloc, ?itn, head);
+    if (sel e.err) { code = 1; }
+    if (sel e.ok) {
+        var me: Manifest                           = e.ok;
+        val re: res[ResolvedProfile, outcome.Fail] = resolve_profile(?alloc, ?itn, ?me, "");
+        if (sel re.err) { code = 1; }
+        if (sel re.ok) {
+            if (re.ok.float_reassoc) { code = 1; }
+        }
+    }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:profile_selection_contract" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+    val head: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{profile.name}\"\n";
+
+    val root_builtins: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, head);
+    if (!(sel root_builtins.err && str_equals(outcome.describe(root_builtins.err), MISSING_PROFILE_MESSAGE))) { code = 1; }
+
+    val builtins: res[Manifest, outcome.Fail] = tparse_lenient(?alloc, ?itn, head);
+    if (sel builtins.err) { code = 1; }
+    if (sel builtins.ok) {
+        var m: Manifest = builtins.ok;
+        if (m.profile_count != 2) { code = 1; }
+        or {
+            val debug:   *ProfileDef = ?m.profiles[0];
+            val release: *ProfileDef = ?m.profiles[1];
+            if (!str_equals(idstr(?itn, debug.name), "debug") || !debug.is_default
+                || debug.opt != MOPT_DEBUG
+                || !debug.debug || debug.simd != SIMD_SCALARIZE || debug.vectorize
+                || debug.float_reassoc) { code = 1; }
+            if (!str_equals(idstr(?itn, release.name), "release") || release.is_default
+                || release.opt != MOPT_RELEASE
+                || release.debug || release.simd != SIMD_SCALARIZE || !release.vectorize
+                || release.float_reassoc) { code = 1; }
+
+            val omitted:  res[ResolvedProfile, outcome.Fail] = resolve_profile(?alloc, ?itn, ?m, "");
+            val explicit: res[ResolvedProfile, outcome.Fail] = resolve_profile(?alloc, ?itn, ?m, "release");
+            if (sel omitted.ok) {
+                if (sel explicit.ok) {
+                    if (!str_equals(idstr(?itn, omitted.ok.name), "debug"))    { code = 1; }
+                    if (!str_equals(idstr(?itn, explicit.ok.name), "release")) { code = 1; }
+                }
+                if (sel explicit.err) { code = 1; }
+            }
+            if (sel omitted.err) { code = 1; }
+        }
+    }
+
+    val sole: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[profile.ship]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n"));
+    if (sel sole.err) { code = 1; }
+    if (sel sole.ok) {
+        var m: Manifest = sole.ok;
+        if (m.profile_count != 1 || m.profiles[0].is_default) { code = 1; }
+        val omitted: res[ResolvedProfile, outcome.Fail] = resolve_profile(?alloc, ?itn, ?m, "");
+        val builtin: res[ResolvedProfile, outcome.Fail] = resolve_profile(?alloc, ?itn, ?m, "debug");
+        if (!(sel omitted.ok && str_equals(idstr(?itn, omitted.ok.name), "ship"))) { code = 1; }
+        if (sel builtin.ok)                                                        { code = 1; }
+    }
+
+    val selected: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[profile.first]\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n[profile.chosen]\ndefault=true\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n"));
+    if (sel selected.err) { code = 1; }
+    if (sel selected.ok) {
+        var m:        Manifest                           = selected.ok;
+        val omitted:  res[ResolvedProfile, outcome.Fail] = resolve_profile(?alloc, ?itn, ?m, "");
+        val explicit: res[ResolvedProfile, outcome.Fail] = resolve_profile(?alloc, ?itn, ?m, "first");
+        if (sel omitted.ok) {
+            if (sel explicit.ok) {
+                if (!str_equals(idstr(?itn, omitted.ok.name), "chosen")) { code = 1; }
+                if (!str_equals(idstr(?itn, explicit.ok.name), "first")) { code = 1; }
+            }
+            if (sel explicit.err) { code = 1; }
+        }
+        if (sel omitted.err) { code = 1; }
+    }
+
+    val missing: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[profile.a]\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n[profile.b]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n"));
+    if (sel missing.err) { code = 1; }
+    if (sel missing.ok) {
+        var mm:          Manifest                           = missing.ok;
+        val omitted_sel: res[ResolvedProfile, outcome.Fail] = resolve_profile(?alloc, ?itn, ?mm, "");
+        if (!(sel omitted_sel.err && str_contains(outcome.describe(omitted_sel.err), "several profiles are declared and none is marked `default = true`"))) { code = 1; }
+        val explicit_sel: res[ResolvedProfile, outcome.Fail] = resolve_profile(?alloc, ?itn, ?mm, "a");
+        if (sel explicit_sel.err) { code = 1; }
+        if (sel explicit_sel.ok) {
+            if (!str_equals(idstr(?itn, explicit_sel.ok.name), "a")) { code = 1; }
+        }
+    }
+
+    val repeated: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[profile.a]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n[profile.b]\ndefault=true\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n"));
+    if (!(sel repeated.err && str_contains(outcome.describe(repeated.err), "exactly one is allowed"))) { code = 1; }
+
+    val typed: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[profile.a]\ndefault=\"yes\"\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n"));
+    if (!(sel typed.err && str_contains(outcome.describe(typed.err), "default must be a boolean"))) { code = 1; }
+
+    val source: res[Manifest, outcome.Fail] = tparse_lenient(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[profile.a]\nopt=0\nvectorize=true\nfloat_reassoc=false\n[profile.b]\nopt=2\nvectorize=true\nfloat_reassoc=false\n"));
+    if (!(sel source.err && str_contains(outcome.describe(source.err), "[profile.a] is missing required key 'debug'"))) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.resolve_build_unit:default_profile" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    var s1: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{profile.name}\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink = []\nneed = []\n[profile.debug]\nopt=0\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n";
+    s1 = sfmt(?alloc, "{}{}", s1, host_target_stanza(?alloc, "h"));
+    val r1: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, s1);
+    if (sel r1.err) { code = 1; }
+    if (sel r1.ok) {
+        var m1: Manifest                     = r1.ok;
+        val u1: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m1, mk_sel("native", "", "app", false, true));
+        if (sel u1.err) { code = 1; }
+        if (sel u1.ok) {
+            if (!str_equals(idstr(?itn, u1.ok.profile_name), "debug")) { code = 1; }
+        }
+    }
+
+    var s2: str = "[project]\nid=\"y\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{profile.name}\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink = []\nneed = []\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    s2 = sfmt(?alloc, "{}{}", s2, host_target_stanza(?alloc, "h"));
+    val r2: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, s2);
+    if (sel r2.err) { code = 1; }
+    if (sel r2.ok) {
+        var m2: Manifest                     = r2.ok;
+        val u2: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m2, mk_sel("native", "", "app", false, true));
+        if (sel u2.err) { code = 1; }
+        if (sel u2.ok) {
+            if (!str_equals(idstr(?itn, u2.ok.profile_name), "debug")) { code = 1; }
+        }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.resolve_build_unit:simd_posture" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+    val art:  str = "[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink = []\nneed = []\n";
+
+    var req: str = sfmt(?alloc, "{}{}", "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{profile.name}\"\n", art);
+    req = sfmt(?alloc, "{}{}", req, "[profile.debug]\nopt=0\ndebug=false\nsimd=\"require\"\nvectorize=true\nfloat_reassoc=false\n");
+    req = sfmt(?alloc, "{}{}", req, host_target_stanza(?alloc, "h"));
+    val rr: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, req);
+    if (sel rr.err) { code = 1; }
+    if (sel rr.ok) {
+        var m: Manifest                     = rr.ok;
+        val u: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("native", "", "app", false, true));
+        if (sel u.err) { code = 1; }
+        if (sel u.ok) {
+            if (u.ok.simd != SIMD_REQUIRE) { code = 1; }
+        }
+    }
+
+    var scl: str = sfmt(?alloc, "{}{}", "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{profile.name}\"\n", art);
+    scl = sfmt(?alloc, "{}{}", scl, "[profile.debug]\nopt=0\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    scl = sfmt(?alloc, "{}{}", scl, host_target_stanza(?alloc, "h"));
+    val rs: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, scl);
+    if (sel rs.err) { code = 1; }
+    if (sel rs.ok) {
+        var m: Manifest                     = rs.ok;
+        val u: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("native", "", "app", false, true));
+        if (sel u.err) { code = 1; }
+        if (sel u.ok) {
+            if (u.ok.simd != SIMD_SCALARIZE) { code = 1; }
+        }
+    }
+
+    var non: str = sfmt(?alloc, "{}{}", "[project]\nid=\"y\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{profile.name}\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n", art);
+    non = sfmt(?alloc, "{}{}", non, host_target_stanza(?alloc, "h"));
+    val rn: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, non);
+    if (sel rn.err) { code = 1; }
+    if (sel rn.ok) {
+        var m: Manifest                     = rn.ok;
+        val u: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("native", "", "app", false, true));
+        if (sel u.err) { code = 1; }
+        if (sel u.ok) {
+            if (u.ok.simd != SIMD_SCALARIZE) { code = 1; }
+        }
+    }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.resolve_build_unit:native_resolution_multi_match" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    var src: str = "[project]\nid = \"x\"\nversion = \"1\"\nsrc=\"src\"\nout=\"out\"\n[artifact.app]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[profile.debug]\ndefault = true\nopt = 0\ndebug = true\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n[profile.release]\nopt = 2\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n";
+    src = sfmt(?alloc, "{}{}", src, host_target_stanza(?alloc, "alpha"));
+    src = sfmt(?alloc, "{}{}", src, host_target_stanza(?alloc, "beta"));
+
+    val res_manifest: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, src);
+    if (sel res_manifest.err) { code = 1; }
+    if (sel res_manifest.ok) {
+        var m: Manifest                     = res_manifest.ok;
+        val u: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("native", "", "app", false, true));
+        if (!(sel u.err && str_contains(outcome.describe(u.err), "matches multiple targets"))) { code = 1; }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.resolve_build_unit:native_resolution_exact" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    var src: str = "[project]\nid = \"x\"\nversion = \"1\"\nsrc=\"src\"\nout=\"out\"\n[artifact.app]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[profile.debug]\ndefault = true\nopt = 0\ndebug = true\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n[profile.release]\nopt = 2\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n";
+    src = sfmt(?alloc, "{}{}", src, "[target.foreign]\nisa = \"nonesuch\"\nos = \"nonesuch\"\nabi = \"x\"\n");
+    src = sfmt(?alloc, "{}{}", src, host_target_stanza(?alloc, "host"));
+
+    val res_manifest: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, src);
+    if (sel res_manifest.err) { code = 1; }
+    if (sel res_manifest.ok) {
+        var m: Manifest                     = res_manifest.ok;
+        val u: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("native", "", "app", false, true));
+        if (sel u.err) { code = 1; }
+        if (sel u.ok) {
+            val bu: BuildUnit = u.ok;
+            if (bu.warned)                                        { code = 1; }
+            if (!str_equals(idstr(?itn, bu.target_name), "host")) { code = 1; }
+        }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.resolve_build_unit:native_resolution_zero_target" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val src: str = "[project]\nid = \"x\"\nversion = \"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[artifact.app]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[profile.debug]\ndefault = true\nopt = 0\ndebug = true\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n[profile.release]\nopt = 2\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n";
+
+    val res_manifest: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, src);
+    if (sel res_manifest.err) { code = 1; }
+    if (sel res_manifest.ok) {
+        var m: Manifest = res_manifest.ok;
+        if (m.target_count != 0) { code = 1; }
+
+        val ue: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("", "", "app", false, true));
+        if (sel ue.err) { code = 1; }
+
+        val u: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("native", "", "app", false, true));
+        if (sel u.err) { code = 1; }
+        if (sel u.ok) {
+            val bu: BuildUnit = u.ok;
+            if (bu.warned)                                                                    { code = 1; }
+            if (!str_equals(idstr(?itn, bu.target_name), "native"))                           { code = 1; }
+            if (!str_equals(idstr(?itn, bu.target.isa), host_isa_name()))                     { code = 1; }
+            if (!str_equals(idstr(?itn, bu.target.os), host_os_name()))                       { code = 1; }
+            if (!str_equals(idstr(?itn, bu.target.abi), abi.abi_name_for(tgt.host_abi_id()))) { code = 1; }
+            if (!str_equals(idstr(?itn, bu.obj_root), "out/native/obj"))                      { code = 1; }
+        }
+
+        val uf: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("foreign", "", "app", false, true));
+        if (!(sel uf.err && str_contains(outcome.describe(uf.err), "no target named"))) { code = 1; }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.resolve_build_unit:collision_detection" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val res_manifest: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"0.1.0\"\nsrc=\"src\"\nout=\"bin/app\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[artifact.a]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"app\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[artifact.b]\nkind=\"bin\"\nentry=\"b.mach\"\nout=\"app\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (sel res_manifest.err) { code = 1; }
+    if (sel res_manifest.ok) {
+        var m:  Manifest          = res_manifest.ok;
+        var v:  TmplVars          = tmpl_vars_of(?itn, ?m.targets[0], "debug");
+        val cr: err[outcome.Fail] = t_check_collisions(?alloc, ?itn, ?m, ?v);
+        if (!(sel cr.err && str_equals(outcome.describe(cr.err), "mach.toml: artifacts 'a' and 'b' collide on output path 'bin/app/app'"))) { code = 1; }
+    }
+
+    val res_clean: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"0.1.0\"\nsrc=\"src\"\nout=\"out/{target.name}/{profile.name}\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app1\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[artifact.tool]\nkind=\"bin\"\nentry=\"tool.mach\"\nout=\"bin/app2\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (sel res_clean.err) { code = 1; }
+    if (sel res_clean.ok) {
+        var m:  Manifest          = res_clean.ok;
+        var v:  TmplVars          = tmpl_vars_of(?itn, ?m.targets[0], "debug");
+        val cr: err[outcome.Fail] = t_check_collisions(?alloc, ?itn, ?m, ?v);
+        if (sel cr.err) { code = 1; }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.resolve_build_unit:ambiguous_artifact" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val res_manifest: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, demo_src());
+    if (sel res_manifest.err) { code = 1; }
+    if (sel res_manifest.ok) {
+        var m: Manifest                     = res_manifest.ok;
+        val u: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("", "", "", false, false));
+        if (sel u.ok) { code = 1; }
+        if (sel u.err) {
+            val msg: str = outcome.describe(u.err);
+            if (!str_contains(msg, "bin ls"))  { code = 1; }
+            if (!str_contains(msg, "bin cat")) { code = 1; }
+        }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.resolve_build_unit:links" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val src:          str                         = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[target.windows]\nisa=\"x86_64\"\nos=\"windows\"\nabi=\"win64\"\n[link.sys]\nsource=\"system\"\nname=\"c\"\nlibrary=\"c-runtime\"\nos=[\"linux\"]\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n[link.local_lib]\nsource=\"local\"\npath=\"lib/mylib.a\"\nos=[\"*\"]\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets = [\"*\"]\nlink = [\"sys\", \"local_lib\"]\nneed = []\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val res_manifest: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, src);
+    if (sel res_manifest.err) { code = 1; }
+    if (sel res_manifest.ok) {
+        var m: Manifest = res_manifest.ok;
+        if (m.link_count != 2) { code = 1; }
+
+        val ul: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("linux", "", "app", false, true));
+        if (sel ul.err) { code = 1; }
+        if (sel ul.ok) {
+            val bu: BuildUnit = ul.ok;
+            if (bu.lib_count != 2)                                                   { code = 1; }
+            if (!requirement_has(?itn, bu.libs, bu.lib_count, "c"))                  { code = 1; }
+            if (!requirement_has(?itn, bu.libs, bu.lib_count, "lib/mylib.a"))        { code = 1; }
+            if (bu.libs[0].source != LINK_SYSTEM || bu.libs[1].source != LINK_LOCAL) { code = 1; }
+            if (!str_equals(idstr(?itn, bu.libs[0].library), "c-runtime"))           { code = 1; }
+            if (!str_equals(idstr(?itn, bu.libs[1].library), "local_lib"))           { code = 1; }
+        }
+
+        val uw: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("windows", "", "app", false, true));
+        if (sel uw.err) { code = 1; }
+        if (sel uw.ok) {
+            val bu: BuildUnit = uw.ok;
+            if (bu.lib_count != 1)                                            { code = 1; }
+            if (!requirement_has(?itn, bu.libs, bu.lib_count, "lib/mylib.a")) { code = 1; }
+        }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.resolve_build_unit:local_project_out" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val src:          str                         = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[link.obj]\nsource=\"local\"\npath=\"{project.out}/obj/shim.o\"\nos=[\"*\"]\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets = [\"*\"]\nlink = [\"obj\"]\nneed = []\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val res_manifest: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, src);
+    if (sel res_manifest.err) { code = 1; }
+    if (sel res_manifest.ok) {
+        var m:  Manifest                     = res_manifest.ok;
+        val ul: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("linux", "", "app", false, true));
+        if (sel ul.err) { code = 1; }
+        if (sel ul.ok) {
+            val bu: BuildUnit = ul.ok;
+            if (bu.lib_count != 1)                                                     { code = 1; }
+            if (!requirement_has(?itn, bu.libs, bu.lib_count, "out/linux/obj/shim.o")) { code = 1; }
+        }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.local_path_demanded_by_step" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val src:          str                         = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[step.shim]\nargv=[\"cc\",\"-c\",\"shim.c\"]\nin=[\"shim.c\"]\nout=[\"{project.out}/obj/shim.o\"]\nneed=[]\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val res_manifest: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, src);
+    if (sel res_manifest.err) { code = 1; }
+    if (sel res_manifest.ok) {
+        var m: Manifest = res_manifest.ok;
+        var v: TmplVars = mk_tv("linux", "x86_64", "linux", "sysv64", "debug");
+        if (!local_path_demanded_by_step(?alloc, ?itn, ?m, "out/linux/obj/shim.o", "out/linux", ?v)) { code = 1; }
+        if (local_path_demanded_by_step(?alloc, ?itn, ?m, "out/linux/obj/nope.o", "out/linux", ?v))  { code = 1; }
+        if (step_producing_out(?alloc, ?itn, ?m, "out/linux/obj/shim.o", "out/linux", ?v) != 0)      { code = 1; }
+        if (step_producing_out(?alloc, ?itn, ?m, "out/linux/obj/nope.o", "out/linux", ?v) != -1)     { code = 1; }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.plan_steps" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val src: str                         = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[link.obj]\nsource=\"local\"\npath=\"{project.out}/o/a.o\"\nos=\"*\"\n[link.win]\nsource=\"local\"\npath=\"{project.out}/o/w.o\"\nos=\"windows\"\n[artifact.app]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink=[\"obj\",\"win\"]\nneed=[\"step.gen\"]\n[step.compile]\nargv=[\"cc\"]\nin=[\"a.c\"]\nout=[\"{project.out}/o/a.o\"]\n[step.winc]\nargv=[\"cc\"]\nin=[\"w.c\"]\nout=[\"{project.out}/o/w.o\"]\n[step.gen]\nargv=[\"g\"]\nin=[\"g.in\"]\nout=[\"{project.out}/g.h\"]\nneed=[\"step.dep*\"]\n[step.dep]\nargv=[\"d\"]\nin=[\"d.in\"]\nout=[\"{project.out}/d.o\"]\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val rm:  res[Manifest, outcome.Fail] = tparse_lenient(?alloc, ?itn, src);
+    if (sel rm.err) { code = 1; }
+    if (sel rm.ok) {
+        var m:  Manifest   = rm.ok;
+        val tl: *TargetDef = find_target_by_name(?itn, ?m, "linux");
+        if (tl == nil) { code = 1; }
+        or {
+            var names: [1]intern.StrId;
+            names[0] = intern_unwrap(?itn, "app");
+            var order: *u32              = nil;
+            var count: u32               = 0;
+            var v:     TmplVars          = tmpl_vars_of(?itn, tl, "debug");
+            val r:     err[outcome.Fail] = plan_steps(?alloc, ?itn, ?m, ?names[0], 1, tl, "out/linux", ?v, ?order, ?count);
+            if (sel r.err) { code = 1; }
+            if (sel r.ok) {
+                var has_compile: bool = false;
+                var has_gen:     bool = false;
+                var has_dep:     bool = false;
+                var has_winc:    bool = false;
+                var gen_pos:     i64  = -1;
+                var dep_pos:     i64  = -1;
+                var k:           u32  = 0;
+                for (k < count) {
+                    val nm: str = idstr(?itn, m.steps[order[k]].name);
+                    if (str_equals(nm, "compile")) { has_compile = true; }
+                    if (str_equals(nm, "gen")) {
+                        has_gen = true;
+                        gen_pos = k::i64;
+                    }
+                    if (str_equals(nm, "dep")) {
+                        has_dep = true;
+                        dep_pos = k::i64;
+                    }
+                    if (str_equals(nm, "winc")) { has_winc = true; }
+                    k = k + 1;
+                }
+                if (count != 3)                                      { code = 1; }
+                if (!has_compile || !has_gen || !has_dep)            { code = 1; }
+                if (has_winc)                                        { code = 1; }
+                if (dep_pos < 0 || gen_pos < 0 || dep_pos > gen_pos) { code = 1; }
+            }
+        }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.plan_export_steps" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val src: str                         = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[link.exp]\nsource=\"local\"\npath=\"{project.out}/o/m.o\"\nos=\"*\"\nexport=true\n[link.noexp]\nsource=\"local\"\npath=\"{project.out}/o/n.o\"\nos=\"*\"\nexport=false\n[link.win]\nsource=\"local\"\npath=\"{project.out}/o/w.o\"\nos=\"windows\"\nexport=true\n[step.mk]\nargv=[\"cc\"]\nin=[\"m.c\"]\nout=[\"{project.out}/o/m.o\"]\n[step.no]\nargv=[\"cc\"]\nin=[\"n.c\"]\nout=[\"{project.out}/o/n.o\"]\n[step.winmk]\nargv=[\"cc\"]\nin=[\"w.c\"]\nout=[\"{project.out}/o/w.o\"]\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val rm:  res[Manifest, outcome.Fail] = tparse_lenient(?alloc, ?itn, src);
+    if (sel rm.err) { code = 1; }
+    if (sel rm.ok) {
+        var m:  Manifest   = rm.ok;
+        val tl: *TargetDef = find_target_by_name(?itn, ?m, "linux");
+        if (tl == nil) { code = 1; }
+        or {
+            var order: *u32              = nil;
+            var count: u32               = 0;
+            var v:     TmplVars          = tmpl_vars_of(?itn, tl, "debug");
+            val r:     err[outcome.Fail] = plan_export_steps(?alloc, ?itn, ?m, tl, "out/linux", ?v, ?order, ?count);
+            if (sel r.err) { code = 1; }
+            if (sel r.ok) {
+                if (count != 1) { code = 1; }
+                or {
+                    if (!str_equals(idstr(?itn, m.steps[order[0]].name), "mk")) { code = 1; }
                 }
             }
         }
-        li = li + 1;
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.step_plans:exact_subset_extent_and_allocation_failure" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    val src:      str                         = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[link.exp]\nsource=\"local\"\npath=\"{project.out}/pick.o\"\nos=\"*\"\nexport=true\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink=[]\nneed=[\"step.pick\"]\n[step.pick]\nargv=[\"pick\"]\nin=[]\nout=[\"{project.out}/pick.o\"]\nneed=[]\n[step.extra_a]\nargv=[\"a\"]\nin=[]\nout=[\"{project.out}/a.o\"]\nneed=[]\n[step.extra_b]\nargv=[\"b\"]\nin=[]\nout=[\"{project.out}/b.o\"]\nneed=[]\n[step.extra_c]\nargv=[\"c\"]\nin=[]\nout=[\"{project.out}/c.o\"]\nneed=[]\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val parsed_r: res[Manifest, outcome.Fail] = tparse_lenient(?alloc, ?itn, src);
+    if (sel parsed_r.err) {
+        arena.dnit(?ar);
+        ret 1;
+    }
+    var m:      Manifest   = parsed_r.ok;
+    val target: *TargetDef = find_target_by_name(?itn, ?m, "linux");
+    if (target == nil) {
+        arena.dnit(?ar);
+        ret 1;
+    }
+    var v:     TmplVars = tmpl_vars_of(?itn, target, "debug");
+    var names: [1]intern.StrId;
+    names[0] = intern_unwrap(?itn, "app");
+    var bad: bool = false;
+
+    var success_probe: PlanAllocProbe;
+    var success_alloc: A.Allocator;
+    if (!plan_probe_make(?success_probe, ?success_alloc, 0)) {
+        arena.dnit(?ar);
+        ret 1;
+    }
+    var order:   *u32              = nil;
+    var count:   u32               = 0;
+    val planned: err[outcome.Fail] = plan_steps(?success_alloc, ?itn, ?m, ?names[0], 1, target, "out/linux", ?v, ?order, ?count);
+    if (sel planned.err || count != 1 || order == nil)     { bad = true; }
+    if (order != nil)                                      { A.deallocate[u32](?success_alloc, order, count::usize); }
+    if (success_probe.live != 0 || success_probe.mismatch) { bad = true; }
+
+    var export_probe: PlanAllocProbe;
+    var export_alloc: A.Allocator;
+    if (!plan_probe_make(?export_probe, ?export_alloc, 0)) {
+        arena.dnit(?ar);
+        ret 1;
+    }
+    order = nil;
+    count = 0;
+    val exported: err[outcome.Fail] = plan_export_steps(?export_alloc, ?itn, ?m, target, "out/linux", ?v, ?order, ?count);
+    if (sel exported.err || count != 1 || order == nil)  { bad = true; }
+    if (order != nil)                                    { A.deallocate[u32](?export_alloc, order, count::usize); }
+    if (export_probe.live != 0 || export_probe.mismatch) { bad = true; }
+
+    var fail_at: u32 = 1;
+    for (fail_at <= 3) {
+        var fail_probe: PlanAllocProbe;
+        var fail_alloc: A.Allocator;
+        if (!plan_probe_make(?fail_probe, ?fail_alloc, fail_at)) {
+            arena.dnit(?ar);
+            ret 1;
+        }
+        order = nil;
+        count = 0;
+        val failed: err[outcome.Fail] = plan_steps(?fail_alloc, ?itn, ?m, ?names[0], 1, target, "out/linux", ?v, ?order, ?count);
+        if (sel failed.ok || order != nil || count != 0 || fail_probe.live != 0 || fail_probe.mismatch) { bad = true; }
+        fail_at = fail_at + 1;
+    }
+    arena.dnit(?ar);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.manifest.resolve_test_libs:union" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val src:          str                         = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[link.a]\nsource=\"system\"\nname=\"liba\"\nos=\"*\"\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n[link.b]\nsource=\"system\"\nname=\"libb\"\nos=\"linux\"\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n[link.c]\nsource=\"system\"\nname=\"libdemo\"\nos=\"windows\"\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n[link.shared]\nsource=\"system\"\nname=\"libshared\"\nos=\"*\"\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n[artifact.app]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink=[\"a\",\"shared\"]\nneed=[]\n[artifact.tool]\nkind=\"bin\"\nentry=\"t.mach\"\nout=\"bin/tool\"\ntargets=[\"*\"]\nlink=[\"b\",\"shared\",\"c\"]\nneed=[]\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val res_manifest: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, src);
+    if (sel res_manifest.err) { code = 1; }
+    if (sel res_manifest.ok) {
+        var m:  Manifest   = res_manifest.ok;
+        val tl: *TargetDef = find_target_by_name(?itn, ?m, "linux");
+        if (tl == nil) { code = 1; }
+        or {
+            var items: *LinkRequirement  = nil;
+            var count: u32               = 0;
+            var v:     TmplVars          = tmpl_vars_of(?itn, tl, "debug");
+            val r:     err[outcome.Fail] = resolve_test_libs(?alloc, ?itn, ?m, tl, "out/linux", ?v, ?items, ?count);
+            if (sel r.err) { code = 1; }
+            if (sel r.ok) {
+                if (count != 3)                                        { code = 1; }
+                if (!requirement_has(?itn, items, count, "liba"))      { code = 1; }
+                if (!requirement_has(?itn, items, count, "libb"))      { code = 1; }
+                if (!requirement_has(?itn, items, count, "libshared")) { code = 1; }
+                if (requirement_has(?itn, items, count, "libdemo"))    { code = 1; }
+            }
+        }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.select_primary_artifact:first_target_compatible" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val src: str                         = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[target.windows]\nisa=\"x86_64\"\nos=\"windows\"\nabi=\"win64\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets=[\"linux\"]\nlink=[]\nneed=[]\n[artifact.app-windows]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app.exe\"\ntargets=[\"windows\"]\nlink=[]\nneed=[]\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val mr:  res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, src);
+    if (sel mr.err) { code = 1; }
+    if (sel mr.ok) {
+        var m: Manifest = mr.ok;
+
+        var windows: Selection         = mk_sel("windows", "", "", false, false);
+        val wr:      err[outcome.Fail] = select_primary_artifact(?alloc, ?itn, ?m, ?windows);
+        if (sel wr.err || !windows.has_artifact
+            || !str_equals(windows.artifact, "app-windows")) { code = 1; }
+        or {
+            val wu: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, windows);
+            if (sel wu.err) { code = 1; }
+            if (sel wu.ok) {
+                val unit: BuildUnit = wu.ok;
+                if (!str_equals(idstr(?itn, unit.bin_path), "out/bin/app.exe")) { code = 1; }
+            }
+        }
+
+        var linux: Selection         = mk_sel("linux", "", "", false, false);
+        val lr:    err[outcome.Fail] = select_primary_artifact(?alloc, ?itn, ?m, ?linux);
+        if (sel lr.err || !linux.has_artifact
+            || !str_equals(linux.artifact, "app")) { code = 1; }
+
+        var runnable: Selection         = mk_sel("windows", "", "", false, false);
+        val rr:       err[outcome.Fail] = select_sole_target_artifact(
+            ?alloc, ?itn, ?m, ?runnable);
+        if (sel rr.err || !runnable.has_artifact
+            || !str_equals(runnable.artifact, "app-windows")) { code = 1; }
+
+        var explicit: Selection                    = mk_sel("windows", "", "app", false, true);
+        val er:       err[outcome.Fail]            = select_primary_artifact(?alloc, ?itn, ?m, ?explicit);
+        val eu:       res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, explicit);
+        if (sel er.err || !str_equals(explicit.artifact, "app")
+            || sel eu.ok) { code = 1; }
     }
 
-    ret plan_finish(alloc, state, order, step_count, order_len, out_order, out_count);
+    val ambiguous_src: str = sfmt(?alloc, "{}{}", src,
+        "[artifact.tool-windows]\nkind=\"bin\"\nentry=\"tool.mach\"\nout=\"bin/tool.exe\"\ntargets=[\"windows\"]\nlink=[]\nneed=[]\n");
+    val amr: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, ambiguous_src);
+    if (sel amr.err) { code = 1; }
+    if (sel amr.ok) {
+        var am:        Manifest          = amr.ok;
+        var ambiguous: Selection         = mk_sel("windows", "", "", false, false);
+        val ar_:       err[outcome.Fail] = select_sole_target_artifact(
+            ?alloc, ?itn, ?am, ?ambiguous);
+        if (sel ar_.err || ambiguous.has_artifact) { code = 1; }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.select_sole_executable_artifact:picks_the_bin_over_a_co_declared_lib" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val src: str                         = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets=[\"linux\"]\nlink=[]\nneed=[]\n[artifact.applib]\nkind=\"static\"\nentry=\"lib.mach\"\nout=\"lib/applib.a\"\ntargets=[\"linux\"]\nlink=[]\nneed=[]\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val mr:  res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, src);
+    if (sel mr.err) { ret 1; }
+    var m: Manifest = mr.ok;
+
+    var picked: Selection         = mk_sel("linux", "", "", false, false);
+    val pr:     err[outcome.Fail] = select_sole_executable_artifact(?alloc, ?itn, ?m, ?picked);
+    if (sel pr.err || !picked.has_artifact
+        || picked.want_lib || !str_equals(picked.artifact, "app")) { code = 1; }
+
+    var stale: Selection         = mk_sel("linux", "", "", false, false);
+    val sr:    err[outcome.Fail] = select_sole_target_artifact(?alloc, ?itn, ?m, ?stale);
+    if (sel sr.err || stale.has_artifact) { code = 1; }
+
+    val two_bin_src: str = sfmt(?alloc, "{}{}", src,
+        "[artifact.app2]\nkind=\"bin\"\nentry=\"main2.mach\"\nout=\"bin/app2\"\ntargets=[\"linux\"]\nlink=[]\nneed=[]\n");
+    val tmr: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, two_bin_src);
+    if (sel tmr.err) { code = 1; }
+    if (sel tmr.ok) {
+        var tm:        Manifest          = tmr.ok;
+        var ambiguous: Selection         = mk_sel("linux", "", "", false, false);
+        val ar_:       err[outcome.Fail] = select_sole_executable_artifact(?alloc, ?itn, ?tm, ?ambiguous);
+        if (sel ar_.err || ambiguous.has_artifact) { code = 1; }
+    }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+fun ut_pin_manifest() str {
+    ret "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[target.windows]\nisa=\"x86_64\"\nos=\"windows\"\nabi=\"win64\"\n[target.linux-arm64]\nisa=\"aarch64\"\nos=\"linux\"\nabi=\"aapcs64\"\n[target.darwin-x86_64]\nisa=\"x86_64\"\nos=\"darwin\"\nabi=\"sysv64\"\n[target.darwin-arm64]\nisa=\"aarch64\"\nos=\"darwin\"\nabi=\"aapcs64\"\n[target.kernel]\nisa=\"x86_64\"\nos=\"freestanding\"\nabi=\"sysv64\"\n[target.kernel-arm]\nisa=\"aarch64\"\nos=\"freestanding\"\nabi=\"aapcs64\"\n[artifact.kernel]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/kernel\"\ntargets=[\"kernel\"]\nlink=[]\nneed=[]\n[artifact.both]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/both\"\ntargets=[\"kernel\",\"kernel-arm\"]\nlink=[]\nneed=[]\n[artifact.tool]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/tool\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+}
+
+test "mach.lang.manifest.resolve_build_unit:sole_target_artifact_pins_it" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val res_manifest: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, ut_pin_manifest());
+    if (sel res_manifest.err) { code = 1; }
+    if (sel res_manifest.ok) {
+        var m: Manifest = res_manifest.ok;
+
+        val uk: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("", "", "kernel", false, true));
+        if (sel uk.err) { code = 1; }
+        if (sel uk.ok) {
+            val u: BuildUnit = uk.ok;
+            if (!str_equals(idstr(?itn, u.target_name), "kernel")) { code = 1; }
+        }
+
+        val ut: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("", "", "tool", false, true));
+        if (sel ut.err) { code = 1; }
+        if (sel ut.ok) {
+            val u: BuildUnit = ut.ok;
+            if (str_equals(idstr(?itn, u.target_name), "kernel")) { code = 1; }
+        }
+
+        val ux: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("linux", "", "kernel", false, true));
+        if (!(sel ux.err && str_contains(outcome.describe(ux.err), "does not support target"))) { code = 1; }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.resolve_build_unit:no_hostable_target_lists_the_candidates" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val res_manifest: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, ut_pin_manifest());
+    if (sel res_manifest.err) { code = 1; }
+    if (sel res_manifest.ok) {
+        var m:  Manifest                     = res_manifest.ok;
+        val ub: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("", "", "both", false, true));
+        if (sel ub.ok) { code = 1; }
+        if (sel ub.err) {
+            val e: str = outcome.describe(ub.err);
+            if (!str_contains(e, "declares no target for this host")) { code = 1; }
+            if (!str_contains(e, "kernel-arm"))                       { code = 1; }
+            if (!str_contains(e, "--target"))                         { code = 1; }
+        }
+
+        val uk: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("kernel-arm", "", "both", false, true));
+        if (sel uk.err) { code = 1; }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.cell_supported:enumerated_axis_is_not_pinned_by_the_artifact" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val res_manifest: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, ut_pin_manifest());
+    if (sel res_manifest.err) { code = 1; }
+    if (sel res_manifest.ok) {
+        var m:  Manifest                = res_manifest.ok;
+        val ck: res[bool, outcome.Fail] = cell_supported(?alloc, ?itn, ?m, mk_sel("", "", "kernel", false, true));
+        if (sel ck.err) { code = 1; }
+        if (sel ck.ok) {
+            if (ck.ok) { code = 1; }
+        }
+        val ct: res[bool, outcome.Fail] = cell_supported(?alloc, ?itn, ?m, mk_sel("", "", "tool", false, true));
+        if (sel ct.err) { code = 1; }
+        if (sel ct.ok) {
+            if (!ct.ok) { code = 1; }
+        }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.select_primary_artifact:several_candidates_need_exactly_one_default_and_order_is_meaningless" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val head:           str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val first:          str = "[artifact.first]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"bin/first\"\ntargets=[\"linux\"]\nlink=[]\nneed=[]\n";
+    val second_default: str = "[artifact.second]\nkind=\"bin\"\nentry=\"b.mach\"\nout=\"bin/second\"\ntargets=[\"linux\"]\nlink=[]\nneed=[]\ndefault=true\n";
+    val second_plain:   str = "[artifact.second]\nkind=\"bin\"\nentry=\"b.mach\"\nout=\"bin/second\"\ntargets=[\"linux\"]\nlink=[]\nneed=[]\n";
+    val first_default:  str = "[artifact.first]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"bin/first\"\ntargets=[\"linux\"]\nlink=[]\nneed=[]\ndefault=true\n";
+
+    val dr: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}", head, first, second_default));
+    if (sel dr.err) { code = 1; }
+    if (sel dr.ok) {
+        var m:                         Manifest          = dr.ok;
+        var primary:                   Selection         = mk_sel("linux", "", "", false, false);
+        val select_primary_artifact_r: err[outcome.Fail] = select_primary_artifact(?alloc, ?itn, ?m, ?primary);
+        if (sel select_primary_artifact_r.err
+            || !primary.has_artifact || !str_equals(primary.artifact, "second")) { code = 1; }
+        var sole:                          Selection         = mk_sel("linux", "", "", false, false);
+        val select_sole_target_artifact_r: err[outcome.Fail] = select_sole_target_artifact(?alloc, ?itn, ?m, ?sole);
+        if (sel select_sole_target_artifact_r.err
+            || !sole.has_artifact || !str_equals(sole.artifact, "second")) { code = 1; }
+        var exe:                               Selection         = mk_sel("linux", "", "", false, false);
+        val select_sole_executable_artifact_r: err[outcome.Fail] = select_sole_executable_artifact(?alloc, ?itn, ?m, ?exe);
+        if (sel select_sole_executable_artifact_r.err
+            || !exe.has_artifact || !str_equals(exe.artifact, "second")) { code = 1; }
+        var explicit:                   Selection         = mk_sel("linux", "", "first", false, true);
+        val select_primary_artifact_r2: err[outcome.Fail] = select_primary_artifact(?alloc, ?itn, ?m, ?explicit);
+        if (sel select_primary_artifact_r2.err
+            || !str_equals(explicit.artifact, "first")) { code = 1; }
+    }
+
+    val nr: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}", head, first, second_plain));
+    if (sel nr.err) { code = 1; }
+    if (sel nr.ok) {
+        var m:       Manifest          = nr.ok;
+        var primary: Selection         = mk_sel("linux", "", "", false, false);
+        val pr:      err[outcome.Fail] = select_primary_artifact(?alloc, ?itn, ?m, ?primary);
+        if (primary.has_artifact) { code = 1; }
+        if (sel pr.err) {
+            val text: str = outcome.describe(pr.err);
+            if (!str_contains(text, "several artifacts support the selected target and none is marked `default = true`")) { code = 1; }
+            if (!str_contains(text, "first") || !str_contains(text, "second"))                                            { code = 1; }
+        }
+        or { code = 1; }
+        var sole:                           Selection         = mk_sel("linux", "", "", false, false);
+        val select_sole_target_artifact_r2: err[outcome.Fail] = select_sole_target_artifact(?alloc, ?itn, ?m, ?sole);
+        if (sel select_sole_target_artifact_r2.err || sole.has_artifact) { code = 1; }
+    }
+
+    val tr: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}", head, first_default, second_default));
+    if (sel tr.err) { code = 1; }
+    if (sel tr.ok) {
+        var m:       Manifest          = tr.ok;
+        var primary: Selection         = mk_sel("linux", "", "", false, false);
+        val pr:      err[outcome.Fail] = select_primary_artifact(?alloc, ?itn, ?m, ?primary);
+        if (!(sel pr.err && (!(primary.has_artifact) && str_contains(outcome.describe(pr.err), "exactly one")))) { code = 1; }
+    }
+
+    val br: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[artifact.bad]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"bin/bad\"\ntargets=[\"linux\"]\nlink=[]\nneed=[]\ndefault=\"yes\"\n"));
+    if (!(sel br.err && str_contains(outcome.describe(br.err), "default must be a boolean"))) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.select_primary_artifact:a_target_that_does_not_resolve_is_reported_as_a_target_failure" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val head: str = "[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n";
+    val arts: str = "[artifact.first]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"bin/first\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n[artifact.second]\nkind=\"bin\"\nentry=\"b.mach\"\nout=\"bin/second\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n";
+
+    var foreign_os:  str = "windows";
+    var foreign_abi: str = "win64";
+    $if ($mach.build.os == $mach.os.windows) {
+        foreign_os  = "linux";
+        foreign_abi = "sysv64";
+    }
+    val f1: str = sfmt(?alloc, "[target.f1]\nisa=\"x86_64\"\nos=\"{}\"\nabi=\"{}\"\n", foreign_os, foreign_abi);
+
+    val named: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}", head, f1, arts));
+    if (sel named.err) { code = 1; }
+    if (sel named.ok) {
+        var m:       Manifest          = named.ok;
+        var missing: Selection         = mk_sel("nope", "", "", false, false);
+        val pr:      err[outcome.Fail] = select_primary_artifact(?alloc, ?itn, ?m, ?missing);
+        if (!(sel pr.err && (!(missing.has_artifact) && str_contains(outcome.describe(pr.err), "no target named 'nope'")))) { code = 1; }
+
+        var sole:                          Selection         = mk_sel("nope", "", "", false, false);
+        val select_sole_target_artifact_r: err[outcome.Fail] = select_sole_target_artifact(?alloc, ?itn, ?m, ?sole);
+        if (sel select_sole_target_artifact_r.err || sole.has_artifact) { code = 1; }
+        var exe:                               Selection         = mk_sel("nope", "", "", false, false);
+        val select_sole_executable_artifact_r: err[outcome.Fail] = select_sole_executable_artifact(?alloc, ?itn, ?m, ?exe);
+        if (sel select_sole_executable_artifact_r.err || exe.has_artifact) { code = 1; }
+    }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.resolve_target:native_without_a_host_match_uses_the_sole_or_default_declaration_never_table_order" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val head:        str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val art:         str = "[artifact.app]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n";
+    var foreign_os:  str = "windows";
+    var foreign_abi: str = "win64";
+    $if ($mach.build.os == $mach.os.windows) {
+        foreign_os  = "linux";
+        foreign_abi = "sysv64";
+    }
+    val w1:         str       = sfmt(?alloc, "[target.w1]\nisa=\"x86_64\"\nos=\"{}\"\nabi=\"{}\"\n", foreign_os, foreign_abi);
+    val w2:         str       = sfmt(?alloc, "[target.w2]\nisa=\"x86_64\"\nos=\"{}\"\nabi=\"{}\"\n", foreign_os, foreign_abi);
+    val w2_default: str       = sfmt(?alloc, "{}default=true\n", w2);
+    val w1_default: str       = sfmt(?alloc, "{}default=true\n", w1);
+    val native:     Selection = mk_sel("native", "", "", false, false);
+
+    val sr: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}", head, w1, art));
+    if (sel sr.err) { code = 1; }
+    if (sel sr.ok) {
+        var m: Manifest                     = sr.ok;
+        val u: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, native);
+        if (sel u.err) { code = 1; }
+        if (sel u.ok) {
+            val bu: BuildUnit = u.ok;
+            if (!bu.warned || !str_equals(idstr(?itn, bu.target_name), "w1")) { code = 1; }
+        }
+    }
+
+    # intentional removal (#3226, #3112): two foreign targets and no default is refused
+    val nr: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}{}", head, w1, w2, art));
+    if (sel nr.err) { code = 1; }
+    if (sel nr.ok) {
+        var m: Manifest                     = nr.ok;
+        val u: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, native);
+        if (sel u.err) {
+            val text: str = outcome.describe(u.err);
+            if (!str_contains(text, "several targets are declared, none matches the host and none is marked `default = true`")) { code = 1; }
+            if (!str_contains(text, "--target"))                                                                                { code = 1; }
+        }
+        or { code = 1; }
+    }
+
+    val dr: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}{}", head, w1, w2_default, art));
+    if (sel dr.err) { code = 1; }
+    if (sel dr.ok) {
+        var m: Manifest                     = dr.ok;
+        val u: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, native);
+        if (sel u.err) { code = 1; }
+        if (sel u.ok) {
+            val bu: BuildUnit = u.ok;
+            if (!bu.warned || !str_equals(idstr(?itn, bu.target_name), "w2")) { code = 1; }
+        }
+        val e: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("w1", "", "", false, false));
+        if (!(sel e.ok && str_equals(idstr(?itn, e.ok.target_name), "w1"))) { code = 1; }
+    }
+
+    val tr: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}{}", head, w1_default, w2_default, art));
+    if (!(sel tr.err && str_contains(outcome.describe(tr.err), "exactly one"))) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+# intentional removal test (#3226, #3112): no profile is selected by table order
+test "mach.lang.manifest.resolve_profile:several_profiles_without_a_default_are_refused_naming_the_default_key" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code:        i32                         = 0;
+    val head:        str                         = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n";
+    val two:         str                         = "[profile.fast]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n[profile.slow]\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val two_default: str                         = "[profile.fast]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n[profile.slow]\nopt=0\ndebug=true\nsimd=\"scalarize\"\ndefault=true\nvectorize=true\nfloat_reassoc=false\n";
+    val lr:          res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, two));
+    if (sel lr.err) { code = 1; }
+    if (sel lr.ok) {
+        var m:  Manifest                           = lr.ok;
+        val pr: res[ResolvedProfile, outcome.Fail] = resolve_profile(?alloc, ?itn, ?m, "");
+        if (!(sel pr.err && str_equals(outcome.describe(pr.err), AMBIGUOUS_PROFILE_MSG))) { code = 1; }
+        val ex: res[ResolvedProfile, outcome.Fail] = resolve_profile(?alloc, ?itn, ?m, "slow");
+        if (!(sel ex.ok && str_equals(idstr(?itn, ex.ok.name), "slow"))) { code = 1; }
+    }
+    val dr: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, two_default));
+    if (sel dr.err) { code = 1; }
+    if (sel dr.ok) {
+        var m:  Manifest                           = dr.ok;
+        val pr: res[ResolvedProfile, outcome.Fail] = resolve_profile(?alloc, ?itn, ?m, "");
+        if (sel pr.err) { code = 1; }
+        if (sel pr.ok) {
+            val rp: ResolvedProfile = pr.ok;
+            if (!str_equals(idstr(?itn, rp.name), "slow")) { code = 1; }
+        }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.native_owner:repeated_resolution_borrows_one_manifest_definition" {
+    # the dependency form: a root manifest must declare a profile, and this test owns only the native target
+    var backing: A.Allocator;
+    val make_r:  err[A.Error] = page.make(?backing);
+    if (sel make_r.err) { ret 1; }
+    var itn: intern.Interner = intern.init(?backing);
+    fin { intern.dnit(?itn); }
+    val table_r: res[toml.Table, toml.TomlError] = toml.parse(?backing,
+        "[project]\nid=\"owner\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n");
+    if (sel table_r.err) { ret 2; }
+    var table: toml.Table = table_r.ok;
+    fin { toml.dnit(?backing, ?table); }
+    var tracking: alloc_test.Testing;
+    val make_r2:  err[A.Error] = alloc_test.make(?tracking);
+    if (sel make_r2.err) { ret 3; }
+    fin { alloc_test.dnit(?tracking); }
+    val parsed: res[Manifest, outcome.Fail] = parse(?tracking.a, ?itn, ?table, false);
+    if (sel parsed.err) { ret 4; }
+    var m: Manifest = parsed.ok;
+    fin { dnit(?m, ?tracking.a); }
+    if (m.native_target == nil || m.targets != nil || m.target_count != 0) { ret 5; }
+    val attempts: usize = tracking.attempts;
+    tracking.fail_at = attempts + 1;
+    var i: usize = 0;
+    for (i < 32) {
+        val resolved: res[ResolvedTarget, outcome.Fail] = resolve_target(?tracking.a, ?itn, ?m, "native", nil);
+        if (sel resolved.err) { ret 6; }
+        val rt: ResolvedTarget = resolved.ok;
+        if (rt.target != m.native_target || rt.warned)                                   { ret 7; }
+        if (!target_matches_host(?itn, rt.target, tgt.host_os_id(), tgt.host_arch_id())) { ret 8; }
+        i = i + 1;
+    }
+    if (tracking.attempts != attempts) { ret 9; }
+    dnit(?m, ?tracking.a);
+    dnit(?m, ?tracking.a);
+    if (tracking.live != 0 || tracking.double_frees != 0 || tracking.exhausted != 0) { ret 10; }
+    var ordinal: usize = 1;
+    for (ordinal <= attempts) {
+        tracking.attempts = 0;
+        tracking.fail_at  = ordinal;
+        val failed: res[Manifest, outcome.Fail] = parse(?tracking.a, ?itn, ?table, false);
+        if (sel failed.ok) {
+            var unexpected: Manifest = failed.ok;
+            dnit(?unexpected, ?tracking.a);
+            ret 11;
+        }
+        if (tracking.live != 0 || tracking.double_frees != 0 || tracking.exhausted != 0) { ret 12; }
+        ordinal = ordinal + 1;
+    }
+    ret 0;
+}
+
+fun t_resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
+    selection: Selection) res[BuildUnit, outcome.Fail] {
+    var reg: tgt.TargetRegistry = tgt.registry_init();
+    fin { tgt.registry_dnit(?reg); }
+    val ready: err[fail.Fail] = tgt.register_all(?reg, target_testing.debug_descriptor);
+    if (sel ready.err) { ret res[BuildUnit, outcome.Fail].err{outcome.from_fail(ready.err)}; }
+    ret resolve_build_unit(alloc, itn, ?reg, m, selection);
+}
+
+fun t_check_collisions(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
+    vars: *TmplVars) err[outcome.Fail] {
+    var reg: tgt.TargetRegistry = tgt.registry_init();
+    fin { tgt.registry_dnit(?reg); }
+    val ready: err[fail.Fail] = tgt.register_all(?reg, target_testing.debug_descriptor);
+    if (sel ready.err) { ret err[outcome.Fail].err{outcome.from_fail(ready.err)}; }
+    ret check_collisions(alloc, itn, ?reg, m, vars);
+}
+
+fun t_resolve_artifact_reqs(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
+    consumer: *ArtifactDef, consumer_target: *TargetDef, profile: str,
+    whole_project: bool, out_items: **ArtifactReq, out_count: *u32) err[outcome.Fail] {
+    var reg: tgt.TargetRegistry = tgt.registry_init();
+    fin { tgt.registry_dnit(?reg); }
+    val ready: err[fail.Fail] = tgt.register_all(?reg, target_testing.debug_descriptor);
+    if (sel ready.err) { ret err[outcome.Fail].err{outcome.from_fail(ready.err)}; }
+    ret resolve_artifact_reqs(alloc, itn, ?reg, m, consumer, consumer_target, profile,
+        whole_project, out_items, out_count);
+}
+
+test "mach.lang.manifest.resolve_build_unit:artifact_suffix_preserves_identity_and_literal_paths" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    fin { arena.dnit(?ar); }
+    val src: str = sfmt(?alloc, "{}{}", need_head(),
+        "[target.win]\nisa=\"x86_64\"\nos=\"windows\"\nabi=\"win64\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app{artifact.suffix}\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n[artifact.literal]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/literal\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n");
+    val parsed: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, src);
+    if (sel parsed.err) { ret 2; }
+    var m:       Manifest                     = parsed.ok;
+    val linux:   res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("host", "debug", "app", false, true));
+    val windows: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("win", "debug", "app", false, true));
+    val literal: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("win", "debug", "literal", false, true));
+    if (sel linux.err)   { ret 3; }
+    if (sel windows.err) { ret 3; }
+    if (sel literal.err) { ret 3; }
+    val lu: BuildUnit = linux.ok;
+    val wu: BuildUnit = windows.ok;
+    if (lu.artifact.name != wu.artifact.name || !str_equals(idstr(?itn, wu.artifact.name), "app")) { ret 4; }
+    if (!str_equals(idstr(?itn, lu.bin_path), "out/host/bin/app"))                                 { ret 5; }
+    if (!str_equals(idstr(?itn, wu.bin_path), "out/win/bin/app.exe"))                              { ret 6; }
+    if (!str_equals(idstr(?itn, literal.ok.bin_path), "out/win/bin/literal"))                      { ret 7; }
+    var v:           TmplVars               = tmpl_vars_of(?itn, wu.target, "debug");
+    val unavailable: res[str, outcome.Fail] = expand(?alloc, "{artifact.suffix}", "out", ?v);
+    if (sel unavailable.ok) { ret 8; }
+    val alias: res[intern.StrId, A.Error] = intern.intern(?itn, "bin/app.exe");
+    if (sel alias.err) { ret 9; }
+    val other: *ArtifactDef = find_artifact(?itn, ?m, "literal");
+    other.out = alias.ok;
+    val t_check_collisions_r: err[outcome.Fail] = t_check_collisions(?alloc, ?itn, ?m, ?v);
+    if (sel t_check_collisions_r.ok) { ret 10; }
+    ret 0;
+}
+
+test "mach.lang.manifest.validate_needs:steps_require_only_steps_and_qualified_globs_skip_the_declarer" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    fin { arena.dnit(?ar); }
+    val steps: str = "[step.gen-a]\nargv=[\"true\"]\nin=[]\nout=[]\nneed=[]\n[step.gen-b]\nargv=[\"true\"]\nin=[]\nout=[]\nneed=[\"step.gen-*\"]\n";
+    val app:   str = "[artifact.app]\nkind=\"bin\"\nentry=\"m.mach\"\nout=\"bin/app\"\ntargets=[\"host\"]\nlink=[]\nneed=[\"step.gen-b\"]\n";
+
+    val glob_skips_self: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}", need_head(), steps, app));
+    if (sel glob_skips_self.err) { ret 2; }
+    var m:       Manifest          = glob_skips_self.ok;
+    var order:   *u32              = nil;
+    var count:   u32               = 0;
+    var vars:    TmplVars          = tmpl_vars_of(?itn, ?m.targets[0], "debug");
+    val a:       *ArtifactDef      = find_artifact(?itn, ?m, "app");
+    val planned: err[outcome.Fail] = plan_steps(?alloc, ?itn, ?m, ?a.name, 1, ?m.targets[0], "out/host", ?vars, ?order, ?count);
+    if (sel planned.err)                                                                                                        { ret 3; }
+    if (count != 2)                                                                                                             { ret 3; }
+    if (!str_equals(idstr(?itn, m.steps[order[0]].name), "gen-a") || !str_equals(idstr(?itn, m.steps[order[1]].name), "gen-b")) { ret 4; }
+
+    val step_needs_artifact: str = sfmt(?alloc, "{}{}{}", need_head(),
+        need_artifact(?alloc, "support", "support", ""),
+        "[step.gen]\nargv=[\"true\"]\nin=[]\nout=[]\nneed=[\"artifact.support\"]\n");
+    if (!need_err(?alloc, ?itn, step_needs_artifact, "[step.gen].need entry 'artifact.support' must use 'step.<name>' or 'artifact.<name>' with optional '*' wildcards; steps may require only steps")) { ret 5; }
+
+    val step_self: str = sfmt(?alloc, "{}{}", need_head(), "[step.gen]\nargv=[\"true\"]\nin=[]\nout=[]\nneed=[\"step.gen\"]\n");
+    if (!need_err(?alloc, ?itn, step_self, "[step.gen].need requires itself")) { ret 6; }
+
+    val step_only_self_glob: str = sfmt(?alloc, "{}{}", need_head(), "[step.gen]\nargv=[\"true\"]\nin=[]\nout=[]\nneed=[\"step.g*\"]\n");
+    if (!need_err(?alloc, ?itn, step_only_self_glob, "[step.gen].need entry 'step.g*' matches no declaration in its category")) { ret 7; }
+
+    val same_name_both: str = sfmt(?alloc, "{}{}{}{}", need_head(),
+        need_artifact(?alloc, "twin", "twin", ""),
+        "[step.twin]\nargv=[\"true\"]\nin=[]\nout=[]\nneed=[]\n",
+        "[artifact.app]\nkind=\"bin\"\nentry=\"m.mach\"\nout=\"bin/app\"\ntargets=[\"host\"]\nlink=[]\nneed=[\"step.twin\",\"artifact.twin\"]\n");
+    val both: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, same_name_both);
+    if (sel both.err) { ret 8; }
+    var mb:       Manifest     = both.ok;
+    val consumer: *ArtifactDef = find_artifact(?itn, ?mb, "app");
+    val twin:     *ArtifactDef = find_artifact(?itn, ?mb, "twin");
+    if (!artifact_needs_artifact(?itn, consumer, twin)) { ret 9; }
+    var border:   *u32              = nil;
+    var bcount:   u32               = 0;
+    var bvars:    TmplVars          = tmpl_vars_of(?itn, ?mb.targets[0], "debug");
+    val bplanned: err[outcome.Fail] = plan_steps(?alloc, ?itn, ?mb, ?consumer.name, 1, ?mb.targets[0], "out/host", ?bvars, ?border, ?bcount);
+    if (sel bplanned.err)                                           { ret 10; }
+    if (bcount != 1)                                                { ret 10; }
+    if (!str_equals(idstr(?itn, mb.steps[border[0]].name), "twin")) { ret 10; }
+    ret 0;
+}
+
+fun t_suffix_unit(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, target: str, artifact: str, want_lib: bool) res[BuildUnit, outcome.Fail] {
+    ret t_resolve_build_unit(alloc, itn, m, mk_sel(target, "debug", artifact, want_lib, true));
+}
+
+test "mach.lang.manifest.resolve_build_unit:artifact_suffix_maps_every_kind_on_every_object_format" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    fin { arena.dnit(?ar); }
+    val targets:   str                         = "[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[target.win]\nisa=\"x86_64\"\nos=\"windows\"\nabi=\"win64\"\n[target.mac]\nisa=\"aarch64\"\nos=\"darwin\"\nabi=\"aapcs64\"\n[target.raw]\nisa=\"x86_64\"\nos=\"freestanding\"\nabi=\"sysv64\"\n[target.gpu]\nisa=\"spirv\"\nos=\"freestanding\"\nabi=\"spirv\"\n";
+    val artifacts: str                         = "[artifact.tool]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/tool{artifact.suffix}\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n[artifact.archive]\nkind=\"static\"\nentry=\"lib.mach\"\nout=\"lib/libarchive{artifact.suffix}\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n[artifact.dyn]\nkind=\"shared\"\nentry=\"lib.mach\"\nout=\"lib/libdyn{artifact.suffix}\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n";
+    val parsed:    res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}", need_head(), targets, artifacts));
+    if (sel parsed.err) { ret 2; }
+    var m: Manifest = parsed.ok;
+
+    var names: [15]str;
+    var kinds: [15]str;
+    var libs:  [15]bool;
+    var wants: [15]str;
+    var tn:    [5]str;
+    tn[0] = "linux";
+    tn[1] = "win";
+    tn[2] = "mac";
+    tn[3] = "raw";
+    tn[4] = "gpu";
+    var exe: [5]str;
+    exe[0] = "out/linux/bin/tool";
+    exe[1] = "out/win/bin/tool.exe";
+    exe[2] = "out/mac/bin/tool";
+    exe[3] = "out/raw/bin/tool";
+    exe[4] = "out/gpu/bin/tool.spv";
+    var sta: [5]str;
+    sta[0] = "out/linux/lib/libarchive.a";
+    sta[1] = "out/win/lib/libarchive.lib";
+    sta[2] = "out/mac/lib/libarchive.a";
+    sta[3] = "";
+    sta[4] = "";
+    var shd: [5]str;
+    shd[0] = "out/linux/lib/libdyn.so";
+    shd[1] = "out/win/lib/libdyn.dll";
+    shd[2] = "out/mac/lib/libdyn.dylib";
+    shd[3] = "";
+    shd[4] = "";
+    var i: usize = 0;
+    for (i < 5) {
+        names[i * 3]     = tn[i];
+        kinds[i * 3]     = "tool";
+        libs[i * 3]      = false;
+        wants[i * 3]     = exe[i];
+        names[i * 3 + 1] = tn[i];
+        kinds[i * 3 + 1] = "archive";
+        libs[i * 3 + 1]  = true;
+        wants[i * 3 + 1] = sta[i];
+        names[i * 3 + 2] = tn[i];
+        kinds[i * 3 + 2] = "dyn";
+        libs[i * 3 + 2]  = true;
+        wants[i * 3 + 2] = shd[i];
+        i                = i + 1;
+    }
+    i = 0;
+    for (i < 15) {
+        val u: res[BuildUnit, outcome.Fail] = t_suffix_unit(?alloc, ?itn, ?m, names[i], kinds[i], libs[i]);
+        if (str_empty(wants[i])) {
+            if (sel u.ok)                                                                             { ret 10 + i::i32; }
+            if (!str_contains(outcome.describe(u.err), "artifact naming: this object format has no")) { ret 10 + i::i32; }
+        }
+        or {
+            if (sel u.err)                                         { ret 30 + i::i32; }
+            if (!str_equals(idstr(?itn, u.ok.bin_path), wants[i])) { ret 50 + i::i32; }
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.manifest.expand:artifact_suffix_is_refused_outside_an_artifact_output" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    fin { arena.dnit(?ar); }
+    val project_out: str = sfmt(?alloc, "{}{}", "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{artifact.suffix}\"\n[target.host]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[profile.debug]\nopt=0\ndebug=false\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n",
+        "[artifact.app]\nkind=\"bin\"\nentry=\"m.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n");
+    val parsed: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, project_out);
+    if (sel parsed.err) { ret 2; }
+    var m: Manifest                     = parsed.ok;
+    val u: res[BuildUnit, outcome.Fail] = t_resolve_build_unit(?alloc, ?itn, ?m, mk_sel("host", "debug", "app", false, true));
+    if (sel u.ok)                                                                                              { ret 3; }
+    if (!str_contains(outcome.describe(u.err), "'{artifact.suffix}' is available only in an artifact output")) { ret 3; }
+
+    val step_out: str = sfmt(?alloc, "{}{}", need_head(),
+        "[artifact.app]\nkind=\"bin\"\nentry=\"m.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink=[]\nneed=[\"step.gen\"]\n[step.gen]\nargv=[\"true\"]\nin=[]\nout=[\"{project.out}/gen{artifact.suffix}\"]\nneed=[]\n");
+    val sp: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, step_out);
+    if (sel sp.err) { ret 4; }
+    var ms:       Manifest               = sp.ok;
+    var v:        TmplVars               = tmpl_vars_of(?itn, ?ms.targets[0], "debug");
+    val expanded: res[str, outcome.Fail] = expand(?alloc, idstr(?itn, ms.steps[0].out[0]), "out/host", ?v);
+    if (sel expanded.ok)                                                                                              { ret 5; }
+    if (!str_contains(outcome.describe(expanded.err), "'{artifact.suffix}' is available only in an artifact output")) { ret 5; }
+    ret 0;
 }
