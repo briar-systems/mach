@@ -28,6 +28,7 @@ A decorator is written as an attribute:
 ```
 #[deprecated]        # external uses warn
 #[deprecated("msg")] # external uses warn with this message
+#[testing]           # exists only for tests; omitted from ordinary builds
 #[symbol("name")]    # linker name override
 #[library("dep")]    # dynamic import attribution (ext only)
 #[inline]            # force inlining (no arguments)
@@ -136,6 +137,62 @@ alias or a `fwd` re-export belongs to the forwarding module and replaces any
 inherited notice for that exported name; a clean alias of the same canonical
 definition keeps no notice. `test` blocks and comptime directives reject the
 attribute because they declare no externally usable name.
+
+### `testing` — test-only declaration
+
+Marks a declaration as existing only for tests, giving a fixture the semantics
+a [`test`](test.md) block already has. It takes no arguments and may appear
+once.
+
+A `#[testing]` declaration is resolved and type-checked in every build, so it
+cannot rot, and a type error in one fails `mach build` as well as `mach test`.
+It is omitted from IR and object files in ordinary builds and emitted under
+`mach test`.
+
+A reference to a `#[testing]` declaration is legal only from a `test` body or
+from another `#[testing]` declaration, including its decorators. Any other
+reference is an error at the use site. Every reference that names the
+declaration is checked: value references, calls, address-of, type references
+(a field, parameter or return type of a production declaration), generic
+instantiation, comptime evaluation and decorator arguments. The check has no
+same-module exemption.
+
+```mach
+# file: src/queue.mach
+#[testing]
+pub fun filled(n: u32) Queue { ... }
+
+test "queue: drains in order" {
+    var q: Queue = filled(3);          # a test body may use the fixture
+    ...
+}
+
+#[testing]
+fun drained() Queue { ret filled(0); } # so may another testing declaration
+
+pub fun reset() Queue { ret filled(0); }
+# error: `filled` is a `#[testing]` declaration: only a test body or another
+#        `#[testing]` declaration may reference it
+```
+
+The mark follows imports. A plain `use` of a testing declaration is itself
+testing, so every reference through it is checked. A `#[testing] use` confines
+its alias even when the target is an ordinary declaration. A `fwd` of a testing
+declaration must itself be marked `#[testing]`, because an unmarked `fwd` puts
+the name on a production surface. `pub #[testing]` is valid, and a dependency's
+testing helper is usable from a dependent's tests.
+
+It applies to `fun`, `rec`, `uni`, `tag`, `def`, `val`, `var`, `use` and `fwd`
+declarations at module scope. `test` blocks reject it because they are already
+test-only, and comptime directives reject it too. It cannot combine with
+`ext` or with `symbol`, `section`, `stage`, `input`, `output`, `builtin`,
+`uniform`, `storage` or `sampler`, because each names a consumer outside Mach
+source that the check cannot see. Inline `asm` `{name}` operands bind only
+locals, so they never reference a declaration.
+
+The mark is not a cycle escape: `mach test` builds with testing declarations
+present, so a `use` cycle that only tests need is still an error. `mach doc`
+omits testing declarations.
 
 ### `symbol(str)` — linker name
 
@@ -947,6 +1004,7 @@ in it.
 | Directive   | `fun` | `ext fun` | `val` / `var` | `rec` / `uni` |
 |-------------|:-----:|:---------:|:-------------:|:-------------:|
 | `deprecated`|  yes  |    yes    |      yes      |      yes      |
+| `testing`   |  yes  |    no     |      yes      |      yes      |
 | `symbol`    |  yes  |    yes    |      yes      |      no       |
 | `library`   |  no   |    yes    |      no       |      no       |
 | `inline`    |  yes  |    no     |      no       |      no       |
@@ -972,12 +1030,14 @@ in it.
 The `val` / `var` column is shared, but `embed` accepts only `val` — a `var`
 is refused (see [`embed`](#embedstr--compile-time-file-embedding) above).
 `deprecated` also applies to `tag`, `def`, `use` and `fwd` declarations and to a
-tag case, none of which the table columns cover.
+tag case, and `testing` to `tag`, `def`, `use` and `fwd` declarations, none of
+which the table columns cover.
 
 The set is closed. New directives require a compiler change.
 
 ## See also
 
+- [test.md](test.md) — `test` blocks, whose semantics `testing` gives a declaration
 - [ext-fun.md](ext-fun.md) — `ext` imports, `library` and `symbol` use cases
 - [visibility.md](visibility.md) — `pub` / `ext` visibility (not decorator-controlled)
 - [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of` / `$align_of` as `align` arguments
