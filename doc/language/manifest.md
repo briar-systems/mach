@@ -1013,10 +1013,27 @@ reads `exact commit ref 'commit/<id>' is not satisfied by the realized commit
 The verifier reads the git **index**, so a freshly realized dependency is
 verifiable before it is committed.
 
-`mach dep pull` on a fresh clone finds each committed gitlink as an empty
-directory and initializes it in place (`realized std @ … (initialized the
-committed gitlink)`); no gitlink command ever runs against a path that is not
-a checkout of its own.
+`mach dep pull` reads what a Git dependency's `dep/<id>` holds together with
+its record (the staged gitlink, its `.gitmodules` entry, and any module
+directory Git retained) and takes the one step that brings it to what a build
+verifies:
+
+- a staged gitlink with nothing checked out, as on a fresh clone or after the
+  directory was deleted, is initialized in place (`realized std @ …
+  (initialized the committed gitlink)`), first restoring its `.gitmodules`
+  entry from the manifest if that entry is gone;
+- a checkout at another commit than its gitlink is checked out at the gitlink;
+- a clean checkout of its own with no gitlink is registered, moved to the
+  declared selector from the declared source, and staged (`(registered the
+  existing checkout)`);
+- with neither, the submodule is added at the selector, reusing a module
+  directory Git retained from an earlier removal.
+
+A symlink, a file, a directory that is not a checkout of its own, and a dirty
+checkout that would be registered are refused and left as they are. `mach dep
+add` takes the same step for its Git source, so re-adding a dependency whose
+checkout `remove` retained registers that checkout, and it refuses a dirty one.
+No gitlink command ever runs against a path that is not a checkout of its own.
 
 A project root is identified by its own `mach.toml`, not by an enclosing git
 repository; `dep/<id>` is resolved relative to the project root. A project
