@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `mach dep pull`, `add` and `update` realize a Git dependency from everything its slot holds (the checkout, the staged gitlink, its `.gitmodules` entry and a retained module store) rather than from whether `dep/<id>` exists. A deleted checkout whose gitlink is staged is initialized again instead of failing in `git submodule add`, a missing `.gitmodules` entry is restored from the manifest, a clean unregistered checkout is registered where pull used to exit 0 without recording it, and re-adding a removed dependency reuses the checkout or module store Git kept instead of refusing (#3390).
+
 ## [5.0.4] - 2026-09-13
 
 ### Fixed
