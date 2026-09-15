@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - A `bin` artifact on a `spirv` target delivers its entry module at the resolved `out`, or `-o`, so `{artifact.<id>.out}` names a file that exists and a host binary can `#[embed]` the shader artifact it requires. The per-module objects are still written under `obj/` (#3397).
+- A failed Git command in `mach dep` or build-time dependency verification names the command, its exit status and Git's own message, where it reported only `Git dependency inspection command failed` (#3389).
+- Only a directory under `dep/` named by a valid project id is a dependency slot, so a file such as the `.DS_Store` Finder writes no longer draws a stray note from `mach dep pull` or fails `mach dep verify` (#3391).
 
 ## [5.0.4] - 2026-09-13
 
