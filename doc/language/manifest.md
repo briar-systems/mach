@@ -310,6 +310,14 @@ abi = "spirv"
 mach build . --target gpu     # writes out/gpu/<profile>/obj/<module>.spv
 ```
 
+With `debug` on, each module carries its debug information inside it, written as core
+instructions that need no capability or extension and so fit every `env`: `OpString`
+and `OpSource` name the source files, `OpName` names functions, interface variables and
+locals, `OpName` and `OpMemberName` name a uniform or storage block's record and its
+fields, and `OpLine` attributes each instruction to its source line and column. A
+required shader artifact built for a consumer's debug profile therefore builds, and
+validation layers and capture tools report names and source lines.
+
 `env` is a general target key whose values are owned by the target's isa; a
 `spirv` target uses it to declare the environment its modules are consumed in.
 The environment fixes the SPIR-V version word and the capability ceiling:
@@ -404,7 +412,7 @@ naming come from `[target.*]` facts, and an absent optional feature such as a
 | Key     | Type    | Meaning |
 |---------|---------|---------|
 | `opt`   | integer | Optimization level: `0` selects the debug pipeline (the always-on passes only), `1` and `2` select the release pipeline. `1` and `2` currently share a pass set, which includes loop auto-vectorization (see `vectorize` below). Any other integer — or a non-integer — is a manifest error. |
-| `debug` | bool    | Emit DWARF debug info for this profile, in ELF, Mach-O and COFF objects alike. A PE image carries it in `.debug_*` sections, which gdb, lldb and the LLVM tools read and Visual Studio and WinDbg do not. Gates emission only, never the optimizer, so a `release` profile can keep symbols with `debug = true`. A non-boolean is a manifest error. |
+| `debug` | bool    | Emit debug info for this profile: DWARF in ELF, Mach-O and COFF objects alike, and the core SPIR-V debug instructions on a `spirv` target (see [Finished-module targets](#finished-module-targets)). A PE image carries its DWARF in `.debug_*` sections, which gdb, lldb and the LLVM tools read and Visual Studio and WinDbg do not. Gates emission only, never the optimizer, so a `release` profile can keep symbols with `debug = true`. A non-boolean is a manifest error. |
 | `simd`  | string  | SIMD scalarization lever. `"scalarize"` emits a defined unrolled scalar expansion wherever the target has no packed instruction for a vector operator, with a build-time note. `"require"` makes that a hard error naming the operation, its **lane width**, the function and the target. It applies **per operation on every target**, not only to targets with no vector unit: x86-64's SSE2 baseline has no 32-bit lane integer multiply and NEON has no 64-bit one, so a capable target scalarizes too. Any other string is a manifest error. |
 | `vectorize` | bool | Auto-vectorization lever. When `true`, the release pipeline rewrites provably-safe counted loops to 128-bit SIMD on a target with hardware vectors; `false` skips the pass, so release output stays scalar. A non-boolean is a manifest error. |
 | `float_reassoc` | bool | Permission to treat floating-point addition and multiplication as **associative**. It lets the vectorizer reduce an `f32`/`f64` accumulator through lane-count partial sums, which changes the result — see [Float reassociation](#float-reassociation) for what that costs and what it buys. A non-boolean is a manifest error. |
