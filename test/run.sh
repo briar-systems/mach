@@ -383,7 +383,7 @@ run_case() {
     fi
 
     # the -g build through the external verifier for its debug model
-    if [ "$dwarf" -eq 1 ] && { [ "$fmt" = elf ] || [ "$fmt" = macho ]; }; then
+    if [ "$dwarf" -eq 1 ] && { [ "$fmt" = elf ] || [ "$fmt" = macho ] || [ "$fmt" = coff ]; }; then
         if ! build "$t" g "$c"; then
             fail "$t $c build g: $(first_error "$out/log/$t.g.$(art "$c").log")"; return
         fi
@@ -422,7 +422,7 @@ for t in $targets; do
             echo "run.sh: warning: llvm-objdump is major $got_major, the goldens were blessed with $objdump_major"
     fi
     [ "$(engine "$t")" = - ] || need_tool "${CC:-cc}" "the $t differential"
-    case "$(object_format "$t")" in elf|macho) [ "$dwarf" -eq 0 ] || need_tool llvm-dwarfdump --dwarf ;; esac
+    case "$(object_format "$t")" in elf|macho|coff) [ "$dwarf" -eq 0 ] || need_tool llvm-dwarfdump --dwarf ;; esac
 done
 echo "targets: $targets"
 echo "cases:   $(echo $cases | wc -w)"
