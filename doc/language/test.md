@@ -62,6 +62,11 @@ test then lowers to a zero-parameter, `i32`-returning function tagged as a test 
 point so the runner can iterate it. The label is interned and becomes the lowered
 function's name. Ordinary builds omit test bodies from IR and object files.
 
+A helper or fixture that exists only for tests is marked
+[`#[testing]`](decorators.md#testing--test-only-declaration). It gets the same
+treatment: checked in every build and omitted from ordinary ones. Only a test
+body or another `#[testing]` declaration may reference it.
+
 The body is checked against an `i32` return type. A test reports its result
 through that return value, treated as a process-style status in the range
 `0..255`:
@@ -210,6 +215,8 @@ automatically, with no separate corpus project.
 ## See also
 
 - [fun.md](fun.md) — functions; a test body is checked like a function body
+- [decorators.md](decorators.md#testing--test-only-declaration) — `#[testing]`
+  for declarations that exist only for tests
 - [statements.md](statements.md) — `if`/`or`, `ret`, and the other
   statements a test body uses
 - [files.md](files.md) — project layout the build (and `mach test`)

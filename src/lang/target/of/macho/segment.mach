@@ -1,0 +1,197 @@
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.target.of;
+use mach.lang.target.of.bin;
+use mach.lang.target.of.macho.format;
+use mach.lang.target.of.plan;
+use A:   std.allocator;
+use fmt: std.format;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+fun vm_prot_for(flags: u32) u32 {
+    var p: u32 = 0;
+    if ((flags & of.SEG_FLAG_READ) != 0)    { p = p | format.VM_PROT_READ; }
+    if ((flags & of.SEG_FLAG_WRITE) != 0)   { p = p | format.VM_PROT_WRITE; }
+    if ((flags & of.SEG_FLAG_EXECUTE) != 0) { p = p | format.VM_PROT_EXECUTE; }
+    if (p == 0)                             { p = format.VM_PROT_READ; }
+    ret p;
+}
+
+pub fun exec_segname(flags: u32, rebased: bool) str {
+    if ((flags & of.SEG_FLAG_EXECUTE) != 0) { ret "__TEXT"; }
+    if ((flags & of.SEG_FLAG_WRITE) != 0)   { ret "__DATA"; }
+    if (rebased)                            { ret "__DATA_CONST"; }
+    ret "__RODATA";
+}
+
+pub rec SegmentRows {
+    rows:    *u32;
+    offsets: *usize;
+}
+
+pub fun segment_rows_free(alloc: *A.Allocator, s: *SegmentRows, seg_count: u32) {
+    if (s.rows != nil)    { A.deallocate[u32](alloc, s.rows, seg_count::usize); }
+    if (s.offsets != nil) { A.deallocate[usize](alloc, s.offsets, seg_count::usize); }
+    s.rows    = nil;
+    s.offsets = nil;
+}
+
+# the segment rows of an image: the first segment starts at the header
+# reservation when `first_at_span` (its bytes follow the load commands in the
+# same mapping), otherwise on the next page; the rest start on a page
+pub fun place_segments(alloc: *A.Allocator, fp: *plan.FilePlan, segs: *of.LoadSegment, seg_count: u32,
+    hdr_span: usize, page: usize, first_at_span: bool) res[SegmentRows, fail.Fail] {
+    var out: SegmentRows;
+    out.rows    = nil;
+    out.offsets = nil;
+    val rr: res[*u32, A.Error] = A.zallocate[u32](alloc, seg_count::usize);
+    if (sel rr.err) { ret res[SegmentRows, fail.Fail].err{fail.message("macho: exec offset table alloc failed")}; }
+    out.rows = rr.ok;
+    val ro: res[*usize, A.Error] = A.zallocate[usize](alloc, seg_count::usize);
+    if (sel ro.err) {
+        segment_rows_free(alloc, ?out, seg_count);
+        ret res[SegmentRows, fail.Fail].err{fail.message("macho: exec offset table alloc failed")};
+    }
+    out.offsets = ro.ok;
+
+    val reserved: err[fail.Fail] = plan.pad_to(fp, "header reservation", hdr_span);
+    if (sel reserved.err) {
+        segment_rows_free(alloc, ?out, seg_count);
+        ret res[SegmentRows, fail.Fail].err{reserved.err};
+    }
+    var li: u32 = 0;
+    for (li < seg_count) {
+        var align: usize = page;
+        if (li == 0 && first_at_span) { align = 1; }
+        val row: res[u32, fail.Fail] = plan.place(fp, "load segment", of.no_section(), align, segs[li].filesz);
+        if (sel row.err) {
+            segment_rows_free(alloc, ?out, seg_count);
+            ret res[SegmentRows, fail.Fail].err{row.err};
+        }
+        out.rows[li]    = row.ok;
+        out.offsets[li] = plan.offset(fp, out.rows[li]);
+        li              = li + 1;
+    }
+    ret res[SegmentRows, fail.Fail].ok{out};
+}
+
+pub fun write_segment_bytes(buf: *u8, segs: *of.LoadSegment, seg_count: u32, seg_offsets: *usize) {
+    var li: u32 = 0;
+    for (li < seg_count) {
+        if (segs[li].bytes != nil && segs[li].filesz > 0) {
+            memory.raw_copy((buf::usize + seg_offsets[li])::ptr, segs[li].bytes::ptr, segs[li].filesz);
+        }
+        li = li + 1;
+    }
+}
+
+fun seg_is_rebased(dyn: *of.DynamicInfo, ls: u32) bool {
+    if (dyn == nil) { ret false; }
+    var i: u32 = 0;
+    for (i < dyn.base_reloc_count) {
+        if (dyn.base_relocs[i].seg_index == ls) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+pub fun seg_is_data_const(dyn: *of.DynamicInfo, segs: *of.LoadSegment, ls: u32) bool {
+    if (vm_prot_for(segs[ls].flags) != format.VM_PROT_READ) { ret false; }
+    ret seg_is_rebased(dyn, ls);
+}
+
+pub fun seg_vm_prot(dyn: *of.DynamicInfo, segs: *of.LoadSegment, ls: u32) u32 {
+    if (seg_is_data_const(dyn, segs, ls)) { ret format.VM_PROT_READ | format.VM_PROT_WRITE; }
+    ret vm_prot_for(segs[ls].flags);
+}
+
+fun seg_same_macho_segment(dyn: *of.DynamicInfo, segs: *of.LoadSegment, a: u32, b: u32) bool {
+    if (vm_prot_for(segs[a].flags) != vm_prot_for(segs[b].flags)) { ret false; }
+    ret seg_is_data_const(dyn, segs, a) == seg_is_data_const(dyn, segs, b);
+}
+
+pub fun seg_group_of(dyn: *of.DynamicInfo, segs: *of.LoadSegment, ls: u32) u32 {
+    var g: u32 = 0;
+    var i: u32 = 1;
+    for (i <= ls) {
+        if (i == 1 || !seg_same_macho_segment(dyn, segs, i, i - 1)) { g = g + 1; }
+        i = i + 1;
+    }
+    ret g;
+}
+
+pub fun seg_group_first(dyn: *of.DynamicInfo, segs: *of.LoadSegment, ls: u32) u32 {
+    if (ls == 0) { ret 0; }
+    var f: u32 = ls;
+    for (f > 1 && seg_same_macho_segment(dyn, segs, f, f - 1)) { f = f - 1; }
+    ret f;
+}
+
+pub fun seg_group_last(dyn: *of.DynamicInfo, segs: *of.LoadSegment, seg_count: u32, first: u32) u32 {
+    if (first == 0) { ret 0; }
+    var l: u32 = first;
+    for (l + 1 < seg_count && seg_same_macho_segment(dyn, segs, l + 1, l)) { l = l + 1; }
+    ret l;
+}
+
+pub fun seg_group_count(dyn: *of.DynamicInfo, segs: *of.LoadSegment, seg_count: u32) u32 {
+    if (seg_count == 0) { ret 0; }
+    ret seg_group_of(dyn, segs, seg_count - 1) + 1;
+}
+
+pub fun data_const_seg_count(dyn: *of.DynamicInfo, segs: *of.LoadSegment, seg_count: u32) u32 {
+    var n:  u32 = 0;
+    var li: u32 = 0;
+    for (li < seg_count) {
+        if (seg_is_data_const(dyn, segs, li) && seg_group_first(dyn, segs, li) == li) { n = n + 1; }
+        li = li + 1;
+    }
+    ret n;
+}
+
+pub fun data_const_conflict_message(itn: *intern.Interner, alloc: *A.Allocator, dyn: *of.DynamicInfo,
+    segs: *of.LoadSegment, seg_count: u32) str {
+    val generic: str = "macho: two separated read-only segments carry base relocations; Mach-O maps a single __DATA_CONST";
+    if (itn == nil) { ret generic; }
+
+    var first:  u32 = 0xFFFFFFFF;
+    var second: u32 = 0xFFFFFFFF;
+    var li:     u32 = 0;
+    for (li < seg_count) {
+        if (seg_is_data_const(dyn, segs, li) && seg_group_first(dyn, segs, li) == li) {
+            if (first == 0xFFFFFFFF) { first = li; }
+            or {
+                if (second == 0xFFFFFFFF) { second = li; }
+            }
+        }
+        li = li + 1;
+    }
+    if (second == 0xFFFFFFFF) { ret generic; }
+
+    var slot: u64 = 0;
+    var i:    u32 = 0;
+    for (i < dyn.base_reloc_count) {
+        if (dyn.base_relocs[i].seg_index == second) {
+            slot = dyn.base_relocs[i].seg_offset::u64;
+            brk;
+        }
+        i = i + 1;
+    }
+
+    val res_: res[str, fmt.FormatError] = fmt.sprint(alloc,
+        "macho: read-only load segments {} (vaddr {}) and {} (vaddr {}, e.g. the pointer at +{}) both need base relocations, but Mach-O maps a single read-only __DATA_CONST and they are not adjacent",
+        first::u64, segs[first].vaddr, second::u64, segs[second].vaddr, slot);
+    if (sel res_.err) { ret generic; }
+    val buf: str = res_.ok;
+    val msg: str = bin.name_message(itn, alloc, "", buf, generic);
+    A.deallocate[u8](alloc, buf::*u8, str_len(buf) + 1);
+    ret msg;
+}

@@ -1,0 +1,1564 @@
+use mach.lang.build.outcome;
+use std.allocator.arena;
+use std.allocator.page;
+use alloc_test: std.allocator.testing;
+use std.data.toml;
+use std.memory;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_contains;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+
+use mach.lang.fail;
+use mach.lang.intern;
+use tgt: mach.lang.target;
+use mach.lang.target.of;
+use target_testing: mach.lang.target.testing;
+
+use mach.lang.manifest.artifact.parse_artifacts;
+use mach.lang.manifest.artifact.validate_need_cycles;
+use mach.lang.manifest.dep.parse_deps;
+use mach.lang.manifest.link.find_link;
+use mach.lang.manifest.link.find_link_by_name;
+use mach.lang.manifest.link.link_matches_target;
+use mach.lang.manifest.link.parse_links;
+use mach.lang.manifest.model.ArtifactDef;
+use mach.lang.manifest.model.LinkDef;
+use mach.lang.manifest.model.Manifest;
+use mach.lang.manifest.model.StepDef;
+use mach.lang.manifest.model.TargetDef;
+use mach.lang.manifest.model.dnit;
+use mach.lang.manifest.model.empty;
+use mach.lang.manifest.parse.glob_matches;
+use mach.lang.manifest.parse.idstr;
+use mach.lang.manifest.parse.intern_unwrap;
+use mach.lang.manifest.parse.is_glob;
+use mach.lang.manifest.parse.need_pattern;
+use mach.lang.manifest.parse.sfmt;
+use mach.lang.manifest.parse.tinit;
+use mach.lang.manifest.parse.validate_source_text;
+use mach.lang.manifest.project.MISSING_PROFILE_MESSAGE;
+use mach.lang.manifest.project.find_target_by_name;
+use mach.lang.manifest.project.make_native_target;
+use mach.lang.manifest.project.parse_profiles;
+use mach.lang.manifest.project.parse_project;
+use mach.lang.manifest.project.parse_targets;
+use mach.lang.manifest.step.parse_steps;
+use mach.lang.manifest.step.plan_visit;
+
+fun root_key_known(k: str) bool {
+    ret str_equals(k, "project") || str_equals(k, "target") || str_equals(k, "artifact")
+        || str_equals(k, "profile") || str_equals(k, "dep") || str_equals(k, "link") || str_equals(k, "step");
+}
+
+fun check_root_keys(alloc: *A.Allocator, t: *toml.Table) err[outcome.Fail] {
+    val n: usize = toml.table_len(t);
+    var i: usize = 0;
+    for (i < n) {
+        val k_o: opt[str] = toml.table_key(t, i);
+        if (sel k_o.none) { brk; }
+        val k: str = k_o.some;
+        if (!root_key_known(k)) {
+            ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "mach.toml: unknown table or key '{}' at the document root", k))};
+        }
+        i = i + 1;
+    }
+    ret err[outcome.Fail].ok{};
+}
+
+# build a `Manifest` from a parsed TOML document. accepted root tables are
+# `[project]`, `[target.*]`, `[artifact.*]`, `[profile.*]`, `[dep.*]`,
+# `[link.*]` and `[step.*]`; any other root key, and any key a table does not
+# define, is an error naming it. on any error every array allocated so far is
+# freed before returning
+# ---
+# alloc:   owns the manifest's arrays
+# itn:     receives every string of the manifest
+# t:       the TOML document
+# as_root: true for the project being built, false for a dependency's manifest.
+#          the root form requires at least one `[profile.*]` table, `[artifact].link`
+#          and `need`, `[link].os`, `isa`, `abi` and `export`, `[step].need`, requires
+#          link filter values to be canonical or "*", and rejects more than one
+#          `default = true` profile. the dependency form treats each of those keys as
+#          optional. a declared `[profile.*]` table requires `opt`, `debug`, `simd`,
+#          `vectorize` and `float_reassoc` in both forms. the key set is closed for
+#          both forms: a key is read or refused as unknown
+# ret:     the manifest, or the first error as a "mach.toml: ..." message. the
+#          `[project]` table and its `id`, `version`, `src` and `out` are always
+#          required; `src`, `out`, artifact `entry` and `out`, local link `path` and
+#          step `in` and `out` entries must satisfy `is_project_path`; every table name
+#          must satisfy `is_valid_id`; `[target.native]` and `[dep.<x>].version` are
+#          reserved; a `[step]` with `cmd` or `shell` is rejected by name; `need`
+#          entries are checked by `validate_needs`. `[profile.*]` absent or empty is
+#          an error at the root and synthesizes `debug` and `release` in a dependency
+pub fun parse(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, as_root: bool) res[Manifest, outcome.Fail] {
+    var m:           Manifest = empty();
+    var transferred: bool     = false;
+    fin {
+        if (!transferred) { dnit(?m, alloc); }
+    }
+
+    val res_root_keys: err[outcome.Fail] = check_root_keys(alloc, t);
+    if (sel res_root_keys.err) { ret res[Manifest, outcome.Fail].err{res_root_keys.err}; }
+
+    val res_project: err[outcome.Fail] = parse_project(alloc, itn, t, ?m);
+    if (sel res_project.err) { ret res[Manifest, outcome.Fail].err{res_project.err}; }
+    m.default_target = intern_unwrap(itn, "native");
+
+    val res_targets: err[outcome.Fail] = parse_targets(alloc, itn, t, ?m, as_root);
+    if (sel res_targets.err) { ret res[Manifest, outcome.Fail].err{res_targets.err}; }
+
+    val res_artifacts: err[outcome.Fail] = parse_artifacts(alloc, itn, t, ?m, as_root);
+    if (sel res_artifacts.err) { ret res[Manifest, outcome.Fail].err{res_artifacts.err}; }
+
+    val res_profiles: err[outcome.Fail] = parse_profiles(alloc, itn, t, ?m, as_root);
+    if (sel res_profiles.err) { ret res[Manifest, outcome.Fail].err{res_profiles.err}; }
+
+    val res_deps: err[outcome.Fail] = parse_deps(alloc, itn, t, ?m, as_root);
+    if (sel res_deps.err) { ret res[Manifest, outcome.Fail].err{res_deps.err}; }
+
+    val res_links: err[outcome.Fail] = parse_links(alloc, itn, t, ?m, as_root);
+    if (sel res_links.err) { ret res[Manifest, outcome.Fail].err{res_links.err}; }
+
+    val res_steps: err[outcome.Fail] = parse_steps(alloc, itn, t, ?m, as_root);
+    if (sel res_steps.err) { ret res[Manifest, outcome.Fail].err{res_steps.err}; }
+
+    val res_needs: err[outcome.Fail] = validate_needs(alloc, itn, ?m);
+    if (sel res_needs.err) { ret res[Manifest, outcome.Fail].err{res_needs.err}; }
+
+    val res_link_refs: err[outcome.Fail] = validate_link_refs(alloc, itn, ?m);
+    if (sel res_link_refs.err) { ret res[Manifest, outcome.Fail].err{res_link_refs.err}; }
+
+    if (m.target_count == 0) {
+        val native: res[*TargetDef, outcome.Fail] = make_native_target(alloc, itn);
+        if (sel native.err) { ret res[Manifest, outcome.Fail].err{native.err}; }
+        m.native_target  = native.ok;
+        m.default_target = m.native_target.name;
+    }
+    transferred = true;
+    ret res[Manifest, outcome.Fail].ok{m};
+}
+
+fun validate_need_entry(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
+    owner: str, name: str, entry: str) err[outcome.Fail] {
+    val step_pattern:     str = need_pattern(entry, "step");
+    val artifact_pattern: str = need_pattern(entry, "artifact");
+    if (step_pattern == nil && (artifact_pattern == nil || str_equals(owner, "step"))) {
+        ret err[outcome.Fail].err{outcome.user(sfmt(alloc,
+            "mach.toml: [{}.{}].need entry '{}' must use 'step.<name>' or 'artifact.<name>' with optional '*' wildcards; steps may require only steps",
+            owner, name, entry))};
+    }
+    var hits: u32 = 0;
+    var i:    u32 = 0;
+    if (step_pattern != nil) {
+        for (i < m.step_count) {
+            val other: str = idstr(itn, m.steps[i].name);
+            if (glob_matches(step_pattern, other)) {
+                if (str_equals(owner, "step") && str_equals(name, other)) {
+                    if (!is_glob(step_pattern)) { ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "mach.toml: [{}.{}].need requires itself", owner, name))}; }
+                }
+                or { hits = hits + 1; }
+            }
+            i = i + 1;
+        }
+    }
+    or {
+        for (i < m.artifact_count) {
+            val other: str = idstr(itn, m.artifacts[i].name);
+            if (glob_matches(artifact_pattern, other)) {
+                if (str_equals(name, other)) {
+                    if (!is_glob(artifact_pattern)) { ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "mach.toml: [artifact.{}].need requires itself", name))}; }
+                }
+                or { hits = hits + 1; }
+            }
+            i = i + 1;
+        }
+    }
+    if (hits == 0) {
+        ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "mach.toml: [{}.{}].need entry '{}' matches no declaration in its category", owner, name, entry))};
+    }
+    ret err[outcome.Fail].ok{};
+}
+
+fun validate_needs(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest) err[outcome.Fail] {
+    var ai: u32 = 0;
+    for (ai < m.artifact_count) {
+        val a:  *ArtifactDef = ?m.artifacts[ai];
+        var ni: u32          = 0;
+        for (ni < a.need_count) {
+            val checked: err[outcome.Fail] = validate_need_entry(alloc, itn, m,
+                "artifact", idstr(itn, a.name), idstr(itn, a.need[ni]));
+            if (sel checked.err) { ret checked; }
+            ni = ni + 1;
+        }
+        ai = ai + 1;
+    }
+    var si: u32 = 0;
+    for (si < m.step_count) {
+        val s:  *StepDef = ?m.steps[si];
+        var ni: u32      = 0;
+        for (ni < s.need_count) {
+            val checked: err[outcome.Fail] = validate_need_entry(alloc, itn, m,
+                "step", idstr(itn, s.name), idstr(itn, s.need[ni]));
+            if (sel checked.err) { ret checked; }
+            ni = ni + 1;
+        }
+        si = si + 1;
+    }
+    val artifacts: err[outcome.Fail] = validate_need_cycles(alloc, itn, m);
+    if (sel artifacts.err) { ret artifacts; }
+    if (m.step_count == 0) { ret err[outcome.Fail].ok{}; }
+    val sr: res[*u8, A.Error] = A.allocate[u8](alloc, m.step_count::usize);
+    if (sel sr.err) { ret err[outcome.Fail].err{outcome.refused(sr.err)}; }
+    val state: *u8 = sr.ok;
+    fin { A.deallocate[u8](alloc, state, m.step_count::usize); }
+    val order_r: res[*u32, A.Error] = A.allocate[u32](alloc, m.step_count::usize);
+    if (sel order_r.err) { ret err[outcome.Fail].err{outcome.refused(order_r.err)}; }
+    val order: *u32 = order_r.ok;
+    fin { A.deallocate[u32](alloc, order, m.step_count::usize); }
+    si = 0;
+    for (si < m.step_count) {
+        state[si] = 0;
+        si        = si + 1;
+    }
+    var count: u32 = 0;
+    si = 0;
+    for (si < m.step_count) {
+        val checked: err[outcome.Fail] = plan_visit(alloc, itn, m, si, state, order, ?count);
+        if (sel checked.err) { ret checked; }
+        si = si + 1;
+    }
+    ret err[outcome.Fail].ok{};
+}
+
+fun validate_link_refs(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest) err[outcome.Fail] {
+    var ai: u32 = 0;
+    for (ai < m.artifact_count) {
+        val a:  *ArtifactDef = ?m.artifacts[ai];
+        var li: u32          = 0;
+        for (li < a.link_count) {
+            if (find_link_by_name(m, a.link[li]) == nil) {
+                var known: str = "no [link.*] table is declared";
+                if (m.link_count > 0) { known = sfmt(alloc, "declared: {}", link_table_names(alloc, itn, m)); }
+                ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "mach.toml: [artifact.{}].link names no [link.*] table: '{}' ({})",
+                    idstr(itn, a.name), idstr(itn, a.link[li]), known))};
+            }
+            li = li + 1;
+        }
+        ai = ai + 1;
+    }
+    ret err[outcome.Fail].ok{};
+}
+
+fun link_table_names(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest) str {
+    var s: str = "";
+    var i: u32 = 0;
+    for (i < m.link_count) {
+        if (i > 0) { s = sfmt(alloc, "{}, ", s); }
+        s = sfmt(alloc, "{}[link.{}]", s, idstr(itn, m.links[i].name));
+        i = i + 1;
+    }
+    ret s;
+}
+
+pub fun demo_src() str {
+    ret "[project]\nid = \"demo\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\ndefault = true\n\n[target.windows]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\n\n[artifact.ls]\nkind = \"bin\"\nentry = \"bin/ls.mach\"\nout = \"bin/ls\"\ntargets = [\"*\"]\nlink = []\nneed = []\n\n[artifact.cat]\nkind = \"bin\"\nentry = \"bin/cat.mach\"\nout = \"bin/cat\"\ntargets = [\"*\"]\nlink = []\nneed = []\n\n[profile.debug]\ndefault = true\nopt = 0\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n\n[profile.release]\nopt = 2\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n\n[dep.std]\ngit = \"https://github.com/briar-systems/mach-std\"\nref = \"tag/v0.4.0\"\n";
+}
+
+rec StepParseLive {
+    backing: A.Allocator;
+    live:    i64;
+}
+
+fun step_parse_live_allocate(ctx: ptr, size: usize, align: usize) opt[ptr] {
+    val p: *StepParseLive = ctx::*StepParseLive;
+    val r: opt[ptr]       = p.backing.fn_allocate(p.backing.ctx, size, align);
+    if (sel r.some) {
+        p.live = p.live + size::i64;
+        memory.raw_fill(r.some, 0xAA, size);
+    }
+    ret r;
+}
+
+fun step_parse_live_reallocate(ctx: ptr, item: ptr, old_size: usize, new_size: usize, align: usize) opt[ptr] {
+    val p: *StepParseLive = ctx::*StepParseLive;
+    val r: opt[ptr]       = p.backing.fn_reallocate(p.backing.ctx, item, old_size, new_size, align);
+    if (sel r.some) {
+        p.live = p.live - old_size::i64 + new_size::i64;
+        if (new_size > old_size) {
+            val grown: ptr = r.some;
+            memory.raw_fill((grown::usize + old_size)::ptr, 0xAA, new_size - old_size);
+        }
+    }
+    ret r;
+}
+
+fun step_parse_live_deallocate(ctx: ptr, item: ptr, size: usize, align: usize) i64 {
+    val p: *StepParseLive = ctx::*StepParseLive;
+    p.live = p.live - size::i64;
+    ret p.backing.fn_deallocate(p.backing.ctx, item, size, align);
+}
+
+fun step_parse_live_make(p: *StepParseLive, alloc: *A.Allocator) bool {
+    val make_r: err[A.Error] = page.make(?p.backing);
+    if (sel make_r.err) { ret false; }
+    p.live = 0;
+    val probe: *StepParseLive = p;
+    alloc.ctx           = probe::ptr;
+    alloc.fn_allocate   = step_parse_live_allocate;
+    alloc.fn_reallocate = step_parse_live_reallocate;
+    alloc.fn_deallocate = step_parse_live_deallocate;
+    ret true;
+}
+
+pub fun tparse(alloc: *A.Allocator, itn: *intern.Interner, src: str) res[Manifest, outcome.Fail] {
+    val source_r: err[outcome.Fail] = validate_source_text(src);
+    if (sel source_r.err) { ret res[Manifest, outcome.Fail].err{source_r.err}; }
+    val tbl_r: res[toml.Table, toml.TomlError] = toml.parse(alloc, src);
+    if (sel tbl_r.err) { ret res[Manifest, outcome.Fail].err{outcome.user(outcome.toml_text(tbl_r.err))}; }
+    var tbl: toml.Table                  = tbl_r.ok;
+    val m:   res[Manifest, outcome.Fail] = parse(alloc, itn, ?tbl, true);
+    toml.dnit(alloc, ?tbl);
+    ret m;
+}
+
+pub fun tparse_lenient(alloc: *A.Allocator, itn: *intern.Interner, src: str) res[Manifest, outcome.Fail] {
+    val source_r: err[outcome.Fail] = validate_source_text(src);
+    if (sel source_r.err) { ret res[Manifest, outcome.Fail].err{source_r.err}; }
+    val tbl_r: res[toml.Table, toml.TomlError] = toml.parse(alloc, src);
+    if (sel tbl_r.err) { ret res[Manifest, outcome.Fail].err{outcome.user(outcome.toml_text(tbl_r.err))}; }
+    var tbl: toml.Table                  = tbl_r.ok;
+    val m:   res[Manifest, outcome.Fail] = parse(alloc, itn, ?tbl, false);
+    toml.dnit(alloc, ?tbl);
+    ret m;
+}
+
+test "mach.lang.manifest.parse:demo_src_ok" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val res_manifest: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, demo_src());
+    if (sel res_manifest.err) { code = 1; }
+    if (sel res_manifest.ok) {
+        var m: Manifest = res_manifest.ok;
+        if (!str_equals(idstr(?itn, m.id), "demo"))                                   { code = 1; }
+        if (!str_equals(idstr(?itn, m.version), "0.1.0"))                             { code = 1; }
+        if (!str_equals(idstr(?itn, m.src), "src"))                                   { code = 1; }
+        if (!str_equals(idstr(?itn, m.out_tmpl), "out/{target.name}/{profile.name}")) { code = 1; }
+        if (m.target_count != 2)                                                      { code = 1; }
+        if (m.artifact_count != 2)                                                    { code = 1; }
+        if (m.profile_count != 2)                                                     { code = 1; }
+        if (m.dep_count != 1)                                                         { code = 1; }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:missing_required_keys" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val a: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nversion=\"1\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n");
+    if (!(sel a.err && str_equals(outcome.describe(a.err), "mach.toml: [project] is missing required key 'id'"))) { code = 1; }
+
+    val b: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (!(sel b.err && str_equals(outcome.describe(b.err), "mach.toml: [project] is missing required key 'version'"))) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+# [project] name/description/mach and [profile.*] emit_ir/emit_asm are no keys:
+# each is refused as unknown in both the strict and the lenient parse
+test "mach.lang.manifest.parse:the_five_unread_keys_are_refused_as_unknown_in_both_forms" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code:  i32 = 0;
+    val head:  str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n";
+    val tail:  str = "[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[profile.debug]\nopt=0\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    var texts: [5]str;
+    texts[0] = sfmt(?alloc, "{}name=\"App\"\n{}", head, tail);
+    texts[1] = sfmt(?alloc, "{}description=\"d\"\n{}", head, tail);
+    texts[2] = sfmt(?alloc, "{}mach=\"4.14.0\"\n{}", head, tail);
+    texts[3] = sfmt(?alloc, "{}{}emit_ir=true\n", head, tail);
+    texts[4] = sfmt(?alloc, "{}{}emit_asm=true\n", head, tail);
+    var wants: [5]str;
+    wants[0] = "mach.toml: unknown key 'name' in [project]";
+    wants[1] = "mach.toml: unknown key 'description' in [project]";
+    wants[2] = "mach.toml: unknown key 'mach' in [project]";
+    wants[3] = "mach.toml: unknown key 'emit_ir' in [profile.debug]";
+    wants[4] = "mach.toml: unknown key 'emit_asm' in [profile.debug]";
+    var k: usize = 0;
+    for (k < 5) {
+        var form: u32 = 0;
+        for (form < 2) {
+            var r: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, texts[k]);
+            if (form == 1) { r = tparse_lenient(?alloc, ?itn, texts[k]); }
+            if (sel r.ok) {
+                var m: Manifest = r.ok;
+                dnit(?m, ?alloc);
+                code = 2;
+            }
+            if (sel r.err) {
+                if (!str_equals(outcome.describe(r.err), wants[k])) { code = 3; }
+            }
+            form = form + 1;
+        }
+        k = k + 1;
+    }
+    val clean_r: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, tail));
+    if (sel clean_r.err) { code = 4; }
+    if (sel clean_r.ok) {
+        var m: Manifest = clean_r.ok;
+        dnit(?m, ?alloc);
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:an_artifact_link_naming_no_link_table_is_refused_naming_the_artifact_and_the_tables" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code:     i32 = 0;
+    val head:     str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val links:    str = "[link.m]\nsource=\"system\"\nname=\"m\"\nos=[\"*\"]\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n[link.z]\nsource=\"system\"\nname=\"z\"\nos=[\"*\"]\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n";
+    val bad_art:  str = "[artifact.app]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink=[\"m\", \"nope\"]\nneed=[]\n";
+    val good_art: str = "[artifact.app]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink=[\"m\", \"z\"]\nneed=[]\n";
+
+    val r: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}", head, links, bad_art));
+    if (sel r.ok) { code = 1; }
+    if (sel r.err) {
+        val msg: str = outcome.describe(r.err);
+        if (!str_equals(msg, "mach.toml: [artifact.app].link names no [link.*] table: 'nope' (declared: [link.m], [link.z])")) { code = 2; }
+    }
+    val none: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, bad_art));
+    if (!(sel none.err && str_contains(outcome.describe(none.err), "no [link.*] table is declared"))) { code = 3; }
+    val dep: res[Manifest, outcome.Fail] = tparse_lenient(?alloc, ?itn, sfmt(?alloc, "{}{}{}", head, links, bad_art));
+    if (sel dep.ok) { code = 4; }
+    val ok: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}", head, links, good_art));
+    if (sel ok.err) { code = 5; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:unknown_keys" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val a: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\nbogus=\"y\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (!(sel a.err && str_equals(outcome.describe(a.err), "mach.toml: unknown key 'bogus' in [project]"))) { code = 1; }
+
+    val b: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\nwat=\"z\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (!(sel b.err && str_equals(outcome.describe(b.err), "mach.toml: unknown key 'wat' in [target.l]"))) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+pub fun need_head() str {
+    ret "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[target.host]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+}
+
+pub fun need_artifact(alloc: *A.Allocator, name: str, out: str, need: str) str {
+    ret sfmt(alloc, "[artifact.{}]\nkind=\"static\"\nentry=\"s.mach\"\nout=\"lib/{}.a\"\ntargets=[\"host\"]\nlink=[]\nneed=[{}]\n", name, out, need);
+}
+
+pub fun need_err(alloc: *A.Allocator, itn: *intern.Interner, src: str, needle: str) bool {
+    val r: res[Manifest, outcome.Fail] = tparse(alloc, itn, src);
+    if (sel r.ok) { ret false; }
+    ret str_contains(outcome.describe(r.err), needle);
+}
+
+test "mach.lang.manifest.validate_needs:rejects_unqualified_names_even_when_they_exist" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val src: str = sfmt(?alloc, "{}{}{}{}", need_head(),
+        need_artifact(?alloc, "twin", "twin", ""),
+        "[step.twin]\nargv=[\"true\"]\nin=[]\nout=[]\nneed=[]\n",
+        "[artifact.app]\nkind=\"bin\"\nentry=\"m.mach\"\nout=\"bin/app\"\ntargets=[\"host\"]\nlink=[]\nneed=[\"twin\"]\n");
+    if (!need_err(?alloc, ?itn, src, "must use 'step.<name>' or 'artifact.<name>'")) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.validate_needs:rejects_an_empty_glob_an_unknown_id_and_self" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val empty_glob: str = sfmt(?alloc, "{}{}{}", need_head(),
+        need_artifact(?alloc, "shader-a", "a", ""),
+        "[artifact.app]\nkind=\"bin\"\nentry=\"m.mach\"\nout=\"bin/app\"\ntargets=[\"host\"]\nlink=[]\nneed=[\"artifact.nothing-*\"]\n");
+    if (!need_err(?alloc, ?itn, empty_glob, "need entry 'artifact.nothing-*' matches no declaration in its category")) { code = 1; }
+
+    val unknown: str = sfmt(?alloc, "{}{}", need_head(),
+        "[artifact.app]\nkind=\"bin\"\nentry=\"m.mach\"\nout=\"bin/app\"\ntargets=[\"host\"]\nlink=[]\nneed=[\"artifact.ghost\"]\n");
+    if (!need_err(?alloc, ?itn, unknown, "need entry 'artifact.ghost' matches no declaration in its category")) { code = 1; }
+
+    val itself: str = sfmt(?alloc, "{}{}", need_head(),
+        "[artifact.app]\nkind=\"bin\"\nentry=\"m.mach\"\nout=\"bin/app\"\ntargets=[\"host\"]\nlink=[]\nneed=[\"artifact.app\"]\n");
+    if (!need_err(?alloc, ?itn, itself, "[artifact.app].need requires itself")) { code = 1; }
+
+    val bad_char: str = sfmt(?alloc, "{}{}", need_head(),
+        "[artifact.app]\nkind=\"bin\"\nentry=\"m.mach\"\nout=\"bin/app\"\ntargets=[\"host\"]\nlink=[]\nneed=[\"../step\"]\n");
+    if (!need_err(?alloc, ?itn, bad_char, "must use 'step.<name>' or 'artifact.<name>'")) { code = 1; }
+
+    val self_glob: str = sfmt(?alloc, "{}{}", need_head(),
+        "[artifact.app]\nkind=\"bin\"\nentry=\"m.mach\"\nout=\"bin/app\"\ntargets=[\"host\"]\nlink=[]\nneed=[\"artifact.a*\"]\n");
+    if (!need_err(?alloc, ?itn, self_glob, "need entry 'artifact.a*' matches no declaration in its category")) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.validate_needs:rejects_a_cycle_naming_the_chain" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val two: str = sfmt(?alloc, "{}{}{}", need_head(),
+        need_artifact(?alloc, "a", "a", "\"artifact.b\""),
+        need_artifact(?alloc, "b", "b", "\"artifact.a\""));
+    if (!need_err(?alloc, ?itn, two, "artifact 'need' cycle: a -> b -> a")) { code = 1; }
+
+    val three: str = sfmt(?alloc, "{}{}{}{}", need_head(),
+        need_artifact(?alloc, "a", "a", "\"artifact.b\""),
+        need_artifact(?alloc, "b", "b", "\"artifact.c\""),
+        need_artifact(?alloc, "c", "c", "\"artifact.a\""));
+    if (!need_err(?alloc, ?itn, three, "artifact 'need' cycle: a -> b -> c -> a")) { code = 1; }
+
+    val glob_cycle: str = sfmt(?alloc, "{}{}{}", need_head(),
+        need_artifact(?alloc, "pack-a", "pa", "\"artifact.pack-b\""),
+        need_artifact(?alloc, "pack-b", "pb", "\"artifact.pack-*\""));
+    if (!need_err(?alloc, ?itn, glob_cycle, "artifact 'need' cycle: pack-a -> pack-b -> pack-a")) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:argv_step_contract" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+    val head: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+
+    val valid: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[step.s]\nargv=['\"quoted\"',\"'single'\",'semi;$|&<>*?[]','{\"x\":1}',\"{\\\"escaped\\\":true}\"]\nin=[]\nout=[]\nneed=[]\n[step.s.env]\nVALUE='literal;$|&<>*?[]'\nJSON=\"{\\\"x\\\":1}\"\n"));
+    if (sel valid.err) { code = 1; }
+    if (sel valid.ok) {
+        var m: Manifest = valid.ok;
+        if (m.step_count != 1 || m.steps[0].argv_count != 5 || m.steps[0].env_count != 2) { code = 1; }
+        or {
+            if (!str_equals(idstr(?itn, m.steps[0].argv[0]), "\"quoted\""))                                                                           { code = 1; }
+            if (!str_equals(idstr(?itn, m.steps[0].argv[1]), "'single'"))                                                                             { code = 1; }
+            if (!str_equals(idstr(?itn, m.steps[0].argv[2]), "semi;$|&<>*?[]"))                                                                       { code = 1; }
+            if (!str_equals(idstr(?itn, m.steps[0].argv[3]), "{\"x\":1}"))                                                                            { code = 1; }
+            if (!str_equals(idstr(?itn, m.steps[0].argv[4]), "{\"escaped\":true}"))                                                                   { code = 1; }
+            if (!str_equals(idstr(?itn, m.steps[0].env_keys[0]), "JSON") || !str_equals(idstr(?itn, m.steps[0].env_values[0]), "{\"x\":1}"))          { code = 1; }
+            if (!str_equals(idstr(?itn, m.steps[0].env_keys[1]), "VALUE") || !str_equals(idstr(?itn, m.steps[0].env_values[1]), "literal;$|&<>*?[]")) { code = 1; }
+        }
+    }
+
+    val empty: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[step.s]\nargv=[]\nin=[]\nout=[]\nneed=[]\n"));
+    if (!(sel empty.err && str_contains(outcome.describe(empty.err), ".argv must be nonempty"))) { code = 1; }
+
+    val empty_program: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[step.s]\nargv=[\"\"]\nin=[]\nout=[]\nneed=[]\n"));
+    if (!(sel empty_program.err && str_contains(outcome.describe(empty_program.err), "argv[0] must name an executable"))) { code = 1; }
+
+    val cmd: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[step.s]\ncmd=\"true\"\nin=[]\nout=[]\nneed=[]\n"));
+    if (!(sel cmd.err && str_contains(outcome.describe(cmd.err), "uses removed key 'cmd'"))) { code = 1; }
+
+    val shell: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[step.s]\nargv=[\"true\"]\nshell=true\nin=[]\nout=[]\nneed=[]\n"));
+    if (!(sel shell.err && str_contains(outcome.describe(shell.err), "uses removed key 'shell'"))) { code = 1; }
+
+    val env_type: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[step.s]\nargv=[\"true\"]\nenv={VALUE=1}\nin=[]\nout=[]\nneed=[]\n"));
+    if (!(sel env_type.err && str_contains(outcome.describe(env_type.err), ".env.VALUE must be a string"))) { code = 1; }
+
+    val env_ambiguous: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[step.s]\nargv=[\"true\"]\nenv={PATH=\"a\",Path=\"b\"}\nin=[]\nout=[]\nneed=[]\n"));
+    if (!(sel env_ambiguous.err && str_contains(outcome.describe(env_ambiguous.err), "ambiguous keys"))) { code = 1; }
+
+    val env_order_a: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[step.s]\nargv=[\"true\"]\nenv={z=\"last\",B=\"middle\",a=\"first\"}\nin=[]\nout=[]\nneed=[]\n"));
+    val env_order_b: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[step.s]\nargv=[\"true\"]\nenv={a=\"first\",z=\"last\",B=\"middle\"}\nin=[]\nout=[]\nneed=[]\n"));
+    if (sel env_order_a.ok) {
+        if (sel env_order_b.ok) {
+            val ma: Manifest = env_order_a.ok;
+            val mb: Manifest = env_order_b.ok;
+            var ei: u32      = 0;
+            for (ei < ma.steps[0].env_count && ei < mb.steps[0].env_count) {
+                if (ma.steps[0].env_keys[ei] != mb.steps[0].env_keys[ei])     { code = 1; }
+                if (ma.steps[0].env_values[ei] != mb.steps[0].env_values[ei]) { code = 1; }
+                ei = ei + 1;
+            }
+            if (!str_equals(idstr(?itn, ma.steps[0].env_keys[0]), "a"))        { code = 1; }
+            if (!str_equals(idstr(?itn, ma.steps[0].env_values[0]), "first"))  { code = 1; }
+            if (!str_equals(idstr(?itn, ma.steps[0].env_keys[1]), "B"))        { code = 1; }
+            if (!str_equals(idstr(?itn, ma.steps[0].env_values[1]), "middle")) { code = 1; }
+            if (!str_equals(idstr(?itn, ma.steps[0].env_keys[2]), "z"))        { code = 1; }
+            if (!str_equals(idstr(?itn, ma.steps[0].env_values[2]), "last"))   { code = 1; }
+        }
+        if (sel env_order_b.err) { code = 1; }
+    }
+    if (sel env_order_a.err) { code = 1; }
+
+    val argv_nul: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[step.s]\nargv=[\"pre\\u0000post\"]\nin=[]\nout=[]\nneed=[]\n"));
+    if (!(sel argv_nul.err && str_contains(outcome.describe(argv_nul.err), "cannot contain NUL"))) { code = 1; }
+
+    val env_key_nul: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[step.s]\nargv=[\"true\"]\nin=[]\nout=[]\nneed=[]\n[step.s.env]\n\"A\\u0000B\"=\"x\"\n"));
+    if (!(sel env_key_nul.err && str_contains(outcome.describe(env_key_nul.err), "cannot contain NUL"))) { code = 1; }
+
+    val env_value_nul: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[step.s]\nargv=[\"true\"]\nin=[]\nout=[]\nneed=[]\n[step.s.env]\nVALUE=\"pre\\U00000000post\"\n"));
+    if (!(sel env_value_nul.err && str_contains(outcome.describe(env_value_nul.err), "cannot contain NUL"))) { code = 1; }
+
+    val literal_escape: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[step.s]\nargv=['pre\\u0000post']\nin=[]\nout=[]\nneed=[]\n"));
+    if (sel literal_escape.err) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:late_step_error_releases_owned_arrays" {
+    var probe: StepParseLive;
+    var alloc: A.Allocator;
+    if (!step_parse_live_make(?probe, ?alloc)) { ret 1; }
+    var itn: intern.Interner             = intern.init(?alloc);
+    val r:   res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[step.s]\nargv=[\"true\",\"arg\"]\nenv={A=\"one\",B=\"two\"}\nin=[\"src\"]\nout=[\"../escape\"]\nneed=[]\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (sel r.ok) {
+        intern.dnit(?itn);
+        ret 1;
+    }
+    str_free(?alloc, outcome.describe(r.err));
+    intern.dnit(?itn);
+    if (probe.live != 0) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.manifest.parse:artifact_middle_entry_error_releases_owned_arrays" {
+    var probe: StepParseLive;
+    var alloc: A.Allocator;
+    if (!step_parse_live_make(?probe, ?alloc)) { ret 1; }
+    var itn: intern.Interner             = intern.init(?alloc);
+    val r:   res[Manifest, outcome.Fail] = tparse(?alloc, ?itn,
+        "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[artifact.a]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/a\"\ntargets=[\"t1\",\"t2\"]\nlink=[\"l1\"]\nneed=[]\n[artifact.b]\nkind=\"static\"\nentry=\"lib.mach\"\nout=\"lib/b\"\ntargets=[\"t1\"]\nlink=[\"l1\",\"l2\"]\nneed=[\"artifact.a\"]\nicon=\"icon.ico\"\n[artifact.c]\nkind=\"bin\"\nentry=\"c.mach\"\nout=\"bin/c\"\ntargets=[\"t1\"]\nlink=[]\nneed=[]\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (sel r.ok) {
+        intern.dnit(?itn);
+        ret 1;
+    }
+    if (!str_contains(outcome.describe(r.err), "icon and .manifest apply only to kind = \"bin\"")) {
+        str_free(?alloc, outcome.describe(r.err));
+        intern.dnit(?itn);
+        ret 1;
+    }
+    str_free(?alloc, outcome.describe(r.err));
+    intern.dnit(?itn);
+    if (probe.live != 0) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.manifest.parse:link_middle_entry_error_releases_owned_arrays" {
+    var probe: StepParseLive;
+    var alloc: A.Allocator;
+    if (!step_parse_live_make(?probe, ?alloc)) { ret 1; }
+    var itn: intern.Interner             = intern.init(?alloc);
+    val r:   res[Manifest, outcome.Fail] = tparse(?alloc, ?itn,
+        "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[link.a]\nsource=\"system\"\nname=\"foo\"\nsymbols=[\"sym1\"]\nos=[\"*\"]\nisa=[\"*\"]\nabi=[\"*\"]\nexport=true\n[link.b]\nsource=\"system\"\nname=\"bar\"\nsymbols=[\"sym2\"]\nos=[\"*\"]\nisa=[\"*\"]\nabi=[\"*\"]\n[link.c]\nsource=\"system\"\nname=\"baz\"\nsymbols=[\"sym3\"]\nos=[\"*\"]\nisa=[\"*\"]\nabi=[\"*\"]\nexport=true\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (sel r.ok) {
+        intern.dnit(?itn);
+        ret 1;
+    }
+    if (!str_contains(outcome.describe(r.err), "is missing required key 'export'")) {
+        str_free(?alloc, outcome.describe(r.err));
+        intern.dnit(?itn);
+        ret 1;
+    }
+    str_free(?alloc, outcome.describe(r.err));
+    intern.dnit(?itn);
+    if (probe.live != 0) { ret 1; }
+    ret 0;
+}
+
+fun step_intern_fail_allocate(ctx: ptr, size: usize, align: usize) opt[ptr] {
+    ret opt[ptr].none{};
+}
+
+fun step_intern_fail_reallocate(ctx: ptr, item: ptr, old_size: usize,
+    new_size: usize, align: usize) opt[ptr] {
+    ret opt[ptr].none{};
+}
+
+fun step_intern_fail_deallocate(ctx: ptr, item: ptr, size: usize, align: usize) i64 {
+    ret 0;
+}
+
+test "mach.lang.manifest.parse:env_intern_failure_aborts_step" {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var base:     intern.Interner             = intern.init(?alloc);
+    val head:     str                         = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[step.s]\nargv=[\"true\"]\nin=[]\nout=[]\nneed=[]\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val seeded_r: res[Manifest, outcome.Fail] = tparse(?alloc, ?base, head);
+    if (sel seeded_r.err) {
+        intern.dnit(?base);
+        ret 1;
+    }
+    var seeded: Manifest = seeded_r.ok;
+    dnit(?seeded, ?alloc);
+
+    val source:  str                             = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[step.s]\nargv=[\"true\"]\nin=[]\nout=[]\nneed=[]\n[step.s.env]\nUNSEEDED=\"value\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val table_r: res[toml.Table, toml.TomlError] = toml.parse(?alloc, source);
+    if (sel table_r.err) {
+        intern.dnit(?base);
+        ret 1;
+    }
+    var table: toml.Table = table_r.ok;
+
+    var fail_alloc: A.Allocator;
+    fail_alloc.ctx           = nil;
+    fail_alloc.fn_allocate   = step_intern_fail_allocate;
+    fail_alloc.fn_reallocate = step_intern_fail_reallocate;
+    fail_alloc.fn_deallocate = step_intern_fail_deallocate;
+    var child:  intern.Interner             = intern.make_child(?base, ?fail_alloc);
+    val parsed: res[Manifest, outcome.Fail] = parse(?alloc, ?child, ?table, true);
+    toml.dnit(?alloc, ?table);
+    val bad: bool = sel parsed.ok || child.len != 0;
+    intern.dnit(?child);
+    intern.dnit(?base);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.manifest.parse:subsystem_optional_and_console" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+    val head: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val art:  str = "[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n";
+
+    val a: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, art));
+    if (sel a.err) { code = 1; }
+    if (sel a.ok) {
+        if (a.ok.artifacts[0].subsystem != of.SUBSYSTEM_CONSOLE || a.ok.artifacts[0].subsystem_declared) { code = 1; }
+    }
+
+    val b: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}", head, art, "subsystem=\"gui\"\n"));
+    if (sel b.err) { code = 1; }
+    if (sel b.ok) {
+        if (b.ok.artifacts[0].subsystem != of.SUBSYSTEM_GUI || !b.ok.artifacts[0].subsystem_declared) { code = 1; }
+    }
+
+    val c: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}", head, art, "subsystem=\"console\"\n"));
+    if (sel c.err) { code = 1; }
+    if (sel c.ok) {
+        if (c.ok.artifacts[0].subsystem != of.SUBSYSTEM_CONSOLE) { code = 1; }
+    }
+
+    val d: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}", head, art, "subsystem=\"windows\"\n"));
+    if (!(sel d.err && str_contains(outcome.describe(d.err), "subsystem must be \"console\" or \"gui\""))) { code = 1; }
+
+    val e: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}", head, art, "subsystem=2\n"));
+    if (!(sel e.err && str_contains(outcome.describe(e.err), "subsystem must be \"console\" or \"gui\""))) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:artifact_resource_keys_validated" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+    val head: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val bin:  str = "[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app.exe\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n";
+
+    val absent: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, bin));
+    if (sel absent.err) { code = 1; }
+    if (sel absent.ok) {
+        val a: ArtifactDef = absent.ok.artifacts[0];
+        if (a.icon != intern.STR_NIL || a.app_manifest != intern.STR_NIL) { code = 1; }
+    }
+
+    val valid: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn,
+        sfmt(?alloc, "{}{}{}", head, bin, "icon=\"assets/app.ico\"\nmanifest=\"assets/app.manifest\"\n"));
+    if (sel valid.err) { code = 1; }
+    if (sel valid.ok) {
+        val a:  ArtifactDef = valid.ok.artifacts[0];
+        val io: opt[str]    = intern.lookup(?itn, a.icon);
+        val mo: opt[str]    = intern.lookup(?itn, a.app_manifest);
+        if (!(sel io.some && str_equals(io.some, "assets/app.ico")))      { code = 1; }
+        if (!(sel mo.some && str_equals(mo.some, "assets/app.manifest"))) { code = 1; }
+    }
+
+    val empty_icon: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn,
+        sfmt(?alloc, "{}{}{}", head, bin, "icon=\"\"\n"));
+    if (!(sel empty_icon.err && str_contains(outcome.describe(empty_icon.err), ".icon must not be empty"))) { code = 1; }
+
+    val wrong_manifest: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn,
+        sfmt(?alloc, "{}{}{}", head, bin, "manifest=42\n"));
+    if (!(sel wrong_manifest.err && str_contains(outcome.describe(wrong_manifest.err), ".manifest must be a non-empty path string"))) { code = 1; }
+
+    val backslash: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn,
+        sfmt(?alloc, "{}{}{}", head, bin, "icon=\"assets\\\\app.ico\"\n"));
+    if (!(sel backslash.err && str_contains(outcome.describe(backslash.err), "manifest paths use '/'"))) { code = 1; }
+
+    val static_art: str                         = "[artifact.lib]\nkind=\"static\"\nentry=\"lib.mach\"\nout=\"lib/x.a\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\nicon=\"assets/app.ico\"\n";
+    val irrelevant: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, static_art));
+    if (!(sel irrelevant.err && str_contains(outcome.describe(irrelevant.err), "apply only to kind = \"bin\" artifacts"))) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:reserved_target_native" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val a: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.native]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (!(sel a.err && str_equals(outcome.describe(a.err), "mach.toml: [target.native] is reserved; 'native' resolves to a declared target"))) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:dep_conflict" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val a: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[dep.std]\nversion=\"1.0\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (!(sel a.err && str_equals(outcome.describe(a.err), "mach.toml: [dep.std].version is reserved for the registry era"))) { code = 1; }
+
+    val b: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[dep.std]\ngit=\"u\"\npath=\"p\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (!(sel b.err && str_equals(outcome.describe(b.err), "mach.toml: [dep.std] needs exactly one source key: 'git' or 'path'"))) { code = 1; }
+
+    val missing_ref: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[dep.std]\ngit=\"u\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (!(sel missing_ref.err && str_contains(outcome.describe(missing_ref.err), "missing required key 'ref'"))) { code = 1; }
+
+    val path_ref: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[dep.std]\npath=\"../std\"\nref=\"branch/main\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (!(sel path_ref.err && str_contains(outcome.describe(path_ref.err), "not allowed for path sources"))) { code = 1; }
+
+    val raw_ref: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[dep.std]\ngit=\"u\"\nref=\"main\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (!(sel raw_ref.err && str_contains(outcome.describe(raw_ref.err), "branch/<name>"))) { code = 1; }
+
+    val short_commit: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[dep.std]\ngit=\"u\"\nref=\"commit/01234567\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (!(sel short_commit.err && str_contains(outcome.describe(short_commit.err), "full-object-id"))) { code = 1; }
+
+    val hidden_ref: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[dep.std]\ngit=\"u\"\nref=\"branch/.hidden\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (sel hidden_ref.ok) { code = 1; }
+
+    val lock_ref: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[dep.std]\ngit=\"u\"\nref=\"tag/release.lock\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (sel lock_ref.ok) { code = 1; }
+
+    val uppercase_commit: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[dep.std]\ngit=\"u\"\nref=\"commit/0123456789ABCDEF0123456789ABCDEF01234567\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (sel uppercase_commit.ok) { code = 1; }
+
+    val prefixed: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[dep.std]\ngit=\"u\"\nref=\"branch/main\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (sel prefixed.err) { code = 1; }
+
+    val full_commit: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[dep.std]\ngit=\"u\"\nref=\"commit/0123456789abcdef0123456789abcdef01234567\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (sel full_commit.err) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:dependency_name_is_portable" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    val src:    str                         = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[dep.\"../escape\"]\npath=\"../lib\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val parsed: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, src);
+    val failed: bool                        = sel parsed.err
+        && str_contains(outcome.describe(parsed.err), "dependency name '../escape' must be a portable identifier");
+    arena.dnit(?ar);
+    if (!failed) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.manifest.parse:selection_names_are_portable" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code:    i32 = 0;
+    val project: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+
+    val target: res[Manifest, outcome.Fail] = tparse_lenient(?alloc, ?itn, sfmt(?alloc, "{}[target.\"../escape\"]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n", project));
+    if (!(sel target.err && str_contains(outcome.describe(target.err), "target name '../escape' must be a portable identifier"))) { code = 1; }
+
+    val artifact: res[Manifest, outcome.Fail] = tparse_lenient(?alloc, ?itn, sfmt(?alloc, "{}[artifact.\"../escape\"]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\n", project));
+    if (!(sel artifact.err && str_contains(outcome.describe(artifact.err), "artifact name '../escape' must be a portable identifier"))) { code = 1; }
+
+    val profile: res[Manifest, outcome.Fail] = tparse_lenient(?alloc, ?itn, sfmt(?alloc, "{}[profile.\"../escape\"]\n", project));
+    if (!(sel profile.err && str_contains(outcome.describe(profile.err), "profile name '../escape' must be a portable identifier"))) { code = 1; }
+
+    val link: res[Manifest, outcome.Fail] = tparse_lenient(?alloc, ?itn, sfmt(?alloc, "{}[link.\"../escape\"]\nsource=\"local\"\npath=\"obj/a.o\"\n", project));
+    if (!(sel link.err && str_contains(outcome.describe(link.err), "link name '../escape' must be a portable identifier"))) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:backslash_rejected" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val a: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"a\\\\b\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (!(sel a.err && str_equals(outcome.describe(a.err), "mach.toml: [project].src contains a '\\\\'; manifest paths use '/'"))) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:operational_paths_are_project_relative" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code:   i32 = 0;
+    val prefix: str = "[project]\nid=\"x\"\nversion=\"1\"\n";
+    val suffix: str = "\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+
+    val parent: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}src=\"../src\"\nout=\"out\"{}", prefix, suffix));
+    if (!(sel parent.err && str_contains(outcome.describe(parent.err), "must not contain '.' or '..'"))) { code = 1; }
+
+    val absolute: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}src=\"src\"\nout=\"/tmp/out\"{}", prefix, suffix));
+    if (!(sel absolute.err && str_contains(outcome.describe(absolute.err), "must be relative to the project root"))) { code = 1; }
+
+    val repeated: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}src=\"src//lib\"\nout=\"out\"{}", prefix, suffix));
+    if (!(sel repeated.err && str_contains(outcome.describe(repeated.err), "empty path component"))) { code = 1; }
+
+    val drive: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}src=\"src\"\nout=\"C:/out\"{}", prefix, suffix));
+    if (!(sel drive.err && str_contains(outcome.describe(drive.err), "absolute drive path"))) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:platform_and_base" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val src:          str                         = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.bmos]\nisa=\"x86_64\"\nos=\"freestanding\"\nabi=\"sysv64\"\nplatform=\"bmos\"\nbase=0xFFFF800000000000\n[target.plain]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val res_manifest: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, src);
+    if (sel res_manifest.err) { code = 1; }
+    if (sel res_manifest.ok) {
+        var m:  Manifest   = res_manifest.ok;
+        val tb: *TargetDef = find_target_by_name(?itn, ?m, "bmos");
+        val tp: *TargetDef = find_target_by_name(?itn, ?m, "plain");
+        if (tb == nil || tp == nil) { code = 1; }
+        or {
+            if (!str_equals(idstr(?itn, tb.platform), "bmos")) { code = 1; }
+            if (tb.base != 0xFFFF800000000000)                 { code = 1; }
+            if (tp.platform != intern.STR_NIL)                 { code = 1; }
+            if (tp.base != 0)                                  { code = 1; }
+        }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.resolve_build_unit:profile_debug_strict" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val a: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[profile.debug]\nopt = 9\ndebug = false\nvectorize = true\nfloat_reassoc = false\n");
+    if (!(sel a.err && str_contains(outcome.describe(a.err), "opt must be 0, 1, or 2"))) { code = 1; }
+
+    val b: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[profile.debug]\nopt = 0\ndebug = 9\nvectorize = true\nfloat_reassoc = false\n");
+    if (!(sel b.err && str_contains(outcome.describe(b.err), "debug must be a boolean"))) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:link_filter_string_form" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val src:          str                         = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[target.windows]\nisa=\"x86_64\"\nos=\"windows\"\nabi=\"win64\"\n[target.arm]\nisa=\"aarch64\"\nos=\"linux\"\nabi=\"aapcs64\"\n[link.os_str]\nsource=\"system\"\nname=\"a\"\nos=\"linux\"\n[link.os_arr]\nsource=\"system\"\nname=\"b\"\nos=[\"linux\"]\n[link.os_star]\nsource=\"system\"\nname=\"c\"\nos=\"*\"\n[link.os_absent]\nsource=\"system\"\nname=\"d\"\n[link.isa_str]\nsource=\"system\"\nname=\"e\"\nisa=\"x86_64\"\n[link.abi_str]\nsource=\"system\"\nname=\"f\"\nabi=\"sysv64\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val res_manifest: res[Manifest, outcome.Fail] = tparse_lenient(?alloc, ?itn, src);
+    if (sel res_manifest.err) { code = 1; }
+    if (sel res_manifest.ok) {
+        var m: Manifest = res_manifest.ok;
+
+        val tl: *TargetDef = find_target_by_name(?itn, ?m, "linux");
+        val tw: *TargetDef = find_target_by_name(?itn, ?m, "windows");
+        val ta: *TargetDef = find_target_by_name(?itn, ?m, "arm");
+        if (tl == nil || tw == nil || ta == nil) { code = 1; }
+        or {
+            if (!link_matches_target(?itn, find_link(?itn, ?m, "os_str"), tl)) { code = 1; }
+            if (link_matches_target(?itn, find_link(?itn, ?m, "os_str"), tw))  { code = 1; }
+            if (!link_matches_target(?itn, find_link(?itn, ?m, "os_arr"), tl)) { code = 1; }
+            if (link_matches_target(?itn, find_link(?itn, ?m, "os_arr"), tw))  { code = 1; }
+
+            if (!link_matches_target(?itn, find_link(?itn, ?m, "os_star"), tw))   { code = 1; }
+            if (!link_matches_target(?itn, find_link(?itn, ?m, "os_absent"), tw)) { code = 1; }
+
+            if (!link_matches_target(?itn, find_link(?itn, ?m, "isa_str"), tl)) { code = 1; }
+            if (link_matches_target(?itn, find_link(?itn, ?m, "isa_str"), ta))  { code = 1; }
+            if (!link_matches_target(?itn, find_link(?itn, ?m, "abi_str"), tl)) { code = 1; }
+            if (link_matches_target(?itn, find_link(?itn, ?m, "abi_str"), tw))  { code = 1; }
+        }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.plan_steps:cycle" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val src: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[artifact.app]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink=[]\nneed=[\"step.a\"]\n[step.a]\nargv=[\"x\"]\nin=[\"i\"]\nout=[\"{project.out}/a.o\"]\nneed=[\"step.b\"]\n[step.b]\nargv=[\"y\"]\nin=[\"i\"]\nout=[\"{project.out}/b.o\"]\nneed=[\"step.a\"]\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    if (!need_err(?alloc, ?itn, src, "build step 'a' is part of a 'need' cycle")) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:id_and_out_validation" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val bad_id: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"a/b\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (sel bad_id.ok) { code = 1; }
+    val ok_id: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"a-b_2\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (sel ok_id.err) { code = 1; }
+    val bad_out: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[step.s]\nargv=[\"cc\"]\nin=[\"a.c\"]\nout=[\"{project.out}/*.o\"]\nneed=[]\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (sel bad_out.ok) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:strict_totality" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+    val bare: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n";
+    val head: str = sfmt(?alloc, "{}{}", bare, "[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+
+    val no_profile: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, bare);
+    if (!(sel no_profile.err && str_equals(outcome.describe(no_profile.err), MISSING_PROFILE_MESSAGE))) { code = 1; }
+    val empty_profile: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", bare, "[profile]\n"));
+    if (!(sel empty_profile.err && str_equals(outcome.describe(empty_profile.err), MISSING_PROFILE_MESSAGE))) { code = 1; }
+    val dep_no_profile: res[Manifest, outcome.Fail] = tparse_lenient(?alloc, ?itn, bare);
+    if (!(sel dep_no_profile.ok && dep_no_profile.ok.profile_count == 2)) { code = 1; }
+
+    var form: u32 = 0;
+    for (form < 2) {
+        var keys: [5]str;
+        keys[0] = "opt";
+        keys[1] = "debug";
+        keys[2] = "simd";
+        keys[3] = "vectorize";
+        keys[4] = "float_reassoc";
+        var partial: [5]str;
+        partial[0] = "[profile.p]\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+        partial[1] = "[profile.p]\nopt=0\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+        partial[2] = "[profile.p]\nopt=0\ndebug=false\nvectorize=true\nfloat_reassoc=false\n";
+        partial[3] = "[profile.p]\nopt=0\ndebug=false\nsimd=\"scalarize\"\nfloat_reassoc=false\n";
+        partial[4] = "[profile.p]\nopt=0\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\n";
+        var ki: usize = 0;
+        for (ki < 5) {
+            var r: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", bare, partial[ki]));
+            if (form == 1) { r = tparse_lenient(?alloc, ?itn, sfmt(?alloc, "{}{}", bare, partial[ki])); }
+            val want: str = sfmt(?alloc, "mach.toml: [profile.p] is missing required key '{}'; a profile declares opt, debug, simd, vectorize and float_reassoc", keys[ki]);
+            if (!(sel r.err && str_equals(outcome.describe(r.err), want))) { code = 1; }
+            ki = ki + 1;
+        }
+        form = form + 1;
+    }
+    val p_simd_bad: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", bare, "[profile.p]\nopt=0\ndebug=false\nsimd=\"bogus\"\nvectorize=true\nfloat_reassoc=false\n"));
+    if (!(sel p_simd_bad.err && str_contains(outcome.describe(p_simd_bad.err), "simd must be \"scalarize\" or \"require\""))) { code = 1; }
+
+    val a_link: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[artifact.a]\nkind=\"bin\"\nentry=\"m.mach\"\nout=\"bin/a\"\ntargets=[\"*\"]\n"));
+    if (!(sel a_link.err && str_contains(outcome.describe(a_link.err), "missing required key 'link'"))) { code = 1; }
+    val a_need: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[artifact.a]\nkind=\"bin\"\nentry=\"m.mach\"\nout=\"bin/a\"\ntargets=[\"*\"]\nlink=[]\n"));
+    if (!(sel a_need.err && str_contains(outcome.describe(a_need.err), "missing required key 'need'"))) { code = 1; }
+
+    val l_os: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[link.l]\nsource=\"system\"\nname=\"c\"\n"));
+    if (!(sel l_os.err && str_contains(outcome.describe(l_os.err), "missing required key 'os'"))) { code = 1; }
+    val l_isa: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[link.l]\nsource=\"system\"\nname=\"c\"\nos=\"*\"\n"));
+    if (!(sel l_isa.err && str_contains(outcome.describe(l_isa.err), "missing required key 'isa'"))) { code = 1; }
+    val l_abi: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[link.l]\nsource=\"system\"\nname=\"c\"\nos=\"*\"\nisa=[\"*\"]\n"));
+    if (!(sel l_abi.err && str_contains(outcome.describe(l_abi.err), "missing required key 'abi'"))) { code = 1; }
+    val l_exp: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[link.l]\nsource=\"system\"\nname=\"c\"\nos=\"*\"\nisa=[\"*\"]\nabi=[\"*\"]\n"));
+    if (!(sel l_exp.err && str_contains(outcome.describe(l_exp.err), "missing required key 'export'"))) { code = 1; }
+
+    val s_need: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[step.s]\nargv=[\"c\"]\nin=[\"i\"]\nout=[\"o\"]\n"));
+    if (!(sel s_need.err && str_contains(outcome.describe(s_need.err), "missing required key 'need'"))) { code = 1; }
+    val d_ref: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[dep.d]\ngit=\"u\"\n"));
+    if (!(sel d_ref.err && str_contains(outcome.describe(d_ref.err), "missing required key 'ref' for git source"))) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:canonical_and_star" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+    val head: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+
+    val bad: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[link.l]\nsource=\"system\"\nname=\"c\"\nos=\"windoze\"\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n"));
+    if (!(sel bad.err && str_contains(outcome.describe(bad.err), "non-canonical value 'windoze'"))) { code = 1; }
+
+    val ok: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[artifact.a]\nkind=\"bin\"\nentry=\"m.mach\"\nout=\"bin/a\"\ntargets=[\"*\"]\nlink=[\"c\"]\nneed=[]\n[link.c]\nsource=\"system\"\nname=\"c\"\nos=\"*\"\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n"));
+    if (sel ok.err) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:root_reject_dep_consume" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val nontotal: str = "[project]\nid=\"std\"\nversion=\"0.18.0\"\nsrc=\"src\"\nout=\"out/{target.name}/{profile.name}\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[target.windows]\nisa=\"x86_64\"\nos=\"windows\"\nabi=\"win64\"\n[profile.debug]\nopt=0\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n[artifact.std]\nkind=\"static\"\nentry=\"lib.mach\"\nout=\"lib/std\"\ntargets=[\"*\"]\nlink=[\"kernel32\"]\n[link.kernel32]\nsource=\"system\"\nname=\"kernel32.dll\"\nos=[\"windows\"]\nexport=true\n";
+
+    val as_root: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, nontotal);
+    if (sel as_root.ok) { code = 1; }
+
+    val as_dep: res[Manifest, outcome.Fail] = tparse_lenient(?alloc, ?itn, nontotal);
+    if (sel as_dep.err) { code = 1; }
+    if (sel as_dep.ok) {
+        var m:  Manifest   = as_dep.ok;
+        val k:  *LinkDef   = find_link(?itn, ?m, "kernel32");
+        val tl: *TargetDef = find_target_by_name(?itn, ?m, "linux");
+        val tw: *TargetDef = find_target_by_name(?itn, ?m, "windows");
+        if (k == nil || tl == nil || tw == nil) { code = 1; }
+        or {
+            if (!k.export)                         { code = 1; }
+            if (!link_matches_target(?itn, k, tw)) { code = 1; }
+            if (link_matches_target(?itn, k, tl))  { code = 1; }
+        }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:link_filter_bad_type" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val a: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[link.bad]\nsource=\"system\"\nname=\"a\"\nos=1\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (!(sel a.err && str_equals(outcome.describe(a.err), "mach.toml: [link.bad].os must be a string or array of strings"))) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:link_library_requires_nonempty_string" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val prefix:    str                         = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n[link.bad]\nsource=\"system\"\nname=\"a\"\nlibrary=";
+    val empty_src: str                         = sfmt(?alloc, "{}\"\"\n", prefix);
+    val typed_src: str                         = sfmt(?alloc, "{}1\n", prefix);
+    val empty:     res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, empty_src);
+    val typed:     res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, typed_src);
+    val want:      str                         = "mach.toml: [link.bad].library must be a non-empty string";
+    if (!(sel empty.err && str_equals(outcome.describe(empty.err), want))) { code = 1; }
+    if (!(sel typed.err && str_equals(outcome.describe(typed.err), want))) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:link_symbols_claim" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+    val head: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+
+    val none: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[link.k]\nsource=\"system\"\nname=\"kernel32.dll\"\nos=\"*\"\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n"));
+    if (sel none.err) { code = 1; }
+    if (sel none.ok) {
+        val m: Manifest = none.ok;
+        if (m.links[0].symbol_count != 0 || m.links[0].symbols != nil) { code = 1; }
+    }
+
+    val two: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[link.k]\nsource=\"system\"\nname=\"kernel32.dll\"\nsymbols=[\"Sleep\",\"ExitProcess\"]\nos=\"*\"\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n"));
+    if (sel two.err) { code = 1; }
+    if (sel two.ok) {
+        val m: Manifest = two.ok;
+        if (m.links[0].symbol_count != 2) { code = 1; }
+        or {
+            if (!str_equals(idstr(?itn, m.links[0].symbols[0]), "Sleep"))       { code = 1; }
+            if (!str_equals(idstr(?itn, m.links[0].symbols[1]), "ExitProcess")) { code = 1; }
+        }
+    }
+
+    val scalar: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[link.k]\nsource=\"system\"\nname=\"kernel32.dll\"\nsymbols=\"Sleep\"\n"));
+    if (!(sel scalar.err && str_equals(outcome.describe(scalar.err), "mach.toml: [link.k].symbols must be an array of strings"))) { code = 1; }
+
+    val typed: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[link.k]\nsource=\"system\"\nname=\"kernel32.dll\"\nsymbols=[\"Sleep\",1]\n"));
+    if (!(sel typed.err && str_equals(outcome.describe(typed.err), "mach.toml: [link.k].symbols must be an array of strings"))) { code = 1; }
+
+    val blank: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[link.k]\nsource=\"system\"\nname=\"kernel32.dll\"\nsymbols=[\"\"]\n"));
+    if (!(sel blank.err && str_equals(outcome.describe(blank.err), "mach.toml: [link.k].symbols has an empty symbol name"))) { code = 1; }
+
+    val dup: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[link.k]\nsource=\"system\"\nname=\"kernel32.dll\"\nsymbols=[\"Sleep\",\"Sleep\"]\n"));
+    if (!(sel dup.err && str_equals(outcome.describe(dup.err), "mach.toml: [link.k].symbols lists 'Sleep' twice"))) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:link_include_values" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+    val head: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+
+    val default_r: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[link.k]\nsource=\"system\"\nname=\"kernel32.dll\"\nos=\"*\"\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n"));
+    if (sel default_r.err) { code = 1; }
+    if (sel default_r.ok) {
+        val m: Manifest = default_r.ok;
+        if (m.links[0].include_referenced) { code = 1; }
+    }
+
+    val always_r: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[link.k]\nsource=\"system\"\nname=\"kernel32.dll\"\ninclude=\"always\"\nos=\"*\"\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n"));
+    if (sel always_r.err) { code = 1; }
+    if (sel always_r.ok) {
+        val m: Manifest = always_r.ok;
+        if (m.links[0].include_referenced) { code = 1; }
+    }
+
+    val referenced_r: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[link.k]\nsource=\"system\"\nname=\"kernel32.dll\"\ninclude=\"referenced\"\nos=\"*\"\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n"));
+    if (sel referenced_r.err) { code = 1; }
+    if (sel referenced_r.ok) {
+        val m: Manifest = referenced_r.ok;
+        if (!m.links[0].include_referenced) { code = 1; }
+    }
+
+    val bad_r: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[link.k]\nsource=\"system\"\nname=\"kernel32.dll\"\ninclude=\"sometimes\"\nos=\"*\"\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n"));
+    if (!(sel bad_r.err && str_equals(outcome.describe(bad_r.err), "mach.toml: [link.k].include must be \"always\" or \"referenced\""))) { code = 1; }
+
+    val typed_r: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[link.k]\nsource=\"system\"\nname=\"kernel32.dll\"\ninclude=1\nos=\"*\"\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n"));
+    if (!(sel typed_r.err && str_equals(outcome.describe(typed_r.err), "mach.toml: [link.k].include must be \"always\" or \"referenced\""))) { code = 1; }
+
+    val dep_r: res[Manifest, outcome.Fail] = tparse_lenient(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[link.k]\nsource=\"system\"\nname=\"libdemo\"\nlibrary=\"libdemo\"\ninclude=\"referenced\"\nexport=true\n"));
+    if (sel dep_r.err) { code = 1; }
+    if (sel dep_r.ok) {
+        val m: Manifest = dep_r.ok;
+        if (!m.links[0].include_referenced || !m.links[0].export) { code = 1; }
+    }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:link_filter_empty_string_error" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val a: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[link.bad]\nsource=\"system\"\nname=\"a\"\nos=\"\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n");
+    if (!(sel a.err && str_equals(outcome.describe(a.err), "mach.toml: [link.bad].os is empty; use a canonical value, \"*\", or [], or omit it"))) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:link_filter_empty_array_matches_nothing" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val src:          str                         = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[target.windows]\nisa=\"x86_64\"\nos=\"windows\"\nabi=\"win64\"\n[target.arm]\nisa=\"aarch64\"\nos=\"linux\"\nabi=\"aapcs64\"\n[link.none]\nsource=\"system\"\nname=\"a\"\nos=[]\n[link.absent]\nsource=\"system\"\nname=\"b\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val res_manifest: res[Manifest, outcome.Fail] = tparse_lenient(?alloc, ?itn, src);
+    if (sel res_manifest.err) { code = 1; }
+    if (sel res_manifest.ok) {
+        var m:  Manifest   = res_manifest.ok;
+        val tl: *TargetDef = find_target_by_name(?itn, ?m, "linux");
+        val tw: *TargetDef = find_target_by_name(?itn, ?m, "windows");
+        val ta: *TargetDef = find_target_by_name(?itn, ?m, "arm");
+        if (tl == nil || tw == nil || ta == nil) { code = 1; }
+        or {
+            if (link_matches_target(?itn, find_link(?itn, ?m, "none"), tl))    { code = 1; }
+            if (link_matches_target(?itn, find_link(?itn, ?m, "none"), tw))    { code = 1; }
+            if (link_matches_target(?itn, find_link(?itn, ?m, "none"), ta))    { code = 1; }
+            if (!link_matches_target(?itn, find_link(?itn, ?m, "absent"), tl)) { code = 1; }
+            if (!link_matches_target(?itn, find_link(?itn, ?m, "absent"), tw)) { code = 1; }
+        }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:several_targets_or_profiles_marked_default_are_refused_naming_each_table" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val head: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[profile.debug]\nopt=0\ndebug=false\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n";
+    val art:  str = "[artifact.app]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n";
+    val lx:   str = "[target.lx]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\ndefault=true\n";
+    val mac:  str = "[target.mac]\nisa=\"x86_64\"\nos=\"darwin\"\nabi=\"sysv64\"\ndefault=true\n";
+    val win:  str = "[target.win]\nisa=\"x86_64\"\nos=\"windows\"\nabi=\"win64\"\n";
+
+    val two: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}{}{}", head, lx, win, mac, art));
+    if (sel two.ok) { code = 1; }
+    if (sel two.err) {
+        val msg: str = outcome.describe(two.err);
+        if (!str_contains(msg, "2 targets declare `default = true` ([target.lx], [target.mac])")
+            || str_contains(msg, "[target.win]") || !str_contains(msg, "exactly one is allowed")) { code = 1; }
+    }
+
+    val one: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}{}", head, lx, win, art));
+    if (sel one.err) { code = 1; }
+    if (sel one.ok) {
+        var m: Manifest = one.ok;
+        if (m.target_count != 2 || !m.targets[0].is_default || m.targets[1].is_default) { code = 1; }
+    }
+
+    val lenient: res[Manifest, outcome.Fail] = tparse_lenient(?alloc, ?itn, sfmt(?alloc, "{}{}{}{}{}", head, lx, win, mac, art));
+    if (sel lenient.err) { code = 1; }
+
+    val pa:       str                         = "[profile.fast]\ndefault=true\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val pb:       str                         = "[profile.slow]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val profiles: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}{}{}", head, lx, art, pa, pb));
+    if (sel profiles.ok) { code = 1; }
+    if (sel profiles.err) {
+        val msg: str = outcome.describe(profiles.err);
+        if (!str_contains(msg, "2 profiles declare `default = true` ([profile.fast], [profile.slow])")
+            || !str_contains(msg, "exactly one is allowed")) { code = 1; }
+    }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:unknown_top_level_table_or_key_is_rejected" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32                         = 0;
+    val head: str                         = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val a:    res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head, "[bogus_top_level_table]\nk = 1\n"));
+    if (!(sel a.err && str_equals(outcome.describe(a.err), "mach.toml: unknown table or key 'bogus_top_level_table' at the document root"))) { code = 1; }
+    val b: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", "stray = true\n", head));
+    if (!(sel b.err && str_equals(outcome.describe(b.err), "mach.toml: unknown table or key 'stray' at the document root"))) { code = 1; }
+    val c: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, head);
+    if (sel c.err) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:env_is_a_target_key_carried_verbatim" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32                         = 0;
+    val head: str                         = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val art:  str                         = "[artifact.k]\nkind=\"bin\"\nentry=\"k.mach\"\nout=\"k.spv\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n";
+    val gpu:  str                         = "[target.gpu]\nisa=\"spirv\"\nos=\"freestanding\"\nabi=\"spirv\"\nenv=\"vulkan1.2\"\n";
+    val r:    res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}", head, gpu, art));
+    if (sel r.err) { code = 1; }
+    if (sel r.ok) {
+        val m: Manifest = r.ok;
+        if (m.target_count != 1 || !str_equals(idstr(?itn, m.targets[0].env), "vulkan1.2")) { code = 1; }
+    }
+    val plain: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}", head, "[target.gpu]\nisa=\"spirv\"\nos=\"freestanding\"\nabi=\"spirv\"\n", art));
+    if (!(sel plain.ok && plain.ok.targets[0].env == intern.STR_NIL)) { code = 1; }
+    val bad: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}", head, "[target.gpu]\nisa=\"spirv\"\nos=\"freestanding\"\nabi=\"spirv\"\nenv=3\n", art));
+    if (!(sel bad.err && str_contains(outcome.describe(bad.err), "env must be a non-empty string"))) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+test "mach.lang.manifest.parse:the_isa_spellings_mach_info_targets_prints_resolve_as_written" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    fin { arena.dnit(?ar); }
+    val head: str                         = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val art:  str                         = "[artifact.k]\nkind=\"bin\"\nentry=\"k.mach\"\nout=\"k\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n";
+    val rows: str                         = "[target.wide]\nisa=\"rv64gc\"\nos=\"linux\"\nabi=\"lp64d\"\n[target.narrow]\nisa=\"rv32imac\"\nos=\"freestanding\"\nabi=\"ilp32\"\n";
+    val r:    res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}{}", head, rows, art));
+    if (sel r.err) { ret 2; }
+    val m: Manifest = r.ok;
+    if (m.target_count != 2) { ret 3; }
+
+    var reg: tgt.TargetRegistry = tgt.registry_init();
+    fin { tgt.registry_dnit(?reg); }
+    val ready: err[fail.Fail] = tgt.register_all(?reg, target_testing.debug_descriptor);
+    if (sel ready.err) { ret 4; }
+    var i: u32 = 0;
+    for (i < 2) {
+        val d:        *TargetDef                 = ?m.targets[i];
+        val isa_name: str                        = idstr(?itn, d.isa);
+        val t_r:      res[tgt.Target, fail.Fail] = tgt.select(?reg, isa_name, idstr(?itn, d.os), idstr(?itn, d.abi));
+        if (sel t_r.err) { ret 5; }
+        var buf: [32]u8;
+        if (!str_equals(tgt.selection_spelling(t_r.ok.isa, ?t_r.ok.model, ?buf[0], 32), isa_name)) { ret 6; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.manifest.parse: Windows Unicode environment names cannot alias" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    fin { arena.dnit(?ar); }
+    val source: str                         = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[step.s]\nargv=[\"true\"]\nin=[]\nout=[]\nneed=[]\n[step.s.env]\n\"MACH_ÄΩ\"=\"first\"\n\"mach_äω\"=\"second\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val parsed: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, source);
+    $if ($mach.build.os == $mach.os.windows) {
+        if (sel parsed.ok)                                                 { ret 2; }
+        if (!str_contains(outcome.describe(parsed.err), "ambiguous keys")) { ret 3; }
+    }
+    $or {
+        if (sel parsed.err) { ret 4; }
+        val manifest: Manifest = parsed.ok;
+        if (manifest.step_count != 1 || manifest.steps[0].env_count != 2) { ret 5; }
+    }
+    ret 0;
+}
+
+test "mach.lang.manifest.native_owner:unknown_key_rejection_owns_only_its_message" {
+    var backing: A.Allocator;
+    val make_r:  err[A.Error] = page.make(?backing);
+    if (sel make_r.err) { ret 1; }
+    var itn: intern.Interner = intern.init(?backing);
+    fin { intern.dnit(?itn); }
+    val table_r: res[toml.Table, toml.TomlError] = toml.parse(?backing, "[project]\nid=\"p\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\nname=\"unused\"\n");
+    if (sel table_r.err) { ret 2; }
+    var table: toml.Table = table_r.ok;
+    fin { toml.dnit(?backing, ?table); }
+    var tracking: alloc_test.Testing;
+    val make_r2:  err[A.Error] = alloc_test.make(?tracking);
+    if (sel make_r2.err) { ret 3; }
+    fin { alloc_test.dnit(?tracking); }
+    val parsed: res[Manifest, outcome.Fail] = parse(?tracking.a, ?itn, ?table, true);
+    if (sel parsed.ok) {
+        var unexpected: Manifest = parsed.ok;
+        dnit(?unexpected, ?tracking.a);
+        ret 4;
+    }
+    if (!str_contains(outcome.describe(parsed.err), "unknown key 'name' in [project]")) { ret 5; }
+    outcome.release_text(?tracking.a, parsed.err);
+    if (tracking.total < 1 || tracking.live != 0 || tracking.double_frees != 0 || tracking.exhausted != 0) { ret 6; }
+    ret 0;
+}
