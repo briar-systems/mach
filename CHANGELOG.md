@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Only a directory under `dep/` named by a valid project id is a dependency slot, so a file such as the `.DS_Store` Finder writes no longer draws a stray note from `mach dep pull` or fails `mach dep verify` (#3391).
+- A System V x86_64 tag of 9 to 16 bytes with more than sixteen members, most often one with many unit cases or a nested tag holding one, keeps its second eightbyte when passed or returned by value. The classifier used to drop every member past the sixteenth, so a payload in the second eightbyte rode no register and read back as zero or garbage (#3400).
 
 ## [5.0.4] - 2026-09-13
 
