@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A SPIR-V module whose `env` pins a version below 1.4 lists only its Input and Output variables in `OpEntryPoint`, and below 1.3 declares a `#[storage]` binding as a `Uniform` variable over a `BufferBlock` block, so `vulkan1.0` and `vulkan1.1` modules with descriptors pass `spirv-val` for their environment (#3399).
+
 ## [5.0.4] - 2026-09-13
 
 ### Fixed
