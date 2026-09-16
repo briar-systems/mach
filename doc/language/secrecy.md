@@ -227,6 +227,71 @@ admitted only when neither side has a public-stored byte at all.
 The comparison reads the same layout the backend emits. Where it cannot
 determine a layout it declines, which rejects.
 
+## Comparing and ordering addresses
+
+`==`, `!=`, `<`, `<=`, `>` and `>=` all accept two pointer-like operands
+whatever their pointees' secrecy, including `*^T` against `*^T` and `*^T`
+against a public `*U`. The result is a public `bool` — `u8`, per
+[operators.md](operators.md) — so it branches, feeds `&&`, and returns like any
+other public value:
+
+```mach
+fun overlap(first: *^u8, first_len: usize, second: *^u8, second_len: usize) bool {
+    ret first <= ?second[second_len - 1] && second <= ?first[first_len - 1];
+}
+```
+
+**This launders nothing**, and the reason is the line the whole model draws: a
+`*^T` is a *public address to secret storage*. The address was never secret, so
+reading it is not a downgrade. What the welding rules protect is the *pointee* —
+that the bytes at that address can only ever be reached as `^T` — and ordering
+reaches no bytes at all. It consumes two addresses and produces one `bool`; no
+integer and no pointer comes out of it, so there is no value to turn back into a
+`*T` and dereference. Ordering is exactly as revealing as the `==` the language
+has always permitted, which answers the same question one address at a time.
+
+The conversions stay closed. None of these become legal by admitting ordering,
+and each has a test pinning it:
+
+| refused | why |
+| --- | --- |
+| `p::usize`, `p:~usize` | `::` and `:~` may neither add nor drop `^` |
+| `p:>*u8` | a `:>T` target must name the operand's *stripped* type, and `*^u8` stripped is `*^u8` |
+| `@((?p):~*usize)` | the same, reached through a pointer to the slot |
+| `val e: ptr = p;` | a secret-welded pointer does not erase to `ptr` |
+
+Three deliberate decisions:
+
+- **A differing pointee type orders.** `*^u8 < *u32` compiles. Addresses are
+  addresses; both operands are pointer-width and the comparison is over the
+  address space, not over either pointee. This is the pair `==` already accepts,
+  and narrowing it for ordering alone would refuse the common case of relating a
+  byte cursor to a typed buffer.
+- **`nil` orders.** `p > nil` compiles and compares against the null address as
+  zero. It falls out of `nil` being a pointer-like operand, the same way
+  `p == nil` does. It is rarely what you mean — `p != nil` is — but it is not a
+  leak, and special-casing it would be surface with nothing behind it.
+- **The comparison is not itself constant-time-gated, and does not need to be.**
+  Both operands are public addresses, so ordering is `CT_OP_NONE`: it lowers to
+  one unsigned integer compare of pointer width, data-independent on every
+  supported target. There is no secret operand for the leakage model to track.
+
+Inside a `#[oblivious]` function this needs no exception. The result of ordering
+two public addresses is public, so it may steer a branch there like any other
+public condition. The gates are unchanged where the *pointer itself* is the
+secret: a `^*T` is a secret value, the order of two of them is secret, and that
+`bool` still cannot be a branch condition.
+
+```mach
+#[oblivious]
+fun before(a: *^u8, b: *^u8) bool { ret a < b; }   # public addresses, public bool
+
+fun leak(a: ^*u8, b: ^*u8) u8 {
+    if (a < b) { ret 1; }   # error: secret value used as a branch condition
+    ret 0;
+}
+```
+
 ## `#[oblivious]` — the codegen contract
 
 The flow typing constrains the *source*; `#[oblivious]` carries the obligation
