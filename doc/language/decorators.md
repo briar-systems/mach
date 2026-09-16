@@ -654,10 +654,14 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
   refused at the decorator (`` `embed` path escapes the project root; an
   embedded file must live inside the project and the file is not read ``) and
   the file outside is never read. Keep assets under the project.
-- A path holding `{artifact.<id>.out}` names the output of an artifact this one
-  requires through the manifest's `need`, and resolves against the **project
-  root** rather than the declaring file's directory; the required artifact is
-  built first. No other template variable may appear in an `embed` path. See
+- A path holding `{artifact.<id>.out}` names the output of a required artifact
+  and resolves against the **root project's** directory rather than the
+  declaring file's directory; the required artifact is built first. The name is
+  read in the manifest that owns the declaring module: the root's own module
+  names an artifact the built artifact requires, and a dependency's module names
+  an artifact that dependency's `default = true` library artifact requires,
+  which the consumer's build produces for it. No other template variable may
+  appear in an `embed` path. See
   [manifest.md](manifest.md#artifact-requirements).
 - The annotation must be `[_]u8` or `[N]u8`; the element type must be `u8`.
   `[_]` is an inferred array length, legal **only** on an `#[embed]`

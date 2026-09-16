@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A dependency's `default = true` library artifact carries its requirements as part of its export surface. The artifacts and steps its `need` names are built for every project whose dependency closure holds that dependency, with the consumer's resolved profile, for the targets they name in the dependency's own manifest, and are homed in the consumer's output tree under `dep/<dependency id>/` so two dependencies' identically named artifacts never collide. `{artifact.<id>.out}` in a module the dependency owns resolves in that dependency's manifest and is checked against its default library artifact, so a library can embed a shader artifact it builds and still be consumed. A requirement reached through several consumers builds once, its own dependencies' requirements travel to it in turn, and a failure names the dependency chain. `mach clean` removes what those cells write, reading the realized dependency manifests for the target names the root never declares (#3420).
 - A `#[testing]` decorator marks a declaration that exists only for tests. It is resolved and type-checked in every build, omitted from ordinary builds and `mach doc`, and emitted under `mach test`. Only a `test` body or another `#[testing]` declaration may reference it, and a `fwd` of one must be marked too. It refuses `ext`, `symbol`, `section`, `stage` and the shader interface decorators (#3402).
 
 ### Fixed
