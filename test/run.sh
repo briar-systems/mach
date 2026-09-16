@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # the codegen corpus, the link cases and the dwarf verify: one loop over
 # test/cases/<group>/<case>.mach and the targets, grounded in external tools.
+# --incremental instead proves the warm build path against clean builds.
 # see test/README.md for the case contract and how to add a case.
 #
 # usage: test/run.sh [--target <t>]... [--case <group>/<name>]... [--bless]
-#                    [--qemu] [--link] [--dwarf]
+#                    [--qemu] [--link] [--dwarf] [--incremental]
 #
 # per case and target: build the object in release, disassemble it with the
 # external decoder and diff against test/golden/<target>/<group>/<case>.dis; on a
@@ -18,6 +19,7 @@
 #   --qemu         execute riscv64-linux under qemu-riscv64
 #   --link         run the link cases (test/link/cases) instead of the corpus
 #   --dwarf        build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
+#   --incremental  warm rebuilds of this compiler and of a manifest fixture match clean builds
 #   MACH           the compiler under test, default out/<host>/debug/bin/mach
 set -u
 
@@ -53,13 +55,13 @@ spirv           spirv       freestanding spirv    -    bin     direct  spirv-dis
 riscv32         rv32imafdc  freestanding ilp32d   elf  static  direct  objdump
 '
 
-usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 want_targets=
 want_cases=
 bless=0
 qemu=0
-link=0
+mode=corpus
 dwarf=0
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -67,7 +69,8 @@ while [ $# -gt 0 ]; do
         --case)   shift; [ $# -gt 0 ] || usage; want_cases="$want_cases $1" ;;
         --bless)  bless=1 ;;
         --qemu)   qemu=1 ;;
-        --link)   link=1 ;;
+        --link)   mode=link ;;
+        --incremental) mode=incremental ;;
         --dwarf)  dwarf=1 ;;
         -h|--help) usage ;;
         *) echo "run.sh: unknown option '$1'" >&2; usage ;;
@@ -409,7 +412,7 @@ run_case() {
 
 # the tools the selected columns reach, checked before anything is built
 need_tool() { command -v "$1" >/dev/null 2>&1 || { echo "run.sh: $2 needs $1 on PATH" >&2; exit 2; }; }
-if [ "$link" -eq 0 ]; then
+if [ "$mode" = corpus ]; then
 for t in $targets; do
     if [ "$(object_format "$t")" = spv ]; then
         need_tool spirv-val "$t"; need_tool spirv-dis "$t"
@@ -552,7 +555,109 @@ read_case_conf() {
     done <"$1/case.conf"
 }
 
-if [ "$link" -eq 1 ]; then
+# inc_build <project> <what> <dest>: -o must sit inside the project, so dest is relative
+inc_build() {
+    if "$mach" build "$1" -o "$3" >"$out/log/incremental.log" 2>&1 && [ -f "$1/$3" ]; then return 0; fi
+    fail "incremental: $2 did not build"
+    sed 's/^/  /' "$out/log/incremental.log"
+    return 1
+}
+
+# inc_same <a> <b> <what>: a pass when equal, a failure otherwise
+inc_same() {
+    if cmp -s "$1" "$2"; then passes=$((passes + 1)); else fail "incremental: $3"; fi
+}
+
+# inc_changed <a> <b> <what>: an edit that leaves the output unchanged proves nothing
+inc_changed() {
+    if cmp -s "$1" "$2"; then fail "incremental: $3 did not change the output, the check proves nothing"; return 1; fi
+}
+
+# the warm path the query engine drives, which a from-scratch fixpoint never
+# reaches: a warm rebuild matches a clean one with no change (reuse is sound) and
+# after an edit (invalidation is sound, #2045). a source edit and a manifest-only
+# fixture cover the two invalidation channels without one masking the other.
+if [ "$mode" = incremental ]; then
+    mkdir -p "$out/log"
+    self=$out/incremental/self
+    rm -rf "$out/incremental"
+    mkdir -p "$self/dep/std"
+    cp -r "$repo/src" "$repo/mach.toml" "$self/"
+    cp -r "$repo/dep/std/src" "$repo/dep/std/mach.toml" "$self/dep/std/"
+    # the copy is no git checkout, so std is the pinned tree taken by path
+    sed -i '/^\[dep\.std\]$/,/^$/{s/^git = .*$/path = "dep\/std"/;/^ref = /d}' "$self/mach.toml"
+    grep -q '^path = "dep/std"$' "$self/mach.toml" || fail "incremental: the copied manifest still names std by git"
+    echo "incremental: $self"
+    if inc_build "$self" "the clean build" o/clean &&
+        inc_build "$self" "the warm no-op rebuild" o/warm; then
+        inc_same "$self/o/clean" "$self/o/warm" "a warm no-op rebuild differs from the clean build"
+        cp "$self/o/clean" "$out/incremental/clean"
+        sed -i 's/^pub val MACH_VERSION: str = "\(.*\)";$/pub val MACH_VERSION: str = "\1-inc";/' "$self/src/lang/version.mach"
+        if ! grep -q -- '-inc";$' "$self/src/lang/version.mach"; then
+            fail "incremental: the version edit did not apply to src/lang/version.mach"
+        elif inc_build "$self" "the warm rebuild after a source edit" o/warm_edit; then
+            cp "$self/o/warm_edit" "$out/incremental/warm_edit"
+            rm -rf "$self/o" "$self/out"
+            if inc_build "$self" "the clean rebuild after a source edit" o/clean_edit &&
+                inc_changed "$out/incremental/clean" "$self/o/clean_edit" "the source edit"; then
+                inc_same "$out/incremental/warm_edit" "$self/o/clean_edit" "a warm rebuild after a source edit differs from a clean one (stale invalidation)"
+            fi
+        fi
+    fi
+
+    fix=$out/incremental/fixture
+    mkdir -p "$fix/src"
+    abi=$(printf '%s\n' "$targets_all" | awk -v i="$host_isa" -v o="$host_os" '$2 == i && $3 == o { print $4; exit }')
+    cat >"$fix/mach.toml" <<EOF
+[project]
+id = "inc"
+version = "1.0.0"
+src = "src"
+out = "out/{target.name}/{profile.name}"
+
+[target.host]
+isa = "$host_isa"
+os  = "$host_os"
+abi = "$abi"
+
+[profile.debug]
+default = true
+opt = 0
+debug = false
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+[artifact.inc]
+kind = "static"
+entry = "main.mach"
+out = "lib/inc"
+targets = ["*"]
+link = []
+need = []
+EOF
+    cat >"$fix/src/main.mach" <<'EOF'
+#[symbol("inc_version_byte")]
+pub fun inc_version_byte(i: u64) u8 {
+    val v: *u8 = $project.version::*u8;
+    ret v[i];
+}
+EOF
+    if inc_build "$fix" "the fixture's clean build" o/clean; then
+        cp "$fix/o/clean" "$out/incremental/fixture_clean"
+        sed -i 's/^version = "1.0.0"$/version = "1.0.1"/' "$fix/mach.toml"
+        if inc_build "$fix" "the fixture's warm rebuild after a manifest edit" o/warm_edit; then
+            cp "$fix/o/warm_edit" "$out/incremental/fixture_warm_edit"
+            rm -rf "$fix/o" "$fix/out"
+            if inc_build "$fix" "the fixture's clean rebuild after a manifest edit" o/clean_edit &&
+                inc_changed "$out/incremental/fixture_clean" "$fix/o/clean_edit" "the manifest edit"; then
+                inc_same "$out/incremental/fixture_warm_edit" "$fix/o/clean_edit" "a warm rebuild after a manifest-only edit differs from a clean one"
+            fi
+        fi
+    fi
+fi
+
+if [ "$mode" = link ]; then
     base_ld_library_path=${LD_LIBRARY_PATH:-}
     legs=
     for t in x86_64-linux aarch64-linux riscv64-linux x86_64-windows x86_64-darwin aarch64-darwin; do

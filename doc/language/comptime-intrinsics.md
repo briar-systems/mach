@@ -172,8 +172,25 @@ $is_record(T)           # T is a record (or an instance of one)
 $is_union(T)            # T is a union  (or an instance of one)
 $is_tag(T)              # T is a tagged value (or an instance of one)
 $is_pointer(T)          # T is a reference: the raw `ptr` or a typed `*U`
+$is_integer(T)          # T is an integer: i8..i64, u8..u64
+$is_float(T)            # T is a float: f32 or f64
 $is_secret(T)           # T is `^`-qualified at the outermost level
 ```
+
+`$is_integer` and `$is_float` are the scalar half of the family, and they exist so
+that a walk can ask what it actually wants to know instead of spelling the scalar
+types out:
+
+```mach
+$each f in $fields(T) {
+    $if ($is_integer(f.type) || $is_float(f.type)) { ... }   # a scalar field
+    $or ($is_record(f.type))                       { ... }   # descend
+}
+```
+
+A ten-way `f.type == i8 || f.type == i16 || ...` chain is the shape the language
+forced before these two, and every scalar type added later had to edit every one
+of those chains. Nothing has to edit a predicate.
 
 They are **comptime-only** — a gate condition selects an arm, and there is no
 runtime boolean for one to become, so using a predicate as a value is an error.
@@ -220,6 +237,10 @@ do, so the four cannot disagree about what a type is:
 | `Box[^u64]` | false | the instance is a record; its field is secret |
 | `u64`, `Pair`, `ptr` | false | no `^` anywhere |
 
+`$is_integer(^u64)` and `$is_float(^f64)` answer **false** for the same reason
+`$is_pointer(^*u8)` does: the outermost constructor is `^`, and a secret is not the
+thing under it. `$is_secret` is where that question is asked.
+
 **It is not transitive, deliberately.** "Does this contain a secret anywhere" is a
 different question, and folding the two together would make the common case answer
 wrong: a `fmt` derive gating on a transitive answer would redact a whole record over
@@ -233,7 +254,7 @@ there is no route through a secret pointer — which is correct, since `$is_secr
 already answered true for it and a walk should stop there.
 
 Because the shape predicates answer false for `^T`, "nothing classifies it" remains
-a usable signal on its own: a walk that gates on the three and refuses the
+a usable signal on its own: a walk that gates on the shapes and refuses the
 fallthrough refuses secrets. `$is_secret` turns that refusal into a decision.
 
 ```mach
@@ -327,7 +348,7 @@ about storage.**
 | asks about | strips `^` |
 |---|---|
 | `$size_of` / `$length_of` / `$align_of` / `$offset_of` / `$discriminant_of` | yes: a secret occupies its base type storage and exposes storage width |
-| `$is_record` / `$is_union` / `$is_tag` / `$is_pointer` | no: `^T` is a secret, not a `T` |
+| `$is_record` / `$is_union` / `$is_tag` / `$is_pointer` / `$is_integer` / `$is_float` | no: `^T` is a secret, not a `T` |
 | `$is_secret` | no: and it is the one query *about* the `^` |
 | `$pointee_of` | no: `^*U` is a secret, and is refused rather than followed |
 | `$type_name` | no: the spelling is `^T` |

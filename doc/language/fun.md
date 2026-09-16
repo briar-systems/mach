@@ -65,6 +65,56 @@ ret apply(identity[i64], 42);          # passed as a callback
 A generic itself is a template rather than code, so a bare `identity` has no
 address and cannot be a value; only an instance can.
 
+### A body is checked at each instantiation
+
+There are no constraints on `T`, so nothing about a type parameter is decided
+before an instantiation supplies its argument. An operator, a cast, a `:~`
+reinterpret, a literal beside a `T`-typed operand and a branch condition are all
+resolved against the instance's concrete type, so an ordered or numeric algorithm
+is writable without a comparator parameter:
+
+```mach
+fun maxof[T](a: T, b: T) T {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+fun sum[T](p: *T, n: u64) T {
+    var acc: T = 0;                        # the literal takes `T`
+    var i:   u64 = 0;
+    for (i < n) {
+        acc = acc + p[i];
+        i   = i + 1;
+    }
+    ret acc;
+}
+```
+
+A type that genuinely does not support the operator is refused at the
+instantiation that asked for it, naming that type:
+
+```
+error: `Point` has no ordering: `<`, `<=`, `>` and `>=` order integers and floats
+  --> src/main.mach:12:5
+   |
+12 |     maxof[Point](p, q);
+   |     ^^^^^^^^^^^^^^^^^^
+   |
+  --> src/main.mach:4:9
+   |
+ 4 |     if (a > b) { ret a; }
+   |         ----- in this generic body, checked against this instance's type arguments
+```
+
+The template itself reports nothing. It types the body so each instance and the
+lowering have an expression table to read, and every judgement is the instance's,
+which is what keeps one bad instantiation to one refusal at one site.
+
+**A generic nothing instantiates is not checked.** `fun never_used[T](a: T) T {
+ret a + a; }` compiles, because there is no type to decide `+` against and no
+site to report at. The way to check a generic is to instantiate it, so a library
+instantiates its own generics in its own tests.
+
 ## Comptime value parameters
 
 A parameter marked with `$name: T` must be supplied with a value the
@@ -128,6 +178,8 @@ reference.
 
 - [ext-fun.md](ext-fun.md) — body-less external functions
 - [variadics.md](variadics.md) — variadic pack parameter reference
-- [comptime-control.md](comptime-control.md) — `$if` inside function bodies
+- [comptime-control.md](comptime-control.md) — `$if` inside function bodies, and
+  the two regimes a generic body is checked under
+- [operators.md](operators.md) — the operator table an instance is checked against
 - [expressions.md](expressions.md) — function calls and generic
   instantiation
