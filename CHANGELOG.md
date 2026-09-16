@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A linked ELF image carries its data symbols, its `.bss` and its `#[section(...)]` names. The image's allocated section headers were synthesized from the LOAD segments, one per mapping, named `.text`/`.data`/`.rodata` by segment protection, typed `SHT_PROGBITS` and sized by `p_filesz`, so a `#[section(...)]` name was gone, a `.bss` contribution appeared as a second `.data` of size 0, and every section claimed page alignment. They are now the named sections the linker placed inside each mapping, with the section's own name, type, address, size and alignment, a zero-initialized section written `SHT_NOBITS` at its memory size, and an init-array section written `SHT_INIT_ARRAY`. The image symbol table, which held functions only, now carries data definitions too, as `STT_OBJECT` with their real `st_size`, and every symbol names the section index it lives in rather than its segment (#3362).
+
 ## [5.1.0] - 2026-09-16
 
 ### Added
