@@ -201,6 +201,13 @@ are **pruned** and only the selected arm is type-checked (and emitted). Each arm
 may therefore use its value at its own concrete type with no per-arm cast — see
 [comptime-intrinsics.md](comptime-intrinsics.md).
 
+Such a chain is decided only at an instantiation. While the operand's type still
+names a generic parameter no arm is selected and none is type-checked, so a `!=`
+gate and a bare `$or` fallback wait for the concrete type like every other gate,
+and a `$error` in an arm the instantiation does not select never fires. An
+instantiation that matches no arm selects the fallback, and its `$error` is
+reported at that instantiation.
+
 ## See also
 
 - [comptime-mach.md](comptime-mach.md) — `$mach.*` for target reads
