@@ -33,16 +33,22 @@ produce_symtab() {
     fi
 
     # `nm` (the standard "does this binary have symbols at all" tool) finds both
-    # the fixture's functions as defined (T) symbols: `main` (an explicit
+    # the fixture's functions as defined symbols: `main` (an explicit
     # `#[symbol("main")]`, unmangled) and `burn` (mangled - matched by substring,
     # not exact name, since the mangling scheme is not this case's concern).
+    #
+    # either binding counts (T or t): #3412 made a definition that no image
+    # exports hidden, and a hidden definition binds locally in the image it lands
+    # in, so a non-`pub` function is `t` here. that this case asserts nothing
+    # about binding is the point - the fact under test is that the table exists
+    # and its entries are usable, which holds for both.
     nm_out=$(nm "$b" 2>/dev/null)
-    if printf '%s\n' "$nm_out" | grep -qE ' T main$'; then
+    if printf '%s\n' "$nm_out" | grep -qE ' [Tt] main$'; then
         echo "nm_main=defined"
     else
         echo "nm_main=missing"
     fi
-    if printf '%s\n' "$nm_out" | grep -qE ' T .*burn'; then
+    if printf '%s\n' "$nm_out" | grep -qE ' [Tt] .*burn'; then
         echo "nm_burn=defined"
     else
         echo "nm_burn=missing"
