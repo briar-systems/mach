@@ -27,6 +27,7 @@ bash test/run.sh --case bits/logic_u32    # one case (repeatable)
 bash test/run.sh --qemu                   # also execute riscv64-linux under qemu-riscv64
 bash test/run.sh --dwarf                  # also build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
 bash test/run.sh --link [--qemu]          # the link cases instead of the corpus (--case <name> selects one)
+bash test/run.sh --incremental            # warm rebuilds of the compiler and a manifest fixture match clean builds
 bash test/run.sh --bless [...]            # write the goldens or expect files instead of diffing, print the diff
 ```
 
