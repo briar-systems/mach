@@ -249,8 +249,19 @@ val n: i32x4 = i32x4{4, 3, 2, 1};
 val z: i32x4 = (m & n) ^ n;    # lane-wise bitwise on integer lanes
 ```
 
+## An operand typed by a type parameter
+
+Inside a generic, an operand whose type is a parameter has no operand class yet:
+`T` is not an integer, not a float and not a pointer, and asking would be asking
+about a placeholder. Every operator on such an operand is decided at the
+instantiation instead, against that instance's concrete type, and the table above
+is what it is checked against there. A type that does not support the operator is
+refused at the instantiation that asked for it. See
+[fun.md](fun.md).
+
 ## See also
 
 - [expressions.md](expressions.md) — how operators compose into expressions
+- [fun.md](fun.md) — an operator on a generic type parameter
 - [types.md](types.md) — which types support which operators
 - [secrecy.md](secrecy.md) — the `^` secret qualifier and the `:>T` strip cast

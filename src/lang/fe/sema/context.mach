@@ -242,6 +242,9 @@ pub rec InstReq {
     depth:   u32;
     parent:  u32;
     site:    token.Span;
+    # the instantiating module's file, so a refusal points at the caller and not at an
+    # offset in the template's own file
+    site_file: source.FileId;
 }
 
 pub val INST_NONE: u32 = 4294967295;
@@ -343,8 +346,9 @@ pub rec SemaContext {
 
     layout_state: *u8;
 
-    inst_site:     token.Span;
-    inst_site_set: bool;
+    inst_site:      token.Span;
+    inst_site_file: source.FileId;
+    inst_site_set:  bool;
 
     in_deferred_arm: bool;
 
@@ -397,6 +401,13 @@ pub fun comptime_expression(sc: *SemaContext, a: *ast.Ast, eid: id.ExprId) res[e
 pub fun apply_subst(sc: *SemaContext, tid: type.TypeId) type.TypeId {
     if (sc.subst == nil || sc.subst_len == 0 || sc.subst_fn == nil) { ret tid; }
     ret type_result(sc, sc.subst_fn(sc.s, tid, sc.subst, sc.subst_len));
+}
+
+# true while a type still names a type parameter: no operand predicate has an answer
+# for it, and every question about it waits for an instantiation
+pub fun awaits_instance(sc: *SemaContext, tid: type.TypeId) bool {
+    if (tid == type.TYPE_ERROR || tid == type.TYPE_NIL) { ret false; }
+    ret type.mentions_generic_param(?sc.s.types, tid);
 }
 
 pub fun arg_triggers_revalidation(sc: *SemaContext, tid: type.TypeId) bool {
@@ -725,14 +736,20 @@ pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.Dec
     if (!sc.collect_insts) { ret res[u8, fail.Fail].ok{RECORD_OK}; }
     if (arg_len == 0)      { ret res[u8, fail.Fail].ok{RECORD_OK}; }
 
-    var any: bool = false;
-    var i:   u32  = 0;
+    var any:  bool = false;
+    var open: bool = false;
+    var i:    u32  = 0;
     for (i < arg_len) {
-        if (arg_triggers_revalidation(sc, args[i])) { any = true; }
+        if (type.mentions_generic_param(?sc.s.types, args[i])) { open = true; }
+        if (arg_triggers_revalidation(sc, args[i]))            { any = true; }
         if (sc.has_secret && args[i] != type.TYPE_ERROR && args[i] != type.TYPE_NIL
             && !type.mentions_generic_param(?sc.s.types, args[i])) { any = true; }
         i = i + 1;
     }
+    # an operator on a type parameter is decided against the instance's own arguments,
+    # so nothing about the body is settled until they are all substituted; every fully
+    # substituted instantiation is checked, and one that is not is left to its own
+    if (!open)                                                  { any = true; }
     if (!any && decl_body_has_type_directive(sc, origin, decl)) { any = true; }
     if (!any && decl_body_calls_c_variadic(sc, origin, decl))   { any = true; }
     if (!any)                                                   { ret res[u8, fail.Fail].ok{RECORD_OK}; }
@@ -796,16 +813,17 @@ pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.Dec
 
     val new_idx: u32      = wl.len;
     val slot:    *InstReq = ?wl.items[new_idx];
-    slot.origin  = origin;
-    slot.decl    = decl;
-    slot.sig     = sig;
-    slot.args    = owned;
-    slot.arg_len = arg_len;
-    slot.bare    = bare;
-    slot.depth   = sc.inst_depth;
-    slot.parent  = sc.inst_parent;
-    slot.site    = site;
-    wl.len       = wl.len + 1;
+    slot.origin    = origin;
+    slot.decl      = decl;
+    slot.sig       = sig;
+    slot.args      = owned;
+    slot.arg_len   = arg_len;
+    slot.bare      = bare;
+    slot.depth     = sc.inst_depth;
+    slot.parent    = sc.inst_parent;
+    slot.site      = site;
+    slot.site_file = sc.a.file_id;
+    wl.len         = wl.len + 1;
 
     val res_insert: res[bool, A.Error] = map.insert[u64, u32](?wl.dedup, h, new_idx);
     if (sel res_insert.err) { ret res[u8, fail.Fail].err{fail.refused(res_insert.err)}; }
@@ -944,16 +962,60 @@ pub fun machine_of(sc: *SemaContext) layout.Machine {
     ret layout.machine(sc.ctx.env.pointer_width, sc.ctx.env.vector_bits);
 }
 
-pub fun report(sc: *SemaContext, span: token.Span, message: str) {
-    if (sc.silent) { ret; }
-    fail.reject(?sc.status);
+pub val TEMPLATE_TRAIL_LABEL: str = "in this generic body, checked against this instance's type arguments";
+
+# a rejection raised while checking an instance body is the instantiation's, not the
+# template's: it points at the call that asked for this instance and carries the
+# template's own span as the related site
+fun emit_error(sc: *SemaContext, span: token.Span, message: str, note: str) {
+    var file: source.FileId = sc.a.file_id;
+    var at:   token.Span    = span;
+    if (sc.inst_site_set) {
+        file = sc.inst_site_file;
+        at   = sc.inst_site;
+    }
+
+    val b_r: res[diagnostic.DiagnosticBuilder, fail.Fail] = diagnostic.builder_init(sc.diags.a, diagnostic.SEVERITY_ERROR, file, at, message);
+    if (sel b_r.err) {
+        fail.internal(?sc.status, fail.describe(b_r.err));
+        ret;
+    }
+    var b: diagnostic.DiagnosticBuilder = b_r.ok;
+
+    if (note != nil) {
+        val ar: err[fail.Fail] = diagnostic.attach_note(?b, note);
+        if (sel ar.err) {
+            diagnostic.builder_dnit(?b);
+            fail.internal(?sc.status, fail.describe(ar.err));
+            ret;
+        }
+    }
+    if (sc.inst_site_set) {
+        val rr: err[fail.Fail] = diagnostic.attach_related(?b, sc.a.file_id, span, TEMPLATE_TRAIL_LABEL);
+        if (sel rr.err) {
+            diagnostic.builder_dnit(?b);
+            fail.internal(?sc.status, fail.describe(rr.err));
+            ret;
+        }
+    }
+
     if (sc.in_comptime_gate) {
-        val r: res[bool, fail.Fail] = diagnostic.gate_error(sc.diags, ?sc.s.interner, sc.a.file_id, span, message);
+        val r: res[bool, fail.Fail] = diagnostic.gate_commit(sc.diags, ?sc.s.interner, ?b);
         if (sel r.err) { fail.internal(?sc.status, fail.describe(r.err)); }
         ret;
     }
-    val r: err[fail.Fail] = diagnostic.error(sc.diags, sc.a.file_id, span, message);
-    if (sel r.err) { fail.internal(?sc.status, fail.describe(r.err)); }
+
+    val cr: res[diagnostic.DiagnosticId, fail.Fail] = diagnostic.commit(?b, sc.diags);
+    if (sel cr.err) {
+        diagnostic.builder_dnit(?b);
+        fail.internal(?sc.status, fail.describe(cr.err));
+    }
+}
+
+pub fun report(sc: *SemaContext, span: token.Span, message: str) {
+    if (sc.silent) { ret; }
+    fail.reject(?sc.status);
+    emit_error(sc, span, message, nil);
 }
 
 pub fun report_internal(sc: *SemaContext, span: token.Span, message: str) {
@@ -985,33 +1047,7 @@ pub fun report_warning(sc: *SemaContext, span: token.Span, message: str) {
 pub fun report_note(sc: *SemaContext, span: token.Span, message: str, note: str) {
     if (sc.silent) { ret; }
     fail.reject(?sc.status);
-
-    val b_r: res[diagnostic.DiagnosticBuilder, fail.Fail] = diagnostic.builder_init(sc.s.diags.a, diagnostic.SEVERITY_ERROR, sc.a.file_id, span, message);
-    if (sel b_r.err) {
-        fail.internal(?sc.status, fail.describe(b_r.err));
-        ret;
-    }
-    var b: diagnostic.DiagnosticBuilder = b_r.ok;
-
-    val ar: err[fail.Fail] = diagnostic.attach_note(?b, note);
-    if (sel ar.err) {
-        diagnostic.builder_dnit(?b);
-        fail.internal(?sc.status, fail.describe(ar.err));
-        ret;
-    }
-
-    if (sc.in_comptime_gate) {
-        val r: res[bool, fail.Fail] = diagnostic.gate_commit(sc.diags, ?sc.s.interner, ?b);
-        if (sel r.err) { fail.internal(?sc.status, fail.describe(r.err)); }
-        ret;
-    }
-
-    val cr: res[diagnostic.DiagnosticId, fail.Fail] = diagnostic.commit(?b, sc.diags);
-    if (sel cr.err) {
-        diagnostic.builder_dnit(?b);
-        fail.internal(?sc.status, fail.describe(cr.err));
-        ret;
-    }
+    emit_error(sc, span, message, note);
 }
 
 pub fun report_numbered(sc: *SemaContext, span: token.Span, prefix: str, n: usize, suffix: str, fallback: str) {

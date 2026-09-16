@@ -208,8 +208,36 @@ and a `$error` in an arm the instantiation does not select never fires. An
 instantiation that matches no arm selects the fallback, and its `$error` is
 reported at that instantiation.
 
+## Two regimes inside a generic body
+
+A generic body is checked under two rules, and which one applies depends on what
+the question is about. Both are stated here because the boundary between them is
+the only thing a reader has to hold.
+
+| the question | when it is answered | what is checked |
+|---|---|---|
+| a `$if` gated on a comptime **value parameter** | per call site | **all** arms, structurally, before any is selected |
+| a `$if` gated on a `$type_of` or a type predicate | per instantiation | only the arm that instantiation selects |
+| an operator, cast, `:~`, literal or condition on a **type parameter** | per instantiation | the whole body, once per distinct instantiation |
+
+The first is the exception described under *Discarded branches*: arm selection
+happens per call site, so every arm must be independently resolvable and
+type-checkable and only the selected one is emitted.
+
+The second and third are the same rule applied to different constructs. Nothing
+about a type parameter is decided while it is still a parameter, because there is
+no concrete type to decide it against: a gate waits for the instantiation, and so
+does every operator. The template types the body so each instance and the lowering
+have an expression table to read, and reports nothing of its own. A refusal
+belongs to the instantiation that asked for the instance and names that instance's
+concrete type — see [fun.md](fun.md).
+
+The consequence is worth stating plainly: a generic that nothing instantiates is
+not checked at all.
+
 ## See also
 
 - [comptime-mach.md](comptime-mach.md) — `$mach.*` for target reads
 - [asm.md](asm.md) — `asm` blocks gated by `$if`
 - [statements.md](statements.md) — runtime `if` / `or` counterpart
+- [fun.md](fun.md) — generic type parameters and per-instance checking
