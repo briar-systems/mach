@@ -60,6 +60,7 @@ use mach.lang.session;
 use mach.lang.source;
 use mach.lang.target;
 use mach.lang.target.isa;
+use mach.lang.target.of;
 use mach.lang.target.os;
 use mach.lang.type;
 
@@ -74,6 +75,29 @@ pub rec Buffer {
     rr:            *resolve.ResolveResult;
     sr:            *context.SemaResult;
     ctx:           comptime.ComptimeCtx;
+}
+
+# the request fields a loaded project's frontend depends on. the strings are owned
+# copies: an AnalysisRequest's strings are borrowed only for the duration of one call.
+# the omitted fields name outputs and link inputs, which no frontend phase reads
+rec ProjKey {
+    valid:          bool;
+    target:         str;
+    profile:        str;
+    artifact:       str;
+    owner:          str;
+    goal:           request.BuildGoal;
+    opt:            u8;
+    debug:          bool;
+    pie:            bool;
+    subsystem_flag: request.SubsystemFlag;
+    subsystem:      of.Subsystem;
+    simd:           manifest.SimdMode;
+    vectorize:      bool;
+    float_reassoc:  bool;
+    want_lib:       bool;
+    all_targets:    bool;
+    include_deps:   bool;
 }
 
 # one serial facade over a borrowed session, with compact open-buffer slots
@@ -93,6 +117,9 @@ pub rec EditorSession {
     proj:            project.Project;
     proj_root:       str;
     proj_dirty:      bool;
+    proj_loads:      u64; # closure loads performed, so a caller can see a reload happen
+    proj_phase:      driver.FrontendPhase;
+    proj_key:        ProjKey;
     proj_roots:      *intern.StrId;
     proj_root_count: u32;
     proj_root_cap:   u32;
@@ -418,7 +445,6 @@ pub fun analyze(es: *EditorSession, req: *AnalysisRequest) res[AnalysisResult, o
     }
     es.view_generation = es.view_generation + 1;
     views_drop(es);
-    es.proj_dirty        = true;
     es.active_request    = req;
     es.operation_failure = opt[outcome.Fail].none{};
     fin {
@@ -512,12 +538,19 @@ pub fun init(s: *session.Session) EditorSession {
     es.active_request    = nil;
     es.operation_failure = opt[outcome.Fail].none{};
 
-    es.proj_loaded     = false;
-    es.proj_root       = nil;
-    es.proj_dirty      = false;
-    es.proj_roots      = nil;
-    es.proj_root_count = 0;
-    es.proj_root_cap   = 0;
+    es.proj_loaded       = false;
+    es.proj_root         = nil;
+    es.proj_dirty        = false;
+    es.proj_loads        = 0;
+    es.proj_phase        = driver.FRONTEND_SEMA;
+    es.proj_key.valid    = false;
+    es.proj_key.target   = nil;
+    es.proj_key.profile  = nil;
+    es.proj_key.artifact = nil;
+    es.proj_key.owner    = nil;
+    es.proj_roots        = nil;
+    es.proj_root_count   = 0;
+    es.proj_root_cap     = 0;
     ret es;
 }
 
@@ -579,7 +612,10 @@ pub fun open(es: *EditorSession, path: str, text: str) res[source.FileId, fail.F
     val changed: bool           = prepared.changed || overlay.changed || !es.buffers[index].in_use;
     val input:   err[fail.Fail] = query.set_input(?es.s.queries, query.Q_FILE_TEXT, prepared.id::u64, text::*u8, str_len(text)::u32);
     if (sel input.err) { ret res[source.FileId, fail.Fail].err{input.err}; }
-    if (changed)       { views_drop(es); }
+    if (changed) {
+        es.proj_dirty = true;
+        views_drop(es);
+    }
     val fid: source.FileId = source.commit_load(?prepared);
     session.commit_overlay(?overlay);
     val b: *Buffer = ?es.buffers[index];
@@ -587,10 +623,7 @@ pub fun open(es: *EditorSession, path: str, text: str) res[source.FileId, fail.F
         @b    = Buffer{file_id: fid, in_use: true, owned: true, parse_status: fail.accepted()};
         b.ctx = host_ctx(es);
     }
-    if (changed) {
-        es.view_generation = es.view_generation + 1;
-        es.proj_dirty      = true;
-    }
+    if (changed) { es.view_generation = es.view_generation + 1; }
     ret res[source.FileId, fail.Fail].ok{fid};
 }
 
@@ -609,6 +642,16 @@ pub fun update(es: *EditorSession, fid: source.FileId, text: str) res[bool, fail
     val updated:    res[source.FileId, fail.Fail] = open(es, file.some.path, text);
     if (sel updated.err) { ret res[bool, fail.Fail].err{updated.err}; }
     ret res[bool, fail.Fail].ok{es.view_generation != generation};
+}
+
+# mark the loaded project stale, so the next analysis that needs it reloads the closure.
+# open, update and close do this for the buffers they own; this is the entry for a change
+# the editor session cannot see, a file written outside any buffer or a manifest edited on
+# disk
+# ---
+# es: the editor session
+pub fun invalidate(es: *EditorSession) {
+    es.proj_dirty = true;
 }
 
 fun removal_order(a: *session.PreparedOverlay, b: *session.PreparedOverlay) i64 {
@@ -668,6 +711,7 @@ fun retire_buffers(es: *EditorSession, fid: source.FileId, all: bool) err[fail.F
     fin { query.discard_retirement(?retired); }
     val valid: err[fail.Fail] = query.validate_retirement(?retired);
     if (sel valid.err) { ret valid; }
+    es.proj_dirty = true;
     views_drop(es);
     val commit_retirement_r: err[fail.Fail] = query.commit_retirement(?retired);
     var j:                   usize          = 0;
@@ -679,7 +723,6 @@ fun retire_buffers(es: *EditorSession, fid: source.FileId, all: bool) err[fail.F
         j                      = j + 1;
     }
     es.proj_root_count = 0;
-    es.proj_dirty      = true;
     es.view_generation = es.view_generation + 1;
     ret err[fail.Fail].ok{};
 }
@@ -738,35 +781,18 @@ fun project_product_missing(es: *EditorSession, text: str) fail.Fail {
 }
 
 # parse an open buffer, best effort: syntax errors become diagnostics and the tree is still
-# returned. resets the session diagnostics first. a buffer under the src directory of a
-# project whose mach.toml lies above it is analyzed as part of that project (loaded, or
-# reloaded when dirty) and the project's own tree for that module is returned; a project
-# that could not be loaded is recorded as the operation failure and the buffer parsed standalone
+# returned. resets the session diagnostics first. a parse never consults the project: one
+# buffer's tree needs no import closure, so a syntax-only consumer pays no closure cost and
+# depends on no closure state, in or out of a project
 # ---
 # es:  the editor session
 # fid: the buffer's FileId
-# ret: the tree, owned by the session or by the loaded project, or the buffer-not-open,
-#      or fatal-parse error
+# ret: the tree, owned by the session, or the buffer-not-open or fatal-parse error
 fun parse_buffer(es: *EditorSession, fid: source.FileId) res[*ast.Ast, fail.Fail] {
     diags_reset(es);
 
     val b: *Buffer = slot_live(es, fid);
     if (b == nil) { ret res[*ast.Ast, fail.Fail].err{fail.message("editor: buffer not open")}; }
-
-    val pe_r: res[opt[*project.ModuleEntry], fail.Fail] = proj_ensure(es, fid);
-    if (sel pe_r.err) {
-        ret res[*ast.Ast, fail.Fail].err{pe_r.err};
-    }
-    val pe: opt[*project.ModuleEntry] = pe_r.ok;
-    if (sel pe.some) {
-        val m: *project.ModuleEntry = pe.some;
-        if (m.a == nil) { ret res[*ast.Ast, fail.Fail].err{project_product_missing(es, "editor: project module has no parsed AST")}; }
-        analysis_drop(es, b);
-        b.owned        = false;
-        b.a            = m.a;
-        b.parse_status = m.parse_status;
-        ret res[*ast.Ast, fail.Fail].ok{b.a};
-    }
 
     ret parse_inner(es, fid);
 }
@@ -989,8 +1015,8 @@ pub fun build(es: *EditorSession, req: *request.BuildRequest) res[outcome.BuildO
         ret res[outcome.BuildOutcome, outcome.Fail].err{fail_owned(es, outcome.internal("editor view generation exhausted"))};
     }
     es.view_generation = es.view_generation + 1;
+    es.proj_dirty      = true;
     views_drop(es);
-    es.proj_dirty = true;
     val s: *session.Session = es.s;
 
     val reg_r: err[outcome.Fail] = driver.setup_registry(s.registry);
@@ -1210,8 +1236,9 @@ fun views_drop(es: *EditorSession) {
         i = i + 1;
     }
     val had_project: bool = es.proj_loaded;
-    proj_teardown(es);
-    if (!had_project) { session.reset_module_registry(es.s); }
+    if (es.proj_dirty) { proj_teardown(es); }
+    # a torn-down project resets the registry itself; a kept one still owns its entries
+    if (!es.proj_loaded && !had_project) { session.reset_module_registry(es.s); }
     if (es.s.query_presentation != nil) {
         query.presentation_dnit(es.s.query_presentation);
         es.s.query_presentation = nil;
@@ -1223,7 +1250,82 @@ fun views_drop(es: *EditorSession) {
     diags_reset(es);
 }
 
+fun proj_key_free(es: *EditorSession, k: *ProjKey) {
+    if (!k.valid)          { ret; }
+    if (k.target != nil)   { str_free(es.alloc, k.target); }
+    if (k.profile != nil)  { str_free(es.alloc, k.profile); }
+    if (k.artifact != nil) { str_free(es.alloc, k.artifact); }
+    if (k.owner != nil)    { str_free(es.alloc, k.owner); }
+    k.valid    = false;
+    k.target   = nil;
+    k.profile  = nil;
+    k.artifact = nil;
+    k.owner    = nil;
+}
+
+fun proj_key_capture(es: *EditorSession, req: *request.BuildRequest, out: *ProjKey) err[fail.Fail] {
+    var k: ProjKey;
+    k.valid    = true;
+    k.target   = nil;
+    k.profile  = nil;
+    k.artifact = nil;
+    k.owner    = nil;
+    var complete: bool = false;
+    fin {
+        if (!complete) { proj_key_free(es, ?k); }
+    }
+    val target: res[str, string.StrError] = str_copy(es.alloc, req.target);
+    if (sel target.err) { ret err[fail.Fail].err{fail.str_refused(target.err)}; }
+    k.target = target.ok;
+    val profile: res[str, string.StrError] = str_copy(es.alloc, req.profile);
+    if (sel profile.err) { ret err[fail.Fail].err{fail.str_refused(profile.err)}; }
+    k.profile = profile.ok;
+    val artifact: res[str, string.StrError] = str_copy(es.alloc, req.artifact);
+    if (sel artifact.err) { ret err[fail.Fail].err{fail.str_refused(artifact.err)}; }
+    k.artifact = artifact.ok;
+    val owner: res[str, string.StrError] = str_copy(es.alloc, req.owner);
+    if (sel owner.err) { ret err[fail.Fail].err{fail.str_refused(owner.err)}; }
+    k.owner          = owner.ok;
+    k.goal           = req.goal;
+    k.opt            = req.opt;
+    k.debug          = req.debug;
+    k.pie            = req.pie;
+    k.subsystem_flag = req.subsystem_flag;
+    k.subsystem      = req.subsystem;
+    k.simd           = req.simd;
+    k.vectorize      = req.vectorize;
+    k.float_reassoc  = req.float_reassoc;
+    k.want_lib       = req.want_lib;
+    k.all_targets    = req.all_targets;
+    k.include_deps   = req.include_deps;
+    complete         = true;
+    @out             = k;
+    ret err[fail.Fail].ok{};
+}
+
+fun proj_key_matches(k: *ProjKey, req: *request.BuildRequest) bool {
+    if (!k.valid)                               { ret false; }
+    if (!str_equals(k.target, req.target))      { ret false; }
+    if (!str_equals(k.profile, req.profile))    { ret false; }
+    if (!str_equals(k.artifact, req.artifact))  { ret false; }
+    if (!str_equals(k.owner, req.owner))        { ret false; }
+    if (k.goal != req.goal)                     { ret false; }
+    if (k.opt != req.opt)                       { ret false; }
+    if (k.debug != req.debug)                   { ret false; }
+    if (k.pie != req.pie)                       { ret false; }
+    if (k.subsystem_flag != req.subsystem_flag) { ret false; }
+    if (k.subsystem != req.subsystem)           { ret false; }
+    if (k.simd != req.simd)                     { ret false; }
+    if (k.vectorize != req.vectorize)           { ret false; }
+    if (k.float_reassoc != req.float_reassoc)   { ret false; }
+    if (k.want_lib != req.want_lib)             { ret false; }
+    if (k.all_targets != req.all_targets)       { ret false; }
+    if (k.include_deps != req.include_deps)     { ret false; }
+    ret true;
+}
+
 fun proj_teardown(es: *EditorSession) {
+    proj_key_free(es, ?es.proj_key);
     if (!es.proj_loaded) { ret; }
     project.dnit_project(?es.proj);
     arena.dnit(?es.proj_arena);
@@ -1332,12 +1434,33 @@ fun proj_ensure(es: *EditorSession, fid: source.FileId) res[opt[*project.ModuleE
     }
     val fqn: intern.StrId = fqn_r.ok;
 
+    var want_req:   request.BuildRequest = request.defaults();
+    var want_phase: driver.FrontendPhase = driver.FRONTEND_SEMA;
+    if (es.active_request != nil) {
+        want_req   = es.active_request.build;
+        want_phase = es.active_request.phase;
+    }
+
+    # a loaded project answers only for the phase it was loaded to and the request it was
+    # loaded under: a deeper phase has no products and a different request has other ones
     val has_root:    bool = proj_roots_has(es, fqn);
-    val need_reload: bool = root_changed || es.proj_dirty || !es.proj_loaded || !has_root;
+    val need_reload: bool = root_changed || es.proj_dirty || !es.proj_loaded || !has_root
+        || want_phase > es.proj_phase || !proj_key_matches(?es.proj_key, ?want_req);
 
     if (!need_reload) {
         str_free(es.alloc, root);
         ret res[opt[*project.ModuleEntry], fail.Fail].ok{project.module_by_fqn(?es.proj, fqn)};
+    }
+
+    var key:      ProjKey        = ProjKey{valid: false, target: nil, profile: nil, artifact: nil, owner: nil};
+    val captured: err[fail.Fail] = proj_key_capture(es, ?want_req, ?key);
+    if (sel captured.err) {
+        str_free(es.alloc, root);
+        ret res[opt[*project.ModuleEntry], fail.Fail].err{captured.err};
+    }
+    var key_committed: bool = false;
+    fin {
+        if (!key_committed) { proj_key_free(es, ?key); }
     }
 
     val rebuilt: err[fail.Fail] = proj_roots_rebuild(es, root, id_text, src_text);
@@ -1375,13 +1498,10 @@ fun proj_ensure(es: *EditorSession, fid: source.FileId) res[opt[*project.ModuleE
     val prior_build: *A.Allocator = es.s.build_alloc;
     es.s.build_alloc = ?es.proj_alloc;
 
-    var req: request.BuildRequest = request.defaults();
-    if (es.active_request != nil) { req = es.active_request.build; }
+    var req: request.BuildRequest = want_req;
     req.project_root = root;
 
-    var phase: driver.FrontendPhase = driver.FRONTEND_SEMA;
-    if (es.active_request != nil) { phase = es.active_request.phase; }
-    val ap_r: res[project.Project, outcome.Fail] = driver.analyze_project_tolerant(es.s, ?m, ?req, es.proj_roots, es.proj_root_count, phase);
+    val ap_r: res[project.Project, outcome.Fail] = driver.analyze_project_tolerant(es.s, ?m, ?req, es.proj_roots, es.proj_root_count, want_phase);
     es.s.build_alloc = prior_build;
 
     if (sel ap_r.err) {
@@ -1394,6 +1514,11 @@ fun proj_ensure(es: *EditorSession, fid: source.FileId) res[opt[*project.ModuleE
     if (es.proj_root != nil) { str_free(es.alloc, es.proj_root); }
     es.proj_root  = root;
     es.proj_dirty = false;
+    es.proj_phase = want_phase;
+    es.proj_loads = es.proj_loads + 1;
+    proj_key_free(es, ?es.proj_key);
+    es.proj_key   = key;
+    key_committed = true;
 
     ret res[opt[*project.ModuleEntry], fail.Fail].ok{project.module_by_fqn(?es.proj, fqn)};
 }
@@ -4238,13 +4363,11 @@ test "mach.lang.editor.analyze:broken_manifest_falls_back_to_standalone_analysis
     var es: EditorSession = init(?s);
     fin { t_dnit(?es); }
 
-    var names: [2]str;
+    var names: [1]str;
     names[0] = "main.mach";
-    names[1] = "shapes.mach";
-    var texts: [2]str;
-    texts[0] = "use edbuild.shapes;\nfun main() i32 {\n    var b: shapes.Box[i32];\n    ret b.v;\n}\n";
-    texts[1] = "pub rec Box[T] { v: T; }\n";
-    val root_r: res[str, fail.Fail] = t_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    var texts: [1]str;
+    texts[0] = "fun main() i32 { ret 1; }\n";
+    val root_r: res[str, fail.Fail] = t_scaffold(?alloc, ?names[0], ?texts[0], 1);
     if (sel root_r.err) { ret 99; }
     val root: str = root_r.ok;
     fin { fs.remove_all(?alloc, root); }
@@ -4255,7 +4378,7 @@ test "mach.lang.editor.analyze:broken_manifest_falls_back_to_standalone_analysis
     if (sel open_r.err) { ret 99; }
     val fid: source.FileId = open_r.ok;
 
-    # the manifest is mid-edit: the project cannot load, the buffer still parses
+    # the manifest is mid-edit: the project cannot load, the buffer still resolves
     val mf_r: res[str, string.StrError] = str_join(?alloc, root, "/", manifest.MANIFEST_FILE);
     if (sel mf_r.err) { ret 99; }
     val manifest_path: str                  = mf_r.ok;
@@ -4268,7 +4391,7 @@ test "mach.lang.editor.analyze:broken_manifest_falls_back_to_standalone_analysis
     val wrote_r: err[fs.FsError] = fs.write_bytes(manifest_path, broken, str_len(broken), 420);
     if (sel wrote_r.err) { ret 99; }
 
-    var req:       AnalysisRequest                   = analysis_request(fid, PHASE_PARSE);
+    var req:       AnalysisRequest                   = analysis_request(fid, PHASE_RESOLVE);
     val analyze_r: res[AnalysisResult, outcome.Fail] = analyze(?es, ?req);
     if (sel analyze_r.err) { ret 1; }
     var result: AnalysisResult = analyze_r.ok;
@@ -5423,8 +5546,10 @@ test "mach.lang.editor.parse:driver_and_editor_share_one_parse_outcome" {
         val res_ast2: res[*ast.Ast, fail.Fail] = ast_of(?result);
         if (!sel result.status.kind.rejected)                                       { bad = 4; }
         if (!(sel result.failure.some && outcome.is_reported(result.failure.some))) { bad = 4; }
-        if (!(sel res_ast2.ok && res_ast2.ok == nil))                               { bad = 4; }
-        if (diagnostic.len(?drv2) != 1 || diagnostic.len(result.diagnostics) != 1)  { bad = 5; }
+        # the parse answers from the buffer, so a depth rejection still hands back the
+        # partial tree it had built when it stopped
+        if (!sel res_ast2.ok)                                                      { bad = 4; }
+        if (diagnostic.len(?drv2) != 1 || diagnostic.len(result.diagnostics) != 1) { bad = 5; }
         or {
             val dd: *diagnostic.Diagnostic = ?drv2.items.data[0];
             val ed: *diagnostic.Diagnostic = ?result.diagnostics.items.data[0];
@@ -5848,15 +5973,14 @@ test "mach.lang.editor.analyze:project_phase_does_not_run_later_frontend_work" {
     fin { str_free(?alloc, path); }
     val open_r: res[source.FileId, fail.Fail] = open(?es, path, texts[0]);
     if (sel open_r.err) { ret 99; }
-    val fid: source.FileId   = open_r.ok;
-    var req: AnalysisRequest = analysis_request(fid, PHASE_PARSE);
-    req.build.target = "linux";
+    val fid:       source.FileId                     = open_r.ok;
+    var req:       AnalysisRequest                   = analysis_request(fid, PHASE_PARSE);
     val analyze_r: res[AnalysisResult, outcome.Fail] = analyze(?es, ?req);
     if (sel analyze_r.err) { ret 99; }
     var parsed: AnalysisResult = analyze_r.ok;
     if (!sel parsed.status.kind.accepted)                  { ret 1; }
     if (diagnostic.has_errors(parsed.diagnostics))         { ret 1; }
-    if (es.proj.module_len != 1)                           { ret 1; }
+    if (es.proj_loaded || es.proj_loads != 0)              { ret 1; }
     if (query.shard_len(?s.queries, query.Q_RESOLVE) != 0) { ret 1; }
     if (query.shard_len(?s.queries, query.Q_SEMA) != 0)    { ret 1; }
     val resolve_of_r: res[*resolve.ResolveResult, fail.Fail] = resolve_of(?parsed);
@@ -5864,7 +5988,8 @@ test "mach.lang.editor.analyze:project_phase_does_not_run_later_frontend_work" {
     analysis_dnit(?parsed);
     val update_r: res[bool, fail.Fail] = update(?es, fid, "fun main() i32 { ret \"wrong\"; }");
     if (sel update_r.err) { ret 99; }
-    req.phase = PHASE_RESOLVE;
+    req.build.target = "linux";
+    req.phase        = PHASE_RESOLVE;
     val analyze_r2: res[AnalysisResult, outcome.Fail] = analyze(?es, ?req);
     if (sel analyze_r2.err) { ret 99; }
     var resolved: AnalysisResult = analyze_r2.ok;
@@ -5874,13 +5999,164 @@ test "mach.lang.editor.analyze:project_phase_does_not_run_later_frontend_work" {
     val sema_of_r: res[*context.SemaResult, fail.Fail] = sema_of(?resolved);
     if (sel sema_of_r.ok) { ret 4; }
     analysis_dnit(?resolved);
+    # nothing changed but the phase: a resolve-deep project cannot answer a sema request
+    val loads_at_resolve: u64 = es.proj_loads;
     req.phase = PHASE_SEMA;
     val analyze_r3: res[AnalysisResult, outcome.Fail] = analyze(?es, ?req);
     if (sel analyze_r3.err) { ret 99; }
     var typed: AnalysisResult = analyze_r3.ok;
     if (!sel typed.status.kind.rejected)               { ret 5; }
     if (!diag_has(typed.diagnostics, "type mismatch")) { ret 5; }
+    if (es.proj_loads != loads_at_resolve + 1)         { ret 6; }
     analysis_dnit(?typed);
+    ret 0;
+}
+
+test "mach.lang.editor.analyze:an_unchanged_project_is_loaded_once" {
+    var alloc:       A.Allocator;
+    val t_session_r: res[session.Session, fail.Fail] = t_session(?alloc);
+    if (sel t_session_r.err) { ret 99; }
+    var s: session.Session = t_session_r.ok;
+    fin { session.dnit(?s); }
+    var es: EditorSession = init(?s);
+    fin { t_dnit(?es); }
+    var names:        [2]str              = [2]str{"main.mach", "helper.mach"};
+    var texts:        [2]str              = [2]str{"use edbuild.helper.square;\nfun main() i32 { ret square(3); }\n", "pub fun square(x: i32) i32 { ret x * x; }\n"};
+    val t_scaffold_r: res[str, fail.Fail] = t_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (sel t_scaffold_r.err) { ret 99; }
+    val root: str = t_scaffold_r.ok;
+    fin { fs.remove_all(?alloc, root); }
+    val str_join_r: res[str, string.StrError] = str_join(?alloc, root, "/src/main.mach");
+    if (sel str_join_r.err) { ret 99; }
+    val path: str = str_join_r.ok;
+    fin { str_free(?alloc, path); }
+    val open_r: res[source.FileId, fail.Fail] = open(?es, path, texts[0]);
+    if (sel open_r.err) { ret 99; }
+    val fid: source.FileId   = open_r.ok;
+    var req: AnalysisRequest = analysis_request(fid, PHASE_SEMA);
+
+    val first_r: res[AnalysisResult, outcome.Fail] = analyze(?es, ?req);
+    if (sel first_r.err) { ret 99; }
+    var first: AnalysisResult = first_r.ok;
+    if (!sel first.status.kind.accepted) { ret 1; }
+    if (!es.proj_loaded)                 { ret 1; }
+    if (es.proj_loads != 1)              { ret 1; }
+    analysis_dnit(?first);
+
+    # nothing invalidated the project, so the same request reuses the loaded closure
+    var i: u32 = 0;
+    for (i < 3) {
+        val again_r: res[AnalysisResult, outcome.Fail] = analyze(?es, ?req);
+        if (sel again_r.err) { ret 99; }
+        var again: AnalysisResult = again_r.ok;
+        val ok:    bool           = sel again.status.kind.accepted;
+        analysis_dnit(?again);
+        if (!ok)                { ret 2; }
+        if (es.proj_loads != 1) { ret 2; }
+        i = i + 1;
+    }
+
+    # an edited buffer does invalidate it, and the reload sees the edit
+    val update_r: res[bool, fail.Fail] = update(?es, fid, "use edbuild.helper.cube;\nfun main() i32 { ret cube(2); }\n");
+    if (sel update_r.err) { ret 99; }
+    if (!update_r.ok)     { ret 3; }
+    val edited_r: res[AnalysisResult, outcome.Fail] = analyze(?es, ?req);
+    if (sel edited_r.err) { ret 99; }
+    var edited:    AnalysisResult = edited_r.ok;
+    val rejected:  bool           = sel edited.status.kind.rejected;
+    val mentioned: bool           = diag_has(edited.diagnostics, "cube");
+    analysis_dnit(?edited);
+    if (!rejected)          { ret 4; }
+    if (!mentioned)         { ret 4; }
+    if (es.proj_loads != 2) { ret 4; }
+
+    # a change the session cannot see is announced, and only then reloads
+    val helper_r: res[str, string.StrError] = str_join(?alloc, root, "/src/helper.mach");
+    if (sel helper_r.err) { ret 99; }
+    val helper: str = helper_r.ok;
+    fin { str_free(?alloc, helper); }
+    val cube:    str             = "pub fun cube(x: i32) i32 { ret x * x * x; }\n";
+    val wrote_r: err[fs.FsError] = fs.write_bytes(helper, cube, str_len(cube), 420);
+    if (sel wrote_r.err) { ret 99; }
+    val stale_r: res[AnalysisResult, outcome.Fail] = analyze(?es, ?req);
+    if (sel stale_r.err) { ret 99; }
+    var stale: AnalysisResult = stale_r.ok;
+    analysis_dnit(?stale);
+    if (es.proj_loads != 2) { ret 5; }
+    invalidate(?es);
+    val fresh_r: res[AnalysisResult, outcome.Fail] = analyze(?es, ?req);
+    if (sel fresh_r.err) { ret 99; }
+    var fresh:    AnalysisResult = fresh_r.ok;
+    val accepted: bool           = sel fresh.status.kind.accepted;
+    analysis_dnit(?fresh);
+    if (!accepted)          { ret 6; }
+    if (es.proj_loads != 3) { ret 6; }
+    ret 0;
+}
+
+test "mach.lang.editor.analyze:the_parse_phase_never_loads_the_project" {
+    var alloc:       A.Allocator;
+    val t_session_r: res[session.Session, fail.Fail] = t_session(?alloc);
+    if (sel t_session_r.err) { ret 99; }
+    var s: session.Session = t_session_r.ok;
+    fin { session.dnit(?s); }
+    var es: EditorSession = init(?s);
+    fin { t_dnit(?es); }
+    var names:        [2]str              = [2]str{"main.mach", "helper.mach"};
+    var texts:        [2]str              = [2]str{"use edbuild.helper.square;\nfun main() i32 { ret square(3); }\n", "pub fun square(x: i32) i32 { ret x * x; }\n"};
+    val t_scaffold_r: res[str, fail.Fail] = t_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (sel t_scaffold_r.err) { ret 99; }
+    val root: str = t_scaffold_r.ok;
+    fin { fs.remove_all(?alloc, root); }
+    val str_join_r: res[str, string.StrError] = str_join(?alloc, root, "/src/main.mach");
+    if (sel str_join_r.err) { ret 99; }
+    val path: str = str_join_r.ok;
+    fin { str_free(?alloc, path); }
+    val open_r: res[source.FileId, fail.Fail] = open(?es, path, texts[0]);
+    if (sel open_r.err) { ret 99; }
+    val fid: source.FileId   = open_r.ok;
+    var req: AnalysisRequest = analysis_request(fid, PHASE_PARSE);
+
+    # a healthy project is in reach and is not touched: the buffer answers with its own tree
+    var i: u32 = 0;
+    for (i < 3) {
+        val parsed_r: res[AnalysisResult, outcome.Fail] = analyze(?es, ?req);
+        if (sel parsed_r.err) { ret 99; }
+        var parsed:   AnalysisResult           = parsed_r.ok;
+        val accepted: bool                     = sel parsed.status.kind.accepted;
+        val ast_r:    res[*ast.Ast, fail.Fail] = ast_of(?parsed);
+        var decls:    bool                     = false;
+        if (sel ast_r.ok) {
+            val a: *ast.Ast = ast_r.ok;
+            decls = a != nil && a.decl_len > 0;
+        }
+        analysis_dnit(?parsed);
+        if (!accepted)          { ret 1; }
+        if (!decls)             { ret 1; }
+        if (es.proj_loaded)     { ret 2; }
+        if (es.proj_loads != 0) { ret 2; }
+        val b: *Buffer = slot_live(?es, fid);
+        if (b == nil || !b.owned) { ret 3; }
+        i = i + 1;
+    }
+
+    # a sema request does load it, and parse requests after it still load nothing further
+    req.phase = PHASE_SEMA;
+    val typed_r: res[AnalysisResult, outcome.Fail] = analyze(?es, ?req);
+    if (sel typed_r.err) { ret 99; }
+    var typed: AnalysisResult = typed_r.ok;
+    analysis_dnit(?typed);
+    if (!es.proj_loaded)    { ret 4; }
+    if (es.proj_loads != 1) { ret 4; }
+
+    req.phase = PHASE_PARSE;
+    val after_r: res[AnalysisResult, outcome.Fail] = analyze(?es, ?req);
+    if (sel after_r.err) { ret 99; }
+    var after:    AnalysisResult = after_r.ok;
+    val after_ok: bool           = sel after.status.kind.accepted;
+    analysis_dnit(?after);
+    if (!after_ok)          { ret 5; }
+    if (es.proj_loads != 1) { ret 5; }
     ret 0;
 }
 
