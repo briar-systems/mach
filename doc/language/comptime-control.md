@@ -189,7 +189,27 @@ resolve names inside the untaken branches — this is the mechanism that makes
 per-target asm blocks safe even when one block references registers the other
 backend doesn't know about.
 
-A `$if` gated on a comptime **parameter** is the one exception: because arm
+Inside a function body, a gate that names a constant from another module (for
+example `$if (capability.HOSTED) { ... }`) is decided during type checking, after
+names are resolved. Its arms are read the same way: a name that doesn't exist in
+an arm the gate discards is never reported, exactly as with C's `#if`. A name
+that doesn't exist in the arm the gate **selects** is reported as an ordinary
+`unresolved identifier` or `unresolved type name` error, once, however many times
+the enclosing function is instantiated. So such an arm may name what only exists
+on the targets that select it.
+
+```mach
+use capability: std.system.capability;
+
+fun field_token(c: *Cursor, error: io_error.Error) {
+    $if (capability.HOSTED) {
+        # names that only a hosted target provides
+        put_quoted(c, io_error.message(error));
+    }
+}
+```
+
+A `$if` gated on a comptime **parameter** is the other exception: because arm
 selection happens per call site (at monomorphization), name resolution and
 type checking run over **all** arms structurally, and only the selected arm is
 emitted into each instance. Each arm must therefore be independently

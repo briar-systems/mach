@@ -46,6 +46,17 @@ pub def SymbolId: u32;
 pub val SYMBOL_NIL: SymbolId = 0xFFFFFFFF;
 # an identifier visited and rejected by resolution has no symbol to remap.
 pub val SYMBOL_REJECTED: SymbolId = 0xFFFFFFFE;
+# a name in an arm of a statement-level gate resolve could not decide, which resolved to
+# nothing: sema reports it if it selects that arm, and an arm it discards reports nothing
+# (#3485). one sentinel per message, so the report reads as resolve's would have.
+pub val SYMBOL_DEFERRED_NAME: SymbolId = 0xFFFFFFFD;
+pub val SYMBOL_DEFERRED_TYPE: SymbolId = 0xFFFFFFFC;
+# every id at or above this one is a sentinel, never a symbol
+pub val SYMBOL_RESERVED_MIN: SymbolId = SYMBOL_DEFERRED_TYPE;
+
+pub fun symbol_deferred(sid: SymbolId) bool {
+    ret sid == SYMBOL_DEFERRED_NAME || sid == SYMBOL_DEFERRED_TYPE;
+}
 
 pub val TESTING_DIRECTIVE: str = "testing";
 
@@ -194,6 +205,8 @@ rec ResolveContext {
     source:              str;
     terminal:            bool;
     in_gated_decl_scope: bool;
+    # binding an arm of a statement-level gate that only sema can decide
+    in_deferred_arm: bool;
 
     symbols: *Symbol;
     sym_len: u32;
@@ -459,6 +472,7 @@ fun init_context(
     rc.own_module          = own_module;
     rc.terminal            = terminal;
     rc.in_gated_decl_scope = false;
+    rc.in_deferred_arm     = false;
 
     val src_opt: opt[*src.SourceFile] = src.get(?s.sources, a.file_id);
     if (sel src_opt.none) {
@@ -726,14 +740,14 @@ pub fun declaration_testing(a: *ast.Ast, source: str, did: id.DeclId) bool {
 }
 
 fun add_symbol(rc: *ResolveContext, kind: SymKind, flags: u8, name: intern.StrId, canon: intern.StrId, decl_id: id.DeclId, slot: u32, origin: session.ModuleId) res[SymbolId, fail.Fail] {
-    if (rc.sym_len >= SYMBOL_REJECTED) {
+    if (rc.sym_len >= SYMBOL_RESERVED_MIN) {
         val message: str = "resolver symbol table exhausted";
         fail.internal(?rc.status, message);
         ret res[SymbolId, fail.Fail].err{fail.message(message)};
     }
     if (rc.sym_len == rc.sym_cap) {
-        var new_cap: u32 = SYMBOL_REJECTED;
-        if (rc.sym_cap <= SYMBOL_REJECTED / 2) { new_cap = rc.sym_cap * 2; }
+        var new_cap: u32 = SYMBOL_RESERVED_MIN;
+        if (rc.sym_cap <= SYMBOL_RESERVED_MIN / 2) { new_cap = rc.sym_cap * 2; }
         val r: res[*Symbol, A.Error] = A.reallocate[Symbol](rc.s.alloc, rc.symbols, rc.sym_cap::usize, new_cap::usize);
         if (sel r.err) {
             fail.internal(?rc.status, alloc.text(r.err));
@@ -1213,16 +1227,19 @@ fun note_refused_name(rc: *ResolveContext, span: token.Span) err[fail.Fail] {
     ret err[fail.Fail].ok{};
 }
 
-# report_unresolved names a missing identifier or type, unless a refusal already accounts for it
-fun report_unresolved(rc: *ResolveContext, span: token.Span, prefix: str, name: intern.StrId, suggest: bool) {
+# report_unresolved names a missing identifier or type, unless a refusal already accounts for it;
+# true when the name sits in an arm only sema can decide, which the caller marks deferred
+fun report_unresolved(rc: *ResolveContext, span: token.Span, prefix: str, name: intern.StrId, suggest: bool) bool {
+    if (rc.in_deferred_arm) { ret true; }
     var key:   intern.StrId   = name;
     val known: opt[*SymbolId] = map.get[intern.StrId, SymbolId](?rc.refused_names, ?key);
     if (sel known.some) {
         fail.reject(?rc.status);
-        ret;
+        ret false;
     }
     val re: err[fail.Fail] = report_named(rc, span, prefix, name, "`");
     if (suggest && sel re.ok) { attach_suggestion(rc, span, name); }
+    ret false;
 }
 
 fun collect_comptime_if(rc: *ResolveContext, ci: *decl.DeclComptimeIf, scope: ScopeId, at_module_scope: bool, at_decl_scope: bool) err[fail.Fail] {
@@ -1494,6 +1511,10 @@ fun bind_member_qualified(rc: *ResolveContext, eid: id.ExprId, member: *expr.Exp
     val ps: *PublicSymbol = find_export(mx, leaf_id);
     if (ps == nil && mx.refused) {
         fail.reject(?rc.status);
+        ret err[fail.Fail].ok{};
+    }
+    if (ps == nil && rc.in_deferred_arm) {
+        rc.expr_resolved[eid] = SYMBOL_DEFERRED_NAME;
         ret err[fail.Fail].ok{};
     }
     if (ps == nil) {
@@ -1848,6 +1869,9 @@ fun bind_comptime_if(rc: *ResolveContext, branches_start: u32, branches_len: u32
             ret err[fail.Fail].err{take_r.err};
         }
         val outcome: comptime.GateOutcome = take_r.ok;
+        if (outcome == comptime.GATE_DEFERRED && !at_decl_scope) {
+            ret bind_deferred_arms(rc, branches_start + bi, branches_len - bi);
+        }
         if (outcome == comptime.GATE_DEFERRED || outcome == comptime.GATE_REJECTED || outcome == comptime.GATE_FAILED) {
             ret err[fail.Fail].ok{};
         }
@@ -1859,6 +1883,33 @@ fun bind_comptime_if(rc: *ResolveContext, branches_start: u32, branches_len: u32
         }
         bi = bi + 1;
     }
+    ret err[fail.Fail].ok{};
+}
+
+# a statement-level gate only sema can decide: any arm from this one on may be the one it
+# selects, so each is bound, and a name none of them can see is left for sema to report if it
+# walks that arm (#3485). the gates of later arms are bound as the arms' own contents are.
+fun bind_deferred_arms(rc: *ResolveContext, start: u32, len: u32) err[fail.Fail] {
+    val saved: bool = rc.in_deferred_arm;
+    rc.in_deferred_arm = true;
+    var i: u32 = 0;
+    for (i < len) {
+        val arm: *decl.ComptimeBranch = ?rc.a.comptime_branches[start + i];
+        if (i > 0 && arm.cond != id.EXPR_NIL) {
+            val rce: err[fail.Fail] = bind_expr(rc, arm.cond);
+            if (sel rce.err) {
+                rc.in_deferred_arm = saved;
+                ret rce;
+            }
+        }
+        val rb: err[fail.Fail] = bind_stmt_list(rc, arm.body_start, arm.body_len);
+        if (sel rb.err) {
+            rc.in_deferred_arm = saved;
+            ret rb;
+        }
+        i = i + 1;
+    }
+    rc.in_deferred_arm = saved;
     ret err[fail.Fail].ok{};
 }
 
@@ -2389,8 +2440,9 @@ fun bind_ident(rc: *ResolveContext, eid: id.ExprId, span: token.Span) err[fail.F
     val name: intern.StrId = r.ok;
     val sid:  SymbolId     = scope_lookup_chain(rc, rc.current_scope, name);
     if (sid == SYMBOL_NIL) {
-        if (rc.expr_resolved != nil) { rc.expr_resolved[eid] = SYMBOL_REJECTED; }
-        report_unresolved(rc, span, "unresolved identifier `", name, true);
+        var mark: SymbolId = SYMBOL_REJECTED;
+        if (report_unresolved(rc, span, "unresolved identifier `", name, true)) { mark = SYMBOL_DEFERRED_NAME; }
+        if (rc.expr_resolved != nil)                                            { rc.expr_resolved[eid] = mark; }
     }
     or {
         if (rc.expr_resolved != nil) { rc.expr_resolved[eid] = sid; }
@@ -2651,8 +2703,9 @@ fun bind_type_name_expr(rc: *ResolveContext, eid: id.ExprId) err[fail.Fail] {
         var sid: SymbolId = sp.sym;
         if (sid == SYMBOL_NIL) { sid = scope_lookup_chain(rc, rc.current_scope, name); }
         if (sid == SYMBOL_NIL) {
-            if (rc.expr_resolved != nil) { rc.expr_resolved[eid] = SYMBOL_REJECTED; }
-            report_unresolved(rc, e.span, "unresolved type name `", name, true);
+            var mark: SymbolId = SYMBOL_REJECTED;
+            if (report_unresolved(rc, e.span, "unresolved type name `", name, true)) { mark = SYMBOL_DEFERRED_TYPE; }
+            if (rc.expr_resolved != nil)                                             { rc.expr_resolved[eid] = mark; }
         }
         or {
             if (rc.expr_resolved != nil) { rc.expr_resolved[eid] = sid; }
@@ -2923,7 +2976,9 @@ fun resolve_type_path(rc: *ResolveContext, named: *atype.TypeNamed, full: token.
         }
 
         if (current_sym == SYMBOL_NIL) {
-            report_unresolved(rc, full, "unresolved type name `", seg_name, seg_span.offset == path.offset && cursor >= end);
+            if (report_unresolved(rc, full, "unresolved type name `", seg_name, seg_span.offset == path.offset && cursor >= end)) {
+                ret SYMBOL_DEFERRED_TYPE;
+            }
             ret SYMBOL_NIL;
         }
 
@@ -3294,7 +3349,7 @@ fun t_symbol_growth_boundary(exhausted: bool) i32 {
     rc.status  = fail.accepted();
     rc.symbols = ?storage[0];
     rc.sym_cap = 0x80000000;
-    if (exhausted) { rc.sym_cap = SYMBOL_REJECTED; }
+    if (exhausted) { rc.sym_cap = SYMBOL_RESERVED_MIN; }
     rc.sym_len = rc.sym_cap;
     val old_cap: u32                      = rc.sym_cap;
     val r:       res[SymbolId, fail.Fail] = add_symbol(?rc, SYM_VAL, 0, intern.STR_NIL, intern.STR_NIL,
@@ -3309,7 +3364,7 @@ fun t_symbol_growth_boundary(exhausted: bool) i32 {
         if ($size_of(usize) == 8) {
             if (!str_equals(fail.describe(r.err), "out of memory")) { ret 4; }
             if (probe.reallocations != 1 || probe.old_size != old_cap::usize * $size_of(Symbol)
-                || probe.new_size != SYMBOL_REJECTED::usize * $size_of(Symbol)) { ret 5; }
+                || probe.new_size != SYMBOL_RESERVED_MIN::usize * $size_of(Symbol)) { ret 5; }
         }
         or {
             if (!str_equals(fail.describe(r.err), "allocation size overflow")) { ret 6; }

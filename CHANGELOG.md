@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - A dependency's public type is looked up through an index keyed by its origin and canonical name, built once per typed surface, instead of scanning every dependency's exports on every lookup. mach-lsp's warm-rebuild profile had 18.3% of its time in that scan (#3472).
+### Fixed
+- A statement-level `$if` in a function body whose gate reads a constant from another module (`$if (capability.HOSTED) { ... }`) no longer fails with `internal: this identifier reached type inference unbound`. Such a gate is decided during type checking, and name resolution now binds every arm it can't yet rule out. A name that doesn't exist in an arm the gate discards is not reported, exactly as with C's `#if`. A missing name in the arm it selects is reported as an ordinary `unresolved identifier` or `unresolved type name` error, once, wherever it appears in that arm and however many times the enclosing generic is instantiated. `doc/language/comptime-control.md` states the rule (#3485).
 
 ## [5.2.1] - 2026-09-16
 
