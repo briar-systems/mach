@@ -1215,6 +1215,13 @@ manifests receive these checks during parsing, before planning can execute a ste
 A required artifact that fails to build fails its consumer, naming the requirement,
 and the consumer is not attempted.
 
+`mach check` builds nothing, and that includes required artifacts. An `#[embed]` is
+read in the frontend, so a consumer that embeds a requirement's output cannot be
+checked on a tree that has never been built: the check reports the output it cannot
+read, names the artifact whose output it is, and says to build first. One `mach build`
+produces the outputs and every later check of unchanged requirements is clean, so a
+pipeline that checks before it builds should build first.
+
 ### Dependency requirements travel
 
 A library that embeds what it builds cannot be consumed if its requirements stop
