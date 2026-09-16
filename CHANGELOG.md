@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Verifying a git dependency checkout costs a constant number of git processes instead of one per walked path. The inspector builds git's child environment once, and answers every committed-mode question about a checkout from one `git ls-tree -r -t --full-tree HEAD` listing, which is dropped whenever a git command that can move a checkout runs. A warm `mach build` of a project depending on the whole mach repository went from 1312 git processes to 88 (#3471).
+### Fixed
+- `mach build`, `mach test`, `mach check` and every other command that resolves the dependency closure now refuse a project whose dependency root `dep` is a symlink, as `mach dep verify` already did. Before, the build followed the link and compiled another tree's checkouts, so a green build said nothing about whether the closure was the project's own. One check in the driver now serves every entry point and the dependency commands, with one message (#3478).
 
 ## [5.2.0] - 2026-09-16
 
