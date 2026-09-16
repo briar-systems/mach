@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A handle type a module declares for another target no longer fails the build with `inline body: handle schema is unavailable`. Such a handle is inert on the selected target and carries words rather than types, and the cross-module inliner now reads it that way (#3427).
 - A path dependency copy leaves the source's build output behind whatever `[project].out` spells. The exclusion compared a directory name against the template text, so only a project whose `out` was literally `out` was excluded (#3429).
 - `mach dep update` removes what a path dependency's source dropped instead of refusing. A realized dependency is its source, and a file deleted upstream no longer forces `rm -rf dep/<id>`; each removal is named (#3429).
 - A `bin` artifact on a `spirv` target delivers its entry module at the resolved `out`, or `-o`, so `{artifact.<id>.out}` names a file that exists and a host binary can `#[embed]` the shader artifact it requires. The per-module objects are still written under `obj/` (#3397).
