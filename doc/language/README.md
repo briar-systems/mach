@@ -66,6 +66,7 @@ from the index below.
 ## Build system
 
 - [manifest.md](manifest.md) — the `mach.toml` manifest reference
+- [ir-output.md](ir-output.md) — `--emit-ir` and its two forms, and which one is stable for tooling
 - `mach --help` and `mach help <command>` — the command-line reference
 
 The supported, source-stable surface of the compiler is the editor API
