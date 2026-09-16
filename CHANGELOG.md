@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The line-table rows covering a function's prologue carry the function's own declaration rather than the location of the first instruction in its body, which at `-O2` belongs to an inlined callee in another file. A debugger, a symbolizer and an assembly view now resolve a function's entry address to its `fun` line, and `DW_AT_decl_file` and `DW_AT_decl_line`, which had the same origin, name the declaration too (#3394).
 - A handle type a module declares for another target no longer fails the build with `inline body: handle schema is unavailable`. Such a handle is inert on the selected target and carries words rather than types, and the cross-module inliner now reads it that way (#3427).
 - A `bin` artifact on a `spirv` target delivers its entry module at the resolved `out`, or `-o`, so `{artifact.<id>.out}` names a file that exists and a host binary can `#[embed]` the shader artifact it requires. The per-module objects are still written under `obj/` (#3397).
 - A SPIR-V module whose `env` pins a version below 1.4 lists only its Input and Output variables in `OpEntryPoint`, and below 1.3 declares a `#[storage]` binding as a `Uniform` variable over a `BufferBlock` block, so `vulkan1.0` and `vulkan1.1` modules with descriptors pass `spirv-val` for their environment (#3399).
