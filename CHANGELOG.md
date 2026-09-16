@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `$if` chain gated on a `$type_of` type comparison inside a generic is decided at the instantiation, not at the uninstantiated template. A type comparison whose operand's type still names a generic parameter no longer evaluates to a confident false, so a `!=` gate and a bare `$or` fallback are no longer selected before the concrete type is known and a `$error` in a provably unselected arm no longer fires. Each arm is type-checked only at the instantiation that selects it, and an instantiation matching no arm still reports the `$error` at the instantiation site (#3433).
 - A handle type a module declares for another target no longer fails the build with `inline body: handle schema is unavailable`. Such a handle is inert on the selected target and carries words rather than types, and the cross-module inliner now reads it that way (#3427).
 - A `bin` artifact on a `spirv` target delivers its entry module at the resolved `out`, or `-o`, so `{artifact.<id>.out}` names a file that exists and a host binary can `#[embed]` the shader artifact it requires. The per-module objects are still written under `obj/` (#3397).
 - A SPIR-V module whose `env` pins a version below 1.4 lists only its Input and Output variables in `OpEntryPoint`, and below 1.3 declares a `#[storage]` binding as a `Uniform` variable over a `BufferBlock` block, so `vulkan1.0` and `vulkan1.1` modules with descriptors pass `spirv-val` for their environment (#3399).
