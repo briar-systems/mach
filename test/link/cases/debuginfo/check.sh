@@ -180,8 +180,11 @@ produce_debuginfo() {
         # builds. release may optimize that list away, so the invariant is that at
         # most one list starts at the winner; a losing base_address alias makes two.
         if [ "$label" = pack ]; then
+            # a list's first entry is where it starts; later entries of the same
+            # list may begin at the same address when a range is empty
             loc_starts=$(printf '%s\n' "$locations" | awk -v addr="$3" '
-                index($0, "[" addr ",") { n++ }
+                /^0x[0-9a-fA-F]+: *$/ { first = 1; next }
+                /\[0x/ { if (first && index($0, "[" addr ",")) { n++ } first = 0 }
                 END { print n + 0 }
             ')
             loc_state="aliased:$loc_starts"
