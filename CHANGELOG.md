@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The relational operators `<`, `<=`, `>` and `>=` accept two pointer-like operands, including `*^T` against `*^T` and `*^T` against a public `*U`, whatever their pointee types. The result is a public `bool` and ordering lowers to one unsigned integer compare of pointer width, so a secret buffer's overlap check is `first <= ?second[second_len - 1] && second <= ?first[first_len - 1]` rather than a linear scan of every address. The address of a `*^T` was always public, and ordering yields no integer and no pointer, so it launders nothing the already-permitted `==` did not: `::`, `:~`, `:>T` and erasure to `ptr` remain closed over a secret-welded pointer, each pinned by a test. `doc/language/secrecy.md` states the rule and why it holds (#3411).
+
 ## [5.1.0] - 2026-09-16
 
 ### Added
