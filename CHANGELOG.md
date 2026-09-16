@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.1.0] - 2026-09-16
+
 ### Added
 
 - `--emit-ir` takes an optional form: bare it writes the ir-debug dump as before, byte for byte, and `--emit-ir=listing` writes a readable listing beside it. The listing prints the instruction and nothing else, spells types the way the language spells them (`i64`, `*i64`, `[4]i64`, `i32x4`, `rec{i64, f32}`), and resolves each instruction's byte offset to `line:column` at print time, naming the path when the position is in a file the function's body does not live in, so a consumer can map a listing line back to an editor line from the output alone. Flags that change what an instruction means (`.secret`, `.pure`, `.nsw`, `.nuw`, `.exact`, `.volatile`) and a secret operand's `~` still print; the operand records, type-table rows and metadata ids do not. The dump's text is not a contract and the listing's is, which [doc/language/ir-output.md](doc/language/ir-output.md) documents (#3440).
