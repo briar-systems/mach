@@ -57,6 +57,8 @@ rec State {
     gep_field:   *u32;
     uni_gep:     *bool;
     erase:       *bool;
+    # an address some instruction uses other than as a load's address or a store's destination
+    escapes: *bool;
 
     cand_id:   *id.InstructionId;
     cand_ty:   *ir_type.IrTypeId;
@@ -156,6 +158,7 @@ fun split_function(work: *FunctionWork, alloc: *A.Allocator) res[bool, fail.Fail
     }
 
     link_phi_partitions(?st);
+    mark_escaping_addresses(?st);
     classify_references(?st);
     mark_union_member_geps(?st);
     classify_gep_uses(?st);
@@ -264,6 +267,10 @@ fun state_alloc(st: *State) err[fail.Fail] {
     if (sel r_er.err) { ret err[fail.Fail].err{fail.refused(r_er.err)}; }
     st.erase = r_er.ok;
 
+    val r_es: res[*bool, A.Error] = A.allocate[bool](st.alloc, n::usize);
+    if (sel r_es.err) { ret err[fail.Fail].err{fail.refused(r_es.err)}; }
+    st.escapes = r_es.ok;
+
     var i: u32 = 0;
     for (i < n) {
         st.instr_block[i] = id.BLOCK_NIL;
@@ -272,6 +279,7 @@ fun state_alloc(st: *State) err[fail.Fail] {
         st.gep_field[i]   = 0;
         st.uni_gep[i]     = false;
         st.erase[i]       = false;
+        st.escapes[i]     = false;
         i                 = i + 1;
     }
 
@@ -343,6 +351,7 @@ fun state_dnit(st: *State) {
     if (st.gep_field != nil)   { A.deallocate[u32](st.alloc, st.gep_field, n::usize); }
     if (st.uni_gep != nil)     { A.deallocate[bool](st.alloc, st.uni_gep, n::usize); }
     if (st.erase != nil)       { A.deallocate[bool](st.alloc, st.erase, n::usize); }
+    if (st.escapes != nil)     { A.deallocate[bool](st.alloc, st.escapes, n::usize); }
 
     val c: u32 = st.cand_cap;
     if (st.cand_id != nil)      { A.deallocate[id.InstructionId](st.alloc, st.cand_id, c::usize); }
@@ -837,9 +846,41 @@ fun union_access_ok(st: *State, c: u32, gid: id.InstructionId, at: ir_type.IrTyp
     ret int_of_bytes(st, acc) != ir_type.IRT_NIL;
 }
 
+# every instruction whose result some use takes as more than a place to load from or store into
+fun mark_escaping_addresses(st: *State) {
+    val fn: *ir.Function = st.fn;
+    var i:  u32          = 0;
+    for (i < st.pool_len) {
+        if (st.instr_block[i] == id.BLOCK_NIL) {
+            i = i + 1;
+            cnt;
+        }
+        val inst: *instruction.Instruction = ?fn.instrs[i];
+        if (inst.kind == instruction.OP_DBG_VALUE) {
+            i = i + 1;
+            cnt;
+        }
+        var o: u32 = 0;
+        for (o < inst.operand_count) {
+            val op: value.Value = inst.operands[o];
+            if (op.kind == value.VAL_INSTR && op.data.instr::u32 < st.pool_len) {
+                val place: bool = (inst.kind == instruction.OP_LOAD && o == 0)
+                    || (inst.kind == instruction.OP_STORE && o == 1);
+                if (!place) { st.escapes[op.data.instr::u32] = true; }
+            }
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# a pointer-arithmetic gep on a field address stays in the field only when it adds no
+# offset and its own result is used just to load and store: passed on, the address reaches
+# the field's siblings, which a split no longer keeps beside it (#3482)
 fun gep_stays_in_field(st: *State, c: u32, gid: id.InstructionId, uid: id.InstructionId, inst: *instruction.Instruction) bool {
     val ft: ir_type.IrTypeId = agg_field_type(st, st.cand_ty[c], st.gep_field[gid::u32]);
     if (union_leaf_ty(st, ft) != ir_type.IRT_NIL)     { ret st.uni_gep[uid::u32]; }
+    if (st.escapes[uid::u32])                         { ret false; }
     if (inst.operand_count < 2)                       { ret false; }
     if (inst.operands[1].kind != value.VAL_CONST_INT) { ret false; }
     if (inst.operands[1].data.int_lit != 0)           { ret false; }
@@ -3213,6 +3254,95 @@ test "mach.lang.me.transform.sroa.run:declines_when_the_address_escapes" {
 
     ir.dnit(?m);
     ret code;
+}
+
+# a function over a local [4]i8 that fills every element, then takes `gep (gep a, 0, 0), 0`
+# and either passes that derived address to a call or only loads through it (#3482)
+fun ut_derived_element(escape: bool, split: *bool, allocas: *u32) i32 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var reg: target.TargetRegistry;
+    fin { target.registry_dnit(?reg); }
+    var tgt: resolved.Target;
+    if (ut_target(?reg, ?tgt) != 0) { ret 1; }
+    val rm: res[ir.Module, fail.Fail] = ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 2; }
+    var m: ir.Module = rm.ok;
+    fin { ir.dnit(?m); }
+    val r8:  res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 8);
+    val r64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    val rv:  res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_void(?m.types);
+    val rp:  res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?m.types);
+    if (sel r8.err)  { ret 3; }
+    if (sel r64.err) { ret 3; }
+    if (sel rv.err)  { ret 3; }
+    if (sel rp.err)  { ret 3; }
+    val i8t:  ir_type.IrTypeId                 = r8.ok;
+    val i64t: ir_type.IrTypeId                 = r64.ok;
+    val rarr: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_array(?m.types, i8t, 4);
+    if (sel rarr.err) { ret 3; }
+    val arr: ir_type.IrTypeId    = rarr.ok;
+    val rc:  res[u32, fail.Fail] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, ir.FN_FLAG_EXTERN);
+    if (sel rc.err) { ret 4; }
+    val rf: res[u32, fail.Fail] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) { ret 4; }
+    val fn: *ir.Function    = ?m.functions[rf.ok];
+    var b:  builder.Builder = builder.init(?m);
+    builder.set_function(?b, fn);
+    val rb: res[id.BlockId, fail.Fail] = builder.new_block(?b);
+    if (sel rb.err) { ret 5; }
+    builder.set_block(?b, rb.ok);
+    val ra: res[value.Value, fail.Fail] = builder.emit_alloca(?b, arr, value.const_int(1, i64t));
+    if (sel ra.err) { ret 6; }
+    val a: value.Value = ra.ok;
+    var k: u64         = 0;
+    for (k < 4) {
+        val gk: res[value.Value, fail.Fail] = ut_gep(?b, ?m, a, arr, k);
+        if (sel gk.err) { ret 7; }
+        val st_r: err[fail.Fail] = builder.emit_store(?b, value.const_int(0xA0 + k, i8t), gk.ok);
+        if (sel st_r.err) { ret 7; }
+        k = k + 1;
+    }
+    val g0: res[value.Value, fail.Fail] = ut_gep(?b, ?m, a, arr, 0);
+    if (sel g0.err) { ret 8; }
+    var zero: [1]value.Value;
+    zero[0] = value.const_int(0, i64t);
+    val rd: res[value.Value, fail.Fail] = builder.emit_gep(?b, g0.ok, i8t, ?zero[0], 1);
+    if (sel rd.err) { ret 8; }
+    if (escape) {
+        var args: [1]value.Value;
+        args[0] = rd.ok;
+        val called: res[value.Value, fail.Fail] = builder.emit_call(?b, value.fn(rc.ok, rp.ok), ?args[0], 1, rv.ok);
+        if (sel called.err) { ret 9; }
+    }
+    or {
+        val loaded: res[value.Value, fail.Fail] = builder.emit_load(?b, rd.ok, i8t);
+        if (sel loaded.err) { ret 9; }
+    }
+    val g1: res[value.Value, fail.Fail] = ut_gep(?b, ?m, a, arr, 1);
+    if (sel g1.err) { ret 10; }
+    val rl: res[value.Value, fail.Fail] = builder.emit_load(?b, g1.ok, i8t);
+    if (sel rl.err) { ret 10; }
+    val rr: err[fail.Fail] = builder.emit_ret(?b, rl.ok);
+    if (sel rr.err) { ret 10; }
+    val ran: res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel ran.err) { ret 11; }
+    @split   = ran.ok;
+    @allocas = ut_count(fn, instruction.OP_ALLOCA);
+    ret 0;
+}
+
+test "mach.lang.me.transform.sroa.run:keeps_an_array_whole_when_a_derived_element_address_escapes" {
+    var split:   bool = false;
+    var allocas: u32  = 0;
+    val built:   i32  = ut_derived_element(true, ?split, ?allocas);
+    if (built != 0)   { ret built; }
+    if (split)        { ret 20; }
+    if (allocas != 1) { ret 21; }
+    val placed: i32 = ut_derived_element(false, ?split, ?allocas);
+    if (placed != 0) { ret placed; }
+    if (!split)      { ret 22; }
+    ret 0;
 }
 
 test "mach.lang.me.transform.sroa.run:declines_a_phi_whose_merge_writes_a_member" {
