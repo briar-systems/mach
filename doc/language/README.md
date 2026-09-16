@@ -45,7 +45,7 @@ from the index below.
 - [comptime.md](comptime.md) - channel overview
 - [comptime-mach.md](comptime-mach.md) - $mach.* compiler-owned namespace
 - [decorators.md](decorators.md) - codegen decorators, #[name] (replaces the removed $sym.attr setters)
-- [comptime-intrinsics.md](comptime-intrinsics.md) - $size_of, $length_of, $align_of, $offset_of, $type_of, $fields, $cases, $is_tag, $discriminant_of, $pointee_of, $is_record, $is_union, $is_pointer, $is_secret, $type_name, $each, $error
+- [comptime-intrinsics.md](comptime-intrinsics.md) - $size_of, $length_of, $align_of, $offset_of, $type_of, $fields, $cases, $is_tag, $discriminant_of, $pointee_of, $is_record, $is_union, $is_pointer, $is_integer, $is_float, $is_secret, $type_name, $each, $error
 - [comptime-control.md](comptime-control.md) - $if / $or
 
 ## Low-level
