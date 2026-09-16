@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - The relational operators `<`, `<=`, `>` and `>=` accept two pointer-like operands, including `*^T` against `*^T` and `*^T` against a public `*U`, whatever their pointee types. The result is a public `bool` and ordering lowers to one unsigned integer compare of pointer width, so a secret buffer's overlap check is `first <= ?second[second_len - 1] && second <= ?first[first_len - 1]` rather than a linear scan of every address. The address of a `*^T` was always public, and ordering yields no integer and no pointer, so it launders nothing the already-permitted `==` did not: `::`, `:~`, `:>T` and erasure to `ptr` remain closed over a secret-welded pointer, each pinned by a test. `doc/language/secrecy.md` states the rule and why it holds (#3411).
+## [Unreleased]
+
 ### Changed
 - CI ends in one `gate` job that needs every other job and fails when any of them failed or was cancelled, while a job its tier skipped counts as passed. `gate` is the single check a merge requires. Pull requests into `dev` again run `changelog headings`, which enforces the single leading `## [Unreleased]` and one `###` of each kind per release from #3039, and `incremental <target>` on both linux hosts, which checks that warm rebuilds of the compiler and of a manifest fixture match clean ones. Pull requests into `main` also run `release <target>`, the release-profile fixpoint and unit suite of the binary `cd.yml` ships. `bash test/run.sh --incremental` runs the warm-build check locally (#3447).
 ### Fixed
