@@ -70,10 +70,11 @@ ret: the argument after the first occurrence that has one; none when the flag is
 pub fun arg_is_flag(s: str) bool;
 ```
 
-whether an argument starts with '-'; nil is not a flag
+whether an argument starts with '-'; nil is not a flag, and a lone '-' is the
+conventional name of the standard stream rather than an option
 
 s: the argument
-ret: true for a leading '-'
+ret: true for a leading '-' followed by anything
 
 ## fun arg_separator_index
 

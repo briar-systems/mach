@@ -587,7 +587,12 @@ reads the selected artifact's name.
 `src` is not part of the cell merely because it shares the project directory. This
 is what lets one project declare host and accelerator artifacts with disjoint target
 sets. `mach test` is the deliberate whole-source exception: it roots collection at
-every module in the current project's `src` tree.
+every module in the current project's `src` tree, minus the modules that only
+artifacts the selected target does not build reach. Those belong to the target their
+artifact declares, so a host test build leaves them out and counts them among the
+modules it skipped, exactly as it does a module a comptime gate excluded. A module
+both a selected-target artifact and another target's reach is compiled here, and a
+module no artifact reaches is collected as before.
 
 - **`bin`** links an executable at the resolved `out` path. On a finished-module
   target such as `spirv` it is the entry module, written there unlinked.
@@ -935,7 +940,8 @@ A dependency is named by its **project id**, and that one name is used in three
 places: the manifest key `[dep.<id>]`, the directory `dep/<id>/`, and the head
 segment of every module path the dependency exposes (`use <id>.x;`). The
 compiler checks all three agree: `dep/<id>/mach.toml` must declare
-`id = "<id>"`.
+`id = "<id>"`. A dependency whose id is the declaring project's own is refused
+where it is declared, since one head segment cannot name two projects.
 
 ```toml
 [dep.std]
