@@ -140,6 +140,8 @@ pub rec ModuleExports {
     module:  session.ModuleId;
     symbols: *PublicSymbol;
     count:   u32;
+    # the module refused itself, and that refusal is its diagnostic, so a missing name is not one
+    refused: bool;
 }
 
 pub rec ExportConstant {
@@ -217,6 +219,9 @@ rec ResolveContext {
 
     module_index: map.Map[intern.StrId, SymbolId];
 
+    # names bound from a refused module: a use of one is that refusal again, not a new error
+    refused_names: map.Map[intern.StrId, SymbolId];
+
     expr_choices:       *interpretation.Choice;
     expr_choices_count: usize;
 }
@@ -243,6 +248,9 @@ pub rec ResolveResult {
 
     expr_choices:       *interpretation.Choice;
     expr_choices_count: usize;
+
+    # a module-scope `$error` in a decided arm refused the module, so nothing else was resolved
+    refused: bool;
 
     remap_sequence: u64;
     remap_modules:  u32;
@@ -357,6 +365,20 @@ pub fun resolve(
     }
     val mnode: *module.Module = m_opt.some;
 
+    # every other diagnostic in a refused module is a consequence of the refusal
+    val refusal_r: res[bool, fail.Fail] = module_refusal(?rc, mnode.decls_start, mnode.decls_len);
+    if (sel refusal_r.err) {
+        dnit_context(?rc);
+        ret res[ResolveResult, fail.Fail].err{refusal_r.err};
+    }
+    if (refusal_r.ok) {
+        val refused_r: res[ResolveResult, fail.Fail] = build_result(?rc);
+        if (sel refused_r.err) { ret refused_r; }
+        var refused: ResolveResult = refused_r.ok;
+        refused.refused = true;
+        ret res[ResolveResult, fail.Fail].ok{refused};
+    }
+
     val c1: err[fail.Fail] = collect_decl_list(?rc, mnode.decls_start, mnode.decls_len, rc.module_scope, true);
     if (sel c1.err) {
         dnit_context(?rc);
@@ -468,6 +490,7 @@ fun init_context(
     rc.imported_cache = map.init[ImportedKey, SymbolId](s.alloc, imported_hash, imported_equal);
     rc.vec_cache      = map.init[intern.StrId, SymbolId](s.alloc, map.hash_u32, map.eq_u32);
     rc.module_index   = map.init[intern.StrId, SymbolId](s.alloc, map.hash_u32, map.eq_u32);
+    rc.refused_names  = map.init[intern.StrId, SymbolId](s.alloc, map.hash_u32, map.eq_u32);
 
     rc.expr_choices       = nil;
     rc.expr_choices_count = 0;
@@ -563,6 +586,7 @@ fun dnit_context(rc: *ResolveContext) {
     map.dnit[ImportedKey, SymbolId](?rc.imported_cache);
     map.dnit[intern.StrId, SymbolId](?rc.vec_cache);
     map.dnit[intern.StrId, SymbolId](?rc.module_index);
+    map.dnit[intern.StrId, SymbolId](?rc.refused_names);
 }
 
 fun open_scope(rc: *ResolveContext, parent: ScopeId) res[ScopeId, fail.Fail] {
@@ -1120,6 +1144,87 @@ fun register_constant_tag(rc: *ResolveContext, name_span: token.Span, init_expr:
     ret comptime.bind(rc.ctx, name_id, comptime.const_elem_untyped(init_expr::u32));
 }
 
+# module_refusal reports the first module-scope `$error` reached through arms the gates
+# decide here, and says whether one was. a gate that cannot be decided yet leaves its
+# chain to collection and sema, which report it when it is decided.
+fun module_refusal(rc: *ResolveContext, start: u32, len: u32) res[bool, fail.Fail] {
+    var i: u32 = 0;
+    for (i < len) {
+        val d_opt: opt[*decl.Decl] = ast.get_decl(rc.a, rc.a.decl_ids[start + i]);
+        if (!sel d_opt.some) { ret res[bool, fail.Fail].err{fail.message("DeclId out of range")}; }
+        val d: *decl.Decl = d_opt.some;
+        if (d.kind == decl.DECL_KIND_COMPTIME_ATTR && d.data.comptime_attr.target != id.EXPR_NIL
+            && comptime.is_error_call(rc.a, rc.source, d.data.comptime_attr.target)) {
+            val er: err[fail.Fail] = report_error_directive(rc, d.data.comptime_attr.target, d.span);
+            if (sel er.err) { ret res[bool, fail.Fail].err{er.err}; }
+            ret res[bool, fail.Fail].ok{true};
+        }
+        if (d.kind == decl.DECL_KIND_COMPTIME_IF) {
+            val r: res[bool, fail.Fail] = comptime_if_refusal(rc, ?d.data.comptime_if);
+            if (sel r.err) { ret r; }
+            if (r.ok)      { ret r; }
+        }
+        i = i + 1;
+    }
+    ret res[bool, fail.Fail].ok{false};
+}
+
+fun comptime_if_refusal(rc: *ResolveContext, ci: *decl.DeclComptimeIf) res[bool, fail.Fail] {
+    var bi: u32 = 0;
+    for (bi < ci.branches_len) {
+        val br: *decl.ComptimeBranch                 = ?rc.a.comptime_branches[ci.branches_start + bi];
+        val vr: res[comptime.GateVerdict, fail.Fail] = comptime.evaluate_gate[ResolveContext](
+            rc.ctx, rc, rc.caps, rc.a, rc.source, br.cond, ?rc.s.interner, comptime.GATE_SCOPE_DECL, false, rc.terminal);
+        if (sel vr.err) { ret res[bool, fail.Fail].err{vr.err}; }
+        val outcome: comptime.GateOutcome = vr.ok.outcome;
+        if (outcome == comptime.GATE_ACTIVE)   { ret module_refusal(rc, br.body_start, br.body_len); }
+        if (outcome != comptime.GATE_INACTIVE) { ret res[bool, fail.Fail].ok{false}; }
+        bi = bi + 1;
+    }
+    ret res[bool, fail.Fail].ok{false};
+}
+
+fun report_error_directive(rc: *ResolveContext, target: id.ExprId, span: token.Span) err[fail.Fail] {
+    val msg_r: res[str, comptime.EvalFail] = comptime.error_message[ResolveContext](
+        rc.ctx, rc, rc.caps, rc.a, rc.source, target, ?rc.s.interner);
+    if (sel msg_r.err) {
+        val f: comptime.EvalFail = msg_r.err;
+        if (f.kind == comptime.EVAL_FAIL_INTERNAL) {
+            fail.internal(?rc.status, f.message);
+            ret err[fail.Fail].err{fail.message(f.message)};
+        }
+        ret report(rc, span, f.message);
+    }
+    ret report(rc, span, msg_r.ok);
+}
+
+fun note_refused_name(rc: *ResolveContext, span: token.Span) err[fail.Fail] {
+    fail.reject(?rc.status);
+    val r: res[intern.StrId, A.Error] = intern.intern_span(?rc.s.interner, rc.source, span);
+    if (sel r.err) {
+        fail.internal(?rc.status, alloc.text(r.err));
+        ret err[fail.Fail].err{fail.refused(r.err)};
+    }
+    val ins: res[bool, A.Error] = map.insert[intern.StrId, SymbolId](?rc.refused_names, r.ok, SYMBOL_REJECTED);
+    if (sel ins.err) {
+        fail.internal(?rc.status, alloc.text(ins.err));
+        ret err[fail.Fail].err{fail.refused(ins.err)};
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# report_unresolved names a missing identifier or type, unless a refusal already accounts for it
+fun report_unresolved(rc: *ResolveContext, span: token.Span, prefix: str, name: intern.StrId, suggest: bool) {
+    var key:   intern.StrId   = name;
+    val known: opt[*SymbolId] = map.get[intern.StrId, SymbolId](?rc.refused_names, ?key);
+    if (sel known.some) {
+        fail.reject(?rc.status);
+        ret;
+    }
+    val re: err[fail.Fail] = report_named(rc, span, prefix, name, "`");
+    if (suggest && sel re.ok) { attach_suggestion(rc, span, name); }
+}
+
 fun collect_comptime_if(rc: *ResolveContext, ci: *decl.DeclComptimeIf, scope: ScopeId, at_module_scope: bool, at_decl_scope: bool) err[fail.Fail] {
     if (at_decl_scope && comptime.comptime_if_declares_nothing(rc.a, ci.branches_start, ci.branches_len)) {
         ret err[fail.Fail].ok{};
@@ -1251,15 +1356,16 @@ fun collect_use(rc: *ResolveContext, decl_id: id.DeclId, du: *decl.DeclUse, scop
     }
     val leaf_id: intern.StrId = r_leaf.ok;
 
-    val ps: *PublicSymbol = find_export(pmx, leaf_id);
-    if (ps == nil) {
-        report_named2(rc, du.path, "`", leaf_id, "` is not exported by `", pmx.path, "`");
-        ret err[fail.Fail].ok{};
-    }
-
     var bind_span: token.Span = du.alias;
     if (bind_span.len == 0) {
         bind_span = leaf;
+    }
+
+    val ps: *PublicSymbol = find_export(pmx, leaf_id);
+    if (ps == nil && pmx.refused) { ret note_refused_name(rc, bind_span); }
+    if (ps == nil) {
+        report_named2(rc, du.path, "`", leaf_id, "` is not exported by `", pmx.path, "`");
+        ret err[fail.Fail].ok{};
     }
     ret bind_imported_symbol(rc, decl_id, bind_span, ps, scope);
 }
@@ -1386,6 +1492,10 @@ fun bind_member_qualified(rc: *ResolveContext, eid: id.ExprId, member: *expr.Exp
     val leaf_id: intern.StrId = r_leaf.ok;
 
     val ps: *PublicSymbol = find_export(mx, leaf_id);
+    if (ps == nil && mx.refused) {
+        fail.reject(?rc.status);
+        ret err[fail.Fail].ok{};
+    }
     if (ps == nil) {
         report_named2(rc, member.name, "no symbol `", leaf_id, "` exported by `", mx.path, "`");
         ret err[fail.Fail].ok{};
@@ -1560,15 +1670,16 @@ fun collect_fwd(rc: *ResolveContext, decl_id: id.DeclId, df: *decl.DeclFwd, flag
     }
     val leaf_id: intern.StrId = r_leaf.ok;
 
-    val ps: *PublicSymbol = find_export(pmx, leaf_id);
-    if (ps == nil) {
-        record_report(rc, df.path, "re-exported symbol is not exported by its module");
-        ret err[fail.Fail].ok{};
-    }
-
     var bind_span: token.Span = df.alias;
     if (bind_span.len == 0) {
         bind_span = leaf;
+    }
+
+    val ps: *PublicSymbol = find_export(pmx, leaf_id);
+    if (ps == nil && pmx.refused) { ret note_refused_name(rc, bind_span); }
+    if (ps == nil) {
+        record_report(rc, df.path, "re-exported symbol is not exported by its module");
+        ret err[fail.Fail].ok{};
     }
 
     val r_name: res[intern.StrId, A.Error] = intern.intern_span(?rc.s.interner, rc.source, bind_span);
@@ -2279,8 +2390,7 @@ fun bind_ident(rc: *ResolveContext, eid: id.ExprId, span: token.Span) err[fail.F
     val sid:  SymbolId     = scope_lookup_chain(rc, rc.current_scope, name);
     if (sid == SYMBOL_NIL) {
         if (rc.expr_resolved != nil) { rc.expr_resolved[eid] = SYMBOL_REJECTED; }
-        val re: err[fail.Fail] = report_named(rc, span, "unresolved identifier `", name, "`");
-        if (sel re.ok) { attach_suggestion(rc, span, name); }
+        report_unresolved(rc, span, "unresolved identifier `", name, true);
     }
     or {
         if (rc.expr_resolved != nil) { rc.expr_resolved[eid] = sid; }
@@ -2542,8 +2652,7 @@ fun bind_type_name_expr(rc: *ResolveContext, eid: id.ExprId) err[fail.Fail] {
         if (sid == SYMBOL_NIL) { sid = scope_lookup_chain(rc, rc.current_scope, name); }
         if (sid == SYMBOL_NIL) {
             if (rc.expr_resolved != nil) { rc.expr_resolved[eid] = SYMBOL_REJECTED; }
-            val re: err[fail.Fail] = report_named(rc, e.span, "unresolved type name `", name, "`");
-            if (sel re.ok) { attach_suggestion(rc, e.span, name); }
+            report_unresolved(rc, e.span, "unresolved type name `", name, true);
         }
         or {
             if (rc.expr_resolved != nil) { rc.expr_resolved[eid] = sid; }
@@ -2814,13 +2923,7 @@ fun resolve_type_path(rc: *ResolveContext, named: *atype.TypeNamed, full: token.
         }
 
         if (current_sym == SYMBOL_NIL) {
-            if (seg_span.offset == path.offset && cursor >= end) {
-                val re: err[fail.Fail] = report_named(rc, full, "unresolved type name `", seg_name, "`");
-                if (sel re.ok) { attach_suggestion(rc, full, seg_name); }
-            }
-            or {
-                report_named(rc, full, "unresolved type name `", seg_name, "`");
-            }
+            report_unresolved(rc, full, "unresolved type name `", seg_name, seg_span.offset == path.offset && cursor >= end);
             ret SYMBOL_NIL;
         }
 
