@@ -57,8 +57,17 @@ values**, so the result is identical in either operand order:
 - **integer vs float** — a compile error; cast one operand explicitly with
   `::`. An implicit widening would hide `f64` rounding above `2^53`.
 
-A pointer-like value — a pointer or a function — may be compared against `nil`
-(the null-address literal). On the seeded vector types, a comparison produces a
+- **pointer vs pointer** — every one of the six operators accepts two
+  pointer-like operands (a pointer, a `ptr`, a function, or `nil`), whatever
+  their pointee types and whatever their pointees' secrecy. Addresses order as
+  unsigned values of pointer width, and the result is a public `u8` even when
+  both pointees are secret: ordering reveals no more than the `==` beside it,
+  and no address comes back out of it. See
+  [secrecy.md](secrecy.md#comparing-and-ordering-addresses).
+- **pointer vs integer** — a compile error. Ordering relates two addresses; it
+  is not a route from an address to an integer.
+
+On the seeded vector types, a comparison produces a
 same-shape unsigned **mask** vector (lane-wise) — see [SIMD vectors](#simd-vectors).
 
 `==` / `!=` on an **aggregate value** (a `rec`, `uni`, or whole `tag`) is a compile error.
@@ -240,8 +249,19 @@ val n: i32x4 = i32x4{4, 3, 2, 1};
 val z: i32x4 = (m & n) ^ n;    # lane-wise bitwise on integer lanes
 ```
 
+## An operand typed by a type parameter
+
+Inside a generic, an operand whose type is a parameter has no operand class yet:
+`T` is not an integer, not a float and not a pointer, and asking would be asking
+about a placeholder. Every operator on such an operand is decided at the
+instantiation instead, against that instance's concrete type, and the table above
+is what it is checked against there. A type that does not support the operator is
+refused at the instantiation that asked for it. See
+[fun.md](fun.md).
+
 ## See also
 
 - [expressions.md](expressions.md) — how operators compose into expressions
+- [fun.md](fun.md) — an operator on a generic type parameter
 - [types.md](types.md) — which types support which operators
 - [secrecy.md](secrecy.md) — the `^` secret qualifier and the `:>T` strip cast
