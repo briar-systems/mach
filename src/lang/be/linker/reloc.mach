@@ -1,0 +1,1248 @@
+use std.allocator.page;
+use std.collections.map;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_contains;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+use std.format;
+
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.session;
+use src: mach.lang.source;
+use mach.lang.target;
+use mach.lang.target.isa;
+use mach.lang.target.of;
+use mach.lang.target.of.ar;
+use mach.lang.target.of.bin;
+use rel:            mach.lang.target.of.reloc;
+use target_testing: mach.lang.target.testing;
+
+use mach.lang.be.linker.atoms.AtomPlan;
+use mach.lang.be.linker.atoms.atom_live_offset;
+use mach.lang.be.linker.atoms.atom_offset_dead;
+use mach.lang.be.linker.atoms.definition_ref_is_dead;
+use mach.lang.be.linker.atoms.lt_isa;
+use mach.lang.be.linker.atoms.reloc_source_live;
+use mach.lang.be.linker.atoms.symbol_is_defined;
+use mach.lang.be.linker.common.atom_reloc_traits;
+use mach.lang.be.linker.common.is_function_branch_kind;
+use mach.lang.be.linker.common.is_loadable_kind;
+use mach.lang.be.linker.common.join2;
+use mach.lang.be.linker.common.join3;
+use mach.lang.be.linker.common.lt_image;
+use mach.lang.be.linker.common.lt_name;
+use mach.lang.be.linker.common.oor_section_message;
+use mach.lang.be.linker.debug.StrMerge;
+use mach.lang.be.linker.debug.build_str_merge;
+use mach.lang.be.linker.debug.debug_str_source_offset;
+use mach.lang.be.linker.debug.free_str_merge;
+use mach.lang.be.linker.debug.module_debug_is_linkable;
+use mach.lang.be.linker.dynamic.DynState;
+use mach.lang.be.linker.dynamic.ImportName;
+use mach.lang.be.linker.dynamic.canonical_import_name;
+use mach.lang.be.linker.dynamic.dynstate_add_base_reloc;
+use mach.lang.be.linker.dynamic.dynstate_add_fixup;
+use mach.lang.be.linker.dynamic.dynstate_add_import_addr_fixup;
+use mach.lang.be.linker.dynamic.dynstate_import_index;
+use mach.lang.be.linker.dynamic.dynstate_import_is_func;
+use mach.lang.be.linker.dynamic.pinned_attribution_message;
+use mach.lang.be.linker.merge.MergedSection;
+use mach.lang.be.linker.merge.Placement;
+use mach.lang.be.linker.merge.SectionGroups;
+use mach.lang.be.linker.merge.align_up_u64_checked;
+use mach.lang.be.linker.merge.final_section_location_for;
+use mach.lang.be.linker.merge.init_section_groups;
+use mach.lang.be.linker.merge.intern_or_nil;
+use mach.lang.be.linker.merge.section_group_add;
+use mach.lang.be.linker.merge.segment_index_for;
+use mach.lang.be.linker.resolve.SymbolLoc;
+use mach.lang.be.linker.resolve.collect_symbols;
+use mach.lang.be.linker.resolve.resolved_symbol_name;
+
+pub val DWARF_TOMBSTONE_ADDRESS: u64 = 0xFFFFFFFFFFFFFFFF;
+
+rec LocalGotSlot {
+    module:      u32;
+    symbol:      u32;
+    name:        intern.StrId;
+    offset:      u32;
+    vaddr:       u64;
+    local:       bool;
+    initialized: bool;
+}
+
+pub rec LocalGotPlan {
+    slots: *LocalGotSlot;
+    count: u32;
+    cap:   u32;
+}
+
+fun debug_str_content_eq(src: *u8, src_len: u32, src_off: u32,
+    ded: *u8, ded_len: u32, ded_off: u32) bool {
+    var i: u32 = 0;
+    for (true) {
+        if (src_off::u64 + i::u64 >= src_len::u64) { ret false; }
+        if (ded_off::u64 + i::u64 >= ded_len::u64) { ret false; }
+        val sc: u8 = src[(src_off + i)::usize];
+        val dc: u8 = ded[(ded_off + i)::usize];
+        if (sc != dc) { ret false; }
+        if (sc == 0)  { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+pub fun patch_relocations(s: *session.Session, out_img: *of.ObjectImage,
+    modules: *of.ObjectImage, module_count: u32, codegen_count: u32,
+    placements: *Placement, sec_base: *u32, merged_to_out: *u32,
+    sym_locs: *map.Map[intern.StrId, SymbolLoc],
+    dyn: *DynState, local_got: *LocalGotPlan,
+    strm: *StrMerge, format: *of.OfVTable,
+    arch: *isa.IsaVTable,
+    image_base: u64, atoms: *AtomPlan) err[fail.Fail] {
+    var m: u32 = 0;
+    for (m < module_count) {
+        val pr: err[fail.Fail] = patch_module_relocations(s, out_img, modules, m,
+            placements, sec_base, merged_to_out, sym_locs, dyn, local_got, strm,
+            format, arch, image_base, m < codegen_count, atoms);
+        if (sel pr.err) { ret pr; }
+
+        m = m + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun difference_subtrahend_vaddr(s: *session.Session, modules: *of.ObjectImage, m: u32,
+    sym2: u32, placements: *Placement, sec_base: *u32,
+    merged_to_out: *u32, out_img: *of.ObjectImage,
+    format: *of.OfVTable, image_base: u64, atoms: *AtomPlan,
+    sym_locs: *map.Map[intern.StrId, SymbolLoc]) res[u64, fail.Fail] {
+    if (sym2 >= modules[m].symbol_count) {
+        ret res[u64, fail.Fail].err{fail.message("link: a difference relocation names a subtrahend outside the module's symbol table")};
+    }
+    val sub:      *of.Symbol   = ?modules[m].symbols[sym2];
+    val sub_name: intern.StrId = sub.name;
+
+    if ((sub.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0 && !of.section_is_external(sub.section)) {
+        var t: rel.RelocTarget = rel.target(0, 0, 0);
+        if (!local_symbol_target(modules, m, sym2, placements, sec_base, merged_to_out,
+            out_img, format, image_base, atoms, ?t)) {
+            ret res[u64, fail.Fail].err{fail.message(undef_message(s, sub_name))};
+        }
+        ret res[u64, fail.Fail].ok{t.vaddr};
+    }
+
+    val rn: res[intern.StrId, fail.Fail] = resolved_symbol_name(sym_locs, sub_name);
+    if (sel rn.err) {
+        ret res[u64, fail.Fail].err{rn.err};
+    }
+    val resolved_name: intern.StrId    = rn.ok;
+    val sl:            opt[*SymbolLoc] = map.get[intern.StrId, SymbolLoc](sym_locs, ?resolved_name);
+    if (sel sl.none) {
+        ret res[u64, fail.Fail].err{fail.message(difference_import_message(s, sub_name))};
+    }
+    ret res[u64, fail.Fail].ok{sl.some.vaddr};
+}
+
+fun difference_relocation_addend(addend: i64, subtrahend: u64) res[i64, fail.Fail] {
+    val adjusted: res[i64, rel.RelocError] =
+        rel.subtract_u64_from_i64(addend, subtrahend);
+    if (sel adjusted.err) {
+        ret res[i64, fail.Fail].err{fail.message("link: difference relocation result is outside the signed 64-bit range")};
+    }
+    ret res[i64, fail.Fail].ok{adjusted.ok};
+}
+
+fun base_relocation_target(vaddr: u64, addend: i64) res[u64, fail.Fail] {
+    val adjusted: res[u64, rel.RelocError] = rel.add_signed_to_u64(vaddr, addend);
+    if (sel adjusted.err) {
+        ret res[u64, fail.Fail].err{fail.message("link: PIE base relocation target is outside the 64-bit address range")};
+    }
+    ret res[u64, fail.Fail].ok{adjusted.ok};
+}
+
+fun difference_import_message(s: *session.Session, name: intern.StrId) str {
+    val n:     opt[str] = intern.lookup(?s.interner, name);
+    var shown: str      = "<unknown>";
+    if (sel n.some) { shown = n.some; }
+    val r: res[str, format.FormatError] = format.sprint(s.alloc,
+        "link: a difference relocation subtracts `{}`, which this link does not define; the loader chooses its address, so the difference is not a link-time constant",
+        shown);
+    if (sel r.err) {
+        ret "link: a difference relocation subtracts a symbol this link does not define";
+    }
+    ret r.ok;
+}
+
+fun local_symbol_target(modules: *of.ObjectImage, m: u32, sy: u32,
+    placements: *Placement, sec_base: *u32, merged_to_out: *u32,
+    out_img: *of.ObjectImage, format: *of.OfVTable,
+    image_base: u64, atoms: *AtomPlan,
+    out: *rel.RelocTarget) bool {
+    val sym: *of.Symbol = ?modules[m].symbols[sy];
+    if (of.section_is_absolute(sym.section)) {
+        @out = rel.target(sym.absolute_value, 0, 0);
+        ret true;
+    }
+    val flat: u32 = sec_base[m] + of.section_index(sym.section);
+    if (atom_offset_dead(atoms, flat, sym.offset)) { ret false; }
+    val pl:      *Placement                   = ?placements[flat];
+    val out_ix:  u32                          = merged_to_out[pl.merged_index];
+    val section: of.ExecutableSectionLocation = final_section_location_for(
+        format, image_base, out_img, out_ix, pl.vaddr - pl.offset::u64);
+    @out = rel.target(pl.vaddr + atom_live_offset(atoms, flat, sym.offset)::u64,
+        section.vaddr, section.ordinal);
+    ret true;
+}
+
+# the module's first defined symbol per name, built once for a module with
+# debug sections so each debug relocation asks a map rather than a scan
+fun index_defined_symbols(alloc: *A.Allocator, modules: *of.ObjectImage, m: u32) res[map.Map[intern.StrId, u32], fail.Fail] {
+    var index: map.Map[intern.StrId, u32] = map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
+    var sy:    u32                        = 0;
+    for (sy < modules[m].symbol_count) {
+        val name: intern.StrId = modules[m].symbols[sy].name;
+        if (symbol_is_defined(modules, m, sy) && !map.contains[intern.StrId, u32](?index, ?name)) {
+            val inserted: res[bool, A.Error] = map.insert[intern.StrId, u32](?index, name, sy);
+            if (sel inserted.err) {
+                map.dnit[intern.StrId, u32](?index);
+                ret res[map.Map[intern.StrId, u32], fail.Fail].err{fail.refused(inserted.err)};
+            }
+        }
+        sy = sy + 1;
+    }
+    ret res[map.Map[intern.StrId, u32], fail.Fail].ok{index};
+}
+
+fun indexed_defined_symbol(index: *map.Map[intern.StrId, u32], name: intern.StrId) u32 {
+    var key:   intern.StrId = name;
+    val found: opt[*u32]    = map.get[intern.StrId, u32](index, ?key);
+    if (sel found.some) { ret @found.some; }
+    ret of.SYMBOL_NONE;
+}
+
+fun is_dwarf_code_address(r: *of.Relocation, info_sec: u32, line_sec: u32,
+    loclists_sec: u32, rnglists_sec: u32, pointer_width: u32) bool {
+    if (!of.is_pointer_abs_kind(r.kind, pointer_width)) { ret false; }
+    ret of.section_index(r.section) == info_sec || of.section_index(r.section) == line_sec
+        || of.section_index(r.section) == loclists_sec || of.section_index(r.section) == rnglists_sec;
+}
+
+fun dwarf_addend_survives_remap(modules: *of.ObjectImage, m: u32, sy: u32,
+    addend: i64, sec_base: *u32, atoms: *AtomPlan) bool {
+    if (addend == 0) { ret true; }
+    val sym: *of.Symbol = ?modules[m].symbols[sy];
+    if (of.section_is_external(sym.section) || of.section_index(sym.section) >= modules[m].section_count) {
+        ret true;
+    }
+    val eff: i64 = sym.offset::i64 + addend;
+    if (eff < 0 || eff > 0xFFFFFFFF) { ret false; }
+    val flat: u32 = sec_base[m] + of.section_index(sym.section);
+    val e:    u32 = eff::u32;
+    if (atom_offset_dead(atoms, flat, sym.offset) || atom_offset_dead(atoms, flat, e)) {
+        ret true;
+    }
+    val want: i64 = atom_live_offset(atoms, flat, sym.offset)::i64 + addend;
+    ret atom_live_offset(atoms, flat, e)::i64 == want;
+}
+
+fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
+    modules: *of.ObjectImage, m: u32,
+    placements: *Placement, sec_base: *u32, merged_to_out: *u32,
+    sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState,
+    local_got: *LocalGotPlan, strm: *StrMerge, format: *of.OfVTable,
+    arch: *isa.IsaVTable, image_base: u64, codegen_image: bool,
+    atoms: *AtomPlan) err[fail.Fail] {
+    var info_sec:     u32                        = 0xFFFFFFFF;
+    var line_sec:     u32                        = 0xFFFFFFFF;
+    var loclists_sec: u32                        = 0xFFFFFFFF;
+    var rnglists_sec: u32                        = 0xFFFFFFFF;
+    val info_name_r:  res[intern.StrId, A.Error] = intern.intern(?s.interner, ".debug_info");
+    if (sel info_name_r.err) {
+        ret err[fail.Fail].err{fail.refused(info_name_r.err)};
+    }
+    val line_name_r: res[intern.StrId, A.Error] = intern.intern(?s.interner, ".debug_line");
+    if (sel line_name_r.err) {
+        ret err[fail.Fail].err{fail.refused(line_name_r.err)};
+    }
+    val loclists_name_r: res[intern.StrId, A.Error] = intern.intern(?s.interner, ".debug_loclists");
+    if (sel loclists_name_r.err) {
+        ret err[fail.Fail].err{fail.refused(loclists_name_r.err)};
+    }
+    val rnglists_name_r: res[intern.StrId, A.Error] = intern.intern(?s.interner, ".debug_rnglists");
+    if (sel rnglists_name_r.err) {
+        ret err[fail.Fail].err{fail.refused(rnglists_name_r.err)};
+    }
+    val info_name:     intern.StrId = info_name_r.ok;
+    val line_name:     intern.StrId = line_name_r.ok;
+    val loclists_name: intern.StrId = loclists_name_r.ok;
+    val rnglists_name: intern.StrId = rnglists_name_r.ok;
+    var scx:           u32          = 0;
+    for (scx < modules[m].section_count) {
+        if (modules[m].sections[scx].kind == of.SK_DEBUG) {
+            if (modules[m].sections[scx].name == info_name)     { info_sec = scx; }
+            or (modules[m].sections[scx].name == line_name)     { line_sec = scx; }
+            or (modules[m].sections[scx].name == loclists_name) { loclists_sec = scx; }
+            or (modules[m].sections[scx].name == rnglists_name) { rnglists_sec = scx; }
+        }
+        scx = scx + 1;
+    }
+
+    val debug_linkable:  bool                       = module_debug_is_linkable(modules, m);
+    var defined_by_name: map.Map[intern.StrId, u32] = map.init[intern.StrId, u32](s.alloc, map.hash_u32, map.eq_u32);
+    fin { map.dnit[intern.StrId, u32](?defined_by_name); }
+    if (debug_linkable && (info_sec != 0xFFFFFFFF || line_sec != 0xFFFFFFFF
+        || loclists_sec != 0xFFFFFFFF || rnglists_sec != 0xFFFFFFFF)) {
+        val indexed: res[map.Map[intern.StrId, u32], fail.Fail] = index_defined_symbols(s.alloc, modules, m);
+        if (sel indexed.err) { ret err[fail.Fail].err{indexed.err}; }
+        defined_by_name = indexed.ok;
+    }
+
+    var ri: u32 = 0;
+    for (ri < modules[m].reloc_count) {
+        val r: *of.Relocation = ?modules[m].relocations[ri];
+        if (arch == nil || arch.reloc == nil || arch.reloc.traits == nil
+            || arch.reloc.apply == nil) {
+            ret err[fail.Fail].err{fail.message(unsupported_message(s, arch, r.kind))};
+        }
+        if (!debug_linkable && of.section_index(r.section) < modules[m].section_count
+            && modules[m].sections[of.section_index(r.section)].kind == of.SK_DEBUG) {
+            ri = ri + 1;
+            cnt;
+        }
+        if (of.section_index(r.section) >= modules[m].section_count) {
+            ret err[fail.Fail].err{fail.message("linker: relocation names an out-of-range section")};
+        }
+        val place_traits: res[rel.RelocTraits, rel.RelocError] = atom_reloc_traits(
+            r, ?modules[m].sections[of.section_index(r.section)], arch, codegen_image);
+        if (sel place_traits.err) {
+            ret err[fail.Fail].err{fail.message(unsupported_message(s, arch, r.kind))};
+        }
+        if (r.offset::u64
+            + place_traits.ok.field_width::u64
+            > modules[m].sections[of.section_index(r.section)].len::u64) {
+            ret err[fail.Fail].err{fail.message("linker: relocation offset is past the end of its section")};
+        }
+
+        val flat: u32 = sec_base[m] + of.section_index(r.section);
+        if (atom_offset_dead(atoms, flat, r.offset)) {
+            ri = ri + 1;
+            cnt;
+        }
+        val pl:       *Placement = ?placements[flat];
+        val live_off: u32        = atom_live_offset(atoms, flat, r.offset);
+        val patch_va: u64        = pl.vaddr + live_off::u64;
+        val out_ix:   u32        = merged_to_out[pl.merged_index];
+        if (out_ix == 0xFFFFFFFF) {
+            ret err[fail.Fail].err{fail.message("linker: relocation targets a section with no merged output")};
+        }
+        val dst: *u8 = out_img.sections[out_ix].bytes;
+        if (dst == nil) {
+            ret err[fail.Fail].err{fail.message("linker: relocation patch site lands in a BSS section")};
+        }
+        val patch_off: u32 = pl.offset + live_off;
+
+        val operand_r: res[of.RelocOperand, fail.Fail] =
+            rel.resolve_operand(arch, ?modules[m], ri);
+        if (sel operand_r.err) {
+            ret err[fail.Fail].err{operand_r.err};
+        }
+        val operand:       of.RelocOperand = operand_r.ok;
+        val target_sym:    u32             = operand.sym;
+        val target_addend: i64             = operand.addend;
+
+        if (target_sym >= modules[m].symbol_count) {
+            ret err[fail.Fail].err{fail.message("linker: relocation references a symbol outside its module's symbol table")};
+        }
+        val target:      *of.Symbol   = ?modules[m].symbols[target_sym];
+        val target_name: intern.StrId = target.name;
+        if (!of.section_is_external(target.section) && !of.section_is_absolute(target.section)
+            && of.section_index(target.section) >= modules[m].section_count) {
+            ret err[fail.Fail].err{fail.message(oor_section_message(s, target_name, modules[m].name))};
+        }
+
+        if (strm.active && of.section_index(target.section) < modules[m].section_count
+            && modules[m].sections[of.section_index(target.section)].kind == of.SK_DEBUG
+            && modules[m].sections[of.section_index(target.section)].name == strm.name) {
+            val sp: err[fail.Fail] = resolve_strp(s, modules, m, of.section_index(target.section), target, r, strm,
+                dst, patch_off, out_img.sections[out_ix].len, patch_va, arch, image_base);
+            if (sel sp.err) { ret sp; }
+            ri = ri + 1;
+            cnt;
+        }
+
+        var resolved:          rel.RelocTarget = rel.target(0, 0, 0);
+        var resolved_absolute: bool            = of.section_is_absolute(target.section);
+        var apply_addend:      i64             = target_addend;
+
+        if (is_dwarf_code_address(r, info_sec, line_sec, loclists_sec, rnglists_sec, arch.pointer_width)) {
+            var own: u32 = target_sym;
+            if (!symbol_is_defined(modules, m, target_sym)) { own = indexed_defined_symbol(?defined_by_name, target_name); }
+            if (definition_ref_is_dead(modules, m, own, target_addend, sec_base, atoms)) {
+                val tr: err[fail.Fail] = apply_one(s, r.kind, dst, patch_off, out_img.sections[out_ix].len,
+                    rel.target(DWARF_TOMBSTONE_ADDRESS, 0, 0), 0, patch_va, target_name, arch, image_base);
+                if (sel tr.err) { ret tr; }
+                ri = ri + 1;
+                cnt;
+            }
+            if (!dwarf_addend_survives_remap(modules, m, target_sym, target_addend, sec_base, atoms)) {
+                ret err[fail.Fail].err{fail.message(dwarf_addend_message(s, modules, m, target_name, r))};
+            }
+        }
+
+        if ((target.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0
+            && !of.section_is_external(target.section)) {
+            if (!local_symbol_target(modules, m, target_sym, placements, sec_base,
+                merged_to_out, out_img, format, image_base,
+                atoms, ?resolved)) {
+                ret err[fail.Fail].err{fail.message(undef_message(s, target_name))};
+            }
+        }
+        or {
+            val rn: res[intern.StrId, fail.Fail] =
+                resolved_symbol_name(sym_locs, target_name);
+            if (sel rn.err) {
+                ret err[fail.Fail].err{rn.err};
+            }
+            val resolved_name: intern.StrId    = rn.ok;
+            val sl:            opt[*SymbolLoc] =
+                map.get[intern.StrId, SymbolLoc](sym_locs, ?resolved_name);
+            if (sel sl.some) {
+                val loc: *SymbolLoc = sl.some;
+                resolved          = rel.target(loc.vaddr, 0, 0);
+                resolved_absolute = loc.merged_index == of.SECTION_ABSOLUTE;
+                if (loc.merged_index != of.SECTION_ABSOLUTE) {
+                    val target_out_ix: u32                          = merged_to_out[loc.merged_index];
+                    val section:       of.ExecutableSectionLocation = final_section_location_for(
+                        format, image_base, out_img, target_out_ix, loc.section_vaddr);
+                    resolved = rel.target(loc.vaddr, section.vaddr, section.ordinal);
+                }
+            }
+            if (sel sl.none) {
+                val cn_r: res[ImportName, fail.Fail] =
+                    canonical_import_name(s, format.import_address_prefix, resolved_name);
+                if (sel cn_r.err) {
+                    ret err[fail.Fail].err{cn_r.err};
+                }
+                val cn:  ImportName          = cn_r.ok;
+                val imp: res[u32, fail.Fail] = dynstate_import_index(dyn, resolved_name);
+                if (sel imp.ok) {
+                    val import_index: u32 = imp.ok;
+                    if (cn.indirect && r.kind == of.RK_PC32) {
+                        val rec_i: err[fail.Fail] = dynstate_add_import_addr_fixup(
+                            s, dyn, segment_index_for(out_img, out_ix), patch_off,
+                            import_index, patch_va, r.kind, target_addend);
+                        if (sel rec_i.err) {
+                            ret rec_i;
+                        }
+                        ri = ri + 1;
+                        cnt;
+                    }
+                    if (is_function_branch_kind(r.kind)
+                        && dynstate_import_is_func(dyn, import_index)) {
+                        val rec_r: err[fail.Fail] = dynstate_add_fixup(s, dyn,
+                            segment_index_for(out_img, out_ix), patch_off,
+                            import_index, patch_va, target_addend);
+                        if (sel rec_r.err) { ret rec_r; }
+                        ri = ri + 1;
+                        cnt;
+                    }
+                    if (is_got_kind(operand.target_kind)) {
+                        val rec_g: err[fail.Fail] = dynstate_add_import_addr_fixup(s, dyn,
+                            segment_index_for(out_img, out_ix), patch_off,
+                            import_index, patch_va, r.kind, target_addend);
+                        if (sel rec_g.err) { ret rec_g; }
+                        ri = ri + 1;
+                        cnt;
+                    }
+                    if (of.is_pointer_abs_kind(r.kind, arch.pointer_width)
+                        && format.id == of.OF_MACHO) {
+                        val rec_b: err[fail.Fail] = dynstate_add_import_addr_fixup(s, dyn,
+                            segment_index_for(out_img, out_ix), patch_off,
+                            import_index, patch_va, r.kind, target_addend);
+                        if (sel rec_b.err) { ret rec_b; }
+                        ri = ri + 1;
+                        cnt;
+                    }
+                }
+                ret err[fail.Fail].err{fail.message(undef_message(s, resolved_name))};
+            }
+        }
+
+        if (is_got_kind(operand.target_kind)) {
+            if (!isa.local_got_kind(arch, operand.target_kind)) {
+                ret err[fail.Fail].err{fail.message("linker: target does not support defined GOT references")};
+            }
+            val local: bool = !of.section_is_external(target.section)
+                && (target.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0;
+            var effective: intern.StrId = target_name;
+            if (!local) {
+                val er: res[intern.StrId, fail.Fail] =
+                    resolved_symbol_name(sym_locs, target_name);
+                if (sel er.err) {
+                    ret err[fail.Fail].err{er.err};
+                }
+                effective = er.ok;
+            }
+            val slot_i: u32 = local_got_slot_index(
+                local_got, m, target_sym, effective, local);
+            if (slot_i == 0xFFFFFFFF) {
+                ret err[fail.Fail].err{fail.message("linker: defined GOT target has no synthesized slot")};
+            }
+            val got_out: u32 = merged_to_out[of.SK_RELRO::u32];
+            if (got_out == 0xFFFFFFFF || got_out >= out_img.section_count
+                || out_img.sections[got_out].bytes == nil) {
+                ret err[fail.Fail].err{fail.message("linker: synthesized GOT has no RELRO output section")};
+            }
+            val slot: *LocalGotSlot = ?local_got.slots[slot_i];
+            if (slot.offset::u64 + arch.pointer_width::u64 > out_img.sections[got_out].len::u64) {
+                ret err[fail.Fail].err{fail.message("linker: synthesized GOT slot is outside RELRO")};
+            }
+            if (!slot.initialized) {
+                if (arch.pointer_width == 4) {
+                    if (resolved.vaddr > 0xFFFFFFFF) {
+                        ret err[fail.Fail].err{fail.message("linker: GOT target exceeds the pointer width")};
+                    }
+                    bin.write_u32_le(out_img.sections[got_out].bytes, slot.offset::usize, resolved.vaddr::u32);
+                }
+                or {
+                    bin.write_u64_le(out_img.sections[got_out].bytes, slot.offset::usize, resolved.vaddr);
+                }
+                if (dyn.info.pie && !resolved_absolute) {
+                    val br: err[fail.Fail] = dynstate_add_base_reloc(
+                        s, dyn, segment_index_for(out_img, got_out),
+                        slot.offset, resolved.vaddr);
+                    if (sel br.err) {
+                        ret br;
+                    }
+                }
+                slot.initialized = true;
+            }
+            val got_section: of.ExecutableSectionLocation = final_section_location_for(
+                format, image_base, out_img, got_out, slot.vaddr - slot.offset::u64);
+            val gr: err[fail.Fail] = apply_one(
+                s, r.kind, dst, patch_off, out_img.sections[out_ix].len,
+                rel.target(slot.vaddr, got_section.vaddr, got_section.ordinal),
+                target_addend, patch_va, target_name, arch, image_base);
+            if (sel gr.err) {
+                ret gr;
+            }
+            ri = ri + 1;
+            cnt;
+        }
+
+        if (dyn.info.pie && resolved_absolute && is_loadable_kind(out_img.sections[out_ix].kind)
+            && (r.kind == of.RK_PC32 || r.kind == of.RK_PLT32 || r.kind == of.RK_PAGE21
+            || r.kind == of.RK_PCREL_HI20 || r.kind == of.RK_PCREL_LO12_I || r.kind == of.RK_PCREL_LO12_S
+            || r.kind == of.RK_JUMP26 || r.kind == of.RK_ADDR32NB)) {
+            ret err[fail.Fail].err{fail.message("link: position-independent relocation to an absolute definition requires unsupported runtime adjustment")};
+        }
+        var apply_kind: of.RelocKind = r.kind;
+        if (of.is_difference(r.kind)) {
+            val sv: res[u64, fail.Fail] = difference_subtrahend_vaddr(
+                s, modules, m, r.sym2, placements, sec_base, merged_to_out, out_img,
+                format, image_base, atoms, sym_locs);
+            if (sel sv.err) { ret err[fail.Fail].err{sv.err}; }
+            if (dyn.info.pie && is_loadable_kind(out_img.sections[out_ix].kind)) {
+                val sub:          *of.Symbol = ?modules[m].symbols[r.sym2];
+                var sub_absolute: bool       = of.section_is_absolute(sub.section);
+                if ((sub.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0 || of.section_is_external(sub.section)) {
+                    val named: res[intern.StrId, fail.Fail] = resolved_symbol_name(sym_locs, sub.name);
+                    if (sel named.err) { ret err[fail.Fail].err{named.err}; }
+                    val name:    intern.StrId    = named.ok;
+                    val located: opt[*SymbolLoc] = map.get[intern.StrId, SymbolLoc](sym_locs, ?name);
+                    if (sel located.none) { ret err[fail.Fail].err{fail.message(undef_message(s, name))}; }
+                    sub_absolute = located.some.merged_index == of.SECTION_ABSOLUTE;
+                }
+                if (resolved_absolute != sub_absolute) {
+                    ret err[fail.Fail].err{fail.message("link: position-independent difference mixes absolute and image-relative definitions")};
+                }
+            }
+            val adjusted: res[i64, fail.Fail] = difference_relocation_addend(
+                apply_addend, sv.ok);
+            if (sel adjusted.err) {
+                ret err[fail.Fail].err{adjusted.err};
+            }
+            apply_addend = adjusted.ok;
+            val applied: opt[of.RelocKind] = of.difference_apply_kind(r.kind);
+            if (sel applied.none) {
+                ret err[fail.Fail].err{fail.message(of.reloc_kind_rejection(?s.interner, s.alloc, r.kind, ""))};
+            }
+            apply_kind = applied.some;
+        }
+
+        val pr: err[fail.Fail] =
+            apply_one(s, apply_kind, dst, patch_off, out_img.sections[out_ix].len, resolved,
+            apply_addend, patch_va, target_name, arch, image_base);
+        if (sel pr.err) {
+            ret pr;
+        }
+
+        if (dyn.info.pie && !resolved_absolute && of.is_pointer_abs_kind(r.kind, arch.pointer_width)
+            && is_loadable_kind(out_img.sections[out_ix].kind)) {
+            val base_target: res[u64, fail.Fail] =
+                base_relocation_target(resolved.vaddr, target_addend);
+            if (sel base_target.err) {
+                ret err[fail.Fail].err{base_target.err};
+            }
+            val brr: err[fail.Fail] = dynstate_add_base_reloc(s, dyn,
+                segment_index_for(out_img, out_ix), patch_off,
+                base_target.ok);
+            if (sel brr.err) { ret brr; }
+        }
+
+        ri = ri + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun resolve_strp(s: *session.Session, modules: *of.ObjectImage, m: u32, str_sec: u32,
+    target: *of.Symbol, r: *of.Relocation, strm: *StrMerge,
+    dst: *u8, patch_off: u32, sec_len: u32,
+    patch_va: u64, arch: *isa.IsaVTable, image_base: u64) err[fail.Fail] {
+    val ssec: *of.Section = ?modules[m].sections[str_sec];
+    if (ssec.bytes == nil) {
+        ret err[fail.Fail].err{fail.message("linker: .debug_str strp target has no bytes")};
+    }
+    val source_offset_r: res[u32, fail.Fail] =
+        debug_str_source_offset(target.offset, r.addend, ssec.len);
+    if (sel source_offset_r.err) {
+        ret err[fail.Fail].err{source_offset_r.err};
+    }
+    val src_off:    u32 = source_offset_r.ok;
+    var terminator: u32 = src_off;
+    for (terminator < ssec.len && ssec.bytes[terminator] != 0) {
+        terminator = terminator + 1;
+    }
+    if (terminator >= ssec.len) {
+        ret err[fail.Fail].err{fail.message("linker: malformed .debug_str strp target is unterminated")};
+    }
+
+    val sid_r: res[intern.StrId, A.Error] = intern.intern(?s.interner, (?ssec.bytes[src_off])::str);
+    if (sel sid_r.err) { ret err[fail.Fail].err{fail.refused(sid_r.err)}; }
+    val sid: intern.StrId = sid_r.ok;
+
+    val og: opt[*u32] = map.get[intern.StrId, u32](?strm.offs, ?sid);
+    if (sel og.none) {
+        ret err[fail.Fail].err{fail.message("linker: .debug_str strp target absent from the deduped table")};
+    }
+    val ded_off: u32 = @og.some;
+
+    if (!debug_str_content_eq(ssec.bytes, ssec.len, src_off, strm.buf.data, strm.buf.len::u32, ded_off)) {
+        ret err[fail.Fail].err{fail.message("linker: .debug_str dedup remapped a strp to divergent content")};
+    }
+
+    ret apply_one(s, r.kind, dst, patch_off, sec_len, rel.target(ded_off::u64, 0, 0), 0, patch_va,
+        target.name, arch, image_base);
+}
+
+fun is_got_kind(kind: of.RelocKind) bool {
+    ret kind == of.RK_GOT_PAGE21 || kind == of.RK_GOT_LO12 || kind == of.RK_GOT_PCREL_HI20
+        || kind == of.RK_GOTPCREL || kind == of.RK_GOTPCREL_NORELAX
+        || kind == of.RK_GOTPCREL64_NORELAX;
+}
+
+pub fun init_local_got_plan(plan: *LocalGotPlan) {
+    plan.slots = nil;
+    plan.count = 0;
+    plan.cap   = 0;
+}
+
+pub fun free_local_got_plan(alloc: *A.Allocator, plan: *LocalGotPlan) {
+    if (plan.slots != nil && plan.cap > 0) {
+        A.deallocate[LocalGotSlot](alloc, plan.slots, plan.cap::usize);
+    }
+    init_local_got_plan(plan);
+}
+
+fun local_got_slot_index(plan: *LocalGotPlan, module: u32, symbol: u32,
+    name: intern.StrId, local: bool) u32 {
+    var i: u32 = 0;
+    for (i < plan.count) {
+        if (plan.slots[i].local == local) {
+            if (local && plan.slots[i].module == module && plan.slots[i].symbol == symbol) { ret i; }
+            if (!local && plan.slots[i].name == name)                                      { ret i; }
+        }
+        i = i + 1;
+    }
+    ret 0xFFFFFFFF;
+}
+
+fun local_got_add(s: *session.Session, plan: *LocalGotPlan,
+    module: u32, symbol: u32, name: intern.StrId,
+    local: bool) err[fail.Fail] {
+    if (local_got_slot_index(plan, module, symbol, name, local) != 0xFFFFFFFF) {
+        ret err[fail.Fail].ok{};
+    }
+    if (plan.count == plan.cap) {
+        if (plan.cap > 0x7FFFFFFF) {
+            ret err[fail.Fail].err{fail.message("linker: synthesized GOT slot count overflow")};
+        }
+        var next: u32 = plan.cap * 2;
+        if (next == 0) { next = 8; }
+        val gr: res[*LocalGotSlot, A.Error] = A.reallocate[LocalGotSlot](
+            s.alloc, plan.slots, plan.cap::usize, next::usize);
+        if (sel gr.err) {
+            ret err[fail.Fail].err{fail.refused(gr.err)};
+        }
+        plan.slots = gr.ok;
+        plan.cap   = next;
+    }
+    val i: u32 = plan.count;
+    plan.slots[i].module      = module;
+    plan.slots[i].symbol      = symbol;
+    plan.slots[i].name        = name;
+    plan.slots[i].offset      = 0;
+    plan.slots[i].vaddr       = 0;
+    plan.slots[i].local       = local;
+    plan.slots[i].initialized = false;
+    plan.count                = i + 1;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun build_local_got_plan(s: *session.Session, arch: *isa.IsaVTable,
+    modules: *of.ObjectImage,
+    module_count: u32, sym_locs: *map.Map[intern.StrId, SymbolLoc],
+    sec_base: *u32, atoms: *AtomPlan,
+    merged: *MergedSection, groups: *SectionGroups,
+    plan: *LocalGotPlan) err[fail.Fail] {
+    if (!isa.declares_local_got(arch)) { ret err[fail.Fail].ok{}; }
+    val width: u32 = arch.pointer_width;
+    if (width != 4 && width != 8) { ret err[fail.Fail].err{fail.message("linker: unsupported GOT pointer width")}; }
+    var m: u32 = 0;
+    for (m < module_count) {
+        var ri: u32 = 0;
+        for (ri < modules[m].reloc_count) {
+            val r: *of.Relocation = ?modules[m].relocations[ri];
+            if (!reloc_source_live(modules, m, r, sec_base, atoms)) {
+                ri = ri + 1;
+                cnt;
+            }
+            val resolved: res[of.RelocOperand, fail.Fail] = rel.resolve_operand(arch, ?modules[m], ri);
+            if (sel resolved.err) { ret err[fail.Fail].err{resolved.err}; }
+            val operand: of.RelocOperand = resolved.ok;
+            if (!isa.local_got_kind(arch, operand.target_kind) || operand.sym >= modules[m].symbol_count) {
+                ri = ri + 1;
+                cnt;
+            }
+            val target: *of.Symbol = ?modules[m].symbols[operand.sym];
+            if (!of.section_is_external(target.section) && !of.section_is_absolute(target.section)
+                && of.section_index(target.section) >= modules[m].section_count) {
+                ri = ri + 1;
+                cnt;
+            }
+            val local: bool = !of.section_is_external(target.section)
+                && (target.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0;
+            var effective: intern.StrId = target.name;
+            if (!local) {
+                val rr: res[intern.StrId, fail.Fail] =
+                    resolved_symbol_name(sym_locs, target.name);
+                if (sel rr.err) {
+                    ret err[fail.Fail].err{rr.err};
+                }
+                effective = rr.ok;
+                val get_r: opt[*SymbolLoc] = map.get[intern.StrId, SymbolLoc](sym_locs, ?effective);
+                if (sel get_r.none) {
+                    ri = ri + 1;
+                    cnt;
+                }
+            }
+            val ar: err[fail.Fail] =
+                local_got_add(s, plan, m, operand.sym, effective, local);
+            if (sel ar.err) {
+                ret ar;
+            }
+            ri = ri + 1;
+        }
+        m = m + 1;
+    }
+    if (plan.count == 0) { ret err[fail.Fail].ok{}; }
+
+    val relro:   u32                 = of.SK_RELRO::u32;
+    val start_r: res[u64, fail.Fail] = align_up_u64_checked(merged[relro].len::u64, width::u64);
+    if (sel start_r.err) { ret err[fail.Fail].err{start_r.err}; }
+    val start: u64 = start_r.ok;
+    val end:   u64 = start + plan.count::u64 * width::u64;
+    if (end > 0xFFFFFFFF) {
+        ret err[fail.Fail].err{fail.message("linker: synthesized GOT exceeds the maximum section size")};
+    }
+    var i: u32 = 0;
+    for (i < plan.count) {
+        plan.slots[i].offset = (start + i::u64 * width::u64)::u32;
+        i                    = i + 1;
+    }
+    merged[relro].used = true;
+    if (merged[relro].align < width) { merged[relro].align = width; }
+    merged[relro].len = end::u32;
+
+    val gn: intern.StrId        = intern_or_nil(s, "__got");
+    val ga: res[u32, fail.Fail] = section_group_add(s.alloc, groups, relro, gn, 0);
+    if (sel ga.err) { ret err[fail.Fail].err{ga.err}; }
+    val gi: u32 = ga.ok;
+    groups.items[gi].align  = width;
+    groups.items[gi].base   = start::u32;
+    groups.items[gi].cursor = end::u32;
+    groups.items[gi].len    = (end - start)::u32;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun finalize_local_got_vaddrs(merged: *MergedSection, plan: *LocalGotPlan) {
+    val base: u64 = merged[of.SK_RELRO::u32].vaddr;
+    var i:    u32 = 0;
+    for (i < plan.count) {
+        plan.slots[i].vaddr = base + plan.slots[i].offset::u64;
+        i                   = i + 1;
+    }
+}
+
+fun apply_one(s: *session.Session, kind: of.RelocKind,
+    dst: *u8, patch_off: u32, sec_len: u32,
+    target: rel.RelocTarget, addend: i64, patch_va: u64,
+    sym_name: intern.StrId, arch: *isa.IsaVTable,
+    image_base: u64) err[fail.Fail] {
+    if (!isa.emits_relocations(arch)) {
+        ret err[fail.Fail].err{fail.message(unsupported_message(s, arch, kind))};
+    }
+    val r: res[bool, rel.RelocError] =
+        arch.reloc.apply(kind, dst, patch_off, sec_len,
+        target, addend, patch_va, image_base);
+    if (!sel r.err) { ret err[fail.Fail].ok{}; }
+    val error: rel.RelocError = r.err;
+    if (error == rel.RELOC_OVERFLOW) {
+        ret err[fail.Fail].err{fail.message(overflow_message(s, kind, sym_name))};
+    }
+    if (error == rel.RELOC_INVALID_INSTRUCTION) {
+        ret err[fail.Fail].err{fail.message(invalid_relocation_instruction_message(s, kind))};
+    }
+    ret err[fail.Fail].err{fail.message(unsupported_message(s, arch, kind))};
+}
+
+fun dwarf_addend_message(s: *session.Session, modules: *of.ObjectImage, m: u32,
+    name: intern.StrId, r: *of.Relocation) str {
+    val fallback: str =
+        "linker: DWARF code-address addend does not survive dead-code elimination";
+    val nm: opt[str] = intern.lookup(?s.interner, name);
+    if (sel nm.none) { ret fallback; }
+    var sec: str = "?";
+    if (of.section_index(r.section) < modules[m].section_count) {
+        val sn: opt[str] = intern.lookup(?s.interner, modules[m].sections[of.section_index(r.section)].name);
+        if (sel sn.some) { sec = sn.some; }
+    }
+    val result: res[str, format.FormatError] = format.sprint(s.alloc,
+        "linker: {} relocation against '{}' with addend {} crosses a discarded body; its address would be stale",
+        sec, nm.some, r.addend);
+    if (sel result.err) { ret fallback; }
+    ret result.ok;
+}
+
+fun undef_message(s: *session.Session, name: intern.StrId) str {
+    val pinned: opt[intern.StrId] = session.import_library(s, name);
+    if (sel pinned.some) {
+        ret pinned_attribution_message(s, name, pinned.some);
+    }
+    val nm: opt[str] = intern.lookup(?s.interner, name);
+    if (sel nm.some) { ret join2(s, "undefined symbol: ", nm.some, "undefined symbol"); }
+    ret "undefined symbol";
+}
+
+fun overflow_message(s: *session.Session, kind: of.RelocKind, sym_name: intern.StrId) str {
+    val named: opt[str] = of.reloc_kind_name(kind);
+    if (sel named.none) { ret of.reloc_kind_rejection(?s.interner, s.alloc, kind, ""); }
+    val kn:  str      = named.some;
+    val sno: opt[str] = intern.lookup(?s.interner, sym_name);
+    if (sel sno.some) {
+        val pre: str = join3(s, "relocation '", kn, "' to '", "relocation overflows");
+        ret join3(s, pre, sno.some, "' overflows", "relocation overflows");
+    }
+    ret join3(s, "relocation '", kn, "' overflows", "relocation overflows");
+}
+
+# a declared relocation kind the instruction set does not honor, or a member
+# outside the catalog; `arch` may be absent when no relocation seam exists
+fun unsupported_message(s: *session.Session, arch: *isa.IsaVTable, kind: of.RelocKind) str {
+    var by: str = "";
+    if (arch != nil) { by = arch.name; }
+    ret of.reloc_kind_rejection(?s.interner, s.alloc, kind, by);
+}
+
+fun invalid_relocation_instruction_message(s: *session.Session, kind: of.RelocKind) str {
+    val named: opt[str] = of.reloc_kind_name(kind);
+    if (sel named.none) { ret of.reloc_kind_rejection(?s.interner, s.alloc, kind, ""); }
+    ret join3(s, "relocation '", named.some,
+        "' does not match its instruction", "relocation does not match its instruction");
+}
+
+test "mach.lang.be.linker.local_symbol_target:owning_section" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+
+    var sym: of.Symbol;
+    sym.name    = lt_name(?s, ".data");
+    sym.section = of.section_id(0);
+    sym.offset  = 0x34;
+    sym.size    = 0;
+    sym.flags   = 0;
+    var module: of.ObjectImage = lt_image(?s, lt_name(?s, "local"),
+        nil::*of.Section, 1, ?sym, 1, nil::*of.Relocation, 0);
+
+    var placement: [1]Placement;
+    placement[0].vaddr        = 0x2200;
+    placement[0].offset       = 0x200;
+    placement[0].merged_index = 1;
+    var sec_base: [1]u32;
+    sec_base[0] = 0;
+    var merged_to_out: [2]u32;
+    merged_to_out[0] = 0;
+    merged_to_out[1] = 2;
+    var out_sections: [3]of.Section;
+    out_sections[0].kind = of.SK_TEXT;
+    out_sections[1].kind = of.SK_DEBUG;
+    out_sections[2].kind = of.SK_DATA;
+    var out_img: of.ObjectImage;
+    out_img.sections      = ?out_sections[0];
+    out_img.section_count = 3;
+
+    var resolved: rel.RelocTarget;
+    if (!local_symbol_target(?module, 0, 0, ?placement[0], ?sec_base[0],
+        ?merged_to_out[0], ?out_img, nil::*of.OfVTable,
+        0, nil::*AtomPlan, ?resolved)) { ret 1; }
+    if (resolved.vaddr != 0x2234 || resolved.section_vaddr != 0x2000
+        || resolved.section_index != 2) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.be.linker.pinned_attribution_message:static_provider_vs_absent" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+
+    var bad: i32 = 0;
+
+    val sym_r:    res[intern.StrId, A.Error] = intern.intern(?s.interner, "provider_valu");
+    val vend_r:   res[intern.StrId, A.Error] = intern.intern(?s.interner, "vendored");
+    val shared_r: res[intern.StrId, A.Error] = intern.intern(?s.interner, "shared");
+    val gone_r:   res[intern.StrId, A.Error] = intern.intern(?s.interner, "no-such-library");
+    if (sel sym_r.err) {
+        session.dnit(?s);
+        ret 1;
+    }
+    if (sel vend_r.err) {
+        session.dnit(?s);
+        ret 1;
+    }
+    if (sel shared_r.err) {
+        session.dnit(?s);
+        ret 1;
+    }
+    if (sel gone_r.err) {
+        session.dnit(?s);
+        ret 1;
+    }
+    val sym:    intern.StrId = sym_r.ok;
+    val vend:   intern.StrId = vend_r.ok;
+    val shared: intern.StrId = shared_r.ok;
+    val gone:   intern.StrId = gone_r.ok;
+
+    val register_link_provider_r: err[fail.Fail] = session.register_link_provider(?s, vend, true);
+    if (sel register_link_provider_r.err) {
+        session.dnit(?s);
+        ret 1;
+    }
+    val register_link_provider_r2: err[fail.Fail] = session.register_link_provider(?s, shared, false);
+    if (sel register_link_provider_r2.err) {
+        session.dnit(?s);
+        ret 1;
+    }
+
+    val stat_msg: str = pinned_attribution_message(?s, sym, vend);
+    if (!str_contains(stat_msg, "provides as a static input"))                 { bad = 1; }
+    if (!str_contains(stat_msg, "defines symbols rather than importing them")) { bad = 1; }
+    if (str_contains(stat_msg, "not among the link's dependencies"))           { bad = 1; }
+
+    val gone_msg: str = pinned_attribution_message(?s, sym, gone);
+    if (!str_contains(gone_msg, "not among the link's dependencies"))             { bad = 1; }
+    if (!str_contains(gone_msg, "this link provides: vendored (static), shared")) { bad = 1; }
+    if (str_contains(gone_msg, "defines symbols rather than importing them"))     { bad = 1; }
+
+    val register_import_library_r: err[fail.Fail] = session.register_import_library(?s, sym, vend);
+    if (sel register_import_library_r.err) {
+        session.dnit(?s);
+        ret 1;
+    }
+    if (!str_equals(undef_message(?s, sym), stat_msg)) { bad = 1; }
+
+    val plain_r: res[intern.StrId, A.Error] = intern.intern(?s.interner, "plain_sym");
+    if (sel plain_r.err) {
+        session.dnit(?s);
+        ret 1;
+    }
+    if (!str_equals(undef_message(?s, plain_r.ok),
+        "undefined symbol: plain_sym")) { bad = 1; }
+
+    session.dnit(?s);
+    ret bad;
+}
+
+test "mach.lang.be.linker.local_got_plan:deduplicates_effective_target" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:   session.Session       = sr.ok;
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val r_11974: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_11974.err) { ret 1; }
+    val x64:   *isa.IsaVTable = lt_isa(?reg, "x86_64");
+    val arm64: *isa.IsaVTable = lt_isa(?reg, "aarch64");
+    if (x64 == nil || arm64 == nil)     { ret 1; }
+    if (!isa.declares_local_got(x64))   { ret 1; }
+    if (!isa.declares_local_got(arm64)) { ret 1; }
+
+    val target_name: intern.StrId = lt_name(?s, "got_target");
+    val text_name:   intern.StrId = lt_name(?s, ".text");
+    if (target_name == intern.STR_NIL || text_name == intern.STR_NIL) { ret 1; }
+
+    var text_bytes: [24]u8;
+    var sections:   [1]of.Section;
+    sections[0].name  = text_name;
+    sections[0].kind  = of.SK_TEXT;
+    sections[0].bytes = ?text_bytes[0];
+    sections[0].len   = 24;
+    sections[0].align = 8;
+    var symbols: [1]of.Symbol;
+    symbols[0].name    = target_name;
+    symbols[0].section = of.external_section();
+    symbols[0].flags   = of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_GLOBAL
+        | of.SYM_OBJ_FLAG_OBJECT;
+    var relocs: [3]of.Relocation;
+    relocs[0].section = of.section_id(0);
+    relocs[0].offset  = 0;
+    relocs[0].kind    = of.RK_GOTPCREL;
+    relocs[0].sym     = 0;
+    relocs[0].addend  = -4;
+    relocs[1].section = of.section_id(0);
+    relocs[1].offset  = 8;
+    relocs[1].kind    = of.RK_GOTPCREL_NORELAX;
+    relocs[1].sym     = 0;
+    relocs[1].addend  = -4;
+    relocs[2].section = of.section_id(0);
+    relocs[2].offset  = 16;
+    relocs[2].kind    = of.RK_GOTPCREL64_NORELAX;
+    relocs[2].sym     = 0;
+    relocs[2].addend  = -8;
+    var module: of.ObjectImage = lt_image(
+        ?s, lt_name(?s, "got-user"), ?sections[0], 1,
+        ?symbols[0], 1, ?relocs[0], 3);
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var loc: SymbolLoc;
+    loc.vaddr         = 0x7000;
+    loc.section_vaddr = 0x7000;
+    loc.merged_index  = of.SK_DATA::u32;
+    loc.weak          = false;
+    loc.fallback      = intern.STR_NIL;
+    val insert_r: res[bool, A.Error] = map.insert[intern.StrId, SymbolLoc](
+        ?locs, target_name, loc);
+    if (sel insert_r.err) { ret 1; }
+
+    var merged: [7]MergedSection;
+    merged[of.SK_RELRO::u32].len = 3;
+    var sec_base: [1]u32;
+    sec_base[0] = 0;
+    var plan: LocalGotPlan;
+    init_local_got_plan(?plan);
+    var groups: SectionGroups;
+    init_section_groups(?groups);
+    var undeclared: LocalGotPlan;
+    init_local_got_plan(?undeclared);
+    val skipped: err[fail.Fail] = build_local_got_plan(
+        ?s, arm64, ?module, 1, ?locs, ?sec_base[0], nil::*AtomPlan,
+        ?merged[0], ?groups, ?undeclared);
+    if (sel skipped.err)       { ret 1; }
+    if (undeclared.count != 0) { ret 1; }
+    free_local_got_plan(?alloc, ?undeclared);
+
+    val built: err[fail.Fail] = build_local_got_plan(
+        ?s, x64, ?module, 1, ?locs, ?sec_base[0], nil::*AtomPlan,
+        ?merged[0], ?groups, ?plan);
+    if (sel built.err)                       { ret 1; }
+    if (plan.count != 1)                     { ret 1; }
+    if (plan.slots[0].offset != 8)           { ret 1; }
+    if (merged[of.SK_RELRO::u32].len != 16)  { ret 1; }
+    if (merged[of.SK_RELRO::u32].align != 8) { ret 1; }
+    if (!merged[of.SK_RELRO::u32].used)      { ret 1; }
+
+    merged[of.SK_RELRO::u32].vaddr = 0x5000;
+    finalize_local_got_vaddrs(?merged[0], ?plan);
+    if (plan.slots[0].vaddr != 0x5008) { ret 1; }
+
+    free_local_got_plan(?alloc, ?plan);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    ret 0;
+}
+
+test "mach.lang.be.linker.resolve_strp:uses_symbol_offset_and_collects_suffix" {
+    var reg:     target.TargetRegistry = target.registry_init();
+    val r_12349: err[fail.Fail]        = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_12349.err) {
+        target.registry_dnit(?reg);
+        ret 1;
+    }
+    val target_r: res[target.Target, fail.Fail] =
+        target.select(?reg, "x86_64", "linux", "sysv64");
+    if (sel target_r.err) {
+        target.registry_dnit(?reg);
+        ret 2;
+    }
+    var selected: target.Target = target_r.ok;
+
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val session_r: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel session_r.err) {
+        target.registry_dnit(?reg);
+        ret 3;
+    }
+    var s: session.Session = session_r.ok;
+
+    var bytes: [13]u8;
+    bytes[0]  = 'f';
+    bytes[1]  = 'i';
+    bytes[2]  = 'r';
+    bytes[3]  = 's';
+    bytes[4]  = 't';
+    bytes[5]  = 0;
+    bytes[6]  = 's';
+    bytes[7]  = 'e';
+    bytes[8]  = 'c';
+    bytes[9]  = 'o';
+    bytes[10] = 'n';
+    bytes[11] = 'd';
+    bytes[12] = 0;
+    var info_bytes: [4]u8;
+    var sections:   [2]of.Section;
+    sections[0].name  = lt_name(?s, ".debug_str");
+    sections[0].kind  = of.SK_DEBUG;
+    sections[0].bytes = ?bytes[0];
+    sections[0].len   = 13;
+    sections[0].align = 1;
+    sections[0].flags = 0;
+    sections[1].name  = lt_name(?s, ".debug_info");
+    sections[1].kind  = of.SK_DEBUG;
+    sections[1].bytes = ?info_bytes[0];
+    sections[1].len   = 4;
+    sections[1].align = 1;
+    sections[1].flags = 0;
+    var symbol: of.Symbol;
+    symbol.name     = lt_name(?s, "second-string-suffix");
+    symbol.section  = of.section_id(0);
+    symbol.offset   = 7;
+    symbol.size     = 0;
+    symbol.flags    = 0;
+    symbol.fallback = of.SYMBOL_NONE;
+    symbol.align    = 1;
+    var relocation: of.Relocation;
+    relocation.section = of.section_id(1);
+    relocation.offset  = 0;
+    relocation.kind    = of.RK_ABS32;
+    relocation.sym     = 0;
+    relocation.sym2    = of.SYMBOL_NONE;
+    relocation.addend  = 0;
+    var module: of.ObjectImage = lt_image(
+        ?s, lt_name(?s, "strings.o"), ?sections[0], 2,
+        ?symbol, 1, ?relocation, 1);
+
+    val merge_r: res[StrMerge, fail.Fail] = build_str_merge(?s, ?module, 1, true);
+    if (sel merge_r.err) {
+        session.dnit(?s);
+        target.registry_dnit(?reg);
+        ret 4;
+    }
+    var strm:        StrMerge = merge_r.ok;
+    var destination: [4]u8;
+
+    val resolved_r: err[fail.Fail] = resolve_strp(
+        ?s, ?module, 0, 0, ?symbol, ?relocation, ?strm,
+        ?destination[0], 0, 4, 0, selected.isa, 0);
+    var bad:                       i32                 = 0;
+    val debug_str_source_offset_r: res[u32, fail.Fail] = debug_str_source_offset(0xFFFFFFFF, 1, 0xFFFFFFFF);
+    if (sel resolved_r.err)                        { bad = 5; }
+    or (bin.read_u32_le(?destination[0], 0) != 13) { bad = 6; }
+    or (sel debug_str_source_offset_r.ok) {
+        bad = 7;
+    }
+
+    free_str_merge(?strm);
+    session.dnit(?s);
+    target.registry_dnit(?reg);
+    ret bad;
+}
+
+test "mach.lang.be.linker.relocation_arithmetic:rejects_wraparound" {
+    val diff_min: res[i64, fail.Fail] =
+        difference_relocation_addend(9223372036854775807, 0xFFFFFFFFFFFFFFFF);
+    val diff_under: res[i64, fail.Fail] =
+        difference_relocation_addend(-9223372036854775807 - 1, 1);
+    val base_zero:  res[u64, fail.Fail] = base_relocation_target(4, -4);
+    val base_under: res[u64, fail.Fail] = base_relocation_target(0, -1);
+    val base_over:  res[u64, fail.Fail] = base_relocation_target(0xFFFFFFFFFFFFFFFF, 1);
+
+    if (sel diff_min.err)                        { ret 1; }
+    if (diff_min.ok != -9223372036854775807 - 1) { ret 1; }
+    if (!sel diff_under.err)                     { ret 1; }
+    if (sel base_zero.err)                       { ret 1; }
+    if (base_zero.ok != 0)                       { ret 1; }
+    if (!sel base_under.err)                     { ret 1; }
+    if (!sel base_over.err)                      { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.be.linker:local_and_global_absolute_definitions_resolve_without_sections" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val initialized: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel initialized.err) { ret 1; }
+    var s: session.Session = initialized.ok;
+    fin { session.dnit(?s); }
+    var symbols: [2]of.Symbol;
+    symbols[0] = of.Symbol{name: lt_name(?s, "@feat.00"), section: of.absolute_section(), absolute_value: 0x123};
+    symbols[1] = of.Symbol{name: lt_name(?s, "public_absolute"), section: of.absolute_section(),
+        absolute_value: 0xF123456789ABCDEF, flags: of.SYM_OBJ_FLAG_GLOBAL};
+    var image: of.ObjectImage = lt_image(?s, lt_name(?s, "absolute"), nil::*of.Section, 0,
+        ?symbols[0], 2, nil::*of.Relocation, 0);
+    var locs: map.Map[intern.StrId, SymbolLoc] = map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    fin { map.dnit[intern.StrId, SymbolLoc](?locs); }
+    val collected: err[fail.Fail] = collect_symbols(?s, ?image, 1,
+        nil::*Placement, nil::*u32, ?locs, true, nil::*AtomPlan);
+    if (sel collected.err) { ret 2; }
+    val location: opt[*SymbolLoc] = map.get[intern.StrId, SymbolLoc](?locs, ?symbols[1].name);
+    if (sel location.none) { ret 3; }
+    val found: *SymbolLoc = location.some;
+    if (found.vaddr != symbols[1].absolute_value || found.merged_index != of.SECTION_ABSOLUTE) { ret 4; }
+    var local: rel.RelocTarget = rel.target(0, 0, 0);
+    if (!local_symbol_target(?image, 0, 0, nil::*Placement, nil::*u32, nil::*u32,
+        nil::*of.ObjectImage, nil::*of.OfVTable, 0, nil::*AtomPlan, ?local) || local.vaddr != 0x123) { ret 5; }
+    val sub: res[u64, fail.Fail] = difference_subtrahend_vaddr(?s, ?image, 0, 1,
+        nil::*Placement, nil::*u32, nil::*u32, nil::*of.ObjectImage, nil::*of.OfVTable,
+        0, nil::*AtomPlan, ?locs);
+    if (sel sub.err)                         { ret 6; }
+    if (sub.ok != symbols[1].absolute_value) { ret 6; }
+    ret 0;
+}

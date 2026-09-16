@@ -25,6 +25,7 @@ use mach.lang.fe.ast.id;
 use mach.lang.fe.comptime;
 use mach.lang.fe.resolve;
 use mach.lang.fe.sema;
+use scx: mach.lang.fe.sema.context;
 use mach.lang.fe.token;
 use mach.lang.intern;
 use mach.lang.manifest;
@@ -49,7 +50,9 @@ pub fun lower_decl(ctx: *context.LowerContext, did: id.DeclId) err[fail.Fail] {
     val d: *decl.Decl    = opt_decl.some;
     val k: decl.DeclKind = d.kind;
 
-    if (k == decl.DECL_KIND_FUN) { ret lower_fun(ctx, did, d, false); }
+    # a `#[testing]` declaration is checked in every build and emitted only for tests
+    if (!ctx.test_mode && resolve.declaration_testing(ctx.scope.a, context.module_source(ctx), did)) { ret err[fail.Fail].ok{}; }
+    if (k == decl.DECL_KIND_FUN)                                                                     { ret lower_fun(ctx, did, d, false); }
     if (k == decl.DECL_KIND_TEST) {
         if (!ctx.test_mode) { ret err[fail.Fail].ok{}; }
         ret lower_test(ctx, did, d);
@@ -57,12 +60,113 @@ pub fun lower_decl(ctx: *context.LowerContext, did: id.DeclId) err[fail.Fail] {
     if (k == decl.DECL_KIND_VAL)         { ret lower_global(ctx, did, d, false); }
     if (k == decl.DECL_KIND_VAR)         { ret lower_global(ctx, did, d, true); }
     if (k == decl.DECL_KIND_COMPTIME_IF) { ret lower_comptime_if(ctx, d); }
+    if (k == decl.DECL_KIND_FWD)         { ret lower_fwd(ctx, did); }
 
     if (k == decl.DECL_KIND_ERROR) {
         ret err[fail.Fail].err{fail.message("lower: error declaration reached the middle end")};
     }
 
     ret err[fail.Fail].ok{};
+}
+
+# a `fwd` in a root-project module puts the re-exported declaration on the
+# library's export surface. the object records the linkage name and the link
+# exports whichever module defines it, so a re-export reaches a dependency's
+# definition without that dependency knowing anything about this library
+pub fun lower_fwd(ctx: *context.LowerContext, did: id.DeclId) err[fail.Fail] {
+    if (!ctx.m.root_project)                                    { ret err[fail.Fail].ok{}; }
+    if (ctx.scope.rr == nil || ctx.scope.rr.decl_symbol == nil) { ret err[fail.Fail].ok{}; }
+    if (did::u32 >= ctx.scope.rr.decl_count)                    { ret err[fail.Fail].ok{}; }
+
+    val sid:     resolve.SymbolId     = ctx.scope.rr.decl_symbol[did];
+    val opt_sym: opt[*resolve.Symbol] = context.symbol_of(ctx, sid);
+    if (sel opt_sym.none) { ret err[fail.Fail].ok{}; }
+
+    var walk:   ReexportWalk   = ReexportWalk{visited: nil, len: 0};
+    val opened: err[fail.Fail] = reexport_walk_open(ctx, ?walk);
+    if (sel opened.err) { ret opened; }
+    fin { reexport_walk_close(ctx, ?walk); }
+    ret record_reexport(ctx, opt_sym.some, ?walk);
+}
+
+# the modules a single `fwd` has already drawn names from, so a pair of modules
+# re-exporting each other terminates
+rec ReexportWalk {
+    visited: *bool;
+    len:     u32;
+}
+
+fun reexport_walk_open(ctx: *context.LowerContext, walk: *ReexportWalk) err[fail.Fail] {
+    val count: u32 = session.module_count(ctx.s);
+    walk.len     = count;
+    walk.visited = nil;
+    if (count == 0) { ret err[fail.Fail].ok{}; }
+    val allocated: res[*bool, A.Error] = A.zallocate[bool](ctx.s.alloc, count::usize);
+    if (sel allocated.err) { ret err[fail.Fail].err{fail.refused(allocated.err)}; }
+    walk.visited = allocated.ok;
+    ret err[fail.Fail].ok{};
+}
+
+fun reexport_walk_close(ctx: *context.LowerContext, walk: *ReexportWalk) {
+    if (walk.visited != nil && walk.len > 0) {
+        A.deallocate[bool](ctx.s.alloc, walk.visited, walk.len::usize);
+    }
+    walk.visited = nil;
+    walk.len     = 0;
+}
+
+fun record_reexport(ctx: *context.LowerContext, sym: *resolve.Symbol, walk: *ReexportWalk) err[fail.Fail] {
+    if (sym.kind == resolve.SYM_USE) { ret record_reexport_module(ctx, sym.slot::session.ModuleId, walk); }
+    ret record_reexport_symbol(ctx, sym);
+}
+
+# `fwd` of a module re-exports that module's whole public surface, nested module
+# aliases included
+fun record_reexport_module(ctx: *context.LowerContext, mid: session.ModuleId, walk: *ReexportWalk) err[fail.Fail] {
+    if (mid == session.MODULE_NIL)                   { ret err[fail.Fail].ok{}; }
+    if (walk.visited == nil || mid::u32 >= walk.len) { ret err[fail.Fail].ok{}; }
+    if (walk.visited[mid::u32])                      { ret err[fail.Fail].ok{}; }
+    walk.visited[mid::u32] = true;
+
+    val scoped: res[context.ModuleScope, fail.Fail] = context.origin_scope(ctx, mid);
+    if (sel scoped.err) { ret err[fail.Fail].err{scoped.err}; }
+    val scope: context.ModuleScope = scoped.ok;
+    if (scope.rr == nil || scope.rr.symbols == nil) { ret err[fail.Fail].ok{}; }
+
+    var i: u32 = 0;
+    for (i < scope.rr.pub_count) {
+        val recorded: err[fail.Fail] = record_reexport(ctx, ?scope.rr.symbols[i], walk);
+        if (sel recorded.err) { ret recorded; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun record_reexport_symbol(ctx: *context.LowerContext, sym: *resolve.Symbol) err[fail.Fail] {
+    # a type carries no linkage symbol, and a generic, comptime-parameter or pack
+    # declaration has instances instead of one definition
+    if (sym.kind != resolve.SYM_FUN && sym.kind != resolve.SYM_VAL && sym.kind != resolve.SYM_VAR) {
+        ret err[fail.Fail].ok{};
+    }
+    if (sym.generic_arity > 0 || sym.has_comptime_params || sym.has_pack_param) { ret err[fail.Fail].ok{}; }
+
+    val acquired: res[scx.DefinedSymbol, fail.Fail] = context.symbol_definition(ctx, sym);
+    if (sel acquired.err) { ret err[fail.Fail].err{acquired.err}; }
+    val defined: scx.DefinedSymbol = acquired.ok;
+    if (defined.symbol.generic_arity > 0 || defined.symbol.has_comptime_params
+        || defined.symbol.has_pack_param) { ret err[fail.Fail].ok{}; }
+
+    # an `ext` declaration names an import: the linked image never defines it
+    val opt_d: opt[*decl.Decl] = ast.get_decl(defined.definition.parsed.a, defined.symbol.decl);
+    if (sel opt_d.none)                               { ret err[fail.Fail].ok{}; }
+    if ((opt_d.some.flags & decl.DECL_FLAG_EXT) != 0) { ret err[fail.Fail].ok{}; }
+
+    val fqn:    intern.StrId                 = session.module_fqn(ctx.s, defined.symbol.origin);
+    val export: opt[intern.StrId]            = session.export_name(ctx.s, defined.symbol.origin, defined.symbol.decl::u32);
+    val named:  res[intern.StrId, fail.Fail] =
+        mangle.linkage_name(ctx.s, fqn, defined.symbol.canon, export);
+    if (sel named.err) { ret err[fail.Fail].err{named.err}; }
+    ret ir.export_request_add(ctx.m, named.ok);
 }
 
 pub fun lower_fun(ctx: *context.LowerContext, did: id.DeclId, d: *decl.Decl, is_test: bool) err[fail.Fail] {
@@ -113,7 +217,7 @@ pub fun lower_fun(ctx: *context.LowerContext, did: id.DeclId, d: *decl.Decl, is_
 
     ctx.m.functions[fn_index].is_import = (d.flags & decl.DECL_FLAG_EXT) != 0;
 
-    publish_function_debug(ctx, fn_index, bare, context.decl_ret_sem(ctx, did));
+    publish_function_debug(ctx, fn_index, d, bare, context.decl_ret_sem(ctx, did));
 
     if ((flags & ir.FN_FLAG_EXTERN) != 0) { ret err[fail.Fail].ok{}; }
 
@@ -146,7 +250,8 @@ pub fun lower_pack_instance(ctx: *context.LowerContext, did: id.DeclId, d: *decl
     if (sel res_bare.err) { ret err[fail.Fail].err{res_bare.err}; }
     val bare: intern.StrId = res_bare.ok;
 
-    var flags: u32 = ir.FN_FLAG_PUB | ir.FN_FLAG_WEAK;
+    # weak so each instantiating module's copy coalesces; not a `pub` declaration
+    var flags: u32 = ir.FN_FLAG_WEAK;
     if (decl_has_decorator(ctx, d, "inline"))    { flags = flags | ir.FN_FLAG_INLINE; }
     if (decl_has_decorator(ctx, d, "noinline"))  { flags = flags | ir.FN_FLAG_NOINLINE; }
     if (decl_has_decorator(ctx, d, "oblivious")) { flags = flags | ir.FN_FLAG_OBLIVIOUS; }
@@ -156,7 +261,7 @@ pub fun lower_pack_instance(ctx: *context.LowerContext, did: id.DeclId, d: *decl
     if (sel res_idx.err) { ret err[fail.Fail].err{res_idx.err}; }
     val fn_index: u32 = res_idx.ok;
 
-    publish_function_debug(ctx, fn_index, bare, context.decl_ret_sem(ctx, did));
+    publish_function_debug(ctx, fn_index, d, bare, context.decl_ret_sem(ctx, did));
 
     context.begin_function(ctx, fn_index, ret_ir);
 
@@ -170,7 +275,7 @@ pub fun lower_pack_instance(ctx: *context.LowerContext, did: id.DeclId, d: *decl
     if (sel res_entry.err) { ret err[fail.Fail].err{res_entry.err}; }
     builder.set_block(?ctx.builder, res_entry.ok);
 
-    builder.set_loc(?ctx.builder, source.loc(ctx.scope.a.file_id, d.span.offset));
+    builder.set_loc(?ctx.builder, ctx.m.functions[fn_index].decl_loc);
 
     val res_params: err[fail.Fail] = lower_pack_params(ctx, did, d, fn_index, fixed_count, types, type_len);
     if (sel res_params.err) {
@@ -290,6 +395,8 @@ pub fun lower_global(ctx: *context.LowerContext, did: id.DeclId, d: *decl.Decl, 
         gx.iface_a     = 0;
         gx.iface_b     = 0;
         gx.iface_flags = 0;
+        gx.disp        = bare;
+        gx.ty_sem      = context.decl_type_of(ctx, did);
         val res_ext: res[u32, fail.Fail] = append_global(ctx, gx);
         if (sel res_ext.err) { ret err[fail.Fail].err{res_ext.err}; }
         ret err[fail.Fail].ok{};
@@ -311,6 +418,8 @@ pub fun lower_global(ctx: *context.LowerContext, did: id.DeclId, d: *decl.Decl, 
     g.iface_a     = 0;
     g.iface_b     = 0;
     g.iface_flags = 0;
+    g.disp        = bare;
+    g.ty_sem      = context.decl_type_of(ctx, did);
     fill_iface_role(ctx, d, ?g);
 
     val res_idx: res[u32, fail.Fail] = append_global(ctx, g);
@@ -346,7 +455,8 @@ fun lower_weak_instance(ctx: *context.LowerContext, did: id.DeclId, d: *decl.Dec
     if (sel res_bare.err) { ret err[fail.Fail].err{res_bare.err}; }
     val bare: intern.StrId = res_bare.ok;
 
-    var flags: u32 = ir.FN_FLAG_PUB | ir.FN_FLAG_WEAK;
+    # weak so each instantiating module's copy coalesces; not a `pub` declaration
+    var flags: u32 = ir.FN_FLAG_WEAK;
     if (decl_has_decorator(ctx, d, "inline"))    { flags = flags | ir.FN_FLAG_INLINE; }
     if (decl_has_decorator(ctx, d, "noinline"))  { flags = flags | ir.FN_FLAG_NOINLINE; }
     if (decl_has_decorator(ctx, d, "oblivious")) { flags = flags | ir.FN_FLAG_OBLIVIOUS; }
@@ -356,7 +466,7 @@ fun lower_weak_instance(ctx: *context.LowerContext, did: id.DeclId, d: *decl.Dec
     if (sel res_idx.err) { ret err[fail.Fail].err{res_idx.err}; }
     val fn_index: u32 = res_idx.ok;
 
-    publish_function_debug(ctx, fn_index, bare, ret_sem);
+    publish_function_debug(ctx, fn_index, d, bare, ret_sem);
 
     val res_ty: err[fail.Fail] = reinfer_instance_typing(ctx, d, context.decl_ret_sem(ctx, did));
     if (sel res_ty.err) { ret res_ty; }
@@ -370,10 +480,11 @@ fun function_bare_name(ctx: *context.LowerContext, d: *decl.Decl) res[intern.Str
     ret res[intern.StrId, fail.Fail].ok{r_353.ok};
 }
 
-fun publish_function_debug(ctx: *context.LowerContext, fn_index: u32,
+fun publish_function_debug(ctx: *context.LowerContext, fn_index: u32, d: *decl.Decl,
     bare: intern.StrId, ret_sem: type.TypeId) {
-    ctx.m.functions[fn_index].disp    = bare;
-    ctx.m.functions[fn_index].ret_sem = ret_sem;
+    ctx.m.functions[fn_index].disp     = bare;
+    ctx.m.functions[fn_index].ret_sem  = ret_sem;
+    ctx.m.functions[fn_index].decl_loc = source.loc(ctx.scope.a.file_id, d.data.fun_.name.offset);
 }
 
 fun emit_function_body(ctx: *context.LowerContext, did: id.DeclId, d: *decl.Decl, fn_index: u32, ret_ir: ir_type.IrTypeId, ret_sem: type.TypeId) err[fail.Fail] {
@@ -385,7 +496,7 @@ fun emit_function_body(ctx: *context.LowerContext, did: id.DeclId, d: *decl.Decl
     if (sel res_entry.err) { ret err[fail.Fail].err{res_entry.err}; }
     builder.set_block(?ctx.builder, res_entry.ok);
 
-    builder.set_loc(?ctx.builder, source.loc(ctx.scope.a.file_id, d.span.offset));
+    builder.set_loc(?ctx.builder, ctx.m.functions[fn_index].decl_loc);
 
     val res_params: err[fail.Fail] = lower_params(ctx, did, d, fn_index);
     if (sel res_params.err) { ret res_params; }
@@ -553,7 +664,8 @@ fun lower_test(ctx: *context.LowerContext, did: id.DeclId, d: *decl.Decl) err[fa
     }
     val res_disp: res[intern.StrId, A.Error] = intern.intern_span(?ctx.s.interner, context.module_source(ctx), label_span);
     if (sel res_disp.err) { ret err[fail.Fail].err{fail.refused(res_disp.err)}; }
-    ctx.m.functions[fn_index].label = res_disp.ok;
+    ctx.m.functions[fn_index].label    = res_disp.ok;
+    ctx.m.functions[fn_index].decl_loc = source.loc(ctx.scope.a.file_id, d.data.test_.label.offset);
 
     val opt_sf: opt[*source.SourceFile] = source.get(?ctx.s.sources, ctx.scope.a.file_id);
     if (sel opt_sf.some) {
@@ -572,7 +684,7 @@ fun emit_test_body(ctx: *context.LowerContext, d: *decl.Decl, fn_index: u32, ret
     if (sel res_entry.err) { ret err[fail.Fail].err{res_entry.err}; }
     builder.set_block(?ctx.builder, res_entry.ok);
 
-    builder.set_loc(?ctx.builder, source.loc(ctx.scope.a.file_id, d.span.offset));
+    builder.set_loc(?ctx.builder, ctx.m.functions[fn_index].decl_loc);
 
     if (d.data.test_.body != id.STMT_NIL) {
         val res_body: err[fail.Fail] = stmt.lower_stmt(ctx, d.data.test_.body);
@@ -1044,7 +1156,7 @@ fun embed_file_of(ctx: *context.LowerContext, d: *decl.Decl) res[*embed.EmbedFil
         ret res[*embed.EmbedFile, fail.Fail].err{fail.message("embed path disappeared from the interner during lowering")};
     }
 
-    val pr: res[str, manifest.TemplateError] = embed.resolve_arg(ctx.s.alloc, ?ctx.s.embeds, f.path, opt_arg.some);
+    val pr: res[str, manifest.TemplateError] = embed.resolve_arg(ctx.s.alloc, ?ctx.s.embeds, ?ctx.s.interner, ctx.scope.fqn, f.path, opt_arg.some);
     if (sel pr.err) {
         val e: manifest.TemplateError = pr.err;
         if (sel e.internal) { ret res[*embed.EmbedFile, fail.Fail].err{fail.message(e.internal)}; }

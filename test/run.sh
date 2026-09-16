@@ -17,7 +17,7 @@
 #   --bless        write the goldens instead of diffing them, print the diff
 #   --qemu         execute riscv64-linux under qemu-riscv64
 #   --link         run the link cases (test/link/cases) instead of the corpus
-#   --dwarf        build every case with -g and run llvm-dwarfdump --verify
+#   --dwarf        build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
 #   MACH           the compiler under test, default out/<host>/debug/bin/mach
 set -u
 
@@ -216,11 +216,12 @@ manifest() {
         [ "$of" != - ] && echo "of  = \"$of\""
         echo
     done
-    for p in o0 o2 g; do
+    for p in o0 o2 g g2; do
         echo "[profile.$p]"
         case $p in o0) echo 'opt = 0'; echo 'debug = false'; echo 'default = true' ;;
                    o2) echo 'opt = 2'; echo 'debug = false' ;;
-                   g)  echo 'opt = 0'; echo 'debug = true' ;; esac
+                   g)  echo 'opt = 0'; echo 'debug = true' ;;
+                   g2) echo 'opt = 2'; echo 'debug = true' ;; esac
         echo 'simd = "scalarize"'; echo 'vectorize = true'; echo 'float_reassoc = false'; echo
     done
     for c in $cases; do
@@ -381,8 +382,8 @@ run_case() {
         done
     fi
 
-    # the -g build through the external verifier
-    if [ "$dwarf" -eq 1 ] && { [ "$fmt" = elf ] || [ "$fmt" = macho ]; }; then
+    # the -g build through the external verifier for its debug model
+    if [ "$dwarf" -eq 1 ] && { [ "$fmt" = elf ] || [ "$fmt" = macho ] || [ "$fmt" = coff ]; }; then
         if ! build "$t" g "$c"; then
             fail "$t $c build g: $(first_error "$out/log/$t.g.$(art "$c").log")"; return
         fi
@@ -390,6 +391,18 @@ run_case() {
         if ! llvm-dwarfdump --verify "$bin" >"$out/log/$t.g.$(art "$c").verify" 2>&1; then
             fail "$t $c dwarfdump --verify: $(grep -m1 -E 'error|warning' "$out/log/$t.g.$(art "$c").verify")"; return
         fi
+    fi
+    # spirv at O2, the level its golden is built at: some cases are refused at O0 for
+    # reasons that have nothing to do with debug info
+    if [ "$dwarf" -eq 1 ] && [ "$fmt" = spv ]; then
+        if ! build "$t" g2 "$c"; then
+            fail "$t $c build g2: $(first_error "$out/log/$t.g2.$(art "$c").log")"; return
+        fi
+        o=$(object "$t" g2 "$c")
+        if ! spirv-val "$o" >"$out/log/$t.g2.$(art "$c").verify" 2>&1; then
+            fail "$t $c -g spirv-val: $(head -n1 "$out/log/$t.g2.$(art "$c").verify")"; return
+        fi
+        spirv-dis "$o" 2>/dev/null | grep -q ' OpLine ' || { fail "$t $c -g: the module carries no OpLine"; return; }
     fi
     passes=$((passes + 1))
 }
@@ -409,7 +422,7 @@ for t in $targets; do
             echo "run.sh: warning: llvm-objdump is major $got_major, the goldens were blessed with $objdump_major"
     fi
     [ "$(engine "$t")" = - ] || need_tool "${CC:-cc}" "the $t differential"
-    [ "$dwarf" -eq 0 ] || need_tool llvm-dwarfdump --dwarf
+    case "$(object_format "$t")" in elf|macho|coff) [ "$dwarf" -eq 0 ] || need_tool llvm-dwarfdump --dwarf ;; esac
 done
 echo "targets: $targets"
 echo "cases:   $(echo $cases | wc -w)"

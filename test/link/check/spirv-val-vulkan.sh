@@ -2,18 +2,27 @@
 . "$(dirname "$0")/common.sh"
 
 # spirv_val_env <binary> <target-env>
-# shared body: glob the case's output root (a finished-module target has no linked
-# binary, so the delivery is the module tree) and run spirv-val over each `.spv`.
-# an EXTERNAL validator is the point — mach reading back its own bytes proves
-# self-consistency, not validity. the observable is the module count plus the
-# verdict, so a build that silently stopped emitting fails on the count rather than
-# passing vacuously.
+# shared body: validate the delivered artifact, the entry module the build wrote at
+# the `-o` path, then glob the case's output root for the per-module objects and run
+# spirv-val over each `.spv`. an EXTERNAL validator is the point — mach reading back
+# its own bytes proves self-consistency, not validity. the observable is the module
+# count plus the verdict, so a build that silently stopped emitting fails on the count
+# rather than passing vacuously, and one that stopped delivering fails on the artifact.
 spirv_val_env() {
     out_dir=$(dirname "$1")
     env_arg=$2
     if ! command -v spirv-val >/dev/null 2>&1; then
         echo "link: spirv-val: the validator is not installed (spirv-tools)" >&2
         return 2
+    fi
+    if [ ! -s "$1" ]; then
+        echo "link: spirv-val: the build delivered no module at the artifact path" >&2
+        return 2
+    fi
+    if [ -n "$env_arg" ]; then
+        spirv-val --target-env "$env_arg" "$1" || return 1
+    else
+        spirv-val "$1" || return 1
     fi
     n=0
     for m in $(find "$out_dir" -name '*.spv' | sort); do
@@ -29,10 +38,10 @@ spirv_val_env() {
         return 2
     fi
     if [ -n "$env_arg" ]; then
-        printf 'modules=%d validator=clean env=%s\n' "$n" "$env_arg"
+        printf 'artifact=clean modules=%d validator=clean env=%s\n' "$n" "$env_arg"
         return 0
     fi
-    printf 'modules=%d validator=clean\n' "$n"
+    printf 'artifact=clean modules=%d validator=clean\n' "$n"
 }
 
 # produce_spirv_val_vulkan <engine> <leg> <binary>

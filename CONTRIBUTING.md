@@ -88,23 +88,25 @@ chore: update dependencies
 
 ## Issues
 
-File issues through the templates. Each template names the sidebar fields a
-template cannot set: the type label, the `area:*` labels, a `target:*` label
-when the work is target-specific, and the milestone.
+File issues through the templates. Issues use an orthogonal, faceted tagging system across five sets:
+
+- SemVer magnitude: `patch`, `minor`, `major`
+- Kind of work: `feature`, `fix`, `removal`, `chore`, `performance`
+- Where (domain or location): `testing`, `tooling`, `doc` (omitted when touching core compiler code)
+- Severity and state: `critical`, `blocked`, `security`
+- Discussion: `discussion` (design proposals, RFCs, and open debates)
+
+Tags mix and match across sets (for example, `patch`, `fix`, `tooling`). When opening an issue, select the applicable tags in the sidebar. Milestones are not used for tracking in-flight work.
 
 
 ## Versioning
 
-Mach uses [semantic versioning](https://semver.org/) (`vMAJOR.MINOR.PATCH`):
-MAJOR for breaking changes to the supported compiler surface, MINOR for
-backward-compatible additions, PATCH for fixes, documentation, and internal
-improvements. The standard library is versioned separately in its own
-repository.
+Mach adheres strictly to [semantic versioning](https://semver.org/) (`vMAJOR.MINOR.PATCH`):
+- `MAJOR`: breaking changes to the language grammar, compiler interface, or supported runtime contracts.
+- `MINOR`: backward-compatible new language features, compiler flags, target additions, and optimizations.
+- `PATCH`: backward-compatible bug fixes, documentation, and internal refactors.
 
-A release bump updates both `[project].version` in `mach.toml` and
-`MACH_VERSION` in `src/lang/version.mach`; CI and the tag workflow require
-the two to match. Tags are created on `main` after the integration merge
-from `dev`.
+The standard library is versioned separately in its own repository. SemVer impact is tracked directly on issues and pull requests via conventional commit types and issue tags. A release bump updates both `[project].version` in `mach.toml` and `MACH_VERSION` in `src/lang/version.mach`. Tags are created on `main` after the integration merge from `dev`.
 
 
 ## License

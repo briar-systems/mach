@@ -60,6 +60,60 @@ pub rec Report {
 # the deepest source directory nesting the walk follows
 val MAX_DEPTH: usize = 256;
 
+# how the operand names its input
+# ---
+# stream:  `-`, the source arrives on stdin
+# source:  one source file, formatted with no manifest read
+# project: a directory holding a mach.toml, or the mach.toml itself
+pub def Operand: u8;
+pub val OPERAND_STREAM:  Operand = 0;
+pub val OPERAND_SOURCE:  Operand = 1;
+pub val OPERAND_PROJECT: Operand = 2;
+
+# the operand spelling that names stdin
+pub val STREAM_OPERAND: str = "-";
+# how diagnostics and the check listing name the stream
+pub val STREAM_NAME: str = "<stdin>";
+
+# where the canonical text of one input goes
+# ---
+# file:   replace the input file in place and name it on stdout
+# stream: write the canonical text to stdout, whether or not it differs
+# name:   write no source; name the input on stdout when its layout differs
+pub def Sink: u8;
+pub val SINK_FILE:   Sink = 0;
+pub val SINK_STREAM: Sink = 1;
+pub val SINK_NAME:   Sink = 2;
+
+# one input's destination; SINK_FILE reads dirfd, leaf and mode, SINK_STREAM
+# reads stream, and SINK_NAME reads none of them
+# ---
+# sink:   which of the three destinations receives the canonical text
+# dirfd:  the directory holding the input file
+# leaf:   the input file's name within that directory
+# mode:   the input file's permission bits, carried onto the replacement
+# stream: the descriptor the canonical text is written to
+rec Destination {
+    sink:   Sink;
+    dirfd:  i32;
+    leaf:   str;
+    mode:   i32;
+    stream: i32;
+}
+
+# a destination for an input with no file behind it, writing to `stream`
+fun detached(sink: Sink, stream: i32) Destination {
+    ret Destination{sink: sink, dirfd: -1, leaf: nil, mode: 0, stream: stream};
+}
+
+# the sink one invocation writes through: --check never writes source, a stream
+# operand always writes its text, and every other operand rewrites in place
+fun sink_for(kind: Operand, check: bool) Sink {
+    if (check)                  { ret SINK_NAME; }
+    if (kind == OPERAND_STREAM) { ret SINK_STREAM; }
+    ret SINK_FILE;
+}
+
 fun environment(a: *A.Allocator, name: str, detail: str) outcome.Fail {
     val text: res[str, format.FormatError] = format.sprint(a, "{}: {}", name, detail);
     if (sel text.err) { ret outcome.environment(detail); }
@@ -129,6 +183,18 @@ fun report_malformed(a: *A.Allocator, name: str, text: str, diags: *diagnostic.D
     ret err[outcome.Fail].ok{};
 }
 
+# every byte of `text` to one descriptor, or the first native refusal
+fun write_all(fd: i32, text: str) i64 {
+    val len:     usize = str_len(text);
+    var written: usize = 0;
+    for (written < len) {
+        val n: i64 = os.write(fd, (text::usize + written)::*u8, len - written);
+        if (n < 0) { ret n; }
+        written = written + n::usize;
+    }
+    ret 0;
+}
+
 # the canonical text is written to `<leaf>.tmp` beside the source and renamed
 # over it, so an interrupted rewrite leaves the original whole
 fun replace_source(a: *A.Allocator, dirfd: i32, leaf: str, name: str, text: str, mode: i32) err[outcome.Fail] {
@@ -140,15 +206,8 @@ fun replace_source(a: *A.Allocator, dirfd: i32, leaf: str, name: str, text: str,
     $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) { flags = flags | nofollow.O_NOFOLLOW; }
     val opened: i64 = os.open(dirfd, tmp, flags, mode);
     if (opened < 0) { ret err[outcome.Fail].err{os_failure(a, name, opened)}; }
-    val fd:      i32   = opened::i32;
-    val len:     usize = str_len(text);
-    var written: usize = 0;
-    var failure: i64   = 0;
-    for (written < len && failure == 0) {
-        val n: i64 = os.write(fd, (text::usize + written)::*u8, len - written);
-        if (n < 0) { failure = n; }
-        or         { written = written + n::usize; }
-    }
+    val fd:      i32 = opened::i32;
+    var failure: i64 = write_all(fd, text);
     $if ($mach.build.os == $mach.os.linux || $mach.build.os == $mach.os.darwin) {
         if (failure == 0) { failure = os.set_mode(fd, mode); }
     }
@@ -162,19 +221,29 @@ fun replace_source(a: *A.Allocator, dirfd: i32, leaf: str, name: str, text: str,
     ret err[outcome.Fail].ok{};
 }
 
-# format one open file. in check mode the name is printed when the layout
-# differs; otherwise the canonical text replaces the file with its permission bits
-fun format_open_file(a: *A.Allocator, fd: i32, dirfd: i32, leaf: str, name: str, check: bool, report: *Report) err[outcome.Fail] {
-    var info:    os.stat_t;
-    val checked: i64 = os.stat(fd, ?info);
-    if (checked < 0) { ret err[outcome.Fail].err{os_failure(a, name, checked)}; }
-    if ((os.stat_mode(?info) & os.S_IFMT) != os.S_IFREG) {
-        ret err[outcome.Fail].err{environment(a, name, "source must be a regular file")};
+# hand one input's canonical text to its destination. SINK_STREAM writes every
+# time, since a stream operand owes its caller the source whether or not the
+# layout moved; the other two sinks act only on a difference
+fun emit(a: *A.Allocator, dest: *Destination, name: str, output: str, differs: bool) err[outcome.Fail] {
+    if (dest.sink == SINK_STREAM) {
+        val failure: i64 = write_all(dest.stream, output);
+        if (failure < 0) { ret err[outcome.Fail].err{os_failure(a, name, failure)}; }
+        ret err[outcome.Fail].ok{};
     }
-    val read: res[str, outcome.Fail] = read_text(a, fd, name);
-    if (sel read.err) { ret err[outcome.Fail].err{read.err}; }
-    val text: str = read.ok;
-    fin { str_free(a, text); }
+    if (!differs) { ret err[outcome.Fail].ok{}; }
+    if (dest.sink == SINK_NAME) {
+        print.println(name);
+        ret err[outcome.Fail].ok{};
+    }
+    val replaced: err[outcome.Fail] = replace_source(a, dest.dirfd, dest.leaf, name, output, dest.mode);
+    if (sel replaced.err) { ret replaced; }
+    print.println(name);
+    ret err[outcome.Fail].ok{};
+}
+
+# the one path every operand takes: named text in, canonical text to the
+# destination, a malformed input reported against its own name and counted
+fun format_text(a: *A.Allocator, name: str, text: str, dest: *Destination, report: *Report) err[outcome.Fail] {
     report.visited = report.visited + 1;
     var diags: diagnostic.DiagnosticStore = diagnostic.store_init(a);
     fin { diagnostic.store_dnit(?diags); }
@@ -188,19 +257,28 @@ fun format_open_file(a: *A.Allocator, fd: i32, dirfd: i32, leaf: str, name: str,
     }
     val output: str = formatted.ok;
     fin { str_free(a, output); }
-    if (str_equals(text, output)) { ret err[outcome.Fail].ok{}; }
-    report.differing = report.differing + 1;
-    if (check) {
-        print.println(name);
-        ret err[outcome.Fail].ok{};
-    }
-    val replaced: err[outcome.Fail] = replace_source(a, dirfd, leaf, name, output, (os.stat_mode(?info) & 0o7777)::i32);
-    if (sel replaced.err) { ret replaced; }
-    print.println(name);
-    ret err[outcome.Fail].ok{};
+    val differs: bool = !str_equals(text, output);
+    if (differs) { report.differing = report.differing + 1; }
+    ret emit(a, dest, name, output, differs);
 }
 
-fun format_file(backing: *A.Allocator, dirfd: i32, leaf: str, name: str, check: bool, report: *Report) err[outcome.Fail] {
+# format one open file; the replacement carries the original's permission bits
+fun format_open_file(a: *A.Allocator, fd: i32, dirfd: i32, leaf: str, name: str, sink: Sink, report: *Report) err[outcome.Fail] {
+    var info:    os.stat_t;
+    val checked: i64 = os.stat(fd, ?info);
+    if (checked < 0) { ret err[outcome.Fail].err{os_failure(a, name, checked)}; }
+    if ((os.stat_mode(?info) & os.S_IFMT) != os.S_IFREG) {
+        ret err[outcome.Fail].err{environment(a, name, "source must be a regular file")};
+    }
+    val read: res[str, outcome.Fail] = read_text(a, fd, name);
+    if (sel read.err) { ret err[outcome.Fail].err{read.err}; }
+    val text: str = read.ok;
+    fin { str_free(a, text); }
+    var dest: Destination = Destination{sink: sink, dirfd: dirfd, leaf: leaf, mode: (os.stat_mode(?info) & 0o7777)::i32, stream: -1};
+    ret format_text(a, name, text, ?dest, report);
+}
+
+fun format_file(backing: *A.Allocator, dirfd: i32, leaf: str, name: str, sink: Sink, report: *Report) err[outcome.Fail] {
     var ar:     arena.Arena;
     val init_r: err[A.Error] = arena.init(?ar, backing, 0);
     if (sel init_r.err) { ret err[outcome.Fail].err{outcome.refused(init_r.err)}; }
@@ -211,13 +289,13 @@ fun format_file(backing: *A.Allocator, dirfd: i32, leaf: str, name: str, check: 
     val opened: i64 = open_file(dirfd, leaf);
     if (opened < 0) { ret err[outcome.Fail].err{os_failure(?a, name, opened)}; }
     val fd:     i32               = opened::i32;
-    var result: err[outcome.Fail] = format_open_file(?a, fd, dirfd, leaf, name, check, report);
+    var result: err[outcome.Fail] = format_open_file(?a, fd, dirfd, leaf, name, sink, report);
     val closed: i64               = os.close(fd);
     if (closed < 0 && sel result.ok) { result = err[outcome.Fail].err{os_failure(?a, name, closed)}; }
     ret result;
 }
 
-fun visit(a: *A.Allocator, dirfd: i32, leaf: str, name: str, check: bool, depth: usize, report: *Report) err[outcome.Fail] {
+fun visit(a: *A.Allocator, dirfd: i32, leaf: str, name: str, sink: Sink, depth: usize, report: *Report) err[outcome.Fail] {
     var info:   os.stat_t;
     val probed: i64 = os.stat_path(dirfd, leaf, ?info, os.AT_SYMLINK_NOFOLLOW);
     if (probed < 0) { ret err[outcome.Fail].err{os_failure(a, name, probed)}; }
@@ -225,13 +303,13 @@ fun visit(a: *A.Allocator, dirfd: i32, leaf: str, name: str, check: bool, depth:
     if (kind == os.S_IFDIR) {
         val child: i64 = remove.open_dir(dirfd, leaf);
         if (child < 0) { ret err[outcome.Fail].err{os_failure(a, name, child)}; }
-        ret finish_dir(a, child::i32, name, walk(a, child::i32, name, check, depth + 1, report));
+        ret finish_dir(a, child::i32, name, walk(a, child::i32, name, sink, depth + 1, report));
     }
     if (kind != os.S_IFREG) {
         ret err[outcome.Fail].err{environment(a, name, "symlinks and other non-regular source entries are refused")};
     }
     if (!str_ends_with(leaf, ".mach")) { ret err[outcome.Fail].ok{}; }
-    ret format_file(a, dirfd, leaf, name, check, report);
+    ret format_file(a, dirfd, leaf, name, sink, report);
 }
 
 fun name_compare(a: *str, b: *str) i64 {
@@ -252,7 +330,7 @@ fun name_compare(a: *str, b: *str) i64 {
 }
 
 # every entry of one directory in name order
-fun walk(a: *A.Allocator, dirfd: i32, name: str, check: bool, depth: usize, report: *Report) err[outcome.Fail] {
+fun walk(a: *A.Allocator, dirfd: i32, name: str, sink: Sink, depth: usize, report: *Report) err[outcome.Fail] {
     if (depth >= MAX_DEPTH) { ret err[outcome.Fail].err{environment(a, name, "source directory nesting exceeds 256")}; }
     var names: Vector[str] = vector.init[str](a);
     fin {
@@ -304,7 +382,7 @@ fun walk(a: *A.Allocator, dirfd: i32, name: str, check: bool, depth: usize, repo
                 brk;
             }
             val display: str = joined.ok;
-            result = visit(a, dirfd, names.data[i], display, check, depth, report);
+            result = visit(a, dirfd, names.data[i], display, sink, depth, report);
             str_free(a, display);
             if (sel result.err) { brk; }
             i = i + 1;
@@ -317,7 +395,7 @@ fun walk(a: *A.Allocator, dirfd: i32, name: str, check: bool, depth: usize, repo
 # directory capabilities, so a symlinked component is refused rather than
 # followed; the first component is compared against the dependency tree's
 # identity so an alias of `dep` cannot be selected as the source
-fun source_walk(a: *A.Allocator, dirfd: i32, rel: str, start: usize, name: str, check: bool, depth: usize, exclude: *identities.Identity, report: *Report) err[outcome.Fail] {
+fun source_walk(a: *A.Allocator, dirfd: i32, rel: str, start: usize, name: str, sink: Sink, depth: usize, exclude: *identities.Identity, report: *Report) err[outcome.Fail] {
     if (depth >= MAX_DEPTH) { ret err[outcome.Fail].err{environment(a, name, "source directory nesting exceeds 256")}; }
     var end:    usize = start;
     val length: usize = str_len(rel);
@@ -340,12 +418,13 @@ fun source_walk(a: *A.Allocator, dirfd: i32, rel: str, start: usize, name: str, 
         }
     }
     var result: err[outcome.Fail] = err[outcome.Fail].ok{};
-    if (end == length) { result = walk(a, child, name, check, 0, report); }
-    or                 { result = source_walk(a, child, rel, end + 1, name, check, depth + 1, nil, report); }
+    if (end == length) { result = walk(a, child, name, sink, 0, report); }
+    or                 { result = source_walk(a, child, rel, end + 1, name, sink, depth + 1, nil, report); }
     ret finish_dir(a, child, name, result);
 }
 
-# the manifest's `project.src`, cleaned, relative to the project root
+# the manifest's `project.src`, cleaned, relative to the project root. only the
+# `[project]` table is read, so formatting never needs a build profile
 fun source_dir(a: *A.Allocator, manifest_path: str) res[str, outcome.Fail] {
     val bytes_r: res[Vector[u8], fs.FsError] = fs.read_bytes(a, manifest_path);
     if (sel bytes_r.err) {
@@ -366,10 +445,10 @@ fun source_dir(a: *A.Allocator, manifest_path: str) res[str, outcome.Fail] {
     fin { toml.dnit(a, ?tbl); }
     var itn: intern.Interner = intern.init(a);
     fin { intern.dnit(?itn); }
-    val man_r: res[manifest.Manifest, outcome.Fail] = manifest.parse(a, ?itn, ?tbl, true);
-    if (sel man_r.err) { ret res[str, outcome.Fail].err{man_r.err}; }
-    var m: manifest.Manifest = man_r.ok;
+    var m: manifest.Manifest = manifest.empty();
     fin { manifest.dnit(?m, a); }
+    val parsed: err[outcome.Fail] = manifest.parse_project(a, ?itn, ?tbl, ?m);
+    if (sel parsed.err) { ret res[str, outcome.Fail].err{parsed.err}; }
     val found: opt[str] = intern.lookup(?itn, m.src);
     if (sel found.none) { ret res[str, outcome.Fail].err{outcome.internal("the manifest's source directory is not interned")}; }
     val cleaned: res[str, A.Error] = path.clean(a, found.some);
@@ -379,23 +458,23 @@ fun source_dir(a: *A.Allocator, manifest_path: str) res[str, outcome.Fail] {
 
 # the dependency tree is identified through the root so the walk can never
 # select it
-fun walk_project(a: *A.Allocator, backing: *A.Allocator, root: i32, rel: str, check: bool, report: *Report) err[outcome.Fail] {
+fun walk_project(a: *A.Allocator, backing: *A.Allocator, root: i32, rel: str, sink: Sink, report: *Report) err[outcome.Fail] {
     val dependency: i64 = remove.open_dir(root, "dep");
-    if (dependency == os.ENOENT || dependency == os.ENOTDIR) { ret source_walk(backing, root, rel, 0, rel, check, 0, nil, report); }
+    if (dependency == os.ENOENT || dependency == os.ENOTDIR) { ret source_walk(backing, root, rel, 0, rel, sink, 0, nil, report); }
     if (dependency < 0)                                      { ret err[outcome.Fail].err{os_failure(a, "dep", dependency)}; }
     val dep_fd:     i32               = dependency::i32;
     var result:     err[outcome.Fail] = err[outcome.Fail].ok{};
     var excluded:   identities.Identity;
     val identified: i64               = os.file_identity(dep_fd, ?excluded);
     if (identified < 0) { result = err[outcome.Fail].err{os_failure(a, "dep", identified)}; }
-    or                  { result = source_walk(backing, root, rel, 0, rel, check, 0, ?excluded, report); }
+    or                  { result = source_walk(backing, root, rel, 0, rel, sink, 0, ?excluded, report); }
     ret finish_dir(a, dep_fd, "dep", result);
 }
 
 # format or check one project: the manifest names the source directory, the
 # dependency tree is identified so it can never be selected, and the walk
 # visits only the source tree
-pub fun format_project(a: *A.Allocator, backing: *A.Allocator, project_root: str, manifest_path: str, check: bool) res[Report, outcome.Fail] {
+pub fun format_project(a: *A.Allocator, backing: *A.Allocator, project_root: str, manifest_path: str, sink: Sink) res[Report, outcome.Fail] {
     var report: Report                 = Report{visited: 0, differing: 0, malformed: 0};
     val rel_r:  res[str, outcome.Fail] = source_dir(a, manifest_path);
     if (sel rel_r.err) { ret res[Report, outcome.Fail].err{rel_r.err}; }
@@ -404,23 +483,83 @@ pub fun format_project(a: *A.Allocator, backing: *A.Allocator, project_root: str
     val opened: i64 = remove.open_path(project_root);
     if (opened < 0) { ret res[Report, outcome.Fail].err{os_failure(a, project_root, opened)}; }
     val root:   i32               = opened::i32;
-    var result: err[outcome.Fail] = walk_project(a, backing, root, rel, check, ?report);
+    var result: err[outcome.Fail] = walk_project(a, backing, root, rel, sink, ?report);
     result = finish_dir(a, root, project_root, result);
     if (sel result.err) { ret res[Report, outcome.Fail].err{result.err}; }
     ret res[Report, outcome.Fail].ok{report};
 }
 
-# `mach fmt <path> [--check]`
+# format one source file named directly, with no manifest read: the file's own
+# directory is opened so the leaf is handled exactly as the project walk handles it
+pub fun format_one_file(a: *A.Allocator, backing: *A.Allocator, operand: str, sink: Sink) res[Report, outcome.Fail] {
+    var report: Report = Report{visited: 0, differing: 0, malformed: 0};
+    val leaf:   str    = path.filename(operand);
+    if (leaf == nil || str_equals(leaf, "")) {
+        ret res[Report, outcome.Fail].err{outcome.user("mach fmt: the source operand names no file")};
+    }
+    val parent_r: res[str, A.Error] = path.parent(a, operand);
+    if (sel parent_r.err) { ret res[Report, outcome.Fail].err{outcome.refused(parent_r.err)}; }
+    val parent: str = parent_r.ok;
+    fin { str_free(a, parent); }
+    val opened: i64 = remove.open_path(parent);
+    if (opened < 0) { ret res[Report, outcome.Fail].err{os_failure(a, parent, opened)}; }
+    val dirfd:  i32               = opened::i32;
+    var result: err[outcome.Fail] = format_file(backing, dirfd, leaf, operand, sink, ?report);
+    result = finish_dir(a, dirfd, parent, result);
+    if (sel result.err) { ret res[Report, outcome.Fail].err{result.err}; }
+    ret res[Report, outcome.Fail].ok{report};
+}
+
+# format the source arriving on one descriptor onto another; nothing on disk is
+# read or written, so no manifest is involved at any point. the descriptors are
+# parameters rather than the process streams so the caller owns that binding
+pub fun format_stream(a: *A.Allocator, in_fd: i32, out_fd: i32, sink: Sink) res[Report, outcome.Fail] {
+    var report: Report                 = Report{visited: 0, differing: 0, malformed: 0};
+    val read:   res[str, outcome.Fail] = read_text(a, in_fd, STREAM_NAME);
+    if (sel read.err) { ret res[Report, outcome.Fail].err{read.err}; }
+    val text: str = read.ok;
+    fin { str_free(a, text); }
+    var dest:   Destination       = detached(sink, out_fd);
+    val result: err[outcome.Fail] = format_text(a, STREAM_NAME, text, ?dest, ?report);
+    if (sel result.err) { ret res[Report, outcome.Fail].err{result.err}; }
+    ret res[Report, outcome.Fail].ok{report};
+}
+
+# which form the operand takes. `-` is the stream; a directory, or a file named
+# mach.toml, is a project; any other existing file is a single source
+pub fun classify(operand: str) res[Operand, outcome.Fail] {
+    if (operand == nil) {
+        ret res[Operand, outcome.Fail].err{outcome.user("mach fmt expects one operand: a project path, a source file, or '-' for stdin")};
+    }
+    if (str_equals(operand, STREAM_OPERAND)) { ret res[Operand, outcome.Fail].ok{OPERAND_STREAM}; }
+    val is_dir: res[bool, io_error.Error] = fs.is_dir(operand);
+    if (sel is_dir.ok && is_dir.ok) { ret res[Operand, outcome.Fail].ok{OPERAND_PROJECT}; }
+    val is_file: res[bool, io_error.Error] = fs.is_file(operand);
+    if (sel is_file.ok && is_file.ok) {
+        if (str_equals(path.filename(operand), util.PROJECT_CONFIG_NAME)) { ret res[Operand, outcome.Fail].ok{OPERAND_PROJECT}; }
+        ret res[Operand, outcome.Fail].ok{OPERAND_SOURCE};
+    }
+    ret res[Operand, outcome.Fail].err{outcome.user("mach fmt operand is not a directory, a file, or '-' for stdin")};
+}
+
+fun run_project(a: *A.Allocator, backing: *A.Allocator, operand: str, sink: Sink) res[Report, outcome.Fail] {
+    val loc_r: res[util.ProjectLocation, outcome.Fail] = util.resolve_project_location(a, operand);
+    if (sel loc_r.err) { ret res[Report, outcome.Fail].err{loc_r.err}; }
+    val loc: util.ProjectLocation = loc_r.ok;
+    ret format_project(a, backing, loc.root, loc.manifest, sink);
+}
+
+# `mach fmt <path>|<file>|- [--check]`
 # ---
 # argv: the full process arguments
 # inv:  the parsed invocation for this command
-# ret:  0 every file is canonical (or was made so), 1 a file differs under
-#       --check, a file is malformed, or the invocation is a user error, 2 internal
+# ret:  0 every input is canonical (or was made so), 1 an input differs under
+#       --check, an input is malformed, or the invocation is a user error, 2 internal
 #       failure, 3 filesystem failure
 pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64 {
     if (args.reject_unknown_from_invocation(inv, argv, "mach fmt")) { ret 1; }
     if (inv.positional_count != 1) {
-        val f: outcome.Fail = outcome.user("mach fmt expects one project path");
+        val f: outcome.Fail = outcome.user("mach fmt expects one operand: a project path, a source file, or '-' for stdin");
         ret cli_diag.render_fail(?f);
     }
     var backing: A.Allocator;
@@ -442,14 +581,19 @@ pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64 {
         val f: outcome.Fail = outcome.internal("failed to initialise allocator");
         ret cli_diag.render_fail(?f);
     }
-    val loc_r: res[util.ProjectLocation, outcome.Fail] = util.resolve_project_location(?a, argv[inv.positional_idx]);
-    if (sel loc_r.err) {
-        val f: outcome.Fail = loc_r.err;
+    val operand: str                        = argv[inv.positional_idx];
+    val kind_r:  res[Operand, outcome.Fail] = classify(operand);
+    if (sel kind_r.err) {
+        val f: outcome.Fail = kind_r.err;
         ret cli_diag.render_fail(?f);
     }
-    val loc:      util.ProjectLocation      = loc_r.ok;
+    val kind:     Operand                   = kind_r.ok;
     val check:    bool                      = args.invocation_flag(args.CMD_FMT, inv, "--check");
-    val report_r: res[Report, outcome.Fail] = format_project(?a, ?backing, loc.root, loc.manifest, check);
+    val sink:     Sink                      = sink_for(kind, check);
+    var report_r: res[Report, outcome.Fail] = res[Report, outcome.Fail].ok{Report{visited: 0, differing: 0, malformed: 0}};
+    if (kind == OPERAND_STREAM) { report_r = format_stream(?a, fs.STDIN.handle.value::i32, fs.STDOUT.handle.value::i32, sink); }
+    or (kind == OPERAND_SOURCE) { report_r = format_one_file(?a, ?backing, operand, sink); }
+    or                          { report_r = run_project(?a, ?backing, operand, sink); }
     if (sel report_r.err) {
         val f: outcome.Fail = report_r.err;
         ret cli_diag.render_fail(?f);
@@ -721,5 +865,168 @@ test "mach.cli.cmd.fmt:source_aliases_cannot_select_the_dependency_directory" {
     if (!t_write(?a, owner.directory, "mach.toml", invalid, 0o600)
         || t_run(?a, owner.directory, true) != 1 || t_run(?a, owner.directory, false) != 1) { ret 8; }
     if (!t_same(?a, owner.directory, "dep/untouched.mach", "fun main()i32{ret 0;}")) { ret 9; }
+    ret 0;
+}
+
+# a manifest with no [profile.*] table: everything mach fmt reads, nothing a
+# build would need
+val T_BARE_MANIFEST: str = "[project]\nid=\"fmtbare\"\nversion=\"0.0.0\"\nsrc=\"src\"\nout=\"out\"\n";
+
+fun t_open(a: *A.Allocator, root: str, rel: str, flags: i32, mode: i32) i32 {
+    val joined: res[str, A.Error] = path.join(a, root, rel);
+    if (sel joined.err) { ret -1; }
+    val name: str = joined.ok;
+    fin { str_free(a, name); }
+    val opened: i64 = os.open(os.AT_FDCWD, name, flags, mode);
+    if (opened < 0) { ret -1; }
+    ret opened::i32;
+}
+
+fun t_text(a: *A.Allocator, root: str, rel: str) str {
+    val joined: res[str, A.Error] = path.join(a, root, rel);
+    if (sel joined.err) { ret nil; }
+    val name: str = joined.ok;
+    fin { str_free(a, name); }
+    val read: res[str, fs.FsError] = fs.read_string(a, name);
+    if (sel read.err) { ret nil; }
+    ret read.ok;
+}
+
+# format `input` through the descriptor pair and answer the resulting report,
+# leaving the canonical text in `out_rel`
+fun t_stream(a: *A.Allocator, root: str, input: str, out_rel: str, sink: Sink, report: *Report) bool {
+    if (!t_write(a, root, "stream.in", input, 0o600)) { ret false; }
+    if (!t_write(a, root, out_rel, "", 0o600))        { ret false; }
+    val in_fd: i32 = t_open(a, root, "stream.in", os.O_RDONLY, 0);
+    if (in_fd < 0) { ret false; }
+    fin { os.close(in_fd); }
+    val out_fd: i32 = t_open(a, root, out_rel, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600);
+    if (out_fd < 0) { ret false; }
+    val formatted: res[Report, outcome.Fail] = format_stream(a, in_fd, out_fd, sink);
+    os.close(out_fd);
+    if (sel formatted.err) { ret false; }
+    @report = formatted.ok;
+    ret true;
+}
+
+test "mach.cli.cmd.fmt:a_file_operand_formats_only_that_file_with_no_manifest" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val created: res[fixture.Output, outcome.Fail] = fixture.create(?a, "mach-fmt-file");
+    if (sel created.err) { ret 2; }
+    var owner: fixture.Output = created.ok;
+    fin { fixture.dnit(?owner); }
+    val original:  str = "fun main()i32{ret 0;}";
+    val canonical: str = "fun main() i32 {\n    ret 0;\n}\n";
+    if (!t_write(?a, owner.directory, "lone.mach", original, 0o600)
+        || !t_write(?a, owner.directory, "sibling.mach", original, 0o600)) { ret 3; }
+    val operand: str = sfmt_join(?a, owner.directory, "lone.mach");
+    if (t_exists(?a, owner.directory, "mach.toml"))                                                 { ret 4; }
+    if (t_run(?a, operand, true) != 1 || !t_same(?a, owner.directory, "lone.mach", original))       { ret 5; }
+    if (t_run(?a, operand, false) != 0 || !t_same(?a, owner.directory, "lone.mach", canonical))     { ret 6; }
+    if (!t_same(?a, owner.directory, "sibling.mach", original))                                     { ret 7; }
+    if (t_exists(?a, owner.directory, "lone.mach.tmp"))                                             { ret 8; }
+    if (t_run(?a, operand, true) != 0 || t_run(?a, operand, false) != 0)                            { ret 9; }
+    if (!t_write(?a, owner.directory, "lone.mach", "fun broken(", 0o600))                           { ret 10; }
+    if (t_run(?a, operand, false) != 1 || !t_same(?a, owner.directory, "lone.mach", "fun broken(")) { ret 11; }
+    ret 0;
+}
+
+test "mach.cli.cmd.fmt:a_project_without_a_profile_table_formats" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val created: res[fixture.Output, outcome.Fail] = fixture.create(?a, "mach-fmt-bare");
+    if (sel created.err) { ret 2; }
+    var owner: fixture.Output = created.ok;
+    fin { fixture.dnit(?owner); }
+    if (fs_failed(fs.create_dir_all(?a, sfmt_join(?a, owner.directory, "src"), 0o700))) { ret 3; }
+    val canonical: str = "fun main() i32 {\n    ret 0;\n}\n";
+    if (!t_write(?a, owner.directory, "mach.toml", T_BARE_MANIFEST, 0o600)
+        || !t_write(?a, owner.directory, "src/main.mach", "fun main()i32{ret 0;}", 0o600)) { ret 4; }
+    if (t_run(?a, owner.directory, true) != 1) { ret 5; }
+    if (t_run(?a, owner.directory, false) != 0
+        || !t_same(?a, owner.directory, "src/main.mach", canonical)) { ret 6; }
+    if (t_run(?a, owner.directory, true) != 0) { ret 7; }
+    ret 0;
+}
+
+test "mach.cli.cmd.fmt:a_stream_formats_to_its_descriptor_exactly_as_a_project_file" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val created: res[fixture.Output, outcome.Fail] = fixture.create(?a, "mach-fmt-stream");
+    if (sel created.err) { ret 2; }
+    var owner: fixture.Output = created.ok;
+    fin { fixture.dnit(?owner); }
+    val original: str = "fun main()i32{ret 0;}";
+    var report:   Report;
+    if (!t_stream(?a, owner.directory, original, "stream.out", SINK_STREAM, ?report)) { ret 3; }
+    if (report.visited != 1 || report.differing != 1 || report.malformed != 0)        { ret 4; }
+    val streamed: str = t_text(?a, owner.directory, "stream.out");
+    if (streamed == nil)                                                                { ret 5; }
+    if (fs_failed(fs.create_dir_all(?a, sfmt_join(?a, owner.directory, "src"), 0o700))) { ret 6; }
+    if (!t_write(?a, owner.directory, "mach.toml", T_MANIFEST, 0o600)
+        || !t_write(?a, owner.directory, "src/main.mach", original, 0o600)) { ret 7; }
+    if (t_run(?a, owner.directory, false) != 0) { ret 8; }
+    val on_disk: str = t_text(?a, owner.directory, "src/main.mach");
+    if (on_disk == nil || !str_equals(streamed, on_disk)) { ret 9; }
+    var canonical_report: Report;
+    if (!t_stream(?a, owner.directory, streamed, "again.out", SINK_STREAM, ?canonical_report)) { ret 10; }
+    if (canonical_report.differing != 0)                                                       { ret 11; }
+    if (!t_same(?a, owner.directory, "again.out", streamed))                                   { ret 12; }
+    var empty_report: Report;
+    if (!t_stream(?a, owner.directory, "", "empty.out", SINK_STREAM, ?empty_report)) { ret 13; }
+    if (empty_report.differing != 0 || empty_report.malformed != 0)                  { ret 14; }
+    if (!t_same(?a, owner.directory, "empty.out", ""))                               { ret 15; }
+    ret 0;
+}
+
+test "mach.cli.cmd.fmt:a_stream_under_check_and_a_malformed_stream_write_no_source" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val created: res[fixture.Output, outcome.Fail] = fixture.create(?a, "mach-fmt-stream-check");
+    if (sel created.err) { ret 2; }
+    var owner: fixture.Output = created.ok;
+    fin { fixture.dnit(?owner); }
+    var differing: Report;
+    if (!t_stream(?a, owner.directory, "fun main()i32{ret 0;}", "check.out", SINK_NAME, ?differing)) { ret 3; }
+    if (differing.differing != 1 || !t_same(?a, owner.directory, "check.out", ""))                   { ret 4; }
+    var canonical: Report;
+    if (!t_stream(?a, owner.directory, "fun main() i32 {\n    ret 0;\n}\n", "clean.out", SINK_NAME, ?canonical)) { ret 5; }
+    if (canonical.differing != 0 || !t_same(?a, owner.directory, "clean.out", ""))                               { ret 6; }
+    var malformed: Report;
+    if (!t_stream(?a, owner.directory, "fun broken(", "bad.out", SINK_STREAM, ?malformed)) { ret 7; }
+    if (malformed.malformed != 1 || malformed.differing != 0)                              { ret 8; }
+    if (!t_same(?a, owner.directory, "bad.out", ""))                                       { ret 9; }
+    ret 0;
+}
+
+# the classified operand, or 255 when classification refused it
+fun t_kind(classified: res[Operand, outcome.Fail]) Operand {
+    if (sel classified.err) { ret 255; }
+    ret classified.ok;
+}
+
+test "mach.cli.cmd.fmt:classify_separates_the_stream_the_project_and_a_lone_source" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val created: res[fixture.Output, outcome.Fail] = fixture.create(?a, "mach-fmt-classify");
+    if (sel created.err) { ret 2; }
+    var owner: fixture.Output = created.ok;
+    fin { fixture.dnit(?owner); }
+    if (!t_write(?a, owner.directory, "mach.toml", T_BARE_MANIFEST, 0o600)
+        || !t_write(?a, owner.directory, "lone.mach", "fun f() {}\n", 0o600)) { ret 3; }
+    if (t_kind(classify("-")) != OPERAND_STREAM)                                          { ret 4; }
+    if (t_kind(classify(owner.directory)) != OPERAND_PROJECT)                             { ret 5; }
+    if (t_kind(classify(sfmt_join(?a, owner.directory, "mach.toml"))) != OPERAND_PROJECT) { ret 6; }
+    if (t_kind(classify(sfmt_join(?a, owner.directory, "lone.mach"))) != OPERAND_SOURCE)  { ret 7; }
+    val missing: res[Operand, outcome.Fail] = classify(sfmt_join(?a, owner.directory, "absent.mach"));
+    if (sel missing.ok) { ret 8; }
+    val none: res[Operand, outcome.Fail] = classify(nil);
+    if (sel none.ok) { ret 9; }
     ret 0;
 }

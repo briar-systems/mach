@@ -52,8 +52,18 @@ error: dep 'std': mach.toml: unknown key 'bogus' in [project]
 What a consumer *uses* from a dependency's manifest is its export surface: the
 project id, the module a bare `use <id>;` binds (see
 [modules.md](modules.md#bare-project-id-imports)), its
-`export = true` link entries, and the steps those entries demand. A dependency's
-`[profile.*]` and `[target.*]` tables are never read to build the consumer.
+`export = true` link entries, the steps those entries demand, and what its
+`default = true` library artifact requires — the artifacts and steps named in
+that artifact's `need` (see
+[Dependency requirements travel](#dependency-requirements-travel)). Nothing else
+travels: a `bin` artifact's `need`, a non-default library's, and every other
+requirement of the dependency stay its own.
+
+A dependency's `[profile.*]` tables are never read to build the consumer, which
+resolves its own profile and builds everything with it. A dependency's
+`[target.*]` tables are read for exactly one purpose: the targets its travelling
+requirements name, `env` included, since those artifacts are built for the
+targets the dependency declares for them. No other `[target.*]` entry is read.
 
 ## The schema at a glance
 
@@ -294,9 +304,11 @@ tuple that would emit nothing.
 ### Finished-module targets
 
 A `spirv` target's object output is a complete, self-contained module rather than
-a link input. The build therefore delivers the **module tree** — one
-`<out>/obj/<fqn-as-path>.spv` per module — and runs no link phase, so a default
-build and `--emit obj` produce the same files:
+a link input. Each module is written to `<out>/obj/<fqn-as-path>.spv` like any
+other target's objects, and the entry module already carries every function its
+stages reach, so it is the whole deliverable. A `bin` artifact therefore needs no
+linker: the build publishes the entry module at the artifact's resolved `out` (or
+`-o`), and `--emit obj` stops at the module tree:
 
 ```toml
 [target.gpu]
@@ -307,8 +319,16 @@ abi = "spirv"
 ```
 
 ```
-mach build . --target gpu     # writes out/gpu/<profile>/obj/<module>.spv
+mach build . --target gpu     # writes the entry module at the artifact's out, and out/gpu/<profile>/obj/<module>.spv
 ```
+
+With `debug` on, each module carries its debug information inside it, written as core
+instructions that need no capability or extension and so fit every `env`: `OpString`
+and `OpSource` name the source files, `OpName` names functions, interface variables and
+locals, `OpName` and `OpMemberName` name a uniform or storage block's record and its
+fields, and `OpLine` attributes each instruction to its source line and column. A
+required shader artifact built for a consumer's debug profile therefore builds, and
+validation layers and capture tools report names and source lines.
 
 `env` is a general target key whose values are owned by the target's isa; a
 `spirv` target uses it to declare the environment its modules are consumed in.
@@ -342,10 +362,11 @@ abi = "spirv"
 env = "vulkan1.2"
 ```
 
-The artifact's `out` template and `-o` name a linked binary, which such a target
-has none of; the module tree is delivered instead. A `static` or `shared`
-artifact kind, and `mach test`, are refused by name — there is no archive, shared
-object, or executable form for a module.
+The artifact's `out` template and `-o` name that delivered module, so
+`{artifact.suffix}` gives it `.spv`, and `{artifact.<id>.out}` names it for a
+consumer that embeds it (see [Artifact requirements](#artifact-requirements)). A
+`static` or `shared` artifact kind, and `mach test`, are refused by name, since
+there is no archive, shared object, or executable form for a module.
 
 ### Platform targets (bare metal)
 
@@ -404,7 +425,7 @@ naming come from `[target.*]` facts, and an absent optional feature such as a
 | Key     | Type    | Meaning |
 |---------|---------|---------|
 | `opt`   | integer | Optimization level: `0` selects the debug pipeline (the always-on passes only), `1` and `2` select the release pipeline. `1` and `2` currently share a pass set, which includes loop auto-vectorization (see `vectorize` below). Any other integer — or a non-integer — is a manifest error. |
-| `debug` | bool    | Emit debug info (DWARF on ELF/Mach-O, CodeView on COFF) for this profile. Gates emission only, never the optimizer, so a `release` profile can keep symbols with `debug = true`. A non-boolean is a manifest error. |
+| `debug` | bool    | Emit debug info for this profile: DWARF in ELF, Mach-O and COFF objects alike, and the core SPIR-V debug instructions on a `spirv` target (see [Finished-module targets](#finished-module-targets)). A PE image carries its DWARF in `.debug_*` sections, which gdb, lldb and the LLVM tools read and Visual Studio and WinDbg do not. Gates emission only, never the optimizer, so a `release` profile can keep symbols with `debug = true`. A non-boolean is a manifest error. |
 | `simd`  | string  | SIMD scalarization lever. `"scalarize"` emits a defined unrolled scalar expansion wherever the target has no packed instruction for a vector operator, with a build-time note. `"require"` makes that a hard error naming the operation, its **lane width**, the function and the target. It applies **per operation on every target**, not only to targets with no vector unit: x86-64's SSE2 baseline has no 32-bit lane integer multiply and NEON has no 64-bit one, so a capable target scalarizes too. Any other string is a manifest error. |
 | `vectorize` | bool | Auto-vectorization lever. When `true`, the release pipeline rewrites provably-safe counted loops to 128-bit SIMD on a target with hardware vectors; `false` skips the pass, so release output stays scalar. A non-boolean is a manifest error. |
 | `float_reassoc` | bool | Permission to treat floating-point addition and multiplication as **associative**. It lets the vectorizer reduce an `f32`/`f64` accumulator through lane-count partial sums, which changes the result — see [Float reassociation](#float-reassociation) for what that costs and what it buys. A non-boolean is a manifest error. |
@@ -566,9 +587,15 @@ reads the selected artifact's name.
 `src` is not part of the cell merely because it shares the project directory. This
 is what lets one project declare host and accelerator artifacts with disjoint target
 sets. `mach test` is the deliberate whole-source exception: it roots collection at
-every module in the current project's `src` tree.
+every module in the current project's `src` tree, minus the modules that only
+artifacts the selected target does not build reach. Those belong to the target their
+artifact declares, so a host test build leaves them out and counts them among the
+modules it skipped, exactly as it does a module a comptime gate excluded. A module
+both a selected-target artifact and another target's reach is compiled here, and a
+module no artifact reaches is collected as before.
 
-- **`bin`** links an executable at the resolved `out` path.
+- **`bin`** links an executable at the resolved `out` path. On a finished-module
+  target such as `spirv` it is the entry module, written there unlinked.
 - **`static`** materialises a real `ar` archive at the resolved `out` path — the
   per-module objects with an archive symbol index, the deliverable a consumer links
   as a `.a` (#1997).
@@ -608,8 +635,9 @@ inspection use the same expansion.
 | SPIR-V module | `.spv` | unsupported | unsupported |
 
 The selected object format supplies the naming rules, including explicit target
-format overrides. Unsupported library forms are errors. Module-producing backends
-retain their existing per-module output behavior.
+format overrides. Unsupported library forms are errors. A SPIR-V `bin` artifact is
+its entry module, delivered at `out` with the per-module objects still written under
+`obj/` (see [Finished-module targets](#finished-module-targets)).
 
 `{artifact.suffix}` is available only in an artifact output template. It does not
 expand in project output roots, link paths, step arguments or source embeds.
@@ -826,7 +854,10 @@ Steps carry **no filters** and **never run automatically**. A step runs only whe
 - by a selected `[link.X]` whose `local` `path` matches the step's `out`;
 - by another step's `need`;
 - by an artifact's `need` (for outputs that are not link inputs), by name or
-  through a glob.
+  through a glob;
+- in a dependency, by the `need` of its `default = true` library artifact, which
+  travels to every consumer (see
+  [Dependency requirements travel](#dependency-requirements-travel)).
 
 Because a step has no filter of its own, the condition for running it lives in the
 link entry that demands it: on a build cell where that entry filters out, the step
@@ -909,7 +940,8 @@ A dependency is named by its **project id**, and that one name is used in three
 places: the manifest key `[dep.<id>]`, the directory `dep/<id>/`, and the head
 segment of every module path the dependency exposes (`use <id>.x;`). The
 compiler checks all three agree: `dep/<id>/mach.toml` must declare
-`id = "<id>"`.
+`id = "<id>"`. A dependency whose id is the declaring project's own is refused
+where it is declared, since one head segment cannot name two projects.
 
 ```toml
 [dep.std]
@@ -1013,10 +1045,27 @@ reads `exact commit ref 'commit/<id>' is not satisfied by the realized commit
 The verifier reads the git **index**, so a freshly realized dependency is
 verifiable before it is committed.
 
-`mach dep pull` on a fresh clone finds each committed gitlink as an empty
-directory and initializes it in place (`realized std @ … (initialized the
-committed gitlink)`); no gitlink command ever runs against a path that is not
-a checkout of its own.
+`mach dep pull` reads what a Git dependency's `dep/<id>` holds together with
+its record (the staged gitlink, its `.gitmodules` entry, and any module
+directory Git retained) and takes the one step that brings it to what a build
+verifies:
+
+- a staged gitlink with nothing checked out, as on a fresh clone or after the
+  directory was deleted, is initialized in place (`realized std @ …
+  (initialized the committed gitlink)`), first restoring its `.gitmodules`
+  entry from the manifest if that entry is gone;
+- a checkout at another commit than its gitlink is checked out at the gitlink;
+- a clean checkout of its own with no gitlink is registered, moved to the
+  declared selector from the declared source, and staged (`(registered the
+  existing checkout)`);
+- with neither, the submodule is added at the selector, reusing a module
+  directory Git retained from an earlier removal.
+
+A symlink, a file, a directory that is not a checkout of its own, and a dirty
+checkout that would be registered are refused and left as they are. `mach dep
+add` takes the same step for its Git source, so re-adding a dependency whose
+checkout `remove` retained registers that checkout, and it refuses a dirty one.
+No gitlink command ever runs against a path that is not a checkout of its own.
 
 A project root is identified by its own `mach.toml`, not by an enclosing git
 repository; `dep/<id>` is resolved relative to the project root. A project
@@ -1081,8 +1130,9 @@ Paths and `cmd`s expand over a closed, final set of eight variables:
   Available only in an artifact's own `out`. See
   [Artifact filenames and identity](#artifact-filenames-and-identity).
 - `{artifact.<id>.out}` — the output path of a required artifact, relative to the
-  project root exactly as `{project.out}` is. See
-  [Artifact requirements](#artifact-requirements).
+  root project's directory exactly as `{project.out}` is. In a dependency's module
+  it names a requirement of that dependency's default library artifact, homed under
+  `dep/<id>`. See [Artifact requirements](#artifact-requirements).
 
 The three `{target.*}` tuple keys are also exported to every step process as
 `MACH_TARGET_ISA`/`MACH_TARGET_OS`/`MACH_TARGET_ABI` (see [build steps](#stepname--build-steps)).
@@ -1146,8 +1196,9 @@ the template's own value does; a literal `#[embed]` path keeps resolving against
 declaring file's directory. Only `{artifact.<id>.out}` may appear in an `#[embed]`
 path.
 
-Requirements are within one manifest: a `need` entry never reaches into a
-dependency.
+Requirements are written within one manifest: a `need` entry never names another
+project's artifact or step, and a consumer cannot add to a dependency's `need`.
+A dependency's own requirements reach the consumer by travelling, below.
 
 These are errors:
 
@@ -1163,6 +1214,76 @@ manifests receive these checks during parsing, before planning can execute a ste
 
 A required artifact that fails to build fails its consumer, naming the requirement,
 and the consumer is not attempted.
+
+### Dependency requirements travel
+
+A library that embeds what it builds cannot be consumed if its requirements stop
+at its own manifest, and a consumer has no way to declare them. So a dependency's
+**`default = true` library artifact** carries its requirements as part of its
+export surface: the artifacts and steps its `need` names are built for any project
+whose dependency closure holds that dependency, before the cells that compile
+against the closure. Only that artifact's `need` travels. Several library artifacts
+may share the `default` marker and the public entry; their requirements travel
+together.
+
+```toml
+# the dependency's mach.toml
+[artifact.shlib]
+default = true
+kind    = "static"
+entry   = "lib.mach"
+out     = "lib/shlib{artifact.suffix}"
+targets = ["linux-x86_64"]
+link    = []
+need    = ["artifact.shader-frag"]
+
+[artifact.shader-frag]
+kind    = "bin"
+entry   = "shaders/frag.mach"
+out     = "spv/frag{artifact.suffix}"
+targets = ["spirv"]
+link    = []
+need    = []
+```
+
+```mach
+# the dependency's src/lib.mach, compiled by every consumer
+#[embed("{artifact.shader-frag.out}")]
+val FRAG: [_]u8;
+```
+
+The rules:
+
+- **The consumer's profile, the dependency's targets.** A travelling requirement
+  is built with the profile the consumer resolved, for every target it names in
+  the dependency's own manifest. The consumer's target never selects among them,
+  because target names of two manifests are unrelated; a requirement naming
+  several targets has no single `{artifact.<id>.out}`, exactly as within one
+  manifest.
+- **Homed in the consumer, namespaced by id.** The output is
+  `<expanded root [project].out>/dep/<dependency id>/<the artifact's own out>`, so
+  two dependencies that both declare `shader-quad` produce two files and neither
+  writes into its own checkout. `{project.out}` keeps meaning the root's out in
+  every manifest of the closure, as it does for a dependency's steps, and the
+  cell's objects sit in the root's `obj/` beside every other module's. `mach clean`
+  removes that home and those objects with the rest of the output, reading the
+  realized dependency manifests for the target names the root never declares.
+- **Scope follows the module.** `{artifact.<id>.out}` in a module the dependency
+  owns is read in that dependency's manifest and checked against its default
+  library artifact; the root's modules keep reading the root's manifest and the
+  requirements of the artifact being built. Naming anything else is the ordinary
+  refusal, located at the scope it was read in.
+- **Its own closure, recursively.** A travelling requirement compiles against the
+  dependency's own transitive closure, realized in the root's flat `dep/`, and
+  the requirements of *those* dependencies' default library artifacts travel to
+  it in turn. A requirement reached through several consumers is built once, and
+  a failure names the dependency chain (`dependency app -> boom -> shader: ...`).
+- **Steps too.** A step the default library artifact's `need` names runs for the
+  consumer, alongside the steps its `export = true` link entries demand.
+
+Nothing here makes an `#[embed]` an edge in the build graph: a missing embedded
+file is still a compile error and still triggers nothing (#2887). What runs is
+the requirement the dependency declared.
 
 ## Selection and the build matrix
 

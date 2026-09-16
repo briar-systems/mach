@@ -1,0 +1,443 @@
+use std.allocator.page;
+use std.collections.map;
+use std.memory;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+use std.format;
+
+use enc: mach.lang.be.codegen.encode;
+use mach.lang.diagnostic;
+use mach.lang.fail;
+use mach.lang.fe.token;
+use mach.lang.intern;
+use mach.lang.layout;
+use mach.lang.session;
+use src: mach.lang.source;
+use mach.lang.target.of;
+use mach.lang.target.of.ar;
+
+use mach.lang.be.linker.common.GmTrackEntry;
+use mach.lang.be.linker.common.GmTracker;
+use mach.lang.be.linker.common.atom_effective_offset;
+use mach.lang.be.linker.common.gm_track_allocate;
+use mach.lang.be.linker.common.gm_track_deallocate;
+use mach.lang.be.linker.common.gm_track_reallocate;
+use mach.lang.be.linker.common.lt_image;
+use mach.lang.be.linker.common.lt_name;
+
+pub rec StrMerge {
+    buf:    enc.ByteBuf;
+    offs:   map.Map[intern.StrId, u32];
+    name:   intern.StrId;
+    active: bool;
+}
+
+pub fun collect_debug_sections(alloc: *A.Allocator, out_img: *of.ObjectImage, count: *u32) res[*of.Section, fail.Fail] {
+    @count = 0;
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < out_img.section_count) {
+        if (out_img.sections[i].kind == of.SK_DEBUG) { n = n + 1; }
+        i = i + 1;
+    }
+    if (n == 0) { ret res[*of.Section, fail.Fail].ok{nil}; }
+
+    val ar: res[*of.Section, A.Error] = A.allocate[of.Section](alloc, n::usize);
+    if (sel ar.err) { ret res[*of.Section, fail.Fail].err{fail.refused(ar.err)}; }
+    val out: *of.Section = ar.ok;
+
+    var w: u32 = 0;
+    i = 0;
+    for (i < out_img.section_count) {
+        if (out_img.sections[i].kind == of.SK_DEBUG) {
+            out[w] = out_img.sections[i];
+            w      = w + 1;
+        }
+        i = i + 1;
+    }
+
+    @count = n;
+    ret res[*of.Section, fail.Fail].ok{out};
+}
+
+pub fun debug_abbrev_tables_equal(a: *of.Section, b: *of.Section) bool {
+    if (a == nil || b == nil || a.len != b.len) { ret false; }
+    if (a.len == 0)                             { ret true; }
+    if (a.bytes == nil || b.bytes == nil)       { ret false; }
+    ret memory.raw_equal(a.bytes::ptr, b.bytes::ptr, a.len::usize);
+}
+
+pub fun module_debug_is_linkable(modules: *of.ObjectImage, m: u32) bool {
+    var has_debug: bool = false;
+    var sc:        u32  = 0;
+    for (sc < modules[m].section_count) {
+        val sec: *of.Section = ?modules[m].sections[sc];
+        if (sec.kind == of.SK_DEBUG && sec.len > 0) {
+            val nm: opt[str] = intern.lookup(modules[m].interner, sec.name);
+            if (sel nm.some && str_equals(nm.some, ".debug_info")) {
+                has_debug = true;
+            }
+        }
+        sc = sc + 1;
+    }
+    if (!has_debug) { ret true; }
+
+    var ri: u32 = 0;
+    for (ri < modules[m].reloc_count) {
+        val r: *of.Relocation = ?modules[m].relocations[ri];
+        if (of.section_index(r.section) >= modules[m].section_count
+            || modules[m].sections[of.section_index(r.section)].kind != of.SK_DEBUG
+            || r.sym >= modules[m].symbol_count) {
+            ri = ri + 1;
+            cnt;
+        }
+        val tsec: u32 = of.section_index(modules[m].symbols[r.sym].section);
+        if (tsec != of.SECTION_EXTERNAL && tsec < modules[m].section_count
+            && tsec != of.section_index(r.section) && modules[m].sections[tsec].kind == of.SK_DEBUG) {
+            ret true;
+        }
+        ri = ri + 1;
+    }
+    ret false;
+}
+
+pub fun warn_debug_dropped(s: *session.Session, name: intern.StrId) {
+    val nm: opt[str] = intern.lookup(?s.interner, name);
+    var on: str      = "?";
+    if (sel nm.some) { on = nm.some; }
+    val result: res[str, format.FormatError] = format.sprint(s.alloc,
+        "debug info in '{}' uses unrelocated cross-section offsets and cannot be merged; it is left out of the link",
+        on);
+    if (sel result.err) { ret; }
+    val buf:  str = result.ok;
+    var span: token.Span;
+    span.offset = 0;
+    span.len    = 0;
+    diagnostic.record_warning(?s.diags, 0xFFFFFFFF::src.FileId, span, buf);
+    str_free(s.alloc, buf);
+}
+
+pub fun discover_debug_names(alloc: *A.Allocator, modules: *of.ObjectImage, module_count: u32,
+    out_names: **intern.StrId, out_count: *u32) err[fail.Fail] {
+    @out_names = nil;
+    @out_count = 0;
+    var names: *intern.StrId = nil;
+    var count: u32           = 0;
+    var cap:   u32           = 0;
+
+    var m: u32 = 0;
+    for (m < module_count) {
+        var sc: u32 = 0;
+        for (sc < modules[m].section_count) {
+            val sec: *of.Section = ?modules[m].sections[sc];
+            if (sec.kind != of.SK_DEBUG) {
+                sc = sc + 1;
+                cnt;
+            }
+
+            var seen: bool = false;
+            var j:    u32  = 0;
+            for (j < count) {
+                if (names[j] == sec.name) { seen = true; }
+                j = j + 1;
+            }
+            if (seen) {
+                sc = sc + 1;
+                cnt;
+            }
+
+            if (count == cap) {
+                val current:      layout.CheckedCount[intern.StrId]                         = layout.count[intern.StrId](cap::usize);
+                val required_add: res[layout.CheckedCount[intern.StrId], layout.CheckCause] =
+                    layout.count_add[intern.StrId](current, layout.count[intern.StrId](1::usize));
+                if (sel required_add.err) {
+                    if (names != nil && cap > 0) { A.deallocate[intern.StrId](alloc, names, cap::usize); }
+                    ret err[fail.Fail].err{fail.message("linker: debug section name table growth count overflow")};
+                }
+                var required: layout.CheckedCount[intern.StrId] = required_add.ok;
+                if (required.value < 4) { required = layout.count[intern.StrId](4::usize); }
+                val grown_r: res[layout.CheckedCount[intern.StrId], layout.CheckCause] =
+                    layout.count_grow[intern.StrId](current, required);
+                if (sel grown_r.err) {
+                    if (names != nil && cap > 0) { A.deallocate[intern.StrId](alloc, names, cap::usize); }
+                    ret err[fail.Fail].err{fail.message("linker: debug section name table growth count overflow")};
+                }
+                val new_cap_fits: res[u32, layout.CheckCause] = layout.usize_to_u32(
+                    grown_r.ok.value);
+                if (sel new_cap_fits.err) {
+                    if (names != nil && cap > 0) { A.deallocate[intern.StrId](alloc, names, cap::usize); }
+                    ret err[fail.Fail].err{fail.message("linker: debug section name table capacity exceeds the u32 limit")};
+                }
+                val new_cap: u32                         = new_cap_fits.ok;
+                val gr:      res[*intern.StrId, A.Error] =
+                    A.reallocate[intern.StrId](alloc, names, cap::usize, new_cap::usize);
+                if (sel gr.err) {
+                    if (names != nil && cap > 0) { A.deallocate[intern.StrId](alloc, names, cap::usize); }
+                    ret err[fail.Fail].err{fail.refused(gr.err)};
+                }
+                names = gr.ok;
+                cap   = new_cap;
+            }
+            names[count] = sec.name;
+            count        = count + 1;
+
+            sc = sc + 1;
+        }
+        m = m + 1;
+    }
+
+    if (cap > count) {
+        if (count == 0) {
+            if (names != nil) { A.deallocate[intern.StrId](alloc, names, cap::usize); }
+            names = nil;
+        }
+        or {
+            val sr: res[*intern.StrId, A.Error] = A.reallocate[intern.StrId](alloc, names, cap::usize, count::usize);
+            if (sel sr.err) {
+                A.deallocate[intern.StrId](alloc, names, cap::usize);
+                ret err[fail.Fail].err{fail.refused(sr.err)};
+            }
+            names = sr.ok;
+        }
+    }
+
+    @out_names = names;
+    @out_count = count;
+    ret err[fail.Fail].ok{};
+}
+
+test "mach.lang.be.linker.discover_debug_names:shrinks_to_exact_capacity" {
+    var page_alloc: A.Allocator;
+    page.make(?page_alloc);
+
+    var tracker:     GmTracker;
+    val res_entries: res[*GmTrackEntry, A.Error] = A.allocate[GmTrackEntry](?page_alloc, 64::usize);
+    if (sel res_entries.err) { ret 1; }
+    tracker.entries  = res_entries.ok;
+    tracker.cap      = 64;
+    tracker.count    = 0;
+    tracker.live     = 0;
+    tracker.mismatch = false;
+
+    var tp:    *GmTracker = ?tracker;
+    var alloc: A.Allocator;
+    alloc.ctx           = tp::ptr;
+    alloc.fn_allocate   = gm_track_allocate;
+    alloc.fn_reallocate = gm_track_reallocate;
+    alloc.fn_deallocate = gm_track_deallocate;
+
+    var secs: [5]of.Section;
+    var i:    u32 = 0;
+    for (i < 5) {
+        secs[i].name  = (i + 1)::intern.StrId;
+        secs[i].kind  = of.SK_DEBUG;
+        secs[i].bytes = nil;
+        secs[i].len   = 0;
+        secs[i].align = 1;
+        i             = i + 1;
+    }
+
+    var mod: of.ObjectImage;
+    mod.sections      = ?secs[0];
+    mod.section_count = 5;
+
+    var out_names: *intern.StrId  = nil;
+    var out_count: u32            = 0;
+    val r:         err[fail.Fail] = discover_debug_names(?alloc, ?mod, 1, ?out_names, ?out_count);
+    if (sel r.err)      { ret 1; }
+    if (out_count != 5) { ret 1; }
+
+    if (out_names != nil && out_count > 0) {
+        A.deallocate[intern.StrId](?alloc, out_names, out_count::usize);
+    }
+
+    if (tracker.mismatch)  { ret 1; }
+    if (tracker.live != 0) { ret 1; }
+
+    A.deallocate[GmTrackEntry](?page_alloc, tracker.entries, 64::usize);
+    ret 0;
+}
+
+fun str_merge_add_string(s: *session.Session, sm: *StrMerge,
+    section: *of.Section, source_offset: u32) res[u32, fail.Fail] {
+    if (section.bytes == nil || source_offset >= section.len) {
+        ret res[u32, fail.Fail].err{fail.message("linker: .debug_str string offset is out of range")};
+    }
+    var terminator: u32 = source_offset;
+    for (terminator < section.len && section.bytes[terminator] != 0) {
+        terminator = terminator + 1;
+    }
+    if (terminator >= section.len) {
+        ret res[u32, fail.Fail].err{fail.message("linker: malformed .debug_str section: unterminated string")};
+    }
+
+    val string_r: res[intern.StrId, A.Error] = intern.intern(?s.interner, (?section.bytes[source_offset])::str);
+    if (sel string_r.err) {
+        ret res[u32, fail.Fail].err{fail.refused(string_r.err)};
+    }
+    val string_id: intern.StrId = string_r.ok;
+    val get_r:     opt[*u32]    = map.get[intern.StrId, u32](?sm.offs, ?string_id);
+    if (sel get_r.none) {
+        val string_len: u64 = (terminator - source_offset)::u64 + 1;
+        if (sm.buf.len::u64 > 0xFFFFFFFF - string_len) {
+            ret res[u32, fail.Fail].err{fail.message("linker: merged .debug_str section exceeds the 4 GiB u32 limit")};
+        }
+        val merged_offset: u32 = sm.buf.len::u32;
+        var index:         u32 = source_offset;
+        for (index <= terminator) {
+            enc.emit_byte(?sm.buf, section.bytes[index]);
+            index = index + 1;
+        }
+        val inserted_r: res[bool, A.Error] =
+            map.insert[intern.StrId, u32](?sm.offs, string_id, merged_offset);
+        if (sel inserted_r.err) {
+            ret res[u32, fail.Fail].err{fail.refused(inserted_r.err)};
+        }
+    }
+    ret res[u32, fail.Fail].ok{terminator + 1};
+}
+
+pub fun build_str_merge(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
+    patching: bool) res[StrMerge, fail.Fail] {
+    val alloc: *A.Allocator = s.alloc;
+    var sm:    StrMerge;
+    sm.buf    = enc.buf_init(alloc);
+    sm.offs   = map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
+    sm.name   = intern.STR_NIL;
+    sm.active = false;
+    if (!patching) { ret res[StrMerge, fail.Fail].ok{sm}; }
+
+    val nr: res[intern.StrId, A.Error] = intern.intern(?s.interner, ".debug_str");
+    if (sel nr.err) {
+        free_str_merge(?sm);
+        ret res[StrMerge, fail.Fail].err{fail.refused(nr.err)};
+    }
+    sm.name = nr.ok;
+
+    var m: u32 = 0;
+    for (m < module_count) {
+        if (!module_debug_is_linkable(modules, m)) {
+            m = m + 1;
+            cnt;
+        }
+        var sc: u32 = 0;
+        for (sc < modules[m].section_count) {
+            val sec: *of.Section = ?modules[m].sections[sc];
+            if (sec.kind != of.SK_DEBUG || sec.name != sm.name || sec.bytes == nil) {
+                sc = sc + 1;
+                cnt;
+            }
+            sm.active = true;
+
+            var o: u32 = 0;
+            for (o < sec.len) {
+                val added_r: res[u32, fail.Fail] = str_merge_add_string(s, ?sm, sec, o);
+                if (sel added_r.err) {
+                    free_str_merge(?sm);
+                    ret res[StrMerge, fail.Fail].err{added_r.err};
+                }
+                o = added_r.ok;
+            }
+            sc = sc + 1;
+        }
+
+        var relocation_index: u32 = 0;
+        for (relocation_index < modules[m].reloc_count) {
+            val relocation: *of.Relocation = ?modules[m].relocations[relocation_index];
+            if (relocation.sym >= modules[m].symbol_count) {
+                relocation_index = relocation_index + 1;
+                cnt;
+            }
+            val target_symbol: *of.Symbol = ?modules[m].symbols[relocation.sym];
+            if (!of.section_is_external(target_symbol.section)
+                && of.section_index(target_symbol.section) < modules[m].section_count) {
+                val target_section: *of.Section =
+                    ?modules[m].sections[of.section_index(target_symbol.section)];
+                if (target_section.kind == of.SK_DEBUG
+                    && target_section.name == sm.name) {
+                    val source_offset_r: res[u32, fail.Fail] = debug_str_source_offset(
+                        target_symbol.offset, relocation.addend, target_section.len);
+                    if (sel source_offset_r.err) {
+                        free_str_merge(?sm);
+                        ret res[StrMerge, fail.Fail].err{source_offset_r.err};
+                    }
+                    val suffix_r: res[u32, fail.Fail] = str_merge_add_string(
+                        s, ?sm, target_section,
+                        source_offset_r.ok);
+                    if (sel suffix_r.err) {
+                        free_str_merge(?sm);
+                        ret res[StrMerge, fail.Fail].err{suffix_r.err};
+                    }
+                }
+            }
+            relocation_index = relocation_index + 1;
+        }
+        m = m + 1;
+    }
+    ret res[StrMerge, fail.Fail].ok{sm};
+}
+
+pub fun free_str_merge(sm: *StrMerge) {
+    if (sm == nil) { ret; }
+    map.dnit[intern.StrId, u32](?sm.offs);
+    enc.buf_dnit(?sm.buf);
+}
+
+pub fun debug_str_source_offset(target_offset: u32, addend: i64,
+    section_len: u32) res[u32, fail.Fail] {
+    var source_offset: u32 = 0;
+    if (!atom_effective_offset(target_offset, addend, ?source_offset)
+        || source_offset >= section_len) {
+        ret res[u32, fail.Fail].err{fail.message("linker: .debug_str strp target offset and addend are out of range")};
+    }
+    ret res[u32, fail.Fail].ok{source_offset};
+}
+
+test "mach.lang.be.linker.build_str_merge:refuses_unterminated_debug_str_section" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+
+    var bad_bytes: [8]u8;
+    bad_bytes[0] = 1;
+    bad_bytes[1] = 2;
+    bad_bytes[2] = 3;
+    bad_bytes[3] = 4;
+    bad_bytes[4] = 5;
+    bad_bytes[5] = 6;
+    bad_bytes[6] = 7;
+    bad_bytes[7] = 8;
+
+    var sec: of.Section;
+    sec.name  = lt_name(?s, ".debug_str");
+    sec.kind  = of.SK_DEBUG;
+    sec.bytes = ?bad_bytes[0];
+    sec.len   = 8;
+    sec.align = 1;
+
+    var mods: [1]of.ObjectImage;
+    mods[0] = lt_image(?s, lt_name(?s, "m.o"), ?sec, 1, nil, 0, nil, 0);
+
+    val r:   res[StrMerge, fail.Fail] = build_str_merge(?s, ?mods[0], 1, true);
+    var bad: i32                      = 0;
+    if (sel r.ok) {
+        bad = 1;
+        var sm: StrMerge = r.ok;
+        free_str_merge(?sm);
+    }
+
+    session.dnit(?s);
+    ret bad;
+}

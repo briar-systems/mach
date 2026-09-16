@@ -1,0 +1,1262 @@
+use std.allocator.page;
+use std.collections.map;
+use std.collections.sort;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.layout;
+use mach.lang.session;
+use mach.lang.target;
+use mach.lang.target.isa;
+use mach.lang.target.of;
+use rel:            mach.lang.target.of.reloc;
+use target_testing: mach.lang.target.testing;
+
+use mach.lang.be.linker.common.ExportSurface;
+use mach.lang.be.linker.common.add_u32_counts;
+use mach.lang.be.linker.common.atom_effective_offset;
+use mach.lang.be.linker.common.atom_reloc_traits;
+use mach.lang.be.linker.common.is_exported_symbol;
+use mach.lang.be.linker.common.is_loadable_kind;
+use mach.lang.be.linker.common.lt_image;
+use mach.lang.be.linker.common.named_message;
+
+rec AtomRelocRefCountUnit {}
+
+rec GcAtomCountUnit {}
+
+# what the image must keep regardless of references
+# ---
+# entry:      the entry symbol, or STR_NIL for an image without one
+# exports:    every exported definition is kept, for a shared object
+# names:      further definitions the caller reaches by name
+# name_count: number of names
+pub rec LinkRoots {
+    entry:      intern.StrId;
+    exports:    bool;
+    names:      *intern.StrId;
+    name_count: u32;
+    # the `fwd` re-exports the link's objects asked for; nil outside a link that exports
+    surface: *ExportSurface;
+}
+
+pub rec AtomWinner {
+    module: u32;
+    symbol: u32;
+    weak:   bool;
+}
+
+pub rec AtomRelocRef {
+    target_section: u32;
+    target_module:  u32;
+    target_symbol:  u32;
+    source_module:  u32;
+    reloc:          u32;
+    width:          u32;
+    addend_mode:    rel.RelocAddendMode;
+    text_bias_min:  i32;
+    text_bias_max:  i32;
+}
+
+# a byte range of one flattened section that nothing live reaches
+pub rec DeadRange {
+    section: u32;
+    start:   u32;
+    end:     u32;
+}
+
+# how reachability treats a section: a root is kept whole unconditionally, a
+# whole section is one atom, a split section is one atom per defined symbol
+def Disposition: u8;
+
+val DISPOSITION_ROOT:  Disposition = 0;
+val DISPOSITION_WHOLE: Disposition = 1;
+val DISPOSITION_SPLIT: Disposition = 2;
+
+val GC_NONE: u32 = 0xFFFFFFFF;
+
+rec GcAtom {
+    module: u32;
+    flat:   u32;
+    start:  u32;
+    end:    u32;
+    cover:  u32;
+}
+
+rec GcSym {
+    flat:   u32;
+    offset: u32;
+    size:   u32;
+    sized:  bool;
+}
+
+rec GcSite {
+    flat:   u32;
+    offset: u32;
+    reloc:  u32;
+}
+
+rec GcState {
+    sec_total:   u32;
+    syms:        *GcSym;
+    sym_total:   u32;
+    sym_first:   *u32;
+    sym_count:   *u32;
+    sites:       *GcSite;
+    site_total:  u32;
+    site_first:  *u32;
+    site_count:  *u32;
+    atoms:       *GcAtom;
+    atom_cap:    u32;
+    atom_total:  u32;
+    atom_first:  *u32;
+    atom_count:  *u32;
+    disposition: *Disposition;
+    live:        *u8;
+    work:        *u32;
+    work_count:  u32;
+}
+
+pub fun reloc_ref_cmp(a: *AtomRelocRef, b: *AtomRelocRef) i64 {
+    if (a.target_section < b.target_section) { ret -1; }
+    if (a.target_section > b.target_section) { ret 1; }
+    if (a.source_module < b.source_module)   { ret -1; }
+    if (a.source_module > b.source_module)   { ret 1; }
+    if (a.reloc < b.reloc)                   { ret -1; }
+    if (a.reloc > b.reloc)                   { ret 1; }
+    ret 0;
+}
+
+pub fun reloc_ref_lower(refs: *AtomRelocRef, count: u32, section: u32) u32 {
+    var lo: u32 = 0;
+    var hi: u32 = count;
+    for (lo < hi) {
+        val mid: u32 = lo + (hi - lo) / 2;
+        if (refs[mid].target_section < section) { lo = mid + 1; }
+        or                                      { hi = mid; }
+    }
+    ret lo;
+}
+
+# the definition a reference to symbol sy of module m binds to: a local
+# definition binds to itself, a global name to its link-wide winner, and an
+# unresolved COFF weak external to its fallback
+pub fun resolve_reference(modules: *of.ObjectImage, m: u32, sy: u32,
+    winners: *map.Map[intern.StrId, AtomWinner], out: *AtomWinner) bool {
+    var cur:  u32 = sy;
+    var hops: u32 = 0;
+    for (cur < modules[m].symbol_count && hops <= modules[m].symbol_count) {
+        val sym: *of.Symbol = ?modules[m].symbols[cur];
+        if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0
+            && !of.section_is_external(sym.section)
+            && of.section_index(sym.section) < modules[m].section_count) {
+            out.module = m;
+            out.symbol = cur;
+            out.weak   = false;
+            ret true;
+        }
+        val wr: opt[*AtomWinner] = map.get[intern.StrId, AtomWinner](winners, ?sym.name);
+        if (sel wr.some) {
+            @out = @wr.some;
+            ret true;
+        }
+        if ((sym.flags & of.SYM_OBJ_FLAG_FALLBACK) == 0) { ret false; }
+        cur  = sym.fallback;
+        hops = hops + 1;
+    }
+    ret false;
+}
+
+fun reloc_ref_set_target(modules: *of.ObjectImage, m: u32, sy: u32,
+    sec_base: *u32,
+    winners: *map.Map[intern.StrId, AtomWinner],
+    reference: *AtomRelocRef) {
+    var winner: AtomWinner;
+    if (!resolve_reference(modules, m, sy, winners, ?winner)) { ret; }
+    reference.target_module = winner.module;
+    reference.target_symbol = winner.symbol;
+    val target: *of.Symbol = ?modules[winner.module].symbols[winner.symbol];
+    if (!of.section_is_external(target.section)
+        && of.section_index(target.section) < modules[winner.module].section_count) {
+        reference.target_section = sec_base[winner.module] + of.section_index(target.section);
+    }
+}
+
+# every relocation operand outside debug sections, bound to its definition and
+# sorted by the flattened section it lands in
+pub fun build_reloc_refs(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
+    codegen_count: u32, sec_base: *u32,
+    winners: *map.Map[intern.StrId, AtomWinner],
+    arch: *isa.IsaVTable, out_total: *u32) res[*AtomRelocRef, fail.Fail] {
+    @out_total = 0;
+    var ref_total_checked: layout.CheckedCount[AtomRelocRefCountUnit] =
+        layout.count[AtomRelocRefCountUnit](0::usize);
+    var m: u32 = 0;
+    for (m < module_count) {
+        val added: res[layout.CheckedCount[AtomRelocRefCountUnit], layout.CheckCause] =
+            layout.count_add[AtomRelocRefCountUnit](ref_total_checked,
+            layout.count[AtomRelocRefCountUnit](modules[m].reloc_count::usize));
+        if (sel added.err) {
+            ret res[*AtomRelocRef, fail.Fail].err{fail.message("linker: atom relocation reference count overflow")};
+        }
+        ref_total_checked = added.ok;
+        var ri: u32 = 0;
+        for (ri < modules[m].reloc_count) {
+            if (of.is_difference(modules[m].relocations[ri].kind)) {
+                val secondary: res[layout.CheckedCount[AtomRelocRefCountUnit], layout.CheckCause] =
+                    layout.count_add[AtomRelocRefCountUnit](ref_total_checked,
+                    layout.count[AtomRelocRefCountUnit](1::usize));
+                if (sel secondary.err) {
+                    ret res[*AtomRelocRef, fail.Fail].err{fail.message("linker: atom relocation reference count overflow")};
+                }
+                ref_total_checked = secondary.ok;
+            }
+            ri = ri + 1;
+        }
+        m = m + 1;
+    }
+    val ref_total_fits: res[u32, layout.CheckCause] =
+        layout.usize_to_u32(ref_total_checked.value);
+    if (sel ref_total_fits.err) {
+        ret res[*AtomRelocRef, fail.Fail].err{fail.message("linker: atom relocation reference count exceeds the u32 limit")};
+    }
+    val ref_total: u32 = ref_total_fits.ok;
+    if (ref_total == 0) { ret res[*AtomRelocRef, fail.Fail].ok{nil}; }
+    if (arch == nil || arch.reloc == nil || arch.reloc.traits == nil) {
+        ret res[*AtomRelocRef, fail.Fail].err{fail.message("linker: target cannot describe relocations")};
+    }
+    val rr: res[*AtomRelocRef, A.Error] =
+        A.zallocate[AtomRelocRef](s.alloc, ref_total::usize);
+    if (sel rr.err) { ret res[*AtomRelocRef, fail.Fail].err{fail.refused(rr.err)}; }
+    val refs: *AtomRelocRef = rr.ok;
+    var rw:   u32           = 0;
+    m = 0;
+    for (m < module_count) {
+        var ri: u32 = 0;
+        for (ri < modules[m].reloc_count) {
+            val relocation: *of.Relocation = ?modules[m].relocations[ri];
+            if (of.section_index(relocation.section) >= modules[m].section_count) {
+                A.deallocate[AtomRelocRef](s.alloc, refs, ref_total::usize);
+                ret res[*AtomRelocRef, fail.Fail].err{fail.message(named_message(s, "linker: object '", modules[m].name, "' has a relocation against a section it does not carry", "linker: a relocation names a section its object does not carry"))};
+            }
+            val from_debug: bool            = modules[m].sections[of.section_index(relocation.section)].kind == of.SK_DEBUG;
+            var traits:     rel.RelocTraits = rel.traits(0, rel.RELOC_ADDEND_IGNORED, 0, 0);
+            if (!from_debug) {
+                val ref_traits: res[rel.RelocTraits, rel.RelocError] = atom_reloc_traits(
+                    relocation, ?modules[m].sections[of.section_index(relocation.section)],
+                    arch, m < codegen_count);
+                if (sel ref_traits.err) {
+                    A.deallocate[AtomRelocRef](s.alloc, refs, ref_total::usize);
+                    ret res[*AtomRelocRef, fail.Fail].err{fail.message(named_message(s, "linker: object '", modules[m].name, "' carries a relocation kind this target's catalog does not describe", "linker: an input carries a relocation kind the target's catalog does not describe"))};
+                }
+                traits = ref_traits.ok;
+            }
+            var operand_count: u32 = 1;
+            if (of.is_difference(relocation.kind)) { operand_count = 2; }
+            var operand: u32 = 0;
+            for (operand < operand_count) {
+                refs[rw].target_section = GC_NONE;
+                refs[rw].target_module  = GC_NONE;
+                refs[rw].target_symbol  = GC_NONE;
+                refs[rw].source_module  = m;
+                refs[rw].reloc          = ri;
+                refs[rw].width          = traits.field_width;
+                refs[rw].addend_mode    = traits.addend_mode;
+                refs[rw].text_bias_min  = traits.text_bias_min;
+                refs[rw].text_bias_max  = traits.text_bias_max;
+                var target_symbol: u32 = relocation.sym;
+                if (operand == 1) {
+                    target_symbol          = relocation.sym2;
+                    refs[rw].addend_mode   = rel.RELOC_ADDEND_IGNORED;
+                    refs[rw].text_bias_min = 0;
+                    refs[rw].text_bias_max = 0;
+                }
+                if (!from_debug) {
+                    reloc_ref_set_target(modules, m, target_symbol, sec_base, winners, ?refs[rw]);
+                }
+                rw      = rw + 1;
+                operand = operand + 1;
+            }
+            ri = ri + 1;
+        }
+        m = m + 1;
+    }
+    sort.sort[AtomRelocRef](refs, ref_total::usize, reloc_ref_cmp);
+    @out_total = ref_total;
+    ret res[*AtomRelocRef, fail.Fail].ok{refs};
+}
+
+# the disposition a section starts from; a split candidate falls back to whole
+# when its atom boundaries cannot be trusted
+fun section_disposition(modules: *of.ObjectImage, m: u32, sc: u32, codegen_count: u32) Disposition {
+    val sec: *of.Section = ?modules[m].sections[sc];
+    if (m >= codegen_count)                                               { ret DISPOSITION_ROOT; }
+    if (!is_loadable_kind(sec.kind))                                      { ret DISPOSITION_ROOT; }
+    if ((sec.flags & (of.SEC_FLAG_INIT_FUNCS | of.SEC_FLAG_RETAIN)) != 0) { ret DISPOSITION_ROOT; }
+    ret DISPOSITION_SPLIT;
+}
+
+fun gc_sym_cmp(a: *GcSym, b: *GcSym) i64 {
+    if (a.flat < b.flat)     { ret -1; }
+    if (a.flat > b.flat)     { ret 1; }
+    if (a.offset < b.offset) { ret -1; }
+    if (a.offset > b.offset) { ret 1; }
+    if (a.size < b.size)     { ret -1; }
+    if (a.size > b.size)     { ret 1; }
+    ret 0;
+}
+
+fun gc_site_cmp(a: *GcSite, b: *GcSite) i64 {
+    if (a.flat < b.flat)     { ret -1; }
+    if (a.flat > b.flat)     { ret 1; }
+    if (a.offset < b.offset) { ret -1; }
+    if (a.offset > b.offset) { ret 1; }
+    if (a.reloc < b.reloc)   { ret -1; }
+    if (a.reloc > b.reloc)   { ret 1; }
+    ret 0;
+}
+
+fun gc_state_free(alloc: *A.Allocator, st: *GcState) {
+    val sections: usize = st.sec_total::usize;
+    if (st.syms != nil)        { A.deallocate[GcSym](alloc, st.syms, st.sym_total::usize); }
+    if (st.sites != nil)       { A.deallocate[GcSite](alloc, st.sites, st.site_total::usize); }
+    if (st.atoms != nil)       { A.deallocate[GcAtom](alloc, st.atoms, st.atom_cap::usize); }
+    if (st.live != nil)        { A.deallocate[u8](alloc, st.live, st.atom_cap::usize); }
+    if (st.work != nil)        { A.deallocate[u32](alloc, st.work, st.atom_cap::usize); }
+    if (st.sym_first != nil)   { A.deallocate[u32](alloc, st.sym_first, sections); }
+    if (st.sym_count != nil)   { A.deallocate[u32](alloc, st.sym_count, sections); }
+    if (st.site_first != nil)  { A.deallocate[u32](alloc, st.site_first, sections); }
+    if (st.site_count != nil)  { A.deallocate[u32](alloc, st.site_count, sections); }
+    if (st.atom_first != nil)  { A.deallocate[u32](alloc, st.atom_first, sections); }
+    if (st.atom_count != nil)  { A.deallocate[u32](alloc, st.atom_count, sections); }
+    if (st.disposition != nil) { A.deallocate[Disposition](alloc, st.disposition, sections); }
+}
+
+fun gc_zallocate_u32(alloc: *A.Allocator, count: u32, out: **u32) err[fail.Fail] {
+    val r: res[*u32, A.Error] = A.zallocate[u32](alloc, count::usize);
+    if (sel r.err) { ret err[fail.Fail].err{fail.refused(r.err)}; }
+    @out = r.ok;
+    ret err[fail.Fail].ok{};
+}
+
+# the index of the atom of a flattened section that holds offset off; the last
+# atom holds the section's end offset
+fun gc_atom_at(st: *GcState, flat: u32, off: u32) u32 {
+    val first: u32 = st.atom_first[flat];
+    val count: u32 = st.atom_count[flat];
+    if (count == 0 || off < st.atoms[first].start) { ret GC_NONE; }
+    var lo: u32 = 0;
+    var hi: u32 = count;
+    for (hi - lo > 1) {
+        val mid: u32 = lo + (hi - lo) / 2;
+        if (st.atoms[first + mid].start <= off) { lo = mid; }
+        or                                      { hi = mid; }
+    }
+    ret first + lo;
+}
+
+fun gc_index_symbols(alloc: *A.Allocator, st: *GcState, modules: *of.ObjectImage,
+    module_count: u32, sec_base: *u32) err[fail.Fail] {
+    var total: u32 = 0;
+    var m:     u32 = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym: *of.Symbol = ?modules[m].symbols[sy];
+            if (!of.section_is_external(sym.section) && of.section_index(sym.section) < modules[m].section_count
+                && modules[m].sections[of.section_index(sym.section)].kind != of.SK_DEBUG) {
+                total = total + 1;
+            }
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+    val fr: err[fail.Fail] = gc_zallocate_u32(alloc, st.sec_total, ?st.sym_first);
+    if (sel fr.err) { ret fr; }
+    val cr: err[fail.Fail] = gc_zallocate_u32(alloc, st.sec_total, ?st.sym_count);
+    if (sel cr.err) { ret cr; }
+    if (total == 0) { ret err[fail.Fail].ok{}; }
+    val sr: res[*GcSym, A.Error] = A.zallocate[GcSym](alloc, total::usize);
+    if (sel sr.err) { ret err[fail.Fail].err{fail.refused(sr.err)}; }
+    st.syms      = sr.ok;
+    st.sym_total = total;
+
+    var w: u32 = 0;
+    m = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym: *of.Symbol = ?modules[m].symbols[sy];
+            if (!of.section_is_external(sym.section) && of.section_index(sym.section) < modules[m].section_count
+                && modules[m].sections[of.section_index(sym.section)].kind != of.SK_DEBUG) {
+                st.syms[w].flat   = sec_base[m] + of.section_index(sym.section);
+                st.syms[w].offset = sym.offset;
+                st.syms[w].size   = sym.size;
+                st.syms[w].sized  = sym.size > 0 && (sym.flags & of.SYM_OBJ_FLAG_SIZE_UNKNOWN) == 0;
+                w                 = w + 1;
+            }
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+    sort.sort[GcSym](st.syms, total::usize, gc_sym_cmp);
+    var i: u32 = 0;
+    for (i < total) {
+        val flat: u32 = st.syms[i].flat;
+        if (st.sym_count[flat] == 0) { st.sym_first[flat] = i; }
+        st.sym_count[flat] = st.sym_count[flat] + 1;
+        i                  = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun gc_index_sites(alloc: *A.Allocator, st: *GcState, modules: *of.ObjectImage,
+    module_count: u32, sec_base: *u32) err[fail.Fail] {
+    var total: u32 = 0;
+    var m:     u32 = 0;
+    for (m < module_count) {
+        var ri: u32 = 0;
+        for (ri < modules[m].reloc_count) {
+            if (modules[m].sections[of.section_index(modules[m].relocations[ri].section)].kind != of.SK_DEBUG) {
+                total = total + 1;
+            }
+            ri = ri + 1;
+        }
+        m = m + 1;
+    }
+    val fr: err[fail.Fail] = gc_zallocate_u32(alloc, st.sec_total, ?st.site_first);
+    if (sel fr.err) { ret fr; }
+    val cr: err[fail.Fail] = gc_zallocate_u32(alloc, st.sec_total, ?st.site_count);
+    if (sel cr.err) { ret cr; }
+    if (total == 0) { ret err[fail.Fail].ok{}; }
+    val sr: res[*GcSite, A.Error] = A.zallocate[GcSite](alloc, total::usize);
+    if (sel sr.err) { ret err[fail.Fail].err{fail.refused(sr.err)}; }
+    st.sites      = sr.ok;
+    st.site_total = total;
+
+    var w: u32 = 0;
+    m = 0;
+    for (m < module_count) {
+        var ri: u32 = 0;
+        for (ri < modules[m].reloc_count) {
+            val r: *of.Relocation = ?modules[m].relocations[ri];
+            if (modules[m].sections[of.section_index(r.section)].kind != of.SK_DEBUG) {
+                st.sites[w].flat   = sec_base[m] + of.section_index(r.section);
+                st.sites[w].offset = r.offset;
+                st.sites[w].reloc  = ri;
+                w                  = w + 1;
+            }
+            ri = ri + 1;
+        }
+        m = m + 1;
+    }
+    sort.sort[GcSite](st.sites, total::usize, gc_site_cmp);
+    var i: u32 = 0;
+    for (i < total) {
+        val flat: u32 = st.sites[i].flat;
+        if (st.site_count[flat] == 0) { st.site_first[flat] = i; }
+        st.site_count[flat] = st.site_count[flat] + 1;
+        i                   = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the section offsets a relocation operand may address around its target: the
+# symbol alone when the addend is ignored, otherwise the addend and any field
+# bias the target cannot pin down; false when that span leaves the u32 range
+fun reference_span(r: *of.Relocation, traits: rel.RelocTraits, source_text: bool,
+    second_operand: bool, target_offset: u32, lo: *u32, hi: *u32) bool {
+    @lo = target_offset;
+    @hi = target_offset;
+    if (second_operand || traits.addend_mode == rel.RELOC_ADDEND_IGNORED) { ret true; }
+    var bias_min: i64 = 0;
+    var bias_max: i64 = 0;
+    if (traits.addend_mode == rel.RELOC_ADDEND_FIELD_BIAS && source_text) {
+        bias_min = traits.text_bias_min::i64;
+        bias_max = traits.text_bias_max::i64;
+    }
+    if ((bias_min > 0 && r.addend > 9223372036854775807 - bias_min)
+        || (bias_min < 0 && r.addend < (-9223372036854775807 - 1) - bias_min)
+        || (bias_max > 0 && r.addend > 9223372036854775807 - bias_max)
+        || (bias_max < 0 && r.addend < (-9223372036854775807 - 1) - bias_max)) {
+        ret false;
+    }
+    ret atom_effective_offset(target_offset, r.addend + bias_min, lo)
+        && atom_effective_offset(target_offset, r.addend + bias_max, hi);
+}
+
+# one atom per distinct sized symbol start, each running to the next start;
+# false when the section's symbols and references do not respect those edges
+fun split_atoms(st: *GcState, modules: *of.ObjectImage, m: u32, sc: u32, flat: u32,
+    codegen_count: u32, refs: *AtomRelocRef, ref_total: u32,
+    arch: *isa.IsaVTable) bool {
+    val sec:   *of.Section = ?modules[m].sections[sc];
+    val first: u32         = st.atom_total;
+    val sf:    u32         = st.sym_first[flat];
+    val sn:    u32         = st.sym_count[flat];
+    var n:     u32         = 0;
+    var i:     u32         = sf;
+    for (i < sf + sn) {
+        val sym: *GcSym = ?st.syms[i];
+        if (!sym.sized) {
+            i = i + 1;
+            cnt;
+        }
+        if (sym.offset::u64 + sym.size::u64 > sec.len::u64) { ret false; }
+        if (n == 0 && sym.offset != 0)                      { ret false; }
+        if (n > 0) {
+            val prev: *GcAtom = ?st.atoms[first + n - 1];
+            if (sym.offset == prev.start && sym.offset + sym.size == prev.cover) {
+                i = i + 1;
+                cnt;
+            }
+            if (sym.offset < prev.cover) { ret false; }
+            prev.end = sym.offset;
+        }
+        st.atoms[first + n].module = m;
+        st.atoms[first + n].flat   = flat;
+        st.atoms[first + n].start  = sym.offset;
+        st.atoms[first + n].end    = sec.len;
+        st.atoms[first + n].cover  = sym.offset + sym.size;
+        n                          = n + 1;
+        i                          = i + 1;
+    }
+    if (n == 0) { ret false; }
+    st.atom_total       = first + n;
+    st.atom_count[flat] = n;
+
+    i = sf;
+    for (i < sf + sn) {
+        val sym: *GcSym = ?st.syms[i];
+        if (!sym.sized) {
+            val holder: u32 = gc_atom_at(st, flat, sym.offset);
+            if (holder == GC_NONE || sym.offset >= st.atoms[holder].cover) { ret false; }
+        }
+        i = i + 1;
+    }
+
+    var si: u32 = st.site_first[flat];
+    val se: u32 = si + st.site_count[flat];
+    for (si < se) {
+        val r:      *of.Relocation                       = ?modules[m].relocations[st.sites[si].reloc];
+        val traits: res[rel.RelocTraits, rel.RelocError] = atom_reloc_traits(r, sec, arch, m < codegen_count);
+        if (sel traits.err) { ret false; }
+        val holder: u32 = gc_atom_at(st, flat, r.offset);
+        if (holder == GC_NONE || r.offset::u64 + traits.ok.field_width::u64 > st.atoms[holder].end::u64) {
+            ret false;
+        }
+        si = si + 1;
+    }
+
+    var ref_i: u32 = reloc_ref_lower(refs, ref_total, flat);
+    for (ref_i < ref_total && refs[ref_i].target_section == flat) {
+        val reference: *AtomRelocRef   = ?refs[ref_i];
+        val target:    *of.Symbol      = ?modules[m].symbols[reference.target_symbol];
+        val source:    *of.ObjectImage = ?modules[reference.source_module];
+        val r:         *of.Relocation  = ?source.relocations[reference.reloc];
+        val traits:    rel.RelocTraits = rel.traits(reference.width, reference.addend_mode,
+            reference.text_bias_min, reference.text_bias_max);
+        var lo: u32 = 0;
+        var hi: u32 = 0;
+        if (!reference_span(r, traits, source.sections[of.section_index(r.section)].kind == of.SK_TEXT,
+            false, target.offset, ?lo, ?hi)) {
+            ret false;
+        }
+        ref_i = ref_i + 1;
+    }
+    ret true;
+}
+
+fun gc_atomize(st: *GcState, modules: *of.ObjectImage, module_count: u32,
+    codegen_count: u32, sec_base: *u32, refs: *AtomRelocRef, ref_total: u32,
+    arch: *isa.IsaVTable) {
+    var m: u32 = 0;
+    for (m < module_count) {
+        var sc: u32 = 0;
+        for (sc < modules[m].section_count) {
+            val flat: u32         = sec_base[m] + sc;
+            val sec:  *of.Section = ?modules[m].sections[sc];
+            val at:   u32         = st.atom_total;
+            st.atom_first[flat] = at;
+            st.atom_count[flat] = 0;
+            if (sec.kind == of.SK_DEBUG) {
+                sc = sc + 1;
+                cnt;
+            }
+            st.disposition[flat] = section_disposition(modules, m, sc, codegen_count);
+            if (st.disposition[flat] == DISPOSITION_SPLIT
+                && split_atoms(st, modules, m, sc, flat, codegen_count, refs, ref_total, arch)) {
+                sc = sc + 1;
+                cnt;
+            }
+            if (st.disposition[flat] == DISPOSITION_SPLIT) { st.disposition[flat] = DISPOSITION_WHOLE; }
+            st.atom_total       = at + 1;
+            st.atom_count[flat] = 1;
+            st.atoms[at].module = m;
+            st.atoms[at].flat   = flat;
+            st.atoms[at].start  = 0;
+            st.atoms[at].end    = sec.len;
+            st.atoms[at].cover  = sec.len;
+            sc                  = sc + 1;
+        }
+        m = m + 1;
+    }
+}
+
+fun gc_mark_atom(st: *GcState, atom: u32) {
+    if (atom == GC_NONE || st.live[atom] != 0) { ret; }
+    st.live[atom]          = 1;
+    st.work[st.work_count] = atom;
+    st.work_count          = st.work_count + 1;
+}
+
+fun gc_mark_symbol(st: *GcState, modules: *of.ObjectImage, m: u32, sy: u32, sec_base: *u32) {
+    val sym: *of.Symbol = ?modules[m].symbols[sy];
+    if (of.section_is_external(sym.section) || of.section_index(sym.section) >= modules[m].section_count) { ret; }
+    gc_mark_atom(st, gc_atom_at(st, sec_base[m] + of.section_index(sym.section), sym.offset));
+}
+
+fun gc_mark_name(st: *GcState, modules: *of.ObjectImage, sec_base: *u32,
+    winners: *map.Map[intern.StrId, AtomWinner], name: intern.StrId) {
+    var key: intern.StrId     = name;
+    val wr:  opt[*AtomWinner] = map.get[intern.StrId, AtomWinner](winners, ?key);
+    if (sel wr.some) { gc_mark_symbol(st, modules, wr.some.module, wr.some.symbol, sec_base); }
+}
+
+# marks every atom a relocation operand's span touches, so no byte between the
+# target symbol and the address the field really holds is dropped
+fun gc_mark_reference(st: *GcState, modules: *of.ObjectImage, m: u32, r: *of.Relocation,
+    traits: rel.RelocTraits, second_operand: bool, sec_base: *u32,
+    winners: *map.Map[intern.StrId, AtomWinner]) err[fail.Fail] {
+    var sy: u32 = r.sym;
+    if (second_operand) { sy = r.sym2; }
+    var winner: AtomWinner;
+    if (!resolve_reference(modules, m, sy, winners, ?winner)) { ret err[fail.Fail].ok{}; }
+    val target: *of.Symbol = ?modules[winner.module].symbols[winner.symbol];
+    if (of.section_is_external(target.section)
+        || of.section_index(target.section) >= modules[winner.module].section_count) {
+        ret err[fail.Fail].ok{};
+    }
+    val flat: u32 = sec_base[winner.module] + of.section_index(target.section);
+    if (st.atom_count[flat] == 0) { ret err[fail.Fail].ok{}; }
+    var lo: u32 = target.offset;
+    var hi: u32 = target.offset;
+    if (!reference_span(r, traits, modules[m].sections[of.section_index(r.section)].kind == of.SK_TEXT,
+        second_operand, target.offset, ?lo, ?hi)) {
+        if (st.atom_count[flat] > 1) {
+            ret err[fail.Fail].err{fail.message("linker: internal: a reference into a split section has no computable span")};
+        }
+        # a foreign field bias can put the span before a whole section's start; its one atom covers every byte
+        lo = target.offset;
+        hi = target.offset;
+    }
+    if (target.offset < lo) { lo = target.offset; }
+    if (target.offset > hi) { hi = target.offset; }
+    var atom: u32 = gc_atom_at(st, flat, lo);
+    val last: u32 = gc_atom_at(st, flat, hi);
+    for (atom <= last) {
+        gc_mark_atom(st, atom);
+        atom = atom + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun gc_mark_roots(st: *GcState, modules: *of.ObjectImage, module_count: u32, sec_base: *u32,
+    winners: *map.Map[intern.StrId, AtomWinner], roots: *LinkRoots) {
+    var flat: u32 = 0;
+    for (flat < st.sec_total) {
+        if (st.atom_count[flat] > 0 && st.disposition[flat] == DISPOSITION_ROOT) {
+            var a: u32 = 0;
+            for (a < st.atom_count[flat]) {
+                gc_mark_atom(st, st.atom_first[flat] + a);
+                a = a + 1;
+            }
+        }
+        flat = flat + 1;
+    }
+    if (roots.entry != intern.STR_NIL) { gc_mark_name(st, modules, sec_base, winners, roots.entry); }
+    var ni: u32 = 0;
+    for (ni < roots.name_count) {
+        gc_mark_name(st, modules, sec_base, winners, roots.names[ni]);
+        ni = ni + 1;
+    }
+    if (!roots.exports) { ret; }
+    var m: u32 = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            if (is_exported_symbol(?modules[m], ?modules[m].symbols[sy], roots.surface)) {
+                gc_mark_name(st, modules, sec_base, winners, modules[m].symbols[sy].name);
+            }
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+}
+
+fun gc_propagate(st: *GcState, modules: *of.ObjectImage, codegen_count: u32, sec_base: *u32,
+    winners: *map.Map[intern.StrId, AtomWinner], arch: *isa.IsaVTable) err[fail.Fail] {
+    for (st.work_count > 0) {
+        st.work_count = st.work_count - 1;
+        val atom:  *GcAtom = ?st.atoms[st.work[st.work_count]];
+        val m:     u32     = atom.module;
+        val first: u32     = st.site_first[atom.flat];
+        var lo:    u32     = 0;
+        var hi:    u32     = st.site_count[atom.flat];
+        for (lo < hi) {
+            val mid: u32 = lo + (hi - lo) / 2;
+            if (st.sites[first + mid].offset < atom.start) { lo = mid + 1; }
+            or                                             { hi = mid; }
+        }
+        var si: u32 = first + lo;
+        val se: u32 = first + st.site_count[atom.flat];
+        for (si < se && st.sites[si].offset < atom.end) {
+            val r:      *of.Relocation                       = ?modules[m].relocations[st.sites[si].reloc];
+            val traits: res[rel.RelocTraits, rel.RelocError] = atom_reloc_traits(
+                r, ?modules[m].sections[of.section_index(r.section)], arch, m < codegen_count);
+            if (sel traits.err) {
+                ret err[fail.Fail].err{fail.message("linker: internal: a live relocation lost its traits after the reference table described it")};
+            }
+            val first_r: err[fail.Fail] = gc_mark_reference(st, modules, m, r, traits.ok, false, sec_base, winners);
+            if (sel first_r.err) { ret first_r; }
+            if (of.is_difference(r.kind)) {
+                val second_r: err[fail.Fail] = gc_mark_reference(st, modules, m, r, traits.ok, true, sec_base, winners);
+                if (sel second_r.err) { ret second_r; }
+            }
+            si = si + 1;
+        }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the byte ranges of a final image that no root reaches through relocations
+# ---
+# refs:       the sorted reference table from build_reloc_refs
+# roots:      what the image keeps regardless of references
+# dead_count: set to the number of ranges returned
+# ret:        the dead ranges, nil when there are none
+pub fun collect_dead_atoms(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
+    codegen_count: u32, sec_base: *u32, sec_total: u32,
+    winners: *map.Map[intern.StrId, AtomWinner],
+    refs: *AtomRelocRef, ref_total: u32, arch: *isa.IsaVTable,
+    roots: *LinkRoots, dead_count: *u32) res[*DeadRange, fail.Fail] {
+    @dead_count = 0;
+    if (sec_total == 0) { ret res[*DeadRange, fail.Fail].ok{nil}; }
+    val alloc: *A.Allocator = s.alloc;
+    var st:    GcState;
+    st.sec_total = sec_total;
+    fin { gc_state_free(alloc, ?st); }
+
+    val symbols_r: err[fail.Fail] = gc_index_symbols(alloc, ?st, modules, module_count, sec_base);
+    if (sel symbols_r.err) { ret res[*DeadRange, fail.Fail].err{symbols_r.err}; }
+    val sites_r: err[fail.Fail] = gc_index_sites(alloc, ?st, modules, module_count, sec_base);
+    if (sel sites_r.err) { ret res[*DeadRange, fail.Fail].err{sites_r.err}; }
+
+    val cap_r: res[u32, layout.CheckCause] = add_u32_counts[GcAtomCountUnit](st.sym_total, sec_total);
+    if (sel cap_r.err) { ret res[*DeadRange, fail.Fail].err{fail.message("linker: reachability atom count exceeds the u32 limit")}; }
+    st.atom_cap = cap_r.ok;
+    val ar: res[*GcAtom, A.Error] = A.zallocate[GcAtom](alloc, st.atom_cap::usize);
+    if (sel ar.err) { ret res[*DeadRange, fail.Fail].err{fail.refused(ar.err)}; }
+    st.atoms = ar.ok;
+    val lr: res[*u8, A.Error] = A.zallocate[u8](alloc, st.atom_cap::usize);
+    if (sel lr.err) { ret res[*DeadRange, fail.Fail].err{fail.refused(lr.err)}; }
+    st.live = lr.ok;
+    val wr: err[fail.Fail] = gc_zallocate_u32(alloc, st.atom_cap, ?st.work);
+    if (sel wr.err) { ret res[*DeadRange, fail.Fail].err{wr.err}; }
+    val fr: err[fail.Fail] = gc_zallocate_u32(alloc, sec_total, ?st.atom_first);
+    if (sel fr.err) { ret res[*DeadRange, fail.Fail].err{fr.err}; }
+    val cr: err[fail.Fail] = gc_zallocate_u32(alloc, sec_total, ?st.atom_count);
+    if (sel cr.err) { ret res[*DeadRange, fail.Fail].err{cr.err}; }
+    val dr: res[*Disposition, A.Error] = A.zallocate[Disposition](alloc, sec_total::usize);
+    if (sel dr.err) { ret res[*DeadRange, fail.Fail].err{fail.refused(dr.err)}; }
+    st.disposition = dr.ok;
+
+    gc_atomize(?st, modules, module_count, codegen_count, sec_base, refs, ref_total, arch);
+    gc_mark_roots(?st, modules, module_count, sec_base, winners, roots);
+    val propagated: err[fail.Fail] = gc_propagate(?st, modules, codegen_count, sec_base, winners, arch);
+    if (sel propagated.err) { ret res[*DeadRange, fail.Fail].err{propagated.err}; }
+
+    var count: u32 = 0;
+    var a:     u32 = 0;
+    for (a < st.atom_total) {
+        if (st.live[a] == 0 && st.atoms[a].end > st.atoms[a].start) { count = count + 1; }
+        a = a + 1;
+    }
+    if (count == 0) { ret res[*DeadRange, fail.Fail].ok{nil}; }
+    val out_r: res[*DeadRange, A.Error] = A.allocate[DeadRange](alloc, count::usize);
+    if (sel out_r.err) { ret res[*DeadRange, fail.Fail].err{fail.refused(out_r.err)}; }
+    val out: *DeadRange = out_r.ok;
+    var w:   u32        = 0;
+    a = 0;
+    for (a < st.atom_total) {
+        if (st.live[a] == 0 && st.atoms[a].end > st.atoms[a].start) {
+            out[w].section = st.atoms[a].flat;
+            out[w].start   = st.atoms[a].start;
+            out[w].end     = st.atoms[a].end;
+            w              = w + 1;
+        }
+        a = a + 1;
+    }
+    @dead_count = count;
+    ret res[*DeadRange, fail.Fail].ok{out};
+}
+
+fun gt_sec(name: intern.StrId, kind: of.SectionKind, bytes: *u8, len: u32, flags: u32) of.Section {
+    var sec: of.Section;
+    sec.name  = name;
+    sec.kind  = kind;
+    sec.bytes = bytes;
+    sec.len   = len;
+    sec.align = 1;
+    sec.flags = flags;
+    ret sec;
+}
+
+fun gt_sym(name: intern.StrId, section: u32, offset: u32, size: u32, flags: u32) of.Symbol {
+    var sym: of.Symbol;
+    sym.name     = name;
+    sym.section  = of.section_id(section);
+    sym.offset   = offset;
+    sym.size     = size;
+    sym.flags    = flags;
+    sym.fallback = of.SYMBOL_NONE;
+    ret sym;
+}
+
+fun gt_extern(name: intern.StrId) of.Symbol {
+    var sym: of.Symbol = gt_sym(name, 0, 0, 0, of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_FUNCTION);
+    sym.section = of.external_section();
+    ret sym;
+}
+
+fun gt_rel(section: u32, offset: u32, kind: of.RelocKind, sym: u32, addend: i64) of.Relocation {
+    var r: of.Relocation;
+    r.section = of.section_id(section);
+    r.offset  = offset;
+    r.kind    = kind;
+    r.sym     = sym;
+    r.addend  = addend;
+    r.sym2    = of.SYMBOL_NONE;
+    r.pair    = 0;
+    ret r;
+}
+
+rec GtHarness {
+    alloc: A.Allocator;
+    s:     session.Session;
+    reg:   target.TargetRegistry;
+    x64:   *isa.IsaVTable;
+    rv64:  *isa.IsaVTable;
+}
+
+fun gt_init(h: *GtHarness) bool {
+    page.make(?h.alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?h.alloc);
+    if (sel sr.err) { ret false; }
+    h.s   = sr.ok;
+    h.reg = target.registry_init();
+    val registered: err[fail.Fail] = target.register_all(?h.reg, target_testing.debug_descriptor);
+    if (sel registered.err) { ret false; }
+    val x64:  opt[*isa.IsaVTable] = isa.lookup(?h.reg.isa, "x86_64");
+    val rv64: opt[*isa.IsaVTable] = isa.lookup(?h.reg.isa, "riscv64");
+    if (sel x64.none)  { ret false; }
+    if (sel rv64.none) { ret false; }
+    h.x64  = x64.some;
+    h.rv64 = rv64.some;
+    ret true;
+}
+
+fun gt_dnit(h: *GtHarness) {
+    target.registry_dnit(?h.reg);
+    session.dnit(?h.s);
+}
+
+fun gt_name(h: *GtHarness, name: str) intern.StrId {
+    val r: res[intern.StrId, A.Error] = intern.intern(?h.s.interner, name);
+    if (sel r.err) { ret intern.STR_NIL; }
+    ret r.ok;
+}
+
+fun gt_roots(entry: intern.StrId) LinkRoots {
+    var roots: LinkRoots;
+    roots.entry      = entry;
+    roots.exports    = false;
+    roots.names      = nil;
+    roots.name_count = 0;
+    ret roots;
+}
+
+# the dead ranges of a link, formatted one "section:start-end" per range
+fun gt_dead(h: *GtHarness, modules: *of.ObjectImage, module_count: u32, codegen_count: u32,
+    roots: *LinkRoots, arch: *isa.IsaVTable, out: *DeadRange, cap: u32) i64 {
+    var sec_base:  [4]u32;
+    var sec_total: u32 = 0;
+    var m:         u32 = 0;
+    for (m < module_count) {
+        sec_base[m] = sec_total;
+        sec_total   = sec_total + modules[m].section_count;
+        m           = m + 1;
+    }
+    var winners: map.Map[intern.StrId, AtomWinner] =
+        map.init[intern.StrId, AtomWinner](?h.alloc, map.hash_u32, map.eq_u32);
+    fin { map.dnit[intern.StrId, AtomWinner](?winners); }
+    m = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym: *of.Symbol = ?modules[m].symbols[sy];
+            if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0 && !of.section_is_external(sym.section)
+                && !map.contains[intern.StrId, AtomWinner](?winners, ?sym.name)) {
+                val ins: res[bool, A.Error] = map.insert[intern.StrId, AtomWinner](?winners, sym.name,
+                    AtomWinner{module: m, symbol: sy, weak: false});
+                if (sel ins.err) { ret -1; }
+            }
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+    var ref_total: u32                           = 0;
+    val refs_r:    res[*AtomRelocRef, fail.Fail] = build_reloc_refs(?h.s, modules, module_count,
+        codegen_count, ?sec_base[0], ?winners, arch, ?ref_total);
+    if (sel refs_r.err) { ret -1; }
+    val refs: *AtomRelocRef = refs_r.ok;
+    fin {
+        if (refs != nil) { A.deallocate[AtomRelocRef](?h.alloc, refs, ref_total::usize); }
+    }
+    var count:  u32                        = 0;
+    val dead_r: res[*DeadRange, fail.Fail] = collect_dead_atoms(?h.s, modules, module_count,
+        codegen_count, ?sec_base[0], sec_total, ?winners, refs, ref_total, arch, roots, ?count);
+    if (sel dead_r.err) { ret -1; }
+    if (count > cap)    { ret -1; }
+    var i: u32 = 0;
+    for (i < count) {
+        out[i] = dead_r.ok[i];
+        i      = i + 1;
+    }
+    if (dead_r.ok != nil) { A.deallocate[DeadRange](?h.alloc, dead_r.ok, count::usize); }
+    ret count::i64;
+}
+
+fun gt_has(dead: *DeadRange, count: i64, section: u32, start: u32, end: u32) bool {
+    var i: i64 = 0;
+    for (i < count) {
+        if (dead[i].section == section && dead[i].start == start && dead[i].end == end) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+val GT_FN: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+
+val GT_OBJ: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_OBJECT;
+
+test "mach.lang.be.linker.gc:the_entry_keeps_what_it_reaches_and_nothing_else" {
+    var h: GtHarness;
+    if (!gt_init(?h)) { ret 1; }
+    fin { gt_dnit(?h); }
+    var text: [24]u8;
+    var secs: [1]of.Section;
+    secs[0] = gt_sec(gt_name(?h, ".text"), of.SK_TEXT, ?text[0], 24, 0);
+    var syms: [3]of.Symbol;
+    syms[0] = gt_sym(gt_name(?h, "_start"), 0, 0, 8, GT_FN);
+    syms[1] = gt_sym(gt_name(?h, "called"), 0, 8, 8, GT_FN);
+    syms[2] = gt_sym(gt_name(?h, "unreached"), 0, 16, 8, GT_FN);
+    var rels: [1]of.Relocation;
+    rels[0] = gt_rel(0, 0, of.RK_ABS64, 1, 0);
+    var mods: [1]of.ObjectImage;
+    mods[0] = lt_image(?h.s, gt_name(?h, "m"), ?secs[0], 1, ?syms[0], 3, ?rels[0], 1);
+
+    var roots: LinkRoots = gt_roots(syms[0].name);
+    var dead:  [8]DeadRange;
+    val n:     i64       = gt_dead(?h, ?mods[0], 1, 1, ?roots, h.x64, ?dead[0], 8);
+    if (n != 1 || !gt_has(?dead[0], n, 0, 16, 24)) { ret 2; }
+
+    rels[0].sym = 2;
+    val retarget: i64 = gt_dead(?h, ?mods[0], 1, 1, ?roots, h.x64, ?dead[0], 8);
+    if (retarget != 1 || !gt_has(?dead[0], retarget, 0, 8, 16)) { ret 3; }
+
+    roots.entry = intern.STR_NIL;
+    val rootless: i64 = gt_dead(?h, ?mods[0], 1, 1, ?roots, h.x64, ?dead[0], 8);
+    if (rootless != 3) { ret 4; }
+    ret 0;
+}
+
+test "mach.lang.be.linker.gc:exports_named_roots_and_foreign_inputs_are_roots" {
+    var h: GtHarness;
+    if (!gt_init(?h)) { ret 1; }
+    fin { gt_dnit(?h); }
+    var text: [24]u8;
+    var secs: [1]of.Section;
+    secs[0] = gt_sec(gt_name(?h, ".text"), of.SK_TEXT, ?text[0], 24, 0);
+    var syms: [3]of.Symbol;
+    syms[0] = gt_sym(gt_name(?h, "exported"), 0, 0, 8, GT_FN);
+    syms[1] = gt_sym(gt_name(?h, "local_fn"), 0, 8, 8, of.SYM_OBJ_FLAG_FUNCTION);
+    syms[2] = gt_sym(gt_name(?h, "probe"), 0, 16, 8, GT_FN);
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_image(?h.s, gt_name(?h, "m"), ?secs[0], 1, ?syms[0], 3, nil::*of.Relocation, 0);
+
+    var roots: LinkRoots = gt_roots(intern.STR_NIL);
+    roots.exports = true;
+    var dead:     [8]DeadRange;
+    val exported: i64 = gt_dead(?h, ?mods[0], 1, 1, ?roots, h.x64, ?dead[0], 8);
+    if (exported != 1 || !gt_has(?dead[0], exported, 0, 8, 16)) { ret 2; }
+
+    roots.exports = false;
+    var names: [1]intern.StrId;
+    names[0]         = syms[2].name;
+    roots.names      = ?names[0];
+    roots.name_count = 1;
+    val named: i64 = gt_dead(?h, ?mods[0], 1, 1, ?roots, h.x64, ?dead[0], 8);
+    if (named != 2 || !gt_has(?dead[0], named, 0, 0, 8) || !gt_has(?dead[0], named, 0, 8, 16)) { ret 3; }
+
+    var ftext: [8]u8;
+    var fsecs: [1]of.Section;
+    fsecs[0] = gt_sec(gt_name(?h, ".text"), of.SK_TEXT, ?ftext[0], 8, 0);
+    var fsyms: [1]of.Symbol;
+    fsyms[0] = gt_extern(syms[0].name);
+    var frels: [1]of.Relocation;
+    frels[0] = gt_rel(0, 0, of.RK_ABS64, 0, 0);
+    mods[1]  = lt_image(?h.s, gt_name(?h, "foreign"), ?fsecs[0], 1, ?fsyms[0], 1, ?frels[0], 1);
+    roots    = gt_roots(intern.STR_NIL);
+    val foreign: i64 = gt_dead(?h, ?mods[0], 2, 1, ?roots, h.x64, ?dead[0], 8);
+    if (foreign != 2 || !gt_has(?dead[0], foreign, 0, 8, 16) || !gt_has(?dead[0], foreign, 0, 16, 24)) { ret 4; }
+    ret 0;
+}
+
+test "mach.lang.be.linker.gc:init_arrays_retained_and_unloaded_sections_are_roots" {
+    var h: GtHarness;
+    if (!gt_init(?h)) { ret 1; }
+    fin { gt_dnit(?h); }
+    var text:   [24]u8;
+    var init:   [8]u8;
+    var boot:   [8]u8;
+    var unwind: [4]u8;
+    var secs:   [4]of.Section;
+    secs[0] = gt_sec(gt_name(?h, ".text"), of.SK_TEXT, ?text[0], 24, 0);
+    secs[1] = gt_sec(gt_name(?h, ".init_array"), of.SK_DATA, ?init[0], 8, of.SEC_FLAG_INIT_FUNCS);
+    secs[2] = gt_sec(gt_name(?h, ".boot"), of.SK_TEXT, ?boot[0], 8, of.SEC_FLAG_RETAIN);
+    secs[3] = gt_sec(gt_name(?h, ".pdata"), of.SK_EXCEPTION, ?unwind[0], 4, 0);
+    var syms: [4]of.Symbol;
+    syms[0] = gt_sym(gt_name(?h, "constructor"), 0, 0, 8, GT_FN);
+    syms[1] = gt_sym(gt_name(?h, "unreached"), 0, 8, 8, GT_FN);
+    syms[2] = gt_sym(gt_name(?h, "vector"), 2, 0, 8, GT_FN);
+    syms[3] = gt_sym(gt_name(?h, "unwound"), 0, 16, 8, GT_FN);
+    var rels: [2]of.Relocation;
+    rels[0] = gt_rel(1, 0, of.RK_ABS64, 0, 0);
+    rels[1] = gt_rel(3, 0, of.RK_ADDR32NB, 3, 0);
+    var mods: [1]of.ObjectImage;
+    mods[0] = lt_image(?h.s, gt_name(?h, "m"), ?secs[0], 4, ?syms[0], 4, ?rels[0], 2);
+
+    var roots: LinkRoots = gt_roots(intern.STR_NIL);
+    var dead:  [8]DeadRange;
+    val n:     i64       = gt_dead(?h, ?mods[0], 1, 1, ?roots, h.x64, ?dead[0], 8);
+    if (n != 1 || !gt_has(?dead[0], n, 0, 8, 16)) { ret 2; }
+
+    secs[1].flags = 0;
+    val no_init: i64 = gt_dead(?h, ?mods[0], 1, 1, ?roots, h.x64, ?dead[0], 8);
+    if (no_init != 3 || !gt_has(?dead[0], no_init, 0, 0, 8) || !gt_has(?dead[0], no_init, 1, 0, 8)) { ret 3; }
+
+    secs[1].flags = of.SEC_FLAG_INIT_FUNCS;
+    secs[2].flags = 0;
+    val no_retain: i64 = gt_dead(?h, ?mods[0], 1, 1, ?roots, h.x64, ?dead[0], 8);
+    if (no_retain != 2 || !gt_has(?dead[0], no_retain, 2, 0, 8)) { ret 4; }
+
+    secs[2].flags = of.SEC_FLAG_RETAIN;
+    secs[3].kind  = of.SK_RODATA;
+    val loaded: i64 = gt_dead(?h, ?mods[0], 1, 1, ?roots, h.x64, ?dead[0], 8);
+    if (loaded != 3 || !gt_has(?dead[0], loaded, 0, 16, 24) || !gt_has(?dead[0], loaded, 3, 0, 4)) { ret 5; }
+    ret 0;
+}
+
+test "mach.lang.be.linker.gc:a_data_relocation_holds_an_address_taken_function" {
+    var h: GtHarness;
+    if (!gt_init(?h)) { ret 1; }
+    fin { gt_dnit(?h); }
+    var text:  [24]u8;
+    var table: [16]u8;
+    var secs:  [2]of.Section;
+    secs[0] = gt_sec(gt_name(?h, ".text"), of.SK_TEXT, ?text[0], 24, 0);
+    secs[1] = gt_sec(gt_name(?h, ".data.rel.ro"), of.SK_RELRO, ?table[0], 16, 0);
+    var syms: [4]of.Symbol;
+    syms[0] = gt_sym(gt_name(?h, "_start"), 0, 0, 8, GT_FN);
+    syms[1] = gt_sym(gt_name(?h, "via_table"), 0, 8, 8, GT_FN);
+    syms[2] = gt_sym(gt_name(?h, "unreached"), 0, 16, 8, GT_FN);
+    syms[3] = gt_sym(gt_name(?h, "table"), 1, 0, 16, GT_OBJ);
+    var rels: [2]of.Relocation;
+    rels[0] = gt_rel(0, 3, of.RK_PC32, 3, -4);
+    rels[1] = gt_rel(1, 8, of.RK_ABS64, 1, 0);
+    var mods: [1]of.ObjectImage;
+    mods[0] = lt_image(?h.s, gt_name(?h, "m"), ?secs[0], 2, ?syms[0], 4, ?rels[0], 2);
+
+    var roots: LinkRoots = gt_roots(syms[0].name);
+    var dead:  [8]DeadRange;
+    val held:  i64       = gt_dead(?h, ?mods[0], 1, 1, ?roots, h.x64, ?dead[0], 8);
+    if (held != 1 || !gt_has(?dead[0], held, 0, 16, 24)) { ret 2; }
+
+    rels[0].offset = 19;
+    val unheld: i64 = gt_dead(?h, ?mods[0], 1, 1, ?roots, h.x64, ?dead[0], 8);
+    if (unheld != 3 || !gt_has(?dead[0], unheld, 1, 0, 16)) { ret 3; }
+    ret 0;
+}
+
+test "mach.lang.be.linker.gc:an_asm_name_reference_and_a_riscv_pair_hold_their_targets" {
+    var h: GtHarness;
+    if (!gt_init(?h)) { ret 1; }
+    fin { gt_dnit(?h); }
+    var text: [32]u8;
+    var secs: [1]of.Section;
+    secs[0] = gt_sec(gt_name(?h, ".text"), of.SK_TEXT, ?text[0], 32, 0);
+    var syms: [4]of.Symbol;
+    syms[0] = gt_sym(gt_name(?h, "_start"), 0, 0, 8, GT_FN);
+    syms[1] = gt_sym(gt_name(?h, "named"), 0, 16, 16, GT_FN);
+    syms[2] = gt_sym(gt_name(?h, "unreached"), 0, 8, 8, GT_FN);
+    syms[3] = gt_sym(gt_name(?h, ".Lpcrel_hi.0"), 0, 0, 0, 0);
+    var rels: [1]of.Relocation;
+    rels[0] = gt_rel(0, 0, of.RK_PLT32, 1, -4);
+    var mods: [1]of.ObjectImage;
+    mods[0] = lt_image(?h.s, gt_name(?h, "m"), ?secs[0], 1, ?syms[0], 4, ?rels[0], 1);
+
+    var roots:   LinkRoots = gt_roots(syms[0].name);
+    var dead:    [8]DeadRange;
+    val asm_ref: i64       = gt_dead(?h, ?mods[0], 1, 1, ?roots, h.x64, ?dead[0], 8);
+    if (asm_ref != 1 || !gt_has(?dead[0], asm_ref, 0, 8, 16)) { ret 2; }
+
+    var pair: [2]of.Relocation;
+    pair[0]      = gt_rel(0, 0, of.RK_PCREL_HI20, 1, 0);
+    pair[1]      = gt_rel(0, 4, of.RK_PCREL_LO12_I, 3, 0);
+    pair[1].pair = 1;
+    mods[0]      = lt_image(?h.s, gt_name(?h, "m"), ?secs[0], 1, ?syms[0], 4, ?pair[0], 2);
+    val rv: i64 = gt_dead(?h, ?mods[0], 1, 1, ?roots, h.rv64, ?dead[0], 8);
+    if (rv != 1 || !gt_has(?dead[0], rv, 0, 8, 16)) { ret 3; }
+    ret 0;
+}
+
+test "mach.lang.be.linker.gc:a_weak_external_reaches_its_fallback" {
+    var h: GtHarness;
+    if (!gt_init(?h)) { ret 1; }
+    fin { gt_dnit(?h); }
+    var text: [16]u8;
+    var secs: [1]of.Section;
+    secs[0] = gt_sec(gt_name(?h, ".text"), of.SK_TEXT, ?text[0], 16, 0);
+    var syms: [3]of.Symbol;
+    syms[0]          = gt_sym(gt_name(?h, "_start"), 0, 0, 8, GT_FN);
+    syms[1]          = gt_sym(gt_name(?h, "fallback_body"), 0, 8, 8, GT_FN);
+    syms[2]          = gt_extern(gt_name(?h, "weak_hook"));
+    syms[2].flags    = syms[2].flags | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FALLBACK;
+    syms[2].fallback = 1;
+    var rels: [1]of.Relocation;
+    rels[0] = gt_rel(0, 0, of.RK_ABS64, 2, 0);
+    var mods: [1]of.ObjectImage;
+    mods[0] = lt_image(?h.s, gt_name(?h, "m"), ?secs[0], 1, ?syms[0], 3, ?rels[0], 1);
+
+    var roots: LinkRoots = gt_roots(syms[0].name);
+    var dead:  [8]DeadRange;
+    if (gt_dead(?h, ?mods[0], 1, 1, ?roots, h.x64, ?dead[0], 8) != 0) { ret 2; }
+    syms[2].flags = syms[2].flags & ~of.SYM_OBJ_FLAG_FALLBACK;
+    val unbound: i64 = gt_dead(?h, ?mods[0], 1, 1, ?roots, h.x64, ?dead[0], 8);
+    if (unbound != 1 || !gt_has(?dead[0], unbound, 0, 8, 16)) { ret 3; }
+    ret 0;
+}
+
+test "mach.lang.be.linker.gc:a_field_bias_span_keeps_every_atom_it_touches" {
+    var h: GtHarness;
+    if (!gt_init(?h)) { ret 1; }
+    fin { gt_dnit(?h); }
+    var text: [32]u8;
+    var secs: [1]of.Section;
+    secs[0] = gt_sec(gt_name(?h, ".text"), of.SK_TEXT, ?text[0], 32, 0);
+    var syms: [4]of.Symbol;
+    syms[0] = gt_sym(gt_name(?h, "_start"), 0, 0, 8, GT_FN);
+    syms[1] = gt_sym(gt_name(?h, "tiny"), 0, 8, 4, GT_FN);
+    syms[2] = gt_sym(gt_name(?h, "neighbour"), 0, 12, 12, GT_FN);
+    syms[3] = gt_sym(gt_name(?h, "far"), 0, 24, 8, GT_FN);
+    var rels: [1]of.Relocation;
+    rels[0] = gt_rel(0, 2, of.RK_PC32, 1, -4);
+    var mods: [1]of.ObjectImage;
+    mods[0] = lt_image(?h.s, gt_name(?h, "m"), ?secs[0], 1, ?syms[0], 4, ?rels[0], 1);
+
+    var roots:   LinkRoots = gt_roots(syms[0].name);
+    var dead:    [8]DeadRange;
+    val codegen: i64       = gt_dead(?h, ?mods[0], 1, 1, ?roots, h.x64, ?dead[0], 8);
+    if (codegen != 1 || !gt_has(?dead[0], codegen, 0, 24, 32)) { ret 2; }
+
+    rels[0] = gt_rel(0, 0, of.RK_ABS64, 1, 0);
+    val exact: i64 = gt_dead(?h, ?mods[0], 1, 1, ?roots, h.x64, ?dead[0], 8);
+    if (exact != 2 || !gt_has(?dead[0], exact, 0, 12, 24) || !gt_has(?dead[0], exact, 0, 24, 32)) { ret 3; }
+    ret 0;
+}
+
+# a section whose symbols or references do not respect atom edges is one atom,
+# kept whole when anything reaches it
+fun gt_fallback_case(h: *GtHarness, syms: *of.Symbol, sym_count: u32, rels: *of.Relocation, rel_count: u32) i32 {
+    var text: [24]u8;
+    var secs: [1]of.Section;
+    secs[0] = gt_sec(gt_name(h, ".text"), of.SK_TEXT, ?text[0], 24, 0);
+    var mods: [1]of.ObjectImage;
+    mods[0] = lt_image(?h.s, gt_name(h, "m"), ?secs[0], 1, syms, sym_count, rels, rel_count);
+    var roots: LinkRoots = gt_roots(syms[0].name);
+    var dead:  [8]DeadRange;
+    ret gt_dead(h, ?mods[0], 1, 1, ?roots, h.x64, ?dead[0], 8)::i32;
+}
+
+test "mach.lang.be.linker.gc:untrustworthy_boundaries_keep_the_section_whole" {
+    var h: GtHarness;
+    if (!gt_init(?h)) { ret 1; }
+    fin { gt_dnit(?h); }
+    val entry: intern.StrId = gt_name(?h, "_start");
+    val mid:   intern.StrId = gt_name(?h, "mid");
+    val other: intern.StrId = gt_name(?h, "other");
+    val label: intern.StrId = gt_name(?h, "label");
+    var syms:  [3]of.Symbol;
+    var rels:  [1]of.Relocation;
+
+    syms[0] = gt_sym(entry, 0, 0, 8, GT_FN);
+    syms[1] = gt_sym(other, 0, 8, 16, GT_FN);
+    if (gt_fallback_case(?h, ?syms[0], 2, nil::*of.Relocation, 0) != 1) { ret 2; }
+    syms[2] = gt_sym(label, 0, 0, 8, GT_OBJ);
+    if (gt_fallback_case(?h, ?syms[0], 3, nil::*of.Relocation, 0) != 1) { ret 13; }
+
+    syms[1] = gt_sym(other, 0, 8, 17, GT_FN);
+    if (gt_fallback_case(?h, ?syms[0], 2, nil::*of.Relocation, 0) != 0) { ret 3; }
+
+    syms[0] = gt_sym(entry, 0, 4, 4, GT_FN);
+    syms[1] = gt_sym(other, 0, 8, 16, GT_FN);
+    if (gt_fallback_case(?h, ?syms[0], 2, nil::*of.Relocation, 0) != 0) { ret 4; }
+
+    syms[0] = gt_sym(entry, 0, 0, 12, GT_FN);
+    if (gt_fallback_case(?h, ?syms[0], 2, nil::*of.Relocation, 0) != 0) { ret 5; }
+
+    syms[0] = gt_sym(entry, 0, 0, 8, GT_FN);
+    syms[1] = gt_sym(other, 0, 8, 16, GT_FN | of.SYM_OBJ_FLAG_SIZE_UNKNOWN);
+    if (gt_fallback_case(?h, ?syms[0], 2, nil::*of.Relocation, 0) != 0) { ret 6; }
+
+    syms[1] = gt_sym(other, 0, 12, 12, GT_FN);
+    syms[2] = gt_sym(label, 0, 8, 0, 0);
+    if (gt_fallback_case(?h, ?syms[0], 3, nil::*of.Relocation, 0) != 0) { ret 7; }
+    syms[2] = gt_sym(label, 0, 4, 0, 0);
+    if (gt_fallback_case(?h, ?syms[0], 3, nil::*of.Relocation, 0) != 1) { ret 8; }
+
+    syms[1] = gt_sym(other, 0, 8, 16, GT_FN);
+    rels[0] = gt_rel(0, 6, of.RK_ABS32, 0, 0);
+    if (gt_fallback_case(?h, ?syms[0], 2, ?rels[0], 1) != 0) { ret 9; }
+    rels[0] = gt_rel(0, 4, of.RK_ABS32, 0, 0);
+    if (gt_fallback_case(?h, ?syms[0], 2, ?rels[0], 1) != 1) { ret 10; }
+
+    syms[1] = gt_sym(mid, 0, 8, 8, GT_FN);
+    syms[2] = gt_sym(other, 0, 16, 8, GT_FN);
+    rels[0] = gt_rel(0, 0, of.RK_ABS64, 2, 0);
+    if (gt_fallback_case(?h, ?syms[0], 3, ?rels[0], 1) != 1) { ret 11; }
+    rels[0] = gt_rel(0, 0, of.RK_ABS64, 2, -17);
+    if (gt_fallback_case(?h, ?syms[0], 3, ?rels[0], 1) != 0) { ret 12; }
+    ret 0;
+}

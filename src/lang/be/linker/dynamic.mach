@@ -1,0 +1,3199 @@
+use std.allocator.page;
+use std.collections.map;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_contains;
+use std.types.string.str_empty;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+
+use A: std.allocator;
+
+use mach.lang.be.linker.relocatable;
+use mach.lang.be.obj;
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.session;
+use mach.lang.target;
+use mach.lang.target.of;
+use rel:            mach.lang.target.of.reloc;
+use target_testing: mach.lang.target.testing;
+
+use mach.lang.be.linker.atoms.AtomPlan;
+use mach.lang.be.linker.atoms.build_atom_plan;
+use mach.lang.be.linker.atoms.free_atom_plan;
+use mach.lang.be.linker.atoms.has_function_branch_reloc;
+use mach.lang.be.linker.atoms.import_symbol_live;
+use mach.lang.be.linker.atoms.init_atom_plan;
+use mach.lang.be.linker.atoms.reloc_source_live;
+use mach.lang.be.linker.common.grow_cap;
+use mach.lang.be.linker.common.is_loadable_kind;
+use mach.lang.be.linker.common.join2;
+use mach.lang.be.linker.common.join3;
+use mach.lang.be.linker.common.lt_image;
+use mach.lang.be.linker.common.lt_name;
+use mach.lang.be.linker.gc.LinkRoots;
+use mach.lang.be.linker.merge.Placement;
+use mach.lang.be.linker.mode.LINK_EXE;
+use mach.lang.be.linker.mode.LINK_RELOCATABLE;
+use mach.lang.be.linker.mode.LinkMode;
+use mach.lang.be.linker.mode.mode_needs_loader;
+use mach.lang.be.linker.mode.unknown_link_mode;
+use mach.lang.be.linker.resolve.SymbolLoc;
+use mach.lang.be.linker.resolve.collect_symbols;
+use mach.lang.be.linker.resolve.is_undefined_extern;
+use mach.lang.be.linker.resolve.resolved_symbol_name;
+
+pub rec DynState {
+    info:                  of.DynamicInfo;
+    import_map:            map.Map[intern.StrId, u32];
+    fixups:                *of.PltFixup;
+    fixup_count:           u32;
+    fixup_cap:             u32;
+    import_cap:            u32;
+    base_reloc_cap:        u32;
+    import_addr_fixup_cap: u32;
+    active:                bool;
+}
+
+pub fun init_dynstate(dyn: *DynState) {
+    dyn.info.libs                    = nil;
+    dyn.info.lib_count               = 0;
+    dyn.info.imports                 = nil;
+    dyn.info.import_count            = 0;
+    dyn.info.interp                  = intern.STR_NIL;
+    dyn.info.base_relocs             = nil;
+    dyn.info.base_reloc_count        = 0;
+    dyn.info.pie                     = false;
+    dyn.info.import_addr_fixups      = nil;
+    dyn.info.import_addr_fixup_count = 0;
+    dyn.fixups                       = nil;
+    dyn.fixup_count                  = 0;
+    dyn.fixup_cap                    = 0;
+    dyn.import_cap                   = 0;
+    dyn.base_reloc_cap               = 0;
+    dyn.import_addr_fixup_cap        = 0;
+    dyn.active                       = false;
+}
+
+pub fun free_dynstate(alloc: *A.Allocator, dyn: *DynState) {
+    if (dyn.info.libs != nil && dyn.info.lib_count > 0) {
+        A.deallocate[of.DynLib](alloc, dyn.info.libs, dyn.info.lib_count::usize);
+    }
+    if (dyn.info.imports != nil && dyn.import_cap > 0) {
+        A.deallocate[of.DynImport](alloc, dyn.info.imports, dyn.import_cap::usize);
+    }
+    if (dyn.fixups != nil && dyn.fixup_cap > 0) {
+        A.deallocate[of.PltFixup](alloc, dyn.fixups, dyn.fixup_cap::usize);
+    }
+    if (dyn.info.base_relocs != nil && dyn.base_reloc_cap > 0) {
+        A.deallocate[of.BaseReloc](alloc, dyn.info.base_relocs, dyn.base_reloc_cap::usize);
+    }
+    if (dyn.info.import_addr_fixups != nil && dyn.import_addr_fixup_cap > 0) {
+        A.deallocate[of.ImportAddrFixup](alloc, dyn.info.import_addr_fixups,
+            dyn.import_addr_fixup_cap::usize);
+    }
+    if (dyn.active) {
+        map.dnit[intern.StrId, u32](?dyn.import_map);
+    }
+    init_dynstate(dyn);
+}
+
+pub fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
+    modules: *of.ObjectImage, module_count: u32,
+    sym_locs: *map.Map[intern.StrId, SymbolLoc],
+    dynlibs: *of.DynLib, dynlib_count: u32,
+    sec_base: *u32, atoms: *AtomPlan) err[fail.Fail] {
+    val alloc: *A.Allocator = s.alloc;
+
+    dyn.info.interp = intern.STR_NIL;
+    if (!str_empty(tgt.fs_policy.dynamic_interpreter)) {
+        val dr: res[intern.StrId, A.Error] = intern.intern(?s.interner, tgt.fs_policy.dynamic_interpreter);
+        if (sel dr.err) { ret err[fail.Fail].err{fail.refused(dr.err)}; }
+        dyn.info.interp = dr.ok;
+    }
+
+    var implicit:        u32          = 0;
+    var implicit_soname: intern.StrId = intern.STR_NIL;
+    if (dyn.info.pie && !str_empty(tgt.fs_policy.platform_lib)) {
+        val pr: res[intern.StrId, A.Error] = intern.intern(?s.interner, tgt.fs_policy.platform_lib);
+        if (sel pr.err) { ret err[fail.Fail].err{fail.refused(pr.err)}; }
+        implicit_soname = pr.ok;
+        implicit        = 1;
+    }
+
+    if (implicit == 1 && dynlib_soname_present(dynlibs, dynlib_count, implicit_soname)) {
+        implicit = 0;
+    }
+    var implicit_lib: of.DynLib;
+    var implicit_ptr: *of.DynLib = nil::*of.DynLib;
+    if (implicit == 1) {
+        implicit_lib.name   = implicit_soname;
+        implicit_lib.soname = implicit_soname;
+        implicit_lib.rpath  = intern.STR_NIL;
+        implicit_ptr        = ?implicit_lib;
+    }
+    var collision_first:    intern.StrId = intern.STR_NIL;
+    var collision_second:   intern.StrId = intern.STR_NIL;
+    var collision_identity: intern.StrId = intern.STR_NIL;
+    if (dynlib_identity_collision(dynlibs, dynlib_count, implicit_ptr,
+        ?collision_first, ?collision_second,
+        ?collision_identity)) {
+        ret err[fail.Fail].err{fail.message(dynlib_identity_conflict_message(
+            s, collision_identity, collision_first, collision_second))};
+    }
+
+    val explicit_libs: u32 = unique_dynlib_count(dynlibs, dynlib_count);
+    val declared_libs: u32 =
+        declared_library_count(s, modules, module_count, dynlibs, dynlib_count,
+        implicit_ptr, sym_locs, tgt.of.import_address_prefix,
+        sec_base, atoms);
+    val attributed_libs_r: res[u32, fail.Fail] =
+        attributed_library_count(s, modules, module_count, dynlibs, dynlib_count,
+        implicit_ptr, sym_locs, tgt.of.import_address_prefix,
+        sec_base, atoms);
+    if (sel attributed_libs_r.err) { ret err[fail.Fail].err{attributed_libs_r.err}; }
+    val attributed_libs: u32 = attributed_libs_r.ok;
+    val total_libs:      u32 = explicit_libs + implicit + declared_libs + attributed_libs;
+    if (total_libs > 0) {
+        val lr: res[*of.DynLib, A.Error] = A.zallocate[of.DynLib](alloc, total_libs::usize);
+        if (sel lr.err) { ret err[fail.Fail].err{fail.refused(lr.err)}; }
+        dyn.info.libs = lr.ok;
+        var i: u32 = 0;
+        var w: u32 = 0;
+        for (i < dynlib_count) {
+            if (!dynlibs[i].include_referenced
+                && !dynlib_soname_seen_before(dynlibs, i, dynlibs[i].soname)) {
+                dyn.info.libs[w] = dynlibs[i];
+                if (dyn.info.libs[w].rpath == intern.STR_NIL) {
+                    var j: u32 = i + 1;
+                    for (j < dynlib_count) {
+                        if (dynlibs[j].soname == dynlibs[i].soname
+                            && dynlibs[j].rpath != intern.STR_NIL) {
+                            dyn.info.libs[w].rpath = dynlibs[j].rpath;
+                            brk;
+                        }
+                        j = j + 1;
+                    }
+                }
+                w = w + 1;
+            }
+            i = i + 1;
+        }
+        if (implicit == 1) {
+            dyn.info.libs[explicit_libs].name   = implicit_soname;
+            dyn.info.libs[explicit_libs].soname = implicit_soname;
+            dyn.info.libs[explicit_libs].rpath  = intern.STR_NIL;
+        }
+        var dw: u32 = explicit_libs + implicit;
+        var dm: u32 = 0;
+        for (dm < module_count) {
+            var di: u32 = 0;
+            for (di < modules[dm].import_count) {
+                val decl: *of.ImportDecl = ?modules[dm].imports[di];
+                if (!declared_import_unresolved(decl, sym_locs)
+                    || !declared_import_referenced(s, modules, module_count, decl.symbol,
+                    tgt.of.import_address_prefix, sec_base, atoms)) {
+                    di = di + 1;
+                    cnt;
+                }
+                val lib: intern.StrId = modules[dm].imports[di].library;
+                if (!dynlib_name_present(dynlibs, dynlib_count, implicit_ptr, lib)
+                    && !emitted_lib_present(dyn.info.libs, dw, lib)) {
+                    dyn.info.libs[dw].name   = lib;
+                    dyn.info.libs[dw].soname = lib;
+                    dyn.info.libs[dw].rpath  = intern.STR_NIL;
+                    dw                       = dw + 1;
+                }
+                di = di + 1;
+            }
+            dm = dm + 1;
+        }
+        var atm: u32 = 0;
+        for (atm < module_count) {
+            var atsy: u32 = 0;
+            for (atsy < modules[atm].symbol_count) {
+                val cand_r: res[opt[of.DynLib], fail.Fail] = attributed_import_candidate(
+                    s, modules, module_count, atm, atsy, tgt.of.import_address_prefix,
+                    dynlibs, dynlib_count, implicit_ptr, sym_locs, sec_base, atoms);
+                if (sel cand_r.err) {
+                    ret err[fail.Fail].err{cand_r.err};
+                }
+                val cand: opt[of.DynLib] = cand_r.ok;
+                if (sel cand.some) {
+                    val entry: of.DynLib = cand.some;
+                    if (!emitted_lib_present(dyn.info.libs, dw, entry.soname)) {
+                        dyn.info.libs[dw].name               = entry.name;
+                        dyn.info.libs[dw].soname             = entry.soname;
+                        dyn.info.libs[dw].rpath              = entry.rpath;
+                        dyn.info.libs[dw].include_referenced = false;
+                        dw                                   = dw + 1;
+                    }
+                }
+                atsy = atsy + 1;
+            }
+            atm = atm + 1;
+        }
+        dyn.info.lib_count = total_libs;
+    }
+
+    var am: u32 = 0;
+    for (am < module_count) {
+        var ai: u32 = 0;
+        for (ai < modules[am].import_count) {
+            val d: *of.ImportDecl = ?modules[am].imports[ai];
+            if (!declared_import_unresolved(d, sym_locs)) {
+                ai = ai + 1;
+                cnt;
+            }
+            val prev: opt[intern.StrId] = session.import_library(s, d.symbol);
+            if (sel prev.some) {
+                if (!declared_attribution_matches(dynlibs, dynlib_count, implicit_ptr,
+                    prev.some, d.library)) {
+                    ret err[fail.Fail].err{fail.message(declared_conflict_message(
+                        s, d.symbol, prev.some, d.library))};
+                }
+            }
+            ai = ai + 1;
+        }
+        am = am + 1;
+    }
+
+    dyn.import_map = map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
+    dyn.active     = true;
+
+    var seen: map.Map[intern.StrId, u32] =
+        map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
+    var n_imports: u32 = 0;
+    var m:         u32 = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym: *of.Symbol = ?modules[m].symbols[sy];
+            if (!is_undefined_extern(sym)) {
+                sy = sy + 1;
+                cnt;
+            }
+            val rr: res[intern.StrId, fail.Fail] = resolved_symbol_name(sym_locs, sym.name);
+            if (sel rr.err) {
+                map.dnit[intern.StrId, u32](?seen);
+                ret err[fail.Fail].err{rr.err};
+            }
+            val effective: intern.StrId    = rr.ok;
+            val get_r:     opt[*SymbolLoc] = map.get[intern.StrId, SymbolLoc](sym_locs, ?effective);
+            if (sel get_r.some) {
+                sy = sy + 1;
+                cnt;
+            }
+            if (!import_symbol_live(modules, module_count, sym.name, sec_base, atoms)) {
+                sy = sy + 1;
+                cnt;
+            }
+            val cn_r: res[ImportName, fail.Fail] =
+                canonical_import_name(s, tgt.of.import_address_prefix, effective);
+            if (sel cn_r.err) {
+                map.dnit[intern.StrId, u32](?seen);
+                ret err[fail.Fail].err{cn_r.err};
+            }
+            val cn:     ImportName = cn_r.ok;
+            val get_r2: opt[*u32]  = map.get[intern.StrId, u32](?seen, ?cn.canonical);
+            if (sel get_r2.some) {
+                sy = sy + 1;
+                cnt;
+            }
+            val ins: res[bool, A.Error] =
+                map.insert[intern.StrId, u32](?seen, cn.canonical, n_imports);
+            if (sel ins.err) {
+                map.dnit[intern.StrId, u32](?seen);
+                ret err[fail.Fail].err{fail.refused(ins.err)};
+            }
+            n_imports = n_imports + 1;
+            sy        = sy + 1;
+        }
+        m = m + 1;
+    }
+    map.dnit[intern.StrId, u32](?seen);
+
+    if (n_imports == 0) { ret err[fail.Fail].ok{}; }
+
+    val ir: res[*of.DynImport, A.Error] = A.zallocate[of.DynImport](alloc, n_imports::usize);
+    if (sel ir.err) { ret err[fail.Fail].err{fail.refused(ir.err)}; }
+    dyn.info.imports = ir.ok;
+    dyn.import_cap   = n_imports;
+
+    m = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym: *of.Symbol = ?modules[m].symbols[sy];
+            if (!is_undefined_extern(sym)) {
+                sy = sy + 1;
+                cnt;
+            }
+            val rr: res[intern.StrId, fail.Fail] = resolved_symbol_name(sym_locs, sym.name);
+            if (sel rr.err) {
+                ret err[fail.Fail].err{rr.err};
+            }
+            val effective: intern.StrId    = rr.ok;
+            val get_r3:    opt[*SymbolLoc] = map.get[intern.StrId, SymbolLoc](sym_locs, ?effective);
+            if (sel get_r3.some) {
+                sy = sy + 1;
+                cnt;
+            }
+            if (!import_symbol_live(modules, module_count, sym.name, sec_base, atoms)) {
+                sy = sy + 1;
+                cnt;
+            }
+
+            val cn_r: res[ImportName, fail.Fail] =
+                canonical_import_name(s, tgt.of.import_address_prefix, effective);
+            if (sel cn_r.err) {
+                ret err[fail.Fail].err{cn_r.err};
+            }
+            val cn:       ImportName = cn_r.ok;
+            val existing: opt[*u32]  =
+                map.get[intern.StrId, u32](?dyn.import_map, ?cn.canonical);
+            if (sel existing.some) {
+                val existing_idx: u32       = @existing.some;
+                val get_r4:       opt[*u32] = map.get[intern.StrId, u32](?dyn.import_map, ?sym.name);
+                if (sel get_r4.none) {
+                    val alias_r: res[bool, A.Error] =
+                        map.insert[intern.StrId, u32](?dyn.import_map, sym.name, existing_idx);
+                    if (sel alias_r.err) {
+                        ret err[fail.Fail].err{fail.refused(alias_r.err)};
+                    }
+                }
+                val get_r5: opt[*u32] = map.get[intern.StrId, u32](?dyn.import_map, ?effective);
+                if (sel get_r5.none) {
+                    val effective_r: res[bool, A.Error] =
+                        map.insert[intern.StrId, u32](?dyn.import_map, effective, existing_idx);
+                    if (sel effective_r.err) {
+                        ret err[fail.Fail].err{fail.refused(effective_r.err)};
+                    }
+                }
+                if (!cn.indirect
+                    && (((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0)
+                    || has_function_branch_reloc(modules, module_count, cn.canonical,
+                    sec_base, atoms)
+                    || has_function_branch_reloc(modules, module_count, effective,
+                    sec_base, atoms))) {
+                    dyn.info.imports[existing_idx].is_func = true;
+                }
+                sy = sy + 1;
+                cnt;
+            }
+
+            val idx: u32 = dyn.info.import_count;
+            dyn.info.imports[idx].symbol = cn.canonical;
+            val decl: *of.ImportDecl =
+                declared_import_for(modules, module_count, cn.canonical, sym_locs);
+            var lib_opt: opt[intern.StrId] = session.import_library(s, cn.canonical);
+            if (decl != nil) { lib_opt = opt[intern.StrId].some{decl.library}; }
+            if (sel lib_opt.some) {
+                val want:   intern.StrId = lib_opt.some;
+                var li_opt: opt[u32]     =
+                    dynlib_index_of(dynlibs, dynlib_count, implicit_ptr, want);
+                val li_opt_none: bool = sel li_opt.none;
+                if (li_opt_none) {
+                    li_opt = emitted_lib_index(dyn.info.libs, explicit_libs + implicit,
+                        dyn.info.lib_count, want);
+                }
+                if (!sel li_opt.some) {
+                    ret err[fail.Fail].err{fail.message(pinned_attribution_message(s, cn.canonical, want))};
+                }
+                dyn.info.imports[idx].lib_index = li_opt.some;
+            }
+            or (tgt.of.two_level_namespace) {
+                ret err[fail.Fail].err{fail.message(unattributed_import_message(
+                    s, cn.canonical, tgt.os.c_symbol_prefix, dynlibs, dynlib_count))};
+            }
+            or {
+                dyn.info.imports[idx].lib_index = of.DYNLIB_ANY;
+            }
+            dyn.info.imports[idx].is_func = !cn.indirect
+                && (((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0)
+                || has_function_branch_reloc(modules, module_count, cn.canonical,
+                sec_base, atoms)
+                || has_function_branch_reloc(modules, module_count, effective,
+                sec_base, atoms));
+            dyn.info.imports[idx].ordinal    = 0;
+            dyn.info.imports[idx].by_ordinal = false;
+            if (decl != nil) {
+                dyn.info.imports[idx].symbol     = decl.import_name;
+                dyn.info.imports[idx].ordinal    = decl.ordinal;
+                dyn.info.imports[idx].by_ordinal = !decl.by_name;
+            }
+            if (!str_empty(tgt.of.import_address_prefix)
+                && is_import_address_alias(s, dyn.info.imports[idx].symbol,
+                tgt.of.import_address_prefix)) {
+                ret err[fail.Fail].err{fail.message(import_alias_message(
+                    s, dyn.info.imports[idx].symbol, tgt.of.import_address_prefix))};
+            }
+            val ins: res[bool, A.Error] =
+                map.insert[intern.StrId, u32](?dyn.import_map, cn.canonical, idx);
+            if (sel ins.err) {
+                ret err[fail.Fail].err{fail.refused(ins.err)};
+            }
+            if (sym.name != cn.canonical) {
+                val alias_r: res[bool, A.Error] =
+                    map.insert[intern.StrId, u32](?dyn.import_map, sym.name, idx);
+                if (sel alias_r.err) {
+                    ret err[fail.Fail].err{fail.refused(alias_r.err)};
+                }
+            }
+            if (effective != cn.canonical && effective != sym.name) {
+                val effective_r: res[bool, A.Error] =
+                    map.insert[intern.StrId, u32](?dyn.import_map, effective, idx);
+                if (sel effective_r.err) {
+                    ret err[fail.Fail].err{fail.refused(effective_r.err)};
+                }
+            }
+            dyn.info.import_count = idx + 1;
+
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun dynlib_index_of(dynlibs: *of.DynLib, dynlib_count: u32,
+    implicit: *of.DynLib, lib: intern.StrId) opt[u32] {
+    var i: u32 = 0;
+    for (i < dynlib_count) {
+        if (!dynlibs[i].include_referenced
+            && (dynlibs[i].name == lib || dynlibs[i].soname == lib)) {
+            var index: u32 = 0;
+            var j:     u32 = 0;
+            for (j < dynlib_count) {
+                if (!dynlibs[j].include_referenced
+                    && !dynlib_soname_seen_before(dynlibs, j, dynlibs[j].soname)) {
+                    if (dynlibs[j].soname == dynlibs[i].soname) {
+                        ret opt[u32].some{index};
+                    }
+                    index = index + 1;
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (implicit != nil && (implicit.name == lib || implicit.soname == lib)) {
+        ret opt[u32].some{unique_dynlib_count(dynlibs, dynlib_count)};
+    }
+    ret opt[u32].none{};
+}
+
+fun dynlib_identity_pair(a: *of.DynLib, b: *of.DynLib,
+    identity: *intern.StrId) bool {
+    if (a.soname == b.soname) { ret false; }
+    if (a.name == b.name || a.name == b.soname) {
+        @identity = a.name;
+        ret true;
+    }
+    if (a.soname == b.name) {
+        @identity = a.soname;
+        ret true;
+    }
+    ret false;
+}
+
+fun dynlib_identity_collision(dynlibs: *of.DynLib, count: u32,
+    implicit: *of.DynLib,
+    first: *intern.StrId, second: *intern.StrId,
+    identity: *intern.StrId) bool {
+    var i: u32 = 0;
+    for (i < count) {
+        var j: u32 = i + 1;
+        for (j < count) {
+            if (dynlib_identity_pair(?dynlibs[i], ?dynlibs[j], identity)) {
+                @first  = dynlibs[i].soname;
+                @second = dynlibs[j].soname;
+                ret true;
+            }
+            j = j + 1;
+        }
+        if (implicit != nil && dynlib_identity_pair(?dynlibs[i], implicit, identity)) {
+            @first  = dynlibs[i].soname;
+            @second = implicit.soname;
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun dynlib_identity_conflict_message(s: *session.Session, identity: intern.StrId,
+    first: intern.StrId, second: intern.StrId) str {
+    val n: opt[str] = intern.lookup(?s.interner, identity);
+    val a: opt[str] = intern.lookup(?s.interner, first);
+    val b: opt[str] = intern.lookup(?s.interner, second);
+    if (sel n.none) {
+        ret "one link library identity names multiple loader dependencies";
+    }
+    if (sel a.none) {
+        ret "one link library identity names multiple loader dependencies";
+    }
+    if (sel b.none) {
+        ret "one link library identity names multiple loader dependencies";
+    }
+    val fallback: str = "one link library identity names multiple loader dependencies";
+    val head:     str = join3(s, "link library identity '", n.some,
+        "' names both loader dependencies '", fallback);
+    val middle: str = join3(s, head, a.some, "' and '", fallback);
+    ret join3(s, middle, b.some, "'", fallback);
+}
+
+fun dynlib_soname_seen_before(dynlibs: *of.DynLib, end: u32,
+    soname: intern.StrId) bool {
+    var i: u32 = 0;
+    for (i < end) {
+        if (!dynlibs[i].include_referenced && dynlibs[i].soname == soname) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun dynlib_soname_present(dynlibs: *of.DynLib, count: u32,
+    soname: intern.StrId) bool {
+    var i: u32 = 0;
+    for (i < count) {
+        if (dynlibs[i].soname == soname) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun symbol_strongly_resolved(sym_locs: *map.Map[intern.StrId, SymbolLoc],
+    name: intern.StrId) bool {
+    val rr: res[intern.StrId, fail.Fail] = resolved_symbol_name(sym_locs, name);
+    if (sel rr.err) { ret false; }
+    val effective: intern.StrId    = rr.ok;
+    val lr:        opt[*SymbolLoc] =
+        map.get[intern.StrId, SymbolLoc](sym_locs, ?effective);
+    if (sel lr.none) { ret false; }
+    ret !lr.some.weak;
+}
+
+fun declared_import_unresolved(d: *of.ImportDecl,
+    sym_locs: *map.Map[intern.StrId, SymbolLoc]) bool {
+    ret !symbol_strongly_resolved(sym_locs, d.symbol);
+}
+
+# whether a declared import the image still references resolves nowhere in it
+pub fun has_unresolved_declared_imports(
+    modules: *of.ObjectImage, module_count: u32,
+    sym_locs: *map.Map[intern.StrId, SymbolLoc],
+    sec_base: *u32, atoms: *AtomPlan) bool {
+    var m: u32 = 0;
+    for (m < module_count) {
+        var i: u32 = 0;
+        for (i < modules[m].import_count) {
+            if (declared_import_unresolved(?modules[m].imports[i], sym_locs)
+                && import_symbol_live(modules, module_count, modules[m].imports[i].symbol, sec_base, atoms)) {
+                ret true;
+            }
+            i = i + 1;
+        }
+        m = m + 1;
+    }
+    ret false;
+}
+
+fun declared_import_for(modules: *of.ObjectImage, module_count: u32,
+    symbol: intern.StrId,
+    sym_locs: *map.Map[intern.StrId, SymbolLoc]) *of.ImportDecl {
+    var m: u32 = 0;
+    for (m < module_count) {
+        var i: u32 = 0;
+        for (i < modules[m].import_count) {
+            if (modules[m].imports[i].symbol == symbol
+                && declared_import_unresolved(?modules[m].imports[i], sym_locs)) {
+                ret ?modules[m].imports[i];
+            }
+            i = i + 1;
+        }
+        m = m + 1;
+    }
+    ret nil;
+}
+
+fun declared_attribution_matches(dynlibs: *of.DynLib, count: u32,
+    implicit: *of.DynLib,
+    attributed: intern.StrId, loader: intern.StrId) bool {
+    if (attributed == loader) { ret true; }
+    var i: u32 = 0;
+    for (i < count) {
+        if ((dynlibs[i].name == attributed || dynlibs[i].soname == attributed)
+            && dynlibs[i].soname == loader) { ret true; }
+        i = i + 1;
+    }
+    if (implicit != nil
+        && (implicit.name == attributed || implicit.soname == attributed)
+        && implicit.soname == loader) { ret true; }
+    ret false;
+}
+
+fun dynlib_name_present(dynlibs: *of.DynLib, count: u32,
+    implicit: *of.DynLib, name: intern.StrId) bool {
+    var i: u32 = 0;
+    for (i < count) {
+        if (!dynlibs[i].include_referenced
+            && (dynlibs[i].name == name || dynlibs[i].soname == name)) { ret true; }
+        i = i + 1;
+    }
+    if (implicit != nil && (implicit.name == name || implicit.soname == name)) { ret true; }
+    ret false;
+}
+
+fun find_referenced_dynlib(dynlibs: *of.DynLib, count: u32, name: intern.StrId) opt[of.DynLib] {
+    var i: u32 = 0;
+    for (i < count) {
+        if (dynlibs[i].include_referenced && dynlibs[i].name == name) {
+            ret opt[of.DynLib].some{dynlibs[i]};
+        }
+        i = i + 1;
+    }
+    ret opt[of.DynLib].none{};
+}
+
+fun emitted_lib_present(libs: *of.DynLib, count: u32, name: intern.StrId) bool {
+    var i: u32 = 0;
+    for (i < count) {
+        if (libs[i].soname == name) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun emitted_lib_index(libs: *of.DynLib, start: u32, count: u32,
+    name: intern.StrId) opt[u32] {
+    if (libs == nil) { ret opt[u32].none{}; }
+    var i: u32 = start;
+    for (i < count) {
+        if (libs[i].name == name || libs[i].soname == name) { ret opt[u32].some{i}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+fun declared_library_count(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
+    dynlibs: *of.DynLib, dynlib_count: u32,
+    implicit: *of.DynLib,
+    sym_locs: *map.Map[intern.StrId, SymbolLoc],
+    prefix: str, sec_base: *u32, atoms: *AtomPlan) u32 {
+    var n: u32 = 0;
+    var m: u32 = 0;
+    for (m < module_count) {
+        var i: u32 = 0;
+        for (i < modules[m].import_count) {
+            val d: *of.ImportDecl = ?modules[m].imports[i];
+            if (!declared_import_unresolved(d, sym_locs)
+                || !declared_import_referenced(s, modules, module_count, d.symbol,
+                prefix, sec_base, atoms)) {
+                i = i + 1;
+                cnt;
+            }
+            val lib: intern.StrId = modules[m].imports[i].library;
+            if (!dynlib_name_present(dynlibs, dynlib_count, implicit, lib)
+                && !declared_library_seen_before(
+                s, modules, module_count, m, i, lib, sym_locs, prefix, sec_base, atoms)) {
+                n = n + 1;
+            }
+            i = i + 1;
+        }
+        m = m + 1;
+    }
+    ret n;
+}
+
+fun declared_library_seen_before(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
+    upto_m: u32, upto_i: u32, lib: intern.StrId,
+    sym_locs: *map.Map[intern.StrId, SymbolLoc],
+    prefix: str, sec_base: *u32, atoms: *AtomPlan) bool {
+    var m: u32 = 0;
+    for (m <= upto_m && m < module_count) {
+        var i:   u32 = 0;
+        var end: u32 = modules[m].import_count;
+        if (m == upto_m) { end = upto_i; }
+        for (i < end) {
+            val d: *of.ImportDecl = ?modules[m].imports[i];
+            if (d.library == lib
+                && declared_import_unresolved(d, sym_locs)
+                && declared_import_referenced(s, modules, module_count, d.symbol,
+                prefix, sec_base, atoms)) {
+                ret true;
+            }
+            i = i + 1;
+        }
+        m = m + 1;
+    }
+    ret false;
+}
+
+fun attributed_import_candidate(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
+    m: u32, sy: u32, prefix: str,
+    dynlibs: *of.DynLib, dynlib_count: u32, implicit: *of.DynLib,
+    sym_locs: *map.Map[intern.StrId, SymbolLoc],
+    sec_base: *u32, atoms: *AtomPlan) res[opt[of.DynLib], fail.Fail] {
+    val none: opt[of.DynLib] = opt[of.DynLib].none{};
+    val sym:  *of.Symbol     = ?modules[m].symbols[sy];
+    if (!is_undefined_extern(sym)) { ret res[opt[of.DynLib], fail.Fail].ok{none}; }
+    val rr: res[intern.StrId, fail.Fail] = resolved_symbol_name(sym_locs, sym.name);
+    if (sel rr.err) {
+        ret res[opt[of.DynLib], fail.Fail].err{rr.err};
+    }
+    val effective: intern.StrId    = rr.ok;
+    val get_r:     opt[*SymbolLoc] = map.get[intern.StrId, SymbolLoc](sym_locs, ?effective);
+    if (sel get_r.some) {
+        ret res[opt[of.DynLib], fail.Fail].ok{none};
+    }
+    val cn_r: res[ImportName, fail.Fail] = canonical_import_name(s, prefix, effective);
+    if (sel cn_r.err) {
+        ret res[opt[of.DynLib], fail.Fail].err{cn_r.err};
+    }
+    val canonical: intern.StrId = cn_r.ok.canonical;
+    if (declared_import_for(modules, module_count, canonical, sym_locs) != nil) {
+        ret res[opt[of.DynLib], fail.Fail].ok{none};
+    }
+    val lib_opt: opt[intern.StrId] = session.import_library(s, canonical);
+    if (sel lib_opt.none) {
+        ret res[opt[of.DynLib], fail.Fail].ok{none};
+    }
+    val lib: intern.StrId = lib_opt.some;
+    if (dynlib_name_present(dynlibs, dynlib_count, implicit, lib)) {
+        ret res[opt[of.DynLib], fail.Fail].ok{none};
+    }
+    val provider: opt[session.LinkProvider] = session.link_provider(s, lib);
+    if (sel provider.some
+        && provider.some.is_static) {
+        ret res[opt[of.DynLib], fail.Fail].ok{none};
+    }
+    val referenced_entry: opt[of.DynLib] = find_referenced_dynlib(dynlibs, dynlib_count, lib);
+    if (!sel referenced_entry.some) {
+        ret res[opt[of.DynLib], fail.Fail].ok{none};
+    }
+    if (!declared_import_referenced(s, modules, module_count, canonical, prefix, sec_base, atoms)) {
+        ret res[opt[of.DynLib], fail.Fail].ok{none};
+    }
+    ret res[opt[of.DynLib], fail.Fail].ok{referenced_entry};
+}
+
+fun attributed_library_seen_before(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
+    upto_m: u32, upto_sy: u32, soname: intern.StrId, prefix: str,
+    dynlibs: *of.DynLib, dynlib_count: u32, implicit: *of.DynLib,
+    sym_locs: *map.Map[intern.StrId, SymbolLoc],
+    sec_base: *u32, atoms: *AtomPlan) res[bool, fail.Fail] {
+    var m: u32 = 0;
+    for (m <= upto_m && m < module_count) {
+        var sy:  u32 = 0;
+        var end: u32 = modules[m].symbol_count;
+        if (m == upto_m) { end = upto_sy; }
+        for (sy < end) {
+            val cand_r: res[opt[of.DynLib], fail.Fail] = attributed_import_candidate(
+                s, modules, module_count, m, sy, prefix, dynlibs, dynlib_count, implicit,
+                sym_locs, sec_base, atoms);
+            if (sel cand_r.err) {
+                ret res[bool, fail.Fail].err{cand_r.err};
+            }
+            val cand: opt[of.DynLib] = cand_r.ok;
+            if (sel cand.some && cand.some.soname == soname) {
+                ret res[bool, fail.Fail].ok{true};
+            }
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+    ret res[bool, fail.Fail].ok{false};
+}
+
+fun attributed_library_count(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
+    dynlibs: *of.DynLib, dynlib_count: u32, implicit: *of.DynLib,
+    sym_locs: *map.Map[intern.StrId, SymbolLoc], prefix: str,
+    sec_base: *u32, atoms: *AtomPlan) res[u32, fail.Fail] {
+    var n: u32 = 0;
+    var m: u32 = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val cand_r: res[opt[of.DynLib], fail.Fail] = attributed_import_candidate(
+                s, modules, module_count, m, sy, prefix, dynlibs, dynlib_count, implicit,
+                sym_locs, sec_base, atoms);
+            if (sel cand_r.err) {
+                ret res[u32, fail.Fail].err{cand_r.err};
+            }
+            val cand: opt[of.DynLib] = cand_r.ok;
+            if (sel cand.some) {
+                val soname: intern.StrId         = cand.some.soname;
+                val seen_r: res[bool, fail.Fail] = attributed_library_seen_before(
+                    s, modules, module_count, m, sy, soname, prefix, dynlibs, dynlib_count, implicit,
+                    sym_locs, sec_base, atoms);
+                if (sel seen_r.err) { ret res[u32, fail.Fail].err{seen_r.err}; }
+                if (!seen_r.ok)     { n = n + 1; }
+            }
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+    ret res[u32, fail.Fail].ok{n};
+}
+
+pub fun has_unresolved_attributed_imports(s: *session.Session, modules: *of.ObjectImage,
+    module_count: u32, dynlibs: *of.DynLib, dynlib_count: u32,
+    sym_locs: *map.Map[intern.StrId, SymbolLoc], prefix: str,
+    sec_base: *u32, atoms: *AtomPlan) res[bool, fail.Fail] {
+    var m: u32 = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val cand_r: res[opt[of.DynLib], fail.Fail] = attributed_import_candidate(
+                s, modules, module_count, m, sy, prefix, dynlibs, dynlib_count, nil::*of.DynLib,
+                sym_locs, sec_base, atoms);
+            if (sel cand_r.err) {
+                ret res[bool, fail.Fail].err{cand_r.err};
+            }
+            val cand: opt[of.DynLib] = cand_r.ok;
+            if (sel cand.some) {
+                ret res[bool, fail.Fail].ok{true};
+            }
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+    ret res[bool, fail.Fail].ok{false};
+}
+
+fun declared_conflict_message(s: *session.Session, sym: intern.StrId,
+    had: intern.StrId, decl: intern.StrId) str {
+    val fallback: str      = "an import library contradicts an existing library attribution";
+    val n:        opt[str] = intern.lookup(?s.interner, sym);
+    val a:        opt[str] = intern.lookup(?s.interner, had);
+    val b:        opt[str] = intern.lookup(?s.interner, decl);
+    if (sel n.none) { ret fallback; }
+    if (sel a.none) { ret fallback; }
+    if (sel b.none) { ret fallback; }
+    val p1: str = join3(s, "import '", n.some, "' is attributed to library '", fallback);
+    val p2: str = join3(s, p1, a.some, "' but an import library declares it in '", fallback);
+    ret join3(s, p2, b.some, "'", fallback);
+}
+
+fun unique_dynlib_count(dynlibs: *of.DynLib, count: u32) u32 {
+    var unique: u32 = 0;
+    var i:      u32 = 0;
+    for (i < count) {
+        if (!dynlibs[i].include_referenced
+            && !dynlib_soname_seen_before(dynlibs, i, dynlibs[i].soname)) {
+            unique = unique + 1;
+        }
+        i = i + 1;
+    }
+    ret unique;
+}
+
+pub rec ImportName {
+    canonical: intern.StrId;
+    indirect:  bool;
+}
+
+pub fun canonical_import_name(s: *session.Session, prefix: str,
+    name: intern.StrId) res[ImportName, fail.Fail] {
+    var out: ImportName;
+    out.canonical = name;
+    out.indirect  = false;
+    if (str_empty(prefix)) { ret res[ImportName, fail.Fail].ok{out}; }
+
+    val text_o: opt[str] = intern.lookup(?s.interner, name);
+    if (sel text_o.none) { ret res[ImportName, fail.Fail].ok{out}; }
+    val text:       str   = text_o.some;
+    val prefix_len: usize = str_len(prefix);
+    if (!str_starts_with(text, prefix) || str_len(text) <= prefix_len) {
+        ret res[ImportName, fail.Fail].ok{out};
+    }
+
+    val cr: res[intern.StrId, A.Error] = intern.intern(?s.interner, (text::usize + prefix_len)::str);
+    if (sel cr.err) {
+        ret res[ImportName, fail.Fail].err{fail.refused(cr.err)};
+    }
+    out.canonical = cr.ok;
+    out.indirect  = true;
+    ret res[ImportName, fail.Fail].ok{out};
+}
+
+fun local_import_candidate(s: *session.Session, prefix: str, sym: *of.Symbol,
+    strong: *map.Map[intern.StrId, u32],
+    defined: *map.Map[intern.StrId, u32]) res[ImportName, fail.Fail] {
+    var none: ImportName;
+    none.canonical = sym.name;
+    none.indirect  = false;
+    if (!is_undefined_extern(sym)
+        || (sym.flags & of.SYM_OBJ_FLAG_FALLBACK) != 0) {
+        ret res[ImportName, fail.Fail].ok{none};
+    }
+
+    val cn_r: res[ImportName, fail.Fail] =
+        canonical_import_name(s, prefix, sym.name);
+    if (sel cn_r.err) {
+        ret res[ImportName, fail.Fail].err{cn_r.err};
+    }
+    val cn: ImportName = cn_r.ok;
+    if (!cn.indirect
+        || !map.contains[intern.StrId, u32](strong, ?cn.canonical)
+        || map.contains[intern.StrId, u32](defined, ?sym.name)) {
+        ret res[ImportName, fail.Fail].ok{none};
+    }
+    ret res[ImportName, fail.Fail].ok{cn};
+}
+
+fun local_import_storage_size(count: u32) res[u32, fail.Fail] {
+    if (count > 0x1FFFFFFF) {
+        ret res[u32, fail.Fail].err{fail.message("link: local import pointer section exceeds 32 bits")};
+    }
+    ret res[u32, fail.Fail].ok{count * 8};
+}
+
+fun local_import_referenced(modules: *of.ObjectImage, module_count: u32,
+    alias: intern.StrId, sec_base: *u32,
+    atoms: *AtomPlan) bool {
+    var m: u32 = 0;
+    for (m < module_count) {
+        var ri: u32 = 0;
+        for (ri < modules[m].reloc_count) {
+            val r: *of.Relocation = ?modules[m].relocations[ri];
+            if (r.sym < modules[m].symbol_count) {
+                val target: *of.Symbol = ?modules[m].symbols[r.sym];
+                if (target.name == alias && is_undefined_extern(target)
+                    && (target.flags & of.SYM_OBJ_FLAG_FALLBACK) == 0
+                    && reloc_source_live(modules, m, r, sec_base, atoms)) {
+                    ret true;
+                }
+            }
+            ri = ri + 1;
+        }
+        m = m + 1;
+    }
+    ret false;
+}
+
+fun relocation_target_is_alias_of(s: *session.Session, target: *of.Symbol,
+    prefix: str, canonical_text: str) bool {
+    if (str_empty(prefix)) { ret false; }
+    val target_text_o: opt[str] = intern.lookup(?s.interner, target.name);
+    if (sel target_text_o.none) { ret false; }
+    val target_text: str   = target_text_o.some;
+    val prefix_len:  usize = str_len(prefix);
+    if (!str_starts_with(target_text, prefix) || str_len(target_text) <= prefix_len) {
+        ret false;
+    }
+    ret str_equals((target_text::usize + prefix_len)::str, canonical_text);
+}
+
+fun declared_import_referenced(s: *session.Session, modules: *of.ObjectImage,
+    module_count: u32, symbol: intern.StrId,
+    prefix: str, sec_base: *u32,
+    atoms: *AtomPlan) bool {
+    if (local_import_referenced(modules, module_count, symbol, sec_base, atoms)) {
+        ret true;
+    }
+    if (str_empty(prefix)) { ret false; }
+    val symbol_text_o: opt[str] = intern.lookup(?s.interner, symbol);
+    if (sel symbol_text_o.none) { ret false; }
+    val symbol_text: str = symbol_text_o.some;
+    var m:           u32 = 0;
+    for (m < module_count) {
+        var ri: u32 = 0;
+        for (ri < modules[m].reloc_count) {
+            val r: *of.Relocation = ?modules[m].relocations[ri];
+            if (r.sym < modules[m].symbol_count) {
+                val target: *of.Symbol = ?modules[m].symbols[r.sym];
+                if (is_undefined_extern(target)
+                    && (target.flags & of.SYM_OBJ_FLAG_FALLBACK) == 0
+                    && relocation_target_is_alias_of(s, target, prefix, symbol_text)
+                    && reloc_source_live(modules, m, r, sec_base, atoms)) {
+                    ret true;
+                }
+            }
+            ri = ri + 1;
+        }
+        m = m + 1;
+    }
+    ret false;
+}
+
+pub fun synthesize_local_imports(s: *session.Session, prefix: str,
+    modules: *of.ObjectImage, module_count: u32,
+    mode: LinkMode, sec_base: *u32, atoms: *AtomPlan,
+    out: *of.ObjectImage) res[bool, fail.Fail] {
+    if (str_empty(prefix) || mode == LINK_RELOCATABLE || modules == nil
+        || module_count == 0) {
+        ret res[bool, fail.Fail].ok{false};
+    }
+
+    val alloc:  *A.Allocator               = s.alloc;
+    var strong: map.Map[intern.StrId, u32] =
+        map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
+    var defined: map.Map[intern.StrId, u32] =
+        map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
+
+    var m: u32 = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym: *of.Symbol = ?modules[m].symbols[sy];
+            if (!of.section_is_external(sym.section)
+                && of.section_index(sym.section) < modules[m].section_count
+                && (sym.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0
+                && is_loadable_kind(modules[m].sections[of.section_index(sym.section)].kind)) {
+                val get_r: opt[*u32] = map.get[intern.StrId, u32](?defined, ?sym.name);
+                if (sel get_r.none) {
+                    val di: res[bool, A.Error] =
+                        map.insert[intern.StrId, u32](?defined, sym.name, 0);
+                    if (sel di.err) {
+                        map.dnit[intern.StrId, u32](?defined);
+                        map.dnit[intern.StrId, u32](?strong);
+                        ret res[bool, fail.Fail].err{fail.refused(di.err)};
+                    }
+                }
+                if ((sym.flags & of.SYM_OBJ_FLAG_WEAK) == 0
+                    && !map.contains[intern.StrId, u32](?strong, ?sym.name)) {
+                    val si: res[bool, A.Error] =
+                        map.insert[intern.StrId, u32](?strong, sym.name, 0);
+                    if (sel si.err) {
+                        map.dnit[intern.StrId, u32](?defined);
+                        map.dnit[intern.StrId, u32](?strong);
+                        ret res[bool, fail.Fail].err{fail.refused(si.err)};
+                    }
+                }
+            }
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+
+    var seen: map.Map[intern.StrId, u32] =
+        map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
+    var count: u32 = 0;
+    m = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym:  *of.Symbol                 = ?modules[m].symbols[sy];
+            val cn_r: res[ImportName, fail.Fail] =
+                local_import_candidate(s, prefix, sym, ?strong, ?defined);
+            if (sel cn_r.err) {
+                map.dnit[intern.StrId, u32](?seen);
+                map.dnit[intern.StrId, u32](?defined);
+                map.dnit[intern.StrId, u32](?strong);
+                ret res[bool, fail.Fail].err{cn_r.err};
+            }
+            val cn: ImportName = cn_r.ok;
+            if (cn.indirect
+                && local_import_referenced(
+                modules, module_count, sym.name, sec_base, atoms)
+                && !map.contains[intern.StrId, u32](?seen, ?sym.name)) {
+                if (count == 0x1FFFFFFF) {
+                    map.dnit[intern.StrId, u32](?seen);
+                    map.dnit[intern.StrId, u32](?defined);
+                    map.dnit[intern.StrId, u32](?strong);
+                    ret res[bool, fail.Fail].err{fail.message("link: local import pointer section exceeds 32 bits")};
+                }
+                val ins: res[bool, A.Error] =
+                    map.insert[intern.StrId, u32](?seen, sym.name, count);
+                if (sel ins.err) {
+                    map.dnit[intern.StrId, u32](?seen);
+                    map.dnit[intern.StrId, u32](?defined);
+                    map.dnit[intern.StrId, u32](?strong);
+                    ret res[bool, fail.Fail].err{fail.refused(ins.err)};
+                }
+                count = count + 1;
+            }
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+    map.dnit[intern.StrId, u32](?seen);
+
+    if (count == 0) {
+        map.dnit[intern.StrId, u32](?defined);
+        map.dnit[intern.StrId, u32](?strong);
+        ret res[bool, fail.Fail].ok{false};
+    }
+
+    val image_name_r:   res[intern.StrId, A.Error] = intern.intern(?s.interner, "<local-import-pointers>");
+    val section_name_r: res[intern.StrId, A.Error] = intern.intern(?s.interner, ".data.rel.ro");
+    if (sel image_name_r.err) {
+        map.dnit[intern.StrId, u32](?defined);
+        map.dnit[intern.StrId, u32](?strong);
+        ret res[bool, fail.Fail].err{fail.refused(image_name_r.err)};
+    }
+    if (sel section_name_r.err) {
+        map.dnit[intern.StrId, u32](?defined);
+        map.dnit[intern.StrId, u32](?strong);
+        ret res[bool, fail.Fail].err{fail.refused(section_name_r.err)};
+    }
+    val image_r: res[of.ObjectImage, fail.Fail] = obj.image_init(alloc, ?s.interner, image_name_r.ok);
+    if (sel image_r.err) {
+        map.dnit[intern.StrId, u32](?defined);
+        map.dnit[intern.StrId, u32](?strong);
+        ret res[bool, fail.Fail].err{image_r.err};
+    }
+    @out = image_r.ok;
+
+    val size_r: res[u32, fail.Fail] = local_import_storage_size(count);
+    if (sel size_r.err) {
+        map.dnit[intern.StrId, u32](?defined);
+        map.dnit[intern.StrId, u32](?strong);
+        ret res[bool, fail.Fail].err{size_r.err};
+    }
+    val byte_count: u32               = size_r.ok;
+    val bytes_r:    res[*u8, A.Error] = A.zallocate[u8](alloc, byte_count::usize);
+    if (sel bytes_r.err) {
+        map.dnit[intern.StrId, u32](?defined);
+        map.dnit[intern.StrId, u32](?strong);
+        ret res[bool, fail.Fail].err{fail.refused(bytes_r.err)};
+    }
+    var sec: of.Section;
+    sec.name  = section_name_r.ok;
+    sec.kind  = of.SK_RELRO;
+    sec.bytes = bytes_r.ok;
+    sec.len   = byte_count;
+    sec.align = 8;
+    sec.flags = 0;
+    val sec_r: res[u32, fail.Fail] = obj.section_install(out, ?sec);
+    if (sel sec_r.err) {
+        obj.dnit(out);
+        map.dnit[intern.StrId, u32](?defined);
+        map.dnit[intern.StrId, u32](?strong);
+        ret res[bool, fail.Fail].err{sec_r.err};
+    }
+
+    val symbols_r: res[*of.Symbol, A.Error] =
+        A.zallocate[of.Symbol](alloc, (count * 2)::usize);
+    if (sel symbols_r.err) {
+        obj.dnit(out);
+        map.dnit[intern.StrId, u32](?defined);
+        map.dnit[intern.StrId, u32](?strong);
+        ret res[bool, fail.Fail].err{fail.refused(symbols_r.err)};
+    }
+    out.symbols      = symbols_r.ok;
+    out.symbol_count = count * 2;
+    out.symbol_cap   = count * 2;
+
+    val relocs_r: res[*of.Relocation, A.Error] =
+        A.zallocate[of.Relocation](alloc, count::usize);
+    if (sel relocs_r.err) {
+        obj.dnit(out);
+        map.dnit[intern.StrId, u32](?defined);
+        map.dnit[intern.StrId, u32](?strong);
+        ret res[bool, fail.Fail].err{fail.refused(relocs_r.err)};
+    }
+    out.relocations = relocs_r.ok;
+    out.reloc_count = count;
+    out.reloc_cap   = count;
+
+    seen = map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
+    var w: u32 = 0;
+    m = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym:  *of.Symbol                 = ?modules[m].symbols[sy];
+            val cn_r: res[ImportName, fail.Fail] =
+                local_import_candidate(s, prefix, sym, ?strong, ?defined);
+            if (sel cn_r.err) {
+                map.dnit[intern.StrId, u32](?seen);
+                obj.dnit(out);
+                map.dnit[intern.StrId, u32](?defined);
+                map.dnit[intern.StrId, u32](?strong);
+                ret res[bool, fail.Fail].err{cn_r.err};
+            }
+            val cn: ImportName = cn_r.ok;
+            if (!cn.indirect
+                || !local_import_referenced(
+                modules, module_count, sym.name, sec_base, atoms)
+                || map.contains[intern.StrId, u32](?seen, ?sym.name)) {
+                sy = sy + 1;
+                cnt;
+            }
+            val ins: res[bool, A.Error] =
+                map.insert[intern.StrId, u32](?seen, sym.name, w);
+            if (sel ins.err) {
+                map.dnit[intern.StrId, u32](?seen);
+                obj.dnit(out);
+                map.dnit[intern.StrId, u32](?defined);
+                map.dnit[intern.StrId, u32](?strong);
+                ret res[bool, fail.Fail].err{fail.refused(ins.err)};
+            }
+
+            val alias_ix:  u32 = w * 2;
+            val target_ix: u32 = alias_ix + 1;
+            out.symbols[alias_ix].name      = sym.name;
+            out.symbols[alias_ix].section   = of.section_id(0);
+            out.symbols[alias_ix].offset    = w * 8;
+            out.symbols[alias_ix].size      = 8;
+            out.symbols[alias_ix].flags     = of.SYM_OBJ_FLAG_GLOBAL;
+            out.symbols[alias_ix].fallback  = of.SYMBOL_NONE;
+            out.symbols[alias_ix].align     = 8;
+            out.symbols[target_ix].name     = cn.canonical;
+            out.symbols[target_ix].section  = of.external_section();
+            out.symbols[target_ix].offset   = 0;
+            out.symbols[target_ix].size     = 0;
+            out.symbols[target_ix].flags    = of.SYM_OBJ_FLAG_GLOBAL;
+            out.symbols[target_ix].fallback = of.SYMBOL_NONE;
+            out.symbols[target_ix].align    = 1;
+
+            out.relocations[w].section = of.section_id(0);
+            out.relocations[w].offset  = w * 8;
+            out.relocations[w].kind    = of.RK_ABS64;
+            out.relocations[w].sym     = target_ix;
+            out.relocations[w].addend  = 0;
+            out.relocations[w].sym2    = of.SYMBOL_NONE;
+            w                          = w + 1;
+            sy                         = sy + 1;
+        }
+        m = m + 1;
+    }
+    map.dnit[intern.StrId, u32](?seen);
+    map.dnit[intern.StrId, u32](?defined);
+    map.dnit[intern.StrId, u32](?strong);
+    if (w != count) {
+        obj.dnit(out);
+        ret res[bool, fail.Fail].err{fail.message("link: local import pointer synthesis changed between passes")};
+    }
+    val valid: err[fail.Fail] = of.validate_owned_object_or_dnit(out);
+    if (sel valid.err) {
+        ret res[bool, fail.Fail].err{valid.err};
+    }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+pub fun dynstate_import_index(dyn: *DynState, name: intern.StrId) res[u32, fail.Fail] {
+    if (!dyn.active) { ret res[u32, fail.Fail].err{fail.message("not dynamic")}; }
+    val g: opt[*u32] = map.get[intern.StrId, u32](?dyn.import_map, ?name);
+    if (sel g.none) { ret res[u32, fail.Fail].err{fail.message("not an import")}; }
+    ret res[u32, fail.Fail].ok{@g.some};
+}
+
+pub fun dynstate_import_is_func(dyn: *DynState, idx: u32) bool {
+    if (idx >= dyn.info.import_count) { ret false; }
+    ret dyn.info.imports[idx].is_func;
+}
+
+pub fun dynstate_add_fixup(s: *session.Session, dyn: *DynState, seg_index: u32, seg_offset: u32,
+    import_index: u32, patch_vaddr: u64, addend: i64) err[fail.Fail] {
+    val alloc: *A.Allocator = s.alloc;
+    if (dyn.fixup_count == dyn.fixup_cap) {
+        val grown: err[fail.Fail] = grow_cap[of.PltFixup](alloc, ?dyn.fixups, ?dyn.fixup_cap, 4);
+        if (sel grown.err) { ret grown; }
+    }
+    val ix: u32 = dyn.fixup_count;
+    dyn.fixups[ix].seg_index    = seg_index;
+    dyn.fixups[ix].seg_offset   = seg_offset;
+    dyn.fixups[ix].import_index = import_index;
+    dyn.fixups[ix].patch_vaddr  = patch_vaddr;
+    dyn.fixups[ix].addend       = addend;
+    dyn.fixup_count             = ix + 1;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun dynstate_add_import_addr_fixup(s: *session.Session, dyn: *DynState,
+    seg_index: u32, seg_offset: u32,
+    import_index: u32, patch_vaddr: u64,
+    kind: of.RelocKind, addend: i64) err[fail.Fail] {
+    val alloc: *A.Allocator = s.alloc;
+    if (dyn.info.import_addr_fixup_count == dyn.import_addr_fixup_cap) {
+        val grown: err[fail.Fail] =
+            grow_cap[of.ImportAddrFixup](alloc, ?dyn.info.import_addr_fixups, ?dyn.import_addr_fixup_cap, 4);
+        if (sel grown.err) { ret grown; }
+    }
+    val ix: u32 = dyn.info.import_addr_fixup_count;
+    dyn.info.import_addr_fixups[ix].seg_index    = seg_index;
+    dyn.info.import_addr_fixups[ix].seg_offset   = seg_offset;
+    dyn.info.import_addr_fixups[ix].import_index = import_index;
+    dyn.info.import_addr_fixups[ix].patch_vaddr  = patch_vaddr;
+    dyn.info.import_addr_fixups[ix].kind         = kind;
+    dyn.info.import_addr_fixups[ix].addend       = addend;
+    dyn.info.import_addr_fixup_count             = ix + 1;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun dynstate_add_base_reloc(s: *session.Session, dyn: *DynState, seg_index: u32,
+    seg_offset: u32, target: u64) err[fail.Fail] {
+    val alloc: *A.Allocator = s.alloc;
+    if (dyn.info.base_reloc_count == dyn.base_reloc_cap) {
+        val grown: err[fail.Fail] =
+            grow_cap[of.BaseReloc](alloc, ?dyn.info.base_relocs, ?dyn.base_reloc_cap, 8);
+        if (sel grown.err) { ret grown; }
+    }
+    val ix: u32 = dyn.info.base_reloc_count;
+    dyn.info.base_relocs[ix].seg_index  = seg_index;
+    dyn.info.base_relocs[ix].seg_offset = seg_offset;
+    dyn.info.base_relocs[ix].target     = target;
+    dyn.info.base_reloc_count           = ix + 1;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun target_requires_pie(tgt: *target.Target) bool {
+    if (tgt.os == nil || tgt.os.pie_exec == nil) { ret false; }
+    ret tgt.os.pie_exec(tgt.isa.id);
+}
+
+# the refusal for a link that needs a loader on an os that maps none, empty
+# when the link needs none
+pub fun loaderless_request_message(s: *session.Session, tgt: *target.Target, mode: LinkMode,
+    pie: bool, dynamic: bool) str {
+    if (tgt.os.mapped_by_loader) { ret ""; }
+    val shared: opt[bool] = mode_needs_loader(mode);
+    if (sel shared.none) { ret unknown_link_mode(s, mode); }
+    if (pie) {
+        ret loader_missing_message(s, tgt.os.name,
+            "a position-independent executable needs a loader to relocate it");
+    }
+    if (shared.some) {
+        ret loader_missing_message(s, tgt.os.name,
+            "a shared library needs a loader to map it");
+    }
+    if (dynamic) {
+        ret loader_missing_message(s, tgt.os.name,
+            "a dynamically-linked executable needs a loader to resolve it");
+    }
+    ret "";
+}
+
+fun loader_missing_message(s: *session.Session, os_name: str, need: str) str {
+    val head: str = join3(s, "link: ", need, ", and os = \"",
+        "link: this image needs a loader and the target os has none");
+    ret join3(s, head, os_name, "\" has none", head);
+}
+
+pub fun pinned_attribution_message(s: *session.Session, sym_name: intern.StrId,
+    lib: intern.StrId) str {
+    val provider: opt[session.LinkProvider] = session.link_provider(s, lib);
+    if (sel provider.some
+        && provider.some.is_static) {
+        ret static_provider_message(s, sym_name, lib);
+    }
+    ret pinned_lib_message(s, sym_name, lib);
+}
+
+fun static_provider_message(s: *session.Session, sym_name: intern.StrId,
+    lib: intern.StrId) str {
+    val fallback: str =
+        "import pinned to a library this link provides as a static input, which defines symbols rather than importing them; the symbol is undefined";
+    val sno: opt[str] = intern.lookup(?s.interner, sym_name);
+    val lno: opt[str] = intern.lookup(?s.interner, lib);
+    if (sel sno.none) { ret fallback; }
+    if (sel lno.none) { ret fallback; }
+    val pre: str = join3(s, "import '", sno.some, "' is pinned to library '", fallback);
+    val mid: str = join3(s, pre, lno.some,
+        "', which this link provides as a static input", fallback);
+    ret join2(s, mid,
+        ". a static input defines symbols rather than importing them, so nothing binds the import: the symbol is not defined by any object or archive in the link. check the declaration's spelling against the library's own symbols, or that the archive was built with it",
+        fallback);
+}
+
+fun pinned_lib_message(s: *session.Session, sym_name: intern.StrId, lib: intern.StrId) str {
+    val fallback: str      = "import pinned to a library not among the link's dependencies";
+    val sno:      opt[str] = intern.lookup(?s.interner, sym_name);
+    val lno:      opt[str] = intern.lookup(?s.interner, lib);
+    if (sel sno.none) { ret fallback; }
+    if (sel lno.none) { ret fallback; }
+    val pre:  str = join3(s, "import '", sno.some, "' pinned to library '", fallback);
+    val head: str = join3(s, pre, lno.some,
+        "' not among the link's dependencies", fallback);
+    val provided: str = join_link_providers(s);
+    if (str_len(provided) == 0) { ret head; }
+    val sep: str = join2(s, head, "; this link provides: ", head);
+    ret join2(s, sep, provided, sep);
+}
+
+fun join_link_providers(s: *session.Session) str {
+    val provs: *session.LinkProvider = session.link_providers(s);
+    val n:     u32                   = session.link_provider_count(s);
+    var acc:   str                   = "";
+    var i:     u32                   = 0;
+    for (i < n) {
+        val nm: opt[str] = intern.lookup(?s.interner, provs[i].name);
+        if (sel nm.none) {
+            i = i + 1;
+            cnt;
+        }
+        var piece: str = nm.some;
+        if (provs[i].is_static) { piece = join2(s, piece, " (static)", piece); }
+        if (str_len(acc) == 0)  { acc = piece; }
+        or {
+            val sep: str = join2(s, acc, ", ", acc);
+            acc = join2(s, sep, piece, sep);
+        }
+        i = i + 1;
+    }
+    ret acc;
+}
+
+fun unattributed_import_message(s: *session.Session, sym_name: intern.StrId,
+    c_symbol_prefix: str,
+    dynlibs: *of.DynLib, dynlib_count: u32) str {
+    val sno: opt[str] = intern.lookup(?s.interner, sym_name);
+    if (sel sno.none) {
+        ret "dynamic import has no #[library] attribution; a two-level-namespace target requires every import to name its providing library - annotate the declaration with #[library(\"...\")], or, when the symbol arrives from a static archive member and has no declaration to annotate, claim it with symbols = [...] on the [link.<entry>] naming its library";
+    }
+    val name: str = sno.some;
+    val head: str = join3(s, "dynamic import '", name,
+        "' has no #[library] attribution; a two-level-namespace target requires every import to name its providing library - annotate the declaration with #[library(\"...\")]",
+        "dynamic import has no #[library] attribution");
+    val claim_pre: str = join2(s,
+        head,
+        ", or, when the symbol arrives from a static archive member and has no declaration to annotate, claim it with symbols = [\"",
+        head);
+    val claim: str = join3(s, claim_pre, source_spelling(name, c_symbol_prefix),
+        "\"] on the [link.<entry>] naming its library", claim_pre);
+    val cands: str = join_dynlibs(s, dynlibs, dynlib_count);
+    if (str_len(cands) == 0) { ret claim; }
+    val pre: str = join2(s, claim, "; candidate libraries: ", claim);
+    ret join2(s, pre, cands, pre);
+}
+
+fun source_spelling(name: str, prefix: str) str {
+    if (str_empty(prefix) || !str_starts_with(name, prefix)
+        || str_len(name) <= str_len(prefix)) {
+        ret name;
+    }
+    ret (name::usize + str_len(prefix))::str;
+}
+
+fun is_import_address_alias(s: *session.Session, name: intern.StrId, prefix: str) bool {
+    val no: opt[str] = intern.lookup(?s.interner, name);
+    if (sel no.none) { ret false; }
+    val text: str = no.some;
+    ret str_starts_with(text, prefix) && str_len(text) > str_len(prefix);
+}
+
+fun import_alias_message(s: *session.Session, name: intern.StrId, prefix: str) str {
+    val no: opt[str] = intern.lookup(?s.interner, name);
+    if (sel no.none) {
+        ret "dynamic import names an import-address alias rather than an export; import the undecorated export instead";
+    }
+    val text:   str = no.some;
+    val export: str = (text::usize + str_len(prefix))::str;
+
+    val head: str = join3(s, "dynamic import '", text, "' names the import-address alias of '",
+        "dynamic import names an import-address alias");
+    val a: str = join3(s, head, export, "' rather than an export: '", head);
+    val b: str = join3(s, a, prefix,
+        "' is the convention for the address cell the import table itself synthesizes, so no library exports a symbol under that name and the image would fail to load. import '",
+        a);
+    ret join3(s, b, export,
+        "' instead - the linker emits that import and resolves every alias reference to its address cell", b);
+}
+
+fun join_dynlibs(s: *session.Session, dynlibs: *of.DynLib, dynlib_count: u32) str {
+    var acc: str = "";
+    var i:   u32 = 0;
+    for (i < dynlib_count) {
+        val nm: opt[str] = intern.lookup(?s.interner, dynlibs[i].name);
+        if (sel nm.none) {
+            i = i + 1;
+            cnt;
+        }
+        var piece: str = nm.some;
+        if (dynlibs[i].soname != dynlibs[i].name) {
+            val so: opt[str] = intern.lookup(?s.interner, dynlibs[i].soname);
+            if (sel so.some) {
+                val pre: str = join2(s, piece, " (", piece);
+                piece = join2(s, pre, so.some, pre);
+                piece = join2(s, piece, ")", piece);
+            }
+        }
+        if (str_len(acc) == 0) { acc = piece; }
+        or {
+            val sep: str = join2(s, acc, ", ", acc);
+            acc = join2(s, sep, piece, sep);
+        }
+        i = i + 1;
+    }
+    ret acc;
+}
+
+test "mach.lang.be.linker.collect_symbols:weak_fallback_resolution" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:        session.Session = sr.ok;
+    val one:      intern.StrId    = lt_name(?s, "fallback_one");
+    val two:      intern.StrId    = lt_name(?s, "fallback_two");
+    val three:    intern.StrId    = lt_name(?s, "fallback_three");
+    val ext:      u32             = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN;
+    val relation: u32             = ext | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FALLBACK;
+
+    var rel_syms: [2]of.Symbol;
+    rel_syms[0].name     = one;
+    rel_syms[0].section  = of.external_section();
+    rel_syms[0].offset   = 0;
+    rel_syms[0].size     = 0;
+    rel_syms[0].flags    = relation;
+    rel_syms[0].fallback = 1;
+    rel_syms[1].name     = two;
+    rel_syms[1].section  = of.external_section();
+    rel_syms[1].offset   = 0;
+    rel_syms[1].size     = 0;
+    rel_syms[1].flags    = ext;
+    rel_syms[1].fallback = of.SYMBOL_NONE;
+    var real_one: of.Symbol;
+    real_one.name     = one;
+    real_one.section  = of.section_id(0);
+    real_one.offset   = 0;
+    real_one.size     = 0;
+    real_one.flags    = of.SYM_OBJ_FLAG_GLOBAL;
+    real_one.fallback = of.SYMBOL_NONE;
+    var real_two: of.Symbol = real_one;
+    real_two.name = two;
+
+    var modules: [3]of.ObjectImage;
+    modules[0] = lt_image(?s, lt_name(?s, "relation"), nil::*of.Section, 0,
+        ?rel_syms[0], 2, nil::*of.Relocation, 0);
+    modules[1] = lt_image(?s, lt_name(?s, "real-one"), nil::*of.Section, 1,
+        ?real_one, 1, nil::*of.Relocation, 0);
+    modules[2] = lt_image(?s, lt_name(?s, "real-two"), nil::*of.Section, 1,
+        ?real_two, 1, nil::*of.Relocation, 0);
+    var placements: [2]Placement;
+    placements[0].vaddr        = 0x1000;
+    placements[0].offset       = 0;
+    placements[0].merged_index = 0;
+    placements[1].vaddr        = 0x2000;
+    placements[1].offset       = 0;
+    placements[1].merged_index = 0;
+    var sec_base: [3]u32;
+    sec_base[0] = 0;
+    sec_base[1] = 0;
+    sec_base[2] = 1;
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    val cr: err[fail.Fail] = collect_symbols(?s, ?modules[0], 3,
+        ?placements[0], ?sec_base[0], ?locs, true, nil::*AtomPlan);
+    if (sel cr.err) { ret 1; }
+    val rn: res[intern.StrId, fail.Fail] = resolved_symbol_name(?locs, one);
+    val ol: opt[*SymbolLoc]              = map.get[intern.StrId, SymbolLoc](?locs, ?one);
+    if (sel rn.err)              { ret 1; }
+    if (rn.ok != one)            { ret 1; }
+    if (sel ol.none)             { ret 1; }
+    if (ol.some.vaddr != 0x1000) { ret 1; }
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+
+    var same_object: [2]of.ObjectImage;
+    same_object[0] = modules[0];
+    same_object[1] = modules[2];
+    var same_base: [2]u32;
+    same_base[0] = 0;
+    same_base[1] = 0;
+    locs         = map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    val sc: err[fail.Fail] = collect_symbols(?s, ?same_object[0], 2,
+        ?placements[1], ?same_base[0], ?locs, true, nil::*AtomPlan);
+    val sn: res[intern.StrId, fail.Fail] = resolved_symbol_name(?locs, one);
+    val tl: opt[*SymbolLoc]              = map.get[intern.StrId, SymbolLoc](?locs, ?two);
+    if (sel sc.err)              { ret 1; }
+    if (sel sn.err)              { ret 1; }
+    if (sn.ok != two)            { ret 1; }
+    if (sel tl.none)             { ret 1; }
+    if (tl.some.vaddr != 0x2000) { ret 1; }
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+
+    var chain: [3]of.Symbol;
+    chain[0]          = rel_syms[0];
+    chain[0].fallback = 1;
+    chain[1]          = rel_syms[0];
+    chain[1].name     = two;
+    chain[1].fallback = 2;
+    chain[2]          = rel_syms[1];
+    chain[2].name     = three;
+    var chain_img: of.ObjectImage = lt_image(?s, lt_name(?s, "chain"),
+        nil::*of.Section, 0, ?chain[0], 3, nil::*of.Relocation, 0);
+    locs = map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    val cc: err[fail.Fail] = collect_symbols(?s, ?chain_img, 1,
+        nil::*Placement, nil::*u32, ?locs, false, nil::*AtomPlan);
+    if (sel cc.err) { ret 1; }
+    val cn: res[intern.StrId, fail.Fail] = resolved_symbol_name(?locs, one);
+    if (sel cn.err)     { ret 1; }
+    if (cn.ok != three) { ret 1; }
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val r_8587: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_8587.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] =
+        target.select(?reg, "x86_64", "linux", "sysv64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
+    var dyn: DynState;
+    init_dynstate(?dyn);
+    val dr: err[fail.Fail] = build_dynamic_info(?s, ?tgt, ?dyn, ?chain_img, 1,
+        ?locs, nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
+    if (sel dr.err)                          { ret 1; }
+    if (dyn.info.import_count != 1)          { ret 1; }
+    if (dyn.info.imports[0].symbol != three) { ret 1; }
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+
+    var conflict: [4]of.Symbol;
+    conflict[0]          = rel_syms[0];
+    conflict[0].fallback = 1;
+    conflict[1]          = rel_syms[1];
+    conflict[2]          = rel_syms[0];
+    conflict[2].fallback = 1;
+    conflict[3]          = rel_syms[1];
+    conflict[3].name     = three;
+    var conflict_mods: [2]of.ObjectImage;
+    conflict_mods[0] = lt_image(?s, lt_name(?s, "conflict-a"), nil::*of.Section, 0,
+        ?conflict[0], 2, nil::*of.Relocation, 0);
+    conflict_mods[1] = lt_image(?s, lt_name(?s, "conflict-b"), nil::*of.Section, 0,
+        ?conflict[2], 2, nil::*of.Relocation, 0);
+    locs = map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    val cf: err[fail.Fail] = collect_symbols(?s, ?conflict_mods[0], 2,
+        nil::*Placement, nil::*u32, ?locs, false, nil::*AtomPlan);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    if (!sel cf.err) { ret 1; }
+
+    chain[0].fallback      = 1;
+    chain[1].fallback      = 0;
+    chain_img.symbol_count = 2;
+    locs                   = map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    val cy: err[fail.Fail] = collect_symbols(?s, ?chain_img, 1,
+        nil::*Placement, nil::*u32, ?locs, false, nil::*AtomPlan);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    if (!sel cy.err) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.be.linker.dynlib_index_of:logical_and_loader_names" {
+    var libs: [3]of.DynLib;
+    libs[0].name   = 41;
+    libs[0].soname = 73;
+    libs[0].rpath  = intern.STR_NIL;
+    libs[1].name   = 42;
+    libs[1].soname = 73;
+    libs[1].rpath  = intern.STR_NIL;
+    libs[2].name   = 43;
+    libs[2].soname = 74;
+    libs[2].rpath  = intern.STR_NIL;
+
+    val logical: opt[u32] =
+        dynlib_index_of(?libs[0], 3, nil::*of.DynLib, 41);
+    val alias: opt[u32] =
+        dynlib_index_of(?libs[0], 3, nil::*of.DynLib, 42);
+    val loader: opt[u32] =
+        dynlib_index_of(?libs[0], 3, nil::*of.DynLib, 73);
+    val other: opt[u32] =
+        dynlib_index_of(?libs[0], 3, nil::*of.DynLib, 74);
+    val missing: opt[u32] =
+        dynlib_index_of(?libs[0], 3, nil::*of.DynLib, 99);
+    if (!sel logical.some)                                                   { ret 1; }
+    if (logical.some != 0)                                                   { ret 1; }
+    if (!sel alias.some)                                                     { ret 1; }
+    if (alias.some != 0)                                                     { ret 1; }
+    if (!sel loader.some)                                                    { ret 1; }
+    if (loader.some != 0)                                                    { ret 1; }
+    if (!sel other.some)                                                     { ret 1; }
+    if (other.some != 1)                                                     { ret 1; }
+    if (sel missing.some)                                                    { ret 1; }
+    if (unique_dynlib_count(?libs[0], 3) != 2)                               { ret 1; }
+    if (!declared_attribution_matches(?libs[0], 3, nil::*of.DynLib, 41, 73)) { ret 1; }
+    if (!declared_attribution_matches(?libs[0], 3, nil::*of.DynLib, 73, 73)) { ret 1; }
+    if (declared_attribution_matches(?libs[0], 3, nil::*of.DynLib, 41, 74))  { ret 1; }
+
+    var collision: [2]of.DynLib;
+    collision[0].name   = 41;
+    collision[0].soname = 73;
+    collision[0].rpath  = intern.STR_NIL;
+    collision[1].name   = 73;
+    collision[1].soname = 74;
+    collision[1].rpath  = intern.STR_NIL;
+    var first:    intern.StrId = intern.STR_NIL;
+    var second:   intern.StrId = intern.STR_NIL;
+    var identity: intern.StrId = intern.STR_NIL;
+    if (!dynlib_identity_collision(?collision[0], 2, nil::*of.DynLib,
+        ?first, ?second, ?identity)) { ret 1; }
+    if (first != 73 || second != 74 || identity != 73) { ret 1; }
+
+    var reversed: [2]of.DynLib;
+    reversed[0] = collision[1];
+    reversed[1] = collision[0];
+    if (!dynlib_identity_collision(?reversed[0], 2, nil::*of.DynLib,
+        ?first, ?second, ?identity)) { ret 1; }
+    if (identity != 73) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.be.linker.unattributed_import_message:names_both_routes" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+
+    val sym:  intern.StrId = lt_name(?s, "Sleep");
+    var libs: [1]of.DynLib;
+    libs[0].name   = lt_name(?s, "kernel32");
+    libs[0].soname = lt_name(?s, "kernel32.dll");
+    libs[0].rpath  = intern.STR_NIL;
+    if (sym == intern.STR_NIL || libs[0].name == intern.STR_NIL
+        || libs[0].soname == intern.STR_NIL) { ret 1; }
+
+    val msg: str = unattributed_import_message(?s, sym, "", ?libs[0], 1);
+    if (!str_contains(msg, "dynamic import 'Sleep'"))                       { ret 1; }
+    if (!str_contains(msg, "#[library(\"...\")]"))                          { ret 1; }
+    if (!str_contains(msg, "static archive member"))                        { ret 1; }
+    if (!str_contains(msg, "no declaration to annotate"))                   { ret 1; }
+    if (!str_contains(msg, "symbols = [\"Sleep\"]"))                        { ret 1; }
+    if (!str_contains(msg, "[link.<entry>]"))                               { ret 1; }
+    if (!str_contains(msg, "candidate libraries: kernel32 (kernel32.dll)")) { ret 1; }
+
+    val mach_o: intern.StrId = lt_name(?s, "_Sleep");
+    if (mach_o == intern.STR_NIL) { ret 1; }
+    val dmsg: str = unattributed_import_message(?s, mach_o, "_", ?libs[0], 1);
+    if (!str_contains(dmsg, "dynamic import '_Sleep'")) { ret 1; }
+    if (!str_contains(dmsg, "symbols = [\"Sleep\"]"))   { ret 1; }
+    if (str_contains(dmsg, "symbols = [\"_Sleep\"]"))   { ret 1; }
+
+    val bare: str = unattributed_import_message(?s, sym, "_", ?libs[0], 1);
+    if (!str_contains(bare, "symbols = [\"Sleep\"]")) { ret 1; }
+
+    val degraded: str =
+        unattributed_import_message(?s, intern.STR_NIL, "", nil::*of.DynLib, 0);
+    if (!str_contains(degraded, "#[library(\"...\")]"))   { ret 1; }
+    if (!str_contains(degraded, "static archive member")) { ret 1; }
+    if (!str_contains(degraded, "symbols = [...]"))       { ret 1; }
+
+    session.dnit(?s);
+    ret 0;
+}
+
+test "mach.lang.be.linker.build_dynamic_info:linux_interpreter_matches_target" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:   session.Session       = sr.ok;
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val r_9005: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_9005.err) { ret 1; }
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var names: [3]str;
+    names[0] = "x86_64";
+    names[1] = "aarch64";
+    names[2] = "riscv64";
+    var abis: [3]str;
+    abis[0] = "sysv64";
+    abis[1] = "aapcs64";
+    abis[2] = "lp64d";
+    var paths: [3]str;
+    paths[0] = "/lib64/ld-linux-x86-64.so.2";
+    paths[1] = "/lib/ld-linux-aarch64.so.1";
+    paths[2] = "/lib/ld-linux-riscv64-lp64d.so.1";
+
+    var i: usize = 0;
+    for (i < 3) {
+        val tr: res[target.Target, fail.Fail] =
+            target.select(?reg, names[i], "linux", abis[i]);
+        if (sel tr.err) { ret 1; }
+        var tgt: target.Target = tr.ok;
+        var dyn: DynState;
+        init_dynstate(?dyn);
+        val built: err[fail.Fail] = build_dynamic_info(
+            ?s, ?tgt, ?dyn, nil::*of.ObjectImage, 0, ?locs,
+            nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
+        if (sel built.err) { ret 1; }
+        val interp: opt[str] = intern.lookup(?s.interner, dyn.info.interp);
+        if (sel interp.none) {
+            ret 1;
+        }
+        if (!(str_equals(interp.some, paths[i]))) {
+            ret 1;
+        }
+        free_dynstate(?alloc, ?dyn);
+        i = i + 1;
+    }
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    ret 0;
+}
+
+test "mach.lang.be.linker.build_dynamic_info:rejects_import_address_alias" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:   session.Session       = sr.ok;
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val r_9050: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_9050.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] =
+        target.select(?reg, "x86_64", "windows", "win64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
+
+    val symbol:  intern.StrId = lt_name(?s, "Sleep");
+    val alias:   intern.StrId = lt_name(?s, "__imp_Sleep");
+    val library: intern.StrId = lt_name(?s, "kernel32.dll");
+    if (symbol == intern.STR_NIL || alias == intern.STR_NIL
+        || library == intern.STR_NIL) { ret 1; }
+
+    var sym: of.Symbol;
+    sym.name    = symbol;
+    sym.section = of.external_section();
+    sym.offset  = 0;
+    sym.size    = 0;
+    sym.flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+        | of.SYM_OBJ_FLAG_FUNCTION;
+    var decl: of.ImportDecl;
+    decl.symbol      = symbol;
+    decl.import_name = alias;
+    decl.library     = library;
+    decl.ordinal     = 0;
+    decl.by_name     = true;
+    decl.is_code     = true;
+    var rel: of.Relocation;
+    rel.section = of.section_id(0);
+    rel.offset  = 0;
+    rel.sym     = 0;
+    rel.addend  = 0;
+    rel.sym2    = 0;
+    var module: of.ObjectImage =
+        lt_image(?s, lt_name(?s, "import-user"), nil::*of.Section, 0,
+        ?sym, 1, ?rel, 1);
+    module.imports      = ?decl;
+    module.import_count = 1;
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var dyn: DynState;
+    init_dynstate(?dyn);
+    val built: err[fail.Fail] =
+        build_dynamic_info(?s, ?tgt, ?dyn, ?module, 1, ?locs,
+        nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
+
+    var code: i32 = 0;
+    if (sel built.err) {
+        val msg: str = fail.describe(built.err);
+        if (dyn.info.import_count != 0)                   { code = 1; }
+        if (!str_contains(msg, "'__imp_Sleep'"))          { code = 1; }
+        if (!str_contains(msg, "import-address alias"))   { code = 1; }
+        if (!str_contains(msg, "import 'Sleep' instead")) { code = 1; }
+    }
+    if (sel built.ok) { code = 1; }
+
+    val bare: intern.StrId = lt_name(?s, "__imp_");
+    if (is_import_address_alias(?s, bare, "__imp_"))   { code = 1; }
+    if (is_import_address_alias(?s, symbol, "__imp_")) { code = 1; }
+    if (!is_import_address_alias(?s, alias, "__imp_")) { code = 1; }
+
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    ret code;
+}
+
+test "mach.lang.be.linker.build_dynamic_info:declared_import_is_link_local" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:   session.Session       = sr.ok;
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val r_9121: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_9121.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] =
+        target.select(?reg, "x86_64", "windows", "win64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
+
+    val symbol:      intern.StrId = lt_name(?s, "PublicName");
+    val export_name: intern.StrId = lt_name(?s, "ExportName");
+    val library:     intern.StrId = lt_name(?s, "demo.dll");
+    if (symbol == intern.STR_NIL || export_name == intern.STR_NIL
+        || library == intern.STR_NIL) { ret 1; }
+
+    var sym: of.Symbol;
+    sym.name    = symbol;
+    sym.section = of.external_section();
+    sym.offset  = 0;
+    sym.size    = 0;
+    sym.flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+        | of.SYM_OBJ_FLAG_FUNCTION;
+    var decl: of.ImportDecl;
+    decl.symbol      = symbol;
+    decl.import_name = export_name;
+    decl.library     = library;
+    decl.ordinal     = 7;
+    decl.by_name     = true;
+    decl.is_code     = true;
+    var rel: of.Relocation;
+    rel.section = of.section_id(0);
+    rel.offset  = 0;
+    rel.sym     = 0;
+    rel.addend  = 0;
+    rel.sym2    = 0;
+    var module: of.ObjectImage =
+        lt_image(?s, lt_name(?s, "import-user"), nil::*of.Section, 0,
+        ?sym, 1, ?rel, 1);
+    module.imports      = ?decl;
+    module.import_count = 1;
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var dyn: DynState;
+    init_dynstate(?dyn);
+    val built: err[fail.Fail] =
+        build_dynamic_info(?s, ?tgt, ?dyn, ?module, 1, ?locs,
+        nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
+    if (sel built.err) { ret 1; }
+    val import_library_r: opt[intern.StrId] = session.import_library(?s, symbol);
+    if (dyn.info.lib_count != 1)                   { ret 1; }
+    if (dyn.info.libs[0].soname != library)        { ret 1; }
+    if (dyn.info.import_count != 1)                { ret 1; }
+    if (dyn.info.imports[0].symbol != export_name) { ret 1; }
+    if (dyn.info.imports[0].lib_index != 0)        { ret 1; }
+    if (dyn.info.imports[0].ordinal != 7)          { ret 1; }
+    if (dyn.info.imports[0].by_ordinal)            { ret 1; }
+    if (sel import_library_r.some)                 { ret 1; }
+
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    ret 0;
+}
+
+test "mach.lang.be.linker.has_unresolved_declared_imports:only_live_references_count" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val registered: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel registered.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] = target.select(?reg, "x86_64", "linux", "sysv64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
+
+    val entry: intern.StrId = lt_name(?s, "_start");
+    val puts:  intern.StrId = lt_name(?s, "puts");
+    val libc:  intern.StrId = lt_name(?s, "libc.so.6");
+    var text:  [16]u8;
+    var secs:  [1]of.Section;
+    secs[0].name  = lt_name(?s, ".text");
+    secs[0].kind  = of.SK_TEXT;
+    secs[0].bytes = ?text[0];
+    secs[0].len   = 16;
+    secs[0].align = 1;
+    var syms: [3]of.Symbol;
+    syms[0].name    = entry;
+    syms[0].section = of.section_id(0);
+    syms[0].offset  = 0;
+    syms[0].size    = 8;
+    syms[0].flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name    = lt_name(?s, "unreached");
+    syms[1].section = of.section_id(0);
+    syms[1].offset  = 8;
+    syms[1].size    = 8;
+    syms[1].flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[2].name    = puts;
+    syms[2].section = of.external_section();
+    syms[2].offset  = 0;
+    syms[2].size    = 0;
+    syms[2].flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_FUNCTION;
+    var relocs: [1]of.Relocation;
+    relocs[0].section = of.section_id(0);
+    relocs[0].offset  = 8;
+    relocs[0].kind    = of.RK_ABS64;
+    relocs[0].sym     = 2;
+    relocs[0].addend  = 0;
+    relocs[0].sym2    = of.SYMBOL_NONE;
+    var decl: of.ImportDecl;
+    decl.symbol      = puts;
+    decl.import_name = puts;
+    decl.library     = libc;
+    decl.by_name     = true;
+    decl.is_code     = true;
+    var module: of.ObjectImage = lt_image(?s, lt_name(?s, "m"), ?secs[0], 1, ?syms[0], 3, ?relocs[0], 1);
+    module.imports      = ?decl;
+    module.import_count = 1;
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    fin { map.dnit[intern.StrId, SymbolLoc](?locs); }
+    var roots: LinkRoots;
+    roots.entry = entry;
+    var sec_base: [1]u32;
+    var atoms:    AtomPlan;
+    init_atom_plan(?atoms);
+    val dead_ref: err[fail.Fail] = build_atom_plan(?s, ?module, 1, 1, ?sec_base[0], 1, true, ?roots, tgt.isa, ?atoms);
+    if (sel dead_ref.err) { ret 2; }
+    val from_dead: bool = has_unresolved_declared_imports(?module, 1, ?locs, ?sec_base[0], ?atoms);
+    free_atom_plan(?alloc, ?atoms);
+    if (from_dead) { ret 3; }
+
+    relocs[0].offset = 0;
+    val live_ref: err[fail.Fail] = build_atom_plan(?s, ?module, 1, 1, ?sec_base[0], 1, true, ?roots, tgt.isa, ?atoms);
+    if (sel live_ref.err) { ret 4; }
+    val from_live: bool = has_unresolved_declared_imports(?module, 1, ?locs, ?sec_base[0], ?atoms);
+    free_atom_plan(?alloc, ?atoms);
+    if (!from_live) { ret 5; }
+    ret 0;
+}
+
+test "mach.lang.be.linker.build_dynamic_info:locally_resolved_declaration" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:   session.Session       = sr.ok;
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val r_9183: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_9183.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] =
+        target.select(?reg, "x86_64", "windows", "win64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
+
+    val symbol:                    intern.StrId   = lt_name(?s, "local_add");
+    val declared:                  intern.StrId   = lt_name(?s, "demo.dll");
+    val stale:                     intern.StrId   = lt_name(?s, "stale.dll");
+    val register_import_library_r: err[fail.Fail] = session.register_import_library(
+        ?s, symbol, stale);
+    if (symbol == intern.STR_NIL)          { ret 1; }
+    if (declared == intern.STR_NIL)        { ret 1; }
+    if (stale == intern.STR_NIL)           { ret 1; }
+    if (sel register_import_library_r.err) { ret 1; }
+
+    var decl: of.ImportDecl;
+    decl.symbol      = symbol;
+    decl.import_name = symbol;
+    decl.library     = declared;
+    decl.ordinal     = 0;
+    decl.by_name     = true;
+    decl.is_code     = true;
+    var module: of.ObjectImage = lt_image(
+        ?s, lt_name(?s, "selected-import-record"), nil::*of.Section, 0,
+        nil::*of.Symbol, 0, nil::*of.Relocation, 0);
+    module.imports      = ?decl;
+    module.import_count = 1;
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var loc: SymbolLoc;
+    loc.vaddr    = 0x1000;
+    loc.weak     = false;
+    loc.fallback = intern.STR_NIL;
+    val insert_r: res[bool, A.Error] = map.insert[intern.StrId, SymbolLoc](
+        ?locs, symbol, loc);
+    if (sel insert_r.err) { ret 1; }
+    var dyn: DynState;
+    init_dynstate(?dyn);
+    val built: err[fail.Fail] = build_dynamic_info(
+        ?s, ?tgt, ?dyn, ?module, 1, ?locs,
+        nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
+    val remains_dynamic: bool = has_unresolved_declared_imports(
+        ?module, 1, ?locs, nil::*u32, nil::*AtomPlan);
+    if (sel built.err) {
+        ret 1;
+    }
+    if (dyn.info.lib_count != 0) {
+        ret 1;
+    }
+    if (dyn.info.import_count != 0) {
+        ret 1;
+    }
+    if (remains_dynamic) {
+        ret 1;
+    }
+
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+
+    val weak_symbol: intern.StrId = lt_name(?s, "weak_local");
+    val weak_alias:  intern.StrId = lt_name(?s, "__imp_weak_local");
+    if (weak_symbol == intern.STR_NIL || weak_alias == intern.STR_NIL) { ret 1; }
+    var weak_decl: of.ImportDecl;
+    weak_decl.symbol      = weak_symbol;
+    weak_decl.import_name = weak_symbol;
+    weak_decl.library     = declared;
+    weak_decl.ordinal     = 0;
+    weak_decl.by_name     = true;
+    weak_decl.is_code     = true;
+    var weak_syms: [2]of.Symbol;
+    weak_syms[0].name    = weak_alias;
+    weak_syms[0].section = of.external_section();
+    weak_syms[0].offset  = 0;
+    weak_syms[0].size    = 0;
+    weak_syms[0].flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+        | of.SYM_OBJ_FLAG_OBJECT;
+    weak_syms[1].name    = weak_symbol;
+    weak_syms[1].section = of.external_section();
+    weak_syms[1].offset  = 0;
+    weak_syms[1].size    = 0;
+    weak_syms[1].flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+        | of.SYM_OBJ_FLAG_FUNCTION;
+    var weak_rel: of.Relocation;
+    weak_rel.section = of.section_id(0);
+    weak_rel.offset  = 0;
+    weak_rel.sym     = 1;
+    weak_rel.addend  = 0;
+    weak_rel.sym2    = 0;
+    var weak_module: of.ObjectImage = lt_image(
+        ?s, lt_name(?s, "weak-import-record"), nil::*of.Section, 0,
+        ?weak_syms[0], 2, ?weak_rel, 1);
+    weak_module.imports      = ?weak_decl;
+    weak_module.import_count = 1;
+    locs                     = map.init[intern.StrId, SymbolLoc](
+        ?alloc, map.hash_u32, map.eq_u32);
+    loc.vaddr    = 0x2000;
+    loc.weak     = true;
+    loc.fallback = intern.STR_NIL;
+    val insert_r2: res[bool, A.Error] = map.insert[intern.StrId, SymbolLoc](
+        ?locs, weak_symbol, loc);
+    if (sel insert_r2.err) { ret 1; }
+    init_dynstate(?dyn);
+    val weak_built: err[fail.Fail] = build_dynamic_info(
+        ?s, ?tgt, ?dyn, ?weak_module, 1, ?locs,
+        nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
+    val weak_dynamic: bool = has_unresolved_declared_imports(
+        ?weak_module, 1, ?locs, nil::*u32, nil::*AtomPlan);
+    if (sel weak_built.err) {
+        ret 1;
+    }
+    if (dyn.info.lib_count != 1) {
+        ret 1;
+    }
+    if (dyn.info.libs[0].soname != declared) {
+        ret 1;
+    }
+    if (dyn.info.import_count != 1) {
+        ret 1;
+    }
+    if (dyn.info.imports[0].symbol != weak_symbol) {
+        ret 1;
+    }
+    if (!weak_dynamic) {
+        ret 1;
+    }
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    ret 0;
+}
+
+test "mach.lang.be.linker.build_dynamic_info:unreferenced_declared_import_elides_needed" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:   session.Session       = sr.ok;
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val r_9283: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_9283.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] =
+        target.select(?reg, "x86_64", "windows", "win64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
+
+    val symbol:  intern.StrId = lt_name(?s, "orphan_fn");
+    val library: intern.StrId = lt_name(?s, "orphan.so");
+    if (symbol == intern.STR_NIL || library == intern.STR_NIL) { ret 1; }
+
+    var decl: of.ImportDecl;
+    decl.symbol      = symbol;
+    decl.import_name = symbol;
+    decl.library     = library;
+    decl.ordinal     = 0;
+    decl.by_name     = true;
+    decl.is_code     = true;
+    var module: of.ObjectImage = lt_image(
+        ?s, lt_name(?s, "orphan-declaration"), nil::*of.Section, 0,
+        nil::*of.Symbol, 0, nil::*of.Relocation, 0);
+    module.imports      = ?decl;
+    module.import_count = 1;
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var dyn: DynState;
+    init_dynstate(?dyn);
+    val built: err[fail.Fail] = build_dynamic_info(
+        ?s, ?tgt, ?dyn, ?module, 1, ?locs,
+        nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
+    if (sel built.err)              { ret 1; }
+    if (dyn.info.lib_count != 0)    { ret 1; }
+    if (dyn.info.import_count != 0) { ret 1; }
+
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    ret 0;
+}
+
+test "mach.lang.be.linker.build_dynamic_info:referenced_declared_import_keeps_needed" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:   session.Session       = sr.ok;
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val r_9327: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_9327.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] =
+        target.select(?reg, "x86_64", "windows", "win64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
+
+    val symbol:  intern.StrId = lt_name(?s, "called_fn");
+    val library: intern.StrId = lt_name(?s, "called.so");
+    if (symbol == intern.STR_NIL || library == intern.STR_NIL) { ret 1; }
+
+    var sym: of.Symbol;
+    sym.name    = symbol;
+    sym.section = of.external_section();
+    sym.offset  = 0;
+    sym.size    = 0;
+    sym.flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+        | of.SYM_OBJ_FLAG_FUNCTION;
+    var decl: of.ImportDecl;
+    decl.symbol      = symbol;
+    decl.import_name = symbol;
+    decl.library     = library;
+    decl.ordinal     = 0;
+    decl.by_name     = true;
+    decl.is_code     = true;
+    var rel: of.Relocation;
+    rel.section = of.section_id(0);
+    rel.offset  = 0;
+    rel.sym     = 0;
+    rel.addend  = 0;
+    rel.sym2    = 0;
+    var module: of.ObjectImage = lt_image(
+        ?s, lt_name(?s, "call-site-user"), nil::*of.Section, 0,
+        ?sym, 1, ?rel, 1);
+    module.imports      = ?decl;
+    module.import_count = 1;
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var dyn: DynState;
+    init_dynstate(?dyn);
+    val built: err[fail.Fail] = build_dynamic_info(
+        ?s, ?tgt, ?dyn, ?module, 1, ?locs,
+        nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
+    if (sel built.err)                      { ret 1; }
+    if (dyn.info.lib_count != 1)            { ret 1; }
+    if (dyn.info.libs[0].soname != library) { ret 1; }
+    if (dyn.info.import_count != 1)         { ret 1; }
+
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    ret 0;
+}
+
+test "mach.lang.be.linker.build_dynamic_info:alias_only_referenced_declared_import_keeps_needed" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:   session.Session       = sr.ok;
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val r_9379: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_9379.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] =
+        target.select(?reg, "x86_64", "windows", "win64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
+
+    val symbol:  intern.StrId = lt_name(?s, "AliasOnly");
+    val alias:   intern.StrId = lt_name(?s, "__imp_AliasOnly");
+    val library: intern.StrId = lt_name(?s, "aliasonly.dll");
+    if (symbol == intern.STR_NIL || alias == intern.STR_NIL
+        || library == intern.STR_NIL) { ret 1; }
+
+    var alias_ref: of.Symbol;
+    alias_ref.name    = alias;
+    alias_ref.section = of.external_section();
+    alias_ref.offset  = 0;
+    alias_ref.size    = 0;
+    alias_ref.flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+        | of.SYM_OBJ_FLAG_FUNCTION;
+    var decl: of.ImportDecl;
+    decl.symbol      = symbol;
+    decl.import_name = symbol;
+    decl.library     = library;
+    decl.ordinal     = 0;
+    decl.by_name     = true;
+    decl.is_code     = true;
+    var rel: of.Relocation;
+    rel.section = of.section_id(0);
+    rel.offset  = 0;
+    rel.sym     = 0;
+    rel.addend  = 0;
+    rel.sym2    = 0;
+    var module: of.ObjectImage = lt_image(
+        ?s, lt_name(?s, "address-taken-user"), nil::*of.Section, 0,
+        ?alias_ref, 1, ?rel, 1);
+    module.imports      = ?decl;
+    module.import_count = 1;
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var dyn: DynState;
+    init_dynstate(?dyn);
+    val built: err[fail.Fail] = build_dynamic_info(
+        ?s, ?tgt, ?dyn, ?module, 1, ?locs,
+        nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
+    if (sel built.err)                      { ret 1; }
+    if (dyn.info.lib_count != 1)            { ret 1; }
+    if (dyn.info.libs[0].soname != library) { ret 1; }
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+
+    var synth: of.ObjectImage;
+    val made:  res[bool, fail.Fail] = synthesize_local_imports(
+        ?s, "__imp_", ?module, 1, LINK_EXE,
+        nil::*u32, nil::*AtomPlan, ?synth);
+    var made_wrong: bool = sel made.err;
+    if (sel made.ok && made.ok) {
+        obj.dnit(?synth);
+        made_wrong = true;
+    }
+    if (made_wrong) {
+        session.dnit(?s);
+        ret 1;
+    }
+
+    session.dnit(?s);
+    ret 0;
+}
+
+test "mach.lang.be.linker.build_dynamic_info:explicit_dynlib_survives_unreferenced" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:   session.Session       = sr.ok;
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val r_9443: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_9443.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] =
+        target.select(?reg, "x86_64", "windows", "win64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
+
+    val soname: intern.StrId = lt_name(?s, "explicit.dll");
+    if (soname == intern.STR_NIL) { ret 1; }
+    var dl: of.DynLib;
+    dl.name   = soname;
+    dl.soname = soname;
+    dl.rpath  = intern.STR_NIL;
+
+    var module: of.ObjectImage = lt_image(
+        ?s, lt_name(?s, "no-declared-imports"), nil::*of.Section, 0,
+        nil::*of.Symbol, 0, nil::*of.Relocation, 0);
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var dyn: DynState;
+    init_dynstate(?dyn);
+    val built: err[fail.Fail] = build_dynamic_info(
+        ?s, ?tgt, ?dyn, ?module, 1, ?locs,
+        ?dl, 1, nil::*u32, nil::*AtomPlan);
+    if (sel built.err)                     { ret 1; }
+    if (dyn.info.lib_count != 1)           { ret 1; }
+    if (dyn.info.libs[0].soname != soname) { ret 1; }
+
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    ret 0;
+}
+
+test "mach.lang.be.linker.build_dynamic_info:attributed_import_referenced_synthesizes_needed" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:   session.Session       = sr.ok;
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val r_9483: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_9483.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] =
+        target.select(?reg, "x86_64", "linux", "sysv64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
+
+    val symbol:                    intern.StrId   = lt_name(?s, "attributed_fn");
+    val pin:                       intern.StrId   = lt_name(?s, "attrlib");
+    val real_soname:               intern.StrId   = lt_name(?s, "attrlib.so.6");
+    val register_import_library_r: err[fail.Fail] = session.register_import_library(?s, symbol, pin);
+    if (symbol == intern.STR_NIL)          { ret 1; }
+    if (pin == intern.STR_NIL)             { ret 1; }
+    if (real_soname == intern.STR_NIL)     { ret 1; }
+    if (sel register_import_library_r.err) { ret 1; }
+
+    var referenced_dl: of.DynLib;
+    referenced_dl.name               = pin;
+    referenced_dl.soname             = real_soname;
+    referenced_dl.rpath              = intern.STR_NIL;
+    referenced_dl.include_referenced = true;
+
+    var sym: of.Symbol;
+    sym.name    = symbol;
+    sym.section = of.external_section();
+    sym.offset  = 0;
+    sym.size    = 0;
+    sym.flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+        | of.SYM_OBJ_FLAG_FUNCTION;
+    var rel: of.Relocation;
+    rel.section = of.section_id(0);
+    rel.offset  = 0;
+    rel.sym     = 0;
+    rel.addend  = 0;
+    rel.sym2    = 0;
+    var module: of.ObjectImage = lt_image(
+        ?s, lt_name(?s, "attributed-caller"), nil::*of.Section, 0,
+        ?sym, 1, ?rel, 1);
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var dyn: DynState;
+    init_dynstate(?dyn);
+    val built: err[fail.Fail] = build_dynamic_info(
+        ?s, ?tgt, ?dyn, ?module, 1, ?locs,
+        ?referenced_dl, 1, nil::*u32, nil::*AtomPlan);
+    if (sel built.err)                          { ret 1; }
+    if (dyn.info.lib_count != 1)                { ret 1; }
+    if (dyn.info.libs[0].soname != real_soname) { ret 1; }
+    if (dyn.info.import_count != 1)             { ret 1; }
+
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    ret 0;
+}
+
+test "mach.lang.be.linker.build_dynamic_info:attributed_import_no_referenced_entry_stays_unresolved" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:   session.Session       = sr.ok;
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val r_9536: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_9536.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] =
+        target.select(?reg, "x86_64", "linux", "sysv64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
+
+    val symbol:                    intern.StrId   = lt_name(?s, "no_link_entry_fn");
+    val pin:                       intern.StrId   = lt_name(?s, "nolinkentrylib");
+    val register_import_library_r: err[fail.Fail] = session.register_import_library(?s, symbol, pin);
+    if (symbol == intern.STR_NIL)          { ret 1; }
+    if (pin == intern.STR_NIL)             { ret 1; }
+    if (sel register_import_library_r.err) { ret 1; }
+
+    var sym: of.Symbol;
+    sym.name    = symbol;
+    sym.section = of.external_section();
+    sym.offset  = 0;
+    sym.size    = 0;
+    sym.flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+        | of.SYM_OBJ_FLAG_FUNCTION;
+    var rel: of.Relocation;
+    rel.section = of.section_id(0);
+    rel.offset  = 0;
+    rel.sym     = 0;
+    rel.addend  = 0;
+    rel.sym2    = 0;
+    var module: of.ObjectImage = lt_image(
+        ?s, lt_name(?s, "no-link-entry-caller"), nil::*of.Section, 0,
+        ?sym, 1, ?rel, 1);
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var dyn: DynState;
+    init_dynstate(?dyn);
+    val built: err[fail.Fail] = build_dynamic_info(
+        ?s, ?tgt, ?dyn, ?module, 1, ?locs,
+        nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
+    if (!sel built.err) { ret 1; }
+    if (!str_contains(fail.describe(built.err), "not among the link's dependencies")) {
+        ret 1;
+    }
+
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    ret 0;
+}
+
+test "mach.lang.be.linker.build_dynamic_info:attributed_import_unreferenced_synthesizes_nothing" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:   session.Session       = sr.ok;
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val r_9584: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_9584.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] =
+        target.select(?reg, "x86_64", "linux", "sysv64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
+
+    val symbol:                    intern.StrId   = lt_name(?s, "unused_attributed_fn");
+    val library:                   intern.StrId   = lt_name(?s, "unusedlib");
+    val register_import_library_r: err[fail.Fail] = session.register_import_library(?s, symbol, library);
+    if (symbol == intern.STR_NIL)          { ret 1; }
+    if (library == intern.STR_NIL)         { ret 1; }
+    if (sel register_import_library_r.err) { ret 1; }
+
+    var module: of.ObjectImage = lt_image(
+        ?s, lt_name(?s, "no-callers"), nil::*of.Section, 0,
+        nil::*of.Symbol, 0, nil::*of.Relocation, 0);
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var dyn: DynState;
+    init_dynstate(?dyn);
+    val built: err[fail.Fail] = build_dynamic_info(
+        ?s, ?tgt, ?dyn, ?module, 1, ?locs,
+        nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
+    if (sel built.err)              { ret 1; }
+    if (dyn.info.lib_count != 0)    { ret 1; }
+    if (dyn.info.import_count != 0) { ret 1; }
+
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    ret 0;
+}
+
+test "mach.lang.be.linker.build_dynamic_info:attributed_import_explicit_dynlib_matches_today" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:   session.Session       = sr.ok;
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val r_9624: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_9624.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] =
+        target.select(?reg, "x86_64", "linux", "sysv64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
+
+    val symbol:                    intern.StrId   = lt_name(?s, "explicit_attributed_fn");
+    val soname:                    intern.StrId   = lt_name(?s, "libexplicit.so.1");
+    val rpath:                     intern.StrId   = lt_name(?s, "/opt/lib");
+    val register_import_library_r: err[fail.Fail] = session.register_import_library(?s, symbol, soname);
+    if (symbol == intern.STR_NIL)          { ret 1; }
+    if (soname == intern.STR_NIL)          { ret 1; }
+    if (rpath == intern.STR_NIL)           { ret 1; }
+    if (sel register_import_library_r.err) { ret 1; }
+
+    var dl: of.DynLib;
+    dl.name   = soname;
+    dl.soname = soname;
+    dl.rpath  = rpath;
+
+    var sym: of.Symbol;
+    sym.name    = symbol;
+    sym.section = of.external_section();
+    sym.offset  = 0;
+    sym.size    = 0;
+    sym.flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+        | of.SYM_OBJ_FLAG_FUNCTION;
+    var rel: of.Relocation;
+    rel.section = of.section_id(0);
+    rel.offset  = 0;
+    rel.sym     = 0;
+    rel.addend  = 0;
+    rel.sym2    = 0;
+    var module: of.ObjectImage = lt_image(
+        ?s, lt_name(?s, "explicit-attributed-caller"), nil::*of.Section, 0,
+        ?sym, 1, ?rel, 1);
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var dyn: DynState;
+    init_dynstate(?dyn);
+    val built: err[fail.Fail] = build_dynamic_info(
+        ?s, ?tgt, ?dyn, ?module, 1, ?locs,
+        ?dl, 1, nil::*u32, nil::*AtomPlan);
+    if (sel built.err)                     { ret 1; }
+    if (dyn.info.lib_count != 1)           { ret 1; }
+    if (dyn.info.libs[0].soname != soname) { ret 1; }
+    if (dyn.info.libs[0].rpath != rpath)   { ret 1; }
+    if (dyn.info.import_count != 1)        { ret 1; }
+
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    ret 0;
+}
+
+test "mach.lang.be.linker.build_dynamic_info:attributed_import_alias_only_reference_synthesizes_needed" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:   session.Session       = sr.ok;
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val r_9677: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_9677.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] =
+        target.select(?reg, "x86_64", "windows", "win64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
+
+    val symbol:                    intern.StrId   = lt_name(?s, "AttributedAliasOnly");
+    val alias:                     intern.StrId   = lt_name(?s, "__imp_AttributedAliasOnly");
+    val pin:                       intern.StrId   = lt_name(?s, "attraliasonly");
+    val real_soname:               intern.StrId   = lt_name(?s, "AttrAliasOnlyReal.dll");
+    val register_import_library_r: err[fail.Fail] = session.register_import_library(?s, symbol, pin);
+    if (symbol == intern.STR_NIL)          { ret 1; }
+    if (alias == intern.STR_NIL)           { ret 1; }
+    if (pin == intern.STR_NIL)             { ret 1; }
+    if (real_soname == intern.STR_NIL)     { ret 1; }
+    if (sel register_import_library_r.err) { ret 1; }
+
+    var referenced_dl: of.DynLib;
+    referenced_dl.name               = pin;
+    referenced_dl.soname             = real_soname;
+    referenced_dl.rpath              = intern.STR_NIL;
+    referenced_dl.include_referenced = true;
+
+    var alias_ref: of.Symbol;
+    alias_ref.name    = alias;
+    alias_ref.section = of.external_section();
+    alias_ref.offset  = 0;
+    alias_ref.size    = 0;
+    alias_ref.flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+        | of.SYM_OBJ_FLAG_FUNCTION;
+    var rel: of.Relocation;
+    rel.section = of.section_id(0);
+    rel.offset  = 0;
+    rel.sym     = 0;
+    rel.addend  = 0;
+    rel.sym2    = 0;
+    var module: of.ObjectImage = lt_image(
+        ?s, lt_name(?s, "attributed-address-taken-user"), nil::*of.Section, 0,
+        ?alias_ref, 1, ?rel, 1);
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var dyn: DynState;
+    init_dynstate(?dyn);
+    val built: err[fail.Fail] = build_dynamic_info(
+        ?s, ?tgt, ?dyn, ?module, 1, ?locs,
+        ?referenced_dl, 1, nil::*u32, nil::*AtomPlan);
+    if (sel built.err)                          { ret 1; }
+    if (dyn.info.lib_count != 1)                { ret 1; }
+    if (dyn.info.libs[0].soname != real_soname) { ret 1; }
+
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    ret 0;
+}
+
+test "mach.lang.be.linker.build_dynamic_info:coff_import_address_alias" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:   session.Session       = sr.ok;
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val r_9731: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_9731.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] =
+        target.select(?reg, "x86_64", "windows", "win64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
+
+    val direct:                    intern.StrId   = lt_name(?s, "Sleep");
+    val indirect:                  intern.StrId   = lt_name(?s, "__imp_Sleep");
+    val library:                   intern.StrId   = lt_name(?s, "kernel32.dll");
+    val register_import_library_r: err[fail.Fail] = session.register_import_library(
+        ?s, direct, library);
+    if (direct == intern.STR_NIL)          { ret 1; }
+    if (indirect == intern.STR_NIL)        { ret 1; }
+    if (library == intern.STR_NIL)         { ret 1; }
+    if (sel register_import_library_r.err) { ret 1; }
+
+    var syms: [2]of.Symbol;
+    syms[0].name    = indirect;
+    syms[0].section = of.external_section();
+    syms[0].offset  = 0;
+    syms[0].size    = 0;
+    syms[0].flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+        | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name    = direct;
+    syms[1].section = of.external_section();
+    syms[1].offset  = 0;
+    syms[1].size    = 0;
+    syms[1].flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+        | of.SYM_OBJ_FLAG_FUNCTION;
+    var module: of.ObjectImage = lt_image(
+        ?s, lt_name(?s, "dllimport-user"), nil::*of.Section, 0,
+        ?syms[0], 2, nil::*of.Relocation, 0);
+    var dep: of.DynLib;
+    dep.name   = library;
+    dep.soname = library;
+    dep.rpath  = intern.STR_NIL;
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var dyn: DynState;
+    init_dynstate(?dyn);
+
+    val built: err[fail.Fail] = build_dynamic_info(
+        ?s, ?tgt, ?dyn, ?module, 1, ?locs, ?dep, 1,
+        nil::*u32, nil::*AtomPlan);
+    val direct_idx:   res[u32, fail.Fail] = dynstate_import_index(?dyn, direct);
+    val indirect_idx: res[u32, fail.Fail] = dynstate_import_index(?dyn, indirect);
+    if (sel built.err)                        { ret 1; }
+    if (dyn.info.import_count != 1)           { ret 1; }
+    if (dyn.info.imports[0].symbol != direct) { ret 1; }
+    if (dyn.info.imports[0].lib_index != 0)   { ret 1; }
+    if (!dyn.info.imports[0].is_func)         { ret 1; }
+    if (sel direct_idx.err)                   { ret 1; }
+    if (sel indirect_idx.err)                 { ret 1; }
+    if (direct_idx.ok != 0)                   { ret 1; }
+    if (indirect_idx.ok != 0)                 { ret 1; }
+
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    ret 0;
+}
+
+test "mach.lang.be.linker.synthesize_local_imports:defined_local_import" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+
+    val x:           intern.StrId = lt_name(?s, "local_x");
+    val y:           intern.StrId = lt_name(?s, "weak_y");
+    val z:           intern.StrId = lt_name(?s, "defined_z");
+    val missing:     intern.StrId = lt_name(?s, "missing");
+    val imp_x:       intern.StrId = lt_name(?s, "__imp_local_x");
+    val imp_y:       intern.StrId = lt_name(?s, "__imp_weak_y");
+    val imp_z:       intern.StrId = lt_name(?s, "__imp_defined_z");
+    val imp_missing: intern.StrId = lt_name(?s, "__imp_missing");
+    if (x == intern.STR_NIL || y == intern.STR_NIL || z == intern.STR_NIL
+        || missing == intern.STR_NIL || imp_x == intern.STR_NIL
+        || imp_y == intern.STR_NIL || imp_z == intern.STR_NIL
+        || imp_missing == intern.STR_NIL) { ret 1; }
+
+    var code: [1]u8;
+    code[0] = 0xC3;
+    var text: of.Section;
+    text.name  = lt_name(?s, ".text");
+    text.kind  = of.SK_TEXT;
+    text.bytes = ?code[0];
+    text.len   = 1;
+    text.align = 1;
+    val global:   u32 = of.SYM_OBJ_FLAG_GLOBAL;
+    val external: u32 = global | of.SYM_OBJ_FLAG_EXTERN;
+
+    var defs: [4]of.Symbol;
+    defs[0].name    = x;
+    defs[0].section = of.section_id(0);
+    defs[0].offset  = 0;
+    defs[0].size    = 1;
+    defs[0].flags   = global | of.SYM_OBJ_FLAG_FUNCTION;
+    defs[1].name    = y;
+    defs[1].section = of.section_id(0);
+    defs[1].offset  = 0;
+    defs[1].size    = 1;
+    defs[1].flags   = global | of.SYM_OBJ_FLAG_WEAK;
+    defs[2].name    = z;
+    defs[2].section = of.section_id(0);
+    defs[2].offset  = 0;
+    defs[2].size    = 1;
+    defs[2].flags   = global;
+    defs[3].name    = imp_z;
+    defs[3].section = of.section_id(0);
+    defs[3].offset  = 0;
+    defs[3].size    = 1;
+    defs[3].flags   = global;
+
+    var refs: [6]of.Symbol;
+    refs[0].name     = imp_x;
+    refs[0].section  = of.external_section();
+    refs[0].flags    = external | of.SYM_OBJ_FLAG_FUNCTION;
+    refs[1]          = refs[0];
+    refs[2].name     = imp_y;
+    refs[2].section  = of.external_section();
+    refs[2].flags    = external;
+    refs[3].name     = imp_z;
+    refs[3].section  = of.external_section();
+    refs[3].flags    = external;
+    refs[4].name     = imp_missing;
+    refs[4].section  = of.external_section();
+    refs[4].flags    = external;
+    refs[5].name     = imp_x;
+    refs[5].section  = of.external_section();
+    refs[5].flags    = external | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FALLBACK;
+    refs[5].fallback = 4;
+
+    var ref_code: [4]u8;
+    var ref_text: of.Section;
+    ref_text.name  = lt_name(?s, ".text");
+    ref_text.kind  = of.SK_TEXT;
+    ref_text.bytes = ?ref_code[0];
+    ref_text.len   = 4;
+    ref_text.align = 1;
+    var ref_reloc: of.Relocation;
+    ref_reloc.section = of.section_id(0);
+    ref_reloc.offset  = 0;
+    ref_reloc.kind    = of.RK_PC32;
+    ref_reloc.sym     = 0;
+    ref_reloc.addend  = 0;
+
+    var modules: [2]of.ObjectImage;
+    modules[0] = lt_image(?s, lt_name(?s, "local-defs"), ?text, 1,
+        ?defs[0], 4, nil::*of.Relocation, 0);
+    modules[1] = lt_image(?s, lt_name(?s, "local-refs"), ?ref_text, 1,
+        ?refs[0], 6, ?ref_reloc, 1);
+
+    var synth: of.ObjectImage;
+    val made:  res[bool, fail.Fail] = synthesize_local_imports(
+        ?s, "__imp_", ?modules[0], 2, LINK_EXE,
+        nil::*u32, nil::*AtomPlan, ?synth);
+    var made_wrong: bool = sel made.err;
+    if (sel made.ok && !made.ok) { made_wrong = true; }
+    if (made_wrong
+        || synth.section_count != 1 || synth.sections[0].kind != of.SK_RELRO
+        || synth.sections[0].len != 8 || synth.sections[0].align != 8
+        || synth.symbol_count != 2 || synth.reloc_count != 1
+        || synth.symbols[0].name != imp_x || of.section_index(synth.symbols[0].section) != 0
+        || synth.symbols[0].offset != 0 || synth.symbols[0].size != 8
+        || synth.symbols[0].flags != global
+        || synth.symbols[1].name != x
+        || !of.section_is_external(synth.symbols[1].section)
+        || of.section_index(synth.relocations[0].section) != 0 || synth.relocations[0].offset != 0
+        || synth.relocations[0].kind != of.RK_ABS64
+        || synth.relocations[0].sym != 1 || synth.relocations[0].addend != 0) {
+        if (sel made.ok && made.ok) { obj.dnit(?synth); }
+        session.dnit(?s);
+        ret 1;
+    }
+    obj.dnit(?synth);
+
+    var untouched:   of.ObjectImage;
+    val relocatable: res[bool, fail.Fail] = synthesize_local_imports(
+        ?s, "__imp_", ?modules[0], 2, LINK_RELOCATABLE,
+        nil::*u32, nil::*AtomPlan, ?untouched);
+    var relocatable_wrong: bool = sel relocatable.err;
+    if (sel relocatable.ok && relocatable.ok) { relocatable_wrong = true; }
+    if (relocatable_wrong) {
+        session.dnit(?s);
+        ret 1;
+    }
+
+    var corrupt_def: of.Symbol = defs[0];
+    corrupt_def.section = of.section_id(1);
+    var corrupt_modules: [2]of.ObjectImage;
+    corrupt_modules[0] = lt_image(?s, lt_name(?s, "corrupt-local-def"), ?text, 1,
+        ?corrupt_def, 1, nil::*of.Relocation, 0);
+    corrupt_modules[1] = modules[1];
+    val malformed: res[bool, fail.Fail] = synthesize_local_imports(
+        ?s, "__imp_", ?corrupt_modules[0], 2, LINK_EXE,
+        nil::*u32, nil::*AtomPlan, ?untouched);
+    var corrupt_locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    val diagnosed: err[fail.Fail] = collect_symbols(
+        ?s, ?corrupt_modules[0], 2, nil::*Placement, nil::*u32,
+        ?corrupt_locs, false, nil::*AtomPlan);
+    map.dnit[intern.StrId, SymbolLoc](?corrupt_locs);
+    val max_size: res[u32, fail.Fail] = local_import_storage_size(0x1FFFFFFF);
+    val overflow: res[u32, fail.Fail] = local_import_storage_size(0x20000000);
+    session.dnit(?s);
+    if (sel malformed.err)         { ret 1; }
+    if (malformed.ok)              { ret 1; }
+    if (!sel diagnosed.err)        { ret 1; }
+    if (sel max_size.err)          { ret 1; }
+    if (max_size.ok != 0xFFFFFFF8) { ret 1; }
+    if (!sel overflow.err)         { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.be.linker.synthesize_local_imports:dead_weak_comdat" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:   session.Session       = sr.ok;
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val r_9920: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_9920.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] =
+        target.select(?reg, "x86_64", "windows", "win64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
+
+    val choice: intern.StrId = lt_name(?s, "qz_select_any");
+    val local:  intern.StrId = lt_name(?s, "dead_local");
+    val alias:  intern.StrId = lt_name(?s, "__imp_dead_local");
+    if (choice == intern.STR_NIL || local == intern.STR_NIL
+        || alias == intern.STR_NIL) { ret 1; }
+
+    var winner_bytes:   [4]u8;
+    var loser_bytes:    [8]u8;
+    var provider_bytes: [1]u8;
+    var sections:       [3]of.Section;
+    sections[0].name  = lt_name(?s, ".text$winner");
+    sections[0].kind  = of.SK_TEXT;
+    sections[0].bytes = ?winner_bytes[0];
+    sections[0].len   = 4;
+    sections[0].align = 1;
+    sections[1].name  = lt_name(?s, ".text$loser");
+    sections[1].kind  = of.SK_TEXT;
+    sections[1].bytes = ?loser_bytes[0];
+    sections[1].len   = 8;
+    sections[1].align = 1;
+    sections[2].name  = lt_name(?s, ".text");
+    sections[2].kind  = of.SK_TEXT;
+    sections[2].bytes = ?provider_bytes[0];
+    sections[2].len   = 1;
+    sections[2].align = 1;
+
+    val weak_fn: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK
+        | of.SYM_OBJ_FLAG_FUNCTION;
+    var winner: of.Symbol;
+    winner.name    = choice;
+    winner.section = of.section_id(0);
+    winner.offset  = 0;
+    winner.size    = 4;
+    winner.flags   = weak_fn;
+    var loser_syms: [2]of.Symbol;
+    loser_syms[0].name    = choice;
+    loser_syms[0].section = of.section_id(0);
+    loser_syms[0].offset  = 0;
+    loser_syms[0].size    = 8;
+    loser_syms[0].flags   = weak_fn;
+    loser_syms[1].name    = alias;
+    loser_syms[1].section = of.external_section();
+    loser_syms[1].offset  = 0;
+    loser_syms[1].size    = 0;
+    loser_syms[1].flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+        | of.SYM_OBJ_FLAG_OBJECT;
+    var provider: of.Symbol;
+    provider.name    = local;
+    provider.section = of.section_id(0);
+    provider.offset  = 0;
+    provider.size    = 1;
+    provider.flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var loser_reloc: of.Relocation;
+    loser_reloc.section = of.section_id(0);
+    loser_reloc.offset  = 0;
+    loser_reloc.kind    = of.RK_PC32;
+    loser_reloc.sym     = 1;
+    loser_reloc.addend  = 0;
+
+    var modules: [3]of.ObjectImage;
+    modules[0] = lt_image(?s, lt_name(?s, "winner"), ?sections[0], 1,
+        ?winner, 1, nil::*of.Relocation, 0);
+    modules[1] = lt_image(?s, lt_name(?s, "loser"), ?sections[1], 1,
+        ?loser_syms[0], 2, ?loser_reloc, 1);
+    modules[2] = lt_image(?s, lt_name(?s, "provider"), ?sections[2], 1,
+        ?provider, 1, nil::*of.Relocation, 0);
+
+    var sec_base: [3]u32;
+    var atoms:    AtomPlan;
+    var roots:    LinkRoots;
+    init_atom_plan(?atoms);
+    val planned: err[fail.Fail] = build_atom_plan(
+        ?s, ?modules[0], 3, 0, ?sec_base[0], 3, true, ?roots, tgt.isa, ?atoms);
+    var synth: of.ObjectImage;
+    val dead:  res[bool, fail.Fail] = synthesize_local_imports(
+        ?s, "__imp_", ?modules[0], 3, LINK_EXE,
+        ?sec_base[0], ?atoms, ?synth);
+    var control: of.ObjectImage;
+    val inert:   res[bool, fail.Fail] = synthesize_local_imports(
+        ?s, "__imp_", ?modules[0], 3, LINK_EXE,
+        nil::*u32, nil::*AtomPlan, ?control);
+    if (sel inert.ok && inert.ok) {
+        obj.dnit(?control);
+    }
+    val discarded: bool = atoms.active;
+    free_atom_plan(?alloc, ?atoms);
+    session.dnit(?s);
+    if (sel planned.err) { ret 1; }
+    if (!discarded)      { ret 1; }
+    if (sel dead.err)    { ret 1; }
+    if (dead.ok)         { ret 1; }
+    if (sel inert.err)   { ret 1; }
+    if (!inert.ok)       { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.be.linker.build_dynamic_info:partial_import_cleanup" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:   session.Session       = sr.ok;
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val r_10012: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_10012.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] =
+        target.select(?reg, "x86_64", "windows", "win64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
+
+    var sym: of.Symbol;
+    sym.name    = lt_name(?s, "NoLibrary");
+    sym.section = of.external_section();
+    sym.offset  = 0;
+    sym.size    = 0;
+    sym.flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+        | of.SYM_OBJ_FLAG_FUNCTION;
+    var module: of.ObjectImage = lt_image(
+        ?s, lt_name(?s, "unattributed-user"), nil::*of.Section, 0,
+        ?sym, 1, nil::*of.Relocation, 0);
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var dyn: DynState;
+    init_dynstate(?dyn);
+
+    val built: err[fail.Fail] = build_dynamic_info(
+        ?s, ?tgt, ?dyn, ?module, 1, ?locs,
+        nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
+    if (!sel built.err)             { ret 1; }
+    if (dyn.info.imports == nil)    { ret 1; }
+    if (dyn.info.import_count != 0) { ret 1; }
+    if (dyn.import_cap != 1)        { ret 1; }
+    free_dynstate(?alloc, ?dyn);
+    if (dyn.info.imports != nil || dyn.import_cap != 0) { ret 1; }
+
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    ret 0;
+}
+
+test "mach.lang.be.linker.build_dynamic_info:implicit_platform_identity" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:   session.Session       = sr.ok;
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val r_10054: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel r_10054.err) { ret 1; }
+    val tr: res[target.Target, fail.Fail] =
+        target.select(?reg, "aarch64", "darwin", "aapcs64");
+    if (sel tr.err) { ret 1; }
+    var tgt: target.Target = tr.ok;
+
+    val platform: intern.StrId = lt_name(?s, "/usr/lib/libSystem.B.dylib");
+    val other:    intern.StrId = lt_name(?s, "@rpath/libother.dylib");
+    val symbol:   intern.StrId = lt_name(?s, "_platform_call");
+    if (platform == intern.STR_NIL || other == intern.STR_NIL
+        || symbol == intern.STR_NIL) { ret 1; }
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var explicit: [1]of.DynLib;
+    explicit[0].name   = platform;
+    explicit[0].soname = other;
+    explicit[0].rpath  = intern.STR_NIL;
+    var collision_dyn: DynState;
+    init_dynstate(?collision_dyn);
+    collision_dyn.info.pie = true;
+    val collision: err[fail.Fail] =
+        build_dynamic_info(?s, ?tgt, ?collision_dyn, nil::*of.ObjectImage, 0,
+        ?locs, ?explicit[0], 1, nil::*u32, nil::*AtomPlan);
+    if (!sel collision.err) { ret 1; }
+    free_dynstate(?alloc, ?collision_dyn);
+
+    var sym: of.Symbol;
+    sym.name    = symbol;
+    sym.section = of.external_section();
+    sym.offset  = 0;
+    sym.size    = 0;
+    sym.flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+        | of.SYM_OBJ_FLAG_FUNCTION;
+    var module: of.ObjectImage =
+        lt_image(?s, lt_name(?s, "platform-user"), nil::*of.Section, 0,
+        ?sym, 1, nil::*of.Relocation, 0);
+    val register_import_library_r: err[fail.Fail] = session.register_import_library(?s, symbol, platform);
+    if (sel register_import_library_r.err) {
+        ret 1;
+    }
+    var dyn: DynState;
+    init_dynstate(?dyn);
+    dyn.info.pie = true;
+    val built: err[fail.Fail] =
+        build_dynamic_info(?s, ?tgt, ?dyn, ?module, 1, ?locs,
+        nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
+    if (sel built.err) { ret 1; }
+    if (dyn.info.lib_count != 1 || dyn.info.libs[0].name != platform
+        || dyn.info.libs[0].soname != platform || dyn.info.import_count != 1
+        || dyn.info.imports[0].lib_index != 0) { ret 1; }
+
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    ret 0;
+}
+
+test "mach.lang.be.linker.dynstate_add_import_addr_fixup:preserves_addend" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s:   session.Session = sr.ok;
+    var dyn: DynState;
+    init_dynstate(?dyn);
+
+    val added: err[fail.Fail] = dynstate_add_import_addr_fixup(
+        ?s, ?dyn, 2, 8, 3, 0x1234, of.RK_PC32, -4);
+    if (sel added.err)                                        { ret 1; }
+    if (dyn.info.import_addr_fixup_count != 1)                { ret 1; }
+    if (dyn.info.import_addr_fixups[0].seg_index != 2)        { ret 1; }
+    if (dyn.info.import_addr_fixups[0].seg_offset != 8)       { ret 1; }
+    if (dyn.info.import_addr_fixups[0].import_index != 3)     { ret 1; }
+    if (dyn.info.import_addr_fixups[0].patch_vaddr != 0x1234) { ret 1; }
+    if (dyn.info.import_addr_fixups[0].kind != of.RK_PC32)    { ret 1; }
+    if (dyn.info.import_addr_fixups[0].addend != -4)          { ret 1; }
+
+    free_dynstate(?alloc, ?dyn);
+    session.dnit(?s);
+    ret 0;
+}

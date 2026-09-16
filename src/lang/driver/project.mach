@@ -100,6 +100,20 @@ pub rec DepEntry {
     manifest:        manifest.Manifest;
 }
 
+# what a configured build cell compiles and where it writes
+# ---
+# project_root:     the directory of the project that declares the cell: the root
+#                   project, or for a dependency's cell the dependency's realization
+# home_root:        the root project's directory; `project_out` is rooted here
+# owner:            the dependency that declares the cell, moved out of the closure;
+#                   meaningful only with `dependency_owned`
+# dependency_owned: the cell is a requirement of a dependency's default library
+#                   artifacts, built for the root project
+# deps:             the realized closure the cell compiles against: the root's whole
+#                   closure, or a dependency cell's own transitive closure
+# art_reqs:         the requirements of the cell's artifact, in its declaring manifest
+# req_scopes:       one requirement scope per project the cell compiles, the declaring
+#                   project's first
 pub rec ProjectConfig {
     id:                intern.StrId;
     version:           intern.StrId;
@@ -110,6 +124,9 @@ pub rec ProjectConfig {
     dir_src:           intern.StrId;
     dir_dep:           intern.StrId;
     project_root:      intern.StrId;
+    home_root:         intern.StrId;
+    owner:             DepEntry;
+    dependency_owned:  bool;
     targets:           *TargetEntry;
     target_count:      u32;
     deps:              *DepEntry;
@@ -124,6 +141,8 @@ pub rec ProjectConfig {
     step_order_count:  u32;
     art_reqs:          *manifest.ArtifactReq;
     art_req_count:     u32;
+    req_scopes:        *manifest.RequirementScope;
+    req_scope_count:   u32;
 }
 
 pub rec PubConst {
@@ -248,6 +267,11 @@ pub rec Project {
     union_entries:     *intern.StrId;
     union_entry_count: u32;
 
+    # the entries of artifacts this target does not build, loaded so the modules only they
+    # reach are known and left out of the compiled set
+    foreign_entries:     *intern.StrId;
+    foreign_entry_count: u32;
+
     compiler_name:                 intern.StrId;
     compiler_ver:                  intern.StrId;
     step_digest:                   [32]u8;
@@ -286,6 +310,7 @@ pub rec Project {
     events: *readout.Progress;
 
     loading_orphans:    bool;
+    loading_foreign:    bool;
     union_tuple_filter: *bool;
     gate_tuple_index:   u32;
     in_gated_decl_walk: bool;
@@ -576,6 +601,9 @@ pub fun dnit_project(p: *Project) {
     if (p.union_entries != nil && p.union_entry_count > 0) {
         A.deallocate[intern.StrId](p.alloc, p.union_entries, p.union_entry_count::usize);
     }
+    if (p.foreign_entries != nil && p.foreign_entry_count > 0) {
+        A.deallocate[intern.StrId](p.alloc, p.foreign_entries, p.foreign_entry_count::usize);
+    }
     map.dnit[intern.StrId, session.ModuleId](?p.by_fqn);
     diagnostic.store_dnit(?p.diags);
     deallocate_config(?p.config, p.alloc);
@@ -608,6 +636,8 @@ pub fun init_project(p: *Project, s: *session.Session) {
     p.union_tuple_cap      = 0;
     p.union_entries        = nil;
     p.union_entry_count    = 0;
+    p.foreign_entries      = nil;
+    p.foreign_entry_count  = 0;
     p.target.os_id         = os.OS_UNKNOWN;
     p.target.arch_id       = isa.ARCH_UNKNOWN;
     p.target.abi_id        = 0;
@@ -647,6 +677,10 @@ pub fun init_project(p: *Project, s: *session.Session) {
     p.config.cascade_lib_count      = 0;
     p.config.art_reqs               = nil;
     p.config.art_req_count          = 0;
+    p.config.req_scopes             = nil;
+    p.config.req_scope_count        = 0;
+    p.config.home_root              = intern.STR_NIL;
+    p.config.dependency_owned       = false;
     p.modules                       = nil;
     p.module_len                    = 0;
     p.module_cap                    = 0;
@@ -663,6 +697,7 @@ pub fun init_project(p: *Project, s: *session.Session) {
     p.roots                         = ROOT_ARTIFACT;
     p.events                        = nil;
     p.loading_orphans               = false;
+    p.loading_foreign               = false;
     p.union_tuple_filter            = nil;
     p.gate_tuple_index              = 0xFFFFFFFF;
     p.in_gated_decl_walk            = false;
@@ -718,14 +753,23 @@ fun deallocate_config(c: *ProjectConfig, alloc: *A.Allocator) {
     if (c.step_order != nil && c.step_order_count > 0) {
         A.deallocate[u32](alloc, c.step_order, c.step_order_count::usize);
     }
-    if (c.art_reqs != nil && c.art_req_count > 0) {
-        var ri: u32 = 0;
-        for (ri < c.art_req_count) {
-            if (!str_empty(c.art_reqs[ri].out)) { str_free(alloc, c.art_reqs[ri].out); }
-            ri = ri + 1;
+    free_artifact_reqs(alloc, c.art_reqs, c.art_req_count);
+    if (c.req_scopes != nil && c.req_scope_count > 0) {
+        var si: u32 = 0;
+        for (si < c.req_scope_count) {
+            if (c.req_scopes[si].dependency) {
+                free_artifact_reqs(alloc, c.req_scopes[si].reqs, c.req_scopes[si].req_count);
+            }
+            si = si + 1;
         }
-        A.deallocate[manifest.ArtifactReq](alloc, c.art_reqs, c.art_req_count::usize);
+        A.deallocate[manifest.RequirementScope](alloc, c.req_scopes, c.req_scope_count::usize);
     }
+    if (c.dependency_owned) {
+        free_dep_entries_in_place(alloc, ?c.owner, 1);
+    }
+    c.dependency_owned  = false;
+    c.req_scopes        = nil;
+    c.req_scope_count   = 0;
     c.art_reqs          = nil;
     c.art_req_count     = 0;
     c.targets           = nil;
@@ -742,6 +786,12 @@ fun deallocate_config(c: *ProjectConfig, alloc: *A.Allocator) {
 
 pub fun free_dep_entries(alloc: *A.Allocator, deps: *DepEntry, count: u32, capacity: usize) {
     if (deps == nil) { ret; }
+    free_dep_entries_in_place(alloc, deps, count);
+    A.deallocate[DepEntry](alloc, deps, capacity);
+}
+
+# release what each entry owns, leaving the entries' own storage to the caller
+pub fun free_dep_entries_in_place(alloc: *A.Allocator, deps: *DepEntry, count: u32) {
     var i: u32 = 0;
     for (i < count) {
         if (deps[i].direct != nil && deps[i].direct_count > 0) {
@@ -750,7 +800,16 @@ pub fun free_dep_entries(alloc: *A.Allocator, deps: *DepEntry, count: u32, capac
         manifest.dnit(?deps[i].manifest, alloc);
         i = i + 1;
     }
-    A.deallocate[DepEntry](alloc, deps, capacity);
+}
+
+pub fun free_artifact_reqs(alloc: *A.Allocator, reqs: *manifest.ArtifactReq, count: u32) {
+    if (reqs == nil || count == 0) { ret; }
+    var ri: u32 = 0;
+    for (ri < count) {
+        if (!str_empty(reqs[ri].out)) { str_free(alloc, reqs[ri].out); }
+        ri = ri + 1;
+    }
+    A.deallocate[manifest.ArtifactReq](alloc, reqs, count::usize);
 }
 
 # the pipeline level a manifest profile level selects; absent for a tag
