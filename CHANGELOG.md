@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `mach build`, `mach test`, `mach check` and every other command that resolves the dependency closure now refuse a project whose dependency root `dep` is a symlink, as `mach dep verify` already did. Before, the build followed the link and compiled another tree's checkouts, so a green build said nothing about whether the closure was the project's own. One check in the driver now serves every entry point and the dependency commands, with one message (#3478).
+
 ## [5.2.0] - 2026-09-16
 
 ### Added
