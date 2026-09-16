@@ -8,8 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-
 - The relational operators `<`, `<=`, `>` and `>=` accept two pointer-like operands, including `*^T` against `*^T` and `*^T` against a public `*U`, whatever their pointee types. The result is a public `bool` and ordering lowers to one unsigned integer compare of pointer width, so a secret buffer's overlap check is `first <= ?second[second_len - 1] && second <= ?first[first_len - 1]` rather than a linear scan of every address. The address of a `*^T` was always public, and ordering yields no integer and no pointer, so it launders nothing the already-permitted `==` did not: `::`, `:~`, `:>T` and erasure to `ptr` remain closed over a secret-welded pointer, each pinned by a test. `doc/language/secrecy.md` states the rule and why it holds (#3411).
+### Fixed
+- A linked ELF image carries its data symbols, its `.bss` and its `#[section(...)]` names. The image's allocated section headers were synthesized from the LOAD segments, one per mapping, named `.text`/`.data`/`.rodata` by segment protection, typed `SHT_PROGBITS` and sized by `p_filesz`, so a `#[section(...)]` name was gone, a `.bss` contribution appeared as a second `.data` of size 0, and every section claimed page alignment. They are now the named sections the linker placed inside each mapping, with the section's own name, type, address, size and alignment, a zero-initialized section written `SHT_NOBITS` at its memory size, and an init-array section written `SHT_INIT_ARRAY`. The image symbol table, which held functions only, now carries data definitions too, as `STT_OBJECT` with their real `st_size`, and every symbol names the section index it lives in rather than its segment (#3362).
 
 ## [5.1.0] - 2026-09-16
 
