@@ -7,11 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.2.1] - 2026-09-16
+
 ### Changed
 - Verifying a git dependency checkout costs a constant number of git processes instead of one per walked path. The inspector builds git's child environment once, and answers every committed-mode question about a checkout from one `git ls-tree -r -t --full-tree HEAD` listing, which is dropped whenever a git command that can move a checkout runs. A warm `mach build` of a project depending on the whole mach repository went from 1312 git processes to 88 (#3471).
 ### Fixed
 - At `opt = 2`, a local array or record whose element address is derived by pointer arithmetic and then passed on (to a call, into further arithmetic, or stored) is kept whole. Scalar replacement accepted a zero-offset `gep` on a field address as staying in the field without looking at what used its result, so after inlining an address such as `?s[i]` could reach a call while the array was split into separate scalars: the callee read one byte of real storage and zeros past it. std's `utf8.decode` through a helper returned `0` and U+FFFD for valid input. Release builds could therefore read wrong values whenever an array element's address flowed into an inlined call. As a consequence, a record whose array field's address feeds further pointer arithmetic is no longer split into scalars either: the arithmetic could reach a sibling field that a split would have moved away, so keeping the record whole is the sound choice, at a small cost in such code (#3482).
-- `mach build`, `mach test`, `mach check` and every other command that resolves the dependency closure now refuse a project whose dependency root `dep` is a symlink, as `mach dep verify` already did. Before, the build followed the link and compiled another tree's checkouts, so a green build said nothing about whether the closure was the project's own. One check in the driver now serves every entry point and the dependency commands, with one message (#3478).
+- `mach build`, `mach test`, `mach check` and every other command that resolves the dependency closure now refuse a project whose dependency root `dep` is a symlink, as `mach dep verify` already did. **A tree 5.2.0 built can now be refused** with `error: dependency root 'dep' must be a physical directory, not a symlink or another kind of entry`. The remedy is to replace the link with the project's own dependencies: `rm dep` (the link only), then `mach dep pull .`. Before, the build followed the link and compiled another tree's checkouts, so a green build said nothing about whether the closure was the project's own. One check in the driver now serves every entry point and the dependency commands (#3478).
 
 ## [5.2.0] - 2026-09-16
 
