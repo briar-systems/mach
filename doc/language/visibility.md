@@ -48,6 +48,41 @@ ext var errno: i32;
 There are no body-less functions outside of `ext fun`. Regular forward
 declarations do not exist.
 
+## What a shared library exports
+
+A `kind = "shared"` artifact exports the **root project's** `pub` declarations
+and nothing else. A dependency's `pub` surface is that dependency's ABI, not
+this library's, so a `pub fun` in a dependency is reachable from your code and
+absent from your library's export table. Every other definition — anything
+without `pub`, and every definition the compiler synthesizes, such as a generic
+or pack instance — is hidden: other modules in the same link resolve it
+normally, and no consumer of the linked library can bind to it.
+
+`#[symbol("name")]` chooses the linker name, not the visibility. A non-`pub`
+declaration with a `#[symbol]` name is still hidden, so a C program cannot link
+against it; a function a C caller links against is `pub`.
+
+A `fwd` re-export is a declaration of surface, so what a root-project module
+re-exports is exported, wherever it is defined:
+
+```mach
+# file: src/lib.mach
+fwd impl.helper;        # exported: this module published it
+fwd other.module;       # exported: that module's whole public surface
+```
+
+A `fwd` of a module exports that module's whole public surface, following its
+own `fwd`s in turn. A `fwd` of a generic, comptime-parameter or pack
+declaration exports nothing, because such a declaration has instances rather
+than one definition and each consumer instantiates its own; a `fwd` of a type
+or of an `ext` import exports nothing either, since neither defines a symbol in
+the image.
+
+A shared library that exports nothing is refused: it would be callable by
+nobody, and dead-code elimination would leave it empty.
+
+An executable exports nothing at all, so `pub` makes no difference to one.
+
 ## See also
 
 - [fun.md](fun.md) — regular function declarations

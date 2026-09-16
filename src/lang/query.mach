@@ -133,6 +133,7 @@ rec Attempt {
     fresh:     bool;
     cancelled: bool;
     failed:    bool;
+    rejected:  bool;
     evidence:  QueryEntry;
 }
 
@@ -215,6 +216,7 @@ pub rec QueryDb {
     presentation_pending: bool;
     operation_failure:    opt[fail.Fail];
     operation_message:    str;
+    rejections:           u64;
     attempts:             Vector[Attempt];
     attempt_index:        Map[QueryKey, usize];
     validated:            Map[QueryKey, Revision];
@@ -254,6 +256,7 @@ pub fun init(a: *A.Allocator) res[QueryDb, fail.Fail] {
     db.presentation_pending = false;
     db.operation_failure    = opt[fail.Fail].none{};
     db.operation_message    = nil;
+    db.rejections           = 0;
     db.attempts             = vector.init[Attempt](a);
     db.attempt_index        = map.init[QueryKey, usize](a, query_key_hash, query_key_equal);
     db.validated            = map.init[QueryKey, Revision](a, query_key_hash, query_key_equal);
@@ -371,6 +374,7 @@ pub fun begin(db: *QueryDb) res[Operation, fail.Fail] {
     db.operation_sequence = db.operation_sequence + 1;
     db.operation_active   = true;
     db.operation_failure  = opt[fail.Fail].none{};
+    db.rejections         = 0;
     ret res[Operation, fail.Fail].ok{Operation{owner: db::ptr, sequence: db.operation_sequence}};
 }
 
@@ -431,6 +435,17 @@ fun operation_fail(db: *QueryDb, failure: fail.Fail) fail.Fail {
     val recorded: fail.Fail = fail.message(db.operation_message);
     db.operation_failure = opt[fail.Fail].some{recorded};
     ret recorded;
+}
+
+# an internal failure leaves the database in a state no later read of the
+# operation can trust, so it ends the operation. a rejection is the answer of
+# one query and of the queries that read it; the rest of the operation still
+# computes, and the operation's standing is the fold of its roots'
+fun operation_poison(db: *QueryDb) opt[fail.Fail] {
+    if (sel db.operation_failure.some) {
+        if (fail.is_message(db.operation_failure.some)) { ret db.operation_failure; }
+    }
+    ret opt[fail.Fail].none{};
 }
 
 fun attempt_prepare(db: *QueryDb, key: QueryKey) res[usize, fail.Fail] {
@@ -993,7 +1008,8 @@ pub fun reusable[T](rt: *QueryRuntime[T], ctx: *T, kind: QueryKind, key: u64) re
     if (!db.operation_active || db.stack.len != 0) {
         ret res[bool, fail.Fail].err{fail.message("query reuse requires an active owner-thread operation")};
     }
-    if (sel db.operation_failure.some) { ret res[bool, fail.Fail].err{db.operation_failure.some}; }
+    val poison: opt[fail.Fail] = operation_poison(db);
+    if (sel poison.some) { ret res[bool, fail.Fail].err{poison.some}; }
     val result: res[bool, fail.Fail] = reusable_inner[T](rt, ctx, kind, key);
     if (sel result.err) {
         ret res[bool, fail.Fail].err{operation_fail(db, result.err)};
@@ -1143,12 +1159,18 @@ pub fun cancel_prepared(db: *QueryDb, prepared: PreparedQuery) err[fail.Fail] {
 
 pub fun complete_prepared(db: *QueryDb, prepared: PreparedQuery, result: err[fail.Fail]) err[fail.Fail] {
     val owner: res[*Attempt, fail.Fail] = prepared_attempt(db, prepared);
-    if (sel owner.err)  { ret err[fail.Fail].err{owner.err}; }
-    if (sel result.err) { operation_fail(db, result.err); }
-    if (sel db.operation_failure.some) {
+    if (sel owner.err) { ret err[fail.Fail].err{owner.err}; }
+    if (sel result.err) {
+        val recorded:  fail.Fail      = operation_fail(db, result.err);
         val cancelled: err[fail.Fail] = cancel_prepared(db, prepared);
         if (sel cancelled.err) { ret cancelled; }
-        ret err[fail.Fail].err{db.operation_failure.some};
+        ret err[fail.Fail].err{recorded};
+    }
+    val poison: opt[fail.Fail] = operation_poison(db);
+    if (sel poison.some) {
+        val cancelled: err[fail.Fail] = cancel_prepared(db, prepared);
+        if (sel cancelled.err) { ret cancelled; }
+        ret err[fail.Fail].err{poison.some};
     }
     val attempt: *Attempt    = owner.ok;
     val sh:      *QueryShard = ?db.storage[prepared.key.kind::u32];
@@ -1173,10 +1195,9 @@ pub fun complete_prepared(db: *QueryDb, prepared: PreparedQuery, result: err[fai
 
 fun acquire_entry[T](rt: *QueryRuntime[T], ctx: *T, kind: QueryKind, key: u64) res[*QueryEntry, fail.Fail] {
     if (rt == nil || rt.db == nil) { ret res[*QueryEntry, fail.Fail].err{fail.message("query get requires a live runtime")}; }
-    if (sel rt.db.operation_failure.some) {
-        if (rt.db.operation_active) {
-            ret res[*QueryEntry, fail.Fail].err{rt.db.operation_failure.some};
-        }
+    if (rt.db.operation_active) {
+        val poison: opt[fail.Fail] = operation_poison(rt.db);
+        if (sel poison.some) { ret res[*QueryEntry, fail.Fail].err{poison.some}; }
     }
     val result: res[*QueryEntry, fail.Fail] = get_acquired[T](rt, ctx, kind, key);
     if (sel result.err) {
@@ -1229,6 +1250,12 @@ fun get_inner[T](rt: *QueryRuntime[T], ctx: *T, sh: *QueryShard, kind: QueryKind
         || db.attempts.data[@pending.some].cancelled)) {
         ret res[*QueryEntry, fail.Fail].err{fail.message("query product is awaiting owner completion")};
     }
+    # the key was rejected earlier in this operation: every later reader gets
+    # that answer without recomputing it, so its diagnostics are emitted once
+    if (sel pending.some && db.attempts.data[@pending.some].rejected) {
+        db.rejections = db.rejections + 1;
+        ret res[*QueryEntry, fail.Fail].err{fail.reported()};
+    }
     val prior: opt[*Revision] = map.get[QueryKey, Revision](?db.validated, ?pair);
     if (sel prior.some) {
         if (@prior.some != 0) {
@@ -1245,7 +1272,13 @@ fun get_inner[T](rt: *QueryRuntime[T], ctx: *T, sh: *QueryShard, kind: QueryKind
     val prepared: res[usize, fail.Fail] = attempt_prepare(db, pair);
     if (sel prepared.err) { ret res[*QueryEntry, fail.Fail].err{prepared.err}; }
     val refreshed: res[*QueryEntry, fail.Fail] = refresh_entry[T](rt, ctx, sh, kind, key, prepared.ok);
-    if (sel refreshed.err) { ret refreshed; }
+    if (sel refreshed.err) {
+        if (sel refreshed.err.reported) {
+            db.attempts.data[prepared.ok].rejected = true;
+            db.rejections                          = db.rejections + 1;
+        }
+        ret refreshed;
+    }
     val revision: opt[*Revision] = map.get[QueryKey, Revision](?db.validated, ?pair);
     if (sel revision.none) { ret res[*QueryEntry, fail.Fail].err{fail.message("refreshed query lost its validation revision")}; }
     @revision.some = refreshed.ok.last_changed;
@@ -1794,7 +1827,8 @@ fun candidate_compute[T](rt: *QueryRuntime[T], ctx: *T, sh: *QueryShard, key: u6
     db.stack.data[frame].entry = candidate;
     fin { db.stack.data[frame].entry = nil; }
     db.compute_depth = db.compute_depth + 1;
-    val computed: res[QueryOutput, fail.Fail] = compute(ctx, sh.kind, key, db.a, candidate.diags);
+    val rejections_before: u64                         = db.rejections;
+    val computed:          res[QueryOutput, fail.Fail] = compute(ctx, sh.kind, key, db.a, candidate.diags);
     db.compute_depth = db.compute_depth - 1;
     if (sel computed.err) {
         ret err[fail.Fail].err{operation_fail(db, computed.err)};
@@ -1805,8 +1839,12 @@ fun candidate_compute[T](rt: *QueryRuntime[T], ctx: *T, sh: *QueryShard, key: u6
     if ((out.len != 0 && out.bytes == nil) || (out.len == 0 && out.bytes != nil)) {
         ret err[fail.Fail].err{fail.message("query output has an inconsistent byte extent")};
     }
-    if (sel db.operation_failure.some) {
-        ret err[fail.Fail].err{db.operation_failure.some};
+    val poison: opt[fail.Fail] = operation_poison(db);
+    if (sel poison.some) { ret err[fail.Fail].err{poison.some}; }
+    # the compute answered while a read of its own rejected: a product built on
+    # an input the database refused to serve is not a product, so it is rejected
+    if (db.rejections != rejections_before) {
+        ret err[fail.Fail].err{operation_fail(db, fail.reported())};
     }
     ret err[fail.Fail].ok{};
 }
@@ -1934,6 +1972,7 @@ val T_MODE_AUTO_DEP:        TestComputeMode = 8;
 val T_MODE_OWNED_DIAG:      TestComputeMode = 9;
 val T_MODE_DIRECT_TOKENIZE: TestComputeMode = 10;
 val T_MODE_BRANCH:          TestComputeMode = 11;
+val T_MODE_REJECT:          TestComputeMode = 12;
 
 rec TestQueryContext {
     runtime:            QueryRuntime[TestQueryContext];
@@ -1941,6 +1980,8 @@ rec TestQueryContext {
     mode:               TestComputeMode;
     last_presentation:  *Presentation;
     diagnostic_refused: bool;
+    sema_calls:         u32;
+    lower_calls:        u32;
 }
 
 def TestComputeFn: fun(*TestQueryContext, QueryKind, u64, *A.Allocator, *diagnostic.DiagnosticStore) res[QueryOutput, fail.Fail];
@@ -1957,6 +1998,8 @@ fun t_context_init_with(ctx: *TestQueryContext, db: *QueryDb, diag_alloc: *A.All
     ctx.mode               = mode;
     ctx.last_presentation  = nil;
     ctx.diagnostic_refused = false;
+    ctx.sema_calls         = 0;
+    ctx.lower_calls        = 0;
     ret true;
 }
 
@@ -2097,7 +2140,11 @@ fun t_owned_diag_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator, diag
 
 fun t_dispatch(ctx: *TestQueryContext, kind: QueryKind, key: u64,
     a: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[QueryOutput, fail.Fail] {
-    if (ctx.mode == T_MODE_BRANCH)   { ret t_branch_compute(ctx, kind, key, a, diags); }
+    if (ctx.mode == T_MODE_BRANCH) { ret t_branch_compute(ctx, kind, key, a, diags); }
+    if (ctx.mode == T_MODE_REJECT) {
+        if (kind == Q_SEMA)  { ret t_reject_sema_compute(ctx, key, a, diags); }
+        if (kind == Q_LOWER) { ret t_reject_lower_compute(ctx, key, a, diags); }
+    }
     if (ctx.mode == T_MODE_FAIL)     { ret t_always_fail(ctx, key, a, diags); }
     if (ctx.mode == T_MODE_TOKENIZE) { ret t_tok_compute(ctx, key, a, diags); }
     if (ctx.mode == T_MODE_OWNED)    { ret t_owned_compute(ctx, key, a, diags); }
@@ -4504,5 +4551,151 @@ test "mach.lang.query.retirement:input_mutation_refuses_a_stale_preparation_with
     val peek_r: res[*QueryEntry, fail.Fail] = peek(?db, Q_FILE_TEXT, 1);
     if (sel peek_r.err)                { ret 99; }
     if (peek_r.ok.value[0] != 'b'::u8) { ret 3; }
+    ret 0;
+}
+
+# the input byte selects the outcome: 0 publishes it, 1 rejects through a
+# recorded diagnostic, anything else fails internally
+val T_REJECT_ACCEPT:   u8 = 0;
+val T_REJECT_REJECTED: u8 = 1;
+
+fun t_reject_sema_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[QueryOutput, fail.Fail] {
+    ctx.sema_calls = ctx.sema_calls + 1;
+    val selected: res[QueryView, fail.Fail] = get[TestQueryContext](?ctx.runtime, ctx, Q_FILE_TEXT, key);
+    if (sel selected.err) { ret res[QueryOutput, fail.Fail].err{selected.err}; }
+    val outcome_byte: u8 = selected.ok.value[0];
+    if (outcome_byte == T_REJECT_REJECTED) {
+        val de: err[fail.Fail] = t_emit_diag(diags);
+        if (sel de.err) { ret res[QueryOutput, fail.Fail].err{de.err}; }
+        ret res[QueryOutput, fail.Fail].err{fail.reported()};
+    }
+    if (outcome_byte != T_REJECT_ACCEPT) { ret res[QueryOutput, fail.Fail].err{fail.message("reject fixture failed internally")}; }
+    val copied: res[*u8, fail.Fail] = bytes_dup(a, ?outcome_byte, 1);
+    if (sel copied.err) { ret res[QueryOutput, fail.Fail].err{copied.err}; }
+    ret res[QueryOutput, fail.Fail].ok{QueryOutput{bytes: copied.ok, len: 1}};
+}
+
+fun t_reject_lower_compute(ctx: *TestQueryContext, key: u64, a: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[QueryOutput, fail.Fail] {
+    ctx.lower_calls = ctx.lower_calls + 1;
+    val typed: res[QueryView, fail.Fail] = get[TestQueryContext](?ctx.runtime, ctx, Q_SEMA, key);
+    if (sel typed.err) { ret res[QueryOutput, fail.Fail].err{typed.err}; }
+    var byte:   u8                  = typed.ok.value[0] + 10;
+    val copied: res[*u8, fail.Fail] = bytes_dup(a, ?byte, 1);
+    if (sel copied.err) { ret res[QueryOutput, fail.Fail].err{copied.err}; }
+    ret res[QueryOutput, fail.Fail].ok{QueryOutput{bytes: copied.ok, len: 1}};
+}
+
+fun t_reject_fixture(ctx: *TestQueryContext, db: *QueryDb, outcomes: *u8, n: u64) i32 {
+    if (!t_context_init(ctx, db, T_MODE_REJECT)) { ret 1; }
+    val text_r:  err[fail.Fail] = register_input(db, Q_FILE_TEXT);
+    val sema_r:  err[fail.Fail] = register_derived(db, Q_SEMA);
+    val lower_r: err[fail.Fail] = register_derived(db, Q_LOWER);
+    if (sel text_r.err || sel sema_r.err || sel lower_r.err) { ret 2; }
+    var i: u64 = 0;
+    for (i < n) {
+        val set_r: err[fail.Fail] = set_input(db, Q_FILE_TEXT, i + 1, ?outcomes[i::usize], 1);
+        if (sel set_r.err) { ret 3; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.query.get:a_rejected_query_leaves_the_rest_of_its_operation_computing" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val initialized: res[QueryDb, fail.Fail] = init(?a);
+    if (sel initialized.err) { ret 2; }
+    var db: QueryDb = initialized.ok;
+    fin { dnit(?db); }
+    var outcomes: [3]u8;
+    outcomes[0] = T_REJECT_REJECTED;
+    outcomes[1] = T_REJECT_ACCEPT;
+    outcomes[2] = T_REJECT_ACCEPT;
+    var ctx:    TestQueryContext;
+    val set_up: i32 = t_reject_fixture(?ctx, ?db, ?outcomes[0], 3);
+    if (set_up != 0) { ret 2 + set_up; }
+    fin { t_context_dnit(?ctx); }
+
+    val opened: res[Operation, fail.Fail] = begin(?db);
+    if (sel opened.err) { ret 6; }
+
+    val rejected: res[*QueryEntry, fail.Fail] = acquire_entry[TestQueryContext](?ctx.runtime, ?ctx, Q_SEMA, 1);
+    if (sel rejected.ok)            { ret 7; }
+    if (!sel rejected.err.reported) { ret 7; }
+
+    # the rejection above is key 1's answer, not the operation's
+    val independent: res[*QueryEntry, fail.Fail] = acquire_entry[TestQueryContext](?ctx.runtime, ?ctx, Q_SEMA, 2);
+    if (sel independent.err)                        { ret 8; }
+    if (independent.ok.value[0] != T_REJECT_ACCEPT) { ret 8; }
+
+    # a reader of the rejected key is itself rejected, and reads the memo
+    val dependent: res[*QueryEntry, fail.Fail] = acquire_entry[TestQueryContext](?ctx.runtime, ?ctx, Q_LOWER, 1);
+    if (sel dependent.ok)            { ret 9; }
+    if (!sel dependent.err.reported) { ret 9; }
+
+    val derived: res[*QueryEntry, fail.Fail] = acquire_entry[TestQueryContext](?ctx.runtime, ?ctx, Q_LOWER, 2);
+    if (sel derived.err)           { ret 10; }
+    if (derived.ok.value[0] != 10) { ret 10; }
+
+    val later: res[*QueryEntry, fail.Fail] = acquire_entry[TestQueryContext](?ctx.runtime, ?ctx, Q_SEMA, 3);
+    if (sel later.err)                        { ret 11; }
+    if (later.ok.value[0] != T_REJECT_ACCEPT) { ret 11; }
+
+    if (ctx.sema_calls != 3)  { ret 12; }
+    if (ctx.lower_calls != 2) { ret 12; }
+
+    val closed: err[fail.Fail] = end(?db, opened.ok);
+    if (sel closed.ok)            { ret 13; }
+    if (!sel closed.err.reported) { ret 13; }
+
+    var roots: [5]QueryKey;
+    roots[0] = QueryKey{kind: Q_SEMA, key: 1};
+    roots[1] = QueryKey{kind: Q_SEMA, key: 2};
+    roots[2] = QueryKey{kind: Q_LOWER, key: 1};
+    roots[3] = QueryKey{kind: Q_LOWER, key: 2};
+    roots[4] = QueryKey{kind: Q_SEMA, key: 3};
+    val presented: res[*Presentation, fail.Fail] = collect(?db, opened.ok, ?roots[0], 5, ?a);
+    if (sel presented.err) { ret 14; }
+    val presentation: *Presentation = presented.ok;
+    fin { presentation_dnit(presentation); }
+    if (diagnostic.len(?presentation.diags) != 1) { ret 15; }
+    if (sel presentation.failure.none)            { ret 16; }
+    if (!sel presentation.failure.some.reported)  { ret 16; }
+    ret 0;
+}
+
+test "mach.lang.query.get:an_internal_failure_still_ends_its_operation" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val initialized: res[QueryDb, fail.Fail] = init(?a);
+    if (sel initialized.err) { ret 2; }
+    var db: QueryDb = initialized.ok;
+    fin { dnit(?db); }
+    var outcomes: [2]u8;
+    outcomes[0] = 9;
+    outcomes[1] = T_REJECT_ACCEPT;
+    var ctx:    TestQueryContext;
+    val set_up: i32 = t_reject_fixture(?ctx, ?db, ?outcomes[0], 2);
+    if (set_up != 0) { ret 2 + set_up; }
+    fin { t_context_dnit(?ctx); }
+
+    val opened: res[Operation, fail.Fail] = begin(?db);
+    if (sel opened.err) { ret 6; }
+
+    val failed: res[*QueryEntry, fail.Fail] = acquire_entry[TestQueryContext](?ctx.runtime, ?ctx, Q_SEMA, 1);
+    if (sel failed.ok)                                                              { ret 7; }
+    if (!str_equals(fail.describe(failed.err), "reject fixture failed internally")) { ret 7; }
+
+    val refused: res[*QueryEntry, fail.Fail] = acquire_entry[TestQueryContext](?ctx.runtime, ?ctx, Q_SEMA, 2);
+    if (sel refused.ok)                                                              { ret 8; }
+    if (!str_equals(fail.describe(refused.err), "reject fixture failed internally")) { ret 8; }
+    if (ctx.sema_calls != 1)                                                         { ret 8; }
+
+    val closed: err[fail.Fail] = end(?db, opened.ok);
+    if (sel closed.ok) { ret 9; }
+    val released: err[fail.Fail] = discard(?db, opened.ok);
+    if (sel released.err) { ret 10; }
     ret 0;
 }
