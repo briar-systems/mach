@@ -52,8 +52,18 @@ error: dep 'std': mach.toml: unknown key 'bogus' in [project]
 What a consumer *uses* from a dependency's manifest is its export surface: the
 project id, the module a bare `use <id>;` binds (see
 [modules.md](modules.md#bare-project-id-imports)), its
-`export = true` link entries, and the steps those entries demand. A dependency's
-`[profile.*]` and `[target.*]` tables are never read to build the consumer.
+`export = true` link entries, the steps those entries demand, and what its
+`default = true` library artifact requires — the artifacts and steps named in
+that artifact's `need` (see
+[Dependency requirements travel](#dependency-requirements-travel)). Nothing else
+travels: a `bin` artifact's `need`, a non-default library's, and every other
+requirement of the dependency stay its own.
+
+A dependency's `[profile.*]` tables are never read to build the consumer, which
+resolves its own profile and builds everything with it. A dependency's
+`[target.*]` tables are read for exactly one purpose: the targets its travelling
+requirements name, `env` included, since those artifacts are built for the
+targets the dependency declares for them. No other `[target.*]` entry is read.
 
 ## The schema at a glance
 
@@ -839,7 +849,10 @@ Steps carry **no filters** and **never run automatically**. A step runs only whe
 - by a selected `[link.X]` whose `local` `path` matches the step's `out`;
 - by another step's `need`;
 - by an artifact's `need` (for outputs that are not link inputs), by name or
-  through a glob.
+  through a glob;
+- in a dependency, by the `need` of its `default = true` library artifact, which
+  travels to every consumer (see
+  [Dependency requirements travel](#dependency-requirements-travel)).
 
 Because a step has no filter of its own, the condition for running it lives in the
 link entry that demands it: on a build cell where that entry filters out, the step
@@ -1111,8 +1124,9 @@ Paths and `cmd`s expand over a closed, final set of eight variables:
   Available only in an artifact's own `out`. See
   [Artifact filenames and identity](#artifact-filenames-and-identity).
 - `{artifact.<id>.out}` — the output path of a required artifact, relative to the
-  project root exactly as `{project.out}` is. See
-  [Artifact requirements](#artifact-requirements).
+  root project's directory exactly as `{project.out}` is. In a dependency's module
+  it names a requirement of that dependency's default library artifact, homed under
+  `dep/<id>`. See [Artifact requirements](#artifact-requirements).
 
 The three `{target.*}` tuple keys are also exported to every step process as
 `MACH_TARGET_ISA`/`MACH_TARGET_OS`/`MACH_TARGET_ABI` (see [build steps](#stepname--build-steps)).
@@ -1176,8 +1190,9 @@ the template's own value does; a literal `#[embed]` path keeps resolving against
 declaring file's directory. Only `{artifact.<id>.out}` may appear in an `#[embed]`
 path.
 
-Requirements are within one manifest: a `need` entry never reaches into a
-dependency.
+Requirements are written within one manifest: a `need` entry never names another
+project's artifact or step, and a consumer cannot add to a dependency's `need`.
+A dependency's own requirements reach the consumer by travelling, below.
 
 These are errors:
 
@@ -1193,6 +1208,76 @@ manifests receive these checks during parsing, before planning can execute a ste
 
 A required artifact that fails to build fails its consumer, naming the requirement,
 and the consumer is not attempted.
+
+### Dependency requirements travel
+
+A library that embeds what it builds cannot be consumed if its requirements stop
+at its own manifest, and a consumer has no way to declare them. So a dependency's
+**`default = true` library artifact** carries its requirements as part of its
+export surface: the artifacts and steps its `need` names are built for any project
+whose dependency closure holds that dependency, before the cells that compile
+against the closure. Only that artifact's `need` travels. Several library artifacts
+may share the `default` marker and the public entry; their requirements travel
+together.
+
+```toml
+# the dependency's mach.toml
+[artifact.shlib]
+default = true
+kind    = "static"
+entry   = "lib.mach"
+out     = "lib/shlib{artifact.suffix}"
+targets = ["linux-x86_64"]
+link    = []
+need    = ["artifact.shader-frag"]
+
+[artifact.shader-frag]
+kind    = "bin"
+entry   = "shaders/frag.mach"
+out     = "spv/frag{artifact.suffix}"
+targets = ["spirv"]
+link    = []
+need    = []
+```
+
+```mach
+# the dependency's src/lib.mach, compiled by every consumer
+#[embed("{artifact.shader-frag.out}")]
+val FRAG: [_]u8;
+```
+
+The rules:
+
+- **The consumer's profile, the dependency's targets.** A travelling requirement
+  is built with the profile the consumer resolved, for every target it names in
+  the dependency's own manifest. The consumer's target never selects among them,
+  because target names of two manifests are unrelated; a requirement naming
+  several targets has no single `{artifact.<id>.out}`, exactly as within one
+  manifest.
+- **Homed in the consumer, namespaced by id.** The output is
+  `<expanded root [project].out>/dep/<dependency id>/<the artifact's own out>`, so
+  two dependencies that both declare `shader-quad` produce two files and neither
+  writes into its own checkout. `{project.out}` keeps meaning the root's out in
+  every manifest of the closure, as it does for a dependency's steps, and the
+  cell's objects sit in the root's `obj/` beside every other module's. `mach clean`
+  removes that home and those objects with the rest of the output, reading the
+  realized dependency manifests for the target names the root never declares.
+- **Scope follows the module.** `{artifact.<id>.out}` in a module the dependency
+  owns is read in that dependency's manifest and checked against its default
+  library artifact; the root's modules keep reading the root's manifest and the
+  requirements of the artifact being built. Naming anything else is the ordinary
+  refusal, located at the scope it was read in.
+- **Its own closure, recursively.** A travelling requirement compiles against the
+  dependency's own transitive closure, realized in the root's flat `dep/`, and
+  the requirements of *those* dependencies' default library artifacts travel to
+  it in turn. A requirement reached through several consumers is built once, and
+  a failure names the dependency chain (`dependency app -> boom -> shader: ...`).
+- **Steps too.** A step the default library artifact's `need` names runs for the
+  consumer, alongside the steps its `export = true` link entries demand.
+
+Nothing here makes an `#[embed]` an edge in the build graph: a missing embedded
+file is still a compile error and still triggers nothing (#2887). What runs is
+the requirement the dependency declared.
 
 ## Selection and the build matrix
 
