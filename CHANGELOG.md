@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A dependency whose id equals the project's own is refused where it is declared, naming both sides, rather than surfacing later as a `use` path that does not name a module (#3430).
 - A `bin` artifact on a `spirv` target delivers its entry module at the resolved `out`, or `-o`, so `{artifact.<id>.out}` names a file that exists and a host binary can `#[embed]` the shader artifact it requires. The per-module objects are still written under `obj/` (#3397).
 - A SPIR-V module whose `env` pins a version below 1.4 lists only its Input and Output variables in `OpEntryPoint`, and below 1.3 declares a `#[storage]` binding as a `Uniform` variable over a `BufferBlock` block, so `vulkan1.0` and `vulkan1.1` modules with descriptors pass `spirv-val` for their environment (#3399).
 - A profile with `debug = true` builds `windows` targets, where it refused them for having no debug model. COFF objects and PE images carry DWARF in `.debug_*` sections with section-relative offsets, which gdb, lldb and the LLVM tools resolve to functions and source lines. The reference no longer claims CodeView (#3408).

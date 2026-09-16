@@ -935,7 +935,8 @@ A dependency is named by its **project id**, and that one name is used in three
 places: the manifest key `[dep.<id>]`, the directory `dep/<id>/`, and the head
 segment of every module path the dependency exposes (`use <id>.x;`). The
 compiler checks all three agree: `dep/<id>/mach.toml` must declare
-`id = "<id>"`.
+`id = "<id>"`. A dependency whose id is the declaring project's own is refused
+where it is declared, since one head segment cannot name two projects.
 
 ```toml
 [dep.std]
