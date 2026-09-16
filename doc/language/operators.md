@@ -152,6 +152,17 @@ Two postfix cast operators, both written `expr OP Type`:
   as the operand's type (a size mismatch is a compile error). The `~` recalls
   its bitwise heritage, so `:~` reads as "bit cast".
 
+On two vector types, `::` converts lane by lane: each lane goes through exactly
+the scalar `::` above, so `i32x4::f32x4` converts every lane numerically and
+`i8x4::i64x4` sign-extends every lane. Both sides need the same lane count
+(`i32x4::i64x2` is an error even though the two are the same size), and any
+pair of lane types is allowed, including equal-size integer and float lanes
+and a signedness change. A lane converts exactly as its scalar would on the
+same target, including NaN, the infinities and values outside the
+destination type. There is no cast between a vector and a scalar. The raw
+bits of a vector are `:~`, which, like every `:~`, needs only equal byte
+sizes (`i32x4:~f32x4`, `i32x4:~i64x2`).
+
 The two differ sharply on int<->float. `::` runs a numeric conversion, while
 `:~` reinterprets the raw bit pattern:
 
