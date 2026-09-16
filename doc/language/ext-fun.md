@@ -216,21 +216,32 @@ work, which is worse than failing.
 
 ## Aggregate arguments and the caller's copy
 
-An aggregate too large for registers is passed as an **address of a copy the caller
-allocates** on AAPCS64, under the RISC-V psABI, and under the Microsoft convention.
-The callee treats that memory as its own parameter and may overwrite it, so mach
-materializes a fresh temporary for every such argument at an `ext` boundary and
-passes the temporary's address. A C callee that writes to its by-value parameter
-therefore cannot reach the caller's object:
+**The caller owns the copy**, on every convention and on every call edge. An
+aggregate too large for registers is passed as the address of a copy the caller
+allocates on AAPCS64, under the RISC-V psABI and under the Microsoft convention, and
+in the outgoing stack area under System V. The callee treats that memory as its own
+parameter and may overwrite it; nothing copies again at entry:
 
 ```mach
 rec Wide { a: i64; b: i64; c: i64; d: i64; }
 ext fun consume(w: Wide) i64;
 ```
 
-A Mach→Mach call keeps mach's own convention, where the callee gives every
-parameter storage of its own and copies into it at entry. The two reach the same
-by-value semantics from opposite ends, and only the foreign one is visible here.
+This is the platform convention, and mach has no second one. A Mach→Mach call, a
+call through a `fun` value, a callback C invokes and an exported symbol reached by
+`dlsym` are all the same edge, so a C caller and a mach caller hand a mach callee the
+same thing, and a C callee and a mach callee do the same thing with it. Mach used to
+copy an incoming aggregate into storage of its own at entry as well, which made two
+copies of every such argument; [mach#3418][3418] ruled that out and
+[mach#3416][3416] removed it.
+
+What the language guarantees on top of the convention is the capture point, not a
+second copy: reading an aggregate captures its value where it is read, so a later
+argument cannot change what an earlier one passed
+(see [expressions.md](expressions.md)).
+
+[3418]: https://github.com/briar-systems/mach/issues/3418
+[3416]: https://github.com/briar-systems/mach/issues/3416
 
 ## Symbol name
 
@@ -333,17 +344,18 @@ dependency is searched at load time regardless.
 
 ## Vector arguments and the C ABI
 
-A 128-bit vector (`f32x4`, `i32x4`, …) crossing an `ext` boundary follows the
-target's **C** vector convention, not Mach's internal one, so the call is
-bit-compatible with a C `__m128` parameter:
+A 128-bit vector (`f32x4`, `i32x4`, …) follows the target's **C** vector
+convention, which is the only one mach has, so a call is bit-compatible with a C
+`__m128` parameter:
 
 - **x86_64-windows (Microsoft x64):** the caller passes each vector argument **by
   reference** — it stores the vector to a 16-byte-aligned temporary and passes that
   temporary's address in the parameter's integer register (RCX/RDX/R8/R9) or, once
   those are exhausted, on the stack. A variadic vector argument is passed the same
   way. Vector **returns** ride XMM0, which both conventions already agree on.
-- **Every other target** (System V, AAPCS64, RISC-V lp64d): the C convention already
-  matches Mach's internal one, so nothing special happens at the boundary.
+- **Every other target** (System V, AAPCS64, RISC-V lp64d): a vector rides a vector
+  register, which is what the convention says and what a boundary-free call would do
+  anyway.
 
 A vector **wider** than the target's vector register (`f32x8` on any target today)
 has no C convention to follow: it is an AVX/SVE type the baseline does not have, so
@@ -351,9 +363,11 @@ no psABI classifies it. Mach gives it the memory class on every convention — a
 hidden pointer to its storage for an argument, the indirect-result pointer for a
 return — which is the placement it already has internally.
 
-Only a *direct* call to a declared `ext fun` marshals — an ordinary Mach→Mach call
-always keeps the internal convention (a vector in a vector register). A call through
-a function *pointer* does not yet carry the `ext` fact, so it is not covered.
+Every call edge marshals the same way, because the C convention is the only one mach
+has: a direct call to a declared `ext fun`, an ordinary Mach→Mach call, and a call
+through a function *pointer* all place a vector where the target's C convention puts
+it. A mach function whose address reaches C is therefore callable from C whatever
+route it took.
 
 ## Linking external objects
 
