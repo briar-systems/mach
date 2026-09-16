@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A by-value aggregate argument is copied once per call instead of twice. The caller owns the copy on every ABI, as C does, and the callee now uses the memory it was handed in place: the entry copy every runtime parameter used to get is no longer emitted for a parameter of aggregate type, and its name binds to the incoming memory. A parameter delivered in registers has its home assembled as before and is now addressed through the same address a by-reference one is, so every aggregate parameter is named the same way whatever the convention did with it. On a 64-byte record this removes about sixteen 8-byte moves per call from the callee; over the codegen corpus it removes roughly twelve thousand lines of disassembly. The caller-side copy, the classification and every symbol's convention are unchanged, so a callback handed to C, a `fun` value, an exported symbol and a separately compiled caller all see exactly what they saw before. This is the contract ruled in #3418, which `doc/language/ext-fun.md` now states (#3416).
+
 ## [5.1.0] - 2026-09-16
 
 ### Added
