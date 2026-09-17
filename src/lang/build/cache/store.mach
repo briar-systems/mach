@@ -11,7 +11,8 @@ use std.collections.map;
 use std.collections.sort;
 use std.collections.vector;
 use std.crypto.hash.sha256;
-use io_error: std.io.error;
+use fs_native: std.filesystem.native;
+use io_error:  std.io.error;
 use std.system.os;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -26,6 +27,13 @@ use std.types.string.str_len;
 
 $if ($mach.build.os == $mach.os.linux)  { use native: std.system.os.linux; }
 $or ($mach.build.os == $mach.os.darwin) { use native: std.system.os.darwin; }
+
+# the portable kind set folds memory into every other exhaustion, so the one
+# code that is an internal failure rather than an unavailable store is read
+# from the host's own module
+$if ($mach.build.os == $mach.os.linux)   { use host_errno: std.system.os.linux; }
+$or ($mach.build.os == $mach.os.darwin)  { use host_errno: std.system.os.darwin; }
+$or ($mach.build.os == $mach.os.windows) { use host_errno: std.system.os.windows; }
 
 # logical entry bytes include headers, excluding filesystem metadata and allocation units
 pub val MAX_STORE_BYTES: u64   = 536870912;
@@ -80,7 +88,7 @@ pub fun fault_message(e: Fault) str {
     or (e.kind == REJECTED)    { ret "entry was rejected"; }
     or (e.kind == INVALID)     { ret "cache store was used out of contract"; }
     or (e.kind == MEMORY)      { ret "out of memory"; }
-    ret os.message(e.code);
+    ret os.error_message(e.code);
 }
 
 pub rec Error {
@@ -103,7 +111,7 @@ pub rec Lookup {
 # the directory's last writer
 rec Access {
     alloc:         *A.Allocator;
-    dirfd:         i32;
+    dirfd:         usize;
     opened:        bool;
     failed:        bool;
     error:         Error;
@@ -112,8 +120,13 @@ rec Access {
     entered_nsec:  i64;
 }
 
+# a native code that means the process is out of memory
+pub fun memory_exhausted(code: i64) bool {
+    ret code == host_errno.ENOMEM;
+}
+
 fun internal(e: Fault) bool {
-    ret e.kind == MEMORY || e.kind == INVALID || e.code == os.ENOMEM;
+    ret e.kind == MEMORY || e.kind == INVALID || memory_exhausted(e.code);
 }
 
 # the first failure is reported unless a later one is internal, which outranks it
@@ -129,24 +142,25 @@ fun record(a: *Access, e: Fault, message: str) {
 fun native_error(a: *Access, code: i64, op: Op) {
     if (code >= 0) { ret; }
     var e: Fault = io_fault(op, code);
-    if (code == os.ENOMEM) { e.kind = MEMORY; }
-    or (code == os.EINVAL) { e.kind = INVALID; }
+    if (memory_exhausted(code))                  { e.kind = MEMORY; }
+    or (os.error_kind(code) == io_error.INVALID) { e.kind = INVALID; }
     record(a, e, fault_message(e));
 }
 
 fun begin(a: *Access, alloc: *A.Allocator, directory: str) {
     a.alloc = alloc;
-    a.dirfd = -1;
+    a.dirfd = os.INVALID_HANDLE;
     if (alloc == nil || directory == nil || str_len(directory) == 0) {
         record(a, fault(INVALID, OP_OPEN), "cache store requires an allocator and existing directory");
         ret;
     }
-    val opened: i64 = os.open(os.AT_FDCWD, directory, os.O_RDONLY | os.O_DIRECTORY, 0);
+    var fd:     usize = os.INVALID_HANDLE;
+    val opened: i64   = os.open(os.working_dir(), directory, os.O_RDONLY | os.O_DIRECTORY, 0, ?fd);
     if (opened < 0) {
         native_error(a, opened, OP_OPEN);
         ret;
     }
-    a.dirfd   = opened::i32;
+    a.dirfd   = fd;
     a.opened  = true;
     a.entered = directory_time(a, ?a.entered_mtime, ?a.entered_nsec);
 }
@@ -154,7 +168,7 @@ fun begin(a: *Access, alloc: *A.Allocator, directory: str) {
 fun finish(a: *Access) {
     if (a.opened) {
         native_error(a, os.close(a.dirfd), OP_OPEN);
-        a.dirfd  = -1;
+        a.dirfd  = os.INVALID_HANDLE;
         a.opened = false;
     }
 }
@@ -218,7 +232,7 @@ fun temp_name(name: str) bool {
 fun pass_temp(a: *Access, name: str) {
     var info:     os.stat_t;
     val observed: i64 = os.stat_path(a.dirfd, name, ?info, os.AT_SYMLINK_NOFOLLOW);
-    if (observed == os.ENOENT) { ret; }
+    if (os.error_kind(observed) == io_error.NOT_FOUND) { ret; }
     if (observed < 0) {
         native_error(a, observed, OP_RECOVER);
         ret;
@@ -231,7 +245,7 @@ fun pass_temp(a: *Access, name: str) {
     }
     if (now.sec - info.st_mtime < STALE_TEMP_SECONDS) { ret; }
     val removed: i64 = os.unlink(a.dirfd, name, 0);
-    if (removed < 0 && removed != os.ENOENT) { native_error(a, removed, OP_REMOVE); }
+    if (removed < 0 && os.error_kind(removed) != io_error.NOT_FOUND) { native_error(a, removed, OP_REMOVE); }
 }
 
 val CHECKSUM_SEED:  u64 = 0x6D61636863616368;
@@ -289,7 +303,7 @@ fun get(bytes: *u8, offset: usize, width: usize) u64 {
     ret value;
 }
 
-fun read_exact(a: *Access, fd: i32, bytes: *u8, len: usize) bool {
+fun read_exact(a: *Access, fd: usize, bytes: *u8, len: usize) bool {
     var got: usize = 0;
     for (got < len) {
         val n: i64 = os.read(fd, ?bytes[got], len - got);
@@ -310,13 +324,13 @@ fun read_entry(a: *Access, key: *[32]u8, result: *Lookup) {
     $if ($mach.build.os == $mach.os.linux)  { flags = flags | native.O_NOFOLLOW | O_NONBLOCK; }
     $or ($mach.build.os == $mach.os.darwin) { flags = flags | native.O_NOFOLLOW | O_NONBLOCK; }
     # windows descriptor-relative open rejects reparse points before returning a handle
-    val opened: i64 = os.open(a.dirfd, ?name[0], flags, 0);
-    if (opened == os.ENOENT) { ret; }
+    var fd:     usize = os.INVALID_HANDLE;
+    val opened: i64   = os.open(a.dirfd, ?name[0], flags, 0, ?fd);
+    if (os.error_kind(opened) == io_error.NOT_FOUND) { ret; }
     if (opened < 0) {
         native_error(a, opened, OP_OPEN);
         ret;
     }
-    val fd: i32 = opened::i32;
     fin { native_error(a, os.close(fd), OP_OPEN); }
     var info:     os.stat_t;
     val observed: i64 = os.stat(fd, ?info);
@@ -324,7 +338,7 @@ fun read_entry(a: *Access, key: *[32]u8, result: *Lookup) {
         native_error(a, observed, OP_OPEN);
         ret;
     }
-    if ((os.stat_mode(?info) & os.S_IFMT) != os.S_IFREG || info.st_size < HEADER_BYTES::i64
+    if ((fs_native.stat_mode(?info) & os.S_IFMT) != os.S_IFREG || info.st_size < HEADER_BYTES::i64
         || info.st_size::u64 > (HEADER_BYTES + image.MAX_ENTRY_BYTES)::u64) { ret; }
     var header: [HEADER_BYTES]u8;
     if (!read_exact(a, fd, ?header[0], HEADER_BYTES)) { ret; }
@@ -421,7 +435,7 @@ fun protected(name: *u8, keys: *[32]u8, count: usize) bool {
 # the directory's entries, oldest publication first; only names from the private
 # hash namespace are listed and anything else refuses the directory as foreign
 fun inventory(a: *Access, entries: *vector.Vector[Entry], replacing: str) u64 {
-    val dirfd: i32 = a.dirfd;
+    val dirfd: usize = a.dirfd;
     native_error(a, os.seek(dirfd, 0, os.SEEK_SET), OP_RECOVER);
     if (a.failed) { ret 0; }
     var total:  u64                    = 0;
@@ -455,7 +469,7 @@ fun inventory(a: *Access, entries: *vector.Vector[Entry], replacing: str) u64 {
             native_error(a, observed, OP_RECOVER);
             brk;
         }
-        if ((os.stat_mode(?info) & os.S_IFMT) != os.S_IFREG || info.st_size < 0) {
+        if ((fs_native.stat_mode(?info) & os.S_IFMT) != os.S_IFREG || info.st_size < 0) {
             record(a, fault(CONTAINMENT, OP_RECOVER), "cache hash entry is not a regular file");
             brk;
         }
@@ -569,14 +583,14 @@ fun index_open_flags() i32 {
 }
 
 # the whole file into the vector's own buffer, reserved from the file's size
-fun read_all(a: *Access, fd: i32, bytes: *vector.Vector[u8]) bool {
+fun read_all(a: *Access, fd: usize, bytes: *vector.Vector[u8]) bool {
     var info:     os.stat_t;
     val observed: i64 = os.stat(fd, ?info);
     if (observed < 0) {
         native_error(a, observed, OP_RECOVER);
         ret false;
     }
-    if ((os.stat_mode(?info) & os.S_IFMT) != os.S_IFREG || info.st_size < 0) {
+    if ((fs_native.stat_mode(?info) & os.S_IFMT) != os.S_IFREG || info.st_size < 0) {
         record(a, fault(CONTAINMENT, OP_RECOVER), "cache index is not a regular file");
         ret false;
     }
@@ -601,14 +615,14 @@ fun read_all(a: *Access, fd: i32, bytes: *vector.Vector[u8]) bool {
 # false when the journal is absent or unusable, which is not a failure of
 # the access: the caller rebuilds it
 fun index_load(a: *Access, inv: *Inventory) bool {
-    val dirfd:  i32 = a.dirfd;
-    val opened: i64 = os.open(dirfd, INDEX_LEAF, os.O_RDONLY | index_open_flags(), 0);
-    if (opened == os.ENOENT) { ret false; }
+    val dirfd:  usize = a.dirfd;
+    var fd:     usize = os.INVALID_HANDLE;
+    val opened: i64   = os.open(dirfd, INDEX_LEAF, os.O_RDONLY | index_open_flags(), 0, ?fd);
+    if (os.error_kind(opened) == io_error.NOT_FOUND) { ret false; }
     if (opened < 0) {
         native_error(a, opened, OP_RECOVER);
         ret false;
     }
-    val fd:    i32               = opened::i32;
     var bytes: vector.Vector[u8] = vector.init[u8](a.alloc);
     fin { vector.dnit[u8](?bytes); }
     val read_ok: bool = read_all(a, fd, ?bytes);
@@ -694,7 +708,7 @@ fun index_load(a: *Access, inv: *Inventory) bool {
     ret true;
 }
 
-fun write_all(a: *Access, fd: i32, bytes: *u8, len: usize) bool {
+fun write_all(a: *Access, fd: usize, bytes: *u8, len: usize) bool {
     var done: usize = 0;
     for (done < len) {
         val n: i64 = os.write(fd, ?bytes[done], len - done);
@@ -751,13 +765,13 @@ fun index_seal(a: *Access) {
 
 fun index_append(a: *Access, op: u8, name: *u8, size: u64) {
     if (a.failed) { ret; }
-    val dirfd:  i32 = a.dirfd;
-    val opened: i64 = os.open(dirfd, INDEX_LEAF, os.O_WRONLY | os.O_APPEND | os.O_CREAT | index_open_flags(), 0o600);
+    val dirfd:  usize = a.dirfd;
+    var fd:     usize = os.INVALID_HANDLE;
+    val opened: i64   = os.open(dirfd, INDEX_LEAF, os.O_WRONLY | os.O_APPEND | os.O_CREAT | index_open_flags(), 0o600, ?fd);
     if (opened < 0) {
         native_error(a, opened, OP_PREPARE);
         ret;
     }
-    val fd:    i32 = opened::i32;
     var bytes: [INDEX_RECORD]u8;
     index_record(?bytes[0], op, name, size);
     write_all(a, fd, ?bytes[0], INDEX_RECORD);
@@ -767,13 +781,13 @@ fun index_append(a: *Access, op: u8, name: *u8, size: u64) {
 # the whole journal from the live inventory, written beside it and renamed over
 fun index_write(a: *Access, inv: *Inventory) {
     if (a.failed) { ret; }
-    val dirfd:  i32 = a.dirfd;
-    val opened: i64 = os.open(dirfd, INDEX_NEXT_LEAF, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | index_open_flags(), 0o600);
+    val dirfd:  usize = a.dirfd;
+    var fd:     usize = os.INVALID_HANDLE;
+    val opened: i64   = os.open(dirfd, INDEX_NEXT_LEAF, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | index_open_flags(), 0o600, ?fd);
     if (opened < 0) {
         native_error(a, opened, OP_PREPARE);
         ret;
     }
-    val fd:     i32 = opened::i32;
     var header: [INDEX_HEADER]u8;
     put(?header[0], 0, INDEX_MAGIC::u64, 4);
     put(?header[0], 4, INDEX_VERSION::u64, 4);
@@ -794,7 +808,7 @@ fun index_write(a: *Access, inv: *Inventory) {
 # the directory's own entries, counted (one listing, no stat); a name outside
 # the private namespace refuses the directory as foreign
 fun count_entries(a: *Access) usize {
-    val dirfd: i32 = a.dirfd;
+    val dirfd: usize = a.dirfd;
     native_error(a, os.seek(dirfd, 0, os.SEEK_SET), OP_RECOVER);
     if (a.failed) { ret 0; }
     var cursor: os.DirectoryCursor     = os.DirectoryCursor{};
@@ -833,7 +847,7 @@ fun count_entries(a: *Access) usize {
 # every listing, so a crashed publication's leftover is collected here, when
 # the journal is compacted
 fun sweep_temps(a: *Access) {
-    val dirfd: i32 = a.dirfd;
+    val dirfd: usize = a.dirfd;
     native_error(a, os.seek(dirfd, 0, os.SEEK_SET), OP_RECOVER);
     if (a.failed) { ret; }
     var cursor: os.DirectoryCursor     = os.DirectoryCursor{};
@@ -866,7 +880,7 @@ fun reconcile(a: *Access, inv: *Inventory) {
     if (inv.sealed && a.entered && a.entered_mtime == inv.seal_mtime && a.entered_nsec == inv.seal_nsec) { ret; }
     val held: usize = count_entries(a);
     if (a.failed || held == inv.entries.len) { ret; }
-    val dirfd: i32                 = a.dirfd;
+    val dirfd: usize               = a.dirfd;
     var slots: map.Map[u64, usize] = map.init[u64, usize](a.alloc, map.hash_u64, map.eq_u64);
     fin { map.dnit[u64, usize](?slots); }
     var seen: vector.Vector[bool] = vector.init[bool](a.alloc);
@@ -934,7 +948,7 @@ fun reconcile(a: *Access, inv: *Inventory) {
             native_error(a, observed, OP_RECOVER);
             brk;
         }
-        if ((os.stat_mode(?info) & os.S_IFMT) != os.S_IFREG || info.st_size < 0) {
+        if ((fs_native.stat_mode(?info) & os.S_IFMT) != os.S_IFREG || info.st_size < 0) {
             record(a, fault(CONTAINMENT, OP_RECOVER), "cache hash entry is not a regular file");
             brk;
         }
@@ -1010,7 +1024,7 @@ fun index_settle(a: *Access, name: *u8) {
     if (a.failed) { ret; }
     var info:     os.stat_t;
     val observed: i64 = os.stat_path(a.dirfd, name, ?info, os.AT_SYMLINK_NOFOLLOW);
-    if (observed == os.ENOENT) {
+    if (os.error_kind(observed) == io_error.NOT_FOUND) {
         index_append(a, INDEX_REMOVE, name, 0);
         ret;
     }
@@ -1018,7 +1032,7 @@ fun index_settle(a: *Access, name: *u8) {
         native_error(a, observed, OP_PREPARE);
         ret;
     }
-    if ((os.stat_mode(?info) & os.S_IFMT) != os.S_IFREG || info.st_size < 0) {
+    if ((fs_native.stat_mode(?info) & os.S_IFMT) != os.S_IFREG || info.st_size < 0) {
         record(a, fault(CONTAINMENT, OP_PREPARE), "cache entry is not a regular file");
         ret;
     }
@@ -1030,7 +1044,7 @@ fun index_settle(a: *Access, name: *u8) {
 fun evict_entry(a: *Access, name: *u8) {
     var info:     os.stat_t;
     val observed: i64 = os.stat_path(a.dirfd, name, ?info, os.AT_SYMLINK_NOFOLLOW);
-    if (observed < 0 && observed != os.ENOENT) {
+    if (observed < 0 && os.error_kind(observed) != io_error.NOT_FOUND) {
         native_error(a, observed, OP_REMOVE);
         ret;
     }
@@ -1048,12 +1062,12 @@ fun make_room(a: *Access, incoming: usize, replacing: str, limit: u64, keys: *[3
     if (replacing != nil) {
         var info:     os.stat_t;
         val observed: i64 = os.stat_path(a.dirfd, replacing, ?info, os.AT_SYMLINK_NOFOLLOW);
-        if (observed < 0 && observed != os.ENOENT) {
+        if (observed < 0 && os.error_kind(observed) != io_error.NOT_FOUND) {
             native_error(a, observed, OP_PREPARE);
             ret;
         }
         if (observed >= 0) {
-            if ((os.stat_mode(?info) & os.S_IFMT) != os.S_IFREG || info.st_size < 0) {
+            if ((fs_native.stat_mode(?info) & os.S_IFMT) != os.S_IFREG || info.st_size < 0) {
                 record(a, fault(CONTAINMENT, OP_PREPARE), "cache replacement is not a regular file");
                 ret;
             }
@@ -1118,18 +1132,18 @@ fun write_entry(a: *Access, name: *u8, bytes: *u8, size: usize) {
     var flags: i32 = os.O_CREAT | os.O_TRUNC | os.O_WRONLY;
     $if ($mach.build.os == $mach.os.linux)  { flags = flags | native.O_NOFOLLOW; }
     $or ($mach.build.os == $mach.os.darwin) { flags = flags | native.O_NOFOLLOW; }
-    val opened: i64 = os.open(a.dirfd, ?temp[0], flags, 0o600);
+    var fd:     usize = os.INVALID_HANDLE;
+    val opened: i64   = os.open(a.dirfd, ?temp[0], flags, 0o600, ?fd);
     if (opened < 0) {
         native_error(a, opened, OP_PREPARE);
         ret;
     }
-    val fd: i32 = opened::i32;
     write_all(a, fd, bytes, size);
     native_error(a, os.close(fd), OP_PREPARE);
     if (!a.failed) { native_error(a, os.rename(a.dirfd, ?temp[0], a.dirfd, name), OP_PREPARE); }
     if (a.failed) {
         val removed: i64 = os.unlink(a.dirfd, ?temp[0], 0);
-        if (removed < 0 && removed != os.ENOENT) { native_error(a, removed, OP_REMOVE); }
+        if (removed < 0 && os.error_kind(removed) != io_error.NOT_FOUND) { native_error(a, removed, OP_REMOVE); }
     }
 }
 
@@ -1241,8 +1255,8 @@ test "mach.lang.build.cache.store:replace_digest_key_length_and_lock_contract" {
     var temp: fs.TempFile = temporary.ok;
     fin { str_free(?alloc, temp.path); }
     val temp_close_and_remove_r: err[io_error.Error] = fs.temp_close_and_remove(?temp);
-    if (sel temp_close_and_remove_r.err)                { ret 3; }
-    if (os.make_dir(os.AT_FDCWD, temp.path, 0o700) < 0) { ret 4; }
+    if (sel temp_close_and_remove_r.err)                     { ret 3; }
+    if (os.make_dir(os.working_dir(), temp.path, 0o700) < 0) { ret 4; }
     fin { fs.remove_all(?alloc, temp.path); }
     var key: [32]u8;
     sha256.hash("source", 6, ?key[0]);
@@ -1311,8 +1325,8 @@ fun t_store(alloc: *A.Allocator) str {
     if (sel temporary.err) { ret nil; }
     var temp:    fs.TempFile         = temporary.ok;
     val removed: err[io_error.Error] = fs.temp_close_and_remove(?temp);
-    if (sel removed.err)                                { ret nil; }
-    if (os.make_dir(os.AT_FDCWD, temp.path, 0o700) < 0) { ret nil; }
+    if (sel removed.err)                                     { ret nil; }
+    if (os.make_dir(os.working_dir(), temp.path, 0o700) < 0) { ret nil; }
     ret temp.path;
 }
 
@@ -1324,11 +1338,12 @@ fun t_path(alloc: *A.Allocator, directory: str, leaf: *u8) str {
 }
 
 fun t_present(directory: str, leaf: *u8) bool {
-    val dir: i64 = os.open(os.AT_FDCWD, directory, os.O_RDONLY | os.O_DIRECTORY, 0);
-    if (dir < 0) { ret false; }
+    var dir:    usize = os.INVALID_HANDLE;
+    val opened: i64   = os.open(os.working_dir(), directory, os.O_RDONLY | os.O_DIRECTORY, 0, ?dir);
+    if (opened < 0) { ret false; }
     var info:     os.stat_t;
-    val observed: i64 = os.stat_path(dir::i32, leaf, ?info, os.AT_SYMLINK_NOFOLLOW);
-    os.close(dir::i32);
+    val observed: i64 = os.stat_path(dir, leaf, ?info, os.AT_SYMLINK_NOFOLLOW);
+    os.close(dir);
     ret observed >= 0;
 }
 
@@ -1428,16 +1443,18 @@ test "mach.lang.build.cache.store:a_replacement_never_rewrites_the_entry_in_plac
     if (!t_status(publish(?alloc, directory, ?key, "first", 5, nil, 0), STORED)) { ret 3; }
     var name: [65]u8;
     leaf(?key, ?name);
-    val dir: i64 = os.open(os.AT_FDCWD, directory, os.O_RDONLY | os.O_DIRECTORY, 0);
-    if (dir < 0) { ret 4; }
-    fin { os.close(dir::i32); }
-    val held: i64 = os.open(dir::i32, ?name[0], os.O_RDONLY, 0);
-    if (held < 0) { ret 5; }
-    fin { os.close(held::i32); }
+    var dir:        usize = os.INVALID_HANDLE;
+    val dir_opened: i64   = os.open(os.working_dir(), directory, os.O_RDONLY | os.O_DIRECTORY, 0, ?dir);
+    if (dir_opened < 0) { ret 4; }
+    fin { os.close(dir); }
+    var held:        usize = os.INVALID_HANDLE;
+    val held_opened: i64   = os.open(dir, ?name[0], os.O_RDONLY, 0, ?held);
+    if (held_opened < 0) { ret 5; }
+    fin { os.close(held); }
     if (!t_status(publish(?alloc, directory, ?key, "second, longer", 14, nil, 0), STORED)) { ret 6; }
     if (!t_read(?alloc, directory, ?key, HIT, "second, longer"))                           { ret 7; }
     var old: [64]u8;
-    val got: i64 = os.read(held::i32, ?old[0], 64);
+    val got: i64 = os.read(held, ?old[0], 64);
     if (got != (HEADER_BYTES + 5)::i64)                           { ret 8; }
     if (old[HEADER_BYTES] != 'f' || old[HEADER_BYTES + 4] != 't') { ret 9; }
     var temp: [96]u8;
@@ -1550,8 +1567,8 @@ test "mach.lang.build.cache.store:eviction_is_oldest_publication_first_under_the
     var temp: fs.TempFile = temporary.ok;
     fin { str_free(?alloc, temp.path); }
     val temp_close_and_remove_r: err[io_error.Error] = fs.temp_close_and_remove(?temp);
-    if (sel temp_close_and_remove_r.err)                { ret 3; }
-    if (os.make_dir(os.AT_FDCWD, temp.path, 0o700) < 0) { ret 3; }
+    if (sel temp_close_and_remove_r.err)                     { ret 3; }
+    if (os.make_dir(os.working_dir(), temp.path, 0o700) < 0) { ret 3; }
     fin { fs.remove_all(?alloc, temp.path); }
     val entry: u64 = HEADER_BYTES::u64 + 4;
     # three publications at distinct mtimes, in the name order c, a, b so that
@@ -1665,11 +1682,12 @@ fun t_load(alloc: *A.Allocator, directory: str) Loaded {
 }
 
 fun t_journal_size(directory: str) i64 {
-    val dirfd: i64 = os.open(os.AT_FDCWD, directory, os.O_RDONLY | os.O_DIRECTORY, 0);
-    if (dirfd < 0) { ret -1; }
+    var dirfd:  usize = os.INVALID_HANDLE;
+    val opened: i64   = os.open(os.working_dir(), directory, os.O_RDONLY | os.O_DIRECTORY, 0, ?dirfd);
+    if (opened < 0) { ret -1; }
     var info:     os.stat_t;
-    val observed: i64 = os.stat_path(dirfd::i32, INDEX_LEAF, ?info, os.AT_SYMLINK_NOFOLLOW);
-    os.close(dirfd::i32);
+    val observed: i64 = os.stat_path(dirfd, INDEX_LEAF, ?info, os.AT_SYMLINK_NOFOLLOW);
+    os.close(dirfd);
     if (observed < 0) { ret -1; }
     ret info.st_size;
 }
@@ -1708,8 +1726,8 @@ test "mach.lang.build.cache.store:journal_tracks_publications_and_reconciles_wit
     var temp: fs.TempFile = temporary.ok;
     fin { str_free(?alloc, temp.path); }
     val temp_close_and_remove_r: err[io_error.Error] = fs.temp_close_and_remove(?temp);
-    if (sel temp_close_and_remove_r.err)                { ret 3; }
-    if (os.make_dir(os.AT_FDCWD, temp.path, 0o700) < 0) { ret 3; }
+    if (sel temp_close_and_remove_r.err)                     { ret 3; }
+    if (os.make_dir(os.working_dir(), temp.path, 0o700) < 0) { ret 3; }
     fin { fs.remove_all(?alloc, temp.path); }
     val entry: u64 = HEADER_BYTES::u64 + 4;
     var keys:  [3][32]u8;
@@ -1759,7 +1777,7 @@ test "mach.lang.build.cache.store:journal_tracks_publications_and_reconciles_wit
     if (sel write_bytes_r.err) { ret 13; }
     loaded = t_load(?alloc, temp.path);
     if (!loaded.failed || loaded.kind != CONTAINMENT) { ret 14; }
-    if (os.unlink(os.AT_FDCWD, foreign, 0) < 0)       { ret 14; }
+    if (os.unlink(os.working_dir(), foreign, 0) < 0)  { ret 14; }
     # publications at a two-entry limit append an add and a remove record each,
     # and the journal is compacted once it grows past twice its live entries
     var round: u32 = 0;
@@ -1805,8 +1823,8 @@ test "mach.lang.build.cache.store:byte_eviction_preserves_unrelated_entries_and_
     var temp: fs.TempFile = temporary.ok;
     fin { str_free(?alloc, temp.path); }
     val temp_close_and_remove_r: err[io_error.Error] = fs.temp_close_and_remove(?temp);
-    if (sel temp_close_and_remove_r.err)                { ret 3; }
-    if (os.make_dir(os.AT_FDCWD, temp.path, 0o700) < 0) { ret 3; }
+    if (sel temp_close_and_remove_r.err)                     { ret 3; }
+    if (os.make_dir(os.working_dir(), temp.path, 0o700) < 0) { ret 3; }
     fin { fs.remove_all(?alloc, temp.path); }
     var key: [32]u8;
     sha256.hash("entry", 5, ?key[0]);
@@ -1911,8 +1929,8 @@ test "mach.lang.build.cache.store:allocation_refusal_is_internal_and_releases_op
     var temp: fs.TempFile = temporary.ok;
     fin { str_free(?alloc, temp.path); }
     val temp_close_and_remove_r: err[io_error.Error] = fs.temp_close_and_remove(?temp);
-    if (sel temp_close_and_remove_r.err)                { ret 3; }
-    if (os.make_dir(os.AT_FDCWD, temp.path, 0o700) < 0) { ret 3; }
+    if (sel temp_close_and_remove_r.err)                     { ret 3; }
+    if (os.make_dir(os.working_dir(), temp.path, 0o700) < 0) { ret 3; }
     fin { fs.remove_all(?alloc, temp.path); }
     var key: [32]u8;
     sha256.hash("fault", 5, ?key[0]);
