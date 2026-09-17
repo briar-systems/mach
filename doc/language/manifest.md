@@ -135,10 +135,14 @@ error: this is mach 5.2.1, and the dependency closure does not accept it:
 ```
 
 A root manifest without `mach` builds, with a warning that prints the line to
-add (`mach.toml: [project] states no compiler range; add mach = "^5.2", the
-compiler this project builds with`). A later release makes the key required. A
-dependency without it states no constraint. `mach init` writes the running
-compiler's caret range.
+add (`mach.toml: [project] states no compiler range; add mach = "^5.3", the
+oldest release that reads the key, and raise it when the project uses a later
+feature`). A later release makes the key required. A dependency without it
+states no constraint. `mach init` writes the same range. It is the oldest
+release of the running compiler's major that reads the key: `^5.3` for every
+5.x compiler, since 5.3.0 is the first release that accepts `mach`, and `^N.0`
+for a later major N, since a caret cannot span majors. The range depends only on
+the running major, so two authors on one project write the same line.
 
 The compiler's version is the last release it was built from. A build from an
 unreleased tree reports that release, so a project cannot require an
@@ -670,8 +674,32 @@ module no artifact reaches is collected as before.
 - **`static`** materialises a real `ar` archive at the resolved `out` path — the
   per-module objects with an archive symbol index, the deliverable a consumer links
   as a `.a` (#1997).
-- **`shared`** is reserved for a shared-library deliverable; its emission is phase 2
-  (#1980).
+- **`shared`** links a dynamic library at the resolved `out`. Only ELF targets
+  write one today: `linux` on `x86_64`, `aarch64` and `riscv64` produce a `.so`
+  whose `SONAME` is its file name. The Mach-O `.dylib` and PE `.dll` writers are
+  not built yet, so a `darwin` or `windows` target refuses with `link: object
+  format cannot write shared libraries` (#3588).
+  - **Exports.** The library exports the root project's `pub` functions and
+    variables and every name its modules re-export with `fwd`, including a
+    dependency's. A dependency's own `pub` surface is not exported unless it is
+    re-exported. `#[symbol("name")]` sets the name an export carries and does not
+    make anything visible: a `pub` function exports under its `#[symbol]` name,
+    and a non-`pub` one stays hidden whatever its name.
+  - **Internals.** Every other definition still links inside the library but is
+    absent from `.dynsym`. In the `.so` it is a `LOCAL` symbol in `.symtab`, and
+    in the per-module object it is a `GLOBAL` symbol with `STV_HIDDEN`
+    visibility.
+  - **Refusals.** A shared artifact that exports nothing is refused:
+
+    ```
+    link: shared library '<artifact>' exports nothing: a shared library needs at least one `pub` declaration in the project, or a `fwd` re-export of one
+    ```
+
+    A `freestanding` target is refused as well. With its default `raw` format
+    the artifact fails naming (`artifact naming: this object format has no
+    shared-library form`), and with `of = "elf"` the link refuses with
+    `link: a shared library needs a loader to map it, and os = "freestanding"
+    has none`.
 
 Per-target extension or per-target entry is not a per-cell exception table — it is a
 second artifact stanza, so the condition stays visible like everything else.
@@ -699,9 +727,9 @@ inspection use the same expansion.
 
 | Target output format | `bin` suffix | `static` suffix | `shared` suffix |
 | --- | --- | --- | --- |
-| ELF on Linux or freestanding | empty | `.a` | `.so` |
-| Mach-O on Darwin | empty | `.a` | `.dylib` |
-| COFF/PE on Windows | `.exe` | `.lib` | `.dll` |
+| ELF on Linux or freestanding | empty | `.a` | `.so` (refused on freestanding) |
+| Mach-O on Darwin | empty | `.a` | `.dylib` (not written yet, #3588) |
+| COFF/PE on Windows | `.exe` | `.lib` | `.dll` (not written yet, #3588) |
 | Raw image | empty | unsupported | unsupported |
 | SPIR-V module | `.spv` | unsupported | unsupported |
 

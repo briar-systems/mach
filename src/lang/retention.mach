@@ -1,0 +1,332 @@
+# which modules a session keeps products for between builds. every party that keeps products
+# alive across builds (a build path, an editor root, an engine plan) holds a retainer, and a
+# module's products stay while any retainer holds it. a build records the modules it loaded under
+# its retainer in rounds; a module no retainer holds any more is released, and its products are
+# retired the next time the session is idle
+use std.collections.map;
+use std.collections.map.Map;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mach.lang.fail;
+use mach.lang.module;
+use mach.lang.query;
+use mach.lang.source;
+
+pub def RetainerId: u32;
+
+# the retainer a session records under until a caller names another
+pub val RETAINER_SESSION: RetainerId = 0;
+
+pub rec Held {
+    stable: module.StableModuleId;
+    file:   source.FileId;
+}
+
+rec Retainer {
+    live:     bool;
+    rejected: bool;
+    settled:  Vector[Held];
+    attempt:  Vector[Held];
+    tried:    Map[module.StableModuleId, bool];
+    held:     Vector[Held];
+    holding:  Map[module.StableModuleId, bool];
+}
+
+# active:  the retainer a build records under
+# rounds:  each load is its own round; false while a caller keeps one round open across builds
+# modules: how many retainers hold each module
+# files:   how many held modules each file backs
+# pending: modules released since the last retirement, possibly held again since
+pub rec Retention {
+    a:         *A.Allocator;
+    retainers: Vector[Retainer];
+    active:    RetainerId;
+    rounds:    bool;
+    modules:   Map[u32, u32];
+    files:     Map[u32, u32];
+    pending:   Vector[Held];
+}
+
+fun retainer_init(a: *A.Allocator) Retainer {
+    ret Retainer{
+        live:    true, rejected: false, settled: vector.init[Held](a), attempt: vector.init[Held](a),
+        tried:   map.init[module.StableModuleId, bool](a, map.hash_u32, map.eq_u32),
+        held:    vector.init[Held](a),
+        holding: map.init[module.StableModuleId, bool](a, map.hash_u32, map.eq_u32)
+    };
+}
+
+fun retainer_dnit(r: *Retainer) {
+    vector.dnit[Held](?r.settled);
+    vector.dnit[Held](?r.attempt);
+    map.dnit[module.StableModuleId, bool](?r.tried);
+    vector.dnit[Held](?r.held);
+    map.dnit[module.StableModuleId, bool](?r.holding);
+    r.live = false;
+}
+
+pub fun init(a: *A.Allocator) res[Retention, fail.Fail] {
+    var t: Retention = Retention{
+        a:       a, retainers: vector.init[Retainer](a), active: RETAINER_SESSION, rounds: true,
+        modules: map.init[u32, u32](a, map.hash_u32, map.eq_u32),
+        files:   map.init[u32, u32](a, map.hash_u32, map.eq_u32),
+        pending: vector.init[Held](a)
+    };
+    val opened: res[RetainerId, fail.Fail] = open(?t);
+    if (sel opened.err) {
+        dnit(?t);
+        ret res[Retention, fail.Fail].err{opened.err};
+    }
+    ret res[Retention, fail.Fail].ok{t};
+}
+
+pub fun dnit(t: *Retention) {
+    var i: usize = 0;
+    for (i < t.retainers.len) {
+        if (t.retainers.data[i].live) { retainer_dnit(?t.retainers.data[i]); }
+        i = i + 1;
+    }
+    vector.dnit[Retainer](?t.retainers);
+    map.dnit[u32, u32](?t.modules);
+    map.dnit[u32, u32](?t.files);
+    vector.dnit[Held](?t.pending);
+}
+
+fun live(t: *Retention, id: RetainerId) *Retainer {
+    if (id::usize >= t.retainers.len || !t.retainers.data[id::usize].live) { ret nil; }
+    ret ?t.retainers.data[id::usize];
+}
+
+# a new retainer holding nothing, in a free slot when one exists
+pub fun open(t: *Retention) res[RetainerId, fail.Fail] {
+    var i: usize = 0;
+    for (i < t.retainers.len) {
+        if (!t.retainers.data[i].live) {
+            t.retainers.data[i] = retainer_init(t.a);
+            ret res[RetainerId, fail.Fail].ok{i::RetainerId};
+        }
+        i = i + 1;
+    }
+    if (t.retainers.len >= 0xFFFFFFFF::usize) { ret res[RetainerId, fail.Fail].err{fail.message("retainer identities are exhausted")}; }
+    val added: res[usize, A.Error] = vector.push[Retainer](?t.retainers, retainer_init(t.a));
+    if (sel added.err) { ret res[RetainerId, fail.Fail].err{fail.refused(added.err)}; }
+    ret res[RetainerId, fail.Fail].ok{(t.retainers.len - 1)::RetainerId};
+}
+
+fun count_bump(counts: *Map[u32, u32], key: u32, up: bool) res[u32, fail.Fail] {
+    var k:       u32       = key;
+    val found:   opt[*u32] = map.get[u32, u32](counts, ?k);
+    var current: u32       = 0;
+    if (sel found.some) { current = @found.some; }
+    var next: u32 = current + 1;
+    if (!up) {
+        if (current == 0) { ret res[u32, fail.Fail].err{fail.message("a released module was not held")}; }
+        next = current - 1;
+    }
+    if (next == 0) {
+        map.remove[u32, u32](counts, ?k);
+        ret res[u32, fail.Fail].ok{0};
+    }
+    val stored: res[bool, A.Error] = map.insert[u32, u32](counts, key, next);
+    if (sel stored.err) { ret res[u32, fail.Fail].err{fail.refused(stored.err)}; }
+    ret res[u32, fail.Fail].ok{next};
+}
+
+fun hold(t: *Retention, r: *Retainer, h: Held) err[fail.Fail] {
+    var key: module.StableModuleId = h.stable;
+    if (map.contains[module.StableModuleId, bool](?r.holding, ?key)) { ret err[fail.Fail].ok{}; }
+    val reserved: res[usize, A.Error] = vector.reserve[Held](?r.held, 1);
+    if (sel reserved.err) { ret err[fail.Fail].err{fail.refused(reserved.err)}; }
+    val marked: res[bool, A.Error] = map.insert[module.StableModuleId, bool](?r.holding, h.stable, true);
+    if (sel marked.err) { ret err[fail.Fail].err{fail.refused(marked.err)}; }
+    val counted: res[u32, fail.Fail] = count_bump(?t.modules, h.stable::u32, true);
+    if (sel counted.err) { ret err[fail.Fail].err{counted.err}; }
+    val backed: res[u32, fail.Fail] = count_bump(?t.files, h.file::u32, true);
+    if (sel backed.err) { ret err[fail.Fail].err{backed.err}; }
+    val pushed: res[usize, A.Error] = vector.push[Held](?r.held, h);
+    if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun drop(t: *Retention, h: Held) err[fail.Fail] {
+    val counted: res[u32, fail.Fail] = count_bump(?t.modules, h.stable::u32, false);
+    if (sel counted.err) { ret err[fail.Fail].err{counted.err}; }
+    val backed: res[u32, fail.Fail] = count_bump(?t.files, h.file::u32, false);
+    if (sel backed.err)                    { ret err[fail.Fail].err{backed.err}; }
+    if (counted.ok != 0 && backed.ok != 0) { ret err[fail.Fail].ok{}; }
+    val pushed: res[usize, A.Error] = vector.push[Held](?t.pending, h);
+    if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# a module the open round loaded; held from now on, so nothing retires it under the build
+# ---
+# rejected: the load that reached it was rejected
+pub fun record(t: *Retention, id: RetainerId, stable: module.StableModuleId, file: source.FileId, rejected: bool) err[fail.Fail] {
+    val r: *Retainer = live(t, id);
+    if (r == nil) { ret err[fail.Fail].err{fail.message("a build records under a released retainer")}; }
+    if (rejected) { r.rejected = true; }
+    var key: module.StableModuleId = stable;
+    if (map.contains[module.StableModuleId, bool](?r.tried, ?key)) { ret err[fail.Fail].ok{}; }
+    val h:     Held           = Held{stable: stable, file: file};
+    val taken: err[fail.Fail] = hold(t, r, h);
+    if (sel taken.err) { ret taken; }
+    val marked: res[bool, A.Error] = map.insert[module.StableModuleId, bool](?r.tried, stable, true);
+    if (sel marked.err) { ret err[fail.Fail].err{fail.refused(marked.err)}; }
+    val pushed: res[usize, A.Error] = vector.push[Held](?r.attempt, h);
+    if (sel pushed.err) {
+        map.remove[module.StableModuleId, bool](?r.tried, ?key);
+        ret err[fail.Fail].err{fail.refused(pushed.err)};
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the rejected flag of the open round, for a load that ended before it reached any module
+pub fun reject(t: *Retention, id: RetainerId) {
+    val r: *Retainer = live(t, id);
+    if (r != nil) { r.rejected = true; }
+}
+
+# close the open round. an accepted round keeps exactly what it loaded. a rejected or unfinished one
+# keeps the last accepted round's modules and its own, and nothing older. invariant: the held set after
+# any run of rejected rounds is the one the last of them alone leaves, so typing an import one character
+# at a time cannot pile modules up
+# ---
+# finished: every build of the round ran to its end
+pub fun end_round(t: *Retention, id: RetainerId, finished: bool) err[fail.Fail] {
+    val r: *Retainer = live(t, id);
+    if (r == nil) { ret err[fail.Fail].err{fail.message("a round ends on a released retainer")}; }
+    val accepted: bool           = finished && !r.rejected;
+    var stays:    Map[u32, bool] = map.init[u32, bool](t.a, map.hash_u32, map.eq_u32);
+    fin { map.dnit[u32, bool](?stays); }
+    var i: usize = 0;
+    for (i < r.attempt.len) {
+        val marked: res[bool, A.Error] = map.insert[u32, bool](?stays, r.attempt.data[i].stable::u32, true);
+        if (sel marked.err) { ret err[fail.Fail].err{fail.refused(marked.err)}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (!accepted && i < r.settled.len) {
+        val marked: res[bool, A.Error] = map.insert[u32, bool](?stays, r.settled.data[i].stable::u32, true);
+        if (sel marked.err) { ret err[fail.Fail].err{fail.refused(marked.err)}; }
+        i = i + 1;
+    }
+    # held covers the settled set and the attempt, so what stays is already held
+    var keep: Vector[Held] = vector.init[Held](t.a);
+    fin { vector.dnit[Held](?keep); }
+    val reserved: res[usize, A.Error] = vector.reserve[Held](?keep, r.held.len);
+    if (sel reserved.err) { ret err[fail.Fail].err{fail.refused(reserved.err)}; }
+    i = 0;
+    for (i < r.held.len) {
+        val h:   Held = r.held.data[i];
+        var key: u32  = h.stable::u32;
+        if (map.contains[u32, bool](?stays, ?key)) {
+            val kept: res[usize, A.Error] = vector.push[Held](?keep, h);
+            if (sel kept.err) { ret err[fail.Fail].err{fail.refused(kept.err)}; }
+        }
+        or {
+            var stable: module.StableModuleId = h.stable;
+            map.remove[module.StableModuleId, bool](?r.holding, ?stable);
+            val dropped: err[fail.Fail] = drop(t, h);
+            if (sel dropped.err) { ret dropped; }
+        }
+        i = i + 1;
+    }
+    val swapped: Vector[Held] = r.held;
+    r.held = keep;
+    keep   = swapped;
+    if (accepted) {
+        val prior: Vector[Held] = r.settled;
+        r.settled = r.attempt;
+        r.attempt = prior;
+    }
+    vector.clear[Held](?r.attempt);
+    map.clear[module.StableModuleId, bool](?r.tried);
+    r.rejected = false;
+    ret err[fail.Fail].ok{};
+}
+
+# a retainer that holds nothing any more; its modules no other retainer holds are released
+pub fun release(t: *Retention, id: RetainerId) err[fail.Fail] {
+    val r: *Retainer = live(t, id);
+    if (r == nil) { ret err[fail.Fail].ok{}; }
+    var i: usize = 0;
+    for (i < r.held.len) {
+        val dropped: err[fail.Fail] = drop(t, r.held.data[i]);
+        if (sel dropped.err) { ret dropped; }
+        i = i + 1;
+    }
+    retainer_dnit(r);
+    ret err[fail.Fail].ok{};
+}
+
+# how many distinct modules the session holds
+pub fun held_count(t: *Retention) usize {
+    ret map.length[u32, u32](t.modules);
+}
+
+# whether a retainer holds a module
+pub fun holds(t: *Retention, id: RetainerId, stable: module.StableModuleId) bool {
+    val r: *Retainer = live(t, id);
+    if (r == nil) { ret false; }
+    var key: module.StableModuleId = stable;
+    ret map.contains[module.StableModuleId, bool](?r.holding, ?key);
+}
+
+rec Released {
+    modules: Map[u32, bool];
+    files:   Map[u32, bool];
+}
+
+fun owner_released(ctx: ptr, owner: query.KeyOwner, id: u32) bool {
+    val released: *Released = ctx::*Released;
+    var key:      u32       = id;
+    if (owner == query.KEY_MODULE) { ret map.contains[u32, bool](?released.modules, ?key); }
+    ret map.contains[u32, bool](?released.files, ?key);
+}
+
+# retire every product of the released modules no retainer holds again, and of the files no held module
+# is backed by. a failure leaves the released modules pending for the next call
+pub fun retire(t: *Retention, db: *query.QueryDb) err[fail.Fail] {
+    if (t.pending.len == 0) { ret err[fail.Fail].ok{}; }
+    var released: Released = Released{
+        modules: map.init[u32, bool](t.a, map.hash_u32, map.eq_u32),
+        files:   map.init[u32, bool](t.a, map.hash_u32, map.eq_u32)
+    };
+    fin {
+        map.dnit[u32, bool](?released.modules);
+        map.dnit[u32, bool](?released.files);
+    }
+    var i: usize = 0;
+    for (i < t.pending.len) {
+        var stable: u32 = t.pending.data[i].stable::u32;
+        var file:   u32 = t.pending.data[i].file::u32;
+        if (!map.contains[u32, u32](?t.modules, ?stable)) {
+            val marked: res[bool, A.Error] = map.insert[u32, bool](?released.modules, stable, true);
+            if (sel marked.err) { ret err[fail.Fail].err{fail.refused(marked.err)}; }
+        }
+        if (!map.contains[u32, u32](?t.files, ?file)) {
+            val marked: res[bool, A.Error] = map.insert[u32, bool](?released.files, file, true);
+            if (sel marked.err) { ret err[fail.Fail].err{fail.refused(marked.err)}; }
+        }
+        i = i + 1;
+    }
+    val prepared: res[query.PreparedRetirement, fail.Fail] = query.prepare_owned_retirement(db, owner_released, (?released)::ptr);
+    if (sel prepared.err) { ret err[fail.Fail].err{prepared.err}; }
+    var retirement: query.PreparedRetirement = prepared.ok;
+    fin { query.discard_retirement(?retirement); }
+    val committed: err[fail.Fail] = query.commit_retirement(?retirement);
+    if (sel committed.err) { ret committed; }
+    vector.clear[Held](?t.pending);
+    ret err[fail.Fail].ok{};
+}
