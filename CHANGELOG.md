@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- CI seeds from mach 5.3.1, and mach's own `mach.toml` states `mach = "^5.3"`. The floor is 5.3 because 5.3.0 is the first release that reads `[project].mach` at all (#3558).
+
 ## [5.3.1] - 2026-09-17
 
 ### Fixed
