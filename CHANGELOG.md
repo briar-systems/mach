@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `mach check` and `mach build` spend less time on the gate pass's shared products. Every module's gate pass writes its gate surface, and each importer reads it back, so a one-shot command paid for encoding and decoding every module's field recipes. That work was one bounds-checked call per value, with a vector growing one field at a time. Each recipe is now written and read as a single fixed-size block, sized in advance, and the bytes are the same as before. The same change speeds up typed exports. A cold `mach check` of mach-lsp runs 3.2% fewer instructions (33.00 to 31.95 billion) (#3551).
+
 ## [5.4.0] - 2026-09-17
 
 ### Added
