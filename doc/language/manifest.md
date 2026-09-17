@@ -1284,6 +1284,14 @@ add` takes the same step for its Git source, so re-adding a dependency whose
 checkout `remove` retained registers that checkout, and it refuses a dirty one.
 No gitlink command ever runs against a path that is not a checkout of its own.
 
+A path dependency has no pin, so `mach dep pull` syncs its `dep/<id>` with the
+declared `path` every time, and `mach dep update` does the same. A changed
+`path` realizes the new source. A file the source no longer has is removed and
+named, and a file whose content differs from the source is overwritten and named
+(`replaced 'src/lib.mach' with its source's content`), so local edits to the
+copy do not survive a pull. A `dep/<id>` that is a symlink is refused and left
+as it is.
+
 A project root is identified by its own `mach.toml`, not by an enclosing git
 repository; `dep/<id>` is resolved relative to the project root. A project
 nested inside an unrelated repository or without any repository builds. Git
