@@ -879,8 +879,15 @@ fun resolve_dep_edge(p: *project.Project, gi: *GitInspector, root_m: *manifest.M
         ret res[u32, outcome.Fail].err{outcome.refused(chain_id_r.err)};
     }
     entry.chain = chain_id_r.ok;
-    val overridden: bool = root_dep != nil;
-    entry.root_declared = overridden;
+    # a root `ref` or `path` overrides the requirers' selectors, a root `version` intersects with them
+    val overridden: bool = root_dep != nil && root_dep.version == intern.STR_NIL;
+    entry.root_declared = root_dep != nil;
+    val release_r: err[outcome.Fail] = edge_release_rule(p.s, chain_here, selected, ?entry.manifest);
+    if (sel release_r.err) {
+        discard_dep_entry(p.alloc, ?entry);
+        str_free(p.alloc, chain_here);
+        ret res[u32, outcome.Fail].err{release_r.err};
+    }
     var j: u32 = 0;
     for (j < dep_count_ptr[0]) {
         if (deps[j].project_id == entry.project_id) {
@@ -2202,14 +2209,100 @@ fun requirer_selector_satisfied(s: *session.Session, gi: *GitInspector, alias: s
     if (sel content_opt.none) { ret err[outcome.Fail].ok{}; }
     val content_text: str = content_opt.some;
     if (!str_starts_with(content_text, "git/")) { ret err[outcome.Fail].ok{}; }
-    val pin:     str      = (?content_text[4])::str;
-    val ref_opt: opt[str] = intern.lookup(?s.interner, d.ref);
-    if (sel ref_opt.none) { ret err[outcome.Fail].ok{}; }
+    val pin:       str                    = (?content_text[4])::str;
     val dep_dir_r: res[str, outcome.Fail] = build_dep_root(s.build_alloc, project_root, dir_dep, alias);
     if (sel dep_dir_r.err) { ret err[outcome.Fail].err{dep_dir_r.err}; }
-    val dep_dir: str               = dep_dir_r.ok;
-    val r:       err[outcome.Fail] = selector_satisfied(s, gi, alias, chain, project_root, dep_dir, ref_opt.some, pin);
-    str_free(s.build_alloc, dep_dir);
+    val dep_dir: str = dep_dir_r.ok;
+    fin { str_free(s.build_alloc, dep_dir); }
+    if (d.version != intern.STR_NIL) {
+        ret range_satisfied(s, gi, alias, chain, project_root, dep_dir, intern_text(s, d.version), pin);
+    }
+    val ref_opt: opt[str] = intern.lookup(?s.interner, d.ref);
+    if (sel ref_opt.none) { ret err[outcome.Fail].ok{}; }
+    ret selector_satisfied(s, gi, alias, chain, project_root, dep_dir, ref_opt.some, pin);
+}
+
+# a version selection holds when the pinned commit carries a release tag, read offline
+# from the checkout's refs, whose version the requirer's range contains (#3496 §4)
+fun range_satisfied(s: *session.Session, gi: *GitInspector, alias: str, chain: str, project_root: str,
+    dep_dir: str, want: str, pin: str) err[outcome.Fail] {
+    val a:   *A.Allocator           = s.build_alloc;
+    val rel: res[str, outcome.Fail] = release_at(a, gi, dep_dir, pin);
+    if (sel rel.err) { ret err[outcome.Fail].err{rel.err}; }
+    val have: str = rel.ok;
+    fin { str_free(a, have); }
+    var mr: res[str, format.FormatError];
+    if (str_empty(have)) {
+        mr = format.sprint(a,
+            "dependency '{}': {} requires version '{}' but the pinned commit '{}' carries no release tag; run `mach dep update <path> {}` for project '{}' to pin a release",
+            alias, chain, want, pin, alias, project_root);
+    }
+    or {
+        val rr: res[range.Range, range.RangeError] = range.parse_range(want);
+        if (sel rr.err) { ret err[outcome.Fail].err{outcome.user(rr.err.reason)}; }
+        val vr: res[range.Version, str] = range.parse_version(have);
+        if (sel vr.err) { ret err[outcome.Fail].err{outcome.user(vr.err)}; }
+        var r: range.Range   = rr.ok;
+        var v: range.Version = vr.ok;
+        if (range.satisfies(?r, ?v)) { ret err[outcome.Fail].ok{}; }
+        mr = format.sprint(a,
+            "dependency '{}': {} requires version '{}' but the pinned release is {}; run `mach dep update <path> {}` for project '{}' to re-pin it, or declare the identity at the root to override",
+            alias, chain, want, have, alias, project_root);
+    }
+    if (sel mr.err) { ret err[outcome.Fail].err{outcome.user("a dependency's pinned release is outside a requirer's range")}; }
+    ret err[outcome.Fail].err{outcome.user(mr.ok)};
+}
+
+# a manifest reached through a release (a version range or a `tag/`) may itself select only
+# releases, so the release is reproducible from its tag all the way down (#3496 §7)
+# ---
+# s:     the session
+# chain: the requirer chain that reached `m`, or the root's name
+# what:  how `m` was selected, as its manifest line spells it
+# m:     the manifest to check
+# ret:   err naming the first dependency selected by a branch, a commit or a path
+pub fun release_selects_releases(s: *session.Session, chain: str, what: str, m: *manifest.Manifest) err[outcome.Fail] {
+    var i: u32 = 0;
+    for (i < m.dep_count) {
+        val d: *manifest.DepDef = ?m.deps[i];
+        i = i + 1;
+        var line_r: res[str, format.FormatError];
+        if (d.git == intern.STR_NIL) {
+            line_r = format.sprint(s.build_alloc, "path = \"{}\"", intern_text(s, d.path));
+        }
+        or (d.version != intern.STR_NIL || str_starts_with(intern_text(s, d.ref), "tag/")) { cnt; }
+        or                                                                                 { line_r = format.sprint(s.build_alloc, "ref = \"{}\"", intern_text(s, d.ref)); }
+        if (sel line_r.err)                                                                { ret err[outcome.Fail].err{outcome.user(outcome.format_text(line_r.err))}; }
+        val mr: res[str, format.FormatError] = format.sprint(s.build_alloc,
+            "{} is a release ({}), and its manifest selects [dep.{}] by {}; a release may select its dependencies only by `version` or an exact `tag/`, so it cannot be reproduced from its tag",
+            chain, what, intern_text(s, d.name), line_r.ok);
+        str_free(s.build_alloc, line_r.ok);
+        if (sel mr.err) { ret err[outcome.Fail].err{outcome.user("a release selects a dependency by something other than a version or a tag")}; }
+        ret err[outcome.Fail].err{outcome.user(mr.ok)};
+    }
+    ret err[outcome.Fail].ok{};
+}
+
+# how a dependency line selects its target when that target is a release ("" otherwise)
+fun release_selection(s: *session.Session, d: *manifest.DepDef) res[str, outcome.Fail] {
+    var r: res[str, format.FormatError];
+    if (d.git == intern.STR_NIL)     { ret res[str, outcome.Fail].ok{""}; }
+    if (d.version != intern.STR_NIL) { r = format.sprint(s.build_alloc, "version = \"{}\"", intern_text(s, d.version)); }
+    or {
+        val ref: str = intern_text(s, d.ref);
+        if (!str_starts_with(ref, "tag/")) { ret res[str, outcome.Fail].ok{""}; }
+        r = format.sprint(s.build_alloc, "ref = \"{}\"", ref);
+    }
+    if (sel r.err) { ret res[str, outcome.Fail].err{outcome.user(outcome.format_text(r.err))}; }
+    ret res[str, outcome.Fail].ok{r.ok};
+}
+
+fun edge_release_rule(s: *session.Session, chain: str, selected: *manifest.DepDef, m: *manifest.Manifest) err[outcome.Fail] {
+    val what: res[str, outcome.Fail] = release_selection(s, selected);
+    if (sel what.err)       { ret err[outcome.Fail].err{what.err}; }
+    if (str_empty(what.ok)) { ret err[outcome.Fail].ok{}; }
+    val r: err[outcome.Fail] = release_selects_releases(s, chain, what.ok, m);
+    str_free(s.build_alloc, what.ok);
     ret r;
 }
 
@@ -3032,15 +3125,21 @@ pub fun checkout_head(s: *session.Session, dep_full: str) res[str, outcome.Fail]
 pub fun release_at_head(s: *session.Session, dep_full: str) res[str, outcome.Fail] {
     val own: err[outcome.Fail] = require_own_work_tree(s, dep_full);
     if (sel own.err) { ret res[str, outcome.Fail].err{own.err}; }
-    var gi: GitInspector      = GitInspector{program: nil};
-    val er: err[outcome.Fail] = git_inspector_require(s.build_alloc, ?gi);
-    if (sel er.err) { ret res[str, outcome.Fail].err{er.err}; }
+    var gi: GitInspector = GitInspector{program: nil};
     fin { git_inspector_dnit(s.build_alloc, ?gi); }
+    ret release_at(s.build_alloc, ?gi, dep_full, "HEAD");
+}
+
+# the release version the commit `rev` of the repository at `dir` is tagged with, read from
+# its local refs ("" when no `v`-prefixed semver tag points at it); the highest wins
+fun release_at(a: *A.Allocator, gi: *GitInspector, dir: str, rev: str) res[str, outcome.Fail] {
+    val er: err[outcome.Fail] = git_inspector_require(a, gi);
+    if (sel er.err) { ret res[str, outcome.Fail].err{er.err}; }
     var args: [3]str;
     args[0] = "tag";
     args[1] = "--points-at";
-    args[2] = "HEAD";
-    val r: res[str, outcome.Fail] = git_query_raw(s.build_alloc, ?gi, dep_full, ?args[0], 3);
+    args[2] = rev;
+    val r: res[str, outcome.Fail] = git_query_raw(a, gi, dir, ?args[0], 3);
     if (sel r.err) { ret r; }
     val text: str   = r.ok;
     val n:    usize = str_len(text);
@@ -3051,20 +3150,28 @@ pub fun release_at_head(s: *session.Session, dep_full: str) res[str, outcome.Fai
         var end: usize = at;
         for (end < n && text[end] != '\n') { end = end + 1; }
         if (end - at > 1 && text[at] == 'v') {
-            val cut: res[str, A.Error] = str_dup_range(s.build_alloc, text, at + 1, end - at - 1);
-            if (sel cut.ok) {
-                val v: res[range.Version, str] = range.parse_version(cut.ok);
-                if (sel v.ok) {
-                    var cand_v: range.Version = v.ok;
-                    if (str_empty(best) || range.compare(?cand_v, ?bv) > 0) {
-                        best = cut.ok;
-                        bv   = cand_v;
-                    }
+            val cut: res[str, A.Error] = str_dup_range(a, text, at + 1, end - at - 1);
+            if (sel cut.err) {
+                str_free(a, text);
+                if (!str_empty(best)) { str_free(a, best); }
+                ret res[str, outcome.Fail].err{outcome.refused(cut.err)};
+            }
+            var kept: bool                    = false;
+            val v:    res[range.Version, str] = range.parse_version(cut.ok);
+            if (sel v.ok) {
+                var cand_v: range.Version = v.ok;
+                if (str_empty(best) || range.compare(?cand_v, ?bv) > 0) {
+                    if (!str_empty(best)) { str_free(a, best); }
+                    best = cut.ok;
+                    bv   = cand_v;
+                    kept = true;
                 }
             }
+            if (!kept) { str_free(a, cut.ok); }
         }
         at = end + 1;
     }
+    str_free(a, text);
     ret res[str, outcome.Fail].ok{best};
 }
 
