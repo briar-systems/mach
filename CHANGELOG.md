@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- A lane-wise multiply of two same-signedness extensions of one integer vector type, such as `a::i32x4 * b::i32x4` for `a, b: i16x4`, compiles to the target's widening multiply wherever the product fits one 128-bit register. That is `pmullw` with `pmulhw` or `pmulhuw` for 16-bit lanes on x86-64, `pmuludq` for unsigned 32-bit lanes, and `smull`/`umull` for 8-, 16- and 32-bit lanes on aarch64. The vector capability catalog declares each widening cell per target, packed or not, and the fusion reads only the catalog. Undeclared cells, and products wider than one register such as `i16x8` to `i32x8`, keep the extend-then-multiply path. A secret widening multiply is still refused, since no lane multiply has a constant-time row. `doc/language/operators.md` lists the cells (#3462).
+
 ## [5.4.0] - 2026-09-17
 
 ### Added
