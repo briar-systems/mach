@@ -33,6 +33,7 @@ use std.types.string.str_len;
 use std.types.string.str_starts_with;
 
 use A: std.allocator;
+use std.filesystem.native;
 use std.print;
 use std.process.env;
 use std.process.exec;
@@ -874,244 +875,361 @@ val PHYSICAL_REGULAR:   u8 = 1;
 val PHYSICAL_DIRECTORY: u8 = 2;
 val PHYSICAL_ENTRY:     u8 = 3;
 
-fun physical_mode_valid(mode: u32, expected: u8) bool {
-    val kind: u32 = mode & sysos.S_IFMT;
-    if (expected == PHYSICAL_REGULAR)   { ret kind == sysos.S_IFREG; }
-    if (expected == PHYSICAL_DIRECTORY) { ret kind == sysos.S_IFDIR; }
-    ret kind == sysos.S_IFREG || kind == sysos.S_IFDIR;
+# what a component walk asks of each step: every component of a validated path
+# exists and the last has the expected kind; a contained path may stop at a
+# missing component, since nothing beyond it can escape; a created path makes
+# each missing directory. no policy follows a symlink
+def WalkPolicy: u8;
+
+val WALK_VALIDATE:  WalkPolicy = 0;
+val WALK_CONTAINED: WalkPolicy = 1;
+val WALK_CREATE:    WalkPolicy = 2;
+
+# a policy's diagnostics: each names the label, the path and the component
+# prefix, and inspect, enter and make add the native detail
+rec WalkText {
+    inspect: str;
+    symlink: str;
+    nondir:  str;
+    enter:   str;
+    invalid: str;
+    make:    str;
 }
 
-fun validate_physical_path_windows(alloc: *A.Allocator, root: str, rel: str, expected: u8, label: str) err[outcome.Fail] {
-    val n: usize = str_len(rel);
-    if (str_equals(rel, ".")) {
-        val root_meta_r: res[fs.Metadata, io_error.Error] = fs.metadata_link(root);
-        if (sel root_meta_r.err) { ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "{} '{}' does not exist or cannot be inspected: {}", label, rel, outcome.io_text(root_meta_r.err)))}; }
-        val root_meta: fs.Metadata = root_meta_r.ok;
-        if (fs.meta_is_symlink(?root_meta))                              { ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "{} '{}' cannot traverse symlink component '{}'", label, rel, rel))}; }
-        if (expected == PHYSICAL_REGULAR || !fs.meta_is_dir(?root_meta)) { ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "{} '{}' has the wrong filesystem entry type", label, rel))}; }
-        ret err[outcome.Fail].ok{};
-    }
-    var start: usize = 0;
-    for (start < n) {
-        var end: usize = start;
-        for (end < n && rel[end] != '/'::u8) { end = end + 1; }
-        if (end == start) { ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "{} '{}' is not a canonical project path", label, rel))}; }
-        val prefix_r: res[str, string.StrError] = str_copy_slice(alloc, rel, 0, end);
-        if (sel prefix_r.err) { ret err[outcome.Fail].err{outcome.user(outcome.str_text(prefix_r.err))}; }
-        val prefix: str               = prefix_r.ok;
-        val abs_r:  res[str, A.Error] = spath.resolve(alloc, root, prefix);
-        if (sel abs_r.err) {
-            str_free(alloc, prefix);
-            ret err[outcome.Fail].err{outcome.refused(abs_r.err)};
-        }
-        val abs:    str                              = abs_r.ok;
-        val meta_r: res[fs.Metadata, io_error.Error] = fs.metadata_link(abs);
-        str_free(alloc, abs);
-        if (sel meta_r.err) {
-            val msg: str = sfmt(alloc, "{} '{}' does not exist or cannot be inspected at '{}': {}", label, rel, prefix, outcome.io_text(meta_r.err));
-            str_free(alloc, prefix);
-            ret err[outcome.Fail].err{outcome.user(msg)};
-        }
-        val meta: fs.Metadata = meta_r.ok;
-        if (fs.meta_is_symlink(?meta)) {
-            val msg: str = sfmt(alloc, "{} '{}' cannot traverse symlink component '{}'", label, rel, prefix);
-            str_free(alloc, prefix);
-            ret err[outcome.Fail].err{outcome.user(msg)};
-        }
-        val last: bool = end == n;
-        if ((!last && !fs.meta_is_dir(?meta)) || (last && expected == PHYSICAL_REGULAR && !fs.meta_is_file(?meta)) || (last && expected == PHYSICAL_DIRECTORY && !fs.meta_is_dir(?meta)) || (last && expected == PHYSICAL_ENTRY && !fs.meta_is_file(?meta) && !fs.meta_is_dir(?meta))) {
-            val msg: str = sfmt(alloc, "{} '{}' has the wrong filesystem entry type at '{}'", label, rel, prefix);
-            str_free(alloc, prefix);
-            ret err[outcome.Fail].err{outcome.user(msg)};
-        }
-        str_free(alloc, prefix);
-        start = end + 1;
+val WALK_TEXT: [3]WalkText = [3]WalkText{
+    WalkText{
+        inspect: "{} '{}' does not exist or cannot be inspected at '{}': {}",
+        symlink: "{} '{}' cannot traverse symlink component '{}'",
+        nondir:  "{} '{}' has non-directory intermediate component '{}'",
+        enter:   "{} '{}' cannot open intermediate directory '{}': {}",
+        invalid: "{} '{}' opened an invalid intermediate directory '{}'",
+        make:    nil
+    },
+    WalkText{
+        inspect: "{} '{}' cannot inspect ancestor '{}': {}",
+        symlink: "{} '{}' cannot traverse non-directory ancestor '{}'",
+        nondir:  "{} '{}' cannot traverse non-directory ancestor '{}'",
+        enter:   "{} '{}' cannot open ancestor '{}': {}",
+        invalid: "{} '{}' opened an invalid ancestor '{}'",
+        make:    nil
+    },
+    WalkText{
+        inspect: "{} '{}' cannot inspect directory '{}': {}",
+        symlink: "{} '{}' cannot use non-directory or symlink component '{}'",
+        nondir:  "{} '{}' cannot use non-directory or symlink component '{}'",
+        enter:   "{} '{}' cannot open directory component '{}': {}",
+        invalid: "{} '{}' opened an invalid directory component '{}'",
+        make:    "{} '{}' cannot create directory '{}': {}"
+    },
+};
+
+# what a component is, read without following it
+def ProbeKind: u8;
+
+val PROBE_ABSENT: ProbeKind = 0;
+val PROBE_FAILED: ProbeKind = 1;
+val PROBE_LINK:   ProbeKind = 2;
+val PROBE_DIR:    ProbeKind = 3;
+val PROBE_FILE:   ProbeKind = 4;
+val PROBE_OTHER:  ProbeKind = 5;
+
+rec Probe {
+    kind:   ProbeKind;
+    detail: str;
+}
+
+# the walk's hold on the path: on posix a descriptor for the directory the next
+# component is read beneath, opened one component at a time; windows reads
+# each prefix by path, beneath the same root
+rec WalkCursor {
+    alloc: *A.Allocator;
+    root:  str;
+    fd:    usize;
+}
+
+fun walk_fail(msg: str) err[outcome.Fail] {
+    ret err[outcome.Fail].err{outcome.user(msg)};
+}
+
+fun cursor_open(c: *WalkCursor, alloc: *A.Allocator, root: str, label: str) err[outcome.Fail] {
+    c.alloc = alloc;
+    c.root  = root;
+    c.fd    = sysos.INVALID_HANDLE;
+    $if ($mach.build.os != $mach.os.windows) {
+        val opened: i64 = sysos.open(sysos.working_dir(), root, sysos.O_RDONLY | sysos.O_DIRECTORY, 0, ?c.fd);
+        if (opened < 0) { ret walk_fail(sfmt(alloc, "{} root '{}' cannot be opened: {}", label, root, sysos.error_message(opened))); }
     }
     ret err[outcome.Fail].ok{};
+}
+
+fun cursor_close(c: *WalkCursor) err[outcome.Fail] {
+    if (c.fd == sysos.INVALID_HANDLE) { ret err[outcome.Fail].ok{}; }
+    val closed: i64 = sysos.close(c.fd);
+    c.fd = sysos.INVALID_HANDLE;
+    if (closed < 0) { ret walk_fail(sysos.error_message(closed)); }
+    ret err[outcome.Fail].ok{};
+}
+
+fun probe_mode(mode: u32) ProbeKind {
+    val kind: u32 = mode & sysos.S_IFMT;
+    if (kind == sysos.S_IFLNK) { ret PROBE_LINK; }
+    if (kind == sysos.S_IFDIR) { ret PROBE_DIR; }
+    if (kind == sysos.S_IFREG) { ret PROBE_FILE; }
+    ret PROBE_OTHER;
+}
+
+fun probe_meta(c: *WalkCursor, path: str) Probe {
+    val meta_r: res[fs.Metadata, io_error.Error] = fs.metadata_link(path);
+    if (sel meta_r.err) {
+        var kind: ProbeKind = PROBE_FAILED;
+        if (meta_r.err.kind == io_error.NOT_FOUND) { kind = PROBE_ABSENT; }
+        ret Probe{kind: kind, detail: outcome.io_text(meta_r.err)};
+    }
+    val meta: fs.Metadata = meta_r.ok;
+    if (fs.meta_is_symlink(?meta)) { ret Probe{kind: PROBE_LINK, detail: ""}; }
+    if (fs.meta_is_dir(?meta))     { ret Probe{kind: PROBE_DIR, detail: ""}; }
+    if (fs.meta_is_file(?meta))    { ret Probe{kind: PROBE_FILE, detail: ""}; }
+    ret Probe{kind: PROBE_OTHER, detail: ""};
+}
+
+# the component's kind; windows resolves the prefix against the root
+fun cursor_probe(c: *WalkCursor, component: str, prefix: str) res[Probe, outcome.Fail] {
+    $if ($mach.build.os == $mach.os.windows) {
+        val abs_r: res[str, A.Error] = spath.resolve(c.alloc, c.root, prefix);
+        if (sel abs_r.err) { ret res[Probe, outcome.Fail].err{outcome.refused(abs_r.err)}; }
+        val probed: Probe = probe_meta(c, abs_r.ok);
+        str_free(c.alloc, abs_r.ok);
+        ret res[Probe, outcome.Fail].ok{probed};
+    }
+    $or {
+        var st:     sysos.stat_t;
+        val stated: i64 = sysos.stat_path(c.fd, component, ?st, sysos.AT_SYMLINK_NOFOLLOW);
+        if (stated < 0) {
+            var kind: ProbeKind = PROBE_FAILED;
+            if (sysos.error_kind(stated) == io_error.NOT_FOUND) { kind = PROBE_ABSENT; }
+            ret res[Probe, outcome.Fail].ok{Probe{kind: kind, detail: sysos.error_message(stated)}};
+        }
+        ret res[Probe, outcome.Fail].ok{Probe{kind: probe_mode(native.stat_mode(?st)), detail: ""}};
+    }
+}
+
+# a directory for a missing component; one a concurrent writer made first is as good
+fun cursor_make(c: *WalkCursor, component: str, prefix: str) opt[str] {
+    $if ($mach.build.os == $mach.os.windows) {
+        val abs_r: res[str, A.Error] = spath.resolve(c.alloc, c.root, prefix);
+        if (sel abs_r.err) { ret opt[str].some{outcome.alloc_text(abs_r.err)}; }
+        val made: err[io_error.Error] = fs.create_dir(abs_r.ok, 0o755);
+        str_free(c.alloc, abs_r.ok);
+        if (sel made.err) {
+            if (made.err.kind != io_error.EXISTS) { ret opt[str].some{outcome.io_text(made.err)}; }
+        }
+        ret opt[str].none{};
+    }
+    $or {
+        val made: i64 = sysos.make_dir(c.fd, component, 0o755);
+        if (made < 0 && sysos.error_kind(made) != io_error.EXISTS) { ret opt[str].some{sysos.error_message(made)}; }
+        ret opt[str].none{};
+    }
+}
+
+# step beneath a component already read as a real directory, checking that
+# what was opened is still one
+fun cursor_enter(c: *WalkCursor, text: *WalkText, label: str, rel: str, component: str, prefix: str) err[outcome.Fail] {
+    $if ($mach.build.os == $mach.os.windows) { ret err[outcome.Fail].ok{}; }
+    $or {
+        var next:   usize = sysos.INVALID_HANDLE;
+        val opened: i64   = sysos.open(c.fd, component, sysos.O_RDONLY | sysos.O_DIRECTORY, 0, ?next);
+        if (opened < 0) { ret walk_fail(sfmt(c.alloc, text.enter, label, rel, prefix, sysos.error_message(opened))); }
+        var st:     sysos.stat_t;
+        val stated: i64 = sysos.stat(next, ?st);
+        if (stated < 0 || probe_mode(native.stat_mode(?st)) != PROBE_DIR) {
+            sysos.close(next);
+            ret walk_fail(sfmt(c.alloc, text.invalid, label, rel, prefix));
+        }
+        val closed: i64 = sysos.close(c.fd);
+        c.fd = next;
+        if (closed < 0) { ret walk_fail(sysos.error_message(closed)); }
+        ret err[outcome.Fail].ok{};
+    }
+}
+
+fun kind_expected(kind: ProbeKind, expected: u8) bool {
+    if (expected == PHYSICAL_REGULAR)   { ret kind == PROBE_FILE; }
+    if (expected == PHYSICAL_DIRECTORY) { ret kind == PROBE_DIR; }
+    ret kind == PROBE_FILE || kind == PROBE_DIR;
+}
+
+# the path `.` names the root itself, which the walk opened as a directory;
+# windows reads it, so a symlinked root is refused there as any component is
+fun walk_root(c: *WalkCursor, text: *WalkText, policy: WalkPolicy, expected: u8, label: str, rel: str) err[outcome.Fail] {
+    var kind: ProbeKind = PROBE_DIR;
+    $if ($mach.build.os == $mach.os.windows) {
+        val probed: Probe = probe_meta(c, c.root);
+        if (probed.kind == PROBE_ABSENT || probed.kind == PROBE_FAILED) {
+            ret walk_fail(sfmt(c.alloc, text.inspect, label, rel, rel, probed.detail));
+        }
+        if (probed.kind == PROBE_LINK) { ret walk_fail(sfmt(c.alloc, text.symlink, label, rel, rel)); }
+        kind = probed.kind;
+    }
+    if (policy == WALK_VALIDATE && !kind_expected(kind, expected)) {
+        ret walk_fail(sfmt(c.alloc, "{} '{}' has the wrong filesystem entry type", label, rel));
+    }
+    if (kind != PROBE_DIR) { ret walk_fail(sfmt(c.alloc, text.nondir, label, rel, rel)); }
+    ret err[outcome.Fail].ok{};
+}
+
+# the component as found, or as made when the policy creates a missing one
+fun walk_probe(c: *WalkCursor, text: *WalkText, policy: WalkPolicy, label: str, rel: str,
+    component: str, prefix: str) res[Probe, outcome.Fail] {
+    val found: res[Probe, outcome.Fail] = cursor_probe(c, component, prefix);
+    if (sel found.err)                                          { ret found; }
+    if (found.ok.kind != PROBE_ABSENT || policy != WALK_CREATE) { ret found; }
+    val made: opt[str] = cursor_make(c, component, prefix);
+    if (sel made.some) { ret res[Probe, outcome.Fail].err{outcome.user(sfmt(c.alloc, text.make, label, rel, prefix, made.some))}; }
+    ret cursor_probe(c, component, prefix);
+}
+
+# one component under the policy; ok{false} ends a contained walk at a missing component
+fun walk_step(c: *WalkCursor, policy: WalkPolicy, expected: u8, label: str, rel: str,
+    component: str, prefix: str, last: bool) res[bool, outcome.Fail] {
+    val text:     *WalkText                = ?WALK_TEXT[policy::usize];
+    val probed_r: res[Probe, outcome.Fail] = walk_probe(c, text, policy, label, rel, component, prefix);
+    if (sel probed_r.err) { ret res[bool, outcome.Fail].err{probed_r.err}; }
+    val probed: Probe = probed_r.ok;
+    if (probed.kind == PROBE_ABSENT && policy == WALK_CONTAINED) { ret res[bool, outcome.Fail].ok{false}; }
+    if (probed.kind == PROBE_ABSENT || probed.kind == PROBE_FAILED) {
+        ret res[bool, outcome.Fail].err{outcome.user(sfmt(c.alloc, text.inspect, label, rel, prefix, probed.detail))};
+    }
+    if (probed.kind == PROBE_LINK) { ret res[bool, outcome.Fail].err{outcome.user(sfmt(c.alloc, text.symlink, label, rel, prefix))}; }
+    if (last && policy == WALK_VALIDATE) {
+        if (!kind_expected(probed.kind, expected)) {
+            ret res[bool, outcome.Fail].err{outcome.user(sfmt(c.alloc, "{} '{}' has the wrong filesystem entry type at '{}'", label, rel, prefix))};
+        }
+        ret res[bool, outcome.Fail].ok{true};
+    }
+    if (probed.kind != PROBE_DIR) { ret res[bool, outcome.Fail].err{outcome.user(sfmt(c.alloc, text.nondir, label, rel, prefix))}; }
+    val entered: err[outcome.Fail] = cursor_enter(c, text, label, rel, component, prefix);
+    if (sel entered.err) { ret res[bool, outcome.Fail].err{entered.err}; }
+    ret res[bool, outcome.Fail].ok{true};
+}
+
+# the one walk behind every physical-path check: `rel` beneath `root`, one
+# component at a time, never following a symlink
+fun walk_components(alloc: *A.Allocator, root: str, rel: str, policy: WalkPolicy, expected: u8, label: str) err[outcome.Fail] {
+    var c:      WalkCursor;
+    val opened: err[outcome.Fail] = cursor_open(?c, alloc, root, label);
+    if (sel opened.err) { ret opened; }
+    var result: err[outcome.Fail] = err[outcome.Fail].ok{};
+    val n:      usize             = str_len(rel);
+    if (str_equals(rel, "."))              { result = walk_root(?c, ?WALK_TEXT[policy::usize], policy, expected, label, rel); }
+    or (n == 0 && policy == WALK_VALIDATE) { result = walk_fail(sfmt(alloc, "{} '{}' is empty", label, rel)); }
+    var start: usize = 0;
+    for (!str_equals(rel, ".") && start < n) {
+        var end: usize = start;
+        for (end < n && rel[end] != '/'::u8) { end = end + 1; }
+        if (end == start) {
+            result = walk_fail(sfmt(alloc, "{} '{}' is not a canonical project path", label, rel));
+            brk;
+        }
+        val prefix_r: res[str, string.StrError] = str_copy_slice(alloc, rel, 0, end);
+        if (sel prefix_r.err) {
+            result = walk_fail(outcome.str_text(prefix_r.err));
+            brk;
+        }
+        val prefix:      str                       = prefix_r.ok;
+        val component_r: res[str, string.StrError] = str_copy_slice(alloc, rel, start, end - start);
+        if (sel component_r.err) {
+            str_free(alloc, prefix);
+            result = walk_fail(outcome.str_text(component_r.err));
+            brk;
+        }
+        val component: str                     = component_r.ok;
+        val stepped:   res[bool, outcome.Fail] = walk_step(?c, policy, expected, label, rel, component, prefix, end == n);
+        str_free(alloc, component);
+        str_free(alloc, prefix);
+        if (sel stepped.err) {
+            result = err[outcome.Fail].err{stepped.err};
+            brk;
+        }
+        if (!stepped.ok) { brk; }
+        start = end + 1;
+    }
+    val closed: err[outcome.Fail] = cursor_close(?c);
+    if (sel result.err) { ret result; }
+    ret closed;
 }
 
 fun validate_physical_path(alloc: *A.Allocator, root: str, rel: str, expected: u8, label: str) err[outcome.Fail] {
-    $if ($mach.build.os == $mach.os.windows) {
-        ret validate_physical_path_windows(alloc, root, rel, expected, label);
-    }
-    $or {
-        val root_fd_raw: i64 = sysos.open(sysos.AT_FDCWD, root, sysos.O_RDONLY | sysos.O_DIRECTORY, 0);
-        if (root_fd_raw < 0) { ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "{} root '{}' cannot be opened: {}", label, root, sysos.message(root_fd_raw)))}; }
-        var fd: i32 = root_fd_raw::i32;
-        if (str_equals(rel, ".")) {
-            val close_r: i64 = sysos.close(fd);
-            if (expected == PHYSICAL_REGULAR) { ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "{} '{}' has the wrong filesystem entry type", label, rel))}; }
-            if (close_r < 0)                  { ret err[outcome.Fail].err{outcome.user(sysos.message(close_r))}; }
-            ret err[outcome.Fail].ok{};
-        }
-        val n:     usize = str_len(rel);
-        var start: usize = 0;
-        for (start < n) {
-            var end: usize = start;
-            for (end < n && rel[end] != '/'::u8) { end = end + 1; }
-            if (end == start) {
-                sysos.close(fd);
-                ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "{} '{}' is not a canonical project path", label, rel))};
-            }
-            val component_r: res[str, string.StrError] = str_copy_slice(alloc, rel, start, end - start);
-            if (sel component_r.err) {
-                sysos.close(fd);
-                ret err[outcome.Fail].err{outcome.user(outcome.str_text(component_r.err))};
-            }
-            val component: str = component_r.ok;
-            var st:        sysos.stat_t;
-            val stat_r:    i64 = sysos.stat_path(fd, component, ?st, sysos.AT_SYMLINK_NOFOLLOW);
-            if (stat_r < 0) {
-                val msg: str = sfmt(alloc, "{} '{}' does not exist or cannot be inspected at '{}': {}", label, rel, component, sysos.message(stat_r));
-                str_free(alloc, component);
-                sysos.close(fd);
-                ret err[outcome.Fail].err{outcome.user(msg)};
-            }
-            val mode: u32  = sysos.stat_mode(?st);
-            val last: bool = end == n;
-            if ((mode & sysos.S_IFMT) == sysos.S_IFLNK) {
-                val msg: str = sfmt(alloc, "{} '{}' cannot traverse symlink component '{}'", label, rel, component);
-                str_free(alloc, component);
-                sysos.close(fd);
-                ret err[outcome.Fail].err{outcome.user(msg)};
-            }
-            if (last) {
-                if (!physical_mode_valid(mode, expected)) {
-                    val msg: str = sfmt(alloc, "{} '{}' has the wrong filesystem entry type at '{}'", label, rel, component);
-                    str_free(alloc, component);
-                    sysos.close(fd);
-                    ret err[outcome.Fail].err{outcome.user(msg)};
-                }
-                str_free(alloc, component);
-                val close_r: i64 = sysos.close(fd);
-                if (close_r < 0) { ret err[outcome.Fail].err{outcome.user(sysos.message(close_r))}; }
-                ret err[outcome.Fail].ok{};
-            }
-            if ((mode & sysos.S_IFMT) != sysos.S_IFDIR) {
-                val msg: str = sfmt(alloc, "{} '{}' has non-directory intermediate component '{}'", label, rel, component);
-                str_free(alloc, component);
-                sysos.close(fd);
-                ret err[outcome.Fail].err{outcome.user(msg)};
-            }
-            val next_fd_raw: i64 = sysos.open(fd, component, sysos.O_RDONLY | sysos.O_DIRECTORY, 0);
-            str_free(alloc, component);
-            if (next_fd_raw < 0) {
-                val msg: str = sfmt(alloc, "{} '{}' cannot open an intermediate directory: {}", label, rel, sysos.message(next_fd_raw));
-                sysos.close(fd);
-                ret err[outcome.Fail].err{outcome.user(msg)};
-            }
-            val next_fd:     i32 = next_fd_raw::i32;
-            var next_st:     sysos.stat_t;
-            val next_stat_r: i64 = sysos.stat(next_fd, ?next_st);
-            if (next_stat_r < 0 || (sysos.stat_mode(?next_st) & sysos.S_IFMT) != sysos.S_IFDIR) {
-                sysos.close(next_fd);
-                sysos.close(fd);
-                ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "{} '{}' opened an invalid intermediate directory", label, rel))};
-            }
-            val close_r: i64 = sysos.close(fd);
-            if (close_r < 0) {
-                sysos.close(next_fd);
-                ret err[outcome.Fail].err{outcome.user(sysos.message(close_r))};
-            }
-            fd    = next_fd;
-            start = end + 1;
-        }
-        sysos.close(fd);
-        ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "{} '{}' is empty", label, rel))};
-    }
-}
-
-fun validate_contained_ancestors_windows(alloc: *A.Allocator, root: str, rel: str, label: str) err[outcome.Fail] {
-    val n:     usize = str_len(rel);
-    var start: usize = 0;
-    for (start < n) {
-        var end: usize = start;
-        for (end < n && rel[end] != '/'::u8) { end = end + 1; }
-        if (end == start) { ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "{} '{}' is not a canonical project path", label, rel))}; }
-        val prefix_r: res[str, string.StrError] = str_copy_slice(alloc, rel, 0, end);
-        if (sel prefix_r.err) { ret err[outcome.Fail].err{outcome.user(outcome.str_text(prefix_r.err))}; }
-        val prefix: str               = prefix_r.ok;
-        val abs_r:  res[str, A.Error] = spath.resolve(alloc, root, prefix);
-        if (sel abs_r.err) {
-            str_free(alloc, prefix);
-            ret err[outcome.Fail].err{outcome.refused(abs_r.err)};
-        }
-        val abs:    str                              = abs_r.ok;
-        val meta_r: res[fs.Metadata, io_error.Error] = fs.metadata_link(abs);
-        str_free(alloc, abs);
-        if (sel meta_r.err) {
-            str_free(alloc, prefix);
-            ret err[outcome.Fail].ok{};
-        }
-        val meta: fs.Metadata = meta_r.ok;
-        if (fs.meta_is_symlink(?meta) || !fs.meta_is_dir(?meta)) {
-            val msg: str = sfmt(alloc, "{} '{}' cannot traverse non-directory ancestor '{}'", label, rel, prefix);
-            str_free(alloc, prefix);
-            ret err[outcome.Fail].err{outcome.user(msg)};
-        }
-        str_free(alloc, prefix);
-        start = end + 1;
-    }
-    ret err[outcome.Fail].ok{};
+    ret walk_components(alloc, root, rel, WALK_VALIDATE, expected, label);
 }
 
 pub fun validate_contained_ancestors(alloc: *A.Allocator, root: str, rel: str, label: str) err[outcome.Fail] {
     if (str_empty(rel)) { ret err[outcome.Fail].ok{}; }
-    $if ($mach.build.os == $mach.os.windows) {
-        ret validate_contained_ancestors_windows(alloc, root, rel, label);
+    ret walk_components(alloc, root, rel, WALK_CONTAINED, PHYSICAL_DIRECTORY, label);
+}
+
+fun ensure_physical_directory_path(alloc: *A.Allocator, root: str, rel: str, label: str) err[outcome.Fail] {
+    ret walk_components(alloc, root, rel, WALK_CREATE, PHYSICAL_DIRECTORY, label);
+}
+
+# every policy refuses a symlinked component and a symlink loop, at the leaf and
+# in the middle of the path, and creates nothing through either (#3532)
+fun t_walk_refused(alloc: *A.Allocator, root: str, rel: str, policy: WalkPolicy, needle: str) bool {
+    val walked: err[outcome.Fail] = walk_components(alloc, root, rel, policy, PHYSICAL_ENTRY, "walk");
+    if (sel walked.ok) { ret false; }
+    ret cfg_contains(outcome.describe(walked.err), needle);
+}
+
+test "mach.lang.driver.config.walk_components:every_policy_refuses_a_symlink_and_a_loop" {
+    # a symlink needs a privilege windows runners lack
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val tf_r: res[fs.TempFile, fs.FsError] = fs.temp_create(?alloc, "mach_walk_policy");
+    if (sel tf_r.err) { ret 2; }
+    var tf:     fs.TempFile       = tf_r.ok;
+    val root_r: res[str, A.Error] = str_dup(?alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (sel root_r.err) { ret 2; }
+    val root: str = root_r.ok;
+    fin {
+        fs.remove_all(?alloc, root);
+        str_free(?alloc, root);
     }
-    $or {
-        val root_fd_raw: i64 = sysos.open(sysos.AT_FDCWD, root, sysos.O_RDONLY | sysos.O_DIRECTORY, 0);
-        if (root_fd_raw < 0) { ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "{} root '{}' cannot be opened: {}", label, root, sysos.message(root_fd_raw)))}; }
-        var fd:    i32   = root_fd_raw::i32;
-        val n:     usize = str_len(rel);
-        var start: usize = 0;
-        for (start < n) {
-            var end: usize = start;
-            for (end < n && rel[end] != '/'::u8) { end = end + 1; }
-            if (end == start) {
-                sysos.close(fd);
-                ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "{} '{}' is not a canonical project path", label, rel))};
-            }
-            val component_r: res[str, string.StrError] = str_copy_slice(alloc, rel, start, end - start);
-            if (sel component_r.err) {
-                sysos.close(fd);
-                ret err[outcome.Fail].err{outcome.user(outcome.str_text(component_r.err))};
-            }
-            val component: str = component_r.ok;
-            var st:        sysos.stat_t;
-            val stat_r:    i64 = sysos.stat_path(fd, component, ?st, sysos.AT_SYMLINK_NOFOLLOW);
-            if (stat_r < 0) {
-                str_free(alloc, component);
-                sysos.close(fd);
-                if (stat_r == sysos.ENOENT) { ret err[outcome.Fail].ok{}; }
-                ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "{} '{}' cannot inspect ancestor '{}': {}", label, rel, component, sysos.message(stat_r)))};
-            }
-            val mode: u32 = sysos.stat_mode(?st);
-            if ((mode & sysos.S_IFMT) != sysos.S_IFDIR) {
-                val msg: str = sfmt(alloc, "{} '{}' cannot traverse non-directory ancestor '{}'", label, rel, component);
-                str_free(alloc, component);
-                sysos.close(fd);
-                ret err[outcome.Fail].err{outcome.user(msg)};
-            }
-            val next_fd_raw: i64 = sysos.open(fd, component, sysos.O_RDONLY | sysos.O_DIRECTORY, 0);
-            str_free(alloc, component);
-            if (next_fd_raw < 0) {
-                val msg: str = sfmt(alloc, "{} '{}' cannot open ancestor '{}': {}", label, rel, sysos.message(next_fd_raw));
-                sysos.close(fd);
-                ret err[outcome.Fail].err{outcome.user(msg)};
-            }
-            val close_r: i64 = sysos.close(fd);
-            if (close_r < 0) {
-                sysos.close(next_fd_raw::i32);
-                ret err[outcome.Fail].err{outcome.user(sysos.message(close_r))};
-            }
-            fd    = next_fd_raw::i32;
-            start = end + 1;
+    val real:      str                 = sfmt(?alloc, "{}/real", root);
+    val link:      str                 = sfmt(?alloc, "{}/real/link", root);
+    val loop:      str                 = sfmt(?alloc, "{}/real/loop", root);
+    val made_root: err[io_error.Error] = fs.create_dir(root, 0o700);
+    val made_real: err[io_error.Error] = fs.create_dir(real, 0o700);
+    if (sel made_root.err || sel made_real.err) { ret 3; }
+    val linked: err[io_error.Error] = fs.symlink(real, link);
+    val looped: err[io_error.Error] = fs.symlink(loop, loop);
+    if (sel linked.err || sel looped.err) { ret 4; }
+    var needles: [3]str = [3]str{"cannot traverse symlink component", "cannot traverse non-directory ancestor", "cannot use non-directory or symlink component"};
+    var paths:   [4]str = [4]str{"real/link", "real/link/made", "real/loop", "real/loop/made"};
+    var p:       usize  = 0;
+    for (p < 3) {
+        var i: usize = 0;
+        for (i < 4) {
+            if (!t_walk_refused(?alloc, root, paths[i], p::WalkPolicy, needles[p])) { ret (10 + p * 4 + i)::i32; }
+            i = i + 1;
         }
-        sysos.close(fd);
-        ret err[outcome.Fail].ok{};
+        p = p + 1;
     }
+    val made:  str                       = sfmt(?alloc, "{}/real/made", root);
+    val found: res[bool, io_error.Error] = fs.exists(made);
+    if (!(sel found.ok && !found.ok)) { ret 30; }
+    # the policies still accept the real path, and create beneath it
+    val whole:   err[outcome.Fail] = walk_components(?alloc, root, "real", WALK_VALIDATE, PHYSICAL_DIRECTORY, "walk");
+    val ahead:   err[outcome.Fail] = walk_components(?alloc, root, "real/new/deeper", WALK_CONTAINED, PHYSICAL_DIRECTORY, "walk");
+    val created: err[outcome.Fail] = walk_components(?alloc, root, "real/new/deeper", WALK_CREATE, PHYSICAL_DIRECTORY, "walk");
+    val checked: err[outcome.Fail] = walk_components(?alloc, root, "real/new/deeper", WALK_VALIDATE, PHYSICAL_DIRECTORY, "walk");
+    if (sel whole.err)   { ret 31; }
+    if (sel ahead.err)   { ret 32; }
+    if (sel created.err) { ret 33; }
+    if (sel checked.err) { ret 34; }
+    ret 0;
 }
 
 test "mach.lang.driver.config.validate_contained_ancestors:missing_real_and_escaping" {
@@ -1186,135 +1304,6 @@ test "mach.lang.driver.config.validate_contained_ancestors:missing_real_and_esca
     ret 0;
 }
 
-fun ensure_physical_directory_path_windows(alloc: *A.Allocator, root: str, rel: str, label: str) err[outcome.Fail] {
-    if (str_equals(rel, ".")) { ret validate_physical_path_windows(alloc, root, rel, PHYSICAL_DIRECTORY, label); }
-    val n:     usize = str_len(rel);
-    var start: usize = 0;
-    for (start < n) {
-        var end: usize = start;
-        for (end < n && rel[end] != '/'::u8) { end = end + 1; }
-        val prefix_r: res[str, string.StrError] = str_copy_slice(alloc, rel, 0, end);
-        if (sel prefix_r.err) { ret err[outcome.Fail].err{outcome.user(outcome.str_text(prefix_r.err))}; }
-        val prefix: str               = prefix_r.ok;
-        val abs_r:  res[str, A.Error] = spath.resolve(alloc, root, prefix);
-        if (sel abs_r.err) {
-            str_free(alloc, prefix);
-            ret err[outcome.Fail].err{outcome.refused(abs_r.err)};
-        }
-        val abs:     str                              = abs_r.ok;
-        val first_r: res[fs.Metadata, io_error.Error] = fs.metadata_link(abs);
-        val absent:  bool                             = sel first_r.err;
-        if (absent) {
-            val make_r: err[io_error.Error] = fs.create_dir(abs, 0o755);
-            if (sel make_r.err) {
-                val msg: str = sfmt(alloc, "{} '{}' cannot create directory '{}': {}", label, rel, prefix, outcome.io_text(make_r.err));
-                str_free(alloc, abs);
-                str_free(alloc, prefix);
-                ret err[outcome.Fail].err{outcome.user(msg)};
-            }
-        }
-        var meta_r: res[fs.Metadata, io_error.Error] = first_r;
-        if (absent) { meta_r = fs.metadata_link(abs); }
-        str_free(alloc, abs);
-        if (sel meta_r.err) {
-            val msg: str = sfmt(alloc, "{} '{}' cannot inspect directory '{}': {}", label, rel, prefix, outcome.io_text(meta_r.err));
-            str_free(alloc, prefix);
-            ret err[outcome.Fail].err{outcome.user(msg)};
-        }
-        val meta: fs.Metadata = meta_r.ok;
-        if (fs.meta_is_symlink(?meta) || !fs.meta_is_dir(?meta)) {
-            val msg: str = sfmt(alloc, "{} '{}' cannot use non-directory or symlink component '{}'", label, rel, prefix);
-            str_free(alloc, prefix);
-            ret err[outcome.Fail].err{outcome.user(msg)};
-        }
-        str_free(alloc, prefix);
-        start = end + 1;
-    }
-    ret err[outcome.Fail].ok{};
-}
-
-fun ensure_physical_directory_path(alloc: *A.Allocator, root: str, rel: str, label: str) err[outcome.Fail] {
-    $if ($mach.build.os == $mach.os.windows) {
-        ret ensure_physical_directory_path_windows(alloc, root, rel, label);
-    }
-    $or {
-        val root_fd_raw: i64 = sysos.open(sysos.AT_FDCWD, root, sysos.O_RDONLY | sysos.O_DIRECTORY, 0);
-        if (root_fd_raw < 0) { ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "{} root '{}' cannot be opened: {}", label, root, sysos.message(root_fd_raw)))}; }
-        var fd: i32 = root_fd_raw::i32;
-        if (str_equals(rel, ".")) {
-            val close_r: i64 = sysos.close(fd);
-            if (close_r < 0) { ret err[outcome.Fail].err{outcome.user(sysos.message(close_r))}; }
-            ret err[outcome.Fail].ok{};
-        }
-        val n:     usize = str_len(rel);
-        var start: usize = 0;
-        for (start < n) {
-            var end: usize = start;
-            for (end < n && rel[end] != '/'::u8) { end = end + 1; }
-            if (end == start) {
-                sysos.close(fd);
-                ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "{} '{}' is not a canonical project path", label, rel))};
-            }
-            val component_r: res[str, string.StrError] = str_copy_slice(alloc, rel, start, end - start);
-            if (sel component_r.err) {
-                sysos.close(fd);
-                ret err[outcome.Fail].err{outcome.user(outcome.str_text(component_r.err))};
-            }
-            val component: str = component_r.ok;
-            var st:        sysos.stat_t;
-            var stat_r:    i64 = sysos.stat_path(fd, component, ?st, sysos.AT_SYMLINK_NOFOLLOW);
-            if (stat_r == sysos.ENOENT) {
-                val make_r: i64 = sysos.make_dir(fd, component, 0o755);
-                if (make_r < 0 && make_r != sysos.EEXIST) {
-                    val msg: str = sfmt(alloc, "{} '{}' cannot create directory '{}': {}", label, rel, component, sysos.message(make_r));
-                    str_free(alloc, component);
-                    sysos.close(fd);
-                    ret err[outcome.Fail].err{outcome.user(msg)};
-                }
-                stat_r = sysos.stat_path(fd, component, ?st, sysos.AT_SYMLINK_NOFOLLOW);
-            }
-            if (stat_r < 0) {
-                val msg: str = sfmt(alloc, "{} '{}' cannot inspect directory '{}': {}", label, rel, component, sysos.message(stat_r));
-                str_free(alloc, component);
-                sysos.close(fd);
-                ret err[outcome.Fail].err{outcome.user(msg)};
-            }
-            val mode: u32 = sysos.stat_mode(?st);
-            if ((mode & sysos.S_IFMT) == sysos.S_IFLNK || (mode & sysos.S_IFMT) != sysos.S_IFDIR) {
-                val msg: str = sfmt(alloc, "{} '{}' cannot use non-directory or symlink component '{}'", label, rel, component);
-                str_free(alloc, component);
-                sysos.close(fd);
-                ret err[outcome.Fail].err{outcome.user(msg)};
-            }
-            val next_fd_raw: i64 = sysos.open(fd, component, sysos.O_RDONLY | sysos.O_DIRECTORY, 0);
-            str_free(alloc, component);
-            if (next_fd_raw < 0) {
-                val msg: str = sfmt(alloc, "{} '{}' cannot open a directory component: {}", label, rel, sysos.message(next_fd_raw));
-                sysos.close(fd);
-                ret err[outcome.Fail].err{outcome.user(msg)};
-            }
-            val next_fd:     i32 = next_fd_raw::i32;
-            var next_st:     sysos.stat_t;
-            val next_stat_r: i64 = sysos.stat(next_fd, ?next_st);
-            if (next_stat_r < 0 || (sysos.stat_mode(?next_st) & sysos.S_IFMT) != sysos.S_IFDIR) {
-                sysos.close(next_fd);
-                sysos.close(fd);
-                ret err[outcome.Fail].err{outcome.user(sfmt(alloc, "{} '{}' opened an invalid directory component", label, rel))};
-            }
-            val close_r: i64 = sysos.close(fd);
-            if (close_r < 0) {
-                sysos.close(next_fd);
-                ret err[outcome.Fail].err{outcome.user(sysos.message(close_r))};
-            }
-            fd    = next_fd;
-            start = end + 1;
-        }
-        val close_r: i64 = sysos.close(fd);
-        if (close_r < 0) { ret err[outcome.Fail].err{outcome.user(sysos.message(close_r))}; }
-        ret err[outcome.Fail].ok{};
-    }
-}
-
 fun glob_visit(alloc: *A.Allocator, root: str, base_rel: str, name: str, pat: str, recursive: bool, out: *vector.Vector[str]) err[outcome.Fail] {
     val child_rel_r: res[str, fail.Fail] = load.join_path(alloc, base_rel, name);
     if (sel child_rel_r.err) { ret err[outcome.Fail].err{outcome.from_fail(child_rel_r.err)}; }
@@ -1384,20 +1373,20 @@ fun glob_walk(alloc: *A.Allocator, root: str, base_rel: str, pat: str, recursive
     if (sel dir_abs_r.err) { ret err[outcome.Fail].err{outcome.refused(dir_abs_r.err)}; }
     val dir_abs: str = dir_abs_r.ok;
 
-    val fd_raw: i64 = sysos.open(sysos.AT_FDCWD, dir_abs, sysos.O_RDONLY | sysos.O_DIRECTORY, 0);
+    var fd:     usize = sysos.INVALID_HANDLE;
+    val fd_raw: i64   = sysos.open(sysos.working_dir(), dir_abs, sysos.O_RDONLY | sysos.O_DIRECTORY, 0, ?fd);
     if (fd_raw < 0) {
-        val msg: str = sfmt(alloc, "failed to open build step glob directory '{}': {}", dir_abs, sysos.message(fd_raw));
+        val msg: str = sfmt(alloc, "failed to open build step glob directory '{}': {}", dir_abs, sysos.error_message(fd_raw));
         str_free(alloc, dir_abs);
         ret err[outcome.Fail].err{outcome.user(msg)};
     }
     str_free(alloc, dir_abs);
-    val fd: i32 = fd_raw::i32;
 
     var cursor: sysos.DirectoryCursor     = sysos.DirectoryCursor{};
     val opened: sysos.DirectoryInitResult = sysos.directory_init(?cursor, fd);
     if (opened.code < 0) {
         sysos.close(fd);
-        ret err[outcome.Fail].err{outcome.user(sysos.message(opened.code))};
+        ret err[outcome.Fail].err{outcome.user(sysos.error_message(opened.code))};
     }
     var result:  err[outcome.Fail] = err[outcome.Fail].ok{};
     var reading: bool              = true;
@@ -1405,7 +1394,7 @@ fun glob_walk(alloc: *A.Allocator, root: str, base_rel: str, pat: str, recursive
         var entry: sysos.DirectoryEntry;
         val nread: i64 = sysos.directory_next(?cursor, ?entry);
         if (nread < 0) {
-            result  = err[outcome.Fail].err{outcome.user(sysos.message(nread))};
+            result  = err[outcome.Fail].err{outcome.user(sysos.error_message(nread))};
             reading = false;
         }
         or (nread == 0) { reading = false; }
@@ -1420,12 +1409,12 @@ fun glob_walk(alloc: *A.Allocator, root: str, base_rel: str, pat: str, recursive
     val cursor_r:  i64  = sysos.directory_close(?cursor);
     val result_ok: bool = sel result.ok && cursor_r < 0;
     if (result_ok) {
-        result = err[outcome.Fail].err{outcome.user(sysos.message(cursor_r))};
+        result = err[outcome.Fail].err{outcome.user(sysos.error_message(cursor_r))};
     }
     val close_r:    i64  = sysos.close(fd);
     val result_ok2: bool = sel result.ok && close_r < 0;
     if (result_ok2) {
-        result = err[outcome.Fail].err{outcome.user(sysos.message(close_r))};
+        result = err[outcome.Fail].err{outcome.user(sysos.error_message(close_r))};
     }
     ret result;
 }

@@ -839,6 +839,12 @@ fun emit_neon_2misc(st: *encode.EncodeState, op: mop.MachOp, rd: u32, rn: u32) {
     emit_inst(st, ?mi);
 }
 
+fun emit_neon_conv(st: *encode.EncodeState, op: mop.MachOp, rd: u32, rn: u32, from_bytes: u8) {
+    var mi: isa.Inst = inst_of(op, mop.vec(rd, 16), mop.vec(rn, 16), isa.make_none());
+    mi.flags = mop.with_elem_bytes(0, from_bytes);
+    emit_inst(st, ?mi);
+}
+
 fun emit_neon_umov(st: *encode.EncodeState, index: u32, rd: u32, rn: u32, lane: u32) {
     var dst_bytes: u8 = 4;
     if (mir.vec_lane_elem_bytes(lane) == 8) { dst_bytes = 8; }
@@ -2020,6 +2026,112 @@ fun neon_3same_refusal(op: mop.MachOp, size: u32) opt[str] {
     ret opt[str].none{};
 }
 
+# one conversion step on the work register: its first step reads the operand
+fun neon_conv_step(st: *encode.EncodeState, op: mop.MachOp, rd: u32, rn: *u32, from_bytes: u8) {
+    emit_neon_conv(st, op, rd, @rn, from_bytes);
+    @rn = rd;
+}
+
+# the NEON conversion of each lane, for the cells the aarch64 packed table
+# declares. a float to integer lane saturates at the 32 or 64 bits the scalar
+# conversion saturates at and is then truncated as the scalar result is, so a
+# 64-bit saturation narrows to 32 bits by saturating again
+fun emit_neon_convert_body(st: *encode.EncodeState, op: mir.MirOpcode, to_float: bool, to: u8,
+    from_float: bool, from: u8, rd: u32, src: u32) err[fail.Fail] {
+    var rn: u32 = src;
+    if (op == mir.MIR_SEXT || op == mir.MIR_ZEXT) {
+        var lengthen: mop.MachOp = mop.V_UXTL;
+        if (op == mir.MIR_SEXT) { lengthen = mop.V_SXTL; }
+        var w: u8 = from;
+        for (w < to) {
+            neon_conv_step(st, lengthen, rd, ?rn, w);
+            w = w * 2;
+        }
+        ret err[fail.Fail].ok{};
+    }
+    if (op == mir.MIR_TRUNC) {
+        emit_neon_narrow(st, from, to, rd, ?rn);
+        ret err[fail.Fail].ok{};
+    }
+    if (op == mir.MIR_FP_EXT && from == 4 && to == 8) {
+        neon_conv_step(st, mop.V_FCVTL, rd, ?rn, 4);
+        ret err[fail.Fail].ok{};
+    }
+    if (op == mir.MIR_FP_TRUNC && from == 8 && to == 4) {
+        neon_conv_step(st, mop.V_FCVTN, rd, ?rn, 8);
+        ret err[fail.Fail].ok{};
+    }
+    if ((op == mir.MIR_SI_TO_FP || op == mir.MIR_UI_TO_FP) && !from_float && to_float && from <= to) {
+        val signed:   bool       = op == mir.MIR_SI_TO_FP;
+        var lengthen: mop.MachOp = mop.V_UXTL;
+        var convert:  mop.MachOp = mop.V_UCVTF;
+        if (signed) {
+            lengthen = mop.V_SXTL;
+            convert  = mop.V_SCVTF;
+        }
+        var w: u8 = from;
+        for (w < to) {
+            neon_conv_step(st, lengthen, rd, ?rn, w);
+            w = w * 2;
+        }
+        neon_conv_step(st, convert, rd, ?rn, to);
+        ret err[fail.Fail].ok{};
+    }
+    if ((op == mir.MIR_FP_TO_SI || op == mir.MIR_FP_TO_UI) && from_float && !to_float) {
+        val signed:   bool       = op == mir.MIR_FP_TO_SI;
+        var convert:  mop.MachOp = mop.V_FCVTZU;
+        var saturate: mop.MachOp = mop.V_UQXTN;
+        if (signed) {
+            convert  = mop.V_FCVTZS;
+            saturate = mop.V_SQXTN;
+        }
+        if (from == 4 && to == 8) {
+            neon_conv_step(st, mop.V_FCVTL, rd, ?rn, 4);
+            neon_conv_step(st, convert, rd, ?rn, 8);
+            ret err[fail.Fail].ok{};
+        }
+        neon_conv_step(st, convert, rd, ?rn, from);
+        var w: u8 = from;
+        if (from == 8 && to < 8) {
+            neon_conv_step(st, saturate, rd, ?rn, 8);
+            w = 4;
+        }
+        emit_neon_narrow(st, w, to, rd, ?rn);
+        ret err[fail.Fail].ok{};
+    }
+    ret err[fail.Fail].err{fail.message("encode: vector conversion outside the aarch64 packed table")};
+}
+
+fun emit_neon_narrow(st: *encode.EncodeState, from: u8, to: u8, rd: u32, rn: *u32) {
+    var w: u8 = from;
+    for (w > to) {
+        neon_conv_step(st, mop.V_XTN, rd, rn, w);
+        w = w / 2;
+    }
+}
+
+fun encode_neon_convert(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) err[fail.Fail] {
+    if (mi.operand_count < 2) { ret err[fail.Fail].err{fail.message("encode: vector conversion missing operands")}; }
+    val rnr: res[i32, fail.Fail] = resolve_fp_source(st, f, ?mi.operands[1], FP_SCRATCH0, 16);
+    if (sel rnr.err) { ret err[fail.Fail].err{rnr.err}; }
+    val dst:     *mir.MirOperand = ?mi.operands[0];
+    var rd:      u32             = FP_SCRATCH0;
+    var to_slot: bool            = true;
+    if (dst.kind != mir.MIR_OP_MEM) {
+        val rdr: res[i32, fail.Fail] = req_vec(dst);
+        if (sel rdr.err) { ret err[fail.Fail].err{rdr.err}; }
+        rd      = rdr.ok::u32;
+        to_slot = false;
+    }
+    val vl:   u32            = mi.vec_lane;
+    val body: err[fail.Fail] = emit_neon_convert_body(st, mi.opcode,
+        mir.vec_lane_kind(vl) == mir.VEC_LANE_FLOAT, mir.vec_lane_elem_bytes(vl),
+        mir.vec_lane_from_kind(vl) == mir.VEC_LANE_FLOAT, mir.vec_lane_from_bytes(vl), rd, rnr.ok::u32);
+    if (sel body.err) { ret body; }
+    if (to_slot)      { ret emit_fp_slot_store(st, f, dst, rd, 16); }
+    ret err[fail.Fail].ok{};
+}
+
 fun encode_neon(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) err[fail.Fail] {
     val vl:       u32  = mi.vec_lane;
     val is_float: bool = mir.vec_lane_kind(vl) == mir.VEC_LANE_FLOAT;
@@ -2719,6 +2831,8 @@ fun encode_mir_instr(st: *encode.EncodeState, f: *mir.MirFunction, fn_base: u32,
     if (mi.opcode == mir.MIR_ALLOCA || mi.opcode == mir.MIR_GEP) { ret encode_addr(st, f, mi); }
     if (mi.opcode == mir.MIR_LOAD)                               { ret encode_load(st, f, mi); }
     if (mi.opcode == mir.MIR_STORE)                              { ret encode_store(st, f, mi); }
+
+    if (mir.vec_lane_is_convert(mi.vec_lane)) { ret encode_neon_convert(st, f, mi); }
 
     if (mi.opcode == mir.MIR_TRUNC || mi.opcode == mir.MIR_SEXT ||
         mi.opcode == mir.MIR_ZEXT || mi.opcode == mir.MIR_BITCAST) {
@@ -8007,14 +8121,18 @@ pub fun asm_ct_class(code: u32, flags: u16) ct.AsmClass {
         code == mop.V_CMEQ::u32 || code == mop.V_CMGT::u32 || code == mop.V_CMGE::u32 ||
         code == mop.V_CMHI::u32 || code == mop.V_CMHS::u32 ||
         code == mop.UMOV::u32 || code == mop.MOV_LANE::u32 || code == mop.INS::u32 || code == mop.DUP::u32 ||
-        code == mop.INS_EL::u32) {
+        code == mop.INS_EL::u32 ||
+        code == mop.V_SXTL::u32 || code == mop.V_UXTL::u32 || code == mop.V_XTN::u32 ||
+        code == mop.V_SQXTN::u32 || code == mop.V_UQXTN::u32) {
         ret ct.flags_untouched(ct.asm_op(ct.CT_OP_NONE));
     }
     if (code == mop.FADD::u32 || code == mop.FSUB::u32 || code == mop.FMUL::u32 || code == mop.FDIV::u32 ||
         code == mop.FNEG::u32 || code == mop.FCVT::u32 || code == mop.SCVTF::u32 || code == mop.UCVTF::u32 ||
         code == mop.FCVTZS::u32 || code == mop.FCVTZU::u32 ||
         code == mop.V_FADD::u32 || code == mop.V_FSUB::u32 || code == mop.V_FMUL::u32 || code == mop.V_FDIV::u32 ||
-        code == mop.V_FCMEQ::u32 || code == mop.V_FCMGT::u32 || code == mop.V_FCMGE::u32) {
+        code == mop.V_FCMEQ::u32 || code == mop.V_FCMGT::u32 || code == mop.V_FCMGE::u32 ||
+        code == mop.V_FCVTL::u32 || code == mop.V_FCVTN::u32 || code == mop.V_SCVTF::u32 ||
+        code == mop.V_UCVTF::u32 || code == mop.V_FCVTZS::u32 || code == mop.V_FCVTZU::u32) {
         ret ct.flags_untouched(ct.asm_op(ct.CT_OP_FLOAT));
     }
     if (code == mop.FCMP::u32) {
@@ -9042,7 +9160,7 @@ fun t_neon3_allocated(op: mop.MachOp, size: u32) bool {
 test "mach.lang.target.isa.arm64.encode.neon_3same_refusal:partition_MachOp" {
     # the integer multiply is the one member without a size-3 arrangement;
     # every other member encodes at every size
-    val others: [115]mop.MachOp = [115]mop.MachOp{mop.MOP_NONE, mop.NOP, mop.YIELD, mop.WFE, mop.WFI, mop.RET,
+    val others: [125]mop.MachOp = [125]mop.MachOp{mop.MOP_NONE, mop.NOP, mop.YIELD, mop.WFE, mop.WFI, mop.RET,
         mop.SVC, mop.BRK, mop.HVC, mop.SMC, mop.MOV, mop.MOVZ, mop.MOVK, mop.MVN, mop.NEG, mop.ADD, mop.ADDS,
         mop.SUB, mop.SUBS, mop.CMP, mop.CMN, mop.AND, mop.ORR, mop.ORN, mop.EOR, mop.MUL, mop.MNEG, mop.MADD,
         mop.MSUB, mop.SDIV, mop.UDIV, mop.LSL, mop.LSR, mop.ASR, mop.LSLV, mop.LSRV, mop.ASRV, mop.UBFX,
@@ -9054,9 +9172,10 @@ test "mach.lang.target.isa.arm64.encode.neon_3same_refusal:partition_MachOp" {
         mop.V_FADD, mop.V_FSUB, mop.V_FMUL, mop.V_FDIV, mop.V_ADD, mop.V_SUB, mop.V_AND, mop.V_ORR, mop.V_EOR,
         mop.V_MVN, mop.V_MOV, mop.V_CMEQ, mop.V_CMGT, mop.V_CMGE, mop.V_CMHI, mop.V_CMHS, mop.V_FCMEQ,
         mop.V_FCMGT, mop.V_FCMGE, mop.UMOV, mop.MOV_LANE, mop.INS, mop.DUP, mop.FMOV_GEN, mop.FMOV_IMM,
-        mop.INS_EL, mop.MOP_LAST};
+        mop.INS_EL, mop.V_SXTL, mop.V_UXTL, mop.V_XTN, mop.V_SQXTN, mop.V_UQXTN, mop.V_FCVTL, mop.V_FCVTN,
+        mop.V_SCVTF, mop.V_UCVTF, mop.V_FCVTZS, mop.MOP_LAST};
     var i: usize = 0;
-    for (i < 115) {
+    for (i < 125) {
         var size: u32 = 0;
         for (size < 4) {
             if (!t_neon3_allocated(others[i], size)) { ret 1; }
