@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A retained session releases the products of a module that leaves the build. Before, once a module had been loaded, its query products (parse, resolve, gates, load views, sema, lower and codegen) stayed for the life of the session, so a language server open across a refactor kept growing. The session now tracks which modules it keeps. Each build records the modules it loaded under a retainer, and a module that no retainer holds any more has its products retired. An accepted build keeps exactly what it loaded. A rejected build keeps the last accepted build's modules plus its own, and nothing older, so typing an import one character at a time cannot pile modules up. The editor holds one retainer per project root that has an open buffer, so analyzing one root never evicts another root's modules, and closing a root's last buffer releases that root. Editor builds hold their own retainer, and a whole build plan counts as one round, so one unit never releases another unit's modules, and a plan that fails partway keeps what it held before. A module that comes back is computed again from scratch (#3570).
+
 ## [5.4.0] - 2026-09-17
 
 ### Added
