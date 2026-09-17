@@ -208,7 +208,65 @@ to whichever *declared* target matches the host.
 | `stack_reserve` | no | Thread stack reserve in bytes. See [Image stack size](#image-stack-size). |
 | `stack_commit` | no | Thread stack commit in bytes. See [Image stack size](#image-stack-size). |
 | `default` | no | `true` marks the target `native` resolves to when no declared target matches the host and several are declared. Exactly one may carry it: two are refused at parse (`2 targets declare `default = true` ([target.linux-x86_64], [target.darwin-x86_64]); exactly one is allowed`). See [`native` target resolution](#native-target-resolution). |
+| `extensions` | no | Array of instruction-set extension names the target may assume, such as `["sha", "ssse3"]`. Each name must be in the isa's vocabulary. See [Instruction-set extensions](#instruction-set-extensions). |
 | `env` | no | Consumer environment (string). The values are owned by the target's isa: an `env` the isa does not define is a manifest error naming the target and the known values, and an isa that defines none refuses the key outright. Today only `spirv` defines any; see [Finished-module targets](#finished-module-targets). |
+
+### Instruction-set extensions
+
+`extensions` lists the extensions a target may assume beyond its isa's baseline:
+
+```toml
+[target.linux-x86_64-sha]
+isa        = "x86_64"
+extensions = ["sha", "ssse3", "sse41"]
+os         = "linux"
+abi        = "sysv64"
+```
+
+Each isa owns its vocabulary. The names are identifiers, so each one is also a
+comptime member, `$mach.build.ext.<name>` (see [`$mach`](comptime-mach.md)):
+
+| `isa` | Baseline | Extensions |
+|-------|----------|------------|
+| `x86_64` | SSE2 | `ssse3`, `sse41`, `sha` |
+| `aarch64` | AdvSIMD | `sha2` |
+| `riscv64`, `riscv32` | the isa string's selection | `i`, `m`, `a`, `f`, `d`, `c`, `zicsr`, `zifencei` |
+| `spirv` | | none |
+
+A name the selected isa does not hold is refused when the target resolves, with the
+names it does hold:
+
+```
+error: target: `sha2` is not an extension of isa 'x86_64'; its extensions are:
+ssse3, sse41, sha
+```
+
+The array must hold strings, and each name must be an identifier (`sse41`, not
+`sse4.1`) listed once.
+
+On riscv the isa string and the list feed one set, so
+`isa = "rv64i"` with `extensions = ["m"]` selects the same machine as
+`isa = "rv64im"`. The combination follows the string's rules: F brings Zicsr, and D
+without F is refused.
+
+Selecting an extension is a promise about **every** machine the binary runs on. The
+inline assembler admits the extension's mnemonics anywhere in the build, and a host
+without the extension faults on the first one it executes. A portable binary keeps the
+target at its baseline instead. It confines the extension instructions to
+[`#[extensions(...)]`](decorators.md#extensionsnames--an-outlier-function) functions
+and picks one of those at run time, after detecting the host's features.
+
+A mnemonic that needs an extension the target does not select, outside such a
+function, is refused. The refusal names the line to add:
+
+```
+error: encode: inline-asm instruction 'sha256rnds2' needs the `sha` extension, which
+this target does not select; add `extensions = ["sha"]` to the target, or mark the
+function `#[extensions(sha)]` and call it only after detecting the extension at run time
+```
+
+The selected set is part of the target's identity: two targets that differ only in
+`extensions` never share cached products.
 
 ### Image stack size
 
