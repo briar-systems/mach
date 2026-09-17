@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `doc/language/rec.md` states that a record literal may omit fields and that every omitted field is zero-initialized, secret (`^`) fields and secret-welded pointers included, for runtime literals, literals of constants and module-level constant literals. A test pins it over a dirtied stack in both profiles, for a scalar, a pointer, a nested record and secret members (#3578).
+
 ### Fixed
 - A path dependency inside a git work tree that ignores it realizes its files again. The copy asked git from the source directory, got the enclosing repository, and kept only what that repository lists, which for an ignored directory is nothing, so `dep/<id>` came out empty and the build failed with `cannot read ./dep/<id>/mach.toml`. A source the enclosing repository ignores, with nothing of it tracked, is now copied by the plain walk, as a source outside any work tree is. A source that is its own repository or a tracked directory of one still copies what git keeps. A copy that would be empty, or would leave out the source's `mach.toml`, is refused with a message naming the source and the repository whose rules dropped it (#3565).
 - `mach dep pull` syncs a path dependency's copy with its declared `path` every time. Before, it skipped any `dep/<id>` that already existed, so after `path` changed it kept the old copy, printed nothing and exited 0. **`mach dep pull` now overwrites local modifications to a path dependency's copy under `dep/`**, and names each file it replaces, as it already named each file it removes. A path dependency has no pin to move, so `pull` and `update` now do the same thing for it. A `dep/<id>` that is a symlink is still refused (#3566).
