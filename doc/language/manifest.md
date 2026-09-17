@@ -112,11 +112,13 @@ ref = "branch/main"
 | `version` | string | Project version. Read by `$project.version` and `$project.version.{major,minor,patch}`, and stamped into a Windows executable's version resource. |
 | `src`     | string | Source root, project-root-relative. Module paths resolve under it. |
 | `out`     | string | The output-path template root, referenced as `{project.out}` by artifact `out`, step paths, and `cmd`s. Expanded over `{target.name}`/`{target.isa}`/`{target.os}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). |
-| `mach`    | string | The compiler versions this project builds with, as a version range (`"^5.2"`). See [Compiler range](#compiler-range). |
+| `mach`    | string | The compiler versions this project builds with, as a [version range](#version-ranges) (`"^5.2"`). See [Compiler range](#compiler-range). |
 
 `[project]` is exactly these five keys. Any other key, `name` and `description`
 included, is an unknown-key error (`mach.toml: unknown key 'name' in
-[project]`), in a root manifest and a dependency's alike.
+[project]`), in a root manifest and a dependency's alike. `[profile.<name>]`
+likewise carries no `emit_ir` or `emit_asm`: emission is `--emit-ir`/`--emit-asm`
+on the command line.
 
 ### Compiler range
 
@@ -132,31 +134,61 @@ error: this is mach 5.2.1, and the dependency closure does not accept it:
     app -> gfx -> glfw requires mach >=5.4, <6
 ```
 
-A range is one or more clauses separated by `,`, and a version satisfies it
-when it satisfies every clause. Each clause names its operator; a bare `1.2` is
-refused.
+A root manifest without `mach` builds, with a warning that prints the line to
+add (`mach.toml: [project] states no compiler range; add mach = "^5.2", the
+compiler this project builds with`). A later release makes the key required. A
+dependency without it states no constraint. `mach init` writes the running
+compiler's caret range.
+
+The compiler's version is the last release it was built from. A build from an
+unreleased tree reports that release, so a project cannot require an
+unreleased feature by version: a feature is a compatibility promise only once
+it is released.
+
+### Version ranges
+
+`[project].mach` and `[dep.<id>].version` share one range grammar, defined
+here and pinned by the compiler's tests:
+
+```
+range   = clause *( "," clause )        ; the intersection of every clause
+clause  = op partial
+op      = "^" / "~" / ">=" / ">" / "<=" / "<" / "="
+partial = major [ "." minor [ "." patch [ "-" pre ] ] ]
+```
+
+A version satisfies a range when it satisfies every clause. Each clause names
+its operator, so a bare `1.2` is refused (`a clause needs an operator, such as
+^1.2 or >=1.2`). Whitespace is allowed around `,` and between an operator and
+its version, and nowhere else. A missing component is 0.
 
 | clause | means |
 |---|---|
 | `^1.2.3` | `>=1.2.3, <2.0.0` |
 | `^1.2` | `>=1.2.0, <2.0.0` |
-| `^0.4.2` | `>=0.4.2, <0.5.0` (below 1.0 the first nonzero component is fixed) |
-| `^0.0.3` | `=0.0.3` |
+| `^1` | `>=1.0.0, <2.0.0` |
 | `~1.2.3` | `>=1.2.3, <1.3.0` |
+| `~1.2` | `>=1.2.0, <1.3.0` |
 | `~1` | `>=1.0.0, <2.0.0` |
-| `>=1.2`, `>1.2`, `<=1.2`, `<2` | a missing component is 0: `>1.2` is `>1.2.0` |
+| `>=1.2`, `>1.2`, `<=1.2`, `<2` | the bound with missing components as 0: `>1.2` is `>1.2.0` |
 | `=1.2.3` | exactly `1.2.3`; `=` needs all three components |
 
-A pre-release version (`1.3.0-rc.1`) satisfies a range only when one of its
-clauses names a pre-release of that same release, so `^1.2` never selects
-`1.3.0-rc.1`. Build metadata is refused in a range. There is no `*` and no
-`||`.
+Below 1.0 a minor release is breaking, so caret fixes everything up to the
+first nonzero component:
 
-A root manifest without `mach` builds, with a warning that prints the line to
-add (`add mach = "^5.2"`); a later release requires the key. A dependency
-without it states no constraint. `[profile.<name>]`
-likewise carries no `emit_ir` or `emit_asm`: emission is `--emit-ir`/`--emit-asm`
-on the command line.
+| clause | means |
+|---|---|
+| `^0.4.2` | `>=0.4.2, <0.5.0` |
+| `^0.4` | `>=0.4.0, <0.5.0` |
+| `^0.0.3` | `=0.0.3` |
+| `^0.0` | `>=0.0.0, <0.1.0` |
+| `^0` | `>=0.0.0, <1.0.0` |
+
+A pre-release version (`1.3.0-rc.1`) satisfies a range only when one of its
+clauses names a pre-release of that same release. So `^1.2` never selects
+`1.3.0-rc.1`, and `>=1.3.0-rc.1, <2` does. Build metadata (`+...`) is refused
+in a range and ignored in a release's version. There is no `*` and no `||`.
+Either can be added later without changing what an existing range means.
 
 ## `[target.<name>]`
 
@@ -985,30 +1017,152 @@ where it is declared, since one head segment cannot name two projects.
 ```toml
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "branch/main"
+version = "^4.0"
 ```
 
 A stanza declares exactly one source:
 
 | Key    | Meaning |
 |--------|---------|
-| `git`  | Git URL. The dependency is a git **submodule** at `dep/<id>/`, pinned by the gitlink the root repository commits. Requires `ref`. |
+| `git`  | Git URL. The dependency is a git **submodule** at `dep/<id>/`, pinned by the gitlink the root repository commits. Requires `ref` or `version`. |
 | `ref`  | Selector for `git`: `branch/<name>`, `tag/<name>`, or `commit/<full-object-id>`. Any other spelling is rejected (`[dep.std].ref must be branch/<name>, tag/<name>, or commit/<full-object-id>`). |
-| `version` | A release range for `git` (see [Compiler range](#compiler-range) for the grammar): the dependency's `v`-prefixed semver tags are its releases, and `mach dep add`/`mach dep update` resolve the range to one of them. A git dependency names exactly one of `ref` and `version`. |
-| `path` | Local project tree, never fetched. A relative `path` is resolved relative to this manifest's directory. `mach dep add <path> <id> --path` copies its files into `dep/<id>/` without the source's own `dep/` or Git metadata. No repository or index is required for a path dependency, and copied files are not automatically staged. Forbids `ref`. |
+| `version` | A [version range](#version-ranges) over the dependency's releases (see [Releases and resolution](#releases-and-resolution)). Valid only with `git`; a path dependency has no releases. |
+| `path` | Local project tree, never fetched. A relative `path` is resolved relative to this manifest's directory. `mach dep add <path> <id> --path` copies its files into `dep/<id>/` without the source's own `dep/` or Git metadata. No repository or index is required for a path dependency, and copied files are not automatically staged. Forbids `ref` and `version`. |
 
 `git` and `path` are mutually exclusive and exactly one is required. A `git`
 dependency also names exactly one selector, `ref` or `version`.
 
-A version-selected dependency is resolved only by `mach dep add` and `mach dep
-update` (with `--lowest` for the lowest release every range accepts, and
-`--offline` to resolve from tags already fetched); builds never resolve. The
-resolver picks the highest release whose range every requirer accepts and whose
-own `[project].mach` accepts the running compiler, for every version-selected
-identity in the closure, and writes the result as gitlinks like any other pin.
-A release whose manifest selects a dependency by branch, commit or path is
-refused, since it cannot be reproduced from its tag. `mach dep outdated` reports
-each such identity's pinned, highest compatible and latest release.
+`ref` and `version` are mutually exclusive (`[dep.std] names both 'ref' and
+'version'; keep one`). `ref` selects one exact commit or tag, or follows a
+branch. `version` selects among releases.
+
+### Releases and resolution
+
+A **release** of a git dependency is a tag `vX.Y.Z` (optionally
+`vX.Y.Z-pre`) together with the `mach.toml` at that tag. A tag whose manifest's
+`[project].version` differs from the tag name is not a candidate (`release
+v1.1.0 (<commit>) is not a candidate: its [project].version does not match the
+tag`).
+
+Resolution runs in exactly three places: `mach dep add`, `mach dep update` and
+`mach dep outdated`. **Builds never resolve.** They verify, offline (see
+[What a build verifies](#what-a-build-verifies)). For every identity in the
+closure that some manifest selects by `version`, resolution picks one release
+such that:
+
+1. every requirer's range contains it;
+2. its own `[project].mach` contains the running compiler;
+3. the closure its own manifest implies also resolves.
+
+Among the choices that satisfy all three, it takes the highest release of each
+identity. The result is written as gitlinks, like any other pin; there is
+still no lock file. `mach dep update <path> <name>` keeps every other
+identity at its current release while that release still fits, so an update
+moves as little as it can. `--all` resolves from scratch.
+
+When nothing fits, the error lists every requirement that took part and names
+the identity the root can settle:
+
+```
+error: no set of releases satisfies every requirement:
+    root requires b ^1.2
+    a 1.0.0 requires b ^2.0
+  the root decides by declaring the identity itself, for example:
+    [dep.b]
+    version = "<a range the root can use>"
+```
+
+A release that needs a newer compiler appears as one of those lines (`b 2.0.0
+requires mach ^6, and this is mach 5.2.1`). Resolution never silently settles
+for a lower release than the ranges allow.
+
+What `mach dep add` writes:
+
+- with `--git <url>` alone, `version = "^X.Y.Z"`, where `X.Y.Z` is the
+  release resolution picked. The lower bound is the release actually tested
+  when the dependency was added, and the caret follows the pre-1.0 rule;
+- with `--version <range>`, that range;
+- with `--ref <selector>`, that selector, as before.
+
+`mach init` adds std the same way, so a new project names the std release that
+works with the compiler that created it. std is an ordinary dependency, with
+no std-specific command. `mach init --no-deps` still resolves and writes the
+range and skips only the checkout, so it needs the network too. Offline it
+fails and writes no `[dep.std]` table. A tool that needs the std for a given
+compiler runs `mach init` and `mach dep pull` in a scratch project and takes
+what resolution chose.
+
+**`--offline`.** `add`, `update` and `outdated` read candidates from each
+dependency's repository: one `git ls-remote --tags` per URL, and the manifest
+at a release through a shallow fetch of its tag. With `--offline` they use only
+the tags already present in the realized checkouts, and they say so
+(`resolving from releases already fetched (--offline)`). A resolution that
+needs a candidate it doesn't have fails, naming the identity.
+
+**`--lowest`.** `mach dep update <path> --all --lowest` picks the lowest
+release every range accepts. A library's CI runs it in a scratch checkout and
+then builds and tests, which proves the lower bounds it declares are honest.
+Without that check, `^3.2.0` can quietly depend on something only 3.4 has. It
+belongs in a release or manually dispatched job, never a scheduled one.
+
+**`mach dep outdated <path>`** prints, for each version-selected identity, the
+pinned release, the highest release resolution would pick now, and the highest
+release published. A newer release held back by a range or by the compiler is
+marked as such.
+
+**No yanking.** A bad release that is otherwise compatible is fixed forward
+with a new release. Nothing marks a published version as withdrawn. A
+consumer that must avoid one raises its range's lower bound (`^3.2.1`).
+
+**Forks.** Identity is the project id, not the URL. A root that declares a
+fork's URL makes that fork the candidate source, so its `vX.Y.Z` tags compete
+under the same ranges. A fork that wants to stay distinguishable tags
+pre-releases (`v1.4.3-fork.1`), and a consumer opts in by naming the
+pre-release in its range.
+
+### Root declarations: narrowing and overriding
+
+A root `version` for an identity **narrows**: it is intersected with every
+requirer's range, and resolution and verification hold the pin to all of them.
+A root `ref` or `path` **overrides**: the requirers' ranges and selectors for
+that identity no longer apply, and `add` and `update` print each one they
+override (`root declares b by ref "branch/main", overriding root -> a 1.0.0
+requires b ^1.2`). A range is therefore never widened silently, and the escape
+hatch is one visible line in the root manifest.
+
+An override is not checked against the requirers. Because the closure is flat,
+a requirer's `use b.*` binds to whatever the root selected, even a major that
+requirer was never built or tested against. Nothing proves the requirer supports
+it: a passing build only shows that the code the build reached compiled, so it is
+evidence and not a guarantee. `mach dep verify` prints a note for every edge an
+override replaced, without failing (`note: dependency 'b': the root declares ref =
+"tag/v2.0.0", overriding root -> a -> b which requires version = "^1.2"; nothing
+checks that 'b' supports the root's selection`). Treat each note as a claim to
+confirm, by testing the requirer at that selection or by checking its own range.
+
+### A release selects only releases
+
+The rule follows how a manifest was reached, not where it sits:
+
+- A dependency reached through a **release** (a `version` range or an exact
+  `tag/`) may itself select dependencies only by `version` or `tag/`. A release
+  is then reproducible from its tag, all the way down.
+- A dependency reached through a `branch/` or `commit/` selection is in
+  development, and its manifest may use any selector.
+
+A release that breaks the rule is refused wherever it is reached. Resolution
+stops when it reaches one, and verification (and so every build) refuses it,
+naming the chain and the offending line:
+
+```
+error: root -> a is a release (ref = "tag/v1.1.0"), and its manifest selects
+[dep.b] by ref = "branch/main"; a release may select its dependencies only by
+`version` or an exact `tag/`, so it cannot be reproduced from its tag
+```
+
+`mach dep verify <path> --release` holds the project itself to the same rule,
+so a library's release workflow catches the mistake before it tags the
+release, not when its first consumer resolves it.
 
 ### Pins are gitlinks; there is no lock file
 
@@ -1078,10 +1232,24 @@ verify` as a command) checks, offline, that:
 3. the closure computed from the realized manifests equals the set of
    directories under `dep/`: nothing missing (`dependency 'std' is not
    resolved (missing 'dep/std'); run `mach dep pull <path>`), nothing extra;
-4. there are no cycles (reported as the chain).
+4. there are no cycles (reported as the chain);
+5. every realized manifest's `[project].mach` accepts the running compiler (see
+   [Compiler range](#compiler-range));
+6. for every identity selected by `version`, the pinned commit carries a
+   release tag, read from the checkout's own refs, and that release is inside
+   every requirer's range, the root's included; and every release in the
+   closure selects only releases (see [A release selects only
+   releases](#a-release-selects-only-releases)).
 
-The committed gitlink is what is verified, and the root's own declaration is
-the override: the root's gitlink is its pin, and a `tag/` it declares is not
+A pin outside a range names the requirer chain, the range, the pinned release
+and a runnable remedy (`dependency 'vb': root -> vb requires version '^1.2' but
+the pinned release is 1.1.0; run `mach dep update <path> vb` for project
+'<root>' to re-pin it, or declare the identity at the root to override`). An
+untagged pin reads `... but the pinned commit '<commit>' carries no release
+tag`.
+
+The committed gitlink is what is verified, and a root `ref` or `path` is the
+override: the root's gitlink is its pin, and a `tag/` it declares is not
 re-checked against that pin (a `commit/` it declares is). For an identity the
 root does **not** declare, every requirer's exact selector (`tag/`, resolved
 through the checkout's own refs, or `commit/`) must be satisfied by the
@@ -1138,10 +1306,9 @@ declares the identity; otherwise agreement among the requirers is taken;
 otherwise the command stops, prints both chains, and names the root
 declaration that would decide (the diagnostic above). A consumed
 dependency's own gitlink records a tested commit, readable without initializing
-that dependency's `dep/`. It is not an automatic compatibility floor: a
-tested commit establishes neither an ordering constraint nor permission to
-substitute a later release, so selection is explicit (#3112). A
-compatibility-range selection would be a separate decision.
+that dependency's `dep/`. It is not a compatibility floor. Compatibility is
+stated by ranges, and `update` resolves every version-selected identity as
+described in [Releases and resolution](#releases-and-resolution).
 
 ### Removed forms
 
