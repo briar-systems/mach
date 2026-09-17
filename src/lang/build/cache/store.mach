@@ -1,5 +1,7 @@
-# bounded content-keyed disk bytes: entries are written in place, a build
-# product regenerable by the next build, and a torn entry reads as a miss
+# bounded content-keyed disk bytes, each a build product regenerable by the
+# next build. an entry is written whole to a private temporary and renamed
+# into place, so a reader never meets a torn one; its checksum catches bit
+# rot, not an adversary, since whoever can write the directory can rewrite it
 
 use mach.lang.alloc;
 use mach.lang.build.cache.image;
@@ -39,9 +41,14 @@ pub val HIT:             u8    = 1;
 pub val MISS:            u8    = 2;
 pub val UNAVAILABLE:     u8    = 3;
 pub val STORED:          u8    = 4;
-val     HEADER_BYTES:    usize = 76;
-val     MAGIC:           u32   = 0x5348434D;
+val     HEADER_BYTES:    usize = 52;
+val     MAGIC:           u32   = 0x3248434D;
 val     HEX:             str   = "0123456789abcdef";
+
+# a temporary no live publication can still own; an older one is a crashed
+# publication's leftover and is removed by the next listing
+val STALE_TEMP_SECONDS: i64   = 600;
+val TEMP_NAME_BYTES:    usize = 85;
 
 # the pinned std exports O_NONBLOCK from neither os module, so the two values live here
 $if ($mach.build.os == $mach.os.linux)  { val O_NONBLOCK: i32 = 0o4000; }
@@ -187,6 +194,92 @@ fun entry_name(name: str) bool {
     ret true;
 }
 
+# `<entry>.<pid>.tmp`: a publication's temporary, private to its process
+fun temp_leaf(name: *u8, out: *[96]u8) {
+    var i: usize = 0;
+    for (i < 64) {
+        (@out)[i] = name[i];
+        i         = i + 1;
+    }
+    (@out)[64] = '.';
+    val pid: u64 = os.getpid()::u64;
+    i = 0;
+    for (i < 16) {
+        (@out)[65 + i] = HEX[((pid >> ((15 - i) * 4)) & 15)::usize];
+        i              = i + 1;
+    }
+    (@out)[81] = '.';
+    (@out)[82] = 't';
+    (@out)[83] = 'm';
+    (@out)[84] = 'p';
+    (@out)[85] = 0;
+}
+
+fun temp_name(name: str) bool {
+    if (str_len(name) != TEMP_NAME_BYTES || name[64] != '.' || name[81] != '.'
+        || name[82] != 't' || name[83] != 'm' || name[84] != 'p') { ret false; }
+    var i: usize = 0;
+    for (i < 81) {
+        val c: u8 = name[i];
+        if (i != 64 && !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# a temporary is never an entry: a listing passes over it, removing one old
+# enough that no live publication can own it
+fun pass_temp(a: *Access, name: str) {
+    var info:     os.stat_t;
+    val observed: i64 = os.stat_path(a.dirfd, name, ?info, os.AT_SYMLINK_NOFOLLOW);
+    if (os.error_kind(observed) == io_error.NOT_FOUND) { ret; }
+    if (observed < 0) {
+        native_error(a, observed, OP_RECOVER);
+        ret;
+    }
+    var now:     os.Timespec = os.Timespec{sec: 0, nsec: 0};
+    val clocked: i64         = os.realtime(?now);
+    if (clocked < 0) {
+        native_error(a, clocked, OP_RECOVER);
+        ret;
+    }
+    if (now.sec - info.st_mtime < STALE_TEMP_SECONDS) { ret; }
+    val removed: i64 = os.unlink(a.dirfd, name, 0);
+    if (removed < 0 && os.error_kind(removed) != io_error.NOT_FOUND) { native_error(a, removed, OP_REMOVE); }
+}
+
+val CHECKSUM_SEED:  u64 = 0x6D61636863616368;
+val CHECKSUM_PRIME: u64 = 0x9E3779B97F4A7C15;
+
+fun checksum_word(bytes: *u8, at: usize) u64 {
+    ret bytes[at]::u64 | (bytes[at + 1]::u64 << 8) | (bytes[at + 2]::u64 << 16) | (bytes[at + 3]::u64 << 24)
+        | (bytes[at + 4]::u64 << 32) | (bytes[at + 5]::u64 << 40) | (bytes[at + 6]::u64 << 48) | (bytes[at + 7]::u64 << 56);
+}
+
+fun checksum_mix(h: u64, word: u64) u64 {
+    val mixed: u64 = (h ^ word) * CHECKSUM_PRIME;
+    ret mixed ^ (mixed >> 29);
+}
+
+# every step is a bijection of the running sum for a fixed word, so a change
+# confined to one 8-byte word (any single flipped bit) always changes the result
+pub fun checksum(bytes: *u8, len: usize) u64 {
+    var h:  u64   = checksum_mix(CHECKSUM_SEED, len::u64);
+    var at: usize = 0;
+    for (at + 8 <= len) {
+        h  = checksum_mix(h, checksum_word(bytes, at));
+        at = at + 8;
+    }
+    var tail:  u64   = 0;
+    var shift: usize = 0;
+    for (at < len) {
+        tail  = tail | (bytes[at]::u64 << shift);
+        shift = shift + 8;
+        at    = at + 1;
+    }
+    ret checksum_mix(h, tail);
+}
+
 fun metadata(name: str) bool {
     if (str_equals(name, ".") || str_equals(name, "..")) { ret true; }
     ret str_equals(name, INDEX_LEAF) || str_equals(name, INDEX_NEXT_LEAF);
@@ -255,7 +348,7 @@ fun read_entry(a: *Access, key: *[32]u8, result: *Lookup) {
         if (header[4 + i] != (@key)[i]) { ret; }
         i = i + 1;
     }
-    val len: u64 = get(?header[0], 68, 8);
+    val len: u64 = get(?header[0], 44, 8);
     if (len > image.MAX_ENTRY_BYTES::u64 || len + HEADER_BYTES::u64 != info.st_size::u64) { ret; }
     if (len != 0) {
         val bytes: res[*u8, A.Error] = A.allocate[u8](a.alloc, len::usize);
@@ -273,14 +366,8 @@ fun read_entry(a: *Access, key: *[32]u8, result: *Lookup) {
         native_error(a, tail, OP_OPEN);
         ret;
     }
-    if (tail != 0) { ret; }
-    var digest: [32]u8;
-    sha256.hash(result.bytes.data, len::usize, ?digest[0]);
-    i = 0;
-    for (i < 32) {
-        if (digest[i] != header[36 + i]) { ret; }
-        i = i + 1;
-    }
+    if (tail != 0)                                                         { ret; }
+    if (checksum(result.bytes.data, len::usize) != get(?header[0], 36, 8)) { ret; }
     result.bytes.len   = len::usize;
     result.status.kind = HIT;
 }
@@ -368,6 +455,10 @@ fun inventory(a: *Access, entries: *vector.Vector[Entry], replacing: str) u64 {
         if (got == 0) { brk; }
         val name: str = entry.name;
         if (metadata(name)) { cnt; }
+        if (temp_name(name)) {
+            pass_temp(a, name);
+            cnt;
+        }
         if (!entry_name(name)) {
             record(a, fault(CONTAINMENT, OP_RECOVER), "cache directory contains an unrelated entry");
             brk;
@@ -737,6 +828,10 @@ fun count_entries(a: *Access) usize {
         if (got == 0) { brk; }
         val name: str = entry.name;
         if (metadata(name)) { cnt; }
+        if (temp_name(name)) {
+            pass_temp(a, name);
+            cnt;
+        }
         if (!entry_name(name)) {
             record(a, fault(CONTAINMENT, OP_RECOVER), "cache directory contains an unrelated entry");
             brk;
@@ -746,6 +841,33 @@ fun count_entries(a: *Access) usize {
     val closed: i64 = os.directory_close(?cursor);
     if (closed < 0 && !a.failed) { native_error(a, closed, OP_RECOVER); }
     ret count;
+}
+
+# the directory's temporaries, a stale one removed. a sealed journal skips
+# every listing, so a crashed publication's leftover is collected here, when
+# the journal is compacted
+fun sweep_temps(a: *Access) {
+    val dirfd: usize = a.dirfd;
+    native_error(a, os.seek(dirfd, 0, os.SEEK_SET), OP_RECOVER);
+    if (a.failed) { ret; }
+    var cursor: os.DirectoryCursor     = os.DirectoryCursor{};
+    val opened: os.DirectoryInitResult = os.directory_init(?cursor, dirfd);
+    if (opened.code < 0) {
+        native_error(a, opened.code, OP_RECOVER);
+        ret;
+    }
+    for (!a.failed) {
+        var entry: os.DirectoryEntry;
+        val got:   i64 = os.directory_next(?cursor, ?entry);
+        if (got < 0) {
+            native_error(a, got, OP_RECOVER);
+            brk;
+        }
+        if (got == 0)              { brk; }
+        if (temp_name(entry.name)) { pass_temp(a, entry.name); }
+    }
+    val closed: i64 = os.directory_close(?cursor);
+    if (closed < 0 && !a.failed) { native_error(a, closed, OP_RECOVER); }
 }
 
 # the journal checked against the directory's names (a listing, no stat).
@@ -799,6 +921,10 @@ fun reconcile(a: *Access, inv: *Inventory) {
         if (got == 0) { brk; }
         val name: str = entry.name;
         if (metadata(name)) { cnt; }
+        if (temp_name(name)) {
+            pass_temp(a, name);
+            cnt;
+        }
         if (!entry_name(name)) {
             record(a, fault(CONTAINMENT, OP_RECOVER), "cache directory contains an unrelated entry");
             brk;
@@ -989,6 +1115,8 @@ fun make_room(a: *Access, incoming: usize, replacing: str, limit: u64, keys: *[3
         ret;
     }
     if (inv.records + evicted > 2 * (inv.entries.len - evicted) + INDEX_SLACK) {
+        sweep_temps(a);
+        if (a.failed) { ret; }
         var compacted: Inventory;
         load_inventory(a, ?compacted);
         fin { inventory_dnit(?compacted); }
@@ -996,18 +1124,27 @@ fun make_room(a: *Access, incoming: usize, replacing: str, limit: u64, keys: *[3
     }
 }
 
+# the whole entry into this process's temporary, then renamed over the entry:
+# the entry is the old one or the new one, never part of either
 fun write_entry(a: *Access, name: *u8, bytes: *u8, size: usize) {
+    var temp: [96]u8;
+    temp_leaf(name, ?temp);
     var flags: i32 = os.O_CREAT | os.O_TRUNC | os.O_WRONLY;
     $if ($mach.build.os == $mach.os.linux)  { flags = flags | native.O_NOFOLLOW; }
     $or ($mach.build.os == $mach.os.darwin) { flags = flags | native.O_NOFOLLOW; }
     var fd:     usize = os.INVALID_HANDLE;
-    val opened: i64   = os.open(a.dirfd, name, flags, 0o600, ?fd);
+    val opened: i64   = os.open(a.dirfd, ?temp[0], flags, 0o600, ?fd);
     if (opened < 0) {
         native_error(a, opened, OP_PREPARE);
         ret;
     }
     write_all(a, fd, bytes, size);
     native_error(a, os.close(fd), OP_PREPARE);
+    if (!a.failed) { native_error(a, os.rename(a.dirfd, ?temp[0], a.dirfd, name), OP_PREPARE); }
+    if (a.failed) {
+        val removed: i64 = os.unlink(a.dirfd, ?temp[0], 0);
+        if (removed < 0 && os.error_kind(removed) != io_error.NOT_FOUND) { native_error(a, removed, OP_REMOVE); }
+    }
 }
 
 # publication may report unavailable after replacement or partial eviction
@@ -1029,8 +1166,8 @@ pub fun publish(alloc: *A.Allocator, directory: str, key: *[32]u8, payload: *u8,
         bytes[4 + i] = (@key)[i];
         i            = i + 1;
     }
-    sha256.hash(payload, len, ?bytes[36]);
-    put(bytes, 68, len::u64, 8);
+    put(bytes, 36, checksum(payload, len), 8);
+    put(bytes, 44, len::u64, 8);
     i = 0;
     for (i < len) {
         bytes[HEADER_BYTES + i] = payload[i];
@@ -1068,8 +1205,10 @@ pub fun publish(alloc: *A.Allocator, directory: str, key: *[32]u8, payload: *u8,
 use std.allocator.page;
 use fs: std.filesystem;
 use std.print;
+use std.process.exec;
 use std.text.string.str_free;
 use std.types.path;
+use std.types.string;
 
 fun t_status(result: res[Status, Error], kind: u8) bool {
     if (sel result.err) {
@@ -1177,6 +1316,211 @@ test "mach.lang.build.cache.store:replace_digest_key_length_and_lock_contract" {
         if (outside_bytes.data[j] != bytes.data[j]) { ret 26; }
         j = j + 1;
     }
+    ret 0;
+}
+
+# a fresh store directory, or nil
+fun t_store(alloc: *A.Allocator) str {
+    val temporary: res[fs.TempFile, fs.FsError] = fs.temp_create(alloc, "mach-cache-store");
+    if (sel temporary.err) { ret nil; }
+    var temp:    fs.TempFile         = temporary.ok;
+    val removed: err[io_error.Error] = fs.temp_close_and_remove(?temp);
+    if (sel removed.err)                                     { ret nil; }
+    if (os.make_dir(os.working_dir(), temp.path, 0o700) < 0) { ret nil; }
+    ret temp.path;
+}
+
+# the path of `leaf` inside the store, or nil
+fun t_path(alloc: *A.Allocator, directory: str, leaf: *u8) str {
+    val joined: res[path.Path, A.Error] = path.join(alloc, directory, leaf::str);
+    if (sel joined.err) { ret nil; }
+    ret joined.ok;
+}
+
+fun t_present(directory: str, leaf: *u8) bool {
+    var dir:    usize = os.INVALID_HANDLE;
+    val opened: i64   = os.open(os.working_dir(), directory, os.O_RDONLY | os.O_DIRECTORY, 0, ?dir);
+    if (opened < 0) { ret false; }
+    var info:     os.stat_t;
+    val observed: i64 = os.stat_path(dir, leaf, ?info, os.AT_SYMLINK_NOFOLLOW);
+    os.close(dir);
+    ret observed >= 0;
+}
+
+# the publication's own bytes for `text` under `key`, written as a temporary
+# that was never renamed, cut to `keep` bytes
+fun t_orphan_temp(alloc: *A.Allocator, directory: str, key: *[32]u8, text: str, keep: usize, temp: *[96]u8) bool {
+    var name: [65]u8;
+    leaf(key, ?name);
+    temp_leaf(?name[0], temp);
+    val len:   usize = str_len(text);
+    var bytes: [128]u8;
+    put(?bytes[0], 0, MAGIC::u64, 4);
+    var i: usize = 0;
+    for (i < 32) {
+        bytes[4 + i] = (@key)[i];
+        i            = i + 1;
+    }
+    put(?bytes[0], 36, checksum(text, len), 8);
+    put(?bytes[0], 44, len::u64, 8);
+    i = 0;
+    for (i < len) {
+        bytes[HEADER_BYTES + i] = text[i];
+        i                       = i + 1;
+    }
+    val full: str = t_path(alloc, directory, ?(@temp)[0]);
+    if (full == nil) { ret false; }
+    fin { str_free(alloc, full); }
+    val written: err[fs.FsError] = fs.write_bytes(full, ?bytes[0], keep, 0o600);
+    ret sel written.ok;
+}
+
+# a publication interrupted before its rename leaves only its temporary: the
+# entry reads as it was, a publication's listing passes over the temporary,
+# and the compaction sweep removes a stale one (#3520)
+test "mach.lang.build.cache.store:an_interrupted_publication_never_reads_as_an_entry" {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val directory: str = t_store(?alloc);
+    if (directory == nil) { ret 2; }
+    fin {
+        fs.remove_all(?alloc, directory);
+        str_free(?alloc, directory);
+    }
+    var kept:  [32]u8;
+    var fresh: [32]u8;
+    var later: [32]u8;
+    t_key("kept", ?kept);
+    t_key("fresh", ?fresh);
+    t_key("later", ?later);
+    if (!t_status(publish(?alloc, directory, ?kept, "first", 5, nil, 0), STORED)) { ret 3; }
+    var torn: [96]u8;
+    if (!t_orphan_temp(?alloc, directory, ?kept, "second generation", HEADER_BYTES + 6, ?torn)) { ret 4; }
+    if (!t_read(?alloc, directory, ?kept, HIT, "first"))                                        { ret 5; }
+    var whole: [96]u8;
+    if (!t_orphan_temp(?alloc, directory, ?fresh, "complete", HEADER_BYTES + 8, ?whole)) { ret 6; }
+    if (!t_read(?alloc, directory, ?fresh, MISS, ""))                                    { ret 7; }
+    if (!t_status(publish(?alloc, directory, ?later, "later", 5, nil, 0), STORED))       { ret 8; }
+    if (!t_present(directory, ?torn[0]) || !t_present(directory, ?whole[0]))             { ret 9; }
+    if (t_inventory(?alloc, directory) != 2 * (HEADER_BYTES::u64 + 5))                   { ret 10; }
+    $if ($mach.build.os != $mach.os.windows) {
+        val full: str = t_path(?alloc, directory, ?torn[0]);
+        if (full == nil) { ret 11; }
+        fin { str_free(?alloc, full); }
+        val command: res[str, string.StrError] = string.str_join(?alloc, "touch -t 200001010000 ", full);
+        if (sel command.err) { ret 11; }
+        val aged: res[exec.ExitStatus, exec.Error] = exec.run_shell(command.ok, nil, nil);
+        if (sel aged.err)                                     { ret 12; }
+        if (!exec.exited(aged.ok) || exec.code(aged.ok) != 0) { ret 12; }
+        var access: Access = Access{};
+        begin(?access, ?alloc, directory);
+        if (!access.failed) { sweep_temps(?access); }
+        finish(?access);
+        if (access.failed)                                                      { ret 13; }
+        if (t_present(directory, ?torn[0]) || !t_present(directory, ?whole[0])) { ret 14; }
+    }
+    if (!t_read(?alloc, directory, ?kept, HIT, "first")) { ret 15; }
+    ret 0;
+}
+
+# a replacement is a new file renamed over the old one: a reader holding the
+# old entry keeps reading it whole, and the publication leaves no temporary
+test "mach.lang.build.cache.store:a_replacement_never_rewrites_the_entry_in_place" {
+    # windows refuses to rename over a file another handle holds open
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val directory: str = t_store(?alloc);
+    if (directory == nil) { ret 2; }
+    fin {
+        fs.remove_all(?alloc, directory);
+        str_free(?alloc, directory);
+    }
+    var key: [32]u8;
+    t_key("replaced", ?key);
+    if (!t_status(publish(?alloc, directory, ?key, "first", 5, nil, 0), STORED)) { ret 3; }
+    var name: [65]u8;
+    leaf(?key, ?name);
+    var dir:        usize = os.INVALID_HANDLE;
+    val dir_opened: i64   = os.open(os.working_dir(), directory, os.O_RDONLY | os.O_DIRECTORY, 0, ?dir);
+    if (dir_opened < 0) { ret 4; }
+    fin { os.close(dir); }
+    var held:        usize = os.INVALID_HANDLE;
+    val held_opened: i64   = os.open(dir, ?name[0], os.O_RDONLY, 0, ?held);
+    if (held_opened < 0) { ret 5; }
+    fin { os.close(held); }
+    if (!t_status(publish(?alloc, directory, ?key, "second, longer", 14, nil, 0), STORED)) { ret 6; }
+    if (!t_read(?alloc, directory, ?key, HIT, "second, longer"))                           { ret 7; }
+    var old: [64]u8;
+    val got: i64 = os.read(held, ?old[0], 64);
+    if (got != (HEADER_BYTES + 5)::i64)                           { ret 8; }
+    if (old[HEADER_BYTES] != 'f' || old[HEADER_BYTES + 4] != 't') { ret 9; }
+    var temp: [96]u8;
+    temp_leaf(?name[0], ?temp);
+    if (t_present(directory, ?temp[0])) { ret 10; }
+    ret 0;
+}
+
+# any damage to a written entry reads as a miss, and any one flipped bit moves the checksum (#3520)
+test "mach.lang.build.cache.store:a_corrupted_entry_reads_as_a_miss" {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val directory: str = t_store(?alloc);
+    if (directory == nil) { ret 2; }
+    fin {
+        fs.remove_all(?alloc, directory);
+        str_free(?alloc, directory);
+    }
+    var key: [32]u8;
+    t_key("flip", ?key);
+    val text: str   = "a payload longer than one checksum word";
+    val len:  usize = str_len(text);
+    if (!t_status(publish(?alloc, directory, ?key, text, len, nil, 0), STORED)) { ret 3; }
+    var name: [65]u8;
+    leaf(?key, ?name);
+    val full: str = t_path(?alloc, directory, ?name[0]);
+    if (full == nil) { ret 4; }
+    fin { str_free(?alloc, full); }
+    val read_r: res[vector.Vector[u8], fs.FsError] = fs.read_bytes(?alloc, full);
+    if (sel read_r.err) { ret 5; }
+    var bytes: vector.Vector[u8] = read_r.ok;
+    fin { vector.dnit[u8](?bytes); }
+    # the checksum, the length, and payload bytes at a word's start, middle and tail
+    var at: [6]usize = [6]usize{36, 43, 44, HEADER_BYTES, HEADER_BYTES + 12, bytes.len - 1};
+    var k:  usize    = 0;
+    for (k < 6) {
+        bytes.data[at[k]] = bytes.data[at[k]] ^ 4;
+        val damaged: err[fs.FsError] = fs.write_bytes(full, bytes.data, bytes.len, 0o600);
+        if (sel damaged.err)                            { ret 6; }
+        if (!t_read(?alloc, directory, ?key, MISS, "")) { ret 7; }
+        bytes.data[at[k]] = bytes.data[at[k]] ^ 4;
+        k                 = k + 1;
+    }
+    val restored: err[fs.FsError] = fs.write_bytes(full, bytes.data, bytes.len, 0o600);
+    if (sel restored.err)                            { ret 8; }
+    if (!t_read(?alloc, directory, ?key, HIT, text)) { ret 9; }
+    var probe: [37]u8;
+    var p:     usize = 0;
+    for (p < 37) {
+        probe[p] = (p * 7)::u8;
+        p        = p + 1;
+    }
+    val base: u64 = checksum(?probe[0], 37);
+    p = 0;
+    for (p < 37) {
+        var bit: usize = 0;
+        for (bit < 8) {
+            probe[p] = probe[p] ^ (1::u8 << bit::u8);
+            if (checksum(?probe[0], 37) == base) { ret 10; }
+            probe[p] = probe[p] ^ (1::u8 << bit::u8);
+            bit      = bit + 1;
+        }
+        p = p + 1;
+    }
+    if (checksum(?probe[0], 36) == checksum(?probe[0], 37)) { ret 11; }
     ret 0;
 }
 
