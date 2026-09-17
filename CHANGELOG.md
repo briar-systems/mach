@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Inline `asm` takes vector registers. On x86-64, `xmm0` to `xmm15` work with the SSE2 packed moves (`movdqa`, `movdqu`, `movaps`, `movups`), the packed integer and float arithmetic, compares and conversions, and `pshufd`, `cmpps` and `cmppd`. A memory operand is written bare or as `xmmword [...]`, and `[symbol]` relocates correctly past a trailing immediate. On aarch64, `vN.16b`, `vN.8h`, `vN.4s` and `vN.2d` work with the AdvSIMD three-register members (`add`, `sub`, `mul`, `and`, `orr`, `eor`, the integer and float compares, `fadd` and its kin), with `mov` and `mvn`, and with `ld1`/`st1` of one register, post-indexed by 16 or by an X register. A write to a vector register lands in the block's vector clobber set, so the allocator and the call conventions see it. The constant-time check tracks secrets per register bank, which also stops a secret in `xmm3` from reading as a secret in `rbx`. A vector register in a general-purpose form, or as a memory base, is refused by name. Only an identifier inside braces names an asm local now, so `{v0.16b}` reaches the aarch64 grammar. `doc/language/asm.md` lists the forms (#3521).
+
 ## [5.3.0] - 2026-09-17
 
 ### Added

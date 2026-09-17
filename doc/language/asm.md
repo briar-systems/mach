@@ -31,6 +31,10 @@ typically a stack slot — so a pointer local's pointee is reached by staging
 the pointer through a scratch register first (`mov rcx, {ptr}` then
 `mov rax, [rcx]`), never by a direct `[{ptr}]` indirection.
 
+Only an identifier inside braces names a local. Any other braced text belongs to
+the ISA's own syntax, such as aarch64's `{v0.16b}` register list, and reaches its
+grammar untouched.
+
 ```mach
 pub fun add_via_asm(a: i64, b: i64) i64 {
     var result: i64 = 0;
@@ -134,6 +138,53 @@ So `mov eax, word [rcx]` is refused (two widths for one access), and
 `movzx eax, [rcx]` is refused too — an unsized source names no width at all, and
 reading it as a same-width move would silently assemble a plain `mov` where a
 zero-extending load was written.
+
+## Vector registers
+
+Both grammars take vector registers as operands. A vector register belongs to the
+floating-point and vector bank, so writing one adds it to the block's vector
+clobber set, and a live vector value crossing the block is kept the same way a
+general-purpose one is. A memory base or index is always a general-purpose
+register, and a vector register in a general-purpose form is refused by name.
+
+**x86-64** spells them `xmm0` to `xmm15`. A memory operand of a vector
+instruction is a whole 128-bit vector, written bare or as `xmmword [...]`, and a
+narrower width prefix is refused. `[symbol]` addresses RIP-relative data, and the
+relocation is correct after a trailing immediate.
+
+| form | mnemonics |
+|---|---|
+| move, in either direction between a register and memory | `movdqa`, `movdqu`, `movaps`, `movups` |
+| `xmm, xmm/m128` | `paddb` `paddw` `paddd` `paddq`, `psubb` `psubw` `psubd` `psubq` `psubusb` `psubusw`, `pmullw`, `pand` `por` `pxor`, `pcmpeqb` `pcmpeqw` `pcmpeqd` `pcmpgtb` `pcmpgtw` `pcmpgtd`, `punpcklbw` `punpcklwd` `punpckldq`, `packsswb` `packssdw`, `addps` `subps` `mulps` `divps` `addpd` `subpd` `mulpd` `divpd`, `cvtdq2ps` `cvttps2dq` `cvtdq2pd` `cvttpd2dq` `cvtps2pd` `cvtpd2ps` |
+| `xmm, xmm/m128, imm8` | `pshufd`, `cmpps`, `cmppd` |
+
+**aarch64** spells them `vN.16b`, `vN.8h`, `vN.4s` or `vN.2d`. The suffix is the
+lane arrangement, and every operand of one instruction shares it. `add`, `sub`,
+`and`, `orr`, `eor` and `mov` select their vector form when their operands are
+vector registers. `and`, `orr`, `eor`, `mov` and `mvn` exist only at `.16b`, the
+float members only at `.4s` and `.2d`, and `mul` everywhere except `.2d`.
+
+| form | mnemonics |
+|---|---|
+| three registers | `add` `sub` `mul`, `and` `orr` `eor`, `cmeq` `cmgt` `cmge` `cmhi` `cmhs`, `fadd` `fsub` `fmul` `fdiv`, `fcmeq` `fcmgt` `fcmge` |
+| two registers | `mov`, `mvn` |
+| one element structure | `ld1 {vT.<lanes>}, [Xn]`, `st1 {vT.<lanes>}, [Xn]` |
+
+`ld1` and `st1` post-index their base by the structure size, `, 16`, or by an X
+register, `, x9`. Either form writes the base register:
+
+```mach
+asm aarch64 {
+    ld1 {v0.16b}, [x1], 16      # load 16 bytes, then x1 += 16
+    ld1 {v1.16b}, [x1], 16
+    eor v0.16b, v0.16b, v1.16b
+    st1 {v0.16b}, [x2], x9      # store, then x2 += x9
+}
+```
+
+The multiply and float members are variable-latency operations, so the
+constant-time check treats them as it treats their scalar counterparts. It
+tracks secrets in vector registers separately from general-purpose ones.
 
 ## Privileged and systems instructions (x86-64)
 
