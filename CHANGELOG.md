@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.3.0] - 2026-09-17
+
 ### Added
 - `mach dep verify` prints a note for each dependency edge whose selector a root declaration replaced, naming the identity, the requiring chain, the requirer's selector and the root's: `note: dependency 'b': the root declares ref = "tag/v2.0.0", overriding root -> a -> b which requires version = "~1.0"; nothing checks that 'b' supports the root's selection`. A root `ref` or `path` replaces every requirer's selector for that identity, and nothing checks that the requirer works with the root's choice, so a passing build is evidence, not proof. The note reports this without refusing, since overriding is a supported feature. A root `version` narrows the requirers' ranges rather than replacing them and is not reported. `doc/language/manifest.md` states the hazard (#3548).
 - `mach dep add`, `update` and `outdated` print `resolving from releases already fetched (--offline)` when run with `--offline`. `add` and `update` also print one line for each requirement a root `ref` or `path` overrides, such as `root declares vb by ref "branch/main", overriding root -> va 1.0.0 requires vb ~1.0`. Before, both happened silently. `--quiet` hides these lines for `add` and `update` (#3529).
