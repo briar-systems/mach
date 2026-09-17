@@ -6,7 +6,8 @@ constants. The tags `$mach.{os,arch,abi,mode}.*` exist for path-value
 comparison against the resolved-build facts.
 
 > **Live and reserved paths.** The resolved-build facts (`$mach.build.{os,arch,
-> abi,pointer_width,mode,pie,platform}`), the tag tables (`$mach.{os,arch,abi,mode}.*`),
+> abi,pointer_width,mode,pie,platform}` and the `$mach.build.ct_mul(op, width)`
+> query), the tag tables (`$mach.{os,arch,abi,mode}.*`),
 > the compiler version (`$mach.version` and `$mach.version.{major,minor,patch}`),
 > and `$mach.compiler.{name,version}` are live. The `$mach.build.{timestamp,
 > host}`, `$mach.build.git.*`, `$mach.project.*`, and `$mach.source.*` paths are
@@ -30,6 +31,7 @@ $mach.build.pointer_width       # live; integer count of bytes
 $mach.build.mode                # live; compared against $mach.mode.* tags
 $mach.build.pie                 # live; 1 when building position-independent, else 0
 $mach.build.platform            # live; the target's open platform tag as a string, "" when unset
+$mach.build.ct_mul(op, width)   # live; 1 when a secret multiply of that cell is admitted, else 0
 $mach.build.timestamp           # stub — not yet available
 $mach.build.host                # stub — not yet available
 $mach.build.git.commit          # stub — not yet available
@@ -44,6 +46,37 @@ ordinary `val`s selected with `$if` over the facts above.
 ```mach
 val TRACING: u64 = $mach.build.TRACING;
 ```
+
+#### `$mach.build.ct_mul(op, width)` — the constant-time multiply catalog
+
+The one call-shaped fact. It folds to 1 exactly when the selected target admits
+a secret-operand multiply of that cell, and to 0 otherwise. The answer comes from
+the same decision the lowering gate and the `#[oblivious]` validators make, so a
+library can choose its hardware or bit-serial path without keeping a per-target
+list:
+
+```mach
+$if ($mach.build.ct_mul(wide_u, 64) == 1) {
+    # one widening multiply per limb product
+} $or {
+    # the bit-serial product
+}
+```
+
+- `op` is a bare word, one of:
+  - `low`: the low half of a same-width product;
+  - `high_u`, `high_s`, `high_su`: the high half, with unsigned, signed or mixed operands;
+  - `wide_u`, `wide_s`: the full double-width product.
+- `width` is the operand width in bits, a comptime integer: 8, 16, 32 or 64.
+- A cell is admitted when the target declares it and the row's condition holds:
+  - an always-safe instruction;
+  - the extension it names, selected for the target;
+  - a data-independent-timing mode the target guarantees.
+- No target declares a cell yet, so the query folds to 0 everywhere. Lane
+  multiplies are not part of the query.
+- The result is a `u8`, like `$mach.build.pie`. An unknown `op` or `width`, a
+  missing argument, or arguments on any other path is a compile error that names
+  what is accepted.
 
 ### `$mach.version` — the compiler version
 

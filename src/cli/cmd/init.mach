@@ -29,6 +29,7 @@ use std.collections.vector;
 use std.collections.vector.Vector;
 
 use mach.cli.args;
+use cdep:     mach.cli.cmd.dep;
 use cli_diag: mach.cli.diagnostic;
 use mach.cli.util;
 use mach.lang.build.outcome;
@@ -52,6 +53,7 @@ use tos: mach.lang.target.os;
 use mach.lang.target.resolved;
 use std.data.toml;
 use std.filesystem.native;
+use std.process.exec;
 use std.system.os;
 
 val DIR_MODE:  i32 = 493;
@@ -69,13 +71,20 @@ rec Buf {
 # identifier. an absent directory is created whole; an existing one is filled in, and
 # `--force` allows overwriting mach.toml and the entry file. `--lib` writes src/lib.mach
 # and a static artifact instead of src/root.mach and binary artifacts. the std dependency
-# is then realized as a git submodule unless `--no-deps`; `--quiet` silences progress
+# is then added at the caret range of the release resolution picks and checked out, unless
+# `--no-deps`, which still resolves the range (so needs the network) but skips the checkout.
+# `--quiet` silences progress
 # ---
 # argv: the full process arguments
 # inv:  the parsed invocation for this command
 # ret:  0 success, 1 an invalid id, a refused overwrite, or a failed publish, 2 allocator or
 #       filesystem failure, 3 the std dependency could not be realized
 pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64 {
+    ret run_with(argv, inv, ?SCAFFOLD_DEPS[0], SCAFFOLD_DEP_COUNT);
+}
+
+# `run` over an explicit scaffold dependency set
+fun run_with(argv: **u8, inv: *args.ParsedInvocation, deps: *ScaffoldDep, dep_count: usize) i64 {
     if (args.reject_unknown_from_invocation(inv, argv, "mach init")) { ret 1; }
     val parsed:  args.InitInvocation = args.build_init_invocation(inv, argv);
     val force:   bool                = parsed.force;
@@ -151,7 +160,7 @@ pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64 {
     val dest: str = dest_r.ok;
     val code: i64 = scaffold(?a, dest, id, is_lib, entry_leaf, entry_label, force, quiet);
     if (code == 0) {
-        val dep_code: i64 = dependency_stage(?a, dest, no_deps, no_git, quiet);
+        val dep_code: i64 = dependency_stage(?a, dest, no_deps, no_git, quiet, deps, dep_count);
         arena.dnit(?ar);
         ret dep_code;
     }
@@ -166,21 +175,22 @@ fun t_init(argc: usize, argv: **u8) i64 {
     val ir: res[args.ParsedInvocation, outcome.Fail] = args.parse_invocation(?a, argc, argv);
     if (sel ir.err) { ret 2; }
     var inv: args.ParsedInvocation = ir.ok;
-    ret run(argv, ?inv);
+    ret run_with(argv, ?inv, nil, 0);
 }
 
+# a dependency every scaffold declares; it is added like `mach dep add <path> <id> --git <git>`,
+# at the caret range of the release resolution picks for the running compiler (#3496 section 6)
 rec ScaffoldDep {
     id:  str;
     git: str;
-    ref: str;
 }
 
 val SCAFFOLD_DEP_COUNT: usize          = 1;
 val SCAFFOLD_DEPS:      [1]ScaffoldDep = [1]ScaffoldDep{
-    ScaffoldDep{id: "std", git: "https://github.com/briar-systems/mach-std", ref: "branch/main"}
+    ScaffoldDep{id: "std", git: "https://github.com/briar-systems/mach-std"}
 };
 
-fun dependency_stage(a: *A.Allocator, root: str, no_deps: bool, no_git: bool, quiet: bool) i64 {
+fun dependency_stage(a: *A.Allocator, root: str, no_deps: bool, no_git: bool, quiet: bool, deps: *ScaffoldDep, dep_count: usize) i64 {
     val sr: res[session.Session, fail.Fail] = session.init(a);
     if (sel sr.err) {
         val fail: outcome.Fail = outcome.internal("failed to initialize project setup");
@@ -188,7 +198,6 @@ fun dependency_stage(a: *A.Allocator, root: str, no_deps: bool, no_git: bool, qu
     }
     var s: session.Session = sr.ok;
     fin { session.dnit(?s); }
-    var mode: u8 = ddep.REALIZE_NESTED;
     if (!no_git) {
         val initialized: err[outcome.Fail] = ddep.initialize_repository(?s, root);
         if (sel initialized.err) {
@@ -200,32 +209,29 @@ fun dependency_stage(a: *A.Allocator, root: str, no_deps: bool, no_git: bool, qu
             val fail: outcome.Fail = selected.err;
             ret cli_diag.render_fail(?fail);
         }
-        mode = selected.ok;
-    }
-    if (no_deps) {
-        if (!quiet) {
-            print.eprint("dependencies declared but not realized; run `mach dep pull <path>` for project '");
-            print.eprint(root);
-            print.eprint("'\n");
-        }
-        ret 0;
     }
     var i: usize = 0;
-    for (i < SCAFFOLD_DEP_COUNT) {
-        val dep:      ScaffoldDep           = SCAFFOLD_DEPS[i];
-        val realized: res[u8, outcome.Fail] = ddep.realize_git_dependency(?s, root, dep.id, dep.git, dep.ref, mode, false);
-        if (sel realized.err) {
-            val msg_r: res[str, format.FormatError] = format.sprint(a,
-                "dependency '{}' could not be realized: {}", dep.id, outcome.describe(realized.err));
-            if (sel msg_r.err) {
-                val fail: outcome.Fail = outcome.environment("a declared dependency could not be realized");
-                ret cli_diag.render_fail(?fail);
+    for (i < dep_count) {
+        val dep: ScaffoldDep = deps[i];
+        i = i + 1;
+        if (cdep.add_release(root, dep.id, dep.git, quiet, !no_deps) != 0) {
+            var msg_r: res[str, format.FormatError];
+            if (no_deps) {
+                msg_r = format.sprint(a,
+                    "dependency '{}' has no resolved release; --no-deps skips only the checkout, resolving its range still needs the network. run `mach dep add <path> {} --git {}` for project '{}' once connected",
+                    dep.id, dep.id, dep.git, root);
             }
-            val fail: outcome.Fail = outcome.environment(msg_r.ok);
+            or {
+                msg_r = format.sprint(a,
+                    "dependency '{}' could not be added; run `mach dep add <path> {} --git {}` for project '{}' once the problem above is fixed", dep.id, dep.id, dep.git, root);
+            }
+            var fail: outcome.Fail = outcome.environment("a declared dependency could not be added");
+            if (sel msg_r.ok) { fail = outcome.environment(msg_r.ok); }
             ret cli_diag.render_fail(?fail);
         }
-        if (!quiet) { print.eprintlnf("realized dependency '{}'", dep.id); }
-        i = i + 1;
+        if (quiet)   { cnt; }
+        if (no_deps) { print.eprintlnf("declared dependency '{}' without a checkout; run `mach dep pull {}` to realize it", dep.id, root); }
+        or           { print.eprintlnf("realized dependency '{}'", dep.id); }
     }
     ret 0;
 }
@@ -365,6 +371,12 @@ fun build_manifest_text(alloc: *A.Allocator, id: *u8, is_lib: bool, arch_id: u32
     buf_put(?buf, id);
     buf_put(?buf, "\"\n");
     buf_put(?buf, "version = \"0.1.0\"\n");
+    val caret: res[str, format.FormatError] = ddep.compiler_caret(alloc);
+    if (sel caret.err) { ret res[str, outcome.Fail].err{outcome.user(outcome.format_text(caret.err))}; }
+    buf_put(?buf, "mach = \"");
+    buf_put(?buf, caret.ok::*u8);
+    buf_put(?buf, "\"\n");
+    str_free(alloc, caret.ok);
     buf_put(?buf, "src = \"src\"\n");
     buf_put(?buf, "out = \"out/{target.name}/{profile.name}\"\n");
     buf_put(?buf, "\n");
@@ -394,21 +406,6 @@ fun build_manifest_text(alloc: *A.Allocator, id: *u8, is_lib: bool, arch_id: u32
     buf_put(?buf, "vectorize = true\n");
     buf_put(?buf, "float_reassoc = false\n");
     buf_put(?buf, "\n");
-
-    var di: usize = 0;
-    for (di < SCAFFOLD_DEP_COUNT) {
-        val dep: ScaffoldDep = SCAFFOLD_DEPS[di];
-        buf_put(?buf, "[dep.");
-        buf_put(?buf, dep.id::*u8);
-        buf_put(?buf, "]\n");
-        buf_put(?buf, "git = \"");
-        buf_put(?buf, dep.git::*u8);
-        buf_put(?buf, "\"\n");
-        buf_put(?buf, "ref = \"");
-        buf_put(?buf, dep.ref::*u8);
-        buf_put(?buf, "\"\n");
-        di = di + 1;
-    }
 
     if (!buf.ok) { ret res[str, outcome.Fail].err{outcome.user("mach.toml scaffold exceeds the scratch buffer")}; }
     val str_copy_slice_r: res[str, string.StrError] = str_copy_slice(alloc, buf.ptr::str, 0, buf.len);
@@ -690,32 +687,185 @@ test "mach.cli.cmd.init.source_template:lib_is_empty_bin_declares_std_runtime" {
     ret 0;
 }
 
-test "mach.cli.cmd.init.build_manifest_text:declares_dep_std" {
+test "mach.cli.cmd.init.build_manifest_text:states_the_compiler_range_and_leaves_dependencies_to_dep_add" {
     var alloc:  A.Allocator;
     val make_r: err[A.Error] = page.make(?alloc);
     if (sel make_r.err) { ret 1; }
-
     val text_r: res[str, outcome.Fail] = build_manifest_text(?alloc, "scaftest", false, isa.ARCH_X86_64);
-    if (sel text_r.err) { ret 1; }
+    if (sel text_r.err) { ret 2; }
     val text: str = text_r.ok;
-    if (!str_contains(text, "[dep.std]")) { ret 1; }
-
+    if (str_contains(text, "[dep.")) { ret 3; }
     var itn:   intern.Interner        = intern.init(?alloc);
     val opt_m: opt[manifest.Manifest] = t_manifest_from_text(?alloc, ?itn, text);
-    if (sel opt_m.none) { ret 1; }
-    val m: manifest.Manifest = opt_m.some;
-
-    if (m.dep_count != 1) { ret 1; }
-    val name_opt: opt[str] = intern.lookup(?itn, m.deps[0].name);
-    if (sel name_opt.none)                 { ret 1; }
-    if (!str_equals(name_opt.some, "std")) { ret 1; }
-    val git_opt: opt[str] = intern.lookup(?itn, m.deps[0].git);
-    if (sel git_opt.none)                                                       { ret 1; }
-    if (!str_equals(git_opt.some, "https://github.com/briar-systems/mach-std")) { ret 1; }
-    val ref_opt: opt[str] = intern.lookup(?itn, m.deps[0].ref);
-    if (sel ref_opt.none)                         { ret 1; }
-    if (!str_equals(ref_opt.some, "branch/main")) { ret 1; }
+    if (sel opt_m.none) { ret 4; }
+    val m:      manifest.Manifest = opt_m.some;
+    val mach_r: opt[str]          = intern.lookup(?itn, m.mach);
+    if (sel mach_r.none) { ret 5; }
+    val caret: res[str, format.FormatError] = ddep.compiler_caret(?alloc);
+    if (sel caret.err)                      { ret 6; }
+    if (!str_equals(mach_r.some, caret.ok)) { ret 7; }
+    if (m.dep_count != 0)                   { ret 8; }
     ret 0;
+}
+
+fun t_git_in(a: *A.Allocator, dir: str, c1: str, c2: str, c3: str) bool {
+    val gr: res[str, exec.Error] = exec.resolve(a, "git");
+    if (sel gr.err) { ret false; }
+    var av: [7]*u8;
+    av[0] = gr.ok::*u8;
+    av[1] = "-C"::*u8;
+    av[2] = dir::*u8;
+    var k: usize = 3;
+    if (!str_empty(c1)) {
+        av[k] = c1::*u8;
+        k     = k + 1;
+    }
+    if (!str_empty(c2)) {
+        av[k] = c2::*u8;
+        k     = k + 1;
+    }
+    if (!str_empty(c3)) {
+        av[k] = c3::*u8;
+        k     = k + 1;
+    }
+    av[k] = nil;
+    val rr: res[exec.ExitStatus, exec.Error] = exec.run(gr.ok, ?av[0], nil);
+    if (sel rr.err) { ret false; }
+    ret exec.exited(rr.ok) && exec.code(rr.ok) == 0;
+}
+
+# one tagged release of a fixture std whose manifest needs `mach_range`
+fun t_std_release(a: *A.Allocator, dir: str, version: str, mach_range: str) bool {
+    val body: res[str, format.FormatError] = format.sprint(a,
+        "[project]\nid = \"std\"\nversion = \"{}\"\nmach = \"{}\"\nsrc = \"src\"\nout = \"out\"\n", version, mach_range);
+    if (sel body.err) { ret false; }
+    val file: str             = sfmt_join(a, dir, "mach.toml");
+    val wr:   err[fs.FsError] = fs.write_bytes(file, body.ok::*u8, str_len(body.ok), 0o644);
+    if (sel wr.err)                              { ret false; }
+    if (!t_git_in(a, dir, "add", "-A", ""))      { ret false; }
+    if (!t_git_in(a, dir, "commit", "-qm", "x")) { ret false; }
+    val tag: res[str, format.FormatError] = format.sprint(a, "v{}", version);
+    if (sel tag.err) { ret false; }
+    ret t_git_in(a, dir, "tag", tag.ok, "");
+}
+
+# init adds std at the caret of the highest release whose [project].mach admits the running
+# compiler, not a branch (#3504)
+test "mach.cli.cmd.init.run:std_is_added_at_the_release_the_running_compiler_resolves" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    var env: [4]*u8;
+    env[0] = "GIT_CONFIG_COUNT=1"::*u8;
+    env[1] = "GIT_CONFIG_KEY_0=protocol.file.allow"::*u8;
+    env[2] = "GIT_CONFIG_VALUE_0=always"::*u8;
+    env[3] = nil;
+    ddep.set_git_config_env(?env[0]);
+    fin { ddep.set_git_config_env(nil); }
+
+    val std_r: res[str, outcome.Fail] = t_scratch_dir(?a, "mach_init_fixture_std");
+    if (sel std_r.err) { ret 2; }
+    val std_dir: str = std_r.ok;
+    fin { fs.remove_all(?a, std_dir); }
+    val src_dir: str             = sfmt_join(?a, std_dir, "src");
+    val made:    err[fs.FsError] = fs.create_dir_all(?a, src_dir, 0o755);
+    if (sel made.err) { ret 3; }
+    val lib:  str             = sfmt_join(?a, std_dir, "src/lib.mach");
+    val body: str             = "pub fun hello() i32 { ret 1; }\n";
+    val lw:   err[fs.FsError] = fs.write_bytes(lib, body::*u8, str_len(body), 0o644);
+    if (sel lw.err)                                            { ret 3; }
+    if (!t_git_in(?a, std_dir, "init", "-q", ""))              { ret 4; }
+    if (!t_git_in(?a, std_dir, "config", "user.email", "t@t")) { ret 4; }
+    if (!t_git_in(?a, std_dir, "config", "user.name", "t"))    { ret 4; }
+    if (!t_std_release(?a, std_dir, "1.0.0", ">=5"))           { ret 5; }
+    if (!t_std_release(?a, std_dir, "1.1.0", ">=5"))           { ret 5; }
+    if (!t_std_release(?a, std_dir, "2.0.0", ">=99"))          { ret 5; }
+
+    val root_r: res[str, outcome.Fail] = t_scratch_dir(?a, "mach_init_std_range");
+    if (sel root_r.err) { ret 6; }
+    val root: str = root_r.ok;
+    fin { fs.remove_all(?a, root); }
+    var argv: [6]*u8 = [6]*u8{"mach", "init", root::*u8, "--name", "rangeinit", "--no-deps"};
+    if (t_init(6, ?argv[0]) != 0) { ret 7; }
+
+    var deps: [1]ScaffoldDep = [1]ScaffoldDep{ScaffoldDep{id: "std", git: std_dir}};
+    if (dependency_stage(?a, root, false, false, true, ?deps[0], 1) != 0) { ret 8; }
+    val text: opt[str] = t_read_file(?a, sfmt_join(?a, root, "mach.toml"));
+    if (sel text.none)                                    { ret 9; }
+    if (!str_contains(text.some, "[dep.std]"))            { ret 10; }
+    if (!str_contains(text.some, "version = \"^1.1.0\"")) { ret 11; }
+    if (str_contains(text.some, "branch/"))               { ret 12; }
+    val tagged: res[str, outcome.Fail] = t_release_of(?a, root);
+    if (sel tagged.err)                  { ret 13; }
+    if (!str_equals(tagged.ok, "1.1.0")) { ret 14; }
+    ret 0;
+}
+
+# --no-deps still resolves and writes the range but checks nothing out, and an unreachable
+# source is a failure rather than a silently unpinned declaration (#3504)
+test "mach.cli.cmd.init.run:no_deps_resolves_the_range_without_a_checkout" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    var env: [4]*u8;
+    env[0] = "GIT_CONFIG_COUNT=1"::*u8;
+    env[1] = "GIT_CONFIG_KEY_0=protocol.file.allow"::*u8;
+    env[2] = "GIT_CONFIG_VALUE_0=always"::*u8;
+    env[3] = nil;
+    ddep.set_git_config_env(?env[0]);
+    fin { ddep.set_git_config_env(nil); }
+
+    val std_r: res[str, outcome.Fail] = t_scratch_dir(?a, "mach_init_nodeps_std");
+    if (sel std_r.err) { ret 2; }
+    val std_dir: str = std_r.ok;
+    fin { fs.remove_all(?a, std_dir); }
+    val made: err[fs.FsError] = fs.create_dir_all(?a, sfmt_join(?a, std_dir, "src"), 0o755);
+    if (sel made.err) { ret 3; }
+    val body: str             = "pub fun hello() i32 { ret 1; }\n";
+    val lw:   err[fs.FsError] = fs.write_bytes(sfmt_join(?a, std_dir, "src/lib.mach"), body::*u8, str_len(body), 0o644);
+    if (sel lw.err)                                            { ret 3; }
+    if (!t_git_in(?a, std_dir, "init", "-q", ""))              { ret 4; }
+    if (!t_git_in(?a, std_dir, "config", "user.email", "t@t")) { ret 4; }
+    if (!t_git_in(?a, std_dir, "config", "user.name", "t"))    { ret 4; }
+    if (!t_std_release(?a, std_dir, "1.0.0", ">=5"))           { ret 5; }
+    if (!t_std_release(?a, std_dir, "2.0.0", ">=99"))          { ret 5; }
+
+    val root_r: res[str, outcome.Fail] = t_scratch_dir(?a, "mach_init_nodeps_root");
+    if (sel root_r.err) { ret 6; }
+    val root: str = root_r.ok;
+    fin { fs.remove_all(?a, root); }
+    var argv: [6]*u8 = [6]*u8{"mach", "init", root::*u8, "--name", "nodepsinit", "--no-deps"};
+    if (t_init(6, ?argv[0]) != 0) { ret 7; }
+
+    var deps: [1]ScaffoldDep = [1]ScaffoldDep{ScaffoldDep{id: "std", git: std_dir}};
+    if (dependency_stage(?a, root, true, false, true, ?deps[0], 1) != 0) { ret 8; }
+    val text: opt[str] = t_read_file(?a, sfmt_join(?a, root, "mach.toml"));
+    if (sel text.none)                                    { ret 9; }
+    if (!str_contains(text.some, "version = \"^1.0.0\"")) { ret 10; }
+    val checkout: res[bool, io_error.Error] = fs.exists(sfmt_join(?a, root, "dep/std"));
+    if (sel checkout.err) { ret 11; }
+    if (checkout.ok)      { ret 12; }
+
+    val bare_r: res[str, outcome.Fail] = t_scratch_dir(?a, "mach_init_nodeps_unreachable");
+    if (sel bare_r.err) { ret 13; }
+    val bare: str = bare_r.ok;
+    fin { fs.remove_all(?a, bare); }
+    argv[2] = bare::*u8;
+    if (t_init(6, ?argv[0]) != 0) { ret 14; }
+    var gone: [1]ScaffoldDep = [1]ScaffoldDep{ScaffoldDep{id: "std", git: sfmt_join(?a, std_dir, "absent")}};
+    if (dependency_stage(?a, bare, true, false, true, ?gone[0], 1) == 0) { ret 15; }
+    val kept: opt[str] = t_read_file(?a, sfmt_join(?a, bare, "mach.toml"));
+    if (sel kept.none)                        { ret 16; }
+    if (str_contains(kept.some, "[dep.std]")) { ret 17; }
+    ret 0;
+}
+
+fun t_release_of(a: *A.Allocator, root: str) res[str, outcome.Fail] {
+    val sr: res[session.Session, fail.Fail] = session.init(a);
+    if (sel sr.err) { ret res[str, outcome.Fail].err{outcome.internal("session")}; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+    ret ddep.release_at_head(?s, sfmt_join(a, root, "dep/std"));
 }
 
 fun t_source_parses(alloc: *A.Allocator, text: str) bool {

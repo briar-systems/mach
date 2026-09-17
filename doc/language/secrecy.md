@@ -83,8 +83,12 @@ than the source alone, so they are reported at lowering:
 
 - a secret operand of a **floating-point** operation (always variable-latency,
   gated on every target)
-- a secret operand of an **integer multiply** on a target without a trusted
-  data-independent-timing mode — conservatively every ISA today
+- a secret operand of an **integer multiply**, unless the target declares the
+  exact multiply it emits (the low half, a high half or the widening product,
+  at that operand width) as data-independent-timing under a condition the
+  build meets. No target declares one yet, so every ISA refuses it today, and
+  every lane multiply is refused. `$mach.build.ct_mul(op, width)` reads the
+  same decision at comptime (see `comptime-mach.md`)
 - a secret **variable shift count** on a target without a barrel shifter
 
 A secret value passed to a variadic pack is also rejected, including a secret
