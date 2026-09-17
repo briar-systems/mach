@@ -55,6 +55,7 @@ use cache_key:   mach.lang.build.cache.key;
 use mach.lang.build.outcome;
 use mach.lang.build.plan;
 use mach.lang.build.request;
+use mach.lang.ct;
 use mach.lang.diagnostic;
 use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
@@ -32099,4 +32100,282 @@ test "mach.lang.driver:ret_chain_inlined_into_a_loop_is_structured_on_spirv" {
         "\nfun main() i32 { ret 0; }\n");
     # one copy inside the loop body: the loop, the outer selection and the nested one
     ret ut_ret_chain_module(?alloc, src, 2, 1);
+}
+
+val UT_CT_WIDTHS: [4]u8 = [4]u8{8, 16, 32, 64};
+
+# a one-target project for a registered tuple; a static library everywhere
+# but spirv, which only builds programs
+fun ut_ct_mul_manifest(alloc: *A.Allocator, isa_name: str, os_name: str, abi_name: str, of_name: str) str {
+    var kind: str = "static";
+    var out:  str = "lib/ctmul.a";
+    if (str_equals(of_name, "spv")) {
+        kind = "bin";
+        out  = "bin/ctmul";
+    }
+    val r: res[str, format.FormatError] = format.sprint(alloc,
+        "[project]\nmach = \">=5\"\nid = \"ctmul\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{{target.name}}/{{profile.name}}\"\n\n[target.t]\nisa = \"{}\"\nos = \"{}\"\nabi = \"{}\"\nof = \"{}\"\n\n[artifact.ctmul]\nkind = \"{}\"\nentry = \"main.mach\"\nout = \"{}\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[profile.debug]\ndefault = true\nopt = 0\ndebug = false\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n",
+        isa_name, os_name, abi_name, of_name, kind, out);
+    if (sel r.err) { ret ""; }
+    ret r.ok;
+}
+
+# 0 when a secret multiply lowered, 1 when a gate refused it as a variable-
+# latency multiply, 2 for any other failure, which the comparison refuses
+fun ut_ct_codegen(p: *project.Project) i32 {
+    val se: err[outcome.Fail] = driver.run_sema_pass(p);
+    if (sel se.err) { ret 2; }
+    val le: err[outcome.Fail] = driver.run_lower_pass(p);
+    if (sel le.err) { ret 2; }
+    val ce: err[outcome.Fail] = driver.run_codegen_pass(p);
+    if (sel ce.ok)                                                                      { ret 0; }
+    if (ut_str_contains(outcome.describe(ce.err), "variable-latency integer multiply")) { ret 1; }
+    var di: usize = 0;
+    for (di < diagnostic.len(?p.s.diags)) {
+        print.println(p.s.diags.items.data[di].message);
+        di = di + 1;
+    }
+    print.printf("ct_mul: codegen {}\n", outcome.describe(ce.err));
+    ret 2;
+}
+
+fun ut_ct_op_name(op: u32) str {
+    val name: opt[str] = ct.mul_op_name(op::ct.CtMulOp);
+    if (sel name.some) { ret name.some; }
+    ret "";
+}
+
+# the query program for one cell: a gate that reports when the cell is admitted
+fun ut_ct_mul_query_program(alloc: *A.Allocator, op: u32, width: u8) str {
+    val name: str                          = ut_ct_op_name(op);
+    val line: res[str, format.FormatError] = format.sprint(alloc,
+        "$if ($mach.build.ct_mul({}, {}) == 1) {{ $error(\"ct_mul admits {} {}\"); }}\n", name, width, name, width);
+    if (sel line.err) { ret ""; }
+    ret line.ok;
+}
+
+rec UtCtTuple {
+    isa_name: str;
+    os_name:  str;
+    abi_name: str;
+    of_name:  str;
+}
+
+# one build of `program` for the tuple, with the synthetic rows installed on
+# its instruction set; the project, or the refusal's diagnostics searched for
+# `needle`
+fun ut_ct_mul_build(alloc: *A.Allocator, t: *UtCtTuple, rows: *ct.CtMulForm, row_len: u32,
+    program: str, needle: str, mask: *ct.CtMulMask, found: *bool, gate: *i32) i32 {
+    val sr: res[session.Session, fail.Fail] = session.init(alloc);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+    val rr: err[outcome.Fail] = driver.setup_registry(s.registry);
+    if (sel rr.err) { ret 2; }
+    if (row_len > 0) {
+        var ii: u32 = 0;
+        for (ii < isa.registered_count(?s.registry.isa)) {
+            val vt: opt[*isa.IsaVTable] = isa.registered(?s.registry.isa, ii);
+            if (sel vt.some) {
+                val v: *isa.IsaVTable = vt.some;
+                if (str_equals(v.name, t.isa_name)) {
+                    v.model.ct_mul_forms    = rows;
+                    v.model.ct_mul_form_len = row_len;
+                }
+            }
+            ii = ii + 1;
+        }
+    }
+    var names:  [1]str              = [1]str{"main.mach"};
+    var texts:  [1]str              = [1]str{program};
+    val root_r: res[str, fail.Fail] = ut_scaffold_m(alloc, ut_ct_mul_manifest(alloc, t.isa_name, t.os_name, t.abi_name, t.of_name), ?names[0], ?texts[0], 1);
+    if (sel root_r.err) { ret 4; }
+    val root: str = root_r.ok;
+    fin { fs.remove_all(alloc, root); }
+    var pick: manifest.Selection                 = ut_target_sel("t");
+    val bp:   res[project.Project, outcome.Fail] = driver.build_project(?s, root, ?pick);
+    if (sel bp.err) {
+        if (!outcome.is_reported(bp.err)) { ret 5; }
+        @found = ut_diag_has(?s.diags, needle);
+        if (!@found) { ret 10; }
+        ret 0;
+    }
+    var p: project.Project = bp.ok;
+    fin { project.dnit_project(?p); }
+    @mask = target.ct_mul_admitted(?p.target);
+    if (gate != nil) {
+        @gate = ut_ct_codegen(?p);
+        ret 0;
+    }
+    val se: err[outcome.Fail] = driver.run_sema_pass(?p);
+    @found = ut_diag_has(?s.diags, needle);
+    if (sel se.err && !@found) { ret 6; }
+    ret 0;
+}
+
+# 0 when every build ran; `admitted` holds the query's answer per cell, in
+# op then width order, and `gate_ok` per low-half width whether a secret
+# multiply in an oblivious function lowered
+fun ut_ct_mul_run(alloc: *A.Allocator, t: *UtCtTuple, rows: *ct.CtMulForm, row_len: u32,
+    mask: *ct.CtMulMask, admitted: *bool, gate_ok: *bool) i32 {
+    var ci: usize = 0;
+    var op: u32   = 1;
+    for (op < ct.CT_MUL_OP_COUNT) {
+        var wi: usize = 0;
+        for (wi < 4) {
+            val w:      u8                           = UT_CT_WIDTHS[wi];
+            val needle: res[str, format.FormatError] = format.sprint(alloc, "ct_mul admits {} {}", ut_ct_op_name(op), w);
+            if (sel needle.err) { ret 7; }
+            var found: bool = false;
+            val code:  i32  = ut_ct_mul_build(alloc, t, rows, row_len, ut_ct_mul_query_program(alloc, op, w), needle.ok, mask, ?found, nil);
+            if (code != 0) { ret code; }
+            admitted[ci] = found;
+            ci           = ci + 1;
+            wi           = wi + 1;
+        }
+        op = op + 1;
+    }
+    var gi: usize = 0;
+    for (gi < 4) {
+        val w:  u8                           = UT_CT_WIDTHS[gi];
+        val pr: res[str, format.FormatError] = format.sprint(alloc,
+            "#[noinline]\n#[oblivious]\npub fun product(a: ^u{}, b: ^u{}) ^u{} {{ ret a * b; }}\n", w, w, w);
+        if (sel pr.err) { ret 3; }
+        var found: bool = false;
+        var gate:  i32  = 2;
+        val code:  i32  = ut_ct_mul_build(alloc, t, rows, row_len, pr.ok, "", mask, ?found, ?gate);
+        if (code != 0) { ret code; }
+        if (gate == 2) { ret 9; }
+        gate_ok[gi] = gate == 0;
+        gi          = gi + 1;
+    }
+    ret 0;
+}
+
+# 0 when, for the tuple, the query answers every cell as the target's one
+# decision does and the lowering gate accepts a secret low-half multiply
+# exactly where the query admits it
+fun ut_ct_mul_agree(alloc: *A.Allocator, t: *UtCtTuple, rows: *ct.CtMulForm, row_len: u32) i32 {
+    var admitted: [28]bool;
+    var gate_ok:  [4]bool;
+    var mask:     ct.CtMulMask = ct.mul_mask_none();
+    val run:      i32          = ut_ct_mul_run(alloc, t, rows, row_len, ?mask, ?admitted[0], ?gate_ok[0]);
+    if (run != 0) { ret run; }
+    var ci: usize = 0;
+    var op: u32   = 1;
+    for (op < ct.CT_MUL_OP_COUNT) {
+        var wi: usize = 0;
+        for (wi < 4) {
+            val decided: bool = ct.mul_mask_has(mask, ct.mul_cell(op::ct.CtMulOp, UT_CT_WIDTHS[wi], false));
+            if (admitted[ci] != decided)                                        { ret 20; }
+            if (op::ct.CtMulOp == ct.CT_MUL_LOW && gate_ok[wi] != admitted[ci]) { ret 21; }
+            ci = ci + 1;
+            wi = wi + 1;
+        }
+        op = op + 1;
+    }
+    ret 0;
+}
+
+fun ut_ct_mul_tuple_at(alloc: *A.Allocator, reg: *target.TargetRegistry, oi: u32, ii: u32, ai: u32, fi: u32, tuples: *u32) i32 {
+    val os_r:  opt[*os.OsVTable]   = os.registered(?reg.os, oi);
+    val isa_r: opt[*isa.IsaVTable] = isa.registered(?reg.isa, ii);
+    val abi_r: opt[*abi.AbiVTable] = abi.registered(?reg.abi, ai);
+    val of_r:  opt[*of.OfVTable]   = of.registered(?reg.of, fi);
+    if (sel os_r.none)  { ret 0; }
+    if (sel isa_r.none) { ret 0; }
+    if (sel abi_r.none) { ret 0; }
+    if (sel of_r.none)  { ret 0; }
+    val ov: *os.OsVTable   = os_r.some;
+    val iv: *isa.IsaVTable = isa_r.some;
+    val av: *abi.AbiVTable = abi_r.some;
+    val fv: *of.OfVTable   = of_r.some;
+    if (target.registered_tuple_capability(ov, iv, av, fv) != target.TUPLE_OK) { ret 0; }
+    var t:    UtCtTuple = UtCtTuple{isa_name: iv.name, os_name: ov.name, abi_name: av.name, of_name: fv.name};
+    val code: i32       = ut_ct_mul_agree(alloc, ?t, nil, 0);
+    if (code != 0) {
+        print.printf("ct_mul: {}-{}-{}-{} disagrees ({})\n", t.os_name, t.isa_name, t.abi_name, t.of_name, code);
+        ret 100 + code;
+    }
+    @tuples = @tuples + 1;
+    ret 0;
+}
+
+test "mach.lang.driver:ct_mul_query_matches_the_lowering_gate_on_every_registered_target" {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val rr: err[outcome.Fail] = driver.setup_registry(?reg);
+    if (sel rr.err) { ret 2; }
+    var tuples: u32 = 0;
+    var oi:     u32 = 0;
+    for (oi < os.registered_count(?reg.os)) {
+        var ii: u32 = 0;
+        for (ii < isa.registered_count(?reg.isa)) {
+            var ai: u32 = 0;
+            for (ai < abi.registered_count(?reg.abi)) {
+                var fi: u32 = 0;
+                for (fi < of.registered_count(?reg.of)) {
+                    val code: i32 = ut_ct_mul_tuple_at(?alloc, ?reg, oi, ii, ai, fi, ?tuples);
+                    if (code != 0) { ret code; }
+                    fi = fi + 1;
+                }
+                ai = ai + 1;
+            }
+            ii = ii + 1;
+        }
+        oi = oi + 1;
+    }
+    if (tuples == 0) { ret 3; }
+    ret 0;
+}
+
+# the same agreement on a synthetic x86_64 model that admits two cells, so a
+# query reading anything but the target's one decision is caught
+test "mach.lang.driver:ct_mul_query_matches_the_lowering_gate_on_a_synthetic_model" {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var rows: [3]ct.CtMulForm = [3]ct.CtMulForm{
+        ct.CtMulForm{op: ct.CT_MUL_LOW, width: 16, lanes: 0, cond: ct.CT_MUL_ALWAYS, ext: 0},
+        ct.CtMulForm{op: ct.CT_MUL_LOW, width: 32, lanes: 0, cond: ct.CT_MUL_ALWAYS, ext: 0},
+        ct.CtMulForm{op: ct.CT_MUL_WIDE_S, width: 64, lanes: 0, cond: ct.CT_MUL_ALWAYS, ext: 0}
+    };
+    var t:        UtCtTuple    = UtCtTuple{isa_name: "x86_64", os_name: "linux", abi_name: "sysv64", of_name: "elf"};
+    var admitted: [28]bool;
+    var gate_ok:  [4]bool;
+    var mask:     ct.CtMulMask = ct.mul_mask_none();
+    if (ut_ct_mul_run(?alloc, ?t, ?rows[0], 3, ?mask, ?admitted[0], ?gate_ok[0]) != 0) { ret 2; }
+    if (!ct.mul_mask_has(mask, ct.mul_cell(ct.CT_MUL_LOW, 32, false)))                 { ret 3; }
+    if (!ct.mul_mask_has(mask, ct.mul_cell(ct.CT_MUL_WIDE_S, 64, false)))              { ret 4; }
+    if (!gate_ok[1] || !gate_ok[2] || gate_ok[3] || gate_ok[0])                        { ret 5; }
+    val code: i32 = ut_ct_mul_agree(?alloc, ?t, ?rows[0], 3);
+    if (code != 0) { ret 10 + code; }
+    # a packed lane multiply is its own cell, which no row may declare yet
+    var found: bool = false;
+    var gate:  i32  = 2;
+    val lanes: i32  = ut_ct_mul_build(?alloc, ?t, ?rows[0], 3,
+        "#[noinline]\n#[oblivious]\npub fun product(a: ^u16x8, b: ^u16x8) ^u16x8 { ret a * b; }\n", "", ?mask, ?found, ?gate);
+    if (lanes != 0 || gate != 1) { ret 40; }
+    ret 0;
+}
+
+# the query folds to a u8 like `$mach.build.pie`, coerces to a wider binding,
+# lowers as a constant, and refuses a malformed call naming what it accepts
+test "mach.lang.driver:ct_mul_query_is_a_folded_u8_and_refuses_malformed_calls" {
+    if (!ut_sema_clean("val Q: u8 = $mach.build.ct_mul(low, 64);\nval W: u64 = $mach.build.ct_mul(high_su, 8);\n$if ($mach.build.ct_mul(wide_s, 32) == 0) { val OFF: u8 = 0; }\nfun main() i32 { ret ($mach.build.ct_mul(high_u, 16) + Q)::i32 + W::i32; }\n")) { ret 1; }
+    if (ut_codegen_target_ok("fun main() i32 { val q: u8 = $mach.build.ct_mul(low, 32); ret q::i32; }\n", "linux") != 0)                                                                                                                                        { ret 2; }
+    if (ut_vec_diag("val Q: u8 = $mach.build.ct_mul(mid, 64);\nfun main() i32 { ret 0; }\n",
+        "unknown multiply `mid`; expected one of low, high_u, high_s, high_su, wide_u, wide_s") != 0) { ret 3; }
+    if (ut_vec_diag("val Q: u8 = $mach.build.ct_mul(low, 24);\nfun main() i32 { ret 0; }\n",
+        "the operand width must be 8, 16, 32 or 64") != 0) { ret 4; }
+    if (ut_vec_diag("val Q: u8 = $mach.build.ct_mul(low);\nfun main() i32 { ret 0; }\n",
+        "takes a multiply and an operand width") != 0) { ret 5; }
+    if (ut_vec_diag("val Q: u8 = $mach.build.ct_mul(1, 64);\nfun main() i32 { ret 0; }\n",
+        "the multiply is a bare word, one of low") != 0) { ret 6; }
+    if (ut_vec_diag("val Q: u32 = $mach.build.os(1);\nfun main() i32 { ret 0; }\n",
+        "this comptime path takes no arguments") != 0) { ret 7; }
+    ret 0;
 }

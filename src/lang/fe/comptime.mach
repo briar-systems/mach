@@ -22,6 +22,7 @@ use std.types.view.view_eq_str;
 
 use A: std.allocator;
 
+use mach.lang.ct;
 use mach.lang.diagnostic;
 use mach.lang.fail;
 use mach.lang.fe.ast;
@@ -698,6 +699,8 @@ pub rec ComptimeEnv {
     target_platform: intern.StrId;
     bin_name:        intern.StrId;
     union_build:     bool;
+    # the constant-time multiply cells the target admits
+    ct_mul: ct.CtMulMask;
 }
 
 pub rec ComptimeCtx {
@@ -761,6 +764,7 @@ pub fun init(
     c.env.target_platform = intern.STR_NIL;
     c.env.bin_name        = intern.STR_NIL;
     c.env.union_build     = false;
+    c.env.ct_mul          = ct.mul_mask_none();
 
     c.entries          = nil;
     c.entries_len      = 0;
@@ -783,6 +787,10 @@ pub fun set_union_build(c: *ComptimeCtx, v: bool) {
 
 pub fun set_target_defs(c: *ComptimeCtx, d: *isa.TargetDefs) {
     c.env.target_defs = d;
+}
+
+pub fun set_ct_mul(c: *ComptimeCtx, mask: ct.CtMulMask) {
+    c.env.ct_mul = mask;
 }
 
 pub fun set_va_list(c: *ComptimeCtx, size: u32, align: u32) {
@@ -1098,6 +1106,7 @@ fun evaluate_expression[T](
     }
 
     if (k == expr.EXPR_KIND_CALL) {
+        if (is_path_call(a, e)) { ret eval_path_call[T](c, cap_ctx, caps, a, source, e, interner); }
         val q: opt[res[CTValue, EvalFail]] = eval_type_query[T](c, cap_ctx, caps, a, source, e, interner);
         if (sel q.some)                             { ret q.some; }
         if (is_layout_intrinsic_call(a, source, e)) { ret eval_layout_intrinsic[T](cap_ctx, caps, a, source, e); }
@@ -2323,6 +2332,7 @@ fun gate_target_dependent_node(a: *ast.Ast, source: str, eid: id.ExprId, e: *exp
     }
     if (k == expr.EXPR_KIND_MEMBER && is_comptime_path(a, eid))               { ret GATE_NODE_PRUNE; }
     if (k == expr.EXPR_KIND_CALL && is_layout_intrinsic_call(a, source, eid)) { ret GATE_NODE_PRUNE; }
+    if (k == expr.EXPR_KIND_CALL && is_path_call(a, eid))                     { ret GATE_NODE_PRUNE; }
     if (k == expr.EXPR_KIND_BINARY || k == expr.EXPR_KIND_UNARY
         || k == expr.EXPR_KIND_SEL) { ret GATE_NODE_NO; }
     ret GATE_NODE_YES;
@@ -3353,6 +3363,107 @@ fun constant_leaf[T](
         }
     }
     ret evaluate_at_float_width[T](c, cap_ctx, caps, a, source, value_eid, interner, fw);
+}
+
+# a call whose callee is a rooted comptime path: `$mach.build.ct_mul(low, 64)`
+pub fun is_path_call(a: *ast.Ast, e: id.ExprId) bool {
+    if (e == id.EXPR_NIL) { ret false; }
+    val n_opt: opt[*expr.Expr] = ast.get_expr(a, e);
+    if (!sel n_opt.some) { ret false; }
+    val node: *expr.Expr = n_opt.some;
+    if (node.kind != expr.EXPR_KIND_CALL) { ret false; }
+    val callee_opt: opt[*expr.Expr] = ast.get_expr(a, node.data.call.callee);
+    if (!sel callee_opt.some)                          { ret false; }
+    if (callee_opt.some.kind != expr.EXPR_KIND_MEMBER) { ret false; }
+    ret is_comptime_path(a, node.data.call.callee);
+}
+
+# a rooted comptime path, or a call on one: both fold to a constant
+pub fun is_comptime_value(a: *ast.Ast, e: id.ExprId) bool {
+    ret is_comptime_path(a, e) || is_path_call(a, e);
+}
+
+val CT_MUL_USAGE: str = "`$mach.build.ct_mul` takes a multiply and an operand width, as in `$mach.build.ct_mul(low, 64)`";
+
+# `$mach.build.ct_mul(op, width)`: 1 when the target admits that scalar
+# multiply cell on a secret operand, the same answer the lowering gate reads
+fun eval_path_call[T](
+    c: *ComptimeCtx,
+    cap_ctx: *T,
+    caps: PhaseCapabilities[T],
+    a: *ast.Ast,
+    source: str,
+    e: id.ExprId,
+    interner: *intern.Interner) res[CTValue, EvalFail] {
+    val node_o: opt[*expr.Expr] = ast.get_expr(a, e);
+    if (!sel node_o.some) { ret reject("ExprId out of range during comptime call evaluation"); }
+    val node:  *expr.Expr = node_o.some;
+    var stack: [16]token.Span;
+    var depth: u32        = 0;
+    var cur:   id.ExprId  = node.data.call.callee;
+    for (true) {
+        if (depth >= 16) { ret reject("comptime path is too deeply nested"); }
+        val n_opt: opt[*expr.Expr] = ast.get_expr(a, cur);
+        if (!sel n_opt.some) { ret reject("ExprId out of range during comptime member walk"); }
+        val step: *expr.Expr = n_opt.some;
+        if (step.kind == expr.EXPR_KIND_MEMBER) {
+            stack[depth] = step.data.member.name;
+            depth        = depth + 1;
+            cur          = step.data.member.object;
+            cnt;
+        }
+        stack[depth] = comptime_ident_name(step.span);
+        depth        = depth + 1;
+        brk;
+    }
+    val callable: bool = depth == 3 && seg_is(source, ?stack[0], 2, "mach")
+        && seg_is(source, ?stack[0], 1, "build") && seg_is(source, ?stack[0], 0, "ct_mul");
+    if (!callable)                                                         { ret reject("this comptime path takes no arguments; `$mach.build.ct_mul(op, width)` is the one that does"); }
+    if (node.data.call.args_len != 2 || node.data.call.type_args_len != 0) { ret reject(CT_MUL_USAGE); }
+
+    val op_eid: id.ExprId       = a.expr_ids[node.data.call.args_start];
+    val op_opt: opt[*expr.Expr] = ast.get_expr(a, op_eid);
+    if (!sel op_opt.some) { ret reject_ct_mul_op(c, ""); }
+    val op_node: *expr.Expr = op_opt.some;
+    if (op_node.kind != expr.EXPR_KIND_IDENT) { ret reject_ct_mul_op(c, ""); }
+    val word: View       = span_text(source, op_node.span);
+    var op:   ct.CtMulOp = ct.CT_MUL_NONE;
+    var i:    u32        = 1;
+    for (i < ct.CT_MUL_OP_COUNT) {
+        val name: opt[str] = ct.mul_op_name(i::ct.CtMulOp);
+        if (sel name.some && view_eq_str(word, name.some)) { op = i::ct.CtMulOp; }
+        i = i + 1;
+    }
+    if (op == ct.CT_MUL_NONE) {
+        val wr:      res[intern.StrId, A.Error] = intern.intern_span(interner, source, op_node.span);
+        var spelled: str                        = "";
+        if (sel wr.ok) {
+            val lo: opt[str] = intern.lookup(interner, wr.ok);
+            if (sel lo.some) { spelled = lo.some; }
+        }
+        ret reject_ct_mul_op(c, spelled);
+    }
+
+    val width_eid: id.ExprId              = a.expr_ids[node.data.call.args_start + 1];
+    val width_r:   res[CTValue, EvalFail] = evaluate[T](c, cap_ctx, caps, a, source, width_eid, interner);
+    if (sel width_r.err) { ret width_r; }
+    val wv: CTValue = width_r.ok;
+    if (wv.kind != CT_KIND_INT || wv.data.i < 0 || wv.data.i > 64
+        || !ct.mul_width_valid(wv.data.i::u8)) {
+        ret reject("`$mach.build.ct_mul`: the operand width must be 8, 16, 32 or 64");
+    }
+    val admitted: bool = ct.mul_mask_has(c.env.ct_mul, ct.mul_cell(op, wv.data.i::u8, false));
+    if (admitted) { ret u8_value(1); }
+    ret u8_value(0);
+}
+
+fun reject_ct_mul_op(c: *ComptimeCtx, spelled: str) res[CTValue, EvalFail] {
+    val fallback: str = "`$mach.build.ct_mul`: the multiply is a bare word, one of low, high_u, high_s, high_su, wide_u, wide_s";
+    if (spelled == nil || str_len(spelled) == 0) { ret reject(fallback); }
+    val r: res[str, format.FormatError] = format.sprint(c.env.alloc,
+        "`$mach.build.ct_mul`: unknown multiply `{}`; expected one of {}", spelled, ct.MUL_OP_SPELLINGS);
+    if (sel r.err) { ret reject(fallback); }
+    ret reject(r.ok);
 }
 
 pub fun is_comptime_path(a: *ast.Ast, e: id.ExprId) bool {
