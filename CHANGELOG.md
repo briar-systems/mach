@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `[project].mach` states the compiler versions a project builds with, as a version range such as `mach = "^5.2"`. Build, test, check, `mach dep verify` and the language server check it for the root and every realized dependency, and a compiler outside any range is refused once, naming every unmet requirement and the chain that states it. The range grammar is mach's own: clauses separated by `,` that each name their operator (`^`, `~`, `>=`, `>`, `<=`, `<`, `=`), Cargo's pre-1.0 caret rule, and pre-releases only where a clause names one. A root manifest without the key builds with a warning that prints the line to add; a later release requires it. `mach dep verify` now also checks a project with no dependencies. `doc/language/manifest.md` states the rules (#3498, #3499, #3496).
 ### Changed
 - A dependency's public type is looked up through an index keyed by its origin and canonical name, instead of scanning every dependency's exports on every lookup. mach-lsp's warm-rebuild profile had 18.3% of its time in that scan. Each imported module's typed surface and its index are now built once per gate result, and once per revision of its typed exports, then shared by every module that imports it. Before, they were rebuilt for each importer. A warm `mach check` of mach-lsp went from 6.1 s on 5.2.1 to 3.2 s, of mach itself from 5.9 s to 3.1 s, and mach-lsp's warm rebuild from 1.70 s to 1.49 s (#3472).
 ### Fixed
