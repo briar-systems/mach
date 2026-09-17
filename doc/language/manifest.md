@@ -674,8 +674,32 @@ module no artifact reaches is collected as before.
 - **`static`** materialises a real `ar` archive at the resolved `out` path — the
   per-module objects with an archive symbol index, the deliverable a consumer links
   as a `.a` (#1997).
-- **`shared`** is reserved for a shared-library deliverable; its emission is phase 2
-  (#1980).
+- **`shared`** links a dynamic library at the resolved `out`. Only ELF targets
+  write one today: `linux` on `x86_64`, `aarch64` and `riscv64` produce a `.so`
+  whose `SONAME` is its file name. The Mach-O `.dylib` and PE `.dll` writers are
+  not built yet, so a `darwin` or `windows` target refuses with `link: object
+  format cannot write shared libraries` (#3588).
+  - **Exports.** The library exports the root project's `pub` functions and
+    variables and every name its modules re-export with `fwd`, including a
+    dependency's. A dependency's own `pub` surface is not exported unless it is
+    re-exported. `#[symbol("name")]` sets the name an export carries and does not
+    make anything visible: a `pub` function exports under its `#[symbol]` name,
+    and a non-`pub` one stays hidden whatever its name.
+  - **Internals.** Every other definition still links inside the library but is
+    absent from `.dynsym`. In the `.so` it is a `LOCAL` symbol in `.symtab`, and
+    in the per-module object it is a `GLOBAL` symbol with `STV_HIDDEN`
+    visibility.
+  - **Refusals.** A shared artifact that exports nothing is refused:
+
+    ```
+    link: shared library '<artifact>' exports nothing: a shared library needs at least one `pub` declaration in the project, or a `fwd` re-export of one
+    ```
+
+    A `freestanding` target is refused as well. With its default `raw` format
+    the artifact fails naming (`artifact naming: this object format has no
+    shared-library form`), and with `of = "elf"` the link refuses with
+    `link: a shared library needs a loader to map it, and os = "freestanding"
+    has none`.
 
 Per-target extension or per-target entry is not a per-cell exception table — it is a
 second artifact stanza, so the condition stays visible like everything else.
@@ -703,9 +727,9 @@ inspection use the same expansion.
 
 | Target output format | `bin` suffix | `static` suffix | `shared` suffix |
 | --- | --- | --- | --- |
-| ELF on Linux or freestanding | empty | `.a` | `.so` |
-| Mach-O on Darwin | empty | `.a` | `.dylib` |
-| COFF/PE on Windows | `.exe` | `.lib` | `.dll` |
+| ELF on Linux or freestanding | empty | `.a` | `.so` (refused on freestanding) |
+| Mach-O on Darwin | empty | `.a` | `.dylib` (not written yet, #3588) |
+| COFF/PE on Windows | `.exe` | `.lib` | `.dll` (not written yet, #3588) |
 | Raw image | empty | unsupported | unsupported |
 | SPIR-V module | `.spv` | unsupported | unsupported |
 
