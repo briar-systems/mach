@@ -19,6 +19,7 @@ use std.types.string.str_starts_with;
 
 use A: std.allocator;
 
+use mach.lang.be.codegen.ctwalk;
 use mach.lang.be.codegen.encode;
 use codegen_frame: mach.lang.be.codegen.frame;
 use mach.lang.be.codegen.mir;
@@ -836,6 +837,12 @@ fun emit_neon_3same(st: *encode.EncodeState, op: mop.MachOp, rd: u32, rn: u32, r
 fun emit_neon_2misc(st: *encode.EncodeState, op: mop.MachOp, rd: u32, rn: u32) {
     var mi: isa.Inst = inst_of(op, mop.vec(rd, 16), mop.vec(rn, 16), isa.make_none());
     mi.flags = mop.with_elem_bytes(0, 1);
+    emit_inst(st, ?mi);
+}
+
+fun emit_neon_conv(st: *encode.EncodeState, op: mop.MachOp, rd: u32, rn: u32, from_bytes: u8) {
+    var mi: isa.Inst = inst_of(op, mop.vec(rd, 16), mop.vec(rn, 16), isa.make_none());
+    mi.flags = mop.with_elem_bytes(0, from_bytes);
     emit_inst(st, ?mi);
 }
 
@@ -2020,6 +2027,112 @@ fun neon_3same_refusal(op: mop.MachOp, size: u32) opt[str] {
     ret opt[str].none{};
 }
 
+# one conversion step on the work register: its first step reads the operand
+fun neon_conv_step(st: *encode.EncodeState, op: mop.MachOp, rd: u32, rn: *u32, from_bytes: u8) {
+    emit_neon_conv(st, op, rd, @rn, from_bytes);
+    @rn = rd;
+}
+
+# the NEON conversion of each lane, for the cells the aarch64 packed table
+# declares. a float to integer lane saturates at the 32 or 64 bits the scalar
+# conversion saturates at and is then truncated as the scalar result is, so a
+# 64-bit saturation narrows to 32 bits by saturating again
+fun emit_neon_convert_body(st: *encode.EncodeState, op: mir.MirOpcode, to_float: bool, to: u8,
+    from_float: bool, from: u8, rd: u32, src: u32) err[fail.Fail] {
+    var rn: u32 = src;
+    if (op == mir.MIR_SEXT || op == mir.MIR_ZEXT) {
+        var lengthen: mop.MachOp = mop.V_UXTL;
+        if (op == mir.MIR_SEXT) { lengthen = mop.V_SXTL; }
+        var w: u8 = from;
+        for (w < to) {
+            neon_conv_step(st, lengthen, rd, ?rn, w);
+            w = w * 2;
+        }
+        ret err[fail.Fail].ok{};
+    }
+    if (op == mir.MIR_TRUNC) {
+        emit_neon_narrow(st, from, to, rd, ?rn);
+        ret err[fail.Fail].ok{};
+    }
+    if (op == mir.MIR_FP_EXT && from == 4 && to == 8) {
+        neon_conv_step(st, mop.V_FCVTL, rd, ?rn, 4);
+        ret err[fail.Fail].ok{};
+    }
+    if (op == mir.MIR_FP_TRUNC && from == 8 && to == 4) {
+        neon_conv_step(st, mop.V_FCVTN, rd, ?rn, 8);
+        ret err[fail.Fail].ok{};
+    }
+    if ((op == mir.MIR_SI_TO_FP || op == mir.MIR_UI_TO_FP) && !from_float && to_float && from <= to) {
+        val signed:   bool       = op == mir.MIR_SI_TO_FP;
+        var lengthen: mop.MachOp = mop.V_UXTL;
+        var convert:  mop.MachOp = mop.V_UCVTF;
+        if (signed) {
+            lengthen = mop.V_SXTL;
+            convert  = mop.V_SCVTF;
+        }
+        var w: u8 = from;
+        for (w < to) {
+            neon_conv_step(st, lengthen, rd, ?rn, w);
+            w = w * 2;
+        }
+        neon_conv_step(st, convert, rd, ?rn, to);
+        ret err[fail.Fail].ok{};
+    }
+    if ((op == mir.MIR_FP_TO_SI || op == mir.MIR_FP_TO_UI) && from_float && !to_float) {
+        val signed:   bool       = op == mir.MIR_FP_TO_SI;
+        var convert:  mop.MachOp = mop.V_FCVTZU;
+        var saturate: mop.MachOp = mop.V_UQXTN;
+        if (signed) {
+            convert  = mop.V_FCVTZS;
+            saturate = mop.V_SQXTN;
+        }
+        if (from == 4 && to == 8) {
+            neon_conv_step(st, mop.V_FCVTL, rd, ?rn, 4);
+            neon_conv_step(st, convert, rd, ?rn, 8);
+            ret err[fail.Fail].ok{};
+        }
+        neon_conv_step(st, convert, rd, ?rn, from);
+        var w: u8 = from;
+        if (from == 8 && to < 8) {
+            neon_conv_step(st, saturate, rd, ?rn, 8);
+            w = 4;
+        }
+        emit_neon_narrow(st, w, to, rd, ?rn);
+        ret err[fail.Fail].ok{};
+    }
+    ret err[fail.Fail].err{fail.message("encode: vector conversion outside the aarch64 packed table")};
+}
+
+fun emit_neon_narrow(st: *encode.EncodeState, from: u8, to: u8, rd: u32, rn: *u32) {
+    var w: u8 = from;
+    for (w > to) {
+        neon_conv_step(st, mop.V_XTN, rd, rn, w);
+        w = w / 2;
+    }
+}
+
+fun encode_neon_convert(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) err[fail.Fail] {
+    if (mi.operand_count < 2) { ret err[fail.Fail].err{fail.message("encode: vector conversion missing operands")}; }
+    val rnr: res[i32, fail.Fail] = resolve_fp_source(st, f, ?mi.operands[1], FP_SCRATCH0, 16);
+    if (sel rnr.err) { ret err[fail.Fail].err{rnr.err}; }
+    val dst:     *mir.MirOperand = ?mi.operands[0];
+    var rd:      u32             = FP_SCRATCH0;
+    var to_slot: bool            = true;
+    if (dst.kind != mir.MIR_OP_MEM) {
+        val rdr: res[i32, fail.Fail] = req_vec(dst);
+        if (sel rdr.err) { ret err[fail.Fail].err{rdr.err}; }
+        rd      = rdr.ok::u32;
+        to_slot = false;
+    }
+    val vl:   u32            = mi.vec_lane;
+    val body: err[fail.Fail] = emit_neon_convert_body(st, mi.opcode,
+        mir.vec_lane_kind(vl) == mir.VEC_LANE_FLOAT, mir.vec_lane_elem_bytes(vl),
+        mir.vec_lane_from_kind(vl) == mir.VEC_LANE_FLOAT, mir.vec_lane_from_bytes(vl), rd, rnr.ok::u32);
+    if (sel body.err) { ret body; }
+    if (to_slot)      { ret emit_fp_slot_store(st, f, dst, rd, 16); }
+    ret err[fail.Fail].ok{};
+}
+
 fun encode_neon(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) err[fail.Fail] {
     val vl:       u32  = mi.vec_lane;
     val is_float: bool = mir.vec_lane_kind(vl) == mir.VEC_LANE_FLOAT;
@@ -2719,6 +2832,8 @@ fun encode_mir_instr(st: *encode.EncodeState, f: *mir.MirFunction, fn_base: u32,
     if (mi.opcode == mir.MIR_ALLOCA || mi.opcode == mir.MIR_GEP) { ret encode_addr(st, f, mi); }
     if (mi.opcode == mir.MIR_LOAD)                               { ret encode_load(st, f, mi); }
     if (mi.opcode == mir.MIR_STORE)                              { ret encode_store(st, f, mi); }
+
+    if (mir.vec_lane_is_convert(mi.vec_lane)) { ret encode_neon_convert(st, f, mi); }
 
     if (mi.opcode == mir.MIR_TRUNC || mi.opcode == mir.MIR_SEXT ||
         mi.opcode == mir.MIR_ZEXT || mi.opcode == mir.MIR_BITCAST) {
@@ -7988,9 +8103,11 @@ pub fun asm_ct_class(code: u32, flags: u16) ct.AsmClass {
     if (code == mop.ADDS::u32 || code == mop.SUBS::u32 || code == mop.CMN::u32) {
         ret ct.flags_defined(ct.asm_op(ct.CT_OP_NONE));
     }
-    if (code == mop.MUL::u32 || code == mop.MNEG::u32 || code == mop.MADD::u32 || code == mop.MSUB::u32 ||
-        code == mop.V_MUL::u32) {
-        ret ct.flags_untouched(ct.asm_op(ct.CT_OP_INT_MUL));
+    if (code == mop.MUL::u32 || code == mop.MNEG::u32 || code == mop.MADD::u32 || code == mop.MSUB::u32) {
+        ret ct.flags_untouched(ct.asm_mul(ct.CT_MUL_LOW));
+    }
+    if (code == mop.V_MUL::u32) {
+        ret ct.flags_untouched(ct.asm_mul_lanes(ct.CT_MUL_LOW, mop.elem_bytes(flags) * 8));
     }
     if (code == mop.SDIV::u32 || code == mop.UDIV::u32) {
         ret ct.flags_untouched(ct.asm_op(ct.CT_OP_INT_DIVMOD));
@@ -8007,14 +8124,18 @@ pub fun asm_ct_class(code: u32, flags: u16) ct.AsmClass {
         code == mop.V_CMEQ::u32 || code == mop.V_CMGT::u32 || code == mop.V_CMGE::u32 ||
         code == mop.V_CMHI::u32 || code == mop.V_CMHS::u32 ||
         code == mop.UMOV::u32 || code == mop.MOV_LANE::u32 || code == mop.INS::u32 || code == mop.DUP::u32 ||
-        code == mop.INS_EL::u32) {
+        code == mop.INS_EL::u32 ||
+        code == mop.V_SXTL::u32 || code == mop.V_UXTL::u32 || code == mop.V_XTN::u32 ||
+        code == mop.V_SQXTN::u32 || code == mop.V_UQXTN::u32) {
         ret ct.flags_untouched(ct.asm_op(ct.CT_OP_NONE));
     }
     if (code == mop.FADD::u32 || code == mop.FSUB::u32 || code == mop.FMUL::u32 || code == mop.FDIV::u32 ||
         code == mop.FNEG::u32 || code == mop.FCVT::u32 || code == mop.SCVTF::u32 || code == mop.UCVTF::u32 ||
         code == mop.FCVTZS::u32 || code == mop.FCVTZU::u32 ||
         code == mop.V_FADD::u32 || code == mop.V_FSUB::u32 || code == mop.V_FMUL::u32 || code == mop.V_FDIV::u32 ||
-        code == mop.V_FCMEQ::u32 || code == mop.V_FCMGT::u32 || code == mop.V_FCMGE::u32) {
+        code == mop.V_FCMEQ::u32 || code == mop.V_FCMGT::u32 || code == mop.V_FCMGE::u32 ||
+        code == mop.V_FCVTL::u32 || code == mop.V_FCVTN::u32 || code == mop.V_SCVTF::u32 ||
+        code == mop.V_UCVTF::u32 || code == mop.V_FCVTZS::u32 || code == mop.V_FCVTZU::u32) {
         ret ct.flags_untouched(ct.asm_op(ct.CT_OP_FLOAT));
     }
     if (code == mop.FCMP::u32) {
@@ -8074,6 +8195,7 @@ pub fun inst_effects(mi: *isa.Inst, e: *ct.InstEffects) {
     val op: mop.MachOp = mi.opcode::mop.MachOp;
     if (!mop.known(op)) { ret; }
     e.cls = asm_ct_class(op::u32, 0);
+    if (op == mop.V_MUL) { e.cls = asm_ct_class(op::u32, mi.flags); }
 
     if (op == mop.NOP || op == mop.YIELD || op == mop.WFE || op == mop.WFI || op == mop.DMB) { ret; }
     if (op == mop.BRK) {
@@ -8202,18 +8324,47 @@ test "mach.lang.target.isa.arm64.encode.asm_ct_scan:a_spill_does_not_launder_a_s
     names[0] = "r";
 
     val addr:   str            = "ldr x0, {r}\nstr x0, [sp]\nldr x1, [sp]\nldr x2, [x1]";
-    val r_7484: err[fail.Fail] = asm_ct_scan(addr, ?names[0], 1, false, false, ?alloc);
+    val r_7484: err[fail.Fail] = asm_ct_scan(addr, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (!sel r_7484.err) { bad = bad + 1; }
-    val r_7485: err[fail.Fail] = asm_ct_scan(addr, ?names[0], 0, false, false, ?alloc);
+    val r_7485: err[fail.Fail] = asm_ct_scan(addr, ?names[0], 0, ct.mul_mask_none(), false, ?alloc);
     if (sel r_7485.err) { bad = bad + 2; }
 
     val br:     str            = "ldr x0, {r}\nstr x0, [sp]\nldr x1, [sp]\ncbnz x1, 1f\n1:\nnop";
-    val r_7488: err[fail.Fail] = asm_ct_scan(br, ?names[0], 1, false, false, ?alloc);
+    val r_7488: err[fail.Fail] = asm_ct_scan(br, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (!sel r_7488.err) { bad = bad + 4; }
-    val r_7489: err[fail.Fail] = asm_ct_scan(br, ?names[0], 0, false, false, ?alloc);
+    val r_7489: err[fail.Fail] = asm_ct_scan(br, ?names[0], 0, ct.mul_mask_none(), false, ?alloc);
     if (sel r_7489.err) { bad = bad + 8; }
 
     ret bad;
+}
+
+fun t_mul_cell_is(mi: *isa.Inst, op: ct.CtMulOp, width: u8, vector: bool) bool {
+    var e: ct.InstEffects;
+    inst_effects(mi, ?e);
+    val cell: ct.CtMulCell = ctwalk.emitted_mul_cell(mi, ?e);
+    ret e.cls.op == ct.CT_OP_INT_MUL && cell.op == op && cell.width == width && cell.vector == vector;
+}
+
+# the inline-asm grammar spells no multiply, so the emitted form is the one
+# the walk classifies: the low half at the register width, a lane multiply at
+# its element width
+test "mach.lang.target.isa.arm64.encode.inst_effects:a_multiply_names_its_cell" {
+    var mi: isa.Inst = isa.inst_blank();
+    mi.opcode = mop.MUL::u16;
+    mi.dst    = mop.gp(0, 8);
+    mi.src1   = mop.gp(1, 8);
+    mi.src2   = mop.gp(2, 8);
+    if (!t_mul_cell_is(?mi, ct.CT_MUL_LOW, 64, false)) { ret 1; }
+    mi.dst  = mop.gp(0, 4);
+    mi.src1 = mop.gp(1, 4);
+    mi.src2 = mop.gp(2, 4);
+    if (!t_mul_cell_is(?mi, ct.CT_MUL_LOW, 32, false)) { ret 2; }
+    mi.opcode = mop.MSUB::u16;
+    if (!t_mul_cell_is(?mi, ct.CT_MUL_LOW, 32, false)) { ret 3; }
+    var v: isa.Inst = inst_of(mop.V_MUL, mop.vec(0, 16), mop.vec(1, 16), mop.vec(2, 16));
+    v.flags = mop.with_elem_bytes(0, 4);
+    if (!t_mul_cell_is(?v, ct.CT_MUL_LOW, 32, true)) { ret 4; }
+    ret 0;
 }
 
 # the preferred `lsl` spelling with a register count is lslv: the variable
@@ -8228,15 +8379,15 @@ test "mach.lang.target.isa.arm64.encode.asm_ct_scan:register_count_shift_alias_i
     val alias:     str            = "ldr x2, {c}\nlsl x0, x1, x2";
     val spelled:   str            = "ldr x2, {c}\nlslv x0, x1, x2";
     val immediate: str            = "ldr x2, {c}\nlsl x0, x2, 3";
-    val r_7506:    err[fail.Fail] = asm_ct_scan(alias, ?names[0], 1, false, false, ?alloc);
+    val r_7506:    err[fail.Fail] = asm_ct_scan(alias, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (!sel r_7506.err) { bad = bad + 1; }
-    val r_7507: err[fail.Fail] = asm_ct_scan(spelled, ?names[0], 1, false, false, ?alloc);
+    val r_7507: err[fail.Fail] = asm_ct_scan(spelled, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (!sel r_7507.err) { bad = bad + 2; }
-    val r_7508: err[fail.Fail] = asm_ct_scan(alias, ?names[0], 1, false, true, ?alloc);
+    val r_7508: err[fail.Fail] = asm_ct_scan(alias, ?names[0], 1, ct.mul_mask_none(), true, ?alloc);
     if (sel r_7508.err) { bad = bad + 4; }
-    val r_7509: err[fail.Fail] = asm_ct_scan(immediate, ?names[0], 1, false, false, ?alloc);
+    val r_7509: err[fail.Fail] = asm_ct_scan(immediate, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (sel r_7509.err) { bad = bad + 8; }
-    val r_7510: err[fail.Fail] = asm_ct_scan(alias, ?names[0], 0, false, false, ?alloc);
+    val r_7510: err[fail.Fail] = asm_ct_scan(alias, ?names[0], 0, ct.mul_mask_none(), false, ?alloc);
     if (sel r_7510.err) { bad = bad + 16; }
     ret bad;
 }
@@ -8299,41 +8450,41 @@ test "mach.lang.target.isa.arm64.encode.asm_ct_scan:register_indirect_transfer_o
     names[0] = "r";
 
     val brt:    str            = "ldr x9, {r}\nbr x9";
-    val r_7573: err[fail.Fail] = asm_ct_scan(brt, ?names[0], 1, false, false, ?alloc);
+    val r_7573: err[fail.Fail] = asm_ct_scan(brt, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (!sel r_7573.err) { ret 1; }
-    val r_7574: err[fail.Fail] = asm_ct_scan(brt, ?names[0], 0, false, false, ?alloc);
+    val r_7574: err[fail.Fail] = asm_ct_scan(brt, ?names[0], 0, ct.mul_mask_none(), false, ?alloc);
     if (sel r_7574.err) { ret 2; }
 
     val blrt:   str            = "ldr x9, {r}\nblr x9";
-    val r_7577: err[fail.Fail] = asm_ct_scan(blrt, ?names[0], 1, false, false, ?alloc);
+    val r_7577: err[fail.Fail] = asm_ct_scan(blrt, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (!sel r_7577.err) { ret 3; }
-    val r_7578: err[fail.Fail] = asm_ct_scan(blrt, ?names[0], 0, false, false, ?alloc);
+    val r_7578: err[fail.Fail] = asm_ct_scan(blrt, ?names[0], 0, ct.mul_mask_none(), false, ?alloc);
     if (sel r_7578.err) { ret 4; }
 
     val rett:   str            = "ldr x30, {r}\nret";
-    val r_7581: err[fail.Fail] = asm_ct_scan(rett, ?names[0], 1, false, false, ?alloc);
+    val r_7581: err[fail.Fail] = asm_ct_scan(rett, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (!sel r_7581.err) { ret 5; }
-    val r_7582: err[fail.Fail] = asm_ct_scan(rett, ?names[0], 0, false, false, ?alloc);
+    val r_7582: err[fail.Fail] = asm_ct_scan(rett, ?names[0], 0, ct.mul_mask_none(), false, ?alloc);
     if (sel r_7582.err) { ret 6; }
 
     val retreg: str            = "ldr x9, {r}\nret x9";
-    val r_7585: err[fail.Fail] = asm_ct_scan(retreg, ?names[0], 1, false, false, ?alloc);
+    val r_7585: err[fail.Fail] = asm_ct_scan(retreg, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (!sel r_7585.err) { ret 7; }
 
     val pubbr:  str            = "mov x9, 5\nbr x9";
-    val r_7588: err[fail.Fail] = asm_ct_scan(pubbr, ?names[0], 1, false, false, ?alloc);
+    val r_7588: err[fail.Fail] = asm_ct_scan(pubbr, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (sel r_7588.err) { ret 8; }
 
     val pubret: str            = "mov x30, 5\nret";
-    val r_7591: err[fail.Fail] = asm_ct_scan(pubret, ?names[0], 1, false, false, ?alloc);
+    val r_7591: err[fail.Fail] = asm_ct_scan(pubret, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (sel r_7591.err) { ret 9; }
 
     val ordinaryret: str            = "ldr x0, {r}\nret";
-    val r_7594:      err[fail.Fail] = asm_ct_scan(ordinaryret, ?names[0], 1, false, false, ?alloc);
+    val r_7594:      err[fail.Fail] = asm_ct_scan(ordinaryret, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (sel r_7594.err) { ret 10; }
 
     val direct: str            = "b some_symbol";
-    val r_7597: err[fail.Fail] = asm_ct_scan(direct, ?names[0], 1, false, false, ?alloc);
+    val r_7597: err[fail.Fail] = asm_ct_scan(direct, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (sel r_7597.err) { ret 11; }
 
     ret 0;
@@ -8348,17 +8499,17 @@ test "mach.lang.target.isa.arm64.encode.asm_ct_scan:cset_flags_taint_reaches_des
     names[0] = "r";
 
     val leak:   str            = "ldr x0, {r}\ncmp x0, x1\ncset x2, eq\nldr x3, [x2]";
-    val r_7611: err[fail.Fail] = asm_ct_scan(leak, ?names[0], 1, false, false, ?alloc);
+    val r_7611: err[fail.Fail] = asm_ct_scan(leak, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (!sel r_7611.err) { bad = bad + 1; }
-    val r_7612: err[fail.Fail] = asm_ct_scan(leak, ?names[0], 0, false, false, ?alloc);
+    val r_7612: err[fail.Fail] = asm_ct_scan(leak, ?names[0], 0, ct.mul_mask_none(), false, ?alloc);
     if (sel r_7612.err) { bad = bad + 2; }
 
     val pubcmp: str            = "mov x0, 5\ncmp x0, x1\ncset x2, eq\nldr x3, [x2]";
-    val r_7615: err[fail.Fail] = asm_ct_scan(pubcmp, ?names[0], 1, false, false, ?alloc);
+    val r_7615: err[fail.Fail] = asm_ct_scan(pubcmp, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (sel r_7615.err) { bad = bad + 4; }
 
     val nocmp:  str            = "ldr x0, {r}\ncset x2, eq\nldr x3, [x2]";
-    val r_7618: err[fail.Fail] = asm_ct_scan(nocmp, ?names[0], 1, false, false, ?alloc);
+    val r_7618: err[fail.Fail] = asm_ct_scan(nocmp, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (sel r_7618.err) { bad = bad + 8; }
 
     ret bad;
@@ -8373,17 +8524,17 @@ test "mach.lang.target.isa.arm64.encode.asm_ct_scan:mrs_nzcv_flags_taint_reaches
     names[0] = "r";
 
     val leak:   str            = "ldr x0, {r}\ncmp x0, x1\nmrs x2, nzcv\nldr x3, [x2]";
-    val r_7632: err[fail.Fail] = asm_ct_scan(leak, ?names[0], 1, false, false, ?alloc);
+    val r_7632: err[fail.Fail] = asm_ct_scan(leak, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (!sel r_7632.err) { bad = bad + 1; }
-    val r_7633: err[fail.Fail] = asm_ct_scan(leak, ?names[0], 0, false, false, ?alloc);
+    val r_7633: err[fail.Fail] = asm_ct_scan(leak, ?names[0], 0, ct.mul_mask_none(), false, ?alloc);
     if (sel r_7633.err) { bad = bad + 2; }
 
     val pubcmp: str            = "mov x0, 5\ncmp x0, x1\nmrs x2, nzcv\nldr x3, [x2]";
-    val r_7636: err[fail.Fail] = asm_ct_scan(pubcmp, ?names[0], 1, false, false, ?alloc);
+    val r_7636: err[fail.Fail] = asm_ct_scan(pubcmp, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (sel r_7636.err) { bad = bad + 4; }
 
     val nocmp:  str            = "ldr x0, {r}\nmrs x2, nzcv\nldr x3, [x2]";
-    val r_7639: err[fail.Fail] = asm_ct_scan(nocmp, ?names[0], 1, false, false, ?alloc);
+    val r_7639: err[fail.Fail] = asm_ct_scan(nocmp, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (sel r_7639.err) { bad = bad + 8; }
 
     ret bad;
@@ -8398,26 +8549,26 @@ test "mach.lang.target.isa.arm64.encode.asm_ct_scan:cmp_defines_rather_than_mere
     names[0] = "r";
 
     val leak:   str            = "ldr x0, {r}\ncmp x0, x1\nb.eq 1f\n1:\nnop";
-    val r_7653: err[fail.Fail] = asm_ct_scan(leak, ?names[0], 1, false, false, ?alloc);
+    val r_7653: err[fail.Fail] = asm_ct_scan(leak, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (!sel r_7653.err) { bad = bad + 1; }
-    val r_7654: err[fail.Fail] = asm_ct_scan(leak, ?names[0], 0, false, false, ?alloc);
+    val r_7654: err[fail.Fail] = asm_ct_scan(leak, ?names[0], 0, ct.mul_mask_none(), false, ?alloc);
     if (sel r_7654.err) { bad = bad + 2; }
 
     val pubcmp: str            = "mov x0, 5\ncmp x0, x1\nb.eq 1f\n1:\nnop";
-    val r_7657: err[fail.Fail] = asm_ct_scan(pubcmp, ?names[0], 1, false, false, ?alloc);
+    val r_7657: err[fail.Fail] = asm_ct_scan(pubcmp, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (sel r_7657.err) { bad = bad + 4; }
 
     val redefined: str            = "ldr x0, {r}\ncmp x0, x1\nmov x2, 5\ncmp x2, x1\nb.eq 1f\n1:\nnop";
-    val r_7660:    err[fail.Fail] = asm_ct_scan(redefined, ?names[0], 1, false, false, ?alloc);
+    val r_7660:    err[fail.Fail] = asm_ct_scan(redefined, ?names[0], 1, ct.mul_mask_none(), false, ?alloc);
     if (sel r_7660.err) { bad = bad + 8; }
 
     ret bad;
 }
 
 pub fun asm_ct_scan(body: str, secret_names: *str, n_secret: u32,
-    trust_mul: bool, trust_shift: bool, alloc: *A.Allocator) err[fail.Fail] {
+    mul: ct.CtMulMask, trust_shift: bool, alloc: *A.Allocator) err[fail.Fail] {
     var g: iasm.Grammar = a64_grammar();
-    ret iasm.ct_scan(?g, body, secret_names, n_secret, trust_mul, trust_shift);
+    ret iasm.ct_scan(?g, body, secret_names, n_secret, mul, trust_shift);
 }
 
 test "mach.lang.target.isa.arm64.encode.asm_ct_class:decode_channel_is_classified" {
@@ -9042,7 +9193,7 @@ fun t_neon3_allocated(op: mop.MachOp, size: u32) bool {
 test "mach.lang.target.isa.arm64.encode.neon_3same_refusal:partition_MachOp" {
     # the integer multiply is the one member without a size-3 arrangement;
     # every other member encodes at every size
-    val others: [115]mop.MachOp = [115]mop.MachOp{mop.MOP_NONE, mop.NOP, mop.YIELD, mop.WFE, mop.WFI, mop.RET,
+    val others: [125]mop.MachOp = [125]mop.MachOp{mop.MOP_NONE, mop.NOP, mop.YIELD, mop.WFE, mop.WFI, mop.RET,
         mop.SVC, mop.BRK, mop.HVC, mop.SMC, mop.MOV, mop.MOVZ, mop.MOVK, mop.MVN, mop.NEG, mop.ADD, mop.ADDS,
         mop.SUB, mop.SUBS, mop.CMP, mop.CMN, mop.AND, mop.ORR, mop.ORN, mop.EOR, mop.MUL, mop.MNEG, mop.MADD,
         mop.MSUB, mop.SDIV, mop.UDIV, mop.LSL, mop.LSR, mop.ASR, mop.LSLV, mop.LSRV, mop.ASRV, mop.UBFX,
@@ -9054,9 +9205,10 @@ test "mach.lang.target.isa.arm64.encode.neon_3same_refusal:partition_MachOp" {
         mop.V_FADD, mop.V_FSUB, mop.V_FMUL, mop.V_FDIV, mop.V_ADD, mop.V_SUB, mop.V_AND, mop.V_ORR, mop.V_EOR,
         mop.V_MVN, mop.V_MOV, mop.V_CMEQ, mop.V_CMGT, mop.V_CMGE, mop.V_CMHI, mop.V_CMHS, mop.V_FCMEQ,
         mop.V_FCMGT, mop.V_FCMGE, mop.UMOV, mop.MOV_LANE, mop.INS, mop.DUP, mop.FMOV_GEN, mop.FMOV_IMM,
-        mop.INS_EL, mop.MOP_LAST};
+        mop.INS_EL, mop.V_SXTL, mop.V_UXTL, mop.V_XTN, mop.V_SQXTN, mop.V_UQXTN, mop.V_FCVTL, mop.V_FCVTN,
+        mop.V_SCVTF, mop.V_UCVTF, mop.V_FCVTZS, mop.MOP_LAST};
     var i: usize = 0;
-    for (i < 115) {
+    for (i < 125) {
         var size: u32 = 0;
         for (size < 4) {
             if (!t_neon3_allocated(others[i], size)) { ret 1; }
