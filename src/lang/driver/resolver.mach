@@ -1,0 +1,1226 @@
+use std.allocator.arena;
+use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.format;
+use std.text.string.str_dup;
+use std.text.string.str_dup_range;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_contains;
+use std.types.string.str_empty;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+
+use mach.lang.build.outcome;
+use cand: mach.lang.driver.candidates;
+use mach.lang.manifest;
+use range: mach.lang.manifest.version;
+
+# dependency version resolution (#3496, #3501): PubGrub (Weizenbaum 2018, as in Dart's pub)
+# over finite domains. an identity's domain is its listed releases, so a set of versions is
+# a bitset over them and complement is exact. the running compiler is checked per release as
+# its own incompatibility, and a failure is explained from the derivation that proved it
+
+pub rec Need {
+    id:    str;
+    url:   str;
+    range: str;
+}
+
+# what a release asks for: the compiler range its manifest states ("" for none) and its
+# dependencies selected by version range
+pub rec ReleaseNeeds {
+    mach:  str;
+    needs: Vector[Need];
+}
+
+# fills `out` (initialized by the caller over the solve's allocator) for one release
+pub def NeedsFn: fun(ptr, str, str, *cand.Release, *ReleaseNeeds) err[outcome.Fail];
+
+# a preferred version, kept while it still satisfies every requirement (`update <name>`)
+pub rec Lock {
+    id:      str;
+    version: str;
+}
+
+pub rec Problem {
+    root:       str;
+    needs:      *Need;
+    need_count: u32;
+    compiler:   str;
+    lowest:     bool;
+    locks:      *Lock;
+    lock_count: u32;
+}
+
+pub rec Choice {
+    id:      str;
+    url:     str;
+    tag:     str;
+    commit:  str;
+    version: str;
+}
+
+rec Pkg {
+    id:         str;
+    url:        str;
+    rels:       Vector[cand.Release];
+    words:      usize;
+    listed:     bool;
+    list_error: str;
+}
+
+rec Term {
+    pkg:      u32;
+    set:      *u64;
+    positive: bool;
+}
+
+def CauseKind: u8;
+val C_ROOT:        CauseKind = 0;
+val C_DEP:         CauseKind = 1;
+val C_NO_VERSIONS: CauseKind = 2;
+val C_COMPILER:    CauseKind = 3;
+val C_UNLISTED:    CauseKind = 4;
+val C_DERIVED:     CauseKind = 5;
+val C_BASE:        CauseKind = 6;
+
+rec Incompat {
+    terms:   Vector[Term];
+    kind:    CauseKind;
+    left:    u32;
+    right:   u32;
+    owner:   u32;
+    version: u32;
+    target:  u32;
+    text:    str;
+}
+
+rec Assign {
+    term:    Term;
+    level:   u32;
+    cause:   i64;
+    version: i64;
+}
+
+rec Solver {
+    a:        *A.Allocator;
+    src:      *cand.CandidateSource;
+    needs:    NeedsFn;
+    ctx:      ptr;
+    problem:  *Problem;
+    compiler: range.Version;
+    pkgs:     Vector[Pkg];
+    incs:     Vector[Incompat];
+    assigns:  Vector[Assign];
+    level:    u32;
+    failure:  str;
+}
+
+val NO_INCOMPAT: i64 = -1;
+
+# add_incompat's answer for an incompatibility that can never hold and is not recorded
+val VACUOUS: u32 = 0xFFFFFFFF;
+
+# ---- bitsets over one package's releases -------------------------------------------
+
+fun domain(s: *Solver, p: u32) usize {
+    if (p == 0) { ret 1; }
+    ret s.pkgs.data[p].rels.len;
+}
+
+fun set_new(s: *Solver, p: u32, full: bool) *u64 {
+    val words: usize              = s.pkgs.data[p].words;
+    val r:     res[*u64, A.Error] = A.allocate[u64](s.a, words);
+    if (sel r.err) { ret nil; }
+    val bits: *u64  = r.ok;
+    var i:    usize = 0;
+    for (i < words) {
+        bits[i] = 0;
+        i       = i + 1;
+    }
+    if (full) {
+        val n: usize = domain(s, p);
+        var k: usize = 0;
+        for (k < n) {
+            bits[k / 64] = bits[k / 64] | (1::u64 << (k % 64)::u64);
+            k            = k + 1;
+        }
+    }
+    ret bits;
+}
+
+fun set_has(bits: *u64, k: usize) bool {
+    ret (bits[k / 64] & (1::u64 << (k % 64)::u64)) != 0;
+}
+
+fun set_put(bits: *u64, k: usize) {
+    bits[k / 64] = bits[k / 64] | (1::u64 << (k % 64)::u64);
+}
+
+def SetOp: u8;
+val OP_AND:    SetOp = 0;
+val OP_OR:     SetOp = 1;
+val OP_ANDNOT: SetOp = 2;
+
+fun set_combine(s: *Solver, p: u32, x: *u64, y: *u64, op: SetOp) *u64 {
+    val out:   *u64  = set_new(s, p, false);
+    val words: usize = s.pkgs.data[p].words;
+    if (out == nil) { ret nil; }
+    var i: usize = 0;
+    for (i < words) {
+        if (op == OP_AND) { out[i] = x[i] & y[i]; }
+        or (op == OP_OR)  { out[i] = x[i] | y[i]; }
+        or                { out[i] = x[i] & ~y[i]; }
+        i = i + 1;
+    }
+    ret out;
+}
+
+fun set_empty(s: *Solver, p: u32, x: *u64) bool {
+    val words: usize = s.pkgs.data[p].words;
+    var i:     usize = 0;
+    for (i < words) {
+        if (x[i] != 0) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun set_count(s: *Solver, p: u32, x: *u64) usize {
+    var n: usize = 0;
+    var k: usize = 0;
+    for (k < domain(s, p)) {
+        if (set_has(x, k)) { n = n + 1; }
+        k = k + 1;
+    }
+    ret n;
+}
+
+fun set_equal(s: *Solver, p: u32, x: *u64, y: *u64) bool {
+    val words: usize = s.pkgs.data[p].words;
+    var i:     usize = 0;
+    for (i < words) {
+        if (x[i] != y[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# ---- terms ------------------------------------------------------------------------------
+
+fun term_equal(s: *Solver, x: *Term, y: *Term) bool {
+    ret x.pkg == y.pkg && x.positive == y.positive && set_equal(s, x.pkg, x.set, y.set);
+}
+
+# the conjunction of two terms on one package
+fun term_intersect(s: *Solver, x: *Term, y: *Term) Term {
+    if (x.positive && y.positive) { ret Term{pkg: x.pkg, set: set_combine(s, x.pkg, x.set, y.set, OP_AND), positive: true}; }
+    if (x.positive)               { ret Term{pkg: x.pkg, set: set_combine(s, x.pkg, x.set, y.set, OP_ANDNOT), positive: true}; }
+    if (y.positive)               { ret Term{pkg: x.pkg, set: set_combine(s, x.pkg, y.set, x.set, OP_ANDNOT), positive: true}; }
+    ret Term{pkg: x.pkg, set: set_combine(s, x.pkg, x.set, y.set, OP_OR), positive: false};
+}
+
+fun term_inverse(t: *Term) Term {
+    ret Term{pkg: t.pkg, set: t.set, positive: !t.positive};
+}
+
+# a positive term over no version can never hold
+fun term_void(s: *Solver, t: *Term) bool {
+    ret t.positive && set_empty(s, t.pkg, t.set);
+}
+
+# ---- the partial solution ----------------------------------------------------------------
+
+rec Known {
+    allowed:  *u64;
+    selected: bool;
+}
+
+# what the first `upto` assignments say about package `p`
+fun known(s: *Solver, p: u32, upto: usize) Known {
+    var k: Known = Known{allowed: set_new(s, p, true), selected: false};
+    var i: usize = 0;
+    for (i < upto) {
+        val as: *Assign = ?s.assigns.data[i];
+        if (as.term.pkg == p) {
+            if (as.term.positive) {
+                k.allowed  = set_combine(s, p, k.allowed, as.term.set, OP_AND);
+                k.selected = true;
+            }
+            or { k.allowed = set_combine(s, p, k.allowed, as.term.set, OP_ANDNOT); }
+        }
+        i = i + 1;
+    }
+    ret k;
+}
+
+def Relation: u8;
+val REL_SATISFIED:    Relation = 0;
+val REL_CONTRADICTED: Relation = 1;
+val REL_OPEN:         Relation = 2;
+
+fun relation(s: *Solver, t: *Term, k: *Known) Relation {
+    val outside: *u64 = set_combine(s, t.pkg, k.allowed, t.set, OP_ANDNOT);
+    val inside:  *u64 = set_combine(s, t.pkg, k.allowed, t.set, OP_AND);
+    val within:  bool = set_empty(s, t.pkg, outside);
+    val apart:   bool = set_empty(s, t.pkg, inside);
+    if (t.positive) {
+        if (k.selected && within) { ret REL_SATISFIED; }
+        if (apart)                { ret REL_CONTRADICTED; }
+        ret REL_OPEN;
+    }
+    if (apart)                { ret REL_SATISFIED; }
+    if (k.selected && within) { ret REL_CONTRADICTED; }
+    ret REL_OPEN;
+}
+
+# the index of the earliest assignment after which `t` holds
+fun satisfier(s: *Solver, t: *Term) usize {
+    var i: usize = 0;
+    for (i < s.assigns.len) {
+        var k: Known = known(s, t.pkg, i + 1);
+        if (s.assigns.data[i].term.pkg == t.pkg && relation(s, t, ?k) == REL_SATISFIED) { ret i; }
+        i = i + 1;
+    }
+    ret s.assigns.len;
+}
+
+fun assign(s: *Solver, t: Term, cause: i64, version: i64) err[outcome.Fail] {
+    val pushed: res[usize, A.Error] = vector.push[Assign](?s.assigns, Assign{term: t, level: s.level, cause: cause, version: version});
+    if (sel pushed.err) { ret err[outcome.Fail].err{outcome.refused(pushed.err)}; }
+    ret err[outcome.Fail].ok{};
+}
+
+fun decided(s: *Solver, p: u32) bool {
+    var i: usize = 0;
+    for (i < s.assigns.len) {
+        if (s.assigns.data[i].term.pkg == p && s.assigns.data[i].cause == NO_INCOMPAT) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun backtrack(s: *Solver, level: u32) {
+    var keep: usize = 0;
+    for (keep < s.assigns.len && s.assigns.data[keep].level <= level) { keep = keep + 1; }
+    s.assigns.len = keep;
+    s.level       = level;
+}
+
+# ---- incompatibilities --------------------------------------------------------------------
+
+fun add_incompat(s: *Solver, terms: Vector[Term], kind: CauseKind, left: u32, right: u32,
+    owner: u32, version: u32, target: u32, text: str) res[u32, outcome.Fail] {
+    # terms on one package are conjoined; a derived fact never needs the root's own term
+    var merged: Vector[Term] = vector.init[Term](s.a);
+    var i:      usize        = 0;
+    for (i < terms.len) {
+        var t: Term = terms.data[i];
+        # `not p in {}` always holds, so it constrains nothing
+        if (!t.positive && set_empty(s, t.pkg, t.set)) {
+            i = i + 1;
+            cnt;
+        }
+        var found: bool  = false;
+        var j:     usize = 0;
+        for (j < merged.len) {
+            if (merged.data[j].pkg == t.pkg) {
+                merged.data[j] = term_intersect(s, ?merged.data[j], ?t);
+                found          = true;
+            }
+            j = j + 1;
+        }
+        if (!found) {
+            val p: res[usize, A.Error] = vector.push[Term](?merged, t);
+            if (sel p.err) { ret res[u32, outcome.Fail].err{outcome.refused(p.err)}; }
+        }
+        i = i + 1;
+    }
+    # a term no assignment can satisfy makes the whole incompatibility vacuous
+    var v: usize = 0;
+    for (v < merged.len) {
+        if (term_void(s, ?merged.data[v])) { ret res[u32, outcome.Fail].ok{VACUOUS}; }
+        v = v + 1;
+    }
+    if (kind == C_DERIVED && merged.len > 1) {
+        var w: usize = 0;
+        var r: usize = 0;
+        for (r < merged.len) {
+            if (!(merged.data[r].pkg == 0 && merged.data[r].positive)) {
+                merged.data[w] = merged.data[r];
+                w              = w + 1;
+            }
+            r = r + 1;
+        }
+        merged.len = w;
+    }
+    val inc: Incompat = Incompat{terms: merged, kind: kind, left: left, right: right, owner: owner,
+        version: version, target: target, text: text};
+    val pushed: res[usize, A.Error] = vector.push[Incompat](?s.incs, inc);
+    if (sel pushed.err) { ret res[u32, outcome.Fail].err{outcome.refused(pushed.err)}; }
+    ret res[u32, outcome.Fail].ok{(pushed.ok - 1)::u32};
+}
+
+fun terms_of(s: *Solver, x: Term, y: opt[Term]) Vector[Term] {
+    var v: Vector[Term] = vector.init[Term](s.a);
+    vector.push[Term](?v, x);
+    if (sel y.some) { vector.push[Term](?v, y.some); }
+    ret v;
+}
+
+val PROP_NONE:     i64 = -1;
+val PROP_CONFLICT: i64 = -2;
+
+# derive from an incompatibility all of whose terms but one hold
+fun propagate_one(s: *Solver, ii: u32) res[i64, outcome.Fail] {
+    var open:  i64   = -1;
+    val count: usize = s.incs.data[ii].terms.len;
+    var t:     usize = 0;
+    for (t < count) {
+        val term: *Term    = ?s.incs.data[ii].terms.data[t];
+        var k:    Known    = known(s, term.pkg, s.assigns.len);
+        val rel:  Relation = relation(s, term, ?k);
+        if (rel == REL_CONTRADICTED) { ret res[i64, outcome.Fail].ok{PROP_NONE}; }
+        if (rel == REL_OPEN) {
+            if (open >= 0) { ret res[i64, outcome.Fail].ok{PROP_NONE}; }
+            open = t::i64;
+        }
+        t = t + 1;
+    }
+    if (open < 0) { ret res[i64, outcome.Fail].ok{PROP_CONFLICT}; }
+    val term:  Term              = s.incs.data[ii].terms.data[open::usize];
+    val added: err[outcome.Fail] = assign(s, term_inverse(?term), ii::i64, -1);
+    if (sel added.err) { ret res[i64, outcome.Fail].err{added.err}; }
+    ret res[i64, outcome.Fail].ok{term.pkg::i64};
+}
+
+fun mentions(s: *Solver, ii: u32, p: u32) bool {
+    var t: usize = 0;
+    for (t < s.incs.data[ii].terms.len) {
+        if (s.incs.data[ii].terms.data[t].pkg == p) { ret true; }
+        t = t + 1;
+    }
+    ret false;
+}
+
+fun is_failure(s: *Solver, ii: u32) bool {
+    val terms: *Vector[Term] = ?s.incs.data[ii].terms;
+    if (terms.len == 0) { ret true; }
+    ret terms.len == 1 && terms.data[0].pkg == 0 && terms.data[0].positive;
+}
+
+# learn from a conflict until the partial solution can be repaired by backjumping
+fun resolve_conflict(s: *Solver, start: u32) res[u32, outcome.Fail] {
+    var ii: u32 = start;
+    for (true) {
+        if (is_failure(s, ii)) { ret res[u32, outcome.Fail].err{outcome.user(explain(s, ii))}; }
+        var recent_term: Term  = s.incs.data[ii].terms.data[0];
+        var recent:      i64   = -1;
+        var previous:    u32   = 1;
+        var difference:  Term;
+        var has_diff:    bool  = false;
+        var t:           usize = 0;
+        for (t < s.incs.data[ii].terms.len) {
+            val term: Term  = s.incs.data[ii].terms.data[t];
+            val at:   usize = satisfier(s, ?term);
+            if (recent < 0) {
+                recent_term = term;
+                recent      = at::i64;
+            }
+            or (recent::usize < at) {
+                if (s.assigns.data[recent::usize].level > previous) { previous = s.assigns.data[recent::usize].level; }
+                recent_term = term;
+                recent      = at::i64;
+                has_diff    = false;
+            }
+            or {
+                if (s.assigns.data[at].level > previous) { previous = s.assigns.data[at].level; }
+            }
+            if (term_equal(s, ?recent_term, ?term)) {
+                val not_term: Term = term_inverse(?term);
+                difference = term_intersect(s, ?s.assigns.data[recent::usize].term, ?not_term);
+                has_diff   = !term_void(s, ?difference);
+                if (has_diff) {
+                    val inv: Term  = term_inverse(?difference);
+                    val di:  usize = satisfier(s, ?inv);
+                    if (di < s.assigns.len && s.assigns.data[di].level > previous) { previous = s.assigns.data[di].level; }
+                }
+            }
+            t = t + 1;
+        }
+        val sat: *Assign = ?s.assigns.data[recent::usize];
+        if (previous < sat.level || sat.cause == NO_INCOMPAT) {
+            backtrack(s, previous);
+            ret res[u32, outcome.Fail].ok{ii};
+        }
+        var terms: Vector[Term] = vector.init[Term](s.a);
+        t = 0;
+        for (t < s.incs.data[ii].terms.len) {
+            val term: Term = s.incs.data[ii].terms.data[t];
+            if (!term_equal(s, ?term, ?recent_term)) { vector.push[Term](?terms, term); }
+            t = t + 1;
+        }
+        val cause: u32 = sat.cause::u32;
+        t = 0;
+        for (t < s.incs.data[cause].terms.len) {
+            val term: Term = s.incs.data[cause].terms.data[t];
+            if (term.pkg != sat.term.pkg) { vector.push[Term](?terms, term); }
+            t = t + 1;
+        }
+        if (has_diff) { vector.push[Term](?terms, term_inverse(?difference)); }
+        val derived: res[u32, outcome.Fail] = add_incompat(s, terms, C_DERIVED, ii, cause, 0, 0, 0, "");
+        if (sel derived.err)       { ret derived; }
+        if (derived.ok == VACUOUS) { ret res[u32, outcome.Fail].err{outcome.internal("internal: conflict resolution derived a vacuous incompatibility")}; }
+        ii = derived.ok;
+    }
+    ret res[u32, outcome.Fail].ok{ii};
+}
+
+fun propagate(s: *Solver, first: u32) err[outcome.Fail] {
+    var changed: Vector[u32] = vector.init[u32](s.a);
+    vector.push[u32](?changed, first);
+    for (changed.len > 0) {
+        val p: u32 = changed.data[changed.len - 1];
+        changed.len = changed.len - 1;
+        var n: usize = s.incs.len;
+        for (n > 0) {
+            n = n - 1;
+            if (!mentions(s, n::u32, p)) { cnt; }
+            val r: res[i64, outcome.Fail] = propagate_one(s, n::u32);
+            if (sel r.err) { ret err[outcome.Fail].err{r.err}; }
+            if (r.ok == PROP_CONFLICT) {
+                val root_cause: res[u32, outcome.Fail] = resolve_conflict(s, n::u32);
+                if (sel root_cause.err) { ret err[outcome.Fail].err{root_cause.err}; }
+                val again: res[i64, outcome.Fail] = propagate_one(s, root_cause.ok);
+                if (sel again.err) { ret err[outcome.Fail].err{again.err}; }
+                changed.len = 0;
+                if (again.ok >= 0) { vector.push[u32](?changed, again.ok::u32); }
+                brk;
+            }
+            if (r.ok >= 0) { vector.push[u32](?changed, r.ok::u32); }
+        }
+    }
+    ret err[outcome.Fail].ok{};
+}
+
+# ---- packages and decisions --------------------------------------------------------------
+
+fun find_pkg(s: *Solver, id: str) i64 {
+    var i: usize = 0;
+    for (i < s.pkgs.len) {
+        if (str_equals(s.pkgs.data[i].id, id)) { ret i::i64; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+fun sort_releases(rels: *Vector[cand.Release]) {
+    var i: usize = 1;
+    for (i < rels.len) {
+        var j: usize = i;
+        for (j > 0 && range.compare(?rels.data[j - 1].version, ?rels.data[j].version) > 0) {
+            val tmp: cand.Release = rels.data[j - 1];
+            rels.data[j - 1] = rels.data[j];
+            rels.data[j]     = tmp;
+            j                = j - 1;
+        }
+        i = i + 1;
+    }
+}
+
+# the package for `id`, its releases listed the first time it is seen; a listing failure is
+# kept and becomes an incompatibility when the package is needed
+fun package(s: *Solver, id: str, url: str) res[u32, outcome.Fail] {
+    val seen: i64 = find_pkg(s, id);
+    if (seen >= 0) { ret res[u32, outcome.Fail].ok{seen::u32}; }
+    var p:      Pkg               = Pkg{id: id, url: url, rels: vector.init[cand.Release](s.a), words: 1, listed: true, list_error: ""};
+    val listed: err[outcome.Fail] = s.src.releases(s.src.ctx, url, ?p.rels);
+    if (sel listed.err) {
+        p.listed     = false;
+        p.list_error = outcome.describe(listed.err);
+        p.rels.len   = 0;
+    }
+    sort_releases(?p.rels);
+    p.words = (p.rels.len + 64) / 64;
+    val pushed: res[usize, A.Error] = vector.push[Pkg](?s.pkgs, p);
+    if (sel pushed.err) { ret res[u32, outcome.Fail].err{outcome.refused(pushed.err)}; }
+    ret res[u32, outcome.Fail].ok{(pushed.ok - 1)::u32};
+}
+
+fun range_set(s: *Solver, p: u32, text: str, who: str) res[*u64, outcome.Fail] {
+    val parsed: res[range.Range, range.RangeError] = range.parse_range(text);
+    if (sel parsed.err) {
+        val msg: res[str, format.FormatError] = format.sprint(s.a, "{} requires {} \"{}\": {} (clause {})",
+            who, s.pkgs.data[p].id, text, parsed.err.reason, parsed.err.clause);
+        if (sel msg.err) { ret res[*u64, outcome.Fail].err{outcome.user("a dependency range is invalid")}; }
+        ret res[*u64, outcome.Fail].err{outcome.user(msg.ok)};
+    }
+    var r:    range.Range = parsed.ok;
+    val bits: *u64        = set_new(s, p, false);
+    var k:    usize       = 0;
+    for (k < s.pkgs.data[p].rels.len) {
+        if (range.satisfies(?r, ?s.pkgs.data[p].rels.data[k].version)) { set_put(bits, k); }
+        k = k + 1;
+    }
+    ret res[*u64, outcome.Fail].ok{bits};
+}
+
+fun single(s: *Solver, p: u32, k: usize) *u64 {
+    val bits: *u64 = set_new(s, p, false);
+    set_put(bits, k);
+    ret bits;
+}
+
+fun locked_index(s: *Solver, p: u32, allowed: *u64) i64 {
+    var i: u32 = 0;
+    for (i < s.problem.lock_count) {
+        if (str_equals(s.problem.locks[i].id, s.pkgs.data[p].id)) {
+            var k: usize = 0;
+            for (k < s.pkgs.data[p].rels.len) {
+                if (set_has(allowed, k) && str_equals(s.pkgs.data[p].rels.data[k].text, s.problem.locks[i].version)) { ret k::i64; }
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+fun needs_incompats(s: *Solver, p: u32, k: usize, rn: *ReleaseNeeds, out_conflict: *bool) err[outcome.Fail] {
+    val rel: *cand.Release = ?s.pkgs.data[p].rels.data[k];
+    if (!str_empty(rn.mach)) {
+        val admitted: res[range.Range, range.RangeError] = range.parse_range(rn.mach);
+        var ok:       bool                               = false;
+        if (sel admitted.ok) {
+            var r: range.Range = admitted.ok;
+            ok = range.satisfies(?r, ?s.compiler);
+        }
+        if (!ok) {
+            val ci: res[u32, outcome.Fail] = add_incompat(s, terms_of(s, Term{pkg: p, set: single(s, p, k), positive: true}, opt[Term].none{}),
+                C_COMPILER, 0, 0, p, k::u32, 0, rn.mach);
+            if (sel ci.err) { ret err[outcome.Fail].err{ci.err}; }
+            @out_conflict = true;
+            ret err[outcome.Fail].ok{};
+        }
+    }
+    var i: usize = 0;
+    for (i < rn.needs.len) {
+        val need: *Need                  = ?rn.needs.data[i];
+        val dp:   res[u32, outcome.Fail] = package(s, need.id, need.url);
+        if (sel dp.err) { ret err[outcome.Fail].err{dp.err}; }
+        if (!s.pkgs.data[dp.ok].listed) {
+            val ui: res[u32, outcome.Fail] = add_incompat(s, terms_of(s, Term{pkg: p, set: single(s, p, k), positive: true}, opt[Term].none{}),
+                C_UNLISTED, 0, 0, p, k::u32, dp.ok, s.pkgs.data[dp.ok].list_error);
+            if (sel ui.err) { ret err[outcome.Fail].err{ui.err}; }
+            @out_conflict = true;
+            i             = i + 1;
+            cnt;
+        }
+        val who:      res[str, format.FormatError] = format.sprint(s.a, "{} {}", s.pkgs.data[p].id, rel.text);
+        var who_text: str                          = s.pkgs.data[p].id;
+        if (sel who.ok) { who_text = who.ok; }
+        val set: res[*u64, outcome.Fail] = range_set(s, dp.ok, need.range, who_text);
+        if (sel set.err) { ret err[outcome.Fail].err{set.err}; }
+        val ii: res[u32, outcome.Fail] = add_incompat(s,
+            terms_of(s, Term{pkg: p, set: single(s, p, k), positive: true}, opt[Term].some{Term{pkg: dp.ok, set: set.ok, positive: false}}),
+            C_DEP, 0, 0, p, k::u32, dp.ok, need.range);
+        if (sel ii.err) { ret err[outcome.Fail].err{ii.err}; }
+        if (ii.ok == VACUOUS) {
+            i = i + 1;
+            cnt;
+        }
+        var all: bool  = true;
+        var t:   usize = 0;
+        for (t < s.incs.data[ii.ok].terms.len) {
+            val term: *Term = ?s.incs.data[ii.ok].terms.data[t];
+            if (term.pkg != p) {
+                var kn: Known = known(s, term.pkg, s.assigns.len);
+                if (relation(s, term, ?kn) != REL_SATISFIED) { all = false; }
+            }
+            t = t + 1;
+        }
+        if (all) { @out_conflict = true; }
+        i = i + 1;
+    }
+    ret err[outcome.Fail].ok{};
+}
+
+# decide one version of the most constrained package still open; -1 when all are decided
+fun decide_next(s: *Solver) res[i64, outcome.Fail] {
+    var best:       i64   = -1;
+    var best_count: usize = 0;
+    var best_allow: *u64  = nil;
+    var p:          u32   = 1;
+    for (p < s.pkgs.len::u32) {
+        var k: Known = known(s, p, s.assigns.len);
+        if (k.selected && !decided(s, p)) {
+            val n: usize = set_count(s, p, k.allowed);
+            if (best < 0 || n < best_count) {
+                best       = p::i64;
+                best_count = n;
+                best_allow = k.allowed;
+            }
+        }
+        p = p + 1;
+    }
+    if (best < 0) { ret res[i64, outcome.Fail].ok{-1}; }
+    val bp: u32 = best::u32;
+    if (best_count == 0) {
+        var pos: *u64  = set_new(s, bp, true);
+        var i:   usize = 0;
+        for (i < s.assigns.len) {
+            if (s.assigns.data[i].term.pkg == bp && s.assigns.data[i].term.positive) {
+                pos = set_combine(s, bp, pos, s.assigns.data[i].term.set, OP_AND);
+            }
+            i = i + 1;
+        }
+        val ni: res[u32, outcome.Fail] = add_incompat(s, terms_of(s, Term{pkg: bp, set: pos, positive: true}, opt[Term].none{}),
+            C_NO_VERSIONS, 0, 0, bp, 0, 0, "");
+        if (sel ni.err) { ret res[i64, outcome.Fail].err{ni.err}; }
+        ret res[i64, outcome.Fail].ok{best};
+    }
+    var pick: i64 = locked_index(s, bp, best_allow);
+    if (pick < 0) {
+        var k: usize = 0;
+        for (k < s.pkgs.data[bp].rels.len) {
+            if (set_has(best_allow, k)) {
+                if (s.problem.lowest) {
+                    if (pick < 0) { pick = k::i64; }
+                }
+                or { pick = k::i64; }
+            }
+            k = k + 1;
+        }
+    }
+    var rn:     ReleaseNeeds      = ReleaseNeeds{mach: "", needs: vector.init[Need](s.a)};
+    val filled: err[outcome.Fail] = s.needs(s.ctx, s.pkgs.data[bp].id, s.pkgs.data[bp].url,
+        ?s.pkgs.data[bp].rels.data[pick::usize], ?rn);
+    if (sel filled.err) { ret res[i64, outcome.Fail].err{filled.err}; }
+    var conflict: bool              = false;
+    val made:     err[outcome.Fail] = needs_incompats(s, bp, pick::usize, ?rn, ?conflict);
+    if (sel made.err) { ret res[i64, outcome.Fail].err{made.err}; }
+    if (!conflict) {
+        s.level = s.level + 1;
+        val d: err[outcome.Fail] = assign(s, Term{pkg: bp, set: single(s, bp, pick::usize), positive: true}, NO_INCOMPAT, pick);
+        if (sel d.err) { ret res[i64, outcome.Fail].err{d.err}; }
+    }
+    ret res[i64, outcome.Fail].ok{best};
+}
+
+# ---- explanation ---------------------------------------------------------------------------
+
+fun describe(s: *Solver, ii: u32) str {
+    val inc: *Incompat                    = ?s.incs.data[ii];
+    var r:   res[str, format.FormatError] = res[str, format.FormatError].ok{""};
+    if (inc.kind == C_ROOT) {
+        r = format.sprint(s.a, "{} requires {} {}", s.problem.root, s.pkgs.data[inc.target].id, inc.text);
+    }
+    or (inc.kind == C_DEP) {
+        r = format.sprint(s.a, "{} {} requires {} {}", s.pkgs.data[inc.owner].id,
+            s.pkgs.data[inc.owner].rels.data[inc.version].text, s.pkgs.data[inc.target].id, inc.text);
+    }
+    or (inc.kind == C_COMPILER) {
+        r = format.sprint(s.a, "{} {} requires mach {}, and this is mach {}", s.pkgs.data[inc.owner].id,
+            s.pkgs.data[inc.owner].rels.data[inc.version].text, inc.text, s.problem.compiler);
+    }
+    or (inc.kind == C_UNLISTED && inc.owner == 0) {
+        r = format.sprint(s.a, "{} requires {}, and the releases of {} cannot be listed: {}", s.problem.root,
+            s.pkgs.data[inc.target].id, s.pkgs.data[inc.target].id, inc.text);
+    }
+    or (inc.kind == C_UNLISTED) {
+        r = format.sprint(s.a, "{} {} requires {}, and the releases of {} cannot be listed: {}", s.pkgs.data[inc.owner].id,
+            s.pkgs.data[inc.owner].rels.data[inc.version].text, s.pkgs.data[inc.target].id, s.pkgs.data[inc.target].id, inc.text);
+    }
+    or (inc.kind == C_NO_VERSIONS) {
+        r = format.sprint(s.a, "no release of {} is left that every requirement accepts", s.pkgs.data[inc.owner].id);
+    }
+    if (sel r.ok) { ret r.ok; }
+    ret "an unrepresentable requirement";
+}
+
+fun collect_external(s: *Solver, ii: u32, seen: *bool, lines: *Vector[str]) {
+    if (seen[ii]) { ret; }
+    seen[ii] = true;
+    val inc: *Incompat = ?s.incs.data[ii];
+    if (inc.kind == C_DERIVED) {
+        collect_external(s, inc.left, seen, lines);
+        collect_external(s, inc.right, seen, lines);
+        ret;
+    }
+    vector.push[str](lines, describe(s, ii));
+}
+
+fun decider(s: *Solver, ii: u32) str {
+    val inc: *Incompat = ?s.incs.data[ii];
+    if (inc.kind == C_DERIVED) {
+        val l: str = decider(s, inc.left);
+        if (!str_empty(l)) { ret l; }
+        ret decider(s, inc.right);
+    }
+    if (inc.kind == C_DEP || inc.kind == C_ROOT || inc.kind == C_UNLISTED) { ret s.pkgs.data[inc.target].id; }
+    if (inc.kind == C_COMPILER || inc.kind == C_NO_VERSIONS)               { ret s.pkgs.data[inc.owner].id; }
+    ret "";
+}
+
+fun explain(s: *Solver, ii: u32) str {
+    val sr: res[*bool, A.Error] = A.allocate[bool](s.a, s.incs.len);
+    if (sel sr.err) { ret "no set of releases satisfies every requirement"; }
+    val seen: *bool = sr.ok;
+    var i:    usize = 0;
+    for (i < s.incs.len) {
+        seen[i] = false;
+        i       = i + 1;
+    }
+    var lines: Vector[str] = vector.init[str](s.a);
+    collect_external(s, ii, seen, ?lines);
+    var text: str = "no set of releases satisfies every requirement:";
+    i = 0;
+    for (i < lines.len) {
+        val r: res[str, format.FormatError] = format.sprint(s.a, "{}\n    {}", text, lines.data[i]);
+        if (sel r.ok) { text = r.ok; }
+        i = i + 1;
+    }
+    val id: str = decider(s, ii);
+    if (!str_empty(id)) {
+        val r: res[str, format.FormatError] = format.sprint(s.a,
+            "{}\n  the root decides by declaring the identity itself, for example:\n    [dep.{}]\n    version = \"<a range the root can use>\"", text, id);
+        if (sel r.ok) { text = r.ok; }
+    }
+    ret text;
+}
+
+# ---- entry ---------------------------------------------------------------------------------
+
+fun copy_out(a: *A.Allocator, text: str) str {
+    val r: res[str, A.Error] = str_dup(a, text);
+    if (sel r.err) { ret ""; }
+    ret r.ok;
+}
+
+# the selected release of every identity the root reaches, allocated in `a`
+pub fun resolve(a: *A.Allocator, src: *cand.CandidateSource, needs: NeedsFn, needs_ctx: ptr,
+    problem: *Problem) res[Vector[Choice], outcome.Fail] {
+    var backing: A.Allocator;
+    val made_b:  err[A.Error] = page.make(?backing);
+    if (sel made_b.err) { ret res[Vector[Choice], outcome.Fail].err{outcome.refused(made_b.err)}; }
+    var ar:     arena.Arena;
+    val init_r: err[A.Error] = arena.init(?ar, ?backing, 0);
+    if (sel init_r.err) { ret res[Vector[Choice], outcome.Fail].err{outcome.refused(init_r.err)}; }
+    fin { arena.dnit(?ar); }
+    var sa:     A.Allocator;
+    val made_a: err[A.Error] = arena.make(?sa, ?ar);
+    if (sel made_a.err) { ret res[Vector[Choice], outcome.Fail].err{outcome.refused(made_a.err)}; }
+
+    val compiler: res[range.Version, str] = range.parse_version(problem.compiler);
+    if (sel compiler.err) { ret res[Vector[Choice], outcome.Fail].err{outcome.internal("the compiler version does not parse")}; }
+    var s: Solver = Solver{a: ?sa, src: src, needs: needs, ctx: needs_ctx, problem: problem, compiler: compiler.ok,
+        pkgs: vector.init[Pkg](?sa), incs: vector.init[Incompat](?sa), assigns: vector.init[Assign](?sa), level: 0, failure: ""};
+
+    val root: Pkg = Pkg{id: problem.root, url: "", rels: vector.init[cand.Release](?sa), words: 1, listed: true, list_error: ""};
+    vector.push[Pkg](?s.pkgs, root);
+    # the root must be selected
+    val base: res[u32, outcome.Fail] = add_incompat(?s, terms_of(?s, Term{pkg: 0, set: set_new(?s, 0, true), positive: false}, opt[Term].none{}),
+        C_BASE, 0, 0, 0, 0, 0, "");
+    if (sel base.err) { ret res[Vector[Choice], outcome.Fail].err{base.err}; }
+    var i: u32 = 0;
+    for (i < problem.need_count) {
+        val need: *Need                  = ?problem.needs[i];
+        val dp:   res[u32, outcome.Fail] = package(?s, need.id, need.url);
+        if (sel dp.err) { ret res[Vector[Choice], outcome.Fail].err{dp.err}; }
+        if (!s.pkgs.data[dp.ok].listed) {
+            val ui: res[u32, outcome.Fail] = add_incompat(?s, terms_of(?s, Term{pkg: 0, set: set_new(?s, 0, true), positive: true}, opt[Term].none{}),
+                C_UNLISTED, 0, 0, 0, 0, dp.ok, s.pkgs.data[dp.ok].list_error);
+            if (sel ui.err) { ret res[Vector[Choice], outcome.Fail].err{ui.err}; }
+            i = i + 1;
+            cnt;
+        }
+        val set: res[*u64, outcome.Fail] = range_set(?s, dp.ok, need.range, problem.root);
+        if (sel set.err) { ret res[Vector[Choice], outcome.Fail].err{set.err}; }
+        val ri: res[u32, outcome.Fail] = add_incompat(?s,
+            terms_of(?s, Term{pkg: 0, set: set_new(?s, 0, true), positive: true}, opt[Term].some{Term{pkg: dp.ok, set: set.ok, positive: false}}),
+            C_ROOT, 0, 0, 0, 0, dp.ok, need.range);
+        if (sel ri.err) { ret res[Vector[Choice], outcome.Fail].err{ri.err}; }
+        i = i + 1;
+    }
+    # the root is the first decision, so backjumping to level 1 keeps it
+    s.level = 1;
+    val root_dec: err[outcome.Fail] = assign(?s, Term{pkg: 0, set: set_new(?s, 0, true), positive: true}, NO_INCOMPAT, 0);
+    if (sel root_dec.err) { ret res[Vector[Choice], outcome.Fail].err{root_dec.err}; }
+
+    var next: i64 = 0;
+    for (next >= 0) {
+        val prop: err[outcome.Fail] = propagate(?s, next::u32);
+        if (sel prop.err) { ret res[Vector[Choice], outcome.Fail].err{outcome.user(copy_out(a, outcome.describe(prop.err)))}; }
+        val chosen: res[i64, outcome.Fail] = decide_next(?s);
+        if (sel chosen.err) { ret res[Vector[Choice], outcome.Fail].err{outcome.user(copy_out(a, outcome.describe(chosen.err)))}; }
+        next = chosen.ok;
+    }
+
+    var out: Vector[Choice] = vector.init[Choice](a);
+    var j:   usize          = 0;
+    for (j < s.assigns.len) {
+        val as: *Assign = ?s.assigns.data[j];
+        if (as.cause == NO_INCOMPAT && as.term.pkg != 0) {
+            val pk:  *Pkg          = ?s.pkgs.data[as.term.pkg];
+            val rel: *cand.Release = ?pk.rels.data[as.version::usize];
+            vector.push[Choice](?out, Choice{id: copy_out(a, pk.id), url: copy_out(a, pk.url), tag: copy_out(a, rel.tag),
+                commit: copy_out(a, rel.commit), version: copy_out(a, rel.text)});
+        }
+        j = j + 1;
+    }
+    ret res[Vector[Choice], outcome.Fail].ok{out};
+}
+
+# ---- tests: an in-memory source -----------------------------------------------------------
+
+rec TRel {
+    id:      str;
+    version: str;
+    mach:    str;
+    deps:    str;
+}
+
+rec TSource {
+    rels:   *TRel;
+    count:  u32;
+    broken: str;
+}
+
+fun t_releases(ctx: ptr, url: str, out: *Vector[cand.Release]) err[outcome.Fail] {
+    val src: *TSource = ctx::*TSource;
+    if (str_equals(url, src.broken)) { ret err[outcome.Fail].err{outcome.user("the server refused the listing")}; }
+    var i: u32 = 0;
+    for (i < src.count) {
+        if (str_equals(src.rels[i].id, url)) {
+            val v: res[range.Version, str] = range.parse_version(src.rels[i].version);
+            if (sel v.ok) {
+                vector.push[cand.Release](out, cand.Release{version: v.ok, text: src.rels[i].version,
+                    tag: src.rels[i].version, commit: src.rels[i].id});
+            }
+        }
+        i = i + 1;
+    }
+    ret err[outcome.Fail].ok{};
+}
+
+fun t_manifest_at(ctx: ptr, url: str, rel: *cand.Release) res[manifest.Manifest, outcome.Fail] {
+    ret res[manifest.Manifest, outcome.Fail].err{outcome.user("unused")};
+}
+
+# deps is "id range;id range" with the id doubling as its url
+fun t_needs(ctx: ptr, id: str, url: str, rel: *cand.Release, out: *ReleaseNeeds) err[outcome.Fail] {
+    val src: *TSource = ctx::*TSource;
+    var i:   u32      = 0;
+    for (i < src.count) {
+        val r: *TRel = ?src.rels[i];
+        if (str_equals(r.id, id) && str_equals(r.version, rel.text)) {
+            out.mach = r.mach;
+            var at: usize = 0;
+            val n:  usize = str_len(r.deps);
+            for (at < n) {
+                var sp: usize = at;
+                for (sp < n && r.deps[sp] != ' ') { sp = sp + 1; }
+                var end: usize = sp;
+                for (end < n && r.deps[end] != ';') { end = end + 1; }
+                val dep_id: res[str, A.Error] = str_dup_range(out.needs.a, r.deps, at, sp - at);
+                val dep_rg: res[str, A.Error] = str_dup_range(out.needs.a, r.deps, sp + 1, end - sp - 1);
+                if (sel dep_id.ok) {
+                    if (sel dep_rg.ok) {
+                        vector.push[Need](?out.needs, Need{id: dep_id.ok, url: dep_id.ok, range: dep_rg.ok});
+                    }
+                }
+                at = end + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret err[outcome.Fail].ok{};
+}
+
+rec TRun {
+    choices: Vector[Choice];
+    failure: str;
+    ok:      bool;
+}
+
+fun t_solve(a: *A.Allocator, src: *TSource, needs: *Need, n: u32, lowest: bool, locks: *Lock, lock_count: u32) TRun {
+    var cs:   cand.CandidateSource = cand.CandidateSource{ctx: src::ptr, releases: t_releases, manifest_at: t_manifest_at};
+    var prob: Problem              = Problem{root: "app", needs: needs, need_count: n, compiler: "5.2.1", lowest: lowest,
+        locks: locks, lock_count: lock_count};
+    val r: res[Vector[Choice], outcome.Fail] = resolve(a, ?cs, t_needs, src::ptr, ?prob);
+    if (sel r.ok)  { ret TRun{choices: r.ok, failure: "", ok: true}; }
+    if (sel r.err) { ret TRun{choices: vector.init[Choice](a), failure: outcome.describe(r.err), ok: false}; }
+    ret TRun{choices: vector.init[Choice](a), failure: "", ok: false};
+}
+
+fun t_picked(run: *TRun, id: str) str {
+    var i: usize = 0;
+    for (i < run.choices.len) {
+        if (str_equals(run.choices.data[i].id, id)) { ret run.choices.data[i].version; }
+        i = i + 1;
+    }
+    ret "";
+}
+
+val T_RELS: [16]TRel = [16]TRel{
+    TRel{id: "a", version: "1.0.0", mach: "", deps: "c ^1"},
+    TRel{id: "a", version: "1.1.0", mach: "", deps: "c ^2"},
+    TRel{id: "a", version: "1.2.0", mach: ">=6", deps: ""},
+    TRel{id: "a", version: "2.0.0", mach: "", deps: ""},
+    TRel{id: "b", version: "1.0.0", mach: "", deps: "c ^1"},
+    TRel{id: "c", version: "1.0.0", mach: "", deps: ""},
+    TRel{id: "c", version: "1.4.0", mach: "", deps: ""},
+    TRel{id: "c", version: "2.0.0", mach: "", deps: ""},
+    TRel{id: "d", version: "1.0.0", mach: "", deps: "e ^1"},
+    TRel{id: "f", version: "1.0.0", mach: "", deps: "c ^2"},
+    TRel{id: "g", version: "0.4.2", mach: "", deps: ""},
+    TRel{id: "g", version: "0.5.0", mach: "", deps: ""},
+    TRel{id: "g", version: "0.5.1-rc.1", mach: "", deps: ""},
+    TRel{id: "h", version: "1.0.0", mach: ">=6", deps: ""},
+    TRel{id: "h", version: "1.1.0", mach: ">=7", deps: ""},
+    TRel{id: "i", version: "1.0.0", mach: "", deps: "c nonsense"},
+};
+
+fun t_env(ar: *arena.Arena, backing: *A.Allocator, a: *A.Allocator) bool {
+    val m: err[A.Error] = page.make(backing);
+    if (sel m.err) { ret false; }
+    val i: err[A.Error] = arena.init(ar, backing, 0);
+    if (sel i.err) { ret false; }
+    val k: err[A.Error] = arena.make(a, ar);
+    if (sel k.err) { ret false; }
+    ret true;
+}
+
+test "mach.lang.driver.resolver.resolve:picks_the_highest_release_every_requirement_and_the_compiler_accept" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var a:       A.Allocator;
+    if (!t_env(?ar, ?backing, ?a)) { ret 1; }
+    fin { arena.dnit(?ar); }
+    var src: TSource = TSource{rels: ?T_RELS[0], count: 16, broken: ""};
+    # a 1.2.0 needs a newer compiler, and a 1.1.0 wants c ^2 while b wants c ^1: backtracking lands on a 1.0.0
+    var needs: [2]Need = [2]Need{Need{id: "a", url: "a", range: "^1"}, Need{id: "b", url: "b", range: "^1"}};
+    var run:   TRun    = t_solve(?a, ?src, ?needs[0], 2, false, nil, 0);
+    if (!run.ok)                                                                                { ret 2; }
+    if (!str_equals(t_picked(?run, "a"), "1.0.0") || !str_equals(t_picked(?run, "b"), "1.0.0")) { ret 3; }
+    if (!str_equals(t_picked(?run, "c"), "1.4.0"))                                              { ret 4; }
+    if (run.choices.len != 3)                                                                   { ret 5; }
+    # alone, a takes 1.1.0 (1.2.0 is compiler-blocked) and pulls c 2.0.0
+    var only: [1]Need = [1]Need{Need{id: "a", url: "a", range: "^1"}};
+    var one:  TRun    = t_solve(?a, ?src, ?only[0], 1, false, nil, 0);
+    if (!one.ok || !str_equals(t_picked(?one, "a"), "1.1.0") || !str_equals(t_picked(?one, "c"), "2.0.0")) { ret 6; }
+    # the lowest mode and a lock
+    var low: TRun = t_solve(?a, ?src, ?only[0], 1, true, nil, 0);
+    if (!low.ok || !str_equals(t_picked(?low, "a"), "1.0.0") || !str_equals(t_picked(?low, "c"), "1.0.0")) { ret 7; }
+    var locks:  [1]Lock = [1]Lock{Lock{id: "a", version: "1.0.0"}};
+    var locked: TRun    = t_solve(?a, ?src, ?only[0], 1, false, ?locks[0], 1);
+    if (!locked.ok || !str_equals(t_picked(?locked, "a"), "1.0.0")) { ret 8; }
+    var stale: [1]Lock = [1]Lock{Lock{id: "a", version: "2.0.0"}};
+    var moved: TRun    = t_solve(?a, ?src, ?only[0], 1, false, ?stale[0], 1);
+    if (!moved.ok || !str_equals(t_picked(?moved, "a"), "1.1.0")) { ret 9; }
+    # the pre-1.0 caret and a pre-release the range does not name
+    var gneeds: [1]Need = [1]Need{Need{id: "g", url: "g", range: "^0.5"}};
+    var g:      TRun    = t_solve(?a, ?src, ?gneeds[0], 1, false, nil, 0);
+    if (!g.ok || !str_equals(t_picked(?g, "g"), "0.5.0")) { ret 10; }
+    ret 0;
+}
+
+test "mach.lang.driver.resolver.resolve:explains_an_unsatisfiable_closure_by_its_requirements" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var a:       A.Allocator;
+    if (!t_env(?ar, ?backing, ?a)) { ret 1; }
+    fin { arena.dnit(?ar); }
+    var src: TSource = TSource{rels: ?T_RELS[0], count: 16, broken: "e"};
+    # b wants c ^1 and f wants c ^2
+    var clash: [2]Need = [2]Need{Need{id: "b", url: "b", range: "^1"}, Need{id: "f", url: "f", range: "^1"}};
+    var run:   TRun    = t_solve(?a, ?src, ?clash[0], 2, false, nil, 0);
+    if (run.ok)                                                                                                     { ret 2; }
+    if (!str_contains(run.failure, "no set of releases satisfies every requirement"))                               { ret 3; }
+    if (!str_contains(run.failure, "b 1.0.0 requires c ^1") || !str_contains(run.failure, "f 1.0.0 requires c ^2")) { ret 4; }
+    if (!str_contains(run.failure, "app requires b ^1") || !str_contains(run.failure, "[dep."))                     { ret 5; }
+    # every release of h needs a newer compiler
+    var hn: [1]Need = [1]Need{Need{id: "h", url: "h", range: "^1"}};
+    var h:  TRun    = t_solve(?a, ?src, ?hn[0], 1, false, nil, 0);
+    if (h.ok) { ret 6; }
+    if (!str_contains(h.failure, "h 1.0.0 requires mach >=6, and this is mach 5.2.1")
+        || !str_contains(h.failure, "h 1.1.0 requires mach >=7")) { ret 7; }
+    # nothing in range
+    var none: [1]Need = [1]Need{Need{id: "a", url: "a", range: "^3"}};
+    var nr:   TRun    = t_solve(?a, ?src, ?none[0], 1, false, nil, 0);
+    if (nr.ok || !str_contains(nr.failure, "app requires a ^3")) { ret 8; }
+    # a listing that fails, and a range that does not parse
+    var dn: [1]Need = [1]Need{Need{id: "d", url: "d", range: "^1"}};
+    var d:  TRun    = t_solve(?a, ?src, ?dn[0], 1, false, nil, 0);
+    if (d.ok || !str_contains(d.failure, "the releases of e cannot be listed: the server refused the listing")) { ret 9; }
+    var inn: [1]Need = [1]Need{Need{id: "i", url: "i", range: "^1"}};
+    var bad: TRun    = t_solve(?a, ?src, ?inn[0], 1, false, nil, 0);
+    if (bad.ok || !str_contains(bad.failure, "i 1.0.0 requires c \"nonsense\"")) { ret 10; }
+    ret 0;
+}
+
+# ---- tests: agreement with an exhaustive search on small random universes -------------------
+
+val T_ROUNDS: u32 = 400;
+
+val T_IDS:      [4]str = [4]str{"p0", "p1", "p2", "p3"};
+val T_VERSIONS: [3]str = [3]str{"1.0.0", "1.1.0", "2.0.0"};
+val T_RANGES:   [5]str = [5]str{"^1", "^2", ">=1.1", "<2", "=1.0.0"};
+
+fun t_next(state: *u64) u64 {
+    @state = @state * 6364136223846793005 + 1442695040888963407;
+    ret @state >> 33;
+}
+
+fun t_in(text: str, version: str) bool {
+    val r: res[range.Range, range.RangeError] = range.parse_range(text);
+    val v: res[range.Version, str]            = range.parse_version(version);
+    if (sel r.ok) {
+        if (sel v.ok) {
+            var rr: range.Range   = r.ok;
+            var vv: range.Version = v.ok;
+            ret range.satisfies(?rr, ?vv);
+        }
+    }
+    ret false;
+}
+
+# pick[i] is the index into T_VERSIONS of p<i>'s selection, or -1 when p<i> is absent
+fun t_valid(rels: *TRel, n: u32, root: *Need, root_n: u32, pick: *i64) bool {
+    var i: u32 = 0;
+    for (i < root_n) {
+        var p: usize = 0;
+        for (p < 4 && !str_equals(T_IDS[p], root[i].id)) { p = p + 1; }
+        if (pick[p] < 0 || !t_in(root[i].range, T_VERSIONS[pick[p]::usize])) { ret false; }
+        i = i + 1;
+    }
+    var p: usize = 0;
+    for (p < 4) {
+        if (pick[p] >= 0) {
+            var found: bool = false;
+            var r:     u32  = 0;
+            for (r < n) {
+                val rel: *TRel = ?rels[r];
+                if (str_equals(rel.id, T_IDS[p]) && str_equals(rel.version, T_VERSIONS[pick[p]::usize])) {
+                    found = true;
+                    if (!str_empty(rel.mach) && !t_in(rel.mach, "5.2.1")) { ret false; }
+                    if (!str_empty(rel.deps)) {
+                        # generated deps are a single "p<d> <range>"
+                        val d: usize = (rel.deps[1] - '0')::usize;
+                        if (pick[d] < 0 || !t_in((?rel.deps[3])::str, T_VERSIONS[pick[d]::usize])) { ret false; }
+                    }
+                }
+                r = r + 1;
+            }
+            if (!found) { ret false; }
+        }
+        p = p + 1;
+    }
+    ret true;
+}
+
+fun t_brute(rels: *TRel, n: u32, root: *Need, root_n: u32) bool {
+    var pick:  [4]i64;
+    var combo: u32 = 0;
+    for (combo < 256) {
+        var c:  u32   = combo;
+        var p:  usize = 0;
+        var ok: bool  = true;
+        for (p < 4) {
+            val digit: u32 = c % 4;
+            c = c / 4;
+            if (digit == 3) { pick[p] = -1; }
+            or              { pick[p] = digit::i64; }
+            p = p + 1;
+        }
+        if (ok && t_valid(rels, n, root, root_n, ?pick[0])) { ret true; }
+        combo = combo + 1;
+    }
+    ret false;
+}
+
+test "mach.lang.driver.resolver.resolve:agrees_with_an_exhaustive_search_on_small_universes" {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var a:       A.Allocator;
+    if (!t_env(?ar, ?backing, ?a)) { ret 1; }
+    fin { arena.dnit(?ar); }
+    var seed:   u64 = 0x5eed;
+    var rounds: u32 = 0;
+    var solved: u32 = 0;
+    for (rounds < T_ROUNDS) {
+        var rels: [12]TRel;
+        var n:    u32   = 0;
+        var deps: [12][16]u8;
+        var p:    usize = 0;
+        for (p < 4) {
+            var v: usize = 0;
+            for (v < 3) {
+                if (t_next(?seed) % 4 != 0) {
+                    var d: str = "";
+                    if (t_next(?seed) % 2 == 0) {
+                        val target: usize = (t_next(?seed) % 4)::usize;
+                        val rg:     str   = T_RANGES[(t_next(?seed) % 5)::usize];
+                        deps[n][0] = 'p';
+                        deps[n][1] = '0' + target::u8;
+                        deps[n][2] = ' ';
+                        var k: usize = 0;
+                        for (rg[k] != 0) {
+                            deps[n][3 + k] = rg[k];
+                            k              = k + 1;
+                        }
+                        deps[n][3 + k] = 0;
+                        d              = (?deps[n][0])::str;
+                    }
+                    var mach: str = "";
+                    if (t_next(?seed) % 6 == 0) { mach = ">=6"; }
+                    rels[n] = TRel{id: T_IDS[p], version: T_VERSIONS[v], mach: mach, deps: d};
+                    n       = n + 1;
+                }
+                v = v + 1;
+            }
+            p = p + 1;
+        }
+        var root:   [2]Need;
+        val root_n: u32 = 1 + (t_next(?seed) % 2)::u32;
+        var r:      u32 = 0;
+        for (r < root_n) {
+            val id: str = T_IDS[(t_next(?seed) % 4)::usize];
+            root[r] = Need{id: id, url: id, range: T_RANGES[(t_next(?seed) % 5)::usize]};
+            r       = r + 1;
+        }
+        var src:      TSource = TSource{rels: ?rels[0], count: n, broken: ""};
+        var run:      TRun    = t_solve(?a, ?src, ?root[0], root_n, false, nil, 0);
+        val possible: bool    = t_brute(?rels[0], n, ?root[0], root_n);
+        if (run.ok != possible) { ret 10 + rounds::i32 * 10; }
+        if (run.ok) {
+            var pick: [4]i64 = [4]i64{-1, -1, -1, -1};
+            var c:    usize  = 0;
+            for (c < run.choices.len) {
+                var q: usize = 0;
+                for (q < 4 && !str_equals(T_IDS[q], run.choices.data[c].id)) { q = q + 1; }
+                var v: usize = 0;
+                for (v < 3 && !str_equals(T_VERSIONS[v], run.choices.data[c].version)) { v = v + 1; }
+                if (q == 4 || v == 3 || pick[q] >= 0) { ret 2; }
+                pick[q] = v::i64;
+                c       = c + 1;
+            }
+            if (!t_valid(?rels[0], n, ?root[0], root_n, ?pick[0])) { ret 3; }
+            solved = solved + 1;
+        }
+        rounds = rounds + 1;
+    }
+    # the generator must produce both outcomes for the agreement to mean anything
+    if (solved == 0 || solved == T_ROUNDS) { ret 4; }
+    ret 0;
+}
