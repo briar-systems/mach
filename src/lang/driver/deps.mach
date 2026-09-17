@@ -32,14 +32,18 @@ use std.types.string.str_starts_with;
 
 use A: std.allocator;
 
+use mach.lang.diagnostic;
+use cand: mach.lang.driver.candidates;
+use mach.lang.fe.token;
 use mach.lang.intern;
 use mach.lang.manifest;
 use range: mach.lang.manifest.version;
-use cand: mach.lang.driver.candidates;
-use std.text.string.str_dup_range;
 use mach.lang.output.remove;
 use mach.lang.session;
+use src:      mach.lang.source;
+use compiler: mach.lang.version;
 use mach.subprocess;
+use std.text.string.str_dup_range;
 
 use mach.lang.driver.load;
 use mach.lang.driver.project;
@@ -880,7 +884,7 @@ fun resolve_dep_edge(p: *project.Project, gi: *GitInspector, root_m: *manifest.M
     for (j < dep_count_ptr[0]) {
         if (deps[j].project_id == entry.project_id) {
             if (!overridden) {
-                val esel_r: err[outcome.Fail] = requirer_selector_satisfied(p.s, gi, alias, current_root, dir_dep, d, deps[j].content);
+                val esel_r: err[outcome.Fail] = requirer_selector_satisfied(p.s, gi, alias, chain_here, current_root, dir_dep, d, deps[j].content);
                 if (sel esel_r.err) {
                     discard_dep_entry(p.alloc, ?entry);
                     str_free(p.alloc, chain_here);
@@ -909,7 +913,7 @@ fun resolve_dep_edge(p: *project.Project, gi: *GitInspector, root_m: *manifest.M
         ret res[u32, outcome.Fail].err{outcome.user("exceeded maximum dependency limit of 128")};
     }
     if (!overridden) {
-        val add_sel_r: err[outcome.Fail] = requirer_selector_satisfied(p.s, gi, alias, current_root, dir_dep, d, entry.content);
+        val add_sel_r: err[outcome.Fail] = requirer_selector_satisfied(p.s, gi, alias, chain_here, current_root, dir_dep, d, entry.content);
         if (sel add_sel_r.err) {
             discard_dep_entry(p.alloc, ?entry);
             str_free(p.alloc, chain_here);
@@ -1030,7 +1034,7 @@ fun take_release_line(a: *A.Allocator, line: *u8, n: usize, out: *Vector[cand.Re
     if (sp == n || !is_hex_id(line, sp)) { ret err[outcome.Fail].ok{}; }
     var ref_at: usize = sp;
     for (ref_at < n && (line[ref_at] == ' ' || line[ref_at] == '\t')) { ref_at = ref_at + 1; }
-    val prefix: str = "refs/tags/";
+    val prefix: str   = "refs/tags/";
     var k:      usize = 0;
     for (k < 10) {
         if (ref_at + k >= n || line[ref_at + k] != prefix[k]) { ret err[outcome.Fail].ok{}; }
@@ -1087,8 +1091,8 @@ fun take_release_line(a: *A.Allocator, line: *u8, n: usize, out: *Vector[cand.Re
 }
 
 fun git_releases(ctx: ptr, url: str, out: *Vector[cand.Release]) err[outcome.Fail] {
-    val c: *GitCandidates = ctx::*GitCandidates;
-    val a: *A.Allocator   = c.s.build_alloc;
+    val c:      *GitCandidates         = ctx::*GitCandidates;
+    val a:      *A.Allocator           = c.s.build_alloc;
     val listed: res[str, outcome.Fail] = cached_listing(c, url);
     if (sel listed.err) { ret err[outcome.Fail].err{listed.err}; }
     val text: str   = listed.ok;
@@ -1144,7 +1148,7 @@ fun cached_listing(c: *GitCandidates, url: str) res[str, outcome.Fail] {
 
 fun ensure_scratch(c: *GitCandidates) err[outcome.Fail] {
     if (c.scratch_ready) { ret err[outcome.Fail].ok{}; }
-    val a:    *A.Allocator                  = c.s.build_alloc;
+    val a:    *A.Allocator                 = c.s.build_alloc;
     val tf_r: res[fs.TempFile, fs.FsError] = fs.temp_create(a, "mach_candidates");
     if (sel tf_r.err) { ret err[outcome.Fail].err{outcome.user(outcome.fs_text(tf_r.err))}; }
     var tf:    fs.TempFile       = tf_r.ok;
@@ -1224,6 +1228,97 @@ fun release_msg(a: *A.Allocator, rel: *cand.Release, why: str) str {
     ret r.ok;
 }
 
+# whether the running compiler satisfies `text`; a range that no longer parses counts as unmet
+fun compiler_admitted(text: str) bool {
+    val want: res[range.Range, range.RangeError] = range.parse_range(text);
+    val have: res[range.Version, str]            = range.parse_version(compiler.MACH_VERSION);
+    if (sel want.ok) {
+        if (sel have.ok) {
+            var r: range.Range   = want.ok;
+            var v: range.Version = have.ok;
+            ret range.satisfies(?r, ?v);
+        }
+    }
+    ret false;
+}
+
+fun append_line(p: *project.Project, acc: str, who: str, text: str) str {
+    val line_r: res[str, format.FormatError] = format.sprint(p.alloc, "{}\n    {} requires mach {}", acc, who, text);
+    if (sel line_r.err) { ret acc; }
+    ret line_r.ok;
+}
+
+fun root_label(p: *project.Project, m: *manifest.Manifest) str {
+    val rn_o: opt[str] = intern.lookup(?p.s.interner, m.id);
+    if (sel rn_o.some) {
+        if (!str_empty(rn_o.some)) { ret rn_o.some; }
+    }
+    ret "root";
+}
+
+# every manifest in the closure states the compiler range it builds with ([project].mach,
+# #3496). all unmet requirements are reported together with who states them; a root without
+# the key warns and prints the line to add, and a dependency without it states no constraint
+fun check_compiler_requirements(p: *project.Project, m: *manifest.Manifest, deps: *project.DepEntry,
+    dep_count: u32, root_name: str) err[outcome.Fail] {
+    var unmet: str  = "";
+    var any:   bool = false;
+    if (m.mach == intern.STR_NIL) { warn_missing_compiler_range(p); }
+    or {
+        val text: opt[str] = intern.lookup(?p.s.interner, m.mach);
+        if (sel text.some) {
+            if (!compiler_admitted(text.some)) {
+                val who_r: res[str, format.FormatError] = format.sprint(p.alloc, "{} (mach.toml)", root_name);
+                var who:   str                          = root_name;
+                if (sel who_r.ok) { who = who_r.ok; }
+                unmet = append_line(p, unmet, who, text.some);
+                any   = true;
+            }
+        }
+    }
+    var i: u32 = 0;
+    for (i < dep_count) {
+        val d: *project.DepEntry = ?deps[i];
+        i = i + 1;
+        if (d.manifest.mach == intern.STR_NIL) { cnt; }
+        val text: opt[str] = intern.lookup(?p.s.interner, d.manifest.mach);
+        if (sel text.none)                { cnt; }
+        if (compiler_admitted(text.some)) { cnt; }
+        var who:   str      = "?";
+        val chain: opt[str] = intern.lookup(?p.s.interner, d.chain);
+        if (sel chain.some) { who = chain.some; }
+        unmet = append_line(p, unmet, who, text.some);
+        any   = true;
+    }
+    if (!any) { ret err[outcome.Fail].ok{}; }
+    val msg_r: res[str, format.FormatError] = format.sprint(p.alloc,
+        "this is mach {}, and the dependency closure does not accept it:{}", compiler.MACH_VERSION, unmet);
+    if (sel msg_r.err) { ret err[outcome.Fail].err{outcome.user("the dependency closure does not accept this compiler")}; }
+    ret err[outcome.Fail].err{outcome.user(msg_r.ok)};
+}
+
+# the caret range of the running compiler's release line, owned by `a`
+pub fun compiler_caret(a: *A.Allocator) res[str, format.FormatError] {
+    val have: res[range.Version, str] = range.parse_version(compiler.MACH_VERSION);
+    if (sel have.ok) { ret format.sprint(a, "^{}.{}", have.ok.major, have.ok.minor); }
+    ret format.sprint(a, "={}", compiler.MACH_VERSION);
+}
+
+fun warn_missing_compiler_range(p: *project.Project) {
+    val caret_r: res[str, format.FormatError] = compiler_caret(p.alloc);
+    if (sel caret_r.err) { ret; }
+    val caret: str = caret_r.ok;
+    fin { str_free(p.alloc, caret); }
+    val msg_r: res[str, format.FormatError] = format.sprint(p.alloc,
+        "mach.toml: [project] states no compiler range; add `mach = \"{}\"`, the compiler this project builds with. A later release requires it", caret);
+    if (sel msg_r.err) { ret; }
+    var span: token.Span;
+    span.offset = 0;
+    span.len    = 0;
+    diagnostic.record_warning(?p.diags, 0xFFFFFFFF::src.FileId, span, msg_r.ok);
+    str_free(p.alloc, msg_r.ok);
+}
+
 # `dep` is the project's reserved dependency root: absent, or a physical directory. a
 # symlink there would resolve the closure from another tree, so every command that reads
 # or realizes the closure refuses it through this one check (#3478)
@@ -1252,7 +1347,7 @@ pub fun resolve_deps(p: *project.Project, m: *manifest.Manifest, project_root: s
         }
         p.config.deps      = nil;
         p.config.dep_count = 0;
-        ret err[outcome.Fail].ok{};
+        ret check_compiler_requirements(p, m, nil, 0, root_label(p, m));
     }
 
     val max_deps: usize                           = 128;
@@ -1276,11 +1371,7 @@ pub fun resolve_deps(p: *project.Project, m: *manifest.Manifest, project_root: s
     }
     val dir_dep: str = dir_dep_opt.some;
 
-    var root_name: str      = "root";
-    val rn_o:      opt[str] = intern.lookup(?p.s.interner, m.id);
-    if (sel rn_o.some) {
-        if (!str_empty(rn_o.some)) { root_name = rn_o.some; }
-    }
+    val root_name: str = root_label(p, m);
 
     var gi:     GitInspector = GitInspector{program: nil};
     var root_i: u32          = 0;
@@ -1297,6 +1388,12 @@ pub fun resolve_deps(p: *project.Project, m: *manifest.Manifest, project_root: s
     }
     git_inspector_dnit(p.alloc, ?gi);
     A.deallocate[bool](p.alloc, active, max_deps);
+
+    val needs: err[outcome.Fail] = check_compiler_requirements(p, m, deps, dep_count, root_name);
+    if (sel needs.err) {
+        project.free_dep_entries(p.alloc, deps, dep_count, max_deps);
+        ret needs;
+    }
 
     if (dep_count == 0) {
         A.deallocate[project.DepEntry](p.alloc, deps, max_deps);
@@ -1943,7 +2040,7 @@ fun verify_parent_gitlink(s: *session.Session, gi: *GitInspector, alias: str,
     ret res[intern.StrId, outcome.Fail].ok{content_r.ok};
 }
 
-fun selector_satisfied(s: *session.Session, gi: *GitInspector, alias: str, project_root: str, dep_dir: str, ref: str, pin: str) err[outcome.Fail] {
+fun selector_satisfied(s: *session.Session, gi: *GitInspector, alias: str, chain: str, project_root: str, dep_dir: str, ref: str, pin: str) err[outcome.Fail] {
     if (str_empty(ref) || str_starts_with(ref, "branch/")) { ret err[outcome.Fail].ok{}; }
     var want:  str  = "";
     var owned: bool = false;
@@ -1961,7 +2058,7 @@ fun selector_satisfied(s: *session.Session, gi: *GitInspector, alias: str, proje
         str_free(s.build_alloc, spec);
         if (sel r.err) {
             val mr: res[str, format.FormatError] = format.sprint(s.build_alloc,
-                "dependency '{}': exact ref '{}' names a tag the checkout does not have; run `mach dep update <path> {}` or `mach dep pull <path>` for project '{}'", alias, ref, alias, project_root);
+                "dependency '{}': exact ref '{}' required by {} names a tag the checkout does not have; run `mach dep update <path> {}` or `mach dep pull <path>` for project '{}'", alias, ref, chain, alias, project_root);
             if (sel mr.err) { ret err[outcome.Fail].err{outcome.user("dependency tag ref is not present in the checkout")}; }
             ret err[outcome.Fail].err{outcome.user(mr.ok)};
         }
@@ -1975,14 +2072,14 @@ fun selector_satisfied(s: *session.Session, gi: *GitInspector, alias: str, proje
         ret err[outcome.Fail].ok{};
     }
     val mr: res[str, format.FormatError] = format.sprint(s.build_alloc,
-        "dependency '{}': exact ref '{}' resolves to '{}' but the realized commit is '{}'; run `mach dep update <path> {}` for project '{}' to re-pin it, or declare the identity at the root to override",
-        alias, ref, want, pin, alias, project_root);
+        "dependency '{}': exact ref '{}' required by {} resolves to '{}' but the realized commit is '{}'; run `mach dep update <path> {}` for project '{}' to re-pin it, or declare the identity at the root to override",
+        alias, ref, chain, want, pin, alias, project_root);
     if (owned)      { str_free(s.build_alloc, want); }
     if (sel mr.err) { ret err[outcome.Fail].err{outcome.user("dependency exact ref is not satisfied by the realized commit")}; }
     ret err[outcome.Fail].err{outcome.user(mr.ok)};
 }
 
-fun requirer_selector_satisfied(s: *session.Session, gi: *GitInspector, alias: str, project_root: str,
+fun requirer_selector_satisfied(s: *session.Session, gi: *GitInspector, alias: str, chain: str, project_root: str,
     dir_dep: str, d: *manifest.DepDef, content: intern.StrId) err[outcome.Fail] {
     if (d.git == intern.STR_NIL) { ret err[outcome.Fail].ok{}; }
     val content_opt: opt[str] = intern.lookup(?s.interner, content);
@@ -1995,7 +2092,7 @@ fun requirer_selector_satisfied(s: *session.Session, gi: *GitInspector, alias: s
     val dep_dir_r: res[str, outcome.Fail] = build_dep_root(s.build_alloc, project_root, dir_dep, alias);
     if (sel dep_dir_r.err) { ret err[outcome.Fail].err{dep_dir_r.err}; }
     val dep_dir: str               = dep_dir_r.ok;
-    val r:       err[outcome.Fail] = selector_satisfied(s, gi, alias, project_root, dep_dir, ref_opt.some, pin);
+    val r:       err[outcome.Fail] = selector_satisfied(s, gi, alias, chain, project_root, dep_dir, ref_opt.some, pin);
     str_free(s.build_alloc, dep_dir);
     ret r;
 }

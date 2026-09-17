@@ -112,10 +112,49 @@ ref = "branch/main"
 | `version` | string | Project version. Read by `$project.version` and `$project.version.{major,minor,patch}`, and stamped into a Windows executable's version resource. |
 | `src`     | string | Source root, project-root-relative. Module paths resolve under it. |
 | `out`     | string | The output-path template root, referenced as `{project.out}` by artifact `out`, step paths, and `cmd`s. Expanded over `{target.name}`/`{target.isa}`/`{target.os}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). |
+| `mach`    | string | The compiler versions this project builds with, as a version range (`"^5.2"`). See [Compiler range](#compiler-range). |
 
-`[project]` is exactly these four keys. Any other key, `name`, `description`
-or `mach` included, is an unknown-key error (`mach.toml: unknown key 'name' in
-[project]`), in a root manifest and a dependency's alike. `[profile.<name>]`
+`[project]` is exactly these five keys. Any other key, `name` and `description`
+included, is an unknown-key error (`mach.toml: unknown key 'name' in
+[project]`), in a root manifest and a dependency's alike.
+
+### Compiler range
+
+`mach` states which compilers a project builds with, and every command that
+reads the dependency closure (build, test, check, `mach dep verify`, the
+language server) checks it for the root and for every realized dependency. A
+compiler outside any of those ranges is refused once, with every unmet
+requirement and the chain that states it:
+
+```
+error: this is mach 5.2.1, and the dependency closure does not accept it:
+    app (mach.toml) requires mach ^5.3
+    app -> gfx -> glfw requires mach >=5.4, <6
+```
+
+A range is one or more clauses separated by `,`, and a version satisfies it
+when it satisfies every clause. Each clause names its operator; a bare `1.2` is
+refused.
+
+| clause | means |
+|---|---|
+| `^1.2.3` | `>=1.2.3, <2.0.0` |
+| `^1.2` | `>=1.2.0, <2.0.0` |
+| `^0.4.2` | `>=0.4.2, <0.5.0` (below 1.0 the first nonzero component is fixed) |
+| `^0.0.3` | `=0.0.3` |
+| `~1.2.3` | `>=1.2.3, <1.3.0` |
+| `~1` | `>=1.0.0, <2.0.0` |
+| `>=1.2`, `>1.2`, `<=1.2`, `<2` | a missing component is 0: `>1.2` is `>1.2.0` |
+| `=1.2.3` | exactly `1.2.3`; `=` needs all three components |
+
+A pre-release version (`1.3.0-rc.1`) satisfies a range only when one of its
+clauses names a pre-release of that same release, so `^1.2` never selects
+`1.3.0-rc.1`. Build metadata is refused in a range. There is no `*` and no
+`||`.
+
+A root manifest without `mach` builds, with a warning that prints the line to
+add (`add mach = "^5.2"`); a later release requires the key. A dependency
+without it states no constraint. `[profile.<name>]`
 likewise carries no `emit_ir` or `emit_asm`: emission is `--emit-ir`/`--emit-asm`
 on the command line.
 
@@ -1037,9 +1076,9 @@ re-checked against that pin (a `commit/` it declares is). For an identity the
 root does **not** declare, every requirer's exact selector (`tag/`, resolved
 through the checkout's own refs, or `commit/`) must be satisfied by the
 realized commit; a mismatch names both commits and the two remedies
-(`dependency 'b': exact ref 'tag/v1.0.0' resolves to '<commit>' but the
-realized commit is '<other>'; run `mach dep update <path> b` to re-pin it, or declare
-the identity at the root to override`; a root `commit/` that does not match
+(`dependency 'b': exact ref 'tag/v1.0.0' required by root -> a -> b resolves to
+'<commit>' but the realized commit is '<other>'; run `mach dep update <path> b` to
+re-pin it, or declare the identity at the root to override`; a root `commit/` that does not match
 reads `exact commit ref 'commit/<id>' is not satisfied by the realized commit
 '<other>'`). A `branch/` selector is an input to `update`, never a verify fact.
 The verifier reads the git **index**, so a freshly realized dependency is
@@ -1079,7 +1118,11 @@ dependencies in these projects are verified from their own plain checkouts.
 moves an exact selector to the commit it names, so an identity realized at a
 dependency's selection lands on the root's declaration once the root declares
 one (`b: 0564… -> e508… (pinned to the exact selector)`, or `(exact selector,
-already pinned)` when nothing moves). For an identity reached by
+already pinned)` when nothing moves). `<name>` is looked up in the whole
+dependency closure, so `mach dep update <path> b` for an identity the root does
+not declare moves its checkout to the selector its requirers declare. A
+name outside the closure is refused (`dependency 'x' is not in the dependency
+closure`). For an identity reached by
 more than one path, one rule decides: the root's selector wins if the root
 declares the identity; otherwise agreement among the requirers is taken;
 otherwise the command stops, prints both chains, and names the root
