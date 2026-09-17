@@ -86,8 +86,10 @@ than the source alone, so they are reported at lowering:
 - a secret operand of an **integer multiply**, unless the target declares the
   exact multiply it emits (the low half, a high half or the widening product,
   at that operand width) as data-independent-timing under a condition the
-  build meets. No target declares one yet, so every ISA refuses it today, and
-  every lane multiply is refused. `$mach.build.ct_mul(op, width)` reads the
+  build meets. riscv64 with the Zkt extension selected admits the low half at
+  every width and the high halves at 64 bits. x86-64 and aarch64 declare their
+  vendors' lists under DOITM and DIT, which no OS guarantees yet (#3508), so they
+  refuse it today, as every other ISA does. Every lane multiply is refused. `$mach.build.ct_mul(op, width)` reads the
   same decision at comptime (see `comptime-mach.md`)
 - a secret **variable shift count** on a target without a barrel shifter
 
