@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Dependency resolution has a candidate source: an interface listing an identity's releases and the manifest each ships, and a git implementation. Releases are the `v`-prefixed semver tags at a url, listed once per command with `git ls-remote --tags`, with an annotated tag resolved to its commit. A release's `mach.toml` is read from a scratch bare repository after a shallow fetch of its tag. A tag whose manifest names another version is not a candidate. Offline, both come from a local repository. Nothing uses it yet; the resolver (#3501) will (#3500).
 ### Changed
 - A dependency's public type is looked up through an index keyed by its origin and canonical name, instead of scanning every dependency's exports on every lookup. mach-lsp's warm-rebuild profile had 18.3% of its time in that scan. Each imported module's typed surface and its index are now built once per gate result, and once per revision of its typed exports, then shared by every module that imports it. Before, they were rebuilt for each importer. A warm `mach check` of mach-lsp went from 6.1 s on 5.2.1 to 3.2 s, of mach itself from 5.9 s to 3.1 s, and mach-lsp's warm rebuild from 1.70 s to 1.49 s (#3472).
 ### Fixed
