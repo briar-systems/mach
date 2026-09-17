@@ -1114,24 +1114,30 @@ fun pack_globals(s: *CodegenContext, tgt: *target.Target, image: *of.ObjectImage
             len   = g.init.data.agg.len;
         }
         or (g.init.kind == value.VAL_CONST_INT || g.init.kind == value.VAL_CONST_FLOAT) {
-            val gsz: u32 = type.byte_size_for_machine(?irmod.types, g.ty, machine);
-            if (gsz > 0 && gsz <= 8) {
+            val gsz:  u32 = type.byte_size_for_machine(?irmod.types, g.ty, machine);
+            var bits: u64 = g.init.data.int_lit;
+            if (g.init.kind == value.VAL_CONST_FLOAT && is_f32_type(?irmod.types, g.ty)) {
+                bits = float.f64_to_f32_bits(bits)::u64;
+            }
+            if (gsz > 0 && gsz < 8) { bits = bits & ((1::u64 << (gsz::u64 * 8::u64)) - 1); }
+            # a writable zero scalar holds no bytes, so it lands in .bss as a zero aggregate does; the
+            # bits are the test, so -0.0 keeps its bytes. read-only and #[section] globals keep theirs (#3421)
+            val zero_fill: bool = bits == 0 && g.is_mut && g.section == intern.STR_NIL;
+            if (gsz == 0 || gsz > 8) {
+                if (g.init.data.int_lit != 0) {
+                    ret err[fail.Fail].err{fail.message("be.codegen.pack_globals: non-zero scalar constant global initializer has unsupported size (expected 1..8 bytes)")};
+                }
+            }
+            or (!zero_fill) {
                 val res_bytes: res[*u8, A.Error] = A.allocate[u8](image.alloc, gsz::usize);
                 if (sel res_bytes.err) { ret err[fail.Fail].err{fail.refused(res_bytes.err)}; }
                 bytes = res_bytes.ok;
-                var bits: u64 = g.init.data.int_lit;
-                if (g.init.kind == value.VAL_CONST_FLOAT && is_f32_type(?irmod.types, g.ty)) {
-                    bits = float.f64_to_f32_bits(bits)::u64;
-                }
                 var ii: u32 = 0;
                 for (ii < gsz) {
                     bytes[ii] = (bits >> (ii::u64 * 8::u64))::u8;
                     ii        = ii + 1;
                 }
                 len = gsz;
-            }
-            or (g.init.data.int_lit != 0) {
-                ret err[fail.Fail].err{fail.message("be.codegen.pack_globals: non-zero scalar constant global initializer has unsupported size (expected 1..8 bytes)")};
             }
         }
 
@@ -2722,6 +2728,130 @@ test "mach.lang.be.codegen.pack_globals:only_a_root_project_pub_definition_is_le
         obj.dnit(?image);
         if (seen != 2) { ret 8; }
         root = root + 1;
+    }
+    ret 0;
+}
+
+var t_zero_count: u64 = 0;
+var t_zero_ratio: f64 = 0.0;
+var t_zero_small: u8;
+var t_kept_count: u64 = 7;
+
+# zero scalar globals live in zero-fill storage and still read zero, take writes, and leave
+# their neighbours alone (#3421)
+test "mach.lang.be.codegen.pack_globals:a_zero_scalar_global_reads_and_writes" {
+    if (t_zero_count != 0 || t_zero_ratio != 0.0 || t_zero_small != 0) { ret 1; }
+    t_zero_count = 0xDEADBEEFCAFE;
+    t_zero_ratio = 2.5;
+    t_zero_small = 200;
+    if (t_zero_count != 0xDEADBEEFCAFE || t_zero_ratio != 2.5 || t_zero_small != 200) { ret 2; }
+    if (t_kept_count != 7)                                                            { ret 3; }
+    t_zero_count = 0;
+    t_zero_ratio = 0.0;
+    t_zero_small = 0;
+    if (t_zero_count != 0 || t_zero_ratio != 0.0 || t_zero_small != 0) { ret 4; }
+    ret 0;
+}
+
+# the section kind the image gives the symbol `name`, or 255 when it has none
+fun t_global_kind(image: *of.ObjectImage, name: intern.StrId) u8 {
+    var i: u32 = 0;
+    for (i < image.symbol_count) {
+        if (image.symbols[i].name == name) {
+            val sec: *of.Section = ?image.sections[of.section_index(image.symbols[i].section)];
+            if (sec.kind == of.SK_BSS && sec.bytes != nil) { ret 254; }
+            ret sec.kind::u8;
+        }
+        i = i + 1;
+    }
+    ret 255;
+}
+
+# a writable global whose scalar initializer has all-zero bits holds no bytes and lands in .bss,
+# like a zero aggregate; -0.0, non-zero, read-only and #[section] globals keep their bytes (#3421)
+test "mach.lang.be.codegen.pack_globals:a_writable_zero_scalar_is_zero_fill" {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+    val registered: err[fail.Fail] = target.register_all(s.registry, target_testing.debug_descriptor);
+    if (sel registered.err) { ret 2; }
+    val triples: [3][3]str = [3][3]str{[3]str{"x86_64", "linux", "sysv64"}, [3]str{"aarch64", "darwin", "aapcs64"}, [3]str{"x86_64", "windows", "win64"}};
+    val labels:  [8]str    = [8]str{"zero_int", "zero_f64", "underflow_f32", "neg_zero_f64", "neg_zero_f32", "one_int", "zero_val", "zero_sectioned"};
+    val want:    [8]u8     = [8]u8{of.SK_BSS::u8, of.SK_BSS::u8, of.SK_BSS::u8, of.SK_DATA::u8, of.SK_DATA::u8, of.SK_DATA::u8, of.SK_RODATA::u8, of.SK_DATA::u8};
+    var names:   [8]intern.StrId;
+    var n:       u32       = 0;
+    for (n < 8) {
+        val named: res[intern.StrId, A.Error] = intern.intern(?s.interner, labels[n]);
+        if (sel named.err) { ret 2; }
+        names[n] = named.ok;
+        n        = n + 1;
+    }
+    val custom_r: res[intern.StrId, A.Error] = intern.intern(?s.interner, ".data.custom");
+    if (sel custom_r.err) { ret 2; }
+
+    var t: u32 = 0;
+    for (t < 3) {
+        val selected: res[target.Target, fail.Fail] = target.select(s.registry, triples[t][0], triples[t][1], triples[t][2]);
+        if (sel selected.err) { ret 3; }
+        var tgt:         target.Target             = selected.ok;
+        val initialized: res[ir.Module, fail.Fail] = ir.init(?alloc, names[0]);
+        if (sel initialized.err) { ret 4; }
+        var module: ir.Module = initialized.ok;
+        module.root_project = true;
+        val i64_r: res[type.IrTypeId, fail.Fail] = type.intern_int(?module.types, 64);
+        val f64_r: res[type.IrTypeId, fail.Fail] = type.intern_float(?module.types, 64);
+        val f32_r: res[type.IrTypeId, fail.Fail] = type.intern_float(?module.types, 32);
+        var i64_t: type.IrTypeId                 = 0;
+        var f64_t: type.IrTypeId                 = 0;
+        var f32_t: type.IrTypeId                 = 0;
+        if (sel i64_r.ok) { i64_t = i64_r.ok; }
+        if (sel f64_r.ok) { f64_t = f64_r.ok; }
+        if (sel f32_r.ok) { f32_t = f32_r.ok; }
+        if (sel i64_r.err || sel f64_r.err || sel f32_r.err) {
+            ir.dnit(?module);
+            ret 4;
+        }
+        var neg_f64: value.Value = value.const_int(0x8000000000000000, f64_t);
+        neg_f64.kind = value.VAL_CONST_FLOAT;
+        var neg_f32: value.Value = value.const_int(0x8000000000000000, f32_t);
+        neg_f32.kind = value.VAL_CONST_FLOAT;
+        # the smallest f64 denormal is +0.0 as an f32, so it is zero fill, not an unsupported initializer
+        var tiny_f32: value.Value = value.const_int(1, f32_t);
+        tiny_f32.kind = value.VAL_CONST_FLOAT;
+        var inits: [8]value.Value = [8]value.Value{value.const_int(0, i64_t), value.const_float(0.0, f64_t),
+            tiny_f32, neg_f64, neg_f32, value.const_int(1, i64_t), value.const_int(0, i64_t),
+            value.const_int(0, i64_t)};
+        var g: u32 = 0;
+        for (g < 8) {
+            var section: intern.StrId = intern.STR_NIL;
+            if (g == 7) { section = custom_r.ok; }
+            module.globals[g] = ir.Global{name: names[g], ty: inits[g].ty, init: inits[g],
+                is_mut:   g != 6, is_pub: false, is_extern: false, is_import: false, is_local: false,
+                is_embed: false, align: 8, section: section, iface: 0, iface_a: 0, iface_b: 0, iface_flags: 0,
+                disp:     intern.STR_NIL, ty_sem: semtype.TYPE_NIL};
+            g = g + 1;
+        }
+        module.global_len = 8;
+
+        val emitted: res[of.ObjectImage, fail.Fail] = codegen_unit(?s, ?tgt, ?module,
+            unit.ir_set_empty(), nil, PLACEMENT_POLICY_VERSION, no_debug());
+        ir.dnit(?module);
+        if (sel emitted.err) { ret 5; }
+        var image: of.ObjectImage = emitted.ok;
+        g = 0;
+        for (g < 8) {
+            if (t_global_kind(?image, names[g]) != want[g]) {
+                obj.dnit(?image);
+                ret (10 + t * 10 + g)::i32;
+            }
+            g = g + 1;
+        }
+        obj.dnit(?image);
+        t = t + 1;
     }
     ret 0;
 }
