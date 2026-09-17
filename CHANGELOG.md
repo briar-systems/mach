@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- The missing-compiler-range warning and `mach init` suggest `mach = "^5.3"`, the oldest release that reads `[project].mach`, on every 5.x compiler, and `^N.0` on a later major N. They used to suggest the running compiler's own minor, so the line depended on which binary the author ran, and a project told `^5.4` stopped building on a 5.3.0 CI seed. The warning now says the floor is the project's to raise when it uses a later feature (#3572).
 - A path dependency inside a git work tree that ignores it realizes its files again. The copy asked git from the source directory, got the enclosing repository, and kept only what that repository lists, which for an ignored directory is nothing, so `dep/<id>` came out empty and the build failed with `cannot read ./dep/<id>/mach.toml`. A source the enclosing repository ignores, with nothing of it tracked, is now copied by the plain walk, as a source outside any work tree is. A source that is its own repository or a tracked directory of one still copies what git keeps. A copy that would be empty, or would leave out the source's `mach.toml`, is refused with a message naming the source and the repository whose rules dropped it (#3565).
 
 ## [5.4.0] - 2026-09-17
