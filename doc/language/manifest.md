@@ -1037,9 +1037,9 @@ re-checked against that pin (a `commit/` it declares is). For an identity the
 root does **not** declare, every requirer's exact selector (`tag/`, resolved
 through the checkout's own refs, or `commit/`) must be satisfied by the
 realized commit; a mismatch names both commits and the two remedies
-(`dependency 'b': exact ref 'tag/v1.0.0' resolves to '<commit>' but the
-realized commit is '<other>'; run `mach dep update <path> b` to re-pin it, or declare
-the identity at the root to override`; a root `commit/` that does not match
+(`dependency 'b': exact ref 'tag/v1.0.0' required by root -> a -> b resolves to
+'<commit>' but the realized commit is '<other>'; run `mach dep update <path> b` to
+re-pin it, or declare the identity at the root to override`; a root `commit/` that does not match
 reads `exact commit ref 'commit/<id>' is not satisfied by the realized commit
 '<other>'`). A `branch/` selector is an input to `update`, never a verify fact.
 The verifier reads the git **index**, so a freshly realized dependency is
@@ -1079,7 +1079,11 @@ dependencies in these projects are verified from their own plain checkouts.
 moves an exact selector to the commit it names, so an identity realized at a
 dependency's selection lands on the root's declaration once the root declares
 one (`b: 0564… -> e508… (pinned to the exact selector)`, or `(exact selector,
-already pinned)` when nothing moves). For an identity reached by
+already pinned)` when nothing moves). `<name>` is looked up in the whole
+dependency closure, so `mach dep update <path> b` for an identity the root does
+not declare moves its checkout to the selector its requirers declare. A
+name outside the closure is refused (`dependency 'x' is not in the dependency
+closure`). For an identity reached by
 more than one path, one rule decides: the root's selector wins if the root
 declares the identity; otherwise agreement among the requirers is taken;
 otherwise the command stops, prints both chains, and names the root
