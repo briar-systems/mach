@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.3.1] - 2026-09-17
+
+### Fixed
+- Editor analysis at the resolve and sema phases no longer fails with "analysis diagnostic refers to an unavailable source version" when the project records a warning that belongs to no file. That covered every root without `[project].mach`, and every `native` selection with no target for the host, so language-server completion came back empty for them. Four warnings spelled "no file" as a bare `0xFFFFFFFF` file id that no reader recognised. They now all record through one call and are located at `FILE_NIL`, so a language server reads them as unlocated diagnostics (#3559).
+
 ## [5.3.0] - 2026-09-17
 
 ### Added
