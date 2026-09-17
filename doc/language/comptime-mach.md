@@ -11,8 +11,8 @@ comparison against the resolved-build facts.
 > the compiler version (`$mach.version` and `$mach.version.{major,minor,patch}`),
 > and `$mach.compiler.{name,version}` are live. The `$mach.build.{timestamp,
 > host}`, `$mach.build.git.*`, `$mach.project.*`, and `$mach.source.*` paths are
-> reserved: the spelling is held for a later release and reading one is a
-> compile error naming the subtree (`` `$mach.source.*` is not yet available ``).
+> reserved: the spelling is held for a later release (#3590) and reading one is
+> a compile error naming the subtree (`` `$mach.source.*` is not yet available ``).
 > Each subtree below notes which it is.
 
 ## Subtrees
