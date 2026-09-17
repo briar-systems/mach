@@ -139,6 +139,36 @@ So `mov eax, word [rcx]` is refused (two widths for one access), and
 reading it as a same-width move would silently assemble a plain `mov` where a
 zero-extending load was written.
 
+## Segment-relative memory (x86-64)
+
+A memory operand may lead with `fs:` or `gs:`, after any width keyword. The
+address is then relative to that segment's base, and the instruction carries the
+`0x64` or `0x65` prefix. The override belongs to the operand, so every
+instruction that takes a memory operand accepts it, the vector forms included:
+
+```mach
+asm x86_64 {
+    mov rax, fs:[0x28]            # an absolute offset from the fs base
+    mov rax, qword gs:[rbx + 8]   # a register-relative one
+    movdqu xmm0, gs:[16]
+    jmp qword fs:[rcx]
+}
+```
+
+The override is refused wherever it would change nothing or mislead:
+
+| operand | why it is refused |
+|---|---|
+| `es:`, `cs:`, `ss:`, `ds:` | long mode ignores these bases, so the prefix relocates nothing |
+| a register, an immediate or a `{name}` binding | only a bracketed memory operand has an address to relocate |
+| `lea rax, fs:[rbx]` | `lea` never accesses its address, so the result is not segment-relative |
+| `fs:[symbol]` | a symbol operand is RIP-relative, and the base would move it off the symbol |
+
+A segment override does not change which registers an instruction reads or
+writes, and the constant-time check treats `fs:[rbx]` exactly as `[rbx]`. The
+language itself has no thread-local storage. These forms only let a block reach
+a base that something else set up.
+
 ## Vector registers
 
 Both grammars take vector registers as operands. A vector register belongs to the
@@ -200,6 +230,7 @@ asm x86_64 {
     lidt [rax]                # install an interrupt descriptor table
     pushfq / popfq            # save and restore RFLAGS
     swapgs                    # per-CPU state on a syscall entry
+    rdfsbase rax / wrgsbase r9d   # read or write the fs or gs base (fsgsbase)
     iretq                     # return from an interrupt handler
     mov rax, cr2              # the faulting address in a page-fault handler
     mov cr3, rax              # switch page tables
@@ -220,6 +251,13 @@ flags, RFLAGS, the stack pointer and a segment base are all outside the allocate
 file, and `mov cr3, rax` writes a control register rather than any general-purpose
 one. `rdtsc` and `rdmsr` are the exceptions — both land their result in EDX:EAX,
 which the effect model reports.
+
+`rdfsbase`, `rdgsbase`, `wrfsbase` and `wrgsbase` take one 32- or 64-bit
+general-purpose register. A read writes that register, and a write changes only
+the segment base. They run only where the kernel has enabled FSGSBASE, and they
+trap elsewhere. A base write is an address for the constant-time check, because
+every later `fs:` or `gs:` access goes through it. Writing a secret into a base
+is therefore refused, just as addressing memory with a secret is.
 
 `iretq` does not fall through, and the effect model has no way to say so: a
 `Mnemonic` names registers written and nothing else. That is sound — nothing can
