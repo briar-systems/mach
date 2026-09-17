@@ -1,0 +1,197 @@
+use mach.lang.fail;
+use std.allocator.page;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+
+use mach.lang.intern;
+use mach.lang.me.ir;
+use mach.lang.me.ir.builder;
+use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use mach.lang.me.vecform;
+use mach.lang.target;
+use target_testing: mach.lang.target.testing;
+
+# rewrites a lane-wise multiply of two same-kind lane-wise extensions of one
+# vector type into the widening multiply of the unextended operands, wherever
+# the target's catalog packs that cell. the extensions stay in place for any
+# other use, and a later dce drops the ones nothing reads
+pub fun run(m: *ir.Module, tgt: *target.Target) res[bool, fail.Fail] {
+    if (!tgt.model.has_v128) { ret res[bool, fail.Fail].ok{false}; }
+    var changed: bool = false;
+    var fi:      u32  = 0;
+    for (fi < m.function_len) {
+        val fn: *ir.Function = ?m.functions[fi];
+        if ((fn.flags & ir.FN_FLAG_EXTERN) == 0 && fuse_function(m, tgt, fn)) { changed = true; }
+        fi = fi + 1;
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+fun fuse_function(m: *ir.Module, tgt: *target.Target, fn: *ir.Function) bool {
+    var changed: bool = false;
+    var bi:      u32  = 0;
+    for (bi < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[bi];
+        var ii:  u32       = 0;
+        for (ii < blk.instr_count) {
+            if (fuse_one(m, tgt, fn, ?fn.instrs[blk.instructions[ii]::u32])) { changed = true; }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret changed;
+}
+
+# the lane-wise extension that defines `v`, absent for any other value
+fun extension_of(m: *ir.Module, fn: *ir.Function, v: value.Value) opt[*instruction.Instruction] {
+    if (v.kind != value.VAL_INSTR) { ret opt[*instruction.Instruction].none{}; }
+    val def: opt[*instruction.Instruction] = ir.instruction_get(fn, v.data.instr);
+    if (sel def.none) { ret def; }
+    val e: *instruction.Instruction = def.some;
+    if (e.kind != instruction.OP_SEXT && e.kind != instruction.OP_ZEXT) { ret opt[*instruction.Instruction].none{}; }
+    if (e.operand_count != 1 || !ir_type.is_vector(?m.types, e.operands[0].ty)) {
+        ret opt[*instruction.Instruction].none{};
+    }
+    ret def;
+}
+
+fun fuse_one(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, inst: *instruction.Instruction) bool {
+    if (inst.kind != instruction.OP_MUL || inst.operand_count != 2) { ret false; }
+    if (!ir_type.is_vector(?m.types, inst.ty))                      { ret false; }
+    val ea: opt[*instruction.Instruction] = extension_of(m, fn, inst.operands[0]);
+    val eb: opt[*instruction.Instruction] = extension_of(m, fn, inst.operands[1]);
+    if (sel ea.none) { ret false; }
+    if (sel eb.none) { ret false; }
+    val a: *instruction.Instruction = ea.some;
+    val b: *instruction.Instruction = eb.some;
+    if (a.kind != b.kind || a.operands[0].ty != b.operands[0].ty) { ret false; }
+    val wide: opt[instruction.InstrKind] = vecform.widening_of(a.kind);
+    if (sel wide.none)                                                         { ret false; }
+    if (!vecform.widening_packs(m, tgt, wide.some, inst.ty, a.operands[0].ty)) { ret false; }
+    inst.kind        = wide.some;
+    inst.operands[0] = a.operands[0];
+    inst.operands[1] = b.operands[0];
+    ret true;
+}
+
+rec TCase {
+    alloc:  A.Allocator;
+    reg:    target.TargetRegistry;
+    m:      ir.Module;
+    mul:    id.InstructionId;
+    narrow: ir_type.IrTypeId;
+}
+
+# a function whose body is `ext(p0) * ext2(p1)` over `bits`-bit lanes widened
+# to twice their width; `ext2` differs from `ext` to build a mixed pair
+fun t_case(c: *TCase, ext: instruction.InstrKind, ext2: instruction.InstrKind, bits: u32, lanes: u32, secret: bool) bool {
+    val rm: res[ir.Module, fail.Fail] = ir.init(?c.alloc, intern.STR_NIL);
+    if (sel rm.err) { ret false; }
+    c.m = rm.ok;
+    val en: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?c.m.types, bits);
+    val ew: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?c.m.types, bits * 2);
+    if (sel en.err) { ret false; }
+    if (sel ew.err) { ret false; }
+    val vn: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_vector(?c.m.types, en.ok, lanes);
+    val vw: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_vector(?c.m.types, ew.ok, lanes);
+    if (sel vn.err) { ret false; }
+    if (sel vw.err) { ret false; }
+    c.narrow = vn.ok;
+    val rf: res[u32, fail.Fail] = ir.function_add(?c.m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) { ret false; }
+    var bld: builder.Builder = builder.init(?c.m);
+    builder.set_function(?bld, ?c.m.functions[rf.ok]);
+    val rb: res[id.BlockId, fail.Fail] = builder.new_block(?bld);
+    if (sel rb.err) { ret false; }
+    builder.set_block(?bld, rb.ok);
+    var p0: value.Value = value.param(0, vn.ok);
+    p0.secret = secret;
+    val p1: value.Value                 = value.param(1, vn.ok);
+    var xa: res[value.Value, fail.Fail] = builder.emit_sext(?bld, p0, vw.ok);
+    if (ext == instruction.OP_ZEXT) { xa = builder.emit_zext(?bld, p0, vw.ok); }
+    var xb: res[value.Value, fail.Fail] = builder.emit_sext(?bld, p1, vw.ok);
+    if (ext2 == instruction.OP_ZEXT) { xb = builder.emit_zext(?bld, p1, vw.ok); }
+    if (sel xa.err)                  { ret false; }
+    if (sel xb.err)                  { ret false; }
+    val rp: res[value.Value, fail.Fail] = builder.emit_mul(?bld, xa.ok, xb.ok);
+    if (sel rp.err) { ret false; }
+    c.mul = rp.ok.data.instr;
+    ret true;
+}
+
+fun t_target(reg: *target.TargetRegistry, isa_name: str, out: *target.Target) bool {
+    var abi: str = "sysv64";
+    if (str_equals(isa_name, "aarch64")) { abi = "aapcs64"; }
+    if (str_equals(isa_name, "riscv64")) { abi = "lp64d"; }
+    val rt: res[target.Target, fail.Fail] = target.select_of(reg, isa_name, "linux", abi, "");
+    if (sel rt.err) { ret false; }
+    @out = rt.ok;
+    ret true;
+}
+
+# the kind the multiply has after the pass, or 255 when the case cannot be built
+fun t_fused(isa_name: str, ext: instruction.InstrKind, ext2: instruction.InstrKind, bits: u32, lanes: u32, secret: bool) instruction.InstrKind {
+    var c:    TCase;
+    val made: err[A.Error] = page.make(?c.alloc);
+    if (sel made.err) { ret 255; }
+    c.reg = target.registry_init();
+    fin { target.registry_dnit(?c.reg); }
+    val registered: err[fail.Fail] = target.register_all(?c.reg, target_testing.debug_descriptor);
+    if (sel registered.err) { ret 255; }
+    var tgt: target.Target;
+    if (!t_target(?c.reg, isa_name, ?tgt))           { ret 255; }
+    if (!t_case(?c, ext, ext2, bits, lanes, secret)) { ret 255; }
+    fin { ir.dnit(?c.m); }
+    val ran: res[bool, fail.Fail] = run(?c.m, ?tgt);
+    if (sel ran.err) { ret 255; }
+    val mul: *instruction.Instruction = ?c.m.functions[0].instrs[c.mul::u32];
+    if (ran.ok != (mul.kind != instruction.OP_MUL)) { ret 254; }
+    if (mul.kind == instruction.OP_MUL)             { ret mul.kind; }
+    # the fused multiply reads the unextended operands, secrecy and all
+    if (mul.operands[0].kind != value.VAL_PARAM || mul.operands[0].data.param_ix != 0
+        || mul.operands[1].kind != value.VAL_PARAM || mul.operands[1].data.param_ix != 1
+        || mul.operands[0].ty != c.narrow || mul.operands[1].ty != c.narrow
+        || mul.operands[0].secret != secret) { ret 253; }
+    ret mul.kind;
+}
+
+test "mach.lang.me.pass.widenmul.run:fuses_exactly_the_cells_the_catalog_packs" {
+    val sx: instruction.InstrKind = instruction.OP_SEXT;
+    val zx: instruction.InstrKind = instruction.OP_ZEXT;
+    val mu: instruction.InstrKind = instruction.OP_MUL;
+    val ws: instruction.InstrKind = instruction.OP_MUL_WIDE_S;
+    val wu: instruction.InstrKind = instruction.OP_MUL_WIDE_U;
+
+    if (t_fused("x86_64", sx, sx, 16, 4, false) != ws)  { ret 1; }
+    if (t_fused("x86_64", zx, zx, 16, 4, false) != wu)  { ret 2; }
+    if (t_fused("x86_64", zx, zx, 32, 2, false) != wu)  { ret 3; }
+    if (t_fused("x86_64", sx, sx, 32, 2, false) != mu)  { ret 4; }
+    if (t_fused("x86_64", sx, sx, 8, 8, false) != mu)   { ret 5; }
+    if (t_fused("aarch64", sx, sx, 8, 8, false) != ws)  { ret 6; }
+    if (t_fused("aarch64", zx, zx, 8, 8, false) != wu)  { ret 7; }
+    if (t_fused("aarch64", sx, sx, 32, 2, false) != ws) { ret 8; }
+    if (t_fused("aarch64", zx, zx, 32, 2, false) != wu) { ret 9; }
+    if (t_fused("riscv64", sx, sx, 16, 4, false) != mu) { ret 10; }
+
+    # the product must fit one register, and the pair must agree in signedness
+    if (t_fused("x86_64", sx, sx, 16, 8, false) != mu)  { ret 11; }
+    if (t_fused("aarch64", zx, zx, 8, 16, false) != mu) { ret 12; }
+    if (t_fused("aarch64", sx, zx, 16, 4, false) != mu) { ret 13; }
+    if (t_fused("x86_64", zx, sx, 16, 4, false) != mu)  { ret 14; }
+
+    # a secret operand fuses as well; the constant-time gate judges the
+    # widening cell it lowers to, which no target declares for lanes
+    if (t_fused("aarch64", sx, sx, 16, 4, true) != ws) { ret 15; }
+    ret 0;
+}

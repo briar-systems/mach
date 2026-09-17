@@ -237,6 +237,22 @@ Integer `*` is where this is most visible today:
 | `i32x4 * i32x4` | scalar expansion (`pmulld` is SSE4.1) | packed `mul .4s` | scalar expansion |
 | `i64x2 * i64x2` | scalar expansion | scalar expansion (NEON has no `.2d` multiply) | scalar expansion |
 
+Operators never widen implicitly, so a widening multiply is spelled as two lane
+casts and a multiply: `a::i32x4 * b::i32x4` for `a, b: i16x4`. When both operands
+are extensions of the same narrower vector type, with the same signedness, and
+the whole product fits one 128-bit register, the backend emits the target's
+widening multiply for that cell:
+
+| operands | x86_64 (SSE2) | aarch64 (NEON) | riscv64 (no vector unit) |
+|---|---|---|---|
+| `i8x8` / `u8x8` → 16-bit lanes | extend, then multiply | `smull` / `umull .8b` | extend, then multiply |
+| `i16x4` / `u16x4` → 32-bit lanes | `pmullw` + `pmulhw` / `pmulhuw` | `smull` / `umull .4h` | extend, then multiply |
+| `i32x2` → `i64x2` | extend, then multiply (`pmuldq` is SSE4.1) | `smull .2s` | extend, then multiply |
+| `u32x2` → `u64x2` | `pmuludq` | `umull .2s` | extend, then multiply |
+
+A wider product, such as `i16x8` → `i32x8`, is a 256-bit value and keeps the
+extend-then-multiply path. Either path gives the same lanes.
+
 A project that cannot afford a scalar expansion sets `simd = "require"` in its
 profile (see [manifest.md](manifest.md)), which turns the shortfall into a
 build error naming the operation, its lane width, the function and the target.
