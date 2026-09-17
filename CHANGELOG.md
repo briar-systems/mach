@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - CI seeds from mach 5.3.1, and mach's own `mach.toml` states `mach = "^5.3"`. The floor is 5.3 because 5.3.0 is the first release that reads `[project].mach` at all (#3558).
 
+### Fixed
+- A warm rebuild of a project whose gates need types reuses its resolve, gate and sema products again. Such a project loads in more than one gate round, and every round threw away each module's resolve and gate products, so a retained session (a language server) recomputed nearly the whole closure after any edit. std 4.0.0's gates make this the common case. Each module's products are now keyed by its load view: a digest of what the load walk hands resolve (its dependencies' views, its gate states, its bound constants), taken once per round. A warm build's rounds find the products their views had last time, and a build that runs fewer rounds drops the views it no longer reaches. On a two-file project that imports std 4.0.0, a warm rebuild now computes no resolve, gate or sema product, against 33 of each before, and a cold build computes 37 resolve products instead of 65. In mach-lsp's own tree (mach 5.3.1 source with std 4.0.0), a language-server rebuild after a one-line comment edit fell from 16.05 s to 1.05 s, the same as with std 3.2.0 (#3536).
+
 ## [5.3.1] - 2026-09-17
 
 ### Fixed

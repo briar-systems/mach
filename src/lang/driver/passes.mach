@@ -1,8 +1,10 @@
 use std.allocator.page;
+use std.collections.map;
 use std.collections.vector;
 use std.crypto.hash.sha256;
 use std.encoding.binary;
 use std.format;
+use std.memory;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -78,7 +80,9 @@ pub fun read_definition(raw: ptr, mid: session.ModuleId, phase: scx.DefinitionPh
     if (sel parsed.err) { ret res[scx.Definition, fail.Fail].err{parsed.err}; }
     var result: scx.Definition = scx.Definition{parsed: parsed.ok, origin: mid};
     if (phase >= scx.DEFINITION_RESOLVED) {
-        val acquired: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_RESOLVE, p.modules[mid::u32].stable_id::u64);
+        val viewed: err[fail.Fail] = depend_final_view(p, ?p.modules[mid::u32]);
+        if (sel viewed.err) { ret res[scx.Definition, fail.Fail].err{viewed.err}; }
+        val acquired: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_RESOLVE, view_key(?p.modules[mid::u32]));
         if (sel acquired.err) { ret res[scx.Definition, fail.Fail].err{acquired.err}; }
         result.rr = dq.resolve_handle_decode(acquired.ok);
         if (result.rr == nil) { ret res[scx.Definition, fail.Fail].err{fail.message("current definition has no resolved query owner")}; }
@@ -111,8 +115,16 @@ pub fun prepare_resolve_pass(p: *project.Project) err[fail.Fail] {
         val rs: err[fail.Fail] = query.register_derived(?p.s.queries, query.Q_GATE_SURFACE);
         if (sel rs.err) { ret rs; }
     }
+    if (!query.is_registered(?p.s.queries, query.Q_LOAD_VIEW)) {
+        val rv: err[fail.Fail] = query.register_input(?p.s.queries, query.Q_LOAD_VIEW);
+        if (sel rv.err) { ret rv; }
+    }
     val tuples: err[fail.Fail] = set_union_tuple_inputs(p);
     if (sel tuples.err) { ret tuples; }
+    if (!p.views_settled) {
+        val viewed: err[fail.Fail] = assign_load_views(p);
+        if (sel viewed.err) { ret viewed; }
+    }
 
     var tflag: u8 = 0;
     if (p.gate_terminal) { tflag = 1; }
@@ -145,7 +157,7 @@ fun run_resolve_one(p: *project.Project, mid: session.ModuleId) err[fail.Fail] {
 
     val t_item: readout.Instant = readout.item_begin(p.events);
 
-    val e_r: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_RESOLVE, m.stable_id::u64);
+    val e_r: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_RESOLVE, view_key(m));
     if (sel e_r.err) { ret err[fail.Fail].err{e_r.err}; }
     val rr: *resolve.ResolveResult = dq.resolve_handle_decode(e_r.ok);
     if (rr == nil) { ret err[fail.Fail].err{fail.message("Q_RESOLVE produced no result handle")}; }
@@ -155,7 +167,7 @@ fun run_resolve_one(p: *project.Project, mid: session.ModuleId) err[fail.Fail] {
     resolve.remap_result(rr, p.s);
     m.resolve_result = rr;
 
-    val ex_r: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_EXPORTS, m.stable_id::u64);
+    val ex_r: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_EXPORTS, view_key(m));
     if (sel ex_r.err) { ret err[fail.Fail].err{ex_r.err}; }
 
     m.resolved = true;
@@ -170,6 +182,7 @@ pub fun q_resolve_compute(p: *project.Project, key: u64, alloc: *A.Allocator, di
     val stable: session.StableModuleId = key::u32::session.StableModuleId;
     val mid:    session.ModuleId       = session.module_id_for_stable(s, stable);
     if (mid == session.MODULE_NIL) { ret res[query.QueryOutput, fail.Fail].err{fail.message("Q_RESOLVE: stable id not loaded this build")}; }
+    if (!keyed_by_view(key))       { ret res[query.QueryOutput, fail.Fail].err{fail.message("Q_RESOLVE: key names no load view")}; }
     val m:      *project.ModuleEntry                     = ?p.modules[mid::u32];
     val parsed: res[resolve.ParsedDefinition, fail.Fail] = load.parsed_definition(p::ptr, mid);
     if (sel parsed.err) { ret res[query.QueryOutput, fail.Fail].err{parsed.err}; }
@@ -178,6 +191,8 @@ pub fun q_resolve_compute(p: *project.Project, key: u64, alloc: *A.Allocator, di
     if (sel rt.err) { ret res[query.QueryOutput, fail.Fail].err{rt.err}; }
     val rgt: err[fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_GATE_TERMINAL, 0);
     if (sel rgt.err) { ret res[query.QueryOutput, fail.Fail].err{rgt.err}; }
+    val rv: err[fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_LOAD_VIEW, key);
+    if (sel rv.err) { ret res[query.QueryOutput, fail.Fail].err{rv.err}; }
 
     val deps_r: res[resolve.ResolveDeps, fail.Fail] = build_resolve_deps_owned(p, m);
     if (sel deps_r.err) { ret res[query.QueryOutput, fail.Fail].err{deps_r.err}; }
@@ -187,8 +202,7 @@ pub fun q_resolve_compute(p: *project.Project, key: u64, alloc: *A.Allocator, di
     for (di < deps.count) {
         val dep_mid: session.ModuleId = deps.entries[di].module;
         if (dep_mid::u32 < p.module_len) {
-            val dep_stable: session.StableModuleId          = p.modules[dep_mid::u32].stable_id;
-            val ge:         res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_EXPORTS, dep_stable::u64);
+            val ge: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_EXPORTS, view_key(?p.modules[dep_mid::u32]));
             if (sel ge.err) {
                 free_resolve_deps(s.alloc, ?deps);
                 ret res[query.QueryOutput, fail.Fail].err{ge.err};
@@ -332,8 +346,10 @@ pub fun q_sema_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags
     if (sel parsed.err) { ret res[query.QueryOutput, fail.Fail].err{parsed.err}; }
     val definition: resolve.ParsedDefinition = parsed.ok;
     if (sel definition.status.kind.internal) { ret res[query.QueryOutput, fail.Fail].err{fail.phase_failure(definition.status)}; }
-    val a:        *ast.Ast                        = definition.a;
-    val resolved: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_RESOLVE, key);
+    val a:      *ast.Ast       = definition.a;
+    val viewed: err[fail.Fail] = depend_final_view(p, m);
+    if (sel viewed.err) { ret res[query.QueryOutput, fail.Fail].err{viewed.err}; }
+    val resolved: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_RESOLVE, view_key(m));
     if (sel resolved.err) { ret res[query.QueryOutput, fail.Fail].err{resolved.err}; }
     val rr: *resolve.ResolveResult = dq.resolve_handle_decode(resolved.ok);
     if (rr == nil) { ret res[query.QueryOutput, fail.Fail].err{fail.message("Q_SEMA: acquired query has no resolve result")}; }
@@ -380,12 +396,12 @@ pub fun q_sema_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags
 # sema reads the gate states the gate pass decided, and each tuple's verdict diagnostics are presented
 # through sema's dependencies, so a tuple-only change reruns the module's sema too
 fun depend_gates(p: *project.Project, m: *project.ModuleEntry) err[fail.Fail] {
-    val built: err[fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_GATES, gate_key(m.stable_id, GATE_TUPLE_NONE));
+    val built: err[fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_GATES, module_gate_key(m, GATE_TUPLE_NONE));
     if (sel built.err || !p.union) { ret built; }
     var ti: u32 = 0;
     for (ti < p.union_tuple_count) {
         if (tuple_reaches(m, ti)) {
-            val tuple: err[fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_GATES, gate_key(m.stable_id, ti));
+            val tuple: err[fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_GATES, module_gate_key(m, ti));
             if (sel tuple.err) { ret tuple; }
         }
         ti = ti + 1;
@@ -488,7 +504,7 @@ pub fun gate_key(stable: session.StableModuleId, ti: u32) u64 {
 }
 
 pub fun gate_key_tuple(key: u64) u32 {
-    val tuple: u64 = key >> 32;
+    val tuple: u64 = (key >> 32) & 0xFF;
     if (tuple == 0) { ret GATE_TUPLE_NONE; }
     ret (tuple - 1)::u32;
 }
@@ -499,7 +515,7 @@ fun tuple_reaches(m: *project.ModuleEntry, ti: u32) bool {
 
 fun gate_view_of(p: *project.Project, mid: session.ModuleId, ti: u32) res[dq.GateView, fail.Fail] {
     val acquired: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_GATE_SURFACE,
-        gate_key(p.modules[mid::u32].stable_id, ti));
+        module_gate_key(?p.modules[mid::u32], ti));
     if (sel acquired.err) { ret res[dq.GateView, fail.Fail].err{acquired.err}; }
     ret dq.gate_view_decode(acquired.ok.value, acquired.ok.value_len);
 }
@@ -507,7 +523,7 @@ fun gate_view_of(p: *project.Project, mid: session.ModuleId, ti: u32) res[dq.Gat
 # the gate surface of a module under the current target, decoded once per view revision
 fun gate_surface_of(p: *project.Project, mid: session.ModuleId) res[*sema.ModuleSema, fail.Fail] {
     val m:        *project.ModuleEntry            = ?p.modules[mid::u32];
-    val key:      u64                             = gate_key(m.stable_id, p.gate_tuple_index);
+    val key:      u64                             = module_gate_key(m, p.gate_tuple_index);
     val acquired: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_GATE_SURFACE, key);
     if (sel acquired.err) { ret res[*sema.ModuleSema, fail.Fail].err{acquired.err}; }
     val view: query.QueryView = acquired.ok;
@@ -617,7 +633,7 @@ fun run_gate_one(p: *project.Project, mid: session.ModuleId, ti: u32) res[bool, 
     set_frame(p, m, ti);
     fin { set_frame(p, m, GATE_TUPLE_NONE); }
     val before:   u32                             = module_decided_count(m);
-    val acquired: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_GATES, gate_key(m.stable_id, ti));
+    val acquired: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_GATES, module_gate_key(m, ti));
     if (sel acquired.err) { ret res[bool, fail.Fail].err{acquired.err}; }
     val decoded: res[dq.GateRecord, fail.Fail] = dq.gate_record_decode(acquired.ok.value, acquired.ok.value_len);
     if (sel decoded.err) { ret res[bool, fail.Fail].err{decoded.err}; }
@@ -662,7 +678,8 @@ pub fun q_gates_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diag
     val ti:     u32                    = gate_key_tuple(key);
     val mid:    session.ModuleId       = session.module_id_for_stable(s, stable);
     if (mid == session.MODULE_NIL) { ret res[query.QueryOutput, fail.Fail].err{fail.message("Q_GATES: stable id not loaded this build")}; }
-    val noted: res[usize, A.Error] = vector.push[u64](?p.gate_computed, key);
+    if (!keyed_by_view(key))       { ret res[query.QueryOutput, fail.Fail].err{fail.message("Q_GATES: key names no load view")}; }
+    val noted: res[usize, A.Error] = vector.push[u64](?p.gate_computed, gate_key(stable, ti));
     if (sel noted.err) { ret res[query.QueryOutput, fail.Fail].err{fail.refused(noted.err)}; }
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
     if (m.frame_tuple != ti && m.frame_tuple != GATE_TUPLE_NONE) {
@@ -685,6 +702,8 @@ pub fun q_gates_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diag
     if (sel rt.err) { ret res[query.QueryOutput, fail.Fail].err{rt.err}; }
     val rn: err[fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_MODULE_NUMBER, stable::u64);
     if (sel rn.err) { ret res[query.QueryOutput, fail.Fail].err{rn.err}; }
+    val rv: err[fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_LOAD_VIEW, stable::u64 | (key & (VIEW_LIMIT << VIEW_SHIFT)));
+    if (sel rv.err) { ret res[query.QueryOutput, fail.Fail].err{rv.err}; }
     if (ti != GATE_TUPLE_NONE) {
         val ru: err[fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_UNION_TUPLE, ti::u64);
         if (sel ru.err) { ret res[query.QueryOutput, fail.Fail].err{ru.err}; }
@@ -814,7 +833,7 @@ fun resolve_tuple(p: *project.Project, mid: session.ModuleId, a: *ast.Ast, ti: u
     for (ci < m.const_import_count) {
         val exporter: *project.ModuleEntry = ?p.modules[m.const_imports[ci].module::u32];
         if (exporter.resolved) {
-            val re: err[fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_EXPORTS, exporter.stable_id::u64);
+            val re: err[fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_EXPORTS, view_key(exporter));
             if (sel re.err) { ret res[u32, fail.Fail].err{re.err}; }
         }
         ci = ci + 1;
@@ -1036,8 +1055,12 @@ fun tuple_fingerprint(t: *project.TargetTuple, fb: *dq.FpBuf) err[fail.Fail] {
     ret err[fail.Fail].ok{};
 }
 
+# a gate key holds the tuple beside the module in one byte
+val MAX_UNION_TUPLES: u32 = 0xFE;
+
 fun set_union_tuple_inputs(p: *project.Project) err[fail.Fail] {
-    if (!p.union) { ret err[fail.Fail].ok{}; }
+    if (!p.union)                               { ret err[fail.Fail].ok{}; }
+    if (p.union_tuple_count > MAX_UNION_TUPLES) { ret err[fail.Fail].err{fail.message("a union build selects more target tuples than a gate key can name")}; }
     var ti: u32 = 0;
     for (ti < p.union_tuple_count) {
         var fb:      dq.FpBuf       = dq.FpBuf{alloc: p.alloc};
@@ -1102,30 +1125,301 @@ fun build_gate_deps(p: *project.Project, m: *project.ModuleEntry) res[sema.SemaD
     ret res[sema.SemaDeps, fail.Fail].ok{deps};
 }
 
-# resolve reads the dep list, the decided gate states and the bound constants untracked, so a round drops every product (#3536)
-pub fun invalidate_resolve_pass(p: *project.Project) err[fail.Fail] {
+# resolve and the gate pass read the dep list, the gate states and the bound constants from the load walk, which
+# changes between gate rounds. those inputs are one digest per module and round, its load view, and the products
+# are keyed by the view's slot: the first round of this build that had the same digest. every round of a warm
+# build then finds the product its round had last time, and a dependent folds a dep's slot, not its digest, so an
+# edit inside the dep reaches the dependent only through the dep's products (#3536)
+val VIEW_SHIFT:  u64 = 40;
+val VIEW_FINAL:  u64 = 0;
+val VIEW_LIMIT:  u64 = 0xFFFFFF;
+val VIEW_DIGEST: u32 = 32;
+
+fun view_field(slot: u32) u64 {
+    ret (slot::u64 + 1) << VIEW_SHIFT;
+}
+
+pub fun view_key(m: *project.ModuleEntry) u64 {
+    ret m.stable_id::u64 | view_field(m.view_slot);
+}
+
+# the key a module's resolve and export products hold under the view its last build settled on
+pub fun settled_view_key(db: *query.QueryDb, stable: session.StableModuleId) u64 {
+    val stored: opt[query.QueryView] = query.peek_input(db, query.Q_LOAD_VIEW, view_input_key(stable, VIEW_FINAL));
+    if (sel stored.none) { ret stable::u64; }
+    val v: query.QueryView = stored.some;
+    if (v.value_len != 4) { ret stable::u64; }
+    val slot: u32 = (v.value::ptr::*u32)[0];
+    ret stable::u64 | view_field(slot);
+}
+
+fun keyed_by_view(key: u64) bool {
+    ret (key >> VIEW_SHIFT) != 0;
+}
+
+pub fun module_gate_key(m: *project.ModuleEntry, ti: u32) u64 {
+    ret gate_key(m.stable_id, ti) | view_field(m.view_slot);
+}
+
+fun view_input_key(stable: session.StableModuleId, field: u64) u64 {
+    ret stable::u64 | (field << VIEW_SHIFT);
+}
+
+fun view_limit(p: *project.Project, stable: session.StableModuleId) u32 {
+    val stored: opt[query.QueryView] = query.peek_input(?p.s.queries, query.Q_LOAD_VIEW, view_input_key(stable, VIEW_LIMIT));
+    if (sel stored.none) { ret 0; }
+    val v: query.QueryView = stored.some;
+    if (v.value_len != 4) { ret 0; }
+    val b: *u8 = v.value;
+    ret b[0]::u32 | (b[1]::u32 << 8) | (b[2]::u32 << 16) | (b[3]::u32 << 24);
+}
+
+fun set_view_limit(p: *project.Project, stable: session.StableModuleId, limit: u32) err[fail.Fail] {
+    var bytes: [4]u8;
+    bytes[0] = (limit & 0xFF)::u8;
+    bytes[1] = ((limit >> 8) & 0xFF)::u8;
+    bytes[2] = ((limit >> 16) & 0xFF)::u8;
+    bytes[3] = ((limit >> 24) & 0xFF)::u8;
+    ret query.set_input(?p.s.queries, query.Q_LOAD_VIEW, view_input_key(stable, VIEW_LIMIT), ?bytes[0], 4);
+}
+
+fun view_holds(p: *project.Project, stable: session.StableModuleId, slot: u32, digest: *u8) bool {
+    val stored: opt[query.QueryView] = query.peek_input(?p.s.queries, query.Q_LOAD_VIEW, view_input_key(stable, slot::u64 + 1));
+    if (sel stored.none) { ret false; }
+    val v: query.QueryView = stored.some;
+    ret v.value_len == VIEW_DIGEST && memory.raw_equal(v.value::ptr, digest::ptr, VIEW_DIGEST::usize);
+}
+
+fun view_free(p: *project.Project, stable: session.StableModuleId, slot: u32) bool {
+    val stored: opt[query.QueryView] = query.peek_input(?p.s.queries, query.Q_LOAD_VIEW, view_input_key(stable, slot::u64 + 1));
+    ret sel stored.none;
+}
+
+fun bool_byte(b: bool) u8 {
+    if (b) { ret 1; }
+    ret 0;
+}
+
+fun parse_revision(p: *project.Project, m: *project.ModuleEntry) query.Revision {
+    ret query.peek_revision(?p.s.queries, query.Q_PARSE, m.file_id::u64);
+}
+
+fun fold_dep_view(p: *project.Project, dep: session.ModuleId, assigned: *bool, fb: *dq.FpBuf) err[fail.Fail] {
+    if (dep::u32 >= p.module_len || !assigned[dep::u32]) { ret dq.fp_u32(fb, session.STABLE_MODULE_NIL::u32); }
+    val id: err[fail.Fail] = dq.fp_u32(fb, p.modules[dep::u32].stable_id::u32);
+    if (sel id.err) { ret id; }
+    ret dq.fp_u32(fb, p.modules[dep::u32].view_slot);
+}
+
+fun fold_bound_const(p: *project.Project, m: *project.ModuleEntry, entry: *comptime.NamedConst, fb: *dq.FpBuf) err[fail.Fail] {
+    val name: err[fail.Fail] = dq.fp_u32(fb, entry.name::u32);
+    if (sel name.err) { ret name; }
+    val gated: err[fail.Fail] = dq.fp_u8(fb, bool_byte(entry.gated));
+    if (sel gated.err) { ret gated; }
+    ret dq.fp_ct_value(fb, ?entry.value, m.stable_id, parse_revision(p, m));
+}
+
+# a bound element may name an element of the exporter's definition, so its revision is folded then
+fun fold_const_import(p: *project.Project, exporter: *project.ModuleEntry, elements: bool, fb: *dq.FpBuf) err[fail.Fail] {
+    val id: err[fail.Fail] = dq.fp_u32(fb, exporter.stable_id::u32);
+    if (sel id.err || !elements) { ret id; }
+    ret dq.fp_u64(fb, parse_revision(p, exporter));
+}
+
+# everything resolve and the gate pass read from the load walk rather than through a query, with each dep's own view.
+# a state's gate-decided flag is left out: resolve never reads it, and the gate pass only uses it to decide those
+# states again, which a resolve hit (whose cached decisions arrive through the gate record instead) makes differ
+fun fold_load_view(p: *project.Project, m: *project.ModuleEntry, assigned: *bool, fb: *dq.FpBuf) err[fail.Fail] {
+    val dep_count: err[fail.Fail] = dq.fp_u32(fb, m.dep_count);
+    if (sel dep_count.err) { ret dep_count; }
+    var i: u32 = 0;
+    for (i < m.dep_count) {
+        val dep: err[fail.Fail] = fold_dep_view(p, m.deps[i], assigned, fb);
+        if (sel dep.err) { ret dep; }
+        i = i + 1;
+    }
+    val gate_count: err[fail.Fail] = dq.fp_u32(fb, m.ctx.gate_count);
+    if (sel gate_count.err) { ret gate_count; }
+    i = 0;
+    for (i < m.ctx.gate_count) {
+        val gate: err[fail.Fail] = dq.fp_u8(fb, m.ctx.gate_states[i]::u8);
+        if (sel gate.err) { ret gate; }
+        i = i + 1;
+    }
+    var elements:    bool           = false;
+    val const_count: err[fail.Fail] = dq.fp_u32(fb, m.ctx.entries_len);
+    if (sel const_count.err) { ret const_count; }
+    i = 0;
+    for (i < m.ctx.entries_len) {
+        if (m.ctx.entries[i].value.kind == comptime.CT_KIND_CONST_ELEM) { elements = true; }
+        val bound: err[fail.Fail] = fold_bound_const(p, m, ?m.ctx.entries[i], fb);
+        if (sel bound.err) { ret bound; }
+        i = i + 1;
+    }
+    val deferred_count: err[fail.Fail] = dq.fp_u32(fb, m.ctx.deferred_len);
+    if (sel deferred_count.err) { ret deferred_count; }
+    i = 0;
+    for (i < m.ctx.deferred_len) {
+        val deferred: err[fail.Fail] = dq.fp_u32(fb, m.ctx.deferred[i]::u32);
+        if (sel deferred.err) { ret deferred; }
+        i = i + 1;
+    }
+    val import_count: err[fail.Fail] = dq.fp_u32(fb, m.const_import_count);
+    if (sel import_count.err) { ret import_count; }
+    i = 0;
+    for (i < m.const_import_count) {
+        val imported: err[fail.Fail] = fold_const_import(p, ?p.modules[m.const_imports[i].module::u32], elements, fb);
+        if (sel imported.err) { ret imported; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun view_reached(p: *project.Project, stable: session.StableModuleId, slot: u32) bool {
+    var key:   u64        = view_input_key(stable, slot::u64 + 1);
+    val found: opt[*bool] = map.get[u64, bool](?p.views_reached, ?key);
+    ret sel found.some;
+}
+
+fun take_view_slot(p: *project.Project, m: *project.ModuleEntry, digest: *u8) err[fail.Fail] {
+    var slot: u32 = p.view_round;
+    var r:    u32 = 0;
+    for (r < p.view_round) {
+        if (view_reached(p, m.stable_id, r) && view_holds(p, m.stable_id, r, digest)) {
+            slot = r;
+            brk;
+        }
+        r = r + 1;
+    }
+    if (slot == p.view_round) {
+        val stored: err[fail.Fail] = query.set_input(?p.s.queries, query.Q_LOAD_VIEW, view_input_key(m.stable_id, slot::u64 + 1), digest, VIEW_DIGEST);
+        if (sel stored.err) { ret stored; }
+        val marked: res[bool, A.Error] = map.insert[u64, bool](?p.views_reached, view_input_key(m.stable_id, slot::u64 + 1), true);
+        if (sel marked.err) { ret err[fail.Fail].err{fail.refused(marked.err)}; }
+        if (slot >= view_limit(p, m.stable_id)) {
+            val grown: err[fail.Fail] = set_view_limit(p, m.stable_id, slot + 1);
+            if (sel grown.err) { ret grown; }
+        }
+    }
+    m.view_slot = slot;
+    ret err[fail.Fail].ok{};
+}
+
+# keys each module's products by the view the load walk left it in this round, dependencies first
+pub fun assign_load_views(p: *project.Project) err[fail.Fail] {
+    if (p.view_round == 0xFFFFFE) { ret err[fail.Fail].err{fail.message("the gate fixpoint ran more rounds than a load view key can name")}; }
+    if (p.topo_len == 0) {
+        p.view_round = p.view_round + 1;
+        ret err[fail.Fail].ok{};
+    }
+    val ar: res[*bool, A.Error] = A.allocate[bool](p.alloc, p.module_len::usize);
+    if (sel ar.err) { ret err[fail.Fail].err{fail.refused(ar.err)}; }
+    val assigned: *bool = ar.ok;
+    fin { A.deallocate[bool](p.alloc, assigned, p.module_len::usize); }
     var i: u32 = 0;
     for (i < p.module_len) {
-        val stable: session.StableModuleId = p.modules[i].stable_id;
-        val re:     err[fail.Fail]         = query.invalidate(?p.s.queries, query.Q_EXPORTS, stable::u64);
-        if (sel re.err) { ret re; }
-        val rr: err[fail.Fail] = query.invalidate(?p.s.queries, query.Q_RESOLVE, stable::u64);
-        if (sel rr.err) { ret rr; }
-        var ti: u32 = GATE_TUPLE_NONE;
-        for (true) {
-            val rg: err[fail.Fail] = query.invalidate(?p.s.queries, query.Q_GATES, gate_key(stable, ti));
-            if (sel rg.err) { ret rg; }
-            val rs: err[fail.Fail] = query.invalidate(?p.s.queries, query.Q_GATE_SURFACE, gate_key(stable, ti));
-            if (sel rs.err)                { ret rs; }
-            if (ti == GATE_TUPLE_NONE)     { ti = 0; }
-            or                             { ti = ti + 1; }
-            if (ti >= p.union_tuple_count) { brk; }
+        assigned[i] = false;
+        i           = i + 1;
+    }
+    var fb: dq.FpBuf = dq.FpBuf{alloc: p.alloc};
+    fin { dq.fp_free(?fb); }
+    var digest: [32]u8;
+    i = 0;
+    for (i < p.topo_len) {
+        val mid: session.ModuleId     = p.topo[i];
+        val m:   *project.ModuleEntry = ?p.modules[mid::u32];
+        fb.len = 0;
+        val folded: err[fail.Fail] = fold_load_view(p, m, assigned, ?fb);
+        if (sel folded.err) { ret folded; }
+        sha256.hash(fb.buf, fb.len, ?digest[0]);
+        val taken: err[fail.Fail] = take_view_slot(p, m, ?digest[0]);
+        if (sel taken.err) { ret taken; }
+        assigned[mid::u32] = true;
+        i                  = i + 1;
+    }
+    p.view_round = p.view_round + 1;
+    ret err[fail.Fail].ok{};
+}
+
+# the gate fixpoint is over: products keyed by module alone read each module's final view, and the views
+# no round reached this build are dropped with their products
+pub fun settle_load_views(p: *project.Project) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val m:     *project.ModuleEntry = ?p.modules[p.topo[i]::u32];
+        var slot:  u32                  = m.view_slot;
+        val final: err[fail.Fail]       = query.set_input(?p.s.queries, query.Q_LOAD_VIEW, view_input_key(m.stable_id, VIEW_FINAL),
+            (?slot)::*u8, 4);
+        if (sel final.err) { ret final; }
+        val swept: err[fail.Fail] = sweep_views(p, m);
+        if (sel swept.err) { ret swept; }
+        i = i + 1;
+    }
+    p.views_settled = true;
+    ret err[fail.Fail].ok{};
+}
+
+fun drop_view(p: *project.Project, m: *project.ModuleEntry, slot: u32) err[fail.Fail] {
+    val field:    u64            = view_field(slot);
+    val exported: err[fail.Fail] = query.invalidate(?p.s.queries, query.Q_EXPORTS, m.stable_id::u64 | field);
+    if (sel exported.err) { ret exported; }
+    val resolved: err[fail.Fail] = query.invalidate(?p.s.queries, query.Q_RESOLVE, m.stable_id::u64 | field);
+    if (sel resolved.err) { ret resolved; }
+    var ti: u32 = GATE_TUPLE_NONE;
+    for (true) {
+        val surface: err[fail.Fail] = query.invalidate(?p.s.queries, query.Q_GATE_SURFACE, gate_key(m.stable_id, ti) | field);
+        if (sel surface.err) { ret surface; }
+        val gates: err[fail.Fail] = query.invalidate(?p.s.queries, query.Q_GATES, gate_key(m.stable_id, ti) | field);
+        if (sel gates.err)             { ret gates; }
+        if (ti == GATE_TUPLE_NONE)     { ti = 0; }
+        or                             { ti = ti + 1; }
+        if (ti >= p.union_tuple_count) { brk; }
+    }
+    ret query.invalidate(?p.s.queries, query.Q_LOAD_VIEW, view_input_key(m.stable_id, slot::u64 + 1));
+}
+
+fun sweep_views(p: *project.Project, m: *project.ModuleEntry) err[fail.Fail] {
+    val limit: u32 = view_limit(p, m.stable_id);
+    var kept:  u32 = 0;
+    var s:     u32 = 0;
+    for (s < limit) {
+        if (view_reached(p, m.stable_id, s)) { kept = s + 1; }
+        or {
+            val dropped: err[fail.Fail] = drop_view(p, m, s);
+            if (sel dropped.err) { ret dropped; }
         }
+        s = s + 1;
+    }
+    if (kept == limit) { ret err[fail.Fail].ok{}; }
+    ret set_view_limit(p, m.stable_id, kept);
+}
+
+# the live load views a module holds across builds
+pub fun view_slot_count(p: *project.Project, m: *project.ModuleEntry) u32 {
+    val limit: u32 = view_limit(p, m.stable_id);
+    var live:  u32 = 0;
+    var s:     u32 = 0;
+    for (s < limit) {
+        if (!view_free(p, m.stable_id, s)) { live = live + 1; }
+        s = s + 1;
+    }
+    ret live;
+}
+
+# a product keyed by module alone reads the module's final view, so a view change reaches it
+fun depend_final_view(p: *project.Project, m: *project.ModuleEntry) err[fail.Fail] {
+    if (!p.views_settled) { ret err[fail.Fail].ok{}; }
+    ret query.depend[project.Project](?p.queries, p, query.Q_LOAD_VIEW, view_input_key(m.stable_id, VIEW_FINAL));
+}
+
+# a module's per-round state resets between rounds, while its products stay under the views that made them
+pub fun reset_resolve_round(p: *project.Project) {
+    var i: u32 = 0;
+    for (i < p.module_len) {
         p.modules[i].resolve_result = nil;
         p.modules[i].resolved       = false;
         i                           = i + 1;
     }
-    ret err[fail.Fail].ok{};
 }
 
 pub fun q_typed_exports_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
@@ -1137,8 +1431,10 @@ pub fun q_typed_exports_compute(p: *project.Project, key: u64, alloc: *A.Allocat
     val m:        *project.ModuleEntry             = ?p.modules[mid::u32];
     val acquired: res[*sema.SemaResult, fail.Fail] = acquire_sema(p, mid);
     if (sel acquired.err) { ret res[query.QueryOutput, fail.Fail].err{acquired.err}; }
-    val sr:       *sema.SemaResult                = acquired.ok;
-    val resolved: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_RESOLVE, key);
+    val sr:     *sema.SemaResult = acquired.ok;
+    val viewed: err[fail.Fail]   = depend_final_view(p, m);
+    if (sel viewed.err) { ret res[query.QueryOutput, fail.Fail].err{viewed.err}; }
+    val resolved: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_RESOLVE, view_key(m));
     if (sel resolved.err) { ret res[query.QueryOutput, fail.Fail].err{resolved.err}; }
     val rr: *resolve.ResolveResult = dq.resolve_handle_decode(resolved.ok);
     if (rr == nil)                    { ret res[query.QueryOutput, fail.Fail].err{fail.message("typed surface has no acquired resolved owner")}; }
