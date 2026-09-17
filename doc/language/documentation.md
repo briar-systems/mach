@@ -80,7 +80,7 @@ line, nor attaches to the declaration below it. The docstring is therefore
 the first thing above the declaration, with decorators between it and the
 declaration:
 
-```mach
+```mach fragment
 # terminate the program with a message
 # ---
 # msg: text to emit before terminating
@@ -90,7 +90,7 @@ pub fun panic(msg: *u8) { ... }
 
 ## Function
 
-```mach
+```mach fragment
 # read the wall-clock time
 # ---
 # out: pointer to Timespec to populate
@@ -101,7 +101,7 @@ pub fun realtime(out: *Timespec) i64 { ... }
 Generic and comptime parameters appear in the component block under their
 syntactic form:
 
-```mach
+```mach fragment
 # atomic load through a typed pointer
 # ---
 # [T]:    element type
@@ -113,7 +113,7 @@ pub fun load[T]($order: Order, ptr: *T) T { ... }
 
 Summary-only, with no separator and no component block:
 
-```mach
+```mach fragment
 # yield the CPU to other threads
 pub fun spin_hint() { ... }
 ```

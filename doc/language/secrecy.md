@@ -45,6 +45,7 @@ arithmetic, bitwise, shift, and comparison operators, and through a value read
 out of a secret container:
 
 ```mach
+#[oblivious]
 fun mix(a: ^u32, b: u32) ^u32 { ret a + b; }    # ^u32 + u32 -> ^u32
 rec Key { d: ^[32]u8; }
 fun first(k: Key) ^u8 { ret k.d[0]; }            # element of a secret array is ^u8
@@ -70,7 +71,7 @@ error decided by operand type:
   public address, and a `*^T` is a public address to secret storage
 - a secret operand of the always-variable-latency `/` or `%`
 
-```mach
+```mach error secret value used as a branch condition
 fun leak(a: ^u32, t: *u8, p: ^*u8) u8 {
     if (a) { ret 1; }       # error: secret value used as a branch condition
     ret t[a];               # error: secret value used as a memory index
@@ -119,7 +120,7 @@ decide rather than refuse: a formatter redacts a secret field, a hash refuses on
 the constant-time comparison instead of the early-out whose timing *is* the
 secret.
 
-```mach
+```mach fragment
 rec Session { id: u64; key: ^[32]u8; }
 
 $each f in $fields(Session) {
@@ -159,7 +160,7 @@ fun publish2(a: ^*u8) *u8 { ret a:>*u8; }
 
 `:^` is no operator; the parse stops at the colon:
 
-```mach
+```mach error expected ';' after 'ret'
 fun publish(a: ^u32) u32 { ret a:^u32; }
 ```
 
@@ -186,8 +187,8 @@ public/secret aliasing leak unconstructable with no alias analysis:
 - a secret-welded pointer cannot be erased to the untyped `ptr`
 - a `uni`'s overlapping variants must agree on secrecy
 
-```mach
-fun erase(p: *^u8) ptr { ret p; }     # error: cannot erase a secret pointer to ptr
+```mach error union variants must agree on secrecy
+fun erase(p: *^u8) ptr { ret p; }     # error: type mismatch: expected ptr, found *^u8
 uni Bad { a: ^u32; b: u32; }          # error: variants disagree on secrecy
 ```
 
@@ -197,7 +198,7 @@ a check on, and at every **instance** of a generic union. At the declaration a
 variant typed by a generic parameter says nothing about secrecy, so `uni U[T] {
 a: T; b: u32; }` agrees there and is decided where each instance is formed:
 
-```mach
+```mach error this instantiation makes overlapping fields part secret
 uni U[T] { a: T; b: u32; }
 rec Box[T] { u: U[T]; }
 
@@ -240,6 +241,9 @@ against a public `*U`. The result is a public `bool` — `u8`, per
 other public value:
 
 ```mach
+use std.types.bool.bool;
+use std.types.size.usize;
+
 fun overlap(first: *^u8, first_len: usize, second: *^u8, second_len: usize) bool {
     ret first <= ?second[second_len - 1] && second <= ?first[first_len - 1];
 }
@@ -286,7 +290,9 @@ public condition. The gates are unchanged where the *pointer itself* is the
 secret: a `^*T` is a secret value, the order of two of them is secret, and that
 `bool` still cannot be a branch condition.
 
-```mach
+```mach error secret value used as a branch condition
+use std.types.bool.bool;
+
 #[oblivious]
 fun before(a: *^u8, b: *^u8) bool { ret a < b; }   # public addresses, public bool
 
@@ -440,6 +446,8 @@ type. Either one marks the store. That taint is the thing an optimization must
 consult, and it is keyed on the storage, not on any decorator, so:
 
 ```mach
+use std.types.size.usize;
+
 # no decorator: the wipe is protected anyway
 fun clear(p: *^u8, n: usize) {
     var i: usize = 0;
@@ -454,7 +462,7 @@ taint is present for any future pass to read.
 **What it does not cover.** A value the compiler keeps in a **register**. Writing to a
 promoted local is not a memory write, so wiping one is not preserved:
 
-```mach
+```mach fragment
 var x: ^u8 = k;
 x = 0;          # NOT guaranteed: `x` may never have been in memory
 ```
