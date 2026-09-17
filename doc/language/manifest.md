@@ -1130,6 +1130,16 @@ override (`root declares b by ref "branch/main", overriding root -> a 1.0.0
 requires b ^1.2`). A range is therefore never widened silently, and the escape
 hatch is one visible line in the root manifest.
 
+An override is not checked against the requirers. Because the closure is flat,
+a requirer's `use b.*` binds to whatever the root selected, even a major that
+requirer was never built or tested against. Nothing proves the requirer supports
+it: a passing build only shows that the code the build reached compiled, so it is
+evidence and not a guarantee. `mach dep verify` prints a note for every edge an
+override replaced, without failing (`note: dependency 'b': the root declares ref =
+"tag/v2.0.0", overriding root -> a -> b which requires version = "^1.2"; nothing
+checks that 'b' supports the root's selection`). Treat each note as a claim to
+confirm, by testing the requirer at that selection or by checking its own range.
+
 ### A release selects only releases
 
 The rule follows how a manifest was reached, not where it sits:
