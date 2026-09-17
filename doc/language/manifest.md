@@ -994,11 +994,21 @@ A stanza declares exactly one source:
 |--------|---------|
 | `git`  | Git URL. The dependency is a git **submodule** at `dep/<id>/`, pinned by the gitlink the root repository commits. Requires `ref`. |
 | `ref`  | Selector for `git`: `branch/<name>`, `tag/<name>`, or `commit/<full-object-id>`. Any other spelling is rejected (`[dep.std].ref must be branch/<name>, tag/<name>, or commit/<full-object-id>`). |
+| `version` | A release range for `git` (see [Compiler range](#compiler-range) for the grammar): the dependency's `v`-prefixed semver tags are its releases, and `mach dep add`/`mach dep update` resolve the range to one of them. A git dependency names exactly one of `ref` and `version`. |
 | `path` | Local project tree, never fetched. A relative `path` is resolved relative to this manifest's directory. `mach dep add <path> <id> --path` copies its files into `dep/<id>/` without the source's own `dep/` or Git metadata. No repository or index is required for a path dependency, and copied files are not automatically staged. Forbids `ref`. |
 
-`git` and `path` are mutually exclusive and exactly one is required. A
-registry-style `version =` is reserved and rejected
-(`[dep.std].version is reserved for the registry era`).
+`git` and `path` are mutually exclusive and exactly one is required. A `git`
+dependency also names exactly one selector, `ref` or `version`.
+
+A version-selected dependency is resolved only by `mach dep add` and `mach dep
+update` (with `--lowest` for the lowest release every range accepts, and
+`--offline` to resolve from tags already fetched); builds never resolve. The
+resolver picks the highest release whose range every requirer accepts and whose
+own `[project].mach` accepts the running compiler, for every version-selected
+identity in the closure, and writes the result as gitlinks like any other pin.
+A release whose manifest selects a dependency by branch, commit or path is
+refused, since it cannot be reproduced from its tag. `mach dep outdated` reports
+each such identity's pinned, highest compatible and latest release.
 
 ### Pins are gitlinks; there is no lock file
 
