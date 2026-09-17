@@ -34,6 +34,7 @@ use A: std.allocator;
 
 use mach.lang.diagnostic;
 use cand: mach.lang.driver.candidates;
+use mach.lang.driver.resolver;
 use mach.lang.fe.token;
 use mach.lang.intern;
 use mach.lang.manifest;
@@ -961,24 +962,30 @@ rec CachedListing {
     text: str;
 }
 
+# offline, each url's releases come from its own local repository
+rec LocalRepo {
+    url: str;
+    dir: str;
+}
+
 pub rec GitCandidates {
-    s:             *session.Session;
-    gi:            GitInspector;
-    listings:      Vector[CachedListing];
-    offline:       bool;
-    local:         str;
+    s:        *session.Session;
+    gi:       GitInspector;
+    listings: Vector[CachedListing];
+    locals:   Vector[LocalRepo];
+    offline:  bool;
+    local:    str;
+    # the project whose dep/<id> checkouts serve offline listings of transitive identities
+    local_root:    str;
     scratch:       str;
     scratch_ready: bool;
 }
 
 pub fun git_candidates_init(s: *session.Session, offline: bool, local: str) res[GitCandidates, outcome.Fail] {
-    if (offline && str_empty(local)) {
-        ret res[GitCandidates, outcome.Fail].err{outcome.user("offline resolution needs a local repository to read releases from")};
-    }
     val gi_r: res[GitInspector, outcome.Fail] = git_inspector_init(s.build_alloc);
     if (sel gi_r.err) { ret res[GitCandidates, outcome.Fail].err{gi_r.err}; }
     ret res[GitCandidates, outcome.Fail].ok{GitCandidates{s: s, gi: gi_r.ok, listings: vector.init[CachedListing](s.build_alloc),
-        offline: offline, local: local, scratch: "", scratch_ready: false}};
+        locals: vector.init[LocalRepo](s.build_alloc), offline: offline, local: local, local_root: "", scratch: "", scratch_ready: false}};
 }
 
 pub fun git_candidates_dnit(c: *GitCandidates) {
@@ -994,7 +1001,53 @@ pub fun git_candidates_dnit(c: *GitCandidates) {
         i = i + 1;
     }
     vector.dnit[CachedListing](?c.listings);
+    i = 0;
+    for (i < c.locals.len) {
+        str_free(c.s.build_alloc, c.locals.data[i].url);
+        str_free(c.s.build_alloc, c.locals.data[i].dir);
+        i = i + 1;
+    }
+    vector.dnit[LocalRepo](?c.locals);
     git_inspector_dnit(c.s.build_alloc, ?c.gi);
+}
+
+# the local repository offline resolution reads `url`'s releases from; the first one named wins
+pub fun git_candidates_add_local(c: *GitCandidates, url: str, dir: str) err[outcome.Fail] {
+    if (!str_empty(local_dir_for(c, url))) { ret err[outcome.Fail].ok{}; }
+    val a:  *A.Allocator      = c.s.build_alloc;
+    val ur: res[str, A.Error] = str_dup_range(a, url, 0, str_len(url));
+    if (sel ur.err) { ret err[outcome.Fail].err{outcome.refused(ur.err)}; }
+    val dr: res[str, A.Error] = str_dup_range(a, dir, 0, str_len(dir));
+    if (sel dr.err) {
+        str_free(a, ur.ok);
+        ret err[outcome.Fail].err{outcome.refused(dr.err)};
+    }
+    val pushed: res[usize, A.Error] = vector.push[LocalRepo](?c.locals, LocalRepo{url: ur.ok, dir: dr.ok});
+    if (sel pushed.err) {
+        str_free(a, ur.ok);
+        str_free(a, dr.ok);
+        ret err[outcome.Fail].err{outcome.refused(pushed.err)};
+    }
+    ret err[outcome.Fail].ok{};
+}
+
+fun local_dir_for(c: *GitCandidates, url: str) str {
+    var i: usize = 0;
+    for (i < c.locals.len) {
+        if (str_equals(c.locals.data[i].url, url)) { ret c.locals.data[i].dir; }
+        i = i + 1;
+    }
+    ret c.local;
+}
+
+fun offline_dir(c: *GitCandidates, url: str) res[str, outcome.Fail] {
+    val dir: str = local_dir_for(c, url);
+    if (str_empty(dir)) {
+        val msg: res[str, format.FormatError] = format.sprint(c.s.build_alloc, "offline: no local checkout of {} to read its releases from; run without --offline once", url);
+        if (sel msg.err) { ret res[str, outcome.Fail].err{outcome.user("offline: a dependency has no local checkout")}; }
+        ret res[str, outcome.Fail].err{outcome.user(msg.ok)};
+    }
+    ret res[str, outcome.Fail].ok{dir};
 }
 
 pub fun git_candidate_source(c: *GitCandidates) cand.CandidateSource {
@@ -1122,7 +1175,9 @@ fun cached_listing(c: *GitCandidates, url: str) res[str, outcome.Fail] {
         args[0] = "for-each-ref";
         args[1] = "--format=%(objectname) %(refname)%0a%(*objectname) %(refname)^{}";
         args[2] = "refs/tags";
-        listed  = git_query_raw(a, ?c.gi, c.local, ?args[0], 3);
+        val dir: res[str, outcome.Fail] = offline_dir(c, url);
+        if (sel dir.err) { ret res[str, outcome.Fail].err{dir.err}; }
+        listed = git_query_raw(a, ?c.gi, dir.ok, ?args[0], 3);
     }
     or {
         var args: [3]str;
@@ -1176,7 +1231,12 @@ fun git_manifest_at(ctx: ptr, url: str, rel: *cand.Release) res[manifest.Manifes
     val c:   *GitCandidates = ctx::*GitCandidates;
     val a:   *A.Allocator   = c.s.build_alloc;
     var dir: str            = c.local;
-    if (!c.offline) {
+    if (c.offline) {
+        val od: res[str, outcome.Fail] = offline_dir(c, url);
+        if (sel od.err) { ret res[manifest.Manifest, outcome.Fail].err{od.err}; }
+        dir = od.ok;
+    }
+    or {
         val ready: err[outcome.Fail] = ensure_scratch(c);
         if (sel ready.err) { ret res[manifest.Manifest, outcome.Fail].err{ready.err}; }
         dir = c.scratch;
@@ -1220,6 +1280,62 @@ fun git_manifest_at(ctx: ptr, url: str, rel: *cand.Release) res[manifest.Manifes
         ret res[manifest.Manifest, outcome.Fail].err{outcome.user(release_msg(a, rel, "its [project].version does not match the tag"))};
     }
     ret res[manifest.Manifest, outcome.Fail].ok{m};
+}
+
+# a release's requirements as the resolver reads them: its compiler range and its dependencies
+# selected by version range, or by an exact release tag. a release selecting anything else
+# (a branch, a commit, a path) is not reproducible from its tag and is refused (#3496 §7)
+pub fun release_needs(ctx: ptr, id: str, url: str, rel: *cand.Release, out: *resolver.ReleaseNeeds) err[outcome.Fail] {
+    val c:  *GitCandidates                       = ctx::*GitCandidates;
+    val a:  *A.Allocator                         = c.s.build_alloc;
+    val mr: res[manifest.Manifest, outcome.Fail] = git_manifest_at(ctx, url, rel);
+    if (sel mr.err) { ret err[outcome.Fail].err{mr.err}; }
+    var m: manifest.Manifest = mr.ok;
+    fin { manifest.dnit(?m, a); }
+    if (m.mach != intern.STR_NIL) {
+        val mach: opt[str] = intern.lookup(?c.s.interner, m.mach);
+        if (sel mach.some) { out.mach = mach.some; }
+    }
+    var i: u32 = 0;
+    for (i < m.dep_count) {
+        val d:    *manifest.DepDef = ?m.deps[i];
+        val name: str              = intern_text(c.s, d.name);
+        i = i + 1;
+        if (d.git == intern.STR_NIL) { ret err[outcome.Fail].err{outcome.user(unreproducible(a, id, rel, name, "a path"))}; }
+        val dep_url: str = intern_text(c.s, d.git);
+        var want:    str = "";
+        if (d.version != intern.STR_NIL) { want = intern_text(c.s, d.version); }
+        or {
+            val ref: str = intern_text(c.s, d.ref);
+            if (!str_starts_with(ref, "tag/v")) { ret err[outcome.Fail].err{outcome.user(unreproducible(a, id, rel, name, ref))}; }
+            val exact: res[str, format.FormatError] = format.sprint(a, "={}", (?ref[5])::str);
+            if (sel exact.err) { ret err[outcome.Fail].err{outcome.user(outcome.format_text(exact.err))}; }
+            want = exact.ok;
+        }
+        val pushed: res[usize, A.Error] = vector.push[resolver.Need](?out.needs, resolver.Need{id: name, url: dep_url, range: want});
+        if (sel pushed.err)          { ret err[outcome.Fail].err{outcome.refused(pushed.err)}; }
+        if (str_empty(c.local_root)) { cnt; }
+        val local_r: res[str, outcome.Fail] = dep_full_of(a, c.local_root, name);
+        if (sel local_r.ok) {
+            val noted: err[outcome.Fail] = git_candidates_add_local(c, dep_url, local_r.ok);
+            if (sel noted.err) { ret noted; }
+        }
+    }
+    ret err[outcome.Fail].ok{};
+}
+
+fun intern_text(s: *session.Session, id: intern.StrId) str {
+    val t: opt[str] = intern.lookup(?s.interner, id);
+    if (sel t.some) { ret t.some; }
+    ret "";
+}
+
+fun unreproducible(a: *A.Allocator, id: str, rel: *cand.Release, name: str, selector: str) str {
+    val r: res[str, format.FormatError] = format.sprint(a,
+        "release {} of {} selects dependency '{}' by {}; a release may select its dependencies only by `version` or an exact `tag/`, so it cannot be reproduced from its tag",
+        rel.tag, id, name, selector);
+    if (sel r.err) { ret "a release selects a dependency by something other than a version or a tag"; }
+    ret r.ok;
 }
 
 fun release_msg(a: *A.Allocator, rel: *cand.Release, why: str) str {
@@ -2137,12 +2253,16 @@ fun verify_git_checkout(s: *session.Session, gi: *GitInspector, alias: str,
     var pin: str = gitlink;
     if (str_empty(pin)) { pin = head; }
 
-    val ref_opt: opt[str] = intern.lookup(?s.interner, d.ref);
-    if (sel ref_opt.none) {
-        str_free(s.build_alloc, head);
-        ret res[intern.StrId, outcome.Fail].err{outcome.user("dependency Git ref is not interned")};
+    # a version range selects releases; whether the pin is one the range accepts is checked with the closure's ranges
+    var ref: str = "tag/";
+    if (d.version == intern.STR_NIL) {
+        val ref_opt: opt[str] = intern.lookup(?s.interner, d.ref);
+        if (sel ref_opt.none) {
+            str_free(s.build_alloc, head);
+            ret res[intern.StrId, outcome.Fail].err{outcome.user("dependency Git ref is not interned")};
+        }
+        ref = ref_opt.some;
     }
-    val ref: str = ref_opt.some;
     if (str_starts_with(ref, "commit/")) {
         if (!str_equals((?ref[7])::str, pin)) {
             val mr: res[str, format.FormatError] = format.sprint(s.build_alloc,
@@ -2905,6 +3025,47 @@ pub fun checkout_head(s: *session.Session, dep_full: str) res[str, outcome.Fail]
     val r: res[str, outcome.Fail] = git_query(s.build_alloc, ?gi, dep_full, ?args[0], 2);
     git_inspector_dnit(s.build_alloc, ?gi);
     ret r;
+}
+
+# the release version a checkout's HEAD is tagged with ("" when no `v`-prefixed semver tag
+# points at it); the highest wins when several do
+pub fun release_at_head(s: *session.Session, dep_full: str) res[str, outcome.Fail] {
+    val own: err[outcome.Fail] = require_own_work_tree(s, dep_full);
+    if (sel own.err) { ret res[str, outcome.Fail].err{own.err}; }
+    var gi: GitInspector      = GitInspector{program: nil};
+    val er: err[outcome.Fail] = git_inspector_require(s.build_alloc, ?gi);
+    if (sel er.err) { ret res[str, outcome.Fail].err{er.err}; }
+    fin { git_inspector_dnit(s.build_alloc, ?gi); }
+    var args: [3]str;
+    args[0] = "tag";
+    args[1] = "--points-at";
+    args[2] = "HEAD";
+    val r: res[str, outcome.Fail] = git_query_raw(s.build_alloc, ?gi, dep_full, ?args[0], 3);
+    if (sel r.err) { ret r; }
+    val text: str   = r.ok;
+    val n:    usize = str_len(text);
+    var best: str   = "";
+    var bv:   range.Version;
+    var at:   usize = 0;
+    for (at < n) {
+        var end: usize = at;
+        for (end < n && text[end] != '\n') { end = end + 1; }
+        if (end - at > 1 && text[at] == 'v') {
+            val cut: res[str, A.Error] = str_dup_range(s.build_alloc, text, at + 1, end - at - 1);
+            if (sel cut.ok) {
+                val v: res[range.Version, str] = range.parse_version(cut.ok);
+                if (sel v.ok) {
+                    var cand_v: range.Version = v.ok;
+                    if (str_empty(best) || range.compare(?cand_v, ?bv) > 0) {
+                        best = cut.ok;
+                        bv   = cand_v;
+                    }
+                }
+            }
+        }
+        at = end + 1;
+    }
+    ret res[str, outcome.Fail].ok{best};
 }
 
 fun realize_git_clone_env(s: *session.Session, root: str, id: str, url: str, ref: str,
@@ -4278,7 +4439,8 @@ test "mach.lang.driver.deps.realized_content:nested_project_verifies_checkout" {
 
         if (bad == 0) {
             var d: manifest.DepDef;
-            d.path = intern.STR_NIL;
+            d.path    = intern.STR_NIL;
+            d.version = intern.STR_NIL;
             val nr: res[intern.StrId, A.Error] = intern.intern(?s.interner, "std");
             val ur: res[intern.StrId, A.Error] = intern.intern(?s.interner, fixture);
             val rr: res[intern.StrId, A.Error] = intern.intern(?s.interner, "branch/main");
@@ -4471,7 +4633,8 @@ test "mach.lang.driver.deps.git_environment:clean_crlf_checkout_verifies_and_rea
     var s: session.Session = sr.ok;
     fin { session.dnit(?s); }
     var d: manifest.DepDef;
-    d.ref = project.intern_unwrap(?s.interner, "branch/main");
+    d.version = intern.STR_NIL;
+    d.ref     = project.intern_unwrap(?s.interner, "branch/main");
     val clean: res[intern.StrId, outcome.Fail] = verify_git_checkout(?s, ?gi, "std", root, clone, "dep", ?d, DEP_AUTHORITY_NESTED);
     if (sel clean.err) { ret 14; }
     var config_args: [3]str;
