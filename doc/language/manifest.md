@@ -1084,11 +1084,13 @@ What `mach dep add` writes:
 - with `--version <range>`, that range;
 - with `--ref <selector>`, that selector, as before.
 
-`mach init` adds std the same way, so a new project names the std release
-that works with the compiler that created it. std is an ordinary dependency,
-with no std-specific command. A tool that needs the std for a given compiler
-runs `mach init` and `mach dep pull` in a scratch project and takes what
-resolution chose.
+`mach init` adds std the same way, so a new project names the std release that
+works with the compiler that created it. std is an ordinary dependency, with
+no std-specific command. `mach init --no-deps` still resolves and writes the
+range and skips only the checkout, so it needs the network too. Offline it
+fails and writes no `[dep.std]` table. A tool that needs the std for a given
+compiler runs `mach init` and `mach dep pull` in a scratch project and takes
+what resolution chose.
 
 **`--offline`.** `add`, `update` and `outdated` read candidates from each
 dependency's repository: one `git ls-remote --tags` per URL, and the manifest
