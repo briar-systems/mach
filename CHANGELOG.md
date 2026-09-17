@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - x86-64 inline `asm` takes `fs:` and `gs:` segment overrides on memory operands, spelled after any width keyword: `mov rax, fs:[0x28]`, `mov rax, qword gs:[rbx + 8]`. The override belongs to the operand, so every instruction that takes a memory operand emits the `0x64` or `0x65` prefix through one path, the vector moves and packed forms included, and `--emit-asm` lists the same spelling back. `es:`, `cs:`, `ss:` and `ds:` are refused because long mode ignores them, and so is an override on a register, an immediate, a `{name}` binding, `lea`'s address or a RIP-relative `[symbol]`. `rdfsbase`, `rdgsbase`, `wrfsbase` and `wrgsbase` take a 32- or 64-bit register. A base write counts as an address for the constant-time check and the emitted-code walk, so writing a secret into a segment base is refused. No language thread-local storage comes with this (#3542).
 
+### Fixed
+- A path dependency inside a git work tree that ignores it realizes its files again. The copy asked git from the source directory, got the enclosing repository, and kept only what that repository lists, which for an ignored directory is nothing, so `dep/<id>` came out empty and the build failed with `cannot read ./dep/<id>/mach.toml`. A source the enclosing repository ignores, with nothing of it tracked, is now copied by the plain walk, as a source outside any work tree is. A source that is its own repository or a tracked directory of one still copies what git keeps. A copy that would be empty, or would leave out the source's `mach.toml`, is refused with a message naming the source and the repository whose rules dropped it (#3565).
+
 ## [5.4.0] - 2026-09-17
 
 ### Added
