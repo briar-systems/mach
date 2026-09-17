@@ -473,10 +473,11 @@ pointer whose target is memory the compiler cannot promote away, which is what t
 standard library's `zeroize` does. Settled: the wipe guarantee is memory-scoped; secret register lifetimes are outside
 it (#2456).
 
-**Today the guarantee is not yet load-bearing**, because no dead-store elimination
-exists to remove anything: an entirely dead fill of a *public* local also survives at
-release. The taint is what makes the requirement enforceable *before* such a pass
-lands, and `mach.lang.driver:secret_store_taint_survives_lower` pins it.
+**Today the guarantee holds trivially.** mach has no dead-store elimination, so
+nothing removes a store: an entirely dead fill of a *public* local also survives at
+release. The guarantee becomes load-bearing only if such a pass is added, and the
+taint is what would hold that pass to it. `mach.lang.driver:secret_store_taint_survives_lower`
+pins the taint.
 
 The contract is only offered where mach emits the instructions that execute.
 A target whose back half hands a module to a downstream compiler instead — the
@@ -613,7 +614,7 @@ know, an out-of-range register reference, and inline assembly without a
 complete effect declaration are rejected, never defaulted to public. A proof
 over the final allocated machine program — after selection, allocation, spills
 and frame insertion, over physical registers and flags — is planned additive
-work past 5.0.0, not something this version claims. Where mach does not own
+work (#3591), not something this version claims. Where mach does not own
 the later stages at all — a whole-module emitter such as SPIR-V — the contract
 is refused rather than assumed.
 

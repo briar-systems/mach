@@ -101,8 +101,9 @@ Rules:
   signature and ABI, so only the runtime parameters are passed.
 - A comptime parameter may be mixed freely with runtime parameters in any order.
 - A comptime parameter on a **generic** function (`fun f[T]($mode: u8, ...)`) is
-  not yet supported — combining a type instance with a value instance is a
-  pending extension and is reported with a clear diagnostic.
+  refused: a function has type instances or value instances, never both, and
+  the declaration is reported as `comptime value parameters on a generic
+  function are not yet supported`.
 - The function may live in any module: a value-parameter instance is emitted
   against its declaring module and folds its `$if` gates against that module's
   own comptime constants, so a library can export a comptime-parameter function
