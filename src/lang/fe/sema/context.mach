@@ -26,6 +26,7 @@ use mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.expr;
 use mach.lang.fe.ast.id;
 use mach.lang.fe.ast.stmt;
+use atype: mach.lang.fe.ast.type;
 use mach.lang.fe.comptime;
 use mach.lang.fe.resolve;
 use mach.lang.fe.sema.fields;
@@ -63,20 +64,49 @@ pub rec TypeExport {
     definition_incarnation: u64;
 }
 
+# exports are append-only, and `index` maps (origin, canon) to the first export with
+# that key over the first `indexed` of them (#3472)
 pub rec ModuleSema {
     path:    intern.StrId;
     module:  session.ModuleId;
     exports: vector.Vector[TypeExport];
     graph:   fields.Graph;
+    index:   map.Map[u64, u32];
+    indexed: usize;
 }
 
 pub fun module_sema_init(a: *A.Allocator, path: intern.StrId, module: session.ModuleId) ModuleSema {
-    ret ModuleSema{path: path, module: module, exports: vector.init[TypeExport](a), graph: fields.init(a)};
+    ret ModuleSema{path: path, module: module, exports: vector.init[TypeExport](a), graph: fields.init(a),
+        index: map.init[u64, u32](a, map.hash_u64, map.eq_u64), indexed: 0};
 }
 
 pub fun module_sema_dnit(module: *ModuleSema) {
     vector.dnit[TypeExport](?module.exports);
     fields.dnit(?module.graph);
+    map.dnit[u64, u32](?module.index);
+    module.indexed = 0;
+}
+
+fun export_key(origin: session.StableModuleId, canon: intern.StrId) u64 {
+    ret (origin::u64 << 32) | canon::u64;
+}
+
+# the export of `module` keyed (origin, canon), bringing the index up to the current exports
+fun module_export_for(module: *ModuleSema, origin: session.StableModuleId, canon: intern.StrId) res[opt[TypeExport], A.Error] {
+    for (module.indexed < module.exports.len) {
+        val item: *TypeExport = ?module.exports.data[module.indexed];
+        var key:  u64         = export_key(item.origin, item.canon);
+        val seen: opt[*u32]   = map.get[u64, u32](?module.index, ?key);
+        if (sel seen.none) {
+            val added: res[bool, A.Error] = map.insert[u64, u32](?module.index, key, module.indexed::u32);
+            if (sel added.err) { ret res[opt[TypeExport], A.Error].err{added.err}; }
+        }
+        module.indexed = module.indexed + 1;
+    }
+    var want:  u64       = export_key(origin, canon);
+    val found: opt[*u32] = map.get[u64, u32](?module.index, ?want);
+    if (sel found.none) { ret res[opt[TypeExport], A.Error].ok{opt[TypeExport].none{}}; }
+    ret res[opt[TypeExport], A.Error].ok{opt[TypeExport].some{module.exports.data[@found.some]}};
 }
 
 pub def DefinitionPhase: u8;
@@ -223,9 +253,11 @@ pub fun symbol_definition(sc: *SemaContext, sym: *resolve.Symbol,
     }};
 }
 
+# the imported surfaces are borrowed: the driver owns each one and shares it
+# between every importer in a pass (#3472)
 pub rec SemaDeps {
     definitions: DefinitionReader;
-    entries:     *ModuleSema;
+    entries:     **ModuleSema;
     count:       u32;
 }
 
@@ -331,6 +363,11 @@ pub rec SemaContext {
     inst_parent: u32;
 
     silent: bool;
+    # resolving every type node up front, before any arm is selected
+    type_prepass: bool;
+    # how many deferred names type resolution has met, so a consumer can tell a type that
+    # failed on one from a type that failed on its own
+    deferred_hits: u32;
 
     expr_type:        *type.TypeId;
     type_resolved_ty: *type.TypeId;
@@ -373,10 +410,100 @@ pub rec SemaContext {
     has_secret:   bool;
 }
 
+# a name resolve left for the arm sema selects (#3485), reported once at the name itself
+# whichever instantiation walks it, and never for an arm sema discards
+pub fun report_deferred_name(sc: *SemaContext, span: token.Span, prefix: str) {
+    if (sc.silent || sc.type_prepass) { ret; }
+    fail.reject(?sc.status);
+    val name_r: res[intern.StrId, A.Error] = intern.intern_span(?sc.s.interner, sc.source, span);
+    if (sel name_r.err) {
+        fail.internal(?sc.status, "out of memory naming an unresolved name");
+        ret;
+    }
+    val name: opt[str] = intern.lookup(?sc.s.interner, name_r.ok);
+    if (sel name.none) {
+        fail.internal(?sc.status, "an unresolved name has no text");
+        ret;
+    }
+    val msg_r: res[str, format.FormatError] = format.sprint(sc.diags.a, "{}{}`", prefix, name.some);
+    if (sel msg_r.err) {
+        fail.internal(?sc.status, "out of memory naming an unresolved name");
+        ret;
+    }
+    val committed: res[bool, fail.Fail] = diagnostic.gate_error(sc.diags, ?sc.s.interner, sc.a.file_id, span, msg_r.ok);
+    str_free(sc.diags.a, msg_r.ok);
+    if (sel committed.err) { fail.internal(?sc.status, fail.describe(committed.err)); }
+}
+
+pub fun report_deferred_type(sc: *SemaContext, ast_tid: id.TypeId) {
+    report_deferred_subtree(sc, ast_tid, 0);
+}
+
+# a type is consumed whole, often from the memo, so every deferred name anywhere inside it is
+# reached from here: its arguments, pointee, element, length, parameters and fields
+fun report_deferred_subtree(sc: *SemaContext, ast_tid: id.TypeId, depth: u32) {
+    if (depth > 64 || ast_tid == id.TYPE_NIL)                                      { ret; }
+    if (sc.rr == nil || sc.rr.type_resolved == nil || ast_tid >= sc.rr.type_count) { ret; }
+    val t_opt: opt[*atype.Type] = ast.get_type(sc.a, ast_tid);
+    if (!sel t_opt.some) { ret; }
+    val t: *atype.Type = t_opt.some;
+    if (sc.rr.type_resolved[ast_tid] == resolve.SYMBOL_DEFERRED_TYPE) {
+        sc.deferred_hits = sc.deferred_hits + 1;
+        report_deferred_name(sc, t.span, "unresolved type name `");
+    }
+    if (t.kind == atype.TYPE_KIND_NAMED) {
+        var i: u32 = 0;
+        for (i < t.data.named.args_len) {
+            report_deferred_subtree(sc, sc.a.type_ids[t.data.named.args_start + i], depth + 1);
+            i = i + 1;
+        }
+    }
+    or (t.kind == atype.TYPE_KIND_PTR)             { report_deferred_subtree(sc, t.data.ptr.pointee, depth + 1); }
+    or (t.kind == atype.TYPE_KIND_SECRET)          { report_deferred_subtree(sc, t.data.secret.inner, depth + 1); }
+    or (t.kind == atype.TYPE_KIND_POINTEE_OF)      { report_deferred_subtree(sc, t.data.pointee_of.inner, depth + 1); }
+    or (t.kind == atype.TYPE_KIND_DISCRIMINANT_OF) { report_deferred_subtree(sc, t.data.discriminant_of.inner, depth + 1); }
+    or (t.kind == atype.TYPE_KIND_ARRAY) {
+        report_deferred_length(sc, t.data.array.length);
+        report_deferred_subtree(sc, t.data.array.element, depth + 1);
+    }
+    or (t.kind == atype.TYPE_KIND_FUN) {
+        var p: u32 = 0;
+        for (p < t.data.fun_.params_len) {
+            report_deferred_subtree(sc, sc.a.type_ids[t.data.fun_.params_start + p], depth + 1);
+            p = p + 1;
+        }
+        report_deferred_subtree(sc, t.data.fun_.ret_type, depth + 1);
+    }
+    or (t.kind == atype.TYPE_KIND_REC || t.kind == atype.TYPE_KIND_UNI) {
+        var start: u32 = t.data.rec_.fields_start;
+        var len:   u32 = t.data.rec_.fields_len;
+        if (t.kind == atype.TYPE_KIND_UNI) {
+            start = t.data.uni_.fields_start;
+            len   = t.data.uni_.fields_len;
+        }
+        var f: u32 = 0;
+        for (f < len) {
+            report_deferred_subtree(sc, sc.a.typed_names[start + f].ty, depth + 1);
+            f = f + 1;
+        }
+    }
+}
+
+# an array length that is one deferred name
+fun report_deferred_length(sc: *SemaContext, eid: id.ExprId) {
+    if (eid == id.EXPR_NIL || sc.rr.expr_resolved == nil || eid >= sc.rr.expr_count) { ret; }
+    if (!resolve.symbol_deferred(sc.rr.expr_resolved[eid]))                          { ret; }
+    val e_opt: res[expr.Expr, fail.Fail] = expression(sc, eid);
+    if (sel e_opt.err) { ret; }
+    sc.deferred_hits = sc.deferred_hits + 1;
+    report_deferred_name(sc, e_opt.ok.span, "unresolved identifier `");
+}
+
 pub fun resolved_type_of(sc: *SemaContext, ast_tid: id.TypeId) type.TypeId {
     if (ast_tid == id.TYPE_NIL)        { ret type.TYPE_NIL; }
     if (sc.type_resolved_ty == nil)    { ret type.TYPE_ERROR; }
     if (ast_tid >= sc.a.type_len::u32) { ret type.TYPE_ERROR; }
+    report_deferred_type(sc, ast_tid);
     if (sc.has_secret && sc.subst != nil && sc.uni_check_fn != nil) {
         sc.uni_check_fn(sc, ast_tid);
     }
@@ -887,7 +1014,7 @@ pub fun module_sema_for(sc: *SemaContext, module: session.ModuleId) opt[*ModuleS
     if (sc.deps == nil) { ret opt[*ModuleSema].none{}; }
     var i: u32 = 0;
     for (i < sc.deps.count) {
-        val ms: *ModuleSema = ?sc.deps.entries[i];
+        val ms: *ModuleSema = sc.deps.entries[i];
         if (ms.module == module) { ret opt[*ModuleSema].some{ms}; }
         i = i + 1;
     }
@@ -899,13 +1026,12 @@ pub fun public_type_for(sc: *SemaContext, sym: *resolve.Symbol) opt[TypeExport] 
     val owner: session.StableModuleId = resolve.type_owner(sc.s, sym.origin, sym.definition_file).module;
     var i:     u32                    = 0;
     for (i < sc.deps.count) {
-        val module: *ModuleSema = ?sc.deps.entries[i];
-        var j:      usize       = 0;
-        for (j < module.exports.len) {
-            val item: TypeExport = module.exports.data[j];
-            if (item.origin == owner && item.canon == sym.canon) { ret opt[TypeExport].some{item}; }
-            j = j + 1;
+        val found: res[opt[TypeExport], A.Error] = module_export_for(sc.deps.entries[i], owner, sym.canon);
+        if (sel found.err) {
+            fail.internal(?sc.status, "out of memory indexing a dependency's public types");
+            ret opt[TypeExport].none{};
         }
+        if (sel found.ok.some) { ret found.ok; }
         i = i + 1;
     }
     ret opt[TypeExport].none{};
@@ -1390,6 +1516,47 @@ pub fun set_embed_len(sc: *SemaContext, tid: id.TypeId, len: u64) {
     if (tid == id.TYPE_NIL)          { ret; }
     if (tid::usize >= sc.a.type_len) { ret; }
     sc.embed_len[tid] = len;
+}
+
+fun t_export(origin: session.StableModuleId, canon: intern.StrId, ty: type.TypeId) TypeExport {
+    var e: TypeExport = TypeExport{};
+    e.origin = origin;
+    e.canon  = canon;
+    e.ty     = ty;
+    ret e;
+}
+
+fun t_push(m: *ModuleSema, e: TypeExport) bool {
+    val r: res[usize, A.Error] = vector.push[TypeExport](?m.exports, e);
+    ret sel r.ok;
+}
+
+fun t_export_ty(m: *ModuleSema, origin: session.StableModuleId, canon: intern.StrId) type.TypeId {
+    val r: res[opt[TypeExport], A.Error] = module_export_for(m, origin, canon);
+    if (sel r.err)     { ret 0xFFFFFFFE; }
+    if (sel r.ok.none) { ret 0xFFFFFFFF; }
+    ret r.ok.some.ty;
+}
+
+# the index answers what the scan it replaced answered: the first export with the key,
+# a miss as none, and exports appended after a lookup (#3472)
+test "mach.lang.fe.sema.context.module_export_for:indexes_first_match_and_follows_appends" {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var m: ModuleSema = module_sema_init(?alloc, 1, 1);
+    fin { module_sema_dnit(?m); }
+    if (!t_push(?m, t_export(7, 10, 100)))    { ret 2; }
+    if (!t_push(?m, t_export(7, 10, 101)))    { ret 2; }
+    if (!t_push(?m, t_export(8, 10, 102)))    { ret 2; }
+    if (t_export_ty(?m, 7, 10) != 100)        { ret 3; }
+    if (t_export_ty(?m, 8, 10) != 102)        { ret 4; }
+    if (t_export_ty(?m, 7, 11) != 0xFFFFFFFF) { ret 5; }
+    if (t_export_ty(?m, 10, 7) != 0xFFFFFFFF) { ret 6; }
+    if (!t_push(?m, t_export(7, 11, 103)))    { ret 7; }
+    if (t_export_ty(?m, 7, 11) != 103)        { ret 8; }
+    if (m.indexed != 4)                       { ret 9; }
+    ret 0;
 }
 
 test "mach.lang.fe.sema.context.embed_len:preserves_full_u32_domain" {

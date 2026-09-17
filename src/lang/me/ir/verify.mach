@@ -599,16 +599,40 @@ fun check_one_instr(m: *ir.Module, fn: *ir.Function, iid: id.InstructionId, fi: 
     ret err[fail.Fail].ok{};
 }
 
+fun vector_lanes_of(m: *ir.Module, ty: type.IrTypeId) u32 {
+    val o: opt[*type.IrType] = type.get(?m.types, ty);
+    if (sel o.none)                     { ret 0; }
+    if (o.some.kind != type.IRT_VECTOR) { ret 0; }
+    ret o.some.data.vector_.lanes;
+}
+
 fun check_convert_width(m: *ir.Module, ins: *instruction.Instruction, fi: u32, bid: id.BlockId, iid: id.InstructionId, r: *VerifyReport, tgt: *resolved.Target) err[fail.Fail] {
     val k:       instruction.InstrKind = ins.kind;
     val narrows: bool                  = k == instruction.OP_TRUNC || k == instruction.OP_FP_TRUNC;
     val widens:  bool                  = k == instruction.OP_SEXT || k == instruction.OP_ZEXT
         || k == instruction.OP_FP_EXT;
-    val keeps: bool = k == instruction.OP_BITCAST;
-    if (!narrows && !widens && !keeps) { ret err[fail.Fail].ok{}; }
-    if (ins.operand_count < 1)         { ret err[fail.Fail].ok{}; }
+    val keeps:   bool = k == instruction.OP_BITCAST;
+    val convert: bool = opdesc.vec_class(k) == opdesc.VCLASS_CONVERT;
+    if (!narrows && !widens && !keeps && !convert) { ret err[fail.Fail].ok{}; }
+    if (ins.operand_count < 1)                     { ret err[fail.Fail].ok{}; }
 
     val src: type.IrTypeId = (?ins.operands[0]).ty;
+    var sw:  u32           = 0;
+    var dw:  u32           = 0;
+    # a conversion is lane-wise: both sides are vectors of one lane count, and
+    # the direction is judged per lane
+    if (convert && (type.is_vector(?m.types, src) || type.is_vector(?m.types, ins.ty))) {
+        val sl: u32 = vector_lanes_of(m, src);
+        val dl: u32 = vector_lanes_of(m, ins.ty);
+        if (sl == 0 || dl == 0 || sl != dl) { ret push(r, fi, bid, iid, VC_CONVERT_WIDTH); }
+        sw = type.bit_width(?m.types, src) / sl;
+        dw = type.bit_width(?m.types, ins.ty) / dl;
+    }
+    or {
+        sw = type.bit_width(?m.types, src);
+        dw = type.bit_width(?m.types, ins.ty);
+    }
+    if (!narrows && !widens && !keeps) { ret err[fail.Fail].ok{}; }
     if (keeps && type.is_aggregate(?m.types, src) && type.is_aggregate(?m.types, ins.ty)) {
         val machine: layout.Machine = resolved.layout_machine(tgt);
         if (type.byte_size_for_machine(?m.types, src, machine)
@@ -618,8 +642,6 @@ fun check_convert_width(m: *ir.Module, ins: *instruction.Instruction, fi: u32, b
         ret push(r, fi, bid, iid, VC_CONVERT_WIDTH);
     }
 
-    val sw: u32 = type.bit_width(?m.types, src);
-    val dw: u32 = type.bit_width(?m.types, ins.ty);
     if (sw == 0 || dw == 0) { ret err[fail.Fail].ok{}; }
 
     if (narrows && dw < sw) { ret err[fail.Fail].ok{}; }
@@ -2047,6 +2069,57 @@ fun t_convert(k: instruction.InstrKind, from: u32, to: u32) i64 {
     if (sel r_1795.err) { ret -1; }
 
     ret t_count(?env, false, false, VC_CONVERT_WIDTH);
+}
+
+# a lane-wise conversion judged per lane, with both sides vectors of one lane count
+fun t_convert_vec(k: instruction.InstrKind, from_bits: u32, from_lanes: u32, to_bits: u32, to_lanes: u32) i64 {
+    var env: TEnv;
+    fin { target.registry_dnit(?env.registry); }
+    if (!t_env(?env)) { ret -1; }
+
+    val fe: res[type.IrTypeId, fail.Fail] = type.intern_int(?env.m.types, from_bits);
+    if (sel fe.err) { ret -1; }
+    val te: res[type.IrTypeId, fail.Fail] = type.intern_int(?env.m.types, to_bits);
+    if (sel te.err) { ret -1; }
+    var fty: type.IrTypeId = fe.ok;
+    if (from_lanes > 0) {
+        val fv: res[type.IrTypeId, fail.Fail] = type.intern_vector(?env.m.types, fe.ok, from_lanes);
+        if (sel fv.err) { ret -1; }
+        fty = fv.ok;
+    }
+    var tty: type.IrTypeId = te.ok;
+    if (to_lanes > 0) {
+        val tv: res[type.IrTypeId, fail.Fail] = type.intern_vector(?env.m.types, te.ok, to_lanes);
+        if (sel tv.err) { ret -1; }
+        tty = tv.ok;
+    }
+
+    val b0: id.BlockId = t_block(?env);
+    builder.set_block(?env.bld, b0);
+    val slot: res[value.Value, fail.Fail] = builder.emit_alloca(?env.bld, fty, t_ci(?env, 1));
+    if (sel slot.err) { ret -1; }
+    val src: res[value.Value, fail.Fail] = builder.emit_load(?env.bld, slot.ok, fty);
+    if (sel src.err) { ret -1; }
+
+    var e: res[value.Value, fail.Fail] = res[value.Value, fail.Fail].err{fail.message("unset")};
+    if (k == instruction.OP_SEXT) { e = builder.emit_sext(?env.bld, src.ok, tty); }
+    or                            { e = builder.emit_trunc(?env.bld, src.ok, tty); }
+    if (sel e.err)                { ret -1; }
+    val r: err[fail.Fail] = builder.emit_ret_void(?env.bld);
+    if (sel r.err) { ret -1; }
+
+    ret t_count(?env, false, false, VC_CONVERT_WIDTH);
+}
+
+test "mach.lang.me.ir.verify.check_convert_width:vector_conversions_are_judged_per_lane" {
+    if (t_convert_vec(instruction.OP_SEXT, 8, 4, 32, 4) != 0)  { ret 1; }
+    if (t_convert_vec(instruction.OP_TRUNC, 64, 2, 8, 2) != 0) { ret 2; }
+    if (t_convert_vec(instruction.OP_SEXT, 32, 4, 8, 4) != 1)  { ret 3; }
+    # the total width moves the right way, but the lane counts differ or one side is a scalar
+    if (t_convert_vec(instruction.OP_SEXT, 8, 4, 16, 8) != 1)  { ret 4; }
+    if (t_convert_vec(instruction.OP_TRUNC, 64, 0, 8, 4) != 1) { ret 5; }
+    if (t_convert_vec(instruction.OP_SEXT, 8, 2, 64, 0) != 1)  { ret 6; }
+    ret 0;
 }
 
 test "mach.lang.me.ir.verify.check_convert_width:unknown_width_not_judged" {
