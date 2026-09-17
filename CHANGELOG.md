@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- x86-64 code has far fewer register-to-register copies around two-address operations. The allocator now picks the register an operation computes in before it rewrites the operation. That is the result's own register, or, for a result kept on the stack, the register of an operand that dies at the operation, swapping the operands of `+`, `*`, `&`, `|` and `^` when that helps. A stack-kept left operand loads straight into that register, and a copy to or from a stack-kept value is now the load or store itself. `neg` and scalar `not` are now single two-address instructions. Before, they were a copy followed by an in-place operation that was correct only because the scratch register still held the copied value. In a release build of the x25519 bit loop, instructions per bit fell from 118 to 85 (secret form), 116 to 95 (public) and 103 to 90 (flat), with register copies down from 33 to 2, 37 to 18 and 32 to 17. std's SHA-256 round loop fell from 151 to 126 instructions, with copies down from 49 to 24 (#3495).
+
 ## [5.4.0] - 2026-09-17
 
 ### Added
