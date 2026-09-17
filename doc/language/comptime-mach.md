@@ -89,7 +89,7 @@ target's `extensions` key and, on riscv, its isa string (see
 
 The names come from the compiler's per-isa vocabularies:
 
-- `x86_64`: `ssse3`, `sse41`, `sha`;
+- `x86_64`: `ssse3`, `sse41`, `sha`, `fsgsbase`;
 - `aarch64`: `sha2`;
 - `riscv64` and `riscv32`: `i`, `m`, `a`, `f`, `d`, `c`, `zicsr`, `zifencei`.
 

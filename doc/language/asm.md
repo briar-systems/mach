@@ -230,6 +230,7 @@ The refusal names the instruction, the extension, and both ways to admit it.
 | x86_64 | `ssse3` | `pshufb xmm, xmm/m128`, `palignr xmm, xmm/m128, imm8` |
 | x86_64 | `sse41` | `pblendw xmm, xmm/m128, imm8`, `ptest xmm, xmm/m128`, `pinsrd xmm, r32/m32, imm8`, `pextrd r32/m32, xmm, imm8` |
 | x86_64 | `sha` | `sha256rnds2 xmm, xmm/m128`, `sha256msg1 xmm, xmm/m128`, `sha256msg2 xmm, xmm/m128` |
+| x86_64 | `fsgsbase` | `rdfsbase r32/r64`, `rdgsbase r32/r64`, `wrfsbase r32/r64`, `wrgsbase r32/r64` |
 | aarch64 | `sha2` | `sha256h qN, qN, vN.4s`, `sha256h2 qN, qN, vN.4s`, `sha256su0 vN.4s, vN.4s`, `sha256su1 vN.4s, vN.4s, vN.4s` |
 
 `sha256rnds2` also reads `xmm0`, the round keys, without naming it, and the
@@ -272,7 +273,7 @@ asm x86_64 {
     lidt [rax]                # install an interrupt descriptor table
     pushfq / popfq            # save and restore RFLAGS
     swapgs                    # per-CPU state on a syscall entry
-    rdfsbase rax / wrgsbase r9d   # read or write the fs or gs base (fsgsbase)
+    rdfsbase rax / wrgsbase r9d   # the fs or gs base, with the fsgsbase extension
     iretq                     # return from an interrupt handler
     mov rax, cr2              # the faulting address in a page-fault handler
     mov cr3, rax              # switch page tables
@@ -296,9 +297,11 @@ which the effect model reports — and so is `cpuid`, which writes EAX, EBX, ECX
 and EDX.
 
 `rdfsbase`, `rdgsbase`, `wrfsbase` and `wrgsbase` take one 32- or 64-bit
-general-purpose register. A read writes that register, and a write changes only
-the segment base. They run only where the kernel has enabled FSGSBASE, and they
-trap elsewhere. A base write is an address for the constant-time check, because
+general-purpose register. They need the `fsgsbase` extension (CPUID leaf 7, EBX
+bit 0), selected by the target or admitted by the function as in
+[Extension instructions](#extension-instructions). A read writes that register,
+and a write changes only the segment base. They also need the kernel to have
+enabled FSGSBASE, and they trap elsewhere. A base write is an address for the constant-time check, because
 every later `fs:` or `gs:` access goes through it. Writing a secret into a base
 is therefore refused, just as addressing memory with a secret is.
 

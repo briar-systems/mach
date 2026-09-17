@@ -232,7 +232,7 @@ comptime member, `$mach.build.ext.<name>` (see [`$mach`](comptime-mach.md)):
 
 | `isa` | Baseline | Extensions |
 |-------|----------|------------|
-| `x86_64` | SSE2 | `ssse3`, `sse41`, `sha` |
+| `x86_64` | SSE2 | `ssse3`, `sse41`, `sha`, `fsgsbase` |
 | `aarch64` | AdvSIMD | `sha2` |
 | `riscv64`, `riscv32` | the isa string's selection | `i`, `m`, `a`, `f`, `d`, `c`, `zicsr`, `zifencei` |
 | `spirv` | | none |
@@ -242,7 +242,7 @@ names it does hold:
 
 ```
 error: target: `sha2` is not an extension of isa 'x86_64'; its extensions are:
-ssse3, sse41, sha
+ssse3, sse41, sha, fsgsbase
 ```
 
 The array must hold strings, and each name must be an identifier (`sse41`, not
