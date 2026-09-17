@@ -135,10 +135,14 @@ error: this is mach 5.2.1, and the dependency closure does not accept it:
 ```
 
 A root manifest without `mach` builds, with a warning that prints the line to
-add (`mach.toml: [project] states no compiler range; add mach = "^5.2", the
-compiler this project builds with`). A later release makes the key required. A
-dependency without it states no constraint. `mach init` writes the running
-compiler's caret range.
+add (`mach.toml: [project] states no compiler range; add mach = "^5.3", the
+oldest release that reads the key, and raise it when the project uses a later
+feature`). A later release makes the key required. A dependency without it
+states no constraint. `mach init` writes the same range. It is the oldest
+release of the running compiler's major that reads the key: `^5.3` for every
+5.x compiler, since 5.3.0 is the first release that accepts `mach`, and `^N.0`
+for a later major N, since a caret cannot span majors. The range depends only on
+the running major, so two authors on one project write the same line.
 
 The compiler's version is the last release it was built from. A build from an
 unreleased tree reports that release, so a project cannot require an
@@ -1341,6 +1345,14 @@ checkout that would be registered are refused and left as they are. `mach dep
 add` takes the same step for its Git source, so re-adding a dependency whose
 checkout `remove` retained registers that checkout, and it refuses a dirty one.
 No gitlink command ever runs against a path that is not a checkout of its own.
+
+A path dependency has no pin, so `mach dep pull` syncs its `dep/<id>` with the
+declared `path` every time, and `mach dep update` does the same. A changed
+`path` realizes the new source. A file the source no longer has is removed and
+named, and a file whose content differs from the source is overwritten and named
+(`replaced 'src/lib.mach' with its source's content`), so local edits to the
+copy do not survive a pull. A `dep/<id>` that is a symlink is refused and left
+as it is.
 
 A project root is identified by its own `mach.toml`, not by an enclosing git
 repository; `dep/<id>` is resolved relative to the project root. A project

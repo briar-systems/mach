@@ -1509,20 +1509,35 @@ fun check_compiler_requirements(p: *project.Project, m: *manifest.Manifest, deps
     ret err[outcome.Fail].err{outcome.user(msg_r.ok)};
 }
 
-# the caret range of the running compiler's release line, owned by `a`
-pub fun compiler_caret(a: *A.Allocator) res[str, format.FormatError] {
-    val have: res[range.Version, str] = range.parse_version(compiler.MACH_VERSION);
-    if (sel have.ok) { ret format.sprint(a, "^{}.{}", have.ok.major, have.ok.minor); }
-    ret format.sprint(a, "={}", compiler.MACH_VERSION);
+# the first release that reads `[project].mach`; an earlier compiler refuses the key as unknown
+pub val MACH_KEY_SINCE: str = "5.3.0";
+
+# the compiler range a project is told to declare when `running` is the compiler: the oldest
+# release of its major that reads the key, since a caret cannot span majors. it depends only on
+# the running major, so two authors on one project write the same range (#3572). owned by `a`
+pub fun mach_range_floor(a: *A.Allocator, running: str) res[str, format.FormatError] {
+    val have:  res[range.Version, str] = range.parse_version(running);
+    val since: res[range.Version, str] = range.parse_version(MACH_KEY_SINCE);
+    if (sel have.err)  { ret format.sprint(a, "={}", running); }
+    if (sel since.err) { ret format.sprint(a, "={}", running); }
+    val major: u64 = have.ok.major;
+    val floor: u64 = since.ok.major;
+    if (major > floor) { ret format.sprint(a, "^{}.0", major); }
+    ret format.sprint(a, "^{}.{}", floor, since.ok.minor);
+}
+
+# mach_range_floor for this compiler
+pub fun running_mach_range_floor(a: *A.Allocator) res[str, format.FormatError] {
+    ret mach_range_floor(a, compiler.MACH_VERSION);
 }
 
 fun warn_missing_compiler_range(p: *project.Project) {
-    val caret_r: res[str, format.FormatError] = compiler_caret(p.alloc);
-    if (sel caret_r.err) { ret; }
-    val caret: str = caret_r.ok;
-    fin { str_free(p.alloc, caret); }
+    val floor_r: res[str, format.FormatError] = running_mach_range_floor(p.alloc);
+    if (sel floor_r.err) { ret; }
+    val floor: str = floor_r.ok;
+    fin { str_free(p.alloc, floor); }
     val msg_r: res[str, format.FormatError] = format.sprint(p.alloc,
-        "mach.toml: [project] states no compiler range; add `mach = \"{}\"`, the compiler this project builds with. A later release requires it", caret);
+        "mach.toml: [project] states no compiler range; add `mach = \"{}\"`, the oldest release that reads the key, and raise it when the project uses a later feature. A later release requires it", floor);
     if (sel msg_r.err) { ret; }
     diagnostic.record_unlocated_warning(?p.diags, msg_r.ok);
     str_free(p.alloc, msg_r.ok);
@@ -3761,7 +3776,8 @@ fun path_filter_load(alloc: *A.Allocator, src: str) res[PathFilter, outcome.Fail
     where_args[1] = "--is-inside-work-tree";
     where_args[2] = "--show-prefix";
     where_args[3] = "--show-toplevel";
-    val where_r: res[GitBytes, outcome.Fail] = git_query_capture(alloc, ?gi, src, ?where_args[0], 4, false, nil, os.INVALID_HANDLE, false);
+    # a source outside any repository is an expected answer, so git's complaint about it is captured, not shown
+    val where_r: res[GitBytes, outcome.Fail] = git_query_capture(alloc, ?gi, src, ?where_args[0], 4, false, nil, os.INVALID_HANDLE, true);
     if (sel where_r.err) { ret res[PathFilter, outcome.Fail].ok{f}; }
     var where: GitBytes = where_r.ok;
     fin { git_bytes_free(alloc, ?where); }
@@ -3961,18 +3977,34 @@ fun copy_inventory(alloc: *A.Allocator, root: str, rel: str, source: bool,
     ret err[outcome.Fail].ok{};
 }
 
-# whether the source inventory holds `prior` with the same kind
-fun source_has(entries: *Vector[CopyEntry], prior: *CopyEntry) bool {
+# the entry of a sorted inventory at `rel`, or nil
+fun inventory_find(entries: *Vector[CopyEntry], rel: str) *CopyEntry {
     var lo: usize = 0;
     var hi: usize = entries.len;
     for (lo < hi) {
         val mid: usize = lo + (hi - lo) / 2;
-        val cmp: i64   = str_compare(entries.data[mid].rel, prior.rel);
-        if (cmp == 0) { ret entries.data[mid].directory == prior.directory; }
+        val cmp: i64   = str_compare(entries.data[mid].rel, rel);
+        if (cmp == 0) { ret ?entries.data[mid]; }
         if (cmp < 0)  { lo = mid + 1; }
         or            { hi = mid; }
     }
-    ret false;
+    ret nil;
+}
+
+# whether the source inventory holds `prior` with the same kind
+fun source_has(entries: *Vector[CopyEntry], prior: *CopyEntry) bool {
+    val found: *CopyEntry = inventory_find(entries, prior.rel);
+    ret found != nil && found.directory == prior.directory;
+}
+
+fun bytes_equal(a: *Vector[u8], b: *Vector[u8]) bool {
+    if (a.len != b.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        if (a.data[i] != b.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 # a source's inventory is never silently empty, and a project source keeps its manifest,
@@ -4090,8 +4122,25 @@ fun copy_tree(alloc: *A.Allocator, src: str, dst: str) err[outcome.Fail] {
             if (sel bytes_r.err) { ret err[outcome.Fail].err{outcome.user(outcome.fs_text(bytes_r.err))}; }
             var bytes: Vector[u8] = bytes_r.ok;
             fin { vector.dnit[u8](?bytes); }
+            # a file the copy already holds is left alone when it matches, and named when replaced,
+            # since a re-pull overwrites whatever the copy was edited to (#3566)
+            val prior:    *CopyEntry = inventory_find(?existing, entry.rel);
+            var replaced: bool       = false;
+            if (prior != nil && !prior.directory) {
+                val held_r: res[Vector[u8], fs.FsError] = fs.read_bytes(alloc, to);
+                if (sel held_r.err) { ret err[outcome.Fail].err{outcome.user(outcome.fs_text(held_r.err))}; }
+                var held: Vector[u8] = held_r.ok;
+                val same: bool       = bytes_equal(?held, ?bytes);
+                vector.dnit[u8](?held);
+                if (same && prior.mode == entry.mode) {
+                    i = i + 1;
+                    cnt;
+                }
+                replaced = !same;
+            }
             val written: err[fs.FsError] = fs.write_bytes(to, bytes.data, bytes.len, entry.mode);
             if (sel written.err) { ret err[outcome.Fail].err{outcome.user(outcome.fs_text(written.err))}; }
+            if (replaced)        { print.eprintlnf("note: path dependency '{}': replaced '{}' with its source's content", dst, entry.rel); }
         }
         i = i + 1;
     }
@@ -4193,6 +4242,27 @@ pub fun stage_dependency(s: *session.Session, root: str, id: str) err[outcome.Fa
     if (sel r.err) { ret err[outcome.Fail].err{r.err}; }
     str_free(s.build_alloc, r.ok);
     ret err[outcome.Fail].ok{};
+}
+
+fun t_floor_is(a: *A.Allocator, running: str, want: str) bool {
+    val got: res[str, format.FormatError] = mach_range_floor(a, running);
+    if (sel got.err) { ret false; }
+    val same: bool = str_equals(got.ok, want);
+    str_free(a, got.ok);
+    ret same;
+}
+
+# the suggested compiler range is the key's floor within its major, and `^N.0` past it (#3572)
+test "mach.lang.driver.deps.mach_range_floor:depends_only_on_the_running_major" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err)                    { ret 1; }
+    if (!t_floor_is(?a, "5.3.0", "^5.3"))  { ret 2; }
+    if (!t_floor_is(?a, "5.4.0", "^5.3"))  { ret 3; }
+    if (!t_floor_is(?a, "5.99.1", "^5.3")) { ret 4; }
+    if (!t_floor_is(?a, "6.0.0", "^6.0"))  { ret 5; }
+    if (!t_floor_is(?a, "7.2.3", "^7.0"))  { ret 6; }
+    ret 0;
 }
 
 fun t_scratch_dir(alloc: *A.Allocator, prefix: str) res[str, outcome.Fail] {
