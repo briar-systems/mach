@@ -29,6 +29,7 @@ use mach.lang.intern;
 use mach.lang.target.abi;
 use mach.lang.target.isa;
 use iasm: mach.lang.target.isa.asm;
+use mach.lang.target.isa.convplan;
 use mach.lang.target.isa.x64;
 use mach.lang.target.isa.x64.printer;
 use mach.lang.target.of;
@@ -3808,83 +3809,118 @@ fun punpckl_op(w: u8) u16 {
     ret x64.PUNPCKLDQ;
 }
 
-# widen the lanes in scratch0 from `from` to `to` bytes, doubling each step:
-# the high half is the sign mask of a signed lane and zero otherwise
-fun emit_vec_widen(from: u8, to: u8, signed: bool, buf: *enc.ByteBuf) err[fail.Fail] {
-    var w: u8 = from;
-    for (w < to) {
-        val zero: err[fail.Fail] = emit_vec_zero(float_scratch1(), buf);
-        if (sel zero.err) { ret zero; }
-        if (signed) {
-            val gt: err[fail.Fail] = emit_packed_op(pcmpgt_op(w), float_scratch1(), vec_reg(float_scratch0()), buf);
-            if (sel gt.err) { ret gt; }
-        }
-        val un: err[fail.Fail] = emit_packed_op(punpckl_op(w), float_scratch0(), vec_reg(float_scratch1()), buf);
-        if (sel un.err) { ret un; }
-        w = w * 2;
-    }
-    ret err[fail.Fail].ok{};
+# the work register holds the operand's lanes from here on; a sequence that has not read it yet copies it in
+fun xconv_load(p: *convplan.Plan, loaded: *bool) {
+    if (@loaded) { ret; }
+    convplan.push(p, x64.MOVAPS::u32, convplan.PLACE_WORK, convplan.PLACE_OPERAND, 0);
+    @loaded = true;
 }
 
-# truncate the lanes in scratch0 from `from` to `to` bytes, halving each step:
+# one packed conversion instruction over the lanes, reading the operand itself when nothing has copied it yet
+fun xconv_cvt(p: *convplan.Plan, loaded: *bool, op: u16) {
+    var src: convplan.Place = convplan.PLACE_WORK;
+    if (!@loaded) { src = convplan.PLACE_OPERAND; }
+    convplan.push(p, op::u32, convplan.PLACE_WORK, src, 0);
+    @loaded = true;
+}
+
+# widen the lanes from `from` to `to` bytes, doubling each step:
+# the high half is the sign mask of a signed lane and zero otherwise
+fun xconv_widen(p: *convplan.Plan, loaded: *bool, from: u8, to: u8, signed: bool) {
+    xconv_load(p, loaded);
+    var w: u8 = from;
+    for (w < to) {
+        convplan.push(p, x64.PXOR::u32, convplan.PLACE_TEMP, convplan.PLACE_TEMP, 0);
+        if (signed) { convplan.push(p, pcmpgt_op(w)::u32, convplan.PLACE_TEMP, convplan.PLACE_WORK, 0); }
+        convplan.push(p, punpckl_op(w)::u32, convplan.PLACE_WORK, convplan.PLACE_TEMP, 0);
+        w = w * 2;
+    }
+}
+
+# truncate the lanes from `from` to `to` bytes, halving each step:
 # a quadword keeps its low doubleword by shuffle, and a narrower lane is
 # sign-folded from its low half so the saturating pack keeps those bits exactly
-fun emit_vec_narrow(from: u8, to: u8, buf: *enc.ByteBuf) err[fail.Fail] {
+fun xconv_narrow(p: *convplan.Plan, loaded: *bool, from: u8, to: u8) {
+    xconv_load(p, loaded);
     var w: u8 = from;
     for (w > to) {
-        if (w == 8) {
-            val sh: err[fail.Fail] = emit_packed_rri(x64.PSHUFD, float_scratch0(), float_scratch0(), 0x08, buf);
-            if (sel sh.err) { ret sh; }
-        }
+        if (w == 8) { convplan.push(p, x64.PSHUFD::u32, convplan.PLACE_WORK, convplan.PLACE_WORK, 0x08); }
         or {
             var left:  u16 = x64.PSLLD;
             var right: u16 = x64.PSRAD;
             var pack:  u16 = x64.PACKSSDW;
-            var bits:  u8  = 16;
+            var bits:  u32 = 16;
             if (w == 2) {
                 left  = x64.PSLLW;
                 right = x64.PSRAW;
                 pack  = x64.PACKSSWB;
                 bits  = 8;
             }
-            val sl: err[fail.Fail] = emit_packed_shift_imm(left, float_scratch0(), bits, buf);
-            if (sel sl.err) { ret sl; }
-            val sr: err[fail.Fail] = emit_packed_shift_imm(right, float_scratch0(), bits, buf);
-            if (sel sr.err) { ret sr; }
-            val pk: err[fail.Fail] = emit_packed_op(pack, float_scratch0(), vec_reg(float_scratch0()), buf);
-            if (sel pk.err) { ret pk; }
+            convplan.push(p, left::u32, convplan.PLACE_WORK, convplan.PLACE_WORK, bits);
+            convplan.push(p, right::u32, convplan.PLACE_WORK, convplan.PLACE_WORK, bits);
+            convplan.push(p, pack::u32, convplan.PLACE_WORK, convplan.PLACE_WORK, 0);
         }
         w = w / 2;
     }
-    ret err[fail.Fail].ok{};
 }
 
-# the packed conversion body over scratch0, for the cells the x86_64 packed
-# table declares; each one agrees bit for bit with the scalar conversion of a lane
-fun emit_vec_convert_body(op: mir.MirOpcode, to_float: bool, to: u8, from_float: bool, from: u8, buf: *enc.ByteBuf) err[fail.Fail] {
-    if (op == mir.MIR_SEXT || op == mir.MIR_ZEXT) { ret emit_vec_widen(from, to, op == mir.MIR_SEXT, buf); }
-    if (op == mir.MIR_TRUNC)                      { ret emit_vec_narrow(from, to, buf); }
-    if (op == mir.MIR_FP_EXT && from == 4 && to == 8) {
-        ret emit_packed_op(x64.CVTPS2PD, float_scratch0(), vec_reg(float_scratch0()), buf);
-    }
-    if (op == mir.MIR_FP_TRUNC && from == 8 && to == 4) {
-        ret emit_packed_op(x64.CVTPD2PS, float_scratch0(), vec_reg(float_scratch0()), buf);
-    }
-    if ((op == mir.MIR_SI_TO_FP || (op == mir.MIR_UI_TO_FP && from < 4)) && from <= 4 && !from_float && to_float) {
-        val wr: err[fail.Fail] = emit_vec_widen(from, 4, op == mir.MIR_SI_TO_FP, buf);
-        if (sel wr.err) { ret wr; }
+# the packed conversion sequence, for the cells the x86_64 packed table
+# declares; each one agrees bit for bit with the scalar conversion of a lane
+fun xconv_plan(op: mir.MirOpcode, to_float: bool, to: u8, from_float: bool, from: u8) opt[convplan.Plan] {
+    var p:      convplan.Plan = convplan.plan();
+    var loaded: bool          = false;
+    if (op == mir.MIR_SEXT || op == mir.MIR_ZEXT)       { xconv_widen(?p, ?loaded, from, to, op == mir.MIR_SEXT); }
+    or (op == mir.MIR_TRUNC)                            { xconv_narrow(?p, ?loaded, from, to); }
+    or (op == mir.MIR_FP_EXT && from == 4 && to == 8)   { xconv_cvt(?p, ?loaded, x64.CVTPS2PD); }
+    or (op == mir.MIR_FP_TRUNC && from == 8 && to == 4) { xconv_cvt(?p, ?loaded, x64.CVTPD2PS); }
+    or ((op == mir.MIR_SI_TO_FP || (op == mir.MIR_UI_TO_FP && from < 4)) && from <= 4 && !from_float && to_float) {
+        if (from < 4) { xconv_widen(?p, ?loaded, from, 4, op == mir.MIR_SI_TO_FP); }
         var cvt: u16 = x64.CVTDQ2PS;
         if (to == 8) { cvt = x64.CVTDQ2PD; }
-        ret emit_packed_op(cvt, float_scratch0(), vec_reg(float_scratch0()), buf);
+        xconv_cvt(?p, ?loaded, cvt);
     }
-    if (op == mir.MIR_FP_TO_SI && from_float && !to_float && to <= 4) {
+    or (op == mir.MIR_FP_TO_SI && from_float && !to_float && to <= 4) {
         var cvt: u16 = x64.CVTTPS2DQ;
         if (from == 8) { cvt = x64.CVTTPD2DQ; }
-        val cr: err[fail.Fail] = emit_packed_op(cvt, float_scratch0(), vec_reg(float_scratch0()), buf);
-        if (sel cr.err) { ret cr; }
-        ret emit_vec_narrow(4, to, buf);
+        xconv_cvt(?p, ?loaded, cvt);
+        xconv_narrow(?p, ?loaded, 4, to);
     }
-    ret err[fail.Fail].err{fail.message("encode: vector conversion outside the x86_64 packed table")};
+    or              { ret opt[convplan.Plan].none{}; }
+    if (p.overflow) { ret opt[convplan.Plan].none{}; }
+    ret opt[convplan.Plan].some{p};
+}
+
+fun xconv_place(place: convplan.Place, operand: isa.Operand, work: i32) isa.Operand {
+    if (place == convplan.PLACE_OPERAND) { ret operand; }
+    if (place == convplan.PLACE_WORK)    { ret vec_reg(work); }
+    ret vec_reg(float_scratch1());
+}
+
+# emit a plan with the result forming in `work`, which the caller chose from the plan's alias property
+fun emit_xconv(p: *convplan.Plan, operand: isa.Operand, work: i32, buf: *enc.ByteBuf) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < p.len) {
+        val step: convplan.Step  = p.steps[i];
+        val op:   u16            = step.op::u16;
+        val dst:  isa.Operand    = xconv_place(step.dst, operand, work);
+        val src:  isa.Operand    = xconv_place(step.src, operand, work);
+        var done: err[fail.Fail] = err[fail.Fail].ok{};
+        if (dst.kind != isa.OPK_REG) { ret err[fail.Fail].err{fail.message("encode: packed conversion step writes its operand")}; }
+        if (op == x64.MOVAPS) {
+            if (src.kind != isa.OPK_REG || src.reg != dst.reg) { done = emit_vec_load(src, dst.reg, buf); }
+        }
+        or (op == x64.PSHUFD) {
+            if (src.kind != isa.OPK_REG) { ret err[fail.Fail].err{fail.message("encode: packed conversion shuffle reads memory")}; }
+            done = emit_packed_rri(op, dst.reg, src.reg, step.arg::u8, buf);
+        }
+        or (op == x64.PSLLW || op == x64.PSLLD || op == x64.PSRAW || op == x64.PSRAD) {
+            done = emit_packed_shift_imm(op, dst.reg, step.arg::u8, buf);
+        }
+        or                { done = emit_packed_op(op, dst.reg, src, buf); }
+        if (sel done.err) { ret done; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
 }
 
 fun encode_vector_convert(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.ByteBuf) err[fail.Fail] {
@@ -3893,13 +3929,26 @@ fun encode_vector_convert(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.Byte
     if (sel rd.err) { ret err[fail.Fail].err{rd.err}; }
     val rs: res[isa.Operand, fail.Fail] = mir_to_operand(f, ?mi.operands[1], 16);
     if (sel rs.err) { ret err[fail.Fail].err{rs.err}; }
-    val ll: err[fail.Fail] = emit_vec_load(rs.ok, float_scratch0(), buf);
-    if (sel ll.err) { ret ll; }
-    val body: err[fail.Fail] = emit_vec_convert_body(mi.opcode,
+    val planned: opt[convplan.Plan] = xconv_plan(mi.opcode,
         mir.vec_lane_kind(mi.vec_lane) == mir.VEC_LANE_FLOAT, mir.vec_lane_elem_bytes(mi.vec_lane),
-        mir.vec_lane_from_kind(mi.vec_lane) == mir.VEC_LANE_FLOAT, mir.vec_lane_from_bytes(mi.vec_lane), buf);
-    if (sel body.err) { ret body; }
-    ret emit_vec_store(rd.ok, float_scratch0(), buf);
+        mir.vec_lane_from_kind(mi.vec_lane) == mir.VEC_LANE_FLOAT, mir.vec_lane_from_bytes(mi.vec_lane));
+    if (sel planned.none) { ret err[fail.Fail].err{fail.message("encode: vector conversion outside the x86_64 packed table")}; }
+    var p: convplan.Plan = planned.some;
+    ret emit_xconv_to(?p, rd.ok, rs.ok, buf);
+}
+
+# the result forms in the destination unless the destination is a frame slot or the scratch temporary,
+# or aliases an operand the plan reads after writing; then it forms in scratch0 and is copied out
+fun emit_xconv_to(p: *convplan.Plan, dst: isa.Operand, operand: isa.Operand, buf: *enc.ByteBuf) err[fail.Fail] {
+    val dst_is_reg: bool = dst.kind == isa.OPK_REG;
+    val aliases:    bool = dst_is_reg && operand.kind == isa.OPK_REG && operand.reg == dst.reg;
+    val is_temp:    bool = dst_is_reg && dst.reg == float_scratch1();
+    var work:       i32  = float_scratch0();
+    if (convplan.in_destination(p, dst_is_reg, aliases, is_temp)) { work = dst.reg; }
+    val body: err[fail.Fail] = emit_xconv(p, operand, work, buf);
+    if (sel body.err)                  { ret body; }
+    if (dst_is_reg && dst.reg == work) { ret err[fail.Fail].ok{}; }
+    ret emit_vec_store(dst, work, buf);
 }
 
 # the widening multiplies the x86_64 packed table declares, from the operand
@@ -11006,5 +11055,100 @@ test "mach.lang.target.isa.x64.encode.is_selected_vector_alu:partition_MirOpcode
         if (is_selected_vector_alu(others[i])) { ret 2; }
         i = i + 1;
     }
+    ret 0;
+}
+
+fun t_bytes_equal(a: *enc.ByteBuf, b: *enc.ByteBuf) bool {
+    if (a.len != b.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        if (a.data[i] != b.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+test "mach.lang.target.isa.x64.encode.vector_convert:an_aliasing_destination_forms_in_scratch_when_the_plan_reads_the_operand_late" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var got:  enc.ByteBuf = enc.buf_init(?alloc);
+    var want: enc.ByteBuf = enc.buf_init(?alloc);
+    fin {
+        enc.buf_dnit(?got);
+        enc.buf_dnit(?want);
+    }
+    val xmm1: i32           = isa.regid_make(isa.REG_CLASS_ID_XMM, x64.XMM1);
+    val xmm2: i32           = isa.regid_make(isa.REG_CLASS_ID_XMM, x64.XMM2);
+    var p:    convplan.Plan = convplan.plan();
+    convplan.push(?p, x64.MOVAPS::u32, convplan.PLACE_WORK, convplan.PLACE_OPERAND, 0);
+    convplan.push(?p, x64.PSLLD::u32, convplan.PLACE_WORK, convplan.PLACE_WORK, 1);
+    convplan.push(?p, x64.PADDD::u32, convplan.PLACE_WORK, convplan.PLACE_OPERAND, 0);
+
+    # aliased: the doubled lanes form in scratch, the original operand is added, then copied out
+    val aliased: err[fail.Fail] = emit_xconv_to(?p, vec_reg(xmm1), vec_reg(xmm1), ?got);
+    if (sel aliased.err) { ret 1; }
+    emit_movaps_rr(float_scratch0(), xmm1, ?want);
+    val s1: err[fail.Fail] = emit_packed_shift_imm(x64.PSLLD, float_scratch0(), 1, ?want);
+    val a1: err[fail.Fail] = emit_packed_op(x64.PADDD, float_scratch0(), vec_reg(xmm1), ?want);
+    if (sel s1.err || sel a1.err) { ret 2; }
+    emit_movaps_rr(xmm1, float_scratch0(), ?want);
+    if (!t_bytes_equal(?got, ?want)) { ret 3; }
+
+    # apart: the same plan forms in the destination with no copy out
+    got.len  = 0;
+    want.len = 0;
+    val apart: err[fail.Fail] = emit_xconv_to(?p, vec_reg(xmm2), vec_reg(xmm1), ?got);
+    if (sel apart.err) { ret 4; }
+    emit_movaps_rr(xmm2, xmm1, ?want);
+    val s2: err[fail.Fail] = emit_packed_shift_imm(x64.PSLLD, xmm2, 1, ?want);
+    val a2: err[fail.Fail] = emit_packed_op(x64.PADDD, xmm2, vec_reg(xmm1), ?want);
+    if (sel s2.err || sel a2.err)    { ret 5; }
+    if (!t_bytes_equal(?got, ?want)) { ret 6; }
+    ret 0;
+}
+
+test "mach.lang.target.isa.x64.encode.vector_convert:every_table_plan_forms_in_an_aliasing_destination" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var got:  enc.ByteBuf = enc.buf_init(?alloc);
+    var want: enc.ByteBuf = enc.buf_init(?alloc);
+    fin {
+        enc.buf_dnit(?got);
+        enc.buf_dnit(?want);
+    }
+    var ops: [8]mir.MirOpcode = [8]mir.MirOpcode{mir.MIR_SEXT, mir.MIR_ZEXT, mir.MIR_TRUNC, mir.MIR_FP_EXT,
+        mir.MIR_FP_TRUNC, mir.MIR_SI_TO_FP, mir.MIR_UI_TO_FP, mir.MIR_FP_TO_SI};
+    var widths: [4]u8 = [4]u8{1, 2, 4, 8};
+    val xmm3:   i32   = isa.regid_make(isa.REG_CLASS_ID_XMM, x64.XMM3);
+    var plans:  u32   = 0;
+    var oi:     u32   = 0;
+    for (oi < 8) {
+        var fi: u32 = 0;
+        for (fi < 4) {
+            var ti: u32 = 0;
+            for (ti < 4) {
+                val from_float: bool               = ops[oi] == mir.MIR_FP_EXT || ops[oi] == mir.MIR_FP_TRUNC || ops[oi] == mir.MIR_FP_TO_SI;
+                val to_float:   bool               = ops[oi] == mir.MIR_FP_EXT || ops[oi] == mir.MIR_FP_TRUNC || ops[oi] == mir.MIR_SI_TO_FP || ops[oi] == mir.MIR_UI_TO_FP;
+                val planned:    opt[convplan.Plan] = xconv_plan(ops[oi], to_float, widths[ti], from_float, widths[fi]);
+                if (sel planned.some) {
+                    var p: convplan.Plan = planned.some;
+                    if (!convplan.alias_safe(?p)) { ret 1; }
+                    # in place: the operand's own register holds the result and nothing is copied
+                    got.len  = 0;
+                    want.len = 0;
+                    val emitted: err[fail.Fail] = emit_xconv_to(?p, vec_reg(xmm3), vec_reg(xmm3), ?got);
+                    if (sel emitted.err) { ret 2; }
+                    val direct: err[fail.Fail] = emit_xconv(?p, vec_reg(xmm3), xmm3, ?want);
+                    if (sel direct.err)              { ret 3; }
+                    if (!t_bytes_equal(?got, ?want)) { ret 4; }
+                    plans = plans + 1;
+                }
+                ti = ti + 1;
+            }
+            fi = fi + 1;
+        }
+        oi = oi + 1;
+    }
+    if (plans == 0) { ret 5; }
     ret 0;
 }
