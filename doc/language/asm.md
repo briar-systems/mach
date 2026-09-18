@@ -169,6 +169,12 @@ writes, and the constant-time check treats `fs:[rbx]` exactly as `[rbx]`. The
 language itself has no thread-local storage. These forms only let a block reach
 a base that something else set up.
 
+In an `#[oblivious]` function the constant-time check reads two facts off each
+`{name}` binding: a pointer to a secret (`*^u32`) is a public address and a
+secret load, so `mov rax, {p}` then `mov ecx, [rax]` is admitted and `ecx` is a
+secret from then on, while a secret pointer (`^*u32`) is a secret address and is
+refused as one.
+
 ## Vector registers
 
 Both grammars take vector registers as operands. A vector register belongs to the
