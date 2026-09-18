@@ -633,7 +633,7 @@ for by writing assembly.
 Lets one function use instruction-set extensions the target does not select.
 Applies to a function with a body; takes one or more bare extension names.
 
-```mach
+```mach fragment
 #[extensions(sha, ssse3)]
 fun compress_sha_ni(state: *[8]u32, block: *[64]u8) {
     asm x86_64 {

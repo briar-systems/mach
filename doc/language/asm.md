@@ -243,7 +243,7 @@ flags.
 processor has. It reads the leaf from `eax` and the subleaf from `ecx`, and writes
 all of `eax`, `ebx`, `ecx` and `edx`:
 
-```mach
+```mach fragment
 var b: u32 = 0;
 var c: u32 = 0;
 var d: u32 = 0;

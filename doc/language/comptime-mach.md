@@ -96,7 +96,7 @@ The names come from the compiler's per-isa vocabularies:
 A name another isa declares folds to 0, so one chain can ask about every isa without
 an architecture guard:
 
-```mach
+```mach fragment
 $if ($mach.build.ext.sha == 1 && $mach.build.ext.ssse3 == 1 && $mach.build.ext.sse41 == 1) {
     use backend: std.crypto.hash.sha256.x86_sha;
 }
