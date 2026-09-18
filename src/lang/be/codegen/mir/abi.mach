@@ -1147,6 +1147,10 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, registers: *mir.Mir
         if (sel fw.err) { ret err[fail.Fail].err{fw.err}; }
         ret emit_call_reg(ctx, mb, registers, mir.op_preg(slot.reg), argop, fw.ok);
     }
+    if (slot_is_wide_scalar(ctx, ?slot, ty, is_aggr)) {
+        ret emit_slot_lanes(ctx, mb, registers, slot, argop, ty,
+            mir.preg_id(ctx.tgt.model.stack_ptr_reg), stack_off, true);
+    }
     ret emit_call_reg(ctx, mb, registers, mir.op_preg(slot.reg), argop, scalar_reg_move_width(ctx.tgt.model.gpr_width, size));
 }
 
@@ -1219,6 +1223,145 @@ fun capture_slot_reg(ctx: *context.LowerCtx, mb: *mir.MirBlock, dst: mir.VRegId,
         scalar_reg_move_width(ctx.tgt.model.gpr_width, size));
 }
 
+# a scalar slot whose pieces are the lanes of one value wider than the ALU: an
+# integer the convention splits across registers, or a register and a stack
+# word. its pieces are stated to legalize one lane at a time (MIR_LANE_JOIN,
+# MIR_LANE_PICK) so no pass has to find lane k of a register by arithmetic on
+# its id (#3602). a float in general registers stays one move: its lanes would
+# have to cross banks, which no target here spells (#2860)
+fun slot_is_wide_scalar(ctx: *context.LowerCtx, slot: *abi.ParamSlot, ty: type.IrTypeId, is_aggr: bool) bool {
+    if (is_aggr || slot.class != abi.CLASS_GP) { ret false; }
+    val maw: u32 = ctx.tgt.model.max_alu_width;
+    if (maw == 0)                                                            { ret false; }
+    if (context.value_is_float(ctx, ty) || context.value_is_vector(ctx, ty)) { ret false; }
+    ret type.byte_size_for_machine(ctx.types, ty, ctx.layout)::u64 > maw::u64;
+}
+
+fun lane_width(ctx: *context.LowerCtx) u64 {
+    ret ctx.tgt.model.max_alu_width::u64;
+}
+
+# the lane a piece carries: pieces are one lane wide at a lane-aligned offset
+fun piece_lane(ctx: *context.LowerCtx, p: *abi.ParamPiece) res[u32, fail.Fail] {
+    val lane: u64 = lane_width(ctx);
+    if (p.width::u64 != lane || p.src_off < 0 || p.src_off::u64 % lane != 0) {
+        ret res[u32, fail.Fail].err{fail.message("mir.abi: a wide scalar's piece is not one lane of it")};
+    }
+    ret res[u32, fail.Fail].ok{(p.src_off::u64 / lane)::u32};
+}
+
+# how many lanes a wide scalar slot has, once its pieces are checked to cover
+# every lane exactly once
+fun wide_slot_lanes(ctx: *context.LowerCtx, slot: *abi.ParamSlot, size: u64) res[u32, fail.Fail] {
+    val lane: u64 = lane_width(ctx);
+    val n:    u64 = size / lane;
+    if (n * lane != size || n < 2 || n > abi.PARAM_MAX_PIECES::u64 || slot.piece_count::u64 != n) {
+        ret res[u32, fail.Fail].err{fail.message("mir.abi: a wide scalar's pieces do not cover its lanes")};
+    }
+    var seen: u32 = 0;
+    var i:    u32 = 0;
+    for (i < slot.piece_count) {
+        val kr: res[u32, fail.Fail] = piece_lane(ctx, ?slot.pieces[i]);
+        if (sel kr.err) { ret kr; }
+        val bit: u32 = 1 << kr.ok;
+        if (kr.ok::u64 >= n || (seen & bit) != 0) {
+            ret res[u32, fail.Fail].err{fail.message("mir.abi: a wide scalar's pieces do not cover its lanes")};
+        }
+        seen = seen | bit;
+        i    = i + 1;
+    }
+    ret res[u32, fail.Fail].ok{n::u32};
+}
+
+# where a lane lives: its general register, or its stack word off stack_base
+fun lane_piece_operand(ctx: *context.LowerCtx, p: *abi.ParamPiece, stack_base: mir.PRegId, stack_off: i64,
+    stack_ok: bool) res[mir.MirOperand, fail.Fail] {
+    if (p.kind == abi.PIECE_STACK) {
+        if (!stack_ok) {
+            ret res[mir.MirOperand, fail.Fail].err{fail.message("mir.abi: a wide scalar's lane rides the stack where the convention passes no stack piece")};
+        }
+        ret res[mir.MirOperand, fail.Fail].ok{mir.op_mem_preg(stack_base, stack_off + p.stk_off)};
+    }
+    if (p.kind != abi.PIECE_GP || mir.preg_is_nil(p.reg)) {
+        ret res[mir.MirOperand, fail.Fail].err{fail.message("mir.abi: a wide integer's lane has no general register")};
+    }
+    ret res[mir.MirOperand, fail.Fail].ok{mir.op_preg(p.reg)};
+}
+
+# dst is the wide value whose lane k is the slot's piece at k: one
+# MIR_LANE_JOIN naming every piece, which legalize turns into a move per lane
+fun capture_slot_lanes(ctx: *context.LowerCtx, mb: *mir.MirBlock, dst: mir.VRegId, slot: abi.ParamSlot, ty: type.IrTypeId,
+    stack_base: mir.PRegId, stack_off: i64, stack_ok: bool) err[fail.Fail] {
+    val size: u64                 = type.byte_size_for_machine(ctx.types, ty, ctx.layout)::u64;
+    val nr:   res[u32, fail.Fail] = wide_slot_lanes(ctx, ?slot, size);
+    if (sel nr.err) { ret err[fail.Fail].err{nr.err}; }
+    val lanes: u32                           = nr.ok;
+    val ar:    res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](ctx.alloc, (lanes + 1)::usize);
+    if (sel ar.err) { ret err[fail.Fail].err{fail.refused(ar.err)}; }
+    val ops: *mir.MirOperand = ar.ok;
+    ops[0] = mir.op_vreg(dst);
+    var i: u32 = 0;
+    for (i < slot.piece_count) {
+        val kr: res[u32, fail.Fail] = piece_lane(ctx, ?slot.pieces[i]);
+        if (sel kr.err) {
+            A.deallocate[mir.MirOperand](ctx.alloc, ops, (lanes + 1)::usize);
+            ret err[fail.Fail].err{kr.err};
+        }
+        val pr: res[mir.MirOperand, fail.Fail] = lane_piece_operand(ctx, ?slot.pieces[i], stack_base, stack_off, stack_ok);
+        if (sel pr.err) {
+            A.deallocate[mir.MirOperand](ctx.alloc, ops, (lanes + 1)::usize);
+            ret err[fail.Fail].err{pr.err};
+        }
+        ops[1 + kr.ok] = pr.ok;
+        i              = i + 1;
+    }
+    var mi: mir.MirInstr = mir.instr(mir.MIR_LANE_JOIN, ops, lanes + 1, size::u8, lane_width(ctx)::u8);
+    ret context.push_instr(ctx, mb, mi);
+}
+
+# each piece of the slot receives lane k of the value: one MIR_LANE_PICK per
+# piece, the register pieces into the deferred register block and a stack
+# piece stored where the value is prepared
+fun emit_slot_lanes(ctx: *context.LowerCtx, mb: *mir.MirBlock, registers: *mir.MirBlock, slot: abi.ParamSlot,
+    src: mir.MirOperand, ty: type.IrTypeId, stack_base: mir.PRegId, stack_off: i64, stack_ok: bool) err[fail.Fail] {
+    val size: u64                 = type.byte_size_for_machine(ctx.types, ty, ctx.layout)::u64;
+    val nr:   res[u32, fail.Fail] = wide_slot_lanes(ctx, ?slot, size);
+    if (sel nr.err) { ret err[fail.Fail].err{nr.err}; }
+    # a memory source is loaded into one wide register while the arguments are prepared, as every
+    # register-bound argument is; an immediate or register source is picked from directly
+    var value: mir.MirOperand = src;
+    if (src.kind == mir.MIR_OP_MEM && registers != mb) {
+        val vr: res[mir.VRegId, fail.Fail] = context.new_vreg(ctx, mir.REG_CLASS_GP);
+        if (sel vr.err) { ret err[fail.Fail].err{vr.err}; }
+        val v: mir.VRegId = vr.ok;
+        ctx.f.vregs[v.n].secret = ctx.cur_writes_secret;
+        val loaded: err[fail.Fail] = context.emit_mov_w(ctx, mb, mir.op_vreg(v), src, size::u8);
+        if (sel loaded.err) { ret loaded; }
+        value = mir.op_vreg(v);
+    }
+    var i: u32 = 0;
+    for (i < slot.piece_count) {
+        val p:  *abi.ParamPiece     = ?slot.pieces[i];
+        val kr: res[u32, fail.Fail] = piece_lane(ctx, p);
+        if (sel kr.err) { ret err[fail.Fail].err{kr.err}; }
+        val pr: res[mir.MirOperand, fail.Fail] = lane_piece_operand(ctx, p, stack_base, stack_off, stack_ok);
+        if (sel pr.err) { ret err[fail.Fail].err{pr.err}; }
+        val ar: res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](ctx.alloc, 3::usize);
+        if (sel ar.err) { ret err[fail.Fail].err{fail.refused(ar.err)}; }
+        val ops: *mir.MirOperand = ar.ok;
+        ops[0] = pr.ok;
+        ops[1] = value;
+        ops[2] = mir.op_imm(kr.ok::i64);
+        var into: *mir.MirBlock = registers;
+        if (p.kind == abi.PIECE_STACK) { into = mb; }
+        var mi:     mir.MirInstr   = mir.instr(mir.MIR_LANE_PICK, ops, 3, lane_width(ctx)::u8, size::u8);
+        val pushed: err[fail.Fail] = context.push_instr(ctx, into, mi);
+        if (sel pushed.err) { ret pushed; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
 fun scalar_reg_move_width(gpr_width: u32, size: u64) u8 {
     if (size == 4)             { ret 4; }
     if (size > gpr_width::u64) { ret size::u8; }
@@ -1258,6 +1401,9 @@ fun emit_ret_slot_to_vreg(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.P
         plan.stack_off    = 0;
         plan.stack_ok     = false;
         ret materialize_pieces(ctx, mb, slot, plan);
+    }
+    if (slot_is_wide_scalar(ctx, ?slot, ty, is_aggr)) {
+        ret capture_slot_lanes(ctx, mb, dst, slot, ty, mir.MIR_PREG_NIL, 0, false);
     }
     ret capture_slot_reg(ctx, mb, dst, slot, ty);
 }
@@ -1541,6 +1687,10 @@ fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, copies: *mir.MirB
         plan.stack_ok     = true;
         ret materialize_pieces(ctx, mb, slot, plan);
     }
+    if (slot_is_wide_scalar(ctx, ?slot, ty, is_aggr)) {
+        ret capture_slot_lanes(ctx, mb, pv, slot, ty,
+            mir.preg_id(ctx.tgt.model.frame_ptr_reg), arg_base + stack_off, true);
+    }
     ret capture_slot_reg(ctx, mb, pv, slot, ty);
 }
 
@@ -1651,6 +1801,10 @@ pub fun lower_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.
         val fw: res[u8, fail.Fail] = fp_move_width(ctx, rt);
         if (sel fw.err) { ret err[fail.Fail].err{fw.err}; }
         val mr: err[fail.Fail] = context.emit_fmov(ctx, mb, mir.op_preg(slot.reg), rvop, fw.ok);
+        if (sel mr.err) { ret mr; }
+    }
+    or (slot_is_wide_scalar(ctx, ?slot, rt, rag)) {
+        val mr: err[fail.Fail] = emit_slot_lanes(ctx, mb, mb, slot, rvop, rt, mir.MIR_PREG_NIL, 0, false);
         if (sel mr.err) { ret mr; }
     }
     or (!mir.preg_is_nil(slot.reg)) {
