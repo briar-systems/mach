@@ -24,7 +24,7 @@ test/
 bash test/run.sh                          # every golden, plus the differential this host can execute
 bash test/run.sh --target x86_64-linux    # one target (repeatable)
 bash test/run.sh --case bits/logic_u32    # one case (repeatable)
-bash test/run.sh --qemu                   # also execute riscv64-linux under qemu-riscv64
+bash test/run.sh --qemu                   # also execute riscv64-linux and riscv64zkt-linux under qemu-riscv64
 bash test/run.sh --dwarf                  # also build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
 bash test/run.sh --link [--qemu]          # the link cases instead of the corpus (--case <name> selects one)
 bash test/run.sh --incremental            # warm rebuilds of the compiler and a manifest fixture match clean builds
@@ -89,6 +89,10 @@ per lane.
    writes. A golden you have not read is not a golden.
 4. A target that cannot serve the case gets a line in `golden/<target>/SKIPS`:
    the case name, then the reason.
+
+The `riscv64zkt-linux` column is riscv64-linux with the Zkt extension selected,
+the one corpus target that admits a secret multiply. It serves the `ct` group
+only, and its `SKIPS` names every other group by pattern.
 
 ## Doc blocks
 

@@ -665,7 +665,7 @@ processor's features and when that answer holds.
   the isa. Each name may appear once. The names are those the manifest's
   [`extensions`](manifest.md#instruction-set-extensions) key takes, closed over
   what they imply (`sse41` admits `pshufb`), except the rows only a target
-  selects (riscv `i`, `c`, `f`, `d`), which are refused with the reason.
+  selects (riscv `i`, `c`, `f`, `d`, `zkt`), which are refused with the reason.
 - **One predicate, everywhere.** A function's admitted set is the target's
   selection plus what the decorator names. An instruction requiring an extension
   is emitted only into a function whose admitted set holds it (see

@@ -74,8 +74,11 @@ $if ($mach.build.ct_mul(wide_u, 64) == 1) {
   - an always-safe instruction;
   - the extension it names, selected for the target;
   - a data-independent-timing mode the target guarantees.
-- No target declares a cell yet, so the query folds to 0 everywhere. Lane
-  multiplies are not part of the query.
+- riscv64 with Zkt selected (`rv64gc_zkt`) admits `low` at every width and the
+  three high halves at 64. x86-64 and aarch64 declare their vendors' lists under
+  a data-independent-timing mode that no OS guarantees yet (#3508), so the query
+  folds to 0 on them, as it does on every other target. Lane multiplies are not
+  part of the query.
 - The result is a `u8`, like `$mach.build.pie`. An unknown `op` or `width`, a
   missing argument, or arguments on any other path is a compile error that names
   what is accepted.
@@ -93,7 +96,7 @@ The names are the selected isa's vocabulary and nothing else:
 
 - `x86_64`: `ssse3`, `sse41`, `sha`, `fsgsbase`;
 - `aarch64`: `sha2`;
-- `riscv64` and `riscv32`: `i`, `m`, `a`, `f`, `d`, `c`, `zicsr`, `zifencei`.
+- `riscv64` and `riscv32`: `i`, `m`, `a`, `f`, `d`, `c`, `zicsr`, `zifencei`, `zkt`.
 
 A name the selected isa does not declare is a compile error, never a silent 0, as
 `$mach.arch.*` refuses an unknown architecture:

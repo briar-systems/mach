@@ -499,6 +499,10 @@ rec InlineCtx {
     entry_blk: id.BlockId;
     cont_blk:  id.BlockId;
     ret_type:  type.IrTypeId;
+    # the copies that make a borrowed aggregate argument private, placed before the body
+    priv_ids: *id.InstructionId;
+    priv_len: u32;
+    priv_cap: u32;
 }
 
 fun do_inline(
@@ -569,6 +573,18 @@ fun inline_body(
     cx.entry_blk = id.BLOCK_NIL;
     cx.cont_blk  = id.BLOCK_NIL;
     cx.ret_type  = ret_type;
+    cx.priv_ids  = nil;
+    cx.priv_len  = 0;
+    cx.priv_cap  = 0;
+    if (arg_count > 0 && (call.flags & instruction.INSTR_FLAG_BORROWED_ARGS) != 0) {
+        val res_priv: res[*id.InstructionId, A.Error] = A.allocate[id.InstructionId](scratch_alloc, (arg_count * 2)::usize);
+        if (sel res_priv.err) {
+            A.deallocate[value.Value](scratch_alloc, args, arg_count::usize);
+            ret err[fail.Fail].err{fail.refused(res_priv.err)};
+        }
+        cx.priv_ids = res_priv.ok;
+        cx.priv_cap = arg_count * 2;
+    }
 
     val res_run: err[fail.Fail] = run_inline(?cx, call_bi, call_ii, call_id);
 
@@ -589,6 +605,9 @@ fun inline_body(
     }
     if (args != nil) {
         A.deallocate[value.Value](scratch_alloc, args, arg_count::usize);
+    }
+    if (cx.priv_ids != nil) {
+        A.deallocate[id.InstructionId](scratch_alloc, cx.priv_ids, cx.priv_cap::usize);
     }
 
     if (sel res_run.err)  { ret res_run; }
@@ -919,6 +938,9 @@ fun run_inline(cx: *InlineCtx, call_bi: u32, call_ii: u32, call_id: id.Instructi
     }
     cx.cont_blk = res_cont.ok;
 
+    val res_priv: err[fail.Fail] = privatize_borrowed_args(cx, call_id);
+    if (sel res_priv.err) { ret res_priv; }
+
     val res_clone: err[fail.Fail] = clone_instructions(cx);
     if (sel res_clone.err) { ret res_clone; }
 
@@ -1056,6 +1078,12 @@ fun split_call_block(cx: *InlineCtx, call_bi: u32, call_ii: u32) err[fail.Fail] 
     rekey_successor_phis(caller, cont, call_bi::id.BlockId, cx.cont_blk);
 
     blk.instr_count = call_ii;
+    var p: u32 = 0;
+    for (p < cx.priv_len) {
+        val res_priv: err[fail.Fail] = ir.block_append_instr(m, blk, cx.priv_ids[p]);
+        if (sel res_priv.err) { ret res_priv; }
+        p = p + 1;
+    }
 
     val res_br: res[id.InstructionId, fail.Fail] = emit_br(cx, cx.entry_blk);
     if (sel res_br.err) {
@@ -1064,6 +1092,71 @@ fun split_call_block(cx: *InlineCtx, call_bi: u32, call_ii: u32) err[fail.Fail] 
     blk.terminator = res_br.ok;
 
     ret err[fail.Fail].ok{};
+}
+
+# a call that borrowed its aggregate arguments passes their sources, which the backend copies
+# at the call; an inlined body has no such copy and uses a parameter in place, so each aggregate
+# argument is copied here first, as the evaluation-point snapshot would have (#3460)
+fun privatize_borrowed_args(cx: *InlineCtx, call_id: id.InstructionId) err[fail.Fail] {
+    if (cx.priv_ids == nil) { ret err[fail.Fail].ok{}; }
+    val m:        *ir.Module                    = cx.m;
+    val opt_call: opt[*instruction.Instruction] = ir.instruction_get(cx.caller, call_id);
+    if (sel opt_call.none) { ret err[fail.Fail].err{fail.message("inline: call id out of range")}; }
+    val loc:     source.SrcLoc                 = opt_call.some.loc;
+    val res_ptr: res[type.IrTypeId, fail.Fail] = type.intern_ptr(?m.types);
+    if (sel res_ptr.err) { ret err[fail.Fail].err{res_ptr.err}; }
+    val res_i64: res[type.IrTypeId, fail.Fail] = type.intern_int(?m.types, 64);
+    if (sel res_i64.err) { ret err[fail.Fail].err{res_i64.err}; }
+    val res_void: res[type.IrTypeId, fail.Fail] = void_ty(m);
+    if (sel res_void.err) { ret err[fail.Fail].err{res_void.err}; }
+    var i: u32 = 0;
+    for (i < cx.arg_count) {
+        val arg:   value.Value = cx.args[i];
+        val place: bool        = arg.kind == value.VAL_INSTR || arg.kind == value.VAL_PARAM || arg.kind == value.VAL_GLOBAL;
+        if (place && type.is_aggregate(?m.types, arg.ty)) {
+            val res_slot: res[id.InstructionId, fail.Fail] = add_priv_instr(cx, instruction.OP_ALLOCA, res_ptr.ok,
+                value.const_int(1, res_i64.ok), value.const_int(0, res_i64.ok), 1, arg.ty, arg.secret, loc);
+            if (sel res_slot.err) { ret err[fail.Fail].err{res_slot.err}; }
+            val slot:     value.Value                      = value.instr(res_slot.ok, res_ptr.ok);
+            val res_copy: res[id.InstructionId, fail.Fail] = add_priv_instr(cx, instruction.OP_STORE, res_void.ok,
+                arg, slot, 2, type.IRT_NIL, arg.secret, loc);
+            if (sel res_copy.err) { ret err[fail.Fail].err{res_copy.err}; }
+            var owned: value.Value = value.retype(slot, arg.ty);
+            owned.secret = arg.secret;
+            cx.args[i]   = owned;
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun add_priv_instr(cx: *InlineCtx, kind: instruction.InstrKind, ty: type.IrTypeId, a: value.Value, b: value.Value,
+    count: u32, aux: type.IrTypeId, secret: bool, loc: source.SrcLoc) res[id.InstructionId, fail.Fail] {
+    if (cx.priv_len >= cx.priv_cap) { ret res[id.InstructionId, fail.Fail].err{fail.message("inline: private argument copies exceed their reservation")}; }
+    val m:       *ir.Module                 = cx.m;
+    val res_ops: res[*value.Value, A.Error] = A.allocate[value.Value](m.alloc, count::usize);
+    if (sel res_ops.err) { ret res[id.InstructionId, fail.Fail].err{fail.refused(res_ops.err)}; }
+    val ops: *value.Value = res_ops.ok;
+    ops[0] = a;
+    if (count > 1) { ops[1] = b; }
+    var ins: instruction.Instruction;
+    ins.kind          = kind;
+    ins.ty            = ty;
+    ins.operands      = ops;
+    ins.operand_count = count;
+    ins.operand_cap   = count;
+    ins.flags         = 0;
+    ins.aux_ty        = aux;
+    ins.loc           = loc;
+    ins.secret        = secret;
+    val res_id: res[id.InstructionId, fail.Fail] = ir.instruction_add(m, cx.caller, ins);
+    if (sel res_id.err) {
+        A.deallocate[value.Value](m.alloc, ops, count::usize);
+        ret res_id;
+    }
+    cx.priv_ids[cx.priv_len] = res_id.ok;
+    cx.priv_len              = cx.priv_len + 1;
+    ret res_id;
 }
 
 fun rekey_successor_phis(caller: *ir.Function, cont: *ir.Block, old_blk: id.BlockId, new_blk: id.BlockId) {

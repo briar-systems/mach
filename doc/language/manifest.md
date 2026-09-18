@@ -234,7 +234,7 @@ comptime member, `$mach.build.extensions.<name>` (see [`$mach`](comptime-mach.md
 |-------|----------|------------|
 | `x86_64` | SSE2 | `ssse3`, `sse41`, `sha`, `fsgsbase` |
 | `aarch64` | AdvSIMD | `sha2` |
-| `riscv64`, `riscv32` | the isa string's selection | `i`, `m`, `a`, `f`, `d`, `c`, `zicsr`, `zifencei` |
+| `riscv64`, `riscv32` | the isa string's selection | `i`, `m`, `a`, `f`, `d`, `c`, `zicsr`, `zifencei`, `zkt` |
 | `spirv` | | none |
 
 A name the selected isa does not hold is refused when the target resolves, with the
@@ -261,13 +261,16 @@ The list is never part of `{target.isa}`. That placeholder is the `isa` value as
 written (`rv64i`, `x86_64`), on every isa; the list belongs to the target's identity
 and to `{target.name}`.
 
-"Selects" means instruction admission and nothing more: the inline assembler admits
-the extension's rows and `$mach.build.extensions.<name>` answers 1. It never means a
-mode is on. A row such as a `dit` would admit `msr dit`, not set it.
+"Selects" means the extension is assumed of every machine the binary runs on: the
+inline assembler admits its rows, `$mach.build.extensions.<name>` answers 1, and a
+property the extension declares (Zkt's data-independent timing, which the
+constant-time multiply rows read) is taken as given. It never means a mode is on. A
+row such as a `dit` would admit `msr dit`, not set it.
 
 Some rows are the target's alone. On riscv `i` is the baseline, `c` is a code-size
 selection mach never emits, and `f` and `d` select the float register file and the
-calling convention's float registers, so none of them may be named in
+calling convention's float registers, and `zkt` is a promise about the machine's
+execution timing that the constant-time rows read, so none of them may be named in
 [`#[extensions(...)]`](decorators.md#extensionsnames--an-outlier-function); the
 refusal says why. Every x86_64 and aarch64 row, and riscv `m`, `a`, `zicsr` and
 `zifencei`, may be.
@@ -373,11 +376,13 @@ emits a finished GPU module rather than machine code (see
 `riscv64` and `riscv32` are width-only spellings, and each names a **default
 profile**: `riscv64` is `rv64gc` and `riscv32` is `rv32imac`. A canonical
 extension string such as `rv32imc` or `rv64imafd` selects a smaller machine.
-The retained vocabulary is I, M, A, F, D, C, Zicsr and Zifencei, written in
+The retained vocabulary is I, M, A, F, D, C, Zicsr, Zifencei and Zkt, written in
 lowercase canonical order with multi-letter names after an underscore; `g`
 expands to IMAFD plus Zicsr and Zifencei. F carries its required Zicsr, and D
-requires F. An optional version must be the one mach models: I 2.1, M 2.0,
-A 2.1, F and D 2.2, C 2.0, Zicsr and Zifencei 2.0. Unknown extensions,
+requires F. Zkt changes no instruction. It states that the listed operations run
+in data-independent time, which is what lets a secret multiply compile (see
+`secrecy.md`). An optional version must be the one mach models: I 2.1, M 2.0,
+A 2.1, F and D 2.2, C 2.0, Zicsr and Zifencei 2.0, Zkt 1.0. Unknown extensions,
 other versions, duplicates, noncanonical order and the E base are refused
 rather than rounded up to the default machine.
 

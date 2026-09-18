@@ -40,6 +40,7 @@ use mach.lang.me.lower.context;
 use mach.lang.me.lower.mangle;
 use mach.lang.session;
 use mach.lang.source;
+use mach.lang.target.abi;
 use mach.lang.target.isa;
 use resolved_target: mach.lang.target.resolved;
 use mach.lang.type;
@@ -55,6 +56,10 @@ pub fun lower_rvalue(ctx: *context.LowerContext, eid: id.ExprId) res[value.Value
     val saved_loc: source.SrcLoc = builder.current_loc(?ctx.builder);
     builder.set_loc(?ctx.builder, source.loc(ctx.scope.a.file_id, e.span.offset));
     fin { builder.set_loc(?ctx.builder, saved_loc); }
+    # only the armed argument's own read may borrow, never a read nested inside it
+    val saved_borrow: bool = ctx.borrow_now;
+    ctx.borrow_now = ctx.borrow_armed && eid == ctx.borrow_eid;
+    fin { ctx.borrow_now = saved_borrow; }
 
     val res_: res[value.Value, fail.Fail] = lower_rvalue_kind(ctx, eid, e);
     if (sel res_.err) { ret res_; }
@@ -1276,7 +1281,8 @@ fun lower_call(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) res[va
     if (has_ct)     { rtc = runtime_arg_count(ctx, cf_ast, cf_decl, argc); }
     if (has_spread) { rtc = (argc - 1) + ctx.pack_len; }
 
-    var args: *value.Value = nil;
+    var args:     *value.Value = nil;
+    var borrowed: bool         = false;
     if (rtc > 0) {
         val res_args: res[*value.Value, A.Error] = A.allocate[value.Value](ctx.s.alloc, rtc::usize);
         if (sel res_args.err) { ret res[value.Value, fail.Fail].err{fail.refused(res_args.err)}; }
@@ -1310,7 +1316,17 @@ fun lower_call(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) res[va
                 i = i + 1;
                 cnt;
             }
+            val saved_armed: bool      = ctx.borrow_armed;
+            val saved_eid:   id.ExprId = ctx.borrow_eid;
+            val saved_hit:   bool      = ctx.borrow_hit;
+            ctx.borrow_armed = arg_may_borrow(ctx, e, i, arg_eid, has_ct, cf_ast, cf_decl);
+            ctx.borrow_eid   = arg_eid;
+            ctx.borrow_hit   = false;
             val res_arg: res[value.Value, fail.Fail] = lower_rvalue(ctx, arg_eid);
+            if (ctx.borrow_hit) { borrowed = true; }
+            ctx.borrow_armed = saved_armed;
+            ctx.borrow_eid   = saved_eid;
+            ctx.borrow_hit   = saved_hit;
             if (sel res_arg.err) {
                 A.deallocate[value.Value](ctx.s.alloc, args, rtc::usize);
                 ret res_arg;
@@ -1333,11 +1349,101 @@ fun lower_call(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) res[va
     if (args != nil)      { A.deallocate[value.Value](ctx.s.alloc, args, rtc::usize); }
     if (sel res_call.err) { ret res_call; }
     var out: value.Value = res_call.ok;
+    # an inliner must copy a borrowed argument before the callee body can write it
+    if (borrowed) { ctx.builder.fn.instrs[out.data.instr::u32].flags = ctx.builder.fn.instrs[out.data.instr::u32].flags | instruction.INSTR_FLAG_BORROWED_ARGS; }
     if (!out.secret && context.type_contains_secret(ctx, context.expr_type_of(ctx, eid))) {
         out.secret = true;
         instruction.mark_result_secret(ctx.builder.fn.instrs, ctx.builder.fn.instr_len, out);
     }
     ret res[value.Value, fail.Fail].ok{out};
+}
+
+# whether call argument `ord` may be read in place: an aggregate place with no secret, read
+# where no later argument can write anything, so the ABI placement at the call still copies
+# the value the argument had when it was evaluated (#3460)
+fun arg_may_borrow(ctx: *context.LowerContext, e: *expr.Expr, ord: u32, arg_eid: id.ExprId,
+    has_ct: bool, cf_ast: *ast.Ast, cf_decl: *decl.DeclFun) bool {
+    # the in-place read rests on the caller's placement copy, which a convention that
+    # passes logical values does not make
+    if (ctx.tgt == nil || ctx.tgt.abi.passing != abi.PASSING_CARRIERS) { ret false; }
+    val opt_e: res[expr.Expr, fail.Fail] = context.expression(ctx, arg_eid);
+    if (sel opt_e.err) { ret false; }
+    val k: expr.ExprKind = opt_e.ok.kind;
+    if (k != expr.EXPR_KIND_IDENT && k != expr.EXPR_KIND_MEMBER && k != expr.EXPR_KIND_PROJECT
+        && k != expr.EXPR_KIND_INDEX && k != expr.EXPR_KIND_UNARY) { ret false; }
+    if (k == expr.EXPR_KIND_UNARY && opt_e.ok.data.unary.op != expr.UN_DEREF)  { ret false; }
+    if (context.type_contains_secret(ctx, context.expr_type_of(ctx, arg_eid))) { ret false; }
+    val res_ir: res[ir_type.IrTypeId, fail.Fail] = ir_type_of_expr(ctx, arg_eid);
+    if (sel res_ir.err)                    { ret false; }
+    if (!is_aggregate_ir(ctx, res_ir.ok))  { ret false; }
+    if (!expr_write_free(ctx, arg_eid, 0)) { ret false; }
+    var j: u32 = ord + 1;
+    for (j < e.data.call.args_len) {
+        if (!(has_ct && arg_is_comptime(ctx, cf_ast, cf_decl, j))) {
+            val pool_ix: u32 = e.data.call.args_start + j;
+            if (pool_ix::usize >= ctx.scope.a.expr_id_len)               { ret false; }
+            if (!expr_write_free(ctx, ctx.scope.a.expr_ids[pool_ix], 0)) { ret false; }
+        }
+        j = j + 1;
+    }
+    ret true;
+}
+
+val WRITE_FREE_DEPTH: u32 = 32;
+
+# whether evaluating `eid` can write no memory: a call, an assignment, or an address that
+# escapes may, and anything unrecognized is taken to (#3460)
+fun expr_write_free(ctx: *context.LowerContext, eid: id.ExprId, depth: u32) bool {
+    if (eid == id.EXPR_NIL)       { ret true; }
+    if (depth > WRITE_FREE_DEPTH) { ret false; }
+    val opt_e: res[expr.Expr, fail.Fail] = context.expression(ctx, eid);
+    if (sel opt_e.err) { ret false; }
+    var e_value: expr.Expr     = opt_e.ok;
+    val e:       *expr.Expr    = ?e_value;
+    val k:       expr.ExprKind = e.kind;
+    val d:       u32           = depth + 1;
+    if (k == expr.EXPR_KIND_LIT_INT || k == expr.EXPR_KIND_LIT_FLOAT || k == expr.EXPR_KIND_LIT_CHAR
+        || k == expr.EXPR_KIND_LIT_STR || k == expr.EXPR_KIND_LIT_NIL || k == expr.EXPR_KIND_IDENT
+        || k == expr.EXPR_KIND_COMPTIME_IDENT || k == expr.EXPR_KIND_TYPE_REF) { ret true; }
+    if (k == expr.EXPR_KIND_BINARY) {
+        if (e.data.binary.op == expr.BIN_ASSIGN) { ret false; }
+        ret expr_write_free(ctx, e.data.binary.lhs, d) && expr_write_free(ctx, e.data.binary.rhs, d);
+    }
+    if (k == expr.EXPR_KIND_UNARY) {
+        if (e.data.unary.op == expr.UN_ADDR) { ret false; }
+        ret expr_write_free(ctx, e.data.unary.operand, d);
+    }
+    if (k == expr.EXPR_KIND_INDEX)      { ret expr_write_free(ctx, e.data.index.object, d) && expr_write_free(ctx, e.data.index.index, d); }
+    if (k == expr.EXPR_KIND_MEMBER)     { ret expr_write_free(ctx, e.data.member.object, d); }
+    if (k == expr.EXPR_KIND_PROJECT)    { ret expr_write_free(ctx, e.data.project.object, d) && expr_write_free(ctx, e.data.project.field, d); }
+    if (k == expr.EXPR_KIND_CAST)       { ret expr_write_free(ctx, e.data.cast.value, d); }
+    if (k == expr.EXPR_KIND_STRIP)      { ret expr_write_free(ctx, e.data.strip.value, d); }
+    if (k == expr.EXPR_KIND_SEL)        { ret expr_write_free(ctx, e.data.sel.place, d) && expr_write_free(ctx, e.data.sel.case_desc, d); }
+    if (k == expr.EXPR_KIND_ARRAY_LIT)  { ret pool_write_free(ctx, e.data.array_lit.elems_start, e.data.array_lit.elems_len, d); }
+    if (k == expr.EXPR_KIND_VECTOR_LIT) { ret pool_write_free(ctx, e.data.vector_lit.elems_start, e.data.vector_lit.elems_len, d); }
+    if (k == expr.EXPR_KIND_STRUCT_LIT) {
+        if (!pool_write_free(ctx, e.data.struct_lit.elems_start, e.data.struct_lit.elems_len, d)) { ret false; }
+        var i: u32 = 0;
+        for (i < e.data.struct_lit.fields_len) {
+            val pool_ix: u32 = e.data.struct_lit.fields_start + i;
+            if (pool_ix::usize >= ctx.scope.a.field_init_len)                     { ret false; }
+            if (!expr_write_free(ctx, ctx.scope.a.field_inits[pool_ix].value, d)) { ret false; }
+            i = i + 1;
+        }
+        ret true;
+    }
+    ret false;
+}
+
+fun pool_write_free(ctx: *context.LowerContext, start: u32, len: u32, depth: u32) bool {
+    var i: u32 = 0;
+    for (i < len) {
+        val pool_ix: u32 = start + i;
+        if (pool_ix::usize >= ctx.scope.a.expr_id_len)                   { ret false; }
+        if (!expr_write_free(ctx, ctx.scope.a.expr_ids[pool_ix], depth)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 fun runtime_arg_count(ctx: *context.LowerContext, a: *ast.Ast, f: *decl.DeclFun, argc: u32) u32 {
@@ -3009,7 +3115,16 @@ fun snapshot_aggregate(ctx: *context.LowerContext, source_value: value.Value, se
 }
 
 fun rvalue_at(ctx: *context.LowerContext, ptr: value.Value, ity: ir_type.IrTypeId, sem_ty: type.TypeId, vol: bool) res[value.Value, fail.Fail] {
-    if (is_aggregate_ir(ctx, ity)) { ret snapshot_aggregate(ctx, value.retype(ptr, ity), sem_ty, vol); }
+    if (is_aggregate_ir(ctx, ity)) {
+        # a call argument nothing later can write is read in place: the call's own ABI
+        # placement is then the only copy (#3460)
+        if (ctx.borrow_now && !vol && !type_is_volatile_record(ctx, sem_ty)) {
+            ctx.borrow_now = false;
+            ctx.borrow_hit = true;
+            ret res[value.Value, fail.Fail].ok{value.retype(ptr, ity)};
+        }
+        ret snapshot_aggregate(ctx, value.retype(ptr, ity), sem_ty, vol);
+    }
     val res_: res[value.Value, fail.Fail] = builder.emit_load(?ctx.builder, ptr, ity);
     if (vol && sel res_.ok) { builder.mark_last_volatile(?ctx.builder); }
     ret res_;
