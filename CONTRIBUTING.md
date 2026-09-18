@@ -62,8 +62,10 @@ fix(#1234): brief description
 Longer explanation if needed.
 ```
 
-The types are `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, and
-`style`. A change with no issue uses `chore: ...` with no scope.
+The types are `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `style`,
+`ci`, and `perf`. A breaking change marks the type with `!` before the colon:
+`feat(#139)!: brief description`. A change with no issue uses `chore: ...` with
+no scope, and a release commit is `chore(release): <version>`.
 
 If no related issue exists, just supply a type without the scope, e.g:
 
