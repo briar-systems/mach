@@ -296,11 +296,13 @@ emits a finished GPU module rather than machine code (see
 `riscv64` and `riscv32` are width-only spellings, and each names a **default
 profile**: `riscv64` is `rv64gc` and `riscv32` is `rv32imac`. A canonical
 extension string such as `rv32imc` or `rv64imafd` selects a smaller machine.
-The retained vocabulary is I, M, A, F, D, C, Zicsr and Zifencei, written in
+The retained vocabulary is I, M, A, F, D, C, Zicsr, Zifencei and Zkt, written in
 lowercase canonical order with multi-letter names after an underscore; `g`
 expands to IMAFD plus Zicsr and Zifencei. F carries its required Zicsr, and D
-requires F. An optional version must be the one mach models: I 2.1, M 2.0,
-A 2.1, F and D 2.2, C 2.0, Zicsr and Zifencei 2.0. Unknown extensions,
+requires F. Zkt changes no instruction. It states that the listed operations run
+in data-independent time, which is what lets a secret multiply compile (see
+`secrecy.md`). An optional version must be the one mach models: I 2.1, M 2.0,
+A 2.1, F and D 2.2, C 2.0, Zicsr and Zifencei 2.0, Zkt 1.0. Unknown extensions,
 other versions, duplicates, noncanonical order and the E base are refused
 rather than rounded up to the default machine.
 

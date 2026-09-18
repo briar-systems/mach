@@ -17,7 +17,7 @@
 #   --target <t>   one target (repeatable); default every target with a golden dir
 #   --case <g/n>   one case (repeatable)
 #   --bless        write the goldens instead of diffing them, print the diff
-#   --qemu         execute riscv64-linux under qemu-riscv64
+#   --qemu         execute riscv64-linux and riscv64zkt-linux under qemu-riscv64
 #   --link         run the link cases (test/link/cases) instead of the corpus
 #   --dwarf        build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
 #   --incremental  warm rebuilds of this compiler and of a manifest fixture match clean builds
@@ -50,14 +50,15 @@ cflags_ubsan="-std=c11 -O0 -ffp-contract=off -fsanitize=undefined -fno-sanitize-
 
 # the targets: name isa os abi of kind entry decoder
 targets_all='
-x86_64-linux    x86_64      linux        sysv64   -    bin     hosted  objdump
-aarch64-linux   aarch64     linux        aapcs64  -    bin     hosted  objdump
-riscv64-linux   riscv64     linux        lp64d    -    bin     hosted  objdump
-x86_64-windows  x86_64      windows      win64    -    bin     hosted  objdump
-x86_64-darwin   x86_64      darwin       sysv64   -    bin     hosted  objdump
-aarch64-darwin  aarch64     darwin       aapcs64  -    bin     hosted  objdump
-spirv           spirv       freestanding spirv    -    bin     direct  spirv-dis
-riscv32         rv32imafdc  freestanding ilp32d   elf  static  direct  objdump
+x86_64-linux      x86_64      linux         sysv64   -    bin     hosted  objdump
+aarch64-linux     aarch64     linux         aapcs64  -    bin     hosted  objdump
+riscv64-linux     riscv64     linux         lp64d    -    bin     hosted  objdump
+riscv64zkt-linux  rv64gc_zkt  linux         lp64d    -    bin     hosted  objdump
+x86_64-windows    x86_64      windows       win64    -    bin     hosted  objdump
+x86_64-darwin     x86_64      darwin        sysv64   -    bin     hosted  objdump
+aarch64-darwin    aarch64     darwin        aapcs64  -    bin     hosted  objdump
+spirv             spirv       freestanding  spirv    -    bin     direct  spirv-dis
+riscv32           rv32imafdc  freestanding  ilp32d   elf  static  direct  objdump
 '
 
 usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
@@ -140,12 +141,14 @@ object_format() {
 }
 
 # engine <target>: "" for the host itself, the qemu command, or "-" when nothing here
-# runs it. qemu serves riscv64 only, the one linux target with no native runner:
-# it is compute evidence, never ABI evidence, so aarch64 is proven on real silicon.
+# runs it. qemu serves the riscv64 columns only, the linux targets with no native
+# runner: it is compute evidence, never ABI evidence, so aarch64 is proven on real
+# silicon. riscv64zkt-linux selects Zkt, whose only effect on codegen is admitting
+# the secret multiply, so qemu is compute evidence for that column too.
 engine() {
     isa=$(target_field "$1" 2); os=$(target_field "$1" 3)
     if [ "$os" = "$host_os" ] && [ "$isa" = "$host_isa" ]; then echo ""; return; fi
-    if [ "$qemu" -eq 1 ] && [ "$1" = riscv64-linux ] && command -v qemu-riscv64 >/dev/null 2>&1; then
+    if [ "$qemu" -eq 1 ] && { [ "$1" = riscv64-linux ] || [ "$1" = riscv64zkt-linux ]; } && command -v qemu-riscv64 >/dev/null 2>&1; then
         echo qemu-riscv64; return
     fi
     echo -
