@@ -6,7 +6,7 @@ plus any padding for alignment.
 
 ## Grammar
 
-```mach
+```mach fragment
 rec NAME {
     field1: type;
     field2: type;

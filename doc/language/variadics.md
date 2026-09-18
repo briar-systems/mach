@@ -14,7 +14,7 @@ callee's ABI — see [ext-fun.md](ext-fun.md#c-variadic-imports).
 
 A pack parameter is written as a named parameter whose type is `...`:
 
-```mach
+```mach fragment
 fun name(va: ...) RetType { ... }
 fun name(fixed: T, va: ...) RetType { ... }   # leading fixed params are allowed
 ```
@@ -119,7 +119,7 @@ fun main(argc: i64, argv: **u8) i64 {
 
 Leading fixed arguments may precede the spread at the call site:
 
-```mach
+```mach fragment
 fun fwdpre(base: i64, va: ...) i64 { ret base + sum(va...); }
 ```
 
@@ -135,7 +135,7 @@ A pack-tailed function is compiled once per distinct argument type-list at
 each call site. Different arities, or the same arity with different types,
 produce separate instances:
 
-```mach
+```mach fragment
 sum(1, 2, 3)           # instance: (i64, i64, i64)
 sum(10, 20)            # instance: (i64, i64)
 sum(5::u8, 1::u32)     # instance: (u8, u32)
@@ -146,7 +146,7 @@ A pack tail composes with generic parameters. The instance key is then the
 and `sink[^u32](x)` over the same elements are two instances with two bodies,
 each typed and lowered against its own type arguments:
 
-```mach
+```mach fragment
 fun sink[T](t: T, va: ...) u32 { ... }
 
 sink[u32](p, 1u32)     # instance: [u32] over (u32)
@@ -182,7 +182,7 @@ Pack-tailed functions may call functions in other modules from inside the
 `$each` body. The compiler re-infers the body per monomorphization instance
 against the full module set.
 
-```mach
+```mach fragment
 fun sumdbl(va: ...) i64 {
     var t: i64 = 0;
     $each a in va {

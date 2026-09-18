@@ -38,7 +38,7 @@ fun main(argc: i64, argv: **u8) i64 {
 `&` `|` `^` `~` apply lane-wise; the shifts `<<` `>>` are not in this increment
 (see [SIMD vectors](#simd-vectors)).
 
-```mach
+```mach fragment
 val x: i64    = (a & b) | (c ^ d);
 val y: i64    = x << 2;
 ```
@@ -85,7 +85,7 @@ equality, no payload equality and no ordering. Test which case is active with th
 `&&` `||` `!` — short-circuiting. Operands are `u8` (`0` is false, nonzero is
 true); the result is `u8` (`1` or `0`).
 
-```mach
+```mach fragment
 val ok: u8 = (x > 0) && (y < 100);
 ```
 
@@ -122,7 +122,7 @@ fun main(argc: i64, argv: **u8) i64 {
 }
 ```
 
-```mach
+```mach error cannot take the address of a call result
 fun g() i64 { ret 1; }
 
 fun addresses(x: i64) {
@@ -265,7 +265,7 @@ unsigned integer of the input's lane width: `f32x4` / `i32x4` / `u32x4` → `u32
 not an operator; it is the library idiom `(mask & a) | (~mask & b)` over matching
 integer lanes (the tier-3 simd library, #2021).
 
-```mach
+```mach fragment
 val a: f32x4 = f32x4{1.0, 2.0, 3.0, 4.0};
 val b: f32x4 = f32x4{4.0, 3.0, 2.0, 1.0};
 val sum:  f32x4 = a + b;       # lane-wise -> {5.0, 5.0, 5.0, 5.0}

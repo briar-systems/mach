@@ -5,7 +5,7 @@ codegen directives on the declared symbol. A decorator is written as an
 attribute: `#[name]` for a bare flag or `#[name(args)]` for a directive with
 arguments. See [decorators.md](decorators.md) for the full reference.
 
-```mach
+```mach fragment
 #[symbol("main")]
 fun entry(argc: i64, argv: **u8) i64 { ... }
 
