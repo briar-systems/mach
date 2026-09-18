@@ -5,7 +5,7 @@ module's public surface. It is the public counterpart to `use`.
 
 ## Grammar
 
-```mach
+```mach fragment
 fwd PATH;                   # re-export under the path leaf
 fwd ALIAS: PATH;            # re-export with rename
 ```
@@ -15,7 +15,7 @@ fwd ALIAS: PATH;            # re-export with rename
 
 ## Examples
 
-```mach
+```mach fragment
 use impl: full.core.data;
 
 fwd impl.Point;             # re-exports as 'Point'
@@ -30,7 +30,7 @@ The surface file in a shadow-module pattern is typically a long list of
 A `fwd` path that ends at a **module** re-exports the whole module as a
 public module alias, mirroring `use`'s module binding:
 
-```mach
+```mach fragment
 fwd demo.alpha;             # re-exports module 'alpha'
 fwd deep: demo.deep.beta;   # re-exports module under 'deep'
 ```

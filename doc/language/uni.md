@@ -6,7 +6,7 @@ does not track which field is "live"; the user is responsible for that.
 
 ## Grammar
 
-```mach
+```mach fragment
 uni NAME {
     field1: type;
     field2: type;
@@ -49,7 +49,7 @@ access requires a guard, use `tag`. See [tag.md](tag.md).
 Low-level systems code can still compose `rec` and `uni` manually when modeling
 foreign data structures, hardware registers, or wire formats:
 
-```mach
+```mach fragment
 rec RawPacket {
     kind: u8;
     data: uni { header: Header; raw: [64]u8; };

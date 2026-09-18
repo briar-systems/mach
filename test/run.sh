@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # the codegen corpus, the link cases and the dwarf verify: one loop over
 # test/cases/<group>/<case>.mach and the targets, grounded in external tools.
-# --incremental instead proves the warm build path against clean builds.
+# --incremental instead proves the warm build path against clean builds, and
+# --docs compiles the mach code blocks of doc/language.
 # see test/README.md for the case contract and how to add a case.
 #
 # usage: test/run.sh [--target <t>]... [--case <group>/<name>]... [--bless]
-#                    [--qemu] [--link] [--dwarf] [--incremental]
+#                    [--qemu] [--link] [--dwarf] [--incremental] [--docs]
 #
 # per case and target: build the object in release, disassemble it with the
 # external decoder and diff against test/golden/<target>/<group>/<case>.dis; on a
@@ -20,7 +21,11 @@
 #   --link         run the link cases (test/link/cases) instead of the corpus
 #   --dwarf        build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
 #   --incremental  warm rebuilds of this compiler and of a manifest fixture match clean builds
+#   --docs         compile every mach block in doc/language and run each one with a main
+#                  (--case <page> selects one page, such as --case operators; one hosted
+#                  --target compiles for it instead of the host, running only natively)
 #   MACH           the compiler under test, default out/<host>/debug/bin/mach
+#   DOCS           the pages --docs reads, default doc/language
 set -u
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -56,7 +61,7 @@ spirv             spirv       freestanding  spirv    -    bin     direct  spirv-
 riscv32           rv32imafdc  freestanding  ilp32d   elf  static  direct  objdump
 '
 
-usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 want_targets=
 want_cases=
@@ -72,6 +77,7 @@ while [ $# -gt 0 ]; do
         --qemu)   qemu=1 ;;
         --link)   mode=link ;;
         --incremental) mode=incremental ;;
+        --docs)   mode=docs ;;
         --dwarf)  dwarf=1 ;;
         -h|--help) usage ;;
         *) echo "run.sh: unknown option '$1'" >&2; usage ;;
@@ -148,8 +154,16 @@ engine() {
     echo -
 }
 
-# the cases, as group/name
-if [ -n "$want_cases" ]; then
+docs=${DOCS:-$repo/doc/language}
+case "$docs" in /*) : ;; *) docs=$PWD/$docs ;; esac
+
+# the cases, as group/name; under --docs a case is a page of $docs
+if [ "$mode" = docs ]; then
+    cases=
+    for c in $want_cases; do
+        [ -f "$docs/$c.md" ] || { echo "run.sh: no such page '$docs/$c.md'" >&2; exit 2; }
+    done
+elif [ -n "$want_cases" ]; then
     cases=
     for c in $want_cases; do
         case "$c" in
@@ -681,6 +695,161 @@ if [ "$mode" = link ]; then
             for profile in $case_profiles; do link_cell "$dir" "$leg" "$profile"; done
         done
     done
+fi
+
+# doc_extract <page.md> <dir>: one directory per mach block, <dir>/<nnn>/, holding
+# src/ (split at `# file: src/<path>` lines, root.mach before the first) and meta:
+# the fence line number, the fence info after `mach`, and the entry file
+doc_extract() {
+    awk -v dir="$2" '
+        function open_file(rel) {
+            if (cur != "") close(cur)
+            cur = blk "/src/" rel
+            d = cur; sub(/\/[^\/]*$/, "", d)
+            system("mkdir -p \"" d "\"")
+            printf "" > cur
+            last = rel
+        }
+        function finish() {
+            if (cur != "") close(cur)
+            entry = (have_root || last == "") ? "root.mach" : last
+            if (last == "") { printf "" > (blk "/src/root.mach"); close(blk "/src/root.mach") }
+            print line > (blk "/meta"); print info > (blk "/meta"); print entry > (blk "/meta")
+            close(blk "/meta")
+            inb = 0
+        }
+        { sub(/\r$/, "") }
+        !inb && /^```mach([ \t]|$)/ {
+            inb = 1; n++; line = NR; cur = ""; last = ""; have_root = 0
+            info = substr($0, 8); sub(/^[ \t]+/, "", info); sub(/[ \t]+$/, "", info)
+            blk = dir "/" sprintf("%03d", n)
+            system("mkdir -p \"" blk "/src\"")
+            next
+        }
+        inb && /^```[ \t]*$/ { finish(); next }
+        inb && /^# file: src\/[^ ]+\.mach[ \t]*$/ {
+            rel = $3; sub(/^src\//, "", rel)
+            if (rel == "root.mach") have_root = 1
+            open_file(rel); next
+        }
+        inb {
+            if (cur == "") open_file("root.mach")
+            print > cur
+        }
+        END { if (inb) { print "unterminated mach block at line " line > "/dev/stderr"; exit 1 } }
+    ' "$1"
+}
+
+# doc_cell <block dir> <label>: build the block as its own project, id `example`,
+# and write pass, skip or FAIL <why> to <block dir>/result
+doc_cell() {
+    b=$1; label=$2
+    { read -r line; read -r info; read -r entry; } <"$b/meta"
+    label="$label:$line"
+    annot=${info%%[ 	]*}
+    expect=${info#"$annot"}
+    expect=${expect#"${expect%%[! 	]*}"}
+    case "$annot" in
+        fragment) echo skip >"$b/result"; return ;;
+        ''|error) : ;;
+        *) echo "FAIL $label unknown block annotation '$annot' (fragment or error)" >"$b/result"; return ;;
+    esac
+    if [ "$annot" = error ] && [ -z "$expect" ]; then
+        echo "FAIL $label an error block names the diagnostic it expects: \`\`\`mach error <text>" >"$b/result"; return
+    fi
+    kind=static; art_out=lib/block.a
+    if grep -rqF '#[symbol("main")]' "$b/src"; then kind=bin; art_out=bin/block; fi
+    mkdir -p "$b/dep/std"
+    cp -R "$docs_std/src" "$b/dep/std/src"
+    cp "$docs_std/mach.toml" "$b/dep/std/"
+    {
+        echo '[project]'; echo 'id = "example"'; echo 'version = "0.0.0"'; echo 'src = "src"'
+        echo 'out = "o"'; echo "mach = \"^$docs_major.0\""; echo
+        echo "[target.$docs_target]"
+        echo "isa = \"$(target_field "$docs_target" 2)\""
+        echo "os  = \"$(target_field "$docs_target" 3)\""
+        echo "abi = \"$(target_field "$docs_target" 4)\""; echo
+        echo '[profile.debug]'; echo 'opt = 0'; echo 'debug = false'; echo 'simd = "scalarize"'
+        echo 'vectorize = true'; echo 'float_reassoc = false'; echo
+        echo '[artifact.block]'; echo "kind = \"$kind\""; echo "entry = \"$entry\""
+        echo "out = \"$art_out\""; echo "targets = [\"$docs_target\"]"; echo 'link = []'; echo 'need = []'; echo
+        echo '[dep.std]'; echo 'path = "dep/std"'
+    } >"$b/mach.toml"
+    "$mach" build "$b" >"$b/log" 2>&1; rc=$?
+    rm -rf "$b/dep"
+    if [ "$annot" = error ]; then
+        if [ "$rc" -eq 0 ]; then
+            echo "FAIL $label an error block compiled; expected a diagnostic containing '$expect'" >"$b/result"
+        elif ! grep -qF -- "$expect" "$b/log"; then
+            echo "FAIL $label an error block failed without '$expect': $(first_error "$b/log")" >"$b/result"
+        else
+            echo "pass error" >"$b/result"
+        fi
+        return
+    fi
+    if [ "$rc" -ne 0 ]; then
+        echo "FAIL $label does not compile: $(first_error "$b/log")" >"$b/result"; return
+    fi
+    if [ "$kind" = static ] || [ "$(engine "$docs_target")" != "" ]; then
+        echo "pass compiled" >"$b/result"; return
+    fi
+    bin=$b/o/bin/block$exe
+    timeout 60 "$bin" </dev/null >"$b/run.out" 2>&1; rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "FAIL $label exits $rc: $(tail -n1 "$b/run.out")" >"$b/result"; return
+    fi
+    echo "pass run" >"$b/result"
+}
+
+if [ "$mode" = docs ]; then
+    if [ -n "$want_targets" ]; then
+        set -- $want_targets
+        [ $# -eq 1 ] && [ "$(target_field "$1" 7)" = hosted ] ||
+            { echo "run.sh: --docs takes one hosted --target" >&2; exit 2; }
+        docs_target=$1
+    else
+        docs_target=$(printf '%s\n' "$targets_all" |
+            awk -v i="$host_isa" -v o="$host_os" '$2 == i && $3 == o && $7 == "hosted" { print $1; exit }')
+        [ -n "$docs_target" ] || { echo "run.sh: --docs has no hosted target for $host_os/$host_isa" >&2; exit 2; }
+    fi
+    echo "target:   $docs_target"
+    docs_major=$("$mach" info 2>/dev/null | sed -n '1s/^mach \([0-9][0-9]*\)\..*/\1/p')
+    [ -n "$docs_major" ] || docs_major=5
+    docs_std=$repo/dep/std
+    [ -f "$docs_std/mach.toml" ] || { echo "run.sh: --docs needs the std checkout at $docs_std" >&2; exit 2; }
+    jobs_max=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
+    root=$out/docs
+    rm -rf "$root"
+    mkdir -p "$root"
+    echo "docs:     $docs"
+    pages=$want_cases
+    [ -n "$pages" ] || pages=$(cd "$docs" && for f in *.md; do echo "${f%.md}"; done | LC_ALL=C sort | tr '\n' ' ')
+    for pg in $pages; do
+        doc_extract "$docs/$pg.md" "$root/$pg" || { fail "$pg.md cannot be read"; continue; }
+        [ -d "$root/$pg" ] || continue
+        for b in "$root/$pg"/*/; do
+            b=${b%/}
+            while [ "$(jobs -rp | wc -l)" -ge "$jobs_max" ]; do sleep 0.1; done
+            doc_cell "$b" "$pg.md" &
+        done
+    done
+    wait
+    compiled=0; ran=0; fragments=0; errors=0; total=0
+    for pg in $pages; do
+        [ -d "$root/$pg" ] || continue
+        for b in "$root/$pg"/*/; do
+            total=$((total + 1))
+            r=$(cat "${b%/}/result" 2>/dev/null || echo "FAIL ${b%/} left no result")
+            case "$r" in
+                skip)            fragments=$((fragments + 1)); skips=$((skips + 1)) ;;
+                "pass compiled") compiled=$((compiled + 1)); passes=$((passes + 1)) ;;
+                "pass run")      compiled=$((compiled + 1)); ran=$((ran + 1)); passes=$((passes + 1)) ;;
+                "pass error")    errors=$((errors + 1)); passes=$((passes + 1)) ;;
+                *)               echo "$r"; fails=$((fails + 1)) ;;
+            esac
+        done
+    done
+    echo "docs: $total blocks, $compiled compiled ($ran run), $errors error, $fragments fragment"
 fi
 
 echo "run.sh: $passes pass, $fails fail, $skips skip"

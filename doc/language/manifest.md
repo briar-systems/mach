@@ -1444,7 +1444,7 @@ link    = []
 need    = ["artifact.shader-*"]
 ```
 
-```mach
+```mach fragment
 #[embed("{artifact.shader-blur.out}")]
 val BLUR: [_]u8;
 ```
@@ -1511,7 +1511,7 @@ link    = []
 need    = []
 ```
 
-```mach
+```mach fragment
 # the dependency's src/lib.mach, compiled by every consumer
 #[embed("{artifact.shader-frag.out}")]
 val FRAG: [_]u8;

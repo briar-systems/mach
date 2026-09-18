@@ -8,7 +8,7 @@ Marks a declaration as part of its module's public surface. Other modules
 that `use` this module can reference `pub`-marked symbols by name; symbols
 without `pub` are file-private.
 
-```mach
+```mach error no symbol `helper` exported by `example.lib`
 # file: src/lib.mach
 pub fun add(a: i64, b: i64) i64 { ret a + b; }
 fun helper() i64 { ret 1; }     # private: only callable inside this file
@@ -65,7 +65,7 @@ against it; a function a C caller links against is `pub`.
 A `fwd` re-export is a declaration of surface, so what a root-project module
 re-exports is exported, wherever it is defined:
 
-```mach
+```mach fragment
 # file: src/lib.mach
 fwd impl.helper;        # exported: this module published it
 fwd other.module;       # exported: that module's whole public surface
