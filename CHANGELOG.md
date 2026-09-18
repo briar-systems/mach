@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.5.2] - 2026-09-18
+
 ### Changed
 - x86-64 code reads a value the allocator keeps on the stack straight from its stack slot in `+`, `-`, `*`, `&`, `|`, `^` and compares, such as `add rax, [rbp-16]` or `cmp qword [rbp-8], 64`, instead of first loading it into a scratch register. Shift counts and division are still loaded. A target declares the widths at which its instructions do this (`slot_read_widths`). x86-64 declares 1, 2, 4 and 8 bytes, and the other targets declare none. A secret read in place is checked for constant time exactly like the register form. In a release build of the x25519 bit loop, instructions per bit fell from 85 to 79 (secret form), 95 to 87 (public) and 90 to 82 (flat), with stack loads down from 24 to 18, 16 to 8 and 16 to 8 as 6, 8 and 8 operations read their operand in place. Stores and register copies are unchanged. std's SHA-256 round loop fell from 126 to 106 instructions, with stack loads down from 33 to 13 and 20 operations reading in place. aarch64 output is unchanged (#3495).
 
