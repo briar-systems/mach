@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- In-place dependencies. A root manifest may declare `[dep.<id>] in_place = "<absolute path>"` with a `digest = "sha256:…"`, and the dependency is read where it stands, never copied into `dep/`. Its identity is a content digest over the whole tree minus a top-level `.git`: every regular file's relative path, executable bit, size and SHA-256, and every directory's relative path, in byte order of names, under a new `DOMAIN_DEP_TREE` fingerprint domain. `build`, `test`, `check`, `mach dep verify` and the editor take one verification path, a full-hash walk in `realized_content`, and refuse a digest mismatch, a symlink, FIFO, socket or device anywhere in the tree, a missing digest (naming `mach dep pull`, which records it), a `dep/<id>` present beside the declaration (a stale copy is ambiguous, never shadowed), a relative path, a declaration outside the root manifest, and `git`, `path`, `ref` or `version` beside `in_place`, each refusal naming the key. `mach dep pull` and `mach dep update` re-pin a changed tree by rewriting `digest` in `mach.toml`, `mach dep add <path> <id> --in-place <dir>` writes the table with the digest, and `mach dep verify` prints one line per in-place dependency. Commands whose operand is the in-place tree itself are left to filesystem permissions, and hosts install in-place trees read-only; `doc/language/manifest.md` states the key, every refusal and that gap. Phase 1 of #3484 (#3610).
+
 ## [5.5.1] - 2026-09-18
 
 ### Fixed
