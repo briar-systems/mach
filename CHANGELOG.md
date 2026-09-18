@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.5.1] - 2026-09-18
+
 ### Fixed
 - A `*SourceFile` taken from `mach.lang.source.get` stays valid for the life of the `SourceMap`. The map kept its files in one flat vector that doubled from 8 entries as sources were loaded, so a pointer held across an analysis that loaded another file dangled once the count crossed a power of two, which mach-lsp hit as a worker crash on macOS (mach-lsp#297). Files now live in fixed chunks that never move, the same store the type interner uses, and a snapshot copies into the same store. Updating a file's text or releasing its payload changes the file in place and bumps its `revision`, and a slot is never reused for another file, so a consumer may hold the pointer across later loads and read `present` and `revision` to see whether the file behind it changed. `SourceMap` no longer exposes `len` and `cap`; `source.count` gives the slot count (#3633).
 
