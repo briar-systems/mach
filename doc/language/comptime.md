@@ -51,7 +51,7 @@ and `version`. A path the root does not carry, `$project.name` and
 the path. See
 [comptime-mach.md](comptime-mach.md) for the `$mach.*` subtree.
 
-```mach
+```mach fragment
 val ver: str = $project.version;                 # "2.0.0", from [project].version
 $if ($project.target.os == "windows") { ... }    # the declared os string
 ```
@@ -76,7 +76,7 @@ under the ordinary scoping rules — never whichever binding happens to share it
 spelling. A block-scoped binding shadows an outer one of the same name here
 exactly as it does at runtime:
 
-```mach
+```mach error array length is not a comptime constant
 val N: i64 = 9;
 
 fun f(k: i64) i64 {

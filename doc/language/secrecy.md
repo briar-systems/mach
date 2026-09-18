@@ -45,6 +45,7 @@ arithmetic, bitwise, shift, and comparison operators, and through a value read
 out of a secret container:
 
 ```mach
+#[oblivious]
 fun mix(a: ^u32, b: u32) ^u32 { ret a + b; }    # ^u32 + u32 -> ^u32
 rec Key { d: ^[32]u8; }
 fun first(k: Key) ^u8 { ret k.d[0]; }            # element of a secret array is ^u8
@@ -70,7 +71,7 @@ error decided by operand type:
   public address, and a `*^T` is a public address to secret storage
 - a secret operand of the always-variable-latency `/` or `%`
 
-```mach
+```mach error secret value used as a branch condition
 fun leak(a: ^u32, t: *u8, p: ^*u8) u8 {
     if (a) { ret 1; }       # error: secret value used as a branch condition
     ret t[a];               # error: secret value used as a memory index
@@ -86,9 +87,29 @@ than the source alone, so they are reported at lowering:
 - a secret operand of an **integer multiply**, unless the target declares the
   exact multiply it emits (the low half, a high half or the widening product,
   at that operand width) as data-independent-timing under a condition the
-  build meets. No target declares one yet, so every ISA refuses it today, and
-  every lane multiply is refused. `$mach.build.ct_mul(op, width)` reads the
-  same decision at comptime (see `comptime-mach.md`)
+  build meets. riscv64 with the Zkt extension selected admits the low half at
+  every width and the high halves at 64 bits (RISC-V Cryptography Extensions
+  Volume I, chapter Zkt, which lists `mul`, `mulh`, `mulhsu`, `mulhu` and
+  `mulw`). x86-64 admits the low half, both high halves and the widening
+  product at 8, 16, 32 and 64 bits on every OS, on Intel and on AMD (#3508).
+  On Intel that is a vendor guarantee: the "Data Operand Independent Timing"
+  guidance states that processors which do not enumerate DOITM may be assumed
+  to behave as if it were enabled for the listed instructions, and `mul`,
+  `imul` and `mulx` are on that list. BearSSL's `ctmul` table, measured per
+  core, records a constant-time multiply since the first Pentium. On AMD the
+  evidence is by table rather than by vendor document: AMD publishes no
+  equivalent list and no mode control (absence, verified 2026-09-18), the same
+  BearSSL table records a constant-time multiply at every width for every AMD
+  core from K7 through Zen, no AMD x86-64 core has ever been documented with a
+  data-dependent multiplier, and AMD's SB-1039 advises constant-time
+  algorithms, which presupposes constant-time instructions. Intel's DOITM
+  mode itself hardens the data dependent prefetcher and the fast store
+  forwarding predictor, memory-side predictors the kernel owns, and is out of
+  scope for this decision (#3623). aarch64 declares the Arm ARM's PSTATE.DIT
+  list (`madd`, `smaddl`, `umaddl`, `smulh`, `umulh`) under DIT, which no OS
+  guarantees yet (#3508), so it refuses the secret multiply today, as every
+  other ISA does. Every lane multiply is refused. `$mach.build.ct_mul(op,
+  width)` reads the same decision at comptime (see `comptime-mach.md`)
 - a secret **variable shift count** on a target without a barrel shifter
 
 A secret value passed to a variadic pack is also rejected, including a secret
@@ -119,7 +140,7 @@ decide rather than refuse: a formatter redacts a secret field, a hash refuses on
 the constant-time comparison instead of the early-out whose timing *is* the
 secret.
 
-```mach
+```mach fragment
 rec Session { id: u64; key: ^[32]u8; }
 
 $each f in $fields(Session) {
@@ -159,7 +180,7 @@ fun publish2(a: ^*u8) *u8 { ret a:>*u8; }
 
 `:^` is no operator; the parse stops at the colon:
 
-```mach
+```mach error expected ';' after 'ret'
 fun publish(a: ^u32) u32 { ret a:^u32; }
 ```
 
@@ -186,8 +207,8 @@ public/secret aliasing leak unconstructable with no alias analysis:
 - a secret-welded pointer cannot be erased to the untyped `ptr`
 - a `uni`'s overlapping variants must agree on secrecy
 
-```mach
-fun erase(p: *^u8) ptr { ret p; }     # error: cannot erase a secret pointer to ptr
+```mach error union variants must agree on secrecy
+fun erase(p: *^u8) ptr { ret p; }     # error: type mismatch: expected ptr, found *^u8
 uni Bad { a: ^u32; b: u32; }          # error: variants disagree on secrecy
 ```
 
@@ -197,7 +218,7 @@ a check on, and at every **instance** of a generic union. At the declaration a
 variant typed by a generic parameter says nothing about secrecy, so `uni U[T] {
 a: T; b: u32; }` agrees there and is decided where each instance is formed:
 
-```mach
+```mach error this instantiation makes overlapping fields part secret
 uni U[T] { a: T; b: u32; }
 rec Box[T] { u: U[T]; }
 
@@ -240,6 +261,9 @@ against a public `*U`. The result is a public `bool` — `u8`, per
 other public value:
 
 ```mach
+use std.types.bool.bool;
+use std.types.size.usize;
+
 fun overlap(first: *^u8, first_len: usize, second: *^u8, second_len: usize) bool {
     ret first <= ?second[second_len - 1] && second <= ?first[first_len - 1];
 }
@@ -286,7 +310,9 @@ public condition. The gates are unchanged where the *pointer itself* is the
 secret: a `^*T` is a secret value, the order of two of them is secret, and that
 `bool` still cannot be a branch condition.
 
-```mach
+```mach error secret value used as a branch condition
+use std.types.bool.bool;
+
 #[oblivious]
 fun before(a: *^u8, b: *^u8) bool { ret a < b; }   # public addresses, public bool
 
@@ -440,6 +466,8 @@ type. Either one marks the store. That taint is the thing an optimization must
 consult, and it is keyed on the storage, not on any decorator, so:
 
 ```mach
+use std.types.size.usize;
+
 # no decorator: the wipe is protected anyway
 fun clear(p: *^u8, n: usize) {
     var i: usize = 0;
@@ -454,7 +482,7 @@ taint is present for any future pass to read.
 **What it does not cover.** A value the compiler keeps in a **register**. Writing to a
 promoted local is not a memory write, so wiping one is not preserved:
 
-```mach
+```mach fragment
 var x: ^u8 = k;
 x = 0;          # NOT guaranteed: `x` may never have been in memory
 ```
@@ -465,10 +493,11 @@ pointer whose target is memory the compiler cannot promote away, which is what t
 standard library's `zeroize` does. Settled: the wipe guarantee is memory-scoped; secret register lifetimes are outside
 it (#2456).
 
-**Today the guarantee is not yet load-bearing**, because no dead-store elimination
-exists to remove anything: an entirely dead fill of a *public* local also survives at
-release. The taint is what makes the requirement enforceable *before* such a pass
-lands, and `mach.lang.driver:secret_store_taint_survives_lower` pins it.
+**Today the guarantee holds trivially.** mach has no dead-store elimination, so
+nothing removes a store: an entirely dead fill of a *public* local also survives at
+release. The guarantee becomes load-bearing only if such a pass is added, and the
+taint is what would hold that pass to it. `mach.lang.driver:secret_store_taint_survives_lower`
+pins the taint.
 
 The contract is only offered where mach emits the instructions that execute.
 A target whose back half hands a module to a downstream compiler instead — the
@@ -605,7 +634,7 @@ know, an out-of-range register reference, and inline assembly without a
 complete effect declaration are rejected, never defaulted to public. A proof
 over the final allocated machine program — after selection, allocation, spills
 and frame insertion, over physical registers and flags — is planned additive
-work past 5.0.0, not something this version claims. Where mach does not own
+work (#3591), not something this version claims. Where mach does not own
 the later stages at all — a whole-module emitter such as SPIR-V — the contract
 is refused rather than assumed.
 

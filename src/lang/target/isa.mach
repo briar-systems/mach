@@ -25,6 +25,7 @@ use mach.lang.be.codegen.unit_input;
 use mach.lang.ct;
 use mach.lang.target.arch;
 use mach.lang.target.definition;
+use mach.lang.target.extension;
 use rvfeatures: mach.lang.target.isa.riscv.features;
 use mach.lang.target.of;
 use std.io.writer;
@@ -86,6 +87,8 @@ pub rec Operand {
     label:      str;
     sym_mod:    SymModifier;
     sym_addend: i32;
+    # a memory operand's segment override, numbered by the ISA; 0 is none
+    seg: u8;
 }
 
 pub rec Inst {
@@ -149,7 +152,14 @@ pub val VEC_OP_FP_TO_SI: VecOp = 18;
 pub val VEC_OP_FP_TO_UI: VecOp = 19;
 pub val VEC_OP_SI_TO_FP: VecOp = 20;
 pub val VEC_OP_UI_TO_FP: VecOp = 21;
-pub val VEC_OP_LAST:     VecOp = VEC_OP_UI_TO_FP;
+
+# a widening multiply: both operands share a lane type, and the result lanes are
+# twice as wide and hold the full product under the operation's signedness. a
+# cell names the result lane width and the operand lane width; its scalar row is
+# the unfused path, where each operand is extended and then multiplied
+pub val VEC_OP_MUL_WIDE_S: VecOp = 22;
+pub val VEC_OP_MUL_WIDE_U: VecOp = 23;
+pub val VEC_OP_LAST:       VecOp = VEC_OP_MUL_WIDE_U;
 
 # a cell is the operation, the result lane kind and width, and the operand
 # lane width; an operation that keeps its lanes repeats lane_bits there
@@ -190,6 +200,23 @@ pub val XBANK_NONE: u32 = 0;
 pub val XBANK_4: u32 = 4;
 
 pub val XBANK_4_8: u32 = 4 + 8;
+
+# the scalar integer widths a target realizes, encoded like vec_mem_widths:
+# the bit for a width is that width; every ISA declares the 64-bit set today
+# and none the 128-bit one (#3511)
+pub val INT_WIDTHS_1_2_4_8: u32 = 1 + 2 + 4 + 8;
+
+pub val INT_WIDTHS_1_2_4_8_16: u32 = 1 + 2 + 4 + 8 + 16;
+
+# how a target realizes the full product of two lane-width integers: no
+# instruction (the schoolbook over extended operands), a three-address high
+# multiply beside the low one, or a fixed register pair (#3511, Q11); a
+# declaration, never derived from mul_hi_width
+pub def MulWideForm: u8;
+
+pub val MULW_NONE:          MulWideForm = 0;
+pub val MULW_THREE_ADDRESS: MulWideForm = 1;
+pub val MULW_FIXED_PAIR:    MulWideForm = 2;
 
 pub rec MachineModel {
     pointer_width: u32;
@@ -242,6 +269,10 @@ pub rec MachineModel {
 
     mul_hi_width: u32;
 
+    int_widths: u32;
+
+    mul_wide_form: MulWideForm;
+
     flat_addressing: bool;
 
     # a load or store takes a base register, a scaled index register and a
@@ -261,8 +292,13 @@ pub rec MachineModel {
     scalar_forms:    *ScalarForm;
     scalar_form_len: u32;
 
-    flen_bits:        u32;
-    riscv_extensions: u32;
+    flen_bits: u32;
+
+    # the selected extensions, as bits of this isa's vocabulary; the table is
+    # the isa module's own and names every bit the isa models
+    extensions:      u64;
+    extension_table: *extension.Extension;
+    extension_count: u32;
 
     index_width:          u32;
     vector_op_bytes:      u32;
@@ -279,7 +315,15 @@ fun float_lane(bits: u32) bool {
 }
 
 pub fun is_convert_op(op: VecOp) bool {
-    ret op >= VEC_OP_TRUNC && op <= VEC_OP_LAST;
+    ret op >= VEC_OP_TRUNC && op <= VEC_OP_UI_TO_FP;
+}
+
+pub fun is_widen_op(op: VecOp) bool {
+    ret op == VEC_OP_MUL_WIDE_S || op == VEC_OP_MUL_WIDE_U;
+}
+
+fun widen_cell_valid(is_float: bool, lane_bits: u32, from_bits: u32) bool {
+    ret !is_float && int_lane(from_bits) && int_lane(lane_bits) && lane_bits == from_bits * 2;
 }
 
 fun convert_cell_valid(op: VecOp, is_float: bool, lane_bits: u32, from_bits: u32) bool {
@@ -296,6 +340,7 @@ fun convert_cell_valid(op: VecOp, is_float: bool, lane_bits: u32, from_bits: u32
 
 fun packed_form_valid(op: VecOp, is_float: bool, lane_bits: u32, from_bits: u32) bool {
     if (is_convert_op(op))      { ret convert_cell_valid(op, is_float, lane_bits, from_bits); }
+    if (is_widen_op(op))        { ret widen_cell_valid(is_float, lane_bits, from_bits); }
     if (from_bits != lane_bits) { ret false; }
     if (is_float == true) {
         if (lane_bits != 32 && lane_bits != 64) { ret false; }
@@ -404,17 +449,29 @@ pub fun vector_domain_cell(index: u32, cell: *ScalarForm) bool {
 # them all as the scalar expansion by declaring no unit
 pub val CONVERT_CELL_COUNT: u32 = 52;
 
+pub val WIDEN_CELL_COUNT: u32 = 6;
+
 # the scalar rows for every conversion cell the model's packed table does not
 # claim, written from `at`; an ISA registers its packed conversions first and
 # declares the rest through this, so each conversion cell is decided once
 pub fun scalar_conversion_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32 {
+    ret scalar_rows_where(m, rows, at, is_convert_op);
+}
+
+# the same for the widening multiplies: a cell the packed table leaves keeps
+# the extend-then-multiply path
+pub fun scalar_widening_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32 {
+    ret scalar_rows_where(m, rows, at, is_widen_op);
+}
+
+fun scalar_rows_where(m: *MachineModel, rows: *ScalarForm, at: u32, family: fun(VecOp) bool) u32 {
     var n:   u32 = 0;
     var i:   u32 = 0;
     val len: u32 = vector_domain_len();
     for (i < len) {
         var cell: ScalarForm;
         if (!vector_domain_cell(i, ?cell)) { ret n; }
-        if (is_convert_op(cell.op)
+        if (family(cell.op)
             && packed_width(m, cell.op, cell.is_float, cell.lane_bits, cell.from_bits) == 0) {
             rows[at + n] = cell;
             n            = n + 1;
@@ -437,17 +494,136 @@ pub fun ct_mul_rows_admit(m: *MachineModel, dit_mode: bool) ct.CtMulMask {
         var held: bool          = false;
         if (row.cond == ct.CT_MUL_ALWAYS)    { held = true; }
         if (row.cond == ct.CT_MUL_DIT_MODE)  { held = dit_mode; }
-        if (row.cond == ct.CT_MUL_EXTENSION) { held = (m.riscv_extensions & row.ext) == row.ext; }
+        if (row.cond == ct.CT_MUL_EXTENSION) { held = (m.extensions & row.ext) == row.ext; }
         if (held)                            { ct.mul_mask_add(?mask, ct.mul_cell(row.op, row.width, row.lanes != 0)); }
         i = i + 1;
     }
     ret mask;
 }
 
+# what a selected target says about extensions: the bits it selects and the
+# vocabulary that names them
+pub rec ExtensionView {
+    selected: u64;
+    table:    *extension.Extension;
+    count:    u32;
+}
+
+pub fun extension_view(m: *MachineModel) ExtensionView {
+    ret ExtensionView{selected: m.extensions, table: m.extension_table, count: m.extension_count};
+}
+
+# every extension bit the model's vocabulary names
+pub fun extension_domain(m: *MachineModel) u64 {
+    if (m.extension_table == nil) { ret 0; }
+    ret extension.domain(m.extension_table, m.extension_count);
+}
+
+# the bit the model's vocabulary gives `name[0..len]`, 0 when it names no such extension
+pub fun extension_bit(m: *MachineModel, name: str, len: usize) u64 {
+    if (m.extension_table == nil) { ret 0; }
+    ret extension.bit_of(m.extension_table, m.extension_count, name, len);
+}
+
+# `bits` closed over the model's vocabulary: every extension a selected one implies
+pub fun extension_close(m: *MachineModel, bits: u64) u64 {
+    if (m.extension_table == nil) { ret bits; }
+    ret extension.close(m.extension_table, m.extension_count, bits);
+}
+
+# what `#[extensions(name)]` may mean: the selected isa's row when it has one,
+# else any registered row of that name, which admits nothing here. a row only
+# a target selects is never a decorator's, and `target_only` says why
+pub rec DecoratorExtension {
+    known:       bool;
+    bit:         u64;
+    target_only: str;
+}
+
+pub fun decorator_extension(reg: *IsaRegistry, selected: ExtensionView, name: str, len: usize) DecoratorExtension {
+    var out: DecoratorExtension   = DecoratorExtension{known: false, bit: 0, target_only: nil};
+    val own: *extension.Extension = table_row(selected.table, selected.count, name, len);
+    if (own != nil) {
+        out.known       = true;
+        out.bit         = own.bit;
+        out.target_only = own.target_only;
+        ret out;
+    }
+    if (reg == nil || reg.count > ISA_REGISTRY_CAP) { ret out; }
+    var i: u32 = 0;
+    for (i < reg.count) {
+        val m:   *MachineModel        = ?reg.entries[i].model;
+        val row: *extension.Extension = table_row(m.extension_table, m.extension_count, name, len);
+        if (row != nil) {
+            if (!out.known || row.target_only == nil) { out.target_only = row.target_only; }
+            out.known = true;
+        }
+        i = i + 1;
+    }
+    ret out;
+}
+
+fun table_row(table: *extension.Extension, count: u32, name: str, len: usize) *extension.Extension {
+    if (table == nil) { ret nil; }
+    var i: u32 = 0;
+    for (i < count) {
+        val row: *extension.Extension = ?table[i];
+        if (str_len(row.name) == len && str_region_equals(name, 0, len, row.name)) { ret row; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the model's vocabulary, `, `-separated, or `none`, NUL-terminated in buf
+pub fun spell_extensions(m: *MachineModel, buf: *u8, cap: usize) {
+    if (m.extension_table == nil || m.extension_count == 0) {
+        extension.spell_names(?NO_EXTENSIONS[0], 1, buf, cap, 0);
+        ret;
+    }
+    extension.spell_names(m.extension_table, m.extension_count, buf, cap, 0);
+}
+
+val NO_EXTENSIONS: [1]extension.Extension = [1]extension.Extension{extension.Extension{name: "none", bit: 0}};
+
+# what a registry's vocabularies say of one name: whether any registered isa
+# names it, and the names every vocabulary holds, deduplicated, for a refusal
+pub fun extension_known(reg: *IsaRegistry, name: str, len: usize) bool {
+    var i: u32 = 0;
+    for (i < reg.count) {
+        val m: *MachineModel = ?reg.entries[i].model;
+        if (extension_bit(m, name, len) != 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# every registered vocabulary's names, each table once, `, `-separated in buf
+pub fun spell_all_extensions(reg: *IsaRegistry, buf: *u8, cap: usize) {
+    var off: usize = 0;
+    var i:   u32   = 0;
+    if (cap > 0) { buf[0] = 0; }
+    for (i < reg.count) {
+        val m:    *MachineModel = ?reg.entries[i].model;
+        var seen: bool          = m.extension_table == nil || m.extension_count == 0;
+        var j:    u32           = 0;
+        for (j < i && !seen) {
+            if (reg.entries[j].model.extension_table == m.extension_table) { seen = true; }
+            j = j + 1;
+        }
+        if (!seen) {
+            if (off > 0) { off = extension.spell_names(?SEPARATOR[0], 1, buf, cap, off); }
+            off = extension.spell_names(m.extension_table, m.extension_count, buf, cap, off);
+        }
+        i = i + 1;
+    }
+}
+
+val SEPARATOR: [1]extension.Extension = [1]extension.Extension{extension.Extension{name: ", ", bit: 0}};
+
 # why a model's constant-time multiply rows are malformed; the extension
 # domain is every extension bit the target model knows
 pub fun ct_mul_forms_refusal(m: *MachineModel) opt[str] {
-    ret ct.mul_forms_refusal(m.ct_mul_forms, m.ct_mul_form_len, rvfeatures.ALL, m.has_mul);
+    ret ct.mul_forms_refusal(m.ct_mul_forms, m.ct_mul_form_len, extension_domain(m), m.has_mul);
 }
 
 pub fun vector_domain_complete(m: *MachineModel) bool {
@@ -512,7 +688,7 @@ pub fun packed_lane_cap(m: *MachineModel, lane_bits: u32) u32 {
     ret w / lane_bits;
 }
 
-fun vec_mem_bit(bytes: u32) u32 {
+fun width_bit(bytes: u32) u32 {
     if (bytes == 1)  { ret 1; }
     if (bytes == 2)  { ret 2; }
     if (bytes == 4)  { ret 4; }
@@ -528,15 +704,23 @@ pub fun moves_unaligned_gp(m: *MachineModel, bytes: u32) bool {
 }
 
 pub fun moves_vector_memory(m: *MachineModel, bytes: u32) bool {
-    val b: u32 = vec_mem_bit(bytes);
+    val b: u32 = width_bit(bytes);
     if (b == 0) { ret false; }
     ret (m.vec_mem_widths & b) != 0;
 }
 
 pub fun moves_cross_bank(m: *MachineModel, bytes: u32) bool {
-    val b: u32 = vec_mem_bit(bytes);
+    val b: u32 = width_bit(bytes);
     if (b == 0) { ret false; }
     ret (m.xbank_widths & b) != 0;
+}
+
+# the only reader of int_widths: whether the target realizes a scalar integer
+# of this many bytes
+pub fun realizes_int_width(m: *MachineModel, bytes: u32) bool {
+    val b: u32 = width_bit(bytes);
+    if (b == 0) { ret false; }
+    ret (m.int_widths & b) != 0;
 }
 
 pub fun fits_vector_register(m: *MachineModel, lane_bits: u32, lanes: u32) bool {
@@ -548,6 +732,9 @@ pub fun fits_vector_register(m: *MachineModel, lane_bits: u32, lanes: u32) bool 
 pub def AsmClobbersFn: fun(str, *u32, *u32);
 
 pub def AsmReturnsFn: fun(str) bool;
+
+# whether an asm body may write the stack pointer; true for a body it cannot parse
+pub def AsmWritesSpFn: fun(str) bool;
 
 pub def AsmCtScanFn: fun(str, *str, u32, ct.CtMulMask, bool, *A.Allocator) err[fail.Fail];
 
@@ -623,10 +810,11 @@ pub def EmitAsmFn: fun(*A.Allocator, *BackendTarget, *mir.MirModule,
 pub def EmitModuleFn: fun(*A.Allocator, *BackendTarget, *unit_input.Unit, *debug_input.ModuleDebug, **u8, *u32) err[fail.Fail];
 
 pub rec AssemblyCapabilities {
-    emit:     EmitAsmFn;
-    clobbers: AsmClobbersFn;
-    returns:  AsmReturnsFn;
-    ct_scan:  AsmCtScanFn;
+    emit:      EmitAsmFn;
+    clobbers:  AsmClobbersFn;
+    returns:   AsmReturnsFn;
+    ct_scan:   AsmCtScanFn;
+    writes_sp: AsmWritesSpFn;
 }
 
 pub rec RegMachine {
@@ -851,12 +1039,13 @@ pub fun reg_machine(select: SelectFn, encode: EncodeFn,
 }
 
 pub fun with_assembly(m: *RegMachine, emit: EmitAsmFn, clobbers: AsmClobbersFn,
-    returns: AsmReturnsFn, ct_scan: AsmCtScanFn) {
-    m.has_assembly      = true;
-    m.assembly.emit     = emit;
-    m.assembly.clobbers = clobbers;
-    m.assembly.returns  = returns;
-    m.assembly.ct_scan  = ct_scan;
+    returns: AsmReturnsFn, ct_scan: AsmCtScanFn, writes_sp: AsmWritesSpFn) {
+    m.has_assembly       = true;
+    m.assembly.writes_sp = writes_sp;
+    m.assembly.emit      = emit;
+    m.assembly.clobbers  = clobbers;
+    m.assembly.returns   = returns;
+    m.assembly.ct_scan   = ct_scan;
 }
 
 pub fun with_dwarf_regs(m: *RegMachine, f: DwarfRegFn) {
@@ -968,7 +1157,7 @@ pub fun build_attributes(tgt_isa: *IsaVTable, model: *MachineModel, alloc: *A.Al
     @out_len = 0;
     if (!declares_attributes(tgt_isa)) { ret res[*u8, fail.Fail].ok{nil}; }
     if (model == nil)                  { ret res[*u8, fail.Fail].err{fail.message("riscv attributes: selected model is missing")}; }
-    val r_855: res[*u8, fail.Fail] = tgt_isa.reloc.elf.build_attributes(alloc, model.gpr_width * 8, model.riscv_extensions,
+    val r_855: res[*u8, fail.Fail] = tgt_isa.reloc.elf.build_attributes(alloc, model.gpr_width * 8, model.extensions,
         float_arg_bits, has_compressed, out_len);
     if (sel r_855.err) { ret res[*u8, fail.Fail].err{r_855.err}; }
     ret res[*u8, fail.Fail].ok{r_855.ok};
@@ -983,7 +1172,7 @@ pub fun validate_attributes(tgt_isa: *IsaVTable, model: *MachineModel,
     if (model == nil || (len != 0 && bytes == nil)) {
         ret err[fail.Fail].err{fail.message("link: target has no selected attribute validation capability")};
     }
-    val r_867: err[fail.Fail] = tgt_isa.reloc.elf.validate_attributes(bytes, len, model.gpr_width * 8, model.riscv_extensions, flags);
+    val r_867: err[fail.Fail] = tgt_isa.reloc.elf.validate_attributes(bytes, len, model.gpr_width * 8, model.extensions, flags);
     if (sel r_867.err) { ret err[fail.Fail].err{r_867.err}; }
     ret err[fail.Fail].ok{};
 }
@@ -1057,6 +1246,7 @@ pub rec IsaRegistryEntry {
     reload_scratch:     *Register;
     packed_forms:       *PackedForm;
     scalar_forms:       *ScalarForm;
+    ct_mul_forms:       *ct.CtMulForm;
     envs:               *Environment;
     op_defs:            *OpDef;
     type_defs:          *TypeDef;
@@ -1294,6 +1484,7 @@ pub fun registry_init_with_allocator(alloc: *A.Allocator) IsaRegistry {
         reg.entries[i].reload_scratch     = nil;
         reg.entries[i].packed_forms       = nil;
         reg.entries[i].scalar_forms       = nil;
+        reg.entries[i].ct_mul_forms       = nil;
         reg.entries[i].envs               = nil;
         reg.entries[i].op_defs            = nil;
         reg.entries[i].type_defs          = nil;
@@ -1373,6 +1564,9 @@ fun release_entry(reg: *IsaRegistry, entry: *IsaRegistryEntry) {
     if (entry.scalar_forms != nil) {
         A.deallocate[ScalarForm](?reg.alloc, entry.scalar_forms, entry.model.scalar_form_len::usize);
     }
+    if (entry.ct_mul_forms != nil) {
+        A.deallocate[ct.CtMulForm](?reg.alloc, entry.ct_mul_forms, entry.model.ct_mul_form_len::usize);
+    }
     if (entry.op_defs != nil) {
         var oi: u32 = 0;
         for (oi < entry.defs.op_count) {
@@ -1420,6 +1614,7 @@ fun release_entry(reg: *IsaRegistry, entry: *IsaRegistryEntry) {
     entry.reload_scratch     = nil;
     entry.packed_forms       = nil;
     entry.scalar_forms       = nil;
+    entry.ct_mul_forms       = nil;
     entry.envs               = nil;
     entry.op_defs            = nil;
     entry.type_defs          = nil;
@@ -1477,11 +1672,13 @@ fun descriptor_valid(vt: *IsaVTable) bool {
         if (vt.reloc != nil && (vt.reloc.apply == nil || vt.reloc.traits == nil)) { ret false; }
         if (vt.machine.has_assembly) {
             if (vt.machine.assembly.emit == nil || vt.machine.assembly.clobbers == nil
-                || vt.machine.assembly.returns == nil || vt.machine.assembly.ct_scan == nil) { ret false; }
+                || vt.machine.assembly.returns == nil || vt.machine.assembly.ct_scan == nil
+                || vt.machine.assembly.writes_sp == nil) { ret false; }
         }
         or {
             if (vt.machine.assembly.emit != nil || vt.machine.assembly.clobbers != nil
-                || vt.machine.assembly.returns != nil || vt.machine.assembly.ct_scan != nil) { ret false; }
+                || vt.machine.assembly.returns != nil || vt.machine.assembly.ct_scan != nil
+                || vt.machine.assembly.writes_sp != nil) { ret false; }
         }
     }
     if (has_emitter && (vt.emitter.emit_module == nil || vt.reloc != nil)) { ret false; }
@@ -1681,13 +1878,15 @@ pub fun register(reg: *IsaRegistry, vt: *IsaVTable) err[fail.Fail] {
         }
         if (vt.machine.has_assembly
             && (vt.machine.assembly.emit == nil || vt.machine.assembly.clobbers == nil
-            || vt.machine.assembly.returns == nil || vt.machine.assembly.ct_scan == nil)) {
+            || vt.machine.assembly.returns == nil || vt.machine.assembly.ct_scan == nil
+            || vt.machine.assembly.writes_sp == nil)) {
             ret err[fail.Fail].err{fail.message(errf("mach.lang.target.isa: an assembly capability group must be complete",
                 "mach.lang.target.isa: instruction set '{}' declares only part of its assembly capability group", vt.name))};
         }
         if (!vt.machine.has_assembly
             && (vt.machine.assembly.emit != nil || vt.machine.assembly.clobbers != nil
-            || vt.machine.assembly.returns != nil || vt.machine.assembly.ct_scan != nil)) {
+            || vt.machine.assembly.returns != nil || vt.machine.assembly.ct_scan != nil
+            || vt.machine.assembly.writes_sp != nil)) {
             ret err[fail.Fail].err{fail.message(errf("mach.lang.target.isa: disabled assembly capabilities cannot carry callbacks",
                 "mach.lang.target.isa: instruction set '{}' carries assembly callbacks while declaring the group unsupported", vt.name))};
         }
@@ -1729,6 +1928,12 @@ pub fun register(reg: *IsaRegistry, vt: *IsaVTable) err[fail.Fail] {
         if (!packed_forms_valid(vt.model) || !scalar_forms_valid(vt.model)) {
             ret err[fail.Fail].err{fail.message(errf("mach.lang.target.isa: machine model declares a vector form outside the retained vocabulary or twice",
                 "mach.lang.target.isa: instruction set '{}' declares a packed or scalar vector form outside the retained vocabulary, twice, or in both tables", vt.name))};
+        }
+        if ((vt.model.extension_count > 0 && vt.model.extension_table == nil)
+            || (vt.model.extension_table != nil && !extension.table_valid(vt.model.extension_table, vt.model.extension_count))
+            || (vt.model.extensions & ~extension_domain(vt.model)) != 0) {
+            ret err[fail.Fail].err{fail.message(errf("mach.lang.target.isa: machine model declares a malformed extension vocabulary",
+                "mach.lang.target.isa: instruction set '{}' declares an extension vocabulary with a repeated or non-identifier name, a bit that is not a single bit, or a selected bit it does not name", vt.name))};
         }
         val mul_why: opt[str] = ct_mul_forms_refusal(vt.model);
         if (sel mul_why.some) {
@@ -1798,6 +2003,7 @@ pub fun register(reg: *IsaRegistry, vt: *IsaVTable) err[fail.Fail] {
     entry.reload_scratch     = nil;
     entry.packed_forms       = nil;
     entry.scalar_forms       = nil;
+    entry.ct_mul_forms       = nil;
     entry.envs               = nil;
     entry.op_defs            = nil;
     entry.type_defs          = nil;
@@ -1897,6 +2103,13 @@ pub fun register(reg: *IsaRegistry, vt: *IsaVTable) err[fail.Fail] {
         }
         entry.scalar_forms       = r_scalar_forms.ok;
         entry.model.scalar_forms = entry.scalar_forms;
+        val r_ct_mul_forms: res[*ct.CtMulForm, fail.Fail] = own_copy[ct.CtMulForm](?reg.alloc, vt.model.ct_mul_forms, vt.model.ct_mul_form_len::usize);
+        if (sel r_ct_mul_forms.err) {
+            release_entry(reg, entry);
+            ret err[fail.Fail].err{r_ct_mul_forms.err};
+        }
+        entry.ct_mul_forms       = r_ct_mul_forms.ok;
+        entry.model.ct_mul_forms = entry.ct_mul_forms;
         entry.descriptor.model   = ?entry.model;
     }
     if (vt.machine != nil) {
@@ -2123,6 +2336,7 @@ fun operand_blank(kind: OperandKind, size: u8) Operand {
     op.label      = nil;
     op.sym_mod    = SYM_MOD_NONE;
     op.sym_addend = 0;
+    op.seg        = 0;
     ret op;
 }
 
@@ -2310,6 +2524,8 @@ fun t_model(width: u32) MachineModel {
     model.scalar_form_len = 0;
     model.ct_mul_forms    = nil;
     model.ct_mul_form_len = 0;
+    model.extension_table = ?rvfeatures.NAMES[0];
+    model.extension_count = rvfeatures.NAME_COUNT;
     ret model;
 }
 
@@ -2363,13 +2579,13 @@ fun t_normalize_image(alloc: *A.Allocator, image: *of.ObjectImage) err[fail.Fail
     ret err[fail.Fail].ok{};
 }
 
-fun t_build_attributes(alloc: *A.Allocator, xlen: u32, extensions: u32, flen: u32,
+fun t_build_attributes(alloc: *A.Allocator, xlen: u32, extensions: u64, flen: u32,
     compressed: bool, out_len: *u32) res[*u8, fail.Fail] {
     @out_len = 0;
     ret res[*u8, fail.Fail].ok{nil};
 }
 
-fun t_validate_attributes(bytes: *u8, len: u32, xlen: u32, extensions: u32, flags: u32) err[fail.Fail] {
+fun t_validate_attributes(bytes: *u8, len: u32, xlen: u32, extensions: u64, flags: u32) err[fail.Fail] {
     ret err[fail.Fail].ok{};
 }
 
@@ -2508,15 +2724,16 @@ test "mach.lang.target.isa.reloc_seam:required_then_optional" {
 
 test "mach.lang.target.isa.reg_machine:optionals_cleared_then_declared" {
     var m: RegMachine = t_machine();
-    if (m.has_assembly)             { ret 1; }
-    if (m.assembly.clobbers != nil) { ret 1; }
-    if (m.assembly.ct_scan != nil)  { ret 1; }
-    if (m.dwarf_reg != nil)         { ret 1; }
-    if (m.cv_reg != nil)            { ret 1; }
+    if (m.has_assembly)              { ret 1; }
+    if (m.assembly.clobbers != nil)  { ret 1; }
+    if (m.assembly.ct_scan != nil)   { ret 1; }
+    if (m.assembly.writes_sp != nil) { ret 1; }
+    if (m.dwarf_reg != nil)          { ret 1; }
+    if (m.cv_reg != nil)             { ret 1; }
 
-    with_assembly(?m, t_emit_asm, t_asm_clobbers, t_asm_returns, t_asm_ct_scan);
+    with_assembly(?m, t_emit_asm, t_asm_clobbers, t_asm_returns, t_asm_ct_scan, t_asm_returns);
     if (!m.has_assembly || m.assembly.emit == nil || m.assembly.clobbers == nil
-        || m.assembly.returns == nil || m.assembly.ct_scan == nil) { ret 1; }
+        || m.assembly.returns == nil || m.assembly.ct_scan == nil || m.assembly.writes_sp == nil) { ret 1; }
 
     with_dwarf_regs(?m, t_dwarf_reg);
     if (m.dwarf_reg == nil)  { ret 1; }
@@ -2759,9 +2976,9 @@ test "mach.lang.target.isa.ct_mul_rows_admit:decides_each_condition" {
         ct.CtMulForm{op: ct.CT_MUL_WIDE_U, width: 64, lanes: 0, cond: ct.CT_MUL_DIT_MODE, ext: 0},
         ct.CtMulForm{op: ct.CT_MUL_HIGH_SU, width: 64, lanes: 0, cond: ct.CT_MUL_EXTENSION, ext: rvfeatures.M | rvfeatures.A}
     };
-    model.ct_mul_forms     = ?rows[0];
-    model.ct_mul_form_len  = 3;
-    model.riscv_extensions = rvfeatures.I | rvfeatures.M;
+    model.ct_mul_forms    = ?rows[0];
+    model.ct_mul_form_len = 3;
+    model.extensions      = rvfeatures.I | rvfeatures.M;
     val low:  ct.CtMulCell = ct.mul_cell(ct.CT_MUL_LOW, 64, false);
     val wide: ct.CtMulCell = ct.mul_cell(ct.CT_MUL_WIDE_U, 64, false);
     val hsu:  ct.CtMulCell = ct.mul_cell(ct.CT_MUL_HIGH_SU, 64, false);
@@ -2769,7 +2986,7 @@ test "mach.lang.target.isa.ct_mul_rows_admit:decides_each_condition" {
     if (!ct.mul_mask_has(off, low) || ct.mul_mask_has(off, wide) || ct.mul_mask_has(off, hsu)) { ret 1; }
     val dit: ct.CtMulMask = ct_mul_rows_admit(?model, true);
     if (!ct.mul_mask_has(dit, wide)) { ret 2; }
-    model.riscv_extensions = rvfeatures.I | rvfeatures.M | rvfeatures.A;
+    model.extensions = rvfeatures.I | rvfeatures.M | rvfeatures.A;
     val ext: ct.CtMulMask = ct_mul_rows_admit(?model, false);
     if (!ct.mul_mask_has(ext, hsu)) { ret 3; }
     # a malformed table admits nothing
@@ -2953,7 +3170,7 @@ test "mach.lang.target.isa.scalar_conversion_rows:declares_every_conversion_the_
     if (scalar_conversion_rows(?m, ?rows[0], 0) != CONVERT_CELL_COUNT) { ret 1; }
     var i: u32 = 0;
     for (i < CONVERT_CELL_COUNT) {
-        if (!is_convert_op(rows[i].op)) { ret 2; }
+        if (!is_convert_op(rows[i].op) || is_widen_op(rows[i].op)) { ret 2; }
         i = i + 1;
     }
     var packed: [1]PackedForm;
@@ -2973,9 +3190,43 @@ test "mach.lang.target.isa.scalar_conversion_rows:declares_every_conversion_the_
     ret 0;
 }
 
+test "mach.lang.target.isa.scalar_widening_rows:declares_every_widening_multiply_the_packed_table_leaves" {
+    var m: MachineModel = t_model(8);
+    m.has_v128         = true;
+    m.vector_bits      = VECTOR_BITS_128;
+    m.max_vector_lanes = VECTOR_LANES_UNBOUNDED;
+    var rows: [6]ScalarForm;
+    if (scalar_widening_rows(?m, ?rows[0], 0) != WIDEN_CELL_COUNT) { ret 1; }
+    var i: u32 = 0;
+    for (i < WIDEN_CELL_COUNT) {
+        if (!is_widen_op(rows[i].op) || is_convert_op(rows[i].op)) { ret 2; }
+        if (rows[i].lane_bits != rows[i].from_bits * 2)            { ret 2; }
+        i = i + 1;
+    }
+    var packed: [1]PackedForm;
+    packed[0]         = PackedForm{op: VEC_OP_MUL_WIDE_U, is_float: false, lane_bits: 32, from_bits: 16};
+    m.packed_forms    = ?packed[0];
+    m.packed_form_len = 1;
+    val left: u32 = scalar_widening_rows(?m, ?rows[0], 0);
+    if (left != WIDEN_CELL_COUNT - 1) { ret 3; }
+    i = 0;
+    for (i < left) {
+        if (rows[i].op == VEC_OP_MUL_WIDE_U && rows[i].lane_bits == 32) { ret 4; }
+        i = i + 1;
+    }
+    # the result lanes are the wider side, and the signed cell is its own
+    if (packed_width(?m, VEC_OP_MUL_WIDE_U, false, 32, 16) != 128) { ret 5; }
+    if (packed_width(?m, VEC_OP_MUL_WIDE_S, false, 32, 16) != 0)   { ret 6; }
+    if (packed_form_valid(VEC_OP_MUL_WIDE_S, false, 32, 8)
+        || packed_form_valid(VEC_OP_MUL_WIDE_S, false, 16, 16)
+        || packed_form_valid(VEC_OP_MUL_WIDE_U, true, 64, 32)
+        || packed_form_valid(VEC_OP_MUL_WIDE_U, false, 128, 64)) { ret 7; }
+    ret 0;
+}
+
 test "mach.lang.target.isa.vector_form:every_retained_cell_has_one_declared_outcome" {
-    # 46 lane-keeping cells and 52 conversions
-    if (vector_domain_len() != 98) { ret 1; }
+    # 46 lane-keeping cells, 52 conversions and 6 widening multiplies
+    if (vector_domain_len() != 104) { ret 1; }
     var cell: ScalarForm;
     if (!vector_domain_cell(0, ?cell)
         || cell.op != VEC_OP_ADD || cell.is_float || cell.lane_bits != 8 || cell.from_bits != 8) { ret 2; }
@@ -2985,7 +3236,11 @@ test "mach.lang.target.isa.vector_form:every_retained_cell_has_one_declared_outc
         || cell.op != VEC_OP_TRUNC || cell.is_float || cell.lane_bits != 8 || cell.from_bits != 16) { ret 18; }
     if (!vector_domain_cell(97, ?cell)
         || cell.op != VEC_OP_UI_TO_FP || !cell.is_float || cell.lane_bits != 64 || cell.from_bits != 64) { ret 19; }
-    if (vector_domain_cell(98, ?cell)) { ret 4; }
+    if (!vector_domain_cell(98, ?cell)
+        || cell.op != VEC_OP_MUL_WIDE_S || cell.is_float || cell.lane_bits != 16 || cell.from_bits != 8) { ret 21; }
+    if (!vector_domain_cell(103, ?cell)
+        || cell.op != VEC_OP_MUL_WIDE_U || cell.is_float || cell.lane_bits != 64 || cell.from_bits != 32) { ret 22; }
+    if (vector_domain_cell(104, ?cell)) { ret 4; }
 
     var packed: [1]PackedForm;
     packed[0] = PackedForm{op: VEC_OP_MUL, is_float: true, lane_bits: 32, from_bits: 32};
@@ -3013,9 +3268,14 @@ test "mach.lang.target.isa.vector_form:every_retained_cell_has_one_declared_outc
         || vector_form(?m, VEC_OP_SEXT, false, 16, 32) != FORM_UNDECLARED
         || vector_form(?m, VEC_OP_TRUNC, false, 16, 16) != FORM_UNDECLARED
         || vector_form(?m, VEC_OP_FP_TO_SI, true, 32, 32) != FORM_UNDECLARED
-        || vector_form(?m, VEC_OP_FP_EXT, true, 64, 64) != FORM_UNDECLARED) { ret 9; }
+        || vector_form(?m, VEC_OP_FP_EXT, true, 64, 64) != FORM_UNDECLARED
+        || vector_form(?m, VEC_OP_MUL_WIDE_S, false, 32, 32) != FORM_UNDECLARED
+        || vector_form(?m, VEC_OP_MUL_WIDE_U, false, 64, 16) != FORM_UNDECLARED
+        || vector_form(?m, VEC_OP_MUL_WIDE_S, true, 64, 32) != FORM_UNDECLARED
+        || vector_form(?m, VEC_OP_MUL_WIDE_U, false, 128, 64) != FORM_UNDECLARED) { ret 9; }
     if (vector_form(?m, VEC_OP_SEXT, false, 32, 16) != FORM_SCALAR
-        || vector_form(?m, VEC_OP_UI_TO_FP, true, 32, 8) != FORM_SCALAR) { ret 20; }
+        || vector_form(?m, VEC_OP_UI_TO_FP, true, 32, 8) != FORM_SCALAR
+        || vector_form(?m, VEC_OP_MUL_WIDE_S, false, 32, 16) != FORM_SCALAR) { ret 20; }
 
     m.scalar_form_len = scalar_len - 1;
     if (vector_domain_complete(?m)) { ret 10; }
@@ -3137,7 +3397,7 @@ test "mach.lang.target.isa.register:rejects_malformed_assembly_group" {
     var reloc: RelocSeam    = t_reloc();
 
     var partial: RegMachine = t_machine();
-    with_assembly(?partial, t_emit_asm, t_asm_clobbers, t_asm_returns, t_asm_ct_scan);
+    with_assembly(?partial, t_emit_asm, t_asm_clobbers, t_asm_returns, t_asm_ct_scan, t_asm_returns);
     partial.assembly.ct_scan = nil;
     var partial_vt: IsaVTable = machine_isa(ARCH_X86_64, "partial_asm", 62, 8,
         ?model, ?partial, ?reloc);
@@ -3521,6 +3781,23 @@ test "mach.lang.target.isa.backend_family:closed_over_native_and_whole_module" {
     val ef:      BackendFamily = backend_family(?evt);
     if (is_native(?ef))        { ret 1; }
     if (!is_whole_module(?ef)) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.isa.realizes_int_width:reads_the_declared_set_and_nothing_else" {
+    var model: MachineModel;
+    model.int_widths = INT_WIDTHS_1_2_4_8;
+    if (!realizes_int_width(?model, 1) || !realizes_int_width(?model, 2)
+        || !realizes_int_width(?model, 4) || !realizes_int_width(?model, 8)) { ret 1; }
+    if (realizes_int_width(?model, 16) || realizes_int_width(?model, 0)
+        || realizes_int_width(?model, 3) || realizes_int_width(?model, 32)) { ret 2; }
+    model.int_widths = INT_WIDTHS_1_2_4_8_16;
+    if (!realizes_int_width(?model, 16) || realizes_int_width(?model, 32)) { ret 3; }
+    # a target that declares nothing realizes nothing, whatever its ALU says
+    model.int_widths    = 0;
+    model.max_alu_width = 8;
+    model.gpr_width     = 8;
+    if (realizes_int_width(?model, 1) || realizes_int_width(?model, 8)) { ret 4; }
     ret 0;
 }
 

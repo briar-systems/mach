@@ -135,10 +135,14 @@ error: this is mach 5.2.1, and the dependency closure does not accept it:
 ```
 
 A root manifest without `mach` builds, with a warning that prints the line to
-add (`mach.toml: [project] states no compiler range; add mach = "^5.2", the
-compiler this project builds with`). A later release makes the key required. A
-dependency without it states no constraint. `mach init` writes the running
-compiler's caret range.
+add (`mach.toml: [project] states no compiler range; add mach = "^5.3", the
+oldest release that reads the key, and raise it when the project uses a later
+feature`). A later release makes the key required (#3496). A dependency without it
+states no constraint. `mach init` writes the same range. It is the oldest
+release of the running compiler's major that reads the key: `^5.3` for every
+5.x compiler, since 5.3.0 is the first release that accepts `mach`, and `^N.0`
+for a later major N, since a caret cannot span majors. The range depends only on
+the running major, so two authors on one project write the same line.
 
 The compiler's version is the last release it was built from. A build from an
 unreleased tree reports that release, so a project cannot require an
@@ -208,7 +212,87 @@ to whichever *declared* target matches the host.
 | `stack_reserve` | no | Thread stack reserve in bytes. See [Image stack size](#image-stack-size). |
 | `stack_commit` | no | Thread stack commit in bytes. See [Image stack size](#image-stack-size). |
 | `default` | no | `true` marks the target `native` resolves to when no declared target matches the host and several are declared. Exactly one may carry it: two are refused at parse (`2 targets declare `default = true` ([target.linux-x86_64], [target.darwin-x86_64]); exactly one is allowed`). See [`native` target resolution](#native-target-resolution). |
+| `extensions` | no | Array of instruction-set extension names the target may assume, such as `["sha", "ssse3"]`. Each name must be in the isa's vocabulary. See [Instruction-set extensions](#instruction-set-extensions). |
 | `env` | no | Consumer environment (string). The values are owned by the target's isa: an `env` the isa does not define is a manifest error naming the target and the known values, and an isa that defines none refuses the key outright. Today only `spirv` defines any; see [Finished-module targets](#finished-module-targets). |
+
+### Instruction-set extensions
+
+`extensions` lists the extensions a target may assume beyond its isa's baseline:
+
+```toml
+[target.linux-x86_64-sha]
+isa        = "x86_64"
+extensions = ["sha", "ssse3", "sse41"]
+os         = "linux"
+abi        = "sysv64"
+```
+
+Each isa owns its vocabulary. The names are identifiers, so each one is also a
+comptime member, `$mach.build.extensions.<name>` (see [`$mach`](comptime-mach.md)):
+
+| `isa` | Baseline | Extensions |
+|-------|----------|------------|
+| `x86_64` | SSE2 | `ssse3`, `sse41`, `sha`, `fsgsbase` |
+| `aarch64` | AdvSIMD | `sha2` |
+| `riscv64`, `riscv32` | the isa string's selection | `i`, `m`, `a`, `f`, `d`, `c`, `zicsr`, `zifencei`, `zkt` |
+| `spirv` | | none |
+
+A name the selected isa does not hold is refused when the target resolves, with the
+names it does hold:
+
+```
+error: target: `sha2` is not an extension of isa 'x86_64'; its extensions are:
+ssse3, sse41, sha, fsgsbase
+```
+
+The array must hold strings, and each name must be an identifier (`sse41`, not
+`sse4.1`) listed once.
+
+A level is a bundle, never an axis of its own: each name may imply others, and the
+selection is closed over that once, when the target resolves. `sse41` brings `ssse3`
+(the chain stops there; SSE3 is not modelled). On riscv `d` brings `f` and `f` brings
+`zicsr`, as the isa string's own grammar has it, so `extensions = ["d"]` on `rv64i`
+selects `rv64ifd` with Zicsr. The isa string and the list feed one set:
+`isa = "rv64i"` with `extensions = ["m"]` selects the same machine as
+`isa = "rv64im"`. Nothing is gated on a level name; a future `x86-64-v2` would expand
+to bits the way riscv `g` does.
+
+The list is never part of `{target.isa}`. That placeholder is the `isa` value as
+written (`rv64i`, `x86_64`), on every isa; the list belongs to the target's identity
+and to `{target.name}`.
+
+"Selects" means the extension is assumed of every machine the binary runs on: the
+inline assembler admits its rows, `$mach.build.extensions.<name>` answers 1, and a
+property the extension declares (Zkt's data-independent timing, which the
+constant-time multiply rows read) is taken as given. It never means a mode is on. A
+row such as a `dit` would admit `msr dit`, not set it.
+
+Some rows are the target's alone. On riscv `i` is the baseline, `c` is a code-size
+selection mach never emits, and `f` and `d` select the float register file and the
+calling convention's float registers, and `zkt` is a promise about the machine's
+execution timing that the constant-time rows read, so none of them may be named in
+[`#[extensions(...)]`](decorators.md#extensionsnames--an-outlier-function); the
+refusal says why. Every x86_64 and aarch64 row, and riscv `m`, `a`, `zicsr` and
+`zifencei`, may be.
+
+Selecting an extension is a promise about **every** machine the binary runs on. The
+inline assembler admits the extension's mnemonics anywhere in the build, and a host
+without the extension faults on the first one it executes. A portable binary keeps the
+target at its baseline instead. It confines the extension instructions to
+[`#[extensions(...)]`](decorators.md#extensionsnames--an-outlier-function) functions
+and picks one of those at run time, after detecting the host's features.
+
+A mnemonic that needs an extension the target does not select, outside such a
+function, is refused. The refusal names the line to add:
+
+```
+error: encode: inline-asm instruction 'sha256rnds2' needs the `sha` extension, which
+this target does not select; add `extensions = ["sha"]` to the target, or mark the
+function `#[extensions(sha)]` and call it only after detecting the extension at run time
+```
+
+The selected set is part of the target's identity: two targets that differ only in
+`extensions` never share cached products.
 
 ### Image stack size
 
@@ -292,11 +376,13 @@ emits a finished GPU module rather than machine code (see
 `riscv64` and `riscv32` are width-only spellings, and each names a **default
 profile**: `riscv64` is `rv64gc` and `riscv32` is `rv32imac`. A canonical
 extension string such as `rv32imc` or `rv64imafd` selects a smaller machine.
-The retained vocabulary is I, M, A, F, D, C, Zicsr and Zifencei, written in
+The retained vocabulary is I, M, A, F, D, C, Zicsr, Zifencei and Zkt, written in
 lowercase canonical order with multi-letter names after an underscore; `g`
 expands to IMAFD plus Zicsr and Zifencei. F carries its required Zicsr, and D
-requires F. An optional version must be the one mach models: I 2.1, M 2.0,
-A 2.1, F and D 2.2, C 2.0, Zicsr and Zifencei 2.0. Unknown extensions,
+requires F. Zkt changes no instruction. It states that the listed operations run
+in data-independent time, which is what lets a secret multiply compile (see
+`secrecy.md`). An optional version must be the one mach models: I 2.1, M 2.0,
+A 2.1, F and D 2.2, C 2.0, Zicsr and Zifencei 2.0, Zkt 1.0. Unknown extensions,
 other versions, duplicates, noncanonical order and the E base are refused
 rather than rounded up to the default machine.
 
@@ -670,8 +756,37 @@ module no artifact reaches is collected as before.
 - **`static`** materialises a real `ar` archive at the resolved `out` path — the
   per-module objects with an archive symbol index, the deliverable a consumer links
   as a `.a` (#1997).
-- **`shared`** is reserved for a shared-library deliverable; its emission is phase 2
-  (#1980).
+- **`shared`** links a dynamic library at the resolved `out`. Only ELF targets
+  write one today: `linux` on `x86_64`, `aarch64` and `riscv64` produce a `.so`
+  whose `SONAME` is its file name. The Mach-O `.dylib` and PE `.dll` writers are
+  not built yet, so a `darwin` or `windows` target refuses with `link: object
+  format cannot write shared libraries` (#3588). A `freestanding` target never
+  writes one: its default `raw` format refuses with `a flat-image object format
+  produces only executables`, and setting `of = "elf"` moves the refusal to the
+  link, `link: a shared library needs a loader to map it, and os =
+  "freestanding" has none`, because a shared library only exists to be mapped by
+  a loader the os provides.
+  - **Exports.** The library exports the root project's `pub` functions and
+    variables and every name its modules re-export with `fwd`, including a
+    dependency's. A dependency's own `pub` surface is not exported unless it is
+    re-exported. `#[symbol("name")]` sets the name an export carries and does not
+    make anything visible: a `pub` function exports under its `#[symbol]` name,
+    and a non-`pub` one stays hidden whatever its name.
+  - **Internals.** Every other definition still links inside the library but is
+    absent from `.dynsym`. In the `.so` it is a `LOCAL` symbol in `.symtab`, and
+    in the per-module object it is a `GLOBAL` symbol with `STV_HIDDEN`
+    visibility.
+  - **Refusals.** A shared artifact that exports nothing is refused:
+
+    ```
+    link: shared library '<artifact>' exports nothing: a shared library needs at least one `pub` declaration in the project, or a `fwd` re-export of one
+    ```
+
+    A `freestanding` target is refused as well. With its default `raw` format
+    the artifact fails naming (`artifact naming: this object format has no
+    shared-library form`), and with `of = "elf"` the link refuses with
+    `link: a shared library needs a loader to map it, and os = "freestanding"
+    has none`.
 
 Per-target extension or per-target entry is not a per-cell exception table — it is a
 second artifact stanza, so the condition stays visible like everything else.
@@ -699,9 +814,9 @@ inspection use the same expansion.
 
 | Target output format | `bin` suffix | `static` suffix | `shared` suffix |
 | --- | --- | --- | --- |
-| ELF on Linux or freestanding | empty | `.a` | `.so` |
-| Mach-O on Darwin | empty | `.a` | `.dylib` |
-| COFF/PE on Windows | `.exe` | `.lib` | `.dll` |
+| ELF on Linux or freestanding | empty | `.a` | `.so` (refused on freestanding) |
+| Mach-O on Darwin | empty | `.a` | `.dylib` (not written yet, #3588) |
+| COFF/PE on Windows | `.exe` | `.lib` | `.dll` (not written yet, #3588) |
 | Raw image | empty | unsupported | unsupported |
 | SPIR-V module | `.spv` | unsupported | unsupported |
 
@@ -736,7 +851,7 @@ has ever emitted declares, so an artifact that omits the key is byte-identical t
 one built before the key existed. A graphical application sets `"gui"` to stop an
 empty console from opening behind it on launch.
 
-Only a PE image carries the field. A key written on an artifact that is planned
+Only a PE image carries the field. A key written on an artifact that builds
 for a target whose format has none (ELF, Mach-O, a flat image) is refused as
 unsupported, naming the key, the target and the format:
 
@@ -1284,6 +1399,14 @@ add` takes the same step for its Git source, so re-adding a dependency whose
 checkout `remove` retained registers that checkout, and it refuses a dirty one.
 No gitlink command ever runs against a path that is not a checkout of its own.
 
+A path dependency has no pin, so `mach dep pull` syncs its `dep/<id>` with the
+declared `path` every time, and `mach dep update` does the same. A changed
+`path` realizes the new source. A file the source no longer has is removed and
+named, and a file whose content differs from the source is overwritten and named
+(`replaced 'src/lib.mach' with its source's content`), so local edits to the
+copy do not survive a pull. A `dep/<id>` that is a symlink is refused and left
+as it is.
+
 A project root is identified by its own `mach.toml`, not by an enclosing git
 repository; `dep/<id>` is resolved relative to the project root. A project
 nested inside an unrelated repository or without any repository builds. Git
@@ -1406,7 +1529,7 @@ link    = []
 need    = ["artifact.shader-*"]
 ```
 
-```mach
+```mach fragment
 #[embed("{artifact.shader-blur.out}")]
 val BLUR: [_]u8;
 ```
@@ -1473,7 +1596,7 @@ link    = []
 need    = []
 ```
 
-```mach
+```mach fragment
 # the dependency's src/lib.mach, compiled by every consumer
 #[embed("{artifact.shader-frag.out}")]
 val FRAG: [_]u8;

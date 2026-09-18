@@ -38,7 +38,7 @@ fun main(argc: i64, argv: **u8) i64 {
 `&` `|` `^` `~` apply lane-wise; the shifts `<<` `>>` are not in this increment
 (see [SIMD vectors](#simd-vectors)).
 
-```mach
+```mach fragment
 val x: i64    = (a & b) | (c ^ d);
 val y: i64    = x << 2;
 ```
@@ -85,7 +85,7 @@ equality, no payload equality and no ordering. Test which case is active with th
 `&&` `||` `!` — short-circuiting. Operands are `u8` (`0` is false, nonzero is
 true); the result is `u8` (`1` or `0`).
 
-```mach
+```mach fragment
 val ok: u8 = (x > 0) && (y < 100);
 ```
 
@@ -122,7 +122,7 @@ fun main(argc: i64, argv: **u8) i64 {
 }
 ```
 
-```mach
+```mach error cannot take the address of a call result
 fun g() i64 { ret 1; }
 
 fun addresses(x: i64) {
@@ -237,6 +237,22 @@ Integer `*` is where this is most visible today:
 | `i32x4 * i32x4` | scalar expansion (`pmulld` is SSE4.1) | packed `mul .4s` | scalar expansion |
 | `i64x2 * i64x2` | scalar expansion | scalar expansion (NEON has no `.2d` multiply) | scalar expansion |
 
+Operators never widen implicitly, so a widening multiply is spelled as two lane
+casts and a multiply: `a::i32x4 * b::i32x4` for `a, b: i16x4`. When both operands
+are extensions of the same narrower vector type, with the same signedness, and
+the whole product fits one 128-bit register, the backend emits the target's
+widening multiply for that cell:
+
+| operands | x86_64 (SSE2) | aarch64 (NEON) | riscv64 (no vector unit) |
+|---|---|---|---|
+| `i8x8` / `u8x8` → 16-bit lanes | extend, then multiply | `smull` / `umull .8b` | extend, then multiply |
+| `i16x4` / `u16x4` → 32-bit lanes | `pmullw` + `pmulhw` / `pmulhuw` | `smull` / `umull .4h` | extend, then multiply |
+| `i32x2` → `i64x2` | extend, then multiply (`pmuldq` is SSE4.1) | `smull .2s` | extend, then multiply |
+| `u32x2` → `u64x2` | `pmuludq` | `umull .2s` | extend, then multiply |
+
+A wider product, such as `i16x8` → `i32x8`, is a 256-bit value and keeps the
+extend-then-multiply path. Either path gives the same lanes.
+
 A project that cannot afford a scalar expansion sets `simd = "require"` in its
 profile (see [manifest.md](manifest.md)), which turns the shortfall into a
 build error naming the operation, its lane width, the function and the target.
@@ -249,7 +265,7 @@ unsigned integer of the input's lane width: `f32x4` / `i32x4` / `u32x4` → `u32
 not an operator; it is the library idiom `(mask & a) | (~mask & b)` over matching
 integer lanes (the tier-3 simd library, #2021).
 
-```mach
+```mach fragment
 val a: f32x4 = f32x4{1.0, 2.0, 3.0, 4.0};
 val b: f32x4 = f32x4{4.0, 3.0, 2.0, 1.0};
 val sum:  f32x4 = a + b;       # lane-wise -> {5.0, 5.0, 5.0, 5.0}

@@ -10,8 +10,12 @@ test/
   cases/<group>/<case>.mach     one codegen case, target-independent
   ref/<group>/<case>.c          its C reference
   golden/<target>/<g>/<c>.dis   blessed external-decoder text
-  golden/<target>/SKIPS         cases that target cannot serve, one per line
+  golden/<target>/ONLY          the cases that column serves, when not all of them
+  golden/<target>/SKIPS         cases that target cannot build, one per line
+  golden/<target>/NORUN         cases it builds and diffs but whose differential is not run yet
   lib/fold.mach, lib/corpus.h   the checksum fold both sides use
+  lib/start_<target>.mach       the process entry a direct target's run bin reports through
+  lib/elf_loadable.py           re-lays a freestanding ELF so qemu-user can map it
   link/cases/<name>/            one link case: a project, case.conf, expect*.txt
   link/check/                   the shared image readers
   fuzz/corpus/                  inputs replayed by the unit suite (see fuzz/README.md)
@@ -24,10 +28,12 @@ test/
 bash test/run.sh                          # every golden, plus the differential this host can execute
 bash test/run.sh --target x86_64-linux    # one target (repeatable)
 bash test/run.sh --case bits/logic_u32    # one case (repeatable)
-bash test/run.sh --qemu                   # also execute riscv64-linux under qemu-riscv64
+bash test/run.sh --qemu                   # also execute riscv64-linux, riscv64zkt-linux and riscv32 under qemu-user
 bash test/run.sh --dwarf                  # also build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
 bash test/run.sh --link [--qemu]          # the link cases instead of the corpus (--case <name> selects one)
 bash test/run.sh --incremental            # warm rebuilds of the compiler and a manifest fixture match clean builds
+bash test/run.sh --docs [--case <page>]   # the mach code blocks of doc/language compile, and the ones with a main run
+bash test/run.sh --docs --target <t>      # the same blocks compiled for one other hosted target, run only natively
 bash test/run.sh --bless [...]            # write the goldens or expect files instead of diffing, print the diff
 ```
 
@@ -42,6 +48,28 @@ against the golden. On a target the host executes it also builds at O0 and O2,
 runs both, and compares the checksums with the C reference built by `cc` at
 `-O0`, `-O2` and under UBSan, which must agree among themselves first. The tool
 versions the goldens were blessed with are stated at the top of `run.sh`.
+
+`--qemu` adds the targets no host runs natively: `riscv64-linux` under
+`qemu-riscv64` and the freestanding `riscv32` under `qemu-riscv32`. A riscv32
+case's own artifact is a static archive, so the driver also builds a run bin per
+case whose entry is `lib/start_riscv32.mach` (reads `argc` at `_start`, prints the
+checksum through raw linux syscalls) and re-lays the freestanding image with
+`lib/elf_loadable.py` into one `PT_LOAD` at file offset 0, which is the only shape
+qemu-user's loader maps. Every byte the program sees is the linker's. A missing
+emulator is announced and its column runs golden only. qemu is compute evidence,
+never ABI evidence.
+
+A target has three case lists, each `case reason` per line, a glob allowed, with
+`#` comments. `ONLY`, when present, names the cases the column serves and no
+other; a case outside it is a skip and no claim about it is made.
+`SKIPS` names the cases the target cannot build at all: nothing is built, decoded
+or run for them. `NORUN` names the cases that build and whose golden is diffed,
+but whose differential disagrees with the reference today; the disagreement is
+not a failure, they count as passes, and the run reports how many were golden
+only. Each `NORUN` line is a compiler defect that names its issue and is deleted
+by the change that fixes it. Neither `SKIPS` nor `NORUN` is trusted: a `SKIPS` case is still
+built and fails the run if it builds, and a `NORUN` case still runs and fails the
+run if it agrees with the reference, so a stale line cannot outlive its defect.
 
 ## The case contract
 
@@ -85,8 +113,39 @@ per lane.
    checksums agree (build failures and disagreements print as `FAIL` lines).
 3. `bash test/run.sh --bless --case <group>/<name>` and read every golden it
    writes. A golden you have not read is not a golden.
-4. A target that cannot serve the case gets a line in `golden/<target>/SKIPS`:
-   the case name, then the reason.
+4. A target that cannot build the case gets a line in `golden/<target>/SKIPS`:
+   the case name, then the reason. One that builds it but computes the wrong
+   checksum gets a line in `golden/<target>/NORUN` instead, so the golden still
+   carries the column while the defect is open.
+
+The `riscv64zkt-linux` column is riscv64-linux with the Zkt extension selected,
+the one corpus target that admits a secret multiply. It serves the `ct` group
+only, which its `ONLY` states.
+
+## Doc blocks
+
+`--docs` reads every `.md` page of `doc/language` (or of `DOCS`, when set) and
+takes each fenced block whose info string starts with `mach`. The fence line says
+what the block is:
+
+| fence | the block |
+|---|---|
+| ```` ```mach ```` | compiles, and when it declares `#[symbol("main")]` it runs and exits 0 |
+| ```` ```mach fragment ```` | is not compiled: a grammar sketch, a statement out of context, a body elided with `...`, or code that builds for one target only |
+| ```` ```mach error <text> ```` | fails to compile, and the compiler's output contains `<text>` verbatim |
+
+The expected text of an `error` block is the rest of the fence line and is
+required. Pick a stable part of the first diagnostic, not the file position.
+
+Each block becomes its own project with `[project] id = "example"`, one target
+(the host, or the one `--target` names), one debug profile and the checkout's `dep/std`. A block with a main is
+a `bin` artifact, any other block a `static` one, so an unused private function
+is still checked. A block that shows several files marks each with a line
+`# file: src/<path>.mach`, and the file named `root.mach` is the entry, or the last
+file when none is. Lines before the first marker belong to `root.mach`.
+
+A fragment is a statement of fact, so annotate a block only when that is what it
+is. An example that stopped compiling is a doc bug to fix, not a block to mark.
 
 ## Link cases
 

@@ -56,6 +56,7 @@ use mach.lang.intern;
 use mach.lang.manifest;
 use mach.lang.me.pipeline;
 use mach.lang.query;
+use mach.lang.retention;
 use mach.lang.session;
 use mach.lang.source;
 use mach.lang.target;
@@ -100,6 +101,12 @@ rec ProjKey {
     include_deps:   bool;
 }
 
+# the retainer a project root's modules are held under while an open buffer belongs to the root
+rec RootRetainer {
+    root: str;
+    id:   retention.RetainerId;
+}
+
 # one serial facade over a borrowed session, with compact open-buffer slots
 pub rec EditorSession {
     s:                 *session.Session;
@@ -123,6 +130,10 @@ pub rec EditorSession {
     proj_roots:      *intern.StrId;
     proj_root_count: u32;
     proj_root_cap:   u32;
+
+    root_retainers: Vector[RootRetainer];
+    build_retainer: retention.RetainerId;
+    has_build:      bool;
 }
 
 pub def AnalysisPhase: driver.FrontendPhase;
@@ -551,6 +562,9 @@ pub fun init(s: *session.Session) EditorSession {
     es.proj_roots        = nil;
     es.proj_root_count   = 0;
     es.proj_root_cap     = 0;
+    es.root_retainers    = vector.init[RootRetainer](s.alloc);
+    es.build_retainer    = retention.RETAINER_SESSION;
+    es.has_build         = false;
     ret es;
 }
 
@@ -578,6 +592,12 @@ fun destroy(es: *EditorSession) {
     es.proj_roots      = nil;
     es.proj_root_count = 0;
     es.proj_root_cap   = 0;
+    var i: usize = 0;
+    for (i < es.root_retainers.len) {
+        str_free(es.alloc, es.root_retainers.data[i].root);
+        i = i + 1;
+    }
+    vector.dnit[RootRetainer](?es.root_retainers);
 }
 
 # register a buffer's text under a path and return its FileId
@@ -724,7 +744,8 @@ fun retire_buffers(es: *EditorSession, fid: source.FileId, all: bool) err[fail.F
     }
     es.proj_root_count = 0;
     es.view_generation = es.view_generation + 1;
-    ret err[fail.Fail].ok{};
+    if (sel commit_retirement_r.err) { ret commit_retirement_r; }
+    ret release_roots(es, false);
 }
 
 # close an open buffer: its overlay, cached dependent products and source payload go;
@@ -753,6 +774,9 @@ pub fun dnit(es: *EditorSession) err[fail.Fail] {
     if (es == nil) { ret err[fail.Fail].ok{}; }
     val retired: err[fail.Fail] = retire_buffers(es, source.FILE_NIL, true);
     if (sel retired.err) { ret retired; }
+    proj_teardown(es);
+    val released: err[fail.Fail] = release_roots(es, true);
+    if (sel released.err) { ret released; }
     destroy(es);
     ret err[fail.Fail].ok{};
 }
@@ -1044,10 +1068,22 @@ pub fun build(es: *EditorSession, req: *request.BuildRequest) res[outcome.BuildO
         val f: outcome.Fail = fail_owned(es, outcome.internal("failed to initialise allocator"));
         ret res[outcome.BuildOutcome, outcome.Fail].err{f};
     }
-    val prior_build: *A.Allocator = s.build_alloc;
-    s.build_alloc = ?al;
+    if (!es.has_build) {
+        val opened: res[retention.RetainerId, fail.Fail] = retention.open(?s.retention);
+        if (sel opened.err) {
+            arena.dnit(?ar);
+            ret res[outcome.BuildOutcome, outcome.Fail].err{fail_owned(es, outcome.from_fail(opened.err))};
+        }
+        es.build_retainer = opened.ok;
+        es.has_build      = true;
+    }
+    val prior_build:    *A.Allocator         = s.build_alloc;
+    val prior_retainer: retention.RetainerId = s.retention.active;
+    s.build_alloc      = ?al;
+    s.retention.active = es.build_retainer;
     fin {
-        s.build_alloc = prior_build;
+        s.build_alloc      = prior_build;
+        s.retention.active = prior_retainer;
         arena.dnit(?ar);
     }
 
@@ -1332,6 +1368,74 @@ fun proj_teardown(es: *EditorSession) {
     es.proj_loaded = false;
 }
 
+# the retainer a root's analyses record under, opened the first time the root loads
+fun root_retainer(es: *EditorSession, root: str) res[retention.RetainerId, fail.Fail] {
+    var i: usize = 0;
+    for (i < es.root_retainers.len) {
+        if (str_equals(es.root_retainers.data[i].root, root)) { ret res[retention.RetainerId, fail.Fail].ok{es.root_retainers.data[i].id}; }
+        i = i + 1;
+    }
+    val reserved: res[usize, A.Error] = vector.reserve[RootRetainer](?es.root_retainers, 1);
+    if (sel reserved.err) { ret res[retention.RetainerId, fail.Fail].err{fail.refused(reserved.err)}; }
+    val owned: res[str, string.StrError] = str_copy(es.alloc, root);
+    if (sel owned.err) { ret res[retention.RetainerId, fail.Fail].err{fail.str_refused(owned.err)}; }
+    val opened: res[retention.RetainerId, fail.Fail] = retention.open(?es.s.retention);
+    if (sel opened.err) {
+        str_free(es.alloc, owned.ok);
+        ret opened;
+    }
+    val added: res[usize, A.Error] = vector.push[RootRetainer](?es.root_retainers, RootRetainer{root: owned.ok, id: opened.ok});
+    if (sel added.err) {
+        str_free(es.alloc, owned.ok);
+        ret res[retention.RetainerId, fail.Fail].err{fail.refused(added.err)};
+    }
+    ret opened;
+}
+
+fun root_has_buffer(es: *EditorSession, root: str) bool {
+    var i: u32 = 0;
+    for (i < es.buf_len) {
+        if (es.buffers[i].in_use) {
+            val file: opt[*source.SourceFile] = source.get(?es.s.sources, es.buffers[i].file_id);
+            if (sel file.none) { ret true; }
+            val owner: res[opt[str], fail.Fail] = discover_project_root(es.alloc, file.some.path);
+            # a root that cannot be told apart from this buffer's stays held
+            if (sel owner.err) { ret true; }
+            if (sel owner.ok.some) {
+                val same: bool = str_equals(owner.ok.some, root);
+                str_free(es.alloc, owner.ok.some);
+                if (same) { ret true; }
+            }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the session stops holding the modules of every root no open buffer belongs to, or of every root and
+# the editor's builds when the editor goes away, and retires what nothing else holds
+fun release_roots(es: *EditorSession, all: bool) err[fail.Fail] {
+    var i: usize = 0;
+    for (i < es.root_retainers.len) {
+        val entry: RootRetainer = es.root_retainers.data[i];
+        if (!all && root_has_buffer(es, entry.root)) {
+            i = i + 1;
+            cnt;
+        }
+        val released: err[fail.Fail] = retention.release(?es.s.retention, entry.id);
+        if (sel released.err) { ret released; }
+        str_free(es.alloc, entry.root);
+        es.root_retainers.data[i] = es.root_retainers.data[es.root_retainers.len - 1];
+        es.root_retainers.len     = es.root_retainers.len - 1;
+    }
+    if (all && es.has_build) {
+        val released: err[fail.Fail] = retention.release(?es.s.retention, es.build_retainer);
+        if (sel released.err) { ret released; }
+        es.has_build = false;
+    }
+    ret retention.retire(?es.s.retention, ?es.s.queries);
+}
+
 # the buffer's project could not be loaded before its frontend ran (an
 # unreadable manifest, a refused load): the failure is recorded for the
 # analysis envelope and the buffer is analyzed standalone, as one outside
@@ -1476,6 +1580,12 @@ fun proj_ensure(es: *EditorSession, fid: source.FileId) res[opt[*project.ModuleE
         have_manifest = true;
     }
 
+    val holder: res[retention.RetainerId, fail.Fail] = root_retainer(es, root);
+    if (sel holder.err) {
+        str_free(es.alloc, root);
+        ret res[opt[*project.ModuleEntry], fail.Fail].err{holder.err};
+    }
+
     proj_teardown(es);
 
     val make_r: err[A.Error] = page.make(?es.proj_backing);
@@ -1501,8 +1611,11 @@ fun proj_ensure(es: *EditorSession, fid: source.FileId) res[opt[*project.ModuleE
     var req: request.BuildRequest = want_req;
     req.project_root = root;
 
+    val prior_retainer: retention.RetainerId = es.s.retention.active;
+    es.s.retention.active = holder.ok;
     val ap_r: res[project.Project, outcome.Fail] = driver.analyze_project_tolerant(es.s, ?m, ?req, es.proj_roots, es.proj_root_count, want_phase);
-    es.s.build_alloc = prior_build;
+    es.s.build_alloc      = prior_build;
+    es.s.retention.active = prior_retainer;
 
     if (sel ap_r.err) {
         arena.dnit(?es.proj_arena);
@@ -1732,6 +1845,7 @@ fun ctx_seed(es: *EditorSession, b: *Buffer) err[fail.Fail] {
     comptime.set_target_defs(?b.ctx, selected.isa.defs);
     comptime.set_va_list(?b.ctx, selected.va_list_size, selected.va_list_align);
     comptime.set_ct_mul(?b.ctx, target.ct_mul_admitted(selected));
+    comptime.set_extensions(?b.ctx, isa.extension_view(?selected.model));
     b.context_ready = true;
     ret err[fail.Fail].ok{};
 }
@@ -6908,5 +7022,161 @@ test "mach.lang.editor.tag:dependency_case_list_edit_and_revert_replay_without_s
     }
     if (counts[0] != 2 || counts[1] != 3 || counts[2] != 2) { ret 7; }
     if (widths[0] != 1 || widths[1] != 2 || widths[2] != 1) { ret 8; }
+    ret 0;
+}
+
+fun t_owned(s: *session.Session, fqn: str) u32 {
+    val stable: session.StableModuleId = t_stable_of(s, fqn);
+    if (stable == session.STABLE_MODULE_NIL) { ret 0; }
+    ret query.owned_len(?s.queries, query.KEY_MODULE, stable::u32);
+}
+
+# a project under its own root whose main imports `only`, opened and analyzed
+fun t_root_analyzed(alloc: *A.Allocator, es: *EditorSession, only: str, fid: *source.FileId) res[str, fail.Fail] {
+    var names: [2]str;
+    names[0] = "main.mach";
+    names[1] = "";
+    var texts: [2]str;
+    texts[1] = "pub fun f() i32 { ret 1; }\n";
+    val named: res[str, string.StrError] = str_join(alloc, only, ".mach");
+    if (sel named.err) { ret res[str, fail.Fail].err{fail.str_refused(named.err)}; }
+    names[1] = named.ok;
+    val main: res[str, string.StrError] = str_join(alloc, "use edbuild.", only, ";\nfun main() i32 { ret ", only, ".f(); }\n");
+    if (sel main.err) { ret res[str, fail.Fail].err{fail.str_refused(main.err)}; }
+    texts[0] = main.ok;
+    val root_r: res[str, fail.Fail] = t_scaffold(alloc, ?names[0], ?texts[0], 2);
+    if (sel root_r.err) { ret root_r; }
+    val path: res[str, string.StrError] = str_join(alloc, root_r.ok, "/src/main.mach");
+    if (sel path.err) { ret res[str, fail.Fail].err{fail.str_refused(path.err)}; }
+    val opened: res[source.FileId, fail.Fail] = open(es, path.ok, texts[0]);
+    if (sel opened.err) { ret res[str, fail.Fail].err{opened.err}; }
+    @fid = opened.ok;
+    val analyzed: res[*context.SemaResult, fail.Fail] = analyze_buffer(es, opened.ok);
+    if (sel analyzed.err) { ret res[str, fail.Fail].err{analyzed.err}; }
+    ret root_r;
+}
+
+test "mach.lang.editor.retention:two_roots_keep_each_other_and_a_closed_or_torn_down_root_lets_go" {
+    var alloc:       A.Allocator;
+    val res_session: res[session.Session, fail.Fail] = t_session(?alloc);
+    if (sel res_session.err) { ret 1; }
+    var s:  session.Session = res_session.ok;
+    var es: EditorSession   = init(?s);
+    fin { session.dnit(?s); }
+    var fid_a:  source.FileId       = source.FILE_NIL;
+    var fid_b:  source.FileId       = source.FILE_NIL;
+    val root_a: res[str, fail.Fail] = t_root_analyzed(?alloc, ?es, "aonly", ?fid_a);
+    if (sel root_a.err) {
+        t_dnit(?es);
+        ret 2;
+    }
+    fin { fs.remove_all(?alloc, root_a.ok); }
+    val root_b: res[str, fail.Fail] = t_root_analyzed(?alloc, ?es, "bonly", ?fid_b);
+    if (sel root_b.err) {
+        t_dnit(?es);
+        ret 3;
+    }
+    fin { fs.remove_all(?alloc, root_b.ok); }
+
+    var bad: i32 = 0;
+    # analyzing the second root leaves the first root's modules in place
+    if (t_owned(?s, "edbuild.aonly") == 0 || t_owned(?s, "edbuild.bonly") == 0) {
+        t_dnit(?es);
+        ret 4;
+    }
+    # and going back to the first root finds them
+    val back: res[*context.SemaResult, fail.Fail] = analyze_buffer(?es, fid_a);
+    if (sel back.err)                                                           { bad = 5; }
+    if (t_owned(?s, "edbuild.aonly") == 0 || t_owned(?s, "edbuild.bonly") == 0) { bad = 6; }
+    if (bad != 0) {
+        t_dnit(?es);
+        ret bad;
+    }
+
+    # closing the first root's only buffer lets its own module go, and the shared main stays with the second
+    val closed: res[bool, fail.Fail] = close(?es, fid_a);
+    if (!(sel closed.ok && closed.ok))     { bad = 7; }
+    or (t_owned(?s, "edbuild.aonly") != 0) { bad = 8; }
+    or (t_owned(?s, "edbuild.bonly") == 0 || !retention.holds(?s.retention, es.root_retainers.data[0].id,
+        t_stable_of(?s, "edbuild.main"))) { bad = 9; }
+    or (es.root_retainers.len != 1) { bad = 10; }
+    if (bad != 0) {
+        t_dnit(?es);
+        ret bad;
+    }
+
+    # tearing the editor down lets go of every root it still held, while the session lives on
+    val torn: err[fail.Fail] = dnit(?es);
+    if (sel torn.err)                                                          { ret 11; }
+    if (t_owned(?s, "edbuild.bonly") != 0 || t_owned(?s, "edbuild.main") != 0) { ret 12; }
+    if (retention.held_count(?s.retention) != 0)                               { ret 13; }
+    ret 0;
+}
+
+fun t_plan_build(es: *EditorSession, rq: *request.BuildRequest) i32 {
+    val built: res[outcome.BuildOutcome, outcome.Fail] = build(es, rq);
+    if (sel built.err) {
+        var f: outcome.Fail = built.err;
+        fail_dnit(es, ?f);
+        ret -1;
+    }
+    var bo:       outcome.BuildOutcome = built.ok;
+    val severity: i32                  = bo.severity::i32;
+    outcome.outcome_dnit(?bo);
+    ret severity;
+}
+
+test "mach.lang.editor.retention:a_plan_that_fails_partway_keeps_what_its_last_whole_plan_held" {
+    var alloc:       A.Allocator;
+    val res_session: res[session.Session, fail.Fail] = t_session(?alloc);
+    if (sel res_session.err) { ret 1; }
+    var s:  session.Session = res_session.ok;
+    var es: EditorSession   = init(?s);
+    var up: bool            = true;
+    fin {
+        if (up) { t_dnit(?es); }
+        session.dnit(?s);
+    }
+    var names:   [2]str              = [2]str{"main.mach", "x.mach"};
+    var texts:   [2]str              = [2]str{"use edbuild.x;\nfun main() i32 { ret x.f(); }\n", "pub fun f() i32 { ret 1; }\n"};
+    val targets: str                 = "[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[target.win]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\n";
+    val root_r:  res[str, fail.Fail] = t_scaffold_with(?alloc, T_MANIFEST_RANGE, targets, ?names[0], ?texts[0], 2);
+    if (sel root_r.err) { ret 2; }
+    val root: str = root_r.ok;
+    fin { fs.remove_all(?alloc, root); }
+    val main_r: res[str, string.StrError] = str_join(?alloc, root, "/src/main.mach");
+    if (sel main_r.err) { ret 3; }
+    val main_path: str = main_r.ok;
+
+    var rq: request.BuildRequest = request.defaults();
+    rq.project_root = root;
+    rq.all_targets  = true;
+    rq.goal         = request.GOAL_CHECK;
+
+    if (t_plan_build(?es, ?rq) != outcome.BUILD_OK::i32) { ret 4; }
+    if (!es.has_build || t_owned(?s, "edbuild.x") == 0)  { ret 5; }
+
+    # one target's unit fails after a load that no longer reaches x: the plan is unfinished, so x stays
+    val split: str             = "$if ($mach.build.os == $mach.os.windows) { fun main() i32 { ret nope(); } } $or { fun main() i32 { ret 0; } }\n";
+    val wrote: err[fs.FsError] = fs.write_bytes(main_path, split, str_len(split), 420);
+    if (sel wrote.err) { ret 6; }
+    val partial: i32 = t_plan_build(?es, ?rq);
+    if (partial == -1 || partial == outcome.BUILD_OK::i32)                                                                { ret 7; }
+    if (t_owned(?s, "edbuild.x") == 0 || !retention.holds(?s.retention, es.build_retainer, t_stable_of(?s, "edbuild.x"))) { ret 8; }
+
+    # a whole plan that no longer reaches x lets it go
+    val plain: str             = "fun main() i32 { ret 0; }\n";
+    val fixed: err[fs.FsError] = fs.write_bytes(main_path, plain, str_len(plain), 420);
+    if (sel fixed.err)                                                                  { ret 9; }
+    if (t_plan_build(?es, ?rq) != outcome.BUILD_OK::i32)                                { ret 10; }
+    if (t_owned(?s, "edbuild.x") != 0)                                                  { ret 11; }
+    if (retention.holds(?s.retention, es.build_retainer, t_stable_of(?s, "edbuild.x"))) { ret 12; }
+
+    # the editor's builds let go of what they held when the editor goes away
+    if (t_owned(?s, "edbuild.main") == 0) { ret 13; }
+    up = false;
+    val torn: err[fail.Fail] = dnit(?es);
+    if (sel torn.err)                                                                { ret 14; }
+    if (t_owned(?s, "edbuild.main") != 0 || retention.held_count(?s.retention) != 0) { ret 15; }
     ret 0;
 }
