@@ -19,8 +19,8 @@
 #   --target <t>   one target (repeatable); default every target with a golden dir
 #   --case <g/n>   one case (repeatable)
 #   --bless        write the goldens instead of diffing them, print the diff
-#   --qemu         execute riscv64-linux and riscv32 under qemu-user (a missing
-#                  emulator is announced and its target stays golden only)
+#   --qemu         execute riscv64-linux, riscv64zkt-linux and riscv32 under qemu-user
+#                  (a missing emulator is announced and its target stays golden only)
 #   --link         run the link cases (test/link/cases) instead of the corpus
 #   --dwarf        build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
 #   --incremental  warm rebuilds of this compiler and of a manifest fixture match clean builds
@@ -56,14 +56,15 @@ cflags_ubsan="-std=c11 -O0 -ffp-contract=off -fsanitize=undefined -fno-sanitize-
 # target with one also builds a run bin from test/lib/start_<name>.mach, re-laid
 # by test/lib/elf_loadable.py, since qemu-user cannot map a freestanding image.
 targets_all='
-x86_64-linux    x86_64      linux        sysv64   -    bin     hosted  objdump    -
-aarch64-linux   aarch64     linux        aapcs64  -    bin     hosted  objdump    -
-riscv64-linux   riscv64     linux        lp64d    -    bin     hosted  objdump    qemu-riscv64
-x86_64-windows  x86_64      windows      win64    -    bin     hosted  objdump    -
-x86_64-darwin   x86_64      darwin       sysv64   -    bin     hosted  objdump    -
-aarch64-darwin  aarch64     darwin       aapcs64  -    bin     hosted  objdump    -
-spirv           spirv       freestanding spirv    -    bin     direct  spirv-dis  -
-riscv32         rv32imafdc  freestanding ilp32d   elf  static  direct  objdump    qemu-riscv32
+x86_64-linux      x86_64      linux         sysv64   -    bin     hosted  objdump    -
+aarch64-linux     aarch64     linux         aapcs64  -    bin     hosted  objdump    -
+riscv64-linux     riscv64     linux         lp64d    -    bin     hosted  objdump    qemu-riscv64
+riscv64zkt-linux  rv64gc_zkt  linux         lp64d    -    bin     hosted  objdump    qemu-riscv64
+x86_64-windows    x86_64      windows       win64    -    bin     hosted  objdump    -
+x86_64-darwin     x86_64      darwin        sysv64   -    bin     hosted  objdump    -
+aarch64-darwin    aarch64     darwin        aapcs64  -    bin     hosted  objdump    -
+spirv             spirv       freestanding  spirv    -    bin     direct  spirv-dis  -
+riscv32           rv32imafdc  freestanding  ilp32d   elf  static  direct  objdump    qemu-riscv32
 '
 # where a run bin is based: above the host's mmap floor with a page for its headers
 run_base=0x20000
@@ -151,6 +152,8 @@ object_format() {
 # engine <target>: "" for the host itself, the qemu command, or "-" when nothing here
 # runs it. qemu serves only the targets with no native runner: it is compute
 # evidence, never ABI evidence, so aarch64 is proven on real silicon.
+# riscv64zkt-linux selects Zkt, whose only effect on codegen is admitting the
+# secret multiply, so qemu is compute evidence for that column too.
 engine() {
     isa=$(target_field "$1" 2); os=$(target_field "$1" 3); q=$(target_field "$1" 9)
     if [ "$os" = "$host_os" ] && [ "$isa" = "$host_isa" ]; then echo ""; return; fi
@@ -394,14 +397,18 @@ disassemble() {
 }
 
 # reference <case>: the C answer, built and run once per case at O0, O2 and ubsan;
-# the three must agree before either is compared with mach
+# the three must agree before either is compared with mach. the answer is kept
+# until the reference or the shared header is edited, so a run never compares
+# mach against a stale reference
 reference() {
     c=$1
     ans=$out/ref/$c.ans
-    [ -f "$ans" ] && { cat "$ans"; return 0; }
-    mkdir -p "$out/ref/${c%/*}"
     src=$here/ref/$c.c
     [ -f "$src" ] || { echo "no C reference at $src" >&2; return 1; }
+    if [ -f "$ans" ] && [ ! "$src" -nt "$ans" ] && [ ! "$here/lib/corpus.h" -nt "$ans" ]; then
+        cat "$ans"; return 0
+    fi
+    mkdir -p "$out/ref/${c%/*}"
     modes="O0 O2 ubsan"
     [ "$host_os" = windows ] && modes="O0 O2"
     got=

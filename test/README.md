@@ -27,7 +27,7 @@ test/
 bash test/run.sh                          # every golden, plus the differential this host can execute
 bash test/run.sh --target x86_64-linux    # one target (repeatable)
 bash test/run.sh --case bits/logic_u32    # one case (repeatable)
-bash test/run.sh --qemu                   # also execute riscv64-linux and riscv32 under qemu-user
+bash test/run.sh --qemu                   # also execute riscv64-linux, riscv64zkt-linux and riscv32 under qemu-user
 bash test/run.sh --dwarf                  # also build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
 bash test/run.sh --link [--qemu]          # the link cases instead of the corpus (--case <name> selects one)
 bash test/run.sh --incremental            # warm rebuilds of the compiler and a manifest fixture match clean builds
@@ -114,6 +114,10 @@ per lane.
    the case name, then the reason. One that builds it but computes the wrong
    checksum gets a line in `golden/<target>/NORUN` instead, so the golden still
    carries the column while the defect is open.
+
+The `riscv64zkt-linux` column is riscv64-linux with the Zkt extension selected,
+the one corpus target that admits a secret multiply. It serves the `ct` group
+only, and its `SKIPS` names every other group by pattern.
 
 ## Doc blocks
 
