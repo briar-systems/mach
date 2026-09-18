@@ -42,6 +42,15 @@ rec FlatInstr {
     is_call: bool;
 }
 
+# one live run of a value: inclusive instruction positions
+rec Segment {
+    from: i64;
+    to:   i64;
+}
+
+# a value's lifetime is its segments, in position order and never touching;
+# start and end_pos are their hull, live_len the positions they cover, and
+# use_weight over live_len is the density the eviction choice compares
 rec LiveRange {
     vreg:         u32;
     start:        i64;
@@ -50,6 +59,9 @@ rec LiveRange {
     use_weight:   i64;
     reg_class:    u32;
     crosses_call: bool;
+    seg_start:    u32;
+    seg_count:    u32;
+    live_len:     i64;
 }
 
 rec BlockSpan {
@@ -69,7 +81,14 @@ rec CopyHint {
 rec AllocCtx {
     alloc:                *A.Allocator;
     interner:             *intern.Interner;
+    tgt:                  *target.Target;
     f:                    *mir.MirFunction;
+    holes:                bool;
+    segs:                 *Segment;
+    seg_count:            u32;
+    inactive:             *u32;
+    inactive_count:       u32;
+    cur_vreg:             u32;
     flat:                 *FlatInstr;
     flat_count:           u32;
     order:                *u32;
@@ -289,6 +308,15 @@ fun alloc_function(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) 
         ret sc;
     }
 
+    # checked while the flat index still names the scanned instructions
+    if (ctx.holes) {
+        val vi: err[fail.Fail] = verify_interference(?ctx);
+        if (sel vi.err) {
+            ctx_dnit(?ctx);
+            ret vi;
+        }
+    }
+
     val sp: err[fail.Fail] = spill_across_calls(tgt, ?ctx);
     if (sel sp.err) {
         ctx_dnit(?ctx);
@@ -333,7 +361,14 @@ fun alloc_function(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) 
 fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) err[fail.Fail] {
     ctx.alloc                = m.alloc;
     ctx.interner             = m.interner;
+    ctx.tgt                  = tgt;
     ctx.f                    = f;
+    ctx.holes                = isa.models_lifetime_holes(?tgt.model);
+    ctx.segs                 = nil;
+    ctx.seg_count            = 0;
+    ctx.inactive             = nil;
+    ctx.inactive_count       = 0;
+    ctx.cur_vreg             = mir.MIR_VREG_NIL.n;
     ctx.flat                 = nil;
     ctx.flat_count           = 0;
     ctx.order                = nil;
@@ -390,6 +425,9 @@ fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.Mir
         ctx.ranges[vi].use_weight   = 0;
         ctx.ranges[vi].reg_class    = f.vregs[vi].class;
         ctx.ranges[vi].crosses_call = false;
+        ctx.ranges[vi].seg_start    = 0;
+        ctx.ranges[vi].seg_count    = 0;
+        ctx.ranges[vi].live_len     = 0;
         vi                          = vi + 1;
     }
 
@@ -474,6 +512,13 @@ fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.Mir
         ret err[fail.Fail].err{fail.refused(ra.err)};
     }
     ctx.active = ra.ok;
+
+    val rin: res[*u32, A.Error] = A.allocate[u32](m.alloc, f.vreg_count::usize);
+    if (sel rin.err) {
+        ctx_dnit(ctx);
+        ret err[fail.Fail].err{fail.refused(rin.err)};
+    }
+    ctx.inactive = rin.ok;
 
     val rh: res[*CopyHint, A.Error] = A.allocate[CopyHint](m.alloc, f.vreg_count::usize);
     if (sel rh.err) {
@@ -575,6 +620,14 @@ fun ctx_dnit(ctx: *AllocCtx) {
     if (ctx.active != nil) {
         A.deallocate[u32](ctx.alloc, ctx.active, ctx.f.vreg_count::usize);
         ctx.active = nil;
+    }
+    if (ctx.inactive != nil) {
+        A.deallocate[u32](ctx.alloc, ctx.inactive, ctx.f.vreg_count::usize);
+        ctx.inactive = nil;
+    }
+    if (ctx.segs != nil && ctx.seg_count > 0) {
+        A.deallocate[Segment](ctx.alloc, ctx.segs, ctx.seg_count::usize);
+        ctx.segs = nil;
     }
     if (ctx.block_id_index != nil && ctx.block_id_index_cap > 0) {
         A.deallocate[u32](ctx.alloc, ctx.block_id_index, ctx.block_id_index_cap::usize);
@@ -1402,7 +1455,7 @@ fun maybe_tie_hint(ctx: *AllocCtx, mi: *mir.MirInstr, pos: u32, nv: u32) {
 fun tie_operand(ctx: *AllocCtx, d: *mir.MirOperand, op: *mir.MirOperand, pos: u32, nv: u32) u32 {
     if (op.kind != mir.MIR_OP_VREG)                        { ret RANGE_NIL; }
     if (op.vreg.n >= nv || mir.vreg_same(d.vreg, op.vreg)) { ret RANGE_NIL; }
-    if (ctx.ranges[op.vreg.n].end_pos != pos::i64)         { ret RANGE_NIL; }
+    if (!dies_at(ctx, op.vreg.n, pos::i64))                { ret RANGE_NIL; }
     ret op.vreg.n;
 }
 
@@ -1413,8 +1466,8 @@ fun maybe_sink_hint(ctx: *AllocCtx, mi: *mir.MirInstr, pos: u32, nv: u32) {
     if (s.vreg.n >= nv)                                         { ret; }
     if (mi.width < ctx.spill_width)                             { ret; }
     val sv: u32 = s.vreg.n;
-    if (ctx.hints[sv].sink_preg >= 0)       { ret; }
-    if (ctx.ranges[sv].end_pos != pos::i64) { ret; }
+    if (ctx.hints[sv].sink_preg >= 0) { ret; }
+    if (!dies_at(ctx, sv, pos::i64))  { ret; }
     ctx.hints[sv].sink_preg = mir.preg_regid(d.preg);
 }
 
@@ -1433,13 +1486,13 @@ fun maybe_reverse_hint(ctx: *AllocCtx, mi: *mir.MirInstr, pos: u32, nv: u32) {
 
     val p:  i64        = pos::i64;
     val dr: *LiveRange = ?ctx.ranges[dv];
-    val sr: *LiveRange = ?ctx.ranges[sv];
 
-    if (dr.start >= p || dr.end_pos < p)                               { ret; }
-    if (sr.end_pos != p || sr.start >= p || sr.start < 0)              { ret; }
-    if (ctx.flat[sr.start::u32].block != ctx.flat[pos].block)          { ret; }
-    if (reads_in_window(ctx, dv, sr.start, p))                         { ret; }
-    if (defines_by_clobbering(flat_instr(ctx, sr.start::u32), sv, dv)) { ret; }
+    if (dr.start >= p || dr.end_pos < p) { ret; }
+    val q: i64 = seg_from_ending_at(ctx, sv, p);
+    if (q < 0 || q >= p)                                        { ret; }
+    if (ctx.flat[q::u32].block != ctx.flat[pos].block)          { ret; }
+    if (reads_in_window(ctx, dv, q, p))                         { ret; }
+    if (defines_by_clobbering(flat_instr(ctx, q::u32), sv, dv)) { ret; }
 
     ctx.hints[sv].dst_vreg     = dv;
     ctx.hints[sv].dst_copy_pos = p;
@@ -1494,6 +1547,61 @@ rec LiveScratch {
     def_blocks: *u32;
     preds:      *u32;
     fill:       bool;
+    out_mark:   *u32;
+    live_in:    PairList;
+    live_out:   PairList;
+}
+
+# (block, register) pairs the propagation discovers, appended as it goes
+rec PairList {
+    blocks: *u32;
+    regs:   *u32;
+    count:  u32;
+    cap:    u32;
+}
+
+fun pair_list_init(l: *PairList) {
+    l.blocks = nil;
+    l.regs   = nil;
+    l.count  = 0;
+    l.cap    = 0;
+}
+
+fun pair_list_dnit(alloc: *A.Allocator, l: *PairList) {
+    if (l.blocks != nil && l.cap > 0) { A.deallocate[u32](alloc, l.blocks, l.cap::usize); }
+    if (l.regs != nil && l.cap > 0)   { A.deallocate[u32](alloc, l.regs, l.cap::usize); }
+    pair_list_init(l);
+}
+
+fun pair_push(alloc: *A.Allocator, l: *PairList, block: u32, reg: u32) err[fail.Fail] {
+    if (l.count >= l.cap) {
+        var new_cap: u32 = l.cap * 2;
+        if (new_cap < 64) { new_cap = 64; }
+        val rb: res[*u32, A.Error] = A.allocate[u32](alloc, new_cap::usize);
+        if (sel rb.err) { ret err[fail.Fail].err{fail.refused(rb.err)}; }
+        val rr: res[*u32, A.Error] = A.allocate[u32](alloc, new_cap::usize);
+        if (sel rr.err) {
+            A.deallocate[u32](alloc, rb.ok, new_cap::usize);
+            ret err[fail.Fail].err{fail.refused(rr.err)};
+        }
+        var i: u32 = 0;
+        for (i < l.count) {
+            rb.ok[i] = l.blocks[i];
+            rr.ok[i] = l.regs[i];
+            i        = i + 1;
+        }
+        if (l.cap > 0) {
+            A.deallocate[u32](alloc, l.blocks, l.cap::usize);
+            A.deallocate[u32](alloc, l.regs, l.cap::usize);
+        }
+        l.blocks = rb.ok;
+        l.regs   = rr.ok;
+        l.cap    = new_cap;
+    }
+    l.blocks[l.count] = block;
+    l.regs[l.count]   = reg;
+    l.count           = l.count + 1;
+    ret err[fail.Fail].ok{};
 }
 
 fun live_scratch_array(l: *LiveScratch, out: **u32, n: u32, value: u32) err[fail.Fail] {
@@ -1518,6 +1626,9 @@ fun live_scratch_release(l: *LiveScratch, arr: **u32, n: u32) {
 }
 
 fun live_scratch_dnit(l: *LiveScratch) {
+    pair_list_dnit(l.alloc, ?l.live_in);
+    pair_list_dnit(l.alloc, ?l.live_out);
+    live_scratch_release(l, ?l.out_mark, l.nb);
     live_scratch_release(l, ?l.preds, l.edge_count);
     live_scratch_release(l, ?l.def_blocks, l.def_count);
     live_scratch_release(l, ?l.use_blocks, l.use_count);
@@ -1550,8 +1661,16 @@ fun live_scratch_init(l: *LiveScratch, alloc: *A.Allocator, nb: u32, nv: u32) er
     l.def_blocks = nil;
     l.preds      = nil;
     l.fill       = false;
+    l.out_mark   = nil;
+    pair_list_init(?l.live_in);
+    pair_list_init(?l.live_out);
     val r0: err[fail.Fail] = live_scratch_array(l, ?l.use_start, nv + 1, 0);
     if (sel r0.err) { ret r0; }
+    val r8: err[fail.Fail] = live_scratch_array(l, ?l.out_mark, nb, RANGE_NIL);
+    if (sel r8.err) {
+        live_scratch_dnit(l);
+        ret r8;
+    }
     val r1: err[fail.Fail] = live_scratch_array(l, ?l.def_start, nv + 1, 0);
     if (sel r1.err) {
         live_scratch_dnit(l);
@@ -1724,14 +1843,38 @@ fun extend_liveness(ctx: *AllocCtx) err[fail.Fail] {
     restore_offsets(l.def_start, nv);
     restore_offsets(l.pred_start, nb);
 
-    propagate_liveness(ctx, ?l);
-    ret err[fail.Fail].ok{};
+    val pl: err[fail.Fail] = propagate_liveness(ctx, ?l);
+    if (sel pl.err) {
+        reset_ranges(ctx);
+        ret pl;
+    }
+    val bs: err[fail.Fail] = build_segments(ctx, ?l);
+    if (sel bs.err) { reset_ranges(ctx); }
+    ret bs;
+}
+
+# a refused liveness leaves the ranges as it found them
+fun reset_ranges(ctx: *AllocCtx) {
+    if (ctx.segs != nil && ctx.seg_count > 0) {
+        A.deallocate[Segment](ctx.alloc, ctx.segs, ctx.seg_count::usize);
+    }
+    ctx.segs      = nil;
+    ctx.seg_count = 0;
+    var i: u32 = 0;
+    for (i < ctx.f.vreg_count) {
+        ctx.ranges[i].start     = POS_MAX;
+        ctx.ranges[i].end_pos   = -1;
+        ctx.ranges[i].seg_start = 0;
+        ctx.ranges[i].seg_count = 0;
+        ctx.ranges[i].live_len  = 0;
+        i                       = i + 1;
+    }
 }
 
 # backward reachability per register: every block with an upward-exposed use
 # is live-in, every predecessor of a live-in block is live-out, and a
 # predecessor without a definition of the register is live-in in turn
-fun propagate_liveness(ctx: *AllocCtx, l: *LiveScratch) {
+fun propagate_liveness(ctx: *AllocCtx, l: *LiveScratch) err[fail.Fail] {
     var reg: u32 = 0;
     for (reg < l.nv) {
         val lr: *LiveRange = ?ctx.ranges[reg];
@@ -1749,6 +1892,8 @@ fun propagate_liveness(ctx: *AllocCtx, l: *LiveScratch) {
                 l.pending[count] = b;
                 count            = count + 1;
                 extend_range_for_block(lr, ctx.block_spans[b], true, false);
+                val pi: err[fail.Fail] = pair_push(l.alloc, ?l.live_in, b, reg);
+                if (sel pi.err) { ret pi; }
             }
             u = u + 1;
         }
@@ -1759,17 +1904,481 @@ fun propagate_liveness(ctx: *AllocCtx, l: *LiveScratch) {
             for (e < l.pred_start[b + 1]) {
                 val p: u32 = l.preds[e];
                 extend_range_for_block(lr, ctx.block_spans[p], false, true);
+                if (l.out_mark[p] != reg) {
+                    l.out_mark[p] = reg;
+                    val po: err[fail.Fail] = pair_push(l.alloc, ?l.live_out, p, reg);
+                    if (sel po.err) { ret po; }
+                }
                 if (l.def_of[p] != reg && l.visited[p] != reg) {
                     l.visited[p]     = reg;
                     l.pending[count] = p;
                     count            = count + 1;
                     extend_range_for_block(lr, ctx.block_spans[p], true, false);
+                    val pi: err[fail.Fail] = pair_push(l.alloc, ?l.live_in, p, reg);
+                    if (sel pi.err) { ret pi; }
                 }
                 e = e + 1;
             }
         }
         reg = reg + 1;
     }
+    ret err[fail.Fail].ok{};
+}
+
+# the segment walk: blocks in reverse layout, instructions backward, so each
+# value's segments come out in descending position and are stored from the
+# end of its slice; the same walk counts on the first pass and fills on the
+# second, and a segment that meets the one after it (a value read and
+# redefined by one instruction, or live across adjacent blocks) is merged
+rec SegBuild {
+    fill:      bool;
+    count:     *u32;
+    last_from: *i64;
+    cursor:    *u32;
+    end:       *u32;
+    cur_end:   *i64;
+}
+
+fun seg_emit(ctx: *AllocCtx, sb: *SegBuild, v: u32, from: i64, to: i64) {
+    if (!sb.fill) {
+        if (sb.last_from[v] != POS_MAX && to + 1 >= sb.last_from[v]) {
+            sb.last_from[v] = from;
+            ret;
+        }
+        sb.count[v + 1] = sb.count[v + 1] + 1;
+        sb.last_from[v] = from;
+        ret;
+    }
+    if (sb.cursor[v] < sb.end[v] && to + 1 >= ctx.segs[sb.cursor[v]].from) {
+        ctx.segs[sb.cursor[v]].from = from;
+        ret;
+    }
+    sb.cursor[v]                = sb.cursor[v] - 1;
+    ctx.segs[sb.cursor[v]].from = from;
+    ctx.segs[sb.cursor[v]].to   = to;
+}
+
+fun seg_read(ctx: *AllocCtx, sb: *SegBuild, v: u32, pos: i64) {
+    if (v >= ctx.f.vreg_count) { ret; }
+    if (sb.cur_end[v] < 0)     { sb.cur_end[v] = pos; }
+}
+
+fun seg_walk(ctx: *AllocCtx, sb: *SegBuild, in_start: *u32, in_regs: *u32, out_start: *u32, out_regs: *u32) {
+    val f:  *mir.MirFunction = ctx.f;
+    val nv: u32              = f.vreg_count;
+    var i:  u32              = 0;
+    for (i < nv) {
+        sb.cur_end[i] = -1;
+        i             = i + 1;
+    }
+    var bi: u32 = f.block_count;
+    for (bi > 0) {
+        bi = bi - 1;
+        val blk:  *mir.MirBlock = ?f.blocks[bi];
+        val span: BlockSpan     = ctx.block_spans[bi];
+        if (blk.instr_count == 0 || span.start < 0) { cnt; }
+        var o: u32 = out_start[bi];
+        for (o < out_start[bi + 1]) {
+            val v: u32 = out_regs[o];
+            if (sb.cur_end[v] < 0) { sb.cur_end[v] = span.end; }
+            o = o + 1;
+        }
+        var ii: u32 = blk.instr_count;
+        for (ii > 0) {
+            ii = ii - 1;
+            val pos:     i64           = span.start + ii::i64;
+            val mi:      *mir.MirInstr = ?blk.instrs[ii];
+            val has_def: bool          = instr_defines(mi);
+            if (has_def) {
+                val d: u32 = mi.operands[0].vreg.n;
+                if (d < nv) {
+                    # a definition nothing reads still holds its register
+                    # for the instruction that writes it
+                    if (sb.cur_end[d] < 0) { sb.cur_end[d] = pos; }
+                    seg_emit(ctx, sb, d, pos, sb.cur_end[d]);
+                    sb.cur_end[d] = -1;
+                }
+            }
+            var k: u32 = 0;
+            for (k < mi.operand_count) {
+                val op: *mir.MirOperand = ?mi.operands[k];
+                if (op.kind == mir.MIR_OP_VREG) {
+                    if (!(has_def && k == 0)) { seg_read(ctx, sb, op.vreg.n, pos); }
+                }
+                or (op.kind == mir.MIR_OP_MEM && !mir.vreg_is_nil(op.vreg)) {
+                    seg_read(ctx, sb, op.vreg.n, pos);
+                }
+                if (sel op.index.vreg) { seg_read(ctx, sb, op.index.vreg.n, pos); }
+                k = k + 1;
+            }
+        }
+        var n: u32 = in_start[bi];
+        for (n < in_start[bi + 1]) {
+            val v: u32 = in_regs[n];
+            if (sb.cur_end[v] >= 0) {
+                seg_emit(ctx, sb, v, span.start, sb.cur_end[v]);
+                sb.cur_end[v] = -1;
+            }
+            n = n + 1;
+        }
+    }
+}
+
+# the pairs bucketed per block, as offsets into one register array
+fun bucket_pairs(ctx: *AllocCtx, l: *PairList, nb: u32, start: **u32, regs: **u32) err[fail.Fail] {
+    val rs: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, (nb + 1)::usize);
+    if (sel rs.err) { ret err[fail.Fail].err{fail.refused(rs.err)}; }
+    val st: *u32 = rs.ok;
+    @start = st;
+    var i: u32 = 0;
+    for (i <= nb) {
+        st[i] = 0;
+        i     = i + 1;
+    }
+    var p: u32 = 0;
+    for (p < l.count) {
+        st[l.blocks[p] + 1] = st[l.blocks[p] + 1] + 1;
+        p                   = p + 1;
+    }
+    exclusive_offsets(st, nb);
+    @regs = nil;
+    if (l.count == 0) { ret err[fail.Fail].ok{}; }
+    val rr: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, l.count::usize);
+    if (sel rr.err) { ret err[fail.Fail].err{fail.refused(rr.err)}; }
+    val rg: *u32 = rr.ok;
+    @regs = rg;
+    p     = 0;
+    for (p < l.count) {
+        val b: u32 = l.blocks[p];
+        rg[st[b]] = l.regs[p];
+        st[b]     = st[b] + 1;
+        p         = p + 1;
+    }
+    restore_offsets(st, nb);
+    ret err[fail.Fail].ok{};
+}
+
+fun build_segments(ctx: *AllocCtx, l: *LiveScratch) err[fail.Fail] {
+    if (!ctx.holes) { ret build_hull_segments(ctx); }
+    val nb: u32 = ctx.f.block_count;
+    val nv: u32 = ctx.f.vreg_count;
+
+    var in_start:  *u32 = nil;
+    var in_regs:   *u32 = nil;
+    var out_start: *u32 = nil;
+    var out_regs:  *u32 = nil;
+    fin {
+        if (in_start != nil)  { A.deallocate[u32](ctx.alloc, in_start, (nb + 1)::usize); }
+        if (in_regs != nil)   { A.deallocate[u32](ctx.alloc, in_regs, l.live_in.count::usize); }
+        if (out_start != nil) { A.deallocate[u32](ctx.alloc, out_start, (nb + 1)::usize); }
+        if (out_regs != nil)  { A.deallocate[u32](ctx.alloc, out_regs, l.live_out.count::usize); }
+    }
+    val bi: err[fail.Fail] = bucket_pairs(ctx, ?l.live_in, nb, ?in_start, ?in_regs);
+    if (sel bi.err) { ret bi; }
+    val bo: err[fail.Fail] = bucket_pairs(ctx, ?l.live_out, nb, ?out_start, ?out_regs);
+    if (sel bo.err) { ret bo; }
+
+    var sb: SegBuild;
+    sb.fill      = false;
+    sb.count     = nil;
+    sb.last_from = nil;
+    sb.cursor    = nil;
+    sb.end       = nil;
+    sb.cur_end   = nil;
+    fin {
+        if (sb.count != nil)     { A.deallocate[u32](ctx.alloc, sb.count, (nv + 1)::usize); }
+        if (sb.last_from != nil) { A.deallocate[i64](ctx.alloc, sb.last_from, nv::usize); }
+        if (sb.cursor != nil)    { A.deallocate[u32](ctx.alloc, sb.cursor, nv::usize); }
+        if (sb.end != nil)       { A.deallocate[u32](ctx.alloc, sb.end, nv::usize); }
+        if (sb.cur_end != nil)   { A.deallocate[i64](ctx.alloc, sb.cur_end, nv::usize); }
+    }
+    val rc: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, (nv + 1)::usize);
+    if (sel rc.err) { ret err[fail.Fail].err{fail.refused(rc.err)}; }
+    sb.count = rc.ok;
+    val rl: res[*i64, A.Error] = A.allocate[i64](ctx.alloc, nv::usize);
+    if (sel rl.err) { ret err[fail.Fail].err{fail.refused(rl.err)}; }
+    sb.last_from = rl.ok;
+    val ru: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, nv::usize);
+    if (sel ru.err) { ret err[fail.Fail].err{fail.refused(ru.err)}; }
+    sb.cursor = ru.ok;
+    val re: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, nv::usize);
+    if (sel re.err) { ret err[fail.Fail].err{fail.refused(re.err)}; }
+    sb.end = re.ok;
+    val rce: res[*i64, A.Error] = A.allocate[i64](ctx.alloc, nv::usize);
+    if (sel rce.err) { ret err[fail.Fail].err{fail.refused(rce.err)}; }
+    sb.cur_end = rce.ok;
+
+    var i: u32 = 0;
+    for (i <= nv) {
+        sb.count[i] = 0;
+        i           = i + 1;
+    }
+    i = 0;
+    for (i < nv) {
+        sb.last_from[i] = POS_MAX;
+        i               = i + 1;
+    }
+    seg_walk(ctx, ?sb, in_start, in_regs, out_start, out_regs);
+    val total: u32 = exclusive_offsets(sb.count, nv);
+    if (total == 0) { ret err[fail.Fail].ok{}; }
+    val rs: res[*Segment, A.Error] = A.allocate[Segment](ctx.alloc, total::usize);
+    if (sel rs.err) { ret err[fail.Fail].err{fail.refused(rs.err)}; }
+    ctx.segs      = rs.ok;
+    ctx.seg_count = total;
+    i             = 0;
+    for (i < nv) {
+        sb.cursor[i] = sb.count[i + 1];
+        sb.end[i]    = sb.count[i + 1];
+        i            = i + 1;
+    }
+    sb.fill = true;
+    seg_walk(ctx, ?sb, in_start, in_regs, out_start, out_regs);
+
+    i = 0;
+    for (i < nv) {
+        val lr: *LiveRange = ?ctx.ranges[i];
+        if (sb.cursor[i] != sb.count[i]) {
+            ret err[fail.Fail].err{fail.message("regalloc: the segment fill did not match its count (internal compiler error)")};
+        }
+        lr.seg_start = sb.count[i];
+        lr.seg_count = sb.count[i + 1] - sb.count[i];
+        lr.live_len  = 0;
+        var k: u32 = 0;
+        for (k < lr.seg_count) {
+            val sg: *Segment = ?ctx.segs[lr.seg_start + k];
+            lr.live_len = lr.live_len + (sg.to - sg.from + 1);
+            k           = k + 1;
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# without holes every value is one segment, its hull
+fun build_hull_segments(ctx: *AllocCtx) err[fail.Fail] {
+    val nv:    u32 = ctx.f.vreg_count;
+    var total: u32 = 0;
+    var i:     u32 = 0;
+    for (i < nv) {
+        if (ctx.ranges[i].end_pos >= 0) { total = total + 1; }
+        i = i + 1;
+    }
+    if (total == 0) { ret err[fail.Fail].ok{}; }
+    val rs: res[*Segment, A.Error] = A.allocate[Segment](ctx.alloc, total::usize);
+    if (sel rs.err) { ret err[fail.Fail].err{fail.refused(rs.err)}; }
+    ctx.segs      = rs.ok;
+    ctx.seg_count = total;
+    var at: u32 = 0;
+    i = 0;
+    for (i < nv) {
+        val lr: *LiveRange = ?ctx.ranges[i];
+        if (lr.end_pos >= 0) {
+            ctx.segs[at].from = lr.start;
+            ctx.segs[at].to   = lr.end_pos;
+            lr.seg_start      = at;
+            lr.seg_count      = 1;
+            lr.live_len       = lr.end_pos - lr.start + 1;
+            at                = at + 1;
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun covers(ctx: *AllocCtx, lr: *LiveRange, pos: i64) bool {
+    var k: u32 = 0;
+    for (k < lr.seg_count) {
+        val sg: *Segment = ?ctx.segs[lr.seg_start + k];
+        if (sg.from <= pos && pos <= sg.to) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# the value v holds is not needed after pos: a segment ends there
+fun dies_at(ctx: *AllocCtx, v: u32, pos: i64) bool {
+    if (v >= ctx.f.vreg_count) { ret false; }
+    val lr: *LiveRange = ?ctx.ranges[v];
+    var k:  u32        = 0;
+    for (k < lr.seg_count) {
+        if (ctx.segs[lr.seg_start + k].to == pos) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+fun seg_from_ending_at(ctx: *AllocCtx, v: u32, pos: i64) i64 {
+    val lr: *LiveRange = ?ctx.ranges[v];
+    var k:  u32        = 0;
+    for (k < lr.seg_count) {
+        if (ctx.segs[lr.seg_start + k].to == pos) { ret ctx.segs[lr.seg_start + k].from; }
+        k = k + 1;
+    }
+    ret -1;
+}
+
+# a segment of `ending` may meet a segment of `starting` at pos and share its
+# register when the instruction there defines `starting` and reads `ending`
+# before it writes (#3647)
+fun handoff_ok(ctx: *AllocCtx, ending: u32, starting: u32, pos: i64) bool {
+    if (pos < 0 || pos::u32 >= ctx.flat_count) { ret false; }
+    val mi: *mir.MirInstr = flat_instr(ctx, pos::u32);
+    if (!instr_defines(mi))                          { ret false; }
+    if (mi.operands[0].vreg.n != starting)           { ret false; }
+    if (defines_by_clobbering(mi, starting, ending)) { ret false; }
+    ret true;
+}
+
+# whether the current interval may take a register some inactive interval
+# holds: only when the two never meet
+fun inactive_conflict(ctx: *AllocCtx, gp: bool, idx: u32) bool {
+    if (ctx.cur_vreg >= ctx.f.vreg_count) { ret false; }
+    val cur: *LiveRange = ?ctx.ranges[ctx.cur_vreg];
+    var i:   u32        = 0;
+    for (i < ctx.inactive_count) {
+        val y:  u32        = ctx.inactive[i];
+        val yr: *LiveRange = ?ctx.ranges[y];
+        if ((yr.reg_class == REG_CLASS_GP) == gp) {
+            val a: mir.PRegId = ctx.f.vregs[y].assigned;
+            if (!mir.preg_is_nil(a) && isa.regid_index(mir.preg_regid(a))::u32 == idx && intersects(ctx, cur, yr)) {
+                ret true;
+            }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# busy is what the active set holds; it is recomputed at every step so the
+# claims a pick makes before its assign and a hand-off's shared register
+# never drift from the set
+fun recompute_busy(ctx: *AllocCtx) {
+    var r: u32 = 0;
+    for (r < ctx.gp_count) {
+        ctx.gp_busy[r] = false;
+        r              = r + 1;
+    }
+    if (ctx.fp_busy != nil) {
+        var fi: u32 = 0;
+        for (fi < ctx.fp_count) {
+            ctx.fp_busy[fi] = false;
+            fi              = fi + 1;
+        }
+    }
+    var ai: u32 = 0;
+    for (ai < ctx.active_count) {
+        val v: u32        = ctx.active[ai];
+        val a: mir.PRegId = ctx.f.vregs[v].assigned;
+        if (!mir.preg_is_nil(a)) { mark_assigned_id(ctx, ctx.ranges[v].reg_class, a); }
+        ai = ai + 1;
+    }
+}
+
+# the sets at position s: an interval whose hull has passed is dropped, one
+# inside a hole waits in inactive, one inside a segment is active
+fun advance(ctx: *AllocCtx, s: i64) {
+    var write: u32 = 0;
+    var read:  u32 = 0;
+    for (read < ctx.active_count) {
+        val v:  u32        = ctx.active[read];
+        val lr: *LiveRange = ?ctx.ranges[v];
+        if (lr.end_pos < s) {}
+        or (covers(ctx, lr, s)) {
+            ctx.active[write] = v;
+            write             = write + 1;
+        }
+        or {
+            ctx.inactive[ctx.inactive_count] = v;
+            ctx.inactive_count               = ctx.inactive_count + 1;
+        }
+        read = read + 1;
+    }
+    ctx.active_count = write;
+    write            = 0;
+    read             = 0;
+    for (read < ctx.inactive_count) {
+        val v:  u32        = ctx.inactive[read];
+        val lr: *LiveRange = ?ctx.ranges[v];
+        if (lr.end_pos < s) {}
+        or (covers(ctx, lr, s)) {
+            ctx.active[ctx.active_count] = v;
+            ctx.active_count             = ctx.active_count + 1;
+        }
+        or {
+            ctx.inactive[write] = v;
+            write               = write + 1;
+        }
+        read = read + 1;
+    }
+    ctx.inactive_count = write;
+    recompute_busy(ctx);
+}
+
+fun remove_inactive(ctx: *AllocCtx, v: mir.VRegId) {
+    var write: u32 = 0;
+    var read:  u32 = 0;
+    for (read < ctx.inactive_count) {
+        if (ctx.inactive[read] != v.n) {
+            ctx.inactive[write] = ctx.inactive[read];
+            write               = write + 1;
+        }
+        read = read + 1;
+    }
+    ctx.inactive_count = write;
+}
+
+fun seg_overlaps_window(ctx: *AllocCtx, lr: *LiveRange, from: i64, to: i64) bool {
+    var k: u32 = 0;
+    for (k < lr.seg_count) {
+        val sg: *Segment = ?ctx.segs[lr.seg_start + k];
+        if (!(sg.to < from || sg.from > to)) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+fun seg_holds_point(ctx: *AllocCtx, lr: *LiveRange, pos: i64) bool {
+    var k: u32 = 0;
+    for (k < lr.seg_count) {
+        val sg: *Segment = ?ctx.segs[lr.seg_start + k];
+        if (sg.from <= pos && pos < sg.to) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# a's loop-weighted use density is below b's
+fun less_dense(a: *LiveRange, b: *LiveRange) bool {
+    ret a.use_weight * b.live_len < b.use_weight * a.live_len;
+}
+
+fun intersects(ctx: *AllocCtx, a: *LiveRange, b: *LiveRange) bool {
+    var i: u32 = 0;
+    var j: u32 = 0;
+    for (i < a.seg_count && j < b.seg_count) {
+        val sa: *Segment = ?ctx.segs[a.seg_start + i];
+        val sb: *Segment = ?ctx.segs[b.seg_start + j];
+        if (sa.to < sb.from) {
+            i = i + 1;
+            cnt;
+        }
+        if (sb.to < sa.from) {
+            j = j + 1;
+            cnt;
+        }
+        if (sa.to == sb.from && sa.from < sa.to) {
+            if (!handoff_ok(ctx, a.vreg, b.vreg, sa.to)) { ret true; }
+            i = i + 1;
+            cnt;
+        }
+        if (sb.to == sa.from && sb.from < sb.to) {
+            if (!handoff_ok(ctx, b.vreg, a.vreg, sb.to)) { ret true; }
+            j = j + 1;
+            cnt;
+        }
+        ret true;
+    }
+    ret false;
 }
 
 fun extend_range_for_block(lr: *LiveRange, span: BlockSpan, live_in: bool, live_out: bool) {
@@ -1835,10 +2444,11 @@ fun mark_call_crossing(ctx: *AllocCtx) err[fail.Fail] {
     var v: u32 = 0;
     for (v < ctx.f.vreg_count) {
         val lr: *LiveRange = ?ctx.ranges[v];
-        if (lr.end_pos >= 0) {
-            if (prefix[(lr.end_pos + 1)::u32] - prefix[lr.start::u32] > 0) {
-                lr.crosses_call = true;
-            }
+        var k:  u32        = 0;
+        for (k < lr.seg_count) {
+            val sg: *Segment = ?ctx.segs[lr.seg_start + k];
+            if (prefix[(sg.to + 1)::u32] - prefix[sg.from::u32] > 0) { lr.crosses_call = true; }
+            k = k + 1;
         }
         v = v + 1;
     }
@@ -1881,11 +2491,12 @@ fun linear_scan(tgt: *target.Target, ctx: *AllocCtx) err[fail.Fail] {
             cnt;
         }
 
-        expire_active(ctx, lr.start);
+        advance(ctx, lr.start);
         release_pins(ctx, lr.start);
 
         ctx.cur_start = lr.start;
         ctx.cur_end   = lr.end_pos;
+        ctx.cur_vreg  = v;
 
         var preg: i32 = -1;
         if (ctx.hints[v].src_vreg != mir.MIR_VREG_NIL.n || ctx.hints[v].src_preg >= 0) {
@@ -1896,7 +2507,17 @@ fun linear_scan(tgt: *target.Target, ctx: *AllocCtx) err[fail.Fail] {
         }
         if (preg < 0 && ctx.hints[v].dst_vreg != mir.MIR_VREG_NIL.n) {
             val rr: i32 = pick_target_hint(ctx, vid, lr);
-            if (rr >= 0) {
+            # with holes the copy target's register is free across its hole
+            # and this interval takes it like any other; without them the
+            # target is live throughout and the two share the register by
+            # construction, anchored until the copy
+            if (rr >= 0 && ctx.holes) {
+                if (reg_free_for(ctx, lr, rr)) {
+                    mark_assigned_id(ctx, lr.reg_class, mir.preg_id(rr));
+                    preg = rr;
+                }
+            }
+            or (rr >= 0) {
                 ctx.f.vregs[v].assigned = mir.preg_id(rr);
                 val dv: u32 = ctx.hints[v].dst_vreg;
                 if (ctx.hints[v].dst_copy_pos > ctx.anchor_until[dv]) {
@@ -2032,7 +2653,12 @@ fun arg_reg_reserved(ctx: *AllocCtx, id: u32) bool {
     var i: u32 = 0;
     for (i < ctx.arg_res_count) {
         if (ctx.arg_res_reg[i] == id) {
-            if (!(ctx.cur_end < ctx.arg_res_start[i] || ctx.cur_start > ctx.arg_res_end[i])) {
+            if (ctx.holes && ctx.cur_vreg < ctx.f.vreg_count) {
+                if (seg_overlaps_window(ctx, ?ctx.ranges[ctx.cur_vreg], ctx.arg_res_start[i], ctx.arg_res_end[i])) {
+                    ret true;
+                }
+            }
+            or (!(ctx.cur_end < ctx.arg_res_start[i] || ctx.cur_start > ctx.arg_res_end[i])) {
                 ret true;
             }
         }
@@ -2140,37 +2766,6 @@ fun sort_by_start(ctx: *AllocCtx, order: *u32, count: u32) err[fail.Fail] {
     ret err[fail.Fail].ok{};
 }
 
-fun expire_active(ctx: *AllocCtx, current_start: i64) {
-    var write: u32 = 0;
-    var read:  u32 = 0;
-    for (read < ctx.active_count) {
-        val v:  u32        = ctx.active[read];
-        val lr: *LiveRange = ?ctx.ranges[v];
-        if (lr.end_pos >= current_start) {
-            ctx.active[write] = v;
-            write             = write + 1;
-        }
-        or {
-            free_assigned(ctx, mir.vreg_id(v));
-        }
-        read = read + 1;
-    }
-    ctx.active_count = write;
-}
-
-fun free_assigned(ctx: *AllocCtx, v: mir.VRegId) {
-    val mv: *mir.MirVReg = ?ctx.f.vregs[v.n];
-    if (mir.preg_is_nil(mv.assigned)) { ret; }
-    val lr:    *LiveRange = ?ctx.ranges[v.n];
-    val index: u32        = isa.regid_index(mir.preg_regid(mv.assigned))::u32;
-    if (lr.reg_class == REG_CLASS_GP) {
-        if (index < ctx.gp_count) { ctx.gp_busy[index] = false; }
-    }
-    or {
-        if (index < ctx.fp_count) { ctx.fp_busy[index] = false; }
-    }
-}
-
 fun pick_hint(ctx: *AllocCtx, v: mir.VRegId, lr: *LiveRange) i32 {
     val h: *CopyHint = ?ctx.hints[v.n];
 
@@ -2198,11 +2793,11 @@ fun pick_hint(ctx: *AllocCtx, v: mir.VRegId, lr: *LiveRange) i32 {
         if (arg_reg_reserved(ctx, rid::u32))                             { ret -1; }
         if (def_reg_reserved(ctx, rid::u32))                             { ret -1; }
         if (ctx.pinned_end[idx] >= 0 && ctx.pinned_end[idx] != lr.start) { ret -1; }
-        if (!ctx.gp_busy[idx]) {
+        if (!ctx.gp_busy[idx] && !inactive_conflict(ctx, true, idx)) {
             ctx.gp_busy[idx] = true;
             ret rid;
         }
-        if (can_transfer(ctx, lr, h)) {
+        if (can_transfer(ctx, lr, h) && !inactive_conflict(ctx, true, idx)) {
             transfer_source_reg(ctx, mir.vreg_id(h.src_vreg), mir.preg_id(rid));
             ret rid;
         }
@@ -2215,11 +2810,11 @@ fun pick_hint(ctx: *AllocCtx, v: mir.VRegId, lr: *LiveRange) i32 {
         if (arg_reg_reserved(ctx, rid::u32))                                                               { ret -1; }
         if (def_reg_reserved(ctx, rid::u32))                                                               { ret -1; }
         if (ctx.fp_pinned_end != nil && ctx.fp_pinned_end[idx] >= 0 && ctx.fp_pinned_end[idx] != lr.start) { ret -1; }
-        if (!ctx.fp_busy[idx]) {
+        if (!ctx.fp_busy[idx] && !inactive_conflict(ctx, false, idx)) {
             ctx.fp_busy[idx] = true;
             ret rid;
         }
-        if (can_transfer(ctx, lr, h)) {
+        if (can_transfer(ctx, lr, h) && !inactive_conflict(ctx, false, idx)) {
             transfer_source_reg(ctx, mir.vreg_id(h.src_vreg), mir.preg_id(rid));
             ret rid;
         }
@@ -2227,19 +2822,28 @@ fun pick_hint(ctx: *AllocCtx, v: mir.VRegId, lr: *LiveRange) i32 {
     }
 }
 
+# the source's value dies at the copy and the source's later segments, if
+# any, never meet this interval
 fun can_transfer(ctx: *AllocCtx, lr: *LiveRange, h: *CopyHint) bool {
     if (h.src_vreg == mir.MIR_VREG_NIL.n)             { ret false; }
     if (h.copy_pos < 0)                               { ret false; }
-    if (ctx.ranges[h.src_vreg].end_pos != h.copy_pos) { ret false; }
+    if (!dies_at(ctx, h.src_vreg, h.copy_pos))        { ret false; }
     if (lr.start != h.copy_pos)                       { ret false; }
+    if (intersects(ctx, lr, ?ctx.ranges[h.src_vreg])) { ret false; }
     ret true;
 }
 
+# the source leaves the active set now that its value is dead; a source with
+# a later segment waits in inactive for it
 fun transfer_source_reg(ctx: *AllocCtx, src: mir.VRegId, rid: mir.PRegId) {
     if (!vreg_in_active(ctx, src) || !mir.preg_same(ctx.f.vregs[src.n].assigned, rid)) {
         panic("regalloc: copy-hint transfer source is not the live owner of its register\n");
     }
     remove_active(ctx, src);
+    if (ctx.ranges[src.n].end_pos > ctx.cur_start) {
+        ctx.inactive[ctx.inactive_count] = src.n;
+        ctx.inactive_count               = ctx.inactive_count + 1;
+    }
 }
 
 fun pick_sink_hint(ctx: *AllocCtx, v: mir.VRegId, lr: *LiveRange) i32 {
@@ -2331,10 +2935,13 @@ fun pick_gp(ctx: *AllocCtx, crosses_call: bool) i32 {
 fun def_reg_reserved(ctx: *AllocCtx, id: u32) bool {
     var i: u32 = 0;
     for (i < ctx.def_res_count) {
-        if (ctx.def_res_reg[i] == id
-            && ctx.cur_start <= ctx.def_res_pos[i]
-            && ctx.cur_end > ctx.def_res_pos[i]) {
-            ret true;
+        if (ctx.def_res_reg[i] == id) {
+            if (ctx.holes && ctx.cur_vreg < ctx.f.vreg_count) {
+                if (seg_holds_point(ctx, ?ctx.ranges[ctx.cur_vreg], ctx.def_res_pos[i])) { ret true; }
+            }
+            or (ctx.cur_start <= ctx.def_res_pos[i] && ctx.cur_end > ctx.def_res_pos[i]) {
+                ret true;
+            }
         }
         i = i + 1;
     }
@@ -2342,10 +2949,11 @@ fun def_reg_reserved(ctx: *AllocCtx, id: u32) bool {
 }
 
 fun gp_available(ctx: *AllocCtx, id: u32) bool {
-    if (ctx.gp_busy[id])           { ret false; }
-    if (ctx.pinned_end[id] >= 0)   { ret false; }
-    if (arg_reg_reserved(ctx, id)) { ret false; }
-    if (def_reg_reserved(ctx, id)) { ret false; }
+    if (ctx.gp_busy[id])                  { ret false; }
+    if (ctx.pinned_end[id] >= 0)          { ret false; }
+    if (arg_reg_reserved(ctx, id))        { ret false; }
+    if (def_reg_reserved(ctx, id))        { ret false; }
+    if (inactive_conflict(ctx, true, id)) { ret false; }
     ret true;
 }
 
@@ -2353,9 +2961,25 @@ fun fp_available(ctx: *AllocCtx, fi: u32) bool {
     if (ctx.fp_busy[fi])                                        { ret false; }
     if (ctx.fp_pinned_end != nil && ctx.fp_pinned_end[fi] >= 0) { ret false; }
     val cid: u32 = isa.regid_make(isa.REG_CLASS_ID_XMM, fi::i32)::u32;
-    if (arg_reg_reserved(ctx, cid)) { ret false; }
-    if (def_reg_reserved(ctx, cid)) { ret false; }
+    if (arg_reg_reserved(ctx, cid))        { ret false; }
+    if (def_reg_reserved(ctx, cid))        { ret false; }
+    if (inactive_conflict(ctx, false, fi)) { ret false; }
     ret true;
+}
+
+# every constraint pick_gp and pick_fp apply, for one named register
+fun reg_free_for(ctx: *AllocCtx, lr: *LiveRange, rid: i32) bool {
+    val rclass: i32 = isa.regid_class(rid);
+    val idx:    u32 = isa.regid_index(rid)::u32;
+    if (lr.reg_class == REG_CLASS_GP) {
+        if (rclass != isa.REG_CLASS_ID_GP || idx >= ctx.gp_count) { ret false; }
+        if (ctx.reserved[idx])                                    { ret false; }
+        if (lr.crosses_call && !ctx.callee_saved[idx])            { ret false; }
+        ret gp_available(ctx, idx);
+    }
+    if (rclass != isa.REG_CLASS_ID_XMM || idx >= ctx.fp_count)                        { ret false; }
+    if (lr.crosses_call && (ctx.fp_callee_saved == nil || !ctx.fp_callee_saved[idx])) { ret false; }
+    ret fp_available(ctx, idx);
 }
 
 fun pick_fp(ctx: *AllocCtx, crosses_call: bool) i32 {
@@ -2408,6 +3032,7 @@ fun assign(ctx: *AllocCtx, v: mir.VRegId, preg: mir.PRegId, reg_class: u32) {
 }
 
 fun spill_on_pressure(ctx: *AllocCtx, v: mir.VRegId) err[fail.Fail] {
+    if (ctx.holes) { ret spill_on_density(ctx, v); }
     val lr:     *LiveRange = ?ctx.ranges[v.n];
     val victim: mir.VRegId = find_spill_victim(ctx, lr.reg_class);
     if (mir.vreg_is_nil(victim)) {
@@ -2438,6 +3063,109 @@ fun spill_on_pressure(ctx: *AllocCtx, v: mir.VRegId) err[fail.Fail] {
     remove_active(ctx, victim);
     assign(ctx, v, mir.preg_id(preg), lr.reg_class);
     ret err[fail.Fail].ok{};
+}
+
+# every register the incoming interval may take is costed by the densest
+# interval it would have to evict, active or inactive, and the cheapest is
+# taken when the incoming is denser than that; otherwise the incoming is the
+# one kept on the stack, so the value read most per position always keeps
+# its register
+fun spill_on_density(ctx: *AllocCtx, v: mir.VRegId) err[fail.Fail] {
+    val lr:    *LiveRange = ?ctx.ranges[v.n];
+    val gp:    bool       = lr.reg_class == REG_CLASS_GP;
+    var count: u32        = ctx.fp_count;
+    if (gp) { count = ctx.gp_count; }
+
+    var best_reg:  i32        = -1;
+    var best_cost: *LiveRange = nil;
+    var r:         u32        = 0;
+    for (r < count) {
+        var rid: i32 = isa.regid_make(isa.REG_CLASS_ID_GP, r::i32);
+        if (!gp) { rid = isa.regid_make(isa.REG_CLASS_ID_XMM, r::i32); }
+        if (!reg_admits(ctx, lr, r)) {
+            r = r + 1;
+            cnt;
+        }
+        var worst:   *LiveRange = nil;
+        var blocked: bool       = false;
+        occupant_cost(ctx, lr, r, ctx.active, ctx.active_count, ?worst, ?blocked);
+        occupant_cost(ctx, lr, r, ctx.inactive, ctx.inactive_count, ?worst, ?blocked);
+        if (!blocked && worst != nil) {
+            if (best_reg < 0 || less_dense(worst, best_cost)) {
+                best_reg  = rid;
+                best_cost = worst;
+            }
+        }
+        r = r + 1;
+    }
+    if (best_reg < 0 || !less_dense(best_cost, lr)) { ret spill_vreg(ctx, v); }
+
+    val idx: u32 = isa.regid_index(best_reg)::u32;
+    var ai:  u32 = 0;
+    for (ai < ctx.active_count) {
+        val y: u32 = ctx.active[ai];
+        if (occupies(ctx, y, lr.reg_class, idx) && intersects(ctx, lr, ?ctx.ranges[y])) {
+            val sr: err[fail.Fail] = spill_vreg(ctx, mir.vreg_id(y));
+            if (sel sr.err) { ret sr; }
+            remove_active(ctx, mir.vreg_id(y));
+        }
+        or { ai = ai + 1; }
+    }
+    var ii: u32 = 0;
+    for (ii < ctx.inactive_count) {
+        val y: u32 = ctx.inactive[ii];
+        if (occupies(ctx, y, lr.reg_class, idx) && intersects(ctx, lr, ?ctx.ranges[y])) {
+            val sr: err[fail.Fail] = spill_vreg(ctx, mir.vreg_id(y));
+            if (sel sr.err) { ret sr; }
+            remove_inactive(ctx, mir.vreg_id(y));
+        }
+        or { ii = ii + 1; }
+    }
+    recompute_busy(ctx);
+    mark_assigned_id(ctx, lr.reg_class, mir.preg_id(best_reg));
+    assign(ctx, v, mir.preg_id(best_reg), lr.reg_class);
+    ret err[fail.Fail].ok{};
+}
+
+# the register's fixed constraints for this interval, everything but who
+# holds it
+fun reg_admits(ctx: *AllocCtx, lr: *LiveRange, idx: u32) bool {
+    if (lr.reg_class == REG_CLASS_GP) {
+        if (ctx.reserved[idx])                         { ret false; }
+        if (lr.crosses_call && !ctx.callee_saved[idx]) { ret false; }
+        if (ctx.pinned_end[idx] >= 0)                  { ret false; }
+        if (arg_reg_reserved(ctx, idx))                { ret false; }
+        if (def_reg_reserved(ctx, idx))                { ret false; }
+        ret true;
+    }
+    if (lr.crosses_call && (ctx.fp_callee_saved == nil || !ctx.fp_callee_saved[idx])) { ret false; }
+    if (ctx.fp_pinned_end != nil && ctx.fp_pinned_end[idx] >= 0)                      { ret false; }
+    val cid: u32 = isa.regid_make(isa.REG_CLASS_ID_XMM, idx::i32)::u32;
+    if (arg_reg_reserved(ctx, cid)) { ret false; }
+    if (def_reg_reserved(ctx, cid)) { ret false; }
+    ret true;
+}
+
+fun occupies(ctx: *AllocCtx, y: u32, reg_class: u32, idx: u32) bool {
+    if (ctx.ranges[y].reg_class != reg_class) { ret false; }
+    val a: mir.PRegId = ctx.f.vregs[y].assigned;
+    if (mir.preg_is_nil(a)) { ret false; }
+    ret isa.regid_index(mir.preg_regid(a))::u32 == idx;
+}
+
+fun occupant_cost(ctx: *AllocCtx, lr: *LiveRange, idx: u32, set: *u32, count: u32, worst: **LiveRange, blocked: *bool) {
+    var i: u32 = 0;
+    for (i < count) {
+        val y: u32 = set[i];
+        if (occupies(ctx, y, lr.reg_class, idx)) {
+            val yr: *LiveRange = ?ctx.ranges[y];
+            if (intersects(ctx, lr, yr)) {
+                if (ctx.anchor_until[y] >= ctx.cur_start)    { @blocked = true; }
+                if (@worst == nil || less_dense(@worst, yr)) { @worst = yr; }
+            }
+        }
+        i = i + 1;
+    }
 }
 
 fun mark_assigned_id(ctx: *AllocCtx, reg_class: u32, preg: mir.PRegId) {
@@ -2750,7 +3478,7 @@ fun spill_across_calls(tgt: *target.Target, ctx: *AllocCtx) err[fail.Fail] {
                 cnt;
             }
             val lr: *LiveRange = ?ctx.ranges[v];
-            if (lr.start >= pos::i64 || lr.end_pos <= pos::i64) {
+            if (!seg_interior(ctx, lr, pos::i64)) {
                 v = v + 1;
                 cnt;
             }
@@ -2785,6 +3513,16 @@ fun spill_across_calls(tgt: *target.Target, ctx: *AllocCtx) err[fail.Fail] {
         pos = pos + 1;
     }
     ret err[fail.Fail].ok{};
+}
+
+fun seg_interior(ctx: *AllocCtx, lr: *LiveRange, pos: i64) bool {
+    var k: u32 = 0;
+    for (k < lr.seg_count) {
+        val sg: *Segment = ?ctx.segs[lr.seg_start + k];
+        if (sg.from < pos && pos < sg.to) { ret true; }
+        k = k + 1;
+    }
+    ret false;
 }
 
 fun rewritten_preg_ok(tgt: *target.Target, preg: mir.PRegId) bool {
@@ -2856,6 +3594,62 @@ fun verify_rewritten_operands(tgt: *target.Target, f: *mir.MirFunction) err[fail
             ii = ii + 1;
         }
         bi = bi + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# two values assigned one register never meet: the allocation's own
+# contract, checked after every scan so a wrong assignment is a refusal and
+# not a miscompile. intervals are sorted by start and each is compared with
+# the earlier ones on its register whose hull still reaches it
+fun verify_interference(ctx: *AllocCtx) err[fail.Fail] {
+    val nv: u32 = ctx.f.vreg_count;
+    if (nv == 0) { ret err[fail.Fail].ok{}; }
+    val ro: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, nv::usize);
+    if (sel ro.err) { ret err[fail.Fail].err{fail.refused(ro.err)}; }
+    val order: *u32 = ro.ok;
+    fin { A.deallocate[u32](ctx.alloc, order, nv::usize); }
+    var i: u32 = 0;
+    for (i < nv) {
+        order[i] = i;
+        i        = i + 1;
+    }
+    val sb: err[fail.Fail] = sort_by_start(ctx, order, nv);
+    if (sel sb.err) { ret sb; }
+
+    val ropen: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, nv::usize);
+    if (sel ropen.err) { ret err[fail.Fail].err{fail.refused(ropen.err)}; }
+    val open:       *u32 = ropen.ok;
+    var open_count: u32  = 0;
+    fin { A.deallocate[u32](ctx.alloc, open, nv::usize); }
+
+    i = 0;
+    for (i < nv) {
+        val v:  u32        = order[i];
+        val lr: *LiveRange = ?ctx.ranges[v];
+        val a:  mir.PRegId = ctx.f.vregs[v].assigned;
+        if (lr.end_pos < 0 || mir.preg_is_nil(a) || ctx.f.vregs[v].spill_slot >= 0) {
+            i = i + 1;
+            cnt;
+        }
+        var write: u32 = 0;
+        var read:  u32 = 0;
+        for (read < open_count) {
+            val y:  u32        = open[read];
+            val yr: *LiveRange = ?ctx.ranges[y];
+            if (yr.end_pos >= lr.start) {
+                open[write] = y;
+                write       = write + 1;
+                if (yr.reg_class == lr.reg_class && mir.preg_same(ctx.f.vregs[y].assigned, a) && intersects(ctx, lr, yr)) {
+                    ret err[fail.Fail].err{fail.message(regalloc_msg(ctx, "regalloc: two live values were assigned one register in '", "' (internal compiler error)", "regalloc: two live values were assigned one register (internal compiler error)"))};
+                }
+            }
+            read = read + 1;
+        }
+        open_count       = write;
+        open[open_count] = v;
+        open_count       = open_count + 1;
+        i                = i + 1;
     }
     ret err[fail.Fail].ok{};
 }
@@ -3279,7 +4073,7 @@ fun operand_register(ctx: *AllocCtx, op: *mir.MirOperand) i32 {
 fun dying_register(ctx: *AllocCtx, op: *mir.MirOperand, d: mir.VRegId, pos: u32) i32 {
     if (op.kind != mir.MIR_OP_VREG || mir.vreg_same(op.vreg, d)) { ret -1; }
     if (op.vreg.n >= ctx.f.vreg_count)                           { ret -1; }
-    if (ctx.ranges[op.vreg.n].end_pos != pos::i64)               { ret -1; }
+    if (!dies_at(ctx, op.vreg.n, pos::i64))                      { ret -1; }
     ret operand_register(ctx, op);
 }
 
@@ -3989,8 +4783,14 @@ test "mach.lang.be.codegen.regalloc.instr_defines:fused_cbr_shape" {
 test "mach.lang.be.codegen.regalloc.can_transfer:destination_born_guard" {
     var ctx:    AllocCtx;
     var ranges: [4]LiveRange;
+    var segs:   [4]Segment;
+    var f:      mir.MirFunction;
+    f.vreg_count      = 4;
+    ctx.f             = ?f;
     ctx.ranges        = ?ranges[0];
+    ctx.segs          = ?segs[0];
     ranges[1].end_pos = 10;
+    t_hull_segs(?ctx, 4);
 
     var h: CopyHint;
     h.src_vreg = 1;
@@ -4006,8 +4806,10 @@ test "mach.lang.be.codegen.regalloc.can_transfer:destination_born_guard" {
     if (can_transfer(?ctx, ?lr_live_in, ?h)) { ret 1; }
 
     ranges[1].end_pos = 14;
+    t_hull_segs(?ctx, 4);
     if (can_transfer(?ctx, ?lr_born, ?h)) { ret 1; }
     ranges[1].end_pos = 10;
+    t_hull_segs(?ctx, 4);
 
     h.src_vreg = mir.MIR_VREG_NIL.n;
     h.src_preg = 5;
@@ -4173,6 +4975,25 @@ fun t_mov(alloc: *A.Allocator, b: *mir.MirBlock, ix: u32, dst: mir.MirOperand, s
     b.instrs[ix].src_width     = 8;
     b.instrs[ix].asm_block     = nil;
     b.instrs[ix].vec_lane      = mir.VEC_LANE_NONE;
+}
+
+# one segment per range from its hull, for tests that shape ranges by hand
+fun t_hull_segs(ctx: *AllocCtx, n: u32) {
+    var i: u32 = 0;
+    for (i < n) {
+        val lr: *LiveRange = ?ctx.ranges[i];
+        lr.seg_start = i;
+        lr.seg_count = 0;
+        lr.live_len  = 0;
+        if (lr.end_pos >= 0 && lr.start <= lr.end_pos) {
+            ctx.segs[i].from = lr.start;
+            ctx.segs[i].to   = lr.end_pos;
+            lr.seg_count     = 1;
+            lr.live_len      = lr.end_pos - lr.start + 1;
+        }
+        i = i + 1;
+    }
+    ctx.seg_count = n;
 }
 
 fun t_ctx(ctx: *AllocCtx, alloc: *A.Allocator, f: *mir.MirFunction, slots: *bool) {
@@ -4429,7 +5250,12 @@ test "mach.lang.be.codegen.regalloc.maybe_sink_hint:records_only_a_dying_full_wi
     var ctx:    AllocCtx;
     var ranges: [2]LiveRange;
     var hints:  [2]CopyHint;
+    var segs:   [2]Segment;
+    var f:      mir.MirFunction;
+    f.vreg_count    = 2;
+    ctx.f           = ?f;
     ctx.ranges      = ?ranges[0];
+    ctx.segs        = ?segs[0];
     ctx.hints       = ?hints[0];
     ctx.spill_width = 8;
     var i: u32 = 0;
@@ -4449,6 +5275,7 @@ test "mach.lang.be.codegen.regalloc.maybe_sink_hint:records_only_a_dying_full_wi
     var mv: mir.MirInstr = mir.instr(mir.MIR_MOV, ?ops[0], 2, 8, 8);
 
     ranges[1].end_pos = 10;
+    t_hull_segs(?ctx, 2);
     maybe_sink_hint(?ctx, ?mv, 10, 2);
     if (hints[1].sink_preg != 7) { ret 1; }
 
@@ -4458,13 +5285,15 @@ test "mach.lang.be.codegen.regalloc.maybe_sink_hint:records_only_a_dying_full_wi
 
     hints[1].sink_preg = -1;
     ranges[1].end_pos  = 14;
-    ops[0]             = mir.op_preg(mir.preg_id(7));
+    t_hull_segs(?ctx, 2);
+    ops[0] = mir.op_preg(mir.preg_id(7));
     maybe_sink_hint(?ctx, ?mv, 10, 2);
     if (hints[1].sink_preg != -1) { ret 1; }
 
     ranges[1].end_pos = 10;
-    mv.width          = 4;
-    mv.src_width      = 4;
+    t_hull_segs(?ctx, 2);
+    mv.width     = 4;
+    mv.src_width = 4;
     maybe_sink_hint(?ctx, ?mv, 10, 2);
     if (hints[1].sink_preg != -1) { ret 1; }
 
@@ -4508,12 +5337,14 @@ test "mach.lang.be.codegen.regalloc.maybe_reverse_hint:refuses_a_right_operand_t
     flat[1].is_call = false;
     var ranges: [3]LiveRange;
     var hints:  [3]CopyHint;
+    var segs:   [3]Segment;
     var slots:  [3]bool;
     var ctx:    AllocCtx;
     t_ctx(?ctx, ?alloc, ?f, ?slots[0]);
     ctx.flat       = ?flat[0];
     ctx.flat_count = 2;
     ctx.ranges     = ?ranges[0];
+    ctx.segs       = ?segs[0];
     ctx.hints      = ?hints[0];
     var i: u32 = 0;
     for (i < 3) {
@@ -4534,6 +5365,7 @@ test "mach.lang.be.codegen.regalloc.maybe_reverse_hint:refuses_a_right_operand_t
 
     # d is the right operand of a sub: refused
     ranges[0].start = -1;
+    t_hull_segs(?ctx, 3);
     maybe_reverse_hint(?ctx, copy, 1, 3);
     if (hints[1].dst_vreg != mir.MIR_VREG_NIL.n) { ret 2; }
 
@@ -4572,8 +5404,13 @@ test "mach.lang.be.codegen.regalloc.maybe_tie_hint:ties_a_dying_left_operand" {
     var ctx:    AllocCtx;
     var ranges: [3]LiveRange;
     var hints:  [3]CopyHint;
-    ctx.ranges = ?ranges[0];
-    ctx.hints  = ?hints[0];
+    var segs:   [3]Segment;
+    var f:      mir.MirFunction;
+    f.vreg_count = 3;
+    ctx.f        = ?f;
+    ctx.ranges   = ?ranges[0];
+    ctx.segs     = ?segs[0];
+    ctx.hints    = ?hints[0];
     var i: u32 = 0;
     for (i < 3) {
         hints[i].src_vreg     = mir.MIR_VREG_NIL.n;
@@ -4593,6 +5430,7 @@ test "mach.lang.be.codegen.regalloc.maybe_tie_hint:ties_a_dying_left_operand" {
 
     ranges[1].end_pos = 20;
     ranges[0].start   = 20;
+    t_hull_segs(?ctx, 3);
     maybe_tie_hint(?ctx, ?op, 20, 3);
     if (hints[0].src_vreg != 1)  { ret 1; }
     if (hints[0].copy_pos != 20) { ret 1; }
@@ -4600,11 +5438,13 @@ test "mach.lang.be.codegen.regalloc.maybe_tie_hint:ties_a_dying_left_operand" {
     hints[0].src_vreg = mir.MIR_VREG_NIL.n;
     hints[0].copy_pos = -1;
     ranges[1].end_pos = 24;
+    t_hull_segs(?ctx, 3);
     maybe_tie_hint(?ctx, ?op, 20, 3);
     if (hints[0].src_vreg != mir.MIR_VREG_NIL.n) { ret 1; }
 
     ranges[1].end_pos = 20;
     ranges[0].start   = 12;
+    t_hull_segs(?ctx, 3);
     maybe_tie_hint(?ctx, ?op, 20, 3);
     if (hints[0].src_vreg != mir.MIR_VREG_NIL.n) { ret 1; }
 
@@ -5348,6 +6188,7 @@ rec TRewrite {
     tgt:     target.Target;
     vregs:   [4]mir.MirVReg;
     ranges:  [4]LiveRange;
+    segs:    [4]Segment;
     hints:   [4]CopyHint;
     slots:   [4]bool;
     pool:    [2]isa.Register;
@@ -5387,6 +6228,7 @@ fun t_rewrite_init(t: *TRewrite) bool {
     t.f.vreg_count = 4;
     t_ctx(?t.ctx, ?t.alloc, ?t.f, ?t.slots[0]);
     t.ctx.ranges               = ?t.ranges[0];
+    t.ctx.segs                 = ?t.segs[0];
     t.ctx.hints                = ?t.hints[0];
     t.ctx.reload_scratch       = ?t.pool[0];
     t.ctx.reload_scratch_count = 2;
@@ -5424,6 +6266,7 @@ fun t_instr(t: *TRewrite, opcode: mir.MirOpcode, a: mir.MirOperand, b: mir.MirOp
 fun t_rewrite(t: *TRewrite, opcode: mir.MirOpcode, a: mir.MirOperand, b: mir.MirOperand, c: mir.MirOperand, n: u32) bool {
     var mi: mir.MirInstr = mir.instr(mir.MIR_MOV, nil, 0, 8, 8);
     if (!t_instr(t, opcode, a, b, c, n, ?mi)) { ret false; }
+    t_hull_segs(?t.ctx, 4);
     val rr: err[fail.Fail] = rewrite_instr(?t.tgt, ?t.ctx, ?mi, ?t.dst[0], ?t.written, false, 0);
     if (sel rr.err) { ret false; }
     ret true;
@@ -5801,6 +6644,7 @@ test "mach.lang.be.codegen.regalloc.maybe_tie_hint:a_commutative_op_ties_its_dyi
     if (!t_rewrite_init(?t)) { ret 1; }
     fin { t_rewrite_dnit(?t); }
     t.ranges[2].end_pos = 0;
+    t_hull_segs(?t.ctx, 4);
     var add: mir.MirInstr = mir.instr(mir.MIR_MOV, nil, 0, 8, 8);
     if (!t_instr(?t, mir.MIR_SEL_ADD, t_v(0), t_v(1), t_v(2), 3, ?add)) { ret 2; }
     maybe_tie_hint(?t.ctx, ?add, 0, 4);
@@ -5814,6 +6658,7 @@ test "mach.lang.be.codegen.regalloc.maybe_tie_hint:a_commutative_op_ties_its_dyi
     if (t.hints[0].src_vreg != mir.MIR_VREG_NIL.n) { ret 5; }
 
     t.ranges[1].end_pos = 0;
+    t_hull_segs(?t.ctx, 4);
     maybe_tie_hint(?t.ctx, ?add, 0, 4);
     if (t.hints[0].src_vreg != 1) { ret 6; }
     ret 0;
@@ -6049,7 +6894,9 @@ test "mach.lang.be.codegen.regalloc:unknown_catalog_inputs_never_use_the_fp_or_n
 
 # the dense block-by-register equations, kept only as the oracle the sparse
 # propagation is checked against on small graphs
-fun t_dense_liveness(ctx: *AllocCtx) err[fail.Fail] {
+# cov, when given, receives one bool per (position, register): the value is
+# read or written there, or is live across it
+fun t_dense_liveness(ctx: *AllocCtx, cov: *bool) err[fail.Fail] {
     val f:  *mir.MirFunction = ctx.f;
     val nb: u32              = f.block_count;
     val nv: u32              = f.vreg_count;
@@ -6146,6 +6993,55 @@ fun t_dense_liveness(ctx: *AllocCtx) err[fail.Fail] {
         }
         bi = bi + 1;
     }
+    if (cov == nil) { ret err[fail.Fail].ok{}; }
+
+    val rl: res[*bool, A.Error] = A.allocate[bool](ctx.alloc, nv::usize);
+    if (sel rl.err) { ret err[fail.Fail].err{fail.refused(rl.err)}; }
+    val live: *bool = rl.ok;
+    fin { A.deallocate[bool](ctx.alloc, live, nv::usize); }
+    bi = 0;
+    for (bi < nb) {
+        val blk:  *mir.MirBlock = ?f.blocks[bi];
+        val base: usize         = (bi::usize) * (nv::usize);
+        var v:    u32           = 0;
+        for (v < nv) {
+            live[v] = live_out[base + v::usize];
+            v       = v + 1;
+        }
+        var ii: u32 = blk.instr_count;
+        for (ii > 0) {
+            ii = ii - 1;
+            val pos:     usize         = (ctx.block_spans[bi].start + ii::i64)::usize;
+            val mi:      *mir.MirInstr = ?blk.instrs[ii];
+            val has_def: bool          = instr_defines(mi);
+            var d:       u32           = mir.MIR_VREG_NIL.n;
+            if (has_def) { d = mi.operands[0].vreg.n; }
+            v = 0;
+            for (v < nv) {
+                cov[pos * (nv::usize) + v::usize] = live[v] || v == d;
+                v                                 = v + 1;
+            }
+            if (d < nv) { live[d] = false; }
+            var k: u32 = 0;
+            for (k < mi.operand_count) {
+                val op: *mir.MirOperand = ?mi.operands[k];
+                var u:  u32             = mir.MIR_VREG_NIL.n;
+                if ((op.kind == mir.MIR_OP_VREG && !(has_def && k == 0)) || op.kind == mir.MIR_OP_MEM) { u = op.vreg.n; }
+                if (u < nv) {
+                    live[u]                           = true;
+                    cov[pos * (nv::usize) + u::usize] = true;
+                }
+                if (sel op.index.vreg) {
+                    if (op.index.vreg.n < nv) {
+                        live[op.index.vreg.n]                           = true;
+                        cov[pos * (nv::usize) + op.index.vreg.n::usize] = true;
+                    }
+                }
+                k = k + 1;
+            }
+        }
+        bi = bi + 1;
+    }
     ret err[fail.Fail].ok{};
 }
 
@@ -6238,6 +7134,7 @@ fun t_sparse_liveness_case(sample: u32, ordinal: usize, attempts: *usize) i32 {
     var ctx: AllocCtx;
     ctx.alloc              = T.allocator_of(?track);
     ctx.f                  = ?f;
+    ctx.holes              = true;
     ctx.block_spans        = ?spans[0];
     ctx.block_id_index     = ?block_map[0];
     ctx.block_id_index_cap = 64;
@@ -6245,24 +7142,60 @@ fun t_sparse_liveness_case(sample: u32, ordinal: usize, attempts: *usize) i32 {
     T.fail_at_ordinal(?track, ordinal);
     val result: err[fail.Fail] = extend_liveness(?ctx);
     @attempts = T.attempt_count(?track);
+    var segs:      [64]Segment;
+    var seg_count: u32 = 0;
+    if (ctx.segs != nil && ctx.seg_count > 0) {
+        seg_count = ctx.seg_count;
+        if (seg_count > 64) { ret 3; }
+        var si: u32 = 0;
+        for (si < seg_count) {
+            segs[si] = ctx.segs[si];
+            si       = si + 1;
+        }
+        A.deallocate[Segment](ctx.alloc, ctx.segs, ctx.seg_count::usize);
+        ctx.segs = ?segs[0];
+    }
     if (T.leaked(?track) || T.double_free_count(?track) != 0 || T.tracking_exhausted(?track)) { ret 3; }
     if (ordinal != 0) {
         if (sel result.ok) { ret 4; }
         bi = 0;
         for (bi < 8) {
-            if (sparse[bi].start != POS_MAX || sparse[bi].end_pos != -1) { ret 5; }
+            if (sparse[bi].start != POS_MAX || sparse[bi].end_pos != -1 || sparse[bi].seg_count != 0) { ret 5; }
             bi = bi + 1;
         }
+        if (seg_count != 0) { ret 5; }
         ret 0;
     }
     if (sel result.err) { ret 6; }
     ctx.alloc  = ?alloc;
     ctx.ranges = ?dense[0];
-    val oracle: err[fail.Fail] = t_dense_liveness(?ctx);
+    var cov: [256]bool;
+    var ci:  u32 = 0;
+    for (ci < 256) {
+        cov[ci] = false;
+        ci      = ci + 1;
+    }
+    val oracle: err[fail.Fail] = t_dense_liveness(?ctx, ?cov[0]);
     if (sel oracle.err) { ret 7; }
     bi = 0;
     for (bi < 8) {
         if (sparse[bi].start != dense[bi].start || sparse[bi].end_pos != dense[bi].end_pos) { ret 8; }
+        # the segments are the exact positions the value is read, written
+        # or live across, in order and never touching
+        val lr:  *LiveRange = ?sparse[bi];
+        var pos: u32        = 0;
+        for (pos < 32) {
+            var in_seg: bool = false;
+            var k:      u32  = 0;
+            for (k < lr.seg_count) {
+                val sg: *Segment = ?segs[lr.seg_start + k];
+                if (sg.from <= pos::i64 && pos::i64 <= sg.to)              { in_seg = true; }
+                if (k > 0 && sg.from <= segs[lr.seg_start + k - 1].to + 1) { ret 9; }
+                k = k + 1;
+            }
+            if (in_seg != cov[pos * 8 + bi]) { ret 10; }
+            pos = pos + 1;
+        }
         bi = bi + 1;
     }
     ret 0;
