@@ -198,11 +198,15 @@ listed() {
     done <"$here/golden/$2/$1"
     return 1
 }
-# skipped: the target cannot build the case. norun: it builds and its golden is
-# diffed, but its differential disagrees with the reference, so the disagreement
-# is not a failure. a norun case counts as a pass with its column reported golden
-# only. both are checked, not trusted: a skipped case that builds and a norun case
-# whose differential agrees are stale lines, and the run fails on them.
+# served: the column's scope. a target with an ONLY file serves the cases its
+# lines match and no other; without one it serves every case. skipped: the target
+# cannot build the case. norun: it builds and its golden is diffed, but its
+# differential disagrees with the reference, so the disagreement is not a failure.
+# a norun case counts as a pass with its column reported golden only. SKIPS and
+# NORUN are claims about a case and are checked, not trusted: a skipped case that
+# builds and a norun case whose differential agrees are stale lines, and the run
+# fails on them. ONLY is a decision about the column, not a claim, so it is not.
+served()  { [ ! -f "$here/golden/$1/ONLY" ] || listed ONLY "$1" "$2"; }
 skipped() { listed SKIPS "$1" "$2"; }
 norun()   { listed NORUN "$1" "$2"; }
 
@@ -433,6 +437,7 @@ reference() {
 run_case() {
     t=$1; c=$2
     fmt=$(object_format "$t")
+    if ! served "$t" "$c"; then skips=$((skips + 1)); return; fi
     if skipped "$t" "$c"; then
         if build "$t" o2 "$c"; then fail "$t $c builds: its golden/$t/SKIPS line is stale"; else skips=$((skips + 1)); fi
         return

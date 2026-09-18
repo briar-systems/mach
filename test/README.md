@@ -10,6 +10,7 @@ test/
   cases/<group>/<case>.mach     one codegen case, target-independent
   ref/<group>/<case>.c          its C reference
   golden/<target>/<g>/<c>.dis   blessed external-decoder text
+  golden/<target>/ONLY          the cases that column serves, when not all of them
   golden/<target>/SKIPS         cases that target cannot build, one per line
   golden/<target>/NORUN         cases it builds and diffs but whose differential is not run yet
   lib/fold.mach, lib/corpus.h   the checksum fold both sides use
@@ -58,13 +59,15 @@ qemu-user's loader maps. Every byte the program sees is the linker's. A missing
 emulator is announced and its column runs golden only. qemu is compute evidence,
 never ABI evidence.
 
-A target has two skip files, both `case reason` per line with `#` comments.
+A target has three case lists, each `case reason` per line, a glob allowed, with
+`#` comments. `ONLY`, when present, names the cases the column serves and no
+other; a case outside it is a skip and no claim about it is made.
 `SKIPS` names the cases the target cannot build at all: nothing is built, decoded
 or run for them. `NORUN` names the cases that build and whose golden is diffed,
 but whose differential disagrees with the reference today; the disagreement is
 not a failure, they count as passes, and the run reports how many were golden
 only. Each `NORUN` line is a compiler defect that names its issue and is deleted
-by the change that fixes it. Neither file is trusted: a `SKIPS` case is still
+by the change that fixes it. Neither `SKIPS` nor `NORUN` is trusted: a `SKIPS` case is still
 built and fails the run if it builds, and a `NORUN` case still runs and fails the
 run if it agrees with the reference, so a stale line cannot outlive its defect.
 
@@ -117,7 +120,7 @@ per lane.
 
 The `riscv64zkt-linux` column is riscv64-linux with the Zkt extension selected,
 the one corpus target that admits a secret multiply. It serves the `ct` group
-only, and its `SKIPS` names every other group by pattern.
+only, which its `ONLY` states.
 
 ## Doc blocks
 
