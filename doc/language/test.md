@@ -7,7 +7,7 @@ project into a single test binary.
 
 ## Grammar
 
-```mach
+```mach fragment
 test "label" { ... }
 ```
 

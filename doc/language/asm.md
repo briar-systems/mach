@@ -7,7 +7,7 @@ no `in` / `out` declarations, no clobber list.
 
 ## Grammar
 
-```mach
+```mach fragment
 asm <isa> {
     # raw instructions, one per line, # for comments
     mov rcx, {ptr}
@@ -35,7 +35,7 @@ Only an identifier inside braces names a local. Any other braced text belongs to
 the ISA's own syntax, such as aarch64's `{v0.16b}` register list, and reaches its
 grammar untouched.
 
-```mach
+```mach fragment
 pub fun add_via_asm(a: i64, b: i64) i64 {
     var result: i64 = 0;
     asm x86_64 {
@@ -56,7 +56,7 @@ deep the enclosing frame is. A statement that moves the stack pointer therefore 
 every `{name}` in the block out from under its own address, and the compiler refuses the
 block rather than assembling a wrong one:
 
-```mach
+```mach fragment
 var x: i64 = 0;
 asm aarch64 {
     ldr x9, {x}
@@ -77,7 +77,7 @@ pointer, which is what a `#[naked]` function's hand-written prologue does.
 `call` and `jmp` take the same three shapes, and which one a statement means is
 read off the operand:
 
-```mach
+```mach fragment
 asm x86_64 {
     call some_symbol     # direct: E8 rel32, relocated against the symbol
     call rax             # indirect through a register: FF /2, mod=11
@@ -111,7 +111,7 @@ A register operand states its own width, so `mov eax, [rcx]` is a four-byte load
 and needs nothing else. A memory operand states none, and where the instruction
 does not settle it either the width must be written out, in nasm's spelling:
 
-```mach
+```mach fragment
 asm x86_64 {
     movzx eax, word [rcx]     # a two-byte load, zero-extended into eax
     movsx rax, dword [rcx]    # a four-byte load, sign-extended (movsxd)
@@ -146,7 +146,7 @@ address is then relative to that segment's base, and the instruction carries the
 `0x64` or `0x65` prefix. The override belongs to the operand, so every
 instruction that takes a memory operand accepts it, the vector forms included:
 
-```mach
+```mach fragment
 asm x86_64 {
     mov rax, fs:[0x28]            # an absolute offset from the fs base
     mov rax, qword gs:[rbx + 8]   # a register-relative one
@@ -203,7 +203,7 @@ float members only at `.4s` and `.2d`, and `mul` everywhere except `.2d`.
 `ld1` and `st1` post-index their base by the structure size, `, 16`, or by an X
 register, `, x9`. Either form writes the base register:
 
-```mach
+```mach fragment
 asm aarch64 {
     ld1 {v0.16b}, [x1], 16      # load 16 bytes, then x1 += 16
     ld1 {v1.16b}, [x1], 16
@@ -262,7 +262,7 @@ val has_sha: bool = ((b >> 29) & 1) == 1;
 
 Beyond the ordinary surface, an OS-level block reaches:
 
-```mach
+```mach fragment
 asm x86_64 {
     cli / sti                 # the interrupt flag
     cld                       # clear DF before entering a program
@@ -315,7 +315,7 @@ an `iretq` are unreachable without the compiler saying so.
 Four data directives emit their values verbatim, for an encoding the ISA's mnemonic
 table does not name. They work on every target:
 
-```mach
+```mach fragment
 asm x86_64 {
     .byte 0x0f, 0x01, 0xd0    # xgetbv
 }
@@ -360,7 +360,7 @@ allocator spills every value in a callee-saved register and the prologue saves e
 callee-saved register the function could reach. A raw encoding may instead state what it
 writes, with a `::` clause on the directive:
 
-```mach
+```mach fragment
 asm x86_64 {
     mov dx, {port}
     .byte 0xee :: writes()                 # out dx, al - reads dx and al, writes nothing
@@ -438,7 +438,7 @@ every `asm` block is already assumed to modify arbitrary memory.
 
 `mrs` and `msr` name a system register by its architectural name, in either case:
 
-```mach
+```mach fragment
 asm aarch64 {
     mrs x0, cntvct_el0        # the virtual counter
     mrs x1, CNTFRQ_EL0        # ... and its frequency, capitalized as ARM spells it
@@ -454,7 +454,7 @@ exhaustive: **any** system register is also nameable by its encoding, exactly as
 GNU as spell it, which is what makes the surface complete rather than a list that always
 lags the architecture:
 
-```mach
+```mach fragment
 asm aarch64 {
     mrs x0, s3_3_c14_c0_2     # the same register as `mrs x0, cntvct_el0`
 }
@@ -478,7 +478,7 @@ read-only at the current level traps at run time, as the architecture defines.
 Three instructions generate an exception at a higher level, and they differ only in
 which level answers:
 
-```mach
+```mach fragment
 asm aarch64 {
     svc 0                     # the kernel, at EL1
     hvc 0                     # the hypervisor, at EL2
@@ -499,7 +499,7 @@ payload is a stream the parser cannot read.
 
 The two waiting hints suspend the core until something wakes it:
 
-```mach
+```mach fragment
 asm aarch64 {
     wfi                       # ... until an interrupt: the correct idle loop
     wfe                       # ... until an event
@@ -515,7 +515,7 @@ may do nothing at all, which is why `wfi` is what an idle loop should say.
 The Zicsr extension's six instructions — read-write, read-set and read-clear, each
 taking its source from a register or a five-bit immediate — reach a CSR by name:
 
-```mach
+```mach fragment
 asm riscv64 {
     csrrw a0, mstatus, a1   # read mstatus into a0, write a1 into it
     csrr  a0, mtvec         # csrrs a0, mtvec, x0 - the read-only pseudo
@@ -532,7 +532,7 @@ deliberately not exhaustive: the privileged spec defines several hundred address
 across three privilege levels, so **any** CSR is also reachable by its numeric address,
 exactly as a name resolves to one:
 
-```mach
+```mach fragment
 asm riscv64 {
     csrr a0, 0xc01   # the same register as `csrr a0, time`
 }
@@ -567,7 +567,7 @@ Different architectures use different mnemonics, registers, and calling
 conventions. There is no nested arch-block construct inside `asm`; instead,
 wrap each `asm` block in `$if` on `$mach.build.arch`:
 
-```mach
+```mach fragment
 $if ($mach.build.arch == $mach.arch.x86_64) {
     asm x86_64 { ... }
 }

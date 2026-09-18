@@ -13,7 +13,7 @@ ordinary std tags.
 
 ## Grammar
 
-```mach
+```mach fragment
 tag NAME: u8 {
     case1;
     case2: type;
@@ -65,7 +65,7 @@ pub tag Entry: u8 {
 An empty tag, a duplicate case name and a discriminator too narrow for the
 case count are rejected:
 
-```mach
+```mach error duplicate tag case name
 tag Twice: u8 {
     one;
     one;
@@ -93,7 +93,7 @@ case takes empty braces. There is no other construction form:
 - The record-literal form (`Reply{value: 1}` or `Reply{empty}`) is a compile error
 - A case selector alone (`Reply.value`) is not a value
 
-```mach
+```mach error this tag case requires a payload
 tag Reply: u8 { empty; value: i64; }
 
 val missing: Reply = Reply.value{};     # the case declares a payload
@@ -182,7 +182,7 @@ or `err` as a tag or as anything else. Declaring one twice in a module is the
 ordinary duplicate definition. A module that spells `res` without importing it
 is rejected the way any unresolved type name is:
 
-```mach
+```mach error unresolved type name `res`
 tag ParseError: u8 { invalid; }
 
 fun parse(x: i64) res[i64, ParseError] { ret res[i64, ParseError].ok{x}; }
@@ -235,7 +235,7 @@ fun tests(reply: Reply, next: opt[i64], a: opt[i64], b: opt[i64]) bool {
 
 `sel` takes a place, so a call result is refused:
 
-```mach
+```mach error `sel` tests a place
 tag Reply: u8 { empty; value: i64; }
 
 fun make() Reply { ret Reply.empty{}; }
@@ -282,7 +282,7 @@ fun read_value(reply: Reply) i64 {
 
 A payload read outside a guard is a compile error:
 
-```mach
+```mach error a tag payload requires a `sel` guard
 tag Reply: u8 { empty; value: i64; }
 
 fun read_value(reply: Reply) i64 {
@@ -304,7 +304,7 @@ the existing value rules, writing it keeps the selected case, and `?value.case`
 yields a typed pointer to naturally aligned storage. Whole-value assignment to
 the guarded place is a compile error; rebind to a new name instead.
 
-```mach
+```mach error cannot assign to this place inside a guard
 tag Reply: u8 { empty; value: i64; }
 
 fun reset(reply: Reply) i64 {
@@ -392,7 +392,7 @@ Case descriptors expose `name`, `has_payload`, `type`, `offset`, and `code`.
 Accessing `type` or `offset` on a descriptor where `has_payload` is false is an
 error.
 
-```mach
+```mach fragment
 $each case in $cases(T) {
     if (sel value.[case]) {
         $if (case.has_payload) {
