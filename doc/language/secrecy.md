@@ -334,7 +334,10 @@ parsed into instructions and walked for the same three leaks the compiler checks
 everywhere else — a secret reaching a branch condition, a memory address, or a
 variable-latency operation the target cannot do in constant time. Taint enters
 through the block's `{name}` bindings, whose secrecy is stamped from the local's
-declared type. What the walk cannot model, it refuses:
+declared type. A pointer to a secret (`*^u32`) is a public address and a secret
+load: the register it is staged into may address memory, and what a load through
+it produces is secret, while a secret pointer (`^*u32`) is a secret address. What
+the walk cannot model, it refuses:
 
 | construct | why |
 |---|---|
