@@ -1418,6 +1418,10 @@ fun maybe_sink_hint(ctx: *AllocCtx, mi: *mir.MirInstr, pos: u32, nv: u32) {
     ctx.hints[sv].sink_preg = mir.preg_regid(d.preg);
 }
 
+# a copy `d = s` where s dies and d is dead from s's birth to the copy: s
+# takes d's register and the copy vanishes. d may still be read by the
+# instruction that defines s, so that instruction must read d before it
+# writes s, which a two-address op does only for its left operand (#3647)
 fun maybe_reverse_hint(ctx: *AllocCtx, mi: *mir.MirInstr, pos: u32, nv: u32) {
     val d: *mir.MirOperand = ?mi.operands[0];
     val s: *mir.MirOperand = ?mi.operands[1];
@@ -1431,13 +1435,41 @@ fun maybe_reverse_hint(ctx: *AllocCtx, mi: *mir.MirInstr, pos: u32, nv: u32) {
     val dr: *LiveRange = ?ctx.ranges[dv];
     val sr: *LiveRange = ?ctx.ranges[sv];
 
-    if (dr.start >= p || dr.end_pos < p)                      { ret; }
-    if (sr.end_pos != p || sr.start >= p || sr.start < 0)     { ret; }
-    if (ctx.flat[sr.start::u32].block != ctx.flat[pos].block) { ret; }
-    if (reads_in_window(ctx, dv, sr.start, p))                { ret; }
+    if (dr.start >= p || dr.end_pos < p)                               { ret; }
+    if (sr.end_pos != p || sr.start >= p || sr.start < 0)              { ret; }
+    if (ctx.flat[sr.start::u32].block != ctx.flat[pos].block)          { ret; }
+    if (reads_in_window(ctx, dv, sr.start, p))                         { ret; }
+    if (defines_by_clobbering(flat_instr(ctx, sr.start::u32), sv, dv)) { ret; }
 
     ctx.hints[sv].dst_vreg     = dv;
     ctx.hints[sv].dst_copy_pos = p;
+}
+
+# whether `mi` defines `d` and, sharing d's register with `y`, would read y
+# after writing d: a two-address op runs as `d = l; d op= r`, so a right
+# operand or an address register is read after the write; a commutative op
+# is swapped onto its right operand instead and reads it first
+fun defines_by_clobbering(mi: *mir.MirInstr, d: u32, y: u32) bool {
+    if (!instr_defines(mi) || mi.operands[0].vreg.n != d) { ret false; }
+    if (!is_two_address_op(mi.opcode))                    { ret false; }
+    var k: u32 = 1;
+    for (k < mi.operand_count) {
+        val op: *mir.MirOperand = ?mi.operands[k];
+        if (op.kind == mir.MIR_OP_VREG && op.vreg.n == y) {
+            if (k == 1) { ret false; }
+            if (mir.has(mi.opcode, mir.MIRF_COMMUTATIVE)) {
+                val l: *mir.MirOperand = ?mi.operands[1];
+                if (!(l.kind == mir.MIR_OP_VREG && l.vreg.n == y)) { ret false; }
+            }
+            ret true;
+        }
+        if (op.kind == mir.MIR_OP_MEM && !mir.vreg_is_nil(op.vreg) && op.vreg.n == y) { ret true; }
+        if (sel op.index.vreg) {
+            if (op.index.vreg.n == y) { ret true; }
+        }
+        k = k + 1;
+    }
+    ret false;
 }
 
 # liveness scratch: per-register use and definition blocks and per-block
@@ -4442,6 +4474,97 @@ test "mach.lang.be.codegen.regalloc.maybe_sink_hint:records_only_a_dying_full_wi
     maybe_sink_hint(?ctx, ?mv, 10, 2);
     if (hints[1].sink_preg != -1) { ret 1; }
 
+    ret 0;
+}
+
+# `s = f(d, ...)` then `d = s`: s may take d's register only when the op reads
+# d before writing s, which rules out a non-commutative two-address right
+# operand and an address register (#3647)
+test "mach.lang.be.codegen.regalloc.maybe_reverse_hint:refuses_a_right_operand_the_op_would_clobber" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 3);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 2);
+    val ro: res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](?alloc, 3::usize);
+    if (sel ro.err) { ret 1; }
+    val ops: *mir.MirOperand = ro.ok;
+    ops[0]      = mir.op_vreg(mir.vreg_id(1));
+    ops[1]      = mir.op_vreg(mir.vreg_id(2));
+    ops[2]      = mir.op_vreg(mir.vreg_id(0));
+    b.instrs[0] = mir.instr(mir.MIR_SEL_SUB, ops, 3, 8, 8);
+    t_mov(?alloc, ?b, 1, mir.op_vreg(mir.vreg_id(0)), mir.op_vreg(mir.vreg_id(1)));
+    f.blocks      = ?b;
+    f.block_count = 1;
+    f.block_cap   = 1;
+
+    var flat: [2]FlatInstr;
+    flat[0].block   = 0;
+    flat[0].instr   = 0;
+    flat[0].is_call = false;
+    flat[1].block   = 0;
+    flat[1].instr   = 1;
+    flat[1].is_call = false;
+    var ranges: [3]LiveRange;
+    var hints:  [3]CopyHint;
+    var slots:  [3]bool;
+    var ctx:    AllocCtx;
+    t_ctx(?ctx, ?alloc, ?f, ?slots[0]);
+    ctx.flat       = ?flat[0];
+    ctx.flat_count = 2;
+    ctx.ranges     = ?ranges[0];
+    ctx.hints      = ?hints[0];
+    var i: u32 = 0;
+    for (i < 3) {
+        hints[i].src_vreg     = mir.MIR_VREG_NIL.n;
+        hints[i].src_preg     = -1;
+        hints[i].copy_pos     = -1;
+        hints[i].dst_vreg     = mir.MIR_VREG_NIL.n;
+        hints[i].dst_copy_pos = -1;
+        hints[i].sink_preg    = -1;
+        ranges[i].start       = 0;
+        ranges[i].end_pos     = 1;
+        i                     = i + 1;
+    }
+    ranges[0].end_pos = 5;
+    ranges[1].start   = 0;
+    ranges[1].end_pos = 1;
+    val copy: *mir.MirInstr = ?b.instrs[1];
+
+    # d is the right operand of a sub: refused
+    ranges[0].start = -1;
+    maybe_reverse_hint(?ctx, copy, 1, 3);
+    if (hints[1].dst_vreg != mir.MIR_VREG_NIL.n) { ret 2; }
+
+    # the same op with d on the left is read first: hinted
+    ops[1] = mir.op_vreg(mir.vreg_id(0));
+    ops[2] = mir.op_vreg(mir.vreg_id(2));
+    maybe_reverse_hint(?ctx, copy, 1, 3);
+    if (hints[1].dst_vreg != 0)     { ret 3; }
+    if (hints[1].dst_copy_pos != 1) { ret 3; }
+
+    # a commutative op is swapped onto its right operand: hinted
+    hints[1].dst_vreg     = mir.MIR_VREG_NIL.n;
+    hints[1].dst_copy_pos = -1;
+    ops[1]                = mir.op_vreg(mir.vreg_id(2));
+    ops[2]                = mir.op_vreg(mir.vreg_id(0));
+    b.instrs[0].opcode    = mir.MIR_SEL_ADD;
+    maybe_reverse_hint(?ctx, copy, 1, 3);
+    if (hints[1].dst_vreg != 0) { ret 4; }
+
+    # an address register of the right operand is read after the copy: refused
+    hints[1].dst_vreg     = mir.MIR_VREG_NIL.n;
+    hints[1].dst_copy_pos = -1;
+    ops[2]                = mir.op_mem_value(mir.vreg_id(0), 8);
+    maybe_reverse_hint(?ctx, copy, 1, 3);
+    if (hints[1].dst_vreg != mir.MIR_VREG_NIL.n) { ret 5; }
+
+    # a single instruction reads every operand before it writes: hinted
+    ops[2]             = mir.op_vreg(mir.vreg_id(0));
+    b.instrs[0].opcode = mir.MIR_MOV;
+    maybe_reverse_hint(?ctx, copy, 1, 3);
+    if (hints[1].dst_vreg != 0) { ret 6; }
     ret 0;
 }
 
