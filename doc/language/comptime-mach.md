@@ -6,7 +6,7 @@ constants. The tags `$mach.{os,arch,abi,mode}.*` exist for path-value
 comparison against the resolved-build facts.
 
 > **Live and reserved paths.** The resolved-build facts (`$mach.build.{os,arch,
-> abi,pointer_width,mode,pie,platform}`, `$mach.build.ext.<name>` and the
+> abi,pointer_width,mode,pie,platform}`, `$mach.build.extensions.<name>` and the
 > `$mach.build.ct_mul(op, width)` query), the tag tables (`$mach.{os,arch,abi,mode}.*`),
 > the compiler version (`$mach.version` and `$mach.version.{major,minor,patch}`),
 > and `$mach.compiler.{name,version}` are live. The `$mach.build.{timestamp,
@@ -32,7 +32,7 @@ $mach.build.mode                # live; compared against $mach.mode.* tags
 $mach.build.pie                 # live; 1 when building position-independent, else 0
 $mach.build.platform            # live; the target's open platform tag as a string, "" when unset
 $mach.build.ct_mul(op, width)   # live; 1 when a secret multiply of that cell is admitted, else 0
-$mach.build.ext.<name>          # live; 1 when the target selects that instruction-set extension, else 0
+$mach.build.extensions.<name>   # live; 1 when the target selects that instruction-set extension, else 0
 $mach.build.timestamp           # stub — not yet available
 $mach.build.host                # stub — not yet available
 $mach.build.git.commit          # stub — not yet available
@@ -40,7 +40,7 @@ $mach.build.git.dirty           # stub — not yet available
 ```
 
 The members above are the whole subtree, and no manifest key adds one. The
-`ext` members are the compiler's own extension vocabularies, not the manifest's. A
+`extensions` members are the selected isa's own vocabulary, not the manifest's. A
 `$mach.build.<name>` that names none of them is a compile error at the use site
 (`` unknown `$mach.*` path ``). A project's own configuration constants are
 ordinary `val`s selected with `$if` over the facts above.
@@ -80,37 +80,58 @@ $if ($mach.build.ct_mul(wide_u, 64) == 1) {
   missing argument, or arguments on any other path is a compile error that names
   what is accepted.
 
-#### `$mach.build.ext.<name>` — instruction-set extensions
+#### `$mach.build.extensions.<name>` — instruction-set extensions
 
-One `u8` member per extension name, like `$mach.build.pie`. It is 1 when the selected
-target selects that extension and 0 otherwise. A build selects extensions with the
-target's `extensions` key and, on riscv, its isa string (see
-[Instruction-set extensions](manifest.md#instruction-set-extensions)).
+One `u8` member per extension name of the selected isa, like `$mach.build.pie`. It is
+1 when the target selects that extension and 0 otherwise. A build selects extensions
+with the target's `extensions` key and, on riscv, its isa string, closed over what
+each one implies (see
+[Instruction-set extensions](manifest.md#instruction-set-extensions)), so
+`extensions = ["sse41"]` answers 1 for `ssse3` too.
 
-The names come from the compiler's per-isa vocabularies:
+The names are the selected isa's vocabulary and nothing else:
 
 - `x86_64`: `ssse3`, `sse41`, `sha`, `fsgsbase`;
 - `aarch64`: `sha2`;
 - `riscv64` and `riscv32`: `i`, `m`, `a`, `f`, `d`, `c`, `zicsr`, `zifencei`.
 
-A name another isa declares folds to 0, so one chain can ask about every isa without
-an architecture guard:
+A name the selected isa does not declare is a compile error, never a silent 0, as
+`$mach.arch.*` refuses an unknown architecture:
+
+```
+`$mach.build.extensions.sha`: `sha` is not an extension of isa 'aarch64'; its
+extensions are: sha2
+```
+
+So a source that serves several isas nests the extension question under an
+architecture guard. `&&` does not stand in for the nesting: every `$mach` path in a
+condition is checked on its own, so
+`$if ($mach.build.arch == $mach.arch.x86_64 && $mach.build.extensions.sha == 1)` is
+refused on aarch64 although the left side is false. Write the nested form:
 
 ```mach fragment
-$if ($mach.build.ext.sha == 1 && $mach.build.ext.ssse3 == 1 && $mach.build.ext.sse41 == 1) {
-    use backend: std.crypto.hash.sha256.x86_sha;
+$if ($mach.build.arch == $mach.arch.x86_64) {
+    $if ($mach.build.extensions.sha == 1) {
+        use backend: std.crypto.hash.sha256.x86_sha;
+    }
+    $or {
+        use backend: std.crypto.hash.sha256.portable;
+    }
 }
-$or ($mach.build.ext.sha2 == 1) {
-    use backend: std.crypto.hash.sha256.arm_sha2;
+$or ($mach.build.arch == $mach.arch.aarch64) {
+    $if ($mach.build.extensions.sha2 == 1) {
+        use backend: std.crypto.hash.sha256.arm_sha2;
+    }
+    $or {
+        use backend: std.crypto.hash.sha256.portable;
+    }
 }
 $or {
     use backend: std.crypto.hash.sha256.portable;
 }
 ```
 
-A name no isa declares is a compile error listing the known names
-(`` `$mach.build.ext.avx9`: no instruction set declares an extension `avx9`; the known
-extensions are: ... ``). So is a bare `$mach.build.ext`.
+A bare `$mach.build.extensions` is refused too.
 
 In an editor union build each target tuple answers for its own target, as
 `$mach.build.os` does.

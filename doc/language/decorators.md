@@ -660,21 +660,30 @@ processor's features and when that answer holds.
   is refused, and the refusal lists the known names. A name another instruction
   set declares admits nothing on this target and is not an error, so one
   declaration serves a multi-arch source: `#[extensions(sse41, sha2)]` admits
-  `sse41` on x86_64 and `sha2` on aarch64. Each name may appear once. The
-  names are those the manifest's
-  [`extensions`](manifest.md#instruction-set-extensions) key takes.
+  `sse41` on x86_64 and `sha2` on aarch64, and an `asm aarch64 {}` block in an
+  x86_64 build still refuses `sha256h` because the tag, not the decorator, picks
+  the isa. Each name may appear once. The names are those the manifest's
+  [`extensions`](manifest.md#instruction-set-extensions) key takes, closed over
+  what they imply (`sse41` admits `pshufb`), except the rows only a target
+  selects (riscv `i`, `c`, `f`, `d`), which are refused with the reason.
+- **One predicate, everywhere.** A function's admitted set is the target's
+  selection plus what the decorator names. An instruction requiring an extension
+  is emitted only into a function whose admitted set holds it (see
+  [asm.md](asm.md#extension-instructions)); the encoder checks every row against
+  it, and the inliner checks it before moving a body, so an outlier the target
+  already selects may still inline into a baseline caller.
 - **Only the instructions change.** The decorator admits instructions in the
   function's inline `asm`. It does not change how the compiler generates the
   rest of the body, which stays within the target's selection. The function is
   called through the ordinary ABI, and its address is an ordinary `fun(...)`
   value that dispatch through a pointer calls like any other.
 - **It is never inlined into a caller that admits less.** The inliner declines
-  to move an outlier's body into a function that does not admit every extension
-  the outlier does, so the extension instructions stay behind the call the
-  run-time check guards. `#[inline]` does not override this. A caller carrying
-  a superset of the outlier's extensions may still inline it, and any function
-  may be inlined *into* an outlier. A generic function's instances carry the
-  decorator's set.
+  to move an outlier's body into a function whose admitted set does not hold
+  every extension the outlier's does, so the extension instructions stay behind
+  the call the run-time check guards. `#[inline]` does not override this. A
+  caller carrying a superset of the outlier's extensions may still inline it,
+  and any function may be inlined *into* an outlier. A generic function's
+  instances carry the decorator's set.
 - **Nothing else changes.** The decorator composes with `inline`, `noinline`,
   `symbol` and `section`. `#[oblivious]` already refuses the instructions a
   constant-time check cannot model, and an extension row it can model is

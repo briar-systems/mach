@@ -225,6 +225,15 @@ encoder refuses it unless the target selects that extension (the manifest's
 function admits it with [`#[extensions(...)]`](decorators.md#extensionsnames--an-outlier-function).
 The refusal names the instruction, the extension, and both ways to admit it.
 
+The one invariant behind every check: **an instruction that requires extension E
+is emitted only into a function whose admitted set holds E**, where a function's
+admitted set is the target's selection plus what its `#[extensions(...)]` names,
+each closed over what it implies. The encoder applies it to every row of an `asm`
+block, and the inliner applies the same predicate before moving one body into
+another, so an inlined body never carries an instruction its new home does not
+admit. An `asm` block has no spelling of its own: the tag is the isa, and the block
+inherits its function's set.
+
 | isa | extension | mnemonics |
 |---|---|---|
 | x86_64 | `ssse3` | `pshufb xmm, xmm/m128`, `palignr xmm, xmm/m128, imm8` |

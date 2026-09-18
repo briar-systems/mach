@@ -228,7 +228,7 @@ abi        = "sysv64"
 ```
 
 Each isa owns its vocabulary. The names are identifiers, so each one is also a
-comptime member, `$mach.build.ext.<name>` (see [`$mach`](comptime-mach.md)):
+comptime member, `$mach.build.extensions.<name>` (see [`$mach`](comptime-mach.md)):
 
 | `isa` | Baseline | Extensions |
 |-------|----------|------------|
@@ -248,10 +248,29 @@ ssse3, sse41, sha, fsgsbase
 The array must hold strings, and each name must be an identifier (`sse41`, not
 `sse4.1`) listed once.
 
-On riscv the isa string and the list feed one set, so
+A level is a bundle, never an axis of its own: each name may imply others, and the
+selection is closed over that once, when the target resolves. `sse41` brings `ssse3`
+(the chain stops there; SSE3 is not modelled). On riscv `d` brings `f` and `f` brings
+`zicsr`, as the isa string's own grammar has it, so `extensions = ["d"]` on `rv64i`
+selects `rv64ifd` with Zicsr. The isa string and the list feed one set:
 `isa = "rv64i"` with `extensions = ["m"]` selects the same machine as
-`isa = "rv64im"`. The combination follows the string's rules: F brings Zicsr, and D
-without F is refused.
+`isa = "rv64im"`. Nothing is gated on a level name; a future `x86-64-v2` would expand
+to bits the way riscv `g` does.
+
+The list is never part of `{target.isa}`. That placeholder is the `isa` value as
+written (`rv64i`, `x86_64`), on every isa; the list belongs to the target's identity
+and to `{target.name}`.
+
+"Selects" means instruction admission and nothing more: the inline assembler admits
+the extension's rows and `$mach.build.extensions.<name>` answers 1. It never means a
+mode is on. A row such as a `dit` would admit `msr dit`, not set it.
+
+Some rows are the target's alone. On riscv `i` is the baseline, `c` is a code-size
+selection mach never emits, and `f` and `d` select the float register file and the
+calling convention's float registers, so none of them may be named in
+[`#[extensions(...)]`](decorators.md#extensionsnames--an-outlier-function); the
+refusal says why. Every x86_64 and aarch64 row, and riscv `m`, `a`, `zicsr` and
+`zifencei`, may be.
 
 Selecting an extension is a promise about **every** machine the binary runs on. The
 inline assembler admits the extension's mnemonics anywhere in the build, and a host
