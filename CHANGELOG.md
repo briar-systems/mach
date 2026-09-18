@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Inside an inline `asm` block in an `#[oblivious]` function a binding whose type is a pointer to a secret, `*^u32` or `*^u8`, is a public address, not a secret value. The binding used to be stamped with one secrecy bit read through the pointer, so staging it into a register and loading through that register was refused as addressing memory with a secret, which kept `#[oblivious]` off exactly the hardware-hash bodies that need it (mach-std's `sha_ni_block` and `sha2_block` at their secret instances). A binding now carries two facts: whether its own storage is secret (`^u64`, `^*T`) and whether it points at a secret (`*^T`, `**^T`, a pointer to a record holding a secret). A pointer to a secret is a public address and a secret load: the load through it taints the destination register, and a branch on, address from or variable-latency operation on the loaded value is refused as before, while the address itself may be a base, an index or a segment base. Copying the address to another register, spilling it, pushing it or installing it as a segment base carries the fact along, so a load through the copy, the reload or the segment is a secret too. A secret pointer, `^*u32`, stays a secret address and keeps its refusals. `mach.lang.ct` gains `BindSecrecy` and `AsmSecret`, the shape the asm bind carries from lowering through MIR into every instruction set's constant-time scan (#3640).
+
 ## [5.5.1] - 2026-09-18
 
 ### Fixed
