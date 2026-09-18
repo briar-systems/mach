@@ -5,7 +5,7 @@ with `;` except where they end with a block `{...}`.
 
 ## `if` / `or`
 
-```mach
+```mach fragment
 if (cond) {
     ...
 } or (cond) {
@@ -79,7 +79,7 @@ fun main(argc: i64, argv: **u8) i64 {
 
 ## `ret`
 
-```mach
+```mach fragment
 ret expr;                   # return a value
 ret;                        # return from a void function
 ```
@@ -166,7 +166,7 @@ whose target loop encloses the fin. A loop fully inside the fin body uses
 `fin` requires a block body (`fin { ... }`). The bare single-statement form
 (`fin stmt;`) is rejected, and so is a `ret` inside a `fin` body:
 
-```mach
+```mach error `ret` cannot appear inside a `fin` body
 fun leave() i64 {
     fin { ret 1; }
     ret 0;
@@ -178,7 +178,7 @@ fun leave() i64 {
 `{ ... }` introduces a new lexical scope. Statements inside are evaluated
 in order. Blocks can stand alone:
 
-```mach
+```mach fragment
 {
     val tmp: i64 = compute();
     use_tmp(tmp);
@@ -189,7 +189,7 @@ in order. Blocks can stand alone:
 
 An expression followed by a semicolon executes as a statement:
 
-```mach
+```mach fragment
 compute();
 ```
 

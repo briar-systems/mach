@@ -137,7 +137,7 @@ error: this is mach 5.2.1, and the dependency closure does not accept it:
 A root manifest without `mach` builds, with a warning that prints the line to
 add (`mach.toml: [project] states no compiler range; add mach = "^5.3", the
 oldest release that reads the key, and raise it when the project uses a later
-feature`). A later release makes the key required. A dependency without it
+feature`). A later release makes the key required (#3496). A dependency without it
 states no constraint. `mach init` writes the same range. It is the oldest
 release of the running compiler's major that reads the key: `^5.3` for every
 5.x compiler, since 5.3.0 is the first release that accepts `mach`, and `^N.0`
@@ -764,7 +764,7 @@ has ever emitted declares, so an artifact that omits the key is byte-identical t
 one built before the key existed. A graphical application sets `"gui"` to stop an
 empty console from opening behind it on launch.
 
-Only a PE image carries the field. A key written on an artifact that is planned
+Only a PE image carries the field. A key written on an artifact that builds
 for a target whose format has none (ELF, Mach-O, a flat image) is refused as
 unsupported, naming the key, the target and the format:
 
@@ -1442,7 +1442,7 @@ link    = []
 need    = ["artifact.shader-*"]
 ```
 
-```mach
+```mach fragment
 #[embed("{artifact.shader-blur.out}")]
 val BLUR: [_]u8;
 ```
@@ -1509,7 +1509,7 @@ link    = []
 need    = []
 ```
 
-```mach
+```mach fragment
 # the dependency's src/lib.mach, compiled by every consumer
 #[embed("{artifact.shader-frag.out}")]
 val FRAG: [_]u8;

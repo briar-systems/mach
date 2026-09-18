@@ -58,7 +58,7 @@ Decorators appear **before** the declaration they target, one per line or
 space-separated on the same line. They attach to the immediately following
 declaration only and do not bleed across declarations.
 
-```mach
+```mach fragment
 #[inline]
 #[symbol("big")]
 fun big(a: i64, b: i64) i64 { ... }
@@ -157,7 +157,7 @@ declaration is checked: value references, calls, address-of, type references
 instantiation, comptime evaluation and decorator arguments. The check has no
 same-module exemption.
 
-```mach
+```mach fragment
 # file: src/queue.mach
 #[testing]
 pub fun filled(n: u32) Queue { ... }
@@ -199,7 +199,7 @@ omits testing declarations.
 Overrides the emitted or imported symbol name. Applies to functions and
 globals.
 
-```mach
+```mach fragment
 #[symbol("main")]
 fun entry(argc: i64, argv: **u8) i64 { ... }
 
@@ -537,7 +537,7 @@ decorator, so a zeroizing wipe is protected in a function carrying no
 `#[oblivious]` at all. See [secrecy.md](secrecy.md#the-zeroizing-write-guarantee)
 for what that covers and what it does not.
 
-```mach
+```mach fragment
 #[oblivious]
 fun ct_eq(a: ^[8]u8, b: ^[8]u8) u8 { ... }
 ```
@@ -561,7 +561,7 @@ Excludes a function from loop auto-vectorization, so its loops compile to scalar
 code even in the release pipeline on a vector-capable target. Applies to
 functions only; takes no arguments.
 
-```mach
+```mach fragment
 #[scalar]
 fun reference_sum(a: *i64, n: usize) i64 { ... }
 ```
@@ -578,7 +578,7 @@ Emits the function's body exactly as written and nothing else: no frame-pointer
 record, no stack allocation, no callee-save stores, no argument moves, and no
 return. Applies to functions only; takes no arguments.
 
-```mach
+```mach fragment
 #[naked] #[symbol("_start")]
 fun start() {
     $if ($mach.build.arch == $mach.arch.x86_64) {
@@ -634,7 +634,7 @@ the initializer. Applies to `val` only — not `var` (the storage is read-only
 data) and not an `ext` data import (which has no storage here). Takes one
 string-literal argument.
 
-```mach
+```mach fragment
 #[embed("assets/logo.qoi")]
 val LOGO: [_]u8;          # length taken from the file's byte count
 
@@ -760,7 +760,7 @@ directives say which kind each variable is. They apply only to module-level
 `val` / `var` bindings, and a variable carries **exactly one** of them — they
 are mutually exclusive.
 
-```mach
+```mach fragment
 #[input(0)]            var in_position: f32x4;
 #[output(0)]           var out_colour:  f32x4;
 #[builtin("position")] var position:    f32x4;
@@ -857,7 +857,7 @@ array, or in a local binding, and each of those is a compile error naming why.
 Sampling a handle is an `#[op(...)]` declaration rather than a language form,
 because a sample IS one SPIR-V instruction like `sqrt` and `dot` are:
 
-```mach
+```mach fragment
 #[op("spirv", "core", "OpImageSampleImplicitLod")]
 fun sample(s: Sampler2D, uv: f32x2) f32x4;
 
@@ -870,7 +870,7 @@ fun frag_main() {
 The separately-bound form works the same way, with the instruction that combines
 an image and a sampler declared alongside it:
 
-```mach
+```mach fragment
 #[op("spirv", "core", "OpSampledImage")]
 fun combine(t: Texture2D, s: Sampler) Sampler2D;
 
@@ -898,7 +898,7 @@ and `Binding` exactly as a `uniform` does.
 A bodyless `def` carrying this directive declares a type whose representation is
 **not the program's**: the owning target mints it and the pipeline binds it.
 
-```mach
+```mach fragment
 #[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED)]
 pub def Texture2D;
 

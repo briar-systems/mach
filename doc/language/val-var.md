@@ -5,7 +5,7 @@ require an explicit type — Mach has no type inference.
 
 ## Grammar
 
-```mach
+```mach fragment
 val NAME: TYPE = EXPR;              # immutable; initializer required
 var NAME: TYPE;                     # mutable; default-initialized
 var NAME: TYPE = EXPR;              # mutable; explicit initializer
@@ -23,7 +23,7 @@ var buf:     [256]u8;               # default-initialized to zero
 fun bump() { counter = counter + 1; }   # var is reassignable
 ```
 
-```mach
+```mach error a `val` is immutable
 val n: i64 = 42;
 
 fun change() { n = 43; }            # ERROR: `n` is a val
@@ -109,7 +109,7 @@ Every binding declares its type. An untyped numeric literal is checked
 against the binding's declared type; it does not participate in inferring
 that type.
 
-```mach
+```mach error bindings require an explicit type annotation
 val n: i64 = 42;                    # ok — 42 conforms to i64
 val x       = 42;                   # ERROR — a binding declares its type
 val y       = 42i64;                # ERROR — a suffix is not an annotation
