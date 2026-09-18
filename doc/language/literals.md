@@ -26,7 +26,7 @@ digit separators (`0xFFu8`, `0b1010u16`, `1_000_000u32`, `1.5e2f32`).
 A suffixed literal *is* that type, in the same way a variable of that type
 is. It is not a hint, and it is never silently retyped:
 
-```mach
+```mach error type mismatch: expected u64, found u32
 val a: u32 = 7u32;      # fine
 val b: u64 = 7u32;      # error: type mismatch, expected u64, found u32
 val c: f64 = 1.5f32;    # error: type mismatch, expected f64, found f32
@@ -46,7 +46,7 @@ A literal outside the range of the type its suffix declares is rejected,
 with the range named. A leading `-` is part of the range check, so the
 most negative value of a signed type is written the way it reads:
 
-```mach
+```mach error literal 128 is out of range for i8
 val a: i8  = -128i8;   # fine
 val b: i8  = 128i8;    # error: literal 128 is out of range for i8 (-128..127)
 val c: u8  = 256u8;    # error: literal 256 is out of range for u8 (0..255)

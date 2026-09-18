@@ -6,7 +6,7 @@ consumers of this module.
 
 ## Grammar
 
-```mach
+```mach fragment
 use PATH;                   # binds the leaf component
 use ALIAS: PATH;            # binds ALIAS
 ```
@@ -35,7 +35,7 @@ val c: usize = 3;
 val d: my_usize = 4;
 ```
 
-```mach
+```mach fragment
 use mylib;                       # bare project id: binds mylib's public module
 ```
 
