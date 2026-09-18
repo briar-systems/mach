@@ -123,6 +123,7 @@ val DW_OP_eq:          u8 = 0x29;
 val DW_OP_le:          u8 = 0x2c;
 val DW_OP_lt:          u8 = 0x2d;
 val DW_OP_ne:          u8 = 0x2e;
+val DW_OP_piece:       u8 = 0x93;
 
 val DW_UT_compile: u8 = 0x01;
 
@@ -252,6 +253,8 @@ val VLOC_REG:   u8 = 1;
 val VLOC_FRAME: u8 = 2;
 val VLOC_CONST: u8 = 4;
 val VLOC_CMP:   u8 = 5;
+# a legalized value whose lanes each have their own home
+val VLOC_PIECES: u8 = 6;
 
 rec DwVar {
     name_off:    u32;
@@ -285,6 +288,18 @@ rec LocRange {
     cmp_signed: bool;
     cmp_width:  u8;
     reused:     bool;
+    pieces:     PieceHomes;
+}
+
+# the home of each lane of a VLOC_PIECES range, lane 0 first; a lane whose home is
+# unknown keeps VLOC_NONE and is described as an empty piece
+rec PieceHomes {
+    count: u8;
+    bytes: u8;
+    seen:  u32;
+    kind:  [mir.DBG_LANES_MAX]u8;
+    reg:   [mir.DBG_LANES_MAX]i32;
+    off:   [mir.DBG_LANES_MAX]i64;
 }
 
 rec DwInline {
@@ -308,10 +323,53 @@ rec DwInlineRange {
 fun home_eq(k1: u8, r1: i32, o1: i64, n1: i64, k2: u8, r2: i32, o2: i64, n2: i64) bool {
     if (k1 != k2)                         { ret false; }
     if (k1 == VLOC_CMP || k2 == VLOC_CMP) { ret false; }
+    if (k1 == VLOC_PIECES)                { ret false; }
     if (k1 == VLOC_REG)                   { ret r1 == r2 && n1 == n2; }
     if (k1 == VLOC_FRAME)                 { ret o1 == o2 && n1 == n2; }
     if (k1 == VLOC_CONST)                 { ret o1 + n1 == o2 + n2; }
     ret true;
+}
+
+# whether a lane's storage is another home's: an offset applied to the value does
+# not move the storage, so it is not compared
+fun lane_home_hits(k: u8, r: i32, o: i64, k2: u8, r2: i32, o2: i64) bool {
+    if (k != k2)         { ret false; }
+    if (k == VLOC_REG)   { ret r == r2; }
+    if (k == VLOC_FRAME) { ret o == o2; }
+    ret false;
+}
+
+# whether one range's storage is any of the other's: a composite is a home per
+# lane, so it is clobbered when any lane is
+fun homes_overlap(a: *LocRange, b: *LocRange) bool {
+    if (a.kind != VLOC_PIECES && b.kind != VLOC_PIECES) {
+        ret home_eq(a.kind, a.reg, a.off, a.net, b.kind, b.reg, b.off, b.net);
+    }
+    if (a.kind == VLOC_PIECES && b.kind == VLOC_PIECES) {
+        var i: u32 = 0;
+        for (i < a.pieces.count::u32) {
+            var j: u32 = 0;
+            for (j < b.pieces.count::u32) {
+                if (lane_home_hits(a.pieces.kind[i], a.pieces.reg[i], a.pieces.off[i],
+                    b.pieces.kind[j], b.pieces.reg[j], b.pieces.off[j])) { ret true; }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        ret false;
+    }
+    var p: *LocRange = a;
+    var w: *LocRange = b;
+    if (b.kind == VLOC_PIECES) {
+        p = b;
+        w = a;
+    }
+    var i: u32 = 0;
+    for (i < p.pieces.count::u32) {
+        if (lane_home_hits(p.pieces.kind[i], p.pieces.reg[i], p.pieces.off[i], w.kind, w.reg, w.off)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 val TK_BASE:    u8 = 0;
@@ -1533,6 +1591,35 @@ fun emit_counted_cmp_loc(b: *enc.ByteBuf, rg: *LocRange) {
     enc.buf_dnit(?e);
 }
 
+# a composite location, lanes in memory order: legalize lays lane i at byte i * width
+fun build_pieces_ops(e: *enc.ByteBuf, p: *PieceHomes) {
+    var i: u32 = 0;
+    for (i < p.count::u32) {
+        if (p.kind[i] == VLOC_REG) {
+            emit_reg_op(e, DW_OP_reg0, DW_OP_regx, p.reg[i]);
+        }
+        or (p.kind[i] == VLOC_FRAME) {
+            enc.emit_byte(e, DW_OP_fbreg);
+            sleb(e, p.off[i]);
+        }
+        enc.emit_byte(e, DW_OP_piece);
+        uleb(e, p.bytes::u64);
+        i = i + 1;
+    }
+}
+
+fun emit_counted_pieces_loc(b: *enc.ByteBuf, p: *PieceHomes) {
+    var e: enc.ByteBuf = enc.buf_init(b.alloc);
+    build_pieces_ops(?e, p);
+    uleb(b, e.len::u64);
+    var i: usize = 0;
+    for (i < e.len) {
+        enc.emit_byte(b, e.data[i]);
+        i = i + 1;
+    }
+    enc.buf_dnit(?e);
+}
+
 fun emit_var_location(b: *enc.ByteBuf, v: *DwVar) {
     emit_counted_loc(b, v.loc_kind, v.reg, v.offset, v.net, v.byref, v.storage);
 }
@@ -1569,8 +1656,9 @@ fun build_loclists(b: *enc.ByteBuf, funcs: *DwFunc, nfuncs: u32, vars: *DwVar, r
                     enc.emit_byte(b, DW_LLE_offset_pair);
                     uleb(b, (rg.start - fn.offset)::u64);
                     uleb(b, (rg.end - fn.offset)::u64);
-                    if (rg.kind == VLOC_CMP) { emit_counted_cmp_loc(b, rg); }
-                    or                       { emit_counted_loc(b, rg.kind, rg.reg, rg.off, rg.net, v.byref, rg.storage); }
+                    if (rg.kind == VLOC_CMP)    { emit_counted_cmp_loc(b, rg); }
+                    or (rg.kind == VLOC_PIECES) { emit_counted_pieces_loc(b, ?rg.pieces); }
+                    or                          { emit_counted_loc(b, rg.kind, rg.reg, rg.off, rg.net, v.byref, rg.storage); }
                 }
                 r = r + 1;
             }
@@ -2868,6 +2956,11 @@ fun gather_vars(s: *debug_input.DebugProgram, irmod: *ir.Module, dtypes: *ir_typ
                 k = k + 1;
                 cnt;
             }
+            if (vl.pieces != 0) {
+                gather_piece(s, irfn, vl, hi, v.range_start, ranges, range_count);
+                k = k + 1;
+                cnt;
+            }
 
             var kind:       u8   = VLOC_NONE;
             var reg:        i32  = 0;
@@ -2903,23 +2996,24 @@ fun gather_vars(s: *debug_input.DebugProgram, irmod: *ir.Module, dtypes: *ir_typ
                     if (vl.end_offset != 0) { end = vl.end_offset; }
                 }
             }
-            ranges[@range_count].start      = vl.text_offset;
-            ranges[@range_count].end        = end;
-            ranges[@range_count].kind       = kind;
-            ranges[@range_count].reg        = reg;
-            ranges[@range_count].off        = off;
-            ranges[@range_count].net        = dbg_expr_net(irfn, vl.iid::id.InstructionId);
-            ranges[@range_count].storage    = storage;
-            ranges[@range_count].kind1      = kind1;
-            ranges[@range_count].kind2      = kind2;
-            ranges[@range_count].reg2       = reg2;
-            ranges[@range_count].off2       = off2;
-            ranges[@range_count].cmp_rel    = cmp_rel;
-            ranges[@range_count].cmp_signed = cmp_signed;
-            ranges[@range_count].cmp_width  = cmp_width;
-            ranges[@range_count].reused     = false;
-            @range_count                    = @range_count + 1;
-            k                               = k + 1;
+            ranges[@range_count].start        = vl.text_offset;
+            ranges[@range_count].end          = end;
+            ranges[@range_count].kind         = kind;
+            ranges[@range_count].reg          = reg;
+            ranges[@range_count].off          = off;
+            ranges[@range_count].net          = dbg_expr_net(irfn, vl.iid::id.InstructionId);
+            ranges[@range_count].storage      = storage;
+            ranges[@range_count].kind1        = kind1;
+            ranges[@range_count].kind2        = kind2;
+            ranges[@range_count].reg2         = reg2;
+            ranges[@range_count].off2         = off2;
+            ranges[@range_count].cmp_rel      = cmp_rel;
+            ranges[@range_count].cmp_signed   = cmp_signed;
+            ranges[@range_count].cmp_width    = cmp_width;
+            ranges[@range_count].reused       = false;
+            ranges[@range_count].pieces.count = 0;
+            @range_count                      = @range_count + 1;
+            k                                 = k + 1;
         }
         v.range_count = @range_count - v.range_start;
 
@@ -2955,6 +3049,62 @@ fun gather_vars(s: *debug_input.DebugProgram, irmod: *ir.Module, dtypes: *ir_typ
     }
 }
 
+# one lane's home joins the pieces range its siblings at the same address opened,
+# or opens it; a lane never seen, or a value with an offset applied, has no home
+fun gather_piece(s: *debug_input.DebugProgram, irfn: *ir.Function, vl: *enc.VarLoc, hi: u32,
+    var_range_start: u32, ranges: *LocRange, range_count: *u32) {
+    if (vl.pieces::u32 > mir.DBG_LANES_MAX || vl.piece >= vl.pieces) { ret; }
+    var at: u32 = @range_count;
+    if (at > var_range_start) {
+        val last: *LocRange = ?ranges[at - 1];
+        if (last.start == vl.text_offset && (last.kind == VLOC_PIECES || last.kind == VLOC_NONE)
+            && last.pieces.count == vl.pieces && (last.pieces.seen & (1::u32 << vl.piece::u32)) == 0) {
+            at = at - 1;
+        }
+    }
+    val rg: *LocRange = ?ranges[at];
+    if (at == @range_count) {
+        rg.start        = vl.text_offset;
+        rg.end          = hi;
+        rg.kind         = VLOC_NONE;
+        rg.reg          = 0;
+        rg.off          = 0;
+        rg.net          = dbg_expr_net(irfn, vl.iid::id.InstructionId);
+        rg.storage      = false;
+        rg.kind1        = VLOC_NONE;
+        rg.kind2        = VLOC_NONE;
+        rg.reg2         = 0;
+        rg.off2         = 0;
+        rg.cmp_rel      = 0;
+        rg.cmp_signed   = false;
+        rg.cmp_width    = 0;
+        rg.reused       = false;
+        rg.pieces.count = vl.pieces;
+        rg.pieces.bytes = vl.piece_bytes;
+        rg.pieces.seen  = 0;
+        var i: u32 = 0;
+        for (i < mir.DBG_LANES_MAX) {
+            rg.pieces.kind[i] = VLOC_NONE;
+            rg.pieces.reg[i]  = 0;
+            rg.pieces.off[i]  = 0;
+            i                 = i + 1;
+        }
+        @range_count = @range_count + 1;
+    }
+    var kind:    u8   = VLOC_NONE;
+    var reg:     i32  = 0;
+    var off:     i64  = 0;
+    var storage: bool = false;
+    varloc_home(s, vl, ?kind, ?reg, ?off, ?storage);
+    val p: u32 = vl.piece::u32;
+    rg.pieces.seen    = rg.pieces.seen | (1::u32 << p);
+    rg.pieces.kind[p] = kind;
+    rg.pieces.reg[p]  = reg;
+    rg.pieces.off[p]  = off;
+    # an offset applies to the whole value, which no lane can carry
+    if (kind != VLOC_NONE && rg.net == 0) { rg.kind = VLOC_PIECES; }
+}
+
 fun bound_storage_reuse(vars: *DwVar, ranges: *LocRange, fn_var_start: u32, var_count: u32, vi: u32, rg: *LocRange) {
     val site: u32 = vars[vi].inline_site;
     var vj:   u32 = fn_var_start;
@@ -2968,8 +3118,7 @@ fun bound_storage_reuse(vars: *DwVar, ranges: *LocRange, fn_var_start: u32, var_
         val oend:  u32    = other.range_start + other.range_count;
         for (rk < oend) {
             val og: *LocRange = ?ranges[rk];
-            if (range_real_home(other, og) && og.start > rg.start && og.start < rg.end
-                && home_eq(rg.kind, rg.reg, rg.off, rg.net, og.kind, og.reg, og.off, og.net)) {
+            if (range_real_home(other, og) && og.start > rg.start && og.start < rg.end && homes_overlap(rg, og)) {
                 rg.end    = og.start;
                 rg.reused = true;
             }
@@ -3062,7 +3211,7 @@ fun classify_var(v: *DwVar, ranges: *LocRange) {
         v.loc_kind = VLOC_LOCLIST;
         ret;
     }
-    if (ranges[first::u32].kind == VLOC_CMP) {
+    if (ranges[first::u32].kind == VLOC_CMP || ranges[first::u32].kind == VLOC_PIECES) {
         v.loc_kind = VLOC_LOCLIST;
         ret;
     }
@@ -5099,6 +5248,44 @@ test "mach.lang.be.codegen.dwarf.emit_frame_base:reg_and_regx" {
     ret code;
 }
 
+test "mach.lang.be.codegen.dwarf.emit_counted_pieces_loc:register_frame_and_unknown_lanes" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var p: PieceHomes;
+    p.count   = 3;
+    p.bytes   = 4;
+    p.seen    = 7;
+    p.kind[0] = VLOC_REG;
+    p.reg[0]  = 5;
+    p.off[0]  = 0;
+    p.kind[1] = VLOC_FRAME;
+    p.reg[1]  = 0;
+    p.off[1]  = -68;
+    p.kind[2] = VLOC_NONE;
+    p.reg[2]  = 0;
+    p.off[2]  = 0;
+    var b: enc.ByteBuf = enc.buf_init(?alloc);
+    emit_counted_pieces_loc(?b, ?p);
+    # DW_OP_reg5 piece 4, DW_OP_fbreg -68 piece 4, and an empty piece 4
+    var e: [11]u8;
+    e[0]  = 10;
+    e[1]  = 0x55;
+    e[2]  = 0x93;
+    e[3]  = 4;
+    e[4]  = 0x91;
+    e[5]  = 0xbc;
+    e[6]  = 0x7f;
+    e[7]  = 0x93;
+    e[8]  = 4;
+    e[9]  = 0x93;
+    e[10] = 4;
+    var code: i32 = 0;
+    if (!buf_eq(?b, ?e[0], 11)) { code = 1; }
+    enc.buf_dnit(?b);
+    ret code;
+}
+
 test "mach.lang.be.codegen.dwarf.emit_var_location:reg_frame_salvage" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -5361,6 +5548,90 @@ test "mach.lang.be.codegen.dwarf.bound_storage_reuse:same_site_truncates_cross_s
     rg2.reused = false;
     bound_storage_reuse(?vars[0], ?ranges[0], 0, 2, 0, ?rg2);
     if (rg2.end != 100 || rg2.reused) { code = 1; }
+    ret code;
+}
+
+fun t_pieces_range(rg: *LocRange, start: u32, end: u32, r0: i32, off1: i64) {
+    rg.start          = start;
+    rg.end            = end;
+    rg.kind           = VLOC_PIECES;
+    rg.reg            = 0;
+    rg.off            = 0;
+    rg.net            = 0;
+    rg.reused         = false;
+    rg.pieces.count   = 2;
+    rg.pieces.bytes   = 4;
+    rg.pieces.seen    = 3;
+    rg.pieces.kind[0] = VLOC_REG;
+    rg.pieces.reg[0]  = r0;
+    rg.pieces.off[0]  = 0;
+    rg.pieces.kind[1] = VLOC_FRAME;
+    rg.pieces.reg[1]  = 0;
+    rg.pieces.off[1]  = off1;
+}
+
+test "mach.lang.be.codegen.dwarf.bound_storage_reuse:a_lane_is_a_home" {
+    var code:   i32 = 0;
+    var vars:   [2]DwVar;
+    var ranges: [2]LocRange;
+    vars[0].inline_site = 0;
+    vars[0].byref       = false;
+    vars[0].range_start = 0;
+    vars[0].range_count = 0;
+    vars[1].inline_site = 0;
+    vars[1].byref       = false;
+    vars[1].range_start = 1;
+    vars[1].range_count = 1;
+
+    # a narrow variable taking a lane register bounds the composite
+    ranges[1].start        = 8;
+    ranges[1].end          = 20;
+    ranges[1].kind         = VLOC_REG;
+    ranges[1].reg          = 5;
+    ranges[1].off          = 0;
+    ranges[1].net          = 0;
+    ranges[1].reused       = false;
+    ranges[1].pieces.count = 0;
+    var rg: LocRange;
+    t_pieces_range(?rg, 0, 100, 5, -16);
+    bound_storage_reuse(?vars[0], ?ranges[0], 0, 2, 0, ?rg);
+    if (rg.end != 8 || !rg.reused) { code = 1; }
+
+    # a frame lane is the slot
+    ranges[1].kind = VLOC_FRAME;
+    ranges[1].reg  = 0;
+    ranges[1].off  = -16;
+    t_pieces_range(?rg, 0, 100, 5, -16);
+    bound_storage_reuse(?vars[0], ?ranges[0], 0, 2, 0, ?rg);
+    if (rg.end != 8 || !rg.reused) { code = 2; }
+
+    # a home no lane has leaves it alone
+    ranges[1].off = -24;
+    t_pieces_range(?rg, 0, 100, 5, -16);
+    bound_storage_reuse(?vars[0], ?ranges[0], 0, 2, 0, ?rg);
+    if (rg.end != 100 || rg.reused) { code = 3; }
+
+    # a composite taking a narrow variable's register bounds it
+    t_pieces_range(?ranges[1], 8, 20, 9, -32);
+    var nw: LocRange;
+    nw.start        = 0;
+    nw.end          = 100;
+    nw.kind         = VLOC_REG;
+    nw.reg          = 9;
+    nw.off          = 0;
+    nw.net          = 0;
+    nw.reused       = false;
+    nw.pieces.count = 0;
+    bound_storage_reuse(?vars[0], ?ranges[0], 0, 2, 0, ?nw);
+    if (nw.end != 8 || !nw.reused) { code = 4; }
+
+    # two composites sharing one lane bound each other
+    t_pieces_range(?rg, 0, 100, 7, -32);
+    bound_storage_reuse(?vars[0], ?ranges[0], 0, 2, 0, ?rg);
+    if (rg.end != 8 || !rg.reused) { code = 5; }
+    t_pieces_range(?rg, 0, 100, 7, -40);
+    bound_storage_reuse(?vars[0], ?ranges[0], 0, 2, 0, ?rg);
+    if (rg.end != 100 || rg.reused) { code = 6; }
     ret code;
 }
 
