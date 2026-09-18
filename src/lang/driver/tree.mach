@@ -1,0 +1,421 @@
+# walks over dependency trees: the one contained walk that path realization checks and
+# in-place verification digest with, and the content digest an in-place dependency is
+# identified by (#3610). the walk never follows a symlink; what each entry means is the
+# visitor's decision, so the two policies share one traversal and no second walk exists
+
+use mach.lang.build.fingerprint;
+use mach.lang.build.outcome;
+use mach.lang.fail;
+use std.allocator.page;
+use std.collections.sort;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.crypto.hash.sha256;
+use std.encoding.binary;
+use fs: std.filesystem;
+use std.format;
+use io_error: std.io.error;
+use std.process.exec;
+use std.text.string.str_free;
+use std.text.utf8;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_contains;
+use std.types.string.str_copy_slice;
+use std.types.string.str_empty;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+
+use mach.lang.driver.load;
+use mach.lang.manifest;
+
+# what a visitor sees for one entry beneath the root
+# ---
+# rel:  the path relative to the root with `/` separators and no trailing separator
+# meta: the entry's own metadata, a symlink reporting itself
+pub def VisitFn: fun(ptr, str, *fs.Metadata) res[bool, outcome.Fail];
+
+fun cmp_name(a: *str, b: *str) i64 {
+    ret str_compare(@a, @b);
+}
+
+fun free_names(alloc: *A.Allocator, names: *Vector[str]) {
+    var i: usize = 0;
+    for (i < names.len) {
+        str_free(alloc, names.data[i]);
+        i = i + 1;
+    }
+    vector.dnit[str](names);
+}
+
+# walk the entries beneath `root`/`rel` in byte order of names, calling `visit` on each
+# with its no-follow metadata, and descending into a directory when the visitor answers
+# true. `rel` is "" for the root or a relative directory with a trailing `/`
+# ---
+# alloc: scratch for names and paths
+# root:  the tree's root directory
+# rel:   the directory beneath it to walk
+# ctx:   handed to every visit
+# visit: the policy; its err ends the walk
+# ret:   ok, or the first refusal from a read or the visitor
+pub fun walk_contained(alloc: *A.Allocator, root: str, rel: str, ctx: ptr, visit: VisitFn) err[outcome.Fail] {
+    val at_r: res[str, fail.Fail] = load.join_path(alloc, root, rel);
+    if (sel at_r.err) { ret err[outcome.Fail].err{outcome.from_fail(at_r.err)}; }
+    val at:      str                          = at_r.ok;
+    val names_r: res[Vector[str], fs.FsError] = fs.read_dir(alloc, at);
+    str_free(alloc, at);
+    if (sel names_r.err) { ret err[outcome.Fail].err{outcome.user(outcome.fs_text(names_r.err))}; }
+    var names: Vector[str] = names_r.ok;
+    fin { free_names(alloc, ?names); }
+    sort.sort[str](names.data, names.len, cmp_name);
+    var i: usize = 0;
+    for (i < names.len) {
+        val child_r: res[str, format.FormatError] = format.sprint(alloc, "{}{}", rel, names.data[i]);
+        if (sel child_r.err) { ret err[outcome.Fail].err{outcome.user(outcome.format_text(child_r.err))}; }
+        val child: str = child_r.ok;
+        fin { str_free(alloc, child); }
+        val full_r: res[str, fail.Fail] = load.join_path(alloc, root, child);
+        if (sel full_r.err) { ret err[outcome.Fail].err{outcome.from_fail(full_r.err)}; }
+        val full:   str                              = full_r.ok;
+        val meta_r: res[fs.Metadata, io_error.Error] = fs.metadata_link(full);
+        str_free(alloc, full);
+        if (sel meta_r.err) { ret err[outcome.Fail].err{outcome.user(outcome.io_text(meta_r.err))}; }
+        var meta:    fs.Metadata             = meta_r.ok;
+        val enter_r: res[bool, outcome.Fail] = visit(ctx, child, ?meta);
+        if (sel enter_r.err) { ret err[outcome.Fail].err{enter_r.err}; }
+        if (enter_r.ok && fs.meta_is_dir(?meta)) {
+            val nested_r: res[str, format.FormatError] = format.sprint(alloc, "{}/", child);
+            if (sel nested_r.err) { ret err[outcome.Fail].err{outcome.user(outcome.format_text(nested_r.err))}; }
+            val nested: str               = nested_r.ok;
+            val walk_r: err[outcome.Fail] = walk_contained(alloc, root, nested, ctx, visit);
+            str_free(alloc, nested);
+            if (sel walk_r.err) { ret walk_r; }
+        }
+        i = i + 1;
+    }
+    ret err[outcome.Fail].ok{};
+}
+
+# the most entries an in-place tree may hold; a shared tree is input, not fact
+pub val MAX_TREE_ENTRIES: u64 = 1000000;
+# the most content bytes an in-place tree may hold
+pub val MAX_TREE_BYTES: u64 = 4294967296;
+
+val RECORD_FILE: u8 = 1;
+val RECORD_DIR:  u8 = 2;
+val TREE_SCHEMA: u8 = 1;
+
+# the identity of one tree's content, host-independent
+# ---
+# bytes:   the SHA-256 over the domain-separated records in walk order
+# files:   regular files recorded
+# dirs:    directories recorded, empty ones included
+# content: content bytes hashed
+pub rec TreeDigest {
+    bytes:   [32]u8;
+    files:   u64;
+    dirs:    u64;
+    content: u64;
+}
+
+rec DigestWalk {
+    alloc:   *A.Allocator;
+    root:    str;
+    state:   sha256.State;
+    encoder: binary.Encoder;
+    entries: u64;
+    files:   u64;
+    dirs:    u64;
+    content: u64;
+}
+
+fun tree_refusal(w: *DigestWalk, rel: str, why: str) outcome.Fail {
+    val r: res[str, format.FormatError] = format.sprint(w.alloc, "in-place tree '{}' contains {} at '{}'; every entry of an in-place tree must be a regular file or directory", w.root, why, rel);
+    if (sel r.err) { ret outcome.user("an in-place tree contains an entry that is not a regular file or directory"); }
+    ret outcome.user(r.ok);
+}
+
+fun name_portable(rel: str) bool {
+    val n: usize = str_len(rel);
+    if (!utf8.validate(rel::*u8, n)) { ret false; }
+    var start: usize = 0;
+    var i:     usize = 0;
+    for (i <= n) {
+        if (i == n || rel[i] == '/'::u8) {
+            if (i == start)                                                           { ret false; }
+            if (rel[start] == '.'::u8 && i - start == 1)                              { ret false; }
+            if (rel[start] == '.'::u8 && i - start == 2 && rel[start + 1] == '.'::u8) { ret false; }
+            start = i + 1;
+        }
+        or (rel[i] == '\\'::u8) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun record_flush(w: *DigestWalk, ok: bool) err[outcome.Fail] {
+    if (!ok) { ret err[outcome.Fail].err{outcome.internal("tree digest record could not be encoded")}; }
+    sha256.update(?w.state, w.encoder.data, w.encoder.len);
+    w.encoder.len = 0;
+    ret err[outcome.Fail].ok{};
+}
+
+fun digest_visit(ctx: ptr, rel: str, meta: *fs.Metadata) res[bool, outcome.Fail] {
+    val w: *DigestWalk = ctx::*DigestWalk;
+    # a release checkout keeps its repository beside its content; nothing else is excluded
+    if (str_equals(rel, ".git"))                         { ret res[bool, outcome.Fail].ok{false}; }
+    if (fs.meta_is_symlink(meta))                        { ret res[bool, outcome.Fail].err{tree_refusal(w, rel, "a symlink")}; }
+    if (!fs.meta_is_dir(meta) && !fs.meta_is_file(meta)) { ret res[bool, outcome.Fail].err{tree_refusal(w, rel, "a FIFO, socket or device")}; }
+    if (!name_portable(rel))                             { ret res[bool, outcome.Fail].err{tree_refusal(w, rel, "an entry whose name is not portable")}; }
+    if (w.entries >= MAX_TREE_ENTRIES) {
+        val r: res[str, format.FormatError] = format.sprint(w.alloc, "in-place tree '{}' holds more than {} entries", w.root, MAX_TREE_ENTRIES);
+        if (sel r.err) { ret res[bool, outcome.Fail].err{outcome.user("an in-place tree holds too many entries")}; }
+        ret res[bool, outcome.Fail].err{outcome.user(r.ok)};
+    }
+    w.entries = w.entries + 1;
+    if (fs.meta_is_dir(meta)) {
+        var ok: bool = fingerprint.write_domain_u8(?w.encoder, fingerprint.DOMAIN_DEP_TREE, TREE_SCHEMA, RECORD_DIR);
+        ok = ok && fingerprint.write_domain_str(?w.encoder, fingerprint.DOMAIN_DEP_TREE, TREE_SCHEMA, rel);
+        val flushed: err[outcome.Fail] = record_flush(w, ok);
+        if (sel flushed.err) { ret res[bool, outcome.Fail].err{flushed.err}; }
+        w.dirs = w.dirs + 1;
+        ret res[bool, outcome.Fail].ok{true};
+    }
+    val size: u64 = meta.size::u64;
+    if (size > MAX_TREE_BYTES - w.content) {
+        val r: res[str, format.FormatError] = format.sprint(w.alloc, "in-place tree '{}' holds more than {} bytes", w.root, MAX_TREE_BYTES);
+        if (sel r.err) { ret res[bool, outcome.Fail].err{outcome.user("an in-place tree holds too many bytes")}; }
+        ret res[bool, outcome.Fail].err{outcome.user(r.ok)};
+    }
+    val full_r: res[str, fail.Fail] = load.join_path(w.alloc, w.root, rel);
+    if (sel full_r.err) { ret res[bool, outcome.Fail].err{outcome.from_fail(full_r.err)}; }
+    var content: [32]u8;
+    val hashed:  err[outcome.Fail] = fingerprint.file_sha256(full_r.ok, ?content[0]);
+    str_free(w.alloc, full_r.ok);
+    if (sel hashed.err) {
+        val r: res[str, format.FormatError] = format.sprint(w.alloc, "in-place tree '{}': cannot digest '{}': {}", w.root, rel, outcome.describe(hashed.err));
+        if (sel r.err) { ret res[bool, outcome.Fail].err{hashed.err}; }
+        ret res[bool, outcome.Fail].err{outcome.user(r.ok)};
+    }
+    var exec: u8 = 0;
+    if ((meta.mode & 0o111::u32) != 0) { exec = 1; }
+    var ok: bool = fingerprint.write_domain_u8(?w.encoder, fingerprint.DOMAIN_DEP_TREE, TREE_SCHEMA, RECORD_FILE);
+    ok = ok && fingerprint.write_domain_str(?w.encoder, fingerprint.DOMAIN_DEP_TREE, TREE_SCHEMA, rel);
+    ok = ok && fingerprint.write_domain_u8(?w.encoder, fingerprint.DOMAIN_DEP_TREE, TREE_SCHEMA, exec);
+    ok = ok && fingerprint.write_domain_u64(?w.encoder, fingerprint.DOMAIN_DEP_TREE, TREE_SCHEMA, size);
+    ok = ok && fingerprint.write_domain_bytes(?w.encoder, fingerprint.DOMAIN_DEP_TREE, TREE_SCHEMA, ?content[0], 32);
+    val flushed: err[outcome.Fail] = record_flush(w, ok);
+    if (sel flushed.err) { ret res[bool, outcome.Fail].err{flushed.err}; }
+    w.files   = w.files + 1;
+    w.content = w.content + size;
+    ret res[bool, outcome.Fail].ok{false};
+}
+
+# the content digest of the whole tree at `root` minus a top-level `.git`: every regular
+# file's relative path, executable bit, size and SHA-256, and every directory's relative
+# path, in byte order of names under `DOMAIN_DEP_TREE`. a symlink, FIFO, socket or
+# device anywhere, an unportable name, or a tree past the declared bounds is refused
+# ---
+# alloc: scratch for the walk
+# root:  the tree's root directory; the caller has checked it is a physical directory
+# ret:   the digest with its counts, or the refusal
+pub fun digest_tree(alloc: *A.Allocator, root: str) res[TreeDigest, outcome.Fail] {
+    var w: DigestWalk;
+    w.alloc   = alloc;
+    w.root    = root;
+    w.state   = sha256.init();
+    w.encoder = binary.encoder(alloc, binary.LITTLE);
+    w.entries = 0;
+    w.files   = 0;
+    w.dirs    = 0;
+    w.content = 0;
+    fin { binary.encoder_dnit(?w.encoder); }
+    val walked: err[outcome.Fail] = walk_contained(alloc, root, "", (?w)::ptr, digest_visit);
+    if (sel walked.err) { ret res[TreeDigest, outcome.Fail].err{walked.err}; }
+    var out: TreeDigest;
+    sha256.final(?w.state, ?out.bytes[0]);
+    out.files   = w.files;
+    out.dirs    = w.dirs;
+    out.content = w.content;
+    ret res[TreeDigest, outcome.Fail].ok{out};
+}
+
+fun hex_digit(v: u8) u8 {
+    if (v < 10) { ret '0'::u8 + v; }
+    ret 'a'::u8 + (v - 10);
+}
+
+# the digest as the manifest records it, `sha256:<64 lowercase hex digits>`
+# ---
+# alloc: owns the returned text
+# d:     the digest
+# ret:   the text
+pub fun digest_text(alloc: *A.Allocator, d: *TreeDigest) res[str, outcome.Fail] {
+    val prefix: usize             = str_len(manifest.DIGEST_PREFIX);
+    val r:      res[*u8, A.Error] = A.allocate[u8](alloc, prefix + 65);
+    if (sel r.err) { ret res[str, outcome.Fail].err{outcome.refused(r.err)}; }
+    val buf: *u8   = r.ok;
+    var i:   usize = 0;
+    for (i < prefix) {
+        buf[i] = manifest.DIGEST_PREFIX[i];
+        i      = i + 1;
+    }
+    var k: usize = 0;
+    for (k < 32) {
+        buf[prefix + k * 2]     = hex_digit(d.bytes[k] / 16::u8);
+        buf[prefix + k * 2 + 1] = hex_digit(d.bytes[k] % 16::u8);
+        k                       = k + 1;
+    }
+    buf[prefix + 64] = 0;
+    ret res[str, outcome.Fail].ok{buf::str};
+}
+
+fun t_scratch(alloc: *A.Allocator, prefix: str) str {
+    val tf_r: res[fs.TempFile, fs.FsError] = fs.temp_create(alloc, prefix);
+    if (sel tf_r.err) { ret ""; }
+    var tf:   fs.TempFile               = tf_r.ok;
+    val name: str                       = fs.temp_path(?tf);
+    val p_r:  res[str, string.StrError] = str_copy_slice(alloc, name, 0, str_len(name));
+    fs.temp_close_and_remove(?tf);
+    if (sel p_r.err) { ret ""; }
+    val made: err[fs.FsError] = fs.create_dir_all(alloc, p_r.ok, 0o755);
+    if (sel made.err) { ret ""; }
+    ret p_r.ok;
+}
+
+fun t_put(alloc: *A.Allocator, dir: str, rel: str, body: str) bool {
+    val p_r: res[str, fail.Fail] = load.join_path(alloc, dir, rel);
+    if (sel p_r.err) { ret false; }
+    val w: err[fs.FsError] = fs.write_bytes(p_r.ok, body::*u8, str_len(body), 0o644);
+    str_free(alloc, p_r.ok);
+    ret sel w.ok;
+}
+
+fun t_mkdir(alloc: *A.Allocator, dir: str, rel: str) bool {
+    val p_r: res[str, fail.Fail] = load.join_path(alloc, dir, rel);
+    if (sel p_r.err) { ret false; }
+    val made: err[fs.FsError] = fs.create_dir_all(alloc, p_r.ok, 0o755);
+    str_free(alloc, p_r.ok);
+    ret sel made.ok;
+}
+
+fun t_tree(alloc: *A.Allocator, prefix: str) str {
+    val root: str = t_scratch(alloc, prefix);
+    if (str_empty(root))                                                      { ret ""; }
+    if (!t_mkdir(alloc, root, "src/inner") || !t_mkdir(alloc, root, "empty")) { ret ""; }
+    if (!t_put(alloc, root, "mach.toml", "[project]\nid = \"t\"\n"))          { ret ""; }
+    if (!t_put(alloc, root, "src/lib.mach", "pub fun v() i32 { ret 1; }\n"))  { ret ""; }
+    if (!t_put(alloc, root, "src/inner/x.mach", "pub val X: i32 = 2;\n"))     { ret ""; }
+    ret root;
+}
+
+fun t_digest_text(alloc: *A.Allocator, root: str) str {
+    val d: res[TreeDigest, outcome.Fail] = digest_tree(alloc, root);
+    if (sel d.err) { ret ""; }
+    var digest: TreeDigest             = d.ok;
+    val text:   res[str, outcome.Fail] = digest_text(alloc, ?digest);
+    if (sel text.err) { ret ""; }
+    ret text.ok;
+}
+
+fun t_refusal(alloc: *A.Allocator, root: str) str {
+    val d: res[TreeDigest, outcome.Fail] = digest_tree(alloc, root);
+    if (sel d.ok) { ret ""; }
+    ret outcome.describe(d.err);
+}
+
+# the digest is a function of content: two walks of an unchanged tree agree, one changed
+# byte changes it, and so does an empty directory, since directories are identity too
+test "mach.lang.driver.tree.digest_tree:stable_across_walks_and_changed_by_one_byte" {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val root: str = t_tree(?alloc, "mach_tree_stable");
+    if (str_empty(root)) { ret 2; }
+    fin { fs.remove_all(?alloc, root); }
+    val first: str = t_digest_text(?alloc, root);
+    if (str_empty(first) || !manifest.digest_text_valid(first)) { ret 3; }
+    val second: str = t_digest_text(?alloc, root);
+    if (!str_equals(first, second))                                           { ret 4; }
+    if (!t_put(?alloc, root, "src/lib.mach", "pub fun v() i32 { ret 2; }\n")) { ret 5; }
+    val edited: str = t_digest_text(?alloc, root);
+    if (str_empty(edited) || str_equals(edited, first)) { ret 6; }
+    if (!t_mkdir(?alloc, root, "another_empty"))        { ret 7; }
+    val with_dir: str = t_digest_text(?alloc, root);
+    if (str_empty(with_dir) || str_equals(with_dir, edited)) { ret 8; }
+    ret 0;
+}
+
+# a top-level `.git` is not identity, so a release checkout digests as its export does;
+# a nested `.git` is content like any other
+test "mach.lang.driver.tree.digest_tree:skips_only_a_top_level_git_entry" {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val root: str = t_tree(?alloc, "mach_tree_git");
+    if (str_empty(root)) { ret 2; }
+    fin { fs.remove_all(?alloc, root); }
+    val plain: str = t_digest_text(?alloc, root);
+    if (str_empty(plain))                                                                              { ret 3; }
+    if (!t_mkdir(?alloc, root, ".git") || !t_put(?alloc, root, ".git/HEAD", "ref: refs/heads/main\n")) { ret 4; }
+    if (!str_equals(t_digest_text(?alloc, root), plain))                                               { ret 5; }
+    if (!t_mkdir(?alloc, root, "src/.git"))                                                            { ret 6; }
+    if (str_equals(t_digest_text(?alloc, root), plain))                                                { ret 7; }
+    ret 0;
+}
+
+test "mach.lang.driver.tree.digest_tree:refuses_a_symlink" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val root: str = t_tree(?alloc, "mach_tree_symlink");
+    if (str_empty(root)) { ret 2; }
+    fin { fs.remove_all(?alloc, root); }
+    val link_r: res[str, fail.Fail] = load.join_path(?alloc, root, "src/link.mach");
+    if (sel link_r.err) { ret 3; }
+    val linked: err[io_error.Error] = fs.symlink("lib.mach", link_r.ok);
+    if (sel linked.err) { ret 4; }
+    val refusal: str = t_refusal(?alloc, root);
+    if (str_empty(refusal))                                     { ret 5; }
+    if (!str_contains(refusal, "a symlink at 'src/link.mach'")) { ret 6; }
+    ret 0;
+}
+
+fun t_mkfifo(alloc: *A.Allocator, p: str) bool {
+    val bin: res[str, exec.Error] = exec.resolve(alloc, "mkfifo");
+    if (sel bin.err) { ret false; }
+    var av: [3]*u8;
+    av[0] = bin.ok::*u8;
+    av[1] = p::*u8;
+    av[2] = nil;
+    val rr: res[exec.ExitStatus, exec.Error] = exec.run(bin.ok, ?av[0], nil);
+    if (sel rr.err) { ret false; }
+    ret exec.exited(rr.ok) && exec.code(rr.ok) == 0;
+}
+
+test "mach.lang.driver.tree.digest_tree:refuses_a_fifo" {
+    $if ($mach.build.os == $mach.os.windows) { ret 0; }
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val root: str = t_tree(?alloc, "mach_tree_fifo");
+    if (str_empty(root)) { ret 2; }
+    fin { fs.remove_all(?alloc, root); }
+    val fifo_r: res[str, fail.Fail] = load.join_path(?alloc, root, "src/pipe");
+    if (sel fifo_r.err)               { ret 3; }
+    if (!t_mkfifo(?alloc, fifo_r.ok)) { ret 4; }
+    val refusal: str = t_refusal(?alloc, root);
+    if (str_empty(refusal))                                               { ret 5; }
+    if (!str_contains(refusal, "a FIFO, socket or device at 'src/pipe'")) { ret 6; }
+    ret 0;
+}
