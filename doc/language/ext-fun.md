@@ -6,7 +6,7 @@ function form Mach allows.
 
 ## Grammar
 
-```mach
+```mach fragment
 ext fun NAME(args) RET;
 ```
 
@@ -83,7 +83,7 @@ there: an integer narrower than `int` arrives as an `int`, and a `float` arrives
 a `double`. Mach inserts no implicit conversions anywhere and makes no exception
 here — a narrow argument is **rejected**, naming the cast:
 
-```mach
+```mach fragment
 var c: u8  = 65;
 var f: f32 = 1.5;
 
@@ -147,6 +147,8 @@ in the third slot. Declare that type with `#[abi_type("va_list")]` on a bodyless
 `def`:
 
 ```mach
+use std.types.size.usize;
+
 #[abi_type("va_list")]
 def VaList;
 
@@ -174,7 +176,7 @@ The whole scope is **forward-only**: receive an opaque token from C and pass it 
 C. There is no `va_start`, no `va_arg`, no `va_end`, and no way to construct one.
 Each of these is refused where it is written:
 
-```mach
+```mach fragment
 val saved: VaList = args;   # refused: a local binding
 rec Held { ap: VaList; }    # refused: a record or union field
 var kept: VaList;           # refused: a global

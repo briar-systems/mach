@@ -26,7 +26,7 @@ followed by `x` and a lane count.
 
 On a 128-bit target the spellings this currently accepts are:
 
-```mach
+```mach fragment
 f32x4  f64x2                    # float lanes
 i8x16  i16x8  i32x4  i64x2      # signed integer lanes
 u8x16  u16x8  u32x4  u64x2      # unsigned integer lanes
@@ -48,7 +48,7 @@ A **type** may not. `rec`, `uni`, `tag`, and `def` reject a name spelled as a ve
 form, because a type declared with a vector's name would be silently unreachable:
 every use in type position resolves to the vector instead:
 
-```mach
+```mach error is spelled as a vector type
 rec f32x3 { x: f32; }           # error: `f32x3` is spelled as a vector type
 tag f32x4: u8 { empty; }        # error: `f32x4` is spelled as a vector type
 ```
@@ -112,7 +112,7 @@ composite types over a vector element.
 **Literals** are full-arity — one initializer per lane, mirroring array literals.
 The lane count must match exactly; too few or too many lanes is a compile error.
 
-```mach
+```mach fragment
 val v: f32x4 = f32x4{1.0, 2.0, 3.0, 4.0};
 val w: i32x4 = i32x4{1, 2, 3, 4};
 ```
@@ -129,7 +129,7 @@ supported in this increment. The bound is the same compile-time rule an array
 gets, reported the same way — `v[4]` on a `u32x4` is `index 4 is out of bounds
 for `u32x4` of length 4`.
 
-```mach
+```mach fragment
 var v: f32x4 = f32x4{1.0, 2.0, 3.0, 4.0};
 val x: f32 = v[0];              # read lane 0
 v[3] = 9.0;                     # write lane 3
@@ -153,7 +153,7 @@ The language knows only the machinery. A handle is a **bodyless `def`** carrying
 `#[handle(target, constructor, operands...)]`, and which constructors exist, what
 operands each takes, and what an operand means all belong to the named target:
 
-```mach
+```mach fragment
 #[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED)]
 pub def Texture2D;
 
@@ -243,7 +243,7 @@ See [ext-fun.md](ext-fun.md) for the binding recipe and
 
 `*T` — pointer to a value of type `T`.
 
-```mach
+```mach fragment
 var x: i64;
 var p: *i64 = ?x;       # address-of yields a pointer
 val v: i64  = @p;       # dereference reads through it
@@ -261,7 +261,7 @@ val g: [2][2]i64 = [2][2]i64{ [2]i64{1, 2}, [2]i64{3, 4} };
 **Constant indices are bounds-checked at compile time.** `N` is part of the
 type, so an index the compiler can fold must land in `[0, N)`:
 
-```mach
+```mach error index 4 is out of bounds for `[4]i32` of length 4
 fun read() i32 {
     var xs: [4]i32;
     val a: i32 = xs[3];             # ok

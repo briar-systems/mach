@@ -17,7 +17,7 @@ narrower binding is a choice of representation rather than a conversion. It
 adopts the binding's width and signedness, and is **refused** — never truncated —
 when the measured value does not fit:
 
-```mach
+```mach error value 300 is out of range for u8
 use std.types.size.usize;
 
 rec Point { x: i64; y: i64; }
@@ -34,14 +34,14 @@ Without a binding to read a width from — an array length, an `#[align(...)]`
 argument, a comparison against a typed value — the measurement behaves the way a
 literal does in the same position.
 
-```mach
+```mach fragment
 $size_of(T)             # byte size of type T
 $length_of(T)           # ELEMENT count of type T
 $align_of(T)            # byte alignment of type T
 $offset_of(T, field)    # byte offset of T's field
 ```
 
-```mach
+```mach fragment
 pub val POINT_SIZE: i64 = $size_of(Point);
 pub val POINT_X:    i64 = $offset_of(Point, x);
 ```
@@ -51,7 +51,7 @@ name. A generic instance, a pointer, an array, a `^` secret, and a qualified
 `module.Type` are all valid, including inside the generic that owns the
 parameter:
 
-```mach
+```mach fragment
 fun probe[T]() u64 {
     ret $size_of(Box[T]) + $align_of(Pair[T, u64]) + $size_of(*T) + $size_of([4]T);
 }
@@ -74,7 +74,7 @@ deliberately in the surface rather than in the caller's head — making a caller
 divide by an element size is exactly the silent-arithmetic error the `u8` case
 hides during development.
 
-```mach
+```mach fragment
 val PIXELS: [400]f32x4 = ...;
 $length_of(PIXELS)      # 400   — elements
 $size_of(PIXELS)        # 6400  — bytes
@@ -97,7 +97,7 @@ denoting that binding's type. A binding's type has no spelling — `val LOGO: [_
 really is a concrete `[7194]u8` that cannot be written — so without this a program
 can index an embed and pass it around and never learn its length:
 
-```mach
+```mach fragment
 #[embed("assets/logo.qoi")]
 val LOGO: [_]u8;
 
@@ -167,7 +167,7 @@ measures normally.
 Ask about a type's **shape** rather than its storage. Each takes one type operand
 and folds in a `$if` / `$or` gate:
 
-```mach
+```mach fragment
 $is_record(T)           # T is a record (or an instance of one)
 $is_union(T)            # T is a union  (or an instance of one)
 $is_tag(T)              # T is a tagged value (or an instance of one)
@@ -181,7 +181,7 @@ $is_secret(T)           # T is `^`-qualified at the outermost level
 that a walk can ask what it actually wants to know instead of spelling the scalar
 types out:
 
-```mach
+```mach fragment
 $each f in $fields(T) {
     $if ($is_integer(f.type) || $is_float(f.type)) { ... }   # a scalar field
     $or ($is_record(f.type))                       { ... }   # descend
@@ -216,7 +216,7 @@ other three's false readable — `$is_record(^Pair)` and `$is_record(u64)` are
 otherwise the same answer, so before this a library could only ever meet a secret as
 a fallthrough it had to refuse.
 
-```mach
+```mach fragment
 $each f in $fields(T) {
     $if ($is_secret(f.type)) { ... }        # redact, refuse, or compare in constant time
     $or { ... }                             # an ordinary public field
@@ -257,7 +257,7 @@ Because the shape predicates answer false for `^T`, "nothing classifies it" rema
 a usable signal on its own: a walk that gates on the shapes and refuses the
 fallthrough refuses secrets. `$is_secret` turns that refusal into a decision.
 
-```mach
+```mach fragment
 rec Inner { x: u64; y: u64; }
 rec Outer { i: Inner; n: u64; }
 
@@ -274,7 +274,7 @@ $each f in $fields(Outer) {
 refers to, which is what makes the reference traversable rather than merely
 detectable:
 
-```mach
+```mach fragment
 $pointee_of(*U)         # U
 $pointee_of(**U)        # *U — one level, not all of them
 ```
@@ -283,7 +283,7 @@ It is a type **constructor**, in the same family as `*`, `[N]` and `^`, not a ca
 that returns a value. So it is written wherever a type is written, including nested
 inside another intrinsic's operand and inside a generic argument list:
 
-```mach
+```mach fragment
 rec Node { value: i64; next: *Inner; }
 
 $each f in $fields(Node) {
@@ -329,7 +329,7 @@ following as a separately named member.
 
 ## `$type_name(T)` — a type's spelling
 
-```mach
+```mach fragment
 $type_name(T)           # the type's spelling, as a NUL-terminated string
 ```
 
@@ -363,7 +363,7 @@ form: a field descriptor's `f.type` inside a `$each` body. `$pointee_of` is part
 that grammar rather than one of its consumers, so it composes with every one of
 them (`$size_of($pointee_of(f.type))`, `$fields($pointee_of(f.type))`).
 
-```mach
+```mach fragment
 $each f in $fields(T) {
     val n: u64 = $size_of(f.type);      # the field's own size
     $each g in $fields(f.type) { ... }  # its own fields
@@ -373,7 +373,7 @@ $each f in $fields(T) {
 The same form is valid in a **generic argument list**, which is what makes a walk
 recursive rather than merely descending (#2691):
 
-```mach
+```mach fragment
 fun eq[T](a: *T, b: *T) bool {
     $each f in $fields(T) {
         $if ($is_record(f.type)) {
@@ -408,13 +408,13 @@ it is written.
 argument `expr`. Type values have no runtime representation; they are only
 meaningful as operands in comptime type comparisons.
 
-```mach
+```mach fragment
 $type_of(expr)          # comptime type value of expr
 ```
 
 Type values can be compared with `==` / `!=` inside `$if` conditions:
 
-```mach
+```mach fragment
 $if ($type_of(arg) == i64) { write_i64(w, arg); }
 $or ($type_of(arg) == str) { write_str(w, arg); }
 $or { $error("unsupported type"); }
@@ -453,7 +453,7 @@ three readable properties:
 `v.[f]` projects the concrete field off an instance `v` — it is an lvalue
 (readable and writable, including through a pointer receiver).
 
-```mach
+```mach fragment
 $fields(T)              # comptime field sequence for record T
 v.[f]                   # comptime field projection: access the field f on v
 ```
@@ -549,7 +549,7 @@ variable, which is always a field descriptor, never a regular member.
 
 `$each` can be nested:
 
-```mach
+```mach fragment
 fun cross(p: Pair, q: Pair) i64 {
     var t: i64 = 0;
     $each f in $fields(Pair) {
@@ -569,7 +569,7 @@ contract in [tag.md](tag.md).
 `$cases(T)` produces a comptime sequence of owner-qualified case descriptors for
 a tag type `T`, in declaration order:
 
-```mach
+```mach fragment
 $cases(T)               # comptime case descriptor sequence for tag T
 ```
 
@@ -641,7 +641,7 @@ available during type checking.
 `$each` is a statement form that splices its body once per element of a
 comptime sequence. There are four sequence forms:
 
-```mach
+```mach fragment
 $each f in $fields(T) { ... }    # one iteration per field of record T
 $each case in $cases(T) { ... }  # one iteration per case of tag T
 $each a in va { ... }            # one iteration per element of pack va
@@ -687,7 +687,7 @@ fun main(argc: i64, argv: **u8) i64 {
 A per-element `$if` selects its arm from the element's constant, so heterogeneous
 handling falls out of the unroll:
 
-```mach
+```mach fragment
 rec Rule { tag: i64; fn: fun(i64) i64; }
 
 val RULES: [3]Rule = [3]Rule{
@@ -726,7 +726,7 @@ fails the build at compile time instead of falling through to a runtime error.
 `$error` is valid in both declaration and statement scope and takes one
 string-literal message.
 
-```mach
+```mach fragment
 $error("msg")           # fails compilation when reached
 
 $if (!supported) {
@@ -748,7 +748,7 @@ functions with per-arch `asm` bodies. See [policy.md](policy.md).
 `$error` already compose to it exactly, so a dedicated directive would add spelling
 without adding capability. Write the composition directly.
 
-```mach
+```mach fragment
 # instead of $assert(cond, "msg")
 $if (!cond) { $error("msg"); }
 

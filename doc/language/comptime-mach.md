@@ -11,8 +11,8 @@ comparison against the resolved-build facts.
 > the compiler version (`$mach.version` and `$mach.version.{major,minor,patch}`),
 > and `$mach.compiler.{name,version}` are live. The `$mach.build.{timestamp,
 > host}`, `$mach.build.git.*`, `$mach.project.*`, and `$mach.source.*` paths are
-> reserved: the spelling is held for a later release and reading one is a
-> compile error naming the subtree (`` `$mach.source.*` is not yet available ``).
+> reserved: the spelling is held for a later release (#3590) and reading one is
+> a compile error naming the subtree (`` `$mach.source.*` is not yet available ``).
 > Each subtree below notes which it is.
 
 ## Subtrees
@@ -23,7 +23,7 @@ The resolved active build's facts. `os`/`arch`/`abi`/`mode` share the numeric
 tag space of `$mach.{os,arch,abi,mode}.*`, so a comparison is a plain integer
 compare (see [Comparison](#comparison)).
 
-```mach
+```mach fragment
 $mach.build.os                  # live; compared against $mach.os.* tags
 $mach.build.arch                # live; compared against $mach.arch.* tags
 $mach.build.abi                 # live; compared against $mach.abi.* tags
@@ -43,7 +43,7 @@ The members above are the whole subtree, and no manifest key adds one. A
 (`` unknown `$mach.*` path ``). A project's own configuration constants are
 ordinary `val`s selected with `$if` over the facts above.
 
-```mach
+```mach error unknown `$mach.*` path
 val TRACING: u64 = $mach.build.TRACING;
 ```
 
@@ -80,7 +80,7 @@ $if ($mach.build.ct_mul(wide_u, 64) == 1) {
 
 ### `$mach.version` — the compiler version
 
-```mach
+```mach fragment
 $mach.version                   # live; the version string, e.g. "2.0.0"
 $mach.version.major             # live; integer component
 $mach.version.minor             # live; integer component
@@ -89,14 +89,14 @@ $mach.version.patch             # live; integer component
 
 ### `$mach.compiler.*` — compiler identity
 
-```mach
+```mach fragment
 $mach.compiler.name             # live
 $mach.compiler.version          # live; same value as $mach.version
 ```
 
 ### `$mach.project.*` — values from mach.toml (stubs)
 
-```mach
+```mach error `$mach.project.*` is not yet available
 val root: u64 = $mach.project.root;
 ```
 
@@ -108,13 +108,13 @@ val root: u64 = $mach.project.root;
 
 ### `$mach.source.*` — current source position (stubs)
 
-```mach
+```mach error `$mach.source.*` is not yet available
 val line: u64 = $mach.source.line;
 ```
 
 ### `$mach.os.*`, `$mach.arch.*`, `$mach.abi.*`, `$mach.mode.*` — tag values
 
-```mach
+```mach fragment
 $mach.os.linux
 $mach.os.darwin
 $mach.os.windows
@@ -150,7 +150,7 @@ carry.
 Tag comparisons are path-value — no `.id` suffix or unwrapping. Both sides share
 one numeric space, so the comparison is an ordinary integer compare:
 
-```mach
+```mach fragment
 $if ($mach.build.os == $mach.os.linux) { ... }
 $if ($mach.build.arch == $mach.arch.x86_64) { ... }
 ```

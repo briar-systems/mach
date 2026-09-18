@@ -18,7 +18,7 @@ See [literals.md](literals.md) — numeric, char, string, and `nil` forms.
 A bare identifier references a name in scope. Module-qualified names use
 the dot path:
 
-```mach
+```mach fragment
 counter             # local or module-level binding
 core.add            # symbol from module `core`
 ```
@@ -92,7 +92,7 @@ guard it opens is what makes the payload readable.
 
 ## Function calls
 
-```mach
+```mach fragment
 add(2, 3)
 identity[i64](42)               # generic call: type args in [ ]
 sum(3, 10i64, 20i64, 30i64)     # variadic pack call (see variadics.md)
@@ -105,7 +105,7 @@ type-list; `g(va...)` forwards a whole pack — see
 For comptime parameters, the value is passed positionally like a runtime
 argument — the function signature determines whether it must be comptime:
 
-```mach
+```mach fragment
 checked_add(MODE_FAST, 1, 2)    # MODE_FAST is comptime-knowable
 ```
 
