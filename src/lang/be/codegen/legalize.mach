@@ -94,6 +94,7 @@ fun function_needs_legalize(f: *mir.MirFunction, mach: *Machine) bool {
 }
 
 fun instr_needs_legalize(f: *mir.MirFunction, mi: *mir.MirInstr, mach: *Machine) bool {
+    if (is_lane_op(mi.opcode))                                        { ret true; }
     if (conv_is_wide(mach, mi))                                       { ret true; }
     if (instr_rides_fp_bank(f, mi))                                   { ret false; }
     if (mi.width > mach.lane_width || mi.src_width > mach.lane_width) { ret true; }
@@ -106,6 +107,12 @@ fun is_shift(op: mir.MirOpcode) bool {
     ret mir.has(op, mir.MIRF_SHIFT);
 }
 
+# the lane ops exist only to be expanded here: a wide value stated as its
+# pieces by whoever produced them (#3602)
+fun is_lane_op(op: mir.MirOpcode) bool {
+    ret op == mir.MIR_LANE_JOIN || op == mir.MIR_LANE_PICK;
+}
+
 fun instr_has_value_base(mi: *mir.MirInstr) bool {
     var k: u32 = 0;
     for (k < mi.operand_count) {
@@ -116,6 +123,8 @@ fun instr_has_value_base(mi: *mir.MirInstr) bool {
     ret false;
 }
 
+# a float lives whole in its bank whatever its width, so an instruction that
+# names one, by vreg or by physical register, is not split into integer lanes
 fun instr_rides_fp_bank(f: *mir.MirFunction, mi: *mir.MirInstr) bool {
     if (mi.vec_lane != mir.VEC_LANE_NONE) { ret true; }
     var k: u32 = 0;
@@ -125,6 +134,7 @@ fun instr_rides_fp_bank(f: *mir.MirFunction, mi: *mir.MirInstr) bool {
             if (f.vregs[op.vreg.n].vector)  { ret true; }
             if (mir.vreg_is_fp(f, op.vreg)) { ret true; }
         }
+        if (op.kind == mir.MIR_OP_PREG && isa.regid_class(mir.preg_regid(op.preg)) != isa.REG_CLASS_ID_GP) { ret true; }
         k = k + 1;
     }
     ret false;
@@ -452,6 +462,16 @@ fun expansion_count(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction,
     val op: mir.MirOpcode = mi.opcode;
     val nl: u32           = wide_lane_count(plan, mi);
 
+    if (op == mir.MIR_LANE_JOIN) { ret lane_join_piece_count(alloc, plan, mi); }
+    if (op == mir.MIR_LANE_PICK) { ret lane_pick_piece_count(alloc, plan, mi); }
+
+    # a physical register is one lane wide: whoever splits a wide value over
+    # registers states the pieces with a lane op, and nothing here may find
+    # lane k of a register by its id (#3602)
+    if (nl > 1 && instr_names_preg(mi)) {
+        ret res[u32, fail.Fail].err{fail.message("legalize: a physical register carries a value wider than the ALU (internal compiler error: ABI lowering states the lanes with MIR_LANE_JOIN and MIR_LANE_PICK, see briar-systems/mach#3602)")};
+    }
+
     if (conv_is_wide(?plan.mach, mi)) { ret conv_piece_count(alloc, plan, f, mi); }
 
     if (instr_is_memory(mi)) { ret memory_piece_count(alloc, plan, mi); }
@@ -601,6 +621,12 @@ fun expand_instr(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: 
     dst: *mir.MirInstr, cursor: *u32) err[fail.Fail] {
     val op: mir.MirOpcode = mi.opcode;
 
+    if (op == mir.MIR_LANE_JOIN) {
+        ret expand_lane_join(alloc, plan, mi, dst, cursor);
+    }
+    if (op == mir.MIR_LANE_PICK) {
+        ret expand_lane_pick(alloc, plan, mi, dst, cursor);
+    }
     if (conv_is_wide(?plan.mach, mi)) {
         ret conv_run(alloc, plan, f, mi, dst, cursor);
     }
@@ -674,15 +700,14 @@ fun emit_piece(alloc: *A.Allocator, dst: *mir.MirInstr, cursor: *u32, src: *mir.
     ret err[fail.Fail].ok{};
 }
 
+# lane i of an operand: a planned vreg's lane, an immediate's slice. a physical
+# register has no lane i; expansion_count has refused it before this is asked
 fun lane_operand(plan: *LanePlan, op: *mir.MirOperand, i: u32) mir.MirOperand {
     if (op.kind == mir.MIR_OP_VREG && op.vreg.n < plan.orig_count && plan.lane_base[op.vreg.n] != LANE_NONE) {
         ret mir.op_vreg(mir.vreg_id(plan.lane_base[op.vreg.n] + i));
     }
     if (op.kind == mir.MIR_OP_IMM) {
         ret mir.op_imm(imm_lane(op.imm, i, plan.lane_width));
-    }
-    if (op.kind == mir.MIR_OP_PREG) {
-        ret mir.op_preg(mir.preg_id(mir.preg_regid(op.preg) + i::i32));
     }
     ret @op;
 }
@@ -692,7 +717,110 @@ fun operand_is_lane_ready(plan: *LanePlan, op: *mir.MirOperand, nl: u32) bool {
         if (op.vreg.n < plan.orig_count && plan.lane_base[op.vreg.n] != LANE_NONE) { ret true; }
         ret nl == 1;
     }
-    ret op.kind == mir.MIR_OP_IMM || op.kind == mir.MIR_OP_PREG;
+    ret op.kind == mir.MIR_OP_IMM;
+}
+
+fun instr_names_preg(mi: *mir.MirInstr) bool {
+    var k: u32 = 0;
+    for (k < mi.operand_count) {
+        if (mi.operands[k].kind == mir.MIR_OP_PREG) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# a lane piece is one register, one narrow vreg or one stack word
+fun lane_piece_kind_ok(plan: *LanePlan, op: *mir.MirOperand) bool {
+    if (op.kind == mir.MIR_OP_VREG) { ret !is_wide_vreg(plan, op.vreg.n); }
+    ret op.kind == mir.MIR_OP_PREG || op.kind == mir.MIR_OP_MEM;
+}
+
+val LANE_JOIN_SHAPE: str = "legalize: a lane join does not name one piece per lane of its value (internal compiler error, see briar-systems/mach#3602)";
+val LANE_PICK_SHAPE: str = "legalize: a lane pick does not name a lane of a wide value (internal compiler error, see briar-systems/mach#3602)";
+
+fun lane_join_piece_count(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr) res[u32, fail.Fail] {
+    val nl: u32 = wide_lane_count(plan, mi);
+    if (nl < 2 || mi.operand_count != nl + 1 || mi.operands[0].kind != mir.MIR_OP_VREG ||
+        !is_wide_vreg(plan, mi.operands[0].vreg.n) || plan.lane_count[mi.operands[0].vreg.n]::u32 != nl) {
+        ret res[u32, fail.Fail].err{fail.message(LANE_JOIN_SHAPE)};
+    }
+    var k: u32 = 1;
+    for (k < mi.operand_count) {
+        if (!lane_piece_kind_ok(plan, ?mi.operands[k])) { ret res[u32, fail.Fail].err{fail.message(LANE_JOIN_SHAPE)}; }
+        k = k + 1;
+    }
+    ret res[u32, fail.Fail].ok{nl};
+}
+
+# lane k of the value is piece k: a move from a register or vreg, a load from
+# a stack word
+fun expand_lane_join(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
+    dst: *mir.MirInstr, cursor: *u32) err[fail.Fail] {
+    val rc: res[u32, fail.Fail] = lane_join_piece_count(alloc, plan, mi);
+    if (sel rc.err) { ret err[fail.Fail].err{rc.err}; }
+    val lw:   u8  = plan.lane_width;
+    val base: u32 = plan.lane_base[mi.operands[0].vreg.n];
+    var k:    u32 = 0;
+    for (k < rc.ok) {
+        val piece: *mir.MirOperand = ?mi.operands[1 + k];
+        var ops:   [2]mir.MirOperand;
+        ops[0] = mir.op_vreg(mir.vreg_id(base + k));
+        ops[1] = @piece;
+        var opcode: mir.MirOpcode = mir.MIR_MOV;
+        if (piece.kind == mir.MIR_OP_MEM) { opcode = mir.MIR_LOAD; }
+        val r: err[fail.Fail] = emit_piece(alloc, dst, cursor, mi, opcode, ?ops[0], 2, lw);
+        if (sel r.err) { ret r; }
+        k = k + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the wide value a pick reads: a planned vreg, an immediate, or memory at the
+# source width, whose lane k is the word k lanes in
+fun lane_pick_source_ok(plan: *LanePlan, mi: *mir.MirInstr) bool {
+    val src: *mir.MirOperand = ?mi.operands[1];
+    val nl:  u32             = (mi.src_width / plan.lane_width)::u32;
+    if (nl < 2) { ret false; }
+    if (src.kind == mir.MIR_OP_VREG) {
+        ret is_wide_vreg(plan, src.vreg.n) && plan.lane_count[src.vreg.n]::u32 == nl;
+    }
+    if (src.kind == mir.MIR_OP_MEM) { ret mi.operands[0].kind != mir.MIR_OP_MEM; }
+    ret src.kind == mir.MIR_OP_IMM;
+}
+
+fun lane_pick_piece_count(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr) res[u32, fail.Fail] {
+    if (mi.operand_count != 3 || mi.operands[2].kind != mir.MIR_OP_IMM || !lane_piece_kind_ok(plan, ?mi.operands[0]) ||
+        !lane_pick_source_ok(plan, mi)) {
+        ret res[u32, fail.Fail].err{fail.message(LANE_PICK_SHAPE)};
+    }
+    val k: i64 = mi.operands[2].imm;
+    if (k < 0 || k >= (mi.src_width / plan.lane_width)::i64) {
+        ret res[u32, fail.Fail].err{fail.message(LANE_PICK_SHAPE)};
+    }
+    ret res[u32, fail.Fail].ok{1};
+}
+
+# the piece receives lane k of the value: a move into a register or vreg, a
+# store into a stack word, a load when the value itself is in memory
+fun expand_lane_pick(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
+    dst: *mir.MirInstr, cursor: *u32) err[fail.Fail] {
+    val rc: res[u32, fail.Fail] = lane_pick_piece_count(alloc, plan, mi);
+    if (sel rc.err) { ret err[fail.Fail].err{rc.err}; }
+    val lw:  u8              = plan.lane_width;
+    val k:   u32             = mi.operands[2].imm::u32;
+    val src: *mir.MirOperand = ?mi.operands[1];
+    var ops: [2]mir.MirOperand;
+    ops[0] = mi.operands[0];
+    var opcode: mir.MirOpcode = mir.MIR_MOV;
+    if (src.kind == mir.MIR_OP_MEM) {
+        opcode = mir.MIR_LOAD;
+        ops[1] = addr_displaced(src, (k * lw::u32)::i64);
+    }
+    or {
+        ops[1] = lane_operand(plan, src, k);
+        if (mi.operands[0].kind == mir.MIR_OP_MEM) { opcode = mir.MIR_STORE; }
+    }
+    ret emit_piece(alloc, dst, cursor, mi, opcode, ?ops[0], 2, lw);
 }
 
 fun imm_lane(imm: i64, i: u32, w: u8) i64 {
@@ -3275,7 +3403,10 @@ test "mach.lang.be.codegen.legalize:refuses_a_wide_access_with_no_address_operan
     ret 0;
 }
 
-test "mach.lang.be.codegen.legalize:expands_wide_preg_move_onto_consecutive_regs" {
+# a wide move from one physical register used to take lane i as register id
+# + i, which is right only where an ABI happens to hand out consecutive ids.
+# the pieces are stated by a lane op now, and the guess is refused (#3602)
+test "mach.lang.be.codegen.legalize:refuses_a_wide_physical_register_operand" {
     var alloc: A.Allocator;
     page.make(?alloc);
 
@@ -3285,17 +3416,233 @@ test "mach.lang.be.codegen.legalize:expands_wide_preg_move_onto_consecutive_regs
     t_block(?alloc, ?b, 1);
     var mv: [2]mir.MirOperand;
     mv[0] = mir.op_vreg(mir.vreg_id(0));
-    mv[1] = mir.op_preg(mir.preg_id(4));
+    mv[1] = mir.op_preg(mir.preg_id(7));
     t_instr(?alloc, ?b, 0, mir.MIR_MOV, ?mv[0], 2, 2);
     f.blocks      = ?b;
     f.block_count = 1;
 
     var mach: Machine        = t_mach(1, 2);
     val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
-    if (sel r.err)                                                                  { ret 1; }
-    if (b.instr_count != 2)                                                         { ret 1; }
-    if (b.instrs[0].operands[0].vreg.n != 1 || b.instrs[0].operands[1].preg.n != 4) { ret 1; }
-    if (b.instrs[1].operands[0].vreg.n != 2 || b.instrs[1].operands[1].preg.n != 5) { ret 1; }
+    if (!sel r.err)         { ret 1; }
+    if (b.instr_count != 1) { ret 1; }
+
+    # the other direction, a wide value into a register, is the same guess
+    var g: mir.MirFunction;
+    t_vregs(?alloc, ?g, 1);
+    var gb: mir.MirBlock;
+    t_block(?alloc, ?gb, 2);
+    var def: [2]mir.MirOperand;
+    def[0] = mir.op_vreg(mir.vreg_id(0));
+    def[1] = mir.op_imm(0x0102);
+    t_instr(?alloc, ?gb, 0, mir.MIR_MOV, ?def[0], 2, 2);
+    var out: [2]mir.MirOperand;
+    out[0] = mir.op_preg(mir.preg_id(7));
+    out[1] = mir.op_vreg(mir.vreg_id(0));
+    t_instr(?alloc, ?gb, 1, mir.MIR_MOV, ?out[0], 2, 2);
+    g.blocks      = ?gb;
+    g.block_count = 1;
+    val r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?g);
+    if (!sel r2.err) { ret 1; }
+    ret 0;
+}
+
+# SysV-shaped: the first two argument registers are rdi = 7 and rsi = 6, so
+# lane 1 is not register id + 1. the join names the pieces and legalize moves
+# each into its lane, in the order the pieces were stated
+test "mach.lang.be.codegen.legalize:a_lane_join_takes_its_lanes_from_the_pieces_named" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 2);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 2);
+    var jn: [3]mir.MirOperand;
+    jn[0] = mir.op_vreg(mir.vreg_id(0));
+    jn[1] = mir.op_preg(mir.preg_id(7));
+    jn[2] = mir.op_preg(mir.preg_id(6));
+    t_instr(?alloc, ?b, 0, mir.MIR_LANE_JOIN, ?jn[0], 3, 2);
+    b.instrs[0].src_width = 1;
+    var use: [3]mir.MirOperand;
+    use[0] = mir.op_vreg(mir.vreg_id(1));
+    use[1] = mir.op_vreg(mir.vreg_id(0));
+    use[2] = mir.op_vreg(mir.vreg_id(0));
+    t_instr(?alloc, ?b, 1, mir.MIR_XOR, ?use[0], 3, 2);
+    f.blocks      = ?b;
+    f.block_count = 1;
+
+    var mach: Machine        = t_mach(1, 2);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    if (sel r.err)          { ret 1; }
+    if (b.instr_count != 4) { ret 2; }
+    val lo: u32 = b.instrs[0].operands[0].vreg.n;
+    val hi: u32 = b.instrs[1].operands[0].vreg.n;
+    if (b.instrs[0].opcode != mir.MIR_MOV || b.instrs[0].width != 1)                            { ret 3; }
+    if (b.instrs[1].opcode != mir.MIR_MOV || b.instrs[1].width != 1)                            { ret 3; }
+    if (hi != lo + 1)                                                                           { ret 4; }
+    if (b.instrs[0].operands[1].kind != mir.MIR_OP_PREG || b.instrs[0].operands[1].preg.n != 7) { ret 5; }
+    if (b.instrs[1].operands[1].kind != mir.MIR_OP_PREG || b.instrs[1].operands[1].preg.n != 6) { ret 6; }
+    # the use of the joined value reads the same lanes
+    if (b.instrs[2].operands[1].vreg.n != lo || b.instrs[3].operands[1].vreg.n != hi) { ret 7; }
+    ret 0;
+}
+
+# a register-plus-stack split: lane 1 is a stack word, loaded into its lane
+test "mach.lang.be.codegen.legalize:a_lane_join_loads_a_stack_piece" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 1);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 1);
+    var jn: [3]mir.MirOperand;
+    jn[0] = mir.op_vreg(mir.vreg_id(0));
+    jn[1] = mir.op_preg(mir.preg_id(17));
+    jn[2] = mir.op_mem_preg(mir.preg_id(8), 16);
+    t_instr(?alloc, ?b, 0, mir.MIR_LANE_JOIN, ?jn[0], 3, 2);
+    b.instrs[0].src_width = 1;
+    f.blocks              = ?b;
+    f.block_count         = 1;
+
+    var mach: Machine        = t_mach(1, 2);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    if (sel r.err)                                                                 { ret 1; }
+    if (b.instr_count != 2)                                                        { ret 2; }
+    if (b.instrs[0].opcode != mir.MIR_MOV || b.instrs[0].operands[1].preg.n != 17) { ret 3; }
+    if (b.instrs[1].opcode != mir.MIR_LOAD || b.instrs[1].width != 1)              { ret 4; }
+    val m: *mir.MirOperand = ?b.instrs[1].operands[1];
+    if (m.kind != mir.MIR_OP_MEM || m.preg.n != 8 || m.imm != 16)             { ret 5; }
+    if (b.instrs[1].operands[0].vreg.n != b.instrs[0].operands[0].vreg.n + 1) { ret 6; }
+    ret 0;
+}
+
+# a pick names the lane it wants: lane 1 into register 6, lane 0 into a stack
+# word, and the wide value's register is never consulted for either
+test "mach.lang.be.codegen.legalize:a_lane_pick_moves_the_lane_it_names" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 1);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 3);
+    var def: [2]mir.MirOperand;
+    def[0] = mir.op_vreg(mir.vreg_id(0));
+    def[1] = mir.op_imm(0x0102);
+    t_instr(?alloc, ?b, 0, mir.MIR_MOV, ?def[0], 2, 2);
+    var p1: [3]mir.MirOperand;
+    p1[0] = mir.op_preg(mir.preg_id(6));
+    p1[1] = mir.op_vreg(mir.vreg_id(0));
+    p1[2] = mir.op_imm(1);
+    t_instr(?alloc, ?b, 1, mir.MIR_LANE_PICK, ?p1[0], 3, 1);
+    b.instrs[1].src_width = 2;
+    var p0: [3]mir.MirOperand;
+    p0[0] = mir.op_mem_preg(mir.preg_id(2), 4);
+    p0[1] = mir.op_vreg(mir.vreg_id(0));
+    p0[2] = mir.op_imm(0);
+    t_instr(?alloc, ?b, 2, mir.MIR_LANE_PICK, ?p0[0], 3, 1);
+    b.instrs[2].src_width = 2;
+    f.blocks              = ?b;
+    f.block_count         = 1;
+
+    var mach: Machine        = t_mach(1, 2);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    if (sel r.err)          { ret 1; }
+    if (b.instr_count != 4) { ret 2; }
+    val lo: u32 = b.instrs[0].operands[0].vreg.n;
+    val hi: u32 = b.instrs[1].operands[0].vreg.n;
+    if (b.instrs[0].operands[1].imm != 2 || b.instrs[1].operands[1].imm != 1) { ret 3; }
+    val mv: *mir.MirInstr = ?b.instrs[2];
+    if (mv.opcode != mir.MIR_MOV || mv.width != 1)                            { ret 4; }
+    if (mv.operands[0].kind != mir.MIR_OP_PREG || mv.operands[0].preg.n != 6) { ret 5; }
+    if (mv.operands[1].vreg.n != hi)                                          { ret 6; }
+    val st: *mir.MirInstr = ?b.instrs[3];
+    if (st.opcode != mir.MIR_STORE || st.width != 1)                                                    { ret 7; }
+    if (st.operands[0].kind != mir.MIR_OP_MEM || st.operands[0].preg.n != 2 || st.operands[0].imm != 4) { ret 8; }
+    if (st.operands[1].vreg.n != lo)                                                                    { ret 9; }
+    ret 0;
+}
+
+# a pick from an immediate slices it, a pick from memory loads the word k
+# lanes in: the value never has to pass through a register first
+test "mach.lang.be.codegen.legalize:a_lane_pick_reads_an_immediate_or_memory_source" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 0);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 2);
+    var pi: [3]mir.MirOperand;
+    pi[0] = mir.op_preg(mir.preg_id(6));
+    pi[1] = mir.op_imm(0x0102);
+    pi[2] = mir.op_imm(1);
+    t_instr(?alloc, ?b, 0, mir.MIR_LANE_PICK, ?pi[0], 3, 1);
+    b.instrs[0].src_width = 2;
+    var pm: [3]mir.MirOperand;
+    pm[0] = mir.op_preg(mir.preg_id(7));
+    pm[1] = mir.op_mem_preg(mir.preg_id(8), 16);
+    pm[2] = mir.op_imm(1);
+    t_instr(?alloc, ?b, 1, mir.MIR_LANE_PICK, ?pm[0], 3, 1);
+    b.instrs[1].src_width = 2;
+    f.blocks              = ?b;
+    f.block_count         = 1;
+
+    var mach: Machine        = t_mach(1, 2);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    if (sel r.err)                                                                          { ret 1; }
+    if (b.instr_count != 2)                                                                 { ret 2; }
+    if (b.instrs[0].opcode != mir.MIR_MOV || b.instrs[0].operands[0].preg.n != 6)           { ret 3; }
+    if (b.instrs[0].operands[1].kind != mir.MIR_OP_IMM || b.instrs[0].operands[1].imm != 1) { ret 4; }
+    if (b.instrs[1].opcode != mir.MIR_LOAD || b.instrs[1].operands[0].preg.n != 7)          { ret 5; }
+    val m: *mir.MirOperand = ?b.instrs[1].operands[1];
+    if (m.kind != mir.MIR_OP_MEM || m.preg.n != 8 || m.imm != 17) { ret 6; }
+    ret 0;
+}
+
+# a lane op whose pieces do not match its value is an internal error, not a
+# partial expansion
+test "mach.lang.be.codegen.legalize:refuses_a_malformed_lane_op" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var mach: Machine = t_mach(1, 2);
+
+    # one piece for a two-lane value
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 1);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 1);
+    var jn: [2]mir.MirOperand;
+    jn[0] = mir.op_vreg(mir.vreg_id(0));
+    jn[1] = mir.op_preg(mir.preg_id(7));
+    t_instr(?alloc, ?b, 0, mir.MIR_LANE_JOIN, ?jn[0], 2, 2);
+    b.instrs[0].src_width = 1;
+    f.blocks              = ?b;
+    f.block_count         = 1;
+    val r1: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    if (!sel r1.err) { ret 1; }
+
+    # a pick past the last lane
+    var g: mir.MirFunction;
+    t_vregs(?alloc, ?g, 1);
+    var gb: mir.MirBlock;
+    t_block(?alloc, ?gb, 2);
+    var def: [2]mir.MirOperand;
+    def[0] = mir.op_vreg(mir.vreg_id(0));
+    def[1] = mir.op_imm(0x0102);
+    t_instr(?alloc, ?gb, 0, mir.MIR_MOV, ?def[0], 2, 2);
+    var pk: [3]mir.MirOperand;
+    pk[0] = mir.op_preg(mir.preg_id(6));
+    pk[1] = mir.op_vreg(mir.vreg_id(0));
+    pk[2] = mir.op_imm(2);
+    t_instr(?alloc, ?gb, 1, mir.MIR_LANE_PICK, ?pk[0], 3, 1);
+    gb.instrs[1].src_width = 2;
+    g.blocks               = ?gb;
+    g.block_count          = 1;
+    val r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?g);
+    if (!sel r2.err) { ret 2; }
     ret 0;
 }
 
@@ -3411,10 +3758,13 @@ test "mach.lang.be.codegen.legalize:stages_runtime_pointer_into_the_address_pair
     t_vregs(?alloc, ?f, 3);
     var b: mir.MirBlock;
     t_block(?alloc, ?b, 4);
-    var p: [2]mir.MirOperand;
+    # the pointer arrives in two registers, stated as its lanes
+    var p: [3]mir.MirOperand;
     p[0] = mir.op_vreg(mir.vreg_id(0));
     p[1] = mir.op_preg(mir.preg_id(4));
-    t_instr(?alloc, ?b, 0, mir.MIR_MOV, ?p[0], 2, 2);
+    p[2] = mir.op_preg(mir.preg_id(5));
+    t_instr(?alloc, ?b, 0, mir.MIR_LANE_JOIN, ?p[0], 3, 2);
+    b.instrs[0].src_width = 1;
     var v: [2]mir.MirOperand;
     v[0] = mir.op_vreg(mir.vreg_id(1));
     v[1] = mir.op_imm(0x01020304);
@@ -4002,6 +4352,34 @@ test "mach.lang.be.codegen.legalize:a_float_is_not_split_into_integer_lanes" {
     if (sel sr.err)          { ret 1; }
     if (sb.instr_count != 8) { ret 1; }
     if (sf.vreg_count <= 2)  { ret 1; }
+    ret 0;
+}
+
+# a double constant bound for a float argument register names no vreg at all,
+# so the bank is only visible through the register: it stays one move, never
+# two integer halves into fa0 and fa1 (the guess of #3602 on the float bank)
+test "mach.lang.be.codegen.legalize:a_float_register_operand_rides_the_float_bank" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 0);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 1);
+    var mv: [2]mir.MirOperand;
+    mv[0] = mir.op_preg(mir.preg_id(isa.regid_make(isa.REG_CLASS_ID_XMM, 10)));
+    mv[1] = mir.op_imm(0x3FC4000000000000);
+    t_instr(?alloc, ?b, 0, mir.MIR_MOV, ?mv[0], 2, 8);
+    f.blocks      = ?b;
+    f.block_count = 1;
+
+    val before_ptr: *mir.MirInstr  = b.instrs;
+    var mach:       Machine        = t_mach(4, 4);
+    val r:          err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    if (sel r.err)              { ret 1; }
+    if (b.instrs != before_ptr) { ret 2; }
+    if (b.instr_count != 1)     { ret 3; }
+    if (b.instrs[0].width != 8) { ret 4; }
     ret 0;
 }
 
