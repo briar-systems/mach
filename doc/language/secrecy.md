@@ -87,9 +87,29 @@ than the source alone, so they are reported at lowering:
 - a secret operand of an **integer multiply**, unless the target declares the
   exact multiply it emits (the low half, a high half or the widening product,
   at that operand width) as data-independent-timing under a condition the
-  build meets. No target declares one yet, so every ISA refuses it today, and
-  every lane multiply is refused. `$mach.build.ct_mul(op, width)` reads the
-  same decision at comptime (see `comptime-mach.md`)
+  build meets. riscv64 with the Zkt extension selected admits the low half at
+  every width and the high halves at 64 bits (RISC-V Cryptography Extensions
+  Volume I, chapter Zkt, which lists `mul`, `mulh`, `mulhsu`, `mulhu` and
+  `mulw`). x86-64 admits the low half, both high halves and the widening
+  product at 8, 16, 32 and 64 bits on every OS, on Intel and on AMD (#3508).
+  On Intel that is a vendor guarantee: the "Data Operand Independent Timing"
+  guidance states that processors which do not enumerate DOITM may be assumed
+  to behave as if it were enabled for the listed instructions, and `mul`,
+  `imul` and `mulx` are on that list. BearSSL's `ctmul` table, measured per
+  core, records a constant-time multiply since the first Pentium. On AMD the
+  evidence is by table rather than by vendor document: AMD publishes no
+  equivalent list and no mode control (absence, verified 2026-09-18), the same
+  BearSSL table records a constant-time multiply at every width for every AMD
+  core from K7 through Zen, no AMD x86-64 core has ever been documented with a
+  data-dependent multiplier, and AMD's SB-1039 advises constant-time
+  algorithms, which presupposes constant-time instructions. Intel's DOITM
+  mode itself hardens the data dependent prefetcher and the fast store
+  forwarding predictor, memory-side predictors the kernel owns, and is out of
+  scope for this decision (#3623). aarch64 declares the Arm ARM's PSTATE.DIT
+  list (`madd`, `smaddl`, `umaddl`, `smulh`, `umulh`) under DIT, which no OS
+  guarantees yet (#3508), so it refuses the secret multiply today, as every
+  other ISA does. Every lane multiply is refused. `$mach.build.ct_mul(op,
+  width)` reads the same decision at comptime (see `comptime-mach.md`)
 - a secret **variable shift count** on a target without a barrel shifter
 
 A secret value passed to a variadic pack is also rejected, including a secret

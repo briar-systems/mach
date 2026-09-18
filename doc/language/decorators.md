@@ -39,6 +39,7 @@ A decorator is written as an attribute:
 #[oblivious]         # constant-time boundary (no arguments)
 #[scalar]            # opt out of auto-vectorization (no arguments)
 #[naked]             # no prologue or epilogue; body as written (no arguments)
+#[extensions(a, b)]  # the function may use these instruction-set extensions
 #[embed("path")]     # compile-time file embedding (val only)
 #[stage("name")]     # GPU pipeline stage; makes the function an entry point
 #[workgroup(x,y,z)]  # compute workgroup dimensions (with #[stage("compute")])
@@ -627,6 +628,67 @@ also makes a call gets one, since an unaligned call boundary (x86-64) or a
 clobbered link register (aarch64, riscv64) is not something the author asked
 for by writing assembly.
 
+### `extensions(names)` — an outlier function
+
+Lets one function use instruction-set extensions the target does not select.
+Applies to a function with a body; takes one or more bare extension names.
+
+```mach fragment
+#[extensions(sha, ssse3)]
+fun compress_sha_ni(state: *[8]u32, block: *[64]u8) {
+    asm x86_64 {
+        # sha256msg1, sha256rnds2, pshufb, ...
+    }
+}
+
+fun compress(state: *[8]u32, block: *[64]u8) {
+    if (cpu_has_sha_ni()) { compress_sha_ni(state, block); }
+    or                    { compress_portable(state, block); }
+}
+```
+
+This is the same contract as Rust's `#[target_feature(enable = "...")]` and
+gcc's `__attribute__((target("...")))`. Inside the function, inline `asm` may
+use every instruction the named extensions admit, in addition to what the
+target selects. **The caller owns the run-time check.** Calling an outlier on a
+processor that lacks one of its extensions is undefined behaviour, typically an
+illegal-instruction trap. The compiler neither inserts the check nor verifies
+that one precedes the call, because only the program knows how it detects the
+processor's features and when that answer holds.
+
+- **Names come from every instruction set.** A name no instruction set declares
+  is refused, and the refusal lists the known names. A name another instruction
+  set declares admits nothing on this target and is not an error, so one
+  declaration serves a multi-arch source: `#[extensions(sse41, sha2)]` admits
+  `sse41` on x86_64 and `sha2` on aarch64, and an `asm aarch64 {}` block in an
+  x86_64 build still refuses `sha256h` because the tag, not the decorator, picks
+  the isa. Each name may appear once. The names are those the manifest's
+  [`extensions`](manifest.md#instruction-set-extensions) key takes, closed over
+  what they imply (`sse41` admits `pshufb`), except the rows only a target
+  selects (riscv `i`, `c`, `f`, `d`, `zkt`), which are refused with the reason.
+- **One predicate, everywhere.** A function's admitted set is the target's
+  selection plus what the decorator names. An instruction requiring an extension
+  is emitted only into a function whose admitted set holds it (see
+  [asm.md](asm.md#extension-instructions)); the encoder checks every row against
+  it, and the inliner checks it before moving a body, so an outlier the target
+  already selects may still inline into a baseline caller.
+- **Only the instructions change.** The decorator admits instructions in the
+  function's inline `asm`. It does not change how the compiler generates the
+  rest of the body, which stays within the target's selection. The function is
+  called through the ordinary ABI, and its address is an ordinary `fun(...)`
+  value that dispatch through a pointer calls like any other.
+- **It is never inlined into a caller that admits less.** The inliner declines
+  to move an outlier's body into a function whose admitted set does not hold
+  every extension the outlier's does, so the extension instructions stay behind
+  the call the run-time check guards. `#[inline]` does not override this. A
+  caller carrying a superset of the outlier's extensions may still inline it,
+  and any function may be inlined *into* an outlier. A generic function's
+  instances carry the decorator's set.
+- **Nothing else changes.** The decorator composes with `inline`, `noinline`,
+  `symbol` and `section`. `#[oblivious]` already refuses the instructions a
+  constant-time check cannot model, and an extension row it can model is
+  checked like any other.
+
 ### `embed(str)` — compile-time file embedding
 
 Sources a `val`'s bytes from a file at compile time: the file's content **is**
@@ -1019,6 +1081,7 @@ in it.
 | `oblivious` |  yes  |    no     |      no       |      no       |
 | `scalar`    |  yes  |    no     |      no       |      no       |
 | `naked`     |  yes  |    no     |      no       |      no       |
+| `extensions`|  yes  |    no     |      no       |      no       |
 | `embed`     |  no   |    no     |      yes      |      no       |
 | `stage`     |  yes  |    no     |      no       |      no       |
 | `workgroup` |  yes  |    no     |      no       |      no       |
@@ -1046,7 +1109,7 @@ The set is closed. New directives require a compiler change.
 - [visibility.md](visibility.md) — `pub` / `ext` visibility (not decorator-controlled)
 - [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of` / `$align_of` as `align` arguments
 - [secrecy.md](secrecy.md) — `^` secret types and the `oblivious` constant-time contract
-- [asm.md](asm.md) — inline `asm`, the only body a `naked` function may have
+- [asm.md](asm.md) — inline `asm`, the only body a `naked` function may have, and the extension instructions `extensions` admits
 - [val-var.md](val-var.md) — `val` / `var` bindings, and the `embed` exemption to `val`'s initializer requirement
 - [grammar.md](grammar.md#types) — the `[_]` inferred array length `embed` introduces
 - [types.md](types.md) — the SIMD vector types a shader stage computes over and `op` operates on, and the handle types `handle` declares

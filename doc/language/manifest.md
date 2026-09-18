@@ -212,7 +212,87 @@ to whichever *declared* target matches the host.
 | `stack_reserve` | no | Thread stack reserve in bytes. See [Image stack size](#image-stack-size). |
 | `stack_commit` | no | Thread stack commit in bytes. See [Image stack size](#image-stack-size). |
 | `default` | no | `true` marks the target `native` resolves to when no declared target matches the host and several are declared. Exactly one may carry it: two are refused at parse (`2 targets declare `default = true` ([target.linux-x86_64], [target.darwin-x86_64]); exactly one is allowed`). See [`native` target resolution](#native-target-resolution). |
+| `extensions` | no | Array of instruction-set extension names the target may assume, such as `["sha", "ssse3"]`. Each name must be in the isa's vocabulary. See [Instruction-set extensions](#instruction-set-extensions). |
 | `env` | no | Consumer environment (string). The values are owned by the target's isa: an `env` the isa does not define is a manifest error naming the target and the known values, and an isa that defines none refuses the key outright. Today only `spirv` defines any; see [Finished-module targets](#finished-module-targets). |
+
+### Instruction-set extensions
+
+`extensions` lists the extensions a target may assume beyond its isa's baseline:
+
+```toml
+[target.linux-x86_64-sha]
+isa        = "x86_64"
+extensions = ["sha", "ssse3", "sse41"]
+os         = "linux"
+abi        = "sysv64"
+```
+
+Each isa owns its vocabulary. The names are identifiers, so each one is also a
+comptime member, `$mach.build.extensions.<name>` (see [`$mach`](comptime-mach.md)):
+
+| `isa` | Baseline | Extensions |
+|-------|----------|------------|
+| `x86_64` | SSE2 | `ssse3`, `sse41`, `sha`, `fsgsbase` |
+| `aarch64` | AdvSIMD | `sha2` |
+| `riscv64`, `riscv32` | the isa string's selection | `i`, `m`, `a`, `f`, `d`, `c`, `zicsr`, `zifencei`, `zkt` |
+| `spirv` | | none |
+
+A name the selected isa does not hold is refused when the target resolves, with the
+names it does hold:
+
+```
+error: target: `sha2` is not an extension of isa 'x86_64'; its extensions are:
+ssse3, sse41, sha, fsgsbase
+```
+
+The array must hold strings, and each name must be an identifier (`sse41`, not
+`sse4.1`) listed once.
+
+A level is a bundle, never an axis of its own: each name may imply others, and the
+selection is closed over that once, when the target resolves. `sse41` brings `ssse3`
+(the chain stops there; SSE3 is not modelled). On riscv `d` brings `f` and `f` brings
+`zicsr`, as the isa string's own grammar has it, so `extensions = ["d"]` on `rv64i`
+selects `rv64ifd` with Zicsr. The isa string and the list feed one set:
+`isa = "rv64i"` with `extensions = ["m"]` selects the same machine as
+`isa = "rv64im"`. Nothing is gated on a level name; a future `x86-64-v2` would expand
+to bits the way riscv `g` does.
+
+The list is never part of `{target.isa}`. That placeholder is the `isa` value as
+written (`rv64i`, `x86_64`), on every isa; the list belongs to the target's identity
+and to `{target.name}`.
+
+"Selects" means the extension is assumed of every machine the binary runs on: the
+inline assembler admits its rows, `$mach.build.extensions.<name>` answers 1, and a
+property the extension declares (Zkt's data-independent timing, which the
+constant-time multiply rows read) is taken as given. It never means a mode is on. A
+row such as a `dit` would admit `msr dit`, not set it.
+
+Some rows are the target's alone. On riscv `i` is the baseline, `c` is a code-size
+selection mach never emits, and `f` and `d` select the float register file and the
+calling convention's float registers, and `zkt` is a promise about the machine's
+execution timing that the constant-time rows read, so none of them may be named in
+[`#[extensions(...)]`](decorators.md#extensionsnames--an-outlier-function); the
+refusal says why. Every x86_64 and aarch64 row, and riscv `m`, `a`, `zicsr` and
+`zifencei`, may be.
+
+Selecting an extension is a promise about **every** machine the binary runs on. The
+inline assembler admits the extension's mnemonics anywhere in the build, and a host
+without the extension faults on the first one it executes. A portable binary keeps the
+target at its baseline instead. It confines the extension instructions to
+[`#[extensions(...)]`](decorators.md#extensionsnames--an-outlier-function) functions
+and picks one of those at run time, after detecting the host's features.
+
+A mnemonic that needs an extension the target does not select, outside such a
+function, is refused. The refusal names the line to add:
+
+```
+error: encode: inline-asm instruction 'sha256rnds2' needs the `sha` extension, which
+this target does not select; add `extensions = ["sha"]` to the target, or mark the
+function `#[extensions(sha)]` and call it only after detecting the extension at run time
+```
+
+The selected set is part of the target's identity: two targets that differ only in
+`extensions` never share cached products.
 
 ### Image stack size
 
@@ -296,11 +376,13 @@ emits a finished GPU module rather than machine code (see
 `riscv64` and `riscv32` are width-only spellings, and each names a **default
 profile**: `riscv64` is `rv64gc` and `riscv32` is `rv32imac`. A canonical
 extension string such as `rv32imc` or `rv64imafd` selects a smaller machine.
-The retained vocabulary is I, M, A, F, D, C, Zicsr and Zifencei, written in
+The retained vocabulary is I, M, A, F, D, C, Zicsr, Zifencei and Zkt, written in
 lowercase canonical order with multi-letter names after an underscore; `g`
 expands to IMAFD plus Zicsr and Zifencei. F carries its required Zicsr, and D
-requires F. An optional version must be the one mach models: I 2.1, M 2.0,
-A 2.1, F and D 2.2, C 2.0, Zicsr and Zifencei 2.0. Unknown extensions,
+requires F. Zkt changes no instruction. It states that the listed operations run
+in data-independent time, which is what lets a secret multiply compile (see
+`secrecy.md`). An optional version must be the one mach models: I 2.1, M 2.0,
+A 2.1, F and D 2.2, C 2.0, Zicsr and Zifencei 2.0, Zkt 1.0. Unknown extensions,
 other versions, duplicates, noncanonical order and the E base are refused
 rather than rounded up to the default machine.
 
@@ -678,7 +760,12 @@ module no artifact reaches is collected as before.
   write one today: `linux` on `x86_64`, `aarch64` and `riscv64` produce a `.so`
   whose `SONAME` is its file name. The Mach-O `.dylib` and PE `.dll` writers are
   not built yet, so a `darwin` or `windows` target refuses with `link: object
-  format cannot write shared libraries` (#3588).
+  format cannot write shared libraries` (#3588). A `freestanding` target never
+  writes one: its default `raw` format refuses with `a flat-image object format
+  produces only executables`, and setting `of = "elf"` moves the refusal to the
+  link, `link: a shared library needs a loader to map it, and os =
+  "freestanding" has none`, because a shared library only exists to be mapped by
+  a loader the os provides.
   - **Exports.** The library exports the root project's `pub` functions and
     variables and every name its modules re-export with `fwd`, including a
     dependency's. A dependency's own `pub` surface is not exported unless it is

@@ -12,12 +12,15 @@
 # external decoder and diff against test/golden/<target>/<group>/<case>.dis; on a
 # target this host can execute, build at O0 and O2, run both, and compare the
 # checksums to the C reference built from test/ref/<group>/<case>.c. spirv is
-# built, validated with spirv-val, and diffed through spirv-dis.
+# built, validated with spirv-val, and diffed through spirv-dis. a case named in
+# test/golden/<target>/SKIPS is not built for that target; one named in its NORUN
+# keeps its golden and skips the differential.
 #
 #   --target <t>   one target (repeatable); default every target with a golden dir
 #   --case <g/n>   one case (repeatable)
 #   --bless        write the goldens instead of diffing them, print the diff
-#   --qemu         execute riscv64-linux under qemu-riscv64
+#   --qemu         execute riscv64-linux, riscv64zkt-linux and riscv32 under qemu-user
+#                  (a missing emulator is announced and its target stays golden only)
 #   --link         run the link cases (test/link/cases) instead of the corpus
 #   --dwarf        build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
 #   --incremental  warm rebuilds of this compiler and of a manifest fixture match clean builds
@@ -48,19 +51,25 @@ cflags_O0="-std=c11 -O0 -ffp-contract=off -Wall -Wextra"
 cflags_O2="-std=c11 -O2 -ffp-contract=off -Wall -Wextra"
 cflags_ubsan="-std=c11 -O0 -ffp-contract=off -fsanitize=undefined -fno-sanitize-recover=all"
 
-# the targets: name isa os abi of kind entry decoder
+# the targets: name isa os abi of kind entry decoder qemu. qemu names the
+# qemu-user command that runs the target under --qemu, or - for none. a direct
+# target with one also builds a run bin from test/lib/start_<name>.mach, re-laid
+# by test/lib/elf_loadable.py, since qemu-user cannot map a freestanding image.
 targets_all='
-x86_64-linux    x86_64      linux        sysv64   -    bin     hosted  objdump
-aarch64-linux   aarch64     linux        aapcs64  -    bin     hosted  objdump
-riscv64-linux   riscv64     linux        lp64d    -    bin     hosted  objdump
-x86_64-windows  x86_64      windows      win64    -    bin     hosted  objdump
-x86_64-darwin   x86_64      darwin       sysv64   -    bin     hosted  objdump
-aarch64-darwin  aarch64     darwin       aapcs64  -    bin     hosted  objdump
-spirv           spirv       freestanding spirv    -    bin     direct  spirv-dis
-riscv32         rv32imafdc  freestanding ilp32d   elf  static  direct  objdump
+x86_64-linux      x86_64      linux         sysv64   -    bin     hosted  objdump    -
+aarch64-linux     aarch64     linux         aapcs64  -    bin     hosted  objdump    -
+riscv64-linux     riscv64     linux         lp64d    -    bin     hosted  objdump    qemu-riscv64
+riscv64zkt-linux  rv64gc_zkt  linux         lp64d    -    bin     hosted  objdump    qemu-riscv64
+x86_64-windows    x86_64      windows       win64    -    bin     hosted  objdump    -
+x86_64-darwin     x86_64      darwin        sysv64   -    bin     hosted  objdump    -
+aarch64-darwin    aarch64     darwin        aapcs64  -    bin     hosted  objdump    -
+spirv             spirv       freestanding  spirv    -    bin     direct  spirv-dis  -
+riscv32           rv32imafdc  freestanding  ilp32d   elf  static  direct  objdump    qemu-riscv32
 '
+# where a run bin is based: above the host's mmap floor with a page for its headers
+run_base=0x20000
 
-usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 want_targets=
 want_cases=
@@ -126,6 +135,7 @@ fi
 fails=0
 passes=0
 skips=0
+noruns=0
 fail() { echo "FAIL $*"; fails=$((fails + 1)); }
 
 # target_field <target> <column>
@@ -140,16 +150,21 @@ object_format() {
 }
 
 # engine <target>: "" for the host itself, the qemu command, or "-" when nothing here
-# runs it. qemu serves riscv64 only, the one linux target with no native runner:
-# it is compute evidence, never ABI evidence, so aarch64 is proven on real silicon.
+# runs it. qemu serves only the targets with no native runner: it is compute
+# evidence, never ABI evidence, so aarch64 is proven on real silicon.
+# riscv64zkt-linux selects Zkt, whose only effect on codegen is admitting the
+# secret multiply, so qemu is compute evidence for that column too.
 engine() {
-    isa=$(target_field "$1" 2); os=$(target_field "$1" 3)
+    isa=$(target_field "$1" 2); os=$(target_field "$1" 3); q=$(target_field "$1" 9)
     if [ "$os" = "$host_os" ] && [ "$isa" = "$host_isa" ]; then echo ""; return; fi
-    if [ "$qemu" -eq 1 ] && [ "$1" = riscv64-linux ] && command -v qemu-riscv64 >/dev/null 2>&1; then
-        echo qemu-riscv64; return
+    if [ "$qemu" -eq 1 ] && [ "$q" != - ] && command -v "$q" >/dev/null 2>&1; then
+        echo "$q"; return
     fi
     echo -
 }
+
+# runs_bare <target>: a direct target the differential executes
+runs_bare() { [ "$(target_field "$1" 7)" = direct ] && [ "$(target_field "$1" 9)" != - ]; }
 
 docs=${DOCS:-$repo/doc/language}
 case "$docs" in /*) : ;; *) docs=$PWD/$docs ;; esac
@@ -173,19 +188,32 @@ else
     cases=$(cd "$here/cases" && for f in */*.mach; do echo "${f%.mach}"; done | LC_ALL=C sort | tr '\n' ' ')
 fi
 
-# skipped <target> <case>: the first field of a test/golden/<target>/SKIPS line is a
-# case name or a glob; the rest of the line is the reason
-skipped() {
-    [ -f "$here/golden/$1/SKIPS" ] || return 1
+# listed <file> <target> <case>: the first field of a test/golden/<target>/<file>
+# line is a case name or a glob; the rest of the line is the reason
+listed() {
+    [ -f "$here/golden/$2/$1" ] || return 1
     while read -r pat rest; do
         case "$pat" in ''|\#*) continue ;; esac
-        case "$2" in $pat) return 0 ;; esac
-    done <"$here/golden/$1/SKIPS"
+        case "$3" in $pat) return 0 ;; esac
+    done <"$here/golden/$2/$1"
     return 1
 }
+# served: the column's scope. a target with an ONLY file serves the cases its
+# lines match and no other; without one it serves every case. skipped: the target
+# cannot build the case. norun: it builds and its golden is diffed, but its
+# differential disagrees with the reference, so the disagreement is not a failure.
+# a norun case counts as a pass with its column reported golden only. SKIPS and
+# NORUN are claims about a case and are checked, not trusted: a skipped case that
+# builds and a norun case whose differential agrees are stale lines, and the run
+# fails on them. ONLY is a decision about the column, not a claim, so it is not.
+served()  { [ ! -f "$here/golden/$1/ONLY" ] || listed ONLY "$1" "$2"; }
+skipped() { listed SKIPS "$1" "$2"; }
+norun()   { listed NORUN "$1" "$2"; }
 
 # one generated project per entry shape: hosted cases print their checksum through
 # std, direct cases (spirv, riscv32) are the artifact and reach no runtime at all.
+# a direct target qemu runs also gets a run bin per case, whose entry is the
+# target's start_<name>.mach and reports the checksum by raw syscalls.
 materialise() {
     hosted=$out/hosted
     bare=$out/bare
@@ -215,6 +243,21 @@ fun main(argc: usize, argv: **u8) i64 {
 }
 EOF
     done
+    for t in $(printf '%s\n' "$targets_all" | awk '$7 == "direct" && $9 != "-" { print $1 }'); do
+        mkdir -p "$bare/src/run/$t"
+        cp "$here/lib/start_$t.mach" "$bare/src/lib/"
+        for c in $cases; do
+            cat >"$bare/src/run/$t/$(art "$c").mach" <<EOF
+use start: corpus.lib.start_$t;
+use k: corpus.cases.${c%/*}.${c#*/};
+
+#[symbol("corpus_run")]
+fun run(argc: u32) {
+    start.report(k.checksum((argc - 1)::u64));
+}
+EOF
+        done
+    done
     manifest "$hosted" hosted >"$hosted/mach.toml"
     manifest "$bare" direct >"$bare/mach.toml"
 }
@@ -227,10 +270,11 @@ manifest() {
     echo '[project]'; echo 'id = "corpus"'; echo 'version = "0.0.0"'; echo 'src = "src"'
     echo 'out = "o/{target.name}/{profile.name}"'; echo
     names=
-    printf '%s\n' "$targets_all" | while read -r name isa os abi of kind entry decoder; do
+    printf '%s\n' "$targets_all" | while read -r name isa os abi of kind entry decoder q; do
         [ -n "$name" ] && [ "$entry" = "$shape" ] || continue
         echo "[target.$name]"; echo "isa = \"$isa\""; echo "os  = \"$os\""; echo "abi = \"$abi\""
         [ "$of" != - ] && echo "of  = \"$of\""
+        [ "$shape" = direct ] && runs_bare "$name" && echo "base = $run_base"
         echo
     done
     for p in o0 o2 g g2; do
@@ -249,10 +293,14 @@ manifest() {
             echo "targets = [$(printf '%s\n' "$targets_all" | awk '$7 == "hosted" { printf "%s\"%s\"", (n++ ? ", " : ""), $1 }')]"
             echo 'link = []'; echo 'need = []'; echo
         else
-            printf '%s\n' "$targets_all" | while read -r name isa os abi of kind entry decoder; do
+            printf '%s\n' "$targets_all" | while read -r name isa os abi of kind entry decoder q; do
                 [ -n "$name" ] && [ "$entry" = direct ] || continue
                 echo "[artifact.${a}_$kind]"; echo "kind = \"$kind\""; echo "entry = \"cases/$c.mach\""
                 if [ "$kind" = static ]; then echo "out = \"lib/$a.a\""; else echo "out = \"bin/$a\""; fi
+                echo "targets = [\"$name\"]"; echo 'link = []'; echo 'need = []'; echo
+                [ "$q" != - ] || continue
+                echo "[artifact.${a}_run_$name]"; echo 'kind = "bin"'; echo "entry = \"run/$name/$a.mach\""
+                echo "out = \"run/$a\""
                 echo "targets = [\"$name\"]"; echo 'link = []'; echo 'need = []'; echo
             done
         fi
@@ -261,21 +309,52 @@ manifest() {
     return 0
 }
 
-# build <target> <profile> <case> [flags]: the artifact for one case, log on failure
+# build <target> <profile> <case> [run]: the artifact for one case, log at log_of.
+# run asks for what the differential executes, which on a direct target is the
+# run bin re-laid for qemu-user rather than the case's own artifact.
 build() {
-    t=$1; p=$2; c=$3; shift 3
+    t=$1; p=$2; c=$3; role=${4:-}
     a=$(art "$c")
+    run_bin=
     if [ "$(target_field "$t" 7)" = hosted ]; then
         proj=$out/hosted; sel="--bin $a"
+    elif [ "$role" = run ]; then
+        proj=$out/bare; sel="--bin ${a}_run_$t"; run_bin=$out/bare/o/$t/$p/run/$a
     else
         proj=$out/bare
         kind=$(target_field "$t" 6)
         if [ "$kind" = static ]; then sel="--lib ${a}_$kind"; else sel="--bin ${a}_$kind"; fi
     fi
-    log=$out/log/$t.$p.$a.log
+    log=$(log_of "$t" "$p" "$c" "$role")
     mkdir -p "$out/log"
-    "$mach" build "$proj" --target "$t" --profile "$p" $sel "$@" >"$log" 2>&1
+    "$mach" build "$proj" --target "$t" --profile "$p" $sel >"$log" 2>&1 || return 1
+    [ -z "$run_bin" ] || python3 "$here/lib/elf_loadable.py" "$run_bin" "$run_bin.load" >>"$log" 2>&1
 }
+
+# differential <target> <case> <engine>: mach at O0 and O2 against the C reference,
+# 0 when both agree, otherwise 1 with the disagreement in why
+differential() {
+    t=$1; c=$2; eng=$3
+    ref=$(reference "$c" 2>"$out/log/ref.$(art "$c").err") || {
+        why="reference: $(cat "$out/log/ref.$(art "$c").err")"; return 1
+    }
+    # a hosted o2 build above is already the run bin, a direct one is not
+    for p in o0 o2; do
+        if { [ "$p" = o0 ] || runs_bare "$t"; } && ! build "$t" "$p" "$c" run; then
+            why="build $p run: $(first_error "$(log_of "$t" "$p" "$c" run)")"; return 1
+        fi
+        bin=$(artifact "$t" "$p" "$c" run)
+        # a wrong program may print a NUL, which a substitution would warn about
+        got=$(timeout 60 $eng "$bin" 2>"$out/log/$t.$p.$(art "$c").err" | tr -d '\0'); rc=${PIPESTATUS[0]}
+        if [ "$rc" -ne 0 ]; then why="$p: exit $rc"; return 1; fi
+        if [ -s "$out/log/$t.$p.$(art "$c").err" ]; then why="$p: wrote to stderr"; return 1; fi
+        if [ "$got" != "$ref" ]; then why="$p: mach says $got, C reference says $ref"; return 1; fi
+    done
+    return 0
+}
+
+# log_of <target> <profile> <case> [run]
+log_of() { echo "$out/log/$1.$2.$(art "$3")${4:+.$4}.log"; }
 
 # object <target> <profile> <case>
 object() {
@@ -284,10 +363,12 @@ object() {
     case "$fmt" in spv) echo "$base.spv" ;; *) echo "$base.o" ;; esac
 }
 
-# artifact <target> <profile> <case>: the executable, archive or module
+# artifact <target> <profile> <case> [run]: the executable, archive or module
 artifact() {
     a=$(art "$3")
-    if [ "$(target_field "$1" 7)" = hosted ]; then
+    if [ "${4:-}" = run ] && [ "$(target_field "$1" 7)" = direct ]; then
+        echo "$out/bare/o/$1/$2/run/$a.load"
+    elif [ "$(target_field "$1" 7)" = hosted ]; then
         d=$out/hosted/o/$1/$2/bin
         if [ -f "$d/$a.exe" ]; then echo "$d/$a.exe"; else echo "$d/$a"; fi
     elif [ "$(target_field "$1" 6)" = static ]; then
@@ -320,14 +401,18 @@ disassemble() {
 }
 
 # reference <case>: the C answer, built and run once per case at O0, O2 and ubsan;
-# the three must agree before either is compared with mach
+# the three must agree before either is compared with mach. the answer is kept
+# until the reference or the shared header is edited, so a run never compares
+# mach against a stale reference
 reference() {
     c=$1
     ans=$out/ref/$c.ans
-    [ -f "$ans" ] && { cat "$ans"; return 0; }
-    mkdir -p "$out/ref/${c%/*}"
     src=$here/ref/$c.c
     [ -f "$src" ] || { echo "no C reference at $src" >&2; return 1; }
+    if [ -f "$ans" ] && [ ! "$src" -nt "$ans" ] && [ ! "$here/lib/corpus.h" -nt "$ans" ]; then
+        cat "$ans"; return 0
+    fi
+    mkdir -p "$out/ref/${c%/*}"
     modes="O0 O2 ubsan"
     [ "$host_os" = windows ] && modes="O0 O2"
     got=
@@ -352,7 +437,11 @@ reference() {
 run_case() {
     t=$1; c=$2
     fmt=$(object_format "$t")
-    if skipped "$t" "$c"; then skips=$((skips + 1)); return; fi
+    if ! served "$t" "$c"; then skips=$((skips + 1)); return; fi
+    if skipped "$t" "$c"; then
+        if build "$t" o2 "$c"; then fail "$t $c builds: its golden/$t/SKIPS line is stale"; else skips=$((skips + 1)); fi
+        return
+    fi
 
     # release build, decoded and diffed against the golden
     if ! build "$t" o2 "$c"; then
@@ -381,22 +470,17 @@ run_case() {
         fail "$t $c golden: $(diff "$golden" "$dis" | head -n1 | sed 's/^/line /')"; return
     fi
 
-    # the differential: mach at O0 and O2 against the C reference
+    # the differential: mach at O0 and O2 against the C reference. a norun case
+    # runs it too, and the disagreement is what its line claims
     eng=$(engine "$t")
     if [ "$eng" != - ]; then
-        ref=$(reference "$c" 2>"$out/log/ref.$(art "$c").err") || {
-            fail "$t $c reference: $(cat "$out/log/ref.$(art "$c").err")"; return
-        }
-        for p in o0 o2; do
-            if [ "$p" = o0 ] && ! build "$t" o0 "$c"; then
-                fail "$t $c build o0: $(first_error "$out/log/$t.o0.$(art "$c").log")"; return
-            fi
-            bin=$(artifact "$t" "$p" "$c")
-            got=$(timeout 60 $eng "$bin" 2>"$out/log/$t.$p.$(art "$c").err"); rc=$?
-            if [ "$rc" -ne 0 ]; then fail "$t $c $p: exit $rc"; return; fi
-            if [ -s "$out/log/$t.$p.$(art "$c").err" ]; then fail "$t $c $p: wrote to stderr"; return; fi
-            if [ "$got" != "$ref" ]; then fail "$t $c $p: mach says $got, C reference says $ref"; return; fi
-        done
+        if differential "$t" "$c" "$eng"; then
+            if norun "$t" "$c"; then fail "$t $c agrees with the C reference: its golden/$t/NORUN line is stale"; return; fi
+        elif norun "$t" "$c"; then
+            noruns=$((noruns + 1))
+        else
+            fail "$t $c $why"; return
+        fi
     fi
 
     # the -g build through the external verifier for its debug model
@@ -438,7 +522,12 @@ for t in $targets; do
         [ "$got_major" = "$objdump_major" ] ||
             echo "run.sh: warning: llvm-objdump is major $got_major, the goldens were blessed with $objdump_major"
     fi
+    q=$(target_field "$t" 9)
+    if [ "$qemu" -eq 1 ] && [ "$q" != - ] && [ "$(engine "$t")" = - ]; then
+        echo "run.sh: warning: --qemu asked for $t but $q is not on PATH, so $t is golden only"
+    fi
     [ "$(engine "$t")" = - ] || need_tool "${CC:-cc}" "the $t differential"
+    if [ "$(engine "$t")" != - ] && runs_bare "$t"; then need_tool python3 "the $t differential"; fi
     case "$(object_format "$t")" in elf|macho|coff) [ "$dwarf" -eq 0 ] || need_tool llvm-dwarfdump --dwarf ;; esac
 done
 echo "targets: $targets"
@@ -454,7 +543,9 @@ for t in $targets; do
     esac
     [ "$dwarf" -eq 1 ] && how="$how + dwarf"
     echo "target:  $t ($how)"
+    before=$noruns
     for c in $cases; do run_case "$t" "$c"; done
+    [ "$noruns" -eq "$before" ] || echo "norun:   $t $((noruns - before)) cases golden only, listed in golden/$t/NORUN"
 done
 fi
 
