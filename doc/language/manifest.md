@@ -296,11 +296,13 @@ emits a finished GPU module rather than machine code (see
 `riscv64` and `riscv32` are width-only spellings, and each names a **default
 profile**: `riscv64` is `rv64gc` and `riscv32` is `rv32imac`. A canonical
 extension string such as `rv32imc` or `rv64imafd` selects a smaller machine.
-The retained vocabulary is I, M, A, F, D, C, Zicsr and Zifencei, written in
+The retained vocabulary is I, M, A, F, D, C, Zicsr, Zifencei and Zkt, written in
 lowercase canonical order with multi-letter names after an underscore; `g`
 expands to IMAFD plus Zicsr and Zifencei. F carries its required Zicsr, and D
-requires F. An optional version must be the one mach models: I 2.1, M 2.0,
-A 2.1, F and D 2.2, C 2.0, Zicsr and Zifencei 2.0. Unknown extensions,
+requires F. Zkt changes no instruction. It states that the listed operations run
+in data-independent time, which is what lets a secret multiply compile (see
+`secrecy.md`). An optional version must be the one mach models: I 2.1, M 2.0,
+A 2.1, F and D 2.2, C 2.0, Zicsr and Zifencei 2.0, Zkt 1.0. Unknown extensions,
 other versions, duplicates, noncanonical order and the E base are refused
 rather than rounded up to the default machine.
 
@@ -678,7 +680,12 @@ module no artifact reaches is collected as before.
   write one today: `linux` on `x86_64`, `aarch64` and `riscv64` produce a `.so`
   whose `SONAME` is its file name. The Mach-O `.dylib` and PE `.dll` writers are
   not built yet, so a `darwin` or `windows` target refuses with `link: object
-  format cannot write shared libraries` (#3588).
+  format cannot write shared libraries` (#3588). A `freestanding` target never
+  writes one: its default `raw` format refuses with `a flat-image object format
+  produces only executables`, and setting `of = "elf"` moves the refusal to the
+  link, `link: a shared library needs a loader to map it, and os =
+  "freestanding" has none`, because a shared library only exists to be mapped by
+  a loader the os provides.
   - **Exports.** The library exports the root project's `pub` functions and
     variables and every name its modules re-export with `fwd`, including a
     dependency's. A dependency's own `pub` surface is not exported unless it is
