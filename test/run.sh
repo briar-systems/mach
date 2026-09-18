@@ -320,14 +320,18 @@ disassemble() {
 }
 
 # reference <case>: the C answer, built and run once per case at O0, O2 and ubsan;
-# the three must agree before either is compared with mach
+# the three must agree before either is compared with mach. the answer is kept
+# until the reference or the shared header is edited, so a run never compares
+# mach against a stale reference
 reference() {
     c=$1
     ans=$out/ref/$c.ans
-    [ -f "$ans" ] && { cat "$ans"; return 0; }
-    mkdir -p "$out/ref/${c%/*}"
     src=$here/ref/$c.c
     [ -f "$src" ] || { echo "no C reference at $src" >&2; return 1; }
+    if [ -f "$ans" ] && [ ! "$src" -nt "$ans" ] && [ ! "$here/lib/corpus.h" -nt "$ans" ]; then
+        cat "$ans"; return 0
+    fi
+    mkdir -p "$out/ref/${c%/*}"
     modes="O0 O2 ubsan"
     [ "$host_os" = windows ] && modes="O0 O2"
     got=
