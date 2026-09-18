@@ -216,6 +216,57 @@ The multiply and float members are variable-latency operations, so the
 constant-time check treats them as it treats their scalar counterparts. It
 tracks secrets in vector registers separately from general-purpose ones.
 
+## Extension instructions
+
+Some instructions exist only on processors that implement an extension beyond
+the instruction set's baseline. Each such row names its extension, and the
+encoder refuses it unless the target selects that extension (the manifest's
+[`extensions`](manifest.md#instruction-set-extensions) key) or the enclosing
+function admits it with [`#[extensions(...)]`](decorators.md#extensionsnames--an-outlier-function).
+The refusal names the instruction, the extension, and both ways to admit it.
+
+The one invariant behind every check: **an instruction that requires extension E
+is emitted only into a function whose admitted set holds E**, where a function's
+admitted set is the target's selection plus what its `#[extensions(...)]` names,
+each closed over what it implies. The encoder applies it to every row of an `asm`
+block, and the inliner applies the same predicate before moving one body into
+another, so an inlined body never carries an instruction its new home does not
+admit. An `asm` block has no spelling of its own: the tag is the isa, and the block
+inherits its function's set.
+
+| isa | extension | mnemonics |
+|---|---|---|
+| x86_64 | `ssse3` | `pshufb xmm, xmm/m128`, `palignr xmm, xmm/m128, imm8` |
+| x86_64 | `sse41` | `pblendw xmm, xmm/m128, imm8`, `ptest xmm, xmm/m128`, `pinsrd xmm, r32/m32, imm8`, `pextrd r32/m32, xmm, imm8` |
+| x86_64 | `sha` | `sha256rnds2 xmm, xmm/m128`, `sha256msg1 xmm, xmm/m128`, `sha256msg2 xmm, xmm/m128` |
+| x86_64 | `fsgsbase` | `rdfsbase r32/r64`, `rdgsbase r32/r64`, `wrfsbase r32/r64`, `wrgsbase r32/r64` |
+| aarch64 | `sha2` | `sha256h qN, qN, vN.4s`, `sha256h2 qN, qN, vN.4s`, `sha256su0 vN.4s, vN.4s`, `sha256su1 vN.4s, vN.4s, vN.4s` |
+
+`sha256rnds2` also reads `xmm0`, the round keys, without naming it, and the
+constant-time check follows a secret through it. `ptest` sets ZF and CF; the
+check treats it as writing the flags rather than defining them, so a branch after
+a `ptest` of public data still counts a secret an earlier instruction left in the
+flags.
+
+`cpuid` is baseline on x86_64 and is how a program finds out which extensions the
+processor has. It reads the leaf from `eax` and the subleaf from `ecx`, and writes
+all of `eax`, `ebx`, `ecx` and `edx`:
+
+```mach fragment
+var b: u32 = 0;
+var c: u32 = 0;
+var d: u32 = 0;
+asm x86_64 {
+    mov eax, 7
+    xor ecx, ecx
+    cpuid
+    mov {b}, ebx
+    mov {c}, ecx
+    mov {d}, edx
+}
+val has_sha: bool = ((b >> 29) & 1) == 1;
+```
+
 ## Privileged and systems instructions (x86-64)
 
 Beyond the ordinary surface, an OS-level block reaches:
@@ -227,10 +278,11 @@ asm x86_64 {
     hlt                       # park the core
     in al, dx / out dx, al    # port i/o, by immediate port or through dx
     rdtsc / rdmsr / wrmsr     # the counter and the model-specific registers
+    cpuid                     # the processor's identity and extensions
     lidt [rax]                # install an interrupt descriptor table
     pushfq / popfq            # save and restore RFLAGS
     swapgs                    # per-CPU state on a syscall entry
-    rdfsbase rax / wrgsbase r9d   # read or write the fs or gs base (fsgsbase)
+    rdfsbase rax / wrgsbase r9d   # the fs or gs base, with the fsgsbase extension
     iretq                     # return from an interrupt handler
     mov rax, cr2              # the faulting address in a page-fault handler
     mov cr3, rax              # switch page tables
@@ -250,12 +302,15 @@ None of these writes a register the allocator tracks: the interrupt and directio
 flags, RFLAGS, the stack pointer and a segment base are all outside the allocated
 file, and `mov cr3, rax` writes a control register rather than any general-purpose
 one. `rdtsc` and `rdmsr` are the exceptions — both land their result in EDX:EAX,
-which the effect model reports.
+which the effect model reports — and so is `cpuid`, which writes EAX, EBX, ECX
+and EDX.
 
 `rdfsbase`, `rdgsbase`, `wrfsbase` and `wrgsbase` take one 32- or 64-bit
-general-purpose register. A read writes that register, and a write changes only
-the segment base. They run only where the kernel has enabled FSGSBASE, and they
-trap elsewhere. A base write is an address for the constant-time check, because
+general-purpose register. They need the `fsgsbase` extension (CPUID leaf 7, EBX
+bit 0), selected by the target or admitted by the function as in
+[Extension instructions](#extension-instructions). A read writes that register,
+and a write changes only the segment base. They also need the kernel to have
+enabled FSGSBASE, and they trap elsewhere. A base write is an address for the constant-time check, because
 every later `fs:` or `gs:` access goes through it. Writing a secret into a base
 is therefore refused, just as addressing memory with a secret is.
 
