@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- On riscv32, an array indexed by a `u64` reads the right element. The address took its index from a register nothing had assigned, because the 64-bit index was split into two 32-bit lanes while the address still named the whole value, so `av[k]` with `k: u64` read `av[0]` or crashed. A flat address is formed at the pointer width, so gep lowering now truncates a wider index to it and the address reads the index's low lane; an address that still names a wide value is refused as an internal error rather than compiled. 42 of the riscv32 corpus cases listed as wrong under qemu now agree with the C reference. Unrelated on every 64-bit target and on SPIR-V, whose output does not change (#3615).
+- On riscv32, a 64-bit integer passed or returned across a call is placed by the registers the convention names rather than by register id arithmetic. ABI lowering now states each piece of a value wider than the ALU with `MIR_LANE_JOIN` and `MIR_LANE_PICK`, which legalize turns into one move per lane, and a wide value in a physical register reaching legalize is an internal error. The register pair is unchanged. A `u64` that the ilp32 convention splits between the last argument register and the first stack word (the eighth integer argument) used to fail to compile with `operand bank refers to an unknown physical register class`; it now builds and passes. A `f64` constant passed directly to a `f64` parameter used to arrive as two integer halves in `fa0` and `fa1` (the same guess on the float bank), so the callee read a wrong double at o0; it arrives whole (#3602).
+
 ## [5.5.1] - 2026-09-18
 
 ### Fixed
