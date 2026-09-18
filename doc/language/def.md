@@ -5,7 +5,7 @@ underlying type are interchangeable; there is no nominal distinction.
 
 ## Grammar
 
-```mach
+```mach fragment
 def NAME: TYPE;
 ```
 

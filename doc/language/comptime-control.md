@@ -7,7 +7,7 @@ or emitted into the binary. This is fundamentally different from runtime
 
 ## Grammar
 
-```mach
+```mach fragment
 $if (cond) {
     ...
 }
@@ -37,7 +37,7 @@ range is a compile error rather than a silent wrap.
 
 ### Target-conditional code
 
-```mach
+```mach fragment
 $if ($mach.build.os == $mach.os.linux) {
     use full.os.linux;
 }
@@ -101,8 +101,9 @@ Rules:
   signature and ABI, so only the runtime parameters are passed.
 - A comptime parameter may be mixed freely with runtime parameters in any order.
 - A comptime parameter on a **generic** function (`fun f[T]($mode: u8, ...)`) is
-  not yet supported — combining a type instance with a value instance is a
-  pending extension and is reported with a clear diagnostic.
+  refused: a function has type instances or value instances, never both, and
+  the declaration is reported as `comptime value parameters on a generic
+  function are not yet supported`.
 - The function may live in any module: a value-parameter instance is emitted
   against its declaring module and folds its `$if` gates against that module's
   own comptime constants, so a library can export a comptime-parameter function
@@ -110,7 +111,7 @@ Rules:
 - A comptime parameter may gate per-target asm safely, since each instance only
   compiles its taken arm:
 
-```mach
+```mach fragment
 pub fun load($order: Order, ptr: *i64) i64 {
     var result: i64 = 0;
 
@@ -160,7 +161,7 @@ $if ($size_of(MeshUniforms) != 64) {
 }
 ```
 
-```mach
+```mach error a layout intrinsic is only comptime-evaluable after type checking
 rec MeshUniforms { model: [16]f32; }
 
 # the second arm declares, so the whole chain is decided while names are
@@ -198,7 +199,7 @@ that doesn't exist in the arm the gate **selects** is reported as an ordinary
 the enclosing function is instantiated. So such an arm may name what only exists
 on the targets that select it.
 
-```mach
+```mach fragment
 use capability: std.system.capability;
 
 fun field_token(c: *Cursor, error: io_error.Error) {

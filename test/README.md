@@ -28,6 +28,8 @@ bash test/run.sh --qemu                   # also execute riscv64-linux under qem
 bash test/run.sh --dwarf                  # also build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
 bash test/run.sh --link [--qemu]          # the link cases instead of the corpus (--case <name> selects one)
 bash test/run.sh --incremental            # warm rebuilds of the compiler and a manifest fixture match clean builds
+bash test/run.sh --docs [--case <page>]   # the mach code blocks of doc/language compile, and the ones with a main run
+bash test/run.sh --docs --target <t>      # the same blocks compiled for one other hosted target, run only natively
 bash test/run.sh --bless [...]            # write the goldens or expect files instead of diffing, print the diff
 ```
 
@@ -87,6 +89,31 @@ per lane.
    writes. A golden you have not read is not a golden.
 4. A target that cannot serve the case gets a line in `golden/<target>/SKIPS`:
    the case name, then the reason.
+
+## Doc blocks
+
+`--docs` reads every `.md` page of `doc/language` (or of `DOCS`, when set) and
+takes each fenced block whose info string starts with `mach`. The fence line says
+what the block is:
+
+| fence | the block |
+|---|---|
+| ```` ```mach ```` | compiles, and when it declares `#[symbol("main")]` it runs and exits 0 |
+| ```` ```mach fragment ```` | is not compiled: a grammar sketch, a statement out of context, a body elided with `...`, or code that builds for one target only |
+| ```` ```mach error <text> ```` | fails to compile, and the compiler's output contains `<text>` verbatim |
+
+The expected text of an `error` block is the rest of the fence line and is
+required. Pick a stable part of the first diagnostic, not the file position.
+
+Each block becomes its own project with `[project] id = "example"`, one target
+(the host, or the one `--target` names), one debug profile and the checkout's `dep/std`. A block with a main is
+a `bin` artifact, any other block a `static` one, so an unused private function
+is still checked. A block that shows several files marks each with a line
+`# file: src/<path>.mach`, and the file named `root.mach` is the entry, or the last
+file when none is. Lines before the first marker belong to `root.mach`.
+
+A fragment is a statement of fact, so annotate a block only when that is what it
+is. An example that stopped compiling is a doc bug to fix, not a block to mark.
 
 ## Link cases
 

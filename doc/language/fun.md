@@ -5,7 +5,7 @@ has a body of statements.
 
 ## Grammar
 
-```mach
+```mach fragment
 fun NAME(args) RET { ... }              # function with return type
 fun NAME(args) { ... }                  # no return type
 fun NAME[T](args) RET { ... }           # generic over type parameters
@@ -47,7 +47,7 @@ unique type instantiation.
 
 Call sites supply the types explicitly:
 
-```mach
+```mach fragment
 val x: i64 = identity[i64](42);
 val p: Pair[i64, u8] = make_pair[i64, u8](1, 2u8);
 ```
@@ -56,7 +56,7 @@ The same spelling with no call after it **names the instance as a value**. Its
 type is the instantiated signature, so it can be stored, passed, returned, and
 addressed:
 
-```mach
+```mach fragment
 val f: fun(i64) i64 = identity[i64];   # the i64 instance, as a value
 val p: ptr          = ?identity[i64];  # its address
 ret apply(identity[i64], 42);          # passed as a callback
@@ -122,7 +122,7 @@ compiler can resolve at compile time. The function body can branch on the
 comptime parameter via `$if`, producing different code per call-site
 instantiation.
 
-```mach
+```mach fragment
 pub fun pick_op($mode: Mode, a: i64, b: i64) i64 {
     $if (mode == MODE_FAST) {
         ret a + b;
