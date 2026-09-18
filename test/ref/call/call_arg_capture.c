@@ -144,6 +144,19 @@ uint64_t checksum(uint64_t seed) {
         }
         h = fold_s(h, ls);
 
+        {
+            R cr = l;
+            l.a = k + 11;
+            h = mix_u64(h, take_r(cr, k + 11));
+        }
+        h = fold_r(h, l);
+        {
+            S cs = ls;
+            ls.b = (uint32_t)(k + 11);
+            h = mix_u64(h, take_s(cs, (uint64_t)(uint32_t)(k + 11)));
+        }
+        h = fold_s(h, ls);
+
         W w;
         w.tag = k;
         w.inner = make_r(k + 9);
