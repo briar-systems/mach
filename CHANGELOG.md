@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A `#[volatile]` type reaches every access form. Volatility was read at a member and a projection only, from the nominal type of the immediate object, and an index or a dereference passed a literal `false`, so the framebuffer loop `fb.px[i] = c` over a volatile record stored plainly, reading `fb.px[i]` twice loaded plainly, and `@p` through a pointer to a volatile aggregate was ordinary. One predicate now decides for every access, load and store alike: it walks the member, projection and index chain to the storage the access reaches and marks it when any nominal type along the way is volatile, so a field of a plain record stored inside a volatile one is volatile too; an indirection ends the walk at its pointee, so a pointer field of a volatile record reaches ordinary storage, and a raw scalar pointer is never volatile, pinned by a test. The decorator is now documented: `doc/language/decorators.md` has its section with the memory-mapped register idiom, and `rec.md`, `uni.md`, `tag.md` and `types.md` link to it (#3364).
+
 ## [5.9.0] - 2026-09-19
 
 ### Added

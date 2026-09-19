@@ -413,9 +413,13 @@ inside the body, to a single case, where it is the only decorator a case
 accepts. A deprecated case warns at every external construction, `sel` test
 and payload place that names it; see [decorators.md](decorators.md).
 
+`#[volatile]` on a tag makes every access to its storage, discriminator and
+payload alike, a volatile access; see
+[decorators.md](decorators.md#volatile--every-access-to-the-type-is-a-volatile-access).
+
 ## See also
 
-- [decorators.md](decorators.md) - `#[deprecated]`, `#[packed]`, `#[align(N)]`
+- [decorators.md](decorators.md) - `#[deprecated]`, `#[packed]`, `#[align(N)]`, `#[volatile]`
 - [rec.md](rec.md) - records and struct layout
 - [uni.md](uni.md) - raw unions
 - [types.md](types.md) - primitive and compound type reference
