@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A `*ModuleEntry` taken from `mach.lang.driver.module_by_fqn` stays valid for the life of the project. The driver kept its modules in one flat array that doubled from 16 entries as modules loaded, so a pointer held across a load that pulled in another module dangled once the count crossed a power of two; the loader knew and re-read the entry after every nested load. Modules now live in fixed chunks that never move, the same store the source map and type interner use, the re-reads are gone, and every reader reaches an entry through `module_count` and `module_at` rather than indexing the array (#3635).
+
 ## [5.7.0] - 2026-09-19
 
 ### Changed
