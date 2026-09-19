@@ -1143,13 +1143,90 @@ A stanza declares exactly one source:
 | `ref`  | Selector for `git`: `branch/<name>`, `tag/<name>`, or `commit/<full-object-id>`. Any other spelling is rejected (`[dep.std].ref must be branch/<name>, tag/<name>, or commit/<full-object-id>`). |
 | `version` | A [version range](#version-ranges) over the dependency's releases (see [Releases and resolution](#releases-and-resolution)). Valid only with `git`; a path dependency has no releases. |
 | `path` | Local project tree, never fetched. A relative `path` is resolved relative to this manifest's directory. `mach dep add <path> <id> --path` copies its files into `dep/<id>/` without the source's own `dep/` or Git metadata. No repository or index is required for a path dependency, and copied files are not automatically staged. Forbids `ref` and `version`. |
+| `in_place` | An **absolute** path to a project tree that is read where it stands and never copied into `dep/`. Root manifest only. Identified by `digest`, which is required; forbids `git`, `path`, `ref` and `version`. See [In-place dependencies](#in-place-dependencies). |
+| `digest` | `sha256:<64 lowercase hex digits>`, the content digest of the `in_place` tree. Written by `mach dep pull`, `mach dep update` and `mach dep add --in-place`, never by hand. Valid only with `in_place`. |
 
-`git` and `path` are mutually exclusive and exactly one is required. A `git`
-dependency also names exactly one selector, `ref` or `version`.
+`git`, `path` and `in_place` are mutually exclusive and exactly one is required
+(`[dep.std] needs exactly one source key: 'git', 'path' or 'in_place'`). A
+`git` dependency also names exactly one selector, `ref` or `version`.
 
 `ref` and `version` are mutually exclusive (`[dep.std] names both 'ref' and
 'version'; keep one`). `ref` selects one exact commit or tag, or follows a
 branch. `version` selects among releases.
+
+### In-place dependencies
+
+A host that already holds a verified tree (an installed std, a release export)
+can declare it **in place**: the build reads the tree where it stands, nothing
+is copied into `dep/`, and the tree is identified by the content digest the
+root manifest records.
+
+```toml
+[dep.std]
+in_place = "/opt/mach/std/2.1.0"
+digest   = "sha256:9f2c…"      # written by `mach dep pull|update|add`, never by hand
+```
+
+`mach dep add <path> <id> --in-place <dir>` writes the table with the tree's
+digest. `mach dep pull` and `mach dep update <path> <id>` re-walk the tree and
+rewrite `digest` when it differs (`pinned std at sha256:…`), which is the only
+way a digest changes; neither copies anything.
+
+**What the digest covers.** The whole tree beneath `in_place` except a
+top-level `.git` (file or directory), so a release checkout digests as its
+export does. Every regular file's path relative to the root, executable bit,
+size and SHA-256, and every directory's path (an empty directory is identity
+too), in byte order of names. Nothing else is excluded: stray build output in
+the tree changes the digest and is refused, which is the point of a pristine
+read-only tree. The digest is host-independent, so the committed value holds
+on every machine.
+
+**Verification.** Every command that resolves the closure (`build`, `test`,
+`check`, `mach dep verify`, and the editor) walks the tree and hashes every
+file, and refuses when the result differs from `digest`
+(`dependency 'std': in-place tree '/opt/mach/std/2.1.0' has digest sha256:…
+but [dep.std].digest declares sha256:…; the tree changed after it was pinned or
+the declaration is stale, so run `mach dep pull <path>` to re-pin it`). The
+dependency's content identity, which the object cache key includes, is that
+digest. `mach dep verify` prints one line per in-place dependency:
+`std  in-place  /opt/mach/std/2.1.0  sha256:…  (verified by full hash)`.
+
+**Refusals.** Each names the key or the entry at fault:
+
+- `git`, `path`, `ref` or `version` beside `in_place`
+  (`[dep.std].in_place cannot be combined with 'git'; an in-place tree is
+  identified by its digest and takes no other source or selector`), and
+  `digest` without `in_place` (`[dep.std].digest applies only to an in-place
+  dependency`);
+- a relative path (`[dep.std].in_place = "../std" must be an absolute path; a
+  tree relative to the project is what 'path' realizes into dep/`);
+- a declaration outside the root manifest (`[dep.std].in_place is allowed only
+  in the root project's manifest; a dependency cannot point a build at a tree
+  outside the project`), because only the root may point a build outside
+  itself; a root `in_place` overrides a requirer's selector for the same
+  identity exactly as a root `path` does;
+- a missing digest (`dependency 'std': [dep.std] declares in_place without
+  'digest'; run `mach dep pull <path>` to record the digest of '/opt/…'`), and
+  a malformed one (`[dep.std].digest must be "sha256:<64 lowercase hex
+  digits>"`);
+- a `dep/<id>` present beside the declaration (`dependency 'std': dep/std
+  exists beside the in-place declaration of '/opt/…'; an in-place tree is the
+  one source of a dependency, so delete dep/std`): a stale realized copy is
+  refused as ambiguous, never silently shadowed;
+- an `in_place` path that is not a physical directory, probed without following
+  a symlink (`in_place path '/opt/…' must be a physical directory, not a symlink
+  or another kind of entry`);
+- a symlink anywhere in the tree (`in-place tree '/opt/…' contains a symlink at
+  'src/x.mach'; every entry of an in-place tree must be a regular file or
+  directory`), and likewise a FIFO, socket or device, an entry whose name is
+  not portable (not UTF-8, or a `.`/`..` component), and a tree past
+  1,000,000 entries or 4 GiB of content.
+
+**What the declaration does not cover.** Commands whose operand is the
+in-place tree itself (`mach fmt /opt/mach/std/src/x.mach`, `mach build
+/opt/mach/std`) act on that tree as its own project, with no consumer manifest
+in play to refuse from. Those commands are left to filesystem permissions, and
+hosts install in-place trees read-only.
 
 ### Releases and resolution
 
@@ -1341,12 +1418,15 @@ Builds never fetch and never write under `dep/`. Every build (and `mach dep
 verify` as a command) checks, offline, that:
 
 1. every Git dependency is a clean checkout at its applicable pin
-   (`dependency 'std': checkout is dirty:  M mach.toml`), and every path
-   dependency is a contained filesystem tree without repository metadata;
+   (`dependency 'std': checkout is dirty:  M mach.toml`), every path
+   dependency is a contained filesystem tree without repository metadata, and
+   every in-place dependency's tree hashes to its declared `digest` (see
+   [In-place dependencies](#in-place-dependencies));
 2. its project id equals the directory name;
 3. the closure computed from the realized manifests equals the set of
    directories under `dep/`: nothing missing (`dependency 'std' is not
-   resolved (missing 'dep/std'); run `mach dep pull <path>`), nothing extra;
+   resolved (missing 'dep/std'); run `mach dep pull <path>`), nothing extra,
+   and no `dep/<id>` for an in-place identity;
 4. there are no cycles (reported as the chain);
 5. every realized manifest's `[project].mach` accepts the running compiler (see
    [Compiler range](#compiler-range));
