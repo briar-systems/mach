@@ -60,6 +60,13 @@ qemu-user's loader maps. Every byte the program sees is the linker's. A missing
 emulator is announced and its column runs golden only. qemu is compute evidence,
 never ABI evidence.
 
+A case that admits a secret multiply (`ct/mul_secret`, `ct/mul_secret128`) links
+a program that turns PSTATE.DIT on at start and, on an aarch64 host whose
+processor or kernel provides no FEAT_DIT, refuses to start with std's one-line
+refusal and status 255. The driver reads that exact refusal as the host's
+limitation, prints `NORUN <target> <case>` and counts a skip: the golden is
+still diffed, and the differential is not a verdict that host can give.
+
 A target has three case lists, each `case reason` per line, a glob allowed, with
 `#` comments. `ONLY`, when present, names the cases the column serves and no
 other; a case outside it is a skip and no claim about it is made.
