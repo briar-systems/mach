@@ -1251,6 +1251,27 @@ fun git_releases(ctx: ptr, url: str, out: *Vector[cand.Release]) err[outcome.Fai
     ret err[outcome.Fail].ok{};
 }
 
+# the release of `url` whose commit is `commit`, as its version text owned by the
+# caller, or "" when no release tag names that commit: a dependency's committed
+# gitlink is a commit, and resolution deals in releases (#3689)
+pub fun release_for_commit(c: *GitCandidates, url: str, commit: str) res[str, outcome.Fail] {
+    val a:    *A.Allocator         = c.s.build_alloc;
+    var rels: Vector[cand.Release] = vector.init[cand.Release](a);
+    fin { cand.releases_free(a, ?rels); }
+    val listed: err[outcome.Fail] = git_releases((c)::ptr, url, ?rels);
+    if (sel listed.err) { ret res[str, outcome.Fail].err{listed.err}; }
+    var i: usize = 0;
+    for (i < rels.len) {
+        if (str_equals(rels.data[i].commit, commit)) {
+            val text: res[str, A.Error] = str_dup_range(a, rels.data[i].text, 0, str_len(rels.data[i].text));
+            if (sel text.err) { ret res[str, outcome.Fail].err{outcome.refused(text.err)}; }
+            ret res[str, outcome.Fail].ok{text.ok};
+        }
+        i = i + 1;
+    }
+    ret res[str, outcome.Fail].ok{""};
+}
+
 # the listing stays owned by the cache
 fun cached_listing(c: *GitCandidates, url: str) res[str, outcome.Fail] {
     val a: *A.Allocator = c.s.build_alloc;
@@ -2848,6 +2869,16 @@ fun git_is_work_tree(alloc: *A.Allocator, gi: *GitInspector, dir: str) bool {
     ret ok;
 }
 
+# whether `dir` lies inside a Git work tree; false for a plain directory
+pub fun inside_work_tree(s: *session.Session, dir: str) res[bool, outcome.Fail] {
+    var gi: GitInspector      = GitInspector{program: nil};
+    val er: err[outcome.Fail] = git_inspector_require(s.build_alloc, ?gi);
+    if (sel er.err) { ret res[bool, outcome.Fail].err{er.err}; }
+    val inside: bool = git_is_work_tree(s.build_alloc, ?gi, dir);
+    git_inspector_dnit(s.build_alloc, ?gi);
+    ret res[bool, outcome.Fail].ok{inside};
+}
+
 pub fun initialize_repository(s: *session.Session, root: str) err[outcome.Fail] {
     var gi:       GitInspector;
     val required: err[outcome.Fail] = git_inspector_require(s.build_alloc, ?gi);
@@ -3057,7 +3088,8 @@ fun add_git_submodule(s: *session.Session, gi: *GitInspector, root: str, id: str
     ret err[outcome.Fail].ok{};
 }
 
-# record dep/<id> in .gitmodules from the manifest's source for a gitlink the index already holds
+# record a gitlink the index already holds in .gitmodules from the manifest's source;
+# `top` is the repository's top level and `rel` the gitlink's path from there
 fun register_gitlink(s: *session.Session, gi: *GitInspector, root: str, id: str, rel: str, url: str,
     extra_env: **u8) err[outcome.Fail] {
     val metadata: err[outcome.Fail] = require_matches_index(s, gi, id, root, ".gitmodules", "dependency metadata before registration");
@@ -3369,9 +3401,17 @@ pub val SLOT_OCCUPIED: u8 = 3;
 pub val SLOT_SYMLINK:  u8 = 4;
 pub val SLOT_ENTRY:    u8 = 5;
 
-# a git dependency's slot; the record facts are read only in a repository root
+# a git dependency's slot: what dep/<id> holds, and its record in the enclosing
+# repository. the record lives at `top`, the repository's top level where
+# .gitmodules is, under the path `record`: dep/<id> when the project root is the
+# repository root, and the project's prefix ahead of it when the project is a
+# subdirectory of a repository, so a committed gitlink under a subproject is
+# its pin exactly as the root's is. `top` is empty when the root is in no work
+# tree, and then there is no record to read
 pub rec GitSlot {
     tree:       u8;
+    top:        str;
+    record:     str;
     gitlink:    opt[str];
     registered: bool;
     store:      bool;
@@ -3389,6 +3429,55 @@ pub fun git_slot_dnit(alloc: *A.Allocator, slot: *GitSlot) {
     val gitlink: opt[str] = slot.gitlink;
     if (sel gitlink.some) { str_free(alloc, gitlink.some); }
     slot.gitlink = opt[str].none{};
+    if (!str_empty(slot.top))    { str_free(alloc, slot.top); }
+    if (!str_empty(slot.record)) { str_free(alloc, slot.record); }
+    slot.top    = "";
+    slot.record = "";
+}
+
+# whether the slot has a record to read or write: the project root is a
+# repository root, or a subdirectory of one
+pub fun git_slot_recorded(slot: *GitSlot) bool {
+    ret !str_empty(slot.top);
+}
+
+# where dep/<id>'s record lives: the repository root records at dep/<id>
+# itself; a subproject records at the repository's top level under its prefix.
+# `top` and `record` come back empty for a root in no work tree
+fun slot_record_place(s: *session.Session, gi: *GitInspector, root: str, rel: str, mode: u8,
+    top: *str, record: *str) err[outcome.Fail] {
+    @top    = "";
+    @record = "";
+    if (mode == REALIZE_REPO_ROOT) {
+        val top_r: res[str, string.StrError] = string.str_copy(s.build_alloc, root);
+        if (sel top_r.err) { ret err[outcome.Fail].err{outcome.user(outcome.str_text(top_r.err))}; }
+        val rec_r: res[str, string.StrError] = string.str_copy(s.build_alloc, rel);
+        if (sel rec_r.err) {
+            str_free(s.build_alloc, top_r.ok);
+            ret err[outcome.Fail].err{outcome.user(outcome.str_text(rec_r.err))};
+        }
+        @top    = top_r.ok;
+        @record = rec_r.ok;
+        ret err[outcome.Fail].ok{};
+    }
+    if (!git_is_work_tree(s.build_alloc, gi, root)) { ret err[outcome.Fail].ok{}; }
+    var top_args: [2]str                 = [2]str{"rev-parse", "--show-toplevel"};
+    val top_r:    res[str, outcome.Fail] = git_query(s.build_alloc, gi, root, ?top_args[0], 2);
+    if (sel top_r.err) { ret err[outcome.Fail].err{top_r.err}; }
+    val prefix_r: res[str, outcome.Fail] = declaring_prefix(s, gi, "project", root);
+    if (sel prefix_r.err) {
+        str_free(s.build_alloc, top_r.ok);
+        ret err[outcome.Fail].err{prefix_r.err};
+    }
+    val record_r: res[str, format.FormatError] = format.sprint(s.build_alloc, "{}{}", prefix_r.ok, rel);
+    str_free(s.build_alloc, prefix_r.ok);
+    if (sel record_r.err) {
+        str_free(s.build_alloc, top_r.ok);
+        ret err[outcome.Fail].err{outcome.user(outcome.format_text(record_r.err))};
+    }
+    @top    = top_r.ok;
+    @record = record_r.ok;
+    ret err[outcome.Fail].ok{};
 }
 
 fun slot_tree(alloc: *A.Allocator, dep_full: str) res[u8, outcome.Fail] {
@@ -3410,7 +3499,7 @@ fun slot_tree(alloc: *A.Allocator, dep_full: str) res[u8, outcome.Fail] {
 }
 
 pub fun observe_git_slot(s: *session.Session, root: str, id: str, mode: u8) res[GitSlot, outcome.Fail] {
-    var slot:       GitSlot                = GitSlot{tree: SLOT_ABSENT, gitlink: opt[str].none{}, registered: false, store: false};
+    var slot:       GitSlot                = GitSlot{tree: SLOT_ABSENT, top: "", record: "", gitlink: opt[str].none{}, registered: false, store: false};
     val dep_full_r: res[str, outcome.Fail] = dep_full_of(s.build_alloc, root, id);
     if (sel dep_full_r.err) { ret res[GitSlot, outcome.Fail].err{dep_full_r.err}; }
     val dep_full: str = dep_full_r.ok;
@@ -3418,7 +3507,6 @@ pub fun observe_git_slot(s: *session.Session, root: str, id: str, mode: u8) res[
     val tree_r: res[u8, outcome.Fail] = slot_tree(s.build_alloc, dep_full);
     if (sel tree_r.err) { ret res[GitSlot, outcome.Fail].err{tree_r.err}; }
     slot.tree = tree_r.ok;
-    if (mode != REALIZE_REPO_ROOT) { ret res[GitSlot, outcome.Fail].ok{slot}; }
 
     val rel_r: res[str, outcome.Fail] = dep_rel_of(s.build_alloc, id);
     if (sel rel_r.err) { ret res[GitSlot, outcome.Fail].err{rel_r.err}; }
@@ -3428,26 +3516,33 @@ pub fun observe_git_slot(s: *session.Session, root: str, id: str, mode: u8) res[
     val required: err[outcome.Fail] = git_inspector_require(s.build_alloc, ?gi);
     if (sel required.err) { ret res[GitSlot, outcome.Fail].err{required.err}; }
     fin { git_inspector_dnit(s.build_alloc, ?gi); }
+    val placed: err[outcome.Fail] = slot_record_place(s, ?gi, root, rel, mode, ?slot.top, ?slot.record);
+    if (sel placed.err)            { ret res[GitSlot, outcome.Fail].err{placed.err}; }
+    if (!git_slot_recorded(?slot)) { ret res[GitSlot, outcome.Fail].ok{slot}; }
+    var placed_slot: bool = false;
+    fin {
+        if (!placed_slot) { git_slot_dnit(s.build_alloc, ?slot); }
+    }
 
-    val key_r: res[str, format.FormatError] = format.sprint(s.build_alloc, "submodule.{}.path", rel);
+    val key_r: res[str, format.FormatError] = format.sprint(s.build_alloc, "submodule.{}.path", slot.record);
     if (sel key_r.err) { ret res[GitSlot, outcome.Fail].err{outcome.user(outcome.format_text(key_r.err))}; }
     fin { str_free(s.build_alloc, key_r.ok); }
     var config_args: [7]str                 = [7]str{"config", "-f", ".gitmodules", "--default", "", "--get", key_r.ok};
-    val config_r:    res[str, outcome.Fail] = git_query(s.build_alloc, ?gi, root, ?config_args[0], 7);
+    val config_r:    res[str, outcome.Fail] = git_query(s.build_alloc, ?gi, slot.top, ?config_args[0], 7);
     if (sel config_r.err) { ret res[GitSlot, outcome.Fail].err{config_r.err}; }
-    slot.registered = str_equals(config_r.ok, rel);
+    slot.registered = str_equals(config_r.ok, slot.record);
     str_free(s.build_alloc, config_r.ok);
 
-    val module_r: res[str, format.FormatError] = format.sprint(s.build_alloc, "modules/{}", rel);
+    val module_r: res[str, format.FormatError] = format.sprint(s.build_alloc, "modules/{}", slot.record);
     if (sel module_r.err) { ret res[GitSlot, outcome.Fail].err{outcome.user(outcome.format_text(module_r.err))}; }
     fin { str_free(s.build_alloc, module_r.ok); }
     var store_args: [3]str                 = [3]str{"rev-parse", "--git-path", module_r.ok};
-    val store_r:    res[str, outcome.Fail] = git_query(s.build_alloc, ?gi, root, ?store_args[0], 3);
+    val store_r:    res[str, outcome.Fail] = git_query(s.build_alloc, ?gi, slot.top, ?store_args[0], 3);
     if (sel store_r.err) { ret res[GitSlot, outcome.Fail].err{store_r.err}; }
     fin { str_free(s.build_alloc, store_r.ok); }
     var store: str = store_r.ok;
     if (!path.is_abs(store)) {
-        val joined: res[str, fail.Fail] = load.join_path(s.build_alloc, root, store);
+        val joined: res[str, fail.Fail] = load.join_path(s.build_alloc, slot.top, store);
         if (sel joined.err) { ret res[GitSlot, outcome.Fail].err{outcome.from_fail(joined.err)}; }
         store = joined.ok;
     }
@@ -3458,6 +3553,7 @@ pub fun observe_git_slot(s: *session.Session, root: str, id: str, mode: u8) res[
     val link_r: res[opt[str], outcome.Fail] = staged_gitlink(s, root, id);
     if (sel link_r.err) { ret res[GitSlot, outcome.Fail].err{link_r.err}; }
     slot.gitlink = link_r.ok;
+    placed_slot  = true;
     ret res[GitSlot, outcome.Fail].ok{slot};
 }
 
@@ -3510,7 +3606,10 @@ pub fun realize_git_slot(s: *session.Session, root: str, id: str, url: str, ref:
 
 fun realize_git_slot_env(s: *session.Session, root: str, id: str, url: str, ref: str, mode: u8,
     slot: *GitSlot, extra_env: **u8) res[u8, outcome.Fail] {
-    if (mode != REALIZE_REPO_ROOT) {
+    # a subproject's dependency is a plain clone unless the enclosing repository
+    # commits a gitlink for it, and then that gitlink is its pin like the root's
+    val recorded_pin: opt[str] = slot.gitlink;
+    if (mode != REALIZE_REPO_ROOT && (sel recorded_pin.none)) {
         if (slot.tree == SLOT_CHECKOUT) { ret res[u8, outcome.Fail].ok{REALIZED_NOTHING}; }
         val cloned: err[outcome.Fail] = realize_git_clone_env(s, root, id, url, ref, extra_env);
         if (sel cloned.err) { ret res[u8, outcome.Fail].err{cloned.err}; }
@@ -3534,7 +3633,7 @@ fun realize_git_slot_env(s: *session.Session, root: str, id: str, url: str, ref:
     if (sel pinned.some) {
         var effect: u8 = REALIZED_NOTHING;
         if (!slot.registered) {
-            val registered: err[outcome.Fail] = register_gitlink(s, ?gi, root, id, rel, url, extra_env);
+            val registered: err[outcome.Fail] = register_gitlink(s, ?gi, slot.top, id, slot.record, url, extra_env);
             if (sel registered.err) { ret res[u8, outcome.Fail].err{registered.err}; }
             effect = REALIZED_REGISTERED;
         }
@@ -4226,6 +4325,19 @@ pub fun fetch_and_checkout(s: *session.Session, dep_full: str, ref: str) err[out
     git_inspector_dnit(s.build_alloc, ?gi);
     if (sel r.err) { print.eprintlnf("note: fetched {}; selector checkout failed; fetched objects and existing checkout retained", dep_full); }
     ret r;
+}
+
+# whether a moved checkout of dep/<id> is to be staged: always in a repository
+# root, where the gitlink is the pin, and in a subproject exactly when the
+# enclosing repository already records a gitlink for it (#3686)
+pub fun gitlink_recorded(s: *session.Session, root: str, id: str, mode: u8) res[bool, outcome.Fail] {
+    if (mode == REALIZE_REPO_ROOT) { ret res[bool, outcome.Fail].ok{true}; }
+    val observed: res[GitSlot, outcome.Fail] = observe_git_slot(s, root, id, mode);
+    if (sel observed.err) { ret res[bool, outcome.Fail].err{observed.err}; }
+    var slot: GitSlot = observed.ok;
+    fin { git_slot_dnit(s.build_alloc, ?slot); }
+    val pinned: opt[str] = slot.gitlink;
+    ret res[bool, outcome.Fail].ok{sel pinned.some};
 }
 
 pub fun stage_dependency(s: *session.Session, root: str, id: str) err[outcome.Fail] {

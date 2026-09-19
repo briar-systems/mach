@@ -75,10 +75,13 @@ $if ($mach.build.ct_mul(wide_u, 64) == 1) {
   - the extension it names, selected for the target;
   - a data-independent-timing mode the target guarantees.
 - riscv64 with Zkt selected (`rv64gc_zkt`) admits `low` at every width and the
-  three high halves at 64. x86-64 and aarch64 declare their vendors' lists under
-  a data-independent-timing mode that no OS guarantees yet (#3508), so the query
-  folds to 0 on them, as it does on every other target. Lane multiplies are not
-  part of the query.
+  three high halves at 64. x86-64 admits `low`, `high_u`, `high_s` and `wide_u`
+  / `wide_s` at every width on every OS. aarch64 declares `low` at every width,
+  `high_u` and `high_s` at 64 and `wide_u` / `wide_s` at 32 under PSTATE.DIT,
+  which linux and darwin declare they guarantee, so the query folds to 1 there
+  and to 0 on aarch64-windows and freestanding aarch64 (#3508, see
+  [secrecy.md](secrecy.md#pstatedit-at-run-time)). Every other target folds to
+  0. Lane multiplies are not part of the query.
 - The result is a `u8`, like `$mach.build.pie`. An unknown `op` or `width`, a
   missing argument, or arguments on any other path is a compile error that names
   what is accepted.
