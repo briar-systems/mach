@@ -533,8 +533,17 @@ pub rec EncodeState {
     last_inline_site:  u32;
     next_block_id:     u32;
     has_next_block:    bool;
-    interner:          *intern.Interner;
-    srcmap:            *source.SourceMap;
+    # the register locations published in this function and not yet ended
+    open_regs:      *OpenReg;
+    open_reg_count: u32;
+    open_reg_cap:   u32;
+    # the register the previous instruction defined: the clobber ends open
+    # locations at the next instruction's start, where the offset is known
+    pending_def:     bool;
+    pending_def_reg: i32;
+    pending_def_at:  u32;
+    interner:        *intern.Interner;
+    srcmap:          *source.SourceMap;
     # the module's diagnostic store: where a refusal of the program lands
     diags:        *diagnostic.DiagnosticStore;
     model:        *isa.MachineModel;
@@ -542,6 +551,14 @@ pub rec EncodeState {
     base_addr:    u64;
     page_size:    u64;
     stack_probe:  bool;
+}
+
+# a variable location published as a register: the binding it describes and
+# the instruction start it was published at
+pub rec OpenReg {
+    iid: u32;
+    reg: i32;
+    at:  u32;
 }
 
 pub def EncodeFunctionFn: fun(*EncodeState, *mir.MirFunction) err[fail.Fail];
@@ -716,6 +733,7 @@ pub fun encode_module_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.
     var fi:       u32 = 0;
     for (fi < m.function_len) {
         st.last_inline_site = 0;
+        begin_function_locations(?st);
         val pre_sym_count: u32            = st.sym_count;
         val res_encode:    err[fail.Fail] = hooks.encode_function(?st, ?m.functions[fi]);
         if (sel res_encode.err) {
@@ -1319,21 +1337,98 @@ pub fun close_cmp_varlocs(st: *EncodeState, instr_start: u32, instr_end: u32) {
     }
 }
 
+# a function's locations start closed and with no def outstanding
+pub fun begin_function_locations(st: *EncodeState) {
+    st.open_reg_count = 0;
+    st.pending_def    = false;
+}
+
+fun open_reg_push(st: *EncodeState, iid: u32, reg: i32, at: u32) err[fail.Fail] {
+    if (st.open_reg_count >= st.open_reg_cap) {
+        val grown: err[fail.Fail] = grow_cap[OpenReg](st.alloc, ?st.open_regs, ?st.open_reg_cap, DRIVER_INIT_CAP);
+        if (sel grown.err) { ret grown; }
+    }
+    st.open_regs[st.open_reg_count].iid = iid;
+    st.open_regs[st.open_reg_count].reg = reg;
+    st.open_regs[st.open_reg_count].at  = at;
+    st.open_reg_count                   = st.open_reg_count + 1;
+    ret err[fail.Fail].ok{};
+}
+
+# drop every open location of a binding published before `at`; the lanes of one
+# binding are published together at one instruction and stay together
+fun open_reg_drop(st: *EncodeState, iid: u32, at: u32) {
+    var i: u32 = 0;
+    for (i < st.open_reg_count) {
+        if (st.open_regs[i].iid == iid && st.open_regs[i].at != at) {
+            st.open_regs[i]   = st.open_regs[st.open_reg_count - 1];
+            st.open_reg_count = st.open_reg_count - 1;
+        }
+        or { i = i + 1; }
+    }
+}
+
+# the register the instruction defines, in the allocator's convention: the
+# first operand of a shaped instruction when it is a register
+fun instr_def_reg(mi: *mir.MirInstr, out_reg: *i32) bool {
+    if (!mir.instr_defines_shape(mi))           { ret false; }
+    if (mi.operands[0].kind != mir.MIR_OP_PREG) { ret false; }
+    if (mir.preg_is_nil(mi.operands[0].preg))   { ret false; }
+    @out_reg = mir.preg_regid(mi.operands[0].preg);
+    ret true;
+}
+
+# the previous instruction's def has clobbered the register: every location
+# published on it by an earlier instruction is lost from here, and says so
+# with a homeless record. a location the defining instruction itself carried
+# describes that def and stands
+fun end_clobbered_locations(st: *EncodeState, fn: *mir.MirFunction, at: u32) err[fail.Fail] {
+    if (!st.pending_def) { ret err[fail.Fail].ok{}; }
+    st.pending_def = false;
+    var i: u32 = 0;
+    for (i < st.open_reg_count) {
+        val o: *OpenReg = ?st.open_regs[i];
+        if (o.reg == st.pending_def_reg && o.at != st.pending_def_at) {
+            val iid:  u32            = o.iid;
+            val lost: err[fail.Fail] = push_varloc(st, at, fn, mir.MIR_VREG_NIL.n, iid);
+            if (sel lost.err) { ret lost; }
+            open_reg_drop(st, iid, at);
+            i = 0;
+        }
+        or { i = i + 1; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
 pub fun emit_var_bindings(st: *EncodeState, fn: *mir.MirFunction, mi: *mir.MirInstr) err[fail.Fail] {
+    val at:    u32            = st.buf.len::u32;
+    val ended: err[fail.Fail] = end_clobbered_locations(st, fn, at);
+    if (sel ended.err) { ret ended; }
+    var def_reg: i32 = 0;
+    if (instr_def_reg(mi, ?def_reg)) {
+        st.pending_def     = true;
+        st.pending_def_reg = def_reg;
+        st.pending_def_at  = at;
+    }
     if (mi.dbg_binding_count == 0) { ret err[fail.Fail].ok{}; }
-    val at: u32 = st.buf.len::u32;
-    var i:  u32 = 0;
+    var i: u32 = 0;
     for (i < mi.dbg_binding_count) {
         val bind: *mir.MirDbgBinding = ?mi.dbg_bindings[i];
         var r:    err[fail.Fail]     = err[fail.Fail].ok{};
         if (bind.cmp_op != 0) { r = push_cmp_varloc(st, at, fn, bind); }
         or                    { r = push_varloc(st, at, fn, bind.vreg, bind.iid); }
         if (sel r.err)        { ret r; }
+        val vl: *VarLoc = ?st.varlocs[st.varloc_count - 1];
         if (bind.cmp_op == 0 && bind.lanes != 0) {
-            val vl: *VarLoc = ?st.varlocs[st.varloc_count - 1];
             vl.piece       = bind.lane;
             vl.pieces      = bind.lanes;
             vl.piece_bytes = bind.lane_bytes;
+        }
+        # the binding's earlier register locations are superseded by this one
+        open_reg_drop(st, bind.iid, at);
+        if (vl.kind == VARLOC_REG) {
+            val opened: err[fail.Fail] = open_reg_push(st, bind.iid, vl.reg, at);
+            if (sel opened.err) { ret opened; }
         }
         i = i + 1;
     }
@@ -1396,6 +1491,12 @@ pub fun state_blank(st: *EncodeState, alloc: *A.Allocator, model: *isa.MachineMo
     st.last_inline_site  = 0;
     st.next_block_id     = 0;
     st.has_next_block    = false;
+    st.open_regs         = nil;
+    st.open_reg_count    = 0;
+    st.open_reg_cap      = 0;
+    st.pending_def       = false;
+    st.pending_def_reg   = 0;
+    st.pending_def_at    = 0;
     st.interner          = nil;
     st.srcmap            = nil;
     st.diags             = nil;
@@ -1434,6 +1535,12 @@ fun state_dnit(st: *EncodeState) {
     st.inline_pcs      = nil;
     st.inline_pc_count = 0;
     st.inline_pc_cap   = 0;
+    if (st.open_regs != nil && st.open_reg_cap > 0) {
+        A.deallocate[OpenReg](st.alloc, st.open_regs, st.open_reg_cap::usize);
+    }
+    st.open_regs      = nil;
+    st.open_reg_count = 0;
+    st.open_reg_cap   = 0;
     consts_free(st.alloc, st.consts, st.const_count, st.const_cap);
     st.consts      = nil;
     st.const_count = 0;
