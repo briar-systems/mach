@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A loop variable has a debugger location from the loop's first test onward. Loop rotation copies the header's test in front of the loop as a guard and deletes the entry branch it replaces, and both lost their debug bindings: the guard was made without any and the deleted branch's were discarded. A variable bound at the loop test was therefore first described at the bottom-of-loop copy, after the whole body, which a whole-function register location used to hide and which #3641's location lists exposed: at release the `debugger-gdb` case read the counter as `<optimized out>` inside the body. The guard now carries the header's bindings, renamed where they name a register the guard computes its own copy of, and the entry branch's bindings move to the guard's first instruction, the program point that replaces it (#3684).
+
 ## [5.8.0] - 2026-09-19
 
 ### Added
