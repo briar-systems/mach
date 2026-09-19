@@ -247,6 +247,7 @@ inherits its function's set.
 | x86_64 | `sha` | `sha256rnds2 xmm, xmm/m128`, `sha256msg1 xmm, xmm/m128`, `sha256msg2 xmm, xmm/m128` |
 | x86_64 | `fsgsbase` | `rdfsbase r32/r64`, `rdgsbase r32/r64`, `wrfsbase r32/r64`, `wrgsbase r32/r64` |
 | aarch64 | `sha2` | `sha256h qN, qN, vN.4s`, `sha256h2 qN, qN, vN.4s`, `sha256su0 vN.4s, vN.4s`, `sha256su1 vN.4s, vN.4s, vN.4s` |
+| aarch64 | `sb` | `sb` (the FEAT_SB speculation barrier) |
 
 `sha256rnds2` also reads `xmm0`, the round keys, without naming it, and the
 constant-time check follows a secret through it. `ptest` sets ZF and CF; the
@@ -480,13 +481,43 @@ field is bounded by its own width. A field the architecture cannot hold is refus
 than truncated, because a truncated selector would name a *different* register than the
 text does.
 
-`msr <field>, #imm` writes a PSTATE field (`daifset`, `daifclr`, `spsel`, `pan`, `uao`,
+`msr <field>, imm` writes a PSTATE field (`daifset`, `daifclr`, `spsel`, `pan`, `uao`,
 `ssbs`, `dit`, `tco`). The architecture spells these by name only, so there is no numeric
-escape for this form.
+escape for this form. The immediate is spelled bare, as every immediate in an `asm`
+block is: `#` opens a comment to the end of the line, so Arm's `#1` would leave the
+instruction without its operand.
+
+```mach fragment
+asm aarch64 {
+    msr dit, 1                # turn on data-independent timing for this thread
+    dsb nsh                   # ... and make the write take effect before what follows
+    isb
+}
+```
 
 Access permission is not checked: whether a register is writable depends on the exception
 level the code runs at, which the compiler does not know. Writing a register that is
 read-only at the current level traps at run time, as the architecture defines.
+
+## Barriers (aarch64)
+
+The three architectural barriers take the Arm ARM's option vocabulary:
+
+```mach fragment
+asm aarch64 {
+    dmb ish                   # data memory barrier, inner shareable
+    dsb nsh                   # data synchronization barrier, non-shareable
+    isb                       # instruction synchronization barrier (`isb sy` spells the same word)
+    sb                        # speculation barrier, under the `sb` extension
+}
+```
+
+`dmb` and `dsb` take one option from `sy`, `st`, `ld`, `ish`, `ishst`, `ishld`, `nsh`,
+`nshst`, `nshld`, `osh`, `oshst`, `oshld`. `isb` takes no option or `sy`, the one the
+architecture defines. `sb` exists only on a processor with FEAT_SB, so it is an
+[extension instruction](#extension-instructions) under `sb`. None of the four reads or
+writes a register, so an oblivious body may spell them beside a loaded secret, and a
+value stays live across them.
 
 ## Exception conduits and waits (aarch64)
 
