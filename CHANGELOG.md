@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A `*EmbedFile` taken from `mach.lang.embed.get` stays valid for the life of the cache. The cache kept its entries in one flat array that doubled from 8 as `embed` paths were read, so a pointer held across a refresh that read another file dangled once the count crossed a power of two; nothing today holds one that long, but nothing said so either. Entries now live in fixed chunks that never move, the same store the source map, type interner and module table use, and a refresh rewrites an entry in place (#3636).
+
 ## [5.8.0] - 2026-09-19
 
 ### Added
