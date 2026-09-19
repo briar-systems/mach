@@ -32,6 +32,7 @@ use mach.lang.fe.resolve;
 use mach.lang.fe.sema;
 use scx: mach.lang.fe.sema.context;
 use mach.lang.fe.token;
+use mach.lang.handle;
 use mach.lang.intern;
 use mach.lang.manifest;
 use mach.lang.me.ir;
@@ -309,10 +310,8 @@ pub rec Project {
     cache_dir:                     str;
     cache_keys:                    vector.Vector[CacheKey];
 
-    modules:    *ModuleEntry;
-    module_len: u32;
-    module_cap: u32;
-    by_fqn:     map.Map[intern.StrId, session.ModuleId];
+    modules: handle.StableChunks[ModuleEntry];
+    by_fqn:  map.Map[intern.StrId, session.ModuleId];
 
     load_status: *LoadStatus;
     load_cap:    u32;
@@ -618,9 +617,7 @@ pub fun dnit_project(p: *Project) {
         }
         i = i + 1;
     }
-    if (p.modules != nil && p.module_cap > 0) {
-        A.deallocate[ModuleEntry](p.alloc, p.modules, p.module_cap::usize);
-    }
+    handle.chunk_dnit[ModuleEntry](?p.modules);
     if (p.load_status != nil && p.load_cap > 0) {
         A.deallocate[LoadStatus](p.alloc, p.load_status, p.load_cap::usize);
     }
@@ -725,9 +722,7 @@ pub fun init_project(p: *Project, s: *session.Session) {
     p.config.req_scope_count   = 0;
     p.config.home_root         = intern.STR_NIL;
     p.config.dependency_owned  = false;
-    p.modules                  = nil;
-    p.module_len               = 0;
-    p.module_cap               = 0;
+    p.modules                  = handle.chunk_init[ModuleEntry](p.alloc);
     p.by_fqn                   = map.init[intern.StrId, session.ModuleId](p.alloc, map.hash_u32, map.eq_u32);
     p.load_status              = nil;
     p.load_cap                 = 0;
@@ -883,46 +878,57 @@ pub fun fqn_name(p: *Project, fqn: intern.StrId) str {
 
 # the loaded module count; the next ModuleId to be issued
 pub fun module_count(p: *Project) u32 {
-    ret p.module_len;
+    ret handle.chunk_count[ModuleEntry](?p.modules)::u32;
 }
 
 # the entry behind a ModuleId the project has issued
+#
+# the store is a handle.StableChunks: an entry is written once into a fixed
+# chunk and never moves, so the pointer stays valid until dnit_project however
+# many modules load after it
 pub fun module_at(p: *Project, mid: u32) *ModuleEntry {
-    if (mid >= p.module_len) { panic("project: module index is past the loaded modules\n"); }
-    ret ?p.modules[mid];
+    val slot: opt[*ModuleEntry] = handle.chunk_at[ModuleEntry](?p.modules, mid::usize);
+    if (sel slot.some) { ret slot.some; }
+    panic("project: module index is past the loaded modules\n");
+    ret nil;
 }
 
-val INITIAL_MODULE_CAP: u32 = 16;
+fun store_fail(e: handle.Error) fail.Fail {
+    if (sel e.alloc) { ret fail.refused(e.alloc); }
+    ret fail.message(handle.text(e));
+}
 
 # make room for one more entry so the next module_append cannot fail
 pub fun module_reserve(p: *Project) err[fail.Fail] {
-    if (p.module_len < p.module_cap) { ret err[fail.Fail].ok{}; }
-    var new_cap: u32 = p.module_cap;
-    if (new_cap == 0) { new_cap = INITIAL_MODULE_CAP; }
-    or                { new_cap = new_cap * 2; }
-    if (p.modules == nil) {
-        val r: res[*ModuleEntry, A.Error] = A.allocate[ModuleEntry](p.alloc, new_cap::usize);
-        if (sel r.err) { ret err[fail.Fail].err{fail.refused(r.err)}; }
-        p.modules = r.ok;
-    }
-    or {
-        val r: res[*ModuleEntry, A.Error] = A.reallocate[ModuleEntry](p.alloc, p.modules, p.module_cap::usize, new_cap::usize);
-        if (sel r.err) { ret err[fail.Fail].err{fail.refused(r.err)}; }
-        p.modules = r.ok;
-    }
-    p.module_cap = new_cap;
+    val editor_r: res[handle.ChunkEditor[ModuleEntry], handle.Error] = handle.chunk_editor[ModuleEntry](?p.modules);
+    if (sel editor_r.err) { ret err[fail.Fail].err{store_fail(editor_r.err)}; }
+    var editor: handle.ChunkEditor[ModuleEntry] = editor_r.ok;
+    fin { handle.chunk_editor_finish[ModuleEntry](?editor); }
+    val grown: err[handle.Error] = handle.chunk_grow[ModuleEntry](?editor, 1);
+    if (sel grown.err) { ret err[fail.Fail].err{store_fail(grown.err)}; }
     ret err[fail.Fail].ok{};
 }
 
 # publish an entry under the next ModuleId into the slot module_reserve made
 pub fun module_append(p: *Project, m: ModuleEntry) session.ModuleId {
-    if (p.module_len == p.module_cap) { panic("project: module_append without a reserved slot\n"); }
-    val mid: session.ModuleId = module_count(p);
-    p.modules[p.module_len] = m;
-    p.module_len            = p.module_len + 1;
+    val mid:      session.ModuleId                                   = module_count(p);
+    val editor_r: res[handle.ChunkEditor[ModuleEntry], handle.Error] = handle.chunk_editor[ModuleEntry](?p.modules);
+    if (sel editor_r.err) {
+        panic("project: module_append while the module table is being edited\n");
+        ret mid;
+    }
+    var editor: handle.ChunkEditor[ModuleEntry] = editor_r.ok;
+    fin { handle.chunk_editor_finish[ModuleEntry](?editor); }
+    val placed: res[*ModuleEntry, handle.Error] = handle.chunk_append[ModuleEntry](?editor, m);
+    if (sel placed.err) { panic("project: reserved module slot refused the append\n"); }
     ret mid;
 }
 
+# the entry loaded under a fully qualified name
+#
+# the returned `*ModuleEntry` is stable until dnit_project: the store never
+# moves an entry when more modules load, so a holder may keep it across a
+# nested load and read the same entry afterwards
 pub fun module_by_fqn(p: *Project, fqn: intern.StrId) opt[*ModuleEntry] {
     val r: opt[*session.ModuleId] = map.get[intern.StrId, session.ModuleId](?p.by_fqn, ?fqn);
     if (sel r.none) { ret opt[*ModuleEntry].none{}; }
