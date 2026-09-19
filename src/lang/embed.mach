@@ -33,6 +33,7 @@ use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.expr;
 use mach.lang.fe.token;
+use mach.lang.handle;
 use mach.lang.intern;
 use mach.lang.manifest;
 use mach.lang.query;
@@ -54,11 +55,15 @@ pub rec EmbedFile {
     digest: [32]u8;
 }
 
+# the embedded files of one build, found by interned path
+#
+# the store is a handle.StableChunks: an entry is written once into a fixed
+# chunk and never moves, so a `*EmbedFile` from `get` or `insert` stays valid
+# until `dnit` however many files a later refresh adds. a refresh rewrites the
+# entry in place, so a holder reads the current status, bytes and digest
 pub rec EmbedCache {
     alloc:   *A.Allocator;
-    entries: *EmbedFile;
-    len:     u32;
-    cap:     u32;
+    entries: handle.StableChunks[EmbedFile];
 
     root:        str;
     scopes:      *manifest.RequirementScope;
@@ -70,16 +75,12 @@ pub rec EmbedCache {
     builds_artifacts: bool;
 }
 
-val ENTRY_SEED_CAP: u32 = 8;
-
 val INPUT_LEN: u32 = 33;
 
 pub fun init(alloc: *A.Allocator) EmbedCache {
     var c: EmbedCache;
     c.alloc            = alloc;
-    c.entries          = nil;
-    c.len              = 0;
-    c.cap              = 0;
+    c.entries          = handle.chunk_init[EmbedFile](alloc);
     c.root             = "";
     c.scopes           = nil;
     c.scope_count      = 0;
@@ -124,27 +125,25 @@ fun scope_of(c: *EmbedCache, itn: *intern.Interner, module_fqn: intern.StrId) *m
 }
 
 pub fun dnit(c: *EmbedCache) {
-    if (c.entries == nil || c.cap == 0) {
-        c.entries = nil;
-        c.len     = 0;
-        c.cap     = 0;
-        ret;
-    }
     var i: u32 = 0;
-    for (i < c.len) {
-        free_bytes(c, ?c.entries[i]);
+    for (i < count(c)) {
+        val e: opt[*EmbedFile] = handle.chunk_at[EmbedFile](?c.entries, i::usize);
+        if (sel e.some) { free_bytes(c, e.some); }
         i = i + 1;
     }
-    A.deallocate[EmbedFile](c.alloc, c.entries, c.cap::usize);
-    c.entries = nil;
-    c.len     = 0;
-    c.cap     = 0;
+    handle.chunk_dnit[EmbedFile](?c.entries);
 }
 
+# the entry for a path the cache holds
+#
+# the returned `*EmbedFile` is stable until `dnit`: the store never moves an
+# entry when more files are added, so the pointer may be held across a refresh
+# that reads other files, and reads the entry's current state
 pub fun get(c: *EmbedCache, path_id: intern.StrId) opt[*EmbedFile] {
     var i: u32 = 0;
-    for (i < c.len) {
-        if (c.entries[i].path == path_id) { ret opt[*EmbedFile].some{?c.entries[i]}; }
+    for (i < count(c)) {
+        val e: opt[*EmbedFile] = handle.chunk_at[EmbedFile](?c.entries, i::usize);
+        if (sel e.some && e.some.path == path_id) { ret e; }
         i = i + 1;
     }
     ret opt[*EmbedFile].none{};
@@ -438,38 +437,24 @@ fun entry_for(c: *EmbedCache, path_id: intern.StrId) res[*EmbedFile, fail.Fail] 
 
 # the number of entries the cache holds
 pub fun count(c: *EmbedCache) u32 {
-    ret c.len;
+    ret handle.chunk_count[EmbedFile](?c.entries)::u32;
 }
 
-# add an entry under a path the cache does not hold yet; the caller owns any
-# bytes the entry names until dnit frees them with the cache
+fun store_fail(e: handle.Error) fail.Fail {
+    if (sel e.alloc) { ret fail.refused(e.alloc); }
+    ret fail.message(handle.text(e));
+}
+
+# add an entry under a path the cache does not hold yet, into a chunk it never
+# leaves; the entry's bytes belong to the cache from here and dnit frees them
 pub fun insert(c: *EmbedCache, e: EmbedFile) res[*EmbedFile, fail.Fail] {
-    val gr: err[fail.Fail] = grow(c);
-    if (sel gr.err) { ret res[*EmbedFile, fail.Fail].err{gr.err}; }
-    val idx: u32 = c.len;
-    c.entries[idx] = e;
-    c.len          = c.len + 1;
-    ret res[*EmbedFile, fail.Fail].ok{?c.entries[idx]};
-}
-
-fun grow(c: *EmbedCache) err[fail.Fail] {
-    if (c.len < c.cap) { ret err[fail.Fail].ok{}; }
-
-    var new_cap: u32 = ENTRY_SEED_CAP;
-    if (c.cap > 0) { new_cap = c.cap * 2; }
-
-    if (c.entries == nil) {
-        val ar: res[*EmbedFile, A.Error] = A.allocate[EmbedFile](c.alloc, new_cap::usize);
-        if (sel ar.err) { ret err[fail.Fail].err{fail.refused(ar.err)}; }
-        c.entries = ar.ok;
-    }
-    or {
-        val rr: res[*EmbedFile, A.Error] = A.reallocate[EmbedFile](c.alloc, c.entries, c.cap::usize, new_cap::usize);
-        if (sel rr.err) { ret err[fail.Fail].err{fail.refused(rr.err)}; }
-        c.entries = rr.ok;
-    }
-    c.cap = new_cap;
-    ret err[fail.Fail].ok{};
+    val editor_r: res[handle.ChunkEditor[EmbedFile], handle.Error] = handle.chunk_editor[EmbedFile](?c.entries);
+    if (sel editor_r.err) { ret res[*EmbedFile, fail.Fail].err{store_fail(editor_r.err)}; }
+    var editor: handle.ChunkEditor[EmbedFile] = editor_r.ok;
+    fin { handle.chunk_editor_finish[EmbedFile](?editor); }
+    val placed: res[*EmbedFile, handle.Error] = handle.chunk_append[EmbedFile](?editor, e);
+    if (sel placed.err) { ret res[*EmbedFile, fail.Fail].err{store_fail(placed.err)}; }
+    ret res[*EmbedFile, fail.Fail].ok{placed.ok};
 }
 
 fun free_bytes(c: *EmbedCache, e: *EmbedFile) {
