@@ -1179,6 +1179,12 @@ such that:
 2. its own `[project].mach` contains the running compiler;
 3. the closure its own manifest implies also resolves.
 
+A requirer is the root, a release resolution chose, or a dependency the root
+reaches by `ref` or `path`. The last declares its range in the closure directly,
+so two such dependencies naming one identity by range are two requirements of
+the same problem, and the error names each by its chain (`root -> c requires b
+<1.2`).
+
 Among the choices that satisfy all three, it takes the highest release of each
 identity. The result is written as gitlinks, like any other pin; there is
 still no lock file. `mach dep update <path> <name>` keeps every other

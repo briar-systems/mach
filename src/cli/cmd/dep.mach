@@ -55,6 +55,14 @@ val MANIFEST: str = manifest.MANIFEST_FILE;
 # resolver reads itself from the chosen release; every other declaration is the
 # closure's own. `seed` is the commit the declaring dependency's committed gitlink
 # holds for a range it declares, its own pin, "" when it has none
+# a further range declared for the identity of a request by another requirer:
+# the closure keeps one request per identity, and every range on it takes part
+# in resolution (#3702)
+rec RangeDecl {
+    range:    str;
+    requirer: str;
+}
+
 rec DepReq {
     id:          str;
     url:         str;
@@ -62,11 +70,13 @@ rec DepReq {
     ref:         str;
     version:     str;
     chain:       str;
+    requirer:    str;
     root_decl:   bool;
     is_git:      bool;
     via_release: bool;
     seed:        str;
     effect:      str;
+    also:        Vector[RangeDecl];
 }
 
 # a release-selected git dependency: its requirements are the chosen release's
@@ -546,7 +556,15 @@ fun free_request(a: *A.Allocator, request: *DepReq) {
     str_free(a, request.ref);
     if (request.version != nil) { str_free(a, request.version); }
     str_free(a, request.chain);
+    str_free(a, request.requirer);
     if (request.seed != nil) { str_free(a, request.seed); }
+    var k: usize = 0;
+    for (k < request.also.len) {
+        str_free(a, request.also.data[k].range);
+        str_free(a, request.also.data[k].requirer);
+        k = k + 1;
+    }
+    vector.dnit[RangeDecl](?request.also);
 }
 
 fun free_requests(a: *A.Allocator, requests: *Vector[DepReq]) {
@@ -598,6 +616,7 @@ fun enqueue(a: *A.Allocator, reqs: *Vector[DepReq], manifest_dir: str, mt: *toml
         r.is_git      = has_git;
         r.via_release = via_release;
         r.seed        = nil;
+        r.also        = vector.init[RangeDecl](a);
         if (has_git) {
             r.url     = own(a, git_src);
             r.ref     = own(a, key_text(?value.data.table, "ref"));
@@ -617,11 +636,20 @@ fun enqueue(a: *A.Allocator, reqs: *Vector[DepReq], manifest_dir: str, mt: *toml
         }
         val chain_r: res[str, format.FormatError] = format.sprint(a, "{} -> {}", chain, key);
         if (sel chain_r.err) { ret err[outcome.Fail].err{outcome.user("out of memory")}; }
-        r.chain = chain_r.ok;
+        r.chain    = chain_r.ok;
+        r.requirer = own(a, chain);
+        if (r.requirer == nil) { ret err[outcome.Fail].err{outcome.user("out of memory")}; }
 
         val existing: i64 = req_index(reqs, r.id);
         if (existing >= 0) {
             val e: *DepReq = ?reqs.data[existing::usize];
+            # a second range on a release-selected identity is one more need of the
+            # same problem; a fixed root selection overrides every range on it
+            if (both_ranged(e, ?r) && !via_release) {
+                val kept: err[outcome.Fail] = keep_range(e, ?r);
+                if (sel kept.err) { ret kept; }
+                cnt;
+            }
             if (e.root_decl)             { cnt; }
             if (selection_agrees(e, ?r)) { cnt; }
             ret err[outcome.Fail].err{outcome.user(conflict_text(a, ?r, e, ?r))};
@@ -630,6 +658,21 @@ fun enqueue(a: *A.Allocator, reqs: *Vector[DepReq], manifest_dir: str, mt: *toml
         if (sel pushed.err) { ret err[outcome.Fail].err{outcome.refused(pushed.err)}; }
         retained = true;
     }
+    ret err[outcome.Fail].ok{};
+}
+
+# two release selections of one identity from the same repository
+fun both_ranged(e: *DepReq, r: *DepReq) bool {
+    ret selects_release(e) && selects_release(r) && str_equals(e.url, r.url);
+}
+
+# `r` is a further range on the identity `e` holds: its range and requirer move
+# to `e`, so the request it came from is freed without them
+fun keep_range(e: *DepReq, r: *DepReq) err[outcome.Fail] {
+    val pushed: res[usize, A.Error] = vector.push[RangeDecl](?e.also, RangeDecl{range: r.version, requirer: r.requirer});
+    if (sel pushed.err) { ret err[outcome.Fail].err{outcome.refused(pushed.err)}; }
+    r.version  = nil;
+    r.requirer = nil;
     ret err[outcome.Fail].ok{};
 }
 
@@ -756,9 +799,20 @@ fun resolve_versions(s: *session.Session, a: *A.Allocator, root: str, table: *to
     for (i < closure.len) {
         val r: *DepReq = ?closure.data[i];
         i = i + 1;
-        if (r.via_release || !selects_release(r)) { cnt; }
-        if (str_listed(?fixed, r.id))             { cnt; }
-        vector.push[resolver.Need](?needs, resolver.Need{id: r.id, url: r.url, range: r.version});
+        if (!selects_release(r))      { cnt; }
+        if (str_listed(?fixed, r.id)) { cnt; }
+        # a range read through a release is the release's own need, which the
+        # resolver reads from its manifest; the ranges declared beside it are not
+        if (!r.via_release) {
+            var who: str = "";
+            if (!r.root_decl) { who = r.requirer; }
+            vector.push[resolver.Need](?needs, resolver.Need{id: r.id, url: r.url, range: r.version, who: who});
+        }
+        var k: usize = 0;
+        for (k < r.also.len) {
+            vector.push[resolver.Need](?needs, resolver.Need{id: r.id, url: r.url, range: r.also.data[k].range, who: r.also.data[k].requirer});
+            k = k + 1;
+        }
         val full: res[str, outcome.Fail] = deps.dep_full_of(a, root, r.id);
         if (sel full.ok) {
             val noted: err[outcome.Fail] = deps.git_candidates_add_local(?gc, r.url, full.ok);
@@ -4190,7 +4244,12 @@ test "mach.cli.cmd.dep.version:transitive_ranges_resolve_and_branch_selecting_re
 # a package `id` selecting vb by the range `^1` from `fix_vb`, with a committed
 # gitlink for it at `tag`; never a release itself, so it is reached by ref or path
 fun t_requirer_of_vb(a: *A.Allocator, prefix: str, id: str, fix_vb: str, tag: str) str {
-    val table: str = t_dep_table_range(a, "vb", fix_vb, "^1");
+    ret t_requirer_of_vb_at(a, prefix, id, fix_vb, tag, "^1");
+}
+
+# a package `id` declaring vb by `range`, its own gitlink for vb at `tag`
+fun t_requirer_of_vb_at(a: *A.Allocator, prefix: str, id: str, fix_vb: str, tag: str, range: str) str {
+    val table: str = t_dep_table_range(a, "vb", fix_vb, range);
     if (str_empty(table)) { ret ""; }
     val dir: str = t_package_repo(a, prefix, id, table);
     if (str_empty(dir))                                                                    { ret ""; }
@@ -4282,6 +4341,88 @@ test "mach.cli.cmd.dep.version:a_range_declared_by_a_path_dependency_resolves_fr
     fin { fs.remove_all(?a, p); }
     var add: [6]str = [6]str{"add", "", "p", "--path", p, "--quiet"};
     ret t_transitive_range_through(?a, "mach_dep_path_edge_root", vb, t_dep_table_path(?a, "p", p), ?add[0], 6);
+}
+
+# the resolution's refusal for `root`, or "" when it resolves
+fun t_resolution_refusal(a: *A.Allocator, root: str) str {
+    val notes: Vector[str] = t_notes_of(a, root, false);
+    if (notes.len == 0) { ret ""; }
+    ret notes.data[0];
+}
+
+# every range declared for one identity takes part in its resolution, whichever
+# requirer declares it: two path dependencies' ranges on vb intersect, disjoint
+# ranges are refused naming each requirer by its chain with the root's remedy,
+# and a root range narrows the same way (#3702)
+test "mach.cli.cmd.dep.version:every_requirer_range_on_one_identity_takes_part_in_resolution" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    var git_env: [4]*u8;
+    t_allow_file_transport(?git_env[0]);
+    fin { deps.set_git_config_env(nil); }
+    val vb: str = t_released(?a);
+    if (str_empty(vb)) { ret 2; }
+    fin { fs.remove_all(?a, vb); }
+    val p: str = t_requirer_of_vb_at(?a, "mach_dep_ranges_p", "p", vb, "v1.0.0", "^1");
+    if (str_empty(p)) { ret 3; }
+    fin { fs.remove_all(?a, p); }
+    val q: str = t_requirer_of_vb_at(?a, "mach_dep_ranges_q", "q", vb, "v1.1.0", ">=1.1");
+    if (str_empty(q)) { ret 4; }
+    fin { fs.remove_all(?a, q); }
+    val n: str = t_requirer_of_vb_at(?a, "mach_dep_ranges_n", "n", vb, "v1.0.0", "<1.1");
+    if (str_empty(n)) { ret 5; }
+    fin { fs.remove_all(?a, n); }
+    val q_table: str = t_dep_table_path(?a, "q", q);
+
+    # overlapping: the highest release inside the intersection, and verify agrees
+    val both: res[str, format.FormatError] = format.sprint(?a, "{}{}", t_dep_table_path(?a, "p", p), q_table);
+    if (sel both.err) { ret 10; }
+    val both_root: str = t_root_repo(?a, "mach_dep_ranges_both", both.ok);
+    if (str_empty(both_root)) { ret 11; }
+    fin { fs.remove_all(?a, both_root); }
+    var up: [3]str = [3]str{"update", both_root, "--all"};
+    if (t_dep_cli_args(?a, ?up[0], 3) != 0)                             { ret 12; }
+    if (!str_equals(t_release_under(?a, both_root, "dep/vb"), "1.1.0")) { ret 13; }
+    if (verify_project(both_root, false) != 0)                          { ret 14; }
+
+    # disjoint: refused, each range named by the chain that declared it
+    val apart: res[str, format.FormatError] = format.sprint(?a, "{}{}", t_dep_table_path(?a, "n", n), q_table);
+    if (sel apart.err) { ret 20; }
+    val apart_root: str = t_root_repo(?a, "mach_dep_ranges_apart", apart.ok);
+    if (str_empty(apart_root)) { ret 21; }
+    fin { fs.remove_all(?a, apart_root); }
+    var up2: [3]str = [3]str{"update", apart_root, "--all"};
+    if (t_dep_cli_args(?a, ?up2[0], 3) == 0)                { ret 22; }
+    if (t_exists_under(?a, apart_root, "dep/vb/mach.toml")) { ret 23; }
+    val refusal: str = t_resolution_refusal(?a, apart_root);
+    if (!t_contains(refusal, "root -> n requires vb <1.1"))                        { ret 24; }
+    if (!t_contains(refusal, "root -> q requires vb >=1.1"))                       { ret 25; }
+    if (!t_contains(refusal, "the root decides by declaring the identity itself")) { ret 26; }
+    if (!t_contains(refusal, "[dep.vb]"))                                          { ret 27; }
+
+    # a root range narrows with the dependencies' ranges: disjoint is refused
+    # naming the root, and an overlap picks inside it
+    val narrow: res[str, format.FormatError] = format.sprint(?a, "{}{}", t_dep_table_range(?a, "vb", vb, "<1.1"), q_table);
+    if (sel narrow.err) { ret 30; }
+    val narrow_root: str = t_root_repo(?a, "mach_dep_ranges_narrow", narrow.ok);
+    if (str_empty(narrow_root)) { ret 31; }
+    fin { fs.remove_all(?a, narrow_root); }
+    var up3: [3]str = [3]str{"update", narrow_root, "--all"};
+    if (t_dep_cli_args(?a, ?up3[0], 3) == 0) { ret 32; }
+    val root_refusal: str = t_resolution_refusal(?a, narrow_root);
+    if (!t_contains(root_refusal, "root requires vb <1.1"))       { ret 33; }
+    if (!t_contains(root_refusal, "root -> q requires vb >=1.1")) { ret 34; }
+    val wide: res[str, format.FormatError] = format.sprint(?a, "{}{}", t_dep_table_range(?a, "vb", vb, "^1"), q_table);
+    if (sel wide.err) { ret 40; }
+    val wide_root: str = t_root_repo(?a, "mach_dep_ranges_wide", wide.ok);
+    if (str_empty(wide_root)) { ret 41; }
+    fin { fs.remove_all(?a, wide_root); }
+    var up4: [3]str = [3]str{"update", wide_root, "--all"};
+    if (t_dep_cli_args(?a, ?up4[0], 3) != 0)                            { ret 42; }
+    if (!str_equals(t_release_under(?a, wide_root, "dep/vb"), "1.1.0")) { ret 43; }
+    if (verify_project(wide_root, false) != 0)                          { ret 44; }
+    ret 0;
 }
 
 fun t_refusal_has(a: *A.Allocator, root: str, n1: str, n2: str) bool {
