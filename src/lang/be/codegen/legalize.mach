@@ -3,6 +3,7 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -13,16 +14,25 @@ use std.format;
 use A: std.allocator;
 
 use mach.lang.be.codegen.mir;
+use lctx: mach.lang.be.codegen.mir.context;
 use mach.lang.diagnostic;
+use mach.lang.me.ir.value;
 use mach.lang.target.isa;
 use target: mach.lang.target.resolved;
+use mach.lang.wide;
 
+# mul_form is the target's declared realization of a lane-width widening
+# multiply (isa.MulWideForm); pair_lo and pair_hi are its fixed accumulator
+# pair when the form is MULW_FIXED_PAIR (#3511)
 rec Machine {
     lane_width: u8;
     ptr_width:  u8;
     var_shift:  bool;
     has_mul:    bool;
     mul_hi:     u8;
+    mul_form:   isa.MulWideForm;
+    pair_lo:    i32;
+    pair_hi:    i32;
     stage_lo:   i32;
     stage_hi:   i32;
     fp_class:   u32;
@@ -67,6 +77,9 @@ pub fun run(tgt: *target.Target, m: *mir.MirModule) err[fail.Fail] {
     mach.var_shift  = tgt.model.has_var_shift;
     mach.has_mul    = tgt.model.has_mul;
     mach.mul_hi     = tgt.model.mul_hi_width::u8;
+    mach.mul_form   = tgt.model.mul_wide_form;
+    mach.pair_lo    = tgt.model.div_reg;
+    mach.pair_hi    = tgt.model.div_hi_reg;
     mach.stage_lo   = -1;
     mach.stage_hi   = -1;
     mach.fp_class   = float_class_of(tgt);
@@ -101,6 +114,8 @@ fun function_needs_legalize(f: *mir.MirFunction, mach: *Machine) bool {
 fun instr_needs_legalize(f: *mir.MirFunction, mi: *mir.MirInstr, mach: *Machine) bool {
     if (is_lane_op(mi.opcode))                                        { ret true; }
     if (conv_is_wide(mach, mi))                                       { ret true; }
+    if (is_scalar_wide_mul(mi))                                       { ret true; }
+    if (is_mul_hi(mi.opcode) && mach.mul_hi == 0)                     { ret true; }
     if (instr_rides_fp_bank(f, mi))                                   { ret false; }
     if (mi.width > mach.lane_width || mi.src_width > mach.lane_width) { ret true; }
     if (!mach.var_shift && is_shift(mi.opcode))                       { ret true; }
@@ -116,6 +131,18 @@ fun is_shift(op: mir.MirOpcode) bool {
 # pieces by whoever produced them (#3602)
 fun is_lane_op(op: mir.MirOpcode) bool {
     ret op == mir.MIR_LANE_JOIN || op == mir.MIR_LANE_PICK;
+}
+
+# a scalar widening multiply exists only above the ALU width and is realized
+# here through the target's declared form; its vector twin is a packed cell
+# isel selects
+fun is_scalar_wide_mul(mi: *mir.MirInstr) bool {
+    if (mi.vec_lane != mir.VEC_LANE_NONE) { ret false; }
+    ret mi.opcode == mir.MIR_MUL_WIDE_U || mi.opcode == mir.MIR_MUL_WIDE_S;
+}
+
+fun is_mul_hi(op: mir.MirOpcode) bool {
+    ret op == mir.MIR_MUL_HI_U || op == mir.MIR_MUL_HI_S;
 }
 
 fun instr_has_value_base(mi: *mir.MirInstr) bool {
@@ -476,10 +503,17 @@ fun expansion_count(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction,
     # registers states the pieces with a lane op, and nothing here may find
     # lane k of a register by its id (#3602)
     if (nl > 1 && instr_names_preg(mi)) {
-        ret res[u32, fail.Fail].err{fail.message("legalize: a physical register carries a value wider than the ALU (internal compiler error: ABI lowering states the lanes with MIR_LANE_JOIN and MIR_LANE_PICK, see briar-systems/mach#3602)")};
+        val rj: res[str, format.FormatError] = format.sprint(alloc,
+            "legalize: a physical register carries a value wider than the ALU ({}, {} bytes wide; internal compiler error: ABI lowering states the lanes with MIR_LANE_JOIN and MIR_LANE_PICK, see briar-systems/mach#3602)",
+            mir.opcode_name(op), mi.width);
+        if (sel rj.err) { ret res[u32, fail.Fail].err{fail.format_refused(rj.err)}; }
+        ret res[u32, fail.Fail].err{fail.message(rj.ok)};
     }
 
     if (conv_is_wide(?plan.mach, mi)) { ret conv_piece_count(alloc, plan, f, mi); }
+
+    if (is_scalar_wide_mul(mi)) { ret mul_wide_piece_count(alloc, plan, mi); }
+    if (is_mul_hi(op))          { ret mul_hi_piece_count(alloc, plan, mi); }
 
     if (instr_is_memory(mi)) { ret memory_piece_count(alloc, plan, mi); }
 
@@ -637,6 +671,12 @@ fun expand_instr(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: 
     if (conv_is_wide(?plan.mach, mi)) {
         ret conv_run(alloc, plan, f, mi, dst, cursor);
     }
+    if (is_scalar_wide_mul(mi)) {
+        ret expand_mul_wide(alloc, plan, f, mi, dst, cursor);
+    }
+    if (is_mul_hi(op)) {
+        ret expand_mul_hi(alloc, plan, f, mi, dst, cursor);
+    }
     if (instr_is_memory(mi)) {
         ret expand_memory(alloc, plan, mi, dst, cursor);
     }
@@ -721,7 +761,7 @@ fun lane_operand(plan: *LanePlan, op: *mir.MirOperand, i: u32) mir.MirOperand {
         ret mir.op_vreg(mir.vreg_id(plan.lane_base[op.vreg.n] + i));
     }
     if (op.kind == mir.MIR_OP_IMM) {
-        ret mir.op_imm(imm_lane(op.imm, i, plan.lane_width));
+        ret mir.op_imm(imm_lane(op, i, plan.lane_width));
     }
     ret @op;
 }
@@ -837,10 +877,11 @@ fun expand_lane_pick(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
     ret emit_piece(alloc, dst, cursor, mi, opcode, ?ops[0], 2, lw);
 }
 
-fun imm_lane(imm: i64, i: u32, w: u8) i64 {
-    val shift: i64 = (i * w::u32)::i64 * 8;
-    val mask:  i64 = (1::i64 << (w::i64 * 8)) - 1;
-    ret (imm >> shift) & mask;
+# lane i of width w of a 128-bit immediate, zero-filled above the lane
+fun imm_lane(op: *mir.MirOperand, i: u32, w: u8) i64 {
+    val bits: u32       = w::u32 * 8;
+    val full: wide.Wide = wide.make(op.imm:~u64, op.imm_hi:~u64);
+    ret wide.trunc(wide.shr_u(full, i * bits), bits).lo:~i64;
 }
 
 fun operands_are_lane_ready(plan: *LanePlan, mi: *mir.MirInstr, start: u32) bool {
@@ -1384,7 +1425,7 @@ fun double_and_add_pieces(nl: u32, stages: u32) u32 {
 }
 
 fun lane_is_seed_zero(op: mir.MirOperand) bool {
-    ret op.kind == mir.MIR_OP_IMM && op.imm == 0;
+    ret op.kind == mir.MIR_OP_IMM && op.imm == 0 && op.imm_hi == 0;
 }
 
 fun accum_into(live: *bool, nl: u32, p: u32) u32 {
@@ -1451,25 +1492,115 @@ fun emit_accumulate_lane(alloc: *A.Allocator, f: *mir.MirFunction, src: *mir.Mir
     ret err[fail.Fail].ok{};
 }
 
-fun lane_product_pieces(native: bool, want_hi: bool, lane_bits: u32) u32 {
-    if (native) {
-        if (want_hi) { ret 2; }
+# the pieces of one lane-width product realized through the declared form.
+# a low-only product is the target's own multiply; the full product is two
+# three-address multiplies, the fixed-pair sequence (stage the accumulator, the
+# pair multiply, read back each wanted half, plus one move when the multiplier
+# is an immediate the pair instruction cannot take), or double-and-add
+fun wide_product_pieces(plan: *LanePlan, a: *mir.MirOperand, b: *mir.MirOperand,
+    want_lo: bool, want_hi: bool, signed: bool) u32 {
+    val lane_bits: u32 = plan.lane_width::u32 * 8;
+    if (!want_hi) {
+        if (plan.mach.has_mul) { ret 1; }
+        ret double_and_add_pieces(1, lane_bits);
+    }
+    if (plan.mach.mul_form == isa.MULW_THREE_ADDRESS) {
+        if (want_lo) { ret 2; }
         ret 1;
     }
-    if (want_hi) { ret double_and_add_pieces(2, lane_bits); }
-    ret double_and_add_pieces(1, lane_bits);
+    if (plan.mach.mul_form == isa.MULW_FIXED_PAIR) {
+        var n: u32 = 3;
+        if (want_lo)                                              { n = n + 1; }
+        if (a.kind == mir.MIR_OP_IMM && b.kind == mir.MIR_OP_IMM) { n = n + 1; }
+        ret n;
+    }
+    var n: u32 = double_and_add_pieces(2, lane_bits);
+    if (signed) { n = n + SIGNED_HIGH_FIX_PIECES; }
+    ret n;
 }
 
-fun emit_lane_product(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, src: *mir.MirInstr,
+# the unsigned high half becomes the signed one by subtracting each operand
+# that is negative from it: hi -= (a >> (w-1)) & b; hi -= (b >> (w-1)) & a
+val SIGNED_HIGH_FIX_PIECES: u32 = 6;
+
+fun emit_signed_high_fix(alloc: *A.Allocator, f: *mir.MirFunction, src: *mir.MirInstr,
+    dst: *mir.MirInstr, cursor: *u32, a: mir.MirOperand, b: mir.MirOperand, hi: mir.MirOperand, lw: u8) err[fail.Fail] {
+    var k: u32 = 0;
+    for (k < 2) {
+        var x: mir.MirOperand = a;
+        var y: mir.MirOperand = b;
+        if (k == 1) {
+            x = b;
+            y = a;
+        }
+        var fill: mir.MirOperand;
+        val rf:   err[fail.Fail] = emit_sign_fill(alloc, f, src, dst, cursor, x, lw, ?fill);
+        if (sel rf.err) { ret rf; }
+        val rm: res[mir.VRegId, fail.Fail] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (sel rm.err) { ret err[fail.Fail].err{rm.err}; }
+        val masked: mir.MirOperand = mir.op_vreg(rm.ok);
+        val ra:     err[fail.Fail] = emit_bin(alloc, dst, cursor, src, mir.MIR_AND, masked, fill, y, lw);
+        if (sel ra.err) { ret ra; }
+        val rs: err[fail.Fail] = emit_bin(alloc, dst, cursor, src, mir.MIR_SUB, hi, hi, masked, lw);
+        if (sel rs.err) { ret rs; }
+        k = k + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the full product of two lane-width operands: lo and hi receive the halves
+# that are wanted, through the target's declared realization. a low-only
+# product is the target's own multiply whatever the form
+fun emit_wide_product(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, src: *mir.MirInstr,
     dst: *mir.MirInstr, cursor: *u32,
     a: mir.MirOperand, b: mir.MirOperand,
-    lo: mir.MirOperand, hi: mir.MirOperand, want_hi: bool) err[fail.Fail] {
+    lo: mir.MirOperand, hi: mir.MirOperand, want_lo: bool, want_hi: bool, signed: bool) err[fail.Fail] {
     val lw: u8 = plan.lane_width;
-    if (plan.mach.mul_hi != 0) {
-        val r1: err[fail.Fail] = emit_bin(alloc, dst, cursor, src, mir.MIR_MUL, lo, a, b, lw);
+    if (!want_hi && plan.mach.has_mul) { ret emit_bin(alloc, dst, cursor, src, mir.MIR_MUL, lo, a, b, lw); }
+
+    if (plan.mach.mul_form == isa.MULW_THREE_ADDRESS) {
+        if (want_lo) {
+            val r1: err[fail.Fail] = emit_bin(alloc, dst, cursor, src, mir.MIR_MUL, lo, a, b, lw);
+            if (sel r1.err) { ret r1; }
+        }
+        var op: mir.MirOpcode = mir.MIR_MUL_HI_U;
+        if (signed) { op = mir.MIR_MUL_HI_S; }
+        ret emit_bin(alloc, dst, cursor, src, op, hi, a, b, lw);
+    }
+
+    if (plan.mach.mul_form == isa.MULW_FIXED_PAIR) {
+        val acc:    mir.MirOperand = mir.op_preg(mir.preg_id(plan.mach.pair_lo));
+        val hi_reg: mir.MirOperand = mir.op_preg(mir.preg_id(plan.mach.pair_hi));
+        # the pair multiply takes a register: an immediate multiplier rides the
+        # accumulator, and two immediates stage the second in a temporary
+        var x: mir.MirOperand = a;
+        var y: mir.MirOperand = b;
+        if (y.kind == mir.MIR_OP_IMM && x.kind != mir.MIR_OP_IMM) {
+            x = b;
+            y = a;
+        }
+        if (y.kind == mir.MIR_OP_IMM) {
+            val rt: res[mir.VRegId, fail.Fail] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+            if (sel rt.err) { ret err[fail.Fail].err{rt.err}; }
+            val staged: mir.MirOperand = mir.op_vreg(rt.ok);
+            val rs:     err[fail.Fail] = emit_copy(alloc, dst, cursor, src, staged, y, lw);
+            if (sel rs.err) { ret rs; }
+            y = staged;
+        }
+        val r0: err[fail.Fail] = emit_copy(alloc, dst, cursor, src, acc, x, lw);
+        if (sel r0.err) { ret r0; }
+        var op: mir.MirOpcode = mir.MIR_MUL_PAIR_U;
+        if (signed) { op = mir.MIR_MUL_PAIR_S; }
+        var ops: [2]mir.MirOperand;
+        ops[0] = acc;
+        ops[1] = y;
+        val r1: err[fail.Fail] = emit_piece(alloc, dst, cursor, src, op, ?ops[0], 2, lw);
         if (sel r1.err) { ret r1; }
-        if (!want_hi)   { ret err[fail.Fail].ok{}; }
-        ret emit_bin(alloc, dst, cursor, src, mir.MIR_MUL_HI_U, hi, a, b, lw);
+        if (want_lo) {
+            val r2: err[fail.Fail] = emit_copy(alloc, dst, cursor, src, lo, acc, lw);
+            if (sel r2.err) { ret r2; }
+        }
+        ret emit_copy(alloc, dst, cursor, src, hi, hi_reg, lw);
     }
 
     var mc:  [MAX_SHIFT_LANES]mir.MirOperand;
@@ -1485,15 +1616,95 @@ fun emit_lane_product(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction,
         out[1] = hi;
         n      = 2;
     }
-    ret emit_double_and_add(alloc, plan, f, src, dst, cursor, ?mc[0], ?mp[0], ?out[0], n, lw::u32 * 8);
+    val rd: err[fail.Fail] = emit_double_and_add(alloc, plan, f, src, dst, cursor, ?mc[0], ?mp[0], ?out[0], n, lw::u32 * 8);
+    if (sel rd.err)          { ret rd; }
+    if (!want_hi || !signed) { ret err[fail.Fail].ok{}; }
+    ret emit_signed_high_fix(alloc, f, src, dst, cursor, a, b, hi, lw);
 }
 
-fun mul_schoolbook_pieces(plan: *LanePlan, nl: u32) u32 {
-    val native:    bool = plan.mach.mul_hi != 0;
-    val lane_bits: u32  = plan.lane_width::u32 * 8;
-    var live:      [MAX_SHIFT_LANES]bool;
-    var total:     u32  = 0;
-    var i:         u32  = 0;
+fun lane_product_pieces(plan: *LanePlan, a: *mir.MirOperand, b: *mir.MirOperand, want_hi: bool) u32 {
+    ret wide_product_pieces(plan, a, b, true, want_hi, false);
+}
+
+fun emit_lane_product(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, src: *mir.MirInstr,
+    dst: *mir.MirInstr, cursor: *u32,
+    a: mir.MirOperand, b: mir.MirOperand,
+    lo: mir.MirOperand, hi: mir.MirOperand, want_hi: bool) err[fail.Fail] {
+    ret emit_wide_product(alloc, plan, f, src, dst, cursor, a, b, lo, hi, true, want_hi, false);
+}
+
+# a target that names a fixed pair must name both registers; a target with a
+# three-address high multiply must declare it at the lane width
+fun mul_form_refusal(plan: *LanePlan) opt[str] {
+    if (plan.mach.mul_form == isa.MULW_FIXED_PAIR && (plan.mach.pair_lo < 0 || plan.mach.pair_hi < 0)) {
+        ret opt[str].some{"this target declares a fixed-pair widening multiply without naming the pair (internal compiler error: MachineModel.div_reg and div_hi_reg, see briar-systems/mach#3511)"};
+    }
+    if (plan.mach.mul_form == isa.MULW_THREE_ADDRESS && plan.mach.mul_hi != plan.lane_width) {
+        ret opt[str].some{"this target declares a three-address widening multiply at a width other than its ALU width, which this pass does not model (see briar-systems/mach#2778)"};
+    }
+    if (plan.mach.mul_form != isa.MULW_NONE && !plan.mach.has_mul) {
+        ret opt[str].some{"this target declares the high half of a multiply but no multiply (see briar-systems/mach#2778)"};
+    }
+    ret opt[str].none{};
+}
+
+fun mul_form_fail(plan: *LanePlan, mi: *mir.MirInstr, why: str) fail.Fail {
+    ret mir.reject_instr_at(plan.diags, plan.f, mi, why);
+}
+
+# the wide value whose lanes are the full product of its two lane-width
+# operands (MIR_MUL_WIDE_*, width twice the lane); its operands are plain
+# lane-width values
+fun mul_wide_piece_count(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr) res[u32, fail.Fail] {
+    if (mi.operand_count != 3 || mi.operands[0].kind != mir.MIR_OP_VREG ||
+        dst_lane_count(plan, mi) != 2 || mi.src_width != plan.lane_width ||
+        !operand_is_lane_ready(plan, ?mi.operands[0], 2) ||
+        !operand_is_lane_ready(plan, ?mi.operands[1], 1) || !operand_is_lane_ready(plan, ?mi.operands[2], 1)) {
+        ret res[u32, fail.Fail].err{unsupported(alloc, plan, mi, mi.opcode)};
+    }
+    val bad: opt[str] = mul_form_refusal(plan);
+    if (sel bad.some) { ret res[u32, fail.Fail].err{mul_form_fail(plan, mi, bad.some)}; }
+    ret res[u32, fail.Fail].ok{wide_product_pieces(plan, ?mi.operands[1], ?mi.operands[2], true, true,
+        mi.opcode == mir.MIR_MUL_WIDE_S)};
+}
+
+fun expand_mul_wide(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *mir.MirInstr,
+    dst: *mir.MirInstr, cursor: *u32) err[fail.Fail] {
+    val rc: res[u32, fail.Fail] = mul_wide_piece_count(alloc, plan, mi);
+    if (sel rc.err) { ret err[fail.Fail].err{rc.err}; }
+    val lo: mir.MirOperand = lane_operand(plan, ?mi.operands[0], 0);
+    val hi: mir.MirOperand = lane_operand(plan, ?mi.operands[0], 1);
+    ret emit_wide_product(alloc, plan, f, mi, dst, cursor, mi.operands[1], mi.operands[2], lo, hi, true, true,
+        mi.opcode == mir.MIR_MUL_WIDE_S);
+}
+
+# the high half alone on a target with no three-address high multiply
+fun mul_hi_piece_count(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr) res[u32, fail.Fail] {
+    if (mi.operand_count != 3 || mi.width != plan.lane_width || mi.operands[0].kind != mir.MIR_OP_VREG ||
+        !operand_is_lane_ready(plan, ?mi.operands[1], 1) || !operand_is_lane_ready(plan, ?mi.operands[2], 1)) {
+        ret res[u32, fail.Fail].err{unsupported(alloc, plan, mi, mi.opcode)};
+    }
+    val bad: opt[str] = mul_form_refusal(plan);
+    if (sel bad.some) { ret res[u32, fail.Fail].err{mul_form_fail(plan, mi, bad.some)}; }
+    ret res[u32, fail.Fail].ok{wide_product_pieces(plan, ?mi.operands[1], ?mi.operands[2], false, true,
+        mi.opcode == mir.MIR_MUL_HI_S)};
+}
+
+fun expand_mul_hi(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *mir.MirInstr,
+    dst: *mir.MirInstr, cursor: *u32) err[fail.Fail] {
+    val rc: res[u32, fail.Fail] = mul_hi_piece_count(alloc, plan, mi);
+    if (sel rc.err) { ret err[fail.Fail].err{rc.err}; }
+    # the double-and-add form writes a low half nothing reads
+    val rt: res[mir.VRegId, fail.Fail] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+    if (sel rt.err) { ret err[fail.Fail].err{rt.err}; }
+    ret emit_wide_product(alloc, plan, f, mi, dst, cursor, mi.operands[1], mi.operands[2],
+        mir.op_vreg(rt.ok), mi.operands[0], false, true, mi.opcode == mir.MIR_MUL_HI_S);
+}
+
+fun mul_schoolbook_pieces(plan: *LanePlan, mi: *mir.MirInstr, nl: u32) u32 {
+    var live:  [MAX_SHIFT_LANES]bool;
+    var total: u32 = 0;
+    var i:     u32 = 0;
     for (i < nl) {
         live[i] = false;
         i       = i + 1;
@@ -1502,9 +1713,11 @@ fun mul_schoolbook_pieces(plan: *LanePlan, nl: u32) u32 {
     for (i < nl) {
         var j: u32 = 0;
         for (i + j < nl) {
-            val p:       u32  = i + j;
-            val want_hi: bool = p + 1 < nl;
-            total = total + lane_product_pieces(native, want_hi, lane_bits);
+            val p:       u32            = i + j;
+            val want_hi: bool           = p + 1 < nl;
+            val a:       mir.MirOperand = lane_operand(plan, ?mi.operands[1], i);
+            val b:       mir.MirOperand = lane_operand(plan, ?mi.operands[2], j);
+            total = total + lane_product_pieces(plan, ?a, ?b, want_hi);
             total = total + accum_into(?live[0], nl, p);
             if (want_hi) { total = total + accum_into(?live[0], nl, p + 1); }
             j = j + 1;
@@ -1521,13 +1734,9 @@ fun mul_piece_count(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr) res
         !operand_is_lane_ready(plan, ?mi.operands[1], nl) || !operand_is_lane_ready(plan, ?mi.operands[2], nl)) {
         ret res[u32, fail.Fail].err{unsupported(alloc, plan, mi, mi.opcode)};
     }
-    if (plan.mach.mul_hi != 0 && plan.mach.mul_hi != plan.lane_width) {
-        ret res[u32, fail.Fail].err{fail.message("legalize: this target declares a widening multiply at a width other than its ALU width, which this pass does not model (see briar-systems/mach#2778)")};
-    }
-    if (plan.mach.mul_hi != 0 && !plan.mach.has_mul) {
-        ret res[u32, fail.Fail].err{fail.message("legalize: this target declares the high half of a multiply but no multiply (see briar-systems/mach#2778)")};
-    }
-    if (nl > 1) { ret res[u32, fail.Fail].ok{mul_schoolbook_pieces(plan, nl)}; }
+    val bad: opt[str] = mul_form_refusal(plan);
+    if (sel bad.some) { ret res[u32, fail.Fail].err{mul_form_fail(plan, mi, bad.some)}; }
+    if (nl > 1)       { ret res[u32, fail.Fail].ok{mul_schoolbook_pieces(plan, mi, nl)}; }
     ret res[u32, fail.Fail].ok{double_and_add_pieces(nl, nl * plan.lane_width::u32 * 8)};
 }
 
@@ -2835,6 +3044,9 @@ fun t_mach(maw: u8, ptr: u8) Machine {
     m.var_shift  = false;
     m.has_mul    = true;
     m.mul_hi     = 0;
+    m.mul_form   = isa.MULW_NONE;
+    m.pair_lo    = -1;
+    m.pair_hi    = -1;
     m.stage_lo   = 6;
     m.stage_hi   = 7;
     m.fp_class   = FP_CLASS_NONE;
@@ -2927,6 +3139,68 @@ test "mach.lang.be.codegen.legalize:inert_on_native_width" {
     if (b.instrs != before_ptr)        { ret 1; }
     if (b.instr_count != before_count) { ret 1; }
     if (f.vreg_count != before_vregs)  { ret 1; }
+    ret 0;
+}
+
+# a 128-bit immediate splits into the lanes of its two limbs, and a 64-bit
+# immediate reads above its width as its sign fill (#3511)
+test "mach.lang.be.codegen.legalize.imm_lane:splits_both_limbs_at_every_lane_width" {
+    val hi:   u64            = 0x99AABBCCDDEEFF00;
+    val wide: mir.MirOperand = mir.op_imm_wide(0x1122334455667788, hi:~i64);
+    if (imm_lane(?wide, 0, 8) != 0x1122334455667788)                        { ret 1; }
+    if (imm_lane(?wide, 1, 8):~u64 != hi)                                   { ret 2; }
+    if (imm_lane(?wide, 0, 4) != 0x55667788)                                { ret 3; }
+    if (imm_lane(?wide, 1, 4) != 0x11223344)                                { ret 4; }
+    if (imm_lane(?wide, 2, 4) != 0xDDEEFF00)                                { ret 5; }
+    if (imm_lane(?wide, 3, 4) != 0x99AABBCC)                                { ret 6; }
+    if (imm_lane(?wide, 0, 1) != 0x88 || imm_lane(?wide, 15, 1) != 0x99)    { ret 7; }
+    if (imm_lane(?wide, 4, 2) != 0xFF00 || imm_lane(?wide, 7, 2) != 0x99AA) { ret 8; }
+
+    val neg: mir.MirOperand = mir.op_imm(-1);
+    if (imm_lane(?neg, 0, 8) != -1 || imm_lane(?neg, 1, 8) != -1)                 { ret 9; }
+    if (imm_lane(?neg, 2, 4) != 0xFFFFFFFF || imm_lane(?neg, 3, 4) != 0xFFFFFFFF) { ret 10; }
+    val one: mir.MirOperand = mir.op_imm(1);
+    if (imm_lane(?one, 0, 8) != 1 || imm_lane(?one, 1, 8) != 0) { ret 11; }
+    if (imm_lane(?one, 0, 4) != 1 || imm_lane(?one, 2, 4) != 0) { ret 12; }
+    ret 0;
+}
+
+# an IR constant with a high limb lowers to one 128-bit immediate and
+# legalizes at an 8-byte lane into two lane moves carrying the limbs (#3511)
+test "mach.lang.be.codegen.legalize:a_wide_ir_constant_becomes_two_lane_immediates" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    val c:       value.Value                    = value.const_int_wide(wide.make(0x0FEDCBA987654321, 0x123456789ABCDEF0), 0);
+    var ctx:     lctx.LowerCtx;
+    val lowered: res[mir.MirOperand, fail.Fail] = lctx.lower_value(?ctx, c);
+    if (sel lowered.err)                                                                 { ret 1; }
+    if (lowered.ok.kind != mir.MIR_OP_IMM)                                               { ret 2; }
+    if (lowered.ok.imm != 0x0FEDCBA987654321 || lowered.ok.imm_hi != 0x123456789ABCDEF0) { ret 3; }
+
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 1);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 1);
+    var mv: [2]mir.MirOperand;
+    mv[0] = mir.op_vreg(mir.vreg_id(0));
+    mv[1] = lowered.ok;
+    t_instr(?alloc, ?b, 0, mir.MIR_MOV, ?mv[0], 2, 16);
+    f.blocks      = ?b;
+    f.block_count = 1;
+
+    var mach: Machine        = t_mach(8, 8);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
+    if (sel r.err)          { ret 4; }
+    if (b.instr_count != 2) { ret 5; }
+    var i: u32 = 0;
+    for (i < 2) {
+        if (b.instrs[i].opcode != mir.MIR_MOV || b.instrs[i].width != 8) { ret 6; }
+        if (b.instrs[i].operands[1].kind != mir.MIR_OP_IMM)              { ret 7; }
+        i = i + 1;
+    }
+    if (b.instrs[0].operands[1].imm != 0x0FEDCBA987654321) { ret 8; }
+    if (b.instrs[1].operands[1].imm != 0x123456789ABCDEF0) { ret 9; }
     ret 0;
 }
 
@@ -3277,7 +3551,10 @@ test "mach.lang.be.codegen.legalize:multiply_costs_agree_at_every_lane_count" {
     var native: u32 = 0;
     for (native < 2) {
         var mach: Machine = t_mach(1, 2);
-        if (native == 1) { mach.mul_hi = 1; }
+        if (native == 1) {
+            mach.mul_hi   = 1;
+            mach.mul_form = isa.MULW_THREE_ADDRESS;
+        }
 
         var k: u32 = 0;
         for (k < 3) {
@@ -3310,11 +3587,12 @@ test "mach.lang.be.codegen.legalize:a_declared_widening_multiply_selects_the_nat
     t_divmod_fn(?alloc, ?f, ?b, mir.MIR_MUL, 8, 1000, 7);
 
     var mach: Machine = t_mach(4, 4);
-    mach.mul_hi = 4;
+    mach.mul_hi   = 4;
+    mach.mul_form = isa.MULW_THREE_ADDRESS;
     val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel legalize_function_r.err) { ret 1; }
 
-    if (b.instr_count != 4 + 8) { ret 1; }
+    if (b.instr_count != 4 + 8) { ret 2; }
 
     var muls:   u32 = 0;
     var highs:  u32 = 0;
@@ -3327,28 +3605,32 @@ test "mach.lang.be.codegen.legalize:a_declared_widening_multiply_selects_the_nat
         if (op == mir.MIR_SHL || op == mir.MIR_SHR_U) { shifts = shifts + 1; }
         i = i + 1;
     }
-    if (muls != 3)   { ret 1; }
-    if (highs != 1)  { ret 1; }
-    if (shifts != 0) { ret 1; }
+    if (muls != 3)   { ret 3; }
+    if (highs != 1)  { ret 4; }
+    if (shifts != 0) { ret 5; }
 
     var f2: mir.MirFunction;
     var b2: mir.MirBlock;
     t_divmod_fn(?alloc, ?f2, ?b2, mir.MIR_MUL, 8, 1000, 7);
     var m2:                   Machine        = t_mach(4, 4);
     val legalize_function_r2: err[fail.Fail] = legalize_function(?alloc, ?m2, ?f2, nil);
-    if (sel legalize_function_r2.err) { ret 1; }
+    if (sel legalize_function_r2.err) { ret 6; }
+    # no widening form: the one full product is double-and-add, the two
+    # cross products whose high halves are discarded stay the plain multiply
     var muls2:   u32 = 0;
+    var highs2:  u32 = 0;
     var shifts2: u32 = 0;
     i = 4;
     for (i < b2.instr_count) {
         val op: mir.MirOpcode = b2.instrs[i].opcode;
-        if (op == mir.MIR_MUL || op == mir.MIR_MUL_HI_U) { muls2 = muls2 + 1; }
-        if (op == mir.MIR_SHL || op == mir.MIR_SHR_U)    { shifts2 = shifts2 + 1; }
+        if (op == mir.MIR_MUL)                        { muls2 = muls2 + 1; }
+        if (op == mir.MIR_MUL_HI_U)                   { highs2 = highs2 + 1; }
+        if (op == mir.MIR_SHL || op == mir.MIR_SHR_U) { shifts2 = shifts2 + 1; }
         i = i + 1;
     }
-    if (muls2 != 0)                           { ret 1; }
-    if (shifts2 == 0)                         { ret 1; }
-    if (b2.instr_count <= b.instr_count * 10) { ret 1; }
+    if (muls2 != 2 || highs2 != 0)            { ret 7; }
+    if (shifts2 == 0)                         { ret 8; }
+    if (b2.instr_count <= b.instr_count * 10) { ret 9; }
     ret 0;
 }
 
@@ -3360,7 +3642,8 @@ test "mach.lang.be.codegen.legalize:refuses_an_unmodelled_widening_multiply" {
     var b: mir.MirBlock;
     t_divmod_fn(?alloc, ?f, ?b, mir.MIR_MUL, 4, 1000, 7);
     var m1: Machine = t_mach(1, 2);
-    m1.mul_hi = 4;
+    m1.mul_hi   = 4;
+    m1.mul_form = isa.MULW_THREE_ADDRESS;
     val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?m1, ?f, nil);
     if (!sel legalize_function_r.err) { ret 1; }
 
@@ -3368,8 +3651,9 @@ test "mach.lang.be.codegen.legalize:refuses_an_unmodelled_widening_multiply" {
     var b2: mir.MirBlock;
     t_divmod_fn(?alloc, ?f2, ?b2, mir.MIR_MUL, 4, 1000, 7);
     var m2: Machine = t_mach(1, 2);
-    m2.mul_hi  = 1;
-    m2.has_mul = false;
+    m2.mul_hi   = 1;
+    m2.mul_form = isa.MULW_THREE_ADDRESS;
+    m2.has_mul  = false;
     val legalize_function_r2: err[fail.Fail] = legalize_function(?alloc, ?m2, ?f2, nil);
     if (!sel legalize_function_r2.err) { ret 1; }
 
@@ -3377,7 +3661,8 @@ test "mach.lang.be.codegen.legalize:refuses_an_unmodelled_widening_multiply" {
     var b3: mir.MirBlock;
     t_divmod_fn(?alloc, ?f3, ?b3, mir.MIR_MUL, 4, 1000, 7);
     var m3: Machine = t_mach(1, 2);
-    m3.mul_hi = 1;
+    m3.mul_hi   = 1;
+    m3.mul_form = isa.MULW_THREE_ADDRESS;
     val legalize_function_r3: err[fail.Fail] = legalize_function(?alloc, ?m3, ?f3, nil);
     if (sel legalize_function_r3.err) { ret 1; }
     ret 0;

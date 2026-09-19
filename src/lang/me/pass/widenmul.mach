@@ -21,13 +21,19 @@ use mach.lang.me.ir.value;
 use mach.lang.me.vecform;
 use mach.lang.target;
 use target_testing: mach.lang.target.testing;
+use mach.lang.wide;
 
-# rewrites a lane-wise multiply of two same-kind lane-wise extensions of one
-# vector type into the widening multiply of the unextended operands, wherever
-# the target's catalog packs that cell. the extensions stay in place for any
-# other use, and a later dce drops the ones nothing reads
+# rewrites a multiply of two same-kind extensions of one type into the
+# widening multiply of the unextended operands: lane-wise on vectors wherever
+# the target's catalog packs that cell, and on scalars wherever the product is
+# wider than the target's ALU, where legalize realizes it through the target's
+# declared widening form (#3511). a truncation of that product to its operand
+# width then becomes the plain multiply, and a truncation of its shift by the
+# operand width becomes the high-half multiply, so the half a program selects
+# is one instruction and no double-width product is materialized. the
+# extensions stay in place for any other use, and a later dce drops the ones
+# nothing reads
 pub fun run(m: *ir.Module, tgt: *target.Target) res[bool, fail.Fail] {
-    if (!tgt.model.has_v128) { ret res[bool, fail.Fail].ok{false}; }
     var changed: bool = false;
     var fi:      u32  = 0;
     for (fi < m.function_len) {
@@ -50,38 +56,120 @@ fun fuse_function(m: *ir.Module, tgt: *target.Target, fn: *ir.Function) bool {
         }
         bi = bi + 1;
     }
+    # the half selects read fused products, so they run once every product
+    # in the function is fused
+    bi = 0;
+    for (bi < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[bi];
+        var ii:  u32       = 0;
+        for (ii < blk.instr_count) {
+            if (select_half(m, fn, ?fn.instrs[blk.instructions[ii]::u32])) { changed = true; }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
     ret changed;
 }
 
-# the lane-wise extension that defines `v`, absent for any other value
-fun extension_of(m: *ir.Module, fn: *ir.Function, v: value.Value) opt[*instruction.Instruction] {
+# the extension that defines `v`, absent for any other value; `vector` asks
+# for a lane-wise one, else a scalar one
+fun extension_of(m: *ir.Module, fn: *ir.Function, v: value.Value, vector: bool) opt[*instruction.Instruction] {
     if (v.kind != value.VAL_INSTR) { ret opt[*instruction.Instruction].none{}; }
     val def: opt[*instruction.Instruction] = ir.instruction_get(fn, v.data.instr);
     if (sel def.none) { ret def; }
     val e: *instruction.Instruction = def.some;
     if (e.kind != instruction.OP_SEXT && e.kind != instruction.OP_ZEXT) { ret opt[*instruction.Instruction].none{}; }
-    if (e.operand_count != 1 || !ir_type.is_vector(?m.types, e.operands[0].ty)) {
+    if (e.operand_count != 1 || ir_type.is_vector(?m.types, e.operands[0].ty) != vector) {
         ret opt[*instruction.Instruction].none{};
     }
     ret def;
 }
 
+fun scalar_int_bits(m: *ir.Module, ty: ir_type.IrTypeId) u32 {
+    val found: opt[*ir_type.IrType] = ir_type.get(?m.types, ty);
+    if (sel found.none)                     { ret 0; }
+    if (found.some.kind != ir_type.IRT_INT) { ret 0; }
+    ret found.some.data.bits;
+}
+
 fun fuse_one(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, inst: *instruction.Instruction) bool {
     if (inst.kind != instruction.OP_MUL || inst.operand_count != 2) { ret false; }
-    if (!ir_type.is_vector(?m.types, inst.ty))                      { ret false; }
-    val ea: opt[*instruction.Instruction] = extension_of(m, fn, inst.operands[0]);
-    val eb: opt[*instruction.Instruction] = extension_of(m, fn, inst.operands[1]);
+    val vector: bool = ir_type.is_vector(?m.types, inst.ty);
+    if (vector && !tgt.model.has_v128) { ret false; }
+    val ea: opt[*instruction.Instruction] = extension_of(m, fn, inst.operands[0], vector);
+    val eb: opt[*instruction.Instruction] = extension_of(m, fn, inst.operands[1], vector);
     if (sel ea.none) { ret false; }
     if (sel eb.none) { ret false; }
     val a: *instruction.Instruction = ea.some;
     val b: *instruction.Instruction = eb.some;
     if (a.kind != b.kind || a.operands[0].ty != b.operands[0].ty) { ret false; }
     val wide: opt[instruction.InstrKind] = vecform.widening_of(a.kind);
-    if (sel wide.none)                                                         { ret false; }
-    if (!vecform.widening_packs(m, tgt, wide.some, inst.ty, a.operands[0].ty)) { ret false; }
+    if (sel wide.none) { ret false; }
+    if (vector) {
+        if (!vecform.widening_packs(m, tgt, wide.some, inst.ty, a.operands[0].ty)) { ret false; }
+    }
+    or {
+        # exactly twice the operand width, and wider than the ALU: below that a
+        # same-width multiply is already one instruction and fusing buys nothing
+        val rb: u32 = scalar_int_bits(m, inst.ty);
+        val ob: u32 = scalar_int_bits(m, a.operands[0].ty);
+        if (ob == 0 || rb != 2 * ob || rb <= tgt.model.max_alu_width * 8) { ret false; }
+    }
     inst.kind        = wide.some;
     inst.operands[0] = a.operands[0];
     inst.operands[1] = b.operands[0];
+    ret true;
+}
+
+# the scalar widening multiply that defines `v`, absent for any other value
+fun scalar_wide_of(m: *ir.Module, fn: *ir.Function, v: value.Value) opt[*instruction.Instruction] {
+    if (v.kind != value.VAL_INSTR) { ret opt[*instruction.Instruction].none{}; }
+    val def: opt[*instruction.Instruction] = ir.instruction_get(fn, v.data.instr);
+    if (sel def.none) { ret def; }
+    val w: *instruction.Instruction = def.some;
+    if (w.kind != instruction.OP_MUL_WIDE_S && w.kind != instruction.OP_MUL_WIDE_U) { ret opt[*instruction.Instruction].none{}; }
+    if (w.operand_count != 2 || ir_type.is_vector(?m.types, w.ty))                  { ret opt[*instruction.Instruction].none{}; }
+    ret def;
+}
+
+fun is_const_int(v: value.Value, want: u64) bool {
+    ret v.kind == value.VAL_CONST_INT && wide.eq(value.int_of(?v), wide.from_u64(want));
+}
+
+# `trunc(wide)` to the operand width is the low half, the plain multiply;
+# `trunc(shr(wide, operand width))` is the high half. the truncation makes the
+# shift's signedness irrelevant, and the high half's is the product's
+fun select_half(m: *ir.Module, fn: *ir.Function, inst: *instruction.Instruction) bool {
+    if (inst.kind != instruction.OP_TRUNC || inst.operand_count != 1) { ret false; }
+    val bits: u32 = scalar_int_bits(m, inst.ty);
+    if (bits == 0) { ret false; }
+    val low: opt[*instruction.Instruction] = scalar_wide_of(m, fn, inst.operands[0]);
+    if (sel low.some)                             { ret select_half_of(m, inst, low.some, bits, false); }
+    if (inst.operands[0].kind != value.VAL_INSTR) { ret false; }
+    val def: opt[*instruction.Instruction] = ir.instruction_get(fn, inst.operands[0].data.instr);
+    if (sel def.none) { ret false; }
+    val sh: *instruction.Instruction = def.some;
+    if (sh.kind != instruction.OP_SHR_U && sh.kind != instruction.OP_SHR_S) { ret false; }
+    if (sh.operand_count != 2 || !is_const_int(sh.operands[1], bits::u64))  { ret false; }
+    val high: opt[*instruction.Instruction] = scalar_wide_of(m, fn, sh.operands[0]);
+    if (sel high.none) { ret false; }
+    ret select_half_of(m, inst, high.some, bits, true);
+}
+
+fun select_half_of(m: *ir.Module, inst: *instruction.Instruction, w: *instruction.Instruction, bits: u32, high: bool) bool {
+    if (w.operands[0].ty != inst.ty || scalar_int_bits(m, w.operands[0].ty) != bits) { ret false; }
+    var kind: instruction.InstrKind = instruction.OP_MUL;
+    if (high) {
+        kind = instruction.OP_MUL_HIGH_U;
+        if (w.kind == instruction.OP_MUL_WIDE_S) { kind = instruction.OP_MUL_HIGH_S; }
+    }
+    # the truncation becomes a two-operand multiply over the product's operands
+    val ar: res[ir.OperandArray, fail.Fail] = ir.operands_alloc(m, 2);
+    if (sel ar.err) { ret false; }
+    ar.ok.ops[0] = w.operands[0];
+    ar.ok.ops[1] = w.operands[1];
+    ir.instr_replace_operands(m, inst, ar.ok);
+    inst.kind = kind;
     ret true;
 }
 

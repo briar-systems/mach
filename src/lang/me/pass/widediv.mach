@@ -1,0 +1,457 @@
+# division and remainder wider than the target's ALU have no instruction on
+# any target, so each becomes a call to a helper the compiler provides with
+# the program: `__mach_udiv<bits>`, `__mach_urem<bits>`, `__mach_sdiv<bits>`
+# and `__mach_srem<bits>`, one per operation (a caller that wants only a
+# remainder does not compute a quotient). the unsigned helpers are the
+# restoring shift-subtract division over the wide type's own IR, which
+# legalize realizes in lanes like any other wide arithmetic; the signed ones
+# take magnitudes, call the unsigned helper and fix the sign. each module that
+# needs a helper synthesizes it weak, so every copy coalesces at link, as a
+# generic instantiation does. a divisor of zero yields an all-ones quotient
+# and the dividend as remainder, the RISC-V convention, rather than a trap:
+# a helper cannot raise the target's divide fault (#3511, ruling Q5)
+
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.me.ir;
+use mach.lang.me.ir.builder;
+use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use mach.lang.me.pass.widehelper;
+use mach.lang.target;
+use target_testing: mach.lang.target.testing;
+use A:              std.allocator;
+use std.allocator.page;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+pub fun run(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner) res[bool, fail.Fail] {
+    var changed: bool = false;
+    val count:   u32  = m.function_len;
+    var fi:      u32  = 0;
+    # helpers appended while walking are never walked: their divisions are the
+    # unsigned helper's own calls, already in helper form
+    for (fi < count) {
+        if ((m.functions[fi].flags & ir.FN_FLAG_EXTERN) != 0) {
+            fi = fi + 1;
+            cnt;
+        }
+        # a synthesized helper may move the function table, so the function
+        # is re-read after every rewrite; its own arrays stay where they are
+        var bi: u32 = 0;
+        for (bi < m.functions[fi].block_count) {
+            var ii: u32 = 0;
+            for (ii < m.functions[fi].blocks[bi].instr_count) {
+                val iid: u32                  = m.functions[fi].blocks[bi].instructions[ii]::u32;
+                val r:   res[bool, fail.Fail] = rewrite_one(m, tgt, itn, ?m.functions[fi].instrs[iid]);
+                if (sel r.err) { ret r; }
+                if (r.ok)      { changed = true; }
+                ii = ii + 1;
+            }
+            bi = bi + 1;
+        }
+        fi = fi + 1;
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+fun is_divide(k: instruction.InstrKind) bool {
+    ret k == instruction.OP_DIV_U || k == instruction.OP_DIV_S || k == instruction.OP_REM_U || k == instruction.OP_REM_S;
+}
+
+fun rewrite_one(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner, ins: *instruction.Instruction) res[bool, fail.Fail] {
+    if (!is_divide(ins.kind) || ins.operand_count != 2) { ret res[bool, fail.Fail].ok{false}; }
+    val bits: u32 = widehelper.wide_bits(m, tgt, ins.ty);
+    if (bits == 0) { ret res[bool, fail.Fail].ok{false}; }
+
+    val helper: res[u32, fail.Fail] = ensure_helper(m, itn, ins.kind, bits, ins.ty);
+    if (sel helper.err) { ret res[bool, fail.Fail].err{helper.err}; }
+    var args: [2]value.Value;
+    args[0] = ins.operands[0];
+    args[1] = ins.operands[1];
+    val rw: err[fail.Fail] = widehelper.rewrite_to_call(m, ins, helper.ok, ?args[0], 2);
+    if (sel rw.err) { ret res[bool, fail.Fail].err{rw.err}; }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+fun helper_stem(k: instruction.InstrKind) str {
+    if (k == instruction.OP_DIV_U) { ret "udiv"; }
+    if (k == instruction.OP_DIV_S) { ret "sdiv"; }
+    if (k == instruction.OP_REM_U) { ret "urem"; }
+    ret "srem";
+}
+
+# the helper for this operation at this width, synthesized on first use
+fun ensure_helper(m: *ir.Module, itn: *intern.Interner, k: instruction.InstrKind, bits: u32, ty: ir_type.IrTypeId) res[u32, fail.Fail] {
+    val name_r: res[str, fail.Fail] = widehelper.name_width(m.alloc, helper_stem(k), bits);
+    if (sel name_r.err) { ret res[u32, fail.Fail].err{name_r.err}; }
+    var params: [2]ir_type.IrTypeId;
+    params[0] = ty;
+    params[1] = ty;
+    val h: res[widehelper.Helper, fail.Fail] = widehelper.find_or_add(m, itn, name_r.ok, ty, ?params[0], 2);
+    if (sel h.err)   { ret res[u32, fail.Fail].err{h.err}; }
+    if (!h.ok.fresh) { ret res[u32, fail.Fail].ok{h.ok.idx}; }
+    val idx: u32 = h.ok.idx;
+
+    var body: err[fail.Fail] = err[fail.Fail].ok{};
+    if (k == instruction.OP_DIV_U || k == instruction.OP_REM_U) {
+        body = build_unsigned(m, idx, ty, bits, k == instruction.OP_REM_U);
+    }
+    or {
+        # the signed helper calls the unsigned one of the same operation
+        var uk: instruction.InstrKind = instruction.OP_DIV_U;
+        if (k == instruction.OP_REM_S) { uk = instruction.OP_REM_U; }
+        val inner: res[u32, fail.Fail] = ensure_helper(m, itn, uk, bits, ty);
+        if (sel inner.err) { ret inner; }
+        body = build_signed(m, idx, inner.ok, ty, k == instruction.OP_REM_S);
+    }
+    if (sel body.err) { ret res[u32, fail.Fail].err{body.err}; }
+    ret res[u32, fail.Fail].ok{idx};
+}
+
+# restoring division, one bit of the dividend per iteration from the top:
+#   r = (r << 1) | ((n >> (bits - 1 - i)) & 1); q = q << 1
+#   if (d <= r) { r = r - d; q = q | 1 }
+fun build_unsigned(m: *ir.Module, idx: u32, ty: ir_type.IrTypeId, bits: u32, want_rem: bool) err[fail.Fail] {
+    var b: builder.Builder = builder.init(m);
+    builder.set_function(?b, ?m.functions[idx]);
+    val n: value.Value = value.param(0, ty);
+    val d: value.Value = value.param(1, ty);
+
+    val entry_r: res[id.BlockId, fail.Fail] = builder.new_block(?b);
+    if (sel entry_r.err) { ret err[fail.Fail].err{entry_r.err}; }
+    val head_r: res[id.BlockId, fail.Fail] = builder.new_block(?b);
+    if (sel head_r.err) { ret err[fail.Fail].err{head_r.err}; }
+    val body_r: res[id.BlockId, fail.Fail] = builder.new_block(?b);
+    if (sel body_r.err) { ret err[fail.Fail].err{body_r.err}; }
+    val take_r: res[id.BlockId, fail.Fail] = builder.new_block(?b);
+    if (sel take_r.err) { ret err[fail.Fail].err{take_r.err}; }
+    val latch_r: res[id.BlockId, fail.Fail] = builder.new_block(?b);
+    if (sel latch_r.err) { ret err[fail.Fail].err{latch_r.err}; }
+    val exit_r: res[id.BlockId, fail.Fail] = builder.new_block(?b);
+    if (sel exit_r.err) { ret err[fail.Fail].err{exit_r.err}; }
+    val entry: id.BlockId = entry_r.ok;
+    val head:  id.BlockId = head_r.ok;
+    val body:  id.BlockId = body_r.ok;
+    val take:  id.BlockId = take_r.ok;
+    val latch: id.BlockId = latch_r.ok;
+    val exit:  id.BlockId = exit_r.ok;
+
+    val zero: value.Value = value.const_int(0, ty);
+    val one:  value.Value = value.const_int(1, ty);
+    val last: value.Value = value.const_int((bits - 1)::u64, ty);
+    val end:  value.Value = value.const_int(bits::u64, ty);
+
+    builder.set_block(?b, entry);
+    val br0: err[fail.Fail] = builder.emit_br(?b, head);
+    if (sel br0.err) { ret br0; }
+
+    builder.set_block(?b, head);
+    val i_r: res[value.Value, fail.Fail] = builder.emit_phi(?b, ty);
+    if (sel i_r.err) { ret err[fail.Fail].err{i_r.err}; }
+    val q_r: res[value.Value, fail.Fail] = builder.emit_phi(?b, ty);
+    if (sel q_r.err) { ret err[fail.Fail].err{q_r.err}; }
+    val r_r: res[value.Value, fail.Fail] = builder.emit_phi(?b, ty);
+    if (sel r_r.err) { ret err[fail.Fail].err{r_r.err}; }
+    val i:      value.Value                 = i_r.ok;
+    val q:      value.Value                 = q_r.ok;
+    val r:      value.Value                 = r_r.ok;
+    val more_r: res[value.Value, fail.Fail] = builder.emit_cmp_lt_u(?b, i, end);
+    if (sel more_r.err) { ret err[fail.Fail].err{more_r.err}; }
+    val cbr0: err[fail.Fail] = builder.emit_cbr(?b, more_r.ok, body, exit);
+    if (sel cbr0.err) { ret cbr0; }
+
+    builder.set_block(?b, body);
+    val shift_r: res[value.Value, fail.Fail] = builder.emit_sub(?b, last, i);
+    if (sel shift_r.err) { ret err[fail.Fail].err{shift_r.err}; }
+    val nbit_r: res[value.Value, fail.Fail] = builder.emit_shr_u(?b, n, shift_r.ok);
+    if (sel nbit_r.err) { ret err[fail.Fail].err{nbit_r.err}; }
+    val bit_r: res[value.Value, fail.Fail] = builder.emit_and(?b, nbit_r.ok, one);
+    if (sel bit_r.err) { ret err[fail.Fail].err{bit_r.err}; }
+    val r2_r: res[value.Value, fail.Fail] = builder.emit_shl(?b, r, one);
+    if (sel r2_r.err) { ret err[fail.Fail].err{r2_r.err}; }
+    val r1_r: res[value.Value, fail.Fail] = builder.emit_or(?b, r2_r.ok, bit_r.ok);
+    if (sel r1_r.err) { ret err[fail.Fail].err{r1_r.err}; }
+    val q1_r: res[value.Value, fail.Fail] = builder.emit_shl(?b, q, one);
+    if (sel q1_r.err) { ret err[fail.Fail].err{q1_r.err}; }
+    val fits_r: res[value.Value, fail.Fail] = builder.emit_cmp_le_u(?b, d, r1_r.ok);
+    if (sel fits_r.err) { ret err[fail.Fail].err{fits_r.err}; }
+    val cbr1: err[fail.Fail] = builder.emit_cbr(?b, fits_r.ok, take, latch);
+    if (sel cbr1.err) { ret cbr1; }
+
+    builder.set_block(?b, take);
+    val rs_r: res[value.Value, fail.Fail] = builder.emit_sub(?b, r1_r.ok, d);
+    if (sel rs_r.err) { ret err[fail.Fail].err{rs_r.err}; }
+    val qs_r: res[value.Value, fail.Fail] = builder.emit_or(?b, q1_r.ok, one);
+    if (sel qs_r.err) { ret err[fail.Fail].err{qs_r.err}; }
+    val br1: err[fail.Fail] = builder.emit_br(?b, latch);
+    if (sel br1.err) { ret br1; }
+
+    builder.set_block(?b, latch);
+    val rn_r: res[value.Value, fail.Fail] = builder.emit_phi(?b, ty);
+    if (sel rn_r.err) { ret err[fail.Fail].err{rn_r.err}; }
+    val qn_r: res[value.Value, fail.Fail] = builder.emit_phi(?b, ty);
+    if (sel qn_r.err) { ret err[fail.Fail].err{qn_r.err}; }
+    val in_r: res[value.Value, fail.Fail] = builder.emit_add(?b, i, one);
+    if (sel in_r.err) { ret err[fail.Fail].err{in_r.err}; }
+    val br2: err[fail.Fail] = builder.emit_br(?b, head);
+    if (sel br2.err) { ret br2; }
+
+    val pe0: err[fail.Fail] = builder.phi_add_incoming(?b, rn_r.ok, body, r1_r.ok);
+    if (sel pe0.err) { ret pe0; }
+    val pe1: err[fail.Fail] = builder.phi_add_incoming(?b, rn_r.ok, take, rs_r.ok);
+    if (sel pe1.err) { ret pe1; }
+    val pe2: err[fail.Fail] = builder.phi_add_incoming(?b, qn_r.ok, body, q1_r.ok);
+    if (sel pe2.err) { ret pe2; }
+    val pe3: err[fail.Fail] = builder.phi_add_incoming(?b, qn_r.ok, take, qs_r.ok);
+    if (sel pe3.err) { ret pe3; }
+    val pe4: err[fail.Fail] = builder.phi_add_incoming(?b, i, entry, zero);
+    if (sel pe4.err) { ret pe4; }
+    val pe5: err[fail.Fail] = builder.phi_add_incoming(?b, i, latch, in_r.ok);
+    if (sel pe5.err) { ret pe5; }
+    val pe6: err[fail.Fail] = builder.phi_add_incoming(?b, q, entry, zero);
+    if (sel pe6.err) { ret pe6; }
+    val pe7: err[fail.Fail] = builder.phi_add_incoming(?b, q, latch, qn_r.ok);
+    if (sel pe7.err) { ret pe7; }
+    val pe8: err[fail.Fail] = builder.phi_add_incoming(?b, r, entry, zero);
+    if (sel pe8.err) { ret pe8; }
+    val pe9: err[fail.Fail] = builder.phi_add_incoming(?b, r, latch, rn_r.ok);
+    if (sel pe9.err) { ret pe9; }
+
+    builder.set_block(?b, exit);
+    var out: value.Value = q;
+    if (want_rem) { out = r; }
+    ret builder.emit_ret(?b, out);
+}
+
+# |n| and |d| through the unsigned helper; a quotient is negated when the
+# signs differ, a remainder takes the dividend's sign
+fun build_signed(m: *ir.Module, idx: u32, inner: u32, ty: ir_type.IrTypeId, want_rem: bool) err[fail.Fail] {
+    var b: builder.Builder = builder.init(m);
+    builder.set_function(?b, ?m.functions[idx]);
+    val n: value.Value = value.param(0, ty);
+    val d: value.Value = value.param(1, ty);
+
+    val entry_r: res[id.BlockId, fail.Fail] = builder.new_block(?b);
+    if (sel entry_r.err) { ret err[fail.Fail].err{entry_r.err}; }
+    val flip_r: res[id.BlockId, fail.Fail] = builder.new_block(?b);
+    if (sel flip_r.err) { ret err[fail.Fail].err{flip_r.err}; }
+    val done_r: res[id.BlockId, fail.Fail] = builder.new_block(?b);
+    if (sel done_r.err) { ret err[fail.Fail].err{done_r.err}; }
+    val entry: id.BlockId = entry_r.ok;
+    val flip:  id.BlockId = flip_r.ok;
+    val done:  id.BlockId = done_r.ok;
+
+    val zero: value.Value = value.const_int(0, ty);
+
+    builder.set_block(?b, entry);
+    val nneg_r: res[value.Value, fail.Fail] = builder.emit_cmp_lt_s(?b, n, zero);
+    if (sel nneg_r.err) { ret err[fail.Fail].err{nneg_r.err}; }
+    val dneg_r: res[value.Value, fail.Fail] = builder.emit_cmp_lt_s(?b, d, zero);
+    if (sel dneg_r.err) { ret err[fail.Fail].err{dneg_r.err}; }
+    # |x| = (x xor fill) - fill with fill the sign spread over the width
+    val na_r: res[value.Value, fail.Fail] = magnitude(?b, n, ty);
+    if (sel na_r.err) { ret err[fail.Fail].err{na_r.err}; }
+    val da_r: res[value.Value, fail.Fail] = magnitude(?b, d, ty);
+    if (sel da_r.err) { ret err[fail.Fail].err{da_r.err}; }
+    var args: [2]value.Value;
+    args[0] = na_r.ok;
+    args[1] = da_r.ok;
+    val call_r: res[value.Value, fail.Fail] = builder.emit_call(?b, value.fn(inner, m.functions[inner].sig), ?args[0], 2, ty);
+    if (sel call_r.err) { ret err[fail.Fail].err{call_r.err}; }
+    var negate: value.Value = nneg_r.ok;
+    if (!want_rem) {
+        val x_r: res[value.Value, fail.Fail] = builder.emit_xor(?b, nneg_r.ok, dneg_r.ok);
+        if (sel x_r.err) { ret err[fail.Fail].err{x_r.err}; }
+        negate = x_r.ok;
+    }
+    val cbr0: err[fail.Fail] = builder.emit_cbr(?b, negate, flip, done);
+    if (sel cbr0.err) { ret cbr0; }
+
+    builder.set_block(?b, flip);
+    val neg_r: res[value.Value, fail.Fail] = builder.emit_sub(?b, zero, call_r.ok);
+    if (sel neg_r.err) { ret err[fail.Fail].err{neg_r.err}; }
+    val br0: err[fail.Fail] = builder.emit_br(?b, done);
+    if (sel br0.err) { ret br0; }
+
+    builder.set_block(?b, done);
+    val out_r: res[value.Value, fail.Fail] = builder.emit_phi(?b, ty);
+    if (sel out_r.err) { ret err[fail.Fail].err{out_r.err}; }
+    val pe0: err[fail.Fail] = builder.phi_add_incoming(?b, out_r.ok, entry, call_r.ok);
+    if (sel pe0.err) { ret pe0; }
+    val pe1: err[fail.Fail] = builder.phi_add_incoming(?b, out_r.ok, flip, neg_r.ok);
+    if (sel pe1.err) { ret pe1; }
+    ret builder.emit_ret(?b, out_r.ok);
+}
+
+fun magnitude(b: *builder.Builder, x: value.Value, ty: ir_type.IrTypeId) res[value.Value, fail.Fail] {
+    val found: opt[*ir_type.IrType] = ir_type.get(?b.m.types, ty);
+    if (sel found.none) { ret res[value.Value, fail.Fail].err{fail.message("widediv: helper type is absent")}; }
+    val fill_r: res[value.Value, fail.Fail] = builder.emit_shr_s(b, x, value.const_int((found.some.data.bits - 1)::u64, ty));
+    if (sel fill_r.err) { ret fill_r; }
+    val x_r: res[value.Value, fail.Fail] = builder.emit_xor(b, x, fill_r.ok);
+    if (sel x_r.err) { ret x_r; }
+    ret builder.emit_sub(b, x_r.ok, fill_r.ok);
+}
+
+rec TCase {
+    alloc: A.Allocator;
+    reg:   target.TargetRegistry;
+    itn:   intern.Interner;
+    m:     ir.Module;
+    ops:   [4]id.InstructionId;
+}
+
+# a function whose body is the four divisions of `p0` by `p1` at `bits`
+fun t_case(c: *TCase, bits: u32) bool {
+    val rm: res[ir.Module, fail.Fail] = ir.init(?c.alloc, intern.STR_NIL);
+    if (sel rm.err) { ret false; }
+    c.m = rm.ok;
+    val ty: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?c.m.types, bits);
+    if (sel ty.err) { ret false; }
+    val rf: res[u32, fail.Fail] = ir.function_add(?c.m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) { ret false; }
+    var bld: builder.Builder = builder.init(?c.m);
+    builder.set_function(?bld, ?c.m.functions[rf.ok]);
+    val rb: res[id.BlockId, fail.Fail] = builder.new_block(?bld);
+    if (sel rb.err) { ret false; }
+    builder.set_block(?bld, rb.ok);
+    val p0: value.Value                 = value.param(0, ty.ok);
+    val p1: value.Value                 = value.param(1, ty.ok);
+    val r0: res[value.Value, fail.Fail] = builder.emit_div_u(?bld, p0, p1);
+    val r1: res[value.Value, fail.Fail] = builder.emit_rem_u(?bld, p0, p1);
+    val r2: res[value.Value, fail.Fail] = builder.emit_div_s(?bld, p0, p1);
+    val r3: res[value.Value, fail.Fail] = builder.emit_rem_s(?bld, p0, p1);
+    if (sel r0.err) { ret false; }
+    if (sel r1.err) { ret false; }
+    if (sel r2.err) { ret false; }
+    if (sel r3.err) { ret false; }
+    c.ops[0] = r0.ok.data.instr;
+    c.ops[1] = r1.ok.data.instr;
+    c.ops[2] = r2.ok.data.instr;
+    c.ops[3] = r3.ok.data.instr;
+    ret true;
+}
+
+fun t_target(reg: *target.TargetRegistry, isa_name: str, out: *target.Target) bool {
+    var abi: str = "sysv64";
+    if (str_equals(isa_name, "aarch64")) { abi = "aapcs64"; }
+    if (str_equals(isa_name, "riscv64")) { abi = "lp64d"; }
+    var os: str = "linux";
+    if (str_equals(isa_name, "riscv32")) {
+        abi = "ilp32";
+        os  = "freestanding";
+    }
+    val rt: res[target.Target, fail.Fail] = target.select_of(reg, isa_name, os, abi, "");
+    if (sel rt.err) { ret false; }
+    @out = rt.ok;
+    ret true;
+}
+
+# the name of the function a call instruction names, or none
+fun t_callee_name(c: *TCase, iid: id.InstructionId) opt[str] {
+    val ins: *instruction.Instruction = ?c.m.functions[0].instrs[iid::u32];
+    if (ins.kind != instruction.OP_CALL || ins.operand_count != 3) { ret opt[str].none{}; }
+    if (ins.operands[0].kind != value.VAL_FN)                      { ret opt[str].none{}; }
+    ret intern.lookup(?c.itn, c.m.functions[ins.operands[0].data.fn_ix].name);
+}
+
+# the pass over `bits`-bit divisions on `isa_name`: 0 when every division became
+# a call to its own helper and the helpers are the four weak functions
+fun t_run(isa_name: str, bits: u32, expect_rewrite: bool) i32 {
+    var c:    TCase;
+    val made: err[A.Error] = page.make(?c.alloc);
+    if (sel made.err) { ret 100; }
+    c.reg = target.registry_init();
+    fin { target.registry_dnit(?c.reg); }
+    c.itn = intern.init(?c.alloc);
+    fin { intern.dnit(?c.itn); }
+    val registered: err[fail.Fail] = target.register_all(?c.reg, target_testing.debug_descriptor);
+    if (sel registered.err) { ret 101; }
+    var tgt: target.Target;
+    if (!t_target(?c.reg, isa_name, ?tgt)) { ret 102; }
+    if (!t_case(?c, bits))                 { ret 103; }
+    fin { ir.dnit(?c.m); }
+    val ran: res[bool, fail.Fail] = run(?c.m, ?tgt, ?c.itn);
+    if (sel ran.err)              { ret 104; }
+    if (ran.ok != expect_rewrite) { ret 1; }
+    if (!expect_rewrite) {
+        if (c.m.function_len != 1) { ret 2; }
+        ret 0;
+    }
+    # one helper per operation, each weak and never inlined, with two params
+    if (c.m.function_len != 5) { ret 3; }
+    var i: u32 = 1;
+    for (i < 5) {
+        val f: *ir.Function = ?c.m.functions[i];
+        if ((f.flags & ir.FN_FLAG_WEAK) == 0 || (f.flags & ir.FN_FLAG_NOINLINE) == 0) { ret 4; }
+        if (f.param_count != 2 || f.block_count == 0)                                 { ret 5; }
+        i = i + 1;
+    }
+    val names: [4]str = [4]str{"__mach_udiv128", "__mach_urem128", "__mach_sdiv128", "__mach_srem128"};
+    var k:     u32    = 0;
+    for (k < 4) {
+        val n: opt[str] = t_callee_name(?c, c.ops[k]);
+        if (sel n.none)                    { ret 6; }
+        if (!str_equals(n.some, names[k])) { ret 7; }
+        k = k + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.me.pass.widediv.run:wide_divisions_become_calls_to_one_helper_each" {
+    if (t_run("x86_64", 128, true) != 0)  { ret 1; }
+    if (t_run("aarch64", 128, true) != 0) { ret 2; }
+    if (t_run("riscv64", 128, true) != 0) { ret 3; }
+    # a division the ALU performs is left alone
+    if (t_run("x86_64", 64, false) != 0) { ret 4; }
+    if (t_run("x86_64", 32, false) != 0) { ret 5; }
+    # a width the target does not realize is left for the lowering to refuse
+    if (t_run("riscv32", 128, false) != 0) { ret 6; }
+    # a 64-bit division on a 32-bit ALU is the legalizer's inline expansion
+    if (t_run("riscv32", 64, false) != 0) { ret 7; }
+    ret 0;
+}
+
+# a signed helper calls the unsigned helper of its operation, and a helper
+# asked for twice is synthesized once
+test "mach.lang.me.pass.widediv.ensure_helper:signed_calls_unsigned_and_a_helper_is_shared" {
+    var c:    TCase;
+    val made: err[A.Error] = page.make(?c.alloc);
+    if (sel made.err) { ret 100; }
+    c.itn = intern.init(?c.alloc);
+    fin { intern.dnit(?c.itn); }
+    if (!t_case(?c, 128)) { ret 101; }
+    fin { ir.dnit(?c.m); }
+    val ty: ir_type.IrTypeId    = c.m.functions[0].instrs[c.ops[0]::u32].ty;
+    val s1: res[u32, fail.Fail] = ensure_helper(?c.m, ?c.itn, instruction.OP_DIV_S, 128, ty);
+    if (sel s1.err) { ret 1; }
+    # the unsigned helper came first, the signed one after it
+    if (c.m.function_len != 3) { ret 2; }
+    val s2: res[u32, fail.Fail] = ensure_helper(?c.m, ?c.itn, instruction.OP_DIV_S, 128, ty);
+    if (sel s2.err)                              { ret 3; }
+    if (s2.ok != s1.ok || c.m.function_len != 3) { ret 4; }
+    val u1: res[u32, fail.Fail] = ensure_helper(?c.m, ?c.itn, instruction.OP_DIV_U, 128, ty);
+    if (sel u1.err)                              { ret 5; }
+    if (u1.ok == s1.ok || c.m.function_len != 3) { ret 6; }
+    # the signed body calls the unsigned helper
+    val sf:             *ir.Function = ?c.m.functions[s1.ok];
+    var calls_unsigned: bool         = false;
+    var i:              u32          = 0;
+    for (i < sf.instr_len) {
+        val ins: *instruction.Instruction = ?sf.instrs[i];
+        if (ins.kind == instruction.OP_CALL && ins.operands[0].kind == value.VAL_FN
+            && ins.operands[0].data.fn_ix == u1.ok) { calls_unsigned = true; }
+        i = i + 1;
+    }
+    if (!calls_unsigned) { ret 7; }
+    ret 0;
+}
