@@ -534,7 +534,7 @@ fun expansion_count(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction,
         val dl: u32 = dst_lane_count(plan, mi);
         val sl: u32 = src_lane_count(plan, mi);
         var n:  u32 = dl;
-        if (dl > sl) { n = n + 1; }
+        if (dl > sl && !sext_folds_immediate(mi)) { n = n + 1; }
         ret res[u32, fail.Fail].ok{n};
     }
     if (op == mir.MIR_TRUNC) {
@@ -2581,6 +2581,8 @@ fun expand_sext(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *
     val sl: u32 = src_lane_count(plan, mi);
     val lw: u8  = plan.lane_width;
 
+    if (sext_folds_immediate(mi)) { ret emit_sext_immediate(alloc, plan, mi, dst, cursor, dl); }
+
     val rl: err[fail.Fail] = emit_low_lanes(alloc, plan, mi, dst, cursor, sl);
     if (sel rl.err) { ret rl; }
 
@@ -2591,6 +2593,36 @@ fun expand_sext(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *
         if (sel rf.err) { ret rf; }
     }
     ret emit_high_lanes(alloc, plan, mi, dst, cursor, sl, dl, fill);
+}
+
+# an immediate source of at most 64 bits is widened by folding
+fun sext_folds_immediate(mi: *mir.MirInstr) bool {
+    ret mi.operand_count == 2 && mi.operands[1].kind == mir.MIR_OP_IMM && mi.src_width <= 8;
+}
+
+# a signed widen of an immediate is known whole at legalization: the value is
+# the immediate read at its source width, and every destination lane is a move
+# of that value's lane, the high ones its sign, so no runtime fill is emitted
+fun emit_sext_immediate(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
+    dst: *mir.MirInstr, cursor: *u32, dl: u32) err[fail.Fail] {
+    val lw:       u8  = plan.lane_width;
+    val src_bits: u32 = mi.src_width::u32 * 8;
+    var v:        i64 = mi.operands[1].imm;
+    if (src_bits < 64) {
+        val drop: u32 = 64 - src_bits;
+        v = ((v:~u64 << drop::u64):~i64) >> drop::i64;
+    }
+    var whole: mir.MirOperand = mir.op_imm(v);
+    var i:     u32            = 0;
+    for (i < dl) {
+        var ops: [2]mir.MirOperand;
+        ops[0] = lane_operand(plan, ?mi.operands[0], i);
+        ops[1] = mir.op_imm(imm_lane(?whole, i, lw));
+        val r: err[fail.Fail] = emit_piece(alloc, dst, cursor, mi, mir.MIR_MOV, ?ops[0], 2, lw);
+        if (sel r.err) { ret r; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
 }
 
 fun expand_trunc(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
@@ -3377,6 +3409,60 @@ fun t_low_lane_converts(opcode: mir.MirOpcode, sw: u8) i32 {
     if (b.instrs[3].opcode != mir.MIR_MOV)                         { ret 1; }
     if (b.instrs[3].operands[1].vreg.n != fill.operands[0].vreg.n) { ret 1; }
     ret 0;
+}
+
+# a signed widen of an immediate folds: every lane is a move of the value's
+# lane as the lane-wide pattern imm_lane gives, the high ones its sign, and no
+# runtime fill appears (#3700)
+fun t_sext_immediate_folds(lw: u8, dst_w: u8, sw: u8, imm: i64, want_lo: i64, want_hi: i64) i32 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var mach: Machine = t_mach(lw, lw);
+    var f:    mir.MirFunction;
+    var b:    mir.MirBlock;
+    t_vregs(?alloc, ?f, 1);
+    t_block(?alloc, ?b, 1);
+    var cv: [2]mir.MirOperand;
+    cv[0] = mir.op_vreg(mir.vreg_id(0));
+    cv[1] = mir.op_imm(imm);
+    t_instr(?alloc, ?b, 0, mir.MIR_SEXT, ?cv[0], 2, dst_w);
+    b.instrs[0].src_width = sw;
+    f.blocks              = ?b;
+    f.block_count         = 1;
+    val r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
+    if (sel r.err)          { ret 1; }
+    if (b.instr_count != 2) { ret 2; }
+    var i: u32 = 0;
+    for (i < 2) {
+        val p: *mir.MirInstr = ?b.instrs[i];
+        if (p.opcode != mir.MIR_MOV)              { ret 3; }
+        if (p.width != lw)                        { ret 4; }
+        if (p.operands[1].kind != mir.MIR_OP_IMM) { ret 5; }
+        i = i + 1;
+    }
+    if (b.instrs[0].operands[1].imm != want_lo) { ret 6; }
+    if (b.instrs[1].operands[1].imm != want_hi) { ret 7; }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.legalize:a_negative_i8_immediate_widens_to_immediate_lanes" {
+    ret t_sext_immediate_folds(4, 8, 1, 0xf8, 0xfffffff8, 0xffffffff);
+}
+
+test "mach.lang.be.codegen.legalize:a_negative_i16_immediate_widens_to_immediate_lanes" {
+    ret t_sext_immediate_folds(4, 8, 2, 0xfff0, 0xfffffff0, 0xffffffff);
+}
+
+test "mach.lang.be.codegen.legalize:a_negative_i32_immediate_widens_to_immediate_lanes" {
+    ret t_sext_immediate_folds(4, 8, 4, 0xffffff00, 0xffffff00, 0xffffffff);
+}
+
+test "mach.lang.be.codegen.legalize:a_positive_immediate_widens_to_a_zero_high_lane" {
+    ret t_sext_immediate_folds(4, 8, 1, 0x7f, 127, 0);
+}
+
+test "mach.lang.be.codegen.legalize:a_negative_i64_immediate_widens_to_128_bit_lanes" {
+    ret t_sext_immediate_folds(8, 16, 8, -2, -2, -1);
 }
 
 test "mach.lang.be.codegen.legalize:a_widened_u8_is_masked_in_its_low_lane" {
