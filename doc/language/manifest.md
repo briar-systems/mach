@@ -458,6 +458,16 @@ is refused at composition (`instruction set 'spirv' emits finished modules, but
 object format 'raw' carries linkable objects`), so the override cannot compose a
 tuple that would emit nothing.
 
+The page an image is laid out at is a function of the same tuple. A format a
+loader maps by page (`elf`, `coff`, `macho`) places every load segment on a page
+of its own, so no two segments with different permissions share one: the os's
+page where the os declares one (`linux` on `aarch64` lays out at 64 KiB, the
+largest page a kernel may use, `darwin` on `aarch64` at 16 KiB, 4 KiB elsewhere),
+and the instruction set's hardware page (4 KiB on `x86_64`, `aarch64`, `riscv64`
+and `riscv32`) where the os has no loader of its own, which is what `freestanding`
+with `of = "elf"` gives a bootloader such as Limine or GRUB. A flat image (`raw`)
+and a finished module (`spv`) have no page and are laid out byte-tight.
+
 ### Finished-module targets
 
 A `spirv` target's object output is a complete, self-contained module rather than
