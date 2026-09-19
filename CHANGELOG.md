@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A back-half refusal of the program is a diagnostic, so the build summary counts it and the exit code is the user's. `mach build` used to print an `#[oblivious]` refusal from codegen and then a summary of `0 errors`, because the refusal travelled as a failure beside the diagnostic list rather than in it. Every backend pass that rejects the program now appends an error to the module's diagnostic store, located like any front-end error, and answers `reported`: the early and late constant-time walks, the inline `asm` parser and encoders on x86-64, aarch64 and riscv (unknown mnemonics, operand shapes, immediates out of range, an instruction needing an extension the target does not select), the legalizer's refusal of an operand width the target has no form for, a stack frame larger than the target's `stack_reserve`, a secret operand on an operation the target has no constant-time form for, and the SPIR-V emitter's refusals of source the target cannot express (block and interface shapes, structured control flow, an environment lacking a capability the module needs). A failure now names the apparatus only: the allocator, I/O, a target with no model, or a compiler defect. The diagnostic text changes shape: the `codegen:`, `encode:`, `legalize:`, `frame:` and `spirv.emit:` prefixes are gone, and the `file:line:col` the message used to embed is now the diagnostic's own location, rendered as a source frame under the headline, so `main.mach:3:5: unknown x86_64 inline-asm instruction 'frobnicate'` reads `error: unknown x86_64 inline-asm instruction 'frobnicate'` followed by `--> main.mach:3:5` and the line. A SPIR-V refusal names its function as `(in f)` in place of the opcode and location it appended (#3656).
+
 ## [5.5.2] - 2026-09-18
 
 ### Changed
