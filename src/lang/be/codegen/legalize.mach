@@ -13,6 +13,7 @@ use std.format;
 use A: std.allocator;
 
 use mach.lang.be.codegen.mir;
+use mach.lang.diagnostic;
 use mach.lang.target.isa;
 use target: mach.lang.target.resolved;
 
@@ -39,12 +40,16 @@ fun float_class_of(tgt: *target.Target) u32 {
     ret FP_CLASS_NONE;
 }
 
+# f and diags: the function under legalization and the module's diagnostic
+# store, where a refusal of the program's operand widths lands
 rec LanePlan {
     lane_base:  *u32;
     lane_count: *u8;
     orig_count: u32;
     lane_width: u8;
     mach:       Machine;
+    f:          *mir.MirFunction;
+    diags:      *diagnostic.DiagnosticStore;
 }
 
 val LANE_NONE: u32 = 0xFFFFFFFF;
@@ -72,7 +77,7 @@ pub fun run(tgt: *target.Target, m: *mir.MirModule) err[fail.Fail] {
 
     var i: u32 = 0;
     for (i < m.function_len) {
-        val res_fn: err[fail.Fail] = legalize_function(m.alloc, ?mach, ?m.functions[i]);
+        val res_fn: err[fail.Fail] = legalize_function(m.alloc, ?mach, ?m.functions[i], m.diags);
         if (sel res_fn.err) { ret res_fn; }
         i = i + 1;
     }
@@ -140,12 +145,14 @@ fun instr_rides_fp_bank(f: *mir.MirFunction, mi: *mir.MirInstr) bool {
     ret false;
 }
 
-fun legalize_function(alloc: *A.Allocator, mach: *Machine, f: *mir.MirFunction) err[fail.Fail] {
+fun legalize_function(alloc: *A.Allocator, mach: *Machine, f: *mir.MirFunction, diags: *diagnostic.DiagnosticStore) err[fail.Fail] {
     if (!function_needs_legalize(f, mach)) { ret err[fail.Fail].ok{}; }
 
     var plan:     LanePlan;
     val res_plan: err[fail.Fail] = plan_lanes(alloc, mach, f, ?plan);
     if (sel res_plan.err) { ret res_plan; }
+    plan.f     = f;
+    plan.diags = diags;
 
     var bi: u32 = 0;
     for (bi < f.block_count) {
@@ -505,7 +512,7 @@ fun expansion_count(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction,
         ret divmod_piece_count(alloc, plan, mi);
     }
     if (mir.is_cmp_opcode(op)) { ret cmp_piece_count(alloc, plan, mi); }
-    ret res[u32, fail.Fail].err{fail.message(unsupported_message(alloc, op, mi.width))};
+    ret res[u32, fail.Fail].err{unsupported(alloc, plan, mi, op)};
 }
 
 fun wide_lane_count(plan: *LanePlan, mi: *mir.MirInstr) u32 {
@@ -549,18 +556,18 @@ fun base_needs_staging(plan: *LanePlan, mem: *mir.MirOperand) bool {
 }
 
 fun memory_piece_count(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr) res[u32, fail.Fail] {
-    if (mi.operand_count != 2) { ret res[u32, fail.Fail].err{fail.message(unsupported_message(alloc, mi.opcode, mi.width))}; }
+    if (mi.operand_count != 2) { ret res[u32, fail.Fail].err{unsupported(alloc, plan, mi, mi.opcode)}; }
     val mx: i32 = addr_operand_index(mi);
     val vx: u32 = 1 - mx::u32;
     var n:  u32 = wide_lane_count(plan, mi);
     if (!operand_is_lane_ready(plan, ?mi.operands[vx], n)) {
-        ret res[u32, fail.Fail].err{fail.message(unsupported_message(alloc, mi.opcode, mi.width))};
+        ret res[u32, fail.Fail].err{unsupported(alloc, plan, mi, mi.opcode)};
     }
     val mem: *mir.MirOperand = ?mi.operands[mx::u32];
     if (base_needs_staging(plan, mem)) {
         val pl: u32 = plan.lane_count[mem.vreg.n]::u32;
         if (pl != 2 || plan.mach.stage_lo < 0 || plan.mach.stage_hi < 0) {
-            ret res[u32, fail.Fail].err{fail.message("legalize: a runtime pointer needs a two-register address-staging pair this target does not reserve")};
+            ret res[u32, fail.Fail].err{mir.reject_instr_at(plan.diags, plan.f, mi, "a runtime pointer needs a two-register address-staging pair this target does not reserve")};
         }
         n = n + pl;
     }
@@ -670,11 +677,18 @@ fun expand_instr(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: 
     if (op == mir.MIR_TRUNC) {
         ret expand_trunc(alloc, plan, mi, dst, cursor);
     }
-    ret err[fail.Fail].err{fail.message(unsupported_message(alloc, op, mi.width))};
+    ret err[fail.Fail].err{unsupported(alloc, plan, mi, op)};
 }
 
 fun emit_piece(alloc: *A.Allocator, dst: *mir.MirInstr, cursor: *u32, src: *mir.MirInstr,
     opcode: mir.MirOpcode, ops: *mir.MirOperand, nops: u32, width: u8) err[fail.Fail] {
+    ret emit_piece_from(alloc, dst, cursor, src, opcode, ops, nops, width, width);
+}
+
+# a piece whose source width differs from its width: the lane-wide convert of a
+# sub-word source, which is where the shared lowering narrows a scalar convert
+fun emit_piece_from(alloc: *A.Allocator, dst: *mir.MirInstr, cursor: *u32, src: *mir.MirInstr,
+    opcode: mir.MirOpcode, ops: *mir.MirOperand, nops: u32, width: u8, src_width: u8) err[fail.Fail] {
     if (src.vec_lane != mir.VEC_LANE_NONE) {
         ret err[fail.Fail].err{fail.message("internal compiler error: width legalization cannot expand a vector-lane instruction without a lane-aware piece emitter; vec_lane would be silently dropped")};
     }
@@ -690,7 +704,7 @@ fun emit_piece(alloc: *A.Allocator, dst: *mir.MirInstr, cursor: *u32, src: *mir.
         }
     }
     val ci: u32 = @cursor;
-    dst[ci] = mir.instr(opcode, arr, nops, width, width);
+    dst[ci] = mir.instr(opcode, arr, nops, width, src_width);
     val p: *mir.MirInstr = ?dst[ci];
     p.loc           = src.loc;
     p.inline_site   = src.inline_site;
@@ -844,7 +858,7 @@ fun operands_are_lane_ready(plan: *LanePlan, mi: *mir.MirInstr, start: u32) bool
 fun expand_bitwise(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
     dst: *mir.MirInstr, cursor: *u32) err[fail.Fail] {
     if (mi.operand_count != 3 || !operands_are_lane_ready(plan, mi, 1)) {
-        ret err[fail.Fail].err{fail.message(unsupported_message(alloc, mi.opcode, mi.width))};
+        ret err[fail.Fail].err{unsupported(alloc, plan, mi, mi.opcode)};
     }
     val nl: u32 = wide_lane_count(plan, mi);
     val lw: u8  = plan.lane_width;
@@ -864,7 +878,7 @@ fun expand_bitwise(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
 fun expand_not(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
     dst: *mir.MirInstr, cursor: *u32) err[fail.Fail] {
     if (mi.operand_count != 2 || !operands_are_lane_ready(plan, mi, 1)) {
-        ret err[fail.Fail].err{fail.message(unsupported_message(alloc, mi.opcode, mi.width))};
+        ret err[fail.Fail].err{unsupported(alloc, plan, mi, mi.opcode)};
     }
     val nl: u32 = wide_lane_count(plan, mi);
     val lw: u8  = plan.lane_width;
@@ -885,7 +899,7 @@ fun expand_mov(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
     val nl: u32 = wide_lane_count(plan, mi);
     if (mi.operand_count != 2 || !operand_is_lane_ready(plan, ?mi.operands[0], nl) ||
         !operand_is_lane_ready(plan, ?mi.operands[1], nl)) {
-        ret err[fail.Fail].err{fail.message(unsupported_message(alloc, mi.opcode, mi.width))};
+        ret err[fail.Fail].err{unsupported(alloc, plan, mi, mi.opcode)};
     }
     val lw: u8 = plan.lane_width;
     # a declassify is the taint barrier; its lanes must stay one or the barrier is gone
@@ -907,7 +921,7 @@ fun expand_addsub(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi:
     dst: *mir.MirInstr, cursor: *u32, is_sub: bool) err[fail.Fail] {
     if (mi.operand_count != 3 || !operands_are_lane_ready(plan, mi, 1) ||
         mi.operands[0].kind != mir.MIR_OP_VREG || plan.lane_base[mi.operands[0].vreg.n] == LANE_NONE) {
-        ret err[fail.Fail].err{fail.message(unsupported_message(alloc, mi.opcode, mi.width))};
+        ret err[fail.Fail].err{unsupported(alloc, plan, mi, mi.opcode)};
     }
     val nl: u32 = wide_lane_count(plan, mi);
     val lw: u8  = plan.lane_width;
@@ -1013,7 +1027,7 @@ fun expand_neg(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *m
     dst: *mir.MirInstr, cursor: *u32) err[fail.Fail] {
     if (mi.operand_count != 2 || !operands_are_lane_ready(plan, mi, 1) ||
         mi.operands[0].kind != mir.MIR_OP_VREG || plan.lane_base[mi.operands[0].vreg.n] == LANE_NONE) {
-        ret err[fail.Fail].err{fail.message(unsupported_message(alloc, mi.opcode, mi.width))};
+        ret err[fail.Fail].err{unsupported(alloc, plan, mi, mi.opcode)};
     }
     var sub: mir.MirInstr = @mi;
     var ops: [3]mir.MirOperand;
@@ -1094,20 +1108,20 @@ fun shift_stage_count(bits: u32) u32 {
 fun shift_piece_count(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr) res[u32, fail.Fail] {
     val nl: u32 = wide_lane_count(plan, mi);
     if (mi.operand_count != 3 || nl > MAX_SHIFT_LANES) {
-        ret res[u32, fail.Fail].err{fail.message(unsupported_message(alloc, mi.opcode, mi.width))};
+        ret res[u32, fail.Fail].err{unsupported(alloc, plan, mi, mi.opcode)};
     }
     if (mi.operands[0].kind != mir.MIR_OP_VREG ||
         !operand_is_lane_ready(plan, ?mi.operands[0], nl) ||
         !operand_is_lane_ready(plan, ?mi.operands[1], nl) ||
         !operand_is_lane_ready(plan, ?mi.operands[2], 1)) {
-        ret res[u32, fail.Fail].err{fail.message(unsupported_message(alloc, mi.opcode, mi.width))};
+        ret res[u32, fail.Fail].err{unsupported(alloc, plan, mi, mi.opcode)};
     }
 
     val lb:     u32 = plan.lane_width::u32 * 8;
     val bits:   u32 = nl * lb;
     val stages: u32 = shift_stage_count(bits);
     if (stages == 0) {
-        ret res[u32, fail.Fail].err{fail.message("legalize: a shift at a width that is not a power of two is unsupported on this target")};
+        ret res[u32, fail.Fail].err{mir.reject_instr_at(plan.diags, plan.f, mi, "a shift at a width that is not a power of two is unsupported on this target")};
     }
 
     val left:  bool = mi.opcode == mir.MIR_SHL;
@@ -1505,7 +1519,7 @@ fun mul_piece_count(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr) res
     if (mi.operand_count != 3 || nl > MAX_SHIFT_LANES ||
         mi.operands[0].kind != mir.MIR_OP_VREG || !operand_is_lane_ready(plan, ?mi.operands[0], nl) ||
         !operand_is_lane_ready(plan, ?mi.operands[1], nl) || !operand_is_lane_ready(plan, ?mi.operands[2], nl)) {
-        ret res[u32, fail.Fail].err{fail.message(unsupported_message(alloc, mi.opcode, mi.width))};
+        ret res[u32, fail.Fail].err{unsupported(alloc, plan, mi, mi.opcode)};
     }
     if (plan.mach.mul_hi != 0 && plan.mach.mul_hi != plan.lane_width) {
         ret res[u32, fail.Fail].err{fail.message("legalize: this target declares a widening multiply at a width other than its ALU width, which this pass does not model (see briar-systems/mach#2778)")};
@@ -1743,7 +1757,7 @@ fun divmod_piece_count(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr) 
     if (mi.operand_count != 3 || nl > MAX_SHIFT_LANES ||
         mi.operands[0].kind != mir.MIR_OP_VREG || !operand_is_lane_ready(plan, ?mi.operands[0], nl) ||
         !operand_is_lane_ready(plan, ?mi.operands[1], nl) || !operand_is_lane_ready(plan, ?mi.operands[2], nl)) {
-        ret res[u32, fail.Fail].err{fail.message(unsupported_message(alloc, mi.opcode, mi.width))};
+        ret res[u32, fail.Fail].err{unsupported(alloc, plan, mi, mi.opcode)};
     }
     val bits:  u32 = nl * plan.lane_width::u32 * 8;
     var total: u32 = bits * divmod_stage_pieces(nl) + divmod_zero_fixup_pieces(nl, div_is_signed(mi.opcode));
@@ -2141,7 +2155,7 @@ fun cmp_piece_count(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr) res
         !cmp_dest_is_native(plan, ?mi.operands[0]) ||
         !operand_is_lane_ready(plan, ?mi.operands[1], nl) ||
         !operand_is_lane_ready(plan, ?mi.operands[2], nl)) {
-        ret res[u32, fail.Fail].err{fail.message(unsupported_message(alloc, mi.opcode, mi.width))};
+        ret res[u32, fail.Fail].err{unsupported(alloc, plan, mi, mi.opcode)};
     }
 
     val op: mir.MirOpcode = mi.opcode;
@@ -2295,21 +2309,36 @@ fun src_lane_count(plan: *LanePlan, mi: *mir.MirInstr) u32 {
     ret n;
 }
 
-fun expand_zext(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
-    dst: *mir.MirInstr, cursor: *u32) err[fail.Fail] {
-    if (mi.operand_count != 2 ||
-        mi.operands[0].kind != mir.MIR_OP_VREG || plan.lane_base[mi.operands[0].vreg.n] == LANE_NONE) {
-        ret err[fail.Fail].err{fail.message(unsupported_message(alloc, mi.opcode, mi.width))};
-    }
-    val dl: u32 = dst_lane_count(plan, mi);
-    val sl: u32 = src_lane_count(plan, mi);
+# a source narrower than a lane arrives with whatever its producer left above
+# its width (sub-word arithmetic does not mask), so the lane that receives it
+# is the same lane-wide convert the shared lowering emits for a scalar widen,
+# not a move; the lanes above it are the fill. the source is narrower than a
+# lane exactly when it has one lane and a width under the lane's
+fun emit_low_lanes(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
+    dst: *mir.MirInstr, cursor: *u32, sl: u32) err[fail.Fail] {
     val lw: u8  = plan.lane_width;
     var i:  u32 = 0;
+    for (i < sl) {
+        var ops: [2]mir.MirOperand;
+        ops[0] = lane_operand(plan, ?mi.operands[0], i);
+        ops[1] = lane_operand(plan, ?mi.operands[1], i);
+        var r: err[fail.Fail] = err[fail.Fail].ok{};
+        if (mi.src_width < lw) { r = emit_piece_from(alloc, dst, cursor, mi, mi.opcode, ?ops[0], 2, lw, mi.src_width); }
+        or                     { r = emit_piece(alloc, dst, cursor, mi, mir.MIR_MOV, ?ops[0], 2, lw); }
+        if (sel r.err)         { ret r; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun emit_high_lanes(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
+    dst: *mir.MirInstr, cursor: *u32, sl: u32, dl: u32, fill: mir.MirOperand) err[fail.Fail] {
+    val lw: u8  = plan.lane_width;
+    var i:  u32 = sl;
     for (i < dl) {
         var ops: [2]mir.MirOperand;
         ops[0] = lane_operand(plan, ?mi.operands[0], i);
-        if (i < sl) { ops[1] = lane_operand(plan, ?mi.operands[1], i); }
-        or          { ops[1] = mir.op_imm(0); }
+        ops[1] = fill;
         val r: err[fail.Fail] = emit_piece(alloc, dst, cursor, mi, mir.MIR_MOV, ?ops[0], 2, lw);
         if (sel r.err) { ret r; }
         i = i + 1;
@@ -2317,40 +2346,48 @@ fun expand_zext(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
     ret err[fail.Fail].ok{};
 }
 
+fun expand_zext(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
+    dst: *mir.MirInstr, cursor: *u32) err[fail.Fail] {
+    if (mi.operand_count != 2 ||
+        mi.operands[0].kind != mir.MIR_OP_VREG || plan.lane_base[mi.operands[0].vreg.n] == LANE_NONE) {
+        ret err[fail.Fail].err{unsupported(alloc, plan, mi, mi.opcode)};
+    }
+    val dl: u32            = dst_lane_count(plan, mi);
+    val sl: u32            = src_lane_count(plan, mi);
+    val rl: err[fail.Fail] = emit_low_lanes(alloc, plan, mi, dst, cursor, sl);
+    if (sel rl.err) { ret rl; }
+    ret emit_high_lanes(alloc, plan, mi, dst, cursor, sl, dl, mir.op_imm(0));
+}
+
+# the sign fill is taken from the destination's top source lane once it holds
+# the lane-wide value, so a sub-word source's sign bit is the one the convert
+# placed, not a bit its producer left in the register
 fun expand_sext(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *mir.MirInstr,
     dst: *mir.MirInstr, cursor: *u32) err[fail.Fail] {
     if (mi.operand_count != 2 ||
         mi.operands[0].kind != mir.MIR_OP_VREG || plan.lane_base[mi.operands[0].vreg.n] == LANE_NONE) {
-        ret err[fail.Fail].err{fail.message(unsupported_message(alloc, mi.opcode, mi.width))};
+        ret err[fail.Fail].err{unsupported(alloc, plan, mi, mi.opcode)};
     }
     val dl: u32 = dst_lane_count(plan, mi);
     val sl: u32 = src_lane_count(plan, mi);
     val lw: u8  = plan.lane_width;
 
+    val rl: err[fail.Fail] = emit_low_lanes(alloc, plan, mi, dst, cursor, sl);
+    if (sel rl.err) { ret rl; }
+
     var fill: mir.MirOperand = mir.op_imm(0);
     if (dl > sl) {
-        val top: mir.MirOperand = lane_operand(plan, ?mi.operands[1], sl - 1);
+        val top: mir.MirOperand = lane_operand(plan, ?mi.operands[0], sl - 1);
         val rf:  err[fail.Fail] = emit_sign_fill(alloc, f, mi, dst, cursor, top, lw, ?fill);
         if (sel rf.err) { ret rf; }
     }
-
-    var i: u32 = 0;
-    for (i < dl) {
-        var ops: [2]mir.MirOperand;
-        ops[0] = lane_operand(plan, ?mi.operands[0], i);
-        if (i < sl) { ops[1] = lane_operand(plan, ?mi.operands[1], i); }
-        or          { ops[1] = fill; }
-        val r: err[fail.Fail] = emit_piece(alloc, dst, cursor, mi, mir.MIR_MOV, ?ops[0], 2, lw);
-        if (sel r.err) { ret r; }
-        i = i + 1;
-    }
-    ret err[fail.Fail].ok{};
+    ret emit_high_lanes(alloc, plan, mi, dst, cursor, sl, dl, fill);
 }
 
 fun expand_trunc(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
     dst: *mir.MirInstr, cursor: *u32) err[fail.Fail] {
     if (mi.operand_count != 2) {
-        ret err[fail.Fail].err{fail.message(unsupported_message(alloc, mi.opcode, mi.width))};
+        ret err[fail.Fail].err{unsupported(alloc, plan, mi, mi.opcode)};
     }
     val dl: u32 = dst_lane_count(plan, mi);
     val lw: u8  = plan.lane_width;
@@ -2704,18 +2741,18 @@ fun conv_is_wide(mach: *Machine, mi: *mir.MirInstr) bool {
 fun conv_prepare(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *mir.MirInstr,
     dst: *mir.MirInstr, cursor: *u32, out: *ConvEmit) err[fail.Fail] {
     if (plan.lane_width != 4 || conv_int_width(mi) != 8) {
-        ret err[fail.Fail].err{fail.message(unsupported_message(alloc, mi.opcode, mi.width))};
+        ret err[fail.Fail].err{unsupported(alloc, plan, mi, mi.opcode)};
     }
     val ii: u32 = 1 - (conv_float_operand(mi.opcode)::u32);
     if (mi.opcode == mir.MIR_FP_TO_SI || mi.opcode == mir.MIR_FP_TO_UI) {
         val d: *mir.MirOperand = ?mi.operands[0];
         if (d.kind != mir.MIR_OP_VREG || plan.lane_base[d.vreg.n] == LANE_NONE) {
-            ret err[fail.Fail].err{fail.message(unsupported_message(alloc, mi.opcode, mi.width))};
+            ret err[fail.Fail].err{unsupported(alloc, plan, mi, mi.opcode)};
         }
     }
     or {
         if (!operand_is_lane_ready(plan, ?mi.operands[ii], 2)) {
-            ret err[fail.Fail].err{fail.message(unsupported_message(alloc, mi.opcode, mi.width))};
+            ret err[fail.Fail].err{unsupported(alloc, plan, mi, mi.opcode)};
         }
     }
     out.alloc  = alloc;
@@ -2760,33 +2797,35 @@ fun emit_bin(alloc: *A.Allocator, dst: *mir.MirInstr, cursor: *u32, src: *mir.Mi
     ret emit_piece(alloc, dst, cursor, src, opcode, ?ops[0], 3, w);
 }
 
-fun unsupported_message(alloc: *A.Allocator, op: mir.MirOpcode, width: u8) str {
+# a refusal of an operand width the target cannot legalize: an error located
+# at the instruction on the module's diagnostic store
+fun unsupported(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr, op: mir.MirOpcode) fail.Fail {
     val family: str                          = unsupported_family(op);
     val rj:     res[str, format.FormatError] =
-        format.sprint(alloc, "{} ({}, {} bytes wide)", family, mir.opcode_name(op), width);
-    if (sel rj.err) { ret family; }
-    ret rj.ok;
+        format.sprint(alloc, "{} ({}, {} bytes wide)", family, mir.opcode_name(op), mi.width);
+    if (sel rj.err) { ret fail.format_refused(rj.err); }
+    ret mir.reject_instr_at(plan.diags, plan.f, mi, rj.ok);
 }
 
 fun unsupported_family(op: mir.MirOpcode) str {
-    if (mir.has(op, mir.MIRF_DIVIDE))    { ret "legalize: wide divide is unsupported on this target"; }
-    if (mir.has(op, mir.MIRF_REMAINDER)) { ret "legalize: wide remainder is unsupported on this target"; }
+    if (mir.has(op, mir.MIRF_DIVIDE))    { ret "wide divide is unsupported on this target"; }
+    if (mir.has(op, mir.MIRF_REMAINDER)) { ret "wide remainder is unsupported on this target"; }
     if (is_shift(op)) {
-        ret "legalize: shift through an unsupported operand shape on this target";
+        ret "shift through an unsupported operand shape on this target";
     }
     if (mir.has(op, mir.MIRF_MEMORY)) {
-        ret "legalize: wide memory access through an unsupported operand shape on this target";
+        ret "wide memory access through an unsupported operand shape on this target";
     }
     if (mir.is_cmp_opcode(op)) {
-        ret "legalize: wide comparison through an unsupported operand shape on this target";
+        ret "wide comparison through an unsupported operand shape on this target";
     }
     if (mir.has(op, mir.MIRF_ADDRESS_PRODUCER)) {
-        ret "legalize: materializing an address wider than one register is not yet legalized on this target";
+        ret "materializing an address wider than one register is not yet legalized on this target";
     }
     if (is_int_fp_conv(op)) {
-        ret "legalize: converting between a float and an integer wider than one register needs a float register bank this target does not have";
+        ret "converting between a float and an integer wider than one register needs a float register bank this target does not have";
     }
-    ret "legalize: operation wider than the target ALU is unsupported";
+    ret "operation wider than the target ALU is unsupported";
 }
 
 fun t_mach(maw: u8, ptr: u8) Machine {
@@ -2883,7 +2922,7 @@ test "mach.lang.be.codegen.legalize:inert_on_native_width" {
     val before_vregs: u32           = f.vreg_count;
 
     var mach: Machine        = t_mach(8, 8);
-    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel r.err)                     { ret 1; }
     if (b.instrs != before_ptr)        { ret 1; }
     if (b.instr_count != before_count) { ret 1; }
@@ -2916,7 +2955,7 @@ test "mach.lang.be.codegen.legalize:expands_wide_add_carry_chain" {
     f.block_count = 1;
 
     var mach: Machine        = t_mach(1, 2);
-    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel r.err) { ret 1; }
 
     if (f.vreg_count != 11) { ret 1; }
@@ -2979,7 +3018,7 @@ test "mach.lang.be.codegen.legalize:a_binding_on_a_wide_value_names_its_lanes" {
     if (!t_bind(?alloc, ?b.instrs[3], 14, 3)) { ret 1; }
 
     var mach: Machine        = t_mach(1, 2);
-    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel r.err)          { ret 1; }
     if (b.instr_count != 9) { ret 2; }
 
@@ -3009,6 +3048,105 @@ test "mach.lang.be.codegen.legalize:a_binding_on_a_wide_value_names_its_lanes" {
     if (!t_lane_binding(?nw.dbg_bindings[0], 8, 0, 2, 1) || nw.dbg_bindings[0].iid != 13) { ret 5; }
     if (!t_lane_binding(?nw.dbg_bindings[1], 9, 1, 2, 1) || nw.dbg_bindings[1].iid != 13) { ret 5; }
     if (!t_lane_binding(?nw.dbg_bindings[2], 3, 0, 0, 0) || nw.dbg_bindings[2].iid != 14) { ret 5; }
+    ret 0;
+}
+
+# v0 (8 bytes) <- widen v1 (sw bytes), on a 4-byte lane machine
+fun t_ext_fn(alloc: *A.Allocator, f: *mir.MirFunction, b: *mir.MirBlock,
+    opcode: mir.MirOpcode, sw: u8) {
+    t_vregs(alloc, f, 2);
+    t_block(alloc, b, 2);
+    var mv: [2]mir.MirOperand;
+    mv[0] = mir.op_vreg(mir.vreg_id(1));
+    mv[1] = mir.op_imm(0x1f8);
+    t_instr(alloc, b, 0, mir.MIR_MOV, ?mv[0], 2, sw);
+    var cv: [2]mir.MirOperand;
+    cv[0] = mir.op_vreg(mir.vreg_id(0));
+    cv[1] = mir.op_vreg(mir.vreg_id(1));
+    t_instr(alloc, b, 1, opcode, ?cv[0], 2, 8);
+    b.instrs[1].src_width = sw;
+    f.blocks              = b;
+    f.block_count         = 1;
+}
+
+# the low lane of a widened sub-word value is the lane-wide convert of the
+# source, never a move of the register it sits in (#3616)
+fun t_low_lane_converts(opcode: mir.MirOpcode, sw: u8) i32 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var mach: Machine = t_mach(4, 4);
+    var f:    mir.MirFunction;
+    var b:    mir.MirBlock;
+    t_ext_fn(?alloc, ?f, ?b, opcode, sw);
+    val r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
+    if (sel r.err) { ret 1; }
+
+    val lo: *mir.MirInstr = ?b.instrs[1];
+    if (lo.opcode != opcode)                    { ret 1; }
+    if (lo.width != 4 || lo.src_width != sw)    { ret 1; }
+    if (lo.operands[1].kind != mir.MIR_OP_VREG) { ret 1; }
+    if (lo.operands[1].vreg.n != 1)             { ret 1; }
+    val lane0: u32 = lo.operands[0].vreg.n;
+
+    if (opcode == mir.MIR_ZEXT) {
+        if (b.instr_count != 3)                             { ret 1; }
+        if (b.instrs[2].opcode != mir.MIR_MOV)              { ret 1; }
+        if (b.instrs[2].operands[1].kind != mir.MIR_OP_IMM) { ret 1; }
+        if (b.instrs[2].operands[1].imm != 0)               { ret 1; }
+        ret 0;
+    }
+    if (b.instr_count != 4) { ret 1; }
+    val fill: *mir.MirInstr = ?b.instrs[2];
+    if (fill.opcode != mir.MIR_SHR_S)                              { ret 1; }
+    if (fill.operands[1].vreg.n != lane0)                          { ret 1; }
+    if (fill.operands[2].imm != 31)                                { ret 1; }
+    if (b.instrs[3].opcode != mir.MIR_MOV)                         { ret 1; }
+    if (b.instrs[3].operands[1].vreg.n != fill.operands[0].vreg.n) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.legalize:a_widened_u8_is_masked_in_its_low_lane" {
+    ret t_low_lane_converts(mir.MIR_ZEXT, 1);
+}
+
+test "mach.lang.be.codegen.legalize:a_widened_u16_is_masked_in_its_low_lane" {
+    ret t_low_lane_converts(mir.MIR_ZEXT, 2);
+}
+
+test "mach.lang.be.codegen.legalize:a_widened_i8_takes_its_sign_from_the_converted_lane" {
+    ret t_low_lane_converts(mir.MIR_SEXT, 1);
+}
+
+test "mach.lang.be.codegen.legalize:a_widened_i16_takes_its_sign_from_the_converted_lane" {
+    ret t_low_lane_converts(mir.MIR_SEXT, 2);
+}
+
+# a lane-wide source has nothing above its width: its lane is a move, and a
+# signed widen fills from the source lane itself
+test "mach.lang.be.codegen.legalize:a_lane_wide_source_widens_by_a_move" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var mach: Machine = t_mach(4, 4);
+
+    var fz: mir.MirFunction;
+    var bz: mir.MirBlock;
+    t_ext_fn(?alloc, ?fz, ?bz, mir.MIR_ZEXT, 4);
+    val rz: err[fail.Fail] = legalize_function(?alloc, ?mach, ?fz, nil);
+    if (sel rz.err)                                             { ret 1; }
+    if (bz.instr_count != 3)                                    { ret 1; }
+    if (bz.instrs[1].opcode != mir.MIR_MOV)                     { ret 1; }
+    if (bz.instrs[1].width != 4 || bz.instrs[1].src_width != 4) { ret 1; }
+    if (bz.instrs[1].operands[1].vreg.n != 1)                   { ret 1; }
+
+    var fs: mir.MirFunction;
+    var bs: mir.MirBlock;
+    t_ext_fn(?alloc, ?fs, ?bs, mir.MIR_SEXT, 4);
+    val rs: err[fail.Fail] = legalize_function(?alloc, ?mach, ?fs, nil);
+    if (sel rs.err)                                                         { ret 1; }
+    if (bs.instr_count != 4)                                                { ret 1; }
+    if (bs.instrs[1].opcode != mir.MIR_MOV)                                 { ret 1; }
+    if (bs.instrs[2].opcode != mir.MIR_SHR_S)                               { ret 1; }
+    if (bs.instrs[2].operands[1].vreg.n != bs.instrs[1].operands[0].vreg.n) { ret 1; }
     ret 0;
 }
 
@@ -3050,7 +3188,7 @@ test "mach.lang.be.codegen.legalize:expands_a_wide_divide" {
     val want: u32 = rc.ok;
     free_plan(?alloc, ?plan);
 
-    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel legalize_function_r.err) { ret 1; }
     if (b.instr_count != 4 + want)   { ret 1; }
     var i:        u32 = 0;
@@ -3111,7 +3249,7 @@ test "mach.lang.be.codegen.legalize:divide_family_costs_agree" {
         if (sel rc.err) { ret 1; }
         val n: u32 = rc.ok;
         free_plan(?alloc, ?plan);
-        val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+        val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
         if (sel legalize_function_r.err) { ret 1; }
         if (b.instr_count != 4 + n)      { ret 1; }
         if (k == 0)                      { du = n; }
@@ -3153,7 +3291,7 @@ test "mach.lang.be.codegen.legalize:multiply_costs_agree_at_every_lane_count" {
             if (sel rc.err) { ret 1; }
             val n: u32 = rc.ok;
             free_plan(?alloc, ?plan);
-            val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+            val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
             if (sel legalize_function_r.err)             { ret 1; }
             if (b.instr_count != 2 * widths[k]::u32 + n) { ret 1; }
             k = k + 1;
@@ -3173,7 +3311,7 @@ test "mach.lang.be.codegen.legalize:a_declared_widening_multiply_selects_the_nat
 
     var mach: Machine = t_mach(4, 4);
     mach.mul_hi = 4;
-    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel legalize_function_r.err) { ret 1; }
 
     if (b.instr_count != 4 + 8) { ret 1; }
@@ -3197,7 +3335,7 @@ test "mach.lang.be.codegen.legalize:a_declared_widening_multiply_selects_the_nat
     var b2: mir.MirBlock;
     t_divmod_fn(?alloc, ?f2, ?b2, mir.MIR_MUL, 8, 1000, 7);
     var m2:                   Machine        = t_mach(4, 4);
-    val legalize_function_r2: err[fail.Fail] = legalize_function(?alloc, ?m2, ?f2);
+    val legalize_function_r2: err[fail.Fail] = legalize_function(?alloc, ?m2, ?f2, nil);
     if (sel legalize_function_r2.err) { ret 1; }
     var muls2:   u32 = 0;
     var shifts2: u32 = 0;
@@ -3223,7 +3361,7 @@ test "mach.lang.be.codegen.legalize:refuses_an_unmodelled_widening_multiply" {
     t_divmod_fn(?alloc, ?f, ?b, mir.MIR_MUL, 4, 1000, 7);
     var m1: Machine = t_mach(1, 2);
     m1.mul_hi = 4;
-    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?m1, ?f);
+    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?m1, ?f, nil);
     if (!sel legalize_function_r.err) { ret 1; }
 
     var f2: mir.MirFunction;
@@ -3232,7 +3370,7 @@ test "mach.lang.be.codegen.legalize:refuses_an_unmodelled_widening_multiply" {
     var m2: Machine = t_mach(1, 2);
     m2.mul_hi  = 1;
     m2.has_mul = false;
-    val legalize_function_r2: err[fail.Fail] = legalize_function(?alloc, ?m2, ?f2);
+    val legalize_function_r2: err[fail.Fail] = legalize_function(?alloc, ?m2, ?f2, nil);
     if (!sel legalize_function_r2.err) { ret 1; }
 
     var f3: mir.MirFunction;
@@ -3240,7 +3378,7 @@ test "mach.lang.be.codegen.legalize:refuses_an_unmodelled_widening_multiply" {
     t_divmod_fn(?alloc, ?f3, ?b3, mir.MIR_MUL, 4, 1000, 7);
     var m3: Machine = t_mach(1, 2);
     m3.mul_hi = 1;
-    val legalize_function_r3: err[fail.Fail] = legalize_function(?alloc, ?m3, ?f3);
+    val legalize_function_r3: err[fail.Fail] = legalize_function(?alloc, ?m3, ?f3, nil);
     if (sel legalize_function_r3.err) { ret 1; }
     ret 0;
 }
@@ -3262,7 +3400,7 @@ test "mach.lang.be.codegen.legalize:rejects_unsupported_wide_op" {
     f.block_count = 1;
 
     var mach: Machine        = t_mach(1, 2);
-    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (!sel r.err) { ret 1; }
     ret 0;
 }
@@ -3283,7 +3421,7 @@ test "mach.lang.be.codegen.legalize:expands_wide_access_at_a_fixed_base" {
     f.block_count = 1;
 
     var mach: Machine        = t_mach(1, 2);
-    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel r.err)          { ret 1; }
     if (b.instr_count != 4) { ret 1; }
 
@@ -3318,7 +3456,7 @@ test "mach.lang.be.codegen.legalize:expands_a_wide_access_at_a_symbol" {
     b.instrs[0].memory_flags = mir.MEMORY_VOLATILE;
 
     var mach: Machine        = t_mach(2, 2);
-    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel r.err)          { ret 1; }
     if (b.instr_count != 2) { ret 1; }
 
@@ -3360,7 +3498,7 @@ test "mach.lang.be.codegen.legalize:refuses_an_address_indexed_by_a_wide_value" 
     f.block_count = 1;
 
     var mach: Machine        = t_mach(1, 1);
-    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (!sel r.err) { ret 1; }
 
     # the same access indexed by a narrow value is legalized as before
@@ -3377,7 +3515,7 @@ test "mach.lang.be.codegen.legalize:refuses_an_address_indexed_by_a_wide_value" 
     t_instr(?alloc, ?gb, 1, mir.MIR_LOAD, ?ld2[0], 2, 1);
     g.blocks      = ?gb;
     g.block_count = 1;
-    val r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?g);
+    val r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?g, nil);
     if (sel r2.err) { ret 2; }
     ret 0;
 }
@@ -3398,7 +3536,7 @@ test "mach.lang.be.codegen.legalize:refuses_a_wide_access_with_no_address_operan
     f.block_count = 1;
 
     var mach: Machine        = t_mach(2, 2);
-    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (!sel r.err) { ret 1; }
     ret 0;
 }
@@ -3422,7 +3560,7 @@ test "mach.lang.be.codegen.legalize:refuses_a_wide_physical_register_operand" {
     f.block_count = 1;
 
     var mach: Machine        = t_mach(1, 2);
-    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (!sel r.err)         { ret 1; }
     if (b.instr_count != 1) { ret 1; }
 
@@ -3441,7 +3579,7 @@ test "mach.lang.be.codegen.legalize:refuses_a_wide_physical_register_operand" {
     t_instr(?alloc, ?gb, 1, mir.MIR_MOV, ?out[0], 2, 2);
     g.blocks      = ?gb;
     g.block_count = 1;
-    val r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?g);
+    val r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?g, nil);
     if (!sel r2.err) { ret 1; }
     ret 0;
 }
@@ -3472,7 +3610,7 @@ test "mach.lang.be.codegen.legalize:a_lane_join_takes_its_lanes_from_the_pieces_
     f.block_count = 1;
 
     var mach: Machine        = t_mach(1, 2);
-    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel r.err)          { ret 1; }
     if (b.instr_count != 4) { ret 2; }
     val lo: u32 = b.instrs[0].operands[0].vreg.n;
@@ -3506,7 +3644,7 @@ test "mach.lang.be.codegen.legalize:a_lane_join_loads_a_stack_piece" {
     f.block_count         = 1;
 
     var mach: Machine        = t_mach(1, 2);
-    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel r.err)                                                                 { ret 1; }
     if (b.instr_count != 2)                                                        { ret 2; }
     if (b.instrs[0].opcode != mir.MIR_MOV || b.instrs[0].operands[1].preg.n != 17) { ret 3; }
@@ -3547,7 +3685,7 @@ test "mach.lang.be.codegen.legalize:a_lane_pick_moves_the_lane_it_names" {
     f.block_count         = 1;
 
     var mach: Machine        = t_mach(1, 2);
-    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel r.err)          { ret 1; }
     if (b.instr_count != 4) { ret 2; }
     val lo: u32 = b.instrs[0].operands[0].vreg.n;
@@ -3590,7 +3728,7 @@ test "mach.lang.be.codegen.legalize:a_lane_pick_reads_an_immediate_or_memory_sou
     f.block_count         = 1;
 
     var mach: Machine        = t_mach(1, 2);
-    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel r.err)                                                                          { ret 1; }
     if (b.instr_count != 2)                                                                 { ret 2; }
     if (b.instrs[0].opcode != mir.MIR_MOV || b.instrs[0].operands[0].preg.n != 6)           { ret 3; }
@@ -3621,7 +3759,7 @@ test "mach.lang.be.codegen.legalize:refuses_a_malformed_lane_op" {
     b.instrs[0].src_width = 1;
     f.blocks              = ?b;
     f.block_count         = 1;
-    val r1: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val r1: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (!sel r1.err) { ret 1; }
 
     # a pick past the last lane
@@ -3641,7 +3779,7 @@ test "mach.lang.be.codegen.legalize:refuses_a_malformed_lane_op" {
     gb.instrs[1].src_width = 2;
     g.blocks               = ?gb;
     g.block_count          = 1;
-    val r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?g);
+    val r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?g, nil);
     if (!sel r2.err) { ret 2; }
     ret 0;
 }
@@ -3668,7 +3806,7 @@ test "mach.lang.be.codegen.legalize:lanes_of_a_secret_wide_value_stay_secret" {
     f.block_count = 1;
 
     var mach:                Machine        = t_mach(1, 2);
-    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel legalize_function_r.err)             { ret 1; }
     if (b.instr_count != 4 || f.vreg_count != 6) { ret 2; }
     var i: u32 = 2;
@@ -3692,7 +3830,7 @@ test "mach.lang.be.codegen.legalize:lanes_of_a_secret_wide_value_stay_secret" {
     t_instr(?alloc, ?gb, 1, mir.MIR_MOV, ?mv[0], 2, 2);
     g.blocks      = ?gb;
     g.block_count = 1;
-    val legalize_function_r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?g);
+    val legalize_function_r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?g, nil);
     if (sel legalize_function_r2.err) { ret 6; }
     i = 0;
     for (i < g.vreg_count) {
@@ -3724,7 +3862,7 @@ test "mach.lang.be.codegen.legalize:a_wide_declassify_keeps_its_barrier_per_lane
     f.block_count = 1;
 
     var mach:                Machine        = t_mach(1, 2);
-    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel legalize_function_r.err)                                            { ret 1; }
     if (b.instr_count != 4)                                                     { ret 2; }
     if (b.instrs[0].opcode != mir.MIR_MOV || b.instrs[1].opcode != mir.MIR_MOV) { ret 7; }
@@ -3744,7 +3882,7 @@ test "mach.lang.be.codegen.legalize:a_wide_declassify_keeps_its_barrier_per_lane
     t_instr(?alloc, ?gb, 1, mir.MIR_MOV, ?dc[0], 2, 2);
     g.blocks      = ?gb;
     g.block_count = 1;
-    val legalize_function_r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?g);
+    val legalize_function_r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?g, nil);
     if (sel legalize_function_r2.err)                                             { ret 5; }
     if (gb.instrs[2].opcode != mir.MIR_MOV || gb.instrs[3].opcode != mir.MIR_MOV) { ret 6; }
     ret 0;
@@ -3781,7 +3919,7 @@ test "mach.lang.be.codegen.legalize:stages_runtime_pointer_into_the_address_pair
     f.block_count = 1;
 
     var mach: Machine        = t_mach(1, 2);
-    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel r.err)           { ret 1; }
     if (b.instr_count != 15) { ret 1; }
 
@@ -3825,7 +3963,7 @@ test "mach.lang.be.codegen.legalize:value_base_is_inert_on_a_wide_pointer_target
     val before_vregs: u32           = f.vreg_count;
 
     var mach: Machine        = t_mach(8, 8);
-    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel r.err)                    { ret 1; }
     if (b.instrs != before_ptr)       { ret 1; }
     if (b.instr_count != 1)           { ret 1; }
@@ -3863,7 +4001,7 @@ test "mach.lang.be.codegen.legalize:expands_constant_wide_shift_as_a_template" {
     t_shift_fn(?alloc, ?f, ?b, mir.MIR_SHL, 4, mir.op_imm(3));
 
     var mach: Machine        = t_mach(1, 2);
-    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel r.err) { ret 1; }
 
     if (b.instr_count != 15)                  { ret 1; }
@@ -3887,7 +4025,7 @@ test "mach.lang.be.codegen.legalize:expands_constant_wide_shift_as_a_template" {
     var f1: mir.MirFunction;
     var b1: mir.MirBlock;
     t_shift_fn(?alloc, ?f1, ?b1, mir.MIR_SHR_S, 1, mir.op_imm(3));
-    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f1);
+    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f1, nil);
     if (sel legalize_function_r.err)          { ret 1; }
     if (b1.instr_count != 3)                  { ret 1; }
     if (b1.instrs[2].opcode != mir.MIR_SHR_S) { ret 1; }
@@ -3895,14 +4033,14 @@ test "mach.lang.be.codegen.legalize:expands_constant_wide_shift_as_a_template" {
     var f2: mir.MirFunction;
     var b2: mir.MirBlock;
     t_shift_fn(?alloc, ?f2, ?b2, mir.MIR_SHR_S, 2, mir.op_imm(3));
-    val legalize_function_r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f2);
+    val legalize_function_r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f2, nil);
     if (sel legalize_function_r2.err) { ret 1; }
     if (b2.instr_count != 7)          { ret 1; }
 
     var f3: mir.MirFunction;
     var b3: mir.MirBlock;
     t_shift_fn(?alloc, ?f3, ?b3, mir.MIR_SHR_S, 2, mir.op_imm(8));
-    val legalize_function_r3: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f3);
+    val legalize_function_r3: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f3, nil);
     if (sel legalize_function_r3.err)         { ret 1; }
     if (b3.instr_count != 6)                  { ret 1; }
     if (b3.instrs[3].opcode != mir.MIR_SHR_S) { ret 1; }
@@ -3932,7 +4070,7 @@ test "mach.lang.be.codegen.legalize:expands_runtime_shift_as_a_masked_barrel" {
         var b: mir.MirBlock;
         t_shift_fn(?alloc, ?f, ?b, mir.MIR_SHL, widths[w], mir.op_vreg(mir.vreg_id(2)));
         var mach:                Machine        = t_mach(1, 2);
-        val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+        val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
         if (sel legalize_function_r.err)                  { ret 1; }
         if (b.instr_count != widths[w]::u32 + 1 + shl[w]) { ret 1; }
         if (f.block_count != 1)                           { ret 1; }
@@ -3946,7 +4084,7 @@ test "mach.lang.be.codegen.legalize:expands_runtime_shift_as_a_masked_barrel" {
         var f2: mir.MirFunction;
         var b2: mir.MirBlock;
         t_shift_fn(?alloc, ?f2, ?b2, mir.MIR_SHR_S, widths[w], mir.op_vreg(mir.vreg_id(2)));
-        val legalize_function_r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f2);
+        val legalize_function_r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f2, nil);
         if (sel legalize_function_r2.err)                   { ret 1; }
         if (b2.instr_count != widths[w]::u32 + 1 + shrs[w]) { ret 1; }
         w = w + 1;
@@ -3962,13 +4100,13 @@ test "mach.lang.be.codegen.legalize:normalizes_an_out_of_range_shift_count" {
     var f3: mir.MirFunction;
     var b3: mir.MirBlock;
     t_shift_fn(?alloc, ?f3, ?b3, mir.MIR_SHL, 2, mir.op_imm(3));
-    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f3);
+    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f3, nil);
     if (sel legalize_function_r.err) { ret 1; }
 
     var f19: mir.MirFunction;
     var b19: mir.MirBlock;
     t_shift_fn(?alloc, ?f19, ?b19, mir.MIR_SHL, 2, mir.op_imm(19));
-    val legalize_function_r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f19);
+    val legalize_function_r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f19, nil);
     if (sel legalize_function_r2.err) { ret 1; }
 
     if (b19.instr_count != b3.instr_count) { ret 1; }
@@ -3988,7 +4126,7 @@ test "mach.lang.be.codegen.legalize:normalizes_an_out_of_range_shift_count" {
     var f16: mir.MirFunction;
     var b16: mir.MirBlock;
     t_shift_fn(?alloc, ?f16, ?b16, mir.MIR_SHL, 2, mir.op_imm(16));
-    val legalize_function_r3: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f16);
+    val legalize_function_r3: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f16, nil);
     if (sel legalize_function_r3.err)        { ret 1; }
     if (b16.instr_count != 5)                { ret 1; }
     if (b16.instrs[3].opcode != mir.MIR_MOV) { ret 1; }
@@ -4017,14 +4155,14 @@ test "mach.lang.be.codegen.legalize:shift_is_inert_on_a_variable_shift_machine" 
 
     var mach: Machine = t_mach(8, 8);
     mach.var_shift = true;
-    val r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel r.err)                    { ret 1; }
     if (b.instrs != before_ptr)       { ret 1; }
     if (b.instr_count != 1)           { ret 1; }
     if (f.vreg_count != before_vregs) { ret 1; }
 
     mach.var_shift = false;
-    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel legalize_function_r.err) { ret 1; }
     if (b.instrs == before_ptr)      { ret 1; }
     ret 0;
@@ -4059,7 +4197,7 @@ test "mach.lang.be.codegen.legalize:expands_wide_equality_lane_wise" {
     var f: mir.MirFunction;
     var b: mir.MirBlock;
     t_cmp_fn(?alloc, ?f, ?b, mir.MIR_CMP_EQ, 2);
-    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel legalize_function_r.err) { ret 1; }
 
     if (b.instr_count != 7)                   { ret 1; }
@@ -4075,7 +4213,7 @@ test "mach.lang.be.codegen.legalize:expands_wide_equality_lane_wise" {
     var f2: mir.MirFunction;
     var b2: mir.MirBlock;
     t_cmp_fn(?alloc, ?f2, ?b2, mir.MIR_CMP_NE, 2);
-    val legalize_function_r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f2);
+    val legalize_function_r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f2, nil);
     if (sel legalize_function_r2.err)          { ret 1; }
     if (b2.instr_count != 7)                   { ret 1; }
     if (b2.instrs[4].opcode != mir.MIR_CMP_NE) { ret 1; }
@@ -4102,7 +4240,7 @@ test "mach.lang.be.codegen.legalize:expands_wide_ordered_as_a_lexicographic_walk
     var f: mir.MirFunction;
     var b: mir.MirBlock;
     t_cmp_fn(?alloc, ?f, ?b, mir.MIR_CMP_LT_U, 2);
-    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel legalize_function_r.err) { ret 1; }
 
     if (b.instr_count != 9) { ret 1; }
@@ -4124,7 +4262,7 @@ test "mach.lang.be.codegen.legalize:expands_wide_ordered_as_a_lexicographic_walk
     var fs: mir.MirFunction;
     var bs: mir.MirBlock;
     t_cmp_fn(?alloc, ?fs, ?bs, mir.MIR_CMP_LT_S, 2);
-    val legalize_function_r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?fs);
+    val legalize_function_r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?fs, nil);
     if (sel legalize_function_r2.err)            { ret 1; }
     if (bs.instr_count != 11)                    { ret 1; }
     if (bs.instrs[4].opcode != mir.MIR_CMP_LT_U) { ret 1; }
@@ -4149,7 +4287,7 @@ test "mach.lang.be.codegen.legalize:expands_wide_ordered_as_a_lexicographic_walk
     var fl: mir.MirFunction;
     var bl: mir.MirBlock;
     t_cmp_fn(?alloc, ?fl, ?bl, mir.MIR_CMP_LE_U, 2);
-    val legalize_function_r3: err[fail.Fail] = legalize_function(?alloc, ?mach, ?fl);
+    val legalize_function_r3: err[fail.Fail] = legalize_function(?alloc, ?mach, ?fl, nil);
     if (sel legalize_function_r3.err)            { ret 1; }
     if (bl.instr_count != 10)                    { ret 1; }
     if (bl.instrs[4].opcode != mir.MIR_CMP_LT_U) { ret 1; }
@@ -4205,7 +4343,7 @@ test "mach.lang.be.codegen.legalize:pins_wide_comparison_piece_counts" {
             var f: mir.MirFunction;
             var b: mir.MirBlock;
             t_cmp_fn(?alloc, ?f, ?b, ops[r], widths[c]);
-            val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+            val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
             if (sel legalize_function_r.err)                                     { ret 1; }
             if (b.instr_count != 2 * widths[c]::u32 + want[r * 3 + c])           { ret 1; }
             if (b.instrs[b.instr_count - 1].operands[0].kind != mir.MIR_OP_VREG) { ret 1; }
@@ -4225,7 +4363,7 @@ test "mach.lang.be.codegen.legalize:leaves_a_comparison_destination_unsplit" {
     var f: mir.MirFunction;
     var b: mir.MirBlock;
     t_cmp_fn(?alloc, ?f, ?b, mir.MIR_CMP_EQ, 8);
-    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel legalize_function_r.err) { ret 1; }
 
     if (b.instrs[16].operands[0].vreg.n != 19) { ret 1; }
@@ -4275,7 +4413,7 @@ test "mach.lang.be.codegen.legalize:rejects_a_wide_comparison_of_an_unsupported_
     f.block_count = 1;
 
     val before:              *mir.MirInstr  = b.instrs;
-    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (!sel legalize_function_r.err) { ret 1; }
     if (b.instrs != before)           { ret 1; }
     if (b.instr_count != 3)           { ret 1; }
@@ -4290,7 +4428,7 @@ test "mach.lang.be.codegen.legalize:rejects_a_shift_at_a_non_power_of_two_width"
     var b: mir.MirBlock;
     t_shift_fn(?alloc, ?f, ?b, mir.MIR_SHL, 3, mir.op_vreg(mir.vreg_id(2)));
     var mach:                Machine        = t_mach(1, 2);
-    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val legalize_function_r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (!sel legalize_function_r.err) { ret 1; }
     ret 0;
 }
@@ -4317,7 +4455,7 @@ test "mach.lang.be.codegen.legalize:a_float_is_not_split_into_integer_lanes" {
     val before_vregs: u32           = f.vreg_count;
 
     var mach: Machine        = t_mach(4, 4);
-    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val r:    err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel r.err)                     { ret 1; }
     if (b.instrs != before_ptr)        { ret 1; }
     if (b.instr_count != before_count) { ret 1; }
@@ -4334,7 +4472,7 @@ test "mach.lang.be.codegen.legalize:a_float_is_not_split_into_integer_lanes" {
     gf.blocks      = ?gb;
     gf.block_count = 1;
 
-    val gr: err[fail.Fail] = legalize_function(?alloc, ?mach, ?gf);
+    val gr: err[fail.Fail] = legalize_function(?alloc, ?mach, ?gf, nil);
     if (sel gr.err)          { ret 1; }
     if (gb.instr_count != 2) { ret 1; }
     if (gf.vreg_count <= 2)  { ret 1; }
@@ -4348,7 +4486,7 @@ test "mach.lang.be.codegen.legalize:a_float_is_not_split_into_integer_lanes" {
     sf.block_count = 1;
 
     var m8: Machine        = t_mach(1, 2);
-    val sr: err[fail.Fail] = legalize_function(?alloc, ?m8, ?sf);
+    val sr: err[fail.Fail] = legalize_function(?alloc, ?m8, ?sf, nil);
     if (sel sr.err)          { ret 1; }
     if (sb.instr_count != 8) { ret 1; }
     if (sf.vreg_count <= 2)  { ret 1; }
@@ -4375,7 +4513,7 @@ test "mach.lang.be.codegen.legalize:a_float_register_operand_rides_the_float_ban
 
     val before_ptr: *mir.MirInstr  = b.instrs;
     var mach:       Machine        = t_mach(4, 4);
-    val r:          err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val r:          err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel r.err)              { ret 1; }
     if (b.instrs != before_ptr) { ret 2; }
     if (b.instr_count != 1)     { ret 3; }
@@ -4425,7 +4563,7 @@ test "mach.lang.be.codegen.legalize:open_codes_a_wide_int_float_conversion" {
     var f1: mir.MirFunction;
     var b1: mir.MirBlock;
     t_conv_fn(?alloc, ?f1, ?b1, mir.MIR_SI_TO_FP, fp, 8, 8);
-    val r1: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f1);
+    val r1: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f1, nil);
     if (sel r1.err)              { ret 1; }
     if (t_has_wide_conv(?b1, 4)) { ret 1; }
     if (b1.instr_count != 11)    { ret 1; }
@@ -4434,7 +4572,7 @@ test "mach.lang.be.codegen.legalize:open_codes_a_wide_int_float_conversion" {
     var f2: mir.MirFunction;
     var b2: mir.MirBlock;
     t_conv_fn(?alloc, ?f2, ?b2, mir.MIR_FP_TO_UI, fp, 8, 8);
-    val r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f2);
+    val r2: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f2, nil);
     if (sel r2.err)              { ret 1; }
     if (t_has_wide_conv(?b2, 4)) { ret 1; }
     if (b2.instr_count != 14)    { ret 1; }
@@ -4442,7 +4580,7 @@ test "mach.lang.be.codegen.legalize:open_codes_a_wide_int_float_conversion" {
     var f3: mir.MirFunction;
     var b3: mir.MirBlock;
     t_conv_fn(?alloc, ?f3, ?b3, mir.MIR_FP_TO_SI, fp, 8, 8);
-    val r3: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f3);
+    val r3: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f3, nil);
     if (sel r3.err)              { ret 1; }
     if (t_has_wide_conv(?b3, 4)) { ret 1; }
     if (b3.instr_count != 43)    { ret 1; }
@@ -4450,7 +4588,7 @@ test "mach.lang.be.codegen.legalize:open_codes_a_wide_int_float_conversion" {
     var f4: mir.MirFunction;
     var b4: mir.MirBlock;
     t_conv_fn(?alloc, ?f4, ?b4, mir.MIR_SI_TO_FP, fp, 4, 8);
-    val r4: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f4);
+    val r4: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f4, nil);
     if (sel r4.err)              { ret 1; }
     if (t_has_wide_conv(?b4, 4)) { ret 1; }
     if (b4.instr_count != 44)    { ret 1; }
@@ -4459,7 +4597,7 @@ test "mach.lang.be.codegen.legalize:open_codes_a_wide_int_float_conversion" {
     var b5: mir.MirBlock;
     t_conv_fn(?alloc, ?f5, ?b5, mir.MIR_SI_TO_FP, mir.REG_CLASS_GP, 8, 8);
     var m8: Machine        = t_mach(1, 2);
-    val r5: err[fail.Fail] = legalize_function(?alloc, ?m8, ?f5);
+    val r5: err[fail.Fail] = legalize_function(?alloc, ?m8, ?f5, nil);
     if (sel r5.ok) { ret 1; }
     ret 0;
 }
@@ -4478,7 +4616,7 @@ test "mach.lang.be.codegen.legalize:a_wide_conversion_is_inert_on_a_wide_alu" {
 
     var mach: Machine = t_mach(8, 8);
     mach.fp_class = fp;
-    val r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f);
+    val r: err[fail.Fail] = legalize_function(?alloc, ?mach, ?f, nil);
     if (sel r.err)                     { ret 1; }
     if (b.instrs != before_ptr)        { ret 1; }
     if (b.instr_count != before_count) { ret 1; }
