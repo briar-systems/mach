@@ -106,10 +106,16 @@ than the source alone, so they are reported at lowering:
   mode itself hardens the data dependent prefetcher and the fast store
   forwarding predictor, memory-side predictors the kernel owns, and is out of
   scope for this decision (#3623). aarch64 declares the Arm ARM's PSTATE.DIT
-  list (`madd`, `smaddl`, `umaddl`, `smulh`, `umulh`) under DIT, which no OS
-  guarantees yet (#3508), so it refuses the secret multiply today, as every
-  other ISA does. Every lane multiply is refused. `$mach.build.ct_mul(op,
-  width)` reads the same decision at comptime (see `comptime-mach.md`)
+  list (`madd`, `smaddl`, `umaddl`, `smulh`, `umulh`) under DIT: the low half
+  at 8, 16, 32 and 64 bits, both high halves at 64 and the widening product at
+  32 hold only while the processor's data-independent-timing mode is on, and a
+  row under that condition is admitted only on an operating system that
+  declares it guarantees the mode (linux and darwin do, see [PSTATE.DIT at run
+  time](#pstatedit-at-run-time)). On windows, freestanding and every other ISA
+  the secret multiply is refused, and the aarch64 refusal names the instruction
+  set's DIT rows and the operating system that declares nothing (#3508). Every
+  lane multiply is refused. `$mach.build.ct_mul(op, width)` reads the same
+  decision at comptime (see `comptime-mach.md`)
 - a secret **variable shift count** on a target without a barrel shifter
 
 A secret value passed to a variadic pack is also rejected, including a secret
@@ -508,6 +514,67 @@ experimental SPIR-V backend — **rejects `#[oblivious]`**: neither that
 translation nor the device's timing behaviour is covered by the leakage model,
 so the obligation could be neither validated nor upheld. Compile constant-time
 code for a machine target and pass such a target only public data.
+
+## PSTATE.DIT at run time
+
+An aarch64 multiply has data-independent timing only while the processor's
+DIT mode is on (Arm ARM DDI 0487, "About PSTATE.DIT"; the DIT register page of
+DDI 0601 lists the instructions: `madd`, `msub`, `smaddl`, `smsubl`, `smulh`,
+`umaddl`, `umsubl`, `umulh`). The mode is per-thread processor state that user
+code turns on with `msr dit, 1`, and a processor without FEAT_DIT has no such
+bit. So admitting the aarch64 rows takes two facts the compiler does not own,
+and the design splits them:
+
+**The operating system declares the guarantee.** A target's OS table declares,
+per instruction set, whether a process can set the mode at start, learn whether
+the processor has it, and keep it. The declaration is read through one accessor
+and never derived, and each carries its citation beside it:
+
+- **aarch64-linux declares it.** The kernel exposes the processor's FEAT_DIT as
+  `HWCAP_DIT` (`1 << 24`) in `AT_HWCAP` since v4.17 (commit 7206dc93a58f, "arm64:
+  Expose Arm v8.4 features"; `Documentation/arch/arm64/elf_hwcaps.rst`:
+  "Functionality implied by ID_AA64PFR0_EL1.DIT == 0b0001"). PSTATE is saved to
+  `SPSR_EL1` on every exception entry and restored on return, so the bit
+  outlives a context switch.
+- **aarch64-darwin declares it.** Apple's "Writing ARM64 code for Apple
+  platforms", section "Enable DIT for constant-time cryptographic operations",
+  documents the mode as per-thread state user code turns on with `msr dit, #1`
+  and reads back as bit 24 of `mrs dit`, and names the sysctl
+  `hw.optional.arm.FEAT_DIT` as the check for a processor that has it.
+- **aarch64-windows and freestanding aarch64 declare nothing**, so a `DIT_MODE`
+  row is refused there with a diagnostic that names the rows and the OS.
+
+**The compiler records the need and the runtime honours it.** The rows only say
+the instruction is safe *while the mode is on*; something must turn it on, and
+only for programs that need it. When a module's lowering admits a secret
+multiply through a `DIT_MODE` row, codegen marks the module: its object carries
+a local absolute symbol `__mach_needs_dit` (value 1) that reaches no linked
+image. When an executable is linked for a target whose OS declares the
+guarantee, the linker appends one synthetic input defining `__mach_dit_required`,
+a hidden one-byte read-only object that is `1` when any input carries the mark
+and `0` otherwise. The std start code reads that byte before `main`. When it is
+zero the program never touches DIT. When it is set, std checks that the
+processor has the mode (`HWCAP_DIT` on linux, `hw.optional.arm.FEAT_DIT` on
+darwin), turns it on with `msr dit, 1` followed by `dsb nsh; isb`, and does the
+same at the entry of every thread it creates, since the bit is per thread. A
+processor or kernel without the mode fails closed: std writes
+
+```
+std.runtime: this program contains a constant-time multiply that requires the processor's data-independent-timing mode (PSTATE.DIT), and this processor or kernel does not provide it (aarch64-linux: HWCAP_DIT absent; aarch64-darwin: hw.optional.arm.FEAT_DIT is 0); refusing to start
+```
+
+to stderr and terminates through its panic path (exit status 255) before any
+secret is multiplied.
+
+Two consequences of the design are worth knowing. The mark is per module, so a
+module that contains such a multiply sets the byte even when the linker
+dead-strips the function; the cost is one unneeded `msr`. And "a binary without
+the need carries nothing DIT-related" holds up to that one byte: the language
+has no weak import, so std reads a cell that is always defined on a declaring
+target, and a binary without the need carries it as `0`. A shared library gets
+no cell, because no start code of std's runs in one, and an object built by
+another compiler carries no mark. `$mach.build.ct_mul(op, width)` answers `1`
+for the aarch64 rows exactly where the OS declares the guarantee.
 
 ## Trusted base
 
