@@ -344,8 +344,11 @@ differential() {
             why="build $p run: $(first_error "$(log_of "$t" "$p" "$c" run)")"; return 1
         fi
         bin=$(artifact "$t" "$p" "$c" run)
-        # a wrong program may print a NUL, which a substitution would warn about
-        got=$(timeout 60 $eng "$bin" 2>"$out/log/$t.$p.$(art "$c").err" | tr -d '\0'); rc=${PIPESTATUS[0]}
+        # the status is the program's own, read before any substitution (PIPESTATUS
+        # after an assignment is the assignment's); a wrong program may print a
+        # NUL, which a substitution would warn about, so the output is filed first
+        timeout 60 $eng "$bin" >"$out/log/$t.$p.$(art "$c").out" 2>"$out/log/$t.$p.$(art "$c").err"; rc=$?
+        got=$(tr -d '\0' <"$out/log/$t.$p.$(art "$c").out")
         # a program admitting a secret multiply sets PSTATE.DIT at start and
         # refuses, with std's one-line refusal and status 255, on an aarch64
         # host without FEAT_DIT: the host cannot run it, and the cell is not a
@@ -486,7 +489,7 @@ run_case() {
             if norun "$t" "$c"; then fail "$t $c agrees with the C reference: its golden/$t/NORUN line is stale"; return; fi
         elif [ "$verdict" -eq 2 ]; then
             echo "NORUN $t $c: $why"
-            skips=$((skips + 1))
+            skips=$((skips + 1)); return
         elif norun "$t" "$c"; then
             noruns=$((noruns + 1))
         else
