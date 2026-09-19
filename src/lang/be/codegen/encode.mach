@@ -22,6 +22,7 @@ use mach.lang.be.codegen.ctwalk;
 use mach.lang.be.codegen.encoding;
 use mach.lang.be.codegen.mir;
 use mach.lang.be.codegen.notes;
+use mach.lang.diagnostic;
 use mach.lang.fail;
 use mach.lang.intern;
 use mach.lang.layout;
@@ -534,11 +535,13 @@ pub rec EncodeState {
     has_next_block:    bool;
     interner:          *intern.Interner;
     srcmap:            *source.SourceMap;
-    model:             *isa.MachineModel;
-    callee_saved:      isa.RegFileFn;
-    base_addr:         u64;
-    page_size:         u64;
-    stack_probe:       bool;
+    # the module's diagnostic store: where a refusal of the program lands
+    diags:        *diagnostic.DiagnosticStore;
+    model:        *isa.MachineModel;
+    callee_saved: isa.RegFileFn;
+    base_addr:    u64;
+    page_size:    u64;
+    stack_probe:  bool;
 }
 
 pub def EncodeFunctionFn: fun(*EncodeState, *mir.MirFunction) err[fail.Fail];
@@ -576,22 +579,25 @@ pub fun encode_module(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.MirM
     ret encode_module_asm(alloc, tgt, m, hooks, nil);
 }
 
-fun no_stream_message(m: *mir.MirModule, tgt: *isa.BackendTarget) str {
+# the refusal of the first oblivious function of a module whose encoder
+# notifies no instruction stream, located at that function's declaration
+fun no_stream_refusal(m: *mir.MirModule, tgt: *isa.BackendTarget) fail.Fail {
     var fi: u32 = 0;
     for (fi < m.function_len) {
-        if (m.functions[fi].oblivious) {
+        val f: *mir.MirFunction = ?m.functions[fi];
+        if (f.oblivious) {
             val r: res[str, format.FormatError] = format.sprint(m.alloc,
-                "codegen: #[oblivious] function `{}` cannot be compiled for the `{}` target: its encoder notifies no instruction stream, so the emitted instructions cannot be validated constant-time",
-                fn_name(m.interner, m.functions[fi].name), tgt.identity.arch_name);
-            if (sel r.ok) { ret stable_message(m, r.ok, NO_STREAM_DETAIL); }
-            ret NO_STREAM_DETAIL;
+                "#[oblivious] function `{}` cannot be compiled for the `{}` target: its encoder notifies no instruction stream, so the emitted instructions cannot be validated constant-time",
+                fn_name(m.interner, f.name), tgt.identity.arch_name);
+            if (sel r.ok) { ret mir.reject_function(m, f, stable_message(m, r.ok, NO_STREAM_DETAIL)); }
+            ret mir.reject_function(m, f, NO_STREAM_DETAIL);
         }
         fi = fi + 1;
     }
-    ret NO_STREAM_DETAIL;
+    ret fail.message(NO_STREAM_DETAIL);
 }
 
-val NO_STREAM_DETAIL: str = "codegen: an #[oblivious] function cannot be compiled for a target whose encoder notifies no instruction stream; the emitted instructions cannot be validated constant-time";
+val NO_STREAM_DETAIL: str = "an #[oblivious] function cannot be compiled for a target whose encoder notifies no instruction stream; the emitted instructions cannot be validated constant-time";
 
 fun fn_name(interner: *intern.Interner, id: intern.StrId) str {
     if (interner == nil) { ret "<unknown>"; }
@@ -610,8 +616,9 @@ fun stable_message(m: *mir.MirModule, buf: str, fallback: str) str {
     ret fallback;
 }
 
-# the post-expansion walk over one function's notifications; a refusal is
-# located at the instruction's source position and names the function
+# the post-expansion walk over one function's notifications; a refusal is an
+# error located at the refused instruction's source position, naming the
+# function, on the module's diagnostic store
 fun walk_function(st: *EncodeState, tgt: *isa.BackendTarget, hooks: *EncodeHooks, f: *mir.MirFunction) err[fail.Fail] {
     if (!sink_active(?st.buf)) {
         ret err[fail.Fail].err{fail.message("codegen: an #[oblivious] function reached the encoder with no instruction stream to validate")};
@@ -621,24 +628,20 @@ fun walk_function(st: *EncodeState, tgt: *isa.BackendTarget, hooks: *EncodeHooks
     if (sel wr.ok) { ret err[fail.Fail].ok{}; }
     var refusal: ctwalk.Refusal = wr.err;
     fin { ctwalk.refusal_free(st.alloc, ?refusal); }
-    if (st.interner == nil || refusal.detail == nil) { ret err[fail.Fail].err{fail.message(WALK_REFUSED_DETAIL)}; }
-    val rf: res[str, format.FormatError] = format.sprint(st.alloc, "codegen: #[oblivious] function `{}` {}",
+    var loc: source.SrcLoc = f.decl_loc;
+    if (refusal.index < s.note_count && source.loc_is_valid(s.notes[refusal.index].loc)) { loc = s.notes[refusal.index].loc; }
+    if (st.interner == nil || refusal.detail == nil)                                     { ret err[fail.Fail].err{mir.reject(st.diags, loc, WALK_REFUSED_DETAIL)}; }
+    val rf: res[str, format.FormatError] = format.sprint(st.alloc, "#[oblivious] function `{}` {}",
         fn_name(st.interner, f.name), refusal.detail);
-    if (sel rf.err) { ret err[fail.Fail].err{fail.message(WALK_REFUSED_DETAIL)}; }
-    val body: str = rf.ok;
-    fin { A.deallocate[u8](st.alloc, body, str_len(body) + 1); }
-    var loc: source.SrcLoc = source.loc_nil();
-    if (refusal.index < s.note_count) { loc = s.notes[refusal.index].loc; }
-    val located: str = asm_located_message(st, loc, body);
-    if (located != body) { ret err[fail.Fail].err{fail.message(located)}; }
-    val ir: res[intern.StrId, A.Error] = intern.intern(st.interner, body);
-    if (sel ir.err) { ret err[fail.Fail].err{fail.message(WALK_REFUSED_DETAIL)}; }
-    val lo: opt[str] = intern.lookup(st.interner, ir.ok);
-    if (sel lo.some) { ret err[fail.Fail].err{fail.message(lo.some)}; }
-    ret err[fail.Fail].err{fail.message(WALK_REFUSED_DETAIL)};
+    if (sel rf.err) { ret err[fail.Fail].err{fail.format_refused(rf.err)}; }
+    val body:    str       = rf.ok;
+    val refused: fail.Fail = mir.reject(st.diags, loc, body);
+    # the store copied the text; a message failure keeps the scratch copy
+    if (sel refused.reported) { A.deallocate[u8](st.alloc, body, str_len(body) + 1); }
+    ret err[fail.Fail].err{refused};
 }
 
-val WALK_REFUSED_DETAIL: str = "codegen: an #[oblivious] function was refused by the post-expansion constant-time walk";
+val WALK_REFUSED_DETAIL: str = "an #[oblivious] function was refused by the post-expansion constant-time walk";
 
 fun apply_emission_order_module(alloc: *A.Allocator, m: *mir.MirModule) err[fail.Fail] {
     var fi: u32 = 0;
@@ -704,7 +707,7 @@ pub fun encode_module_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.
     val oblivious: bool = module_has_oblivious(m);
     if (oblivious && !hooks.stream) {
         state_dnit(?st);
-        ret res[EncoderOutput, fail.Fail].err{fail.message(no_stream_message(m, tgt))};
+        ret res[EncoderOutput, fail.Fail].err{no_stream_refusal(m, tgt)};
     }
     var sink: AsmSink = sink_init(asm_out, m.interner);
     if (asm_out != nil || (hooks.stream && oblivious)) { st.buf.asm = ?sink; }
@@ -1345,6 +1348,7 @@ fun state_init(st: *EncodeState, alloc: *A.Allocator, m: *mir.MirModule, tgt: *i
     state_blank(st, alloc, ?tgt.model);
     st.interner     = m.interner;
     st.srcmap       = m.srcmap;
+    st.diags        = m.diags;
     st.callee_saved = tgt.abi.callee_saved;
     st.base_addr    = tgt.os.image_base;
     st.page_size    = tgt.os.page_size;
@@ -1394,6 +1398,7 @@ pub fun state_blank(st: *EncodeState, alloc: *A.Allocator, model: *isa.MachineMo
     st.has_next_block    = false;
     st.interner          = nil;
     st.srcmap            = nil;
+    st.diags             = nil;
 }
 
 fun state_dnit(st: *EncodeState) {

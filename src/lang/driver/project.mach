@@ -1,4 +1,6 @@
+use std.allocator.page;
 use std.collections.map;
+use std.system.panic.panic;
 use std.text.string.str_dup;
 use std.text.string.str_free;
 use std.types.bool.bool;
@@ -30,6 +32,7 @@ use mach.lang.fe.resolve;
 use mach.lang.fe.sema;
 use scx: mach.lang.fe.sema.context;
 use mach.lang.fe.token;
+use mach.lang.handle;
 use mach.lang.intern;
 use mach.lang.manifest;
 use mach.lang.me.ir;
@@ -307,10 +310,8 @@ pub rec Project {
     cache_dir:                     str;
     cache_keys:                    vector.Vector[CacheKey];
 
-    modules:    *ModuleEntry;
-    module_len: u32;
-    module_cap: u32;
-    by_fqn:     map.Map[intern.StrId, session.ModuleId];
+    modules: handle.StableChunks[ModuleEntry];
+    by_fqn:  map.Map[intern.StrId, session.ModuleId];
 
     load_status: *LoadStatus;
     load_cap:    u32;
@@ -471,8 +472,8 @@ pub fun finish_query_phase(p: *Project, operation: query.Operation,
     if (sel ended.err) { products_stand = sel ended.err.reported; }
     if (!products_stand) {
         var i: u32 = 0;
-        for (i < p.module_len) {
-            val m: *ModuleEntry = ?p.modules[i];
+        for (i < module_count(p)) {
+            val m: *ModuleEntry = module_at(p, i);
             m.a              = nil;
             m.resolve_result = nil;
             m.sema_result    = nil;
@@ -539,8 +540,8 @@ pub fun release_staged(p: *Project, m: *ModuleEntry) {
 
 pub fun release_all_staged(p: *Project) {
     var i: u32 = 0;
-    for (i < p.module_len) {
-        release_staged(p, ?p.modules[i]);
+    for (i < module_count(p)) {
+        release_staged(p, module_at(p, i));
         i = i + 1;
     }
 }
@@ -556,8 +557,8 @@ fun release_cache_operation(p: *Project) {
     p.cache_initialized        = false;
     p.cache_operation_sequence = 0;
     var i: u32 = 0;
-    for (i < p.module_len) {
-        val m: *ModuleEntry = ?p.modules[i];
+    for (i < module_count(p)) {
+        val m: *ModuleEntry = module_at(p, i);
         if (m.staged_image != nil && !m.cache_hit) { release_staged(p, m); }
         i = i + 1;
     }
@@ -571,8 +572,8 @@ pub fun dnit_project(p: *Project) {
     vector.dnit[u64](?p.gate_computed);
     map.dnit[u64, bool](?p.views_reached);
     var i: u32 = 0;
-    for (i < p.module_len) {
-        val m: *ModuleEntry = ?p.modules[i];
+    for (i < module_count(p)) {
+        val m: *ModuleEntry = module_at(p, i);
         if (m.gate_decided != nil && m.ctx.gate_count > 0) {
             A.deallocate[bool](p.alloc, m.gate_decided, m.ctx.gate_count::usize);
         }
@@ -616,9 +617,7 @@ pub fun dnit_project(p: *Project) {
         }
         i = i + 1;
     }
-    if (p.modules != nil && p.module_cap > 0) {
-        A.deallocate[ModuleEntry](p.alloc, p.modules, p.module_cap::usize);
-    }
+    handle.chunk_dnit[ModuleEntry](?p.modules);
     if (p.load_status != nil && p.load_cap > 0) {
         A.deallocate[LoadStatus](p.alloc, p.load_status, p.load_cap::usize);
     }
@@ -723,9 +722,7 @@ pub fun init_project(p: *Project, s: *session.Session) {
     p.config.req_scope_count   = 0;
     p.config.home_root         = intern.STR_NIL;
     p.config.dependency_owned  = false;
-    p.modules                  = nil;
-    p.module_len               = 0;
-    p.module_cap               = 0;
+    p.modules                  = handle.chunk_init[ModuleEntry](p.alloc);
     p.by_fqn                   = map.init[intern.StrId, session.ModuleId](p.alloc, map.hash_u32, map.eq_u32);
     p.load_status              = nil;
     p.load_cap                 = 0;
@@ -879,12 +876,65 @@ pub fun fqn_name(p: *Project, fqn: intern.StrId) str {
     ret "<?>";
 }
 
+# the loaded module count; the next ModuleId to be issued
+pub fun module_count(p: *Project) u32 {
+    ret handle.chunk_count[ModuleEntry](?p.modules)::u32;
+}
+
+# the entry behind a ModuleId the project has issued
+#
+# the store is a handle.StableChunks: an entry is written once into a fixed
+# chunk and never moves, so the pointer stays valid until dnit_project however
+# many modules load after it
+pub fun module_at(p: *Project, mid: u32) *ModuleEntry {
+    val slot: opt[*ModuleEntry] = handle.chunk_at[ModuleEntry](?p.modules, mid::usize);
+    if (sel slot.some) { ret slot.some; }
+    panic("project: module index is past the loaded modules\n");
+    ret nil;
+}
+
+fun store_fail(e: handle.Error) fail.Fail {
+    if (sel e.alloc) { ret fail.refused(e.alloc); }
+    ret fail.message(handle.text(e));
+}
+
+# make room for one more entry so the next module_append cannot fail
+pub fun module_reserve(p: *Project) err[fail.Fail] {
+    val editor_r: res[handle.ChunkEditor[ModuleEntry], handle.Error] = handle.chunk_editor[ModuleEntry](?p.modules);
+    if (sel editor_r.err) { ret err[fail.Fail].err{store_fail(editor_r.err)}; }
+    var editor: handle.ChunkEditor[ModuleEntry] = editor_r.ok;
+    fin { handle.chunk_editor_finish[ModuleEntry](?editor); }
+    val grown: err[handle.Error] = handle.chunk_grow[ModuleEntry](?editor, 1);
+    if (sel grown.err) { ret err[fail.Fail].err{store_fail(grown.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# publish an entry under the next ModuleId into the slot module_reserve made
+pub fun module_append(p: *Project, m: ModuleEntry) session.ModuleId {
+    val mid:      session.ModuleId                                   = module_count(p);
+    val editor_r: res[handle.ChunkEditor[ModuleEntry], handle.Error] = handle.chunk_editor[ModuleEntry](?p.modules);
+    if (sel editor_r.err) {
+        panic("project: module_append while the module table is being edited\n");
+        ret mid;
+    }
+    var editor: handle.ChunkEditor[ModuleEntry] = editor_r.ok;
+    fin { handle.chunk_editor_finish[ModuleEntry](?editor); }
+    val placed: res[*ModuleEntry, handle.Error] = handle.chunk_append[ModuleEntry](?editor, m);
+    if (sel placed.err) { panic("project: reserved module slot refused the append\n"); }
+    ret mid;
+}
+
+# the entry loaded under a fully qualified name
+#
+# the returned `*ModuleEntry` is stable until dnit_project: the store never
+# moves an entry when more modules load, so a holder may keep it across a
+# nested load and read the same entry afterwards
 pub fun module_by_fqn(p: *Project, fqn: intern.StrId) opt[*ModuleEntry] {
     val r: opt[*session.ModuleId] = map.get[intern.StrId, session.ModuleId](?p.by_fqn, ?fqn);
     if (sel r.none) { ret opt[*ModuleEntry].none{}; }
     val mid: session.ModuleId = @r.some;
-    if (mid::u32 >= p.module_len) { ret opt[*ModuleEntry].none{}; }
-    ret opt[*ModuleEntry].some{?p.modules[mid::u32]};
+    if (mid::u32 >= module_count(p)) { ret opt[*ModuleEntry].none{}; }
+    ret opt[*ModuleEntry].some{module_at(p, mid::u32)};
 }
 
 pub fun drop_surface(a: *A.Allocator, slot: **sema.ModuleSema) {
@@ -892,4 +942,47 @@ pub fun drop_surface(a: *A.Allocator, slot: **sema.ModuleSema) {
     scx.module_sema_dnit(@slot);
     A.deallocate[sema.ModuleSema](a, @slot, 1::usize);
     @slot = nil;
+}
+
+test "mach.lang.driver.project.module_by_fqn:pointer_stays_valid_across_growth" {
+    var a: A.Allocator;
+    page.make(?a);
+    val sr: res[session.Session, fail.Fail] = session.init(?a);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+    var p: Project;
+    init_project(?p, ?s);
+    fin { dnit_project(?p); }
+
+    val first_r: res[intern.StrId, A.Error] = intern.intern(?s.interner, "growth.first");
+    if (sel first_r.err) { ret 1; }
+    val first: intern.StrId   = first_r.ok;
+    val room:  err[fail.Fail] = module_reserve(?p);
+    if (sel room.err) { ret 1; }
+    var entry: ModuleEntry;
+    entry.fqn = first;
+    val mid:   session.ModuleId   = module_append(?p, entry);
+    val named: res[bool, A.Error] = map.insert[intern.StrId, session.ModuleId](?p.by_fqn, first, mid);
+    if (sel named.err) { ret 1; }
+    val held_o: opt[*ModuleEntry] = module_by_fqn(?p, first);
+    if (sel held_o.none) { ret 1; }
+    val held: *ModuleEntry = held_o.some;
+
+    # grow past 16, 32, 64 and 128 modules; the held pointer must not move at any boundary
+    var i: u32 = 0;
+    for (i < 200) {
+        val more: err[fail.Fail] = module_reserve(?p);
+        if (sel more.err) { ret 1; }
+        module_append(?p, ModuleEntry{});
+        val again: opt[*ModuleEntry] = module_by_fqn(?p, first);
+        if (sel again.none)     { ret 1; }
+        if (again.some != held) { ret 2; }
+        i = i + 1;
+    }
+
+    if (held.fqn != first)               { ret 3; }
+    if (module_count(?p) != 201)         { ret 3; }
+    if (module_at(?p, mid::u32) != held) { ret 2; }
+    ret 0;
 }

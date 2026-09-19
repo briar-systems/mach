@@ -4,11 +4,13 @@ use std.allocator.page;
 use fs:       std.filesystem;
 use io_error: std.io.error;
 use std.system.os;
+use std.text.string.str_dup;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
+use std.types.path;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -21,7 +23,10 @@ use std.io.writer;
 
 use mach.lang.build.outcome;
 use mach.lang.diagnostic;
+use mach.lang.driver;
+use mach.lang.driver.project;
 use mach.lang.fe.token;
+use mach.lang.manifest;
 use mach.lang.session;
 use mach.lang.source;
 
@@ -1158,4 +1163,101 @@ test "mach.cli.diagnostic.mem_sink_write:reports_only_bytes_actually_written" {
     if (sink.len != 4) { ret 2; }
 
     ret 0;
+}
+
+# a scratch project holding one source file; the caller removes the root
+fun t_scaffold(a: *A.Allocator, manifest_text: str, source_text: str) res[str, fail.Fail] {
+    val tf_r: res[fs.TempFile, fs.FsError] = fs.temp_create(a, "mach_cli_diag_codegen");
+    if (sel tf_r.err) { ret res[str, fail.Fail].err{fail.fs_refused(tf_r.err)}; }
+    var tf:    fs.TempFile       = tf_r.ok;
+    val dup_r: res[str, A.Error] = str_dup(a, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (sel dup_r.err) { ret res[str, fail.Fail].err{fail.refused(dup_r.err)}; }
+    val root: str = dup_r.ok;
+
+    val made: err[fs.FsError] = fs.create_dir_all(a, root, 0o755);
+    if (sel made.err) { ret res[str, fail.Fail].err{fail.fs_refused(made.err)}; }
+    val src_dir_r: res[str, A.Error] = path.join(a, root, "src");
+    if (sel src_dir_r.err) { ret res[str, fail.Fail].err{fail.refused(src_dir_r.err)}; }
+    val made_src: err[fs.FsError] = fs.create_dir_all(a, src_dir_r.ok, 0o755);
+    if (sel made_src.err) { ret res[str, fail.Fail].err{fail.fs_refused(made_src.err)}; }
+
+    val manifest_path_r: res[str, A.Error] = path.join(a, root, "mach.toml");
+    if (sel manifest_path_r.err) { ret res[str, fail.Fail].err{fail.refused(manifest_path_r.err)}; }
+    val wrote_manifest: err[fs.FsError] = fs.write_bytes(manifest_path_r.ok, manifest_text::*u8, str_len(manifest_text), 0o644);
+    if (sel wrote_manifest.err) { ret res[str, fail.Fail].err{fail.fs_refused(wrote_manifest.err)}; }
+    val source_path_r: res[str, A.Error] = path.join(a, src_dir_r.ok, "main.mach");
+    if (sel source_path_r.err) { ret res[str, fail.Fail].err{fail.refused(source_path_r.err)}; }
+    val wrote_source: err[fs.FsError] = fs.write_bytes(source_path_r.ok, source_text::*u8, str_len(source_text), 0o644);
+    if (sel wrote_source.err) { ret res[str, fail.Fail].err{fail.fs_refused(wrote_source.err)}; }
+    ret res[str, fail.Fail].ok{root};
+}
+
+# the tally counts a diagnostic the back half raised: an `#[oblivious]` function
+# whose inline asm branches on a loaded secret word is refused by codegen, and
+# the refusal is one located error on the store, so the rendered outcome ends
+# `1 error / 0 warnings` and the exit code is the user's, not `0 errors` beside
+# a nonzero exit (#3656)
+test "mach.cli.diagnostic.render_outcome_w:the_tally_counts_a_codegen_rejection" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+
+    val manifest_text: str = "[project]\nmach = \">=5\"\nid = \"ctdiag\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[profile.debug]\ndefault = true\nopt = 0\ndebug = false\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n\n[artifact.ctdiag]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/ctdiag\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
+    val source_text:   str = "#[oblivious]\nfun f(k: *^u64) ^u64 {\n    var r: ^u64 = @k;\n    asm x86_64 {\n        mov rax, {r}\n        inc rax\n        je 1f\n    1:\n        nop\n    }\n    ret r;\n}\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n";
+
+    val root_r: res[str, fail.Fail] = t_scaffold(?a, manifest_text, source_text);
+    if (sel root_r.err) { ret 2; }
+    val root: str = root_r.ok;
+    fin { fs.remove_all(?a, root); }
+
+    val session_r: res[session.Session, fail.Fail] = session.init(?a);
+    if (sel session_r.err) { ret 3; }
+    var s: session.Session = session_r.ok;
+    fin { session.dnit(?s); }
+    val registered: err[outcome.Fail] = driver.setup_registry(s.registry);
+    if (sel registered.err) { ret 4; }
+
+    var pick: manifest.Selection;
+    pick.target       = "linux";
+    pick.profile      = "";
+    pick.artifact     = "";
+    pick.want_lib     = false;
+    pick.has_artifact = false;
+    val project_r: res[project.Project, outcome.Fail] = driver.build_project(?s, root, ?pick);
+    if (sel project_r.err) { ret 5; }
+    var p: project.Project = project_r.ok;
+    fin { project.dnit_project(?p); }
+
+    val checked: err[outcome.Fail] = driver.run_sema_pass(?p);
+    if (sel checked.err) { ret 6; }
+    val lowered: err[outcome.Fail] = driver.run_lower_pass(?p);
+    if (sel lowered.err) { ret 7; }
+    val generated: err[outcome.Fail] = driver.run_codegen_pass(?p);
+    if (sel generated.ok) { ret 8; }
+    var failure: outcome.Fail = generated.err;
+
+    # the outcome the engine would hand the renderer: the failure, then the
+    # session's diagnostics
+    var bo: outcome.BuildOutcome = outcome.outcome_init(?a);
+    fin { outcome.outcome_dnit(?bo); }
+    val failed: err[A.Error] = outcome.record_fail(?bo, ?failure);
+    if (sel failed.err) { ret 9; }
+    outcome.fold_fail(?bo, ?failure);
+    val recorded: err[outcome.Fail] = outcome.record_diagnostics(?bo, ?s.sources, ?s.diags);
+    if (sel recorded.err) { ret 10; }
+
+    var buf:  [4096]u8;
+    var sink: MemSink;
+    var w:    writer.Writer;
+    mem_writer(?w, ?sink, ?buf[0], 4096);
+    render_outcome_w(?w, ?bo, false);
+
+    var bad: i32 = 0;
+    if (!sink_contains(?sink, "error: #[oblivious] function `ctdiag.main.f` branches on a secret value")) { bad = 11; }
+    if (!sink_contains(?sink, "main.mach:4:5"))                                                           { bad = 12; }
+    if (!sink_contains(?sink, "\n1 error / 0 warnings\n"))                                                { bad = 13; }
+    if (sink_contains(?sink, "0 errors"))                                                                 { bad = 14; }
+    if (outcome_code_w(?w, ?bo) != 1)                                                                     { bad = 15; }
+    ret bad;
 }
