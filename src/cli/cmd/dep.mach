@@ -50,16 +50,34 @@ use mach.lang.version;
 
 val MANIFEST: str = manifest.MANIFEST_FILE;
 
+# one declared dependency of the closure. `via_release` marks a declaration read
+# from a manifest reached through a release-selected edge, whose requirements the
+# resolver reads itself from the chosen release; every other declaration is the
+# closure's own. `seed` is the commit the declaring dependency's committed gitlink
+# holds for a range it declares, its own pin, "" when it has none
 rec DepReq {
-    id:        str;
-    url:       str;
-    src_path:  str;
-    ref:       str;
-    version:   str;
-    chain:     str;
-    root_decl: bool;
-    is_git:    bool;
-    effect:    str;
+    id:          str;
+    url:         str;
+    src_path:    str;
+    ref:         str;
+    version:     str;
+    chain:       str;
+    root_decl:   bool;
+    is_git:      bool;
+    via_release: bool;
+    seed:        str;
+    effect:      str;
+}
+
+# a release-selected git dependency: its requirements are the chosen release's
+fun selects_release(r: *DepReq) bool {
+    ret r.is_git && is_ranged(r);
+}
+
+# a manifest reached through `parent` is read through a release when the parent
+# was, or is one
+fun reached_via_release(parent: *DepReq) bool {
+    ret parent.via_release || selects_release(parent);
 }
 
 # `mach dep`: route to one action: list, add, remove, update, pull, verify, or the
@@ -144,6 +162,26 @@ pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64 {
 # realize the dependency closure of a project: clone or link every declared dependency
 # transitively, check each realized manifest's project id against its declared name, and
 # report realized directories under dep/ that are no longer in the closure
+#
+# the closure is one walk over every edge kind: the root's declarations, then the
+# declarations of each realized dependency, whether it was reached by a version range, a
+# git ref or a path. the root's dep/ holds every identity once, and a version range any
+# project in the closure declares is pinned there:
+#
+# - a range's pin is a committed gitlink. for a repository root it is the root's own
+#   gitlink at dep/<id>; for a subproject, a project in a subdirectory of a repository, it
+#   is the gitlink the enclosing repository commits under the subproject's prefix. pull
+#   realizes the gitlink's commit on a fresh clone and restores a checkout that drifted
+#   from it, and update stages the moved gitlink. a subproject with no gitlink for a
+#   dependency gets a plain clone, as a project outside any repository does
+# - a range a dependency declares resolves with the root's own (mach dep add, mach dep
+#   update), whether the dependency was reached by a ref or a path: when the root holds no
+#   checkout of the identity yet, it is seeded by the dependency's committed gitlink for it,
+#   update --all moves it to the highest release every range admits, and a root declaration
+#   of the same identity overrides it
+# - a range with neither a gitlink nor a checkout under the root is refused here with
+#   `run mach dep update <root> <id>`, which pins it whether the root or a dependency
+#   declares it
 # ---
 # root:  the project root directory
 # quiet: suppress progress lines
@@ -267,7 +305,7 @@ fun realize_closure(s: *session.Session, a: *A.Allocator, root: str, reqs: *Vect
     var root_id: str = key_text(mt, "project.id");
     if (str_empty(root_id)) { root_id = "(project)"; }
 
-    val seed_r: err[outcome.Fail] = enqueue(a, reqs, root, mt, root_id, true);
+    val seed_r: err[outcome.Fail] = enqueue(a, reqs, root, mt, root_id, true, false);
     if (sel seed_r.err) {
         err_line(outcome.describe(seed_r.err));
         ret 1;
@@ -330,7 +368,7 @@ fun realize_closure(s: *session.Session, a: *A.Allocator, root: str, reqs: *Vect
             ret 1;
         }
 
-        val child_r: err[outcome.Fail] = enqueue(a, reqs, dep_full, ?sub, reqs.data[i].chain, false);
+        val child_r: err[outcome.Fail] = enqueue(a, reqs, dep_full, ?sub, reqs.data[i].chain, false, reached_via_release(?reqs.data[i]));
         if (sel child_r.err) {
             err_line(outcome.describe(child_r.err));
             ret 1;
@@ -386,19 +424,23 @@ pub fun unpinned_refusal(a: *A.Allocator, root: str, id: str, version: str) str 
 
 fun ensure_realized(s: *session.Session, a: *A.Allocator, root: str, r: *DepReq,
     mode: u8, quiet: bool) i64 {
-    if (r.is_git && is_ranged(r) && str_empty(r.ref)) {
-        val full: res[str, outcome.Fail] = deps.dep_full_of(a, root, r.id);
-        if (sel full.err) { ret err_oom(); }
-        val present: res[bool, io_error.Error] = fs.exists(full.ok);
-        str_free(a, full.ok);
-        if (!(sel present.ok && present.ok)) {
+    if (r.is_git) {
+        val observed: res[deps.GitSlot, outcome.Fail] = deps.observe_git_slot(s, root, r.id, mode);
+        if (sel observed.err) {
+            err_line(outcome.describe(observed.err));
+            ret 3;
+        }
+        var slot: deps.GitSlot = observed.ok;
+        fin { deps.git_slot_dnit(s.build_alloc, ?slot); }
+        # a range has no selector of its own: its pin is the recorded gitlink, or
+        # the checkout already there; with neither there is nothing to realize
+        val pinned: opt[str] = slot.gitlink;
+        if (is_ranged(r) && str_empty(r.ref) && (sel pinned.none) && slot.tree != deps.SLOT_CHECKOUT) {
             print.eprintlnf("error: {}", unpinned_refusal(a, root, r.id, r.version));
             ret 1;
         }
-    }
-    if (r.is_git) {
         var effect: u8 = deps.REALIZED_NOTHING;
-        ret realize_git_request(s, a, root, r, mode, false, quiet, ?effect);
+        ret realize_git_slot_request(s, a, root, r, mode, false, quiet, ?effect, ?slot);
     }
     val dep_full_r: res[str, outcome.Fail] = deps.dep_full_of(a, root, r.id);
     if (sel dep_full_r.err) { ret err_oom(); }
@@ -437,12 +479,18 @@ fun realize_git_request(s: *session.Session, a: *A.Allocator, root: str, r: *Dep
     }
     var slot: deps.GitSlot = observed.ok;
     fin { deps.git_slot_dnit(s.build_alloc, ?slot); }
-    val refused: err[outcome.Fail] = deps.refuse_git_slot(s, root, r.id, mode, ?slot, accept);
+    ret realize_git_slot_request(s, a, root, r, mode, accept, quiet, effect, ?slot);
+}
+
+# realize an observed slot and report what changed
+fun realize_git_slot_request(s: *session.Session, a: *A.Allocator, root: str, r: *DepReq,
+    mode: u8, accept: bool, quiet: bool, effect: *u8, slot: *deps.GitSlot) i64 {
+    val refused: err[outcome.Fail] = deps.refuse_git_slot(s, root, r.id, mode, slot, accept);
     if (sel refused.err) {
         err_line(outcome.describe(refused.err));
         ret 1;
     }
-    val realized: res[u8, outcome.Fail] = deps.realize_git_slot(s, root, r.id, r.url, r.ref, mode, ?slot);
+    val realized: res[u8, outcome.Fail] = deps.realize_git_slot(s, root, r.id, r.url, r.ref, mode, slot);
     if (sel realized.err) {
         err_line(outcome.describe(realized.err));
         ret 3;
@@ -498,6 +546,7 @@ fun free_request(a: *A.Allocator, request: *DepReq) {
     str_free(a, request.ref);
     if (request.version != nil) { str_free(a, request.version); }
     str_free(a, request.chain);
+    if (request.seed != nil) { str_free(a, request.seed); }
 }
 
 fun free_requests(a: *A.Allocator, requests: *Vector[DepReq]) {
@@ -510,7 +559,7 @@ fun free_requests(a: *A.Allocator, requests: *Vector[DepReq]) {
 }
 
 fun enqueue(a: *A.Allocator, reqs: *Vector[DepReq], manifest_dir: str, mt: *toml.Table,
-    chain: str, root_decl: bool) err[outcome.Fail] {
+    chain: str, root_decl: bool, via_release: bool) err[outcome.Fail] {
     val deps_t_o: opt[*toml.Table] = toml.get_table(mt, "dep");
     if (sel deps_t_o.none) { ret err[outcome.Fail].ok{}; }
     val deps_t: *toml.Table = deps_t_o.some;
@@ -545,8 +594,10 @@ fun enqueue(a: *A.Allocator, reqs: *Vector[DepReq], manifest_dir: str, mt: *toml
         }
         r.id = own(a, key);
         if (r.id == nil) { ret err[outcome.Fail].err{outcome.user("out of memory")}; }
-        r.root_decl = root_decl;
-        r.is_git    = has_git;
+        r.root_decl   = root_decl;
+        r.is_git      = has_git;
+        r.via_release = via_release;
+        r.seed        = nil;
         if (has_git) {
             r.url     = own(a, git_src);
             r.ref     = own(a, key_text(?value.data.table, "ref"));
@@ -633,8 +684,32 @@ fun print_notes(r: *Resolution) {
     }
 }
 
-# resolve every identity the root reaches through a version range. locks keep each realized
-# version-selected checkout where it is unless `unlocked` names it or `lock` is false
+fun str_listed(list: *Vector[str], id: str) bool {
+    var i: usize = 0;
+    for (i < list.len) {
+        if (str_equals(list.data[i], id)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun lock_listed(locks: *Vector[resolver.Lock], id: str) bool {
+    var i: usize = 0;
+    for (i < locks.len) {
+        if (str_equals(locks.data[i].id, id)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# resolve every identity the closure reaches through a version range: the root's
+# own ranges and every range a dependency reached by a ref or a path declares,
+# read from the same closure walk `pull` realizes. an identity the root or such a
+# dependency selects by ref or path is fixed, and a requirement on it is
+# overridden. locks keep each realized version-selected checkout where it is
+# unless `unlocked` names it or `lock` is false; an identity with no checkout yet
+# is seeded by the committed gitlink of the dependency declaring it, when one
+# exists and the range admits it, so a dependency pulls its own tested pin in
 fun resolve_versions(s: *session.Session, a: *A.Allocator, root: str, table: *toml.Table,
     lowest: bool, offline: bool, lock: bool, unlocked: str) res[Resolution, outcome.Fail] {
     var out:    Resolution                           = Resolution{picks: vector.init[resolver.Choice](a), ranged: false, notes: vector.init[str](a)};
@@ -642,35 +717,51 @@ fun resolve_versions(s: *session.Session, a: *A.Allocator, root: str, table: *to
     if (sel parsed.err) { ret res[Resolution, outcome.Fail].err{parsed.err}; }
     var m: manifest.Manifest = parsed.ok;
     fin { manifest.dnit(?m, a); }
-    var needs:    Vector[resolver.Need]                 = vector.init[resolver.Need](a);
-    var fixed:    Vector[str]                           = vector.init[str](a);
-    var fixed_by: Vector[str]                           = vector.init[str](a);
-    var locks:    Vector[resolver.Lock]                 = vector.init[resolver.Lock](a);
-    val gc_r:     res[deps.GitCandidates, outcome.Fail] = deps.git_candidates_init(s, offline, "");
+    var needs:     Vector[resolver.Need]                 = vector.init[resolver.Need](a);
+    var fixed:     Vector[str]                           = vector.init[str](a);
+    var fixed_by:  Vector[str]                           = vector.init[str](a);
+    var fixed_who: Vector[str]                           = vector.init[str](a);
+    var locks:     Vector[resolver.Lock]                 = vector.init[resolver.Lock](a);
+    val gc_r:      res[deps.GitCandidates, outcome.Fail] = deps.git_candidates_init(s, offline, "");
     if (sel gc_r.err) { ret res[Resolution, outcome.Fail].err{gc_r.err}; }
     var gc: deps.GitCandidates = gc_r.ok;
     fin { deps.git_candidates_dnit(?gc); }
     gc.local_root = root;
     gc.root       = ?m;
-    var i: u32 = 0;
-    for (i < m.dep_count) {
-        val d:    *manifest.DepDef = ?m.deps[i];
-        val name: str              = intern_str(s, d.name);
+    var root_id: str = key_text(table, "project.id");
+    if (str_empty(root_id)) { root_id = "(project)"; }
+
+    var closure: Vector[DepReq] = vector.init[DepReq](a);
+    fin { free_requests(a, ?closure); }
+    val walked: err[outcome.Fail] = preflight_closure(s, a, root, table, ?closure, true);
+    if (sel walked.err) { ret res[Resolution, outcome.Fail].err{walked.err}; }
+
+    # fixed identities first: a range on one of them is overridden
+    var i: usize = 0;
+    for (i < closure.len) {
+        val r: *DepReq = ?closure.data[i];
         i = i + 1;
-        if (d.version == intern.STR_NIL) {
-            vector.push[str](?fixed, name);
-            var by: res[str, format.FormatError];
-            if (d.git == intern.STR_NIL) { by = format.sprint(a, "path \"{}\"", intern_str(s, d.path)); }
-            or                           { by = format.sprint(a, "ref \"{}\"", intern_str(s, d.ref)); }
-            if (sel by.err)              { ret res[Resolution, outcome.Fail].err{outcome.user(outcome.format_text(by.err))}; }
-            vector.push[str](?fixed_by, by.ok);
-            cnt;
-        }
-        val url: str = intern_str(s, d.git);
-        vector.push[resolver.Need](?needs, resolver.Need{id: name, url: url, range: intern_str(s, d.version)});
-        val full: res[str, outcome.Fail] = deps.dep_full_of(a, root, name);
+        if (r.via_release || selects_release(r)) { cnt; }
+        vector.push[str](?fixed, r.id);
+        var by: res[str, format.FormatError];
+        if (!r.is_git)  { by = format.sprint(a, "path \"{}\"", r.src_path); }
+        or              { by = format.sprint(a, "ref \"{}\"", r.ref); }
+        if (sel by.err) { ret res[Resolution, outcome.Fail].err{outcome.user(outcome.format_text(by.err))}; }
+        vector.push[str](?fixed_by, by.ok);
+        var who: str = root_id;
+        if (!r.root_decl) { who = r.chain; }
+        vector.push[str](?fixed_who, who);
+    }
+    i = 0;
+    for (i < closure.len) {
+        val r: *DepReq = ?closure.data[i];
+        i = i + 1;
+        if (r.via_release || !selects_release(r)) { cnt; }
+        if (str_listed(?fixed, r.id))             { cnt; }
+        vector.push[resolver.Need](?needs, resolver.Need{id: r.id, url: r.url, range: r.version});
+        val full: res[str, outcome.Fail] = deps.dep_full_of(a, root, r.id);
         if (sel full.ok) {
-            val noted: err[outcome.Fail] = deps.git_candidates_add_local(?gc, url, full.ok);
+            val noted: err[outcome.Fail] = deps.git_candidates_add_local(?gc, r.url, full.ok);
             if (sel noted.err) { ret res[Resolution, outcome.Fail].err{noted.err}; }
         }
     }
@@ -693,9 +784,19 @@ fun resolve_versions(s: *session.Session, a: *A.Allocator, root: str, table: *to
                 }
             }
         }
+        # a range with no checkout yet starts at the declaring dependency's own pin
+        i = 0;
+        for (i < closure.len) {
+            val r: *DepReq = ?closure.data[i];
+            i = i + 1;
+            if (r.seed == nil || str_empty(r.seed))            { cnt; }
+            if (unlocked != nil && str_equals(r.id, unlocked)) { cnt; }
+            if (lock_listed(?locks, r.id))                     { cnt; }
+            val at: res[str, outcome.Fail] = deps.release_for_commit(?gc, r.url, r.seed);
+            if (sel at.err)        { ret res[Resolution, outcome.Fail].err{at.err}; }
+            if (!str_empty(at.ok)) { vector.push[resolver.Lock](?locks, resolver.Lock{id: r.id, version: at.ok}); }
+        }
     }
-    var root_id: str = key_text(table, "project.id");
-    if (str_empty(root_id)) { root_id = "(project)"; }
     var problem: resolver.Problem = resolver.Problem{root: root_id, needs: needs.data, need_count: needs.len::u32,
         fixed: fixed.data, fixed_count: fixed.len::u32, compiler: version.MACH_VERSION, lowest: lowest,
         locks: locks.data, lock_count: locks.len::u32};
@@ -704,15 +805,16 @@ fun resolve_versions(s: *session.Session, a: *A.Allocator, root: str, table: *to
     if (sel solved.err) { ret res[Resolution, outcome.Fail].err{solved.err}; }
     out.picks = solved.ok;
     if (fixed.len > 0) {
-        val noted: err[outcome.Fail] = note_overrides(a, ?gc, root_id, ?out.picks, ?fixed, ?fixed_by, ?out.notes);
+        val noted: err[outcome.Fail] = note_overrides(a, ?gc, root_id, ?out.picks, ?fixed, ?fixed_by, ?fixed_who, ?out.notes);
         if (sel noted.err) { ret res[Resolution, outcome.Fail].err{noted.err}; }
     }
     ret res[Resolution, outcome.Fail].ok{out};
 }
 
-# name every requirement of a chosen release that a root `ref` or `path` overrides (#3496 section 4)
+# name every requirement of a chosen release that a `ref` or `path` declaration overrides,
+# the root's or one along the closure's fixed edges (#3496 section 4)
 fun note_overrides(a: *A.Allocator, gc: *deps.GitCandidates, root_id: str, picks: *Vector[resolver.Choice],
-    fixed: *Vector[str], fixed_by: *Vector[str], notes: *Vector[str]) err[outcome.Fail] {
+    fixed: *Vector[str], fixed_by: *Vector[str], fixed_who: *Vector[str], notes: *Vector[str]) err[outcome.Fail] {
     var i: usize = 0;
     for (i < picks.len) {
         val pick: *resolver.Choice = ?picks.data[i];
@@ -731,7 +833,7 @@ fun note_overrides(a: *A.Allocator, gc: *deps.GitCandidates, root_id: str, picks
             for (f < fixed.len) {
                 if (str_equals(fixed.data[f], need.id)) {
                     val line: res[str, format.FormatError] = format.sprint(a, "{} declares {} by {}, overriding {} -> {} {} requires {} {}",
-                        root_id, need.id, fixed_by.data[f], root_id, pick.id, pick.version, need.id, need.range);
+                        fixed_who.data[f], need.id, fixed_by.data[f], root_id, pick.id, pick.version, need.id, need.range);
                     if (sel line.err) { ret err[outcome.Fail].err{outcome.user(outcome.format_text(line.err))}; }
                     vector.push[str](notes, line.ok);
                 }
@@ -778,7 +880,12 @@ fun realize_picks(s: *session.Session, a: *A.Allocator, root: str, mode: u8, pic
             err_line(outcome.describe(fr.err));
             ret 3;
         }
-        if (mode == deps.REALIZE_REPO_ROOT) {
+        val recorded: res[bool, outcome.Fail] = deps.gitlink_recorded(s, root, pick.id, mode);
+        if (sel recorded.err) {
+            err_line(outcome.describe(recorded.err));
+            ret 2;
+        }
+        if (recorded.ok) {
             val st: err[outcome.Fail] = deps.stage_dependency(s, root, pick.id);
             if (sel st.err) {
                 err_line(outcome.describe(st.err));
@@ -1010,6 +1117,9 @@ fun report_dep_effects(reqs: *Vector[DepReq]) {
     }
 }
 
+# update: the fixed selectors move first (a ref is fetched and checked out, a path is
+# copied again), so their manifests are the closure's when the version ranges resolve;
+# then every chosen release is realized and the closure is pulled
 fun update_apply(s: *session.Session, a: *A.Allocator, root: str, mode: u8, all: bool,
     name: *u8, quiet: bool, fail_after: i32, lowest: bool, offline: bool) i64 {
     val mt_path_r: res[str, A.Error] = path.join(a, root, MANIFEST);
@@ -1025,19 +1135,34 @@ fun update_apply(s: *session.Session, a: *A.Allocator, root: str, mode: u8, all:
     fin { free_requests(a, ?reqs); }
     var root_id: str = key_text(?mt, "project.id");
     if (str_empty(root_id)) { root_id = "(project)"; }
-    val seed_r: err[outcome.Fail] = enqueue(a, ?reqs, root, ?mt, root_id, true);
+    val seed_r: err[outcome.Fail] = enqueue(a, ?reqs, root, ?mt, root_id, true, false);
     if (sel seed_r.err) {
         err_line(outcome.describe(seed_r.err));
         ret 1;
     }
+    var known: Vector[DepReq] = vector.init[DepReq](a);
+    fin { free_requests(a, ?known); }
+    var complete: bool = false;
+    fin {
+        if (!complete) {
+            report_dep_effects(?reqs);
+            report_dep_effects(?known);
+        }
+    }
 
     # a name the root does not declare is looked up in the realized closure
-    val transitive: bool           = !all && req_index(?reqs, name::str) < 0;
-    var known:      Vector[DepReq] = vector.init[DepReq](a);
-    fin { free_requests(a, ?known); }
-    val preflight: err[outcome.Fail] = preflight_closure(s, a, root, ?mt, ?known, transitive);
+    val transitive: bool = !all && req_index(?reqs, name::str) < 0;
+    if (!transitive) {
+        val advanced: i64 = advance_fixed(s, a, root, mode, ?reqs, all, name, quiet, fail_after);
+        if (advanced != 0) { ret advanced; }
+    }
+    val preflight: err[outcome.Fail] = preflight_closure(s, a, root, ?mt, ?known, true);
     if (sel preflight.err) {
         err_line(outcome.describe(preflight.err));
+        ret 1;
+    }
+    if (transitive && req_index(?known, name::str) < 0) {
+        print.eprintlnf("error: dependency '{}' is not in the dependency closure", name::str);
         ret 1;
     }
     # version ranges resolve together; naming one unlocks only that identity
@@ -1050,27 +1175,38 @@ fun update_apply(s: *session.Session, a: *A.Allocator, root: str, mode: u8, all:
     }
     var update_notes: Resolution = resolved.ok;
     if (!quiet) { print_notes(?update_notes); }
-    var picks:   Vector[resolver.Choice] = resolved.ok.picks;
-    val picked:  bool                    = !all && pick_index(?picks, name::str) >= 0;
-    var targets: *Vector[DepReq]         = ?reqs;
+    var picks:  Vector[resolver.Choice] = resolved.ok.picks;
+    val picked: bool                    = !all && pick_index(?picks, name::str) >= 0;
     if (transitive && !picked) {
-        if (req_index(?known, name::str) < 0) {
-            print.eprintlnf("error: dependency '{}' is not in the dependency closure", name::str);
-            ret 1;
-        }
-        targets = ?known;
-    }
-    var complete: bool = false;
-    fin {
-        if (!complete) { report_dep_effects(targets); }
+        val advanced: i64 = advance_fixed(s, a, root, mode, ?known, false, name, quiet, fail_after);
+        if (advanced != 0) { ret advanced; }
     }
 
+    val moved: i64 = realize_picks(s, a, root, mode, ?picks, quiet);
+    if (moved != 0) { ret moved; }
+
+    var closure: Vector[DepReq] = vector.init[DepReq](a);
+    fin { free_requests(a, ?closure); }
+    val rc: i64 = realize_closure(s, a, root, ?closure, quiet, false, nil, ?picks);
+    if (rc != 0) { ret rc; }
+    if (fail_after == 3) {
+        err_line("injected dependency closure failure");
+        ret 1;
+    }
+    complete = true;
+    ret 0;
+}
+
+# move every fixed selector among `targets` (all of them, or the one `name` names): a path
+# is copied again, a git ref is fetched and checked out, and a recorded gitlink is staged
+fun advance_fixed(s: *session.Session, a: *A.Allocator, root: str, mode: u8, targets: *Vector[DepReq],
+    all: bool, name: *u8, quiet: bool, fail_after: i32) i64 {
     var i: usize = 0;
     for (i < targets.len) {
         val r: *DepReq = ?targets.data[i];
         i = i + 1;
         if (!all && !str_equals(r.id, name::str)) { cnt; }
-        if (r.is_git && is_ranged(r))             { cnt; }
+        if (selects_release(r))                   { cnt; }
 
         val dep_full_r: res[str, outcome.Fail] = deps.dep_full_of(a, root, r.id);
         if (sel dep_full_r.err) { ret err_oom(); }
@@ -1110,14 +1246,19 @@ fun update_apply(s: *session.Session, a: *A.Allocator, root: str, mode: u8, all:
             err_line("injected dependency checkout failure");
             ret 1;
         }
-        if (mode == deps.REALIZE_REPO_ROOT) {
+        val recorded: res[bool, outcome.Fail] = deps.gitlink_recorded(s, root, r.id, mode);
+        if (sel recorded.err) {
+            err_line(outcome.describe(recorded.err));
+            ret 2;
+        }
+        if (recorded.ok) {
             val st: err[outcome.Fail] = deps.stage_dependency(s, root, r.id);
             if (sel st.err) {
                 err_line(outcome.describe(st.err));
                 ret 2;
             }
+            r.effect = "checked out and staged the requested selector";
         }
-        if (mode == deps.REALIZE_REPO_ROOT) { r.effect = "checked out and staged the requested selector"; }
         if (fail_after == 2) {
             err_line("injected dependency staging failure");
             ret 1;
@@ -1139,19 +1280,6 @@ fun update_apply(s: *session.Session, a: *A.Allocator, root: str, mode: u8, all:
             }
         }
     }
-
-    val moved: i64 = realize_picks(s, a, root, mode, ?picks, quiet);
-    if (moved != 0) { ret moved; }
-
-    var closure: Vector[DepReq] = vector.init[DepReq](a);
-    fin { free_requests(a, ?closure); }
-    val rc: i64 = realize_closure(s, a, root, ?closure, quiet, false, nil, ?picks);
-    if (rc != 0) { ret rc; }
-    if (fail_after == 3) {
-        err_line("injected dependency closure failure");
-        ret 1;
-    }
-    complete = true;
     ret 0;
 }
 
@@ -1299,7 +1427,7 @@ fun preflight_closure(s: *session.Session, a: *A.Allocator, root: str, table: *t
     manifest.dnit(?parsed, a);
     var root_id: str = key_text(table, "project.id");
     if (str_empty(root_id)) { root_id = "(project)"; }
-    val seeded: err[outcome.Fail] = enqueue(a, reqs, root, table, root_id, true);
+    val seeded: err[outcome.Fail] = enqueue(a, reqs, root, table, root_id, true, false);
     if (sel seeded.err) { ret seeded; }
     var i: usize = 0;
     for (i < reqs.len) {
@@ -1329,10 +1457,84 @@ fun preflight_closure(s: *session.Session, a: *A.Allocator, root: str, table: *t
         fin { toml.dnit(a, ?dependency); }
         val identity: err[outcome.Fail] = deps.check_dep_identity(s, request.id, key_text(?dependency, "project.id"));
         if (sel identity.err) { ret identity; }
-        val more: err[outcome.Fail] = enqueue(a, reqs, source, ?dependency, request.chain, false);
+        val first_child: usize             = reqs.len;
+        val more:        err[outcome.Fail] = enqueue(a, reqs, source, ?dependency, request.chain, false, reached_via_release(?request));
         if (sel more.err) { ret more; }
+        # a range this dependency declares is seeded by the pin its own repository commits for it
+        if (!reached_via_release(?request)) {
+            val seeded_children: err[outcome.Fail] = seed_from_source(s, a, source, reqs, first_child);
+            if (sel seeded_children.err) { ret seeded_children; }
+        }
     }
     ret err[outcome.Fail].ok{};
+}
+
+# the committed gitlink of `source`, a dependency's own repository, for each range
+# it declares from `first` on; a source in no repository, or without a gitlink for
+# the identity, seeds nothing
+fun seed_from_source(s: *session.Session, a: *A.Allocator, source: str, reqs: *Vector[DepReq], first: usize) err[outcome.Fail] {
+    var k:   usize = first;
+    var any: bool  = false;
+    for (k < reqs.len) {
+        if (selects_release(?reqs.data[k]) && str_empty(reqs.data[k].ref)) { any = true; }
+        k = k + 1;
+    }
+    if (!any) { ret err[outcome.Fail].ok{}; }
+    val inside: res[bool, outcome.Fail] = deps.inside_work_tree(s, source);
+    if (sel inside.err) { ret err[outcome.Fail].err{inside.err}; }
+    if (!inside.ok)     { ret err[outcome.Fail].ok{}; }
+    k = first;
+    for (k < reqs.len) {
+        val child: *DepReq = ?reqs.data[k];
+        k = k + 1;
+        if (!selects_release(child) || !str_empty(child.ref)) { cnt; }
+        val link: res[opt[str], outcome.Fail] = deps.staged_gitlink(s, source, child.id);
+        if (sel link.err) { ret err[outcome.Fail].err{link.err}; }
+        val pin: opt[str] = link.ok;
+        if (sel pin.some) {
+            val kept: str = own(a, pin.some);
+            str_free(s.build_alloc, pin.some);
+            if (kept == nil) { ret err[outcome.Fail].err{outcome.user("out of memory")}; }
+            child.seed = kept;
+        }
+    }
+    ret err[outcome.Fail].ok{};
+}
+
+# realize the dependency `add` declares by path or by ref, naming what it did in `completed`
+fun realize_added(s: *session.Session, a: *A.Allocator, root: str, mode: u8, spec: *manifest.DepTableSpec,
+    name: str, quiet: bool, completed: *str) i64 {
+    if (spec.source == manifest.DEP_SOURCE_PATH) {
+        var src: str = spec.value;
+        if (!path.is_abs(src)) {
+            val j: res[str, A.Error] = path.join(a, root, spec.value);
+            if (sel j.err) { ret err_oom(); }
+            src = j.ok;
+        }
+        val pr: err[outcome.Fail] = deps.realize_path_dependency(s, root, name, src, mode);
+        if (sel pr.err) {
+            err_line(outcome.describe(pr.err));
+            ret 1;
+        }
+        @completed = "copied the local source";
+        ret 0;
+    }
+    var request: DepReq;
+    request.version     = "";
+    request.id          = name;
+    request.url         = spec.value;
+    request.src_path    = "";
+    request.ref         = spec.ref;
+    request.chain       = "";
+    request.root_decl   = true;
+    request.is_git      = true;
+    request.via_release = false;
+    request.seed        = nil;
+    request.effect      = "";
+    var realized: u8  = deps.REALIZED_NOTHING;
+    val slot_rc:  i64 = realize_git_request(s, a, root, ?request, mode, true, quiet, ?realized);
+    if (!str_empty(request.effect)) { @completed = request.effect; }
+    ret slot_rc;
 }
 
 # realize false only declares: the manifest gains the table (a git one at its resolved range)
@@ -1410,15 +1612,7 @@ fun mutate_apply(edit: *ManifestEdit, s: *session.Session, a: *A.Allocator, root
         err_line(outcome.describe(preflight.err));
         ret 1;
     }
-    val resolved: res[Resolution, outcome.Fail] = resolve_versions(s, a, root, ?table, false, offline, true, name);
-    if (sel resolved.err) {
-        err_line(outcome.describe(resolved.err));
-        ret 1;
-    }
-    var add_notes: Resolution = resolved.ok;
-    if (!quiet) { print_notes(?add_notes); }
-    var picks:          Vector[resolver.Choice] = resolved.ok.picks;
-    val still_required: bool                    = !adding && req_index(?known, name) >= 0;
+    val still_required: bool = !adding && req_index(?known, name) >= 0;
     if (still_required && purge) {
         err_line("dependency is still required by the closure; cannot purge its checkout");
         ret 1;
@@ -1466,6 +1660,22 @@ fun mutate_apply(edit: *ManifestEdit, s: *session.Session, a: *A.Allocator, root
         }
     }
 
+    # a dependency added by path or by ref is realized first, so the ranges it declares
+    # are the closure's when they resolve; one added by range is a pick of that resolution
+    val fixed_add: bool = adding && (spec.source == manifest.DEP_SOURCE_PATH || spec.version == nil || str_empty(spec.version));
+    if (fixed_add) {
+        val placed: i64 = realize_added(s, a, root, mode, spec, name, quiet, ?completed);
+        if (placed != 0) { ret placed; }
+    }
+    val resolved: res[Resolution, outcome.Fail] = resolve_versions(s, a, root, ?table, false, offline, true, name);
+    if (sel resolved.err) {
+        err_line(outcome.describe(resolved.err));
+        ret 1;
+    }
+    var add_notes: Resolution = resolved.ok;
+    if (!quiet) { print_notes(?add_notes); }
+    var picks: Vector[resolver.Choice] = resolved.ok.picks;
+
     if (!adding) {
         if (!still_required && removing_git) {
             val ur: err[outcome.Fail] = deps.remove_dependency_index(s, root, name, mode);
@@ -1484,40 +1694,10 @@ fun mutate_apply(edit: *ManifestEdit, s: *session.Session, a: *A.Allocator, root
             completed = "removed the dependency registration and purged its checkout";
         }
     }
-    or (spec.source == manifest.DEP_SOURCE_PATH) {
-        var src: str = spec.value;
-        if (!path.is_abs(src)) {
-            val j: res[str, A.Error] = path.join(a, root, spec.value);
-            if (sel j.err) { ret err_oom(); }
-            src = j.ok;
-        }
-        val pr: err[outcome.Fail] = deps.realize_path_dependency(s, root, name, src, mode);
-        if (sel pr.err) {
-            err_line(outcome.describe(pr.err));
-            ret 1;
-        }
-        completed = "copied the local source";
-    }
-    or (spec.version != nil && !str_empty(spec.version)) {
+    or (!fixed_add) {
         val placed: i64 = realize_picks(s, a, root, mode, ?picks, quiet);
         if (placed != 0) { ret placed; }
         completed = "realized the selected release";
-    }
-    or {
-        var request: DepReq;
-        request.version   = "";
-        request.id        = name;
-        request.url       = spec.value;
-        request.src_path  = "";
-        request.ref       = spec.ref;
-        request.chain     = "";
-        request.root_decl = true;
-        request.is_git    = true;
-        request.effect    = "";
-        var realized: u8  = deps.REALIZED_NOTHING;
-        val slot_rc:  i64 = realize_git_request(s, a, root, ?request, mode, true, quiet, ?realized);
-        if (!str_empty(request.effect)) { completed = request.effect; }
-        if (slot_rc != 0)               { ret slot_rc; }
     }
     if (fail_after == 2) {
         err_line("injected dependency realization failure");
@@ -2692,6 +2872,109 @@ test "mach.cli.cmd.dep.pull:a_fresh_clone_initializes_the_committed_gitlinks_in_
     fs.remove_all(?a, proj);
     fs.remove_all(?a, fix_a);
     fs.remove_all(?a, fix_b);
+    ret bad;
+}
+
+# a dependency table selecting releases by `range`, through the manifest writer
+fun t_dep_table_range(a: *A.Allocator, name: str, url: str, range: str) str {
+    var spec: manifest.DepTableSpec;
+    spec.name    = name;
+    spec.source  = manifest.DEP_SOURCE_GIT;
+    spec.value   = url;
+    spec.ref     = "";
+    spec.version = range;
+    val r: res[str, outcome.Fail] = manifest.manifest_add_dep_table(a, "", ?spec);
+    if (sel r.err) { ret ""; }
+    ret r.ok;
+}
+
+# a subproject of `proj` at `rel`: a package manifest carrying `extra`, and a
+# committed gitlink for `id` at `rel`/dep/`id` checked out at `tag` of `url`
+fun t_subproject_with_gitlink(a: *A.Allocator, proj: str, rel: str, id: str, extra: str, url: str, tag: str) bool {
+    val sub:   str               = t_join_owned(a, proj, rel);
+    val src_r: res[str, A.Error] = path.join(a, sub, "src");
+    if (sel src_r.err) { ret false; }
+    val made: err[fs.FsError] = fs.create_dir_all(a, src_r.ok, 0o755);
+    if (sel made.err) { ret false; }
+    val body_r: res[str, format.FormatError] = format.sprint(a,
+        "[project]\nid = \"consumer\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out\"\n{}\n", extra);
+    if (sel body_r.err)                                                       { ret false; }
+    if (!t_write(a, sub, MANIFEST, body_r.ok))                                { ret false; }
+    if (!t_write(a, sub, "src/lib.mach", "pub fun hello() i32 { ret 1; }\n")) { ret false; }
+    val link_r: res[str, format.FormatError] = format.sprint(a, "{}/dep/{}", rel, id);
+    if (sel link_r.err)                                                                      { ret false; }
+    if (!t_git_submodule_add(a, proj, url, link_r.ok))                                       { ret false; }
+    if (!t_git3(a, t_join_owned(a, proj, link_r.ok), "checkout", "-q", "--detach", tag, "")) { ret false; }
+    ret t_commit_all(a, proj);
+}
+
+# the object id the index of the repository enclosing `root` records for dep/`id`, or ""
+fun t_staged_gitlink_under(a: *A.Allocator, root: str, id: str) str {
+    var s:    session.Session;
+    var mode: u8 = 0;
+    if (!t_session_and_mode(a, root, ?s, ?mode)) { ret ""; }
+    fin { session.dnit(?s); }
+    val link: res[opt[str], outcome.Fail] = deps.staged_gitlink(?s, root, id);
+    if (sel link.err) { ret ""; }
+    val staged: opt[str] = link.ok;
+    if (sel staged.none) { ret ""; }
+    ret own(a, staged.some);
+}
+
+# a subproject's committed gitlink is the pin of its range declaration exactly as
+# the root's is: on a fresh clone, `pull <subproject>` initializes the gitlink at
+# its recorded commit rather than cloning the source's default branch (#3686)
+test "mach.cli.cmd.dep.pull:a_subprojects_committed_gitlink_pins_its_range_declaration" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    var git_env: [4]*u8;
+    t_allow_file_transport(?git_env[0]);
+    fin { deps.set_git_config_env(nil); }
+    val fix: str = t_released(?a);
+    if (str_empty(fix)) { ret 1; }
+    val proj: str = t_root_repo(?a, "mach_dep_sub_src", "");
+    if (str_empty(proj)) { ret 1; }
+    val table: str = t_dep_table_range(?a, "vb", fix, "^1");
+    if (str_empty(table))                                                                  { ret 1; }
+    if (!t_subproject_with_gitlink(?a, proj, "test/consumer", "vb", table, fix, "v1.0.0")) { ret 1; }
+    val pinned: str = t_head_under(?a, proj, "test/consumer/dep/vb");
+    val latest: str = t_head_under(?a, fix, "");
+    if (str_empty(pinned) || str_empty(latest) || str_equals(pinned, latest)) { ret 1; }
+
+    val clone: str = t_scratch(?a, "mach_dep_sub_dst");
+    if (str_empty(clone)) { ret 1; }
+    var av: [6]*u8;
+    av[0] = ""::*u8;
+    av[1] = "clone"::*u8;
+    av[2] = "-q"::*u8;
+    av[3] = proj::*u8;
+    av[4] = clone::*u8;
+    av[5] = nil;
+    var bad: i32 = 0;
+    if (!t_git(?a, ?av[0]))                                                                { bad = 2; }
+    if (bad == 0 && !t_git3(?a, clone, "config", "protocol.file.allow", "always", "", "")) { bad = 3; }
+    if (bad == 0 && !t_exists_under(?a, clone, "test/consumer/dep/vb"))                    { bad = 4; }
+    if (bad == 0 && t_exists_under(?a, clone, "test/consumer/dep/vb/.git"))                { bad = 5; }
+    val sub: str = t_join_owned(?a, clone, "test/consumer");
+    if (bad == 0 && pull_project(sub, true) != 0)                                         { bad = 6; }
+    if (bad == 0 && !t_exists_under(?a, clone, "test/consumer/dep/vb/mach.toml"))         { bad = 7; }
+    if (bad == 0 && !str_equals(t_head_under(?a, clone, "test/consumer/dep/vb"), pinned)) { bad = 8; }
+    if (bad == 0 && !str_equals(t_release_under(?a, sub, "dep/vb"), "1.0.0"))             { bad = 9; }
+    # a second pull finds the pin realized and changes nothing
+    if (bad == 0 && pull_project(sub, true) != 0)                                         { bad = 10; }
+    if (bad == 0 && !str_equals(t_head_under(?a, clone, "test/consumer/dep/vb"), pinned)) { bad = 11; }
+    # update moves the pin: the range's highest release is checked out and the
+    # subproject's gitlink is staged at it in the enclosing repository
+    var up: [4]str = [4]str{"update", sub, "vb", "--quiet"};
+    if (bad == 0 && t_dep_cli_args(?a, ?up[0], 4) != 0)                       { bad = 12; }
+    if (bad == 0 && !str_equals(t_release_under(?a, sub, "dep/vb"), "1.1.0")) { bad = 13; }
+    val moved: str = t_head_under(?a, clone, "test/consumer/dep/vb");
+    if (bad == 0 && (str_empty(moved) || str_equals(moved, pinned)))           { bad = 14; }
+    if (bad == 0 && !str_equals(t_staged_gitlink_under(?a, sub, "vb"), moved)) { bad = 15; }
+    fs.remove_all(?a, clone);
+    fs.remove_all(?a, proj);
+    fs.remove_all(?a, fix);
     ret bad;
 }
 
@@ -3902,6 +4185,103 @@ test "mach.cli.cmd.dep.version:transitive_ranges_resolve_and_branch_selecting_re
     if (!str_equals(t_release_under(?a, root, "dep/vb"), "1.0.0")) { ret 10; }
     if (verify_project(root, false) != 0)                          { ret 11; }
     ret 0;
+}
+
+# a package `id` selecting vb by the range `^1` from `fix_vb`, with a committed
+# gitlink for it at `tag`; never a release itself, so it is reached by ref or path
+fun t_requirer_of_vb(a: *A.Allocator, prefix: str, id: str, fix_vb: str, tag: str) str {
+    val table: str = t_dep_table_range(a, "vb", fix_vb, "^1");
+    if (str_empty(table)) { ret ""; }
+    val dir: str = t_package_repo(a, prefix, id, table);
+    if (str_empty(dir))                                                                    { ret ""; }
+    if (!t_git_submodule_add(a, dir, fix_vb, "dep/vb"))                                    { ret ""; }
+    if (!t_git3(a, t_join_owned(a, dir, "dep/vb"), "checkout", "-q", "--detach", tag, "")) { ret ""; }
+    if (!t_commit_all(a, dir))                                                             { ret ""; }
+    ret dir;
+}
+
+# the closure contract for a range a dependency declares, with the dependency
+# reached by `table` (a git ref or a path): `update --all` pins the range's
+# highest release under the root, `add` seeds it from the dependency's own
+# committed gitlink, a root declaration overrides it, and the "no pin yet"
+# hint of a pull names a command that succeeds (#3689)
+fun t_transitive_range_through(a: *A.Allocator, prefix: str, vb: str, p_table: str, add_words: *str, add_n: usize) i32 {
+    # --all: the highest release the range admits, under the root's dep/
+    val all_root: str = t_root_repo(a, prefix, p_table);
+    if (str_empty(all_root)) { ret 20; }
+    fin { fs.remove_all(a, all_root); }
+    var up: [3]str = [3]str{"update", all_root, "--all"};
+    if (t_dep_cli_args(a, ?up[0], 3) != 0)                            { ret 21; }
+    if (!t_exists_under(a, all_root, "dep/vb/mach.toml"))             { ret 22; }
+    if (!str_equals(t_release_under(a, all_root, "dep/vb"), "1.1.0")) { ret 23; }
+    if (verify_project(all_root, false) != 0)                         { ret 24; }
+
+    # add: the dependency's gitlink seeds the range, and a later --all moves it
+    val add_root: str = t_root_repo(a, prefix, "");
+    if (str_empty(add_root)) { ret 30; }
+    fin { fs.remove_all(a, add_root); }
+    add_words[1] = add_root;
+    if (t_dep_cli_args(a, add_words, add_n) != 0)                     { ret 31; }
+    if (!str_equals(t_release_under(a, add_root, "dep/vb"), "1.0.0")) { ret 32; }
+    if (verify_project(add_root, false) != 0)                         { ret 33; }
+    var up2: [3]str = [3]str{"update", add_root, "--all"};
+    if (t_dep_cli_args(a, ?up2[0], 3) != 0)                           { ret 34; }
+    if (!str_equals(t_release_under(a, add_root, "dep/vb"), "1.1.0")) { ret 35; }
+
+    # the root's own declaration of vb overrides the dependency's range
+    val over_table: res[str, format.FormatError] = format.sprint(a, "{}{}", p_table, t_dep_table_ref(a, "vb", vb, "tag/v2.0.0"));
+    if (sel over_table.err) { ret 40; }
+    val over_root: str = t_root_repo(a, prefix, over_table.ok);
+    if (str_empty(over_root)) { ret 41; }
+    fin { fs.remove_all(a, over_root); }
+    var up3: [3]str = [3]str{"update", over_root, "--all"};
+    if (t_dep_cli_args(a, ?up3[0], 3) != 0)                            { ret 42; }
+    if (!str_equals(t_release_under(a, over_root, "dep/vb"), "2.0.0")) { ret 43; }
+
+    # pull refuses the unpinned range and names update <root> vb, which succeeds
+    val pull_root: str = t_root_repo(a, prefix, p_table);
+    if (str_empty(pull_root)) { ret 50; }
+    fin { fs.remove_all(a, pull_root); }
+    if (pull_project(pull_root, true) != 1) { ret 51; }
+    var one: [3]str = [3]str{"update", pull_root, "vb"};
+    if (t_dep_cli_args(a, ?one[0], 3) != 0)                { ret 52; }
+    if (!t_exists_under(a, pull_root, "dep/vb/mach.toml")) { ret 53; }
+    if (pull_project(pull_root, true) != 0)                { ret 54; }
+    ret 0;
+}
+
+test "mach.cli.cmd.dep.version:a_range_declared_by_a_git_dependency_resolves_from_its_gitlink" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    var git_env: [4]*u8;
+    t_allow_file_transport(?git_env[0]);
+    fin { deps.set_git_config_env(nil); }
+    val vb: str = t_released(?a);
+    if (str_empty(vb)) { ret 2; }
+    fin { fs.remove_all(?a, vb); }
+    val p: str = t_requirer_of_vb(?a, "mach_dep_git_requirer", "p", vb, "v1.0.0");
+    if (str_empty(p)) { ret 3; }
+    fin { fs.remove_all(?a, p); }
+    var add: [8]str = [8]str{"add", "", "p", "--git", p, "--ref", "branch/main", "--quiet"};
+    ret t_transitive_range_through(?a, "mach_dep_git_edge_root", vb, t_dep_table(?a, "p", p), ?add[0], 8);
+}
+
+test "mach.cli.cmd.dep.version:a_range_declared_by_a_path_dependency_resolves_from_its_gitlink" {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    var git_env: [4]*u8;
+    t_allow_file_transport(?git_env[0]);
+    fin { deps.set_git_config_env(nil); }
+    val vb: str = t_released(?a);
+    if (str_empty(vb)) { ret 2; }
+    fin { fs.remove_all(?a, vb); }
+    val p: str = t_requirer_of_vb(?a, "mach_dep_path_requirer", "p", vb, "v1.0.0");
+    if (str_empty(p)) { ret 3; }
+    fin { fs.remove_all(?a, p); }
+    var add: [6]str = [6]str{"add", "", "p", "--path", p, "--quiet"};
+    ret t_transitive_range_through(?a, "mach_dep_path_edge_root", vb, t_dep_table_path(?a, "p", p), ?add[0], 6);
 }
 
 fun t_refusal_has(a: *A.Allocator, root: str, n1: str, n2: str) bool {

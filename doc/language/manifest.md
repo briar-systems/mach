@@ -1287,10 +1287,25 @@ records a pin: there is no `mach.lock`, and a file of that name in the project
 root is an unrelated file no command reads.
 
 A project does not need its own Git repository. In a repository root, Git
-dependencies use the staged gitlinks as their pins. In a filesystem project or a
-project nested inside an unrelated repository, they are plain clones whose own
-checkout commits are verified. Local path dependencies are verified from their
-filesystem realizations, independently of any Git index.
+dependencies use the staged gitlinks as their pins. A subproject, a project in a
+subdirectory of a repository, uses the gitlink the enclosing repository commits
+under its prefix (`test/consumer/dep/std` for a subproject at `test/consumer`)
+the same way: `pull` realizes that gitlink's commit and `update` moves it and
+stages it. Without such a gitlink, and in a filesystem project, Git dependencies
+are plain clones whose own checkout commits are verified. Local path dependencies
+are verified from their filesystem realizations, independently of any Git index.
+
+A version range is resolved for the whole closure, not for the root's own
+declarations alone: a range a dependency declares, whether that dependency was
+reached by a range, a `ref` or a `path`, is pinned under the root's `dep/` by
+`mach dep add` and `mach dep update`. When the root has no checkout of the
+identity yet, resolution starts from the declaring dependency's own committed
+gitlink for it, so a dependency brings the pin it was tested with; `update
+--all` moves every range to the highest release all of them admit; and a root
+declaration of the same identity by `ref` or `path` overrides the range, noted
+as `<declarer> declares <id> by ..., overriding ...`. `pull` refuses a range with
+neither a gitlink nor a checkout under the root and names `mach dep update <root>
+<id>`, which pins it wherever in the closure it is declared.
 
 ### The root owns the flat closure
 
