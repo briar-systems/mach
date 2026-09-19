@@ -110,6 +110,7 @@ rec AllocCtx {
     arg_res_start:        *i64;
     arg_res_end:          *i64;
     arg_res_count:        u32;
+    arg_res_cap:          u32;
     def_res_reg:          *u32;
     def_res_pos:          *i64;
     def_res_count:        u32;
@@ -408,6 +409,7 @@ fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.Mir
     ctx.arg_res_start        = nil;
     ctx.arg_res_end          = nil;
     ctx.arg_res_count        = 0;
+    ctx.arg_res_cap          = 0;
     ctx.def_res_reg          = nil;
     ctx.def_res_pos          = nil;
     ctx.def_res_count        = 0;
@@ -661,16 +663,16 @@ fun round_tables_dnit(ctx: *AllocCtx) {
         A.deallocate[FlatInstr](ctx.alloc, ctx.flat, ctx.flat_count::usize);
         ctx.flat = nil;
     }
-    if (ctx.arg_res_reg != nil && ctx.flat_count > 0) {
-        A.deallocate[u32](ctx.alloc, ctx.arg_res_reg, ctx.flat_count::usize);
+    if (ctx.arg_res_reg != nil && ctx.arg_res_cap > 0) {
+        A.deallocate[u32](ctx.alloc, ctx.arg_res_reg, ctx.arg_res_cap::usize);
         ctx.arg_res_reg = nil;
     }
-    if (ctx.arg_res_start != nil && ctx.flat_count > 0) {
-        A.deallocate[i64](ctx.alloc, ctx.arg_res_start, ctx.flat_count::usize);
+    if (ctx.arg_res_start != nil && ctx.arg_res_cap > 0) {
+        A.deallocate[i64](ctx.alloc, ctx.arg_res_start, ctx.arg_res_cap::usize);
         ctx.arg_res_start = nil;
     }
-    if (ctx.arg_res_end != nil && ctx.flat_count > 0) {
-        A.deallocate[i64](ctx.alloc, ctx.arg_res_end, ctx.flat_count::usize);
+    if (ctx.arg_res_end != nil && ctx.arg_res_cap > 0) {
+        A.deallocate[i64](ctx.alloc, ctx.arg_res_end, ctx.arg_res_cap::usize);
         ctx.arg_res_end = nil;
     }
     if (ctx.def_res_reg != nil && ctx.flat_count > 0) {
@@ -683,6 +685,7 @@ fun round_tables_dnit(ctx: *AllocCtx) {
     }
     ctx.flat_count    = 0;
     ctx.arg_res_count = 0;
+    ctx.arg_res_cap   = 0;
     ctx.def_res_count = 0;
     if (ctx.segs != nil && ctx.seg_count > 0) {
         A.deallocate[Segment](ctx.alloc, ctx.segs, ctx.seg_count::usize);
@@ -2725,18 +2728,80 @@ fun reserve_param_registers(ctx: *AllocCtx) {
     }
 }
 
+# a physical register a call leaves a value in is busy from the position
+# after the call to the instruction that reads it: the window an argument
+# register is busy over before a call, mirrored. the reading instruction's
+# own destination may take the register (a capture `v = a0` lives in a0), so
+# the window ends one position before the read; a value born earlier, such as
+# the capture of the other half of a pair whose copy would sit on this
+# register, may not. no value spans the call itself in a return register, so
+# the window starts after it, and a read right after the call reserves
+# nothing (#3690)
+fun preg_read_count(ctx: *AllocCtx) u32 {
+    var n:   u32 = 0;
+    var pos: u32 = 0;
+    for (pos < ctx.flat_count) {
+        val mi: *mir.MirInstr = flat_instr(ctx, pos);
+        var k:  u32           = 0;
+        if (mir.instr_defines_shape(mi)) { k = 1; }
+        for (k < mi.operand_count) {
+            if (mi.operands[k].kind == mir.MIR_OP_PREG) { n = n + 1; }
+            k = k + 1;
+        }
+        pos = pos + 1;
+    }
+    ret n;
+}
+
+fun reserve_return_reads(ctx: *AllocCtx) {
+    var pos: u32 = 0;
+    for (pos < ctx.flat_count) {
+        val mi: *mir.MirInstr = flat_instr(ctx, pos);
+        var k:  u32           = 0;
+        if (mir.instr_defines_shape(mi)) { k = 1; }
+        for (k < mi.operand_count) {
+            if (mi.operands[k].kind == mir.MIR_OP_PREG && pos > 0) {
+                val r: u32 = mi.operands[k].preg.n;
+                # the nearest call before the read, unless a def of the
+                # register comes first: that def's own reservation covers it
+                var c:     u32  = pos;
+                var found: bool = false;
+                var stop:  bool = false;
+                for (c > 0 && !found && !stop) {
+                    c = c - 1;
+                    if (ctx.flat[c].is_call) { found = true; }
+                    or {
+                        val mj: *mir.MirInstr = flat_instr(ctx, c);
+                        if (instr_defines_preg(mj) && mj.operands[0].preg.n == r) { stop = true; }
+                    }
+                }
+                if (found && c + 1 < pos && ctx.arg_res_count < ctx.arg_res_cap) {
+                    ctx.arg_res_reg[ctx.arg_res_count]   = r;
+                    ctx.arg_res_start[ctx.arg_res_count] = (c + 1)::i64;
+                    ctx.arg_res_end[ctx.arg_res_count]   = (pos - 1)::i64;
+                    ctx.arg_res_count                    = ctx.arg_res_count + 1;
+                }
+            }
+            k = k + 1;
+        }
+        pos = pos + 1;
+    }
+}
+
 fun build_arg_reservations(ctx: *AllocCtx) err[fail.Fail] {
     ctx.arg_res_count = 0;
     ctx.def_res_count = 0;
     if (ctx.flat_count == 0) { ret err[fail.Fail].ok{}; }
 
-    val rr: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, ctx.flat_count::usize);
+    # one entry per register-defining instruction plus one per register read
+    ctx.arg_res_cap = ctx.flat_count + preg_read_count(ctx);
+    val rr: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, ctx.arg_res_cap::usize);
     if (sel rr.err) { ret err[fail.Fail].err{fail.refused(rr.err)}; }
     ctx.arg_res_reg = rr.ok;
-    val rs: res[*i64, A.Error] = A.allocate[i64](ctx.alloc, ctx.flat_count::usize);
+    val rs: res[*i64, A.Error] = A.allocate[i64](ctx.alloc, ctx.arg_res_cap::usize);
     if (sel rs.err) { ret err[fail.Fail].err{fail.refused(rs.err)}; }
     ctx.arg_res_start = rs.ok;
-    val re: res[*i64, A.Error] = A.allocate[i64](ctx.alloc, ctx.flat_count::usize);
+    val re: res[*i64, A.Error] = A.allocate[i64](ctx.alloc, ctx.arg_res_cap::usize);
     if (sel re.err) { ret err[fail.Fail].err{fail.refused(re.err)}; }
     ctx.arg_res_end = re.ok;
     val dr: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, ctx.flat_count::usize);
@@ -2781,6 +2846,7 @@ fun build_arg_reservations(ctx: *AllocCtx) err[fail.Fail] {
         }
         pos = pos + 1;
     }
+    reserve_return_reads(ctx);
     ret err[fail.Fail].ok{};
 }
 
