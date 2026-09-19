@@ -220,7 +220,7 @@ materialise() {
     rm -rf "$hosted" "$bare"
     for proj in "$hosted" "$bare"; do
         mkdir -p "$proj/src/cases" "$proj/src/lib"
-        cp "$here"/lib/fold.mach "$proj/src/lib/"
+        cp "$here"/lib/fold.mach "$here"/lib/fold128.mach "$proj/src/lib/"
         for c in $cases; do
             mkdir -p "$proj/src/cases/${c%/*}"
             cp "$here/cases/$c.mach" "$proj/src/cases/$c.mach"

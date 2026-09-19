@@ -40,6 +40,7 @@ use mach.lang.target.extension;
 use mach.lang.target.isa;
 use mach.lang.target.os;
 use mach.lang.type;
+use mach.lang.wide;
 
 pub def CTKind: u8;
 
@@ -113,6 +114,9 @@ pub val COMPTIME_IDENT_UNBOUND_MSG: str =
 pub val COMPTIME_LAYOUT_NO_RESOLVER_MSG: str =
     "a layout intrinsic is only comptime-evaluable after type checking: an arm of this `$if` declares something, so the gate selects DECLARATIONS and is decided during name resolution, before any type is laid out. a `$if` whose every arm declares nothing is decided during type checking and can measure a type";
 
+# an integer value is 128 bits in data.w; data.i is its low limb, and a signed
+# value sign-fills the high limb so every reader of a value that fits 64 bits
+# sees the same i64 it always did (#3511)
 pub rec CTValue {
     kind:         CTKind;
     int_unsigned: bool;
@@ -120,6 +124,7 @@ pub rec CTValue {
     float_width:  float.FloatWidth;
     data:         uni {
         i: i64;
+        w: wide.Wide;
         f: f64;
         s: intern.StrId;
         t: u32;
@@ -729,10 +734,6 @@ pub fun environment(c: *ComptimeCtx) ComptimeEnv {
 
 val INITIAL_CONST_CAP: u32 = 8;
 
-fun is_i64_min(a: i64) bool {
-    ret a != 0 && (0 - a) == a;
-}
-
 pub fun init(
     alloc: *A.Allocator,
     target_os_id: u32,
@@ -1161,7 +1162,7 @@ fun span_text(source: str, span: token.Span) View {
 }
 
 pub rec LitInt {
-    value:    u64;
+    value:    wide.Wide;
     suffix:   type.TypeKind;
     in_range: bool;
 }
@@ -1172,7 +1173,7 @@ pub rec LitFloat {
 }
 
 val LIT_SUFFIX_INT_MSG: str =
-    "unknown integer literal suffix: an integer literal takes `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, or `i64`; a float literal carries a fractional part or an exponent (`1.0f32`)";
+    "unknown integer literal suffix: an integer literal takes `u8`, `u16`, `u32`, `u64`, `u128`, `i8`, `i16`, `i32`, `i64`, or `i128`; a float literal carries a fractional part or an exponent (`1.0f32`)";
 
 val LIT_SUFFIX_FLOAT_MSG: str =
     "unknown float literal suffix: a float literal takes `f32` or `f64`";
@@ -1211,10 +1212,9 @@ pub fun scan_lit_int(source: str, span: token.Span) res[LitInt, fail.Fail] {
         }
     }
 
-    val u64_max:   u64  = 0xFFFFFFFFFFFFFFFF;
-    val base_u:    u64  = base:~u64;
-    var value:     u64  = 0;
-    var saw_digit: bool = false;
+    val base_u:    u64       = base:~u64;
+    var value:     wide.Wide = wide.zero();
+    var saw_digit: bool      = false;
     for (i < text.len) {
         val c: u8 = text.data[i];
         if (c == '_') {
@@ -1228,11 +1228,11 @@ pub fun scan_lit_int(source: str, span: token.Span) res[LitInt, fail.Fail] {
         or (c >= 'A' && c <= 'F') { digit = (c - 'A')::i64 + 10; }
 
         if (digit >= 0 && digit < base) {
-            val d: u64 = digit:~u64;
-            if (value > (u64_max - d) / base_u) {
+            var overflow: bool = false;
+            value = wide.mul_add_small(value, base_u, digit:~u64, ?overflow);
+            if (overflow) {
                 ret res[LitInt, fail.Fail].err{fail.message("integer literal out of range")};
             }
-            value     = value * base_u + d;
             saw_digit = true;
             i         = i + 1;
         }
@@ -1266,11 +1266,15 @@ pub fun eval_lit_int(source: str, span: token.Span) res[CTValue, EvalFail] {
     val lit: LitInt = lit_r.ok;
     if (!lit.in_range) { ret reject(LIT_SUFFIX_RANGE_MSG); }
 
-    val signed_max: u64                    = 0x7FFFFFFFFFFFFFFF;
-    val result:     res[CTValue, EvalFail] = make_int_value(lit.value:~i64, lit.value > signed_max);
+    # an unsuffixed literal is as wide as it must be: 64 bits when it fits
+    # them, 128 otherwise; it reads unsigned once it exceeds that width's
+    # signed maximum
+    var width: u32 = 64;
+    if (!wide.fits_unsigned(lit.value, 64)) { width = 128; }
+    val result: res[CTValue, EvalFail] = make_int_wide(lit.value, wide.bit_length(lit.value) == width);
     if (sel result.err) { ret result; }
     var out: CTValue = result.ok;
-    out.int_width = 64;
+    out.int_width = width::u8;
     if (lit.suffix != expr.LIT_SUFFIX_NONE) {
         val d: type.PrimDesc = type.prim_desc(lit.suffix);
         out.int_width    = d.bits::u8;
@@ -1493,7 +1497,7 @@ pub fun eval_lit_char(source: str, span: token.Span) res[CTValue, EvalFail] {
     v.kind         = CT_KIND_INT;
     v.int_unsigned = true;
     v.int_width    = 8;
-    v.data.i       = r.ok::i64;
+    v.data.w       = wide.from_u64(r.ok::u64);
     ret res[CTValue, EvalFail].ok{v};
 }
 
@@ -1724,32 +1728,27 @@ fun eval_unary[T](
         if (v.kind != CT_KIND_INT || (v.int_width != 0 && !is_u8(v))) {
             ret reject("unary ! requires a u8 operand");
         }
-        var out: CTValue = ct_u8(if_u8(v.data.i != 1));
+        var out: CTValue = ct_u8(if_u8(!truth(v)));
         if (v.int_width == 0) { out.int_width = 0; }
         ret res[CTValue, EvalFail].ok{out};
     }
     if (un.op == expr.UN_BIT_NOT) {
         if (v.kind != CT_KIND_INT) { ret reject("unary ~ requires an integer operand"); }
-        if (v.int_width == 0)      { ret make_int_value(~v.data.i, v.int_unsigned); }
-        ret cast_int(~v.data.i, v.int_width::u32, !v.int_unsigned);
+        if (v.int_width == 0)      { ret make_int_wide(wide.not(v.data.w), v.int_unsigned); }
+        ret cast_int(wide.not(v.data.w), v.int_width::u32, !v.int_unsigned);
     }
     ret reject("unsupported unary operator");
 }
 
-fun cast_int(bits: i64, width: u32, signed: bool) res[CTValue, EvalFail] {
-    if (width == 0 || width > 64) { ret internal_failure("comptime scalar cast has an invalid integer width"); }
-    var value: i64 = bits;
-    if (width < 64) {
-        val shift:  u64 = (64 - width)::u64;
-        val masked: u64 = (bits:~u64 << shift) >> shift;
-        value = masked:~i64;
-        if (signed) { value = (value << shift) >> shift; }
-    }
+fun cast_int(bits: wide.Wide, width: u32, signed: bool) res[CTValue, EvalFail] {
+    if (width == 0 || width > 128) { ret internal_failure("comptime scalar cast has an invalid integer width"); }
+    var value: wide.Wide = wide.trunc(bits, width);
+    if (signed) { value = wide.sext(bits, width); }
     var out: CTValue;
     out.kind         = CT_KIND_INT;
     out.int_unsigned = !signed;
     out.int_width    = width::u8;
-    out.data.i       = value;
+    out.data.w       = value;
     ret res[CTValue, EvalFail].ok{out};
 }
 
@@ -1799,22 +1798,22 @@ pub fun cast_scalar(types: *type.TypeInterner, pointer_width: u32, value: CTValu
         val source_value: f64 = source_r.ok.data.f;
         if (to_float) { ret float_value(source_value, fw); }
         if (representation) {
-            if (from.bits == 32) { ret cast_int(((source_value::f32):~u32)::i64, to.bits, to.signed); }
-            ret cast_int(source_value:~i64, to.bits, to.signed);
+            if (from.bits == 32) { ret cast_int(wide.from_u64(((source_value::f32):~u32)::u64), to.bits, to.signed); }
+            ret cast_int(wide.from_u64(source_value:~u64), to.bits, to.signed);
         }
-        if (to.signed) { ret cast_int(source_value::i64, to.bits, true); }
-        ret cast_int((source_value::u64):~i64, to.bits, false);
+        if (to.signed) { ret cast_int(wide.from_f64_s(source_value), to.bits, true); }
+        ret cast_int(wide.from_f64_u(source_value), to.bits, false);
     }
-    val source_r: res[CTValue, EvalFail] = cast_int(value.data.i, from.bits, from.signed);
+    val source_r: res[CTValue, EvalFail] = cast_int(value.data.w, from.bits, from.signed);
     if (sel source_r.err) { ret source_r; }
-    val source_value: i64 = source_r.ok.data.i;
+    val source_value: wide.Wide = source_r.ok.data.w;
     if (!to_float) { ret cast_int(source_value, to.bits, to.signed); }
     if (representation) {
-        if (to.bits == 32) { ret float_value(((source_value:~u64)::u32):~f32::f64, fw); }
-        ret float_value(source_value:~f64, fw);
+        if (to.bits == 32) { ret float_value((source_value.lo::u32):~f32::f64, fw); }
+        ret float_value(source_value.lo:~f64, fw);
     }
-    if (from.signed) { ret float_value(source_value::f64, fw); }
-    ret float_value((source_value:~u64)::f64, fw);
+    if (from.signed) { ret float_value(wide.to_f64_s(source_value), fw); }
+    ret float_value(wide.to_f64_u(source_value), fw);
 }
 
 fun eval_logical[T](
@@ -1832,7 +1831,7 @@ fun eval_logical[T](
         ret reject("logical operator requires u8 operands");
     }
 
-    if ((bin.op == expr.BIN_AND && lhs.data.i != 1) || (bin.op == expr.BIN_OR && lhs.data.i == 1)) {
+    if ((bin.op == expr.BIN_AND && !truth(lhs)) || (bin.op == expr.BIN_OR && truth(lhs))) {
         ret short_circuit[T](c, cap_ctx, caps, a, source, bin, interner, lhs);
     }
 
@@ -1843,7 +1842,7 @@ fun eval_logical[T](
         ret reject("logical operator requires u8 operands");
     }
 
-    var out: CTValue = ct_u8(if_u8(rhs.data.i == 1));
+    var out: CTValue = ct_u8(if_u8(truth(rhs)));
     if (lhs.int_width == 0 || rhs.int_width == 0) { out.int_width = 0; }
     ret res[CTValue, EvalFail].ok{out};
 }
@@ -2087,7 +2086,7 @@ fun gate_verdict(outcome: GateOutcome, message: str, span: token.Span, depends: 
     v.depends         = depends;
     v.value.kind      = CT_KIND_INT;
     v.value.int_width = 0;
-    v.value.data.i    = 0;
+    v.value.data.w    = wide.zero();
     ret v;
 }
 
@@ -2507,39 +2506,16 @@ pub fun apply_declared_int_type(a: *ast.Ast, source: str, t: id.TypeId, value: C
     val ty: *atype.Type = found.some;
     if (ty.kind == atype.TYPE_KIND_SECRET)                               { ret apply_declared_int_type(a, source, ty.data.secret.inner, out); }
     if (ty.kind != atype.TYPE_KIND_NAMED || ty.data.named.args_len != 0) { ret out; }
-    val text: View = span_text(source, ty.data.named.name);
+    # the catalog decides the width and signedness a spelling declares; any
+    # other name leaves the value untyped
     out.int_width = 0;
-    if (view_eq_str(text, "u8")) {
-        out.int_unsigned = true;
-        out.int_width    = 8;
-    }
-    if (view_eq_str(text, "u16")) {
-        out.int_unsigned = true;
-        out.int_width    = 16;
-    }
-    if (view_eq_str(text, "u32")) {
-        out.int_unsigned = true;
-        out.int_width    = 32;
-    }
-    if (view_eq_str(text, "u64")) {
-        out.int_unsigned = true;
-        out.int_width    = 64;
-    }
-    if (view_eq_str(text, "i8")) {
-        out.int_unsigned = false;
-        out.int_width    = 8;
-    }
-    if (view_eq_str(text, "i16")) {
-        out.int_unsigned = false;
-        out.int_width    = 16;
-    }
-    if (view_eq_str(text, "i32")) {
-        out.int_unsigned = false;
-        out.int_width    = 32;
-    }
-    if (view_eq_str(text, "i64")) {
-        out.int_unsigned = false;
-        out.int_width    = 64;
+    val kind: opt[type.TypeKind] = type.prim_from_view(span_text(source, ty.data.named.name));
+    if (sel kind.some) {
+        val d: type.PrimDesc = type.prim_desc(kind.some);
+        if (d.class == type.PRIM_CLASS_INT) {
+            out.int_unsigned = !d.signed;
+            out.int_width    = d.bits::u8;
+        }
     }
     ret out;
 }
@@ -2754,19 +2730,34 @@ fun eval_type_operand[T](
 pub fun ct_is_negative(v: CTValue) bool {
     if (v.kind != CT_KIND_INT) { ret false; }
     if (v.int_unsigned)        { ret false; }
-    ret v.data.i < 0;
+    ret wide.is_negative(v.data.w);
 }
 
+# an integer value that is neither negative nor above u64, read as a u64
+pub fun ct_int_u64(v: CTValue, out: *u64) bool {
+    if (v.kind != CT_KIND_INT || ct_is_negative(v)) { ret false; }
+    if (v.data.w.hi != 0)                           { ret false; }
+    @out = v.data.w.lo;
+    ret true;
+}
+
+# the decimal text of an integer value in a wide.FORMAT_CAP buffer
+pub fun ct_int_text(v: CTValue, buf: *u8) str {
+    if (v.int_unsigned) { ret wide.text_u(v.data.w, buf); }
+    ret wide.text_s(v.data.w, buf);
+}
+
+# operands of one sign order as their two's complement bit patterns
 fun ct_int_lt(a: CTValue, b: CTValue) bool {
     val an: bool = ct_is_negative(a);
     val bn: bool = ct_is_negative(b);
     if (an != bn) { ret an; }
-    ret (a.data.i:~u64) < (b.data.i:~u64);
+    ret wide.lt_u(a.data.w, b.data.w);
 }
 
 fun ct_int_eq(a: CTValue, b: CTValue) bool {
     if (ct_is_negative(a) != ct_is_negative(b)) { ret false; }
-    ret a.data.i == b.data.i;
+    ret wide.eq(a.data.w, b.data.w);
 }
 
 fun apply_equality(op: expr.BinOp, lhs: CTValue, rhs: CTValue) res[CTValue, EvalFail] {
@@ -2881,113 +2872,106 @@ fun apply_float_arith(op: expr.BinOp, lhs: CTValue, rhs: CTValue) res[CTValue, E
     ret reject("unsupported float operator");
 }
 
-fun bitwise_value(bits: i64, lhs: CTValue, rhs: CTValue) res[CTValue, EvalFail] {
+fun bitwise_value(bits: wide.Wide, lhs: CTValue, rhs: CTValue) res[CTValue, EvalFail] {
     val unsigned: bool = lhs.int_unsigned || rhs.int_unsigned;
     if (lhs.int_width != 0 && lhs.int_width == rhs.int_width) {
         ret cast_int(bits, lhs.int_width::u32, !unsigned);
     }
-    ret make_int_value(bits, unsigned);
+    ret make_int_wide(bits, unsigned);
 }
 
 fun apply_int_arith(op: expr.BinOp, lhs: CTValue, rhs: CTValue) res[CTValue, EvalFail] {
     val res_uns: bool = lhs.int_unsigned || rhs.int_unsigned;
 
-    if (op == expr.BIN_BIT_AND)                   { ret bitwise_value(lhs.data.i & rhs.data.i, lhs, rhs); }
-    if (op == expr.BIN_BIT_OR)                    { ret bitwise_value(lhs.data.i | rhs.data.i, lhs, rhs); }
-    if (op == expr.BIN_BIT_XOR)                   { ret bitwise_value(lhs.data.i ^ rhs.data.i, lhs, rhs); }
+    if (op == expr.BIN_BIT_AND)                   { ret bitwise_value(wide.and(lhs.data.w, rhs.data.w), lhs, rhs); }
+    if (op == expr.BIN_BIT_OR)                    { ret bitwise_value(wide.or (lhs.data.w, rhs.data.w), lhs, rhs); }
+    if (op == expr.BIN_BIT_XOR)                   { ret bitwise_value(wide.xor(lhs.data.w, rhs.data.w), lhs, rhs); }
     if (op == expr.BIN_SHL || op == expr.BIN_SHR) { ret apply_int_shift(op, lhs, rhs); }
 
-    if (!res_uns) { ret apply_signed_arith(op, lhs.data.i, rhs.data.i); }
+    if (!res_uns) { ret apply_signed_arith(op, lhs.data.w, rhs.data.w); }
     if (ct_is_negative(lhs) || ct_is_negative(rhs)) {
         ret reject("comptime arithmetic mixes a negative value with an unsigned operand");
     }
-    ret apply_unsigned_arith(op, lhs.data.i:~u64, rhs.data.i:~u64);
+    ret apply_unsigned_arith(op, lhs.data.w, rhs.data.w);
 }
 
-fun apply_signed_arith(op: expr.BinOp, a: i64, b: i64) res[CTValue, EvalFail] {
+fun apply_signed_arith(op: expr.BinOp, a: wide.Wide, b: wide.Wide) res[CTValue, EvalFail] {
+    var overflow: bool = false;
     if (op == expr.BIN_ADD) {
-        val s: i64 = a + b;
-        if (((a ^ s) & (b ^ s)) < 0) {
-            ret reject("comptime integer overflow in '+'");
-        }
-        ret make_int_value(s, false);
+        val s: wide.Wide = wide.add_signed(a, b, ?overflow);
+        if (overflow) { ret reject("comptime integer overflow in '+'"); }
+        ret make_int_wide(s, false);
     }
     if (op == expr.BIN_SUB) {
-        val s: i64 = a - b;
-        if (((a ^ b) & (a ^ s)) < 0) {
-            ret reject("comptime integer overflow in '-'");
-        }
-        ret make_int_value(s, false);
+        val s: wide.Wide = wide.sub_signed(a, b, ?overflow);
+        if (overflow) { ret reject("comptime integer overflow in '-'"); }
+        ret make_int_wide(s, false);
     }
-    if (op == expr.BIN_MUL) { ret signed_mul(a, b); }
+    if (op == expr.BIN_MUL) {
+        if (wide.mul_overflows_s(a, b)) { ret reject("comptime integer overflow in '*'"); }
+        ret make_int_wide(wide.mul(a, b), false);
+    }
+    val min_by_minus_one: bool = wide.eq(a, wide.min_s()) && wide.eq(b, wide.from_i64(-1));
+    var q:                wide.Wide;
+    var r:                wide.Wide;
     if (op == expr.BIN_DIV) {
-        if (b == 0) { ret reject("integer division by zero"); }
-        if (is_i64_min(a) && b == (0 - 1)) {
-            ret reject("integer division overflow (INT64_MIN / -1)");
-        }
-        ret make_int_value(a / b, false);
+        if (wide.is_zero(b))  { ret reject("integer division by zero"); }
+        if (min_by_minus_one) { ret reject("integer division overflow (INT128_MIN / -1)"); }
+        wide.divmod_s(a, b, ?q, ?r);
+        ret make_int_wide(q, false);
     }
     if (op == expr.BIN_MOD) {
-        if (b == 0) { ret reject("integer modulo by zero"); }
-        if (is_i64_min(a) && b == (0 - 1)) {
-            ret reject("integer modulo overflow (INT64_MIN % -1)");
-        }
-        ret make_int_value(a % b, false);
+        if (wide.is_zero(b))  { ret reject("integer modulo by zero"); }
+        if (min_by_minus_one) { ret reject("integer modulo overflow (INT128_MIN % -1)"); }
+        wide.divmod_s(a, b, ?q, ?r);
+        ret make_int_wide(r, false);
     }
     ret reject("unsupported integer operator");
 }
 
-fun signed_mul(a: i64, b: i64) res[CTValue, EvalFail] {
-    if (a == 0 || b == 0) { ret make_int_value(0, false); }
-    if ((is_i64_min(a) && b == (0 - 1)) || (is_i64_min(b) && a == (0 - 1))) {
-        ret reject("comptime integer overflow in '*'");
-    }
-    val p: i64 = a * b;
-    if (p / a != b) { ret reject("comptime integer overflow in '*'"); }
-    ret make_int_value(p, false);
-}
-
-fun apply_unsigned_arith(op: expr.BinOp, a: u64, b: u64) res[CTValue, EvalFail] {
+fun apply_unsigned_arith(op: expr.BinOp, a: wide.Wide, b: wide.Wide) res[CTValue, EvalFail] {
+    var flag: bool = false;
     if (op == expr.BIN_ADD) {
-        val s: u64 = a + b;
-        if (s < a) { ret reject("comptime integer overflow in '+'"); }
-        ret make_int_value(s:~i64, true);
+        val s: wide.Wide = wide.add_carry(a, b, ?flag);
+        if (flag) { ret reject("comptime integer overflow in '+'"); }
+        ret make_int_wide(s, true);
     }
     if (op == expr.BIN_SUB) {
-        if (a < b) { ret reject("comptime integer overflow in '-'"); }
-        ret make_int_value((a - b):~i64, true);
+        val d: wide.Wide = wide.sub_borrow(a, b, ?flag);
+        if (flag) { ret reject("comptime integer overflow in '-'"); }
+        ret make_int_wide(d, true);
     }
     if (op == expr.BIN_MUL) {
-        val p: u64 = a * b;
-        if (b != 0 && p / b != a) { ret reject("comptime integer overflow in '*'"); }
-        ret make_int_value(p:~i64, true);
+        if (wide.mul_overflows_u(a, b)) { ret reject("comptime integer overflow in '*'"); }
+        ret make_int_wide(wide.mul(a, b), true);
     }
+    var q: wide.Wide;
+    var r: wide.Wide;
     if (op == expr.BIN_DIV) {
-        if (b == 0) { ret reject("integer division by zero"); }
-        ret make_int_value((a / b):~i64, true);
+        if (!wide.divmod_u(a, b, ?q, ?r)) { ret reject("integer division by zero"); }
+        ret make_int_wide(q, true);
     }
     if (op == expr.BIN_MOD) {
-        if (b == 0) { ret reject("integer modulo by zero"); }
-        ret make_int_value((a % b):~i64, true);
+        if (!wide.divmod_u(a, b, ?q, ?r)) { ret reject("integer modulo by zero"); }
+        ret make_int_wide(r, true);
     }
     ret reject("unsupported integer operator");
 }
 
 fun apply_int_shift(op: expr.BinOp, lhs: CTValue, rhs: CTValue) res[CTValue, EvalFail] {
-    if (ct_is_negative(rhs)) { ret reject("comptime shift amount is negative"); }
-    val amt: u64 = rhs.data.i:~u64;
-    if (amt >= 64) { ret reject("comptime shift amount must be less than 64"); }
-    val sh: i64 = amt:~i64;
+    if (ct_is_negative(rhs))                        { ret reject("comptime shift amount is negative"); }
+    if (rhs.data.w.hi != 0 || rhs.data.w.lo >= 128) { ret reject("comptime shift amount must be less than 128"); }
+    val amt: u32 = rhs.data.w.lo::u32;
     if (op == expr.BIN_SHL) {
         if (amt > 0) {
-            val discarded: u64 = (lhs.data.i:~u64) >> (64 - amt);
-            if (discarded != 0) { ret reject("comptime left shift discards significant bits"); }
+            val discarded: wide.Wide = wide.shr_u(lhs.data.w, 128 - amt);
+            if (!wide.is_zero(discarded)) { ret reject("comptime left shift discards significant bits"); }
         }
-        val shifted: u64 = (lhs.data.i:~u64) << amt;
-        ret make_int_value(shifted:~i64, shifted > 0x7FFFFFFFFFFFFFFF);
+        val shifted: wide.Wide = wide.shl(lhs.data.w, amt);
+        ret make_int_wide(shifted, wide.is_negative(shifted));
     }
-    if (lhs.int_unsigned) { ret make_int_value((lhs.data.i:~u64 >> amt):~i64, true); }
-    ret make_int_value(lhs.data.i >> sh, false);
+    if (lhs.int_unsigned) { ret make_int_wide(wide.shr_u(lhs.data.w, amt), true); }
+    ret make_int_wide(wide.shr_s(lhs.data.w, amt), false);
 }
 
 fun eval_ident[T](
@@ -3456,12 +3440,12 @@ fun eval_path_call[T](
     val width_eid: id.ExprId              = a.expr_ids[node.data.call.args_start + 1];
     val width_r:   res[CTValue, EvalFail] = evaluate[T](c, cap_ctx, caps, a, source, width_eid, interner);
     if (sel width_r.err) { ret width_r; }
-    val wv: CTValue = width_r.ok;
-    if (wv.kind != CT_KIND_INT || wv.data.i < 0 || wv.data.i > 64
-        || !ct.mul_width_valid(wv.data.i::u8)) {
-        ret reject("`$mach.build.ct_mul`: the operand width must be 8, 16, 32 or 64");
+    val wv:    CTValue = width_r.ok;
+    var width: u64     = 0;
+    if (!ct_int_u64(wv, ?width) || width > 128 || !ct.mul_cell_width_valid(width::u8)) {
+        ret reject("`$mach.build.ct_mul`: the operand width must be 8, 16, 32, 64 or 128");
     }
-    val admitted: bool = ct.mul_mask_has(c.env.ct_mul, ct.mul_cell(op, wv.data.i::u8, false));
+    val admitted: bool = ct.mul_mask_has(c.env.ct_mul, ct.mul_cell(op, width::u8, false));
     if (admitted) { ret u8_value(1); }
     ret u8_value(0);
 }
@@ -3782,31 +3766,38 @@ fun version_value(s: str, which: u32) res[CTValue, EvalFail] {
     ret int_value(r.ok);
 }
 
-fun make_int_value(bits: i64, unsigned: bool) res[CTValue, EvalFail] {
+fun make_int_wide(bits: wide.Wide, unsigned: bool) res[CTValue, EvalFail] {
     var v: CTValue;
     v.kind         = CT_KIND_INT;
     v.int_unsigned = unsigned;
     v.int_width    = 0;
-    v.data.i       = bits;
+    v.data.w       = bits;
     ret res[CTValue, EvalFail].ok{v};
+}
+
+# a 64-bit producer: the bits are a u64 when unsigned and an i64 otherwise
+fun make_int_value(bits: i64, unsigned: bool) res[CTValue, EvalFail] {
+    if (unsigned) { ret make_int_wide(wide.from_u64(bits:~u64), unsigned); }
+    ret make_int_wide(wide.from_i64(bits), unsigned);
 }
 
 fun int_value(i: i64) res[CTValue, EvalFail] {
     ret make_int_value(i, false);
 }
 
+# -x over the untyped 128-bit range: the signed minimum negates to its own
+# magnitude, which only reads as unsigned; an unsigned magnitude past it has no
+# negation
 fun ct_negate(v: CTValue) res[CTValue, EvalFail] {
     if (!v.int_unsigned) {
-        if (is_i64_min(v.data.i)) { ret make_int_value(v.data.i, true); }
-        ret make_int_value(0 - v.data.i, false);
+        if (wide.eq(v.data.w, wide.min_s())) { ret make_int_wide(v.data.w, true); }
+        ret make_int_wide(wide.neg(v.data.w), false);
     }
-    val mag: u64 = v.data.i:~u64;
-    if (mag == 0) { ret make_int_value(0, false); }
-    val signed_min_mag: u64 = 0x8000000000000000;
-    if (mag > signed_min_mag) {
+    if (wide.is_zero(v.data.w)) { ret make_int_wide(wide.zero(), false); }
+    if (wide.lt_u(wide.min_s(), v.data.w)) {
         ret reject("comptime negation of an unsigned value is out of range");
     }
-    ret make_int_value(0 - v.data.i, false);
+    ret make_int_wide(wide.neg(v.data.w), false);
 }
 
 fun float_value(f: f64, w: float.FloatWidth) res[CTValue, EvalFail] {
@@ -3889,7 +3880,7 @@ pub fun ct_u8(n: u8) CTValue {
     v.kind         = CT_KIND_INT;
     v.int_unsigned = true;
     v.int_width    = 8;
-    v.data.i       = n::i64;
+    v.data.w       = wide.from_u64(n::u64);
     ret v;
 }
 
@@ -3898,7 +3889,7 @@ pub fun is_u8(v: CTValue) bool {
 }
 
 pub fun truth(v: CTValue) bool {
-    ret v.kind == CT_KIND_INT && v.data.i == 1;
+    ret v.kind == CT_KIND_INT && wide.eq(v.data.w, wide.from_u64(1));
 }
 
 fun if_u8(v: bool) u8 {
@@ -3918,7 +3909,7 @@ pub fun ct_uint(n: u64) CTValue {
     v.kind         = CT_KIND_INT;
     v.int_unsigned = true;
     v.int_width    = 64;
-    v.data.i       = n:~i64;
+    v.data.w       = wide.from_u64(n);
     ret v;
 }
 
@@ -3927,7 +3918,7 @@ pub fun ct_zero_int(unsigned: bool, width: u8) CTValue {
     v.kind         = CT_KIND_INT;
     v.int_unsigned = unsigned;
     v.int_width    = width;
-    v.data.i       = 0;
+    v.data.w       = wide.zero();
     ret v;
 }
 
@@ -3948,9 +3939,98 @@ fun t_i64_max() i64 {
     ret ((one << 63) - 1):~i64;
 }
 
-test "mach.lang.fe.comptime.eval_lit_int:above_u64_max_rejected" {
-    val r: res[CTValue, EvalFail] = t_eval_int("18446744073709551616");
-    if (sel r.ok) { ret 1; }
+fun t_ct_wide(lo: u64, hi: u64, unsigned: bool) CTValue {
+    var v: CTValue;
+    v.kind         = CT_KIND_INT;
+    v.int_unsigned = unsigned;
+    v.int_width    = 0;
+    v.data.w       = wide.make(lo, hi);
+    ret v;
+}
+
+fun t_is(v: CTValue, lo: u64, hi: u64, unsigned: bool) bool {
+    ret v.kind == CT_KIND_INT && v.data.w.lo == lo && v.data.w.hi == hi && v.int_unsigned == unsigned;
+}
+
+fun t_ok_is(r: res[CTValue, EvalFail], lo: u64, hi: u64, unsigned: bool) bool {
+    if (sel r.err) { ret false; }
+    ret t_is(r.ok, lo, hi, unsigned);
+}
+
+fun t_val(r: res[CTValue, EvalFail]) CTValue {
+    if (sel r.err) { ret ct_zero_int(false, 0); }
+    ret r.ok;
+}
+
+fun t_width(r: res[CTValue, EvalFail]) u8 {
+    if (sel r.err) { ret 0; }
+    ret r.ok.int_width;
+}
+
+fun t_float_of(r: res[CTValue, EvalFail]) f64 {
+    if (sel r.err) { ret 0.0; }
+    ret r.ok.data.f;
+}
+
+# 0 when the literal fails to scan, 1 when its suffix range holds it, 2 otherwise
+fun t_lit_range(text: str) u8 {
+    val r: res[LitInt, fail.Fail] = t_scan_int(text);
+    if (sel r.err)     { ret 0; }
+    if (r.ok.in_range) { ret 1; }
+    ret 2;
+}
+
+test "mach.lang.fe.comptime.eval_lit_int:above_u128_max_rejected" {
+    val r: res[CTValue, EvalFail] = t_eval_int("340282366920938463463374607431768211456");
+    if (sel r.ok)                                                   { ret 1; }
+    if (!str_equals(r.err.message, "integer literal out of range")) { ret 2; }
+    val far: res[CTValue, EvalFail] = t_eval_int("3402823669209384634633746074317682114550");
+    if (sel far.ok) { ret 3; }
+    val two64: res[CTValue, EvalFail] = t_eval_int("18446744073709551616");
+    if (sel two64.err)                { ret 4; }
+    if (!t_is(two64.ok, 0, 1, false)) { ret 5; }
+    if (two64.ok.int_width != 128)    { ret 6; }
+    ret 0;
+}
+
+# the four literal spellings of the 128-bit extremes: u128 max and i128 max
+# scan exactly, and an unsuffixed literal reads unsigned only past i128 max
+test "mach.lang.fe.comptime.eval_lit_int:u128_extremes" {
+    val umax: res[CTValue, EvalFail] = t_eval_int("340282366920938463463374607431768211455");
+    if (sel umax.err)                                                 { ret 1; }
+    if (!t_is(umax.ok, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, true)) { ret 2; }
+    if (umax.ok.int_width != 128)                                     { ret 3; }
+    val hex: res[CTValue, EvalFail] = t_eval_int("0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF");
+    if (sel hex.err)                                                 { ret 4; }
+    if (!t_is(hex.ok, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, true)) { ret 5; }
+    val smax: res[CTValue, EvalFail] = t_eval_int("170141183460469231731687303715884105727i128");
+    if (sel smax.err)                                                  { ret 6; }
+    if (!t_is(smax.ok, 0xFFFFFFFFFFFFFFFF, 0x7FFFFFFFFFFFFFFF, false)) { ret 7; }
+    if (smax.ok.int_width != 128)                                      { ret 8; }
+    val smin_mag: res[CTValue, EvalFail] = t_eval_int("170141183460469231731687303715884105728");
+    if (sel smin_mag.err)                                { ret 9; }
+    if (!t_is(smin_mag.ok, 0, 0x8000000000000000, true)) { ret 10; }
+    val neg_r: res[CTValue, EvalFail] = ct_negate(smin_mag.ok);
+    if (sel neg_r.err)                                                              { ret 11; }
+    if (!t_is(neg_r.ok, 0, 0x8000000000000000, false) || !ct_is_negative(neg_r.ok)) { ret 12; }
+    # the i128 minimum's magnitude scans under its suffix (sema applies the sign); one past it does not
+    val min_mag_s: res[CTValue, EvalFail] = t_eval_int("170141183460469231731687303715884105728i128");
+    if (!t_ok_is(min_mag_s, 0, 0x8000000000000000, false)) { ret 13; }
+    val over_s: res[CTValue, EvalFail] = t_eval_int("170141183460469231731687303715884105729i128");
+    if (sel over_s.ok) { ret 16; }
+    val u128_lit: res[CTValue, EvalFail] = t_eval_int("340282366920938463463374607431768211455u128");
+    if (!t_ok_is(u128_lit, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, true) || t_width(u128_lit) != 128) { ret 14; }
+    val bin: res[CTValue, EvalFail] = t_eval_int("0b1_0000000000000000000000000000000000000000000000000000000000000000");
+    if (!t_ok_is(bin, 0, 1, false)) { ret 15; }
+    ret 0;
+}
+
+test "mach.lang.fe.comptime.scan_lit_int:in_range_uses_the_128_bit_catalog_width" {
+    if (t_lit_range("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFu128") != 1) { ret 1; }
+    if (t_lit_range("0x80000000000000000000000000000000i128") != 1) { ret 2; }
+    if (t_lit_range("0x80000000000000000000000000000001i128") != 2) { ret 3; }
+    if (t_lit_range("18446744073709551616u64") != 2)                { ret 4; }
+    if (t_lit_range("18446744073709551616i128") != 1)               { ret 5; }
     ret 0;
 }
 
@@ -3991,9 +4071,9 @@ test "mach.lang.fe.comptime.scan_lit_int:suffix_names_a_primitive_type" {
     if (t_suffix_of("0xFF") != expr.LIT_SUFFIX_NONE) { ret 13; }
 
     val r: res[LitInt, fail.Fail] = t_scan_int("255u8");
-    if (sel r.err)         { ret 14; }
-    if (r.ok.value != 255) { ret 15; }
-    if (!r.ok.in_range)    { ret 16; }
+    if (sel r.err)                                { ret 14; }
+    if (!wide.eq(r.ok.value, wide.from_u64(255))) { ret 15; }
+    if (!r.ok.in_range)                           { ret 16; }
     ret 0;
 }
 
@@ -4027,7 +4107,36 @@ test "mach.lang.fe.comptime.scan_lit_int:unknown_suffix_rejected" {
     val t_scan_int_4: res[LitInt, fail.Fail] = t_scan_int("1f32");
     if (sel t_scan_int_4.ok) { ret 4; }
     val t_scan_int_5: res[LitInt, fail.Fail] = t_scan_int("7u128");
-    if (sel t_scan_int_5.ok) { ret 5; }
+    if (sel t_scan_int_5.err)                     { ret 5; }
+    if (t_scan_int_5.ok.suffix != type.TYPE_U128) { ret 5; }
+    val t_scan_int_6: res[LitInt, fail.Fail] = t_scan_int("7i128");
+    if (sel t_scan_int_6.err)                     { ret 6; }
+    if (t_scan_int_6.ok.suffix != type.TYPE_I128) { ret 6; }
+    ret 0;
+}
+
+# every integer spelling in the catalog is named by the suffix refusal, so a new
+# width cannot be accepted by the scanner and missing from the message
+test "mach.lang.fe.comptime.LIT_SUFFIX_INT_MSG:names_every_catalog_integer" {
+    var buf: [8]u8;
+    var k:   u32 = 0;
+    for (k < type.PRIM_COUNT) {
+        val kind: type.TypeKind = type.prim_kind_at(k);
+        if (type.prim_desc(kind).class == type.PRIM_CLASS_INT) {
+            val name: str   = type.prim_name(kind);
+            val n:    usize = str_len(name);
+            buf[0] = '`';
+            var i: usize = 0;
+            for (i < n) {
+                buf[1 + i] = name[i];
+                i          = i + 1;
+            }
+            buf[1 + n] = '`';
+            buf[2 + n] = 0;
+            if (!str_contains(LIT_SUFFIX_INT_MSG, (?buf[0])::str)) { ret 1; }
+        }
+        k = k + 1;
+    }
     ret 0;
 }
 
@@ -4052,8 +4161,10 @@ test "mach.lang.fe.comptime.eval_lit_int:out_of_range_for_its_suffix_rejected" {
 }
 
 test "mach.lang.fe.comptime.eval_lit_int:hex_overflow_rejected" {
-    val r: res[CTValue, EvalFail] = t_eval_int("0x1FFFFFFFFFFFFFFFF");
+    val r: res[CTValue, EvalFail] = t_eval_int("0x1FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
     if (sel r.ok) { ret 1; }
+    val fits: res[CTValue, EvalFail] = t_eval_int("0x1FFFFFFFFFFFFFFFF");
+    if (!t_ok_is(fits, 0xFFFFFFFFFFFFFFFF, 1, false)) { ret 2; }
     ret 0;
 }
 
@@ -4062,9 +4173,7 @@ fun t_view(s: str) View {
 }
 
 test "mach.lang.fe.comptime.apply_arith:int_min_idiv_traps" {
-    val int_value_r: res[CTValue, EvalFail] = int_value(t_i64_min());
-    if (sel int_value_r.err) { ret 99; }
-    val lhs:          CTValue                = int_value_r.ok;
+    val lhs:          CTValue                = t_ct_wide(0, 0x8000000000000000, false);
     val int_value_r2: res[CTValue, EvalFail] = int_value(0 - 1);
     if (sel int_value_r2.err) { ret 99; }
     val rhs:           CTValue                = int_value_r2.ok;
@@ -4467,8 +4576,8 @@ test "mach.lang.fe.comptime.apply_arith:u64_unsigned_div" {
     ret 0;
 }
 
-test "mach.lang.fe.comptime.apply_arith:u64_boundary_overflow" {
-    val t_eval_int_r: res[CTValue, EvalFail] = t_eval_int("0xFFFFFFFFFFFFFFFF");
+test "mach.lang.fe.comptime.apply_arith:u128_boundary_overflow" {
+    val t_eval_int_r: res[CTValue, EvalFail] = t_eval_int("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
     if (sel t_eval_int_r.err) { ret 99; }
     val big:         CTValue                = t_eval_int_r.ok;
     val int_value_r: res[CTValue, EvalFail] = int_value(1);
@@ -4480,17 +4589,83 @@ test "mach.lang.fe.comptime.apply_arith:u64_boundary_overflow" {
     val apply_arith_r: res[CTValue, EvalFail] = apply_arith(expr.BIN_SUB, big, one);
     if (sel apply_arith_r.err) { ret 99; }
     val dec: CTValue = apply_arith_r.ok;
-    if (!t_bool(apply_compare(expr.BIN_GT, dec, zero))) { ret 1; }
-    if (dec.data.i:~u64 != 0xFFFFFFFFFFFFFFFE)          { ret 1; }
+    if (!t_bool(apply_compare(expr.BIN_GT, dec, zero)))           { ret 1; }
+    if (!t_is(dec, 0xFFFFFFFFFFFFFFFE, 0xFFFFFFFFFFFFFFFF, true)) { ret 1; }
     val apply_arith_r2: res[CTValue, EvalFail] = apply_arith(expr.BIN_ADD, big, one);
     if (sel apply_arith_r2.ok) { ret 1; }
+    val u64_max: res[CTValue, EvalFail] = t_eval_int("0xFFFFFFFFFFFFFFFF");
+    if (sel u64_max.err) { ret 99; }
+    val carried: res[CTValue, EvalFail] = apply_arith(expr.BIN_ADD, u64_max.ok, one);
+    if (!t_ok_is(carried, 0, 1, true)) { ret 2; }
+    ret 0;
+}
+
+# every operator carries across the limb boundary and rejects only at 2^128 or
+# the i128 extremes
+test "mach.lang.fe.comptime.apply_arith:128_bit_operators" {
+    val two64: CTValue = t_ct_wide(0, 1, false);
+    val one:   CTValue = t_ct_wide(1, 0, false);
+    val three: CTValue = t_ct_wide(3, 0, false);
+    val neg1:  CTValue = t_ct_wide(0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, false);
+    val smax:  CTValue = t_ct_wide(0xFFFFFFFFFFFFFFFF, 0x7FFFFFFFFFFFFFFF, false);
+    val smin:  CTValue = t_ct_wide(0, 0x8000000000000000, false);
+    val umax:  CTValue = t_ct_wide(0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, true);
+
+    val sub_r: res[CTValue, EvalFail] = apply_arith(expr.BIN_SUB, two64, one);
+    if (!t_ok_is(sub_r, 0xFFFFFFFFFFFFFFFF, 0, false)) { ret 1; }
+    val mul_r: res[CTValue, EvalFail] = apply_arith(expr.BIN_MUL, two64, three);
+    if (!t_ok_is(mul_r, 0, 3, false)) { ret 2; }
+    val mul_neg: res[CTValue, EvalFail] = apply_arith(expr.BIN_MUL, two64, neg1);
+    if (!t_ok_is(mul_neg, 0, 0xFFFFFFFFFFFFFFFF, false)) { ret 3; }
+    if (!ct_is_negative(t_val(mul_neg)))                 { ret 4; }
+    val mul_over: res[CTValue, EvalFail] = apply_arith(expr.BIN_MUL, smax, three);
+    if (sel mul_over.ok) { ret 5; }
+    val div_r: res[CTValue, EvalFail] = apply_arith(expr.BIN_DIV, t_val(mul_r), three);
+    if (!t_ok_is(div_r, 0, 1, false)) { ret 6; }
+    val big_seven: CTValue                = t_ct_wide(7, 5, false);
+    val mod_r:     res[CTValue, EvalFail] = apply_arith(expr.BIN_MOD, big_seven, two64);
+    if (!t_ok_is(mod_r, 7, 0, false)) { ret 7; }
+    val neg_div: res[CTValue, EvalFail] = apply_arith(expr.BIN_DIV, t_val(mul_neg), three);
+    if (!t_ok_is(neg_div, 0xAAAAAAAAAAAAAAAB, 0xFFFFFFFFFFFFFFFF, false)) { ret 8; }
+    val add_over: res[CTValue, EvalFail] = apply_arith(expr.BIN_ADD, smax, one);
+    if (sel add_over.ok) { ret 9; }
+    val sub_over: res[CTValue, EvalFail] = apply_arith(expr.BIN_SUB, smin, one);
+    if (sel sub_over.ok) { ret 10; }
+    val udiv: res[CTValue, EvalFail] = apply_arith(expr.BIN_DIV, umax, two64);
+    if (!t_ok_is(udiv, 0xFFFFFFFFFFFFFFFF, 0, true)) { ret 11; }
+    val umod: res[CTValue, EvalFail] = apply_arith(expr.BIN_MOD, umax, two64);
+    if (!t_ok_is(umod, 0xFFFFFFFFFFFFFFFF, 0, true)) { ret 12; }
+    val umul_over: res[CTValue, EvalFail] = apply_arith(expr.BIN_MUL, umax, t_ct_wide(2, 0, true));
+    if (sel umul_over.ok) { ret 13; }
+    val usub_under: res[CTValue, EvalFail] = apply_arith(expr.BIN_SUB, t_ct_wide(0, 1, true), umax);
+    if (sel usub_under.ok) { ret 14; }
+    val and_r: res[CTValue, EvalFail] = apply_arith(expr.BIN_BIT_AND, umax, two64);
+    if (!t_ok_is(and_r, 0, 1, true)) { ret 15; }
+    val xor_r: res[CTValue, EvalFail] = apply_arith(expr.BIN_BIT_XOR, umax, t_ct_wide(0xF, 0xF, true));
+    if (!t_ok_is(xor_r, 0xFFFFFFFFFFFFFFF0, 0xFFFFFFFFFFFFFFF0, true)) { ret 16; }
+    val or_r: res[CTValue, EvalFail] = apply_arith(expr.BIN_BIT_OR, two64, three);
+    if (!t_ok_is(or_r, 3, 1, false)) { ret 17; }
+    ret 0;
+}
+
+test "mach.lang.fe.comptime.apply_compare:128_bit_orders" {
+    val two64: CTValue = t_ct_wide(0, 1, false);
+    val big:   CTValue = t_ct_wide(0xFFFFFFFFFFFFFFFF, 0, false);
+    val neg:   CTValue = t_ct_wide(0, 0xFFFFFFFFFFFFFFFF, false);
+    val umax:  CTValue = t_ct_wide(0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, true);
+    val smin:  CTValue = t_ct_wide(0, 0x8000000000000000, false);
+    if (!t_bool(apply_compare(expr.BIN_LT, big, two64)))                                 { ret 1; }
+    if (!t_bool(apply_compare(expr.BIN_LT, neg, big)))                                   { ret 2; }
+    if (!t_bool(apply_compare(expr.BIN_GT, umax, two64)))                                { ret 3; }
+    if (!t_bool(apply_compare(expr.BIN_LT, neg, umax)))                                  { ret 4; }
+    if (!t_bool(apply_compare(expr.BIN_LT, smin, neg)))                                  { ret 5; }
+    if (!t_bool(apply_compare(expr.BIN_EQ, two64, t_ct_wide(0, 1, true))))               { ret 6; }
+    if (t_bool(apply_compare(expr.BIN_EQ, neg, t_ct_wide(0, 0xFFFFFFFFFFFFFFFF, true)))) { ret 7; }
     ret 0;
 }
 
 test "mach.lang.fe.comptime.apply_arith:signed_overflow_traps" {
-    val int_value_r: res[CTValue, EvalFail] = int_value(t_i64_max());
-    if (sel int_value_r.err) { ret 99; }
-    val imax:         CTValue                = int_value_r.ok;
+    val imax:         CTValue                = t_ct_wide(0xFFFFFFFFFFFFFFFF, 0x7FFFFFFFFFFFFFFF, false);
     val int_value_r2: res[CTValue, EvalFail] = int_value(1);
     if (sel int_value_r2.err) { ret 99; }
     val one:           CTValue                = int_value_r2.ok;
@@ -4505,8 +4680,13 @@ test "mach.lang.fe.comptime.apply_arith:signed_overflow_traps" {
     val apply_arith_r2: res[CTValue, EvalFail] = apply_arith(expr.BIN_SUB, five, ten);
     if (sel apply_arith_r2.err) { ret 99; }
     val d: CTValue = apply_arith_r2.ok;
-    if (d.data.i != (0 - 5)) { ret 1; }
-    if (d.int_unsigned)      { ret 1; }
+    if (d.data.i != (0 - 5))                                    { ret 1; }
+    if (d.int_unsigned)                                         { ret 1; }
+    if (!t_is(d, (0 - 5)::i64:~u64, 0xFFFFFFFFFFFFFFFF, false)) { ret 2; }
+    val i64_max: res[CTValue, EvalFail] = int_value(t_i64_max());
+    if (sel i64_max.err) { ret 99; }
+    val past: res[CTValue, EvalFail] = apply_arith(expr.BIN_ADD, i64_max.ok, one);
+    if (!t_ok_is(past, 0x8000000000000000, 0, false)) { ret 3; }
     ret 0;
 }
 
@@ -4535,43 +4715,146 @@ test "mach.lang.fe.comptime.apply_int_shift:left_shift_high_bit_matches_the_equi
     val int_value_r: res[CTValue, EvalFail] = int_value(1);
     if (sel int_value_r.err) { ret 99; }
     val one:          CTValue                = int_value_r.ok;
-    val int_value_r2: res[CTValue, EvalFail] = int_value(63);
+    val int_value_r2: res[CTValue, EvalFail] = int_value(127);
     if (sel int_value_r2.err) { ret 99; }
-    val sh63:          CTValue                = int_value_r2.ok;
-    val apply_arith_r: res[CTValue, EvalFail] = apply_arith(expr.BIN_SHL, one, sh63);
+    val sh127:         CTValue                = int_value_r2.ok;
+    val apply_arith_r: res[CTValue, EvalFail] = apply_arith(expr.BIN_SHL, one, sh127);
     if (sel apply_arith_r.err) { ret 99; }
     val shifted:      CTValue                = apply_arith_r.ok;
-    val t_eval_int_r: res[CTValue, EvalFail] = t_eval_int("0x8000000000000000");
+    val t_eval_int_r: res[CTValue, EvalFail] = t_eval_int("0x80000000000000000000000000000000");
     if (sel t_eval_int_r.err) { ret 99; }
     val lit: CTValue = t_eval_int_r.ok;
 
     if (shifted.int_unsigned != lit.int_unsigned) { ret 1; }
-    if (shifted.data.i != lit.data.i)             { ret 2; }
+    if (!wide.eq(shifted.data.w, lit.data.w))     { ret 2; }
     if (ct_is_negative(shifted))                  { ret 3; }
 
     val int_value_r3: res[CTValue, EvalFail] = int_value(2);
     if (sel int_value_r3.err) { ret 99; }
     val two:            CTValue                = int_value_r3.ok;
-    val apply_arith_r2: res[CTValue, EvalFail] = apply_arith(expr.BIN_SHL, two, sh63);
+    val apply_arith_r2: res[CTValue, EvalFail] = apply_arith(expr.BIN_SHL, two, sh127);
     if (sel apply_arith_r2.ok) { ret 4; }
 
     ret 0;
 }
 
-test "mach.lang.fe.comptime.ct_negate:i64_u64_boundary" {
-    val int_value_r: res[CTValue, EvalFail] = int_value(t_i64_min());
-    if (sel int_value_r.err) { ret 99; }
-    val imin:        CTValue                = int_value_r.ok;
+# shifts cross the limb at 64, reach 127 and stop at 128
+test "mach.lang.fe.comptime.apply_int_shift:limb_crossing_and_bounds" {
+    val one:   CTValue                = t_ct_wide(1, 0, false);
+    val sh64:  CTValue                = t_ct_wide(64, 0, false);
+    val sh100: CTValue                = t_ct_wide(100, 0, false);
+    val sh128: CTValue                = t_ct_wide(128, 0, false);
+    val shl64: res[CTValue, EvalFail] = apply_arith(expr.BIN_SHL, one, sh64);
+    if (!t_ok_is(shl64, 0, 1, false)) { ret 1; }
+    val shl100: res[CTValue, EvalFail] = apply_arith(expr.BIN_SHL, one, sh100);
+    if (!t_ok_is(shl100, 0, 1::u64 << 36, false)) { ret 2; }
+    val back: res[CTValue, EvalFail] = apply_arith(expr.BIN_SHR, t_val(shl100), sh100);
+    if (!t_ok_is(back, 1, 0, false)) { ret 3; }
+    val too_far: res[CTValue, EvalFail] = apply_arith(expr.BIN_SHL, one, sh128);
+    if (sel too_far.ok)                                                                  { ret 4; }
+    if (!str_equals(too_far.err.message, "comptime shift amount must be less than 128")) { ret 5; }
+    val huge_amt: res[CTValue, EvalFail] = apply_arith(expr.BIN_SHR, one, t_ct_wide(0, 1, false));
+    if (sel huge_amt.ok) { ret 6; }
+    val neg: CTValue                = t_ct_wide(0, 0x8000000000000000, false);
+    val sar: res[CTValue, EvalFail] = apply_arith(expr.BIN_SHR, neg, sh100);
+    if (!t_ok_is(sar, 0xFFFFFFFFF8000000, 0xFFFFFFFFFFFFFFFF, false)) { ret 7; }
+    val umax: CTValue                = t_ct_wide(0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, true);
+    val lsr:  res[CTValue, EvalFail] = apply_arith(expr.BIN_SHR, umax, sh64);
+    if (!t_ok_is(lsr, 0xFFFFFFFFFFFFFFFF, 0, true)) { ret 8; }
+    val drop: res[CTValue, EvalFail] = apply_arith(expr.BIN_SHL, t_ct_wide(0, 2, false), t_ct_wide(63, 0, false));
+    if (sel drop.ok) { ret 9; }
+    ret 0;
+}
+
+test "mach.lang.fe.comptime.ct_negate:i128_u128_boundary" {
+    val imin:        CTValue                = t_ct_wide(0, 0x8000000000000000, false);
     val ct_negate_r: res[CTValue, EvalFail] = ct_negate(imin);
     if (sel ct_negate_r.err) { ret 99; }
     val n: CTValue = ct_negate_r.ok;
-    if (!n.int_unsigned)                     { ret 1; }
-    if (n.data.i:~u64 != 0x8000000000000000) { ret 1; }
-    val t_eval_int_r: res[CTValue, EvalFail] = t_eval_int("0xFFFFFFFFFFFFFFFF");
+    if (!n.int_unsigned)                       { ret 1; }
+    if (!t_is(n, 0, 0x8000000000000000, true)) { ret 1; }
+    val t_eval_int_r: res[CTValue, EvalFail] = t_eval_int("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
     if (sel t_eval_int_r.err) { ret 99; }
     val big:          CTValue                = t_eval_int_r.ok;
     val ct_negate_r2: res[CTValue, EvalFail] = ct_negate(big);
     if (sel ct_negate_r2.ok) { ret 1; }
+    val int_value_r: res[CTValue, EvalFail] = int_value(t_i64_min());
+    if (sel int_value_r.err) { ret 99; }
+    val i64_min_neg: res[CTValue, EvalFail] = ct_negate(int_value_r.ok);
+    if (!t_ok_is(i64_min_neg, 0x8000000000000000, 0, false)) { ret 2; }
+    val u64_max: res[CTValue, EvalFail] = t_eval_int("0xFFFFFFFFFFFFFFFF");
+    if (sel u64_max.err) { ret 99; }
+    val u64_max_neg: res[CTValue, EvalFail] = ct_negate(u64_max.ok);
+    if (!t_ok_is(u64_max_neg, 1, 0xFFFFFFFFFFFFFFFF, false)) { ret 3; }
+    ret 0;
+}
+
+# casts between 64 and 128 bits: truncation drops the high limb, sign
+# extension fills it, and a 128-bit reinterpret keeps every bit
+test "mach.lang.fe.comptime.cast_scalar:between_64_and_128_bits" {
+    var a:      A.Allocator;
+    val make_1: err[A.Error] = page.make(?a);
+    if (sel make_1.err) { ret 1; }
+    var types:  type.TypeInterner;
+    val init_r: err[fail.Fail] = type.init(?types, ?a);
+    if (sel init_r.err) { ret 1; }
+    fin { type.dnit(?types); }
+    val u128_o: opt[type.TypeId] = type.prim(?types, type.TYPE_U128);
+    val i128_o: opt[type.TypeId] = type.prim(?types, type.TYPE_I128);
+    val u64_o:  opt[type.TypeId] = type.prim(?types, type.TYPE_U64);
+    val i64_o:  opt[type.TypeId] = type.prim(?types, type.TYPE_I64);
+    val f64_o:  opt[type.TypeId] = type.prim(?types, type.TYPE_F64);
+    if (!sel u128_o.some) { ret 1; }
+    if (!sel i128_o.some) { ret 1; }
+    if (!sel u64_o.some)  { ret 1; }
+    if (!sel i64_o.some)  { ret 1; }
+    if (!sel f64_o.some)  { ret 1; }
+    val u128t: type.TypeId = u128_o.some;
+    val i128t: type.TypeId = i128_o.some;
+    val u64t:  type.TypeId = u64_o.some;
+    val i64t:  type.TypeId = i64_o.some;
+    val f64t:  type.TypeId = f64_o.some;
+
+    val neg1_r: res[CTValue, EvalFail] = int_value(0 - 1);
+    if (sel neg1_r.err) { ret 99; }
+    val neg1:   CTValue                = neg1_r.ok;
+    val sext_r: res[CTValue, EvalFail] = cast_scalar(?types, 8, neg1, i64t, i128t, false);
+    if (sel sext_r.err)                                                                                { ret 2; }
+    if (!t_is(sext_r.ok, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, false) || sext_r.ok.int_width != 128) { ret 3; }
+    val to_u128: res[CTValue, EvalFail] = cast_scalar(?types, 8, neg1, i64t, u128t, false);
+    if (!t_ok_is(to_u128, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, true)) { ret 4; }
+    val u64_max: CTValue                = t_ct_wide(0xFFFFFFFFFFFFFFFF, 0, true);
+    val zext_r:  res[CTValue, EvalFail] = cast_scalar(?types, 8, u64_max, u64t, i128t, false);
+    if (!t_ok_is(zext_r, 0xFFFFFFFFFFFFFFFF, 0, false)) { ret 5; }
+    val wide_v:  CTValue                = t_ct_wide(0x0FEDCBA987654321, 0x123456789ABCDEF0, true);
+    val trunc_r: res[CTValue, EvalFail] = cast_scalar(?types, 8, wide_v, u128t, u64t, false);
+    if (!t_ok_is(trunc_r, 0x0FEDCBA987654321, 0, true) || t_width(trunc_r) != 64) { ret 6; }
+    val to_i64: res[CTValue, EvalFail] = cast_scalar(?types, 8, t_ct_wide(0x8000000000000000, 7, true), u128t, i64t, false);
+    if (!t_ok_is(to_i64, 0x8000000000000000, 0xFFFFFFFFFFFFFFFF, false)) { ret 7; }
+    val reinterp: res[CTValue, EvalFail] = cast_scalar(?types, 8, t_ct_wide(5, 0x8000000000000000, true), u128t, i128t, true);
+    if (!t_ok_is(reinterp, 5, 0x8000000000000000, false) || !ct_is_negative(t_val(reinterp))) { ret 8; }
+    val narrow_reinterp: res[CTValue, EvalFail] = cast_scalar(?types, 8, wide_v, u128t, u64t, true);
+    if (sel narrow_reinterp.ok) { ret 9; }
+    val to_f: res[CTValue, EvalFail] = cast_scalar(?types, 8, t_ct_wide(0, 1, true), u128t, f64t, false);
+    if (t_float_of(to_f) != 18446744073709551616.0) { ret 10; }
+    val neg_f: res[CTValue, EvalFail] = cast_scalar(?types, 8, t_ct_wide(0, 0xFFFFFFFFFFFFFFFF, false), i128t, f64t, false);
+    if (t_float_of(neg_f) != -18446744073709551616.0) { ret 11; }
+    val from_f: res[CTValue, EvalFail] = cast_scalar(?types, 8, ct_float(18446744073709551616.0, float.FLOAT_W_64), f64t, u128t, false);
+    if (!t_ok_is(from_f, 0, 1, true)) { ret 12; }
+    ret 0;
+}
+
+test "mach.lang.fe.comptime.ct_int_u64:reads_only_what_fits" {
+    var out: u64 = 0;
+    if (!ct_int_u64(t_ct_wide(7, 0, false), ?out) || out != 7)                                  { ret 1; }
+    if (!ct_int_u64(t_ct_wide(0xFFFFFFFFFFFFFFFF, 0, true), ?out) || out != 0xFFFFFFFFFFFFFFFF) { ret 2; }
+    if (ct_int_u64(t_ct_wide(0, 1, false), ?out))                                               { ret 3; }
+    if (ct_int_u64(t_ct_wide(0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, false), ?out))             { ret 4; }
+    if (!ct_int_u64(t_ct_wide(0xFFFFFFFFFFFFFFFF, 0, false), ?out))                             { ret 5; }
+    var digits: [wide.FORMAT_CAP]u8;
+    if (!str_equals(ct_int_text(t_ct_wide(0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, false), ?digits[0]), "-1")) { ret 6; }
+    if (!str_equals(ct_int_text(t_ct_wide(0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, true), ?digits[0]),
+        "340282366920938463463374607431768211455")) { ret 7; }
     ret 0;
 }
 
@@ -5442,7 +5725,7 @@ test "mach.lang.fe.comptime.gate_depends_on:unlisted_expression_kind_fails_close
 
     var lit: expr.Expr;
     lit.kind                = expr.EXPR_KIND_LIT_INT;
-    lit.data.lit_int.value  = 1;
+    lit.data.lit_int.value  = wide.from_u64(1);
     lit.data.lit_int.suffix = expr.LIT_SUFFIX_NONE;
     val lit_r: res[id.ExprId, fail.Fail] = ast.add_expr(?a, lit);
     if (sel lit_r.err) {

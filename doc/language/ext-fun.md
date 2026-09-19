@@ -245,6 +245,35 @@ argument cannot change what an earlier one passed
 [3418]: https://github.com/briar-systems/mach/issues/3418
 [3416]: https://github.com/briar-systems/mach/issues/3416
 
+## 128-bit integers and `__int128`
+
+`u128` and `i128` are C's `unsigned __int128` and `__int128` at every boundary:
+16 bytes, 16-byte aligned, low half first in memory. Each convention passes them
+the way its C compilers do, and mach follows the convention rather than a rule
+of its own:
+
+| Convention | Argument | Return |
+|---|---|---|
+| System V x86-64 | two consecutive integer registers (`rdi:rsi`, ... `r8:r9`); when fewer than two are left the whole value goes to the stack, never split | `rax:rdx` |
+| AAPCS64 | the register number is rounded up to even and the value takes that pair (`x0:x1`, `x2:x3`, ...); a skipped register is not reused (C.10). When fewer than two are left the remaining registers are given up and the value goes to the stack, 16-byte aligned (C.11) | `x0:x1` |
+| RISC-V LP64 | two consecutive argument registers; with one left, that register carries the low half and the stack the high half; with none, the stack | `a0:a1` |
+| Win64 | a pointer to a caller-owned, 16-byte-aligned copy, in the argument's positional slot, like every other 16-byte object | `XMM0`, low half in the low 64 bits |
+
+Microsoft's x64 convention has no 128-bit integer (MSVC has no such type). The
+Win64 row is the convention GCC (mingw-w64) and Clang share: LLVM 18 made
+`i128` match `__int128` ("Changes to the X86 Backend", LLVM 18.1 release
+notes), and the Clang change that gave `fp128` the same treatment describes it
+as "identical to `i128`" and "the same as GCC": passed on the stack by
+reference and returned in `xmm0` ([llvm/llvm-project#115052][115052]). The
+corpus verifies each row against a clang `-O0` probe (`test/link/cases`).
+
+The mach side of a 128-bit return on Win64 goes through a 16-byte frame slot:
+the two lanes are stored and `XMM0` is loaded from it (`movups`), because no
+x86-64 move carries 128 bits between the integer and the vector bank. The
+caller reverses it. That is the same price a 16-byte vector pays on Win64.
+
+[115052]: https://github.com/llvm/llvm-project/pull/115052
+
 ## Symbol name
 
 The declaration names a C declaration, so its linker symbol is whatever the

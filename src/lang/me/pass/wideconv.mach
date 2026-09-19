@@ -1,0 +1,487 @@
+# a conversion between a float and an integer wider than the target's ALU has
+# no instruction on any target, so each becomes a call to a helper the
+# compiler provides with the program: `__mach_u128_to_f64`, `__mach_i128_to_f32`,
+# `__mach_f64_to_u128` and so on, one per pair of types. every conversion is
+# correctly rounded and branch-free. to a float: the integer is normalized by a
+# binary search over its leading zeros, its top lane keeps a sticky bit for
+# everything below, the lane converts natively (exact rounding needs the round
+# bit and one sticky bit, which a 64-bit lane has room for beyond any float
+# significand) and the result is scaled by the exact power of two the
+# normalization removed. from a float: the value splits at 2^64 into two lanes
+# by exact float arithmetic, each converting natively; a value outside the
+# integer's range converts as the target's own lane conversion does with an
+# out-of-range operand, the same contract as every `::` into an integer. a
+# signed conversion is the unsigned one on the magnitude with the sign
+# restored. the helpers cover a two-lane width, the widest any target here
+# realizes (#3511)
+
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.me.ir;
+use mach.lang.me.ir.builder;
+use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use wh: mach.lang.me.pass.widehelper;
+use mach.lang.target;
+use target_testing: mach.lang.target.testing;
+use A:              std.allocator;
+use std.allocator.page;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+pub fun run(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner) res[bool, fail.Fail] {
+    var changed: bool = false;
+    val count:   u32  = m.function_len;
+    var fi:      u32  = 0;
+    # helpers appended while walking are never walked: their conversions are
+    # already at lane width
+    for (fi < count) {
+        if ((m.functions[fi].flags & ir.FN_FLAG_EXTERN) != 0) {
+            fi = fi + 1;
+            cnt;
+        }
+        var bi: u32 = 0;
+        for (bi < m.functions[fi].block_count) {
+            var ii: u32 = 0;
+            for (ii < m.functions[fi].blocks[bi].instr_count) {
+                val iid: u32                  = m.functions[fi].blocks[bi].instructions[ii]::u32;
+                val r:   res[bool, fail.Fail] = rewrite_one(m, tgt, itn, ?m.functions[fi].instrs[iid]);
+                if (sel r.err) { ret r; }
+                if (r.ok)      { changed = true; }
+                ii = ii + 1;
+            }
+            bi = bi + 1;
+        }
+        fi = fi + 1;
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+fun to_float(k: instruction.InstrKind) bool {
+    ret k == instruction.OP_UI_TO_FP || k == instruction.OP_SI_TO_FP;
+}
+
+fun from_float(k: instruction.InstrKind) bool {
+    ret k == instruction.OP_FP_TO_UI || k == instruction.OP_FP_TO_SI;
+}
+
+fun is_signed(k: instruction.InstrKind) bool {
+    ret k == instruction.OP_SI_TO_FP || k == instruction.OP_FP_TO_SI;
+}
+
+fun float_bits(m: *ir.Module, ty: ir_type.IrTypeId) u32 {
+    val found: opt[*ir_type.IrType] = ir_type.get(?m.types, ty);
+    if (sel found.none)                       { ret 0; }
+    if (found.some.kind != ir_type.IRT_FLOAT) { ret 0; }
+    ret found.some.data.bits;
+}
+
+fun rewrite_one(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner, ins: *instruction.Instruction) res[bool, fail.Fail] {
+    if (ins.operand_count != 1)                       { ret res[bool, fail.Fail].ok{false}; }
+    if (!to_float(ins.kind) && !from_float(ins.kind)) { ret res[bool, fail.Fail].ok{false}; }
+    var ity: ir_type.IrTypeId = ins.ty;
+    var fty: ir_type.IrTypeId = ins.operands[0].ty;
+    if (to_float(ins.kind)) {
+        ity = ins.operands[0].ty;
+        fty = ins.ty;
+    }
+    val bits:  u32 = wh.wide_bits(m, tgt, ity);
+    val fbits: u32 = float_bits(m, fty);
+    if (bits == 0 || fbits == 0) { ret res[bool, fail.Fail].ok{false}; }
+
+    val helper: res[u32, fail.Fail] = ensure_helper(m, itn, ins.kind, ity, bits, fty, fbits);
+    if (sel helper.err) { ret res[bool, fail.Fail].err{helper.err}; }
+    var args: [1]value.Value;
+    args[0] = ins.operands[0];
+    val rw: err[fail.Fail] = wh.rewrite_to_call(m, ins, helper.ok, ?args[0], 1);
+    if (sel rw.err) { ret res[bool, fail.Fail].err{rw.err}; }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+fun int_stem(signed: bool) str {
+    if (signed) { ret "i"; }
+    ret "u";
+}
+
+# the helper for this conversion, synthesized on first use
+fun ensure_helper(m: *ir.Module, itn: *intern.Interner, k: instruction.InstrKind, ity: ir_type.IrTypeId, bits: u32,
+    fty: ir_type.IrTypeId, fbits: u32) res[u32, fail.Fail] {
+    val signed: bool                = is_signed(k);
+    var name_r: res[str, fail.Fail] = wh.name_conv(m.alloc, int_stem(signed), bits, "f", fbits);
+    var params: [1]ir_type.IrTypeId;
+    var ret_ty: ir_type.IrTypeId    = fty;
+    params[0] = ity;
+    if (from_float(k)) {
+        name_r    = wh.name_conv(m.alloc, "f", fbits, int_stem(signed), bits);
+        params[0] = fty;
+        ret_ty    = ity;
+    }
+    if (sel name_r.err) { ret res[u32, fail.Fail].err{name_r.err}; }
+    val h: res[wh.Helper, fail.Fail] = wh.find_or_add(m, itn, name_r.ok, ret_ty, ?params[0], 1);
+    if (sel h.err)   { ret res[u32, fail.Fail].err{h.err}; }
+    if (!h.ok.fresh) { ret res[u32, fail.Fail].ok{h.ok.idx}; }
+    val idx: u32 = h.ok.idx;
+
+    var body: err[fail.Fail] = err[fail.Fail].ok{};
+    if (k == instruction.OP_UI_TO_FP) {
+        body = build_u_to_f(m, idx, ity, bits, fty, fbits);
+    }
+    or (k == instruction.OP_SI_TO_FP) {
+        val inner: res[u32, fail.Fail] = ensure_helper(m, itn, instruction.OP_UI_TO_FP, ity, bits, fty, fbits);
+        if (sel inner.err) { ret inner; }
+        body = build_s_to_f(m, idx, inner.ok, ity, bits, fty, fbits);
+    }
+    or (k == instruction.OP_FP_TO_UI) {
+        if (fbits < 64) {
+            # a narrower float extends exactly, so the f64 helper serves it
+            val f64_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_float(?m.types, 64);
+            if (sel f64_r.err) { ret res[u32, fail.Fail].err{f64_r.err}; }
+            val inner: res[u32, fail.Fail] = ensure_helper(m, itn, k, ity, bits, f64_r.ok, 64);
+            if (sel inner.err) { ret inner; }
+            body = build_ext_then_call(m, idx, inner.ok, ity, f64_r.ok);
+        }
+        or {
+            body = build_f_to_u(m, idx, ity, bits, fty);
+        }
+    }
+    or {
+        val f64_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_float(?m.types, 64);
+        if (sel f64_r.err) { ret res[u32, fail.Fail].err{f64_r.err}; }
+        val inner: res[u32, fail.Fail] = ensure_helper(m, itn, instruction.OP_FP_TO_UI, ity, bits, f64_r.ok, 64);
+        if (sel inner.err) { ret inner; }
+        body = build_f_to_s(m, idx, inner.ok, ity, bits, fty, fbits, f64_r.ok);
+    }
+    if (sel body.err) { ret res[u32, fail.Fail].err{body.err}; }
+    ret res[u32, fail.Fail].ok{idx};
+}
+
+fun open_entry(e: *wh.Em) err[fail.Fail] {
+    val entry_r: res[id.BlockId, fail.Fail] = builder.new_block(?e.b);
+    if (sel entry_r.err) { ret err[fail.Fail].err{entry_r.err}; }
+    builder.set_block(?e.b, entry_r.ok);
+    ret err[fail.Fail].ok{};
+}
+
+# the float's significand width plus the round bit and one sticky bit fit in
+# a lane of this many bits, and the lane keeps that many top bits of the value
+fun lane_bits_for(fbits: u32) u32 {
+    if (fbits == 64) { ret 64; }
+    ret 32;
+}
+
+fun float_bias(fbits: u32) u32 {
+    if (fbits == 64) { ret 1023; }
+    ret 127;
+}
+
+fun float_mantissa(fbits: u32) u32 {
+    if (fbits == 64) { ret 52; }
+    ret 23;
+}
+
+# x normalized so its top bit is set (0 stays 0) and the count of positions it
+# moved, both of the wide type: a binary search over the leading zeros, one
+# select per power of two, with no branch on the value
+fun normalize(e: *wh.Em, x: value.Value, ity: ir_type.IrTypeId, bits: u32, out_shift: *value.Value) value.Value {
+    val zero: value.Value = value.const_int(0, ity);
+    var cur:  value.Value = x;
+    var n:    value.Value = zero;
+    var k:    u32         = bits / 2;
+    var lg:   u32         = 0;
+    var t:    u32         = k;
+    for (t > 1) {
+        lg = lg + 1;
+        t  = t / 2;
+    }
+    for (k >= 1) {
+        val top:  value.Value = wh.shr_u(e, cur, value.const_int((bits - k)::u64, ity));
+        val z:    value.Value = wh.zext(e, wh.eq(e, top, zero), ity);
+        val mask: value.Value = wh.sub(e, zero, z);
+        val sh:   value.Value = wh.shl(e, cur, value.const_int(k::u64, ity));
+        cur = wh.bxor(e, cur, wh.band(e, wh.bxor(e, cur, sh), mask));
+        n   = wh.add(e, n, wh.shl(e, z, value.const_int(lg::u64, ity)));
+        if (k == 1) { k = 0; }
+        or {
+            k  = k / 2;
+            lg = lg - 1;
+        }
+    }
+    @out_shift = n;
+    ret cur;
+}
+
+fun build_u_to_f(m: *ir.Module, idx: u32, ity: ir_type.IrTypeId, bits: u32, fty: ir_type.IrTypeId, fbits: u32) err[fail.Fail] {
+    var e:  wh.Em          = wh.em_init(m, idx);
+    val op: err[fail.Fail] = open_entry(?e);
+    if (sel op.err) { ret op; }
+    val lane:  u32                              = lane_bits_for(fbits);
+    val i64_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel i64_r.err) { ret err[fail.Fail].err{i64_r.err}; }
+    val ifb_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, fbits);
+    if (sel ifb_r.err) { ret err[fail.Fail].err{ifb_r.err}; }
+    val i64ty: ir_type.IrTypeId = i64_r.ok;
+    val ifty:  ir_type.IrTypeId = ifb_r.ok;
+
+    val x:   value.Value = value.param(0, ity);
+    var n:   value.Value;
+    val cur: value.Value = normalize(?e, x, ity, bits, ?n);
+
+    # the top lane, its lowest bit also saying whether anything below is set
+    val top:    value.Value = wh.trunc(?e, wh.shr_u(?e, cur, value.const_int((bits - lane)::u64, ity)), i64ty);
+    val below:  value.Value = wh.shl(?e, cur, value.const_int(lane::u64, ity));
+    val sticky: value.Value = wh.zext(?e, wh.ne(?e, below, value.const_int(0, ity)), i64ty);
+    val t:      value.Value = wh.bor(?e, top, sticky);
+    val f:      value.Value = wh.ui_to_fp(?e, t, fty);
+
+    # x = t * 2^(bits - lane - n): the scale is a power of two built from its
+    # exponent field, exact, and the product is exact
+    val e0:    value.Value = value.const_int((bits - lane + float_bias(fbits))::u64, ifty);
+    val expo:  value.Value = wh.sub(?e, e0, wh.trunc(?e, n, ifty));
+    val scale: value.Value = wh.bitcast(?e, wh.shl(?e, expo, value.const_int(float_mantissa(fbits)::u64, ifty)), fty);
+    val out:   value.Value = wh.mul(?e, f, scale);
+    ret wh.finish(?e, out);
+}
+
+# the magnitude through the unsigned helper, the sign copied into the float
+fun build_s_to_f(m: *ir.Module, idx: u32, inner: u32, ity: ir_type.IrTypeId, bits: u32, fty: ir_type.IrTypeId, fbits: u32) err[fail.Fail] {
+    var e:  wh.Em          = wh.em_init(m, idx);
+    val op: err[fail.Fail] = open_entry(?e);
+    if (sel op.err) { ret op; }
+    val ifb_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, fbits);
+    if (sel ifb_r.err) { ret err[fail.Fail].err{ifb_r.err}; }
+    val ifty: ir_type.IrTypeId = ifb_r.ok;
+
+    val x:    value.Value = value.param(0, ity);
+    val fill: value.Value = wh.shr_s(?e, x, value.const_int((bits - 1)::u64, ity));
+    val mag:  value.Value = wh.sub(?e, wh.bxor(?e, x, fill), fill);
+    var args: [1]value.Value;
+    args[0] = mag;
+    val f:       value.Value = wh.call(?e, inner, ?args[0], 1, fty);
+    val signbit: value.Value = wh.band(?e, wh.trunc(?e, fill, ifty), value.const_int(1u64 << (fbits - 1)::u64, ifty));
+    val out:     value.Value = wh.bitcast(?e, wh.bxor(?e, wh.bitcast(?e, f, ifty), signbit), fty);
+    ret wh.finish(?e, out);
+}
+
+# hi = trunc(x / 2^64), lo = trunc(x - hi * 2^64): both float steps are exact
+# for any x below 2^128, each lane converts natively
+fun build_f_to_u(m: *ir.Module, idx: u32, ity: ir_type.IrTypeId, bits: u32, fty: ir_type.IrTypeId) err[fail.Fail] {
+    var e:  wh.Em          = wh.em_init(m, idx);
+    val op: err[fail.Fail] = open_entry(?e);
+    if (sel op.err) { ret op; }
+    val i64_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel i64_r.err) { ret err[fail.Fail].err{i64_r.err}; }
+    val i64ty: ir_type.IrTypeId = i64_r.ok;
+
+    val x:     value.Value = value.param(0, fty);
+    val two64: value.Value = value.const_float(18446744073709551616.0, fty);
+    val inv64: value.Value = value.const_float(1.0 / 18446744073709551616.0, fty);
+    val hi:    value.Value = wh.fp_to_ui(?e, wh.mul(?e, x, inv64), i64ty);
+    val back:  value.Value = wh.mul(?e, wh.ui_to_fp(?e, hi, fty), two64);
+    val lo:    value.Value = wh.fp_to_ui(?e, wh.sub(?e, x, back), i64ty);
+    val whi:   value.Value = wh.shl(?e, wh.zext(?e, hi, ity), value.const_int((bits - 64)::u64, ity));
+    val out:   value.Value = wh.bor(?e, whi, wh.zext(?e, lo, ity));
+    ret wh.finish(?e, out);
+}
+
+# |x| through the f64 unsigned helper, negated when the sign bit is set
+fun build_f_to_s(m: *ir.Module, idx: u32, inner: u32, ity: ir_type.IrTypeId, bits: u32, fty: ir_type.IrTypeId, fbits: u32,
+    f64ty: ir_type.IrTypeId) err[fail.Fail] {
+    var e:  wh.Em          = wh.em_init(m, idx);
+    val op: err[fail.Fail] = open_entry(?e);
+    if (sel op.err) { ret op; }
+    val i64_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel i64_r.err) { ret err[fail.Fail].err{i64_r.err}; }
+    val i64ty: ir_type.IrTypeId = i64_r.ok;
+
+    var x: value.Value = value.param(0, fty);
+    if (fbits < 64) { x = wh.fp_ext(?e, x, f64ty); }
+    val raw:  value.Value = wh.bitcast(?e, x, i64ty);
+    val fill: value.Value = wh.shr_s(?e, raw, value.const_int(63, i64ty));
+    val mag:  value.Value = wh.bitcast(?e, wh.band(?e, raw, value.const_int(0x7FFF_FFFF_FFFF_FFFF, i64ty)), f64ty);
+    var args: [1]value.Value;
+    args[0] = mag;
+    val u:    value.Value = wh.call(?e, inner, ?args[0], 1, ity);
+    val mask: value.Value = wh.sext(?e, fill, ity);
+    val out:  value.Value = wh.sub(?e, wh.bxor(?e, u, mask), mask);
+    ret wh.finish(?e, out);
+}
+
+# a narrower float extended exactly and handed to the f64 helper
+fun build_ext_then_call(m: *ir.Module, idx: u32, inner: u32, ity: ir_type.IrTypeId, f64ty: ir_type.IrTypeId) err[fail.Fail] {
+    var e:  wh.Em          = wh.em_init(m, idx);
+    val op: err[fail.Fail] = open_entry(?e);
+    if (sel op.err) { ret op; }
+    val x:    value.Value = value.param(0, m.functions[idx].params[0].ty);
+    var args: [1]value.Value;
+    args[0] = wh.fp_ext(?e, x, f64ty);
+    val out: value.Value = wh.call(?e, inner, ?args[0], 1, ity);
+    ret wh.finish(?e, out);
+}
+
+rec TCase {
+    alloc: A.Allocator;
+    reg:   target.TargetRegistry;
+    itn:   intern.Interner;
+    m:     ir.Module;
+    ops:   [8]id.InstructionId;
+}
+
+# a function converting `p0` (the integer) and `p1` (the float) both ways, in
+# both signednesses, at `bits` and `fbits`: eight conversions
+fun t_case(c: *TCase, bits: u32, fbits: u32) bool {
+    val rm: res[ir.Module, fail.Fail] = ir.init(?c.alloc, intern.STR_NIL);
+    if (sel rm.err) { ret false; }
+    c.m = rm.ok;
+    val ity: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?c.m.types, bits);
+    if (sel ity.err) { ret false; }
+    val fty: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_float(?c.m.types, fbits);
+    if (sel fty.err) { ret false; }
+    val rf: res[u32, fail.Fail] = ir.function_add(?c.m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) { ret false; }
+    var bld: builder.Builder = builder.init(?c.m);
+    builder.set_function(?bld, ?c.m.functions[rf.ok]);
+    val rb: res[id.BlockId, fail.Fail] = builder.new_block(?bld);
+    if (sel rb.err) { ret false; }
+    builder.set_block(?bld, rb.ok);
+    val p0: value.Value                 = value.param(0, ity.ok);
+    val p1: value.Value                 = value.param(1, fty.ok);
+    val r0: res[value.Value, fail.Fail] = builder.emit_ui_to_fp(?bld, p0, fty.ok);
+    val r1: res[value.Value, fail.Fail] = builder.emit_si_to_fp(?bld, p0, fty.ok);
+    val r2: res[value.Value, fail.Fail] = builder.emit_fp_to_ui(?bld, p1, ity.ok);
+    val r3: res[value.Value, fail.Fail] = builder.emit_fp_to_si(?bld, p1, ity.ok);
+    if (sel r0.err) { ret false; }
+    if (sel r1.err) { ret false; }
+    if (sel r2.err) { ret false; }
+    if (sel r3.err) { ret false; }
+    c.ops[0] = r0.ok.data.instr;
+    c.ops[1] = r1.ok.data.instr;
+    c.ops[2] = r2.ok.data.instr;
+    c.ops[3] = r3.ok.data.instr;
+    ret true;
+}
+
+fun t_target(reg: *target.TargetRegistry, isa_name: str, out: *target.Target) bool {
+    var abi: str = "sysv64";
+    if (str_equals(isa_name, "aarch64")) { abi = "aapcs64"; }
+    if (str_equals(isa_name, "riscv64")) { abi = "lp64d"; }
+    var os: str = "linux";
+    if (str_equals(isa_name, "riscv32")) {
+        abi = "ilp32";
+        os  = "freestanding";
+    }
+    val rt: res[target.Target, fail.Fail] = target.select_of(reg, isa_name, os, abi, "");
+    if (sel rt.err) { ret false; }
+    @out = rt.ok;
+    ret true;
+}
+
+fun t_callee_name(c: *TCase, iid: id.InstructionId) opt[str] {
+    val ins: *instruction.Instruction = ?c.m.functions[0].instrs[iid::u32];
+    if (ins.kind != instruction.OP_CALL || ins.operand_count != 2) { ret opt[str].none{}; }
+    if (ins.operands[0].kind != value.VAL_FN)                      { ret opt[str].none{}; }
+    ret intern.lookup(?c.itn, c.m.functions[ins.operands[0].data.fn_ix].name);
+}
+
+fun t_has_fn(c: *TCase, text: str) bool {
+    var i: u32 = 0;
+    for (i < c.m.function_len) {
+        val n: opt[str] = intern.lookup(?c.itn, c.m.functions[i].name);
+        if (sel n.some && str_equals(n.some, text)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the pass over the eight conversions on `isa_name`: 0 when each became a call
+# to its own helper, `helpers` the count of helpers the module then holds
+fun t_run(isa_name: str, bits: u32, fbits: u32, expect_rewrite: bool, helpers: u32, names: *str) i32 {
+    var c:    TCase;
+    val made: err[A.Error] = page.make(?c.alloc);
+    if (sel made.err) { ret 100; }
+    c.reg = target.registry_init();
+    fin { target.registry_dnit(?c.reg); }
+    c.itn = intern.init(?c.alloc);
+    fin { intern.dnit(?c.itn); }
+    val registered: err[fail.Fail] = target.register_all(?c.reg, target_testing.debug_descriptor);
+    if (sel registered.err) { ret 101; }
+    var tgt: target.Target;
+    if (!t_target(?c.reg, isa_name, ?tgt)) { ret 102; }
+    if (!t_case(?c, bits, fbits))          { ret 103; }
+    fin { ir.dnit(?c.m); }
+    val ran: res[bool, fail.Fail] = run(?c.m, ?tgt, ?c.itn);
+    if (sel ran.err)              { ret 104; }
+    if (ran.ok != expect_rewrite) { ret 1; }
+    if (!expect_rewrite) {
+        if (c.m.function_len != 1) { ret 2; }
+        ret 0;
+    }
+    if (c.m.function_len != 1 + helpers) { ret 3; }
+    var i: u32 = 1;
+    for (i < c.m.function_len) {
+        val f: *ir.Function = ?c.m.functions[i];
+        if ((f.flags & ir.FN_FLAG_WEAK) == 0 || (f.flags & ir.FN_FLAG_NOINLINE) == 0) { ret 4; }
+        if (f.param_count != 1 || f.block_count == 0)                                 { ret 5; }
+        i = i + 1;
+    }
+    var k: u32 = 0;
+    for (k < 4) {
+        val n: opt[str] = t_callee_name(?c, c.ops[k]);
+        if (sel n.none)                    { ret 6; }
+        if (!str_equals(n.some, names[k])) { ret 7; }
+        k = k + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.me.pass.wideconv.run:wide_float_conversions_become_calls_to_one_helper_each" {
+    val n64: [4]str = [4]str{"__mach_u128_to_f64", "__mach_i128_to_f64", "__mach_f64_to_u128", "__mach_f64_to_i128"};
+    val n32: [4]str = [4]str{"__mach_u128_to_f32", "__mach_i128_to_f32", "__mach_f32_to_u128", "__mach_f32_to_i128"};
+    # f64: the four helpers and nothing else
+    if (t_run("x86_64", 128, 64, true, 4, ?n64[0]) != 0)  { ret 1; }
+    if (t_run("aarch64", 128, 64, true, 4, ?n64[0]) != 0) { ret 2; }
+    if (t_run("riscv64", 128, 64, true, 4, ?n64[0]) != 0) { ret 3; }
+    # f32: the two from-float helpers extend and call the f64 unsigned helper,
+    # so one more function than the four named
+    if (t_run("x86_64", 128, 32, true, 5, ?n32[0]) != 0) { ret 4; }
+    # a conversion at a lane width is left alone
+    if (t_run("x86_64", 64, 64, false, 0, ?n64[0]) != 0) { ret 5; }
+    # a width the target does not realize is left for the lowering to refuse
+    if (t_run("riscv32", 128, 64, false, 0, ?n64[0]) != 0) { ret 6; }
+    # a 64-bit conversion on a 32-bit ALU is the legalizer's inline expansion
+    if (t_run("riscv32", 64, 64, false, 0, ?n64[0]) != 0) { ret 7; }
+    ret 0;
+}
+
+# a helper asked for twice is synthesized once, and a signed conversion's helper
+# brings the unsigned one it calls
+test "mach.lang.me.pass.wideconv.ensure_helper:helpers_are_shared_and_signed_calls_unsigned" {
+    var c:    TCase;
+    val made: err[A.Error] = page.make(?c.alloc);
+    if (sel made.err) { ret 100; }
+    c.itn = intern.init(?c.alloc);
+    fin { intern.dnit(?c.itn); }
+    if (!t_case(?c, 128, 64)) { ret 101; }
+    fin { ir.dnit(?c.m); }
+    val ity: ir_type.IrTypeId    = c.m.functions[0].instrs[c.ops[2]::u32].ty;
+    val fty: ir_type.IrTypeId    = c.m.functions[0].instrs[c.ops[0]::u32].ty;
+    val s1:  res[u32, fail.Fail] = ensure_helper(?c.m, ?c.itn, instruction.OP_SI_TO_FP, ity, 128, fty, 64);
+    if (sel s1.err)                                                                 { ret 1; }
+    if (c.m.function_len != 3)                                                      { ret 2; }
+    if (!t_has_fn(?c, "__mach_u128_to_f64") || !t_has_fn(?c, "__mach_i128_to_f64")) { ret 3; }
+    val s2: res[u32, fail.Fail] = ensure_helper(?c.m, ?c.itn, instruction.OP_SI_TO_FP, ity, 128, fty, 64);
+    if (sel s2.err)                              { ret 4; }
+    if (s2.ok != s1.ok || c.m.function_len != 3) { ret 5; }
+    val f1: res[u32, fail.Fail] = ensure_helper(?c.m, ?c.itn, instruction.OP_FP_TO_SI, ity, 128, fty, 64);
+    if (sel f1.err)                                                                 { ret 6; }
+    if (c.m.function_len != 5)                                                      { ret 7; }
+    if (!t_has_fn(?c, "__mach_f64_to_u128") || !t_has_fn(?c, "__mach_f64_to_i128")) { ret 8; }
+    ret 0;
+}
