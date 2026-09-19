@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- On riscv32, a `u8`, `i8`, `u16` or `i16` value widened to `u64` or `i64` is masked or sign-extended to its width. Sub-word arithmetic wraps in a 32-bit register without masking, and the width pass copied that register straight into the low lane of the 64-bit value, so `var a: u8 = 240 + s; a = a + 8; a::u64` kept the carry above bit 8 and an `i8` took its sign fill from bit 31 of the register, even after a zero-extending byte load. The pass now emits the same lane-wide convert the scalar widen uses for the lane that receives the source, and takes the sign fill from that converted lane, one rule for every sub-word width and both signednesses. All 21 riscv32 corpus cases that `test/golden/riscv32/NORUN` listed as computing a wrong checksum under qemu now agree with the C reference, and the file is gone. Every 64-bit target and SPIR-V are unchanged (#3616).
+
 ## [5.6.1] - 2026-09-18
 
 ### Removed
