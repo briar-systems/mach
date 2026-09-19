@@ -137,7 +137,8 @@ error: this is mach 5.2.1, and the dependency closure does not accept it:
 A root manifest without `mach` builds, with a warning that prints the line to
 add (`mach.toml: [project] states no compiler range; add mach = "^5.3", the
 oldest release that reads the key, and raise it when the project uses a later
-feature`). The key is optional. A dependency without it states no constraint. `mach init` writes the same range. It is the oldest
+feature`). The next major release makes the key required for a root manifest (#3671).
+A dependency without it states no constraint. `mach init` writes the same range. It is the oldest
 release of the running compiler's major that reads the key: `^5.3` for every
 5.x compiler, since 5.3.0 is the first release that accepts `mach`, and `^N.0`
 for a later major N, since a caret cannot span majors. The range depends only on
