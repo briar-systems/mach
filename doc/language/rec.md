@@ -77,11 +77,13 @@ By default the compiler may insert padding between fields for alignment. The
 bytes (a power of two), and `#[packed]` lays the record out with no padding
 at all, for a shape whose layout is fixed elsewhere (a C struct, a file
 header, a wire frame); see [decorators.md](decorators.md#packed--no-padding)
-for what a packed record refuses.
+for what a packed record refuses. `#[volatile]` makes every access to the
+record's storage a volatile access, the way a memory-mapped register block is
+declared; see [decorators.md](decorators.md#volatile--every-access-to-the-type-is-a-volatile-access).
 
 ## See also
 
 - [tag.md](tag.md) - tagged value
 - [uni.md](uni.md) - overlapping-memory counterpart
-- [decorators.md](decorators.md) - #[align] and #[packed]
+- [decorators.md](decorators.md) - #[align], #[packed] and #[volatile]
 - [comptime-intrinsics.md](comptime-intrinsics.md) - $size_of, $offset_of
