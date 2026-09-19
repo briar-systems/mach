@@ -14,6 +14,7 @@ test/
   golden/<target>/SKIPS         cases that target cannot build, one per line
   golden/<target>/NORUN         cases it builds and diffs but whose differential is not run yet
   lib/fold.mach, lib/corpus.h   the checksum fold both sides use
+  lib/fold128.mach              the 128-bit folds, imported only by the cases that need them
   lib/start_<target>.mach       the process entry a direct target's run bin reports through
   lib/elf_loadable.py           re-lays a freestanding ELF so qemu-user can map it
   link/cases/<name>/            one link case: a project, case.conf, expect*.txt

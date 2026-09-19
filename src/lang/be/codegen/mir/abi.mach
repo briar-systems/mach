@@ -322,16 +322,13 @@ fun agg_layout(ctx: *context.LowerCtx, ty: type.IrTypeId, is_aggr: bool) abi.Agg
     ret out;
 }
 
+# the general registers an argument consumes are the slot's declaration, not
+# a count of its pieces: an ABI may skip or exhaust registers it never fills
 fun advance_arg_cursors(slot: *abi.ParamSlot, gp_used: *i32, fp_used: *i32) {
+    @gp_used = @gp_used + slot.gp_consumed;
     var i: u32 = 0;
     for (i < slot.piece_count) {
-        val k: abi.PieceKind = slot.pieces[i].kind;
-        if (k == abi.PIECE_GP) {
-            @gp_used = @gp_used + 1;
-        }
-        or (k == abi.PIECE_FP) {
-            @fp_used = @fp_used + 1;
-        }
+        if (slot.pieces[i].kind == abi.PIECE_FP) { @fp_used = @fp_used + 1; }
         i = i + 1;
     }
 }
@@ -482,6 +479,7 @@ pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type:
             stack_off   = round_up_i64(stack_off, stack_arg_align(ctx.tgt, slot.class, pal, fixed_natural));
             slot.offset = stack_off;
             stack_off   = stack_off + stack_arg_bytes(ctx.tgt, slot.size, fixed_natural);
+            gp_used     = gp_used + slot.gp_consumed;
         }
         or {
             advance_arg_cursors(?slot, ?gp_used, ?fp_used);
@@ -800,6 +798,7 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         if (pidx >= layout.param_count) {
             if (is_stack_slot_class(slot.class)) {
                 stack_off = stack_off + stack_arg_bytes(ctx.tgt, slot.size, false);
+                gp_used   = gp_used + slot.gp_consumed;
             }
             or {
                 advance_arg_cursors(?slot, ?gp_used, ?fp_used);
@@ -1082,10 +1081,14 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, registers: *mir.Mir
     stack_off: i64, is_aggr: bool, ty: type.IrTypeId, natural: bool) err[fail.Fail] {
     val size: u64 = type.byte_size_for_machine(ctx.types, ty, ctx.layout)::u64;
 
-    if (is_aggr && (slot.class == abi.CLASS_BYREF || slot.class == abi.CLASS_STACK_BYREF)) {
+    val scalar_byref: bool = int_by_reference(ctx, ty) &&
+        (slot.class == abi.CLASS_BYREF || slot.class == abi.CLASS_STACK_BYREF);
+    if (is_aggr && (slot.class == abi.CLASS_BYREF || slot.class == abi.CLASS_STACK_BYREF) || scalar_byref) {
         var owned: mir.VRegId     = mir.MIR_VREG_NIL;
-        val cr:    err[fail.Fail] = copy_aggregate_to_temp(ctx, mb, argop, ty, ?owned);
-        if (sel cr.err) { ret cr; }
+        var cr:    err[fail.Fail] = err[fail.Fail].ok{};
+        if (scalar_byref) { cr = copy_scalar_to_temp(ctx, mb, argop, ty, ?owned); }
+        or                { cr = copy_aggregate_to_temp(ctx, mb, argop, ty, ?owned); }
+        if (sel cr.err)   { ret cr; }
         if (slot.class == abi.CLASS_STACK_BYREF) {
             val sp: mir.PRegId = mir.preg_id(ctx.tgt.model.stack_ptr_reg);
             ret context.emit_store_to(ctx, mb, mir.op_mem_preg(sp, stack_off), mir.op_vreg(owned));
@@ -1143,6 +1146,7 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, registers: *mir.Mir
         ret materialize_pieces(ctx, mb, slot, plan);
     }
     if (slot.class == abi.CLASS_FP) {
+        if (int_rides_fp_slot(ctx, ty)) { ret emit_int_to_fp_reg(ctx, mb, registers, slot.reg, argop, ty); }
         val fw: res[u8, fail.Fail] = fp_move_width(ctx, ty);
         if (sel fw.err) { ret err[fail.Fail].err{fw.err}; }
         ret emit_call_reg(ctx, mb, registers, mir.op_preg(slot.reg), argop, fw.ok);
@@ -1152,6 +1156,25 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, registers: *mir.Mir
             mir.preg_id(ctx.tgt.model.stack_ptr_reg), stack_off, true);
     }
     ret emit_call_reg(ctx, mb, registers, mir.op_preg(slot.reg), argop, scalar_reg_move_width(ctx.tgt.model.gpr_width, size));
+}
+
+# a scalar passed by reference gets a caller-owned copy at its own alignment;
+# the store is legalize's to split (#3511)
+fun copy_scalar_to_temp(ctx: *context.LowerCtx, mb: *mir.MirBlock, src: mir.MirOperand,
+    ty: type.IrTypeId, out_addr: *mir.VRegId) err[fail.Fail] {
+    val size:    u64                        = type.byte_size_for_machine(ctx.types, ty, ctx.layout)::u64;
+    val align:   u32                        = type.byte_align_for_machine(ctx.types, ty, ctx.layout);
+    val res_key: res[mir.VRegId, fail.Fail] = context.new_vreg(ctx, mir.REG_CLASS_GP);
+    if (sel res_key.err) { ret err[fail.Fail].err{res_key.err}; }
+    val sk: mir.VRegId = res_key.ok;
+
+    val sr: err[fail.Fail] = context.add_spill_slot_aligned(ctx, sk.n, size, align);
+    if (sel sr.err) { ret sr; }
+
+    val st: err[fail.Fail] = context.emit_mov_w(ctx, mb, mir.op_mem_slot(sk, 0), src, size::u8);
+    if (sel st.err) { ret st; }
+
+    ret context.emit_lea_slot(ctx, mb, mir.op_mem_slot(sk, 0), out_addr);
 }
 
 fun copy_aggregate_to_temp(ctx: *context.LowerCtx, mb: *mir.MirBlock, src: mir.MirOperand,
@@ -1198,6 +1221,52 @@ fun spill_vector_to_temp(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.Pa
     ret context.emit_lea_slot(ctx, mb, mir.op_mem_slot(sk, 0), out_addr);
 }
 
+# an integer wider than a general register that a convention carries in a
+# vector register (Win64 returns a 16-byte integer in XMM0): no move crosses
+# banks at that width, so it goes through a frame slot, its integer lanes
+# stored (or loaded) as legalize splits them and the vector register loaded
+# (or stored) whole (#3511)
+fun int_rides_fp_slot(ctx: *context.LowerCtx, ty: type.IrTypeId) bool {
+    if (context.value_is_float(ctx, ty) || context.value_is_vector(ctx, ty) || context.value_is_aggregate(ctx, ty)) { ret false; }
+    val size: u64 = type.byte_size_for_machine(ctx.types, ty, ctx.layout)::u64;
+    ret size > ctx.tgt.model.gpr_width::u64;
+}
+
+fun int_fp_slot(ctx: *context.LowerCtx, ty: type.IrTypeId, out: *mir.VRegId) err[fail.Fail] {
+    val size:    u64                        = type.byte_size_for_machine(ctx.types, ty, ctx.layout)::u64;
+    val align:   u32                        = type.byte_align_for_machine(ctx.types, ty, ctx.layout);
+    val res_key: res[mir.VRegId, fail.Fail] = context.new_vreg(ctx, mir.REG_CLASS_GP);
+    if (sel res_key.err) { ret err[fail.Fail].err{res_key.err}; }
+    val sr: err[fail.Fail] = context.add_spill_slot_aligned(ctx, res_key.ok.n, size, align);
+    if (sel sr.err) { ret sr; }
+    @out = res_key.ok;
+    ret err[fail.Fail].ok{};
+}
+
+# integer value -> vector register; the store is preparation, the register
+# load lands with the other register moves
+fun emit_int_to_fp_reg(ctx: *context.LowerCtx, preparation: *mir.MirBlock, registers: *mir.MirBlock,
+    reg: mir.PRegId, src: mir.MirOperand, ty: type.IrTypeId) err[fail.Fail] {
+    val size: u64            = type.byte_size_for_machine(ctx.types, ty, ctx.layout)::u64;
+    var sk:   mir.VRegId     = mir.MIR_VREG_NIL;
+    val slot: err[fail.Fail] = int_fp_slot(ctx, ty, ?sk);
+    if (sel slot.err) { ret slot; }
+    val st: err[fail.Fail] = context.emit_mov_w(ctx, preparation, mir.op_mem_slot(sk, 0), src, size::u8);
+    if (sel st.err) { ret st; }
+    ret context.emit_fmov(ctx, registers, mir.op_preg(reg), mir.op_mem_slot(sk, 0), size::u8);
+}
+
+# vector register -> integer value
+fun emit_fp_reg_to_int(ctx: *context.LowerCtx, mb: *mir.MirBlock, dst: mir.VRegId, reg: mir.PRegId, ty: type.IrTypeId) err[fail.Fail] {
+    val size: u64            = type.byte_size_for_machine(ctx.types, ty, ctx.layout)::u64;
+    var sk:   mir.VRegId     = mir.MIR_VREG_NIL;
+    val slot: err[fail.Fail] = int_fp_slot(ctx, ty, ?sk);
+    if (sel slot.err) { ret slot; }
+    val st: err[fail.Fail] = context.emit_fmov(ctx, mb, mir.op_mem_slot(sk, 0), mir.op_preg(reg), size::u8);
+    if (sel st.err) { ret st; }
+    ret context.emit_mov_w(ctx, mb, mir.op_vreg(dst), mir.op_mem_slot(sk, 0), size::u8);
+}
+
 fun fp_move_width(ctx: *context.LowerCtx, ty: type.IrTypeId) res[u8, fail.Fail] {
     val size: u64 = type.byte_size_for_machine(ctx.types, ty, ctx.layout)::u64;
     if (context.value_is_vector(ctx, ty)) {
@@ -1214,6 +1283,7 @@ fun fp_move_width(ctx: *context.LowerCtx, ty: type.IrTypeId) res[u8, fail.Fail] 
 
 fun capture_slot_reg(ctx: *context.LowerCtx, mb: *mir.MirBlock, dst: mir.VRegId, slot: abi.ParamSlot, ty: type.IrTypeId) err[fail.Fail] {
     if (slot.class == abi.CLASS_FP) {
+        if (int_rides_fp_slot(ctx, ty)) { ret emit_fp_reg_to_int(ctx, mb, dst, slot.reg, ty); }
         val fw: res[u8, fail.Fail] = fp_move_width(ctx, ty);
         if (sel fw.err) { ret err[fail.Fail].err{fw.err}; }
         ret context.emit_fmov(ctx, mb, mir.op_vreg(dst), mir.op_preg(slot.reg), fw.ok);
@@ -1609,6 +1679,27 @@ pub fun lower_params(ctx: *context.LowerCtx, mb: *mir.MirBlock) err[fail.Fail] {
     ret append_deferred(ctx, mb, ?copies);
 }
 
+# an integer the convention passes by reference (Win64's 16-byte integer); a
+# vector or aggregate by reference stays an address (#3511)
+fun int_by_reference(ctx: *context.LowerCtx, ty: type.IrTypeId) bool {
+    val found: opt[*type.IrType] = type.get(ctx.types, ty);
+    if (sel found.none) { ret false; }
+    ret found.some.kind == type.IRT_INT;
+}
+
+# the value is loaded from the caller's copy, whose address `src` carries;
+# legalize splits the load into lanes
+fun capture_scalar_byref(ctx: *context.LowerCtx, mb: *mir.MirBlock, pv: mir.VRegId,
+    ty: type.IrTypeId, src: mir.MirOperand) err[fail.Fail] {
+    val ar: res[mir.VRegId, fail.Fail] = context.new_vreg(ctx, mir.REG_CLASS_GP);
+    if (sel ar.err) { ret err[fail.Fail].err{ar.err}; }
+    val addr: mir.VRegId     = ar.ok;
+    val mr:   err[fail.Fail] = context.emit_mov_w(ctx, mb, mir.op_vreg(addr), src, ptr_move_width(ctx));
+    if (sel mr.err) { ret mr; }
+    val size: u64 = type.byte_size_for_machine(ctx.types, ty, ctx.layout)::u64;
+    ret context.emit_mov_w(ctx, mb, mir.op_vreg(pv), mir.op_mem_value(addr, 0), size::u8);
+}
+
 fun capture_vector_byref(ctx: *context.LowerCtx, mb: *mir.MirBlock, pv: mir.VRegId,
     ty: type.IrTypeId, src: mir.MirOperand) err[fail.Fail] {
     if (!context.value_is_vector(ctx, ty)) {
@@ -1639,6 +1730,9 @@ fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, copies: *mir.MirB
     }
     if (slot.class == abi.CLASS_STACK_BYREF) {
         val fp: mir.PRegId = mir.preg_id(ctx.tgt.model.frame_ptr_reg);
+        if (int_by_reference(ctx, ty)) {
+            ret capture_scalar_byref(ctx, mb, pv, ty, mir.op_mem_preg(fp, arg_base + stack_off));
+        }
         ret context.emit_mov_w(ctx, mb, mir.op_vreg(pv), mir.op_mem_preg(fp, arg_base + stack_off),
             ptr_move_width(ctx));
     }
@@ -1656,6 +1750,7 @@ fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, copies: *mir.MirB
             natural_stack_slot(ctx.tgt, false)));
     }
     if (slot.class == abi.CLASS_BYREF) {
+        if (int_by_reference(ctx, ty)) { ret capture_scalar_byref(ctx, mb, pv, ty, mir.op_preg(slot.reg)); }
         ret context.emit_mov_w(ctx, mb, mir.op_vreg(pv), mir.op_preg(slot.reg), ptr_move_width(ctx));
     }
 
@@ -1795,6 +1890,10 @@ pub fun lower_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.
         plan.stack_off  = 0;
         plan.stack_ok   = false;
         val mr: err[fail.Fail] = materialize_pieces(ctx, mb, slot, plan);
+        if (sel mr.err) { ret mr; }
+    }
+    or (slot.class == abi.CLASS_FP && int_rides_fp_slot(ctx, rt)) {
+        val mr: err[fail.Fail] = emit_int_to_fp_reg(ctx, mb, mb, slot.reg, rvop, rt);
         if (sel mr.err) { ret mr; }
     }
     or (slot.class == abi.CLASS_FP) {

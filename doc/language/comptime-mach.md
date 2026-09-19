@@ -69,7 +69,7 @@ $if ($mach.build.ct_mul(wide_u, 64) == 1) {
   - `low`: the low half of a same-width product;
   - `high_u`, `high_s`, `high_su`: the high half, with unsigned, signed or mixed operands;
   - `wide_u`, `wide_s`: the full double-width product.
-- `width` is the operand width in bits, a comptime integer: 8, 16, 32 or 64.
+- `width` is the operand width in bits, a comptime integer: 8, 16, 32, 64 or 128.
 - A cell is admitted when the target declares it and the row's condition holds:
   - an always-safe instruction;
   - the extension it names, selected for the target;

@@ -1,0 +1,225 @@
+# the helpers the compiler provides with the program for an operation on an
+# integer wider than the target's ALU that no target has an instruction for:
+# division and remainder (widediv) and the float conversions (wideconv). a
+# helper is an ordinary function of the module that needs it, weak so every
+# module's copy coalesces at link, as a generic instantiation does, and never
+# inlined so a program pays for the code once. this module holds what the two
+# passes share: the width test and the function synthesis (#3511)
+
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.me.ir;
+use mach.lang.me.ir.builder;
+use mach.lang.me.ir.instruction;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use mach.lang.target;
+use mach.lang.target.isa;
+use A: std.allocator;
+use std.format;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+# the widest integer the legalizer expands in place: a 64-bit value on a 32-bit
+# ALU (rv32's i64) divides and converts inline, as it always has. an integer
+# wider than this goes to a helper on every machine: its inline expansion is
+# prohibitive, and the helpers' lanes are 64-bit (#3511, ruling Q5)
+pub val INLINE_BITS: u32 = 64;
+
+# the bit width of a scalar integer wider than both the target's ALU and the
+# inline limit that the target realizes, else 0: a width the target does not
+# realize is left for the lowering to refuse at the program's own location
+pub fun wide_bits(m: *ir.Module, tgt: *target.Target, ty: ir_type.IrTypeId) u32 {
+    val found: opt[*ir_type.IrType] = ir_type.get(?m.types, ty);
+    if (sel found.none)                     { ret 0; }
+    if (found.some.kind != ir_type.IRT_INT) { ret 0; }
+    val bits: u32 = found.some.data.bits;
+    if (bits <= INLINE_BITS)                                 { ret 0; }
+    if (bits <= tgt.model.max_alu_width * 8)                 { ret 0; }
+    if (!isa.realizes_int_width(?tgt.model, (bits + 7) / 8)) { ret 0; }
+    ret bits;
+}
+
+# a helper looked up by name, or added empty with its signature and params
+pub rec Helper {
+    idx:   u32;
+    fresh: bool;
+}
+
+pub fun find_or_add(m: *ir.Module, itn: *intern.Interner, text: str, ret_ty: ir_type.IrTypeId,
+    params: *ir_type.IrTypeId, count: u32) res[Helper, fail.Fail] {
+    val name_r: res[intern.StrId, A.Error] = intern.intern(itn, text);
+    if (sel name_r.err) { ret res[Helper, fail.Fail].err{fail.refused(name_r.err)}; }
+    val name:  intern.StrId = name_r.ok;
+    val found: opt[u32]     = ir.function_lookup(m, name);
+    if (sel found.some) { ret res[Helper, fail.Fail].ok{Helper{idx: found.some, fresh: false}}; }
+
+    val sig_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_fn(?m.types, ret_ty, params, count, false);
+    if (sel sig_r.err) { ret res[Helper, fail.Fail].err{sig_r.err}; }
+    val add_r: res[u32, fail.Fail] = ir.function_add(m, name, sig_r.ok, ir.FN_FLAG_WEAK | ir.FN_FLAG_NOINLINE);
+    if (sel add_r.err) { ret res[Helper, fail.Fail].err{add_r.err}; }
+    val idx:   u32            = add_r.ok;
+    val reg_r: err[fail.Fail] = ir.function_register(m, name, idx);
+    if (sel reg_r.err) { ret res[Helper, fail.Fail].err{reg_r.err}; }
+
+    val pr: res[*value.Value, A.Error] = A.allocate[value.Value](m.alloc, count::usize);
+    if (sel pr.err) { ret res[Helper, fail.Fail].err{fail.refused(pr.err)}; }
+    var i: u32 = 0;
+    for (i < count) {
+        pr.ok[i] = value.param(i, params[i]);
+        i        = i + 1;
+    }
+    m.functions[idx].params      = pr.ok;
+    m.functions[idx].param_count = count;
+    m.functions[idx].body_module = m.name;
+    ret res[Helper, fail.Fail].ok{Helper{idx: idx, fresh: true}};
+}
+
+# `__mach_<stem><bits>`, the name of a helper over one integer width
+pub fun name_width(alloc: *A.Allocator, stem: str, bits: u32) res[str, fail.Fail] {
+    val r: res[str, format.FormatError] = format.sprint(alloc, "__mach_{}{}", stem, bits);
+    if (sel r.err) { ret res[str, fail.Fail].err{fail.format_refused(r.err)}; }
+    ret res[str, fail.Fail].ok{r.ok};
+}
+
+# `__mach_<from>_to_<to>`, the name of a conversion helper between two types
+pub fun name_conv(alloc: *A.Allocator, from: str, from_bits: u32, to: str, to_bits: u32) res[str, fail.Fail] {
+    val r: res[str, format.FormatError] = format.sprint(alloc, "__mach_{}{}_to_{}{}", from, from_bits, to, to_bits);
+    if (sel r.err) { ret res[str, fail.Fail].err{fail.format_refused(r.err)}; }
+    ret res[str, fail.Fail].ok{r.ok};
+}
+
+# a call in place of the instruction: the given arguments follow the callee,
+# the result keeps the instruction's own value id and type
+pub fun rewrite_to_call(m: *ir.Module, ins: *instruction.Instruction, callee: u32, args: *value.Value, count: u32) err[fail.Fail] {
+    val arr: res[ir.OperandArray, fail.Fail] = ir.operands_alloc(m, count + 1);
+    if (sel arr.err) { ret err[fail.Fail].err{arr.err}; }
+    arr.ok.ops[0] = value.fn(callee, m.functions[callee].sig);
+    var i: u32 = 0;
+    for (i < count) {
+        arr.ok.ops[i + 1] = args[i];
+        i                 = i + 1;
+    }
+    ir.instr_replace_operands(m, ins, arr.ok);
+    ins.kind   = instruction.OP_CALL;
+    ins.aux_ty = m.functions[callee].sig;
+    ret err[fail.Fail].ok{};
+}
+
+# a straight-line emitter that remembers the first failure, so an algorithm
+# reads as its arithmetic rather than as a check per operation. a value emitted
+# after a failure is the nil value and is never used: the caller reads `failed`
+# before it returns the function
+pub rec Em {
+    b:      builder.Builder;
+    failed: bool;
+    first:  fail.Fail;
+}
+
+pub fun em_init(m: *ir.Module, idx: u32) Em {
+    var e: Em;
+    e.b = builder.init(m);
+    builder.set_function(?e.b, ?m.functions[idx]);
+    e.failed = false;
+    ret e;
+}
+
+pub fun take(e: *Em, r: res[value.Value, fail.Fail]) value.Value {
+    if (sel r.err) {
+        if (!e.failed) {
+            e.failed = true;
+            e.first  = r.err;
+        }
+        ret value.const_null(ir_type.IRT_NIL);
+    }
+    ret r.ok;
+}
+
+pub fun add(e: *Em, a: value.Value, b: value.Value) value.Value {
+    ret take(e, builder.emit_add(?e.b, a, b));
+}
+
+pub fun sub(e: *Em, a: value.Value, b: value.Value) value.Value {
+    ret take(e, builder.emit_sub(?e.b, a, b));
+}
+
+pub fun mul(e: *Em, a: value.Value, b: value.Value) value.Value {
+    ret take(e, builder.emit_mul(?e.b, a, b));
+}
+
+pub fun band(e: *Em, a: value.Value, b: value.Value) value.Value {
+    ret take(e, builder.emit_and(?e.b, a, b));
+}
+
+pub fun bor(e: *Em, a: value.Value, b: value.Value) value.Value {
+    ret take(e, builder.emit_or(?e.b, a, b));
+}
+
+pub fun bxor(e: *Em, a: value.Value, b: value.Value) value.Value {
+    ret take(e, builder.emit_xor(?e.b, a, b));
+}
+
+pub fun shl(e: *Em, a: value.Value, b: value.Value) value.Value {
+    ret take(e, builder.emit_shl(?e.b, a, b));
+}
+
+pub fun shr_u(e: *Em, a: value.Value, b: value.Value) value.Value {
+    ret take(e, builder.emit_shr_u(?e.b, a, b));
+}
+
+pub fun shr_s(e: *Em, a: value.Value, b: value.Value) value.Value {
+    ret take(e, builder.emit_shr_s(?e.b, a, b));
+}
+
+pub fun eq(e: *Em, a: value.Value, b: value.Value) value.Value {
+    ret take(e, builder.emit_cmp_eq(?e.b, a, b));
+}
+
+pub fun ne(e: *Em, a: value.Value, b: value.Value) value.Value {
+    ret take(e, builder.emit_cmp_ne(?e.b, a, b));
+}
+
+pub fun trunc(e: *Em, a: value.Value, to: ir_type.IrTypeId) value.Value {
+    ret take(e, builder.emit_trunc(?e.b, a, to));
+}
+
+pub fun zext(e: *Em, a: value.Value, to: ir_type.IrTypeId) value.Value {
+    ret take(e, builder.emit_zext(?e.b, a, to));
+}
+
+pub fun sext(e: *Em, a: value.Value, to: ir_type.IrTypeId) value.Value {
+    ret take(e, builder.emit_sext(?e.b, a, to));
+}
+
+pub fun bitcast(e: *Em, a: value.Value, to: ir_type.IrTypeId) value.Value {
+    ret take(e, builder.emit_bitcast(?e.b, a, to));
+}
+
+pub fun fp_ext(e: *Em, a: value.Value, to: ir_type.IrTypeId) value.Value {
+    ret take(e, builder.emit_fp_ext(?e.b, a, to));
+}
+
+pub fun ui_to_fp(e: *Em, a: value.Value, to: ir_type.IrTypeId) value.Value {
+    ret take(e, builder.emit_ui_to_fp(?e.b, a, to));
+}
+
+pub fun fp_to_ui(e: *Em, a: value.Value, to: ir_type.IrTypeId) value.Value {
+    ret take(e, builder.emit_fp_to_ui(?e.b, a, to));
+}
+
+pub fun call(e: *Em, callee: u32, args: *value.Value, count: u32, ret_ty: ir_type.IrTypeId) value.Value {
+    val f: value.Value = value.fn(callee, e.b.m.functions[callee].sig);
+    ret take(e, builder.emit_call(?e.b, f, args, count, ret_ty));
+}
+
+# the function's result: the first failure, or the return
+pub fun finish(e: *Em, out: value.Value) err[fail.Fail] {
+    if (e.failed) { ret err[fail.Fail].err{e.first}; }
+    ret builder.emit_ret(?e.b, out);
+}

@@ -36,6 +36,16 @@ static inline uint64_t mix_i16(uint64_t h, int16_t v)  { return mix_u64(h, (uint
 static inline uint64_t mix_i32(uint64_t h, int32_t v)  { return mix_u64(h, (uint64_t)(int64_t)v); }
 static inline uint64_t mix_i64(uint64_t h, int64_t v)  { return mix_u64(h, (uint64_t)v); }
 
+/* a 128-bit value folds as its two little-endian 64-bit limbs; the C side
+ * spells the type the way GCC and Clang do */
+typedef unsigned __int128 corpus_u128;
+typedef __int128 corpus_i128;
+
+static inline uint64_t mix_u128(uint64_t h, corpus_u128 v) {
+    return mix_u64(mix_u64(h, (uint64_t)v), (uint64_t)(v >> 64));
+}
+static inline uint64_t mix_i128(uint64_t h, corpus_i128 v) { return mix_u128(h, (corpus_u128)v); }
+
 static inline uint64_t mix_f32(uint64_t h, float v) {
     uint32_t bits;
     memcpy(&bits, &v, sizeof bits);

@@ -29,6 +29,7 @@ use mach.lang.me.ir.builder;
 use mach.lang.me.ir.id;
 use instr: mach.lang.me.ir.instruction;
 use mach.lang.me.ir.opdesc;
+use mach.lang.me.ir.refs;
 use ir_type: mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.source;
@@ -37,6 +38,7 @@ use mach.lang.target.abi;
 use mach.lang.target.isa;
 use target:         mach.lang.target.resolved;
 use target_testing: mach.lang.target.testing;
+use mach.lang.wide;
 
 pub fun lower_module(tgt: *target.Target, m: *ir.Module, alloc: *A.Allocator, interner: *intern.Interner, srcmap: *source.SourceMap,
     diags: *diagnostic.DiagnosticStore) res[mir.MirModule, fail.Fail] {
@@ -148,6 +150,13 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, alloc: 
     ctx.pending_count     = 0;
     ctx.pending_cap       = 0;
     ctx.max_block_id      = 0;
+
+    val widths: err[fail.Fail] = check_signature_int_widths(?ctx, fn);
+    if (sel widths.err) {
+        lctx.ctx_dnit(?ctx);
+        mir.dnit_function(alloc, ?mf);
+        ret res[mir.MirFunction, fail.Fail].err{widths.err};
+    }
 
     val setup: err[fail.Fail] = lctx.ctx_setup(?ctx, tgt, fn);
     if (sel setup.err) {
@@ -626,6 +635,9 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
     ctx.cur_memory_flags  = 0;
     if ((inst.flags & instr.INSTR_FLAG_VOLATILE) != 0) { ctx.cur_memory_flags = mir.MEMORY_VOLATILE; }
 
+    val unrealized: err[fail.Fail] = check_int_widths(ctx, inst);
+    if (sel unrealized.err) { ret unrealized; }
+
     var cop: ct.CtOp = opcode_ct_op(inst.kind);
     if (is_float_op(ctx, inst)) { cop = ct.CT_OP_FLOAT; }
     val declared_cap: opt[ct.CtCap] = ct.ct_cap(cop);
@@ -740,6 +752,43 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
     ret lower_generic(ctx, mb, inst, iid);
 }
 
+# an integer the target does not realize is refused at the first instruction
+# that produces or consumes one, naming the target and the width: the one
+# refusal site for a width outside MachineModel.int_widths (#3511). sema is
+# target-independent, so `u128` type-checks everywhere and is refused here
+fun check_int_widths(ctx: *lctx.LowerCtx, inst: *instr.Instruction) err[fail.Fail] {
+    var bytes: u32 = lctx.unrealized_int_width(ctx, inst.ty);
+    var i:     u32 = 0;
+    for (bytes == 0 && i < inst.operand_count) {
+        if (!refs.operand_is_block(inst.kind, i)) { bytes = lctx.unrealized_int_width(ctx, inst.operands[i].ty); }
+        i = i + 1;
+    }
+    if (bytes == 0) { ret err[fail.Fail].ok{}; }
+    ret err[fail.Fail].err{lctx.reject(ctx, unrealized_int_message(ctx, bytes))};
+}
+
+# a parameter or the return of the function itself, refused at its declaration
+fun check_signature_int_widths(ctx: *lctx.LowerCtx, fn: *ir.Function) err[fail.Fail] {
+    var bytes: u32 = lctx.unrealized_int_width(ctx, lctx.fn_return_type(ctx));
+    var i:     u32 = 0;
+    for (bytes == 0 && i < fn.param_count) {
+        bytes = lctx.unrealized_int_width(ctx, fn.params[i].ty);
+        i     = i + 1;
+    }
+    if (bytes == 0) { ret err[fail.Fail].ok{}; }
+    ret err[fail.Fail].err{lctx.reject(ctx, unrealized_int_message(ctx, bytes))};
+}
+
+fun unrealized_int_message(ctx: *lctx.LowerCtx, bytes: u32) str {
+    val fallback: str = "a 128-bit integer is not realized on this target: it declares no integer of that width";
+    var arch:     str = ctx.tgt.isa.name;
+    if (arch == nil) { arch = "this target"; }
+    val rm: res[str, format.FormatError] = format.sprint(ctx.alloc,
+        "a {}-bit integer is not realized on {}: the target declares no integer of that width", bytes * 8, arch);
+    if (sel rm.err) { ret fallback; }
+    ret intern_owned(ctx, rm.ok, fallback);
+}
+
 fun instr_touches_vector(ctx: *lctx.LowerCtx, inst: *instr.Instruction) bool {
     if (lctx.value_is_vector(ctx, inst.ty)) { ret true; }
     var i: u32 = 0;
@@ -782,7 +831,7 @@ fun ir_mul_cell(ctx: *lctx.LowerCtx, inst: *instr.Instruction) ct.CtMulCell {
     if (mir.vec_lane_is_vector(lane)) {
         ret ct.mul_cell(op, mir.vec_lane_elem_bytes(lane) * 8, true);
     }
-    ret ct.mul_cell(op, lctx.op_width_of(ctx, inst.ty) * 8, false);
+    ret ct.mul_cell(op, lctx.op_width_of(ctx, operand_ty) * 8, false);
 }
 
 fun is_fp_convert(kind: instr.InstrKind) bool {
@@ -853,6 +902,41 @@ test "mach.lang.be.codegen.mir.lower.ct_gate:mechanism" {
     val low: ct.CtMulCell = ct.mul_cell(ct.CT_MUL_LOW, 64, false);
     if (ct.target_provides(ct.mul_mask_none(), low, false, ct.ct_cap_or_always(ct.CT_OP_VAR_SHIFT))) { ret 1; }
     if (!ct.target_provides(ct.mul_mask_none(), low, true, ct.ct_cap_or_always(ct.CT_OP_VAR_SHIFT))) { ret 1; }
+    ret 0;
+}
+
+# the exponent pow2_exponent finds, -1 for none
+fun t_pow2(v: value.Value, bits: u32) i64 {
+    val k: opt[u32] = pow2_exponent(v, bits);
+    if (sel k.some) { ret k.some::i64; }
+    ret -1;
+}
+
+# a divisor's power-of-two test reads both limbs at the operand width (#3511)
+test "mach.lang.be.codegen.mir.lower.pow2_exponent:reads_both_limbs" {
+    if (t_pow2(value.const_int(8, 0), 64) != 3)                      { ret 1; }
+    if (t_pow2(value.const_int(1, 0), 64) != -1)                     { ret 2; }
+    if (t_pow2(value.const_int(12, 0), 64) != -1)                    { ret 3; }
+    if (t_pow2(value.const_int_wide(wide.make(0, 1), 0), 128) != 64) { ret 4; }
+    if (t_pow2(value.const_int_wide(wide.make(4, 1), 0), 128) != -1) { ret 5; }
+    # the operand width truncates: 2^64 at 64 bits is zero
+    if (t_pow2(value.const_int_wide(wide.make(0, 1), 0), 64) != -1) { ret 6; }
+    if (t_pow2(value.const_int(0x108, 0), 8) != 3)                  { ret 7; }
+    ret 0;
+}
+
+# a zero extension of a full 64-bit immediate has no sign to fill (#3511)
+test "mach.lang.be.codegen.mir.lower.promote_imm:unsigned_full_limb_is_not_sign_filled" {
+    val zu: mir.MirOperand = promote_imm(-1, 8, false);
+    if (zu.kind != mir.MIR_OP_IMM || zu.imm != -1 || zu.imm_hi != 0) { ret 1; }
+    val zs: mir.MirOperand = promote_imm(-1, 8, true);
+    if (zs.imm != -1 || zs.imm_hi != -1) { ret 2; }
+    val nu: mir.MirOperand = promote_imm(200, 1, false);
+    if (nu.imm != 200 || nu.imm_hi != 0) { ret 3; }
+    val ns: mir.MirOperand = promote_imm(200, 1, true);
+    if (ns.imm != -56 || ns.imm_hi != -1) { ret 4; }
+    val wu: mir.MirOperand = promote_imm(0x7FFFFFFF, 4, false);
+    if (wu.imm != 0x7FFFFFFF || wu.imm_hi != 0) { ret 5; }
     ret 0;
 }
 
@@ -1036,8 +1120,12 @@ fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
     if (sel rv.err) { ret err[fail.Fail].err{rv.err}; }
     val value: mir.MirOperand = rv.ok;
 
+    # the fixed count register serves the machine's own variable shift. a shift
+    # wider than the alu is legalized into constant-shift stages selected by the
+    # count's bits, so its count stays a vreg legalize reads in the low lane
     var count_op: mir.MirOperand = count;
-    if (count.kind != mir.MIR_OP_IMM) {
+    val maw:      u8             = ctx.tgt.model.max_alu_width::u8;
+    if (count.kind != mir.MIR_OP_IMM && (maw == 0 || w <= maw)) {
         val cnt_reg: i32 = ctx.tgt.model.shift_count_reg;
         if (cnt_reg >= 0) {
             val mc: err[fail.Fail] = lctx.emit_mov_w(ctx, mb, mir.op_preg(mir.preg_id(cnt_reg)), count, w);
@@ -1059,12 +1147,9 @@ fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
 # the exponent of a divisor that is a power of two at least 2, or none
 fun pow2_exponent(v: value.Value, bits: u32) opt[u32] {
     if (v.kind != value.VAL_CONST_INT) { ret opt[u32].none{}; }
-    var m: u64 = v.data.int_lit;
-    if (bits < 64)                   { m = m & ((1::u64 << bits::u64) - 1); }
-    if (m < 2 || (m & (m - 1)) != 0) { ret opt[u32].none{}; }
-    var k: u32 = 0;
-    for ((1::u64 << k::u64) != m) { k = k + 1; }
-    ret opt[u32].some{k};
+    val m: wide.Wide = wide.trunc(value.int_of(?v), bits);
+    if (wide.lt_u(m, wide.from_u64(2)) || !wide.is_pow2(m)) { ret opt[u32].none{}; }
+    ret opt[u32].some{wide.trailing_zeros(m)};
 }
 
 fun div_temp(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, op: mir.MirOpcode, a: mir.MirOperand, b: mir.MirOperand, w: u8) res[mir.MirOperand, fail.Fail] {
@@ -1243,13 +1328,21 @@ fun narrow_imm_value(imm: i64, width: u8, signed: bool) i64 {
     ret (v | ~m)::i64;
 }
 
+# the 128-bit immediate an immediate of `width` bytes extends to: a zero
+# extension of the full 64-bit limb has no sign to fill (#3511)
+fun promote_imm(imm: i64, width: u8, signed: bool) mir.MirOperand {
+    val v: i64 = narrow_imm_value(imm, width, signed);
+    if (!signed && (width == 0 || width >= 8)) { ret mir.op_imm_wide(v, 0); }
+    ret mir.op_imm(v);
+}
+
 fun emit_promote(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, src: mir.MirOperand,
     dst_w: u8, src_w: u8, signed: bool) err[fail.Fail] {
     if (src_w >= dst_w) {
         ret lctx.emit_mov_w(ctx, mb, dst, src, dst_w);
     }
     if (src.kind == mir.MIR_OP_IMM) {
-        ret lctx.emit_mov_w(ctx, mb, dst, mir.op_imm(narrow_imm_value(src.imm, src_w, signed)), dst_w);
+        ret lctx.emit_mov_w(ctx, mb, dst, promote_imm(src.imm, src_w, signed), dst_w);
     }
     val r: res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
     if (sel r.err) { ret err[fail.Fail].err{fail.refused(r.err)}; }
@@ -1271,6 +1364,10 @@ fun lower_generic(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instructi
         kind  = mir.MIR_NEG::u32;
         first = 1;
     }
+    # the high-half multiplies are the one generic pair whose MIR opcode is
+    # not their IR kind: MIR claimed them before the IR did (#3511)
+    if (inst.kind == instr.OP_MUL_HIGH_S) { kind = mir.MIR_MUL_HI_S::u32; }
+    if (inst.kind == instr.OP_MUL_HIGH_U) { kind = mir.MIR_MUL_HI_U::u32; }
     var total: u32 = inst.operand_count - first;
     if (has_dst) { total = total + 1; }
 
@@ -1321,8 +1418,8 @@ fun lower_generic(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instructi
 fun is_zero_minuend(ctx: *lctx.LowerCtx, inst: *instr.Instruction) bool {
     if (inst.kind != instr.OP_SUB || inst.operand_count != 2) { ret false; }
     val minuend: value.Value = inst.operands[0];
-    if (minuend.kind != value.VAL_CONST_INT || minuend.data.int_lit != 0) { ret false; }
-    if (lctx.value_is_float(ctx, inst.ty))                                { ret false; }
+    if (minuend.kind != value.VAL_CONST_INT || !wide.is_zero(value.int_of(?minuend))) { ret false; }
+    if (lctx.value_is_float(ctx, inst.ty))                                            { ret false; }
     ret !instr_touches_vector(ctx, inst);
 }
 
@@ -1342,6 +1439,10 @@ fun set_generic_widths(ctx: *lctx.LowerCtx, inst: *instr.Instruction, mi: *mir.M
     if (is_int_alu_kind(inst.kind))       { dw = lctx.clamp_alu_width(ctx.tgt.model.alu_min_width, dw); }
     var sw: u8 = dw;
     if (is_int_conversion_kind(inst.kind) && inst.operand_count >= 1) {
+        sw = lctx.op_width_of(ctx, inst.operands[0].ty);
+    }
+    # a widening multiply's source width is its operand's, half its result
+    if ((inst.kind == instr.OP_MUL_WIDE_S || inst.kind == instr.OP_MUL_WIDE_U) && inst.operand_count >= 1) {
         sw = lctx.op_width_of(ctx, inst.operands[0].ty);
     }
     mi.width     = dw;
@@ -2238,6 +2339,7 @@ test "mach.lang.be.codegen.mir.lower:volatile_memory_flags_follow_each_ir_instru
     tgt.model.flat_addressing = true;
     tgt.model.pointer_width   = 8;
     tgt.model.gpr_width       = 8;
+    tgt.model.int_widths      = isa.INT_WIDTHS_1_2_4_8;
     var parameters: [1]mir.VRegId = [1]mir.VRegId{mir.vreg_id(0)};
     var operands:   [1]value.Value;
     operands[0] = value.param(0, ty);
@@ -2274,6 +2376,192 @@ test "mach.lang.be.codegen.mir.lower:volatile_memory_flags_follow_each_ir_instru
     ret 0;
 }
 
+# the IR high-half multiplies lower to the MIR high multiplies, whose opcodes
+# are not the IR kinds (#3511)
+test "mach.lang.be.codegen.mir.lower.lower_generic:high_multiply_takes_the_mir_high_opcode" {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var types:  ir_type.IrTypeTable;
+    val r_init: err[fail.Fail] = ir_type.init(?types, ?alloc);
+    if (sel r_init.err) { ret 1; }
+    fin { ir_type.dnit(?types); }
+    val tr: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?types, 64);
+    if (sel tr.err) { ret 1; }
+    val ty:  ir_type.IrTypeId = tr.ok;
+    var tgt: target.Target;
+    tgt.model.flat_addressing = true;
+    tgt.model.pointer_width   = 8;
+    tgt.model.gpr_width       = 8;
+    tgt.model.int_widths      = isa.INT_WIDTHS_1_2_4_8;
+    var parameters: [2]mir.VRegId = [2]mir.VRegId{mir.vreg_id(0), mir.vreg_id(1)};
+    var operands:   [2]value.Value;
+    operands[0] = value.param(0, ty);
+    operands[1] = value.param(1, ty);
+    var instructions: [2]instr.Instruction;
+    var i:            u32 = 0;
+    for (i < 2) {
+        instructions[i].ty            = ty;
+        instructions[i].operands      = ?operands[0];
+        instructions[i].operand_count = 2;
+        i                             = i + 1;
+    }
+    instructions[0].kind = instr.OP_MUL_HIGH_U;
+    instructions[1].kind = instr.OP_MUL_HIGH_S;
+    var fn: ir.Function;
+    fn.instrs    = ?instructions[0];
+    fn.instr_len = 2;
+    var ctx: lctx.LowerCtx;
+    ctx.alloc       = ?alloc;
+    ctx.tgt         = ?tgt;
+    ctx.types       = ?types;
+    ctx.param_vregs = ?parameters[0];
+    ctx.param_count = 2;
+    var mb: mir.MirBlock;
+    fin { mir.dnit_block(?alloc, ?mb); }
+    val r0: err[fail.Fail] = lower_instr(?ctx, ?fn, ?mb, 0);
+    if (sel r0.err) { ret 2; }
+    val r1: err[fail.Fail] = lower_instr(?ctx, ?fn, ?mb, 1);
+    if (sel r1.err)                              { ret 3; }
+    if (mb.instr_count != 2)                     { ret 4; }
+    if (mb.instrs[0].opcode != mir.MIR_MUL_HI_U) { ret 5; }
+    if (mb.instrs[1].opcode != mir.MIR_MUL_HI_S) { ret 6; }
+    if (mb.instrs[0].width != 8)                 { ret 7; }
+    ret 0;
+}
+
+# the fixed shift-count register serves the machine's own variable shift. a
+# shift wider than the alu is legalized into constant stages, so its count stays
+# a vreg: a move of a two-lane count into rcx would put a wide value in a
+# physical register, which legalize refuses (#3511, #3602)
+test "mach.lang.be.codegen.mir.lower.lower_shift:wide_count_stays_a_vreg_narrow_count_takes_the_register" {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var types:  ir_type.IrTypeTable;
+    val r_init: err[fail.Fail] = ir_type.init(?types, ?alloc);
+    if (sel r_init.err) { ret 1; }
+    fin { ir_type.dnit(?types); }
+    val t64_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?types, 64);
+    if (sel t64_r.err) { ret 1; }
+    val t128_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?types, 128);
+    if (sel t128_r.err) { ret 1; }
+    var tgt: target.Target;
+    tgt.model.flat_addressing = true;
+    tgt.model.pointer_width   = 8;
+    tgt.model.gpr_width       = 8;
+    tgt.model.max_alu_width   = 8;
+    tgt.model.alu_min_width   = 4;
+    tgt.model.int_widths      = isa.INT_WIDTHS_1_2_4_8_16;
+    tgt.model.shift_count_reg = 1;
+    var parameters: [2]mir.VRegId = [2]mir.VRegId{mir.vreg_id(0), mir.vreg_id(1)};
+    var wide:       [2]value.Value;
+    wide[0] = value.param(0, t128_r.ok);
+    wide[1] = value.param(1, t128_r.ok);
+    var narrow: [2]value.Value;
+    narrow[0] = value.param(0, t64_r.ok);
+    narrow[1] = value.param(1, t64_r.ok);
+    var instructions: [2]instr.Instruction;
+    instructions[0].kind          = instr.OP_SHL;
+    instructions[0].ty            = t128_r.ok;
+    instructions[0].operands      = ?wide[0];
+    instructions[0].operand_count = 2;
+    instructions[1].kind          = instr.OP_SHL;
+    instructions[1].ty            = t64_r.ok;
+    instructions[1].operands      = ?narrow[0];
+    instructions[1].operand_count = 2;
+    var fn: ir.Function;
+    fn.instrs    = ?instructions[0];
+    fn.instr_len = 2;
+    var results: [2]mir.VRegId = [2]mir.VRegId{mir.vreg_id(2), mir.vreg_id(3)};
+    var f:       mir.MirFunction;
+    fin { mir.dnit_function(?alloc, ?f); }
+    val rv: res[*mir.MirVReg, A.Error] = A.allocate[mir.MirVReg](?alloc, 8);
+    if (sel rv.err) { ret 1; }
+    f.vregs      = rv.ok;
+    f.vreg_cap   = 8;
+    f.vreg_count = 4;
+    var vi: u32 = 0;
+    for (vi < 4) {
+        f.vregs[vi] = mir.vreg(vi, mir.REG_CLASS_GP, false, false);
+        vi          = vi + 1;
+    }
+    var ctx: lctx.LowerCtx;
+    ctx.alloc       = ?alloc;
+    ctx.tgt         = ?tgt;
+    ctx.types       = ?types;
+    ctx.f           = ?f;
+    ctx.param_vregs = ?parameters[0];
+    ctx.param_count = 2;
+    ctx.instr_vregs = ?results[0];
+    ctx.instr_count = 2;
+    var mb: mir.MirBlock;
+    fin { mir.dnit_block(?alloc, ?mb); }
+    val r0: err[fail.Fail] = lower_instr(?ctx, ?fn, ?mb, 0);
+    if (sel r0.err) { ret 2; }
+    # the wide shift is one instruction whose count operand is the vreg itself
+    if (mb.instr_count != 1)                              { ret 3; }
+    if (mb.instrs[0].opcode != mir.MIR_SHL)               { ret 4; }
+    if (mb.instrs[0].operands[2].kind != mir.MIR_OP_VREG) { ret 5; }
+    if (mb.instrs[0].operands[2].vreg.n != 1)             { ret 6; }
+    val r1: err[fail.Fail] = lower_instr(?ctx, ?fn, ?mb, 1);
+    if (sel r1.err) { ret 7; }
+    # the narrow shift moves its count into the fixed register and names it
+    if (mb.instr_count != 3)                              { ret 8; }
+    if (mb.instrs[1].opcode != mir.MIR_MOV)               { ret 9; }
+    if (mb.instrs[1].operands[0].kind != mir.MIR_OP_PREG) { ret 10; }
+    if (mb.instrs[2].operands[2].kind != mir.MIR_OP_PREG) { ret 11; }
+    ret 0;
+}
+
+# the constant-time gate keys a scalar widening multiply by its operand width:
+# two i64 operands into an i128 result are the 64-bit wide cell, not a 128-bit
+# one, and the high multiply keys the same way (#3511)
+test "mach.lang.be.codegen.mir.lower.ir_mul_cell:widening_multiply_is_keyed_by_its_operand_width" {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var types:  ir_type.IrTypeTable;
+    val r_init: err[fail.Fail] = ir_type.init(?types, ?alloc);
+    if (sel r_init.err) { ret 1; }
+    fin { ir_type.dnit(?types); }
+    val t64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?types, 64);
+    if (sel t64.err) { ret 1; }
+    val t128: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?types, 128);
+    if (sel t128.err) { ret 1; }
+    var tgt: target.Target;
+    tgt.model.flat_addressing = true;
+    tgt.model.pointer_width   = 8;
+    tgt.model.gpr_width       = 8;
+    tgt.model.int_widths      = isa.INT_WIDTHS_1_2_4_8_16;
+    var operands: [2]value.Value;
+    operands[0] = value.param(0, t64.ok);
+    operands[1] = value.param(1, t64.ok);
+    var inst: instr.Instruction;
+    inst.kind          = instr.OP_MUL_WIDE_U;
+    inst.ty            = t128.ok;
+    inst.operands      = ?operands[0];
+    inst.operand_count = 2;
+    var ctx: lctx.LowerCtx;
+    ctx.alloc = ?alloc;
+    ctx.tgt   = ?tgt;
+    ctx.types = ?types;
+
+    val wide_u: ct.CtMulCell = ir_mul_cell(?ctx, ?inst);
+    if (wide_u.op != ct.CT_MUL_WIDE_U || wide_u.width != 64 || wide_u.vector) { ret 2; }
+    inst.kind = instr.OP_MUL_WIDE_S;
+    val wide_s: ct.CtMulCell = ir_mul_cell(?ctx, ?inst);
+    if (wide_s.op != ct.CT_MUL_WIDE_S || wide_s.width != 64 || wide_s.vector) { ret 3; }
+    inst.kind = instr.OP_MUL_HIGH_U;
+    inst.ty   = t64.ok;
+    val high: ct.CtMulCell = ir_mul_cell(?ctx, ?inst);
+    if (high.op != ct.CT_MUL_HIGH_U || high.width != 64 || high.vector) { ret 4; }
+    inst.kind = instr.OP_MUL;
+    val low: ct.CtMulCell = ir_mul_cell(?ctx, ?inst);
+    if (low.op != ct.CT_MUL_LOW || low.width != 64 || low.vector) { ret 5; }
+    ret 0;
+}
+
 # a narrow divide is widened to the target's declared ALU floor, never to a
 # fixed 32 bits: a register machine declares 4 and promotes, a typed target
 # like SPIR-V declares 1 and divides at the lane width so the quotient stays
@@ -2293,6 +2581,7 @@ fun t_narrow_div_widening(alu_min_width: u32, want_width: u8, want_promotes: u32
     tgt.model.flat_addressing = true;
     tgt.model.pointer_width   = 4;
     tgt.model.gpr_width       = 4;
+    tgt.model.int_widths      = isa.INT_WIDTHS_1_2_4_8;
     tgt.model.alu_min_width   = alu_min_width;
     tgt.model.div_reg         = -1;
     tgt.model.div_hi_reg      = -1;

@@ -115,7 +115,22 @@ than the source alone, so they are reported at lowering:
   the secret multiply is refused, and the aarch64 refusal names the instruction
   set's DIT rows and the operating system that declares nothing (#3508). Every
   lane multiply is refused. `$mach.build.ct_mul(op, width)` reads the same
-  decision at comptime (see `comptime-mach.md`)
+  decision at comptime (see `comptime-mach.md`).
+
+  A **128-bit** multiply is never declared by a target, because no target
+  executes one: it is realized from 64-bit cells, and it is admitted exactly
+  when every cell of its realization is. `(a::^u128) * (b::^u128)` with
+  64-bit `a` and `b` is the widening product, one instruction, and is
+  admitted where the 64-bit widening product (x86-64) or the 64-bit high
+  half (aarch64 under DIT, riscv64 under Zkt) is; its high half
+  `(... >> 64)::^u64` is that one instruction. A secret `^u128 * ^u128` low
+  product is the schoolbook over the lanes, three 64-bit low products and
+  the widening one, and is admitted when those are
+  (`$mach.build.ct_mul(low, 128)` says so). A realized cell sits under the
+  same condition as the cells that realize it, so on aarch64 it needs DIT
+  like the high half does. A secret 128-bit `/` or `%` is
+  refused like every secret division: the helper it would call is a loop
+  over the dividend's bits
 - a secret **variable shift count** on a target without a barrel shifter
 
 A secret value passed to a variadic pack is also rejected, including a secret
