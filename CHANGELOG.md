@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.6.1] - 2026-09-18
+
 ### Removed
 - In-place dependencies, added in 5.6.0, are withdrawn in full. The compiler reads code only from the project tree: every dependency is realized under `dep/` from its declaration, and nothing outside the project root is ever read, which is a hallmark of the design that 5.6.0 broke. The `in_place` and `digest` keys of `[dep.<id>]` are refused as unknown keys like any other, `mach dep add --in-place` and the `dep verify` line are gone, and no manifest is expected to carry them (#3662).
 
