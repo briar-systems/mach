@@ -9,12 +9,52 @@ are stdlib `def`s.
 
 | Family | Members |
 |---|---|
-| Unsigned int | `u8`, `u16`, `u32`, `u64` |
-| Signed int | `i8`, `i16`, `i32`, `i64` |
+| Unsigned int | `u8`, `u16`, `u32`, `u64`, `u128` |
+| Signed int | `i8`, `i16`, `i32`, `i64`, `i128` |
 | Float | `f32`, `f64` |
 | Untyped pointer | `ptr` |
 
-These eleven names are the complete set of compiler-seeded primitive types.
+These thirteen names are the complete set of compiler-seeded primitive types.
+
+### 128-bit integers
+
+`u128` and `i128` are integers like the others: every arithmetic, bitwise,
+shift, comparison and conversion operator applies, literals take the `u128`
+and `i128` suffixes, comptime evaluates them exactly, and `$size_of` is 16
+with `$align_of` 16, which is what C's `__int128` has on every ABI mach
+targets.
+
+No target has a 128-bit register. A 128-bit value is **realized** as two
+64-bit lanes on the 64-bit targets (x86-64, aarch64, riscv64), the way a
+vector wider than the vector register is realized as pieces: addition and
+subtraction carry across the lanes, shifts move bits between them, and a
+comparison decides on the high lane first. Which targets realize the width is
+a declaration of the machine model, not a consequence of its name. A target
+that declares no 128-bit integer (riscv32, spirv) refuses the type where it
+is used, at the declaration or expression that names it:
+
+```text
+error: a 128-bit integer is not realized on riscv32: the target declares no integer of that width
+```
+
+Three operations have a shape worth knowing:
+
+- **Widening multiply.** `(a::u128) * (b::u128)` with `a` and `b` 64-bit is
+  recognized as the full 64 x 64 product and compiles to the target's one
+  widening instruction, never to a 128 x 128 multiply. Its high half,
+  `(... >> 64)::u64`, is one high-multiply instruction (`mul` on x86-64,
+  `umulh` on aarch64, `mulhu` on riscv64) and its low half `(...)::u64` is
+  the plain multiply. The same holds for `i128` from `i64` operands, with the
+  signed forms. A `u128 * u128` product that is not of that shape is the
+  schoolbook over its lanes, three multiplies and the widening one.
+- **Division and remainder** at 128 bits have no instruction on any target
+  and are calls into helpers the compiler provides with the program.
+- **Vectors** have lanes of 8 to 64 bits, so `u128x2` is not a vector type;
+  it is refused with the lane rule named.
+
+The secrecy page states which 128-bit operations a secret may reach
+([secrecy.md](secrecy.md)); the calling conventions for `u128` and `i128`
+across an `ext fun` boundary are on [ext-fun.md](ext-fun.md).
 
 There is no compiler `bool`. `bool` is a stdlib `def bool: u8;` with `true` /
 `false` as stdlib `val`s (`1` / `0`) — see [def.md](def.md).

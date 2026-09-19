@@ -19,8 +19,8 @@ context an integer literal is `i64` and a float literal is `f64`.
 ### Typed suffixes
 
 A suffix is the spelling of the primitive type the literal has: `u8`,
-`u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64` on an integer literal, and
-`f32` or `f64` on a float literal. It works with every radix and with
+`u16`, `u32`, `u64`, `u128`, `i8`, `i16`, `i32`, `i64`, `i128` on an
+integer literal, and `f32` or `f64` on a float literal. It works with every radix and with
 digit separators (`0xFFu8`, `0b1010u16`, `1_000_000u32`, `1.5e2f32`).
 
 A suffixed literal *is* that type, in the same way a variable of that type
@@ -51,6 +51,17 @@ val a: i8  = -128i8;   # fine
 val b: i8  = 128i8;    # error: literal 128 is out of range for i8 (-128..127)
 val c: u8  = 256u8;    # error: literal 256 is out of range for u8 (0..255)
 val d: u32 = -1u32;    # error: literal -1 is out of range for u32 (0..4294967295)
+```
+
+An integer literal may be as large as `u128` holds, in any radix and with
+separators, and the range check reaches the same width; a literal that no
+integer type holds is an error:
+
+```mach fragment
+val a: u128 = 340282366920938463463374607431768211455;         # u128 max
+val b: u128 = 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF;        # the same
+val c: i128 = -170141183460469231731687303715884105728;        # i128 min
+val d: u128 = 1u128 << 100;                                     # folded at comptime
 ```
 
 A float suffix needs a float literal: the fractional part or the exponent

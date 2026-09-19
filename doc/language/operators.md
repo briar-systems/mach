@@ -32,6 +32,23 @@ fun main(argc: i64, argv: **u8) i64 {
 }
 ```
 
+**Widening multiply.** A multiply whose operands are both conversions from
+one narrower integer type to a type exactly twice as wide is the full
+product of the narrow operands, and compiles to the target's widening
+instruction rather than a multiply at the wide width. This is how a 64 x 64
+product is written at 128 bits, and the two halves a program selects from
+it are single instructions on every 64-bit target:
+
+```mach fragment
+val full: u128 = (a::u128) * (b::u128);       # a, b: u64; one widening multiply
+val hi:   u64  = (full >> 64)::u64;            # the high-half multiply
+val lo:   u64  = full::u64;                    # the plain multiply
+```
+
+Both operands must be the same conversion (both zero-extensions or both
+sign-extensions); a mixed-sign product is an ordinary multiply at the wide
+width. See [types.md](types.md#128-bit-integers).
+
 ## Bitwise
 
 `&` `|` `^` `~` `<<` `>>` — work on integer scalars. On integer-lane vectors
