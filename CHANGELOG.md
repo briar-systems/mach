@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A `freestanding` target with `of = "elf"` lays its image out on pages. The page an image is laid out at came from the operating system alone, and `freestanding` declared a page of one byte, right for its default flat image and wrong for a format a loader maps by page: a kernel's code and data segments shared one page with `p_align = 1`, and Limine refused the file (`Attempted to load ELF file with PHDRs with different permissions sharing the same memory page`). The page is now a fact of the target tuple, each axis declaring its part: an object format says whether a loader maps it by page (`elf`, `coff`, `macho`), an operating system declares the page its loader maps at or none (`freestanding` declares none), and an instruction set declares its hardware page (4 KiB on `x86_64`, `aarch64`, `riscv64` and `riscv32`). A page-mapped format takes the system's page where one is declared and the isa's otherwise, so a freestanding ELF places each `PT_LOAD` on a 4 KiB page of its own with `p_align = 0x1000`; a `raw` or `spv` image has no page and its bytes are unchanged, and every hosted target keeps its page. A page-mapped format on a tuple where neither the system nor the isa declares a page is refused at selection, naming all three. `doc/language/manifest.md` states the rule (#3360).
+
 ## [5.9.0] - 2026-09-19
 
 ### Added
