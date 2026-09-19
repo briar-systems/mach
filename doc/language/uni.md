@@ -60,9 +60,15 @@ With manual composition, the compiler does not verify that `kind` and `data`
 agree. Keeping them consistent is the programmer's responsibility. In ordinary
 Mach code, prefer first-class `tag` declarations.
 
+A union may carry `#[align(N)]`, `#[packed]` and `#[volatile]` like a record;
+`#[volatile]` makes every access to the union's storage a volatile access, for a
+device register that reads and writes as different types. See
+[decorators.md](decorators.md#volatile--every-access-to-the-type-is-a-volatile-access).
+
 ## See also
 
 - [tag.md](tag.md) - checked tagged values with guarded payload access
+- [decorators.md](decorators.md) - `#[align(N)]`, `#[packed]`, `#[volatile]`
 - [rec.md](rec.md) - records and sequential aggregate layout
 - [statements.md](statements.md) - if/or chains for branching
 - [secrecy.md](secrecy.md) - secrecy agreement across overlapping variants

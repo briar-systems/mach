@@ -35,6 +35,7 @@ A decorator is written as an attribute:
 #[noinline]          # forbid inlining (no arguments)
 #[align(expr)]       # alignment; expr is a comptime integer
 #[packed]            # lay a rec / uni out with no padding (no arguments)
+#[volatile]          # every access to a rec / uni / tag is a volatile access (no arguments)
 #[section(".name")]  # place in a named object section
 #[oblivious]         # constant-time boundary (no arguments)
 #[scalar]            # opt out of auto-vectorization (no arguments)
@@ -500,6 +501,56 @@ codegen work and not part of `#[packed]` as it stands.
 x86-64 and aarch64 do unaligned scalar access in hardware. The aarch64 answer is
 measured on real hardware rather than assumed — `int`'s `linux-arm64` leg runs
 natively.
+
+### `volatile` — every access to the type is a volatile access
+
+`#[volatile]` on a `rec`, `uni` or `tag` declaration makes every load and store
+of that type's storage volatile: the optimizer keeps each one, in program order,
+at the width written. A volatile access is never elided as dead or redundant,
+never hoisted out of a loop, never merged with its neighbour into a wider or
+unaligned access, and never promoted to a register (`mem2reg` leaves a function
+with one alone; `licm` refuses to hoist one; the bulk-memory combiner skips
+one). It takes no arguments and applies to nothing else: `#[volatile]` on a
+function or a variable is refused with `` `volatile` decorator applies only to
+records, unions, and tags``.
+
+Volatility is a property of a **declared type**, so every volatile access in a
+program traces back to a declaration. There is no variable-level decorator and
+no pointer qualifier (see [types.md](types.md#pointer)); a memory-mapped device is
+expressed by declaring its register block as a volatile record and casting its
+address to a pointer to it:
+
+```mach
+#[volatile]
+rec Fb {
+    status: u32;
+    px:     [1024]u32;
+}
+
+val fb: *Fb = 0xB8000::*Fb;
+
+fun fill(c: u32) {
+    var i: u64 = 0;
+    for (i < 1024) {
+        fb.px[i] = c;    # one volatile store per iteration
+        i = i + 1;
+    }
+    fb.status = 1;       # a volatile store, ordered after the loop
+}
+```
+
+The access decides by the storage it reaches, not by its form. A member
+(`fb.status`), a projection, an index (`fb.px[i]`), a dereference (`@fb`) and a
+whole-record copy are volatile alike, and so is a field of a plain record stored
+inside a volatile one (`blk.ctl.bits` when `Blk` is volatile and `Ctl` is not),
+because the storage is the volatile block. An indirection ends the walk: a
+pointer field of a volatile record is itself read volatile, but what it points
+at is ordinary storage unless its own type says otherwise. A raw scalar pointer
+(`@p` with `p: *u32`) is never volatile, since it traces to no declaration.
+
+A volatile record copied by value is a volatile copy in both directions, and a
+`#[volatile]` type is compatible with `#[packed]` and `#[align(N)]`, which only
+shape the layout. `rec.md`, `uni.md` and `tag.md` link here.
 
 ### `section(str)` — object section placement
 
