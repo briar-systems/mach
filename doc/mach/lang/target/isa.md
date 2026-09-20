@@ -705,6 +705,24 @@ pub fun extension_bit(m: *MachineModel, name: str, len: usize) u64;
 
 the bit the model's vocabulary gives `name[0..len]`, 0 when it names no such extension
 
+## fun extension_bundle
+
+```mach
+pub fun extension_bundle(m: *MachineModel, name: str, len: usize) u64;
+```
+
+what a manifest's `extensions` entry `name[0..len]` selects: a level's
+members when the model publishes one by that spelling, else the row's bit,
+0 when the vocabulary has neither
+
+## fun spell_levels
+
+```mach
+pub fun spell_levels(m: *MachineModel, buf: *u8, cap: usize);
+```
+
+the model's levels, `, `-separated in buf, empty when it publishes none
+
 ## fun extension_close
 
 ```mach
