@@ -6,6 +6,34 @@
 pub val HAS_FLOAT: bool = true
 ```
 
+## val EXT_SHA2
+
+```mach
+pub val EXT_SHA2: u64 = 0x1
+```
+
+the aarch64 extension vocabulary over the AdvSIMD baseline
+
+## val EXT_SB
+
+```mach
+pub val EXT_SB: u64 = 0x2
+```
+
+FEAT_SB, the speculation barrier `sb` (Armv8.0 optional, Armv8.5 mandatory)
+
+## val EXTENSION_COUNT
+
+```mach
+pub val EXTENSION_COUNT: u32 = 2
+```
+
+## val EXTENSIONS
+
+```mach
+pub val EXTENSIONS: [EXTENSION_COUNT]extension.Extension = [EXTENSION_COUNT]extension.Extension;
+```
+
 ## val X0
 
 ```mach
@@ -532,6 +560,20 @@ pub val BRK:  Opcode = 15
 
 ```mach
 pub val FMOV: Opcode = 16
+```
+
+## val UMULH
+
+```mach
+pub val UMULH: Opcode = 17
+```
+
+the high half of a 64x64 product; 64-bit only
+
+## val SMULH
+
+```mach
+pub val SMULH: Opcode = 18
 ```
 
 ## val VEC_ADD

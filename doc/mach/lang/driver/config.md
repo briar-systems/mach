@@ -22,14 +22,29 @@ output_override: str) res[RunArtifact, outcome.Fail];
 ## fun load_project_config
 
 ```mach
-pub fun load_project_config(p: *project.Project, project_root: str, manifest_path: str, pick: *manifest.Selection, for_union: bool, is_test: bool) err[outcome.Fail];
+pub fun load_project_config(p: *project.Project, project_root: str, manifest_path: str, pick: *manifest.Selection,
+owner: str, for_union: bool, is_test: bool) err[outcome.Fail];
 ```
 
 ## fun load_config_manifest
 
 ```mach
-pub fun load_config_manifest(p: *project.Project, project_root: str, m: *manifest.Manifest, pick: *manifest.Selection, for_union: bool, is_test: bool) err[outcome.Fail];
+pub fun load_config_manifest(p: *project.Project, project_root: str, m: *manifest.Manifest, pick: *manifest.Selection,
+owner: str, for_union: bool, is_test: bool) err[outcome.Fail];
 ```
+
+configure a project for one build cell of `m`, or of one of its dependencies
+
+p: the project being configured
+project_root: the root project's directory
+m: the root manifest
+pick: the cell; with `owner`, a target and artifact of that dependency and
+              a profile of `m`
+owner: "" for a cell of `m`, or the id of the closure dependency whose default
+              library artifacts require the cell
+for_union: configure the editor's union of every artifact
+is_test: configure the whole-project test build
+ret: ok; err from selection, template, step, link or dependency resolution
 
 ## fun select_target
 
@@ -58,8 +73,12 @@ pub fun glob_shape_ok(pattern: str) bool;
 ## fun execute_steps
 
 ```mach
-pub fun execute_steps(a: *A.Allocator, p: *project.Project, project_root: str) err[outcome.Fail];
+pub fun execute_steps(a: *A.Allocator, p: *project.Project) err[outcome.Fail];
 ```
+
+run the declaring project's prerequisite steps for the configured cell, in its
+own directory. a dependency's cell runs them as a dependency step runs, homed
+in the root's output tree through an absolute `{project.out}`
 
 ## fun dep_out_home
 

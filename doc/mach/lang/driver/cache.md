@@ -18,10 +18,11 @@ pub fun operation_active(p: *project.Project) bool;
 ## fun identify
 
 ```mach
-pub fun identify(p: *project.Project) err[fail.Fail];
+pub fun identify(p: *project.Project, ph: u8) err[fail.Fail];
 ```
 
-the compiler identity is a process constant: read once per project
+the compiler identity is a process constant: read once per project, reported
+under the readout phase ph that asked for it
 
 ## fun identity_available
 
@@ -68,8 +69,10 @@ restored and still staged, which is what the codegen query publishes
 ## fun restore
 
 ```mach
-pub fun restore(p: *project.Project, mid: session.ModuleId) res[bool, fail.Fail];
+pub fun restore(p: *project.Project, mid: session.ModuleId, ph: u8) res[bool, fail.Fail];
 ```
+
+a hit is reported under the readout phase ph that asked for the module
 
 ## fun take_staged
 

@@ -48,6 +48,12 @@ pub val PH_EMIT:     u8 = 6
 pub val PH_LINK:     u8 = 7
 ```
 
+## val PH_CACHE
+
+```mach
+pub val PH_CACHE:    u8 = 8
+```
+
 ## val LEVEL_PHASES
 
 ```mach
@@ -69,7 +75,7 @@ pub fun phase_valid(ph: u8) bool;
 ## def Instant
 
 ```mach
-pub def Instant: opt[ctime.Time]
+pub def Instant: opt[ctime.Instant]
 ```
 
 an instant a readout measures from: absent when the platform clock refused

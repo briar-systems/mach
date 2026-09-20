@@ -48,15 +48,19 @@ pub fun check_annotation_uni_secrecy(sc: *sema.SemaContext, ast_tid: id.TypeId);
 ## fun check_type_uni_secrecy
 
 ```mach
-pub fun check_type_uni_secrecy(sc: *sema.SemaContext, tid: type.TypeId, args: *type.TypeId,
-arg_len: u32, span: token.Span);
+pub fun check_type_uni_secrecy(sc: *sema.SemaContext, tid: type.TypeId, who: *type.GenericOwner,
+args: *type.TypeId, arg_len: u32, span: token.Span);
 ```
 
 ## fun substitute
 
 ```mach
-pub fun substitute(s: *session.Session, body_type: type.TypeId, args: *type.TypeId, arg_count: u32) res[type.TypeId, fail.Fail];
+pub fun substitute(s: *session.Session, body_type: type.TypeId, who: *type.GenericOwner, args: *type.TypeId, arg_count: u32) res[type.TypeId, fail.Fail];
 ```
+
+replace `who`'s parameters in `body_type` with `args`, position for position;
+a parameter of any other declaration (an enclosing generic's, in an open
+instance) stays, so a substituted type reads as the identity under a second pass
 
 ## fun ensure_fields
 

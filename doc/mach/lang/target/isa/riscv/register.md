@@ -3,7 +3,7 @@
 ## fun select_features
 
 ```mach
-pub fun select_features(model: *isa.MachineModel, bits: u32);
+pub fun select_features(model: *isa.MachineModel, bits: u64);
 ```
 
 narrows the registered template to one selection: the float and multiply facts,

@@ -6,11 +6,35 @@
 pub rec LowerCtx;
 ```
 
+## fun reject
+
+```mach
+pub fun reject(ctx: *LowerCtx, text: str) fail.Fail;
+```
+
+lowering rejects the program at the instruction under translation, or at
+the function when no instruction is
+
 ## fun ctx_setup
 
 ```mach
 pub fun ctx_setup(ctx: *LowerCtx, tgt: *target.Target, fn: *ir.Function) err[fail.Fail];
 ```
+
+## fun gep_folds
+
+```mach
+pub fun gep_folds(ctx: *LowerCtx, iid: id.InstructionId) bool;
+```
+
+## fun seed_gep_mems
+
+```mach
+pub fun seed_gep_mems(ctx: *LowerCtx, fn: *ir.Function, pure: fun(*LowerCtx, *instruction.Instruction) opt[mir.MirOperand]);
+```
+
+the folded addresses are computed after the use check, from the IR alone;
+a candidate whose address needs an instruction is not folded
 
 ## fun ctx_dnit
 
@@ -110,6 +134,19 @@ pub fun ret_align(ctx: *LowerCtx, ty: ir_type.IrTypeId) u32;
 pub fun op_width_of(ctx: *LowerCtx, ty: ir_type.IrTypeId) u8;
 ```
 
+the operand width of a scalar is its size at every size the target realizes
+(lower_instr refuses an integer the target does not before this is asked);
+an aggregate or a scalar of no size is one register
+
+## fun unrealized_int_width
+
+```mach
+pub fun unrealized_int_width(ctx: *LowerCtx, ty: ir_type.IrTypeId) u32;
+```
+
+the byte size of an integer scalar the target does not realize, 0 when the
+type is not one: the width refusal's one predicate
+
 ## fun mem_width_of
 
 ```mach
@@ -150,6 +187,14 @@ pub fun lower_operand(ctx: *LowerCtx, inst: *instruction.Instruction, idx: u32) 
 ```mach
 pub fun mem_operand_of(ctx: *LowerCtx, v: value.Value) res[mir.MirOperand, fail.Fail];
 ```
+
+## fun mem_operand_of_plain
+
+```mach
+pub fun mem_operand_of_plain(ctx: *LowerCtx, v: value.Value) res[mir.MirOperand, fail.Fail];
+```
+
+the memory operand of a pointer value as lowered, with no folded address
 
 ## fun push_instr
 
@@ -292,6 +337,14 @@ pub fun alloc_object_storage(ctx: *LowerCtx, mb: *mir.MirBlock, dst: mir.VRegId,
 pub fun add_alloca_slot(ctx: *LowerCtx, value_id: u32, size: u64, align: u32, ty: u32) err[fail.Fail];
 ```
 
+## fun set_slot_origin
+
+```mach
+pub fun set_slot_origin(ctx: *LowerCtx, value_id: u32, origin: u32);
+```
+
+record the ir alloca behind the slot just added for `value_id`
+
 ## fun add_spill_slot
 
 ```mach
@@ -303,6 +356,9 @@ pub fun add_spill_slot(ctx: *LowerCtx, value_id: u32, size: u64) err[fail.Fail];
 ```mach
 pub fun alloc_result_storage(ctx: *LowerCtx, mb: *mir.MirBlock, dst: mir.VRegId, size: u64, align: u32) err[fail.Fail];
 ```
+
+storage of a given extent, addressed through `dst`: a call's returned object, and the
+home an incoming aggregate assembled from register carriers is written into
 
 ## fun add_spill_slot_aligned
 

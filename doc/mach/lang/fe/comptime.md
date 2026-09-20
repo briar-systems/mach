@@ -107,49 +107,55 @@ pub def GateOutcome: u8
 ## val GATE_INACTIVE
 
 ```mach
-pub val GATE_INACTIVE:        GateOutcome = 0
+pub val GATE_INACTIVE:          GateOutcome = 0
 ```
 
 ## val GATE_ACTIVE
 
 ```mach
-pub val GATE_ACTIVE:          GateOutcome = 1
+pub val GATE_ACTIVE:            GateOutcome = 1
 ```
 
 ## val GATE_DEFERRED
 
 ```mach
-pub val GATE_DEFERRED:        GateOutcome = 2
+pub val GATE_DEFERRED:          GateOutcome = 2
 ```
 
 ## val GATE_REJECTED
 
 ```mach
-pub val GATE_REJECTED:        GateOutcome = 3
+pub val GATE_REJECTED:          GateOutcome = 3
 ```
 
 ## val GATE_FAILED
 
 ```mach
-pub val GATE_FAILED:          GateOutcome = 4
+pub val GATE_FAILED:            GateOutcome = 4
 ```
 
 ## val GATE_AWAITING_LAYOUT
 
 ```mach
-pub val GATE_AWAITING_LAYOUT: GateOutcome = 5
+pub val GATE_AWAITING_LAYOUT:   GateOutcome = 5
 ```
 
 ## val GATE_AWAITING_PHASE
 
 ```mach
-pub val GATE_AWAITING_PHASE:  GateOutcome = 6
+pub val GATE_AWAITING_PHASE:    GateOutcome = 6
 ```
 
 ## val GATE_AWAITING_TYPES
 
 ```mach
-pub val GATE_AWAITING_TYPES:  GateOutcome = 7
+pub val GATE_AWAITING_TYPES:    GateOutcome = 7
+```
+
+## val GATE_AWAITING_INSTANCE
+
+```mach
+pub val GATE_AWAITING_INSTANCE: GateOutcome = 8
 ```
 
 ## rec GateSelection
@@ -197,6 +203,10 @@ pub val COMPTIME_LAYOUT_NO_RESOLVER_MSG: str =
 pub rec CTValue;
 ```
 
+an integer value is 128 bits in data.w; data.i is its low limb, and a signed
+value sign-fills the high limb so every reader of a value that fits 64 bits
+sees the same i64 it always did (#3511)
+
 ## rec NamedConst
 
 ```mach
@@ -222,6 +232,13 @@ pub val COMPTIME_TYPE_NO_RESOLVER_MSG: str =
 ```mach
 pub val COMPTIME_TYPE_UNRESOLVED_MSG: str =
 "type comparison operand does not name a type"
+```
+
+## val COMPTIME_TYPE_NEEDS_INSTANCE_MSG
+
+```mach
+pub val COMPTIME_TYPE_NEEDS_INSTANCE_MSG: str =
+"a type comparison on an unsubstituted generic parameter is only decidable at an instantiation"
 ```
 
 ## val FIELD_SEL_NAME
@@ -349,6 +366,18 @@ pub val TYPE_QUERY_IS_SECRET:  u8 = 4
 
 ```mach
 pub val TYPE_QUERY_IS_TAG:     u8 = 5
+```
+
+## val TYPE_QUERY_IS_INTEGER
+
+```mach
+pub val TYPE_QUERY_IS_INTEGER: u8 = 6
+```
+
+## val TYPE_QUERY_IS_FLOAT
+
+```mach
+pub val TYPE_QUERY_IS_FLOAT:   u8 = 7
 ```
 
 ## def PhaseCapabilityKind
@@ -528,43 +557,49 @@ pub def EvalFailKind: u8
 ## val EVAL_FAIL_NONE
 
 ```mach
-pub val EVAL_FAIL_NONE:         EvalFailKind = 0
+pub val EVAL_FAIL_NONE:           EvalFailKind = 0
 ```
 
 ## val EVAL_FAIL_REJECTED
 
 ```mach
-pub val EVAL_FAIL_REJECTED:     EvalFailKind = 1
+pub val EVAL_FAIL_REJECTED:       EvalFailKind = 1
 ```
 
 ## val EVAL_FAIL_UNBOUND
 
 ```mach
-pub val EVAL_FAIL_UNBOUND:      EvalFailKind = 2
+pub val EVAL_FAIL_UNBOUND:        EvalFailKind = 2
 ```
 
 ## val EVAL_FAIL_NEEDS_MEMBER
 
 ```mach
-pub val EVAL_FAIL_NEEDS_MEMBER: EvalFailKind = 3
+pub val EVAL_FAIL_NEEDS_MEMBER:   EvalFailKind = 3
 ```
 
 ## val EVAL_FAIL_NEEDS_TYPES
 
 ```mach
-pub val EVAL_FAIL_NEEDS_TYPES:  EvalFailKind = 4
+pub val EVAL_FAIL_NEEDS_TYPES:    EvalFailKind = 4
 ```
 
 ## val EVAL_FAIL_NEEDS_LAYOUT
 
 ```mach
-pub val EVAL_FAIL_NEEDS_LAYOUT: EvalFailKind = 5
+pub val EVAL_FAIL_NEEDS_LAYOUT:   EvalFailKind = 5
 ```
 
 ## val EVAL_FAIL_INTERNAL
 
 ```mach
-pub val EVAL_FAIL_INTERNAL:     EvalFailKind = 6
+pub val EVAL_FAIL_INTERNAL:       EvalFailKind = 6
+```
+
+## val EVAL_FAIL_NEEDS_INSTANCE
+
+```mach
+pub val EVAL_FAIL_NEEDS_INSTANCE: EvalFailKind = 7
 ```
 
 ## rec EvalFail
@@ -745,6 +780,33 @@ pub rec ComptimeEnv;
 pub rec ComptimeCtx;
 ```
 
+## def LoadMark
+
+```mach
+pub def LoadMark: u8
+```
+
+what the load walk decided for a declaration: unwalked, walked, or a `use`
+the load reported and bound nothing for, so resolve binds nothing and says nothing
+
+## val LOAD_MARK_NONE
+
+```mach
+pub val LOAD_MARK_NONE:    LoadMark = 0
+```
+
+## val LOAD_MARK_WALKED
+
+```mach
+pub val LOAD_MARK_WALKED:  LoadMark = 1
+```
+
+## val LOAD_MARK_UNBOUND
+
+```mach
+pub val LOAD_MARK_UNBOUND: LoadMark = 2
+```
+
 ## fun environment
 
 ```mach
@@ -778,6 +840,18 @@ pub fun set_union_build(c: *ComptimeCtx, v: bool);
 
 ```mach
 pub fun set_target_defs(c: *ComptimeCtx, d: *isa.TargetDefs);
+```
+
+## fun set_ct_mul
+
+```mach
+pub fun set_ct_mul(c: *ComptimeCtx, mask: ct.CtMulMask);
+```
+
+## fun set_extensions
+
+```mach
+pub fun set_extensions(c: *ComptimeCtx, view: isa.ExtensionView);
 ```
 
 ## fun set_va_list
@@ -834,6 +908,20 @@ pub fun load_walked(c: *ComptimeCtx, did: id.DeclId) bool;
 
 ```mach
 pub fun mark_load_walked(c: *ComptimeCtx, did: id.DeclId);
+```
+
+an unbound mark is the stronger fact and survives the walk's own mark
+
+## fun use_unbound
+
+```mach
+pub fun use_unbound(c: *ComptimeCtx, did: id.DeclId) bool;
+```
+
+## fun mark_use_unbound
+
+```mach
+pub fun mark_use_unbound(c: *ComptimeCtx, did: id.DeclId);
 ```
 
 ## fun defer_float_width
@@ -1378,6 +1466,22 @@ pub fun is_type_name_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
 pub fun ct_is_negative(v: CTValue) bool;
 ```
 
+## fun ct_int_u64
+
+```mach
+pub fun ct_int_u64(v: CTValue, out: *u64) bool;
+```
+
+an integer value that is neither negative nor above u64, read as a u64
+
+## fun ct_int_text
+
+```mach
+pub fun ct_int_text(v: CTValue, buf: *u8) str;
+```
+
+the decimal text of an integer value in a wide.FORMAT_CAP buffer
+
 ## fun is_case_literal
 
 ```mach
@@ -1387,6 +1491,22 @@ pub fun is_case_literal(a: *ast.Ast, eid: id.ExprId) bool;
 a literal is a case literal when its head names a tag case, `T.c{...}` or `T.[c]{...}`; the
 parser records the case only for a head with generic arguments, name resolution splits the
 others, so the answer is complete once the literal's head has been bound
+
+## fun is_path_call
+
+```mach
+pub fun is_path_call(a: *ast.Ast, e: id.ExprId) bool;
+```
+
+a call whose callee is a rooted comptime path: `$mach.build.ct_mul(low, 64)`
+
+## fun is_comptime_value
+
+```mach
+pub fun is_comptime_value(a: *ast.Ast, e: id.ExprId) bool;
+```
+
+a rooted comptime path, or a call on one: both fold to a constant
 
 ## fun is_comptime_path
 

@@ -6,6 +6,9 @@
 pub val FN_FLAG_PUB:       u32 = 0x01
 ```
 
+the declaration carried `pub`, and nothing else sets it: a synthesized
+definition is never `pub`, however visible it has to stay within a link
+
 ## val FN_FLAG_EXTERN
 
 ```mach
@@ -311,6 +314,16 @@ pub fun function_new(alloc: *A.Allocator, name: intern.StrId, sig: type.IrTypeId
 ```mach
 pub fun function_add(m: *Module, name: intern.StrId, sig: type.IrTypeId, flags: u32) res[u32, fail.Fail];
 ```
+
+## fun export_request_add
+
+```mach
+pub fun export_request_add(m: *Module, name: intern.StrId) err[fail.Fail];
+```
+
+a name this module's `fwd` re-exports puts on the library's export surface;
+recording the same name twice is the common case (two modules re-exporting one
+declaration) and collapses here
 
 ## fun function_register
 

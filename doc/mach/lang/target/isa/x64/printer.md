@@ -26,6 +26,14 @@ pub fun note_inst(buf: *enc.ByteBuf, mi: *isa.Inst, start: usize);
 
 notify first, render only for a writer: the stream is the same on every build
 
+## fun note_local_label
+
+```mach
+pub fun note_local_label(buf: *enc.ByteBuf, number: u32);
+```
+
+the definition of a numbered local label, at the current offset
+
 ## fun mnemonic
 
 ```mach
@@ -38,5 +46,19 @@ the spelling a diagnostic names an emitted instruction by
 
 ```mach
 pub fun reg_name(id: i32, width: u8) str;
+```
+
+## fun test_sink_writer
+
+```mach
+pub fun test_sink_writer(w: *writer.Writer);
+```
+
+a writer into the test buffer, emptied, for an encoder-side round trip
+
+## fun test_sink_text
+
+```mach
+pub fun test_sink_text() str;
 ```
 

@@ -312,6 +312,22 @@ pub val MIR_UNREACHABLE: MirOpcode = 42
 pub val MIR_ASM:         MirOpcode = 43
 ```
 
+## val MIR_MUL_WIDE_S
+
+```mach
+pub val MIR_MUL_WIDE_S: MirOpcode = 50
+```
+
+the IR widening multiplies, lowered by their IR kind: the full product of two
+integer vectors in lanes twice as wide, which the vec_lane names as a result
+lane carrying its operand lane
+
+## val MIR_MUL_WIDE_U
+
+```mach
+pub val MIR_MUL_WIDE_U: MirOpcode = 51
+```
+
 ## val MIR_MOV
 
 ```mach
@@ -364,6 +380,49 @@ pub val MIR_VEC_BUILD:   MirOpcode = 0x1007
 
 ```mach
 pub val MIR_MUL_HI_U: MirOpcode = 0x1008
+```
+
+## val MIR_MUL_HI_S
+
+```mach
+pub val MIR_MUL_HI_S: MirOpcode = 0x1009
+```
+
+the signed high half, the pair of MIR_MUL_HI_U (#3511); claimed ahead of the
+legalize expansion that will emit it
+
+## val MIR_LANE_JOIN
+
+```mach
+pub val MIR_LANE_JOIN: MirOpcode = 0x100A
+```
+
+a wide value assembled from lane-width pieces (dst, then one operand per
+lane) and one lane of a wide value (dst, src, lane index in imm); both exist
+only above the ALU width and legalize consumes them (#3511)
+
+## val MIR_LANE_PICK
+
+```mach
+pub val MIR_LANE_PICK: MirOpcode = 0x100B
+```
+
+## val MIR_MUL_PAIR_U
+
+```mach
+pub val MIR_MUL_PAIR_U: MirOpcode = 0x100C
+```
+
+the fixed-pair widening multiply of a MULW_FIXED_PAIR target: operands
+[acc, src], both one lane wide, where acc is the target's fixed accumulator
+(div_reg) and the instruction leaves the low half in it and the high half in
+div_hi_reg (x86's one-operand mul and imul). legalize emits it; only a
+target that declares the form has a rule for it (#3511)
+
+## val MIR_MUL_PAIR_S
+
+```mach
+pub val MIR_MUL_PAIR_S: MirOpcode = 0x100D
 ```
 
 ## val MIR_SEL_ADD
@@ -520,6 +579,35 @@ pub val MIR_SEL_CBR_LE_S: MirOpcode = 0x1124
 
 ```mach
 pub val MIR_SEL_CBR_LE_U: MirOpcode = 0x1125
+```
+
+## val MIR_SEL_NEG
+
+```mach
+pub val MIR_SEL_NEG: MirOpcode = 0x1126
+```
+
+two-address unary selections: destination and operand, run as a copy into
+the destination and the op in place
+
+## val MIR_SEL_NOT
+
+```mach
+pub val MIR_SEL_NOT: MirOpcode = 0x1127
+```
+
+## val MIR_SEL_MUL_PAIR_U
+
+```mach
+pub val MIR_SEL_MUL_PAIR_U: MirOpcode = 0x1128
+```
+
+the selected fixed-pair widening multiply (#3511)
+
+## val MIR_SEL_MUL_PAIR_S
+
+```mach
+pub val MIR_SEL_MUL_PAIR_S: MirOpcode = 0x1129
 ```
 
 ## fun is_cmp_opcode
@@ -788,6 +876,30 @@ pub val MIRF_ADDRESSED:        MirFlags = 0x00200000
 pub val MIRF_ADDRESS_PRODUCER: MirFlags = 0x00400000
 ```
 
+## val MIRF_COMMUTATIVE
+
+```mach
+pub val MIRF_COMMUTATIVE:      MirFlags = 0x00800000
+```
+
+## val MIRF_SLOT_SOURCE
+
+```mach
+pub val MIRF_SLOT_SOURCE: MirFlags = 0x01000000
+```
+
+on a target that reads slot operands, one spilled source operand may be read
+in place from its frame slot
+
+## val MIRF_FIXED_PAIR
+
+```mach
+pub val MIRF_FIXED_PAIR: MirFlags = 0x02000000
+```
+
+the instruction reads and writes the target's fixed accumulator pair
+(div_reg, div_hi_reg), which the allocator reserves for the function
+
 ## def MirCtClass
 
 ```mach
@@ -911,6 +1023,24 @@ pub fun ct_class(op: MirOpcode) MirCtClass;
 pub fun ct_op(op: MirOpcode) res[ct.CtOp, fail.Fail];
 ```
 
+## fun ct_mul_op
+
+```mach
+pub fun ct_mul_op(op: MirOpcode) ct.CtMulOp;
+```
+
+the multiply an INT_MUL opcode realizes, NONE for every other opcode; the
+width is the operand's
+
+## fun ct_mul_cell
+
+```mach
+pub fun ct_mul_cell(mi: *MirInstr) ct.CtMulCell;
+```
+
+the multiply cell an instruction realizes, for the constant-time gate; a
+lane multiply is keyed by its operand lane width
+
 ## fun is_terminator
 
 ```mach
@@ -932,7 +1062,7 @@ pub val SELECTION_REACHABLE_FLOAT_COUNT: u32 = 6
 ## val SELECTION_ELIMINATED_COUNT
 
 ```mach
-pub val SELECTION_ELIMINATED_COUNT:      u32 = 5
+pub val SELECTION_ELIMINATED_COUNT:      u32 = 7
 ```
 
 ## val SELECTION_FUSED_COUNT
@@ -950,7 +1080,19 @@ pub val SELECTION_LANE_COUNT:            u32 = 2
 ## val SELECTION_WIDENING_MUL_COUNT
 
 ```mach
-pub val SELECTION_WIDENING_MUL_COUNT:    u32 = 1
+pub val SELECTION_WIDENING_MUL_COUNT:    u32 = 2
+```
+
+## val SELECTION_PACKED_WIDENING_COUNT
+
+```mach
+pub val SELECTION_PACKED_WIDENING_COUNT: u32 = 2
+```
+
+## val SELECTION_FIXED_PAIR_MUL_COUNT
+
+```mach
+pub val SELECTION_FIXED_PAIR_MUL_COUNT:  u32 = 2
 ```
 
 ## fun selection_reachable
@@ -981,6 +1123,18 @@ pub fun selection_lane(out: *u32);
 
 ```mach
 pub fun selection_widening_mul(out: *u32);
+```
+
+## fun selection_packed_widening
+
+```mach
+pub fun selection_packed_widening(out: *u32);
+```
+
+## fun selection_fixed_pair_mul
+
+```mach
+pub fun selection_fixed_pair_mul(out: *u32);
 ```
 
 ## fun selection_fused
@@ -1154,6 +1308,9 @@ pub val ALU_MIN_WIDTH: u8 = 4
 pub rec MirOperand;
 ```
 
+an immediate is 128 bits: imm is the low limb and imm_hi the high one, so
+every 64-bit immediate reads as its sign extension (#3511)
+
 ## rec MirAsmBind
 
 ```mach
@@ -1163,7 +1320,7 @@ pub rec MirAsmBind;
 ## fun asm_bind
 
 ```mach
-pub fun asm_bind(name: intern.StrId, slot_vreg: u32, secret: bool) MirAsmBind;
+pub fun asm_bind(name: intern.StrId, slot_vreg: u32, secrecy: ct.BindSecrecy) MirAsmBind;
 ```
 
 ## rec MirAsm
@@ -1271,11 +1428,57 @@ pub fun vec_lane_is_vector(v: u32) bool;
 pub fun vec_lane_count(v: u32) u32;
 ```
 
+## fun vec_lane_make_convert
+
+```mach
+pub fun vec_lane_make_convert(result: u32, from_kind: u8, from_bytes: u8) u32;
+```
+
+a lane-changing instruction (a lane-wise conversion or a widening multiply)
+names its result lane in bits 0..27 of its vec_lane and its
+operand lane in bits 28..31: bit 31 is set for a float operand and bits
+28..30 hold log2 of the operand element bytes plus one, zero for a value
+that is not a conversion. these accessors are the only readers and writers
+of the operand bits
+
+## fun vec_lane_is_convert
+
+```mach
+pub fun vec_lane_is_convert(v: u32) bool;
+```
+
+## fun vec_lane_from_kind
+
+```mach
+pub fun vec_lane_from_kind(v: u32) u8;
+```
+
+the operand lane kind of a conversion, the result's for any other value
+
+## fun vec_lane_from_bytes
+
+```mach
+pub fun vec_lane_from_bytes(v: u32) u8;
+```
+
+the operand element bytes of a conversion, the result's for any other value
+
 ## rec MirDbgBinding
 
 ```mach
 pub rec MirDbgBinding;
 ```
+
+lane: which lane of a value wider than one register `vreg` holds, of `lanes`
+lanes each `lane_bytes` wide; `lanes` is 0 when `vreg` holds the whole value
+
+## val DBG_LANES_MAX
+
+```mach
+pub val DBG_LANES_MAX: u32 = 8
+```
+
+the most lanes a debug location describes; a wider value binds no location
 
 ## rec MirBlock
 
@@ -1328,7 +1531,13 @@ pub rec MirSlot;
 ## val SLOT_TY_NIL
 
 ```mach
-pub val SLOT_TY_NIL: u32 = 0xFFFFFFFF
+pub val SLOT_TY_NIL:     u32 = 0xFFFFFFFF
+```
+
+## val SLOT_ORIGIN_NIL
+
+```mach
+pub val SLOT_ORIGIN_NIL: u32 = 0xFFFFFFFF
 ```
 
 ## rec MirFrame
@@ -1397,6 +1606,15 @@ pub rec MirAbiInput;
 pub rec MirFunction;
 ```
 
+## fun module_needs_dit
+
+```mach
+pub fun module_needs_dit(m: *MirModule) bool;
+```
+
+whether any function of the module needs PSTATE.DIT: the per-module fact
+codegen records in the object for the linker to union
+
 ## fun opcode_name
 
 ```mach
@@ -1414,6 +1632,49 @@ fn_name: str, mi: *MirInstr, what: str) str;
 
 ```mach
 pub rec MirModule;
+```
+
+diags: the store a backend pass appends to when it rejects the program, the
+same store the front-end passes of the module wrote; owned by the caller
+
+## fun reject
+
+```mach
+pub fun reject(diags: *diagnostic.DiagnosticStore, loc: source.SrcLoc, text: str) fail.Fail;
+```
+
+a backend pass rejects the program: the refusal is an error located at `loc`
+on the module's diagnostic store and the pass answers `reported`, exactly as a
+front-end pass does, so rendering, the tally and the exit status derive from
+one list. an append the store refuses is an internal failure; a module wired
+without a store is a compiler defect, and the text then stands as an internal
+failure rather than vanishing
+
+## fun refusal_loc
+
+```mach
+pub fun refusal_loc(f: *MirFunction, mi: *MirInstr) source.SrcLoc;
+```
+
+the location a refusal of `mi` in `f` reports: the instruction's own when it
+has one, else the function's declaration
+
+## fun reject_instr
+
+```mach
+pub fun reject_instr(m: *MirModule, f: *MirFunction, mi: *MirInstr, text: str) fail.Fail;
+```
+
+## fun reject_instr_at
+
+```mach
+pub fun reject_instr_at(diags: *diagnostic.DiagnosticStore, f: *MirFunction, mi: *MirInstr, text: str) fail.Fail;
+```
+
+## fun reject_function
+
+```mach
+pub fun reject_function(m: *MirModule, f: *MirFunction, text: str) fail.Fail;
 ```
 
 ## fun catalog_failure
@@ -1510,6 +1771,12 @@ pub fun operand_seed_secret(f: *MirFunction, op: *MirOperand) bool;
 pub fun op_imm(imm: i64) MirOperand;
 ```
 
+## fun op_imm_wide
+
+```mach
+pub fun op_imm_wide(lo: i64, hi: i64) MirOperand;
+```
+
 ## fun op_mem_slot
 
 ```mach
@@ -1557,6 +1824,15 @@ pub fun push_function(mm: *MirModule, mf: MirFunction) err[fail.Fail];
 ```mach
 pub fun instr_attach_dbg(a: *A.Allocator, mi: *MirInstr, iid: u32, vreg: u32) err[fail.Fail];
 ```
+
+## fun instr_pass_dbg
+
+```mach
+pub fun instr_pass_dbg(a: *A.Allocator, from: *MirInstr, to: *MirInstr) err[fail.Fail];
+```
+
+the bindings of `from` move ahead of those of `to`: a deleted instruction's
+program point is the instruction that follows it
 
 ## fun dnit_module
 

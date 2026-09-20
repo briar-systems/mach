@@ -20,6 +20,50 @@ pub val SYMBOL_REJECTED: SymbolId = 0xFFFFFFFE
 
 an identifier visited and rejected by resolution has no symbol to remap.
 
+## val SYMBOL_DEFERRED_NAME
+
+```mach
+pub val SYMBOL_DEFERRED_NAME: SymbolId = 0xFFFFFFFD
+```
+
+a name in an arm of a statement-level gate resolve could not decide, which resolved to
+nothing: sema reports it if it selects that arm, and an arm it discards reports nothing
+(#3485). one sentinel per message, so the report reads as resolve's would have.
+
+## val SYMBOL_DEFERRED_TYPE
+
+```mach
+pub val SYMBOL_DEFERRED_TYPE: SymbolId = 0xFFFFFFFC
+```
+
+## val SYMBOL_RESERVED_MIN
+
+```mach
+pub val SYMBOL_RESERVED_MIN: SymbolId = SYMBOL_DEFERRED_TYPE
+```
+
+every id at or above this one is a sentinel, never a symbol
+
+## fun symbol_deferred
+
+```mach
+pub fun symbol_deferred(sid: SymbolId) bool;
+```
+
+## val TESTING_DIRECTIVE
+
+```mach
+pub val TESTING_DIRECTIVE: str = "testing"
+```
+
+## val EXTENSIONS_DIRECTIVE
+
+```mach
+pub val EXTENSIONS_DIRECTIVE: str = "extensions"
+```
+
+`#[extensions(name, ...)]` takes bare extension names, which bind to nothing
+
 ## def SymKind
 
 ```mach
@@ -233,6 +277,14 @@ reported by type checking and records nothing here
 ```mach
 pub fun decorators_deprecation(a: *ast.Ast, source: str, interner: *intern.Interner, start: u32, len: u32) res[deprecation.Deprecation, fail.Fail];
 ```
+
+## fun declaration_testing
+
+```mach
+pub fun declaration_testing(a: *ast.Ast, source: str, did: id.DeclId) bool;
+```
+
+whether a declaration carries `#[testing]`, which confines every reference to it to test code
 
 ## def TypeSpellStatus
 

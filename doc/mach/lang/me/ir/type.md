@@ -217,6 +217,55 @@ pub fun tag_case_type(t: *IrTypeTable, id: IrTypeId, case_ix: u32) IrTypeId;
 pub fun tag_case_has_payload(t: *IrTypeTable, id: IrTypeId, case_ix: u32) bool;
 ```
 
+## fun tag_disc_field
+
+```mach
+pub fun tag_disc_field() u32;
+```
+
+a tag is addressed like a struct: field 0 is the discriminator and field
+k + 1 is the payload of case k, so a gep into a tag needs no spelling of
+its own. every case payload shares the payload offset
+
+## fun tag_case_field
+
+```mach
+pub fun tag_case_field(case_ix: u32) u32;
+```
+
+## fun tag_field_count
+
+```mach
+pub fun tag_field_count(t: *IrTypeTable, id: IrTypeId) u32;
+```
+
+## fun tag_disc_type
+
+```mach
+pub fun tag_disc_type(t: *IrTypeTable, id: IrTypeId) IrTypeId;
+```
+
+## fun tag_field_type
+
+```mach
+pub fun tag_field_type(t: *IrTypeTable, id: IrTypeId, field_ix: u32) IrTypeId;
+```
+
+## fun tag_field_offset_for_machine
+
+```mach
+pub fun tag_field_offset_for_machine(t: *IrTypeTable, id: IrTypeId, field_ix: u32, machine: layout.Machine) u32;
+```
+
+## fun member_offset_for_machine
+
+```mach
+pub fun member_offset_for_machine(t: *IrTypeTable, id: IrTypeId, member_ix: u32, machine: layout.Machine) u32;
+```
+
+the byte offset of a declared member as the source numbers it: a struct
+field by its index, a tag case by its case index
+
 ## fun tag_discriminator_bytes
 
 ```mach
@@ -313,6 +362,10 @@ pub fun byte_align_for_machine(t: *IrTypeTable, id: IrTypeId, machine: layout.Ma
 pub fun byte_offset_for_machine(t: *IrTypeTable, id: IrTypeId, field_ix: u32,
 machine: layout.Machine) u32;
 ```
+
+the byte offset of an aggregate's field as a gep addresses it; for a tag
+that is the discriminator at field 0 and the shared payload offset for
+every case field after it
 
 ## fun tag_payload_offset_for_machine
 

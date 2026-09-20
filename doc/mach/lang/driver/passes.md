@@ -18,6 +18,9 @@ pub fun prepare_resolve_pass(p: *project.Project) err[fail.Fail];
 pub fun run_resolve_pass(p: *project.Project) err[fail.Fail];
 ```
 
+a rejected module is one module's answer, so the pass folds it and carries
+on over the rest; an internal failure ends the pass where it met it
+
 ## fun q_resolve_compute
 
 ```mach
@@ -42,6 +45,9 @@ pub fun prepare_sema_pass(p: *project.Project) err[outcome.Fail];
 pub fun run_sema_pass(p: *project.Project) err[outcome.Fail];
 ```
 
+a rejected module is one module's answer, so the pass folds it and carries
+on over the rest; an internal failure ends the pass where it met it
+
 ## fun acquire_sema
 
 ```mach
@@ -58,6 +64,26 @@ pub fun q_sema_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags
 
 ```mach
 pub fun q_sema_finalize(value: *u8, value_len: u32, alloc: *A.Allocator);
+```
+
+## val GATE_TUPLE_NONE
+
+```mach
+pub val GATE_TUPLE_NONE: u32 = 0xFFFFFFFF
+```
+
+## fun gate_key
+
+```mach
+pub fun gate_key(stable: session.StableModuleId, ti: u32) u64;
+```
+
+a gate product's key: the module's stable id, with the union tuple counted from one above it
+
+## fun gate_key_tuple
+
+```mach
+pub fun gate_key_tuple(key: u64) u32;
 ```
 
 ## fun read_typed_surface
@@ -78,17 +104,88 @@ pub fun decided_gate_count(p: *project.Project) u32;
 pub fun run_gate_pass(p: *project.Project) res[bool, fail.Fail];
 ```
 
-## fun clear_gate_results
+## fun q_gates_compute
 
 ```mach
-pub fun clear_gate_results(p: *project.Project);
+pub fun q_gates_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
 ```
 
-## fun invalidate_resolve_pass
+## fun q_gate_surface_compute
 
 ```mach
-pub fun invalidate_resolve_pass(p: *project.Project) err[fail.Fail];
+pub fun q_gate_surface_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
 ```
+
+## fun enter_frame
+
+```mach
+pub fun enter_frame(p: *project.Project, mid: session.ModuleId, ti: u32) err[fail.Fail];
+```
+
+bring a module into a target's frame, preparing it first
+
+## fun view_key
+
+```mach
+pub fun view_key(m: *project.ModuleEntry) u64;
+```
+
+## fun settled_view_key
+
+```mach
+pub fun settled_view_key(db: *query.QueryDb, stable: session.StableModuleId) u64;
+```
+
+the key a module's resolve and export products hold under the view its last build settled on
+
+## fun module_gate_key
+
+```mach
+pub fun module_gate_key(m: *project.ModuleEntry, ti: u32) u64;
+```
+
+## fun assign_load_views
+
+```mach
+pub fun assign_load_views(p: *project.Project) err[fail.Fail];
+```
+
+keys each module's products by the view the load walk left it in this round, dependencies first
+
+## fun settle_load_views
+
+```mach
+pub fun settle_load_views(p: *project.Project) err[fail.Fail];
+```
+
+the gate fixpoint is over: products keyed by module alone read each module's final view, and the views
+no round reached this build are dropped with their products
+
+## fun retain_modules
+
+```mach
+pub fun retain_modules(p: *project.Project, rejected: bool) err[fail.Fail];
+```
+
+every module the load reached, gated out or not, is held under the session's active retainer: the
+project borrows each one's parse. a load closes its retainer's round unless a caller keeps the round
+open across builds, and then whatever no retainer holds is retired
+
+## fun view_slot_count
+
+```mach
+pub fun view_slot_count(p: *project.Project, m: *project.ModuleEntry) u32;
+```
+
+the live load views a module holds across builds
+
+## fun reset_resolve_round
+
+```mach
+pub fun reset_resolve_round(p: *project.Project);
+```
+
+a module's per-round state resets between rounds, while its products stay under the views that made them
 
 ## fun q_typed_exports_compute
 
@@ -155,6 +252,14 @@ definition in the cell, the target configuration and the codegen flags. its
 bytes are the cell digest, so an edit anywhere in the cell advances it and
 every product restored under the old digest recomputes
 
+## fun load_status
+
+```mach
+pub fun load_status(p: *project.Project) fail.PhaseStatus;
+```
+
+the standing of the load walk alone, over every module it reached
+
 ## fun frontend_status
 
 ```mach
@@ -204,12 +309,13 @@ staged product when the snapshot is unchanged and lowers now if it changed
 ## fun prepare_persistent_cache
 
 ```mach
-pub fun prepare_persistent_cache(p: *project.Project) err[outcome.Fail];
+pub fun prepare_persistent_cache(p: *project.Project, ph: u8) err[outcome.Fail];
 ```
 
 once per query operation, after the typed definitions are current: the
 compiler identity (once per project), then the cell snapshot through its
-query so an unchanged cell is not rehashed, then the store directory
+query so an unchanged cell is not rehashed, then the store directory. its
+items are reported under the readout phase ph that runs it
 
 ## fun run_codegen_pass
 

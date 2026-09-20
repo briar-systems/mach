@@ -715,10 +715,175 @@ pub val FMOV_IMM: MachOp = 113
 pub val INS_EL:   MachOp = 114
 ```
 
+## val V_SXTL
+
+```mach
+pub val V_SXTL:   MachOp = 115
+```
+
+the lane-wise conversions: the flags carry the operand element width
+
+## val V_UXTL
+
+```mach
+pub val V_UXTL:   MachOp = 116
+```
+
+## val V_XTN
+
+```mach
+pub val V_XTN:    MachOp = 117
+```
+
+## val V_SQXTN
+
+```mach
+pub val V_SQXTN:  MachOp = 118
+```
+
+## val V_UQXTN
+
+```mach
+pub val V_UQXTN:  MachOp = 119
+```
+
+## val V_FCVTL
+
+```mach
+pub val V_FCVTL:  MachOp = 120
+```
+
+## val V_FCVTN
+
+```mach
+pub val V_FCVTN:  MachOp = 121
+```
+
+## val V_SCVTF
+
+```mach
+pub val V_SCVTF:  MachOp = 122
+```
+
+## val V_UCVTF
+
+```mach
+pub val V_UCVTF:  MachOp = 123
+```
+
+## val V_FCVTZS
+
+```mach
+pub val V_FCVTZS: MachOp = 124
+```
+
+## val V_FCVTZU
+
+```mach
+pub val V_FCVTZU: MachOp = 125
+```
+
+## val MOVN
+
+```mach
+pub val MOVN: MachOp = 126
+```
+
+the inverted move-wide: `~(imm16 << hw*16)`, the one-word negative constant
+
+## val LD1
+
+```mach
+pub val LD1: MachOp = 127
+```
+
+one-register element-structure load and store, reached only from inline asm
+
+## val ST1
+
+```mach
+pub val ST1: MachOp = 128
+```
+
+## val V_SMULL
+
+```mach
+pub val V_SMULL: MachOp = 129
+```
+
+the signed and unsigned long multiplies: the flags carry the operand element width
+
+## val V_UMULL
+
+```mach
+pub val V_UMULL: MachOp = 130
+```
+
+## val SHA256H
+
+```mach
+pub val SHA256H:   MachOp = 131
+```
+
+the sha2 extension rows, reached only from inline asm
+
+## val SHA256H2
+
+```mach
+pub val SHA256H2:  MachOp = 132
+```
+
+## val SHA256SU0
+
+```mach
+pub val SHA256SU0: MachOp = 133
+```
+
+## val SHA256SU1
+
+```mach
+pub val SHA256SU1: MachOp = 134
+```
+
+## val DSB
+
+```mach
+pub val DSB: MachOp = 135
+```
+
+the data synchronization and instruction synchronization barriers and the
+FEAT_SB speculation barrier, reached only from inline asm (#3508)
+
+## val ISB
+
+```mach
+pub val ISB: MachOp = 136
+```
+
+## val SB
+
+```mach
+pub val SB:  MachOp = 137
+```
+
+## val UMULH
+
+```mach
+pub val UMULH: MachOp = 138
+```
+
+the high half of a 64x64 product: 64-bit only, sf fixed in the base word
+
+## val SMULH
+
+```mach
+pub val SMULH: MachOp = 139
+```
+
 ## val MOP_LAST
 
 ```mach
-pub val MOP_LAST:  MachOp = INS_EL
+pub val MOP_LAST:  MachOp = SMULH
 ```
 
 ## fun known
@@ -920,6 +1085,41 @@ pub val L_FMOV_IMM: Layout = 22
 ```
 
 dst, the imm8 in src2
+
+## val L_NEON_CONV
+
+```mach
+pub val L_NEON_CONV: Layout = 23
+```
+
+dst, src1 vectors at the arrangements the operand element width in the flags names
+
+## val L_NEON_ELEM
+
+```mach
+pub val L_NEON_ELEM: Layout = 24
+```
+
+ld1 dst, [src1]; st1 [dst], src1. a post-indexed base advances by the disp or
+by the memory operand's index register, with FLAG_WB_POST set
+
+## val L_NEON_3DIFF
+
+```mach
+pub val L_NEON_3DIFF: Layout = 25
+```
+
+dst, src1, src2 vectors: a long operation over the low halves of its operands
+at the element width in the flags, into lanes twice as wide
+
+## val L_NEON_SHA
+
+```mach
+pub val L_NEON_SHA: Layout = 26
+```
+
+the sha2 rows at their one .4s arrangement: dst, src1 and an optional src2;
+sha256h and sha256h2 spell dst and src1 as q registers
 
 ## def WidthRule
 
@@ -1219,6 +1419,15 @@ pub fun base_word(mi: *isa.Inst) u32;
 
 the base word with the operand widths applied: the row's rule names which
 operands the size bits come from
+
+## fun neon_conv_field
+
+```mach
+pub fun neon_conv_field(op: MachOp, eb: u8) u32;
+```
+
+the operand-width field of a lane-wise conversion: the shift-left-long
+immh marker, the narrowing size of its result, or the double-precision bit
 
 ## fun assemble
 

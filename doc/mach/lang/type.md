@@ -93,7 +93,7 @@ pub val TYPE_PTR:   TypeKind = 10
 ## val PRIM_COUNT
 
 ```mach
-pub val PRIM_COUNT: u32      = 11
+pub val PRIM_COUNT: u32      = 13
 ```
 
 ## val TYPE_POINTER
@@ -186,6 +186,21 @@ pub val TYPE_TAG: TypeKind = 23
 pub val TYPE_CASE_SELECTOR: TypeKind = 24
 ```
 
+## val TYPE_U128
+
+```mach
+pub val TYPE_U128: TypeKind = 25
+```
+
+the 128-bit integers are appended kinds (#3511): the catalog, never the
+numbering, decides what is primitive
+
+## val TYPE_I128
+
+```mach
+pub val TYPE_I128: TypeKind = 26
+```
+
 ## def PrimClass
 
 ```mach
@@ -221,6 +236,32 @@ pub val PRIM_CLASS_PTR:   PrimClass = 3
 ```mach
 pub rec PrimDesc;
 ```
+
+## fun is_prim
+
+```mach
+pub fun is_prim(kind: TypeKind) bool;
+```
+
+the primitive predicate: a kind is primitive exactly when the catalog names
+it, never because of where it sits in the TypeKind numbering
+
+## fun prim_index
+
+```mach
+pub fun prim_index(kind: TypeKind) opt[u32];
+```
+
+the catalog position of a primitive kind, the index of every table sized by
+PRIM_COUNT
+
+## fun prim_kind_at
+
+```mach
+pub fun prim_kind_at(index: u32) TypeKind;
+```
+
+the kind at a catalog position, for walkers over 0..PRIM_COUNT
 
 ## fun prim_desc
 
@@ -294,6 +335,15 @@ pub fun prim_spelling_len(kind: TypeKind) usize;
 pub fun prim_from_name(name: str) opt[TypeKind];
 ```
 
+## fun int_kind_for
+
+```mach
+pub fun int_kind_for(bits: u32, signed: bool) opt[TypeKind];
+```
+
+the integer primitive of a width and signedness, absent when the catalog has
+no such row; the one lookup every width-driven typing goes through
+
 ## fun prim_from_view
 
 ```mach
@@ -306,6 +356,9 @@ pub fun prim_from_view(name: View) opt[TypeKind];
 pub rec IntRange;
 ```
 
+the magnitudes an integer kind admits: min_mag is the largest negated value
+(the signed minimum), max_mag the largest positive one, both exact to 128 bits
+
 ## fun int_range
 
 ```mach
@@ -315,13 +368,13 @@ pub fun int_range(kind: TypeKind) opt[IntRange];
 ## fun int_fits
 
 ```mach
-pub fun int_fits(value: u64, negated: bool, r: IntRange) bool;
+pub fun int_fits(value: wide.Wide, negated: bool, r: IntRange) bool;
 ```
 
 ## fun int_fits_either_sign
 
 ```mach
-pub fun int_fits_either_sign(value: u64, kind: TypeKind) bool;
+pub fun int_fits_either_sign(value: wide.Wide, kind: TypeKind) bool;
 ```
 
 ## fun float_width_of
@@ -368,6 +421,35 @@ pub val VEC_FORM_TOO_WIDE:  VecFormStatus = 2
 ```mach
 pub val VEC_FORM_BAD_LANES: VecFormStatus = 3
 ```
+
+## val VEC_FORM_BAD_ELEMENT
+
+```mach
+pub val VEC_FORM_BAD_ELEMENT: VecFormStatus = 4
+```
+
+the element is a primitive no vector packs: a lane is 8 to 64 bits wide
+
+## val VEC_LANE_MIN_BITS
+
+```mach
+pub val VEC_LANE_MIN_BITS: u32 = 8
+```
+
+## val VEC_LANE_MAX_BITS
+
+```mach
+pub val VEC_LANE_MAX_BITS: u32 = 64
+```
+
+## fun vec_lane_kind_ok
+
+```mach
+pub fun vec_lane_kind_ok(kind: TypeKind) bool;
+```
+
+whether a primitive is a legal vector lane: a declared set, never "every
+primitive but ptr". a 128-bit lane has no packed form on any ISA (#3511)
 
 ## rec VecForm
 
@@ -417,6 +499,33 @@ pub rec TypeNominal;
 
 ```mach
 pub rec TypeGenericParam;
+```
+
+## rec GenericOwner
+
+```mach
+pub rec GenericOwner;
+```
+
+the declaration whose type parameters a substitution replaces: a parameter
+of any other declaration, an enclosing generic's for one, is left as it is
+
+## fun generic_owner_equals
+
+```mach
+pub fun generic_owner_equals(a: *GenericOwner, b: *GenericOwner) bool;
+```
+
+## fun param_owner
+
+```mach
+pub fun param_owner(p: *TypeGenericParam) GenericOwner;
+```
+
+## fun param_owned_by
+
+```mach
+pub fun param_owned_by(p: *TypeGenericParam, who: *GenericOwner) bool;
 ```
 
 ## rec TypeInstance
@@ -573,6 +682,12 @@ pub fun vector_mask(ti: *TypeInterner, tid: TypeId) res[TypeId, fail.Fail];
 
 ```mach
 pub fun strip_secret(ti: *TypeInterner, tid: TypeId) TypeId;
+```
+
+## fun mentions_generic_param
+
+```mach
+pub fun mentions_generic_param(ti: *TypeInterner, tid: TypeId) bool;
 ```
 
 ## fun shape_kind

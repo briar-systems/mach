@@ -320,6 +320,14 @@ pub fun record_error(store: *DiagnosticStore, file_id: source.FileId, span: toke
 pub fun record_warning(store: *DiagnosticStore, file_id: source.FileId, span: token.Span, message: str);
 ```
 
+## fun record_unlocated_warning
+
+```mach
+pub fun record_unlocated_warning(store: *DiagnosticStore, message: str);
+```
+
+a warning about the build as a whole, located at no source
+
 ## fun record_note_committed
 
 ```mach

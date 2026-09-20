@@ -104,11 +104,18 @@ pub fun const_value_of_init(ctx: *context.LowerContext, eid: id.ExprId, v: compt
 pub fun type_is_volatile_record(ctx: *context.LowerContext, sem_ty: type.TypeId) bool;
 ```
 
-## fun value_is_volatile_record
+## fun access_is_volatile
 
 ```mach
-pub fun value_is_volatile_record(ctx: *context.LowerContext, eid: id.ExprId) bool;
+pub fun access_is_volatile(ctx: *context.LowerContext, eid: id.ExprId) bool;
 ```
+
+volatility is a property of the storage an access is rooted in. the chain of
+member, projection and index steps is walked to the object it reads or writes,
+and any volatile nominal along it, the node's own type included, marks the
+access; an indirection ends the chain at its pointee, so a pointer field of a
+volatile record reaches ordinary storage and a raw scalar pointer is never
+volatile. one predicate for every access form, load and store alike
 
 ## fun field_index_in_type
 

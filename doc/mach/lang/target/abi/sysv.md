@@ -162,6 +162,14 @@ pub val MAX_REG_RET: u64 = 16
 pub val EIGHTBYTE: u32 = 8
 ```
 
+## val DOUBLE_WORD
+
+```mach
+pub val DOUBLE_WORD: u64 = 16
+```
+
+a 128-bit integer: two eightbytes
+
 ## fun gp_param_reg
 
 ```mach

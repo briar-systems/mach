@@ -63,7 +63,7 @@ pub val NONE_U32: u32 = 0xFFFFFFFF
 ## fun emit_alias_guard
 
 ```mach
-pub fun emit_alias_guard(b: *builder.Builder, d: *dep.DepInfo, init: value.Value, bound_ex: value.Value) res[value.Value, fail.Fail];
+pub fun emit_alias_guard(b: *builder.Builder, fn: *ir.Function, d: *dep.DepInfo, init: value.Value, bound_ex: value.Value) res[value.Value, fail.Fail];
 ```
 
 ## fun emit_exclusive_bound
@@ -81,13 +81,13 @@ pub fun pred_is_unsigned(pred: instruction.InstrKind) bool;
 ## fun magnitude_safe
 
 ```mach
-pub fun magnitude_safe(b: *builder.Builder, v: value.Value, is_unsigned: bool) res[value.Value, fail.Fail];
+pub fun magnitude_safe(b: *builder.Builder, fn: *ir.Function, la: *loops.LoopAnalysis, v: value.Value, is_unsigned: bool) res[value.Value, fail.Fail];
 ```
 
 ## fun offset_safe
 
 ```mach
-pub fun offset_safe(b: *builder.Builder, off: value.Value) res[value.Value, fail.Fail];
+pub fun offset_safe(b: *builder.Builder, fn: *ir.Function, la: *loops.LoopAnalysis, off: value.Value) res[value.Value, fail.Fail];
 ```
 
 ## fun const_magnitude_safe

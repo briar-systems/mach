@@ -168,6 +168,21 @@ pub val SHADOW_SPACE: u64 = 32
 pub fun is_by_value_size(size: u64) bool;
 ```
 
+## val INT128
+
+```mach
+pub val INT128: u64 = 16
+```
+
+a 16-byte integer has no Microsoft rule (MSVC has no such type). the
+convention is the one GCC (mingw-w64) and Clang share: LLVM 18 made i128
+match __int128 ("Changes to the X86 Backend", LLVM 18.1 release notes), and
+llvm/llvm-project#115052 describes that convention as passing on the stack
+by reference and returning in xmm0, "identical to i128" and "the same as
+GCC". the clang -O0 probe under test/link/cases exhibits it: the argument
+is a pointer to a caller copy like any other 16-byte object, the value
+returns in XMM0 with the low half in the low lanes (#3511)
+
 ## fun slot_gp_reg
 
 ```mach

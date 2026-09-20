@@ -18,6 +18,25 @@ pub fun run(tgt: *target.Target, m: *mir.MirModule) err[fail.Fail];
 pub fun omits_frame(func: *mir.MirFunction, fp: mir.PRegId, sp: mir.PRegId) bool;
 ```
 
+## fun body_writes_sp
+
+```mach
+pub fun body_writes_sp(m: *isa.RegMachine, func: *mir.MirFunction, sp: mir.PRegId) bool;
+```
+
+whether the body may move the stack pointer. the encoders write sp only in
+the prologue and epilogue, outgoing arguments live in the fixed frame, and no
+instruction set allocates stack dynamically, so the writers are an inline-asm
+block that writes sp and an instruction naming sp as a register operand
+
+## fun sp_fixed
+
+```mach
+pub fun sp_fixed(frame: *mir.MirFrame) bool;
+```
+
+the declared frame property: sp == fp - base_dist for the whole body
+
 ## fun slot_offset
 
 ```mach

@@ -3,74 +3,137 @@
 ## val I
 
 ```mach
-pub val I:         u32 = 1
+pub val I:        u64 = 1
 ```
 
 ## val M
 
 ```mach
-pub val M:         u32 = 2
+pub val M:        u64 = 2
 ```
 
 ## val A
 
 ```mach
-pub val A:         u32 = 4
+pub val A:        u64 = 4
 ```
 
 ## val F
 
 ```mach
-pub val F:         u32 = 8
+pub val F:        u64 = 8
 ```
 
 ## val D
 
 ```mach
-pub val D:         u32 = 16
+pub val D:        u64 = 16
 ```
 
 ## val C
 
 ```mach
-pub val C:         u32 = 32
+pub val C:        u64 = 32
 ```
 
 ## val ZICSR
 
 ```mach
-pub val ZICSR:     u32 = 64
+pub val ZICSR:    u64 = 64
 ```
 
 ## val ZIFENCEI
 
 ```mach
-pub val ZIFENCEI:  u32 = 128
+pub val ZIFENCEI: u64 = 128
 ```
+
+## val ZKT
+
+```mach
+pub val ZKT:       u64 = 256
+```
+
+data-independent execution latency: the listed M, Zb and base operations run in
+time independent of their operand values (riscv-crypto scalar spec, Zkt)
 
 ## val G
 
 ```mach
-pub val G:         u32 = I | M | A | F | D | ZICSR | ZIFENCEI
+pub val G:         u64 = I | M | A | F | D | ZICSR | ZIFENCEI
 ```
 
 ## val DEFAULT32
 
 ```mach
-pub val DEFAULT32: u32 = I | M | A | C
+pub val DEFAULT32: u64 = I | M | A | C
 ```
 
 ## val DEFAULT64
 
 ```mach
-pub val DEFAULT64: u32 = G | C
+pub val DEFAULT64: u64 = G | C
 ```
 
 ## val ALL
 
 ```mach
-pub val ALL:       u32 = DEFAULT64
+pub val ALL:       u64 = DEFAULT64 | ZKT
 ```
+
+## val NAME_COUNT
+
+```mach
+pub val NAME_COUNT: u32 = 9
+```
+
+the riscv extension vocabulary: the letters and z-extensions a selection
+string spells, each the same bit the string sets, so a manifest's
+`extensions` list and an `rv64imac` isa string feed one set. d brings f and
+f brings zicsr, as the string grammar has it. i is the baseline, c is a
+code-size selection mach never emits, and f and d select the float register
+file and the calling convention's float registers, so none of the four is a
+function's to admit alone. zkt is a timing promise about the whole machine
+the constant-time rows read, so it is the target's too
+
+## val ONLY_BASELINE
+
+```mach
+pub val ONLY_BASELINE: str = "it is the baseline every selection holds"
+```
+
+## val ONLY_CODESIZE
+
+```mach
+pub val ONLY_CODESIZE: str = "it is a code-size selection of the whole target
+```
+
+## val ONLY_FLOAT
+
+```mach
+pub val ONLY_FLOAT:    str = "it selects the float register file and the calling convention's float registers for the whole target"
+```
+
+## val ONLY_TIMING
+
+```mach
+pub val ONLY_TIMING:   str = "it is a promise about the machine's execution timing that the constant-time rows read, not a set of instructions"
+```
+
+## val NAMES
+
+```mach
+pub val NAMES: [NAME_COUNT]extension.Extension = [NAME_COUNT]extension.Extension;
+```
+
+## fun widen
+
+```mach
+pub fun widen(bits: u64, added: u64) u64;
+```
+
+a selection widened by names from a manifest list and closed over what they
+imply: d brings f, f brings zicsr
 
 ## rec ExtSpec
 
@@ -96,7 +159,7 @@ name subsets no selection can spell.
 ## val EXT_COUNT
 
 ```mach
-pub val EXT_COUNT: usize = 14
+pub val EXT_COUNT: usize = 15
 ```
 
 ## val EXTS
@@ -122,13 +185,13 @@ pub rec Selection;
 ## fun has
 
 ```mach
-pub fun has(bits: u32, required: u32) bool;
+pub fun has(bits: u64, required: u64) bool;
 ```
 
 ## fun valid
 
 ```mach
-pub fun valid(bits: u32) bool;
+pub fun valid(bits: u64) bool;
 ```
 
 ## fun is_name
@@ -161,7 +224,7 @@ pub fun parse_at(name: str, bad: *Span) res[Selection, fail.Fail];
 ## fun letters
 
 ```mach
-pub fun letters(bits: u32) str;
+pub fun letters(bits: u64) str;
 ```
 
 the extension letters a mask holds, in canonical order, for diagnostics
@@ -169,7 +232,7 @@ the extension letters a mask holds, in canonical order, for diagnostics
 ## fun float_requirement
 
 ```mach
-pub fun float_requirement(bits: u32) u32;
+pub fun float_requirement(bits: u32) u64;
 ```
 
 the extension a floating-point width needs: F for 32-bit values, F and D for 64
@@ -177,7 +240,7 @@ the extension a floating-point width needs: F for 32-bit values, F and D for 64
 ## fun spell
 
 ```mach
-pub fun spell(width: u32, bits: u32, buf: *u8, cap: usize) str;
+pub fun spell(width: u32, bits: u64, buf: *u8, cap: usize) str;
 ```
 
 the canonical selection string for a mask: the shortest string parse maps back

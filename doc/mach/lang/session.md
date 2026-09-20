@@ -74,6 +74,21 @@ pub fun module_count(s: *Session) u32;
 pub fun register_module_fqn(s: *Session, mid: module.ModuleId, fqn: intern.StrId) err[fail.Fail];
 ```
 
+## fun register_module_root_project
+
+```mach
+pub fun register_module_root_project(s: *Session, mid: module.ModuleId, root: bool) err[fail.Fail];
+```
+
+## fun module_is_root_project
+
+```mach
+pub fun module_is_root_project(s: *Session, mid: module.ModuleId) bool;
+```
+
+a module the loader never declared is not the root project's: a dependency's
+module, or one loaded outside a project, exports nothing of its own
+
 ## fun module_fqn
 
 ```mach
