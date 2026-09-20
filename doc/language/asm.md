@@ -129,7 +129,8 @@ token.** What counts as a contradiction is per mnemonic:
 
 | shape | rule |
 |---|---|
-| most instructions | every operand shares one width, so a prefix must agree with any register operand; with no register operand it *sets* the width |
+| most instructions | every operand shares one width, so a prefix must agree with any register operand, and two register operands of different widths (`add rax, ecx`) name no form; with no register operand the prefix *sets* the width |
+| `shl` / `shr` / `sar`, `shld` / `shrd` | the count is `cl` or an immediate whatever the width of the operand shifted |
 | `movzx` / `movsx` | the source is narrower by design, so a memory source **must** be sized, and the size must be strictly narrower than the destination |
 | `push` / `pop`, indirect `call` / `jmp` | fixed 64-bit in long mode, so any narrower prefix names no instruction |
 | `lidt` | its pseudo-descriptor is ten bytes, which no keyword names |
@@ -138,6 +139,36 @@ So `mov eax, word [rcx]` is refused (two widths for one access), and
 `movzx eax, [rcx]` is refused too — an unsized source names no width at all, and
 reading it as a same-width move would silently assemble a plain `mov` where a
 zero-extending load was written.
+
+## Bit scans, byte swap, multiply and double shifts (x86-64)
+
+```mach fragment
+asm x86_64 {
+    bsf rax, rcx              # index of the lowest set bit; zf set and rax undefined when rcx is 0
+    bsr rdx, qword [rdi]      # index of the highest set bit
+    tzcnt r8, r9              # trailing zeros, 64 for a zero source (bmi1)
+    lzcnt eax, dword [rsi]    # leading zeros, 32 for a zero source (lzcnt)
+    popcnt rax, rcx           # set bits (popcnt)
+    bswap rax                 # reverse the bytes of a 32- or 64-bit register
+    imul rax, rcx             # rax = rax * rcx, low half
+    imul rax, rcx, 5          # rax = rcx * 5, low half, with a 32-bit signed immediate
+    imul eax, dword [rdi], 7  # the source may be memory in either form
+    shld rax, rcx, 5          # shift rax left, bits from rcx fill from the right
+    shrd qword [rdi], rax, cl # the memory operand is shifted, rax feeds bits, cl counts
+}
+```
+
+The scans and counts take a 16-, 32- or 64-bit register destination and a
+register or memory source of the same width. `bsf` and `bsr` set ZF on a zero
+source and leave the destination undefined, which the effect model reports as
+writing the flags; the three counts need their extension, listed under
+[Extension instructions](#extension-instructions). `bswap` takes one 32- or
+64-bit register, and has no 16-bit form. `imul` in two or three operands is the
+signed multiply with the low half kept; the one-operand widening form is not
+spelled. `shld` and `shrd` take the register or memory shifted, a register of the
+same width feeding bits, and a count of 0 to 255 or `cl`. A secret in `cl` is a
+variable-latency count for the constant-time check, as it is for `shl`; an
+immediate count is not.
 
 ## Segment-relative memory (x86-64)
 
@@ -246,6 +277,9 @@ inherits its function's set.
 | x86_64 | `sse41` | `pblendw xmm, xmm/m128, imm8`, `ptest xmm, xmm/m128`, `pinsrd xmm, r32/m32, imm8`, `pextrd r32/m32, xmm, imm8` |
 | x86_64 | `sha` | `sha256rnds2 xmm, xmm/m128`, `sha256msg1 xmm, xmm/m128`, `sha256msg2 xmm, xmm/m128` |
 | x86_64 | `fsgsbase` | `rdfsbase r32/r64`, `rdgsbase r32/r64`, `wrfsbase r32/r64`, `wrgsbase r32/r64` |
+| x86_64 | `popcnt` | `popcnt r16/32/64, r/m` (CPUID leaf 1, ECX bit 23) |
+| x86_64 | `lzcnt` | `lzcnt r16/32/64, r/m` (CPUID leaf 0x80000001, ECX bit 5) |
+| x86_64 | `bmi1` | `tzcnt r16/32/64, r/m` (CPUID leaf 7, EBX bit 3) |
 | aarch64 | `sha2` | `sha256h qN, qN, vN.4s`, `sha256h2 qN, qN, vN.4s`, `sha256su0 vN.4s, vN.4s`, `sha256su1 vN.4s, vN.4s, vN.4s` |
 | aarch64 | `sb` | `sb` (the FEAT_SB speculation barrier) |
 
