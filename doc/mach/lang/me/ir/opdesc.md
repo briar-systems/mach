@@ -363,79 +363,145 @@ pub def IrVecOp: u8
 ## val IVEC_NONE
 
 ```mach
-pub val IVEC_NONE: IrVecOp = 0
+pub val IVEC_NONE:       IrVecOp = 0
 ```
 
 ## val IVEC_ADD
 
 ```mach
-pub val IVEC_ADD:  IrVecOp = 1
+pub val IVEC_ADD:        IrVecOp = 1
 ```
 
 ## val IVEC_SUB
 
 ```mach
-pub val IVEC_SUB:  IrVecOp = 2
+pub val IVEC_SUB:        IrVecOp = 2
 ```
 
 ## val IVEC_MUL
 
 ```mach
-pub val IVEC_MUL:  IrVecOp = 3
+pub val IVEC_MUL:        IrVecOp = 3
 ```
 
 ## val IVEC_DIV
 
 ```mach
-pub val IVEC_DIV:  IrVecOp = 4
+pub val IVEC_DIV:        IrVecOp = 4
 ```
 
 ## val IVEC_AND
 
 ```mach
-pub val IVEC_AND:  IrVecOp = 5
+pub val IVEC_AND:        IrVecOp = 5
 ```
 
 ## val IVEC_OR
 
 ```mach
-pub val IVEC_OR:   IrVecOp = 6
+pub val IVEC_OR:         IrVecOp = 6
 ```
 
 ## val IVEC_XOR
 
 ```mach
-pub val IVEC_XOR:  IrVecOp = 7
+pub val IVEC_XOR:        IrVecOp = 7
 ```
 
 ## val IVEC_NOT
 
 ```mach
-pub val IVEC_NOT:  IrVecOp = 8
+pub val IVEC_NOT:        IrVecOp = 8
 ```
 
 ## val IVEC_NEG
 
 ```mach
-pub val IVEC_NEG:  IrVecOp = 9
+pub val IVEC_NEG:        IrVecOp = 9
 ```
 
 ## val IVEC_SHL
 
 ```mach
-pub val IVEC_SHL:  IrVecOp = 10
+pub val IVEC_SHL:        IrVecOp = 10
 ```
 
 ## val IVEC_SHR
 
 ```mach
-pub val IVEC_SHR:  IrVecOp = 11
+pub val IVEC_SHR:        IrVecOp = 11
 ```
 
 ## val IVEC_CMP
 
 ```mach
-pub val IVEC_CMP:  IrVecOp = 12
+pub val IVEC_CMP:        IrVecOp = 12
+```
+
+## val IVEC_TRUNC
+
+```mach
+pub val IVEC_TRUNC:      IrVecOp = 13
+```
+
+## val IVEC_SEXT
+
+```mach
+pub val IVEC_SEXT:       IrVecOp = 14
+```
+
+## val IVEC_ZEXT
+
+```mach
+pub val IVEC_ZEXT:       IrVecOp = 15
+```
+
+## val IVEC_FP_TRUNC
+
+```mach
+pub val IVEC_FP_TRUNC:   IrVecOp = 16
+```
+
+## val IVEC_FP_EXT
+
+```mach
+pub val IVEC_FP_EXT:     IrVecOp = 17
+```
+
+## val IVEC_FP_TO_SI
+
+```mach
+pub val IVEC_FP_TO_SI:   IrVecOp = 18
+```
+
+## val IVEC_FP_TO_UI
+
+```mach
+pub val IVEC_FP_TO_UI:   IrVecOp = 19
+```
+
+## val IVEC_SI_TO_FP
+
+```mach
+pub val IVEC_SI_TO_FP:   IrVecOp = 20
+```
+
+## val IVEC_UI_TO_FP
+
+```mach
+pub val IVEC_UI_TO_FP:   IrVecOp = 21
+```
+
+## val IVEC_MUL_WIDE_S
+
+```mach
+pub val IVEC_MUL_WIDE_S: IrVecOp = 22
+```
+
+## val IVEC_MUL_WIDE_U
+
+```mach
+pub val IVEC_MUL_WIDE_U: IrVecOp = 23
 ```
 
 ## def VecClass
@@ -473,6 +539,23 @@ pub val VCLASS_COMPARE:    VecClass = 3
 ```mach
 pub val VCLASS_DISALLOWED: VecClass = 4
 ```
+
+## val VCLASS_CONVERT
+
+```mach
+pub val VCLASS_CONVERT: VecClass = 5
+```
+
+a lane-wise conversion: the result lanes differ in kind or width from the operand lanes
+
+## val VCLASS_WIDEN
+
+```mach
+pub val VCLASS_WIDEN: VecClass = 6
+```
+
+a lane-wise widening binary: both operands share one lane type and the result
+lanes are twice as wide
 
 ## def CtClass
 
@@ -645,7 +728,7 @@ pub rec IrOpDescriptor;
 ## val IR_OP_DESCRIPTOR_COUNT
 
 ```mach
-pub val IR_OP_DESCRIPTOR_COUNT: usize = 50
+pub val IR_OP_DESCRIPTOR_COUNT: usize = 54
 ```
 
 ## fun is_known

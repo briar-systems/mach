@@ -23,8 +23,14 @@ pub def EmitModuleFn: isa.EmitModuleFn
 ```mach
 pub fun codegen_unit(s: *session.Session, tgt: *target.Target,
 irmod: *ir.Module, deps: unit.IrSet, asm_out: *writer.Writer,
-placement_policy: u32, dbg: DebugInfo) res[of.ObjectImage, fail.Fail];
+placement_policy: u32, dbg: DebugInfo,
+diags: *diagnostic.DiagnosticStore) res[of.ObjectImage, fail.Fail];
 ```
+
+the back half of one module. a rejection of the program by any pass is an
+error appended to `diags`, the module's diagnostic store, and answers
+`reported`; a `message` failure is the apparatus (allocator, I/O, a target
+without a model) or a compiler defect
 
 ## val PLACEMENT_POLICY_VERSION
 

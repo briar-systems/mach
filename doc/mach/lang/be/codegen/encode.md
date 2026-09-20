@@ -391,6 +391,15 @@ pub rec RelocPairSite;
 pub rec EncodeState;
 ```
 
+## rec OpenReg
+
+```mach
+pub rec OpenReg;
+```
+
+a variable location published as a register: the binding it describes and
+the instruction start it was published at
+
 ## def EncodeFunctionFn
 
 ```mach
@@ -556,6 +565,14 @@ pub fun push_cmp_varloc(st: *EncodeState, text_offset: u32, fn: *mir.MirFunction
 ```mach
 pub fun close_cmp_varlocs(st: *EncodeState, instr_start: u32, instr_end: u32);
 ```
+
+## fun begin_function_locations
+
+```mach
+pub fun begin_function_locations(st: *EncodeState);
+```
+
+a function's locations start closed and with no def outstanding
 
 ## fun emit_var_bindings
 

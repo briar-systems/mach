@@ -1,35 +1,11 @@
 # mach.lang.be.linker
 
-## def LinkMode
-
-```mach
-pub def LinkMode: u8
-```
-
-## val LINK_EXE
-
-```mach
-pub val LINK_EXE:         LinkMode = 0
-```
-
-## val LINK_RELOCATABLE
-
-```mach
-pub val LINK_RELOCATABLE: LinkMode = 1
-```
-
-## val LINK_SHARED
-
-```mach
-pub val LINK_SHARED:      LinkMode = 2
-```
-
 ## fun link
 
 ```mach
 pub fun link(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
 obj_count: u32, dynlibs: *of.DynLib, dynlib_count: u32,
-destination: *publication.Destination, name: *u8, mode: LinkMode, pie: bool,
+destination: str, name: *u8, mode: LinkMode, pie: bool,
 image_options: of.ImageOptions) err[fail.Fail];
 ```
 
@@ -57,15 +33,21 @@ pub fun linked_image_symbol(img: *LinkedImage, itn: *intern.Interner, name: str)
 pub fun link_images_captured(s: *session.Session, tgt: *target.Target, images: *of.ObjectImage,
 image_count: u32, dynlibs: *of.DynLib, dynlib_count: u32,
 name: *u8, pie: bool, image_options: of.ImageOptions,
-out: *LinkedImage) err[fail.Fail];
+root_names: *str, root_count: u32, out: *LinkedImage) err[fail.Fail];
 ```
+
+link images into an executable handed back in memory
+
+root_names: definitions the caller reaches by name, kept even when the entry
+            does not reach them
+root_count: number of root names
 
 ## fun link_images
 
 ```mach
 pub fun link_images(s: *session.Session, tgt: *target.Target, images: *of.ObjectImage,
 image_count: u32, dynlibs: *of.DynLib, dynlib_count: u32,
-destination: *publication.Destination, name: *u8, mode: LinkMode, pie: bool,
+destination: str, name: *u8, mode: LinkMode, pie: bool,
 image_options: of.ImageOptions) err[fail.Fail];
 ```
 
@@ -76,7 +58,7 @@ pub fun link_mixed(s: *session.Session, tgt: *target.Target,
 images: *of.ObjectImage, image_count: u32,
 obj_paths: **u8, obj_count: u32,
 dynlibs: *of.DynLib, dynlib_count: u32,
-destination: *publication.Destination, name: *u8, mode: LinkMode, pie: bool,
+destination: str, name: *u8, mode: LinkMode, pie: bool,
 image_options: of.ImageOptions) err[fail.Fail];
 ```
 

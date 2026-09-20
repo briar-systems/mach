@@ -72,3 +72,23 @@ pub fun doc_run_above(stream: *TokenStream, decl_offset: usize) token.Span;
 pub fun emit_diagnostics(stream: *TokenStream, diags: *diagnostic.DiagnosticStore) err[fail.Fail];
 ```
 
+## fun is_ident_start
+
+```mach
+pub fun is_ident_start(c: u8) bool;
+```
+
+## fun is_ident_char
+
+```mach
+pub fun is_ident_char(c: u8) bool;
+```
+
+## fun is_identifier
+
+```mach
+pub fun is_identifier(text: str, len: usize) bool;
+```
+
+`text[0..len]` lexes as exactly one identifier token; keywords lex as identifiers too
+

@@ -432,6 +432,28 @@ pub val KW_VAL:   str = "val"
 pub val KW_VAR:   str = "var"
 ```
 
+## val KEYWORD_COUNT
+
+```mach
+pub val KEYWORD_COUNT: u32 = 25
+```
+
+every reserved word above, the set `is_keyword` answers from
+
+## val KEYWORDS
+
+```mach
+pub val KEYWORDS: [KEYWORD_COUNT]str = [KEYWORD_COUNT]str;
+```
+
+## fun is_keyword
+
+```mach
+pub fun is_keyword(text: str, len: usize) bool;
+```
+
+`text[0..len]` is a reserved word
+
 ## rec Span
 
 ```mach

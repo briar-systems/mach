@@ -111,6 +111,10 @@ pub rec LinkToken;
 pub rec BuildRequest;
 ```
 
+owner: "" for a cell of the root manifest, or the id of the closure dependency
+       whose default library artifacts require the cell; `target` and
+       `artifact` then name that dependency's declarations
+
 ## fun defaults
 
 ```mach
@@ -133,6 +137,12 @@ pub fun goal_from_emit_name(name: str) opt[BuildGoal];
 
 ```mach
 pub fun goal_name(goal: BuildGoal) str;
+```
+
+## fun goal_verb
+
+```mach
+pub fun goal_verb(goal: BuildGoal) str;
 ```
 
 ## fun validate
@@ -158,7 +168,7 @@ pick: *manifest.Selection) res[BuildRequest, outcome.Fail];
 ## fun for_cell
 
 ```mach
-pub fun for_cell(base: *BuildRequest, target: str, artifact: str, want_lib: bool,
+pub fun for_cell(base: *BuildRequest, owner: str, target: str, artifact: str, want_lib: bool,
 subsystem: of.Subsystem, goal: BuildGoal) BuildRequest;
 ```
 

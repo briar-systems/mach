@@ -31,6 +31,12 @@ out: *writer.Writer) res[encode.EncoderOutput, fail.Fail];
 pub fun asm_returns(body: str) bool;
 ```
 
+## fun asm_writes_sp
+
+```mach
+pub fun asm_writes_sp(body: str) bool;
+```
+
 ## fun asm_clobbers
 
 ```mach
@@ -56,7 +62,7 @@ implicit effects. x0 is never written; the walk holds it constant
 ## fun asm_ct_scan
 
 ```mach
-pub fun asm_ct_scan(body: str, secret_names: *str, n_secret: u32,
-trust_mul: bool, trust_shift: bool, alloc: *A.Allocator) err[fail.Fail];
+pub fun asm_ct_scan(body: str, secrets: *ct.AsmSecret, n_secret: u32,
+mul: ct.CtMulMask, trust_shift: bool, alloc: *A.Allocator) err[fail.Fail];
 ```
 

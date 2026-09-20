@@ -49,6 +49,15 @@ with the walk's allocator and released by refusal_free
 pub fun refusal_free(alloc: *A.Allocator, r: *Refusal);
 ```
 
+## fun emitted_mul_cell
+
+```mach
+pub fun emitted_mul_cell(mi: *isa.Inst, e: *ct.InstEffects) ct.CtMulCell;
+```
+
+the multiply cell an emitted instruction realizes: its explicit operands
+in order, the first one's width
+
 ## fun walk
 
 ```mach

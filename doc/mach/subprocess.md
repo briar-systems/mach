@@ -179,7 +179,7 @@ pub fun init(p: *OwnedSubprocess);
 ## fun set_deadline
 
 ```mach
-pub fun set_deadline(p: *OwnedSubprocess, deadline: tm.Time) bool;
+pub fun set_deadline(p: *OwnedSubprocess, deadline: tm.Instant) bool;
 ```
 
 ## fun bound_seconds
@@ -191,7 +191,7 @@ pub fun bound_seconds(p: *OwnedSubprocess, seconds: i64) bool;
 ## fun deadline_reached
 
 ```mach
-pub fun deadline_reached(p: *OwnedSubprocess, now: tm.Time) bool;
+pub fun deadline_reached(p: *OwnedSubprocess, now: tm.Instant) bool;
 ```
 
 ## fun expired
@@ -230,7 +230,7 @@ identity: str, limit: usize) err[Error];
 
 ```mach
 pub fun spawn_captured_input(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
-stdin_fd: i32, capture_stderr: bool, identity: str, limit: usize) err[Error];
+stdin_fd: usize, capture_stderr: bool, identity: str, limit: usize) err[Error];
 ```
 
 ## fun spawn_grouped

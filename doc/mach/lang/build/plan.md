@@ -88,12 +88,20 @@ one planned cell: an artifact on a target for a profile, with every decision
 the engine executes. `plan` fills everything the root manifest decides; `configure`
 adds what the realized dependency closure decides
 
-steps: the root manifest's prerequisite steps in execution order, by name
+steps: the declaring manifest's prerequisite steps in execution order, by name
 dep_steps: exported dependency steps in execution order as `<dep id>.<step>`;
               empty until `configure`
 export_links: the dependency closure's exported link requirements for this
               cell, in link order; empty until `configure`
 configured: `configure` ran, so `dep_steps` and `export_links` are effective
+requires: the declaring manifest's artifacts this cell requires, by name
+owner: "" for a cell of the root manifest, or the id of the dependency
+              whose default library artifacts require the cell
+owner_chain: the dependency chain that reaches `owner`, "" for the root
+label: the unit's artifact as requirements name it: `<artifact>` for the
+              root, `<owner>.<artifact>` for a dependency
+dep_requires: the labels of the dependency requirement cells this cell waits on;
+              empty until `plan_dependency_requirements`
 
 ## def BuildRequest
 
@@ -134,11 +142,32 @@ m: the root manifest
 bp: the plan, mutated in place; each unit becomes `configured`
 ret: ok; the configuration failure of the first cell that has one
 
+## fun plan_dependency_requirements
+
+```mach
+pub fun plan_dependency_requirements(s: *session.Session, m: *manifest.Manifest, bp: *BuildPlan) err[outcome.Fail];
+```
+
+add the cells a dependency's default library artifacts require to a plan made
+from the root manifest. the root's closure is realized and verified exactly as
+a build does; every cell compiled against a closure that holds a dependency
+waits on that dependency's requirement cells, which are planned before it with
+the root's profile, for every target they name in the dependency's manifest,
+and against the dependency's own closure in turn. a requirement reached through
+several consumers is planned once. two cells that would write one output path
+are refused
+
+s: the session the plan was made in
+m: the root manifest
+bp: the plan, mutated in place
+ret: ok; err from closure realization, a dependency cell's planning, or an
+     output collision
+
 ## fun replan_unit
 
 ```mach
 pub fun replan_unit(a: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry,
-m: *manifest.Manifest, req: *request.BuildRequest,
+s: *manifest.Scope, req: *request.BuildRequest,
 prior: *BuildUnit) res[BuildUnit, outcome.Fail];
 ```
 

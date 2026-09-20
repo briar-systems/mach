@@ -19,6 +19,12 @@ out: *writer.Writer) res[encode.EncoderOutput, fail.Fail];
 pub fun asm_returns(body: str) bool;
 ```
 
+## fun asm_writes_sp
+
+```mach
+pub fun asm_writes_sp(body: str) bool;
+```
+
 ## fun asm_clobbers
 
 ```mach
@@ -44,7 +50,7 @@ src3 as to_inst lays them out) and the implicit effects
 ## fun asm_ct_scan
 
 ```mach
-pub fun asm_ct_scan(body: str, secret_names: *str, n_secret: u32,
-trust_mul: bool, trust_shift: bool, alloc: *A.Allocator) err[fail.Fail];
+pub fun asm_ct_scan(body: str, secrets: *ct.AsmSecret, n_secret: u32,
+mul: ct.CtMulMask, trust_shift: bool, alloc: *A.Allocator) err[fail.Fail];
 ```
 

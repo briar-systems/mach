@@ -105,14 +105,14 @@ pub fun serialize(alloc: *A.Allocator, at: *Attrs, out_len: *u32) res[*u8, fail.
 ## fun riscv64_build_attributes
 
 ```mach
-pub fun riscv64_build_attributes(alloc: *A.Allocator, xlen_bits: u32, extension_bits: u32, float_arg_bits: u32,
+pub fun riscv64_build_attributes(alloc: *A.Allocator, xlen_bits: u32, extension_bits: u64, float_arg_bits: u32,
 has_compressed: bool, out_len: *u32) res[*u8, fail.Fail];
 ```
 
 ## fun validate_selected
 
 ```mach
-pub fun validate_selected(bytes: *u8, len: u32, xlen_bits: u32, selected: u32, flags: u32) err[fail.Fail];
+pub fun validate_selected(bytes: *u8, len: u32, xlen_bits: u32, selected: u64, flags: u32) err[fail.Fail];
 ```
 
 refuses an object whose Tag_RISCV_arch or header flags need something the selected

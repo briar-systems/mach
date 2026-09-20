@@ -74,8 +74,8 @@ pub fun free_dispatch_inputs(p: *driver.Project, di: *DispatchInputs);
 
 ```mach
 pub fun link_dispatcher(p: *driver.Project, unit: *plan.BuildUnit, sc: *TestScope,
-di: *DispatchInputs, dispatcher: *publication.Destination,
-artifact: *publication.Destination) err[outcome.Fail];
+di: *DispatchInputs, dispatcher: str,
+artifact: str) err[outcome.Fail];
 ```
 
 ## fun fingerprint_scope

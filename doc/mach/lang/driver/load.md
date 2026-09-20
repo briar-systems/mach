@@ -24,6 +24,16 @@ pub fun entry_module_fqn(p: *project.Project, t: *project.TargetEntry) res[inter
 pub fun compose_module_fqn(alloc: *A.Allocator, itn: *intern.Interner, id_text: str, rel_text: str) res[intern.StrId, fail.Fail];
 ```
 
+## fun fqn_in_root_project
+
+```mach
+pub fun fqn_in_root_project(p: *project.Project, fqn: intern.StrId) bool;
+```
+
+the head segment of a module path names the project that owns the module, and
+the loader is where that ownership is decided: it is what picks the source
+root a module is read from
+
 ## fun diag_join3
 
 ```mach
@@ -105,8 +115,10 @@ pub fun check_gated_const_imports(p: *project.Project) err[fail.Fail];
 ## fun remerge_tuple_pub_consts
 
 ```mach
-pub fun remerge_tuple_pub_consts(p: *project.Project, mid: session.ModuleId, ti: u32) res[bool, fail.Fail];
+pub fun remerge_tuple_pub_consts(p: *project.Project, mid: session.ModuleId, ti: u32) res[u32, fail.Fail];
 ```
+
+the imported public constants one union tuple round binds, and how many it bound
 
 ## fun eval_for_load
 

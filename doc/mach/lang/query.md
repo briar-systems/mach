@@ -138,6 +138,87 @@ pub val Q_INLINE_BODIES:     QueryKind = 21
 pub val Q_CELL_SNAPSHOT:     QueryKind = 22
 ```
 
+## val Q_UNION_TUPLE
+
+```mach
+pub val Q_UNION_TUPLE:       QueryKind = 23
+```
+
+## val Q_GATES
+
+```mach
+pub val Q_GATES:             QueryKind = 24
+```
+
+## val Q_GATE_SURFACE
+
+```mach
+pub val Q_GATE_SURFACE:      QueryKind = 25
+```
+
+## val Q_LOAD_VIEW
+
+```mach
+pub val Q_LOAD_VIEW:         QueryKind = 26
+```
+
+## def KeyOwner
+
+```mach
+pub def KeyOwner: u8
+```
+
+what a kind's keys name, so a session can release every product a module or file left behind.
+a kind keyed by a module carries its stable module id in the key's low 32 bits, whatever the
+higher bits add (a load view, a gate tuple, a test build), and a kind keyed by a file is keyed
+by its file id alone. file text is the source map's and the editor's input, released with them
+
+## val KEY_UNDECLARED
+
+```mach
+pub val KEY_UNDECLARED: KeyOwner = 0
+```
+
+## val KEY_UNOWNED
+
+```mach
+pub val KEY_UNOWNED:    KeyOwner = 1
+```
+
+## val KEY_MODULE
+
+```mach
+pub val KEY_MODULE:     KeyOwner = 2
+```
+
+## val KEY_FILE
+
+```mach
+pub val KEY_FILE:       KeyOwner = 3
+```
+
+## val QUERY_KIND_COUNT
+
+```mach
+pub val QUERY_KIND_COUNT: u32 = 27
+```
+
+one past the highest kind; the owner table and every kind constant stay inside it
+
+## fun key_owner
+
+```mach
+pub fun key_owner(kind: QueryKind) KeyOwner;
+```
+
+## def OwnedFn
+
+```mach
+pub def OwnedFn: fun(ptr, KeyOwner, u32) bool
+```
+
+whether a released owner's products go, given the kind's owner class and the id its key names
+
 ## def Revision
 
 ```mach
@@ -459,6 +540,19 @@ pub fun discard_retirement(prepared: *PreparedRetirement);
 pub fun prepare_retirement(db: *QueryDb, roots: *QueryKey, count: usize) res[PreparedRetirement, fail.Fail];
 ```
 
+## fun prepare_owned_retirement
+
+```mach
+pub fun prepare_owned_retirement(db: *QueryDb, owned: OwnedFn, ctx: ptr) res[PreparedRetirement, fail.Fail];
+```
+
+a retirement rooted at every product whose key a released module or file owns, with its dependents
+
+db: the database; no operation may be active
+owned: whether a key's owner is released
+ctx: owned's context
+ret: the prepared retirement, committed or discarded by the caller
+
 ## fun validate_retirement
 
 ```mach
@@ -547,6 +641,14 @@ a: *A.Allocator) res[Vector[QueryKey], fail.Fail];
 
 observation copies recorded keys without validating or exposing a cached product
 
+## fun peek_input
+
+```mach
+pub fun peek_input(db: *QueryDb, kind: QueryKind, key: u64) opt[QueryView];
+```
+
+an input's stored bytes, read outside any operation and recording no dependency
+
 ## fun peek_revision
 
 ```mach
@@ -558,4 +660,12 @@ pub fun peek_revision(db: *QueryDb, kind: QueryKind, key: u64) Revision;
 ```mach
 pub fun shard_len(db: *QueryDb, kind: QueryKind) u32;
 ```
+
+## fun owned_len
+
+```mach
+pub fun owned_len(db: *QueryDb, owner: KeyOwner, id: u32) u32;
+```
+
+how many products of every registered kind a module or file owns
 

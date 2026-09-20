@@ -235,7 +235,7 @@ pub rec LocalBinding;
 ## fun bind_local
 
 ```mach
-pub fun bind_local(lc: *LowerContext, sym: resolve.SymbolId, v: value.Value, secret: bool) err[fail.Fail];
+pub fun bind_local(lc: *LowerContext, sym: resolve.SymbolId, v: value.Value, secrecy: ct.BindSecrecy) err[fail.Fail];
 ```
 
 ## fun lookup_local_name
@@ -347,6 +347,9 @@ pub fun is_void_ir(lc: *LowerContext, tid: ir_type.IrTypeId) bool;
 pub fun expr_type_of(lc: *LowerContext, eid: id.ExprId) type.TypeId;
 ```
 
+an expression's type inside an instance's scope is the instance's, never the template's:
+sema records the template's and every type decision here is made against this instance
+
 ## fun expr_float_width
 
 ```mach
@@ -382,6 +385,16 @@ pub fun type_contains_secret(lc: *LowerContext, tid: type.TypeId) bool;
 ```mach
 pub fun type_carries_secret(lc: *LowerContext, tid: type.TypeId) bool;
 ```
+
+## fun bind_secrecy_of
+
+```mach
+pub fun bind_secrecy_of(lc: *LowerContext, tid: type.TypeId) ct.BindSecrecy;
+```
+
+the secrecy an inline-asm binding of this type carries: its own storage (`^usize`,
+`^*T`) and, for a pointer, whether the pointee reaches a secret (`*^T`, `**^T`,
+`*rec{ k: ^u32 }`); a pointer to a secret is a public address and a secret load
 
 ## fun substitute_type
 

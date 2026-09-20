@@ -1,36 +1,121 @@
 # mach.lang.me.ir.printer
 
-## rec IrDebugContext
+## def IrForm
 
 ```mach
-pub rec IrDebugContext;
+pub def IrForm: u8
 ```
 
-## rec IrDebugWriter
+which rendering of a module the writer produces; the rows are IR_FORMS
+
+## val IR_FORM_DEBUG
 
 ```mach
-pub rec IrDebugWriter;
+pub val IR_FORM_DEBUG: IrForm = 0
 ```
 
-## fun debug_context
+the ir-debug dump: every instruction carries its whole record, so no two
+distinct instructions print the same. It is the compiler's debugging form and
+its text is not a contract
+
+## val IR_FORM_LISTING
 
 ```mach
-pub fun debug_context(stage: str, target_name: str, isa_name: str, os_name: str,
-abi_name: str, of_name: str) IrDebugContext;
+pub val IR_FORM_LISTING: IrForm = 1
 ```
 
-## fun debug_writer
+a readable listing: language type spellings, elided state, and positions as
+line and column. It is the form tooling reads
+
+## val IR_FORM_CATALOG_VERSION
 
 ```mach
-pub fun debug_writer(out: *writer.Writer, m: *ir.Module, interner: *intern.Interner,
-context: IrDebugContext) IrDebugWriter;
+pub val IR_FORM_CATALOG_VERSION: u8 = 1
 ```
 
-## fun write_debug
+bumped when a row's fingerprint tag changes meaning
+
+## val IR_FORM_N
 
 ```mach
-pub fun write_debug(d: *IrDebugWriter) err[fail.Fail];
+pub val IR_FORM_N: usize                 = 2
 ```
+
+## val IR_FORM_HELP
+
+```mach
+pub val IR_FORM_HELP: str = "emit per-module .ir text beside each object
+```
+
+## val IR_FORM_ERROR
+
+```mach
+pub val IR_FORM_ERROR: str = "--emit-ir expects 'debug' or 'listing'"
+```
+
+## fun ir_form_from_name
+
+```mach
+pub fun ir_form_from_name(name: str) opt[IrForm];
+```
+
+the form a `--emit-ir=<name>` value names
+
+## fun ir_form_fingerprint_tag
+
+```mach
+pub fun ir_form_fingerprint_tag(form: IrForm) u8;
+```
+
+the fingerprint byte of a form, or 0 when the form is not a catalog row
+
+## fun ir_form_name
+
+```mach
+pub fun ir_form_name(form: IrForm) str;
+```
+
+the `--emit-ir=<name>` spelling of a form, or "" when the form is not a catalog row
+
+## rec IrContext
+
+```mach
+pub rec IrContext;
+```
+
+## rec IrWriter
+
+```mach
+pub rec IrWriter;
+```
+
+a module rendering in progress
+
+sources: resolves an instruction's byte offset to a line, a column and a path; the listing needs it and the dump does not read it
+form: the row of IR_FORMS write_ir dispatches on
+col: bytes emitted on the current output line, which the listing pads against
+
+## fun ir_context
+
+```mach
+pub fun ir_context(stage: str, target_name: str, isa_name: str, os_name: str,
+abi_name: str, of_name: str) IrContext;
+```
+
+## fun ir_writer
+
+```mach
+pub fun ir_writer(out: *writer.Writer, m: *ir.Module, interner: *intern.Interner,
+sources: *source.SourceMap, context: IrContext, form: IrForm) IrWriter;
+```
+
+## fun write_ir
+
+```mach
+pub fun write_ir(d: *IrWriter) err[fail.Fail];
+```
+
+render the module in the writer's form; a new row of IR_FORMS lands here
 
 ## fun print_global
 

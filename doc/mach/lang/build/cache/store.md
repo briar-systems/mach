@@ -32,6 +32,99 @@ pub val UNAVAILABLE:     u8    = 3
 pub val STORED:          u8    = 4
 ```
 
+## def Kind
+
+```mach
+pub def Kind: u8
+```
+
+the store's own failure vocabulary: the kind decides whether a caller
+treats the store as unavailable or reports an internal error
+
+## val IO
+
+```mach
+pub val IO:          Kind = 0
+```
+
+## val MEMORY
+
+```mach
+pub val MEMORY:      Kind = 1
+```
+
+## val INVALID
+
+```mach
+pub val INVALID:     Kind = 2
+```
+
+## val CONTAINMENT
+
+```mach
+pub val CONTAINMENT: Kind = 3
+```
+
+## val REJECTED
+
+```mach
+pub val REJECTED:    Kind = 4
+```
+
+## def Op
+
+```mach
+pub def Op: u8
+```
+
+## val OP_OPEN
+
+```mach
+pub val OP_OPEN:    Op = 0
+```
+
+## val OP_PREPARE
+
+```mach
+pub val OP_PREPARE: Op = 1
+```
+
+## val OP_RECOVER
+
+```mach
+pub val OP_RECOVER: Op = 2
+```
+
+## val OP_REMOVE
+
+```mach
+pub val OP_REMOVE:  Op = 3
+```
+
+## rec Fault
+
+```mach
+pub rec Fault;
+```
+
+## fun fault
+
+```mach
+pub fun fault(kind: Kind, op: Op) Fault;
+```
+
+## fun io_fault
+
+```mach
+pub fun io_fault(op: Op, code: i64) Fault;
+```
+
+## fun fault_message
+
+```mach
+pub fun fault_message(e: Fault) str;
+```
+
 ## rec Error
 
 ```mach
@@ -49,6 +142,23 @@ pub rec Status;
 ```mach
 pub rec Lookup;
 ```
+
+## fun memory_exhausted
+
+```mach
+pub fun memory_exhausted(code: i64) bool;
+```
+
+a native code that means the process is out of memory
+
+## fun checksum
+
+```mach
+pub fun checksum(bytes: *u8, len: usize) u64;
+```
+
+every step is a bijection of the running sum for a fixed word, so a change
+confined to one 8-byte word (any single flipped bit) always changes the result
 
 ## fun read
 

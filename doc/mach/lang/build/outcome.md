@@ -140,12 +140,6 @@ pub fun parse_text(e: parse.ParseError) str;
 pub fun thread_text(e: thread.ThreadError) str;
 ```
 
-## fun txn_text
-
-```mach
-pub fun txn_text(e: txn.Error) str;
-```
-
 ## fun semver_text
 
 ```mach
@@ -303,6 +297,9 @@ pub rec TestArtifact;
 pub rec BuildUnitEvent;
 ```
 
+verb: what the unit's goal calls working on it, borrowed from the goal catalog
+rather than owned, since every spelling there is a static string
+
 ## rec DiagnosticBatch
 
 ```mach
@@ -405,7 +402,7 @@ pub fun record_test(bo: *BuildOutcome, module: str, label: str, file: str, line:
 ## fun record_unit
 
 ```mach
-pub fun record_unit(bo: *BuildOutcome, artifact: str, target: str, has_artifact: bool) err[A.Error];
+pub fun record_unit(bo: *BuildOutcome, artifact: str, target: str, verb: str, has_artifact: bool) err[A.Error];
 ```
 
 ## fun record_note
