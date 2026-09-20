@@ -1,5 +1,4 @@
 use std.allocator.page;
-use std.chrono.duration;
 use std.collections.map;
 use std.format;
 use std.memory;
@@ -44,7 +43,6 @@ use mach.lang.source;
 use mach.lang.target.isa;
 use target: mach.lang.target.resolved;
 use mach.lang.type;
-use tm: std.chrono.time;
 
 val INITIAL_STACK_CAP: u32 = 8;
 
@@ -1926,12 +1924,60 @@ fun enqueue_distinct_instances(lc: *LowerContext, first: u32, count: u32) err[fa
     ret err[fail.Fail].ok{};
 }
 
-fun time_enqueue_fresh(count: u32) i64 {
-    var alloc:  A.Allocator;
-    val r_1844: err[A.Error] = page.make(?alloc);
-    if (sel r_1844.err) { ret -1; }
+# an allocator that forwards to another and counts what passes through it, so a
+# test can assert on the work a population costs without touching a clock
+rec CountingAlloc {
+    inner: *A.Allocator;
+    calls: u64;
+    bytes: u64;
+}
+
+fun counting_allocate(ctx: ptr, size: usize, align: usize) opt[ptr] {
+    val c: *CountingAlloc = ctx::*CountingAlloc;
+    c.calls = c.calls + 1;
+    c.bytes = c.bytes + size::u64;
+    val r: res[ptr, A.Error] = A.allocate_raw(c.inner, size, align);
+    if (sel r.err) { ret opt[ptr].none{}; }
+    ret opt[ptr].some{r.ok};
+}
+
+fun counting_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) opt[ptr] {
+    val c: *CountingAlloc = ctx::*CountingAlloc;
+    c.calls = c.calls + 1;
+    c.bytes = c.bytes + new_size::u64;
+    val r: res[ptr, A.Error] = A.reallocate_raw(c.inner, p, old_size, new_size, align);
+    if (sel r.err) { ret opt[ptr].none{}; }
+    ret opt[ptr].some{r.ok};
+}
+
+fun counting_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64 {
+    val c: *CountingAlloc = ctx::*CountingAlloc;
+    val r: err[A.Error]   = A.deallocate_raw(c.inner, p, size, align);
+    if (sel r.err) { ret 1; }
+    ret 0;
+}
+
+fun counting_make(a: *A.Allocator, c: *CountingAlloc, inner: *A.Allocator) {
+    c.inner         = inner;
+    c.calls         = 0;
+    c.bytes         = 0;
+    a.ctx           = c::ptr;
+    a.fn_allocate   = counting_allocate;
+    a.fn_reallocate = counting_reallocate;
+    a.fn_deallocate = counting_deallocate;
+}
+
+# enqueues count distinct instances into a fresh context and reports the
+# allocator calls and bytes that cost, or none if the enqueue itself refused
+fun count_enqueue_work(count: u32, calls: *u64, bytes: *u64) bool {
+    var page_alloc: A.Allocator;
+    val r_1844:     err[A.Error] = page.make(?page_alloc);
+    if (sel r_1844.err) { ret false; }
+    var counter: CountingAlloc;
+    var alloc:   A.Allocator;
+    counting_make(?alloc, ?counter, ?page_alloc);
     val sr: res[session.Session, fail.Fail] = session.init(?alloc);
-    if (sel sr.err) { ret -1; }
+    if (sel sr.err) { ret false; }
     var s: session.Session = sr.ok;
 
     var lc: LowerContext;
@@ -1944,13 +1990,12 @@ fun time_enqueue_fresh(count: u32) i64 {
     lc.insts        = nil;
     lc.inst_by_name = map.init[intern.StrId, u32](?alloc);
 
-    val started: tm.InstantClock = tm.instant();
-    if (sel started.err) { ret -1; }
-    val ok:      err[fail.Fail]  = enqueue_distinct_instances(?lc, 0, count);
-    val stopped: tm.InstantClock = tm.instant();
-    if (sel stopped.err) { ret -1; }
-    val elapsed: duration.Duration = tm.instant_sub(stopped.ok, started.ok);
-    if (sel ok.err) { ret -1; }
+    val before_calls: u64            = counter.calls;
+    val before_bytes: u64            = counter.bytes;
+    val ok:           err[fail.Fail] = enqueue_distinct_instances(?lc, 0, count);
+    @calls = counter.calls - before_calls;
+    @bytes = counter.bytes - before_bytes;
+    if (sel ok.err) { ret false; }
 
     var i: u32 = 0;
     for (i < lc.inst_len) {
@@ -1961,20 +2006,7 @@ fun time_enqueue_fresh(count: u32) i64 {
     }
     if (lc.insts != nil && lc.inst_cap > 0) { A.deallocate[Instance](?alloc, lc.insts, lc.inst_cap::usize); }
     map.dnit[intern.StrId, u32](?lc.inst_by_name);
-
-    ret duration.duration_usec(elapsed);
-}
-
-fun time_enqueue_min(count: u32, reps: u32) i64 {
-    var best: i64 = -1;
-    var r:    u32 = 0;
-    for (r < reps) {
-        val us: i64 = time_enqueue_fresh(count);
-        if (us < 0)                { ret -1; }
-        if (best < 0 || us < best) { best = us; }
-        r = r + 1;
-    }
-    ret best;
+    ret true;
 }
 
 test "mach.lang.me.lower.context.scope_leave:refuses_a_stale_or_out_of_order_mark" {
@@ -2183,20 +2215,30 @@ test "mach.lang.me.lower.context.request:refuses_a_module_product_that_does_not_
 }
 
 test "mach.lang.me.lower.context.enqueue_instance:cost_stays_near_linear_as_population_grows" {
+    # the instance vector and the name index both grow geometrically, so
+    # quadrupling the population adds at most two growth steps to each and the
+    # bytes it moves stay within the doubling envelope; a linear growth policy
+    # would add thousands of calls, a per-call copy would square the bytes
     val small: u32 = 1500;
     val large: u32 = small * 4;
 
-    val us_small: i64 = time_enqueue_min(small, 7);
-    val us_large: i64 = time_enqueue_min(large, 7);
-    if (us_small < 0 || us_large < 0) { ret 1; }
+    var calls_small: u64 = 0;
+    var bytes_small: u64 = 0;
+    var calls_large: u64 = 0;
+    var bytes_large: u64 = 0;
+    if (!count_enqueue_work(small, ?calls_small, ?bytes_small)) { ret 1; }
+    if (!count_enqueue_work(large, ?calls_large, ?bytes_large)) { ret 1; }
 
     var pa: A.Allocator;
     page.make(?pa);
-    val msg: res[str, format.FormatError] = format.sprint(?pa, "us_small={} us_large={}\n", us_small, us_large);
+    val msg: res[str, format.FormatError] = format.sprint(?pa,
+        "calls_small={} bytes_small={} calls_large={} bytes_large={}\n",
+        calls_small, bytes_small, calls_large, bytes_large);
     if (sel msg.ok) { print.eprint(msg.ok); }
 
     var bad: i32 = 0;
-    if (us_large > us_small * 8) { bad = 1; }
+    if (calls_large > calls_small + 16) { bad = 1; }
+    if (bytes_large > bytes_small * 8)  { bad = 1; }
     ret bad;
 }
 
