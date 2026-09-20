@@ -50,6 +50,14 @@ runs both, and compares the checksums with the C reference built by `cc` at
 `-O0`, `-O2` and under UBSan, which must agree among themselves first. The tool
 versions the goldens were blessed with are stated at the top of `run.sh`.
 
+A golden mismatch does not stop the differential: the one `FAIL` line carries
+the golden verdict and then either `differential agrees with the C reference`
+or the disagreement, so a run whose goldens moved still says whether the
+behaviour held. A case whose differential never executed (the build or the
+decoder failed first) is counted in the summary as `differential not run`, and
+no such case counts as a pass. The C reference answer is rebuilt whenever
+`ref/<group>/<case>.c` or `lib/corpus.h` is newer than it.
+
 `--qemu` adds the targets no host runs natively: `riscv64-linux` under
 `qemu-riscv64` and the freestanding `riscv32` under `qemu-riscv32`. A riscv32
 case's own artifact is a static archive, so the driver also builds a run bin per
@@ -118,7 +126,8 @@ per lane.
 
 1. Write `cases/<group>/<name>.mach` to the contract and `ref/<group>/<name>.c`.
 2. `bash test/run.sh --case <group>/<name> --target <host>` until the four
-   checksums agree (build failures and disagreements print as `FAIL` lines).
+   checksums agree (build failures and disagreements print as `FAIL` lines; the
+   missing golden is reported on the same line and does not hide them).
 3. `bash test/run.sh --bless --case <group>/<name>` and read every golden it
    writes. A golden you have not read is not a golden.
 4. A target that cannot build the case gets a line in `golden/<target>/SKIPS`:
