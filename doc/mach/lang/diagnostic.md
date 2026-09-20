@@ -138,6 +138,19 @@ pub fun mark(store: *DiagnosticStore) DiagMark;
 pub fun truncate(store: *DiagnosticStore, m: DiagMark) err[fail.Fail];
 ```
 
+## fun drop_file
+
+```mach
+pub fun drop_file(store: *DiagnosticStore, file_id: source.FileId);
+```
+
+drop every diagnostic located in one file, keeping the rest in order. a module refreshed
+in place re-reports its own load diagnostics, so the old ones go; ids issued before the
+drop are stale afterwards, as after a truncate
+
+store: the store
+file_id: the file whose diagnostics go
+
 ## fun store_dnit
 
 ```mach
@@ -289,6 +302,19 @@ pub val STALE_ID_TEXT: str = "stale diagnostic id"
 ```mach
 pub fun error(store: *DiagnosticStore, file_id: source.FileId, span: token.Span, message: str) err[fail.Fail];
 ```
+
+## fun reject
+
+```mach
+pub fun reject(store: *DiagnosticStore, loc: source.SrcLoc, text: str) fail.Fail;
+```
+
+a pass past the front end rejects the program: the refusal is an error
+located at `loc` on the store and the pass answers `reported`, exactly as a
+front-end pass does, so rendering, the tally and the exit status derive from
+one list. an append the store refuses is an internal failure; a store wired
+as nil is a compiler defect, and the text then stands as an internal failure
+rather than vanishing
 
 ## fun warning
 

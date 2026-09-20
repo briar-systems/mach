@@ -377,6 +377,130 @@ pub fun dfs_load(p: *project.Project, fqn: intern.StrId) res[session.ModuleId, f
     ret res[session.ModuleId, fail.Fail].ok{mid};
 }
 
+# reparse and re-walk one loaded module in place, after its text changed, and say
+# whether its load surface survived: the modules it reaches, the public constants it
+# declares to importers' gates, its own gate outcome and its target gating. a surface
+# that survived leaves the project's module set, topo and every other entry as they
+# are, so the caller can rerun the query phases over the kept project; one that did
+# not needs a full load. the entry's walk state is rebuilt from a fresh comptime
+# context, since gate states and load marks are keyed by the old syntax tree's ids
+# ---
+# p:   the loaded project
+# mid: the module whose text changed
+# ret: ok(true) when the surface is unchanged; ok(false) when the caller must reload;
+#      or the parse or walk failure
+pub fun reload_module(p: *project.Project, mid: session.ModuleId) res[bool, fail.Fail] {
+    val m: *project.ModuleEntry = project.module_at(p, mid::u32);
+
+    val old_modules:   u32                  = project.module_count(p);
+    val old_outcome:   comptime.GateOutcome = m.load_outcome;
+    val old_gated:     bool                 = m.target_gated;
+    val old_deps:      *session.ModuleId    = m.deps;
+    val old_dep_n:     u32                  = m.dep_count;
+    val old_dep_cap:   u32                  = m.dep_cap;
+    val old_consts:    *project.PubConst    = m.pub_consts;
+    val old_const_n:   u32                  = m.pub_const_count;
+    val old_const_cap: u32                  = m.pub_const_cap;
+    fin {
+        if (old_deps != nil)   { A.deallocate[session.ModuleId](p.alloc, old_deps, old_dep_cap::usize); }
+        if (old_consts != nil) { A.deallocate[project.PubConst](p.alloc, old_consts, old_const_cap::usize); }
+    }
+
+    val ctx_r: res[comptime.ComptimeCtx, fail.Fail] = module_context(p, ?p.req);
+    if (sel ctx_r.err) { ret res[bool, fail.Fail].err{ctx_r.err}; }
+    if (m.gate_decided != nil && m.ctx.gate_count > 0) {
+        A.deallocate[bool](p.alloc, m.gate_decided, m.ctx.gate_count::usize);
+    }
+    comptime.dnit(?m.ctx);
+    m.ctx                   = ctx_r.ok;
+    m.gate_decided          = nil;
+    m.deps                  = nil;
+    m.dep_count             = 0;
+    m.dep_cap               = 0;
+    m.pub_consts            = nil;
+    m.pub_const_count       = 0;
+    m.pub_const_cap         = 0;
+    m.mod_ref_count         = 0;
+    m.const_import_count    = 0;
+    m.resolve_result        = nil;
+    m.resolved              = false;
+    m.sema_result           = nil;
+    m.ir_module             = nil;
+    m.object_image          = nil;
+    m.staged_image          = nil;
+    m.cache_checked         = false;
+    m.cache_hit             = false;
+    m.parse_status          = fail.accepted();
+    m.load_status           = fail.accepted();
+    m.gate_status           = fail.accepted();
+    m.load_outcome          = comptime.GATE_ACTIVE;
+    m.load_walk_count       = 0;
+    p.load_status[mid::u32] = project.LOAD_LOADING;
+
+    val parse_r: err[fail.Fail] = parse_module(p, mid, m.fqn);
+    if (sel parse_r.err) {
+        p.load_status[mid::u32] = project.LOAD_DONE;
+        ret res[bool, fail.Fail].err{parse_r.err};
+    }
+    val gates: err[fail.Fail] = comptime.prepare_gates(?m.ctx, m.a.expr_len::u32, m.a.decl_len::u32);
+    if (sel gates.err) {
+        p.load_status[mid::u32] = project.LOAD_DONE;
+        ret res[bool, fail.Fail].err{gates.err};
+    }
+    val saved_gated: bool = p.in_gated_decl_walk;
+    p.in_gated_decl_walk = false;
+    val walk_r: res[comptime.GateOutcome, fail.Fail] = walk_module_for_load(p, mid);
+    p.in_gated_decl_walk    = saved_gated;
+    p.load_status[mid::u32] = project.LOAD_DONE;
+    if (sel walk_r.err) { ret res[bool, fail.Fail].err{walk_r.err}; }
+    m.load_outcome = walk_r.ok;
+
+    if (project.module_count(p) != old_modules)                                     { ret res[bool, fail.Fail].ok{false}; }
+    if (m.load_outcome != old_outcome)                                              { ret res[bool, fail.Fail].ok{false}; }
+    if (m.target_gated != old_gated)                                                { ret res[bool, fail.Fail].ok{false}; }
+    if (!same_dep_set(old_deps, old_dep_n, m.deps, m.dep_count))                    { ret res[bool, fail.Fail].ok{false}; }
+    if (!same_pub_consts(old_consts, old_const_n, m.pub_consts, m.pub_const_count)) { ret res[bool, fail.Fail].ok{false}; }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+fun same_dep_set(a: *session.ModuleId, an: u32, b: *session.ModuleId, bn: u32) bool {
+    if (an != bn) { ret false; }
+    var i: u32 = 0;
+    for (i < an) {
+        var found: bool = false;
+        var j:     u32  = 0;
+        for (j < bn) {
+            if (b[j] == a[i]) { found = true; }
+            j = j + 1;
+        }
+        if (!found) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun same_ct_value(a: *comptime.CTValue, b: *comptime.CTValue) bool {
+    if (a.kind != b.kind || a.int_unsigned != b.int_unsigned || a.int_width != b.int_width || a.float_width != b.float_width) { ret false; }
+    if (a.kind == comptime.CT_KIND_INT)                                                                                       { ret a.data.w.lo == b.data.w.lo && a.data.w.hi == b.data.w.hi; }
+    if (a.kind == comptime.CT_KIND_FLOAT)                                                                                     { ret a.data.f == b.data.f; }
+    if (a.kind == comptime.CT_KIND_STR)                                                                                       { ret a.data.s == b.data.s; }
+    if (a.kind == comptime.CT_KIND_TYPE)                                                                                      { ret a.data.t == b.data.t; }
+    if (a.kind == comptime.CT_KIND_FIELD || a.kind == comptime.CT_KIND_CASE)                                                  { ret a.data.fld.owner == b.data.fld.owner && a.data.fld.index == b.data.fld.index; }
+    if (a.kind == comptime.CT_KIND_PACK_ELEM)                                                                                 { ret a.data.pelem.index == b.data.pelem.index && a.data.pelem.ty == b.data.pelem.ty; }
+    if (a.kind == comptime.CT_KIND_CONST_ELEM)                                                                                { ret a.data.celem.elem == b.data.celem.elem && a.data.celem.ty == b.data.celem.ty; }
+    ret false;
+}
+
+fun same_pub_consts(a: *project.PubConst, an: u32, b: *project.PubConst, bn: u32) bool {
+    if (an != bn) { ret false; }
+    var i: u32 = 0;
+    for (i < an) {
+        if (a[i].name != b[i].name || a[i].gated != b[i].gated || !same_ct_value(?a[i].value, ?b[i].value)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
 fun module_context(p: *project.Project, req: *request.BuildRequest) res[comptime.ComptimeCtx, fail.Fail] {
     if (p == nil || req == nil || p.target_entry == nil) {
         ret res[comptime.ComptimeCtx, fail.Fail].err{fail.message("driver: module context requires an opened project and request")};

@@ -64,6 +64,25 @@ pub fun parse_root(p: *project.Project, fqn: intern.StrId) res[session.ModuleId,
 pub fun dfs_load(p: *project.Project, fqn: intern.StrId) res[session.ModuleId, fail.Fail];
 ```
 
+## fun reload_module
+
+```mach
+pub fun reload_module(p: *project.Project, mid: session.ModuleId) res[bool, fail.Fail];
+```
+
+reparse and re-walk one loaded module in place, after its text changed, and say
+whether its load surface survived: the modules it reaches, the public constants it
+declares to importers' gates, its own gate outcome and its target gating. a surface
+that survived leaves the project's module set, topo and every other entry as they
+are, so the caller can rerun the query phases over the kept project; one that did
+not needs a full load. the entry's walk state is rebuilt from a fresh comptime
+context, since gate states and load marks are keyed by the old syntax tree's ids
+
+p: the loaded project
+mid: the module whose text changed
+ret: ok(true) when the surface is unchanged; ok(false) when the caller must reload;
+     or the parse or walk failure
+
 ## fun parsed_definition
 
 ```mach

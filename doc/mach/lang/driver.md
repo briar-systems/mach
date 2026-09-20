@@ -159,6 +159,25 @@ pub fun run_load_phase(p: *project.Project) err[outcome.Fail];
 pub fun run_gate_pass(p: *project.Project) res[bool, outcome.Fail];
 ```
 
+## fun refresh_frontend
+
+```mach
+pub fun refresh_frontend(p: *project.Project, mid: session.ModuleId, phase: FrontendPhase) res[bool, outcome.Fail];
+```
+
+re-derive a loaded project's frontend after one module's text changed, without
+reloading its closure. the module is reparsed and re-walked in place; when its load
+surface survived (load.reload_module), the module set and topo are as loaded and
+the query phases rerun over them, so every unchanged module's resolve and sema are
+hits and only the edited module and its dependents recompute. a surface that did
+not survive is reported as ok(false): the caller reloads
+
+p: the loaded project, at least at FRONTEND_RESOLVE
+mid: the module whose text changed
+phase: the frontend phase to re-derive to, at most the one the project was loaded to
+ret: ok(true) when refreshed, a rejection included since the project's standing carries it;
+       ok(false) when the caller must reload; or the internal failure
+
 ## fun load_manifest
 
 ```mach
