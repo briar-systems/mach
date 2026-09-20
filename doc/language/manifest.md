@@ -294,6 +294,16 @@ function `#[extensions(sha)]` and call it only after detecting the extension at 
 The selected set is part of the target's identity: two targets that differ only in
 `extensions` never share cached products.
 
+The selection also reaches code generation. Every vector operation is legal on every
+target and its shape never depends on the extension list; what moves is the lowering.
+A cell the baseline expands to a scalar sequence lowers to the one packed instruction
+when the selected set holds the extension that carries it (`i32x4 * i32x4` is
+`pmulld` under `sse41` on x86_64 and a scalar expansion without), and
+[`simd = "require"`](#profilename) judges against the selected set, so a kernel refused on
+the baseline is accepted once the target declares the extension it needs. SSE2 is the
+x86_64 baseline. A build never infers the build machine's features: what the binary
+assumes is what the manifest declares.
+
 ### Image stack size
 
 `stack_reserve` and `stack_commit` set the thread stack an image asks its loader for,
