@@ -338,6 +338,19 @@ the returned `*ModuleEntry` is stable until dnit_project: the store never
 moves an entry when more modules load, so a holder may keep it across a
 nested load and read the same entry afterwards
 
+## fun module_by_file
+
+```mach
+pub fun module_by_file(p: *Project, fid: src.FileId) opt[session.ModuleId];
+```
+
+the loaded module a source file backs, by a scan of the module table: editor edits
+arrive as file ids and the table is small beside the work a refresh saves
+
+p: the project
+fid: the file
+ret: the module's id, or none when no loaded module reads that file
+
 ## fun drop_surface
 
 ```mach

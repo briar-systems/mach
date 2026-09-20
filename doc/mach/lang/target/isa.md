@@ -417,7 +417,10 @@ pub rec PackedForm;
 ```
 
 a cell is the operation, the result lane kind and width, and the operand
-lane width; an operation that keeps its lanes repeats lane_bits there
+lane width; an operation that keeps its lanes repeats lane_bits there. ext
+is the extension bits the packed instruction needs, none for the baseline:
+a gated row takes part only when the selected target holds every bit, and
+the same cell may then also carry a baseline scalar row for when it does not
 
 ## rec ScalarForm
 

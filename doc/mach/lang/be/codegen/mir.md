@@ -1643,12 +1643,7 @@ same store the front-end passes of the module wrote; owned by the caller
 pub fun reject(diags: *diagnostic.DiagnosticStore, loc: source.SrcLoc, text: str) fail.Fail;
 ```
 
-a backend pass rejects the program: the refusal is an error located at `loc`
-on the module's diagnostic store and the pass answers `reported`, exactly as a
-front-end pass does, so rendering, the tally and the exit status derive from
-one list. an append the store refuses is an internal failure; a module wired
-without a store is a compiler defect, and the text then stands as an internal
-failure rather than vanishing
+a backend pass rejects the program through the shared located refusal
 
 ## fun refusal_loc
 
