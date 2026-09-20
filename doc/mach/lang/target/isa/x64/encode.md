@@ -43,7 +43,7 @@ effect walk read it: the class column of the one description table
 ## val X64_OPCODE_COUNT
 
 ```mach
-pub val X64_OPCODE_COUNT: u32 = 177
+pub val X64_OPCODE_COUNT: u32 = 178
 ```
 
 the machine opcodes a notification can carry: every x64.Opcode except the
