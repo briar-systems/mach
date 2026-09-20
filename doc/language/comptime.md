@@ -129,9 +129,11 @@ fun main(argc: i64, argv: **u8) i64 {
   structural expansion resolved at compile time, not an iterated computation.
 - No compile-time evaluation of user functions, ever: a call in a `val`
   initializer is a runtime call. A lookup table is committed as generator
-  output next to its generator and held to it by a `test`, or built at
-  startup into a module-private `var`; a module-scope `val` lands in
-  read-only data.
+  output next to its generator and held to it by a `test` (equality with the
+  generator when it is deterministic, the property it searched for when it is
+  randomised, and no startup fallback that repairs a bad constant before the
+  test sees it), or built at startup into a module-private `var`; a
+  module-scope `val` lands in read-only data.
 - No bare `$ident` — see above.
 
 ## See also
