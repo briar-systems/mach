@@ -125,6 +125,19 @@ pub fun module_id_for_stable(s: *Session, stable: module.StableModuleId) module.
 pub fun register_export_name(s: *Session, mid: module.ModuleId, did: u32, name: intern.StrId) err[fail.Fail];
 ```
 
+## fun forget_export_names
+
+```mach
+pub fun forget_export_names(s: *Session, mid: module.ModuleId, decl_count: u32);
+```
+
+drop every export name one module registered, before its syntax tree is replaced and
+its declaration ids no longer name the same declarations
+
+s: the session
+mid: the module whose names go
+decl_count: the declaration count of the AST they were registered against
+
 ## fun export_name
 
 ```mach

@@ -602,6 +602,16 @@ compute: fun(*T, QueryKind, u64, *A.Allocator, *diagnostic.DiagnosticStore) res[
 pub fun prepared_view(db: *QueryDb, prepared: PreparedQuery) res[QueryView, fail.Fail];
 ```
 
+## fun prepared_diags
+
+```mach
+pub fun prepared_diags(db: *QueryDb, prepared: PreparedQuery) res[*diagnostic.DiagnosticStore, fail.Fail];
+```
+
+the store a prepared query's compute reports into: work finished outside the
+compute (a worker thread's optimize) appends there, so a refusal it records
+reaches the presentation like one the compute made itself
+
 ## fun cancel_prepared
 
 ```mach
