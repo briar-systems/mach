@@ -404,10 +404,27 @@ the unfused path, where each operand is extended and then multiplied
 pub val VEC_OP_MUL_WIDE_U: VecOp = 23
 ```
 
+## val VEC_OP_WIDEN_S
+
+```mach
+pub val VEC_OP_WIDEN_S: VecOp = 24
+```
+
+a lane-halving extension: half the operand's integer lanes (its low or high
+half), each extended to twice the width under the operation's signedness. a
+cell names the result lane width and the operand lane width; its scalar row
+is the unfused path, one extension per lane into a rebuilt vector (#3738)
+
+## val VEC_OP_WIDEN_U
+
+```mach
+pub val VEC_OP_WIDEN_U: VecOp = 25
+```
+
 ## val VEC_OP_LAST
 
 ```mach
-pub val VEC_OP_LAST:       VecOp = VEC_OP_MUL_WIDE_U
+pub val VEC_OP_LAST:    VecOp = VEC_OP_WIDEN_U
 ```
 
 ## rec PackedForm
@@ -579,6 +596,12 @@ pub fun is_convert_op(op: VecOp) bool;
 pub fun is_widen_op(op: VecOp) bool;
 ```
 
+## fun is_widen_half_op
+
+```mach
+pub fun is_widen_half_op(op: VecOp) bool;
+```
+
 ## fun vector_domain_len
 
 ```mach
@@ -607,7 +630,7 @@ them all as the scalar expansion by declaring no unit
 ## val WIDEN_CELL_COUNT
 
 ```mach
-pub val WIDEN_CELL_COUNT: u32 = 6
+pub val WIDEN_CELL_COUNT: u32 = 12
 ```
 
 ## fun scalar_conversion_rows
@@ -626,8 +649,8 @@ declares the rest through this, so each conversion cell is decided once
 pub fun scalar_widening_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
 ```
 
-the same for the widening multiplies: a cell the packed table leaves keeps
-the extend-then-multiply path
+the same for the widening multiplies and the lane-halving extensions: a
+cell the packed table leaves keeps the per-lane path
 
 ## fun ct_mul_rows_admit
 

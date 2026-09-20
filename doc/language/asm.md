@@ -222,7 +222,7 @@ relocation is correct after a trailing immediate.
 | form | mnemonics |
 |---|---|
 | move, in either direction between a register and memory | `movdqa`, `movdqu`, `movaps`, `movups` |
-| `xmm, xmm/m128` | `paddb` `paddw` `paddd` `paddq`, `psubb` `psubw` `psubd` `psubq` `psubusb` `psubusw`, `pmullw`, `pand` `por` `pxor`, `pcmpeqb` `pcmpeqw` `pcmpeqd` `pcmpgtb` `pcmpgtw` `pcmpgtd`, `punpcklbw` `punpcklwd` `punpckldq`, `packsswb` `packssdw`, `addps` `subps` `mulps` `divps` `addpd` `subpd` `mulpd` `divpd`, `cvtdq2ps` `cvttps2dq` `cvtdq2pd` `cvttpd2dq` `cvtps2pd` `cvtpd2ps` |
+| `xmm, xmm/m128` | `paddb` `paddw` `paddd` `paddq`, `psubb` `psubw` `psubd` `psubq` `psubusb` `psubusw`, `pmullw`, `pand` `por` `pxor`, `pcmpeqb` `pcmpeqw` `pcmpeqd` `pcmpgtb` `pcmpgtw` `pcmpgtd`, `punpcklbw` `punpcklwd` `punpckldq` `punpckhbw` `punpckhwd` `punpckhdq`, `packsswb` `packssdw`, `addps` `subps` `mulps` `divps` `addpd` `subpd` `mulpd` `divpd`, `cvtdq2ps` `cvttps2dq` `cvtdq2pd` `cvttpd2dq` `cvtps2pd` `cvtpd2ps` |
 | `xmm, xmm/m128, imm8` | `pshufd`, `cmpps`, `cmppd` |
 
 **aarch64** spells them `vN.16b`, `vN.8h`, `vN.4s` or `vN.2d`. The suffix is the
@@ -274,7 +274,7 @@ inherits its function's set.
 | isa | extension | mnemonics |
 |---|---|---|
 | x86_64 | `ssse3` | `pshufb xmm, xmm/m128`, `palignr xmm, xmm/m128, imm8` |
-| x86_64 | `sse41` | `pblendw xmm, xmm/m128, imm8`, `ptest xmm, xmm/m128`, `pinsrd xmm, r32/m32, imm8`, `pextrd r32/m32, xmm, imm8` |
+| x86_64 | `sse41` | `pblendw xmm, xmm/m128, imm8`, `ptest xmm, xmm/m128`, `pinsrd xmm, r32/m32, imm8`, `pextrd r32/m32, xmm, imm8`, `pmulld xmm, xmm/m128`, `pmovsxbw` `pmovsxwd` `pmovsxdq` `pmovzxbw` `pmovzxwd` `pmovzxdq` `xmm, xmm/m64` |
 | x86_64 | `sha` | `sha256rnds2 xmm, xmm/m128`, `sha256msg1 xmm, xmm/m128`, `sha256msg2 xmm, xmm/m128` |
 | x86_64 | `fsgsbase` | `rdfsbase r32/r64`, `rdgsbase r32/r64`, `wrfsbase r32/r64`, `wrgsbase r32/r64` |
 | x86_64 | `popcnt` | `popcnt r16/32/64, r/m` (CPUID leaf 1, ECX bit 23) |
