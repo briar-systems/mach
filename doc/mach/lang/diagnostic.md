@@ -290,6 +290,19 @@ pub val STALE_ID_TEXT: str = "stale diagnostic id"
 pub fun error(store: *DiagnosticStore, file_id: source.FileId, span: token.Span, message: str) err[fail.Fail];
 ```
 
+## fun reject
+
+```mach
+pub fun reject(store: *DiagnosticStore, loc: source.SrcLoc, text: str) fail.Fail;
+```
+
+a pass past the front end rejects the program: the refusal is an error
+located at `loc` on the store and the pass answers `reported`, exactly as a
+front-end pass does, so rendering, the tally and the exit status derive from
+one list. an append the store refuses is an internal failure; a store wired
+as nil is a compiler defect, and the text then stands as an internal failure
+rather than vanishing
+
 ## fun warning
 
 ```mach

@@ -6,6 +6,8 @@
 pub rec ScalarizeSite;
 ```
 
+loc is the operation's own location when it has one, else the function's declaration
+
 ## fun detect
 
 ```mach
