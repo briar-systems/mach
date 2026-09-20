@@ -289,6 +289,12 @@ var p: *i64 = ?x;       # address-of yields a pointer
 val v: i64  = @p;       # dereference reads through it
 ```
 
+A pointer carries no qualifiers: there is no `const` or `volatile` pointer.
+Immutability is a property of the binding (`val`), and volatility is a property
+of a declared record, union or tag (`#[volatile]`, see
+[decorators.md](decorators.md#volatile--every-access-to-the-type-is-a-volatile-access)),
+so an access through `*T` is volatile exactly when `T`'s storage is.
+
 ## Array
 
 `[N]T` — array of exactly `N` values of type `T`. Nested: `[N][M]T`.

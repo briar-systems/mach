@@ -344,8 +344,18 @@ differential() {
             why="build $p run: $(first_error "$(log_of "$t" "$p" "$c" run)")"; return 1
         fi
         bin=$(artifact "$t" "$p" "$c" run)
-        # a wrong program may print a NUL, which a substitution would warn about
-        got=$(timeout 60 $eng "$bin" 2>"$out/log/$t.$p.$(art "$c").err" | tr -d '\0'); rc=${PIPESTATUS[0]}
+        # the status is the program's own, read before any substitution (PIPESTATUS
+        # after an assignment is the assignment's); a wrong program may print a
+        # NUL, which a substitution would warn about, so the output is filed first
+        timeout 60 $eng "$bin" >"$out/log/$t.$p.$(art "$c").out" 2>"$out/log/$t.$p.$(art "$c").err"; rc=$?
+        got=$(tr -d '\0' <"$out/log/$t.$p.$(art "$c").out")
+        # a program admitting a secret multiply sets PSTATE.DIT at start and
+        # refuses, with std's one-line refusal and status 255, on an aarch64
+        # host without FEAT_DIT: the host cannot run it, and the cell is not a
+        # verdict on the compiler
+        if [ "$rc" -eq 255 ] && grep -q "data-independent-timing mode (PSTATE.DIT)" "$out/log/$t.$p.$(art "$c").err"; then
+            why="$p: this host provides no PSTATE.DIT, so the program refused to start"; return 2
+        fi
         if [ "$rc" -ne 0 ]; then why="$p: exit $rc"; return 1; fi
         if [ -s "$out/log/$t.$p.$(art "$c").err" ]; then why="$p: wrote to stderr"; return 1; fi
         if [ "$got" != "$ref" ]; then why="$p: mach says $got, C reference says $ref"; return 1; fi
@@ -474,8 +484,12 @@ run_case() {
     # runs it too, and the disagreement is what its line claims
     eng=$(engine "$t")
     if [ "$eng" != - ]; then
-        if differential "$t" "$c" "$eng"; then
+        differential "$t" "$c" "$eng"; verdict=$?
+        if [ "$verdict" -eq 0 ]; then
             if norun "$t" "$c"; then fail "$t $c agrees with the C reference: its golden/$t/NORUN line is stale"; return; fi
+        elif [ "$verdict" -eq 2 ]; then
+            echo "NORUN $t $c: $why"
+            skips=$((skips + 1)); return
         elif norun "$t" "$c"; then
             noruns=$((noruns + 1))
         else
@@ -690,7 +704,7 @@ if [ "$mode" = incremental ]; then
     cp -r "$repo/src" "$repo/mach.toml" "$self/"
     cp -r "$repo/dep/std/src" "$repo/dep/std/mach.toml" "$self/dep/std/"
     # the copy is no git checkout, so std is the pinned tree taken by path
-    sed -i '/^\[dep\.std\]$/,/^$/{s/^git = .*$/path = "dep\/std"/;/^ref = /d}' "$self/mach.toml"
+    sed -i '/^\[dep\.std\]$/,/^$/{s/^git = .*$/path = "dep\/std"/;/^ref = /d;/^version = /d}' "$self/mach.toml"
     grep -q '^path = "dep/std"$' "$self/mach.toml" || fail "incremental: the copied manifest still names std by git"
     echo "incremental: $self"
     if inc_build "$self" "the clean build" o/clean &&

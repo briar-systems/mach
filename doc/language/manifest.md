@@ -458,6 +458,16 @@ is refused at composition (`instruction set 'spirv' emits finished modules, but
 object format 'raw' carries linkable objects`), so the override cannot compose a
 tuple that would emit nothing.
 
+The page an image is laid out at is a function of the same tuple. A format a
+loader maps by page (`elf`, `coff`, `macho`) places every load segment on a page
+of its own, so no two segments with different permissions share one: the os's
+page where the os declares one (`linux` on `aarch64` lays out at 64 KiB, the
+largest page a kernel may use, `darwin` on `aarch64` at 16 KiB, 4 KiB elsewhere),
+and the instruction set's hardware page (4 KiB on `x86_64`, `aarch64`, `riscv64`
+and `riscv32`) where the os has no loader of its own, which is what `freestanding`
+with `of = "elf"` gives a bootloader such as Limine or GRUB. A flat image (`raw`)
+and a finished module (`spv`) have no page and are laid out byte-tight.
+
 ### Finished-module targets
 
 A `spirv` target's object output is a complete, self-contained module rather than
@@ -1132,7 +1142,7 @@ where it is declared, since one head segment cannot name two projects.
 ```toml
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^4.0"
+version = "^6.0"
 ```
 
 A stanza declares exactly one source:
@@ -1168,6 +1178,12 @@ such that:
 1. every requirer's range contains it;
 2. its own `[project].mach` contains the running compiler;
 3. the closure its own manifest implies also resolves.
+
+A requirer is the root, a release resolution chose, or a dependency the root
+reaches by `ref` or `path`. The last declares its range in the closure directly,
+so two such dependencies naming one identity by range are two requirements of
+the same problem, and the error names each by its chain (`root -> c requires b
+<1.2`).
 
 Among the choices that satisfy all three, it takes the highest release of each
 identity. The result is written as gitlinks, like any other pin; there is
