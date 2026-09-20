@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.10.0] - 2026-09-19
+
 ### Changed
 - The compiler builds against std 6.0.0 (`[dep.std] version = "^6.0"`, gitlink at v6.0.0, from v4.0.0). The tree follows `MIGRATION.md` for "std 4.x to 5.0.0" (monotonic readings and deadlines are `time.Instant`, cancel scopes take an `opt[Instant]`) and "std 5.x to 6.0.0" (maps over scalar and scalar-record keys use the natural hash and equality, the `Type` and `IrType` dedup maps and the resolver's import cache are `MapBy` with typed functions, sorts whose comparator spelled the element's natural order drop it and the rest are `sort_by`). The project floor is `mach = "^5.8"`, std's own, and CI seeds from mach 5.9.0. No user-visible behaviour changes; the compiler is not byte-identical, since the sort algorithm and the hash of a value changed (#3714).
 
