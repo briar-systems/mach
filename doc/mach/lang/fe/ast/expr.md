@@ -144,6 +144,17 @@ pub val EXPR_KIND_SEL:              ExprKind = 23
 pub val EXPR_KIND_ERROR:            ExprKind = 255
 ```
 
+## fun span_is_token
+
+```mach
+pub fun span_is_token(kind: ExprKind) bool;
+```
+
+a token-backed node's span is its token: its text is read back through the span
+(a name is interned from it, a literal is rescanned from it), so the span never
+grows past the token. every other node's span is its source extent, grouping
+parentheses included
+
 ## def BinOp
 
 ```mach
