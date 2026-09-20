@@ -283,6 +283,11 @@ inherits its function's set.
 | aarch64 | `sha2` | `sha256h qN, qN, vN.4s`, `sha256h2 qN, qN, vN.4s`, `sha256su0 vN.4s, vN.4s`, `sha256su1 vN.4s, vN.4s, vN.4s` |
 | aarch64 | `sb` | `sb` (the FEAT_SB speculation barrier) |
 
+A manifest [level](manifest.md#levels) (`extensions = ["x86-64-v2"]`) selects every
+member name, so it admits the rows of each: `pmulld` assembles under `x86-64-v2`, and
+`tzcnt` and `lzcnt` under `x86-64-v3`. The names a level brings that have no rows
+yet (`sse42`, `avx`, `avx2`, `avx512*`) admit nothing until an encoding lands for them.
+
 `sha256rnds2` also reads `xmm0`, the round keys, without naming it, and the
 constant-time check follows a secret through it. `ptest` sets ZF and CF; the
 check treats it as writing the flags rather than defining them, so a branch after
