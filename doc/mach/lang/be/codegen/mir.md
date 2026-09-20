@@ -328,6 +328,22 @@ lane carrying its operand lane
 pub val MIR_MUL_WIDE_U: MirOpcode = 51
 ```
 
+## val MIR_VEC_WIDEN_S
+
+```mach
+pub val MIR_VEC_WIDEN_S: MirOpcode = 54
+```
+
+the IR lane-halving extensions, lowered by their IR kind: half the operand's
+integer lanes extended to twice the width, the low half at immediate base 0
+and the high half at base N (#3738)
+
+## val MIR_VEC_WIDEN_U
+
+```mach
+pub val MIR_VEC_WIDEN_U: MirOpcode = 55
+```
+
 ## val MIR_MOV
 
 ```mach
@@ -1086,7 +1102,7 @@ pub val SELECTION_WIDENING_MUL_COUNT:    u32 = 2
 ## val SELECTION_PACKED_WIDENING_COUNT
 
 ```mach
-pub val SELECTION_PACKED_WIDENING_COUNT: u32 = 2
+pub val SELECTION_PACKED_WIDENING_COUNT: u32 = 4
 ```
 
 ## val SELECTION_FIXED_PAIR_MUL_COUNT

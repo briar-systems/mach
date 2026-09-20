@@ -504,6 +504,18 @@ pub val IVEC_MUL_WIDE_S: IrVecOp = 22
 pub val IVEC_MUL_WIDE_U: IrVecOp = 23
 ```
 
+## val IVEC_WIDEN_S
+
+```mach
+pub val IVEC_WIDEN_S:    IrVecOp = 24
+```
+
+## val IVEC_WIDEN_U
+
+```mach
+pub val IVEC_WIDEN_U:    IrVecOp = 25
+```
+
 ## def VecClass
 
 ```mach
@@ -556,6 +568,15 @@ pub val VCLASS_WIDEN: VecClass = 6
 
 a lane-wise widening binary: both operands share one lane type and the result
 lanes are twice as wide
+
+## val VCLASS_WIDEN_HALF
+
+```mach
+pub val VCLASS_WIDEN_HALF: VecClass = 7
+```
+
+a lane-halving extension: the result has half the operand's lanes, each twice
+as wide, taken from the operand's low or high half
 
 ## def CtClass
 
@@ -728,7 +749,7 @@ pub rec IrOpDescriptor;
 ## val IR_OP_DESCRIPTOR_COUNT
 
 ```mach
-pub val IR_OP_DESCRIPTOR_COUNT: usize = 54
+pub val IR_OP_DESCRIPTOR_COUNT: usize = 56
 ```
 
 ## fun is_known

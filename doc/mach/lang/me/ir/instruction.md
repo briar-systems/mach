@@ -338,6 +338,23 @@ nothing emits either yet
 pub val OP_MUL_HIGH_U: InstrKind = 53
 ```
 
+## val OP_VEC_WIDEN_S
+
+```mach
+pub val OP_VEC_WIDEN_S: InstrKind = 54
+```
+
+half the lanes of an integer vector, each extended to twice its width: the
+fused form of a vector literal whose lanes are the extensions of one source's
+low (operand 1 is 0) or high (operand 1 is the result lane count) lanes,
+formed only where the target packs it (#3738)
+
+## val OP_VEC_WIDEN_U
+
+```mach
+pub val OP_VEC_WIDEN_U: InstrKind = 55
+```
+
 ## val INSTR_FLAG_NSW
 
 ```mach
