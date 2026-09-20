@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- x86-64 inline asm spells the bit-scan family, byte swap, the two- and three-operand multiply and the double shifts: `bsf`, `bsr` and `bswap` on the baseline, `popcnt`, `lzcnt` and `tzcnt` under the new `popcnt`, `lzcnt` and `bmi1` extensions (CPUID leaf 1 ECX bit 23, leaf 0x80000001 ECX bit 5, leaf 7 EBX bit 3), `imul r, r/m` and `imul r, r/m, imm`, and `shld` and `shrd` with an immediate or `cl` count. The scans and counts take a 16-, 32- or 64-bit register from a source of the same width, `bswap` a 32- or 64-bit register, and each row carries its effects: the counts and the double shifts define the flags, a secret `cl` count of a double shift is variable latency as it is for `shl`, and `imul` is the scalar multiply the mul mask gates. Every spelling is byte-exact against gas. The 16-bit registers `r8w` to `r15w` are now spelled too; a two-operand row whose registers name two widths (`add rax, ecx`) is refused instead of assembling the wider form. `doc/language/asm.md` has the section and the extension table (#3724).
+
+### Fixed
+
 ## [5.10.0] - 2026-09-19
 
 ### Changed
