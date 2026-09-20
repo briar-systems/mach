@@ -102,6 +102,8 @@ pub val AOF_MEM_ABS:   u8 = 0x40
 pub rec Operand;
 ```
 
+reg indexes its bank; memory base and index registers are always gp
+
 ## val AF_NONE
 
 ```mach
@@ -246,6 +248,22 @@ pub rec Stmt;
 pub rec Cursor;
 ```
 
+diags and loc: the module's diagnostic store and the block's source location,
+where a refusal of the user's assembly text lands as a located error; a
+cursor over text with no block (a scan, a test) has neither
+
+## fun reject
+
+```mach
+pub fun reject(c: *Cursor, text: str) fail.Fail;
+```
+
+the inline-asm parser rejects the user's text: an error located at the asm
+block on the module's diagnostic store, answered as `reported`, exactly as
+the front-end parser reports. the statement text rides in the message,
+since a body is comment-stripped and interned and no longer maps to source
+offsets of its own
+
 ## def DecodeFn
 
 ```mach
@@ -330,6 +348,18 @@ pub fun op_none() Operand;
 pub fun op_reg(reg: i32, size: u8) Operand;
 ```
 
+## fun op_vreg
+
+```mach
+pub fun op_vreg(reg: i32, size: u8) Operand;
+```
+
+## fun is_vreg
+
+```mach
+pub fun is_vreg(op: *Operand) bool;
+```
+
 ## fun op_imm
 
 ```mach
@@ -410,6 +440,14 @@ pub fun cursor_init(c: *Cursor, g: *Grammar, body: str, alloc: *A.Allocator,
 interner: *intern.Interner, f: *mir.MirFunction, pl: *mir.MirAsm);
 ```
 
+## fun cursor_locate
+
+```mach
+pub fun cursor_locate(c: *Cursor, st: *encode.EncodeState, mi: *mir.MirInstr);
+```
+
+binds the cursor to the block it parses, so a refusal is located there
+
 ## fun claim
 
 ```mach
@@ -450,6 +488,12 @@ pub fun fold_clobbers(g: *Grammar, item: *Item, gp: *u32, fp: *u32);
 
 ```mach
 pub fun clobbers(g: *Grammar, body: str, gp_out: *u32, fp_out: *u32);
+```
+
+## fun writes_sp
+
+```mach
+pub fun writes_sp(g: *Grammar, body: str) bool;
 ```
 
 ## fun returns
@@ -509,7 +553,7 @@ pub fun label_record_def(st: *encode.EncodeState, g: *Grammar, l: *Labels, numbe
 ## fun resolve_local
 
 ```mach
-pub fun resolve_local(st: *encode.EncodeState, g: *Grammar, l: *Labels, patch_pos: u32,
+pub fun resolve_local(st: *encode.EncodeState, c: *Cursor, l: *Labels, patch_pos: u32,
 number: u64, fwd: bool) err[fail.Fail];
 ```
 
@@ -525,10 +569,21 @@ pub fun encode_block(st: *encode.EncodeState, g: *Grammar, f: *mir.MirFunction, 
 pub fun run(st: *encode.EncodeState, g: *Grammar, c: *Cursor, l: *Labels) err[fail.Fail];
 ```
 
+## fun admitted_extensions
+
+```mach
+pub fun admitted_extensions(st: *encode.EncodeState, c: *Cursor) u64;
+```
+
+the extensions an instruction in this body may use: the target's selection,
+and whatever the enclosing #[extensions] function admits beyond it. the body
+is the post-inlining MIR function, so this is the backstop the inliner's
+predicate (the same `extension.admits`) keeps from ever firing
+
 ## fun ct_scan
 
 ```mach
-pub fun ct_scan(g: *Grammar, body: str, secret_names: *str, n_secret: u32,
-trust_mul: bool, trust_shift: bool) err[fail.Fail];
+pub fun ct_scan(g: *Grammar, body: str, secrets: *ct.AsmSecret, n_secret: u32,
+mul: ct.CtMulMask, trust_shift: bool) err[fail.Fail];
 ```
 

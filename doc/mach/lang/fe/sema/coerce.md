@@ -33,7 +33,7 @@ pub rec CoerceResult;
 ## fun out_of_range
 
 ```mach
-pub fun out_of_range(to: type.TypeId, value: u64, negated: bool, bounds: type.IntRange, literal: bool) CoerceResult;
+pub fun out_of_range(to: type.TypeId, value: wide.Wide, negated: bool, bounds: type.IntRange, literal: bool) CoerceResult;
 ```
 
 ## fun try_coerce_literal

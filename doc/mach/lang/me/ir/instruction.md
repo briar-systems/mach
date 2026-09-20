@@ -306,6 +306,38 @@ pub val OP_VEC_INSERT:  InstrKind = 48
 pub val OP_VEC_BUILD:   InstrKind = 49
 ```
 
+## val OP_MUL_WIDE_S
+
+```mach
+pub val OP_MUL_WIDE_S: InstrKind = 50
+```
+
+the full product of two integer vectors of one lane type, in lanes twice as
+wide: the fused form of a lane-wise extension of both operands followed by a
+multiply, formed only where the target packs it
+
+## val OP_MUL_WIDE_U
+
+```mach
+pub val OP_MUL_WIDE_U: InstrKind = 51
+```
+
+## val OP_MUL_HIGH_S
+
+```mach
+pub val OP_MUL_HIGH_S: InstrKind = 52
+```
+
+the high half of the full product of two integers at their own width
+(#3511): claimed ahead of the widening recognition that will form them, so
+nothing emits either yet
+
+## val OP_MUL_HIGH_U
+
+```mach
+pub val OP_MUL_HIGH_U: InstrKind = 53
+```
+
 ## val INSTR_FLAG_NSW
 
 ```mach
@@ -329,6 +361,14 @@ pub val INSTR_FLAG_EXACT:    u16 = 0x04
 ```mach
 pub val INSTR_FLAG_VOLATILE: u16 = 0x08
 ```
+
+## val INSTR_FLAG_BORROWED_ARGS
+
+```mach
+pub val INSTR_FLAG_BORROWED_ARGS: u16 = 0x10
+```
+
+a call whose aggregate arguments may name their sources rather than private copies (#3460)
 
 ## rec Instruction
 

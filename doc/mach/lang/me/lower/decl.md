@@ -6,6 +6,17 @@
 pub fun lower_decl(ctx: *context.LowerContext, did: id.DeclId) err[fail.Fail];
 ```
 
+## fun lower_fwd
+
+```mach
+pub fun lower_fwd(ctx: *context.LowerContext, did: id.DeclId) err[fail.Fail];
+```
+
+a `fwd` in a root-project module puts the re-exported declaration on the
+library's export surface. the object records the linkage name and the link
+exports whichever module defines it, so a re-export reaches a dependency's
+definition without that dependency knowing anything about this library
+
 ## fun lower_fun
 
 ```mach

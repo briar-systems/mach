@@ -102,6 +102,22 @@ pub fun param(index: u32, ty: ir_type.IrTypeId) Value;
 pub fun const_int(bits: u64, ty: ir_type.IrTypeId) Value;
 ```
 
+## fun const_int_wide
+
+```mach
+pub fun const_int_wide(bits: wide.Wide, ty: ir_type.IrTypeId) Value;
+```
+
+a 128-bit integer constant; a narrower type reads its low limb (#3511)
+
+## fun int_of
+
+```mach
+pub fun int_of(v: *Value) wide.Wide;
+```
+
+both limbs of an integer constant
+
 ## fun const_float
 
 ```mach

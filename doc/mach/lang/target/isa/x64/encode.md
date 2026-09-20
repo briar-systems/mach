@@ -19,6 +19,12 @@ out: *writer.Writer) res[enc.EncoderOutput, fail.Fail];
 pub fun asm_returns(body: str) bool;
 ```
 
+## fun asm_writes_sp
+
+```mach
+pub fun asm_writes_sp(body: str) bool;
+```
+
 ## fun asm_clobbers
 
 ```mach
@@ -37,7 +43,7 @@ effect walk read it: the class column of the one description table
 ## val X64_OPCODE_COUNT
 
 ```mach
-pub val X64_OPCODE_COUNT: u32 = 135
+pub val X64_OPCODE_COUNT: u32 = 169
 ```
 
 the machine opcodes a notification can carry: every x64.Opcode except the
@@ -83,7 +89,7 @@ pub fun probed_rows(out: *ProbedRow) u32;
 ## fun asm_ct_scan
 
 ```mach
-pub fun asm_ct_scan(body: str, secret_names: *str, n_secret: u32,
-trust_mul: bool, trust_shift: bool, alloc: *A.Allocator) err[fail.Fail];
+pub fun asm_ct_scan(body: str, secrets: *ct.AsmSecret, n_secret: u32,
+mul: ct.CtMulMask, trust_shift: bool, alloc: *A.Allocator) err[fail.Fail];
 ```
 

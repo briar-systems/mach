@@ -1,5 +1,39 @@
 # mach.cli.args
 
+## def OptionArity
+
+```mach
+pub def OptionArity: u8
+```
+
+whether an option is a bare flag, takes the next argv token, or takes a value
+attached to its own token after `=`
+
+## val ARITY_FLAG
+
+```mach
+pub val ARITY_FLAG: OptionArity = 0
+```
+
+the option stands alone
+
+## val ARITY_VALUE
+
+```mach
+pub val ARITY_VALUE: OptionArity = 1
+```
+
+the option consumes the next argv token as its value
+
+## val ARITY_ATTACHED
+
+```mach
+pub val ARITY_ATTACHED: OptionArity = 2
+```
+
+the option carries an optional value in its own token after `=`; it never
+consumes the next one, so `--emit-ir` and `--emit-ir=listing` both parse
+
 ## rec FlagSpec
 
 ```mach
@@ -9,7 +43,8 @@ pub rec FlagSpec;
 one command-line option as the schema tables declare it
 
 name: the spelling matched against an argv token, such as `--target` or `-o`
-value: help placeholder for the option's value; non-empty means the option takes the next argv token, empty means a bare flag
+value: help placeholder for the option's value; empty for ARITY_FLAG
+arity: how the option takes its value; the ARITY_* constants
 doc: one-line help text; schema_valid rejects an empty one
 default: help text for what applies when the option is absent; empty prints nothing
 repeatable: rendered as `repeatable` by help; parse_invocation records every occurrence either way
@@ -68,7 +103,8 @@ pub val CGEN: [CGEN_N]FlagSpec = [CGEN_N]FlagSpec;
 
 the codegen options `--all-targets`, `--pie`, `--subsystem`, `-g`,
 `--emit-asm`, `--emit-ir`, consumed by build and test; doc parses them with
-every row hidden
+every row hidden. `--emit-ir` is the one attached-value row: bare it writes
+the ir-debug dump, `--emit-ir=<form>` selects a row of printer.IR_FORMS
 
 ## val OPT_N
 
@@ -261,7 +297,7 @@ the `--quiet` and `-q` options accepted by every dep action, through DEP_SCHEMA
 ## val DEP_ADD_N
 
 ```mach
-pub val DEP_ADD_N: usize = 3
+pub val DEP_ADD_N: usize = 5
 ```
 
 row count of DEP_ADD
@@ -272,7 +308,7 @@ row count of DEP_ADD
 pub val DEP_ADD: [DEP_ADD_N]FlagSpec = [DEP_ADD_N]FlagSpec;
 ```
 
-the dep add options `--git <url>`, `--path <dir>`, `--ref <ref>`
+the dep add options `--git <url>`, `--path <dir>`, `--ref <ref>`, `--version <range>`, `--offline`
 
 ## val DEP_REMOVE_N
 
@@ -293,7 +329,7 @@ the `--purge` option, dep remove only
 ## val DEP_UPDATE_N
 
 ```mach
-pub val DEP_UPDATE_N: usize = 1
+pub val DEP_UPDATE_N: usize = 3
 ```
 
 row count of DEP_UPDATE
@@ -304,7 +340,39 @@ row count of DEP_UPDATE
 pub val DEP_UPDATE: [DEP_UPDATE_N]FlagSpec = [DEP_UPDATE_N]FlagSpec;
 ```
 
-the `--all` option, dep update only
+the dep update options `--all`, `--lowest`, `--offline`
+
+## val DEP_OUTDATED_N
+
+```mach
+pub val DEP_OUTDATED_N: usize = 1
+```
+
+row count of DEP_OUTDATED
+
+## val DEP_VERIFY_N
+
+```mach
+pub val DEP_VERIFY_N: usize = 1
+```
+
+row count of DEP_VERIFY
+
+## val DEP_VERIFY
+
+```mach
+pub val DEP_VERIFY: [DEP_VERIFY_N]FlagSpec = [DEP_VERIFY_N]FlagSpec;
+```
+
+the `--release` option of dep verify
+
+## val DEP_OUTDATED
+
+```mach
+pub val DEP_OUTDATED: [DEP_OUTDATED_N]FlagSpec = [DEP_OUTDATED_N]FlagSpec;
+```
+
+the `--offline` option of dep outdated
 
 ## fun flag_in_table
 
@@ -318,30 +386,6 @@ tok: an argv token; nil is never in a table
 table: first row of the FlagSpec table
 n: row count of table
 ret: true when a row's name equals tok
-
-## def OptionArity
-
-```mach
-pub def OptionArity: u8
-```
-
-whether an option is a bare flag or takes a value
-
-## val ARITY_FLAG
-
-```mach
-pub val ARITY_FLAG: OptionArity = 0
-```
-
-the option stands alone
-
-## val ARITY_VALUE
-
-```mach
-pub val ARITY_VALUE: OptionArity = 1
-```
-
-the option consumes the next argv token as its value
 
 ## def SemanticKey
 
@@ -522,10 +566,18 @@ pub val DEPACT_VERIFY: DepAction = 5
 
 `mach dep verify`
 
+## val DEPACT_OUTDATED
+
+```mach
+pub val DEPACT_OUTDATED: DepAction = 6
+```
+
+`mach dep outdated`
+
 ## val DEPACT_N
 
 ```mach
-pub val DEPACT_N: usize = 6
+pub val DEPACT_N: usize = 7
 ```
 
 number of dep actions, the length of DEP_ACTIONS
@@ -798,10 +850,42 @@ pub val DEP_UPDATE_SCHEMA: [DEP_UPDATE_SCHEMA_N]TableRef = [DEP_UPDATE_SCHEMA_N]
 
 the option tables specific to dep update: DEP_UPDATE
 
+## val DEP_VERIFY_SCHEMA_N
+
+```mach
+pub val DEP_VERIFY_SCHEMA_N: usize = 1
+```
+
+length of DEP_VERIFY_SCHEMA
+
+## val DEP_VERIFY_SCHEMA
+
+```mach
+pub val DEP_VERIFY_SCHEMA: [DEP_VERIFY_SCHEMA_N]TableRef = [DEP_VERIFY_SCHEMA_N]TableRef;
+```
+
+the option tables specific to dep verify: DEP_VERIFY
+
+## val DEP_OUTDATED_SCHEMA_N
+
+```mach
+pub val DEP_OUTDATED_SCHEMA_N: usize = 1
+```
+
+length of DEP_OUTDATED_SCHEMA
+
+## val DEP_OUTDATED_SCHEMA
+
+```mach
+pub val DEP_OUTDATED_SCHEMA: [DEP_OUTDATED_SCHEMA_N]TableRef = [DEP_OUTDATED_SCHEMA_N]TableRef;
+```
+
+the option tables specific to dep outdated: DEP_OUTDATED
+
 ## val DEP_ADD_CONSTRAINT_N
 
 ```mach
-pub val DEP_ADD_CONSTRAINT_N: usize = 2
+pub val DEP_ADD_CONSTRAINT_N: usize = 3
 ```
 
 length of DEP_ADD_CONSTRAINT
@@ -856,7 +940,7 @@ example_n: length of examples
 pub val DEP_ACTIONS: [DEPACT_N]DepActionSpec = [DEPACT_N]DepActionSpec;
 ```
 
-the six dep action records: list, add, remove, update, pull, verify.
+the seven dep action records: list, add, remove, update, outdated, pull, verify.
 Indexed by search, not by DepAction
 
 ## val BUILD_CONSTRAINT_N
@@ -1040,8 +1124,9 @@ pub rec SchemaHit;
 the result of looking one argv token up in a schema
 
 found: the token names an option of the schema
-arity: ARITY_VALUE when the row has a value placeholder, else ARITY_FLAG; ARITY_FLAG when not found
+arity: the matched row's arity; ARITY_FLAG when not found
 key: the row's SemanticKey; 0 when not found
+value_off: byte offset of the attached value inside the token; 0 when the token carried none
 
 ## fun schema_lookup
 
@@ -1067,8 +1152,9 @@ one recognized option in argv
 
 key: the row's SemanticKey
 idx: argv index of the option token
-has_value: a value token followed within the scanned range
+has_value: a value token followed within the scanned range, or an ARITY_ATTACHED option carried one after `=`
 value_idx: argv index of the value token, or idx when has_value is false
+value_off: byte offset of the value inside argv[value_idx]; non-zero only for an ARITY_ATTACHED option
 
 ## rec ParsedInvocation
 

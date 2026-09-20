@@ -618,3 +618,9 @@ pub val FMV:    Opcode = 16
 pub val MULHU:  Opcode = 17
 ```
 
+## val MULH
+
+```mach
+pub val MULH:   Opcode = 18
+```
+

@@ -1766,7 +1766,7 @@ pub fun admits(op: MachOp, xlen_bytes: u8) bool;
 ## fun required_extensions
 
 ```mach
-pub fun required_extensions(op: MachOp) u32;
+pub fun required_extensions(op: MachOp) u64;
 ```
 
 the selection bits an opcode needs; 0 only for an opcode outside the catalog

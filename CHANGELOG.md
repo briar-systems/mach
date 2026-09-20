@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- The committed API reference under `doc/mach` is regenerated from the current source: 146 pages were behind it or missing (the linker submodules, the manifest, the wide-arithmetic passes, the output layer, the macho writer, the driver resolver), and three pages documented the removed `publication` module. The docs job in CI now generates the reference from the fixpoint compiler and fails when it differs from the committed tree, so the drift cannot return (#3458).
 - A `use` whose path names no module no longer ends the module's load. The load walk returned the refusal as a failure at the first such `use`, so an editor session with one unresolved import (a dependency not yet pulled, a path mid-edit) lost every symbol of the module and the language server answered nothing for it, and a build reported only the first bad import. The walk now reports the `use` with the loader's remedy, marks it unbound, and goes on: the rest of the module binds and resolves, the resolver treats the alias as a refused name so a reference to it says nothing more, and the module's load standing carries the rejection, which the build refuses at the frontend as before and the analysis entry points and the editor carry on their products. A rejected walk is a rejected retention round, so the last accepted build's holdings stay as they did for a failed one (#3722).
 
 ## [5.10.0] - 2026-09-19

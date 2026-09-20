@@ -192,6 +192,16 @@ pub def VaModelFn:    abi.VaModelFn
 pub val WORD: u32 = 8
 ```
 
+## val DOUBLE_WORD
+
+```mach
+pub val DOUBLE_WORD: u64 = 16
+```
+
+a 16-byte integer scalar: C.10 rounds NGRN up to even and passes it in the
+next two registers, else C.11 sets NGRN to 8 and it goes to the stack at its
+natural 16-byte alignment (#3511)
+
 ## fun gp_param_reg
 
 ```mach

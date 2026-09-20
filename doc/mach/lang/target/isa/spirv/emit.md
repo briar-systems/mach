@@ -4,6 +4,6 @@
 
 ```mach
 pub fun emit_module(out_alloc: *A.Allocator, tgt: *isa.BackendTarget, u: *unit.Unit,
-out_bytes: **u8, out_len: *u32) err[fail.Fail];
+dbg: *debug_input.ModuleDebug, out_bytes: **u8, out_len: *u32) err[fail.Fail];
 ```
 
