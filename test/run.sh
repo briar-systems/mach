@@ -137,6 +137,10 @@ passes=0
 skips=0
 noruns=0
 fail() { echo "FAIL $*"; fails=$((fails + 1)); }
+# unrun <target>: a failed case on a target with a differential never reached it,
+# so the summary says how many behaviour checks did not execute
+unruns=0
+unrun() { [ "$(engine "$1")" = - ] || unruns=$((unruns + 1)); }
 
 # target_field <target> <column>
 target_field() { printf '%s\n' "$targets_all" | awk -v t="$1" -v c="$2" '$1 == t { print $c }'; }
@@ -455,18 +459,21 @@ run_case() {
 
     # release build, decoded and diffed against the golden
     if ! build "$t" o2 "$c"; then
-        fail "$t $c build o2: $(first_error "$out/log/$t.o2.$(art "$c").log")"; return
+        fail "$t $c build o2: $(first_error "$out/log/$t.o2.$(art "$c").log")"; unrun "$t"; return
     fi
     o=$(object "$t" o2 "$c")
-    [ -f "$o" ] || { fail "$t $c o2: no object at $o"; return; }
+    [ -f "$o" ] || { fail "$t $c o2: no object at $o"; unrun "$t"; return; }
     if [ "$fmt" = spv ]; then
         if ! spirv-val "$o" >"$out/log/$t.val.$(art "$c").log" 2>&1; then
-            fail "$t $c spirv-val: $(head -n1 "$out/log/$t.val.$(art "$c").log")"; return
+            fail "$t $c spirv-val: $(head -n1 "$out/log/$t.val.$(art "$c").log")"; unrun "$t"; return
         fi
     fi
     golden=$here/golden/$t/$c.dis
     dis=$out/log/$t.$(art "$c").dis
-    disassemble "$t" "$c" "$o" >"$dis" || { fail "$t $c disassemble"; return; }
+    disassemble "$t" "$c" "$o" >"$dis" || { fail "$t $c disassemble"; unrun "$t"; return; }
+    # a golden verdict is held, not returned on: the differential below is the
+    # stronger fact and runs whatever the golden says, so one run reports both
+    golden_why=
     if [ "$bless" -eq 1 ]; then
         mkdir -p "$(dirname "$golden")"
         if [ ! -f "$golden" ] || ! cmp -s "$golden" "$dis"; then
@@ -475,9 +482,9 @@ run_case() {
             echo "BLESS $t $c"
         fi
     elif [ ! -f "$golden" ]; then
-        fail "$t $c golden: none at ${golden#"$here"/}; run --bless"; return
+        golden_why="golden: none at ${golden#"$here"/}; run --bless"
     elif ! cmp -s "$golden" "$dis"; then
-        fail "$t $c golden: $(diff "$golden" "$dis" | head -n1 | sed 's/^/line /')"; return
+        golden_why="golden: $(diff "$golden" "$dis" | head -n1 | sed 's/^/line /')"
     fi
 
     # the differential: mach at O0 and O2 against the C reference. a norun case
@@ -487,14 +494,20 @@ run_case() {
         differential "$t" "$c" "$eng"; verdict=$?
         if [ "$verdict" -eq 0 ]; then
             if norun "$t" "$c"; then fail "$t $c agrees with the C reference: its golden/$t/NORUN line is stale"; return; fi
+            [ -z "$golden_why" ] || { fail "$t $c $golden_why (differential agrees with the C reference)"; return; }
         elif [ "$verdict" -eq 2 ]; then
+            [ -z "$golden_why" ] || { fail "$t $c $golden_why (differential not run: $why)"; return; }
             echo "NORUN $t $c: $why"
             skips=$((skips + 1)); return
         elif norun "$t" "$c"; then
+            [ -z "$golden_why" ] || { fail "$t $c $golden_why (differential disagrees as its NORUN line claims)"; return; }
             noruns=$((noruns + 1))
         else
-            fail "$t $c $why"; return
+            case $why in build\ *) unrun "$t" ;; esac
+            fail "$t $c ${golden_why:+$golden_why; }$why"; return
         fi
+    elif [ -n "$golden_why" ]; then
+        fail "$t $c $golden_why"; return
     fi
 
     # the -g build through the external verifier for its debug model
@@ -954,5 +967,6 @@ if [ "$mode" = docs ]; then
     echo "docs: $total blocks, $compiled compiled ($ran run), $errors error, $fragments fragment"
 fi
 
-echo "run.sh: $passes pass, $fails fail, $skips skip"
+tail=; [ "$unruns" -eq 0 ] || tail=", $unruns differential not run"
+echo "run.sh: $passes pass, $fails fail, $skips skip$tail"
 [ "$fails" -eq 0 ]

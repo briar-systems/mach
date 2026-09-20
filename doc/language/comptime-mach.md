@@ -97,7 +97,7 @@ each one implies (see
 
 The names are the selected isa's vocabulary and nothing else:
 
-- `x86_64`: `ssse3`, `sse41`, `sha`, `fsgsbase`;
+- `x86_64`: `ssse3`, `sse41`, `sha`, `fsgsbase`, `popcnt`, `lzcnt`, `bmi1`;
 - `aarch64`: `sha2`;
 - `riscv64` and `riscv32`: `i`, `m`, `a`, `f`, `d`, `c`, `zicsr`, `zifencei`, `zkt`.
 
