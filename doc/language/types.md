@@ -116,7 +116,12 @@ compute identical lanes — the expansion is a fixed unroll, never a reassociati
 cannot afford them.
 
 A target that gains wider vector registers therefore gets **better code**, not
-new spellings.
+new spellings. Until then a shape wider than the register is the second answer:
+`f32x8` and `i32x8` compile on x86-64, where the vector register is 128 bits, as
+one scalar operation per lane through a stack slot, eight for one `+`; the build
+note under `simd = "scalarize"` counts these sites and `simd = "require"` refuses
+them. A kernel written for the 128-bit seed uses the register-width shapes (`f32x4`,
+`i32x4`, `i16x8`) and takes the wider ones only where the cost is accepted.
 
 `ptr` is not a lane element: its width is target-defined rather than a scalar bit
 count, so `ptrx2` is not a vector spelling.
@@ -162,6 +167,23 @@ An uninitialized vector local default-initializes to all-zero lanes:
 ```mach
 var z: i32x4;                   # every lane is 0
 ```
+
+A literal is for a constant or for lanes assembled from unrelated scalars. It is
+not how a vector is loaded from memory: `f32x4{p[i], p[i + 1], p[i + 2], p[i + 3]}`
+is four scalar loads, four lane stores into a stack slot and a vector load of the
+slot. **A window onto an array is a pointer reinterpret**, and the store is the same
+cast on the destination pointer:
+
+```mach fragment
+val a: f32x4 = @((?A[i]):~*f32x4);      # lanes A[i] .. A[i + 3]
+@((?out[i]):~*f32x4) = a * a;           # store four lanes at out[i]
+```
+
+This lowers to one unaligned vector load or store (`movups` on x86-64), so any
+element offset is valid; nothing requires `i` to be a multiple of the lane count.
+The reinterpret reads bytes, so the pointer's element type and the vector's lane
+type must agree in size and meaning: `(?A[i]):~*f32x4` over a `*f32` is the four
+floats at `i`, over a `*i32` it is their bits.
 
 **Lane access** `v[i]` reads or writes a single lane. The index must be a
 comptime constant in `[0, lanes)`; a dynamic (runtime) lane index is not
