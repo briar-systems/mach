@@ -251,8 +251,8 @@ Integer `*` is where this is most visible today:
 |---|---|---|---|
 | `i8x16 * i8x16` | scalar expansion | packed `mul .16b` | scalar expansion |
 | `i16x8 * i16x8` | packed `pmullw` | packed `mul .8h` | scalar expansion |
-| `i32x4 * i32x4` | scalar expansion (`pmulld` is SSE4.1) | packed `mul .4s` | scalar expansion |
-| `i64x2 * i64x2` | scalar expansion | scalar expansion (NEON has no `.2d` multiply) | scalar expansion |
+| `i32x4 * i32x4` | packed `pmuludq` pair (`pmulld` under `sse41`) | packed `mul .4s` | scalar expansion |
+| `i64x2 * i64x2` | packed `pmuludq` triple | scalar expansion (NEON has no `.2d` multiply) | scalar expansion |
 
 Operators never widen implicitly, so a widening multiply is spelled as two lane
 casts and a multiply: `a::i32x4 * b::i32x4` for `a, b: i16x4`. When both operands
