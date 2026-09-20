@@ -127,6 +127,11 @@ fun main(argc: i64, argv: **u8) i64 {
   counterexample: it splices its body once per element of a fixed comptime
   sequence (a variadic pack, `$fields(T)`, or a constant array `val`), a bounded
   structural expansion resolved at compile time, not an iterated computation.
+- No compile-time evaluation of user functions, ever: a call in a `val`
+  initializer is a runtime call. A lookup table is committed as generator
+  output next to its generator and held to it by a `test`, or built at
+  startup into a module-private `var`; a module-scope `val` lands in
+  read-only data.
 - No bare `$ident` — see above.
 
 ## See also
