@@ -1,4 +1,5 @@
 use mach.lang.fail;
+use std.allocator.page;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -6,10 +7,14 @@ use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
 
 use A: std.allocator;
 
+use mach.lang.intern;
 use mach.lang.me.ir;
+use mach.lang.me.ir.builder;
 use mach.lang.me.ir.id;
 use mach.lang.me.ir.instruction;
 use mach.lang.me.ir.mutate;
@@ -19,6 +24,7 @@ use mach.lang.me.ir.value;
 use mach.lang.me.scratch;
 use mach.lang.me.vecform;
 use mach.lang.target;
+use target_testing: mach.lang.target.testing;
 use mach.lang.wide;
 
 # rewrites a vector literal whose lanes are the same-kind extensions of one
@@ -195,10 +201,10 @@ fun single_user(fn: *ir.Function, sc: *Scan, iid: id.InstructionId, blk: u32) op
     ret opt[id.InstructionId].none{};
 }
 
-# the extension kind, source vector and lane index a stored lane value is,
-# absent for any other value
+# the extension and the extracted source lane behind one stored lane value;
+# `idx_ty` is the index constant's type, which the widen's base reuses
 fun lane_source(m: *ir.Module, fn: *ir.Function, sc: *Scan, v: *value.Value,
-    ext: *instruction.InstrKind, src: *value.Value, lane: *u64) bool {
+    ext: *instruction.InstrKind, src: *value.Value, lane: *u64, idx_ty: *ir_type.IrTypeId) bool {
     val eo: opt[*instruction.Instruction] = instr_of(fn, v, sc);
     if (sel eo.none) { ret false; }
     val e: *instruction.Instruction = eo.some;
@@ -211,9 +217,10 @@ fun lane_source(m: *ir.Module, fn: *ir.Function, sc: *Scan, v: *value.Value,
     if (x.operands[1].kind != value.VAL_CONST_INT)                     { ret false; }
     val lw: wide.Wide = value.int_of(?x.operands[1]);
     if (!wide.eq(lw, wide.from_u64(x.operands[1].data.int_lit)))       { ret false; }
-    @ext  = e.kind;
-    @src  = x.operands[0];
-    @lane = x.operands[1].data.int_lit;
+    @ext    = e.kind;
+    @src    = x.operands[0];
+    @lane   = x.operands[1].data.int_lit;
+    @idx_ty = x.operands[1].ty;
     ret true;
 }
 
@@ -248,6 +255,7 @@ fun fuse_slot(w: *Work, sc: *Scan, slot_id: id.InstructionId) res[bool, fail.Fai
     var last_store: u32 = 0;
     var ext:  instruction.InstrKind = instruction.OP_UNREACHABLE;
     var src:  value.Value;
+    var idx_ty: ir_type.IrTypeId = ir_type.IRT_NIL;
     var base: u64 = 0;
     var have_src: bool = false;
     val b:  *ir.Block = ?fn.blocks[blk];
@@ -280,10 +288,12 @@ fun fuse_slot(w: *Work, sc: *Scan, slot_id: id.InstructionId) res[bool, fail.Fai
                 var e:  instruction.InstrKind = instruction.OP_UNREACHABLE;
                 var s:  value.Value;
                 var ln: u64 = 0;
-                if (!lane_source(m, fn, sc, ?st.operands[0], ?e, ?s, ?ln)) { ret res[bool, fail.Fail].ok{false}; }
+                var it: ir_type.IrTypeId = ir_type.IRT_NIL;
+                if (!lane_source(m, fn, sc, ?st.operands[0], ?e, ?s, ?ln, ?it)) { ret res[bool, fail.Fail].ok{false}; }
                 if (!have_src) {
                     ext      = e;
                     src      = s;
+                    idx_ty   = it;
                     have_src = true;
                     if (ln < lane_w)  { ret res[bool, fail.Fail].ok{false}; }
                     base = ln - lane_w;
@@ -319,7 +329,7 @@ fun fuse_slot(w: *Work, sc: *Scan, slot_id: id.InstructionId) res[bool, fail.Fai
     val arr: res[ir.OperandArray, fail.Fail] = ir.operands_alloc(m, 2);
     if (sel arr.err) { ret res[bool, fail.Fail].err{arr.err}; }
     arr.ok.ops[0] = src;
-    arr.ok.ops[1] = value.const_int(base, src.ty);
+    arr.ok.ops[1] = value.const_int(base, idx_ty);
     val load: *instruction.Instruction = ?fn.instrs[load_id::u32];
     ir.instr_replace_operands(m, load, arr.ok);
     load.kind   = kind.some;
@@ -332,4 +342,185 @@ fun fuse_slot(w: *Work, sc: *Scan, slot_id: id.InstructionId) res[bool, fail.Fai
         k = k + 1;
     }
     ret res[bool, fail.Fail].ok{true};
+}
+
+# the knobs a literal fixture can be turned away from the recognized shape by
+val T_CLEAN:      u32 = 0;
+val T_PERMUTED:   u32 = 1;
+val T_MIXED_SRC:  u32 = 2;
+val T_SCALAR:     u32 = 3;
+val T_EXTRA_LOAD: u32 = 4;
+val T_MIXED_EXT:  u32 = 5;
+
+rec TCase {
+    alloc: A.Allocator;
+    reg:   target.TargetRegistry;
+    m:     ir.Module;
+    load:  id.InstructionId;
+    wide:  ir_type.IrTypeId;
+}
+
+# a function whose body is the lane-by-lane literal `{ext(p0[base+0]), ..,
+# ext(p0[base+lanes-1])}` over a `bits`-bit source vector of `2*lanes` lanes,
+# as the front end lowers it: a slot, one gep and store per lane, one load
+fun t_case(c: *TCase, ext: instruction.InstrKind, bits: u32, lanes: u32, base: u64, knob: u32) bool {
+    val rm: res[ir.Module, fail.Fail] = ir.init(?c.alloc, intern.STR_NIL);
+    if (sel rm.err) { ret false; }
+    c.m = rm.ok;
+    val en: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?c.m.types, bits);
+    val ew: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?c.m.types, bits * 2);
+    val ix: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?c.m.types, 64);
+    if (sel en.err) { ret false; }
+    if (sel ew.err) { ret false; }
+    if (sel ix.err) { ret false; }
+    val vn: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_vector(?c.m.types, en.ok, lanes * 2);
+    val vw: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_vector(?c.m.types, ew.ok, lanes);
+    if (sel vn.err) { ret false; }
+    if (sel vw.err) { ret false; }
+    c.wide = vw.ok;
+    val rf: res[u32, fail.Fail] = ir.function_add(?c.m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) { ret false; }
+    var bld: builder.Builder = builder.init(?c.m);
+    builder.set_function(?bld, ?c.m.functions[rf.ok]);
+    val rb: res[id.BlockId, fail.Fail] = builder.new_block(?bld);
+    if (sel rb.err) { ret false; }
+    builder.set_block(?bld, rb.ok);
+    val p0:   value.Value = value.param(0, vn.ok);
+    val p1:   value.Value = value.param(1, vn.ok);
+    val p2:   value.Value = value.param(2, en.ok);
+    val slot: res[value.Value, fail.Fail] = builder.emit_alloca(?bld, vw.ok, value.const_int(1, ix.ok));
+    if (sel slot.err) { ret false; }
+    var k: u32 = 0;
+    for (k < lanes) {
+        var src_lane: u64 = base + k::u64;
+        if (knob == T_PERMUTED && k == 0) { src_lane = base + 1; }
+        if (knob == T_PERMUTED && k == 1) { src_lane = base; }
+        var src: value.Value = p0;
+        if (knob == T_MIXED_SRC && k == lanes - 1) { src = p1; }
+        var x: res[value.Value, fail.Fail] = builder.emit_vec_extract(?bld, src, value.const_int(src_lane, ix.ok), en.ok);
+        if (sel x.err) { ret false; }
+        var lane_v: value.Value = x.ok;
+        if (knob == T_SCALAR && k == lanes - 1) { lane_v = p2; }
+        var e: instruction.InstrKind = ext;
+        if (knob == T_MIXED_EXT && k == lanes - 1) {
+            e = instruction.OP_ZEXT;
+            if (ext == instruction.OP_ZEXT) { e = instruction.OP_SEXT; }
+        }
+        var xt: res[value.Value, fail.Fail] = builder.emit_sext(?bld, lane_v, ew.ok);
+        if (e == instruction.OP_ZEXT) { xt = builder.emit_zext(?bld, lane_v, ew.ok); }
+        if (sel xt.err) { ret false; }
+        var idx: [2]value.Value;
+        idx[0] = value.const_int(0, ix.ok);
+        idx[1] = value.const_int(k::u64, ix.ok);
+        val g: res[value.Value, fail.Fail] = builder.emit_gep(?bld, slot.ok, vw.ok, ?idx[0], 2);
+        if (sel g.err) { ret false; }
+        val st: err[fail.Fail] = builder.emit_store(?bld, xt.ok, g.ok);
+        if (sel st.err) { ret false; }
+        k = k + 1;
+    }
+    if (knob == T_EXTRA_LOAD) {
+        val extra: res[value.Value, fail.Fail] = builder.emit_load(?bld, slot.ok, vw.ok);
+        if (sel extra.err) { ret false; }
+    }
+    val ld: res[value.Value, fail.Fail] = builder.emit_load(?bld, slot.ok, vw.ok);
+    if (sel ld.err) { ret false; }
+    c.load = ld.ok.data.instr;
+    ret true;
+}
+
+fun t_target(reg: *target.TargetRegistry, isa_name: str, out: *target.Target) bool {
+    var abi: str = "sysv64";
+    if (str_equals(isa_name, "aarch64")) { abi = "aapcs64"; }
+    if (str_equals(isa_name, "riscv64")) { abi = "lp64d"; }
+    val rt: res[target.Target, fail.Fail] = target.select_of(reg, isa_name, "linux", abi, "");
+    if (sel rt.err) { ret false; }
+    @out = rt.ok;
+    ret true;
+}
+
+# the kind the whole load has after the pass: the widen op when the literal
+# fused, `OP_LOAD` when it was left alone, 255 when the case cannot be built
+fun t_fused(isa_name: str, ext: instruction.InstrKind, bits: u32, lanes: u32, base: u64, knob: u32) instruction.InstrKind {
+    var c:    TCase;
+    val made: err[A.Error] = page.make(?c.alloc);
+    if (sel made.err) { ret 255; }
+    c.reg = target.registry_init();
+    fin { target.registry_dnit(?c.reg); }
+    val registered: err[fail.Fail] = target.register_all(?c.reg, target_testing.debug_descriptor);
+    if (sel registered.err) { ret 255; }
+    var tgt: target.Target;
+    if (!t_target(?c.reg, isa_name, ?tgt))        { ret 255; }
+    if (!t_case(?c, ext, bits, lanes, base, knob)) { ret 255; }
+    fin { ir.dnit(?c.m); }
+    var ws: scratch.Workspace;
+    val init: err[fail.Fail] = scratch.init(?ws);
+    if (sel init.err) { ret 255; }
+    fin { scratch.dnit(?ws); }
+    val ran: res[bool, fail.Fail] = run(?c.m, ?tgt, ?ws);
+    if (sel ran.err) { ret 255; }
+    val fn:   *ir.Function            = ?c.m.functions[0];
+    val load: *instruction.Instruction = ?fn.instrs[c.load::u32];
+    if (ran.ok != (load.kind != instruction.OP_LOAD)) { ret 254; }
+    if (load.kind == instruction.OP_LOAD) {
+        # the untouched literal keeps its slot and every lane store
+        var stores: u32 = 0;
+        var ii: u32 = 0;
+        for (ii < fn.blocks[0].instr_count) {
+            if (fn.instrs[fn.blocks[0].instructions[ii]::u32].kind == instruction.OP_STORE) { stores = stores + 1; }
+            ii = ii + 1;
+        }
+        if (stores != lanes) { ret 252; }
+        ret load.kind;
+    }
+    # the widen reads the unextended source and the half it takes, typed as the
+    # literal's vector, and the slot with its stores is gone
+    if (load.operand_count != 2 || load.ty != c.wide)                                   { ret 253; }
+    if (load.operands[0].kind != value.VAL_PARAM || load.operands[0].data.param_ix != 0) { ret 253; }
+    if (load.operands[1].kind != value.VAL_CONST_INT || load.operands[1].data.int_lit != base) { ret 253; }
+    var ii: u32 = 0;
+    for (ii < fn.blocks[0].instr_count) {
+        val k: instruction.InstrKind = fn.instrs[fn.blocks[0].instructions[ii]::u32].kind;
+        if (k == instruction.OP_ALLOCA || k == instruction.OP_STORE || k == instruction.OP_GEP) { ret 251; }
+        ii = ii + 1;
+    }
+    ret load.kind;
+}
+
+test "mach.lang.me.pass.vecwiden.run:fuses_the_halves_the_catalog_packs" {
+    val sx: instruction.InstrKind = instruction.OP_SEXT;
+    val zx: instruction.InstrKind = instruction.OP_ZEXT;
+    val ld: instruction.InstrKind = instruction.OP_LOAD;
+    val ws: instruction.InstrKind = instruction.OP_VEC_WIDEN_S;
+    val wu: instruction.InstrKind = instruction.OP_VEC_WIDEN_U;
+
+    if (t_fused("x86_64", sx, 8, 8, 0, T_CLEAN) != ws)   { ret 1; }
+    if (t_fused("x86_64", sx, 8, 8, 8, T_CLEAN) != ws)   { ret 2; }
+    if (t_fused("x86_64", zx, 8, 8, 0, T_CLEAN) != wu)   { ret 3; }
+    if (t_fused("x86_64", zx, 8, 8, 8, T_CLEAN) != wu)   { ret 4; }
+    if (t_fused("x86_64", sx, 16, 4, 0, T_CLEAN) != ws)  { ret 5; }
+    if (t_fused("x86_64", zx, 16, 4, 4, T_CLEAN) != wu)  { ret 6; }
+    if (t_fused("x86_64", sx, 32, 2, 2, T_CLEAN) != ws)  { ret 7; }
+    if (t_fused("x86_64", zx, 32, 2, 0, T_CLEAN) != wu)  { ret 8; }
+
+    # a target without a packed row keeps the lane path
+    if (t_fused("riscv64", sx, 16, 4, 0, T_CLEAN) != ld) { ret 9; }
+    ret 0;
+}
+
+test "mach.lang.me.pass.vecwiden.run:leaves_every_other_literal_alone" {
+    val sx: instruction.InstrKind = instruction.OP_SEXT;
+    val ld: instruction.InstrKind = instruction.OP_LOAD;
+
+    # lanes out of order, a lane from another vector, a lane that is not an
+    # extracted lane, a second reader of the slot, and extensions of mixed sign
+    if (t_fused("x86_64", sx, 16, 4, 0, T_PERMUTED) != ld)   { ret 1; }
+    if (t_fused("x86_64", sx, 16, 4, 0, T_MIXED_SRC) != ld)  { ret 2; }
+    if (t_fused("x86_64", sx, 16, 4, 0, T_SCALAR) != ld)     { ret 3; }
+    if (t_fused("x86_64", sx, 16, 4, 0, T_EXTRA_LOAD) != ld) { ret 4; }
+    if (t_fused("x86_64", sx, 16, 4, 0, T_MIXED_EXT) != ld)  { ret 5; }
+
+    # consecutive lanes that straddle the halves are not a half
+    if (t_fused("x86_64", sx, 16, 4, 2, T_CLEAN) != ld)      { ret 6; }
+    if (t_fused("x86_64", sx, 16, 4, 1, T_CLEAN) != ld)      { ret 7; }
+    ret 0;
 }
