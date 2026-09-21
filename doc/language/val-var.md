@@ -89,7 +89,10 @@ ext var errno: i32;                        # imported mutable datum
   for [`ext fun`](ext-fun.md).
 - On a dynamic target the reference is emitted GOT-indirect so the loader binds
   it to the runtime definition. ELF uses a dynamic pointer relocation,
-  `GLOB_DAT` on x86-64 and ARM64 or `R_RISCV_64` on RV64. An ordinary
+  `GLOB_DAT` on x86-64 and ARM64 or `R_RISCV_64` on RV64; Mach-O binds the
+  `__GOT` slot through dyld, and on arm64 the object carries the reference as
+  the `GOT_LOAD_PAGE21`/`GOT_LOAD_PAGEOFF12` pair. A cell another object of the
+  same image defines is reached through a linker-owned slot instead. An ordinary
   cross-module reference to a `val`/`var` defined elsewhere in the same artifact
   stays directly addressed. Executed dynamic-import resolution is proven on the
   native ELF legs.
