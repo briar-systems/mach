@@ -223,6 +223,15 @@ pub fun codegen_reusable(p: *project.Project, mid: session.ModuleId) res[bool, f
 pub fun test_build(p: *project.Project) bool;
 ```
 
+## fun shared_artifact_build
+
+```mach
+pub fun shared_artifact_build(p: *project.Project) bool;
+```
+
+the artifact this build links is a shared library. a test build of the same
+project links an executable, so the export surface is not at stake there
+
 ## fun debug_info_of
 
 ```mach
