@@ -291,6 +291,18 @@ property the extension declares (Zkt's data-independent timing, which the
 constant-time multiply rows read) is taken as given. It never means a mode is on. A
 row such as a `dit` would admit `msr dit`, not set it.
 
+The `extensions` list is the manifest's only lever over the constant-time multiply,
+and only on riscv64, where `zkt` is what admits a secret `*`. There is no key that
+declares or overrides a timing mode. On aarch64 the condition is PSTATE.DIT, which
+the operating system declares it guarantees (linux and darwin) and the linked
+program's start code turns on for a binary that needs it; a manifest cannot assert
+it for an OS that declares nothing. On x86-64 the multiply rows hold unconditionally
+on Intel and AMD, so nothing is there to declare, and Intel's DOITM is a kernel-owned
+model-specific register that hardens memory-side predictors rather than the
+multiplier, so mach offers no key for it either. The rows, their conditions and
+the DOITM note are in
+[secrecy.md](secrecy.md#constant-time-multiply-by-instruction-set).
+
 Some rows are the target's alone. On riscv `i` is the baseline, `c` is a code-size
 selection mach never emits, and `f` and `d` select the float register file and the
 calling convention's float registers, and `zkt` is a promise about the machine's
