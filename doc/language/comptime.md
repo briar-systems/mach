@@ -54,8 +54,9 @@ the path. See
 `$bin.name` is the table key of the artifact the module is compiled for. A build
 compiles one artifact, so every module reads that artifact's key. An editor
 session analyzes the project as the union of every artifact, and there a module
-reads the artifact whose entry reached it first: the primary artifact's when the
-primary reaches it, otherwise the first artifact in manifest order that does.
+reads the artifact whose walk reached it first: the primary artifact when its
+walk reaches the module, otherwise the first artifact in manifest order that
+does; a module first reached behind a gate decided later reads its importer's.
 
 ```mach fragment
 val ver: str = $project.version;                 # "2.0.0", from [project].version
