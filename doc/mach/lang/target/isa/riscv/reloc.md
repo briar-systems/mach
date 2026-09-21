@@ -22,6 +22,20 @@ target: rel.RelocTarget, addend: i64, patch_va: u64,
 image_base: u64) res[bool, rel.RelocError];
 ```
 
+## fun jal20_ok
+
+```mach
+pub fun jal20_ok(delta: i64) bool;
+```
+
+## fun set_jal20
+
+```mach
+pub fun set_jal20(word: u32, delta: i64) u32;
+```
+
+the j-type immediate: imm[20] at 31, imm[10:1] at 30:21, imm[11] at 20, imm[19:12] at 19:12
+
 ## fun resolve_riscv_pcrel_pairs
 
 ```mach
