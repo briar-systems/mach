@@ -74,9 +74,13 @@ fwd other.module;       # exported: that module's whole public surface
 A `fwd` of a module exports that module's whole public surface, following its
 own `fwd`s in turn. A `fwd` of a generic, comptime-parameter or pack
 declaration exports nothing, because such a declaration has instances rather
-than one definition and each consumer instantiates its own; a `fwd` of a type
-or of an `ext` import exports nothing either, since neither defines a symbol in
-the image.
+than one definition and each consumer instantiates its own. A shared library
+build warns at such a `fwd`, naming the declaration; the way to export one
+instantiation is a `pub` non-generic wrapper around it. A `fwd` of a module
+that holds generics warns for none of them, since it asked for the module's
+exportable surface, and the same `fwd` in an executable or static library build
+says nothing. A `fwd` of a type or of an `ext` import exports nothing either,
+since neither defines a symbol in the image.
 
 A shared library that exports nothing is refused: it would be callable by
 nobody, and dead-code elimination would leave it empty.
