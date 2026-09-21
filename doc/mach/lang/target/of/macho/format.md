@@ -345,37 +345,49 @@ pub val X86_64_RELOC_SIGNED_4:   u32 = 8
 ## val ARM64_RELOC_UNSIGNED
 
 ```mach
-pub val ARM64_RELOC_UNSIGNED:   u32 = 0
+pub val ARM64_RELOC_UNSIGNED:           u32 = 0
 ```
 
 ## val ARM64_RELOC_SUBTRACTOR
 
 ```mach
-pub val ARM64_RELOC_SUBTRACTOR: u32 = 1
+pub val ARM64_RELOC_SUBTRACTOR:         u32 = 1
 ```
 
 ## val ARM64_RELOC_BRANCH26
 
 ```mach
-pub val ARM64_RELOC_BRANCH26:   u32 = 2
+pub val ARM64_RELOC_BRANCH26:           u32 = 2
 ```
 
 ## val ARM64_RELOC_PAGE21
 
 ```mach
-pub val ARM64_RELOC_PAGE21:     u32 = 3
+pub val ARM64_RELOC_PAGE21:             u32 = 3
 ```
 
 ## val ARM64_RELOC_PAGEOFF12
 
 ```mach
-pub val ARM64_RELOC_PAGEOFF12:  u32 = 4
+pub val ARM64_RELOC_PAGEOFF12:          u32 = 4
+```
+
+## val ARM64_RELOC_GOT_LOAD_PAGE21
+
+```mach
+pub val ARM64_RELOC_GOT_LOAD_PAGE21:    u32 = 5
+```
+
+## val ARM64_RELOC_GOT_LOAD_PAGEOFF12
+
+```mach
+pub val ARM64_RELOC_GOT_LOAD_PAGEOFF12: u32 = 6
 ```
 
 ## val ARM64_RELOC_ADDEND
 
 ```mach
-pub val ARM64_RELOC_ADDEND:     u32 = 10
+pub val ARM64_RELOC_ADDEND:             u32 = 10
 ```
 
 ## val MACH_HEADER_64_SIZE
