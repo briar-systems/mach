@@ -1,0 +1,353 @@
+# the export-request list of a relocatable object: the names a module asks the
+# link to export whoever defines them, one per `fwd` re-export. no format shared
+# by elf and mach-o has a native per-object export directive, so both carry the
+# list in a mach-specific section the emitter writes and the parser consumes:
+# `u32 version`, `u32 count`, then per name `u32 len`, the bytes, padded to 4.
+# coff spells the same request natively as a `.drectve /EXPORT:` of a name the
+# object does not define, so it does not carry this section.
+
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.target.of;
+use mach.lang.target.of.bin;
+use mach.lang.target.of.plan;
+use std.allocator.page;
+use std.memory;
+use std.system.panic.panic;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+
+pub val SECTION_NAME: str = ".mach.exports";
+pub val VERSION:      u32 = 1;
+
+# a request name is interned, so the checked round-up over a constant
+# alignment cannot fail here
+fun align4(value: usize) usize {
+    val aligned: res[usize, fail.Fail] = plan.align_bytes(value, 4);
+    if (sel aligned.err) {
+        panic("of: a bounded value overflowed its 4-byte round-up\n");
+        ret 0;
+    }
+    ret aligned.ok;
+}
+
+# the section blob for an image's request list, or a nil blob when the list is
+# empty. the caller owns the bytes
+pub fun encode(alloc: *A.Allocator, img: *of.ObjectImage, out_bytes: **u8, out_len: *u32) err[fail.Fail] {
+    @out_bytes = nil;
+    @out_len   = 0;
+    if (img.export_request_count == 0) { ret err[fail.Fail].ok{}; }
+
+    var total: usize = 8;
+    var i:     u32   = 0;
+    for (i < img.export_request_count) {
+        val nm: str = bin.resolve_name(img.interner, img.export_requests[i]);
+        if (nm == nil || str_len(nm) == 0) {
+            ret err[fail.Fail].err{fail.message("of: export request name did not resolve")};
+        }
+        total = total + 4 + align4(str_len(nm));
+        i     = i + 1;
+    }
+    if (total > 0xFFFFFFFF) { ret err[fail.Fail].err{fail.message("of: export request section exceeds the section size field")}; }
+
+    val rb: res[*u8, A.Error] = A.zallocate[u8](alloc, total);
+    if (sel rb.err) { ret err[fail.Fail].err{fail.message("of: export request section alloc failed")}; }
+    val buf: *u8 = rb.ok;
+    bin.write_u32_le(buf, 0, VERSION);
+    bin.write_u32_le(buf, 4, img.export_request_count);
+    var pos: usize = 8;
+    i = 0;
+    for (i < img.export_request_count) {
+        val nm:   str   = bin.resolve_name(img.interner, img.export_requests[i]);
+        val nlen: usize = str_len(nm);
+        bin.write_u32_le(buf, pos, nlen::u32);
+        pos = pos + 4;
+        memory.raw_copy((buf::usize + pos)::ptr, nm::ptr, nlen);
+        pos = pos + align4(nlen);
+        i   = i + 1;
+    }
+
+    @out_bytes = buf;
+    @out_len   = total::u32;
+    ret err[fail.Fail].ok{};
+}
+
+# reads the request list out of section `index` into the image and consumes
+# the section, leaving a zero-length husk the linker skips. the image must
+# hold no requests yet: a parse fills the list exactly once
+pub fun decode(alloc: *A.Allocator, itn: *intern.Interner, img: *of.ObjectImage, index: u32) err[fail.Fail] {
+    if (img.export_request_count != 0) {
+        ret err[fail.Fail].err{fail.message("of: export requests decoded twice into one image")};
+    }
+    val sec:  *of.Section = ?img.sections[index];
+    val blob: *u8         = sec.bytes;
+    val blen: usize       = sec.len::usize;
+    if (blob == nil || blen < 8) { ret err[fail.Fail].err{fail.message("of: malformed .mach.exports section")}; }
+    if (bin.read_u32_le(blob, 0) != VERSION) {
+        ret err[fail.Fail].err{fail.message("of: unsupported .mach.exports version")};
+    }
+    val count: u32 = bin.read_u32_le(blob, 4);
+    if (count::usize > (blen - 8) / 4) { ret err[fail.Fail].err{fail.message("of: malformed .mach.exports count")}; }
+
+    var names: *intern.StrId = nil;
+    if (count > 0) {
+        val na: res[*intern.StrId, A.Error] = A.zallocate[intern.StrId](alloc, count::usize);
+        if (sel na.err) { ret err[fail.Fail].err{fail.message("of: export request alloc failed")}; }
+        names = na.ok;
+    }
+
+    var pos: usize = 8;
+    var i:   u32   = 0;
+    for (i < count) {
+        if (pos + 4 > blen) {
+            A.deallocate[intern.StrId](alloc, names, count::usize);
+            ret err[fail.Fail].err{fail.message("of: truncated .mach.exports record")};
+        }
+        val nlen: usize = bin.read_u32_le(blob, pos)::usize;
+        pos = pos + 4;
+        if (nlen == 0 || nlen > blen - pos || align4(nlen) > blen - pos) {
+            A.deallocate[intern.StrId](alloc, names, count::usize);
+            ret err[fail.Fail].err{fail.message("of: malformed .mach.exports record")};
+        }
+        val nb: res[*u8, A.Error] = A.allocate[u8](alloc, nlen + 1);
+        if (sel nb.err) {
+            A.deallocate[intern.StrId](alloc, names, count::usize);
+            ret err[fail.Fail].err{fail.message("of: export request name alloc failed")};
+        }
+        val nbuf: *u8 = nb.ok;
+        memory.raw_copy(nbuf::ptr, (blob::usize + pos)::ptr, nlen);
+        nbuf[nlen] = 0;
+        val nir: res[intern.StrId, A.Error] = intern.intern(itn, nbuf::str);
+        A.deallocate[u8](alloc, nbuf, nlen + 1);
+        if (sel nir.err) {
+            A.deallocate[intern.StrId](alloc, names, count::usize);
+            ret err[fail.Fail].err{fail.refused(nir.err)};
+        }
+        names[i] = nir.ok;
+        pos      = pos + align4(nlen);
+        i        = i + 1;
+    }
+
+    img.export_requests      = names;
+    img.export_request_count = count;
+    img.export_request_cap   = count;
+
+    A.deallocate[u8](alloc, sec.bytes, sec.len::usize);
+    sec.bytes = nil;
+    sec.len   = 0;
+    ret err[fail.Fail].ok{};
+}
+
+# the index of the section named `name`, or none
+pub fun find(img: *of.ObjectImage, name: intern.StrId) opt[u32] {
+    var i: u32 = 0;
+    for (i < img.section_count) {
+        if (img.sections[i].name == name) { ret opt[u32].some{i}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# a view of `img` whose sections are the input's plus one carrying `bytes`:
+# a zero-length section already named `name` (the husk an earlier parse left)
+# is filled in place, otherwise the section is appended. every other array is
+# shared with the input, so only the sections array is freed by `release`
+pub fun with_section(alloc: *A.Allocator, img: *of.ObjectImage, name: intern.StrId,
+    template: of.Section, bytes: *u8, len: u32, out: *of.ObjectImage) err[fail.Fail] {
+    @out = @img;
+    val n0:   u32 = img.section_count;
+    var slot: u32 = n0;
+    var i:    u32 = 0;
+    for (i < n0) {
+        if (img.sections[i].name == name && img.sections[i].len == 0) {
+            slot = i;
+            brk;
+        }
+        i = i + 1;
+    }
+    var n1: u32 = n0;
+    if (slot == n0) { n1 = n0 + 1; }
+    val gs: res[*of.Section, A.Error] = A.zallocate[of.Section](alloc, n1::usize);
+    if (sel gs.err) { ret err[fail.Fail].err{fail.message("of: section append failed")}; }
+    val secs: *of.Section = gs.ok;
+    i = 0;
+    for (i < n0) {
+        secs[i] = img.sections[i];
+        i       = i + 1;
+    }
+    secs[slot]        = template;
+    secs[slot].name   = name;
+    secs[slot].bytes  = bytes;
+    secs[slot].len    = len;
+    out.sections      = secs;
+    out.section_count = n1;
+    out.section_cap   = n1;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun release(alloc: *A.Allocator, view: *of.ObjectImage) {
+    if (view.sections != nil && view.section_cap > 0) {
+        A.deallocate[of.Section](alloc, view.sections, view.section_cap::usize);
+    }
+    view.sections      = nil;
+    view.section_count = 0;
+    view.section_cap   = 0;
+}
+
+fun t_image(alloc: *A.Allocator, itn: *intern.Interner, names: *intern.StrId, count: u32) of.ObjectImage {
+    var img: of.ObjectImage = of.object_image_init(alloc, itn, intern.STR_NIL);
+    img.export_requests      = names;
+    img.export_request_count = count;
+    img.export_request_cap   = count;
+    ret img;
+}
+
+test "mach.lang.target.of.exports:blob_round_trips_the_request_list" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    fin { intern.dnit(?itn); }
+    val a_r: res[intern.StrId, A.Error] = intern.intern(?itn, "fwd_one");
+    val b_r: res[intern.StrId, A.Error] = intern.intern(?itn, "a_rather_longer_reexport");
+    if (sel a_r.err) { ret 1; }
+    if (sel b_r.err) { ret 1; }
+    var names: [2]intern.StrId = [2]intern.StrId{a_r.ok, b_r.ok};
+    var src:   of.ObjectImage  = t_image(?alloc, ?itn, ?names[0], 2);
+
+    var bytes: *u8            = nil;
+    var len:   u32            = 0;
+    val enc:   err[fail.Fail] = encode(?alloc, ?src, ?bytes, ?len);
+    if (sel enc.err)                                                            { ret 2; }
+    if (bytes == nil || len != 8 + 4 + 8 + 4 + 24)                              { ret 3; }
+    if (bin.read_u32_le(bytes, 0) != VERSION || bin.read_u32_le(bytes, 4) != 2) { ret 4; }
+
+    var sections: [1]of.Section  = [1]of.Section{of.Section{name: intern.STR_NIL, kind: of.SK_DEBUG, bytes: bytes, len: len, align: 4}};
+    var dst:      of.ObjectImage = of.object_image_init(?alloc, ?itn, intern.STR_NIL);
+    dst.sections      = ?sections[0];
+    dst.section_count = 1;
+    val dec: err[fail.Fail] = decode(?alloc, ?itn, ?dst, 0);
+    if (sel dec.err)                                                          { ret 5; }
+    if (dst.export_request_count != 2)                                        { ret 6; }
+    if (dst.export_requests[0] != a_r.ok || dst.export_requests[1] != b_r.ok) { ret 7; }
+    if (sections[0].len != 0 || sections[0].bytes != nil)                     { ret 8; }
+    A.deallocate[intern.StrId](?alloc, dst.export_requests, 2);
+
+    var empty: of.ObjectImage = t_image(?alloc, ?itn, nil::*intern.StrId, 0);
+    var nb:    *u8            = nil;
+    var nl:    u32            = 0;
+    val none:  err[fail.Fail] = encode(?alloc, ?empty, ?nb, ?nl);
+    if (sel none.err)         { ret 9; }
+    if (nb != nil || nl != 0) { ret 10; }
+    ret 0;
+}
+
+fun t_decode_refuses(alloc: *A.Allocator, itn: *intern.Interner, blob: *u8, len: u32) bool {
+    val rb: res[*u8, A.Error] = A.allocate[u8](alloc, len::usize);
+    if (sel rb.err) { ret false; }
+    memory.raw_copy(rb.ok::ptr, blob::ptr, len::usize);
+    var sections: [1]of.Section  = [1]of.Section{of.Section{name: intern.STR_NIL, kind: of.SK_DEBUG, bytes: rb.ok, len: len, align: 4}};
+    var img:      of.ObjectImage = of.object_image_init(alloc, itn, intern.STR_NIL);
+    img.sections      = ?sections[0];
+    img.section_count = 1;
+    val dec:     err[fail.Fail] = decode(alloc, itn, ?img, 0);
+    val refused: bool           = sel dec.err;
+    if (!refused) {
+        if (img.export_requests != nil) { A.deallocate[intern.StrId](alloc, img.export_requests, img.export_request_cap::usize); }
+    }
+    if (sections[0].bytes != nil) { A.deallocate[u8](alloc, sections[0].bytes, sections[0].len::usize); }
+    ret refused;
+}
+
+test "mach.lang.target.of.exports:malformed_blobs_are_refused" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    fin { intern.dnit(?itn); }
+
+    var short: [4]u8;
+    bin.write_u32_le(?short[0], 0, VERSION);
+    if (!t_decode_refuses(?alloc, ?itn, ?short[0], 4)) { ret 1; }
+
+    var version: [8]u8;
+    bin.write_u32_le(?version[0], 0, VERSION + 1);
+    bin.write_u32_le(?version[0], 4, 0);
+    if (!t_decode_refuses(?alloc, ?itn, ?version[0], 8)) { ret 2; }
+
+    # a count the payload cannot hold
+    var count: [8]u8;
+    bin.write_u32_le(?count[0], 0, VERSION);
+    bin.write_u32_le(?count[0], 4, 1);
+    if (!t_decode_refuses(?alloc, ?itn, ?count[0], 8)) { ret 3; }
+
+    # a name length past the end of the blob
+    var truncated: [12]u8;
+    bin.write_u32_le(?truncated[0], 0, VERSION);
+    bin.write_u32_le(?truncated[0], 4, 1);
+    bin.write_u32_le(?truncated[0], 8, 16);
+    if (!t_decode_refuses(?alloc, ?itn, ?truncated[0], 12)) { ret 4; }
+
+    # an empty name
+    var empty_name: [12]u8;
+    bin.write_u32_le(?empty_name[0], 0, VERSION);
+    bin.write_u32_le(?empty_name[0], 4, 1);
+    bin.write_u32_le(?empty_name[0], 8, 0);
+    if (!t_decode_refuses(?alloc, ?itn, ?empty_name[0], 12)) { ret 5; }
+
+    # the well-formed shape the refusals are variations of
+    var good: [16]u8;
+    bin.write_u32_le(?good[0], 0, VERSION);
+    bin.write_u32_le(?good[0], 4, 1);
+    bin.write_u32_le(?good[0], 8, 2);
+    good[12] = 'o';
+    good[13] = 'k';
+    good[14] = 0;
+    good[15] = 0;
+    if (t_decode_refuses(?alloc, ?itn, ?good[0], 16)) { ret 6; }
+    ret 0;
+}
+
+test "mach.lang.target.of.exports:with_section_fills_a_husk_or_appends" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    fin { intern.dnit(?itn); }
+    val name_r: res[intern.StrId, A.Error] = intern.intern(?itn, SECTION_NAME);
+    val text_r: res[intern.StrId, A.Error] = intern.intern(?itn, ".text");
+    if (sel name_r.err) { ret 1; }
+    if (sel text_r.err) { ret 1; }
+    var payload:  [8]u8;
+    val template: of.Section = of.Section{name: intern.STR_NIL, kind: of.SK_DEBUG, bytes: nil, len: 0, align: 4};
+
+    var one: [1]of.Section  = [1]of.Section{of.Section{name: text_r.ok, kind: of.SK_TEXT, bytes: ?payload[0], len: 8, align: 4}};
+    var img: of.ObjectImage = of.object_image_init(?alloc, ?itn, intern.STR_NIL);
+    img.sections      = ?one[0];
+    img.section_count = 1;
+    var view:     of.ObjectImage;
+    val appended: err[fail.Fail] = with_section(?alloc, ?img, name_r.ok, template, ?payload[0], 8, ?view);
+    if (sel appended.err)                                                                           { ret 2; }
+    if (view.section_count != 2 || view.sections[1].name != name_r.ok || view.sections[1].len != 8) { ret 3; }
+    if (view.sections[0].name != text_r.ok || view.sections == img.sections)                        { ret 4; }
+    release(?alloc, ?view);
+
+    var two: [2]of.Section;
+    two[0]            = one[0];
+    two[1]            = of.Section{name: name_r.ok, kind: of.SK_DEBUG, bytes: nil, len: 0, align: 4};
+    img.sections      = ?two[0];
+    img.section_count = 2;
+    val filled: err[fail.Fail] = with_section(?alloc, ?img, name_r.ok, template, ?payload[0], 8, ?view);
+    if (sel filled.err)                                                                                { ret 5; }
+    if (view.section_count != 2 || view.sections[1].len != 8 || view.sections[1].bytes != ?payload[0]) { ret 6; }
+    if (two[1].len != 0)                                                                               { ret 7; }
+    release(?alloc, ?view);
+    ret 0;
+}
