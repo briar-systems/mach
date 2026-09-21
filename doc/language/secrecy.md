@@ -131,7 +131,11 @@ than the source alone, so they are reported at lowering:
   like the high half does. A secret 128-bit `/` or `%` is
   refused like every secret division: the helper it would call is a loop
   over the dividend's bits
-- a secret **variable shift count** on a target without a barrel shifter
+- a secret **variable shift count** on a target without a barrel shifter. Where
+  it is admitted, the saturation of a count at or above the operand width
+  ([operators.md](operators.md#bitwise)) is a compare, a negate and a mask on
+  the count and the result, with no branch, so it reveals nothing the shift
+  itself would not
 
 A secret value passed to a variadic pack is also rejected, including a secret
 wrapped inside an aggregate.

@@ -60,6 +60,24 @@ val x: i64    = (a & b) | (c ^ d);
 val y: i64    = x << 2;
 ```
 
+A shift's result has the left operand's type, and its count is any integer
+type. `<<` shifts zeros in from the right; `>>` on an unsigned operand shifts
+zeros in from the left and on a signed operand copies the sign bit in. A count
+at or above the left operand's width **saturates**: `<<` and an unsigned `>>`
+answer `0`, a signed `>>` answers the sign fill (`0` or `-1`). A count that is
+a compile-time constant at or above the width, or negative, is a compile
+error, since a program never means the saturated value by it:
+
+```mach fragment
+val a: u32 = x << 31;        # ok
+val b: u32 = x << 32;        # error: shift count 32 is at least the width of `u32` (32 bits)
+val c: u32 = x >> n;         # n: u8 at run time; 0 when n >= 32
+val d: i32 = y >> n;         # -1 or 0 when n >= 32, the sign of y
+```
+
+The saturation is branch-free, so a secret count admitted by the constant-time
+gates (see [secrecy.md](secrecy.md)) stays admitted.
+
 ## Comparison
 
 `==` `!=` `<` `>` `<=` `>=` — produce `u8` (`1` or `0`). Mach has no compiler
