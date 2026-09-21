@@ -20220,6 +20220,230 @@ test "mach.lang.driver:legalized_wide_local_has_a_piece_location_riscv32" {
     ret bad;
 }
 
+fun ut_uleb32(bytes: *u8, len: u32, pos: *u32, out: *u32) bool {
+    var v:     u32 = 0;
+    var shift: u32 = 0;
+    for (@pos < len) {
+        val b: u8 = bytes[@pos];
+        @pos = @pos + 1;
+        v    = v | ((b & 0x7f)::u32 << shift);
+        if ((b & 0x80) == 0) {
+            @out = v;
+            ret true;
+        }
+        shift = shift + 7;
+        if (shift > 28) { ret false; }
+    }
+    ret false;
+}
+
+# one location list of the parsed section: where its base address sits (the
+# relocation there names the function), its entry count and, for a single
+# offset pair, the pair's bounds and the one-byte expression it carries
+rec UtLocList {
+    addr_at: u32;
+    entries: u32;
+    start:   u32;
+    end:     u32;
+    op:      u8;
+    op_len:  u32;
+}
+
+# walks a DWARF 5 .debug_loclists body: each list opens with a base address
+# and holds offset pairs until its end-of-list; anything else fails the parse
+fun ut_parse_loclists(sec: *of.Section, out: *UtLocList, cap: u32, count: *u32) bool {
+    @count = 0;
+    if (sec.len < 12) { ret false; }
+    val addr_size: u32 = sec.bytes[6]::u32;
+    var pos:       u32 = 12;
+    for (pos < sec.len) {
+        if (sec.bytes[pos] != 0x06 || @count >= cap) { ret false; }
+        var l: UtLocList;
+        l.addr_at = pos + 1;
+        pos       = pos + 1 + addr_size;
+        l.entries = 0;
+        l.start   = 0;
+        l.end     = 0;
+        l.op      = 0;
+        l.op_len  = 0;
+        var closed: bool = false;
+        for (!closed && pos < sec.len) {
+            val kind: u8 = sec.bytes[pos];
+            pos = pos + 1;
+            if (kind == 0x00) { closed = true; }
+            or (kind == 0x04) {
+                var s: u32 = 0;
+                var e: u32 = 0;
+                var n: u32 = 0;
+                if (!ut_uleb32(sec.bytes, sec.len, ?pos, ?s)) { ret false; }
+                if (!ut_uleb32(sec.bytes, sec.len, ?pos, ?e)) { ret false; }
+                if (!ut_uleb32(sec.bytes, sec.len, ?pos, ?n)) { ret false; }
+                if (pos + n > sec.len)                        { ret false; }
+                l.start   = s;
+                l.end     = e;
+                l.op      = sec.bytes[pos];
+                l.op_len  = n;
+                pos       = pos + n;
+                l.entries = l.entries + 1;
+            }
+            or { ret false; }
+        }
+        if (!closed) { ret false; }
+        out[@count] = l;
+        @count      = @count + 1;
+    }
+    ret true;
+}
+
+# the defined function symbol whose name ends in `tail`, or -1
+fun ut_image_function(img: *of.ObjectImage, tail: str) i32 {
+    var found: i32 = -1;
+    var sy:    u32 = 0;
+    for (sy < img.symbol_count) {
+        val sym:     *of.Symbol = ?img.symbols[sy];
+        val looked:  opt[str]   = intern.lookup(img.interner, sym.name);
+        val defined: bool       = (sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0 && !of.section_is_external(sym.section);
+        if (sel looked.some) {
+            if (defined && ut_name_tail_is(looked.some, tail)) {
+                if (found >= 0) { ret -1; }
+                found = sy::i32;
+            }
+        }
+        sy = sy + 1;
+    }
+    ret found;
+}
+
+# the text offset, relative to `fn`, of the one relocation inside it that
+# names `callee`: where the call instruction's target field sits
+fun ut_call_reloc_offset(img: *of.ObjectImage, fn: *of.Symbol, callee: u32, out: *u32) bool {
+    var hits: u32 = 0;
+    var ri:   u32 = 0;
+    for (ri < img.reloc_count) {
+        val rl: *of.Relocation = ?img.relocations[ri];
+        if (rl.section.index == fn.section.index && rl.sym == callee && rl.offset >= fn.offset && rl.offset < fn.offset + fn.size) {
+            @out = rl.offset - fn.offset;
+            hits = hits + 1;
+        }
+        ri = ri + 1;
+    }
+    ret hits == 1;
+}
+
+# whether the base address at `at` of the location list section is relocated
+# against the function symbol `sym`
+fun ut_loclist_owner_is(img: *of.ObjectImage, section: u32, at: u32, sym: u32) bool {
+    var ri: u32 = 0;
+    for (ri < img.reloc_count) {
+        val rl: *of.Relocation = ?img.relocations[ri];
+        if (rl.section.index == section && rl.offset == at) { ret rl.sym == sym; }
+        ri = ri + 1;
+    }
+    ret false;
+}
+
+# compiles a function at -g whose first parameter's register is taken by a
+# temporary before a call and whose second parameter's register is caller-saved
+# and left alone until that call, then reads .debug_loclists back from the
+# object image: the three lists (a, b and the temporary t) each hold one
+# register offset pair, a's ends at the clobber, before the call, and b's and
+# t's end at the instruction after the call
+fun ut_clobbered_register_loclists(target_name: str) i32 {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+    val rr: err[outcome.Fail] = driver.setup_registry(s.registry);
+    if (sel rr.err) { ret 1; }
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = "#[noinline]\nfun spend(v: u64) u64 { ret v + 1; }\n\n#[noinline]\npub fun clobbered(a: u64, b: u64) u64 {\n    val t: u64 = a * 3;\n    val r: u64 = spend(t + b);\n    ret r;\n}\n";
+    val mtext:  str                 = "[project]\nmach = \">=5\"\nid = \"clobdbg\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.x64]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[target.arm64]\nisa = \"aarch64\"\nos = \"linux\"\nabi = \"aapcs64\"\n\n[target.rv64]\nisa = \"riscv64\"\nos = \"linux\"\nabi = \"lp64d\"\n\n[artifact.app]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[profile.debug]\ndefault = true\nopt = 0\ndebug = true\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n";
+    val root_r: res[str, fail.Fail] = ut_scaffold_m(?alloc, mtext, ?names[0], ?texts[0], 1);
+    if (sel root_r.err) { ret 1; }
+    val root: str = root_r.ok;
+
+    var pick: manifest.Selection                 = ut_target_sel(target_name);
+    val pr:   res[project.Project, outcome.Fail] = driver.build_project_sel(?s, root, ?pick);
+    fs.remove_all(?alloc, root);
+    if (sel pr.err) {
+        print.eprintln(outcome.describe(pr.err));
+        ret 1;
+    }
+    var p: project.Project = pr.ok;
+    fin { project.dnit_project(?p); }
+    if (p.target.debug == nil || p.target.debug.id != of.DBG_DWARF) { ret 2; }
+    p.req.debug = true;
+    if (ut_run_codegen_ok(?p) != 0) { ret 3; }
+    val mid: session.ModuleId = ut_mid(?p, ?s, "clobdbg.main");
+    if (mid == session.MODULE_NIL) { ret 4; }
+    val img: *of.ObjectImage = project.module_at(?p, mid::u32).object_image;
+
+    val fi: i32 = ut_image_function(img, "clobbered");
+    val ci: i32 = ut_image_function(img, "spend");
+    if (fi < 0 || ci < 0) { ret 5; }
+    val fn: *of.Symbol = ?img.symbols[fi::u32];
+    if (fn.size == 0) { ret 5; }
+    var call_at: u32 = 0;
+    if (!ut_call_reloc_offset(img, fn, ci::u32, ?call_at)) { ret 6; }
+
+    var lists: [8]UtLocList;
+    var count: u32 = 0;
+    var lsec:  i32 = -1;
+    var si:    u32 = 0;
+    for (si < img.section_count) {
+        val sec: *of.Section = ?img.sections[si];
+        val nm:  opt[str]    = intern.lookup(img.interner, sec.name);
+        if (sel nm.some && str_equals(nm.some, ".debug_loclists")) {
+            if (!ut_parse_loclists(sec, ?lists[0], 8, ?count)) { ret 7; }
+            lsec = si::i32;
+        }
+        si = si + 1;
+    }
+    if (lsec < 0) { ret 8; }
+
+    # a call's target field ends the instruction within eight bytes on every
+    # target here: rel32 after the opcode, one bl word, or auipc then jalr
+    var owned:   u32 = 0;
+    var at_call: u32 = 0;
+    var at_temp: u32 = 0;
+    var li:      u32 = 0;
+    for (li < count) {
+        val l: *UtLocList = ?lists[li];
+        if (!ut_loclist_owner_is(img, lsec::u32, l.addr_at, fi::u32)) {
+            li = li + 1;
+            cnt;
+        }
+        owned = owned + 1;
+        if (l.entries != 1)                          { ret 10; }
+        if (l.op_len != 1)                           { ret 11; }
+        if (l.op < 0x50 || l.op > 0x6f)              { ret 12; }
+        if (l.start >= l.end || l.end > fn.size)     { ret 13; }
+        if (l.end > call_at && l.end <= call_at + 8) { at_call = at_call + 1; }
+        or (l.end <= call_at)                        { at_temp = at_temp + 1; }
+        li = li + 1;
+    }
+    if (owned != 3)   { ret 9; }
+    if (at_call != 2) { ret 14; }
+    if (at_temp != 1) { ret 15; }
+    ret 0;
+}
+
+test "mach.lang.driver:clobbered_parameter_register_ends_its_location_list_on_x86_64_aarch64_and_riscv64" {
+    val x86: i32 = ut_clobbered_register_loclists("x64");
+    if (x86 != 0) { ret 20 + x86; }
+    val arm: i32 = ut_clobbered_register_loclists("arm64");
+    if (arm != 0) { ret 40 + arm; }
+    val rv: i32 = ut_clobbered_register_loclists("rv64");
+    if (rv != 0) { ret 60 + rv; }
+    ret 0;
+}
+
 fun ut_rv32_sweep(mem: *u8, offs: *u32) i32 {
     var bad:   i32 = 0;
     var steps: u32 = 0;
