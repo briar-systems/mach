@@ -117,6 +117,14 @@ pub rec ModRef;
 pub rec TupleGateResult;
 ```
 
+## rec ArtifactEntry
+
+```mach
+pub rec ArtifactEntry;
+```
+
+an artifact entry the union walk loads: the entry module and the artifact it is of
+
 ## rec ModuleEntry
 
 ```mach

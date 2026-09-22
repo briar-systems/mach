@@ -595,6 +595,33 @@ Neither writes anything, so an idle loop holds every live value across it. `yiel
 is the weaker hint of the three — it asks a hypervisor to schedule elsewhere and
 may do nothing at all, which is why `wfi` is what an idle loop should say.
 
+## Jumps, calls and branches (riscv64)
+
+A jump or call target is a symbol or a numeric local label, and the row decides which
+it may be:
+
+```mach fragment
+asm riscv64 {
+    j    some_symbol      # jal x0: one J-type word under R_RISCV_JAL, +-1 MiB
+    jal  some_symbol      # jal ra, the same word and relocation
+    jal  t0, some_symbol  # ... with a named link register
+    call some_symbol      # auipc + jalr under R_RISCV_CALL_PLT, +-2 GiB, may reach a PLT stub
+    tail some_symbol      # the same pair through t1, no link
+    j    1f               # a numeric local label resolves in place, no relocation
+1:
+    beq  a0, a1, 1b       # a conditional branch takes a numeric local label only
+}
+```
+
+`j` and `jal` name a symbol under the 20-bit `R_RISCV_JAL` field, which the linker
+fills from the final placement and refuses when the target is more than 1 MiB away, so
+a target that may live in another module or a shared object is spelled `call` or
+`tail`, whose `auipc` + `jalr` pair reaches +-2 GiB and, for an imported function, the
+PLT stub. A conditional branch (`beq`, `bnez` and the rest) takes a numeric local
+label only: its 12-bit field has no relocation kind here, the same posture as
+aarch64's `b.cond`, so a symbol in that position is refused at the asm site rather
+than assembled to a word the linker cannot fill. On riscv32 the rows are the same.
+
 ## Control-and-status registers (riscv64)
 
 The Zicsr extension's six instructions — read-write, read-set and read-clear, each

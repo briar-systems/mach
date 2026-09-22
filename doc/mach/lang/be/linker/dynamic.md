@@ -86,7 +86,7 @@ pub fun dynstate_import_is_func(dyn: *DynState, idx: u32) bool;
 
 ```mach
 pub fun dynstate_add_fixup(s: *session.Session, dyn: *DynState, seg_index: u32, seg_offset: u32,
-import_index: u32, patch_vaddr: u64, addend: i64) err[fail.Fail];
+import_index: u32, patch_vaddr: u64, kind: of.RelocKind, addend: i64) err[fail.Fail];
 ```
 
 ## fun dynstate_add_import_addr_fixup
