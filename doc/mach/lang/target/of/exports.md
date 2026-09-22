@@ -28,8 +28,9 @@ pub fun decode(alloc: *A.Allocator, itn: *intern.Interner, img: *of.ObjectImage,
 ```
 
 reads the request list out of section `index` into the image and consumes
-the section, leaving a zero-length husk the linker skips. the image must
-hold no requests yet: a parse fills the list exactly once
+the section, leaving a zero-length husk the linker skips. a husk written
+back out reads as no requests. the image must hold no requests yet: a parse
+fills the list exactly once
 
 ## fun find
 
