@@ -93,7 +93,9 @@ val d: i32 = y >> n;         # -1 or 0 when n >= 32, the sign of y
 ```
 
 The saturation is branch-free, so a secret count admitted by the constant-time
-gates (see [secrecy.md](secrecy.md)) stays admitted.
+gates (see [secrecy.md](secrecy.md)) stays admitted. A count already masked
+below the width, such as `x << (n & 31)` on a `u32`, needs no saturation and
+compiles to the bare shift.
 
 ## Comparison
 
