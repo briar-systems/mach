@@ -72,6 +72,10 @@ uint64_t checksum(uint64_t seed) {
     h = mix_i16(h, (int16_t)asr16(a, 255));
     h = mix_i16(h, (int16_t)asr16(b, 255));
     h = mix_i16(h, (int16_t)shl16(c, 255));
+    h = mix_i16(h, (int16_t)shl16(a, 33));
+    h = mix_i16(h, (int16_t)asr16(a, 33));
+    h = mix_i16(h, (int16_t)asr16(b, 33));
+    h = mix_i16(h, (int16_t)shl16(c, 33));
 
     for (uint64_t j = 0; j < 12; j = j + 1) {
         const uint64_t n = 10u + j + (seed & 3u);
