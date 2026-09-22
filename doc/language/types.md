@@ -186,8 +186,9 @@ floats at `i`, over a `*i32` it is their bits.
 A literal whose lanes are the consecutive elements of one pointer at stride one,
 `f32x4{p[i], p[i + 1], p[i + 2], p[i + 3]}`, is recognized as the same load and
 lowers to it. Any other literal of loads (a permuted order, a stride, a second
-pointer, a lane that is not a load) is assembled lane by lane through a stack slot,
-and a literal that stores lane by lane to memory is not yet folded to one store (#3767).
+pointer, a lane that is not a load) is assembled lane by lane through a stack slot.
+Storing a vector's lanes one at a time (`p[at] = v[0]; p[at + 1] = v[1]; ...`) is that
+many scalar stores; the one-instruction store is the cast on the destination pointer shown above.
 
 **Lane access** `v[i]` reads or writes a single lane. The index must be a
 comptime constant in `[0, lanes)`; a dynamic (runtime) lane index is not
