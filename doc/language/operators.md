@@ -49,6 +49,23 @@ Both operands must be the same conversion (both zero-extensions or both
 sign-extensions); a mixed-sign product is an ordinary multiply at the wide
 width. See [types.md](types.md#128-bit-integers).
 
+**`*` on a secret operand.** `^T * T` and `^T * ^T` are the same wrapping,
+same-width product with a `^T` result: the operator means the same thing on a
+secret, and nothing declassifies. What the operand's secrecy changes is
+whether the target may execute it. A secret `/` or `%` is always refused, and a
+secret `*` compiles only where the instruction set declares the exact multiply
+it emits (the low half, a high half or the widening product, at that operand
+width) as data-independent-timing under a condition the build meets: on x86-64
+every scalar cell unconditionally, on aarch64 under PSTATE.DIT on linux and
+darwin, on riscv64 with `m` and `zkt` selected, and nowhere else. An undeclared
+cell is a compile error at lowering, never a slower substitute. The widening
+form above carries through: `(a::^u128) * (b::^u128)` over 64-bit secrets is
+the 64-bit widening cell, and its halves are `^u64`. The per-instruction-set
+table and the conditions are in
+[secrecy.md](secrecy.md#constant-time-multiply-by-instruction-set), and
+`$mach.build.ct_mul(op, width)` answers the same question at comptime
+([comptime-mach.md](comptime-mach.md)).
+
 ## Bitwise
 
 `&` `|` `^` `~` `<<` `>>` — work on integer scalars. On integer-lane vectors

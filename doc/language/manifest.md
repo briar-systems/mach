@@ -291,6 +291,18 @@ property the extension declares (Zkt's data-independent timing, which the
 constant-time multiply rows read) is taken as given. It never means a mode is on. A
 row such as a `dit` would admit `msr dit`, not set it.
 
+The `extensions` list is the manifest's only lever over the constant-time multiply,
+and only on riscv64, where `zkt` is what admits a secret `*`. There is no key that
+declares or overrides a timing mode. On aarch64 the condition is PSTATE.DIT, which
+the operating system declares it guarantees (linux and darwin) and the linked
+program's start code turns on for a binary that needs it; a manifest cannot assert
+it for an OS that declares nothing. On x86-64 the multiply rows hold unconditionally
+on Intel and AMD, so nothing is there to declare, and Intel's DOITM is a kernel-owned
+model-specific register that hardens memory-side predictors rather than the
+multiplier, so mach offers no key for it either. The rows, their conditions and
+the DOITM note are in
+[secrecy.md](secrecy.md#constant-time-multiply-by-instruction-set).
+
 Some rows are the target's alone. On riscv `i` is the baseline, `c` is a code-size
 selection mach never emits, and `f` and `d` select the float register file and the
 calling convention's float registers, and `zkt` is a promise about the machine's
@@ -818,8 +830,16 @@ module no artifact reaches is collected as before.
     and a non-`pub` one stays hidden whatever its name.
   - **Internals.** Every other definition still links inside the library but is
     absent from `.dynsym`. In the `.so` it is a `LOCAL` symbol in `.symtab`, and
-    in the per-module object it is a `GLOBAL` symbol with `STV_HIDDEN`
-    visibility.
+    in the per-module object it is a `GLOBAL` symbol whose visibility the
+    format spells its own way: ELF `STV_HIDDEN`, Mach-O `N_PEXT`, and COFF, which
+    has no visibility bit, a `.drectve` section listing every exported definition
+    as ` /EXPORT:<name>`, so a global definition the directives do not name is
+    hidden. A COFF object with no `.drectve` says nothing about visibility and
+    is read as it was. A `fwd` re-export of a dependency's symbol is a request
+    the object carries separately: on COFF it is one more `/EXPORT:` token, and
+    on ELF and Mach-O it rides in a non-loaded mach section (`.mach.exports`, or
+    `__MACH,__mach_exports`) the parser consumes. A relocatable object emitted
+    and parsed back therefore keeps the same visibility and the same requests.
   - **Refusals.** A shared artifact that exports nothing is refused:
 
     ```
@@ -1176,7 +1196,7 @@ where it is declared, since one head segment cannot name two projects.
 ```toml
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^6.0"
+version = "^6.1"
 ```
 
 A stanza declares exactly one source:
