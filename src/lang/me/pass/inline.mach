@@ -31,8 +31,6 @@ use semtype: mach.lang.type;
 
 val INLINE_INSTR_THRESHOLD: u32 = body.SMALL_INSTRUCTIONS;
 
-val INLINE_BUDGET: u32 = body.MAX_INSTRUCTIONS;
-
 val INLINE_SMALL_CALLEE_FANOUT_CAP: u32 = 16;
 
 val PEEL_LEVELS: u32 = 2;
@@ -230,9 +228,11 @@ fun inline_module(work: *InlineWork, scratch_alloc: *A.Allocator) res[bool, fail
     for (i < m.function_len) {
         val caller: *ir.Function = ?m.functions[i];
         if ((caller.flags & ir.FN_FLAG_EXTERN) == 0) {
+            # a forced site is never budgeted, so the loop runs to no progress
+            # rather than to a full budget; the charge refusal marks exhaustion
             var budget:   body.Budget;
             var progress: bool = true;
-            for (progress && budget.instructions < INLINE_BUDGET) {
+            for (progress) {
                 val inlined_r: res[bool, fail.Fail] = inline_one_in_fn(m, scratch_alloc, recursive, counts, ?facts, dup_count, caller, available, ?budget, ?any_exhausted, selected);
                 if (sel inlined_r.err) {
                     A.deallocate[u32](scratch_alloc, dup_count, m.function_len::usize);
@@ -244,7 +244,6 @@ fun inline_module(work: *InlineWork, scratch_alloc: *A.Allocator) res[bool, fail
                 progress = inlined_r.ok;
                 if (progress) { any_inlined = true; }
             }
-            if (budget.instructions == INLINE_BUDGET) { any_exhausted = true; }
         }
         i = i + 1;
     }
@@ -277,8 +276,12 @@ fun inline_one_in_fn(m: *ir.Module, scratch_alloc: *A.Allocator, recursive: *boo
                     if (callee_ix != 0xFFFFFFFF && callee_ix < m.function_len) {
                         val callee: *ir.Function = ?m.functions[callee_ix];
                         if (should_inline(recursive, counts, facts, dup_count, caller, callee_ix, callee, available, selected)) {
+                            # `#[inline]` means every call site: a forced expansion is not
+                            # charged against the caller's budget, so it cannot lose to
+                            # heuristic expansions that happened to come earlier (#3425)
                             var cost: body.Budget;
-                            if (!body.growth_cost(callee, ?cost) || !body.charge(budget, cost.instructions, cost.bytes)) {
+                            if ((callee.flags & ir.FN_FLAG_INLINE) == 0
+                                && (!body.growth_cost(callee, ?cost) || !body.charge(budget, cost.instructions, cost.bytes))) {
                                 @exhausted = true;
                                 ii         = ii + 1;
                                 cnt;
@@ -3091,7 +3094,7 @@ test "mach.lang.me.pass.inline.run:exhausted_inline_budget_is_a_distinct_reporte
     }
     val sig0: type.IrTypeId = rs0.ok;
 
-    val pad_count: u32 = INLINE_BUDGET + 1;
+    val pad_count: u32 = body.MAX_INSTRUCTIONS + 1;
 
     val res_pads: res[*u32, A.Error] = A.allocate[u32](?alloc, pad_count::usize);
     if (sel res_pads.err) {
@@ -3198,6 +3201,158 @@ test "mach.lang.me.pass.inline.run:exhausted_inline_budget_is_a_distinct_reporte
     ret 0;
 }
 
+# a caller whose heuristic candidates alone fill the budget, plus one forced
+# callee whose call sits first or last among them; returns the remaining call
+# count in the low half and the forced callee's surviving call count above it
+fun t_forced_site_against_a_spent_budget(forced_last: bool) u32 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: res[ir.Module, fail.Fail] = ir.init(?alloc, intern.STR_NIL);
+    if (sel res_m.err) { ret 0xFFFFFFFF; }
+    var m: ir.Module = res_m.ok;
+
+    val ri: res[type.IrTypeId, fail.Fail] = type.intern_int(?m.types, 64);
+    if (sel ri.err) {
+        ir.dnit(?m);
+        ret 0xFFFFFFFF;
+    }
+    val i64t: type.IrTypeId                 = ri.ok;
+    var pi:   type.IrTypeId                 = i64t;
+    val rs:   res[type.IrTypeId, fail.Fail] = type.intern_fn(?m.types, i64t, ?pi, 1, false);
+    if (sel rs.err) {
+        ir.dnit(?m);
+        ret 0xFFFFFFFF;
+    }
+    val sig: type.IrTypeId                 = rs.ok;
+    val rs0: res[type.IrTypeId, fail.Fail] = type.intern_fn(?m.types, i64t, nil, 0, false);
+    if (sel rs0.err) {
+        ir.dnit(?m);
+        ret 0xFFFFFFFF;
+    }
+    val sig0: type.IrTypeId = rs0.ok;
+
+    # the pads are heuristic candidates; one more than the budget admits
+    val pad_count: u32                = body.MAX_INSTRUCTIONS + 1;
+    val res_pads:  res[*u32, A.Error] = A.allocate[u32](?alloc, pad_count::usize);
+    if (sel res_pads.err) {
+        ir.dnit(?m);
+        ret 0xFFFFFFFF;
+    }
+    val pads: *u32 = res_pads.ok;
+
+    var bld: builder.Builder = builder.init(?m);
+
+    var k: u32 = 0;
+    for (k <= pad_count) {
+        var flags: u32 = 0;
+        if (k == pad_count) { flags = ir.FN_FLAG_INLINE; }
+        val r_fn: res[u32, fail.Fail] = ir.function_add(?m, intern.STR_NIL, sig, flags);
+        if (sel r_fn.err) {
+            A.deallocate[u32](?alloc, pads, pad_count::usize);
+            ir.dnit(?m);
+            ret 0xFFFFFFFF;
+        }
+        if (k < pad_count) { pads[k] = r_fn.ok; }
+        builder.set_function(?bld, ?m.functions[r_fn.ok]);
+        val rpb: res[id.BlockId, fail.Fail] = builder.new_block(?bld);
+        if (sel rpb.err) {
+            A.deallocate[u32](?alloc, pads, pad_count::usize);
+            ir.dnit(?m);
+            ret 0xFFFFFFFF;
+        }
+        builder.set_block(?bld, rpb.ok);
+        val r_ret: err[fail.Fail] = builder.emit_ret(?bld, value.param(0, i64t));
+        if (sel r_ret.err) {
+            A.deallocate[u32](?alloc, pads, pad_count::usize);
+            ir.dnit(?m);
+            ret 0xFFFFFFFF;
+        }
+        k = k + 1;
+    }
+    val forced_ix: u32 = m.function_len - 1;
+
+    val r_main: res[u32, fail.Fail] = ir.function_add(?m, intern.STR_NIL, sig0, 0);
+    if (sel r_main.err) {
+        A.deallocate[u32](?alloc, pads, pad_count::usize);
+        ir.dnit(?m);
+        ret 0xFFFFFFFF;
+    }
+    val main_ix: u32 = r_main.ok;
+
+    builder.set_function(?bld, ?m.functions[main_ix]);
+    val rmb: res[id.BlockId, fail.Fail] = builder.new_block(?bld);
+    if (sel rmb.err) {
+        A.deallocate[u32](?alloc, pads, pad_count::usize);
+        ir.dnit(?m);
+        ret 0xFFFFFFFF;
+    }
+    builder.set_block(?bld, rmb.ok);
+
+    k = 0;
+    for (k <= pad_count) {
+        var callee: u32 = forced_ix;
+        if (forced_last && k < pad_count) { callee = pads[k]; }
+        if (!forced_last && k > 0)        { callee = pads[k - 1]; }
+        var arg: value.Value                 = value.const_int(k::u64, i64t);
+        val rc:  res[value.Value, fail.Fail] = builder.emit_call(?bld, value.fn(callee, sig), ?arg, 1, i64t);
+        if (sel rc.err) {
+            A.deallocate[u32](?alloc, pads, pad_count::usize);
+            ir.dnit(?m);
+            ret 0xFFFFFFFF;
+        }
+        k = k + 1;
+    }
+    val r_mret: err[fail.Fail] = builder.emit_ret(?bld, value.const_int(0, i64t));
+    if (sel r_mret.err) {
+        A.deallocate[u32](?alloc, pads, pad_count::usize);
+        ir.dnit(?m);
+        ret 0xFFFFFFFF;
+    }
+
+    var report: InlineBudget;
+    val rr:     res[bool, fail.Fail] = run(?m, nil, ?report);
+    if (sel rr.err) {
+        A.deallocate[u32](?alloc, pads, pad_count::usize);
+        ir.dnit(?m);
+        ret 0xFFFFFFFF;
+    }
+
+    val main_fn:         *ir.Function = ?m.functions[main_ix];
+    var remaining_calls: u32          = 0;
+    var forced_calls:    u32          = 0;
+    var bi:              u32          = 0;
+    for (bi < main_fn.block_count) {
+        val blk: *ir.Block = ?main_fn.blocks[bi];
+        var ii:  u32       = 0;
+        for (ii < blk.instr_count) {
+            val oi: opt[*instruction.Instruction] = ir.instruction_get(main_fn, blk.instructions[ii]);
+            if (sel oi.some) {
+                val ins: *instruction.Instruction = oi.some;
+                if (ins.kind == instruction.OP_CALL) {
+                    remaining_calls = remaining_calls + 1;
+                    if (callee_index(ins) == forced_ix) { forced_calls = forced_calls + 1; }
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    A.deallocate[u32](?alloc, pads, pad_count::usize);
+    ir.dnit(?m);
+
+    if (report.inline_exhausted != true) { ret 0xFFFFFFFF; }
+    ret remaining_calls | (forced_calls << 16);
+}
+
+test "mach.lang.me.pass.inline.run:a_forced_site_is_expanded_whatever_the_budget_and_the_call_order" {
+    # the forced callee is expanded and exactly one heuristic pad is refused,
+    # whether the forced call comes after every pad or before them all
+    if (t_forced_site_against_a_spent_budget(true) != 1)  { ret 1; }
+    if (t_forced_site_against_a_spent_budget(false) != 1) { ret 2; }
+    ret 0;
+}
+
 test "mach.lang.me.pass.inline.run:peel_budget_survives_inline_budget_exhaustion" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -3300,7 +3455,7 @@ test "mach.lang.me.pass.inline.run:peel_budget_survives_inline_budget_exhaustion
         ret 1;
     }
 
-    val pad_count: u32                = INLINE_BUDGET + 1;
+    val pad_count: u32                = body.MAX_INSTRUCTIONS + 1;
     val res_pads:  res[*u32, A.Error] = A.allocate[u32](?alloc, pad_count::usize);
     if (sel res_pads.err) {
         ir.dnit(?m);
@@ -3693,7 +3848,7 @@ test "mach.lang.me.pass.inline.run:a_later_function_is_not_starved_by_an_earlier
     }
     val sig0: type.IrTypeId = rs0.ok;
 
-    val pad_count: u32                = INLINE_BUDGET + 1;
+    val pad_count: u32                = body.MAX_INSTRUCTIONS + 1;
     val res_pads:  res[*u32, A.Error] = A.allocate[u32](?alloc, pad_count::usize);
     if (sel res_pads.err) {
         ir.dnit(?m);
