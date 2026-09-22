@@ -253,18 +253,22 @@ ext fun wsa_startup(ver: u16, data: *u8) i32;
 
 ### `inline` — force inlining
 
-Marks a function for inlining at every call site, overriding the compiler's
-size and use-count heuristics. Applies to functions only and takes no arguments.
-The optimization pipeline must enable inlining. Indirect calls and recursive
-call cycles are not expanded by this attribute. Taking a function's address
-retains its callable identity even when direct calls are inlined.
+Marks a function for inlining at every direct call site, overriding the
+compiler's size and use-count heuristics and exempt from the caller's expansion
+budget. Applies to functions only and takes no arguments. The optimization
+pipeline must enable inlining. Indirect calls and recursive call cycles are not
+expanded by this attribute. Taking a function's address retains its callable
+identity even when direct calls are inlined.
 
 Release optimization makes small ordinary helper bodies available across source
 modules without emitting extra definitions. A helper is small when its body has
 fewer than 25 live instructions after promotion, debug annotations excluded, so
-`-g` never moves the decision. Extraction, import and per-caller expansion each
-have a limit of 1024 copied IR instructions and 256 KiB of owned payload.
-`inline` overrides size and use-count heuristics within those limits. An
+`-g` never moves the decision. Extraction, import and per-caller heuristic expansion each
+have a limit of 1024 copied IR instructions and 256 KiB of owned payload. An
+`inline` function is expanded at every direct call site in the same module
+without charging that budget, so the outcome never depends on what else the
+caller expanded first; across modules it is imported within the extraction and
+import limits like any other body. An
 `oblivious` function is expanded only into another `oblivious` function, so
 its instructions never leave a constant-time validated body; a `naked` or
 `noinline` function, a recursive cycle and an indirect call are never expanded.

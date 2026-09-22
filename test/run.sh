@@ -579,6 +579,12 @@ fi
 # the link cases: test/link/cases/<name>/ is a project, case.conf says which legs
 # run it, what it builds and how it is checked, and expect*.txt is the recorded
 # observable. see test/README.md.
+#
+# `goal: test` compiles the case with `mach test` in place of `mach build`: every
+# module of the project is loaded, the collected tests run through the leg's
+# engine as part of the compile step, and the artifact is the test dispatcher.
+# a defect that exists only under a test build (#3535) is reachable by no other
+# goal.
 link_cell() {
     dir=$1; leg=$2; profile=$3
     id=$(basename "$dir")
@@ -586,6 +592,8 @@ link_cell() {
     build_target=${case_target:-$leg}
     runner=$(engine "$leg")
     case "$runner" in '') eng=native ;; *) eng="qemu:$runner" ;; esac
+    goal_flags=
+    [ "$case_goal" = test ] && [ -n "$runner" ] && goal_flags="--runner $runner"
     tmp=$(mktemp -d)
     rm -rf "$dir/out/link"; mkdir -p "$dir/out/link"
     bin=$dir/out/link/prog$exe
@@ -600,7 +608,7 @@ link_cell() {
         fi
         case "$eng" in qemu:*) buildcc="${eng#qemu:} $repo/$rel" ;; *) buildcc=$repo/$rel ;; esac
     fi
-    if (cd "$dir" && "$mach" dep pull . && $buildcc build . --target "$build_target" --profile "$profile" $case_build_flags -o "out/link/prog$exe") >"$tmp/build.log" 2>&1; then
+    if (cd "$dir" && "$mach" dep pull . && $buildcc "$case_goal" . --target "$build_target" --profile "$profile" $case_build_flags $goal_flags -o "out/link/prog$exe") >"$tmp/build.log" 2>&1; then
         built=1
     else
         built=0
@@ -614,13 +622,13 @@ link_cell() {
             ;;
         *)
             if [ "$built" -eq 0 ]; then
-                fail "$label build: $(first_error "$tmp/build.log")"; tail -n 6 "$tmp/build.log" | sed 's/^/    /'; rm -rf "$tmp"; return
+                fail "$label $case_goal: $(first_error "$tmp/build.log")"; tail -n 6 "$tmp/build.log" | sed 's/^/    /'; rm -rf "$tmp"; return
             fi
             gbin=
             if [ "$case_gbuild" = yes ]; then
                 gbin=$dir/out/link/prog-g$exe
-                if ! (cd "$dir" && $buildcc build . --target "$build_target" --profile "$profile" $case_build_flags -g -o "out/link/prog-g$exe") >"$tmp/build-g.log" 2>&1; then
-                    fail "$label build -g: $(first_error "$tmp/build-g.log")"; rm -rf "$tmp"; return
+                if ! (cd "$dir" && $buildcc "$case_goal" . --target "$build_target" --profile "$profile" $case_build_flags $goal_flags -g -o "out/link/prog-g$exe") >"$tmp/build-g.log" 2>&1; then
+                    fail "$label $case_goal -g: $(first_error "$tmp/build-g.log")"; rm -rf "$tmp"; return
                 fi
             fi
             # a fixture-owned .so the case's own steps built has to be findable at run time
@@ -632,6 +640,22 @@ link_cell() {
                 if [ "$rc" -ne 0 ]; then
                     fail "$label check exit $rc"; sed 's/^/    /' "$tmp/err.txt"; rm -rf "$tmp"; return
                 fi
+            elif [ "$case_run" = exec ] && [ "$case_goal" = test ]; then
+                # the dispatcher runs one test per invocation, `<exe> <index>`; the
+                # observable is every collected test's stdout in collection order
+                if ! (cd "$dir" && $buildcc test . --target "$build_target" --profile "$profile" $case_build_flags --list --format json) >"$tmp/list.json" 2>"$tmp/err.txt"; then
+                    fail "$label test --list: $(first_error "$tmp/err.txt")"; rm -rf "$tmp"; return
+                fi
+                n=$(grep -c '"event":"case"' "$tmp/list.json")
+                [ "$n" -gt 0 ] || { fail "$label collected no tests"; rm -rf "$tmp"; return; }
+                : >"$tmp/out.txt"; i=0
+                while [ "$i" -lt "$n" ]; do
+                    $runner "$bin" "$i" >>"$tmp/out.txt" 2>"$tmp/err.txt"; rc=$?
+                    if [ "$rc" -ne 0 ]; then
+                        fail "$label test $i exit $rc"; sed 's/^/    /' "$tmp/out.txt" "$tmp/err.txt"; rm -rf "$tmp"; return
+                    fi
+                    i=$((i + 1))
+                done
             elif [ "$case_run" = exec ]; then
                 $runner "$bin" >"$tmp/out.txt" 2>"$tmp/err.txt"; rc=$?
                 if [ "$rc" -ne 0 ]; then
@@ -672,7 +696,7 @@ link_cell() {
 # read_case_conf <dir>: the case's defaults, then its case.conf
 read_case_conf() {
     case_legs=; case_skip=; case_profiles="debug release"; case_run=exec
-    case_target=; case_build_flags=; case_self_host=; case_gbuild=no
+    case_target=; case_build_flags=; case_self_host=; case_gbuild=no; case_goal=build
     [ -f "$1/case.conf" ] || return 0
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in ''|\#*) continue ;; esac
@@ -682,9 +706,14 @@ read_case_conf() {
             legs) case_legs=$value ;; skip) case_skip=$value ;; profiles) case_profiles=$value ;;
             run) case_run=$value ;; target) case_target=$value ;; build-flags) case_build_flags=$value ;;
             self-host) case_self_host=$value ;; gbuild) case_gbuild=$value ;;
+            goal) case_goal=$value ;;
             *) echo "run.sh: $1/case.conf: unknown key '$key'" >&2; exit 2 ;;
         esac
     done <"$1/case.conf"
+    case "$case_goal" in
+        build|test) ;;
+        *) echo "run.sh: $1/case.conf: goal is 'build' or 'test', not '$case_goal'" >&2; exit 2 ;;
+    esac
 }
 
 # inc_build <project> <what> <dest>: -o must sit inside the project, so dest is relative

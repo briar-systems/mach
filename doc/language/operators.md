@@ -49,6 +49,23 @@ Both operands must be the same conversion (both zero-extensions or both
 sign-extensions); a mixed-sign product is an ordinary multiply at the wide
 width. See [types.md](types.md#128-bit-integers).
 
+**`*` on a secret operand.** `^T * T` and `^T * ^T` are the same wrapping,
+same-width product with a `^T` result: the operator means the same thing on a
+secret, and nothing declassifies. What the operand's secrecy changes is
+whether the target may execute it. A secret `/` or `%` is always refused, and a
+secret `*` compiles only where the instruction set declares the exact multiply
+it emits (the low half, a high half or the widening product, at that operand
+width) as data-independent-timing under a condition the build meets: on x86-64
+every scalar cell unconditionally, on aarch64 under PSTATE.DIT on linux and
+darwin, on riscv64 with `m` and `zkt` selected, and nowhere else. An undeclared
+cell is a compile error at lowering, never a slower substitute. The widening
+form above carries through: `(a::^u128) * (b::^u128)` over 64-bit secrets is
+the 64-bit widening cell, and its halves are `^u64`. The per-instruction-set
+table and the conditions are in
+[secrecy.md](secrecy.md#constant-time-multiply-by-instruction-set), and
+`$mach.build.ct_mul(op, width)` answers the same question at comptime
+([comptime-mach.md](comptime-mach.md)).
+
 ## Bitwise
 
 `&` `|` `^` `~` `<<` `>>` — work on integer scalars. On integer-lane vectors
@@ -59,6 +76,26 @@ width. See [types.md](types.md#128-bit-integers).
 val x: i64    = (a & b) | (c ^ d);
 val y: i64    = x << 2;
 ```
+
+A shift's result has the left operand's type, and its count is any integer
+type. `<<` shifts zeros in from the right; `>>` on an unsigned operand shifts
+zeros in from the left and on a signed operand copies the sign bit in. A count
+at or above the left operand's width **saturates**: `<<` and an unsigned `>>`
+answer `0`, a signed `>>` answers the sign fill (`0` or `-1`). A count that is
+a compile-time constant at or above the width, or negative, is a compile
+error, since a program never means the saturated value by it:
+
+```mach fragment
+val a: u32 = x << 31;        # ok
+val b: u32 = x << 32;        # error: shift count 32 is at least the width of `u32` (32 bits)
+val c: u32 = x >> n;         # n: u8 at run time; 0 when n >= 32
+val d: i32 = y >> n;         # -1 or 0 when n >= 32, the sign of y
+```
+
+The saturation is branch-free, so a secret count admitted by the constant-time
+gates (see [secrecy.md](secrecy.md)) stays admitted. A count already masked
+below the width, such as `x << (n & 31)` on a `u32`, needs no saturation and
+compiles to the bare shift.
 
 ## Comparison
 

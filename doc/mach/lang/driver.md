@@ -74,6 +74,9 @@ ret: the project holding the closure, released with `project.dnit_project`;
 pub fun begin_build(s: *session.Session, m: *manifest.Manifest, req: *request.BuildRequest, ev: *readout.Progress) res[project.Project, outcome.Fail];
 ```
 
+begin the build the request names: a test goal loads the test root set, every
+other goal the selected artifact's
+
 ## def FrontendPhase
 
 ```mach
@@ -102,21 +105,21 @@ pub val FRONTEND_SEMA:    FrontendPhase = 2
 
 ```mach
 pub fun analyze_project(s: *session.Session, m: *manifest.Manifest, req: *request.BuildRequest,
-extra_roots: *intern.StrId, extra_root_count: u32) res[project.Project, outcome.Fail];
+roots: project.RootSet, extra_roots: *intern.StrId, extra_root_count: u32) res[project.Project, outcome.Fail];
 ```
 
 ## fun analyze_project_until
 
 ```mach
 pub fun analyze_project_until(s: *session.Session, m: *manifest.Manifest, req: *request.BuildRequest,
-extra_roots: *intern.StrId, extra_root_count: u32, phase: FrontendPhase) res[project.Project, outcome.Fail];
+roots: project.RootSet, extra_roots: *intern.StrId, extra_root_count: u32, phase: FrontendPhase) res[project.Project, outcome.Fail];
 ```
 
 ## fun analyze_project_tolerant
 
 ```mach
 pub fun analyze_project_tolerant(s: *session.Session, m: *manifest.Manifest, req: *request.BuildRequest,
-extra_roots: *intern.StrId, extra_root_count: u32, phase: FrontendPhase) res[project.Project, outcome.Fail];
+roots: project.RootSet, extra_roots: *intern.StrId, extra_root_count: u32, phase: FrontendPhase) res[project.Project, outcome.Fail];
 ```
 
 frontend analysis for tools: the project comes back whenever the frontend
@@ -130,7 +133,12 @@ failure only (an unreadable manifest, allocation, I/O)
 s: the session
 m: the loaded manifest
 req: the build request selecting target, profile and artifact
-extra_roots: module fqns loaded beside the artifact's entry, nil with count 0
+roots: the root set the frontend loads: `project.ROOT_ARTIFACT` is the
+                  selected artifact's closure, `project.ROOT_UNION` every artifact's
+                  with the modules only a foreign target reaches gated out and
+                  `{artifact.<id>.out}` resolving over every artifact some artifact
+                  needs, `project.ROOT_TEST` the whole project a test goal builds
+extra_roots: module fqns loaded beside the root set's entries, nil with count 0
 extra_root_count: how many extra roots
 phase: the last frontend phase to run
 ret: the project, released by the caller with project.dnit_project
