@@ -48,6 +48,16 @@ pub fun check_const_index(sc: *context.SemaContext, object: type.TypeId, idx: id
 pub fun const_index_value(sc: *context.SemaContext, eid: id.ExprId) opt[comptime.CTValue];
 ```
 
+## fun check_shift_count
+
+```mach
+pub fun check_shift_count(sc: *context.SemaContext, span: token.Span, lt: type.TypeId, count: id.ExprId) bool;
+```
+
+a shift whose count is a comptime constant must keep the count below the
+left operand's width: at or above it the runtime answer is the saturated
+value (0, or the sign fill), which a constant program never means (#3756)
+
 ## fun check_secret_address
 
 ```mach
