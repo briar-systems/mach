@@ -80,5 +80,8 @@ uint64_t checksum(uint64_t seed) {
         h = mix_i64(h, (int64_t)asr64(b, n));
     }
 
+    h = mix_i64(h, (int64_t)shl64(a, 70u & 63u));
+    h = mix_i64(h, (int64_t)asr64(b, 255u & 63u));
+
     return h;
 }

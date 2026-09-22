@@ -75,5 +75,8 @@ uint64_t checksum(uint64_t seed) {
         h = mix_u32(h, shr32(b, n));
     }
 
+    h = mix_u32(h, shl32(a, 37u & 31u));
+    h = mix_u32(h, shr32(b, 255u & 31u));
+
     return h;
 }
