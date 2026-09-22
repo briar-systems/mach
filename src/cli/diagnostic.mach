@@ -97,9 +97,23 @@ pub fun flush(out: *writer.Writer, s: *session.Session, list: *diagnostic.Diagno
 # sources: the SourceMap that locates each diagnostic
 # list:    the diagnostics, rendered in order; nothing is written when it is empty
 pub fun flush_sources(out: *writer.Writer, sources: *source.SourceMap, list: *diagnostic.DiagnosticStore) {
-    var errors:   usize = 0;
-    var warnings: usize = 0;
+    var tally: Tally;
+    render_store(out, sources, list, ?tally);
+    if (tally.rendered > 0) {
+        fmt.write_str(out, "\n");
+        emit_summary(out, tally.errors, tally.warnings);
+    }
+}
 
+# what one summary line stands for: every error and warning rendered above it,
+# whichever store or failure record it came from
+rec Tally {
+    errors:   usize;
+    warnings: usize;
+    rendered: usize;
+}
+
+fun render_store(out: *writer.Writer, sources: *source.SourceMap, list: *diagnostic.DiagnosticStore, tally: *Tally) {
     val total: usize = diagnostic.len(list);
     var i:     usize = 0;
     for (i < total) {
@@ -108,16 +122,12 @@ pub fun flush_sources(out: *writer.Writer, sources: *source.SourceMap, list: *di
         if (i > 0) { fmt.write_str(out, "\n"); }
         render(out, sources, d);
 
-        if (d.severity == diagnostic.SEVERITY_ERROR)   { errors = errors + 1; }
-        or (d.severity == diagnostic.SEVERITY_WARNING) { warnings = warnings + 1; }
+        if (d.severity == diagnostic.SEVERITY_ERROR)   { tally.errors = tally.errors + 1; }
+        or (d.severity == diagnostic.SEVERITY_WARNING) { tally.warnings = tally.warnings + 1; }
 
         i = i + 1;
     }
-
-    if (total > 0) {
-        fmt.write_str(out, "\n");
-        emit_summary(out, errors, warnings);
-    }
+    tally.rendered = tally.rendered + total;
 }
 
 rec Frame {
@@ -905,8 +915,13 @@ fun build_unit_count(bo: *outcome.BuildOutcome) usize {
     ret total;
 }
 
+# one summary line closes the whole outcome: a failure record printed as its own
+# `error:` line (an encoder or rules refusal that reached no store) counts in
+# it beside every store's diagnostics, so the tally never reads `0 errors`
+# above a nonzero exit (#3617)
 fun render_outcome_w(w: *writer.Writer, bo: *outcome.BuildOutcome, quiet: bool) {
     val units: usize = build_unit_count(bo);
+    var tally: Tally;
     var i:     usize = 0;
     for (i < bo.events.len) {
         val ev: *outcome.BuildEvent = ?bo.events.data[i];
@@ -917,12 +932,20 @@ fun render_outcome_w(w: *writer.Writer, bo: *outcome.BuildOutcome, quiet: bool) 
             sink_note_w(w, ev.note);
         }
         or (sel ev.fail) {
+            if (!sel ev.fail.reported) {
+                tally.errors   = tally.errors + 1;
+                tally.rendered = tally.rendered + 1;
+            }
             render_fail_w(w, ?ev.fail);
         }
         or (sel ev.diagnostics) {
-            flush_sources(w, ev.diagnostics.sources, ev.diagnostics.diags);
+            render_store(w, ev.diagnostics.sources, ev.diagnostics.diags, ?tally);
         }
         i = i + 1;
+    }
+    if (tally.rendered > 0) {
+        fmt.write_str(w, "\n");
+        emit_summary(w, tally.errors, tally.warnings);
     }
 }
 
@@ -1103,6 +1126,63 @@ test "mach.cli.diagnostic.render_outcome_w:consumes_owned_events_in_order" {
     if (!sink_contains(?sink, "error: bad input\n"))             { bad = 1; }
 
     outcome.outcome_dnit(?bo);
+    ret bad;
+}
+
+# a refusal that reached no store (an encoder or rules refusal is an internal
+# failure record, printed as its own `error:` line) counts in the one summary
+# beside the stores' diagnostics: `1 error / 1 warning`, never `0 errors / 1
+# warning` above exit 2 (#3617)
+test "mach.cli.diagnostic.render_outcome_w:the_tally_counts_a_failure_record_beside_the_stores" {
+    var a: A.Allocator;
+    page.make(?a);
+    val session_r: res[session.Session, fail.Fail] = session.init(?a);
+    if (sel session_r.err) { ret 1; }
+    var s: session.Session = session_r.ok;
+    fin { session.dnit(?s); }
+
+    val file_r: res[source.FileId, fail.Fail] = session.load_source(?s, "mach.toml", "[project]\n");
+    if (sel file_r.err) { ret 1; }
+    val fid:    source.FileId           = file_r.ok;
+    val file_o: opt[*source.SourceFile] = source.get(?s.sources, fid);
+    if (sel file_o.none) { ret 1; }
+    val warned: err[fail.Fail] = diagnostic.warning(?s.diags, fid, line_span(file_o.some, 1), "states no compiler range");
+    if (sel warned.err) { ret 1; }
+
+    var bo: outcome.BuildOutcome = outcome.outcome_init(?a);
+    fin { outcome.outcome_dnit(?bo); }
+    var f: outcome.Fail = outcome.internal("encode: RISC-V instruction is not admitted on riscv32");
+    if (lang_alloc.refused(outcome.record_fail(?bo, ?f))) { ret 1; }
+    outcome.fold_fail(?bo, ?f);
+    val recorded: err[outcome.Fail] = outcome.record_diagnostics(?bo, ?s.sources, ?s.diags);
+    if (sel recorded.err) { ret 1; }
+
+    var buf:  [1024]u8;
+    var sink: MemSink;
+    var w:    writer.Writer;
+    mem_writer(?w, ?sink, ?buf[0], 1024);
+    render_outcome_w(?w, ?bo, false);
+
+    var bad: i32 = 0;
+    if (!sink_contains(?sink, "error: encode: RISC-V instruction is not admitted on riscv32\n")) { bad = 2; }
+    if (!sink_contains(?sink, "states no compiler range"))                                       { bad = 3; }
+    if (!sink_contains(?sink, "\n1 error / 1 warning\n"))                                        { bad = 4; }
+    if (sink_contains(?sink, "0 errors"))                                                        { bad = 5; }
+    if (outcome_code_w(?w, ?bo) != 2)                                                            { bad = 6; }
+
+    # a reported failure's error is already on a store, so it is not counted twice
+    var reported: outcome.BuildOutcome = outcome.outcome_init(?a);
+    fin { outcome.outcome_dnit(?reported); }
+    var rf: outcome.Fail = outcome.reported();
+    if (lang_alloc.refused(outcome.record_fail(?reported, ?rf))) { ret 1; }
+    val again: err[outcome.Fail] = outcome.record_diagnostics(?reported, ?s.sources, ?s.diags);
+    if (sel again.err) { ret 1; }
+    var buf2:  [1024]u8;
+    var sink2: MemSink;
+    var w2:    writer.Writer;
+    mem_writer(?w2, ?sink2, ?buf2[0], 1024);
+    render_outcome_w(?w2, ?reported, false);
+    if (!sink_contains(?sink2, "\n0 errors / 1 warning\n")) { bad = 7; }
     ret bad;
 }
 
