@@ -330,10 +330,18 @@ pub val RK_JUMP26: RelocKind = 26
 pub val RK_GOT_PCREL_HI20: RelocKind = 27
 ```
 
+## val RK_JAL20
+
+```mach
+pub val RK_JAL20: RelocKind = 28
+```
+
+the riscv jal 20-bit j-type field, +-1 MiB, even displacement
+
 ## val RK_CATALOG_COUNT
 
 ```mach
-pub val RK_CATALOG_COUNT: u32 = 28
+pub val RK_CATALOG_COUNT: u32 = 29
 ```
 
 ## rec RelocKindDesc

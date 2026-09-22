@@ -42,7 +42,9 @@ pick: the cell; with `owner`, a target and artifact of that dependency and
               a profile of `m`
 owner: "" for a cell of `m`, or the id of the closure dependency whose default
               library artifacts require the cell
-for_union: configure the editor's union of every artifact
+for_union: configure the editor's union of every artifact: every artifact's
+              entry loads, and `{artifact.<id>.out}` resolves over every artifact
+              some artifact needs, as a test build's does
 is_test: configure the whole-project test build
 ret: ok; err from selection, template, step, link or dependency resolution
 

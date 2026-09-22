@@ -1,33 +1,31 @@
 #include "corpus.h"
 
-/* every op here runs on the unsigned two's-complement identity so nothing is
- * implementation-defined or UB: a plain C `<<` on a negative signed value, or
- * `>>` on one, is not guaranteed to be an arithmetic shift, and a count >= the
- * operand width is UB either way. mach masks the count to the low 6 bits
- * (count mod 64) and its `>>` on a signed operand sign-extends. */
-static inline uint64_t shl64(uint64_t v, uint64_t n) { return v << (n & 63u); }
-
+/* mach saturates a shift count at or above the operand width: << and a
+ * logical >> answer 0, an arithmetic >> the sign fill (#3756). a plain C shift
+ * by such a count is UB, and a C >> of a negative signed value is
+ * implementation-defined, so every op runs on the unsigned identity. */
+static inline uint64_t shl64(uint64_t v, uint64_t n) { return n >= 64u ? (uint64_t)0 : (uint64_t)(v << n); }
 static inline uint64_t asr64(uint64_t v, uint64_t n) {
-    const uint64_t sh = n & 63u;
-    if (sh == 0u) { return v; }
-    const uint64_t lo   = v >> sh;
-    const uint64_t fill = UINT64_C(0) - (v >> 63);
-    const uint64_t hi   = fill << (64u - sh);
-    return lo | hi;
+    const uint64_t fill = (uint64_t)(UINT64_C(0) - (v >> 63));
+    if (n >= 64u) { return fill; }
+    if (n == 0u)   { return v; }
+    return (uint64_t)((v >> n) | (uint64_t)(fill << (64u - n)));
 }
+
 
 uint64_t checksum(uint64_t seed) {
     uint64_t h = fold_init();
+    const uint64_t s = (uint64_t)seed;
 
     const uint64_t zero = UINT64_C(0);
-    const uint64_t neg1 = UINT64_C(0xFFFFFFFFFFFFFFFF);
-    const uint64_t even = UINT64_C(0xAAAAAAAAAAAAAAAA);
-    const uint64_t odd  = UINT64_C(0x5555555555555555);
+    const uint64_t neg1 = UINT64_C(18446744073709551615);
+    const uint64_t even = UINT64_C(12297829382473034410);
+    const uint64_t odd  = UINT64_C(6148914691236517205);
 
-    uint64_t a = neg1 ^ seed;
-    uint64_t b = even ^ seed;
-    uint64_t c = odd ^ seed;
-    uint64_t z = zero ^ seed;
+    uint64_t a = (uint64_t)(neg1 ^ s);
+    uint64_t b = (uint64_t)(even ^ s);
+    uint64_t c = (uint64_t)(odd ^ s);
+    uint64_t z = (uint64_t)(zero ^ s);
 
     h = mix_i64(h, (int64_t)shl64(a, 0));
     h = mix_i64(h, (int64_t)shl64(a, 1));
@@ -43,26 +41,47 @@ uint64_t checksum(uint64_t seed) {
     h = mix_i64(h, (int64_t)shl64(z, 5));
     h = mix_i64(h, (int64_t)asr64(z, 5));
 
-    h = mix_i64(h, (int64_t)shl64(a, 64));
-    h = mix_i64(h, (int64_t)asr64(a, 64));
-    h = mix_i64(h, (int64_t)shl64(a, 65));
-    h = mix_i64(h, (int64_t)asr64(a, 65));
-    h = mix_i64(h, (int64_t)shl64(a, 127));
-    h = mix_i64(h, (int64_t)asr64(a, 127));
-    h = mix_i64(h, (int64_t)shl64(b, 64));
-    h = mix_i64(h, (int64_t)asr64(b, 127));
-
-    for (uint64_t i = 0; i < UINT64_C(64); i = (uint64_t)(i + UINT64_C(1))) {
+    for (uint8_t i = 0; i < 64; i = (uint8_t)(i + 1)) {
         h = mix_i64(h, (int64_t)shl64(a, i));
         h = mix_i64(h, (int64_t)asr64(a, i));
-        h = mix_i64(h, (int64_t)shl64(b, (uint64_t)(i + seed)));
-        h = mix_i64(h, (int64_t)asr64(c, (uint64_t)(i + seed)));
+        h = mix_i64(h, (int64_t)shl64(b, i));
+        h = mix_i64(h, (int64_t)asr64(c, i));
     }
 
-    for (uint64_t j = UINT64_C(60); j < UINT64_C(72); j = (uint64_t)(j + UINT64_C(1))) {
-        h = mix_i64(h, (int64_t)shl64(a, (uint64_t)(j + seed)));
-        h = mix_i64(h, (int64_t)asr64(a, (uint64_t)(j + seed)));
+    h = mix_i64(h, (int64_t)shl64(a, 63));
+    h = mix_i64(h, (int64_t)asr64(a, 63));
+    h = mix_i64(h, (int64_t)asr64(b, 63));
+    h = mix_i64(h, (int64_t)shl64(c, 63));
+    h = mix_i64(h, (int64_t)shl64(a, 64));
+    h = mix_i64(h, (int64_t)asr64(a, 64));
+    h = mix_i64(h, (int64_t)asr64(b, 64));
+    h = mix_i64(h, (int64_t)shl64(c, 64));
+    h = mix_i64(h, (int64_t)shl64(a, 65));
+    h = mix_i64(h, (int64_t)asr64(a, 65));
+    h = mix_i64(h, (int64_t)asr64(b, 65));
+    h = mix_i64(h, (int64_t)shl64(c, 65));
+    h = mix_i64(h, (int64_t)shl64(a, 128));
+    h = mix_i64(h, (int64_t)asr64(a, 128));
+    h = mix_i64(h, (int64_t)asr64(b, 128));
+    h = mix_i64(h, (int64_t)shl64(c, 128));
+    h = mix_i64(h, (int64_t)shl64(a, 135));
+    h = mix_i64(h, (int64_t)asr64(a, 135));
+    h = mix_i64(h, (int64_t)asr64(b, 135));
+    h = mix_i64(h, (int64_t)shl64(c, 135));
+    h = mix_i64(h, (int64_t)shl64(a, 255));
+    h = mix_i64(h, (int64_t)asr64(a, 255));
+    h = mix_i64(h, (int64_t)asr64(b, 255));
+    h = mix_i64(h, (int64_t)shl64(c, 255));
+
+    for (uint64_t j = 0; j < 12; j = j + 1) {
+        const uint64_t n = 58u + j + (seed & 3u);
+        h = mix_i64(h, (int64_t)shl64(a, n));
+        h = mix_i64(h, (int64_t)asr64(a, n));
+        h = mix_i64(h, (int64_t)asr64(b, n));
     }
+
+    h = mix_i64(h, (int64_t)shl64(a, 70u & 63u));
+    h = mix_i64(h, (int64_t)asr64(b, 255u & 63u));
 
     return h;
 }
