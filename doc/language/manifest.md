@@ -830,8 +830,16 @@ module no artifact reaches is collected as before.
     and a non-`pub` one stays hidden whatever its name.
   - **Internals.** Every other definition still links inside the library but is
     absent from `.dynsym`. In the `.so` it is a `LOCAL` symbol in `.symtab`, and
-    in the per-module object it is a `GLOBAL` symbol with `STV_HIDDEN`
-    visibility.
+    in the per-module object it is a `GLOBAL` symbol whose visibility the
+    format spells its own way: ELF `STV_HIDDEN`, Mach-O `N_PEXT`, and COFF, which
+    has no visibility bit, a `.drectve` section listing every exported definition
+    as ` /EXPORT:<name>`, so a global definition the directives do not name is
+    hidden. A COFF object with no `.drectve` says nothing about visibility and
+    is read as it was. A `fwd` re-export of a dependency's symbol is a request
+    the object carries separately: on COFF it is one more `/EXPORT:` token, and
+    on ELF and Mach-O it rides in a non-loaded mach section (`.mach.exports`, or
+    `__MACH,__mach_exports`) the parser consumes. A relocatable object emitted
+    and parsed back therefore keeps the same visibility and the same requests.
   - **Refusals.** A shared artifact that exports nothing is refused:
 
     ```
