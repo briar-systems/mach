@@ -51,6 +51,13 @@ and `version`. A path the root does not carry, `$project.name` and
 the path. See
 [comptime-mach.md](comptime-mach.md) for the `$mach.*` subtree.
 
+`$bin.name` is the table key of the artifact the module is compiled for. A build
+compiles one artifact, so every module reads that artifact's key. An editor
+session analyzes the project as the union of every artifact, and there a module
+reads the artifact whose walk reached it first: the primary artifact when its
+walk reaches the module, otherwise the first artifact in manifest order that
+does; a module first reached behind a gate decided later reads its importer's.
+
 ```mach fragment
 val ver: str = $project.version;                 # "2.0.0", from [project].version
 $if ($project.target.os == "windows") { ... }    # the declared os string
