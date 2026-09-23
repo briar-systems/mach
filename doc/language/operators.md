@@ -191,6 +191,57 @@ Each of those reads, in full, `cannot take the address of a call result: `?`
 applies to a place (a binding, a field, an element, or a dereference)`. Bind
 the temporary to a `var` and take that binding's address.
 
+## Index
+
+- `x[i]`: one element of an array, an element through a pointer, or one lane of
+  a vector. A lane index is a comptime constant, and a constant index into an
+  array or a vector is bounds-checked at compile time ([types.md](types.md#array)).
+- `x[start, count]`: a **range** of `count` consecutive elements or lanes from
+  `start`.
+
+### Range
+
+`count` is a comptime constant of at least 1, a length and never an end index:
+there are no absolute ranges, no negative counts and no runtime counts, and each
+of those is an error at the count. `start` is any index expression, as for `x[i]`.
+
+| object | `x[start, count]` is |
+|---|---|
+| `TxN` | a `Txcount` vector of those lanes (`v[4, 4]` on an `i16x8` is an `i16x4`), with a constant `start` and a `count` of at least 2 |
+| `[N]T` | a `[count]T` value |
+| `*T` | a `[count]T` value, read through the pointer |
+
+A constant `start` over an array or a vector keeps the whole range inside it:
+`start + count` may equal `N` and may not pass it, reported as
+`range [3, 2] is out of bounds for `[4]i32` of length 4`. A pointer carries no
+length, so a range through one is not checked.
+
+A range is an assignment target: `x[start, count] = value` stores `count` elements
+or lanes starting at `start`, and `value` has exactly the range's type. A range
+read is a value, not a view onto the memory, so its address cannot be taken
+(`cannot take the address of a range`) and it cannot be written into.
+
+```mach
+use std.runtime;
+use print: std.print;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var xs: [6]f32 = [6]f32{1.0, 2.0, 3.0, 4.0, 5.0, 6.0};
+    val p: *f32 = ?xs[0];
+    val a: f32x4 = p[1, 4]::f32x4;      # the four floats at p[1]
+    p[2, 4] = (a * a)::[4]f32;          # stored at p[2]
+    val tail: [2]f32 = xs[4, 2];
+    print.printlnf("{} {} {}", xs[2], tail[0], tail[1]);
+    ret 0;
+}
+```
+
+The comma form cannot be confused with generic arguments: a comma list after a
+name reads both ways (`f[T, U]` is also a list of type arguments), and name
+resolution picks by what the name is, exactly as it does for `f[x]`
+([grammar.md](grammar.md#postfix)).
+
 ## Cast
 
 Two postfix cast operators, both written `expr OP Type`:
@@ -248,6 +299,19 @@ same target, including NaN, the infinities and values outside the
 destination type. There is no cast between a vector and a scalar. The raw
 bits of a vector are `:~`, which, like every `:~`, needs only equal byte
 sizes (`i32x4:~f32x4`, `i32x4:~i64x2`).
+
+Between an array and a vector of the same shape, `[N]T` and `TxN`, `::` converts
+element by element in either direction. The element type and the count must be
+the same on both sides: `[4]i32::f32x4` and `[8]i16::i32x4` are errors, and a lane
+type change is a separate vector `::` after the array's lanes are in a vector. An
+array that lives in memory converted to a vector is one vector load, and a vector
+converted to an array and stored into a place is one vector store, which makes a
+[range](#range) with `::` the load and store idiom:
+
+```mach fragment
+val a: f32x4 = p[i, 4]::f32x4;          # one vector load
+p[i, 4] = (a * a)::[4]f32;              # one vector store
+```
 
 The two differ sharply on int<->float. `::` runs a numeric conversion, while
 `:~` reinterprets the raw bit pattern:
