@@ -65,7 +65,7 @@ use example.foo.b;
 fwd a.one;
 fwd b.two;
 
-# file: src/root.mach
+# file: src/main.mach
 use std.runtime;
 use print: std.print;
 use example.foo;
