@@ -110,7 +110,7 @@ File issues through the templates. Issues use an orthogonal, faceted tagging sys
 - Severity and state: `critical`, `blocked`, `security`
 - Discussion: `discussion` (design proposals, RFCs, and open debates)
 
-Tags mix and match across sets (for example, `patch`, `fix`, `tooling`). When opening an issue, select the applicable tags in the sidebar. Milestones are not used for tracking in-flight work.
+Tags mix and match across sets (for example, `patch`, `fix`, `tooling`). When opening an issue, select the applicable tags in the sidebar. Milestones record where an issue stands in the current plan and change freely, so the list on GitHub is the reference. Themes are epic issues with native sub-issues. SemVer impact comes from the `major`, `minor` and `patch` tags, never from a milestone.
 
 
 ## Versioning
