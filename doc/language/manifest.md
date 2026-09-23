@@ -1193,7 +1193,7 @@ where it is declared, since one head segment cannot name two projects.
 ```toml
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^6.1"
+version = "^7.4"
 ```
 
 A stanza declares exactly one source:
@@ -1307,10 +1307,27 @@ pre-release in its range.
 A root `version` for an identity **narrows**: it is intersected with every
 requirer's range, and resolution and verification hold the pin to all of them.
 A root `ref` or `path` **overrides**: the requirers' ranges and selectors for
-that identity no longer apply, and `add` and `update` print each one they
-override (`root declares b by ref "branch/main", overriding root -> a 1.0.0
-requires b ^1.2`). A range is therefore never widened silently, and the escape
-hatch is one visible line in the root manifest.
+that identity no longer apply. A range is therefore never widened silently, and
+the escape hatch is one visible line in the root manifest.
+
+An override is always reported. `mach dep pull`, `mach dep update` and `mach
+dep add` print one note on stderr for each requirement a root declaration
+replaced, whatever `--quiet` says, naming the identity, the root's winning
+selection, the requirer chain and what that chain asked for:
+
+```
+note: dependency 'std': the root declares ref = "tag/v2.0.0", overriding
+hedgeacme -> hedge -> std which requires ref = "tag/v2.1.0"; nothing checks that
+'std' supports the root's selection
+```
+
+A requirement that asks for exactly the root's selection is no override and is
+not noted. `mach dep list` shows each root declaration's winning selection
+(`ref=`, `version=` or `path=`, and the recorded `pin=`) and, under it, every
+requirement it overrides (`overrides hedgeacme -> hedge -> std, which requires
+ref = "tag/v2.1.0"`). `mach dep outdated` names the requirements of a chosen
+release that a root or a fixed dependency overrides (`root declares b by ref
+"branch/main", overriding root -> a 1.0.0 requires b ^1.2`).
 
 An override is not checked against the requirers. Because the closure is flat,
 a requirer's `use b.*` binds to whatever the root selected, even a major that
@@ -1370,7 +1387,7 @@ identity yet, resolution starts from the declaring dependency's own committed
 gitlink for it, so a dependency brings the pin it was tested with; `update
 --all` moves every range to the highest release all of them admit; and a root
 declaration of the same identity by `ref` or `path` overrides the range, noted
-as `<declarer> declares <id> by ..., overriding ...`. `pull` refuses a range with
+as above. `pull` refuses a range with
 neither a gitlink nor a checkout under the root and names `mach dep update <root>
 <id>`, which pins it wherever in the closure it is declared.
 
@@ -1427,8 +1444,13 @@ verify` as a command) checks, offline, that:
    dependency is a contained filesystem tree without repository metadata;
 2. its project id equals the directory name;
 3. the closure computed from the realized manifests equals the set of
-   directories under `dep/`: nothing missing (`dependency 'std' is not
-   resolved (missing 'dep/std'); run `mach dep pull <path>`), nothing extra;
+   directories under `dep/`: nothing missing, nothing extra. A dependency with
+   nothing checked out, whether `dep/<id>` is absent or is the empty directory
+   Git leaves for an uninitialized gitlink on a fresh clone, is refused naming
+   the command that realizes it (`dependency 'std' is not realized (nothing
+   checked out at 'dep/std'); run `mach dep pull <path>` for project '<root>'`,
+   and for a `version` selection also `or `mach dep update <path> std` when it
+   has no pin yet`);
 4. there are no cycles (reported as the chain);
 5. every realized manifest's `[project].mach` accepts the running compiler (see
    [Compiler range](#compiler-range));
@@ -1445,19 +1467,34 @@ the pinned release is 1.1.0; run `mach dep update <path> vb` for project
 untagged pin reads `... but the pinned commit '<commit>' carries no release
 tag`.
 
-The committed gitlink is what is verified, and a root `ref` or `path` is the
-override: the root's gitlink is its pin, and a `tag/` it declares is not
-re-checked against that pin (a `commit/` it declares is). For an identity the
-root does **not** declare, every requirer's exact selector (`tag/`, resolved
-through the checkout's own refs, or `commit/`) must be satisfied by the
-realized commit; a mismatch names both commits and the two remedies
-(`dependency 'b': exact ref 'tag/v1.0.0' required by root -> a -> b resolves to
-'<commit>' but the realized commit is '<other>'; run `mach dep update <path> b` to
-re-pin it, or declare the identity at the root to override`; a root `commit/` that does not match
-reads `exact commit ref 'commit/<id>' is not satisfied by the realized commit
-'<other>'`). A `branch/` selector is an input to `update`, never a verify fact.
-The verifier reads the git **index**, so a freshly realized dependency is
-verifiable before it is committed.
+The recorded gitlink is the pin, and two kinds of drift from it are refused,
+each naming the identity and the command that fixes it:
+
+- a `dep/<id>` checkout at another commit than its gitlink (`dependency 'b':
+  the checkout is at '<commit>' but the recorded gitlink is '<other>'; run
+  `mach dep pull <path>` for project '<root>' to restore the recorded pin, or
+  `mach dep update <path> b` to re-pin it to the manifest's selection`);
+- a gitlink outside the manifest's selection. The root's own `tag/` or
+  `commit/` must be satisfied by the pin (`dependency 'b': exact ref
+  'tag/v1.0.0' required by root -> b resolves to '<commit>' but the realized
+  commit is '<other>'; run `mach dep update <path> b` for project '<root>' to
+  re-pin it to the root's selection`; a root `commit/` that does not match
+  reads `exact commit ref 'commit/<id>' is not satisfied by the realized commit
+  '<other>'`), and so must every range the root declares (item 6). `pull`
+  realizes the gitlink as it is, so it never cures this; `update` moves the
+  gitlink to the selection.
+
+A root `ref` or `path` is the override for its identity, so the requirers'
+selectors are not checked against its pin (the override notes above name them).
+For an identity the root does **not** declare, every requirer's exact selector
+(`tag/`, resolved through the checkout's own refs, or `commit/`) must be
+satisfied by the realized commit; a mismatch names both commits and the two
+remedies (`dependency 'b': exact ref 'tag/v1.0.0' required by root -> a -> b
+resolves to '<commit>' but the realized commit is '<other>'; run `mach dep
+update <path> b` for project '<root>' to re-pin it, or declare the identity at
+the root to override`). A `branch/` selector is an input to `update`, never a
+verify fact. The verifier reads the git **index**, so a freshly realized
+dependency is verifiable before it is committed.
 
 `mach dep pull` reads what a Git dependency's `dep/<id>` holds together with
 its record (the staged gitlink, its `.gitmodules` entry, and any module
@@ -1482,7 +1519,11 @@ checkout `remove` retained registers that checkout, and it refuses a dirty one.
 No gitlink command ever runs against a path that is not a checkout of its own.
 
 A path dependency has no pin, so `mach dep pull` syncs its `dep/<id>` with the
-declared `path` every time, and `mach dep update` does the same. A changed
+declared `path` every time, and `mach dep update` does the same, once per
+command. Unless `--quiet`, each says whether the copy was refreshed or reused (`realized hedge
+from ../.. (copy refreshed from its source)`, or `(copy reused: it already
+matched its source)`), so a copy left from another checkout cannot pass
+unnoticed. A build reads the copy as it is and never syncs it. A changed
 `path` realizes the new source. A file the source no longer has is removed and
 named, and a file whose content differs from the source is overwritten and named
 (`replaced 'src/lib.mach' with its source's content`), so local edits to the

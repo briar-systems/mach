@@ -44,6 +44,21 @@ pub fun root_override_text(s: *session.Session, o: *RootOverride) res[str, outco
 
 the note `mach dep verify` prints for one override
 
+## fun override_note
+
+```mach
+pub fun override_note(a: *A.Allocator, name: str, declared: str, chain: str, requested: str) res[str, outcome.Fail];
+```
+
+the note naming one requirement a root declaration overrode, as `mach dep pull`, `update`,
+`add` and `verify` print it
+
+a: allocates the note
+name: the dependency identity
+declared: the root's winning selector, as its manifest line spells it
+chain: the requiring chain, ending at the dependency
+requested: the selector the chain asked for, in the same form
+
 ## rec GitCandidates
 
 ```mach
@@ -482,8 +497,12 @@ pub fun remove_dependency_index(s: *session.Session, root: str, id: str, mode: u
 
 ```mach
 pub fun realize_path_dependency(s: *session.Session, root: str, id: str, src_dir: str,
-mode: u8) err[outcome.Fail];
+mode: u8) res[bool, outcome.Fail];
 ```
+
+sync dep/<id> with a path dependency's source
+
+ret: true when the copy was refreshed, false when it already matched its source and was reused
 
 ## fun realized_ids
 

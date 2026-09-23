@@ -143,7 +143,7 @@ summary that re-lists every failure:
 
 ```
 failures:
-  fails on purpose  src/root.mach:11  (exit 3)
+  fails on purpose  src/main.mach:11  (exit 3)
 
 1 passed, 1 failed, 2 total  (1ms)
 ```
@@ -172,7 +172,7 @@ line, and is still a failing test for the exit code, so the suite exits `1`.
 
 ```
 failures:
-  spins  src/root.mach:4  (timed out after 1s)
+  spins  src/main.mach:4  (timed out after 1s)
 
 0 passed, 1 failed (1 timed out), 1 total  (1.0s)
 ```
