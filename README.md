@@ -204,7 +204,7 @@ $or {
 }
 ```
 
-| | |
+| field | values |
 |---|---|
 | **isa** | x86_64, aarch64, riscv64, riscv32, rv32imc, rv64imafd, …, spirv, wasm32 |
 | **os** | linux, darwin, windows, freestanding, wasi |
