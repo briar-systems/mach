@@ -142,11 +142,13 @@ pub fun load($order: Order, ptr: *i64) i64 {
 A `$if` chain written in declaration scope runs at one of two times, and what its
 arms contain picks which.
 
-- **Some arm declares something.** The chain is decided while names are being
-  resolved, because what it decides is which declarations exist and every later
-  stage reads the resulting declaration set. Nothing has a type at that point, so
-  the gate cannot ask a type question: a layout intrinsic, a type predicate or a
-  `$type_of` comparison there is rejected, with a message naming the reason.
+- **Some arm declares something.** The chain is decided while the modules load,
+  because what it decides is which declarations exist and every later stage reads
+  the resulting declaration set. Nothing has a type at that point, so the gate
+  cannot ask a type question: `$size_of`, `$align_of`, `$length_of`, `$offset_of`,
+  `$type_of`, `$type_name` or an `$is_*` predicate there is rejected, with a
+  message naming the question. So is one the gate reaches through a constant it
+  reads, and the message names the constants it goes through.
 - **No arm declares anything.** The chain contributes no name and no type whichever
   arm is taken, so nothing depends on deciding it early. It is decided during type
   checking instead, where its gate may measure a type (`$size_of`, `$align_of`,
@@ -158,8 +160,23 @@ arm anywhere keeps the whole chain at the earlier time. Per-arm answers are not
 possible: which stage runs the gate would then depend on which arm the gate selects,
 and the stage that would have to know that is the one being chosen.
 
-A `use` is a declaration, so a conditional import is always decided while names are
-resolved. That is what makes the common target-gating form work.
+A `use` is a declaration, so a conditional import is always decided while the modules
+load. That is what makes the common target-gating form work.
+
+A declaring gate reads build facts (`$mach.*`, `$bin.*`, `$project.*`) and `val`
+constants from any module. The gates are decided in one pass that reads constants in
+the order they depend on each other, not the order they are written in: a gate may
+read a constant declared later in its own module, one declared under a later `$if`
+(whose gate is decided first), or one a later `use` imports. A `val` a gate reads may
+be typed through a `def`, followed across `use` and `fwd`, and a cast in the gate
+converts to the integer its destination names. Constants and gates that depend on
+each other have no order that decides them, so the gate is rejected with a message
+naming the cycle:
+
+```mach error depend on each other, so no order decides them
+$if (A == 4) { pub val B: u32 = 4; }
+$if (B == 4) { pub val A: u32 = 4; }
+```
 
 ```mach
 rec MeshUniforms { model: [16]f32; }
@@ -170,11 +187,11 @@ $if ($size_of(MeshUniforms) != 64) {
 }
 ```
 
-```mach error a layout intrinsic is only comptime-evaluable after type checking
+```mach error `$size_of` asks a type question
 rec MeshUniforms { model: [16]f32; }
 
-# the second arm declares, so the whole chain is decided while names are
-# resolved - and the gate is rejected there
+# the second arm declares, so the whole chain is decided while the modules
+# load - and the gate is rejected there
 $if ($size_of(MeshUniforms) != 64) {
     $error("MeshUniforms must be 64 bytes");
 }
