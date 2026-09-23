@@ -50,7 +50,10 @@ rec Segment {
 
 # a value's lifetime is its segments, in position order and never touching;
 # start and end_pos are their hull, live_len the positions they cover, and
-# use_weight over live_len is the density the eviction choice compares
+# use_weight over live_len is the density the eviction choice compares.
+# crosses_call says a segment meets a call anywhere, call_inside that one
+# holds a call strictly within it, where a caller-saved register cannot
+# carry the value
 rec LiveRange {
     vreg:         u32;
     start:        i64;
@@ -59,6 +62,7 @@ rec LiveRange {
     use_weight:   i64;
     reg_class:    u32;
     crosses_call: bool;
+    call_inside:  bool;
     seg_start:    u32;
     seg_count:    u32;
     live_len:     i64;
@@ -594,6 +598,7 @@ fun round_tables_init(ctx: *AllocCtx) err[fail.Fail] {
         ctx.ranges[vi].use_weight   = 0;
         ctx.ranges[vi].reg_class    = f.vregs[vi].class;
         ctx.ranges[vi].crosses_call = false;
+        ctx.ranges[vi].call_inside  = false;
         ctx.ranges[vi].seg_start    = 0;
         ctx.ranges[vi].seg_count    = 0;
         ctx.ranges[vi].live_len     = 0;
@@ -2590,7 +2595,8 @@ fun mark_call_crossing(ctx: *AllocCtx) err[fail.Fail] {
         var k:  u32        = 0;
         for (k < lr.seg_count) {
             val sg: *Segment = ?ctx.segs[lr.seg_start + k];
-            if (prefix[(sg.to + 1)::u32] - prefix[sg.from::u32] > 0) { lr.crosses_call = true; }
+            if (prefix[(sg.to + 1)::u32] - prefix[sg.from::u32] > 0)                    { lr.crosses_call = true; }
+            if (sg.to > sg.from && prefix[sg.to::u32] - prefix[(sg.from + 1)::u32] > 0) { lr.call_inside = true; }
             k = k + 1;
         }
         v = v + 1;
@@ -2676,6 +2682,22 @@ fun linear_scan(tgt: *target.Target, ctx: *AllocCtx) err[fail.Fail] {
             }
             or {
                 preg = pick_fp(ctx, lr.crosses_call);
+            }
+            # a caller-saved register under a call is the whole value spilled
+            # by spill_across_calls; a less dense callee-saved holder gives
+            # way first, as it would under full pressure
+            if (preg >= 0 && ctx.holes && lr.call_inside && !saved_across_calls(ctx, lr.reg_class, isa.regid_index(preg)::u32)) {
+                val r: i32 = cheapest_eviction(ctx, lr);
+                if (r >= 0) {
+                    free_assigned_id(ctx, vid, lr.reg_class, mir.preg_id(preg));
+                    val er: err[fail.Fail] = evict_into(ctx, vid, r);
+                    if (sel er.err) {
+                        A.deallocate[u32](ctx.alloc, order, nv::usize);
+                        ret er;
+                    }
+                    oi = oi + 1;
+                    cnt;
+                }
             }
         }
 
@@ -3042,6 +3064,10 @@ fun transfer_source_reg(ctx: *AllocCtx, src: mir.VRegId, rid: mir.PRegId) {
     }
 }
 
+# the register a sink hint names is often held by an operand of the very
+# instruction that defines this value (`ret a * b` with a in the return
+# register): that holder dies there and hands the register over when the
+# instruction reads it before writing, the same rule intersects applies
 fun pick_sink_hint(ctx: *AllocCtx, v: mir.VRegId, lr: *LiveRange) i32 {
     val rid: i32 = ctx.hints[v.n].sink_preg;
     if (rid < 0) { ret -1; }
@@ -3054,18 +3080,61 @@ fun pick_sink_hint(ctx: *AllocCtx, v: mir.VRegId, lr: *LiveRange) i32 {
         if (idx >= ctx.gp_count)                       { ret -1; }
         if (ctx.reserved[idx])                         { ret -1; }
         if (lr.crosses_call && !ctx.callee_saved[idx]) { ret -1; }
-        if (!gp_available(ctx, idx))                   { ret -1; }
-        ctx.gp_busy[idx] = true;
-        ret rid;
+        if (gp_available(ctx, idx)) {
+            ctx.gp_busy[idx] = true;
+            ret rid;
+        }
+        if (take_from_dying_holder(ctx, lr, true, idx, rid)) { ret rid; }
+        ret -1;
     }
     or {
         if (rclass != isa.REG_CLASS_ID_XMM)                                               { ret -1; }
         if (idx >= ctx.fp_count)                                                          { ret -1; }
         if (lr.crosses_call && (ctx.fp_callee_saved == nil || !ctx.fp_callee_saved[idx])) { ret -1; }
-        if (!fp_available(ctx, idx))                                                      { ret -1; }
-        ctx.fp_busy[idx] = true;
-        ret rid;
+        if (fp_available(ctx, idx)) {
+            ctx.fp_busy[idx] = true;
+            ret rid;
+        }
+        if (take_from_dying_holder(ctx, lr, false, idx, rid)) { ret rid; }
+        ret -1;
     }
+}
+
+# a register that is busy only because its active holder dies at lr's birth
+# passes to lr when the two never meet; every other constraint on the
+# register must still hold
+fun take_from_dying_holder(ctx: *AllocCtx, lr: *LiveRange, gp: bool, idx: u32, rid: i32) bool {
+    if (gp) {
+        if (!ctx.gp_busy[idx])                                               { ret false; }
+        if (ctx.pinned_end[idx] >= 0 || arg_reg_reserved(ctx, idx))          { ret false; }
+        if (def_reg_reserved(ctx, idx) || inactive_conflict(ctx, true, idx)) { ret false; }
+    }
+    or {
+        if (!ctx.fp_busy[idx])                                                  { ret false; }
+        if (ctx.fp_pinned_end != nil && ctx.fp_pinned_end[idx] >= 0)            { ret false; }
+        if (arg_reg_reserved(ctx, rid::u32) || def_reg_reserved(ctx, rid::u32)) { ret false; }
+        if (inactive_conflict(ctx, false, idx))                                 { ret false; }
+    }
+    val holder: u32 = active_holder(ctx, gp, idx);
+    if (holder == mir.MIR_VREG_NIL.n)             { ret false; }
+    if (!dies_at(ctx, holder, lr.start))          { ret false; }
+    if (intersects(ctx, lr, ?ctx.ranges[holder])) { ret false; }
+    transfer_source_reg(ctx, mir.vreg_id(holder), mir.preg_id(rid));
+    ret true;
+}
+
+fun active_holder(ctx: *AllocCtx, gp: bool, idx: u32) u32 {
+    var i: u32 = 0;
+    for (i < ctx.active_count) {
+        val y: u32        = ctx.active[i];
+        val a: mir.PRegId = ctx.f.vregs[y].assigned;
+        if ((ctx.ranges[y].reg_class == REG_CLASS_GP) == gp && !mir.preg_is_nil(a)
+            && isa.regid_index(mir.preg_regid(a))::u32 == idx) {
+            ret y;
+        }
+        i = i + 1;
+    }
+    ret mir.MIR_VREG_NIL.n;
 }
 
 fun pick_target_hint(ctx: *AllocCtx, v: mir.VRegId, lr: *LiveRange) i32 {
@@ -3267,9 +3336,16 @@ fun spill_on_pressure(ctx: *AllocCtx, v: mir.VRegId) err[fail.Fail] {
 # one kept on the stack, so the value read most per position always keeps
 # its register
 fun spill_on_density(ctx: *AllocCtx, v: mir.VRegId) err[fail.Fail] {
-    val lr:    *LiveRange = ?ctx.ranges[v.n];
-    val gp:    bool       = lr.reg_class == REG_CLASS_GP;
-    var count: u32        = ctx.fp_count;
+    val r: i32 = cheapest_eviction(ctx, ?ctx.ranges[v.n]);
+    if (r < 0) { ret spill_vreg(ctx, v); }
+    ret evict_into(ctx, v, r);
+}
+
+# the register whose densest occupant the interval may evict, or -1 when no
+# register admits it or the cheapest occupant is at least as dense
+fun cheapest_eviction(ctx: *AllocCtx, lr: *LiveRange) i32 {
+    val gp:    bool = lr.reg_class == REG_CLASS_GP;
+    var count: u32  = ctx.fp_count;
     if (gp) { count = ctx.gp_count; }
 
     var best_reg:  i32        = -1;
@@ -3294,10 +3370,16 @@ fun spill_on_density(ctx: *AllocCtx, v: mir.VRegId) err[fail.Fail] {
         }
         r = r + 1;
     }
-    if (best_reg < 0 || !less_dense(best_cost, lr)) { ret spill_vreg(ctx, v); }
+    if (best_reg < 0 || !less_dense(best_cost, lr)) { ret -1; }
+    ret best_reg;
+}
 
-    val idx: u32 = isa.regid_index(best_reg)::u32;
-    var ai:  u32 = 0;
+# every occupant of best_reg that meets the interval is spilled and the
+# interval takes the register
+fun evict_into(ctx: *AllocCtx, v: mir.VRegId, best_reg: i32) err[fail.Fail] {
+    val lr:  *LiveRange = ?ctx.ranges[v.n];
+    val idx: u32        = isa.regid_index(best_reg)::u32;
+    var ai:  u32        = 0;
     for (ai < ctx.active_count) {
         val y: u32 = ctx.active[ai];
         if (occupies(ctx, y, lr.reg_class, idx) && intersects(ctx, lr, ?ctx.ranges[y])) {
@@ -3321,6 +3403,11 @@ fun spill_on_density(ctx: *AllocCtx, v: mir.VRegId) err[fail.Fail] {
     mark_assigned_id(ctx, lr.reg_class, mir.preg_id(best_reg));
     assign(ctx, v, mir.preg_id(best_reg), lr.reg_class);
     ret err[fail.Fail].ok{};
+}
+
+fun saved_across_calls(ctx: *AllocCtx, reg_class: u32, idx: u32) bool {
+    if (reg_class == REG_CLASS_GP) { ret idx < ctx.gp_count && ctx.callee_saved[idx]; }
+    ret idx < ctx.fp_count && ctx.fp_callee_saved != nil && ctx.fp_callee_saved[idx];
 }
 
 # the register's fixed constraints for this interval, everything but who
@@ -5867,6 +5954,21 @@ test "mach.lang.be.codegen.regalloc.maybe_reverse_hint:refuses_a_right_operand_t
     ret 0;
 }
 
+# a lane write runs as `d = vec; d.lane = scalar` on aarch64, so the scalar
+# is read after the write and may not share d's register; the vector may
+test "mach.lang.be.codegen.regalloc.defines_by_clobbering:a_lane_write_clobbers_its_scalar_but_not_its_vector" {
+    var ops: [4]mir.MirOperand;
+    ops[0] = mir.op_vreg(mir.vreg_id(3));
+    ops[1] = mir.op_vreg(mir.vreg_id(1));
+    ops[2] = mir.op_imm(0);
+    ops[3] = mir.op_vreg(mir.vreg_id(2));
+    var mi: mir.MirInstr = mir.instr(mir.MIR_VEC_INSERT, ?ops[0], 4, 16, 4);
+    mi.vec_lane = mir.vec_lane_make(mir.VEC_LANE_FLOAT, 4, 4);
+    if (!defines_by_clobbering(?mi, 3, 2)) { ret 1; }
+    if (defines_by_clobbering(?mi, 3, 1))  { ret 2; }
+    ret 0;
+}
+
 test "mach.lang.be.codegen.regalloc.maybe_tie_hint:ties_a_dying_left_operand" {
     var ctx:    AllocCtx;
     var ranges: [3]LiveRange;
@@ -6182,11 +6284,11 @@ rec TScan {
     active:       [4]u32;
     inactive:     [4]u32;
     anchors:      [4]i64;
-    callee_saved: [1]bool;
-    reserved:     [1]bool;
-    busy:         [1]bool;
-    pinned:       [1]i64;
-    param_end:    [1]i64;
+    callee_saved: [2]bool;
+    reserved:     [2]bool;
+    busy:         [2]bool;
+    pinned:       [2]i64;
+    param_end:    [2]i64;
     f:            mir.MirFunction;
     ctx:          AllocCtx;
 }
@@ -6197,37 +6299,43 @@ fun t_scan_init(t: *TScan, holes: bool) bool {
     if (sel mb.err) { ret false; }
     var i: u32 = 0;
     for (i < 4) {
-        t.vregs[i]              = mir.vreg(i, REG_CLASS_GP, false, false);
-        t.ranges[i].vreg        = i;
-        t.ranges[i].start       = POS_MAX;
-        t.ranges[i].end_pos     = -1;
-        t.ranges[i].use_count   = 0;
-        t.ranges[i].use_weight  = 0;
-        t.ranges[i].reg_class   = REG_CLASS_GP;
-        t.ranges[i].seg_start   = 0;
-        t.ranges[i].seg_count   = 0;
-        t.ranges[i].live_len    = 0;
-        t.hints[i].src_vreg     = mir.MIR_VREG_NIL.n;
-        t.hints[i].src_preg     = -1;
-        t.hints[i].copy_pos     = -1;
-        t.hints[i].dst_vreg     = mir.MIR_VREG_NIL.n;
-        t.hints[i].dst_copy_pos = -1;
-        t.hints[i].sink_preg    = -1;
-        t.slots[i]              = false;
-        t.spilled[i]            = false;
-        t.piece_of[i]           = mir.MIR_VREG_NIL.n;
-        t.no_pieces[i]          = false;
-        t.anchors[i]            = -1;
-        i                       = i + 1;
+        t.vregs[i]               = mir.vreg(i, REG_CLASS_GP, false, false);
+        t.ranges[i].vreg         = i;
+        t.ranges[i].start        = POS_MAX;
+        t.ranges[i].end_pos      = -1;
+        t.ranges[i].use_count    = 0;
+        t.ranges[i].use_weight   = 0;
+        t.ranges[i].reg_class    = REG_CLASS_GP;
+        t.ranges[i].crosses_call = false;
+        t.ranges[i].call_inside  = false;
+        t.ranges[i].seg_start    = 0;
+        t.ranges[i].seg_count    = 0;
+        t.ranges[i].live_len     = 0;
+        t.hints[i].src_vreg      = mir.MIR_VREG_NIL.n;
+        t.hints[i].src_preg      = -1;
+        t.hints[i].copy_pos      = -1;
+        t.hints[i].dst_vreg      = mir.MIR_VREG_NIL.n;
+        t.hints[i].dst_copy_pos  = -1;
+        t.hints[i].sink_preg     = -1;
+        t.slots[i]               = false;
+        t.spilled[i]             = false;
+        t.piece_of[i]            = mir.MIR_VREG_NIL.n;
+        t.no_pieces[i]           = false;
+        t.anchors[i]             = -1;
+        i                        = i + 1;
     }
-    t.callee_saved[0] = false;
-    t.reserved[0]     = false;
-    t.busy[0]         = false;
-    t.pinned[0]       = -1;
-    t.param_end[0]    = -1;
-    t.f.vregs         = ?t.vregs[0];
-    t.f.vreg_count    = 0;
-    t.f.block_count   = 0;
+    var r: u32 = 0;
+    for (r < 2) {
+        t.callee_saved[r] = false;
+        t.reserved[r]     = false;
+        t.busy[r]         = false;
+        t.pinned[r]       = -1;
+        t.param_end[r]    = -1;
+        r                 = r + 1;
+    }
+    t.f.vregs       = ?t.vregs[0];
+    t.f.vreg_count  = 0;
+    t.f.block_count = 0;
     t_ctx(?t.ctx, ?t.backing, ?t.f, ?t.slots[0]);
     t.ctx.tgt           = ?t.tgt;
     t.ctx.holes         = holes;
@@ -6293,10 +6401,52 @@ fun t_scan_segment(t: *TScan, from: i64, to: i64) {
 }
 
 fun t_scan_holds_reg0(t: *TScan, v: u32) bool {
+    ret t_scan_holds_reg(t, v, 0);
+}
+
+fun t_scan_holds_reg(t: *TScan, v: u32, idx: i32) bool {
     if (t.spilled[v]) { ret false; }
     val a: mir.PRegId = t.vregs[v].assigned;
     if (mir.preg_is_nil(a)) { ret false; }
-    ret isa.regid_index(mir.preg_regid(a)) == 0;
+    ret isa.regid_index(mir.preg_regid(a)) == idx;
+}
+
+# two registers, reg0 callee-saved and reg1 not; a long value of the given
+# weight holds reg0 across calls when a short dense value that also lives
+# over a call arrives. inside says the short value's call is strictly
+# within its segment
+fun t_call_evict_case(long_weight: i64, inside: bool) i32 {
+    var t: TScan;
+    if (!t_scan_init(?t, true)) { ret 1; }
+    fin { t_scan_dnit(?t); }
+    t.ctx.gp_count    = 2;
+    t.callee_saved[0] = true;
+    t_scan_value(?t, 0, 40, long_weight);
+    t.ranges[0].crosses_call = true;
+    t.ranges[0].call_inside  = true;
+    t_scan_value(?t, 5, 10, 16);
+    t.ranges[1].crosses_call = true;
+    t.ranges[1].call_inside  = inside;
+    val r: err[fail.Fail] = linear_scan(?t.tgt, ?t.ctx);
+    if (sel r.err) { ret 2; }
+    if (t_scan_holds_reg(?t, 1, 0)) {
+        if (!t.spilled[0]) { ret 3; }
+        ret 10;
+    }
+    if (!t_scan_holds_reg(?t, 0, 0)) { ret 4; }
+    if (!t_scan_holds_reg(?t, 1, 1)) { ret 5; }
+    ret 11;
+}
+
+test "mach.lang.be.codegen.regalloc.linear_scan:a_call_crossing_value_evicts_a_sparser_callee_saved_holder" {
+    # the sparse holder gives way: a caller-saved register would only be
+    # spilled whole by spill_across_calls
+    if (t_call_evict_case(4, true) != 10) { ret 1; }
+    # a denser holder keeps its register and the incoming falls back
+    if (t_call_evict_case(400, true) != 11) { ret 2; }
+    # a call only at the segment's edge leaves a caller-saved register usable
+    if (t_call_evict_case(4, false) != 11) { ret 3; }
+    ret 0;
 }
 
 # a value dead across its hole does not hold its register there: the short
@@ -8226,6 +8376,147 @@ test "mach.lang.be.codegen.regalloc.run:a_call_result_pair_reaches_the_next_call
     val a: i32 = t_pair_case("aarch64", "linux", "aapcs64");
     if (a != 0) { code = code | 2 | (a << 4); }
     val r: i32 = t_pair_case("riscv64", "linux", "lp64d");
+    if (r != 0) { code = code | 4 | (r << 4); }
+    ret code;
+}
+
+# `ret hi(a, b)` on one convention: the parameters captured from their
+# registers, the high multiply, the result sunk into the return register
+rec THigh {
+    alloc: A.Allocator;
+    reg:   target.TargetRegistry;
+    tgt:   target.Target;
+    m:     mir.MirModule;
+    f:     mir.MirFunction;
+    block: mir.MirBlock;
+    ret_r: i32;
+    arg:   [2]i32;
+}
+
+fun t_high_op(alloc: *A.Allocator, b: *mir.MirBlock, ix: u32, op: mir.MirOpcode, ops: *mir.MirOperand, n: u32) {
+    b.instrs[ix].opcode        = op;
+    b.instrs[ix].operands      = ops;
+    b.instrs[ix].operand_count = n;
+    b.instrs[ix].width         = 8;
+    b.instrs[ix].src_width     = 8;
+    b.instrs[ix].asm_block     = nil;
+    b.instrs[ix].vec_lane      = mir.VEC_LANE_NONE;
+}
+
+fun t_high_init(t: *THigh, isa_name: str, os_name: str, abi_name: str, pair_op: mir.MirOpcode) bool {
+    val mk: err[A.Error] = page.make(?t.alloc);
+    if (sel mk.err) { ret false; }
+    t.reg = target.registry_init();
+    val rr: err[fail.Fail] = target.register_all(?t.reg, target_testing.debug_descriptor);
+    if (sel rr.err) { ret false; }
+    val ts: res[target.Target, fail.Fail] = target.select(?t.reg, isa_name, os_name, abi_name);
+    if (sel ts.err) { ret false; }
+    t.tgt = ts.ok;
+
+    val slot: abi.ParamSlot = t.tgt.abi.ret_passing(8, 8, false, 0, false, false, 0, 0, abi.agg_none());
+    if (mir.preg_is_nil(slot.reg)) { ret false; }
+    t.ret_r = mir.preg_regid(slot.reg);
+    var regs: [16]isa.Register;
+    val n:    i32 = t.tgt.abi.gp_arg_regs(?regs[0]);
+    if (n < 2) { ret false; }
+    t.arg[0] = regs[0].id;
+    t.arg[1] = regs[1].id;
+
+    val pr: fun(i32) mir.MirOperand = t_pair_preg;
+    t_vregs(?t.alloc, ?t.f, 3);
+    val b:    *mir.MirBlock  = ?t.block;
+    val v0:   mir.MirOperand = mir.op_vreg(mir.vreg_id(0));
+    val v1:   mir.MirOperand = mir.op_vreg(mir.vreg_id(1));
+    val v2:   mir.MirOperand = mir.op_vreg(mir.vreg_id(2));
+    val pair: bool           = t.tgt.arch.div_reg >= 0 && t.tgt.arch.div_hi_reg >= 0;
+    if (pair) {
+        # the shape legalize leaves on a fixed-pair target
+        t_block(?t.alloc, b, 7);
+        val acc: mir.MirOperand = pr(t.tgt.arch.div_reg);
+        val hi:  mir.MirOperand = pr(t.tgt.arch.div_hi_reg);
+        t_mov(?t.alloc, b, 0, v0, pr(t.arg[0]));
+        t_mov(?t.alloc, b, 1, v1, pr(t.arg[1]));
+        t_mov(?t.alloc, b, 2, acc, v0);
+        val ro: res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](?t.alloc, 2::usize);
+        if (sel ro.err) { ret false; }
+        ro.ok[0] = acc;
+        ro.ok[1] = v1;
+        t_high_op(?t.alloc, b, 3, pair_op, ro.ok, 2);
+        t_mov(?t.alloc, b, 4, v2, hi);
+        t_mov(?t.alloc, b, 5, pr(t.ret_r), v2);
+        t_high_op(?t.alloc, b, 6, mir.MIR_RET, nil, 0);
+    }
+    or {
+        t_block(?t.alloc, b, 5);
+        t_mov(?t.alloc, b, 0, v0, pr(t.arg[0]));
+        t_mov(?t.alloc, b, 1, v1, pr(t.arg[1]));
+        val ro: res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](?t.alloc, 3::usize);
+        if (sel ro.err) { ret false; }
+        ro.ok[0] = v2;
+        ro.ok[1] = v0;
+        ro.ok[2] = v1;
+        t_high_op(?t.alloc, b, 2, mir.MIR_MUL_HI_U, ro.ok, 3);
+        t_mov(?t.alloc, b, 3, pr(t.ret_r), v2);
+        t_high_op(?t.alloc, b, 4, mir.MIR_RET, nil, 0);
+    }
+    t.f.blocks      = b;
+    t.f.block_count = 1;
+    t.f.block_cap   = 1;
+    var k: u32 = 0;
+    for (k < b.instr_count) {
+        val stamped: err[fail.Fail] = rules.capture_operand_banks(?t.f, ?b.instrs[k]);
+        if (sel stamped.err) { ret false; }
+        k = k + 1;
+    }
+    t.m.alloc        = ?t.alloc;
+    t.m.interner     = nil;
+    t.m.functions    = ?t.f;
+    t.m.function_len = 1;
+    t.m.function_cap = 1;
+    ret true;
+}
+
+fun t_high_dnit(t: *THigh) {
+    target.registry_dnit(?t.reg);
+}
+
+# the moves that survive allocation between two distinct registers; a self
+# copy is dropped by the rewrite, so this is the count of real moves
+fun t_high_moves(t: *THigh) u32 {
+    var n:  u32 = 0;
+    var ii: u32 = 0;
+    for (ii < t.block.instr_count) {
+        val mi: *mir.MirInstr = ?t.block.instrs[ii];
+        if (mi.opcode == mir.MIR_MOV) { n = n + 1; }
+        ii = ii + 1;
+    }
+    ret n;
+}
+
+# 0 when the result reaches the return register in the moves the machine
+# needs: none on a three-address high multiply, one (the accumulator load)
+# plus one (the high half out) on a fixed pair; the failing code otherwise
+fun t_high_case(isa_name: str, os_name: str, abi_name: str) i32 {
+    var t: THigh;
+    if (!t_high_init(?t, isa_name, os_name, abi_name, mir.MIR_SEL_MUL_PAIR_U)) { ret 1; }
+    fin { t_high_dnit(?t); }
+    val ran: err[fail.Fail] = run(?t.tgt, ?t.m);
+    if (sel ran.err) { ret 2; }
+    var want: u32 = 0;
+    if (t.tgt.arch.div_reg >= 0)  { want = 2; }
+    if (t_high_moves(?t) != want) { ret 3; }
+    ret 0;
+}
+
+# the high half of a widening multiply returned directly: the result takes
+# the return register its dying operand held (#3691). x86-64 is not an arm
+# here: its function-wide reservation of the accumulator pair keeps the
+# result out of rax whatever the hint says, a separate issue
+test "mach.lang.be.codegen.regalloc.run:a_returned_high_multiply_needs_no_scratch_copy" {
+    var code: i32 = 0;
+    val a:    i32 = t_high_case("aarch64", "linux", "aapcs64");
+    if (a != 0) { code = code | 2 | (a << 4); }
+    val r: i32 = t_high_case("riscv64", "linux", "lp64d");
     if (r != 0) { code = code | 4 | (r << 4); }
     ret code;
 }

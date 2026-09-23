@@ -87,51 +87,21 @@ than the source alone, so they are reported at lowering:
 - a secret operand of an **integer multiply**, unless the target declares the
   exact multiply it emits (the low half, a high half or the widening product,
   at that operand width) as data-independent-timing under a condition the
-  build meets. riscv64 with the Zkt extension selected admits the low half at
-  every width and the high halves at 64 bits (RISC-V Cryptography Extensions
-  Volume I, chapter Zkt, which lists `mul`, `mulh`, `mulhsu`, `mulhu` and
-  `mulw`). x86-64 admits the low half, both high halves and the widening
-  product at 8, 16, 32 and 64 bits on every OS, on Intel and on AMD (#3508).
-  On Intel that is a vendor guarantee: the "Data Operand Independent Timing"
-  guidance states that processors which do not enumerate DOITM may be assumed
-  to behave as if it were enabled for the listed instructions, and `mul`,
-  `imul` and `mulx` are on that list. BearSSL's `ctmul` table, measured per
-  core, records a constant-time multiply since the first Pentium. On AMD the
-  evidence is by table rather than by vendor document: AMD publishes no
-  equivalent list and no mode control (absence, verified 2026-09-18), the same
-  BearSSL table records a constant-time multiply at every width for every AMD
-  core from K7 through Zen, no AMD x86-64 core has ever been documented with a
-  data-dependent multiplier, and AMD's SB-1039 advises constant-time
-  algorithms, which presupposes constant-time instructions. Intel's DOITM
-  mode itself hardens the data dependent prefetcher and the fast store
-  forwarding predictor, memory-side predictors the kernel owns, and is out of
-  scope for this decision (#3623). aarch64 declares the Arm ARM's PSTATE.DIT
-  list (`madd`, `smaddl`, `umaddl`, `smulh`, `umulh`) under DIT: the low half
-  at 8, 16, 32 and 64 bits, both high halves at 64 and the widening product at
-  32 hold only while the processor's data-independent-timing mode is on, and a
-  row under that condition is admitted only on an operating system that
-  declares it guarantees the mode (linux and darwin do, see [PSTATE.DIT at run
-  time](#pstatedit-at-run-time)). On windows, freestanding and every other ISA
-  the secret multiply is refused, and the aarch64 refusal names the instruction
-  set's DIT rows and the operating system that declares nothing (#3508). Every
-  lane multiply is refused. `$mach.build.ct_mul(op, width)` reads the same
-  decision at comptime (see `comptime-mach.md`).
-
-  A **128-bit** multiply is never declared by a target, because no target
-  executes one: it is realized from 64-bit cells, and it is admitted exactly
-  when every cell of its realization is. `(a::^u128) * (b::^u128)` with
-  64-bit `a` and `b` is the widening product, one instruction, and is
-  admitted where the 64-bit widening product (x86-64) or the 64-bit high
-  half (aarch64 under DIT, riscv64 under Zkt) is; its high half
-  `(... >> 64)::^u64` is that one instruction. A secret `^u128 * ^u128` low
-  product is the schoolbook over the lanes, three 64-bit low products and
-  the widening one, and is admitted when those are
-  (`$mach.build.ct_mul(low, 128)` says so). A realized cell sits under the
-  same condition as the cells that realize it, so on aarch64 it needs DIT
-  like the high half does. A secret 128-bit `/` or `%` is
-  refused like every secret division: the helper it would call is a loop
-  over the dividend's bits
-- a secret **variable shift count** on a target without a barrel shifter
+  build meets. The declared cells are the table in [Constant-time multiply by
+  instruction set](#constant-time-multiply-by-instruction-set): x86-64 admits
+  every scalar cell unconditionally, aarch64 admits its cells only while
+  PSTATE.DIT is on and only on an operating system that guarantees the mode,
+  riscv64 admits its cells only when the selection holds `m` and `zkt`, and
+  riscv32, SPIR-V and every lane multiply are refused. The refusal names the
+  target and the condition it lacks. `$mach.build.ct_mul(op, width)` reads the
+  same decision at comptime (see `comptime-mach.md`). A secret 128-bit `/` or
+  `%` is refused like every secret division: the helper it would call is a
+  loop over the dividend's bits
+- a secret **variable shift count** on a target without a barrel shifter. Where
+  it is admitted, the saturation of a count at or above the operand width
+  ([operators.md](operators.md#bitwise)) is a compare, a negate and a mask on
+  the count and the result, with no branch, so it reveals nothing the shift
+  itself would not
 
 A secret value passed to a variadic pack is also rejected, including a secret
 wrapped inside an aggregate.
@@ -529,6 +499,133 @@ experimental SPIR-V backend — **rejects `#[oblivious]`**: neither that
 translation nor the device's timing behaviour is covered by the leakage model,
 so the obligation could be neither validated nor upheld. Compile constant-time
 code for a machine target and pass such a target only public data.
+
+## Constant-time multiply by instruction set
+
+`*` on a secret operand means what it means on a public one: the wrapping,
+same-width product. What changes per target is whether the machine can execute
+it without a timing leak, and mach decides that from a catalog each instruction
+set declares, never from a guess. A **row** of the catalog names one cell (a
+multiply, an operand width) and the **condition** under which that cell has
+data-independent timing:
+
+- **always**: nothing to check;
+- **PSTATE.DIT on**: the cell is data-independent only while the processor's
+  DIT mode is set, so the row is admitted only on an operating system that
+  declares it guarantees the mode (see [PSTATE.DIT at run
+  time](#pstatedit-at-run-time));
+- **extensions selected**: the cell is data-independent only on a machine that
+  has the named extensions, so the row is admitted only when the target selects
+  every one of them (`extensions` in the manifest, or the isa string).
+
+The multiply column is the spelling `$mach.build.ct_mul` takes: `low` is the
+same-width product, `high_u` and `high_s` the upper half of the unsigned and
+signed full product, `high_su` the upper half of a signed-by-unsigned product,
+and `wide_u` and `wide_s` the full double-width product of two operands of the
+named width as one instruction. The width is the operand's: a product whose
+result is no wider than the machine's ALU is a `low` cell at the result width
+(`(a::^u64) * (b::^u64)` over 32-bit `a` and `b` is the 64-bit `low` cell on a
+64-bit target), and only a product wider than the ALU is fused into the
+widening cell (see [operators.md](operators.md)). The narrower `wide` and
+`high` rows classify the inline-asm forms (the one-operand `mul r32`) the same
+way.
+The declared rows, one line per multiply:
+
+| Instruction set | Multiply | Widths | Condition |
+|---|---|---|---|
+| `x86_64` | `low` | 8, 16, 32, 64 | always |
+| `x86_64` | `high_u` | 8, 16, 32, 64 | always |
+| `x86_64` | `high_s` | 8, 16, 32, 64 | always |
+| `x86_64` | `wide_u` | 8, 16, 32, 64 | always |
+| `x86_64` | `wide_s` | 8, 16, 32, 64 | always |
+| `aarch64` | `low` | 8, 16, 32, 64 | PSTATE.DIT on |
+| `aarch64` | `high_u` | 64 | PSTATE.DIT on |
+| `aarch64` | `high_s` | 64 | PSTATE.DIT on |
+| `aarch64` | `wide_u` | 32 | PSTATE.DIT on |
+| `aarch64` | `wide_s` | 32 | PSTATE.DIT on |
+| `riscv64` | `low` | 8, 16, 32, 64 | `m` and `zkt` selected |
+| `riscv64` | `high_u` | 64 | `m` and `zkt` selected |
+| `riscv64` | `high_s` | 64 | `m` and `zkt` selected |
+| `riscv64` | `high_su` | 64 | `m` and `zkt` selected |
+| `riscv32` | none | | |
+| `spirv` | none | | |
+
+A test reads this table back against the compiler's catalog, so the two cannot
+drift. A cell the table does not hold is refused, as is every lane multiply
+(`i32x4 * i32x4` on a secret vector): the vector rows exist in the contract and
+no instruction set declares one.
+
+**Realized cells.** A cell no instruction executes directly is admitted exactly
+when every cell of its realization is, under the union of their conditions. On
+x86-64 the one-operand `mul` and `imul` write the full product to a register
+pair, so the high halves and the widening products are the same instruction;
+on aarch64 and riscv64 the full product is the low multiply beside the high
+one (`mul` + `umulh`/`smulh`, `mul` + `mulhu`/`mulh`), so the 64-bit `wide_u`
+and `wide_s` are admitted there through the 64-bit `low` and high rows. A
+**128-bit** multiply is never declared by a target, because no target executes
+one: `(a::^u128) * (b::^u128)` with 64-bit `a` and `b` is the 64-bit widening
+product, one instruction, and its high half `(... >> 64)::^u64` is that same
+instruction; a secret `^u128 * ^u128` low product is the schoolbook over the
+lanes, three 64-bit low products and the widening one. `$mach.build.ct_mul(low,
+128)` and `$mach.build.ct_mul(wide_u, 64)` answer for the realized cells the
+same way the gate does, so on aarch64 they need DIT like the 64-bit high half.
+
+**Why each row holds.** Every row cites its source beside the declaration in the
+instruction set's registration, and the kind of each claim is marked:
+
+- **x86-64, always, Intel and AMD (#3508).** On Intel it is a vendor guarantee:
+  the "Data Operand Independent Timing" guidance states that processors which
+  do not enumerate DOITM may be assumed to behave as if it were enabled for the
+  listed instructions, and `mul` (F6, F7), `imul` (69, 6B, 0F AF, F6, F7) and
+  `mulx` (F6) are on that list, so every operand size of the one- and
+  two-operand forms. BearSSL's `ctmul` table, measured per core, records a
+  constant-time multiply since the first Pentium. On AMD the evidence is by
+  table rather than by vendor document: AMD publishes no equivalent list and no
+  mode control (absence, verified 2026-09-18), the same BearSSL table records a
+  constant-time multiply at every width for every AMD core from K7 through Zen,
+  no AMD x86-64 core has ever been documented with a data-dependent multiplier,
+  and AMD's SB-1039 advises constant-time algorithms, which presupposes
+  constant-time instructions. The compiler emits `imul` for the low half and
+  the one-operand `mul`/`imul` for the high halves and widening products.
+- **aarch64, PSTATE.DIT on.** The Arm ARM (DDI 0487, "About PSTATE.DIT") and
+  the DIT register page of DDI 0601 list the data-processing (3 source)
+  instructions `madd` (`mul`), `msub`, `smaddl` (`smull`), `smsubl`, `smulh`,
+  `umaddl` (`umull`), `umsubl` and `umulh` as data-independent while DIT is
+  set. The 8- and 16-bit low halves are the 32-bit `madd`, the 64-bit high
+  halves are `umulh` and `smulh`, and the 32-bit widening rows are `umaddl`
+  and `smaddl`. Whether a process can set and hold the mode is the operating
+  system's declaration, and on an OS that declares nothing (windows,
+  freestanding) the refusal names the instruction set that declares the rows
+  and the operating system that declares no guarantee.
+- **riscv64, `m` and `zkt` selected.** The RISC-V Cryptography Extensions
+  Volume I (scalar), chapter "Data Independent Execution Latency Subset: Zkt",
+  table RVM, lists `mul`, `mulh`, `mulhsu`, `mulhu` and (rv64) `mulw`, and
+  excludes `div` and `rem`. Zkt changes no instruction: it is a promise about
+  the hart's timing, so like any selected extension it is assumed of every
+  machine the binary runs on. riscv32 declares no rows yet.
+- **SPIR-V** has no timing model and declares nothing.
+
+**DOITM is not a multiply condition.** Intel's Data Operand Independent Timing
+Mode (`IA32_UARCH_MISC_CTL[0]`) hardens the data dependent prefetcher and the
+fast store forwarding predictor, memory-side predictors keyed on data values;
+it does not touch the multiplier, which is why the x86-64 rows hold without it
+(#3623). It is a model-specific register the kernel owns, user space cannot set
+it, and Linux does not enable it by default, so mach neither declares it nor
+offers a manifest key for it. A program that wants that hardening asks the
+operator for the kernel control, the same class as SMT and other side-channel
+mitigations.
+
+**Fail closed, never fall back.** A secret multiply the catalog does not admit
+is a compile error; the compiler never substitutes a bit-serial loop, a
+shift-add expansion or a call for it, and it has no multiply strength
+reduction, so a secret square and a secret multiply by a constant each reach
+the machine as the one multiply instruction. A per-ISA test decodes the emitted
+function and checks exactly that: one multiply, no call, branch or loop, on
+riscv64 through its Zkt rows, x86-64 through its unconditional rows and aarch64
+through its DIT rows on linux and darwin. A program that compiles
+through a `PSTATE.DIT on` row and reaches a processor without the mode is
+refused at start by the std runtime, before any secret is multiplied, as the
+next section describes.
 
 ## PSTATE.DIT at run time
 

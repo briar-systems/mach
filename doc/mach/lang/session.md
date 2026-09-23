@@ -74,6 +74,21 @@ pub fun module_count(s: *Session) u32;
 pub fun register_module_fqn(s: *Session, mid: module.ModuleId, fqn: intern.StrId) err[fail.Fail];
 ```
 
+## fun register_module_root_project
+
+```mach
+pub fun register_module_root_project(s: *Session, mid: module.ModuleId, root: bool) err[fail.Fail];
+```
+
+## fun module_is_root_project
+
+```mach
+pub fun module_is_root_project(s: *Session, mid: module.ModuleId) bool;
+```
+
+a module the loader never declared is not the root project's: a dependency's
+module, or one loaded outside a project, exports nothing of its own
+
 ## fun module_fqn
 
 ```mach
@@ -109,6 +124,19 @@ pub fun module_id_for_stable(s: *Session, stable: module.StableModuleId) module.
 ```mach
 pub fun register_export_name(s: *Session, mid: module.ModuleId, did: u32, name: intern.StrId) err[fail.Fail];
 ```
+
+## fun forget_export_names
+
+```mach
+pub fun forget_export_names(s: *Session, mid: module.ModuleId, decl_count: u32);
+```
+
+drop every export name one module registered, before its syntax tree is replaced and
+its declaration ids no longer name the same declarations
+
+s: the session
+mid: the module whose names go
+decl_count: the declaration count of the AST they were registered against
 
 ## fun export_name
 

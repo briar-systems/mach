@@ -45,6 +45,6 @@ pub rec ArMember;
 ## fun write_archive
 
 ```mach
-pub fun write_archive(alloc: *A.Allocator, members: *ArMember, count: u32, destination: *publication.Destination) err[fail.Fail];
+pub fun write_archive(alloc: *A.Allocator, members: *ArMember, count: u32, destination: str) err[fail.Fail];
 ```
 

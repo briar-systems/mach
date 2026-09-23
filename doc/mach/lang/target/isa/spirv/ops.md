@@ -81,6 +81,16 @@ pub val SH_CONVERT: Shape = 4
 <type> <result> a, the source typed from `src_float` when its operand
 carries no type of its own
 
+## val SH_SHIFT
+
+```mach
+pub val SH_SHIFT: Shape = 5
+```
+
+<type> <result> base shift, result and base typed as the destination while
+the shift keeps its own integer type: SPIR-V lets the shift's bit width
+differ from the base's, and mach types a count by its own operand
+
 ## rec MirMap
 
 ```mach

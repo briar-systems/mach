@@ -79,3 +79,9 @@ pub fun place_equal(sc: *context.SemaContext, a: id.ExprId, b: id.ExprId) bool;
 two place expressions name the same storage when they are spelled the same way over the same
 bindings; this is lexical identity, exactly what a guard region is
 
+## fun span_text_equal
+
+```mach
+pub fun span_text_equal(sc: *context.SemaContext, a: token.Span, b: token.Span) bool;
+```
+

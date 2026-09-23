@@ -163,6 +163,18 @@ pub def NaturalStackArgsFn: fun(u32) bool
 pub def ReservedGpFn: fun(u32) u32
 ```
 
+## def DitGuaranteedFn
+
+```mach
+pub def DitGuaranteedFn: fun(u32) bool
+```
+
+whether the os guarantees, on one instruction set, the processor's
+data-independent-timing mode a DIT_MODE constant-time multiply row needs: a
+process can set the mode at start, the kernel exposes whether the processor
+has it, and the mode is per-thread state the os preserves. declared per (os,
+isa) with its citations beside the declaration, never derived (#3508)
+
 ## rec VaList
 
 ```mach
@@ -321,6 +333,15 @@ pub fun variadic_stack_for(vt: *OsVTable, arch_id: u32) bool;
 ```mach
 pub fun reserved_gp_for(vt: *OsVTable, arch_id: u32) u32;
 ```
+
+## fun dit_guaranteed_for
+
+```mach
+pub fun dit_guaranteed_for(vt: *OsVTable, arch_id: u32) bool;
+```
+
+the one door onto the DIT declaration: an os that declares nothing
+guarantees nothing
 
 ## fun natural_stack_args_for
 

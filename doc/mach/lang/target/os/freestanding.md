@@ -9,8 +9,11 @@ pub val FREESTANDING_BASE_ADDR: u64 = 0
 ## val FREESTANDING_PAGE_SIZE
 
 ```mach
-pub val FREESTANDING_PAGE_SIZE: u64 = 1
+pub val FREESTANDING_PAGE_SIZE: u64 = 0
 ```
+
+no loader of its own: a page-mapping format takes the isa's hardware page, a
+flat image has no page (#3360)
 
 ## fun freestanding_va_list
 

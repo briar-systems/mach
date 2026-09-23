@@ -223,7 +223,18 @@ pub rec ParamSlot;
 ```
 
 reg is the physical register the slot rides, MIR_PREG_NIL for a stack slot;
-the constructors take the isa regid the packs select (-1 for none)
+the constructors take the isa regid the packs select (-1 for none).
+gp_consumed is how many general registers the argument takes out of the
+sequence, which the constructors set to the GP pieces it rides; a classifier
+raises it where its ABI skips or exhausts registers without using them
+(AAPCS64 C.10 rounds a double-word to an even register, C.11 gives the
+remaining registers to nothing once one spills to the stack) (#3511)
+
+## fun gp_piece_count
+
+```mach
+pub fun gp_piece_count(s: *ParamSlot) i32;
+```
 
 ## val EB_SSE_LO
 

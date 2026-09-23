@@ -24,6 +24,12 @@ pub fun section_install(o: *of.ObjectImage, s: *of.Section) res[u32, fail.Fail];
 pub fun symbol_add(o: *of.ObjectImage, sym: of.Symbol) res[u32, fail.Fail];
 ```
 
+## fun export_request_add
+
+```mach
+pub fun export_request_add(o: *of.ObjectImage, name: intern.StrId) err[fail.Fail];
+```
+
 ## fun add_frame
 
 ```mach
@@ -96,6 +102,6 @@ src: *of.ObjectImage, remap: intern.ReinternMap) res[of.ObjectImage, fail.Fail];
 ## fun emit_image
 
 ```mach
-pub fun emit_image(o: *of.ObjectImage, tgt: *target.Target, destination: *publication.Destination) err[fail.Fail];
+pub fun emit_image(o: *of.ObjectImage, tgt: *target.Target, destination: str) err[fail.Fail];
 ```
 

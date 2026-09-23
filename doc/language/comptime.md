@@ -51,6 +51,13 @@ and `version`. A path the root does not carry, `$project.name` and
 the path. See
 [comptime-mach.md](comptime-mach.md) for the `$mach.*` subtree.
 
+`$bin.name` is the table key of the artifact the module is compiled for. A build
+compiles one artifact, so every module reads that artifact's key. An editor
+session analyzes the project as the union of every artifact, and there a module
+reads the artifact whose walk reached it first: the primary artifact when its
+walk reaches the module, otherwise the first artifact in manifest order that
+does; a module first reached behind a gate decided later reads its importer's.
+
 ```mach fragment
 val ver: str = $project.version;                 # "2.0.0", from [project].version
 $if ($project.target.os == "windows") { ... }    # the declared os string
@@ -127,6 +134,13 @@ fun main(argc: i64, argv: **u8) i64 {
   counterexample: it splices its body once per element of a fixed comptime
   sequence (a variadic pack, `$fields(T)`, or a constant array `val`), a bounded
   structural expansion resolved at compile time, not an iterated computation.
+- No compile-time evaluation of user functions, ever: a call in a `val`
+  initializer is a runtime call. A lookup table is committed as generator
+  output next to its generator and held to it by a `test` (equality with the
+  generator when it is deterministic, the property it searched for when it is
+  randomised, and no startup fallback that repairs a bad constant before the
+  test sees it), or built at startup into a module-private `var`; a
+  module-scope `val` lands in read-only data.
 - No bare `$ident` — see above.
 
 ## See also

@@ -14,6 +14,7 @@ use std.types.string.str_contains;
 
 use A: std.allocator;
 
+use mach.lang.diagnostic;
 use mach.lang.intern;
 use mach.lang.me.ir;
 use mach.lang.me.ir.body;
@@ -32,6 +33,8 @@ use mach.lang.me.pass.dce;
 use mach.lang.me.pass.inline;
 use mach.lang.me.pass.mem2reg;
 use mach.lang.me.pass.scalarize;
+use mach.lang.me.pass.vecload;
+use mach.lang.me.pass.vecwiden;
 use mach.lang.me.pass.wideconv;
 use mach.lang.me.pass.widediv;
 use mach.lang.me.pass.widenmul;
@@ -58,6 +61,8 @@ pub rec VectorizeEnabledOption { v: bool; }
 pub rec SimdRequireOption      { v: bool; }
 pub rec FloatReassocOption     { v: bool; }
 
+# diags is the module's diagnostic store: a shape or `simd = "require"` refusal
+# is a located error there, never a bare failure
 pub rec PipelineRequest {
     module:            *ir.Module;
     available:         *body.Available;
@@ -68,6 +73,9 @@ pub rec PipelineRequest {
     float_reassoc:     FloatReassocOption;
     interner:          *intern.Interner;
     source_map:        *source.SourceMap;
+    # the module's diagnostic store: a shape or `simd = "require"` refusal is a
+    # located error there, never a bare failure
+    diags: *diagnostic.DiagnosticStore;
 }
 
 pub fun run(req: *PipelineRequest) res[bool, fail.Fail] {
@@ -76,10 +84,10 @@ pub fun run(req: *PipelineRequest) res[bool, fail.Fail] {
     if (req.interner == nil) { ret res[bool, fail.Fail].err{fail.message("pipeline request: interner is required")}; }
 
     ret run_impl(req.module, req.target, req.level, req.vectorize_enabled.v,
-        req.simd_require.v, req.float_reassoc.v, req.interner, req.source_map, req.available);
+        req.simd_require.v, req.float_reassoc.v, req.interner, req.source_map, req.available, req.diags);
 }
 
-fun run_impl(m: *ir.Module, tgt: *target.Target, level: OptLevel, vectorize_enabled: bool, simd_require: bool, float_reassoc: bool, itn: *intern.Interner, srcmap: *source.SourceMap, available: *body.Available) res[bool, fail.Fail] {
+fun run_impl(m: *ir.Module, tgt: *target.Target, level: OptLevel, vectorize_enabled: bool, simd_require: bool, float_reassoc: bool, itn: *intern.Interner, srcmap: *source.SourceMap, available: *body.Available, diags: *diagnostic.DiagnosticStore) res[bool, fail.Fail] {
     var vc: VerifyCtx;
     vc.tgt    = tgt;
     vc.itn    = itn;
@@ -213,6 +221,33 @@ fun run_impl(m: *ir.Module, tgt: *target.Target, level: OptLevel, vectorize_enab
         }
     }
 
+    # a vector literal whose lanes are consecutive scalar loads from one
+    # pointer at stride one becomes the one vector load the reinterpret
+    # spells; the slot and its stores go, and the lane loads they leave
+    # unread go with dce
+    val vecload_changed_r: res[bool, fail.Fail] = vecload.run(m, ws);
+    if (sel vecload_changed_r.err) { ret vecload_changed_r; }
+    if (vecload_changed_r.ok) {
+        changed = true;
+        val dce_vecload_changed_r: res[bool, fail.Fail] = dce.run_in(m, ws);
+        if (sel dce_vecload_changed_r.err) { ret dce_vecload_changed_r; }
+        val res_verify_vecload: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
+        if (sel res_verify_vecload.err) { ret res[bool, fail.Fail].err{res_verify_vecload.err}; }
+    }
+
+    # a vector literal that spells the extension of one source's half becomes
+    # the lane-halving widen op wherever the target packs it; the slot and
+    # its stores go, and the extractions they leave unread go with dce
+    val vecwiden_changed_r: res[bool, fail.Fail] = vecwiden.run(m, tgt, ws);
+    if (sel vecwiden_changed_r.err) { ret vecwiden_changed_r; }
+    if (vecwiden_changed_r.ok) {
+        changed = true;
+        val dce_vecwiden_changed_r: res[bool, fail.Fail] = dce.run_in(m, ws);
+        if (sel dce_vecwiden_changed_r.err) { ret dce_vecwiden_changed_r; }
+        val res_verify_vecwiden: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
+        if (sel res_verify_vecwiden.err) { ret res[bool, fail.Fail].err{res_verify_vecwiden.err}; }
+    }
+
     # a widening multiply is selected at every level, before placement reads
     # each operator's declared form; an extension it leaves unread goes with dce
     val widen_changed_r: res[bool, fail.Fail] = widenmul.run(m, tgt);
@@ -238,11 +273,11 @@ fun run_impl(m: *ir.Module, tgt: *target.Target, level: OptLevel, vectorize_enab
         if (sel res_verify_widecall.err) { ret res[bool, fail.Fail].err{res_verify_widecall.err}; }
     }
 
-    val res_declared: err[fail.Fail] = declared_check(m, tgt, itn);
+    val res_declared: err[fail.Fail] = declared_check(m, tgt, itn, diags);
     if (sel res_declared.err) { ret res[bool, fail.Fail].err{res_declared.err}; }
 
     if (simd_require) {
-        val res_req: err[fail.Fail] = require_check(m, tgt, itn);
+        val res_req: err[fail.Fail] = require_check(m, tgt, itn, diags);
         if (sel res_req.err) { ret res[bool, fail.Fail].err{res_req.err}; }
     }
 
@@ -274,12 +309,13 @@ fun run_impl(m: *ir.Module, tgt: *target.Target, level: OptLevel, vectorize_enab
 }
 
 # a vector operator whose shape the target's catalog does not name is refused in
-# every simd mode: the outcome is a declaration, never a fallback
-fun declared_check(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner) err[fail.Fail] {
+# every simd mode: the outcome is a declaration, never a fallback. the refusal
+# is a located error on the store, so the tally and exit status agree
+fun declared_check(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner, diags: *diagnostic.DiagnosticStore) err[fail.Fail] {
     var site:  scalarize.ScalarizeSite;
     val count: u32 = scalarize.detect_undeclared(m, tgt, ?site);
     if (count == 0) { ret err[fail.Fail].ok{}; }
-    ret err[fail.Fail].err{fail.message(undeclared_msg(m, tgt, itn, ?site))};
+    ret err[fail.Fail].err{diagnostic.reject(diags, site.loc, undeclared_msg(m, tgt, itn, ?site))};
 }
 
 # the diagnostic spelling of a site's vector operation; a descriptor vector tag
@@ -317,11 +353,11 @@ fun undeclared_text(m: *ir.Module, tgt: *target.Target, op: str, fname: str, sit
     ret res[str, fail.Fail].ok{r_241.ok};
 }
 
-fun require_check(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner) err[fail.Fail] {
+fun require_check(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner, diags: *diagnostic.DiagnosticStore) err[fail.Fail] {
     var site:  scalarize.ScalarizeSite;
     val count: u32 = scalarize.detect(m, tgt, ?site);
     if (count == 0) { ret err[fail.Fail].ok{}; }
-    ret err[fail.Fail].err{fail.message(require_msg(m, tgt, itn, ?site))};
+    ret err[fail.Fail].err{diagnostic.reject(diags, site.loc, require_msg(m, tgt, itn, ?site))};
 }
 
 fun require_msg(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner, site: *scalarize.ScalarizeSite) str {
@@ -1007,15 +1043,25 @@ test "mach.lang.me.pipeline.run:simd_require_gate" {
     preq1.float_reassoc     = FloatReassocOption{v: false};
     preq1.interner          = ?itn;
     preq1.source_map        = nil;
+    var diags1: diagnostic.DiagnosticStore = diagnostic.store_init(?alloc);
+    fin { diagnostic.store_dnit(?diags1); }
+    preq1.diags = ?diags1;
     val e1: res[bool, fail.Fail] = run(?preq1);
     if (sel e1.ok) { code = 1; }
     or (sel e1.err) {
-        val msg: str = fail.describe(e1.err);
-        if (!str_contains(msg, "simd = \"require\"")) { code = 1; }
-        if (!str_contains(msg, "add"))                { code = 1; }
-        if (!str_contains(msg, "kernel"))             { code = 1; }
-        if (!str_contains(msg, "riscv64"))            { code = 1; }
-        if (!str_contains(msg, "4 lanes of 32 bits")) { code = 1; }
+        # the refusal is one located error on the store and the pass answers reported
+        if (!fail.is_reported(e1.err))            { code = 1; }
+        if (diagnostic.error_count(?diags1) != 1) { code = 1; }
+        val d1: opt[*diagnostic.Diagnostic] = diagnostic.get(?diags1, 0);
+        if (sel d1.none) { code = 1; }
+        or (sel d1.some) {
+            val msg: str = d1.some.message;
+            if (!str_contains(msg, "simd = \"require\"")) { code = 1; }
+            if (!str_contains(msg, "add"))                { code = 1; }
+            if (!str_contains(msg, "kernel"))             { code = 1; }
+            if (!str_contains(msg, "riscv64"))            { code = 1; }
+            if (!str_contains(msg, "4 lanes of 32 bits")) { code = 1; }
+        }
     }
     ir.dnit(?m);
 
@@ -1056,15 +1102,19 @@ test "mach.lang.me.pipeline.run:simd_require_gate" {
     if (sel r_687.err) { code = 1; }
     ir.dnit(?m2);
 
-    if (mul_require_refused(?alloc, ?itn, ?reg, "x86_64", "sysv64") != 1)   { code = 1; }
-    if (mul_require_refused(?alloc, ?itn, ?reg, "riscv64", "lp64d") != 1)   { code = 1; }
-    if (mul_require_refused(?alloc, ?itn, ?reg, "aarch64", "aapcs64") != 0) { code = 1; }
+    # x86-64 packs the 32-bit multiply through the pmuludq sequences (#3739)
+    # and scalarizes the 8-bit one; NEON has no 64-bit lane multiply
+    if (mul_require_refused(?alloc, ?itn, ?reg, "x86_64", "sysv64", 32) != 0)   { code = 1; }
+    if (mul_require_refused(?alloc, ?itn, ?reg, "x86_64", "sysv64", 8) != 1)    { code = 1; }
+    if (mul_require_refused(?alloc, ?itn, ?reg, "riscv64", "lp64d", 32) != 1)   { code = 1; }
+    if (mul_require_refused(?alloc, ?itn, ?reg, "aarch64", "aapcs64", 32) != 0) { code = 1; }
+    if (mul_require_refused(?alloc, ?itn, ?reg, "aarch64", "aapcs64", 64) != 1) { code = 1; }
 
     intern.dnit(?itn);
     ret code;
 }
 
-fun mul_require_refused(alloc: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry, isa_name: str, abi_name: str) i32 {
+fun mul_require_refused(alloc: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry, isa_name: str, abi_name: str, lane_bits: u32) i32 {
     val trr: res[resolved.Target, fail.Fail] = target.select(reg, isa_name, "linux", abi_name);
     if (sel trr.err) { ret 2; }
     var rv: resolved.Target = trr.ok;
@@ -1075,12 +1125,12 @@ fun mul_require_refused(alloc: *A.Allocator, itn: *intern.Interner, reg: *target
     val rm: res[ir.Module, fail.Fail] = ir.init(alloc, intern.STR_NIL);
     if (sel rm.err) { ret 2; }
     var m:  ir.Module                        = rm.ok;
-    val ri: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 32);
+    val ri: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, lane_bits);
     if (sel ri.err) {
         ir.dnit(?m);
         ret 2;
     }
-    val rvt: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_vector(?m.types, ri.ok, 4);
+    val rvt: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_vector(?m.types, ri.ok, 128 / lane_bits);
     if (sel rvt.err) {
         ir.dnit(?m);
         ret 2;
@@ -1141,19 +1191,30 @@ test "mach.lang.me.pipeline.run:undeclared_vector_shape_is_refused_in_every_simd
     if (sel trr.err) { ret 1; }
     var rv: resolved.Target = trr.ok;
 
-    if (vector_mul_outcome(?alloc, ?itn, ?rv, 32, false) != 0) { ret 2; }
-    if (vector_mul_outcome(?alloc, ?itn, ?rv, 16, false) != 0) { ret 3; }
+    # the 8-bit multiply is x86-64's scalar-row cell (the wider lanes pack
+    # through the pmuludq sequences since #3739); dropping the scalar rows
+    # leaves it undeclared in every simd mode while the packed cells stay
+    if (vector_mul_outcome(?alloc, ?itn, ?rv, 8, false) != 0)  { ret 2; }
+    if (vector_mul_outcome(?alloc, ?itn, ?rv, 32, false) != 0) { ret 3; }
     rv.model.scalar_form_len = 0;
-    val undeclared: i32 = vector_mul_outcome(?alloc, ?itn, ?rv, 32, false);
+    val undeclared: i32 = vector_mul_outcome(?alloc, ?itn, ?rv, 8, false);
     if (undeclared != 1)                                        { ret 4; }
-    if (vector_mul_outcome(?alloc, ?itn, ?rv, 32, true) != 1)   { ret 5; }
-    if (vector_mul_outcome(?alloc, ?itn, ?rv, 16, false) != 0)  { ret 6; }
+    if (vector_mul_outcome(?alloc, ?itn, ?rv, 8, true) != 1)    { ret 5; }
+    if (vector_mul_outcome(?alloc, ?itn, ?rv, 32, false) != 0)  { ret 6; }
     if (vector_mul_outcome(?alloc, ?itn, ?rv, 128, false) != 3) { ret 7; }
     ret 0;
 }
 
+fun lane_text(lane_bits: u32) str {
+    if (lane_bits == 8)  { ret "16 lanes of 8 bits"; }
+    if (lane_bits == 16) { ret "8 lanes of 16 bits"; }
+    if (lane_bits == 32) { ret "4 lanes of 32 bits"; }
+    ret "2 lanes of 64 bits";
+}
+
 # 0 when the pipeline accepts the vector multiply, 1 when it refuses it as an
-# undeclared cell, 3 when it refuses the lane shape as outside the vocabulary
+# undeclared cell, 3 when it refuses the lane shape as outside the vocabulary,
+# 10 to 12 when a refusal is not one located error answered as reported
 fun vector_mul_outcome(alloc: *A.Allocator, itn: *intern.Interner, rv: *resolved.Target, lane_bits: u32, require: bool) i32 {
     val rfn: res[intern.StrId, A.Error] = intern.intern(itn, "kernel");
     if (sel rfn.err) { ret 9; }
@@ -1213,14 +1274,22 @@ fun vector_mul_outcome(alloc: *A.Allocator, itn: *intern.Interner, rv: *resolved
     preq.float_reassoc     = FloatReassocOption{v: false};
     preq.interner          = itn;
     preq.source_map        = nil;
+    var diags: diagnostic.DiagnosticStore = diagnostic.store_init(alloc);
+    fin { diagnostic.store_dnit(?diags); }
+    preq.diags = ?diags;
     val r: res[bool, fail.Fail] = run(?preq);
     ir.dnit(?m);
     if (sel r.ok) { ret 0; }
-    val msg: str = fail.describe(r.err);
+    # a refusal is one located error on the store, answered as reported
+    if (!fail.is_reported(r.err))            { ret 10; }
+    if (diagnostic.error_count(?diags) != 1) { ret 11; }
+    val d: opt[*diagnostic.Diagnostic] = diagnostic.get(?diags, 0);
+    if (sel d.none) { ret 12; }
+    val msg: str = d.some.message;
     if (str_contains(msg, "outside the retained vocabulary") && str_contains(msg, "multiply")
         && str_contains(msg, "kernel") && str_contains(msg, "x86_64")) { ret 3; }
     if (str_contains(msg, "has no declared form on x86_64") && str_contains(msg, "multiply")
-        && str_contains(msg, "kernel") && str_contains(msg, "lanes of 32 bits")) { ret 1; }
+        && str_contains(msg, "kernel") && str_contains(msg, lane_text(lane_bits))) { ret 1; }
     ret 2;
 }
 

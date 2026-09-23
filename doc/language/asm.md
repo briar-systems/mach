@@ -129,7 +129,8 @@ token.** What counts as a contradiction is per mnemonic:
 
 | shape | rule |
 |---|---|
-| most instructions | every operand shares one width, so a prefix must agree with any register operand; with no register operand it *sets* the width |
+| most instructions | every operand shares one width, so a prefix must agree with any register operand, and two register operands of different widths (`add rax, ecx`) name no form; with no register operand the prefix *sets* the width |
+| `shl` / `shr` / `sar`, `shld` / `shrd` | the count is `cl` or an immediate whatever the width of the operand shifted |
 | `movzx` / `movsx` | the source is narrower by design, so a memory source **must** be sized, and the size must be strictly narrower than the destination |
 | `push` / `pop`, indirect `call` / `jmp` | fixed 64-bit in long mode, so any narrower prefix names no instruction |
 | `lidt` | its pseudo-descriptor is ten bytes, which no keyword names |
@@ -138,6 +139,36 @@ So `mov eax, word [rcx]` is refused (two widths for one access), and
 `movzx eax, [rcx]` is refused too — an unsized source names no width at all, and
 reading it as a same-width move would silently assemble a plain `mov` where a
 zero-extending load was written.
+
+## Bit scans, byte swap, multiply and double shifts (x86-64)
+
+```mach fragment
+asm x86_64 {
+    bsf rax, rcx              # index of the lowest set bit; zf set and rax undefined when rcx is 0
+    bsr rdx, qword [rdi]      # index of the highest set bit
+    tzcnt r8, r9              # trailing zeros, 64 for a zero source (bmi1)
+    lzcnt eax, dword [rsi]    # leading zeros, 32 for a zero source (lzcnt)
+    popcnt rax, rcx           # set bits (popcnt)
+    bswap rax                 # reverse the bytes of a 32- or 64-bit register
+    imul rax, rcx             # rax = rax * rcx, low half
+    imul rax, rcx, 5          # rax = rcx * 5, low half, with a 32-bit signed immediate
+    imul eax, dword [rdi], 7  # the source may be memory in either form
+    shld rax, rcx, 5          # shift rax left, bits from rcx fill from the right
+    shrd qword [rdi], rax, cl # the memory operand is shifted, rax feeds bits, cl counts
+}
+```
+
+The scans and counts take a 16-, 32- or 64-bit register destination and a
+register or memory source of the same width. `bsf` and `bsr` set ZF on a zero
+source and leave the destination undefined, which the effect model reports as
+writing the flags; the three counts need their extension, listed under
+[Extension instructions](#extension-instructions). `bswap` takes one 32- or
+64-bit register, and has no 16-bit form. `imul` in two or three operands is the
+signed multiply with the low half kept; the one-operand widening form is not
+spelled. `shld` and `shrd` take the register or memory shifted, a register of the
+same width feeding bits, and a count of 0 to 255 or `cl`. A secret in `cl` is a
+variable-latency count for the constant-time check, as it is for `shl`; an
+immediate count is not.
 
 ## Segment-relative memory (x86-64)
 
@@ -191,7 +222,7 @@ relocation is correct after a trailing immediate.
 | form | mnemonics |
 |---|---|
 | move, in either direction between a register and memory | `movdqa`, `movdqu`, `movaps`, `movups` |
-| `xmm, xmm/m128` | `paddb` `paddw` `paddd` `paddq`, `psubb` `psubw` `psubd` `psubq` `psubusb` `psubusw`, `pmullw`, `pand` `por` `pxor`, `pcmpeqb` `pcmpeqw` `pcmpeqd` `pcmpgtb` `pcmpgtw` `pcmpgtd`, `punpcklbw` `punpcklwd` `punpckldq`, `packsswb` `packssdw`, `addps` `subps` `mulps` `divps` `addpd` `subpd` `mulpd` `divpd`, `cvtdq2ps` `cvttps2dq` `cvtdq2pd` `cvttpd2dq` `cvtps2pd` `cvtpd2ps` |
+| `xmm, xmm/m128` | `paddb` `paddw` `paddd` `paddq`, `psubb` `psubw` `psubd` `psubq` `psubusb` `psubusw`, `pmullw` `pmulhw` `pmulhuw` `pmuludq`, `pand` `por` `pxor`, `pcmpeqb` `pcmpeqw` `pcmpeqd` `pcmpgtb` `pcmpgtw` `pcmpgtd`, `punpcklbw` `punpcklwd` `punpckldq` `punpckhbw` `punpckhwd` `punpckhdq`, `packsswb` `packssdw`, `addps` `subps` `mulps` `divps` `addpd` `subpd` `mulpd` `divpd`, `cvtdq2ps` `cvttps2dq` `cvtdq2pd` `cvttpd2dq` `cvtps2pd` `cvtpd2ps` |
 | `xmm, xmm/m128, imm8` | `pshufd`, `cmpps`, `cmppd` |
 
 **aarch64** spells them `vN.16b`, `vN.8h`, `vN.4s` or `vN.2d`. The suffix is the
@@ -243,11 +274,19 @@ inherits its function's set.
 | isa | extension | mnemonics |
 |---|---|---|
 | x86_64 | `ssse3` | `pshufb xmm, xmm/m128`, `palignr xmm, xmm/m128, imm8` |
-| x86_64 | `sse41` | `pblendw xmm, xmm/m128, imm8`, `ptest xmm, xmm/m128`, `pinsrd xmm, r32/m32, imm8`, `pextrd r32/m32, xmm, imm8` |
+| x86_64 | `sse41` | `pblendw xmm, xmm/m128, imm8`, `ptest xmm, xmm/m128`, `pinsrd xmm, r32/m32, imm8`, `pextrd r32/m32, xmm, imm8`, `pmulld xmm, xmm/m128`, `pmovsxbw` `pmovsxwd` `pmovsxdq` `pmovzxbw` `pmovzxwd` `pmovzxdq` `xmm, xmm/m64` |
 | x86_64 | `sha` | `sha256rnds2 xmm, xmm/m128`, `sha256msg1 xmm, xmm/m128`, `sha256msg2 xmm, xmm/m128` |
 | x86_64 | `fsgsbase` | `rdfsbase r32/r64`, `rdgsbase r32/r64`, `wrfsbase r32/r64`, `wrgsbase r32/r64` |
+| x86_64 | `popcnt` | `popcnt r16/32/64, r/m` (CPUID leaf 1, ECX bit 23) |
+| x86_64 | `lzcnt` | `lzcnt r16/32/64, r/m` (CPUID leaf 0x80000001, ECX bit 5) |
+| x86_64 | `bmi1` | `tzcnt r16/32/64, r/m` (CPUID leaf 7, EBX bit 3) |
 | aarch64 | `sha2` | `sha256h qN, qN, vN.4s`, `sha256h2 qN, qN, vN.4s`, `sha256su0 vN.4s, vN.4s`, `sha256su1 vN.4s, vN.4s, vN.4s` |
 | aarch64 | `sb` | `sb` (the FEAT_SB speculation barrier) |
+
+A manifest [level](manifest.md#levels) (`extensions = ["x86-64-v2"]`) selects every
+member name, so it admits the rows of each: `pmulld` assembles under `x86-64-v2`, and
+`tzcnt` and `lzcnt` under `x86-64-v3`. The names a level brings that have no rows
+yet (`sse42`, `avx`, `avx2`, `avx512*`) admit nothing until an encoding lands for them.
 
 `sha256rnds2` also reads `xmm0`, the round keys, without naming it, and the
 constant-time check follows a secret through it. `ptest` sets ZF and CF; the
@@ -555,6 +594,33 @@ asm aarch64 {
 Neither writes anything, so an idle loop holds every live value across it. `yield`
 is the weaker hint of the three — it asks a hypervisor to schedule elsewhere and
 may do nothing at all, which is why `wfi` is what an idle loop should say.
+
+## Jumps, calls and branches (riscv64)
+
+A jump or call target is a symbol or a numeric local label, and the row decides which
+it may be:
+
+```mach fragment
+asm riscv64 {
+    j    some_symbol      # jal x0: one J-type word under R_RISCV_JAL, +-1 MiB
+    jal  some_symbol      # jal ra, the same word and relocation
+    jal  t0, some_symbol  # ... with a named link register
+    call some_symbol      # auipc + jalr under R_RISCV_CALL_PLT, +-2 GiB, may reach a PLT stub
+    tail some_symbol      # the same pair through t1, no link
+    j    1f               # a numeric local label resolves in place, no relocation
+1:
+    beq  a0, a1, 1b       # a conditional branch takes a numeric local label only
+}
+```
+
+`j` and `jal` name a symbol under the 20-bit `R_RISCV_JAL` field, which the linker
+fills from the final placement and refuses when the target is more than 1 MiB away, so
+a target that may live in another module or a shared object is spelled `call` or
+`tail`, whose `auipc` + `jalr` pair reaches +-2 GiB and, for an imported function, the
+PLT stub. A conditional branch (`beq`, `bnez` and the rest) takes a numeric local
+label only: its 12-bit field has no relocation kind here, the same posture as
+aarch64's `b.cond`, so a symbol in that position is refused at the asm site rather
+than assembled to a word the linker cannot fill. On riscv32 the rows are the same.
 
 ## Control-and-status registers (riscv64)
 

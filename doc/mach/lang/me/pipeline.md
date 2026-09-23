@@ -42,6 +42,9 @@ pub rec FloatReassocOption;
 pub rec PipelineRequest;
 ```
 
+diags is the module's diagnostic store: a shape or `simd = "require"` refusal
+is a located error there, never a bare failure
+
 ## fun run
 
 ```mach

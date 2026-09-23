@@ -57,6 +57,8 @@ s: the warm session
 oa: owns the returned outcome
 ev: progress sink for the readout; nil for none
 ret: the merged outcome, released with outcome.outcome_dnit, or an engine failure
+the plan is one round of the session's active retainer: every unit's modules stay held until the plan
+ends, so one unit never releases another's, and a plan that stops early or fails keeps what it had
 
 ## fun set_link_config_input
 

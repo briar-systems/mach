@@ -330,10 +330,18 @@ pub val RK_JUMP26: RelocKind = 26
 pub val RK_GOT_PCREL_HI20: RelocKind = 27
 ```
 
+## val RK_JAL20
+
+```mach
+pub val RK_JAL20: RelocKind = 28
+```
+
+the riscv jal 20-bit j-type field, +-1 MiB, even displacement
+
 ## val RK_CATALOG_COUNT
 
 ```mach
-pub val RK_CATALOG_COUNT: u32 = 28
+pub val RK_CATALOG_COUNT: u32 = 29
 ```
 
 ## rec RelocKindDesc
@@ -453,6 +461,15 @@ pub val SYM_OBJ_FLAG_COMMON:       u32 = 0x100
 pub val SYM_OBJ_FLAG_SIZE_UNKNOWN: u32 = 0x200
 ```
 
+## val SYM_OBJ_FLAG_HIDDEN
+
+```mach
+pub val SYM_OBJ_FLAG_HIDDEN: u32 = 0x400
+```
+
+a definition every module in the link may reference and no linked image
+exports: ELF STV_HIDDEN, Mach-O N_PEXT, absent from a PE export table
+
 ## val SECTION_EXTERNAL
 
 ```mach
@@ -570,6 +587,14 @@ pub val SEC_FLAG_COALESCE:   u32 = 0x4
 ```mach
 pub val SEC_FLAG_INIT_FUNCS: u32 = 0x2
 ```
+
+## val SEC_FLAG_RETAIN
+
+```mach
+pub val SEC_FLAG_RETAIN: u32 = 0x8
+```
+
+a final link keeps the section even when nothing references it
 
 ## val SEC_FLAG_IMAGE_MASK
 
@@ -800,6 +825,39 @@ pub rec LoadSegment;
 pub rec ExecFunction;
 ```
 
+## def SymbolType
+
+```mach
+pub def SymbolType: u8
+```
+
+what an image symbol names: a callable body, a data object, or neither. the
+format writer maps it onto its own symbol type field
+
+## val SYMT_NOTYPE
+
+```mach
+pub val SYMT_NOTYPE: SymbolType = 0
+```
+
+## val SYMT_FUNC
+
+```mach
+pub val SYMT_FUNC:   SymbolType = 1
+```
+
+## val SYMT_OBJECT
+
+```mach
+pub val SYMT_OBJECT: SymbolType = 2
+```
+
+## val SYMT_COUNT
+
+```mach
+pub val SYMT_COUNT: u32 = 3
+```
+
 ## rec SymtabEntry
 
 ```mach
@@ -998,7 +1056,7 @@ pub def ResolveRelocOperandFn: fun(*ObjectImage, u32) res[RelocOperand, fail.Fai
 ## def BuildAttributesFn
 
 ```mach
-pub def BuildAttributesFn: fun(*A.Allocator, u32, u32, u32, bool, *u32) res[*u8, fail.Fail]
+pub def BuildAttributesFn: fun(*A.Allocator, u32, u64, u32, bool, *u32) res[*u8, fail.Fail]
 ```
 
 build: (alloc, xlen_bits, selected extension bits, float_arg_bits, has_compressed, out_len)
@@ -1012,7 +1070,7 @@ pub def MergeAttributesFn: fun(*A.Allocator, *u8, u32, *u8, u32, *u32) res[*u8, 
 ## def ValidateAttributesFn
 
 ```mach
-pub def ValidateAttributesFn: fun(*u8, u32, u32, u32, u32) err[fail.Fail]
+pub def ValidateAttributesFn: fun(*u8, u32, u32, u64, u32) err[fail.Fail]
 ```
 
 validate: (bytes, len, xlen_bits, selected extension bits, object machine flags)
@@ -1044,7 +1102,7 @@ pub rec ObjectTarget;
 ## def WriterFn
 
 ```mach
-pub def WriterFn: fun(*ObjectTarget, *ObjectImage, *publication.Destination) err[fail.Fail]
+pub def WriterFn: fun(*ObjectTarget, *ObjectImage, str) err[fail.Fail]
 ```
 
 ## def ParserFn
@@ -1059,7 +1117,7 @@ pub def ParserFn: fun(*A.Allocator, *intern.Interner, *u8, usize, *ObjectImage) 
 pub def ExecFn: fun(*A.Allocator, *intern.Interner, *ObjectTarget, *LoadSegment, u32, u64, u64, u64,
 *ExecFunction, u32, *Section, u32, *Section, u32,
 *SymtabEntry, u32,
-*publication.Destination, *u8, ImageOptions) err[fail.Fail]
+str, *u8, ImageOptions) err[fail.Fail]
 ```
 
 ## def DynExecFn
@@ -1069,7 +1127,7 @@ pub def DynExecFn: fun(*A.Allocator, *intern.Interner, *ObjectTarget, *LoadSegme
 *ExecFunction, u32, *DynamicInfo, *PltFixup, u32,
 *Section, u32, *Section, u32,
 *SymtabEntry, u32,
-*publication.Destination, *u8, ImageOptions) err[fail.Fail]
+str, *u8, ImageOptions) err[fail.Fail]
 ```
 
 ## def SharedFn
@@ -1077,7 +1135,7 @@ pub def DynExecFn: fun(*A.Allocator, *intern.Interner, *ObjectTarget, *LoadSegme
 ```mach
 pub def SharedFn: fun(*A.Allocator, *intern.Interner, *ObjectTarget, *LoadSegment, u32, u64,
 *ExportSym, u32, *DynamicInfo, *Section, u32,
-*SymtabEntry, u32, *publication.Destination, ImageOptions) err[fail.Fail]
+*SymtabEntry, u32, str, ImageOptions) err[fail.Fail]
 ```
 
 ## rec ExecutableSectionLocation
@@ -1265,6 +1323,36 @@ pub val DBG_DWARF:    u32 = 1
 pub val DBG_CODEVIEW: u32 = 2
 ```
 
+## val DBG_SPIRV
+
+```mach
+pub val DBG_SPIRV:    u32 = 3
+```
+
+## def DebugShape
+
+```mach
+pub def DebugShape: u8
+```
+
+how a debug model reaches its format
+
+## val DEBUG_SHAPE_SECTIONS
+
+```mach
+pub val DEBUG_SHAPE_SECTIONS: DebugShape = 0
+```
+
+appends its own sections to a finished object image from address-keyed rows, through produce
+
+## val DEBUG_SHAPE_MODULE
+
+```mach
+pub val DEBUG_SHAPE_MODULE: DebugShape = 1
+```
+
+written by a whole-module emitter as it builds the module, so it declares no producer
+
 ## rec DebugProduceRequest
 
 ```mach
@@ -1288,6 +1376,35 @@ pub def DebugSupportsFn: fun(*debug_input.DebugTarget) bool
 ```mach
 pub rec DebugVTable;
 ```
+
+## fun sections_debug_model
+
+```mach
+pub fun sections_debug_model(id: u32, name: str, produce: DebugProduceFn, supports: DebugSupportsFn) DebugVTable;
+```
+
+## fun module_debug_model
+
+```mach
+pub fun module_debug_model(id: u32, name: str, supports: DebugSupportsFn) DebugVTable;
+```
+
+## fun debug_shape_for
+
+```mach
+pub fun debug_shape_for(vt: *OfVTable) DebugShape;
+```
+
+a format whose object is the finished artifact takes its debug model from the emitter that
+builds it, and a format of linkable objects takes one that appends sections
+
+## fun debug_hooks_declared
+
+```mach
+pub fun debug_hooks_declared(vt: *DebugVTable) bool;
+```
+
+a sections model names its producer and a module model names none; both declare compatibility
 
 ## rec DebugRegistry
 

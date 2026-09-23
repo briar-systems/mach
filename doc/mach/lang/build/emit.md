@@ -9,13 +9,13 @@ pub fun ensure_parents(a: *A.Allocator, p: str) err[outcome.Fail];
 ## fun emit_asm
 
 ```mach
-pub fun emit_asm(p: *driver.Project, destination: *publication.Destination, m: *ir.Module) err[outcome.Fail];
+pub fun emit_asm(p: *driver.Project, destination: str, m: *ir.Module) err[outcome.Fail];
 ```
 
 ## fun emit_ir
 
 ```mach
-pub fun emit_ir(p: *driver.Project, destination: *publication.Destination, m: *ir.Module) err[outcome.Fail];
+pub fun emit_ir(p: *driver.Project, destination: str, m: *ir.Module) err[outcome.Fail];
 ```
 
 ## fun artifact_product_name
@@ -46,37 +46,54 @@ exe_path: *u8) res[LoadedImageOptions, outcome.Fail];
 ## fun emit_static_archive
 
 ```mach
-pub fun emit_static_archive(p: *driver.Project, destination: *publication.Destination, images: *of.ObjectImage, paths: **u8, out_path: **u8) err[outcome.Fail];
+pub fun emit_static_archive(p: *driver.Project, destination: str, images: *of.ObjectImage, paths: **u8, out_path: **u8) err[outcome.Fail];
 ```
 
 ## fun emit_shared_library
 
 ```mach
-pub fun emit_shared_library(p: *driver.Project, destination: *publication.Destination, paths: **u8, len: u32,
+pub fun emit_shared_library(p: *driver.Project, destination: str, paths: **u8, len: u32,
 dynlibs: *of.DynLib, dynlib_len: u32, out_path: **u8) err[outcome.Fail];
+```
+
+## fun link_shared_images
+
+```mach
+pub fun link_shared_images(p: *driver.Project, images: *of.ObjectImage,
+ext_paths: **u8, ext_count: u32,
+dynlibs: *of.DynLib, dynlib_len: u32, destination: str, out_path: **u8) err[outcome.Fail];
 ```
 
 ## fun link_executable
 
 ```mach
 pub fun link_executable(p: *driver.Project, paths: **u8, len: u32,
-dynlibs: *of.DynLib, dynlib_len: u32, destination: *publication.Destination,
+dynlibs: *of.DynLib, dynlib_len: u32, destination: str,
 image_options: of.ImageOptions) err[outcome.Fail];
 ```
 
 ## fun link_flat_images
 
 ```mach
-pub fun link_flat_images(p: *driver.Project, images: *of.ObjectImage, destination: *publication.Destination,
+pub fun link_flat_images(p: *driver.Project, images: *of.ObjectImage, destination: str,
 image_options: of.ImageOptions) err[outcome.Fail];
 ```
+
+## fun publish_entry_module
+
+```mach
+pub fun publish_entry_module(p: *driver.Project, images: *of.ObjectImage, destination: str) err[outcome.Fail];
+```
+
+write the artifact entry module's object to `destination`. on a finished-module
+format that object is the complete deliverable, so no other module takes part
 
 ## fun link_mixed_images
 
 ```mach
 pub fun link_mixed_images(p: *driver.Project, images: *of.ObjectImage,
 ext_paths: **u8, ext_count: u32,
-dynlibs: *of.DynLib, dynlib_len: u32, destination: *publication.Destination,
+dynlibs: *of.DynLib, dynlib_len: u32, destination: str,
 image_options: of.ImageOptions) err[outcome.Fail];
 ```
 
@@ -98,7 +115,7 @@ pub fun free_dynlibs(a: *A.Allocator, dynlibs: *of.DynLib, dynlib_len: u32);
 
 ```mach
 pub fun write_objects(p: *driver.Project, images: *of.ObjectImage,
-destinations: **publication.Destination, paths_out: ***u8) err[outcome.Fail];
+destinations: *str, paths_out: ***u8) err[outcome.Fail];
 ```
 
 ## fun mirror_fqn

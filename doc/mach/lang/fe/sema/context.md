@@ -30,6 +30,9 @@ pub rec TypeExport;
 pub rec ModuleSema;
 ```
 
+exports are append-only, and `index` maps (origin, canon) to the first export with
+that key over the first `indexed` of them (#3472)
+
 ## fun module_sema_init
 
 ```mach
@@ -138,6 +141,9 @@ phase: DefinitionPhase) res[DefinedSymbol, fail.Fail];
 ```mach
 pub rec SemaDeps;
 ```
+
+the imported surfaces are borrowed: the driver owns each one and shares it
+between every importer in a pass (#3472)
 
 ## rec InstReq
 
@@ -268,6 +274,21 @@ walker's stack and chain through `prev`
 pub rec SemaContext;
 ```
 
+## fun report_deferred_name
+
+```mach
+pub fun report_deferred_name(sc: *SemaContext, span: token.Span, prefix: str);
+```
+
+a name resolve left for the arm sema selects (#3485), reported once at the name itself
+whichever instantiation walks it, and never for an arm sema discards
+
+## fun report_deferred_type
+
+```mach
+pub fun report_deferred_type(sc: *SemaContext, ast_tid: id.TypeId);
+```
+
 ## fun resolved_type_of
 
 ```mach
@@ -292,22 +313,19 @@ pub fun comptime_expression(sc: *SemaContext, a: *ast.Ast, eid: id.ExprId) res[e
 pub fun apply_subst(sc: *SemaContext, tid: type.TypeId) type.TypeId;
 ```
 
-## fun arg_triggers_revalidation
+## fun awaits_instance
 
 ```mach
-pub fun arg_triggers_revalidation(sc: *SemaContext, tid: type.TypeId) bool;
+pub fun awaits_instance(sc: *SemaContext, tid: type.TypeId) bool;
 ```
+
+true while a type still names a type parameter: no operand predicate has an answer
+for it, and every question about it waits for an instantiation
 
 ## fun decl_body_spreads_pack_to_c_variadic
 
 ```mach
 pub fun decl_body_spreads_pack_to_c_variadic(sc: *SemaContext, origin: session.ModuleId, did: id.DeclId) bool;
-```
-
-## fun type_mentions_generic_param
-
-```mach
-pub fun type_mentions_generic_param(sc: *SemaContext, tid: type.TypeId) bool;
 ```
 
 ## fun record_instance
@@ -388,6 +406,12 @@ pub fun ptr_width_of(sc: *SemaContext) u32;
 
 ```mach
 pub fun machine_of(sc: *SemaContext) layout.Machine;
+```
+
+## val TEMPLATE_TRAIL_LABEL
+
+```mach
+pub val TEMPLATE_TRAIL_LABEL: str = "in this generic body, checked against this instance's type arguments"
 ```
 
 ## fun report
@@ -517,6 +541,16 @@ pub fun own_nominal_declaration(sc: *SemaContext, nominal: *type.Type) res[id.De
 ```mach
 pub fun definition_ast(sc: *SemaContext, origin: session.ModuleId) *ast.Ast;
 ```
+
+## fun generic_owner_of_decl
+
+```mach
+pub fun generic_owner_of_decl(s: *session.Session, a: *ast.Ast, origin: session.ModuleId,
+decl_id: id.DeclId) res[type.GenericOwner, fail.Fail];
+```
+
+the identity a declaration's type parameters carry (type.TypeGenericParam owner
+fields): the one key both interning a parameter and substituting for it use
 
 ## fun generic_param_type_for
 

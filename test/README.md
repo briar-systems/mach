@@ -50,6 +50,14 @@ runs both, and compares the checksums with the C reference built by `cc` at
 `-O0`, `-O2` and under UBSan, which must agree among themselves first. The tool
 versions the goldens were blessed with are stated at the top of `run.sh`.
 
+A golden mismatch does not stop the differential: the one `FAIL` line carries
+the golden verdict and then either `differential agrees with the C reference`
+or the disagreement, so a run whose goldens moved still says whether the
+behaviour held. A case whose differential never executed (the build or the
+decoder failed first) is counted in the summary as `differential not run`, and
+no such case counts as a pass. The C reference answer is rebuilt whenever
+`ref/<group>/<case>.c` or `lib/corpus.h` is newer than it.
+
 `--qemu` adds the targets no host runs natively: `riscv64-linux` under
 `qemu-riscv64` and the freestanding `riscv32` under `qemu-riscv32`. A riscv32
 case's own artifact is a static archive, so the driver also builds a run bin per
@@ -118,7 +126,8 @@ per lane.
 
 1. Write `cases/<group>/<name>.mach` to the contract and `ref/<group>/<name>.c`.
 2. `bash test/run.sh --case <group>/<name> --target <host>` until the four
-   checksums agree (build failures and disagreements print as `FAIL` lines).
+   checksums agree (build failures and disagreements print as `FAIL` lines; the
+   missing golden is reported on the same line and does not hide them).
 3. `bash test/run.sh --bless --case <group>/<name>` and read every golden it
    writes. A golden you have not read is not a golden.
 4. A target that cannot build the case gets a line in `golden/<target>/SKIPS`:
@@ -176,6 +185,7 @@ here.
   build-flags: --pie
   gbuild: yes                        # also build the -g twin, handed to the check
   self-host: linux-riscv64           # cross-build the compiler for the leg and let it compile the case
+  goal: test                         # compile with `mach test` instead of `mach build` (default: build)
   ```
 - `check.sh`, when the case reads its own image: invoked as
   `check.sh <engine> <leg> <binary> [<g-binary>] [<profile>]` with `engine`
@@ -184,6 +194,15 @@ here.
   reader `run:` names under `link/check/`, or the built-in modes: `exec` runs
   the program and records its stdout, `built` records that an artifact was
   emitted, `build-fails` records the compiler's `error:` lines.
+- `goal: test` makes the compile step `mach test` with the same target, profile
+  and flags, so every module of the project is loaded (an orphan module nothing
+  imports is reached only this way) and the collected tests run as part of that
+  step, through the leg's engine when it is qemu (`--runner`). A failing test
+  is a failed compile step with the readout in the cell's log. The artifact is
+  the test dispatcher, and `exec` runs it once per collected test in collection
+  order (`<exe> <index>`) and records the concatenated stdout; `built`,
+  `build-fails` and a `check.sh` apply to the dispatcher as they would to a
+  program.
 - the expected output, the most specific of `expect.<target>.<profile>.txt`,
   `expect.<profile>.txt`, `expect.<target>.txt`, `expect.txt`. Create the file
   you want, then `--bless` fills it.

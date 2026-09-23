@@ -137,6 +137,10 @@ passes=0
 skips=0
 noruns=0
 fail() { echo "FAIL $*"; fails=$((fails + 1)); }
+# unrun <target>: a failed case on a target with a differential never reached it,
+# so the summary says how many behaviour checks did not execute
+unruns=0
+unrun() { [ "$(engine "$1")" = - ] || unruns=$((unruns + 1)); }
 
 # target_field <target> <column>
 target_field() { printf '%s\n' "$targets_all" | awk -v t="$1" -v c="$2" '$1 == t { print $c }'; }
@@ -455,18 +459,21 @@ run_case() {
 
     # release build, decoded and diffed against the golden
     if ! build "$t" o2 "$c"; then
-        fail "$t $c build o2: $(first_error "$out/log/$t.o2.$(art "$c").log")"; return
+        fail "$t $c build o2: $(first_error "$out/log/$t.o2.$(art "$c").log")"; unrun "$t"; return
     fi
     o=$(object "$t" o2 "$c")
-    [ -f "$o" ] || { fail "$t $c o2: no object at $o"; return; }
+    [ -f "$o" ] || { fail "$t $c o2: no object at $o"; unrun "$t"; return; }
     if [ "$fmt" = spv ]; then
         if ! spirv-val "$o" >"$out/log/$t.val.$(art "$c").log" 2>&1; then
-            fail "$t $c spirv-val: $(head -n1 "$out/log/$t.val.$(art "$c").log")"; return
+            fail "$t $c spirv-val: $(head -n1 "$out/log/$t.val.$(art "$c").log")"; unrun "$t"; return
         fi
     fi
     golden=$here/golden/$t/$c.dis
     dis=$out/log/$t.$(art "$c").dis
-    disassemble "$t" "$c" "$o" >"$dis" || { fail "$t $c disassemble"; return; }
+    disassemble "$t" "$c" "$o" >"$dis" || { fail "$t $c disassemble"; unrun "$t"; return; }
+    # a golden verdict is held, not returned on: the differential below is the
+    # stronger fact and runs whatever the golden says, so one run reports both
+    golden_why=
     if [ "$bless" -eq 1 ]; then
         mkdir -p "$(dirname "$golden")"
         if [ ! -f "$golden" ] || ! cmp -s "$golden" "$dis"; then
@@ -475,9 +482,9 @@ run_case() {
             echo "BLESS $t $c"
         fi
     elif [ ! -f "$golden" ]; then
-        fail "$t $c golden: none at ${golden#"$here"/}; run --bless"; return
+        golden_why="golden: none at ${golden#"$here"/}; run --bless"
     elif ! cmp -s "$golden" "$dis"; then
-        fail "$t $c golden: $(diff "$golden" "$dis" | head -n1 | sed 's/^/line /')"; return
+        golden_why="golden: $(diff "$golden" "$dis" | head -n1 | sed 's/^/line /')"
     fi
 
     # the differential: mach at O0 and O2 against the C reference. a norun case
@@ -487,14 +494,20 @@ run_case() {
         differential "$t" "$c" "$eng"; verdict=$?
         if [ "$verdict" -eq 0 ]; then
             if norun "$t" "$c"; then fail "$t $c agrees with the C reference: its golden/$t/NORUN line is stale"; return; fi
+            [ -z "$golden_why" ] || { fail "$t $c $golden_why (differential agrees with the C reference)"; return; }
         elif [ "$verdict" -eq 2 ]; then
+            [ -z "$golden_why" ] || { fail "$t $c $golden_why (differential not run: $why)"; return; }
             echo "NORUN $t $c: $why"
             skips=$((skips + 1)); return
         elif norun "$t" "$c"; then
+            [ -z "$golden_why" ] || { fail "$t $c $golden_why (differential disagrees as its NORUN line claims)"; return; }
             noruns=$((noruns + 1))
         else
-            fail "$t $c $why"; return
+            case $why in build\ *) unrun "$t" ;; esac
+            fail "$t $c ${golden_why:+$golden_why; }$why"; return
         fi
+    elif [ -n "$golden_why" ]; then
+        fail "$t $c $golden_why"; return
     fi
 
     # the -g build through the external verifier for its debug model
@@ -566,6 +579,12 @@ fi
 # the link cases: test/link/cases/<name>/ is a project, case.conf says which legs
 # run it, what it builds and how it is checked, and expect*.txt is the recorded
 # observable. see test/README.md.
+#
+# `goal: test` compiles the case with `mach test` in place of `mach build`: every
+# module of the project is loaded, the collected tests run through the leg's
+# engine as part of the compile step, and the artifact is the test dispatcher.
+# a defect that exists only under a test build (#3535) is reachable by no other
+# goal.
 link_cell() {
     dir=$1; leg=$2; profile=$3
     id=$(basename "$dir")
@@ -573,6 +592,8 @@ link_cell() {
     build_target=${case_target:-$leg}
     runner=$(engine "$leg")
     case "$runner" in '') eng=native ;; *) eng="qemu:$runner" ;; esac
+    goal_flags=
+    [ "$case_goal" = test ] && [ -n "$runner" ] && goal_flags="--runner $runner"
     tmp=$(mktemp -d)
     rm -rf "$dir/out/link"; mkdir -p "$dir/out/link"
     bin=$dir/out/link/prog$exe
@@ -587,7 +608,7 @@ link_cell() {
         fi
         case "$eng" in qemu:*) buildcc="${eng#qemu:} $repo/$rel" ;; *) buildcc=$repo/$rel ;; esac
     fi
-    if (cd "$dir" && "$mach" dep pull . && $buildcc build . --target "$build_target" --profile "$profile" $case_build_flags -o "out/link/prog$exe") >"$tmp/build.log" 2>&1; then
+    if (cd "$dir" && "$mach" dep pull . && $buildcc "$case_goal" . --target "$build_target" --profile "$profile" $case_build_flags $goal_flags -o "out/link/prog$exe") >"$tmp/build.log" 2>&1; then
         built=1
     else
         built=0
@@ -601,13 +622,13 @@ link_cell() {
             ;;
         *)
             if [ "$built" -eq 0 ]; then
-                fail "$label build: $(first_error "$tmp/build.log")"; tail -n 6 "$tmp/build.log" | sed 's/^/    /'; rm -rf "$tmp"; return
+                fail "$label $case_goal: $(first_error "$tmp/build.log")"; tail -n 6 "$tmp/build.log" | sed 's/^/    /'; rm -rf "$tmp"; return
             fi
             gbin=
             if [ "$case_gbuild" = yes ]; then
                 gbin=$dir/out/link/prog-g$exe
-                if ! (cd "$dir" && $buildcc build . --target "$build_target" --profile "$profile" $case_build_flags -g -o "out/link/prog-g$exe") >"$tmp/build-g.log" 2>&1; then
-                    fail "$label build -g: $(first_error "$tmp/build-g.log")"; rm -rf "$tmp"; return
+                if ! (cd "$dir" && $buildcc "$case_goal" . --target "$build_target" --profile "$profile" $case_build_flags $goal_flags -g -o "out/link/prog-g$exe") >"$tmp/build-g.log" 2>&1; then
+                    fail "$label $case_goal -g: $(first_error "$tmp/build-g.log")"; rm -rf "$tmp"; return
                 fi
             fi
             # a fixture-owned .so the case's own steps built has to be findable at run time
@@ -619,6 +640,22 @@ link_cell() {
                 if [ "$rc" -ne 0 ]; then
                     fail "$label check exit $rc"; sed 's/^/    /' "$tmp/err.txt"; rm -rf "$tmp"; return
                 fi
+            elif [ "$case_run" = exec ] && [ "$case_goal" = test ]; then
+                # the dispatcher runs one test per invocation, `<exe> <index>`; the
+                # observable is every collected test's stdout in collection order
+                if ! (cd "$dir" && $buildcc test . --target "$build_target" --profile "$profile" $case_build_flags --list --format json) >"$tmp/list.json" 2>"$tmp/err.txt"; then
+                    fail "$label test --list: $(first_error "$tmp/err.txt")"; rm -rf "$tmp"; return
+                fi
+                n=$(grep -c '"event":"case"' "$tmp/list.json")
+                [ "$n" -gt 0 ] || { fail "$label collected no tests"; rm -rf "$tmp"; return; }
+                : >"$tmp/out.txt"; i=0
+                while [ "$i" -lt "$n" ]; do
+                    $runner "$bin" "$i" >>"$tmp/out.txt" 2>"$tmp/err.txt"; rc=$?
+                    if [ "$rc" -ne 0 ]; then
+                        fail "$label test $i exit $rc"; sed 's/^/    /' "$tmp/out.txt" "$tmp/err.txt"; rm -rf "$tmp"; return
+                    fi
+                    i=$((i + 1))
+                done
             elif [ "$case_run" = exec ]; then
                 $runner "$bin" >"$tmp/out.txt" 2>"$tmp/err.txt"; rc=$?
                 if [ "$rc" -ne 0 ]; then
@@ -659,7 +696,7 @@ link_cell() {
 # read_case_conf <dir>: the case's defaults, then its case.conf
 read_case_conf() {
     case_legs=; case_skip=; case_profiles="debug release"; case_run=exec
-    case_target=; case_build_flags=; case_self_host=; case_gbuild=no
+    case_target=; case_build_flags=; case_self_host=; case_gbuild=no; case_goal=build
     [ -f "$1/case.conf" ] || return 0
     while IFS= read -r line || [ -n "$line" ]; do
         case "$line" in ''|\#*) continue ;; esac
@@ -669,9 +706,14 @@ read_case_conf() {
             legs) case_legs=$value ;; skip) case_skip=$value ;; profiles) case_profiles=$value ;;
             run) case_run=$value ;; target) case_target=$value ;; build-flags) case_build_flags=$value ;;
             self-host) case_self_host=$value ;; gbuild) case_gbuild=$value ;;
+            goal) case_goal=$value ;;
             *) echo "run.sh: $1/case.conf: unknown key '$key'" >&2; exit 2 ;;
         esac
     done <"$1/case.conf"
+    case "$case_goal" in
+        build|test) ;;
+        *) echo "run.sh: $1/case.conf: goal is 'build' or 'test', not '$case_goal'" >&2; exit 2 ;;
+    esac
 }
 
 # inc_build <project> <what> <dest>: -o must sit inside the project, so dest is relative
@@ -954,5 +996,6 @@ if [ "$mode" = docs ]; then
     echo "docs: $total blocks, $compiled compiled ($ran run), $errors error, $fragments fragment"
 fi
 
-echo "run.sh: $passes pass, $fails fail, $skips skip"
+tail=; [ "$unruns" -eq 0 ] || tail=", $unruns differential not run"
+echo "run.sh: $passes pass, $fails fail, $skips skip$tail"
 [ "$fails" -eq 0 ]

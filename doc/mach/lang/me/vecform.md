@@ -16,6 +16,9 @@ outside the catalog, which the caller refuses as undeclared and names
 pub rec LaneDesc;
 ```
 
+from_bits is the operand lane width, which only a conversion or a widening
+multiply changes
+
 ## fun lane_desc
 
 ```mach
@@ -54,6 +57,42 @@ expansion, or undeclared when the catalog names neither for its lane shape
 ```mach
 pub fun realizes_packed(m: *ir.Module, tgt: *target.Target, inst: *instruction.Instruction) bool;
 ```
+
+## fun widening_of
+
+```mach
+pub fun widening_of(ext: instruction.InstrKind) opt[instruction.InstrKind];
+```
+
+the widening multiply that a multiply of two lane-wise extensions of `ext`
+kind fuses into; absent for any other extension
+
+## fun widening_packs
+
+```mach
+pub fun widening_packs(m: *ir.Module, tgt: *target.Target, kind: instruction.InstrKind, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
+```
+
+whether a widening multiply of two `from_ty` vectors into `ty` is a cell the
+target packs at these lanes; the catalog is the only judge
+
+## fun widen_half_of
+
+```mach
+pub fun widen_half_of(ext: instruction.InstrKind) opt[instruction.InstrKind];
+```
+
+the lane-halving extension that a vector literal of lane-wise extensions of
+`ext` kind fuses into; absent for any other extension
+
+## fun widen_half_packs
+
+```mach
+pub fun widen_half_packs(m: *ir.Module, tgt: *target.Target, kind: instruction.InstrKind, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
+```
+
+whether a lane-halving extension of a `from_ty` vector into `ty` is a cell
+the target packs at these lanes; the catalog is the only judge
 
 ## fun holds_in_register
 

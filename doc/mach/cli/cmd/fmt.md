@@ -110,7 +110,7 @@ directory is opened so the leaf is handled exactly as the project walk handles i
 ## fun format_stream
 
 ```mach
-pub fun format_stream(a: *A.Allocator, in_fd: i32, out_fd: i32, sink: Sink) res[Report, outcome.Fail];
+pub fun format_stream(a: *A.Allocator, in_fd: usize, out_fd: usize, sink: Sink) res[Report, outcome.Fail];
 ```
 
 format the source arriving on one descriptor onto another; nothing on disk is

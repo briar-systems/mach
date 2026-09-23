@@ -18,6 +18,12 @@ pub val SPV_VERSION_1_0: u32 = 0x00010000
 pub val SPV_VERSION_1_3: u32 = 0x00010300
 ```
 
+## val SPV_VERSION_1_4
+
+```mach
+pub val SPV_VERSION_1_4: u32 = 0x00010400
+```
+
 ## val SPV_VERSION_1_5
 
 ```mach
@@ -48,10 +54,40 @@ pub val ENV_PROFILE_COUNT: u32 = 4
 pub val SPV_GENERATOR: u32 = 0
 ```
 
+## val OP_SOURCE
+
+```mach
+pub val OP_SOURCE:                    u32 = 3
+```
+
 ## val OP_NAME
 
 ```mach
 pub val OP_NAME:                      u32 = 5
+```
+
+## val OP_MEMBER_NAME
+
+```mach
+pub val OP_MEMBER_NAME:               u32 = 6
+```
+
+## val OP_STRING
+
+```mach
+pub val OP_STRING:                    u32 = 7
+```
+
+## val OP_LINE
+
+```mach
+pub val OP_LINE:                      u32 = 8
+```
+
+## val OP_NO_LINE
+
+```mach
+pub val OP_NO_LINE:                   u32 = 317
 ```
 
 ## val OP_EXT_INST_IMPORT
@@ -690,6 +726,30 @@ pub val NEED_SAMPLED_1D:         u32 = 0x20
 pub val NEED_SAMPLED_CUBE_ARRAY: u32 = 0x40
 ```
 
+## fun entry_interface_lists
+
+```mach
+pub fun entry_interface_lists(version: u32, storage: u32) bool;
+```
+
+before 1.4 an entry point's interface list names only its Input and Output
+variables, from 1.4 every global the entry point statically uses
+
+## fun storage_buffer_class
+
+```mach
+pub fun storage_buffer_class(version: u32) u32;
+```
+
+the StorageBuffer storage class is core from 1.3. before that a storage buffer is
+a Uniform variable whose block is decorated BufferBlock
+
+## fun storage_block_decoration
+
+```mach
+pub fun storage_block_decoration(version: u32) u32;
+```
+
 ## fun env_profile
 
 ```mach
@@ -844,6 +904,12 @@ pub val STORAGE_UNIFORM_CONSTANT: u32 = 0
 
 ```mach
 pub val DECOR_BLOCK:          u32 = 2
+```
+
+## val DECOR_BUFFER_BLOCK
+
+```mach
+pub val DECOR_BUFFER_BLOCK:   u32 = 3
 ```
 
 ## val DECOR_BUILTIN
@@ -1019,6 +1085,15 @@ pub fun inst(b: *Builder, v: *Vec, opcode: u32, ops: *u32, n: u32);
 ```mach
 pub fun ext_inst_import(b: *Builder, set: str) u32;
 ```
+
+## fun inst_string
+
+```mach
+pub fun inst_string(b: *Builder, v: *Vec, opcode: u32, lead: *u32, lead_n: u32, s: str);
+```
+
+an instruction of lead operands followed by one literal string, the shape of OpString,
+OpName and OpMemberName
 
 ## fun string_words
 

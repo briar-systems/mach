@@ -36,7 +36,11 @@ out/linux-x86_64/debug/bin/mach fmt .
 ```
 
 The tree is canonical: `mach fmt .` must leave it unchanged before a pull
-request is opened (`mach fmt --check .` reports what differs).
+request is opened (`mach fmt --check .` reports what differs). The same holds
+for the API reference: `doc/mach` and `doc/README.md` are what `mach doc .`
+writes, so a change to a doc-comment or to the module tree regenerates them in
+the same pull request, and CI fails when the committed pages differ from a
+fresh generation.
 
 `bash test/run.sh` runs the codegen corpus against the external decoders and
 the C reference, and `bash test/run.sh --link` the link cases; see

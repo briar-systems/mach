@@ -54,6 +54,12 @@ pub rec TargetRequest;
 pub fun target_request(isa_name: str, os_name: str, abi_name: str) TargetRequest;
 ```
 
+## fun with_extensions
+
+```mach
+pub fun with_extensions(req: *TargetRequest, names: *str, count: u32);
+```
+
 ## fun with_of
 
 ```mach
@@ -78,6 +84,17 @@ pub fun with_image(req: *TargetRequest, base: u64, stack_reserve: u64, stack_com
 pub fun select_of(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: str, of_name: str) res[resolved.Target, fail.Fail];
 ```
 
+## fun tuple_page_size
+
+```mach
+pub fun tuple_page_size(os_vt: *os.OsVTable, arch_vt: *isa.IsaVTable, of_vt: *of.OfVTable) res[u64, fail.Fail];
+```
+
+the granularity the image is laid out at: a format a loader maps by page puts
+each segment on a page of its own, the operating system's page where it
+declares one (the largest a kernel of that system may use) and the isa's
+hardware page otherwise; a flat image has no page and is laid out byte-tight
+
 ## fun resolve
 
 ```mach
@@ -87,8 +104,10 @@ pub fun resolve(reg: *TargetRegistry, req: *TargetRequest) res[resolved.Target, 
 ## val TARGET_FINGERPRINT_VERSION
 
 ```mach
-pub val TARGET_FINGERPRINT_VERSION: u8 = 3
+pub val TARGET_FINGERPRINT_VERSION: u8 = 4
 ```
+
+version 4: the model's extension set is a 64-bit field of the isa's own vocabulary
 
 ## fun fingerprint
 

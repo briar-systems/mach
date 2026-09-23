@@ -24,6 +24,16 @@ pub fun entry_module_fqn(p: *project.Project, t: *project.TargetEntry) res[inter
 pub fun compose_module_fqn(alloc: *A.Allocator, itn: *intern.Interner, id_text: str, rel_text: str) res[intern.StrId, fail.Fail];
 ```
 
+## fun fqn_in_root_project
+
+```mach
+pub fun fqn_in_root_project(p: *project.Project, fqn: intern.StrId) bool;
+```
+
+the head segment of a module path names the project that owns the module, and
+the loader is where that ownership is decided: it is what picks the source
+root a module is read from
+
 ## fun diag_join3
 
 ```mach
@@ -53,6 +63,25 @@ pub fun parse_root(p: *project.Project, fqn: intern.StrId) res[session.ModuleId,
 ```mach
 pub fun dfs_load(p: *project.Project, fqn: intern.StrId) res[session.ModuleId, fail.Fail];
 ```
+
+## fun reload_module
+
+```mach
+pub fun reload_module(p: *project.Project, mid: session.ModuleId) res[bool, fail.Fail];
+```
+
+reparse and re-walk one loaded module in place, after its text changed, and say
+whether its load surface survived: the modules it reaches, the public constants it
+declares to importers' gates, its own gate outcome and its target gating. a surface
+that survived leaves the project's module set, topo and every other entry as they
+are, so the caller can rerun the query phases over the kept project; one that did
+not needs a full load. the entry's walk state is rebuilt from a fresh comptime
+context, since gate states and load marks are keyed by the old syntax tree's ids
+
+p: the loaded project
+mid: the module whose text changed
+ret: ok(true) when the surface is unchanged; ok(false) when the caller must reload;
+     or the parse or walk failure
 
 ## fun parsed_definition
 
@@ -105,8 +134,10 @@ pub fun check_gated_const_imports(p: *project.Project) err[fail.Fail];
 ## fun remerge_tuple_pub_consts
 
 ```mach
-pub fun remerge_tuple_pub_consts(p: *project.Project, mid: session.ModuleId, ti: u32) res[bool, fail.Fail];
+pub fun remerge_tuple_pub_consts(p: *project.Project, mid: session.ModuleId, ti: u32) res[u32, fail.Fail];
 ```
+
+the imported public constants one union tuple round binds, and how many it bound
 
 ## fun eval_for_load
 

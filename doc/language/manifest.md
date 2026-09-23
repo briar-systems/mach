@@ -232,7 +232,7 @@ comptime member, `$mach.build.extensions.<name>` (see [`$mach`](comptime-mach.md
 
 | `isa` | Baseline | Extensions |
 |-------|----------|------------|
-| `x86_64` | SSE2 | `ssse3`, `sse41`, `sha`, `fsgsbase` |
+| `x86_64` | SSE2 | `ssse3`, `sse41`, `sse42`, `sha`, `fsgsbase`, `popcnt`, `lzcnt`, `bmi1`, `bmi2`, `cx16`, `avx`, `avx2`, `fma`, `movbe`, `f16c`, `avx512f`, `avx512bw`, `avx512cd`, `avx512dq`, `avx512vl` |
 | `aarch64` | AdvSIMD | `sha2` |
 | `riscv64`, `riscv32` | the isa string's selection | `i`, `m`, `a`, `f`, `d`, `c`, `zicsr`, `zifencei`, `zkt` |
 | `spirv` | | none |
@@ -241,21 +241,45 @@ A name the selected isa does not hold is refused when the target resolves, with 
 names it does hold:
 
 ```
-error: target: `sha2` is not an extension of isa 'x86_64'; its extensions are:
-ssse3, sse41, sha, fsgsbase
+error: target: `sha2` is not an extension or level of isa 'x86_64'; its extensions are:
+ssse3, sse41, sha, fsgsbase, popcnt, lzcnt, bmi1, sse42, cx16, avx, avx2, bmi2, fma,
+movbe, f16c, avx512f, avx512bw, avx512cd, avx512dq, avx512vl; its levels are:
+x86-64-v2, x86-64-v3, x86-64-v4
 ```
 
-The array must hold strings, and each name must be an identifier (`sse41`, not
-`sse4.1`) listed once.
+The array must hold strings, each an identifier (`sse41`, not `sse4.1`) or a level
+spelling (`x86-64-v2`), listed once.
 
 A level is a bundle, never an axis of its own: each name may imply others, and the
 selection is closed over that once, when the target resolves. `sse41` brings `ssse3`
-(the chain stops there; SSE3 is not modelled). On riscv `d` brings `f` and `f` brings
-`zicsr`, as the isa string's own grammar has it, so `extensions = ["d"]` on `rv64i`
-selects `rv64ifd` with Zicsr. The isa string and the list feed one set:
-`isa = "rv64i"` with `extensions = ["m"]` selects the same machine as
-`isa = "rv64im"`. Nothing is gated on a level name; a future `x86-64-v2` would expand
-to bits the way riscv `g` does.
+(the chain stops there; SSE3 is not modelled), `sse42` brings `sse41`, `avx` brings
+`sse42`, `avx2`, `fma` and `f16c` bring `avx`, and every `avx512*` set brings
+`avx512f`, which brings `avx2`. On riscv `d` brings `f` and `f` brings `zicsr`, as
+the isa string's own grammar has it, so `extensions = ["d"]` on `rv64i` selects
+`rv64ifd` with Zicsr. The isa string and the list feed one set: `isa = "rv64i"` with
+`extensions = ["m"]` selects the same machine as `isa = "rv64im"`. A name nothing in
+the compiler encodes against yet (`avx2`, `avx512f`) is still a declared requirement:
+the inline assembler has no rows to admit under it, so today it records only the
+promise the binary makes about its hosts, and the promise is the program's to check.
+
+#### Levels
+
+x86-64 also spells the published microarchitecture levels. A level is a manifest
+spelling that expands to its member names, so it may stand alone or beside names
+(`["x86-64-v2", "sha"]`), and it includes every lower level. It has no bit of its own:
+`$mach.build.extensions.x86-64-v2` and `#[extensions("x86-64-v2")]` do not exist,
+programs ask about the members (`.avx2`). `sse2`, `cmpxchg8b` and `lahf-sahf` are the
+`x86_64` baseline and are not names. The table here is the compiler's, held together by
+a test:
+
+| Level | Members beyond the level before |
+|-------|----------------------------------|
+| `x86-64-v2` | `ssse3`, `sse41`, `sse42`, `popcnt`, `cx16` |
+| `x86-64-v3` | `avx`, `avx2`, `bmi1`, `bmi2`, `fma`, `lzcnt`, `movbe`, `f16c` |
+| `x86-64-v4` | `avx512f`, `avx512bw`, `avx512cd`, `avx512dq`, `avx512vl` |
+
+`native` is not a spelling and never a default: the hardware requirement is visible
+in the manifest, never inferred from the build machine.
 
 The list is never part of `{target.isa}`. That placeholder is the `isa` value as
 written (`rv64i`, `x86_64`), on every isa; the list belongs to the target's identity
@@ -266,6 +290,18 @@ inline assembler admits its rows, `$mach.build.extensions.<name>` answers 1, and
 property the extension declares (Zkt's data-independent timing, which the
 constant-time multiply rows read) is taken as given. It never means a mode is on. A
 row such as a `dit` would admit `msr dit`, not set it.
+
+The `extensions` list is the manifest's only lever over the constant-time multiply,
+and only on riscv64, where `zkt` is what admits a secret `*`. There is no key that
+declares or overrides a timing mode. On aarch64 the condition is PSTATE.DIT, which
+the operating system declares it guarantees (linux and darwin) and the linked
+program's start code turns on for a binary that needs it; a manifest cannot assert
+it for an OS that declares nothing. On x86-64 the multiply rows hold unconditionally
+on Intel and AMD, so nothing is there to declare, and Intel's DOITM is a kernel-owned
+model-specific register that hardens memory-side predictors rather than the
+multiplier, so mach offers no key for it either. The rows, their conditions and
+the DOITM note are in
+[secrecy.md](secrecy.md#constant-time-multiply-by-instruction-set).
 
 Some rows are the target's alone. On riscv `i` is the baseline, `c` is a code-size
 selection mach never emits, and `f` and `d` select the float register file and the
@@ -293,6 +329,16 @@ function `#[extensions(sha)]` and call it only after detecting the extension at 
 
 The selected set is part of the target's identity: two targets that differ only in
 `extensions` never share cached products.
+
+The selection also reaches code generation. Every vector operation is legal on every
+target and its shape never depends on the extension list; what moves is the lowering.
+A cell the baseline expands to a scalar sequence lowers to the one packed instruction
+when the selected set holds the extension that carries it (`i32x4 * i32x4` is
+`pmulld` under `sse41` on x86_64 and a scalar expansion without), and
+[`simd = "require"`](#profilename) judges against the selected set, so a kernel refused on
+the baseline is accepted once the target declares the extension it needs. SSE2 is the
+x86_64 baseline. A build never infers the build machine's features: what the binary
+assumes is what the manifest declares.
 
 ### Image stack size
 
@@ -784,8 +830,16 @@ module no artifact reaches is collected as before.
     and a non-`pub` one stays hidden whatever its name.
   - **Internals.** Every other definition still links inside the library but is
     absent from `.dynsym`. In the `.so` it is a `LOCAL` symbol in `.symtab`, and
-    in the per-module object it is a `GLOBAL` symbol with `STV_HIDDEN`
-    visibility.
+    in the per-module object it is a `GLOBAL` symbol whose visibility the
+    format spells its own way: ELF `STV_HIDDEN`, Mach-O `N_PEXT`, and COFF, which
+    has no visibility bit, a `.drectve` section listing every exported definition
+    as ` /EXPORT:<name>`, so a global definition the directives do not name is
+    hidden. A COFF object with no `.drectve` says nothing about visibility and
+    is read as it was. A `fwd` re-export of a dependency's symbol is a request
+    the object carries separately: on COFF it is one more `/EXPORT:` token, and
+    on ELF and Mach-O it rides in a non-loaded mach section (`.mach.exports`, or
+    `__MACH,__mach_exports`) the parser consumes. A relocatable object emitted
+    and parsed back therefore keeps the same visibility and the same requests.
   - **Refusals.** A shared artifact that exports nothing is refused:
 
     ```
@@ -1142,7 +1196,7 @@ where it is declared, since one head segment cannot name two projects.
 ```toml
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^6.0"
+version = "^6.1"
 ```
 
 A stanza declares exactly one source:

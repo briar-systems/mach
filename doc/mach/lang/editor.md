@@ -246,6 +246,19 @@ text: the new full text
 ret: ok(true) when the text changed; ok(false) when the buffer is not open or the text
       is identical, in which case nothing is dropped; or the SourceMap or overlay error
 
+## fun invalidate
+
+```mach
+pub fun invalidate(es: *EditorSession);
+```
+
+mark the loaded project stale, so the next analysis that needs it reloads the closure.
+open, update and close do this for the buffers they own; this is the entry for a change
+the editor session cannot see, a file written outside any buffer or a manifest edited on
+disk
+
+es: the editor session
+
 ## fun close
 
 ```mach
