@@ -248,8 +248,12 @@ Two postfix cast operators, both written `expr OP Type`:
 
 - `expr::Type` — **value conversion**. Resizes integers (sign- or zero-extend,
   truncate), converts between integer and float (a numeric `CVT`), and is the
-  identity on a same-type operand. Value-preserving where representable. When
-  either type is nonnumeric, equal sizes are required and the bits are reinterpreted.
+  identity on a same-type operand. Value-preserving where representable. Two
+  vectors with the same lane count convert lane by lane with the scalar rule. An
+  array and a vector (`[N]T` and `TxN`, either way) convert element by element and
+  need the same element type and count, so `[8]i16::i32x4` is an error. Any other
+  pair where either type is nonnumeric needs equal sizes, and the bits are
+  reinterpreted.
   Constant expressions follow these rules at every nesting depth, including casts
   through type aliases.
 - `expr:~Type` — **bit reinterpret**. Reads the operand's exact bits as the
