@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - `doc/language/operators.md` states how a cast binds under a prefix operator. A cast is a postfix and a prefix operator takes the whole postfix chain, so `@p::T` is `@(p::T)` and dereference-then-convert is `(@p)::T`. The rule was stated only in `grammar.md`, and the cast section, where people look it up, invited the other reading (#3814).
+- Resolving dependency releases, as `mach dep update` does, no longer fails at random with `fatal: shallow file has changed since we read it` while reading release manifests. Each release's tag is fetched shallow into one scratch repository, and every fetch ended by starting git's automatic maintenance detached, which rewrote the scratch's `shallow` file under the next fetch. The scratch is thrown away after the command, so its fetches now run with `gc.auto=0` and `maintenance.auto=false`, and nothing but mach's own fetches touches it (#3816).
 
 ## [5.11.0] - 2026-09-22
 
