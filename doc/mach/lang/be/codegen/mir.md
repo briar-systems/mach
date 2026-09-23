@@ -1488,7 +1488,9 @@ pub rec MirDbgBinding;
 ```
 
 lane: which lane of a value wider than one register `vreg` holds, of `lanes`
-lanes each `lane_bytes` wide; `lanes` is 0 when `vreg` holds the whole value
+lanes each `lane_bytes` wide; `lanes` is 0 when `vreg` holds the whole value.
+at_end: the binding is published at the end of the instruction that carries
+it, where that instruction's def exists, instead of at its start
 
 ## val DBG_LANES_MAX
 
@@ -1838,6 +1840,14 @@ pub fun push_function(mm: *MirModule, mf: MirFunction) err[fail.Fail];
 pub fun instr_attach_dbg(a: *A.Allocator, mi: *MirInstr, iid: u32, vreg: u32) err[fail.Fail];
 ```
 
+## fun instr_attach_dbg_end
+
+```mach
+pub fun instr_attach_dbg_end(a: *A.Allocator, mi: *MirInstr, iid: u32, vreg: u32) err[fail.Fail];
+```
+
+the binding is published where `mi`'s def exists: at its end
+
 ## fun instr_pass_dbg
 
 ```mach
@@ -1845,7 +1855,25 @@ pub fun instr_pass_dbg(a: *A.Allocator, from: *MirInstr, to: *MirInstr) err[fail
 ```
 
 the bindings of `from` move ahead of those of `to`: a deleted instruction's
-program point is the instruction that follows it
+program point is the instruction that follows it, so its end is `to`'s start
+
+## fun instr_spread_dbg
+
+```mach
+pub fun instr_spread_dbg(a: *A.Allocator, from: *MirInstr, first: *MirInstr, last: *MirInstr) err[fail.Fail];
+```
+
+`from` is replaced by the pieces `first` through `last`: its start is the
+first piece's start and its end the last piece's end
+
+## fun instr_move_end_dbg
+
+```mach
+pub fun instr_move_end_dbg(a: *A.Allocator, from: *MirInstr, to: *MirInstr) err[fail.Fail];
+```
+
+the value `from` defines reaches its home only at the end of `to`, a later
+instruction that finishes placing it
 
 ## fun dnit_module
 

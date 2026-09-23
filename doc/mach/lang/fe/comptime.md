@@ -1347,6 +1347,12 @@ a: *ast.Ast, source: str, obs: *T, probes: GateProbes[T], probe: GateProbe, eid:
 pub fun is_layout_intrinsic_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
 ```
 
+## fun is_type_id_call
+
+```mach
+pub fun is_type_id_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
+```
+
 ## fun is_length_of_call
 
 ```mach
