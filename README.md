@@ -166,7 +166,7 @@ fun step() {
 ```
 
 
-## One source, every target
+## Targets
 
 A target is a fully spelled tuple of isa, os and abi, plus the extensions every host it runs on is promised to have. Declare them once in [`mach.toml`](doc/language/manifest.md) and one command builds every one of them, from a desktop binary to a bare-metal image to a GPU module.
 
@@ -232,12 +232,13 @@ Contributions are welcome. Read the [contributing guidelines](CONTRIBUTING.md) f
 
 ## Credit
 
-The inspiration for Mach comes from too many languages to count. Direct inspiration for the compiler itself comes from a few specific sources:
+Mach draws on more languages than can be counted, but a few shaped the language and its compiler most directly:
 
+- [C](https://www.c-language.org/)
 - [Go](https://go.dev/)
-- [V](https://vlang.io/)
 - [Zig](https://ziglang.org/)
 - [Rust](https://www.rust-lang.org/)
+- [V](https://vlang.io/)
 
 Mach stands on the shoulders of countless giants who contributed to these languages, directly or by proxy. It is out of respect for their work that Mach will always be fully open source. Thank you all.
 
