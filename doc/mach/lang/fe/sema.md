@@ -13,19 +13,6 @@ own_module: session.ModuleId,
 diags: *diagnostic.DiagnosticStore) res[context.SemaResult, fail.Fail];
 ```
 
-## fun resolve_gates
-
-```mach
-pub fun resolve_gates(
-s: *session.Session,
-a: *ast.Ast,
-rr: *resolve.ResolveResult,
-deps: *context.SemaDeps,
-ctx: *comptime.ComptimeCtx,
-own_module: session.ModuleId,
-diags: *diagnostic.DiagnosticStore) res[context.SemaResult, fail.Fail];
-```
-
 ## fun reinfer_pack_each_body
 
 ```mach
