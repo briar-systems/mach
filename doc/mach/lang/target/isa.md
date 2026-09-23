@@ -312,18 +312,6 @@ pub val VEC_OP_NOT:  VecOp = 8
 pub val VEC_OP_NEG:  VecOp = 9
 ```
 
-## val VEC_OP_SHL
-
-```mach
-pub val VEC_OP_SHL:  VecOp = 10
-```
-
-## val VEC_OP_SHR
-
-```mach
-pub val VEC_OP_SHR:  VecOp = 11
-```
-
 ## val VEC_OP_CMP
 
 ```mach
@@ -421,10 +409,53 @@ is the unfused path, one extension per lane into a rebuilt vector (#3738)
 pub val VEC_OP_WIDEN_U: VecOp = 25
 ```
 
+## val VEC_OP_SHL_U
+
+```mach
+pub val VEC_OP_SHL_U:   VecOp = 26
+```
+
+the lane-wise shifts of integer lanes, keyed by direction, by signedness for
+a right shift, and by the count's form, since the packed answer differs along
+each (#3740): a uniform count (`_U`) is one scalar applied to every lane, the
+form every baseline set has an instruction for, and a per-lane count (`_V`)
+is a vector of counts, one per lane. a count at or above the lane width
+saturates in every form, as the scalar shift does (#3756)
+
+## val VEC_OP_SHR_U_U
+
+```mach
+pub val VEC_OP_SHR_U_U: VecOp = 27
+```
+
+## val VEC_OP_SHR_S_U
+
+```mach
+pub val VEC_OP_SHR_S_U: VecOp = 28
+```
+
+## val VEC_OP_SHL_V
+
+```mach
+pub val VEC_OP_SHL_V:   VecOp = 29
+```
+
+## val VEC_OP_SHR_U_V
+
+```mach
+pub val VEC_OP_SHR_U_V: VecOp = 30
+```
+
+## val VEC_OP_SHR_S_V
+
+```mach
+pub val VEC_OP_SHR_S_V: VecOp = 31
+```
+
 ## val VEC_OP_LAST
 
 ```mach
-pub val VEC_OP_LAST:    VecOp = VEC_OP_WIDEN_U
+pub val VEC_OP_LAST:    VecOp = VEC_OP_SHR_S_V
 ```
 
 ## rec PackedForm
@@ -602,6 +633,12 @@ pub fun is_widen_op(op: VecOp) bool;
 pub fun is_widen_half_op(op: VecOp) bool;
 ```
 
+## fun is_shift_op
+
+```mach
+pub fun is_shift_op(op: VecOp) bool;
+```
+
 ## fun vector_domain_len
 
 ```mach
@@ -633,6 +670,12 @@ them all as the scalar expansion by declaring no unit
 pub val WIDEN_CELL_COUNT: u32 = 12
 ```
 
+## val SHIFT_CELL_COUNT
+
+```mach
+pub val SHIFT_CELL_COUNT: u32 = 24
+```
+
 ## fun scalar_conversion_rows
 
 ```mach
@@ -651,6 +694,15 @@ pub fun scalar_widening_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
 
 the same for the widening multiplies and the lane-halving extensions: a
 cell the packed table leaves keeps the per-lane path
+
+## fun scalar_shift_rows
+
+```mach
+pub fun scalar_shift_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
+```
+
+the same for the shifts: a cell the packed table leaves is shifted lane by
+lane through the scalar shift, which saturates the same way
 
 ## fun ct_mul_rows_admit
 
