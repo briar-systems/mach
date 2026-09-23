@@ -995,8 +995,9 @@ pub val BANK_NONE:    OperandBank = 4
 pub fun validate_bank_pattern(pattern: str) err[fail.Fail];
 ```
 
-g/f require a bank, v is gp scalar or fp vector, a is typed transport, n forbids registers
-a final star repeats the preceding operand contract
+g/f require a bank, v is gp scalar or fp vector, a is typed transport, n forbids registers,
+c is a shift count: gp beside a scalar, and beside a vector either one uniform gp count
+or the vector's own lane counts (#3740). a final star repeats the preceding operand contract
 
 ## fun check_operand_banks
 

@@ -25,6 +25,15 @@ The condition must be a comptime expression. Common shapes:
 - Comparisons of comptime constants (`pub val` declarations)
 - Comparisons of a comptime function parameter (`$mode`) — see below
 
+A condition is a `u8`, and a constant it reads has the width and sign its
+declaration gives it. A constant declared through a `def`, as std's `bool` is
+`def bool: u8`, takes the integer primitive the `def` chain ends at, followed
+across `use` and `fwd`, so `$if (capability.HAS_FILES)` reads a `u8`. A chain
+that ends outside the integers (a record, a pointer, a float) is refused at the
+gate with a message naming the chain. A `def` declared inside a `$if` arm is not
+read this way: a declaring gate on a constant typed through one is decided once
+types are checked.
+
 A comptime comparison or arithmetic relates the **mathematical values** of its
 operands, exactly as the runtime operators do (see
 [operators.md](operators.md)). A constant in `2^63 .. 2^64-1` is its true

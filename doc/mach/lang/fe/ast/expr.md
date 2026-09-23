@@ -144,17 +144,6 @@ pub val EXPR_KIND_SEL:              ExprKind = 23
 pub val EXPR_KIND_ERROR:            ExprKind = 255
 ```
 
-## fun span_is_token
-
-```mach
-pub fun span_is_token(kind: ExprKind) bool;
-```
-
-a token-backed node's span is its token: its text is read back through the span
-(a name is interned from it, a literal is rescanned from it), so the span never
-grows past the token. every other node's span is its source extent, grouping
-parentheses included
-
 ## def BinOp
 
 ```mach
@@ -317,6 +306,14 @@ pub val UN_DEREF:   UnOp = 4
 pub val LIT_SUFFIX_NONE: type.TypeKind = 0xFF
 ```
 
+## rec ExprIdent
+
+```mach
+pub rec ExprIdent;
+```
+
+an identifier, or a `$name` comptime identifier whose `tok` covers the `$` and the name
+
 ## rec ExprLitInt
 
 ```mach
@@ -328,6 +325,34 @@ pub rec ExprLitInt;
 ```mach
 pub rec ExprLitFloat;
 ```
+
+## rec ExprLitChar
+
+```mach
+pub rec ExprLitChar;
+```
+
+## rec ExprLitStr
+
+```mach
+pub rec ExprLitStr;
+```
+
+a string literal: `tok` covers the quotes
+
+## rec ExprLitNil
+
+```mach
+pub rec ExprLitNil;
+```
+
+## fun lit_str_content
+
+```mach
+pub fun lit_str_content(e: *Expr) opt[token.Span];
+```
+
+the text between a string literal's quotes, read from its token; none for any other node
 
 ## rec ExprBinary
 
@@ -442,4 +467,8 @@ pub rec ExprSel;
 ```mach
 pub rec Expr;
 ```
+
+`span` is the node's visual extent, grouping parentheses included. a token-backed node (a name
+or a literal) keeps its token in its payload's `tok`, and its text is read through `tok`, never
+through `span`
 

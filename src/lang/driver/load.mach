@@ -33,6 +33,7 @@ use mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.expr;
 use mach.lang.fe.ast.id;
 use mach.lang.fe.ast.module;
+use atype: mach.lang.fe.ast.type;
 use mach.lang.fe.comptime;
 use mach.lang.fe.lexer;
 use mach.lang.fe.parser;
@@ -48,6 +49,7 @@ use mach.lang.session;
 use src: mach.lang.source;
 use mach.lang.target;
 use mach.lang.target.isa;
+use mach.lang.type;
 use mach.lang.version;
 use std.collections.vector;
 
@@ -487,6 +489,7 @@ fun same_ct_value(a: *comptime.CTValue, b: *comptime.CTValue) bool {
     if (a.kind == comptime.CT_KIND_INT)                                                                                       { ret a.data.w.lo == b.data.w.lo && a.data.w.hi == b.data.w.hi; }
     if (a.kind == comptime.CT_KIND_FLOAT)                                                                                     { ret a.data.f == b.data.f; }
     if (a.kind == comptime.CT_KIND_STR)                                                                                       { ret a.data.s == b.data.s; }
+    if (a.kind == comptime.CT_KIND_NON_INTEGER)                                                                               { ret a.data.s == b.data.s; }
     if (a.kind == comptime.CT_KIND_TYPE)                                                                                      { ret a.data.t == b.data.t; }
     if (a.kind == comptime.CT_KIND_FIELD || a.kind == comptime.CT_KIND_CASE)                                                  { ret a.data.fld.owner == b.data.fld.owner && a.data.fld.index == b.data.fld.index; }
     if (a.kind == comptime.CT_KIND_PACK_ELEM)                                                                                 { ret a.data.pelem.index == b.data.pelem.index && a.data.pelem.ty == b.data.pelem.ty; }
@@ -1812,7 +1815,7 @@ fun resolve_module_member_const_load(lc: *LoadMemberCtx, eid: id.ExprId) res[opt
     if (sel src_opt.none) { ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}}; }
     val source: str = src_opt.some.text;
 
-    val obj_r: res[intern.StrId, A.Error] = intern.intern_span(?lc.p.s.interner, source, obj.span);
+    val obj_r: res[intern.StrId, A.Error] = intern.intern_span(?lc.p.s.interner, source, obj.data.ident.tok);
     if (sel obj_r.err) { ret res[opt[comptime.CTValue], comptime.EvalFail].err{comptime.eval_error(comptime.EVAL_FAIL_INTERNAL, outcome.alloc_text(obj_r.err))}; }
     val dep_opt: opt[session.ModuleId] = mod_ref_lookup(m, obj_r.ok);
     if (sel dep_opt.none) { ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}}; }
@@ -1882,8 +1885,9 @@ fun register_val_for_load(p: *project.Project, mid: session.ModuleId, d: *decl.D
     val fw:    float.FloatWidth                         = comptime.declared_float_width(m.a, source, d.data.bind.ty);
     val r_val: res[comptime.CTValue, comptime.EvalFail] = eval_for_load(p, mid, source, d.data.bind.init, fw);
     if (sel r_val.err) { ret err[fail.Fail].ok{}; }
-    val v: comptime.CTValue = comptime.apply_declared_int_type(m.a, source, d.data.bind.ty,
-        r_val.ok);
+    val typed_r: res[comptime.CTValue, fail.Fail] = declared_value(p, mid, name_id, d.data.bind.ty, r_val.ok);
+    if (sel typed_r.err) { ret err[fail.Fail].err{typed_r.err}; }
+    val v: comptime.CTValue = typed_r.ok;
 
     if (comptime.float_width_unread(v)) {
         ret comptime.defer_float_width(?m.ctx, name_id);
@@ -1895,6 +1899,288 @@ fun register_val_for_load(p: *project.Project, mid: session.ModuleId, d: *decl.D
     val is_pub: bool = (d.flags & decl.DECL_FLAG_PUB) != 0;
     if (is_pub) { ret add_pub_const(p, m, name_id, v); }
     ret err[fail.Fail].ok{};
+}
+
+# what a constant's declared type makes of its integer value: a primitive
+# spelling types it directly, and a name is followed through `def`s across
+# `use` and `fwd` to the primitive the chain ends at, so a gate reading the
+# constant computes with the width and sign the program declared
+def DeclaredClass: u8;
+
+# not readable from syntax (a computed type, or a name the loaded modules do not
+# bind yet): the value stays untyped and type checking decides it
+val DECLARED_UNTYPED: DeclaredClass = 0;
+val DECLARED_INT:     DeclaredClass = 1;
+# the chain ends at a record, pointer, float or other non-integer type
+val DECLARED_NON_INT: DeclaredClass = 2;
+
+# a chain longer than this is a cycle, which type checking reports
+val DECLARED_CHAIN_LIMIT: u32 = 64;
+
+rec DeclaredInt {
+    class:    DeclaredClass;
+    unsigned: bool;
+    width:    u8;
+}
+
+fun declared_int(class: DeclaredClass) DeclaredInt {
+    var r: DeclaredInt;
+    r.class    = class;
+    r.unsigned = false;
+    r.width    = 0;
+    ret r;
+}
+
+rec DeclaredWalk {
+    p: *project.Project;
+    # the type spellings the chain passes through, for the refusal that names it
+    steps: vector.Vector[intern.StrId];
+}
+
+def BindingKind: u8;
+
+val BINDING_NONE:    BindingKind = 0;
+val BINDING_DEF:     BindingKind = 1;
+val BINDING_NOMINAL: BindingKind = 2;
+val BINDING_MODULE:  BindingKind = 3;
+val BINDING_SYMBOL:  BindingKind = 4;
+
+# what one module-scope name binds, as far as a def chain needs to know
+rec Binding {
+    kind:   BindingKind;
+    ty:     id.TypeId;
+    module: session.ModuleId;
+    leaf:   intern.StrId;
+}
+
+fun binding(kind: BindingKind) Binding {
+    var b: Binding;
+    b.kind   = kind;
+    b.ty     = id.TYPE_NIL;
+    b.module = session.MODULE_NIL;
+    b.leaf   = intern.STR_NIL;
+    ret b;
+}
+
+fun module_source(p: *project.Project, mid: session.ModuleId) res[str, fail.Fail] {
+    val src_opt: opt[*src.SourceFile] = src.get(?p.s.sources, project.module_at(p, mid::u32).file_id);
+    if (sel src_opt.none) { ret res[str, fail.Fail].err{fail.message("module file_id not found in SourceMap")}; }
+    ret res[str, fail.Fail].ok{src_opt.some.text};
+}
+
+fun declared_value(p: *project.Project, mid: session.ModuleId, name: intern.StrId, ty: id.TypeId, value: comptime.CTValue) res[comptime.CTValue, fail.Fail] {
+    val m:        *project.ModuleEntry = project.module_at(p, mid::u32);
+    val source_r: res[str, fail.Fail]  = module_source(p, mid);
+    if (sel source_r.err) { ret res[comptime.CTValue, fail.Fail].err{source_r.err}; }
+    val source: str = source_r.ok;
+    if (value.kind != comptime.CT_KIND_INT || !names_def_chain(m.a, source, ty)) {
+        ret res[comptime.CTValue, fail.Fail].ok{comptime.apply_declared_int_type(m.a, source, ty, value)};
+    }
+
+    var w: DeclaredWalk;
+    w.p     = p;
+    w.steps = vector.init[intern.StrId](p.alloc);
+    fin { vector.dnit[intern.StrId](?w.steps); }
+    val r: res[DeclaredInt, fail.Fail] = declared_type(?w, mid, ty, 0);
+    if (sel r.err) { ret res[comptime.CTValue, fail.Fail].err{r.err}; }
+    val d: DeclaredInt = r.ok;
+    if (d.class == DECLARED_INT) { ret res[comptime.CTValue, fail.Fail].ok{comptime.typed_int(value, d.unsigned, d.width)}; }
+    if (d.class == DECLARED_UNTYPED) {
+        ret res[comptime.CTValue, fail.Fail].ok{comptime.typed_int(value, value.int_unsigned, 0)};
+    }
+    val message_r: res[intern.StrId, fail.Fail] = non_integer_message(p, name, ?w.steps);
+    if (sel message_r.err) { ret res[comptime.CTValue, fail.Fail].err{message_r.err}; }
+    ret res[comptime.CTValue, fail.Fail].ok{comptime.non_integer(message_r.ok)};
+}
+
+# a declared type that is a name no primitive spells, so only its def chain types the value
+fun names_def_chain(a: *ast.Ast, source: str, ty: id.TypeId) bool {
+    if (ty == id.TYPE_NIL) { ret false; }
+    val found: opt[*atype.Type] = ast.get_type(a, ty);
+    if (sel found.none) { ret false; }
+    val t: *atype.Type = found.some;
+    if (t.kind == atype.TYPE_KIND_SECRET)                              { ret names_def_chain(a, source, t.data.secret.inner); }
+    if (t.kind != atype.TYPE_KIND_NAMED || t.data.named.args_len != 0) { ret false; }
+    val prim: opt[type.TypeKind] = type.prim_from_view(view(?source[t.data.named.name.offset], t.data.named.name.len));
+    ret sel prim.none;
+}
+
+fun declared_type(w: *DeclaredWalk, mid: session.ModuleId, ty: id.TypeId, depth: u32) res[DeclaredInt, fail.Fail] {
+    if (depth > DECLARED_CHAIN_LIMIT || ty == id.TYPE_NIL) { ret res[DeclaredInt, fail.Fail].ok{declared_int(DECLARED_UNTYPED)}; }
+    val m:        *project.ModuleEntry = project.module_at(w.p, mid::u32);
+    val source_r: res[str, fail.Fail]  = module_source(w.p, mid);
+    if (sel source_r.err) { ret res[DeclaredInt, fail.Fail].err{source_r.err}; }
+    val source: str              = source_r.ok;
+    val found:  opt[*atype.Type] = ast.get_type(m.a, ty);
+    if (sel found.none) { ret res[DeclaredInt, fail.Fail].err{fail.message("declared TypeId out of range")}; }
+    var copied: atype.Type  = @found.some;
+    val t:      *atype.Type = ?copied;
+    if (t.kind == atype.TYPE_KIND_SECRET) { ret declared_type(w, mid, t.data.secret.inner, depth); }
+
+    val step_r: res[intern.StrId, A.Error] = intern.intern_span(?w.p.s.interner, source, t.span);
+    if (sel step_r.err) { ret res[DeclaredInt, fail.Fail].err{fail.refused(step_r.err)}; }
+    val pushed: res[usize, A.Error] = vector.push[intern.StrId](?w.steps, step_r.ok);
+    if (sel pushed.err) { ret res[DeclaredInt, fail.Fail].err{fail.refused(pushed.err)}; }
+
+    if (t.kind == atype.TYPE_KIND_PTR || t.kind == atype.TYPE_KIND_ARRAY || t.kind == atype.TYPE_KIND_FUN
+        || t.kind == atype.TYPE_KIND_REC || t.kind == atype.TYPE_KIND_UNI) {
+        ret res[DeclaredInt, fail.Fail].ok{declared_int(DECLARED_NON_INT)};
+    }
+    if (t.kind != atype.TYPE_KIND_NAMED) { ret res[DeclaredInt, fail.Fail].ok{declared_int(DECLARED_UNTYPED)}; }
+    # a def is never generic, so a name taking arguments is a record, union or tag
+    if (t.data.named.args_len != 0) { ret res[DeclaredInt, fail.Fail].ok{declared_int(DECLARED_NON_INT)}; }
+
+    val path: token.Span = t.data.named.name;
+    if (np.prefix(source, path).len == 0) {
+        val prim: opt[type.TypeKind] = type.prim_from_view(view(?source[path.offset], path.len));
+        if (sel prim.some) {
+            val pd: type.PrimDesc = type.prim_desc(prim.some);
+            if (pd.class != type.PRIM_CLASS_INT) { ret res[DeclaredInt, fail.Fail].ok{declared_int(DECLARED_NON_INT)}; }
+            var r: DeclaredInt = declared_int(DECLARED_INT);
+            r.unsigned = !pd.signed;
+            r.width    = pd.bits::u8;
+            ret res[DeclaredInt, fail.Fail].ok{r};
+        }
+    }
+    val owner_r: res[opt[session.ModuleId], fail.Fail] = qualifier_module(w.p, mid, source, np.prefix(source, path));
+    if (sel owner_r.err)     { ret res[DeclaredInt, fail.Fail].err{owner_r.err}; }
+    if (sel owner_r.ok.none) { ret res[DeclaredInt, fail.Fail].ok{declared_int(DECLARED_UNTYPED)}; }
+    val leaf_r: res[intern.StrId, A.Error] = intern.intern_span(?w.p.s.interner, source, np.leaf(source, path));
+    if (sel leaf_r.err) { ret res[DeclaredInt, fail.Fail].err{fail.refused(leaf_r.err)}; }
+    val local: bool = np.prefix(source, path).len == 0;
+    ret declared_name(w, owner_r.ok.some, leaf_r.ok, local, depth);
+}
+
+# the type a name binds in a module: its own scope when `local`, else its public surface
+fun declared_name(w: *DeclaredWalk, mid: session.ModuleId, name: intern.StrId, local: bool, depth: u32) res[DeclaredInt, fail.Fail] {
+    if (depth > DECLARED_CHAIN_LIMIT) { ret res[DeclaredInt, fail.Fail].ok{declared_int(DECLARED_UNTYPED)}; }
+    val b_r: res[Binding, fail.Fail] = module_binding(w.p, mid, name, local);
+    if (sel b_r.err) { ret res[DeclaredInt, fail.Fail].err{b_r.err}; }
+    val b: Binding = b_r.ok;
+    if (b.kind == BINDING_DEF)     { ret declared_type(w, mid, b.ty, depth + 1); }
+    if (b.kind == BINDING_NOMINAL) { ret res[DeclaredInt, fail.Fail].ok{declared_int(DECLARED_NON_INT)}; }
+    if (b.kind == BINDING_SYMBOL)  { ret declared_name(w, b.module, b.leaf, false, depth + 1); }
+    ret res[DeclaredInt, fail.Fail].ok{declared_int(DECLARED_UNTYPED)};
+}
+
+# the module a qualified type's prefix names: its first segment is a module this
+# one imports, and each further segment a module the previous one forwards
+fun qualifier_module(p: *project.Project, mid: session.ModuleId, source: str, prefix: token.Span) res[opt[session.ModuleId], fail.Fail] {
+    if (prefix.len == 0) { ret res[opt[session.ModuleId], fail.Fail].ok{opt[session.ModuleId].some{mid}}; }
+    var owner:  session.ModuleId = mid;
+    var local:  bool             = true;
+    var cursor: usize            = prefix.offset;
+    for (cursor < prefix.offset + prefix.len) {
+        val segment: token.Span = np.next(source, prefix, ?cursor);
+        if (segment.len == 0) { brk; }
+        val seg_r: res[intern.StrId, A.Error] = intern.intern_span(?p.s.interner, source, segment);
+        if (sel seg_r.err) { ret res[opt[session.ModuleId], fail.Fail].err{fail.refused(seg_r.err)}; }
+        val b_r: res[Binding, fail.Fail] = module_binding(p, owner, seg_r.ok, local);
+        if (sel b_r.err)                   { ret res[opt[session.ModuleId], fail.Fail].err{b_r.err}; }
+        if (b_r.ok.kind != BINDING_MODULE) { ret res[opt[session.ModuleId], fail.Fail].ok{opt[session.ModuleId].none{}}; }
+        owner = b_r.ok.module;
+        local = false;
+    }
+    ret res[opt[session.ModuleId], fail.Fail].ok{opt[session.ModuleId].some{owner}};
+}
+
+# what `name` binds at module scope in `mid`, read from its syntax so the answer
+# does not depend on how far the walk has reached; a `use` binds only locally, and
+# a gated declaration is not read, so a name bound only under `$if` stays unknown
+fun module_binding(p: *project.Project, mid: session.ModuleId, name: intern.StrId, local: bool) res[Binding, fail.Fail] {
+    val acquired: err[fail.Fail] = acquire_load_view(p, mid, 0);
+    if (sel acquired.err) { ret res[Binding, fail.Fail].err{acquired.err}; }
+    val m:        *project.ModuleEntry = project.module_at(p, mid::u32);
+    val source_r: res[str, fail.Fail]  = module_source(p, mid);
+    if (sel source_r.err) { ret res[Binding, fail.Fail].err{source_r.err}; }
+    val source: str      = source_r.ok;
+    val text:   opt[str] = intern.lookup(?p.s.interner, name);
+    if (sel text.none) { ret res[Binding, fail.Fail].err{fail.message("def chain name is not interned")}; }
+    val m_opt: opt[*module.Module] = ast.get_module(m.a, m.a.root_module);
+    if (sel m_opt.none) { ret res[Binding, fail.Fail].err{fail.message("module root not set on Ast")}; }
+    val start: u32 = m_opt.some.decls_start;
+    val len:   u32 = m_opt.some.decls_len;
+    var i:     u32 = 0;
+    for (i < len) {
+        val d_opt: opt[*decl.Decl] = ast.get_decl(m.a, m.a.decl_ids[start + i]);
+        if (sel d_opt.none) { ret res[Binding, fail.Fail].err{fail.message("DeclId out of range during def chain lookup")}; }
+        val d: *decl.Decl = d_opt.some;
+        if (d.kind == decl.DECL_KIND_DEF && spells(source, d.data.def_.name, text.some)) {
+            var b: Binding = binding(BINDING_DEF);
+            b.ty = d.data.def_.ty;
+            ret res[Binding, fail.Fail].ok{b};
+        }
+        if ((d.kind == decl.DECL_KIND_REC && spells(source, d.data.rec_.name, text.some))
+            || (d.kind == decl.DECL_KIND_UNI && spells(source, d.data.uni_.name, text.some))
+            || (d.kind == decl.DECL_KIND_TAG && spells(source, d.data.tag_.name, text.some))
+            || (d.kind == decl.DECL_KIND_FUN && spells(source, d.data.fun_.name, text.some))) {
+            ret res[Binding, fail.Fail].ok{binding(BINDING_NOMINAL)};
+        }
+        if ((d.kind == decl.DECL_KIND_USE && local) || d.kind == decl.DECL_KIND_FWD) {
+            var alias: token.Span = d.data.use_.alias;
+            var path:  token.Span = d.data.use_.path;
+            if (d.kind == decl.DECL_KIND_FWD) {
+                alias = d.data.fwd_.alias;
+                path  = d.data.fwd_.path;
+            }
+            var bound: token.Span = alias;
+            if (bound.len == 0)                                    { bound = np.leaf(source, path); }
+            if (path.len != 0 && spells(source, bound, text.some)) { ret import_binding(p, source, path); }
+        }
+        i = i + 1;
+    }
+    ret res[Binding, fail.Fail].ok{binding(BINDING_NONE)};
+}
+
+fun import_binding(p: *project.Project, source: str, path: token.Span) res[Binding, fail.Fail] {
+    # an unresolvable import is reported where the walk reaches it
+    val tgt_r: res[UseTarget, outcome.Fail] = resolve_use_target(p, source, path);
+    if (sel tgt_r.err) {
+        val error: outcome.Fail = tgt_r.err;
+        if (sel error.user) { ret res[Binding, fail.Fail].ok{binding(BINDING_NONE)}; }
+        ret res[Binding, fail.Fail].err{fail.message(outcome.describe(error))};
+    }
+    val ut:      UseTarget              = tgt_r.ok;
+    val entry_r: opt[*session.ModuleId] = map.get[intern.StrId, session.ModuleId](?p.by_fqn, ?ut.module_fqn);
+    if (sel entry_r.none) { ret res[Binding, fail.Fail].ok{binding(BINDING_NONE)}; }
+    val target: session.ModuleId = @entry_r.some;
+    if (p.load_status[target::u32] == project.LOAD_NEW) { ret res[Binding, fail.Fail].ok{binding(BINDING_NONE)}; }
+    var b: Binding = binding(BINDING_SYMBOL);
+    if (ut.binds_module) { b.kind = BINDING_MODULE; }
+    b.module = target;
+    b.leaf   = ut.leaf;
+    ret res[Binding, fail.Fail].ok{b};
+}
+
+fun spells(source: str, span: token.Span, text: str) bool {
+    ret span.len != 0 && view_eq_str(view(?source[span.offset], span.len), text);
+}
+
+fun non_integer_message(p: *project.Project, name: intern.StrId, steps: *vector.Vector[intern.StrId]) res[intern.StrId, fail.Fail] {
+    val name_text: opt[str] = intern.lookup(?p.s.interner, name);
+    if (sel name_text.none) { ret res[intern.StrId, fail.Fail].err{fail.message("constant name is not interned")}; }
+    var chain: str = nil;
+    var i:     u32 = 0;
+    for (i::usize < steps.len) {
+        val step: opt[str] = intern.lookup(?p.s.interner, steps.data[i]);
+        if (sel step.none) { ret res[intern.StrId, fail.Fail].err{fail.message("def chain step is not interned")}; }
+        var next_r: res[str, format.FormatError];
+        if (chain == nil)   { next_r = format.sprint(p.s.alloc, "`{}`", step.some); }
+        or                  { next_r = format.sprint(p.s.alloc, "{} -> `{}`", chain, step.some); }
+        if (chain != nil)   { str_free(p.s.alloc, chain); }
+        if (sel next_r.err) { ret res[intern.StrId, fail.Fail].err{fail.format_refused(next_r.err)}; }
+        chain = next_r.ok;
+        i     = i + 1;
+    }
+    val msg_r: res[str, format.FormatError] = format.sprint(p.s.alloc,
+        "`{}` is not an integer constant, so no gate can read it: its type follows the def chain {}, which ends outside the integer primitives",
+        name_text.some, chain);
+    if (chain != nil)  { str_free(p.s.alloc, chain); }
+    if (sel msg_r.err) { ret res[intern.StrId, fail.Fail].err{fail.format_refused(msg_r.err)}; }
+    val interned: res[intern.StrId, A.Error] = intern.intern(?p.s.interner, msg_r.ok);
+    str_free(p.s.alloc, msg_r.ok);
+    if (sel interned.err) { ret res[intern.StrId, fail.Fail].err{fail.refused(interned.err)}; }
+    ret res[intern.StrId, fail.Fail].ok{interned.ok};
 }
 
 fun add_pub_const(p: *project.Project, m: *project.ModuleEntry, name: intern.StrId, value: comptime.CTValue) err[fail.Fail] {

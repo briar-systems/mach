@@ -478,7 +478,7 @@ fun offset_of_member_index(sc: *context.SemaContext, c: *expr.ExprCall, owner: t
         if (!silent) { context.report(sc, m.span, "`$offset_of` names its member by a bare identifier"); }
         ret opt[u32].none{};
     }
-    val name: intern.StrId = intern_span_or_nil(sc, m.span);
+    val name: intern.StrId = intern_span_or_nil(sc, m.data.ident.tok);
     val base: type.TypeId  = type.strip_secret(?sc.s.types, owner);
     context.record_result(sc, generics.ensure_fields(sc.s, base));
     val n: u32 = type.field_count(?sc.s.types, base);
@@ -1135,6 +1135,7 @@ fun report_unbound_ident(sc: *context.SemaContext, eid: id.ExprId) type.TypeId {
             var prefix: str = "unresolved identifier `";
             if (sc.rr.expr_resolved[eid] == resolve.SYMBOL_DEFERRED_TYPE) { prefix = "unresolved type name `"; }
             var at: token.Span = d_opt.ok.span;
+            if (d_opt.ok.kind == expr.EXPR_KIND_IDENT) { at = d_opt.ok.data.ident.tok; }
             if (d_opt.ok.kind == expr.EXPR_KIND_MEMBER) {
                 at     = d_opt.ok.data.member.name;
                 prefix = "unresolved module member `";
@@ -1336,6 +1337,7 @@ fun infer_binary(sc: *context.SemaContext, eid: id.ExprId, b: *expr.ExprBinary, 
     }
 
     if (type.is_vector(?sc.s.types, lt) || type.is_vector(?sc.s.types, rt)) {
+        if (b.op == expr.BIN_SHL || b.op == expr.BIN_SHR) { ret infer_vector_shift(sc, b, lt, rt, either_secret, span); }
         ret infer_vector_binary(sc, b.op, lt, rt, either_secret, span);
     }
 
@@ -1496,11 +1498,6 @@ fun infer_vector_binary(sc: *context.SemaContext, op: expr.BinOp, lt: type.TypeI
         ret join_secret(sc, mr.ok, either_secret);
     }
 
-    if (op == expr.BIN_SHL || op == expr.BIN_SHR) {
-        check.report_typed(sc, span, "vector shift `<<` / `>>` is not in the increment-1 operator table (`", lbase, "`); a per-lane variable shift is not 1:1 on the SSE2 baseline (AVX2-only, no 8-bit packed form), so shifts are deferred to a later increment", "vector shift is not in the increment-1 operator table");
-        ret type.TYPE_ERROR;
-    }
-
     if (op == expr.BIN_BIT_AND || op == expr.BIN_BIT_OR || op == expr.BIN_BIT_XOR) {
         if (!int_lane) {
             context.report(sc, span, "type mismatch: bitwise vector operands must have integer lanes");
@@ -1537,6 +1534,62 @@ fun infer_vector_binary(sc: *context.SemaContext, op: expr.BinOp, lt: type.TypeI
     }
 
     ret unknown_binop(sc, op);
+}
+
+# `vec << vec` and `vec >> vec` shift each lane of the left operand by the
+# lane of the count at the same position, both the same integer vector type
+# (#3740). there is no vector-by-scalar form: a uniform count is the same
+# count in every lane of a literal, which keeps the operators' shape rule and
+# is what lowers to the one-count shift. each lane follows the scalar shift,
+# so a lane count that is a constant at or above the lane width is refused
+fun infer_vector_shift(sc: *context.SemaContext, b: *expr.ExprBinary, lt: type.TypeId, rt: type.TypeId, either_secret: bool, span: token.Span) type.TypeId {
+    val lvec: bool = type.is_vector(?sc.s.types, lt);
+    val rvec: bool = type.is_vector(?sc.s.types, rt);
+    if (!lvec || !rvec) {
+        var vty: type.TypeId = type.strip_secret(?sc.s.types, lt);
+        if (!lvec) { vty = type.strip_secret(?sc.s.types, rt); }
+        check.report_typed(sc, span, "a vector shift count is a vector of the shifted type, never a scalar: write `", vty, "{c, c, ...}` with the count in every lane for a uniform shift", "a vector shift count is a vector of the shifted type, never a scalar");
+        ret type.TYPE_ERROR;
+    }
+    val lbase: type.TypeId = type.strip_secret(?sc.s.types, lt);
+    val rbase: type.TypeId = type.strip_secret(?sc.s.types, rt);
+    if (lbase != rbase) {
+        type_mismatch(sc, span, lt, rt);
+        ret type.TYPE_ERROR;
+    }
+    val lane: type.TypeId = prim_or_error(sc, type.vector_element(?sc.s.types, lbase));
+    if (lane == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+    if (!is_integer(sc, lane)) {
+        check.report_typed(sc, span, "`", lbase, "` cannot be shifted: `<<` and `>>` apply to integer lanes", "vector shift needs integer lanes");
+        ret type.TYPE_ERROR;
+    }
+    if (!check_lane_counts(sc, span, lane, b.rhs)) { ret type.TYPE_ERROR; }
+    gate_ct_always(sc, ct.CT_OP_VAR_SHIFT, either_secret, span);
+    ret join_secret(sc, lbase, either_secret);
+}
+
+# every lane of a literal count is held to the scalar shift's constant rule
+fun check_lane_counts(sc: *context.SemaContext, span: token.Span, lane: type.TypeId, count: id.ExprId) bool {
+    val ce: res[expr.Expr, fail.Fail] = context.expression(sc, count);
+    if (sel ce.err) { ret true; }
+    var start: u32 = 0;
+    var len:   u32 = 0;
+    if (ce.ok.kind == expr.EXPR_KIND_VECTOR_LIT) {
+        start = ce.ok.data.vector_lit.elems_start;
+        len   = ce.ok.data.vector_lit.elems_len;
+    }
+    or (ce.ok.kind == expr.EXPR_KIND_STRUCT_LIT) {
+        start = ce.ok.data.struct_lit.elems_start;
+        len   = ce.ok.data.struct_lit.elems_len;
+    }
+    var i: u32 = 0;
+    for (i < len) {
+        val ix: u32 = start + i;
+        if (ix::usize >= sc.a.expr_id_len)                               { ret true; }
+        if (!check.check_shift_count(sc, span, lane, sc.a.expr_ids[ix])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 # a binary operator no arm of the vector dispatch names: a defect, since the
@@ -1828,8 +1881,8 @@ fun expr_names_readonly_storage(sc: *context.SemaContext, eid: id.ExprId) bool {
             val q_opt: opt[*expr.Expr] = ast.get_expr(a, a.expr_ids[dec.args_start + q]);
             if (sel q_opt.some) {
                 val qa: *expr.Expr = q_opt.some;
-                if (qa.kind == expr.EXPR_KIND_LIT_STR && qa.span.len >= 2::usize
-                    && str_region_equals(src, qa.span.offset + 1::usize, qa.span.len - 2::usize, "readonly")) {
+                if (qa.kind == expr.EXPR_KIND_LIT_STR && qa.data.lit_str.tok.len >= 2::usize
+                    && str_region_equals(src, qa.data.lit_str.tok.offset + 1::usize, qa.data.lit_str.tok.len - 2::usize, "readonly")) {
                     ret true;
                 }
             }
@@ -2181,7 +2234,7 @@ fun infer_comptime_intrinsic(sc: *context.SemaContext, c: *expr.ExprCall, span: 
     val ce:       *expr.Expr = ?ce_value;
     if (ce.kind != expr.EXPR_KIND_COMPTIME_IDENT) { ret type.TYPE_NIL; }
 
-    val name: intern.StrId = comptime_ident_name(sc, ce.span);
+    val name: intern.StrId = comptime_ident_name(sc, ce.data.comptime_ident.tok);
     if (name == intern.STR_NIL) { ret type.TYPE_NIL; }
 
     if (name == interned(sc, "type_of")) {
@@ -3090,7 +3143,7 @@ fun infer_vector_lit(sc: *context.SemaContext, vl: *expr.ExprVectorLit, span: to
         val symbol: opt[*resolve.Symbol] = context.symbol_for_expr(sc, ee);
         if (sel parsed.some) {
             if (parsed.some.kind == expr.EXPR_KIND_IDENT && !sel symbol.some) {
-                val name: token.Span = parsed.some.span;
+                val name: token.Span = parsed.some.data.ident.tok;
                 check.report_named(sc, name, "unresolved identifier `", intern_span_or_nil(sc, name), "`", "unresolved vector element");
                 i = i + 1;
                 cnt;

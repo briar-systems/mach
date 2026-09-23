@@ -34,6 +34,7 @@ use mach.lang.me.pass.inline;
 use mach.lang.me.pass.mem2reg;
 use mach.lang.me.pass.scalarize;
 use mach.lang.me.pass.vecload;
+use mach.lang.me.pass.vecsplat;
 use mach.lang.me.pass.vecwiden;
 use mach.lang.me.pass.wideconv;
 use mach.lang.me.pass.widediv;
@@ -248,6 +249,17 @@ fun run_impl(m: *ir.Module, tgt: *target.Target, level: OptLevel, vectorize_enab
         if (sel res_verify_vecwiden.err) { ret res[bool, fail.Fail].err{res_verify_vecwiden.err}; }
     }
 
+    # a vector shift whose count is the same value in every lane of a literal
+    # shifts by that one scalar, the uniform form placement reads as its own
+    # cell; the literal goes when nothing else reads it (#3740)
+    val vecsplat_changed_r: res[bool, fail.Fail] = vecsplat.run(m, ws);
+    if (sel vecsplat_changed_r.err) { ret vecsplat_changed_r; }
+    if (vecsplat_changed_r.ok) {
+        changed = true;
+        val res_verify_vecsplat: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
+        if (sel res_verify_vecsplat.err) { ret res[bool, fail.Fail].err{res_verify_vecsplat.err}; }
+    }
+
     # a widening multiply is selected at every level, before placement reads
     # each operator's declared form; an extension it leaves unread goes with dce
     val widen_changed_r: res[bool, fail.Fail] = widenmul.run(m, tgt);
@@ -321,7 +333,7 @@ fun declared_check(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner, di
 # the diagnostic spelling of a site's vector operation; a descriptor vector tag
 # or an operation outside its catalog is named as such instead
 fun site_op_name(m: *ir.Module, itn: *intern.Interner, site: *scalarize.ScalarizeSite) str {
-    val op: opt[isa.VecOp] = vecform.vec_op_of(site.op);
+    val op: opt[isa.VecOp] = vecform.vec_op_of(site.op, site.uniform_count);
     if (sel op.none) { ret fail.catalog_message(itn, m.alloc, fail.unknown_member("IrVecOp", opdesc.vec_op(site.op)::u32)); }
     val name: opt[str] = vecform.vec_op_name(op.some);
     if (sel name.none) { ret fail.catalog_message(itn, m.alloc, fail.unknown_member("VecOp", op.some::u32)); }
@@ -1203,6 +1215,99 @@ test "mach.lang.me.pipeline.run:undeclared_vector_shape_is_refused_in_every_simd
     if (vector_mul_outcome(?alloc, ?itn, ?rv, 32, false) != 0)  { ret 6; }
     if (vector_mul_outcome(?alloc, ?itn, ?rv, 128, false) != 3) { ret 7; }
     ret 0;
+}
+
+# a uniform shift count packs on x86-64 at every lane width but the 64-bit
+# arithmetic shift, and a per-lane count packs nowhere on the SSE2 baseline, so
+# simd = "require" accepts the first and refuses the other two, naming the
+# count's form (#3740)
+test "mach.lang.me.pipeline.run:simd_require_judges_a_shift_by_its_count_form" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    fin { intern.dnit(?itn); }
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val rr: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel rr.err) { ret 1; }
+    val trr: res[resolved.Target, fail.Fail] = target.select(?reg, "x86_64", "linux", "sysv64");
+    if (sel trr.err) { ret 1; }
+    var rv: resolved.Target = trr.ok;
+
+    var bits: u32 = 8;
+    for (bits <= 64) {
+        if (vector_shift_outcome(?alloc, ?itn, ?rv, instruction.OP_SHL, bits, true) != 0)    { ret 2; }
+        if (vector_shift_outcome(?alloc, ?itn, ?rv, instruction.OP_SHR_U, bits, true) != 0)  { ret 3; }
+        if (vector_shift_outcome(?alloc, ?itn, ?rv, instruction.OP_SHL, bits, false) != 1)   { ret 4; }
+        if (vector_shift_outcome(?alloc, ?itn, ?rv, instruction.OP_SHR_S, bits, false) != 1) { ret 5; }
+        bits = bits * 2;
+    }
+    if (vector_shift_outcome(?alloc, ?itn, ?rv, instruction.OP_SHR_S, 32, true) != 0) { ret 6; }
+    if (vector_shift_outcome(?alloc, ?itn, ?rv, instruction.OP_SHR_S, 64, true) != 1) { ret 7; }
+    ret 0;
+}
+
+# 0 when simd = "require" accepts the vector shift by a scalar count
+# (`uniform`) or by a vector of lane counts, 1 when it refuses it naming the
+# operation and its count form, 2 for any other outcome
+fun vector_shift_outcome(alloc: *A.Allocator, itn: *intern.Interner, rv: *resolved.Target,
+    kind: instruction.InstrKind, lane_bits: u32, uniform: bool) i32 {
+    val rfn: res[intern.StrId, A.Error] = intern.intern(itn, "kernel");
+    if (sel rfn.err) { ret 9; }
+    val rm: res[ir.Module, fail.Fail] = ir.init(alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 9; }
+    var m: ir.Module = rm.ok;
+    fin { ir.dnit(?m); }
+    val ri: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, lane_bits);
+    if (sel ri.err) { ret 9; }
+    val rvt: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_vector(?m.types, ri.ok, 128 / lane_bits);
+    if (sel rvt.err) { ret 9; }
+    val vec:      ir_type.IrTypeId = rvt.ok;
+    var count_ty: ir_type.IrTypeId = vec;
+    if (uniform) { count_ty = ri.ok; }
+    val rfa: res[u32, fail.Fail] = ir.function_add(?m, rfn.ok, vec, 0);
+    if (sel rfa.err) { ret 9; }
+    val fn:   *ir.Function               = ?m.functions[rfa.ok];
+    val args: res[*value.Value, A.Error] = A.allocate[value.Value](m.alloc, 2);
+    if (sel args.err) { ret 9; }
+    fn.params      = args.ok;
+    fn.param_count = 2;
+    fn.params[0]   = value.param(0, vec);
+    fn.params[1]   = value.param(1, count_ty);
+    var b: builder.Builder = builder.init(?m);
+    builder.set_function(?b, fn);
+    val rb: res[id.BlockId, fail.Fail] = builder.new_block(?b);
+    if (sel rb.err) { ret 9; }
+    builder.set_block(?b, rb.ok);
+    var rsh: res[value.Value, fail.Fail] = builder.emit_shl(?b, value.param(0, vec), value.param(1, count_ty));
+    if (kind == instruction.OP_SHR_U) { rsh = builder.emit_shr_u(?b, value.param(0, vec), value.param(1, count_ty)); }
+    if (kind == instruction.OP_SHR_S) { rsh = builder.emit_shr_s(?b, value.param(0, vec), value.param(1, count_ty)); }
+    if (sel rsh.err)                  { ret 9; }
+    val rret: err[fail.Fail] = builder.emit_ret(?b, rsh.ok);
+    if (sel rret.err) { ret 9; }
+    var preq: PipelineRequest;
+    preq.module            = ?m;
+    preq.target            = rv;
+    preq.level             = OPT_DEBUG;
+    preq.vectorize_enabled = VectorizeEnabledOption{v: false};
+    preq.simd_require      = SimdRequireOption{v: true};
+    preq.float_reassoc     = FloatReassocOption{v: false};
+    preq.interner          = itn;
+    preq.source_map        = nil;
+    var diags: diagnostic.DiagnosticStore = diagnostic.store_init(alloc);
+    fin { diagnostic.store_dnit(?diags); }
+    preq.diags = ?diags;
+    val r: res[bool, fail.Fail] = run(?preq);
+    if (sel r.ok)                                                        { ret 0; }
+    if (!fail.is_reported(r.err) || diagnostic.error_count(?diags) != 1) { ret 2; }
+    val d: opt[*diagnostic.Diagnostic] = diagnostic.get(?diags, 0);
+    if (sel d.none) { ret 2; }
+    val msg:  str = d.some.message;
+    var form: str = "by per-lane counts";
+    if (uniform) { form = "by a uniform count"; }
+    if (str_contains(msg, "simd = \"require\"") && str_contains(msg, form) && str_contains(msg, "shift")
+        && str_contains(msg, lane_text(lane_bits))) { ret 1; }
+    ret 2;
 }
 
 fun lane_text(lane_bits: u32) str {

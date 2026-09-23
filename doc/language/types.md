@@ -231,7 +231,10 @@ scalar-to-vector conversion nor a `1.0::f32x4` reinterpret is legal. Between
 two vectors with the same lane count, `::` converts each lane with the scalar
 rule (a lane of `-7` becomes `-7.0` in `i32x4::f32x4`), and `:~` reads the
 bits of any vector of the same byte size. The lane-wise operators and the
-comparison-to-mask rule are in [operators.md](operators.md); what a target
+comparison-to-mask rule are in [operators.md](operators.md), including the
+shifts, whose two forms are `vec << vec` and `vec >> vec` with a count of the
+same shape (a uniform count is the same count in every lane of a literal,
+`v >> u32x4{k, k, k, k}`, never a scalar); what a target
 without hardware SIMD does with a vector operator is the `simd` profile lever ([manifest.md](manifest.md),
 [policy.md](policy.md)).
 
