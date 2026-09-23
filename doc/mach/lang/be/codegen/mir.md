@@ -914,7 +914,8 @@ pub val MIRF_FIXED_PAIR: MirFlags = 0x02000000
 ```
 
 the instruction reads and writes the target's fixed accumulator pair
-(div_reg, div_hi_reg), which the allocator reserves for the function
+(div_reg, div_hi_reg), which the allocator closes at the instruction to any
+value live across it or read by it, and after it until the pair is read back
 
 ## def MirCtClass
 
