@@ -459,28 +459,6 @@ s: the scope
 pick: the selection, naming targets and artifacts of `s.owner` and a profile of `s.root`
 ret: as `resolve_build_unit`
 
-## fun resolve_test_libs
-
-```mach
-pub fun resolve_test_libs(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, t: *TargetDef,
-proj_out: str, v: *TmplVars,
-out_items: **LinkRequirement, out_count: *u32) err[outcome.Fail];
-```
-
-the union of every artifact's link requirements for a target, for the test
-binary. requirements equal in source, text and library merge with
-`merge_link_claims`
-
-alloc: owns the returned array
-itn: resolves names
-m: the manifest
-t: the target
-proj_out: the expanded `[project].out`
-v: the template values
-out_items: receives the exact array, or nil when no artifact links anything
-out_count: receives its length
-ret: ok; err from `link_requirement` or a merge, with everything freed
-
 ## fun check_collisions
 
 ```mach
