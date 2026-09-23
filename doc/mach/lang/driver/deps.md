@@ -99,7 +99,7 @@ pub fun release_for_commit(c: *GitCandidates, url: str, commit: str) res[str, ou
 ```
 
 the release of `url` whose commit is `commit`, as its version text owned by the
-caller, or "" when no release tag names that commit: a dependency's committed
+caller, or an owned "" when no release tag names that commit: a dependency's committed
 gitlink is a commit, and resolution deals in releases (#3689)
 
 ## fun release_needs
