@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - `doc/language/operators.md` states how a cast binds under a prefix operator. A cast is a postfix and a prefix operator takes the whole postfix chain, so `@p::T` is `@(p::T)` and dereference-then-convert is `(@p)::T`. The rule was stated only in `grammar.md`, and the cast section, where people look it up, invited the other reading (#3814).
 - Resolving dependency releases, as `mach dep update` does, no longer fails at random with `fatal: shallow file has changed since we read it` while reading release manifests. Each release's tag is fetched shallow into one scratch repository, and every fetch ended by starting git's automatic maintenance detached, which rewrote the scratch's `shallow` file under the next fetch. The scratch is thrown away after the command, so its fetches now run with `gc.auto=0` and `maintenance.auto=false`, and nothing but mach's own fetches touches it (#3816).
+- A COFF object parsed and re-emitted without frame records parses again. The parser consumes `.mach.frames` to a zero-length husk of the same name, a re-emit with no frames writes that husk back out, and the parser refused any `.mach.frames` shorter than its 8-byte header, so the second parse failed with `coff: malformed .mach.frames section`. A zero-length section now reads as no frame records, the same as an absent one, and a section of 1 to 7 bytes is still refused (#3810).
 
 ## [5.11.0] - 2026-09-22
 
