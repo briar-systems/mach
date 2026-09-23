@@ -42,6 +42,24 @@ pub fun check_index(sc: *context.SemaContext, object: type.TypeId, index: type.T
 pub fun check_const_index(sc: *context.SemaContext, object: type.TypeId, idx: id.ExprId, span: token.Span) bool;
 ```
 
+## fun check_range_count
+
+```mach
+pub fun check_range_count(sc: *context.SemaContext, count: id.ExprId, span: token.Span) opt[u32];
+```
+
+the count of a range `x[i, n]`: a comptime constant, at least one. absent,
+reported at the count, when it is not
+
+## fun check_const_range
+
+```mach
+pub fun check_const_range(sc: *context.SemaContext, object: type.TypeId, start: id.ExprId, count: u32, span: token.Span) bool;
+```
+
+a constant start must keep the whole range inside an array or a vector:
+`start + count` may reach the length and not pass it. a pointer has no length
+
 ## fun const_index_value
 
 ```mach

@@ -300,6 +300,15 @@ pub fun emit_vec_extract(b: *Builder, vec: value.Value, lane: value.Value, ty: t
 pub fun emit_vec_insert(b: *Builder, vec: value.Value, lane: value.Value, value_: value.Value) res[value.Value, fail.Fail];
 ```
 
+## fun emit_vec_widen_half
+
+```mach
+pub fun emit_vec_widen_half(b: *Builder, signed: bool, src: value.Value, base: value.Value, ty: type.IrTypeId) res[value.Value, fail.Fail];
+```
+
+the lane-halving extension of the half of `src` whose first lane is `base`:
+a vector of half the lanes at twice the width, sign- or zero-extended
+
 ## fun emit_vec_build
 
 ```mach

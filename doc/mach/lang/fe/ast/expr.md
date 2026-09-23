@@ -378,6 +378,15 @@ pub rec ExprCall;
 pub rec ExprIndex;
 ```
 
+`x[i]` reads one element; `x[i, n]` is a range of `n` elements from `i`, and
+`count` is EXPR_NIL for the single element
+
+## fun is_range
+
+```mach
+pub fun is_range(ix: *ExprIndex) bool;
+```
+
 ## rec ExprMember
 
 ```mach

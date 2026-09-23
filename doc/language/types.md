@@ -169,26 +169,50 @@ var z: i32x4;                   # every lane is 0
 ```
 
 A literal is for a constant or for lanes assembled from unrelated scalars. **A
-window onto an array is a pointer reinterpret**, and the store is the same cast on
-the destination pointer:
+window onto memory is a range converted to a vector.** `p[i, 4]` is the four
+elements at `p[i]` as a `[4]f32` value, and `::` between `[N]T` and `TxN` moves
+those elements into the lanes and back. The store is the same range as the
+assignment target:
 
 ```mach fragment
-val a: f32x4 = @((?A[i]):~*f32x4);      # lanes A[i] .. A[i + 3]
-@((?out[i]):~*f32x4) = a * a;           # store four lanes at out[i]
+val a: f32x4 = p[i, 4]::f32x4;          # load the four floats at p[i]
+p[i, 4] = (a * a)::[4]f32;              # store four floats at p[i]
 ```
 
-This lowers to one unaligned vector load or store (`movups` on x86-64), so any
-element offset is valid; nothing requires `i` to be a multiple of the lane count.
-The reinterpret reads bytes, so the pointer's element type and the vector's lane
-type must agree in size and meaning: `(?A[i]):~*f32x4` over a `*f32` is the four
-floats at `i`, over a `*i32` it is their bits.
+The load is one unaligned vector load and the store one vector store (`movups` on
+x86-64), with no array value in between, so any element offset is valid. Nothing
+requires `i` to be a multiple of the lane count. `::` between an array and a
+vector is type-checked like every other `::`: the element type and the count must
+be the same on both sides, so `[4]i32` does not convert to `f32x4` and `[8]i16`
+does not convert to `i32x4`. The range and the conversion are described with the
+index and cast operators in [operators.md](operators.md#range).
+
+**The reinterpret is the bit-level view.** `@((?A[i]):~*f32x4)` reads the sixteen
+bytes at `A[i]` as an `f32x4` and stays legal. It lowers to the same load. It
+reads bytes, so the pointer's element type and the vector's lane type must agree
+in size and meaning: `(?A[i]):~*f32x4` over a `*f32` is the four floats at `i`,
+over a `*i32` it is their bits.
 
 A literal whose lanes are the consecutive elements of one pointer at stride one,
 `f32x4{p[i], p[i + 1], p[i + 2], p[i + 3]}`, is recognized as the same load and
 lowers to it. Any other literal of loads (a permuted order, a stride, a second
 pointer, a lane that is not a load) is assembled lane by lane through a stack slot.
 Storing a vector's lanes one at a time (`p[at] = v[0]; p[at + 1] = v[1]; ...`) is that
-many scalar stores; the one-instruction store is the cast on the destination pointer shown above.
+many scalar stores. The one-instruction store is the range store shown above.
+
+**Half a vector is a range of its lanes.** `v[start, count]` on a vector is the
+vector of those `count` lanes, so `v[4, 4]` on an `i16x8` is an `i16x4`. Widening
+a half lane by lane is the range followed by a vector `::`:
+
+```mach fragment
+val lo: i32x4 = v[0, 4]::i32x4;         # widen the low half of an i16x8
+val hi: i32x4 = v[4, 4]::i32x4;         # widen the high half
+```
+
+Where the target packs the lane-halving extension (x86-64, aarch64) each line is
+that one instruction, signed or unsigned by the source lanes, and elsewhere it is the
+lane path. A vector range's start is a comptime constant, as a lane index is, and
+it takes at least 2 lanes (one lane is `v[i]`).
 
 **Lane access** `v[i]` reads or writes a single lane. The index must be a
 comptime constant in `[0, lanes)`; a dynamic (runtime) lane index is not
@@ -356,6 +380,27 @@ takes the identical rule.
 
 Only a **constant** index is checked. A runtime index is not, and a pointer is
 not indexed against any length at all — `*T` carries none.
+
+**A range** `x[start, count]` is `count` consecutive elements from `start`, as a
+`[count]T` value, over an array or through a pointer. `count` is a comptime
+constant of at least 1, and `start` is any index. A constant `start` is checked the
+way a constant index is, against the whole range: `start + count` may reach `N`
+and may not pass it.
+
+```mach error range [3, 2] is out of bounds for `[4]i32` of length 4
+fun window() i32 {
+    var xs: [4]i32;
+    val a: [2]i32 = xs[2, 2];       # ok: elements 2 and 3
+    val b: [2]i32 = xs[3, 2];       # error: range [3, 2] is out of bounds for `[4]i32` of length 4
+    ret a[0] + b[0];
+}
+```
+
+A range is also an assignment target, storing `count` elements from `start`: the
+stored value's type is exactly `[count]T`. A range read is a value, not a view:
+`?xs[0, 2]` is an error, and writing into a range (`xs[0, 2][1] = 3`) is too. With
+`::` to a vector of the same shape it is the vector load and store in
+[SIMD vectors](#simd-vectors).
 
 ## Function type
 
