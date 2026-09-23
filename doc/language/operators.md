@@ -206,6 +206,38 @@ Two postfix cast operators, both written `expr OP Type`:
   as the operand's type (a size mismatch is a compile error). The `~` recalls
   its bitwise heritage, so `:~` reads as "bit cast".
 
+Every cast (`::`, `:~` and the `:>` strip cast) is a
+[postfix](grammar.md#postfix), and a prefix operator (`@`, `?`, `-`, `~`, `!`)
+takes its operand together with the whole postfix chain that follows it
+([grammar.md](grammar.md#prefix-atoms-and-unary)). So `@p::T` is `@(p::T)`: it
+casts the pointer `p` and then dereferences the result. To dereference first
+and convert the value read, parenthesize the dereference: `(@p)::T`. The same
+holds for `-x::T`, which is `-(x::T)`.
+
+```mach
+use std.runtime;
+use print: std.print;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var x: i64 = -1;
+    val p: *i64 = ?x;
+    val bits: u64 = @p::*u64;       # @(p::*u64): retype the pointer, read a u64
+    val wide: i128 = (@p)::i128;    # read the i64, then sign-extend it
+    print.printlnf("{:x} {}", bits, wide);
+    ret 0;
+}
+```
+
+Reading `@p::u64` as dereference-then-convert is refused, because the cast
+applies to `p` and a `u64` cannot be dereferenced:
+
+```mach error dereference of non-pointer type
+fun widen(p: *i64) u64 {
+    ret @p::u64;                    # error: @(p::u64) dereferences a u64
+}
+```
+
 On two vector types, `::` converts lane by lane: each lane goes through exactly
 the scalar `::` above, so `i32x4::f32x4` converts every lane numerically and
 `i8x4::i64x4` sign-extends every lane. Both sides need the same lane count
