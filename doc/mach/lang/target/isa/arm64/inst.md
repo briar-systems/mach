@@ -880,10 +880,25 @@ the high half of a 64x64 product: 64-bit only, sf fixed in the base word
 pub val SMULH: MachOp = 139
 ```
 
+## val V_SXTL2
+
+```mach
+pub val V_SXTL2: MachOp = 140
+```
+
+the shift-left-long of the upper half of the source register, the high half
+of a lane-halving extension
+
+## val V_UXTL2
+
+```mach
+pub val V_UXTL2: MachOp = 141
+```
+
 ## val MOP_LAST
 
 ```mach
-pub val MOP_LAST:  MachOp = SMULH
+pub val MOP_LAST:  MachOp = V_UXTL2
 ```
 
 ## fun known
