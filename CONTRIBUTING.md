@@ -16,12 +16,13 @@ host and put `mach` on `PATH`; CI seeds from the same archive
 git clone https://github.com/briar-systems/mach.git
 cd mach
 mach dep pull .
-mach build .
+mach build . --bin mach
 ```
 
 The compiler is written to `out/<target>/<profile>/bin/mach`, or
-`bin/mach.exe` on Windows. A default Linux x86_64 build writes
-`out/linux-x86_64/debug/bin/mach`.
+`bin/mach.exe` on Windows (`--bin mach-windows` there). A default Linux x86_64
+build writes `out/linux-x86_64/debug/bin/mach`. Without `--bin`, `mach build .`
+also builds the `tests` library artifact described below.
 
 
 ## Testing and formatting
@@ -32,8 +33,16 @@ the seed on `PATH`:
 ```bash
 out/linux-x86_64/debug/bin/mach test .
 out/linux-x86_64/debug/bin/mach test . --profile release
+out/linux-x86_64/debug/bin/mach test . --lib tests
+out/linux-x86_64/debug/bin/mach test . --lib tests --profile release
 out/linux-x86_64/debug/bin/mach fmt .
 ```
+
+`mach test .` runs the tests in the compiler's own closure. The suites that
+live in modules the compiler never reaches (`src/lang/driver/tests.mach`, the
+codegen runtime probes and the rest) are reached by the `tests` library
+artifact, whose entry `src/lib/tests.mach` `use`s each of them, so a new
+test-only module is added there.
 
 The tree is canonical: `mach fmt .` must leave it unchanged before a pull
 request is opened (`mach fmt --check .` reports what differs). The same holds

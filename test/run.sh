@@ -603,7 +603,9 @@ link_cell() {
     buildcc=$mach
     if [ -n "$case_self_host" ]; then
         rel=${dir#"$repo"/}/out/link/selfhostcc$exe
-        if ! (cd "$repo" && "$mach" build . --target "$case_self_host" --profile "$profile" -o "$rel") >"$tmp/selfhost.log" 2>&1; then
+        # the compiler is one of several artifacts, and -o names one output
+        selfbin=mach; case "$case_self_host" in windows*) selfbin=mach-windows ;; esac
+        if ! (cd "$repo" && "$mach" build . --bin "$selfbin" --target "$case_self_host" --profile "$profile" -o "$rel") >"$tmp/selfhost.log" 2>&1; then
             fail "$label self-host cross-build: $(first_error "$tmp/selfhost.log")"; rm -rf "$tmp"; return
         fi
         case "$eng" in qemu:*) buildcc="${eng#qemu:} $repo/$rel" ;; *) buildcc=$repo/$rel ;; esac
@@ -716,10 +718,11 @@ read_case_conf() {
     esac
 }
 
-# inc_build <project> <what> <dest>: -o must sit inside the project, so dest is relative
+# inc_build <project> <what> <dest> [flags...]: -o must sit inside the project, so dest is relative
 inc_build() {
-    if "$mach" build "$1" -o "$3" >"$out/log/incremental.log" 2>&1 && [ -f "$1/$3" ]; then return 0; fi
-    fail "incremental: $2 did not build"
+    proj=$1; what=$2; dest=$3; shift 3
+    if "$mach" build "$proj" "$@" -o "$dest" >"$out/log/incremental.log" 2>&1 && [ -f "$proj/$dest" ]; then return 0; fi
+    fail "incremental: $what did not build"
     sed 's/^/  /' "$out/log/incremental.log"
     return 1
 }
@@ -749,17 +752,17 @@ if [ "$mode" = incremental ]; then
     sed -i '/^\[dep\.std\]$/,/^$/{s/^git = .*$/path = "dep\/std"/;/^ref = /d;/^version = /d}' "$self/mach.toml"
     grep -q '^path = "dep/std"$' "$self/mach.toml" || fail "incremental: the copied manifest still names std by git"
     echo "incremental: $self"
-    if inc_build "$self" "the clean build" o/clean &&
-        inc_build "$self" "the warm no-op rebuild" o/warm; then
+    if inc_build "$self" "the clean build" o/clean --bin mach &&
+        inc_build "$self" "the warm no-op rebuild" o/warm --bin mach; then
         inc_same "$self/o/clean" "$self/o/warm" "a warm no-op rebuild differs from the clean build"
         cp "$self/o/clean" "$out/incremental/clean"
         sed -i 's/^pub val MACH_VERSION: str = "\(.*\)";$/pub val MACH_VERSION: str = "\1-inc";/' "$self/src/lang/version.mach"
         if ! grep -q -- '-inc";$' "$self/src/lang/version.mach"; then
             fail "incremental: the version edit did not apply to src/lang/version.mach"
-        elif inc_build "$self" "the warm rebuild after a source edit" o/warm_edit; then
+        elif inc_build "$self" "the warm rebuild after a source edit" o/warm_edit --bin mach; then
             cp "$self/o/warm_edit" "$out/incremental/warm_edit"
             rm -rf "$self/o" "$self/out"
-            if inc_build "$self" "the clean rebuild after a source edit" o/clean_edit &&
+            if inc_build "$self" "the clean rebuild after a source edit" o/clean_edit --bin mach &&
                 inc_changed "$out/incremental/clean" "$self/o/clean_edit" "the source edit"; then
                 inc_same "$out/incremental/warm_edit" "$self/o/clean_edit" "a warm rebuild after a source edit differs from a clean one (stale invalidation)"
             fi
