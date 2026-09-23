@@ -7,8 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `test/run.sh --qemu` runs the aarch64-linux corpus column's differential under `qemu-aarch64` on a host that is not aarch64 linux, the way the riscv64 columns run under `qemu-riscv64`, so a local run on x86_64 executes every aarch64-linux case against the C reference instead of diffing its golden alone. The reference is the host's own C build, as it is for riscv, so no cross C compiler is needed, and a missing emulator is announced and the column stays golden only. On an x86_64 host all 137 cases agree, where the native arm64 CI runner agrees on 135 and refuses the two secret-multiply cases for want of FEAT_DIT, which qemu provides. A compiler with the #3691 lane-write miscompile and its golden blessed passes the golden-only run and fails this one at `frame/frame_align`. The link cases keep emulating riscv64-linux alone, since aarch64-linux has a native leg to prove its ABI (#3818).
+
 ### Fixed
 - `doc/language/operators.md` states how a cast binds under a prefix operator. A cast is a postfix and a prefix operator takes the whole postfix chain, so `@p::T` is `@(p::T)` and dereference-then-convert is `(@p)::T`. The rule was stated only in `grammar.md`, and the cast section, where people look it up, invited the other reading (#3814).
+- Resolving dependency releases, as `mach dep update` does, no longer fails at random with `fatal: shallow file has changed since we read it` while reading release manifests. Each release's tag is fetched shallow into one scratch repository, and every fetch ended by starting git's automatic maintenance detached, which rewrote the scratch's `shallow` file under the next fetch. The scratch is thrown away after the command, so its fetches now run with `gc.auto=0` and `maintenance.auto=false`, and nothing but mach's own fetches touches it (#3816).
 - A COFF object parsed and re-emitted without frame records parses again. The parser consumes `.mach.frames` to a zero-length husk of the same name, a re-emit with no frames writes that husk back out, and the parser refused any `.mach.frames` shorter than its 8-byte header, so the second parse failed with `coff: malformed .mach.frames section`. A zero-length section now reads as no frame records, the same as an absent one, and a section of 1 to 7 bytes is still refused (#3810).
 
 ## [5.11.0] - 2026-09-22
