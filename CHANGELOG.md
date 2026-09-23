@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The compiler builds against std 7 (`[dep.std] version = "^7.4"`, gitlink at v7.4.0, from v6.1.0), a new std major, so a project that depends on the compiler moves to std 7 with it. The range starts at 7.4 because the compiler's test probe reads `Allocator.retains`, which std 7.3.0 added: the probe now reports its backing's `retains`, as std asks of a wrapper over another allocator, and a refusing probe reclaims. The source otherwise builds against std 7 unchanged, since the compiler neither calls `io.runtime.make` nor builds a `data.toml.Value` or a `memory.table.Pool` (#3796).
+
 ### Added
 - `test/run.sh --qemu` runs the aarch64-linux corpus column's differential under `qemu-aarch64` on a host that is not aarch64 linux, the way the riscv64 columns run under `qemu-riscv64`, so a local run on x86_64 executes every aarch64-linux case against the C reference instead of diffing its golden alone. The reference is the host's own C build, as it is for riscv, so no cross C compiler is needed, and a missing emulator is announced and the column stays golden only. On an x86_64 host all 137 cases agree, where the native arm64 CI runner agrees on 135 and refuses the two secret-multiply cases for want of FEAT_DIT, which qemu provides. A compiler with the #3691 lane-write miscompile and its golden blessed passes the golden-only run and fails this one at `frame/frame_align`. The link cases keep emulating riscv64-linux alone, since aarch64-linux has a native leg to prove its ABI (#3818).
 
