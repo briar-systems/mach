@@ -145,7 +145,7 @@ arms contain picks which.
 - **Some arm declares something.** The chain is decided while the modules load,
   because what it decides is which declarations exist and every later stage reads
   the resulting declaration set. Nothing has a type at that point, so the gate
-  cannot ask a type question: `$size_of`, `$align_of`, `$length_of`, `$offset_of`,
+  cannot ask a type question: `$size_of`, `$align_of`, `$length_of`, `$offset_of`, `$type_id`,
   `$type_of`, `$type_name` or an `$is_*` predicate there is rejected, with a
   message naming the question. So is one the gate reaches through a constant it
   reads, and the message names the constants it goes through.
