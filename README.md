@@ -42,7 +42,7 @@ irm https://machlang.org/install.ps1 | iex
 Both install the latest release, to `~/.local/bin` on Linux and macOS and `%LOCALAPPDATA%\mach\bin` on Windows. Precompiled binaries are also on the [releases](https://github.com/briar-systems/mach/releases) page.
 
 
-## Four steps in
+## Getting started
 
 ```sh
 curl -fsSL https://machlang.org/install.sh | sh   # install
