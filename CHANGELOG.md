@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `doc/language/operators.md` states how a cast binds under a prefix operator. A cast is a postfix and a prefix operator takes the whole postfix chain, so `@p::T` is `@(p::T)` and dereference-then-convert is `(@p)::T`. The rule was stated only in `grammar.md`, and the cast section, where people look it up, invited the other reading (#3814).
+
 ## [5.11.0] - 2026-09-22
 
 ### Changed
