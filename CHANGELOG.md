@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.11.0] - 2026-09-22
+
 ### Changed
 - The compiler builds against std 6.1.0 (`[dep.std] version = "^6.1"`, gitlink at v6.1.0). The two places that read a map's slot layout are gone: the source snapshot copies its path index with `map.clone`, and IR module equality walks a map with the `map.iter`/`map.next` cursor, so the compiler no longer follows std's control-byte encoding (#3766, briar-systems/mach-std#847).
 
