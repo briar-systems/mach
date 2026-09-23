@@ -1,0 +1,600 @@
+# drops the widen of a value the machine already holds extended: a widening
+# load zero-fills its general register, a zext or sext fills to its width, and
+# an immediate move fills to its width, so a zext or sext that reads such a
+# value at or above the width it was extended from and writes at or below the
+# width it was extended to is a move, and one that writes past a whole-register
+# fill reads the whole register instead (#3660)
+use mach.lang.fail;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.allocator.page;
+
+use A: std.allocator;
+
+use mach.lang.be.codegen.mir;
+use mach.lang.target;
+
+# what is known of the bits above a value's width: nothing yet (the optimistic
+# start of a vreg every definition still refines), a fill of zeros or of the
+# sign from `from` bytes up to `to` bytes, or nothing at all
+val EXT_BOTTOM: u8 = 0;
+val EXT_FILL:   u8 = 1;
+val EXT_TOP:    u8 = 2;
+
+rec Ext {
+    state: u8;
+    from:  u8;
+    to:    u8;
+}
+
+# the zero and sign fills known of every vreg, indexed by vreg number
+rec Facts {
+    zero:  *Ext;
+    sign:  *Ext;
+    count: u32;
+}
+
+pub fun run(tgt: *target.Target, m: *mir.MirModule) err[fail.Fail] {
+    if (tgt == nil) { ret err[fail.Fail].err{fail.message("extfold: nil target")}; }
+    if (m == nil)   { ret err[fail.Fail].err{fail.message("extfold: nil mir module")}; }
+    val gpr: u8  = tgt.model.gpr_width::u8;
+    var fi:  u32 = 0;
+    for (fi < m.function_len) {
+        val r: err[fail.Fail] = fold_function(m.alloc, gpr, ?m.functions[fi]);
+        if (sel r.err) { ret r; }
+        fi = fi + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun fold_function(alloc: *A.Allocator, gpr: u8, f: *mir.MirFunction) err[fail.Fail] {
+    if (f.vreg_count == 0) { ret err[fail.Fail].ok{}; }
+    var facts: Facts;
+    val ir:    err[fail.Fail] = facts_init(alloc, f, ?facts);
+    if (sel ir.err) { ret ir; }
+    fin { facts_dnit(alloc, ?facts); }
+    solve(gpr, f, ?facts);
+    rewrite(gpr, f, ?facts);
+    ret err[fail.Fail].ok{};
+}
+
+fun facts_init(alloc: *A.Allocator, f: *mir.MirFunction, out: *Facts) err[fail.Fail] {
+    val n:  u32                = f.vreg_count;
+    val zr: res[*Ext, A.Error] = A.zallocate[Ext](alloc, n::usize);
+    if (sel zr.err) { ret err[fail.Fail].err{fail.refused(zr.err)}; }
+    val sr: res[*Ext, A.Error] = A.zallocate[Ext](alloc, n::usize);
+    if (sel sr.err) {
+        A.deallocate[Ext](alloc, zr.ok, n::usize);
+        ret err[fail.Fail].err{fail.refused(sr.err)};
+    }
+    out.zero  = zr.ok;
+    out.sign  = sr.ok;
+    out.count = n;
+    # a vreg no instruction defines (a parameter, an abi input) is not refined
+    # by anything and starts unknown
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        var ii:  u32           = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            if (instr_defines(mi) && mi.operands[0].vreg.n < n) {
+                out.zero[mi.operands[0].vreg.n].state = EXT_FILL;
+                out.sign[mi.operands[0].vreg.n].state = EXT_FILL;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    var v: u32 = 0;
+    for (v < n) {
+        if (out.zero[v].state == EXT_FILL) {
+            out.zero[v].state = EXT_BOTTOM;
+            out.sign[v].state = EXT_BOTTOM;
+        }
+        or {
+            out.zero[v].state = EXT_TOP;
+            out.sign[v].state = EXT_TOP;
+        }
+        v = v + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun facts_dnit(alloc: *A.Allocator, facts: *Facts) {
+    if (facts.count == 0) { ret; }
+    A.deallocate[Ext](alloc, facts.zero, facts.count::usize);
+    A.deallocate[Ext](alloc, facts.sign, facts.count::usize);
+    facts.count = 0;
+}
+
+fun instr_defines(mi: *mir.MirInstr) bool {
+    if (!mir.instr_defines_shape(mi)) { ret false; }
+    ret mi.operands[0].kind == mir.MIR_OP_VREG;
+}
+
+fun bottom() Ext {
+    var e: Ext;
+    e.state = EXT_BOTTOM;
+    ret e;
+}
+
+fun top() Ext {
+    var e: Ext;
+    e.state = EXT_TOP;
+    ret e;
+}
+
+fun fill(from: u8, to: u8) Ext {
+    if (from >= to) { ret top(); }
+    var e: Ext;
+    e.state = EXT_FILL;
+    e.from  = from;
+    e.to    = to;
+    ret e;
+}
+
+# the fill both of two definitions leave: the wider origin and the narrower reach
+fun meet(a: Ext, b: Ext) Ext {
+    if (a.state == EXT_BOTTOM)                    { ret b; }
+    if (b.state == EXT_BOTTOM)                    { ret a; }
+    if (a.state == EXT_TOP || b.state == EXT_TOP) { ret top(); }
+    var from: u8 = a.from;
+    if (b.from > from) { from = b.from; }
+    var to: u8 = a.to;
+    if (b.to < to) { to = b.to; }
+    ret fill(from, to);
+}
+
+fun same(a: Ext, b: Ext) bool {
+    if (a.state != b.state)  { ret false; }
+    if (a.state != EXT_FILL) { ret true; }
+    ret a.from == b.from && a.to == b.to;
+}
+
+# a copy of `w` bytes carries the fill only as far as it writes
+fun clip(e: Ext, w: u8) Ext {
+    if (e.state != EXT_FILL) { ret e; }
+    var to: u8 = e.to;
+    if (w < to) { to = w; }
+    ret fill(e.from, to);
+}
+
+# the fewest bytes the immediate `v` read at `w` bytes needs as an unsigned value
+fun unsigned_width(v: i64, w: u8) u8 {
+    val bits: u32 = w::u32 * 8;
+    var u:    u64 = v::u64;
+    if (bits < 64) { u = u & ((1::u64 << bits) - 1); }
+    var n: u8 = 1;
+    for (n < w) {
+        if (u < (1::u64 << (n::u64 * 8))) { ret n; }
+        n = n * 2;
+    }
+    ret w;
+}
+
+# the fewest bytes the immediate `v` read at `w` bytes needs as a signed value
+fun signed_width(v: i64, w: u8) u8 {
+    val bits: u32 = w::u32 * 8;
+    var s:    i64 = v;
+    if (bits < 64) {
+        val drop: u64 = 64 - bits::u64;
+        s = ((s:~u64 << drop):~i64) >> drop::i64;
+    }
+    var n: u8 = 1;
+    for (n < w) {
+        val half: i64 = 1::i64 << (n::i64 * 8 - 1);
+        if (s >= -half && s < half) { ret n; }
+        n = n * 2;
+    }
+    ret w;
+}
+
+fun scalar_gp(f: *mir.MirFunction, mi: *mir.MirInstr, op: *mir.MirOperand) bool {
+    if (op.kind != mir.MIR_OP_VREG)          { ret false; }
+    if (op.vreg.n >= f.vreg_count)           { ret false; }
+    if (mir.vec_lane_is_vector(mi.vec_lane)) { ret false; }
+    val v: *mir.MirVReg = ?f.vregs[op.vreg.n];
+    ret v.class == mir.REG_CLASS_GP && !v.vector;
+}
+
+# the fills one definition leaves on the vreg it writes
+fun def_facts(gpr: u8, f: *mir.MirFunction, facts: *Facts, mi: *mir.MirInstr, zero: *Ext, sign: *Ext) {
+    @zero = top();
+    @sign = top();
+    if (mi.asm_block != nil)                { ret; }
+    if (!scalar_gp(f, mi, ?mi.operands[0])) { ret; }
+    if (mi.opcode == mir.MIR_LOAD) {
+        # a widening load writes the whole general register
+        if (mi.width > mi.src_width) { @zero = fill(mi.src_width, gpr); }
+        ret;
+    }
+    if (mi.opcode == mir.MIR_ZEXT) {
+        @zero = fill(mi.src_width, mi.width);
+        ret;
+    }
+    if (mi.opcode == mir.MIR_SEXT) {
+        @sign = fill(mi.src_width, mi.width);
+        ret;
+    }
+    if (mi.opcode == mir.MIR_MOV && mi.operand_count == 2) {
+        val src: *mir.MirOperand = ?mi.operands[1];
+        if (src.kind == mir.MIR_OP_IMM) {
+            @zero = fill(unsigned_width(src.imm, mi.width), mi.width);
+            @sign = fill(signed_width(src.imm, mi.width), mi.width);
+            ret;
+        }
+        if (scalar_gp(f, mi, src)) {
+            @zero = clip(facts.zero[src.vreg.n], mi.width);
+            @sign = clip(facts.sign[src.vreg.n], mi.width);
+        }
+    }
+}
+
+# every vreg's fill is the meet over its definitions, copies carrying their
+# source's; the sweep repeats until nothing moves, which every vreg does at
+# most twice on its way down
+fun solve(gpr: u8, f: *mir.MirFunction, facts: *Facts) {
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        var bi: u32 = 0;
+        for (bi < f.block_count) {
+            val blk: *mir.MirBlock = ?f.blocks[bi];
+            var ii:  u32           = 0;
+            for (ii < blk.instr_count) {
+                val mi: *mir.MirInstr = ?blk.instrs[ii];
+                if (instr_defines(mi) && mi.operands[0].vreg.n < facts.count) {
+                    val d:    u32 = mi.operands[0].vreg.n;
+                    var zero: Ext;
+                    var sign: Ext;
+                    def_facts(gpr, f, facts, mi, ?zero, ?sign);
+                    val nz: Ext = meet(facts.zero[d], zero);
+                    val ns: Ext = meet(facts.sign[d], sign);
+                    if (!same(nz, facts.zero[d]) || !same(ns, facts.sign[d])) {
+                        facts.zero[d] = nz;
+                        facts.sign[d] = ns;
+                        changed       = true;
+                    }
+                }
+                ii = ii + 1;
+            }
+            bi = bi + 1;
+        }
+    }
+}
+
+fun rewrite(gpr: u8, f: *mir.MirFunction, facts: *Facts) {
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        var ii:  u32           = 0;
+        for (ii < blk.instr_count) {
+            rewrite_instr(gpr, f, facts, ?blk.instrs[ii]);
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+}
+
+# a widen whose source is already filled the same way from at most the width
+# it reads becomes a move when the fill reaches the width it writes, and reads
+# the whole register when the fill is a whole-register one that stops short
+fun rewrite_instr(gpr: u8, f: *mir.MirFunction, facts: *Facts, mi: *mir.MirInstr) {
+    if (mi.opcode != mir.MIR_ZEXT && mi.opcode != mir.MIR_SEXT) { ret; }
+    if (mi.operand_count != 2 || mi.asm_block != nil)           { ret; }
+    if (mi.width <= mi.src_width)                               { ret; }
+    if (!scalar_gp(f, mi, ?mi.operands[0]))                     { ret; }
+    if (!scalar_gp(f, mi, ?mi.operands[1]))                     { ret; }
+    var known: Ext = facts.zero[mi.operands[1].vreg.n];
+    if (mi.opcode == mir.MIR_SEXT) { known = facts.sign[mi.operands[1].vreg.n]; }
+    if (known.state != EXT_FILL)   { ret; }
+    if (known.from > mi.src_width) { ret; }
+    if (mi.width <= known.to) {
+        mi.opcode    = mir.MIR_MOV;
+        mi.src_width = mi.width;
+        ret;
+    }
+    if (known.to == gpr) { mi.src_width = gpr; }
+}
+
+fun t_vregs(alloc: *A.Allocator, f: *mir.MirFunction, n: u32) {
+    val r: res[*mir.MirVReg, A.Error] = A.allocate[mir.MirVReg](alloc, n::usize);
+    if (sel r.err) { ret; }
+    f.vregs      = r.ok;
+    f.vreg_count = n;
+    f.vreg_cap   = n;
+    var i: u32 = 0;
+    for (i < n) {
+        f.vregs[i] = mir.vreg(i, mir.REG_CLASS_GP, false, false);
+        i          = i + 1;
+    }
+}
+
+fun t_block(alloc: *A.Allocator, f: *mir.MirFunction, b: *mir.MirBlock, n: u32) {
+    val r: res[*mir.MirInstr, A.Error] = A.zallocate[mir.MirInstr](alloc, n::usize);
+    if (sel r.err) { ret; }
+    b.instrs      = r.ok;
+    b.instr_count = n;
+    b.instr_cap   = n;
+    f.blocks      = b;
+    f.block_count = 1;
+}
+
+fun t_instr(alloc: *A.Allocator, b: *mir.MirBlock, ix: u32, opcode: mir.MirOpcode,
+    dst: u32, src: mir.MirOperand, width: u8, src_width: u8) {
+    val r: res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](alloc, 2);
+    if (sel r.err) { ret; }
+    r.ok[0]      = mir.op_vreg(mir.vreg_id(dst));
+    r.ok[1]      = src;
+    b.instrs[ix] = mir.instr(opcode, r.ok, 2, width, src_width);
+}
+
+fun t_vreg(n: u32) mir.MirOperand {
+    ret mir.op_vreg(mir.vreg_id(n));
+}
+
+fun t_mem() mir.MirOperand {
+    ret mir.op_mem_value(mir.vreg_id(9), 0);
+}
+
+# a widening load of `lw` bytes into v1, then `op` widening v1 to `dw` from
+# `sw` into v0; the shape the widen is left in comes back through the block
+fun t_load_then_widen(gpr: u8, lw: u8, op: mir.MirOpcode, dw: u8, sw: u8, b: *mir.MirBlock, f: *mir.MirFunction, alloc: *A.Allocator) err[fail.Fail] {
+    t_vregs(alloc, f, 10);
+    t_block(alloc, f, b, 2);
+    t_instr(alloc, b, 0, mir.MIR_LOAD, 1, t_mem(), 4, lw);
+    t_instr(alloc, b, 1, op, 0, t_vreg(1), dw, sw);
+    ret fold_function(alloc, gpr, f);
+}
+
+test "mach.lang.be.codegen.extfold:a_zext_of_a_widening_load_is_a_move" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    val r: err[fail.Fail] = t_load_then_widen(8, 1, mir.MIR_ZEXT, 8, 1, ?b, ?f, ?alloc);
+    if (sel r.err)                           { ret 1; }
+    if (b.instrs[1].opcode != mir.MIR_MOV)   { ret 2; }
+    if (b.instrs[1].width != 8)              { ret 3; }
+    if (b.instrs[1].src_width != 8)          { ret 4; }
+    if (b.instrs[1].operands[1].vreg.n != 1) { ret 5; }
+    if (b.instrs[0].opcode != mir.MIR_LOAD)  { ret 6; }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.extfold:a_zext_reading_above_the_load_width_is_a_move" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    val r: err[fail.Fail] = t_load_then_widen(8, 1, mir.MIR_ZEXT, 8, 2, ?b, ?f, ?alloc);
+    if (sel r.err)                         { ret 1; }
+    if (b.instrs[1].opcode != mir.MIR_MOV) { ret 2; }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.extfold:a_zext_reading_below_the_load_width_stays" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    val r: err[fail.Fail] = t_load_then_widen(8, 2, mir.MIR_ZEXT, 8, 1, ?b, ?f, ?alloc);
+    if (sel r.err)                          { ret 1; }
+    if (b.instrs[1].opcode != mir.MIR_ZEXT) { ret 2; }
+    if (b.instrs[1].src_width != 1)         { ret 3; }
+    ret 0;
+}
+
+# a load fills with zeros, so a sign extension of it is not known
+test "mach.lang.be.codegen.extfold:a_sext_of_a_widening_load_stays" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    val r: err[fail.Fail] = t_load_then_widen(8, 1, mir.MIR_SEXT, 8, 1, ?b, ?f, ?alloc);
+    if (sel r.err)                          { ret 1; }
+    if (b.instrs[1].opcode != mir.MIR_SEXT) { ret 2; }
+    if (b.instrs[1].src_width != 1)         { ret 3; }
+    ret 0;
+}
+
+# on a 32-bit register the load fills the register and the widen to 64 bits
+# past it reads the whole register, which legalize splits into lane moves
+test "mach.lang.be.codegen.extfold:a_zext_past_a_narrow_register_reads_the_whole_register" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    val r: err[fail.Fail] = t_load_then_widen(4, 1, mir.MIR_ZEXT, 8, 1, ?b, ?f, ?alloc);
+    if (sel r.err)                          { ret 1; }
+    if (b.instrs[1].opcode != mir.MIR_ZEXT) { ret 2; }
+    if (b.instrs[1].width != 8)             { ret 3; }
+    if (b.instrs[1].src_width != 4)         { ret 4; }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.extfold:a_non_widening_load_leaves_the_zext" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    t_vregs(?alloc, ?f, 10);
+    t_block(?alloc, ?f, ?b, 2);
+    t_instr(?alloc, ?b, 0, mir.MIR_LOAD, 1, t_mem(), 4, 4);
+    t_instr(?alloc, ?b, 1, mir.MIR_ZEXT, 0, t_vreg(1), 8, 4);
+    val r: err[fail.Fail] = fold_function(?alloc, 8, ?f);
+    if (sel r.err)                          { ret 1; }
+    if (b.instrs[1].opcode != mir.MIR_ZEXT) { ret 2; }
+    ret 0;
+}
+
+# a second definition of the source by an instruction with no known fill
+# takes the fact away
+test "mach.lang.be.codegen.extfold:a_source_also_defined_by_arithmetic_is_unknown" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    t_vregs(?alloc, ?f, 10);
+    t_block(?alloc, ?f, ?b, 3);
+    t_instr(?alloc, ?b, 0, mir.MIR_LOAD, 1, t_mem(), 4, 1);
+    t_instr(?alloc, ?b, 1, mir.MIR_NOT, 1, t_vreg(2), 4, 4);
+    t_instr(?alloc, ?b, 2, mir.MIR_ZEXT, 0, t_vreg(1), 8, 1);
+    val r: err[fail.Fail] = fold_function(?alloc, 8, ?f);
+    if (sel r.err)                          { ret 1; }
+    if (b.instrs[2].opcode != mir.MIR_ZEXT) { ret 2; }
+    ret 0;
+}
+
+# a parameter has no defining instruction and is unknown even when a copy from
+# a load also reaches the same vreg
+test "mach.lang.be.codegen.extfold:an_undefined_source_is_unknown" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    t_vregs(?alloc, ?f, 10);
+    t_block(?alloc, ?f, ?b, 3);
+    t_instr(?alloc, ?b, 0, mir.MIR_LOAD, 2, t_mem(), 4, 1);
+    t_instr(?alloc, ?b, 1, mir.MIR_MOV, 1, t_vreg(2), 8, 8);
+    t_instr(?alloc, ?b, 2, mir.MIR_ZEXT, 0, t_vreg(3), 8, 1);
+    val r: err[fail.Fail] = fold_function(?alloc, 8, ?f);
+    if (sel r.err)                          { ret 1; }
+    if (b.instrs[2].opcode != mir.MIR_ZEXT) { ret 2; }
+    b.instrs[1].operands[1] = t_vreg(3);
+    b.instrs[2].operands[1] = t_vreg(1);
+    val r2: err[fail.Fail] = fold_function(?alloc, 8, ?f);
+    if (sel r2.err)                         { ret 3; }
+    if (b.instrs[2].opcode != mir.MIR_ZEXT) { ret 4; }
+    ret 0;
+}
+
+# the copies a phi lowers to: one edge moves a loaded byte, the other a small
+# immediate, both at the full width, and the widen of their meet is a move; at
+# a byte width the copies fill nothing above the byte and the widen stays
+fun t_phi_copies(w: u8) i32 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    t_vregs(?alloc, ?f, 10);
+    t_block(?alloc, ?f, ?b, 4);
+    t_instr(?alloc, ?b, 0, mir.MIR_LOAD, 2, t_mem(), 4, 1);
+    t_instr(?alloc, ?b, 1, mir.MIR_MOV, 1, t_vreg(2), w, w);
+    t_instr(?alloc, ?b, 2, mir.MIR_MOV, 1, mir.op_imm(255), w, w);
+    t_instr(?alloc, ?b, 3, mir.MIR_ZEXT, 0, t_vreg(1), 8, 1);
+    val r: err[fail.Fail] = fold_function(?alloc, 8, ?f);
+    if (sel r.err)                                    { ret 1; }
+    if (w == 8 && b.instrs[3].opcode != mir.MIR_MOV)  { ret 2; }
+    if (w == 1 && b.instrs[3].opcode != mir.MIR_ZEXT) { ret 3; }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.extfold:phi_copies_at_full_width_carry_the_fill" {
+    ret t_phi_copies(8);
+}
+
+test "mach.lang.be.codegen.extfold:phi_copies_at_byte_width_carry_nothing" {
+    ret t_phi_copies(1);
+}
+
+# an immediate too wide for the source width of the widen is not a fill from it
+test "mach.lang.be.codegen.extfold:an_immediate_above_the_source_width_stays" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    t_vregs(?alloc, ?f, 10);
+    t_block(?alloc, ?f, ?b, 2);
+    t_instr(?alloc, ?b, 0, mir.MIR_MOV, 1, mir.op_imm(256), 8, 8);
+    t_instr(?alloc, ?b, 1, mir.MIR_ZEXT, 0, t_vreg(1), 8, 1);
+    val r: err[fail.Fail] = fold_function(?alloc, 8, ?f);
+    if (sel r.err)                          { ret 1; }
+    if (b.instrs[1].opcode != mir.MIR_ZEXT) { ret 2; }
+    b.instrs[1].src_width = 2;
+    val r2: err[fail.Fail] = fold_function(?alloc, 8, ?f);
+    if (sel r2.err)                        { ret 3; }
+    if (b.instrs[1].opcode != mir.MIR_MOV) { ret 4; }
+    ret 0;
+}
+
+# a negative immediate is a sign fill, never a zero one
+test "mach.lang.be.codegen.extfold:a_negative_immediate_is_a_sign_fill" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    t_vregs(?alloc, ?f, 10);
+    t_block(?alloc, ?f, ?b, 3);
+    t_instr(?alloc, ?b, 0, mir.MIR_MOV, 1, mir.op_imm(-3), 8, 8);
+    t_instr(?alloc, ?b, 1, mir.MIR_ZEXT, 0, t_vreg(1), 8, 1);
+    t_instr(?alloc, ?b, 2, mir.MIR_SEXT, 3, t_vreg(1), 8, 1);
+    val r: err[fail.Fail] = fold_function(?alloc, 8, ?f);
+    if (sel r.err)                          { ret 1; }
+    if (b.instrs[1].opcode != mir.MIR_ZEXT) { ret 2; }
+    if (b.instrs[2].opcode != mir.MIR_MOV)  { ret 3; }
+    ret 0;
+}
+
+# a sext of a value a sext already filled the same way, and a zext of a zext
+test "mach.lang.be.codegen.extfold:a_widen_of_a_matching_widen_is_a_move" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    t_vregs(?alloc, ?f, 10);
+    t_block(?alloc, ?f, ?b, 4);
+    t_instr(?alloc, ?b, 0, mir.MIR_SEXT, 1, t_vreg(5), 4, 1);
+    t_instr(?alloc, ?b, 1, mir.MIR_SEXT, 0, t_vreg(1), 4, 2);
+    t_instr(?alloc, ?b, 2, mir.MIR_ZEXT, 3, t_vreg(1), 8, 2);
+    t_instr(?alloc, ?b, 3, mir.MIR_SEXT, 4, t_vreg(1), 8, 2);
+    val r: err[fail.Fail] = fold_function(?alloc, 8, ?f);
+    if (sel r.err)                          { ret 1; }
+    if (b.instrs[1].opcode != mir.MIR_MOV)  { ret 2; }
+    if (b.instrs[1].src_width != 4)         { ret 3; }
+    if (b.instrs[2].opcode != mir.MIR_ZEXT) { ret 4; }
+    if (b.instrs[3].opcode != mir.MIR_SEXT) { ret 5; }
+    if (b.instrs[3].src_width != 2)         { ret 6; }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.extfold:a_vector_source_is_left_alone" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    t_vregs(?alloc, ?f, 10);
+    t_block(?alloc, ?f, ?b, 2);
+    f.vregs[1].vector = true;
+    t_instr(?alloc, ?b, 0, mir.MIR_LOAD, 1, t_mem(), 4, 1);
+    t_instr(?alloc, ?b, 1, mir.MIR_ZEXT, 0, t_vreg(1), 8, 1);
+    val r: err[fail.Fail] = fold_function(?alloc, 8, ?f);
+    if (sel r.err)                          { ret 1; }
+    if (b.instrs[1].opcode != mir.MIR_ZEXT) { ret 2; }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.extfold.unsigned_width:smallest_byte_count_holding_the_value" {
+    if (unsigned_width(0, 8) != 1)           { ret 1; }
+    if (unsigned_width(255, 8) != 1)         { ret 2; }
+    if (unsigned_width(256, 8) != 2)         { ret 3; }
+    if (unsigned_width(0x10000, 8) != 4)     { ret 4; }
+    if (unsigned_width(0x100000000, 8) != 8) { ret 5; }
+    if (unsigned_width(-1, 8) != 8)          { ret 6; }
+    if (unsigned_width(-1, 4) != 4)          { ret 7; }
+    if (unsigned_width(0x1ff, 1) != 1)       { ret 8; }
+    if (signed_width(127, 8) != 1)           { ret 9; }
+    if (signed_width(128, 8) != 2)           { ret 10; }
+    if (signed_width(-128, 8) != 1)          { ret 11; }
+    if (signed_width(-129, 8) != 2)          { ret 12; }
+    if (signed_width(0xffffffff, 4) != 1)    { ret 13; }
+    if (signed_width(0x7fffffff, 8) != 4)    { ret 14; }
+    if (signed_width(0x80000000, 8) != 8)    { ret 15; }
+    ret 0;
+}
