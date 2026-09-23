@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `doc/language/operators.md` states how a cast binds under a prefix operator. A cast is a postfix and a prefix operator takes the whole postfix chain, so `@p::T` is `@(p::T)` and dereference-then-convert is `(@p)::T`. The rule was stated only in `grammar.md`, and the cast section, where people look it up, invited the other reading (#3814).
 - A COFF object parsed and re-emitted without frame records parses again. The parser consumes `.mach.frames` to a zero-length husk of the same name, a re-emit with no frames writes that husk back out, and the parser refused any `.mach.frames` shorter than its 8-byte header, so the second parse failed with `coff: malformed .mach.frames section`. A zero-length section now reads as no frame records, the same as an absent one, and a section of 1 to 7 bytes is still refused (#3810).
 
 ## [5.11.0] - 2026-09-22
