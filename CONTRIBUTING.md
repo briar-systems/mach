@@ -16,13 +16,12 @@ host and put `mach` on `PATH`; CI seeds from the same archive
 git clone https://github.com/briar-systems/mach.git
 cd mach
 mach dep pull .
-mach build . --bin mach
+mach build .
 ```
 
 The compiler is written to `out/<target>/<profile>/bin/mach`, or
-`bin/mach.exe` on Windows (`--bin mach-windows` there). A default Linux x86_64
-build writes `out/linux-x86_64/debug/bin/mach`. Without `--bin`, `mach build .`
-also builds the `tests` library artifact described below.
+`bin/mach.exe` on Windows. A default Linux x86_64 build writes
+`out/linux-x86_64/debug/bin/mach`.
 
 
 ## Testing and formatting
