@@ -12,16 +12,10 @@ pub def RootSet: u8
 pub val ROOT_ARTIFACT: RootSet = 0
 ```
 
-## val ROOT_TEST
-
-```mach
-pub val ROOT_TEST: RootSet = 1
-```
-
 ## val ROOT_UNION
 
 ```mach
-pub val ROOT_UNION: RootSet = 2
+pub val ROOT_UNION: RootSet = 1
 ```
 
 ## def BuildMode

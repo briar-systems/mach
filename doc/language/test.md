@@ -2,8 +2,8 @@
 
 A `test` declaration names a block of statements the test runner can
 execute on its own. Tests live alongside the code they exercise: any
-module may declare them, and `mach test` collects every test across the
-project into a single test binary.
+module may declare them, and `mach test` collects every test in the
+selected artifact's closure into a single test binary.
 
 ## Grammar
 
@@ -56,8 +56,10 @@ function body.
 ## Semantics
 
 Every build resolves and type-checks each `test` body in the modules its artifact
-entry reaches. `mach test` roots its build at every module in the current project's
-source tree, so it checks and collects tests in modules no artifact imports. Each
+entry reaches. `mach test` builds exactly what `mach build` builds for the same
+artifact: the closure its entry reaches through `use` and `fwd`. A module no
+selected artifact reaches is not loaded under test either, so it is not checked and
+its tests do not run (see [Which tests run](#which-tests-run)). Each
 test then lowers to a zero-parameter, `i32`-returning function tagged as a test entry
 point so the runner can iterate it. The label is interned and becomes the lowered
 function's name. Ordinary builds omit test bodies from IR and object files.
@@ -103,9 +105,9 @@ the ordinal of the first failing check instead.
 ### Collection across modules
 
 Tests are not tied to a single file. Every `test` declaration in every
-module of the current project is collected, and `mach test` builds one
-dispatcher executable in place of the project's normal entry and runs each
-test through it in its own process.
+module of the artifact under test that belongs to the current project is
+collected, and `mach test` builds one dispatcher executable in place of the
+artifact's normal entry and runs each test through it in its own process.
 
 By default collection is scoped to the current project's own modules: tests
 declared in dependency modules are excluded, so a library's own suite never
@@ -207,10 +209,57 @@ under `log/` beside the dispatcher (a passing test's file is removed on the
 spot, a failing test's file stays), and reads its exit status. Results render
 in collection order regardless of completion order.
 
-Tests live inline alongside the code they cover: write `test "..." { }`
-declarations directly in the relevant `src/` module, or group them under
-`src/test/`. Every test declaration across the project's modules is collected
-automatically, with no separate corpus project.
+## Which tests run
+
+`mach test` selects the artifact under test the way every command that needs
+one artifact does: `--bin <name>` or `--lib <name>` names it; otherwise the sole
+artifact the selected target builds is chosen, or among several the one marked
+`default = true` (see [manifest.md](manifest.md#artifactname)). It then builds that
+artifact's closure, the same module set `mach build` compiles for it, and runs
+the tests declared there. Each run tests one artifact, so `$bin.name` in a test
+block, and in every module the run compiles, is the artifact under test.
+
+Tests live inline alongside the code they cover: a `test "..." { }` declaration
+in a module the artifact reaches runs with no further wiring. A module that
+exists only for tests, a suite too large to sit beside the code or a harness
+that drives the whole compiler, is reached by no artifact and so never runs on
+its own. Give such modules a **test artifact**: an ordinary library artifact
+whose entry `use`s each of them, tested by name.
+
+```toml
+[artifact.app]
+kind    = "bin"
+default = true
+entry   = "main.mach"
+out     = "bin/app"
+targets = ["*"]
+link    = []
+need    = []
+
+# the test-only modules no other artifact reaches
+[artifact.tests]
+kind    = "static"
+entry   = "test/all.mach"
+out     = "lib/tests"
+targets = ["*"]
+link    = []
+need    = []
+```
+
+```mach fragment
+# src/test/all.mach
+use std.runtime;
+
+use app.test.parser;
+use app.test.roundtrip;
+```
+
+`mach test .` then runs the tests `app` reaches and `mach test . --lib tests`
+the test-only suites. The entry reaches the runtime's startup (`use std.runtime;`)
+because a library artifact's closure is all the test dispatcher links. Marking
+`app` `default = true` keeps `mach build .` and `mach check .` to `app`, since with
+no selector they take the marked artifacts; `mach build . --lib tests` builds the
+test artifact.
 
 ## See also
 

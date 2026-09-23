@@ -793,19 +793,16 @@ reads the selected artifact's name.
 | `subsystem` | no | `"console"` (default) or `"gui"` — the environment a windows executable declares it runs under; refused on a target whose image format has no subsystem (see below). |
 | `icon` | no | Project-root-relative `.ico` path embedded in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
 | `manifest` | no | Project-root-relative application-manifest path embedded byte-for-byte in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
-| `default` | no | `true` marks the artifact chosen when a command needs one artifact (`mach test`, `mach run`, the editor's union build) and several declared artifacts support the selected target. Exactly one of those candidates may carry it; an explicit `--bin`/`--lib` always wins, and a sole candidate needs no marker. |
+| `default` | no | `true` puts the artifact in the [default selection](#selection-and-the-build-matrix): with no `--bin`/`--lib`, `mach build` and `mach check` take the marked artifacts among those supporting the selected target (every one of them when none is marked), and a command that needs one artifact (`mach test`, `mach run`, the editor's union build) takes the marked one. A command that needs one artifact refuses two marked candidates; an explicit `--bin`/`--lib` always wins, and a sole candidate needs no marker. |
 
 `entry` is the build cell's source root. The build follows its active `use` and
 `fwd` edges transitively and compiles that reachable module set; another file under
 `src` is not part of the cell merely because it shares the project directory. This
 is what lets one project declare host and accelerator artifacts with disjoint target
-sets. `mach test` is the deliberate whole-source exception: it roots collection at
-every module in the current project's `src` tree, minus the modules that only
-artifacts the selected target does not build reach. Those belong to the target their
-artifact declares, so a host test build leaves them out and counts them among the
-modules it skipped, exactly as it does a module a comptime gate excluded. A module
-both a selected-target artifact and another target's reach is compiled here, and a
-module no artifact reaches is collected as before.
+sets. `mach build`, `mach check` and `mach test` all operate on the selected
+artifact's closure: a test build compiles and tests exactly the modules the artifact
+under test reaches, so a module no selected artifact reaches is not loaded under
+any of them (see [test.md](test.md#which-tests-run)).
 
 - **`bin`** links an executable at the resolved `out` path. On a finished-module
   target such as `spirv` it is the entry module, written there unlinked.
@@ -1724,22 +1721,26 @@ the requirement the dependency declared.
 
 A build cell is one artifact × one target × one profile.
 
-- `mach build <path>` builds every declared artifact whose `targets` includes the
-  selected target, for the default profile. `--all-targets` crosses every artifact
-  with every target in its `targets`. `--bin <name>` / `--lib <name>` narrow to one
-  artifact; `--target <name>` selects a declared target; `--profile <name>` selects
-  a profile.
+With no `--bin`/`--lib`, every command reads one rule, the **default selection**:
+of the artifacts whose `targets` includes the selected target, those marked
+`default = true` when any is marked, and every one of them when none is.
+
+- `mach build <path>` and `mach check <path>` build and check the default selection
+  for the selected target, for the default profile. `--all-targets` crosses every
+  artifact with every target in its `targets`, applying the default selection per
+  target. `--bin <name>` / `--lib <name>` narrow to one artifact, marked or not;
+  `--target <name>` selects a declared target; `--profile <name>` selects a profile.
 - `mach run <path>` consumes exactly one artifact. With no `--bin`/`--lib`, it selects
   one when exactly one artifact declares the resolved target; if several do, it asks
   you to pick one, naming every candidate.
 - `mach test <path>` and `mach doc <path>` need one artifact as their primary
-  context and select it by the same rule as everything else: `--bin`/`--lib`
+  context and take the default selection when it holds one artifact: `--bin`/`--lib`
   wins, a sole artifact that declares the resolved target is chosen, several
   need exactly one `default = true` (several with none marked is refused).
-  `mach test` links the union of all artifacts' referenced entries plus
-  exported dependency entries, filtered to that target. Foreign-target tests require
-  a compatible `--runner`. If two artifacts' objects collide on symbols in that union,
-  that is an honest link error — restructure the entries.
+  `mach test` builds that artifact's cell as `mach build` would, its closure, its
+  `link` entries, its `need` and exported dependency entries, and links the test
+  dispatcher in place of its entry. Foreign-target tests require a compatible
+  `--runner`.
 
 ### Enumerated cells are filtered; named ones are not
 

@@ -32,8 +32,16 @@ the seed on `PATH`:
 ```bash
 out/linux-x86_64/debug/bin/mach test .
 out/linux-x86_64/debug/bin/mach test . --profile release
+out/linux-x86_64/debug/bin/mach test . --lib tests
+out/linux-x86_64/debug/bin/mach test . --lib tests --profile release
 out/linux-x86_64/debug/bin/mach fmt .
 ```
+
+`mach test .` runs the tests in the compiler's own closure. The suites that
+live in modules the compiler never reaches (`src/lang/driver/tests.mach`, the
+codegen runtime probes and the rest) are reached by the `tests` library
+artifact, whose entry `src/lib/tests.mach` `use`s each of them, so a new
+test-only module is added there.
 
 The tree is canonical: `mach fmt .` must leave it unchanged before a pull
 request is opened (`mach fmt --check .` reports what differs). The same holds

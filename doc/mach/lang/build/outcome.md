@@ -365,7 +365,6 @@ severity: the worst standing recorded, BUILD_OK to BUILD_INTERNAL; ordered, comp
 artifacts: the outputs written, in build order
 tests: the test dispatchers built, for the runner
 events: everything recorded, in order
-tests_skipped: target-gated modules the test scope skipped, reported as a note
 
 ## fun outcome_init
 
