@@ -256,9 +256,10 @@ use app.test.roundtrip;
 
 `mach test .` then runs the tests `app` reaches and `mach test . --lib tests`
 the test-only suites. The entry reaches the runtime's startup (`use std.runtime;`)
-because a library artifact's closure is all the test dispatcher links. The test
-artifact is an ordinary artifact: `mach build .` without `--bin`/`--lib` builds
-it too, so `default = true` marks the artifact the project means by default.
+because a library artifact's closure is all the test dispatcher links. Marking
+`app` `default = true` keeps `mach build .` and `mach check .` to `app`, since with
+no selector they take the marked artifacts; `mach build . --lib tests` builds the
+test artifact.
 
 ## See also
 
