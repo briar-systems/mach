@@ -799,13 +799,10 @@ reads the selected artifact's name.
 `fwd` edges transitively and compiles that reachable module set; another file under
 `src` is not part of the cell merely because it shares the project directory. This
 is what lets one project declare host and accelerator artifacts with disjoint target
-sets. `mach test` is the deliberate whole-source exception: it roots collection at
-every module in the current project's `src` tree, minus the modules that only
-artifacts the selected target does not build reach. Those belong to the target their
-artifact declares, so a host test build leaves them out and counts them among the
-modules it skipped, exactly as it does a module a comptime gate excluded. A module
-both a selected-target artifact and another target's reach is compiled here, and a
-module no artifact reaches is collected as before.
+sets. `mach build`, `mach check` and `mach test` all operate on the selected
+artifact's closure: a test build compiles and tests exactly the modules the artifact
+under test reaches, so a module no selected artifact reaches is not loaded under
+any of them (see [test.md](test.md#which-tests-run)).
 
 - **`bin`** links an executable at the resolved `out` path. On a finished-module
   target such as `spirv` it is the entry module, written there unlinked.
@@ -1736,10 +1733,10 @@ A build cell is one artifact × one target × one profile.
   context and select it by the same rule as everything else: `--bin`/`--lib`
   wins, a sole artifact that declares the resolved target is chosen, several
   need exactly one `default = true` (several with none marked is refused).
-  `mach test` links the union of all artifacts' referenced entries plus
-  exported dependency entries, filtered to that target. Foreign-target tests require
-  a compatible `--runner`. If two artifacts' objects collide on symbols in that union,
-  that is an honest link error — restructure the entries.
+  `mach test` builds that artifact's cell as `mach build` would, its closure, its
+  `link` entries, its `need` and exported dependency entries, and links the test
+  dispatcher in place of its entry. Foreign-target tests require a compatible
+  `--runner`.
 
 ### Enumerated cells are filtered; named ones are not
 
