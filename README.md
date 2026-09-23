@@ -39,7 +39,7 @@ Windows, in PowerShell:
 irm https://machlang.org/install.ps1 | iex
 ```
 
-Both install the latest release, to `~/.local/bin` on Linux and macOS and `%LOCALAPPDATA%\mach\bin` on Windows. Precompiled binaries are also on the [releases](https://github.com/briar-systems/mach/releases) page.
+Both install the latest release. `~/.local/bin` on Linux and macOS and `%LOCALAPPDATA%\mach\bin` on Windows. Precompiled binaries are also on the [releases](https://github.com/briar-systems/mach/releases) page.
 
 
 ## Getting started
