@@ -582,9 +582,10 @@ fi
 # run it, what it builds and how it is checked, and expect*.txt is the recorded
 # observable. see test/README.md.
 #
-# `goal: test` compiles the case with `mach test` in place of `mach build`: every
-# module of the project is loaded, the collected tests run through the leg's
-# engine as part of the compile step, and the artifact is the test dispatcher.
+# `goal: test` compiles the case with `mach test` in place of `mach build`: the
+# artifact's closure is loaded as a build loads it, the collected tests run
+# through the leg's engine as part of the compile step, and the artifact is the
+# test dispatcher.
 # a defect that exists only under a test build (#3535) is reachable by no other
 # goal.
 link_cell() {

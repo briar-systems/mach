@@ -199,12 +199,12 @@ here.
   the program and records its stdout, `built` records that an artifact was
   emitted, `build-fails` records the compiler's `error:` lines.
 - `goal: test` makes the compile step `mach test` with the same target, profile
-  and flags, so every module of the project is loaded (an orphan module nothing
-  imports is reached only this way) and the collected tests run as part of that
-  step, through the leg's engine when it is qemu (`--runner`). A failing test
-  is a failed compile step with the readout in the cell's log. The artifact is
-  the test dispatcher, and `exec` runs it once per collected test in collection
-  order (`<exe> <index>`) and records the concatenated stdout; `built`,
+  and flags, so the tests in the artifact's closure (the modules a build of it
+  loads) are collected and run as part of that step, through the leg's engine
+  when it is qemu (`--runner`). A failing test is a failed compile step with
+  the readout in the cell's log. The artifact is the test dispatcher, and
+  `exec` runs it once per collected test in collection order (`<exe> <index>`)
+  and records the concatenated stdout; `built`,
   `build-fails` and a `check.sh` apply to the dispatcher as they would to a
   program.
 - the expected output, the most specific of `expect.<target>.<profile>.txt`,
