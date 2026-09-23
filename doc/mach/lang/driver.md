@@ -161,12 +161,6 @@ pub fun run_dep_steps_phase(p: *project.Project) err[outcome.Fail];
 pub fun run_load_phase(p: *project.Project) err[outcome.Fail];
 ```
 
-## fun run_gate_pass
-
-```mach
-pub fun run_gate_pass(p: *project.Project) res[bool, outcome.Fail];
-```
-
 ## fun refresh_frontend
 
 ```mach

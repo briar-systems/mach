@@ -105,11 +105,34 @@ pub rec PubConst;
 pub rec ModRef;
 ```
 
-## rec TupleGateResult
+a module name or constant a `use` binds
+
+name: the name it binds
+module: the module it names, or whose constant it binds
+span: the imported path, for a constant a union build refuses
+decl: the `use` that binds it, so a walk reads the one the arm its gate selects declares
+
+## val FRAME_BUILD
 
 ```mach
-pub rec TupleGateResult;
+pub val FRAME_BUILD: u32 = 0xFFFFFFFF
 ```
+
+the frame the load walk reads and binds in: the build target's, or a union tuple's by index
+
+## rec LoadDemand
+
+```mach
+pub rec LoadDemand;
+```
+
+one declaration or gate the load is deciding, so a demand that reaches it again is a cycle
+
+module: the module it is in
+frame: the frame it is decided in
+decl: the `val` being walked, or DECL_NIL for a gate
+cond: the gate's condition, or EXPR_NIL for a `val`
+name: the `val`'s name
 
 ## rec ArtifactEntry
 
@@ -244,6 +267,14 @@ pub fun dnit_project(p: *Project);
 ```mach
 pub fun init_project(p: *Project, s: *session.Session);
 ```
+
+## fun drop_tuple_frames
+
+```mach
+pub fun drop_tuple_frames(p: *Project, m: *ModuleEntry);
+```
+
+release a module's union tuple frames, which only the load reads
 
 ## fun free_dep_entries
 
