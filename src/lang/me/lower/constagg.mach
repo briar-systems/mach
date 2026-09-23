@@ -75,7 +75,9 @@ pub fun try_const_aggregate(ctx: *lower.LowerContext, init_eid: id.ExprId, gty: 
     var e_value: aexpr.Expr  = opt_e.ok;
     val e:       *aexpr.Expr = ?e_value;
 
-    var is_agg: bool = e.kind == aexpr.EXPR_KIND_STRUCT_LIT || e.kind == aexpr.EXPR_KIND_ARRAY_LIT;
+    var is_agg: bool = e.kind == aexpr.EXPR_KIND_STRUCT_LIT || e.kind == aexpr.EXPR_KIND_ARRAY_LIT
+        || e.kind == aexpr.EXPR_KIND_VECTOR_LIT;
+    if (e.kind == aexpr.EXPR_KIND_INDEX && aexpr.is_range(?e.data.index))          { is_agg = true; }
     if (e.kind == aexpr.EXPR_KIND_STRUCT_LIT && ir_type.is_tag(?ctx.m.types, gty)) { is_agg = true; }
     if (ir_is_ptr_or_fn(ctx, gty) && is_const_addr_init(ctx, eid, e))              { is_agg = true; }
     if (!is_agg) {
@@ -121,9 +123,9 @@ fun place(ctx: *lower.LowerContext, leaf_eid: id.ExprId, ity: ir_type.IrTypeId, 
     if (t.kind == ir_type.IRT_STRUCT || t.kind == ir_type.IRT_UNION) {
         ret place_struct(ctx, eid, ity, blob, base, rb);
     }
-    if (t.kind == ir_type.IRT_ARRAY) { ret place_array(ctx, eid, ity, blob, base, rb); }
-    if (t.kind == ir_type.IRT_PTR)   { ret place_ptr(ctx, eid, blob, base, rb); }
-    if (t.kind == ir_type.IRT_FN)    { ret place_fn(ctx, eid, blob, base, rb); }
+    if (t.kind == ir_type.IRT_ARRAY || t.kind == ir_type.IRT_VECTOR) { ret place_elements(ctx, eid, ity, blob, base, rb); }
+    if (t.kind == ir_type.IRT_PTR)                                   { ret place_ptr(ctx, eid, blob, base, rb); }
+    if (t.kind == ir_type.IRT_FN)                                    { ret place_fn(ctx, eid, blob, base, rb); }
     ret place_scalar(ctx, eid, ity, blob, base);
 }
 
@@ -189,27 +191,71 @@ fun place_struct(ctx: *lower.LowerContext, eid: id.ExprId, ity: ir_type.IrTypeId
     ret res[FoldResult, fail.Fail].ok{FOLD_OK};
 }
 
-fun place_array(ctx: *lower.LowerContext, eid: id.ExprId, ity: ir_type.IrTypeId, blob: *u8, base: u32, rb: *RelocBuf) res[FoldResult, fail.Fail] {
+# ranges nest only as deep as the source spells them, the bound keeps a malformed chain finite
+val CONSTANT_RANGE_DEPTH: u32 = 64;
+
+# an array or a vector is its elements at the element stride: those of an array
+# or a vector literal, or the window `A[start, n]` of one a constant names. an
+# element the literal leaves out stays zero
+fun place_elements(ctx: *lower.LowerContext, eid: id.ExprId, ity: ir_type.IrTypeId, blob: *u8, base: u32, rb: *RelocBuf) res[FoldResult, fail.Fail] {
     val opt_e: res[aexpr.Expr, fail.Fail] = lower.expression(ctx, eid);
     if (sel opt_e.err) { ret res[FoldResult, fail.Fail].err{opt_e.err}; }
-    var e_value: aexpr.Expr  = opt_e.ok;
-    val e:       *aexpr.Expr = ?e_value;
-    if (e.kind != aexpr.EXPR_KIND_ARRAY_LIT) { ret res[FoldResult, fail.Fail].ok{FOLD_FALLBACK}; }
+    val e_value: aexpr.Expr = opt_e.ok;
+
+    # a range of a range, through any `::` between them, offsets into the literal they all name
+    var first: u64        = 0;
+    var lit:   aexpr.Expr = e_value;
+    var hops:  u32        = 0;
+    for (lit.kind == aexpr.EXPR_KIND_INDEX && aexpr.is_range(?lit.data.index)) {
+        if (hops >= CONSTANT_RANGE_DEPTH) { ret res[FoldResult, fail.Fail].ok{FOLD_FALLBACK}; }
+        val res_start: res[comptime.CTValue, comptime.EvalFail] = comptime.evaluate[lower.LowerContext](ctx.scope.ctx, ctx, ctx.caps, ctx.scope.a,
+            lower.module_source(ctx), lit.data.index.index, ?ctx.s.interner);
+        lower.record_eval_result(ctx, res_start);
+        if (sel res_start.err) { ret res[FoldResult, fail.Fail].ok{FOLD_FALLBACK}; }
+        var start: u64 = 0;
+        if (!comptime.ct_int_u64(res_start.ok, ?start)) { ret res[FoldResult, fail.Fail].ok{FOLD_FALLBACK}; }
+        first = first + start;
+        val literal: opt[id.ExprId] = expr.constant_literal_expr(ctx, lit.data.index.object);
+        if (sel literal.none) { ret res[FoldResult, fail.Fail].ok{FOLD_FALLBACK}; }
+        val opt_lit: res[aexpr.Expr, fail.Fail] = lower.expression(ctx, literal.some);
+        if (sel opt_lit.err) { ret res[FoldResult, fail.Fail].err{opt_lit.err}; }
+        lit  = opt_lit.ok;
+        hops = hops + 1;
+    }
+    var elems_start: u32 = 0;
+    var elems_len:   u32 = 0;
+    if (lit.kind == aexpr.EXPR_KIND_ARRAY_LIT) {
+        elems_start = lit.data.array_lit.elems_start;
+        elems_len   = lit.data.array_lit.elems_len;
+    }
+    or (lit.kind == aexpr.EXPR_KIND_VECTOR_LIT) {
+        elems_start = lit.data.vector_lit.elems_start;
+        elems_len   = lit.data.vector_lit.elems_len;
+    }
+    or { ret res[FoldResult, fail.Fail].ok{FOLD_FALLBACK}; }
 
     val opt_t: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, ity);
     if (sel opt_t.none) { ret res[FoldResult, fail.Fail].err{fail.message("constagg: array leaf has unknown IR type")}; }
-    val t:       *ir_type.IrType  = opt_t.some;
-    val ety:     ir_type.IrTypeId = t.data.array_.element;
-    val stride:  u32              = ir_type.byte_size_for_machine(?ctx.m.types, ety, resolved_target.layout_machine(ctx.tgt));
-    val arr_len: u32              = ir_type.array_count(?ctx.m.types, ity);
+    val t:     *ir_type.IrType  = opt_t.some;
+    var ety:   ir_type.IrTypeId = ir_type.IRT_NIL;
+    var count: u32              = 0;
+    if (t.kind == ir_type.IRT_VECTOR) {
+        ety   = t.data.vector_.element;
+        count = t.data.vector_.lanes;
+    }
+    or {
+        ety   = t.data.array_.element;
+        count = ir_type.array_count(?ctx.m.types, ity);
+    }
+    val stride: u32 = ir_type.byte_size_for_machine(?ctx.m.types, ety, resolved_target.layout_machine(ctx.tgt));
 
     var i: u32 = 0;
-    for (i < e.data.array_lit.elems_len) {
-        if (i >= arr_len) { ret res[FoldResult, fail.Fail].ok{FOLD_OK}; }
-        val pool_ix: u32 = e.data.array_lit.elems_start + i;
-        if (pool_ix::usize >= ctx.scope.a.expr_id_len) { ret res[FoldResult, fail.Fail].err{fail.message("constagg: array element index out of range")}; }
-        val elem_eid:  id.ExprId                  = ctx.scope.a.expr_ids[pool_ix];
-        val res_place: res[FoldResult, fail.Fail] = place(ctx, elem_eid, ety, blob, base + i * stride, rb);
+    for (i < count) {
+        val at: u64 = first + i::u64;
+        if (at >= elems_len::u64) { ret res[FoldResult, fail.Fail].ok{FOLD_OK}; }
+        val pool_ix: u64 = elems_start::u64 + at;
+        if (pool_ix >= ctx.scope.a.expr_id_len::u64) { ret res[FoldResult, fail.Fail].err{fail.message("constagg: array element index out of range")}; }
+        val res_place: res[FoldResult, fail.Fail] = place(ctx, ctx.scope.a.expr_ids[pool_ix], ety, blob, base + i * stride, rb);
         if (sel res_place.err)             { ret res_place; }
         if (res_place.ok == FOLD_FALLBACK) { ret res[FoldResult, fail.Fail].ok{FOLD_FALLBACK}; }
         i = i + 1;
