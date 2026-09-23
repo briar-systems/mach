@@ -580,6 +580,10 @@ a function's locations start closed and with no def outstanding
 pub fun emit_var_bindings(st: *EncodeState, fn: *mir.MirFunction, mi: *mir.MirInstr) err[fail.Fail];
 ```
 
+the bindings of an instruction open at its start, and the ones it publishes
+at its end open at the next instruction's start, the same offset, once the
+locations its def clobbered are ended
+
 ## fun state_blank
 
 ```mach
