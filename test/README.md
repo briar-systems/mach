@@ -162,8 +162,8 @@ Each block becomes its own project with `[project] id = "example"`, one target
 (the host, or the one `--target` names), one debug profile and the checkout's `dep/std`. A block with a main is
 a `bin` artifact, any other block a `static` one, so an unused private function
 is still checked. A block that shows several files marks each with a line
-`# file: src/<path>.mach`, and the file named `root.mach` is the entry, or the last
-file when none is. Lines before the first marker belong to `root.mach`.
+`# file: src/<path>.mach`, and the file named `main.mach` is the entry, or the last
+file when none is. Lines before the first marker belong to `main.mach`.
 
 A fragment is a statement of fact, so annotate a block only when that is what it
 is. An example that stopped compiling is a doc bug to fix, not a block to mark.
