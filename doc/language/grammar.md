@@ -770,10 +770,10 @@ mach-read      ::= comptime-ident { member }        (* $mach.build.os, $mach.arc
   `$offset_of(T, field)`, `$type_of(e)`, `$fields(T)`, `$cases(T)`,
   `$discriminant_of(T)`, `$is_tag(T)`, `$is_record(T)`,
   `$is_union(T)`, `$is_pointer(T)`, `$is_secret(T)`, `$type_name(T)`,
-  `$error("msg")`) are syntactically a `comptime-ident` callee with `call-args`.
+  `$type_id(T)`, `$error("msg")`) are syntactically a `comptime-ident` callee with `call-args`.
 - The **type-taking** intrinsics — `$size_of`, `$length_of`, `$align_of`,
   `$offset_of`, `$fields`, `$cases`, `$discriminant_of`, and the five predicates
-  with `$type_name` — parse their
+  with `$type_name` and `$type_id` — parse their
   **first argument with the `type` production**, not the
   expression grammar, so the whole type language is spellable there:
   `$fields(Box[T])`, `$size_of(Pair[A, B])`, `$size_of(*T)`, `$size_of([4]u16)`,

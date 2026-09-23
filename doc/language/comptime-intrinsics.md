@@ -115,12 +115,12 @@ a silently-typed binding.
 
 ### Where a layout intrinsic is constant
 
-`$size_of`, `$length_of`, `$align_of` and `$offset_of` fold in every **type** position, including ones resolved
+`$size_of`, `$length_of`, `$align_of`, `$offset_of` and `$type_id` fold in every **type** position, including ones resolved
 before layout would otherwise be known — the measured type's layout is established
 on demand when the measurement asks for it, so where the type is *declared* relative
 to where it is measured makes no difference:
 
-| position | `$size_of` / `$length_of` / `$align_of` / `$offset_of` |
+| position | `$size_of` / `$length_of` / `$align_of` / `$offset_of` / `$type_id` |
 |---|---|
 | `val` / `var` initializer | yes |
 | global `align` | yes |
@@ -340,6 +340,67 @@ error reports cannot drift. Composites spell compositely (`$type_name(*Pair)` is
 be a drift on the one qualifier where a drift matters most, since a diagnostic about
 that type prints `^Pair`.
 
+## `$type_id(T)` — a type's identity
+
+```mach fragment
+$type_id(T)             # a u64 unique to T
+```
+
+A value, like `$type_name`, and a compile-time constant: it folds wherever the layout
+intrinsics do (see [Where a layout intrinsic is constant](#where-a-layout-intrinsic-is-constant)),
+so it can gate a `$if`, initialize a `val`, or be compared at run time against a
+stored one. Its type is `u64`. It never adopts a narrower binding by value, because
+an identity cut to 32 bits is not one: `val id: u32 = $type_id(T)` is a type mismatch.
+
+The contract:
+
+- **Distinct for distinct types.** Types are nominal, so two records named `Point`
+  in two modules have two identities. `^T` differs from `T`, and `*T`, `[N]T`,
+  a function type and each instance of a generic differ by their parts:
+  `$type_id(Box[u64])` is not `$type_id(Box[u32])`.
+- **Equal for the same type** wherever it is named: in any module, at any
+  instantiation site of a generic, and in every compilation unit and library of one
+  program. A `def` is a transparent alias, so `def Id: Point;` has `Point`'s identity.
+- **Unaffected by optimization and linking.** It is a constant the compiler folds,
+  not an address, so no folding of identical code or data can merge two identities.
+
+Inside a generic, `$type_id(T)` is answered per instantiation, as the predicates are.
+
+```mach
+use std.runtime;
+
+rec Point { x: u64; }
+rec Box[T] { v: T; }
+
+fun same[T, U]() u8 { ret $type_id(T) == $type_id(U); }
+
+#[symbol("main")]
+fun main() i32 {
+    if ($type_id(^Point) == $type_id(Point))     { ret 1; }
+    if ($type_id(Box[u64]) == $type_id(Box[u32])) { ret 2; }
+    if (same[Box[Point], Box[Point]]() == 0)     { ret 3; }
+    ret 0;
+}
+```
+
+**Why a hash, and how often it collides.** A program's units are compiled
+separately, and a library may be compiled long before the program that links it, so
+no unit can see every type that will share the program. A numbering with no
+collisions needs that global view, and an address needs the linker and breaks at a
+shared library, whose internal symbols are hidden. So the identity is derived from
+the type alone: the first 64 bits of SHA-256 over the type's canonical recipe, which
+spells a nominal type by its owning module and name and every other type by its
+parts. Two distinct types of one program share an identity only by collision. For
+`n` distinct types that chance is at most `n(n-1)/2^65`: about `2^-26` for a million
+types, and far less for any real program. A check that pins a value to one type is
+defeated only when the two colliding types are the very pair it compares, and a
+source author aiming for that must find a SHA-256 match on 64 bits, about `2^64`
+work, while naming only types of their own program.
+
+The value is the same for every build of one program by one compiler. It is not
+promised across compiler versions, so a stored identity is a check inside a
+program, not a file format.
+
 ## Where `^` is stripped
 
 One rule covers the whole surface: **`^` is stripped only where the question is
@@ -352,6 +413,7 @@ about storage.**
 | `$is_secret` | no: and it is the one query *about* the `^` |
 | `$pointee_of` | no: `^*U` is a secret, and is refused rather than followed |
 | `$type_name` | no: the spelling is `^T` |
+| `$type_id` | no: `^T` is a different type from `T` |
 | `$fields` / `$cases` | no: a secret aggregate is refused, not walked |
 | type comparison (`f.type == u64`) | no: `^u64` is not `u64` |
 
