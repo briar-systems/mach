@@ -347,8 +347,8 @@ pub fun checkout_head(s: *session.Session, dep_full: str) res[str, outcome.Fail]
 pub fun release_at_head(s: *session.Session, dep_full: str) res[str, outcome.Fail];
 ```
 
-the release version a checkout's HEAD is tagged with ("" when no `v`-prefixed semver tag
-points at it); the highest wins when several do
+the release version a checkout's HEAD is tagged with (an owned "" when no `v`-prefixed
+semver tag points at it); the highest wins when several do, and the caller frees the result
 
 ## val SLOT_ABSENT
 
