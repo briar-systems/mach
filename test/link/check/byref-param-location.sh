@@ -18,6 +18,7 @@
 #
 # the register number and the slot offset are the allocator's and differ per ISA and
 # profile, so only the class is stated and one golden serves every arm:
+#   subprograms=<n>    subprograms taken as the case's `probe`; the invariant is 1
 #   located=<yes|no>   the parameter DIE carries a DW_AT_location
 #   exprs=<nonzero|zero>  expressions found (a loclist may carry several)
 #   nonmemory=<n>      expressions not of memory class; the invariant is 0
@@ -27,14 +28,29 @@ produce_byref_param_location() {
         echo "link: byref-param-location: llvm-dwarfdump not found (install the 'llvm' package)" >&2; return 2
     }
 
-    # the expressions of `w` under the `probe` subprogram, one per line
+    # the expressions of `w` under the case's own `probe`, one per line. the linked
+    # image also carries std DIEs named `probe` (a function and a variable), so the
+    # subprogram is chosen by name and declaring file, and only its direct children
+    # are read as its parameters (#3815). depth is the indentation after the offset.
     exprs=$("$dd_tool" --debug-info "$g" 2>/dev/null | awk '
-        /DW_TAG_subprogram/ { in_probe = 0; in_w = 0; next }
-        /DW_AT_name/ && /"probe"/ { in_probe = 1; next }
-        in_probe && /DW_TAG_/ { in_w = 0 }
-        in_probe && /DW_TAG_formal_parameter/ { in_param = 1; next }
-        in_probe && in_param && /DW_AT_name/ && /"w"/ { in_w = 1; in_param = 0; next }
-        in_probe && in_param && /DW_AT_name/ { in_param = 0; next }
+        function settle() {
+            if (!pending) return
+            pending = 0
+            if (name == "probe" && file ~ /^(\.\/)?src\/main\.mach$/) { in_probe = 1; picked++ }
+        }
+        function attr(line) { sub(/^[^(]*\("/, "", line); sub(/"\)[ \t]*$/, "", line); return line }
+        /^0x[0-9a-f]+: +(DW_TAG_|NULL)/ {
+            settle()
+            depth = match($0, /(DW_TAG_|NULL)/) - index($0, ":")
+            if (in_probe && depth <= probe_depth) in_probe = 0
+            in_param = 0; in_w = 0; in_list = 0
+            if ($0 ~ /DW_TAG_subprogram/ && !in_probe) { pending = 1; name = ""; file = ""; probe_depth = depth; next }
+            if (in_probe && depth == probe_depth + 2 && $0 ~ /DW_TAG_formal_parameter/) in_param = 1
+            next
+        }
+        pending && /DW_AT_name/ { name = attr($0); next }
+        pending && /DW_AT_decl_file/ { file = attr($0); next }
+        in_param && /DW_AT_name/ { if ($0 ~ /"w"/) in_w = 1; in_param = 0; next }
         in_w && /DW_AT_location/ {
             located = 1
             s = $0; sub(/^.*DW_AT_location[ \t]*\(/, "", s)
@@ -47,9 +63,12 @@ produce_byref_param_location() {
             print s; next
         }
         in_w && in_list && /^[ \t]*$/ { in_list = 0 }
-        END { if (!located) print "NONE" }
+        END { settle(); print "PICKED " picked + 0; if (!located) print "NONE" }
     ')
 
+    picked=$(sed -n 's/^PICKED //p' <<<"$exprs")
+    exprs=$(grep -v '^PICKED ' <<<"$exprs")
+    echo "byref_param_subprograms=$picked"
     if [ "$exprs" = "NONE" ]; then
         echo "byref_param_located=no"
         echo "byref_param_exprs=zero"
