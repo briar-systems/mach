@@ -1,0 +1,440 @@
+use mach.lang.fail;
+use std.allocator.page;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mach.lang.intern;
+use mach.lang.me.ir;
+use mach.lang.me.ir.builder;
+use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.mutate;
+use mach.lang.me.ir.opdesc;
+use mach.lang.me.ir.refs;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use mach.lang.me.scratch;
+use mach.lang.wide;
+
+# rewrites a vector shift whose count is a literal with the same value in
+# every lane into the shift by that one scalar: `v >> u32x4{k, k, k, k}`
+# becomes `v >> k`, the uniform count every baseline set shifts by in one
+# instruction (#3740). the source has no vector-by-scalar shift, so this is
+# the only producer of the uniform form. a lane is the same when every lane
+# stores one ssa value or equal constants. a machine target lowers a vector
+# literal to a stack slot written lane by lane and read back whole, so the
+# shape recognized there is that slot: every use of the slot is one of N lane
+# stores through a gep and exactly one whole load after the last store in the
+# same block, the shape vecwiden and vecload read. a target that builds a
+# vector from its lanes spells the literal as one vec.build. a slot whose load
+# nothing else reads goes with its stores
+pub fun run(m: *ir.Module, workspace: *scratch.Workspace) res[bool, fail.Fail] {
+    var changed: bool = false;
+    var fi:      u32  = 0;
+    for (fi < m.function_len) {
+        val fn: *ir.Function = ?m.functions[fi];
+        if ((fn.flags & ir.FN_FLAG_EXTERN) == 0) {
+            var work: Work                 = Work{m: m, fn: fn};
+            val r:    res[bool, fail.Fail] = scratch.run[Work, bool](workspace, m.alloc, ?work, splat_function);
+            if (sel r.err) { ret r; }
+            if (r.ok)      { changed = true; }
+        }
+        fi = fi + 1;
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+rec Work {
+    m:  *ir.Module;
+    fn: *ir.Function;
+}
+
+# the per-function scratch: every listed instruction's value-use count, the
+# block each listed instruction sits in, its position there, and the erase marks
+rec Scan {
+    uses:  *u32;
+    block: *u32;
+    order: *u32;
+    dead:  *bool;
+    ilen:  u32;
+}
+
+val NO_BLOCK: u32 = 0xFFFFFFFF;
+
+val MAX_LANES: u32 = 64;
+
+fun count_use(sc: *Scan, r: *refs.Ref) bool {
+    if (r.role != refs.REF_VALUE_USE)       { ret true; }
+    if (r.value.kind != value.VAL_INSTR)    { ret true; }
+    if (r.value.data.instr::u32 >= sc.ilen) { ret true; }
+    sc.uses[r.value.data.instr::u32] = sc.uses[r.value.data.instr::u32] + 1;
+    ret true;
+}
+
+fun scan(fn: *ir.Function, sc: *Scan) {
+    var i: u32 = 0;
+    for (i < sc.ilen) {
+        sc.uses[i]  = 0;
+        sc.block[i] = NO_BLOCK;
+        sc.order[i] = 0;
+        sc.dead[i]  = false;
+        i           = i + 1;
+    }
+    var bi: u32 = 0;
+    for (bi < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[bi];
+        var pi:  u32       = 0;
+        for (pi < blk.phi_count) {
+            val iid: u32 = blk.phis[pi]::u32;
+            if (iid < sc.ilen) { sc.block[iid] = bi; }
+            refs.visit_operands[Scan](?fn.instrs[iid], sc, count_use);
+            pi = pi + 1;
+        }
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val iid: u32 = blk.instructions[ii]::u32;
+            if (iid < sc.ilen) {
+                sc.block[iid] = bi;
+                sc.order[iid] = ii;
+            }
+            refs.visit_operands[Scan](?fn.instrs[iid], sc, count_use);
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+}
+
+fun splat_function(w: *Work, alloc: *A.Allocator) res[bool, fail.Fail] {
+    val fn:   *ir.Function = w.fn;
+    val ilen: u32          = fn.instr_len;
+    if (ilen == 0) { ret res[bool, fail.Fail].ok{false}; }
+    val ru: res[*u32, A.Error] = A.allocate[u32](alloc, ilen::usize);
+    if (sel ru.err) { ret res[bool, fail.Fail].err{fail.refused(ru.err)}; }
+    val rb: res[*u32, A.Error] = A.allocate[u32](alloc, ilen::usize);
+    if (sel rb.err) { ret res[bool, fail.Fail].err{fail.refused(rb.err)}; }
+    val ro: res[*u32, A.Error] = A.allocate[u32](alloc, ilen::usize);
+    if (sel ro.err) { ret res[bool, fail.Fail].err{fail.refused(ro.err)}; }
+    val rd: res[*bool, A.Error] = A.allocate[bool](alloc, ilen::usize);
+    if (sel rd.err) { ret res[bool, fail.Fail].err{fail.refused(rd.err)}; }
+    var sc: Scan = Scan{uses: ru.ok, block: rb.ok, order: ro.ok, dead: rd.ok, ilen: ilen};
+    scan(fn, ?sc);
+
+    var changed: bool = false;
+    var erase:   bool = false;
+    var bi:      u32  = 0;
+    for (bi < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[bi];
+        var ii:  u32       = 0;
+        for (ii < blk.instr_count) {
+            val inst: *instruction.Instruction = ?fn.instrs[blk.instructions[ii]::u32];
+            if (is_vector_shift(w.m, inst)) {
+                val cut: opt[id.InstructionId] = uniform_count(w.m, fn, ?sc, inst);
+                if (sel cut.some) {
+                    changed = true;
+                    if (cut.some != id.INSTR_NIL) { erase = true; }
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    if (!erase) { ret res[bool, fail.Fail].ok{changed}; }
+    val erased: res[bool, fail.Fail] = mutate.erase_marked[Scan](w.m, fn, alloc, ?sc, is_dead);
+    if (sel erased.err) { ret erased; }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+fun is_dead(sc: *Scan, iid: id.InstructionId) bool {
+    if (iid::u32 >= sc.ilen) { ret false; }
+    ret sc.dead[iid::u32];
+}
+
+fun is_vector_shift(m: *ir.Module, inst: *instruction.Instruction) bool {
+    if (opdesc.lower_route(inst.kind) != opdesc.LOWER_SHIFT || inst.operand_count != 2) { ret false; }
+    ret ir_type.is_vector(?m.types, inst.operands[0].ty) && inst.operands[1].ty == inst.operands[0].ty;
+}
+
+fun instr_of(fn: *ir.Function, v: *value.Value, sc: *Scan) opt[*instruction.Instruction] {
+    if (v.kind != value.VAL_INSTR)               { ret opt[*instruction.Instruction].none{}; }
+    if (v.data.instr::u32 >= sc.ilen)            { ret opt[*instruction.Instruction].none{}; }
+    if (sc.block[v.data.instr::u32] == NO_BLOCK) { ret opt[*instruction.Instruction].none{}; }
+    ret opt[*instruction.Instruction].some{?fn.instrs[v.data.instr::u32]};
+}
+
+# one ssa value, or two constants of one type and value
+fun same_lane(a: *value.Value, b: *value.Value) bool {
+    if (a.kind != b.kind || a.ty != b.ty) { ret false; }
+    if (a.kind == value.VAL_INSTR)        { ret a.data.instr == b.data.instr; }
+    if (a.kind == value.VAL_PARAM)        { ret a.data.param_ix == b.data.param_ix; }
+    if (a.kind == value.VAL_CONST_INT)    { ret wide.eq(value.int_of(a), value.int_of(b)); }
+    ret false;
+}
+
+fun const_index(v: *value.Value, want: u64) bool {
+    if (v.kind != value.VAL_CONST_INT) { ret false; }
+    ret wide.eq(value.int_of(v), wide.from_u64(want));
+}
+
+# the one listed instruction that reads `iid`, absent unless exactly one does
+fun single_user(fn: *ir.Function, sc: *Scan, iid: id.InstructionId, blk: u32) opt[id.InstructionId] {
+    if (sc.uses[iid::u32] != 1) { ret opt[id.InstructionId].none{}; }
+    val b:  *ir.Block = ?fn.blocks[blk];
+    var ii: u32       = 0;
+    for (ii < b.instr_count) {
+        val cand: *instruction.Instruction = ?fn.instrs[b.instructions[ii]::u32];
+        var o:    u32                      = 0;
+        for (o < cand.operand_count) {
+            if (cand.operands[o].kind == value.VAL_INSTR && cand.operands[o].data.instr == iid
+                && refs.operand_is_value_use(cand.kind, o)) {
+                ret opt[id.InstructionId].some{b.instructions[ii]};
+            }
+            o = o + 1;
+        }
+        ii = ii + 1;
+    }
+    ret opt[id.InstructionId].none{};
+}
+
+# rewrites the shift's count to its one lane value when every lane holds it:
+# absent when the count is not such a literal, INSTR_NIL when the literal
+# stays because something else reads it, and the literal's load when this was
+# its last reader and it is marked to go
+fun uniform_count(m: *ir.Module, fn: *ir.Function, sc: *Scan, inst: *instruction.Instruction) opt[id.InstructionId] {
+    val defo: opt[*instruction.Instruction] = instr_of(fn, ?inst.operands[1], sc);
+    if (sel defo.none) { ret opt[id.InstructionId].none{}; }
+    val def:     *instruction.Instruction = defo.some;
+    val def_id:  id.InstructionId         = inst.operands[1].data.instr;
+    var lane:    value.Value;
+    var is_slot: bool                     = false;
+    if (def.kind == instruction.OP_VEC_BUILD) {
+        if (!build_lane(def, ?lane)) { ret opt[id.InstructionId].none{}; }
+    }
+    or (def.kind == instruction.OP_LOAD) {
+        if (!slot_lane(m, fn, sc, def_id, def, ?lane, false)) { ret opt[id.InstructionId].none{}; }
+        is_slot = true;
+    }
+    or { ret opt[id.InstructionId].none{}; }
+
+    inst.operands[1]     = lane;
+    sc.uses[def_id::u32] = sc.uses[def_id::u32] - 1;
+    if (sc.uses[def_id::u32] != 0) { ret opt[id.InstructionId].some{id.INSTR_NIL}; }
+    sc.dead[def_id::u32] = true;
+    if (is_slot) { slot_lane(m, fn, sc, def_id, def, ?lane, true); }
+    ret opt[id.InstructionId].some{def_id};
+}
+
+fun build_lane(def: *instruction.Instruction, out: *value.Value) bool {
+    if (def.operand_count < 2) { ret false; }
+    var k: u32 = 1;
+    for (k < def.operand_count) {
+        if (!same_lane(?def.operands[k], ?def.operands[0])) { ret false; }
+        k = k + 1;
+    }
+    @out = def.operands[0];
+    ret true;
+}
+
+# the one value every lane store of the literal slot behind `load` writes;
+# with `mark`, the slot, its geps and its stores are marked to go instead
+fun slot_lane(m: *ir.Module, fn: *ir.Function, sc: *Scan, load_id: id.InstructionId, load: *instruction.Instruction,
+    out: *value.Value, mark: bool) bool {
+    if (load.operand_count != 1) { ret false; }
+    val slo: opt[*instruction.Instruction] = instr_of(fn, ?load.operands[0], sc);
+    if (sel slo.none) { ret false; }
+    val slot:    *instruction.Instruction = slo.some;
+    val slot_id: id.InstructionId         = load.operands[0].data.instr;
+    if (slot.kind != instruction.OP_ALLOCA || slot.aux_ty != load.ty) { ret false; }
+    val vo: opt[*ir_type.IrType] = ir_type.get(?m.types, load.ty);
+    if (sel vo.none)                        { ret false; }
+    if (vo.some.kind != ir_type.IRT_VECTOR) { ret false; }
+    val lanes:   u32              = vo.some.data.vector_.lanes;
+    val lane_ty: ir_type.IrTypeId = vo.some.data.vector_.element;
+    if (lanes < 2 || lanes > MAX_LANES)     { ret false; }
+    if (sc.uses[slot_id::u32] != lanes + 1) { ret false; }
+    val blk: u32 = sc.block[slot_id::u32];
+    if (blk == NO_BLOCK || sc.block[load_id::u32] != blk) { ret false; }
+
+    var seen: [MAX_LANES]bool;
+    var k:    u32 = 0;
+    for (k < lanes) {
+        seen[k] = false;
+        k       = k + 1;
+    }
+    var have: bool      = false;
+    var val0: value.Value;
+    val b:    *ir.Block = ?fn.blocks[blk];
+    var ii:   u32       = 0;
+    for (ii < b.instr_count) {
+        val uid: id.InstructionId         = b.instructions[ii];
+        val u:   *instruction.Instruction = ?fn.instrs[uid::u32];
+        if (u.kind == instruction.OP_GEP && u.operand_count == 3 && u.operands[0].kind == value.VAL_INSTR
+            && u.operands[0].data.instr == slot_id) {
+            if (!const_index(?u.operands[1], 0) || u.operands[2].kind != value.VAL_CONST_INT) { ret false; }
+            val lane_w: u64 = u.operands[2].data.int_lit;
+            if (lane_w >= lanes::u64 || seen[lane_w::u32]) { ret false; }
+            val so: opt[id.InstructionId] = single_user(fn, sc, uid, blk);
+            if (sel so.none) { ret false; }
+            val st: *instruction.Instruction = ?fn.instrs[so.some::u32];
+            if (st.kind != instruction.OP_STORE || st.operand_count != 2)                        { ret false; }
+            if (st.operands[1].kind != value.VAL_INSTR || st.operands[1].data.instr != uid)      { ret false; }
+            if (st.operands[0].ty != lane_ty || sc.order[so.some::u32] > sc.order[load_id::u32]) { ret false; }
+            if (!have) {
+                val0 = st.operands[0];
+                have = true;
+            }
+            or (!same_lane(?st.operands[0], ?val0)) { ret false; }
+            seen[lane_w::u32] = true;
+            if (mark) {
+                sc.dead[uid::u32]     = true;
+                sc.dead[so.some::u32] = true;
+            }
+        }
+        ii = ii + 1;
+    }
+    k = 0;
+    for (k < lanes) {
+        if (!seen[k]) { ret false; }
+        k = k + 1;
+    }
+    if (mark) { sc.dead[slot_id::u32] = true; }
+    @out = val0;
+    ret true;
+}
+
+# the knobs a count literal fixture can be turned away from one uniform value by
+val T_SAME_PARAM:  u32 = 0;
+val T_SAME_CONST:  u32 = 1;
+val T_MIXED_PARAM: u32 = 2;
+val T_MIXED_CONST: u32 = 3;
+val T_SHARED:      u32 = 4;
+val T_BUILD:       u32 = 5;
+val T_BUILD_MIXED: u32 = 6;
+
+# `p0 << literal` over a `bits`-bit vector of `lanes` lanes, the literal lowered
+# as a machine target lowers it (a slot, one gep and store per lane, one load)
+# or, for the build knobs, as one vec.build. the result is the shift's count
+# after the pass: 0 for the one parameter p1 every lane held, 1 for the
+# constant 5, 2 for the count left a vector; 3 when the slot outlived a
+# rewrite that left nothing reading it or went while something still did,
+# and 9 when the case cannot be built or run
+fun t_splat(bits: u32, lanes: u32, knob: u32) u32 {
+    var alloc: A.Allocator;
+    val made:  err[A.Error] = page.make(?alloc);
+    if (sel made.err) { ret 9; }
+    val rm: res[ir.Module, fail.Fail] = ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 9; }
+    var m: ir.Module = rm.ok;
+    fin { ir.dnit(?m); }
+    val el: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, bits);
+    val ix: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel el.err) { ret 9; }
+    if (sel ix.err) { ret 9; }
+    val vt: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_vector(?m.types, el.ok, lanes);
+    if (sel vt.err) { ret 9; }
+    val rf: res[u32, fail.Fail] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) { ret 9; }
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, ?m.functions[rf.ok]);
+    val rb: res[id.BlockId, fail.Fail] = builder.new_block(?bld);
+    if (sel rb.err) { ret 9; }
+    builder.set_block(?bld, rb.ok);
+    val p0: value.Value = value.param(0, vt.ok);
+    val p1: value.Value = value.param(1, el.ok);
+    val p2: value.Value = value.param(2, el.ok);
+
+    var lane: [MAX_LANES]value.Value;
+    var k:    u32 = 0;
+    for (k < lanes) {
+        lane[k] = p1;
+        if (knob == T_SAME_CONST || knob == T_MIXED_CONST) { lane[k] = value.const_int(5, el.ok); }
+        k = k + 1;
+    }
+    if (knob == T_MIXED_PARAM || knob == T_BUILD_MIXED) { lane[lanes - 1] = p2; }
+    if (knob == T_MIXED_CONST)                          { lane[lanes - 1] = value.const_int(6, el.ok); }
+
+    var count: value.Value;
+    if (knob == T_BUILD || knob == T_BUILD_MIXED) {
+        val rv: res[value.Value, fail.Fail] = builder.emit_vec_build(?bld, vt.ok, ?lane[0], lanes);
+        if (sel rv.err) { ret 9; }
+        count = rv.ok;
+    }
+    or {
+        val slot: res[value.Value, fail.Fail] = builder.emit_alloca(?bld, vt.ok, value.const_int(1, ix.ok));
+        if (sel slot.err) { ret 9; }
+        k = 0;
+        for (k < lanes) {
+            var idx: [2]value.Value;
+            idx[0] = value.const_int(0, ix.ok);
+            idx[1] = value.const_int(k::u64, ix.ok);
+            val g: res[value.Value, fail.Fail] = builder.emit_gep(?bld, slot.ok, vt.ok, ?idx[0], 2);
+            if (sel g.err) { ret 9; }
+            val st: err[fail.Fail] = builder.emit_store(?bld, lane[k], g.ok);
+            if (sel st.err) { ret 9; }
+            k = k + 1;
+        }
+        val ld: res[value.Value, fail.Fail] = builder.emit_load(?bld, slot.ok, vt.ok);
+        if (sel ld.err) { ret 9; }
+        count = ld.ok;
+    }
+    val sh: res[value.Value, fail.Fail] = builder.emit_shl(?bld, p0, count);
+    if (sel sh.err) { ret 9; }
+    if (knob == T_SHARED) {
+        val other: res[value.Value, fail.Fail] = builder.emit_add(?bld, p0, count);
+        if (sel other.err) { ret 9; }
+    }
+
+    var ws:   scratch.Workspace;
+    val init: err[fail.Fail] = scratch.init(?ws);
+    if (sel init.err) { ret 9; }
+    fin { scratch.dnit(?ws); }
+    val ran: res[bool, fail.Fail] = run(?m, ?ws);
+    if (sel ran.err) { ret 9; }
+
+    val fn:      *ir.Function = ?m.functions[0];
+    var slots:   u32          = 0;
+    var shifted: value.Value;
+    var ii:      u32          = 0;
+    for (ii < fn.blocks[0].instr_count) {
+        val inst: *instruction.Instruction = ?fn.instrs[fn.blocks[0].instructions[ii]::u32];
+        if (inst.kind == instruction.OP_ALLOCA) { slots = slots + 1; }
+        if (inst.kind == instruction.OP_SHL)    { shifted = inst.operands[1]; }
+        ii = ii + 1;
+    }
+    val rewritten: bool = shifted.ty == el.ok;
+    if (knob != T_BUILD && knob != T_BUILD_MIXED) {
+        val slot_stays: bool = !rewritten || knob == T_SHARED;
+        if ((slots == 1) != slot_stays) { ret 3; }
+    }
+    if (!rewritten)                                                                               { ret 2; }
+    if (shifted.kind == value.VAL_PARAM && shifted.data.param_ix == 1)                            { ret 0; }
+    if (shifted.kind == value.VAL_CONST_INT && wide.eq(value.int_of(?shifted), wide.from_u64(5))) { ret 1; }
+    ret 9;
+}
+
+test "mach.lang.me.pass.vecsplat.run:a_literal_of_one_lane_value_counts_by_that_value" {
+    if (t_splat(32, 4, T_SAME_PARAM) != 0)  { ret 1; }
+    if (t_splat(32, 4, T_SAME_CONST) != 1)  { ret 2; }
+    if (t_splat(8, 16, T_SAME_PARAM) != 0)  { ret 3; }
+    if (t_splat(64, 2, T_SAME_CONST) != 1)  { ret 4; }
+    if (t_splat(16, 16, T_SAME_PARAM) != 0) { ret 5; }
+    # a literal something else reads stays for that reader
+    if (t_splat(32, 4, T_SHARED) != 0) { ret 6; }
+    # a target that builds a literal from its lanes spells it as one vec.build
+    if (t_splat(32, 4, T_BUILD) != 0) { ret 7; }
+    ret 0;
+}
+
+test "mach.lang.me.pass.vecsplat.run:lane_counts_that_differ_stay_a_vector" {
+    if (t_splat(32, 4, T_MIXED_PARAM) != 2) { ret 1; }
+    if (t_splat(32, 4, T_MIXED_CONST) != 2) { ret 2; }
+    if (t_splat(8, 16, T_MIXED_PARAM) != 2) { ret 3; }
+    if (t_splat(32, 4, T_BUILD_MIXED) != 2) { ret 4; }
+    ret 0;
+}

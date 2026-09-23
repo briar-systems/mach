@@ -69,8 +69,8 @@ table and the conditions are in
 ## Bitwise
 
 `&` `|` `^` `~` `<<` `>>` — work on integer scalars. On integer-lane vectors
-`&` `|` `^` `~` apply lane-wise; the shifts `<<` `>>` are not in this increment
-(see [SIMD vectors](#simd-vectors)).
+all six apply lane-wise, and a vector shift's count is a vector of the same
+shape (see [SIMD vectors](#simd-vectors)).
 
 ```mach fragment
 val x: i64    = (a & b) | (c ^ d);
@@ -289,16 +289,46 @@ the two differ only in how they are realized.
 | Lane family | `+` `-` | `*` | `/` | `%` | `& \| ^ ~` | `<< >>` | `== != < > <= >=` |
 |---|---|---|---|---|---|---|---|
 | float — `f32x4`, `f64x2` | yes | yes | yes | no | — | no | → same-shape unsigned mask |
-| integer — `i8x16` `i16x8` `i32x4` `i64x2` (+ unsigned) | yes | yes | yes | no | yes | no | → same-shape unsigned mask |
+| integer — `i8x16` `i16x8` `i32x4` `i64x2` (+ unsigned) | yes | yes | yes | no | yes | yes, by a same-shape count | → same-shape unsigned mask |
 
 Both operands of a binary operator must be the **same** vector shape: there is no
 implicit scalar↔vector mixing and no cross-shape widening. Anything the table
 marks `no` is a compile error, not a silent fallback:
 
 - no vector `%` on any lane type;
-- bitwise `& | ^ ~` require integer lanes; the shifts `<< >>` are not in this
-  increment (a per-lane variable shift is AVX2-only on x86_64, with no 8-bit
-  packed form).
+- bitwise `& | ^ ~` and the shifts `<< >>` require integer lanes;
+- a shift's count is a vector of the shifted type, never a scalar: `vec << vec`
+  and `vec >> vec` are the only two forms, and `v << 3` is an error that names
+  the form to write instead.
+
+A vector shift shifts each lane by the count in the same lane, and each lane
+follows the scalar operator exactly: `>>` is arithmetic on signed lanes and
+logical on unsigned ones, a lane count at or above the lane width saturates
+(`0`, or the sign fill for an arithmetic `>>`), and a lane count that is a
+compile-time constant at or above the width is an error. A uniform count is
+the same count in every lane of a literal, which is the form every baseline
+instruction set shifts by in one instruction:
+
+```mach
+use std.runtime;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    val x: u32x4 = u32x4{1, 2, 0x80000000, 0xF0};
+    val n: u32   = argc::u32 + 31;              # 32 at run time
+    val h: u32x4 = x >> u32x4{4, 4, 4, 4};      # one psrld on x86_64
+    val k: u32x4 = x << u32x4{n, n, n, n};      # at the lane width: every lane is 0
+    val m: u32x4 = x << u32x4{0, 1, 2, 3};      # a count per lane
+    if (h[3] != 0x0F || k[2] != 0 || m[1] != 4) { ret 1; }
+    ret 0;
+}
+```
+
+```mach error a vector shift count is a vector of the shifted type, never a scalar
+fun f(x: u32x4) u32x4 {
+    ret x << 3;
+}
+```
 
 Integer division uses each lane's signedness and scalar division behavior, including
 truncation toward zero for signed quotients and the scalar behavior for division by
@@ -322,6 +352,22 @@ Integer `*` is where this is most visible today:
 | `i16x8 * i16x8` | packed `pmullw` | packed `mul .8h` | scalar expansion |
 | `i32x4 * i32x4` | packed `pmuludq` pair (`pmulld` under `sse41`) | packed `mul .4s` | scalar expansion |
 | `i64x2 * i64x2` | packed `pmuludq` triple | scalar expansion (NEON has no `.2d` multiply) | scalar expansion |
+
+Shifts realize by the count's form: a count that is the same value in every
+lane shifts every lane by that one scalar, and any other count shifts each lane
+by its own.
+
+| shape | x86_64 (SSE2) | aarch64 (NEON) | riscv64 (no vector unit) |
+|---|---|---|---|
+| uniform `<<`, `>>` on 16-, 32- and 64-bit lanes | packed `psll*` / `psrl*` / `psra*` | scalar expansion | scalar expansion |
+| uniform arithmetic `>>` on 64-bit lanes | scalar expansion (`psraq` is AVX-512VL) | scalar expansion | scalar expansion |
+| uniform `<<`, `>>` on 8-bit lanes | packed through the 16-bit shifts, each byte shifted with its neighbour cleared | scalar expansion | scalar expansion |
+| per-lane count, any lane width | scalar expansion (SSE2 has no per-lane shift; `vpsllv*` is AVX2) | scalar expansion | scalar expansion |
+
+The packed instructions saturate a count at or above the lane width on their
+own, so they need none of the scalar shift's range test. SPIR-V leaves an
+`OpShift*` by the component width or more undefined, so it shifts lane by lane
+through the scalar shift as well.
 
 Operators never widen implicitly, so a widening multiply is spelled as two lane
 casts and a multiply: `a::i32x4 * b::i32x4` for `a, b: i16x4`. When both operands

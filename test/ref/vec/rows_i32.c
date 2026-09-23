@@ -23,6 +23,18 @@ static vec vcmp_s_lt(vec x, vec y) { vec r; for (unsigned i = 0; i < 4u; i++) { 
 static vec vcmp_u_eq(vec x, vec y) { vec r; for (unsigned i = 0; i < 4u; i++) { r.l[i] = (x.l[i] == y.l[i]) ? (uint32_t)UINT64_C(4294967295) : (uint32_t)0; } return r; }
 static vec vcmp_s_eq(vec x, vec y) { vec r; for (unsigned i = 0; i < 4u; i++) { r.l[i] = (sx(x.l[i]) == sx(y.l[i])) ? (uint32_t)UINT64_C(4294967295) : (uint32_t)0; } return r; }
 
+static uint32_t lshl(uint32_t x, uint32_t c) { return (c >= 32u) ? (uint32_t)0 : (uint32_t)((uint32_t)x << c); }
+static uint32_t lshr_u(uint32_t x, uint32_t c) { return (c >= 32u) ? (uint32_t)0 : (uint32_t)(x >> c); }
+static uint32_t lshr_s(uint32_t x, uint32_t c) {
+    const int neg = (x >> 31u) != 0;
+    if (c >= 32u) { return neg ? (uint32_t)UINT64_C(4294967295) : (uint32_t)0; }
+    return neg ? (uint32_t)~(uint32_t)(((uint32_t)~x) >> c) : (uint32_t)(x >> c);
+}
+static vec vshl(vec x, vec y) { vec r; for (unsigned i = 0; i < 4u; i++) { r.l[i] = lshl(x.l[i], y.l[i]); } return r; }
+static vec vshr_u(vec x, vec y) { vec r; for (unsigned i = 0; i < 4u; i++) { r.l[i] = lshr_u(x.l[i], y.l[i]); } return r; }
+static vec vshr_s(vec x, vec y) { vec r; for (unsigned i = 0; i < 4u; i++) { r.l[i] = lshr_s(x.l[i], y.l[i]); } return r; }
+static vec vsplat(uint32_t c) { vec r; for (unsigned i = 0; i < 4u; i++) { r.l[i] = c; } return r; }
+
 static uint64_t fold_u(uint64_t h, vec v) { for (unsigned i = 0; i < 4u; i++) { h = mix_u32(h, v.l[i]); } return h; }
 static uint64_t fold_s(uint64_t h, vec v) { for (unsigned i = 0; i < 4u; i++) { h = mix_i32(h, sx(v.l[i])); } return h; }
 
@@ -146,6 +158,94 @@ uint64_t checksum(uint64_t seed) {
         vec b = {{ UINT64_C(3), UINT64_C(2), UINT64_C(7), UINT64_C(5) }};
         a.l[0] = (uint32_t)((uint64_t)a.l[0] + (uint64_t)s);
         h = fold_u(h, vcmp_u_eq(a, b));
+    }
+    {
+        vec a = {{ UINT64_C(2147483647), UINT64_C(2147483648), UINT64_C(7), UINT64_C(4294967293) }};
+        vec b = {{ UINT64_C(1), UINT64_C(31), UINT64_C(32), UINT64_C(4294967295) }};
+        a.l[0] = (uint32_t)((uint32_t)a.l[0] + (uint32_t)s);
+        b.l[1] = (uint32_t)((uint32_t)b.l[1] + (uint32_t)s);
+        h = fold_s(h, vshl(a, b));
+    }
+    {
+        vec a = {{ UINT64_C(2147483647), UINT64_C(2147483648), UINT64_C(7), UINT64_C(4294967293) }};
+        vec b = {{ UINT64_C(1), UINT64_C(31), UINT64_C(32), UINT64_C(4294967295) }};
+        a.l[0] = (uint32_t)((uint32_t)a.l[0] + (uint32_t)s);
+        b.l[1] = (uint32_t)((uint32_t)b.l[1] + (uint32_t)s);
+        h = fold_s(h, vshr_s(a, b));
+    }
+    {
+        vec a = {{ UINT64_C(2147483647), UINT64_C(2147483648), UINT64_C(7), UINT64_C(4294967293) }};
+        a.l[0] = (uint32_t)((uint32_t)a.l[0] + (uint32_t)s);
+        h = fold_s(h, vshl(a, vsplat(10)));
+    }
+    {
+        vec a = {{ UINT64_C(2147483647), UINT64_C(2147483648), UINT64_C(7), UINT64_C(4294967293) }};
+        a.l[0] = (uint32_t)((uint32_t)a.l[0] + (uint32_t)s);
+        h = fold_s(h, vshr_s(a, vsplat(29)));
+    }
+    {
+        vec a = {{ UINT64_C(2147483647), UINT64_C(2147483648), UINT64_C(7), UINT64_C(4294967293) }};
+        a.l[0] = (uint32_t)((uint32_t)a.l[0] + (uint32_t)s);
+        h = fold_s(h, vshl(a, vsplat((uint32_t)((uint32_t)s + 5u))));
+    }
+    {
+        vec a = {{ UINT64_C(2147483647), UINT64_C(2147483648), UINT64_C(7), UINT64_C(4294967293) }};
+        a.l[0] = (uint32_t)((uint32_t)a.l[0] + (uint32_t)s);
+        h = fold_s(h, vshl(a, vsplat((uint32_t)((uint32_t)s + 33u))));
+    }
+    {
+        vec a = {{ UINT64_C(2147483647), UINT64_C(2147483648), UINT64_C(7), UINT64_C(4294967293) }};
+        a.l[0] = (uint32_t)((uint32_t)a.l[0] + (uint32_t)s);
+        h = fold_s(h, vshr_s(a, vsplat((uint32_t)((uint32_t)s + 5u))));
+    }
+    {
+        vec a = {{ UINT64_C(2147483647), UINT64_C(2147483648), UINT64_C(7), UINT64_C(4294967293) }};
+        a.l[0] = (uint32_t)((uint32_t)a.l[0] + (uint32_t)s);
+        h = fold_s(h, vshr_s(a, vsplat((uint32_t)((uint32_t)s + 33u))));
+    }
+    {
+        vec a = {{ UINT64_C(4294967295), UINT64_C(0), UINT64_C(7), UINT64_C(3) }};
+        vec b = {{ UINT64_C(1), UINT64_C(31), UINT64_C(32), UINT64_C(40) }};
+        a.l[0] = (uint32_t)((uint32_t)a.l[0] + (uint32_t)s);
+        b.l[1] = (uint32_t)((uint32_t)b.l[1] + (uint32_t)s);
+        h = fold_u(h, vshl(a, b));
+    }
+    {
+        vec a = {{ UINT64_C(4294967295), UINT64_C(0), UINT64_C(7), UINT64_C(3) }};
+        vec b = {{ UINT64_C(1), UINT64_C(31), UINT64_C(32), UINT64_C(40) }};
+        a.l[0] = (uint32_t)((uint32_t)a.l[0] + (uint32_t)s);
+        b.l[1] = (uint32_t)((uint32_t)b.l[1] + (uint32_t)s);
+        h = fold_u(h, vshr_u(a, b));
+    }
+    {
+        vec a = {{ UINT64_C(4294967295), UINT64_C(0), UINT64_C(7), UINT64_C(3) }};
+        a.l[0] = (uint32_t)((uint32_t)a.l[0] + (uint32_t)s);
+        h = fold_u(h, vshl(a, vsplat(10)));
+    }
+    {
+        vec a = {{ UINT64_C(4294967295), UINT64_C(0), UINT64_C(7), UINT64_C(3) }};
+        a.l[0] = (uint32_t)((uint32_t)a.l[0] + (uint32_t)s);
+        h = fold_u(h, vshr_u(a, vsplat(29)));
+    }
+    {
+        vec a = {{ UINT64_C(4294967295), UINT64_C(0), UINT64_C(7), UINT64_C(3) }};
+        a.l[0] = (uint32_t)((uint32_t)a.l[0] + (uint32_t)s);
+        h = fold_u(h, vshl(a, vsplat((uint32_t)((uint32_t)s + 5u))));
+    }
+    {
+        vec a = {{ UINT64_C(4294967295), UINT64_C(0), UINT64_C(7), UINT64_C(3) }};
+        a.l[0] = (uint32_t)((uint32_t)a.l[0] + (uint32_t)s);
+        h = fold_u(h, vshl(a, vsplat((uint32_t)((uint32_t)s + 33u))));
+    }
+    {
+        vec a = {{ UINT64_C(4294967295), UINT64_C(0), UINT64_C(7), UINT64_C(3) }};
+        a.l[0] = (uint32_t)((uint32_t)a.l[0] + (uint32_t)s);
+        h = fold_u(h, vshr_u(a, vsplat((uint32_t)((uint32_t)s + 5u))));
+    }
+    {
+        vec a = {{ UINT64_C(4294967295), UINT64_C(0), UINT64_C(7), UINT64_C(3) }};
+        a.l[0] = (uint32_t)((uint32_t)a.l[0] + (uint32_t)s);
+        h = fold_u(h, vshr_u(a, vsplat((uint32_t)((uint32_t)s + 33u))));
     }
     return h;
 }

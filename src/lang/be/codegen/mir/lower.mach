@@ -677,6 +677,9 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
         if (!ctx.tgt.model.has_v128) {
             ret err[fail.Fail].err{lctx.reject(ctx, vector_unsupported(ctx))};
         }
+        if (route == opdesc.LOWER_SHIFT) {
+            ret lower_vector_shift(ctx, mb, inst, iid);
+        }
         if (ctx.tgt.model.vector_compute_generic && is_vector_compute(inst.kind)) {
             ret lower_generic(ctx, mb, inst, iid);
         }
@@ -1213,6 +1216,114 @@ fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
     val ng:   err[fail.Fail] = emit_alu2(ctx, mb, mir.MIR_NEG, mir.op_vreg(mask), mir.op_vreg(keep), w);
     if (sel ng.err) { ret ng; }
     ret emit_alu3(ctx, mb, mir.MIR_AND, mir.op_vreg(dst), mir.op_vreg(shifted), mir.op_vreg(mask), w);
+}
+
+# a packed vector shift reaches here only in a form the target packs, and
+# the packed instructions saturate a count at or above the lane width on
+# their own, so it carries none of the scalar shift's sequence. a lane
+# narrower than the narrowest one the target shifts is shifted as lanes twice
+# as wide, each half on its own with the other half cleared (#3740)
+fun lower_vector_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) err[fail.Fail] {
+    if (inst.operand_count < 2) {
+        ret err[fail.Fail].err{fail.message("mir.lower_ir: vector shift missing value or count operand")};
+    }
+    val lane_bits: u32 = mir.vec_lane_elem_bytes(ctx.cur_vec_lane)::u32 * 8;
+    val min_bits:  u32 = ctx.tgt.model.packed_shift_min_bits;
+    if (lctx.value_is_vector(ctx, inst.operands[1].ty) || lane_bits >= min_bits) {
+        ret lower_generic(ctx, mb, inst, iid);
+    }
+    if (lane_bits * 2 != min_bits) {
+        ret err[fail.Fail].err{fail.message("mir.lower_ir: vector shift lane is more than one halving below the target's narrowest packed shift")};
+    }
+    ret lower_halved_vector_shift(ctx, mb, inst, iid);
+}
+
+# each wide lane holds a low and a high narrow lane. a left shift moves the
+# low half's bits up into the high half, so the low result is the wide shift
+# with its high half cleared, and the high result is the wide shift of the
+# high half alone; a right shift is the mirror, whose high result is the wide
+# shift with its low half cleared and whose low result is the low half moved
+# up, shifted, and moved back. a count at or above the narrow width empties
+# the narrow lane in every case, and an arithmetic one fills it with the sign
+fun lower_halved_vector_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) err[fail.Fail] {
+    val dst: mir.VRegId = lctx.instr_vreg(ctx, iid);
+    if (mir.vreg_is_nil(dst)) {
+        ret err[fail.Fail].err{fail.message("mir.lower_ir: vector shift defines no result vreg")};
+    }
+    val ar: res[mir.MirOperand, fail.Fail] = lctx.lower_operand(ctx, inst, 0);
+    if (sel ar.err) { ret err[fail.Fail].err{ar.err}; }
+    val cr: res[mir.MirOperand, fail.Fail] = lctx.lower_operand(ctx, inst, 1);
+    if (sel cr.err) { ret err[fail.Fail].err{cr.err}; }
+    val a:    mir.MirOperand = ar.ok;
+    var c:    mir.MirOperand = cr.ok;
+    val lane: u32            = ctx.cur_vec_lane;
+    val eb:   u8             = mir.vec_lane_elem_bytes(lane);
+
+    # the wide shifts read a count of the wide lane's width, so a register
+    # count is zero-extended to it: its value, not its low bits, is the count
+    if (c.kind != mir.MIR_OP_IMM) {
+        val zr: res[mir.VRegId, fail.Fail] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
+        if (sel zr.err) { ret err[fail.Fail].err{zr.err}; }
+        ctx.cur_vec_lane = mir.VEC_LANE_NONE;
+        val ze: err[fail.Fail] = emit_promote(ctx, mb, mir.op_vreg(zr.ok), c, eb * 2, eb, false);
+        ctx.cur_vec_lane = lane;
+        if (sel ze.err) { ret ze; }
+        c = mir.op_vreg(zr.ok);
+    }
+
+    val w:    u8             = lctx.op_width_of(ctx, inst.ty);
+    val half: mir.MirOperand = mir.op_imm(eb::i64 * 8);
+    var op:   mir.MirOpcode  = mir.MIR_SHR_U;
+    if (inst.kind == instr.OP_SHL)   { op = mir.MIR_SHL; }
+    if (inst.kind == instr.OP_SHR_S) { op = mir.MIR_SHR_S; }
+
+    var t: [6]mir.MirOperand;
+    var k: u32 = 0;
+    for (k < 6) {
+        val tr: res[mir.VRegId, fail.Fail] = lctx.new_vreg_vec(ctx, ctx.f.vregs[dst.n].class, true);
+        if (sel tr.err) { ret err[fail.Fail].err{tr.err}; }
+        ctx.f.vregs[tr.ok.n].ty = inst.ty::u32;
+        t[k]                    = mir.op_vreg(tr.ok);
+        k                       = k + 1;
+    }
+
+    var steps: [6]VecStep;
+    if (op == mir.MIR_SHL) {
+        steps[0] = VecStep{op: mir.MIR_SHL, d: t[0], x: a, y: c};
+        steps[1] = VecStep{op: mir.MIR_SHL, d: t[1], x: t[0], y: half};
+        steps[2] = VecStep{op: mir.MIR_SHR_U, d: t[2], x: t[1], y: half};
+        steps[3] = VecStep{op: mir.MIR_SHR_U, d: t[3], x: a, y: half};
+        steps[4] = VecStep{op: mir.MIR_SHL, d: t[4], x: t[3], y: half};
+        steps[5] = VecStep{op: mir.MIR_SHL, d: t[5], x: t[4], y: c};
+    }
+    or {
+        steps[0] = VecStep{op: op, d: t[0], x: a, y: c};
+        steps[1] = VecStep{op: mir.MIR_SHR_U, d: t[1], x: t[0], y: half};
+        steps[2] = VecStep{op: mir.MIR_SHL, d: t[2], x: t[1], y: half};
+        steps[3] = VecStep{op: mir.MIR_SHL, d: t[3], x: a, y: half};
+        steps[4] = VecStep{op: op, d: t[4], x: t[3], y: c};
+        steps[5] = VecStep{op: mir.MIR_SHR_U, d: t[5], x: t[4], y: half};
+    }
+    ctx.cur_vec_lane = mir.vec_lane_make(mir.VEC_LANE_INT, eb * 2, mir.vec_lane_count(lane) / 2);
+    k                = 0;
+    for (k < 6) {
+        val se: err[fail.Fail] = emit_alu3(ctx, mb, steps[k].op, steps[k].d, steps[k].x, steps[k].y, w);
+        if (sel se.err) {
+            ctx.cur_vec_lane = lane;
+            ret se;
+        }
+        k = k + 1;
+    }
+    val oe: err[fail.Fail] = emit_alu3(ctx, mb, mir.MIR_OR, mir.op_vreg(dst), t[2], t[5], w);
+    ctx.cur_vec_lane = lane;
+    ret oe;
+}
+
+rec VecStep {
+    op: mir.MirOpcode;
+    d:  mir.MirOperand;
+    x:  mir.MirOperand;
+    y:  mir.MirOperand;
 }
 
 # a count the ir already bounds below the width needs no saturation: a mask by
