@@ -370,6 +370,41 @@ pub val AMBIGUOUS_PROFILE_MSG:  str = "mach.toml: several profiles are declared 
 pub val AMBIGUOUS_ARTIFACT_MSG: str = "mach.toml: several artifacts support the selected target and none is marked `default = true`
 ```
 
+## fun default_selection_includes
+
+```mach
+pub fun default_selection_includes(itn: *intern.Interner, m: *Manifest, a: *ArtifactDef,
+target: intern.StrId, executables_only: bool) bool;
+```
+
+the default selection: what a command takes for a target when no `--bin`/`--lib`
+names an artifact. of the artifacts the target builds, those marked
+`default = true` when any is, otherwise every one. build and check take the whole
+selection, and a command that needs one artifact takes it only when it holds one
+
+itn: resolves names
+m: the manifest
+a: the artifact asked about
+target: the resolved target's name
+executables_only: consider `bin` artifacts only, so a library beside them is never taken
+ret: true when the default selection holds `a`
+
+## fun default_selection_takes
+
+```mach
+pub fun default_selection_takes(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
+target: str, a: *ArtifactDef) res[bool, outcome.Fail];
+```
+
+`default_selection_includes` for a target selector not yet resolved
+
+alloc: owns error text
+itn: resolves names
+m: the manifest
+target: the target selector, "" for the default target
+a: the artifact asked about
+ret: whether the default selection holds `a`; err from target resolution
+
 ## fun select_primary_artifact
 
 ```mach
@@ -378,9 +413,9 @@ m: *Manifest, pick: *Selection) err[outcome.Fail];
 ```
 
 fill in `pick.artifact` when none was named and several artifacts are declared:
-the sole artifact supporting the selected target, else the one marked
-`default = true`; several candidates with none marked default are refused,
-never selected by table order
+the default selection when it holds one artifact, the sole artifact supporting
+the selected target or the one marked `default = true`; a selection of several
+is refused, never narrowed by table order
 
 alloc: owns error text
 itn: resolves names
@@ -397,9 +432,8 @@ pub fun select_sole_target_artifact(alloc: *A.Allocator, itn: *intern.Interner,
 m: *Manifest, pick: *Selection) err[outcome.Fail];
 ```
 
-`select_primary_artifact` without the fallback: fill in `pick.artifact` only
-when the target leaves one candidate or one marked `default = true`, and stay
-silent otherwise
+`select_primary_artifact` without the refusal: fill in `pick.artifact` only
+when the default selection holds one artifact, and stay silent otherwise
 
 alloc: owns error text
 itn: resolves names
