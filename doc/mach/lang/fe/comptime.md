@@ -68,6 +68,15 @@ pub val CT_KIND_CASE: CTKind = 7
 
 a tag case descriptor from `$cases(T)`: the same owner/index shape as a field descriptor
 
+## val CT_KIND_NON_INTEGER
+
+```mach
+pub val CT_KIND_NON_INTEGER: CTKind = 8
+```
+
+an integer constant whose declared type is a def chain ending outside the integers;
+data.s is the interned refusal naming the chain, and reading it fails with that refusal
+
 ## def GateState
 
 ```mach
@@ -600,6 +609,12 @@ pub val EVAL_FAIL_INTERNAL:       EvalFailKind = 6
 
 ```mach
 pub val EVAL_FAIL_NEEDS_INSTANCE: EvalFailKind = 7
+```
+
+## val EVAL_FAIL_NOT_INTEGER
+
+```mach
+pub val EVAL_FAIL_NOT_INTEGER:    EvalFailKind = 8
 ```
 
 ## rec EvalFail
@@ -1386,6 +1401,12 @@ pub fun declared_float_width(a: *ast.Ast, source: str, t: id.TypeId) float.Float
 pub fun apply_declared_int_type(a: *ast.Ast, source: str, t: id.TypeId, value: CTValue) CTValue;
 ```
 
+## fun typed_int
+
+```mach
+pub fun typed_int(value: CTValue, unsigned: bool, width: u8) CTValue;
+```
+
 ## fun float_width_unread
 
 ```mach
@@ -1481,6 +1502,12 @@ pub fun ct_int_text(v: CTValue, buf: *u8) str;
 ```
 
 the decimal text of an integer value in a wide.FORMAT_CAP buffer
+
+## fun non_integer
+
+```mach
+pub fun non_integer(message: intern.StrId) CTValue;
+```
 
 ## fun is_case_literal
 
