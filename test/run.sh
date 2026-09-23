@@ -852,7 +852,7 @@ if [ "$mode" = link ]; then
 fi
 
 # doc_extract <page.md> <dir>: one directory per mach block, <dir>/<nnn>/, holding
-# src/ (split at `# file: src/<path>` lines, root.mach before the first) and meta:
+# src/ (split at `# file: src/<path>` lines, main.mach before the first) and meta:
 # the fence line number, the fence info after `mach`, and the entry file
 doc_extract() {
     awk -v dir="$2" '
@@ -866,15 +866,15 @@ doc_extract() {
         }
         function finish() {
             if (cur != "") close(cur)
-            entry = (have_root || last == "") ? "root.mach" : last
-            if (last == "") { printf "" > (blk "/src/root.mach"); close(blk "/src/root.mach") }
+            entry = (have_main || last == "") ? "main.mach" : last
+            if (last == "") { printf "" > (blk "/src/main.mach"); close(blk "/src/main.mach") }
             print line > (blk "/meta"); print info > (blk "/meta"); print entry > (blk "/meta")
             close(blk "/meta")
             inb = 0
         }
         { sub(/\r$/, "") }
         !inb && /^```mach([ \t]|$)/ {
-            inb = 1; n++; line = NR; cur = ""; last = ""; have_root = 0
+            inb = 1; n++; line = NR; cur = ""; last = ""; have_main = 0
             info = substr($0, 8); sub(/^[ \t]+/, "", info); sub(/[ \t]+$/, "", info)
             blk = dir "/" sprintf("%03d", n)
             system("mkdir -p \"" blk "/src\"")
@@ -883,11 +883,11 @@ doc_extract() {
         inb && /^```[ \t]*$/ { finish(); next }
         inb && /^# file: src\/[^ ]+\.mach[ \t]*$/ {
             rel = $3; sub(/^src\//, "", rel)
-            if (rel == "root.mach") have_root = 1
+            if (rel == "main.mach") have_main = 1
             open_file(rel); next
         }
         inb {
-            if (cur == "") open_file("root.mach")
+            if (cur == "") open_file("main.mach")
             print > cur
         }
         END { if (inb) { print "unterminated mach block at line " line > "/dev/stderr"; exit 1 } }

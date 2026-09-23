@@ -1193,7 +1193,7 @@ where it is declared, since one head segment cannot name two projects.
 ```toml
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^6.1"
+version = "^7.4"
 ```
 
 A stanza declares exactly one source:
