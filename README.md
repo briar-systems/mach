@@ -21,7 +21,9 @@
   <a href="doc/language/README.md">docs</a> ·
   <a href="https://github.com/briar-systems/mach/releases">releases</a> ·
   <a href="CHANGELOG.md">changelog</a> ·
-  <a href="https://discord.com/invite/dfWG9NhGj7">discord</a>
+  <a href="https://discord.com/invite/dfWG9NhGj7">discord</a> ·
+  <a href="https://machlang.org/ecosystem/">ecosystem</a> ·
+  <a href="https://github.com/briar-systems/awesome-mach">awesome-mach</a>
 </p>
 
 
