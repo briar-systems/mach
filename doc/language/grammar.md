@@ -553,7 +553,7 @@ postfix ::= call-args
 call-args    ::= "(" [ call-arg { "," call-arg } [ "," ] ] ")"
 call-arg     ::= expr [ "..." ]     (* trailing "..." makes it a va... spread *)
 generic-call ::= type-args call-args        (* callee[T, U](args) *)
-index        ::= "[" expr "]"
+index        ::= "[" expr [ "," expr ] "]"  (* x[i], or the range x[start, count] *)
 member       ::= "." IDENT
 project      ::= "." "[" expr "]"          (* v.[f]: comptime field projection *)
 cast         ::= ( "::" | ":~" ) type
@@ -571,18 +571,25 @@ Its target type is required and names the operand's stripped public type; a bare
 chain stops at the colon, and the enclosing statement reports its own
 terminator error there. All casts bind as postfix.
 
+The second `expr` of an `index` makes it a range: `count` elements or lanes from
+`start` ([operators.md](operators.md#range)). `count` is a length, never an end
+index.
+
 Disambiguating a postfix `[`: the bracket may open a generic argument list
 (`callee[T, U](args)`, or `f[T]` naming an instance as a value) or be an index
-(`obj[idx]`, or the index of an index-then-call `callee[idx](args)`). The two
+(`obj[idx]`, a range `obj[start, count]`, or the index of an index-then-call
+`callee[idx](args)`). The two
 grammars overlap — a bare name is both a type and a value — so the parser cannot
 decide locally. It probes the payload against both grammars, and the same four
 outcomes apply whether or not a `(` follows the `]`:
-- reads cleanly **only** as a type list (`*T`, `[N]T`, a comma list, or a
-  nested generic like `res[bool, ParseError]`) → generic arguments;
-- reads cleanly **only** as an expression (`i + 1`, `f(x)`, a literal) → an
-  index, so `table[0]()` and `table[i + 1]()` are index-then-call;
+- reads cleanly **only** as a type list (`*T`, `[N]T`, a list of three or more,
+  or a nested generic like `res[bool, ParseError]`) → generic arguments;
+- reads cleanly **only** as an expression (`i + 1`, `f(x)`, a literal, or a
+  range with such a part like `p[i, 4]`) → an index, so `table[0]()` and
+  `table[i + 1]()` are index-then-call;
 - reads cleanly as **both** (a bare identifier, a dotted path, a generic
-  application like `v[k]`) → the decision is deferred to name resolution, which
+  application like `v[k]`, or two of those separated by a comma like `v[a, b]`)
+  → the decision is deferred to name resolution, which
   picks by the object's resolved kind. In **callee** position a value (or any
   non-name callee, e.g. an index/call result) makes `[x]` an index, while a
   function, type, or imported name takes `[x]` as a type argument. In **value**
@@ -590,7 +597,9 @@ outcomes apply whether or not a `(` follows the `]`:
   declaration* takes type arguments — because with no `(` to key on every
   subscript in the language reaches this path, and `mod.ARR[i]` must stay an
   index. So `table[i]()` calls the indexed function pointer, `make[T]()`
-  instantiates the generic, and `make[T]` names that instance as a value;
+  instantiates the generic, and `make[T]` names that instance as a value. A
+  two-part payload follows the same rule: `v[a, b]` on a value is a range, and
+  `f[T, U]` on a generic is its type arguments, in either position;
 - reads cleanly as **neither** → the committing index parse reports the error
   (never a silent wrong parse). In value position, a payload that is a type and
   nothing else has no index reading to fall back on, and is reported against the
@@ -761,10 +770,10 @@ mach-read      ::= comptime-ident { member }        (* $mach.build.os, $mach.arc
   `$offset_of(T, field)`, `$type_of(e)`, `$fields(T)`, `$cases(T)`,
   `$discriminant_of(T)`, `$is_tag(T)`, `$is_record(T)`,
   `$is_union(T)`, `$is_pointer(T)`, `$is_secret(T)`, `$type_name(T)`,
-  `$error("msg")`) are syntactically a `comptime-ident` callee with `call-args`.
+  `$type_id(T)`, `$error("msg")`) are syntactically a `comptime-ident` callee with `call-args`.
 - The **type-taking** intrinsics — `$size_of`, `$length_of`, `$align_of`,
   `$offset_of`, `$fields`, `$cases`, `$discriminant_of`, and the five predicates
-  with `$type_name` — parse their
+  with `$type_name` and `$type_id` — parse their
   **first argument with the `type` production**, not the
   expression grammar, so the whole type language is spellable there:
   `$fields(Box[T])`, `$size_of(Pair[A, B])`, `$size_of(*T)`, `$size_of([4]u16)`,

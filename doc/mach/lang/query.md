@@ -120,10 +120,10 @@ pub val Q_EMBED_FILE:        QueryKind = 18
 pub val Q_CODEGEN_FLAGS:     QueryKind = 19
 ```
 
-## val Q_GATE_TERMINAL
+## val Q_LOAD_VIEW
 
 ```mach
-pub val Q_GATE_TERMINAL:     QueryKind = 20
+pub val Q_LOAD_VIEW:         QueryKind = 20
 ```
 
 ## val Q_INLINE_BODIES
@@ -138,30 +138,6 @@ pub val Q_INLINE_BODIES:     QueryKind = 21
 pub val Q_CELL_SNAPSHOT:     QueryKind = 22
 ```
 
-## val Q_UNION_TUPLE
-
-```mach
-pub val Q_UNION_TUPLE:       QueryKind = 23
-```
-
-## val Q_GATES
-
-```mach
-pub val Q_GATES:             QueryKind = 24
-```
-
-## val Q_GATE_SURFACE
-
-```mach
-pub val Q_GATE_SURFACE:      QueryKind = 25
-```
-
-## val Q_LOAD_VIEW
-
-```mach
-pub val Q_LOAD_VIEW:         QueryKind = 26
-```
-
 ## def KeyOwner
 
 ```mach
@@ -170,7 +146,7 @@ pub def KeyOwner: u8
 
 what a kind's keys name, so a session can release every product a module or file left behind.
 a kind keyed by a module carries its stable module id in the key's low 32 bits, whatever the
-higher bits add (a load view, a gate tuple, a test build), and a kind keyed by a file is keyed
+higher bits add (a test build), and a kind keyed by a file is keyed
 by its file id alone. file text is the source map's and the editor's input, released with them
 
 ## val KEY_UNDECLARED
@@ -200,7 +176,7 @@ pub val KEY_FILE:       KeyOwner = 3
 ## val QUERY_KIND_COUNT
 
 ```mach
-pub val QUERY_KIND_COUNT: u32 = 27
+pub val QUERY_KIND_COUNT: u32 = 23
 ```
 
 one past the highest kind; the owner table and every kind constant stay inside it

@@ -259,7 +259,6 @@ a: *ast.Ast,
 deps: *ResolveDeps,
 ctx: *comptime.ComptimeCtx,
 own_module: session.ModuleId,
-terminal: bool,
 diags: *diagnostic.DiagnosticStore) res[ResolveResult, fail.Fail];
 ```
 

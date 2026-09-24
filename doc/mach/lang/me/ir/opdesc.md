@@ -426,10 +426,10 @@ pub val IVEC_NEG:        IrVecOp = 9
 pub val IVEC_SHL:        IrVecOp = 10
 ```
 
-## val IVEC_SHR
+## val IVEC_SHR_U
 
 ```mach
-pub val IVEC_SHR:        IrVecOp = 11
+pub val IVEC_SHR_U:      IrVecOp = 11
 ```
 
 ## val IVEC_CMP
@@ -514,6 +514,12 @@ pub val IVEC_WIDEN_S:    IrVecOp = 24
 
 ```mach
 pub val IVEC_WIDEN_U:    IrVecOp = 25
+```
+
+## val IVEC_SHR_S
+
+```mach
+pub val IVEC_SHR_S:      IrVecOp = 26
 ```
 
 ## def VecClass

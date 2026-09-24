@@ -44,6 +44,21 @@ pub fun root_override_text(s: *session.Session, o: *RootOverride) res[str, outco
 
 the note `mach dep verify` prints for one override
 
+## fun override_note
+
+```mach
+pub fun override_note(a: *A.Allocator, name: str, declared: str, chain: str, requested: str) res[str, outcome.Fail];
+```
+
+the note naming one requirement a root declaration overrode, as `mach dep pull`, `update`,
+`add` and `verify` print it
+
+a: allocates the note
+name: the dependency identity
+declared: the root's winning selector, as its manifest line spells it
+chain: the requiring chain, ending at the dependency
+requested: the selector the chain asked for, in the same form
+
 ## rec GitCandidates
 
 ```mach
@@ -84,7 +99,7 @@ pub fun release_for_commit(c: *GitCandidates, url: str, commit: str) res[str, ou
 ```
 
 the release of `url` whose commit is `commit`, as its version text owned by the
-caller, or "" when no release tag names that commit: a dependency's committed
+caller, or an owned "" when no release tag names that commit: a dependency's committed
 gitlink is a commit, and resolution deals in releases (#3689)
 
 ## fun release_needs
@@ -332,8 +347,8 @@ pub fun checkout_head(s: *session.Session, dep_full: str) res[str, outcome.Fail]
 pub fun release_at_head(s: *session.Session, dep_full: str) res[str, outcome.Fail];
 ```
 
-the release version a checkout's HEAD is tagged with ("" when no `v`-prefixed semver tag
-points at it); the highest wins when several do
+the release version a checkout's HEAD is tagged with (an owned "" when no `v`-prefixed
+semver tag points at it); the highest wins when several do, and the caller frees the result
 
 ## val SLOT_ABSENT
 
@@ -482,8 +497,12 @@ pub fun remove_dependency_index(s: *session.Session, root: str, id: str, mode: u
 
 ```mach
 pub fun realize_path_dependency(s: *session.Session, root: str, id: str, src_dir: str,
-mode: u8) err[outcome.Fail];
+mode: u8) res[bool, outcome.Fail];
 ```
+
+sync dep/<id> with a path dependency's source
+
+ret: true when the copy was refreshed, false when it already matched its source and was reused
 
 ## fun realized_ids
 

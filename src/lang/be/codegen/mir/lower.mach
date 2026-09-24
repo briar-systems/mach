@@ -248,6 +248,13 @@ fun lower_block(ctx: *lctx.LowerCtx, fn: *ir.Function, blk: *ir.Block, is_entry:
     ret err[fail.Fail].ok{};
 }
 
+# whether `mi` writes `v` as its destination
+fun instr_defines_vreg(mi: *mir.MirInstr, v: mir.VRegId) bool {
+    if (!mir.instr_defines_shape(mi))           { ret false; }
+    if (mi.operands[0].kind != mir.MIR_OP_VREG) { ret false; }
+    ret mir.vreg_same(mi.operands[0].vreg, v);
+}
+
 fun copy_preds(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, blk: *ir.Block) err[fail.Fail] {
     if (blk.pred_count == 0) { ret err[fail.Fail].ok{}; }
     val r: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, blk.pred_count::usize);
@@ -670,6 +677,9 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
         if (!ctx.tgt.model.has_v128) {
             ret err[fail.Fail].err{lctx.reject(ctx, vector_unsupported(ctx))};
         }
+        if (route == opdesc.LOWER_SHIFT) {
+            ret lower_vector_shift(ctx, mb, inst, iid);
+        }
         if (ctx.tgt.model.vector_compute_generic && is_vector_compute(inst.kind)) {
             ret lower_generic(ctx, mb, inst, iid);
         }
@@ -691,6 +701,15 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
             if (sel op_r.err) { ret err[fail.Fail].err{op_r.err}; }
             val op: mir.MirOperand = op_r.ok;
             if (op.kind == mir.MIR_OP_VREG) { vreg = op.vreg; }
+        }
+        # the value exists from the end of the instruction that defines it, so a
+        # binding of the def just lowered is published there; anything regalloc
+        # or legalize later puts between the def and its successor is covered
+        if (!mir.vreg_is_nil(vreg) && mb.instr_count > 0) {
+            val last: *mir.MirInstr = ?mb.instrs[mb.instr_count - 1];
+            if (instr_defines_vreg(last, vreg)) {
+                ret mir.instr_attach_dbg_end(ctx.alloc, last, iid::u32, vreg.n);
+            }
         }
         ret lctx.push_pending_dbg(ctx, iid::u32, vreg.n);
     }
@@ -1197,6 +1216,114 @@ fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
     val ng:   err[fail.Fail] = emit_alu2(ctx, mb, mir.MIR_NEG, mir.op_vreg(mask), mir.op_vreg(keep), w);
     if (sel ng.err) { ret ng; }
     ret emit_alu3(ctx, mb, mir.MIR_AND, mir.op_vreg(dst), mir.op_vreg(shifted), mir.op_vreg(mask), w);
+}
+
+# a packed vector shift reaches here only in a form the target packs, and
+# the packed instructions saturate a count at or above the lane width on
+# their own, so it carries none of the scalar shift's sequence. a lane
+# narrower than the narrowest one the target shifts is shifted as lanes twice
+# as wide, each half on its own with the other half cleared (#3740)
+fun lower_vector_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) err[fail.Fail] {
+    if (inst.operand_count < 2) {
+        ret err[fail.Fail].err{fail.message("mir.lower_ir: vector shift missing value or count operand")};
+    }
+    val lane_bits: u32 = mir.vec_lane_elem_bytes(ctx.cur_vec_lane)::u32 * 8;
+    val min_bits:  u32 = ctx.tgt.model.packed_shift_min_bits;
+    if (lctx.value_is_vector(ctx, inst.operands[1].ty) || lane_bits >= min_bits) {
+        ret lower_generic(ctx, mb, inst, iid);
+    }
+    if (lane_bits * 2 != min_bits) {
+        ret err[fail.Fail].err{fail.message("mir.lower_ir: vector shift lane is more than one halving below the target's narrowest packed shift")};
+    }
+    ret lower_halved_vector_shift(ctx, mb, inst, iid);
+}
+
+# each wide lane holds a low and a high narrow lane. a left shift moves the
+# low half's bits up into the high half, so the low result is the wide shift
+# with its high half cleared, and the high result is the wide shift of the
+# high half alone; a right shift is the mirror, whose high result is the wide
+# shift with its low half cleared and whose low result is the low half moved
+# up, shifted, and moved back. a count at or above the narrow width empties
+# the narrow lane in every case, and an arithmetic one fills it with the sign
+fun lower_halved_vector_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) err[fail.Fail] {
+    val dst: mir.VRegId = lctx.instr_vreg(ctx, iid);
+    if (mir.vreg_is_nil(dst)) {
+        ret err[fail.Fail].err{fail.message("mir.lower_ir: vector shift defines no result vreg")};
+    }
+    val ar: res[mir.MirOperand, fail.Fail] = lctx.lower_operand(ctx, inst, 0);
+    if (sel ar.err) { ret err[fail.Fail].err{ar.err}; }
+    val cr: res[mir.MirOperand, fail.Fail] = lctx.lower_operand(ctx, inst, 1);
+    if (sel cr.err) { ret err[fail.Fail].err{cr.err}; }
+    val a:    mir.MirOperand = ar.ok;
+    var c:    mir.MirOperand = cr.ok;
+    val lane: u32            = ctx.cur_vec_lane;
+    val eb:   u8             = mir.vec_lane_elem_bytes(lane);
+
+    # the wide shifts read a count of the wide lane's width, so a register
+    # count is zero-extended to it: its value, not its low bits, is the count
+    if (c.kind != mir.MIR_OP_IMM) {
+        val zr: res[mir.VRegId, fail.Fail] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
+        if (sel zr.err) { ret err[fail.Fail].err{zr.err}; }
+        ctx.cur_vec_lane = mir.VEC_LANE_NONE;
+        val ze: err[fail.Fail] = emit_promote(ctx, mb, mir.op_vreg(zr.ok), c, eb * 2, eb, false);
+        ctx.cur_vec_lane = lane;
+        if (sel ze.err) { ret ze; }
+        c = mir.op_vreg(zr.ok);
+    }
+
+    val w:    u8             = lctx.op_width_of(ctx, inst.ty);
+    val half: mir.MirOperand = mir.op_imm(eb::i64 * 8);
+    var op:   mir.MirOpcode  = mir.MIR_SHR_U;
+    if (inst.kind == instr.OP_SHL)   { op = mir.MIR_SHL; }
+    if (inst.kind == instr.OP_SHR_S) { op = mir.MIR_SHR_S; }
+
+    var t: [6]mir.MirOperand;
+    var k: u32 = 0;
+    for (k < 6) {
+        val tr: res[mir.VRegId, fail.Fail] = lctx.new_vreg_vec(ctx, ctx.f.vregs[dst.n].class, true);
+        if (sel tr.err) { ret err[fail.Fail].err{tr.err}; }
+        ctx.f.vregs[tr.ok.n].ty = inst.ty::u32;
+        t[k]                    = mir.op_vreg(tr.ok);
+        k                       = k + 1;
+    }
+
+    var steps: [6]VecStep;
+    if (op == mir.MIR_SHL) {
+        steps[0] = VecStep{op: mir.MIR_SHL, d: t[0], x: a, y: c};
+        steps[1] = VecStep{op: mir.MIR_SHL, d: t[1], x: t[0], y: half};
+        steps[2] = VecStep{op: mir.MIR_SHR_U, d: t[2], x: t[1], y: half};
+        steps[3] = VecStep{op: mir.MIR_SHR_U, d: t[3], x: a, y: half};
+        steps[4] = VecStep{op: mir.MIR_SHL, d: t[4], x: t[3], y: half};
+        steps[5] = VecStep{op: mir.MIR_SHL, d: t[5], x: t[4], y: c};
+    }
+    or {
+        steps[0] = VecStep{op: op, d: t[0], x: a, y: c};
+        steps[1] = VecStep{op: mir.MIR_SHR_U, d: t[1], x: t[0], y: half};
+        steps[2] = VecStep{op: mir.MIR_SHL, d: t[2], x: t[1], y: half};
+        steps[3] = VecStep{op: mir.MIR_SHL, d: t[3], x: a, y: half};
+        steps[4] = VecStep{op: op, d: t[4], x: t[3], y: c};
+        steps[5] = VecStep{op: mir.MIR_SHR_U, d: t[5], x: t[4], y: half};
+    }
+    ctx.cur_vec_lane = mir.vec_lane_make(mir.VEC_LANE_INT, eb * 2, mir.vec_lane_count(lane) / 2);
+    k                = 0;
+    for (k < 6) {
+        val se: err[fail.Fail] = emit_alu3(ctx, mb, steps[k].op, steps[k].d, steps[k].x, steps[k].y, w);
+        if (sel se.err) {
+            ctx.cur_vec_lane = lane;
+            ret se;
+        }
+        k = k + 1;
+    }
+    val oe: err[fail.Fail] = emit_alu3(ctx, mb, mir.MIR_OR, mir.op_vreg(dst), t[2], t[5], w);
+    ctx.cur_vec_lane = lane;
+    ret oe;
+}
+
+rec VecStep {
+    op: mir.MirOpcode;
+    d:  mir.MirOperand;
+    x:  mir.MirOperand;
+    y:  mir.MirOperand;
 }
 
 # a count the ir already bounds below the width needs no saturation: a mask by
@@ -2524,6 +2651,85 @@ test "mach.lang.be.codegen.mir.lower:volatile_memory_flags_follow_each_ir_instru
     if (mb.instrs[0].opcode != mir.MIR_MEMZERO || mb.instrs[1].opcode != mir.MIR_MEMZERO) { ret 5; }
     if (mb.instrs[0].memory_flags != mir.MEMORY_VOLATILE)                                 { ret 6; }
     if (mb.instrs[1].memory_flags != 0)                                                   { ret 7; }
+    ret 0;
+}
+
+# a binding of the value the instruction just lowered defined is published at
+# that instruction's end, where the value exists; a binding of an older value
+# waits for the next instruction's start (#3688)
+test "mach.lang.be.codegen.mir.lower:a_binding_of_the_def_just_lowered_opens_at_its_end" {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var types:  ir_type.IrTypeTable;
+    val r_init: err[fail.Fail] = ir_type.init(?types, ?alloc);
+    if (sel r_init.err) { ret 1; }
+    fin { ir_type.dnit(?types); }
+    val tr: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?types, 64);
+    if (sel tr.err) { ret 1; }
+    val ty:  ir_type.IrTypeId = tr.ok;
+    var tgt: target.Target;
+    tgt.model.flat_addressing = true;
+    tgt.model.pointer_width   = 8;
+    tgt.model.gpr_width       = 8;
+    tgt.model.int_widths      = isa.INT_WIDTHS_1_2_4_8;
+    var parameters: [2]mir.VRegId = [2]mir.VRegId{mir.vreg_id(0), mir.vreg_id(1)};
+    var results:    [4]mir.VRegId = [4]mir.VRegId{mir.vreg_id(2), mir.MIR_VREG_NIL, mir.MIR_VREG_NIL, mir.vreg_id(3)};
+    var sum:        [2]value.Value;
+    sum[0] = value.param(0, ty);
+    sum[1] = value.param(1, ty);
+    var of_sum: [1]value.Value;
+    of_sum[0] = value.instr(0::id.InstructionId, ty);
+    var of_param: [1]value.Value;
+    of_param[0] = value.param(0, ty);
+    var instructions: [4]instr.Instruction;
+    instructions[0].kind          = instr.OP_ADD;
+    instructions[0].ty            = ty;
+    instructions[0].operands      = ?sum[0];
+    instructions[0].operand_count = 2;
+    instructions[1].kind          = instr.OP_DBG_VALUE;
+    instructions[1].ty            = ty;
+    instructions[1].operands      = ?of_sum[0];
+    instructions[1].operand_count = 1;
+    instructions[2].kind          = instr.OP_DBG_VALUE;
+    instructions[2].ty            = ty;
+    instructions[2].operands      = ?of_param[0];
+    instructions[2].operand_count = 1;
+    instructions[3]               = instructions[0];
+    var fn: ir.Function;
+    fn.instrs    = ?instructions[0];
+    fn.instr_len = 4;
+    var ctx: lctx.LowerCtx;
+    ctx.alloc         = ?alloc;
+    ctx.tgt           = ?tgt;
+    ctx.types         = ?types;
+    ctx.param_vregs   = ?parameters[0];
+    ctx.param_count   = 2;
+    ctx.instr_vregs   = ?results[0];
+    ctx.instr_count   = 4;
+    ctx.pending       = nil;
+    ctx.pending_count = 0;
+    ctx.pending_cap   = 0;
+    fin {
+        if (ctx.pending != nil) { A.deallocate[mir.MirDbgBinding](?alloc, ctx.pending, ctx.pending_cap::usize); }
+    }
+    var mb: mir.MirBlock;
+    fin { mir.dnit_block(?alloc, ?mb); }
+    var k: u32 = 0;
+    for (k < 4) {
+        val r: err[fail.Fail] = lower_instr(?ctx, ?fn, ?mb, k);
+        if (sel r.err) { ret 2; }
+        k = k + 1;
+    }
+    if (mb.instr_count != 2) { ret 3; }
+    val def: *mir.MirInstr = ?mb.instrs[0];
+    if (def.dbg_binding_count != 1)                                    { ret 4; }
+    if (def.dbg_bindings[0].iid != 1 || def.dbg_bindings[0].vreg != 2) { ret 4; }
+    if (!def.dbg_bindings[0].at_end)                                   { ret 5; }
+    val next: *mir.MirInstr = ?mb.instrs[1];
+    if (next.dbg_binding_count != 1)                                     { ret 6; }
+    if (next.dbg_bindings[0].iid != 2 || next.dbg_bindings[0].vreg != 0) { ret 6; }
+    if (next.dbg_bindings[0].at_end)                                     { ret 7; }
     ret 0;
 }
 

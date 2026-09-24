@@ -69,8 +69,8 @@ table and the conditions are in
 ## Bitwise
 
 `&` `|` `^` `~` `<<` `>>` — work on integer scalars. On integer-lane vectors
-`&` `|` `^` `~` apply lane-wise; the shifts `<<` `>>` are not in this increment
-(see [SIMD vectors](#simd-vectors)).
+all six apply lane-wise, and a vector shift's count is a vector of the same
+shape (see [SIMD vectors](#simd-vectors)).
 
 ```mach fragment
 val x: i64    = (a & b) | (c ^ d);
@@ -191,20 +191,107 @@ Each of those reads, in full, `cannot take the address of a call result: `?`
 applies to a place (a binding, a field, an element, or a dereference)`. Bind
 the temporary to a `var` and take that binding's address.
 
+## Index
+
+- `x[i]`: one element of an array, an element through a pointer, or one lane of
+  a vector. A lane index is a comptime constant, and a constant index into an
+  array or a vector is bounds-checked at compile time ([types.md](types.md#array)).
+- `x[start, count]`: a **range** of `count` consecutive elements or lanes from
+  `start`.
+
+### Range
+
+`count` is a comptime constant of at least 1, a length and never an end index:
+there are no absolute ranges, no negative counts and no runtime counts, and each
+of those is an error at the count. `start` is any index expression, as for `x[i]`.
+
+| object | `x[start, count]` is |
+|---|---|
+| `TxN` | a `Txcount` vector of those lanes (`v[4, 4]` on an `i16x8` is an `i16x4`), with a constant `start` and a `count` of at least 2 |
+| `[N]T` | a `[count]T` value |
+| `*T` | a `[count]T` value, read through the pointer |
+
+A constant `start` over an array or a vector keeps the whole range inside it:
+`start + count` may equal `N` and may not pass it, reported as
+`range [3, 2] is out of bounds for `[4]i32` of length 4`. A pointer carries no
+length, so a range through one is not checked.
+
+A range is an assignment target: `x[start, count] = value` stores `count` elements
+or lanes starting at `start`, and `value` has exactly the range's type. A range
+read is a value, not a view onto the memory, so its address cannot be taken
+(`cannot take the address of a range`) and it cannot be written into.
+
+```mach
+use std.runtime;
+use print: std.print;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var xs: [6]f32 = [6]f32{1.0, 2.0, 3.0, 4.0, 5.0, 6.0};
+    val p: *f32 = ?xs[0];
+    val a: f32x4 = p[1, 4]::f32x4;      # the four floats at p[1]
+    p[2, 4] = (a * a)::[4]f32;          # stored at p[2]
+    val tail: [2]f32 = xs[4, 2];
+    print.printlnf("{} {} {}", xs[2], tail[0], tail[1]);
+    ret 0;
+}
+```
+
+The comma form cannot be confused with generic arguments: a comma list after a
+name reads both ways (`f[T, U]` is also a list of type arguments), and name
+resolution picks by what the name is, exactly as it does for `f[x]`
+([grammar.md](grammar.md#postfix)).
+
 ## Cast
 
 Two postfix cast operators, both written `expr OP Type`:
 
 - `expr::Type` — **value conversion**. Resizes integers (sign- or zero-extend,
   truncate), converts between integer and float (a numeric `CVT`), and is the
-  identity on a same-type operand. Value-preserving where representable. When
-  either type is nonnumeric, equal sizes are required and the bits are reinterpreted.
+  identity on a same-type operand. Value-preserving where representable. Two
+  vectors with the same lane count convert lane by lane with the scalar rule. An
+  array and a vector (`[N]T` and `TxN`, either way) convert element by element and
+  need the same element type and count, so `[8]i16::i32x4` is an error. Any other
+  pair where either type is nonnumeric needs equal sizes, and the bits are
+  reinterpreted.
   Constant expressions follow these rules at every nesting depth, including casts
   through type aliases.
 - `expr:~Type` — **bit reinterpret**. Reads the operand's exact bits as the
   target type with no conversion. Legal only when `Type` has the same byte size
   as the operand's type (a size mismatch is a compile error). The `~` recalls
   its bitwise heritage, so `:~` reads as "bit cast".
+
+Every cast (`::`, `:~` and the `:>` strip cast) is a
+[postfix](grammar.md#postfix), and a prefix operator (`@`, `?`, `-`, `~`, `!`)
+takes its operand together with the whole postfix chain that follows it
+([grammar.md](grammar.md#prefix-atoms-and-unary)). So `@p::T` is `@(p::T)`: it
+casts the pointer `p` and then dereferences the result. To dereference first
+and convert the value read, parenthesize the dereference: `(@p)::T`. The same
+holds for `-x::T`, which is `-(x::T)`.
+
+```mach
+use std.runtime;
+use print: std.print;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var x: i64 = -1;
+    val p: *i64 = ?x;
+    val bits: u64 = @p::*u64;       # @(p::*u64): retype the pointer, read a u64
+    val wide: i128 = (@p)::i128;    # read the i64, then sign-extend it
+    print.printlnf("{:x} {}", bits, wide);
+    ret 0;
+}
+```
+
+Reading `@p::u64` as dereference-then-convert is refused, because the cast
+applies to `p` and a `u64` cannot be dereferenced:
+
+```mach error dereference of non-pointer type
+fun widen(p: *i64) u64 {
+    ret @p::u64;                    # error: @(p::u64) dereferences a u64
+}
+```
 
 On two vector types, `::` converts lane by lane: each lane goes through exactly
 the scalar `::` above, so `i32x4::f32x4` converts every lane numerically and
@@ -216,6 +303,19 @@ same target, including NaN, the infinities and values outside the
 destination type. There is no cast between a vector and a scalar. The raw
 bits of a vector are `:~`, which, like every `:~`, needs only equal byte
 sizes (`i32x4:~f32x4`, `i32x4:~i64x2`).
+
+Between an array and a vector of the same shape, `[N]T` and `TxN`, `::` converts
+element by element in either direction. The element type and the count must be
+the same on both sides: `[4]i32::f32x4` and `[8]i16::i32x4` are errors, and a lane
+type change is a separate vector `::` after the array's lanes are in a vector. An
+array that lives in memory converted to a vector is one vector load, and a vector
+converted to an array and stored into a place is one vector store, which makes a
+[range](#range) with `::` the load and store idiom:
+
+```mach fragment
+val a: f32x4 = p[i, 4]::f32x4;          # one vector load
+p[i, 4] = (a * a)::[4]f32;              # one vector store
+```
 
 The two differ sharply on int<->float. `::` runs a numeric conversion, while
 `:~` reinterprets the raw bit pattern:
@@ -257,16 +357,46 @@ the two differ only in how they are realized.
 | Lane family | `+` `-` | `*` | `/` | `%` | `& \| ^ ~` | `<< >>` | `== != < > <= >=` |
 |---|---|---|---|---|---|---|---|
 | float — `f32x4`, `f64x2` | yes | yes | yes | no | — | no | → same-shape unsigned mask |
-| integer — `i8x16` `i16x8` `i32x4` `i64x2` (+ unsigned) | yes | yes | yes | no | yes | no | → same-shape unsigned mask |
+| integer — `i8x16` `i16x8` `i32x4` `i64x2` (+ unsigned) | yes | yes | yes | no | yes | yes, by a same-shape count | → same-shape unsigned mask |
 
 Both operands of a binary operator must be the **same** vector shape: there is no
 implicit scalar↔vector mixing and no cross-shape widening. Anything the table
 marks `no` is a compile error, not a silent fallback:
 
 - no vector `%` on any lane type;
-- bitwise `& | ^ ~` require integer lanes; the shifts `<< >>` are not in this
-  increment (a per-lane variable shift is AVX2-only on x86_64, with no 8-bit
-  packed form).
+- bitwise `& | ^ ~` and the shifts `<< >>` require integer lanes;
+- a shift's count is a vector of the shifted type, never a scalar: `vec << vec`
+  and `vec >> vec` are the only two forms, and `v << 3` is an error that names
+  the form to write instead.
+
+A vector shift shifts each lane by the count in the same lane, and each lane
+follows the scalar operator exactly: `>>` is arithmetic on signed lanes and
+logical on unsigned ones, a lane count at or above the lane width saturates
+(`0`, or the sign fill for an arithmetic `>>`), and a lane count that is a
+compile-time constant at or above the width is an error. A uniform count is
+the same count in every lane of a literal, which is the form every baseline
+instruction set shifts by in one instruction:
+
+```mach
+use std.runtime;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    val x: u32x4 = u32x4{1, 2, 0x80000000, 0xF0};
+    val n: u32   = argc::u32 + 31;              # 32 at run time
+    val h: u32x4 = x >> u32x4{4, 4, 4, 4};      # one psrld on x86_64
+    val k: u32x4 = x << u32x4{n, n, n, n};      # at the lane width: every lane is 0
+    val m: u32x4 = x << u32x4{0, 1, 2, 3};      # a count per lane
+    if (h[3] != 0x0F || k[2] != 0 || m[1] != 4) { ret 1; }
+    ret 0;
+}
+```
+
+```mach error a vector shift count is a vector of the shifted type, never a scalar
+fun f(x: u32x4) u32x4 {
+    ret x << 3;
+}
+```
 
 Integer division uses each lane's signedness and scalar division behavior, including
 truncation toward zero for signed quotients and the scalar behavior for division by
@@ -290,6 +420,22 @@ Integer `*` is where this is most visible today:
 | `i16x8 * i16x8` | packed `pmullw` | packed `mul .8h` | scalar expansion |
 | `i32x4 * i32x4` | packed `pmuludq` pair (`pmulld` under `sse41`) | packed `mul .4s` | scalar expansion |
 | `i64x2 * i64x2` | packed `pmuludq` triple | scalar expansion (NEON has no `.2d` multiply) | scalar expansion |
+
+Shifts realize by the count's form: a count that is the same value in every
+lane shifts every lane by that one scalar, and any other count shifts each lane
+by its own.
+
+| shape | x86_64 (SSE2) | aarch64 (NEON) | riscv64 (no vector unit) |
+|---|---|---|---|
+| uniform `<<`, `>>` on 16-, 32- and 64-bit lanes | packed `psll*` / `psrl*` / `psra*` | scalar expansion | scalar expansion |
+| uniform arithmetic `>>` on 64-bit lanes | scalar expansion (`psraq` is AVX-512VL) | scalar expansion | scalar expansion |
+| uniform `<<`, `>>` on 8-bit lanes | packed through the 16-bit shifts, each byte shifted with its neighbour cleared | scalar expansion | scalar expansion |
+| per-lane count, any lane width | scalar expansion (SSE2 has no per-lane shift; `vpsllv*` is AVX2) | scalar expansion | scalar expansion |
+
+The packed instructions saturate a count at or above the lane width on their
+own, so they need none of the scalar shift's range test. SPIR-V leaves an
+`OpShift*` by the component width or more undefined, so it shifts lane by lane
+through the scalar shift as well.
 
 Operators never widen implicitly, so a widening multiply is spelled as two lane
 casts and a multiply: `a::i32x4 * b::i32x4` for `a, b: i16x4`. When both operands

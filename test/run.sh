@@ -19,7 +19,8 @@
 #   --target <t>   one target (repeatable); default every target with a golden dir
 #   --case <g/n>   one case (repeatable)
 #   --bless        write the goldens instead of diffing them, print the diff
-#   --qemu         execute riscv64-linux, riscv64zkt-linux and riscv32 under qemu-user
+#   --qemu         execute aarch64-linux, riscv64-linux, riscv64zkt-linux and riscv32 under
+#                  qemu-user when this host cannot run them natively
 #                  (a missing emulator is announced and its target stays golden only)
 #   --link         run the link cases (test/link/cases) instead of the corpus
 #   --dwarf        build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
@@ -57,7 +58,7 @@ cflags_ubsan="-std=c11 -O0 -ffp-contract=off -fsanitize=undefined -fno-sanitize-
 # by test/lib/elf_loadable.py, since qemu-user cannot map a freestanding image.
 targets_all='
 x86_64-linux      x86_64      linux         sysv64   -    bin     hosted  objdump    -
-aarch64-linux     aarch64     linux         aapcs64  -    bin     hosted  objdump    -
+aarch64-linux     aarch64     linux         aapcs64  -    bin     hosted  objdump    qemu-aarch64
 riscv64-linux     riscv64     linux         lp64d    -    bin     hosted  objdump    qemu-riscv64
 riscv64zkt-linux  rv64gc_zkt  linux         lp64d    -    bin     hosted  objdump    qemu-riscv64
 x86_64-windows    x86_64      windows       win64    -    bin     hosted  objdump    -
@@ -69,7 +70,7 @@ riscv32           rv32imafdc  freestanding  ilp32d   elf  static  direct  objdum
 # where a run bin is based: above the host's mmap floor with a page for its headers
 run_base=0x20000
 
-usage() { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 want_targets=
 want_cases=
@@ -154,8 +155,9 @@ object_format() {
 }
 
 # engine <target>: "" for the host itself, the qemu command, or "-" when nothing here
-# runs it. qemu serves only the targets with no native runner: it is compute
-# evidence, never ABI evidence, so aarch64 is proven on real silicon.
+# runs it. qemu serves only a target this host cannot run: it is compute evidence,
+# never ABI evidence, so aarch64-linux under qemu-aarch64 lets a corpus run on an
+# x86_64 host execute its cases while CI still proves them on real silicon.
 # riscv64zkt-linux selects Zkt, whose only effect on codegen is admitting the
 # secret multiply, so qemu is compute evidence for that column too.
 engine() {
@@ -580,9 +582,10 @@ fi
 # run it, what it builds and how it is checked, and expect*.txt is the recorded
 # observable. see test/README.md.
 #
-# `goal: test` compiles the case with `mach test` in place of `mach build`: every
-# module of the project is loaded, the collected tests run through the leg's
-# engine as part of the compile step, and the artifact is the test dispatcher.
+# `goal: test` compiles the case with `mach test` in place of `mach build`: the
+# artifact's closure is loaded as a build loads it, the collected tests run
+# through the leg's engine as part of the compile step, and the artifact is the
+# test dispatcher.
 # a defect that exists only under a test build (#3535) is reachable by no other
 # goal.
 link_cell() {
@@ -820,9 +823,17 @@ fi
 
 if [ "$mode" = link ]; then
     base_ld_library_path=${LD_LIBRARY_PATH:-}
+    # a link case is ABI and loader evidence, which qemu is not, so a leg is
+    # emulated only when no native leg can prove it; aarch64-linux has one
+    link_emulated="riscv64-linux"
     legs=
     for t in x86_64-linux aarch64-linux riscv64-linux x86_64-windows x86_64-darwin aarch64-darwin; do
-        [ "$(engine "$t")" != - ] && legs="$legs $t"
+        case "$(engine "$t")" in
+            -) continue ;;
+            '') ;;
+            *) case " $link_emulated " in *" $t "*) ;; *) continue ;; esac ;;
+        esac
+        legs="$legs $t"
     done
     echo "legs:   $legs"
     for dir in "$here"/link/cases/*/; do
@@ -842,7 +853,7 @@ if [ "$mode" = link ]; then
 fi
 
 # doc_extract <page.md> <dir>: one directory per mach block, <dir>/<nnn>/, holding
-# src/ (split at `# file: src/<path>` lines, root.mach before the first) and meta:
+# src/ (split at `# file: src/<path>` lines, main.mach before the first) and meta:
 # the fence line number, the fence info after `mach`, and the entry file
 doc_extract() {
     awk -v dir="$2" '
@@ -856,15 +867,15 @@ doc_extract() {
         }
         function finish() {
             if (cur != "") close(cur)
-            entry = (have_root || last == "") ? "root.mach" : last
-            if (last == "") { printf "" > (blk "/src/root.mach"); close(blk "/src/root.mach") }
+            entry = (have_main || last == "") ? "main.mach" : last
+            if (last == "") { printf "" > (blk "/src/main.mach"); close(blk "/src/main.mach") }
             print line > (blk "/meta"); print info > (blk "/meta"); print entry > (blk "/meta")
             close(blk "/meta")
             inb = 0
         }
         { sub(/\r$/, "") }
         !inb && /^```mach([ \t]|$)/ {
-            inb = 1; n++; line = NR; cur = ""; last = ""; have_root = 0
+            inb = 1; n++; line = NR; cur = ""; last = ""; have_main = 0
             info = substr($0, 8); sub(/^[ \t]+/, "", info); sub(/[ \t]+$/, "", info)
             blk = dir "/" sprintf("%03d", n)
             system("mkdir -p \"" blk "/src\"")
@@ -873,11 +884,11 @@ doc_extract() {
         inb && /^```[ \t]*$/ { finish(); next }
         inb && /^# file: src\/[^ ]+\.mach[ \t]*$/ {
             rel = $3; sub(/^src\//, "", rel)
-            if (rel == "root.mach") have_root = 1
+            if (rel == "main.mach") have_main = 1
             open_file(rel); next
         }
         inb {
-            if (cur == "") open_file("root.mach")
+            if (cur == "") open_file("main.mach")
             print > cur
         }
         END { if (inb) { print "unterminated mach block at line " line > "/dev/stderr"; exit 1 } }

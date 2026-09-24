@@ -52,7 +52,8 @@ the path. See
 [comptime-mach.md](comptime-mach.md) for the `$mach.*` subtree.
 
 `$bin.name` is the table key of the artifact the module is compiled for. A build
-compiles one artifact, so every module reads that artifact's key. An editor
+compiles one artifact, and a test build tests one, so every module reads that
+artifact's key. An editor
 session analyzes the project as the union of every artifact, and there a module
 reads the artifact whose walk reached it first: the primary artifact when its
 walk reaches the module, otherwise the first artifact in manifest order that

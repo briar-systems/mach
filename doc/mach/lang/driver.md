@@ -74,8 +74,8 @@ ret: the project holding the closure, released with `project.dnit_project`;
 pub fun begin_build(s: *session.Session, m: *manifest.Manifest, req: *request.BuildRequest, ev: *readout.Progress) res[project.Project, outcome.Fail];
 ```
 
-begin the build the request names: a test goal loads the test root set, every
-other goal the selected artifact's
+begin the build the request names: every goal, a test goal included, loads the
+selected artifact's closure
 
 ## def FrontendPhase
 
@@ -137,7 +137,7 @@ roots: the root set the frontend loads: `project.ROOT_ARTIFACT` is the
                   selected artifact's closure, `project.ROOT_UNION` every artifact's
                   with the modules only a foreign target reaches gated out and
                   `{artifact.<id>.out}` resolving over every artifact some artifact
-                  needs, `project.ROOT_TEST` the whole project a test goal builds
+                  needs
 extra_roots: module fqns loaded beside the root set's entries, nil with count 0
 extra_root_count: how many extra roots
 phase: the last frontend phase to run
@@ -159,12 +159,6 @@ pub fun run_dep_steps_phase(p: *project.Project) err[outcome.Fail];
 
 ```mach
 pub fun run_load_phase(p: *project.Project) err[outcome.Fail];
-```
-
-## fun run_gate_pass
-
-```mach
-pub fun run_gate_pass(p: *project.Project) res[bool, outcome.Fail];
 ```
 
 ## fun refresh_frontend
@@ -205,12 +199,6 @@ pub fun build_project_sel_req(s: *session.Session, project_root: str, pick: *man
 ```
 
 the caller's request stands in for the composed one; steps still run
-
-## fun build_project_test
-
-```mach
-pub fun build_project_test(s: *session.Session, project_root: str, pick: *manifest.Selection) res[project.Project, outcome.Fail];
-```
 
 ## fun build_project_union
 

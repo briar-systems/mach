@@ -412,7 +412,8 @@ fun fold_layout_intrinsic(sc: *context.SemaContext, eid: id.ExprId, span: token.
     val is_align:  bool = comptime.is_align_of_call(sc.a, sc.source, eid);
     val is_len:    bool = comptime.is_length_of_call(sc.a, sc.source, eid);
     val is_offset: bool = comptime.is_offset_of_call(sc.a, sc.source, eid);
-    if (!is_size && !is_align && !is_len && !is_offset) { ret opt[opt[comptime.CTValue]].none{}; }
+    val is_id:     bool = comptime.is_type_id_call(sc.a, sc.source, eid);
+    if (!is_size && !is_align && !is_len && !is_offset && !is_id) { ret opt[opt[comptime.CTValue]].none{}; }
 
     val arg: id.ExprId = comptime.layout_intrinsic_type_arg(sc.a, eid);
     if (arg == id.EXPR_NIL) {
@@ -422,6 +423,8 @@ fun fold_layout_intrinsic(sc: *context.SemaContext, eid: id.ExprId, span: token.
 
     val tid: type.TypeId = intrinsic_operand_type(sc, arg, span);
     if (tid == type.TYPE_ERROR) { ret opt[opt[comptime.CTValue]].some{opt[comptime.CTValue].none{}}; }
+
+    if (is_id) { ret opt[opt[comptime.CTValue]].some{fold_type_id(sc, tid, span)}; }
 
     if (is_len) {
         val n_opt: opt[u32] = type.element_count(?sc.s.types, tid);
@@ -468,6 +471,22 @@ fun fold_layout_intrinsic(sc: *context.SemaContext, eid: id.ExprId, span: token.
     ret opt[opt[comptime.CTValue]].some{opt[comptime.CTValue].some{comptime.ct_uint(n::u64)}};
 }
 
+# `$type_id` needs no layout, and `^T` keeps its qualifier: a secret is a different type
+fun fold_type_id(sc: *context.SemaContext, tid: type.TypeId, span: token.Span) opt[comptime.CTValue] {
+    if (type.mentions_generic_param(?sc.s.types, tid)) {
+        check.report_typed(sc, span, "`$type_id` of `", tid, "` is answered per instantiation, and this position has none",
+            "`$type_id` of a generic parameter has no instance here");
+        ret opt[comptime.CTValue].none{};
+    }
+    val r: res[u64, fail.Fail] = recipe.identity(sc.s, sc.ctx.env.target_defs, tid);
+    if (sel r.err) {
+        check.report_typed(sc, span, "`$type_id` has no identity for `", tid, "`",
+            "`$type_id` has no identity for this type");
+        ret opt[comptime.CTValue].none{};
+    }
+    ret opt[comptime.CTValue].some{comptime.ct_uint(r.ok)};
+}
+
 # the member named by `$offset_of(T, m)`: a record field, or a tag case that owns a payload
 fun offset_of_member_index(sc: *context.SemaContext, c: *expr.ExprCall, owner: type.TypeId, span: token.Span, silent: bool) opt[u32] {
     if (c.args_len < 2) { ret opt[u32].none{}; }
@@ -478,7 +497,7 @@ fun offset_of_member_index(sc: *context.SemaContext, c: *expr.ExprCall, owner: t
         if (!silent) { context.report(sc, m.span, "`$offset_of` names its member by a bare identifier"); }
         ret opt[u32].none{};
     }
-    val name: intern.StrId = intern_span_or_nil(sc, m.span);
+    val name: intern.StrId = intern_span_or_nil(sc, m.data.ident.tok);
     val base: type.TypeId  = type.strip_secret(?sc.s.types, owner);
     context.record_result(sc, generics.ensure_fields(sc.s, base));
     val n: u32 = type.field_count(?sc.s.types, base);
@@ -1135,6 +1154,7 @@ fun report_unbound_ident(sc: *context.SemaContext, eid: id.ExprId) type.TypeId {
             var prefix: str = "unresolved identifier `";
             if (sc.rr.expr_resolved[eid] == resolve.SYMBOL_DEFERRED_TYPE) { prefix = "unresolved type name `"; }
             var at: token.Span = d_opt.ok.span;
+            if (d_opt.ok.kind == expr.EXPR_KIND_IDENT) { at = d_opt.ok.data.ident.tok; }
             if (d_opt.ok.kind == expr.EXPR_KIND_MEMBER) {
                 at     = d_opt.ok.data.member.name;
                 prefix = "unresolved module member `";
@@ -1336,6 +1356,7 @@ fun infer_binary(sc: *context.SemaContext, eid: id.ExprId, b: *expr.ExprBinary, 
     }
 
     if (type.is_vector(?sc.s.types, lt) || type.is_vector(?sc.s.types, rt)) {
+        if (b.op == expr.BIN_SHL || b.op == expr.BIN_SHR) { ret infer_vector_shift(sc, b, lt, rt, either_secret, span); }
         ret infer_vector_binary(sc, b.op, lt, rt, either_secret, span);
     }
 
@@ -1496,11 +1517,6 @@ fun infer_vector_binary(sc: *context.SemaContext, op: expr.BinOp, lt: type.TypeI
         ret join_secret(sc, mr.ok, either_secret);
     }
 
-    if (op == expr.BIN_SHL || op == expr.BIN_SHR) {
-        check.report_typed(sc, span, "vector shift `<<` / `>>` is not in the increment-1 operator table (`", lbase, "`); a per-lane variable shift is not 1:1 on the SSE2 baseline (AVX2-only, no 8-bit packed form), so shifts are deferred to a later increment", "vector shift is not in the increment-1 operator table");
-        ret type.TYPE_ERROR;
-    }
-
     if (op == expr.BIN_BIT_AND || op == expr.BIN_BIT_OR || op == expr.BIN_BIT_XOR) {
         if (!int_lane) {
             context.report(sc, span, "type mismatch: bitwise vector operands must have integer lanes");
@@ -1537,6 +1553,62 @@ fun infer_vector_binary(sc: *context.SemaContext, op: expr.BinOp, lt: type.TypeI
     }
 
     ret unknown_binop(sc, op);
+}
+
+# `vec << vec` and `vec >> vec` shift each lane of the left operand by the
+# lane of the count at the same position, both the same integer vector type
+# (#3740). there is no vector-by-scalar form: a uniform count is the same
+# count in every lane of a literal, which keeps the operators' shape rule and
+# is what lowers to the one-count shift. each lane follows the scalar shift,
+# so a lane count that is a constant at or above the lane width is refused
+fun infer_vector_shift(sc: *context.SemaContext, b: *expr.ExprBinary, lt: type.TypeId, rt: type.TypeId, either_secret: bool, span: token.Span) type.TypeId {
+    val lvec: bool = type.is_vector(?sc.s.types, lt);
+    val rvec: bool = type.is_vector(?sc.s.types, rt);
+    if (!lvec || !rvec) {
+        var vty: type.TypeId = type.strip_secret(?sc.s.types, lt);
+        if (!lvec) { vty = type.strip_secret(?sc.s.types, rt); }
+        check.report_typed(sc, span, "a vector shift count is a vector of the shifted type, never a scalar: write `", vty, "{c, c, ...}` with the count in every lane for a uniform shift", "a vector shift count is a vector of the shifted type, never a scalar");
+        ret type.TYPE_ERROR;
+    }
+    val lbase: type.TypeId = type.strip_secret(?sc.s.types, lt);
+    val rbase: type.TypeId = type.strip_secret(?sc.s.types, rt);
+    if (lbase != rbase) {
+        type_mismatch(sc, span, lt, rt);
+        ret type.TYPE_ERROR;
+    }
+    val lane: type.TypeId = prim_or_error(sc, type.vector_element(?sc.s.types, lbase));
+    if (lane == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+    if (!is_integer(sc, lane)) {
+        check.report_typed(sc, span, "`", lbase, "` cannot be shifted: `<<` and `>>` apply to integer lanes", "vector shift needs integer lanes");
+        ret type.TYPE_ERROR;
+    }
+    if (!check_lane_counts(sc, span, lane, b.rhs)) { ret type.TYPE_ERROR; }
+    gate_ct_always(sc, ct.CT_OP_VAR_SHIFT, either_secret, span);
+    ret join_secret(sc, lbase, either_secret);
+}
+
+# every lane of a literal count is held to the scalar shift's constant rule
+fun check_lane_counts(sc: *context.SemaContext, span: token.Span, lane: type.TypeId, count: id.ExprId) bool {
+    val ce: res[expr.Expr, fail.Fail] = context.expression(sc, count);
+    if (sel ce.err) { ret true; }
+    var start: u32 = 0;
+    var len:   u32 = 0;
+    if (ce.ok.kind == expr.EXPR_KIND_VECTOR_LIT) {
+        start = ce.ok.data.vector_lit.elems_start;
+        len   = ce.ok.data.vector_lit.elems_len;
+    }
+    or (ce.ok.kind == expr.EXPR_KIND_STRUCT_LIT) {
+        start = ce.ok.data.struct_lit.elems_start;
+        len   = ce.ok.data.struct_lit.elems_len;
+    }
+    var i: u32 = 0;
+    for (i < len) {
+        val ix: u32 = start + i;
+        if (ix::usize >= sc.a.expr_id_len)                               { ret true; }
+        if (!check.check_shift_count(sc, span, lane, sc.a.expr_ids[ix])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 # a binary operator no arm of the vector dispatch names: a defect, since the
@@ -1691,9 +1763,18 @@ fun is_assignable_place(sc: *context.SemaContext, eid: id.ExprId, ty: type.TypeI
 }
 
 fun is_assignable_place_base(sc: *context.SemaContext, eid: id.ExprId) bool {
+    # a range is a value, not a view: writing into it writes nothing
+    if (is_range_expr(sc, eid)) { ret false; }
     val ty: type.TypeId = target_expr_type(sc, eid);
     if (is_pointer_like(sc, type.strip_secret(?sc.s.types, ty))) { ret true; }
     ret is_assignable_place(sc, eid, ty);
+}
+
+fun is_range_expr(sc: *context.SemaContext, eid: id.ExprId) bool {
+    val e_opt: res[expr.Expr, fail.Fail] = context.expression(sc, eid);
+    if (sel e_opt.err) { ret false; }
+    var e: expr.Expr = e_opt.ok;
+    ret e.kind == expr.EXPR_KIND_INDEX && expr.is_range(?e.data.index);
 }
 
 fun check_assign_mutable(sc: *context.SemaContext, eid: id.ExprId, span: token.Span) {
@@ -1819,8 +1900,8 @@ fun expr_names_readonly_storage(sc: *context.SemaContext, eid: id.ExprId) bool {
             val q_opt: opt[*expr.Expr] = ast.get_expr(a, a.expr_ids[dec.args_start + q]);
             if (sel q_opt.some) {
                 val qa: *expr.Expr = q_opt.some;
-                if (qa.kind == expr.EXPR_KIND_LIT_STR && qa.span.len >= 2::usize
-                    && str_region_equals(src, qa.span.offset + 1::usize, qa.span.len - 2::usize, "readonly")) {
+                if (qa.kind == expr.EXPR_KIND_LIT_STR && qa.data.lit_str.tok.len >= 2::usize
+                    && str_region_equals(src, qa.data.lit_str.tok.offset + 1::usize, qa.data.lit_str.tok.len - 2::usize, "readonly")) {
                     ret true;
                 }
             }
@@ -1971,12 +2052,13 @@ fun address_operand_rvalue(sc: *context.SemaContext, eid: id.ExprId) str {
     var e_value: expr.Expr     = e_opt.ok;
     val e:       *expr.Expr    = ?e_value;
     val k:       expr.ExprKind = ast.expr_place_kind(e);
-    if (k == expr.EXPR_KIND_IDENT || k == expr.EXPR_KIND_UNARY) { ret nil; }
-    if (e.kind == expr.EXPR_KIND_GENERIC_INSTANCE)              { ret nil; }
-    if (k == expr.EXPR_KIND_MEMBER)                             { ret address_base_rvalue(sc, e.data.member.object, "a field of "); }
-    if (k == expr.EXPR_KIND_PROJECT)                            { ret address_base_rvalue(sc, e.data.project.object, "a projection of "); }
-    if (k == expr.EXPR_KIND_INDEX)                              { ret address_base_rvalue(sc, e.data.index.object, "an element of "); }
-    if (k == expr.EXPR_KIND_CALL)                               { ret "a call result"; }
+    if (k == expr.EXPR_KIND_IDENT || k == expr.EXPR_KIND_UNARY)    { ret nil; }
+    if (e.kind == expr.EXPR_KIND_GENERIC_INSTANCE)                 { ret nil; }
+    if (k == expr.EXPR_KIND_MEMBER)                                { ret address_base_rvalue(sc, e.data.member.object, "a field of "); }
+    if (k == expr.EXPR_KIND_PROJECT)                               { ret address_base_rvalue(sc, e.data.project.object, "a projection of "); }
+    if (k == expr.EXPR_KIND_INDEX && expr.is_range(?e.data.index)) { ret "a range"; }
+    if (k == expr.EXPR_KIND_INDEX)                                 { ret address_base_rvalue(sc, e.data.index.object, "an element of "); }
+    if (k == expr.EXPR_KIND_CALL)                                  { ret "a call result"; }
     val ek: expr.ExprKind = e.kind;
     if (ek == expr.EXPR_KIND_LIT_INT || ek == expr.EXPR_KIND_LIT_FLOAT || ek == expr.EXPR_KIND_LIT_CHAR
         || ek == expr.EXPR_KIND_LIT_STR || ek == expr.EXPR_KIND_LIT_NIL) { ret "a literal"; }
@@ -2171,7 +2253,7 @@ fun infer_comptime_intrinsic(sc: *context.SemaContext, c: *expr.ExprCall, span: 
     val ce:       *expr.Expr = ?ce_value;
     if (ce.kind != expr.EXPR_KIND_COMPTIME_IDENT) { ret type.TYPE_NIL; }
 
-    val name: intern.StrId = comptime_ident_name(sc, ce.span);
+    val name: intern.StrId = comptime_ident_name(sc, ce.data.comptime_ident.tok);
     if (name == intern.STR_NIL) { ret type.TYPE_NIL; }
 
     if (name == interned(sc, "type_of")) {
@@ -2215,13 +2297,15 @@ fun infer_comptime_intrinsic(sc: *context.SemaContext, c: *expr.ExprCall, span: 
     val is_align:  bool = name == interned(sc, "align_of");
     val is_offset: bool = name == interned(sc, "offset_of");
     val is_len:    bool = name == interned(sc, "length_of");
-    if (!is_size && !is_align && !is_offset && !is_len) { ret type.TYPE_NIL; }
+    val is_id:     bool = name == interned(sc, "type_id");
+    if (!is_size && !is_align && !is_offset && !is_len && !is_id) { ret type.TYPE_NIL; }
 
     var need: u32 = 1;
     if (is_offset) { need = 2; }
     if (c.args_len != need) {
         var iname: str = "$size_of: expected ";
         if (is_align)  { iname = "$align_of: expected "; }
+        if (is_id)     { iname = "$type_id: expected "; }
         if (is_offset) { iname = "$offset_of: expected "; }
         if (is_len)    { iname = "$length_of: expected "; }
         context.report_numbered(sc, span, iname, need::usize, " argument(s)", "comptime intrinsic: wrong number of arguments");
@@ -2665,6 +2749,7 @@ fun infer_generic_instance(sc: *context.SemaContext, c: *expr.ExprCall, span: to
 fun infer_index(sc: *context.SemaContext, ix: *expr.ExprIndex, span: token.Span) type.TypeId {
     val ot: type.TypeId = infer_expr(sc, ix.object);
     val it: type.TypeId = infer_expr(sc, ix.index);
+    if (expr.is_range(ix))                              { ret infer_range(sc, ix, ot, it, span); }
     if (ot == type.TYPE_ERROR || it == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
 
     if (!check.check_const_index(sc, ot, ix.index, span)) { ret type.TYPE_ERROR; }
@@ -2676,6 +2761,49 @@ fun infer_index(sc: *context.SemaContext, ix: *expr.ExprIndex, span: token.Span)
     val r: opt[type.TypeId] = check.check_index(sc, ot, it, span);
     if (!sel r.some) { ret type.TYPE_ERROR; }
     ret r.some;
+}
+
+# `x[start, count]`: `count` lanes of a vector as a vector of that width, or
+# `count` elements of an array or through a pointer as a `[count]T` value
+fun infer_range(sc: *context.SemaContext, ix: *expr.ExprIndex, ot: type.TypeId, it: type.TypeId, span: token.Span) type.TypeId {
+    val ct: type.TypeId = infer_expr(sc, ix.count);
+    if (ot == type.TYPE_ERROR || it == type.TYPE_ERROR || ct == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+
+    val count_opt: opt[u32] = check.check_range_count(sc, ix.count, span);
+    if (!sel count_opt.some) { ret type.TYPE_ERROR; }
+    val count: u32 = count_opt.some;
+
+    if (!check.check_const_range(sc, ot, ix.index, count, span)) { ret type.TYPE_ERROR; }
+
+    if (type.is_vector(?sc.s.types, ot)) {
+        val start: opt[comptime.CTValue] = check.const_index_value(sc, ix.index);
+        if (!sel start.some) {
+            context.report(sc, span, "dynamic lane index not supported: a vector range's start must be a comptime constant");
+            ret type.TYPE_ERROR;
+        }
+        if (count < 2) {
+            context.report_note(sc, span, "a vector range needs at least 2 lanes",
+                "a single lane is the lane itself: write `v[i]`");
+            ret type.TYPE_ERROR;
+        }
+        val lane_kind: type.TypeKind               = type.vector_element(?sc.s.types, ot);
+        val vr:        res[type.TypeId, fail.Fail] = type.intern_vector(?sc.s.types, lane_kind, count);
+        if (sel vr.err) {
+            fail.internal(?sc.status, fail.describe(vr.err));
+            ret type.TYPE_ERROR;
+        }
+        ret join_secret(sc, vr.ok, type.is_secret(?sc.s.types, ot));
+    }
+
+    val elem: opt[type.TypeId] = check.check_index(sc, ot, it, span);
+    if (!sel elem.some)               { ret type.TYPE_ERROR; }
+    if (elem.some == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+    val ar: res[type.TypeId, fail.Fail] = type.intern_array(?sc.s.types, elem.some, count);
+    if (sel ar.err) {
+        fail.internal(?sc.status, fail.describe(ar.err));
+        ret type.TYPE_ERROR;
+    }
+    ret ar.ok;
 }
 
 fun infer_vector_lane(sc: *context.SemaContext, ix: *expr.ExprIndex, ot: type.TypeId, span: token.Span) type.TypeId {
@@ -3036,7 +3164,7 @@ fun infer_vector_lit(sc: *context.SemaContext, vl: *expr.ExprVectorLit, span: to
         val symbol: opt[*resolve.Symbol] = context.symbol_for_expr(sc, ee);
         if (sel parsed.some) {
             if (parsed.some.kind == expr.EXPR_KIND_IDENT && !sel symbol.some) {
-                val name: token.Span = parsed.some.span;
+                val name: token.Span = parsed.some.data.ident.tok;
                 check.report_named(sc, name, "unresolved identifier `", intern_span_or_nil(sc, name), "`", "unresolved vector element");
                 i = i + 1;
                 cnt;

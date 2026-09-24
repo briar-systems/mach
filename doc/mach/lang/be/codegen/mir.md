@@ -914,7 +914,8 @@ pub val MIRF_FIXED_PAIR: MirFlags = 0x02000000
 ```
 
 the instruction reads and writes the target's fixed accumulator pair
-(div_reg, div_hi_reg), which the allocator reserves for the function
+(div_reg, div_hi_reg), which the allocator closes at the instruction to any
+value live across it or read by it, and after it until the pair is read back
 
 ## def MirCtClass
 
@@ -994,8 +995,9 @@ pub val BANK_NONE:    OperandBank = 4
 pub fun validate_bank_pattern(pattern: str) err[fail.Fail];
 ```
 
-g/f require a bank, v is gp scalar or fp vector, a is typed transport, n forbids registers
-a final star repeats the preceding operand contract
+g/f require a bank, v is gp scalar or fp vector, a is typed transport, n forbids registers,
+c is a shift count: gp beside a scalar, and beside a vector either one uniform gp count
+or the vector's own lane counts (#3740). a final star repeats the preceding operand contract
 
 ## fun check_operand_banks
 
@@ -1486,7 +1488,9 @@ pub rec MirDbgBinding;
 ```
 
 lane: which lane of a value wider than one register `vreg` holds, of `lanes`
-lanes each `lane_bytes` wide; `lanes` is 0 when `vreg` holds the whole value
+lanes each `lane_bytes` wide; `lanes` is 0 when `vreg` holds the whole value.
+at_end: the binding is published at the end of the instruction that carries
+it, where that instruction's def exists, instead of at its start
 
 ## val DBG_LANES_MAX
 
@@ -1836,6 +1840,14 @@ pub fun push_function(mm: *MirModule, mf: MirFunction) err[fail.Fail];
 pub fun instr_attach_dbg(a: *A.Allocator, mi: *MirInstr, iid: u32, vreg: u32) err[fail.Fail];
 ```
 
+## fun instr_attach_dbg_end
+
+```mach
+pub fun instr_attach_dbg_end(a: *A.Allocator, mi: *MirInstr, iid: u32, vreg: u32) err[fail.Fail];
+```
+
+the binding is published where `mi`'s def exists: at its end
+
 ## fun instr_pass_dbg
 
 ```mach
@@ -1843,7 +1855,25 @@ pub fun instr_pass_dbg(a: *A.Allocator, from: *MirInstr, to: *MirInstr) err[fail
 ```
 
 the bindings of `from` move ahead of those of `to`: a deleted instruction's
-program point is the instruction that follows it
+program point is the instruction that follows it, so its end is `to`'s start
+
+## fun instr_spread_dbg
+
+```mach
+pub fun instr_spread_dbg(a: *A.Allocator, from: *MirInstr, first: *MirInstr, last: *MirInstr) err[fail.Fail];
+```
+
+`from` is replaced by the pieces `first` through `last`: its start is the
+first piece's start and its end the last piece's end
+
+## fun instr_move_end_dbg
+
+```mach
+pub fun instr_move_end_dbg(a: *A.Allocator, from: *MirInstr, to: *MirInstr) err[fail.Fail];
+```
+
+the value `from` defines reaches its home only at the end of `to`, a later
+instruction that finishes placing it
 
 ## fun dnit_module
 

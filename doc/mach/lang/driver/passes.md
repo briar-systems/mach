@@ -66,100 +66,11 @@ pub fun q_sema_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags
 pub fun q_sema_finalize(value: *u8, value_len: u32, alloc: *A.Allocator);
 ```
 
-## val GATE_TUPLE_NONE
-
-```mach
-pub val GATE_TUPLE_NONE: u32 = 0xFFFFFFFF
-```
-
-## fun gate_key
-
-```mach
-pub fun gate_key(stable: session.StableModuleId, ti: u32) u64;
-```
-
-a gate product's key: the module's stable id, with the union tuple counted from one above it
-
-## fun gate_key_tuple
-
-```mach
-pub fun gate_key_tuple(key: u64) u32;
-```
-
 ## fun read_typed_surface
 
 ```mach
 pub fun read_typed_surface(p: *project.Project, mid: session.ModuleId, a: *A.Allocator) res[scx.ModuleSema, fail.Fail];
 ```
-
-## fun decided_gate_count
-
-```mach
-pub fun decided_gate_count(p: *project.Project) u32;
-```
-
-## fun run_gate_pass
-
-```mach
-pub fun run_gate_pass(p: *project.Project) res[bool, fail.Fail];
-```
-
-## fun q_gates_compute
-
-```mach
-pub fun q_gates_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
-```
-
-## fun q_gate_surface_compute
-
-```mach
-pub fun q_gate_surface_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
-```
-
-## fun enter_frame
-
-```mach
-pub fun enter_frame(p: *project.Project, mid: session.ModuleId, ti: u32) err[fail.Fail];
-```
-
-bring a module into a target's frame, preparing it first
-
-## fun view_key
-
-```mach
-pub fun view_key(m: *project.ModuleEntry) u64;
-```
-
-## fun settled_view_key
-
-```mach
-pub fun settled_view_key(db: *query.QueryDb, stable: session.StableModuleId) u64;
-```
-
-the key a module's resolve and export products hold under the view its last build settled on
-
-## fun module_gate_key
-
-```mach
-pub fun module_gate_key(m: *project.ModuleEntry, ti: u32) u64;
-```
-
-## fun assign_load_views
-
-```mach
-pub fun assign_load_views(p: *project.Project) err[fail.Fail];
-```
-
-keys each module's products by the view the load walk left it in this round, dependencies first
-
-## fun settle_load_views
-
-```mach
-pub fun settle_load_views(p: *project.Project) err[fail.Fail];
-```
-
-the gate fixpoint is over: products keyed by module alone read each module's final view, and the views
-no round reached this build are dropped with their products
 
 ## fun retain_modules
 
@@ -170,22 +81,6 @@ pub fun retain_modules(p: *project.Project, rejected: bool) err[fail.Fail];
 every module the load reached, gated out or not, is held under the session's active retainer: the
 project borrows each one's parse. a load closes its retainer's round unless a caller keeps the round
 open across builds, and then whatever no retainer holds is retired
-
-## fun view_slot_count
-
-```mach
-pub fun view_slot_count(p: *project.Project, m: *project.ModuleEntry) u32;
-```
-
-the live load views a module holds across builds
-
-## fun reset_resolve_round
-
-```mach
-pub fun reset_resolve_round(p: *project.Project);
-```
-
-a module's per-round state resets between rounds, while its products stay under the views that made them
 
 ## fun q_typed_exports_compute
 

@@ -97,7 +97,7 @@ pub fun old() i32 { ret replacement(); }
 
 pub fun replacement() i32 { ret 1; }
 
-# file: src/root.mach
+# file: src/main.mach
 use example.legacy;
 
 fun caller() i32 { ret legacy.old(); }      # warning: `old` is deprecated: use replacement
@@ -117,7 +117,7 @@ pub tag Reply: u8 {
     fresh: i64;
 }
 
-# file: src/root.mach
+# file: src/main.mach
 use example.reply;
 
 fun read(r: reply.Reply) i64 {

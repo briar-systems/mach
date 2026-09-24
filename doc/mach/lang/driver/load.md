@@ -107,18 +107,6 @@ pub fun q_parse_finalize(value: *u8, value_len: u32, alloc: *A.Allocator);
 pub fun q_exports_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
 ```
 
-## fun resume_deferred_gates
-
-```mach
-pub fun resume_deferred_gates(p: *project.Project) res[bool, fail.Fail];
-```
-
-## fun deferred_gate_count
-
-```mach
-pub fun deferred_gate_count(p: *project.Project) u32;
-```
-
 ## rec UseTarget
 
 ```mach
@@ -130,14 +118,6 @@ pub rec UseTarget;
 ```mach
 pub fun check_gated_const_imports(p: *project.Project) err[fail.Fail];
 ```
-
-## fun remerge_tuple_pub_consts
-
-```mach
-pub fun remerge_tuple_pub_consts(p: *project.Project, mid: session.ModuleId, ti: u32) res[u32, fail.Fail];
-```
-
-the imported public constants one union tuple round binds, and how many it bound
 
 ## fun eval_for_load
 

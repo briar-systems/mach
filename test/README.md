@@ -29,7 +29,7 @@ test/
 bash test/run.sh                          # every golden, plus the differential this host can execute
 bash test/run.sh --target x86_64-linux    # one target (repeatable)
 bash test/run.sh --case bits/logic_u32    # one case (repeatable)
-bash test/run.sh --qemu                   # also execute riscv64-linux, riscv64zkt-linux and riscv32 under qemu-user
+bash test/run.sh --qemu                   # also execute aarch64-linux, riscv64-linux, riscv64zkt-linux and riscv32 under qemu-user
 bash test/run.sh --dwarf                  # also build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
 bash test/run.sh --link [--qemu]          # the link cases instead of the corpus (--case <name> selects one)
 bash test/run.sh --incremental            # warm rebuilds of the compiler and a manifest fixture match clean builds
@@ -58,15 +58,19 @@ decoder failed first) is counted in the summary as `differential not run`, and
 no such case counts as a pass. The C reference answer is rebuilt whenever
 `ref/<group>/<case>.c` or `lib/corpus.h` is newer than it.
 
-`--qemu` adds the targets no host runs natively: `riscv64-linux` under
-`qemu-riscv64` and the freestanding `riscv32` under `qemu-riscv32`. A riscv32
+`--qemu` adds the targets this host does not run natively: `aarch64-linux` under
+`qemu-aarch64` on a host that is not aarch64 linux, `riscv64-linux` under
+`qemu-riscv64` and the freestanding `riscv32` under `qemu-riscv32`. The C
+reference is the host's own build, since its answer does not depend on the
+target, so no cross C compiler is needed. A riscv32
 case's own artifact is a static archive, so the driver also builds a run bin per
 case whose entry is `lib/start_riscv32.mach` (reads `argc` at `_start`, prints the
 checksum through raw linux syscalls) and re-lays the freestanding image with
 `lib/elf_loadable.py` into one `PT_LOAD` at file offset 0, which is the only shape
 qemu-user's loader maps. Every byte the program sees is the linker's. A missing
 emulator is announced and its column runs golden only. qemu is compute evidence,
-never ABI evidence.
+never ABI evidence: CI runs aarch64-linux on a native runner, and the link cases
+emulate only riscv64-linux, the one leg no native runner proves.
 
 A case that admits a secret multiply (`ct/mul_secret`, `ct/mul_secret128`) links
 a program that turns PSTATE.DIT on at start and, on an aarch64 host whose
@@ -158,8 +162,8 @@ Each block becomes its own project with `[project] id = "example"`, one target
 (the host, or the one `--target` names), one debug profile and the checkout's `dep/std`. A block with a main is
 a `bin` artifact, any other block a `static` one, so an unused private function
 is still checked. A block that shows several files marks each with a line
-`# file: src/<path>.mach`, and the file named `root.mach` is the entry, or the last
-file when none is. Lines before the first marker belong to `root.mach`.
+`# file: src/<path>.mach`, and the file named `main.mach` is the entry, or the last
+file when none is. Lines before the first marker belong to `main.mach`.
 
 A fragment is a statement of fact, so annotate a block only when that is what it
 is. An example that stopped compiling is a doc bug to fix, not a block to mark.
@@ -195,12 +199,12 @@ here.
   the program and records its stdout, `built` records that an artifact was
   emitted, `build-fails` records the compiler's `error:` lines.
 - `goal: test` makes the compile step `mach test` with the same target, profile
-  and flags, so every module of the project is loaded (an orphan module nothing
-  imports is reached only this way) and the collected tests run as part of that
-  step, through the leg's engine when it is qemu (`--runner`). A failing test
-  is a failed compile step with the readout in the cell's log. The artifact is
-  the test dispatcher, and `exec` runs it once per collected test in collection
-  order (`<exe> <index>`) and records the concatenated stdout; `built`,
+  and flags, so the tests in the artifact's closure (the modules a build of it
+  loads) are collected and run as part of that step, through the leg's engine
+  when it is qemu (`--runner`). A failing test is a failed compile step with
+  the readout in the cell's log. The artifact is the test dispatcher, and
+  `exec` runs it once per collected test in collection order (`<exe> <index>`)
+  and records the concatenated stdout; `built`,
   `build-fails` and a `check.sh` apply to the dispatcher as they would to a
   program.
 - the expected output, the most specific of `expect.<target>.<profile>.txt`,

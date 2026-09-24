@@ -27,6 +27,7 @@ use mach.lang.ct;
 use mach.lang.diagnostic;
 use mach.lang.fail;
 use mach.lang.fe.ast;
+use mach.lang.fe.ast.id;
 use mach.lang.fe.comptime;
 use mach.lang.fe.resolve;
 use mach.lang.fe.sema;
@@ -53,9 +54,7 @@ pub def RootSet: u8;
 
 pub val ROOT_ARTIFACT: RootSet = 0;
 
-pub val ROOT_TEST: RootSet = 1;
-
-pub val ROOT_UNION: RootSet = 2;
+pub val ROOT_UNION: RootSet = 1;
 
 pub def BuildMode: u8;
 
@@ -160,23 +159,35 @@ pub rec PubConst {
     gated: bool;
 }
 
+# a module name or constant a `use` binds
+# ---
+# name:   the name it binds
+# module: the module it names, or whose constant it binds
+# span:   the imported path, for a constant a union build refuses
+# decl:   the `use` that binds it, so a walk reads the one the arm its gate selects declares
 pub rec ModRef {
     name:   intern.StrId;
     module: session.ModuleId;
     span:   token.Span;
+    decl:   id.DeclId;
 }
 
-pub rec TupleGateResult {
-    states:             *comptime.GateState;
-    state_count:        u32;
-    entries:            *comptime.NamedConst;
-    entries_len:        u32;
-    entries_cap:        u32;
-    deferred:           *intern.StrId;
-    deferred_len:       u32;
-    deferred_cap:       u32;
-    decided:            *bool;
-    merged_const_count: u32;
+# the frame the load walk reads and binds in: the build target's, or a union tuple's by index
+pub val FRAME_BUILD: u32 = 0xFFFFFFFF;
+
+# one declaration or gate the load is deciding, so a demand that reaches it again is a cycle
+# ---
+# module: the module it is in
+# frame:  the frame it is decided in
+# decl:   the `val` being walked, or DECL_NIL for a gate
+# cond:   the gate's condition, or EXPR_NIL for a `val`
+# name:   the `val`'s name
+pub rec LoadDemand {
+    module: session.ModuleId;
+    frame:  u32;
+    decl:   id.DeclId;
+    cond:   id.ExprId;
+    name:   intern.StrId;
 }
 
 # an artifact entry the union walk loads: the entry module and the artifact it is of
@@ -191,7 +202,6 @@ pub rec ModuleEntry {
     a:                  *ast.Ast;
     parse_status:       fail.PhaseStatus;
     load_status:        fail.PhaseStatus;
-    gate_status:        fail.PhaseStatus;
     ctx:                comptime.ComptimeCtx;
     pub_consts:         *PubConst;
     pub_const_count:    u32;
@@ -208,21 +218,14 @@ pub rec ModuleEntry {
     resolve_result:     *resolve.ResolveResult;
     resolved:           bool;
     resolve_elapsed:    cdur.Duration;
-    # the load view the current round keys this module's resolve and gate products by
-    view_slot: u32;
-    # the gates this module's gate pass decided under the current target, so a recompute starts where load and resolve left them
-    # no product output may depend on it: a resolve hit flags decisions a compute leaves unflagged (see fold_load_view)
-    gate_decided: *bool;
-    # the union tuple whose frame the comptime context holds, or none for the build target's
-    frame_tuple: u32;
-    # the public surface each importer reads, decoded once per gate view and once per typed-exports revision (#3472)
-    gate_surface:      *sema.ModuleSema;
-    gate_surface_key:  u64;
-    gate_surface_rev:  query.Revision;
+    # the frame the load walk is in for this module: FRAME_BUILD, whose context every later
+    # phase reads, or a union tuple, whose context in tuple_frames only the load reads
+    frame:             u32;
+    tuple_frames:      *comptime.ComptimeCtx;
+    tuple_frame_count: u32;
+    # the public surface each importer reads, decoded once per typed-exports revision (#3472)
     typed_surface:     *sema.ModuleSema;
     typed_surface_rev: query.Revision;
-    tuple_gates:       *TupleGateResult;
-    tuple_gate_count:  u32;
     tuple_reachable:   *bool;
     tuple_reach_count: u32;
     sema_result:       *sema.SemaResult;
@@ -239,9 +242,8 @@ pub rec ModuleEntry {
     # gates a foreign module: the cell's artifact, or under a union walk the primary's when
     # the primary's walk reaches it, otherwise the first artifact's in union order; a module
     # first reached behind a gate decided later is its importer's artifact's
-    artifact:        intern.StrId;
-    load_outcome:    comptime.GateOutcome;
-    load_walk_count: u32;
+    artifact:     intern.StrId;
+    load_outcome: comptime.GateOutcome;
 }
 
 pub def LoadStatus: u8;
@@ -341,22 +343,17 @@ pub rec Project {
 
     events: *readout.Progress;
 
-    loading_orphans: bool;
     loading_foreign: bool;
     # the artifact a module registered now is attributed to: the cell's artifact, or the
     # artifact whose entry the union walk is under
     loading_artifact:   intern.StrId;
     union_tuple_filter: *bool;
-    gate_tuple_index:   u32;
     in_gated_decl_walk: bool;
-    gate_terminal:      bool;
-    # the gate products this project computed rather than reused, by key
-    gate_computed: vector.Vector[u64];
-    # the load views are final, so products keyed by module alone read them
-    views_settled: bool;
-    # the gate round the next load views are assigned for, and the view keys this build reached
-    view_round:    u32;
-    views_reached: map.Map[u64, bool];
+    # the gates and constants the load is deciding, innermost last
+    demands: vector.Vector[LoadDemand];
+    # a module reached under a new union tuple after it loaded was walked again, which can
+    # give it dependencies the topo placed after it
+    topo_dirty: bool;
     # how many products of each query kind this project computed rather than reused
     computes: [QUERY_KIND_SLOTS]u32;
 }
@@ -583,15 +580,12 @@ pub fun dnit_project(p: *Project) {
     release_cache_operation(p);
     release_all_staged(p);
     vector.dnit[CacheKey](?p.cache_keys);
-    vector.dnit[u64](?p.gate_computed);
-    map.dnit[u64, bool](?p.views_reached);
+    vector.dnit[LoadDemand](?p.demands);
     var i: u32 = 0;
     for (i < module_count(p)) {
         val m: *ModuleEntry = module_at(p, i);
-        if (m.gate_decided != nil && m.ctx.gate_count > 0) {
-            A.deallocate[bool](p.alloc, m.gate_decided, m.ctx.gate_count::usize);
-        }
         comptime.dnit(?m.ctx);
+        drop_tuple_frames(p, m);
         if (m.pub_consts != nil && m.pub_const_cap > 0) {
             A.deallocate[PubConst](p.alloc, m.pub_consts, m.pub_const_cap::usize);
         }
@@ -604,28 +598,7 @@ pub fun dnit_project(p: *Project) {
         if (m.deps != nil && m.dep_cap > 0) {
             A.deallocate[session.ModuleId](p.alloc, m.deps, m.dep_cap::usize);
         }
-        drop_surface(p.alloc, ?m.gate_surface);
         drop_surface(p.alloc, ?m.typed_surface);
-        if (m.tuple_gates != nil) {
-            var ti: u32 = 0;
-            for (ti < m.tuple_gate_count) {
-                val tg: *TupleGateResult = ?m.tuple_gates[ti];
-                if (tg.states != nil && tg.state_count > 0) {
-                    A.deallocate[comptime.GateState](p.alloc, tg.states, tg.state_count::usize);
-                }
-                if (tg.entries != nil && tg.entries_cap > 0) {
-                    A.deallocate[comptime.NamedConst](p.alloc, tg.entries, tg.entries_cap::usize);
-                }
-                if (tg.deferred != nil && tg.deferred_cap > 0) {
-                    A.deallocate[intern.StrId](p.alloc, tg.deferred, tg.deferred_cap::usize);
-                }
-                if (tg.decided != nil && tg.state_count > 0) {
-                    A.deallocate[bool](p.alloc, tg.decided, tg.state_count::usize);
-                }
-                ti = ti + 1;
-            }
-            A.deallocate[TupleGateResult](p.alloc, m.tuple_gates, m.tuple_gate_count::usize);
-        }
         if (m.tuple_reachable != nil && m.tuple_reach_count > 0) {
             A.deallocate[bool](p.alloc, m.tuple_reachable, m.tuple_reach_count::usize);
         }
@@ -709,10 +682,8 @@ pub fun init_project(p: *Project, s: *session.Session) {
     p.cache_misses                  = 0;
     p.cache_dir                     = nil;
     p.cache_keys                    = vector.init[CacheKey](s.alloc);
-    p.gate_computed                 = vector.init[u64](s.alloc);
-    p.views_settled                 = false;
-    p.view_round                    = 0;
-    p.views_reached                 = map.init[u64, bool](s.alloc);
+    p.demands                       = vector.init[LoadDemand](s.alloc);
+    p.topo_dirty                    = false;
     var ki: u32 = 0;
     for (ki < QUERY_KIND_SLOTS) {
         p.computes[ki] = 0;
@@ -749,13 +720,23 @@ pub fun init_project(p: *Project, s: *session.Session) {
     p.emit_len                 = 0;
     p.roots                    = ROOT_ARTIFACT;
     p.events                   = nil;
-    p.loading_orphans          = false;
     p.loading_foreign          = false;
     p.loading_artifact         = intern.STR_NIL;
     p.union_tuple_filter       = nil;
-    p.gate_tuple_index         = 0xFFFFFFFF;
     p.in_gated_decl_walk       = false;
-    p.gate_terminal            = false;
+}
+
+# release a module's union tuple frames, which only the load reads
+pub fun drop_tuple_frames(p: *Project, m: *ModuleEntry) {
+    if (m.tuple_frames == nil) { ret; }
+    var ti: u32 = 0;
+    for (ti < m.tuple_frame_count) {
+        comptime.dnit(?m.tuple_frames[ti]);
+        ti = ti + 1;
+    }
+    A.deallocate[comptime.ComptimeCtx](p.alloc, m.tuple_frames, m.tuple_frame_count::usize);
+    m.tuple_frames      = nil;
+    m.tuple_frame_count = 0;
 }
 
 fun deallocate_config(c: *ProjectConfig, alloc: *A.Allocator) {

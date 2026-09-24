@@ -3,12 +3,22 @@
 ## fun vec_op_of
 
 ```mach
-pub fun vec_op_of(k: instruction.InstrKind) opt[isa.VecOp];
+pub fun vec_op_of(k: instruction.InstrKind, uniform_count: bool) opt[isa.VecOp];
 ```
 
 the target-layer vector operation an instruction kind maps to, VEC_OP_NONE
 for a kind that is not a vector operator; absent for a descriptor vector tag
-outside the catalog, which the caller refuses as undeclared and names
+outside the catalog, which the caller refuses as undeclared and names. a
+shift is keyed by its count's form as well: `uniform_count` is one scalar
+count for every lane, and otherwise the count is a vector of lane counts
+
+## fun uniform_count
+
+```mach
+pub fun uniform_count(m: *ir.Module, inst: *instruction.Instruction) bool;
+```
+
+a vector shift whose count is one scalar rather than a vector of lane counts
 
 ## rec LaneDesc
 
@@ -36,6 +46,8 @@ pub fun scalar_bits(m: *ir.Module, ty: ir_type.IrTypeId) u32;
 ```mach
 pub fun packs(tgt: *target.Target, k: instruction.InstrKind, is_float: bool, lane_bits: u32) bool;
 ```
+
+a loop's lanes carry their own values, so a shift here counts by lanes
 
 ## fun packed_lanes
 

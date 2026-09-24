@@ -1,17 +1,5 @@
 # mach.lang.driver.union
 
-## fun count_target_gated
-
-```mach
-pub fun count_target_gated(p: *project.Project) u32;
-```
-
-## fun load_all_own_src
-
-```mach
-pub fun load_all_own_src(p: *project.Project) err[fail.Fail];
-```
-
 ## fun populate_union_tuples
 
 ```mach

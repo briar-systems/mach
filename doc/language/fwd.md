@@ -46,7 +46,7 @@ pub fun answer() i64 { ret 42; }
 # file: src/lib.mach
 fwd example.alpha;          # re-exports module 'alpha'
 
-# file: src/root.mach
+# file: src/main.mach
 use std.runtime;
 use print: std.print;
 use example.lib;            # lib.mach contains `fwd example.alpha;`

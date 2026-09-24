@@ -68,6 +68,15 @@ pub val CT_KIND_CASE: CTKind = 7
 
 a tag case descriptor from `$cases(T)`: the same owner/index shape as a field descriptor
 
+## val CT_KIND_NON_INTEGER
+
+```mach
+pub val CT_KIND_NON_INTEGER: CTKind = 8
+```
+
+an integer constant whose declared type is a def chain ending outside the integers;
+data.s is the interned refusal naming the chain, and reading it fails with that refusal
+
 ## def GateState
 
 ```mach
@@ -116,58 +125,28 @@ pub val GATE_INACTIVE:          GateOutcome = 0
 pub val GATE_ACTIVE:            GateOutcome = 1
 ```
 
-## val GATE_DEFERRED
-
-```mach
-pub val GATE_DEFERRED:          GateOutcome = 2
-```
-
 ## val GATE_REJECTED
 
 ```mach
-pub val GATE_REJECTED:          GateOutcome = 3
+pub val GATE_REJECTED:          GateOutcome = 2
 ```
 
 ## val GATE_FAILED
 
 ```mach
-pub val GATE_FAILED:            GateOutcome = 4
-```
-
-## val GATE_AWAITING_LAYOUT
-
-```mach
-pub val GATE_AWAITING_LAYOUT:   GateOutcome = 5
+pub val GATE_FAILED:            GateOutcome = 3
 ```
 
 ## val GATE_AWAITING_PHASE
 
 ```mach
-pub val GATE_AWAITING_PHASE:    GateOutcome = 6
-```
-
-## val GATE_AWAITING_TYPES
-
-```mach
-pub val GATE_AWAITING_TYPES:    GateOutcome = 7
+pub val GATE_AWAITING_PHASE:    GateOutcome = 4
 ```
 
 ## val GATE_AWAITING_INSTANCE
 
 ```mach
-pub val GATE_AWAITING_INSTANCE: GateOutcome = 8
-```
-
-## rec GateSelection
-
-```mach
-pub rec GateSelection;
-```
-
-## fun gate_selection
-
-```mach
-pub fun gate_selection(outcome: GateOutcome, branch: u32) GateSelection;
+pub val GATE_AWAITING_INSTANCE: GateOutcome = 5
 ```
 
 ## rec ConstElemRef
@@ -443,7 +422,8 @@ pub fun no_capabilities() PhaseCapabilities[NoCapabilityContext];
 ## fun loading_capabilities
 
 ```mach
-pub fun loading_capabilities[T](member: fun(*T, id.ExprId) res[opt[CTValue], EvalFail]) res[PhaseCapabilities[T], fail.Fail];
+pub fun loading_capabilities[T](member: fun(*T, id.ExprId) res[opt[CTValue], EvalFail],
+cast: fun(*T, id.ExprId, CTValue) res[CTValue, EvalFail]) res[PhaseCapabilities[T], fail.Fail];
 ```
 
 ## fun resolution_capabilities
@@ -600,6 +580,12 @@ pub val EVAL_FAIL_INTERNAL:       EvalFailKind = 6
 
 ```mach
 pub val EVAL_FAIL_NEEDS_INSTANCE: EvalFailKind = 7
+```
+
+## val EVAL_FAIL_NOT_INTEGER
+
+```mach
+pub val EVAL_FAIL_NOT_INTEGER:    EvalFailKind = 8
 ```
 
 ## rec EvalFail
@@ -1140,16 +1126,10 @@ pub val GATE_PROBE_FIELD_DESCRIPTOR: GateProbe = 3
 pub val GATE_PROBE_EACH_LOOPVAR:     GateProbe = 4
 ```
 
-## val GATE_PROBE_TARGET_DEPENDENT
-
-```mach
-pub val GATE_PROBE_TARGET_DEPENDENT: GateProbe = 5
-```
-
 ## val GATE_PROBE_NODE_ACTION
 
 ```mach
-pub val GATE_PROBE_NODE_ACTION:      GateProbe = 6
+pub val GATE_PROBE_NODE_ACTION:      GateProbe = 5
 ```
 
 ## val GATE_PROBE_COUNT
@@ -1237,12 +1217,6 @@ a: *ast.Ast, source: str, obs: *T, probes: GateProbes[T], probe: GateProbe,
 branches_start: u32, branches_len: u32) res[bool, fail.Fail];
 ```
 
-## fun gate_needs_typed_selection
-
-```mach
-pub fun gate_needs_typed_selection(a: *ast.Ast, source: str, eid: id.ExprId) res[bool, fail.Fail];
-```
-
 ## def GateScope
 
 ```mach
@@ -1307,8 +1281,7 @@ source: str,
 cond: id.ExprId,
 interner: *intern.Interner,
 scope: GateScope,
-cache: bool,
-terminal: bool) res[GateVerdict, fail.Fail];
+cache: bool) res[GateVerdict, fail.Fail];
 ```
 
 ## fun gate_chain_defers
@@ -1330,6 +1303,12 @@ a: *ast.Ast, source: str, obs: *T, probes: GateProbes[T], probe: GateProbe, eid:
 
 ```mach
 pub fun is_layout_intrinsic_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
+```
+
+## fun is_type_id_call
+
+```mach
+pub fun is_type_id_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
 ```
 
 ## fun is_length_of_call
@@ -1384,6 +1363,21 @@ pub fun declared_float_width(a: *ast.Ast, source: str, t: id.TypeId) float.Float
 
 ```mach
 pub fun apply_declared_int_type(a: *ast.Ast, source: str, t: id.TypeId, value: CTValue) CTValue;
+```
+
+## fun cast_to_int
+
+```mach
+pub fun cast_to_int(value: CTValue, width: u32, signed: bool) res[CTValue, EvalFail];
+```
+
+an integer cast as a scalar cast computes it: a typed operand is read at its own width and sign,
+an untyped one as it stands, then the result is cut or extended to the destination
+
+## fun typed_int
+
+```mach
+pub fun typed_int(value: CTValue, unsigned: bool, width: u8) CTValue;
 ```
 
 ## fun float_width_unread
@@ -1460,6 +1454,39 @@ pub fun is_type_query_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
 pub fun is_type_name_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
 ```
 
+## fun is_type_question_call
+
+```mach
+pub fun is_type_question_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
+```
+
+a call that asks about a type: its layout, its identity, or a predicate over it
+
+## fun type_question
+
+```mach
+pub fun type_question(a: *ast.Ast, source: str, eid: id.ExprId) res[id.ExprId, fail.Fail];
+```
+
+the first call in an expression that asks a type question, EXPR_NIL when none does
+
+## fun type_question_message
+
+```mach
+pub fun type_question_message(interner: *intern.Interner, a: *ast.Ast, source: str, call: id.ExprId, through: str) res[intern.StrId, fail.Fail];
+```
+
+a declaring gate may not ask a type question; `through` names the constants it asks it through,
+as ` through `T` -> `S``, or is empty when the gate asks it itself
+
+## fun comptime_callee_span
+
+```mach
+pub fun comptime_callee_span(a: *ast.Ast, eid: id.ExprId) token.Span;
+```
+
+the spelling of the intrinsic a comptime call names, `$size_of` for `$size_of(T)`
+
 ## fun ct_is_negative
 
 ```mach
@@ -1481,6 +1508,12 @@ pub fun ct_int_text(v: CTValue, buf: *u8) str;
 ```
 
 the decimal text of an integer value in a wide.FORMAT_CAP buffer
+
+## fun non_integer
+
+```mach
+pub fun non_integer(message: intern.StrId) CTValue;
+```
 
 ## fun is_case_literal
 
