@@ -21,6 +21,30 @@ the function when no instruction is
 pub fun ctx_setup(ctx: *LowerCtx, tgt: *target.Target, fn: *ir.Function) err[fail.Fail];
 ```
 
+## fun count_mask_folds
+
+```mach
+pub fun count_mask_folds(ctx: *LowerCtx, iid: id.InstructionId) bool;
+```
+
+## fun count_mask_source
+
+```mach
+pub fun count_mask_source(ctx: *LowerCtx, inst: *instruction.Instruction) opt[u32];
+```
+
+the operand of a count mask that is not its mask constant, or none when
+`inst` is not a scalar `and` of a variable value with a constant
+
+## fun mark_foldable_count_masks
+
+```mach
+pub fun mark_foldable_count_masks(ctx: *LowerCtx, fn: *ir.Function);
+```
+
+a count mask folds when every use of it is a shift count that
+count_mask_use_folds admits; any other use needs the masked value itself
+
 ## fun gep_folds
 
 ```mach

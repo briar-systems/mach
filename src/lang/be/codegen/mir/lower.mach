@@ -137,6 +137,7 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, alloc: 
     ctx.slot_key_vregs    = nil;
     ctx.gep_fold          = nil;
     ctx.gep_mem           = nil;
+    ctx.count_mask_fold   = nil;
     ctx.instr_count       = fn.instr_len;
     ctx.interner          = interner;
     ctx.diags             = diags;
@@ -634,6 +635,7 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
         ret err[fail.Fail].err{fail.message("mir.lower_ir: dangling instruction id")};
     }
     val inst: *instr.Instruction = gi.some;
+    if (lctx.count_mask_folds(ctx, iid)) { ret err[fail.Fail].ok{}; }
 
     ctx.cur_loc           = inst.loc;
     ctx.cur_inline_site   = ir.instr_inline_site_of(fn, iid);
@@ -1119,7 +1121,8 @@ fun narrow_shift_value(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Inst
 # from `m`, all ones exactly when `count < W`: a logical result is masked by
 # `m`, an arithmetic count becomes `count | ~m`, all ones out of range, which
 # the machine masks to its width - 1 and the sign-extended value fills from.
-# a shift the middle end marked count-bounded is the bare machine shift (#3885)
+# a shift the middle end marked count-bounded is the bare machine shift (#3885),
+# and so is one whose count is a mask the machine applies itself (#3893)
 fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) err[fail.Fail] {
     if (inst.operand_count < 2) {
         ret err[fail.Fail].err{fail.message("mir.lower_ir: shift missing value or count operand")};
@@ -1139,8 +1142,9 @@ fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
 
     val raw_r: res[mir.MirOperand, fail.Fail] = lctx.lower_value(ctx, inst.operands[0]);
     if (sel raw_r.err) { ret err[fail.Fail].err{raw_r.err}; }
-    val raw:     mir.MirOperand                 = raw_r.ok;
-    val count_r: res[mir.MirOperand, fail.Fail] = lctx.lower_value(ctx, inst.operands[1]);
+    val raw:            mir.MirOperand                 = raw_r.ok;
+    val machine_masked: bool                           = count_is_folded_mask(ctx, inst.operands[1]);
+    val count_r:        res[mir.MirOperand, fail.Fail] = lctx.lower_value(ctx, shift_count_value(ctx, inst.operands[1]));
     if (sel count_r.err) { ret err[fail.Fail].err{count_r.err}; }
     var count: mir.MirOperand = count_r.ok;
 
@@ -1155,7 +1159,7 @@ fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
         count = mir.op_imm(bits - 1);
     }
 
-    val saturate: bool           = count.kind != mir.MIR_OP_IMM && (inst.flags & instr.INSTR_FLAG_COUNT_BOUNDED) == 0;
+    val saturate: bool           = count.kind != mir.MIR_OP_IMM && (inst.flags & instr.INSTR_FLAG_COUNT_BOUNDED) == 0 && !machine_masked;
     var mask:     mir.MirOperand = mir.op_imm(-1);
     if (saturate && !arith) {
         val mr: res[mir.MirOperand, fail.Fail] = emit_count_mask(ctx, mb, inst, count, bits, w);
@@ -1208,6 +1212,20 @@ fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
 
     # logical: the result survives only when the count was in range
     ret emit_alu3(ctx, mb, mir.MIR_AND, mir.op_vreg(dst), mir.op_vreg(shifted), mask, w);
+}
+
+fun count_is_folded_mask(ctx: *lctx.LowerCtx, v: value.Value) bool {
+    ret v.kind == value.VAL_INSTR && lctx.count_mask_folds(ctx, v.data.instr);
+}
+
+# the value a shift reads as its count: the masked operand of a count mask
+# lowering does not materialize, else the count itself
+fun shift_count_value(ctx: *lctx.LowerCtx, v: value.Value) value.Value {
+    if (!count_is_folded_mask(ctx, v)) { ret v; }
+    val mask: *instr.Instruction = ?ctx.fn.instrs[v.data.instr::u32];
+    val src:  opt[u32]           = lctx.count_mask_source(ctx, mask);
+    if (sel src.some) { ret mask.operands[src.some]; }
+    ret v;
 }
 
 # a packed vector shift reaches here only in a form the target packs, and
@@ -3122,6 +3140,214 @@ test "mach.lang.be.codegen.mir.lower.lower_shift:saturates_a_variable_count_and_
     if (mb.instrs[37].opcode != mir.MIR_MOV || mb.instrs[37].width != 4)                            { ret 45; }
     if (mb.instrs[37].operands[1].vreg.n != mb.instrs[36].operands[0].vreg.n)                       { ret 45; }
     if (mb.instrs[38].opcode != mir.MIR_SHR_S)                                                      { ret 46; }
+    ret 0;
+}
+
+# a count masked by the width it shifts at, less one, is the unmasked count to
+# a machine that reads the count modulo that width. the mask is not
+# materialized when every use of it is such a count, and the shift takes the
+# masked operand: never for another constant, a second use, a narrow shift
+# the alu widens, or a target that masks nothing (#3893)
+test "mach.lang.be.codegen.mir.lower.lower_shift:drops_a_count_mask_the_machine_applies" {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var types:  ir_type.IrTypeTable;
+    val r_init: err[fail.Fail] = ir_type.init(?types, ?alloc);
+    if (sel r_init.err) { ret 1; }
+    fin { ir_type.dnit(?types); }
+    val t64_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?types, 64);
+    if (sel t64_r.err) { ret 1; }
+    val t32_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?types, 32);
+    if (sel t32_r.err) { ret 1; }
+    val t8_r: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?types, 8);
+    if (sel t8_r.err) { ret 1; }
+    val t64: ir_type.IrTypeId = t64_r.ok;
+    val t32: ir_type.IrTypeId = t32_r.ok;
+    val t8:  ir_type.IrTypeId = t8_r.ok;
+    var tgt: target.Target;
+    tgt.model.flat_addressing        = true;
+    tgt.model.pointer_width          = 8;
+    tgt.model.gpr_width              = 8;
+    tgt.model.max_alu_width          = 8;
+    tgt.model.alu_min_width          = 4;
+    tgt.model.int_widths             = isa.INT_WIDTHS_1_2_4_8;
+    tgt.model.shift_count_reg        = 1;
+    tgt.model.shift_count_mod_widths = isa.SHIFT_MOD_4_8;
+    var convention: abi.AbiVTable = target_testing.carriers_convention();
+    tgt.abi = ?convention;
+    var parameters: [6]mir.VRegId = [6]mir.VRegId{mir.vreg_id(0), mir.vreg_id(1), mir.vreg_id(2), mir.vreg_id(3), mir.vreg_id(4), mir.vreg_id(5)};
+
+    # 0, 1: a 64-bit shift by `a & 63`, which folds
+    var mask63: [2]value.Value;
+    mask63[0] = value.param(0, t64);
+    mask63[1] = value.const_int(63, t64);
+    var shift0: [2]value.Value;
+    shift0[0] = value.param(1, t64);
+    shift0[1] = value.instr(0::id.InstructionId, t64);
+    # 2, 3: `a & 31` on a 64-bit shift is a real mask
+    var mask31: [2]value.Value;
+    mask31[0] = value.param(0, t64);
+    mask31[1] = value.const_int(31, t64);
+    var shift2: [2]value.Value;
+    shift2[0] = value.param(1, t64);
+    shift2[1] = value.instr(2::id.InstructionId, t64);
+    # 4, 5, 6: `a & 63` read by a shift and by an add
+    var shift4: [2]value.Value;
+    shift4[0] = value.param(1, t64);
+    shift4[1] = value.instr(4::id.InstructionId, t64);
+    var add4: [2]value.Value;
+    add4[0] = value.instr(4::id.InstructionId, t64);
+    add4[1] = value.param(1, t64);
+    # 7, 8: a 32-bit shift by `31 & c`, the constant first, which folds
+    var mask31n: [2]value.Value;
+    mask31n[0] = value.const_int(31, t32);
+    mask31n[1] = value.param(2, t32);
+    var shift7: [2]value.Value;
+    shift7[0] = value.param(3, t32);
+    shift7[1] = value.instr(7::id.InstructionId, t32);
+    # 9, 10: a u8 shift by `c & 7` runs at the 32-bit alu floor, which reads 5 bits
+    var mask7: [2]value.Value;
+    mask7[0] = value.param(4, t8);
+    mask7[1] = value.const_int(7, t8);
+    var shift9: [2]value.Value;
+    shift9[0] = value.param(5, t8);
+    shift9[1] = value.instr(9::id.InstructionId, t8);
+
+    var instructions: [11]instr.Instruction;
+    var ii:           u32 = 0;
+    for (ii < 11) {
+        instructions[ii].operand_count = 2;
+        instructions[ii].flags         = instr.INSTR_FLAG_COUNT_BOUNDED;
+        ii                             = ii + 1;
+    }
+    instructions[0].kind      = instr.OP_AND;
+    instructions[0].ty        = t64;
+    instructions[0].operands  = ?mask63[0];
+    instructions[1].kind      = instr.OP_SHL;
+    instructions[1].ty        = t64;
+    instructions[1].operands  = ?shift0[0];
+    instructions[2].kind      = instr.OP_AND;
+    instructions[2].ty        = t64;
+    instructions[2].operands  = ?mask31[0];
+    instructions[3].kind      = instr.OP_SHL;
+    instructions[3].ty        = t64;
+    instructions[3].operands  = ?shift2[0];
+    instructions[4].kind      = instr.OP_AND;
+    instructions[4].ty        = t64;
+    instructions[4].operands  = ?mask63[0];
+    instructions[5].kind      = instr.OP_SHR_U;
+    instructions[5].ty        = t64;
+    instructions[5].operands  = ?shift4[0];
+    instructions[6].kind      = instr.OP_ADD;
+    instructions[6].ty        = t64;
+    instructions[6].operands  = ?add4[0];
+    instructions[7].kind      = instr.OP_AND;
+    instructions[7].ty        = t32;
+    instructions[7].operands  = ?mask31n[0];
+    instructions[8].kind      = instr.OP_SHR_S;
+    instructions[8].ty        = t32;
+    instructions[8].operands  = ?shift7[0];
+    instructions[9].kind      = instr.OP_AND;
+    instructions[9].ty        = t8;
+    instructions[9].operands  = ?mask7[0];
+    instructions[10].kind     = instr.OP_SHL;
+    instructions[10].ty       = t8;
+    instructions[10].operands = ?shift9[0];
+    ii                        = 0;
+    for (ii < 11) {
+        if (instructions[ii].kind == instr.OP_AND || instructions[ii].kind == instr.OP_ADD) { instructions[ii].flags = 0; }
+        ii = ii + 1;
+    }
+
+    var fn: ir.Function;
+    fn.instrs    = ?instructions[0];
+    fn.instr_len = 11;
+    var results: [11]mir.VRegId;
+    var f:       mir.MirFunction;
+    fin { mir.dnit_function(?alloc, ?f); }
+    val rv: res[*mir.MirVReg, A.Error] = A.allocate[mir.MirVReg](?alloc, 17);
+    if (sel rv.err) { ret 1; }
+    f.vregs      = rv.ok;
+    f.vreg_cap   = 17;
+    f.vreg_count = 17;
+    var vi: u32 = 0;
+    for (vi < 17) {
+        f.vregs[vi] = mir.vreg(vi, mir.REG_CLASS_GP, false, false);
+        if (vi >= 6) { results[vi - 6] = mir.vreg_id(vi); }
+        vi = vi + 1;
+    }
+    var folds: [11]bool;
+    var ctx:   lctx.LowerCtx;
+    ctx.alloc           = ?alloc;
+    ctx.tgt             = ?tgt;
+    ctx.types           = ?types;
+    ctx.f               = ?f;
+    ctx.param_vregs     = ?parameters[0];
+    ctx.param_count     = 6;
+    ctx.instr_vregs     = ?results[0];
+    ctx.instr_count     = 11;
+    ctx.fn              = ?fn;
+    ctx.count_mask_fold = ?folds[0];
+
+    lctx.mark_foldable_count_masks(?ctx, ?fn);
+    if (!folds[0] || folds[2] || folds[4] || !folds[7] || folds[9]) { ret 2; }
+    ii = 0;
+    for (ii < 11) {
+        if (instructions[ii].kind != instr.OP_AND && folds[ii]) { ret 3; }
+        ii = ii + 1;
+    }
+
+    # the folded mask emits nothing, and the shift moves `a` itself into the
+    # fixed register: no and, no saturation
+    var mb: mir.MirBlock;
+    fin { mir.dnit_block(?alloc, ?mb); }
+    val r0: err[fail.Fail] = lower_instr(?ctx, ?fn, ?mb, 0);
+    if (sel r0.err)          { ret 4; }
+    if (mb.instr_count != 0) { ret 5; }
+    val r1: err[fail.Fail] = lower_instr(?ctx, ?fn, ?mb, 1);
+    if (sel r1.err)                                                                               { ret 6; }
+    if (mb.instr_count != 2)                                                                      { ret 7; }
+    if (mb.instrs[0].opcode != mir.MIR_MOV)                                                       { ret 8; }
+    if (mb.instrs[0].operands[1].kind != mir.MIR_OP_VREG || mb.instrs[0].operands[1].vreg.n != 0) { ret 8; }
+    if (mb.instrs[1].opcode != mir.MIR_SHL)                                                       { ret 9; }
+
+    # the 32-bit arithmetic shift reads its count's variable operand the same way
+    val r7: err[fail.Fail] = lower_instr(?ctx, ?fn, ?mb, 7);
+    if (sel r7.err)          { ret 10; }
+    if (mb.instr_count != 2) { ret 11; }
+    val r8: err[fail.Fail] = lower_instr(?ctx, ?fn, ?mb, 8);
+    if (sel r8.err)                                                                               { ret 12; }
+    if (mb.instr_count != 4)                                                                      { ret 13; }
+    if (mb.instrs[2].operands[1].kind != mir.MIR_OP_VREG || mb.instrs[2].operands[1].vreg.n != 2) { ret 13; }
+    if (mb.instrs[3].opcode != mir.MIR_SHR_S)                                                     { ret 13; }
+
+    # a mask that is not the width's is lowered, and the shift reads its result
+    val r2: err[fail.Fail] = lower_instr(?ctx, ?fn, ?mb, 2);
+    if (sel r2.err)                         { ret 14; }
+    if (mb.instr_count != 5)                { ret 15; }
+    if (mb.instrs[4].opcode != mir.MIR_AND) { ret 15; }
+    val r3: err[fail.Fail] = lower_instr(?ctx, ?fn, ?mb, 3);
+    if (sel r3.err)                                                                               { ret 16; }
+    if (mb.instr_count != 7)                                                                      { ret 17; }
+    if (mb.instrs[5].operands[1].kind != mir.MIR_OP_VREG || mb.instrs[5].operands[1].vreg.n != 8) { ret 17; }
+
+    # a target whose shift masks nothing keeps every mask
+    tgt.model.shift_count_mod_widths = isa.SHIFT_MOD_NONE;
+    lctx.mark_foldable_count_masks(?ctx, ?fn);
+    ii = 0;
+    for (ii < 11) {
+        if (folds[ii]) { ret 18; }
+        ii = ii + 1;
+    }
+    val r0n: err[fail.Fail] = lower_instr(?ctx, ?fn, ?mb, 0);
+    if (sel r0n.err)                        { ret 19; }
+    if (mb.instr_count != 8)                { ret 20; }
+    if (mb.instrs[7].opcode != mir.MIR_AND) { ret 20; }
+    val r1n: err[fail.Fail] = lower_instr(?ctx, ?fn, ?mb, 1);
+    if (sel r1n.err)                                                                              { ret 21; }
+    if (mb.instr_count != 10)                                                                     { ret 22; }
+    if (mb.instrs[8].operands[1].kind != mir.MIR_OP_VREG || mb.instrs[8].operands[1].vreg.n != 6) { ret 22; }
     ret 0;
 }
 

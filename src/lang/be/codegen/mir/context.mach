@@ -54,6 +54,11 @@ pub rec LowerCtx {
     gep_fold: *bool;
     gep_mem:  *mir.MirOperand;
 
+    # a count mask `c & (8 * W - 1)` whose every use is the count of a shift
+    # the machine runs at W and reads modulo W is never materialized: each
+    # shift takes `c` as its count (#3893)
+    count_mask_fold: *bool;
+
     instr_count: u32;
     interner:    *intern.Interner;
     # the module's diagnostic store, where a refusal of the program lands
@@ -107,6 +112,9 @@ pub fun ctx_setup(ctx: *LowerCtx, tgt: *target.Target, fn: *ir.Function) err[fai
         val res_mem: res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](ctx.alloc, ctx.instr_count::usize);
         if (sel res_mem.err) { ret err[fail.Fail].err{fail.refused(res_mem.err)}; }
         ctx.gep_mem = res_mem.ok;
+        val res_mask: res[*bool, A.Error] = A.allocate[bool](ctx.alloc, ctx.instr_count::usize);
+        if (sel res_mask.err) { ret err[fail.Fail].err{fail.refused(res_mask.err)}; }
+        ctx.count_mask_fold = res_mask.ok;
 
         var i: u32 = 0;
         for (i < ctx.instr_count) {
@@ -115,6 +123,7 @@ pub fun ctx_setup(ctx: *LowerCtx, tgt: *target.Target, fn: *ir.Function) err[fai
             i                     = i + 1;
         }
         mark_foldable_geps(ctx, tgt, fn);
+        mark_foldable_count_masks(ctx, fn);
     }
 
     var i: u32 = 0;
@@ -181,6 +190,78 @@ fun mark_foldable_geps(ctx: *LowerCtx, tgt: *target.Target, fn: *ir.Function) {
     }
 }
 
+pub fun count_mask_folds(ctx: *LowerCtx, iid: id.InstructionId) bool {
+    if (ctx.count_mask_fold == nil || iid::u32 >= ctx.instr_count) { ret false; }
+    ret ctx.count_mask_fold[iid::u32];
+}
+
+# the operand of a count mask that is not its mask constant, or none when
+# `inst` is not a scalar `and` of a variable value with a constant
+pub fun count_mask_source(ctx: *LowerCtx, inst: *instruction.Instruction) opt[u32] {
+    if (inst.kind != instruction.OP_AND || inst.operand_count != 2)        { ret opt[u32].none{}; }
+    if (value_is_vector(ctx, inst.ty) || value_is_aggregate(ctx, inst.ty)) { ret opt[u32].none{}; }
+    val c0: bool = inst.operands[0].kind == value.VAL_CONST_INT;
+    val c1: bool = inst.operands[1].kind == value.VAL_CONST_INT;
+    if (c1 && !c0) { ret opt[u32].some{0}; }
+    if (c0 && !c1) { ret opt[u32].some{1}; }
+    ret opt[u32].none{};
+}
+
+# the mask constant of a count mask, at the mask's own width
+fun count_mask_constant(ctx: *LowerCtx, mask: *instruction.Instruction) wide.Wide {
+    var c: value.Value = mask.operands[1];
+    if (mask.operands[0].kind == value.VAL_CONST_INT) { c = mask.operands[0]; }
+    ret wide.trunc(value.int_of(?c), op_width_of(ctx, mask.ty)::u32 * 8);
+}
+
+# whether a shift reads operand `o` as a count the machine takes modulo the
+# width it shifts at, and `mask` is exactly that width's bits less one
+fun count_mask_use_folds(ctx: *LowerCtx, inst: *instruction.Instruction, o: u32, mask: wide.Wide) bool {
+    if (o != 1)                                                                                                    { ret false; }
+    if (inst.kind != instruction.OP_SHL && inst.kind != instruction.OP_SHR_U && inst.kind != instruction.OP_SHR_S) { ret false; }
+    if (value_is_vector(ctx, inst.ty) || value_is_vector(ctx, inst.operands[1].ty))                                { ret false; }
+    val natural_w: u8  = op_width_of(ctx, inst.ty);
+    val w:         u8  = clamp_alu_width(ctx.tgt.model.alu_min_width, natural_w);
+    val maw:       u32 = ctx.tgt.model.max_alu_width;
+    if (w != natural_w || (maw != 0 && w::u32 > maw))       { ret false; }
+    if (!isa.shift_count_mod_width(?ctx.tgt.model, w::u32)) { ret false; }
+    ret wide.eq(mask, wide.from_u64(w::u64 * 8 - 1));
+}
+
+# a count mask folds when every use of it is a shift count that
+# count_mask_use_folds admits; any other use needs the masked value itself
+pub fun mark_foldable_count_masks(ctx: *LowerCtx, fn: *ir.Function) {
+    var i: u32 = 0;
+    for (i < ctx.instr_count) {
+        ctx.count_mask_fold[i] = false;
+        i                      = i + 1;
+    }
+    if (map.length[id.InstructionId, ir.IrAsm](fn.asm_blocks) > 0) { ret; }
+
+    i = 0;
+    for (i < ctx.instr_count) {
+        val src: opt[u32] = count_mask_source(ctx, ?fn.instrs[i]);
+        if (sel src.some) { ctx.count_mask_fold[i] = true; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < ctx.instr_count) {
+        val inst: *instruction.Instruction = ?fn.instrs[i];
+        var o:    u32                      = 0;
+        for (o < inst.operand_count) {
+            val v: value.Value = inst.operands[o];
+            if (v.kind == value.VAL_INSTR && v.data.instr::u32 < ctx.instr_count) {
+                val g: u32 = v.data.instr::u32;
+                if (ctx.count_mask_fold[g] && !count_mask_use_folds(ctx, inst, o, count_mask_constant(ctx, ?fn.instrs[g]))) {
+                    ctx.count_mask_fold[g] = false;
+                }
+            }
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+}
+
 fun gep_use_folds(ctx: *LowerCtx, inst: *instruction.Instruction, o: u32) bool {
     if ((inst.flags & instruction.INSTR_FLAG_VOLATILE) != 0) { ret false; }
     if (inst.kind == instruction.OP_LOAD && o == 0) {
@@ -220,6 +301,10 @@ pub fun ctx_dnit(ctx: *LowerCtx) {
     if (ctx.gep_mem != nil && ctx.instr_count > 0) {
         A.deallocate[mir.MirOperand](ctx.alloc, ctx.gep_mem, ctx.instr_count::usize);
         ctx.gep_mem = nil;
+    }
+    if (ctx.count_mask_fold != nil && ctx.instr_count > 0) {
+        A.deallocate[bool](ctx.alloc, ctx.count_mask_fold, ctx.instr_count::usize);
+        ctx.count_mask_fold = nil;
     }
     if (ctx.param_vregs != nil && ctx.param_count > 0) {
         A.deallocate[mir.VRegId](ctx.alloc, ctx.param_vregs, ctx.param_count::usize);
