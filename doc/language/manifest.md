@@ -232,8 +232,8 @@ comptime member, `$mach.build.extensions.<name>` (see [`$mach`](comptime-mach.md
 
 | `isa` | Baseline | Extensions |
 |-------|----------|------------|
-| `x86_64` | SSE2 | `ssse3`, `sse41`, `sse42`, `sha`, `fsgsbase`, `popcnt`, `lzcnt`, `bmi1`, `bmi2`, `cx16`, `avx`, `avx2`, `fma`, `movbe`, `f16c`, `avx512f`, `avx512bw`, `avx512cd`, `avx512dq`, `avx512vl` |
-| `aarch64` | AdvSIMD | `sha2` |
+| `x86_64` | SSE2 | `ssse3`, `sse41`, `sse42`, `sha`, `fsgsbase`, `popcnt`, `lzcnt`, `bmi1`, `bmi2`, `cx16`, `avx`, `avx2`, `fma`, `movbe`, `f16c`, `avx512f`, `avx512bw`, `avx512cd`, `avx512dq`, `avx512vl`, `aes`, `pclmul` |
+| `aarch64` | AdvSIMD | `sha2`, `sb`, `aes`, `pmull` |
 | `riscv64`, `riscv32` | the isa string's selection | `i`, `m`, `a`, `f`, `d`, `c`, `zicsr`, `zifencei`, `zkt` |
 | `spirv` | | none |
 
@@ -243,7 +243,7 @@ names it does hold:
 ```
 error: target: `sha2` is not an extension or level of isa 'x86_64'; its extensions are:
 ssse3, sse41, sha, fsgsbase, popcnt, lzcnt, bmi1, sse42, cx16, avx, avx2, bmi2, fma,
-movbe, f16c, avx512f, avx512bw, avx512cd, avx512dq, avx512vl; its levels are:
+movbe, f16c, avx512f, avx512bw, avx512cd, avx512dq, avx512vl, aes, pclmul; its levels are:
 x86-64-v2, x86-64-v3, x86-64-v4
 ```
 
@@ -254,8 +254,8 @@ A level is a bundle, never an axis of its own: each name may imply others, and t
 selection is closed over that once, when the target resolves. `sse41` brings `ssse3`
 (the chain stops there; SSE3 is not modelled), `sse42` brings `sse41`, `avx` brings
 `sse42`, `avx2`, `fma` and `f16c` bring `avx`, and every `avx512*` set brings
-`avx512f`, which brings `avx2`. On riscv `d` brings `f` and `f` brings `zicsr`, as
-the isa string's own grammar has it, so `extensions = ["d"]` on `rv64i` selects
+`avx512f`, which brings `avx2`. On aarch64 `pmull` brings `aes`. On riscv `d` brings
+`f` and `f` brings `zicsr`, as the isa string's own grammar has it, so `extensions = ["d"]` on `rv64i` selects
 `rv64ifd` with Zicsr. The isa string and the list feed one set: `isa = "rv64i"` with
 `extensions = ["m"]` selects the same machine as `isa = "rv64im"`. A name nothing in
 the compiler encodes against yet (`avx2`, `avx512f`) is still a declared requirement:
