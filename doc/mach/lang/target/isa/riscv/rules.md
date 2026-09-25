@@ -3,7 +3,7 @@
 ## val RULE_COUNT
 
 ```mach
-pub val RULE_COUNT: usize = 65
+pub val RULE_COUNT: usize = 66
 ```
 
 ## val COPY_OPCODE_COUNT

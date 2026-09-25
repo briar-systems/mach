@@ -93,9 +93,13 @@ val d: i32 = y >> n;         # -1 or 0 when n >= 32, the sign of y
 ```
 
 The saturation is branch-free, so a secret count admitted by the constant-time
-gates (see [secrecy.md](secrecy.md)) stays admitted. A count already masked
-below the width, such as `x << (n & 31)` on a `u32`, needs no saturation and
-compiles to the bare shift.
+gates (see [secrecy.md](secrecy.md)) stays admitted. A count the compiler
+proves below the width needs no saturation and compiles to the bare shift:
+one masked below it, such as `x << (n & 31)` on a `u32`, a loop counter its
+guard bounds, as `plane` in `for (plane < 8) { x >> plane }`, and a count a
+dominating compare bounds, as in `if (n < 32) { x << n }`, or sums, differences
+and products of such values, such as `(i & 3) * 16 + (i >> 2) * 4` under
+`i < 16`.
 
 ## Comparison
 

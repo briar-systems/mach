@@ -132,6 +132,12 @@ pub val VC_OPCODE_KNOWN: VerifyCheck = 19
 pub val VC_VALUE_KNOWN:  VerifyCheck = 20
 ```
 
+## val VC_BOUNDED_FORM
+
+```mach
+pub val VC_BOUNDED_FORM: VerifyCheck = 21
+```
+
 ## rec Violation
 
 ```mach

@@ -344,6 +344,17 @@ and the high half at base N (#3738)
 pub val MIR_VEC_WIDEN_U: MirOpcode = 55
 ```
 
+## val MIR_MASK_LT_U
+
+```mach
+pub val MIR_MASK_LT_U: MirOpcode = 56
+```
+
+all ones when the first operand is below the second read unsigned at the
+source width, zero otherwise, written at the instruction's width: the mask
+a saturating shift keeps its result by, one compare-to-mask sequence on
+every target (#3885). both widths are at most the alu width
+
 ## val MIR_MOV
 
 ```mach
@@ -625,6 +636,14 @@ the selected fixed-pair widening multiply (#3511)
 ```mach
 pub val MIR_SEL_MUL_PAIR_S: MirOpcode = 0x1129
 ```
+
+## val MIR_SEL_MASK_LT_U
+
+```mach
+pub val MIR_SEL_MASK_LT_U: MirOpcode = 0x112A
+```
+
+the selected compare-to-mask (#3885)
 
 ## fun is_cmp_opcode
 
@@ -1068,7 +1087,7 @@ pub fun is_terminator(op: MirOpcode) bool;
 ## val SELECTION_REACHABLE_COUNT
 
 ```mach
-pub val SELECTION_REACHABLE_COUNT:       u32 = 46
+pub val SELECTION_REACHABLE_COUNT:       u32 = 47
 ```
 
 ## val SELECTION_REACHABLE_FLOAT_COUNT
