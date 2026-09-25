@@ -1,0 +1,449 @@
+# the unsigned range of an integer value where a block reads it (#3885)
+#
+# a range comes from what the ir already states: a constant, the operation
+# that defines the value (a mask, an extension, a sum or difference of bounded
+# terms), the counted loops the loop analysis recognizes, and the compares
+# whose branch edge dominates the reading block. a range where block `at`
+# reads a value holds for every execution of `at`, because an ssa value is
+# only redefined by re-running its definition, which the guarding edge would
+# then run again before `at`. every answer is sound on its own: a cycle, a
+# recursion past MAX_DEPTH or an operation with no rule answers the value's
+# whole width. a range reads its value as unsigned at the value's own width,
+# and UNBOUNDED as its top means no bound below 2^64 - 1, which includes a
+# value wider than 64 bits whose bound does not fit
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mach.lang.fail;
+use mach.lang.me.analysis.loops;
+use mach.lang.me.ir;
+use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+
+pub val UNBOUNDED: u64 = 0xFFFFFFFFFFFFFFFF;
+
+# how deep one query follows operands; a deeper chain answers its full width
+val MAX_DEPTH: u32 = 24;
+
+# every value in `lo..=hi`; a range whose lo passes its hi belongs to code
+# no execution reaches
+pub rec Range {
+    lo: u64;
+    hi: u64;
+}
+
+pub rec RangeAnalysis {
+    alloc: *A.Allocator;
+    fn:    *ir.Function;
+    types: *ir_type.IrTypeTable;
+    la:    *loops.LoopAnalysis;
+
+    # the phis a query is inside, so a cycle through one answers its width
+    open:     *bool;
+    open_len: u32;
+    depth:    u32;
+}
+
+# the analysis reads the loop analysis of the same function and owns nothing
+# of it; `la` outlives the analysis
+pub fun init(ra: *RangeAnalysis, fn: *ir.Function, types: *ir_type.IrTypeTable,
+    la: *loops.LoopAnalysis, alloc: *A.Allocator) err[fail.Fail] {
+    ra.alloc    = alloc;
+    ra.fn       = fn;
+    ra.types    = types;
+    ra.la       = la;
+    ra.open     = nil;
+    ra.open_len = 0;
+    ra.depth    = 0;
+    if (fn.instr_len == 0) { ret err[fail.Fail].ok{}; }
+    val r: res[*bool, A.Error] = A.zallocate[bool](alloc, fn.instr_len::usize);
+    if (sel r.err) { ret err[fail.Fail].err{fail.refused(r.err)}; }
+    ra.open     = r.ok;
+    ra.open_len = fn.instr_len;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun dnit(ra: *RangeAnalysis) {
+    if (ra.open != nil) { A.deallocate[bool](ra.alloc, ra.open, ra.open_len::usize); }
+    ra.open     = nil;
+    ra.open_len = 0;
+}
+
+# the values `v` holds wherever block `at` reads it
+pub fun range_at(ra: *RangeAnalysis, v: value.Value, at: id.BlockId) Range {
+    val bits: u32 = bits_of(ra.types, v.ty);
+    if (v.kind == value.VAL_CONST_INT) { ret constant(v, bits); }
+    val whole: Range = full(bits);
+    if (v.kind != value.VAL_INSTR && v.kind != value.VAL_PARAM) { ret whole; }
+    if (ra.depth >= MAX_DEPTH)                                  { ret whole; }
+    ra.depth = ra.depth + 1;
+    var r: Range = whole;
+    if (v.kind == value.VAL_INSTR) { r = meet(r, defined(ra, v, at)); }
+    r        = meet(r, guarded(ra, v, at));
+    ra.depth = ra.depth - 1;
+    ret r;
+}
+
+# whether `v` is below `limit` wherever `at` reads it
+pub fun below(ra: *RangeAnalysis, v: value.Value, at: id.BlockId, limit: u64) bool {
+    ret range_at(ra, v, at).hi < limit;
+}
+
+# a constant's range, no analysis needed
+pub fun constant_range(types: *ir_type.IrTypeTable, v: value.Value) Range {
+    val bits: u32 = bits_of(types, v.ty);
+    if (v.kind != value.VAL_CONST_INT) { ret full(bits); }
+    ret constant(v, bits);
+}
+
+fun span(lo: u64, hi: u64) Range {
+    ret Range{lo: lo, hi: hi};
+}
+
+fun min(a: u64, b: u64) u64 {
+    if (a < b) { ret a; }
+    ret b;
+}
+
+fun max(a: u64, b: u64) u64 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+fun meet(a: Range, b: Range) Range {
+    ret span(max(a.lo, b.lo), min(a.hi, b.hi));
+}
+
+fun join(a: Range, b: Range) Range {
+    ret span(min(a.lo, b.lo), max(a.hi, b.hi));
+}
+
+fun is_full(r: Range) bool {
+    ret r.lo == 0 && r.hi == UNBOUNDED;
+}
+
+fun bits_of(types: *ir_type.IrTypeTable, ty: ir_type.IrTypeId) u32 {
+    val found: opt[*ir_type.IrType] = ir_type.get(types, ty);
+    if (sel found.none)                     { ret 0; }
+    if (found.some.kind != ir_type.IRT_INT) { ret 0; }
+    ret found.some.data.bits;
+}
+
+# the largest value of a width, UNBOUNDED for one that is unknown or 64 bits
+# and wider
+fun width_max(bits: u32) u64 {
+    if (bits == 0 || bits >= 64) { ret UNBOUNDED; }
+    ret (1::u64 << bits::u64) - 1;
+}
+
+fun full(bits: u32) Range {
+    ret span(0, width_max(bits));
+}
+
+# the largest value of a signed width's non-negative half
+fun signed_max(bits: u32) u64 {
+    if (bits == 0 || bits > 64) { ret 0; }
+    ret (1::u64 << (bits::u64 - 1)) - 1;
+}
+
+fun constant(v: value.Value, bits: u32) Range {
+    if (bits == 0) { ret full(bits); }
+    var c: u64 = v.data.int_wide.lo;
+    if (bits < 64)                            { c = c & width_max(bits); }
+    if (bits > 64 && v.data.int_wide.hi != 0) { ret full(bits); }
+    ret span(c, c);
+}
+
+fun is_const(v: value.Value) bool {
+    ret v.kind == value.VAL_CONST_INT;
+}
+
+fun add(a: Range, b: Range, whole: Range) Range {
+    if (a.hi == UNBOUNDED || b.hi == UNBOUNDED || a.hi > UNBOUNDED - b.hi) { ret whole; }
+    if (a.hi + b.hi > whole.hi)                                            { ret whole; }
+    ret span(a.lo + b.lo, a.hi + b.hi);
+}
+
+# a difference that cannot wrap: every left value is at least every right one
+fun sub(a: Range, b: Range, whole: Range) Range {
+    if (b.hi == UNBOUNDED || a.lo < b.hi) { ret whole; }
+    var hi: u64 = UNBOUNDED;
+    if (a.hi != UNBOUNDED) { hi = a.hi - b.lo; }
+    ret span(a.lo - b.hi, hi);
+}
+
+fun mul(a: Range, b: Range, whole: Range) Range {
+    if (a.hi == 0 || b.hi == 0)                            { ret span(0, 0); }
+    if (a.hi == UNBOUNDED || b.hi == UNBOUNDED)            { ret whole; }
+    if (b.hi > UNBOUNDED / a.hi || a.hi * b.hi > whole.hi) { ret whole; }
+    ret span(a.lo * b.lo, a.hi * b.hi);
+}
+
+fun divide(a: Range, c: u64) Range {
+    var hi: u64 = UNBOUNDED;
+    if (a.hi != UNBOUNDED) { hi = a.hi / c; }
+    ret span(a.lo / c, hi);
+}
+
+# every bit up to the highest one `x` sets: an or or xor of values no larger
+# than `x` is no larger than this
+fun smear(x: u64) u64 {
+    var s: u64 = x;
+    s = s | (s >> 1);
+    s = s | (s >> 2);
+    s = s | (s >> 4);
+    s = s | (s >> 8);
+    s = s | (s >> 16);
+    s = s | (s >> 32);
+    ret s;
+}
+
+# the range the defining instruction gives
+fun defined(ra: *RangeAnalysis, v: value.Value, at: id.BlockId) Range {
+    val bits:  u32                           = bits_of(ra.types, v.ty);
+    val whole: Range                         = full(bits);
+    val found: opt[*instruction.Instruction] = ir.instruction_get(ra.fn, v.data.instr);
+    if (sel found.none) { ret whole; }
+    val d: *instruction.Instruction = found.some;
+    val k: instruction.InstrKind    = d.kind;
+
+    if (k == instruction.OP_PHI) { ret phi_range(ra, v.data.instr, d, bits, at); }
+    if (k == instruction.OP_CMP_EQ || k == instruction.OP_CMP_NE || k == instruction.OP_CMP_LT_S
+        || k == instruction.OP_CMP_LT_U || k == instruction.OP_CMP_LE_S || k == instruction.OP_CMP_LE_U) {
+        ret span(0, 1);
+    }
+    if (d.operand_count < 1) { ret whole; }
+    val a: value.Value = d.operands[0];
+    if (k == instruction.OP_ZEXT) { ret range_at(ra, a, at); }
+    if (k == instruction.OP_TRUNC) {
+        val x: Range = range_at(ra, a, at);
+        if (x.hi <= whole.hi) { ret x; }
+        ret whole;
+    }
+    if (k == instruction.OP_SEXT) {
+        # a non-negative source extends with zeros
+        val x: Range = range_at(ra, a, at);
+        if (x.hi <= signed_max(bits_of(ra.types, a.ty))) { ret x; }
+        ret whole;
+    }
+    if (d.operand_count < 2) { ret whole; }
+    val b: value.Value = d.operands[1];
+    if (k == instruction.OP_AND) { ret span(0, min(range_at(ra, a, at).hi, range_at(ra, b, at).hi)); }
+    if (k == instruction.OP_OR || k == instruction.OP_XOR) {
+        val x:  Range = range_at(ra, a, at);
+        val y:  Range = range_at(ra, b, at);
+        val hi: u64   = min(whole.hi, smear(max(x.hi, y.hi)));
+        if (k == instruction.OP_OR) { ret span(max(x.lo, y.lo), hi); }
+        ret span(0, hi);
+    }
+    if (k == instruction.OP_ADD) { ret add(range_at(ra, a, at), range_at(ra, b, at), whole); }
+    if (k == instruction.OP_SUB) { ret sub(range_at(ra, a, at), range_at(ra, b, at), whole); }
+    if (k == instruction.OP_MUL) { ret mul(range_at(ra, a, at), range_at(ra, b, at), whole); }
+    if (k == instruction.OP_SHL && is_const(b)) {
+        val c: u64 = constant(b, bits_of(ra.types, b.ty)).lo;
+        if (c >= 64 || c >= bits::u64) { ret whole; }
+        ret mul(range_at(ra, a, at), span(1::u64 << c, 1::u64 << c), whole);
+    }
+    # a right shift of a non-negative value never grows it, and a constant
+    # count below the width divides it
+    if (k == instruction.OP_SHR_U || k == instruction.OP_SHR_S) {
+        val x: Range = range_at(ra, a, at);
+        if (k == instruction.OP_SHR_S && x.hi > signed_max(bits)) { ret whole; }
+        if (!is_const(b))                                         { ret span(0, x.hi); }
+        val c: u64 = constant(b, bits_of(ra.types, b.ty)).lo;
+        if (c >= 64 || c >= bits::u64) { ret span(0, x.hi); }
+        ret divide(x, 1::u64 << c);
+    }
+    # a division by zero is the target's own answer, so only a nonzero
+    # constant divisor bounds a quotient or a remainder
+    if ((k == instruction.OP_DIV_U || k == instruction.OP_REM_U) && is_const(b)) {
+        val c: u64 = constant(b, bits_of(ra.types, b.ty)).lo;
+        if (c == 0) { ret whole; }
+        val x: Range = range_at(ra, a, at);
+        if (k == instruction.OP_DIV_U) { ret divide(x, c); }
+        if (x.hi < c)                  { ret x; }
+        ret span(0, c - 1);
+    }
+    ret whole;
+}
+
+# a phi holds one of its incoming values, each read at the end of the edge it
+# arrives on, and stays within its counted loop's range when it is that loop's
+# induction variable. a phi already open in this query is a cycle and answers
+# its width, which a guard on the path may still narrow
+fun phi_range(ra: *RangeAnalysis, iid: id.InstructionId, d: *instruction.Instruction, bits: u32, at: id.BlockId) Range {
+    val whole: Range = full(bits);
+    if (iid::u32 >= ra.open_len || ra.open[iid::u32]) { ret whole; }
+    ra.open[iid::u32] = true;
+    val counted: Range = induction_range(ra, iid, bits);
+    var merged:  Range = span(UNBOUNDED, 0);
+    var j:       u32   = 0;
+    for (j + 1 < d.operand_count && !is_full(merged)) {
+        val from: id.BlockId = ir.block_target(d.operands[j]);
+        merged = join(merged, range_at(ra, d.operands[j + 1], from));
+        j      = j + 2;
+    }
+    ra.open[iid::u32] = false;
+    ret meet(whole, meet(counted, merged));
+}
+
+# the induction variable of a counted loop that starts at a constant, steps up
+# by a constant and continues only while it is below (or at) its bound stays
+# between its start and the last value that passes the test plus one step. a
+# signed test bounds it only when the start and the bound are non-negative and
+# the last step cannot overflow, which also keeps every value non-negative
+fun induction_range(ra: *RangeAnalysis, iid: id.InstructionId, bits: u32) Range {
+    var li: u32 = 0;
+    for (li < ra.la.loop_len) {
+        val lp: *loops.Loop = ?ra.la.loops[li];
+        if (lp.is_counted && lp.iv.phi == iid) { ret counted_range(ra, lp, bits); }
+        li = li + 1;
+    }
+    ret full(bits);
+}
+
+fun counted_range(ra: *RangeAnalysis, lp: *loops.Loop, bits: u32) Range {
+    val whole: Range = full(bits);
+    if (!is_const(lp.iv.init) || !is_const(lp.iv.step)) { ret whole; }
+    if (bits == 0 || bits > 64)                         { ret whole; }
+    val pred:   instruction.InstrKind = lp.counted.pred;
+    val signed: bool                  = pred == instruction.OP_CMP_LT_S || pred == instruction.OP_CMP_LE_S;
+    if (!signed && pred != instruction.OP_CMP_LT_U && pred != instruction.OP_CMP_LE_U) { ret whole; }
+
+    # `iv < b` taken while true, or `b < iv` taken while false (`iv <= b`)
+    if (lp.counted.iv_on_left != lp.counted.continue_on_true) { ret whole; }
+    var inclusive: bool = pred == instruction.OP_CMP_LE_S || pred == instruction.OP_CMP_LE_U;
+    if (!lp.counted.iv_on_left) { inclusive = !inclusive; }
+
+    var ceiling: u64 = whole.hi;
+    if (signed) { ceiling = signed_max(bits); }
+    val init: u64 = constant(lp.iv.init, bits).lo;
+    val step: u64 = constant(lp.iv.step, bits).lo;
+    if (init > ceiling || step == 0 || step > ceiling) { ret whole; }
+
+    val bound: u64 = range_at(ra, lp.counted.bound, lp.header).hi;
+    if (bound > ceiling)          { ret whole; }
+    if (!inclusive && bound == 0) { ret span(init, init); }
+    var last: u64 = bound;
+    if (!inclusive)            { last = bound - 1; }
+    if (last > ceiling - step) { ret whole; }
+    ret span(init, max(init, last + step));
+}
+
+# the narrowest range the compares guarding `at` give `v`: every dominator of
+# `at` entered from its only predecessor over a conditional branch on a
+# compare holds that compare's outcome
+fun guarded(ra: *RangeAnalysis, v: value.Value, at: id.BlockId) Range {
+    var r:     Range      = span(0, UNBOUNDED);
+    var x:     id.BlockId = at;
+    var steps: u32        = 0;
+    val n:     u32        = ra.la.block_count;
+    for (x != id.BLOCK_NIL && x::u32 < n && steps < n) {
+        if (ra.la.rpo_index[x::u32] == loops.NONE_U32) { ret r; }
+        r = meet(r, edge_range(ra, v, x));
+        if (x::u32 == 0) { ret r; }
+        x     = ra.la.idom[x::u32];
+        steps = steps + 1;
+    }
+    ret r;
+}
+
+fun edge_range(ra: *RangeAnalysis, v: value.Value, x: id.BlockId) Range {
+    val none: Range     = span(0, UNBOUNDED);
+    val blk:  *ir.Block = ?ra.fn.blocks[x::u32];
+    if (blk.pred_count != 1) { ret none; }
+    val p: id.BlockId = blk.preds[0];
+    if (p == x || p::u32 >= ra.fn.block_count) { ret none; }
+    val pblk: *ir.Block                     = ?ra.fn.blocks[p::u32];
+    val topt: opt[*instruction.Instruction] = ir.instruction_get(ra.fn, pblk.terminator);
+    if (sel topt.none) { ret none; }
+    val term: *instruction.Instruction = topt.some;
+    if (term.kind != instruction.OP_CBR || term.operand_count < 3) { ret none; }
+    val then_b: id.BlockId = ir.block_target(term.operands[1]);
+    val else_b: id.BlockId = ir.block_target(term.operands[2]);
+    if (then_b == else_b) { ret none; }
+    val cond: value.Value = term.operands[0];
+    if (cond.kind != value.VAL_INSTR) { ret none; }
+    val copt: opt[*instruction.Instruction] = ir.instruction_get(ra.fn, cond.data.instr);
+    if (sel copt.none) { ret none; }
+    val cmp: *instruction.Instruction = copt.some;
+    if (cmp.operand_count != 2) { ret none; }
+    ret compare_range(ra, v, cmp, then_b == x, p);
+}
+
+# what `cmp` holding (or failing, when `holds` is false) says of `v`, reading
+# the other operand at the branching block `p`
+fun compare_range(ra: *RangeAnalysis, v: value.Value, cmp: *instruction.Instruction, holds: bool, p: id.BlockId) Range {
+    val none:     Range       = span(0, UNBOUNDED);
+    val l:        value.Value = cmp.operands[0];
+    val r:        value.Value = cmp.operands[1];
+    val on_left:  bool        = same_value(v, l);
+    val on_right: bool        = same_value(v, r);
+    if (on_left == on_right) { ret none; }
+    val k: instruction.InstrKind = cmp.kind;
+
+    if ((k == instruction.OP_CMP_EQ && holds) || (k == instruction.OP_CMP_NE && !holds)) {
+        if (on_left) { ret range_at(ra, r, p); }
+        ret range_at(ra, l, p);
+    }
+
+    var signed: bool = false;
+    var strict: bool = false;
+    if (k == instruction.OP_CMP_LT_U) { strict = true; }
+    or (k == instruction.OP_CMP_LT_S) {
+        strict = true;
+        signed = true;
+    }
+    or (k == instruction.OP_CMP_LE_S) { signed = true; }
+    or (k != instruction.OP_CMP_LE_U) { ret none; }
+
+    # the outcome as `small < big` (or `<=`): `l < r` holding, or `r <= l`
+    # when it fails
+    var v_small: bool        = on_left;
+    var other:   value.Value = r;
+    if (on_right) { other = l; }
+    if (!holds) {
+        v_small = !v_small;
+        strict  = !strict;
+    }
+
+    val o:    Range = range_at(ra, other, p);
+    val bits: u32   = bits_of(ra.types, v.ty);
+    if (v_small) {
+        # v <= big: a signed order says so of the unsigned value only when v
+        # itself and the bound are non-negative
+        if (signed) {
+            if (o.hi > signed_max(bits))                 { ret none; }
+            if (v.kind != value.VAL_INSTR)               { ret none; }
+            if (defined(ra, v, p).hi > signed_max(bits)) { ret none; }
+        }
+        if (!strict)                        { ret span(0, o.hi); }
+        if (o.hi == 0 || o.hi == UNBOUNDED) { ret span(0, o.hi); }
+        ret span(0, o.hi - 1);
+    }
+
+    # small <= v: a non-negative small bound makes a signed v non-negative too
+    var lo: u64 = o.lo;
+    if (strict && lo != UNBOUNDED) { lo = lo + 1; }
+    if (signed) {
+        if (o.hi > signed_max(bits)) { ret none; }
+        ret span(lo, signed_max(bits));
+    }
+    ret span(lo, UNBOUNDED);
+}
+
+fun same_value(a: value.Value, b: value.Value) bool {
+    if (a.kind != b.kind)          { ret false; }
+    if (a.kind == value.VAL_INSTR) { ret a.data.instr == b.data.instr; }
+    if (a.kind == value.VAL_PARAM) { ret a.data.param_ix == b.data.param_ix; }
+    ret false;
+}
