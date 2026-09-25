@@ -788,8 +788,8 @@ Two consequences worth stating plainly:
   timing harness will see it. For small tables the property rests entirely on
   the secret-index gate and on reading the emitted code.
 
-**Where the check runs.** Through 5.0.0 the constant-time contract is checked
-at the **IR level**: the validator runs over the lowered, target-independent
+**Where the check runs.** The constant-time contract is checked at the **IR
+level**: the validator runs over the lowered, target-independent
 MIR before width legalization, instruction selection, register allocation,
 spilling, frame insertion, and encoding, and trusts those stages to be
 timing-preserving. What it refuses, it refuses closed: an operation it does not
