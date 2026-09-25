@@ -280,8 +280,12 @@ inherits its function's set.
 | x86_64 | `popcnt` | `popcnt r16/32/64, r/m` (CPUID leaf 1, ECX bit 23) |
 | x86_64 | `lzcnt` | `lzcnt r16/32/64, r/m` (CPUID leaf 0x80000001, ECX bit 5) |
 | x86_64 | `bmi1` | `tzcnt r16/32/64, r/m` (CPUID leaf 7, EBX bit 3) |
+| x86_64 | `aes` | `aesenc` `aesenclast` `aesdec` `aesdeclast` `xmm, xmm/m128`, `aesimc xmm, xmm/m128`, `aeskeygenassist xmm, xmm/m128, imm8` (CPUID leaf 1, ECX bit 25) |
+| x86_64 | `pclmul` | `pclmulqdq xmm, xmm/m128, imm8` (CPUID leaf 1, ECX bit 1) |
 | aarch64 | `sha2` | `sha256h qN, qN, vN.4s`, `sha256h2 qN, qN, vN.4s`, `sha256su0 vN.4s, vN.4s`, `sha256su1 vN.4s, vN.4s, vN.4s` |
 | aarch64 | `sb` | `sb` (the FEAT_SB speculation barrier) |
+| aarch64 | `aes` | `aese vN.16b, vN.16b`, `aesd vN.16b, vN.16b`, `aesmc vN.16b, vN.16b`, `aesimc vN.16b, vN.16b` (FEAT_AES) |
+| aarch64 | `pmull` | `pmull vN.1q, vN.1d, vN.1d`, `pmull2 vN.1q, vN.2d, vN.2d` (FEAT_PMULL; brings `aes`) |
 
 A manifest [level](manifest.md#levels) (`extensions = ["x86-64-v2"]`) selects every
 member name, so it admits the rows of each: `pmulld` assembles under `x86-64-v2`, and
@@ -293,6 +297,19 @@ constant-time check follows a secret through it. `ptest` sets ZF and CF; the
 check treats it as writing the flags rather than defining them, so a branch after
 a `ptest` of public data still counts a secret an earlier instruction left in the
 flags.
+
+The aes rounds and the carry-less multiplies are data-independent: Intel lists
+`aesenc`, `aesenclast`, `aesdec`, `aesdeclast`, `aesimc`, `aeskeygenassist` and
+`pclmulqdq` among the instructions whose latency does not depend on their data
+operands, and Arm lists `aese`, `aesd`, `aesmc`, `aesimc`, `pmull` and `pmull2`
+among those whose timing is independent of their data under DIT. The
+constant-time check admits them in an `#[oblivious]` function the way it admits
+the sha rows, and follows a secret through them, so what they compute from a
+secret is still a secret. On aarch64 `pmull` names its product `.1q` and its
+operands `.1d`, and `pmull2` reads the high halves at `.2d`. The `pmull` row
+brings `aes`, because the architecture reports both in one field
+(ID_AA64ISAR0_EL1.AES is 1 for the aes rounds and 2 for those and the 64-bit
+`pmull`).
 
 `cpuid` is baseline on x86_64 and is how a program finds out which extensions the
 processor has. It reads the leaf from `eax` and the subleaf from `ecx`, and writes
