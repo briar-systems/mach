@@ -24,6 +24,32 @@ The compiler is written to `out/<target>/<profile>/bin/mach`, or
 `out/linux-x86_64/debug/bin/mach`.
 
 
+## Fixpoint
+
+A change to the compiler has to reach the self-host fixpoint: the compiler it
+builds must build itself byte for byte. These are the stages CI runs, from the
+repository root:
+
+```bash
+mach dep pull .
+mach build . --bin mach -o a
+./a build . -o b
+./b build . -o c
+cmp b c
+```
+
+The seed `mach` on `PATH` builds `a` from your tree. `a` builds `b`, and `b`
+builds `c`. `cmp` prints nothing and exits 0 when `b` and `c` are identical,
+which is the evidence a pull request states. On Windows the binary is
+`mach-windows` and the outputs are `a.exe`, `b.exe` and `c.exe`. Add
+`--profile release` to every build for the release fixpoint.
+
+`-o` names a canonical path inside the project root: relative, `/`-separated,
+with no `.` or `..` component. `-o ../a`, `-o ./a` and an absolute path are
+refused with `-o must name a canonical path inside the project root`, so keep
+the stage outputs in the checkout. `.gitignore` covers `a`, `b` and `c`.
+
+
 ## Testing and formatting
 
 Run the tests and the formatter through the compiler you just built, never

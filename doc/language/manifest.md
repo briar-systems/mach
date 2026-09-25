@@ -1819,6 +1819,12 @@ refused otherwise, naming the cells it resolved to. Two artifacts collide on one
 output path the same way two targets do: each would link over the previous, leaving
 only the last with no warning. Narrow with `--bin`/`--lib` and `--target`.
 
+`-o` names a canonical path inside the project root, as an artifact's `out` does:
+relative, `/`-separated, with no `.` or `..` component and no empty one.
+`-o ../mach`, `-o ./mach` and `-o /tmp/mach` are refused with `-o must name a
+canonical path inside the project root`, so a build never writes outside the
+tree it was asked to build.
+
 ### When one cell fails
 
 Every cell is attempted; a failure does not abandon the ones after it. Each cell's
