@@ -895,10 +895,19 @@ of a lane-halving extension
 pub val V_UXTL2: MachOp = 141
 ```
 
+## val CSETM
+
+```mach
+pub val CSETM: MachOp = 142
+```
+
+all ones when the condition holds, zero otherwise: csinv rd, zr, zr of the
+inverted condition, the mask a saturating shift keeps its result by (#3885)
+
 ## val MOP_LAST
 
 ```mach
-pub val MOP_LAST:  MachOp = V_UXTL2
+pub val MOP_LAST:  MachOp = CSETM
 ```
 
 ## fun known
