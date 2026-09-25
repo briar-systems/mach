@@ -904,10 +904,49 @@ pub val CSETM: MachOp = 142
 all ones when the condition holds, zero otherwise: csinv rd, zr, zr of the
 inverted condition, the mask a saturating shift keeps its result by (#3885)
 
+## val AESE
+
+```mach
+pub val AESE:   MachOp = 143
+```
+
+the aes rounds and mix-columns steps under aes, and the 64x64 carry-less
+multiply under pmull, reached only from inline asm (#3835)
+
+## val AESD
+
+```mach
+pub val AESD:   MachOp = 144
+```
+
+## val AESMC
+
+```mach
+pub val AESMC:  MachOp = 145
+```
+
+## val AESIMC
+
+```mach
+pub val AESIMC: MachOp = 146
+```
+
+## val PMULL
+
+```mach
+pub val PMULL:  MachOp = 147
+```
+
+## val PMULL2
+
+```mach
+pub val PMULL2: MachOp = 148
+```
+
 ## val MOP_LAST
 
 ```mach
-pub val MOP_LAST:  MachOp = CSETM
+pub val MOP_LAST:  MachOp = PMULL2
 ```
 
 ## fun known
@@ -1136,14 +1175,14 @@ pub val L_NEON_3DIFF: Layout = 25
 dst, src1, src2 vectors: a long operation over the low halves of its operands
 at the element width in the flags, into lanes twice as wide
 
-## val L_NEON_SHA
+## val L_NEON_CRYPTO
 
 ```mach
-pub val L_NEON_SHA: Layout = 26
+pub val L_NEON_CRYPTO: Layout = 26
 ```
 
-the sha2 rows at their one .4s arrangement: dst, src1 and an optional src2;
-sha256h and sha256h2 spell dst and src1 as q registers
+a cryptographic row at the one arrangement per operand its CRYPTO_ROWS entry
+names: dst, src1 and an optional src2, packed as rd, rn and rm
 
 ## def WidthRule
 
@@ -1277,6 +1316,95 @@ one member's row: the spelling, the operand layout, the base word of its
 encoding (and of its immediate form when the instruction has one), and how
 the operand widths reach the word. an alias row has no base word: the
 encoder assembles the member it aliases and the notification renames it
+
+## def Arrangement
+
+```mach
+pub def Arrangement: u8
+```
+
+the arrangement a fixed-arrangement row names one operand at: a whole
+q register, or a v register with its lanes
+
+## val ARR_NONE
+
+```mach
+pub val ARR_NONE: Arrangement = 0
+```
+
+## val ARR_Q
+
+```mach
+pub val ARR_Q:    Arrangement = 1
+```
+
+## val ARR_16B
+
+```mach
+pub val ARR_16B:  Arrangement = 2
+```
+
+## val ARR_4S
+
+```mach
+pub val ARR_4S:   Arrangement = 3
+```
+
+## val ARR_2D
+
+```mach
+pub val ARR_2D:   Arrangement = 4
+```
+
+## val ARR_1D
+
+```mach
+pub val ARR_1D:   Arrangement = 5
+```
+
+## val ARR_1Q
+
+```mach
+pub val ARR_1Q:   Arrangement = 6
+```
+
+## fun arrangement_suffix
+
+```mach
+pub fun arrangement_suffix(a: Arrangement) str;
+```
+
+the lane suffix a v-register arrangement is spelled with; nil for a q register or none
+
+## rec CryptoRow
+
+```mach
+pub rec CryptoRow;
+```
+
+one L_NEON_CRYPTO member: the arrangement of each operand (src2 ARR_NONE for
+a two-operand row), whether it folds its destination into the result, and
+the words its refusal ends with when the operands do not match
+
+## val CRYPTO_ROW_COUNT
+
+```mach
+pub val CRYPTO_ROW_COUNT: usize = 10
+```
+
+## val CRYPTO_ROWS
+
+```mach
+pub val CRYPTO_ROWS: [CRYPTO_ROW_COUNT]CryptoRow = [CRYPTO_ROW_COUNT]CryptoRow;
+```
+
+## fun crypto_row
+
+```mach
+pub fun crypto_row(op: MachOp) *CryptoRow;
+```
+
+the fixed-arrangement row of a member; nil for a member outside L_NEON_CRYPTO
 
 ## fun form
 

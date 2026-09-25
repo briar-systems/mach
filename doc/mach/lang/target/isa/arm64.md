@@ -22,10 +22,27 @@ pub val EXT_SB: u64 = 0x2
 
 FEAT_SB, the speculation barrier `sb` (Armv8.0 optional, Armv8.5 mandatory)
 
+## val EXT_AES
+
+```mach
+pub val EXT_AES: u64 = 0x4
+```
+
+FEAT_AES, the aese, aesd, aesmc and aesimc rounds
+
+## val EXT_PMULL
+
+```mach
+pub val EXT_PMULL: u64 = 0x8
+```
+
+FEAT_PMULL, the 64x64 carry-less pmull and pmull2. the architecture reports
+it as a higher value of the one ID_AA64ISAR0_EL1.AES field, so it brings aes
+
 ## val EXTENSION_COUNT
 
 ```mach
-pub val EXTENSION_COUNT: u32 = 2
+pub val EXTENSION_COUNT: u32 = 4
 ```
 
 ## val EXTENSIONS
