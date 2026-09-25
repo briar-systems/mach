@@ -3,6 +3,6 @@
 ## val MACH_VERSION
 
 ```mach
-pub val MACH_VERSION: str = "5.12.0"
+pub val MACH_VERSION: str = "5.12.1"
 ```
 
