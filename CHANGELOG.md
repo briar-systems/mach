@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- The vector literal folds of #3753 and #3738. A literal whose lanes were consecutive loads through one pointer, `f32x4{p[i], p[i + 1], p[i + 2], p[i + 3]}`, was rewritten into one vector load, and a literal of the extensions of one vector's half, `i32x4{v[4]::i32, .., v[7]::i32}` over an `i16x8`, into one lane-halving widen. The range forms of #3779 spell both directly, `p[i, 4]::f32x4` and `v[4, 4]::i32x4`, and lower to the same instructions, so a literal is now always built lane by lane through its stack slot. No program changes meaning, and one that still spells a load or a widen as a literal keeps working on the slower lane path. `test/cases/vec/load_literal` and `widen_half` moved to the range spelling, and their goldens show the same packed instructions (#3780).
+
 ### Fixed
 - A linux program with more than 128 MB of static data links on aarch64 when it calls a shared library. The ELF writer placed the PLT in a segment of its own after `.bss`, so a `bl` from the code to a PLT entry crossed the whole zero-fill and a `var BIG: [140000000]u8` beside one import failed with `elf: dynamic call-site displacement overflows the BL +-128MB range`. ELF now declares its `.plt` through `OfVTable.stub_shape`, as Mach-O declares `__stubs`, so the linker reserves it at the end of `.text` inside the executable segment, the way GNU and LLVM `ld` lay it out, and the image has one load segment fewer. The PLT's GOT stays after the data, and an entry whose slot lies beyond its reach (+-4 GB for the aarch64 `adrp`, +-2 GB for the riscv64 `auipc` and the x86-64 `jmp *disp32(%rip)`) is refused at link time instead of written with a truncated displacement. riscv64 and x86-64 keep their 2 GB reach, now bounded by the GOT instead of the call (#3902).
 
