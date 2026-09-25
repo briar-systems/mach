@@ -18,6 +18,24 @@ pub fun init_dynstate(dyn: *DynState);
 pub fun free_dynstate(alloc: *A.Allocator, dyn: *DynState);
 ```
 
+## fun reserve_call_stubs
+
+```mach
+pub fun reserve_call_stubs(s: *session.Session, tgt: *target.Target, dyn: *DynState,
+merged: *MergedSection, groups: *SectionGroups) err[fail.Fail];
+```
+
+reserves the format's call-stub table at the end of the merged code, before
+anything is given an address, so a call site and its stub are never separated
+by the image's data however large it is (#3888); the addresses are read back
+by place_call_stubs once the layout is final
+
+## fun place_call_stubs
+
+```mach
+pub fun place_call_stubs(dyn: *DynState, merged: *MergedSection);
+```
+
 ## fun build_dynamic_info
 
 ```mach

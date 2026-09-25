@@ -795,6 +795,28 @@ pub rec BaseReloc;
 pub rec DynamicInfo;
 ```
 
+## rec StubTable
+
+```mach
+pub rec StubTable;
+```
+
+## rec StubShape
+
+```mach
+pub rec StubShape;
+```
+
+what a format's call-stub table takes for a count of imported functions: the
+linker reserves it at the end of the code under this section name, so every
+call site reaches its stub whatever data the image carries
+
+## def StubShapeFn
+
+```mach
+pub def StubShapeFn: fun(u32, u32) res[StubShape, fail.Fail]
+```
+
 ## rec PltFixup
 
 ```mach

@@ -97,8 +97,10 @@ each one implies (see
 
 The names are the selected isa's vocabulary and nothing else:
 
-- `x86_64`: `ssse3`, `sse41`, `sha`, `fsgsbase`, `popcnt`, `lzcnt`, `bmi1`;
-- `aarch64`: `sha2`;
+- `x86_64`: `ssse3`, `sse41`, `sha`, `fsgsbase`, `popcnt`, `lzcnt`, `bmi1`, `sse42`,
+  `cx16`, `avx`, `avx2`, `bmi2`, `fma`, `movbe`, `f16c`, `avx512f`, `avx512bw`,
+  `avx512cd`, `avx512dq`, `avx512vl`, `aes`, `pclmul`;
+- `aarch64`: `sha2`, `sb`, `aes`, `pmull`;
 - `riscv64` and `riscv32`: `i`, `m`, `a`, `f`, `d`, `c`, `zicsr`, `zifencei`, `zkt`.
 
 A name the selected isa does not declare is a compile error, never a silent 0, as
@@ -106,7 +108,7 @@ A name the selected isa does not declare is a compile error, never a silent 0, a
 
 ```
 `$mach.build.extensions.sha`: `sha` is not an extension of isa 'aarch64'; its
-extensions are: sha2
+extensions are: sha2, sb, aes, pmull
 ```
 
 So a source that serves several isas nests the extension question under an

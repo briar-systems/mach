@@ -564,6 +564,24 @@ pub val SLOT_READ_NONE: u32 = 0
 pub val SLOT_READ_1_2_4_8: u32 = 1 + 2 + 4 + 8
 ```
 
+## val SHIFT_MOD_NONE
+
+```mach
+pub val SHIFT_MOD_NONE: u32 = 0
+```
+
+## val SHIFT_MOD_4
+
+```mach
+pub val SHIFT_MOD_4: u32 = 4
+```
+
+## val SHIFT_MOD_4_8
+
+```mach
+pub val SHIFT_MOD_4_8: u32 = 4 + 8
+```
+
 ## val INT_WIDTHS_1_2_4_8
 
 ```mach
@@ -883,6 +901,12 @@ pub fun reads_slot_operand(m: *MachineModel, bytes: u32) bool;
 
 ```mach
 pub fun models_lifetime_holes(m: *MachineModel) bool;
+```
+
+## fun shift_count_mod_width
+
+```mach
+pub fun shift_count_mod_width(m: *MachineModel, bytes: u32) bool;
 ```
 
 ## fun moves_cross_bank

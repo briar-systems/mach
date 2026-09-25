@@ -30,10 +30,19 @@ pub fun got_import_count(dyn: *of.DynamicInfo) u32;
 pub fun macho_stub_size(arch_id: u32) usize;
 ```
 
+## fun macho_stub_shape
+
+```mach
+pub fun macho_stub_shape(arch_id: u32, count: u32) res[of.StubShape, fail.Fail];
+```
+
+the __TEXT,__stubs table the linker reserves at the end of the code, so a
+call site's branch reaches its stub whatever data the image carries
+
 ## fun write_macho_stub
 
 ```mach
-pub fun write_macho_stub(buf: *u8, arch_id: u32, stub_off: usize, stub_va: u64, slot_va: u64);
+pub fun write_macho_stub(buf: *u8, arch_id: u32, stub_off: usize, stub_va: u64, slot_va: u64) err[fail.Fail];
 ```
 
 ## fun dylib_ordinal_for
