@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `mach help build` lists the `-o` path rule among its constraints: `-o` names a canonical path inside the project root, relative, with no `.` or `..` component. `doc/language/manifest.md` states the rule under `-o` names one output, and CONTRIBUTING.md has the three-stage fixpoint recipe CI runs, with stage outputs `a`, `b` and `c` that `.gitignore` covers (#3863).
+
 ### Fixed
 - A linux program with more than 128 MB of static data links on aarch64 when it calls a shared library. The ELF writer placed the PLT in a segment of its own after `.bss`, so a `bl` from the code to a PLT entry crossed the whole zero-fill and a `var BIG: [140000000]u8` beside one import failed with `elf: dynamic call-site displacement overflows the BL +-128MB range`. ELF now declares its `.plt` through `OfVTable.stub_shape`, as Mach-O declares `__stubs`, so the linker reserves it at the end of `.text` inside the executable segment, the way GNU and LLVM `ld` lay it out, and the image has one load segment fewer. The PLT's GOT stays after the data, and an entry whose slot lies beyond its reach (+-4 GB for the aarch64 `adrp`, +-2 GB for the riscv64 `auipc` and the x86-64 `jmp *disp32(%rip)`) is refused at link time instead of written with a truncated displacement. riscv64 and x86-64 keep their 2 GB reach, now bounded by the GOT instead of the call (#3902).
 
