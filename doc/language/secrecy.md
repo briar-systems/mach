@@ -9,9 +9,8 @@ in [grammar.md](grammar.md); the decorator reference is in
 [decorators.md](decorators.md).
 
 > **Experimental preview.** The constant-time support is incomplete and
-> unaudited: a proven secret-disclosure path is still open. Read
-> [Assurance](#assurance) before relying on any of this. **Do not build
-> production cryptography on it at this version.**
+> unaudited. Read [Assurance](#assurance) before relying on any of this.
+> **Do not build production cryptography on it at this version.**
 
 ## Secrecy lattice
 
@@ -789,26 +788,8 @@ Two consequences worth stating plainly:
   timing harness will see it. For small tables the property rests entirely on
   the secret-index gate and on reading the emitted code.
 
-What does not hold — the known open holes:
-
-- **`$fields` reflection projection inside a generic erases a secret field's
-  secrecy**, which discloses the secret. Proven, security-blocking
-  (briar-systems/mach#2168).
-- the validator over-taints a wide secret on a narrow-ALU target, rejecting a
-  public-count shift as a secret memory address — a false positive; it fails safe
-  (briar-systems/mach#2195)
-- a **member or index access through a secret pointer** is rejected by the
-  secret-address gate, but a `p.x` / `p[i]` on a plain `^Rec` or `^[N]T` — which
-  this page documents as legal — fails at lowering, which does not strip the `^`
-  before resolving the field. A spurious error, not a disclosure
-- an anonymous `uni` nested in a **generic** record does not get union layout:
-  its variants occupy distinct storage instead of overlapping
-  (briar-systems/mach#2239). A layout defect, not a secrecy one — the mixed-secrecy
-  rule rejects those instantiations either way — but it is the reason a
-  `Result[^u32, u32]` built before that rule landed leaked nothing at run time
-
-**Where the check runs.** Through 5.0.0 the constant-time contract is checked
-at the **IR level**: the validator runs over the lowered, target-independent
+**Where the check runs.** The constant-time contract is checked at the **IR
+level**: the validator runs over the lowered, target-independent
 MIR before width legalization, instruction selection, register allocation,
 spilling, frame insertion, and encoding, and trusts those stages to be
 timing-preserving. What it refuses, it refuses closed: an operation it does not

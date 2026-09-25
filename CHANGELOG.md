@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `doc/language/secrecy.md` no longer lists closed issues as open holes. Its top warning keeps the experimental-preview label but no longer says a secret-disclosure path is open, since the one it meant (#2168) is fixed, and the Assurance section drops its list of known open holes, all four of which (#2168, #2195, #2297, #2239) are closed. The check over the final allocated machine program (#3591) stays the open item, named under "Where the check runs", which now states in the present tense that the contract is checked at the IR level instead of "Through 5.0.0" (#3882).
+
 ## [5.12.0] - 2026-09-23
 
 ### Changed
