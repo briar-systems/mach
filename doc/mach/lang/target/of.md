@@ -1512,6 +1512,17 @@ pub fun abs_kind_for_pointer_width(w: u32) res[RelocKind, fail.Fail];
 pub fun is_pointer_abs_kind(kind: RelocKind, w: u32) bool;
 ```
 
+## fun is_pcrel_address_kind
+
+```mach
+pub fun is_pcrel_address_kind(kind: RelocKind) bool;
+```
+
+a pc-relative materialization of a symbol's address in two parts, a page or
+high part and a low part, as aarch64 and riscv64 take it (x86-64 takes it
+whole with RK_PC32). against a function import each part resolves to the
+import's call stub, as a call does
+
 ## fun reloc_symbol_name
 
 ```mach
