@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A shift of a narrow value by a count the ALU holds in one register no longer truncates the count through its own copy. A `u64` count of a 32-bit or narrower shift was truncated to the shift's width first, and the register allocator did not merge that copy with the move into the count register, so mach-crypto's bit-plane unload paid `mov %r13d,%r15d; mov %r15d,%ecx` on every iteration where 5.10.0 emitted one `mov %r13d,%ecx`. The shift and the count register now read the untruncated count's low bits, the #3756 saturation still reads the whole count, and an arithmetic shift's saturating `or` runs at the count's own width, so SPIR-V, whose values are typed, drops its `OpUConvert` of the count too. A count wider than the ALU (a `u128` count, or a `u64` count on riscv32) keeps its truncation (#3615). On x86-64, mach-crypto v0.21.0's AES-128 block runs 13,656 instructions instead of 13,784 and a 1,200-byte AES-128-GCM seal 862.9 k instead of 872.6 k (#3892).
+
 ## [5.12.1] - 2026-09-25
 
 ### Fixed
