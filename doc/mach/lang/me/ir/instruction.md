@@ -387,6 +387,15 @@ pub val INSTR_FLAG_BORROWED_ARGS: u16 = 0x10
 
 a call whose aggregate arguments may name their sources rather than private copies (#3460)
 
+## val INSTR_FLAG_COUNT_BOUNDED
+
+```mach
+pub val INSTR_FLAG_COUNT_BOUNDED: u16 = 0x20
+```
+
+a scalar shift whose count is proven below its operand's width, so it needs
+none of the saturation a count at or above the width takes (#3885)
+
 ## rec Instruction
 
 ```mach

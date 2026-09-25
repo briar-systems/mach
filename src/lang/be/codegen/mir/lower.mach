@@ -1116,9 +1116,10 @@ fun narrow_shift_value(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Inst
 # a shift count at or above the operand's width saturates: `<<` and a logical
 # `>>` answer 0, an arithmetic `>>` the sign fill (#3756). the machine masks
 # the count to its own width, so the saturation is computed here, branch-free,
-# from `k = count < W`: a logical result is masked by `0 - k`, an arithmetic
-# count becomes `count | (k - 1)`, all ones out of range, which the machine
-# masks to its width - 1 and the sign-extended value fills from
+# from `m`, all ones exactly when `count < W`: a logical result is masked by
+# `m`, an arithmetic count becomes `count | ~m`, all ones out of range, which
+# the machine masks to its width - 1 and the sign-extended value fills from.
+# a shift the middle end marked count-bounded is the bare machine shift (#3885)
 fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) err[fail.Fail] {
     if (inst.operand_count < 2) {
         ret err[fail.Fail].err{fail.message("mir.lower_ir: shift missing value or count operand")};
@@ -1154,19 +1155,20 @@ fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
         count = mir.op_imm(bits - 1);
     }
 
-    var in_range: mir.MirOperand = mir.op_imm(1);
+    val saturate: bool           = count.kind != mir.MIR_OP_IMM && (inst.flags & instr.INSTR_FLAG_COUNT_BOUNDED) == 0;
+    var mask:     mir.MirOperand = mir.op_imm(-1);
+    if (saturate && !arith) {
+        val mr: res[mir.MirOperand, fail.Fail] = emit_count_mask(ctx, mb, inst, count, bits, w);
+        if (sel mr.err) { ret err[fail.Fail].err{mr.err}; }
+        mask = mr.ok;
+    }
     if (count.kind != mir.MIR_OP_IMM) {
-        val bounded: bool = count_below(ctx, inst.operands[1], bits);
-        if (!bounded) {
-            val kr: res[mir.MirOperand, fail.Fail] = emit_count_in_range(ctx, mb, inst, count, bits);
-            if (sel kr.err) { ret err[fail.Fail].err{kr.err}; }
-            in_range = kr.ok;
-        }
-        val tr: res[mir.MirOperand, fail.Fail] = count_at_shift_width(ctx, mb, inst, count, w);
+        val full: mir.MirOperand                 = count;
+        val tr:   res[mir.MirOperand, fail.Fail] = count_at_shift_width(ctx, mb, inst, count, w);
         if (sel tr.err) { ret err[fail.Fail].err{tr.err}; }
         count = tr.ok;
-        if (arith && !bounded) {
-            val nr: res[mir.MirOperand, fail.Fail] = emit_saturating_arith_count(ctx, mb, inst, count, in_range, w);
+        if (saturate && arith) {
+            val nr: res[mir.MirOperand, fail.Fail] = emit_saturating_arith_count(ctx, mb, inst, full, count, bits, w);
             if (sel nr.err) { ret err[fail.Fail].err{nr.err}; }
             count = nr.ok;
         }
@@ -1186,7 +1188,7 @@ fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
         }
     }
 
-    val needs_mask: bool       = !arith && in_range.kind != mir.MIR_OP_IMM;
+    val needs_mask: bool       = mask.kind != mir.MIR_OP_IMM;
     var shifted:    mir.VRegId = dst;
     if (needs_mask) {
         val sr: res[mir.VRegId, fail.Fail] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
@@ -1205,17 +1207,7 @@ fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
     if (sel ps.err || !needs_mask) { ret ps; }
 
     # logical: the result survives only when the count was in range
-    val mr: res[mir.VRegId, fail.Fail] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
-    if (sel mr.err) { ret err[fail.Fail].err{mr.err}; }
-    val keep: mir.VRegId     = mr.ok;
-    val pr:   err[fail.Fail] = emit_promote(ctx, mb, mir.op_vreg(keep), in_range, w, 1, false);
-    if (sel pr.err) { ret pr; }
-    val nr: res[mir.VRegId, fail.Fail] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
-    if (sel nr.err) { ret err[fail.Fail].err{nr.err}; }
-    val mask: mir.VRegId     = nr.ok;
-    val ng:   err[fail.Fail] = emit_alu2(ctx, mb, mir.MIR_NEG, mir.op_vreg(mask), mir.op_vreg(keep), w);
-    if (sel ng.err) { ret ng; }
-    ret emit_alu3(ctx, mb, mir.MIR_AND, mir.op_vreg(dst), mir.op_vreg(shifted), mir.op_vreg(mask), w);
+    ret emit_alu3(ctx, mb, mir.MIR_AND, mir.op_vreg(dst), mir.op_vreg(shifted), mask, w);
 }
 
 # a packed vector shift reaches here only in a form the target packs, and
@@ -1326,20 +1318,6 @@ rec VecStep {
     y:  mir.MirOperand;
 }
 
-# a count the ir already bounds below the width needs no saturation: a mask by
-# a constant under the width, seen through the extends and truncations that
-# carry it to the shift's count type
-fun count_below(ctx: *lctx.LowerCtx, v: value.Value, bits: i64) bool {
-    if (v.kind == value.VAL_CONST_INT)              { ret v.data.int_wide.hi == 0 && v.data.int_wide.lo < bits::u64; }
-    if (v.kind != value.VAL_INSTR || ctx.fn == nil) { ret false; }
-    if (v.data.instr::u32 >= ctx.fn.instr_len)      { ret false; }
-    val def: *instr.Instruction = ?ctx.fn.instrs[v.data.instr::u32];
-    if (def.operand_count < 1)                                   { ret false; }
-    if (def.kind == instr.OP_ZEXT || def.kind == instr.OP_TRUNC) { ret count_below(ctx, def.operands[0], bits); }
-    if (def.kind != instr.OP_AND || def.operand_count < 2)       { ret false; }
-    ret count_below(ctx, def.operands[0], bits) || count_below(ctx, def.operands[1], bits);
-}
-
 # `count < bits` as a 0/1 byte, compared at the count's own width
 fun emit_count_in_range(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction,
     count: mir.MirOperand, bits: i64) res[mir.MirOperand, fail.Fail] {
@@ -1350,6 +1328,54 @@ fun emit_count_in_range(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Ins
     val e: err[fail.Fail] = emit_alu3(ctx, mb, mir.MIR_CMP_LT_U, mir.op_vreg(k), count, mir.op_imm(bits), cw);
     if (sel e.err) { ret res[mir.MirOperand, fail.Fail].err{e.err}; }
     ret res[mir.MirOperand, fail.Fail].ok{mir.op_vreg(k)};
+}
+
+# all ones at width `mw` exactly when `count < bits`, the whole count read at
+# its own width. the compare-to-mask reads and writes at most the alu width:
+# a wider mask is its sign extension, and a count wider than the alu is
+# compared by the legalized wide compare, whose 0/1 answer is negated
+fun emit_count_mask(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction,
+    count: mir.MirOperand, bits: i64, mw: u8) res[mir.MirOperand, fail.Fail] {
+    val cw:  u8                         = lctx.op_width_of(ctx, inst.operands[1].ty);
+    val maw: u8                         = ctx.tgt.model.max_alu_width::u8;
+    val mr:  res[mir.VRegId, fail.Fail] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
+    if (sel mr.err) { ret res[mir.MirOperand, fail.Fail].err{mr.err}; }
+    val m: mir.VRegId = mr.ok;
+
+    if (maw != 0 && cw > maw) {
+        val kr: res[mir.MirOperand, fail.Fail] = emit_count_in_range(ctx, mb, inst, count, bits);
+        if (sel kr.err) { ret kr; }
+        val zr: res[mir.VRegId, fail.Fail] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
+        if (sel zr.err) { ret res[mir.MirOperand, fail.Fail].err{zr.err}; }
+        val pr: err[fail.Fail] = emit_promote(ctx, mb, mir.op_vreg(zr.ok), kr.ok, mw, 1, false);
+        if (sel pr.err) { ret res[mir.MirOperand, fail.Fail].err{pr.err}; }
+        val ng: err[fail.Fail] = emit_alu2(ctx, mb, mir.MIR_NEG, mir.op_vreg(m), mir.op_vreg(zr.ok), mw);
+        if (sel ng.err) { ret res[mir.MirOperand, fail.Fail].err{ng.err}; }
+        ret res[mir.MirOperand, fail.Fail].ok{mir.op_vreg(m)};
+    }
+
+    var lw: u8 = mw;
+    if (maw != 0 && lw > maw) { lw = maw; }
+    var narrow: mir.VRegId = m;
+    if (lw != mw) {
+        val nr: res[mir.VRegId, fail.Fail] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
+        if (sel nr.err) { ret res[mir.MirOperand, fail.Fail].err{nr.err}; }
+        narrow = nr.ok;
+    }
+    val ar: res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](ctx.alloc, 3::usize);
+    if (sel ar.err) { ret res[mir.MirOperand, fail.Fail].err{fail.refused(ar.err)}; }
+    val ops: *mir.MirOperand = ar.ok;
+    ops[0] = mir.op_vreg(narrow);
+    ops[1] = count;
+    ops[2] = mir.op_imm(bits);
+    var mi: mir.MirInstr   = mir.instr(mir.MIR_MASK_LT_U, ops, 3, lw, cw);
+    val pe: err[fail.Fail] = lctx.push_instr(ctx, mb, mi);
+    if (sel pe.err) { ret res[mir.MirOperand, fail.Fail].err{pe.err}; }
+    if (lw != mw) {
+        val se: err[fail.Fail] = emit_promote(ctx, mb, mir.op_vreg(m), mir.op_vreg(narrow), mw, lw, true);
+        if (sel se.err) { ret res[mir.MirOperand, fail.Fail].err{se.err}; }
+    }
+    ret res[mir.MirOperand, fail.Fail].ok{mir.op_vreg(m)};
 }
 
 # the range test read the whole count; the shift itself reads it at its own
@@ -1374,23 +1400,21 @@ fun count_at_shift_width(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.In
     ret res[mir.MirOperand, fail.Fail].ok{mir.op_vreg(t)};
 }
 
-# `count | (in_range - 1)`: the count itself in range, all ones out of range,
-# at the count's width once it is no wider than the shift
+# `count | ~m`: the count itself in range, all ones out of range, at the
+# count's width once it is no wider than the shift; the mask reads the whole
+# count, before its truncation to the shift's width
 fun emit_saturating_arith_count(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction,
-    count: mir.MirOperand, in_range: mir.MirOperand, w: u8) res[mir.MirOperand, fail.Fail] {
+    full: mir.MirOperand, count: mir.MirOperand, bits: i64, w: u8) res[mir.MirOperand, fail.Fail] {
     var cw: u8 = lctx.op_width_of(ctx, inst.operands[1].ty);
     if (cw > w) { cw = w; }
     cw = lctx.clamp_alu_width(ctx.tgt.model.alu_min_width, cw);
-    val zr: res[mir.VRegId, fail.Fail] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
-    if (sel zr.err) { ret res[mir.MirOperand, fail.Fail].err{zr.err}; }
-    val keep: mir.VRegId     = zr.ok;
-    val pr:   err[fail.Fail] = emit_promote(ctx, mb, mir.op_vreg(keep), in_range, cw, 1, false);
-    if (sel pr.err) { ret res[mir.MirOperand, fail.Fail].err{pr.err}; }
+    val mr: res[mir.MirOperand, fail.Fail] = emit_count_mask(ctx, mb, inst, full, bits, cw);
+    if (sel mr.err) { ret mr; }
     val fr: res[mir.VRegId, fail.Fail] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
     if (sel fr.err) { ret res[mir.MirOperand, fail.Fail].err{fr.err}; }
     val fill: mir.VRegId     = fr.ok;
-    val sb:   err[fail.Fail] = emit_alu3(ctx, mb, mir.MIR_SUB, mir.op_vreg(fill), mir.op_vreg(keep), mir.op_imm(1), cw);
-    if (sel sb.err) { ret res[mir.MirOperand, fail.Fail].err{sb.err}; }
+    val nt:   err[fail.Fail] = emit_alu2(ctx, mb, mir.MIR_NOT, mir.op_vreg(fill), mr.ok, cw);
+    if (sel nt.err) { ret res[mir.MirOperand, fail.Fail].err{nt.err}; }
     val nr: res[mir.VRegId, fail.Fail] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
     if (sel nr.err) { ret res[mir.MirOperand, fail.Fail].err{nr.err}; }
     val n:   mir.VRegId     = nr.ok;
@@ -2791,9 +2815,9 @@ test "mach.lang.be.codegen.mir.lower.lower_generic:high_multiply_takes_the_mir_h
 # shift wider than the alu is legalized into constant stages, so its count stays
 # a vreg: a move of a two-lane count into rcx would put a wide value in a
 # physical register, which legalize refuses (#3511, #3602). both carry the
-# saturation (#3756): a logical shift is `k = count < W; shift; and (0 - k)`,
-# an arithmetic one shifts by `count | (k - 1)`, and an in-range immediate
-# count is the bare machine shift
+# saturation (#3756): a logical shift is `m = count < W ? ~0 : 0; shift; and
+# m`, an arithmetic one shifts by `count | ~m`, and an in-range immediate count
+# or one the middle end marked bounded is the bare machine shift (#3885)
 test "mach.lang.be.codegen.mir.lower.lower_shift:saturates_a_variable_count_and_keeps_a_wide_count_a_vreg" {
     var alloc:  A.Allocator;
     val make_r: err[A.Error] = page.make(?alloc);
@@ -2890,6 +2914,12 @@ test "mach.lang.be.codegen.mir.lower.lower_shift:saturates_a_variable_count_and_
     instructions[9].ty            = t64_r.ok;
     instructions[9].operands      = ?unbounded[0];
     instructions[9].operand_count = 2;
+    var ii: u32 = 0;
+    for (ii < 10) {
+        instructions[ii].flags = 0;
+        ii                     = ii + 1;
+    }
+    instructions[7].flags = instr.INSTR_FLAG_COUNT_BOUNDED;
     var fn: ir.Function;
     fn.instrs    = ?instructions[0];
     fn.instr_len = 10;
@@ -2920,8 +2950,9 @@ test "mach.lang.be.codegen.mir.lower.lower_shift:saturates_a_variable_count_and_
     var mb: mir.MirBlock;
     fin { mir.dnit_block(?alloc, ?mb); }
 
-    # the wide logical shift: compare at the count's width (16), the shift with
-    # the count vreg itself, then the zero-extended flag, its negation, the mask
+    # the wide logical shift: a count wider than the alu is compared by the
+    # wide compare at its own width (16), whose 0/1 answer is zero-extended and
+    # negated into the mask; the shift keeps the count vreg itself
     val r0: err[fail.Fail] = lower_instr(?ctx, ?fn, ?mb, 0);
     if (sel r0.err)                                              { ret 2; }
     if (mb.instr_count != 5)                                     { ret 3; }
@@ -2929,119 +2960,119 @@ test "mach.lang.be.codegen.mir.lower.lower_shift:saturates_a_variable_count_and_
     if (mb.instrs[0].width != 16)                                { ret 4; }
     if (mb.instrs[0].operands[2].kind != mir.MIR_OP_IMM)         { ret 4; }
     if (mb.instrs[0].operands[2].imm != 128)                     { ret 4; }
-    if (mb.instrs[1].opcode != mir.MIR_SHL)                      { ret 5; }
-    if (mb.instrs[1].operands[2].kind != mir.MIR_OP_VREG)        { ret 5; }
-    if (mb.instrs[1].operands[2].vreg.n != 1)                    { ret 5; }
-    if (mb.instrs[1].operands[0].vreg.n == 2)                    { ret 5; }
-    if (mb.instrs[2].opcode != mir.MIR_ZEXT)                     { ret 6; }
-    if (mb.instrs[2].width != 16 || mb.instrs[2].src_width != 1) { ret 6; }
-    if (mb.instrs[3].opcode != mir.MIR_NEG)                      { ret 6; }
+    if (mb.instrs[1].opcode != mir.MIR_ZEXT)                     { ret 5; }
+    if (mb.instrs[1].width != 16 || mb.instrs[1].src_width != 1) { ret 5; }
+    if (mb.instrs[2].opcode != mir.MIR_NEG)                      { ret 5; }
+    if (mb.instrs[3].opcode != mir.MIR_SHL)                      { ret 6; }
+    if (mb.instrs[3].operands[2].kind != mir.MIR_OP_VREG)        { ret 6; }
+    if (mb.instrs[3].operands[2].vreg.n != 1)                    { ret 6; }
+    if (mb.instrs[3].operands[0].vreg.n == 2)                    { ret 6; }
     if (mb.instrs[4].opcode != mir.MIR_AND)                      { ret 7; }
     if (mb.instrs[4].width != 16)                                { ret 7; }
     if (mb.instrs[4].operands[0].vreg.n != 2)                    { ret 7; }
 
-    # the narrow logical shift: the compare reads the u8 count at width 1,
-    # the count moves into the fixed register, then the same mask at width 8
+    # the narrow logical shift: one compare-to-mask reads the u8 count at
+    # width 1 and writes the mask at 8, the count moves into the fixed
+    # register, and the mask keeps the result
     val r1: err[fail.Fail] = lower_instr(?ctx, ?fn, ?mb, 1);
-    if (sel r1.err)                                       { ret 8; }
-    if (mb.instr_count != 11)                             { ret 9; }
-    if (mb.instrs[5].opcode != mir.MIR_CMP_LT_U)          { ret 10; }
-    if (mb.instrs[5].width != 1)                          { ret 10; }
-    if (mb.instrs[5].operands[2].imm != 64)               { ret 10; }
-    if (mb.instrs[6].opcode != mir.MIR_MOV)               { ret 11; }
-    if (mb.instrs[6].operands[0].kind != mir.MIR_OP_PREG) { ret 11; }
-    if (mb.instrs[7].opcode != mir.MIR_SHL)               { ret 12; }
-    if (mb.instrs[7].operands[2].kind != mir.MIR_OP_PREG) { ret 12; }
-    if (mb.instrs[8].opcode != mir.MIR_ZEXT)              { ret 13; }
-    if (mb.instrs[9].opcode != mir.MIR_NEG)               { ret 13; }
-    if (mb.instrs[10].opcode != mir.MIR_AND)              { ret 13; }
-    if (mb.instrs[10].width != 8)                         { ret 13; }
-    if (mb.instrs[10].operands[0].vreg.n != 3)            { ret 13; }
+    if (sel r1.err)                                                         { ret 8; }
+    if (mb.instr_count != 9)                                                { ret 9; }
+    if (mb.instrs[5].opcode != mir.MIR_MASK_LT_U)                           { ret 10; }
+    if (mb.instrs[5].width != 8 || mb.instrs[5].src_width != 1)             { ret 10; }
+    if (mb.instrs[5].operands[2].imm != 64)                                 { ret 10; }
+    if (mb.instrs[6].opcode != mir.MIR_MOV)                                 { ret 11; }
+    if (mb.instrs[6].operands[0].kind != mir.MIR_OP_PREG)                   { ret 11; }
+    if (mb.instrs[7].opcode != mir.MIR_SHL)                                 { ret 12; }
+    if (mb.instrs[7].operands[2].kind != mir.MIR_OP_PREG)                   { ret 12; }
+    if (mb.instrs[8].opcode != mir.MIR_AND)                                 { ret 13; }
+    if (mb.instrs[8].width != 8)                                            { ret 13; }
+    if (mb.instrs[8].operands[0].vreg.n != 3)                               { ret 13; }
+    if (mb.instrs[8].operands[2].vreg.n != mb.instrs[5].operands[0].vreg.n) { ret 13; }
 
-    # the arithmetic shift saturates its count instead: zext, sub 1, or, and
-    # the or'd count is what moves into the fixed register; no mask follows
+    # the arithmetic shift saturates its count instead: the mask at the
+    # count's alu width, its complement or'd into the count, and the or'd
+    # count is what moves into the fixed register; no mask follows
     val r2: err[fail.Fail] = lower_instr(?ctx, ?fn, ?mb, 2);
     if (sel r2.err)                                                                                                                { ret 14; }
-    if (mb.instr_count != 17)                                                                                                      { ret 15; }
-    if (mb.instrs[11].opcode != mir.MIR_CMP_LT_U)                                                                                  { ret 16; }
-    if (mb.instrs[12].opcode != mir.MIR_ZEXT)                                                                                      { ret 16; }
-    if (mb.instrs[12].width != 4)                                                                                                  { ret 16; }
-    if (mb.instrs[13].opcode != mir.MIR_SUB)                                                                                       { ret 16; }
-    if (mb.instrs[13].operands[2].kind != mir.MIR_OP_IMM)                                                                          { ret 16; }
-    if (mb.instrs[13].operands[2].imm != 1)                                                                                        { ret 16; }
-    if (mb.instrs[14].opcode != mir.MIR_OR)                                                                                        { ret 17; }
-    if (mb.instrs[14].operands[1].kind != mir.MIR_OP_VREG || mb.instrs[14].operands[1].vreg.n != 1)                                { ret 17; }
-    if (mb.instrs[15].opcode != mir.MIR_MOV)                                                                                       { ret 18; }
-    if (mb.instrs[15].operands[1].kind != mir.MIR_OP_VREG || mb.instrs[15].operands[1].vreg.n != mb.instrs[14].operands[0].vreg.n) { ret 18; }
-    if (mb.instrs[16].opcode != mir.MIR_SHR_S)                                                                                     { ret 19; }
-    if (mb.instrs[16].operands[0].vreg.n != 4)                                                                                     { ret 19; }
+    if (mb.instr_count != 14)                                                                                                      { ret 15; }
+    if (mb.instrs[9].opcode != mir.MIR_MASK_LT_U)                                                                                  { ret 16; }
+    if (mb.instrs[9].width != 4)                                                                                                   { ret 16; }
+    if (mb.instrs[10].opcode != mir.MIR_NOT)                                                                                       { ret 16; }
+    if (mb.instrs[11].opcode != mir.MIR_OR)                                                                                        { ret 17; }
+    if (mb.instrs[11].operands[1].kind != mir.MIR_OP_VREG || mb.instrs[11].operands[1].vreg.n != 1)                                { ret 17; }
+    if (mb.instrs[12].opcode != mir.MIR_MOV)                                                                                       { ret 18; }
+    if (mb.instrs[12].operands[1].kind != mir.MIR_OP_VREG || mb.instrs[12].operands[1].vreg.n != mb.instrs[11].operands[0].vreg.n) { ret 18; }
+    if (mb.instrs[13].opcode != mir.MIR_SHR_S)                                                                                     { ret 19; }
+    if (mb.instrs[13].operands[0].vreg.n != 4)                                                                                     { ret 19; }
 
     # an in-range immediate count is the bare shift
     val r3: err[fail.Fail] = lower_instr(?ctx, ?fn, ?mb, 3);
     if (sel r3.err)                                       { ret 20; }
-    if (mb.instr_count != 18)                             { ret 21; }
-    if (mb.instrs[17].opcode != mir.MIR_SHR_U)            { ret 21; }
-    if (mb.instrs[17].operands[2].kind != mir.MIR_OP_IMM) { ret 21; }
-    if (mb.instrs[17].operands[2].imm != 3)               { ret 21; }
+    if (mb.instr_count != 15)                             { ret 21; }
+    if (mb.instrs[14].opcode != mir.MIR_SHR_U)            { ret 21; }
+    if (mb.instrs[14].operands[2].kind != mir.MIR_OP_IMM) { ret 21; }
+    if (mb.instrs[14].operands[2].imm != 3)               { ret 21; }
 
     # an immediate count at the width, should one reach lowering, is the
     # saturated shift: an arithmetic one by width - 1
     val r4: err[fail.Fail] = lower_instr(?ctx, ?fn, ?mb, 4);
     if (sel r4.err)                            { ret 22; }
-    if (mb.instr_count != 19)                  { ret 23; }
-    if (mb.instrs[18].opcode != mir.MIR_SHR_S) { ret 23; }
-    if (mb.instrs[18].operands[2].imm != 63)   { ret 23; }
+    if (mb.instr_count != 16)                  { ret 23; }
+    if (mb.instrs[15].opcode != mir.MIR_SHR_S) { ret 23; }
+    if (mb.instrs[15].operands[2].imm != 63)   { ret 23; }
 
-    # a count wider than the shift: the range test reads all of it, then the
-    # shift's own width keeps its low bits before the saturating or and the
-    # fixed register read it; a narrow shift never names the wide vreg
+    # a count wider than the shift: the shift's own width keeps its low bits,
+    # the range test reads all of it through the wide compare, and the
+    # saturating or and the fixed register read the low bits; a narrow shift
+    # never names the wide vreg
     val r5: err[fail.Fail] = lower_instr(?ctx, ?fn, ?mb, 5);
     if (sel r5.err)                                                { ret 24; }
-    if (mb.instr_count != 26)                                      { ret 25; }
-    if (mb.instrs[19].opcode != mir.MIR_CMP_LT_U)                  { ret 26; }
-    if (mb.instrs[19].width != 16)                                 { ret 26; }
-    if (mb.instrs[19].operands[1].vreg.n != 1)                     { ret 26; }
-    if (mb.instrs[20].opcode != mir.MIR_TRUNC)                     { ret 27; }
-    if (mb.instrs[20].width != 8 || mb.instrs[20].src_width != 16) { ret 27; }
-    if (mb.instrs[20].operands[1].vreg.n != 1)                     { ret 27; }
-    val low: u32 = mb.instrs[20].operands[0].vreg.n;
-    if (mb.instrs[21].opcode != mir.MIR_ZEXT)                                                         { ret 28; }
-    if (mb.instrs[21].width != 8)                                                                     { ret 28; }
-    if (mb.instrs[22].opcode != mir.MIR_SUB)                                                          { ret 28; }
-    if (mb.instrs[23].opcode != mir.MIR_OR)                                                           { ret 29; }
-    if (mb.instrs[23].width != 8)                                                                     { ret 29; }
-    if (mb.instrs[23].operands[1].kind != mir.MIR_OP_VREG || mb.instrs[23].operands[1].vreg.n != low) { ret 29; }
-    if (mb.instrs[24].opcode != mir.MIR_MOV)                                                          { ret 30; }
-    if (mb.instrs[25].opcode != mir.MIR_SHR_S)                                                        { ret 30; }
-    if (mb.instrs[25].operands[2].kind != mir.MIR_OP_PREG)                                            { ret 30; }
-    var k: u32 = 19;
-    for (k < 26) {
+    if (mb.instr_count != 24)                                      { ret 25; }
+    if (mb.instrs[16].opcode != mir.MIR_TRUNC)                     { ret 26; }
+    if (mb.instrs[16].width != 8 || mb.instrs[16].src_width != 16) { ret 26; }
+    if (mb.instrs[16].operands[1].vreg.n != 1)                     { ret 26; }
+    val low: u32 = mb.instrs[16].operands[0].vreg.n;
+    if (mb.instrs[17].opcode != mir.MIR_CMP_LT_U)                                                     { ret 27; }
+    if (mb.instrs[17].width != 16)                                                                    { ret 27; }
+    if (mb.instrs[17].operands[1].vreg.n != 1)                                                        { ret 27; }
+    if (mb.instrs[18].opcode != mir.MIR_ZEXT)                                                         { ret 28; }
+    if (mb.instrs[18].width != 8)                                                                     { ret 28; }
+    if (mb.instrs[19].opcode != mir.MIR_NEG)                                                          { ret 28; }
+    if (mb.instrs[20].opcode != mir.MIR_NOT)                                                          { ret 28; }
+    if (mb.instrs[21].opcode != mir.MIR_OR)                                                           { ret 29; }
+    if (mb.instrs[21].width != 8)                                                                     { ret 29; }
+    if (mb.instrs[21].operands[1].kind != mir.MIR_OP_VREG || mb.instrs[21].operands[1].vreg.n != low) { ret 29; }
+    if (mb.instrs[22].opcode != mir.MIR_MOV)                                                          { ret 30; }
+    if (mb.instrs[23].opcode != mir.MIR_SHR_S)                                                        { ret 30; }
+    if (mb.instrs[23].operands[2].kind != mir.MIR_OP_PREG)                                            { ret 30; }
+    var k: u32 = 16;
+    for (k < 24) {
         var o: u32 = 0;
         for (o < mb.instrs[k].operand_count) {
             val op: mir.MirOperand = mb.instrs[k].operands[o];
-            if (op.kind == mir.MIR_OP_VREG && op.vreg.n == 1 && k != 19 && k != 20) { ret 31; }
+            if (op.kind == mir.MIR_OP_VREG && op.vreg.n == 1 && k != 16 && k != 17) { ret 31; }
             o = o + 1;
         }
         k = k + 1;
     }
 
-    # a count masked below the width is already in range: the bare shift, no
-    # compare and no saturating or
+    # a count the middle end proved below the width (here a mask by 63) is
+    # the bare shift, no compare and no saturating or
     val r7: err[fail.Fail] = lower_instr(?ctx, ?fn, ?mb, 7);
     if (sel r7.err)                                                                                 { ret 32; }
-    if (mb.instr_count != 28)                                                                       { ret 33; }
-    if (mb.instrs[26].opcode != mir.MIR_MOV)                                                        { ret 33; }
-    if (mb.instrs[26].operands[1].kind != mir.MIR_OP_VREG || mb.instrs[26].operands[1].vreg.n != 8) { ret 33; }
-    if (mb.instrs[27].opcode != mir.MIR_SHR_S)                                                      { ret 33; }
-    if (mb.instrs[27].operands[0].vreg.n != 9)                                                      { ret 33; }
+    if (mb.instr_count != 26)                                                                       { ret 33; }
+    if (mb.instrs[24].opcode != mir.MIR_MOV)                                                        { ret 33; }
+    if (mb.instrs[24].operands[1].kind != mir.MIR_OP_VREG || mb.instrs[24].operands[1].vreg.n != 8) { ret 33; }
+    if (mb.instrs[25].opcode != mir.MIR_SHR_S)                                                      { ret 33; }
+    if (mb.instrs[25].operands[0].vreg.n != 9)                                                      { ret 33; }
 
-    # a mask that admits the width does not bound the count: the full sequence
+    # an unmarked count, here a mask that admits the width: the full sequence
     val r9: err[fail.Fail] = lower_instr(?ctx, ?fn, ?mb, 9);
-    if (sel r9.err)                               { ret 34; }
-    if (mb.instr_count != 34)                     { ret 35; }
-    if (mb.instrs[28].opcode != mir.MIR_CMP_LT_U) { ret 35; }
-    if (mb.instrs[33].opcode != mir.MIR_AND)      { ret 35; }
-    if (mb.instrs[33].operands[0].vreg.n != 11)   { ret 35; }
+    if (sel r9.err)                                { ret 34; }
+    if (mb.instr_count != 30)                      { ret 35; }
+    if (mb.instrs[26].opcode != mir.MIR_MASK_LT_U) { ret 35; }
+    if (mb.instrs[29].opcode != mir.MIR_AND)       { ret 35; }
+    if (mb.instrs[29].operands[0].vreg.n != 11)    { ret 35; }
     ret 0;
 }
 

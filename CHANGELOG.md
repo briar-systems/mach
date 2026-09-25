@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.12.1] - 2026-09-25
+
+### Fixed
+- A shift whose count the program already bounds below the operand's width no longer pays the #3756 saturation, which 5.11.0 added to every shift by a count that was not a constant or masked by one. `for (plane < 8) { x >> plane }` compiled to a compare, a `setb`, two zero-extends, a `neg` and an `and` around the shift, and the extra live values pushed an enclosing loop counter to the stack. The middle end now answers the unsigned range of an integer value where a block reads it (`mach.lang.me.analysis.range`), from constants, the defining operation (masks, extensions, sums, differences, products, shifts and divisions by constants), the counted loops the loop analysis recognizes, and the compares whose branch edge dominates the reading block, including the failing arm of an `if`. A last pass marks each shift whose count it proves below the width, and lowering emits the bare machine shift for it. A count that is not proven keeps the saturation, now as one compare-to-mask: `cmp; sbb; and` on x86-64, `cmp; csetm; and` on aarch64, `sltiu; neg; and` on riscv, an `OpSelect` on SPIR-V. A shift by a count at or above the width still answers 0, or the sign fill, and `test/cases/bits/shift_bounded` pins proven and unproven counts against a C reference on every column. On x86-64 the bit-plane load of a bitsliced cipher runs 1,801 instructions per call, against 1,817 under 5.10.0 and 3,357 under 5.12.0, and mach-crypto v0.21.0's AES-128 block and 1,200-byte AES-128-GCM seal recover most of their 26% and 38%: the remaining cost is the clamp on a bit-plane position that adds a runtime block index, which no guard bounds (#3885).
+- `doc/language/secrecy.md` no longer lists closed issues as open holes. Its top warning keeps the experimental-preview label but no longer says a secret-disclosure path is open, since the one it meant (#2168) is fixed, and the Assurance section drops its list of known open holes, all four of which (#2168, #2195, #2297, #2239) are closed. The check over the final allocated machine program (#3591) stays the open item, named under "Where the check runs", which now states in the present tense that the contract is checked at the IR level instead of "Through 5.0.0" (#3882).
+
 ## [5.12.0] - 2026-09-23
 
 ### Changed
