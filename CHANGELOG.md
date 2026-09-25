@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.12.2] - 2026-09-25
+
 ### Added
 - Hardware AES and carry-less multiply in inline asm. The x86_64 vocabulary gains `aes` and `pclmul` and the aarch64 vocabulary `aes` and `pmull`, spelled in `[target.X].extensions`, `#[extensions(...)]` and `$mach.build.extensions.<name>` like the sha rows of #3521. x86_64 encodes `aesenc`, `aesenclast`, `aesdec`, `aesdeclast`, `aesimc` and `aeskeygenassist` under `aes` and `pclmulqdq` under `pclmul`, each with a register or memory source; aarch64 encodes `aese`, `aesd`, `aesmc` and `aesimc` under `aes` and `pmull vD.1q, vN.1d, vM.1d` and `pmull2 vD.1q, vN.2d, vM.2d` under `pmull`, which brings `aes` as the architecture's one ID_AA64ISAR0_EL1.AES field does. Using one where neither the target nor the function admits its extension is a located error that names both ways to admit it. The constant-time check treats every row as data-independent, from Intel's data-operand-independent-timing list and Arm's DIT list, so an `#[oblivious]` function may run a secret through them, and what they compute from a secret stays secret. Every form's bytes match GNU as 2.47 and llvm-mc 22, and the tests library runs the FIPS-197 appendix C.1 AES-128 cipher and its inverse and the GCM test case 2 GHASH through the rows where the processor has them. The aarch64 sha2 rows now share one arrangement table with the new rows (`doc/language/asm.md`, `manifest.md`, `comptime-mach.md`) (#3835).
 
