@@ -24,15 +24,15 @@ the symbol, not its module.
 ## Examples
 
 ```mach
-use std.types.size;             # binds module 'size'; use as `size.usize`
-use sz: std.types.size;         # binds module under 'sz'; use as `sz.usize`
-use std.types.size.usize;       # binds symbol 'usize'; use bare as `usize`
-use my_usize: std.types.size.usize;  # binds symbol under 'my_usize'
+use std.types.size; # binds module 'size'; use as `size.usize`
+use sz: std.types.size; # binds module under 'sz'; use as `sz.usize`
+use std.types.size.usize; # binds symbol 'usize'; use bare as `usize`
+use my_usize: std.types.size.usize; # binds symbol under 'my_usize'
 
 val a: size.usize = 1;
-val b: sz.usize = 2;
-val c: usize = 3;
-val d: my_usize = 4;
+val b: sz.usize   = 2;
+val c: usize      = 3;
+val d: my_usize   = 4;
 ```
 
 ```mach fragment
