@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- A shift count masked by the shift's width less one, `x << (n & 63)` on a 64-bit value or `x >> (n & 31)` on a 32-bit one, compiles to the bare machine shift on a target whose shift masks the count itself. The target model records the widths at which that holds (`shift_count_mod_widths`): 32 and 64 bits on x86-64, aarch64 and riscv64, 32 bits on riscv32, and none on SPIR-V, where a shift by the width or more is undefined. The mask is dropped only when every use of it is such a count and its constant is exactly the width less one, so a mask by another constant, a mask whose value is also used elsewhere, and a shift of a narrow value that the ALU widens keep it. On x86-64, #3885's hand-masked bit-plane load runs 1,788 instructions per call instead of 2,060, and `bits/shift_u32` and `bits/shift_i64` pin masked counts at and past the width against the C reference on every column (#3893).
+
 ## [5.12.1] - 2026-09-25
 
 ### Fixed
