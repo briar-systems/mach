@@ -1,19 +1,15 @@
 # mach.lang.driver.cache
 
-## fun snapshot
+## fun configuration
 
 ```mach
-pub fun snapshot(scratch: *A.Allocator, p: *project.Project, config: *u8, config_len: usize,
+pub fun configuration(scratch: *A.Allocator, p: *project.Project, config: *u8, config_len: usize,
 compiler_id: *compiler.Identity, digest: *[32]u8) err[fail.Fail];
 ```
 
-hash the whole active build cell because generic instantiations can cross import direction
-
-## fun operation_active
-
-```mach
-pub fun operation_active(p: *project.Project) bool;
-```
+what every module's key shares: the compiler identity, the configuration
+bytes the driver captured (target, platform, project identity), the request,
+the step outputs, the realized dependency closure and the link providers
 
 ## fun identify
 
@@ -29,15 +25,6 @@ under the readout phase ph that asked for it
 ```mach
 pub fun identity_available(p: *project.Project) bool;
 ```
-
-## fun prepare
-
-```mach
-pub fun prepare(p: *project.Project, snapshot: *[32]u8) err[fail.Fail];
-```
-
-once per query operation. snapshot is the cell digest the operation computed,
-nil when the cache is off or the compiler has no identity
 
 ## fun object_path
 
@@ -55,6 +42,15 @@ pub fun test_object_path(p: *project.Project, m: *project.ModuleEntry, a: *A.All
 
 where the build writes module m's test object: `obj/<project>/<module path>.test.<ext>`
 
+## fun has_test_object
+
+```mach
+pub fun has_test_object(p: *project.Project, m: *project.ModuleEntry) bool;
+```
+
+the module gets a test object in this build: a test build, and a module whose
+source declares a test or a `#[testing]` declaration
+
 ## fun early_restore_enabled
 
 ```mach
@@ -71,9 +67,8 @@ referenced module's ir while generating one object
 pub fun restored(p: *project.Project, m: *project.ModuleEntry) bool;
 ```
 
-the module's codegen product is its cached object under the current
-snapshot, whether it is still staged or a query already took it: the module
-does not lower, and its object is already in `obj/`
+the module's codegen product is its cached object under the key this load
+built, whether it is still staged or a query already took it
 
 ## fun staged_restored
 
@@ -89,8 +84,7 @@ restored and still staged, which is what the codegen query publishes
 pub fun test_restored(p: *project.Project, m: *project.ModuleEntry) bool;
 ```
 
-the module's test object is its cached object under the current snapshot:
-it does not lower, and it is already in `obj/`
+the module's test object is its cached object under the key this load built
 
 ## fun test_staged_restored
 
@@ -99,6 +93,47 @@ pub fun test_staged_restored(p: *project.Project, m: *project.ModuleEntry) bool;
 ```
 
 the test object is restored and still staged for the codegen query to publish
+
+## fun skips_lowering
+
+```mach
+pub fun skips_lowering(p: *project.Project, m: *project.ModuleEntry) bool;
+```
+
+the module is restored and nothing needs its lowered ir
+
+## fun lowered_count
+
+```mach
+pub fun lowered_count(p: *project.Project) u32;
+```
+
+the emitted modules the build lowers
+
+## fun generated_count
+
+```mach
+pub fun generated_count(p: *project.Project) u32;
+```
+
+the emitted modules the build generates code for
+
+## fun frontend_count
+
+```mach
+pub fun frontend_count(p: *project.Project) u32;
+```
+
+the modules the front end still processes
+
+## fun forget
+
+```mach
+pub fun forget(p: *project.Project);
+```
+
+every key and skip decision of the previous load is dropped: the next load
+keys again, and a project that is not keyed processes every module
 
 ## rec Cached
 
@@ -119,21 +154,49 @@ none on a miss: an object that is missing, unreadable, carries no record or
 a damaged one, or was built under another key is rebuilt, never reused.
 err only when allocation fails
 
-## fun restore
+## fun object_key
 
 ```mach
-pub fun restore(p: *project.Project, mid: session.ModuleId, ph: u8) res[bool, fail.Fail];
+pub fun object_key(p: *project.Project, m: *project.ModuleEntry, out: *[32]u8) err[fail.Fail];
 ```
 
-a hit is reported under the readout phase ph that asked for the module
+the object key of a module: its module key and its name. a module's other
+objects (a test object) key off this one
 
-## fun restore_test
+## fun test_object_key
 
 ```mach
-pub fun restore_test(p: *project.Project, mid: session.ModuleId, ph: u8) res[bool, fail.Fail];
+pub fun test_object_key(p: *project.Project, m: *project.ModuleEntry, out: *[32]u8) err[fail.Fail];
 ```
 
-the module's test object, read back like its normal object
+the key of module m's test object: its normal object's key and its whole source
+
+## val TEST_KEY_BIT
+
+```mach
+pub val TEST_KEY_BIT: u64 = 0x100000000
+```
+
+a module's test object is keyed in the query database by its stable id and this bit
+
+## fun test_input_key
+
+```mach
+pub fun test_input_key(m: *project.ModuleEntry) u64;
+```
+
+the query key of a module's test object products and its object key input
+
+## fun prepare
+
+```mach
+pub fun prepare(p: *project.Project, config: *u8, config_len: usize, ph: u8) err[fail.Fail];
+```
+
+once per load, after the load walk and the embedded inputs, before anything
+is resolved: key every module, read each emitted module's `obj/` object under
+its key, and mark the modules the front end skips. config is the captured
+configuration identity. its items are reported under the readout phase ph
 
 ## fun take_staged
 
@@ -169,7 +232,7 @@ a module's tests, from its lowered test ir or from the facts its restored test o
 ## fun publish
 
 ```mach
-pub fun publish(p: *project.Project, m: *project.ModuleEntry, image: *of.ObjectImage) err[fail.Fail];
+pub fun publish(p: *project.Project, m: *project.ModuleEntry, image: *of.ObjectImage, back_key: u64) err[fail.Fail];
 ```
 
 a generated image carries its record into `obj/`: the key it was built
@@ -178,6 +241,9 @@ under and the facts its lowered ir holds
 ## fun publish_test
 
 ```mach
-pub fun publish_test(p: *project.Project, m: *project.ModuleEntry, image: *of.ObjectImage) err[fail.Fail];
+pub fun publish_test(p: *project.Project, m: *project.ModuleEntry, image: *of.ObjectImage, back_key: u64) err[fail.Fail];
 ```
+
+the same for the module's test object, which records only its own back half's
+warnings: the normal object carries the front end's
 

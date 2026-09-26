@@ -51,17 +51,19 @@ pub fun equal(left: *[32]u8, right: *[32]u8) bool;
 ## fun object
 
 ```mach
-pub fun object(snapshot: *[32]u8, module: str, out: *[32]u8) err[fail.Fail];
+pub fun object(module_key: *[32]u8, module: str, out: *[32]u8) err[fail.Fail];
 ```
+
+the key of a module's object: the module's key and its name
 
 ## fun test_object
 
 ```mach
-pub fun test_object(object_key: *[32]u8, source: str, out: *[32]u8) err[fail.Fail];
+pub fun test_object(object_key: *[32]u8, source: *[32]u8, out: *[32]u8) err[fail.Fail];
 ```
 
-the key of a module's test object: the key of the normal object it builds on,
-and the module's source, which holds the test bodies the normal key need not cover
+the key of a module's test object: the key of the normal object it is lowered
+against, and the digest of the module's whole source, tests included
 
 ## fun step
 
