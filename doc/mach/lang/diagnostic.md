@@ -36,6 +36,35 @@ pub val SEVERITY_HELP:    Severity = 3
 pub fun severity_valid(s: Severity) bool;
 ```
 
+## def WarningKind
+
+```mach
+pub def WarningKind: u8
+```
+
+the named warning kinds, a closed catalog: a warning that carries a kind can be silenced
+by its name, and an unnamed one cannot
+
+## val WARNING_UNNAMED
+
+```mach
+pub val WARNING_UNNAMED:               WarningKind = 0
+```
+
+## val WARNING_INEXACT_FLOAT_LITERAL
+
+```mach
+pub val WARNING_INEXACT_FLOAT_LITERAL: WarningKind = 1
+```
+
+## fun warning_kind_name
+
+```mach
+pub fun warning_kind_name(k: WarningKind) opt[str];
+```
+
+the stable name of a warning kind; absent for an unnamed warning or a tag outside the catalog
+
 ## def ChildKind
 
 ```mach
