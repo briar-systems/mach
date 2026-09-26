@@ -242,8 +242,10 @@ functions the module's own code does, and every symbol has exactly one
 definition. It defines only what the module's object lacks: the tests, the
 `#[testing]` declarations, a private function inlined everywhere or called
 only from tests, a private global only tests use, and generic instances only
-tests use. The module's object never changes for tests. The test object's
-cache key is the module object's key and the module's source.
+tests use. The module's object never changes for tests, and its cache key
+leaves the module's test declarations out, so editing a test recompiles only
+that module's test object and relinks. The test object's key is the module
+object's key and the module's whole source.
 
 Each run synthesizes one dispatcher object, `test/<artifact>/dispatch.o`,
 whose entry selects a test by its index argument, and links it with the test
