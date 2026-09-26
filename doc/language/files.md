@@ -49,6 +49,7 @@ binary project, as `mach init` writes it for one target:
 [project]
 id = "myproj"
 version = "0.1.0"
+mach = "^5.3"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
