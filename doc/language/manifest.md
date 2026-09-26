@@ -1093,7 +1093,7 @@ plain identifier — it keys the step's stamp file.
 | `in`   | yes | Declared input file list. Accepts globs (`*`, `**`), expanded sorted for a stable fingerprint; a glob that matches nothing is a hard error. |
 | `out`  | yes | Declared output file list. Concrete paths only — a glob here is an error, since the demand match and cache key expand `out` verbatim. |
 | `need` | yes | Array of `step.<name>` requirements or `step.<pattern>` globs this step must run after. Steps may require only steps. Cycles are manifest errors. `[]` for none. |
-| `timeout_seconds` | no | Positive integer number of seconds after which the step's process group is terminated and the build fails. Omit for an unbounded step. |
+| `timeout` | no | Duration string (`"30ms"`, `"30s"`, `"5m"`, `"1h"`) after which the step's process group is terminated and the build fails. Omit for an unbounded step. |
 
 Steps carry **no filters** and **never run automatically**. A step runs only when
 **demanded**:
@@ -1115,14 +1115,15 @@ arguments, and effective environment contribute to its fingerprint. An unchanged
 step whose outputs still exist is skipped. Changing an inherited environment
 value received by the child also invalidates the step.
 
-**Bounding a step.** `timeout_seconds` gives the step a deadline measured from
+**Bounding a step.** `timeout` gives the step a deadline measured from
 the moment it is spawned. When the deadline passes, the step's whole process
 group is signalled — a compiler or archiver the step's shell invoked dies with
 it rather than outliving the build — the child is reaped, and the build fails
 naming the step and the bound. Omitting the key leaves the step unbounded,
 which is the default and the behaviour of every step that does not set it. The
-value is an integer number of seconds; zero, a negative number, and a
-non-integer are rejected at manifest load, and there is no duration grammar.
+value is a string holding a positive integer and a unit, `ms`, `s`, `m` or `h`,
+the same grammar as `mach test --timeout`. A bare number, zero, a fraction and
+any other unit are rejected at manifest load.
 The bound is not part of the step's cache key: changing it does not invalidate
 a cached step, because it cannot change what the step produces.
 
