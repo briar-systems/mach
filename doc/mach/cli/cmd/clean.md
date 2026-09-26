@@ -42,7 +42,8 @@ pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64;
 ```
 
 `mach clean`: remove every output path the manifest can produce for every declared target
-and profile. the obj, ir, asm, and test roots and the binary path of each artifact cell
+and profile. the obj, ir, asm, and test roots, the compiler cache and step staging
+directories, and the binary path of each artifact cell
 are collected, sorted, collapsed under their ancestors, and removed inside the project
 root; a path that escapes the root or crosses a symlink is refused. a missing path is
 not an error; "nothing to clean" prints when nothing was removed

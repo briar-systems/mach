@@ -47,8 +47,8 @@ cmp b c
 
 The seed builds `a` from your tree. `a` builds `b`, and `b` builds `c`. `cmp`
 prints nothing and exits 0 when `b` and `c` are identical. CI runs the
-fixpoint on every pull request, so run it locally only when a change needs
-it. The seed builds the `mach` binary and nothing
+fixpoint on every pull request that touches the compiler, so run it locally
+only when a change needs it. The seed builds the `mach` binary and nothing
 else. Run the unit suites with `c`, as in [Testing and
 formatting](#testing-and-formatting), because the test code may use language
 the seed release predates. A release newer than the pin builds `a` too, and an
@@ -137,7 +137,9 @@ chore: update dependencies
 - Link the issue with `Closes #N`.
 - Leave `CHANGELOG.md` alone. The changelog is written from the merged
   commits when `dev` is released to `main`.
-- Say briefly what changed and which tests you ran. CI runs the full suite.
+- Say briefly what changed and which tests you ran. CI runs the legs the
+  changed paths select (`.github/scripts/ci-legs.sh`), and the pull request
+  from `dev` to `main` runs everything.
 - Merge with a merge commit. Never rebase or fast-forward.
 - When the target is not the default branch, close the linked issue by hand
   after the merge.
