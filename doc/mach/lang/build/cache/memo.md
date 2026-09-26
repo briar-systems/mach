@@ -7,7 +7,8 @@ pub rec Digests;
 ```
 
 what the memo remembers of one file: the digest of its bytes, of its surface
-without positions, and of its surface with the positions of what it omits
+without positions, of its surface with the positions of what it omits, and of
+its code without its test declarations, without and with their positions
 
 ## rec Stamp
 

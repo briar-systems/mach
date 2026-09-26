@@ -1207,7 +1207,11 @@ build prints what a cold one prints. Each object
 carries its key in a section no link loads: `.mach.cache` on
 ELF (not allocated) and COFF (`IMAGE_SCN_LNK_INFO | IMAGE_SCN_LNK_REMOVE`), and
 `__MACH,__mach_cache` on Mach-O (debug-attributed). The parser consumes it, so an
-object links exactly as it would without it. An object that is missing, has no
+object links exactly as it would without it. The section also carries the image
+the compiler generated for the module, and a reused module links that image
+rather than what the object format spells, since COFF and Mach-O cannot spell
+everything a link reads, such as symbol sizes. A warm build therefore links the
+binary a cold one links, byte for byte. An object that is missing, has no
 key, a damaged one or another key is rebuilt, never linked stale. `obj/` holds one
 object per module, the latest, and each object is written to a sibling temporary
 and renamed into place, so an interrupted build leaves the previous object or the

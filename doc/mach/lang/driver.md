@@ -6,6 +6,14 @@
 pub fun append_frontend_roots(p: *project.Project, roots: *Vector[query.QueryKey]) err[outcome.Fail];
 ```
 
+## fun append_test_roots
+
+```mach
+pub fun append_test_roots(p: *project.Project, roots: *Vector[query.QueryKey]) err[outcome.Fail];
+```
+
+the backend's roots and each test object's lowering and codegen
+
 ## fun run_sema_pass
 
 ```mach
@@ -23,6 +31,14 @@ pub fun run_lower_pass(p: *project.Project) err[outcome.Fail];
 ```mach
 pub fun run_codegen_pass(p: *project.Project) err[outcome.Fail];
 ```
+
+## fun run_test_pass
+
+```mach
+pub fun run_test_pass(p: *project.Project) err[outcome.Fail];
+```
+
+a test build's test objects, lowered against the normal objects run_codegen_pass made
 
 ## fun run_link_pass
 
