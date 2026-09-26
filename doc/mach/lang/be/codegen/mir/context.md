@@ -244,6 +244,13 @@ pub fun emit_mov(ctx: *LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, src: mi
 pub fun emit_mov_w(ctx: *LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, src: mir.MirOperand, w: u8) err[fail.Fail];
 ```
 
+## fun emit_promote
+
+```mach
+pub fun emit_promote(ctx: *LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, src: mir.MirOperand,
+dst_w: u8, src_w: u8, signed: bool) err[fail.Fail];
+```
+
 ## fun emit_declassify
 
 ```mach

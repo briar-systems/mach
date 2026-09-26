@@ -741,9 +741,11 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         val aag:  bool        = context.value_is_aggregate(ctx, av.ty);
         var slot: abi.ParamSlot;
         var soff: i64         = 0;
+        var ext:  type.IntExt = type.EXT_NONE;
         if (pidx < layout.param_count) {
             slot = layout.params[pidx];
             soff = slot.offset;
+            ext  = type.ext_at(ctx.types, inst.arg_ext, pidx);
         }
         or {
             val aal:  u64  = type.byte_align_for_machine(ctx.types, av.ty, ctx.layout)::u64;
@@ -779,7 +781,7 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         # the carriers, the caller's copy and every temporary between them are secret when any byte of the object is
         ctx.cur_writes_secret = av.secret;
         val er: err[fail.Fail] = emit_arg_slot(ctx, mb, registers, slot, argop, soff, aag, av.ty,
-            natural_stack_slot(ctx.tgt, pidx >= layout.param_count));
+            natural_stack_slot(ctx.tgt, pidx >= layout.param_count), ext);
         ctx.cur_writes_secret = false;
         if (sel er.err) {
             sig_layout_free(ctx, ?layout);
@@ -1091,7 +1093,7 @@ fun materialize_pieces(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.Para
 }
 
 fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, registers: *mir.MirBlock, slot: abi.ParamSlot, argop: mir.MirOperand,
-    stack_off: i64, is_aggr: bool, ty: type.IrTypeId, natural: bool) err[fail.Fail] {
+    stack_off: i64, is_aggr: bool, ty: type.IrTypeId, natural: bool, ext: type.IntExt) err[fail.Fail] {
     val size: u64 = type.byte_size_for_machine(ctx.types, ty, ctx.layout)::u64;
 
     val scalar_byref: bool = int_by_reference(ctx, ty) &&
@@ -1172,7 +1174,48 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, registers: *mir.Mir
         ret emit_slot_lanes(ctx, mb, registers, slot, argop, ty,
             mir.preg_id(ctx.tgt.model.stack_ptr_reg), stack_off, true);
     }
-    ret emit_call_reg(ctx, mb, registers, mir.op_preg(slot.reg), argop, scalar_reg_move_width(ctx.tgt.model.gpr_width, size));
+    var value: mir.MirOperand = argop;
+    if (caller_widens(ctx.tgt, ext, size)) {
+        val wr: res[mir.MirOperand, fail.Fail] = widen_arg(ctx, mb, argop, size, ext);
+        if (sel wr.err) { ret err[fail.Fail].err{wr.err}; }
+        value = wr.ok;
+    }
+    ret emit_call_reg(ctx, mb, registers, mir.op_preg(slot.reg), value, scalar_reg_move_width(ctx.tgt.model.gpr_width, size));
+}
+
+# the platform widens an integer argument narrower than reg_arg_extend in its
+# register by the extension the call declares for it, where the convention
+# leaves the upper bits to the callee (darwin aarch64, #3927)
+fun caller_widens(tgt: *target.Target, ext: type.IntExt, size: u64) bool {
+    ret ext != type.EXT_NONE && size * 8 < tgt.reg_arg_extend::u64;
+}
+
+# the value is moved into a general register first, as the register move
+# without widening does, since it may live in another bank or in memory. the
+# widening is scalar even inside a call that also passes a vector
+fun widen_arg(ctx: *context.LowerCtx, mb: *mir.MirBlock, argop: mir.MirOperand, size: u64,
+    ext: type.IntExt) res[mir.MirOperand, fail.Fail] {
+    val lane: u32 = ctx.cur_vec_lane;
+    ctx.cur_vec_lane = mir.VEC_LANE_NONE;
+    fin { ctx.cur_vec_lane = lane; }
+    var src: mir.MirOperand = argop;
+    if (argop.kind != mir.MIR_OP_IMM) {
+        val gr: res[mir.VRegId, fail.Fail] = context.new_vreg(ctx, mir.REG_CLASS_GP);
+        if (sel gr.err) { ret res[mir.MirOperand, fail.Fail].err{gr.err}; }
+        ctx.f.vregs[gr.ok.n].secret = ctx.cur_writes_secret;
+        val mv: err[fail.Fail] = context.emit_mov_w(ctx, mb, mir.op_vreg(gr.ok), argop,
+            scalar_reg_move_width(ctx.tgt.model.gpr_width, size));
+        if (sel mv.err) { ret res[mir.MirOperand, fail.Fail].err{mv.err}; }
+        src = mir.op_vreg(gr.ok);
+    }
+    val vr: res[mir.VRegId, fail.Fail] = context.new_vreg(ctx, mir.REG_CLASS_GP);
+    if (sel vr.err) { ret res[mir.MirOperand, fail.Fail].err{vr.err}; }
+    val v: mir.VRegId = vr.ok;
+    ctx.f.vregs[v.n].secret = ctx.cur_writes_secret;
+    val pr: err[fail.Fail] = context.emit_promote(ctx, mb, mir.op_vreg(v), src,
+        (ctx.tgt.reg_arg_extend / 8)::u8, size::u8, ext == type.EXT_SIGN);
+    if (sel pr.err) { ret res[mir.MirOperand, fail.Fail].err{pr.err}; }
+    ret res[mir.MirOperand, fail.Fail].ok{mir.op_vreg(v)};
 }
 
 # a scalar passed by reference gets a caller-owned copy at its own alignment;
@@ -2105,6 +2148,20 @@ test stack_arg__align_and_bytes {
     # a natural slot packs a narrow argument at its own size and alignment
     if (stack_arg_align(?w8, abi.CLASS_STACK, 1, true) != 1) { ret 4; }
     if (stack_arg_bytes(?w8, 4, true) != 4)                  { ret 4; }
+    ret 0;
+}
+
+# darwin aarch64 declares 32: an 8- or 16-bit integer with a declared
+# extension is widened, a 32-bit one and one with none are not (#3927)
+test caller_widens__only_narrow_arguments_with_an_extension {
+    var tgt: target.Target;
+    tgt.reg_arg_extend = 32;
+    if (!caller_widens(?tgt, type.EXT_ZERO, 1)) { ret 1; }
+    if (!caller_widens(?tgt, type.EXT_SIGN, 2)) { ret 2; }
+    if (caller_widens(?tgt, type.EXT_SIGN, 4))  { ret 3; }
+    if (caller_widens(?tgt, type.EXT_NONE, 1))  { ret 4; }
+    tgt.reg_arg_extend = 0;
+    if (caller_widens(?tgt, type.EXT_ZERO, 1)) { ret 5; }
     ret 0;
 }
 
@@ -3212,7 +3269,7 @@ test rv32_f64__in_a_register_pair_leaves_through_a_frame_slot {
     fin { mir.dnit_block(?alloc, ?mb); }
     fin { mir.dnit_block(?alloc, ?regs_block); }
 
-    val from_reg: err[fail.Fail] = emit_arg_slot(?ctx, ?mb, ?regs_block, slot, mir.op_vreg(fv.ok), 0, false, dr.ok, false);
+    val from_reg: err[fail.Fail] = emit_arg_slot(?ctx, ?mb, ?regs_block, slot, mir.op_vreg(fv.ok), 0, false, dr.ok, false, type.EXT_NONE);
     if (sel from_reg.err) { ret 2; }
     # preparation: the float store to the slot, then the slot loaded as one wide general value
     if (mb.instr_count != 2) { ret 3; }
@@ -3236,7 +3293,7 @@ test rv32_f64__in_a_register_pair_leaves_through_a_frame_slot {
 
     mb.instr_count         = 0;
     regs_block.instr_count = 0;
-    val from_imm: err[fail.Fail] = emit_arg_slot(?ctx, ?mb, ?regs_block, slot, mir.op_imm(0x3FF0000000000000), 0, false, dr.ok, false);
+    val from_imm: err[fail.Fail] = emit_arg_slot(?ctx, ?mb, ?regs_block, slot, mir.op_imm(0x3FF0000000000000), 0, false, dr.ok, false, type.EXT_NONE);
     if (sel from_imm.err)                                   { ret 8; }
     if (mb.instr_count != 0 || regs_block.instr_count != 2) { ret 9; }
     k = 0;

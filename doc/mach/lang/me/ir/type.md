@@ -120,6 +120,56 @@ pub rec IrTypeTag;
 pub rec IrTypeFn;
 ```
 
+## def IntExt
+
+```mach
+pub def IntExt: u8
+```
+
+the extension a caller owes an integer argument narrower than 64 bits where
+its platform asks the caller for one: the declared signedness the signless
+integer type does not carry, as LLVM's zeroext and signext (#3927)
+
+## val EXT_NONE
+
+```mach
+pub val EXT_NONE: IntExt = 0
+```
+
+## val EXT_ZERO
+
+```mach
+pub val EXT_ZERO: IntExt = 1
+```
+
+## val EXT_SIGN
+
+```mach
+pub val EXT_SIGN: IntExt = 2
+```
+
+## def ExtListId
+
+```mach
+pub def ExtListId: u32
+```
+
+an interned list of one IntExt per parameter, carried by a function's
+declaration and by each call rather than by the signless function type.
+trailing EXT_NONE entries are dropped, so a list with none is EXT_LIST_NONE
+
+## val EXT_LIST_NONE
+
+```mach
+pub val EXT_LIST_NONE: ExtListId = 0
+```
+
+## rec ExtList
+
+```mach
+pub rec ExtList;
+```
+
 ## rec IrType
 
 ```mach
@@ -143,6 +193,30 @@ pub fun init(t: *IrTypeTable, a: *A.Allocator) err[fail.Fail];
 ```mach
 pub fun dnit(t: *IrTypeTable);
 ```
+
+## fun intern_ext_list
+
+```mach
+pub fun intern_ext_list(t: *IrTypeTable, ext: *IntExt, count: u32) res[ExtListId, fail.Fail];
+```
+
+the list id of `count` extensions, one per parameter in order
+
+## fun ext_at
+
+```mach
+pub fun ext_at(t: *IrTypeTable, xid: ExtListId, index: u32) IntExt;
+```
+
+the extension of parameter `index` in list `xid`: EXT_NONE past its end
+
+## fun copy_ext_list
+
+```mach
+pub fun copy_ext_list(dst: *IrTypeTable, src: *IrTypeTable, xid: ExtListId) res[ExtListId, fail.Fail];
+```
+
+the list `xid` of table `src` interned in `dst`
 
 ## fun get
 
