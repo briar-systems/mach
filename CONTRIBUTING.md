@@ -90,8 +90,8 @@ writes, so a change to a doc-comment or to the module tree regenerates them in
 the same pull request, and CI fails when the committed pages differ from a
 fresh generation.
 
-`bash test/run.sh` runs the codegen corpus against the external decoders and
-the C reference, and `bash test/run.sh --link` the link cases; see
+`bash test/run.sh` runs the codegen corpus, a differential of each case against
+the same program written in C, and `bash test/run.sh --link` the link cases; see
 [test/README.md](test/README.md).
 
 

@@ -1,18 +1,17 @@
 # test
 
 `mach test .` is the unit suite. Everything here proves correctness at the codegen
-and image level against something external: `llvm-objdump`, the host C compiler,
-qemu, a real linker and loader, `spirv-val`, `llvm-dwarfdump`.
+and image level against something external: the host C compiler, qemu, a real
+linker and loader, `spirv-val`, `llvm-dwarfdump`.
 
 ```
 test/
   run.sh                        the one driver
   cases/<group>/<case>.mach     one codegen case, target-independent
   ref/<group>/<case>.c          its C reference
-  golden/<target>/<g>/<c>.dis   blessed external-decoder text
-  golden/<target>/ONLY          the cases that column serves, when not all of them
-  golden/<target>/SKIPS         cases that target cannot build, one per line
-  golden/<target>/NORUN         cases it builds and diffs but whose differential is not run yet
+  cases/ONLY.<target>           the cases that column serves, when not all of them
+  cases/SKIPS.<target>          cases that target cannot build, one per line
+  cases/NORUN.<target>          cases it builds but whose differential disagrees today
   lib/fold.mach, lib/corpus.h   the checksum fold both sides use
   lib/fold128.mach              the 128-bit folds, imported only by the cases that need them
   lib/start_<target>.mach       the process entry a direct target's run bin reports through
@@ -26,7 +25,7 @@ test/
 ## Running it
 
 ```
-bash test/run.sh                          # every golden, plus the differential this host can execute
+bash test/run.sh                          # every target built, and the differential on the ones this host can execute
 bash test/run.sh --target x86_64-linux    # one target (repeatable)
 bash test/run.sh --case bits/logic_u32    # one case (repeatable)
 bash test/run.sh --qemu                   # also execute aarch64-linux, riscv64-linux, riscv64zkt-linux and riscv32 under qemu-user
@@ -35,28 +34,23 @@ bash test/run.sh --link [--qemu]          # the link cases instead of the corpus
 bash test/run.sh --incremental            # warm rebuilds of the compiler and a manifest fixture match clean builds
 bash test/run.sh --docs [--case <page>]   # the mach code blocks of doc/language compile, are fmt-canonical, and the ones with a main run
 bash test/run.sh --docs --target <t>      # the same blocks compiled for one other hosted target, run only natively
-bash test/run.sh --bless [...]            # write the goldens or expect files instead of diffing, print the diff
 ```
 
 `MACH` names the compiler under test; the default is the checkout's
 `out/<host>/debug/bin/mach` and the run prints what it used. Exit is nonzero on
 any failure, one `FAIL` line per cell and a one-line total.
 
-Per case and target the driver builds the object in release, decodes it with
-`llvm-objdump -d --no-leading-addr --no-show-raw-insn --symbolize-operands`
-(spirv: `spirv-val`, then `spirv-dis --no-color --no-indent`) and diffs the text
-against the golden. On a target the host executes it also builds at O0 and O2,
-runs both, and compares the checksums with the C reference built by `cc` at
-`-O0`, `-O2` and under UBSan, which must agree among themselves first. The tool
-versions the goldens were blessed with are stated at the top of `run.sh`.
+The corpus is a differential against C. Per case and target the driver builds
+in release (spirv: then `spirv-val`). On a target the host executes it also
+builds at O0 and O2, runs both, and compares the checksums with the C reference
+built by `cc` at `-O0`, `-O2` and under UBSan, which must agree among themselves
+first. A target the host cannot execute is only built, and spirv only built and
+validated. Nothing compares emitted instructions against a stored file.
 
-A golden mismatch does not stop the differential: the one `FAIL` line carries
-the golden verdict and then either `differential agrees with the C reference`
-or the disagreement, so a run whose goldens moved still says whether the
-behaviour held. A case whose differential never executed (the build or the
-decoder failed first) is counted in the summary as `differential not run`, and
-no such case counts as a pass. The C reference answer is rebuilt whenever
-`ref/<group>/<case>.c` or `lib/corpus.h` is newer than it.
+A case whose differential never executed (its build failed first) is counted in
+the summary as `differential not run`, and no such case counts as a pass. The C
+reference answer is rebuilt whenever `ref/<group>/<case>.c` or `lib/corpus.h` is
+newer than it.
 
 `--qemu` adds the targets this host does not run natively: `aarch64-linux` under
 `qemu-aarch64` on a host that is not aarch64 linux, `riscv64-linux` under
@@ -68,7 +62,7 @@ case whose entry is `lib/start_riscv32.mach` (reads `argc` at `_start`, prints t
 checksum through raw linux syscalls) and re-lays the freestanding image with
 `lib/elf_loadable.py` into one `PT_LOAD` at file offset 0, which is the only shape
 qemu-user's loader maps. Every byte the program sees is the linker's. A missing
-emulator is announced and its column runs golden only. qemu is compute evidence,
+emulator is announced and its column is only built. qemu is compute evidence,
 never ABI evidence: CI runs aarch64-linux on a native runner, and the link cases
 emulate only riscv64-linux, the one leg no native runner proves.
 
@@ -76,17 +70,17 @@ A case that admits a secret multiply (`ct/mul_secret`, `ct/mul_secret128`) links
 a program that turns PSTATE.DIT on at start and, on an aarch64 host whose
 processor or kernel provides no FEAT_DIT, refuses to start with std's one-line
 refusal and status 255. The driver reads that exact refusal as the host's
-limitation, prints `NORUN <target> <case>` and counts a skip: the golden is
-still diffed, and the differential is not a verdict that host can give.
+limitation, prints `NORUN <target> <case>` and counts a skip: the differential
+is not a verdict that host can give.
 
-A target has three case lists, each `case reason` per line, a glob allowed, with
-`#` comments. `ONLY`, when present, names the cases the column serves and no
-other; a case outside it is a skip and no claim about it is made.
-`SKIPS` names the cases the target cannot build at all: nothing is built, decoded
-or run for them. `NORUN` names the cases that build and whose golden is diffed,
-but whose differential disagrees with the reference today; the disagreement is
-not a failure, they count as passes, and the run reports how many were golden
-only. Each `NORUN` line is a compiler defect that names its issue and is deleted
+A target has three case lists beside the cases, `cases/ONLY.<target>`,
+`cases/SKIPS.<target>` and `cases/NORUN.<target>`, each `case reason` per line,
+a glob allowed, with `#` comments, and an absent file an empty list. `ONLY`
+names the cases the column serves and no other; a case outside it is a skip and
+no claim about it is made. `SKIPS` names the cases the target cannot build at
+all: nothing is built or run for them. `NORUN` names the cases that build but
+whose differential disagrees with the reference today; the disagreement is not
+a failure, they count as passes, and the run reports how many were only built. Each `NORUN` line is a compiler defect that names its issue and is deleted
 by the change that fixes it. Neither `SKIPS` nor `NORUN` is trusted: a `SKIPS` case is still
 built and fails the run if it builds, and a `NORUN` case still runs and fails the
 run if it agrees with the reference, so a stale line cannot outlive its defect.
@@ -101,7 +95,7 @@ A case is one file, `cases/<group>/<case>.mach`.
    checksum, and on spirv or riscv32 it compiles the case file directly.
 2. **Target-independent source.** No target conditionals, no inline asm, no
    OS-specific calls. The same source compiles for every target, or is named in
-   that target's `SKIPS` with a reason.
+   that target's `SKIPS.<target>` with a reason.
 3. **Deterministic.** No input, no time, no address observed as a value, no
    float printing. Terminates in well under a second on the slowest engine.
 4. **Folds every intermediate with FNV-1a** through `corpus.lib.fold`
@@ -122,26 +116,22 @@ fixed-width types with an explicit cast at every width change, signed operations
 through two's-complement identities.
 
 The `vec/rows_*` cases are the vector rows: one `#[noinline]` probe per operation,
-signedness and predicate of each lane width, so the golden shows each probe's
-body on its own and witnesses which cells the target packs and which it expands
-per lane.
+signedness and predicate of each lane width, so each cell runs through its own
+body whether the target packs it or expands it per lane.
 
 ## Adding a case
 
 1. Write `cases/<group>/<name>.mach` to the contract and `ref/<group>/<name>.c`.
 2. `bash test/run.sh --case <group>/<name> --target <host>` until the four
-   checksums agree (build failures and disagreements print as `FAIL` lines; the
-   missing golden is reported on the same line and does not hide them).
-3. `bash test/run.sh --bless --case <group>/<name>` and read every golden it
-   writes. A golden you have not read is not a golden.
-4. A target that cannot build the case gets a line in `golden/<target>/SKIPS`:
+   checksums agree (build failures and disagreements print as `FAIL` lines).
+3. A target that cannot build the case gets a line in `cases/SKIPS.<target>`:
    the case name, then the reason. One that builds it but computes the wrong
-   checksum gets a line in `golden/<target>/NORUN` instead, so the golden still
-   carries the column while the defect is open.
+   checksum gets a line in `cases/NORUN.<target>` instead, naming the issue for
+   the defect.
 
 The `riscv64zkt-linux` column is riscv64-linux with the Zkt extension selected,
 the one corpus target that admits a secret multiply. It serves the `ct` group
-only, which its `ONLY` states.
+only, which `cases/ONLY.riscv64zkt-linux` states.
 
 ## Doc blocks
 
@@ -216,8 +206,8 @@ here.
   `build-fails` and a `check.sh` apply to the dispatcher as they would to a
   program.
 - the expected output, the most specific of `expect.<target>.<profile>.txt`,
-  `expect.<profile>.txt`, `expect.<target>.txt`, `expect.txt`. Create the file
-  you want, then `--bless` fills it.
+  `expect.<profile>.txt`, `expect.<target>.txt`, `expect.txt`. A run with no
+  expect file, or one that differs, prints what the case observed.
 
 The standard library a case declares is the checkout's own `dep/std`, so a run
 tests the compiler against the library it was built with and a bisect over mach
