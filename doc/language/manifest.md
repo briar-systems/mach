@@ -71,6 +71,7 @@ targets the dependency declares for them. No other `[target.*]` entry is read.
 [project]
 id      = "demo"                       # required: identifier; root of every module path
 version = "0.1.0"                      # required
+mach    = "^5.3"                       # required in a root manifest: the compiler range
 src     = "src"                        # required: source dir, project-root-relative
 out     = "out/{target.name}/{profile.name}"  # required: output-path template root
 
@@ -112,7 +113,7 @@ ref = "branch/main"
 | `version` | string | Project version. Read by `$project.version` and `$project.version.{major,minor,patch}`, and stamped into a Windows executable's version resource. |
 | `src`     | string | Source root, project-root-relative. Module paths resolve under it. |
 | `out`     | string | The output-path template root, referenced as `{project.out}` by artifact `out`, step paths, and `cmd`s. Expanded over `{target.name}`/`{target.isa}`/`{target.os}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). |
-| `mach`    | string | The compiler versions this project builds with, as a [version range](#version-ranges) (`"^5.2"`). See [Compiler range](#compiler-range). |
+| `mach`    | string | The compiler versions this project builds with, as a [version range](#version-ranges) (`"^5.3"`). Required in a root manifest. See [Compiler range](#compiler-range). |
 
 `[project]` is exactly these five keys. Any other key, `name` and `description`
 included, is an unknown-key error (`mach.toml: unknown key 'name' in
@@ -134,11 +135,10 @@ error: this is mach 5.2.1, and the dependency closure does not accept it:
     app -> gfx -> glfw requires mach >=5.4, <6
 ```
 
-A root manifest without `mach` builds, with a warning that prints the line to
+A root manifest must state `mach`. One without it is refused with the line to
 add (`mach.toml: [project] states no compiler range; add mach = "^5.3", the
 oldest release that reads the key, and raise it when the project uses a later
-feature`). A later release, the next major, makes the key required for a root
-manifest (#3671). A dependency without it states no constraint. `mach init` writes the same range. It is the oldest
+feature`). A dependency without it states no constraint. `mach init` writes the same range. It is the oldest
 release of the running compiler's major that reads the key: `^5.3` for every
 5.x compiler, since 5.3.0 is the first release that accepts `mach`, and `^N.0`
 for a later major N, since a caret cannot span majors. The range depends only on
@@ -1890,6 +1890,7 @@ and never on a windows one.
 [project]
 id      = "demo"
 version = "0.1.0"
+mach    = "^5.3"
 src     = "src"
 out     = "out/{target.name}/{profile.name}"
 
@@ -2076,6 +2077,7 @@ profiles, two binary artifacts with literal output paths, and one dependency,
 [project]
 id = "mach"
 version = "5.0.0"
+mach = "^5.3"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 

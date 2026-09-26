@@ -258,7 +258,7 @@ art() { echo "$1" | tr / _; }
 # manifest <project> <entry-shape>
 manifest() {
     shape=$2
-    echo '[project]'; echo 'id = "corpus"'; echo 'version = "0.0.0"'; echo 'src = "src"'
+    echo '[project]'; echo 'id = "corpus"'; echo 'version = "0.0.0"'; echo 'mach = ">=5"'; echo 'src = "src"'
     echo 'out = "o/{target.name}/{profile.name}"'; echo
     names=
     printf '%s\n' "$targets_all" | while read -r name isa os abi of kind entry q; do
@@ -703,6 +703,7 @@ if [ "$mode" = incremental ]; then
 [project]
 id = "inc"
 version = "1.0.0"
+mach = ">=5"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
