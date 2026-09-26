@@ -37,21 +37,3 @@ pub fun reg_name(id: i32, size: u8) str;
 the spelling a diagnostic names a register by; index 31 is the zero
 register in a data position, which is where the walk reads it
 
-## fun test_sink_write
-
-```mach
-pub fun test_sink_write(ctx: ptr, buf: *u8, len: usize) res[usize, writer.WriteError];
-```
-
-## fun test_sink_reset
-
-```mach
-pub fun test_sink_reset();
-```
-
-## fun test_sink_text
-
-```mach
-pub fun test_sink_text() str;
-```
-
