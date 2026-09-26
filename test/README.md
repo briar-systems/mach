@@ -33,7 +33,7 @@ bash test/run.sh --qemu                   # also execute aarch64-linux, riscv64-
 bash test/run.sh --dwarf                  # also build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
 bash test/run.sh --link [--qemu]          # the link cases instead of the corpus (--case <name> selects one)
 bash test/run.sh --incremental            # warm rebuilds of the compiler and a manifest fixture match clean builds
-bash test/run.sh --docs [--case <page>]   # the mach code blocks of doc/language compile, and the ones with a main run
+bash test/run.sh --docs [--case <page>]   # the mach code blocks of doc/language compile, are fmt-canonical, and the ones with a main run
 bash test/run.sh --docs --target <t>      # the same blocks compiled for one other hosted target, run only natively
 bash test/run.sh --bless [...]            # write the goldens or expect files instead of diffing, print the diff
 ```
@@ -165,6 +165,14 @@ is still checked. A block that shows several files marks each with a line
 `# file: src/<path>.mach`, and the file named `main.mach` is the entry, or the last
 file when none is. Lines before the first marker belong to `main.mach`.
 
+A block that is not a fragment is also held to `mach fmt`: each of its files
+must be what `mach fmt -` writes for it, since readers copy style from the
+examples. A block that differs fails with the page line of the first line that
+differs and what the formatter has there. Blank lines that end a file before the
+next `# file:` marker separate the files and are not part of either. An `error`
+block the parser refuses is not checked, since the formatter cannot lay out what
+it cannot parse.
+
 A fragment is a statement of fact, so annotate a block only when that is what it
 is. An example that stopped compiling is a doc bug to fix, not a block to mark.
 
@@ -215,6 +223,10 @@ The standard library a case declares is the checkout's own `dep/std`, so a run
 tests the compiler against the library it was built with and a bisect over mach
 commits is sound. A `[step]` that compiles C runs `../../cc.sh`, which picks the
 host `cc` when it targets the leg and a cross-capable clang when it does not.
+The riscv64-linux leg compiles against a riscv64 sysroot and runs its dynamic
+images under qemu with that sysroot's loader. Both read `MACH_RISCV64_SYSROOT`,
+which defaults to `/usr/riscv64-linux-gnu`, where Ubuntu's
+`libc6-dev-riscv64-cross` installs.
 
 qemu is compute evidence, never ABI evidence: RELRO and page-size behaviour is
 proven only by a native leg.

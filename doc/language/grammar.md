@@ -373,10 +373,10 @@ local statement (see [Statements](#statements)).
 ### `test`
 
 ```ebnf
-test-decl ::= "test" LIT_STR block
+test-decl ::= "test" ( IDENT | LIT_STR ) block
 ```
 
-A `test` carries a string label and a block body.
+A `test` carries a label and a block body. An identifier label is the string label of the same text.
 
 ### Generic parameters
 

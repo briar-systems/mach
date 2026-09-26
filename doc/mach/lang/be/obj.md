@@ -12,36 +12,6 @@ pub fun image_init(a: *A.Allocator, interner: *intern.Interner, name: intern.Str
 pub fun dnit(o: *of.ObjectImage);
 ```
 
-## fun section_install
-
-```mach
-pub fun section_install(o: *of.ObjectImage, s: *of.Section) res[u32, fail.Fail];
-```
-
-## fun symbol_add
-
-```mach
-pub fun symbol_add(o: *of.ObjectImage, sym: of.Symbol) res[u32, fail.Fail];
-```
-
-## fun export_request_add
-
-```mach
-pub fun export_request_add(o: *of.ObjectImage, name: intern.StrId) err[fail.Fail];
-```
-
-## fun add_frame
-
-```mach
-pub fun add_frame(o: *of.ObjectImage, fr: *of.FrameUnwind) err[fail.Fail];
-```
-
-## fun add_relocation
-
-```mach
-pub fun add_relocation(o: *of.ObjectImage, rel: of.Relocation) err[fail.Fail];
-```
-
 ## fun symbol_index
 
 ```mach

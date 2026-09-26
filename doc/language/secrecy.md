@@ -23,7 +23,9 @@ A public value coerces *up* to secret wherever a secret is expected, with no
 syntax:
 
 ```mach
-fun up(p: u32) ^u32 { ret p; }      # public u32 flows into a secret slot
+fun up(p: u32) ^u32 {
+    ret p; # public u32 flows into a secret slot
+}
 ```
 
 A **literal is public by construction** and stays public through that coercion:
@@ -45,9 +47,15 @@ out of a secret container:
 
 ```mach
 #[oblivious]
-fun mix(a: ^u32, b: u32) ^u32 { ret a + b; }    # ^u32 + u32 -> ^u32
+fun mix(a: ^u32, b: u32) ^u32 {
+    ret a + b; # ^u32 + u32 -> ^u32
+}
+
 rec Key { d: ^[32]u8; }
-fun first(k: Key) ^u8 { ret k.d[0]; }            # element of a secret array is ^u8
+
+fun first(k: Key) ^u8 {
+    ret k.d[0]; # element of a secret array is ^u8
+}
 ```
 
 Taking the address of a `^T` value with `?` gives the public pointer `*^T` (the
@@ -72,9 +80,9 @@ error decided by operand type:
 
 ```mach error secret value used as a branch condition
 fun leak(a: ^u32, t: *u8, p: ^*u8) u8 {
-    if (a) { ret 1; }       # error: secret value used as a branch condition
-    ret t[a];               # error: secret value used as a memory index
-    ret @p;                 # error: secret value used as a memory address
+    if (a) { ret 1; } # error: secret value used as a branch condition
+    ret t[a]; # error: secret value used as a memory index
+    ret @p; # error: secret value used as a memory address
 }
 ```
 
@@ -164,8 +172,13 @@ walk that gates wrongly is a compile error, not a silent disclosure.
 reinterprets storage in place, and it always names the public type it lands on:
 
 ```mach
-fun publish(a: ^u32) u32 { ret a:>u32; }
-fun publish2(a: ^*u8) *u8 { ret a:>*u8; }
+fun publish(a: ^u32) u32 {
+    ret a:>u32;
+}
+
+fun publish2(a: ^*u8) *u8 {
+    ret a:>*u8;
+}
 ```
 
 `:^` is no operator; the parse stops at the colon:
@@ -198,8 +211,11 @@ public/secret aliasing leak unconstructable with no alias analysis:
 - a `uni`'s overlapping variants must agree on secrecy
 
 ```mach error union variants must agree on secrecy
-fun erase(p: *^u8) ptr { ret p; }     # error: type mismatch: expected ptr, found *^u8
-uni Bad { a: ^u32; b: u32; }          # error: variants disagree on secrecy
+fun erase(p: *^u8) ptr {
+    ret p; # error: type mismatch: expected ptr, found *^u8
+}
+
+uni Bad { a: ^u32; b: u32; } # error: variants disagree on secrecy
 ```
 
 The union rule is a property of the union **type**, not of the syntax that
@@ -209,12 +225,12 @@ variant typed by a generic parameter says nothing about secrecy, so `uni U[T] {
 a: T; b: u32; }` agrees there and is decided where each instance is formed:
 
 ```mach error this instantiation makes overlapping fields part secret
-uni U[T] { a: T; b: u32; }
+uni U[T]   { a: T; b: u32; }
 rec Box[T] { u: U[T]; }
 
-var s: U[^u32];                       # error: this instantiation makes the variants disagree
-var b: Box[^u32];                     # same error: the instance need not be spelled
-var p: U[u32];                        # fine, and so is an all-secret instantiation
+var s: U[^u32]; # error: this instantiation makes the variants disagree
+var b: Box[^u32]; # same error: the instance need not be spelled
+var p: U[u32]; # fine, and so is an all-secret instantiation
 ```
 
 A *partially* concrete template (`U[T, ^u32]` written inside another generic) is
@@ -304,10 +320,12 @@ secret: a `^*T` is a secret value, the order of two of them is secret, and that
 use std.types.bool.bool;
 
 #[oblivious]
-fun before(a: *^u8, b: *^u8) bool { ret a < b; }   # public addresses, public bool
+fun before(a: *^u8, b: *^u8) bool {
+    ret a < b; # public addresses, public bool
+}
 
 fun leak(a: ^*u8, b: ^*u8) u8 {
-    if (a < b) { ret 1; }   # error: secret value used as a branch condition
+    if (a < b) { ret 1; } # error: secret value used as a branch condition
     ret 0;
 }
 ```
@@ -436,7 +454,9 @@ instantiated at a secret type is held to the concrete type's rules.
 
 ```mach
 #[oblivious]
-fun ct_select(mask: ^u32, a: ^u32, b: ^u32) ^u32 { ret (a & mask) | (b & ~mask); }
+fun ct_select(mask: ^u32, a: ^u32, b: ^u32) ^u32 {
+    ret (a & mask) | (b & ~mask);
+}
 ```
 
 A **translation validator** re-derives the taint over the lowered,
@@ -464,7 +484,10 @@ use std.types.size.usize;
 # no decorator: the wipe is protected anyway
 fun clear(p: *^u8, n: usize) {
     var i: usize = 0;
-    for (i < n) { p[i] = 0; i = i + 1; }
+    for (i < n) {
+        p[i] = 0;
+        i    = i + 1;
+    }
 }
 ```
 

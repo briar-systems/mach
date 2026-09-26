@@ -19,13 +19,21 @@ struct u16 c_mk_u16(long long x) { struct u16 r; r.d = 16; r.u.p = x; return r; 
 struct u16f c_mk_u16f(double x) { struct u16f r; r.d = 16; r.u.p = x; return r; }
 struct w13 c_mk_w13(unsigned int x) { struct w13 r; r.d = 1; r.u.p.d = 13; r.u.p.u.p = x; return r; }
 
+/* a mach #[symbol] name is the literal object symbol, and darwin's C compiler
+ * prefixes an underscore to every C name, so the label makes C ask for the literal one */
+#ifdef __APPLE__
+#define MACH_SYM(name) __asm__(#name)
+#else
+#define MACH_SYM(name)
+#endif
+
 /* the reverse direction: C calls mach with the same shapes */
-long long m_u16(struct u16 v, long long next);
-long long m_u16f(struct u16f v, long long next);
-long long m_w13(struct w13 v, long long next);
-struct u16 m_mk_u16(long long x);
-struct u16f m_mk_u16f(double x);
-struct w13 m_mk_w13(unsigned int x);
+long long m_u16(struct u16 v, long long next) MACH_SYM(m_u16);
+long long m_u16f(struct u16f v, long long next) MACH_SYM(m_u16f);
+long long m_w13(struct w13 v, long long next) MACH_SYM(m_w13);
+struct u16 m_mk_u16(long long x) MACH_SYM(m_mk_u16);
+struct u16f m_mk_u16f(double x) MACH_SYM(m_mk_u16f);
+struct w13 m_mk_w13(unsigned int x) MACH_SYM(m_mk_w13);
 
 long long c_drives_mach(void) {
     if (m_u16(c_mk_u16(-5000000000LL), 3) != 1600 - 5000000000LL + 3000000) return 1;

@@ -9,10 +9,12 @@
 #
 #  - main.o carries matched PAGE21/PAGEOFF12 pairs for every imported cell,
 #    symbol based, addressed to the cell's C spelling;
-#  - the two cells provider.o defines are reached through linker-owned slots in
-#    __DATA_CONST,__got, each rebased and each holding the address of bytes in
-#    __DATA,__data whose values are the cells' initializers (7 and 35);
-#  - libSystem's `__stderrp` is reached through one __GOT slot dyld binds.
+#  - the two cells provider.o defines are reached through the first two
+#    linker-owned slots in __DATA_CONST,__got, each rebased and each holding the
+#    address of bytes in __DATA,__data whose values are the cells' initializers
+#    (7 and 35);
+#  - libSystem's `__stderrp` is reached through one import slot after them in
+#    the same __got, which dyld binds (#3903).
 #
 # On a native arm64 macOS leg the image is also executed and its output compared
 # with the runtime contract, so the structural facts and the loaded values are
@@ -47,8 +49,8 @@ produce_macho_got_aarch64() {
     got_fields=$(macho_section_fields "$bin" __DATA_CONST __got) || return 2
     set -- $got_fields
     got_addr=$1; got_size=$2
-    [ "$got_size" -eq 16 ] || {
-        echo "link: macho-got-aarch64: __DATA_CONST,__got holds $got_size bytes, expected two 8-byte slots" >&2
+    [ "$got_size" -gt 16 ] && [ $((got_size % 8)) -eq 0 ] || {
+        echo "link: macho-got-aarch64: __DATA_CONST,__got holds $got_size bytes, expected two local 8-byte slots and the import slots after them" >&2
         return 1
     }
 
@@ -82,9 +84,15 @@ produce_macho_got_aarch64() {
     echo "local_slots=rebased_to_cells"
 
     binds=$(macho_objdump --macho --bind "$bin") || return 2
-    [ "$(printf '%s\n' "$binds" | grep -c '^__GOT .*libSystem .*___stderrp$')" -eq 1 ] || {
-        echo "link: macho-got-aarch64: no unique __GOT bind of ___stderrp to libSystem" >&2
+    stderrp=$(printf '%s\n' "$binds" | grep '^__DATA_CONST *__got .*libSystem .*___stderrp$')
+    [ "$(printf '%s\n' "$stderrp" | grep -c .)" -eq 1 ] || {
+        echo "link: macho-got-aarch64: no unique __DATA_CONST,__got bind of ___stderrp to libSystem" >&2
         printf '%s\n' "$binds" | sed 's/^/    /' >&2
+        return 1
+    }
+    set -- $stderrp
+    [ $(($3)) -ge $((got_addr + 16)) ] && [ $(($3)) -lt $((got_addr + got_size)) ] || {
+        echo "link: macho-got-aarch64: the ___stderrp slot $3 is not an import slot of __got" >&2
         return 1
     }
     echo "import_slot=libSystem-bind"

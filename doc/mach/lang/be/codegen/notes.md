@@ -44,6 +44,12 @@ pub val ASM_NOTE_BYTES_WIDTH: usize = 4
 pub rec AsmNote;
 ```
 
+## val NOTE_NO_LANDING
+
+```mach
+pub val NOTE_NO_LANDING: u32 = 0xFFFFFFFF
+```
+
 ## fun note_blank
 
 ```mach

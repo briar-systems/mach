@@ -85,7 +85,9 @@ use mach.lang.be.linker.dynamic.has_unresolved_declared_imports;
 use mach.lang.be.linker.dynamic.init_dynstate;
 use mach.lang.be.linker.dynamic.loaderless_request_message;
 use mach.lang.be.linker.dynamic.place_call_stubs;
+use mach.lang.be.linker.dynamic.place_import_got;
 use mach.lang.be.linker.dynamic.reserve_call_stubs;
+use mach.lang.be.linker.dynamic.reserve_import_got;
 use mach.lang.be.linker.dynamic.synthesize_local_imports;
 use mach.lang.be.linker.dynamic.target_requires_pie;
 use mach.lang.be.linker.emit.build_exec_functions;
@@ -992,6 +994,14 @@ fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.Obj
             free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, sym_base, sym_out, sym_total, ?strm, ?atoms, ?groups);
             ret stubs_r;
         }
+        val got_r: err[fail.Fail] = reserve_import_got(s, tgt, ?dyn, merged, ?groups);
+        if (sel got_r.err) {
+            free_dynstate(alloc, ?dyn);
+            free_local_got_plan(alloc, ?local_got);
+            map.dnit[intern.StrId, SymbolLoc](?sym_locs);
+            free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, sym_base, sym_out, sym_total, ?strm, ?atoms, ?groups);
+            ret got_r;
+        }
     }
 
     var out_img: of.ObjectImage;
@@ -1043,8 +1053,8 @@ fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.Obj
         var shape: of.HeaderShape;
         measure_header_shape(s, ?out_img, merged, ?groups, ?dyn, position_independent, ?shape);
         val want: u64 = header_reserve_bytes(tgt, position_independent, ?shape);
-        # a grown header, or a stub table that moved everything after the code
-        if (want > header_reserve || dyn.info.stubs.size > 0) {
+        # a grown header, or a reserved table that moved everything after it
+        if (want > header_reserve || dyn.info.stubs.size > 0 || dyn.info.got.size > 0) {
             if (want > header_reserve) { header_reserve = want; }
             val header_vaddr_r: err[fail.Fail] =
                 assign_section_vaddrs(tgt, merged, header_reserve);
@@ -1074,6 +1084,7 @@ fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.Obj
             }
         }
         place_call_stubs(?dyn, merged);
+        place_import_got(?dyn, merged);
     }
 
     val patch_r: err[fail.Fail] =
@@ -4021,6 +4032,321 @@ test "mach.lang.be.linker.link_modules:arm64_import_stub_beside_code_past_large_
             print.eprintlnf("zero_fill image: status kind {} code {} signal {}",
                 ran.ok.kind::i64, ran.ok.code::i64, ran.ok.signal::i64);
             ret 15;
+        }
+    }
+    ret 0;
+}
+
+# more zero-fill than a rip-relative displacement reaches (+-2 GiB) between the
+# code and the end of the image: the import GOT is laid out ahead of the
+# zero-fill, so a stub's jmp and a GOTPCREL load still reach their slots (#3903).
+# a native x86-64 darwin host also runs the image, which stores into the last
+# byte of the zero-fill and exits through the stub
+test "mach.lang.be.linker.link_modules:x86_64_import_got_ahead_of_large_zero_fill" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val registered: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel registered.err) { ret 2; }
+    val tr: res[target.Target, fail.Fail] = target.select(?reg, "x86_64", "darwin", "sysv64");
+    if (sel tr.err) { ret 3; }
+    var tgt:         target.Target  = tr.ok;
+    val pin:         intern.StrId   = lt_name(?s, "libSystem");
+    val called:      intern.StrId   = lt_name(?s, "_exit");
+    val loaded:      intern.StrId   = lt_name(?s, "___stderrp");
+    val pinned_call: err[fail.Fail] = session.register_import_library(?s, called, pin);
+    if (sel pinned_call.err) { ret 4; }
+    val pinned_load: err[fail.Fail] = session.register_import_library(?s, loaded, pin);
+    if (sel pinned_load.err) { ret 4; }
+    var provider: of.DynLib;
+    provider.name               = pin;
+    provider.soname             = lt_name(?s, "/usr/lib/libSystem.B.dylib");
+    provider.include_referenced = true;
+
+    # push %rbp; lea zero_fill_tail(%rip),%rax; mov ___stderrp@GOTPCREL(%rip),%rdx;
+    # movabs $zero_fill-1,%rcx; mov $42,%edi; mov %dil,(%rax,%rcx); call _exit
+    val zero_fill: u32   = 3000000000;
+    var bytes:     [40]u8;
+    var k:         usize = 0;
+    for (k < 40) {
+        bytes[k] = 0xCC;
+        k        = k + 1;
+    }
+    bytes[0]  = 0x55;
+    bytes[1]  = 0x48;
+    bytes[2]  = 0x8D;
+    bytes[3]  = 0x05;
+    bytes[8]  = 0x48;
+    bytes[9]  = 0x8B;
+    bytes[10] = 0x15;
+    bytes[15] = 0x48;
+    bytes[16] = 0xB9;
+    bin.write_u64_le(?bytes[0], 17, (zero_fill - 1)::u64);
+    bytes[25] = 0xBF;
+    bin.write_u32_le(?bytes[0], 26, 42);
+    bytes[30] = 0x40;
+    bytes[31] = 0x88;
+    bytes[32] = 0x3C;
+    bytes[33] = 0x08;
+    bytes[34] = 0xE8;
+    var sections: [2]of.Section;
+    sections[0].name  = lt_name(?s, ".text");
+    sections[0].kind  = of.SK_TEXT;
+    sections[0].bytes = ?bytes[0];
+    sections[0].len   = 40;
+    sections[0].align = 16;
+    sections[1].name  = lt_name(?s, ".bss");
+    sections[1].kind  = of.SK_BSS;
+    sections[1].bytes = nil;
+    sections[1].len   = zero_fill;
+    sections[1].align = 16;
+    var symbols: [4]of.Symbol;
+    symbols[0].name    = lt_name(?s, tgt.os.entry_symbol);
+    symbols[0].section = of.section_id(0);
+    symbols[0].size    = 40;
+    symbols[0].flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    symbols[1].name    = lt_name(?s, "zero_fill_tail");
+    symbols[1].section = of.section_id(1);
+    symbols[1].offset  = 0;
+    symbols[1].size    = zero_fill;
+    symbols[1].flags   = of.SYM_OBJ_FLAG_OBJECT;
+    symbols[2].name    = called;
+    symbols[2].section = of.external_section();
+    symbols[2].flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN;
+    symbols[3].name    = loaded;
+    symbols[3].section = of.external_section();
+    symbols[3].flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN;
+    var relocations: [3]of.Relocation;
+    relocations[0] = of.Relocation{section: of.section_id(0), offset: 4, kind: of.RK_PC32, sym: 1, addend: -4};
+    relocations[1] = of.Relocation{section: of.section_id(0), offset: 11, kind: of.RK_GOTPCREL, sym: 3, addend: -4};
+    relocations[2] = of.Relocation{section: of.section_id(0), offset: 35, kind: of.RK_PLT32, sym: 2, addend: -4};
+    var module: of.ObjectImage = lt_image(?s, lt_name(?s, "got_ahead"),
+        ?sections[0], 2, ?symbols[0], 4, ?relocations[0], 3);
+
+    val fr: res[fixture.Output, outcome.Fail] = fixture.create(?alloc, "got_ahead");
+    if (sel fr.err) { ret 5; }
+    var file: fixture.Output = fr.ok;
+    fin { fixture.dnit(?file); }
+    # a fresh path in the fixture's directory, so the linker creates the image
+    # executable as a build does; the fixture's own file stays 0600
+    val named: res[str, string.StrError] = str_join(?alloc, file.directory, "/got_ahead");
+    if (sel named.err) { ret 5; }
+    val path: str = named.ok;
+    fin { str_free(?alloc, path); }
+    val linked: err[fail.Fail] = link_modules_nocapture(?s, ?tgt,
+        ?module, 1, 1, ?provider, 1, path, "got_ahead"::*u8,
+        LINK_EXE, true, of.image_options_default(of.SUBSYSTEM_CONSOLE));
+    if (sel linked.err) {
+        print.eprintlnf("got_ahead link: {}", fail.describe(linked.err));
+        ret 6;
+    }
+    val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(?alloc, path);
+    if (sel rr.err) { ret 7; }
+    var image: Vector[u8] = rr.ok;
+    fin { vector.dnit[u8](?image); }
+
+    val text:  usize = lt_macho_section(image.data, "__TEXT", "__text");
+    val stubs: usize = lt_macho_section(image.data, "__TEXT", "__stubs");
+    val got:   usize = lt_macho_section(image.data, "__DATA_CONST", "__got");
+    val bss:   usize = lt_macho_section(image.data, "__DATA", "__bss");
+    if (text == 0 || stubs == 0 || got == 0 || bss == 0) { ret 8; }
+    val text_va:  u64   = bin.read_u64_le(image.data, text + 32);
+    val stub_va:  u64   = bin.read_u64_le(image.data, stubs + 32);
+    val got_va:   u64   = bin.read_u64_le(image.data, got + 32);
+    val got_size: u64   = bin.read_u64_le(image.data, got + 40);
+    val bss_va:   u64   = bin.read_u64_le(image.data, bss + 32);
+    val text_off: usize = bin.read_u32_le(image.data, text + 48)::usize;
+    val stub_off: usize = bin.read_u32_le(image.data, stubs + 48)::usize;
+    if (bin.read_u64_le(image.data, bss + 40) < zero_fill::u64) { ret 9; }
+    if (got_size != 16 || got_va + got_size > bss_va)           { ret 10; }
+    if (bss_va + zero_fill::u64 - text_va < 2147483648)         { ret 11; }
+
+    # the call reaches the stub, and the stub and the load each reach a slot of their own
+    val call:      i64 = (bin.read_u32_le(image.data, text_off + 35)::i32)::i64;
+    val stub_disp: i64 = (bin.read_u32_le(image.data, stub_off + 2)::i32)::i64;
+    val load_disp: i64 = (bin.read_u32_le(image.data, text_off + 11)::i32)::i64;
+    if ((text_va::i64 + 39 + call)::u64 != stub_va)                       { ret 12; }
+    if (image.data[stub_off] != 0xFF || image.data[stub_off + 1] != 0x25) { ret 13; }
+    val stub_slot: u64 = (stub_va::i64 + 6 + stub_disp)::u64;
+    val load_slot: u64 = (text_va::i64 + 15 + load_disp)::u64;
+    if (stub_slot < got_va || stub_slot + 8 > got_va + got_size) { ret 14; }
+    if (load_slot < got_va || load_slot + 8 > got_va + got_size) { ret 15; }
+    if (stub_slot == load_slot)                                  { ret 16; }
+
+    $if ($mach.build.os == $mach.os.darwin && $mach.build.arch == $mach.arch.x86_64) {
+        var argv: [2]*u8;
+        argv[0] = path::*u8;
+        argv[1] = nil;
+        val ran: res[exec.ExitStatus, exec.Error] = exec.run(path, ?argv[0], env.environ());
+        if (sel ran.err) { ret 17; }
+        if (!exec.exited(ran.ok) || exec.code(ran.ok) != 42) {
+            print.eprintlnf("got_ahead image: status kind {} code {} signal {}",
+                ran.ok.kind::i64, ran.ok.code::i64, ran.ok.signal::i64);
+            ret 18;
+        }
+    }
+    ret 0;
+}
+
+# the section header named `name` in a linked ELF64 image, or 0
+fun lt_elf_section(buf: *u8, len: usize, name: str) usize {
+    if (len < 64) { ret 0; }
+    val shoff:     usize = bin.read_u64_le(buf, 40)::usize;
+    val shentsize: usize = bin.read_u16_le(buf, 58)::usize;
+    val shnum:     usize = bin.read_u16_le(buf, 60)::usize;
+    val shstrndx:  usize = bin.read_u16_le(buf, 62)::usize;
+    if (shentsize < 64 || shstrndx >= shnum || shoff + shnum * shentsize > len) { ret 0; }
+    val strtab: usize = bin.read_u64_le(buf, shoff + shstrndx * shentsize + 24)::usize;
+    var i:      usize = 0;
+    for (i < shnum) {
+        val at:    usize               = shoff + i * shentsize;
+        val named: res[str, fail.Fail] = bin.cstr_at(buf, len, strtab + bin.read_u32_le(buf, at)::usize);
+        if (sel named.ok && str_equals(named.ok, name)) { ret at; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# the ELF twin of the darwin case above: more zero-fill than a BL reaches
+# between the code and the data it writes. the .plt is laid out at the end of
+# the code, inside the executable segment, so the call still reaches its stub
+# (#3902). a native aarch64 linux host also runs the image, which stores into
+# the last byte of the zero-fill and exits 42 through the PLT into libc's _exit
+test "mach.lang.be.linker.link_modules:elf_arm64_plt_beside_code_past_large_zero_fill" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val registered: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel registered.err) { ret 2; }
+    val tr: res[target.Target, fail.Fail] = target.select(?reg, "aarch64", "linux", "aapcs64");
+    if (sel tr.err) { ret 3; }
+    var tgt:      target.Target  = tr.ok;
+    val pin:      intern.StrId   = lt_name(?s, "libc");
+    val imported: intern.StrId   = lt_name(?s, "_exit");
+    val pinned:   err[fail.Fail] = session.register_import_library(?s, imported, pin);
+    if (sel pinned.err) { ret 4; }
+    var provider: of.DynLib;
+    provider.name               = pin;
+    provider.soname             = lt_name(?s, "libc.so.6");
+    provider.rpath              = intern.STR_NIL;
+    provider.include_referenced = true;
+
+    val zero_fill: u32 = 200000000;
+    var bytes:     [16]u8;
+    bin.write_u32_le(?bytes[0], 0, 0x90000001);
+    bin.write_u32_le(?bytes[0], 4, 0x52800540);
+    bin.write_u32_le(?bytes[0], 8, 0x39000020);
+    bin.write_u32_le(?bytes[0], 12, 0x94000000);
+    var sections: [2]of.Section;
+    sections[0].name  = lt_name(?s, ".text");
+    sections[0].kind  = of.SK_TEXT;
+    sections[0].bytes = ?bytes[0];
+    sections[0].len   = 16;
+    sections[0].align = 4;
+    sections[1].name  = lt_name(?s, ".bss");
+    sections[1].kind  = of.SK_BSS;
+    sections[1].bytes = nil;
+    sections[1].len   = zero_fill;
+    sections[1].align = 16;
+    var symbols: [3]of.Symbol;
+    symbols[0].name    = lt_name(?s, tgt.os.entry_symbol);
+    symbols[0].section = of.section_id(0);
+    symbols[0].size    = 16;
+    symbols[0].flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    symbols[1].name    = lt_name(?s, "zero_fill_tail");
+    symbols[1].section = of.section_id(1);
+    symbols[1].offset  = 0;
+    symbols[1].size    = zero_fill;
+    symbols[1].flags   = of.SYM_OBJ_FLAG_OBJECT;
+    symbols[2].name    = imported;
+    symbols[2].section = of.external_section();
+    symbols[2].flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN;
+    var relocations: [3]of.Relocation;
+    val last:        i64 = (zero_fill - 1)::i64;
+    relocations[0] = of.Relocation{section: of.section_id(0), offset: 0, kind: of.RK_PAGE21, sym: 1, addend: last};
+    relocations[1] = of.Relocation{section: of.section_id(0), offset: 8, kind: of.RK_LDST8_LO12, sym: 1, addend: last};
+    relocations[2] = of.Relocation{section: of.section_id(0), offset: 12, kind: of.RK_PLT32, sym: 2};
+    var module: of.ObjectImage = lt_image(?s, lt_name(?s, "zero_fill"),
+        ?sections[0], 2, ?symbols[0], 3, ?relocations[0], 3);
+
+    val fr: res[fixture.Output, outcome.Fail] = fixture.create(?alloc, "elf_zero_fill");
+    if (sel fr.err) { ret 5; }
+    var file: fixture.Output = fr.ok;
+    fin { fixture.dnit(?file); }
+    # a fresh path in the fixture's directory, so the linker creates the image
+    # executable as a build does; the fixture's own file stays 0600
+    val named: res[str, string.StrError] = str_join(?alloc, file.directory, "/elf_zero_fill");
+    if (sel named.err) { ret 5; }
+    val path: str = named.ok;
+    fin { str_free(?alloc, path); }
+    val linked: err[fail.Fail] = link_modules_nocapture(?s, ?tgt,
+        ?module, 1, 1, ?provider, 1, path, "elf_zero_fill"::*u8,
+        LINK_EXE, false, of.image_options_default(of.SUBSYSTEM_CONSOLE));
+    if (sel linked.err) {
+        print.eprintlnf("elf_zero_fill link: {}", fail.describe(linked.err));
+        ret 6;
+    }
+    val rr: res[Vector[u8], fs.FsError] = fs.read_bytes(?alloc, path);
+    if (sel rr.err) { ret 7; }
+    var image: Vector[u8] = rr.ok;
+    fin { vector.dnit[u8](?image); }
+    val kept: err[outcome.Fail] = fixture.retain_bytes(?alloc, "elf-aarch64-plt-beside-code", image.data, image.len);
+    if (sel kept.err) { ret 7; }
+
+    val text: usize = lt_elf_section(image.data, image.len, ".text");
+    val plt:  usize = lt_elf_section(image.data, image.len, ".plt");
+    val bss:  usize = lt_elf_section(image.data, image.len, ".bss");
+    if (text == 0 || plt == 0 || bss == 0) { ret 8; }
+    val text_va: u64 = bin.read_u64_le(image.data, text + 16);
+    val plt_va:  u64 = bin.read_u64_le(image.data, plt + 16);
+    val bss_va:  u64 = bin.read_u64_le(image.data, bss + 16);
+    if (bin.read_u64_le(image.data, bss + 32) < zero_fill::u64) { ret 9; }
+    if (plt_va < text_va + 16 || plt_va + 16 > bss_va)          { ret 10; }
+    if (bss_va + zero_fill::u64 - text_va < 134217728)          { ret 11; }
+    val word:         u32 = bin.read_u32_le(image.data, bin.read_u64_le(image.data, text + 24)::usize + 12);
+    val displacement: i64 = ((word & 0x03FFFFFF)::i32 << 6)::i64 >> 4;
+    if ((word & 0xFC000000) != 0x94000000)                 { ret 12; }
+    if ((text_va::i64 + 12 + displacement)::u64 != plt_va) { ret 13; }
+
+    # the PLT is mapped by an executable load segment, not a segment of its own
+    val phoff:  usize = bin.read_u64_le(image.data, 32)::usize;
+    val phnum:  usize = bin.read_u16_le(image.data, 56)::usize;
+    var mapped: bool  = false;
+    var p:      usize = 0;
+    for (p < phnum) {
+        val at: usize = phoff + p * 56;
+        if (bin.read_u32_le(image.data, at) == 1) {
+            val va: u64 = bin.read_u64_le(image.data, at + 16);
+            val sz: u64 = bin.read_u64_le(image.data, at + 32);
+            if (plt_va >= va && plt_va + 16 <= va + sz) {
+                if ((bin.read_u32_le(image.data, at + 4) & 1) == 0 || plt_va - va < 16) { ret 14; }
+                mapped = true;
+            }
+        }
+        p = p + 1;
+    }
+    if (!mapped) { ret 15; }
+
+    $if ($mach.build.os == $mach.os.linux && $mach.build.arch == $mach.arch.aarch64) {
+        var argv: [2]*u8;
+        argv[0] = path::*u8;
+        argv[1] = nil;
+        val ran: res[exec.ExitStatus, exec.Error] = exec.run(path, ?argv[0], env.environ());
+        if (sel ran.err) { ret 16; }
+        if (!exec.exited(ran.ok) || exec.code(ran.ok) != 42) {
+            print.eprintlnf("elf_zero_fill image: status kind {} code {} signal {}",
+                ran.ok.kind::i64, ran.ok.code::i64, ran.ok.signal::i64);
+            ret 17;
         }
     }
     ret 0;

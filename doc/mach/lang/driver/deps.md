@@ -111,7 +111,8 @@ pub fun release_needs(ctx: ptr, id: str, url: str, rel: *cand.Release, out: *res
 a release's requirements as the resolver reads them: its compiler range and its dependencies
 selected by version range, or by an exact release tag. a release selecting anything else
 (a branch, a commit, a path) is not reproducible from its tag and is refused (#3496 §7),
-unless the root declares that identity and so selects it itself (#3553)
+unless the root declares that identity and so selects it itself (#3553). a release whose
+manifest does not load or names another version is no candidate, which `out.excluded` says
 
 ## val MACH_KEY_SINCE
 
@@ -349,6 +350,24 @@ pub fun release_at_head(s: *session.Session, dep_full: str) res[str, outcome.Fai
 
 the release version a checkout's HEAD is tagged with (an owned "" when no `v`-prefixed
 semver tag points at it); the highest wins when several do, and the caller frees the result
+
+## fun release_at_pin
+
+```mach
+pub fun release_at_pin(s: *session.Session, root: str, id: str, dep_full: str) res[str, outcome.Fail];
+```
+
+the release version dep/<id>'s pin is tagged with, read from its checkout's refs (an owned ""
+when no release tag points at it); the highest wins, and the caller frees the result
+
+## fun pinned_at_release
+
+```mach
+pub fun pinned_at_release(s: *session.Session, root: str, id: str, dep_full: str, version: str) bool;
+```
+
+whether dep/<id> is pinned at the release `version` and its checkout is at that pin; a
+checkout drifted from its gitlink is not, whatever release it holds
 
 ## val SLOT_ABSENT
 

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [5.13.0] - 2026-09-26
+
+### Added
+- A test can be labelled with an identifier, `test parses_empty { }`, as well as a string, `test "parses empty" { }`. The identifier form gets the same label, linkage name and duplicate check as the quoted form of its text (#3956).
+
+### Changed
+- x86-64 code keeps more values in registers. The allocator now holds back only `r10` for reloads, so 12 registers carry values instead of 10, and a reload that needs a second register borrows a free one. Release builds of hot loops such as x25519 and AES-GCM run fewer instructions with fewer stack loads, and no x86-64 golden grew. aarch64, riscv and SPIR-V output is unchanged (#3495).
+- `asm spirv { }` is refused where it is written, with `inline assembly is not available on instruction set 'spirv'`, instead of failing later in the SPIR-V emitter. SPIR-V output is byte-identical (#3370).
+- `mach help build` and `doc/language/manifest.md` state the `-o` rule: a canonical path inside the project root, relative, with no `.` or `..` component (#3863).
+- The installers print the current mach mark, the chevron and dot beside the `mach` wordmark, identically in `install.sh` and `install.ps1` (#3869).
+
+### Removed
+- The vector literal folds of #3753 and #3738. A literal of consecutive loads or of one vector's widened half is now built lane by lane. Spell those as ranges instead, `p[i, 4]::f32x4` and `v[4, 4]::i32x4`. On riscv and SPIR-V a widened half range now extends each lane straight from the source vector, which is shorter (#3780).
+
+### Fixed
+- On aarch64-darwin a `u128` or `i128` argument after an odd number of integer arguments starts in the next register, as Apple's ABI says, instead of being rounded to an even register pair. C reads the right values in both call directions (#3922).
+- On riscv64 the constant-time check no longer mistakes the divide-by-zero guard of `/` or `%` for a branch to the function's first block, which refused valid code in debug builds and left the instruction after the guard unchecked (#3847).
+- An `#[oblivious]` function that inlines an inline-asm loop is no longer refused for secrets held in registers the loop never reads. The check now follows each local asm branch to where it lands (#3901).
+- In a union analysis (the editor and multi-target `mach check`), a constant that several `$if` arms declare differently reads the arm the build target selects, not whichever arm was walked last (#3873).
+- A constant index past 2^31 - 1 into a static array reaches its byte on every target. The offset was truncated to 32 bits, which failed to link on aarch64 and wrote 2 GB below the array on x86-64 and riscv64. COFF and Mach-O x86-64 now refuse an addend that does not fit instead of truncating it (#3907).
+- A linux program with more than 128 MB of static data that calls a shared library links on aarch64. The PLT is now placed at the end of the code instead of after the zero-fill (#3902).
+- A darwin program with more than 2 GB of zero-fill that calls a shared library links on x86-64. The import GOT is now placed ahead of the zero-fill, and on arm64 the zero-fill no longer counts against the stubs' reach (#3903).
+- Taking the address of a function from a shared library, such as passing an `ext fun` to C as a callback, links on aarch64 and riscv64 linux and on aarch64 darwin, as it already did on x86-64 (#3891).
+- `mach dep update` re-pins a version-selected dependency to the release its range selects in one run, even when the checkout had drifted from its recorded pin. `mach dep list` shows a pin its range excludes as `out of range` instead of `realized` (#3878).
+- `mach dep add` with no `--version` names the version conflict when no release fits, instead of stopping at an old release whose `mach.toml` no longer loads. Such a release is set aside and listed in the error (#3881).
+
 ## [5.12.2] - 2026-09-25
 
 ### Added

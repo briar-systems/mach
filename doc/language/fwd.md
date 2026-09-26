@@ -41,19 +41,21 @@ through any depth of re-export — including a `fwd` of another library's
 
 ```mach
 # file: src/alpha.mach
-pub fun answer() i64 { ret 42; }
+pub fun answer() i64 {
+    ret 42;
+}
 
 # file: src/lib.mach
-fwd example.alpha;          # re-exports module 'alpha'
+fwd example.alpha; # re-exports module 'alpha'
 
 # file: src/main.mach
+use example.lib; # lib.mach contains `fwd example.alpha;`
+use std.print;
 use std.runtime;
-use print: std.print;
-use example.lib;            # lib.mach contains `fwd example.alpha;`
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
-    print.printlnf("{}", lib.alpha.answer());   # resolves through the module re-export
+    print.printlnf("{}", lib.alpha.answer()); # resolves through the module re-export
     ret 0;
 }
 ```

@@ -28,23 +28,23 @@ core.add            # symbol from module `core`
 A type name followed by a brace-delimited initializer:
 
 ```mach
-use std.types.result.res;
 use std.types.error.err;
+use std.types.result.res;
 
-rec Point { x: i64; y: i64; }
-uni Number { i: i64; f: f64; }
+rec Point      { x: i64; y: i64; }
+uni Number     { i: i64; f: f64; }
 rec Pair[T, U] { left: T; right: U; }
-tag Reply: u8 { empty; value: i64; }
-tag MyErr: u8 { bad; }
+tag Reply: u8  { empty; value: i64; }
+tag MyErr: u8  { bad; }
 
-val p:    Point             = Point{ x: 1, y: 2 };
-val a:    [3]i64            = [3]i64{10, 20, 30};
-val u:    Number            = Number{ i: 99 };
-val pair: Pair[i64, u8]     = Pair[i64, u8]{ left: 5, right: 6u8 };
-val rep0: Reply             = Reply.empty{};
-val rep1: Reply             = Reply.value{42};
-val good: res[i64, MyErr]   = res[i64, MyErr].ok{42};
-val done: err[MyErr]        = err[MyErr].ok{};
+val p:    Point           = Point{x: 1, y: 2};
+val a:    [3]i64          = [3]i64{10, 20, 30};
+val u:    Number          = Number{i: 99};
+val pair: Pair[i64, u8]   = Pair[i64, u8]{left: 5, right: 6u8};
+val rep0: Reply           = Reply.empty{};
+val rep1: Reply           = Reply.value{42};
+val good: res[i64, MyErr] = res[i64, MyErr].ok{42};
+val done: err[MyErr]      = err[MyErr].ok{};
 ```
 
 For generics, the type arguments appear in brackets before the body.
@@ -60,17 +60,17 @@ require one positional initializer per lane. See [types.md](types.md#simd-vector
 ## Field, index, and tag access
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
 rec Point { x: i64; y: i64; }
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
-    val p: Point  = Point{ x: 1, y: 2 };
-    val a: [3]i64 = [3]i64{10, 20, 30};
-    val x:     i64 = p.x;            # record field
-    val first: i64 = a[0];           # array index
+    val p:     Point  = Point{x: 1, y: 2};
+    val a:     [3]i64 = [3]i64{10, 20, 30};
+    val x:     i64    = p.x; # record field
+    val first: i64    = a[0]; # array index
     print.printlnf("{} {}", x, first);
     ret 0;
 }

@@ -27,6 +27,7 @@ use mach.lang.intern;
 use mach.lang.layout;
 use mach.lang.output;
 use mach.lang.target.isa;
+use a64rel: mach.lang.target.isa.arm64.reloc;
 use rvrel:  mach.lang.target.isa.riscv.reloc;
 use x64rel: mach.lang.target.isa.x64.reloc;
 use mach.lang.target.of;
@@ -1306,6 +1307,7 @@ pub fun register(reg: *of.OfRegistry) err[fail.Fail] {
     elf_vtable.carries_stack_size          = false;
     elf_vtable.default_stack_reserve       = 0;
     elf_vtable.executable_section_location = nil;
+    elf_vtable.stub_shape                  = elf_stub_shape;
 
     elf_vtable.covers_isa_any   = false;
     elf_vtable.covers_isa_count = 0;
@@ -2762,6 +2764,15 @@ fun plt_header_size(arch_id: u32) usize {
     ret 0;
 }
 
+# the .plt the linker reserves at the end of the code, as GNU and LLVM ld lay
+# it out beside .text, so a call site's branch reaches its stub whatever data
+# the image carries (#3902)
+fun elf_stub_shape(arch_id: u32, count: u32) res[of.TableShape, fail.Fail] {
+    ret res[of.TableShape, fail.Fail].ok{of.TableShape{
+        name: ".plt", size: plt_header_size(arch_id) + count::usize * PLT_ENTRY_SIZE, align: 16
+    }};
+}
+
 fun plt_stub_va(lay: *DynLayout, n: u32, arch_id: u32) u64 {
     ret lay.plt_va + plt_header_size(arch_id)::u64 + n::u64 * PLT_ENTRY_SIZE::u64;
 }
@@ -2773,7 +2784,6 @@ rec DynLayout {
     hash_row:     u32;
     relaplt_row:  u32;
     reladyn_row:  u32;
-    plt_row:      u32;
     gotplt_row:   u32;
     datagot_row:  u32;
     dynamic_row:  u32;
@@ -2927,7 +2937,7 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *of.Objec
 
     val hi_va: u64 = highest_vaddr(segs, seg_count);
 
-    val phdr_count: u32 = seg_count + 7;
+    val phdr_count: u32 = seg_count + 6;
 
     if (!header_fits_reserved_page(?elay, phdr_count, page_size)) {
         ret err[fail.Fail].err{fail.message("elf: dynamic-exec program headers exceed the one-page header reservation (too many load segments)")};
@@ -2966,6 +2976,8 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *of.Objec
     val laid: err[fail.Fail] = compute_dyn_layout(itn, ?fp, ?lay, dyn, ?got, nimp, tgt_isa.arch_id,
         struct_va.ok, page_size);
     if (sel laid.err) { ret laid; }
+    val located: err[fail.Fail] = locate_plt(dyn, nimp, tgt_isa.arch_id, segs, seg_count, seg_offsets, ?lay);
+    if (sel located.err) { ret located; }
 
     var aux:       *ShtAlloc = nil;
     var aux_count: u32       = 0;
@@ -3064,9 +3076,9 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *of.Objec
 }
 
 # the dynamic structures are placed from the plan's cursor: the read-only run
-# starts on a page, the PLT and the read-write run each start on a page, and
-# every address is the file offset carried to `struct_va`, so the file and the
-# mapping stay congruent
+# and the read-write run each start on a page, and every address is the file
+# offset carried to `struct_va`, so the file and the mapping stay congruent.
+# the PLT is not among them: it lives in the code (locate_plt)
 fun compute_dyn_layout(itn: *intern.Interner, fp: *plan.FilePlan, lay: *DynLayout, dyn: *of.DynamicInfo, got: *ImportAddressPlan, nimp: u32,
     arch_id: u32, struct_va: u64, page_size: u64) err[fail.Fail] {
     val page_sz: usize = page_size::usize;
@@ -3123,11 +3135,6 @@ fun compute_dyn_layout(itn: *intern.Interner, fp: *plan.FilePlan, lay: *DynLayou
     if (sel r_reladyn.err) { ret r_reladyn; }
     lay.ro_size = plan.end(fp, lay.reladyn_row) - lay.ro_off;
 
-    if (nimp > 0) { lay.plt_size = plt_header_size(arch_id) + PLT_ENTRY_SIZE * nimp::usize; }
-    or            { lay.plt_size = 0; }
-    val r_plt: err[fail.Fail] = place_row(fp, "PLT", page_sz, lay.plt_size, ?lay.plt_row);
-    if (sel r_plt.err) { ret r_plt; }
-
     lay.gotplt_size = (nimp + 3)::usize * GOT_ENTRY_SIZE;
     val r_gotplt: err[fail.Fail] = place_row(fp, "PLT GOT", page_sz, lay.gotplt_size, ?lay.gotplt_row);
     if (sel r_gotplt.err) { ret r_gotplt; }
@@ -3151,7 +3158,6 @@ fun compute_dyn_layout(itn: *intern.Interner, fp: *plan.FilePlan, lay: *DynLayou
     lay.hash_off    = plan.offset(fp, lay.hash_row);
     lay.relaplt_off = plan.offset(fp, lay.relaplt_row);
     lay.reladyn_off = plan.offset(fp, lay.reladyn_row);
-    lay.plt_off     = plan.offset(fp, lay.plt_row);
     lay.gotplt_off  = plan.offset(fp, lay.gotplt_row);
     lay.datagot_off = plan.offset(fp, lay.datagot_row);
     lay.dynamic_off = plan.offset(fp, lay.dynamic_row);
@@ -3166,8 +3172,6 @@ fun compute_dyn_layout(itn: *intern.Interner, fp: *plan.FilePlan, lay: *DynLayou
     if (sel a4.err) { ret a4; }
     val a5: err[fail.Fail] = row_address(fp, lay.reladyn_row, lay.ro_off, struct_va, ?lay.reladyn_va);
     if (sel a5.err) { ret a5; }
-    val a6: err[fail.Fail] = row_address(fp, lay.plt_row, lay.ro_off, struct_va, ?lay.plt_va);
-    if (sel a6.err) { ret a6; }
     val a7: err[fail.Fail] = row_address(fp, lay.gotplt_row, lay.ro_off, struct_va, ?lay.gotplt_va);
     if (sel a7.err) { ret a7; }
     lay.rw_va = lay.gotplt_va;
@@ -3176,6 +3180,36 @@ fun compute_dyn_layout(itn: *intern.Interner, fp: *plan.FilePlan, lay: *DynLayou
     val a9: err[fail.Fail] = row_address(fp, lay.dynamic_row, lay.ro_off, struct_va, ?lay.dynamic_va);
     if (sel a9.err) { ret a9; }
     ret err[fail.Fail].ok{};
+}
+
+# the PLT lives in the table the linker reserved at the end of the code, so no
+# data lies between a call site and its stub
+fun locate_plt(dyn: *of.DynamicInfo, nimp: u32, arch_id: u32,
+    segs: *of.LoadSegment, seg_count: u32, seg_offsets: *usize, lay: *DynLayout) err[fail.Fail] {
+    lay.plt_off  = 0;
+    lay.plt_va   = 0;
+    lay.plt_size = 0;
+    if (nimp == 0) { ret err[fail.Fail].ok{}; }
+    val size: usize = plt_header_size(arch_id) + nimp::usize * PLT_ENTRY_SIZE;
+    if (dyn.stubs.size != size) {
+        ret err[fail.Fail].err{fail.message("elf: the linker reserved no PLT for the imported functions")};
+    }
+    var li: u32 = 0;
+    for (li < seg_count) {
+        val seg: *of.LoadSegment = ?segs[li];
+        if (dyn.stubs.vaddr >= seg.vaddr && dyn.stubs.vaddr - seg.vaddr <= seg.filesz::u64
+            && size::u64 <= seg.filesz::u64 - (dyn.stubs.vaddr - seg.vaddr)) {
+            if ((seg.flags & of.SEG_FLAG_EXECUTE) == 0) {
+                ret err[fail.Fail].err{fail.message("elf: the PLT lies outside the executable segment")};
+            }
+            lay.plt_off  = seg_offsets[li] + (dyn.stubs.vaddr - seg.vaddr)::usize;
+            lay.plt_va   = dyn.stubs.vaddr;
+            lay.plt_size = size;
+            ret err[fail.Fail].ok{};
+        }
+        li = li + 1;
+    }
+    ret err[fail.Fail].err{fail.message("elf: the PLT lies outside every load segment")};
 }
 
 fun write_dyn_structures(itn: *intern.Interner, buf: *u8, fp: *plan.FilePlan, lay: *DynLayout, dyn: *of.DynamicInfo, got: *ImportAddressPlan, nimp: u32,
@@ -3273,13 +3307,17 @@ fun write_dyn_structures(itn: *intern.Interner, buf: *u8, fp: *plan.FilePlan, la
 
     var rela_off: usize = lay.relaplt_off;
     if (nimp > 0) {
-        if (arch_id == isa.ARCH_X86_64) { write_plt_header(buf, lay); }
+        if (arch_id == isa.ARCH_X86_64) {
+            val header_r: err[fail.Fail] = write_plt_header(buf, lay);
+            if (sel header_r.err) { ret header_r; }
+        }
         var n:         u32 = 0;
         var sym_index: u32 = 1;
         i = 0;
         for (i < dyn.import_count) {
             if (dyn.imports[i].is_func) {
-                write_plt_stub(buf, lay, n, arch_id);
+                val stub_r: err[fail.Fail] = write_plt_stub(buf, lay, n, arch_id);
+                if (sel stub_r.err) { ret stub_r; }
 
                 val got_slot_off: usize = lay.gotplt_off + (3 + n)::usize * GOT_ENTRY_SIZE;
                 if (arch_id == isa.ARCH_X86_64) {
@@ -3366,22 +3404,33 @@ fun write_dyn_entry(buf: *u8, off: usize, tag: u64, value: u64) usize {
     ret off + DYN_SIZE;
 }
 
-fun write_plt_header(buf: *u8, lay: *DynLayout) {
-    val p: usize = lay.plt_off;
+# the PLT sits in the code and the GOT after the data, so every stub's reach to
+# its slot is checked rather than truncated into the instruction
+fun plt_got_disp32(slot_va: u64, next_va: u64) res[u32, fail.Fail] {
+    val disp: i64 = slot_va::i64 - next_va::i64;
+    if (disp > 2147483647 || disp < -2147483648) {
+        ret res[u32, fail.Fail].err{fail.message("elf: a PLT entry's GOT slot lies outside the rip-relative +-2GB range")};
+    }
+    ret res[u32, fail.Fail].ok{(disp::u64)::u32};
+}
+
+fun write_plt_header(buf: *u8, lay: *DynLayout) err[fail.Fail] {
+    val p:  usize               = lay.plt_off;
+    val d1: res[u32, fail.Fail] = plt_got_disp32(lay.gotplt_va + 8, lay.plt_va + 6);
+    if (sel d1.err) { ret err[fail.Fail].err{d1.err}; }
+    val d2: res[u32, fail.Fail] = plt_got_disp32(lay.gotplt_va + 16, lay.plt_va + 12);
+    if (sel d2.err) { ret err[fail.Fail].err{d2.err}; }
     buf[p]     = 0xFF;
     buf[p + 1] = 0x35;
-    val next1: u64 = lay.plt_va + 6;
-    val got1:  u64 = lay.gotplt_va + 8;
-    bin.write_u32_le(buf, p + 2, (got1 - next1)::u32);
+    bin.write_u32_le(buf, p + 2, d1.ok);
     buf[p + 6] = 0xFF;
     buf[p + 7] = 0x25;
-    val next2: u64 = lay.plt_va + 12;
-    val got2:  u64 = lay.gotplt_va + 16;
-    bin.write_u32_le(buf, p + 8, (got2 - next2)::u32);
+    bin.write_u32_le(buf, p + 8, d2.ok);
     buf[p + 12] = 0x0F;
     buf[p + 13] = 0x1F;
     buf[p + 14] = 0x40;
     buf[p + 15] = 0x00;
+    ret err[fail.Fail].ok{};
 }
 
 val A64_PLT_ADRP_X16: u32 = 0x90000010;
@@ -3418,53 +3467,58 @@ fun riscv_lo12_i_word(base: u32, delta: i64) u32 {
     ret base | (lo12 << 20);
 }
 
-fun write_plt_stub(buf: *u8, lay: *DynLayout, n: u32, arch_id: u32) {
-    if (arch_id == isa.ARCH_AARCH64) {
-        write_plt_stub_aarch64(buf, lay, n);
-        ret;
-    }
-    if (arch_id == isa.ARCH_RISCV64) {
-        write_plt_stub_riscv64(buf, lay, n);
-        ret;
-    }
-    write_plt_stub_x86_64(buf, lay, n);
+fun write_plt_stub(buf: *u8, lay: *DynLayout, n: u32, arch_id: u32) err[fail.Fail] {
+    if (arch_id == isa.ARCH_AARCH64) { ret write_plt_stub_aarch64(buf, lay, n); }
+    if (arch_id == isa.ARCH_RISCV64) { ret write_plt_stub_riscv64(buf, lay, n); }
+    ret write_plt_stub_x86_64(buf, lay, n);
 }
 
-fun write_plt_stub_x86_64(buf: *u8, lay: *DynLayout, n: u32) {
-    val stub_off: usize = lay.plt_off + (n + 1)::usize * PLT_ENTRY_SIZE;
-    val stub_va:  u64   = lay.plt_va + (n + 1)::u64 * PLT_ENTRY_SIZE::u64;
+fun write_plt_stub_x86_64(buf: *u8, lay: *DynLayout, n: u32) err[fail.Fail] {
+    val stub_off: usize               = lay.plt_off + (n + 1)::usize * PLT_ENTRY_SIZE;
+    val stub_va:  u64                 = lay.plt_va + (n + 1)::u64 * PLT_ENTRY_SIZE::u64;
+    val got:      u64                 = lay.gotplt_va + (3 + n)::u64 * GOT_ENTRY_SIZE::u64;
+    val disp:     res[u32, fail.Fail] = plt_got_disp32(got, stub_va + 6);
+    if (sel disp.err) { ret err[fail.Fail].err{disp.err}; }
     buf[stub_off]     = 0xFF;
     buf[stub_off + 1] = 0x25;
-    val next: u64 = stub_va + 6;
-    val got:  u64 = lay.gotplt_va + (3 + n)::u64 * GOT_ENTRY_SIZE::u64;
-    bin.write_u32_le(buf, stub_off + 2, (got - next)::u32);
+    bin.write_u32_le(buf, stub_off + 2, disp.ok);
     buf[stub_off + 6] = 0x68;
     bin.write_u32_le(buf, stub_off + 7, n);
     buf[stub_off + 11] = 0xE9;
     val plt0:  u64 = lay.plt_va;
     val after: u64 = stub_va + 16;
     bin.write_u32_le(buf, stub_off + 12, (plt0 - after)::u32);
+    ret err[fail.Fail].ok{};
 }
 
-fun write_plt_stub_aarch64(buf: *u8, lay: *DynLayout, n: u32) {
+fun write_plt_stub_aarch64(buf: *u8, lay: *DynLayout, n: u32) err[fail.Fail] {
     val stub_off: usize = lay.plt_off + n::usize * PLT_ENTRY_SIZE;
     val stub_va:  u64   = plt_stub_va(lay, n, isa.ARCH_AARCH64);
     val got_va:   u64   = lay.gotplt_va + (3 + n)::u64 * GOT_ENTRY_SIZE::u64;
+    val pages:    i64   = ((got_va >> 12) << 12)::i64 - ((stub_va >> 12) << 12)::i64;
+    if (pages < -4294967296 || pages >= 4294967296) {
+        ret err[fail.Fail].err{fail.message("elf: a PLT entry's GOT slot lies outside the adrp +-4GB range")};
+    }
     bin.write_u32_le(buf, stub_off, arm64_adrp_word(A64_PLT_ADRP_X16, stub_va, got_va));
     bin.write_u32_le(buf, stub_off + 4, arm64_ldr64_lo12_word(A64_PLT_LDR_X16, got_va));
     bin.write_u32_le(buf, stub_off + 8, A64_PLT_BR_X16);
     bin.write_u32_le(buf, stub_off + 12, A64_NOP);
+    ret err[fail.Fail].ok{};
 }
 
-fun write_plt_stub_riscv64(buf: *u8, lay: *DynLayout, n: u32) {
+fun write_plt_stub_riscv64(buf: *u8, lay: *DynLayout, n: u32) err[fail.Fail] {
     val stub_off: usize = lay.plt_off + n::usize * PLT_ENTRY_SIZE;
     val stub_va:  u64   = plt_stub_va(lay, n, isa.ARCH_RISCV64);
     val got_va:   u64   = lay.gotplt_va + (3 + n)::u64 * GOT_ENTRY_SIZE::u64;
     val delta:    i64   = (got_va::i64) - (stub_va::i64);
+    if (!riscv_pcrel_ok(delta)) {
+        ret err[fail.Fail].err{fail.message("elf: a PLT entry's GOT slot lies outside the auipc +-2GB range")};
+    }
     bin.write_u32_le(buf, stub_off, riscv_hi20_word(RV_PLT_AUIPC_T3, delta));
     bin.write_u32_le(buf, stub_off + 4, riscv_lo12_i_word(RV_PLT_LD_T3, delta));
     bin.write_u32_le(buf, stub_off + 8, RV_PLT_JR_T3);
     bin.write_u32_le(buf, stub_off + 12, RV_NOP);
+    ret err[fail.Fail].ok{};
 }
 
 fun patch_plt_fixups(buf: *u8, lay: *DynLayout, dyn: *of.DynamicInfo,
@@ -3563,15 +3617,18 @@ fun patch_import_addr_fixups(buf: *u8, lay: *DynLayout, dyn: *of.DynamicInfo, go
     ret err[fail.Fail].ok{};
 }
 
-# a riscv call site is the auipc+jalr pair under RK_PLT32 and one jal word
-# under RK_JAL20; every other arch has one shape per branch kind
+# a riscv call site is the auipc+jalr pair under RK_PLT32; a jal word, and
+# each part of a two-part address, is one word
 fun call_patch_width(arch_id: u32, kind: of.RelocKind) usize {
-    if (arch_id == isa.ARCH_RISCV64 && kind != of.RK_JAL20) { ret 8; }
+    if (arch_id == isa.ARCH_RISCV64 && kind == of.RK_PLT32) { ret 8; }
     ret 4;
 }
 
 fun patch_call_site(buf: *u8, file_off: usize, arch_id: u32, kind: of.RelocKind, stub_va: u64,
     addend: i64, patch_va: u64) err[fail.Fail] {
+    if (of.is_pcrel_address_kind(kind)) {
+        ret patch_stub_address(buf, file_off, arch_id, kind, stub_va, addend, patch_va);
+    }
     if (arch_id == isa.ARCH_AARCH64) {
         val disp: i64 = (stub_va::i64) + addend - (patch_va::i64);
         val lim:  i64 = 134217728;
@@ -3611,6 +3668,24 @@ fun patch_call_site(buf: *u8, file_off: usize, arch_id: u32, kind: of.RelocKind,
         ret err[fail.Fail].err{fail.message("elf: dynamic call-site displacement overflows 32 bits")};
     }
     bin.write_u32_le(buf, file_off, (disp::u64)::u32);
+    ret err[fail.Fail].ok{};
+}
+
+# one part of a function import's address taken pc-relative, bound to its stub
+fun patch_stub_address(buf: *u8, file_off: usize, arch_id: u32, kind: of.RelocKind,
+    stub_va: u64, addend: i64, patch_va: u64) err[fail.Fail] {
+    val site:    *u8                              = (buf::usize + file_off)::*u8;
+    val target:  of.RelocTarget                   = relocation.target(stub_va, 0, 0);
+    var patched: res[bool, relocation.RelocError] = res[bool, relocation.RelocError].err{relocation.RELOC_UNSUPPORTED};
+    if (arch_id == isa.ARCH_AARCH64) {
+        patched = a64rel.apply_reloc(kind, site, 0, 4, target, addend, patch_va, 0);
+    }
+    or (arch_id == isa.ARCH_RISCV64) {
+        patched = rvrel.apply_reloc(kind, site, 0, 4, target, addend, patch_va, 0);
+    }
+    if (sel patched.err) {
+        ret err[fail.Fail].err{fail.message("elf: a function import's address cannot be bound to its PLT entry")};
+    }
     ret err[fail.Fail].ok{};
 }
 
@@ -3663,7 +3738,6 @@ fun write_dyn_phdrs(buf: *u8, fp: *plan.FilePlan, phdr_offset: usize, lay: *DynL
     }
 
     pos = write_phdr(buf, pos, PT_LOAD, PF_R, lay.ro_off, lay.ro_va, lay.ro_size, lay.ro_size, page_size);
-    pos = write_phdr(buf, pos, PT_LOAD, PF_R | PF_X, lay.plt_off, lay.plt_va, lay.plt_size, lay.plt_size, page_size);
     pos = write_phdr(buf, pos, PT_LOAD, PF_R | PF_W, lay.rw_off, lay.rw_va, lay.rw_size, lay.rw_size, page_size);
 
     pos = write_phdr(buf, pos, PT_DYNAMIC, PF_R | PF_W, lay.dynamic_off, lay.dynamic_va,
@@ -3672,7 +3746,7 @@ fun write_dyn_phdrs(buf: *u8, fp: *plan.FilePlan, phdr_offset: usize, lay: *DynL
 }
 
 fun phdr_count_bytes(seg_count: u32) usize {
-    ret (seg_count + 7)::usize * PHDR_SIZE;
+    ret (seg_count + 6)::usize * PHDR_SIZE;
 }
 
 fun write_phdr(buf: *u8, pos: usize, p_type: u32, flags: u32, off: usize, vaddr: u64,
@@ -5398,8 +5472,9 @@ fun t_emit_dyn_one(alloc: *A.Allocator, itn: *intern.Interner, arch_id: u32, lay
     if (sel r_4802.err) { ret nil; }
     val r_4803: res[usize, fail.Fail] = plan.seal(?fp);
     if (sel r_4803.err) { ret nil; }
-    val total: usize             = lay.rw_off + lay.rw_size;
-    val rb:    res[*u8, A.Error] = A.zallocate[u8](alloc, total);
+    val total: usize = t_place_plt(?dyn, 1, arch_id, lay, lay.rw_off + lay.rw_size);
+    if (total == 0) { ret nil; }
+    val rb: res[*u8, A.Error] = A.zallocate[u8](alloc, total);
     if (sel rb.err) { ret nil; }
     val buf: *u8 = rb.ok;
 
@@ -5413,6 +5488,24 @@ fun t_emit_dyn_one(alloc: *A.Allocator, itn: *intern.Interner, arch_id: u32, lay
     ret buf;
 }
 
+# the PLT as the linker reserves it, at the end of a code segment below the
+# dynamic structures; its bytes follow them in the test's buffer. returns the
+# buffer's new length, 0 when the writer refuses the table
+fun t_place_plt(dyn: *of.DynamicInfo, nimp: u32, arch_id: u32, lay: *DynLayout, total: usize) usize {
+    dyn.stubs.vaddr = 0x3F0000;
+    dyn.stubs.size  = plt_header_size(arch_id) + nimp::usize * PLT_ENTRY_SIZE;
+    var seg: of.LoadSegment;
+    seg.vaddr  = 0x3F0000;
+    seg.filesz = dyn.stubs.size;
+    seg.memsz  = dyn.stubs.size;
+    seg.flags  = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE;
+    seg.bytes  = nil;
+    var offset: usize          = total;
+    val placed: err[fail.Fail] = locate_plt(dyn, nimp, arch_id, ?seg, 1, ?offset, lay);
+    if (sel placed.err) { ret 0; }
+    ret total + dyn.stubs.size;
+}
+
 fun t_dyn_has(buf: *u8, lay: *DynLayout, tag: u64, value: u64) bool {
     val count: usize = lay.dynamic_size / DYN_SIZE;
     var k:     usize = 0;
@@ -5424,6 +5517,16 @@ fun t_dyn_has(buf: *u8, lay: *DynLayout, tag: u64, value: u64) bool {
         k = k + 1;
     }
     ret false;
+}
+
+fun t_stub_ok(buf: *u8, lay: *DynLayout, n: u32, arch_id: u32) bool {
+    val written: err[fail.Fail] = write_plt_stub(buf, lay, n, arch_id);
+    ret sel written.ok;
+}
+
+fun t_header_ok(buf: *u8, lay: *DynLayout) bool {
+    val written: err[fail.Fail] = write_plt_header(buf, lay);
+    ret sel written.ok;
 }
 
 test "mach.lang.target.of.elf.write_plt_stub:eager_arch_bytes" {
@@ -5441,23 +5544,50 @@ test "mach.lang.target.of.elf.write_plt_stub:eager_arch_bytes" {
 
     var bad: bool = false;
 
-    write_plt_stub(buf, ?lay, 0, isa.ARCH_AARCH64);
-    if (bin.read_u32_le(buf, 0) != 0xD0000010)  { bad = true; }
-    if (bin.read_u32_le(buf, 4) != 0xF9400E10)  { bad = true; }
-    if (bin.read_u32_le(buf, 8) != 0xD61F0200)  { bad = true; }
-    if (bin.read_u32_le(buf, 12) != 0xD503201F) { bad = true; }
+    if (!t_stub_ok(buf, ?lay, 0, isa.ARCH_AARCH64)) { bad = true; }
+    if (bin.read_u32_le(buf, 0) != 0xD0000010)      { bad = true; }
+    if (bin.read_u32_le(buf, 4) != 0xF9400E10)      { bad = true; }
+    if (bin.read_u32_le(buf, 8) != 0xD61F0200)      { bad = true; }
+    if (bin.read_u32_le(buf, 12) != 0xD503201F)     { bad = true; }
 
-    write_plt_stub(buf, ?lay, 1, isa.ARCH_AARCH64);
+    if (!t_stub_ok(buf, ?lay, 1, isa.ARCH_AARCH64)) { bad = true; }
     if (bin.read_u32_le(buf, 16 + 4) != 0xF9401210) { bad = true; }
 
-    write_plt_stub(buf, ?lay, 0, isa.ARCH_RISCV64);
-    if (bin.read_u32_le(buf, 0) != 0x00002E17)  { bad = true; }
-    if (bin.read_u32_le(buf, 4) != 0x018E3E03)  { bad = true; }
-    if (bin.read_u32_le(buf, 8) != 0x000E0067)  { bad = true; }
-    if (bin.read_u32_le(buf, 12) != 0x00000013) { bad = true; }
+    if (!t_stub_ok(buf, ?lay, 0, isa.ARCH_RISCV64)) { bad = true; }
+    if (bin.read_u32_le(buf, 0) != 0x00002E17)      { bad = true; }
+    if (bin.read_u32_le(buf, 4) != 0x018E3E03)      { bad = true; }
+    if (bin.read_u32_le(buf, 8) != 0x000E0067)      { bad = true; }
+    if (bin.read_u32_le(buf, 12) != 0x00000013)     { bad = true; }
 
     A.deallocate[u8](?alloc, buf, 64);
     if (bad) { ret 1; }
+    ret 0;
+}
+
+# the PLT sits beside the code and the GOT after the data, so a slot beyond an
+# entry's reach is refused rather than truncated into the instruction (#3902)
+test "mach.lang.target.of.elf.write_plt_stub:got_out_of_reach_refused" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val rb: res[*u8, A.Error] = A.zallocate[u8](?alloc, 64);
+    if (sel rb.err) { ret 1; }
+    val buf: *u8 = rb.ok;
+    fin { A.deallocate[u8](?alloc, buf, 64); }
+
+    var lay: DynLayout;
+    lay.plt_off   = 0;
+    lay.plt_va    = 0x400000;
+    lay.gotplt_va = 0x400000 + 0x100000000;
+    if (t_stub_ok(buf, ?lay, 0, isa.ARCH_AARCH64)) { ret 2; }
+    lay.gotplt_va = 0x400000 + 0xF0000000;
+    if (!t_stub_ok(buf, ?lay, 0, isa.ARCH_AARCH64)) { ret 3; }
+    if (t_stub_ok(buf, ?lay, 0, isa.ARCH_RISCV64))  { ret 4; }
+    if (t_stub_ok(buf, ?lay, 0, isa.ARCH_X86_64))   { ret 5; }
+    if (t_header_ok(buf, ?lay))                     { ret 6; }
+    lay.gotplt_va = 0x400000 + 0x7FFF0000;
+    if (!t_stub_ok(buf, ?lay, 0, isa.ARCH_RISCV64)) { ret 7; }
+    if (!t_stub_ok(buf, ?lay, 0, isa.ARCH_X86_64))  { ret 8; }
+    if (!t_header_ok(buf, ?lay))                    { ret 9; }
     ret 0;
 }
 
@@ -5474,14 +5604,14 @@ test "mach.lang.target.of.elf.write_plt_stub:x86_64_lazy_unchanged" {
     if (sel rb.err) { ret 1; }
     val buf: *u8 = rb.ok;
 
-    write_plt_stub(buf, ?lay, 0, isa.ARCH_X86_64);
     var bad: bool = false;
-    if (buf[16] != 0xFF || buf[17] != 0x25)     { bad = true; }
-    if (bin.read_u32_le(buf, 18) != 0x2002)     { bad = true; }
-    if (buf[22] != 0x68)                        { bad = true; }
-    if (bin.read_u32_le(buf, 23) != 0)          { bad = true; }
-    if (buf[27] != 0xE9)                        { bad = true; }
-    if (bin.read_u32_le(buf, 28) != 0xFFFFFFE0) { bad = true; }
+    if (!t_stub_ok(buf, ?lay, 0, isa.ARCH_X86_64)) { bad = true; }
+    if (buf[16] != 0xFF || buf[17] != 0x25)        { bad = true; }
+    if (bin.read_u32_le(buf, 18) != 0x2002)        { bad = true; }
+    if (buf[22] != 0x68)                           { bad = true; }
+    if (bin.read_u32_le(buf, 23) != 0)             { bad = true; }
+    if (buf[27] != 0xE9)                           { bad = true; }
+    if (bin.read_u32_le(buf, 28) != 0xFFFFFFE0)    { bad = true; }
 
     A.deallocate[u8](?alloc, buf, 64);
     if (bad) { ret 1; }
@@ -5516,7 +5646,7 @@ test "mach.lang.target.of.elf.write_dyn_structures:aarch64_bindnow" {
     if (!t_dyn_has(buf, ?lay, DT_FLAGS, DF_BIND_NOW)) { bad = true; }
     if (!t_dyn_has(buf, ?lay, DT_BIND_NOW, 0))        { bad = true; }
 
-    A.deallocate[u8](?alloc, buf, lay.rw_off + lay.rw_size);
+    A.deallocate[u8](?alloc, buf, lay.plt_off + lay.plt_size);
     if (bad) { ret 1; }
     ret 0;
 }
@@ -5548,7 +5678,7 @@ test "mach.lang.target.of.elf.write_dyn_structures:riscv64_jump_slot" {
     if (!t_dyn_has(buf, ?lay, DT_FLAGS, DF_BIND_NOW)) { bad = true; }
     if (!t_dyn_has(buf, ?lay, DT_BIND_NOW, 0))        { bad = true; }
 
-    A.deallocate[u8](?alloc, buf, lay.rw_off + lay.rw_size);
+    A.deallocate[u8](?alloc, buf, lay.plt_off + lay.plt_size);
     if (bad) { ret 1; }
     ret 0;
 }
@@ -5573,7 +5703,7 @@ test "mach.lang.target.of.elf.write_dyn_structures:x86_64_lazy_got" {
     if (t_dyn_has(buf, ?lay, DT_BIND_NOW, 0))        { bad = true; }
     if (t_dyn_has(buf, ?lay, DT_FLAGS, DF_BIND_NOW)) { bad = true; }
 
-    A.deallocate[u8](?alloc, buf, lay.rw_off + lay.rw_size);
+    A.deallocate[u8](?alloc, buf, lay.plt_off + lay.plt_size);
     if (bad) { ret 1; }
     ret 0;
 }
@@ -7579,8 +7709,9 @@ fun t_import_call_and_address(arch_id: u32) i32 {
     val r_6535: res[usize, fail.Fail] = plan.seal(?fp);
     if (sel r_6535.err)                                                             { ret 1; }
     if (lay.datagot_size != 16 || lay.reladyn_size != 48 || lay.relaplt_size != 48) { ret 1; }
-    val total: usize             = lay.rw_off + lay.rw_size;
-    val made:  res[*u8, A.Error] = A.zallocate[u8](?alloc, total);
+    val total: usize = t_place_plt(?dyn, 2, arch_id, ?lay, lay.rw_off + lay.rw_size);
+    if (total == 0) { ret 1; }
+    val made: res[*u8, A.Error] = A.zallocate[u8](?alloc, total);
     if (sel made.err) { ret 2; }
     val buf: *u8 = made.ok;
     fin { A.deallocate[u8](?alloc, buf, total); }

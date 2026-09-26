@@ -137,6 +137,12 @@ surface: *ExportSurface) bool;
 pub fun is_function_branch_kind(kind: of.RelocKind) bool;
 ```
 
+## fun is_got_kind
+
+```mach
+pub fun is_got_kind(kind: of.RelocKind) bool;
+```
+
 ## fun named_message
 
 ```mach

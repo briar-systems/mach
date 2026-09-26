@@ -741,6 +741,36 @@ name: intern.StrId) ObjectImage;
 pub fun object_image_dnit(image: *ObjectImage);
 ```
 
+## fun section_install
+
+```mach
+pub fun section_install(o: *ObjectImage, s: *Section) res[u32, fail.Fail];
+```
+
+## fun symbol_add
+
+```mach
+pub fun symbol_add(o: *ObjectImage, sym: Symbol) res[u32, fail.Fail];
+```
+
+## fun export_request_add
+
+```mach
+pub fun export_request_add(o: *ObjectImage, name: intern.StrId) err[fail.Fail];
+```
+
+## fun add_frame
+
+```mach
+pub fun add_frame(o: *ObjectImage, fr: *FrameUnwind) err[fail.Fail];
+```
+
+## fun add_relocation
+
+```mach
+pub fun add_relocation(o: *ObjectImage, rel: Relocation) err[fail.Fail];
+```
+
 ## fun validate_object_view
 
 ```mach
@@ -795,27 +825,40 @@ pub rec BaseReloc;
 pub rec DynamicInfo;
 ```
 
-## rec StubTable
+## rec TableSpan
 
 ```mach
-pub rec StubTable;
+pub rec TableSpan;
 ```
 
-## rec StubShape
+where a table the linker reserved for a format lies in the image
+
+## rec TableShape
 
 ```mach
-pub rec StubShape;
+pub rec TableShape;
 ```
 
-what a format's call-stub table takes for a count of imported functions: the
-linker reserves it at the end of the code under this section name, so every
-call site reaches its stub whatever data the image carries
+what a table a format asks the linker to reserve takes: the linker lays it out
+under this section name before it gives anything an address, so the code
+reaches it whatever data the image carries
 
 ## def StubShapeFn
 
 ```mach
-pub def StubShapeFn: fun(u32, u32) res[StubShape, fail.Fail]
+pub def StubShapeFn: fun(u32, u32) res[TableShape, fail.Fail]
 ```
+
+the call-stub table for a count of imported functions, at the end of the code
+
+## def GotShapeFn
+
+```mach
+pub def GotShapeFn: fun(u32, *DynamicInfo) res[TableShape, fail.Fail]
+```
+
+the import GOT for the imports of a dynamic link, at the end of the read-only
+data; an empty shape when no import needs a slot
 
 ## rec PltFixup
 
@@ -1506,11 +1549,33 @@ pub fun covers_isa(vt: *OfVTable, arch_id: u32) bool;
 pub fun abs_kind_for_pointer_width(w: u32) res[RelocKind, fail.Fail];
 ```
 
+## fun addend_fits_field
+
+```mach
+pub fun addend_fits_field(addend: i64, width: usize, pc_relative: bool) bool;
+```
+
+an addend a format stores in the relocated field itself fits that field of
+`width` bytes: signed for a pc-relative field, signed or unsigned for an
+absolute one. a writer refuses one that does not rather than keep its low
+bits (#3907)
+
 ## fun is_pointer_abs_kind
 
 ```mach
 pub fun is_pointer_abs_kind(kind: RelocKind, w: u32) bool;
 ```
+
+## fun is_pcrel_address_kind
+
+```mach
+pub fun is_pcrel_address_kind(kind: RelocKind) bool;
+```
+
+a pc-relative materialization of a symbol's address in two parts, a page or
+high part and a low part, as aarch64 and riscv64 take it (x86-64 takes it
+whole with RK_PC32). against a function import each part resolves to the
+import's call stub, as a call does
 
 ## fun reloc_symbol_name
 

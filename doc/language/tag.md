@@ -96,7 +96,7 @@ case takes empty braces. There is no other construction form:
 ```mach error this tag case requires a payload
 tag Reply: u8 { empty; value: i64; }
 
-val missing: Reply = Reply.value{};     # the case declares a payload
+val missing: Reply = Reply.value{}; # the case declares a payload
 ```
 
 Whole-value assignment replaces the selected case and payload together.
@@ -107,14 +107,14 @@ Zero initialization selects the first declared case and zero-initializes its
 payload if one exists.
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
 tag Reply: u8 { empty; value: i64; }
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
-    var reply: Reply;           # selects Reply.empty
+    var reply: Reply; # selects Reply.empty
     if (sel reply.empty) { print.println("empty"); }
     ret 0;
 }
@@ -129,17 +129,17 @@ construction form, `sel`, guards, layout and reflection. A module imports the
 ones it spells:
 
 ```mach
-use std.types.result.res;
-use std.types.option.opt;
 use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
 ```
 
 std declares them as:
 
 ```mach
 pub tag res[T, E]: u8 { err: E; ok: T; }
-pub tag opt[T]: u8    { none; some: T; }
-pub tag err[E]: u8    { err: E; ok; }
+pub tag opt[T]:    u8 { none; some: T; }
+pub tag err[E]:    u8 { err: E; ok; }
 ```
 
 - `res[T, E]` is either an error of type `E` or a value of type `T`; `err: E` is
@@ -153,9 +153,9 @@ There is no defaulted type argument, general type inference, dummy success
 type, unit value, constructor function or automatic error conversion.
 
 ```mach
-use std.types.result.res;
-use std.types.option.opt;
 use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
 
 tag ParseError: u8 { invalid; overflow; }
 
@@ -185,7 +185,9 @@ is rejected the way any unresolved type name is:
 ```mach error unresolved type name `res`
 tag ParseError: u8 { invalid; }
 
-fun parse(x: i64) res[i64, ParseError] { ret res[i64, ParseError].ok{x}; }
+fun parse(x: i64) res[i64, ParseError] {
+    ret res[i64, ParseError].ok{x};
+}
 ```
 
 ## Case tests
@@ -199,10 +201,10 @@ tag Reply: u8 { empty; value: i64; }
 
 fun describe(reply: Reply) i64 {
     if (sel reply.value) {
-        ret reply.value;        # reply holds value here
+        ret reply.value; # reply holds value here
     }
     or {
-        ret 0;                  # reply holds empty here
+        ret 0; # reply holds empty here
     }
 }
 ```
@@ -238,7 +240,9 @@ fun tests(reply: Reply, next: opt[i64], a: opt[i64], b: opt[i64]) bool {
 ```mach error `sel` tests a place
 tag Reply: u8 { empty; value: i64; }
 
-fun make() Reply { ret Reply.empty{}; }
+fun make() Reply {
+    ret Reply.empty{};
+}
 
 fun test() i64 {
     if (sel make().empty) { ret 1; }
@@ -274,7 +278,7 @@ tag Reply: u8 { empty; value: i64; }
 
 fun read_value(reply: Reply) i64 {
     if (sel reply.value) {
-        ret reply.value;    # guarded by the arm condition
+        ret reply.value; # guarded by the arm condition
     }
     ret 0;
 }
@@ -286,7 +290,7 @@ A payload read outside a guard is a compile error:
 tag Reply: u8 { empty; value: i64; }
 
 fun read_value(reply: Reply) i64 {
-    ret reply.value;        # no guard opens here
+    ret reply.value; # no guard opens here
 }
 ```
 
@@ -310,7 +314,7 @@ tag Reply: u8 { empty; value: i64; }
 fun reset(reply: Reply) i64 {
     var r: Reply = reply;
     if (sel r.value) {
-        r = Reply.empty{};          # whole-value assignment inside the guard
+        r = Reply.empty{}; # whole-value assignment inside the guard
         ret 1;
     }
     ret 0;

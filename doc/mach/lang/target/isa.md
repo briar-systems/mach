@@ -885,6 +885,26 @@ pub fun packed_lane_cap(m: *MachineModel, lane_bits: u32) u32;
 pub fun moves_unaligned_gp(m: *MachineModel, bytes: u32) bool;
 ```
 
+## fun offset_fits
+
+```mach
+pub fun offset_fits(bits: u32, off: i64) bool;
+```
+
+a constant offset fits a signed field of `bits` bits; 0 bits is no bound
+
+## fun sym_offset_folds
+
+```mach
+pub fun sym_offset_folds(m: *MachineModel, off: i64) bool;
+```
+
+## fun mem_disp_folds
+
+```mach
+pub fun mem_disp_folds(m: *MachineModel, off: i64) bool;
+```
+
 ## fun moves_vector_memory
 
 ```mach
@@ -1041,8 +1061,12 @@ pub def EmitAsmFn: fun(*A.Allocator, *BackendTarget, *mir.MirModule,
 ## def EmitModuleFn
 
 ```mach
-pub def EmitModuleFn: fun(*A.Allocator, *BackendTarget, *unit_input.Unit, *debug_input.ModuleDebug, **u8, *u32) err[fail.Fail]
+pub def EmitModuleFn: fun(*A.Allocator, *BackendTarget, *unit_input.Unit, *debug_input.ModuleDebug, *of.ObjectImage) err[fail.Fail]
 ```
+
+a whole-module emitter fills the object image codegen initialized: its sections,
+symbols and relocations, in the same neutral kinds a native image carries, with
+section bytes allocated from the image's allocator. names are the emitter's own
 
 ## rec AssemblyCapabilities
 
@@ -1399,7 +1423,7 @@ model: *MachineModel, emitter: *ModuleEmitter) IsaVTable;
 ## fun module_emitter
 
 ```mach
-pub fun module_emitter(emit_module: EmitModuleFn) ModuleEmitter;
+pub fun module_emitter(emit_module: EmitModuleFn, has_assembly: bool) ModuleEmitter;
 ```
 
 ## rec IsaRegistryEntry
@@ -1649,6 +1673,14 @@ pub fun has_codegen(vt: *IsaVTable) bool;
 pub fun emits_whole_module(vt: *IsaVTable) bool;
 ```
 
+## fun has_assembly
+
+```mach
+pub fun has_assembly(vt: *IsaVTable) bool;
+```
+
+whether source may carry `asm` blocks for this instruction set, whichever backend family it has
+
 ## fun emits_relocations
 
 ```mach
@@ -1712,7 +1744,7 @@ pub fun make_sym_mod(sym_id: u32, size: u8, mod: SymModifier) Operand;
 ## fun make_sym_addend
 
 ```mach
-pub fun make_sym_addend(sym_id: u32, size: u8, mod: SymModifier, addend: i32) Operand;
+pub fun make_sym_addend(sym_id: u32, size: u8, mod: SymModifier, addend: i64) Operand;
 ```
 
 ## fun inst_blank

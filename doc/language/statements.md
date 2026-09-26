@@ -28,10 +28,10 @@ tag Reply: u8 { empty; value: i64; }
 
 fun read(reply: Reply) i64 {
     if (sel reply.value) {
-        ret reply.value;            # guarded by the arm condition
+        ret reply.value; # guarded by the arm condition
     }
     or {
-        ret 0;                      # reply holds empty on this path
+        ret 0; # reply holds empty on this path
     }
 }
 ```
@@ -45,8 +45,8 @@ untested. See [tag.md](tag.md).
 A single condition-loop form. There is no for-each.
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
@@ -62,8 +62,8 @@ fun main(argc: i64, argv: **u8) i64 {
 A `for` with no condition loops until a `brk` or a `ret` leaves it:
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
@@ -90,8 +90,8 @@ Loop control: `brk` exits the enclosing `for`; `cnt` continues to the
 next iteration.
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
@@ -120,8 +120,8 @@ order of declaration. Useful for cleanup that should happen regardless of how
 the scope exits.
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
 var counter: i64 = 0;
 
@@ -203,20 +203,25 @@ and exits the arm that handles the failure; the exiting chain guards the
 success payload for the rest of the block:
 
 ```mach
-use std.types.result.res;
 use std.types.error.err;
+use std.types.result.res;
 
 tag WriteError: u8 { closed; full; }
 
-fun flush() err[WriteError] { ret err[WriteError].ok{}; }
-fun parse(input: u8) res[i64, WriteError] { ret res[i64, WriteError].ok{input::i64}; }
+fun flush() err[WriteError] {
+    ret err[WriteError].ok{};
+}
+
+fun parse(input: u8) res[i64, WriteError] {
+    ret res[i64, WriteError].ok{input::i64};
+}
 
 fun increment(input: u8) res[i64, WriteError] {
     val flushed: err[WriteError] = flush();
     if (sel flushed.err) { ret res[i64, WriteError].err{flushed.err}; }
     val r: res[i64, WriteError] = parse(input);
     if (sel r.err) { ret res[i64, WriteError].err{r.err}; }
-    ret res[i64, WriteError].ok{r.ok + 1};      # r.ok is guarded: the chain above exits
+    ret res[i64, WriteError].ok{r.ok + 1}; # r.ok is guarded: the chain above exits
 }
 ```
 
