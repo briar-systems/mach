@@ -57,6 +57,7 @@ profile_name: the resolved profile's name
 entry: the artifact's `entry`
 bin_path: the artifact's output: the expanded `[project].out` joined with the
                expanded artifact `out`
+out_root: `<expanded project out>`, whose layout beneath it the build owns
 obj_root: `<expanded project out>/obj`
 ir_root: `<expanded project out>/ir`
 asm_root: `<expanded project out>/asm`

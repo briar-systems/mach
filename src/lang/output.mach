@@ -4,7 +4,9 @@
 # object: the object cache reads it back, so it goes through
 # `through_temporary`. a file in the source tree goes through `replace`. both
 # write a sibling temporary and rename it over the destination, so an
-# interrupted write leaves the original intact
+# interrupted write leaves the original intact. the build owns its output
+# layout: `directory` and `reserve` replace a stale entry of the wrong kind,
+# and every failure names the path and the operation
 use mach.lang.build.outcome;
 use mach.lang.fail;
 use mach.lang.intern;
@@ -53,28 +55,99 @@ pub fun io_message(itn: *intern.Interner, a: *A.Allocator, op: str, path: str, o
     ret intern_message(itn, a, buf, str_len(buf), generic);
 }
 
+# `<op> '<path>': <detail>`, interned when `itn` is given and otherwise owned by `a`
 fun message(itn: *intern.Interner, a: *A.Allocator, op: str, path: str, detail: str, generic: str) str {
-    if (itn == nil) { ret detail; }
-    ret io_message(itn, a, op, path, detail, generic);
+    if (itn != nil) { ret io_message(itn, a, op, path, detail, generic); }
+    val res_msg: res[str, format.FormatError] = format.sprint(a, "{} '{}': {}", op, path, detail);
+    if (sel res_msg.err) { ret generic; }
+    ret res_msg.ok;
 }
 
-fun parents(a: *A.Allocator, target: str) err[fs.FsError] {
-    val parent: res[str, A.Error] = path.parent(a, target);
-    if (sel parent.err) { ret err[fs.FsError].err{fs.FsError.alloc{parent.err}}; }
-    val made: err[fs.FsError] = fs.create_dir_all(a, parent.ok, DIR_MODE);
-    str_free(a, parent.ok);
-    ret made;
+fun layout_fail(a: *A.Allocator, op: str, at: str, detail: str) err[outcome.Fail] {
+    ret err[outcome.Fail].err{outcome.environment(message(nil, a, op, at, detail, op))};
 }
 
-# write `buf` to `path`, creating missing parent directories when `create_parents`
-pub fun bytes(itn: *intern.Interner, a: *A.Allocator, path: str, buf: *u8, len: usize, mode: i32,
-    create_parents: bool, op: str, generic: str) err[outcome.Fail] {
-    if (create_parents) {
-        val made: err[fs.FsError] = parents(a, path);
-        if (sel made.err) {
-            ret err[outcome.Fail].err{outcome.environment(message(itn, a, op, path, outcome.fs_text(made.err), generic))};
-        }
+# `p` lies strictly beneath `root`, both read as cleaned paths
+fun beneath(a: *A.Allocator, root: str, p: str) bool {
+    if (root == nil) { ret false; }
+    val clean_root: res[str, A.Error] = path.clean(a, root);
+    if (sel clean_root.err) { ret false; }
+    fin { str_free(a, clean_root.ok); }
+    val clean_p: res[str, A.Error] = path.clean(a, p);
+    if (sel clean_p.err) { ret false; }
+    fin { str_free(a, clean_p.ok); }
+    val r:  str   = clean_root.ok;
+    val c:  str   = clean_p.ok;
+    val rl: usize = str_len(r);
+    if (rl == 0 || str_len(c) <= rl + 1) { ret false; }
+    var i: usize = 0;
+    for (i < rl) {
+        if (r[i] != c[i]) { ret false; }
+        i = i + 1;
     }
+    ret path.is_separator(c[rl]) || path.is_separator(r[rl - 1]);
+}
+
+# the build owns the layout beneath its output root: `dir` and each missing
+# ancestor become directories, and beneath `root` an entry where one belongs
+# that does not resolve to a directory (a stale file, a dangling link) is
+# removed first, a link as the link and never its target. `root` itself and
+# what lies above it or outside it are created but never replaced, and a
+# symlink to a directory is used as it stands
+pub fun directory(a: *A.Allocator, root: str, dir: str) err[outcome.Fail] {
+    if (path.is_empty(dir) || path.is_root(dir)) { ret err[outcome.Fail].ok{}; }
+    val present: res[bool, io_error.Error] = fs.is_dir(dir);
+    if (sel present.err) { ret layout_fail(a, "cannot inspect directory", dir, outcome.io_text(present.err)); }
+    if (present.ok)      { ret err[outcome.Fail].ok{}; }
+    if (!beneath(a, root, dir)) {
+        val created: err[fs.FsError] = fs.create_dir_all(a, dir, DIR_MODE);
+        if (sel created.err) { ret layout_fail(a, "cannot create directory", dir, outcome.fs_text(created.err)); }
+        ret err[outcome.Fail].ok{};
+    }
+    val parent: res[str, A.Error] = path.parent(a, dir);
+    if (sel parent.err) { ret err[outcome.Fail].err{outcome.refused(parent.err)}; }
+    val above: err[outcome.Fail] = directory(a, root, parent.ok);
+    str_free(a, parent.ok);
+    if (sel above.err) { ret above; }
+    val stale: res[bool, io_error.Error] = fs.exists(dir);
+    if (sel stale.err) { ret layout_fail(a, "cannot inspect directory", dir, outcome.io_text(stale.err)); }
+    if (stale.ok) {
+        val removed: err[io_error.Error] = fs.remove_file(dir);
+        if (sel removed.err) { ret layout_fail(a, "cannot replace stale file", dir, outcome.io_text(removed.err)); }
+    }
+    val made: err[io_error.Error] = fs.create_dir(dir, DIR_MODE);
+    if (sel made.ok) { ret err[outcome.Fail].ok{}; }
+    # a concurrent writer that made it first is as good
+    val now: res[bool, io_error.Error] = fs.is_dir(dir);
+    if (sel now.ok && now.ok) { ret err[outcome.Fail].ok{}; }
+    ret layout_fail(a, "cannot create directory", dir, outcome.io_text(made.err));
+}
+
+# ready `file` to be written: its parent is a directory as `directory` makes
+# it, and beneath `root` a stale directory at its own name is removed. a
+# symlink there is left for the write to follow
+pub fun reserve(a: *A.Allocator, root: str, file: str) err[outcome.Fail] {
+    val parent: res[str, A.Error] = path.parent(a, file);
+    if (sel parent.err) { ret err[outcome.Fail].err{outcome.refused(parent.err)}; }
+    val made: err[outcome.Fail] = directory(a, root, parent.ok);
+    str_free(a, parent.ok);
+    if (sel made.err)            { ret made; }
+    if (!beneath(a, root, file)) { ret err[outcome.Fail].ok{}; }
+    val found: res[fs.Metadata, io_error.Error] = fs.metadata_link(file);
+    if (sel found.err) {
+        if (found.err.kind == io_error.NOT_FOUND) { ret err[outcome.Fail].ok{}; }
+        ret layout_fail(a, "cannot inspect", file, outcome.io_text(found.err));
+    }
+    var meta: fs.Metadata = found.ok;
+    if (!fs.meta_is_dir(?meta)) { ret err[outcome.Fail].ok{}; }
+    val removed: err[fs.FsError] = fs.remove_all(a, file);
+    if (sel removed.err) { ret layout_fail(a, "cannot replace stale directory", file, outcome.fs_text(removed.err)); }
+    ret err[outcome.Fail].ok{};
+}
+
+# write `buf` to `path`, whose parent exists
+pub fun bytes(itn: *intern.Interner, a: *A.Allocator, path: str, buf: *u8, len: usize, mode: i32,
+    op: str, generic: str) err[outcome.Fail] {
     val written: err[fs.FsError] = fs.write_bytes(path, buf, len, mode);
     if (sel written.err) {
         ret err[outcome.Fail].err{outcome.environment(message(itn, a, op, path, outcome.fs_text(written.err), generic))};
@@ -82,16 +155,10 @@ pub fun bytes(itn: *intern.Interner, a: *A.Allocator, path: str, buf: *u8, len: 
     ret err[outcome.Fail].ok{};
 }
 
-# stream `path` through `write_cb`, creating missing parent directories when `create_parents`
+# stream `path`, whose parent exists, through `write_cb`
 pub fun writer[W](itn: *intern.Interner, a: *A.Allocator, path: str, ctx: *W,
     write_cb: fun(*W, *mwriter.Writer) err[mwriter.WriteError], mode: i32,
-    create_parents: bool, op: str, generic: str) err[outcome.Fail] {
-    if (create_parents) {
-        val made: err[fs.FsError] = parents(a, path);
-        if (sel made.err) {
-            ret err[outcome.Fail].err{outcome.environment(message(itn, a, op, path, outcome.fs_text(made.err), generic))};
-        }
-    }
+    op: str, generic: str) err[outcome.Fail] {
     val created: res[fs.File, io_error.Error] = fs.create(path, mode);
     if (sel created.err) {
         ret err[outcome.Fail].err{outcome.environment(message(itn, a, op, path, outcome.io_text(created.err), generic))};
