@@ -292,6 +292,10 @@ Regression tests are a separate kind, and rare: they are kept only for
 regressions that are easy to reintroduce, and are named `regression__*`. They
 may sit next to unit tests. The name is a convention, not a mechanism.
 
+The compiler's codegen corpus and link cases get the same scrutiny, scoped to
+what cannot be tested inside the compiler: the final codegen and link result on
+disk.
+
 ## See also
 
 - [fun.md](fun.md) — functions; a test body is checked like a function body
