@@ -1,7 +1,13 @@
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
 
 use std.allocator.page;
 
@@ -11,18 +17,23 @@ use adecl: mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.id;
 use mach.lang.fe.ast.module;
 use mach.lang.fe.comptime;
+use mach.lang.fe.resolve;
 use scx: mach.lang.fe.sema.context;
 use mach.lang.intern;
 use mach.lang.me.ir;
 use mach.lang.me.lower.context;
 use mach.lang.me.lower.decl;
 use mach.lang.session;
+use mach.lang.source;
 use mach.lang.type;
 
 fwd context.LoopFrame;
 fwd context.LowerContext;
 fwd context.LowerRequest;
 fwd context.NormalObject;
+fwd context.BindSweep;
+fwd context.SWEEP_NORMAL;
+fwd context.SWEEP_TESTING;
 fwd context.ModuleScope;
 fwd context.ScopeMark;
 fwd context.request;
@@ -111,6 +122,86 @@ pub fun lower_module(req: *context.LowerRequest) res[ir.Module, fail.Fail] {
     if (!sel lc.status.kind.accepted) { ret lower_module_fail(?lc, ?m, fail.phase_failure(lc.status)); }
     context.dnit_context(?lc);
     ret res[ir.Module, fail.Fail].ok{m};
+}
+
+# binds the module's constants for `sweep` and emits nothing (see context.BindSweep)
+pub fun bind_constants(req: *context.LowerRequest, sweep: context.BindSweep) err[fail.Fail] {
+    if (req == nil) { ret err[fail.Fail].err{fail.message("lower: bind_constants requires a lowering request")}; }
+    val a: *ast.Ast = req.module.a;
+
+    val res_module: res[ir.Module, fail.Fail] = ir.init(req.malloc, req.module.fqn);
+    if (sel res_module.err) { ret err[fail.Fail].err{res_module.err}; }
+    var m: ir.Module = res_module.ok;
+
+    var lc:       context.LowerContext;
+    val res_init: err[fail.Fail] = context.init_context(?lc, req, ?m);
+    if (sel res_init.err) {
+        ir.dnit(?m);
+        ret res_init;
+    }
+    lc.sweep = sweep;
+
+    var bound: err[fail.Fail] = bind_decls(?lc, a);
+    if (!sel lc.status.kind.accepted) { bound = err[fail.Fail].err{fail.phase_failure(lc.status)}; }
+    context.dnit_context(?lc);
+    ir.dnit(?m);
+    ret bound;
+}
+
+fun bind_decls(lc: *context.LowerContext, a: *ast.Ast) err[fail.Fail] {
+    val opt_module: opt[*module.Module] = ast.get_module(a, a.root_module);
+    if (sel opt_module.none) { ret err[fail.Fail].err{fail.message("lower: root_module is not set on this Ast")}; }
+    val mnode: *module.Module = opt_module.some;
+    var i:     u32            = 0;
+    for (i < mnode.decls_len) {
+        val pool_ix: u32 = mnode.decls_start + i;
+        if (pool_ix::usize >= a.decl_id_len) { ret err[fail.Fail].err{fail.message("lower: module decl index out of range")}; }
+        val bound: err[fail.Fail] = decl.lower_decl(lc, a.decl_ids[pool_ix]);
+        if (sel bound.err) { ret bound; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a bind sweep over the module has work: a module-scope global of the sweep's kind
+# whose constant is not bound yet, in any branch of a comptime `if`
+pub fun constants_pending(s: *session.Session, a: *ast.Ast, ctx: *comptime.ComptimeCtx, sweep: context.BindSweep) bool {
+    val opt_module: opt[*module.Module] = ast.get_module(a, a.root_module);
+    if (sel opt_module.none) { ret true; }
+    val sf: opt[*source.SourceFile] = source.get(?s.sources, a.file_id);
+    if (sel sf.none) { ret true; }
+    ret decls_pending(s, a, sf.some.text, ctx, sweep, opt_module.some.decls_start, opt_module.some.decls_len);
+}
+
+fun decls_pending(s: *session.Session, a: *ast.Ast, text: str, ctx: *comptime.ComptimeCtx, sweep: context.BindSweep, start: u32, len: u32) bool {
+    var i: u32 = 0;
+    for (i < len) {
+        val pool_ix: u32 = start + i;
+        if (pool_ix::usize >= a.decl_id_len) { ret true; }
+        val did:      id.DeclId        = a.decl_ids[pool_ix];
+        val opt_decl: opt[*adecl.Decl] = ast.get_decl(a, did);
+        if (sel opt_decl.none) { ret true; }
+        val d: *adecl.Decl = opt_decl.some;
+        if (d.kind == adecl.DECL_KIND_COMPTIME_IF) {
+            var b: u32 = 0;
+            for (b < d.data.comptime_if.branches_len) {
+                val branch_ix: u32 = d.data.comptime_if.branches_start + b;
+                if (branch_ix::usize >= a.comptime_branch_len) { ret true; }
+                val branch: *adecl.ComptimeBranch = ?a.comptime_branches[branch_ix];
+                if (decls_pending(s, a, text, ctx, sweep, branch.body_start, branch.body_len)) { ret true; }
+                b = b + 1;
+            }
+        }
+        or ((d.kind == adecl.DECL_KIND_VAL || d.kind == adecl.DECL_KIND_VAR) && d.data.bind.init != id.EXPR_NIL
+            && resolve.declaration_testing(a, text, did) == (sweep == context.SWEEP_TESTING)) {
+            val named: res[intern.StrId, A.Error] = intern.intern_span(?s.interner, text, d.data.bind.name);
+            if (sel named.err) { ret true; }
+            val bound: opt[comptime.NamedConst] = comptime.lookup(ctx, named.ok);
+            if (sel bound.none) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
 }
 
 fun lower_module_fail(lc: *context.LowerContext, m: *ir.Module, f: fail.Fail) res[ir.Module, fail.Fail] {

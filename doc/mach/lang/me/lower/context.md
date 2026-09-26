@@ -74,6 +74,35 @@ pub fun normal_defines(lc: *LowerContext, name: intern.StrId) bool;
 
 lowering the test object, which declares `name` because the normal object defines it
 
+## def BindSweep
+
+```mach
+pub def BindSweep: u8
+```
+
+a lowering that emits nothing and only binds the module's constants, the way its
+normal object's lowering binds them or its test object's binds the `#[testing]` ones
+after those. a lowering that reads a module whose own lowering this session skipped
+binds them first, so a reused object never changes what a constant folds to
+
+## val SWEEP_NONE
+
+```mach
+pub val SWEEP_NONE:    BindSweep = 0
+```
+
+## val SWEEP_NORMAL
+
+```mach
+pub val SWEEP_NORMAL:  BindSweep = 1
+```
+
+## val SWEEP_TESTING
+
+```mach
+pub val SWEEP_TESTING: BindSweep = 2
+```
+
 ## rec ModuleScope
 
 ```mach

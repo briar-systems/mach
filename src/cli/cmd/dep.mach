@@ -96,6 +96,19 @@ val COPY_NONE:      u8 = 0;
 val COPY_REFRESHED: u8 = 1;
 val COPY_REUSED:    u8 = 2;
 
+# how a closure walk reads a fixed git dependency: at the commit its selector picks, fetching
+# one its checkout lacks unless `offline`. a branch is read at its pin, or at its fetched tip
+# when the walk is an update that moves it: every one under `all`, or the identity `name` names
+rec Walk {
+    offline: bool;
+    all:     bool;
+    name:    str;
+}
+
+fun walk_moves(w: *Walk, id: str) bool {
+    ret w.all || (w.name != nil && str_equals(w.name, id));
+}
+
 # a release-selected git dependency: its requirements are the chosen release's
 fun selects_release(r: *DepReq) bool {
     ret r.is_git && is_ranged(r);
@@ -779,9 +792,10 @@ fun lock_listed(locks: *Vector[resolver.Lock], id: str) bool {
 # command that pulls the closure afterwards leaves them to the pull, which names every
 # requirement the root overrides
 fun resolve_versions(s: *session.Session, a: *A.Allocator, root: str, table: *toml.Table,
-    lowest: bool, offline: bool, lock: bool, unlocked: str, root_notes: bool) res[Resolution, outcome.Fail] {
-    var out:    Resolution                           = Resolution{picks: vector.init[resolver.Choice](a), ranged: false, notes: vector.init[str](a)};
-    val parsed: res[manifest.Manifest, outcome.Fail] = manifest.parse(a, ?s.interner, table, false);
+    lowest: bool, lock: bool, unlocked: str, root_notes: bool, walk: *Walk) res[Resolution, outcome.Fail] {
+    val offline: bool                                 = walk.offline;
+    var out:     Resolution                           = Resolution{picks: vector.init[resolver.Choice](a), ranged: false, notes: vector.init[str](a)};
+    val parsed:  res[manifest.Manifest, outcome.Fail] = manifest.parse(a, ?s.interner, table, false);
     if (sel parsed.err) { ret res[Resolution, outcome.Fail].err{parsed.err}; }
     var m: manifest.Manifest = parsed.ok;
     fin { manifest.dnit(?m, a); }
@@ -803,7 +817,7 @@ fun resolve_versions(s: *session.Session, a: *A.Allocator, root: str, table: *to
 
     var closure: Vector[DepReq] = vector.init[DepReq](a);
     fin { free_requests(a, ?closure); }
-    val walked: err[outcome.Fail] = preflight_closure(s, a, root, table, ?closure, true);
+    val walked: err[outcome.Fail] = preflight_closure(s, a, root, table, ?closure, true, walk);
     if (sel walked.err) { ret res[Resolution, outcome.Fail].err{walked.err}; }
 
     # fixed identities first: a range on one of them is overridden
@@ -976,7 +990,8 @@ pub fun dep_outdated(root: str, offline: bool) i64 {
     val mt_r: res[toml.Table, outcome.Fail] = parse_file(?a, mt_path_r.ok);
     if (sel mt_r.err) { ret cli_diag.refuse(mt_r.err); }
     var mt:       toml.Table                    = mt_r.ok;
-    val resolved: res[Resolution, outcome.Fail] = resolve_versions(?s, ?a, root, ?mt, false, offline, false, nil, true);
+    var walk:     Walk                          = Walk{offline: offline, all: false, name: nil};
+    val resolved: res[Resolution, outcome.Fail] = resolve_versions(?s, ?a, root, ?mt, false, false, nil, true, ?walk);
     if (sel resolved.err) { ret cli_diag.refuse(resolved.err); }
     var outdated_notes: Resolution = resolved.ok;
     print_notes(?outdated_notes);
@@ -1187,10 +1202,11 @@ fun update_apply(s: *session.Session, a: *A.Allocator, root: str, mode: u8, all:
     # a name the root does not declare is looked up in the realized closure
     val transitive: bool = !all && req_index(?reqs, name::str) < 0;
     if (!transitive) {
-        val advanced: i64 = advance_fixed(s, a, root, mode, ?reqs, all, name, quiet, fail_after);
+        val advanced: i64 = advance_fixed(s, a, root, mode, ?reqs, true, all, name, quiet, fail_after);
         if (advanced != exit.OK) { ret advanced; }
     }
-    val preflight: err[outcome.Fail] = preflight_closure(s, a, root, ?mt, ?known, true);
+    var walk:      Walk              = Walk{offline: offline, all: all, name: name::str};
+    val preflight: err[outcome.Fail] = preflight_closure(s, a, root, ?mt, ?known, true, ?walk);
     if (sel preflight.err) { ret cli_diag.refuse(preflight.err); }
     if (transitive && req_index(?known, name::str) < 0) {
         print.eprintlnf("error: dependency '{}' is not in the dependency closure", name::str);
@@ -1199,14 +1215,15 @@ fun update_apply(s: *session.Session, a: *A.Allocator, root: str, mode: u8, all:
     # version ranges resolve together; naming one unlocks only that identity
     var unlocked: str = nil;
     if (!all) { unlocked = name::str; }
-    val resolved: res[Resolution, outcome.Fail] = resolve_versions(s, a, root, ?mt, lowest, offline, !all, unlocked, false);
+    val resolved: res[Resolution, outcome.Fail] = resolve_versions(s, a, root, ?mt, lowest, !all, unlocked, false, ?walk);
     if (sel resolved.err) { ret cli_diag.refuse(resolved.err); }
     var update_notes: Resolution = resolved.ok;
     if (!quiet) { print_notes(?update_notes); }
     var picks:  Vector[resolver.Choice] = resolved.ok.picks;
     val picked: bool                    = !all && pick_index(?picks, name::str) >= 0;
-    if (transitive && !picked) {
-        val advanced: i64 = advance_fixed(s, a, root, mode, ?known, false, name, quiet, fail_after);
+    # a fixed selector the closure declares moves to the commit resolution read it at
+    if (all || (transitive && !picked)) {
+        val advanced: i64 = advance_fixed(s, a, root, mode, ?known, false, all, name, quiet, fail_after);
         if (advanced != exit.OK) { ret advanced; }
     }
 
@@ -1220,15 +1237,17 @@ fun update_apply(s: *session.Session, a: *A.Allocator, root: str, mode: u8, all:
     ret exit.OK;
 }
 
-# move every fixed git selector among `targets` (all of them, or the one `name` names): its
-# ref is fetched and checked out, and a recorded gitlink is staged. a path has no selector to
-# move; the closure pull that follows syncs its copy
+# move every fixed git selector among `targets` (all of them, or the one `name` names), the
+# root's own declarations among them only when `roots`: its ref is fetched and checked out, and
+# a recorded gitlink is staged. a path has no selector to move; the closure pull that follows
+# syncs its copy
 fun advance_fixed(s: *session.Session, a: *A.Allocator, root: str, mode: u8, targets: *Vector[DepReq],
-    all: bool, name: *u8, quiet: bool, fail_after: i32) i64 {
+    roots: bool, all: bool, name: *u8, quiet: bool, fail_after: i32) i64 {
     var i: usize = 0;
     for (i < targets.len) {
         val r: *DepReq = ?targets.data[i];
         i = i + 1;
+        if (r.root_decl && !roots)                { cnt; }
         if (!all && !str_equals(r.id, name::str)) { cnt; }
         if (selects_release(r) || !r.is_git)      { cnt; }
 
@@ -1387,8 +1406,10 @@ fun mutate_manifest(root: str, spec: *manifest.DepTableSpec, name: str, adding: 
     ret finished;
 }
 
+# a fixed git dependency's manifest, and the pins it commits for its ranges, are read at the
+# commit its selector picks, never from whatever its checkout holds (#4060)
 fun preflight_closure(s: *session.Session, a: *A.Allocator, root: str, table: *toml.Table,
-    reqs: *Vector[DepReq], inspect_git: bool) err[outcome.Fail] {
+    reqs: *Vector[DepReq], inspect_git: bool, walk: *Walk) err[outcome.Fail] {
     val checked: res[manifest.Manifest, outcome.Fail] = manifest.parse(a, ?s.interner, table, false);
     if (sel checked.err) { ret err[outcome.Fail].err{checked.err}; }
     var parsed: manifest.Manifest = checked.ok;
@@ -1415,11 +1436,24 @@ fun preflight_closure(s: *session.Session, a: *A.Allocator, root: str, table: *t
         fin {
             if (request.is_git) { str_free(a, source); }
         }
-        val file_r: res[str, A.Error] = path.join(a, source, MANIFEST);
-        if (sel file_r.err) { ret err[outcome.Fail].err{outcome.refused(file_r.err)}; }
-        val file: str = file_r.ok;
-        fin { str_free(a, file); }
-        val read: res[toml.Table, outcome.Fail] = parse_file(a, file);
+        var rev: str = nil;
+        fin {
+            if (rev != nil) { str_free(s.build_alloc, rev); }
+        }
+        var read: res[toml.Table, outcome.Fail];
+        if (request.is_git && !is_ranged(?request)) {
+            val at: res[str, outcome.Fail] = deps.selection_commit(s, root, request.id, source, request.ref,
+                walk_moves(walk, request.id), walk.offline);
+            if (sel at.err) { ret err[outcome.Fail].err{at.err}; }
+            rev  = at.ok;
+            read = deps.manifest_at(a, source, rev);
+        }
+        or {
+            val file_r: res[str, A.Error] = path.join(a, source, MANIFEST);
+            if (sel file_r.err) { ret err[outcome.Fail].err{outcome.refused(file_r.err)}; }
+            read = parse_file(a, file_r.ok);
+            str_free(a, file_r.ok);
+        }
         if (sel read.err) { ret err[outcome.Fail].err{read.err}; }
         var dependency: toml.Table = read.ok;
         fin { toml.dnit(a, ?dependency); }
@@ -1430,7 +1464,7 @@ fun preflight_closure(s: *session.Session, a: *A.Allocator, root: str, table: *t
         if (sel more.err) { ret more; }
         # a range this dependency declares is seeded by the pin its own repository commits for it
         if (!reached_via_release(?request)) {
-            val seeded_children: err[outcome.Fail] = seed_from_source(s, a, source, reqs, first_child);
+            val seeded_children: err[outcome.Fail] = seed_from_source(s, a, source, rev, reqs, first_child);
             if (sel seeded_children.err) { ret seeded_children; }
         }
     }
@@ -1438,9 +1472,10 @@ fun preflight_closure(s: *session.Session, a: *A.Allocator, root: str, table: *t
 }
 
 # the committed gitlink of `source`, a dependency's own repository, for each range
-# it declares from `first` on; a source in no repository, or without a gitlink for
-# the identity, seeds nothing
-fun seed_from_source(s: *session.Session, a: *A.Allocator, source: str, reqs: *Vector[DepReq], first: usize) err[outcome.Fail] {
+# it declares from `first` on: the one the commit `rev` records, or with no `rev` the
+# one its index stages. a source in no repository, or without a gitlink for the
+# identity, seeds nothing
+fun seed_from_source(s: *session.Session, a: *A.Allocator, source: str, rev: str, reqs: *Vector[DepReq], first: usize) err[outcome.Fail] {
     var k:   usize = first;
     var any: bool  = false;
     for (k < reqs.len) {
@@ -1448,15 +1483,19 @@ fun seed_from_source(s: *session.Session, a: *A.Allocator, source: str, reqs: *V
         k = k + 1;
     }
     if (!any) { ret err[outcome.Fail].ok{}; }
-    val inside: res[bool, outcome.Fail] = deps.inside_work_tree(s, source);
-    if (sel inside.err) { ret err[outcome.Fail].err{inside.err}; }
-    if (!inside.ok)     { ret err[outcome.Fail].ok{}; }
+    if (rev == nil) {
+        val inside: res[bool, outcome.Fail] = deps.inside_work_tree(s, source);
+        if (sel inside.err) { ret err[outcome.Fail].err{inside.err}; }
+        if (!inside.ok)     { ret err[outcome.Fail].ok{}; }
+    }
     k = first;
     for (k < reqs.len) {
         val child: *DepReq = ?reqs.data[k];
         k = k + 1;
         if (!selects_release(child) || !str_empty(child.ref)) { cnt; }
-        val link: res[opt[str], outcome.Fail] = deps.staged_gitlink(s, source, child.id);
+        var link: res[opt[str], outcome.Fail];
+        if (rev == nil)   { link = deps.staged_gitlink(s, source, child.id); }
+        or                { link = deps.gitlink_at(s, source, rev, child.id); }
         if (sel link.err) { ret err[outcome.Fail].err{link.err}; }
         val pin: opt[str] = link.ok;
         if (sel pin.some) {
@@ -1507,6 +1546,7 @@ fun realize_added(s: *session.Session, a: *A.Allocator, root: str, mode: u8, spe
 fun mutate_apply(edit: *ManifestEdit, s: *session.Session, a: *A.Allocator, root: str, mode: u8,
     spec: *manifest.DepTableSpec, name: str, adding: bool, purge: bool,
     quiet: bool, realize: bool, offline: bool, fail_after: i32) i64 {
+    var walk:      Walk              = Walk{offline: offline, all: false, name: nil};
     val mt_path_r: res[str, A.Error] = path.join(a, root, MANIFEST);
     if (sel mt_path_r.err) { ret err_oom(); }
     val mt_path: str = mt_path_r.ok;
@@ -1527,7 +1567,7 @@ fun mutate_apply(edit: *ManifestEdit, s: *session.Session, a: *A.Allocator, root
         val probe_t: res[toml.Table, toml.TomlError] = toml.parse(a, probe_r.ok);
         if (sel probe_t.err) { ret cli_diag.refuse(outcome.toml_failure(probe_t.err)); }
         var probe:  toml.Table                    = probe_t.ok;
-        val chosen: res[Resolution, outcome.Fail] = resolve_versions(s, a, root, ?probe, false, offline, true, name, false);
+        val chosen: res[Resolution, outcome.Fail] = resolve_versions(s, a, root, ?probe, false, true, name, false, ?walk);
         toml.dnit(a, ?probe);
         if (sel chosen.err) { ret cli_diag.refuse(chosen.err); }
         val at: i64 = pick_index(?chosen.ok.picks, name);
@@ -1551,7 +1591,7 @@ fun mutate_apply(edit: *ManifestEdit, s: *session.Session, a: *A.Allocator, root
     fin { toml.dnit(a, ?table); }
     var known: Vector[DepReq] = vector.init[DepReq](a);
     fin { free_requests(a, ?known); }
-    val preflight: err[outcome.Fail] = preflight_closure(s, a, root, ?table, ?known, true);
+    val preflight: err[outcome.Fail] = preflight_closure(s, a, root, ?table, ?known, true, ?walk);
     if (sel preflight.err) { ret cli_diag.refuse(preflight.err); }
     val still_required: bool = !adding && req_index(?known, name) >= 0;
     if (still_required && purge) { ret cli_diag.refuse(outcome.user("dependency is still required by the closure; cannot purge its checkout")); }
@@ -1593,7 +1633,7 @@ fun mutate_apply(edit: *ManifestEdit, s: *session.Session, a: *A.Allocator, root
         val placed: i64 = realize_added(s, a, root, mode, spec, name, quiet, ?completed);
         if (placed != exit.OK) { ret placed; }
     }
-    val resolved: res[Resolution, outcome.Fail] = resolve_versions(s, a, root, ?table, false, offline, true, name, false);
+    val resolved: res[Resolution, outcome.Fail] = resolve_versions(s, a, root, ?table, false, true, name, false, ?walk);
     if (sel resolved.err) { ret cli_diag.refuse(resolved.err); }
     var add_notes: Resolution = resolved.ok;
     if (!quiet) { print_notes(?add_notes); }
@@ -1690,7 +1730,8 @@ fun list_lines(s: *session.Session, a: *A.Allocator, root: str, out: *Vector[str
     # the closure as the realized checkouts and path sources declare it
     var closure: Vector[DepReq] = vector.init[DepReq](a);
     fin { free_requests(a, ?closure); }
-    val walked: err[outcome.Fail] = preflight_closure(s, a, root, ?mt, ?closure, true);
+    var walk:   Walk              = Walk{offline: true, all: false, name: nil};
+    val walked: err[outcome.Fail] = preflight_closure(s, a, root, ?mt, ?closure, true, ?walk);
     if (sel walked.err) { print.eprintlnf("note: the dependency closure could not be read, so overridden requirements are not shown: {}", outcome.describe(walked.err)); }
 
     var i: usize = 0;
@@ -3146,7 +3187,7 @@ test update__the_remedy_verify_prints_for_a_stale_transitive_checkout_repins_it 
     ret 0;
 }
 
-test update__a_root_declared_name_and_all_advance_only_the_roots_selectors {
+test update__a_root_declared_name_moves_only_its_selector_and_all_keeps_an_exact_pin {
     var a:      A.Allocator;
     val make_r: err[A.Error] = page.make(?a);
     if (sel make_r.err) { ret 1; }
@@ -3187,6 +3228,56 @@ test update__a_root_declared_name_and_all_advance_only_the_roots_selectors {
     if (str_empty(a_all) || str_equals(a_all, a_named))         { ret 14; }
     if (!str_equals(t_head_under(?a, proj, "dep/b"), b_before)) { ret 15; }
     if (verify_project(proj, false) != 0)                       { ret 16; }
+    ret 0;
+}
+
+# a requirer that moves its exact selector of b is resolved against b's manifest at the commit
+# it now names, not the stale checkout, and `--all` moves the transitive pin there (#4060)
+test update__a_moved_transitive_selector_resolves_from_the_commit_it_names {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    var git_env: [4]*u8;
+    t_allow_file_transport(?git_env[0]);
+    fin { deps.set_git_config_env(nil); }
+    val vb: str = t_released(?a);
+    if (str_empty(vb)) { ret 2; }
+    fin { fs.remove_all(?a, vb); }
+    val fix_b: str = t_package_repo(?a, "mach_dep_moved_b", "b", t_dep_table_range(?a, "vb", vb, "<1.1"));
+    if (str_empty(fix_b)) { ret 3; }
+    fin { fs.remove_all(?a, fix_b); }
+    val old_b:      str                    = t_head_under(?a, fix_b, ".");
+    val b_manifest: res[str, outcome.Fail] = t_read_under(?a, fix_b, MANIFEST);
+    if (str_empty(old_b))                                                                                                 { ret 4; }
+    if (sel b_manifest.err)                                                                                               { ret 4; }
+    if (!t_write(?a, fix_b, MANIFEST, str_replace_first(?a, b_manifest.ok, "<1.1", ">=1.1")) || !t_commit_all(?a, fix_b)) { ret 5; }
+    val new_b: str = t_head_under(?a, fix_b, ".");
+    if (str_empty(new_b)) { ret 6; }
+
+    val selects: res[str, format.FormatError] = format.sprint(?a, "commit/{}", old_b);
+    if (sel selects.err) { ret 7; }
+    val tables: res[str, format.FormatError] = format.sprint(?a, "{}{}",
+        t_dep_table_ref(?a, "b", fix_b, selects.ok), t_dep_table_range(?a, "vb", vb, "=1.0.0"));
+    if (sel tables.err) { ret 8; }
+    val req: str = t_package_repo(?a, "mach_dep_moved_req", "req", tables.ok);
+    if (str_empty(req)) { ret 9; }
+    fin { fs.remove_all(?a, req); }
+    val root: str = t_root_repo(?a, "mach_dep_moved_root", t_dep_table_path(?a, "req", req));
+    if (str_empty(root)) { ret 10; }
+    fin { fs.remove_all(?a, root); }
+    var up: [3]str = [3]str{"update", root, "--all"};
+    if (t_dep_cli_args(?a, ?up[0], 3) != 0 || !t_commit_all(?a, root)) { ret 11; }
+    if (!str_equals(t_head_under(?a, root, "dep/b"), old_b))           { ret 12; }
+
+    # the requirer now selects the commit whose manifest admits vb 1.1.0
+    val req_manifest: res[str, outcome.Fail] = t_read_under(?a, req, MANIFEST);
+    if (sel req_manifest.err) { ret 13; }
+    val moved: str = str_replace_first(?a, str_replace_first(?a, req_manifest.ok, old_b, new_b), "=1.0.0", "=1.1.0");
+    if (!t_write(?a, req, MANIFEST, moved))                  { ret 14; }
+    if (t_dep_cli_args(?a, ?up[0], 3) != 0)                  { ret 15; }
+    if (!str_equals(t_head_under(?a, root, "dep/b"), new_b)) { ret 16; }
+    if (!t_release_is(?a, root, "dep/vb", "1.1.0"))          { ret 17; }
+    if (verify_project(root, false) != 0)                    { ret 18; }
     ret 0;
 }
 
@@ -4596,7 +4687,8 @@ fun t_notes_of(a: *A.Allocator, root: str, offline: bool) Vector[str] {
     val mt: res[toml.Table, outcome.Fail] = parse_file(a, t_join_owned(a, root, MANIFEST));
     if (sel mt.err) { ret none; }
     var table: toml.Table                    = mt.ok;
-    val r:     res[Resolution, outcome.Fail] = resolve_versions(?s, a, root, ?table, false, offline, false, nil, true);
+    var walk:  Walk                          = Walk{offline: offline, all: false, name: nil};
+    val r:     res[Resolution, outcome.Fail] = resolve_versions(?s, a, root, ?table, false, false, nil, true, ?walk);
     if (sel r.err) {
         vector.push[str](?none, own(a, outcome.describe(r.err)));
         ret none;
