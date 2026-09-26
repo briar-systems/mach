@@ -30,6 +30,7 @@ use mach.lang.be.linker.atoms.AtomPlan;
 use mach.lang.be.linker.atoms.build_atom_plan;
 use mach.lang.be.linker.atoms.free_atom_plan;
 use mach.lang.be.linker.atoms.has_function_branch_reloc;
+use mach.lang.be.linker.atoms.has_got_reloc;
 use mach.lang.be.linker.atoms.import_symbol_live;
 use mach.lang.be.linker.atoms.init_atom_plan;
 use mach.lang.be.linker.atoms.reloc_source_live;
@@ -68,6 +69,8 @@ pub rec DynState {
     # where the reserved call-stub table starts inside the merged code, which
     # every later relayout moves with it
     stubs_offset: u32;
+    # where the reserved import GOT starts inside the merged read-only data
+    got_offset: u32;
 }
 
 pub fun init_dynstate(dyn: *DynState) {
@@ -84,6 +87,9 @@ pub fun init_dynstate(dyn: *DynState) {
     dyn.info.stubs.vaddr             = 0;
     dyn.info.stubs.size              = 0;
     dyn.stubs_offset                 = 0;
+    dyn.info.got.vaddr               = 0;
+    dyn.info.got.size                = 0;
+    dyn.got_offset                   = 0;
     dyn.fixups                       = nil;
     dyn.fixup_count                  = 0;
     dyn.fixup_cap                    = 0;
@@ -130,9 +136,9 @@ pub fun reserve_call_stubs(s: *session.Session, tgt: *target.Target, dyn: *DynSt
         i = i + 1;
     }
     if (count == 0) { ret err[fail.Fail].ok{}; }
-    val shape_r: res[of.StubShape, fail.Fail] = tgt.of.stub_shape(tgt.object.arch_id, count);
+    val shape_r: res[of.TableShape, fail.Fail] = tgt.of.stub_shape(tgt.object.arch_id, count);
     if (sel shape_r.err) { ret err[fail.Fail].err{shape_r.err}; }
-    val shape: of.StubShape = shape_r.ok;
+    val shape: of.TableShape = shape_r.ok;
     if (shape.size == 0 || shape.align == 0) {
         ret err[fail.Fail].err{fail.message("linker: the format declared an empty call-stub table")};
     }
@@ -167,6 +173,78 @@ pub fun reserve_call_stubs(s: *session.Session, tgt: *target.Target, dyn: *DynSt
 pub fun place_call_stubs(dyn: *DynState, merged: *MergedSection) {
     if (dyn.info.stubs.size == 0) { ret; }
     dyn.info.stubs.vaddr = merged[of.SK_TEXT::u32].vaddr + dyn.stubs_offset::u64;
+}
+
+# reserves the format's import GOT at the end of the read-only data, before
+# anything is given an address, so the zero-fill that follows it never
+# separates the code from its slots however large it is (#3903). a GOT the
+# linker already synthesized for defined symbols ends the same section under
+# the same name, and the import slots extend it; the address is read back by
+# place_import_got once the layout is final
+pub fun reserve_import_got(s: *session.Session, tgt: *target.Target, dyn: *DynState,
+    merged: *MergedSection, groups: *SectionGroups) err[fail.Fail] {
+    if (tgt.of == nil || tgt.of.got_shape == nil) { ret err[fail.Fail].ok{}; }
+    val shape_r: res[of.TableShape, fail.Fail] = tgt.of.got_shape(tgt.object.arch_id, ?dyn.info);
+    if (sel shape_r.err) { ret err[fail.Fail].err{shape_r.err}; }
+    val shape: of.TableShape = shape_r.ok;
+    if (shape.size == 0) { ret err[fail.Fail].ok{}; }
+    if (shape.align == 0) {
+        ret err[fail.Fail].err{fail.message("linker: the format declared an unaligned import GOT")};
+    }
+
+    val relro:   u32                 = of.SK_RELRO::u32;
+    val start_r: res[u64, fail.Fail] = align_up_u64_checked(merged[relro].len::u64, shape.align::u64);
+    if (sel start_r.err) { ret err[fail.Fail].err{start_r.err}; }
+    val start: u64 = start_r.ok;
+    if (shape.size::u64 > 0xFFFFFFFF - start) {
+        ret err[fail.Fail].err{fail.message("linker: the import GOT takes the read-only data past the maximum section size")};
+    }
+    val end: u64 = start + shape.size::u64;
+
+    val name_r: res[intern.StrId, A.Error] = intern.intern(?s.interner, shape.name);
+    if (sel name_r.err) { ret err[fail.Fail].err{fail.refused(name_r.err)}; }
+    val name: intern.StrId = name_r.ok;
+    var gi:   u32          = 0xFFFFFFFF;
+    var i:    u32          = 0;
+    for (i < groups.count) {
+        if (groups.items[i].slot == relro && groups.items[i].name == name
+            && groups.items[i].base::u64 + groups.items[i].len::u64 == merged[relro].len::u64) {
+            gi = i;
+        }
+        i = i + 1;
+    }
+    if (gi == 0xFFFFFFFF) {
+        val ga: res[u32, fail.Fail] = section_group_add(s.alloc, groups, relro, name, 0);
+        if (sel ga.err) { ret err[fail.Fail].err{ga.err}; }
+        gi                     = ga.ok;
+        groups.items[gi].base  = start::u32;
+        groups.items[gi].align = shape.align;
+    }
+    if (groups.items[gi].align < shape.align) { groups.items[gi].align = shape.align; }
+    groups.items[gi].cursor = end::u32;
+    groups.items[gi].len    = (end - groups.items[gi].base::u64)::u32;
+
+    merged[relro].used = true;
+    if (merged[relro].align < shape.align) { merged[relro].align = shape.align; }
+    merged[relro].len = end::u32;
+
+    dyn.got_offset    = start::u32;
+    dyn.info.got.size = shape.size;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun place_import_got(dyn: *DynState, merged: *MergedSection) {
+    if (dyn.info.got.size == 0) { ret; }
+    dyn.info.got.vaddr = merged[of.SK_RELRO::u32].vaddr + dyn.got_offset::u64;
+}
+
+# a GOT-kind relocation reaches the import under any of the names it is known by
+fun import_got_referenced(modules: *of.ObjectImage, module_count: u32, local: intern.StrId,
+    canonical: intern.StrId, effective: intern.StrId, sec_base: *u32, atoms: *AtomPlan) bool {
+    ret has_got_reloc(modules, module_count, local, sec_base, atoms)
+        || (canonical != local && has_got_reloc(modules, module_count, canonical, sec_base, atoms))
+        || (effective != local && effective != canonical
+        && has_got_reloc(modules, module_count, effective, sec_base, atoms));
 }
 
 pub fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
@@ -449,6 +527,10 @@ pub fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynSt
                     sec_base, atoms))) {
                     dyn.info.imports[existing_idx].is_func = true;
                 }
+                if (import_got_referenced(modules, module_count, sym.name, cn.canonical,
+                    effective, sec_base, atoms)) {
+                    dyn.info.imports[existing_idx].got_ref = true;
+                }
                 sy = sy + 1;
                 cnt;
             }
@@ -486,6 +568,8 @@ pub fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynSt
                 sec_base, atoms)
                 || has_function_branch_reloc(modules, module_count, effective,
                 sec_base, atoms));
+            dyn.info.imports[idx].got_ref = import_got_referenced(modules, module_count,
+                sym.name, cn.canonical, effective, sec_base, atoms);
             dyn.info.imports[idx].ordinal    = 0;
             dyn.info.imports[idx].by_ordinal = false;
             if (decl != nil) {

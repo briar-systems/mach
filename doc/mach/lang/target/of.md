@@ -795,27 +795,40 @@ pub rec BaseReloc;
 pub rec DynamicInfo;
 ```
 
-## rec StubTable
+## rec TableSpan
 
 ```mach
-pub rec StubTable;
+pub rec TableSpan;
 ```
 
-## rec StubShape
+where a table the linker reserved for a format lies in the image
+
+## rec TableShape
 
 ```mach
-pub rec StubShape;
+pub rec TableShape;
 ```
 
-what a format's call-stub table takes for a count of imported functions: the
-linker reserves it at the end of the code under this section name, so every
-call site reaches its stub whatever data the image carries
+what a table a format asks the linker to reserve takes: the linker lays it out
+under this section name before it gives anything an address, so the code
+reaches it whatever data the image carries
 
 ## def StubShapeFn
 
 ```mach
-pub def StubShapeFn: fun(u32, u32) res[StubShape, fail.Fail]
+pub def StubShapeFn: fun(u32, u32) res[TableShape, fail.Fail]
 ```
+
+the call-stub table for a count of imported functions, at the end of the code
+
+## def GotShapeFn
+
+```mach
+pub def GotShapeFn: fun(u32, *DynamicInfo) res[TableShape, fail.Fail]
+```
+
+the import GOT for the imports of a dynamic link, at the end of the read-only
+data; an empty shape when no import needs a slot
 
 ## rec PltFixup
 
