@@ -53,6 +53,17 @@ arch: *isa.IsaVTable,
 codegen_image: bool) res[rel.RelocTraits, rel.RelocError];
 ```
 
+## fun atom_field_bias
+
+```mach
+pub fun atom_field_bias(r: *of.Relocation, mode: rel.RelocAddendMode, text_bias_min: i32,
+text_bias_max: i32, source_text: bool, lo: *i64, hi: *i64);
+```
+
+the bias between a field-bias operand's addend and the address it reaches:
+the exact distance to the instruction's end when the encoder recorded it,
+otherwise the target's bound for a field in text, and none outside text
+
 ## fun atom_effective_offset
 
 ```mach
