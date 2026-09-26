@@ -186,12 +186,6 @@ pub rec Operand;
 pub rec Inst;
 ```
 
-## rec InstBuf
-
-```mach
-pub rec InstBuf;
-```
-
 ## def RegClassKind
 
 ```mach
@@ -1251,12 +1245,6 @@ pub fun local_got_kind(tgt_isa: *IsaVTable, kind: of.RelocKind) bool;
 pub fun with_machine_flags(s: *RelocSeam, f: of.MachineFlagsFn);
 ```
 
-## def MachineFlagsFn
-
-```mach
-pub def MachineFlagsFn: of.MachineFlagsFn
-```
-
 ## fun declares_machine_flags
 
 ```mach
@@ -1286,18 +1274,6 @@ pub fun with_resolve_reloc_operand(s: *RelocSeam, f: of.ResolveRelocOperandFn);
 
 ```mach
 pub fun with_attributes(s: *RelocSeam, build: of.BuildAttributesFn, merge: of.MergeAttributesFn, validate: of.ValidateAttributesFn);
-```
-
-## def BuildAttributesFn
-
-```mach
-pub def BuildAttributesFn: of.BuildAttributesFn
-```
-
-## def MergeAttributesFn
-
-```mach
-pub def MergeAttributesFn: of.MergeAttributesFn
 ```
 
 ## fun declares_attributes
@@ -1589,18 +1565,6 @@ whether source may carry `asm` blocks for this instruction set, whichever backen
 
 ```mach
 pub fun emits_relocations(vt: *IsaVTable) bool;
-```
-
-## def BackendKind
-
-```mach
-pub def BackendKind: u8
-```
-
-## rec BackendFamily
-
-```mach
-pub rec BackendFamily;
 ```
 
 ## fun make_sym_mod
