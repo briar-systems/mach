@@ -244,47 +244,50 @@ secret at these boundaries, and a placement the checker cannot prove severs no
 weld — a secrecy difference reachable through a function type, or a shape whose
 layout it cannot determine — is rejected rather than allowed.
 
-Two aggregates are compared **by byte extent**, not by field ordinal: matching
-`^` placement in the type graph does not put two fields on the same bytes, so
-each paired field must also agree in size and alignment. That is what keeps
-every later field aligned between the two, and without it a narrower secret on
-one side displaced a public field onto a secret one. Differing *shapes* are
-fine — with the common prefix identical byte for byte, a longer aggregate's
-extra fields provably begin past the shorter one's extent, so a public field
-beyond the secret is accepted. This holds only for sequential layout; a union
-overlays every variant at offset 0, so a differing-shape pair involving one is
-admitted only when neither side has a public-stored byte at all.
+Types are compared **by byte extent**, not by field ordinal. Each type lays out
+as a run of bytes, each byte secret or public, with padding counted as public
+and a pointer counted by what it reaches. A `::` or `:~` from `*S` to `*T`
+retypes the storage `S` covers, and a `*S` may address a run of `S` values, so
+the rule is directional:
 
-So a `::` or `:~` between pointer types retypes storage only when the two
-pointees agree on secrecy:
+1. every byte both `S` and `T` cover has the same class on both sides
+2. a narrowing (`T` no larger than `S`) is accepted
+3. a widening is accepted only when the extra bytes cannot change class: every
+   byte of `S` has one class and every byte of `T` has that same class
+4. beneath a pointer (a pointer field, a pointer to a pointer, a union variant
+   of pointer type) the target is shared storage, so the relation holds both
+   ways: equal extent and the same class at every byte
 
-- the pointee's own `^` matches on both sides, and so does every `^` reached
-  through nested pointers, array elements and function signatures
-- two aggregates agree field by field over their common prefix, in secrecy,
-  size and alignment, or both are secret in every stored byte
-- any other pair, a scalar against an aggregate included, is legal only when
-  neither pointee contains a secret below its own `^`
-
-A type that stores no value (an empty `rec`, a `[0]T`, or an aggregate of only
-those) has no secrecy layout to match, so it compares as a scalar and never as
-a prefix of every aggregate. A cast through one gets the verdict of the direct
-cast:
+The rule is the same for scalars and aggregates, and the variants of a union
+overlay its own storage from offset 0, so every pair of variants agrees on each
+byte both cover. A widening past a secret is refused because the extra bytes
+may be the next element of a run:
 
 ```mach error cannot add or drop the secret qualifier
-rec Empty {}
+rec Key { x: ^u32; }
 
-rec Key { a: ^u64; b: ^u64; }
+rec Wide { x: ^u32; y: u32; }
 
-# refused
-fun direct(p: *^u8) *^Key {
-    ret p::*^Key;
+# fine: one secret class throughout, as a run of `^u8` is
+fun words(p: *^u8) *^u64 {
+    ret p::*^u64;
 }
 
-# refused the same way
-fun hop(p: *^Empty) *^Key {
-    ret p::*^Key;
+# fine: a narrowing keeps the class of every byte it still covers
+fun head(p: *Wide) *Key {
+    ret p::*Key;
+}
+
+# refused: `y` of the first element is the next element's secret `x`
+fun widen(p: *Key) *Wide {
+    ret p::*Wide;
 }
 ```
+
+A type that stores no value (an empty `rec`, a `[0]T`, or an aggregate of only
+those) has zero extent and so no class: anything narrows to it, and it widens
+to nothing that stores a value. Reading past an object by indexing
+(`(?q.a)[1]`) is a bounds question no cast rule closes.
 
 The comparison reads the same layout the backend emits. Where it cannot
 determine a layout it declines, which rejects.
