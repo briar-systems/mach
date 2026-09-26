@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.1.0] - 2026-09-26
+
+### Added
+- An unused direct symbol import, `use a.b.foo;` or `use x: a.b.foo;`, is a warning, ``unused import `foo` ``, at the binding. Module imports never warn. The warning covers only the root project's modules, so a dependency's unused imports stay silent, and the editor shows it for the project's own files (#4007).
+
+### Changed
+- A mach-built object records that codegen made it and carries one link section, `.mach.link` on ELF and COFF and `__MACH,__mach_link` on Mach-O, holding what its format cannot spell: symbol sizes and types, section flags, instruction ends and unwind frames. The linker reads it back and splits and collects each such image as codegen made it. Objects from other compilers carry none and link as before (#4002).
+
+### Fixed
+- A mach-built static library links like its modules linked directly on ELF, COFF and Mach-O. It keeps the same symbols with their sizes and kinds, keeps `#[section]` globals, collects unreferenced functions and carries unwind frames (#4002).
+- On aarch64 an aggregate that goes to the stack gives the rest of its register bank to nothing, as AAPCS64 requires. A 9 to 16 byte record, or an HFA or HVA, that does not fit the registers left no longer lets a later argument take them (#3928).
+- On aarch64-linux a record with natural 16-byte alignment, such as one holding a `u128`, starts on an even register pair and is placed on the stack by its natural alignment, not the one its own `#[align]` raises. aarch64-darwin is unchanged, as Apple places it by declared alignment (#3929).
+- On aarch64 an empty record argument takes no register and no stack slot, as C passes it (#3930).
+
 ## [6.0.0] - 2026-09-26
 
 ### Breaking
