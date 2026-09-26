@@ -1200,7 +1200,9 @@ those; a release build inlines function bodies across modules, so there the
 whole source is the surface. Editing such a body rebuilds that module alone, and
 editing a declaration rebuilds the module and the modules that import it. With
 debug information the surface also covers where each retained declaration sits,
-so an edit that moves one to another line rebuilds its importers. Each object
+so an edit that moves one to another line rebuilds its importers. A reused
+module reports again the warnings it reported when it was compiled, so a warm
+build prints what a cold one prints. Each object
 carries its key in a section no link loads: `.mach.cache` on
 ELF (not allocated) and COFF (`IMAGE_SCN_LNK_INFO | IMAGE_SCN_LNK_REMOVE`), and
 `__MACH,__mach_cache` on Mach-O (debug-attributed). The parser consumes it, so an
