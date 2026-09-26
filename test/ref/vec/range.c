@@ -79,6 +79,7 @@ uint64_t checksum(uint64_t seed) {
         float f[16];
         for (unsigned k = 0; k < 16u; k++) { f[k] = ((float)k - 5.5f) * 1.25f + (float)seed; }
         h = fold_f32s(h, &f[at + 1u], 4u);
+        h = fold_f32s(h, &f[at + 2u], 2u);
         h = fold_f32s(h, &f[4], 4u);
         {
             float v[4] = { 1.5f, -2.0f, 0.25f, 8.0f };
@@ -140,6 +141,7 @@ uint64_t checksum(uint64_t seed) {
         h = fold_u16s(h, w, 8u);
         for (unsigned k = 0; k < 8u; k++) { w[k] = (uint16_t)v[8u + k]; }
         h = fold_u16s(h, w, 8u);
+        h = fold_u8s(h, &v[3], 8u);
     }
     {
         int16_t v[8] = { -32768, 32767, -1, 0, 1, -32767, 32766, -7 };
@@ -160,6 +162,7 @@ uint64_t checksum(uint64_t seed) {
         h = fold_u32s(h, w, 4u);
         for (unsigned k = 0; k < 4u; k++) { w[k] = (uint32_t)v[4u + k]; }
         h = fold_u32s(h, w, 4u);
+        h = fold_u16s(h, &v[1], 4u);
     }
     {
         int32_t v[4] = { INT32_MIN, 2147483647, -1, -2147483647 };

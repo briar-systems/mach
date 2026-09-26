@@ -355,6 +355,17 @@ target packs it (#3738, #3779)
 pub val OP_VEC_WIDEN_U: InstrKind = 55
 ```
 
+## val OP_VEC_RANGE
+
+```mach
+pub val OP_VEC_RANGE: InstrKind = 56
+```
+
+the lanes `start` to `start + n - 1` of a vector (operand 1 is the constant
+`start`, the result has the `n` lanes), of the same lane type: a vector range
+`v[start, n]` other than a widened half, formed only where the target packs
+it (#3864)
+
 ## val INSTR_FLAG_NSW
 
 ```mach
