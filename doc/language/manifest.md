@@ -1679,7 +1679,11 @@ dependency's selection lands on the root's declaration once the root declares
 one (`b: 0564… -> e508… (pinned to the exact selector)`, or `(exact selector,
 already pinned)` when nothing moves). `<name>` is looked up in the whole
 dependency closure, so `mach dep update <path> b` for an identity the root does
-not declare moves its checkout to the selector its requirers declare. A
+not declare moves its checkout to the selector its requirers declare, and
+`--all` moves every selector in the closure. Resolution reads a dependency
+selected by `ref` at the commit its selector names, never from its checkout, so
+a requirer that has just moved its selector is resolved against the manifest it
+now selects. A
 name outside the closure is refused (`dependency 'x' is not in the dependency
 closure`). For an identity reached by
 more than one path, one rule decides: the root's selector wins if the root
