@@ -329,12 +329,6 @@ pub fun prim_name(kind: TypeKind) str;
 pub fun prim_spelling_len(kind: TypeKind) usize;
 ```
 
-## fun prim_from_name
-
-```mach
-pub fun prim_from_name(name: str) opt[TypeKind];
-```
-
 ## fun int_kind_for
 
 ```mach
@@ -666,12 +660,6 @@ pub fun vector_lanes(ti: *TypeInterner, tid: TypeId) u32;
 pub fun element_count(ti: *TypeInterner, tid: TypeId) opt[u32];
 ```
 
-## fun vec
-
-```mach
-pub fun vec(ti: *TypeInterner, index: u32) opt[TypeId];
-```
-
 ## fun vector_mask
 
 ```mach
@@ -819,12 +807,6 @@ pub fun gparam_memo_get(ti: *TypeInterner, tid: TypeId) GParamMemo;
 pub fun gparam_memo_set(ti: *TypeInterner, tid: TypeId, mentions: bool);
 ```
 
-## fun secrecy_structure_equal
-
-```mach
-pub fun secrecy_structure_equal(ti: *TypeInterner, a: TypeId, b: TypeId) bool;
-```
-
 ## fun intern_pointer
 
 ```mach
@@ -904,18 +886,6 @@ pub fun is_case_selector(ti: *TypeInterner, tid: TypeId) bool;
 pub fun case_selector_tag_type(ti: *TypeInterner, tid: TypeId) TypeId;
 ```
 
-## fun case_selector_case_index
-
-```mach
-pub fun case_selector_case_index(ti: *TypeInterner, tid: TypeId) u32;
-```
-
-## fun case_selector_case_name
-
-```mach
-pub fun case_selector_case_name(ti: *TypeInterner, tid: TypeId) intern.StrId;
-```
-
 ## fun intern_nominal
 
 ```mach
@@ -960,12 +930,6 @@ pub fun type_equals_signatures(ti: *TypeInterner, a: TypeId, b: TypeId) bool;
 
 ```mach
 pub fun field_projection_reset(ti: *TypeInterner);
-```
-
-## fun field_epoch_bump
-
-```mach
-pub fun field_epoch_bump(ti: *TypeInterner);
 ```
 
 ## fun field_epoch

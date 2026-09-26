@@ -126,12 +126,6 @@ pub rec DiagnosticBuilder;
 pub fun store_init(a: *A.Allocator) DiagnosticStore;
 ```
 
-## fun mark
-
-```mach
-pub fun mark(store: *DiagnosticStore) DiagMark;
-```
-
 ## fun truncate
 
 ```mach
@@ -161,18 +155,6 @@ pub fun store_dnit(store: *DiagnosticStore);
 
 ```mach
 pub fun len(store: *DiagnosticStore) usize;
-```
-
-## fun get
-
-```mach
-pub fun get(store: *DiagnosticStore, index: usize) opt[*Diagnostic];
-```
-
-## fun has_errors
-
-```mach
-pub fun has_errors(store: *DiagnosticStore) bool;
 ```
 
 ## fun error_count
@@ -271,12 +253,6 @@ pub fun attach_fix_edit_committed(store: *DiagnosticStore, id: DiagnosticId, fix
 pub fun remove_fix_committed(store: *DiagnosticStore, id: DiagnosticId, fix: FixId) err[fail.Fail];
 ```
 
-## fun fix_valid
-
-```mach
-pub fun fix_valid(fx: *Fix) bool;
-```
-
 ## fun commit
 
 ```mach
@@ -322,18 +298,6 @@ rather than vanishing
 pub fun warning(store: *DiagnosticStore, file_id: source.FileId, span: token.Span, message: str) err[fail.Fail];
 ```
 
-## fun info
-
-```mach
-pub fun info(store: *DiagnosticStore, file_id: source.FileId, span: token.Span, message: str) err[fail.Fail];
-```
-
-## fun help
-
-```mach
-pub fun help(store: *DiagnosticStore, file_id: source.FileId, span: token.Span, message: str) err[fail.Fail];
-```
-
 ## fun record_error
 
 ```mach
@@ -376,20 +340,6 @@ pub fun record_related_committed(store: *DiagnosticStore, id: DiagnosticId, file
 
 ```mach
 pub fun record_fix_committed(store: *DiagnosticStore, id: DiagnosticId, label: str, file_id: source.FileId, span: token.Span, replacement: str);
-```
-
-## fun record_gate_error
-
-```mach
-pub fun record_gate_error(store: *DiagnosticStore, itn: *intern.Interner,
-file_id: source.FileId, span: token.Span, message: str);
-```
-
-## fun record_gate_commit
-
-```mach
-pub fun record_gate_commit(store: *DiagnosticStore, itn: *intern.Interner,
-b: *DiagnosticBuilder);
 ```
 
 ## fun note_lost

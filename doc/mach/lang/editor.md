@@ -178,33 +178,6 @@ es: the editor session
 req: the request; its file must be open and its phase at most PHASE_SEMA
 ret: the owned result, released with analysis_dnit, or the operational failure
 
-## fun expr_type_of
-
-```mach
-pub fun expr_type_of(result: *AnalysisResult, eid: id.ExprId) res[type.TypeId, fail.Fail];
-```
-
-the type sema assigned to an expression node; the same view and phase checks as
-sema_of, and the node id is meaningful only with the AST of this result
-
-ret: the TypeId (TYPE_NIL for an untyped node), or the expiry or phase failure
-
-## fun decl_type_of
-
-```mach
-pub fun decl_type_of(result: *AnalysisResult, did: id.DeclId) res[type.TypeId, fail.Fail];
-```
-
-the type sema assigned to a declaration node, under expr_type_of's rules
-
-## fun resolved_type_of
-
-```mach
-pub fun resolved_type_of(result: *AnalysisResult, tid: id.TypeId) res[type.TypeId, fail.Fail];
-```
-
-the resolved type behind a type node, under expr_type_of's rules
-
 ## fun init
 
 ```mach
@@ -246,35 +219,6 @@ text: the new full text
 ret: ok(true) when the text changed; ok(false) when the buffer is not open or the text
       is identical, in which case nothing is dropped; or the SourceMap or overlay error
 
-## fun invalidate
-
-```mach
-pub fun invalidate(es: *EditorSession);
-```
-
-mark the loaded project stale, so the next analysis that needs it reloads the closure.
-open, update and close do this for the buffers they own; this is the entry for a change
-the editor session cannot see, a file written outside any buffer or a manifest edited on
-disk
-
-es: the editor session
-
-## fun close
-
-```mach
-pub fun close(es: *EditorSession, fid: source.FileId) res[bool, fail.Fail];
-```
-
-close an open buffer: its overlay, cached dependent products and source payload go;
-file identity and path metadata survive, and reopening the same canonical path returns
-the same FileId with a fresh revision. expires every raw analysis view. every fallible
-allocation is prepared before anything is published, so a failure leaves the open
-buffers and current views intact and may be retried
-
-es: the editor session
-fid: the buffer's FileId
-ret: ok(true) when a buffer was closed, ok(false) when none was open under fid
-
 ## fun dnit
 
 ```mach
@@ -287,33 +231,6 @@ success leaves unrelated Session cache entries and stable source identities in p
 destroy the Session only after this succeeds; there is no separate close-all
 
 es: the editor session; nil is a no-op
-
-## fun tokenize
-
-```mach
-pub fun tokenize(result: *AnalysisResult) res[lexer.TokenStream, fail.Fail];
-```
-
-lex the result's owned source version without touching the Session. the caller owns
-the token storage and frees it with lexer.dnit(stream, result.alloc); its bytes borrow
-the result, so free the stream before analysis_dnit
-
-result: the envelope
-ret: the token stream, or a failure when the result carries no owned source version
-
-## fun build
-
-```mach
-pub fun build(es: *EditorSession, req: *request.BuildRequest) res[outcome.BuildOutcome, outcome.Fail];
-```
-
-run a full build of a project through the warm engine, reading open buffers through the
-session's overlays. the manifest is loaded fresh on every call
-
-es: the editor session
-req: the build request; project_root must name the project directory
-ret: the build outcome, or a Fail whose message is a copy owned by the editor session;
-     release it with fail_dnit
 
 ## fun fail_dnit
 

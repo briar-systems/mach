@@ -1795,15 +1795,6 @@ pub fun classify(word: u32) MachOp;
 
 the opcode an emitted word spells, MOP_NONE when no row claims it
 
-## fun key_word
-
-```mach
-pub fun key_word(op: MachOp) u32;
-```
-
-the word an opcode's row spells with every register field zero: the
-keyed fields set, every free field zero
-
 ## val FLAG_AQ
 
 ```mach

@@ -1,17 +1,5 @@
 # mach.lang.target.isa.riscv.encode
 
-## fun frame_reserved_top
-
-```mach
-pub fun frame_reserved_top(st: *encode.EncodeState, f: *mir.MirFunction) i64;
-```
-
-## fun frame_total
-
-```mach
-pub fun frame_total(st: *encode.EncodeState, f: *mir.MirFunction) u32;
-```
-
 ## fun encode_riscv64
 
 ```mach

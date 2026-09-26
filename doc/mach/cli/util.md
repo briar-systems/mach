@@ -120,17 +120,6 @@ a: allocator for the returned strings
 arg: the operand; nil is an error asking for a path
 ret: the location, freed with dnit_project_location, or a message naming what was wrong
 
-## fun ensure_dir
-
-```mach
-pub fun ensure_dir(p: str) bool;
-```
-
-create a directory with mode 0755 when it does not exist; not recursive
-
-p: the directory path
-ret: true when the directory exists afterwards
-
 ## fun ensure_parents
 
 ```mach

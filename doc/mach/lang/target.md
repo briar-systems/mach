@@ -174,7 +174,7 @@ pub fun artifact_naming(tgt: *resolved.Target, kind: of.ArtifactOutputKind) res[
 ## val TUPLE_OK
 
 ```mach
-pub val TUPLE_OK:              u32 = 0
+pub val TUPLE_OK: u32 = 0
 ```
 
 ## val TUPLE_NO_CODEGEN

@@ -42,12 +42,6 @@ pub rec Read;
 pub fun decorator_of(sc: *context.SemaContext, d: *decl.Decl) *decl.Decorator;
 ```
 
-## fun declares_handle
-
-```mach
-pub fun declares_handle(sc: *context.SemaContext, d: *decl.Decl) bool;
-```
-
 ## fun arg_is_type
 
 ```mach
