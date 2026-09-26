@@ -472,14 +472,6 @@ pub rec Token;
 pub fun make(kind: Kind, offset: usize, len: usize) Token;
 ```
 
-## fun kind_str
-
-```mach
-pub fun kind_str(kind: Kind) opt[str];
-```
-
-the spelling of a kind; absent for a tag outside the catalog
-
 ## fun infix_precedence
 
 ```mach

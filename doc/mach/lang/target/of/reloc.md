@@ -124,13 +124,6 @@ pub fun apply_abs32(dst: *u8, patch_off: u32, sec_len: u32,
 sym_va: u64, addend: i64) res[bool, RelocError];
 ```
 
-## fun apply_abs16
-
-```mach
-pub fun apply_abs16(dst: *u8, patch_off: u32, sec_len: u32,
-sym_va: u64, addend: i64) res[bool, RelocError];
-```
-
 ## fun apply_pcrel32
 
 ```mach

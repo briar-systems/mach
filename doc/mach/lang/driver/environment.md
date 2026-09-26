@@ -70,9 +70,3 @@ pub fun strings_free(a: *A.Allocator, strings: *Strings);
 pub fun to_strings(values: *Environment) res[Strings, outcome.Fail];
 ```
 
-## fun capture_planner
-
-```mach
-pub fun capture_planner(a: *A.Allocator) res[Environment, outcome.Fail];
-```
-

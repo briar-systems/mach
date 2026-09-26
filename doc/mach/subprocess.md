@@ -212,20 +212,6 @@ pub fun dnit(a: *A.Allocator, p: *OwnedSubprocess);
 pub fun spawn(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8) err[Error];
 ```
 
-## fun spawn_in
-
-```mach
-pub fun spawn_in(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
-cwd: str) err[Error];
-```
-
-## fun spawn_captured
-
-```mach
-pub fun spawn_captured(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
-identity: str, limit: usize) err[Error];
-```
-
 ## fun spawn_captured_input
 
 ```mach
@@ -257,12 +243,6 @@ identity: str, limit: usize) err[Error];
 
 ```mach
 pub fun running(p: *OwnedSubprocess) bool;
-```
-
-## fun pid
-
-```mach
-pub fun pid(p: *OwnedSubprocess) i64;
 ```
 
 ## fun wait

@@ -101,12 +101,6 @@ the byte offset of a record field or tag payload from the same checked layout th
 pub fun secrecy_structure_equal_deep(s: *session.Session, m: layout.Machine, a: type.TypeId, b: type.TypeId) res[SecrecyVerdict, fail.Fail];
 ```
 
-## fun deep_all_secret
-
-```mach
-pub fun deep_all_secret(s: *session.Session, tid: type.TypeId) res[bool, fail.Fail];
-```
-
 ## fun module_reaches_secret
 
 ```mach

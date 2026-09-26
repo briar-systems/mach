@@ -119,13 +119,6 @@ pub fun fp_public_surface(fb: *FpBuf, rr: *resolve.ResolveResult, origin: sessio
 definition_revision: query.Revision) err[fail.Fail];
 ```
 
-## fun public_symbols_decode
-
-```mach
-pub fun public_symbols_decode(a: *A.Allocator, s: *session.Session, bytes: *u8, len: u32,
-path: intern.StrId, module: session.ModuleId) res[resolve.ModuleExports, fail.Fail];
-```
-
 ## fun typed_surface_encode
 
 ```mach

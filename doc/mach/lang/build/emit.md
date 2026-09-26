@@ -1,11 +1,5 @@
 # mach.lang.build.emit
 
-## fun ensure_parents
-
-```mach
-pub fun ensure_parents(a: *A.Allocator, p: str) err[outcome.Fail];
-```
-
 ## fun emit_asm
 
 ```mach

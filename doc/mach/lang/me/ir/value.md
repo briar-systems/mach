@@ -160,9 +160,3 @@ pub fun const_agg(bytes: *u8, len: u32, relocs: *AggReloc, reloc_count: u32, rel
 pub fun retype(v: Value, ty: ir_type.IrTypeId) Value;
 ```
 
-## fun is_constant
-
-```mach
-pub fun is_constant(v: Value) bool;
-```
-

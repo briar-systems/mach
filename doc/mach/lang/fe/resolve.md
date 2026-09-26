@@ -127,43 +127,33 @@ pub val SYM_IMPORTED: SymKind = 8
 ## val SYM_TEST
 
 ```mach
-pub val SYM_TEST:     SymKind = 9
+pub val SYM_TEST:   SymKind = 9
 ```
+
+reached only by mach-lsp
 
 ## val SYM_UNI
 
 ```mach
-pub val SYM_UNI:      SymKind = 10
+pub val SYM_UNI:    SymKind = 10
 ```
 
 ## val SYM_PRIM
 
 ```mach
-pub val SYM_PRIM:     SymKind = 11
+pub val SYM_PRIM:   SymKind = 11
 ```
 
 ## val SYM_VECTOR
 
 ```mach
-pub val SYM_VECTOR:   SymKind = 12
+pub val SYM_VECTOR: SymKind = 12
 ```
 
 ## val SYM_TAG
 
 ```mach
-pub val SYM_TAG:      SymKind = 13
-```
-
-## val SYM_KIND_COUNT
-
-```mach
-pub val SYM_KIND_COUNT: u32 = 14
-```
-
-## fun sym_kind_valid
-
-```mach
-pub fun sym_kind_valid(kind: SymKind) bool;
+pub val SYM_TAG:    SymKind = 13
 ```
 
 ## val SYM_FLAG_PUB

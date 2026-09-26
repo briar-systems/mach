@@ -276,18 +276,6 @@ pub fun emit_memzero(b: *Builder, ptr: value.Value, pointee_ty: type.IrTypeId) e
 pub fun emit_gep(b: *Builder, base: value.Value, src_ty: type.IrTypeId, indices: *value.Value, index_count: u32) res[value.Value, fail.Fail];
 ```
 
-## fun emit_extract
-
-```mach
-pub fun emit_extract(b: *Builder, agg: value.Value, index: value.Value, ty: type.IrTypeId) res[value.Value, fail.Fail];
-```
-
-## fun emit_insert
-
-```mach
-pub fun emit_insert(b: *Builder, agg: value.Value, index: value.Value, element: value.Value) res[value.Value, fail.Fail];
-```
-
 ## fun emit_vec_extract
 
 ```mach

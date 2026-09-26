@@ -18,12 +18,6 @@ pub val SPV_SET_CORE:    u8 = 1
 pub val SPV_SET_GLSL450: u8 = 2
 ```
 
-## val SPV_OP_NONE
-
-```mach
-pub val SPV_OP_NONE: u32 = 0xFFFFFFFF
-```
-
 ## val SET_CORE_NAME
 
 ```mach
@@ -70,12 +64,6 @@ pub val SPV_CTOR_SAMPLED_IMAGE: u32 = 1
 
 ```mach
 pub val SPV_CTOR_SAMPLER:       u32 = 2
-```
-
-## val TEXEL_F32
-
-```mach
-pub val TEXEL_F32: u32 = 0
 ```
 
 ## val TEXEL_I32
@@ -160,17 +148,5 @@ pub fun set_import_name(set: u8) str;
 
 ```mach
 pub fun register_defs(storage: *DefStorage) *isa.TargetDefs;
-```
-
-## fun opcode_of
-
-```mach
-pub fun opcode_of(definitions: *isa.TargetDefs, set: u8, name: str) u32;
-```
-
-## fun set_of
-
-```mach
-pub fun set_of(name: str) u8;
 ```
 

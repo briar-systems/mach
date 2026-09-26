@@ -184,12 +184,6 @@ pub val ASM_NOTE_BARRIER: u8 = notes.ASM_NOTE_BARRIER
 pub val ASM_NOTE_BYTES_WIDTH: usize = notes.ASM_NOTE_BYTES_WIDTH
 ```
 
-## val NOTE_SEED_MAX
-
-```mach
-pub val NOTE_SEED_MAX: u32 = notes.NOTE_SEED_MAX
-```
-
 ## val NOTE_NO_LANDING
 
 ```mach
@@ -322,18 +316,6 @@ pub fun sink_claims(buf: *ByteBuf) u32;
 
 ```mach
 pub fun sink_unaccounted(buf: *ByteBuf) usize;
-```
-
-## fun note_seeds_clear
-
-```mach
-pub fun note_seeds_clear(out: *NoteSeeds);
-```
-
-## fun note_seeds
-
-```mach
-pub fun note_seeds(f: *mir.MirFunction, n: *AsmNote, out: *NoteSeeds);
 ```
 
 ## fun sink_set_mir

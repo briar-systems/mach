@@ -27,14 +27,6 @@ pub val IR_FORM_LISTING: IrForm = 1
 a readable listing: language type spellings, elided state, and positions as
 line and column. It is the form tooling reads
 
-## val IR_FORM_CATALOG_VERSION
-
-```mach
-pub val IR_FORM_CATALOG_VERSION: u8 = 1
-```
-
-bumped when a row's fingerprint tag changes meaning
-
 ## val IR_FORM_N
 
 ```mach
@@ -60,22 +52,6 @@ pub fun ir_form_from_name(name: str) opt[IrForm];
 ```
 
 the form a `--emit-ir=<name>` value names
-
-## fun ir_form_fingerprint_tag
-
-```mach
-pub fun ir_form_fingerprint_tag(form: IrForm) u8;
-```
-
-the fingerprint byte of a form, or 0 when the form is not a catalog row
-
-## fun ir_form_name
-
-```mach
-pub fun ir_form_name(form: IrForm) str;
-```
-
-the `--emit-ir=<name>` spelling of a form, or "" when the form is not a catalog row
 
 ## rec IrContext
 

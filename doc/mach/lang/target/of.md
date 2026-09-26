@@ -42,12 +42,6 @@ pub val OF_SPV:     u32 = 5
 pub val OF_FORMAT_CATALOG_VERSION: u8 = 1
 ```
 
-## fun of_id_for
-
-```mach
-pub fun of_id_for(name: str) u32;
-```
-
 ## fun of_name_for
 
 ```mach
@@ -532,14 +526,6 @@ pub fun section_is_external(id: SectionId) bool;
 pub fun section_is_absolute(id: SectionId) bool;
 ```
 
-## fun section_defined
-
-```mach
-pub fun section_defined(id: SectionId, count: u32) bool;
-```
-
-true when the id names a real section below `count`
-
 ## fun section_same
 
 ```mach
@@ -917,12 +903,6 @@ pub val SYMT_FUNC:   SymbolType = 1
 pub val SYMT_OBJECT: SymbolType = 2
 ```
 
-## val SYMT_COUNT
-
-```mach
-pub val SYMT_COUNT: u32 = 3
-```
-
 ## rec SymtabEntry
 
 ```mach
@@ -993,12 +973,6 @@ pub rec ImageOptions;
 
 ```mach
 pub fun image_options_default(subsystem: Subsystem) ImageOptions;
-```
-
-## fun image_options_flagged
-
-```mach
-pub fun image_options_flagged(subsystem: Subsystem, flags: u32) ImageOptions;
 ```
 
 ## fun effective_stack_reserve
@@ -1373,19 +1347,13 @@ pub fun registered(reg: *OfRegistry, idx: u32) opt[*OfVTable];
 ## val DBG_UNKNOWN
 
 ```mach
-pub val DBG_UNKNOWN:  u32 = 0
+pub val DBG_UNKNOWN: u32 = 0
 ```
 
 ## val DBG_DWARF
 
 ```mach
-pub val DBG_DWARF:    u32 = 1
-```
-
-## val DBG_CODEVIEW
-
-```mach
-pub val DBG_CODEVIEW: u32 = 2
+pub val DBG_DWARF:   u32 = 1
 ```
 
 ## val DBG_SPIRV
