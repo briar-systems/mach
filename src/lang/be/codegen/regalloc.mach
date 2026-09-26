@@ -283,6 +283,12 @@ fun alloc_function(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) 
         ret ao;
     }
 
+    val cd: err[fail.Fail] = coalesce_dying_copies(tgt, ?ctx);
+    if (sel cd.err) {
+        ctx_dnit(?ctx);
+        ret cd;
+    }
+
     # a round scans the function as it stands; when it leaves a spilled
     # value whose reads a piece could carry, the pieces are inserted and the
     # next round scans them as intervals of their own
@@ -369,7 +375,7 @@ fun alloc_round(tgt: *target.Target, ctx: *AllocCtx) err[fail.Fail] {
 
     build_ranges(ctx);
 
-    val lv: err[fail.Fail] = extend_liveness(ctx);
+    val lv: err[fail.Fail] = extend_liveness(ctx, ctx.holes);
     if (sel lv.err) { ret lv; }
 
     val mc: err[fail.Fail] = mark_call_crossing(ctx);
@@ -1528,6 +1534,159 @@ fun coalesce_copies(tgt: *target.Target, ctx: *AllocCtx) err[fail.Fail] {
     ret err[fail.Fail].ok{};
 }
 
+# a copy the dying-copy pass may merge away, the hottest first
+rec DyingCopy {
+    cold: i64;
+    pos:  u32;
+}
+
+# a copy `d = s` whose source dies at it: d and s become one value when no
+# position holds both, so every definition of either writes one register and
+# the copy is a self-copy that vanishes. unlike coalesce_copies, either side
+# may have many definitions, which is the shape of a loop-carried variable
+# and the value its back edge copies into it. the test is exact liveness on
+# every ISA, whatever the scan models: two values that never meet may share
+# a register soundly, and without holes the merged hull is the union of two
+# hulls that meet at the copy, so no position gains a value. a position where
+# one side's last read meets the other's definition is shared only when the
+# instruction reads before it writes, the rule the scan's hand-off applies,
+# so a merge never makes a two-address op clobber its own operand. the
+# constraints a register must meet (calls, argument windows, definitions,
+# pins and the reload guarantee) apply to the merged value as the rounds
+# place it. the copies are taken hottest first, so a loop's copy is not lost
+# to a colder one that would merge a value it meets
+fun coalesce_dying_copies(tgt: *target.Target, ctx: *AllocCtx) err[fail.Fail] {
+    val nv: u32 = ctx.f.vreg_count;
+    if (nv == 0 || tgt.arch.is_reg_move == nil) { ret err[fail.Fail].ok{}; }
+    if (!has_mergeable_copy(tgt, ctx))          { ret err[fail.Fail].ok{}; }
+
+    val rt: err[fail.Fail] = round_tables_init(ctx);
+    if (sel rt.err) { ret rt; }
+    fin { round_tables_dnit(ctx); }
+    val fl: err[fail.Fail] = flatten(ctx);
+    if (sel fl.err) { ret fl; }
+    val bs: err[fail.Fail] = build_block_spans(ctx);
+    if (sel bs.err) { ret bs; }
+    val bd: err[fail.Fail] = build_loop_depth(ctx);
+    if (sel bd.err) { ret bd; }
+    build_ranges(ctx);
+    val lv: err[fail.Fail] = extend_liveness(ctx, true);
+    if (sel lv.err) { ret lv; }
+
+    var count: u32 = 0;
+    var pos:   u32 = 0;
+    for (pos < ctx.flat_count) {
+        if (dying_copy(tgt, ctx, pos)) { count = count + 1; }
+        pos = pos + 1;
+    }
+    if (count == 0) { ret err[fail.Fail].ok{}; }
+    val rc: res[*DyingCopy, A.Error] = A.allocate[DyingCopy](ctx.alloc, count::usize);
+    if (sel rc.err) { ret err[fail.Fail].err{fail.refused(rc.err)}; }
+    val copies: *DyingCopy = rc.ok;
+    fin { A.deallocate[DyingCopy](ctx.alloc, copies, count::usize); }
+    var n: u32 = 0;
+    pos = 0;
+    for (pos < ctx.flat_count) {
+        if (dying_copy(tgt, ctx, pos)) {
+            copies[n].cold = -use_weight_at(ctx, pos);
+            copies[n].pos  = pos;
+            n              = n + 1;
+        }
+        pos = pos + 1;
+    }
+    sort.sort[DyingCopy](copies, count::usize);
+
+    val rp: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, nv::usize);
+    if (sel rp.err) { ret err[fail.Fail].err{fail.refused(rp.err)}; }
+    val parent: *u32 = rp.ok;
+    fin { A.deallocate[u32](ctx.alloc, parent, nv::usize); }
+    val rn: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, nv::usize);
+    if (sel rn.err) { ret err[fail.Fail].err{fail.refused(rn.err)}; }
+    val next: *u32 = rn.ok;
+    fin { A.deallocate[u32](ctx.alloc, next, nv::usize); }
+    var i: u32 = 0;
+    for (i < nv) {
+        parent[i] = i;
+        next[i]   = i;
+        i         = i + 1;
+    }
+
+    var merged: bool = false;
+    var c:      u32  = 0;
+    for (c < count) {
+        val mi: *mir.MirInstr = flat_instr(ctx, copies[c].pos);
+        val rd: u32           = web_find(parent, mi.operands[0].vreg.n);
+        val rs: u32           = web_find(parent, mi.operands[1].vreg.n);
+        if (rd != rs && !webs_meet(ctx, next, rd, rs)) {
+            parent[rd] = rs;
+            # splice the two member rings into one
+            val t: u32 = next[rd];
+            next[rd] = next[rs];
+            next[rs] = t;
+            merged   = true;
+        }
+        c = c + 1;
+    }
+    if (!merged) { ret err[fail.Fail].ok{}; }
+    rename_vregs(ctx, parent, nv);
+    ret drop_self_copies(tgt, ctx);
+}
+
+# a full-width copy between two values that could share a register, whose
+# source's segment ends at it
+fun dying_copy(tgt: *target.Target, ctx: *AllocCtx, pos: u32) bool {
+    val mi: *mir.MirInstr = flat_instr(ctx, pos);
+    if (!mergeable_copy(tgt, ctx, mi)) { ret false; }
+    ret dies_at(ctx, mi.operands[1].vreg.n, pos::i64);
+}
+
+fun has_mergeable_copy(tgt: *target.Target, ctx: *AllocCtx) bool {
+    val f:  *mir.MirFunction = ctx.f;
+    var bi: u32              = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        var ii:  u32           = 0;
+        for (ii < blk.instr_count) {
+            if (mergeable_copy(tgt, ctx, ?blk.instrs[ii])) { ret true; }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+fun mergeable_copy(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr) bool {
+    if (!instr_is_reg_copy(tgt, mi)) { ret false; }
+    if (mi.width < ctx.spill_width)  { ret false; }
+    val dop: *mir.MirOperand = ?mi.operands[0];
+    val sop: *mir.MirOperand = ?mi.operands[1];
+    if (dop.kind != mir.MIR_OP_VREG || sop.kind != mir.MIR_OP_VREG) { ret false; }
+    val d: u32 = dop.vreg.n;
+    val s: u32 = sop.vreg.n;
+    if (d >= ctx.f.vreg_count || s >= ctx.f.vreg_count || d == s)     { ret false; }
+    if (vreg_has_slot(ctx, dop.vreg) || vreg_has_slot(ctx, sop.vreg)) { ret false; }
+    val dv: *mir.MirVReg = ?ctx.f.vregs[d];
+    val sv: *mir.MirVReg = ?ctx.f.vregs[s];
+    ret dv.class == sv.class && dv.secret == sv.secret && dv.vector == sv.vector;
+}
+
+# whether any value of one web meets any value of the other; each value's
+# segments are its own, so the webs' union is tested member by member
+fun webs_meet(ctx: *AllocCtx, next: *u32, a: u32, b: u32) bool {
+    var x: u32 = a;
+    for (true) {
+        var y: u32 = b;
+        for (true) {
+            if (intersects(ctx, ?ctx.ranges[x], ?ctx.ranges[y])) { ret true; }
+            y = next[y];
+            if (y == b) { brk; }
+        }
+        x = next[x];
+        if (x == a) { brk; }
+    }
+    ret false;
+}
+
 fun reads_in_window(ctx: *AllocCtx, d: u32, from: i64, to: i64) bool {
     var p: i64 = from + 1;
     for (p < to) {
@@ -1955,7 +2114,9 @@ fun restore_offsets(start: *u32, n: u32) {
     start[0] = 0;
 }
 
-fun extend_liveness(ctx: *AllocCtx) err[fail.Fail] {
+# exact asks for a value's segments with their holes whatever the scan's
+# model, for a pass that must know where values are dead
+fun extend_liveness(ctx: *AllocCtx, exact: bool) err[fail.Fail] {
     val nb: u32 = ctx.f.block_count;
     val nv: u32 = ctx.f.vreg_count;
     if (nb == 0 || nv == 0) { ret err[fail.Fail].ok{}; }
@@ -1987,7 +2148,7 @@ fun extend_liveness(ctx: *AllocCtx) err[fail.Fail] {
         reset_ranges(ctx);
         ret pl;
     }
-    val bs: err[fail.Fail] = build_segments(ctx, ?l);
+    val bs: err[fail.Fail] = build_segments(ctx, ?l, exact);
     if (sel bs.err) { reset_ranges(ctx); }
     ret bs;
 }
@@ -2208,8 +2369,8 @@ fun bucket_pairs(ctx: *AllocCtx, l: *PairList, nb: u32, start: **u32, regs: **u3
     ret err[fail.Fail].ok{};
 }
 
-fun build_segments(ctx: *AllocCtx, l: *LiveScratch) err[fail.Fail] {
-    if (!ctx.holes) { ret build_hull_segments(ctx); }
+fun build_segments(ctx: *AllocCtx, l: *LiveScratch, exact: bool) err[fail.Fail] {
+    if (!exact) { ret build_hull_segments(ctx); }
     val nb: u32 = ctx.f.block_count;
     val nv: u32 = ctx.f.vreg_count;
 
@@ -6507,6 +6668,122 @@ fun t_scale(v: i64, k: i64) i64 {
     ret v * k;
 }
 
+fun t_op(alloc: *A.Allocator, b: *mir.MirBlock, ix: u32, opcode: mir.MirOpcode, x: mir.MirOperand, y: mir.MirOperand, z: mir.MirOperand, n: u32) {
+    val r: res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](alloc, 3::usize);
+    if (sel r.err) { ret; }
+    val arr: *mir.MirOperand = r.ok;
+    arr[0]                     = x;
+    arr[1]                     = y;
+    arr[2]                     = z;
+    b.instrs[ix].opcode        = opcode;
+    b.instrs[ix].operands      = arr;
+    b.instrs[ix].operand_count = n;
+    b.instrs[ix].width         = 8;
+    b.instrs[ix].src_width     = 8;
+    b.instrs[ix].asm_block     = nil;
+    b.instrs[ix].vec_lane      = mir.VEC_LANE_NONE;
+    b.instrs[ix].declassified  = mir.MIR_VREG_NIL;
+}
+
+# a loop around one value: v0 enters the loop, the body computes the next
+# value into v1 by `op`, reads v0 again when late_read says so, and the back
+# edge copies v1 into v0, which the exit reads. v2 is a value live through
+# the loop. the result is the loop block's instruction count after the
+# dying-copy pass, or a failure below 100 for a broken setup
+fun t_dying_loop_case(isa_name: str, abi_name: str, op: mir.MirOpcode, left: u32, right: u32, late_read: bool) i32 {
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val rr: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel rr.err) { ret 1; }
+    val ts: res[target.Target, fail.Fail] = target.select(?reg, isa_name, "linux", abi_name);
+    if (sel ts.err) { ret 2; }
+    var tgt:   target.Target = ts.ok;
+    var alloc: A.Allocator;
+    val made:  err[A.Error]  = page.make(?alloc);
+    if (sel made.err) { ret 3; }
+
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 3);
+    var blocks: [3]mir.MirBlock;
+    var preds:  [3]u32;
+    preds[0] = 0;
+    preds[1] = 1;
+    preds[2] = 1;
+    t_block(?alloc, ?blocks[0], 3);
+    blocks[0].id         = 0;
+    blocks[0].pred_count = 0;
+    t_mov(?alloc, ?blocks[0], 0, mir.op_vreg(mir.vreg_id(0)), mir.op_preg(mir.preg_id(3)));
+    t_mov(?alloc, ?blocks[0], 1, mir.op_vreg(mir.vreg_id(2)), mir.op_preg(mir.preg_id(4)));
+    t_op(?alloc, ?blocks[0], 2, mir.MIR_BR, mir.op_block(1), mir.op_imm(0), mir.op_imm(0), 1);
+    var body: u32 = 3;
+    if (late_read) { body = 4; }
+    t_block(?alloc, ?blocks[1], body);
+    blocks[1].id         = 1;
+    blocks[1].preds      = ?preds[0];
+    blocks[1].pred_count = 2;
+    t_op(?alloc, ?blocks[1], 0, op, mir.op_vreg(mir.vreg_id(1)), mir.op_vreg(mir.vreg_id(left)), mir.op_vreg(mir.vreg_id(right)), 3);
+    var at: u32 = 1;
+    if (late_read) {
+        t_mov(?alloc, ?blocks[1], 1, mir.op_preg(mir.preg_id(5)), mir.op_vreg(mir.vreg_id(0)));
+        at = 2;
+    }
+    t_mov(?alloc, ?blocks[1], at, mir.op_vreg(mir.vreg_id(0)), mir.op_vreg(mir.vreg_id(1)));
+    t_op(?alloc, ?blocks[1], at + 1, mir.MIR_CBR, mir.op_vreg(mir.vreg_id(0)), mir.op_block(1), mir.op_block(2), 3);
+    t_block(?alloc, ?blocks[2], 3);
+    blocks[2].id         = 2;
+    blocks[2].preds      = ?preds[2];
+    blocks[2].pred_count = 1;
+    t_mov(?alloc, ?blocks[2], 0, mir.op_preg(mir.preg_id(0)), mir.op_vreg(mir.vreg_id(0)));
+    t_mov(?alloc, ?blocks[2], 1, mir.op_preg(mir.preg_id(1)), mir.op_vreg(mir.vreg_id(2)));
+    t_op(?alloc, ?blocks[2], 2, mir.MIR_RET, mir.op_imm(0), mir.op_imm(0), mir.op_imm(0), 0);
+    f.blocks           = ?blocks[0];
+    f.block_count      = 3;
+    f.block_cap        = 3;
+    f.frame.slot_count = 0;
+
+    var m: mir.MirModule;
+    m.alloc    = ?alloc;
+    m.interner = nil;
+    var ctx: AllocCtx;
+    val ci:  err[fail.Fail] = ctx_init(?ctx, ?tgt, ?m, ?f);
+    if (sel ci.err) { ret 4; }
+    fin { ctx_dnit(?ctx); }
+    val vs: err[fail.Fail] = build_vreg_slot_flags(?ctx);
+    if (sel vs.err) { ret 5; }
+    ctx.round_count = f.vreg_count;
+    val bo: err[fail.Fail] = build_order(?ctx);
+    if (sel bo.err) { ret 6; }
+    val ao: err[fail.Fail] = apply_order(?ctx);
+    if (sel ao.err)          { ret 7; }
+    if (f.blocks[1].id != 1) { ret 8; }
+    val cd: err[fail.Fail] = coalesce_dying_copies(?tgt, ?ctx);
+    if (sel cd.err) { ret 9; }
+    ret (100 + f.blocks[1].instr_count)::i32;
+}
+
+# the back-edge copy of a loop-carried value merges on every ISA: the
+# value's last read in the body is where its next value is written, and the
+# two never meet, so the add runs in place and the copy is gone
+test "mach.lang.be.codegen.regalloc.coalesce_dying_copies:a_loop_carried_value_takes_its_back_edge_copy" {
+    if (t_dying_loop_case("x86_64", "sysv64", mir.MIR_SEL_ADD, 0, 2, false) != 102)   { ret 1; }
+    if (t_dying_loop_case("aarch64", "aapcs64", mir.MIR_SEL_ADD, 0, 2, false) != 102) { ret 2; }
+    if (t_dying_loop_case("riscv64", "lp64d", mir.MIR_SEL_ADD, 0, 2, false) != 102)   { ret 3; }
+    # a commutative op reads its right operand first once it is swapped
+    if (t_dying_loop_case("x86_64", "sysv64", mir.MIR_SEL_ADD, 2, 0, false) != 102) { ret 4; }
+    ret 0;
+}
+
+test "mach.lang.be.codegen.regalloc.coalesce_dying_copies:refuses_values_that_meet" {
+    # the loop value is read after its next value is written: both are live
+    if (t_dying_loop_case("x86_64", "sysv64", mir.MIR_SEL_ADD, 0, 2, true) != 104)   { ret 1; }
+    if (t_dying_loop_case("aarch64", "aapcs64", mir.MIR_SEL_ADD, 0, 2, true) != 104) { ret 2; }
+    # a two-address sub writes its result before it reads its right operand
+    if (t_dying_loop_case("x86_64", "sysv64", mir.MIR_SEL_SUB, 2, 0, false) != 103) { ret 3; }
+    # the same sub with the loop value on the left runs in place
+    if (t_dying_loop_case("x86_64", "sysv64", mir.MIR_SEL_SUB, 0, 2, false) != 102) { ret 4; }
+    ret 0;
+}
+
 test "mach.lang.be.codegen.regalloc.coalesce_copies:forwarded_values_survive" {
     var acc: i64 = 0;
     var i:   i64 = 0;
@@ -8691,7 +8968,7 @@ fun t_sparse_liveness_case(sample: u32, ordinal: usize, attempts: *usize) i32 {
     ctx.block_id_index_cap = 64;
     ctx.ranges             = ?sparse[0];
     T.fail_at_ordinal(?track, ordinal);
-    val result: err[fail.Fail] = extend_liveness(?ctx);
+    val result: err[fail.Fail] = extend_liveness(?ctx, true);
     @attempts = T.attempt_count(?track);
     var segs:      [64]Segment;
     var seg_count: u32 = 0;
