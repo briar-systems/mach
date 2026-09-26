@@ -516,6 +516,12 @@ pub val IVEC_WIDEN_U:    IrVecOp = 25
 pub val IVEC_SHR_S:      IrVecOp = 26
 ```
 
+## val IVEC_RANGE
+
+```mach
+pub val IVEC_RANGE:      IrVecOp = 27
+```
+
 ## def VecClass
 
 ```mach
@@ -577,6 +583,15 @@ pub val VCLASS_WIDEN_HALF: VecClass = 7
 
 a lane-halving extension: the result has half the operand's lanes, each twice
 as wide, taken from the operand's low or high half
+
+## val VCLASS_RANGE
+
+```mach
+pub val VCLASS_RANGE: VecClass = 8
+```
+
+a lane range: the result has at most the operand's lanes, of the same type,
+taken from a constant first lane on
 
 ## def CtClass
 
@@ -755,7 +770,7 @@ pub rec IrOpDescriptor;
 ## val IR_OP_DESCRIPTOR_COUNT
 
 ```mach
-pub val IR_OP_DESCRIPTOR_COUNT: usize = 57
+pub val IR_OP_DESCRIPTOR_COUNT: usize = 58
 ```
 
 ## fun is_known
