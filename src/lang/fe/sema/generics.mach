@@ -430,225 +430,347 @@ fun nominal_overlays(g: *GenericOp, tid: type.TypeId) opt[bool] {
     ret opt[bool].none{};
 }
 
-pub def SecrecyVerdict: u8;
-
-pub val SECRECY_EQUAL:   SecrecyVerdict = 0;
-pub val SECRECY_DIFFERS: SecrecyVerdict = 1;
-
-fun secrecy_structure_equal_deep_inner(g: *GenericOp, m: layout.Machine, a: type.TypeId, b: type.TypeId) SecrecyVerdict {
-    val s: *session.Session = g.s;
-    if (!contains_secret_deep_inner(g, a) && !contains_secret_deep_inner(g, b)) { ret SECRECY_EQUAL; }
-
-    var scan:   type.PairScan;
-    val scan_r: err[fail.Fail] = type.pair_scan_begin(?s.types, ?scan);
-    if (sel scan_r.err) {
-        fail.internal(g.status, fail.describe(scan_r.err));
-        ret SECRECY_DIFFERS;
-    }
-    val equal: bool = sse_deep_walk(g, m, a, b, ?scan);
-    type.pair_scan_end(?s.types, ?scan);
-
-    if (equal) { ret SECRECY_EQUAL; }
-    ret SECRECY_DIFFERS;
+# one run of bytes of the same secrecy class, as offsets into the type's storage;
+# a pointer run carries the stripped pointer type whose target it reaches
+rec SecrecyRun {
+    start:    u32;
+    end:      u32;
+    ptr:      bool;
+    secret:   bool;
+    conflict: bool;
+    leaf:     type.TypeId;
 }
 
-fun sse_deep_walk(g: *GenericOp, m: layout.Machine, a: type.TypeId, b: type.TypeId, scan: *type.PairScan) bool {
-    val s: *session.Session = g.s;
-    if (type.is_secret(?s.types, a) != type.is_secret(?s.types, b)) { ret false; }
+rec SecrecyWalk {
+    g:    *GenericOp;
+    m:    layout.Machine;
+    scan: *type.PairScan;
+}
 
-    val sa: type.TypeId     = type.strip_secret(?s.types, a);
-    val sb: type.TypeId     = type.strip_secret(?s.types, b);
-    val oa: opt[*type.Type] = type.get(?s.types, sa);
-    val ob: opt[*type.Type] = type.get(?s.types, sb);
+fun data_run(start: u32, end: u32, secret: bool) SecrecyRun {
+    ret SecrecyRun{start: start, end: end, ptr: false, secret: secret, conflict: false, leaf: type.TYPE_NIL};
+}
+
+# a byte the walk cannot classify; it agrees with nothing
+fun conflict_run(off: u32) SecrecyRun {
+    ret SecrecyRun{start: off, end: off + 1, ptr: false, secret: false, conflict: true, leaf: type.TYPE_NIL};
+}
+
+fun shift_run(r: SecrecyRun, by: u32) SecrecyRun {
+    var out: SecrecyRun = r;
+    out.start = r.start + by;
+    out.end   = r.end + by;
+    ret out;
+}
+
+# the run of `tid` that holds byte `off`; padding is public, and an array of one
+# data class is a single run
+fun secrecy_run_at(w: *SecrecyWalk, tid: type.TypeId, inherited: bool, off: u32, depth: u32) SecrecyRun {
+    val g: *GenericOp       = w.g;
+    val s: *session.Session = g.s;
+    if (depth > SEMA_LAYOUT_MAX_DEPTH) { ret conflict_run(off); }
+
+    val secret: bool          = inherited || type.is_secret(?s.types, tid);
+    val base:   type.TypeId   = type.strip_secret(?s.types, tid);
+    val e:      layout.Extent = type_extent_inner(g, w.m, base);
+    if (!e.ok || off >= e.size) { ret conflict_run(off); }
+    val n: layout.Node = describe_type(g, base::u32);
+
+    if (n.kind == layout.NODE_SCALAR || n.kind == layout.NODE_VECTOR || n.kind == layout.NODE_OPAQUE) {
+        ret data_run(0, e.size, secret);
+    }
+    if (n.kind == layout.NODE_POINTER) {
+        ret SecrecyRun{start: 0, end: e.size, ptr: true, secret: secret, conflict: false, leaf: base};
+    }
+
+    if (n.kind == layout.NODE_ARRAY) {
+        val child: type.TypeId   = n.child::type.TypeId;
+        val ce:    layout.Extent = type_extent_inner(g, w.m, type.strip_secret(?s.types, child));
+        if (!ce.ok || ce.size == 0) { ret conflict_run(off); }
+        val at:    u32        = (off / ce.size) * ce.size;
+        val inner: SecrecyRun = secrecy_run_at(w, child, secret, off - at, depth + 1);
+        if (!inner.ptr && !inner.conflict && inner.start == 0 && inner.end == ce.size) {
+            ret data_run(at, e.size, inner.secret);
+        }
+        ret shift_run(inner, at);
+    }
+
+    if (n.kind == layout.NODE_TAG) {
+        val disc: u32 = n.bytes;
+        if (off < disc) { ret data_run(0, disc, false); }
+        val pe: layout.Extent = layout.field_offset_of[GenericOp](g, describe_type, describe_type_field, base::u32, 0, w.m,
+            SEMA_LAYOUT_MAX_DEPTH);
+        if (!pe.ok)        { ret conflict_run(off); }
+        if (off < pe.size) { ret data_run(disc, pe.size, false); }
+        ret overlay_run_at(w, base, n.field_count, pe.size, e.size, secret, off, depth);
+    }
+
+    if (n.kind == layout.NODE_AGGREGATE && n.overlays) {
+        ret overlay_run_at(w, base, n.field_count, 0, e.size, secret, off, depth);
+    }
+
+    if (n.kind == layout.NODE_AGGREGATE) {
+        var offset:   u32 = 0;
+        var prev_end: u32 = 0;
+        var i:        u32 = 0;
+        for (i < n.field_count) {
+            val fty: type.TypeId   = describe_type_field(g, base::u32, i)::type.TypeId;
+            val fe:  layout.Extent = type_extent_inner(g, w.m, type.strip_secret(?s.types, fty));
+            if (!fe.ok) { ret conflict_run(off); }
+            if (!n.packed) {
+                val aligned: layout.Extent = layout.checked_round_up(offset, fe.align);
+                if (!aligned.ok) { ret conflict_run(off); }
+                offset = aligned.size;
+            }
+            if (off < offset) { ret data_run(prev_end, offset, false); }
+            if (off < offset + fe.size) {
+                ret shift_run(secrecy_run_at(w, fty, secret, off - offset, depth + 1), offset);
+            }
+            offset   = offset + fe.size;
+            prev_end = offset;
+            i        = i + 1;
+        }
+        ret data_run(prev_end, e.size, false);
+    }
+
+    ret conflict_run(off);
+}
+
+# the variants of a union or tag payload overlay one storage from `at`; a byte
+# takes the class every variant covering it agrees on, and a conflict otherwise
+fun overlay_run_at(w: *SecrecyWalk, base: type.TypeId, count: u32, at: u32, size: u32, secret: bool,
+    off: u32, depth: u32) SecrecyRun {
+    val g: *GenericOp       = w.g;
+    val s: *session.Session = g.s;
+
+    var covered:   bool       = false;
+    var out:       SecrecyRun = data_run(at, size, false);
+    var uncovered: u32        = at;
+    var i:         u32        = 0;
+    for (i < count) {
+        val vty: type.TypeId   = describe_type_field(g, base::u32, i)::type.TypeId;
+        val ve:  layout.Extent = type_extent_inner(g, w.m, type.strip_secret(?s.types, vty));
+        if (!ve.ok) { ret conflict_run(off); }
+        if (off < at + ve.size) {
+            val r: SecrecyRun = shift_run(secrecy_run_at(w, vty, secret, off - at, depth + 1), at);
+            if (!covered) {
+                out     = r;
+                covered = true;
+            }
+            or {
+                out = merge_overlay_runs(w, out, r);
+            }
+        }
+        or (at + ve.size > uncovered) { uncovered = at + ve.size; }
+        i = i + 1;
+    }
+    if (!covered) { ret data_run(uncovered, size, false); }
+    ret out;
+}
+
+fun merge_overlay_runs(w: *SecrecyWalk, a: SecrecyRun, b: SecrecyRun) SecrecyRun {
+    var out: SecrecyRun = a;
+    if (b.start > out.start) { out.start = b.start; }
+    if (b.end < out.end)     { out.end = b.end; }
+    if (a.conflict || b.conflict || a.ptr != b.ptr || a.secret != b.secret) {
+        out.conflict = true;
+        ret out;
+    }
+    if (a.ptr && (a.start != b.start || a.end != b.end || !pointer_leaves_equal(w, a.leaf, b.leaf))) {
+        out.conflict = true;
+    }
+    ret out;
+}
+
+# a run that holds no secret and reaches none
+fun run_is_public(w: *SecrecyWalk, r: SecrecyRun) bool {
+    if (r.conflict || r.secret) { ret false; }
+    if (!r.ptr)                 { ret true; }
+    ret !contains_secret_deep_inner(w.g, r.leaf);
+}
+
+fun runs_agree(w: *SecrecyWalk, a: SecrecyRun, b: SecrecyRun) bool {
+    if (a.conflict || b.conflict) { ret false; }
+    if (!a.ptr && !b.ptr)         { ret a.secret == b.secret; }
+    if (a.ptr && b.ptr && a.start == b.start && a.end == b.end) {
+        ret a.secret == b.secret && pointer_leaves_equal(w, a.leaf, b.leaf);
+    }
+    ret run_is_public(w, a) && run_is_public(w, b);
+}
+
+# beneath a pointer the target is shared storage, so the two targets must match
+# both ways: equal extent and the same class at every byte
+fun pointer_leaves_equal(w: *SecrecyWalk, a: type.TypeId, b: type.TypeId) bool {
+    val g: *GenericOp       = w.g;
+    val s: *session.Session = g.s;
+    if (!contains_secret_deep_inner(g, a) && !contains_secret_deep_inner(g, b)) { ret true; }
+
+    val oa: opt[*type.Type] = type.get(?s.types, a);
+    val ob: opt[*type.Type] = type.get(?s.types, b);
     if (!sel oa.some) { ret false; }
     if (!sel ob.some) { ret false; }
     val ta: *type.Type = oa.some;
     val tb: *type.Type = ob.some;
 
     if (ta.kind == type.TYPE_POINTER && tb.kind == type.TYPE_POINTER) {
-        ret sse_deep_walk(g, m, ta.data.pointer.base, tb.data.pointer.base, scan);
-    }
-    if (ta.kind == type.TYPE_ARRAY && tb.kind == type.TYPE_ARRAY) {
-        ret sse_deep_walk(g, m, ta.data.array.base, tb.data.array.base, scan);
+        ret storage_equal(w, ta.data.pointer.base, tb.data.pointer.base);
     }
     if (ta.kind == type.TYPE_FUN && tb.kind == type.TYPE_FUN) {
-        if (ta.data.fn.params_len != tb.data.fn.params_len)                       { ret false; }
-        if (!sse_deep_walk(g, m, ta.data.fn.ret_type, tb.data.fn.ret_type, scan)) { ret false; }
+        if (ta.data.fn.params_len != tb.data.fn.params_len)              { ret false; }
+        if (!storage_equal(w, ta.data.fn.ret_type, tb.data.fn.ret_type)) { ret false; }
         var pi: u32 = 0;
         for (pi < ta.data.fn.params_len) {
             val pa: opt[type.TypeId] = type.get_param(?s.types, ta.data.fn.params_start + pi);
             val pb: opt[type.TypeId] = type.get_param(?s.types, tb.data.fn.params_start + pi);
-            if (!sel pa.some)                                 { ret false; }
-            if (!sel pb.some)                                 { ret false; }
-            if (!sse_deep_walk(g, m, pa.some, pb.some, scan)) { ret false; }
+            if (!sel pa.some)                        { ret false; }
+            if (!sel pb.some)                        { ret false; }
+            if (!storage_equal(w, pa.some, pb.some)) { ret false; }
             pi = pi + 1;
         }
         ret true;
     }
-
-    val a_nom: bool = ta.kind == type.TYPE_REC || ta.kind == type.TYPE_UNI || ta.kind == type.TYPE_TAG || ta.kind == type.TYPE_INSTANCE;
-    val b_nom: bool = tb.kind == type.TYPE_REC || tb.kind == type.TYPE_UNI || tb.kind == type.TYPE_TAG || tb.kind == type.TYPE_INSTANCE;
-    if (a_nom && b_nom) {
-        val mark_r: res[type.VisitMark, fail.Fail] = type.pair_scan_mark(?s.types, scan, sa, sb);
-        if (sel mark_r.err) {
-            fail.internal(g.status, fail.describe(mark_r.err));
-            ret false;
-        }
-        val mark: type.VisitMark = mark_r.ok;
-        if (mark == type.VISIT_SEEN) { ret true; }
-
-        if (ta.kind == type.TYPE_INSTANCE) { ensure_fields_inner(g, sa); }
-        if (tb.kind == type.TYPE_INSTANCE) { ensure_fields_inner(g, sb); }
-
-        # an aggregate holding no value has no secrecy layout to be a prefix of
-        # or all-secret over, so it compares as the scalar leaf it stands for
-        if (holds_no_value_inner(g, sa) || holds_no_value_inner(g, sb)) {
-            ret !contains_secret_deep_inner(g, sa) && !contains_secret_deep_inner(g, sb);
-        }
-
-        if (deep_all_secret_inner(g, sa) && deep_all_secret_inner(g, sb)) { ret true; }
-
-        val tab_a: opt[*type.FieldTable] = type.field_table_for(?s.types, sa);
-        val tab_b: opt[*type.FieldTable] = type.field_table_for(?s.types, sb);
-        if (!sel tab_a.some) { ret false; }
-        if (!sel tab_b.some) { ret false; }
-        val na: u32 = tab_a.some.fields_len;
-        val nb: u32 = tab_b.some.fields_len;
-
-        var common: u32 = na;
-        if (nb < common) { common = nb; }
-        var f: u32 = 0;
-        for (f < common) {
-            val fa: opt[*type.FieldEntry] = type.field_at(?s.types, sa, f);
-            val fb: opt[*type.FieldEntry] = type.field_at(?s.types, sb, f);
-            if (!sel fa.some) { ret false; }
-            if (!sel fb.some) { ret false; }
-            val ty_a: type.TypeId = fa.some.ty;
-            val ty_b: type.TypeId = fb.some.ty;
-            if (!sse_deep_walk(g, m, ty_a, ty_b, scan)) { ret false; }
-
-            val ea: layout.Extent = type_extent_inner(g, m, ty_a);
-            val eb: layout.Extent = type_extent_inner(g, m, ty_b);
-            if (!ea.ok || !eb.ok)                           { ret false; }
-            if (ea.size != eb.size || ea.align != eb.align) { ret false; }
-            f = f + 1;
-        }
-        if (na == nb) { ret true; }
-
-        val oa: opt[bool] = nominal_overlays(g, sa);
-        val ob: opt[bool] = nominal_overlays(g, sb);
-        if (!sel oa.some)       { ret false; }
-        if (!sel ob.some)       { ret false; }
-        if (oa.some || ob.some) { ret false; }
-        ret true;
-    }
-
-    ret !contains_secret_deep_inner(g, sa) && !contains_secret_deep_inner(g, sb);
-}
-
-fun holds_no_value_inner(g: *GenericOp, tid: type.TypeId) bool {
-    val s:      *session.Session = g.s;
-    var scan:   type.TypeScan;
-    val scan_r: err[fail.Fail]   = type.type_scan_begin(?s.types, ?scan);
-    if (sel scan_r.err) {
-        fail.internal(g.status, fail.describe(scan_r.err));
-        ret false;
-    }
-    val none: bool = no_value_walk(g, tid, ?scan);
-    type.type_scan_end(?s.types, ?scan);
-    ret none;
-}
-
-# true when no scalar, pointer or discriminator is stored anywhere in the type:
-# an empty record, a zero-count array, and aggregates of only those
-fun no_value_walk(g: *GenericOp, tid: type.TypeId, scan: *type.TypeScan) bool {
-    val s:        *session.Session = g.s;
-    val base:     type.TypeId      = type.strip_secret(?s.types, tid);
-    val opt_type: opt[*type.Type]  = type.get(?s.types, base);
-    if (!sel opt_type.some) { ret false; }
-    val t: *type.Type = opt_type.some;
-
-    if (t.kind == type.TYPE_ARRAY) {
-        if (t.data.array.count == 0) { ret true; }
-        ret no_value_walk(g, t.data.array.base, scan);
-    }
-
-    if (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI || t.kind == type.TYPE_INSTANCE) {
-        if (t.kind == type.TYPE_INSTANCE) { ensure_fields_inner(g, base); }
-        if (type.is_tag(?s.types, base))  { ret false; }
-        val mark_r: res[type.VisitMark, fail.Fail] = type.type_scan_mark(?s.types, scan, base);
-        if (sel mark_r.err) {
-            fail.internal(g.status, fail.describe(mark_r.err));
-            ret false;
-        }
-        if (mark_r.ok == type.VISIT_SEEN) { ret true; }
-
-        val opt_tab: opt[*type.FieldTable] = type.field_table_for(?s.types, base);
-        if (!sel opt_tab.some) { ret false; }
-        val n: u32 = opt_tab.some.fields_len;
-        var f: u32 = 0;
-        for (f < n) {
-            val e: opt[*type.FieldEntry] = type.field_at(?s.types, base, f);
-            if (!sel e.some)                        { ret false; }
-            if (!no_value_walk(g, e.some.ty, scan)) { ret false; }
-            f = f + 1;
-        }
-        ret true;
-    }
-
     ret false;
 }
 
-fun deep_all_secret_inner(g: *GenericOp, tid: type.TypeId) bool {
-    val s:      *session.Session = g.s;
-    var scan:   type.TypeScan;
-    val scan_r: err[fail.Fail]   = type.type_scan_begin(?s.types, ?scan);
-    if (sel scan_r.err) {
-        fail.internal(g.status, fail.describe(scan_r.err));
-        ret false;
-    }
-    val all: bool = all_secret_walk(g, tid, ?scan);
-    type.type_scan_end(?s.types, ?scan);
-    ret all;
-}
-
-fun all_secret_walk(g: *GenericOp, tid: type.TypeId, scan: *type.TypeScan) bool {
+fun storage_equal(w: *SecrecyWalk, a: type.TypeId, b: type.TypeId) bool {
+    val g: *GenericOp       = w.g;
     val s: *session.Session = g.s;
-    if (type.is_secret(?s.types, tid)) { ret true; }
-    if (type.is_tag(?s.types, tid))    { ret false; }
+    if (a == type.TYPE_NIL || b == type.TYPE_NIL)                               { ret a == b; }
+    if (!contains_secret_deep_inner(g, a) && !contains_secret_deep_inner(g, b)) { ret true; }
 
-    val opt_type: opt[*type.Type] = type.get(?s.types, tid);
-    if (!sel opt_type.some) { ret false; }
-    val t: *type.Type = opt_type.some;
-
-    if (t.kind == type.TYPE_POINTER) { ret false; }
-    if (t.kind == type.TYPE_ARRAY)   { ret all_secret_walk(g, t.data.array.base, scan); }
-
-    if (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI || t.kind == type.TYPE_TAG || t.kind == type.TYPE_INSTANCE) {
-        val mark_r: res[type.VisitMark, fail.Fail] = type.type_scan_mark(?s.types, scan, tid);
-        if (sel mark_r.err) {
-            fail.internal(g.status, fail.describe(mark_r.err));
-            ret false;
-        }
-        val mark: type.VisitMark = mark_r.ok;
-        if (mark == type.VISIT_SEEN) { ret true; }
-
-        if (t.kind == type.TYPE_INSTANCE) { ensure_fields_inner(g, tid); }
-        val opt_tab: opt[*type.FieldTable] = type.field_table_for(?s.types, tid);
-        if (!sel opt_tab.some) { ret false; }
-        val n: u32 = opt_tab.some.fields_len;
-
-        var f: u32 = 0;
-        for (f < n) {
-            val e: opt[*type.FieldEntry] = type.field_at(?s.types, tid, f);
-            if (!sel e.some)                          { ret false; }
-            if (!all_secret_walk(g, e.some.ty, scan)) { ret false; }
-            f = f + 1;
-        }
-        ret true;
+    val mark_r: res[type.VisitMark, fail.Fail] = type.pair_scan_mark(?s.types, w.scan, a, b);
+    if (sel mark_r.err) {
+        fail.internal(g.status, fail.describe(mark_r.err));
+        ret false;
     }
+    if (mark_r.ok == type.VISIT_SEEN) { ret true; }
 
-    ret false;
+    val ea: layout.Extent = type_extent_inner(g, w.m, type.strip_secret(?s.types, a));
+    val eb: layout.Extent = type_extent_inner(g, w.m, type.strip_secret(?s.types, b));
+    if (!ea.ok || !eb.ok || ea.size != eb.size) { ret false; }
+    ret agree_below(w, a, b, ea.size);
+}
+
+# every byte below `limit`, which both types cover, has one class on both sides
+fun agree_below(w: *SecrecyWalk, a: type.TypeId, b: type.TypeId, limit: u32) bool {
+    val g:   *GenericOp = w.g;
+    var pos: u32        = 0;
+    for (pos < limit) {
+        val ra: SecrecyRun = secrecy_run_at(w, a, false, pos, 0);
+        val rb: SecrecyRun = secrecy_run_at(w, b, false, pos, 0);
+        if (sel g.status.kind.internal) { ret false; }
+        if (!runs_agree(w, ra, rb))     { ret false; }
+        var next: u32 = ra.end;
+        if (rb.end < next) { next = rb.end; }
+        pos = next;
+    }
+    ret true;
+}
+
+# the one data class that holds every byte of the type; none for a type with no
+# bytes, a pointer or a byte of mixed class
+fun single_class(w: *SecrecyWalk, tid: type.TypeId, size: u32) opt[bool] {
+    if (size == 0) { ret opt[bool].none{}; }
+    val first: SecrecyRun = secrecy_run_at(w, tid, false, 0, 0);
+    if (first.ptr || first.conflict) { ret opt[bool].none{}; }
+    var pos: u32 = first.end;
+    for (pos < size) {
+        val r: SecrecyRun = secrecy_run_at(w, tid, false, pos, 0);
+        if (r.ptr || r.conflict || r.secret != first.secret) { ret opt[bool].none{}; }
+        pos = r.end;
+    }
+    ret opt[bool].some{first.secret};
+}
+
+# a `*S` retyped as `*T`: the bytes both cover keep their class, a narrowing is
+# accepted, and a widening only when `S` and `T` are one and the same class throughout
+fun retype_allowed(w: *SecrecyWalk, from: type.TypeId, to: type.TypeId) bool {
+    val g:  *GenericOp       = w.g;
+    val s:  *session.Session = g.s;
+    val ef: layout.Extent    = type_extent_inner(g, w.m, type.strip_secret(?s.types, from));
+    val et: layout.Extent    = type_extent_inner(g, w.m, type.strip_secret(?s.types, to));
+    if (!ef.ok || !et.ok) { ret false; }
+
+    var common: u32 = ef.size;
+    if (et.size < common)                  { common = et.size; }
+    if (!agree_below(w, from, to, common)) { ret false; }
+    if (et.size <= ef.size)                { ret true; }
+
+    val cf: opt[bool] = single_class(w, from, ef.size);
+    val ct: opt[bool] = single_class(w, to, et.size);
+    if (!sel cf.some) { ret false; }
+    if (!sel ct.some) { ret false; }
+    ret cf.some == ct.some;
+}
+
+fun is_data_leaf(g: *GenericOp, tid: type.TypeId) bool {
+    val s: *session.Session = g.s;
+    val n: layout.Node      = describe_type(g, type.strip_secret(?s.types, tid)::u32);
+    ret n.kind == layout.NODE_SCALAR || n.kind == layout.NODE_VECTOR;
+}
+
+fun secrecy_cast_allowed_inner(g: *GenericOp, m: layout.Machine, from: type.TypeId, to: type.TypeId) bool {
+    val s: *session.Session = g.s;
+    if (!contains_secret_deep_inner(g, from) && !contains_secret_deep_inner(g, to)) { ret true; }
+
+    var scan:   type.PairScan;
+    val scan_r: err[fail.Fail] = type.pair_scan_begin(?s.types, ?scan);
+    if (sel scan_r.err) {
+        fail.internal(g.status, fail.describe(scan_r.err));
+        ret false;
+    }
+    var w: SecrecyWalk = SecrecyWalk{g: g, m: m, scan: ?scan};
+
+    val sf:      type.TypeId     = type.strip_secret(?s.types, from);
+    val st:      type.TypeId     = type.strip_secret(?s.types, to);
+    val of:      opt[*type.Type] = type.get(?s.types, sf);
+    val ot:      opt[*type.Type] = type.get(?s.types, st);
+    var allowed: bool            = false;
+    if (sel of.some) {
+        if (sel ot.some) {
+            val same: bool = type.is_secret(?s.types, from) == type.is_secret(?s.types, to);
+            if (of.some.kind == type.TYPE_POINTER && ot.some.kind == type.TYPE_POINTER) {
+                allowed = same && retype_allowed(?w, of.some.data.pointer.base, ot.some.data.pointer.base);
+            }
+            or (is_data_leaf(g, from) && is_data_leaf(g, to)) {
+                allowed = same;
+            }
+            or {
+                allowed = overlay_agrees_walk(?w, from, to);
+            }
+        }
+    }
+    type.pair_scan_end(?s.types, ?scan);
+    ret allowed;
+}
+
+fun overlay_agrees_walk(w: *SecrecyWalk, a: type.TypeId, b: type.TypeId) bool {
+    val g:  *GenericOp       = w.g;
+    val s:  *session.Session = g.s;
+    val ea: layout.Extent    = type_extent_inner(g, w.m, type.strip_secret(?s.types, a));
+    val eb: layout.Extent    = type_extent_inner(g, w.m, type.strip_secret(?s.types, b));
+    if (!ea.ok || !eb.ok) { ret false; }
+    var common: u32 = ea.size;
+    if (eb.size < common) { common = eb.size; }
+    ret agree_below(w, a, b, common);
+}
+
+# two types laid over one storage from offset 0, as union variants are: every
+# byte both cover has one class on both sides
+fun secrecy_overlay_agrees_inner(g: *GenericOp, m: layout.Machine, a: type.TypeId, b: type.TypeId) bool {
+    val s: *session.Session = g.s;
+    if (!contains_secret_deep_inner(g, a) && !contains_secret_deep_inner(g, b)) { ret true; }
+
+    var scan:   type.PairScan;
+    val scan_r: err[fail.Fail] = type.pair_scan_begin(?s.types, ?scan);
+    if (sel scan_r.err) {
+        fail.internal(g.status, fail.describe(scan_r.err));
+        ret false;
+    }
+    var w:     SecrecyWalk = SecrecyWalk{g: g, m: m, scan: ?scan};
+    val agree: bool        = overlay_agrees_walk(?w, a, b);
+    type.pair_scan_end(?s.types, ?scan);
+    ret agree;
 }
 
 rec UniInstScan {
@@ -1006,35 +1128,48 @@ fun check_uni_variants(sc: *sema.SemaContext, nom: type.TypeId, who: *type.Gener
     val fields_len: u32 = opt_tab.some.fields_len;
     if (fields_len < 2) { ret; }
 
-    val first_opt: opt[*type.FieldEntry] = type.field_at(?s.types, nom, 0);
-    if (!sel first_opt.some) {
-        report_unprovable(sc, scan, span);
-        ret;
-    }
-    val first_raw: type.TypeId = first_opt.some.ty;
-    val first:     type.TypeId = subst_or_self(g, first_raw, who, args, arg_len);
-    if (type_mentions_gparam(g, first)) { ret; }
-
-    var i: u32 = 1;
+    var i: u32 = 0;
     for (i < fields_len) {
-        val e_opt: opt[*type.FieldEntry] = type.field_at(?s.types, nom, i);
-        if (!sel e_opt.some) {
+        val vi: opt[type.TypeId] = uni_variant(g, nom, i, who, args, arg_len);
+        if (!sel vi.some) {
             report_unprovable(sc, scan, span);
             ret;
         }
-        val raw: type.TypeId = e_opt.some.ty;
-        val ty:  type.TypeId = subst_or_self(g, raw, who, args, arg_len);
-        if (type_mentions_gparam(g, ty)) { ret; }
-        val verdict: SecrecyVerdict = secrecy_structure_equal_deep_inner(g, sema.machine_of(sc), first, ty);
-        if (sel g.status.kind.internal) { ret; }
-        if (verdict == SECRECY_DIFFERS) {
-            if (sema.uni_report_mark(sc.uni_reports, key)) {
-                sema.report(sc, span, "union variants must agree on secrecy: this instantiation makes overlapping fields part secret `^` and part public, which would alias the same storage at two classifications");
+        if (type_mentions_gparam(g, vi.some)) { ret; }
+        i = i + 1;
+    }
+
+    # agreement is pairwise over the bytes each pair shares, so no variant stands in for the rest
+    i = 1;
+    for (i < fields_len) {
+        val vi: opt[type.TypeId] = uni_variant(g, nom, i, who, args, arg_len);
+        var j:  u32              = 0;
+        for (j < i) {
+            val vj: opt[type.TypeId] = uni_variant(g, nom, j, who, args, arg_len);
+            if (sel vi.some) {
+                if (sel vj.some) {
+                    val agree: bool = secrecy_overlay_agrees_inner(g, sema.machine_of(sc), vj.some, vi.some);
+                    if (sel g.status.kind.internal) { ret; }
+                    if (!agree) {
+                        if (sema.uni_report_mark(sc.uni_reports, key)) {
+                            sema.report(sc, span, "union variants must agree on secrecy: this instantiation makes overlapping fields part secret `^` and part public, which would alias the same storage at two classifications");
+                        }
+                        ret;
+                    }
+                }
             }
-            ret;
+            j = j + 1;
         }
         i = i + 1;
     }
+}
+
+fun uni_variant(g: *GenericOp, nom: type.TypeId, i: u32, who: *type.GenericOwner, args: *type.TypeId,
+    arg_len: u32) opt[type.TypeId] {
+    val s:     *session.Session      = g.s;
+    val e_opt: opt[*type.FieldEntry] = type.field_at(?s.types, nom, i);
+    if (!sel e_opt.some) { ret opt[type.TypeId].none{}; }
+    ret opt[type.TypeId].some{subst_or_self(g, e_opt.some.ty, who, args, arg_len)};
 }
 
 fun nominal_visit_key(g: *GenericOp, nom: type.TypeId, args: *type.TypeId, arg_len: u32) type.TypeId {
@@ -1627,14 +1762,26 @@ pub fun type_field_offset(s: *session.Session, m: layout.Machine, tid: type.Type
     ret res[layout.Extent, fail.Fail].ok{value};
 }
 
-pub fun secrecy_structure_equal_deep(s: *session.Session, m: layout.Machine, a: type.TypeId, b: type.TypeId) res[SecrecyVerdict, fail.Fail] {
+# whether a `::` or `:~` from `from` to `to` keeps every byte's secrecy class
+pub fun secrecy_cast_allowed(s: *session.Session, m: layout.Machine, from: type.TypeId, to: type.TypeId) res[bool, fail.Fail] {
     var status: fail.PhaseStatus = fail.accepted();
     var op:     GenericOp;
     op.s      = s;
     op.status = ?status;
-    val value: SecrecyVerdict = secrecy_structure_equal_deep_inner(?op, m, a, b);
-    if (sel status.kind.internal) { ret res[SecrecyVerdict, fail.Fail].err{fail.message(status.kind.internal)}; }
-    ret res[SecrecyVerdict, fail.Fail].ok{value};
+    val value: bool = secrecy_cast_allowed_inner(?op, m, from, to);
+    if (sel status.kind.internal) { ret res[bool, fail.Fail].err{fail.message(status.kind.internal)}; }
+    ret res[bool, fail.Fail].ok{value};
+}
+
+# whether two union variants overlaying one storage agree on every byte they share
+pub fun secrecy_overlay_agrees(s: *session.Session, m: layout.Machine, a: type.TypeId, b: type.TypeId) res[bool, fail.Fail] {
+    var status: fail.PhaseStatus = fail.accepted();
+    var op:     GenericOp;
+    op.s      = s;
+    op.status = ?status;
+    val value: bool = secrecy_overlay_agrees_inner(?op, m, a, b);
+    if (sel status.kind.internal) { ret res[bool, fail.Fail].err{fail.message(status.kind.internal)}; }
+    ret res[bool, fail.Fail].ok{value};
 }
 
 pub fun module_reaches_secret(s: *session.Session, resolved: *type.TypeId, len: u32) res[bool, fail.Fail] {
