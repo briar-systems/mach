@@ -4,6 +4,7 @@ use std.collections.vector;
 use std.collections.vector.Vector;
 use fs: std.filesystem;
 use std.print;
+use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -13,6 +14,8 @@ use std.types.path;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_contains;
+use std.types.string.str_empty;
 use std.types.string.str_len;
 
 use A: std.allocator;
@@ -25,7 +28,8 @@ use mach.lang.build.emit;
 use mach.lang.build.outcome;
 use mach.lang.build.plan;
 use mach.lang.driver;
-use dq: mach.lang.driver.query;
+use persistent: mach.lang.driver.cache;
+use dq:         mach.lang.driver.query;
 use mach.lang.fail;
 use mach.lang.intern;
 use mach.lang.manifest;
@@ -99,8 +103,6 @@ pub fun collect_scope(p: *driver.Project, col: testrunner.Collected, sc: *TestSc
         ret err[outcome.Fail].err{outcome.user("no 'test' declarations found (add 'test name { ... }' blocks)")};
     }
 
-    val include_deps: bool = p.req.include_deps;
-
     val res_sel: res[*testrunner.Test, A.Error] = A.allocate[testrunner.Test](p.alloc, sc.col.count::usize);
     if (sel res_sel.err) {
         free_scope(p, sc);
@@ -109,7 +111,7 @@ pub fun collect_scope(p: *driver.Project, col: testrunner.Collected, sc: *TestSc
     sc.pick = res_sel.ok;
     var i: u32 = 0;
     for (i < sc.col.count) {
-        if (test_selected(p, ?sc.col.tests[i], include_deps)) {
+        if (test_selected(p, ?sc.col.tests[i])) {
             sc.pick[sc.sel_len] = sc.col.tests[i];
             sc.sel_len          = sc.sel_len + 1;
         }
@@ -141,9 +143,14 @@ pub fun record_tests(p: *driver.Project, sc: *TestScope, exe: *u8,
     ret err[outcome.Fail].ok{};
 }
 
-fun test_selected(p: *driver.Project, t: *testrunner.Test, include_deps: bool) bool {
-    if (include_deps) { ret true; }
-    ret test_in_project(p, t);
+# a run selects the project's own tests, or its dependencies' too under
+# `--include-deps`, whose qualified name contains the filter
+fun test_selected(p: *driver.Project, t: *testrunner.Test) bool {
+    if (!p.req.include_deps && !test_in_project(p, t)) { ret false; }
+    if (str_empty(p.req.test_filter))                  { ret true; }
+    val name: opt[str] = intern.lookup(?p.s.interner, t.name);
+    if (sel name.none) { ret false; }
+    ret str_contains(name.some, p.req.test_filter);
 }
 
 fun test_in_project(p: *driver.Project, t: *testrunner.Test) bool {
@@ -152,34 +159,18 @@ fun test_in_project(p: *driver.Project, t: *testrunner.Test) bool {
     ret driver.module_in_current_project(p, m.fqn);
 }
 
+# what the dispatcher links beside the build's images: the external objects and
+# the dynamic libraries the artifact names
 pub rec DispatchInputs {
-    shared:     **u8;
-    shared_len: u32;
-    borrowed:   u32;
+    ext_paths:  **u8;
+    ext_len:    u32;
     dynlibs:    *of.DynLib;
     dynlib_len: u32;
 }
 
-pub fun collect_dispatch_inputs(p: *driver.Project, unit: *plan.BuildUnit,
-    obj_paths: **u8) res[DispatchInputs, outcome.Fail] {
-    var di: DispatchInputs;
-    di.shared     = nil;
-    di.shared_len = 0;
-    di.borrowed   = p.emit_len;
-    di.dynlibs    = nil;
-    di.dynlib_len = 0;
-
-    val res_sh: res[**u8, A.Error] = A.allocate[*u8](p.alloc, di.borrowed::usize);
-    if (sel res_sh.err) { ret res[DispatchInputs, outcome.Fail].err{outcome.refused(res_sh.err)}; }
-    di.shared = res_sh.ok;
-    var i: u32 = 0;
-    for (i < di.borrowed) {
-        di.shared[i] = obj_paths[i];
-        i            = i + 1;
-    }
-    di.shared_len = di.borrowed;
-
-    val ec: err[outcome.Fail] = emit.append_external_inputs(p, unit, ?di.shared, ?di.shared_len, ?di.dynlibs, ?di.dynlib_len);
+pub fun collect_dispatch_inputs(p: *driver.Project, unit: *plan.BuildUnit) res[DispatchInputs, outcome.Fail] {
+    var di: DispatchInputs    = DispatchInputs{};
+    val ec: err[outcome.Fail] = emit.append_external_inputs(p, unit, ?di.ext_paths, ?di.ext_len, ?di.dynlibs, ?di.dynlib_len);
     if (sel ec.err) {
         free_dispatch_inputs(p, ?di);
         ret res[DispatchInputs, outcome.Fail].err{ec.err};
@@ -188,26 +179,25 @@ pub fun collect_dispatch_inputs(p: *driver.Project, unit: *plan.BuildUnit,
 }
 
 pub fun free_dispatch_inputs(p: *driver.Project, di: *DispatchInputs) {
-    free_shared(p, di.shared, di.shared_len, di.borrowed);
+    emit.free_paths(p.alloc, di.ext_paths, di.ext_len, di.ext_len);
     emit.free_dynlibs(p.alloc, di.dynlibs, di.dynlib_len);
-    di.shared     = nil;
-    di.shared_len = 0;
-    di.dynlibs    = nil;
-    di.dynlib_len = 0;
+    @di = DispatchInputs{};
 }
 
-pub fun link_dispatcher(p: *driver.Project, unit: *plan.BuildUnit, sc: *TestScope,
-    di: *DispatchInputs, dispatcher: str,
-    artifact: str) err[outcome.Fail] {
+# synthesize the dispatcher over the selected tests, write it to `dispatcher`, and
+# link it with the test objects and the normal objects into `artifact`. the images
+# are compiler-produced, so the link keeps only what the selected tests reach
+# ---
+# modules: the build's current images: normal and test objects in topological order
+pub fun link_dispatcher(p: *driver.Project, sc: *TestScope, di: *DispatchInputs,
+    modules: *of.ObjectImage, module_len: u32, dispatcher: str, artifact: str) err[outcome.Fail] {
     val te: *driver.TargetEntry = p.target_entry;
     if (te == nil) {
         ret err[outcome.Fail].err{outcome.internal("no target selected")};
     }
-
-    val shared:     **u8       = di.shared;
-    val shared_len: u32        = di.shared_len;
-    val dynlibs:    *of.DynLib = di.dynlibs;
-    val dynlib_len: u32        = di.dynlib_len;
+    if (!p.target.of.links_from_image) {
+        ret err[outcome.Fail].err{outcome.user("this target's object format does not link from compiled images, so it cannot build tests")};
+    }
 
     var scratch_backing: A.Allocator;
     val make_r:          err[A.Error] = page.make(?scratch_backing);
@@ -230,8 +220,7 @@ pub fun link_dispatcher(p: *driver.Project, unit: *plan.BuildUnit, sc: *TestScop
 
     p.s.alloc = ?scratch_alloc;
     val result: err[outcome.Fail] = build_dispatch_executable(p, dispatcher, artifact,
-        sc.pick, sc.sel_len, shared, shared_len,
-        dynlibs, dynlib_len);
+        sc.pick, sc.sel_len, modules, module_len, di);
     p.s.alloc = persistent;
     arena.dnit(?scratch_ar);
     ret result;
@@ -260,22 +249,9 @@ fun scope_name(p: *driver.Project, id: intern.StrId) *u8 {
     ret ""::*u8;
 }
 
-fun free_shared(p: *driver.Project, shared: **u8, shared_len: u32, borrowed: u32) {
-    if (shared == nil) { ret; }
-    var i: u32 = borrowed;
-    for (i < shared_len) {
-        if (shared[i] != nil) {
-            A.deallocate[u8](p.alloc, shared[i], (str_len(shared[i]::str) + 1)::usize);
-        }
-        i = i + 1;
-    }
-    A.deallocate[*u8](p.alloc, shared, shared_len::usize);
-}
-
 fun build_dispatch_executable(p: *driver.Project, dispatcher: str, artifact: str,
     pick: *testrunner.Test, sel_len: u32,
-    shared: **u8, shared_len: u32,
-    dynlibs: *of.DynLib, dynlib_len: u32) err[outcome.Fail] {
+    modules: *of.ObjectImage, module_len: u32, di: *DispatchInputs) err[outcome.Fail] {
     val res_synth: res[ir.Module, fail.Fail] = testrunner.synthesize_dispatcher(p.s, pick, sel_len);
     if (sel res_synth.err) {
         ret err[outcome.Fail].err{outcome.from_fail(res_synth.err)};
@@ -305,48 +281,66 @@ fun build_dispatch_executable(p: *driver.Project, dispatcher: str, artifact: str
     }
 
     val res_codegen: res[of.ObjectImage, fail.Fail] = codegen.codegen_unit(p.s, ?p.target, ?entry_ir, cgunit.ir_set_empty(), nil, p.req.placement_policy, dbg_r.ok, ?p.diags);
+    ir.dnit(?entry_ir);
     if (sel res_codegen.err) {
-        ir.dnit(?entry_ir);
         ret err[outcome.Fail].err{outcome.from_fail(res_codegen.err)};
     }
     var entry_img: of.ObjectImage = res_codegen.ok;
+    fin { obj.dnit(?entry_img); }
 
-    val entry_path: str            = dispatcher;
-    val res_emit:   err[fail.Fail] = obj.emit_image(?entry_img, ?p.target, dispatcher);
-    obj.dnit(?entry_img);
-    ir.dnit(?entry_ir);
+    val res_emit: err[fail.Fail] = obj.emit_image(?entry_img, ?p.target, dispatcher);
     if (sel res_emit.err) {
         ret err[outcome.Fail].err{outcome.user_fail(res_emit.err)};
     }
 
-    ret link_one_test(p, shared, shared_len, dynlibs, dynlib_len, entry_path, artifact);
-}
-
-fun link_one_test(p: *driver.Project, shared: **u8, shared_len: u32,
-    dynlibs: *of.DynLib, dynlib_len: u32,
-    entry_path: *u8, artifact: str) err[outcome.Fail] {
-    val total:     u32                = shared_len + 1;
-    val res_paths: res[**u8, A.Error] = A.allocate[*u8](p.alloc, total::usize);
-    if (sel res_paths.err) { ret err[outcome.Fail].err{outcome.refused(res_paths.err)}; }
-    val paths: **u8 = res_paths.ok;
-
-    val per_module: u32 = p.emit_len;
-    var i:          u32 = 0;
-    for (i < per_module) {
-        paths[i] = shared[i];
-        i        = i + 1;
+    val total:     u32                           = module_len + 1;
+    val res_image: res[*of.ObjectImage, A.Error] = A.allocate[of.ObjectImage](p.s.alloc, total::usize);
+    if (sel res_image.err) { ret err[outcome.Fail].err{outcome.refused(res_image.err)}; }
+    val images: *of.ObjectImage = res_image.ok;
+    images[0] = entry_img;
+    var i: u32 = 0;
+    for (i < module_len) {
+        images[i + 1] = modules[i];
+        i             = i + 1;
     }
-    paths[per_module] = entry_path;
-    var j: u32 = per_module;
-    for (j < shared_len) {
-        paths[j + 1] = shared[j];
-        j            = j + 1;
-    }
+    val yielded: err[outcome.Fail] = yield_main(p, ?images[1], module_len);
+    if (sel yielded.err) { ret yielded; }
 
-    val res_link: err[fail.Fail] = linker.link(p.s, ?p.target, paths, total, dynlibs, dynlib_len, artifact, emit.artifact_product_name(p), linker.LINK_EXE, p.req.pie, of.image_options_default(p.req.subsystem));
-    A.deallocate[*u8](p.alloc, paths, total::usize);
+    val res_link: err[fail.Fail] = linker.link_mixed(p.s, ?p.target, images, total, di.ext_paths, di.ext_len,
+        di.dynlibs, di.dynlib_len, artifact, emit.artifact_product_name(p), linker.LINK_EXE, p.req.pie,
+        of.image_options_default(p.req.subsystem));
     if (sel res_link.err) {
         ret err[outcome.Fail].err{outcome.from_fail(res_link.err)};
+    }
+    ret err[outcome.Fail].ok{};
+}
+
+# the dispatcher is the test executable's `main`: an artifact's own `main` yields to
+# it as a weak definition, so the normal object that defines it links unchanged. the
+# yielding image's symbols are copied, never the build's own
+fun yield_main(p: *driver.Project, images: *of.ObjectImage, count: u32) err[outcome.Fail] {
+    val named: res[intern.StrId, A.Error] = intern.intern(?p.s.interner, testrunner.MAIN_LINKAGE);
+    if (sel named.err) { ret err[outcome.Fail].err{outcome.refused(named.err)}; }
+    var i: u32 = 0;
+    for (i < count) {
+        val img: *of.ObjectImage = ?images[i];
+        var sy:  u32             = 0;
+        for (sy < img.symbol_count) {
+            val sym: *of.Symbol = ?img.symbols[sy];
+            if (sym.name == named.ok && !of.section_is_external(sym.section) && (sym.flags & of.SYM_OBJ_FLAG_WEAK) == 0) {
+                val copied: res[*of.Symbol, A.Error] = A.allocate[of.Symbol](p.s.alloc, img.symbol_count::usize);
+                if (sel copied.err) { ret err[outcome.Fail].err{outcome.refused(copied.err)}; }
+                var k: u32 = 0;
+                for (k < img.symbol_count) {
+                    copied.ok[k] = img.symbols[k];
+                    k            = k + 1;
+                }
+                copied.ok[sy].flags = copied.ok[sy].flags | of.SYM_OBJ_FLAG_WEAK;
+                img.symbols         = copied.ok;
+            }
+            sy = sy + 1;
+        }
+        i = i + 1;
     }
     ret err[outcome.Fail].ok{};
 }
@@ -357,9 +351,17 @@ fun record_test(p: *driver.Project, t: *testrunner.Test, exe: *u8, idx: u32,
     var name:     str      = "<test>";
     if (sel opt_name.some) { name = opt_name.some; }
 
-    val rec_r: err[A.Error] = outcome.record_test(bo,
-        test_module_fqn(p, t.mod_idx)::str, name, test_source_path(p, t.mod_idx)::str,
-        t.line, exe::str, idx);
+    var object: *u8 = nil;
+    if (t.mod_idx < driver.module_count(p)) {
+        val located: res[str, fail.Fail] = persistent.test_object_path(p, driver.module_at(p, t.mod_idx), p.alloc);
+        if (sel located.err) { ret err[outcome.Fail].err{outcome.from_fail(located.err)}; }
+        object = located.ok::*u8;
+    }
+    val rec_r: err[A.Error] = outcome.record_test(bo, outcome.TestArtifact{
+        module: test_module_fqn(p, t.mod_idx), name: name::*u8, file: test_source_path(p, t.mod_idx),
+        line:   t.line, object: object, exe: exe, idx: idx
+    });
+    if (object != nil) { str_free(p.alloc, object::str); }
     if (sel rec_r.err) { ret err[outcome.Fail].err{outcome.refused(rec_r.err)}; }
     ret err[outcome.Fail].ok{};
 }

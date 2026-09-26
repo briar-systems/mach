@@ -121,6 +121,16 @@ destinations: *str, paths_out: ***u8) err[outcome.Fail];
 every module's object reaches `obj/` through a sibling temporary, since the
 object cache reads it back; a module the cache restored is already there
 
+## fun write_test_objects
+
+```mach
+pub fun write_test_objects(p: *driver.Project, destinations: *str) err[outcome.Fail];
+```
+
+each test object reaches `obj/` beside its module's object, the same way
+
+destinations: per emitted module, its test object's path, nil for a module without one
+
 ## fun free_paths
 
 ```mach

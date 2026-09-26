@@ -54,6 +54,14 @@ pub val PH_LINK:     u8 = 7
 pub val PH_CACHE:    u8 = 8
 ```
 
+## val PH_TEST
+
+```mach
+pub val PH_TEST: u8 = 9
+```
+
+a test build's test objects, lowered and generated
+
 ## val LEVEL_PHASES
 
 ```mach

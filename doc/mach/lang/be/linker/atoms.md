@@ -119,9 +119,3 @@ atoms: *AtomPlan) bool;
 
 a live relocation loads the symbol's address from a GOT slot
 
-## fun lt_isa
-
-```mach
-pub fun lt_isa(reg: *target.TargetRegistry, name: str) *isa.IsaVTable;
-```
-

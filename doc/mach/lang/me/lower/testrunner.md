@@ -40,17 +40,25 @@ pub fun collect(s: *session.Session, modules: *ir.Module, count: u32) res[Collec
 pub fun free(s: *session.Session, c: *Collected);
 ```
 
-## fun main_linkage_id
+## val MAIN_LINKAGE
 
 ```mach
-pub fun main_linkage_id(s: *session.Session) res[intern.StrId, fail.Fail];
+pub val MAIN_LINKAGE: str = "main"
 ```
 
-## fun neutralize_main
+the dispatcher's entry: the name the runtime's start routine calls
+
+## fun declares_tests
 
 ```mach
-pub fun neutralize_main(main_id: intern.StrId, mod: *ir.Module);
+pub fun declares_tests(a: *ast.Ast, text: str) bool;
 ```
+
+the module has a test object: its source declares a test or a `#[testing]`
+declaration, in any comptime branch
+
+a: the module's parsed tree
+text: the module's source text, which decorator names are spans of
 
 ## val TEST_STATUS_WIDE
 
