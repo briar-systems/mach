@@ -3,7 +3,6 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
-use std.types.string.str;
 
 use mach.lang.be.codegen.mir;
 use mach.lang.target.abi;
@@ -54,11 +53,21 @@ pub fun classify_arg(index: i32, size: u64, align: u64,
     is_float: bool, fp_eightbytes: u8, is_aggregate: bool, is_vector: bool,
     gp_used: i32, fp_used: i32, hfa_members: u8, hfa_elem: u8,
     agg: abi.AggLayout) abi.ParamSlot {
+    # an empty record takes no register and no stack: clang ignores one in C on
+    # linux, and Apple's arm64 ABI lets a function ignore it (#3930)
+    if (is_aggregate && size == 0) {
+        ret abi.make_slot(abi.CLASS_GP, -1, 0, 0, 0);
+    }
+
+    # C.3: an HFA or HVA that does not fit the vector registers left sets NSRN
+    # to 8, so no later floating-point argument takes one (#3928)
     if (is_aggregate && hfa_members > 0) {
         if (fp_used + hfa_members::i32 <= FP_PARAM_COUNT) {
             ret abi.make_slot_hfa(fp_param_reg(fp_used), hfa_members, hfa_elem, size);
         }
-        ret abi.make_slot(abi.CLASS_STACK, -1, 0, size, 0);
+        var hs: abi.ParamSlot = abi.make_slot(abi.CLASS_STACK, -1, 0, size, 0);
+        hs.fp_consumed = remaining(FP_PARAM_COUNT, fp_used);
+        ret hs;
     }
 
     if (is_aggregate && size > MAX_REG_RET) {
@@ -75,10 +84,21 @@ pub fun classify_arg(index: i32, size: u64, align: u64,
             }
             ret abi.make_slot(abi.CLASS_STACK, -1, 0, size, 0);
         }
-        if (gp_used + 2 <= GP_PARAM_COUNT) {
-            ret abi.make_slot_pair(abi.CLASS_GP, gp_param_reg(gp_used), gp_param_reg(gp_used + 1), 0, size, WORD);
+        # C.12: a composite of alignment 16 rounds NGRN up to even, as a 16-byte
+        # integer does. its alignment is the natural one, which darwin caps at 8
+        # (#3922, #3929)
+        var ngrn: i32 = gp_used;
+        if (align >= DOUBLE_WORD && (ngrn & 1) != 0) { ngrn = ngrn + 1; }
+        if (ngrn + 2 <= GP_PARAM_COUNT) {
+            var ps: abi.ParamSlot = abi.make_slot_pair(abi.CLASS_GP, gp_param_reg(ngrn), gp_param_reg(ngrn + 1), 0, size, WORD);
+            ps.gp_consumed = ngrn + 2 - gp_used;
+            ret ps;
         }
-        ret abi.make_slot(abi.CLASS_STACK, -1, 0, size, 0);
+        # C.13: a composite that does not fit the general registers left sets
+        # NGRN to 8, so no later integer argument takes one (#3928)
+        var cs: abi.ParamSlot = abi.make_slot(abi.CLASS_STACK, -1, 0, size, 0);
+        cs.gp_consumed = remaining(GP_PARAM_COUNT, gp_used);
+        ret cs;
     }
 
     if (is_vector) {
@@ -110,7 +130,7 @@ pub fun classify_arg(index: i32, size: u64, align: u64,
             ret s;
         }
         var st: abi.ParamSlot = abi.make_slot(abi.CLASS_STACK, -1, 0, size, 0);
-        st.gp_consumed = GP_PARAM_COUNT - gp_used;
+        st.gp_consumed = remaining(GP_PARAM_COUNT, gp_used);
         ret st;
     }
 
@@ -118,6 +138,11 @@ pub fun classify_arg(index: i32, size: u64, align: u64,
         ret abi.make_slot(abi.CLASS_GP, gp_param_reg(gp_used), 0, size, 8);
     }
     ret abi.make_slot(abi.CLASS_STACK, -1, 0, size, 0);
+}
+
+fun remaining(count: i32, used: i32) i32 {
+    if (used >= count) { ret 0; }
+    ret count - used;
 }
 
 pub fun classify_return(size: u64, align: u64,
@@ -205,6 +230,7 @@ pub fun register(reg: *abi.AbiRegistry) err[fail.Fail] {
         consumes_agg_layout, fp_callee_saved_full_vector,
         float_arg_bits, WORD,
         va_model);
+    aapcs64_vtable.agg_natural_align = true;
 
     ret abi.register(reg, ?aapcs64_vtable);
 }
@@ -239,8 +265,9 @@ test classify_arg__integer_aggregates {
 
 # C.10: a 16-byte integer rounds NGRN to even and rides the next pair; C.11:
 # with fewer than two registers left it exhausts them and goes to the stack.
-# a 16-byte composite (C.12) does not round (#3511). at alignment 8 (darwin)
-# the pair starts in the next register and C.11 still holds (#3922)
+# a 16-byte composite of alignment 8 (C.12) does not round (#3511). at
+# alignment 8 (darwin) the pair starts in the next register and C.11 still
+# holds (#3922)
 test classify_arg__int128_even_pair_or_exhausts_registers {
     val a: abi.ParamSlot = classify_arg(0, 16, 16, false, 0, false, false, 0, 0, 0, 0, abi.agg_none());
     if (a.class != abi.CLASS_GP || a.piece_count != 2 || a.gp_consumed != 2)   { ret 1; }
@@ -267,6 +294,50 @@ test classify_arg__int128_even_pair_or_exhausts_registers {
     if (r.class != abi.CLASS_GP || r.piece_count != 2)                         { ret 11; }
     if (mir.preg_regid(r.pieces[0].reg) != REG_X0 || r.pieces[0].src_off != 0) { ret 12; }
     if (mir.preg_regid(r.pieces[1].reg) != REG_X1 || r.pieces[1].src_off != 8) { ret 13; }
+    ret 0;
+}
+
+# C.13 and C.3: a composite or HFA that spills gives the rest of its bank to
+# nothing, and the other bank is untouched (#3928)
+test classify_arg__spilled_aggregate_exhausts_its_bank {
+    val s: abi.ParamSlot = classify_arg(7, 12, 8, false, 0, true, false, 7, 0, 0, 0, abi.agg_none());
+    if (s.class != abi.CLASS_STACK || s.gp_consumed != 1 || s.fp_consumed != 0) { ret 1; }
+    val f: abi.ParamSlot = classify_arg(8, 8, 8, false, 0, false, false, 8, 0, 0, 0, abi.agg_none());
+    if (f.class != abi.CLASS_STACK) { ret 2; }
+    val h: abi.ParamSlot = classify_arg(6, 24, 8, false, 0, true, false, 0, 6, 3, 8, abi.agg_none());
+    if (h.class != abi.CLASS_STACK || h.fp_consumed != 2 || h.gp_consumed != 0) { ret 3; }
+    val g: abi.ParamSlot = classify_arg(0, 8, 4, false, 0, true, false, 0, 7, 2, 4, abi.agg_none());
+    if (g.class != abi.CLASS_STACK || g.fp_consumed != 1) { ret 4; }
+    val full: abi.ParamSlot = classify_arg(8, 12, 8, false, 0, true, false, 8, 8, 0, 0, abi.agg_none());
+    if (full.gp_consumed != 0 || full.fp_consumed != 0) { ret 5; }
+    val fits: abi.ParamSlot = classify_arg(6, 12, 8, false, 0, true, false, 6, 0, 0, 0, abi.agg_none());
+    if (fits.class != abi.CLASS_GP || fits.gp_consumed != 2) { ret 6; }
+    ret 0;
+}
+
+# C.12: a composite of natural alignment 16 rounds NGRN to even like a 16-byte
+# integer, and one that then does not fit exhausts the registers (#3929)
+test classify_arg__aligned_composite_even_pair {
+    val a: abi.ParamSlot = classify_arg(1, 16, 16, false, 0, true, false, 1, 0, 0, 0, abi.agg_none());
+    if (a.class != abi.CLASS_GP || a.gp_consumed != 3)                                { ret 1; }
+    if (mir.preg_regid(a.pieces[0].reg) != 2 || mir.preg_regid(a.pieces[1].reg) != 3) { ret 2; }
+    val b: abi.ParamSlot = classify_arg(2, 16, 16, false, 0, true, false, 2, 0, 0, 0, abi.agg_none());
+    if (b.gp_consumed != 2 || mir.preg_regid(b.pieces[0].reg) != 2) { ret 3; }
+    val c: abi.ParamSlot = classify_arg(7, 16, 16, false, 0, true, false, 7, 0, 0, 0, abi.agg_none());
+    if (c.class != abi.CLASS_STACK || c.gp_consumed != 1) { ret 4; }
+    val d: abi.ParamSlot = classify_arg(1, 16, 8, false, 0, true, false, 1, 0, 0, 0, abi.agg_none());
+    if (d.gp_consumed != 2 || mir.preg_regid(d.pieces[0].reg) != 1) { ret 5; }
+    ret 0;
+}
+
+# an empty record rides no register and no stack, and takes none from either
+# bank (#3930)
+test classify_arg__empty_record_takes_nothing {
+    val e: abi.ParamSlot = classify_arg(1, 0, 1, false, 0, true, false, 1, 0, 0, 0, abi.agg_none());
+    if (e.class != abi.CLASS_GP || e.piece_count != 0) { ret 1; }
+    if (e.gp_consumed != 0 || e.fp_consumed != 0)      { ret 2; }
+    val f: abi.ParamSlot = classify_arg(9, 0, 1, false, 0, true, false, 8, 8, 0, 0, abi.agg_none());
+    if (f.class != abi.CLASS_GP || f.piece_count != 0) { ret 3; }
     ret 0;
 }
 

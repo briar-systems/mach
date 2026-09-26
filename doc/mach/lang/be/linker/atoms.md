@@ -60,7 +60,7 @@ pub fun copy_live_section(dst: *u8, src: *u8, src_len: u32, plan: *AtomPlan, sec
 
 ```mach
 pub fun build_atom_plan(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
-codegen_count: u32, sec_base: *u32, sec_total: u32, enabled: bool,
+sec_base: *u32, sec_total: u32, enabled: bool,
 roots: *LinkRoots, arch: *isa.IsaVTable, plan: *AtomPlan) err[fail.Fail];
 ```
 
