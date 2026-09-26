@@ -121,6 +121,33 @@ included, is an unknown-key error (`mach.toml: unknown key 'name' in
 likewise carries no `emit_ir` or `emit_asm`: emission is `--emit-ir`/`--emit-asm`
 on the command line.
 
+### The output directory
+
+Everything a build and its cache write lands under the expanded `out`, in one
+layout:
+
+| Path | Holds |
+| --- | --- |
+| `obj/` | one object per module, each carrying its cache key; it is the [object cache](#stepname--build-steps) and is read by developers and tooling too |
+| `ir/`, `asm/` | the human-readable views `--emit-ir` and `--emit-asm` write |
+| `.cache/` | compiler-only state, read and written by nothing but the compiler |
+| `.cache/steps/` | one fingerprint stamp per [build step](#stepname--build-steps) |
+| `.stage/` | build step scratch space, one directory per step, reset before the step runs |
+| `test/<artifact>/dispatch.o` | the test dispatcher object of a tested artifact |
+| `test/<artifact>/<artifact>` | the test dispatcher executable |
+| `test/<artifact>/log/` | a failing test's captured output |
+| `dep/<id>/` | a dependency's artifact outputs (see [Dependency requirements travel](#dependency-requirements-travel)) |
+
+Test objects sit in `obj/` beside the module objects, as
+`obj/<project>/<module>.test.o`. Artifact outputs go wherever their own `out`
+names under the directory.
+
+`mach clean` removes `obj/`, `ir/`, `asm/`, `.cache/`, `.stage/`, `test/` and
+`dep/` along with every artifact output, for every declared target and profile,
+so the build after it is a cold one that reuses nothing. A step output may not
+name a path inside `obj/<project.id>/`, `.cache/` or `.stage/` (see
+[build steps](#stepname--build-steps)).
+
 ### Compiler range
 
 `mach` states which compilers a project builds with, and every command that
@@ -1114,6 +1141,14 @@ A step is cached by content: its declared inputs, resolved executable, expanded
 arguments, and effective environment contribute to its fingerprint. An unchanged
 step whose outputs still exist is skipped. Changing an inherited environment
 value received by the child also invalidates the step.
+
+The fingerprint of the last successful run is kept as a stamp in
+`{project.out}/.cache/steps/`, and a step's outputs under `{project.out}` are
+written into scratch space in `{project.out}/.stage/<name>/` and published only
+once the step succeeds. Both belong
+to the compiler: a declared `out` inside `{project.out}/.cache/` or
+`{project.out}/.stage/` fails at manifest load, naming the step and the path.
+`mach clean` removes both, so the next build runs every demanded step again.
 
 **Bounding a step.** `timeout_seconds` gives the step a deadline measured from
 the moment it is spawned. When the deadline passes, the step's whole process

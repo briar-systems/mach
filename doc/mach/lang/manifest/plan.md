@@ -62,6 +62,8 @@ ir_root: `<expanded project out>/ir`
 asm_root: `<expanded project out>/asm`
 test_root: `<expanded project out>/test/{name}`, with `{name}` left literal for
                the test runner to fill
+cache_root: `<expanded project out>/.cache`, the compiler-only state
+stage_root: `<expanded project out>/.stage`, the build step scratch space
 opt: from the resolved profile
 debug: from the resolved profile
 simd: from the resolved profile
@@ -99,6 +101,32 @@ pub val DEPENDENCY_ARTIFACT_DIR: str = "dep"
 
 the directory under the expanded root `[project].out` that holds a dependency's
 artifact outputs, one subdirectory per dependency id
+
+## val CACHE_DIR
+
+```mach
+pub val CACHE_DIR: str = ".cache"
+```
+
+the directory under the expanded `[project].out` that holds compiler-only state:
+nothing but the compiler reads or writes it, and a step output may not name it
+
+## val STEP_STAMP_DIR
+
+```mach
+pub val STEP_STAMP_DIR: str = ".cache/steps"
+```
+
+the directory under `CACHE_DIR` that holds one fingerprint stamp per build step
+
+## val STAGE_DIR
+
+```mach
+pub val STAGE_DIR: str = ".stage"
+```
+
+the directory under the expanded `[project].out` that holds build step scratch
+space, one subdirectory per step, reset before the step runs
 
 ## fun root_scope
 
