@@ -190,6 +190,12 @@ pub val ASM_NOTE_BYTES_WIDTH: usize = notes.ASM_NOTE_BYTES_WIDTH
 pub val NOTE_SEED_MAX: u32 = notes.NOTE_SEED_MAX
 ```
 
+## val NOTE_NO_LANDING
+
+```mach
+pub val NOTE_NO_LANDING: u32 = notes.NOTE_NO_LANDING
+```
+
 ## fun sink_init
 
 ```mach
@@ -240,6 +246,15 @@ pub fun note_at(buf: *ByteBuf, idx: u32) *AsmNote;
 ```mach
 pub fun note_index_at(buf: *ByteBuf, off: u32) i32;
 ```
+
+## fun note_set_landing
+
+```mach
+pub fun note_set_landing(buf: *ByteBuf, first: u32, pos: u32, target: u32);
+```
+
+the instruction note from `first` on whose bytes hold `pos` lands on the
+text offset `target`
 
 ## fun notes_reset
 
