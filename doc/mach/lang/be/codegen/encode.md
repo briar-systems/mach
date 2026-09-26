@@ -471,6 +471,15 @@ pub fun push_frame_step(st: *EncodeState, kind: u8, reg: u8, end_off: u32, value
 pub fun push_reloc(st: *EncodeState, offset: u32, kind: of.RelocKind, sym: intern.StrId, addend: i64) err[fail.Fail];
 ```
 
+## fun push_inst_reloc
+
+```mach
+pub fun push_inst_reloc(st: *EncodeState, offset: u32, kind: of.RelocKind, sym: intern.StrId, addend: i64,
+inst_end: u8) err[fail.Fail];
+```
+
+a relocation whose field starts inst_end bytes before its instruction ends
+
 ## fun bind_reloc_pair
 
 ```mach
