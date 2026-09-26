@@ -94,6 +94,36 @@ fresh generation.
 the C reference, and `bash test/run.sh --link` the link cases; see
 [test/README.md](test/README.md).
 
+### Test policy
+
+A change does not need a test of its own. A unit test exists only if it:
+
+- covers a unique surface, duplicating no other test
+- covers functionality critical to correctness that cannot be allowed to break
+- is deterministic, never depending on timing or performance
+- is valuable to check automatically
+- covers logic that is not blatantly simple
+- checks correctness
+- is no more complicated than the code it tests, unless that is unavoidable
+- does not pin a problem that no longer exists
+
+Coverage means branches and known failure points, not volume. `str_len` gets
+the inputs that exercise each of its branches, not a pile of strings, and a
+parser's tests cover its surface concisely, not exhaustively.
+
+Inline tests are small and sit in their module for convenience or because they
+need private access. A test lives outside the module it covers to declutter it,
+because the test is significant, or, most often, because it exercises several
+modules together.
+
+Regression tests are a separate kind, and rare: they are kept only for
+regressions that are easy to reintroduce, and are named `regression__*`. They
+may sit next to unit tests. The name is a convention, not a mechanism.
+
+Codegen corpus cases and link cases get the same scrutiny, scoped to what
+cannot be tested inside the compiler: the final codegen and link result on
+disk.
+
 
 ## Branching
 
