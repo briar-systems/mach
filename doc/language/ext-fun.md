@@ -20,7 +20,7 @@ ext fun NAME(args) RET;
 ```mach
 pub ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 
-ext fun strlen(s: *u8) i64;             # private, file-local
+ext fun strlen(s: *u8) i64; # private, file-local
 ```
 
 ## C-variadic imports
@@ -348,7 +348,8 @@ under the renamed symbol within the named library.
 
 ```mach
 # imported as `socket` from ws2_32.dll, called as `ws2_socket` in Mach
-#[library("ws2_32.dll")] #[symbol("socket")]
+#[library("ws2_32.dll")]
+#[symbol("socket")]
 ext fun ws2_socket(af: i32, kind: i32, proto: i32) i64;
 ```
 

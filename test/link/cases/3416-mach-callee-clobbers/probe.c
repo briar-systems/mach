@@ -15,13 +15,21 @@
 struct wide { long long a, b, c, d; };
 struct pair { long long a, b; };
 
+/* a mach #[symbol] name is the literal object symbol, and darwin's C compiler
+ * prefixes an underscore to every C name, so the label makes C ask for the literal one */
+#ifdef __APPLE__
+#define MACH_SYM(name) __asm__(#name)
+#else
+#define MACH_SYM(name)
+#endif
+
 /* 32 bytes: the address of a caller-allocated copy under AAPCS64, the RISC-V psABI
  * and the Microsoft convention; the outgoing stack area under System V. */
-extern long long m_clobber_wide(struct wide w);
+extern long long m_clobber_wide(struct wide w) MACH_SYM(m_clobber_wide);
 
 /* 16 bytes: two registers under AAPCS64, System V and lp64d, and by reference under
  * the Microsoft convention. */
-extern long long m_clobber_pair(struct pair p);
+extern long long m_clobber_pair(struct pair p) MACH_SYM(m_clobber_pair);
 
 /* fills out[0..12) with each call's return and the caller's own fields after it */
 long long c_drives_mach(long long *out) {

@@ -88,15 +88,6 @@ pub fun widening_packs(m: *ir.Module, tgt: *target.Target, kind: instruction.Ins
 whether a widening multiply of two `from_ty` vectors into `ty` is a cell the
 target packs at these lanes; the catalog is the only judge
 
-## fun widen_half_of
-
-```mach
-pub fun widen_half_of(ext: instruction.InstrKind) opt[instruction.InstrKind];
-```
-
-the lane-halving extension that a vector literal of lane-wise extensions of
-`ext` kind fuses into; absent for any other extension
-
 ## fun widen_half_packs
 
 ```mach

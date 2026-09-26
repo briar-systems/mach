@@ -1506,6 +1506,17 @@ pub fun covers_isa(vt: *OfVTable, arch_id: u32) bool;
 pub fun abs_kind_for_pointer_width(w: u32) res[RelocKind, fail.Fail];
 ```
 
+## fun addend_fits_field
+
+```mach
+pub fun addend_fits_field(addend: i64, width: usize, pc_relative: bool) bool;
+```
+
+an addend a format stores in the relocated field itself fits that field of
+`width` bytes: signed for a pc-relative field, signed or unsigned for an
+absolute one. a writer refuses one that does not rather than keep its low
+bits (#3907)
+
 ## fun is_pointer_abs_kind
 
 ```mach

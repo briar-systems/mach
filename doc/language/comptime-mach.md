@@ -60,7 +60,8 @@ list:
 ```mach
 $if ($mach.build.ct_mul(wide_u, 64) == 1) {
     # one widening multiply per limb product
-} $or {
+}
+$or {
     # the bit-serial product
 }
 ```
@@ -234,11 +235,11 @@ RHS at compile time:
 ```mach
 use std.types.string.str;
 
-pub val IS_LINUX: u8   = $mach.build.os == $mach.os.linux;
-pub val COMPILER: *u8  = $mach.compiler.name;
-pub val VERSION:  str  = $mach.version;
-pub val MAJOR:    u64  = $mach.version.major;
-pub val WIDTH:    u64  = $mach.build.pointer_width;
+pub val IS_LINUX: u8  = $mach.build.os == $mach.os.linux;
+pub val COMPILER: *u8 = $mach.compiler.name;
+pub val VERSION:  str = $mach.version;
+pub val MAJOR:    u64 = $mach.version.major;
+pub val WIDTH:    u64 = $mach.build.pointer_width;
 ```
 
 ## See also

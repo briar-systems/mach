@@ -35,17 +35,17 @@ pub rec Pair[T, U] {
 A record literal names the type and provides each field by name:
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
-rec Point { x: i64; y: i64; }
+rec Point      { x: i64; y: i64; }
 rec Pair[T, U] { left: T; right: U; }
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
-    val p: Point          = Point{ x: 1, y: 2 };
-    val q: Pair[i64, u8]  = Pair[i64, u8]{ left: 5, right: 6u8 };
-    val n: i64            = p.x;            # field access via .
+    val p: Point         = Point{x: 1, y: 2};
+    val q: Pair[i64, u8] = Pair[i64, u8]{left: 5, right: 6u8};
+    val n: i64           = p.x; # field access via .
     print.printlnf("{} {}", n, q.right);
     ret 0;
 }
@@ -64,10 +64,10 @@ never exposes what the storage held before.
 rec Key { id: u64; material: ^[32]u8; buf: *^u8; }
 
 fun fresh(id: u64) Key {
-    ret Key{ id: id };                # material is all zero, buf is nil
+    ret Key{id: id}; # material is all zero, buf is nil
 }
 
-val EMPTY: Key = Key{ id: 0 };        # the same holds for a constant literal
+val EMPTY: Key = Key{id: 0}; # the same holds for a constant literal
 ```
 
 ## Layout

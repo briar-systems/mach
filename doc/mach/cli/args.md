@@ -946,7 +946,7 @@ Indexed by search, not by DepAction
 ## val BUILD_CONSTRAINT_N
 
 ```mach
-pub val BUILD_CONSTRAINT_N: usize = 3
+pub val BUILD_CONSTRAINT_N: usize = 4
 ```
 
 length of BUILD_CONSTRAINT
@@ -959,7 +959,7 @@ pub val BUILD_CONSTRAINT: [BUILD_CONSTRAINT_N]str = [BUILD_CONSTRAINT_N]str;
 
 the constraint sentences help prints for build; the first is enforced by
 build_cli_invocation, the second by selection_from_config, the third by the
-build command
+build command, the fourth by the build plan's output path
 
 ## val TEST_CONSTRAINT_N
 

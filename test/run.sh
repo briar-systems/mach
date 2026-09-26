@@ -2,7 +2,7 @@
 # the codegen corpus, the link cases and the dwarf verify: one loop over
 # test/cases/<group>/<case>.mach and the targets, grounded in external tools.
 # --incremental instead proves the warm build path against clean builds, and
-# --docs compiles the mach code blocks of doc/language.
+# --docs compiles the mach code blocks of doc/language and holds them to mach fmt.
 # see test/README.md for the case contract and how to add a case.
 #
 # usage: test/run.sh [--target <t>]... [--case <group>/<name>]... [--bless]
@@ -25,7 +25,7 @@
 #   --link         run the link cases (test/link/cases) instead of the corpus
 #   --dwarf        build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
 #   --incremental  warm rebuilds of this compiler and of a manifest fixture match clean builds
-#   --docs         compile every mach block in doc/language and run each one with a main
+#   --docs         compile every mach block in doc/language, check it against mach fmt and run each one with a main
 #                  (--case <page> selects one page, such as --case operators; one hosted
 #                  --target compiles for it instead of the host, running only natively)
 #   MACH           the compiler under test, default out/<host>/debug/bin/mach
@@ -853,20 +853,26 @@ if [ "$mode" = link ]; then
 fi
 
 # doc_extract <page.md> <dir>: one directory per mach block, <dir>/<nnn>/, holding
-# src/ (split at `# file: src/<path>` lines, main.mach before the first) and meta:
-# the fence line number, the fence info after `mach`, and the entry file
+# src/ (split at `# file: src/<path>` lines, main.mach before the first, each
+# without its trailing blank lines), lines/
+# (for each src file, the page line of each of its lines) and meta: the fence
+# line number, the fence info after `mach`, and the entry file
 doc_extract() {
     awk -v dir="$2" '
         function open_file(rel) {
-            if (cur != "") close(cur)
+            if (cur != "") { close(cur); close(map) }
+            blanks = 0
             cur = blk "/src/" rel
+            map = blk "/lines/" rel
             d = cur; sub(/\/[^\/]*$/, "", d)
-            system("mkdir -p \"" d "\"")
+            m = map; sub(/\/[^\/]*$/, "", m)
+            system("mkdir -p \"" d "\" \"" m "\"")
             printf "" > cur
+            printf "" > map
             last = rel
         }
         function finish() {
-            if (cur != "") close(cur)
+            if (cur != "") { close(cur); close(map) }
             entry = (have_main || last == "") ? "main.mach" : last
             if (last == "") { printf "" > (blk "/src/main.mach"); close(blk "/src/main.mach") }
             print line > (blk "/meta"); print info > (blk "/meta"); print entry > (blk "/meta")
@@ -889,18 +895,54 @@ doc_extract() {
         }
         inb {
             if (cur == "") open_file("main.mach")
+            # blank lines that end a file separate it from the next marker
+            if ($0 ~ /^[ \t]*$/) { blanks++; held[blanks] = $0; held_at[blanks] = NR; next }
+            for (i = 1; i <= blanks; i++) { print held[i] > cur; print held_at[i] > map }
+            blanks = 0
             print > cur
+            print NR > map
         }
         END { if (inb) { print "unterminated mach block at line " line > "/dev/stderr"; exit 1 } }
     ' "$1"
 }
 
+# doc_fmt <block dir> <page> <annotation>: print where the block's first file
+# differs from what `mach fmt` writes, as `<page>:<line>: ...`, or nothing when
+# every file is canonical. an error block may show source the parser refuses,
+# and fmt cannot lay out what it cannot parse, so such a block is not checked
+doc_fmt() {
+    for f in $(cd "$1/src" && find . -name '*.mach' | LC_ALL=C sort); do
+        rel=${f#./}
+        if ! "$mach" fmt - <"$1/src/$rel" >"$1/fmt.out" 2>"$1/fmt.err"; then
+            [ "$3" = error ] && continue
+            echo "$2: mach fmt cannot read $rel: $(first_error "$1/fmt.err")"; return
+        fi
+        cmp -s "$1/src/$rel" "$1/fmt.out" && continue
+        # the first line the two differ on, or one past the shorter file
+        k=$(awk 'NR == FNR { a[FNR] = $0; n = FNR; next }
+                 !(FNR in a) || a[FNR] != $0 { print FNR; hit = 1; exit }
+                 { m = FNR }
+                 END { if (!hit) print (n > m ? m + 1 : n) }' "$1/src/$rel" "$1/fmt.out")
+        at=$(sed -n "${k}p" "$1/lines/$rel"); [ -n "$at" ] || at=$(tail -n1 "$1/lines/$rel")
+        want=$(sed -n "${k}p" "$1/fmt.out")
+        echo "$2:$at: not what mach fmt writes; it has \`$want\` here"; return
+    done
+}
+
+# doc_pass <verdict>: a block that did what its fence says passes when its layout
+# is also what mach fmt writes; uses doc_cell's b, page and annot
+doc_pass() {
+    bad=$(doc_fmt "$b" "$page" "$annot")
+    if [ -n "$bad" ]; then echo "FAIL $bad" >"$b/result"; else echo "$1" >"$b/result"; fi
+}
+
 # doc_cell <block dir> <label>: build the block as its own project, id `example`,
-# and write pass, skip or FAIL <why> to <block dir>/result
+# and write pass, skip or FAIL <why> to <block dir>/result. a block that does
+# what its fence says still fails when it is not what mach fmt writes
 doc_cell() {
     b=$1; label=$2
     { read -r line; read -r info; read -r entry; } <"$b/meta"
-    label="$label:$line"
+    page=$label; label="$label:$line"
     annot=${info%%[ 	]*}
     expect=${info#"$annot"}
     expect=${expect#"${expect%%[! 	]*}"}
@@ -938,7 +980,7 @@ doc_cell() {
         elif ! grep -qF -- "$expect" "$b/log"; then
             echo "FAIL $label an error block failed without '$expect': $(first_error "$b/log")" >"$b/result"
         else
-            echo "pass error" >"$b/result"
+            doc_pass "pass error"
         fi
         return
     fi
@@ -946,14 +988,14 @@ doc_cell() {
         echo "FAIL $label does not compile: $(first_error "$b/log")" >"$b/result"; return
     fi
     if [ "$kind" = static ] || [ "$(engine "$docs_target")" != "" ]; then
-        echo "pass compiled" >"$b/result"; return
+        doc_pass "pass compiled"; return
     fi
     bin=$b/o/bin/block$exe
     timeout 60 "$bin" </dev/null >"$b/run.out" 2>&1; rc=$?
     if [ "$rc" -ne 0 ]; then
         echo "FAIL $label exits $rc: $(tail -n1 "$b/run.out")" >"$b/result"; return
     fi
-    echo "pass run" >"$b/result"
+    doc_pass "pass run"
 }
 
 if [ "$mode" = docs ]; then

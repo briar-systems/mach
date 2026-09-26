@@ -198,9 +198,10 @@ pub val WORD: u32 = 8
 pub val DOUBLE_WORD: u64 = 16
 ```
 
-a 16-byte integer scalar: C.10 rounds NGRN up to even and passes it in the
-next two registers, else C.11 sets NGRN to 8 and it goes to the stack at its
-natural 16-byte alignment (#3511)
+a 16-byte integer scalar: C.10 rounds NGRN up to even when its alignment is
+16 and passes it in the next two registers, else C.11 sets NGRN to 8 and it
+goes to the stack at its natural 16-byte alignment (#3511). darwin hands the
+classifier an alignment of 8, so the pair starts in any register (#3922)
 
 ## fun gp_param_reg
 
