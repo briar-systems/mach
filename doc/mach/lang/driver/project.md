@@ -218,6 +218,9 @@ pub fun begin_query_phase(p: *Project) res[query.Operation, outcome.Fail];
 pub fun refresh_diagnostics(p: *Project) err[outcome.Fail];
 ```
 
+the session's store is rebuilt from the project's and the query presentation's,
+dropping the warnings the profile's `allow` silences
+
 ## fun finish_query_phase
 
 ```mach

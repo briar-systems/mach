@@ -588,6 +588,21 @@ a final link keeps the section even when nothing references it
 pub val SEC_FLAG_IMAGE_MASK: u32 = SEC_FLAG_INIT_FUNCS
 ```
 
+## val SEC_FLAG_UNWIND_INDEX
+
+```mach
+pub val SEC_FLAG_UNWIND_INDEX:  u32 = 0x10
+```
+
+a load section the linker reserved for the format's unwind tables: the index
+an unwinder searches first and the frame descriptions it leads to
+
+## val SEC_FLAG_UNWIND_FRAMES
+
+```mach
+pub val SEC_FLAG_UNWIND_FRAMES: u32 = 0x20
+```
+
 ## val NATIVE_GROUP
 
 ```mach
@@ -642,6 +657,20 @@ pub rec Symbol;
 pub val FRAME_STEP_PUSH:     u8 = 1
 ```
 
+a frame step records what one prologue instruction did to the frame, in
+effect once the code reaches `end_off` bytes into the function. a step is
+isa-neutral: `reg` is the isa's own register number, which each unwind format
+translates, and "the stack pointer" is its value once the step has happened.
+  PUSH reg          the stack pointer drops by a pointer and reg is stored where it points
+  ALLOC value       the stack pointer drops by value bytes
+  SET_FP reg value  reg becomes the stack pointer plus value, and holds for the whole body
+  SAVE reg value    reg is stored at the stack pointer plus value, a signed offset
+  SAVE_VEC reg value  vector register reg is stored at the stack pointer plus value
+  REALIGN value     the stack pointer is rounded down to a multiple of value, so its
+                    distance from the caller's frame is no longer known
+a save after REALIGN is addressed from the stack pointer the body runs with.
+a frameless function's record has no steps: its call's frame holds throughout
+
 ## val FRAME_STEP_ALLOC
 
 ```mach
@@ -666,11 +695,26 @@ pub val FRAME_STEP_SAVE:     u8 = 4
 pub val FRAME_STEP_SAVE_VEC: u8 = 5
 ```
 
+## val FRAME_STEP_REALIGN
+
+```mach
+pub val FRAME_STEP_REALIGN:  u8 = 6
+```
+
+## val FRAME_STEP_LAST
+
+```mach
+pub val FRAME_STEP_LAST: u8 = FRAME_STEP_REALIGN
+```
+
 ## val FRAME_STEP_CAP
 
 ```mach
-pub val FRAME_STEP_CAP: u32 = 24
+pub val FRAME_STEP_CAP: u32 = 32
 ```
+
+the most steps a frame record holds: enough for every callee-saved register
+a riscv prologue stores one at a time, the longest prologue any isa has
 
 ## rec FrameStep
 
@@ -845,6 +889,24 @@ pub def GotShapeFn: fun(u32, *DynamicInfo) res[TableShape, fail.Fail]
 
 the import GOT for the imports of a dynamic link, at the end of the read-only
 data; an empty shape when no import needs a slot
+
+## rec UnwindShape
+
+```mach
+pub rec UnwindShape;
+```
+
+the unwind tables of an executable: an index an unwinder searches by address
+and the frame descriptions it reaches, each empty when the format needs none
+
+## def UnwindShapeFn
+
+```mach
+pub def UnwindShapeFn: fun(u32, *FrameUnwind, u32) res[UnwindShape, fail.Fail]
+```
+
+the unwind tables for the frame records a link keeps, at the end of the code,
+sized from the records' steps alone so the linker reserves them before layout
 
 ## rec PltFixup
 

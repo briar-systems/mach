@@ -86,6 +86,7 @@ debug = true                           # emit debug info for this profile
 simd  = "scalarize"                    # SIMD lever: "scalarize" | "require"
 vectorize = false                      # auto-vectorization lever
 float_reassoc = false                  # float reassociation permission
+# allow = ["unused-import"]            # optional: warning kinds this profile silences
 
 [artifact.demo]                        # a produced artifact
 kind    = "bin"                        # "bin" | "static" | "shared"
@@ -359,9 +360,12 @@ The selected set is part of the target's identity: two targets that differ only 
 
 The selection also reaches code generation. Every vector operation is legal on every
 target and its shape never depends on the extension list; what moves is the lowering.
-A cell the baseline expands to a scalar sequence lowers to the one packed instruction
-when the selected set holds the extension that carries it (`i32x4 * i32x4` is
-`pmulld` under `sse41` on x86_64 and a scalar expansion without), and
+Each packed row of a target's catalog declares the extension its instruction needs,
+and the lowering reads those rows: a cell with a baseline row and a row gated on an
+extension lowers to the gated instruction when the selected set holds it (`i32x4 *
+i32x4` is `pmulld` under `sse41` on x86_64 and the `pmuludq` pair without). A cell
+whose only packed row is gated scalarizes without the extension, and the warning at
+each such site names it (see `simd` below), and
 [`simd = "require"`](#profilename) judges against the selected set, so a kernel refused on
 the baseline is accepted once the target declares the extension it needs. SSE2 is the
 x86_64 baseline. A build never infers the build machine's features: what the binary
@@ -666,14 +670,15 @@ naming come from `[target.*]` facts, and an absent optional feature such as a
 |---------|---------|---------|
 | `opt`   | integer | Optimization level: `0` selects the debug pipeline (the always-on passes only), `1` and `2` select the release pipeline. `1` and `2` currently share a pass set, which includes loop auto-vectorization (see `vectorize` below). Any other integer — or a non-integer — is a manifest error. |
 | `debug` | bool    | Emit debug info for this profile: DWARF in ELF, Mach-O and COFF objects alike, and the core SPIR-V debug instructions on a `spirv` target (see [Finished-module targets](#finished-module-targets)). A PE image carries its DWARF in `.debug_*` sections, which gdb, lldb and the LLVM tools read and Visual Studio and WinDbg do not. Gates emission only, never the optimizer, so a `release` profile can keep symbols with `debug = true`. A non-boolean is a manifest error. |
-| `simd`  | string  | SIMD scalarization lever. `"scalarize"` emits a defined unrolled scalar expansion wherever the target has no packed instruction for a vector operator, with a build-time note. `"require"` makes that a hard error naming the operation, its **lane width**, the function and the target. It applies **per operation on every target**, not only to targets with no vector unit: x86-64's SSE2 baseline has no 32-bit lane integer multiply and NEON has no 64-bit one, so a capable target scalarizes too. Any other string is a manifest error. |
+| `simd`  | string  | SIMD scalarization lever. `"scalarize"` emits a defined unrolled scalar expansion wherever the target has no packed instruction for a vector operator, with one `scalarize` warning at each such operation naming the operation, its lanes, the function, the target and the extension that would pack it (or that none would). `"require"` makes each of those sites a hard error with the same text. It applies **per operation on every target**, not only to targets with no vector unit: x86-64's SSE2 baseline has no 32-bit lane integer multiply and NEON has no 64-bit one, so a capable target scalarizes too. Any other string is a manifest error. |
 | `vectorize` | bool | Auto-vectorization lever. When `true`, the release pipeline rewrites provably-safe counted loops to 128-bit SIMD on a target with hardware vectors; `false` skips the pass, so release output stays scalar. A non-boolean is a manifest error. |
 | `float_reassoc` | bool | Permission to treat floating-point addition and multiplication as **associative**. It lets the vectorizer reduce an `f32`/`f64` accumulator through lane-count partial sums, which changes the result — see [Float reassociation](#float-reassociation) for what that costs and what it buys. A non-boolean is a manifest error. |
 | `default` | bool | **Optional.** `true` marks the profile a build uses when several are declared and `--profile` is absent. Exactly one profile may carry it. See [Profile requirement and selection](#profile-requirement-and-selection). |
+| `allow` | array of strings | **Optional.** The warning kinds this profile silences, each named once from the [warning kind table](#silencing-warnings). An unknown name, an error kind, a repeated name or a non-string entry is a manifest error. Absent, nothing is silenced. |
 
 Five keys (`opt`, `debug`, `simd`, `vectorize`, `float_reassoc`) are required
 in a declared profile, in a root and in a dependency manifest alike; only
-`default` is optional. A missing key is a manifest error naming the table and
+`default` and `allow` are optional. A missing key is a manifest error naming the table and
 the key:
 
 ```
@@ -735,6 +740,55 @@ is parsed by the same schema and never read to build the consumer, so a library'
 values are inert — the effective levers come from the consumer's resolved profile.
 Libraries set nothing SIMD-specific and inherit the consumer's choice; there is no
 ecosystem fork and no dual API.
+
+### Silencing warnings
+
+`allow` names warning kinds the build does not report. A silenced warning is
+dropped before it is printed or counted, so the summary's warning count leaves
+it out as well. Nothing else changes: the same code is built, and an error is
+never silenced.
+
+```toml
+[profile.release]
+opt = 2
+debug = false
+simd = "scalarize"
+vectorize = true
+float_reassoc = false
+allow = ["unused-import", "deprecated"]
+```
+
+Every diagnostic kind has one row in one table in the compiler
+(`src/lang/diagnostic/kind.mach`). Each warning names its row where it is
+raised, and `allow` reads the same rows, so a name here is exactly the kind the
+warning carries. The list is closed: a name no row declares is refused, naming
+the warning kinds there are. A name is never reused for a different kind.
+
+| Kind | Warns when |
+|---|---|
+| `unused-import` | a symbol import names something the module never uses |
+| `deprecated` | code outside a `#[deprecated]` declaration's module uses it |
+| `doclint` | a doc comment's component list names no parameter, field, generic or `ret` of its declaration, leaves a component undescribed, or lists them out of declaration order |
+| `fwd-instances` | a shared library `fwd`s a generic, comptime-parameter or pack declaration, which exports no symbol |
+| `debug-dropped` | the linker leaves out an object's debug info that it cannot merge |
+| `target-skipped` | multi-target analysis skips a declared target this build does not support |
+| `native-fallback` | `native` matches no declared target and a declared target is built instead |
+| `inexact-float-literal` | a float literal is not exact at its type and its digits are not the shortest spelling of the value stored |
+| `scalarize` | a vector operation falls back to scalar code on the target (see `simd`); portable code silences it |
+
+Only warnings can be silenced. The table also names error kinds, and naming
+one in `allow` is refused rather than read as unknown:
+
+| Kind | Error |
+|---|---|
+| `not-oblivious` | a function performs a constant-time operation on a secret value without `#[oblivious]` |
+
+```
+error: mach.toml: [profile.release].allow entry "not-oblivious" names an error; only a warning can be silenced
+```
+
+Like the SIMD levers, `allow` is the consumer's: a dependency's profiles are
+never read to build it, so a library cannot silence the consumer's warnings.
 
 ### Float reassociation
 
@@ -1911,8 +1965,9 @@ tree it was asked to build.
 Every cell is attempted; a failure does not abandon the ones after it. Each cell's
 diagnostics are reported under its own heading as it happens, and every cell that
 succeeded leaves its artifact on disk at its own path — nothing is rolled back. The
-exit code is `0` when all cells succeeded, `2` if the first failure was an internal
-error, and `1` otherwise.
+exit code is `0` when all cells succeeded, and otherwise the code of the worst failure
+among them: `2` when any cell failed internally, else `3` when any failed for the
+environment, and `1` otherwise.
 
 Artifacts cannot share an output path: a manifest whose expanded `out` templates
 collide is rejected before the build starts.

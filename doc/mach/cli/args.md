@@ -919,6 +919,86 @@ pub val DEP_UPDATE_CONSTRAINT: [DEP_UPDATE_CONSTRAINT_N]str = [DEP_UPDATE_CONSTR
 
 the constraint sentence help prints for dep update; the dep command enforces it, this module does not
 
+## val CHECK_EXIT_N
+
+```mach
+pub val CHECK_EXIT_N: usize = 1
+```
+
+length of CHECK_EXIT
+
+## val CHECK_EXIT
+
+```mach
+pub val CHECK_EXIT: [CHECK_EXIT_N]exit.Note = [CHECK_EXIT_N]exit.Note;
+```
+
+the exit codes check documents beside exit.SHARED
+
+## val RUN_EXIT_N
+
+```mach
+pub val RUN_EXIT_N: usize = 2
+```
+
+length of RUN_EXIT
+
+## val RUN_EXIT
+
+```mach
+pub val RUN_EXIT: [RUN_EXIT_N]exit.Note = [RUN_EXIT_N]exit.Note;
+```
+
+the exit codes run documents beside exit.SHARED
+
+## val TEST_EXIT_N
+
+```mach
+pub val TEST_EXIT_N: usize = 1
+```
+
+length of TEST_EXIT
+
+## val TEST_EXIT
+
+```mach
+pub val TEST_EXIT: [TEST_EXIT_N]exit.Note = [TEST_EXIT_N]exit.Note;
+```
+
+the exit codes test documents beside exit.SHARED
+
+## val FMT_EXIT_N
+
+```mach
+pub val FMT_EXIT_N: usize = 1
+```
+
+length of FMT_EXIT
+
+## val FMT_EXIT
+
+```mach
+pub val FMT_EXIT: [FMT_EXIT_N]exit.Note = [FMT_EXIT_N]exit.Note;
+```
+
+the exit codes fmt documents beside exit.SHARED
+
+## val DEP_VERIFY_EXIT_N
+
+```mach
+pub val DEP_VERIFY_EXIT_N: usize = 1
+```
+
+length of DEP_VERIFY_EXIT
+
+## val DEP_VERIFY_EXIT
+
+```mach
+pub val DEP_VERIFY_EXIT: [DEP_VERIFY_EXIT_N]exit.Note = [DEP_VERIFY_EXIT_N]exit.Note;
+```
+
+the exit codes dep verify documents beside exit.SHARED
+
 ## rec DepActionSpec
 
 ```mach
@@ -931,7 +1011,8 @@ name: the action word after `dep`
 id: the DepAction value
 grammar: the argument grammar help appends after the action name, leading space included
 effect: one-sentence description
-exits: exit-code description
+exits: the action's own exit notes beside exit.SHARED; nil when exit_n is 0
+exit_n: length of exits
 tables: the action's own option tables, searched after DEP_SCHEMA; nil when table_n is 0
 table_n: length of tables
 constraints: constraint sentences for help; nil when constraint_n is 0
@@ -1015,7 +1096,8 @@ id: the CommandId value
 grammar: the argument grammar help appends after the name, leading space included
 summary: one-line description for the overview
 effect: one-sentence description for the command page
-exits: exit-code description
+exits: the command's own exit notes beside exit.SHARED; nil when exit_n is 0
+exit_n: length of exits
 terminator: help text for what follows `--`; empty when the command has none
 tables: the option tables the command accepts; nil when table_n is 0
 table_n: length of tables
@@ -1110,12 +1192,12 @@ pub fun schema_valid() bool;
 ```
 
 whether COMMANDS and DEP_ACTIONS are well formed: every record has a name,
-summary or effect, and exits; each count field is zero exactly when its
-pointer is nil; every option row has a name and doc; ids and names are
-unique; every alias resolves to its own record and collides with no name
-or other alias; every option spelling and every alias_of target occurs
-exactly once across a command's tables, and across the dep tables joined
-with each action's tables; the dep record has has_action. help refuses to
+summary or effect, and exit notes that keep to exit.notes_valid; each count
+field is zero exactly when its pointer is nil; every option row has a name
+and doc; ids and names are unique; every alias resolves to its own record
+and collides with no name or other alias; every option spelling and every
+alias_of target occurs exactly once across a command's tables, and across
+the dep tables joined with each action's tables; the dep record has has_action. help refuses to
 render when this is false
 
 ret: true when every check passes

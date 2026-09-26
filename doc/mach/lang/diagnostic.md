@@ -126,6 +126,14 @@ pub rec DiagnosticBuilder;
 pub fun store_init(a: *A.Allocator) DiagnosticStore;
 ```
 
+## fun silence
+
+```mach
+pub fun silence(store: *DiagnosticStore, set: dkind.KindSet);
+```
+
+drop every warning of a kind in `set` that reaches the store from now on
+
 ## fun truncate
 
 ```mach
@@ -174,6 +182,14 @@ pub fun note_error(store: *DiagnosticStore);
 ```mach
 pub fun builder_init(a: *A.Allocator, severity: Severity, file_id: source.FileId, span: token.Span, message: str) res[DiagnosticBuilder, fail.Fail];
 ```
+
+## fun builder_init_kind
+
+```mach
+pub fun builder_init_kind(a: *A.Allocator, k: dkind.Kind, file_id: source.FileId, span: token.Span, message: str) res[DiagnosticBuilder, fail.Fail];
+```
+
+a builder for a diagnostic of a named kind, at the severity its row declares
 
 ## fun builder_dnit
 
@@ -256,8 +272,11 @@ pub fun remove_fix_committed(store: *DiagnosticStore, id: DiagnosticId, fix: Fix
 ## fun commit
 
 ```mach
-pub fun commit(b: *DiagnosticBuilder, store: *DiagnosticStore) res[DiagnosticId, fail.Fail];
+pub fun commit(b: *DiagnosticBuilder, store: *DiagnosticStore) res[opt[DiagnosticId], fail.Fail];
 ```
+
+consumes the builder into the store; absent when the store silences the warning's kind,
+which drops it
 
 ## fun resolve
 
@@ -292,10 +311,18 @@ one list. an append the store refuses is an internal failure; a store wired
 as nil is a compiler defect, and the text then stands as an internal failure
 rather than vanishing
 
+## fun record_warning_at
+
+```mach
+pub fun record_warning_at(store: *DiagnosticStore, k: dkind.Kind, loc: source.SrcLoc, message: str);
+```
+
+a warning of kind `k` located at `loc`, as `reject` locates an error
+
 ## fun warning
 
 ```mach
-pub fun warning(store: *DiagnosticStore, file_id: source.FileId, span: token.Span, message: str) err[fail.Fail];
+pub fun warning(store: *DiagnosticStore, k: dkind.Kind, file_id: source.FileId, span: token.Span, message: str) err[fail.Fail];
 ```
 
 ## fun record_error
@@ -307,13 +334,13 @@ pub fun record_error(store: *DiagnosticStore, file_id: source.FileId, span: toke
 ## fun record_warning
 
 ```mach
-pub fun record_warning(store: *DiagnosticStore, file_id: source.FileId, span: token.Span, message: str);
+pub fun record_warning(store: *DiagnosticStore, k: dkind.Kind, file_id: source.FileId, span: token.Span, message: str);
 ```
 
 ## fun record_unlocated_warning
 
 ```mach
-pub fun record_unlocated_warning(store: *DiagnosticStore, message: str);
+pub fun record_unlocated_warning(store: *DiagnosticStore, k: dkind.Kind, message: str);
 ```
 
 a warning about the build as a whole, located at no source

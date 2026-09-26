@@ -200,6 +200,15 @@ member no operand carries (it is lowered through storage), reported as
 unsupported; a kind outside the catalog is an internal failure naming the
 tag; both were panics behind the verifier
 
+## fun lower_callee
+
+```mach
+pub fun lower_callee(ctx: *LowerCtx, v: value.Value) res[mir.MirOperand, fail.Fail];
+```
+
+the target of a call. a direct call reaches an import through its call stub,
+so the callee is the bare symbol, never its GOT slot
+
 ## fun lower_operand
 
 ```mach

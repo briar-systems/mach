@@ -21,24 +21,6 @@ arg_count: u32,
 span: token.Span) bool;
 ```
 
-## def SecrecyVerdict
-
-```mach
-pub def SecrecyVerdict: u8
-```
-
-## val SECRECY_EQUAL
-
-```mach
-pub val SECRECY_EQUAL:   SecrecyVerdict = 0
-```
-
-## val SECRECY_DIFFERS
-
-```mach
-pub val SECRECY_DIFFERS: SecrecyVerdict = 1
-```
-
 ## fun check_annotation_uni_secrecy
 
 ```mach
@@ -95,11 +77,21 @@ pub fun type_field_offset(s: *session.Session, m: layout.Machine, tid: type.Type
 the byte offset of a record field or tag payload from the same checked layout that sizes the type;
 `size` carries the offset when `ok`
 
-## fun secrecy_structure_equal_deep
+## fun secrecy_cast_allowed
 
 ```mach
-pub fun secrecy_structure_equal_deep(s: *session.Session, m: layout.Machine, a: type.TypeId, b: type.TypeId) res[SecrecyVerdict, fail.Fail];
+pub fun secrecy_cast_allowed(s: *session.Session, m: layout.Machine, from: type.TypeId, to: type.TypeId) res[bool, fail.Fail];
 ```
+
+whether a `::` or `:~` from `from` to `to` keeps every byte's secrecy class
+
+## fun secrecy_overlay_agrees
+
+```mach
+pub fun secrecy_overlay_agrees(s: *session.Session, m: layout.Machine, a: type.TypeId, b: type.TypeId) res[bool, fail.Fail];
+```
+
+whether two union variants overlaying one storage agree on every byte they share
 
 ## fun module_reaches_secret
 

@@ -6,7 +6,18 @@
 pub rec ScalarizeSite;
 ```
 
-loc is the operation's own location when it has one, else the function's declaration
+loc is the operation's own location when it has one, else the function's
+declaration. lane_bits is 0 when the lane shape is outside the vocabulary,
+and from_bits is the operand lane width, which a conversion changes
+
+## fun sites
+
+```mach
+pub fun sites(m: *ir.Module, tgt: *target.Target, out: *Vector[ScalarizeSite]) err[A.Error];
+```
+
+every operator the target scalarizes, one site per operation, in function
+and block order: the sites `simd = "require"` refuses and the default warns at
 
 ## fun detect
 

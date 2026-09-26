@@ -215,15 +215,6 @@ hand the staged image to the query that publishes it; the facts stay with the mo
 pub fun take_staged_test(p: *project.Project, m: *project.ModuleEntry) *of.ObjectImage;
 ```
 
-## fun scalarized
-
-```mach
-pub fun scalarized(p: *project.Project, m: *project.ModuleEntry) u32;
-```
-
-what the engine reads from lowered ir, answered from the ir when the module
-lowered and from the restored facts when it did not
-
 ## fun collect_tests
 
 ```mach

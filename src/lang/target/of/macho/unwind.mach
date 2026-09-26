@@ -1,0 +1,341 @@
+# mach-o unwind: `__TEXT,__unwind_info` holds one compact encoding per
+# function, and a frame compact unwind cannot say points into `__TEXT,__eh_frame`
+# instead. both are sized from the frame records' steps before layout and
+# filled once every function has its address
+
+use mach.lang.fail;
+use mach.lang.target.isa;
+use mach.lang.target.of;
+use mach.lang.target.of.bin;
+use mach.lang.target.of.cfi;
+use A: std.allocator;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+val X86_64_MODE_RBP_FRAME:  u32   = 0x01000000;
+val X86_64_MODE_STACK_IMMD: u32   = 0x02000000;
+val X86_64_MODE_DWARF:      u32   = 0x04000000;
+val ARM64_MODE_FRAMELESS:   u32   = 0x02000000;
+val ARM64_MODE_DWARF:       u32   = 0x03000000;
+val ARM64_MODE_FRAME:       u32   = 0x04000000;
+val DWARF_SECTION_OFFSET:   u32   = 0x00FFFFFF;
+val SECOND_LEVEL_REGULAR:   u32   = 2;
+val HEADER_SIZE:            usize = 28;
+val INDEX_ENTRY_SIZE:       usize = 12;
+val PAGE_HEADER_SIZE:       usize = 8;
+val PAGE_ENTRY_SIZE:        usize = 8;
+# entries per second-level page, as ld64 fills a four-kilobyte page
+val PAGE_CAP: u32 = 511;
+
+# x86-64 dwarf numbers of the registers an rbp frame can restore, in the order
+# of their compact ids 1 to 5
+val X64_FRAME_REGS: [5]u32 = [5]u32{3, 12, 13, 14, 15};
+
+# arm64 register pairs a frame encoding restores, first register first, in the
+# order they sit below the frame record, and the encoding's bit for each
+val ARM64_PAIR_FIRST: [9]u32 = [9]u32{19, 21, 23, 25, 27, 72, 74, 76, 78};
+val ARM64_PAIR_BIT:   [9]u32 = [9]u32{0x1, 0x2, 0x4, 0x8, 0x10, 0x100, 0x200, 0x400, 0x800};
+
+fun find_save(st: *cfi.FrameState, reg: u32, off: i64) bool {
+    var i: u32 = 0;
+    for (i < st.save_count) {
+        if (st.saves[i].reg == reg) { ret !st.saves[i].from_sp && st.saves[i].off == off; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun saved(st: *cfi.FrameState, reg: u32) bool {
+    var i: u32 = 0;
+    for (i < st.save_count) {
+        if (st.saves[i].reg == reg) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun x64_compact(fi: *cfi.FrameIsa, steps: *of.FrameStep, count: u32) res[opt[u32], fail.Fail] {
+    # a leaf's only stack word is its return address
+    if (count == 0) { ret res[opt[u32], fail.Fail].ok{opt[u32].some{X86_64_MODE_STACK_IMMD | (1::u32 << 16)}}; }
+    var st: cfi.FrameState;
+    val r:  err[fail.Fail] = cfi.frame_state(fi, steps, count, ?st);
+    if (sel r.err) { ret res[opt[u32], fail.Fail].err{r.err}; }
+    if (st.cfa_reg != 6 || st.cfa_off != 16 || !find_save(?st, 6, -16)) {
+        ret res[opt[u32], fail.Fail].ok{opt[u32].none{}};
+    }
+    # the saved registers sit in eight-byte slots up from rbp - 8 * offset
+    var lowest: i64 = 0;
+    var i:      u32 = 0;
+    for (i < st.save_count) {
+        val sv: *cfi.FrameSave = ?st.saves[i];
+        if (sv.reg != 6) {
+            if (sv.vec || sv.from_sp) { ret res[opt[u32], fail.Fail].ok{opt[u32].none{}}; }
+            val rbp_rel: i64 = sv.off + 16;
+            if (rbp_rel >= 0 || (rbp_rel % 8) != 0) { ret res[opt[u32], fail.Fail].ok{opt[u32].none{}}; }
+            if (rbp_rel < lowest)                   { lowest = rbp_rel; }
+        }
+        i = i + 1;
+    }
+    val offset: i64 = (0 - lowest) / 8;
+    if (offset > 255) { ret res[opt[u32], fail.Fail].ok{opt[u32].none{}}; }
+    var regs: u32 = 0;
+    i = 0;
+    for (i < st.save_count) {
+        val sv: *cfi.FrameSave = ?st.saves[i];
+        if (sv.reg != 6) {
+            val slot: i64 = (sv.off + 16 - lowest) / 8;
+            var id:   u32 = 0;
+            var k:    u32 = 0;
+            for (k < 5) {
+                if (X64_FRAME_REGS[k::usize] == sv.reg) { id = k + 1; }
+                k = k + 1;
+            }
+            if (id == 0 || slot >= 5) { ret res[opt[u32], fail.Fail].ok{opt[u32].none{}}; }
+            regs = regs | (id << (3 * slot::u32));
+        }
+        i = i + 1;
+    }
+    ret res[opt[u32], fail.Fail].ok{opt[u32].some{X86_64_MODE_RBP_FRAME | (offset::u32 << 16) | regs}};
+}
+
+fun arm64_compact(fi: *cfi.FrameIsa, steps: *of.FrameStep, count: u32) res[opt[u32], fail.Fail] {
+    if (count == 0) { ret res[opt[u32], fail.Fail].ok{opt[u32].some{ARM64_MODE_FRAMELESS}}; }
+    var st: cfi.FrameState;
+    val r:  err[fail.Fail] = cfi.frame_state(fi, steps, count, ?st);
+    if (sel r.err) { ret res[opt[u32], fail.Fail].err{r.err}; }
+    if (st.cfa_reg != 29 || st.cfa_off != 16 || !find_save(?st, 29, -16) || !find_save(?st, 30, -8)) {
+        ret res[opt[u32], fail.Fail].ok{opt[u32].none{}};
+    }
+    # the pairs descend from the frame pointer, each pair's first register above its second
+    var enc:  u32 = ARM64_MODE_FRAME;
+    var used: u32 = 2;
+    var loc:  i64 = -24;
+    var p:    u32 = 0;
+    for (p < 9) {
+        val a: u32 = ARM64_PAIR_FIRST[p::usize];
+        if (find_save(?st, a, loc) && find_save(?st, a + 1, loc - 8)) {
+            enc  = enc | ARM64_PAIR_BIT[p::usize];
+            used = used + 2;
+            loc  = loc - 16;
+        }
+        or (saved(?st, a) || saved(?st, a + 1)) {
+            ret res[opt[u32], fail.Fail].ok{opt[u32].none{}};
+        }
+        p = p + 1;
+    }
+    if (used != st.save_count) { ret res[opt[u32], fail.Fail].ok{opt[u32].none{}}; }
+    ret res[opt[u32], fail.Fail].ok{opt[u32].some{enc}};
+}
+
+# a frame's compact encoding, none when only its dwarf description says it
+fun compact(fi: *cfi.FrameIsa, steps: *of.FrameStep, count: u32) res[opt[u32], fail.Fail] {
+    if (fi.arch == isa.ARCH_X86_64)  { ret x64_compact(fi, steps, count); }
+    if (fi.arch == isa.ARCH_AARCH64) { ret arm64_compact(fi, steps, count); }
+    ret res[opt[u32], fail.Fail].ok{opt[u32].none{}};
+}
+
+fun dwarf_mode(fi: *cfi.FrameIsa) u32 {
+    if (fi.arch == isa.ARCH_AARCH64) { ret ARM64_MODE_DWARF; }
+    ret X86_64_MODE_DWARF;
+}
+
+fun page_count(entries: u32) u32 {
+    ret (entries + PAGE_CAP - 1) / PAGE_CAP;
+}
+
+fun unwind_info_size(entries: u32) usize {
+    val pages: u32 = page_count(entries);
+    ret HEADER_SIZE + INDEX_ENTRY_SIZE * (pages + 1)::usize
+        + PAGE_HEADER_SIZE * pages::usize + PAGE_ENTRY_SIZE * entries::usize;
+}
+
+# `__unwind_info` for a function and a gap after each, and `__eh_frame` for
+# the frames compact unwind cannot say
+pub fun macho_unwind_shape(arch_id: u32, frames: *of.FrameUnwind, count: u32) res[of.UnwindShape, fail.Fail] {
+    var shape: of.UnwindShape;
+    val fo:    opt[cfi.FrameIsa] = cfi.frame_isa(arch_id);
+    if (sel fo.none) { ret res[of.UnwindShape, fail.Fail].ok{shape}; }
+    if (count == 0)  { ret res[of.UnwindShape, fail.Fail].ok{shape}; }
+    var fi: cfi.FrameIsa = fo.some;
+
+    var eh: usize = 0;
+    var i:  u32   = 0;
+    for (i < count) {
+        val c: res[opt[u32], fail.Fail] = compact(?fi, ?frames[i].steps[0], frames[i].step_count);
+        if (sel c.err) { ret res[of.UnwindShape, fail.Fail].err{c.err}; }
+        if (sel c.ok.none) {
+            val f: res[usize, fail.Fail] = cfi.fde_size(?fi, ?frames[i].steps[0], frames[i].step_count);
+            if (sel f.err) { ret res[of.UnwindShape, fail.Fail].err{f.err}; }
+            eh = eh + f.ok;
+        }
+        i = i + 1;
+    }
+    shape.index = of.TableShape{name: "__unwind_info", size: unwind_info_size(2 * count), align: 4};
+    if (eh > 0) {
+        shape.frames = of.TableShape{name: "__eh_frame", size: cfi.cie_size(?fi) + eh + 4, align: 8};
+    }
+    ret res[of.UnwindShape, fail.Fail].ok{shape};
+}
+
+rec Entry {
+    func_off: u32;
+    encoding: u32;
+}
+
+# fills the unwind tables the linker reserved: an encoding per function with a
+# frame record in address order, a zero one across each gap no such function
+# covers, and the dwarf descriptions the encodings that need them point to.
+# every function offset counts from `mh_addr`, where the mach header is mapped
+pub fun fill_unwind(alloc: *A.Allocator, arch_id: u32, segs: *of.LoadSegment, seg_count: u32,
+    funcs: *of.ExecFunction, func_count: u32, mh_addr: u64) err[fail.Fail] {
+    var index:  cfi.UnwindRoom = cfi.unwind_room(segs, seg_count, of.SEC_FLAG_UNWIND_INDEX);
+    var frames: cfi.UnwindRoom = cfi.unwind_room(segs, seg_count, of.SEC_FLAG_UNWIND_FRAMES);
+    if (!index.present) {
+        if (frames.present) { ret err[fail.Fail].err{fail.message("macho: the linker reserved frame descriptions without the unwind index")}; }
+        ret err[fail.Fail].ok{};
+    }
+    val fo: opt[cfi.FrameIsa] = cfi.frame_isa(arch_id);
+    if (sel fo.none) { ret err[fail.Fail].err{fail.message("macho: unwind tables reserved for an architecture compact unwind cannot describe")}; }
+    var fi: cfi.FrameIsa = fo.some;
+
+    var n:  u32                           = 0;
+    val fr: res[*cfi.UnwindFn, fail.Fail] = cfi.unwind_functions(alloc, segs, seg_count, funcs, func_count, ?n);
+    if (sel fr.err) { ret err[fail.Fail].err{fr.err}; }
+    val fns: *cfi.UnwindFn = fr.ok;
+    fin {
+        if (fns != nil) { A.deallocate[cfi.UnwindFn](alloc, fns, n::usize); }
+    }
+    if (n == 0) {
+        cfi.unwind_room_trim(segs, ?frames, 0);
+        val bare: res[usize, fail.Fail] = write_unwind_info(index.bytes, index.cap, nil, 0, 0);
+        if (sel bare.err) { ret err[fail.Fail].err{bare.err}; }
+        cfi.unwind_room_trim(segs, ?index, bare.ok);
+        ret err[fail.Fail].ok{};
+    }
+
+    val er: res[*u32, A.Error] = A.zallocate[u32](alloc, n::usize);
+    if (sel er.err) { ret err[fail.Fail].err{fail.refused(er.err)}; }
+    val encodings: *u32 = er.ok;
+    fin { A.deallocate[u32](alloc, encodings, n::usize); }
+    val dr: res[*cfi.UnwindFn, A.Error] = A.allocate[cfi.UnwindFn](alloc, n::usize);
+    if (sel dr.err) { ret err[fail.Fail].err{fail.refused(dr.err)}; }
+    val dwarf: *cfi.UnwindFn = dr.ok;
+    fin { A.deallocate[cfi.UnwindFn](alloc, dwarf, n::usize); }
+    val dor: res[*u32, A.Error] = A.zallocate[u32](alloc, n::usize);
+    if (sel dor.err) { ret err[fail.Fail].err{fail.refused(dor.err)}; }
+    val dwarf_of: *u32 = dor.ok;
+    fin { A.deallocate[u32](alloc, dwarf_of, n::usize); }
+
+    var m: u32 = 0;
+    var i: u32 = 0;
+    for (i < n) {
+        val c: res[opt[u32], fail.Fail] = compact(?fi, fns[i].steps, fns[i].step_count);
+        if (sel c.err)     { ret err[fail.Fail].err{c.err}; }
+        if (sel c.ok.some) { encodings[i] = c.ok.some; }
+        or {
+            dwarf[m]    = fns[i];
+            dwarf_of[m] = i;
+            m           = m + 1;
+        }
+        i = i + 1;
+    }
+
+    var eh_len: usize = 0;
+    if (m > 0) {
+        if (!frames.present) { ret err[fail.Fail].err{fail.message("macho: a frame compact unwind cannot say has no reserved __eh_frame")}; }
+        val ofr: res[*u32, A.Error] = A.zallocate[u32](alloc, m::usize);
+        if (sel ofr.err) { ret err[fail.Fail].err{fail.refused(ofr.err)}; }
+        val offs: *u32 = ofr.ok;
+        fin { A.deallocate[u32](alloc, offs, m::usize); }
+        val eh: res[usize, fail.Fail] = cfi.write_eh_frame(?fi, frames.bytes, frames.cap, frames.vaddr, dwarf, m, offs);
+        if (sel eh.err) { ret err[fail.Fail].err{eh.err}; }
+        eh_len = eh.ok;
+        var k: u32 = 0;
+        for (k < m) {
+            if (offs[k] > DWARF_SECTION_OFFSET) {
+                ret err[fail.Fail].err{fail.message("macho: a frame description lies past what a compact encoding can point to")};
+            }
+            encodings[dwarf_of[k]] = dwarf_mode(?fi) | offs[k];
+            k                      = k + 1;
+        }
+    }
+    cfi.unwind_room_trim(segs, ?frames, eh_len);
+
+    val entr: res[*Entry, A.Error] = A.allocate[Entry](alloc, (2 * n)::usize);
+    if (sel entr.err) { ret err[fail.Fail].err{fail.refused(entr.err)}; }
+    val entries: *Entry = entr.ok;
+    fin { A.deallocate[Entry](alloc, entries, (2 * n)::usize); }
+    var e: u32 = 0;
+    i = 0;
+    for (i < n) {
+        if (fns[i].addr < mh_addr || fns[i].addr + fns[i].size::u64 - mh_addr > 0xFFFFFFFF) {
+            ret err[fail.Fail].err{fail.message("macho: a function lies outside the image's 32-bit unwind range")};
+        }
+        entries[e] = Entry{func_off: (fns[i].addr - mh_addr)::u32, encoding: encodings[i]};
+        e          = e + 1;
+        val end: u64 = fns[i].addr + fns[i].size::u64;
+        if (i + 1 < n && fns[i + 1].addr > end) {
+            entries[e] = Entry{func_off: (end - mh_addr)::u32, encoding: 0};
+            e          = e + 1;
+        }
+        i = i + 1;
+    }
+    val last_end: u64                   = fns[n - 1].addr + fns[n - 1].size::u64 - mh_addr;
+    val written:  res[usize, fail.Fail] = write_unwind_info(index.bytes, index.cap, entries, e, last_end::u32);
+    if (sel written.err) { ret err[fail.Fail].err{written.err}; }
+    cfi.unwind_room_trim(segs, ?index, written.ok);
+    ret err[fail.Fail].ok{};
+}
+
+# version 1 with no common encodings, personalities or lsdas: the first-level
+# index names each regular second-level page and ends at `end`
+fun write_unwind_info(buf: *u8, cap: usize, entries: *Entry, count: u32, end: u32) res[usize, fail.Fail] {
+    val size: usize = unwind_info_size(count);
+    if (size > cap) {
+        ret res[usize, fail.Fail].err{fail.message("macho: the unwind index outgrew the room the linker reserved for it")};
+    }
+    val pages:    u32   = page_count(count);
+    val lsda_off: usize = HEADER_SIZE + INDEX_ENTRY_SIZE * (pages + 1)::usize;
+    bin.write_u32_le(buf, 0, 1);
+    bin.write_u32_le(buf, 4, HEADER_SIZE::u32);
+    bin.write_u32_le(buf, 8, 0);
+    bin.write_u32_le(buf, 12, HEADER_SIZE::u32);
+    bin.write_u32_le(buf, 16, 0);
+    bin.write_u32_le(buf, 20, HEADER_SIZE::u32);
+    bin.write_u32_le(buf, 24, pages + 1);
+
+    var page_off: usize = lsda_off;
+    var p:        u32   = 0;
+    for (p < pages) {
+        val first: u32 = p * PAGE_CAP;
+        var take:  u32 = count - first;
+        if (take > PAGE_CAP) { take = PAGE_CAP; }
+        val at: usize = HEADER_SIZE + INDEX_ENTRY_SIZE * p::usize;
+        bin.write_u32_le(buf, at, entries[first].func_off);
+        bin.write_u32_le(buf, at + 4, page_off::u32);
+        bin.write_u32_le(buf, at + 8, lsda_off::u32);
+
+        bin.write_u32_le(buf, page_off, SECOND_LEVEL_REGULAR);
+        bin.write_u16_le(buf, page_off + 4, PAGE_HEADER_SIZE::u16);
+        bin.write_u16_le(buf, page_off + 6, take::u16);
+        var k: u32 = 0;
+        for (k < take) {
+            val eo: usize = page_off + PAGE_HEADER_SIZE + PAGE_ENTRY_SIZE * k::usize;
+            bin.write_u32_le(buf, eo, entries[first + k].func_off);
+            bin.write_u32_le(buf, eo + 4, entries[first + k].encoding);
+            k = k + 1;
+        }
+        page_off = page_off + PAGE_HEADER_SIZE + PAGE_ENTRY_SIZE * take::usize;
+        p        = p + 1;
+    }
+    val sentinel: usize = HEADER_SIZE + INDEX_ENTRY_SIZE * pages::usize;
+    bin.write_u32_le(buf, sentinel, end);
+    bin.write_u32_le(buf, sentinel + 4, 0);
+    bin.write_u32_le(buf, sentinel + 8, lsda_off::u32);
+    ret res[usize, fail.Fail].ok{size};
+}

@@ -1,0 +1,578 @@
+# dwarf call frame information from the linker's frame records: how each isa's
+# registers read in cfi, the frame a function's prologue steps leave, and the
+# `.eh_frame` and `.eh_frame_hdr` tables elf images carry and mach-o falls back
+# to where compact unwind cannot say a frame. a table's size depends on the
+# steps alone, so the linker reserves it before layout and the writer fills it
+# after
+
+use mach.lang.fail;
+use mach.lang.target.isa;
+use mach.lang.target.of;
+use mach.lang.target.of.bin;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+
+# how one isa spells its frame in cfi: dwarf register numbers, the return
+# address column and the frame a call leaves
+pub rec FrameIsa {
+    arch:     u32;
+    ptr_size: u32;
+    # dwarf number of the stack pointer and of the return address column
+    sp: u32;
+    ra: u32;
+    # the call frame address sits this far above the stack pointer at entry,
+    # and the return address this far below it when the call pushed it
+    entry_cfa: i64;
+    ra_pushed: bool;
+    # dwarf number of vector register 0
+    vec_base: u32;
+    # the unit a saved register's offset is counted in, negative as dwarf has it
+    data_align: i64;
+}
+
+# x86-64 hardware register numbers in dwarf order
+val X64_DWARF: [16]u8 = [16]u8{0, 2, 1, 3, 7, 6, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15};
+
+pub fun frame_isa(arch: u32) opt[FrameIsa] {
+    if (arch == isa.ARCH_X86_64) {
+        ret opt[FrameIsa].some{FrameIsa{arch: arch, ptr_size: 8, sp: 7, ra: 16, entry_cfa: 8, ra_pushed: true, vec_base: 17, data_align: -8}};
+    }
+    if (arch == isa.ARCH_AARCH64) {
+        ret opt[FrameIsa].some{FrameIsa{arch: arch, ptr_size: 8, sp: 31, ra: 30, entry_cfa: 0, ra_pushed: false, vec_base: 64, data_align: -8}};
+    }
+    if (arch == isa.ARCH_RISCV64) {
+        ret opt[FrameIsa].some{FrameIsa{arch: arch, ptr_size: 8, sp: 2, ra: 1, entry_cfa: 0, ra_pushed: false, vec_base: 32, data_align: -4}};
+    }
+    if (arch == isa.ARCH_RISCV32) {
+        ret opt[FrameIsa].some{FrameIsa{arch: arch, ptr_size: 4, sp: 2, ra: 1, entry_cfa: 0, ra_pushed: false, vec_base: 32, data_align: -4}};
+    }
+    ret opt[FrameIsa].none{};
+}
+
+pub fun dwarf_gp(fi: *FrameIsa, reg: u8) u32 {
+    if (fi.arch == isa.ARCH_X86_64) { ret X64_DWARF[(reg & 15)::usize]::u32; }
+    ret reg::u32;
+}
+
+pub fun dwarf_vec(fi: *FrameIsa, reg: u8) u32 {
+    ret fi.vec_base + reg::u32;
+}
+
+# where the body finds a saved register: at an offset from the call frame
+# address, or from the stack pointer when a realigned prologue left the
+# frame's distance from it unknown
+pub rec FrameSave {
+    reg:     u32;
+    vec:     bool;
+    from_sp: bool;
+    off:     i64;
+}
+
+# the frame a function's prologue leaves: the call frame address as a register
+# plus an offset, and every register the prologue saved
+pub rec FrameState {
+    cfa_reg:    u32;
+    cfa_off:    i64;
+    sp_known:   bool;
+    sp_dist:    i64;
+    save_count: u32;
+    saves:      [of.FRAME_STEP_CAP]FrameSave;
+}
+
+# a byte sink that measures when it has no buffer. `loc` is the code offset
+# the next rule holds from and `at` the one the program has advanced to
+rec Sink {
+    buf: *u8;
+    pos: usize;
+    at:  u32;
+    loc: u32;
+}
+
+fun blank_sink(buf: *u8) Sink {
+    ret Sink{buf: buf, pos: 0, at: 0, loc: 0};
+}
+
+fun put_u8(s: *Sink, v: u8) {
+    if (s.buf != nil) { s.buf[s.pos] = v; }
+    s.pos = s.pos + 1;
+}
+
+fun put_u16(s: *Sink, v: u16) {
+    if (s.buf != nil) { bin.write_u16_le(s.buf, s.pos, v); }
+    s.pos = s.pos + 2;
+}
+
+fun put_u32(s: *Sink, v: u32) {
+    if (s.buf != nil) { bin.write_u32_le(s.buf, s.pos, v); }
+    s.pos = s.pos + 4;
+}
+
+fun put_uleb(s: *Sink, v: u64) {
+    var value: u64  = v;
+    var more:  bool = true;
+    for (more) {
+        var byte: u8 = (value & 0x7F)::u8;
+        value = value >> 7;
+        if (value != 0) { byte = byte | 0x80; }
+        or              { more = false; }
+        put_u8(s, byte);
+    }
+}
+
+fun put_sleb(s: *Sink, v: i64) {
+    var value: i64  = v;
+    var more:  bool = true;
+    for (more) {
+        val byte: u8 = (value::u64 & 0x7F)::u8;
+        value = value >> 7;
+        val sign: bool = (byte & 0x40) != 0;
+        if ((value == 0 && !sign) || (value == -1 && sign)) {
+            more = false;
+            put_u8(s, byte);
+        }
+        or { put_u8(s, byte | 0x80); }
+    }
+}
+
+fun pad_to(s: *Sink, start: usize, align: usize) {
+    for (((s.pos - start) % align) != 0) { put_u8(s, DW_CFA_NOP); }
+}
+
+val DW_CFA_NOP:                u8 = 0x00;
+val DW_CFA_ADVANCE_LOC1:       u8 = 0x02;
+val DW_CFA_ADVANCE_LOC2:       u8 = 0x03;
+val DW_CFA_ADVANCE_LOC4:       u8 = 0x04;
+val DW_CFA_OFFSET_EXTENDED:    u8 = 0x05;
+val DW_CFA_DEF_CFA:            u8 = 0x0C;
+val DW_CFA_DEF_CFA_REGISTER:   u8 = 0x0D;
+val DW_CFA_DEF_CFA_OFFSET:     u8 = 0x0E;
+val DW_CFA_EXPRESSION:         u8 = 0x10;
+val DW_CFA_OFFSET_EXTENDED_SF: u8 = 0x11;
+val DW_CFA_ADVANCE_LOC:        u8 = 0x40;
+val DW_CFA_OFFSET:             u8 = 0x80;
+val DW_OP_BREG0:               u8 = 0x70;
+
+# pc-relative, signed four-byte pointers
+pub val DW_EH_PE_PCREL_SDATA4:   u8 = 0x1B;
+pub val DW_EH_PE_UDATA4:         u8 = 0x03;
+pub val DW_EH_PE_DATAREL_SDATA4: u8 = 0x3B;
+
+# advances the program to the code offset the next rule holds from
+fun sync(s: *Sink) {
+    val delta: u32 = s.loc - s.at;
+    s.at = s.loc;
+    if (delta == 0) { ret; }
+    if (delta < 64) {
+        put_u8(s, DW_CFA_ADVANCE_LOC | delta::u8);
+        ret;
+    }
+    if (delta <= 0xFF) {
+        put_u8(s, DW_CFA_ADVANCE_LOC1);
+        put_u8(s, delta::u8);
+        ret;
+    }
+    if (delta <= 0xFFFF) {
+        put_u8(s, DW_CFA_ADVANCE_LOC2);
+        put_u16(s, delta::u16);
+        ret;
+    }
+    put_u8(s, DW_CFA_ADVANCE_LOC4);
+    put_u32(s, delta);
+}
+
+fun def_cfa(s: *Sink, reg: u32, off: i64) {
+    sync(s);
+    put_u8(s, DW_CFA_DEF_CFA);
+    put_uleb(s, reg::u64);
+    put_uleb(s, off::u64);
+}
+
+fun cfa_rule(s: *Sink, old_reg: u32, old_off: i64, reg: u32, off: i64) {
+    if (reg != old_reg && off != old_off) {
+        def_cfa(s, reg, off);
+        ret;
+    }
+    if (reg != old_reg) {
+        sync(s);
+        put_u8(s, DW_CFA_DEF_CFA_REGISTER);
+        put_uleb(s, reg::u64);
+        ret;
+    }
+    if (off != old_off) {
+        sync(s);
+        put_u8(s, DW_CFA_DEF_CFA_OFFSET);
+        put_uleb(s, off::u64);
+    }
+}
+
+fun offset_rule(fi: *FrameIsa, s: *Sink, reg: u32, cfa_rel: i64) err[fail.Fail] {
+    val da: i64 = fi.data_align;
+    if (cfa_rel % da != 0) {
+        ret err[fail.Fail].err{fail.message("cfi: a saved register sits off the frame's slot grid")};
+    }
+    val factored: i64 = cfa_rel / da;
+    sync(s);
+    if (factored >= 0 && reg < 64) {
+        put_u8(s, DW_CFA_OFFSET | reg::u8);
+        put_uleb(s, factored::u64);
+    }
+    or (factored >= 0) {
+        put_u8(s, DW_CFA_OFFSET_EXTENDED);
+        put_uleb(s, reg::u64);
+        put_uleb(s, factored::u64);
+    }
+    or {
+        put_u8(s, DW_CFA_OFFSET_EXTENDED_SF);
+        put_uleb(s, reg::u64);
+        put_sleb(s, factored);
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a register the stack pointer addresses once the frame's distance from it is
+# unknown: an expression `sp + off`
+fun sp_rule(fi: *FrameIsa, s: *Sink, reg: u32, off: i64) {
+    var expr: Sink = blank_sink(nil);
+    put_sleb(?expr, off);
+    sync(s);
+    put_u8(s, DW_CFA_EXPRESSION);
+    put_uleb(s, reg::u64);
+    put_uleb(s, (1 + expr.pos)::u64);
+    put_u8(s, DW_OP_BREG0 + fi.sp::u8);
+    put_sleb(s, off);
+}
+
+fun record_save(st: *FrameState, reg: u32, vec: bool, from_sp: bool, off: i64) {
+    var i: u32 = 0;
+    for (i < st.save_count) {
+        if (st.saves[i].reg == reg) {
+            st.saves[i] = FrameSave{reg: reg, vec: vec, from_sp: from_sp, off: off};
+            ret;
+        }
+        i = i + 1;
+    }
+    st.saves[st.save_count] = FrameSave{reg: reg, vec: vec, from_sp: from_sp, off: off};
+    st.save_count           = st.save_count + 1;
+}
+
+fun entry_state(fi: *FrameIsa, st: *FrameState) {
+    st.cfa_reg    = fi.sp;
+    st.cfa_off    = fi.entry_cfa;
+    st.sp_known   = true;
+    st.sp_dist    = fi.entry_cfa;
+    st.save_count = 0;
+}
+
+val STEPS_INEXPRESSIBLE: str = "cfi: a frame's prologue steps leave no call frame address a table can state";
+
+# runs a function's prologue steps: writes the cfi program that follows them
+# into the sink and leaves the frame they build in `st`
+fun run_steps(fi: *FrameIsa, steps: *of.FrameStep, count: u32, s: *Sink, st: *FrameState) err[fail.Fail] {
+    entry_state(fi, st);
+    s.at  = 0;
+    s.loc = 0;
+    if (count > of.FRAME_STEP_CAP) { ret err[fail.Fail].err{fail.message("cfi: a frame record exceeds its step capacity")}; }
+    var sp_fixed: bool = false;
+    var i:        u32  = 0;
+    for (i < count) {
+        val stp: *of.FrameStep = ?steps[i];
+        if (stp.end_off < s.loc) { ret err[fail.Fail].err{fail.message("cfi: a frame record's steps run backwards")}; }
+        s.loc = stp.end_off;
+        val old_reg: u32 = st.cfa_reg;
+        val old_off: i64 = st.cfa_off;
+        val value:   i64 = stp.value::i64;
+
+        if (stp.kind == of.FRAME_STEP_PUSH) {
+            if (!st.sp_known || sp_fixed) { ret err[fail.Fail].err{fail.message(STEPS_INEXPRESSIBLE)}; }
+            st.sp_dist = st.sp_dist + fi.ptr_size::i64;
+            if (st.cfa_reg == fi.sp) { st.cfa_off = st.sp_dist; }
+            cfa_rule(s, old_reg, old_off, st.cfa_reg, st.cfa_off);
+            val reg: u32            = dwarf_gp(fi, stp.reg);
+            val o:   err[fail.Fail] = offset_rule(fi, s, reg, 0 - st.sp_dist);
+            if (sel o.err) { ret o; }
+            record_save(st, reg, false, false, 0 - st.sp_dist);
+        }
+        or (stp.kind == of.FRAME_STEP_ALLOC) {
+            if (sp_fixed) { ret err[fail.Fail].err{fail.message(STEPS_INEXPRESSIBLE)}; }
+            if (st.sp_known) {
+                st.sp_dist = st.sp_dist + value;
+                if (st.cfa_reg == fi.sp) { st.cfa_off = st.sp_dist; }
+                cfa_rule(s, old_reg, old_off, st.cfa_reg, st.cfa_off);
+            }
+        }
+        or (stp.kind == of.FRAME_STEP_SET_FP) {
+            if (!st.sp_known) { ret err[fail.Fail].err{fail.message(STEPS_INEXPRESSIBLE)}; }
+            st.cfa_reg = dwarf_gp(fi, stp.reg);
+            st.cfa_off = st.sp_dist - value;
+            if (st.cfa_off < 0) { ret err[fail.Fail].err{fail.message(STEPS_INEXPRESSIBLE)}; }
+            cfa_rule(s, old_reg, old_off, st.cfa_reg, st.cfa_off);
+        }
+        or (stp.kind == of.FRAME_STEP_REALIGN) {
+            if (st.cfa_reg == fi.sp) { ret err[fail.Fail].err{fail.message(STEPS_INEXPRESSIBLE)}; }
+            st.sp_known = false;
+        }
+        or (stp.kind == of.FRAME_STEP_SAVE || stp.kind == of.FRAME_STEP_SAVE_VEC) {
+            val vec: bool = stp.kind == of.FRAME_STEP_SAVE_VEC;
+            var reg: u32  = dwarf_gp(fi, stp.reg);
+            if (vec) { reg = dwarf_vec(fi, stp.reg); }
+            if (st.sp_known) {
+                val cfa_rel: i64            = value - st.sp_dist;
+                val o:       err[fail.Fail] = offset_rule(fi, s, reg, cfa_rel);
+                if (sel o.err) { ret o; }
+                record_save(st, reg, vec, false, cfa_rel);
+            }
+            or {
+                sp_rule(fi, s, reg, value);
+                record_save(st, reg, vec, true, value);
+                sp_fixed = true;
+            }
+        }
+        or {
+            ret err[fail.Fail].err{fail.message("cfi: a frame record has an unknown step kind")};
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the frame a function's steps leave once its prologue has run
+pub fun frame_state(fi: *FrameIsa, steps: *of.FrameStep, count: u32, st: *FrameState) err[fail.Fail] {
+    var s: Sink = blank_sink(nil);
+    ret run_steps(fi, steps, count, ?s, st);
+}
+
+fun write_cie_at(fi: *FrameIsa, s: *Sink) {
+    val start: usize = s.pos;
+    put_u32(s, 0);
+    put_u32(s, 0);
+    put_u8(s, 1);
+    put_u8(s, 'z');
+    put_u8(s, 'R');
+    put_u8(s, 0);
+    put_uleb(s, 1);
+    put_sleb(s, fi.data_align);
+    put_uleb(s, fi.ra::u64);
+    put_uleb(s, 1);
+    put_u8(s, DW_EH_PE_PCREL_SDATA4);
+    def_cfa(s, fi.sp, fi.entry_cfa);
+    if (fi.ra_pushed) {
+        put_u8(s, DW_CFA_OFFSET | fi.ra::u8);
+        put_uleb(s, (0 - fi.ptr_size::i64 / fi.data_align)::u64);
+    }
+    pad_to(s, start, fi.ptr_size::usize);
+    if (s.buf != nil) { bin.write_u32_le(s.buf, start, (s.pos - start - 4)::u32); }
+}
+
+pub fun cie_size(fi: *FrameIsa) usize {
+    var s: Sink = blank_sink(nil);
+    write_cie_at(fi, ?s);
+    ret s.pos;
+}
+
+# one function's frame description entry; `vaddr` is where buf[0] is mapped
+fun write_fde_at(fi: *FrameIsa, s: *Sink, vaddr: u64, cie_pos: usize,
+    fn_addr: u64, fn_size: u32, steps: *of.FrameStep, count: u32) err[fail.Fail] {
+    val start: usize = s.pos;
+    put_u32(s, 0);
+    put_u32(s, (s.pos - cie_pos)::u32);
+    val field: u64 = vaddr + s.pos::u64;
+    put_u32(s, (fn_addr - field)::u32);
+    put_u32(s, fn_size);
+    put_uleb(s, 0);
+    var st: FrameState;
+    val r:  err[fail.Fail] = run_steps(fi, steps, count, s, ?st);
+    if (sel r.err) { ret r; }
+    pad_to(s, start, fi.ptr_size::usize);
+    if (s.buf != nil) { bin.write_u32_le(s.buf, start, (s.pos - start - 4)::u32); }
+    ret err[fail.Fail].ok{};
+}
+
+pub fun fde_size(fi: *FrameIsa, steps: *of.FrameStep, count: u32) res[usize, fail.Fail] {
+    var s: Sink           = blank_sink(nil);
+    val r: err[fail.Fail] = write_fde_at(fi, ?s, 0, 0, 0, 0, steps, count);
+    if (sel r.err) { ret res[usize, fail.Fail].err{r.err}; }
+    ret res[usize, fail.Fail].ok{s.pos};
+}
+
+# a function an unwind table describes, at its final address
+pub rec UnwindFn {
+    addr:       u64;
+    size:       u32;
+    step_count: u32;
+    steps:      *of.FrameStep;
+}
+
+# the `.eh_frame` bytes for `fns` in address order: one cie, an fde each and
+# the zero terminator. `fde_offs`, when given, receives each fde's offset
+pub fun write_eh_frame(fi: *FrameIsa, buf: *u8, cap: usize, vaddr: u64, fns: *UnwindFn, count: u32,
+    fde_offs: *u32) res[usize, fail.Fail] {
+    var measure: Sink = blank_sink(nil);
+    write_cie_at(fi, ?measure);
+    var i: u32 = 0;
+    for (i < count) {
+        val r: err[fail.Fail] = write_fde_at(fi, ?measure, 0, 0, 0, 0, fns[i].steps, fns[i].step_count);
+        if (sel r.err) { ret res[usize, fail.Fail].err{r.err}; }
+        i = i + 1;
+    }
+    put_u32(?measure, 0);
+    if (measure.pos > cap) {
+        ret res[usize, fail.Fail].err{fail.message("cfi: the frame table outgrew the room the linker reserved for it")};
+    }
+
+    var s: Sink = blank_sink(buf);
+    write_cie_at(fi, ?s);
+    i = 0;
+    for (i < count) {
+        if (fde_offs != nil) { fde_offs[i] = s.pos::u32; }
+        val r: err[fail.Fail] = write_fde_at(fi, ?s, vaddr, 0, fns[i].addr, fns[i].size, fns[i].steps, fns[i].step_count);
+        if (sel r.err) { ret res[usize, fail.Fail].err{r.err}; }
+        i = i + 1;
+    }
+    put_u32(?s, 0);
+    ret res[usize, fail.Fail].ok{s.pos};
+}
+
+# the most `.eh_frame` bytes the given frames can take: a function the link
+# keeps has at most one frame record
+pub fun eh_frame_bound(fi: *FrameIsa, frames: *of.FrameUnwind, count: u32) res[usize, fail.Fail] {
+    var n: usize = cie_size(fi) + 4;
+    var i: u32   = 0;
+    for (i < count) {
+        val f: res[usize, fail.Fail] = fde_size(fi, ?frames[i].steps[0], frames[i].step_count);
+        if (sel f.err) { ret f; }
+        n = n + f.ok;
+        i = i + 1;
+    }
+    ret res[usize, fail.Fail].ok{n};
+}
+
+pub fun eh_frame_hdr_size(count: u32) usize {
+    ret 12 + 8 * count::usize;
+}
+
+# `.eh_frame_hdr`: the frame table's address and a search table of each
+# function's start and its fde, both relative to the header. `fns` is in
+# address order and `fde_offs` is what write_eh_frame returned
+pub fun write_eh_frame_hdr(buf: *u8, cap: usize, vaddr: u64, eh_vaddr: u64, fns: *UnwindFn, count: u32,
+    fde_offs: *u32) err[fail.Fail] {
+    if (eh_frame_hdr_size(count) > cap) {
+        ret err[fail.Fail].err{fail.message("cfi: the frame search table outgrew the room the linker reserved for it")};
+    }
+    buf[0] = 1;
+    buf[1] = DW_EH_PE_PCREL_SDATA4;
+    buf[2] = DW_EH_PE_UDATA4;
+    buf[3] = DW_EH_PE_DATAREL_SDATA4;
+    bin.write_u32_le(buf, 4, (eh_vaddr - (vaddr + 4))::u32);
+    bin.write_u32_le(buf, 8, count);
+    var i: u32 = 0;
+    for (i < count) {
+        val at: usize = 12 + 8 * i::usize;
+        bin.write_u32_le(buf, at, (fns[i].addr - vaddr)::u32);
+        bin.write_u32_le(buf, at + 4, (eh_vaddr + fde_offs[i]::u64 - vaddr)::u32);
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the room the linker reserved for one unwind table, found by its section flag
+pub rec UnwindRoom {
+    present: bool;
+    seg:     u32;
+    sec:     u32;
+    vaddr:   u64;
+    bytes:   *u8;
+    cap:     usize;
+}
+
+pub fun unwind_room(segs: *of.LoadSegment, seg_count: u32, flag: u32) UnwindRoom {
+    var room: UnwindRoom;
+    room.present = false;
+    var li: u32 = 0;
+    for (li < seg_count) {
+        var i: u32 = 0;
+        for (i < segs[li].section_count) {
+            val sec: *of.LoadSection = ?segs[li].sections[i];
+            if ((sec.flags & flag) != 0 && segs[li].bytes != nil
+                && sec.offset::usize + sec.len::usize <= segs[li].filesz) {
+                room.present = true;
+                room.seg     = li;
+                room.sec     = i;
+                room.vaddr   = segs[li].vaddr + sec.offset::u64;
+                room.bytes   = (segs[li].bytes::usize + sec.offset::usize)::*u8;
+                room.cap     = sec.len::usize;
+                ret room;
+            }
+            i = i + 1;
+        }
+        li = li + 1;
+    }
+    ret room;
+}
+
+# the table fills `len` bytes of its room, which is what its section header says
+pub fun unwind_room_trim(segs: *of.LoadSegment, room: *UnwindRoom, len: usize) {
+    if (!room.present) { ret; }
+    segs[room.seg].sections[room.sec].len = len::u32;
+}
+
+# the functions with frame records at their final addresses, in address order
+# with an alias of an earlier start dropped; `count` entries the caller frees
+pub fun unwind_functions(alloc: *A.Allocator, segs: *of.LoadSegment, seg_count: u32,
+    funcs: *of.ExecFunction, func_count: u32, count: *u32) res[*UnwindFn, fail.Fail] {
+    @count = 0;
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < func_count) {
+        if (funcs[i].framed && funcs[i].seg_index < seg_count) { n = n + 1; }
+        i = i + 1;
+    }
+    if (n == 0) { ret res[*UnwindFn, fail.Fail].ok{nil}; }
+    val ar: res[*UnwindFn, A.Error] = A.allocate[UnwindFn](alloc, n::usize);
+    if (sel ar.err) { ret res[*UnwindFn, fail.Fail].err{fail.refused(ar.err)}; }
+    val fns: *UnwindFn = ar.ok;
+    var w:   u32       = 0;
+    i = 0;
+    for (i < func_count) {
+        val f: *of.ExecFunction = ?funcs[i];
+        if (f.framed && f.seg_index < seg_count) {
+            var cur: UnwindFn = UnwindFn{addr: segs[f.seg_index].vaddr + f.seg_offset::u64, size: f.size,
+                step_count: f.step_count, steps: ?f.steps[0]};
+            var j: u32 = w;
+            for (j > 0 && fns[j - 1].addr > cur.addr) {
+                fns[j] = fns[j - 1];
+                j      = j - 1;
+            }
+            if (j > 0 && fns[j - 1].addr == cur.addr) {
+                var k: u32 = j;
+                for (k < w) {
+                    fns[k] = fns[k + 1];
+                    k      = k + 1;
+                }
+            }
+            or {
+                fns[j] = cur;
+                w      = w + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (w < n) {
+        val rr: res[*UnwindFn, A.Error] = A.reallocate[UnwindFn](alloc, fns, n::usize, w::usize);
+        if (sel rr.err) {
+            A.deallocate[UnwindFn](alloc, fns, n::usize);
+            ret res[*UnwindFn, fail.Fail].err{fail.refused(rr.err)};
+        }
+        @count = w;
+        ret res[*UnwindFn, fail.Fail].ok{rr.ok};
+    }
+    @count = w;
+    ret res[*UnwindFn, fail.Fail].ok{fns};
+}

@@ -121,6 +121,8 @@ debug: the required `debug` key
 simd: the required `simd` key
 vectorize: the required `vectorize` key
 float_reassoc: the required `float_reassoc` key
+allow: the optional `allow` key: the warning kinds the profile silences,
+               empty when the key is absent
 
 ## rec DepDef
 

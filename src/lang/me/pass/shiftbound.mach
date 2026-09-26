@@ -1,8 +1,16 @@
-# marks every scalar shift whose count the range analysis proves below its
-# operand's width, so lowering emits the bare machine shift for it and keeps
-# the saturation of #3756 for the rest (#3885). the mark is recomputed from
-# scratch on each run: a shift the analysis cannot prove loses one an earlier
-# run or an inlined body left on it, so the flag never outlives its proof
+# the one home of the shift saturation (#3756, #3885, #3887). every scalar
+# shift leaves this pass marked count-bounded, its count below its operand's
+# width: a count the range analysis proves keeps the bare shift, and any other
+# count is saturated here in the ir, branch-free, around the mask
+# `m = mask_lt_u(count, W)`, all ones exactly when the count is in range. a
+# logical shift keeps its value only under `m` and shifts by `count & (W-1)`,
+# an arithmetic one shifts by `(count | ~m) & (W-1)`, which is W - 1 out of
+# range and fills with the sign. `m` is 0 or all ones, so it may and the value
+# before the shift as well as the result after it, and it goes into an
+# adjacent single-use and with a constant wherever there is one, so a mask of
+# a count the loop does not change is loop-invariant and licm hoists it with
+# the and. the mark is recomputed from scratch on each run, so it never
+# outlives its proof, and a count this pass saturated proves on a later run
 use mach.lang.fail;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -10,6 +18,7 @@ use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
+use std.types.size.usize;
 
 use A: std.allocator;
 
@@ -18,6 +27,7 @@ use mach.lang.me.analysis.range;
 use mach.lang.me.ir;
 use mach.lang.me.ir.id;
 use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.refs;
 use ir_type: mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.me.scratch;
@@ -29,7 +39,7 @@ pub fun run_in(m: *ir.Module, workspace: *scratch.Workspace) res[bool, fail.Fail
         val fn: *ir.Function = ?m.functions[i];
         if ((fn.flags & ir.FN_FLAG_EXTERN) == 0 && fn.block_count > 0) {
             var work: scratch.Function     = scratch.Function{module: m, body: fn};
-            val r:    res[bool, fail.Fail] = scratch.run[scratch.Function, bool](workspace, m.alloc, ?work, mark_function);
+            val r:    res[bool, fail.Fail] = scratch.run[scratch.Function, bool](workspace, m.alloc, ?work, bound_function);
             if (sel r.err) { ret r; }
             if (r.ok)      { changed = true; }
         }
@@ -42,18 +52,29 @@ fun is_shift(k: instruction.InstrKind) bool {
     ret k == instruction.OP_SHL || k == instruction.OP_SHR_U || k == instruction.OP_SHR_S;
 }
 
-# the width of a scalar integer shift, 0 for anything else
-fun shift_bits(types: *ir_type.IrTypeTable, ins: *instruction.Instruction) u32 {
-    if (!is_shift(ins.kind) || ins.operand_count != 2) { ret 0; }
-    val found: opt[*ir_type.IrType] = ir_type.get(types, ins.ty);
+fun int_bits(types: *ir_type.IrTypeTable, ty: ir_type.IrTypeId) u32 {
+    val found: opt[*ir_type.IrType] = ir_type.get(types, ty);
     if (sel found.none)                     { ret 0; }
     if (found.some.kind != ir_type.IRT_INT) { ret 0; }
     ret found.some.data.bits;
 }
 
-# the analysis is built only for a function that has a shift by a count
-# that is not a constant
-fun mark_function(work: *scratch.Function, alloc: *A.Allocator) res[bool, fail.Fail] {
+# the width of a scalar integer shift, 0 for anything else
+fun shift_bits(types: *ir_type.IrTypeTable, ins: *instruction.Instruction) u32 {
+    if (!is_shift(ins.kind) || ins.operand_count != 2) { ret 0; }
+    ret int_bits(types, ins.ty);
+}
+
+# a count type too narrow to hold the width holds only counts below it, and
+# the width is a constant of every count type the expansion builds it in
+fun count_type_bounds(types: *ir_type.IrTypeTable, ins: *instruction.Instruction, bits: u32) bool {
+    val cb: u32 = int_bits(types, ins.operands[1].ty);
+    ret cb > 0 && cb < 64 && (bits::u64 >> cb::u64) != 0;
+}
+
+# the analysis is built only for a function that has a shift by a count that
+# is not a constant, and it is released before any instruction is added
+fun bound_function(work: *scratch.Function, alloc: *A.Allocator) res[bool, fail.Fail] {
     val m:  *ir.Module   = work.module;
     val fn: *ir.Function = work.body;
 
@@ -85,25 +106,35 @@ fun mark_function(work: *scratch.Function, alloc: *A.Allocator) res[bool, fail.F
         analyzed = true;
     }
 
+    # a proven count keeps the bare shift, a constant one out of range folds
+    # in place, and a variable one is left for the expansion below
     var changed: bool = false;
+    var pending: u32  = 0;
     bi = 0;
     for (bi < fn.block_count) {
         val blk: *ir.Block = ?fn.blocks[bi];
         var ii:  u32       = 0;
         for (ii < blk.instr_count) {
-            val ins:    *instruction.Instruction = ?fn.instrs[blk.instructions[ii]::u32];
-            val bits:   u32                      = shift_bits(?m.types, ins);
-            var proven: bool                     = false;
+            val ins:  *instruction.Instruction = ?fn.instrs[blk.instructions[ii]::u32];
+            val bits: u32                      = shift_bits(?m.types, ins);
             if (bits != 0) {
-                val count: value.Value = ins.operands[1];
-                if (count.kind == value.VAL_CONST_INT) { proven = range.constant_range(?m.types, count).hi < bits::u64; }
-                or (analyzed)                          { proven = range.below(?ra, count, blk.id, bits::u64); }
-            }
-            var flags: u16 = ins.flags & (0xFFFF - instruction.INSTR_FLAG_COUNT_BOUNDED);
-            if (proven) { flags = flags | instruction.INSTR_FLAG_COUNT_BOUNDED; }
-            if (flags != ins.flags) {
-                ins.flags = flags;
-                changed   = true;
+                val count:  value.Value = ins.operands[1];
+                var proven: bool        = count_type_bounds(?m.types, ins, bits);
+                if (count.kind == value.VAL_CONST_INT) { proven = proven || range.constant_range(?m.types, count).hi < bits::u64; }
+                or (analyzed && !proven)               { proven = range.below(?ra, count, blk.id, bits::u64); }
+                val was:      u16                   = ins.flags;
+                val was_kind: instruction.InstrKind = ins.kind;
+                if (proven) {
+                    ins.flags = ins.flags | instruction.INSTR_FLAG_COUNT_BOUNDED;
+                }
+                or (count.kind == value.VAL_CONST_INT) {
+                    saturate_constant(?m.types, ins, bits);
+                }
+                or {
+                    ins.flags = ins.flags & (0xFFFF - instruction.INSTR_FLAG_COUNT_BOUNDED);
+                    pending   = pending + 1;
+                }
+                if (ins.flags != was || ins.kind != was_kind) { changed = true; }
             }
             ii = ii + 1;
         }
@@ -114,5 +145,292 @@ fun mark_function(work: *scratch.Function, alloc: *A.Allocator) res[bool, fail.F
         range.dnit(?ra);
         loops.dnit(?la);
     }
-    ret res[bool, fail.Fail].ok{changed};
+    if (pending == 0) { ret res[bool, fail.Fail].ok{changed}; }
+
+    val er: err[fail.Fail] = expand_function(m, fn, alloc);
+    if (sel er.err) { ret res[bool, fail.Fail].err{er.err}; }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# a constant count at or above the width, which a fold exposed after the
+# front end refused every literal one: a logical shift is 0, an and with
+# zero, and an arithmetic one shifts by W - 1
+fun saturate_constant(types: *ir_type.IrTypeTable, ins: *instruction.Instruction, bits: u32) {
+    if (ins.kind == instruction.OP_SHR_S) {
+        ins.operands[1] = value.const_int((bits - 1)::u64, ins.operands[1].ty);
+        ins.flags       = ins.flags | instruction.INSTR_FLAG_COUNT_BOUNDED;
+        ret;
+    }
+    ins.kind        = instruction.OP_AND;
+    ins.operands[1] = value.const_int(0, ins.ty);
+    ins.flags       = ins.flags & (0xFFFF - instruction.INSTR_FLAG_COUNT_BOUNDED);
+}
+
+# how many times each instruction's value is read by a listed instruction,
+# debug reads included, so a value moved or reassociated has no other reader,
+# and the last listed instruction that reads it, its sole reader when the
+# count is one. both are taken before any block is relisted
+rec Uses {
+    count:  *u32;
+    reader: *id.InstructionId;
+    len:    u32;
+}
+
+fun count_uses(fn: *ir.Function, alloc: *A.Allocator) res[Uses, fail.Fail] {
+    var uses: Uses;
+    uses.len = fn.instr_len;
+    val cr: res[*u32, A.Error] = A.allocate[u32](alloc, fn.instr_len::usize);
+    if (sel cr.err) { ret res[Uses, fail.Fail].err{fail.refused(cr.err)}; }
+    uses.count = cr.ok;
+    val rr: res[*id.InstructionId, A.Error] = A.allocate[id.InstructionId](alloc, fn.instr_len::usize);
+    if (sel rr.err) { ret res[Uses, fail.Fail].err{fail.refused(rr.err)}; }
+    uses.reader = rr.ok;
+    var i: u32 = 0;
+    for (i < fn.instr_len) {
+        uses.count[i]  = 0;
+        uses.reader[i] = id.INSTR_NIL;
+        i              = i + 1;
+    }
+    var bi: u32 = 0;
+    for (bi < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[bi];
+        var k:   u32       = 0;
+        for (k < blk.phi_count) {
+            count_operands(fn, blk.phis[k], ?uses);
+            k = k + 1;
+        }
+        k = 0;
+        for (k < blk.instr_count) {
+            count_operands(fn, blk.instructions[k], ?uses);
+            k = k + 1;
+        }
+        if (blk.terminator != id.INSTR_NIL) { count_operands(fn, blk.terminator, ?uses); }
+        bi = bi + 1;
+    }
+    ret res[Uses, fail.Fail].ok{uses};
+}
+
+fun count_operands(fn: *ir.Function, iid: id.InstructionId, uses: *Uses) {
+    if (iid::u32 >= fn.instr_len) { ret; }
+    val ins: *instruction.Instruction = ?fn.instrs[iid::u32];
+    var o:   u32                      = 0;
+    for (o < ins.operand_count) {
+        val v: value.Value = ins.operands[o];
+        if (v.kind == value.VAL_INSTR && v.data.instr::u32 < fn.instr_len && !refs.operand_is_block(ins.kind, o)) {
+            uses.count[v.data.instr::u32]  = uses.count[v.data.instr::u32] + 1;
+            uses.reader[v.data.instr::u32] = iid;
+        }
+        o = o + 1;
+    }
+}
+
+# each block holding an unmarked shift is relisted with the saturation of each
+# one listed ahead of it. `old` is the block's former list, which the
+# expansion reads while the block's own list is rebuilt
+fun expand_function(m: *ir.Module, fn: *ir.Function, alloc: *A.Allocator) err[fail.Fail] {
+    val ur: res[Uses, fail.Fail] = count_uses(fn, alloc);
+    if (sel ur.err) { ret err[fail.Fail].err{ur.err}; }
+    var uses: Uses = ur.ok;
+    val len:  u32  = uses.len;
+
+    var bi: u32 = 0;
+    for (bi < fn.block_count) {
+        if (block_has_unmarked(m, fn, bi)) {
+            val n:  u32                             = fn.blocks[bi].instr_count;
+            val lr: res[*id.InstructionId, A.Error] = A.allocate[id.InstructionId](alloc, n::usize);
+            if (sel lr.err) { ret err[fail.Fail].err{fail.refused(lr.err)}; }
+            val old: *id.InstructionId = lr.ok;
+            var k:   u32               = 0;
+            for (k < n) {
+                old[k] = fn.blocks[bi].instructions[k];
+                k      = k + 1;
+            }
+            fn.blocks[bi].instr_count = 0;
+            k                         = 0;
+            for (k < n) {
+                val iid: id.InstructionId = old[k];
+                if (iid::u32 < len && shift_bits(?m.types, ?fn.instrs[iid::u32]) != 0
+                    && (fn.instrs[iid::u32].flags & instruction.INSTR_FLAG_COUNT_BOUNDED) == 0) {
+                    val ex: err[fail.Fail] = expand_shift(m, fn, bi, iid, ?uses);
+                    if (sel ex.err) { ret ex; }
+                }
+                val ap: err[fail.Fail] = ir.block_append_instr(m, ?fn.blocks[bi], iid);
+                if (sel ap.err) { ret ap; }
+                k = k + 1;
+            }
+        }
+        bi = bi + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun block_has_unmarked(m: *ir.Module, fn: *ir.Function, bi: u32) bool {
+    val blk: *ir.Block = ?fn.blocks[bi];
+    var k:   u32       = 0;
+    for (k < blk.instr_count) {
+        val ins: *instruction.Instruction = ?fn.instrs[blk.instructions[k]::u32];
+        if (shift_bits(?m.types, ins) != 0 && (ins.flags & instruction.INSTR_FLAG_COUNT_BOUNDED) == 0) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# the new instruction `kind(a, b)` of type `ty`, listed at the end of block
+# `bi`, where it reads as the shift `site` it saturates: the same source
+# location and inline site. its result is secret when an operand is
+fun emit(m: *ir.Module, fn: *ir.Function, bi: u32, site: id.InstructionId, kind: instruction.InstrKind,
+    ty: ir_type.IrTypeId, a: value.Value, b: value.Value) res[value.Value, fail.Fail] {
+    ret emit_n(m, fn, bi, site, kind, ty, a, b, 2);
+}
+
+fun emit_n(m: *ir.Module, fn: *ir.Function, bi: u32, site: id.InstructionId, kind: instruction.InstrKind,
+    ty: ir_type.IrTypeId, a: value.Value, b: value.Value, n: u32) res[value.Value, fail.Fail] {
+    val ar: res[ir.OperandArray, fail.Fail] = ir.operands_alloc(m, n);
+    if (sel ar.err) { ret res[value.Value, fail.Fail].err{ar.err}; }
+    ar.ok.ops[0] = a;
+    if (n > 1) { ar.ok.ops[1] = b; }
+    val secret: bool = a.secret || (n > 1 && b.secret);
+    var ins:    instruction.Instruction;
+    ins.kind          = kind;
+    ins.ty            = ty;
+    ins.operands      = ar.ok.ops;
+    ins.operand_count = n;
+    ins.operand_cap   = n;
+    ins.flags         = 0;
+    ins.aux_ty        = ir_type.IRT_NIL;
+    ins.loc           = fn.instrs[site::u32].loc;
+    ins.secret        = secret;
+    ins.arg_ext       = ir_type.EXT_LIST_NONE;
+    val inline_site: u32                              = ir.instr_inline_site_of(fn, site);
+    val added:       res[id.InstructionId, fail.Fail] = ir.instruction_add(m, fn, ins);
+    if (sel added.err) { ret res[value.Value, fail.Fail].err{added.err}; }
+    if (inline_site != 0) {
+        val ss: err[fail.Fail] = ir.instr_inline_site_set(fn, added.ok, inline_site);
+        if (sel ss.err) { ret res[value.Value, fail.Fail].err{ss.err}; }
+    }
+    val ap: err[fail.Fail] = ir.block_append_instr(m, ?fn.blocks[bi], added.ok);
+    if (sel ap.err) { ret res[value.Value, fail.Fail].err{ap.err}; }
+    var v: value.Value = value.instr(added.ok, ty);
+    v.secret = secret;
+    ret res[value.Value, fail.Fail].ok{v};
+}
+
+fun unary(m: *ir.Module, fn: *ir.Function, bi: u32, site: id.InstructionId, kind: instruction.InstrKind,
+    a: value.Value) res[value.Value, fail.Fail] {
+    ret emit_n(m, fn, bi, site, kind, a.ty, a, a, 1);
+}
+
+# the operand of a scalar `and` that is its constant, or none
+fun and_constant(ins: *instruction.Instruction) opt[u32] {
+    if (ins.kind != instruction.OP_AND || ins.operand_count != 2) { ret opt[u32].none{}; }
+    val c0: bool = ins.operands[0].kind == value.VAL_CONST_INT;
+    val c1: bool = ins.operands[1].kind == value.VAL_CONST_INT;
+    if (c1 && !c0) { ret opt[u32].some{1}; }
+    if (c0 && !c1) { ret opt[u32].some{0}; }
+    ret opt[u32].none{};
+}
+
+# the sole reader of `iid` when it is an and with a constant of type `ty`
+fun single_and_reader(fn: *ir.Function, iid: id.InstructionId, ty: ir_type.IrTypeId, uses: *Uses) opt[id.InstructionId] {
+    if (uses.count[iid::u32] != 1) { ret opt[id.InstructionId].none{}; }
+    val r: id.InstructionId = uses.reader[iid::u32];
+    if (r::u32 >= uses.len || fn.instrs[r::u32].ty != ty) { ret opt[id.InstructionId].none{}; }
+    val kc: opt[u32] = and_constant(?fn.instrs[r::u32]);
+    if (sel kc.none) { ret opt[id.InstructionId].none{}; }
+    ret opt[id.InstructionId].some{r};
+}
+
+# drop `iid` from the part of block `bi` relisted so far, if it is there
+fun unlist(fn: *ir.Function, bi: u32, iid: id.InstructionId) bool {
+    val blk: *ir.Block = ?fn.blocks[bi];
+    var k:   u32       = 0;
+    for (k < blk.instr_count) {
+        if (blk.instructions[k] == iid) {
+            var j: u32 = k;
+            for (j + 1 < blk.instr_count) {
+                blk.instructions[j] = blk.instructions[j + 1];
+                j                   = j + 1;
+            }
+            blk.instr_count = blk.instr_count - 1;
+            ret true;
+        }
+        k = k + 1;
+    }
+    ret false;
+}
+
+fun expand_shift(m: *ir.Module, fn: *ir.Function, bi: u32, sid: id.InstructionId, uses: *Uses) err[fail.Fail] {
+    val kind:  instruction.InstrKind = fn.instrs[sid::u32].kind;
+    val ty:    ir_type.IrTypeId      = fn.instrs[sid::u32].ty;
+    val v:     value.Value           = fn.instrs[sid::u32].operands[0];
+    val count: value.Value           = fn.instrs[sid::u32].operands[1];
+    val bits:  u32                   = int_bits(?m.types, ty);
+    if (int_bits(?m.types, count.ty) == 0) {
+        ret err[fail.Fail].err{fail.message("shiftbound: a scalar shift's count is not an integer")};
+    }
+    val width: value.Value = value.const_int(bits::u64, count.ty);
+    val low:   value.Value = value.const_int((bits - 1)::u64, count.ty);
+
+    if (kind == instruction.OP_SHR_S) {
+        val mr: res[value.Value, fail.Fail] = emit(m, fn, bi, sid, instruction.OP_MASK_LT_U, count.ty, count, width);
+        if (sel mr.err) { ret err[fail.Fail].err{mr.err}; }
+        val nr: res[value.Value, fail.Fail] = unary(m, fn, bi, sid, instruction.OP_NOT, mr.ok);
+        if (sel nr.err) { ret err[fail.Fail].err{nr.err}; }
+        val fr: res[value.Value, fail.Fail] = emit(m, fn, bi, sid, instruction.OP_OR, count.ty, count, nr.ok);
+        if (sel fr.err) { ret err[fail.Fail].err{fr.err}; }
+        val cr: res[value.Value, fail.Fail] = emit(m, fn, bi, sid, instruction.OP_AND, count.ty, fr.ok, low);
+        if (sel cr.err) { ret err[fail.Fail].err{cr.err}; }
+        fn.instrs[sid::u32].operands[1] = cr.ok;
+        fn.instrs[sid::u32].flags       = fn.instrs[sid::u32].flags | instruction.INSTR_FLAG_COUNT_BOUNDED;
+        ret err[fail.Fail].ok{};
+    }
+
+    val mr: res[value.Value, fail.Fail] = emit(m, fn, bi, sid, instruction.OP_MASK_LT_U, ty, count, width);
+    if (sel mr.err) { ret err[fail.Fail].err{mr.err}; }
+    val cr: res[value.Value, fail.Fail] = emit(m, fn, bi, sid, instruction.OP_AND, count.ty, count, low);
+    if (sel cr.err) { ret err[fail.Fail].err{cr.err}; }
+    val mask: value.Value = mr.ok;
+
+    # the result's one reader `r & K` reads `r & (m & K)`
+    val reader: opt[id.InstructionId] = single_and_reader(fn, sid, ty, uses);
+    if (sel reader.some) {
+        val ui: u32      = reader.some::u32;
+        val kc: opt[u32] = and_constant(?fn.instrs[ui]);
+        if (sel kc.some) {
+            val kr: res[value.Value, fail.Fail] = emit(m, fn, bi, sid, instruction.OP_AND, ty, mask, fn.instrs[ui].operands[kc.some]);
+            if (sel kr.err) { ret err[fail.Fail].err{kr.err}; }
+            fn.instrs[ui].operands[kc.some] = kr.ok;
+            if (kr.ok.secret) { fn.instrs[ui].secret = true; }
+            fn.instrs[sid::u32].operands[1] = cr.ok;
+            fn.instrs[sid::u32].flags       = fn.instrs[sid::u32].flags | instruction.INSTR_FLAG_COUNT_BOUNDED;
+            ret err[fail.Fail].ok{};
+        }
+    }
+
+    # the value's one reader is the shift and it is `y & K` listed ahead of
+    # it in this block: it moves after the mask and reads `y & (m & K)`
+    if (v.kind == value.VAL_INSTR && v.data.instr::u32 < uses.len && uses.count[v.data.instr::u32] == 1) {
+        val vi: u32      = v.data.instr::u32;
+        val kc: opt[u32] = and_constant(?fn.instrs[vi]);
+        if (sel kc.some) {
+            if (fn.instrs[vi].ty == ty && unlist(fn, bi, v.data.instr)) {
+                val kr: res[value.Value, fail.Fail] = emit(m, fn, bi, sid, instruction.OP_AND, ty, mask, fn.instrs[vi].operands[kc.some]);
+                if (sel kr.err) { ret err[fail.Fail].err{kr.err}; }
+                fn.instrs[vi].operands[kc.some] = kr.ok;
+                if (kr.ok.secret) { fn.instrs[vi].secret = true; }
+                val ap: err[fail.Fail] = ir.block_append_instr(m, ?fn.blocks[bi], v.data.instr);
+                if (sel ap.err) { ret ap; }
+                fn.instrs[sid::u32].operands[1] = cr.ok;
+                fn.instrs[sid::u32].flags       = fn.instrs[sid::u32].flags | instruction.INSTR_FLAG_COUNT_BOUNDED;
+                ret err[fail.Fail].ok{};
+            }
+        }
+    }
+
+    val vr: res[value.Value, fail.Fail] = emit(m, fn, bi, sid, instruction.OP_AND, ty, v, mask);
+    if (sel vr.err) { ret err[fail.Fail].err{vr.err}; }
+    fn.instrs[sid::u32].operands[0] = vr.ok;
+    fn.instrs[sid::u32].operands[1] = cr.ok;
+    fn.instrs[sid::u32].flags       = fn.instrs[sid::u32].flags | instruction.INSTR_FLAG_COUNT_BOUNDED;
+    ret err[fail.Fail].ok{};
 }

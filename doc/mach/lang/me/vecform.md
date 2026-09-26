@@ -26,8 +26,9 @@ a vector shift whose count is one scalar rather than a vector of lane counts
 pub rec LaneDesc;
 ```
 
-from_bits is the operand lane width, which only a conversion or a widening
-multiply changes
+from_bits and from_lanes are the operand's lane width and lane count, which
+only a conversion, a widening multiply, a lane-halving extension or a lane
+range changes
 
 ## fun lane_desc
 
@@ -96,6 +97,24 @@ pub fun widen_half_packs(m: *ir.Module, tgt: *target.Target, kind: instruction.I
 
 whether a lane-halving extension of a `from_ty` vector into `ty` is a cell
 the target packs at these lanes; the catalog is the only judge
+
+## fun conversion_packs
+
+```mach
+pub fun conversion_packs(m: *ir.Module, tgt: *target.Target, kind: instruction.InstrKind, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
+```
+
+whether the lane-wise conversion `kind` of a `from_ty` vector into `ty` is a
+cell the target packs at these lanes; the catalog is the only judge
+
+## fun range_packs
+
+```mach
+pub fun range_packs(m: *ir.Module, tgt: *target.Target, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
+```
+
+whether a lane range of a `from_ty` vector into `ty` is a cell the target
+packs at these lanes; the catalog is the only judge
 
 ## fun holds_in_register
 

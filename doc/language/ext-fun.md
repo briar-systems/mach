@@ -116,8 +116,11 @@ The *fixed* parameters diverge on Apple arm64 too, on a separate axis: a fixed
 argument that lands on the stack there takes its **natural size and alignment**,
 where AAPCS64 rounds every stack argument up to an 8-byte slot. Past the eight GP
 registers, `(…, int i, short j, long long k)` occupies `[sp+0]`, `[sp+4]`, `[sp+8]`
-on `darwin-aarch64` and `[sp+0]`, `[sp+8]`, `[sp+16]` on `linux-arm64`. Mach applies
-each target's own rule, so nothing in a declaration has to say which one is in force.
+on `darwin-aarch64` and `[sp+0]`, `[sp+8]`, `[sp+16]` on `linux-arm64`. A record
+that is not a homogeneous float or vector aggregate is the exception: Apple arm64
+gives it a slot aligned to at least 8 bytes and rounded up to a multiple of 8, as
+AAPCS64 does. Mach applies each target's own rule, so nothing in a declaration has
+to say which one is in force.
 Note only that Apple's two rules genuinely differ from each other: the variadic tail
 in the table above keeps its 8-byte minimum on the very target where a fixed argument
 does not.

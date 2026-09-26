@@ -118,9 +118,9 @@ cannot afford them.
 A target that gains wider vector registers therefore gets **better code**, not
 new spellings. Until then a shape wider than the register is the second answer:
 `f32x8` and `i32x8` compile on x86-64, where the vector register is 128 bits, as
-one scalar operation per lane through a stack slot, eight for one `+`; the build
-note under `simd = "scalarize"` counts these sites and `simd = "require"` refuses
-them. A kernel written for the 128-bit seed uses the register-width shapes (`f32x4`,
+one scalar operation per lane through a stack slot, eight for one `+`; under
+`simd = "scalarize"` each such operation warns at its site and `simd = "require"`
+refuses them. A kernel written for the 128-bit seed uses the register-width shapes (`f32x4`,
 `i32x4`, `i16x8`) and takes the wider ones only where the cost is accepted.
 
 `ptr` is not a lane element: its width is target-defined rather than a scalar bit

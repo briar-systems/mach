@@ -181,6 +181,11 @@ The exit code of `mach test`:
   user error such as an unknown flag.
 - `2` — a build or internal error before the tests could run, or a test that
   failed for an infrastructure reason (the harness, not the test).
+- `3` — an environment failure before the tests could run: a file, directory
+  or process operation the machine refused.
+
+These are the codes every `mach` command shares (`mach help <command>` lists
+them under `exit:`); `test` only adds what `1` also means.
 
 `--list` prints each selected test's qualified name and the test object that
 holds it, and exits without linking or running anything:
