@@ -1832,7 +1832,7 @@ pub fun op_mem_value(base: VRegId, disp: i64) MirOperand;
 ## fun op_sym
 
 ```mach
-pub fun op_sym(sym: intern.StrId, sym_off: i32) MirOperand;
+pub fun op_sym(sym: intern.StrId, sym_off: i64) MirOperand;
 ```
 
 ## fun op_block

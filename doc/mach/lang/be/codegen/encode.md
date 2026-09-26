@@ -447,7 +447,7 @@ hooks: *EncodeHooks, asm_out: *writer.Writer) res[EncoderOutput, fail.Fail];
 
 ```mach
 pub fun classify_refs(mi: *mir.MirInstr, target_block: *u32, has_block: *bool,
-sym: *intern.StrId, has_sym: *bool, sym_addend: *i32);
+sym: *intern.StrId, has_sym: *bool, sym_addend: *i64);
 ```
 
 ## fun push_symbol
@@ -471,7 +471,7 @@ pub fun push_frame_step(st: *EncodeState, kind: u8, reg: u8, end_off: u32, value
 ## fun push_reloc
 
 ```mach
-pub fun push_reloc(st: *EncodeState, offset: u32, kind: of.RelocKind, sym: intern.StrId, addend: i32) err[fail.Fail];
+pub fun push_reloc(st: *EncodeState, offset: u32, kind: of.RelocKind, sym: intern.StrId, addend: i64) err[fail.Fail];
 ```
 
 ## fun bind_reloc_pair

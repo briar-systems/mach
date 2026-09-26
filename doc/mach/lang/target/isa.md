@@ -885,6 +885,26 @@ pub fun packed_lane_cap(m: *MachineModel, lane_bits: u32) u32;
 pub fun moves_unaligned_gp(m: *MachineModel, bytes: u32) bool;
 ```
 
+## fun offset_fits
+
+```mach
+pub fun offset_fits(bits: u32, off: i64) bool;
+```
+
+a constant offset fits a signed field of `bits` bits; 0 bits is no bound
+
+## fun sym_offset_folds
+
+```mach
+pub fun sym_offset_folds(m: *MachineModel, off: i64) bool;
+```
+
+## fun mem_disp_folds
+
+```mach
+pub fun mem_disp_folds(m: *MachineModel, off: i64) bool;
+```
+
 ## fun moves_vector_memory
 
 ```mach
@@ -1712,7 +1732,7 @@ pub fun make_sym_mod(sym_id: u32, size: u8, mod: SymModifier) Operand;
 ## fun make_sym_addend
 
 ```mach
-pub fun make_sym_addend(sym_id: u32, size: u8, mod: SymModifier, addend: i32) Operand;
+pub fun make_sym_addend(sym_id: u32, size: u8, mod: SymModifier, addend: i64) Operand;
 ```
 
 ## fun inst_blank
