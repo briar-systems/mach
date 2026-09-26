@@ -27,7 +27,7 @@ test/
 ```
 bash test/run.sh                          # every target built, and the differential on the ones this host can execute
 bash test/run.sh --target x86_64-linux    # one target (repeatable)
-bash test/run.sh --case bits/logic_u32    # one case (repeatable)
+bash test/run.sh --case bits/logic        # one case (repeatable)
 bash test/run.sh --qemu                   # also execute aarch64-linux, riscv64-linux, riscv64zkt-linux and riscv32 under qemu-user
 bash test/run.sh --dwarf                  # also build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
 bash test/run.sh --link [--qemu]          # the link cases instead of the corpus (--case <name> selects one)

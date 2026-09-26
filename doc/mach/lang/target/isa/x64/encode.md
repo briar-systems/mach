@@ -68,24 +68,6 @@ intel order, plus the implicit effects the form carries. every opcode
 notifiable_opcode admits has a row; the two pseudo entries and anything
 outside the catalog describe as unknown
 
-## val PROBED_ROW_COUNT
-
-```mach
-pub val PROBED_ROW_COUNT: usize = 26
-```
-
-## rec ProbedRow
-
-```mach
-pub rec ProbedRow;
-```
-
-## fun probed_rows
-
-```mach
-pub fun probed_rows(out: *ProbedRow) u32;
-```
-
 ## fun asm_ct_scan
 
 ```mach

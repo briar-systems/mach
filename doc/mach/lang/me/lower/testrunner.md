@@ -6,6 +6,8 @@
 pub rec Test;
 ```
 
+name: the qualified name `<module path>#<identifier>`, which is also the test's symbol
+
 ## rec Collected
 
 ```mach
