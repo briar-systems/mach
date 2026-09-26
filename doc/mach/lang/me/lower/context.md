@@ -54,6 +54,26 @@ pub rec ValueInstance;
 pub rec PackInstance;
 ```
 
+## rec NormalObject
+
+```mach
+pub rec NormalObject;
+```
+
+a module's test object holds its tests and `#[testing]` declarations beside its
+normal object, which it never changes. every definition the normal object already
+holds is declared in the test object instead, so each symbol has one definition
+
+defined: the global symbols the normal object defines
+
+## fun normal_defines
+
+```mach
+pub fun normal_defines(lc: *LowerContext, name: intern.StrId) bool;
+```
+
+lowering the test object, which declares `name` because the normal object defines it
+
 ## rec ModuleScope
 
 ```mach
@@ -117,7 +137,7 @@ own_module: session.ModuleId,
 sema_result: *sema.SemaResult,
 rr: *resolve.ResolveResult,
 ctx: *comptime.ComptimeCtx,
-test_mode: bool,
+normal_object: *NormalObject,
 shared_artifact: bool,
 debug: bool,
 checks: bool,
