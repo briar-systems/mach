@@ -741,6 +741,36 @@ name: intern.StrId) ObjectImage;
 pub fun object_image_dnit(image: *ObjectImage);
 ```
 
+## fun section_install
+
+```mach
+pub fun section_install(o: *ObjectImage, s: *Section) res[u32, fail.Fail];
+```
+
+## fun symbol_add
+
+```mach
+pub fun symbol_add(o: *ObjectImage, sym: Symbol) res[u32, fail.Fail];
+```
+
+## fun export_request_add
+
+```mach
+pub fun export_request_add(o: *ObjectImage, name: intern.StrId) err[fail.Fail];
+```
+
+## fun add_frame
+
+```mach
+pub fun add_frame(o: *ObjectImage, fr: *FrameUnwind) err[fail.Fail];
+```
+
+## fun add_relocation
+
+```mach
+pub fun add_relocation(o: *ObjectImage, rel: Relocation) err[fail.Fail];
+```
+
 ## fun validate_object_view
 
 ```mach
