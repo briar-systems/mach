@@ -54,10 +54,14 @@ symbols through the surface — they never name the split files directly.
 
 ```mach
 # file: src/foo/a.mach
-pub fun one() i64 { ret 1; }
+pub fun one() i64 {
+    ret 1;
+}
 
 # file: src/foo/b.mach
-pub fun two() i64 { ret 2; }
+pub fun two() i64 {
+    ret 2;
+}
 
 # file: src/foo.mach
 use example.foo.a;
@@ -66,9 +70,9 @@ fwd a.one;
 fwd b.two;
 
 # file: src/main.mach
-use std.runtime;
-use print: std.print;
 use example.foo;
+use std.print;
+use std.runtime;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {

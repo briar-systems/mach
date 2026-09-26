@@ -18,15 +18,19 @@ val pi: f64 = 3.14159;
 val n:  i64 = 42;
 
 var counter: i64 = 0;
-var buf:     [256]u8;               # default-initialized to zero
+var buf:     [256]u8; # default-initialized to zero
 
-fun bump() { counter = counter + 1; }   # var is reassignable
+fun bump() {
+    counter = counter + 1; # var is reassignable
+}
 ```
 
 ```mach error a `val` is immutable
 val n: i64 = 42;
 
-fun change() { n = 43; }            # ERROR: `n` is a val
+fun change() {
+    n = 43; # ERROR: `n` is a val
+}
 ```
 
 ## Immutability
@@ -77,9 +81,11 @@ forward reference the linker resolves, so it is **storage-less** and carries no
 initializer:
 
 ```mach
-ext var errno: i32;                        # imported mutable datum
-#[symbol("environ")] ext var env: **u8;    # renamed import
-#[library("libfoo.so")] ext val foo_flags: u32;  # library-pinned import
+ext var errno: i32; # imported mutable datum
+#[symbol("environ")]
+ext var env: **u8; # renamed import
+#[library("libfoo.so")]
+ext val foo_flags: u32; # library-pinned import
 ```
 
 - No initializer. `ext val x: T = ...;` is an error — the definition, and its

@@ -1215,10 +1215,13 @@ branch. `version` selects among releases.
 ### Releases and resolution
 
 A **release** of a git dependency is a tag `vX.Y.Z` (optionally
-`vX.Y.Z-pre`) together with the `mach.toml` at that tag. A tag whose manifest's
-`[project].version` differs from the tag name is not a candidate (`release
-v1.1.0 (<commit>) is not a candidate: its [project].version does not match the
-tag`).
+`vX.Y.Z-pre`) together with the `mach.toml` at that tag. A tag whose manifest
+does not load, as an old tag's written for an earlier manifest schema, or whose
+`[project].version` differs from the tag name is not a candidate. Resolution
+sets it aside and keeps looking. When nothing fits, the error lists it among the
+requirements (`gl 0.1.0 is not a candidate: its mach.toml does not load: unknown
+key 'name' in [project]`, or `... its [project].version does not match the
+tag`), so the error never reads as one in the project's own `mach.toml`.
 
 Resolution runs in exactly three places: `mach dep add`, `mach dep update` and
 `mach dep outdated`. **Builds never resolve.** They verify, offline (see
@@ -1239,8 +1242,14 @@ the same problem, and the error names each by its chain (`root -> c requires b
 Among the choices that satisfy all three, it takes the highest release of each
 identity. The result is written as gitlinks, like any other pin; there is
 still no lock file. `mach dep update <path> <name>` keeps every other
-identity at its current release while that release still fits, so an update
-moves as little as it can. `--all` resolves from scratch.
+identity at its pinned release (the release its recorded gitlink carries) while
+that release still fits, so an update moves as little as it can. `--all`
+resolves from scratch. A pin the range no longer admits, as after the range is
+raised past it, is re-pinned to the release resolution picks; `update` never
+keeps it. The recorded gitlink is the pin, not whatever the checkout holds: a
+checkout that drifted from its gitlink is moved to the chosen release and the
+gitlink staged in the same run, even when the drifted checkout already sits at
+that release.
 
 When nothing fits, the error lists every requirement that took part and names
 the identity the root can settle:
@@ -1323,8 +1332,10 @@ hedgeacme -> hedge -> std which requires ref = "tag/v2.1.0"; nothing checks that
 
 A requirement that asks for exactly the root's selection is no override and is
 not noted. `mach dep list` shows each root declaration's winning selection
-(`ref=`, `version=` or `path=`, and the recorded `pin=`) and, under it, every
-requirement it overrides (`overrides hedgeacme -> hedge -> std, which requires
+(`ref=`, `version=` or `path=`, and the recorded `pin=`), its state
+(`realized`, `missing`, or, for a `version` selection whose range excludes the
+pinned release, `out of range (the pinned release 7.0.2 is outside ^8.0)`) and,
+under it, every requirement it overrides (`overrides hedgeacme -> hedge -> std, which requires
 ref = "tag/v2.1.0"`). `mach dep outdated` names the requirements of a chosen
 release that a root or a fixed dependency overrides (`root declares b by ref
 "branch/main", overriding root -> a 1.0.0 requires b ^1.2`).
@@ -1818,6 +1829,12 @@ for.
 refused otherwise, naming the cells it resolved to. Two artifacts collide on one
 output path the same way two targets do: each would link over the previous, leaving
 only the last with no warning. Narrow with `--bin`/`--lib` and `--target`.
+
+`-o` names a canonical path inside the project root, as an artifact's `out` does:
+relative, `/`-separated, with no `.` or `..` component and no empty one.
+`-o ../mach`, `-o ./mach` and `-o /tmp/mach` are refused with `-o must name a
+canonical path inside the project root`, so a build never writes outside the
+tree it was asked to build.
 
 ### When one cell fails
 

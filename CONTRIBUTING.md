@@ -24,6 +24,45 @@ The compiler is written to `out/<target>/<profile>/bin/mach`, or
 `out/linux-x86_64/debug/bin/mach`.
 
 
+## Fixpoint
+
+A change to the compiler has to reach the self-host fixpoint: the compiler it
+builds must build itself byte for byte. The stages start from a seed, a
+published release fetched and checked against the release's `SHA256SUMS`, as
+CI does in `.github/actions/seed-mach`. The seed is the tag that action pins
+(its `default: v...` line), not whichever `mach` happens to be on `PATH`. From
+the repository root on x86_64 Linux:
+
+```bash
+v=$(sed -n 's/^ *default: v//p' .github/actions/seed-mach/action.yml)
+t=x86_64-linux
+gh release download "v$v" -R briar-systems/mach -p "mach-$v-$t.tar.gz" -p SHA256SUMS -D ../mach-seed
+(cd ../mach-seed && grep " mach-$v-$t.tar.gz\$" SHA256SUMS | sha256sum -c - && tar -xzf "mach-$v-$t.tar.gz" mach)
+../mach-seed/mach dep pull .
+../mach-seed/mach build . --bin mach -o a
+./a build . -o b
+./b build . -o c
+cmp b c
+```
+
+The seed builds `a` from your tree. `a` builds `b`, and `b` builds `c`. `cmp`
+prints nothing and exits 0 when `b` and `c` are identical, which is the
+evidence a pull request states. The seed builds the `mach` binary and nothing
+else. Run the unit suites with `c`, as in [Testing and
+formatting](#testing-and-formatting), because the test code may use language
+the seed release predates. A release newer than the pin builds `a` too, and an
+older one is not supported. On macOS use `aarch64-darwin` or `x86_64-darwin`
+and `shasum -a 256 -c`. On Windows the archive is `mach-$v-x86_64-windows.zip`
+holding `mach.exe`, the seed builds `--bin mach-windows`, and the outputs are
+`a.exe`, `b.exe` and `c.exe`. Add `--profile release` to every build for the
+release fixpoint.
+
+`-o` names a canonical path inside the project root: relative, `/`-separated,
+with no `.` or `..` component. `-o ../a`, `-o ./a` and an absolute path are
+refused with `-o must name a canonical path inside the project root`, so keep
+the stage outputs in the checkout. `.gitignore` covers `a`, `b` and `c`.
+
+
 ## Testing and formatting
 
 Run the tests and the formatter through the compiler you just built, never

@@ -160,7 +160,7 @@ pub tag Maybe[T]: u8 {
 # ---
 # [E]: error type
 # err: failure case
-# ok: success case
+# ok:  success case
 pub tag Outcome[E]: u8 {
     err: E;
     ok;
@@ -175,7 +175,7 @@ case must exist on the tag; `doclint` warns at the component otherwise:
 # a unit outcome with a typed failure
 # ---
 # [E]: error type
-# err: failure case
+# err:  failure case
 # done: no such case
 pub tag Outcome[E]: u8 {
     err: E;
