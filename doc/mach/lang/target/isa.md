@@ -1061,8 +1061,12 @@ pub def EmitAsmFn: fun(*A.Allocator, *BackendTarget, *mir.MirModule,
 ## def EmitModuleFn
 
 ```mach
-pub def EmitModuleFn: fun(*A.Allocator, *BackendTarget, *unit_input.Unit, *debug_input.ModuleDebug, **u8, *u32) err[fail.Fail]
+pub def EmitModuleFn: fun(*A.Allocator, *BackendTarget, *unit_input.Unit, *debug_input.ModuleDebug, *of.ObjectImage) err[fail.Fail]
 ```
+
+a whole-module emitter fills the object image codegen initialized: its sections,
+symbols and relocations, in the same neutral kinds a native image carries, with
+section bytes allocated from the image's allocator. names are the emitter's own
 
 ## rec AssemblyCapabilities
 
@@ -1419,7 +1423,7 @@ model: *MachineModel, emitter: *ModuleEmitter) IsaVTable;
 ## fun module_emitter
 
 ```mach
-pub fun module_emitter(emit_module: EmitModuleFn) ModuleEmitter;
+pub fun module_emitter(emit_module: EmitModuleFn, has_assembly: bool) ModuleEmitter;
 ```
 
 ## rec IsaRegistryEntry
@@ -1668,6 +1672,14 @@ pub fun has_codegen(vt: *IsaVTable) bool;
 ```mach
 pub fun emits_whole_module(vt: *IsaVTable) bool;
 ```
+
+## fun has_assembly
+
+```mach
+pub fun has_assembly(vt: *IsaVTable) bool;
+```
+
+whether source may carry `asm` blocks for this instruction set, whichever backend family it has
 
 ## fun emits_relocations
 
