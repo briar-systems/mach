@@ -22,12 +22,12 @@ use std.types.size.usize;
 
 rec Point { x: i64; y: i64; }
 
-val A: u8    = $size_of(Point);   # 16, stored in one byte
-val B: i64   = $size_of(Point);   # the same 16, stored in eight
-val C: usize = $size_of(usize);   # correct at any pointer width
+val A: u8    = $size_of(Point); # 16, stored in one byte
+val B: i64   = $size_of(Point); # the same 16, stored in eight
+val C: usize = $size_of(usize); # correct at any pointer width
 
 rec Huge { a: [300]u8; }
-val D: u8 = $size_of(Huge);       # error: value 300 is out of range for u8 (0..255)
+val D: u8 = $size_of(Huge); # error: value 300 is out of range for u8 (0..255)
 ```
 
 Without a binding to read a width from — an array length, an `#[align(...)]`
@@ -132,10 +132,10 @@ to where it is measured makes no difference:
 ```mach
 rec Pair { a: u64; b: u64; }
 
-#[align($align_of(Pair))]        # a type's alignment
+#[align($align_of(Pair))] # a type's alignment
 rec Over { x: u8; }
 
-rec Holder { buf: [$size_of(Pair)]u8; }   # an array length, inside a field type
+rec Holder { buf: [$size_of(Pair)]u8; } # an array length, inside a field type
 ```
 
 `$offset_of` and a descriptor's `.offset` answer from the same checked layout that
@@ -369,16 +369,18 @@ Inside a generic, `$type_id(T)` is answered per instantiation, as the predicates
 ```mach
 use std.runtime;
 
-rec Point { x: u64; }
+rec Point  { x: u64; }
 rec Box[T] { v: T; }
 
-fun same[T, U]() u8 { ret $type_id(T) == $type_id(U); }
+fun same[T, U]() u8 {
+    ret $type_id(T) == $type_id(U);
+}
 
 #[symbol("main")]
 fun main() i32 {
-    if ($type_id(^Point) == $type_id(Point))     { ret 1; }
+    if ($type_id(^Point) == $type_id(Point))      { ret 1; }
     if ($type_id(Box[u64]) == $type_id(Box[u32])) { ret 2; }
-    if (same[Box[Point], Box[Point]]() == 0)     { ret 3; }
+    if (same[Box[Point], Box[Point]]() == 0)      { ret 3; }
     ret 0;
 }
 ```
@@ -521,15 +523,15 @@ v.[f]                   # comptime field projection: access the field f on v
 ```
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
 rec Pair { x: i64; y: i64; }
 
 fun sum(p: Pair) i64 {
     var total: i64 = 0;
     $each f in $fields(Pair) {
-        total = total + p.[f];      # p.x on iteration 1, p.y on iteration 2
+        total = total + p.[f]; # p.x on iteration 1, p.y on iteration 2
     }
     ret total;
 }
@@ -549,15 +551,15 @@ Because each `$each` iteration re-types `v.[f]` to the concrete field type,
 heterogeneous records work naturally:
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
 rec Mixed { a: i64; b: u8; }
 
 fun total(m: Mixed) i64 {
     var t: i64 = 0;
     $each f in $fields(Mixed) {
-        t = t + m.[f]::i64;     # m.a (i64) on iter 1, m.b (u8) cast to i64 on iter 2
+        t = t + m.[f]::i64; # m.a (i64) on iter 1, m.b (u8) cast to i64 on iter 2
     }
     ret t;
 }
@@ -574,15 +576,15 @@ fun main(argc: i64, argv: **u8) i64 {
 Field descriptor properties can be read inside the loop body:
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
 rec Mixed { a: i64; b: u8; }
 
 fun offsum(m: Mixed) i64 {
     var s: i64 = 0;
     $each f in $fields(Mixed) {
-        s = s + f.offset::i64;    # 0 + 8 = 8 for Mixed { a: i64; b: u8; }
+        s = s + f.offset::i64; # 0 + 8 = 8 for Mixed { a: i64; b: u8; }
     }
     ret s;
 }
@@ -590,7 +592,8 @@ fun offsum(m: Mixed) i64 {
 fun count_i64(m: Mixed) i64 {
     var n: i64 = 0;
     $each f in $fields(Mixed) {
-        $if (f.type == i64) { n = n + 1; } $or { }
+        $if (f.type == i64) { n = n + 1; }
+        $or                 {}
     }
     ret n;
 }
@@ -656,12 +659,14 @@ Inside the loop body, `sel value.[case]` is the case test and `value.[case]` is
 the guarded payload place:
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
 tag Reply: u8 { empty; value: i64; }
 
-fun consume[T](v: T) { print.printlnf("value {}", v); }
+fun consume[T](v: T) {
+    print.printlnf("value {}", v);
+}
 
 fun walk[T](value: T) {
     $each case in $cases(T) {
@@ -726,17 +731,17 @@ variable is an ordinary constant value: it reads as a value, casts, dispatches a
 per-element `$if`, and — for a record element — projects fields with `x.field`.
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
 val PRIMES: [4]i64 = [4]i64{2, 3, 5, 7};
 
 fun sum() i64 {
     var total: i64 = 0;
     $each x in PRIMES {
-        total = total + x;      # x is 2, then 3, then 5, then 7
+        total = total + x; # x is 2, then 3, then 5, then 7
     }
-    ret total;                  # 17
+    ret total; # 17
 }
 
 #[symbol("main")]

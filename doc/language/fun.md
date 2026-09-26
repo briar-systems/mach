@@ -23,7 +23,7 @@ pub fun add(a: i64, b: i64) i64 {
     ret a + b;
 }
 
-pub fun bump() {                        # no return value
+pub fun bump() { # no return value
     counter = counter + 1;
 }
 
@@ -80,7 +80,7 @@ fun maxof[T](a: T, b: T) T {
 }
 
 fun sum[T](p: *T, n: u64) T {
-    var acc: T = 0;                        # the literal takes `T`
+    var acc: T   = 0; # the literal takes `T`
     var i:   u64 = 0;
     for (i < n) {
         acc = acc + p[i];
@@ -145,8 +145,8 @@ function once per distinct call-site type-list; the pack is consumed by
 `$each a in va` at compile time — there is no runtime `va_list`.
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
 pub fun sum(va: ...) i64 {
     var t: i64 = 0;
