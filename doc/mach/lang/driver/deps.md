@@ -111,7 +111,8 @@ pub fun release_needs(ctx: ptr, id: str, url: str, rel: *cand.Release, out: *res
 a release's requirements as the resolver reads them: its compiler range and its dependencies
 selected by version range, or by an exact release tag. a release selecting anything else
 (a branch, a commit, a path) is not reproducible from its tag and is refused (#3496 §7),
-unless the root declares that identity and so selects it itself (#3553)
+unless the root declares that identity and so selects it itself (#3553). a release whose
+manifest does not load or names another version is no candidate, which `out.excluded` says
 
 ## val MACH_KEY_SINCE
 

@@ -12,10 +12,10 @@ def NAME: TYPE;
 ## Examples
 
 ```mach
-pub def Age:    i64;                            # alias for a primitive
-pub def BinOp:  fun(i64, i64) i64;              # alias for a function type
-pub def Anon:   rec { x: i64; y: i64; };        # inline record
-pub def Choice: uni { a: i64; b: f64; };        # inline union
+pub def Age:    i64; # alias for a primitive
+pub def BinOp:  fun(i64, i64) i64; # alias for a function type
+pub def Anon:   rec { x: i64; y: i64; }; # inline record
+pub def Choice: uni { a: i64; b: f64; }; # inline union
 ```
 
 Aliases may name any type: primitives, pointers, arrays, function types,

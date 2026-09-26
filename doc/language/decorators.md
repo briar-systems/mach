@@ -93,14 +93,20 @@ import alone produces no warning.
 ```mach
 # file: src/legacy.mach
 #[deprecated("use replacement")]
-pub fun old() i32 { ret replacement(); }
+pub fun old() i32 {
+    ret replacement();
+}
 
-pub fun replacement() i32 { ret 1; }
+pub fun replacement() i32 {
+    ret 1;
+}
 
 # file: src/main.mach
 use example.legacy;
 
-fun caller() i32 { ret legacy.old(); }      # warning: `old` is deprecated: use replacement
+fun caller() i32 {
+    ret legacy.old(); # warning: `old` is deprecated: use replacement
+}
 ```
 
 It applies to `fun`, `rec`, `uni`, `tag`, `def`, `val`, `var`, `use` and `fwd`
@@ -113,7 +119,8 @@ pub tag Old: u8 { empty; }
 
 pub tag Reply: u8 {
     empty;
-    #[deprecated("use fresh")] value: i64;
+    #[deprecated("use fresh")]
+    value: i64;
     fresh: i64;
 }
 
@@ -121,12 +128,17 @@ pub tag Reply: u8 {
 use example.reply;
 
 fun read(r: reply.Reply) i64 {
-    if (sel r.value) { ret r.value; }        # both sites warn: tag case `value` is deprecated: use fresh
+    if (sel r.value) { ret r.value; } # both sites warn: tag case `value` is deprecated: use fresh
     ret 0;
 }
 
-fun make() reply.Reply { ret reply.Reply.value{1}; }   # construction warns too
-fun stale() reply.Old { ret reply.Old.empty{}; }        # warning: `Old` is deprecated: the whole tag
+fun make() reply.Reply {
+    ret reply.Reply.value{1}; # construction warns too
+}
+
+fun stale() reply.Old {
+    ret reply.Old.empty{}; # warning: `Old` is deprecated: the whole tag
+}
 ```
 
 A deprecated case warns at every external use that names it: `Reply.value{...}`
@@ -234,7 +246,8 @@ Pins an `ext` import to a specific dependency in the link set. Applies to
 `ext` functions only.
 
 ```mach
-#[library("ws2_32.dll")] #[symbol("WSAStartup")]
+#[library("ws2_32.dll")]
+#[symbol("WSAStartup")]
 ext fun wsa_startup(ver: u16, data: *u8) i32;
 ```
 
@@ -283,7 +296,9 @@ and copied instructions preserve effects, assembly bindings and debug locations.
 
 ```mach
 #[inline]
-fun fast_path(x: i64) i64 { ret x * 2; }
+fun fast_path(x: i64) i64 {
+    ret x * 2;
+}
 ```
 
 ### `noinline` — forbid inlining
@@ -294,7 +309,9 @@ Applies to functions only; takes no arguments.
 
 ```mach
 #[noinline]
-fun cold_path(code: i64) i64 { ret code * 100; }
+fun cold_path(code: i64) i64 {
+    ret code * 100;
+}
 ```
 
 Use it to keep a function's frame and symbol real — for a profiler or stack
@@ -368,16 +385,16 @@ frame, a vertex whose stride a buffer fixes. Without it such a shape cannot be
 described as a record at all.
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
 #[packed]
 rec Header {
-    magic:    u8;    # offset 0
-    version:  u16;   # offset 1
-    length:   u32;   # offset 3
-    checksum: u64;   # offset 7
-}                    # $size_of == 15, $align_of == 1
+    magic:    u8; # offset 0
+    version:  u16; # offset 1
+    length:   u32; # offset 3
+    checksum: u64; # offset 7
+} # $size_of == 15, $align_of == 1
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
@@ -399,11 +416,12 @@ The two compose rather than conflict, and each owns one question:
   multiple of `N`.
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
-#[packed] #[align(8)]
-rec Frame { a: u8; b: u32; }   # fields at 0 and 1; $align_of == 8, $size_of == 8
+#[packed]
+#[align(8)]
+rec Frame { a: u8; b: u32; } # fields at 0 and 1; $align_of == 8, $size_of == 8
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
@@ -420,10 +438,10 @@ the rule that composes: an inner type's layout does not change depending on who
 holds it.
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
-rec Point { x: u8; y: u32; }   # natural: y at 4, size 8
+rec Point { x: u8; y: u32; } # natural: y at 4, size 8
 
 #[packed]
 rec Msg { tag: u8; p: Point; } # p at offset 1, still 8 bytes; $size_of(Msg) == 9
@@ -536,10 +554,10 @@ val fb: *Fb = 0xB8000::*Fb;
 fun fill(c: u32) {
     var i: u64 = 0;
     for (i < 1024) {
-        fb.px[i] = c;    # one volatile store per iteration
-        i = i + 1;
+        fb.px[i] = c; # one volatile store per iteration
+        i        = i + 1;
     }
-    fb.status = 1;       # a volatile store, ordered after the loop
+    fb.status = 1; # a volatile store, ordered after the loop
 }
 ```
 
@@ -562,10 +580,14 @@ Places a function or global variable in a named section instead of the
 default `.text` / `.data`.
 
 ```mach
-#[section(".hottext")] #[symbol("f_hot")]
-fun f_hot(x: i64) i64 { ret x + 1; }
+#[section(".hottext")]
+#[symbol("f_hot")]
+fun f_hot(x: i64) i64 {
+    ret x + 1;
+}
 
-#[section(".machsec")] #[symbol("g_sec")]
+#[section(".machsec")]
+#[symbol("g_sec")]
 pub var g_sec: u64 = 100;
 ```
 
@@ -825,10 +847,10 @@ stage.
 
 ```mach
 #[stage("vertex")]
-fun vertex_main() { }
+fun vertex_main() {}
 
 #[stage("fragment")]
-fun fragment_main() { }
+fun fragment_main() {}
 ```
 
 A staged function **takes no parameters and returns nothing**. A pipeline stage
@@ -859,8 +881,9 @@ Sizes the workgroup of a `#[stage("compute")]` function. The three arguments are
 comptime integers giving the x, y and z dimensions.
 
 ```mach
-#[stage("compute")] #[workgroup(64, 1, 1)]
-fun compute_main() { }
+#[stage("compute")]
+#[workgroup(64, 1, 1)]
+fun compute_main() {}
 ```
 
 It requires a stage on the same function — without one it would silently mean
@@ -947,7 +970,8 @@ than varyings.
 
 ```mach
 rec Palette { columns: [512]f32x4; }
-#[storage(0, 3, "readonly")] var palette: Palette;
+#[storage(0, 3, "readonly")]
+var palette: Palette;
 ```
 
 A store through a `"readonly"` binding is a compile error on every target, naming
