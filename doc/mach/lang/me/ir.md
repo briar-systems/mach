@@ -385,12 +385,6 @@ pub fun instr_replace_operands(m: *Module, ins: *instruction.Instruction, arr: O
 pub fun phi_append_incoming(m: *Module, phi: *instruction.Instruction, pred: id.BlockId, incoming: value.Value) err[fail.Fail];
 ```
 
-## fun asm_get
-
-```mach
-pub fun asm_get(fn: *Function, iid: id.InstructionId) opt[*IrAsm];
-```
-
 ## fun dbg_var_get
 
 ```mach
@@ -449,12 +443,6 @@ pub fun dbg_expr_prepend_op(m: *Module, fn: *Function, eid: DbgExprId, op: DbgOp
 
 ```mach
 pub fun inline_site_add(m: *Module, fn: *Function, callee: intern.StrId, call_loc: source.SrcLoc, parent: u32) res[u32, fail.Fail];
-```
-
-## fun inline_site_get
-
-```mach
-pub fun inline_site_get(fn: *Function, site: u32) opt[*InlineSite];
 ```
 
 ## fun instr_inline_site_set

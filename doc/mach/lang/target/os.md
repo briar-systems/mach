@@ -394,18 +394,6 @@ pub fun reg_arg_extend_for(vt: *OsVTable, arch_id: u32) u32;
 pub fun declared_agg_align_for(vt: *OsVTable, arch_id: u32) bool;
 ```
 
-## fun va_list_for
-
-```mach
-pub fun va_list_for(vt: *OsVTable, arch_id: u32) opt[VaList];
-```
-
-## fun fs_policy_for
-
-```mach
-pub fun fs_policy_for(vt: *OsVTable, arch_id: u32) opt[FsPolicy];
-```
-
 ## fun va_list_checked_for
 
 ```mach

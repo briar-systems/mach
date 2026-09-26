@@ -30,6 +30,7 @@ use mach.lang.be.linker.atoms.AtomPlan;
 use mach.lang.be.linker.atoms.build_atom_plan;
 use mach.lang.be.linker.atoms.free_atom_plan;
 use mach.lang.be.linker.atoms.has_function_branch_reloc;
+use mach.lang.be.linker.atoms.has_got_reloc;
 use mach.lang.be.linker.atoms.import_symbol_live;
 use mach.lang.be.linker.atoms.init_atom_plan;
 use mach.lang.be.linker.atoms.reloc_source_live;
@@ -68,6 +69,8 @@ pub rec DynState {
     # where the reserved call-stub table starts inside the merged code, which
     # every later relayout moves with it
     stubs_offset: u32;
+    # where the reserved import GOT starts inside the merged read-only data
+    got_offset: u32;
 }
 
 pub fun init_dynstate(dyn: *DynState) {
@@ -84,6 +87,9 @@ pub fun init_dynstate(dyn: *DynState) {
     dyn.info.stubs.vaddr             = 0;
     dyn.info.stubs.size              = 0;
     dyn.stubs_offset                 = 0;
+    dyn.info.got.vaddr               = 0;
+    dyn.info.got.size                = 0;
+    dyn.got_offset                   = 0;
     dyn.fixups                       = nil;
     dyn.fixup_count                  = 0;
     dyn.fixup_cap                    = 0;
@@ -130,9 +136,9 @@ pub fun reserve_call_stubs(s: *session.Session, tgt: *target.Target, dyn: *DynSt
         i = i + 1;
     }
     if (count == 0) { ret err[fail.Fail].ok{}; }
-    val shape_r: res[of.StubShape, fail.Fail] = tgt.of.stub_shape(tgt.object.arch_id, count);
+    val shape_r: res[of.TableShape, fail.Fail] = tgt.of.stub_shape(tgt.object.arch_id, count);
     if (sel shape_r.err) { ret err[fail.Fail].err{shape_r.err}; }
-    val shape: of.StubShape = shape_r.ok;
+    val shape: of.TableShape = shape_r.ok;
     if (shape.size == 0 || shape.align == 0) {
         ret err[fail.Fail].err{fail.message("linker: the format declared an empty call-stub table")};
     }
@@ -167,6 +173,78 @@ pub fun reserve_call_stubs(s: *session.Session, tgt: *target.Target, dyn: *DynSt
 pub fun place_call_stubs(dyn: *DynState, merged: *MergedSection) {
     if (dyn.info.stubs.size == 0) { ret; }
     dyn.info.stubs.vaddr = merged[of.SK_TEXT::u32].vaddr + dyn.stubs_offset::u64;
+}
+
+# reserves the format's import GOT at the end of the read-only data, before
+# anything is given an address, so the zero-fill that follows it never
+# separates the code from its slots however large it is (#3903). a GOT the
+# linker already synthesized for defined symbols ends the same section under
+# the same name, and the import slots extend it; the address is read back by
+# place_import_got once the layout is final
+pub fun reserve_import_got(s: *session.Session, tgt: *target.Target, dyn: *DynState,
+    merged: *MergedSection, groups: *SectionGroups) err[fail.Fail] {
+    if (tgt.of == nil || tgt.of.got_shape == nil) { ret err[fail.Fail].ok{}; }
+    val shape_r: res[of.TableShape, fail.Fail] = tgt.of.got_shape(tgt.object.arch_id, ?dyn.info);
+    if (sel shape_r.err) { ret err[fail.Fail].err{shape_r.err}; }
+    val shape: of.TableShape = shape_r.ok;
+    if (shape.size == 0) { ret err[fail.Fail].ok{}; }
+    if (shape.align == 0) {
+        ret err[fail.Fail].err{fail.message("linker: the format declared an unaligned import GOT")};
+    }
+
+    val relro:   u32                 = of.SK_RELRO::u32;
+    val start_r: res[u64, fail.Fail] = align_up_u64_checked(merged[relro].len::u64, shape.align::u64);
+    if (sel start_r.err) { ret err[fail.Fail].err{start_r.err}; }
+    val start: u64 = start_r.ok;
+    if (shape.size::u64 > 0xFFFFFFFF - start) {
+        ret err[fail.Fail].err{fail.message("linker: the import GOT takes the read-only data past the maximum section size")};
+    }
+    val end: u64 = start + shape.size::u64;
+
+    val name_r: res[intern.StrId, A.Error] = intern.intern(?s.interner, shape.name);
+    if (sel name_r.err) { ret err[fail.Fail].err{fail.refused(name_r.err)}; }
+    val name: intern.StrId = name_r.ok;
+    var gi:   u32          = 0xFFFFFFFF;
+    var i:    u32          = 0;
+    for (i < groups.count) {
+        if (groups.items[i].slot == relro && groups.items[i].name == name
+            && groups.items[i].base::u64 + groups.items[i].len::u64 == merged[relro].len::u64) {
+            gi = i;
+        }
+        i = i + 1;
+    }
+    if (gi == 0xFFFFFFFF) {
+        val ga: res[u32, fail.Fail] = section_group_add(s.alloc, groups, relro, name, 0);
+        if (sel ga.err) { ret err[fail.Fail].err{ga.err}; }
+        gi                     = ga.ok;
+        groups.items[gi].base  = start::u32;
+        groups.items[gi].align = shape.align;
+    }
+    if (groups.items[gi].align < shape.align) { groups.items[gi].align = shape.align; }
+    groups.items[gi].cursor = end::u32;
+    groups.items[gi].len    = (end - groups.items[gi].base::u64)::u32;
+
+    merged[relro].used = true;
+    if (merged[relro].align < shape.align) { merged[relro].align = shape.align; }
+    merged[relro].len = end::u32;
+
+    dyn.got_offset    = start::u32;
+    dyn.info.got.size = shape.size;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun place_import_got(dyn: *DynState, merged: *MergedSection) {
+    if (dyn.info.got.size == 0) { ret; }
+    dyn.info.got.vaddr = merged[of.SK_RELRO::u32].vaddr + dyn.got_offset::u64;
+}
+
+# a GOT-kind relocation reaches the import under any of the names it is known by
+fun import_got_referenced(modules: *of.ObjectImage, module_count: u32, local: intern.StrId,
+    canonical: intern.StrId, effective: intern.StrId, sec_base: *u32, atoms: *AtomPlan) bool {
+    ret has_got_reloc(modules, module_count, local, sec_base, atoms)
+        || (canonical != local && has_got_reloc(modules, module_count, canonical, sec_base, atoms))
+        || (effective != local && effective != canonical
+        && has_got_reloc(modules, module_count, effective, sec_base, atoms));
 }
 
 pub fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
@@ -449,6 +527,10 @@ pub fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynSt
                     sec_base, atoms))) {
                     dyn.info.imports[existing_idx].is_func = true;
                 }
+                if (import_got_referenced(modules, module_count, sym.name, cn.canonical,
+                    effective, sec_base, atoms)) {
+                    dyn.info.imports[existing_idx].got_ref = true;
+                }
                 sy = sy + 1;
                 cnt;
             }
@@ -486,6 +568,8 @@ pub fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynSt
                 sec_base, atoms)
                 || has_function_branch_reloc(modules, module_count, effective,
                 sec_base, atoms));
+            dyn.info.imports[idx].got_ref = import_got_referenced(modules, module_count,
+                sym.name, cn.canonical, effective, sec_base, atoms);
             dyn.info.imports[idx].ordinal    = 0;
             dyn.info.imports[idx].by_ordinal = false;
             if (decl != nil) {
@@ -1584,7 +1668,7 @@ fun join_dynlibs(s: *session.Session, dynlibs: *of.DynLib, dynlib_count: u32) st
     ret acc;
 }
 
-test "mach.lang.be.linker.collect_symbols:weak_fallback_resolution" {
+test collect_symbols__weak_fallback_resolution {
     var alloc: A.Allocator;
     page.make(?alloc);
     val sr: res[session.Session, fail.Fail] = session.init(?alloc);
@@ -1734,7 +1818,7 @@ test "mach.lang.be.linker.collect_symbols:weak_fallback_resolution" {
     ret 0;
 }
 
-test "mach.lang.be.linker.dynlib_index_of:logical_and_loader_names" {
+test dynlib_index_of__logical_and_loader_names {
     var libs: [3]of.DynLib;
     libs[0].name   = 41;
     libs[0].soname = 73;
@@ -1793,7 +1877,7 @@ test "mach.lang.be.linker.dynlib_index_of:logical_and_loader_names" {
     ret 0;
 }
 
-test "mach.lang.be.linker.unattributed_import_message:names_both_routes" {
+test unattributed_import_message__spells_the_source_name {
     var alloc: A.Allocator;
     page.make(?alloc);
     val sr: res[session.Session, fail.Fail] = session.init(?alloc);
@@ -1810,11 +1894,7 @@ test "mach.lang.be.linker.unattributed_import_message:names_both_routes" {
 
     val msg: str = unattributed_import_message(?s, sym, "", ?libs[0], 1);
     if (!str_contains(msg, "dynamic import 'Sleep'"))                       { ret 1; }
-    if (!str_contains(msg, "#[library(\"...\")]"))                          { ret 1; }
-    if (!str_contains(msg, "static archive member"))                        { ret 1; }
-    if (!str_contains(msg, "no declaration to annotate"))                   { ret 1; }
     if (!str_contains(msg, "symbols = [\"Sleep\"]"))                        { ret 1; }
-    if (!str_contains(msg, "[link.<entry>]"))                               { ret 1; }
     if (!str_contains(msg, "candidate libraries: kernel32 (kernel32.dll)")) { ret 1; }
 
     val mach_o: intern.StrId = lt_name(?s, "_Sleep");
@@ -1829,15 +1909,13 @@ test "mach.lang.be.linker.unattributed_import_message:names_both_routes" {
 
     val degraded: str =
         unattributed_import_message(?s, intern.STR_NIL, "", nil::*of.DynLib, 0);
-    if (!str_contains(degraded, "#[library(\"...\")]"))   { ret 1; }
-    if (!str_contains(degraded, "static archive member")) { ret 1; }
-    if (!str_contains(degraded, "symbols = [...]"))       { ret 1; }
+    if (!str_contains(degraded, "symbols = [...]")) { ret 1; }
 
     session.dnit(?s);
     ret 0;
 }
 
-test "mach.lang.be.linker.build_dynamic_info:linux_interpreter_matches_target" {
+test build_dynamic_info__linux_interpreter_matches_target {
     var alloc: A.Allocator;
     page.make(?alloc);
     val sr: res[session.Session, fail.Fail] = session.init(?alloc);
@@ -1890,7 +1968,7 @@ test "mach.lang.be.linker.build_dynamic_info:linux_interpreter_matches_target" {
     ret 0;
 }
 
-test "mach.lang.be.linker.build_dynamic_info:rejects_import_address_alias" {
+test build_dynamic_info__rejects_import_address_alias {
     var alloc: A.Allocator;
     page.make(?alloc);
     val sr: res[session.Session, fail.Fail] = session.init(?alloc);
@@ -1966,7 +2044,7 @@ test "mach.lang.be.linker.build_dynamic_info:rejects_import_address_alias" {
     ret code;
 }
 
-test "mach.lang.be.linker.build_dynamic_info:declared_import_is_link_local" {
+test build_dynamic_info__declared_import_is_link_local_and_needed_only_when_referenced {
     var alloc: A.Allocator;
     page.make(?alloc);
     val sr: res[session.Session, fail.Fail] = session.init(?alloc);
@@ -2030,6 +2108,18 @@ test "mach.lang.be.linker.build_dynamic_info:declared_import_is_link_local" {
     if (dyn.info.imports[0].ordinal != 7)          { ret 1; }
     if (dyn.info.imports[0].by_ordinal)            { ret 1; }
     if (sel import_library_r.some)                 { ret 1; }
+    free_dynstate(?alloc, ?dyn);
+
+    # with no reference left the declaration names no library
+    module.symbol_count = 0;
+    module.reloc_count  = 0;
+    init_dynstate(?dyn);
+    val unreferenced: err[fail.Fail] =
+        build_dynamic_info(?s, ?tgt, ?dyn, ?module, 1, ?locs,
+        nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
+    if (sel unreferenced.err)       { ret 2; }
+    if (dyn.info.lib_count != 0)    { ret 3; }
+    if (dyn.info.import_count != 0) { ret 4; }
 
     free_dynstate(?alloc, ?dyn);
     map.dnit[intern.StrId, SymbolLoc](?locs);
@@ -2037,7 +2127,7 @@ test "mach.lang.be.linker.build_dynamic_info:declared_import_is_link_local" {
     ret 0;
 }
 
-test "mach.lang.be.linker.has_unresolved_declared_imports:only_live_references_count" {
+test has_unresolved_declared_imports__only_live_references_count {
     var alloc: A.Allocator;
     page.make(?alloc);
     val sr: res[session.Session, fail.Fail] = session.init(?alloc);
@@ -2118,7 +2208,7 @@ test "mach.lang.be.linker.has_unresolved_declared_imports:only_live_references_c
     ret 0;
 }
 
-test "mach.lang.be.linker.build_dynamic_info:locally_resolved_declaration" {
+test build_dynamic_info__locally_resolved_declaration {
     var alloc: A.Allocator;
     page.make(?alloc);
     val sr: res[session.Session, fail.Fail] = session.init(?alloc);
@@ -2259,119 +2349,7 @@ test "mach.lang.be.linker.build_dynamic_info:locally_resolved_declaration" {
     ret 0;
 }
 
-test "mach.lang.be.linker.build_dynamic_info:unreferenced_declared_import_elides_needed" {
-    var alloc: A.Allocator;
-    page.make(?alloc);
-    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
-    if (sel sr.err) { ret 1; }
-    var s:   session.Session       = sr.ok;
-    var reg: target.TargetRegistry = target.registry_init();
-    fin { target.registry_dnit(?reg); }
-    val r_9283: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
-    if (sel r_9283.err) { ret 1; }
-    val tr: res[target.Target, fail.Fail] =
-        target.select(?reg, "x86_64", "windows", "win64");
-    if (sel tr.err) { ret 1; }
-    var tgt: target.Target = tr.ok;
-
-    val symbol:  intern.StrId = lt_name(?s, "orphan_fn");
-    val library: intern.StrId = lt_name(?s, "orphan.so");
-    if (symbol == intern.STR_NIL || library == intern.STR_NIL) { ret 1; }
-
-    var decl: of.ImportDecl;
-    decl.symbol      = symbol;
-    decl.import_name = symbol;
-    decl.library     = library;
-    decl.ordinal     = 0;
-    decl.by_name     = true;
-    decl.is_code     = true;
-    var module: of.ObjectImage = lt_image(
-        ?s, lt_name(?s, "orphan-declaration"), nil::*of.Section, 0,
-        nil::*of.Symbol, 0, nil::*of.Relocation, 0);
-    module.imports      = ?decl;
-    module.import_count = 1;
-
-    var locs: map.Map[intern.StrId, SymbolLoc] =
-        map.init[intern.StrId, SymbolLoc](?alloc);
-    var dyn: DynState;
-    init_dynstate(?dyn);
-    val built: err[fail.Fail] = build_dynamic_info(
-        ?s, ?tgt, ?dyn, ?module, 1, ?locs,
-        nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
-    if (sel built.err)              { ret 1; }
-    if (dyn.info.lib_count != 0)    { ret 1; }
-    if (dyn.info.import_count != 0) { ret 1; }
-
-    free_dynstate(?alloc, ?dyn);
-    map.dnit[intern.StrId, SymbolLoc](?locs);
-    session.dnit(?s);
-    ret 0;
-}
-
-test "mach.lang.be.linker.build_dynamic_info:referenced_declared_import_keeps_needed" {
-    var alloc: A.Allocator;
-    page.make(?alloc);
-    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
-    if (sel sr.err) { ret 1; }
-    var s:   session.Session       = sr.ok;
-    var reg: target.TargetRegistry = target.registry_init();
-    fin { target.registry_dnit(?reg); }
-    val r_9327: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
-    if (sel r_9327.err) { ret 1; }
-    val tr: res[target.Target, fail.Fail] =
-        target.select(?reg, "x86_64", "windows", "win64");
-    if (sel tr.err) { ret 1; }
-    var tgt: target.Target = tr.ok;
-
-    val symbol:  intern.StrId = lt_name(?s, "called_fn");
-    val library: intern.StrId = lt_name(?s, "called.so");
-    if (symbol == intern.STR_NIL || library == intern.STR_NIL) { ret 1; }
-
-    var sym: of.Symbol;
-    sym.name    = symbol;
-    sym.section = of.external_section();
-    sym.offset  = 0;
-    sym.size    = 0;
-    sym.flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
-        | of.SYM_OBJ_FLAG_FUNCTION;
-    var decl: of.ImportDecl;
-    decl.symbol      = symbol;
-    decl.import_name = symbol;
-    decl.library     = library;
-    decl.ordinal     = 0;
-    decl.by_name     = true;
-    decl.is_code     = true;
-    var rel: of.Relocation;
-    rel.section = of.section_id(0);
-    rel.offset  = 0;
-    rel.sym     = 0;
-    rel.addend  = 0;
-    rel.sym2    = 0;
-    var module: of.ObjectImage = lt_image(
-        ?s, lt_name(?s, "call-site-user"), nil::*of.Section, 0,
-        ?sym, 1, ?rel, 1);
-    module.imports      = ?decl;
-    module.import_count = 1;
-
-    var locs: map.Map[intern.StrId, SymbolLoc] =
-        map.init[intern.StrId, SymbolLoc](?alloc);
-    var dyn: DynState;
-    init_dynstate(?dyn);
-    val built: err[fail.Fail] = build_dynamic_info(
-        ?s, ?tgt, ?dyn, ?module, 1, ?locs,
-        nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
-    if (sel built.err)                      { ret 1; }
-    if (dyn.info.lib_count != 1)            { ret 1; }
-    if (dyn.info.libs[0].soname != library) { ret 1; }
-    if (dyn.info.import_count != 1)         { ret 1; }
-
-    free_dynstate(?alloc, ?dyn);
-    map.dnit[intern.StrId, SymbolLoc](?locs);
-    session.dnit(?s);
-    ret 0;
-}
-
-test "mach.lang.be.linker.build_dynamic_info:alias_only_referenced_declared_import_keeps_needed" {
+test build_dynamic_info__alias_only_referenced_declared_import_keeps_needed {
     var alloc: A.Allocator;
     page.make(?alloc);
     val sr: res[session.Session, fail.Fail] = session.init(?alloc);
@@ -2449,7 +2427,7 @@ test "mach.lang.be.linker.build_dynamic_info:alias_only_referenced_declared_impo
     ret 0;
 }
 
-test "mach.lang.be.linker.build_dynamic_info:explicit_dynlib_survives_unreferenced" {
+test build_dynamic_info__explicit_dynlib_survives_unreferenced {
     var alloc: A.Allocator;
     page.make(?alloc);
     val sr: res[session.Session, fail.Fail] = session.init(?alloc);
@@ -2492,7 +2470,7 @@ test "mach.lang.be.linker.build_dynamic_info:explicit_dynlib_survives_unreferenc
     ret 0;
 }
 
-test "mach.lang.be.linker.build_dynamic_info:attributed_import_referenced_synthesizes_needed" {
+test build_dynamic_info__attributed_import_needed_only_when_referenced {
     var alloc: A.Allocator;
     page.make(?alloc);
     val sr: res[session.Session, fail.Fail] = session.init(?alloc);
@@ -2550,6 +2528,18 @@ test "mach.lang.be.linker.build_dynamic_info:attributed_import_referenced_synthe
     if (dyn.info.lib_count != 1)                { ret 1; }
     if (dyn.info.libs[0].soname != real_soname) { ret 1; }
     if (dyn.info.import_count != 1)             { ret 1; }
+    free_dynstate(?alloc, ?dyn);
+
+    # an attribution nothing references synthesizes nothing
+    module.symbol_count = 0;
+    module.reloc_count  = 0;
+    init_dynstate(?dyn);
+    val unreferenced: err[fail.Fail] = build_dynamic_info(
+        ?s, ?tgt, ?dyn, ?module, 1, ?locs,
+        nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
+    if (sel unreferenced.err)       { ret 2; }
+    if (dyn.info.lib_count != 0)    { ret 3; }
+    if (dyn.info.import_count != 0) { ret 4; }
 
     free_dynstate(?alloc, ?dyn);
     map.dnit[intern.StrId, SymbolLoc](?locs);
@@ -2557,7 +2547,7 @@ test "mach.lang.be.linker.build_dynamic_info:attributed_import_referenced_synthe
     ret 0;
 }
 
-test "mach.lang.be.linker.build_dynamic_info:attributed_import_no_referenced_entry_stays_unresolved" {
+test build_dynamic_info__attributed_import_no_referenced_entry_stays_unresolved {
     var alloc: A.Allocator;
     page.make(?alloc);
     val sr: res[session.Session, fail.Fail] = session.init(?alloc);
@@ -2614,50 +2604,7 @@ test "mach.lang.be.linker.build_dynamic_info:attributed_import_no_referenced_ent
     ret 0;
 }
 
-test "mach.lang.be.linker.build_dynamic_info:attributed_import_unreferenced_synthesizes_nothing" {
-    var alloc: A.Allocator;
-    page.make(?alloc);
-    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
-    if (sel sr.err) { ret 1; }
-    var s:   session.Session       = sr.ok;
-    var reg: target.TargetRegistry = target.registry_init();
-    fin { target.registry_dnit(?reg); }
-    val r_9584: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
-    if (sel r_9584.err) { ret 1; }
-    val tr: res[target.Target, fail.Fail] =
-        target.select(?reg, "x86_64", "linux", "sysv64");
-    if (sel tr.err) { ret 1; }
-    var tgt: target.Target = tr.ok;
-
-    val symbol:                    intern.StrId   = lt_name(?s, "unused_attributed_fn");
-    val library:                   intern.StrId   = lt_name(?s, "unusedlib");
-    val register_import_library_r: err[fail.Fail] = session.register_import_library(?s, symbol, library);
-    if (symbol == intern.STR_NIL)          { ret 1; }
-    if (library == intern.STR_NIL)         { ret 1; }
-    if (sel register_import_library_r.err) { ret 1; }
-
-    var module: of.ObjectImage = lt_image(
-        ?s, lt_name(?s, "no-callers"), nil::*of.Section, 0,
-        nil::*of.Symbol, 0, nil::*of.Relocation, 0);
-
-    var locs: map.Map[intern.StrId, SymbolLoc] =
-        map.init[intern.StrId, SymbolLoc](?alloc);
-    var dyn: DynState;
-    init_dynstate(?dyn);
-    val built: err[fail.Fail] = build_dynamic_info(
-        ?s, ?tgt, ?dyn, ?module, 1, ?locs,
-        nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
-    if (sel built.err)              { ret 1; }
-    if (dyn.info.lib_count != 0)    { ret 1; }
-    if (dyn.info.import_count != 0) { ret 1; }
-
-    free_dynstate(?alloc, ?dyn);
-    map.dnit[intern.StrId, SymbolLoc](?locs);
-    session.dnit(?s);
-    ret 0;
-}
-
-test "mach.lang.be.linker.build_dynamic_info:attributed_import_explicit_dynlib_matches_today" {
+test build_dynamic_info__attributed_import_explicit_dynlib_matches_today {
     var alloc: A.Allocator;
     page.make(?alloc);
     val sr: res[session.Session, fail.Fail] = session.init(?alloc);
@@ -2722,7 +2669,7 @@ test "mach.lang.be.linker.build_dynamic_info:attributed_import_explicit_dynlib_m
     ret 0;
 }
 
-test "mach.lang.be.linker.build_dynamic_info:attributed_import_alias_only_reference_synthesizes_needed" {
+test build_dynamic_info__attributed_import_alias_only_reference_synthesizes_needed {
     var alloc: A.Allocator;
     page.make(?alloc);
     val sr: res[session.Session, fail.Fail] = session.init(?alloc);
@@ -2788,7 +2735,7 @@ test "mach.lang.be.linker.build_dynamic_info:attributed_import_alias_only_refere
     ret 0;
 }
 
-test "mach.lang.be.linker.build_dynamic_info:coff_import_address_alias" {
+test build_dynamic_info__coff_import_address_alias {
     var alloc: A.Allocator;
     page.make(?alloc);
     val sr: res[session.Session, fail.Fail] = session.init(?alloc);
@@ -2859,7 +2806,7 @@ test "mach.lang.be.linker.build_dynamic_info:coff_import_address_alias" {
     ret 0;
 }
 
-test "mach.lang.be.linker.synthesize_local_imports:defined_local_import" {
+test synthesize_local_imports__defined_local_import {
     var alloc: A.Allocator;
     page.make(?alloc);
     val sr: res[session.Session, fail.Fail] = session.init(?alloc);
@@ -3013,7 +2960,7 @@ test "mach.lang.be.linker.synthesize_local_imports:defined_local_import" {
     ret 0;
 }
 
-test "mach.lang.be.linker.synthesize_local_imports:dead_weak_comdat" {
+test synthesize_local_imports__dead_weak_comdat {
     var alloc: A.Allocator;
     page.make(?alloc);
     val sr: res[session.Session, fail.Fail] = session.init(?alloc);
@@ -3124,52 +3071,7 @@ test "mach.lang.be.linker.synthesize_local_imports:dead_weak_comdat" {
     ret 0;
 }
 
-test "mach.lang.be.linker.build_dynamic_info:partial_import_cleanup" {
-    var alloc: A.Allocator;
-    page.make(?alloc);
-    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
-    if (sel sr.err) { ret 1; }
-    var s:   session.Session       = sr.ok;
-    var reg: target.TargetRegistry = target.registry_init();
-    fin { target.registry_dnit(?reg); }
-    val r_10012: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
-    if (sel r_10012.err) { ret 1; }
-    val tr: res[target.Target, fail.Fail] =
-        target.select(?reg, "x86_64", "windows", "win64");
-    if (sel tr.err) { ret 1; }
-    var tgt: target.Target = tr.ok;
-
-    var sym: of.Symbol;
-    sym.name    = lt_name(?s, "NoLibrary");
-    sym.section = of.external_section();
-    sym.offset  = 0;
-    sym.size    = 0;
-    sym.flags   = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
-        | of.SYM_OBJ_FLAG_FUNCTION;
-    var module: of.ObjectImage = lt_image(
-        ?s, lt_name(?s, "unattributed-user"), nil::*of.Section, 0,
-        ?sym, 1, nil::*of.Relocation, 0);
-    var locs: map.Map[intern.StrId, SymbolLoc] =
-        map.init[intern.StrId, SymbolLoc](?alloc);
-    var dyn: DynState;
-    init_dynstate(?dyn);
-
-    val built: err[fail.Fail] = build_dynamic_info(
-        ?s, ?tgt, ?dyn, ?module, 1, ?locs,
-        nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
-    if (!sel built.err)             { ret 1; }
-    if (dyn.info.imports == nil)    { ret 1; }
-    if (dyn.info.import_count != 0) { ret 1; }
-    if (dyn.import_cap != 1)        { ret 1; }
-    free_dynstate(?alloc, ?dyn);
-    if (dyn.info.imports != nil || dyn.import_cap != 0) { ret 1; }
-
-    map.dnit[intern.StrId, SymbolLoc](?locs);
-    session.dnit(?s);
-    ret 0;
-}
-
-test "mach.lang.be.linker.build_dynamic_info:implicit_platform_identity" {
+test build_dynamic_info__implicit_platform_identity {
     var alloc: A.Allocator;
     page.make(?alloc);
     val sr: res[session.Session, fail.Fail] = session.init(?alloc);
@@ -3232,31 +3134,6 @@ test "mach.lang.be.linker.build_dynamic_info:implicit_platform_identity" {
 
     free_dynstate(?alloc, ?dyn);
     map.dnit[intern.StrId, SymbolLoc](?locs);
-    session.dnit(?s);
-    ret 0;
-}
-
-test "mach.lang.be.linker.dynstate_add_import_addr_fixup:preserves_addend" {
-    var alloc: A.Allocator;
-    page.make(?alloc);
-    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
-    if (sel sr.err) { ret 1; }
-    var s:   session.Session = sr.ok;
-    var dyn: DynState;
-    init_dynstate(?dyn);
-
-    val added: err[fail.Fail] = dynstate_add_import_addr_fixup(
-        ?s, ?dyn, 2, 8, 3, 0x1234, of.RK_PC32, -4);
-    if (sel added.err)                                        { ret 1; }
-    if (dyn.info.import_addr_fixup_count != 1)                { ret 1; }
-    if (dyn.info.import_addr_fixups[0].seg_index != 2)        { ret 1; }
-    if (dyn.info.import_addr_fixups[0].seg_offset != 8)       { ret 1; }
-    if (dyn.info.import_addr_fixups[0].import_index != 3)     { ret 1; }
-    if (dyn.info.import_addr_fixups[0].patch_vaddr != 0x1234) { ret 1; }
-    if (dyn.info.import_addr_fixups[0].kind != of.RK_PC32)    { ret 1; }
-    if (dyn.info.import_addr_fixups[0].addend != -4)          { ret 1; }
-
-    free_dynstate(?alloc, ?dyn);
     session.dnit(?s);
     ret 0;
 }

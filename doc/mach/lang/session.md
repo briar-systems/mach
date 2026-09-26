@@ -56,12 +56,6 @@ pub fun reset_module_registry(s: *Session);
 pub fun register_module_ast(s: *Session, mid: module.ModuleId, a: *ast.Ast) err[fail.Fail];
 ```
 
-## fun module_ast
-
-```mach
-pub fun module_ast(s: *Session, mid: module.ModuleId) *ast.Ast;
-```
-
 ## fun module_count
 
 ```mach
@@ -264,22 +258,10 @@ pub fun reset_link_publications(s: *Session);
 pub fun register_module_sema(s: *Session, mid: module.ModuleId, p: ptr) err[fail.Fail];
 ```
 
-## fun module_sema_ptr
-
-```mach
-pub fun module_sema_ptr(s: *Session, mid: module.ModuleId) ptr;
-```
-
 ## fun register_module_resolve
 
 ```mach
 pub fun register_module_resolve(s: *Session, mid: module.ModuleId, p: ptr) err[fail.Fail];
-```
-
-## fun module_resolve_ptr
-
-```mach
-pub fun module_resolve_ptr(s: *Session, mid: module.ModuleId) ptr;
 ```
 
 ## fun register_module_comptime
@@ -306,12 +288,6 @@ fqn: intern.StrId, stable: module.StableModuleId) err[fail.Fail];
 
 ```mach
 pub fun unregister_module_identity(s: *Session, mid: module.ModuleId, stable: module.StableModuleId);
-```
-
-## fun module_comptime_ptr
-
-```mach
-pub fun module_comptime_ptr(s: *Session, mid: module.ModuleId) ptr;
 ```
 
 ## fun next_parse_incarnation

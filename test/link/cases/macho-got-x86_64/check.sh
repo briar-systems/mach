@@ -109,14 +109,17 @@ produce_macho_got() {
         return 1
     }
 
-    got_fields=$(macho_segment_fields "$bin" __GOT) || return 2
+    # the linker reserves the import slots in the same __DATA_CONST,__got, after
+    # the local ones and ahead of the zero-fill (#3903)
+    got_fields=$(macho_section_fields "$bin" __DATA_CONST __got) || return 2
     set -- $got_fields
-    got_vm=$1; got_file=$3; got_size=$4
-    [ "$import_load" -ge "$got_vm" ] && [ "$import_load" -lt $((got_vm + got_size)) ] || {
-        echo "link: macho-got: import slot is not in __GOT" >&2
+    got_addr=$1; got_size=$2
+    [ "$local_load" -ge "$got_addr" ] && [ "$import_load" -gt "$local_load" ] \
+        && [ "$import_load" -lt $((got_addr + got_size)) ] || {
+        echo "link: macho-got: the import slot does not follow the local one in __DATA_CONST,__got" >&2
         return 1
     }
-    import_file=$((got_file + import_load - got_vm))
+    import_file=$((relro_file + import_load - relro_vm))
     import_value=$(read_le_uint "$bin" "$import_file" 8)
     [ "$import_value" -eq 0 ] || {
         echo "link: macho-got: import slot is not zero before dyld binding" >&2

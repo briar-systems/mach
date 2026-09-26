@@ -20,7 +20,7 @@ definition without that dependency knowing anything about this library
 ## fun lower_fun
 
 ```mach
-pub fun lower_fun(ctx: *context.LowerContext, did: id.DeclId, d: *decl.Decl, is_test: bool) err[fail.Fail];
+pub fun lower_fun(ctx: *context.LowerContext, did: id.DeclId, d: *decl.Decl) err[fail.Fail];
 ```
 
 ## fun lower_instance

@@ -54,6 +54,14 @@ pub val PH_EMIT: PhaseKind = 6
 pub val PH_LINK: PhaseKind = 7
 ```
 
+## val PH_TEST
+
+```mach
+pub val PH_TEST: PhaseKind = 8
+```
+
+a test build's test objects, after the normal objects they are lowered against
+
 ## def LinkInputKind
 
 ```mach

@@ -815,43 +815,13 @@ pub val ADDRESSING_LOGICAL: u32 = 0
 ## val DIM_1D
 
 ```mach
-pub val DIM_1D:           u32 = 0
-```
-
-## val DIM_2D
-
-```mach
-pub val DIM_2D:           u32 = 1
-```
-
-## val DIM_3D
-
-```mach
-pub val DIM_3D:           u32 = 2
+pub val DIM_1D: u32 = 0
 ```
 
 ## val DIM_CUBE
 
 ```mach
-pub val DIM_CUBE:         u32 = 3
-```
-
-## val DIM_RECT
-
-```mach
-pub val DIM_RECT:         u32 = 4
-```
-
-## val DIM_BUFFER
-
-```mach
-pub val DIM_BUFFER:       u32 = 5
-```
-
-## val DIM_SUBPASS_DATA
-
-```mach
-pub val DIM_SUBPASS_DATA: u32 = 6
+pub val DIM_CUBE: u32 = 3
 ```
 
 ## val IMAGE_FORMAT_UNKNOWN
