@@ -1,35 +1,5 @@
 # mach.lang.be.linker.common
 
-## rec GmTrackEntry
-
-```mach
-pub rec GmTrackEntry;
-```
-
-## rec GmTracker
-
-```mach
-pub rec GmTracker;
-```
-
-## fun gm_track_allocate
-
-```mach
-pub fun gm_track_allocate(ctx: ptr, size: usize, align: usize) opt[ptr];
-```
-
-## fun gm_track_deallocate
-
-```mach
-pub fun gm_track_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64;
-```
-
-## fun gm_track_reallocate
-
-```mach
-pub fun gm_track_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) opt[ptr];
-```
-
 ## fun grow_cap
 
 ```mach
@@ -137,6 +107,12 @@ surface: *ExportSurface) bool;
 pub fun is_function_branch_kind(kind: of.RelocKind) bool;
 ```
 
+## fun is_got_kind
+
+```mach
+pub fun is_got_kind(kind: of.RelocKind) bool;
+```
+
 ## fun named_message
 
 ```mach
@@ -171,38 +147,5 @@ pub fun join3(s: *session.Session, a: str, b: str, c: str, prefix: str) str;
 
 ```mach
 pub fun lt_name(s: *session.Session, name: str) intern.StrId;
-```
-
-## fun lt_image
-
-```mach
-pub fun lt_image(s: *session.Session, name: intern.StrId,
-sections: *of.Section, section_count: u32,
-symbols: *of.Symbol, symbol_count: u32,
-relocations: *of.Relocation, reloc_count: u32) of.ObjectImage;
-```
-
-## rec GrowProbe
-
-```mach
-pub rec GrowProbe;
-```
-
-## fun grow_probe_allocate
-
-```mach
-pub fun grow_probe_allocate(ctx: ptr, size: usize, align: usize) opt[ptr];
-```
-
-## fun grow_probe_reallocate
-
-```mach
-pub fun grow_probe_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) opt[ptr];
-```
-
-## fun grow_probe_deallocate
-
-```mach
-pub fun grow_probe_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64;
 ```
 

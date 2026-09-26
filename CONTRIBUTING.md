@@ -46,8 +46,9 @@ cmp b c
 ```
 
 The seed builds `a` from your tree. `a` builds `b`, and `b` builds `c`. `cmp`
-prints nothing and exits 0 when `b` and `c` are identical, which is the
-evidence a pull request states. The seed builds the `mach` binary and nothing
+prints nothing and exits 0 when `b` and `c` are identical. CI runs the
+fixpoint on every pull request that touches the compiler, so run it locally
+only when a change needs it. The seed builds the `mach` binary and nothing
 else. Run the unit suites with `c`, as in [Testing and
 formatting](#testing-and-formatting), because the test code may use language
 the seed release predates. A release newer than the pin builds `a` too, and an
@@ -77,7 +78,7 @@ out/linux-x86_64/debug/bin/mach fmt .
 ```
 
 `mach test .` runs the tests in the compiler's own closure. The suites that
-live in modules the compiler never reaches (`src/lang/driver/tests.mach`, the
+live in modules the compiler never reaches (`src/lang/driver/tests/`, the
 codegen runtime probes and the rest) are reached by the `tests` library
 artifact, whose entry `src/lib/tests.mach` `use`s each of them, so a new
 test-only module is added there.
@@ -89,9 +90,14 @@ writes, so a change to a doc-comment or to the module tree regenerates them in
 the same pull request, and CI fails when the committed pages differ from a
 fresh generation.
 
-`bash test/run.sh` runs the codegen corpus against the external decoders and
-the C reference, and `bash test/run.sh --link` the link cases; see
+`bash test/run.sh` runs the codegen corpus, a differential of each case against
+the same program written in C, and `bash test/run.sh --link` the link cases; see
 [test/README.md](test/README.md).
+
+### Test policy
+
+What earns a test, and where it sits, is set by the
+[test policy](doc/language/test.md#test-policy).
 
 
 ## Branching
@@ -129,11 +135,11 @@ chore: update dependencies
 
 - Open as a draft targeting `dev`; mark it ready when it is done.
 - Link the issue with `Closes #N`.
-- Add a line to the `## [Unreleased]` section of `CHANGELOG.md` under the
-  matching heading (`Added`, `Changed`, `Fixed`, `Removed`) for anything a
-  user can observe.
-- Put the verification evidence in the body: the fixpoint and the test
-  counts in both profiles.
+- Leave `CHANGELOG.md` alone. The changelog is written from the merged
+  commits when `dev` is released to `main`.
+- Say briefly what changed and which tests you ran. CI runs the legs the
+  changed paths select (`.github/scripts/ci-legs.sh`), and the pull request
+  from `dev` to `main` runs everything.
 - Merge with a merge commit. Never rebase or fast-forward.
 - When the target is not the default branch, close the linked issue by hand
   after the merge.

@@ -1,20 +1,38 @@
 # `test` — test declaration
 
 A `test` declaration names a block of statements the test runner can
-execute on its own. Tests live alongside the code they exercise: any
-module may declare them, and `mach test` collects every test in the
-selected artifact's closure into a single test binary.
+execute on its own. Any module may declare them, and `mach test` collects
+every test in the selected artifact's closure into a single test binary.
+What earns a test, and where it sits, is set by the
+[test policy](#test-policy).
 
 ## Grammar
 
 ```mach fragment
-test "label" { ... }
+test <identifier> { ... }
 ```
 
-The label is a **string literal** — it is required, and it must be a
-string literal (not an identifier or a bare word). The body is a block of
-statements. A test takes no parameters and is not callable from ordinary
-code; it exists only for the runner to invoke.
+The name is an identifier, following the ordinary identifier rules. A string
+in its place (`test "label" { ... }`) is a compile error located at the string
+that names the identifier form. The body is a block of statements. A test takes
+no parameters and is not callable from ordinary code; it exists only for the
+runner to invoke.
+
+Tests live in their own namespace in each module. A test's name is never in
+scope in code, so `test str_len { ... }` and `fun str_len` in one module do not
+conflict, and no code can name, call or reference a test. Two tests with the
+same name in one module are a compile error located at the second.
+
+A test's **qualified name** is its module path, `#`, and its name:
+`std.types.string#str_len__empty`. `#` appears in no identifier or module path,
+so a qualified name never collides with another symbol. It is the test's symbol
+(hidden, like every other symbol that is not exported), and it is the name
+`--list`, `--filter`, the readout and `--format json` show. A debugger takes it
+unquoted: `break std.types.string#str_len__empty` in gdb.
+
+Related tests group under a common subject as `subject__case`
+(`str_len__empty`, `str_len__multibyte`), and a regression test is named
+`regression__*`. Both are conventions the compiler does not check.
 
 `test` is a reserved keyword and appears at module (declaration) scope,
 the same level as `fun`, `rec`, and `val`. Visibility modifiers such as
@@ -41,14 +59,14 @@ fun info(msg: *u8) {
     if (msg == nil) { ret; }
 }
 
-test "date: is_leap_year" {
+test is_leap_year__centuries {
     if (!is_leap_year(2000)) { ret 1; }
     if (is_leap_year(1900))  { ret 1; }
     if (is_leap_year(2023))  { ret 1; }
     ret 0;
 }
 
-test "log: nil message does not crash" {
+test log__nil_message_does_not_crash {
     debug(nil);
     info(nil);
     ret 0;
@@ -66,8 +84,8 @@ artifact: the closure its entry reaches through `use` and `fwd`. A module no
 selected artifact reaches is not loaded under test either, so it is not checked and
 its tests do not run (see [Which tests run](#which-tests-run)). Each
 test then lowers to a zero-parameter, `i32`-returning function tagged as a test entry
-point so the runner can iterate it. The label is interned and becomes the lowered
-function's name. Ordinary builds omit test bodies from IR and object files.
+point so the runner can iterate it. Its qualified name is the lowered function's
+name. Ordinary builds omit test bodies from IR and object files.
 
 A helper or fixture that exists only for tests is marked
 [`#[testing]`](decorators.md#testing--test-only-declaration). It gets the same
@@ -118,7 +136,7 @@ By default collection is scoped to the current project's own modules: tests
 declared in dependency modules are excluded, so a library's own suite never
 runs (or fails) as part of your project's `mach test`. Pass `--include-deps`
 to collect dependency tests as well — useful when working on a dependency
-in-tree. `--filter` narrows the run by test name in either mode.
+in-tree. `--filter` narrows the run by qualified name in either mode.
 
 ## The `mach test` workflow
 
@@ -132,23 +150,23 @@ failing test's captured output and location. The full flag reference is
 
 ```
 --jobs <n>               run up to n test processes at once (default: host CPUs)
---filter <substr>        run only tests whose label contains the substring
+--filter <substr>        run only tests whose qualified name contains the substring
 --include-deps           also run tests declared in dependency modules
 --list                   list the collected tests and exit
 --format <human|json>    the live readout, or an NDJSON event stream
 --runner <cmd>           launch each test through a host-side command
---timeout_seconds <n>    terminate a test and its process group after n seconds
+--timeout <duration>     terminate a test and its process group after the duration
 ```
 
 A roll-up is `<module>  <ok> ok[  <fail> FAIL]  <duration>`. Each expanded
 failure shows `file:line`, the exit code (`(exit N)`), signal (`(signal N)`)
-or `(timed out after <n>s)`, the child's captured output indented beneath, and
+or `(timed out after <duration>)`, the child's captured output indented beneath, and
 the exact `rerun:` command; a passing test stays quiet. The run closes with a
 summary that re-lists every failure:
 
 ```
 failures:
-  fails on purpose  src/main.mach:11  (exit 3)
+  app.main#fails_on_purpose  src/main.mach:11  (exit 3)
 
 1 passed, 1 failed, 2 total  (1ms)
 ```
@@ -169,34 +187,39 @@ dispatcher`).
 
 ### Timeouts
 
-`--timeout_seconds <n>` bounds each spawned test process independently, from
+`--timeout <duration>` bounds each spawned test process independently, from
 its own spawn, on its whole process group, so a process the test started dies
 with it. A test that exceeds the bound is the distinct outcome **timed out**:
-it renders as `(timed out after <n>s)`, is counted separately on the summary
-line, and is still a failing test for the exit code, so the suite exits `1`.
+it renders as `(timed out after <duration>)`, is counted separately on the
+summary line, and is still a failing test for the exit code, so the suite
+exits `1`.
 
 ```
 failures:
-  spins  src/main.mach:4  (timed out after 1s)
+  app.main#spins  src/main.mach:4  (timed out after 1s)
 
 0 passed, 1 failed (1 timed out), 1 total  (1.0s)
 ```
 
-`<n>` is a positive integer number of seconds with no default: omitting the
-flag leaves every test unbounded.
+`<duration>` is a positive integer followed by a unit: `ms`, `s`, `m` or `h`
+(`30ms`, `30s`, `5m`, `1h`). A bare number, a fraction, zero or any other
+unit is a usage error naming the accepted forms. There is no default: omitting
+the flag leaves every test unbounded.
 
 ### JSON output
 
 `--format json` replaces the readout with one JSON object per line on stdout
 (`run_start`, one `test` per result, `summary`; `case` under `--list`), with
-build diagnostics kept on stderr. A timed-out test reports `"kind":"timeout"`
-with its bound in `timeout_seconds`. The schema is versioned (`"schema":1`
-on every event) and its writer is `mach.cli.cmd.testing`.
+build diagnostics kept on stderr. A `test` or `case` event names its test by
+qualified name in `name`, beside its `module`, `file`, `line` and dispatcher
+`index`. A timed-out test reports `"kind":"timeout"` with its bound in
+nanoseconds in `timeout_ns`. The schema is versioned (`"schema":2` on every
+event) and its writer is `mach.cli.cmd.testing`.
 
 ## The runner
 
 The compiler (`mach.lang.me.lower.testrunner`) lowers every collected test to
-a zero-parameter, `i32`-returning function under a compiler-private symbol
+a zero-parameter, `i32`-returning function under its qualified name, a symbol
 that never collides with, reserves, or rewrites a user symbol, and synthesizes
 one dispatcher object whose entry selects a test by its index argument. That
 object links with the project's objects into a single executable, even for a
@@ -224,11 +247,10 @@ artifact's closure, the same module set `mach build` compiles for it, and runs
 the tests declared there. Each run tests one artifact, so `$bin.name` in a test
 block, and in every module the run compiles, is the artifact under test.
 
-Tests live inline alongside the code they cover: a `test "..." { }` declaration
-in a module the artifact reaches runs with no further wiring. A module that
-exists only for tests, a suite too large to sit beside the code or a harness
-that drives the whole compiler, is reached by no artifact and so never runs on
-its own. Give such modules a **test artifact**: an ordinary library artifact
+An inline `test name { }` declaration in a module the artifact reaches runs
+with no further wiring. A module that exists only for tests, such as a suite
+that exercises several modules together, is reached by no artifact and so never
+runs on its own. Give such modules a **test artifact**: an ordinary library artifact
 whose entry `use`s each of them, tested by name.
 
 ```toml
@@ -265,6 +287,36 @@ because a library artifact's closure is all the test dispatcher links. Marking
 `app` `default = true` keeps `mach build .` and `mach check .` to `app`, since with
 no selector they take the marked artifacts; `mach build . --lib tests` builds the
 test artifact.
+
+## Test policy
+
+A change does not need a test of its own. A unit test exists only if it:
+
+- covers a unique surface, duplicating no other test
+- covers functionality critical to correctness that cannot be allowed to break
+- is deterministic, never depending on timing or performance
+- is valuable to check automatically
+- covers logic that is not blatantly simple
+- checks correctness
+- is no more complicated than the code it tests, unless that is unavoidable
+- does not pin a problem that no longer exists
+
+Coverage means branches and known failure points, not volume. `str_len` gets
+the inputs that exercise each of its branches, not a pile of strings, and a
+parser's tests cover its surface concisely, not exhaustively.
+
+Inline tests are small and sit in their module for convenience or because they
+need private access. A test lives outside the module it covers to declutter it,
+because the test is significant, or, most often, because it exercises several
+modules together (see [Which tests run](#which-tests-run)).
+
+Regression tests are a separate kind, and rare: they are kept only for
+regressions that are easy to reintroduce, and are named `regression__*`. They
+may sit next to unit tests. The name is a convention, not a mechanism.
+
+The compiler's codegen corpus and link cases get the same scrutiny, scoped to
+what cannot be tested inside the compiler: the final codegen and link result on
+disk.
 
 ## See also
 

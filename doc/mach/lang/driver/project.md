@@ -178,14 +178,6 @@ pub val LOAD_DONE: LoadStatus = 2
 pub rec TargetTuple;
 ```
 
-## rec CacheKey
-
-```mach
-pub rec CacheKey;
-```
-
-an entry this unit build restored or published, which eviction keeps
-
 ## rec RawLowerCapture
 
 ```mach

@@ -1,0 +1,265 @@
+# the record an `obj/` object carries for the object cache (see
+# target/of/record for the section it rides in): the key the object was built
+# under, and what the engine reads from a module's lowered ir besides its
+# object, so a module whose object is reused never has to lower. the layout is
+# `"MCR2"`, the 32-byte key, the scalarization count, the test count, then per
+# test its qualified name and its line, then the length and bytes of the
+# module's warnings (driver/cache encodes them), every number a little-endian
+# u32 and every name its length then its bytes
+
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.target.of.bin;
+use A: std.allocator;
+use std.allocator.page;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+val MAGIC: u32 = 0x3252434D;
+val FIXED: u32 = 44;
+
+pub rec TestFact {
+    name: intern.StrId;
+    line: u32;
+}
+
+pub rec Facts {
+    scalarized: u32;
+    tests:      *TestFact;
+    test_count: u32;
+    # the diagnostics short of errors building the module reported, which a
+    # build that reuses the object reports again
+    warnings:     *u8;
+    warnings_len: u32;
+}
+
+pub rec Record {
+    key:   [32]u8;
+    facts: Facts;
+}
+
+pub fun facts_dnit(alloc: *A.Allocator, f: *Facts) {
+    if (f == nil)                                                 { ret; }
+    if (f.tests != nil && f.test_count != 0 && alloc != nil)      { A.deallocate[TestFact](alloc, f.tests, f.test_count::usize); }
+    if (f.warnings != nil && f.warnings_len != 0 && alloc != nil) { A.deallocate[u8](alloc, f.warnings, f.warnings_len::usize); }
+    f.warnings     = nil;
+    f.warnings_len = 0;
+    f.tests        = nil;
+    f.test_count   = 0;
+    f.scalarized   = 0;
+}
+
+fun name_text(itn: *intern.Interner, id: intern.StrId) opt[str] {
+    if (id == intern.STR_NIL) { ret opt[str].none{}; }
+    ret intern.lookup(itn, id);
+}
+
+fun put_name(buf: *u8, pos: usize, text: str) usize {
+    val len: usize = str_len(text);
+    bin.write_u32_le(buf, pos, len::u32);
+    memory.raw_copy((buf::usize + pos + 4)::ptr, text::ptr, len);
+    ret pos + 4 + len;
+}
+
+# the record for an object built under `key` whose module lowered to `facts`;
+# the caller owns the bytes, allocated in alloc
+pub fun encode(alloc: *A.Allocator, itn: *intern.Interner, key: *[32]u8, facts: *Facts,
+    out_bytes: **u8, out_len: *u32) err[fail.Fail] {
+    @out_bytes = nil;
+    @out_len   = 0;
+    var total: usize = FIXED::usize;
+    var i:     u32   = 0;
+    for (i < facts.test_count) {
+        val text: opt[str] = name_text(itn, facts.tests[i].name);
+        if (sel text.none) { ret err[fail.Fail].err{fail.message("cache record test has no name")}; }
+        total = total + 8 + str_len(text.some);
+        i     = i + 1;
+    }
+    total = total + 4 + facts.warnings_len::usize;
+    if (total > 0xFFFFFFFF) { ret err[fail.Fail].err{fail.message("cache record exceeds the section size field")}; }
+    val allocated: res[*u8, A.Error] = A.allocate[u8](alloc, total);
+    if (sel allocated.err) { ret err[fail.Fail].err{fail.refused(allocated.err)}; }
+    val buf: *u8 = allocated.ok;
+    bin.write_u32_le(buf, 0, MAGIC);
+    memory.raw_copy((buf::usize + 4)::ptr, (?(@key)[0])::ptr, 32);
+    bin.write_u32_le(buf, 36, facts.scalarized);
+    bin.write_u32_le(buf, 40, facts.test_count);
+    var pos: usize = FIXED::usize;
+    i = 0;
+    for (i < facts.test_count) {
+        val t:    *TestFact = ?facts.tests[i];
+        val text: opt[str]  = name_text(itn, t.name);
+        if (sel text.none) { ret err[fail.Fail].err{fail.message("cache record test has no name")}; }
+        pos = put_name(buf, pos, text.some);
+        bin.write_u32_le(buf, pos, t.line);
+        pos = pos + 4;
+        i   = i + 1;
+    }
+    bin.write_u32_le(buf, pos, facts.warnings_len);
+    if (facts.warnings_len != 0) { memory.raw_copy((buf::usize + pos + 4)::ptr, facts.warnings::ptr, facts.warnings_len::usize); }
+    @out_bytes = buf;
+    @out_len   = total::u32;
+    ret err[fail.Fail].ok{};
+}
+
+rec Reader {
+    data: *u8;
+    len:  usize;
+    pos:  usize;
+    bad:  bool;
+}
+
+fun get(r: *Reader) u32 {
+    if (r.bad || r.len - r.pos < 4) {
+        r.bad = true;
+        ret 0;
+    }
+    val value: u32 = bin.read_u32_le(r.data, r.pos);
+    r.pos = r.pos + 4;
+    ret value;
+}
+
+fun name(r: *Reader, itn: *intern.Interner, oom: *bool) intern.StrId {
+    val len: u32 = get(r);
+    if (r.bad) { ret intern.STR_NIL; }
+    if (len == 0 || len::usize > r.len - r.pos) {
+        r.bad = true;
+        ret intern.STR_NIL;
+    }
+    val bytes: *u8 = (r.data::usize + r.pos)::*u8;
+    var i:     u32 = 0;
+    for (i < len) {
+        if (bytes[i] == 0) {
+            r.bad = true;
+            ret intern.STR_NIL;
+        }
+        i = i + 1;
+    }
+    r.pos = r.pos + len::usize;
+    val id: res[intern.StrId, A.Error] = intern.intern_bytes(itn, bytes, len::usize);
+    if (sel id.err) {
+        @oom  = true;
+        r.bad = true;
+        ret intern.STR_NIL;
+    }
+    ret id.ok;
+}
+
+# the record in `bytes`, or none when it is missing, truncated or malformed:
+# an object whose record cannot be read is not reused. err only when
+# allocation fails
+pub fun decode(alloc: *A.Allocator, itn: *intern.Interner, bytes: *u8, len: usize) res[opt[Record], fail.Fail] {
+    if (bytes == nil || len < FIXED::usize) { ret res[opt[Record], fail.Fail].ok{opt[Record].none{}}; }
+    var r: Reader = Reader{data: bytes, len: len, pos: 0};
+    if (get(?r) != MAGIC) { ret res[opt[Record], fail.Fail].ok{opt[Record].none{}}; }
+    var out: Record = Record{};
+    memory.raw_copy((?out.key[0])::ptr, (bytes::usize + 4)::ptr, 32);
+    r.pos                = 36;
+    out.facts.scalarized = get(?r);
+    val tests: u32 = get(?r);
+    # every test takes at least its name length and its line
+    if (tests::usize > (len - r.pos) / 8) { ret res[opt[Record], fail.Fail].ok{opt[Record].none{}}; }
+    if (tests > 0) {
+        val allocated: res[*TestFact, A.Error] = A.allocate[TestFact](alloc, tests::usize);
+        if (sel allocated.err) { ret res[opt[Record], fail.Fail].err{fail.refused(allocated.err)}; }
+        out.facts.tests      = allocated.ok;
+        out.facts.test_count = tests;
+    }
+    var oom: bool = false;
+    var i:   u32  = 0;
+    for (i < tests && !r.bad) {
+        val nm:   intern.StrId = name(?r, itn, ?oom);
+        val line: u32          = get(?r);
+        if (nm == intern.STR_NIL) { r.bad = true; }
+        out.facts.tests[i] = TestFact{name: nm, line: line};
+        i                  = i + 1;
+    }
+    val warnings_len: u32 = get(?r);
+    if (!r.bad && warnings_len::usize > r.len - r.pos) { r.bad = true; }
+    if (!r.bad && warnings_len != 0) {
+        val kept: res[*u8, A.Error] = A.allocate[u8](alloc, warnings_len::usize);
+        if (sel kept.err) {
+            facts_dnit(alloc, ?out.facts);
+            ret res[opt[Record], fail.Fail].err{fail.refused(kept.err)};
+        }
+        memory.raw_copy(kept.ok::ptr, (bytes::usize + r.pos)::ptr, warnings_len::usize);
+        out.facts.warnings     = kept.ok;
+        out.facts.warnings_len = warnings_len;
+        r.pos                  = r.pos + warnings_len::usize;
+    }
+    if (!r.bad && r.pos != r.len) { r.bad = true; }
+    if (r.bad) {
+        facts_dnit(alloc, ?out.facts);
+        if (oom) { ret res[opt[Record], fail.Fail].err{fail.message("out of memory decoding a cache record")}; }
+        ret res[opt[Record], fail.Fail].ok{opt[Record].none{}};
+    }
+    ret res[opt[Record], fail.Fail].ok{opt[Record].some{out}};
+}
+
+#[testing]
+fun t_decodes(alloc: *A.Allocator, itn: *intern.Interner, bytes: *u8, len: usize) bool {
+    val decoded: res[opt[Record], fail.Fail] = decode(alloc, itn, bytes, len);
+    if (sel decoded.err)     { ret true; }
+    if (sel decoded.ok.none) { ret false; }
+    var found: Record = decoded.ok.some;
+    facts_dnit(alloc, ?found.facts);
+    ret true;
+}
+
+test decode__round_trips_and_refuses_every_damaged_record {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var itn: intern.Interner = intern.init(?alloc);
+    fin { intern.dnit(?itn); }
+    val one: res[intern.StrId, A.Error] = intern.intern(?itn, "m#adds_one");
+    val two: res[intern.StrId, A.Error] = intern.intern(?itn, "m#adds_two");
+    if (sel one.err) { ret 1; }
+    if (sel two.err) { ret 1; }
+    var tests:  [2]TestFact = [2]TestFact{TestFact{name: one.ok, line: 7}, TestFact{name: two.ok, line: 9}};
+    var warned: [3]u8       = [3]u8{7, 0, 9};
+    var facts:  Facts       = Facts{scalarized: 3, tests: ?tests[0], test_count: 2, warnings: ?warned[0], warnings_len: 3};
+    var key:    [32]u8;
+    key[0]  = 0xAB;
+    key[31] = 0xCD;
+    var bytes:   *u8            = nil;
+    var len:     u32            = 0;
+    val encoded: err[fail.Fail] = encode(?alloc, ?itn, ?key, ?facts, ?bytes, ?len);
+    if (sel encoded.err) { ret 2; }
+    fin { A.deallocate[u8](?alloc, bytes, len::usize); }
+
+    val decoded: res[opt[Record], fail.Fail] = decode(?alloc, ?itn, bytes, len::usize);
+    if (sel decoded.err)     { ret 3; }
+    if (sel decoded.ok.none) { ret 3; }
+    var got: Record = decoded.ok.some;
+    fin { facts_dnit(?alloc, ?got.facts); }
+    if (got.key[0] != 0xAB || got.key[31] != 0xCD || got.facts.scalarized != 3 || got.facts.test_count != 2) { ret 4; }
+    if (got.facts.tests[0].name != one.ok || got.facts.tests[0].line != 7)                                   { ret 5; }
+    if (got.facts.tests[1].name != two.ok || got.facts.tests[1].line != 9)                                   { ret 6; }
+    if (got.facts.warnings_len != 3 || got.facts.warnings[0] != 7 || got.facts.warnings[2] != 9)             { ret 6; }
+
+    # every truncation, a missing record, a trailing byte and a bad signature read as none
+    var cut: usize = 0;
+    for (cut < len::usize) {
+        if (t_decodes(?alloc, ?itn, bytes, cut)) { ret 7; }
+        cut = cut + 1;
+    }
+    if (t_decodes(?alloc, ?itn, nil, 0)) { ret 8; }
+    val longer_r: res[*u8, A.Error] = A.zallocate[u8](?alloc, len::usize + 1);
+    if (sel longer_r.err) { ret 9; }
+    val longer: *u8 = longer_r.ok;
+    fin { A.deallocate[u8](?alloc, longer, len::usize + 1); }
+    memory.raw_copy(longer::ptr, bytes::ptr, len::usize);
+    if (t_decodes(?alloc, ?itn, longer, len::usize + 1)) { ret 10; }
+    longer[0] = 0;
+    if (t_decodes(?alloc, ?itn, longer, len::usize)) { ret 11; }
+    ret 0;
+}

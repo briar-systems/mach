@@ -194,7 +194,9 @@ row count of BUILD_OWN
 pub val BUILD_OWN: [BUILD_OWN_N]FlagSpec = [BUILD_OWN_N]FlagSpec;
 ```
 
-the `--cache`, `--no-cache` and `--plan` options, build only
+the `--cache`, `--no-cache` and `--plan` options, build only. `--cache`
+reads `obj/` as the object cache: a module whose object there carries the
+build's key is reused instead of lowered and generated
 
 ## val RUN_OWN_N
 
@@ -210,7 +212,7 @@ row count of RUN_OWN
 pub val RUN_OWN: [RUN_OWN_N]FlagSpec = [RUN_OWN_N]FlagSpec;
 ```
 
-the `--runner <cmd>` and `--timeout_seconds <n>` options, run only
+the `--runner <cmd>` and `--timeout <duration>` options, run only
 
 ## val TEST_OWN_N
 
@@ -227,7 +229,8 @@ pub val TEST_OWN: [TEST_OWN_N]FlagSpec = [TEST_OWN_N]FlagSpec;
 ```
 
 the test-only options `--cache`, `--no-cache`, `--jobs`, `--filter`,
-`--include-deps`, `--list`, `--format`, `--runner`, `--timeout_seconds`
+`--include-deps`, `--list`, `--format`, `--runner`, `--timeout`.
+`--cache` reads `obj/` as the object cache, as a build does
 
 ## val DOC_OWN_N
 
@@ -1440,7 +1443,7 @@ has_bin: `--bin` occurred with a value
 bin_idx: argv index of the bin value
 has_runner: `--runner` occurred with a value
 runner_idx: argv index of the runner value
-has_timeout: `--timeout_seconds` occurred with a value
+has_timeout: `--timeout` occurred with a value
 timeout_idx: argv index of the timeout value
 
 ## fun build_run_invocation

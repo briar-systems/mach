@@ -395,7 +395,7 @@ made before the refusal
 ## fun record_test
 
 ```mach
-pub fun record_test(bo: *BuildOutcome, module: str, label: str, file: str, line: u32, exe: str, idx: u32) err[A.Error];
+pub fun record_test(bo: *BuildOutcome, module: str, name: str, file: str, line: u32, exe: str, idx: u32) err[A.Error];
 ```
 
 ## fun record_unit

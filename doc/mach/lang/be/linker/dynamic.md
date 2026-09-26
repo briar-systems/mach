@@ -36,6 +36,26 @@ by place_call_stubs once the layout is final
 pub fun place_call_stubs(dyn: *DynState, merged: *MergedSection);
 ```
 
+## fun reserve_import_got
+
+```mach
+pub fun reserve_import_got(s: *session.Session, tgt: *target.Target, dyn: *DynState,
+merged: *MergedSection, groups: *SectionGroups) err[fail.Fail];
+```
+
+reserves the format's import GOT at the end of the read-only data, before
+anything is given an address, so the zero-fill that follows it never
+separates the code from its slots however large it is (#3903). a GOT the
+linker already synthesized for defined symbols ends the same section under
+the same name, and the import slots extend it; the address is read back by
+place_import_got once the layout is final
+
+## fun place_import_got
+
+```mach
+pub fun place_import_got(dyn: *DynState, merged: *MergedSection);
+```
+
 ## fun build_dynamic_info
 
 ```mach

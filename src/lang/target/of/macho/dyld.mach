@@ -27,10 +27,12 @@ pub rec MachoDynLayout {
     stubs_va:   u64;
     stubs_size: usize;
 
-    got_off:       usize;
-    got_va:        u64;
-    got_size:      usize;
-    got_seg_index: u32;
+    got_va:   u64;
+    got_size: usize;
+    # the Mach-O segment holding the GOT and the GOT's offset inside it, as a
+    # bind opcode addresses a slot
+    got_seg_index:  u32;
+    got_seg_offset: u64;
 
     linkedit_off:  usize;
     linkedit_va:   u64;
@@ -109,19 +111,10 @@ pub fun func_import_count(dyn: *of.DynamicInfo) u32 {
     ret n;
 }
 
-fun import_has_addr_fixup(dyn: *of.DynamicInfo, import_index: u32) bool {
-    var i: u32 = 0;
-    for (i < dyn.import_addr_fixup_count) {
-        if (dyn.import_addr_fixups[i].kind != of.RK_ABS64
-            && dyn.import_addr_fixups[i].import_index == import_index) { ret true; }
-        i = i + 1;
-    }
-    ret false;
-}
-
+# a function's stub loads it from a slot, and a GOT-kind relocation reads one
 pub fun import_needs_got(dyn: *of.DynamicInfo, import_index: u32) bool {
     if (import_index >= dyn.import_count) { ret false; }
-    ret dyn.imports[import_index].is_func || import_has_addr_fixup(dyn, import_index);
+    ret dyn.imports[import_index].is_func || dyn.imports[import_index].got_ref;
 }
 
 pub fun got_import_count(dyn: *of.DynamicInfo) u32 {
@@ -141,9 +134,17 @@ pub fun macho_stub_size(arch_id: u32) usize {
 
 # the __TEXT,__stubs table the linker reserves at the end of the code, so a
 # call site's branch reaches its stub whatever data the image carries
-pub fun macho_stub_shape(arch_id: u32, count: u32) res[of.StubShape, fail.Fail] {
-    ret res[of.StubShape, fail.Fail].ok{of.StubShape{
+pub fun macho_stub_shape(arch_id: u32, count: u32) res[of.TableShape, fail.Fail] {
+    ret res[of.TableShape, fail.Fail].ok{of.TableShape{
         name: "__stubs", size: count::usize * macho_stub_size(arch_id), align: 4
+    }};
+}
+
+# the __DATA_CONST,__got table the linker reserves ahead of the zero-fill, so a
+# stub or a GOT load reaches its slot whatever zero-fill the image carries (#3903)
+pub fun macho_got_shape(arch_id: u32, dyn: *of.DynamicInfo) res[of.TableShape, fail.Fail] {
+    ret res[of.TableShape, fail.Fail].ok{of.TableShape{
+        name: "__got", size: got_import_count(dyn)::usize * 8, align: 8
     }};
 }
 
@@ -222,7 +223,7 @@ fun write_bind_prefix(buf: *u8, off: usize, itn: *intern.Interner,
 }
 
 pub fun measure_bind_info(itn: *intern.Interner, dyn: *of.DynamicInfo,
-    segs: *of.LoadSegment, text_va: u64, pz: u32) usize {
+    segs: *of.LoadSegment, text_va: u64, pz: u32, got_seg_offset: u64) usize {
     var size: usize = 0;
     var n:    u32   = 0;
     var f:    u32   = 0;
@@ -245,7 +246,7 @@ pub fun measure_bind_info(itn: *intern.Interner, dyn: *of.DynamicInfo,
     for (i < dyn.import_count) {
         if (import_needs_got(dyn, i)) {
             size = size + measure_bind_prefix(itn, dyn, i);
-            size = size + 1 + uleb_size(g::u64 * 8);
+            size = size + 1 + uleb_size(got_seg_offset + g::u64 * 8);
             size = size + 1;
             g    = g + 1;
             n    = n + 1;
@@ -257,7 +258,7 @@ pub fun measure_bind_info(itn: *intern.Interner, dyn: *of.DynamicInfo,
 }
 
 pub fun write_bind_info(buf: *u8, off: usize, itn: *intern.Interner, dyn: *of.DynamicInfo,
-    segs: *of.LoadSegment, text_va: u64, pz: u32, got_seg_index: u32) usize {
+    segs: *of.LoadSegment, text_va: u64, pz: u32, got_seg_index: u32, got_seg_offset: u64) usize {
     var p: usize = off;
     var n: u32   = 0;
     var f: u32   = 0;
@@ -287,7 +288,7 @@ pub fun write_bind_info(buf: *u8, off: usize, itn: *intern.Interner, dyn: *of.Dy
             p = write_bind_prefix(buf, p, itn, dyn, i);
 
             buf[p] = format.BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (got_seg_index::u8 & 0xF);
-            p      = write_uleb(buf, p + 1, g::u64 * 8);
+            p      = write_uleb(buf, p + 1, got_seg_offset + g::u64 * 8);
 
             buf[p] = format.BIND_OPCODE_DO_BIND;
             p      = p + 1;
@@ -319,7 +320,7 @@ fun base_reloc_loc(dyn: *of.DynamicInfo, br: *of.BaseReloc, segs: *of.LoadSegmen
     seg_offset_loc(dyn, br.seg_index, br.seg_offset, segs, text_va, pz, out_seg, out_off);
 }
 
-fun seg_offset_loc(dyn: *of.DynamicInfo, ls: u32, seg_offset: u32,
+pub fun seg_offset_loc(dyn: *of.DynamicInfo, ls: u32, seg_offset: u32,
     segs: *of.LoadSegment, text_va: u64, pz: u32,
     out_seg: *u32, out_off: *u64) {
     val first: u32 = segment.seg_group_first(dyn, segs, ls);
@@ -389,7 +390,18 @@ pub fun patch_macho_fixups(buf: *u8, arch_id: u32, lay: *MachoDynLayout, dyn: *o
         val disp:     i64   = (stub_va::i64) + fx.addend - (fx.patch_vaddr::i64);
         val file_off: usize = seg_offsets[fx.seg_index] + fx.seg_offset::usize;
 
-        if (format.arch_is_arm64(arch_id)) {
+        if (of.is_pcrel_address_kind(fx.kind)) {
+            # one part of a function import's address, bound to its stub
+            var patched: res[bool, rel.RelocError] = res[bool, rel.RelocError].err{rel.RELOC_UNSUPPORTED};
+            if (format.arch_is_arm64(arch_id)) {
+                patched = a64rel.apply_reloc(fx.kind, (buf::usize + file_off)::*u8, 0, 4,
+                    rel.target(stub_va, 0, 0), fx.addend, fx.patch_vaddr, 0);
+            }
+            if (sel patched.err) {
+                ret err[fail.Fail].err{fail.message("macho: a function import's address cannot be bound to its stub")};
+            }
+        }
+        or (format.arch_is_arm64(arch_id)) {
             val lim: i64 = 134217728;
             if (disp < -lim || disp >= lim || (disp & 3) != 0) {
                 ret err[fail.Fail].err{fail.message("macho: dynamic call-site displacement overflows a 26-bit branch")};
@@ -523,7 +535,7 @@ pub fun macho_got_ordinal(dyn: *of.DynamicInfo, import_index: u32) u32 {
     ret n;
 }
 
-fun ts_import_address_fixup_validation() u8 {
+test patch_macho_import_addr_fixups__validates_the_instruction {
     var buf:         [16]u8;
     var seg_offsets: [1]usize;
     seg_offsets[0] = 0;
@@ -533,6 +545,7 @@ fun ts_import_address_fixup_validation() u8 {
 
     var imports: [1]of.DynImport;
     imports[0].is_func = false;
+    imports[0].got_ref = true;
     var fixups: [1]of.ImportAddrFixup;
     fixups[0].seg_index    = 0;
     fixups[0].seg_offset   = 0;
@@ -656,12 +669,7 @@ fun ts_import_address_fixup_validation() u8 {
     ret 0;
 }
 
-test "mach.lang.target.of.macho.dyld:import_address_fixup_validation" {
-    if (ts_import_address_fixup_validation() != 0) { ret 1; }
-    ret 0;
-}
-
-test "mach.lang.target.of.macho.dyld:write_sleb" {
+test write_sleb__byte_boundaries {
     var buf:   [4]u8;
     var cases: [9]i64;
     cases[0] = 0;
@@ -721,7 +729,7 @@ test "mach.lang.target.of.macho.dyld:write_sleb" {
     ret 0;
 }
 
-test "mach.lang.target.of.macho.dyld.write_bind_info:abs64_in_place_bind" {
+test write_bind_info__abs64_in_place_bind {
     var alloc: A.Allocator;
     page.make(?alloc);
     var itn: intern.Interner = intern.init(?alloc);
@@ -744,11 +752,13 @@ test "mach.lang.target.of.macho.dyld.write_bind_info:abs64_in_place_bind" {
     imports[0].is_func    = false;
     imports[0].ordinal    = 0;
     imports[0].by_ordinal = false;
+    imports[0].got_ref    = false;
     imports[1].symbol     = cn.ok;
     imports[1].lib_index  = 0;
     imports[1].is_func    = true;
     imports[1].ordinal    = 0;
     imports[1].by_ordinal = false;
+    imports[1].got_ref    = false;
 
     var fixups: [2]of.ImportAddrFixup;
     fixups[0].seg_index    = 2;
@@ -793,14 +803,14 @@ test "mach.lang.target.of.macho.dyld.write_bind_info:abs64_in_place_bind" {
     dyn.import_addr_fixups      = ?fixups[0];
     dyn.import_addr_fixup_count = 2;
 
-    val want: usize = measure_bind_info(?itn, ?dyn, ?segs[0], 0x1000, 1);
+    val want: usize = measure_bind_info(?itn, ?dyn, ?segs[0], 0x1000, 1, 0x10);
     var buf:  [128]u8;
     var k:    usize = 0;
     for (k < 128) {
         buf[k] = 0xEE;
         k      = k + 1;
     }
-    val end: usize = write_bind_info(?buf[0], 0, ?itn, ?dyn, ?segs[0], 0x1000, 1, 4);
+    val end: usize = write_bind_info(?buf[0], 0, ?itn, ?dyn, ?segs[0], 0x1000, 1, 4, 0x10);
     if (end != want) { ret 1; }
 
     var p: usize = 0;
@@ -848,7 +858,7 @@ test "mach.lang.target.of.macho.dyld.write_bind_info:abs64_in_place_bind" {
     p = p + 1;
     if (buf[p] != (format.BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | 4)) { ret 1; }
     p = p + 1;
-    if (buf[p] != 0x00) { ret 1; }
+    if (buf[p] != 0x10) { ret 1; }
     p = p + 1;
     if (buf[p] != format.BIND_OPCODE_DO_BIND) { ret 1; }
     p = p + 1;

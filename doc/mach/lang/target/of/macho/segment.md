@@ -41,6 +41,8 @@ pub fun write_segment_bytes(buf: *u8, segs: *of.LoadSegment, seg_count: u32, seg
 pub fun seg_is_data_const(dyn: *of.DynamicInfo, segs: *of.LoadSegment, ls: u32) bool;
 ```
 
+a read-only segment dyld writes into before it maps it read-only
+
 ## fun seg_vm_prot
 
 ```mach

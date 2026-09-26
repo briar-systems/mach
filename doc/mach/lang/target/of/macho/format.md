@@ -808,33 +808,3 @@ pub fun canonical_sectname(raw: str, out: *u8) str;
 pub fun indirect_slots(section: *of.Section) res[u32, fail.Fail];
 ```
 
-## fun t_isa
-
-```mach
-pub fun t_isa(id: u32) of.ObjectTarget;
-```
-
-## fun t_intern
-
-```mach
-pub fun t_intern(itn: *intern.Interner, s: str) intern.StrId;
-```
-
-## fun t_find_lc
-
-```mach
-pub fun t_find_lc(buf: *u8, cmd: u32) usize;
-```
-
-## fun t_bytes_contain
-
-```mach
-pub fun t_bytes_contain(buf: *u8, start: usize, len: usize, needle: str) bool;
-```
-
-## fun t_untouched
-
-```mach
-pub fun t_untouched(alloc: *A.Allocator, path: str) bool;
-```
-

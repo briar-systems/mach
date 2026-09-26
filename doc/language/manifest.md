@@ -71,6 +71,7 @@ targets the dependency declares for them. No other `[target.*]` entry is read.
 [project]
 id      = "demo"                       # required: identifier; root of every module path
 version = "0.1.0"                      # required
+mach    = "^5.3"                       # required in a root manifest: the compiler range
 src     = "src"                        # required: source dir, project-root-relative
 out     = "out/{target.name}/{profile.name}"  # required: output-path template root
 
@@ -112,13 +113,40 @@ ref = "branch/main"
 | `version` | string | Project version. Read by `$project.version` and `$project.version.{major,minor,patch}`, and stamped into a Windows executable's version resource. |
 | `src`     | string | Source root, project-root-relative. Module paths resolve under it. |
 | `out`     | string | The output-path template root, referenced as `{project.out}` by artifact `out`, step paths, and `cmd`s. Expanded over `{target.name}`/`{target.isa}`/`{target.os}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). |
-| `mach`    | string | The compiler versions this project builds with, as a [version range](#version-ranges) (`"^5.2"`). See [Compiler range](#compiler-range). |
+| `mach`    | string | The compiler versions this project builds with, as a [version range](#version-ranges) (`"^5.3"`). Required in a root manifest. See [Compiler range](#compiler-range). |
 
 `[project]` is exactly these five keys. Any other key, `name` and `description`
 included, is an unknown-key error (`mach.toml: unknown key 'name' in
 [project]`), in a root manifest and a dependency's alike. `[profile.<name>]`
 likewise carries no `emit_ir` or `emit_asm`: emission is `--emit-ir`/`--emit-asm`
 on the command line.
+
+### The output directory
+
+Everything a build and its cache write lands under the expanded `out`, in one
+layout:
+
+| Path | Holds |
+| --- | --- |
+| `obj/` | one object per module, each carrying its cache key; it is the [object cache](#stepname--build-steps) and is read by developers and tooling too |
+| `ir/`, `asm/` | the human-readable views `--emit-ir` and `--emit-asm` write |
+| `.cache/` | compiler-only state, read and written by nothing but the compiler |
+| `.cache/steps/` | one fingerprint stamp per [build step](#stepname--build-steps) |
+| `.stage/` | build step scratch space, one directory per step, reset before the step runs |
+| `test/<artifact>/dispatch.o` | the test dispatcher object of a tested artifact |
+| `test/<artifact>/<artifact>` | the test dispatcher executable |
+| `test/<artifact>/log/` | a failing test's captured output |
+| `dep/<id>/` | a dependency's artifact outputs (see [Dependency requirements travel](#dependency-requirements-travel)) |
+
+Test objects sit in `obj/` beside the module objects, as
+`obj/<project>/<module>.test.o`. Artifact outputs go wherever their own `out`
+names under the directory.
+
+`mach clean` removes `obj/`, `ir/`, `asm/`, `.cache/`, `.stage/`, `test/` and
+`dep/` along with every artifact output, for every declared target and profile,
+so the build after it is a cold one that reuses nothing. A step output may not
+name a path inside `obj/<project.id>/`, `.cache/` or `.stage/` (see
+[build steps](#stepname--build-steps)).
 
 ### Compiler range
 
@@ -134,11 +162,10 @@ error: this is mach 5.2.1, and the dependency closure does not accept it:
     app -> gfx -> glfw requires mach >=5.4, <6
 ```
 
-A root manifest without `mach` builds, with a warning that prints the line to
+A root manifest must state `mach`. One without it is refused with the line to
 add (`mach.toml: [project] states no compiler range; add mach = "^5.3", the
 oldest release that reads the key, and raise it when the project uses a later
-feature`). A later release, the next major, makes the key required for a root
-manifest (#3671). A dependency without it states no constraint. `mach init` writes the same range. It is the oldest
+feature`). A dependency without it states no constraint. `mach init` writes the same range. It is the oldest
 release of the running compiler's major that reads the key: `^5.3` for every
 5.x compiler, since 5.3.0 is the first release that accepts `mach`, and `^N.0`
 for a later major N, since a caret cannot span majors. The range depends only on
@@ -1093,7 +1120,7 @@ plain identifier — it keys the step's stamp file.
 | `in`   | yes | Declared input file list. Accepts globs (`*`, `**`), expanded sorted for a stable fingerprint; a glob that matches nothing is a hard error. |
 | `out`  | yes | Declared output file list. Concrete paths only — a glob here is an error, since the demand match and cache key expand `out` verbatim. |
 | `need` | yes | Array of `step.<name>` requirements or `step.<pattern>` globs this step must run after. Steps may require only steps. Cycles are manifest errors. `[]` for none. |
-| `timeout_seconds` | no | Positive integer number of seconds after which the step's process group is terminated and the build fails. Omit for an unbounded step. |
+| `timeout` | no | Duration string (`"30ms"`, `"30s"`, `"5m"`, `"1h"`) after which the step's process group is terminated and the build fails. Omit for an unbounded step. |
 
 Steps carry **no filters** and **never run automatically**. A step runs only when
 **demanded**:
@@ -1115,14 +1142,23 @@ arguments, and effective environment contribute to its fingerprint. An unchanged
 step whose outputs still exist is skipped. Changing an inherited environment
 value received by the child also invalidates the step.
 
-**Bounding a step.** `timeout_seconds` gives the step a deadline measured from
+The fingerprint of the last successful run is kept as a stamp in
+`{project.out}/.cache/steps/`, and a step's outputs under `{project.out}` are
+written into scratch space in `{project.out}/.stage/<name>/` and published only
+once the step succeeds. Both belong
+to the compiler: a declared `out` inside `{project.out}/.cache/` or
+`{project.out}/.stage/` fails at manifest load, naming the step and the path.
+`mach clean` removes both, so the next build runs every demanded step again.
+
+**Bounding a step.** `timeout` gives the step a deadline measured from
 the moment it is spawned. When the deadline passes, the step's whole process
 group is signalled — a compiler or archiver the step's shell invoked dies with
 it rather than outliving the build — the child is reaped, and the build fails
 naming the step and the bound. Omitting the key leaves the step unbounded,
 which is the default and the behaviour of every step that does not set it. The
-value is an integer number of seconds; zero, a negative number, and a
-non-integer are rejected at manifest load, and there is no duration grammar.
+value is a string holding a positive integer and a unit, `ms`, `s`, `m` or `h`,
+the same grammar as `mach test --timeout`. A bare number, zero, a fraction and
+any other unit are rejected at manifest load.
 The bound is not part of the step's cache key: changing it does not invalidate
 a cached step, because it cannot change what the step produces.
 
@@ -1151,6 +1187,34 @@ after the module's path (`src/window.mach` in project `glfw` becomes
 `{project.out}/obj/glfw/window.o`). A step that writes there collides with those
 objects by name, and because the link takes whichever file survived, the result is
 a binary that is subtly wrong rather than a build that fails.
+
+**The object tree is the object cache.** Under `--cache` a module whose object in
+`obj/` was built under the same key is reused as it is: the module is neither
+lowered nor generated again, and when nothing the build still compiles imports
+it, it is not resolved or type-checked either. Each module has its own key: the
+compiler identity, the build configuration, the module's own source and embedded
+files, and the surface of every module it imports, directly or not. A module's
+surface is its source without the bodies of its tests and of its functions that
+are neither generic nor take a comptime parameter, since no importer compiles
+those; a release build inlines function bodies across modules, so there the
+whole source is the surface. Editing such a body rebuilds that module alone, and
+editing a declaration rebuilds the module and the modules that import it. With
+debug information the surface also covers where each retained declaration sits,
+so an edit that moves one to another line rebuilds its importers. A reused
+module reports again the warnings it reported when it was compiled, so a warm
+build prints what a cold one prints. Each object
+carries its key in a section no link loads: `.mach.cache` on
+ELF (not allocated) and COFF (`IMAGE_SCN_LNK_INFO | IMAGE_SCN_LNK_REMOVE`), and
+`__MACH,__mach_cache` on Mach-O (debug-attributed). The parser consumes it, so an
+object links exactly as it would without it. An object that is missing, has no
+key, a damaged one or another key is rebuilt, never linked stale. `obj/` holds one
+object per module, the latest, and each object is written to a sibling temporary
+and renamed into place, so an interrupted build leaves the previous object or the
+new one, never a torn file. The digests of the sources the keys read are
+remembered in `{project.out}/.cache/digests` under each file's path, size,
+modification time and identity, so an unchanged file is not hashed again for its
+key; a missing or damaged memo is rebuilt. `--no-cache` ignores the tree, and
+`mach clean` removes it with the rest of the output.
 
 A step output is therefore rejected in that subtree. A declared `out` inside it
 fails at manifest load, naming the step and the path, before any step runs. A step
@@ -1876,6 +1940,7 @@ and never on a windows one.
 [project]
 id      = "demo"
 version = "0.1.0"
+mach    = "^5.3"
 src     = "src"
 out     = "out/{target.name}/{profile.name}"
 
@@ -2062,6 +2127,7 @@ profiles, two binary artifacts with literal output paths, and one dependency,
 [project]
 id = "mach"
 version = "5.0.0"
+mach = "^5.3"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 

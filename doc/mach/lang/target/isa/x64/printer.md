@@ -48,17 +48,3 @@ the spelling a diagnostic names an emitted instruction by
 pub fun reg_name(id: i32, width: u8) str;
 ```
 
-## fun test_sink_writer
-
-```mach
-pub fun test_sink_writer(w: *writer.Writer);
-```
-
-a writer into the test buffer, emptied, for an encoder-side round trip
-
-## fun test_sink_text
-
-```mach
-pub fun test_sink_text() str;
-```
-
