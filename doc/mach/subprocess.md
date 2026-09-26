@@ -182,10 +182,10 @@ pub fun init(p: *OwnedSubprocess);
 pub fun set_deadline(p: *OwnedSubprocess, deadline: tm.Instant) bool;
 ```
 
-## fun bound_seconds
+## fun bound
 
 ```mach
-pub fun bound_seconds(p: *OwnedSubprocess, seconds: i64) bool;
+pub fun bound(p: *OwnedSubprocess, timeout: duration.Duration) bool;
 ```
 
 ## fun deadline_reached
