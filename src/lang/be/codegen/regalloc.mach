@@ -283,6 +283,12 @@ fun alloc_function(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) 
         ret ao;
     }
 
+    val cd: err[fail.Fail] = coalesce_dying_copies(tgt, ?ctx);
+    if (sel cd.err) {
+        ctx_dnit(?ctx);
+        ret cd;
+    }
+
     # a round scans the function as it stands; when it leaves a spilled
     # value whose reads a piece could carry, the pieces are inserted and the
     # next round scans them as intervals of their own
@@ -369,7 +375,7 @@ fun alloc_round(tgt: *target.Target, ctx: *AllocCtx) err[fail.Fail] {
 
     build_ranges(ctx);
 
-    val lv: err[fail.Fail] = extend_liveness(ctx);
+    val lv: err[fail.Fail] = extend_liveness(ctx, ctx.holes);
     if (sel lv.err) { ret lv; }
 
     val mc: err[fail.Fail] = mark_call_crossing(ctx);
@@ -1528,6 +1534,218 @@ fun coalesce_copies(tgt: *target.Target, ctx: *AllocCtx) err[fail.Fail] {
     ret err[fail.Fail].ok{};
 }
 
+# a copy the dying-copy pass may merge away, the hottest first
+rec DyingCopy {
+    cold: i64;
+    pos:  u32;
+}
+
+# a copy `d = s` whose source dies at it: d and s become one value when no
+# position holds both, so every definition of either writes one register and
+# the copy is a self-copy that vanishes. unlike coalesce_copies, either side
+# may have many definitions, which is the shape of a loop-carried variable
+# and the value its back edge copies into it. the test is exact liveness on
+# every ISA, whatever the scan models: two values that never meet may share
+# a register soundly, and without holes the merged hull is the union of two
+# hulls that meet at the copy, so no position gains a value. a position where
+# one side's last read meets the other's definition is shared only when the
+# instruction reads before it writes, the rule the scan's hand-off applies,
+# so a merge never makes a two-address op clobber its own operand. one web's
+# hull must lie inside the other's, so the merged value spans nothing new,
+# and a value copied from or into a physical register keeps its own hint:
+# without either, merges lengthen the hot loops. the constraints a register
+# must meet (calls, argument windows, definitions, pins and the reload
+# guarantee) apply to the merged value as the rounds place it. the copies are
+# taken hottest first, so a loop's copy is not lost to a colder one that
+# would merge a value it meets
+fun coalesce_dying_copies(tgt: *target.Target, ctx: *AllocCtx) err[fail.Fail] {
+    val nv: u32 = ctx.f.vreg_count;
+    if (nv == 0 || tgt.arch.is_reg_move == nil) { ret err[fail.Fail].ok{}; }
+    if (!has_mergeable_copy(tgt, ctx))          { ret err[fail.Fail].ok{}; }
+
+    val rt: err[fail.Fail] = round_tables_init(ctx);
+    if (sel rt.err) { ret rt; }
+    fin { round_tables_dnit(ctx); }
+    val fl: err[fail.Fail] = flatten(ctx);
+    if (sel fl.err) { ret fl; }
+    val bs: err[fail.Fail] = build_block_spans(ctx);
+    if (sel bs.err) { ret bs; }
+    val bd: err[fail.Fail] = build_loop_depth(ctx);
+    if (sel bd.err) { ret bd; }
+    build_ranges(ctx);
+    val lv: err[fail.Fail] = extend_liveness(ctx, true);
+    if (sel lv.err) { ret lv; }
+
+    var count: u32 = 0;
+    var pos:   u32 = 0;
+    for (pos < ctx.flat_count) {
+        if (dying_copy(tgt, ctx, pos)) { count = count + 1; }
+        pos = pos + 1;
+    }
+    if (count == 0) { ret err[fail.Fail].ok{}; }
+    val rc: res[*DyingCopy, A.Error] = A.allocate[DyingCopy](ctx.alloc, count::usize);
+    if (sel rc.err) { ret err[fail.Fail].err{fail.refused(rc.err)}; }
+    val copies: *DyingCopy = rc.ok;
+    fin { A.deallocate[DyingCopy](ctx.alloc, copies, count::usize); }
+    var n: u32 = 0;
+    pos = 0;
+    for (pos < ctx.flat_count) {
+        if (dying_copy(tgt, ctx, pos)) {
+            copies[n].cold = -use_weight_at(ctx, pos);
+            copies[n].pos  = pos;
+            n              = n + 1;
+        }
+        pos = pos + 1;
+    }
+    sort.sort[DyingCopy](copies, count::usize);
+
+    val rp: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, nv::usize);
+    if (sel rp.err) { ret err[fail.Fail].err{fail.refused(rp.err)}; }
+    val parent: *u32 = rp.ok;
+    fin { A.deallocate[u32](ctx.alloc, parent, nv::usize); }
+    val rn: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, nv::usize);
+    if (sel rn.err) { ret err[fail.Fail].err{fail.refused(rn.err)}; }
+    val next: *u32 = rn.ok;
+    fin { A.deallocate[u32](ctx.alloc, next, nv::usize); }
+    val rb: res[*bool, A.Error] = A.allocate[bool](ctx.alloc, nv::usize);
+    if (sel rb.err) { ret err[fail.Fail].err{fail.refused(rb.err)}; }
+    val pinned: *bool = rb.ok;
+    fin { A.deallocate[bool](ctx.alloc, pinned, nv::usize); }
+    var i: u32 = 0;
+    for (i < nv) {
+        parent[i] = i;
+        next[i]   = i;
+        pinned[i] = false;
+        i         = i + 1;
+    }
+    mark_register_copies(tgt, ctx, pinned);
+
+    var merged: bool = false;
+    var c:      u32  = 0;
+    for (c < count) {
+        val mi: *mir.MirInstr = flat_instr(ctx, copies[c].pos);
+        val rd: u32           = web_find(parent, mi.operands[0].vreg.n);
+        val rs: u32           = web_find(parent, mi.operands[1].vreg.n);
+        if (rd != rs && !web_any(next, pinned, rd) && !web_any(next, pinned, rs) && hulls_nest(ctx, next, rd, rs)
+            && !webs_meet(ctx, next, rd, rs)) {
+            parent[rd] = rs;
+            # splice the two member rings into one
+            val t: u32 = next[rd];
+            next[rd] = next[rs];
+            next[rs] = t;
+            merged   = true;
+        }
+        c = c + 1;
+    }
+    if (!merged) { ret err[fail.Fail].ok{}; }
+    rename_vregs(ctx, parent, nv);
+    ret drop_self_copies(tgt, ctx);
+}
+
+# a full-width copy between two values that could share a register, whose
+# source's segment ends at it
+fun dying_copy(tgt: *target.Target, ctx: *AllocCtx, pos: u32) bool {
+    val mi: *mir.MirInstr = flat_instr(ctx, pos);
+    if (!mergeable_copy(tgt, ctx, mi)) { ret false; }
+    ret dies_at(ctx, mi.operands[1].vreg.n, pos::i64);
+}
+
+fun has_mergeable_copy(tgt: *target.Target, ctx: *AllocCtx) bool {
+    val f:  *mir.MirFunction = ctx.f;
+    var bi: u32              = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        var ii:  u32           = 0;
+        for (ii < blk.instr_count) {
+            if (mergeable_copy(tgt, ctx, ?blk.instrs[ii])) { ret true; }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+fun mergeable_copy(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr) bool {
+    if (!instr_is_reg_copy(tgt, mi)) { ret false; }
+    if (mi.width < ctx.spill_width)  { ret false; }
+    val dop: *mir.MirOperand = ?mi.operands[0];
+    val sop: *mir.MirOperand = ?mi.operands[1];
+    if (dop.kind != mir.MIR_OP_VREG || sop.kind != mir.MIR_OP_VREG) { ret false; }
+    val d: u32 = dop.vreg.n;
+    val s: u32 = sop.vreg.n;
+    if (d >= ctx.f.vreg_count || s >= ctx.f.vreg_count || d == s)     { ret false; }
+    if (vreg_has_slot(ctx, dop.vreg) || vreg_has_slot(ctx, sop.vreg)) { ret false; }
+    val dv: *mir.MirVReg = ?ctx.f.vregs[d];
+    val sv: *mir.MirVReg = ?ctx.f.vregs[s];
+    ret dv.class == sv.class && dv.secret == sv.secret && dv.vector == sv.vector;
+}
+
+# the values copied from or into a physical register
+fun mark_register_copies(tgt: *target.Target, ctx: *AllocCtx, pinned: *bool) {
+    var pos: u32 = 0;
+    for (pos < ctx.flat_count) {
+        val mi: *mir.MirInstr = flat_instr(ctx, pos);
+        if (instr_is_reg_copy(tgt, mi)) {
+            val d: *mir.MirOperand = ?mi.operands[0];
+            val s: *mir.MirOperand = ?mi.operands[1];
+            if (d.kind == mir.MIR_OP_VREG && s.kind == mir.MIR_OP_PREG && d.vreg.n < ctx.f.vreg_count) { pinned[d.vreg.n] = true; }
+            if (d.kind == mir.MIR_OP_PREG && s.kind == mir.MIR_OP_VREG && s.vreg.n < ctx.f.vreg_count) { pinned[s.vreg.n] = true; }
+        }
+        pos = pos + 1;
+    }
+}
+
+fun web_any(next: *u32, flag: *bool, a: u32) bool {
+    var x: u32 = a;
+    for (true) {
+        if (flag[x]) { ret true; }
+        x = next[x];
+        if (x == a) { brk; }
+    }
+    ret false;
+}
+
+fun web_hull(ctx: *AllocCtx, next: *u32, a: u32, lo: *i64, hi: *i64) {
+    @lo = POS_MAX;
+    @hi = -1;
+    var x: u32 = a;
+    for (true) {
+        if (ctx.ranges[x].start < @lo)   { @lo = ctx.ranges[x].start; }
+        if (ctx.ranges[x].end_pos > @hi) { @hi = ctx.ranges[x].end_pos; }
+        x = next[x];
+        if (x == a) { brk; }
+    }
+}
+
+# whether one web's hull lies inside the other's, so the merged value spans
+# no position that one of them did not already span
+fun hulls_nest(ctx: *AllocCtx, next: *u32, a: u32, b: u32) bool {
+    var alo: i64 = 0;
+    var ahi: i64 = 0;
+    var blo: i64 = 0;
+    var bhi: i64 = 0;
+    web_hull(ctx, next, a, ?alo, ?ahi);
+    web_hull(ctx, next, b, ?blo, ?bhi);
+    ret (alo <= blo && bhi <= ahi) || (blo <= alo && ahi <= bhi);
+}
+
+# whether any value of one web meets any value of the other; each value's
+# segments are its own, so the webs' union is tested member by member
+fun webs_meet(ctx: *AllocCtx, next: *u32, a: u32, b: u32) bool {
+    var x: u32 = a;
+    for (true) {
+        var y: u32 = b;
+        for (true) {
+            if (intersects(ctx, ?ctx.ranges[x], ?ctx.ranges[y])) { ret true; }
+            y = next[y];
+            if (y == b) { brk; }
+        }
+        x = next[x];
+        if (x == a) { brk; }
+    }
+    ret false;
+}
+
 fun reads_in_window(ctx: *AllocCtx, d: u32, from: i64, to: i64) bool {
     var p: i64 = from + 1;
     for (p < to) {
@@ -1955,7 +2173,9 @@ fun restore_offsets(start: *u32, n: u32) {
     start[0] = 0;
 }
 
-fun extend_liveness(ctx: *AllocCtx) err[fail.Fail] {
+# exact asks for a value's segments with their holes whatever the scan's
+# model, for a pass that must know where values are dead
+fun extend_liveness(ctx: *AllocCtx, exact: bool) err[fail.Fail] {
     val nb: u32 = ctx.f.block_count;
     val nv: u32 = ctx.f.vreg_count;
     if (nb == 0 || nv == 0) { ret err[fail.Fail].ok{}; }
@@ -1987,7 +2207,7 @@ fun extend_liveness(ctx: *AllocCtx) err[fail.Fail] {
         reset_ranges(ctx);
         ret pl;
     }
-    val bs: err[fail.Fail] = build_segments(ctx, ?l);
+    val bs: err[fail.Fail] = build_segments(ctx, ?l, exact);
     if (sel bs.err) { reset_ranges(ctx); }
     ret bs;
 }
@@ -2208,8 +2428,8 @@ fun bucket_pairs(ctx: *AllocCtx, l: *PairList, nb: u32, start: **u32, regs: **u3
     ret err[fail.Fail].ok{};
 }
 
-fun build_segments(ctx: *AllocCtx, l: *LiveScratch) err[fail.Fail] {
-    if (!ctx.holes) { ret build_hull_segments(ctx); }
+fun build_segments(ctx: *AllocCtx, l: *LiveScratch, exact: bool) err[fail.Fail] {
+    if (!exact) { ret build_hull_segments(ctx); }
     val nb: u32 = ctx.f.block_count;
     val nv: u32 = ctx.f.vreg_count;
 
@@ -5457,155 +5677,70 @@ fun free_ops(ctx: *AllocCtx, ops: *mir.MirOperand, n: u32) {
     }
 }
 
-test "mach.lang.be.codegen.regalloc.seed_reserved:aarch64_reserved_and_fp_bank" {
+# the frame, link and veneer scratch registers are reserved everywhere on
+# aarch64, the platform register x18 only on darwin
+test seed_reserved__aarch64 {
     var reg: target.TargetRegistry = target.registry_init();
     fin { target.registry_dnit(?reg); }
     val rr: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
     if (sel rr.err) { ret 1; }
+    var linux: [64]bool;
+    if (!t_seed_reserved(?reg, "linux", ?linux[0]))          { ret 2; }
+    if (!linux[30] || !linux[16] || !linux[17] || linux[18]) { ret 3; }
+    var darwin: [64]bool;
+    if (!t_seed_reserved(?reg, "darwin", ?darwin[0])) { ret 4; }
+    if (!darwin[18])                                  { ret 5; }
 
     val ts: res[target.Target, fail.Fail] = target.select(?reg, "aarch64", "linux", "aapcs64");
-    if (sel ts.err) { ret 1; }
+    if (sel ts.err) { ret 6; }
     var t: target.Target = ts.ok;
+    if (bank_count(?t, fp_class_index(?t)) != 30) { ret 7; }
+    ret 0;
+}
 
-    var ctx: AllocCtx;
-    ctx.gp_count = bank_count(?t, REG_CLASS_GP);
-    var reserved: [64]bool;
-    var i:        u32 = 0;
+#[testing]
+fun t_seed_reserved(reg: *target.TargetRegistry, os_name: str, reserved: *bool) bool {
+    val ts: res[target.Target, fail.Fail] = target.select(reg, "aarch64", os_name, "aapcs64");
+    if (sel ts.err) { ret false; }
+    var t: target.Target = ts.ok;
+    var i: u32           = 0;
     for (i < 64) {
         reserved[i] = false;
         i           = i + 1;
     }
-    ctx.reserved = ?reserved[0];
-
+    var ctx: AllocCtx;
+    ctx.gp_count = bank_count(?t, REG_CLASS_GP);
+    ctx.reserved = reserved;
     seed_reserved(?t, ?ctx);
-
-    if (!reserved[30]) { ret 1; }
-    if (!reserved[16]) { ret 1; }
-    if (!reserved[17]) { ret 1; }
-
-    if (bank_count(?t, fp_class_index(?t)) != 30) { ret 1; }
-
-    ret 0;
+    ret true;
 }
 
-test "mach.lang.be.codegen.regalloc.seed_reserved:x18_reserved_on_darwin_only" {
-    var reg: target.TargetRegistry = target.registry_init();
-    fin { target.registry_dnit(?reg); }
-    val rr: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
-    if (sel rr.err) { ret 1; }
-
-    val ls: res[target.Target, fail.Fail] = target.select(?reg, "aarch64", "linux", "aapcs64");
-    if (sel ls.err) { ret 2; }
-    var tl:   target.Target = ls.ok;
-    var ctxl: AllocCtx;
-    ctxl.gp_count = bank_count(?tl, REG_CLASS_GP);
-    var reservedl: [64]bool;
-    var il:        u32 = 0;
-    for (il < 64) {
-        reservedl[il] = false;
-        il            = il + 1;
-    }
-    ctxl.reserved = ?reservedl[0];
-    seed_reserved(?tl, ?ctxl);
-    if (reservedl[18]) { ret 3; }
-
-    val ds: res[target.Target, fail.Fail] = target.select(?reg, "aarch64", "darwin", "aapcs64");
-    if (sel ds.err) { ret 4; }
-    var td:   target.Target = ds.ok;
-    var ctxd: AllocCtx;
-    ctxd.gp_count = bank_count(?td, REG_CLASS_GP);
-    var reservedd: [64]bool;
-    var id:        u32 = 0;
-    for (id < 64) {
-        reservedd[id] = false;
-        id            = id + 1;
-    }
-    ctxd.reserved = ?reservedd[0];
-    seed_reserved(?td, ?ctxd);
-    if (!reservedd[18]) { ret 5; }
-
-    ret 0;
-}
-
-test "mach.lang.be.codegen.regalloc.verify_allocation:accepts_a_well_formed_assignment" {
+test verify_allocation__class_and_reservation {
     var alloc:  A.Allocator;
     val make_r: err[A.Error] = page.make(?alloc);
     if (sel make_r.err) { ret 1; }
     var reg: target.TargetRegistry = target.registry_init();
     fin { target.registry_dnit(?reg); }
-    val r_2920: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
-    if (sel r_2920.err) { ret 1; }
+    val registered: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel registered.err) { ret 1; }
     val tr: res[target.Target, fail.Fail] = target.select(?reg, "x86_64", "linux", "sysv64");
     if (sel tr.err) { ret 1; }
     var tgt: target.Target = tr.ok;
 
     var vregs: [2]mir.MirVReg;
     vregs[0]          = mir.vreg(0, REG_CLASS_GP, false, false);
-    vregs[0].assigned = mir.preg_id(isa.regid_make(isa.REG_CLASS_ID_GP, 0));
+    vregs[0].assigned = mir.preg_id(isa.regid_make(isa.REG_CLASS_ID_GP, 2));
     vregs[1]          = mir.vreg(1, 1, false, false);
     vregs[1].assigned = mir.preg_id(isa.regid_make(isa.REG_CLASS_ID_XMM, 0));
-
     var f: mir.MirFunction;
     f.vregs      = ?vregs[0];
     f.vreg_count = 2;
-
     var ranges: [2]LiveRange;
     ranges[0].reg_class = REG_CLASS_GP;
     ranges[1].reg_class = 1;
-
-    var reserved: [4]bool;
-    var ri:       u32 = 0;
-    for (ri < 4) {
-        reserved[ri] = false;
-        ri           = ri + 1;
-    }
-
-    var ctx: AllocCtx;
-    ctx.alloc    = ?alloc;
-    ctx.interner = nil;
-    ctx.f        = ?f;
-    ctx.ranges   = ?ranges[0];
-    ctx.gp_count = 4;
-    ctx.fp_count = 4;
-    ctx.reserved = ?reserved[0];
-
-    val vr: err[fail.Fail] = verify_allocation(?tgt, ?ctx);
-    if (sel vr.err) { ret 1; }
-    ret 0;
-}
-
-test "mach.lang.be.codegen.regalloc.verify_allocation:rejects_a_cross_class_register_id" {
-    var alloc:  A.Allocator;
-    val make_r: err[A.Error] = page.make(?alloc);
-    if (sel make_r.err) { ret 1; }
-    var reg: target.TargetRegistry = target.registry_init();
-    fin { target.registry_dnit(?reg); }
-    val r_2963: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
-    if (sel r_2963.err) { ret 1; }
-    val tr: res[target.Target, fail.Fail] = target.select(?reg, "x86_64", "linux", "sysv64");
-    if (sel tr.err) { ret 1; }
-    var tgt: target.Target = tr.ok;
-
-    var vregs: [1]mir.MirVReg;
-    vregs[0]          = mir.vreg(0, REG_CLASS_GP, false, false);
-    vregs[0].assigned = mir.preg_id(isa.regid_make(isa.REG_CLASS_ID_XMM, 0));
-
-    var f: mir.MirFunction;
-    f.vregs      = ?vregs[0];
-    f.vreg_count = 1;
-
-    var ranges: [1]LiveRange;
-    ranges[0].reg_class = REG_CLASS_GP;
-
-    var reserved: [4]bool;
-    var ri:       u32 = 0;
-    for (ri < 4) {
-        reserved[ri] = false;
-        ri           = ri + 1;
-    }
-
-    var itn: intern.Interner = intern.init(?alloc);
-    var ctx: AllocCtx;
+    var reserved: [4]bool         = [4]bool{false, false, false, false};
+    var itn:      intern.Interner = intern.init(?alloc);
+    var ctx:      AllocCtx;
     ctx.alloc    = ?alloc;
     ctx.interner = ?itn;
     ctx.f        = ?f;
@@ -5614,62 +5749,19 @@ test "mach.lang.be.codegen.regalloc.verify_allocation:rejects_a_cross_class_regi
     ctx.fp_count = 4;
     ctx.reserved = ?reserved[0];
 
-    val vr: err[fail.Fail] = verify_allocation(?tgt, ?ctx);
-    if (sel vr.ok) { ret 1; }
-    ret 0;
-}
-
-test "mach.lang.be.codegen.regalloc.verify_allocation:rejects_a_reserved_register" {
-    var alloc:  A.Allocator;
-    val make_r: err[A.Error] = page.make(?alloc);
-    if (sel make_r.err) { ret 1; }
-    var reg: target.TargetRegistry = target.registry_init();
-    fin { target.registry_dnit(?reg); }
-    val r_3004: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
-    if (sel r_3004.err) { ret 1; }
-    val tr: res[target.Target, fail.Fail] = target.select(?reg, "x86_64", "linux", "sysv64");
-    if (sel tr.err) { ret 1; }
-    var tgt: target.Target = tr.ok;
-
-    var vregs: [1]mir.MirVReg;
-    vregs[0]          = mir.vreg(0, REG_CLASS_GP, false, false);
-    vregs[0].assigned = mir.preg_id(isa.regid_make(isa.REG_CLASS_ID_GP, 2));
-
-    var f: mir.MirFunction;
-    f.vregs      = ?vregs[0];
-    f.vreg_count = 1;
-
-    var ranges: [1]LiveRange;
-    ranges[0].reg_class = REG_CLASS_GP;
-
-    var reserved: [4]bool;
-    var ri:       u32 = 0;
-    for (ri < 4) {
-        reserved[ri] = false;
-        ri           = ri + 1;
-    }
+    val ok: err[fail.Fail] = verify_allocation(?tgt, ?ctx);
+    if (sel ok.err) { ret 2; }
     reserved[2] = true;
-
-    var itn: intern.Interner = intern.init(?alloc);
-    var ctx: AllocCtx;
-    ctx.alloc    = ?alloc;
-    ctx.interner = ?itn;
-    ctx.f        = ?f;
-    ctx.ranges   = ?ranges[0];
-    ctx.gp_count = 4;
-    ctx.fp_count = 4;
-    ctx.reserved = ?reserved[0];
-
-    val vr: err[fail.Fail] = verify_allocation(?tgt, ?ctx);
-    if (sel vr.ok) { ret 1; }
-
-    reserved[2] = false;
-    val vr2: err[fail.Fail] = verify_allocation(?tgt, ?ctx);
-    if (sel vr2.err) { ret 1; }
+    val held: err[fail.Fail] = verify_allocation(?tgt, ?ctx);
+    if (sel held.ok) { ret 3; }
+    reserved[2]       = false;
+    vregs[0].assigned = mir.preg_id(isa.regid_make(isa.REG_CLASS_ID_XMM, 0));
+    val crossed: err[fail.Fail] = verify_allocation(?tgt, ?ctx);
+    if (sel crossed.ok) { ret 4; }
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.sort_by_start:orders_by_start_then_end_then_original_index" {
+test sort_by_start__orders_by_start_then_end_then_original_index {
     var alloc:  A.Allocator;
     val make_r: err[A.Error] = page.make(?alloc);
     if (sel make_r.err) { ret 1; }
@@ -5708,73 +5800,7 @@ test "mach.lang.be.codegen.regalloc.sort_by_start:orders_by_start_then_end_then_
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.sort_by_start:leaves_short_orders_untouched" {
-    var alloc:  A.Allocator;
-    val make_r: err[A.Error] = page.make(?alloc);
-    if (sel make_r.err) { ret 1; }
-    var ctx: AllocCtx;
-    ctx.alloc = ?alloc;
-
-    var order0: [1]u32;
-    order0[0] = 77;
-    val r0: err[fail.Fail] = sort_by_start(?ctx, ?order0[0], 0);
-    if (sel r0.err)      { ret 1; }
-    if (order0[0] != 77) { ret 1; }
-
-    var ranges: [1]LiveRange;
-    ranges[0].start   = 7;
-    ranges[0].end_pos = 9;
-    ctx.ranges        = ?ranges[0];
-    var order1: [1]u32;
-    order1[0] = 0;
-    val r1: err[fail.Fail] = sort_by_start(?ctx, ?order1[0], 1);
-    if (sel r1.err)     { ret 1; }
-    if (order1[0] != 0) { ret 1; }
-    ret 0;
-}
-
-test "mach.lang.be.codegen.regalloc.extend_range_for_block:in_out_matrix" {
-    var span: BlockSpan;
-    span.start = 100;
-    span.end   = 110;
-
-    var lr1: LiveRange;
-    lr1.start   = 105;
-    lr1.end_pos = 106;
-    extend_range_for_block(?lr1, span, true, true);
-    if (lr1.start != 100 || lr1.end_pos != 110) { ret 1; }
-
-    var lr2: LiveRange;
-    lr2.start   = 105;
-    lr2.end_pos = 106;
-    extend_range_for_block(?lr2, span, true, false);
-    if (lr2.start != 100 || lr2.end_pos != 106) { ret 1; }
-
-    var lr3: LiveRange;
-    lr3.start   = 105;
-    lr3.end_pos = 106;
-    extend_range_for_block(?lr3, span, false, true);
-    if (lr3.start != 105 || lr3.end_pos != 110) { ret 1; }
-
-    var lr4: LiveRange;
-    lr4.start   = 105;
-    lr4.end_pos = 106;
-    extend_range_for_block(?lr4, span, false, false);
-    if (lr4.start != 105 || lr4.end_pos != 106) { ret 1; }
-
-    var empty: BlockSpan;
-    empty.start = -1;
-    empty.end   = -1;
-    var lr5: LiveRange;
-    lr5.start   = 105;
-    lr5.end_pos = 106;
-    extend_range_for_block(?lr5, empty, true, true);
-    if (lr5.start != 105 || lr5.end_pos != 106) { ret 1; }
-
-    ret 0;
-}
-
-test "mach.lang.be.codegen.regalloc.instr_defines:fused_cbr_shape" {
+test instr_defines__a_fused_branch_defines_nothing {
     var ops: [4]mir.MirOperand;
     ops[0] = mir.op_vreg(mir.vreg_id(3));
     ops[1] = mir.op_vreg(mir.vreg_id(4));
@@ -5802,7 +5828,7 @@ test "mach.lang.be.codegen.regalloc.instr_defines:fused_cbr_shape" {
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.can_transfer:destination_born_guard" {
+test can_transfer__only_to_a_destination_born_at_the_copy {
     var ctx:    AllocCtx;
     var ranges: [4]LiveRange;
     var segs:   [4]Segment;
@@ -5840,7 +5866,7 @@ test "mach.lang.be.codegen.regalloc.can_transfer:destination_born_guard" {
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.is_dead_mov:physical_dest_and_read_guards" {
+test is_dead_mov__guards {
     var reg: target.TargetRegistry = target.registry_init();
     fin { target.registry_dnit(?reg); }
     val r_3195: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
@@ -5889,7 +5915,7 @@ test "mach.lang.be.codegen.regalloc.is_dead_mov:physical_dest_and_read_guards" {
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.sweep_dead_movs:retallies_to_a_fixpoint" {
+test sweep_dead_movs__retallies_to_a_fixpoint {
     var reg: target.TargetRegistry;
     fin { target.registry_dnit(?reg); }
     var t: target.Target;
@@ -5928,35 +5954,7 @@ test "mach.lang.be.codegen.regalloc.sweep_dead_movs:retallies_to_a_fixpoint" {
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.cross_block_liveness:1851" {
-    var i:   i32 = 0;
-    var a:   i32 = 3;
-    var b:   i32 = -7;
-    var acc: i32 = 0;
-    for (i < 6) {
-        if (b < 0) { acc = acc + a; }
-        or         { acc = acc - a; }
-        b = b + 1;
-        a = a + 2;
-        i = i + 1;
-    }
-    if (acc != 48) { ret 1; }
-    ret 0;
-}
-
-test "mach.lang.be.codegen.regalloc.phi_neg_i32_signed_compare:1851" {
-    var probe: i32 = 0;
-    var i:     i32 = 0;
-    for (i < 5) {
-        probe = probe + i;
-        i     = i + 1;
-    }
-    var v: i32 = -1;
-    if (probe > 100) { v = probe; }
-    if (v < 0)       { ret 0; }
-    ret 1;
-}
-
+#[testing]
 fun t_vregs(alloc: *A.Allocator, f: *mir.MirFunction, n: u32) {
     val r: res[*mir.MirVReg, A.Error] = A.allocate[mir.MirVReg](alloc, n::usize);
     if (sel r.err) { ret; }
@@ -5975,6 +5973,7 @@ fun t_vregs(alloc: *A.Allocator, f: *mir.MirFunction, n: u32) {
     }
 }
 
+#[testing]
 fun t_block(alloc: *A.Allocator, b: *mir.MirBlock, n: u32) {
     val r: res[*mir.MirInstr, A.Error] = A.zallocate[mir.MirInstr](alloc, n::usize);
     if (sel r.err) { ret; }
@@ -5984,6 +5983,7 @@ fun t_block(alloc: *A.Allocator, b: *mir.MirBlock, n: u32) {
     b.id          = 0;
 }
 
+#[testing]
 fun t_mov(alloc: *A.Allocator, b: *mir.MirBlock, ix: u32, dst: mir.MirOperand, src: mir.MirOperand) {
     val r: res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](alloc, 2::usize);
     if (sel r.err) { ret; }
@@ -6000,6 +6000,7 @@ fun t_mov(alloc: *A.Allocator, b: *mir.MirBlock, ix: u32, dst: mir.MirOperand, s
 }
 
 # one segment per range from its hull, for tests that shape ranges by hand
+#[testing]
 fun t_hull_segs(ctx: *AllocCtx, n: u32) {
     var i: u32 = 0;
     for (i < n) {
@@ -6018,6 +6019,7 @@ fun t_hull_segs(ctx: *AllocCtx, n: u32) {
     ctx.seg_count = n;
 }
 
+#[testing]
 fun t_ctx(ctx: *AllocCtx, alloc: *A.Allocator, f: *mir.MirFunction, slots: *bool) {
     ctx.alloc          = alloc;
     ctx.interner       = nil;
@@ -6031,6 +6033,7 @@ fun t_ctx(ctx: *AllocCtx, alloc: *A.Allocator, f: *mir.MirFunction, slots: *bool
     ctx.borrowed_gp    = 0;
 }
 
+#[testing]
 fun t_target(reg: *target.TargetRegistry, out: *target.Target) bool {
     @reg = target.registry_init();
     val r_3350: err[fail.Fail] = target.register_all(reg, target_testing.debug_descriptor);
@@ -6044,96 +6047,56 @@ fun t_target(reg: *target.TargetRegistry, out: *target.Target) bool {
     ret true;
 }
 
-test "mach.lang.be.codegen.regalloc.coalesce_copies:single_assignment_web_is_merged" {
+# `v0 = p3; v1 = v0; p4 = v1` merges v1 into v0, unless the two differ in
+# secrecy, the copy narrows, v1 has a slot, or v1 is defined twice
+test coalesce_copies__a_single_assignment_web {
     var reg: target.TargetRegistry;
     fin { target.registry_dnit(?reg); }
     var t: target.Target;
     if (!t_target(?reg, ?t)) { ret 1; }
     var alloc: A.Allocator;
     page.make(?alloc);
-
-    var f: mir.MirFunction;
-    t_vregs(?alloc, ?f, 2);
-    var b: mir.MirBlock;
-    t_block(?alloc, ?b, 3);
-    t_mov(?alloc, ?b, 0, mir.op_vreg(mir.vreg_id(0)), mir.op_preg(mir.preg_id(3)));
-    t_mov(?alloc, ?b, 1, mir.op_vreg(mir.vreg_id(1)), mir.op_vreg(mir.vreg_id(0)));
-    t_mov(?alloc, ?b, 2, mir.op_preg(mir.preg_id(4)), mir.op_vreg(mir.vreg_id(1)));
-    f.blocks      = ?b;
-    f.block_count = 1;
-    f.block_cap   = 1;
-
-    var slots: [2]bool;
-    slots[0] = false;
-    slots[1] = false;
-    var ctx: AllocCtx;
-    t_ctx(?ctx, ?alloc, ?f, ?slots[0]);
-
-    val coalesce_copies_r: err[fail.Fail] = coalesce_copies(?t, ?ctx);
-    if (sel coalesce_copies_r.err) { ret 1; }
-
-    if (b.instr_count != 2)                              { ret 1; }
-    if (b.instrs[1].operands[1].kind != mir.MIR_OP_VREG) { ret 1; }
-    if (b.instrs[1].operands[1].vreg.n != 0)             { ret 1; }
-    if (b.instrs[0].operands[0].vreg.n != 0)             { ret 1; }
-
+    if (t_web(?t, ?alloc, false, false, 8, false, false) != 2) { ret 2; }
+    if (t_web(?t, ?alloc, true, false, 8, false, false) != 3)  { ret 3; }
+    if (t_web(?t, ?alloc, true, true, 8, false, false) != 2)   { ret 4; }
+    if (t_web(?t, ?alloc, false, false, 4, false, false) != 3) { ret 5; }
+    if (t_web(?t, ?alloc, false, false, 8, true, false) != 3)  { ret 6; }
+    if (t_web(?t, ?alloc, false, false, 8, false, true) != 4)  { ret 7; }
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.coalesce_copies:refuses_to_merge_a_secret_with_a_public_web" {
-    var reg: target.TargetRegistry;
-    fin { target.registry_dnit(?reg); }
-    var t: target.Target;
-    if (!t_target(?reg, ?t)) { ret 1; }
-    var alloc: A.Allocator;
-    page.make(?alloc);
-
-    # the same single-assignment web single_assignment_web_is_merged merges, seeded secret on one side
+# the instruction count the web coalesces to; 0 when the merge is malformed
+#[testing]
+fun t_web(t: *target.Target, alloc: *A.Allocator, secret0: bool, secret1: bool, width: u8, slot1: bool, redefine: bool) u32 {
     var f: mir.MirFunction;
-    t_vregs(?alloc, ?f, 2);
-    f.vregs[0].secret = true;
+    t_vregs(alloc, ?f, 2);
+    f.vregs[0].secret = secret0;
+    f.vregs[1].secret = secret1;
     var b: mir.MirBlock;
-    t_block(?alloc, ?b, 3);
-    t_mov(?alloc, ?b, 0, mir.op_vreg(mir.vreg_id(0)), mir.op_preg(mir.preg_id(3)));
-    t_mov(?alloc, ?b, 1, mir.op_vreg(mir.vreg_id(1)), mir.op_vreg(mir.vreg_id(0)));
-    t_mov(?alloc, ?b, 2, mir.op_preg(mir.preg_id(4)), mir.op_vreg(mir.vreg_id(1)));
+    var n: u32 = 3;
+    if (redefine) { n = 4; }
+    t_block(alloc, ?b, n);
+    t_mov(alloc, ?b, 0, mir.op_vreg(mir.vreg_id(0)), mir.op_preg(mir.preg_id(3)));
+    t_mov(alloc, ?b, 1, mir.op_vreg(mir.vreg_id(1)), mir.op_vreg(mir.vreg_id(0)));
+    b.instrs[1].width     = width;
+    b.instrs[1].src_width = width;
+    if (redefine) { t_mov(alloc, ?b, 2, mir.op_vreg(mir.vreg_id(1)), mir.op_preg(mir.preg_id(5))); }
+    t_mov(alloc, ?b, n - 1, mir.op_preg(mir.preg_id(4)), mir.op_vreg(mir.vreg_id(1)));
     f.blocks      = ?b;
     f.block_count = 1;
     f.block_cap   = 1;
-    var slots: [2]bool;
-    slots[0] = false;
-    slots[1] = false;
-    var ctx: AllocCtx;
-    t_ctx(?ctx, ?alloc, ?f, ?slots[0]);
-    val coalesce_copies_r: err[fail.Fail] = coalesce_copies(?t, ?ctx);
-    if (sel coalesce_copies_r.err)                                                  { ret 1; }
-    if (b.instr_count != 3)                                                         { ret 2; }
-    if (b.instrs[1].operands[0].vreg.n != 1 || b.instrs[1].operands[1].vreg.n != 0) { ret 3; }
-
-    # control: the same web with both sides secret merges
-    var f2: mir.MirFunction;
-    t_vregs(?alloc, ?f2, 2);
-    f2.vregs[0].secret = true;
-    f2.vregs[1].secret = true;
-    var b2: mir.MirBlock;
-    t_block(?alloc, ?b2, 3);
-    t_mov(?alloc, ?b2, 0, mir.op_vreg(mir.vreg_id(0)), mir.op_preg(mir.preg_id(3)));
-    t_mov(?alloc, ?b2, 1, mir.op_vreg(mir.vreg_id(1)), mir.op_vreg(mir.vreg_id(0)));
-    t_mov(?alloc, ?b2, 2, mir.op_preg(mir.preg_id(4)), mir.op_vreg(mir.vreg_id(1)));
-    f2.blocks      = ?b2;
-    f2.block_count = 1;
-    f2.block_cap   = 1;
-    var slots2: [2]bool;
-    slots2[0] = false;
-    slots2[1] = false;
-    var ctx2: AllocCtx;
-    t_ctx(?ctx2, ?alloc, ?f2, ?slots2[0]);
-    val coalesce_copies_r2: err[fail.Fail] = coalesce_copies(?t, ?ctx2);
-    if (sel coalesce_copies_r2.err) { ret 4; }
-    if (b2.instr_count != 2)        { ret 5; }
-    ret 0;
+    var slots: [2]bool = [2]bool{false, slot1};
+    var ctx:   AllocCtx;
+    t_ctx(?ctx, alloc, ?f, ?slots[0]);
+    val r: err[fail.Fail] = coalesce_copies(t, ?ctx);
+    if (sel r.err) { ret 0; }
+    if (b.instr_count == 2) {
+        if (b.instrs[0].operands[0].vreg.n != 0 || b.instrs[1].operands[1].kind != mir.MIR_OP_VREG || b.instrs[1].operands[1].vreg.n != 0) { ret 0; }
+    }
+    ret b.instr_count;
 }
 
+#[testing]
 fun t_selected_copy(t: *target.Target, opcode: u32, copied: bool) bool {
     var alloc:  A.Allocator;
     val make_r: err[A.Error] = page.make(?alloc);
@@ -6175,7 +6138,7 @@ fun t_selected_copy(t: *target.Target, opcode: u32, copied: bool) bool {
         b.instrs[1].operands[1].vreg.n == 0;
 }
 
-test "mach.lang.be.codegen.regalloc.coalesce_copies:rv32_guard_uses_each_selected_machine" {
+test coalesce_copies__a_narrow_copy_merges_only_where_the_machine_selected_a_move {
     var reg: target.TargetRegistry = target.registry_init();
     fin { target.registry_dnit(?reg); }
     val r_3487: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
@@ -6198,82 +6161,7 @@ test "mach.lang.be.codegen.regalloc.coalesce_copies:rv32_guard_uses_each_selecte
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.coalesce_copies:refuses_unsafe_shapes" {
-    var reg: target.TargetRegistry;
-    fin { target.registry_dnit(?reg); }
-    var t: target.Target;
-    if (!t_target(?reg, ?t)) { ret 1; }
-    var alloc: A.Allocator;
-    page.make(?alloc);
-
-    var f: mir.MirFunction;
-    t_vregs(?alloc, ?f, 2);
-    var b: mir.MirBlock;
-    t_block(?alloc, ?b, 4);
-    t_mov(?alloc, ?b, 0, mir.op_vreg(mir.vreg_id(0)), mir.op_preg(mir.preg_id(3)));
-    t_mov(?alloc, ?b, 1, mir.op_vreg(mir.vreg_id(1)), mir.op_vreg(mir.vreg_id(0)));
-    t_mov(?alloc, ?b, 2, mir.op_vreg(mir.vreg_id(1)), mir.op_preg(mir.preg_id(5)));
-    t_mov(?alloc, ?b, 3, mir.op_preg(mir.preg_id(4)), mir.op_vreg(mir.vreg_id(1)));
-    f.blocks      = ?b;
-    f.block_count = 1;
-    f.block_cap   = 1;
-
-    var slots: [2]bool;
-    slots[0] = false;
-    slots[1] = false;
-    var ctx: AllocCtx;
-    t_ctx(?ctx, ?alloc, ?f, ?slots[0]);
-
-    val coalesce_copies_r: err[fail.Fail] = coalesce_copies(?t, ?ctx);
-    if (sel coalesce_copies_r.err) { ret 1; }
-    if (b.instr_count != 4)        { ret 1; }
-
-    var f2: mir.MirFunction;
-    t_vregs(?alloc, ?f2, 2);
-    var b2: mir.MirBlock;
-    t_block(?alloc, ?b2, 3);
-    t_mov(?alloc, ?b2, 0, mir.op_vreg(mir.vreg_id(0)), mir.op_preg(mir.preg_id(3)));
-    t_mov(?alloc, ?b2, 1, mir.op_vreg(mir.vreg_id(1)), mir.op_vreg(mir.vreg_id(0)));
-    b2.instrs[1].width     = 4;
-    b2.instrs[1].src_width = 4;
-    t_mov(?alloc, ?b2, 2, mir.op_preg(mir.preg_id(4)), mir.op_vreg(mir.vreg_id(1)));
-    f2.blocks      = ?b2;
-    f2.block_count = 1;
-    f2.block_cap   = 1;
-
-    var slots2: [2]bool;
-    slots2[0] = false;
-    slots2[1] = false;
-    var ctx2: AllocCtx;
-    t_ctx(?ctx2, ?alloc, ?f2, ?slots2[0]);
-    val coalesce_copies_r2: err[fail.Fail] = coalesce_copies(?t, ?ctx2);
-    if (sel coalesce_copies_r2.err) { ret 1; }
-    if (b2.instr_count != 3)        { ret 1; }
-
-    var f3: mir.MirFunction;
-    t_vregs(?alloc, ?f3, 2);
-    var b3: mir.MirBlock;
-    t_block(?alloc, ?b3, 3);
-    t_mov(?alloc, ?b3, 0, mir.op_vreg(mir.vreg_id(0)), mir.op_preg(mir.preg_id(3)));
-    t_mov(?alloc, ?b3, 1, mir.op_vreg(mir.vreg_id(1)), mir.op_vreg(mir.vreg_id(0)));
-    t_mov(?alloc, ?b3, 2, mir.op_preg(mir.preg_id(4)), mir.op_vreg(mir.vreg_id(1)));
-    f3.blocks      = ?b3;
-    f3.block_count = 1;
-    f3.block_cap   = 1;
-
-    var slots3: [2]bool;
-    slots3[0] = false;
-    slots3[1] = true;
-    var ctx3: AllocCtx;
-    t_ctx(?ctx3, ?alloc, ?f3, ?slots3[0]);
-    val coalesce_copies_r3: err[fail.Fail] = coalesce_copies(?t, ?ctx3);
-    if (sel coalesce_copies_r3.err) { ret 1; }
-    if (b3.instr_count != 3)        { ret 1; }
-
-    ret 0;
-}
-
-test "mach.lang.be.codegen.regalloc.maybe_sink_hint:records_only_a_dying_full_width_placement" {
+test maybe_sink_hint__only_a_dying_full_width_placement {
     var ctx:    AllocCtx;
     var ranges: [2]LiveRange;
     var hints:  [2]CopyHint;
@@ -6336,7 +6224,7 @@ test "mach.lang.be.codegen.regalloc.maybe_sink_hint:records_only_a_dying_full_wi
 # `s = f(d, ...)` then `d = s`: s may take d's register only when the op reads
 # d before writing s, which rules out a non-commutative two-address right
 # operand and an address register (#3647)
-test "mach.lang.be.codegen.regalloc.maybe_reverse_hint:refuses_a_right_operand_the_op_would_clobber" {
+test maybe_reverse_hint__refuses_an_operand_the_op_would_clobber {
     var alloc: A.Allocator;
     page.make(?alloc);
     var f: mir.MirFunction;
@@ -6429,7 +6317,7 @@ test "mach.lang.be.codegen.regalloc.maybe_reverse_hint:refuses_a_right_operand_t
 
 # a lane write runs as `d = vec; d.lane = scalar` on aarch64, so the scalar
 # is read after the write and may not share d's register; the vector may
-test "mach.lang.be.codegen.regalloc.defines_by_clobbering:a_lane_write_clobbers_its_scalar_but_not_its_vector" {
+test defines_by_clobbering__a_lane_write_clobbers_its_scalar_only {
     var ops: [4]mir.MirOperand;
     ops[0] = mir.op_vreg(mir.vreg_id(3));
     ops[1] = mir.op_vreg(mir.vreg_id(1));
@@ -6442,7 +6330,7 @@ test "mach.lang.be.codegen.regalloc.defines_by_clobbering:a_lane_write_clobbers_
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.maybe_tie_hint:ties_a_dying_left_operand" {
+test maybe_tie_hint__a_dying_left_operand {
     var ctx:    AllocCtx;
     var ranges: [3]LiveRange;
     var hints:  [3]CopyHint;
@@ -6503,23 +6391,125 @@ test "mach.lang.be.codegen.regalloc.maybe_tie_hint:ties_a_dying_left_operand" {
     ret 0;
 }
 
-fun t_scale(v: i64, k: i64) i64 {
-    ret v * k;
+#[testing]
+fun t_op(alloc: *A.Allocator, b: *mir.MirBlock, ix: u32, opcode: mir.MirOpcode, x: mir.MirOperand, y: mir.MirOperand, z: mir.MirOperand, n: u32) {
+    val r: res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](alloc, 3::usize);
+    if (sel r.err) { ret; }
+    val arr: *mir.MirOperand = r.ok;
+    arr[0]                     = x;
+    arr[1]                     = y;
+    arr[2]                     = z;
+    b.instrs[ix].opcode        = opcode;
+    b.instrs[ix].operands      = arr;
+    b.instrs[ix].operand_count = n;
+    b.instrs[ix].width         = 8;
+    b.instrs[ix].src_width     = 8;
+    b.instrs[ix].asm_block     = nil;
+    b.instrs[ix].vec_lane      = mir.VEC_LANE_NONE;
+    b.instrs[ix].declassified  = mir.MIR_VREG_NIL;
 }
 
-test "mach.lang.be.codegen.regalloc.coalesce_copies:forwarded_values_survive" {
-    var acc: i64 = 0;
-    var i:   i64 = 0;
-    for (i < 8) {
-        val a: i64 = t_scale(i, 3);
-        val b: i64 = t_scale(a, 2);
-        acc = acc + (b - a);
-        i   = i + 1;
+# a loop around one value: v0 enters the loop, the body computes the next
+# value into v1 by `op`, reads v0 again when late_read says so, and the back
+# edge copies v1 into v0, which the exit reads. v2 is a value live through
+# the loop. the result is the loop block's instruction count after the
+# dying-copy pass, or a failure below 100 for a broken setup
+#[testing]
+fun t_dying_loop_case(isa_name: str, abi_name: str, op: mir.MirOpcode, left: u32, right: u32, late_read: bool) i32 {
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val rr: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel rr.err) { ret 1; }
+    val ts: res[target.Target, fail.Fail] = target.select(?reg, isa_name, "linux", abi_name);
+    if (sel ts.err) { ret 2; }
+    var tgt:   target.Target = ts.ok;
+    var alloc: A.Allocator;
+    val made:  err[A.Error]  = page.make(?alloc);
+    if (sel made.err) { ret 3; }
+
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 3);
+    var blocks: [3]mir.MirBlock;
+    var preds:  [3]u32;
+    preds[0] = 0;
+    preds[1] = 1;
+    preds[2] = 1;
+    t_block(?alloc, ?blocks[0], 3);
+    blocks[0].id         = 0;
+    blocks[0].pred_count = 0;
+    t_mov(?alloc, ?blocks[0], 0, mir.op_vreg(mir.vreg_id(0)), mir.op_imm(3));
+    t_mov(?alloc, ?blocks[0], 1, mir.op_vreg(mir.vreg_id(2)), mir.op_imm(4));
+    t_op(?alloc, ?blocks[0], 2, mir.MIR_BR, mir.op_block(1), mir.op_imm(0), mir.op_imm(0), 1);
+    var body: u32 = 3;
+    if (late_read) { body = 4; }
+    t_block(?alloc, ?blocks[1], body);
+    blocks[1].id         = 1;
+    blocks[1].preds      = ?preds[0];
+    blocks[1].pred_count = 2;
+    t_op(?alloc, ?blocks[1], 0, op, mir.op_vreg(mir.vreg_id(1)), mir.op_vreg(mir.vreg_id(left)), mir.op_vreg(mir.vreg_id(right)), 3);
+    var at: u32 = 1;
+    if (late_read) {
+        t_op(?alloc, ?blocks[1], 1, mir.MIR_STORE, mir.op_mem_value(mir.vreg_id(2), 0), mir.op_vreg(mir.vreg_id(0)), mir.op_imm(0), 2);
+        at = 2;
     }
-    if (acc != 84) { ret 1; }
+    t_mov(?alloc, ?blocks[1], at, mir.op_vreg(mir.vreg_id(0)), mir.op_vreg(mir.vreg_id(1)));
+    t_op(?alloc, ?blocks[1], at + 1, mir.MIR_CBR, mir.op_vreg(mir.vreg_id(0)), mir.op_block(1), mir.op_block(2), 3);
+    t_block(?alloc, ?blocks[2], 3);
+    blocks[2].id         = 2;
+    blocks[2].preds      = ?preds[2];
+    blocks[2].pred_count = 1;
+    t_op(?alloc, ?blocks[2], 0, mir.MIR_SEL_ADD, mir.op_vreg(mir.vreg_id(2)), mir.op_vreg(mir.vreg_id(2)), mir.op_vreg(mir.vreg_id(0)), 3);
+    t_op(?alloc, ?blocks[2], 1, mir.MIR_STORE, mir.op_mem_value(mir.vreg_id(2), 0), mir.op_imm(0), mir.op_imm(0), 2);
+    t_op(?alloc, ?blocks[2], 2, mir.MIR_RET, mir.op_imm(0), mir.op_imm(0), mir.op_imm(0), 0);
+    f.blocks           = ?blocks[0];
+    f.block_count      = 3;
+    f.block_cap        = 3;
+    f.frame.slot_count = 0;
+
+    var m: mir.MirModule;
+    m.alloc    = ?alloc;
+    m.interner = nil;
+    var ctx: AllocCtx;
+    val ci:  err[fail.Fail] = ctx_init(?ctx, ?tgt, ?m, ?f);
+    if (sel ci.err) { ret 4; }
+    fin { ctx_dnit(?ctx); }
+    val vs: err[fail.Fail] = build_vreg_slot_flags(?ctx);
+    if (sel vs.err) { ret 5; }
+    ctx.round_count = f.vreg_count;
+    val bo: err[fail.Fail] = build_order(?ctx);
+    if (sel bo.err) { ret 6; }
+    val ao: err[fail.Fail] = apply_order(?ctx);
+    if (sel ao.err)          { ret 7; }
+    if (f.blocks[1].id != 1) { ret 8; }
+    val cd: err[fail.Fail] = coalesce_dying_copies(?tgt, ?ctx);
+    if (sel cd.err) { ret 9; }
+    ret (100 + f.blocks[1].instr_count)::i32;
+}
+
+# the back-edge copy of a loop-carried value merges on every ISA: the
+# value's last read in the body is where its next value is written, and the
+# two never meet, so the add runs in place and the copy is gone
+test coalesce_dying_copies__a_loop_carried_value_takes_its_back_edge_copy {
+    if (t_dying_loop_case("x86_64", "sysv64", mir.MIR_SEL_ADD, 0, 2, false) != 102)   { ret 1; }
+    if (t_dying_loop_case("aarch64", "aapcs64", mir.MIR_SEL_ADD, 0, 2, false) != 102) { ret 2; }
+    if (t_dying_loop_case("riscv64", "lp64d", mir.MIR_SEL_ADD, 0, 2, false) != 102)   { ret 3; }
+    # a commutative op reads its right operand first once it is swapped
+    if (t_dying_loop_case("x86_64", "sysv64", mir.MIR_SEL_ADD, 2, 0, false) != 102) { ret 4; }
     ret 0;
 }
 
+test coalesce_dying_copies__refuses_values_that_meet {
+    # the loop value is read after its next value is written: both are live
+    if (t_dying_loop_case("x86_64", "sysv64", mir.MIR_SEL_ADD, 0, 2, true) != 104)   { ret 1; }
+    if (t_dying_loop_case("aarch64", "aapcs64", mir.MIR_SEL_ADD, 0, 2, true) != 104) { ret 2; }
+    # a two-address sub writes its result before it reads its right operand
+    if (t_dying_loop_case("x86_64", "sysv64", mir.MIR_SEL_SUB, 2, 0, false) != 103) { ret 3; }
+    # the same sub with the loop value on the left runs in place
+    if (t_dying_loop_case("x86_64", "sysv64", mir.MIR_SEL_SUB, 0, 2, false) != 102) { ret 4; }
+    ret 0;
+}
+
+#[testing]
 fun t_self_copy_is_dropped(t: *target.Target, width: u8) bool {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -6554,7 +6544,7 @@ fun t_self_copy_is_dropped(t: *target.Target, width: u8) bool {
         kept[1].kind == mir.MIR_OP_VREG && kept[1].vreg.n == 0;
 }
 
-test "mach.lang.be.codegen.regalloc.drop_self_copies:width_is_not_a_gate" {
+test drop_self_copies__at_every_width_and_machine {
     var reg: target.TargetRegistry = target.registry_init();
     fin { target.registry_dnit(?reg); }
     val r_3732: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
@@ -6590,12 +6580,13 @@ test "mach.lang.be.codegen.regalloc.drop_self_copies:width_is_not_a_gate" {
     ret 0;
 }
 
+#[testing]
 fun t_dbg(alloc: *A.Allocator, mi: *mir.MirInstr, iid: u32, vreg: u32) bool {
     val r: err[fail.Fail] = mir.instr_attach_dbg(alloc, mi, iid, vreg);
     ret sel r.ok;
 }
 
-test "mach.lang.be.codegen.regalloc.drop_self_copies:a_deleted_copy_passes_its_bindings_on" {
+test drop_self_copies__passes_bindings_on {
     var reg: target.TargetRegistry;
     var t:   target.Target;
     if (!t_target(?reg, ?t)) { ret 1; }
@@ -6645,7 +6636,7 @@ test "mach.lang.be.codegen.regalloc.drop_self_copies:a_deleted_copy_passes_its_b
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.sweep_dead_movs:a_deleted_copy_passes_its_bindings_on" {
+test sweep_dead_movs__passes_bindings_on {
     var reg: target.TargetRegistry;
     var t:   target.Target;
     if (!t_target(?reg, ?t)) { ret 1; }
@@ -6682,7 +6673,7 @@ test "mach.lang.be.codegen.regalloc.sweep_dead_movs:a_deleted_copy_passes_its_bi
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.drop_self_copies_physical:deletes_only_the_same_register_copy" {
+test drop_self_copies_physical__only_the_same_register {
     var reg: target.TargetRegistry;
     fin { target.registry_dnit(?reg); }
     var t: target.Target;
@@ -6716,31 +6707,34 @@ test "mach.lang.be.codegen.regalloc.drop_self_copies_physical:deletes_only_the_s
     ret 0;
 }
 
+#[testing]
 rec RegallocGrowthProbe {
     reallocate_calls: u32;
     allocate_calls:   u32;
 }
 
+#[testing]
 fun regalloc_growth_probe_allocate(ctx: ptr, size: usize, align: usize) opt[ptr] {
     val g: *RegallocGrowthProbe = ctx::*RegallocGrowthProbe;
     g.allocate_calls = g.allocate_calls + 1;
     ret opt[ptr].none{};
 }
 
+#[testing]
 fun regalloc_growth_probe_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) opt[ptr] {
     val g: *RegallocGrowthProbe = ctx::*RegallocGrowthProbe;
     g.reallocate_calls = g.reallocate_calls + 1;
     ret opt[ptr].none{};
 }
 
+#[testing]
 fun regalloc_growth_probe_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64 {
     ret 0;
 }
 
-# the only register is held by a victim that outlives the incoming range, and
-# an argument reservation keeps the incoming range out of it: the victim stays
 # a scan over hand-shaped intervals on one general register: the smallest
 # machine on which a hole or a density decision shows
+#[testing]
 rec TScan {
     backing:      A.Allocator;
     reg:          target.TargetRegistry;
@@ -6766,6 +6760,7 @@ rec TScan {
     ctx:          AllocCtx;
 }
 
+#[testing]
 fun t_scan_init(t: *TScan, holes: bool) bool {
     if (!t_target(?t.reg, ?t.tgt)) { ret false; }
     val mb: err[A.Error] = page.make(?t.backing);
@@ -6834,11 +6829,13 @@ fun t_scan_init(t: *TScan, holes: bool) bool {
     ret true;
 }
 
+#[testing]
 fun t_scan_dnit(t: *TScan) {
     target.registry_dnit(?t.reg);
 }
 
 # a value live over [from, to] with the given loop-weighted use
+#[testing]
 fun t_scan_value(t: *TScan, from: i64, to: i64, weight: i64) {
     val v:  u32        = t.f.vreg_count;
     val lr: *LiveRange = ?t.ranges[v];
@@ -6857,6 +6854,7 @@ fun t_scan_value(t: *TScan, from: i64, to: i64, weight: i64) {
 
 # a second segment for the value just added, leaving a hole before it; the
 # legacy scan knows only hulls, so there the value stays live across it
+#[testing]
 fun t_scan_segment(t: *TScan, from: i64, to: i64) {
     val lr: *LiveRange = ?t.ranges[t.f.vreg_count - 1];
     if (!t.ctx.holes) {
@@ -6873,10 +6871,12 @@ fun t_scan_segment(t: *TScan, from: i64, to: i64) {
     lr.live_len                  = lr.live_len + (to - from + 1);
 }
 
+#[testing]
 fun t_scan_holds_reg0(t: *TScan, v: u32) bool {
     ret t_scan_holds_reg(t, v, 0);
 }
 
+#[testing]
 fun t_scan_holds_reg(t: *TScan, v: u32, idx: i32) bool {
     if (t.spilled[v]) { ret false; }
     val a: mir.PRegId = t.vregs[v].assigned;
@@ -6888,6 +6888,7 @@ fun t_scan_holds_reg(t: *TScan, v: u32, idx: i32) bool {
 # weight holds reg0 across calls when a short dense value that also lives
 # over a call arrives. inside says the short value's call is strictly
 # within its segment
+#[testing]
 fun t_call_evict_case(long_weight: i64, inside: bool) i32 {
     var t: TScan;
     if (!t_scan_init(?t, true)) { ret 1; }
@@ -6915,6 +6916,7 @@ fun t_call_evict_case(long_weight: i64, inside: bool) i32 {
 # on a machine that reserves one, over a pool of two registers: v2 and v3
 # live across it with the given weights, held flags whether each holds its
 # register, and what is left is checked through the borrow the rewrite takes
+#[testing]
 fun t_reload_guarantee_case(w2: i64, held2: bool, w3: i64) i32 {
     var t: TScan;
     if (!t_scan_init(?t, true)) { ret 1; }
@@ -6977,21 +6979,17 @@ fun t_reload_guarantee_case(w2: i64, held2: bool, w3: i64) i32 {
     ret isa.regid_index(b);
 }
 
-test "mach.lang.be.codegen.regalloc.guarantee_reload_registers:a_second_reload_borrows_a_free_pool_register" {
-    # the reserved register carries one reload and the free register the other
+# the reserved register carries one reload and a free pool register the
+# other; with both pool registers held the sparser holder goes to the stack
+# and its register carries the reload
+test guarantee_reload_registers__a_second_reload {
     if (t_reload_guarantee_case(1, false, 100) != 0) { ret 1; }
+    if (t_reload_guarantee_case(1, true, 100) != 10) { ret 2; }
+    if (t_reload_guarantee_case(100, true, 1) != 21) { ret 3; }
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.guarantee_reload_registers:a_second_reload_evicts_the_least_dense_holder" {
-    # both pool registers are held across the store: the sparser holder goes
-    # to the stack and its register carries the reload
-    if (t_reload_guarantee_case(1, true, 100) != 10) { ret 1; }
-    if (t_reload_guarantee_case(100, true, 1) != 21) { ret 2; }
-    ret 0;
-}
-
-test "mach.lang.be.codegen.regalloc.linear_scan:a_call_crossing_value_evicts_a_sparser_callee_saved_holder" {
+test linear_scan__a_call_crossing_value_evicts_a_sparser_callee_saved_holder {
     # the sparse holder gives way: a caller-saved register would only be
     # spilled whole by spill_across_calls
     if (t_call_evict_case(4, true) != 10) { ret 1; }
@@ -7005,6 +7003,7 @@ test "mach.lang.be.codegen.regalloc.linear_scan:a_call_crossing_value_evicts_a_s
 # a value dead across its hole does not hold its register there: the short
 # value inside the hole takes the same register and nothing spills, where
 # the same shape on the legacy scan, live throughout, costs one spill
+#[testing]
 fun t_hole_case(holes: bool) i32 {
     var t: TScan;
     if (!t_scan_init(?t, holes)) { ret 1; }
@@ -7025,34 +7024,28 @@ fun t_hole_case(holes: bool) i32 {
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.linear_scan:a_hole_frees_the_register_for_a_value_inside_it" {
-    ret t_hole_case(true);
-}
-
-test "mach.lang.be.codegen.regalloc.linear_scan:without_holes_the_value_inside_the_hole_spills" {
-    ret t_hole_case(false);
-}
-
-# a value whose second segment meets the short value is a real conflict:
-# the hole is honoured only where the value is dead
-test "mach.lang.be.codegen.regalloc.linear_scan:a_segment_inside_the_window_is_not_a_hole" {
+# a hole is honoured only where the value is dead: a second segment meeting
+# the short value is a real conflict
+test linear_scan__holes {
+    if (t_hole_case(true) != 0)  { ret 1; }
+    if (t_hole_case(false) != 0) { ret 2; }
     var t: TScan;
-    if (!t_scan_init(?t, true)) { ret 1; }
+    if (!t_scan_init(?t, true)) { ret 3; }
     fin { t_scan_dnit(?t); }
     t_scan_value(?t, 0, 5, 40);
     t_scan_segment(?t, 9, 20);
     t_scan_value(?t, 8, 10, 2);
     val r: err[fail.Fail] = linear_scan(?t.tgt, ?t.ctx);
-    if (sel r.err)                 { ret 2; }
-    if (!t_scan_holds_reg0(?t, 0)) { ret 3; }
-    if (!t.spilled[1])             { ret 4; }
+    if (sel r.err)                 { ret 4; }
+    if (!t_scan_holds_reg0(?t, 0)) { ret 5; }
+    if (!t.spilled[1])             { ret 6; }
     ret 0;
 }
 
 # under pressure the victim is the value with the lowest loop-weighted use
 # density, whichever side of the decision it is on: a dense newcomer evicts
 # a sparse holder, and a sparse newcomer spills itself before a dense holder
-test "mach.lang.be.codegen.regalloc.spill_on_density:the_least_dense_value_is_the_victim" {
+test linear_scan__the_least_dense_value_is_the_victim {
     var t: TScan;
     if (!t_scan_init(?t, true)) { ret 1; }
     fin { t_scan_dnit(?t); }
@@ -7075,7 +7068,7 @@ test "mach.lang.be.codegen.regalloc.spill_on_density:the_least_dense_value_is_th
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.spill_on_pressure:a_victim_keeps_a_register_the_incoming_range_cannot_take" {
+test spill_on_pressure__a_victim_keeps_a_register_the_incoming_range_cannot_take {
     var alloc: A.Allocator;
     val made:  err[A.Error] = page.make(?alloc);
     if (sel made.err) { ret 1; }
@@ -7136,7 +7129,9 @@ test "mach.lang.be.codegen.regalloc.spill_on_pressure:a_victim_keeps_a_register_
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.add_spill_slot:refuses_u32_capacity_overflow_before_reallocating" {
+# growth past the u32 capacity is refused before any allocation, and an index
+# past the i32 limit is refused
+test add_spill_slot__refuses_counts_past_the_limits {
     var probe: RegallocGrowthProbe;
     probe.reallocate_calls = 0;
     probe.allocate_calls   = 0;
@@ -7146,46 +7141,24 @@ test "mach.lang.be.codegen.regalloc.add_spill_slot:refuses_u32_capacity_overflow
     alloc.fn_allocate   = regalloc_growth_probe_allocate;
     alloc.fn_reallocate = regalloc_growth_probe_reallocate;
     alloc.fn_deallocate = regalloc_growth_probe_deallocate;
-
     var f: mir.MirFunction;
     f.frame.slots      = nil;
     f.frame.slot_count = 0xFFFFFFFF;
     f.frame.slot_cap   = 0xFFFFFFFF;
-
     var ctx: AllocCtx;
     ctx.alloc = ?alloc;
     ctx.f     = ?f;
-
-    val r: res[i32, fail.Fail] = add_spill_slot(?ctx, 0, 8);
-
-    var bad: i32 = 0;
-    if (!sel r.err)                  { bad = 1; }
-    if (probe.reallocate_calls != 0) { bad = 2; }
-    if (probe.allocate_calls != 0)   { bad = 3; }
-    ret bad;
-}
-
-test "mach.lang.be.codegen.regalloc.add_spill_slot:refuses_a_slot_index_past_the_i32_limit" {
-    var alloc: A.Allocator;
-    page.make(?alloc);
-
-    var f: mir.MirFunction;
-    f.frame.slots      = nil;
+    val grown: res[i32, fail.Fail] = add_spill_slot(?ctx, 0, 8);
+    if (!sel grown.err)                                           { ret 1; }
+    if (probe.reallocate_calls != 0 || probe.allocate_calls != 0) { ret 2; }
     f.frame.slot_count = 0x80000000;
     f.frame.slot_cap   = 0x80000001;
-
-    var ctx: AllocCtx;
-    ctx.alloc = ?alloc;
-    ctx.f     = ?f;
-
-    val r: res[i32, fail.Fail] = add_spill_slot(?ctx, 0, 8);
-
-    var bad: i32 = 0;
-    if (!sel r.err) { bad = 1; }
-    ret bad;
+    val indexed: res[i32, fail.Fail] = add_spill_slot(?ctx, 0, 8);
+    if (!sel indexed.err) { ret 3; }
+    ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.build_order_apply_order_restore_order:round_trips_to_original_identity" {
+test block_order__round_trips {
     var alloc: A.Allocator;
     page.make(?alloc);
 
@@ -7250,7 +7223,7 @@ test "mach.lang.be.codegen.regalloc.build_order_apply_order_restore_order:round_
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.verify_rewritten_operands:walks_the_program_not_the_allocator" {
+test verify_rewritten_operands__register_ranges_and_classes {
     var reg: target.TargetRegistry = target.registry_init();
     fin { target.registry_dnit(?reg); }
     val r_3929: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
@@ -7294,6 +7267,7 @@ test "mach.lang.be.codegen.regalloc.verify_rewritten_operands:walks_the_program_
     ret 0;
 }
 
+#[testing]
 fun t_spilled_update(mode: u32) i32 {
     var backing: A.Allocator;
     val make_r:  err[A.Error] = page.make(?backing);
@@ -7427,7 +7401,7 @@ fun t_spilled_update(mode: u32) i32 {
 
 # a spilled secret travels through a reload scratch and a slot keyed by its own vreg id; these are the
 # physical facts a post-allocation validator seeds from (#3126)
-test "mach.lang.be.codegen.regalloc.rewrite_instr:a_spilled_secret_keeps_its_slot_key_through_the_scratch" {
+test rewrite_instr__a_spilled_secret_source_keeps_its_origin {
     var backing: A.Allocator;
     val make_r:  err[A.Error] = page.make(?backing);
     if (sel make_r.err) { ret 1; }
@@ -7506,7 +7480,7 @@ test "mach.lang.be.codegen.regalloc.rewrite_instr:a_spilled_secret_keeps_its_slo
 # a spilled destination of an instruction that is not a copy stores through
 # the scratch, and the store names the vreg it homes as provenance on both
 # its register and its slot
-test "mach.lang.be.codegen.regalloc.rewrite_instr:a_spilled_secret_destination_keeps_its_origin_through_the_store" {
+test rewrite_instr__a_spilled_secret_destination_keeps_its_origin {
     var backing: A.Allocator;
     val make_r:  err[A.Error] = page.make(?backing);
     if (sel make_r.err) { ret 1; }
@@ -7577,6 +7551,7 @@ test "mach.lang.be.codegen.regalloc.rewrite_instr:a_spilled_secret_destination_k
 
 # a rewrite fixture: vregs 0..3 in general registers 0..3, live past position
 # 0, over the x86_64 target with reload scratch registers 8 and 9
+#[testing]
 rec TRewrite {
     backing: A.Allocator;
     scratch: arena.Arena;
@@ -7596,6 +7571,7 @@ rec TRewrite {
     written: u32;
 }
 
+#[testing]
 fun t_rewrite_init(t: *TRewrite) bool {
     if (!t_target(?t.reg, ?t.tgt)) { ret false; }
     val mb: err[A.Error] = page.make(?t.backing);
@@ -7636,11 +7612,20 @@ fun t_rewrite_init(t: *TRewrite) bool {
     ret true;
 }
 
+#[testing]
 fun t_rewrite_dnit(t: *TRewrite) {
     arena.dnit(?t.scratch);
     target.registry_dnit(?t.reg);
 }
 
+# a fresh fixture in place of a used one
+#[testing]
+fun t_rewrite_again(t: *TRewrite) bool {
+    t_rewrite_dnit(t);
+    ret t_rewrite_init(t);
+}
+
+#[testing]
 fun t_spill(t: *TRewrite, v: u32) {
     t.vregs[v].assigned   = mir.MIR_PREG_NIL;
     t.vregs[v].spill_slot = v::i32;
@@ -7650,6 +7635,7 @@ fun t_spill(t: *TRewrite, v: u32) {
 # a block whose spilled value 0 is read by two loads before a call and by
 # one after it; the pair before the call earns a piece, the single read after
 # it does not, and a write of the value closes a run
+#[testing]
 fun t_piece_block(alloc: *A.Allocator, f: *mir.MirFunction, b: *mir.MirBlock, ctx: *AllocCtx, slots: *bool) err[fail.Fail] {
     t_vregs(alloc, f, 6);
     f.vreg_cap = 6;
@@ -7673,11 +7659,12 @@ fun t_piece_block(alloc: *A.Allocator, f: *mir.MirFunction, b: *mir.MirBlock, ct
     ret err[fail.Fail].ok{};
 }
 
+#[testing]
 fun t_reads_base(mi: *mir.MirInstr, v: u32) bool {
     ret mi.operands[1].kind == mir.MIR_OP_MEM && mi.operands[1].vreg.n == v;
 }
 
-test "mach.lang.be.codegen.regalloc.make_pieces_in_block:a_run_of_reloading_reads_is_carried_by_one_load" {
+test make_pieces_in_block__a_run_of_reads_is_carried_by_one_load {
     var reg: target.TargetRegistry;
     fin { target.registry_dnit(?reg); }
     var tgt: target.Target;
@@ -7731,7 +7718,7 @@ test "mach.lang.be.codegen.regalloc.make_pieces_in_block:a_run_of_reloading_read
 
 # a single read, a read the instruction takes from the slot as a memory
 # operand, and a value the pieces already served earn no piece
-test "mach.lang.be.codegen.regalloc.make_pieces_in_block:one_reload_earns_no_piece" {
+test make_pieces_in_block__one_read_earns_no_piece {
     var reg: target.TargetRegistry;
     fin { target.registry_dnit(?reg); }
     var tgt: target.Target;
@@ -7759,6 +7746,7 @@ test "mach.lang.be.codegen.regalloc.make_pieces_in_block:one_reload_earns_no_pie
     ret 0;
 }
 
+#[testing]
 fun ctx_dnit_tables(ctx: *AllocCtx) {
     A.deallocate[bool](ctx.alloc, ctx.spilled, ctx.table_count::usize);
     A.deallocate[u32](ctx.alloc, ctx.spill_order, ctx.table_count::usize);
@@ -7766,10 +7754,12 @@ fun ctx_dnit_tables(ctx: *AllocCtx) {
     A.deallocate[bool](ctx.alloc, ctx.no_pieces, ctx.table_count::usize);
 }
 
+#[testing]
 fun t_v(v: u32) mir.MirOperand {
     ret mir.op_vreg(mir.vreg_id(v));
 }
 
+#[testing]
 fun t_instr(t: *TRewrite, opcode: mir.MirOpcode, a: mir.MirOperand, b: mir.MirOperand, c: mir.MirOperand, n: u32, out: *mir.MirInstr) bool {
     val ro: res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](?t.alloc, n::usize);
     if (sel ro.err) { ret false; }
@@ -7783,6 +7773,7 @@ fun t_instr(t: *TRewrite, opcode: mir.MirOpcode, a: mir.MirOperand, b: mir.MirOp
     ret true;
 }
 
+#[testing]
 fun t_rewrite(t: *TRewrite, opcode: mir.MirOpcode, a: mir.MirOperand, b: mir.MirOperand, c: mir.MirOperand, n: u32) bool {
     var mi: mir.MirInstr = mir.instr(mir.MIR_MOV, nil, 0, 8, 8);
     if (!t_instr(t, opcode, a, b, c, n, ?mi)) { ret false; }
@@ -7794,6 +7785,7 @@ fun t_rewrite(t: *TRewrite, opcode: mir.MirOpcode, a: mir.MirOperand, b: mir.Mir
 
 # t_rewrite of an op that binds its destination at its start (iid 1) and at
 # its end (iid 2), where the value exists
+#[testing]
 fun t_rewrite_bound(t: *TRewrite, opcode: mir.MirOpcode, a: mir.MirOperand, b: mir.MirOperand, c: mir.MirOperand, n: u32) bool {
     var mi: mir.MirInstr = mir.instr(mir.MIR_MOV, nil, 0, 8, 8);
     if (!t_instr(t, opcode, a, b, c, n, ?mi)) { ret false; }
@@ -7803,6 +7795,7 @@ fun t_rewrite_bound(t: *TRewrite, opcode: mir.MirOpcode, a: mir.MirOperand, b: m
     ret sel rr.ok;
 }
 
+#[testing]
 fun t_bind_both(alloc: *A.Allocator, mi: *mir.MirInstr) bool {
     val bs: err[fail.Fail] = mir.instr_attach_dbg(alloc, mi, 1, 0);
     if (sel bs.err) { ret false; }
@@ -7812,20 +7805,24 @@ fun t_bind_both(alloc: *A.Allocator, mi: *mir.MirInstr) bool {
 
 # a spilled def's store puts the value in its slot: the def keeps the binding
 # at its start and the store takes the one at its end
+#[testing]
 fun t_end_binding_at_store(def: *mir.MirInstr, store: *mir.MirInstr) bool {
     if (def.dbg_binding_count != 1 || def.dbg_bindings[0].iid != 1 || def.dbg_bindings[0].at_end) { ret false; }
     ret store.dbg_binding_count == 1 && store.dbg_bindings[0].iid == 2 && store.dbg_bindings[0].at_end;
 }
 
+#[testing]
 fun t_is_reg(op: *mir.MirOperand, id: i32) bool {
     ret op.kind == mir.MIR_OP_PREG && mir.preg_regid(op.preg) == id;
 }
 
+#[testing]
 fun t_is_slot(op: *mir.MirOperand, v: u32) bool {
     ret op.kind == mir.MIR_OP_MEM && op.vreg.n == v && mir.preg_is_nil(op.preg);
 }
 
 # the rewritten op writes register `d` from `l` and, for a binary op, `r`
+#[testing]
 fun t_op_is(mi: *mir.MirInstr, opcode: mir.MirOpcode, d: i32, l: i32, r: i32) bool {
     if (mi.opcode != opcode)           { ret false; }
     if (!t_is_reg(?mi.operands[0], d)) { ret false; }
@@ -7835,6 +7832,7 @@ fun t_op_is(mi: *mir.MirInstr, opcode: mir.MirOpcode, d: i32, l: i32, r: i32) bo
 }
 
 # a load or store between register `reg` and the slot of `v`
+#[testing]
 fun t_transport_is(mi: *mir.MirInstr, load: bool, reg: i32, v: u32) bool {
     if (mi.opcode != mir.MIR_MOV) { ret false; }
     if (load)                     { ret t_is_reg(?mi.operands[0], reg) && t_is_slot(?mi.operands[1], v); }
@@ -7842,48 +7840,37 @@ fun t_transport_is(mi: *mir.MirInstr, load: bool, reg: i32, v: u32) bool {
 }
 
 # a copy into a spilled value stores its source register straight into the
-# slot, with no scratch register between them
-test "mach.lang.be.codegen.regalloc.rewrite_instr:a_copy_into_a_spilled_value_is_the_store" {
+# slot, a copy from one is the load, and a copy between two is one of each
+test rewrite_instr__a_spilled_copy_is_the_transport {
     var t: TRewrite;
     if (!t_rewrite_init(?t)) { ret 1; }
     fin { t_rewrite_dnit(?t); }
     t_spill(?t, 0);
-    if (!t_rewrite(?t, mir.MIR_MOV, t_v(0), t_v(1), t_v(0), 2)) { ret 2; }
-    if (t.written != 1)                                         { ret 3; }
-    if (!t_transport_is(?t.dst[0], false, 1, 0))                { ret 4; }
-    if (mir.operand_origin(?t.dst[0].operands[1]).n != 1)       { ret 5; }
-    ret 0;
-}
+    if (!t_rewrite(?t, mir.MIR_MOV, t_v(0), t_v(1), t_v(0), 2))    { ret 2; }
+    if (t.written != 1 || !t_transport_is(?t.dst[0], false, 1, 0)) { ret 3; }
+    if (mir.operand_origin(?t.dst[0].operands[1]).n != 1)          { ret 4; }
 
-test "mach.lang.be.codegen.regalloc.rewrite_instr:a_copy_from_a_spilled_value_is_the_load" {
-    var t: TRewrite;
-    if (!t_rewrite_init(?t)) { ret 1; }
-    fin { t_rewrite_dnit(?t); }
+    if (!t_rewrite_again(?t)) { ret 5; }
     t_spill(?t, 1);
-    if (!t_rewrite(?t, mir.MIR_MOV, t_v(0), t_v(1), t_v(0), 2)) { ret 2; }
-    if (t.written != 1)                                         { ret 3; }
-    if (!t_transport_is(?t.dst[0], true, 0, 1))                 { ret 4; }
-    if (mir.operand_origin(?t.dst[0].operands[0]).n != 0)       { ret 5; }
-    ret 0;
-}
+    if (!t_rewrite(?t, mir.MIR_MOV, t_v(0), t_v(1), t_v(0), 2))   { ret 6; }
+    if (t.written != 1 || !t_transport_is(?t.dst[0], true, 0, 1)) { ret 7; }
+    if (mir.operand_origin(?t.dst[0].operands[0]).n != 0)         { ret 8; }
 
-test "mach.lang.be.codegen.regalloc.rewrite_instr:a_copy_between_spilled_values_is_one_load_and_one_store" {
-    var t: TRewrite;
-    if (!t_rewrite_init(?t)) { ret 1; }
-    fin { t_rewrite_dnit(?t); }
+    if (!t_rewrite_again(?t)) { ret 9; }
     t_spill(?t, 0);
     t_spill(?t, 1);
-    if (!t_rewrite_bound(?t, mir.MIR_MOV, t_v(0), t_v(1), t_v(0), 2)) { ret 2; }
-    if (t.written != 2)                                               { ret 3; }
-    if (!t_transport_is(?t.dst[0], true, 8, 1))                       { ret 4; }
-    if (!t_transport_is(?t.dst[1], false, 8, 0))                      { ret 5; }
-    if (!t_end_binding_at_store(?t.dst[0], ?t.dst[1]))                { ret 6; }
+    if (!t_rewrite_bound(?t, mir.MIR_MOV, t_v(0), t_v(1), t_v(0), 2)) { ret 10; }
+    if (t.written != 2)                                               { ret 11; }
+    if (!t_transport_is(?t.dst[0], true, 8, 1))                       { ret 12; }
+    if (!t_transport_is(?t.dst[1], false, 8, 0))                      { ret 13; }
+    if (!t_end_binding_at_store(?t.dst[0], ?t.dst[1]))                { ret 14; }
     ret 0;
 }
 
-# a spilled result runs in the register of a left operand that dies at the
-# op and is stored from it, with no scratch copy
-test "mach.lang.be.codegen.regalloc.rewrite_two_address:a_spilled_result_runs_in_its_dying_left_operand" {
+# a spilled result runs in a left operand dying at the op and is stored from
+# it; a live left operand runs the op in scratch; a commutative op runs in a
+# dying right operand, a subtraction does not
+test rewrite_two_address__a_spilled_result_picks_its_work_register {
     var t: TRewrite;
     if (!t_rewrite_init(?t)) { ret 1; }
     fin { t_rewrite_dnit(?t); }
@@ -7895,84 +7882,71 @@ test "mach.lang.be.codegen.regalloc.rewrite_two_address:a_spilled_result_runs_in
     if (!t_transport_is(?t.dst[1], false, 1, 0))                          { ret 5; }
     if (mir.operand_origin(?t.dst[0].operands[0]).n != 0)                 { ret 6; }
     if (!t_end_binding_at_store(?t.dst[0], ?t.dst[1]))                    { ret 7; }
-    ret 0;
-}
 
-# a left operand that stays live keeps its register, so the op runs in scratch
-test "mach.lang.be.codegen.regalloc.rewrite_two_address:a_live_left_operand_is_not_overwritten" {
-    var t: TRewrite;
-    if (!t_rewrite_init(?t)) { ret 1; }
-    fin { t_rewrite_dnit(?t); }
+    if (!t_rewrite_again(?t)) { ret 8; }
     t_spill(?t, 0);
-    if (!t_rewrite(?t, mir.MIR_SEL_SUB, t_v(0), t_v(1), t_v(2), 3)) { ret 2; }
-    if (t.written != 2)                                             { ret 3; }
-    if (!t_op_is(?t.dst[0], mir.MIR_SEL_SUB, 8, 1, 2))              { ret 4; }
-    if (!t_transport_is(?t.dst[1], false, 8, 0))                    { ret 5; }
-    ret 0;
-}
+    if (!t_rewrite(?t, mir.MIR_SEL_SUB, t_v(0), t_v(1), t_v(2), 3))      { ret 9; }
+    if (t.written != 2 || !t_op_is(?t.dst[0], mir.MIR_SEL_SUB, 8, 1, 2)) { ret 10; }
+    if (!t_transport_is(?t.dst[1], false, 8, 0))                         { ret 11; }
 
-test "mach.lang.be.codegen.regalloc.rewrite_two_address:a_commutative_op_runs_in_its_dying_right_operand" {
-    var t: TRewrite;
-    if (!t_rewrite_init(?t)) { ret 1; }
-    fin { t_rewrite_dnit(?t); }
+    if (!t_rewrite_again(?t)) { ret 12; }
     t_spill(?t, 0);
     t.ranges[2].end_pos = 0;
-    if (!t_rewrite(?t, mir.MIR_SEL_ADD, t_v(0), t_v(1), t_v(2), 3)) { ret 2; }
-    if (t.written != 2)                                             { ret 3; }
-    if (!t_op_is(?t.dst[0], mir.MIR_SEL_ADD, 2, 2, 1))              { ret 4; }
-    if (!t_transport_is(?t.dst[1], false, 2, 0))                    { ret 5; }
-    ret 0;
-}
+    if (!t_rewrite(?t, mir.MIR_SEL_ADD, t_v(0), t_v(1), t_v(2), 3))      { ret 13; }
+    if (t.written != 2 || !t_op_is(?t.dst[0], mir.MIR_SEL_ADD, 2, 2, 1)) { ret 14; }
+    if (!t_transport_is(?t.dst[1], false, 2, 0))                         { ret 15; }
 
-# a subtraction does not commute, so its dying right operand is not a work register
-test "mach.lang.be.codegen.regalloc.rewrite_two_address:a_non_commutative_op_keeps_its_operand_order" {
-    var t: TRewrite;
-    if (!t_rewrite_init(?t)) { ret 1; }
-    fin { t_rewrite_dnit(?t); }
+    if (!t_rewrite_again(?t)) { ret 16; }
     t_spill(?t, 0);
     t.ranges[2].end_pos = 0;
-    if (!t_rewrite(?t, mir.MIR_SEL_SUB, t_v(0), t_v(1), t_v(2), 3)) { ret 2; }
-    if (t.written != 2)                                             { ret 3; }
-    if (!t_op_is(?t.dst[0], mir.MIR_SEL_SUB, 8, 1, 2))              { ret 4; }
+    if (!t_rewrite(?t, mir.MIR_SEL_SUB, t_v(0), t_v(1), t_v(2), 3))      { ret 17; }
+    if (t.written != 2 || !t_op_is(?t.dst[0], mir.MIR_SEL_SUB, 8, 1, 2)) { ret 18; }
     ret 0;
 }
 
-# a spilled left operand reloads straight into the destination register
-test "mach.lang.be.codegen.regalloc.rewrite_two_address:a_spilled_left_operand_reloads_into_the_destination" {
+# a spilled left operand reloads straight into the destination; a repeated
+# one loads once; with no slot read in place both spilled operands reload
+# into distinct registers; a shift count is never read from memory
+test rewrite_two_address__spilled_operands_reload {
     var t: TRewrite;
     if (!t_rewrite_init(?t)) { ret 1; }
     fin { t_rewrite_dnit(?t); }
     t_spill(?t, 1);
     if (!t_rewrite(?t, mir.MIR_SEL_SUB, t_v(0), t_v(1), t_v(2), 3)) { ret 2; }
-    if (t.written != 2)                                             { ret 3; }
-    if (!t_transport_is(?t.dst[0], true, 0, 1))                     { ret 4; }
-    if (!t_op_is(?t.dst[1], mir.MIR_SEL_SUB, 0, 0, 2))              { ret 5; }
-    if (mir.operand_origin(?t.dst[1].operands[1]).n != 1)           { ret 6; }
-    ret 0;
-}
+    if (t.written != 2 || !t_transport_is(?t.dst[0], true, 0, 1))   { ret 3; }
+    if (!t_op_is(?t.dst[1], mir.MIR_SEL_SUB, 0, 0, 2))              { ret 4; }
+    if (mir.operand_origin(?t.dst[1].operands[1]).n != 1)           { ret 5; }
 
-# both operands spilled on a target that reads no slot in place: the left
-# reloads into the work register and the right into a second scratch
-test "mach.lang.be.codegen.regalloc.rewrite_two_address:spilled_operands_reload_into_distinct_registers" {
-    var t: TRewrite;
-    if (!t_rewrite_init(?t)) { ret 1; }
-    fin { t_rewrite_dnit(?t); }
+    if (!t_rewrite_again(?t)) { ret 6; }
+    t_spill(?t, 1);
+    if (!t_rewrite(?t, mir.MIR_SEL_ADD, t_v(0), t_v(1), t_v(1), 3)) { ret 7; }
+    if (t.written != 2 || !t_transport_is(?t.dst[0], true, 0, 1))   { ret 8; }
+    if (!t_op_is(?t.dst[1], mir.MIR_SEL_ADD, 0, 0, 0))              { ret 9; }
+
+    if (!t_rewrite_again(?t)) { ret 10; }
     t.tgt.model.slot_read_widths = isa.SLOT_READ_NONE;
     t_spill(?t, 0);
     t_spill(?t, 1);
     t_spill(?t, 2);
-    if (!t_rewrite(?t, mir.MIR_SEL_AND, t_v(0), t_v(1), t_v(2), 3)) { ret 2; }
-    if (t.written != 4)                                             { ret 3; }
-    if (!t_transport_is(?t.dst[0], true, 8, 1))                     { ret 4; }
-    if (!t_transport_is(?t.dst[1], true, 9, 2))                     { ret 5; }
-    if (!t_op_is(?t.dst[2], mir.MIR_SEL_AND, 8, 8, 9))              { ret 6; }
-    if (!t_transport_is(?t.dst[3], false, 8, 0))                    { ret 7; }
+    if (!t_rewrite(?t, mir.MIR_SEL_AND, t_v(0), t_v(1), t_v(2), 3)) { ret 11; }
+    if (t.written != 4)                                             { ret 12; }
+    if (!t_transport_is(?t.dst[0], true, 8, 1))                     { ret 13; }
+    if (!t_transport_is(?t.dst[1], true, 9, 2))                     { ret 14; }
+    if (!t_op_is(?t.dst[2], mir.MIR_SEL_AND, 8, 8, 9))              { ret 15; }
+    if (!t_transport_is(?t.dst[3], false, 8, 0))                    { ret 16; }
+
+    if (!t_rewrite_again(?t)) { ret 17; }
+    t_spill(?t, 2);
+    if (!t_rewrite(?t, mir.MIR_SEL_SHL, t_v(0), t_v(1), t_v(2), 3)) { ret 18; }
+    if (t.written != 2 || !t_transport_is(?t.dst[0], true, 8, 2))   { ret 19; }
+    if (!t_op_is(?t.dst[1], mir.MIR_SEL_SHL, 0, 1, 8))              { ret 20; }
     ret 0;
 }
 
 # a spilled right operand is read from its slot in place, and the slot names
-# the secret value it holds, so the constant-time walk sees a secret read
-test "mach.lang.be.codegen.regalloc.rewrite_two_address:a_spilled_right_operand_is_read_from_its_slot" {
+# the secret value it holds, so the constant-time walk sees a secret read;
+# a live register left operand runs in scratch with the same slot read
+test rewrite_two_address__a_spilled_right_operand_is_read_from_its_slot {
     var t: TRewrite;
     if (!t_rewrite_init(?t)) { ret 1; }
     fin { t_rewrite_dnit(?t); }
@@ -7989,119 +7963,64 @@ test "mach.lang.be.codegen.regalloc.rewrite_two_address:a_spilled_right_operand_
     if (mir.operand_origin(?op.operands[2]).n != 2 || !mir.operand_seed_secret(?t.f, ?op.operands[2]))  { ret 7; }
     if (mir.operand_seed_secret(?t.f, ?op.operands[1]))                                                 { ret 8; }
     if (!t_transport_is(?t.dst[2], false, 8, 0))                                                        { ret 9; }
-    ret 0;
-}
 
-# a live register left operand and a spilled right one run in scratch with
-# the right read in place
-test "mach.lang.be.codegen.regalloc.rewrite_two_address:a_register_left_operand_reads_its_right_from_the_slot" {
-    var t: TRewrite;
-    if (!t_rewrite_init(?t)) { ret 1; }
-    fin { t_rewrite_dnit(?t); }
+    if (!t_rewrite_again(?t)) { ret 10; }
     t_spill(?t, 0);
     t_spill(?t, 2);
-    if (!t_rewrite(?t, mir.MIR_SEL_SUB, t_v(0), t_v(1), t_v(2), 3)) { ret 2; }
-    if (t.written != 2)                                             { ret 3; }
-    val op: *mir.MirInstr = ?t.dst[0];
-    if (!t_is_reg(?op.operands[0], 8) || !t_is_reg(?op.operands[1], 1) || !t_is_slot(?op.operands[2], 2)) { ret 4; }
-    if (!t_transport_is(?t.dst[1], false, 8, 0))                                                          { ret 5; }
+    if (!t_rewrite(?t, mir.MIR_SEL_SUB, t_v(0), t_v(1), t_v(2), 3)) { ret 11; }
+    if (t.written != 2)                                             { ret 12; }
+    val sub: *mir.MirInstr = ?t.dst[0];
+    if (!t_is_reg(?sub.operands[0], 8) || !t_is_reg(?sub.operands[1], 1) || !t_is_slot(?sub.operands[2], 2)) { ret 13; }
+    if (!t_transport_is(?t.dst[1], false, 8, 0))                                                             { ret 14; }
     ret 0;
 }
 
-# a shift count is never read from memory
-test "mach.lang.be.codegen.regalloc.rewrite_two_address:a_shift_count_is_reloaded" {
-    var t: TRewrite;
-    if (!t_rewrite_init(?t)) { ret 1; }
-    fin { t_rewrite_dnit(?t); }
-    t_spill(?t, 2);
-    if (!t_rewrite(?t, mir.MIR_SEL_SHL, t_v(0), t_v(1), t_v(2), 3)) { ret 2; }
-    if (t.written != 2)                                             { ret 3; }
-    if (!t_transport_is(?t.dst[0], true, 8, 2))                     { ret 4; }
-    if (!t_op_is(?t.dst[1], mir.MIR_SEL_SHL, 0, 1, 8))              { ret 5; }
-    ret 0;
-}
-
-# a right operand that is the reloaded left operand reuses its register
-test "mach.lang.be.codegen.regalloc.rewrite_two_address:a_repeated_spilled_operand_loads_once" {
-    var t: TRewrite;
-    if (!t_rewrite_init(?t)) { ret 1; }
-    fin { t_rewrite_dnit(?t); }
-    t_spill(?t, 1);
-    if (!t_rewrite(?t, mir.MIR_SEL_ADD, t_v(0), t_v(1), t_v(1), 3)) { ret 2; }
-    if (t.written != 2)                                             { ret 3; }
-    if (!t_transport_is(?t.dst[0], true, 0, 1))                     { ret 4; }
-    if (!t_op_is(?t.dst[1], mir.MIR_SEL_ADD, 0, 0, 0))              { ret 5; }
-    ret 0;
-}
-
-# a compare past a register source reads the spilled one in place
-test "mach.lang.be.codegen.regalloc.rewrite_instr:a_compare_reads_a_spilled_right_source_in_place" {
+# a compare reads one spilled source from its slot and reloads any other: the
+# first spilled source that is neither a vector nor the compare's own
+# spilled destination takes the slot read
+test rewrite_instr__a_compare_reads_one_spilled_source_in_place {
     var t: TRewrite;
     if (!t_rewrite_init(?t)) { ret 1; }
     fin { t_rewrite_dnit(?t); }
     t_spill(?t, 2);
     if (!t_rewrite(?t, mir.MIR_SEL_CMP_NE, t_v(0), t_v(1), t_v(2), 3)) { ret 2; }
     if (t.written != 1)                                                { ret 3; }
-    val op: *mir.MirInstr = ?t.dst[0];
-    if (!t_is_reg(?op.operands[0], 0) || !t_is_reg(?op.operands[1], 1) || !t_is_slot(?op.operands[2], 2)) { ret 4; }
-    ret 0;
-}
+    val ne: *mir.MirInstr = ?t.dst[0];
+    if (!t_is_reg(?ne.operands[0], 0) || !t_is_reg(?ne.operands[1], 1) || !t_is_slot(?ne.operands[2], 2)) { ret 4; }
 
-# a spilled vector value is never read in place as a scalar, so the in-place
-# read goes to the spilled scalar operand after it
-test "mach.lang.be.codegen.regalloc.rewrite_instr:a_spilled_vector_source_does_not_take_the_slot_read" {
-    var t: TRewrite;
-    if (!t_rewrite_init(?t)) { ret 1; }
-    fin { t_rewrite_dnit(?t); }
-    t.vregs[1].vector = true;
-    t_spill(?t, 1);
-    t_spill(?t, 2);
-    if (!t_rewrite(?t, mir.MIR_SEL_CMP_EQ, t_v(0), t_v(1), t_v(2), 3)) { ret 2; }
-    if (t.written != 2)                                                { ret 3; }
-    if (!t_transport_is(?t.dst[0], true, 8, 1))                        { ret 4; }
-    val op: *mir.MirInstr = ?t.dst[1];
-    if (!t_is_reg(?op.operands[1], 8) || !t_is_slot(?op.operands[2], 2)) { ret 5; }
-    ret 0;
-}
-
-# a compare reads its first spilled source from the slot and reloads the other
-test "mach.lang.be.codegen.regalloc.rewrite_instr:a_compare_reads_one_spilled_source_in_place" {
-    var t: TRewrite;
-    if (!t_rewrite_init(?t)) { ret 1; }
-    fin { t_rewrite_dnit(?t); }
+    if (!t_rewrite_again(?t)) { ret 5; }
     t_spill(?t, 1);
     t_spill(?t, 2);
     t.vregs[1].secret = true;
-    if (!t_rewrite(?t, mir.MIR_SEL_CMP_LT_U, t_v(0), t_v(1), t_v(2), 3)) { ret 2; }
-    if (t.written != 2)                                                  { ret 3; }
-    if (!t_transport_is(?t.dst[0], true, 8, 2))                          { ret 4; }
-    val op: *mir.MirInstr = ?t.dst[1];
-    if (op.opcode != mir.MIR_SEL_CMP_LT_U || !t_is_reg(?op.operands[0], 0))                            { ret 5; }
-    if (!t_is_slot(?op.operands[1], 1) || !t_is_reg(?op.operands[2], 8))                               { ret 6; }
-    if (mir.operand_origin(?op.operands[1]).n != 1 || !mir.operand_seed_secret(?t.f, ?op.operands[1])) { ret 7; }
-    ret 0;
-}
+    if (!t_rewrite(?t, mir.MIR_SEL_CMP_LT_U, t_v(0), t_v(1), t_v(2), 3)) { ret 6; }
+    if (t.written != 2 || !t_transport_is(?t.dst[0], true, 8, 2))        { ret 7; }
+    val lt: *mir.MirInstr = ?t.dst[1];
+    if (lt.opcode != mir.MIR_SEL_CMP_LT_U || !t_is_reg(?lt.operands[0], 0))                            { ret 8; }
+    if (!t_is_slot(?lt.operands[1], 1) || !t_is_reg(?lt.operands[2], 8))                               { ret 9; }
+    if (mir.operand_origin(?lt.operands[1]).n != 1 || !mir.operand_seed_secret(?t.f, ?lt.operands[1])) { ret 10; }
 
-# a compare whose spilled destination is also its first source stores
-# through scratch, so the slot read goes to the next spilled source
-test "mach.lang.be.codegen.regalloc.rewrite_instr:a_compare_does_not_read_its_own_destination_slot" {
-    var t: TRewrite;
-    if (!t_rewrite_init(?t)) { ret 1; }
-    fin { t_rewrite_dnit(?t); }
+    if (!t_rewrite_again(?t)) { ret 11; }
+    t.vregs[1].vector = true;
     t_spill(?t, 1);
     t_spill(?t, 2);
-    if (!t_rewrite(?t, mir.MIR_SEL_CMP_EQ, t_v(1), t_v(1), t_v(2), 3)) { ret 2; }
-    if (t.written != 3)                                                { ret 3; }
-    if (!t_transport_is(?t.dst[0], true, 8, 1))                        { ret 4; }
-    val op: *mir.MirInstr = ?t.dst[1];
-    if (!t_is_reg(?op.operands[0], 8) || !t_is_reg(?op.operands[1], 8) || !t_is_slot(?op.operands[2], 2)) { ret 5; }
-    if (!t_transport_is(?t.dst[2], false, 8, 1))                                                          { ret 6; }
+    if (!t_rewrite(?t, mir.MIR_SEL_CMP_EQ, t_v(0), t_v(1), t_v(2), 3))               { ret 12; }
+    if (t.written != 2 || !t_transport_is(?t.dst[0], true, 8, 1))                    { ret 13; }
+    if (!t_is_reg(?t.dst[1].operands[1], 8) || !t_is_slot(?t.dst[1].operands[2], 2)) { ret 14; }
+
+    if (!t_rewrite_again(?t)) { ret 15; }
+    t_spill(?t, 1);
+    t_spill(?t, 2);
+    if (!t_rewrite(?t, mir.MIR_SEL_CMP_EQ, t_v(1), t_v(1), t_v(2), 3)) { ret 16; }
+    if (t.written != 3 || !t_transport_is(?t.dst[0], true, 8, 1))      { ret 17; }
+    val eq: *mir.MirInstr = ?t.dst[1];
+    if (!t_is_reg(?eq.operands[0], 8) || !t_is_reg(?eq.operands[1], 8) || !t_is_slot(?eq.operands[2], 2)) { ret 18; }
+    if (!t_transport_is(?t.dst[2], false, 8, 1))                                                          { ret 19; }
     ret 0;
 }
 
 # a fused compare-and-branch has no destination: its spilled left operand is
 # the slot, and no register is spent on it
-test "mach.lang.be.codegen.regalloc.rewrite_instr:a_fused_branch_compares_a_spilled_value_in_place" {
+test rewrite_instr__a_fused_branch_compares_a_spilled_value_in_place {
     var t: TRewrite;
     if (!t_rewrite_init(?t)) { ret 1; }
     fin { t_rewrite_dnit(?t); }
@@ -8145,7 +8064,7 @@ test "mach.lang.be.codegen.regalloc.rewrite_instr:a_fused_branch_compares_a_spil
 
 # a commutative op whose right operand holds the destination register reads
 # it before the copy of the left operand would overwrite it
-test "mach.lang.be.codegen.regalloc.rewrite_instr:a_right_operand_in_the_destination_register_commutes" {
+test rewrite_instr__a_right_operand_in_the_destination_register_commutes {
     var t: TRewrite;
     if (!t_rewrite_init(?t)) { ret 1; }
     fin { t_rewrite_dnit(?t); }
@@ -8156,7 +8075,9 @@ test "mach.lang.be.codegen.regalloc.rewrite_instr:a_right_operand_in_the_destina
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.rewrite_two_address:a_unary_op_with_spilled_operands_runs_in_one_scratch" {
+# a unary op with spilled operands runs in one scratch, and a spilled
+# destination the op also reads is reloaded before it
+test rewrite_two_address__a_unary_op_runs_in_one_scratch {
     var t: TRewrite;
     if (!t_rewrite_init(?t)) { ret 1; }
     fin { t_rewrite_dnit(?t); }
@@ -8167,26 +8088,20 @@ test "mach.lang.be.codegen.regalloc.rewrite_two_address:a_unary_op_with_spilled_
     if (!t_transport_is(?t.dst[0], true, 8, 1))                     { ret 4; }
     if (!t_op_is(?t.dst[1], mir.MIR_SEL_NEG, 8, 8, -1))             { ret 5; }
     if (!t_transport_is(?t.dst[2], false, 8, 0))                    { ret 6; }
-    ret 0;
-}
 
-# a spilled destination the op also reads is reloaded before the op
-test "mach.lang.be.codegen.regalloc.rewrite_two_address:an_in_place_unary_op_reloads_its_spilled_value" {
-    var t: TRewrite;
-    if (!t_rewrite_init(?t)) { ret 1; }
-    fin { t_rewrite_dnit(?t); }
+    if (!t_rewrite_again(?t)) { ret 7; }
     t_spill(?t, 0);
-    if (!t_rewrite(?t, mir.MIR_SEL_NOT, t_v(0), t_v(0), t_v(0), 2)) { ret 2; }
-    if (t.written != 3)                                             { ret 3; }
-    if (!t_transport_is(?t.dst[0], true, 8, 0))                     { ret 4; }
-    if (!t_op_is(?t.dst[1], mir.MIR_SEL_NOT, 8, 8, -1))             { ret 5; }
-    if (!t_transport_is(?t.dst[2], false, 8, 0))                    { ret 6; }
+    if (!t_rewrite(?t, mir.MIR_SEL_NOT, t_v(0), t_v(0), t_v(0), 2)) { ret 8; }
+    if (t.written != 3)                                             { ret 9; }
+    if (!t_transport_is(?t.dst[0], true, 8, 0))                     { ret 10; }
+    if (!t_op_is(?t.dst[1], mir.MIR_SEL_NOT, 8, 8, -1))             { ret 11; }
+    if (!t_transport_is(?t.dst[2], false, 8, 0))                    { ret 12; }
     ret 0;
 }
 
 # the result of a commutative op is hinted onto a right operand dying there
 # when the left one lives on, and a non-commutative op takes no such hint
-test "mach.lang.be.codegen.regalloc.maybe_tie_hint:a_commutative_op_ties_its_dying_right_operand" {
+test maybe_tie_hint__a_dying_right_operand_of_a_commutative_op {
     var t: TRewrite;
     if (!t_rewrite_init(?t)) { ret 1; }
     fin { t_rewrite_dnit(?t); }
@@ -8213,7 +8128,7 @@ test "mach.lang.be.codegen.regalloc.maybe_tie_hint:a_commutative_op_ties_its_dyi
 
 # a packed conversion carries its operand lane in vec_lane; rewriting the
 # instruction onto its registers keeps the operand kind and width
-test "mach.lang.be.codegen.regalloc.rewrite_instr:a_packed_conversion_keeps_its_operand_lane" {
+test rewrite_instr__a_packed_conversion_keeps_its_operand_lane {
     var backing: A.Allocator;
     val make_r:  err[A.Error] = page.make(?backing);
     if (sel make_r.err) { ret 1; }
@@ -8283,7 +8198,7 @@ test "mach.lang.be.codegen.regalloc.rewrite_instr:a_packed_conversion_keeps_its_
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.rewrite_instr:spilled_update_reloads_previous_value_once" {
+test rewrite_instr__a_spilled_update_reloads_its_value_once {
     val one: i32 = t_spilled_update(0);
     if (one != 0) { ret one; }
     val repeated: i32 = t_spilled_update(1);
@@ -8293,6 +8208,7 @@ test "mach.lang.be.codegen.regalloc.rewrite_instr:spilled_update_reloads_previou
     ret 0;
 }
 
+#[testing]
 fun t_verify_bank_slots(tgt: *target.Target, opcode: mir.MirOpcode, bank0: mir.OperandBank,
     bank1: mir.OperandBank, bank2: mir.OperandBank, count: u32, vector: bool) i32 {
     var expected: [3]mir.OperandBank;
@@ -8336,7 +8252,7 @@ fun t_verify_bank_slots(tgt: *target.Target, opcode: mir.MirOpcode, bank0: mir.O
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.verify_rewritten_operands:enforces_individual_selected_banks" {
+test verify_rewritten_operands__selected_banks {
     var reg: target.TargetRegistry = target.registry_init();
     fin { target.registry_dnit(?reg); }
     val r_4264: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
@@ -8381,7 +8297,7 @@ test "mach.lang.be.codegen.regalloc.verify_rewritten_operands:enforces_individua
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc:unknown_catalog_inputs_never_use_the_fp_or_nonregister_defaults" {
+test run__refuses_unknown_catalog_inputs {
     var alloc:  A.Allocator;
     val make_r: err[A.Error] = page.make(?alloc);
     if (sel make_r.err) { ret 1; }
@@ -8447,6 +8363,7 @@ test "mach.lang.be.codegen.regalloc:unknown_catalog_inputs_never_use_the_fp_or_n
 # propagation is checked against on small graphs
 # cov, when given, receives one bool per (position, register): the value is
 # read or written there, or is live across it
+#[testing]
 fun t_dense_liveness(ctx: *AllocCtx, cov: *bool) err[fail.Fail] {
     val f:  *mir.MirFunction = ctx.f;
     val nb: u32              = f.block_count;
@@ -8596,6 +8513,7 @@ fun t_dense_liveness(ctx: *AllocCtx, cov: *bool) err[fail.Fail] {
     ret err[fail.Fail].ok{};
 }
 
+#[testing]
 fun t_or_row(dst: *bool, dbase: usize, src: *bool, sbase: usize, nv: u32) {
     var v: u32 = 0;
     for (v < nv) {
@@ -8606,6 +8524,7 @@ fun t_or_row(dst: *bool, dbase: usize, src: *bool, sbase: usize, nv: u32) {
 
 # eight blocks of four instructions whose uses, definitions, memory operands,
 # fallthroughs, self loops and an empty block vary with the sample bits
+#[testing]
 fun t_sparse_liveness_case(sample: u32, ordinal: usize, attempts: *usize) i32 {
     var track: T.Testing;
     val made:  err[A.Error] = T.make(?track);
@@ -8691,7 +8610,7 @@ fun t_sparse_liveness_case(sample: u32, ordinal: usize, attempts: *usize) i32 {
     ctx.block_id_index_cap = 64;
     ctx.ranges             = ?sparse[0];
     T.fail_at_ordinal(?track, ordinal);
-    val result: err[fail.Fail] = extend_liveness(?ctx);
+    val result: err[fail.Fail] = extend_liveness(?ctx, true);
     @attempts = T.attempt_count(?track);
     var segs:      [64]Segment;
     var seg_count: u32 = 0;
@@ -8752,7 +8671,10 @@ fun t_sparse_liveness_case(sample: u32, ordinal: usize, attempts: *usize) i32 {
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.extend_liveness:sparse_matches_dense_loops_definitions_and_memory_uses" {
+# the sparse propagation matches the dense oracle over loops, definitions and
+# memory uses, and a refused allocation at any point leaves the ranges
+# untouched and releases its scratch
+test extend_liveness__sparse_matches_the_dense_oracle {
     var sample: u32 = 0;
     for (sample < 16) {
         var attempts: usize = 0;
@@ -8760,18 +8682,14 @@ test "mach.lang.be.codegen.regalloc.extend_liveness:sparse_matches_dense_loops_d
         if (result != 0) { ret result; }
         sample = sample + 1;
     }
-    ret 0;
-}
-
-test "mach.lang.be.codegen.regalloc.extend_liveness:allocation_failure_preserves_ranges_and_releases_scratch" {
     var attempts: usize = 0;
     val baseline: i32   = t_sparse_liveness_case(9, 0, ?attempts);
-    if (baseline != 0 || attempts == 0) { ret 1; }
+    if (baseline != 0 || attempts == 0) { ret 20; }
     var ordinal: usize = 1;
     for (ordinal <= attempts) {
         var refused_attempts: usize = 0;
         val result:           i32   = t_sparse_liveness_case(9, ordinal, ?refused_attempts);
-        if (result != 0) { ret result; }
+        if (result != 0) { ret 20 + result; }
         ordinal = ordinal + 1;
     }
     ret 0;
@@ -8784,6 +8702,7 @@ test "mach.lang.be.codegen.regalloc.extend_liveness:allocation_failure_preserves
 # the second call must see the first call's low word in its second argument
 # register and the high word in its third, whatever registers the captures
 # took and however the copies were ordered
+#[testing]
 rec TPair {
     alloc:  A.Allocator;
     reg:    target.TargetRegistry;
@@ -8796,6 +8715,7 @@ rec TPair {
     arg:    [3]i32;
 }
 
+#[testing]
 fun t_pair_call(alloc: *A.Allocator, b: *mir.MirBlock, ix: u32, op: mir.MirOpcode) {
     b.instrs[ix].opcode        = op;
     b.instrs[ix].operands      = nil;
@@ -8806,6 +8726,7 @@ fun t_pair_call(alloc: *A.Allocator, b: *mir.MirBlock, ix: u32, op: mir.MirOpcod
     b.instrs[ix].vec_lane      = mir.VEC_LANE_NONE;
 }
 
+#[testing]
 fun t_pair_init(t: *TPair, isa_name: str, os_name: str, abi_name: str) bool {
     val mk: err[A.Error] = page.make(?t.alloc);
     if (sel mk.err) { ret false; }
@@ -8867,17 +8788,21 @@ fun t_pair_init(t: *TPair, isa_name: str, os_name: str, abi_name: str) bool {
     ret true;
 }
 
+#[testing]
 fun t_pair_preg(id: i32) mir.MirOperand {
     ret mir.op_preg(mir.preg_id(id));
 }
 
+#[testing]
 fun t_pair_dnit(t: *TPair) {
     target.registry_dnit(?t.reg);
 }
 
 # tokens: 0 unknown, 1 the low word, 2 the high word, 3 the third value
+#[testing]
 val T_PAIR_REGS: u32 = 64;
 
+#[testing]
 fun t_pair_token_of(regs: *u8, mem: *u8, op: *mir.MirOperand) u8 {
     if (op.kind == mir.MIR_OP_PREG) {
         val id: i32 = mir.preg_regid(op.preg);
@@ -8896,6 +8821,7 @@ fun t_pair_token_of(regs: *u8, mem: *u8, op: *mir.MirOperand) u8 {
     ret 0;
 }
 
+#[testing]
 fun t_pair_store(regs: *u8, mem: *u8, op: *mir.MirOperand, token: u8) bool {
     if (op.kind == mir.MIR_OP_PREG) {
         val id: i32 = mir.preg_regid(op.preg);
@@ -8913,6 +8839,7 @@ fun t_pair_store(regs: *u8, mem: *u8, op: *mir.MirOperand, token: u8) bool {
 }
 
 # 0 when the second call sees the pair in place; the failing code otherwise
+#[testing]
 fun t_pair_case(isa_name: str, os_name: str, abi_name: str) i32 {
     var t: TPair;
     if (!t_pair_init(?t, isa_name, os_name, abi_name)) { ret 1; }
@@ -8958,7 +8885,7 @@ fun t_pair_case(isa_name: str, os_name: str, abi_name: str) i32 {
     ret 6;
 }
 
-test "mach.lang.be.codegen.regalloc.run:a_call_result_pair_reaches_the_next_call_shifted_by_one_register" {
+test run__a_call_result_pair_reaches_the_next_call_shifted_by_one_register {
     # one bit per failing convention, the case code in the high nibble
     var code: i32 = 0;
     val x:    i32 = t_pair_case("x86_64", "linux", "sysv64");
@@ -8972,6 +8899,7 @@ test "mach.lang.be.codegen.regalloc.run:a_call_result_pair_reaches_the_next_call
 
 # `ret hi(a, b)` on one convention: the parameters captured from their
 # registers, the high multiply, the result sunk into the return register
+#[testing]
 rec THigh {
     alloc:  A.Allocator;
     reg:    target.TargetRegistry;
@@ -8983,6 +8911,7 @@ rec THigh {
     arg:    [3]i32;
 }
 
+#[testing]
 fun t_high_op(alloc: *A.Allocator, b: *mir.MirBlock, ix: u32, op: mir.MirOpcode, ops: *mir.MirOperand, n: u32) {
     b.instrs[ix].opcode        = op;
     b.instrs[ix].operands      = ops;
@@ -8993,6 +8922,7 @@ fun t_high_op(alloc: *A.Allocator, b: *mir.MirBlock, ix: u32, op: mir.MirOpcode,
     b.instrs[ix].vec_lane      = mir.VEC_LANE_NONE;
 }
 
+#[testing]
 fun t_high_target(t: *THigh, isa_name: str, os_name: str, abi_name: str) bool {
     val mk: err[A.Error] = page.make(?t.alloc);
     if (sel mk.err) { ret false; }
@@ -9015,6 +8945,7 @@ fun t_high_target(t: *THigh, isa_name: str, os_name: str, abi_name: str) bool {
     ret true;
 }
 
+#[testing]
 fun t_high_module(t: *THigh, block_count: u32) bool {
     t.f.blocks      = ?t.blocks[0];
     t.f.block_count = block_count;
@@ -9038,100 +8969,16 @@ fun t_high_module(t: *THigh, block_count: u32) bool {
     ret true;
 }
 
-fun t_high_init(t: *THigh, isa_name: str, os_name: str, abi_name: str, pair_op: mir.MirOpcode) bool {
-    if (!t_high_target(t, isa_name, os_name, abi_name)) { ret false; }
-    val pr: fun(i32) mir.MirOperand = t_pair_preg;
-    t_vregs(?t.alloc, ?t.f, 3);
-    val b:    *mir.MirBlock  = ?t.blocks[0];
-    val v0:   mir.MirOperand = mir.op_vreg(mir.vreg_id(0));
-    val v1:   mir.MirOperand = mir.op_vreg(mir.vreg_id(1));
-    val v2:   mir.MirOperand = mir.op_vreg(mir.vreg_id(2));
-    val pair: bool           = t.tgt.arch.div_reg >= 0 && t.tgt.arch.div_hi_reg >= 0;
-    if (pair) {
-        # the shape legalize leaves on a fixed-pair target
-        t_block(?t.alloc, b, 7);
-        val acc: mir.MirOperand = pr(t.tgt.arch.div_reg);
-        val hi:  mir.MirOperand = pr(t.tgt.arch.div_hi_reg);
-        t_mov(?t.alloc, b, 0, v0, pr(t.arg[0]));
-        t_mov(?t.alloc, b, 1, v1, pr(t.arg[1]));
-        t_mov(?t.alloc, b, 2, acc, v0);
-        val ro: res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](?t.alloc, 2::usize);
-        if (sel ro.err) { ret false; }
-        ro.ok[0] = acc;
-        ro.ok[1] = v1;
-        t_high_op(?t.alloc, b, 3, pair_op, ro.ok, 2);
-        t_mov(?t.alloc, b, 4, v2, hi);
-        t_mov(?t.alloc, b, 5, pr(t.ret_r), v2);
-        t_high_op(?t.alloc, b, 6, mir.MIR_RET, nil, 0);
-    }
-    or {
-        t_block(?t.alloc, b, 5);
-        t_mov(?t.alloc, b, 0, v0, pr(t.arg[0]));
-        t_mov(?t.alloc, b, 1, v1, pr(t.arg[1]));
-        val ro: res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](?t.alloc, 3::usize);
-        if (sel ro.err) { ret false; }
-        ro.ok[0] = v2;
-        ro.ok[1] = v0;
-        ro.ok[2] = v1;
-        t_high_op(?t.alloc, b, 2, mir.MIR_MUL_HI_U, ro.ok, 3);
-        t_mov(?t.alloc, b, 3, pr(t.ret_r), v2);
-        t_high_op(?t.alloc, b, 4, mir.MIR_RET, nil, 0);
-    }
-    ret t_high_module(t, 1);
-}
-
+#[testing]
 fun t_high_dnit(t: *THigh) {
     target.registry_dnit(?t.reg);
 }
 
-# the moves that survive allocation between two distinct registers; a self
-# copy is dropped by the rewrite, so this is the count of real moves
-fun t_high_moves(t: *THigh) u32 {
-    var n:  u32 = 0;
-    var ii: u32 = 0;
-    for (ii < t.blocks[0].instr_count) {
-        val mi: *mir.MirInstr = ?t.blocks[0].instrs[ii];
-        if (mi.opcode == mir.MIR_MOV) { n = n + 1; }
-        ii = ii + 1;
-    }
-    ret n;
-}
-
+#[testing]
 fun t_high_reg(t: *THigh, v: u32) i32 {
     val a: mir.PRegId = t.f.vregs[v].assigned;
     if (mir.preg_is_nil(a)) { ret -1; }
     ret mir.preg_regid(a);
-}
-
-# 0 when the result reaches the return register in the moves the machine
-# needs: none on a three-address high multiply, one (the accumulator load)
-# plus one (the high half out) on a fixed pair, where the high half stays in
-# the register the pair left it in; the failing code otherwise
-fun t_high_case(isa_name: str, os_name: str, abi_name: str) i32 {
-    var t: THigh;
-    if (!t_high_init(?t, isa_name, os_name, abi_name, mir.MIR_SEL_MUL_PAIR_U)) { ret 1; }
-    fin { t_high_dnit(?t); }
-    val ran: err[fail.Fail] = run(?t.tgt, ?t.m);
-    if (sel ran.err) { ret 2; }
-    var want: u32 = 0;
-    if (t.tgt.arch.div_reg >= 0)                                               { want = 2; }
-    if (t_high_moves(?t) != want)                                              { ret 3; }
-    if (t.tgt.arch.div_reg >= 0 && t_high_reg(?t, 2) != t.tgt.arch.div_hi_reg) { ret 4; }
-    ret 0;
-}
-
-# the high half of a widening multiply returned directly: the result takes
-# the return register its dying operand held (#3691), or on x86-64 stays in
-# rdx, which the pair holds only at the multiply itself (#3760)
-test "mach.lang.be.codegen.regalloc.run:a_returned_high_multiply_needs_no_scratch_copy" {
-    var code: i32 = 0;
-    val x:    i32 = t_high_case("x86_64", "linux", "sysv64");
-    if (x != 0) { code = code | 1 | (x << 4); }
-    val a: i32 = t_high_case("aarch64", "linux", "aapcs64");
-    if (a != 0) { code = code | 2 | (a << 4); }
-    val r: i32 = t_high_case("riscv64", "linux", "lp64d");
-    if (r != 0) { code = code | 4 | (r << 4); }
-    ret code;
 }
 
 # the pair op between values that would take its registers on x86-64 (#3760).
@@ -9140,6 +8987,7 @@ test "mach.lang.be.codegen.regalloc.run:a_returned_high_multiply_needs_no_scratc
 # entry block so no parameter pin holds either register. clobber: the divisor
 # v1 is captured from rdx and dies at the divide, which writes rdx (xor edx,
 # edx) before it reads the divisor
+#[testing]
 fun t_fixed_init(t: *THigh, clobber: bool) bool {
     if (!t_high_target(t, "x86_64", "linux", "sysv64")) { ret false; }
     if (t.arg[2] != t.tgt.arch.div_hi_reg)              { ret false; }
@@ -9185,12 +9033,13 @@ fun t_fixed_init(t: *THigh, clobber: bool) bool {
     ret t_high_module(t, 2);
 }
 
+#[testing]
 fun t_fixed_in_pair(t: *THigh, v: u32) bool {
     val r: i32 = t_high_reg(t, v);
     ret r == t.tgt.arch.div_reg || r == t.tgt.arch.div_hi_reg;
 }
 
-test "mach.lang.be.codegen.regalloc.run:a_value_live_across_the_fixed_pair_stays_out_of_both_registers" {
+test run__a_value_live_across_the_fixed_pair_stays_out_of_both_registers {
     var t: THigh;
     if (!t_fixed_init(?t, false)) { ret 1; }
     fin { t_high_dnit(?t); }
@@ -9203,7 +9052,7 @@ test "mach.lang.be.codegen.regalloc.run:a_value_live_across_the_fixed_pair_stays
     ret 0;
 }
 
-test "mach.lang.be.codegen.regalloc.run:a_value_read_by_the_fixed_pair_stays_out_of_the_early_clobbered_register" {
+test run__a_value_read_by_the_fixed_pair_stays_out_of_the_early_clobbered_register {
     var t: THigh;
     if (!t_fixed_init(?t, true)) { ret 1; }
     fin { t_high_dnit(?t); }

@@ -22,6 +22,15 @@ the dwarf segment rewrite leaves it alone
 pub val EXPORTS_SECTNAME: str = "__mach_exports"
 ```
 
+## val RECORD_SECTNAME
+
+```mach
+pub val RECORD_SECTNAME: str = "__mach_cache"
+```
+
+the object cache's record rides in `__MACH,__mach_cache`, debug-attributed
+like the request list so no link loads it
+
 ## fun emit_object
 
 ```mach

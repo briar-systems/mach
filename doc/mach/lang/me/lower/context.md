@@ -54,6 +54,26 @@ pub rec ValueInstance;
 pub rec PackInstance;
 ```
 
+## rec NormalObject
+
+```mach
+pub rec NormalObject;
+```
+
+a module's test object holds its tests and `#[testing]` declarations beside its
+normal object, which it never changes. every definition the normal object already
+holds is declared in the test object instead, so each symbol has one definition
+
+defined: the global symbols the normal object defines
+
+## fun normal_defines
+
+```mach
+pub fun normal_defines(lc: *LowerContext, name: intern.StrId) bool;
+```
+
+lowering the test object, which declares `name` because the normal object defines it
+
 ## rec ModuleScope
 
 ```mach
@@ -117,7 +137,7 @@ own_module: session.ModuleId,
 sema_result: *sema.SemaResult,
 rr: *resolve.ResolveResult,
 ctx: *comptime.ComptimeCtx,
-test_mode: bool,
+normal_object: *NormalObject,
 shared_artifact: bool,
 debug: bool,
 checks: bool,
@@ -427,18 +447,45 @@ pub fun decl_ret_sem(lc: *LowerContext, did: id.DeclId) type.TypeId;
 pub fun function_return_ir(lc: *LowerContext, did: id.DeclId) res[ir_type.IrTypeId, fail.Fail];
 ```
 
+## rec FnSig
+
+```mach
+pub rec FnSig;
+```
+
+a function's signature and the extension each parameter declares, which the
+signless signature does not carry (#3927)
+
+## fun lower_fn_sig
+
+```mach
+pub fun lower_fn_sig(lc: *LowerContext, tid: type.TypeId) res[FnSig, fail.Fail];
+```
+
+the signature of the semantic type `tid` and, when it is a function type,
+its parameters' extensions
+
+## fun fun_type_ext
+
+```mach
+pub fun fun_type_ext(lc: *LowerContext, tid: type.TypeId) res[ir_type.ExtListId, fail.Fail];
+```
+
+the extensions the parameters of the semantic function type `tid` declare,
+EXT_LIST_NONE for any other type
+
 ## fun pack_instance_sig
 
 ```mach
 pub fun pack_instance_sig(lc: *LowerContext, d: *adecl.Decl, fixed_count: u32,
-types: *type.TypeId, type_len: u32, ret_ir: ir_type.IrTypeId) res[ir_type.IrTypeId, fail.Fail];
+types: *type.TypeId, type_len: u32, ret_ir: ir_type.IrTypeId) res[FnSig, fail.Fail];
 ```
 
 ## fun instance_ref_sig
 
 ```mach
 pub fun instance_ref_sig(lc: *LowerContext, decl_id: id.DeclId, origin: session.ModuleId,
-args: *type.TypeId, arg_len: u32) res[ir_type.IrTypeId, fail.Fail];
+args: *type.TypeId, arg_len: u32) res[FnSig, fail.Fail];
 ```
 
 ## fun pack_instance_ref_sig
@@ -446,7 +493,7 @@ args: *type.TypeId, arg_len: u32) res[ir_type.IrTypeId, fail.Fail];
 ```mach
 pub fun pack_instance_ref_sig(lc: *LowerContext, decl_id: id.DeclId, origin: session.ModuleId,
 args: *type.TypeId, arg_len: u32,
-types: *type.TypeId, type_len: u32) res[ir_type.IrTypeId, fail.Fail];
+types: *type.TypeId, type_len: u32) res[FnSig, fail.Fail];
 ```
 
 ## fun expr_symbol_of
@@ -490,7 +537,7 @@ pub fun symbol_of(lc: *LowerContext, sid: resolve.SymbolId) opt[*resolve.Symbol]
 ## fun ensure_extern_function
 
 ```mach
-pub fun ensure_extern_function(lc: *LowerContext, name: intern.StrId, sig: ir_type.IrTypeId, import_flag: bool) res[u32, fail.Fail];
+pub fun ensure_extern_function(lc: *LowerContext, name: intern.StrId, sig: FnSig, import_flag: bool) res[u32, fail.Fail];
 ```
 
 ## fun ensure_extern_global

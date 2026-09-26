@@ -60,18 +60,6 @@ pub val REG_R8:  i32 = 8
 pub val REG_R9:  i32 = 9
 ```
 
-## val REG_R10
-
-```mach
-pub val REG_R10: i32 = 10
-```
-
-## val REG_R11
-
-```mach
-pub val REG_R11: i32 = 11
-```
-
 ## val REG_R12
 
 ```mach
@@ -222,24 +210,6 @@ pub fun gp_param_regs(out: *isa.Register) i32;
 
 ```mach
 pub fun callee_saved(out: *isa.Register) i32;
-```
-
-## fun stack_align
-
-```mach
-pub fun stack_align() u32;
-```
-
-## fun red_zone
-
-```mach
-pub fun red_zone() u32;
-```
-
-## fun shadow_space
-
-```mach
-pub fun shadow_space() u64;
 ```
 
 ## fun va_model

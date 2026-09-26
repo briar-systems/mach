@@ -94,18 +94,6 @@ pub fun cursor(p: *FilePlan) usize;
 
 the next unplaced offset
 
-## fun total
-
-```mach
-pub fun total(p: *FilePlan) usize;
-```
-
-## fun row_count
-
-```mach
-pub fun row_count(p: *FilePlan) u32;
-```
-
 ## fun offset
 
 ```mach
@@ -122,18 +110,6 @@ pub fun size(p: *FilePlan, row: u32) usize;
 
 ```mach
 pub fun end(p: *FilePlan, row: u32) usize;
-```
-
-## fun label
-
-```mach
-pub fun label(p: *FilePlan, row: u32) str;
-```
-
-## fun section
-
-```mach
-pub fun section(p: *FilePlan, row: u32) of.SectionId;
 ```
 
 ## fun close
@@ -162,12 +138,6 @@ pub fun field_u32(p: *FilePlan, value: usize, what: str) res[u32, fail.Fail];
 
 ```mach
 pub fun field_u16(p: *FilePlan, value: usize, what: str) res[u16, fail.Fail];
-```
-
-## fun field_u8
-
-```mach
-pub fun field_u8(p: *FilePlan, value: usize, what: str) res[u8, fail.Fail];
 ```
 
 ## fun field_u64_u32

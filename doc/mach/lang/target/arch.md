@@ -24,14 +24,6 @@ pub val AARCH64: u32 = 2
 pub val RISCV64: u32 = 3
 ```
 
-## val MOS6502_WITHDRAWN
-
-```mach
-pub val MOS6502_WITHDRAWN: u32 = 4
-```
-
-4 was the withdrawn MOS 6502 target (#3226, #3112); no catalog row carries it
-
 ## val SPIRV
 
 ```mach

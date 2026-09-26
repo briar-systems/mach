@@ -182,10 +182,10 @@ pub fun init(p: *OwnedSubprocess);
 pub fun set_deadline(p: *OwnedSubprocess, deadline: tm.Instant) bool;
 ```
 
-## fun bound_seconds
+## fun bound
 
 ```mach
-pub fun bound_seconds(p: *OwnedSubprocess, seconds: i64) bool;
+pub fun bound(p: *OwnedSubprocess, timeout: duration.Duration) bool;
 ```
 
 ## fun deadline_reached
@@ -210,20 +210,6 @@ pub fun dnit(a: *A.Allocator, p: *OwnedSubprocess);
 
 ```mach
 pub fun spawn(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8) err[Error];
-```
-
-## fun spawn_in
-
-```mach
-pub fun spawn_in(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
-cwd: str) err[Error];
-```
-
-## fun spawn_captured
-
-```mach
-pub fun spawn_captured(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
-identity: str, limit: usize) err[Error];
 ```
 
 ## fun spawn_captured_input
@@ -257,12 +243,6 @@ identity: str, limit: usize) err[Error];
 
 ```mach
 pub fun running(p: *OwnedSubprocess) bool;
-```
-
-## fun pid
-
-```mach
-pub fun pid(p: *OwnedSubprocess) i64;
 ```
 
 ## fun wait

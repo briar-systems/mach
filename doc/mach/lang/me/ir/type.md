@@ -114,15 +114,21 @@ pub rec IrTypeStruct;
 pub rec IrTypeTag;
 ```
 
+## rec IrTypeFn
+
+```mach
+pub rec IrTypeFn;
+```
+
 ## def IntExt
 
 ```mach
 pub def IntExt: u8
 ```
 
-how a caller widens an integer argument narrower than 64 bits where its
-platform asks the caller to: the declared signedness the signless integer
-type does not carry (#3927)
+the extension a caller owes an integer argument narrower than 64 bits where
+its platform asks the caller for one: the declared signedness the signless
+integer type does not carry, as LLVM's zeroext and signext (#3927)
 
 ## val EXT_NONE
 
@@ -142,19 +148,26 @@ pub val EXT_ZERO: IntExt = 1
 pub val EXT_SIGN: IntExt = 2
 ```
 
-## rec IrTypeFn
+## def ExtListId
 
 ```mach
-pub rec IrTypeFn;
+pub def ExtListId: u32
 ```
 
-param_ext holds one IntExt per parameter, or is nil when every one is
-EXT_NONE, so equal signatures have one form
+an interned list of one IntExt per parameter, carried by a function's
+declaration and by each call rather than by the signless function type.
+trailing EXT_NONE entries are dropped, so a list with none is EXT_LIST_NONE
 
-## fun fn_param_ext
+## val EXT_LIST_NONE
 
 ```mach
-pub fun fn_param_ext(f: *IrTypeFn, index: u32) IntExt;
+pub val EXT_LIST_NONE: ExtListId = 0
+```
+
+## rec ExtList
+
+```mach
+pub rec ExtList;
 ```
 
 ## rec IrType
@@ -180,6 +193,30 @@ pub fun init(t: *IrTypeTable, a: *A.Allocator) err[fail.Fail];
 ```mach
 pub fun dnit(t: *IrTypeTable);
 ```
+
+## fun intern_ext_list
+
+```mach
+pub fun intern_ext_list(t: *IrTypeTable, ext: *IntExt, count: u32) res[ExtListId, fail.Fail];
+```
+
+the list id of `count` extensions, one per parameter in order
+
+## fun ext_at
+
+```mach
+pub fun ext_at(t: *IrTypeTable, xid: ExtListId, index: u32) IntExt;
+```
+
+the extension of parameter `index` in list `xid`: EXT_NONE past its end
+
+## fun copy_ext_list
+
+```mach
+pub fun copy_ext_list(dst: *IrTypeTable, src: *IrTypeTable, xid: ExtListId) res[ExtListId, fail.Fail];
+```
+
+the list `xid` of table `src` interned in `dst`
 
 ## fun get
 
@@ -375,15 +412,6 @@ pub fun intern_union(t: *IrTypeTable, fields: *IrTypeId, field_count: u32, align
 pub fun intern_fn(t: *IrTypeTable, ret_type: IrTypeId, params: *IrTypeId, param_count: u32, variadic: bool) res[IrTypeId, fail.Fail];
 ```
 
-## fun intern_fn_ext
-
-```mach
-pub fun intern_fn_ext(t: *IrTypeTable, ret_type: IrTypeId, params: *IrTypeId, param_ext: *IntExt,
-param_count: u32, variadic: bool) res[IrTypeId, fail.Fail];
-```
-
-param_ext is nil or one IntExt per parameter
-
 ## fun intern_tag
 
 ```mach
@@ -417,19 +445,6 @@ every case field after it
 
 ```mach
 pub fun tag_payload_offset_for_machine(t: *IrTypeTable, id: IrTypeId, machine: layout.Machine) u32;
-```
-
-## fun checked_extent_for_machine
-
-```mach
-pub fun checked_extent_for_machine(t: *IrTypeTable, id: IrTypeId, machine: layout.Machine) layout.Extent;
-```
-
-## fun checked_offset_for_machine
-
-```mach
-pub fun checked_offset_for_machine(t: *IrTypeTable, id: IrTypeId, field_ix: u32,
-machine: layout.Machine) layout.Extent;
 ```
 
 ## fun content_equal

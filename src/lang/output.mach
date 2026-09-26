@@ -1,25 +1,37 @@
 # output: how a compiler-controlled file reaches its final name. a build
 # product under `out/` is regenerable by the next build or `mach clean`, so
-# it is written in place with no staging, lock or journal. a file in the
-# source tree goes through `replace`, which writes a sibling temporary and
-# renames it over the destination so an interrupted write leaves the
-# original intact
+# it is written in place with no staging, lock or journal, except an `obj/`
+# object: the object cache reads it back, so it goes through
+# `through_temporary`. a file in the source tree goes through `replace`. both
+# write a sibling temporary and rename it over the destination, so an
+# interrupted write leaves the original intact
 use mach.lang.build.outcome;
+use mach.lang.fail;
 use mach.lang.intern;
-use A:  std.allocator;
+use fixture: mach.lang.output.testing;
+use A:       std.allocator;
+use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.crypto.rand;
 use fs: std.filesystem;
 use std.format;
 use io_error: std.io.error;
 use mwriter:  std.io.writer;
 use std.text.string.str_free;
 use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.path;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string;
 use std.types.string.str;
+use std.types.string.str_join;
 use std.types.string.str_len;
+use std.types.string.str_replace;
 
 pub val DIR_MODE: i32 = 0o755;
 
@@ -103,4 +115,137 @@ pub fun replace(a: *A.Allocator, path: str, buf: *u8, len: usize, mode: i32) err
     val replaced: err[fs.FsError] = fs.replace_bytes_atomic(a, path, buf, len, mode, DIR_MODE);
     if (sel replaced.err) { ret err[outcome.Fail].err{outcome.environment(outcome.fs_text(replaced.err))}; }
     ret err[outcome.Fail].ok{};
+}
+
+# the file a module's output takes under `base`: its dotted name as a path,
+# with `suffix` as the extension
+pub fun mirror_fqn(a: *A.Allocator, base: *u8, fqn: str, suffix: str) res[str, outcome.Fail] {
+    val rel_r: res[str, string.StrError] = str_replace(a, fqn, ".", "/");
+    if (sel rel_r.err) { ret res[str, outcome.Fail].err{outcome.environment(outcome.str_text(rel_r.err))}; }
+    val rel: str = rel_r.ok;
+    fin { str_free(a, rel); }
+    val leaf_r: res[str, string.StrError] = str_join(a, rel, ".", suffix);
+    if (sel leaf_r.err) { ret res[str, outcome.Fail].err{outcome.environment(outcome.str_text(leaf_r.err))}; }
+    val leaf: str = leaf_r.ok;
+    fin { str_free(a, leaf); }
+    val join_r: res[path.Path, A.Error] = path.join(a, base::str, leaf);
+    if (sel join_r.err) { ret res[str, outcome.Fail].err{outcome.refused(join_r.err)}; }
+    ret res[str, outcome.Fail].ok{join_r.ok};
+}
+
+val HEX: str = "0123456789abcdef";
+
+# `<destination>.tmp-<16 random hex digits>`, beside the destination so the
+# rename stays on one filesystem
+fun temporary_name(a: *A.Allocator, destination: str) res[str, outcome.Fail] {
+    var random: [8]u8;
+    val filled: err[io_error.Error] = rand.fill(?random[0], 8);
+    if (sel filled.err) { ret res[str, outcome.Fail].err{outcome.environment(outcome.io_text(filled.err))}; }
+    var digits: [17]u8;
+    var i:      usize = 0;
+    for (i < 8) {
+        digits[i * 2]     = HEX[(random[i] >> 4)::usize];
+        digits[i * 2 + 1] = HEX[(random[i] & 0x0f)::usize];
+        i                 = i + 1;
+    }
+    digits[16] = 0;
+    val named: res[str, string.StrError] = str_join(a, destination, ".tmp-", (?digits[0])::str);
+    if (sel named.err) { ret res[str, outcome.Fail].err{outcome.environment(outcome.str_text(named.err))}; }
+    ret res[str, outcome.Fail].ok{named.ok};
+}
+
+# `write` fills a sibling temporary of `destination`, which is then renamed
+# over it: a reader sees the previous file or the complete new one, never a
+# torn one, and a failed write leaves the previous file and no temporary
+pub fun through_temporary[C](a: *A.Allocator, destination: str, ctx: *C,
+    write: fun(*C, str) err[fail.Fail]) err[outcome.Fail] {
+    val named: res[str, outcome.Fail] = temporary_name(a, destination);
+    if (sel named.err) { ret err[outcome.Fail].err{named.err}; }
+    val temporary: str = named.ok;
+    fin { str_free(a, temporary); }
+    val written: err[fail.Fail] = write(ctx, temporary);
+    if (sel written.err) {
+        fs.remove_file(temporary);
+        ret err[outcome.Fail].err{outcome.from_fail(written.err)};
+    }
+    val renamed: err[io_error.Error] = fs.rename(temporary, destination);
+    if (sel renamed.err) {
+        fs.remove_file(temporary);
+        ret err[outcome.Fail].err{outcome.environment(message(nil, a, "cannot publish", destination, outcome.io_text(renamed.err), "cannot publish an object"))};
+    }
+    ret err[outcome.Fail].ok{};
+}
+
+#[testing]
+rec TornWrite {
+    bytes: str;
+    fails: bool;
+}
+
+# writes its bytes, then fails part way when asked, as an interrupted writer would
+#[testing]
+fun t_torn_write(w: *TornWrite, destination: str) err[fail.Fail] {
+    val written: err[fs.FsError] = fs.write_bytes(destination, w.bytes, str_len(w.bytes), 0o644);
+    if (sel written.err) { ret err[fail.Fail].err{fail.message("torn write could not write")}; }
+    if (w.fails)         { ret err[fail.Fail].err{fail.message("interrupted")}; }
+    ret err[fail.Fail].ok{};
+}
+
+#[testing]
+fun t_holds(a: *A.Allocator, file: str, expected: str) bool {
+    val read: res[Vector[u8], fs.FsError] = fs.read_bytes(a, file);
+    if (sel read.err) { ret false; }
+    var bytes: Vector[u8] = read.ok;
+    fin { vector.dnit[u8](?bytes); }
+    if (bytes.len != str_len(expected)) { ret false; }
+    var i: usize = 0;
+    for (i < bytes.len) {
+        if (bytes.data[i] != expected[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+#[testing]
+fun t_entries(a: *A.Allocator, directory: str) usize {
+    val listed: res[Vector[str], fs.FsError] = fs.read_dir(a, directory);
+    if (sel listed.err) { ret 0; }
+    var names: Vector[str] = listed.ok;
+    val count: usize       = names.len;
+    var i:     usize       = 0;
+    for (i < names.len) {
+        str_free(a, names.data[i]);
+        i = i + 1;
+    }
+    vector.dnit[str](?names);
+    ret count;
+}
+
+test through_temporary__an_interrupted_write_leaves_the_previous_file_whole {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val created: res[fixture.Output, outcome.Fail] = fixture.create(?a, "through-temporary");
+    if (sel created.err) { ret 1; }
+    var file: fixture.Output = created.ok;
+    fin { fixture.dnit(?file); }
+    val closed: err[outcome.Fail] = fixture.close(?file);
+    if (sel closed.err) { ret 1; }
+    val destination: str               = fixture.path(?file);
+    var first:       TornWrite         = TornWrite{bytes: "the previous object", fails: false};
+    val wrote:       err[outcome.Fail] = through_temporary[TornWrite](?a, destination, ?first, t_torn_write);
+    if (sel wrote.err)                                    { ret 2; }
+    if (!t_holds(?a, destination, "the previous object")) { ret 3; }
+    var torn:   TornWrite         = TornWrite{bytes: "half", fails: true};
+    val failed: err[outcome.Fail] = through_temporary[TornWrite](?a, destination, ?torn, t_torn_write);
+    if (sel failed.ok)                                    { ret 4; }
+    if (!t_holds(?a, destination, "the previous object")) { ret 5; }
+    # the directory holds the destination and nothing the torn write left behind
+    if (t_entries(?a, file.directory) != 1) { ret 6; }
+    var next:     TornWrite         = TornWrite{bytes: "the next object", fails: false};
+    val replaced: err[outcome.Fail] = through_temporary[TornWrite](?a, destination, ?next, t_torn_write);
+    if (sel replaced.err)                             { ret 7; }
+    if (!t_holds(?a, destination, "the next object")) { ret 8; }
+    if (t_entries(?a, file.directory) != 1)           { ret 9; }
+    ret 0;
 }

@@ -110,9 +110,3 @@ ret: the requirement; on error nothing is left allocated
 pub fun find_link_by_name(m: *Manifest, name: intern.StrId) *LinkDef;
 ```
 
-## fun find_link
-
-```mach
-pub fun find_link(itn: *intern.Interner, m: *Manifest, name: str) *LinkDef;
-```
-

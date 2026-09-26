@@ -42,12 +42,6 @@ pub val MODE_LIBRARY: BuildMode = 1
 pub def TargetOpt: u8
 ```
 
-## val TARGET_OPT_DEFAULT
-
-```mach
-pub val TARGET_OPT_DEFAULT: TargetOpt = 0
-```
-
 ## val TARGET_OPT_DEBUG
 
 ```mach
@@ -148,6 +142,16 @@ an artifact entry the union walk loads: the entry module and the artifact it is 
 pub rec ModuleEntry;
 ```
 
+## rec TestObject
+
+```mach
+pub rec TestObject;
+```
+
+a module's test object, beside its normal object and never changing it: the
+module's tests and what they reach that the normal object does not define. the
+fields mirror the normal object's on ModuleEntry
+
 ## def LoadStatus
 
 ```mach
@@ -177,14 +181,6 @@ pub val LOAD_DONE: LoadStatus = 2
 ```mach
 pub rec TargetTuple;
 ```
-
-## rec CacheKey
-
-```mach
-pub rec CacheKey;
-```
-
-an entry this unit build restored or published, which eviction keeps
 
 ## rec RawLowerCapture
 
@@ -250,6 +246,12 @@ pub fun release_staged(p: *Project, m: *ModuleEntry);
 
 staged images are project-owned until a query takes them, object_image is borrowed
 
+## fun release_staged_test
+
+```mach
+pub fun release_staged_test(p: *Project, m: *ModuleEntry);
+```
+
 ## fun release_all_staged
 
 ```mach
@@ -304,18 +306,6 @@ pub fun map_opt(o: manifest.MOpt) opt[TargetOpt];
 
 the pipeline level a manifest profile level selects; absent for a tag
 outside the catalog, which the caller reports through the catalog policy
-
-## fun intern_unwrap
-
-```mach
-pub fun intern_unwrap(itn: *intern.Interner, text: str) intern.StrId;
-```
-
-## fun intern_opt_unwrap
-
-```mach
-pub fun intern_opt_unwrap(itn: *intern.Interner, text: str) intern.StrId;
-```
 
 ## fun fqn_name
 

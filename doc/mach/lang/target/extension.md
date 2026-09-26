@@ -139,14 +139,6 @@ pub fun spell_levels(levels: *Level, count: u32, buf: *u8, cap: usize, off: usiz
 
 the level table's spellings, `, `-separated, appended at `off`; returns the new end
 
-## fun spell_bits
-
-```mach
-pub fun spell_bits(table: *Extension, count: u32, bits: u64, buf: *u8, cap: usize, off: usize) usize;
-```
-
-the names of every row whose bit is in `bits`, `, `-separated, appended at `off`
-
 ## fun spell_names
 
 ```mach

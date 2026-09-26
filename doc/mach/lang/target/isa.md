@@ -60,12 +60,6 @@ pub val ARCH_RISCV32: u32 = arch.RISCV32
 pub val ISA_LABEL:       u16 = 0xFFFF
 ```
 
-## val ISA_ASM_MARKER
-
-```mach
-pub val ISA_ASM_MARKER:  u16 = 0xFFFE
-```
-
 ## val ISA_PCOPY
 
 ```mach
@@ -82,18 +76,6 @@ pub val ISA_PCOPY_FENCE: u16 = 0xFFFC
 
 ```mach
 pub val ISA_USE:         u16 = 0xFFFB
-```
-
-## val ISA_FLAG_DST_READ
-
-```mach
-pub val ISA_FLAG_DST_READ: u16 = 0x8000
-```
-
-## val ISA_FLAG_FP_COPY
-
-```mach
-pub val ISA_FLAG_FP_COPY:  u16 = 0x4000
 ```
 
 ## def OperandKind
@@ -202,12 +184,6 @@ pub rec Operand;
 
 ```mach
 pub rec Inst;
-```
-
-## rec InstBuf
-
-```mach
-pub rec InstBuf;
 ```
 
 ## def RegClassKind
@@ -673,27 +649,6 @@ checked against it
 pub fun vector_domain_cell(index: u32, cell: *ScalarForm) bool;
 ```
 
-## val CONVERT_CELL_COUNT
-
-```mach
-pub val CONVERT_CELL_COUNT: u32 = 52
-```
-
-a machine with a vector unit decides every retained cell; one without decides
-them all as the scalar expansion by declaring no unit
-
-## val WIDEN_CELL_COUNT
-
-```mach
-pub val WIDEN_CELL_COUNT: u32 = 12
-```
-
-## val SHIFT_CELL_COUNT
-
-```mach
-pub val SHIFT_CELL_COUNT: u32 = 24
-```
-
 ## fun scalar_conversion_rows
 
 ```mach
@@ -824,15 +779,6 @@ pub fun spell_extensions(m: *MachineModel, buf: *u8, cap: usize);
 ```
 
 the model's vocabulary, `, `-separated, or `none`, NUL-terminated in buf
-
-## fun extension_known
-
-```mach
-pub fun extension_known(reg: *IsaRegistry, name: str, len: usize) bool;
-```
-
-what a registry's vocabularies say of one name: whether any registered isa
-names it, and the names every vocabulary holds, deduplicated, for a refusal
 
 ## fun spell_all_extensions
 
@@ -1134,12 +1080,6 @@ pub rec TargetDefs;
 pub val NO_OP_SET: u32 = definition.NO_OP_SET
 ```
 
-## val NO_OPCODE
-
-```mach
-pub val NO_OPCODE: u32 = definition.NO_OPCODE
-```
-
 ## fun op_def
 
 ```mach
@@ -1158,12 +1098,6 @@ pub fun type_def(name: str, tag: u32, operands: *u32, arity: u32, refuse: TypeRe
 pub fun target_defs(ops: *OpDef, op_count: u32, types: *TypeDef, type_count: u32) TargetDefs;
 ```
 
-## fun type_def_of
-
-```mach
-pub fun type_def_of(defs: *TargetDefs, name: str) *TypeDef;
-```
-
 ## fun type_def_of_region
 
 ```mach
@@ -1174,12 +1108,6 @@ pub fun type_def_of_region(defs: *TargetDefs, src: str, off: usize, len: usize) 
 
 ```mach
 pub fun type_def_by_tag(defs: *TargetDefs, tag: u32) *TypeDef;
-```
-
-## fun op_def_of
-
-```mach
-pub fun op_def_of(defs: *TargetDefs, set_name: str, op_name: str) *OpDef;
 ```
 
 ## fun op_def_of_region
@@ -1193,12 +1121,6 @@ nam_src: str, nam_off: usize, nam_len: usize) *OpDef;
 
 ```mach
 pub fun op_set_exists_region(defs: *TargetDefs, src: str, off: usize, len: usize) bool;
-```
-
-## fun op_set_exists
-
-```mach
-pub fun op_set_exists(defs: *TargetDefs, name: str) bool;
 ```
 
 ## fun with_defs
@@ -1323,12 +1245,6 @@ pub fun local_got_kind(tgt_isa: *IsaVTable, kind: of.RelocKind) bool;
 pub fun with_machine_flags(s: *RelocSeam, f: of.MachineFlagsFn);
 ```
 
-## def MachineFlagsFn
-
-```mach
-pub def MachineFlagsFn: of.MachineFlagsFn
-```
-
 ## fun declares_machine_flags
 
 ```mach
@@ -1358,18 +1274,6 @@ pub fun with_resolve_reloc_operand(s: *RelocSeam, f: of.ResolveRelocOperandFn);
 
 ```mach
 pub fun with_attributes(s: *RelocSeam, build: of.BuildAttributesFn, merge: of.MergeAttributesFn, validate: of.ValidateAttributesFn);
-```
-
-## def BuildAttributesFn
-
-```mach
-pub def BuildAttributesFn: of.BuildAttributesFn
-```
-
-## def MergeAttributesFn
-
-```mach
-pub def MergeAttributesFn: of.MergeAttributesFn
 ```
 
 ## fun declares_attributes
@@ -1528,12 +1432,6 @@ pub fun make_imm(value: i64, size: u8) Operand;
 pub fun make_mem(base: i32, disp: i32, index: i32, scale: u8, size: u8) Operand;
 ```
 
-## fun make_label
-
-```mach
-pub fun make_label(name: str) Operand;
-```
-
 ## fun make_block_label
 
 ```mach
@@ -1593,24 +1491,6 @@ pub fun label_is_forward_local(op: *Operand) bool;
 
 ```mach
 pub fun make_sym(sym_id: u32, size: u8) Operand;
-```
-
-## fun buf_init
-
-```mach
-pub fun buf_init(alloc: *A.Allocator) InstBuf;
-```
-
-## fun buf_append
-
-```mach
-pub fun buf_append(buf: *InstBuf, inst: Inst);
-```
-
-## fun buf_dnit
-
-```mach
-pub fun buf_dnit(buf: *InstBuf);
 ```
 
 ## fun registry_init_with_allocator
@@ -1685,54 +1565,6 @@ whether source may carry `asm` blocks for this instruction set, whichever backen
 
 ```mach
 pub fun emits_relocations(vt: *IsaVTable) bool;
-```
-
-## def BackendKind
-
-```mach
-pub def BackendKind: u8
-```
-
-## val BACKEND_NATIVE
-
-```mach
-pub val BACKEND_NATIVE:       BackendKind = 0
-```
-
-## val BACKEND_WHOLE_MODULE
-
-```mach
-pub val BACKEND_WHOLE_MODULE: BackendKind = 1
-```
-
-## rec BackendFamily
-
-```mach
-pub rec BackendFamily;
-```
-
-## fun backend_family
-
-```mach
-pub fun backend_family(vt: *IsaVTable) BackendFamily;
-```
-
-## fun is_native
-
-```mach
-pub fun is_native(f: *BackendFamily) bool;
-```
-
-## fun is_whole_module
-
-```mach
-pub fun is_whole_module(f: *BackendFamily) bool;
-```
-
-## fun as_native
-
-```mach
-pub fun as_native(f: *BackendFamily) *RegMachine;
 ```
 
 ## fun make_sym_mod
