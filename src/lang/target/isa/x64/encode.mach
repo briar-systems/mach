@@ -2666,6 +2666,14 @@ fun encode_mir_instr(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32, mi
     if (mi.opcode == mir.MIR_PHI) {
         ret err[fail.Fail].err{fail.message(enc_named_message(st, "internal compiler error: phi survived register allocation in '", enc_fn_name(st, f), "'", "internal compiler error: phi survived register allocation"))};
     }
+    if (reads_got_memory(mi)) {
+        ret encode_through_got(st, f, fn_base, mi);
+    }
+    ret encode_selected(st, f, fn_base, mi);
+}
+
+fun encode_selected(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32, mi: *mir.MirInstr) err[fail.Fail] {
+    val opcode: u16 = mi.opcode::u16;
 
     if (mi.opcode == mir.MIR_MUL_WIDE_S || mi.opcode == mir.MIR_MUL_WIDE_U) {
         ret encode_vector_widen_mul(f, mi, ?st.buf);
@@ -2750,8 +2758,7 @@ fun encode_mir_instr(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32, mi
         ret encode_asm_block(st, f, fn_base, mi);
     }
 
-    if (opcode == x64.LEA::u16 && mi.operand_count >= 2
-        && mi.operands[1].kind == mir.MIR_OP_SYM && mi.operands[1].sym_got) {
+    if (is_got_addr(mi)) {
         ret encode_got_addr(st, f, mi);
     }
 
@@ -2810,32 +2817,114 @@ fun encode_mir_instr(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32, mi
     ret err[fail.Fail].ok{};
 }
 
-# an import's address, read from its GOT slot: mov r64, [rip + sym@GOTPCREL],
-# then the operand's offset added
-fun encode_got_addr(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) err[fail.Fail] {
-    val symop: *mir.MirOperand = ?mi.operands[1];
-    if (symop.sym == intern.STR_NIL) {
-        ret err[fail.Fail].err{fail.message("encode: GOT address-of has no resolved symbol name")};
+fun is_got_addr(mi: *mir.MirInstr) bool {
+    ret mi.opcode == x64.LEA::u32 && mi.operand_count >= 2
+        && mi.operands[1].kind == mir.MIR_OP_SYM && mi.operands[1].sym_got;
+}
+
+# a marked symbol operand that names memory rather than an address: a call or
+# jump target is the symbol's address, and so is an address-of, which
+# encode_got_addr reads from the slot itself
+fun reads_got_memory(mi: *mir.MirInstr) bool {
+    if (mi.opcode == mir.MIR_CALL || mi.opcode == x64.CALL::u32 || mi.opcode == x64.JMP::u32
+        || mi.opcode == x64.ASM_BLOCK::u32 || is_got_addr(mi)) {
+        ret false;
     }
-    val dr: res[isa.Operand, fail.Fail] = mir_to_operand(f, ?mi.operands[0], 8);
-    if (sel dr.err) { ret err[fail.Fail].err{dr.err}; }
+    var k: u32 = 0;
+    for (k < mi.operand_count) {
+        if (mi.operands[k].kind == mir.MIR_OP_SYM && mi.operands[k].sym_got) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# an import's slot address in reg: mov r64, [rip + sym@GOTPCREL]
+fun emit_got_load(st: *enc.EncodeState, reg: isa.Operand, sym: intern.StrId) err[fail.Fail] {
+    if (sym == intern.STR_NIL) {
+        ret err[fail.Fail].err{fail.message("encode: GOT slot load has no resolved symbol name")};
+    }
     var load: isa.Inst = isa.inst_blank();
     load.opcode       = x64.MOV;
-    load.dst          = dr.ok;
+    load.dst          = reg;
     load.src1         = isa.make_mem(-1, 0, -1, 0, 8);
-    load.src1.sym_id  = symop.sym;
+    load.src1.sym_id  = sym;
     load.src1.sym_mod = isa.SYM_MOD_GOT;
     load.size         = 8;
     val start: usize = st.buf.len;
     val n:     i32   = encode_inst(?load, ?st.buf);
-    if (n <= 0) { ret err[fail.Fail].err{fail.message("encode: a GOT address load produced no bytes")}; }
+    if (n <= 0) { ret err[fail.Fail].err{fail.message("encode: a GOT slot load produced no bytes")}; }
     val patch: i32 = x86_reloc_offset(nil, ?load, n);
     if (patch < 0) {
-        ret err[fail.Fail].err{fail.message("encode: a GOT address load has no relocation patch site")};
+        ret err[fail.Fail].err{fail.message("encode: a GOT slot load has no relocation patch site")};
     }
-    val pushed: err[fail.Fail] = enc.push_inst_reloc(st, (start + patch::usize)::u32, of.RK_GOTPCREL, symop.sym,
+    ret enc.push_inst_reloc(st, (start + patch::usize)::u32, of.RK_GOTPCREL, sym,
         -(n - patch)::i64, (n - patch)::u8);
-    if (sel pushed.err)     { ret err[fail.Fail].err{pushed.err}; }
+}
+
+# an instruction whose memory operand is an import, accessed through its GOT
+# slot: each slot's address is loaded into a scratch no operand names, and the
+# instruction encodes against [scratch + offset] (#4035)
+fun encode_through_got(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32, mi: *mir.MirInstr) err[fail.Fail] {
+    if (mi.operand_count > GOT_OPERAND_MAX) {
+        ret err[fail.Fail].err{fail.message("encode: an x86-64 instruction reading an import through its GOT slot has too many operands")};
+    }
+    var ops:  [GOT_OPERAND_MAX]mir.MirOperand;
+    var used: [2]i32 = [2]i32{-1, -1};
+    var k:    u32    = 0;
+    for (k < mi.operand_count) {
+        ops[k] = mi.operands[k];
+        k      = k + 1;
+    }
+    k = 0;
+    for (k < mi.operand_count) {
+        if (ops[k].kind == mir.MIR_OP_SYM && ops[k].sym_got) {
+            val sr: res[i32, fail.Fail] = got_scratch(f, mi, ?used[0]);
+            if (sel sr.err) { ret err[fail.Fail].err{sr.err}; }
+            val ld: err[fail.Fail] = emit_got_load(st, isa.make_reg(sr.ok, 8), ops[k].sym);
+            if (sel ld.err) { ret ld; }
+            ops[k] = mir.op_mem_preg(mir.preg_id(sr.ok), ops[k].sym_off);
+        }
+        k = k + 1;
+    }
+    var via: mir.MirInstr = @mi;
+    via.operands = ?ops[0];
+    ret encode_selected(st, f, fn_base, ?via);
+}
+
+val GOT_OPERAND_MAX: u32 = 4;
+
+# r11, else r10: a scratch the instruction names in no operand and no earlier
+# slot load of it took
+fun got_scratch(f: *mir.MirFunction, mi: *mir.MirInstr, used: *i32) res[i32, fail.Fail] {
+    val cands: [2]i32 = [2]i32{x64.SCRATCH_REG, x64.SCRATCH_REG2};
+    var c: u32 = 0;
+    for (c < 2) {
+        val reg:  i32  = cands[c];
+        var free: bool = used[0] != reg && used[1] != reg;
+        var k:    u32  = 0;
+        for (free && k < mi.operand_count) {
+            val o: res[isa.Operand, fail.Fail] = mir_to_operand(f, ?mi.operands[k], 8);
+            if (sel o.err) { ret res[i32, fail.Fail].err{o.err}; }
+            if (operand_touches_reg(?o.ok, reg)) { free = false; }
+            k = k + 1;
+        }
+        if (free) {
+            if (used[0] < 0) { used[0] = reg; } or { used[1] = reg; }
+            ret res[i32, fail.Fail].ok{reg};
+        }
+        c = c + 1;
+    }
+    ret res[i32, fail.Fail].err{fail.message("encode: no x86-64 scratch register is free to read an import through its GOT slot")};
+}
+
+# an import's address, read from its GOT slot: mov r64, [rip + sym@GOTPCREL],
+# then the operand's offset added
+fun encode_got_addr(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) err[fail.Fail] {
+    val symop: *mir.MirOperand = ?mi.operands[1];
+    val dr: res[isa.Operand, fail.Fail] = mir_to_operand(f, ?mi.operands[0], 8);
+    if (sel dr.err) { ret err[fail.Fail].err{dr.err}; }
+    val ld: err[fail.Fail] = emit_got_load(st, dr.ok, symop.sym);
+    if (sel ld.err)         { ret ld; }
     if (symop.sym_off == 0) { ret err[fail.Fail].ok{}; }
     if (!isa.offset_fits(32, symop.sym_off)) {
         ret err[fail.Fail].err{fail.message("encode: x86-64 GOT address offset does not fit a signed 32-bit immediate")};
@@ -2898,14 +2987,19 @@ fun emit_flag_cmp(f: *mir.MirFunction, lhs_op: *mir.MirOperand, rhs_op: *mir.Mir
 
     var cmp_lhs: isa.Operand = lhs;
     if (cmp_lhs.kind == isa.OPK_IMM) {
+        # the right side may address memory through a scratch, a GOT slot's (#4035)
+        val scratch: i32 = pick_stage_scratch(?rhs, nil);
+        if (scratch < 0) {
+            ret res[u16, fail.Fail].err{fail.message("encode: no x86-64 scratch register is free to stage a compare's immediate")};
+        }
         var ld: isa.Inst = isa.inst_blank();
         ld.opcode = x64.MOV;
-        ld.dst    = isa.make_reg(x64.R11, cwidth);
+        ld.dst    = isa.make_reg(scratch, cwidth);
         ld.src1   = lhs;
         ld.size   = cwidth;
         ld.flags  = width_flags(width);
         encode_inst(?ld, buf);
-        cmp_lhs = isa.make_reg(x64.R11, cwidth);
+        cmp_lhs = isa.make_reg(scratch, cwidth);
     }
 
     var cmp: isa.Inst = isa.inst_blank();
