@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.0.0] - 2026-09-26
+
+### Breaking
+- A test is declared with an identifier, `test parses_empty { ... }`. The string form `test "label"` is now an error, so rename each test to an identifier (`subject__case` by convention). A test's name and symbol is `<module>#<identifier>`, and `--filter` matches a substring of that name (#3954).
+- `mach test` and `mach run` take `--timeout <duration>`, such as `30s`, `500ms`, `5m` or `1h`, in place of `--timeout_seconds`. In `mach.toml`, `[step.<name>] timeout = "<duration>"` replaces `timeout_seconds`. The old flag and key are refused (#3845).
+- `--cache` is removed from `mach build` and `mach test`. The build cache is on by default, so drop the flag, and pass `--no-cache` to force an uncached build (#3786, #3806).
+- A root manifest must state its compiler range, `[project].mach` (for example `mach = "^6.0"`). A missing range was a warning and is now an error. A dependency without one is still accepted (#3671).
+- The output directory is laid out as `.cache/` for compiler state, `.cache/steps/` for step stamps, `.stage/` for step scratch and `test/<artifact>/` for each test dispatcher and its logs. The old `.steps`, `.mach-stage` and `.mach-cache` directories are no longer read. `mach clean` clears all of it (#3785).
+- `mach test --format json` is schema 2. A test event carries `name` in place of `label`, `timeout_ns` in place of `timeout_seconds`, and a new `object` field with the test's object path (#3961, #3954, #3842).
+
+### Added
+- `mach test` builds a test object per module, `obj/<project>/<module>.test.o`, beside the module's normal object, and links a small dispatcher of only the selected tests. After `mach build`, `mach test` recompiles no normal object, and editing a test rebuilds only its module's test object. `--list` prints each test's name and object path (#3842).
+- `mach test -v` reports build phase timing, as `mach build -v` does (#3841).
+
+### Changed
+- `obj/` is the object cache. Each object carries its own cache key, and the separate `.mach-cache` store is gone (#3782).
+- Each module has its own cache key, so an edit rebuilds only that module and the modules whose view of it changed. A reused module skips the front end when nothing still compiled imports it, and its recorded warnings are reported again (#3784).
+- The register allocator merges a copy whose source dies at it when the two values never overlap, on every target. x25519 runs about 7% fewer instructions (#3939).
+- The compiler's own test suite is pruned to the test policy, and the golden disassembly layer is replaced by the differential corpus against C (#3840, #3952).
+
+### Fixed
+- A warm build on windows and darwin links the same binary as a cold one. The cache now stores a lossless snapshot of the image codegen produced instead of reading it back from the COFF or Mach-O object, which lost symbol sizes, section flags and unwind frames (#3999).
+- On x86-64 the dead-code collection reaches exactly the end of the instruction a relocation sits in, so a function placed after a short callee is no longer kept alive by accident (#4003).
+- The build replaces a stale entry in its output layout, such as the 5.x test dispatcher file at `test/<artifact>`, instead of failing. A test log directory that cannot be created now fails `mach test` with the path (#4006).
+- On aarch64-darwin the caller sign- or zero-extends an integer argument narrower than 32 bits, as Apple's ABI requires, so C callees that read the full register get the right value (#3927).
+
 ## [5.13.0] - 2026-09-26
 
 ### Added
