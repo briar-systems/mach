@@ -46,3 +46,23 @@ pub fun replace(a: *A.Allocator, path: str, buf: *u8, len: usize, mode: i32) err
 replace a source-tree file through a sibling temporary and rename, so the
 destination is either the old content or the complete new content
 
+## fun mirror_fqn
+
+```mach
+pub fun mirror_fqn(a: *A.Allocator, base: *u8, fqn: str, suffix: str) res[str, outcome.Fail];
+```
+
+the file a module's output takes under `base`: its dotted name as a path,
+with `suffix` as the extension
+
+## fun through_temporary
+
+```mach
+pub fun through_temporary[C](a: *A.Allocator, destination: str, ctx: *C,
+write: fun(*C, str) err[fail.Fail]) err[outcome.Fail];
+```
+
+`write` fills a sibling temporary of `destination`, which is then renamed
+over it: a reader sees the previous file or the complete new one, never a
+torn one, and a failed write leaves the previous file and no temporary
+

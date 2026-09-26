@@ -194,7 +194,9 @@ row count of BUILD_OWN
 pub val BUILD_OWN: [BUILD_OWN_N]FlagSpec = [BUILD_OWN_N]FlagSpec;
 ```
 
-the `--cache`, `--no-cache` and `--plan` options, build only
+the `--cache`, `--no-cache` and `--plan` options, build only. `--cache`
+reads `obj/` as the object cache: a module whose object there carries the
+build's key is reused instead of lowered and generated
 
 ## val RUN_OWN_N
 
@@ -227,7 +229,8 @@ pub val TEST_OWN: [TEST_OWN_N]FlagSpec = [TEST_OWN_N]FlagSpec;
 ```
 
 the test-only options `--cache`, `--no-cache`, `--jobs`, `--filter`,
-`--include-deps`, `--list`, `--format`, `--runner`, `--timeout`
+`--include-deps`, `--list`, `--format`, `--runner`, `--timeout`.
+`--cache` reads `obj/` as the object cache, as a build does
 
 ## val DOC_OWN_N
 

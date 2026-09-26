@@ -118,11 +118,8 @@ pub fun write_objects(p: *driver.Project, images: *of.ObjectImage,
 destinations: *str, paths_out: ***u8) err[outcome.Fail];
 ```
 
-## fun mirror_fqn
-
-```mach
-pub fun mirror_fqn(a: *A.Allocator, base: *u8, fqn: str, suffix: str) res[str, outcome.Fail];
-```
+every module's object reaches `obj/` through a sibling temporary, since the
+object cache reads it back; a module the cache restored is already there
 
 ## fun free_paths
 
