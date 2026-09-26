@@ -355,6 +355,17 @@ target packs it (#3738, #3779)
 pub val OP_VEC_WIDEN_U: InstrKind = 55
 ```
 
+## val OP_MASK_LT_U
+
+```mach
+pub val OP_MASK_LT_U: InstrKind = 56
+```
+
+all ones at the result's width when operand 0 is below operand 1, unsigned,
+else zero: the branch-free range test a shift by an unproven count is
+saturated with (#3887). both operands share one integer type, the result is
+an integer of any width
+
 ## val INSTR_FLAG_NSW
 
 ```mach
@@ -393,8 +404,10 @@ a call whose aggregate arguments may name their sources rather than private copi
 pub val INSTR_FLAG_COUNT_BOUNDED: u16 = 0x20
 ```
 
-a scalar shift whose count is proven below its operand's width, so it needs
-none of the saturation a count at or above the width takes (#3885)
+a scalar shift whose count is below its operand's width: proven by the range
+analysis, or made so by the saturation shiftbound expands around it (#3885,
+#3887). lowering emits the bare machine shift for it and refuses a variable
+count without it
 
 ## rec Instruction
 
