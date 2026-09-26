@@ -167,7 +167,7 @@ pub fun collect_tests(p: *project.Project, m: *project.ModuleEntry, mid: u32, c:
 ## fun publish
 
 ```mach
-pub fun publish(p: *project.Project, m: *project.ModuleEntry, image: *of.ObjectImage) err[fail.Fail];
+pub fun publish(p: *project.Project, m: *project.ModuleEntry, image: *of.ObjectImage, back_key: u64) err[fail.Fail];
 ```
 
 a generated image carries its record into `obj/`: the key it was built

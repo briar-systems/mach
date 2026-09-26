@@ -655,3 +655,11 @@ pub fun owned_len(db: *QueryDb, owner: KeyOwner, id: u32) u32;
 
 how many products of every registered kind a module or file owns
 
+## fun product_diagnostics
+
+```mach
+pub fun product_diagnostics(db: *QueryDb, kind: QueryKind, key: u64) *diagnostic.DiagnosticStore;
+```
+
+the diagnostics a ready product carries, nil when the product is absent or has none
+
