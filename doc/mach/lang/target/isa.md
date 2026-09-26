@@ -845,6 +845,25 @@ pub fun packed_width(m: *MachineModel, op: VecOp, is_float: bool, lane_bits: u32
 
 a conversion's register holds its wider side, so that side sets the extent
 
+## fun packing_extension
+
+```mach
+pub fun packing_extension(m: *MachineModel, op: VecOp, is_float: bool, lane_bits: u32, from_bits: u32) u64;
+```
+
+the extensions a target would add to pack this cell: what the first declared
+row of the cell needs beyond the model's selection. 0 when a selected row
+packs it already or no row declares it at any extension
+
+## fun packed_row_selected_by
+
+```mach
+pub fun packed_row_selected_by(m: *MachineModel, op: VecOp, is_float: bool, lane_bits: u32, from_bits: u32, ext: u64) bool;
+```
+
+whether the model selects the row of this cell gated on exactly `ext`: the
+lowering's choice between the baseline form and an extension's instruction
+
 ## fun vector_form
 
 ```mach

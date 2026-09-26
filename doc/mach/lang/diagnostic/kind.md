@@ -86,6 +86,12 @@ pub val NOT_OBLIVIOUS:         Kind = 8
 pub val INEXACT_FLOAT_LITERAL: Kind = 9
 ```
 
+## val SCALARIZE
+
+```mach
+pub val SCALARIZE:             Kind = 10
+```
+
 ## rec Spec
 
 ```mach
@@ -95,7 +101,7 @@ pub rec Spec;
 ## val COUNT
 
 ```mach
-pub val COUNT: usize       = 9
+pub val COUNT: usize       = 10
 ```
 
 ## fun at

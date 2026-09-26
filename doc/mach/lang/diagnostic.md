@@ -311,6 +311,14 @@ one list. an append the store refuses is an internal failure; a store wired
 as nil is a compiler defect, and the text then stands as an internal failure
 rather than vanishing
 
+## fun record_warning_at
+
+```mach
+pub fun record_warning_at(store: *DiagnosticStore, k: dkind.Kind, loc: source.SrcLoc, message: str);
+```
+
+a warning of kind `k` located at `loc`, as `reject` locates an error
+
 ## fun warning
 
 ```mach
