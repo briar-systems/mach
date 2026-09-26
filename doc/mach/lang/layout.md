@@ -102,12 +102,6 @@ pub rec CheckedPowerAlignment[Unit];
 pub rec CheckedId[Domain];
 ```
 
-## rec CheckedSpan
-
-```mach
-pub rec CheckedSpan[T];
-```
-
 ## fun usize_add
 
 ```mach
