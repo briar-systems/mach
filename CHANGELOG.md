@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `mach help build` lists the `-o` path rule among its constraints: `-o` names a canonical path inside the project root, relative, with no `.` or `..` component. `doc/language/manifest.md` states the rule under `-o` names one output, and CONTRIBUTING.md has the three-stage fixpoint recipe CI runs, seeded from the verified release `.github/actions/seed-mach` pins, with stage outputs `a`, `b` and `c` that `.gitignore` covers (#3863).
+- The installers' banner is the current mach identity: the chevron-and-dot mark beside the `mach` wordmark, in plain ASCII, identical in `dist/install.sh` and `dist/install.ps1` (#3869).
 
 ### Fixed
 - On riscv64 the constant-time check no longer reads the divide-by-zero guard of a `/` or `%` as a branch to the function's first block. The guard `bne divisor, zero, 8` skips its `ebreak`, but its note carried no target, so the walk over the emitted instructions joined its state into block 0 and dropped the state at the divide past the trap. mach-crypto's `aes.software.expand` was refused in debug at `if (key_len == AES256_KEY_SIZE)` once `generated % key_len` put a secret in the register that later held `key_len`, and an instruction after the trap was checked with no taint at all. `emit_b` and `emit_j` now note a displacement they are given as a skip inside the expansion, so the guard lands on the divide, and the signed guard's `INT_MIN / -1` skip does too (#3847).
