@@ -15,6 +15,7 @@ terminates it after the duration
 argv: the full process arguments
 inv: the parsed invocation for this command
 ret: the program's exit code; 128 plus the signal number when it was killed by a signal;
-      3 when the timeout expired; 1 for a usage error, a missing or non-executable artifact,
-      or a spawn or wait failure; 2 out of memory
+      exit.TIMEOUT when the timeout expired; otherwise the shared code of mach's own failure:
+      exit.USER for a usage error or a missing or non-executable artifact, exit.ENVIRONMENT
+      for a spawn or wait failure, exit.INTERNAL out of memory
 
