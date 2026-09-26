@@ -8,9 +8,10 @@ long long c_narrow(unsigned char a, signed char b, unsigned short c, short d, lo
     return (long long)a + (long long)b * 1000 + (long long)c * 1000000 + (long long)d * 10000000000LL + next;
 }
 
-/* on aarch64-darwin the four narrow arguments arrive extended to 32 bits, so read
- * each whole w register; elsewhere the convention defines only the narrow bits */
-#if defined(__APPLE__) && defined(__aarch64__)
+/* on aarch64-darwin and x86-64 System V the four narrow arguments arrive extended to
+ * 32 bits, so read each whole 32-bit register; elsewhere the convention defines only
+ * the narrow bits */
+#if (defined(__APPLE__) && defined(__aarch64__)) || (defined(__x86_64__) && !defined(_WIN32))
 typedef unsigned int w_u8;
 typedef int w_i8;
 typedef unsigned int w_u16;
