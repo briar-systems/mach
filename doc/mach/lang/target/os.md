@@ -373,6 +373,12 @@ pub fun natural_stack_args_for(vt: *OsVTable, arch_id: u32) bool;
 pub fun reg_arg_align_for(vt: *OsVTable, arch_id: u32) u32;
 ```
 
+## fun reg_arg_extend_for
+
+```mach
+pub fun reg_arg_extend_for(vt: *OsVTable, arch_id: u32) u32;
+```
+
 ## fun va_list_checked_for
 
 ```mach
