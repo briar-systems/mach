@@ -136,17 +136,11 @@ pub rec AsmSink;
 ## def AsmNote
 
 ```mach
-pub def AsmNote:   notes.AsmNote
+pub def AsmNote: notes.AsmNote
 ```
 
 the stream records live in notes.mach so the walk that consumes them can
 sit beside the driver instead of inside it; the names stay reachable here
-
-## def NoteSeeds
-
-```mach
-pub def NoteSeeds: notes.NoteSeeds
-```
 
 ## val ASM_NOTE_INST
 

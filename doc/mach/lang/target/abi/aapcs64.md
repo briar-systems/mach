@@ -72,30 +72,6 @@ pub val RED_ZONE:    u32 = 0
 pub val MAX_REG_RET: u64 = 16
 ```
 
-## def ArgPassingFn
-
-```mach
-pub def ArgPassingFn: abi.ArgPassingFn
-```
-
-## def RetPassingFn
-
-```mach
-pub def RetPassingFn: abi.RetPassingFn
-```
-
-## def RegFileFn
-
-```mach
-pub def RegFileFn:    abi.RegFileFn
-```
-
-## def VaModelFn
-
-```mach
-pub def VaModelFn:    abi.VaModelFn
-```
-
 ## val WORD
 
 ```mach

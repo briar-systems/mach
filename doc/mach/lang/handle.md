@@ -103,12 +103,6 @@ pub rec HandleId[Domain];
 pub rec HandleTable[T, Domain];
 ```
 
-## rec HandleView
-
-```mach
-pub rec HandleView[T, Domain];
-```
-
 ## rec HandleEditor
 
 ```mach
