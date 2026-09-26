@@ -1550,11 +1550,15 @@ rec DyingCopy {
 # hulls that meet at the copy, so no position gains a value. a position where
 # one side's last read meets the other's definition is shared only when the
 # instruction reads before it writes, the rule the scan's hand-off applies,
-# so a merge never makes a two-address op clobber its own operand. the
-# constraints a register must meet (calls, argument windows, definitions,
-# pins and the reload guarantee) apply to the merged value as the rounds
-# place it. the copies are taken hottest first, so a loop's copy is not lost
-# to a colder one that would merge a value it meets
+# so a merge never makes a two-address op clobber its own operand. a merge
+# must also leave the scan's choices where they were: only copies inside a
+# loop are taken, one web's hull must lie inside the other's, a value held
+# across a call does not join one that is not, and a value copied from or
+# into a physical register keeps its own hint. the constraints a register
+# must meet (calls, argument windows, definitions, pins and the reload
+# guarantee) apply to the merged value as the rounds place it. the copies are
+# taken hottest first, so a loop's copy is not lost to a colder one that
+# would merge a value it meets
 fun coalesce_dying_copies(tgt: *target.Target, ctx: *AllocCtx) err[fail.Fail] {
     val nv: u32 = ctx.f.vreg_count;
     if (nv == 0 || tgt.arch.is_reg_move == nil) { ret err[fail.Fail].ok{}; }
@@ -1572,6 +1576,8 @@ fun coalesce_dying_copies(tgt: *target.Target, ctx: *AllocCtx) err[fail.Fail] {
     build_ranges(ctx);
     val lv: err[fail.Fail] = extend_liveness(ctx, true);
     if (sel lv.err) { ret lv; }
+    val mc: err[fail.Fail] = mark_call_crossing(ctx);
+    if (sel mc.err) { ret mc; }
 
     var count: u32 = 0;
     var pos:   u32 = 0;
@@ -1604,12 +1610,18 @@ fun coalesce_dying_copies(tgt: *target.Target, ctx: *AllocCtx) err[fail.Fail] {
     if (sel rn.err) { ret err[fail.Fail].err{fail.refused(rn.err)}; }
     val next: *u32 = rn.ok;
     fin { A.deallocate[u32](ctx.alloc, next, nv::usize); }
+    val rb: res[*bool, A.Error] = A.allocate[bool](ctx.alloc, nv::usize);
+    if (sel rb.err) { ret err[fail.Fail].err{fail.refused(rb.err)}; }
+    val pinned: *bool = rb.ok;
+    fin { A.deallocate[bool](ctx.alloc, pinned, nv::usize); }
     var i: u32 = 0;
     for (i < nv) {
         parent[i] = i;
         next[i]   = i;
+        pinned[i] = false;
         i         = i + 1;
     }
+    mark_register_copies(tgt, ctx, pinned);
 
     var merged: bool = false;
     var c:      u32  = 0;
@@ -1617,7 +1629,9 @@ fun coalesce_dying_copies(tgt: *target.Target, ctx: *AllocCtx) err[fail.Fail] {
         val mi: *mir.MirInstr = flat_instr(ctx, copies[c].pos);
         val rd: u32           = web_find(parent, mi.operands[0].vreg.n);
         val rs: u32           = web_find(parent, mi.operands[1].vreg.n);
-        if (rd != rs && !webs_meet(ctx, next, rd, rs)) {
+        if (rd != rs && !web_any(next, pinned, rd) && !web_any(next, pinned, rs)
+            && web_calls(ctx, next, rd) == web_calls(ctx, next, rs) && hulls_nest(ctx, next, rd, rs)
+            && !webs_meet(ctx, next, rd, rs)) {
             parent[rd] = rs;
             # splice the two member rings into one
             val t: u32 = next[rd];
@@ -1636,7 +1650,8 @@ fun coalesce_dying_copies(tgt: *target.Target, ctx: *AllocCtx) err[fail.Fail] {
 # source's segment ends at it
 fun dying_copy(tgt: *target.Target, ctx: *AllocCtx, pos: u32) bool {
     val mi: *mir.MirInstr = flat_instr(ctx, pos);
-    if (!mergeable_copy(tgt, ctx, mi)) { ret false; }
+    if (!mergeable_copy(tgt, ctx, mi))             { ret false; }
+    if (ctx.block_depth[ctx.flat[pos].block] == 0) { ret false; }
     ret dies_at(ctx, mi.operands[1].vreg.n, pos::i64);
 }
 
@@ -1668,6 +1683,67 @@ fun mergeable_copy(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr) bool 
     val dv: *mir.MirVReg = ?ctx.f.vregs[d];
     val sv: *mir.MirVReg = ?ctx.f.vregs[s];
     ret dv.class == sv.class && dv.secret == sv.secret && dv.vector == sv.vector;
+}
+
+# the values copied from or into a physical register
+fun mark_register_copies(tgt: *target.Target, ctx: *AllocCtx, pinned: *bool) {
+    var pos: u32 = 0;
+    for (pos < ctx.flat_count) {
+        val mi: *mir.MirInstr = flat_instr(ctx, pos);
+        if (instr_is_reg_copy(tgt, mi)) {
+            val d: *mir.MirOperand = ?mi.operands[0];
+            val s: *mir.MirOperand = ?mi.operands[1];
+            if (d.kind == mir.MIR_OP_VREG && s.kind == mir.MIR_OP_PREG && d.vreg.n < ctx.f.vreg_count) { pinned[d.vreg.n] = true; }
+            if (d.kind == mir.MIR_OP_PREG && s.kind == mir.MIR_OP_VREG && s.vreg.n < ctx.f.vreg_count) { pinned[s.vreg.n] = true; }
+        }
+        pos = pos + 1;
+    }
+}
+
+fun web_any(next: *u32, flag: *bool, a: u32) bool {
+    var x: u32 = a;
+    for (true) {
+        if (flag[x]) { ret true; }
+        x = next[x];
+        if (x == a) { brk; }
+    }
+    ret false;
+}
+
+fun web_hull(ctx: *AllocCtx, next: *u32, a: u32, lo: *i64, hi: *i64) {
+    @lo = POS_MAX;
+    @hi = -1;
+    var x: u32 = a;
+    for (true) {
+        if (ctx.ranges[x].start < @lo)   { @lo = ctx.ranges[x].start; }
+        if (ctx.ranges[x].end_pos > @hi) { @hi = ctx.ranges[x].end_pos; }
+        x = next[x];
+        if (x == a) { brk; }
+    }
+}
+
+# whether one web's hull lies inside the other's, so the merged value spans
+# no position that one of them did not already span
+fun hulls_nest(ctx: *AllocCtx, next: *u32, a: u32, b: u32) bool {
+    var alo: i64 = 0;
+    var ahi: i64 = 0;
+    var blo: i64 = 0;
+    var bhi: i64 = 0;
+    web_hull(ctx, next, a, ?alo, ?ahi);
+    web_hull(ctx, next, b, ?blo, ?bhi);
+    ret (alo <= blo && bhi <= ahi) || (blo <= alo && ahi <= bhi);
+}
+
+# whether a call lies inside some value of the web, where a caller-saved
+# register cannot carry it
+fun web_calls(ctx: *AllocCtx, next: *u32, a: u32) bool {
+    var x: u32 = a;
+    for (true) {
+        if (ctx.ranges[x].call_inside) { ret true; }
+        x = next[x];
+        if (x == a) { brk; }
+    }
+    ret false;
 }
 
 # whether any value of one web meets any value of the other; each value's
@@ -6712,8 +6788,8 @@ fun t_dying_loop_case(isa_name: str, abi_name: str, op: mir.MirOpcode, left: u32
     t_block(?alloc, ?blocks[0], 3);
     blocks[0].id         = 0;
     blocks[0].pred_count = 0;
-    t_mov(?alloc, ?blocks[0], 0, mir.op_vreg(mir.vreg_id(0)), mir.op_preg(mir.preg_id(3)));
-    t_mov(?alloc, ?blocks[0], 1, mir.op_vreg(mir.vreg_id(2)), mir.op_preg(mir.preg_id(4)));
+    t_mov(?alloc, ?blocks[0], 0, mir.op_vreg(mir.vreg_id(0)), mir.op_imm(3));
+    t_mov(?alloc, ?blocks[0], 1, mir.op_vreg(mir.vreg_id(2)), mir.op_imm(4));
     t_op(?alloc, ?blocks[0], 2, mir.MIR_BR, mir.op_block(1), mir.op_imm(0), mir.op_imm(0), 1);
     var body: u32 = 3;
     if (late_read) { body = 4; }
@@ -6724,7 +6800,7 @@ fun t_dying_loop_case(isa_name: str, abi_name: str, op: mir.MirOpcode, left: u32
     t_op(?alloc, ?blocks[1], 0, op, mir.op_vreg(mir.vreg_id(1)), mir.op_vreg(mir.vreg_id(left)), mir.op_vreg(mir.vreg_id(right)), 3);
     var at: u32 = 1;
     if (late_read) {
-        t_mov(?alloc, ?blocks[1], 1, mir.op_preg(mir.preg_id(5)), mir.op_vreg(mir.vreg_id(0)));
+        t_op(?alloc, ?blocks[1], 1, mir.MIR_STORE, mir.op_mem_value(mir.vreg_id(2), 0), mir.op_vreg(mir.vreg_id(0)), mir.op_imm(0), 2);
         at = 2;
     }
     t_mov(?alloc, ?blocks[1], at, mir.op_vreg(mir.vreg_id(0)), mir.op_vreg(mir.vreg_id(1)));
@@ -6733,8 +6809,8 @@ fun t_dying_loop_case(isa_name: str, abi_name: str, op: mir.MirOpcode, left: u32
     blocks[2].id         = 2;
     blocks[2].preds      = ?preds[2];
     blocks[2].pred_count = 1;
-    t_mov(?alloc, ?blocks[2], 0, mir.op_preg(mir.preg_id(0)), mir.op_vreg(mir.vreg_id(0)));
-    t_mov(?alloc, ?blocks[2], 1, mir.op_preg(mir.preg_id(1)), mir.op_vreg(mir.vreg_id(2)));
+    t_op(?alloc, ?blocks[2], 0, mir.MIR_SEL_ADD, mir.op_vreg(mir.vreg_id(2)), mir.op_vreg(mir.vreg_id(2)), mir.op_vreg(mir.vreg_id(0)), 3);
+    t_op(?alloc, ?blocks[2], 1, mir.MIR_STORE, mir.op_mem_value(mir.vreg_id(2), 0), mir.op_imm(0), mir.op_imm(0), 2);
     t_op(?alloc, ?blocks[2], 2, mir.MIR_RET, mir.op_imm(0), mir.op_imm(0), mir.op_imm(0), 0);
     f.blocks           = ?blocks[0];
     f.block_count      = 3;
