@@ -8,6 +8,14 @@ pub fun omitted(a: *ast.Ast, text: str, out: *Vector[token.Span]) err[fail.Fail]
 
 the omitted bodies of `a`, in source order
 
+## fun tests
+
+```mach
+pub fun tests(a: *ast.Ast, text: str, out: *Vector[token.Span]) err[fail.Fail];
+```
+
+the test declarations of `a`, whole, in source order
+
 ## fun write
 
 ```mach

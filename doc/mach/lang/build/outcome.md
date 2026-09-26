@@ -291,6 +291,9 @@ pub rec Artifact;
 pub rec TestArtifact;
 ```
 
+a collected test: its qualified name, where it is declared, the test object
+that holds it, and the dispatcher that runs it as `<exe> <idx>`
+
 ## rec BuildUnitEvent
 
 ```mach
@@ -395,8 +398,10 @@ made before the refusal
 ## fun record_test
 
 ```mach
-pub fun record_test(bo: *BuildOutcome, module: str, name: str, file: str, line: u32, exe: str, idx: u32) err[A.Error];
+pub fun record_test(bo: *BuildOutcome, t: TestArtifact) err[A.Error];
 ```
+
+t's text is borrowed; the outcome keeps its own copy. a nil text stays nil
 
 ## fun record_unit
 
