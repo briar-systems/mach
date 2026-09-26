@@ -94,6 +94,11 @@ fresh generation.
 the C reference, and `bash test/run.sh --link` the link cases; see
 [test/README.md](test/README.md).
 
+### Test policy
+
+What earns a test, and where it sits, is set by the
+[test policy](doc/language/test.md#test-policy).
+
 
 ## Branching
 

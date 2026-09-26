@@ -1,9 +1,10 @@
 # `test` — test declaration
 
 A `test` declaration names a block of statements the test runner can
-execute on its own. Tests live alongside the code they exercise: any
-module may declare them, and `mach test` collects every test in the
-selected artifact's closure into a single test binary.
+execute on its own. Any module may declare them, and `mach test` collects
+every test in the selected artifact's closure into a single test binary.
+What earns a test, and where it sits, is set by the
+[test policy](#test-policy).
 
 ## Grammar
 
@@ -224,11 +225,10 @@ artifact's closure, the same module set `mach build` compiles for it, and runs
 the tests declared there. Each run tests one artifact, so `$bin.name` in a test
 block, and in every module the run compiles, is the artifact under test.
 
-Tests live inline alongside the code they cover: a `test "..." { }` declaration
-in a module the artifact reaches runs with no further wiring. A module that
-exists only for tests, a suite too large to sit beside the code or a harness
-that drives the whole compiler, is reached by no artifact and so never runs on
-its own. Give such modules a **test artifact**: an ordinary library artifact
+An inline `test "..." { }` declaration in a module the artifact reaches runs
+with no further wiring. A module that exists only for tests, such as a suite
+that exercises several modules together, is reached by no artifact and so never
+runs on its own. Give such modules a **test artifact**: an ordinary library artifact
 whose entry `use`s each of them, tested by name.
 
 ```toml
@@ -265,6 +265,36 @@ because a library artifact's closure is all the test dispatcher links. Marking
 `app` `default = true` keeps `mach build .` and `mach check .` to `app`, since with
 no selector they take the marked artifacts; `mach build . --lib tests` builds the
 test artifact.
+
+## Test policy
+
+A change does not need a test of its own. A unit test exists only if it:
+
+- covers a unique surface, duplicating no other test
+- covers functionality critical to correctness that cannot be allowed to break
+- is deterministic, never depending on timing or performance
+- is valuable to check automatically
+- covers logic that is not blatantly simple
+- checks correctness
+- is no more complicated than the code it tests, unless that is unavoidable
+- does not pin a problem that no longer exists
+
+Coverage means branches and known failure points, not volume. `str_len` gets
+the inputs that exercise each of its branches, not a pile of strings, and a
+parser's tests cover its surface concisely, not exhaustively.
+
+Inline tests are small and sit in their module for convenience or because they
+need private access. A test lives outside the module it covers to declutter it,
+because the test is significant, or, most often, because it exercises several
+modules together (see [Which tests run](#which-tests-run)).
+
+Regression tests are a separate kind, and rare: they are kept only for
+regressions that are easy to reintroduce, and are named `regression__*`. They
+may sit next to unit tests. The name is a convention, not a mechanism.
+
+The compiler's codegen corpus and link cases get the same scrutiny, scoped to
+what cannot be tested inside the compiler: the final codegen and link result on
+disk.
 
 ## See also
 
