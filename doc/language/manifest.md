@@ -1961,8 +1961,9 @@ tree it was asked to build.
 Every cell is attempted; a failure does not abandon the ones after it. Each cell's
 diagnostics are reported under its own heading as it happens, and every cell that
 succeeded leaves its artifact on disk at its own path — nothing is rolled back. The
-exit code is `0` when all cells succeeded, `2` if the first failure was an internal
-error, and `1` otherwise.
+exit code is `0` when all cells succeeded, and otherwise the code of the worst failure
+among them: `2` when any cell failed internally, else `3` when any failed for the
+environment, and `1` otherwise.
 
 Artifacts cannot share an output path: a manifest whose expanded `out` templates
 collide is rejected before the build starts.

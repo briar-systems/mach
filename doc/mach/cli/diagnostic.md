@@ -34,7 +34,7 @@ print a Fail to stderr as "error: <message>" and map it to an exit code
 a reported Fail prints nothing, its diagnostics having been rendered already
 
 f: the Fail
-ret: 1 for reported and user failures, 2 for internal, 3 for environment
+ret: the exit code `exit.of` maps the failure to
 
 ## fun outcome_code_w
 
@@ -45,7 +45,7 @@ pub fun outcome_code_w(w: *writer.Writer, bo: *outcome.BuildOutcome) i64;
 map a build outcome's severity to the process exit code
 
 bo: the outcome
-ret: 0 ok, 1 user, 2 internal, 3 environment; a severity outside the catalog
+ret: the shared exit code of the severity; a severity outside the catalog
 is an internal failure written to `w` naming the catalog and the tag
 
 ## fun outcome_code

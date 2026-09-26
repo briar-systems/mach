@@ -50,5 +50,5 @@ not an error; "nothing to clean" prints when nothing was removed
 
 argv: the full process arguments
 inv: the parsed invocation for this command
-ret: 0 success, 1 manifest error, 2 allocator, read, or removal failure
+ret: 0 success, 1 manifest error or escaping target, 2 allocator failure, 3 read or removal failure
 
