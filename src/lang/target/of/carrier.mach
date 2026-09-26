@@ -1,0 +1,888 @@
+# mach's link carrier: what the link needs to treat a mach-built object as the
+# image codegen made and its native format cannot spell. a writer describes the
+# image it serializes when that image is a codegen image, the parser applies
+# the carrier after its own decode, and an object that carries one is a codegen
+# image. foreign objects carry none and keep their native reading.
+#
+# the described sections are the first sections of the serialized image. each
+# names where it lies in the image the parser reads back (a host section and an
+# offset there), which is itself unless the format merged sections, as mach-o
+# does. symbols, relocations and frames name described sections. the tables
+# are optional so a format carries only what it cannot say: section flags and
+# placement, symbol sizes and types, the instruction end of a relocation and
+# unwind frames.
+#
+# the layout is `u32 magic`, `u32 tables`, then per present table its count
+# and entries: a section `host, offset, len, align, flags`, a symbol
+# `section, offset, size, flags` then its name's length and bytes, a
+# relocation `section, offset` and its `u8` instruction end, a frame
+# `section, offset, step count` then per step `u8 kind, u8 reg, u32 end, u64
+# value`. every number is little-endian
+
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.target.of;
+use mach.lang.target.of.bin;
+use mach.lang.target.of.exports;
+use std.collections.sort;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+
+# the section elf and coff carry it in; mach-o spells it `__MACH,__mach_link`
+pub val SECTION_NAME: str = ".mach.link";
+
+val MAGIC: u32 = 0x314B4C4D;
+
+# the tables a carrier may hold, one bit each
+pub val TABLE_SECTIONS: u32 = 0x1;
+pub val TABLE_SYMBOLS:  u32 = 0x2;
+pub val TABLE_RELOCS:   u32 = 0x4;
+pub val TABLE_FRAMES:   u32 = 0x8;
+
+val TABLE_ALL: u32 = TABLE_SECTIONS | TABLE_SYMBOLS | TABLE_RELOCS | TABLE_FRAMES;
+
+# the symbol flags the carrier restores; the rest the native format spells
+val SYMBOL_TYPE: u32 = of.SYM_OBJ_FLAG_FUNCTION | of.SYM_OBJ_FLAG_OBJECT | of.SYM_OBJ_FLAG_SIZE_UNKNOWN;
+
+val SECTION_MIN: usize = 20;
+val SYMBOL_MIN:  usize = 20;
+val RELOC_MIN:   usize = 9;
+val FRAME_MIN:   usize = 12;
+val STEP_SIZE:   usize = 14;
+
+# where a described section lies in the image the parser reads back
+pub rec Host {
+    section: u32;
+    offset:  u32;
+}
+
+rec Sink {
+    buf: *u8;
+    pos: usize;
+    bad: bool;
+}
+
+fun put_u8(w: *Sink, v: u8) {
+    if (w.buf != nil) { w.buf[w.pos] = v; }
+    w.pos = w.pos + 1;
+}
+
+fun put_u32(w: *Sink, v: u32) {
+    if (w.buf != nil) { bin.write_u32_le(w.buf, w.pos, v); }
+    w.pos = w.pos + 4;
+}
+
+fun put_u64(w: *Sink, v: u64) {
+    if (w.buf != nil) { bin.write_u64_le(w.buf, w.pos, v); }
+    w.pos = w.pos + 8;
+}
+
+fun described_symbol(img: *of.ObjectImage, sym: *of.Symbol, described: u32) bool {
+    if (of.section_is_external(sym.section) || of.section_is_absolute(sym.section)) { ret false; }
+    ret of.section_index(sym.section) < described && sym.name != intern.STR_NIL;
+}
+
+fun described_reloc(r: *of.Relocation, described: u32) bool {
+    ret r.inst_end != 0 && !of.section_is_external(r.section) && of.section_index(r.section) < described;
+}
+
+fun put_carrier(w: *Sink, img: *of.ObjectImage, described: u32, hosts: *Host, tables: u32) {
+    put_u32(w, MAGIC);
+    put_u32(w, tables);
+    var i: u32 = 0;
+    if ((tables & TABLE_SECTIONS) != 0) {
+        put_u32(w, described);
+        for (i < described) {
+            val sec: *of.Section = ?img.sections[i];
+            if (hosts != nil) {
+                put_u32(w, hosts[i].section);
+                put_u32(w, hosts[i].offset);
+            }
+            or {
+                put_u32(w, i);
+                put_u32(w, 0);
+            }
+            put_u32(w, sec.len);
+            put_u32(w, sec.align);
+            # coalescing groups generated sections for a writer; a parsed
+            # section is native and is not grouped again
+            put_u32(w, sec.flags & ~of.SEC_FLAG_COALESCE);
+            i = i + 1;
+        }
+    }
+    if ((tables & TABLE_SYMBOLS) != 0) {
+        var n: u32 = 0;
+        i = 0;
+        for (i < img.symbol_count) {
+            if (described_symbol(img, ?img.symbols[i], described)) { n = n + 1; }
+            i = i + 1;
+        }
+        put_u32(w, n);
+        i = 0;
+        for (i < img.symbol_count) {
+            val sym: *of.Symbol = ?img.symbols[i];
+            if (!described_symbol(img, sym, described)) {
+                i = i + 1;
+                cnt;
+            }
+            put_u32(w, of.section_index(sym.section));
+            put_u32(w, sym.offset);
+            put_u32(w, sym.size);
+            put_u32(w, sym.flags & SYMBOL_TYPE);
+            val text: opt[str] = intern.lookup(img.interner, sym.name);
+            if (sel text.some) {
+                val len: usize = str_len(text.some);
+                put_u32(w, len::u32);
+                if (w.buf != nil && len > 0) { memory.raw_copy((w.buf::usize + w.pos)::ptr, text.some::ptr, len); }
+                w.pos = w.pos + len;
+            }
+            or {
+                w.bad = true;
+                put_u32(w, 0);
+            }
+            i = i + 1;
+        }
+    }
+    if ((tables & TABLE_RELOCS) != 0) {
+        var n: u32 = 0;
+        i = 0;
+        for (i < img.reloc_count) {
+            if (described_reloc(?img.relocations[i], described)) { n = n + 1; }
+            i = i + 1;
+        }
+        put_u32(w, n);
+        i = 0;
+        for (i < img.reloc_count) {
+            val r: *of.Relocation = ?img.relocations[i];
+            if (described_reloc(r, described)) {
+                put_u32(w, of.section_index(r.section));
+                put_u32(w, r.offset);
+                put_u8(w, r.inst_end);
+            }
+            i = i + 1;
+        }
+    }
+    if ((tables & TABLE_FRAMES) != 0) {
+        var n: u32 = 0;
+        i = 0;
+        for (i < img.frame_count) {
+            if (of.section_index(img.frames[i].section) < described) { n = n + 1; }
+            i = i + 1;
+        }
+        put_u32(w, n);
+        i = 0;
+        for (i < img.frame_count) {
+            val fr: *of.FrameUnwind = ?img.frames[i];
+            if (of.section_index(fr.section) >= described) {
+                i = i + 1;
+                cnt;
+            }
+            if (fr.step_count > of.FRAME_STEP_CAP) { w.bad = true; }
+            put_u32(w, of.section_index(fr.section));
+            put_u32(w, fr.offset);
+            put_u32(w, fr.step_count);
+            var k: u32 = 0;
+            for (k < fr.step_count && k < of.FRAME_STEP_CAP) {
+                put_u8(w, fr.steps[k].kind);
+                put_u8(w, fr.steps[k].reg);
+                put_u32(w, fr.steps[k].end_off);
+                put_u64(w, fr.steps[k].value);
+                k = k + 1;
+            }
+            i = i + 1;
+        }
+    }
+}
+
+# the carrier of img's first `described` sections, holding `tables`; `hosts`
+# places each described section in the parsed image, nil when each is itself.
+# the caller owns the bytes
+pub fun encode(alloc: *A.Allocator, img: *of.ObjectImage, described: u32, hosts: *Host,
+    tables: u32, out_bytes: **u8, out_len: *u32) err[fail.Fail] {
+    @out_bytes = nil;
+    @out_len   = 0;
+    if (described > img.section_count || (tables & ~TABLE_ALL) != 0) {
+        ret err[fail.Fail].err{fail.message("of: link carrier describes sections the image does not hold")};
+    }
+    var measure: Sink = Sink{buf: nil, pos: 0, bad: false};
+    put_carrier(?measure, img, described, hosts, tables);
+    if (measure.bad)              { ret err[fail.Fail].err{fail.message("of: link carrier cannot spell a symbol name or a frame")}; }
+    if (measure.pos > 0xFFFFFFFF) { ret err[fail.Fail].err{fail.message("of: link carrier exceeds the section size field")}; }
+    val allocated: res[*u8, A.Error] = A.allocate[u8](alloc, measure.pos);
+    if (sel allocated.err) { ret err[fail.Fail].err{fail.refused(allocated.err)}; }
+    var w: Sink = Sink{buf: allocated.ok, pos: 0, bad: false};
+    put_carrier(?w, img, described, hosts, tables);
+    @out_bytes = allocated.ok;
+    @out_len   = measure.pos::u32;
+    ret err[fail.Fail].ok{};
+}
+
+rec Source {
+    data: *u8;
+    len:  usize;
+    pos:  usize;
+    bad:  bool;
+}
+
+fun take_u8(r: *Source) u8 {
+    if (r.bad || r.len - r.pos < 1) {
+        r.bad = true;
+        ret 0;
+    }
+    val v: u8 = r.data[r.pos];
+    r.pos = r.pos + 1;
+    ret v;
+}
+
+fun take_u32(r: *Source) u32 {
+    if (r.bad || r.len - r.pos < 4) {
+        r.bad = true;
+        ret 0;
+    }
+    val v: u32 = bin.read_u32_le(r.data, r.pos);
+    r.pos = r.pos + 4;
+    ret v;
+}
+
+fun take_u64(r: *Source) u64 {
+    if (r.bad || r.len - r.pos < 8) {
+        r.bad = true;
+        ret 0;
+    }
+    val v: u64 = bin.read_u64_le(r.data, r.pos);
+    r.pos = r.pos + 8;
+    ret v;
+}
+
+fun take_count(r: *Source, min: usize) u32 {
+    val n: u32 = take_u32(r);
+    if (!r.bad && n::usize > (r.len - r.pos) / min) { r.bad = true; }
+    if (r.bad)                                      { ret 0; }
+    ret n;
+}
+
+rec SectionEntry {
+    host:   u32;
+    offset: u32;
+    len:    u32;
+    align:  u32;
+    flags:  u32;
+}
+
+rec SymbolEntry {
+    section: u32;
+    offset:  u32;
+    size:    u32;
+    flags:   u32;
+    name:    intern.StrId;
+}
+
+rec RelocEntry {
+    section:  u32;
+    offset:   u32;
+    inst_end: u8;
+}
+
+rec Decoded {
+    alloc:         *A.Allocator;
+    tables:        u32;
+    sections:      *SectionEntry;
+    section_count: u32;
+    symbols:       *SymbolEntry;
+    symbol_count:  u32;
+    relocs:        *RelocEntry;
+    reloc_count:   u32;
+    frames:        *of.FrameUnwind;
+    frame_count:   u32;
+}
+
+fun decoded_dnit(d: *Decoded) {
+    if (d.sections != nil) { A.deallocate[SectionEntry](d.alloc, d.sections, d.section_count::usize); }
+    if (d.symbols != nil)  { A.deallocate[SymbolEntry](d.alloc, d.symbols, d.symbol_count::usize); }
+    if (d.relocs != nil)   { A.deallocate[RelocEntry](d.alloc, d.relocs, d.reloc_count::usize); }
+    if (d.frames != nil)   { A.deallocate[of.FrameUnwind](d.alloc, d.frames, d.frame_count::usize); }
+}
+
+fun malformed() err[fail.Fail] {
+    ret err[fail.Fail].err{fail.message("of: malformed link carrier")};
+}
+
+fun decode(itn: *intern.Interner, bytes: *u8, len: usize, d: *Decoded) err[fail.Fail] {
+    var r: Source = Source{data: bytes, len: len, pos: 0, bad: false};
+    if (take_u32(?r) != MAGIC) { ret err[fail.Fail].err{fail.message("of: unsupported link carrier")}; }
+    d.tables = take_u32(?r);
+    if (r.bad || (d.tables & ~TABLE_ALL) != 0) { ret malformed(); }
+    var i: u32 = 0;
+    if ((d.tables & TABLE_SECTIONS) != 0) {
+        val n: u32 = take_count(?r, SECTION_MIN);
+        if (r.bad) { ret malformed(); }
+        if (n > 0) {
+            val got: res[*SectionEntry, A.Error] = A.zallocate[SectionEntry](d.alloc, n::usize);
+            if (sel got.err) { ret err[fail.Fail].err{fail.refused(got.err)}; }
+            d.sections      = got.ok;
+            d.section_count = n;
+        }
+        for (i < n) {
+            d.sections[i].host   = take_u32(?r);
+            d.sections[i].offset = take_u32(?r);
+            d.sections[i].len    = take_u32(?r);
+            d.sections[i].align  = take_u32(?r);
+            d.sections[i].flags  = take_u32(?r);
+            i                    = i + 1;
+        }
+    }
+    if ((d.tables & TABLE_SYMBOLS) != 0) {
+        val n: u32 = take_count(?r, SYMBOL_MIN);
+        if (r.bad) { ret malformed(); }
+        if (n > 0) {
+            val got: res[*SymbolEntry, A.Error] = A.zallocate[SymbolEntry](d.alloc, n::usize);
+            if (sel got.err) { ret err[fail.Fail].err{fail.refused(got.err)}; }
+            d.symbols      = got.ok;
+            d.symbol_count = n;
+        }
+        i = 0;
+        for (i < n && !r.bad) {
+            d.symbols[i].section = take_u32(?r);
+            d.symbols[i].offset  = take_u32(?r);
+            d.symbols[i].size    = take_u32(?r);
+            d.symbols[i].flags   = take_u32(?r);
+            val nlen: u32 = take_u32(?r);
+            if (r.bad || nlen == 0 || nlen::usize > r.len - r.pos) { ret malformed(); }
+            val id: res[intern.StrId, A.Error] = intern.intern_bytes(itn, (r.data::usize + r.pos)::str, nlen::usize);
+            if (sel id.err) { ret err[fail.Fail].err{fail.refused(id.err)}; }
+            d.symbols[i].name = id.ok;
+            r.pos             = r.pos + nlen::usize;
+            i                 = i + 1;
+        }
+    }
+    if ((d.tables & TABLE_RELOCS) != 0) {
+        val n: u32 = take_count(?r, RELOC_MIN);
+        if (r.bad) { ret malformed(); }
+        if (n > 0) {
+            val got: res[*RelocEntry, A.Error] = A.zallocate[RelocEntry](d.alloc, n::usize);
+            if (sel got.err) { ret err[fail.Fail].err{fail.refused(got.err)}; }
+            d.relocs      = got.ok;
+            d.reloc_count = n;
+        }
+        i = 0;
+        for (i < n) {
+            d.relocs[i].section  = take_u32(?r);
+            d.relocs[i].offset   = take_u32(?r);
+            d.relocs[i].inst_end = take_u8(?r);
+            i                    = i + 1;
+        }
+    }
+    if ((d.tables & TABLE_FRAMES) != 0) {
+        val n: u32 = take_count(?r, FRAME_MIN);
+        if (r.bad) { ret malformed(); }
+        if (n > 0) {
+            val got: res[*of.FrameUnwind, A.Error] = A.zallocate[of.FrameUnwind](d.alloc, n::usize);
+            if (sel got.err) { ret err[fail.Fail].err{fail.refused(got.err)}; }
+            d.frames      = got.ok;
+            d.frame_count = n;
+        }
+        i = 0;
+        for (i < n && !r.bad) {
+            val fr: *of.FrameUnwind = ?d.frames[i];
+            fr.section    = of.section_id(take_u32(?r));
+            fr.offset     = take_u32(?r);
+            fr.step_count = take_u32(?r);
+            if (fr.step_count > of.FRAME_STEP_CAP) { ret malformed(); }
+            var k: u32 = 0;
+            for (k < fr.step_count) {
+                fr.steps[k].kind    = take_u8(?r);
+                fr.steps[k].reg     = take_u8(?r);
+                fr.steps[k].end_off = take_u32(?r);
+                fr.steps[k].value   = take_u64(?r);
+                k                   = k + 1;
+            }
+            i = i + 1;
+        }
+    }
+    if (r.bad || r.pos != r.len) { ret malformed(); }
+    ret err[fail.Fail].ok{};
+}
+
+# a section-relative place in the parsed image, sortable to find an entry's match
+rec Place {
+    section: u32;
+    offset:  u32;
+    index:   u32;
+}
+
+fun place_cmp(a: *Place, b: *Place) i64 {
+    if (a.section != b.section) {
+        if (a.section < b.section) { ret -1; }
+        ret 1;
+    }
+    if (a.offset != b.offset) {
+        if (a.offset < b.offset) { ret -1; }
+        ret 1;
+    }
+    if (a.index < b.index) { ret -1; }
+    if (a.index > b.index) { ret 1; }
+    ret 0;
+}
+
+# the first place at or after (section, offset)
+fun lower_bound(places: *Place, n: u32, section: u32, offset: u32) u32 {
+    var lo: u32 = 0;
+    var hi: u32 = n;
+    for (lo < hi) {
+        val mid: u32    = lo + (hi - lo) / 2;
+        val p:   *Place = ?places[mid];
+        if (p.section < section || (p.section == section && p.offset < offset)) { lo = mid + 1; }
+        or                                                                      { hi = mid; }
+    }
+    ret lo;
+}
+
+fun defined_in_image(img: *of.ObjectImage, sym: *of.Symbol) bool {
+    if (of.section_is_external(sym.section) || of.section_is_absolute(sym.section)) { ret false; }
+    ret of.section_index(sym.section) < img.section_count;
+}
+
+# where a carrier place lies in the parsed image before any split
+fun host_place(d: *Decoded, section: u32, offset: u32, host: *u32, host_offset: *u32) {
+    @host        = section;
+    @host_offset = offset;
+    if (d.section_count > 0) {
+        @host        = d.sections[section].host;
+        @host_offset = d.sections[section].offset + offset;
+    }
+}
+
+# the described section a place in host section h falls in; `at_end` admits a
+# place one past a piece's last byte, which a sizeless label may hold
+fun piece_for(d: *Decoded, h: u32, offset: u32, at_end: bool, out: *u32, out_offset: *u32) bool {
+    var i: u32 = 0;
+    for (i < d.section_count) {
+        val e: *SectionEntry = ?d.sections[i];
+        if (e.host == h && offset >= e.offset && offset - e.offset < e.len) {
+            @out        = i;
+            @out_offset = offset - e.offset;
+            ret true;
+        }
+        i = i + 1;
+    }
+    if (!at_end) { ret false; }
+    i = d.section_count;
+    for (i > 0) {
+        i = i - 1;
+        val e: *SectionEntry = ?d.sections[i];
+        if (e.host == h && offset >= e.offset && offset - e.offset == e.len) {
+            @out        = i;
+            @out_offset = e.len;
+            ret true;
+        }
+    }
+    ret false;
+}
+
+rec Split {
+    uses:      *u32;
+    new_index: *u32;
+    host_n:    u32;
+}
+
+fun split_dnit(alloc: *A.Allocator, sp: *Split) {
+    if (sp.uses != nil) { A.deallocate[u32](alloc, sp.uses, (sp.host_n * 2)::usize); }
+}
+
+# the new section of host h's place, or false when no described section holds it
+fun remap(d: *Decoded, sp: *Split, h: u32, offset: u32, at_end: bool, section: *u32, out_offset: *u32) bool {
+    if (sp.uses[h] == 0) {
+        @section    = sp.new_index[h];
+        @out_offset = offset;
+        ret true;
+    }
+    ret piece_for(d, h, offset, at_end, section, out_offset);
+}
+
+# rebuilds the image's sections as the described ones, in order, then every
+# parsed section none of them lies in, and moves what lies in a host onto the
+# described section holding it. `matched` holds the carrier symbol each parsed
+# symbol took, plus one, and those take the carrier's place
+fun split_sections(img: *of.ObjectImage, d: *Decoded, matched: *u32) err[fail.Fail] {
+    val alloc:  *A.Allocator = img.alloc;
+    val host_n: u32          = img.section_count;
+    var sp:     Split        = Split{uses: nil, new_index: nil, host_n: host_n};
+    if (host_n > 0) {
+        val got: res[*u32, A.Error] = A.zallocate[u32](alloc, (host_n * 2)::usize);
+        if (sel got.err) { ret err[fail.Fail].err{fail.refused(got.err)}; }
+        sp.uses      = got.ok;
+        sp.new_index = (got.ok::usize + host_n::usize * 4)::*u32;
+    }
+    fin { split_dnit(alloc, ?sp); }
+    var i: u32 = 0;
+    for (i < d.section_count) {
+        val e: *SectionEntry = ?d.sections[i];
+        if (e.host >= host_n || e.offset::u64 + e.len::u64 > img.sections[e.host].len::u64) { ret malformed(); }
+        sp.uses[e.host] = sp.uses[e.host] + 1;
+        i               = i + 1;
+    }
+    var total: u32 = d.section_count;
+    var h:     u32 = 0;
+    for (h < host_n) {
+        if (sp.uses[h] == 0) {
+            sp.new_index[h] = total;
+            total           = total + 1;
+        }
+        h = h + 1;
+    }
+
+    # every place is remapped before anything moves, so a failure leaves the image whole
+    var sy: u32 = 0;
+    for (sy < img.symbol_count) {
+        val sym: *of.Symbol = ?img.symbols[sy];
+        if (defined_in_image(img, sym) && matched[sy] == 0) {
+            var ns:  u32 = 0;
+            var off: u32 = 0;
+            if (!remap(d, ?sp, of.section_index(sym.section), sym.offset, true, ?ns, ?off)) {
+                ret err[fail.Fail].err{fail.message("of: a symbol lies outside every section the link carrier describes")};
+            }
+        }
+        sy = sy + 1;
+    }
+    var ri: u32 = 0;
+    for (ri < img.reloc_count) {
+        val r: *of.Relocation = ?img.relocations[ri];
+        if (!of.section_is_external(r.section) && of.section_index(r.section) < host_n) {
+            var ns:  u32 = 0;
+            var off: u32 = 0;
+            if (!remap(d, ?sp, of.section_index(r.section), r.offset, false, ?ns, ?off)) {
+                ret err[fail.Fail].err{fail.message("of: a relocation lies outside every section the link carrier describes")};
+            }
+        }
+        ri = ri + 1;
+    }
+    i = 0;
+    for (i < img.indirect_count) {
+        if (sp.uses[of.section_index(img.indirects[i].section)] != 0) {
+            ret err[fail.Fail].err{fail.message("of: an indirect symbol lies in a section the link carrier splits")};
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < host_n) {
+        val link: u32 = img.sections[i].native.link_section;
+        if (link != 0 && (link > host_n || sp.uses[link - 1] > 1)) {
+            ret err[fail.Fail].err{fail.message("of: a section links to one the link carrier splits")};
+        }
+        i = i + 1;
+    }
+
+    val got: res[*of.Section, A.Error] = A.zallocate[of.Section](alloc, total::usize);
+    if (sel got.err) { ret err[fail.Fail].err{fail.refused(got.err)}; }
+    val sections: *of.Section = got.ok;
+    i = 0;
+    for (i < d.section_count) {
+        val e:    *SectionEntry = ?d.sections[i];
+        val host: *of.Section   = ?img.sections[e.host];
+        sections[i]       = @host;
+        sections[i].len   = e.len;
+        sections[i].align = e.align;
+        sections[i].flags = e.flags;
+        sections[i].bytes = nil;
+        if (host.bytes != nil && e.len > 0) {
+            if (sp.uses[e.host] == 1 && e.offset == 0 && e.len == host.len) { sections[i].bytes = host.bytes; }
+            or {
+                val copy: res[*u8, A.Error] = A.allocate[u8](alloc, e.len::usize);
+                if (sel copy.err) {
+                    var k: u32 = 0;
+                    for (k < i) {
+                        val ke: *SectionEntry = ?d.sections[k];
+                        if (sections[k].bytes != nil && sections[k].bytes != img.sections[ke.host].bytes) {
+                            A.deallocate[u8](alloc, sections[k].bytes, sections[k].len::usize);
+                        }
+                        k = k + 1;
+                    }
+                    A.deallocate[of.Section](alloc, sections, total::usize);
+                    ret err[fail.Fail].err{fail.refused(copy.err)};
+                }
+                memory.raw_copy(copy.ok::ptr, (host.bytes::usize + e.offset::usize)::ptr, e.len::usize);
+                sections[i].bytes = copy.ok;
+            }
+        }
+        i = i + 1;
+    }
+    h = 0;
+    for (h < host_n) {
+        val host: *of.Section = ?img.sections[h];
+        if (sp.uses[h] == 0) { sections[sp.new_index[h]] = @host; }
+        or (host.bytes != nil && host.len > 0 && !(sp.uses[h] == 1 && host.bytes == sections[piece_of_host(d, h)].bytes)) {
+            A.deallocate[u8](alloc, host.bytes, host.len::usize);
+        }
+        h = h + 1;
+    }
+    i = 0;
+    for (i < total) {
+        val link: u32 = sections[i].native.link_section;
+        if (link != 0) {
+            val lh: u32 = link - 1;
+            if (sp.uses[lh] == 0) { sections[i].native.link_section = sp.new_index[lh] + 1; }
+            or                    { sections[i].native.link_section = piece_of_host(d, lh) + 1; }
+        }
+        i = i + 1;
+    }
+
+    sy = 0;
+    for (sy < img.symbol_count) {
+        val sym: *of.Symbol = ?img.symbols[sy];
+        if (matched[sy] != 0) {
+            val e: *SymbolEntry = ?d.symbols[matched[sy] - 1];
+            sym.section = of.section_id(e.section);
+            sym.offset  = e.offset;
+        }
+        or (defined_in_image(img, sym)) {
+            var ns:  u32 = 0;
+            var off: u32 = 0;
+            if (remap(d, ?sp, of.section_index(sym.section), sym.offset, true, ?ns, ?off)) {
+                sym.section = of.section_id(ns);
+                sym.offset  = off;
+            }
+        }
+        sy = sy + 1;
+    }
+    ri = 0;
+    for (ri < img.reloc_count) {
+        val r: *of.Relocation = ?img.relocations[ri];
+        if (!of.section_is_external(r.section) && of.section_index(r.section) < host_n) {
+            var ns:  u32 = 0;
+            var off: u32 = 0;
+            if (remap(d, ?sp, of.section_index(r.section), r.offset, false, ?ns, ?off)) {
+                r.section = of.section_id(ns);
+                r.offset  = off;
+            }
+        }
+        ri = ri + 1;
+    }
+    i = 0;
+    for (i < img.frame_count) {
+        val fr:  *of.FrameUnwind = ?img.frames[i];
+        var ns:  u32             = 0;
+        var off: u32             = 0;
+        if (of.section_index(fr.section) < host_n
+            && remap(d, ?sp, of.section_index(fr.section), fr.offset, false, ?ns, ?off)) {
+            fr.section = of.section_id(ns);
+            fr.offset  = off;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < img.indirect_count) {
+        img.indirects[i].section = of.section_id(sp.new_index[of.section_index(img.indirects[i].section)]);
+        i                        = i + 1;
+    }
+
+    A.deallocate[of.Section](alloc, img.sections, img.section_cap::usize);
+    img.sections      = sections;
+    img.section_count = total;
+    img.section_cap   = total;
+    ret err[fail.Fail].ok{};
+}
+
+# the described section of a host that holds exactly one
+fun piece_of_host(d: *Decoded, h: u32) u32 {
+    var i: u32 = 0;
+    for (i < d.section_count) {
+        if (d.sections[i].host == h) { ret i; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# the parsed symbol each carrier symbol names, found at its host place by name
+fun match_symbols(img: *of.ObjectImage, d: *Decoded, matched: *u32) err[fail.Fail] {
+    val alloc: *A.Allocator = img.alloc;
+    var n:     u32          = 0;
+    var sy:    u32          = 0;
+    for (sy < img.symbol_count) {
+        if (defined_in_image(img, ?img.symbols[sy])) { n = n + 1; }
+        sy = sy + 1;
+    }
+    var places: *Place = nil;
+    if (n > 0) {
+        val got: res[*Place, A.Error] = A.allocate[Place](alloc, n::usize);
+        if (sel got.err) { ret err[fail.Fail].err{fail.refused(got.err)}; }
+        places = got.ok;
+    }
+    fin {
+        if (places != nil) { A.deallocate[Place](alloc, places, n::usize); }
+    }
+    var at: u32 = 0;
+    sy = 0;
+    for (sy < img.symbol_count) {
+        val sym: *of.Symbol = ?img.symbols[sy];
+        if (defined_in_image(img, sym)) {
+            places[at] = Place{section: of.section_index(sym.section), offset: sym.offset, index: sy};
+            at         = at + 1;
+        }
+        sy = sy + 1;
+    }
+    sort.sort_by[Place](places, n::usize, place_cmp);
+
+    var e: u32 = 0;
+    for (e < d.symbol_count) {
+        val entry: *SymbolEntry = ?d.symbols[e];
+        var h:     u32          = 0;
+        var ho:    u32          = 0;
+        host_place(d, entry.section, entry.offset, ?h, ?ho);
+        var k:     u32  = lower_bound(places, n, h, ho);
+        var found: bool = false;
+        for (!found && k < n && places[k].section == h && places[k].offset == ho) {
+            val j: u32 = places[k].index;
+            if (matched[j] == 0 && img.symbols[j].name == entry.name) {
+                matched[j] = e + 1;
+                found      = true;
+            }
+            k = k + 1;
+        }
+        if (!found) { ret err[fail.Fail].err{fail.message("of: the link carrier names a symbol the object does not define")}; }
+        e = e + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun apply_relocs(img: *of.ObjectImage, d: *Decoded) err[fail.Fail] {
+    if (d.reloc_count == 0) { ret err[fail.Fail].ok{}; }
+    val alloc: *A.Allocator = img.alloc;
+    val n:     u32          = img.reloc_count;
+    if (n == 0) { ret err[fail.Fail].err{fail.message("of: the link carrier names a relocation the object does not carry")}; }
+    val got: res[*Place, A.Error] = A.allocate[Place](alloc, n::usize);
+    if (sel got.err) { ret err[fail.Fail].err{fail.refused(got.err)}; }
+    val places: *Place = got.ok;
+    fin { A.deallocate[Place](alloc, places, n::usize); }
+    var ri: u32 = 0;
+    for (ri < n) {
+        places[ri] = Place{section: of.section_index(img.relocations[ri].section), offset: img.relocations[ri].offset, index: ri};
+        ri         = ri + 1;
+    }
+    sort.sort_by[Place](places, n::usize, place_cmp);
+    var e: u32 = 0;
+    for (e < d.reloc_count) {
+        val entry: *RelocEntry = ?d.relocs[e];
+        var k:     u32         = lower_bound(places, n, entry.section, entry.offset);
+        if (k >= n || places[k].section != entry.section || places[k].offset != entry.offset) {
+            ret err[fail.Fail].err{fail.message("of: the link carrier names a relocation the object does not carry")};
+        }
+        for (k < n && places[k].section == entry.section && places[k].offset == entry.offset) {
+            img.relocations[places[k].index].inst_end = entry.inst_end;
+            k                                         = k + 1;
+        }
+        e = e + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# applies a carrier to the image its object parsed into, which becomes a
+# codegen image
+pub fun apply(img: *of.ObjectImage, bytes: *u8, len: usize) err[fail.Fail] {
+    var d: Decoded = Decoded{alloc: img.alloc, tables: 0, sections: nil, section_count: 0,
+        symbols: nil, symbol_count: 0, relocs: nil, reloc_count: 0, frames: nil, frame_count: 0};
+    fin { decoded_dnit(?d); }
+    val decoded: err[fail.Fail] = decode(img.interner, bytes, len, ?d);
+    if (sel decoded.err) { ret decoded; }
+
+    var limit: u32 = img.section_count;
+    if (d.section_count > 0) { limit = d.section_count; }
+    var i: u32 = 0;
+    for (i < d.symbol_count) {
+        if (d.symbols[i].section >= limit) { ret malformed(); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < d.reloc_count) {
+        if (d.relocs[i].section >= limit) { ret malformed(); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < d.frame_count) {
+        if (of.section_index(d.frames[i].section) >= limit) { ret malformed(); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < d.section_count) {
+        if (d.sections[i].host >= img.section_count) { ret malformed(); }
+        i = i + 1;
+    }
+
+    var matched: *u32 = nil;
+    if (img.symbol_count > 0) {
+        val got: res[*u32, A.Error] = A.zallocate[u32](img.alloc, img.symbol_count::usize);
+        if (sel got.err) { ret err[fail.Fail].err{fail.refused(got.err)}; }
+        matched = got.ok;
+    }
+    val symbol_n: u32 = img.symbol_count;
+    fin {
+        if (matched != nil) { A.deallocate[u32](img.alloc, matched, symbol_n::usize); }
+    }
+    val found: err[fail.Fail] = match_symbols(img, ?d, matched);
+    if (sel found.err) { ret found; }
+    if (d.section_count > 0) {
+        val split: err[fail.Fail] = split_sections(img, ?d, matched);
+        if (sel split.err) { ret split; }
+    }
+    var sy: u32 = 0;
+    for (sy < symbol_n) {
+        if (matched[sy] != 0) {
+            val e:   *SymbolEntry = ?d.symbols[matched[sy] - 1];
+            val sym: *of.Symbol   = ?img.symbols[sy];
+            sym.size  = e.size;
+            sym.flags = (sym.flags & ~SYMBOL_TYPE) | (e.flags & SYMBOL_TYPE);
+        }
+        sy = sy + 1;
+    }
+    val relocs: err[fail.Fail] = apply_relocs(img, ?d);
+    if (sel relocs.err) { ret relocs; }
+    i = 0;
+    for (i < d.frame_count) {
+        val added: err[fail.Fail] = of.add_frame(img, ?d.frames[i]);
+        if (sel added.err) { ret added; }
+        i = i + 1;
+    }
+    img.codegen = true;
+    ret err[fail.Fail].ok{};
+}
+
+# applies the carrier in section `index` and leaves its zero-length husk, which
+# reads as no carrier
+pub fun take(img: *of.ObjectImage, index: u32) err[fail.Fail] {
+    val sec:   *of.Section = ?img.sections[index];
+    val bytes: *u8         = sec.bytes;
+    val len:   u32         = sec.len;
+    if (len == 0)     { ret err[fail.Fail].ok{}; }
+    if (bytes == nil) { ret malformed(); }
+    sec.bytes = nil;
+    sec.len   = 0;
+    fin { A.deallocate[u8](img.alloc, bytes, len::usize); }
+    ret apply(img, bytes, len::usize);
+}
+
+# applies the carrier the section named `name` holds, when the object has one
+pub fun consume(itn: *intern.Interner, img: *of.ObjectImage, name: str) err[fail.Fail] {
+    val name_r: res[intern.StrId, A.Error] = intern.intern(itn, name);
+    if (sel name_r.err) { ret err[fail.Fail].err{fail.refused(name_r.err)}; }
+    val found: opt[u32] = exports.find(img, name_r.ok);
+    if (sel found.none) { ret err[fail.Fail].ok{}; }
+    ret take(img, found.some);
+}
+
+# a view of img carrying the carrier bytes in a section named `name` shaped by
+# `template`; the caller releases it with `exports.release`
+pub fun with_carrier(alloc: *A.Allocator, img: *of.ObjectImage, name: str, template: of.Section,
+    bytes: *u8, len: u32, out: *of.ObjectImage) err[fail.Fail] {
+    val name_r: res[intern.StrId, A.Error] = intern.intern(img.interner, name);
+    if (sel name_r.err) { ret err[fail.Fail].err{fail.refused(name_r.err)}; }
+    ret exports.with_section(alloc, img, name_r.ok, template, bytes, len, out);
+}
