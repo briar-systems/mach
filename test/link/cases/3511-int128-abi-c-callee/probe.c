@@ -26,15 +26,23 @@ long long c_fmix(double x, u128 v, double y, long long next) {
 u128 c_mk_u128(long long lo, long long hi) { return ((u128)(unsigned long long)hi << 64) | (u128)(unsigned long long)lo; }
 i128 c_mk_i128(long long x) { return (i128)x * 3; }
 
+/* a mach #[symbol] name is the literal object symbol, and darwin's C compiler
+ * prefixes an underscore to every C name, so the label makes C ask for the literal one */
+#ifdef __APPLE__
+#define MACH_SYM(name) __asm__(#name)
+#else
+#define MACH_SYM(name)
+#endif
+
 /* the reverse direction: C calls mach with the same shapes */
-long long m_u128(u128 v, long long next);
-long long m_i128(i128 v, long long next);
-long long m_odd(long long first, u128 v, long long next);
-long long m_six(long long a, long long b, long long c, long long d, long long e, long long f, u128 v, long long next);
-long long m_seven(long long a, long long b, long long c, long long d, long long e, long long f, long long g, u128 v, long long next);
-long long m_fmix(double x, u128 v, double y, long long next);
-u128 m_mk_u128(long long lo, long long hi);
-i128 m_mk_i128(long long x);
+long long m_u128(u128 v, long long next) MACH_SYM(m_u128);
+long long m_i128(i128 v, long long next) MACH_SYM(m_i128);
+long long m_odd(long long first, u128 v, long long next) MACH_SYM(m_odd);
+long long m_six(long long a, long long b, long long c, long long d, long long e, long long f, u128 v, long long next) MACH_SYM(m_six);
+long long m_seven(long long a, long long b, long long c, long long d, long long e, long long f, long long g, u128 v, long long next) MACH_SYM(m_seven);
+long long m_fmix(double x, u128 v, double y, long long next) MACH_SYM(m_fmix);
+u128 m_mk_u128(long long lo, long long hi) MACH_SYM(m_mk_u128);
+i128 m_mk_i128(long long x) MACH_SYM(m_mk_i128);
 
 long long c_drives_mach(void) {
     const u128 v = ((u128)3 << 64) | 7;
