@@ -33,8 +33,13 @@ fun is_leap_year(y: i64) bool {
     ret y % 4 == 0;
 }
 
-fun debug(msg: *u8) { if (msg == nil) { ret; } }
-fun info(msg: *u8) { if (msg == nil) { ret; } }
+fun debug(msg: *u8) {
+    if (msg == nil) { ret; }
+}
+
+fun info(msg: *u8) {
+    if (msg == nil) { ret; }
+}
 
 test "date: is_leap_year" {
     if (!is_leap_year(2000)) { ret 1; }
