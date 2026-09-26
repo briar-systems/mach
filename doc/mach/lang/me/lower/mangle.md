@@ -10,6 +10,15 @@ bare: intern.StrId,
 export: opt[intern.StrId]) res[intern.StrId, fail.Fail];
 ```
 
+## fun test_name
+
+```mach
+pub fun test_name(s: *session.Session, fqn: intern.StrId, ident: intern.StrId) res[intern.StrId, fail.Fail];
+```
+
+a test's qualified name and symbol, `<module path>#<identifier>`: `#` is in no
+identifier or module path, so it names no other symbol
+
 ## fun instance_name
 
 ```mach
