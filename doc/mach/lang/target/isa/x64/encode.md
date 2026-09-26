@@ -40,21 +40,15 @@ pub fun asm_ct_class(code: u32, flags: u16) ct.AsmClass;
 the flags and latency row of an opcode, as the inline-asm scan and the
 effect walk read it: the class column of the one description table
 
-## val X64_OPCODE_COUNT
-
-```mach
-pub val X64_OPCODE_COUNT: u32 = 200
-```
-
-the machine opcodes a notification can carry: every x64.Opcode except the
-two pseudo entries, the inline-asm block marker and the data byte, which
-reach the stream as a MIR pseudo and an ASM_NOTE_BYTES note respectively
-
 ## fun notifiable_opcode
 
 ```mach
 pub fun notifiable_opcode(op: u16) bool;
 ```
+
+the machine opcodes a notification can carry: every x64.Opcode except the
+two pseudo entries, the inline-asm block marker and the data byte, which
+reach the stream as a MIR pseudo and an ASM_NOTE_BYTES note respectively
 
 ## fun inst_effects
 
