@@ -401,12 +401,6 @@ pub val PHASE_CAP_SEMANTIC_TYPES: PhaseCapabilityKind = 4
 pub val PHASE_CAP_LOWERING:       PhaseCapabilityKind = 5
 ```
 
-## rec NoCapabilityContext
-
-```mach
-pub rec NoCapabilityContext;
-```
-
 ## rec PhaseCapabilities
 
 ```mach
@@ -604,36 +598,6 @@ pub fun eval_from_fail(f: fail.Fail, rejected_message: str) EvalFail;
 
 ```mach
 pub fun gate_eval_failure_is_transient(kind: EvalFailKind) bool;
-```
-
-## def ConstKind
-
-```mach
-pub def ConstKind: u8
-```
-
-## rec ConstAddress
-
-```mach
-pub rec ConstAddress;
-```
-
-## rec TypedConstant
-
-```mach
-pub rec TypedConstant;
-```
-
-## rec DataModel
-
-```mach
-pub rec DataModel;
-```
-
-## rec RelocationRequest
-
-```mach
-pub rec RelocationRequest;
 ```
 
 ## rec FrameMark
