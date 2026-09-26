@@ -266,15 +266,14 @@ pub rec DiagnosticBatch;
 ```mach
 pub tag BuildEvent: u8 {
     unit:        BuildUnitEvent;
-    note:        u32;
     fail:        Fail;
     diagnostics: DiagnosticBatch;
 }
 ```
 
-what a build recorded, in order: a unit finished, a scalarization note
-(the count), a failure, or a batch of diagnostics with the sources they
-refer to. every payload is owned by the outcome's allocator
+what a build recorded, in order: a unit finished, a failure, or a batch of
+diagnostics with the sources they refer to. every payload is owned by the
+outcome's allocator
 
 ## def BuildSeverity
 
@@ -359,12 +358,6 @@ t's text is borrowed; the outcome keeps its own copy. a nil text stays nil
 
 ```mach
 pub fun record_unit(bo: *BuildOutcome, artifact: str, target: str, verb: str, has_artifact: bool) err[A.Error];
-```
-
-## fun record_note
-
-```mach
-pub fun record_note(bo: *BuildOutcome, scalarized: u32) err[A.Error];
 ```
 
 ## fun record_fail

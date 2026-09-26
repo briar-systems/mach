@@ -80,6 +80,12 @@ pub val NATIVE_FALLBACK: Kind = 7
 pub val NOT_OBLIVIOUS:   Kind = 8
 ```
 
+## val SCALARIZE
+
+```mach
+pub val SCALARIZE:       Kind = 9
+```
+
 ## rec Spec
 
 ```mach
@@ -89,7 +95,7 @@ pub rec Spec;
 ## val COUNT
 
 ```mach
-pub val COUNT: usize       = 8
+pub val COUNT: usize       = 9
 ```
 
 ## fun at

@@ -1,6 +1,8 @@
 use mach.lang.fail;
 use std.allocator.arena;
 use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
 use std.format;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -11,10 +13,12 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_contains;
+use std.types.string.str_len;
 
 use A: std.allocator;
 
 use mach.lang.diagnostic;
+use dkind: mach.lang.diagnostic.kind;
 use mach.lang.intern;
 use mach.lang.me.ir;
 use mach.lang.me.ir.body;
@@ -47,6 +51,7 @@ use mach.lang.me.transform.vectorize;
 use mach.lang.me.vecform;
 use mach.lang.source;
 use mach.lang.target;
+use mach.lang.target.extension;
 use mach.lang.target.isa;
 use mach.lang.target.resolved;
 use target_testing: mach.lang.target.testing;
@@ -74,7 +79,8 @@ pub rec PipelineRequest {
     interner:          *intern.Interner;
     source_map:        *source.SourceMap;
     # the module's diagnostic store: a shape or `simd = "require"` refusal is a
-    # located error there, never a bare failure
+    # located error there, never a bare failure, and a scalarized operation a
+    # warning at its site
     diags: *diagnostic.DiagnosticStore;
 }
 
@@ -260,10 +266,8 @@ fun run_impl(m: *ir.Module, tgt: *target.Target, level: OptLevel, vectorize_enab
     val res_declared: err[fail.Fail] = declared_check(m, tgt, itn, diags);
     if (sel res_declared.err) { ret res[bool, fail.Fail].err{res_declared.err}; }
 
-    if (simd_require) {
-        val res_req: err[fail.Fail] = require_check(m, tgt, itn, diags);
-        if (sel res_req.err) { ret res[bool, fail.Fail].err{res_req.err}; }
-    }
+    val res_fallback: err[fail.Fail] = fallback_check(m, tgt, itn, diags, simd_require);
+    if (sel res_fallback.err) { ret res[bool, fail.Fail].err{res_fallback.err}; }
 
     val place_changed_r: res[bool, fail.Fail] = scalarize.run_in(m, tgt, ws);
     if (sel place_changed_r.err) { ret place_changed_r; }
@@ -336,40 +340,93 @@ fun undeclared_text(m: *ir.Module, tgt: *target.Target, op: str, fname: str, sit
         if (sel r_239.err) { ret res[str, fail.Fail].err{fail.format_refused(r_239.err)}; }
         ret res[str, fail.Fail].ok{r_239.ok};
     }
+    var lane: str = "integers";
+    if (site.is_float) { lane = "floats"; }
     val r_241: res[str, format.FormatError] = format.sprint(m.alloc,
-        "vector {} on {} lanes of {} bits in '{}' has no declared form on {}: the target's catalog names neither a packed instruction nor the scalar expansion for this operation and lane shape",
-        op, site.lanes, site.lane_bits, fname, tgt.isa.name);
+        "vector {} on {} lanes of {}-bit {} in '{}' has no declared form on {}: the target's catalog names neither a packed instruction nor the scalar expansion for this operation and lane shape",
+        op, site.lanes, site.lane_bits, lane, fname, tgt.isa.name);
     if (sel r_241.err) { ret res[str, fail.Fail].err{fail.format_refused(r_241.err)}; }
     ret res[str, fail.Fail].ok{r_241.ok};
 }
 
-fun require_check(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner, diags: *diagnostic.DiagnosticStore) err[fail.Fail] {
-    var site:  scalarize.ScalarizeSite;
-    val count: u32 = scalarize.detect(m, tgt, ?site);
-    if (count == 0) { ret err[fail.Fail].ok{}; }
-    ret err[fail.Fail].err{diagnostic.reject(diags, site.loc, require_msg(m, tgt, itn, ?site))};
+# every operation that falls back to scalar code is named at its own site: a
+# warning by default, and under `simd = "require"` an error, the same sites
+# with the same text. each names the operation, its lanes and the target, and
+# the extension whose declared packed row would pack it, read from the catalog
+fun fallback_check(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner, diags: *diagnostic.DiagnosticStore,
+    require: bool) err[fail.Fail] {
+    var found: Vector[scalarize.ScalarizeSite] = vector.init[scalarize.ScalarizeSite](m.alloc);
+    fin { vector.dnit[scalarize.ScalarizeSite](?found); }
+    val listed: err[A.Error] = scalarize.sites(m, tgt, ?found);
+    if (sel listed.err) { ret err[fail.Fail].err{fail.refused(listed.err)}; }
+    var refused: bool      = false;
+    var first:   fail.Fail = fail.reported();
+    var i:       usize     = 0;
+    for (i < found.len) {
+        val site: *scalarize.ScalarizeSite = ?found.data[i];
+        val text: str                      = fallback_msg(m, tgt, itn, site, require);
+        if (require) {
+            val f: fail.Fail = diagnostic.reject(diags, site.loc, text);
+            if (!refused) { first = f; }
+            refused = true;
+        }
+        or { diagnostic.record_warning_at(diags, dkind.SCALARIZE, site.loc, text); }
+        i = i + 1;
+    }
+    if (refused) { ret err[fail.Fail].err{first}; }
+    ret err[fail.Fail].ok{};
 }
 
-fun require_msg(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner, site: *scalarize.ScalarizeSite) str {
+fun fallback_msg(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner, site: *scalarize.ScalarizeSite, require: bool) str {
     val op:    str      = site_op_name(m, itn, site);
     var fname: str      = "<anonymous>";
     val on:    opt[str] = intern.lookup(itn, site.fn_name);
     if (sel on.some) { fname = on.some; }
+    var lane: str = "integers";
+    if (site.is_float) { lane = "floats"; }
 
-    var why: str = "target has no packed form for this operation at this lane width";
-    if (!tgt.model.has_v128) { why = "target has no 128-bit SIMD"; }
-    or {
-        val cap: u32 = vecform.packed_lanes(tgt, site.lane_bits);
-        if (cap != 0 && site.lanes > cap) {
-            why = "this shape has more lanes than one packed vector holds on this target";
-        }
+    val why: res[str, format.FormatError] = fallback_reason(m, tgt, site);
+    if (sel why.err) { ret fail.describe(fail.format_refused(why.err)); }
+    var text: res[str, format.FormatError];
+    if (require) {
+        text = format.sprint(m.alloc,
+            "simd = \"require\": vector {} on {} lanes of {}-bit {} in '{}' would scalarize on {}: {}; set simd = \"scalarize\" to build with the scalar expansion",
+            op, site.lanes, site.lane_bits, lane, fname, tgt.isa.name, why.ok);
     }
+    or {
+        text = format.sprint(m.alloc, "vector {} on {} lanes of {}-bit {} in '{}' scalarizes on {}: {}",
+            op, site.lanes, site.lane_bits, lane, fname, tgt.isa.name, why.ok);
+    }
+    if (sel text.err) { ret fail.describe(fail.format_refused(text.err)); }
+    ret text.ok;
+}
 
-    val rj: res[str, format.FormatError] = format.sprint(m.alloc,
-        "simd = \"require\": vector {} on {} lanes of {} bits in '{}' would scalarize on {} ({}); set simd = \"scalarize\" to build with the scalar expansion",
-        op, site.lanes, site.lane_bits, fname, tgt.isa.name, why);
-    if (sel rj.err) { ret fail.describe(fail.format_refused(rj.err)); }
-    ret rj.ok;
+# why a site has no packed form: the extensions its declared row needs, or
+# that no row packs it at any extension
+fun fallback_reason(m: *ir.Module, tgt: *target.Target, site: *scalarize.ScalarizeSite) res[str, format.FormatError] {
+    if (!tgt.model.has_v128) { ret format.sprint(m.alloc, "{} has no 128-bit SIMD", tgt.isa.name); }
+    val cap: u32 = vecform.packed_lanes(tgt, site.lane_bits);
+    if (cap != 0 && site.lanes > cap) {
+        ret format.sprint(m.alloc, "the shape has more lanes than one packed vector holds, at any extension");
+    }
+    var ext: u64            = 0;
+    val op:  opt[isa.VecOp] = vecform.vec_op_of(site.op, site.uniform_count);
+    if (sel op.some) { ext = isa.packing_extension(?tgt.model, op.some, site.is_float, site.lane_bits, site.from_bits); }
+    if (ext == 0)    { ret format.sprint(m.alloc, "no packed form for it at any extension"); }
+    var names: str = "";
+    var k:     u32 = 0;
+    for (k < tgt.model.extension_count) {
+        val row: *extension.Extension = ?tgt.model.extension_table[k];
+        if ((row.bit & ext) != 0) {
+            var joined: res[str, format.FormatError];
+            if (str_len(names) == 0) { joined = format.sprint(m.alloc, "`{}`", row.name); }
+            or                       { joined = format.sprint(m.alloc, "{} and `{}`", names, row.name); }
+            if (sel joined.err)      { ret joined; }
+            names = joined.ok;
+        }
+        k = k + 1;
+    }
+    ret format.sprint(m.alloc, "declaring {} in the target's `extensions` packs it", names);
 }
 
 rec VerifyCtx {
@@ -896,11 +953,12 @@ test run__simd_require_gate {
         if (sel d1.none) { code = 1; }
         or (sel d1.some) {
             val msg: str = d1.some.message;
-            if (!str_contains(msg, "simd = \"require\"")) { code = 1; }
-            if (!str_contains(msg, "add"))                { code = 1; }
-            if (!str_contains(msg, "kernel"))             { code = 1; }
-            if (!str_contains(msg, "riscv64"))            { code = 1; }
-            if (!str_contains(msg, "4 lanes of 32 bits")) { code = 1; }
+            if (!str_contains(msg, "simd = \"require\""))          { code = 1; }
+            if (!str_contains(msg, "add"))                         { code = 1; }
+            if (!str_contains(msg, "kernel"))                      { code = 1; }
+            if (!str_contains(msg, "riscv64"))                     { code = 1; }
+            if (!str_contains(msg, "4 lanes of 32-bit floats"))    { code = 1; }
+            if (!str_contains(msg, "riscv64 has no 128-bit SIMD")) { code = 1; }
         }
     }
     ir.dnit(?m);
@@ -1050,6 +1108,116 @@ test run__undeclared_vector_shape_is_refused_in_every_simd_mode {
 # arithmetic shift, and a per-lane count packs nowhere on the SSE2 baseline, so
 # simd = "require" accepts the first and refuses the other two, naming the
 # count's form (#3740)
+# the diagnostics a chain of `ops` 8-bit lane multiplies reports
+# on `rv`, each through the pipeline under `require`; the count of those that
+# carry `needle`, or -1 when the run answers otherwise than its mode demands
+#[testing]
+fun mul_fallbacks(alloc: *A.Allocator, itn: *intern.Interner, rv: *resolved.Target, ops: u32, require: bool, needle: str) i32 {
+    val rfn: res[intern.StrId, A.Error] = intern.intern(itn, "kernel");
+    if (sel rfn.err) { ret -1; }
+    val rm: res[ir.Module, fail.Fail] = ir.init(alloc, intern.STR_NIL);
+    if (sel rm.err) { ret -1; }
+    var m: ir.Module = rm.ok;
+    fin { ir.dnit(?m); }
+    val ri: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 8);
+    if (sel ri.err) { ret -1; }
+    val rvt: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_vector(?m.types, ri.ok, 16);
+    if (sel rvt.err) { ret -1; }
+    val vec: ir_type.IrTypeId    = rvt.ok;
+    val rfa: res[u32, fail.Fail] = ir.function_add(?m, rfn.ok, vec, 0);
+    if (sel rfa.err) { ret -1; }
+    val fn:   *ir.Function               = ?m.functions[rfa.ok];
+    val args: res[*value.Value, A.Error] = A.allocate[value.Value](m.alloc, 2);
+    if (sel args.err) { ret -1; }
+    fn.params      = args.ok;
+    fn.param_count = 2;
+    fn.params[0]   = value.param(0, vec);
+    fn.params[1]   = value.param(1, vec);
+    var b: builder.Builder = builder.init(?m);
+    builder.set_function(?b, fn);
+    val rb: res[id.BlockId, fail.Fail] = builder.new_block(?b);
+    if (sel rb.err) { ret -1; }
+    builder.set_block(?b, rb.ok);
+    var acc: value.Value = value.param(0, vec);
+    var k:   u32         = 0;
+    for (k < ops) {
+        val rmul: res[value.Value, fail.Fail] = builder.emit_mul(?b, acc, value.param(1, vec));
+        if (sel rmul.err) { ret -1; }
+        acc = rmul.ok;
+        k   = k + 1;
+    }
+    val rret: err[fail.Fail] = builder.emit_ret(?b, acc);
+    if (sel rret.err) { ret -1; }
+
+    var preq: PipelineRequest = t_ready_request();
+    preq.module       = ?m;
+    preq.target       = rv;
+    preq.simd_require = SimdRequireOption{v: require};
+    preq.interner     = itn;
+    var diags: diagnostic.DiagnosticStore = diagnostic.store_init(alloc);
+    fin { diagnostic.store_dnit(?diags); }
+    preq.diags = ?diags;
+    val r: res[bool, fail.Fail] = run(?preq);
+    if (require && diagnostic.len(?diags) > 0 && !(sel r.err && fail.is_reported(r.err))) { ret -1; }
+    if (!require && sel r.err)                                                            { ret -1; }
+    var want: diagnostic.Severity = diagnostic.SEVERITY_WARNING;
+    if (require) { want = diagnostic.SEVERITY_ERROR; }
+    var n: i32   = 0;
+    var i: usize = 0;
+    for (i < diagnostic.len(?diags)) {
+        val d: *diagnostic.Diagnostic = ?diags.items.data[i];
+        if (d.severity != want)                    { ret -1; }
+        if (!require && d.kind != dkind.SCALARIZE) { ret -1; }
+        if (str_contains(d.message, "vector multiply on 16 lanes of 8-bit integers in 'kernel'")
+            && str_contains(d.message, needle)) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# a scalarized operation is named once at its site, whatever its lane count,
+# with the extension a declared packed row of its cell needs: a warning by
+# default and the same text as an error under `simd = "require"`, and nothing
+# once the target declares that extension. the x86_64 catalog packs no 8-bit
+# multiply at any extension, so the gated row here is the test's own
+test run__a_scalarized_site_names_the_extension_that_packs_it {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    fin { intern.dnit(?itn); }
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val rr: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel rr.err) { ret 1; }
+    val trr: res[resolved.Target, fail.Fail] = target.select(?reg, "x86_64", "linux", "sysv64");
+    if (sel trr.err) { ret 1; }
+    var rv: resolved.Target = trr.ok;
+
+    val none: str = "x86_64: no packed form for it at any extension";
+    if (mul_fallbacks(?alloc, ?itn, ?rv, 1, false, none) != 1) { ret 2; }
+    if (mul_fallbacks(?alloc, ?itn, ?rv, 3, false, none) != 3) { ret 3; }
+    if (mul_fallbacks(?alloc, ?itn, ?rv, 1, true, none) != 1)  { ret 4; }
+
+    val sse41: u64 = isa.extension_bit(?rv.model, "sse41", 5);
+    if (sse41 == 0 || rv.model.packed_form_len >= 128) { ret 5; }
+    var forms: [128]isa.PackedForm;
+    var i:     u32 = 0;
+    for (i < rv.model.packed_form_len) {
+        forms[i] = rv.model.packed_forms[i];
+        i        = i + 1;
+    }
+    forms[i]                 = isa.PackedForm{op: isa.VEC_OP_MUL, is_float: false, lane_bits: 8, from_bits: 8, ext: sse41};
+    rv.model.packed_forms    = ?forms[0];
+    rv.model.packed_form_len = i + 1;
+    val hint: str = "declaring `sse41` in the target's `extensions` packs it";
+    if (mul_fallbacks(?alloc, ?itn, ?rv, 1, false, hint) != 1) { ret 6; }
+    if (mul_fallbacks(?alloc, ?itn, ?rv, 1, true, hint) != 1)  { ret 7; }
+    rv.model.extensions = rv.model.extensions | sse41;
+    if (mul_fallbacks(?alloc, ?itn, ?rv, 1, false, "multiply") != 0) { ret 8; }
+    if (mul_fallbacks(?alloc, ?itn, ?rv, 1, true, "multiply") != 0)  { ret 9; }
+    ret 0;
+}
+
 test run__simd_require_judges_a_shift_by_its_count_form {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -1142,10 +1310,10 @@ fun vector_shift_outcome(alloc: *A.Allocator, itn: *intern.Interner, rv: *resolv
 
 #[testing]
 fun lane_text(lane_bits: u32) str {
-    if (lane_bits == 8)  { ret "16 lanes of 8 bits"; }
-    if (lane_bits == 16) { ret "8 lanes of 16 bits"; }
-    if (lane_bits == 32) { ret "4 lanes of 32 bits"; }
-    ret "2 lanes of 64 bits";
+    if (lane_bits == 8)  { ret "16 lanes of 8-bit integers"; }
+    if (lane_bits == 16) { ret "8 lanes of 16-bit integers"; }
+    if (lane_bits == 32) { ret "4 lanes of 32-bit integers"; }
+    ret "2 lanes of 64-bit integers";
 }
 
 # 0 when the pipeline accepts the vector multiply, 1 when it refuses it as an

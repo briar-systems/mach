@@ -60,8 +60,8 @@ pub fun outcome_code(bo: *outcome.BuildOutcome) i64;
 pub fun render_outcome(bo: *outcome.BuildOutcome, quiet: bool);
 ```
 
-render a build outcome's events to stderr in order: unit banners, scalarization notes,
-failures, and diagnostics
+render a build outcome's events to stderr in order: unit banners, failures,
+and diagnostics
 
 bo: the outcome
 quiet: suppress the "building <artifact> (<target>)" banner, which prints only when the
