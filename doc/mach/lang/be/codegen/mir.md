@@ -452,6 +452,16 @@ target that declares the form has a rule for it (#3511)
 pub val MIR_MUL_PAIR_S: MirOpcode = 0x100D
 ```
 
+## val MIR_VEC_RANGE
+
+```mach
+pub val MIR_VEC_RANGE: MirOpcode = 0x100E
+```
+
+the IR lane range (dst, src, first lane in imm): the source's lanes from the
+first on, of the same lane type. its IR kind is taken by MIR_MASK_LT_U here,
+so it lowers to this opcode instead (#3864)
+
 ## val MIR_SEL_ADD
 
 ```mach

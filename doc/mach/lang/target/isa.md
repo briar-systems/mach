@@ -428,10 +428,21 @@ pub val VEC_OP_SHR_U_V: VecOp = 30
 pub val VEC_OP_SHR_S_V: VecOp = 31
 ```
 
+## val VEC_OP_RANGE
+
+```mach
+pub val VEC_OP_RANGE: VecOp = 32
+```
+
+a lane range: the lanes of the operand from a constant first lane on, of the
+same lane type, in a vector of at most as many lanes. a cell names the lane
+kind and width, which the operation keeps; its scalar row is the lane path,
+each lane extracted and the result built or written through memory (#3864)
+
 ## val VEC_OP_LAST
 
 ```mach
-pub val VEC_OP_LAST:    VecOp = VEC_OP_SHR_S_V
+pub val VEC_OP_LAST:  VecOp = VEC_OP_RANGE
 ```
 
 ## rec PackedForm
@@ -633,6 +644,12 @@ pub fun is_widen_half_op(op: VecOp) bool;
 pub fun is_shift_op(op: VecOp) bool;
 ```
 
+## fun is_range_op
+
+```mach
+pub fun is_range_op(op: VecOp) bool;
+```
+
 ## fun vector_domain_len
 
 ```mach
@@ -676,6 +693,15 @@ pub fun scalar_shift_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
 
 the same for the shifts: a cell the packed table leaves is shifted lane by
 lane through the scalar shift, which saturates the same way
+
+## fun scalar_range_rows
+
+```mach
+pub fun scalar_range_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
+```
+
+the same for the lane ranges: a cell the packed table leaves keeps the lane
+path
 
 ## fun ct_mul_rows_admit
 
