@@ -218,7 +218,7 @@ pub fun prepare_persistent_cache(p: *project.Project, ph: u8) err[outcome.Fail];
 
 once per query operation, after the typed definitions are current: the
 compiler identity (once per project), then the cell snapshot through its
-query so an unchanged cell is not rehashed, then the store directory. its
+query so an unchanged cell is not rehashed, then whether `obj/` is read. its
 items are reported under the readout phase ph that runs it
 
 ## fun run_codegen_pass

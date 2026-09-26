@@ -39,15 +39,23 @@ pub fun prepare(p: *project.Project, snapshot: *[32]u8) err[fail.Fail];
 once per query operation. snapshot is the cell digest the operation computed,
 nil when the cache is off or the compiler has no identity
 
+## fun object_path
+
+```mach
+pub fun object_path(p: *project.Project, m: *project.ModuleEntry, a: *A.Allocator) res[str, fail.Fail];
+```
+
+where the build writes module m's object: `obj/<project>/<module path>.<ext>`
+
 ## fun early_restore_enabled
 
 ```mach
 pub fun early_restore_enabled(p: *project.Project) bool;
 ```
 
-a module whose object the store holds skips lowering when nothing else needs
-its ir: the ir and asm emitters read it, and a whole-module backend reads
-every referenced module's ir while generating one object
+a module whose object is cached skips lowering when nothing else needs its
+ir: the ir and asm emitters read it, and a whole-module backend reads every
+referenced module's ir while generating one object
 
 ## fun restored
 
@@ -55,8 +63,9 @@ every referenced module's ir while generating one object
 pub fun restored(p: *project.Project, m: *project.ModuleEntry) bool;
 ```
 
-the module's codegen product came from the store under the current snapshot,
-whether it is still staged or a query already took it: the module does not lower
+the module's codegen product is its cached object under the current
+snapshot, whether it is still staged or a query already took it: the module
+does not lower, and its object is already in `obj/`
 
 ## fun staged_restored
 
@@ -65,6 +74,25 @@ pub fun staged_restored(p: *project.Project, m: *project.ModuleEntry) bool;
 ```
 
 restored and still staged, which is what the codegen query publishes
+
+## rec Cached
+
+```mach
+pub rec Cached;
+```
+
+an object read back from `obj/` with the facts its record carries
+
+## fun read
+
+```mach
+pub fun read(p: *project.Project, location: str, expected: *[32]u8) res[opt[Cached], fail.Fail];
+```
+
+the object at `location` when its record says it was built under `expected`,
+none on a miss: an object that is missing, unreadable, carries no record or
+a damaged one, or was built under another key is rebuilt, never reused.
+err only when allocation fails
 
 ## fun restore
 
@@ -102,4 +130,7 @@ pub fun collect_tests(p: *project.Project, m: *project.ModuleEntry, mid: u32, c:
 ```mach
 pub fun publish(p: *project.Project, m: *project.ModuleEntry, image: *of.ObjectImage) err[fail.Fail];
 ```
+
+a generated image carries its record into `obj/`: the key it was built
+under and the facts its lowered ir holds
 
