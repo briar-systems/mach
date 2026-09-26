@@ -145,17 +145,6 @@ pub fun run_lower_pass(p: *project.Project) err[outcome.Fail];
 pub fun prepare_lower_pass(p: *project.Project) err[outcome.Fail];
 ```
 
-## fun q_cell_snapshot_compute
-
-```mach
-pub fun q_cell_snapshot_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
-```
-
-the persistent object key's inputs as one query product: every typed
-definition in the cell, the target configuration and the codegen flags. its
-bytes are the cell digest, so an edit anywhere in the cell advances it and
-every product restored under the old digest recomputes
-
 ## fun load_status
 
 ```mach
@@ -209,17 +198,6 @@ pub fun acquire_codegen_inputs(p: *project.Project) err[outcome.Fail];
 the modules that still lower here are those without a product restored under
 this operation's snapshot; a module restored in the lower operation keeps its
 staged product when the snapshot is unchanged and lowers now if it changed
-
-## fun prepare_persistent_cache
-
-```mach
-pub fun prepare_persistent_cache(p: *project.Project, ph: u8) err[outcome.Fail];
-```
-
-once per query operation, after the typed definitions are current: the
-compiler identity (once per project), then the cell snapshot through its
-query so an unchanged cell is not rehashed, then whether `obj/` is read. its
-items are reported under the readout phase ph that runs it
 
 ## fun run_codegen_pass
 
@@ -305,6 +283,15 @@ pub fun capture_configuration_identity(p: *project.Project, alloc: *A.Allocator)
 
 the build identity without the request: the persistent key hashes the request
 itself, with the project root in canonical form, so the spelled root stays out
+
+## fun prepare_object_cache
+
+```mach
+pub fun prepare_object_cache(p: *project.Project) err[fail.Fail];
+```
+
+key the loaded modules and read `obj/` under their keys (driver/cache),
+reported as the cache phase carved out of resolve, which it precedes
 
 ## fun set_build_config_input
 
