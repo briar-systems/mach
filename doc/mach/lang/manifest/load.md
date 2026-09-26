@@ -32,39 +32,3 @@ ret: the manifest, or the first error as a "mach.toml: ..." message. the
          entries are checked by `validate_needs`. `[profile.*]` absent or empty is
          an error at the root and synthesizes `debug` and `release` in a dependency
 
-## fun demo_src
-
-```mach
-pub fun demo_src() str;
-```
-
-## fun tparse
-
-```mach
-pub fun tparse(alloc: *A.Allocator, itn: *intern.Interner, src: str) res[Manifest, outcome.Fail];
-```
-
-## fun tparse_lenient
-
-```mach
-pub fun tparse_lenient(alloc: *A.Allocator, itn: *intern.Interner, src: str) res[Manifest, outcome.Fail];
-```
-
-## fun need_head
-
-```mach
-pub fun need_head() str;
-```
-
-## fun need_artifact
-
-```mach
-pub fun need_artifact(alloc: *A.Allocator, name: str, out: str, need: str) str;
-```
-
-## fun need_err
-
-```mach
-pub fun need_err(alloc: *A.Allocator, itn: *intern.Interner, src: str, needle: str) bool;
-```
-

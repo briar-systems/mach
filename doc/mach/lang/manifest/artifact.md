@@ -264,9 +264,3 @@ a: the artifact
 tname: the target name
 ret: true when listed
 
-## fun mk_tv
-
-```mach
-pub fun mk_tv(target: str, isa: str, os: str, abi: str, profile: str) TmplVars;
-```
-
