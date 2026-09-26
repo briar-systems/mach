@@ -51,8 +51,10 @@ pub fun equal(left: *[32]u8, right: *[32]u8) bool;
 ## fun object
 
 ```mach
-pub fun object(snapshot: *[32]u8, module: str, out: *[32]u8) err[fail.Fail];
+pub fun object(module_key: *[32]u8, module: str, out: *[32]u8) err[fail.Fail];
 ```
+
+the key of a module's object: the module's key and its name
 
 ## fun step
 

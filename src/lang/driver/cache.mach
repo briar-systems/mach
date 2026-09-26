@@ -1,9 +1,20 @@
+# the persistent object cache. every module the build emits is keyed once per
+# load, after the load walk and before anything is resolved: its key covers
+# the build configuration and compiler identity, the module's own source and
+# embedded files, and the surface of every module it imports, transitively.
+# an import's surface is its source without the bodies no importer compiles
+# (see driver/surface), so an edit inside such a body keys only its own
+# module. a release build inlines bodies across modules, so there an import's
+# whole source is its surface. a module whose `obj/` object carries its key
+# is reused, and when nothing the build still compiles imports it, it is not
+# resolved, typed or lowered at all. source digests come from the per-file
+# digest memo in the cell's `.cache` directory (build/cache/memo)
 use mach.lang.build.cache.key;
 use mach.lang.build.request;
+use mach.lang.diagnostic;
 use mach.lang.driver.project;
 use mach.lang.embed;
 use mach.lang.fail;
-use mach.lang.fe.sema;
 use mach.lang.intern;
 use mach.lang.source;
 use A: std.allocator;
@@ -18,6 +29,35 @@ use std.types.string.OwnedString;
 use std.types.string.owned_release;
 use std.types.string.str;
 use std.types.string.str_len;
+
+use mach.lang.build.cache.compiler;
+use mach.lang.build.cache.memo;
+use cache_record: mach.lang.build.cache.record;
+use mach.lang.build.outcome;
+use mach.lang.driver.surface;
+use mach.lang.driver.union;
+use mach.lang.fe.token;
+use mach.lang.me.ir;
+use mach.lang.me.lower.testrunner;
+use mach.lang.me.pipeline;
+use mach.lang.output;
+use mach.lang.query;
+use mach.lang.readout;
+use mach.lang.session;
+use mach.lang.target.isa;
+use mach.lang.target.of;
+use mach.lang.target.of.bin;
+use std.allocator.page;
+use std.chrono.time;
+use std.collections.map;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.crypto.hash.sha256;
+use fs: std.filesystem;
+use std.memory;
+use std.text.string.str_free;
+use std.types.bool.true;
+use std.types.path;
 
 # a path as the filesystem would name it from this process: absolute and
 # lexically clean, so `mach build .` and `mach build /abs/project` agree
@@ -44,20 +84,28 @@ fun key_path(b: *key.Builder, scratch: *A.Allocator, cwd: str, spelled: str, spe
     ret err[fail.Fail].ok{};
 }
 
-# hash the whole active build cell because generic instantiations can cross import direction
-pub fun snapshot(scratch: *A.Allocator, p: *project.Project, config: *u8, config_len: usize,
+fun current_dir(scratch: *A.Allocator) res[OwnedString, fail.Fail] {
+    val cwd_r: res[OwnedString, env.EnvError] = env.current_dir(scratch);
+    if (sel cwd_r.err) { ret res[OwnedString, fail.Fail].err{fail.message("the object cache cannot read the current directory")}; }
+    ret res[OwnedString, fail.Fail].ok{cwd_r.ok};
+}
+
+# what every module's key shares: the compiler identity, the configuration
+# bytes the driver captured (target, platform, project identity), the request,
+# the step outputs, the realized dependency closure and the link providers
+pub fun configuration(scratch: *A.Allocator, p: *project.Project, config: *u8, config_len: usize,
     compiler_id: *compiler.Identity, digest: *[32]u8) err[fail.Fail] {
     if (scratch == nil || p == nil || p.s == nil || compiler_id == nil || digest == nil
         || compiler_id.len == 0 || compiler_id.len > 32) {
-        ret err[fail.Fail].err{fail.message("cache snapshot requires a project and compiler identity")};
+        ret err[fail.Fail].err{fail.message("the cache configuration requires a project and compiler identity")};
     }
-    val cwd_r: res[OwnedString, env.EnvError] = env.current_dir(scratch);
-    if (sel cwd_r.err) { ret err[fail.Fail].err{fail.message("cache snapshot cannot read the current directory")}; }
+    val cwd_r: res[OwnedString, fail.Fail] = current_dir(scratch);
+    if (sel cwd_r.err) { ret err[fail.Fail].err{cwd_r.err}; }
     var cwd_owned: OwnedString = cwd_r.ok;
     fin { owned_release(?cwd_owned); }
     val cwd:              str         = cwd_owned.data;
     val spelling_matters: bool        = p.req.debug;
-    var b:                key.Builder = key.begin("mach.compilation-cell");
+    var b:                key.Builder = key.begin("mach.build-configuration");
     key.number(?b, compiler_id.source::u64);
     key.bytes(?b, ?compiler_id.bytes[0], compiler_id.len);
     key.bytes(?b, config, config_len);
@@ -81,42 +129,12 @@ pub fun snapshot(scratch: *A.Allocator, p: *project.Project, config: *u8, config
     key.name(?b, ?p.s.interner, p.config.module);
     key.name(?b, ?p.s.interner, p.config.dir_src);
     val root: opt[str] = intern.lookup(?p.s.interner, p.config.project_root);
-    if (sel root.none) { ret err[fail.Fail].err{fail.message("cache snapshot has no project root")}; }
+    if (sel root.none) { ret err[fail.Fail].err{fail.message("the cache configuration has no project root")}; }
     val root_keyed: err[fail.Fail] = key_path(?b, scratch, cwd, root.some, spelling_matters);
     if (sel root_keyed.err) { ret root_keyed; }
     key.number(?b, p.roots::u64);
-    key.number(?b, project.module_count(p)::u64);
-    var i: u32 = 0;
-    for (i < project.module_count(p)) {
-        val m:    *project.ModuleEntry    = project.module_at(p, i);
-        val file: opt[*source.SourceFile] = source.get(?p.s.sources, m.file_id);
-        if (sel file.none) { ret err[fail.Fail].err{fail.message("cache snapshot module has no current source")}; }
-        val f: *source.SourceFile = file.some;
-        if (!f.present || f.text == nil) { ret err[fail.Fail].err{fail.message("cache snapshot source is not present")}; }
-        key.name(?b, ?p.s.interner, m.fqn);
-        val file_keyed: err[fail.Fail] = key_path(?b, scratch, cwd, f.path, spelling_matters);
-        if (sel file_keyed.err) { ret file_keyed; }
-        key.bytes(?b, f.text, str_len(f.text));
-        key.number(?b, m.dep_count::u64);
-        var d: u32 = 0;
-        for (d < m.dep_count) {
-            val dependency: u32 = m.deps[d]::u32;
-            if (dependency >= project.module_count(p)) { ret err[fail.Fail].err{fail.message("cache snapshot dependency is not loaded")}; }
-            key.name(?b, ?p.s.interner, project.module_at(p, dependency).fqn);
-            d = d + 1;
-        }
-        i = i + 1;
-    }
-    key.number(?b, p.emit_len::u64);
-    i = 0;
-    for (i < p.emit_len) {
-        val mid: u32 = p.topo[i]::u32;
-        if (mid >= project.module_count(p)) { ret err[fail.Fail].err{fail.message("cache snapshot emission order names an absent module")}; }
-        key.name(?b, ?p.s.interner, project.module_at(p, mid).fqn);
-        i = i + 1;
-    }
     key.number(?b, p.config.dep_count::u64);
-    i = 0;
+    var i: u32 = 0;
     for (i < p.config.dep_count) {
         val d: *project.DepEntry = ?p.config.deps[i];
         key.name(?b, ?p.s.interner, d.alias);
@@ -124,7 +142,7 @@ pub fun snapshot(scratch: *A.Allocator, p: *project.Project, config: *u8, config
         key.name(?b, ?p.s.interner, d.project_dir_src);
         key.name(?b, ?p.s.interner, d.project_module);
         val vendor: opt[str] = intern.lookup(?p.s.interner, d.vendor_root);
-        if (sel vendor.none) { ret err[fail.Fail].err{fail.message("cache snapshot dependency has no vendor root")}; }
+        if (sel vendor.none) { ret err[fail.Fail].err{fail.message("the cache configuration dependency has no vendor root")}; }
         val vendor_keyed: err[fail.Fail] = key_path(?b, scratch, cwd, vendor.some, spelling_matters);
         if (sel vendor_keyed.err) { ret vendor_keyed; }
         key.name(?b, ?p.s.interner, d.source);
@@ -139,28 +157,6 @@ pub fun snapshot(scratch: *A.Allocator, p: *project.Project, config: *u8, config
         }
         i = i + 1;
     }
-    key.number(?b, p.topo_len::u64);
-    i = 0;
-    for (i < p.topo_len) {
-        val mid: u32 = p.topo[i]::u32;
-        if (mid >= project.module_count(p)) { ret err[fail.Fail].err{fail.message("cache snapshot names an absent typed module")}; }
-        val typed: *sema.SemaResult = project.module_at(p, mid).sema_result;
-        if (typed == nil) { ret err[fail.Fail].err{fail.message("cache snapshot module has no current typed owner")}; }
-        key.name(?b, ?p.s.interner, project.module_at(p, mid).fqn);
-        key.number(?b, typed.embed_path_count::u64);
-        var ei: u32 = 0;
-        for (ei < typed.embed_path_count) {
-            val found: opt[*embed.EmbedFile] = embed.get(?p.s.embeds, typed.embed_paths[ei]);
-            if (sel found.none) { ret err[fail.Fail].err{fail.message("cache snapshot is missing an active embedded input")}; }
-            val e: *embed.EmbedFile = found.some;
-            if (e.status != embed.EMBED_OK) { ret err[fail.Fail].err{fail.message("cache snapshot contains an unavailable embedded input")}; }
-            key.name(?b, ?p.s.interner, e.path);
-            key.number(?b, e.len::u64);
-            key.bytes(?b, ?e.digest[0], 32);
-            ei = ei + 1;
-        }
-        i = i + 1;
-    }
     key.number(?b, p.s.link_provider_len::u64);
     i = 0;
     for (i < p.s.link_provider_len) {
@@ -169,29 +165,6 @@ pub fun snapshot(scratch: *A.Allocator, p: *project.Project, config: *u8, config
         i = i + 1;
     }
     ret key.finish(?b, digest);
-}
-
-use mach.lang.build.cache.compiler;
-use cache_record: mach.lang.build.cache.record;
-use mach.lang.build.outcome;
-use mach.lang.me.ir;
-use mach.lang.me.lower.testrunner;
-use mach.lang.output;
-use mach.lang.query;
-use mach.lang.readout;
-use mach.lang.session;
-use mach.lang.target.isa;
-use mach.lang.target.of;
-use std.allocator.page;
-use std.collections.vector;
-use fs: std.filesystem;
-use std.text.string.str_free;
-use std.types.bool.true;
-use std.types.path;
-
-pub fun operation_active(p: *project.Project) bool {
-    ret p != nil && p.s != nil && p.s.queries.operation_active
-        && p.cache_operation_sequence != 0 && p.cache_operation_sequence == p.s.queries.operation_sequence;
 }
 
 # the compiler identity is a process constant: read once per project, reported
@@ -223,36 +196,12 @@ pub fun identity_available(p: *project.Project) bool {
     ret p.compiler_identity_initialized && p.compiler_identity_available;
 }
 
-# once per query operation. snapshot is the cell digest the operation computed,
-# nil when the cache is off or the compiler has no identity
-pub fun prepare(p: *project.Project, snapshot: *[32]u8) err[fail.Fail] {
-    if (!operation_active(p)) { ret err[fail.Fail].err{fail.message("cache preparation requires the current query operation")}; }
-    if (p.cache_initialized)  { ret err[fail.Fail].ok{}; }
-    p.cache_initialized = true;
-    if (snapshot == nil || !p.req.object_cache) { ret err[fail.Fail].ok{}; }
-    p.cache_snapshot = @snapshot;
-    discard_stale(p);
-    p.cache_ready = objects_cached(p);
-    ret err[fail.Fail].ok{};
-}
-
 # `obj/` is the object cache when the build writes its modules there as
 # relocatable objects the target's format reads back
 fun objects_cached(p: *project.Project) bool {
+    if (p.target.of == nil) { ret false; }
     val vt: *of.OfVTable = p.target.of;
-    ret p.object_dir != nil && vt != nil && !vt.produces_image
-        && vt.emit_object != nil && vt.parse_object != nil;
-}
-
-# a module's cache verdict and staged product belong to the snapshot they were
-# taken under; a new snapshot reads the object again
-fun discard_stale(p: *project.Project) {
-    var i: u32 = 0;
-    for (i < project.module_count(p)) {
-        val m: *project.ModuleEntry = project.module_at(p, i);
-        if (m.cache_checked && !key.equal(?m.cache_under, ?p.cache_snapshot)) { project.release_staged(p, m); }
-        i = i + 1;
-    }
+    ret p.object_dir != nil && !vt.produces_image && vt.emit_object != nil && vt.parse_object != nil;
 }
 
 # where the build writes module m's object: `obj/<project>/<module path>.<ext>`
@@ -265,6 +214,15 @@ pub fun object_path(p: *project.Project, m: *project.ModuleEntry, a: *A.Allocato
     ret res[str, fail.Fail].ok{named.ok};
 }
 
+# the digest memo in the cell's compiler-only state: `<out>/.cache/digests`,
+# none for a build that has no such directory, whose memo lives in memory only
+fun memo_path(p: *project.Project, scratch: *A.Allocator) res[opt[str], fail.Fail] {
+    if (p.cache_dir == nil) { ret res[opt[str], fail.Fail].ok{opt[str].none{}}; }
+    val file: res[str, A.Error] = path.join(scratch, p.cache_dir, "digests");
+    if (sel file.err) { ret res[opt[str], fail.Fail].err{fail.refused(file.err)}; }
+    ret res[opt[str], fail.Fail].ok{opt[str].some{file.ok}};
+}
+
 # a module whose object is cached skips lowering when nothing else needs its
 # ir: the ir and asm emitters read it, and a whole-module backend reads every
 # referenced module's ir while generating one object
@@ -272,16 +230,66 @@ pub fun early_restore_enabled(p: *project.Project) bool {
     ret p.req.object_cache && !p.req.emit_ir && !p.req.emit_asm && !isa.emits_whole_module(p.target.isa);
 }
 
-# the module's codegen product is its cached object under the current
-# snapshot, whether it is still staged or a query already took it: the module
-# does not lower, and its object is already in `obj/`
+# the module's codegen product is its cached object under the key this load
+# built, whether it is still staged or a query already took it
 pub fun restored(p: *project.Project, m: *project.ModuleEntry) bool {
-    ret m.cache_hit && key.equal(?m.cache_under, ?p.cache_snapshot);
+    ret p.cache_ready && m.cache_keyed && m.cache_hit && key.equal(?m.cache_under, ?m.cache_key);
 }
 
 # restored and still staged, which is what the codegen query publishes
 pub fun staged_restored(p: *project.Project, m: *project.ModuleEntry) bool {
     ret m.staged_image != nil && restored(p, m);
+}
+
+# the module is restored and nothing needs its lowered ir
+pub fun skips_lowering(p: *project.Project, m: *project.ModuleEntry) bool {
+    ret restored(p, m) && early_restore_enabled(p);
+}
+
+# the emitted modules the build lowers
+pub fun lowered_count(p: *project.Project) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < p.emit_len) {
+        if (!skips_lowering(p, project.module_at(p, p.topo[i]::u32))) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the emitted modules the build generates code for
+pub fun generated_count(p: *project.Project) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < p.emit_len) {
+        if (!restored(p, project.module_at(p, p.topo[i]::u32))) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the modules the front end still processes
+pub fun frontend_count(p: *project.Project) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        if (!project.module_at(p, p.topo[i]::u32).frontend_skipped) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# every key and skip decision of the previous load is dropped: the next load
+# keys again, and a project that is not keyed processes every module
+pub fun forget(p: *project.Project) {
+    p.cache_ready = false;
+    var i: u32 = 0;
+    for (i < project.module_count(p)) {
+        val m: *project.ModuleEntry = project.module_at(p, i);
+        m.cache_keyed      = false;
+        m.frontend_skipped = false;
+        i                  = i + 1;
+    }
 }
 
 # an object read back from `obj/` with the facts its record carries
@@ -327,21 +335,26 @@ pub fun read(p: *project.Project, location: str, expected: *[32]u8) res[opt[Cach
     ret res[opt[Cached], fail.Fail].ok{opt[Cached].some{Cached{image: image, facts: found.facts}}};
 }
 
-# a hit is reported under the readout phase ph that asked for the module
-pub fun restore(p: *project.Project, mid: session.ModuleId, ph: u8) res[bool, fail.Fail] {
-    if (!operation_active(p)) { ret res[bool, fail.Fail].err{fail.message("cache restoration requires the current query operation")}; }
-    val index: u32 = mid::u32;
-    if (index >= project.module_count(p)) { ret res[bool, fail.Fail].err{fail.message("cache restore names an absent module")}; }
-    val m: *project.ModuleEntry = project.module_at(p, index);
-    if (!p.cache_ready || m.cache_checked) { ret res[bool, fail.Fail].ok{m.cache_hit}; }
+# the object key of a module: its module key and its name. a module's other
+# objects (a test object) key off this one
+pub fun object_key(p: *project.Project, m: *project.ModuleEntry, out: *[32]u8) err[fail.Fail] {
+    ret key.object(?m.cache_key, project.fqn_name(p, m.fqn), out);
+}
+
+# read module m's object under its key; a hit is staged for the codegen query.
+# a hit under the same key stands, and a miss is read again, since the build
+# that missed published the object
+fun restore(p: *project.Project, m: *project.ModuleEntry, ph: u8) res[bool, fail.Fail] {
+    if (m.cache_checked && m.cache_hit && key.equal(?m.cache_under, ?m.cache_key)) { ret res[bool, fail.Fail].ok{true}; }
+    project.release_staged(p, m);
     m.cache_checked = true;
-    m.cache_under   = p.cache_snapshot;
+    m.cache_under   = m.cache_key;
     val t_restore: readout.Instant = readout.item_begin(p.events);
     var backing:   A.Allocator;
     val make_r:    err[A.Error]    = page.make(?backing);
     if (sel make_r.err) { ret res[bool, fail.Fail].err{fail.message("cache scratch allocator is unavailable")}; }
     var expected: [32]u8;
-    val keyed:    err[fail.Fail] = key.object(?p.cache_snapshot, project.fqn_name(p, m.fqn), ?expected);
+    val keyed:    err[fail.Fail] = object_key(p, m, ?expected);
     if (sel keyed.err) { ret res[bool, fail.Fail].err{keyed.err}; }
     val located: res[str, fail.Fail] = object_path(p, m, ?backing);
     if (sel located.err) { ret res[bool, fail.Fail].err{located.err}; }
@@ -367,8 +380,355 @@ pub fun restore(p: *project.Project, mid: session.ModuleId, ph: u8) res[bool, fa
     m.staged_facts = cached.facts;
     m.cache_hit    = true;
     p.cache_hits   = p.cache_hits + 1;
-    readout.item(p.events, ph, "cached object", t_restore);
+    readout.item(p.events, ph, project.fqn_name(p, m.fqn), t_restore);
     ret res[bool, fail.Fail].ok{true};
+}
+
+# what one load needs while it keys its modules
+rec Keying {
+    scratch: *A.Allocator;
+    cwd:     str;
+    config:  [32]u8;
+    memo:    memo.Memo;
+    now:     opt[time.Time];
+    # which surface digest an importer's key reads
+    variant: u8;
+    # each module's surface digest, 32 bytes at 32 times its module number
+    ifaces: *u8;
+    ready:  *bool;
+    spans:  Vector[token.Span];
+}
+
+val SURFACE_BARE:   u8 = 0;
+val SURFACE_PLACED: u8 = 1;
+val SURFACE_WHOLE:  u8 = 2;
+
+fun compute_digests(k: *Keying, m: *project.ModuleEntry, text: str, out: *memo.Digests) bool {
+    sha256.hash(text::*u8, str_len(text), ?out.content[0]);
+    vector.clear[token.Span](?k.spans);
+    val found: err[fail.Fail] = surface.omitted(m.a, text, ?k.spans);
+    if (sel found.err) { ret false; }
+    surface.digest(text, ?k.spans, false, ?out.surface);
+    surface.digest(text, ?k.spans, true, ?out.placed);
+    ret true;
+}
+
+fun bytes_equal(a: *u8, a_len: usize, text: str) bool {
+    if (a_len != str_len(text)) { ret false; }
+    ret memory.raw_equal(a::ptr, text::ptr, a_len);
+}
+
+# the digests of the module's text: from the memo when the file still looks
+# as it did when it was hashed, else hashed now and remembered when the file
+# provably holds the text that was hashed
+fun source_digests(k: *Keying, m: *project.ModuleEntry, file: str, text: str, out: *memo.Digests) res[bool, fail.Fail] {
+    val observed: opt[memo.Stamp] = memo.stamp(file);
+    if (sel observed.none) {
+        ret res[bool, fail.Fail].ok{compute_digests(k, m, text, out)};
+    }
+    var first: memo.Stamp = observed.some;
+    if (first.size == str_len(text)::u64) {
+        val got: opt[memo.Digests] = memo.lookup(?k.memo, file, ?first);
+        if (sel got.some) {
+            @out = got.some;
+            ret res[bool, fail.Fail].ok{true};
+        }
+    }
+    if (!compute_digests(k, m, text, out)) { ret res[bool, fail.Fail].ok{false}; }
+    if (sel k.now.none)                    { ret res[bool, fail.Fail].ok{true}; }
+    val read: res[Vector[u8], fs.FsError] = fs.read_bytes(k.scratch, file);
+    if (sel read.err) { ret res[bool, fail.Fail].ok{true}; }
+    var bytes: Vector[u8] = read.ok;
+    fin { vector.dnit[u8](?bytes); }
+    if (!bytes_equal(bytes.data, bytes.len, text)) { ret res[bool, fail.Fail].ok{true}; }
+    val again: opt[memo.Stamp] = memo.stamp(file);
+    if (sel again.none) { ret res[bool, fail.Fail].ok{true}; }
+    var second: memo.Stamp = again.some;
+    if (first.size != second.size || first.sec != second.sec || first.nsec != second.nsec
+        || !memory.raw_equal((?first.identity[0])::ptr, (?second.identity[0])::ptr, 41)) { ret res[bool, fail.Fail].ok{true}; }
+    val recorded: err[A.Error] = memo.record(?k.memo, file, ?first, out, k.now.some);
+    if (sel recorded.err) { ret res[bool, fail.Fail].err{fail.refused(recorded.err)}; }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# the files a module embeds, by path, status, length and digest
+fun key_embeds(b: *key.Builder, p: *project.Project, m: *project.ModuleEntry) err[fail.Fail] {
+    var paths: Vector[str] = vector.init[str](p.s.alloc);
+    fin {
+        var i: usize = 0;
+        for (i < paths.len) {
+            str_free(p.s.alloc, paths.data[i]);
+            i = i + 1;
+        }
+        vector.dnit[str](?paths);
+    }
+    val collected: err[fail.Fail] = union.module_embeds(p, m, ?paths);
+    if (sel collected.err) { ret collected; }
+    key.number(b, paths.len::u64);
+    var i: usize = 0;
+    for (i < paths.len) {
+        key.text(b, paths.data[i]);
+        val named: res[intern.StrId, A.Error] = intern.intern(?p.s.interner, paths.data[i]);
+        if (sel named.err) { ret err[fail.Fail].err{fail.refused(named.err)}; }
+        val found: opt[*embed.EmbedFile] = embed.get(?p.s.embeds, named.ok);
+        if (sel found.some) {
+            val e: *embed.EmbedFile = found.some;
+            key.number(b, e.status::u64);
+            key.number(b, e.len::u64);
+            key.bytes(b, ?e.digest[0], 32);
+        }
+        or { key.number(b, 0xFFFFFFFF); }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# what names a module in both of its digests: its name, its module number,
+# its file and the artifact whose comptime values it reads
+fun key_module_identity(b: *key.Builder, k: *Keying, p: *project.Project, mid: u32, file: str) err[fail.Fail] {
+    val m: *project.ModuleEntry = project.module_at(p, mid);
+    key.name(b, ?p.s.interner, m.fqn);
+    key.number(b, mid::u64);
+    key.name(b, ?p.s.interner, m.artifact);
+    ret key_path(b, k.scratch, k.cwd, file, p.req.debug);
+}
+
+fun iface_of(k: *Keying, mid: u32) *u8 {
+    ret (k.ifaces::usize + mid::usize * 32)::*u8;
+}
+
+fun key_imports(b: *key.Builder, k: *Keying, m: *project.ModuleEntry) {
+    key.number(b, m.dep_count::u64);
+    var d: u32 = 0;
+    for (d < m.dep_count) {
+        key.bytes(b, iface_of(k, m.deps[d]::u32), 32);
+        d = d + 1;
+    }
+}
+
+# key module mid: its import surface for its importers, and its object key.
+# a module without a current source, or one importing a module that has no
+# surface yet, stays unkeyed and is always built
+fun key_module(k: *Keying, p: *project.Project, mid: u32) err[fail.Fail] {
+    val m: *project.ModuleEntry = project.module_at(p, mid);
+    if (m.a == nil || m.file_id == source.FILE_NIL) { ret err[fail.Fail].ok{}; }
+    val file_o: opt[*source.SourceFile] = source.get(?p.s.sources, m.file_id);
+    if (sel file_o.none) { ret err[fail.Fail].ok{}; }
+    val f: *source.SourceFile = file_o.some;
+    if (!f.present || f.text == nil || f.path == nil) { ret err[fail.Fail].ok{}; }
+    var d: u32 = 0;
+    for (d < m.dep_count) {
+        val dep: u32 = m.deps[d]::u32;
+        if (dep >= project.module_count(p) || !k.ready[dep]) { ret err[fail.Fail].ok{}; }
+        d = d + 1;
+    }
+    val canon: res[str, fail.Fail] = canonical(k.scratch, k.cwd, f.path);
+    if (sel canon.err) { ret err[fail.Fail].err{canon.err}; }
+    var digests: memo.Digests;
+    val known:   res[bool, fail.Fail] = source_digests(k, m, canon.ok, f.text, ?digests);
+    str_free(k.scratch, canon.ok);
+    if (sel known.err) { ret err[fail.Fail].err{known.err}; }
+    if (!known.ok)     { ret err[fail.Fail].ok{}; }
+
+    var iface: key.Builder    = key.begin("mach.module-surface");
+    val named: err[fail.Fail] = key_module_identity(?iface, k, p, mid, f.path);
+    if (sel named.err)               { ret named; }
+    if (k.variant == SURFACE_WHOLE)  { key.bytes(?iface, ?digests.content[0], 32); }
+    or (k.variant == SURFACE_PLACED) { key.bytes(?iface, ?digests.placed[0], 32); }
+    or                               { key.bytes(?iface, ?digests.surface[0], 32); }
+    val iface_embeds: err[fail.Fail] = key_embeds(?iface, p, m);
+    if (sel iface_embeds.err) { ret iface_embeds; }
+    key_imports(?iface, k, m);
+
+    var own: key.Builder = key.begin("mach.module-object");
+    key.bytes(?own, ?k.config[0], 32);
+    val named_own: err[fail.Fail] = key_module_identity(?own, k, p, mid, f.path);
+    if (sel named_own.err) { ret named_own; }
+    key.bytes(?own, ?digests.content[0], 32);
+    val own_embeds: err[fail.Fail] = key_embeds(?own, p, m);
+    if (sel own_embeds.err) { ret own_embeds; }
+    key_imports(?own, k, m);
+
+    val iface_done: err[fail.Fail] = key.finish(?iface, iface_of(k, mid)::*[32]u8);
+    if (sel iface_done.err) { ret iface_done; }
+    val own_done: err[fail.Fail] = key.finish(?own, ?m.cache_key);
+    if (sel own_done.err) { ret own_done; }
+    k.ready[mid]  = true;
+    m.cache_keyed = true;
+    ret err[fail.Fail].ok{};
+}
+
+fun memo_compiler(id: *compiler.Identity, out: *[32]u8) err[fail.Fail] {
+    var b: key.Builder = key.begin("mach.digest-memo");
+    key.number(?b, id.source::u64);
+    key.bytes(?b, ?id.bytes[0], id.len);
+    ret key.finish(?b, out);
+}
+
+fun key_modules(p: *project.Project, scratch: *A.Allocator, config: *u8, config_len: usize, ph: u8) err[fail.Fail] {
+    val t_keys: readout.Instant             = readout.item_begin(p.events);
+    val cwd_r:  res[OwnedString, fail.Fail] = current_dir(scratch);
+    if (sel cwd_r.err) { ret err[fail.Fail].err{cwd_r.err}; }
+    var cwd_owned: OwnedString = cwd_r.ok;
+    fin { owned_release(?cwd_owned); }
+    var k: Keying = Keying{scratch: scratch, cwd: cwd_owned.data, spans: vector.init[token.Span](scratch)};
+    fin { vector.dnit[token.Span](?k.spans); }
+    val configured: err[fail.Fail] = configuration(scratch, p, config, config_len, ?p.compiler_identity, ?k.config);
+    if (sel configured.err) { ret configured; }
+    k.variant = SURFACE_BARE;
+    if (p.req.opt == pipeline.OPT_RELEASE) { k.variant = SURFACE_WHOLE; }
+    or (p.req.debug)                       { k.variant = SURFACE_PLACED; }
+    val clock: time.Clock = time.now();
+    k.now = opt[time.Time].none{};
+    if (sel clock.ok) { k.now = opt[time.Time].some{clock.ok}; }
+
+    var owner: [32]u8;
+    val owned: err[fail.Fail] = memo_compiler(?p.compiler_identity, ?owner);
+    if (sel owned.err) { ret owned; }
+    val located: res[opt[str], fail.Fail] = memo_path(p, scratch);
+    if (sel located.err) { ret err[fail.Fail].err{located.err}; }
+    val memo_file: opt[str] = located.ok;
+    k.memo = memo.init(scratch, ?owner);
+    if (sel memo_file.some) {
+        val loaded: res[memo.Memo, A.Error] = memo.load(scratch, ?owner, memo_file.some);
+        if (sel loaded.err) { ret err[fail.Fail].err{fail.refused(loaded.err)}; }
+        memo.dnit(?k.memo);
+        k.memo = loaded.ok;
+    }
+    fin { memo.dnit(?k.memo); }
+
+    val n:        usize             = project.module_count(p)::usize;
+    val ifaces_r: res[*u8, A.Error] = A.zallocate[u8](scratch, (n + 1) * 32);
+    if (sel ifaces_r.err) { ret err[fail.Fail].err{fail.refused(ifaces_r.err)}; }
+    val ready_r: res[*bool, A.Error] = A.zallocate[bool](scratch, n + 1);
+    if (sel ready_r.err) { ret err[fail.Fail].err{fail.refused(ready_r.err)}; }
+    k.ifaces = ifaces_r.ok;
+    k.ready  = ready_r.ok;
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val keyed: err[fail.Fail] = key_module(?k, p, p.topo[i]::u32);
+        if (sel keyed.err) { ret keyed; }
+        i = i + 1;
+    }
+    if (sel memo_file.some) {
+        val stored: err[outcome.Fail] = memo.store(?k.memo, memo_file.some);
+        if (sel stored.err) { ret err[fail.Fail].err{fail.message(outcome.describe(stored.err))}; }
+    }
+    readout.item(p.events, ph, "module keys", t_keys);
+    ret err[fail.Fail].ok{};
+}
+
+# every key goes into the query database, so a product restored under one
+# key recomputes in a session that later keys the module differently
+fun publish_keys(p: *project.Project) err[fail.Fail] {
+    if (!query.is_registered(?p.s.queries, query.Q_OBJECT_KEY)) {
+        val registered: err[fail.Fail] = query.register_input(?p.s.queries, query.Q_OBJECT_KEY);
+        if (sel registered.err) { ret registered; }
+    }
+    var i: u32 = 0;
+    for (i < p.emit_len) {
+        val m: *project.ModuleEntry = project.module_at(p, p.topo[i]::u32);
+        if (m.cache_keyed) {
+            var digest: [32]u8;
+            val keyed:  err[fail.Fail] = object_key(p, m, ?digest);
+            if (sel keyed.err) { ret keyed; }
+            val set: err[fail.Fail] = query.set_input(?p.s.queries, query.Q_OBJECT_KEY, m.stable_id::u64, ?digest[0], 32);
+            if (sel set.err) { ret set; }
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a module the build still compiles needs the typed definitions of everything
+# it imports, transitively, so only a reused module nothing compiled imports
+# skips the front end
+fun mark_skipped(p: *project.Project, scratch: *A.Allocator) err[fail.Fail] {
+    if (!early_restore_enabled(p)) { ret err[fail.Fail].ok{}; }
+    val n:        usize               = project.module_count(p)::usize;
+    val needed_r: res[*bool, A.Error] = A.zallocate[bool](scratch, n + 1);
+    if (sel needed_r.err) { ret err[fail.Fail].err{fail.refused(needed_r.err)}; }
+    val needed: *bool = needed_r.ok;
+    var i:      u32   = 0;
+    for (i < p.topo_len) {
+        val mid: u32 = p.topo[i]::u32;
+        if (i >= p.emit_len || !restored(p, project.module_at(p, mid))) { needed[mid] = true; }
+        i = i + 1;
+    }
+    # the topo lists every module after its imports, so walking it backwards
+    # reaches a module's importers first
+    i = p.topo_len;
+    for (i > 0) {
+        i = i - 1;
+        val mid: u32 = p.topo[i]::u32;
+        if (needed[mid]) {
+            val m: *project.ModuleEntry = project.module_at(p, mid);
+            var d: u32                  = 0;
+            for (d < m.dep_count) {
+                val dep: u32 = m.deps[d]::u32;
+                if (dep < n::u32) { needed[dep] = true; }
+                d = d + 1;
+            }
+        }
+    }
+    i = 0;
+    for (i < p.topo_len) {
+        val mid: u32 = p.topo[i]::u32;
+        project.module_at(p, mid).frontend_skipped = !needed[mid];
+        i                                          = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# once per load, after the load walk and the embedded inputs, before anything
+# is resolved: key every module, read each emitted module's `obj/` object under
+# its key, and mark the modules the front end skips. config is the captured
+# configuration identity. its items are reported under the readout phase ph
+pub fun prepare(p: *project.Project, config: *u8, config_len: usize, ph: u8) err[fail.Fail] {
+    forget(p);
+    if (!p.req.object_cache || !objects_cached(p)) { ret err[fail.Fail].ok{}; }
+    val identified: err[fail.Fail] = identify(p, ph);
+    if (sel identified.err)     { ret identified; }
+    if (!identity_available(p)) { ret err[fail.Fail].ok{}; }
+    var backing: A.Allocator;
+    val make_r:  err[A.Error] = page.make(?backing);
+    if (sel make_r.err) { ret err[fail.Fail].err{fail.message("cache scratch allocator is unavailable")}; }
+    val keyed: err[fail.Fail] = key_modules(p, ?backing, config, config_len, ph);
+    if (sel keyed.err) {
+        forget(p);
+        ret keyed;
+    }
+    p.cache_ready = true;
+    val published: err[fail.Fail] = publish_keys(p);
+    if (sel published.err) { ret published; }
+    val fresh_r: res[*bool, A.Error] = A.zallocate[bool](?backing, p.emit_len::usize + 1);
+    if (sel fresh_r.err) { ret err[fail.Fail].err{fail.refused(fresh_r.err)}; }
+    val fresh: *bool = fresh_r.ok;
+    var i:     u32   = 0;
+    for (i < p.emit_len) {
+        val m: *project.ModuleEntry = project.module_at(p, p.topo[i]::u32);
+        if (m.cache_keyed) {
+            # a hit this project already holds reported its warnings then
+            fresh[i] = !(m.cache_checked && m.cache_hit && key.equal(?m.cache_under, ?m.cache_key));
+            val found: res[bool, fail.Fail] = restore(p, m, ph);
+            if (sel found.err) { ret err[fail.Fail].err{found.err}; }
+        }
+        or { project.release_staged(p, m); }
+        i = i + 1;
+    }
+    val marked: err[fail.Fail] = mark_skipped(p, ?backing);
+    if (sel marked.err) { ret marked; }
+    # the same source reports the same warnings whether it compiled or not
+    i = 0;
+    for (i < p.emit_len) {
+        val m: *project.ModuleEntry = project.module_at(p, p.topo[i]::u32);
+        if (fresh[i] && restored(p, m)) {
+            val replayed: err[fail.Fail] = replay_warnings(p, m, !m.frontend_skipped);
+            if (sel replayed.err) { ret replayed; }
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
 }
 
 # hand the staged image to the query that publishes it; the facts stay with the module
@@ -393,6 +753,291 @@ pub fun collect_tests(p: *project.Project, m: *project.ModuleEntry, mid: u32, c:
         val pushed: err[fail.Fail]         = testrunner.push(p.s, c, testrunner.Test{name: f.name, line: f.line, mod_idx: mid});
         if (sel pushed.err) { ret pushed; }
         i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a module's warnings travel in its record as bytes: per diagnostic whether
+# its back half (lowering or codegen) reported it, its severity, location and
+# message, then its notes, related locations and fixes. a location is its
+# file's path (absent as 0xFFFFFFFF), offset and length; a text is its length
+# (absent as 0xFFFFFFFF) and bytes; every number little endian
+rec Writer {
+    bytes:  Vector[u8];
+    failed: bool;
+}
+
+val ABSENT: u32 = 0xFFFFFFFF;
+
+fun put(w: *Writer, data: *u8, len: usize) {
+    var i: usize = 0;
+    for (i < len && !w.failed) {
+        val pushed: res[usize, A.Error] = vector.push[u8](?w.bytes, data[i]);
+        if (sel pushed.err) { w.failed = true; }
+        i = i + 1;
+    }
+}
+
+fun put_u32(w: *Writer, v: u32) {
+    var wire: [4]u8;
+    bin.write_u32_le(?wire[0], 0, v);
+    put(w, ?wire[0], 4);
+}
+
+fun put_u64(w: *Writer, v: u64) {
+    var wire: [8]u8;
+    bin.write_u64_le(?wire[0], 0, v);
+    put(w, ?wire[0], 8);
+}
+
+fun put_text(w: *Writer, t: str) {
+    if (t == nil) {
+        put_u32(w, ABSENT);
+        ret;
+    }
+    put_u32(w, str_len(t)::u32);
+    put(w, t::*u8, str_len(t));
+}
+
+fun put_place(w: *Writer, p: *project.Project, loc: diagnostic.Location) {
+    var file: str = nil;
+    if (loc.file_id != source.FILE_NIL) {
+        val found: opt[*source.SourceFile] = source.get(?p.s.sources, loc.file_id);
+        if (sel found.some) { file = found.some.path; }
+    }
+    put_text(w, file);
+    put_u64(w, loc.span.offset::u64);
+    put_u64(w, loc.span.len::u64);
+}
+
+fun put_warnings(w: *Writer, p: *project.Project, store: *diagnostic.DiagnosticStore, back: bool) {
+    if (store == nil) { ret; }
+    var i: usize = 0;
+    for (i < store.items.len) {
+        val d: *diagnostic.Diagnostic = ?store.items.data[i];
+        if (d.severity != diagnostic.SEVERITY_ERROR) {
+            var phase: u8 = 0;
+            if (back) { phase = 1; }
+            put(w, ?phase, 1);
+            var severity: u8 = d.severity::u8;
+            put(w, ?severity, 1);
+            put_place(w, p, d.loc);
+            put_text(w, d.message);
+            put_u32(w, d.children.len::u32);
+            var c: usize = 0;
+            for (c < d.children.len) {
+                var kind: u8 = d.children.data[c].kind::u8;
+                put(w, ?kind, 1);
+                put_text(w, d.children.data[c].text);
+                c = c + 1;
+            }
+            put_u32(w, d.related.len::u32);
+            c = 0;
+            for (c < d.related.len) {
+                put_place(w, p, d.related.data[c].loc);
+                put_text(w, d.related.data[c].label);
+                c = c + 1;
+            }
+            put_u32(w, d.fixes.len::u32);
+            c = 0;
+            for (c < d.fixes.len) {
+                val fx: *diagnostic.Fix = ?d.fixes.data[c];
+                put_text(w, fx.label);
+                put_u32(w, fx.edits.len::u32);
+                var e: usize = 0;
+                for (e < fx.edits.len) {
+                    put_place(w, p, fx.edits.data[e].loc);
+                    put_text(w, fx.edits.data[e].replacement);
+                    e = e + 1;
+                }
+                c = c + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# the warnings module m's products reported: its front end keyed by its
+# stable id, its back half by back_key
+fun gather_warnings(p: *project.Project, m: *project.ModuleEntry, back_key: u64, scratch: *A.Allocator, facts: *cache_record.Facts) err[fail.Fail] {
+    var w: Writer = Writer{bytes: vector.init[u8](scratch)};
+    fin { vector.dnit[u8](?w.bytes); }
+    val front: [4]query.QueryKind = [4]query.QueryKind{query.Q_RESOLVE, query.Q_EXPORTS, query.Q_SEMA, query.Q_TYPED_EXPORTS};
+    val back:  [3]query.QueryKind = [3]query.QueryKind{query.Q_INLINE_BODIES, query.Q_LOWER, query.Q_CODEGEN};
+    var i:     usize              = 0;
+    for (i < 4) {
+        put_warnings(?w, p, query.product_diagnostics(?p.s.queries, front[i], m.stable_id::u64), false);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 3) {
+        put_warnings(?w, p, query.product_diagnostics(?p.s.queries, back[i], back_key), true);
+        i = i + 1;
+    }
+    if (w.failed)                 { ret err[fail.Fail].err{fail.message("out of memory recording a module's warnings")}; }
+    if (w.bytes.len == 0)         { ret err[fail.Fail].ok{}; }
+    if (w.bytes.len > 0xFFFFFFF0) { ret err[fail.Fail].err{fail.message("a module's warnings exceed the cache record")}; }
+    val kept: res[*u8, A.Error] = A.allocate[u8](scratch, w.bytes.len);
+    if (sel kept.err) { ret err[fail.Fail].err{fail.refused(kept.err)}; }
+    memory.raw_copy(kept.ok::ptr, w.bytes.data::ptr, w.bytes.len);
+    facts.warnings     = kept.ok;
+    facts.warnings_len = w.bytes.len::u32;
+    ret err[fail.Fail].ok{};
+}
+
+rec WarningReader {
+    data: *u8;
+    len:  usize;
+    pos:  usize;
+    bad:  bool;
+}
+
+fun take(r: *WarningReader, n: usize) *u8 {
+    if (r.bad || r.len - r.pos < n) {
+        r.bad = true;
+        ret nil;
+    }
+    val at: *u8 = (r.data::usize + r.pos)::*u8;
+    r.pos = r.pos + n;
+    ret at;
+}
+
+fun take_u8(r: *WarningReader) u8 {
+    val at: *u8 = take(r, 1);
+    if (at == nil) { ret 0; }
+    ret at[0];
+}
+
+fun take_u32(r: *WarningReader) u32 {
+    val at: *u8 = take(r, 4);
+    if (at == nil) { ret 0; }
+    ret bin.read_u32_le(at, 0);
+}
+
+fun take_u64(r: *WarningReader) u64 {
+    val at: *u8 = take(r, 8);
+    if (at == nil) { ret 0; }
+    ret bin.read_u64_le(at, 0);
+}
+
+# a text as a nul-terminated copy in a, nil when absent
+fun take_text(r: *WarningReader, a: *A.Allocator) str {
+    val len: u32 = take_u32(r);
+    if (r.bad || len == ABSENT) { ret nil; }
+    val at: *u8 = take(r, len::usize);
+    if (at == nil) { ret nil; }
+    val copied: res[*u8, A.Error] = A.allocate[u8](a, len::usize + 1);
+    if (sel copied.err) {
+        r.bad = true;
+        ret nil;
+    }
+    memory.raw_copy(copied.ok::ptr, at::ptr, len::usize);
+    copied.ok[len::usize] = 0;
+    ret copied.ok::str;
+}
+
+rec Place {
+    file: source.FileId;
+    span: token.Span;
+}
+
+# a recorded location, in the file this session loaded under that path, or
+# unlocated when it loaded none
+fun take_place(r: *WarningReader, p: *project.Project, a: *A.Allocator) Place {
+    var at:   Place = Place{file: source.FILE_NIL};
+    val file: str   = take_text(r, a);
+    at.span.offset = take_u64(r)::usize;
+    at.span.len    = take_u64(r)::usize;
+    if (file == nil) { ret at; }
+    val named: res[intern.StrId, A.Error] = intern.intern(?p.s.interner, file);
+    if (sel named.err) {
+        r.bad = true;
+        ret at;
+    }
+    var id:    intern.StrId        = named.ok;
+    val found: opt[*source.FileId] = map.get[intern.StrId, source.FileId](?p.s.sources.by_path, ?id);
+    if (sel found.some) { at.file = @found.some; }
+    ret at;
+}
+
+# read one recorded diagnostic and report it unless back_only skips it; false
+# once the bytes are exhausted or malformed
+fun replay_one(r: *WarningReader, p: *project.Project, scratch: *A.Allocator, back_only: bool) res[bool, fail.Fail] {
+    val back:     bool                = take_u8(r) != 0;
+    val severity: diagnostic.Severity = take_u8(r)::diagnostic.Severity;
+    val at:       Place               = take_place(r, p, scratch);
+    val message:  str                 = take_text(r, scratch);
+    if (r.bad || message == nil || !diagnostic.severity_valid(severity) || severity == diagnostic.SEVERITY_ERROR) { ret res[bool, fail.Fail].ok{false}; }
+    val begun: res[diagnostic.DiagnosticBuilder, fail.Fail] = diagnostic.builder_init(p.diags.a, severity, at.file, at.span, message);
+    if (sel begun.err) { ret res[bool, fail.Fail].err{begun.err}; }
+    var b: diagnostic.DiagnosticBuilder = begun.ok;
+    fin { diagnostic.builder_dnit(?b); }
+    var built:    err[fail.Fail] = err[fail.Fail].ok{};
+    val children: u32            = take_u32(r);
+    var c:        u32            = 0;
+    for (c < children && !r.bad) {
+        val kind: u8  = take_u8(r);
+        val text: str = take_text(r, scratch);
+        if (text == nil)                                         { r.bad = true; }
+        or (kind::diagnostic.ChildKind == diagnostic.CHILD_HELP) { built = diagnostic.attach_help(?b, text); }
+        or                                                       { built = diagnostic.attach_note(?b, text); }
+        if (sel built.err)                                       { ret res[bool, fail.Fail].err{built.err}; }
+        c = c + 1;
+    }
+    val related: u32 = take_u32(r);
+    c = 0;
+    for (c < related && !r.bad) {
+        val loc:   Place = take_place(r, p, scratch);
+        val label: str   = take_text(r, scratch);
+        built = diagnostic.attach_related(?b, loc.file, loc.span, label);
+        if (sel built.err) { ret res[bool, fail.Fail].err{built.err}; }
+        c = c + 1;
+    }
+    val fixes: u32 = take_u32(r);
+    c = 0;
+    for (c < fixes && !r.bad) {
+        val label:  str              = take_text(r, scratch);
+        val edits:  u32              = take_u32(r);
+        var opened: bool             = false;
+        var fix:    diagnostic.FixId = 0;
+        var e:      u32              = 0;
+        for (e < edits && !r.bad) {
+            val loc:         Place = take_place(r, p, scratch);
+            val replacement: str   = take_text(r, scratch);
+            if (opened) {
+                built = diagnostic.attach_fix_edit(?b, fix, loc.file, loc.span, replacement);
+                if (sel built.err) { ret res[bool, fail.Fail].err{built.err}; }
+            }
+            or {
+                val made: res[diagnostic.FixId, fail.Fail] = diagnostic.attach_fix(?b, label, loc.file, loc.span, replacement);
+                if (sel made.err) { ret res[bool, fail.Fail].err{made.err}; }
+                fix    = made.ok;
+                opened = true;
+            }
+            e = e + 1;
+        }
+        c = c + 1;
+    }
+    if (r.bad) { ret res[bool, fail.Fail].ok{false}; }
+    if (back || !back_only) {
+        val committed: res[diagnostic.DiagnosticId, fail.Fail] = diagnostic.commit(?b, ?p.diags);
+        if (sel committed.err) { ret res[bool, fail.Fail].err{committed.err}; }
+    }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# report a restored module's recorded warnings again; with back_only, only
+# those of its back half, since its front end ran and reported the rest
+fun replay_warnings(p: *project.Project, m: *project.ModuleEntry, back_only: bool) err[fail.Fail] {
+    if (m.staged_facts.warnings_len == 0) { ret err[fail.Fail].ok{}; }
+    var backing: A.Allocator;
+    val make_r:  err[A.Error] = page.make(?backing);
+    if (sel make_r.err) { ret err[fail.Fail].err{fail.message("cache scratch allocator is unavailable")}; }
+    var r: WarningReader = WarningReader{data: m.staged_facts.warnings, len: m.staged_facts.warnings_len::usize};
+    for (r.pos < r.len && !r.bad) {
+        val more: res[bool, fail.Fail] = replay_one(?r, p, ?backing, back_only);
+        if (sel more.err) { ret err[fail.Fail].err{more.err}; }
+        if (!more.ok)     { brk; }
     }
     ret err[fail.Fail].ok{};
 }
@@ -425,10 +1070,9 @@ fun gather_facts(scratch: *A.Allocator, irmod: *ir.Module, facts: *cache_record.
 
 # a generated image carries its record into `obj/`: the key it was built
 # under and the facts its lowered ir holds
-pub fun publish(p: *project.Project, m: *project.ModuleEntry, image: *of.ObjectImage) err[fail.Fail] {
-    if (!operation_active(p))          { ret err[fail.Fail].err{fail.message("cache publication requires the current query operation")}; }
-    if (!p.cache_ready || m.cache_hit) { ret err[fail.Fail].ok{}; }
-    if (m.ir_module == nil)            { ret err[fail.Fail].err{fail.message("cache publication requires the module's lowered ir")}; }
+pub fun publish(p: *project.Project, m: *project.ModuleEntry, image: *of.ObjectImage, back_key: u64) err[fail.Fail] {
+    if (!p.cache_ready || !m.cache_keyed || restored(p, m)) { ret err[fail.Fail].ok{}; }
+    if (m.ir_module == nil)                                 { ret err[fail.Fail].err{fail.message("cache publication requires the module's lowered ir")}; }
     var backing: A.Allocator;
     val make_r:  err[A.Error] = page.make(?backing);
     if (sel make_r.err) { ret err[fail.Fail].err{fail.message("cache scratch allocator is unavailable")}; }
@@ -436,8 +1080,10 @@ pub fun publish(p: *project.Project, m: *project.ModuleEntry, image: *of.ObjectI
     fin { cache_record.facts_dnit(?backing, ?facts); }
     val gathered: err[fail.Fail] = gather_facts(?backing, m.ir_module, ?facts);
     if (sel gathered.err) { ret gathered; }
+    val warned: err[fail.Fail] = gather_warnings(p, m, back_key, ?backing, ?facts);
+    if (sel warned.err) { ret warned; }
     var digest: [32]u8;
-    val keyed:  err[fail.Fail] = key.object(?p.cache_snapshot, project.fqn_name(p, m.fqn), ?digest);
+    val keyed:  err[fail.Fail] = object_key(p, m, ?digest);
     if (sel keyed.err) { ret keyed; }
     var bytes:   *u8            = nil;
     var len:     u32            = 0;
@@ -449,19 +1095,17 @@ pub fun publish(p: *project.Project, m: *project.ModuleEntry, image: *of.ObjectI
     ret err[fail.Fail].ok{};
 }
 
-fun t_append_module(p: *project.Project, m: project.ModuleEntry) bool {
-    val reserved: err[fail.Fail] = project.module_reserve(p);
-    if (sel reserved.err) { ret false; }
-    project.module_append(p, m);
-    ret true;
+#[testing]
+fun t_configured(p: *project.Project, config: *[1]u8, compiler_id: *compiler.Identity, out: *[32]u8) bool {
+    val configured: err[fail.Fail] = configuration(p.alloc, p, config::*u8, 1, compiler_id, out);
+    ret sel configured.ok;
 }
 
-fun t_snapshot(p: *project.Project, config: *[1]u8, compiler_id: *compiler.Identity, out: *[32]u8) bool {
-    val snapshot_r: err[fail.Fail] = snapshot(p.alloc, p, config::*u8, 1, compiler_id, out);
-    ret sel snapshot_r.ok;
-}
-
-test snapshot_tracks_source_compiler_configuration_steps_and_embeds {
+# every input the configuration names moves it, and nothing else does: the
+# compiler identity, the captured configuration, each request field that
+# reaches codegen, the step outputs, the dependency closure and the link
+# providers
+test configuration__tracks_compiler_request_steps_dependencies_and_providers {
     var a:      A.Allocator;
     val make_r: err[A.Error] = page.make(?a);
     if (sel make_r.err) { ret 1; }
@@ -472,9 +1116,6 @@ test snapshot_tracks_source_compiler_configuration_steps_and_embeds {
     var p: project.Project;
     project.init_project(?p, ?s);
     fin {
-        p.topo             = nil;
-        p.topo_len         = 0;
-        p.topo_cap         = 0;
         p.config.deps      = nil;
         p.config.dep_count = 0;
         project.dnit_project(?p);
@@ -484,30 +1125,6 @@ test snapshot_tracks_source_compiler_configuration_steps_and_embeds {
     if (sel root_id.err) { ret 3; }
     p.config.project_root = root_id.ok;
     p.req.project_root    = "/project";
-    val f: res[source.FileId, fail.Fail] = source.add(?s.sources, "/project/main.mach", "use support.lib.answer; pub fun main() i64 { ret answer(); }");
-    val n: res[intern.StrId, A.Error]    = intern.intern(?s.interner, "project.main");
-    if (sel f.err) { ret 3; }
-    if (sel n.err) { ret 3; }
-    val transitive_file: res[source.FileId, fail.Fail] = source.add(?s.sources, "/project/dep/support/src/lib.mach", "pub fun answer() i64 { ret 7; }");
-    val transitive_name: res[intern.StrId, A.Error]    = intern.intern(?s.interner, "support.lib");
-    if (sel transitive_file.err) { ret 3; }
-    if (sel transitive_name.err) { ret 3; }
-    var modules: [2]project.ModuleEntry;
-    modules[0].file_id = f.ok;
-    modules[0].fqn     = n.ok;
-    modules[1].file_id = transitive_file.ok;
-    modules[1].fqn     = transitive_name.ok;
-    var module_dependencies: [1]session.ModuleId = [1]session.ModuleId{1};
-    modules[0].deps      = ?module_dependencies[0];
-    modules[0].dep_count = 1;
-    var topo:  [2]session.ModuleId = [2]session.ModuleId{1, 0};
-    var typed: [2]sema.SemaResult;
-    modules[0].sema_result = ?typed[0];
-    modules[1].sema_result = ?typed[1];
-    if (!t_append_module(?p, modules[0]) || !t_append_module(?p, modules[1])) { ret 3; }
-    p.topo     = ?topo[0];
-    p.topo_len = 2;
-    p.emit_len = 2;
     val names: [9]str = [9]str{"content-1", "revision-1", "1.0.0", "support", "path", "/project/dep/support", "src", "lib", "changed"};
     var ids:   [9]intern.StrId;
     var nidx:  usize  = 0;
@@ -539,233 +1156,74 @@ test snapshot_tracks_source_compiler_configuration_steps_and_embeds {
     var config:   [1]u8 = [1]u8{1};
     var baseline: [32]u8;
     var changed:  [32]u8;
-    if (!t_snapshot(?p, ?config, ?compiler_id, ?baseline)) { ret 4; }
+    if (!t_configured(?p, ?config, ?compiler_id, ?baseline)) { ret 4; }
     val original: request.BuildRequest = p.req;
     var axis:     u32                  = 0;
-    for (axis < 17) {
+    for (axis < 15) {
         p.req = original;
         if (axis == 0)  { compiler_id.bytes[0] = 1; }
-        if (axis == 15) { compiler_id.source = compiler.SOURCE_BUILD_ID; }
-        if (axis == 16) { compiler_id.len = 16; }
-        if (axis == 1)  { config[0] = 2; }
-        if (axis == 2)  { p.req.target = "another-target"; }
-        if (axis == 3)  { p.req.profile = "another-profile"; }
-        if (axis == 4)  { p.req.artifact = "another-artifact"; }
-        if (axis == 5)  { p.req.debug = true; }
-        if (axis == 6)  { p.req.float_reassoc = !p.req.float_reassoc; }
-        if (axis == 7)  { p.req.placement_policy = 17; }
-        if (axis == 8)  { p.step_digest[0] = 1; }
-        val get_r: opt[*source.SourceFile] = source.get(?s.sources, modules[0].file_id);
-        if (sel get_r.none) { ret 99; }
-        val file:  *source.SourceFile = get_r.some;
-        val prior: str                = file.text;
-        if (axis == 9) { file.text = "use support.lib.answer; pub fun main() i64 { ret answer() + 1; }"; }
-        val get_r2: opt[*source.SourceFile] = source.get(?s.sources, modules[1].file_id);
-        if (sel get_r2.none) { ret 99; }
-        val transitive:       *source.SourceFile = get_r2.some;
-        val transitive_prior: str                = transitive.text;
-        if (axis == 10) { transitive.text = "pub fun answer() i64 { ret 99; }"; }
+        if (axis == 1)  { compiler_id.source = compiler.SOURCE_BUILD_ID; }
+        if (axis == 2)  { compiler_id.len = 16; }
+        if (axis == 3)  { config[0] = 2; }
+        if (axis == 4)  { p.req.target = "another-target"; }
+        if (axis == 5)  { p.req.profile = "another-profile"; }
+        if (axis == 6)  { p.req.artifact = "another-artifact"; }
+        if (axis == 7)  { p.req.debug = true; }
+        if (axis == 8)  { p.req.float_reassoc = !p.req.float_reassoc; }
+        if (axis == 9)  { p.req.placement_policy = 17; }
+        if (axis == 10) { p.step_digest[0] = 1; }
         if (axis == 11) { dependencies[0].content = ids[8]; }
         if (axis == 12) { dependencies[0].ref = ids[8]; }
         if (axis == 13) { dependencies[0].manifest.version = ids[8]; }
         if (axis == 14) { direct_aliases[0] = ids[8]; }
-        val captured: bool = t_snapshot(?p, ?config, ?compiler_id, ?changed);
-        file.text                        = prior;
-        transitive.text                  = transitive_prior;
+        val captured: bool = t_configured(?p, ?config, ?compiler_id, ?changed);
         dependencies[0].content          = ids[0];
         dependencies[0].ref              = ids[1];
         dependencies[0].manifest.version = ids[2];
         direct_aliases[0]                = ids[3];
+        compiler_id.bytes[0]             = 0;
+        compiler_id.len                  = 32;
+        compiler_id.source               = compiler.SOURCE_DIGEST;
+        config[0]                        = 1;
+        p.step_digest[0]                 = 0;
         if (!captured || key.equal(?baseline, ?changed)) { ret (10 + axis)::i32; }
-        compiler_id.bytes[0] = 0;
-        compiler_id.len      = 32;
-        compiler_id.source   = compiler.SOURCE_DIGEST;
-        config[0]            = 1;
-        p.step_digest[0]     = 0;
-        axis                 = axis + 1;
+        axis = axis + 1;
     }
+    # what does not reach an object leaves it alone
     p.req         = original;
     p.req.jobs    = 17;
     p.req.emit_ir = true;
-    if (!t_snapshot(?p, ?config, ?compiler_id, ?changed) || !key.equal(?baseline, ?changed)) { ret 27; }
+    if (!t_configured(?p, ?config, ?compiler_id, ?changed) || !key.equal(?baseline, ?changed)) { ret 30; }
+    # a test listing reads the test build's objects
     p.req      = original;
     p.req.goal = request.GOAL_TESTS;
     var tests_key: [32]u8;
-    if (!t_snapshot(?p, ?config, ?compiler_id, ?tests_key) || key.equal(?baseline, ?tests_key)) { ret 34; }
+    if (!t_configured(?p, ?config, ?compiler_id, ?tests_key) || key.equal(?baseline, ?tests_key)) { ret 31; }
     p.req.goal = request.GOAL_TEST_LIST;
-    if (!t_snapshot(?p, ?config, ?compiler_id, ?changed) || !key.equal(?tests_key, ?changed)) { ret 35; }
-    # another spelling of the same paths keys the same cell, unless debug
-    # information is requested and the spelling reaches the line tables
+    if (!t_configured(?p, ?config, ?compiler_id, ?changed) || !key.equal(?tests_key, ?changed)) { ret 32; }
+    # another spelling of the same root keys the same configuration, unless
+    # debug information is requested and the spelling reaches the line tables
     p.req              = original;
     p.req.project_root = "/project/./";
     val spelled_root: res[intern.StrId, A.Error] = intern.intern(?s.interner, "/project/./");
-    if (sel spelled_root.err) { ret 30; }
+    if (sel spelled_root.err) { ret 33; }
     p.config.project_root = spelled_root.ok;
-    val get_spelled: opt[*source.SourceFile] = source.get(?s.sources, modules[0].file_id);
-    if (sel get_spelled.none) { ret 30; }
-    val spelled_path: str = get_spelled.some.path;
-    get_spelled.some.path = "/project/./main.mach";
-    val spelled_vendor: res[intern.StrId, A.Error] = intern.intern(?s.interner, "/project/dep/../dep/support");
-    if (sel spelled_vendor.err) { ret 30; }
-    dependencies[0].vendor_root = spelled_vendor.ok;
-    if (!t_snapshot(?p, ?config, ?compiler_id, ?changed) || !key.equal(?baseline, ?changed)) { ret 31; }
+    if (!t_configured(?p, ?config, ?compiler_id, ?changed) || !key.equal(?baseline, ?changed)) { ret 34; }
     p.req.debug = true;
     var debug_spelled: [32]u8;
-    if (!t_snapshot(?p, ?config, ?compiler_id, ?debug_spelled)) { ret 32; }
-    get_spelled.some.path       = spelled_path;
-    p.config.project_root       = root_id.ok;
-    p.req.project_root          = "/project";
-    dependencies[0].vendor_root = ids[5];
+    if (!t_configured(?p, ?config, ?compiler_id, ?debug_spelled)) { ret 35; }
+    p.config.project_root = root_id.ok;
+    p.req.project_root    = "/project";
     var debug_canonical: [32]u8;
-    if (!t_snapshot(?p, ?config, ?compiler_id, ?debug_canonical) || key.equal(?debug_spelled, ?debug_canonical)) { ret 33; }
-    compiler_id.len = 0;
-    if (t_snapshot(?p, ?config, ?compiler_id, ?changed)) { ret 28; }
-    compiler_id.len = 32;
+    if (!t_configured(?p, ?config, ?compiler_id, ?debug_canonical) || key.equal(?debug_spelled, ?debug_canonical)) { ret 36; }
     p.req           = original;
-    var embedded_path: intern.StrId = modules[0].fqn;
-    typed[0].embed_paths      = ?embedded_path;
-    typed[0].embed_path_count = 1;
-    # the entries live in the session's cache: no bytes, so its dnit frees nothing
-    val embedded_r: res[*embed.EmbedFile, fail.Fail] = embed.insert(?s.embeds, embed.EmbedFile{path: modules[0].fqn, status: embed.EMBED_OK, len: 1});
-    if (sel embedded_r.err) { ret 25; }
-    val embedded:    *embed.EmbedFile                 = embedded_r.ok;
-    val with_embed:  bool                             = t_snapshot(?p, ?config, ?compiler_id, ?baseline);
-    val unrelated_r: res[*embed.EmbedFile, fail.Fail] = embed.insert(?s.embeds, embed.EmbedFile{path: modules[1].fqn, status: embed.EMBED_MISSING});
-    if (sel unrelated_r.err) { ret 25; }
-    val ignores_unrelated: bool = t_snapshot(?p, ?config, ?compiler_id, ?changed) && key.equal(?baseline, ?changed);
-    embedded.digest[0] = 1;
-    val changed_embed: bool = t_snapshot(?p, ?config, ?compiler_id, ?changed);
-    embedded.status = embed.EMBED_MISSING;
-    var refused:        [32]u8;
-    val rejects_active: bool = !t_snapshot(?p, ?config, ?compiler_id, ?refused);
-    if (!with_embed || !ignores_unrelated || !changed_embed || !rejects_active || key.equal(?baseline, ?changed)) { ret 25; }
-    typed[0].embed_path_count = 0;
-    val register_link_provider_r: err[fail.Fail] = session.register_link_provider(?s, modules[0].fqn, false);
-    if (sel register_link_provider_r.err)                  { ret 27; }
-    if (!t_snapshot(?p, ?config, ?compiler_id, ?baseline)) { ret 28; }
+    compiler_id.len = 0;
+    if (t_configured(?p, ?config, ?compiler_id, ?changed)) { ret 37; }
+    compiler_id.len = 32;
+    val register_link_provider_r: err[fail.Fail] = session.register_link_provider(?s, ids[3], false);
+    if (sel register_link_provider_r.err)                    { ret 38; }
+    if (!t_configured(?p, ?config, ?compiler_id, ?baseline)) { ret 38; }
     s.link_providers[0].is_static = true;
-    if (!t_snapshot(?p, ?config, ?compiler_id, ?changed) || key.equal(?baseline, ?changed)) { ret 29; }
-    ret 0;
-}
-
-fun t_boxed_image(s: *session.Session) *of.ObjectImage {
-    val allocated: res[*of.ObjectImage, A.Error] = A.allocate[of.ObjectImage](s.alloc, 1);
-    if (sel allocated.err) { ret nil; }
-    val staged: *of.ObjectImage = allocated.ok;
-    @staged = of.object_image_init(s.alloc, ?s.interner, intern.STR_NIL);
-    ret staged;
-}
-
-fun t_emit(tgt: *of.ObjectTarget, img: *of.ObjectImage, destination: str) err[fail.Fail] {
-    ret err[fail.Fail].err{fail.message("test format writes nothing")};
-}
-
-fun t_parse(a: *A.Allocator, itn: *intern.Interner, bytes: *u8, len: usize, out: *of.ObjectImage) err[fail.Fail] {
-    ret err[fail.Fail].err{fail.message("test format reads nothing")};
-}
-
-test operation_reset_keeps_restored_products_under_their_snapshot_and_drops_fresh_ones {
-    var a:      A.Allocator;
-    val make_r: err[A.Error] = page.make(?a);
-    if (sel make_r.err) { ret 1; }
-    val initialized: res[session.Session, fail.Fail] = session.init(?a);
-    if (sel initialized.err) { ret 2; }
-    var s: session.Session = initialized.ok;
-    fin { session.dnit(?s); }
-    var p: project.Project;
-    project.init_project(?p, ?s);
-    fin {
-        project.release_all_staged(?p);
-        project.dnit_project(?p);
-    }
-    if (!t_append_module(?p, project.ModuleEntry{}) || !t_append_module(?p, project.ModuleEntry{})) { ret 2; }
-    val m0: *project.ModuleEntry = project.module_at(?p, 0);
-    val m1: *project.ModuleEntry = project.module_at(?p, 1);
-    # a relocatable format the cache can read back, and the cell's obj directory
-    var vt: of.OfVTable = of.linker_vtable(1, "test", "o", t_emit, t_parse, nil);
-    p.target.of                     = ?vt;
-    p.object_dir                    = "out/obj";
-    p.req.object_cache              = true;
-    p.compiler_identity_initialized = true;
-    p.compiler_identity_available   = false;
-    p.compiler_identity.bytes[0]    = 91;
-    val begun: res[query.Operation, outcome.Fail] = project.begin_query_phase(?p);
-    if (sel begun.err) { ret 3; }
-    val first: query.Operation = begun.ok;
-    # no identity: the operation prepares as disabled and touches nothing
-    val prepare_r: err[fail.Fail] = prepare(?p, nil);
-    if (sel prepare_r.err)                     { ret 4; }
-    if (!p.cache_initialized || p.cache_ready) { ret 4; }
-    val finished_disabled: err[outcome.Fail] = project.finish_query_phase(?p, first, nil, 0, err[outcome.Fail].ok{});
-    if (sel finished_disabled.err) { ret 4; }
-    # a snapshot: the cache is ready to read `obj/`
-    var snapshot_a: [32]u8;
-    var snapshot_b: [32]u8;
-    snapshot_a[0] = 37;
-    snapshot_b[0] = 38;
-    val second_r: res[query.Operation, outcome.Fail] = project.begin_query_phase(?p);
-    if (sel second_r.err) { ret 5; }
-    val second:   query.Operation = second_r.ok;
-    val prepared: err[fail.Fail]  = prepare(?p, ?snapshot_a);
-    if (sel prepared.err)                            { ret 5; }
-    if (!p.cache_ready || p.cache_snapshot[0] != 37) { ret 5; }
-    p.cache_hits   = 2;
-    p.cache_misses = 3;
-    # module 0 holds a product restored under snapshot a; module 1 a fresh image a worker staged
-    m0.cache_checked = true;
-    m0.cache_hit     = true;
-    m0.cache_under   = snapshot_a;
-    val restored: *of.ObjectImage = t_boxed_image(?s);
-    if (restored == nil) { ret 6; }
-    m0.staged_image = restored;
-    val fresh: *of.ObjectImage = t_boxed_image(?s);
-    if (fresh == nil) { ret 6; }
-    m1.staged_image = fresh;
-    var borrowed: of.ObjectImage = of.object_image_init(?a, ?s.interner, intern.STR_NIL);
-    m0.object_image = ?borrowed;
-    if (!staged_restored(?p, m0) || staged_restored(?p, m1)) { ret 6; }
-    val prepare_again: err[fail.Fail] = prepare(?p, ?snapshot_b);
-    if (sel prepare_again.err)                                    { ret 7; }
-    if (p.cache_snapshot[0] != 37 || m0.staged_image != restored) { ret 7; }
-    val finished: err[outcome.Fail] = project.finish_query_phase(?p, second, nil, 0, err[outcome.Fail].ok{});
-    if (sel finished.err) { ret 8; }
-    if (m0.staged_image != restored || !m0.cache_hit || !m0.cache_checked
-        || m1.staged_image != nil || m0.object_image != ?borrowed
-        || p.cache_ready || p.cache_initialized || p.cache_operation_sequence != 0
-        || p.cache_hits != 2 || p.cache_misses != 3) { ret 9; }
-    val prepare_r3: err[fail.Fail] = prepare(?p, ?snapshot_a);
-    if (sel prepare_r3.ok) { ret 10; }
-    val restore_r: res[bool, fail.Fail] = restore(?p, 0, readout.PH_CACHE);
-    val publish_r: err[fail.Fail]       = publish(?p, m0, ?borrowed);
-    if (sel restore_r.ok) { ret 10; }
-    if (sel publish_r.ok) { ret 10; }
-    # the next operation under the same snapshot keeps the restored product
-    val third_r: res[query.Operation, outcome.Fail] = project.begin_query_phase(?p);
-    if (sel third_r.err) { ret 11; }
-    val third: query.Operation = third_r.ok;
-    if (third.sequence == second.sequence || p.cache_snapshot[0] != 0 || p.cache_initialized
-        || !p.compiler_identity_initialized || p.compiler_identity_available || p.compiler_identity.bytes[0] != 91) { ret 11; }
-    val prepared_same: err[fail.Fail] = prepare(?p, ?snapshot_a);
-    if (sel prepared_same.err)                                     { ret 12; }
-    if (m0.staged_image != restored || !staged_restored(?p, m0))   { ret 12; }
-    if (take_staged(?p, m0) != restored || m0.staged_image != nil) { ret 12; }
-    of.object_image_dnit(restored);
-    A.deallocate[of.ObjectImage](s.alloc, restored, 1);
-    m0.staged_image = t_boxed_image(?s);
-    if (m0.staged_image == nil) { ret 12; }
-    val ended_third: err[outcome.Fail] = project.finish_query_phase(?p, third, nil, 0, err[outcome.Fail].ok{});
-    if (sel ended_third.err)    { ret 13; }
-    if (m0.staged_image == nil) { ret 13; }
-    # a different snapshot discards it and forgets the verdict: the object is read again
-    val fourth_r: res[query.Operation, outcome.Fail] = project.begin_query_phase(?p);
-    if (sel fourth_r.err) { ret 14; }
-    val fourth:         query.Operation = fourth_r.ok;
-    val prepared_other: err[fail.Fail]  = prepare(?p, ?snapshot_b);
-    if (sel prepared_other.err)                                     { ret 14; }
-    if (m0.staged_image != nil || m0.cache_hit || m0.cache_checked) { ret 15; }
-    p.req.object_cache = false;
-    val ended: err[outcome.Fail] = project.finish_query_phase(?p, fourth, nil, 0, err[outcome.Fail].ok{});
-    if (sel ended.err)                                        { ret 16; }
-    if (m0.object_image != ?borrowed || borrowed.alloc != ?a) { ret 17; }
+    if (!t_configured(?p, ?config, ?compiler_id, ?changed) || key.equal(?baseline, ?changed)) { ret 39; }
     ret 0;
 }

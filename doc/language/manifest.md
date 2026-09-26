@@ -1190,17 +1190,31 @@ a binary that is subtly wrong rather than a build that fails.
 
 **The object tree is the object cache.** Under `--cache` a module whose object in
 `obj/` was built under the same key is reused as it is: the module is neither
-lowered nor generated again. The key is the one the module is built under (the
-compiler identity, the build configuration and the sources the module's cell
-reads), and each object carries it in a section no link loads: `.mach.cache` on
+lowered nor generated again, and when nothing the build still compiles imports
+it, it is not resolved or type-checked either. Each module has its own key: the
+compiler identity, the build configuration, the module's own source and embedded
+files, and the surface of every module it imports, directly or not. A module's
+surface is its source without the bodies of its tests and of its functions that
+are neither generic nor take a comptime parameter, since no importer compiles
+those; a release build inlines function bodies across modules, so there the
+whole source is the surface. Editing such a body rebuilds that module alone, and
+editing a declaration rebuilds the module and the modules that import it. With
+debug information the surface also covers where each retained declaration sits,
+so an edit that moves one to another line rebuilds its importers. A reused
+module reports again the warnings it reported when it was compiled, so a warm
+build prints what a cold one prints. Each object
+carries its key in a section no link loads: `.mach.cache` on
 ELF (not allocated) and COFF (`IMAGE_SCN_LNK_INFO | IMAGE_SCN_LNK_REMOVE`), and
 `__MACH,__mach_cache` on Mach-O (debug-attributed). The parser consumes it, so an
 object links exactly as it would without it. An object that is missing, has no
 key, a damaged one or another key is rebuilt, never linked stale. `obj/` holds one
 object per module, the latest, and each object is written to a sibling temporary
 and renamed into place, so an interrupted build leaves the previous object or the
-new one, never a torn file. `--no-cache` ignores the tree, and `mach clean` removes
-it with the rest of the output.
+new one, never a torn file. The digests of the sources the keys read are
+remembered in `{project.out}/.cache/digests` under each file's path, size,
+modification time and identity, so an unchanged file is not hashed again for its
+key; a missing or damaged memo is rebuilt. `--no-cache` ignores the tree, and
+`mach clean` removes it with the rest of the output.
 
 A step output is therefore rejected in that subtree. A declared `out` inside it
 fails at manifest load, naming the step and the path, before any step runs. A step
