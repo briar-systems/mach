@@ -157,6 +157,15 @@ pub def VariadicStackFn: fun(u32) bool
 pub def NaturalStackArgsFn: fun(u32) bool
 ```
 
+## def RegArgAlignFn
+
+```mach
+pub def RegArgAlignFn: fun(u32) u32
+```
+
+the largest alignment the argument registers honor for the instruction set,
+0 when the calling convention's own rule stands
+
 ## def ReservedGpFn
 
 ```mach
@@ -347,6 +356,12 @@ guarantees nothing
 
 ```mach
 pub fun natural_stack_args_for(vt: *OsVTable, arch_id: u32) bool;
+```
+
+## fun reg_arg_align_for
+
+```mach
+pub fun reg_arg_align_for(vt: *OsVTable, arch_id: u32) u32;
 ```
 
 ## fun va_list_for
