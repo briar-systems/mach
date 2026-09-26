@@ -20,7 +20,7 @@ use A: std.allocator;
 
 use mach.lang.alloc;
 use mach.lang.build.cache.compiler;
-use codec: mach.lang.build.cache.image;
+use cache_record: mach.lang.build.cache.record;
 use mach.lang.build.outcome;
 use mach.lang.build.request;
 use mach.lang.ct;
@@ -63,8 +63,6 @@ pub val MODE_EXECUTABLE: BuildMode = 0;
 pub val MODE_LIBRARY: BuildMode = 1;
 
 pub def TargetOpt: u8;
-
-pub val TARGET_OPT_DEFAULT: TargetOpt = 0;
 
 pub val TARGET_OPT_DEBUG: TargetOpt = 1;
 
@@ -232,18 +230,41 @@ pub rec ModuleEntry {
     ir_module:         *ir.Module;
     object_image:      *of.ObjectImage;
     staged_image:      *of.ObjectImage;
-    staged_facts:      codec.Facts;
+    staged_facts:      cache_record.Facts;
     cache_checked:     bool;
     cache_hit:         bool;
     cache_under:       [32]u8;
-    stable_id:         session.StableModuleId;
-    target_gated:      bool;
+    # the key this load built for the module's object, when it has one. the key
+    # leaves the module's tests out, so the digest of its whole source keys its
+    # test object and says whether the object's recorded warnings still stand
+    cache_key:     [32]u8;
+    cache_keyed:   bool;
+    source_digest: [32]u8;
+    # the module's object is reused and nothing the build still compiles
+    # imports it, so it is not resolved, typed or lowered
+    frontend_skipped: bool;
+    stable_id:        session.StableModuleId;
+    target_gated:     bool;
     # the artifact whose walk first reached this module, the same first-reached rule that
     # gates a foreign module: the cell's artifact, or under a union walk the primary's when
     # the primary's walk reaches it, otherwise the first artifact's in union order; a module
     # first reached behind a gate decided later is its importer's artifact's
     artifact:     intern.StrId;
     load_outcome: comptime.GateOutcome;
+    test:         TestObject;
+}
+
+# a module's test object, beside its normal object and never changing it: the
+# module's tests and what they reach that the normal object does not define. the
+# fields mirror the normal object's on ModuleEntry
+pub rec TestObject {
+    ir_module:     *ir.Module;
+    object_image:  *of.ObjectImage;
+    staged_image:  *of.ObjectImage;
+    staged_facts:  cache_record.Facts;
+    cache_checked: bool;
+    cache_hit:     bool;
+    cache_under:   [32]u8;
 }
 
 pub def LoadStatus: u8;
@@ -271,11 +292,6 @@ pub rec TargetTuple {
     ct_mul:        ct.CtMulMask;
     # the extensions the tuple's target selects, in its isa's vocabulary
     extensions: isa.ExtensionView;
-}
-
-# an entry this unit build restored or published, which eviction keeps
-pub rec CacheKey {
-    bytes: [32]u8;
 }
 
 pub rec RawLowerCapture {
@@ -308,20 +324,25 @@ pub rec Project {
     foreign_entries:     *ArtifactEntry;
     foreign_entry_count: u32;
 
-    compiler_name:                 intern.StrId;
-    compiler_ver:                  intern.StrId;
-    step_digest:                   [32]u8;
-    cache_snapshot:                [32]u8;
+    compiler_name: intern.StrId;
+    compiler_ver:  intern.StrId;
+    step_digest:   [32]u8;
+    # the modules are keyed and `obj/` is read under those keys, until the next load
     cache_ready:                   bool;
-    cache_initialized:             bool;
-    cache_operation_sequence:      u64;
     compiler_identity:             compiler.Identity;
     compiler_identity_initialized: bool;
     compiler_identity_available:   bool;
     cache_hits:                    u32;
     cache_misses:                  u32;
-    cache_dir:                     str;
-    cache_keys:                    vector.Vector[CacheKey];
+    # the build cell's obj directory, borrowed from its plan: where each
+    # module's object is written and where the object cache reads it back
+    object_dir: str;
+    # the cell's compiler-only state directory, `<out>/.cache`, borrowed from
+    # its plan: where the object cache keeps its digest memo
+    cache_dir: str;
+    # the cell's expanded `[project].out`, borrowed from its plan: the build
+    # owns the layout beneath it
+    out_dir: str;
 
     modules: handle.StableChunks[ModuleEntry];
     by_fqn:  map.Map[intern.StrId, session.ModuleId];
@@ -373,13 +394,7 @@ pub fun begin_query_phase(p: *Project) res[query.Operation, outcome.Fail] {
     if (sel begun.err) {
         ret res[query.Operation, outcome.Fail].err{outcome.from_fail(begun.err)};
     }
-    release_cache_operation(p);
-    p.cache_operation_sequence = begun.ok.sequence;
-    var i: usize = 0;
-    for (i < 32) {
-        p.cache_snapshot[i] = 0;
-        i                   = i + 1;
-    }
+    release_fresh_staged(p);
     ret res[query.Operation, outcome.Fail].ok{begun.ok};
 }
 
@@ -404,9 +419,7 @@ pub fun finish_query_phase(p: *Project, operation: query.Operation,
     result: err[outcome.Fail]) err[outcome.Fail] {
     val db:    *query.QueryDb = ?p.s.queries;
     val ended: err[fail.Fail] = query.end(db, operation);
-    if (!db.operation_active && operation.owner == db::ptr && operation.sequence == p.cache_operation_sequence) {
-        release_cache_operation(p);
-    }
+    if (!db.operation_active) { release_fresh_staged(p); }
     var final_result:      err[outcome.Fail] = result;
     var operation_failure: bool              = false;
     var message:           str               = nil;
@@ -485,12 +498,14 @@ pub fun finish_query_phase(p: *Project, operation: query.Operation,
         var i: u32 = 0;
         for (i < module_count(p)) {
             val m: *ModuleEntry = module_at(p, i);
-            m.a              = nil;
-            m.resolve_result = nil;
-            m.sema_result    = nil;
-            m.ir_module      = nil;
-            m.object_image   = nil;
-            i                = i + 1;
+            m.a                 = nil;
+            m.resolve_result    = nil;
+            m.sema_result       = nil;
+            m.ir_module         = nil;
+            m.object_image      = nil;
+            m.test.ir_module    = nil;
+            m.test.object_image = nil;
+            i                   = i + 1;
         }
         i = 0;
         for (i < p.s.module_ast_count) {
@@ -544,42 +559,50 @@ pub fun release_staged(p: *Project, m: *ModuleEntry) {
         A.deallocate[of.ObjectImage](p.s.alloc, m.staged_image, 1);
         m.staged_image = nil;
     }
-    codec.facts_dnit(p.s.alloc, ?m.staged_facts);
+    cache_record.facts_dnit(p.s.alloc, ?m.staged_facts);
     m.cache_checked = false;
     m.cache_hit     = false;
+}
+
+pub fun release_staged_test(p: *Project, m: *ModuleEntry) {
+    val t: *TestObject = ?m.test;
+    if (t.staged_image != nil) {
+        of.object_image_dnit(t.staged_image);
+        A.deallocate[of.ObjectImage](p.s.alloc, t.staged_image, 1);
+        t.staged_image = nil;
+    }
+    cache_record.facts_dnit(p.s.alloc, ?t.staged_facts);
+    t.cache_checked = false;
+    t.cache_hit     = false;
 }
 
 pub fun release_all_staged(p: *Project) {
     var i: u32 = 0;
     for (i < module_count(p)) {
         release_staged(p, module_at(p, i));
+        release_staged_test(p, module_at(p, i));
         i = i + 1;
     }
 }
 
-# a restored product stays staged across operations: it is keyed by the cell
-# snapshot it was read under and the next preparation discards it if that
-# changed. a freshly generated image staged by a codegen worker belongs to the
-# operation that generated it and leaves with it
-fun release_cache_operation(p: *Project) {
-    str_free(p.alloc, p.cache_dir);
-    p.cache_dir                = nil;
-    p.cache_ready              = false;
-    p.cache_initialized        = false;
-    p.cache_operation_sequence = 0;
+# a restored product stays staged across operations: it is keyed by the key
+# it was read under and the next load discards it if that changed. a freshly
+# generated image staged by a codegen worker belongs to the operation that
+# generated it and leaves with it
+fun release_fresh_staged(p: *Project) {
     var i: u32 = 0;
     for (i < module_count(p)) {
         val m: *ModuleEntry = module_at(p, i);
-        if (m.staged_image != nil && !m.cache_hit) { release_staged(p, m); }
+        if (m.staged_image != nil && !m.cache_hit)           { release_staged(p, m); }
+        if (m.test.staged_image != nil && !m.test.cache_hit) { release_staged_test(p, m); }
         i = i + 1;
     }
 }
 
 pub fun dnit_project(p: *Project) {
     if (p == nil) { ret; }
-    release_cache_operation(p);
+    release_fresh_staged(p);
     release_all_staged(p);
-    vector.dnit[CacheKey](?p.cache_keys);
     vector.dnit[LoadDemand](?p.demands);
     var i: u32 = 0;
     for (i < module_count(p)) {
@@ -668,20 +691,18 @@ pub fun init_project(p: *Project, s: *session.Session) {
     p.compiler_ver         = intern.STR_NIL;
     var cache_byte: usize = 0;
     for (cache_byte < 32) {
-        p.step_digest[cache_byte]    = 0;
-        p.cache_snapshot[cache_byte] = 0;
-        cache_byte                   = cache_byte + 1;
+        p.step_digest[cache_byte] = 0;
+        cache_byte                = cache_byte + 1;
     }
     compiler.identity_clear(?p.compiler_identity);
     p.cache_ready                   = false;
-    p.cache_initialized             = false;
-    p.cache_operation_sequence      = 0;
     p.compiler_identity_initialized = false;
     p.compiler_identity_available   = false;
     p.cache_hits                    = 0;
     p.cache_misses                  = 0;
+    p.object_dir                    = nil;
     p.cache_dir                     = nil;
-    p.cache_keys                    = vector.init[CacheKey](s.alloc);
+    p.out_dir                       = nil;
     p.demands                       = vector.init[LoadDemand](s.alloc);
     p.topo_dirty                    = false;
     var ki: u32 = 0;
@@ -855,15 +876,11 @@ pub fun map_opt(o: manifest.MOpt) opt[TargetOpt] {
     ret opt[TargetOpt].none{};
 }
 
+#[testing]
 pub fun intern_unwrap(itn: *intern.Interner, text: str) intern.StrId {
     val interned: res[intern.StrId, A.Error] = intern.intern(itn, text);
     if (sel interned.ok) { ret interned.ok; }
     ret intern.STR_NIL;
-}
-
-pub fun intern_opt_unwrap(itn: *intern.Interner, text: str) intern.StrId {
-    if (str_empty(text)) { ret intern.STR_NIL; }
-    ret intern_unwrap(itn, text);
 }
 
 pub fun fqn_name(p: *Project, fqn: intern.StrId) str {
@@ -955,7 +972,7 @@ pub fun drop_surface(a: *A.Allocator, slot: **sema.ModuleSema) {
     @slot = nil;
 }
 
-test "mach.lang.driver.project.module_by_fqn:pointer_stays_valid_across_growth" {
+test module_by_fqn__pointer_stays_valid_across_growth {
     var a: A.Allocator;
     page.make(?a);
     val sr: res[session.Session, fail.Fail] = session.init(?a);

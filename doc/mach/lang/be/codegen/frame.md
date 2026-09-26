@@ -65,15 +65,3 @@ the byte extent an encoder addresses a slot at: the displacement from the
 slot base register (the stack pointer when slots_from_sp, else the frame
 pointer) and the slot's size. false when v owns no slot
 
-## fun is_slot
-
-```mach
-pub fun is_slot(frame: *mir.MirFrame, v: u32) bool;
-```
-
-## fun is_alloca_slot
-
-```mach
-pub fun is_alloca_slot(frame: *mir.MirFrame, v: u32) bool;
-```
-

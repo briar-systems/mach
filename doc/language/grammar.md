@@ -373,10 +373,10 @@ local statement (see [Statements](#statements)).
 ### `test`
 
 ```ebnf
-test-decl ::= "test" ( IDENT | LIT_STR ) block
+test-decl ::= "test" IDENT block
 ```
 
-A `test` carries a label and a block body. An identifier label is the string label of the same text.
+A `test` carries a name and a block body. The name lives in the module's test namespace, apart from every other declaration (see [test.md](test.md#grammar)).
 
 ### Generic parameters
 

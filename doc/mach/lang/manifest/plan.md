@@ -57,11 +57,14 @@ profile_name: the resolved profile's name
 entry: the artifact's `entry`
 bin_path: the artifact's output: the expanded `[project].out` joined with the
                expanded artifact `out`
+out_root: `<expanded project out>`, whose layout beneath it the build owns
 obj_root: `<expanded project out>/obj`
 ir_root: `<expanded project out>/ir`
 asm_root: `<expanded project out>/asm`
 test_root: `<expanded project out>/test/{name}`, with `{name}` left literal for
                the test runner to fill
+cache_root: `<expanded project out>/.cache`, the compiler-only state
+stage_root: `<expanded project out>/.stage`, the build step scratch space
 opt: from the resolved profile
 debug: from the resolved profile
 simd: from the resolved profile
@@ -99,6 +102,32 @@ pub val DEPENDENCY_ARTIFACT_DIR: str = "dep"
 
 the directory under the expanded root `[project].out` that holds a dependency's
 artifact outputs, one subdirectory per dependency id
+
+## val CACHE_DIR
+
+```mach
+pub val CACHE_DIR: str = ".cache"
+```
+
+the directory under the expanded `[project].out` that holds compiler-only state:
+nothing but the compiler reads or writes it, and a step output may not name it
+
+## val STEP_STAMP_DIR
+
+```mach
+pub val STEP_STAMP_DIR: str = ".cache/steps"
+```
+
+the directory under `CACHE_DIR` that holds one fingerprint stamp per build step
+
+## val STAGE_DIR
+
+```mach
+pub val STAGE_DIR: str = ".stage"
+```
+
+the directory under the expanded `[project].out` that holds build step scratch
+space, one subdirectory per step, reset before the step runs
 
 ## fun root_scope
 
@@ -424,22 +453,6 @@ pick: updated in place; untouched when it already names an artifact or fewer
        than two are declared
 ret: ok; err from target resolution, when no artifact supports the target,
        when more than one candidate is marked default, or when several are and none is
-
-## fun select_sole_target_artifact
-
-```mach
-pub fun select_sole_target_artifact(alloc: *A.Allocator, itn: *intern.Interner,
-m: *Manifest, pick: *Selection) err[outcome.Fail];
-```
-
-`select_primary_artifact` without the refusal: fill in `pick.artifact` only
-when the default selection holds one artifact, and stay silent otherwise
-
-alloc: owns error text
-itn: resolves names
-m: the manifest
-pick: updated in place when a choice is clear
-ret: ok unless the artifact name cannot be looked up
 
 ## fun select_sole_executable_artifact
 

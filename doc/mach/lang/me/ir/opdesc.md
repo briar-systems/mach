@@ -6,12 +6,6 @@
 pub def IrEffects: u32
 ```
 
-## val EFF_NONE
-
-```mach
-pub val EFF_NONE: IrEffects = 0x00000000
-```
-
 ## val EFF_TERMINATOR
 
 ```mach
@@ -784,12 +778,6 @@ the text lives in the module allocator, which outlives the pass
 
 ```mach
 pub fun desc(k: instruction.InstrKind) *IrOpDescriptor;
-```
-
-## fun effects
-
-```mach
-pub fun effects(k: instruction.InstrKind) IrEffects;
 ```
 
 ## fun has

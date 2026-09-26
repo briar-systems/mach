@@ -354,12 +354,6 @@ pub fun inst_worklist_free(wl: *InstWorklist);
 pub fun inst_worklist_dnit(sc: *SemaContext);
 ```
 
-## fun module_sema_for
-
-```mach
-pub fun module_sema_for(sc: *SemaContext, module: session.ModuleId) opt[*ModuleSema];
-```
-
 ## fun public_type_for
 
 ```mach
@@ -394,12 +388,6 @@ pub fun symbol_for_type(sc: *SemaContext, tid: id.TypeId) opt[*resolve.Symbol];
 
 ```mach
 pub fun symbol_by_id(sc: *SemaContext, sid: resolve.SymbolId) opt[*resolve.Symbol];
-```
-
-## fun ptr_width_of
-
-```mach
-pub fun ptr_width_of(sc: *SemaContext) u32;
 ```
 
 ## fun machine_of
@@ -444,12 +432,6 @@ pub fun diag_mark(sc: *SemaContext) u64;
 pub fun reported_since(sc: *SemaContext, mark: u64) bool;
 ```
 
-## fun report_warning
-
-```mach
-pub fun report_warning(sc: *SemaContext, span: token.Span, message: str);
-```
-
 ## fun report_note
 
 ```mach
@@ -468,12 +450,6 @@ pub fun report_numbered(sc: *SemaContext, span: token.Span, prefix: str, n: usiz
 pub fun field_table_stage(sc: *SemaContext, additional: u32) res[u32, fail.Fail];
 ```
 
-## fun field_table_stage_push
-
-```mach
-pub fun field_table_stage_push(sc: *SemaContext, name: intern.StrId, ty: type.TypeId) err[fail.Fail];
-```
-
 ## fun field_table_stage_push_entry
 
 ```mach
@@ -490,12 +466,6 @@ pub fun field_table_publish(sc: *SemaContext, ty: type.TypeId, fields_start: u32
 
 ```mach
 pub fun field_table_for(sc: *SemaContext, ty: type.TypeId) opt[*FieldTable];
-```
-
-## fun field_epoch
-
-```mach
-pub fun field_epoch(sc: *SemaContext) u32;
 ```
 
 ## fun field_lookup

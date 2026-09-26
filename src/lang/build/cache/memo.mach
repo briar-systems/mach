@@ -1,0 +1,519 @@
+# the per-file digest memo: what a source file's bytes digest to, remembered
+# under the path, size, modification time and identity the file had when it
+# was hashed, so an unchanged file costs a stat and not a hash. the memo lives
+# at `<out>/.cache/digests` and belongs to one compiler identity, whose
+# parser decides the surface digests; a memo written by another compiler, or
+# one that is missing, truncated or damaged, reads as empty. the layout is
+# `"MDM2"`, the 32-byte compiler digest, the entry count, the entries, then
+# the sha-256 of everything before it. an entry is its path (length then
+# bytes), its size, modification seconds and nanoseconds, its 41-byte
+# identity, then its five digests, every number little endian
+use mach.lang.build.outcome;
+use mach.lang.fail;
+use mach.lang.output;
+use mach.lang.target.of.bin;
+use A: std.allocator;
+use std.allocator.page;
+use std.chrono.time;
+use std.collections.map;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.crypto.hash.sha256;
+use fs:       std.filesystem;
+use io_error: std.io.error;
+use std.memory;
+use identities: std.system.file_identity;
+use std.text.string.str_dup;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.path;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+val MAGIC:         u32   = 0x324D444D;
+val HEADER:        usize = 40;
+val IDENTITY_SIZE: usize = 41;
+val ENTRY_FIXED:   usize = 4 + 24 + 41 + 160;
+val TRAILER:       usize = 32;
+
+# a file modified this close to the moment it is stamped could be modified
+# again within the same timestamp tick, so it is hashed again next time rather
+# than remembered
+val RACY_SECONDS: i64 = 2;
+
+# what the memo remembers of one file: the digest of its bytes, of its surface
+# without positions, of its surface with the positions of what it omits, and of
+# its code without its test declarations, without and with their positions
+pub rec Digests {
+    content:       [32]u8;
+    surface:       [32]u8;
+    placed:        [32]u8;
+    normal:        [32]u8;
+    normal_placed: [32]u8;
+}
+
+# what a file looked like when it was observed
+pub rec Stamp {
+    size:     u64;
+    sec:      i64;
+    nsec:     i64;
+    identity: [41]u8;
+}
+
+rec Entry {
+    path:    str;
+    stamp:   Stamp;
+    digests: Digests;
+}
+
+pub rec Memo {
+    alloc:    *A.Allocator;
+    compiler: [32]u8;
+    entries:  Vector[Entry];
+    index:    map.Map[u64, u32];
+    dirty:    bool;
+}
+
+pub fun init(a: *A.Allocator, compiler: *[32]u8) Memo {
+    var m: Memo = Memo{alloc: a, entries: vector.init[Entry](a), index: map.init[u64, u32](a)};
+    memory.raw_copy((?m.compiler[0])::ptr, (?(@compiler)[0])::ptr, 32);
+    ret m;
+}
+
+pub fun dnit(m: *Memo) {
+    var i: usize = 0;
+    for (i < m.entries.len) {
+        str_free(m.alloc, m.entries.data[i].path);
+        i = i + 1;
+    }
+    vector.dnit[Entry](?m.entries);
+    map.dnit[u64, u32](?m.index);
+}
+
+fun path_hash(p: str) u64 {
+    var h: u64   = 0xcbf29ce484222325;
+    val n: usize = str_len(p);
+    var i: usize = 0;
+    for (i < n) {
+        h = (h ^ p[i]::u64) * 0x100000001b3;
+        i = i + 1;
+    }
+    ret h;
+}
+
+fun find(m: *Memo, p: str) opt[u32] {
+    var h:     u64       = path_hash(p);
+    val found: opt[*u32] = map.get[u64, u32](?m.index, ?h);
+    if (sel found.none) { ret opt[u32].none{}; }
+    val at: u32 = @found.some;
+    if (!str_equals(m.entries.data[at].path, p)) { ret opt[u32].none{}; }
+    ret opt[u32].some{at};
+}
+
+fun stamp_equal(a: *Stamp, b: *Stamp) bool {
+    ret a.size == b.size && a.sec == b.sec && a.nsec == b.nsec
+        && memory.raw_equal((?a.identity[0])::ptr, (?b.identity[0])::ptr, IDENTITY_SIZE);
+}
+
+# how the file at `p` looks now, none when it cannot be opened or observed
+pub fun stamp(p: str) opt[Stamp] {
+    val opened: res[fs.File, io_error.Error] = fs.open(p);
+    if (sel opened.err) { ret opt[Stamp].none{}; }
+    var f: fs.File = opened.ok;
+    fin { fs.close(?f); }
+    val meta: res[fs.Metadata, io_error.Error] = fs.stat_of(f);
+    if (sel meta.err) { ret opt[Stamp].none{}; }
+    val ident: res[fs.Identity, io_error.Error] = fs.identity_of(f);
+    if (sel ident.err) { ret opt[Stamp].none{}; }
+    var s:  Stamp       = Stamp{size: meta.ok.size::u64, sec: meta.ok.modified.sec, nsec: meta.ok.modified.nsec};
+    var id: fs.Identity = ident.ok;
+    memory.raw_copy((?s.identity[0])::ptr, (?id.representation[0])::ptr, IDENTITY_SIZE);
+    ret opt[Stamp].some{s};
+}
+
+# the digests remembered for `p` when the file still looks as it did
+pub fun lookup(m: *Memo, p: str, s: *Stamp) opt[Digests] {
+    val at: opt[u32] = find(m, p);
+    if (sel at.none) { ret opt[Digests].none{}; }
+    val e: *Entry = ?m.entries.data[at.some];
+    if (!stamp_equal(?e.stamp, s)) { ret opt[Digests].none{}; }
+    ret opt[Digests].some{e.digests};
+}
+
+# remember the digests of `p` as stamped, unless it was modified so recently
+# (relative to `now`) that a second edit could share its timestamp
+pub fun record(m: *Memo, p: str, s: *Stamp, d: *Digests, now: time.Time) err[A.Error] {
+    if (s.sec > now.sec - RACY_SECONDS) { ret err[A.Error].ok{}; }
+    val at: opt[u32] = find(m, p);
+    if (sel at.some) {
+        val e: *Entry = ?m.entries.data[at.some];
+        e.stamp   = @s;
+        e.digests = @d;
+        m.dirty   = true;
+        ret err[A.Error].ok{};
+    }
+    var h:     u64       = path_hash(p);
+    val taken: opt[*u32] = map.get[u64, u32](?m.index, ?h);
+    # a colliding path is simply not remembered
+    if (sel taken.some) { ret err[A.Error].ok{}; }
+    val copied: res[str, A.Error] = str_dup(m.alloc, p);
+    if (sel copied.err) { ret err[A.Error].err{copied.err}; }
+    val pushed: res[usize, A.Error] = vector.push[Entry](?m.entries, Entry{path: copied.ok, stamp: @s, digests: @d});
+    if (sel pushed.err) {
+        str_free(m.alloc, copied.ok);
+        ret err[A.Error].err{pushed.err};
+    }
+    val indexed: res[bool, A.Error] = map.insert[u64, u32](?m.index, h, (m.entries.len - 1)::u32);
+    if (sel indexed.err) { ret err[A.Error].err{indexed.err}; }
+    m.dirty = true;
+    ret err[A.Error].ok{};
+}
+
+rec Reader {
+    data: *u8;
+    len:  usize;
+    pos:  usize;
+    bad:  bool;
+}
+
+fun take(r: *Reader, n: usize) *u8 {
+    if (r.bad || r.len - r.pos < n) {
+        r.bad = true;
+        ret nil;
+    }
+    val at: *u8 = (r.data::usize + r.pos)::*u8;
+    r.pos = r.pos + n;
+    ret at;
+}
+
+fun take_u32(r: *Reader) u32 {
+    val at: *u8 = take(r, 4);
+    if (at == nil) { ret 0; }
+    ret bin.read_u32_le(at, 0);
+}
+
+fun take_u64(r: *Reader) u64 {
+    val at: *u8 = take(r, 8);
+    if (at == nil) { ret 0; }
+    ret bin.read_u64_le(at, 0);
+}
+
+fun take_digest(r: *Reader, out: *[32]u8) {
+    val at: *u8 = take(r, 32);
+    if (at != nil) { memory.raw_copy((?(@out)[0])::ptr, at::ptr, 32); }
+}
+
+# the memo `bytes` hold for `compiler`: every entry, or none at all when the
+# bytes are not a complete memo of that compiler. err only when allocation fails
+pub fun decode(a: *A.Allocator, compiler: *[32]u8, bytes: *u8, len: usize) res[Memo, A.Error] {
+    var m: Memo = init(a, compiler);
+    if (bytes == nil || len < HEADER + TRAILER) { ret res[Memo, A.Error].ok{m}; }
+    var sum: [32]u8;
+    sha256.hash(bytes, len - TRAILER, ?sum[0]);
+    if (!memory.raw_equal((?sum[0])::ptr, (bytes::usize + len - TRAILER)::ptr, 32)) { ret res[Memo, A.Error].ok{m}; }
+    var r: Reader = Reader{data: bytes, len: len - TRAILER, pos: 0};
+    if (take_u32(?r) != MAGIC) { ret res[Memo, A.Error].ok{m}; }
+    val written_by: *u8 = take(?r, 32);
+    if (!memory.raw_equal(written_by::ptr, (?(@compiler)[0])::ptr, 32)) { ret res[Memo, A.Error].ok{m}; }
+    val count: u32 = take_u32(?r);
+    if (count::usize > (r.len - r.pos) / ENTRY_FIXED) { ret res[Memo, A.Error].ok{m}; }
+    var i: u32 = 0;
+    for (i < count && !r.bad) {
+        val path_len: u32 = take_u32(?r);
+        val path_at:  *u8 = take(?r, path_len::usize);
+        var s:        Stamp;
+        s.size = take_u64(?r);
+        s.sec  = take_u64(?r)::i64;
+        s.nsec = take_u64(?r)::i64;
+        val ident: *u8 = take(?r, IDENTITY_SIZE);
+        if (ident != nil) { memory.raw_copy((?s.identity[0])::ptr, ident::ptr, IDENTITY_SIZE); }
+        var d: Digests;
+        take_digest(?r, ?d.content);
+        take_digest(?r, ?d.surface);
+        take_digest(?r, ?d.placed);
+        take_digest(?r, ?d.normal);
+        take_digest(?r, ?d.normal_placed);
+        if (r.bad || path_len == 0) {
+            r.bad = true;
+            brk;
+        }
+        val copied: res[str, A.Error] = str_dup_bytes(a, path_at, path_len::usize);
+        if (sel copied.err) {
+            dnit(?m);
+            ret res[Memo, A.Error].err{copied.err};
+        }
+        var h:     u64       = path_hash(copied.ok);
+        val clash: opt[*u32] = map.get[u64, u32](?m.index, ?h);
+        if (sel clash.some) {
+            str_free(a, copied.ok);
+            r.bad = true;
+            brk;
+        }
+        val pushed: res[usize, A.Error] = vector.push[Entry](?m.entries, Entry{path: copied.ok, stamp: s, digests: d});
+        if (sel pushed.err) {
+            str_free(a, copied.ok);
+            dnit(?m);
+            ret res[Memo, A.Error].err{pushed.err};
+        }
+        val indexed: res[bool, A.Error] = map.insert[u64, u32](?m.index, h, (m.entries.len - 1)::u32);
+        if (sel indexed.err) {
+            dnit(?m);
+            ret res[Memo, A.Error].err{indexed.err};
+        }
+        i = i + 1;
+    }
+    if (r.bad || r.pos != r.len) {
+        dnit(?m);
+        ret res[Memo, A.Error].ok{init(a, compiler)};
+    }
+    ret res[Memo, A.Error].ok{m};
+}
+
+fun str_dup_bytes(a: *A.Allocator, bytes: *u8, len: usize) res[str, A.Error] {
+    val allocated: res[*u8, A.Error] = A.allocate[u8](a, len + 1);
+    if (sel allocated.err) { ret res[str, A.Error].err{allocated.err}; }
+    val buf: *u8 = allocated.ok;
+    memory.raw_copy(buf::ptr, bytes::ptr, len);
+    buf[len] = 0;
+    ret res[str, A.Error].ok{buf::str};
+}
+
+# the memo as bytes, allocated in a and owned by the caller
+pub fun encode(m: *Memo, a: *A.Allocator, out_len: *usize) res[*u8, A.Error] {
+    var total: usize = HEADER + TRAILER;
+    var i:     usize = 0;
+    for (i < m.entries.len) {
+        total = total + ENTRY_FIXED + str_len(m.entries.data[i].path);
+        i     = i + 1;
+    }
+    val allocated: res[*u8, A.Error] = A.allocate[u8](a, total);
+    if (sel allocated.err) { ret res[*u8, A.Error].err{allocated.err}; }
+    val buf: *u8 = allocated.ok;
+    bin.write_u32_le(buf, 0, MAGIC);
+    memory.raw_copy((buf::usize + 4)::ptr, (?m.compiler[0])::ptr, 32);
+    bin.write_u32_le(buf, 36, m.entries.len::u32);
+    var pos: usize = HEADER;
+    i = 0;
+    for (i < m.entries.len) {
+        val e: *Entry = ?m.entries.data[i];
+        val n: usize  = str_len(e.path);
+        bin.write_u32_le(buf, pos, n::u32);
+        memory.raw_copy((buf::usize + pos + 4)::ptr, e.path::ptr, n);
+        pos = pos + 4 + n;
+        bin.write_u64_le(buf, pos, e.stamp.size);
+        bin.write_u64_le(buf, pos + 8, e.stamp.sec::u64);
+        bin.write_u64_le(buf, pos + 16, e.stamp.nsec::u64);
+        memory.raw_copy((buf::usize + pos + 24)::ptr, (?e.stamp.identity[0])::ptr, IDENTITY_SIZE);
+        pos = pos + 24 + IDENTITY_SIZE;
+        memory.raw_copy((buf::usize + pos)::ptr, (?e.digests.content[0])::ptr, 32);
+        memory.raw_copy((buf::usize + pos + 32)::ptr, (?e.digests.surface[0])::ptr, 32);
+        memory.raw_copy((buf::usize + pos + 64)::ptr, (?e.digests.placed[0])::ptr, 32);
+        memory.raw_copy((buf::usize + pos + 96)::ptr, (?e.digests.normal[0])::ptr, 32);
+        memory.raw_copy((buf::usize + pos + 128)::ptr, (?e.digests.normal_placed[0])::ptr, 32);
+        pos = pos + 160;
+        i   = i + 1;
+    }
+    sha256.hash(buf, pos, (buf::usize + pos)::*u8);
+    @out_len = total;
+    ret res[*u8, A.Error].ok{buf};
+}
+
+# the memo stored at `file`, empty when there is none or it cannot be read
+pub fun load(a: *A.Allocator, compiler: *[32]u8, file: str) res[Memo, A.Error] {
+    var backing: A.Allocator;
+    val made:    err[A.Error] = page.make(?backing);
+    if (sel made.err) { ret res[Memo, A.Error].err{made.err}; }
+    val read: res[Vector[u8], fs.FsError] = fs.read_bytes(?backing, file);
+    if (sel read.err) { ret res[Memo, A.Error].ok{init(a, compiler)}; }
+    var bytes: Vector[u8] = read.ok;
+    fin { vector.dnit[u8](?bytes); }
+    ret decode(a, compiler, bytes.data, bytes.len);
+}
+
+rec MemoWrite {
+    bytes: *u8;
+    len:   usize;
+}
+
+fun write_memo(w: *MemoWrite, destination: str) err[fail.Fail] {
+    val written: err[fs.FsError] = fs.write_bytes(destination, w.bytes, w.len, 0o644);
+    if (sel written.err) { ret err[fail.Fail].err{fail.message("the digest memo could not be written")}; }
+    ret err[fail.Fail].ok{};
+}
+
+# write the memo to `file` through a sibling temporary when it changed
+pub fun store(m: *Memo, out_dir: str, file: str) err[outcome.Fail] {
+    if (!m.dirty) { ret err[outcome.Fail].ok{}; }
+    var backing: A.Allocator;
+    val made:    err[A.Error] = page.make(?backing);
+    if (sel made.err) { ret err[outcome.Fail].err{outcome.refused(made.err)}; }
+    val reserved: err[outcome.Fail] = output.reserve(?backing, out_dir, file);
+    if (sel reserved.err) { ret reserved; }
+    var len:     usize             = 0;
+    val encoded: res[*u8, A.Error] = encode(m, ?backing, ?len);
+    if (sel encoded.err) { ret err[outcome.Fail].err{outcome.refused(encoded.err)}; }
+    var write:   MemoWrite         = MemoWrite{bytes: encoded.ok, len: len};
+    val written: err[outcome.Fail] = output.through_temporary[MemoWrite](?backing, file, ?write, write_memo);
+    A.deallocate[u8](?backing, encoded.ok, len);
+    if (sel written.err) { ret written; }
+    m.dirty = false;
+    ret err[outcome.Fail].ok{};
+}
+
+#[testing]
+fun t_digests(fill: u8) Digests {
+    var d: Digests;
+    var i: usize = 0;
+    for (i < 32) {
+        d.content[i]       = fill;
+        d.surface[i]       = fill + 1;
+        d.placed[i]        = fill + 2;
+        d.normal[i]        = fill + 3;
+        d.normal_placed[i] = fill + 4;
+        i                  = i + 1;
+    }
+    ret d;
+}
+
+#[testing]
+fun t_write(file: str, text: str) bool {
+    val wrote: err[fs.FsError] = fs.write_bytes(file, text, str_len(text), 0o644);
+    ret sel wrote.ok;
+}
+
+#[testing]
+fun t_found(m: *Memo, file: str, fill: u8) bool {
+    val s: opt[Stamp] = stamp(file);
+    if (sel s.none) { ret false; }
+    var observed: Stamp        = s.some;
+    val got:      opt[Digests] = lookup(m, file, ?observed);
+    if (sel got.none) { ret false; }
+    ret got.some.content[0] == fill;
+}
+
+# an unchanged file is answered from the memo; a file rewritten in place with
+# the same size is not, nor one replaced by another file of the same bytes'
+# size, nor one whose stamp is so recent it could be rewritten unnoticed
+test lookup__answers_an_unchanged_file_and_refuses_a_changed_one {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val tf_r: res[fs.TempFile, fs.FsError] = fs.temp_create(?a, "mach_memo_test");
+    if (sel tf_r.err) { ret 2; }
+    var tf:    fs.TempFile       = tf_r.ok;
+    val dup_r: res[str, A.Error] = str_dup(?a, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (sel dup_r.err) { ret 2; }
+    val dir:  str             = dup_r.ok;
+    val made: err[fs.FsError] = fs.create_dir_all(?a, dir, 0o755);
+    if (sel made.err) { ret 2; }
+    fin { fs.remove_all(?a, dir); }
+    val file_r: res[str, A.Error] = path.join(?a, dir, "m.mach");
+    if (sel file_r.err) { ret 2; }
+    val file: str = file_r.ok;
+    if (!t_write(file, "pub fun one() i32 { ret 1; }\n")) { ret 3; }
+    var compiler: [32]u8;
+    compiler[0] = 7;
+    var m: Memo = init(?a, ?compiler);
+    fin { dnit(?m); }
+    val first: opt[Stamp] = stamp(file);
+    if (sel first.none) { ret 4; }
+    var s: Stamp   = first.some;
+    var d: Digests = t_digests(9);
+    # stamped just now: too recent to remember
+    val record_r: err[A.Error] = record(?m, file, ?s, ?d, time.unix(s.sec, 0));
+    if (sel record_r.err || m.dirty) { ret 5; }
+    val recorded: err[A.Error] = record(?m, file, ?s, ?d, time.unix(s.sec + 10, 0));
+    if (sel recorded.err || !m.dirty) { ret 6; }
+    if (!t_found(?m, file, 9))        { ret 7; }
+    # the same bytes' length written in place: the modification time or the
+    # size moves, so the memo does not answer
+    var moved: Stamp = s;
+    moved.nsec = moved.nsec + 1;
+    val none: opt[Digests] = lookup(?m, file, ?moved);
+    if (sel none.some) { ret 8; }
+    # a same-size file renamed over it has another identity
+    val other_r: res[str, A.Error] = path.join(?a, dir, "n.mach");
+    if (sel other_r.err)                                        { ret 9; }
+    if (!t_write(other_r.ok, "pub fun one() i32 { ret 2; }\n")) { ret 9; }
+    val other: opt[Stamp] = stamp(other_r.ok);
+    if (sel other.none) { ret 9; }
+    var replaced: Stamp = other.some;
+    replaced.sec  = s.sec;
+    replaced.nsec = s.nsec;
+    val renamed: err[io_error.Error] = fs.rename(other_r.ok, file);
+    if (sel renamed.err) { ret 10; }
+    val after: opt[Stamp] = stamp(file);
+    if (sel after.none) { ret 10; }
+    var now_stamp: Stamp = after.some;
+    now_stamp.sec  = s.sec;
+    now_stamp.nsec = s.nsec;
+    if (now_stamp.size != s.size) { ret 11; }
+    val swapped: opt[Digests] = lookup(?m, file, ?now_stamp);
+    if (sel swapped.some) { ret 12; }
+    ret 0;
+}
+
+# the memo round-trips through its bytes, and any damage or another
+# compiler's memo reads as empty
+test decode__round_trips_and_forgets_a_damaged_or_foreign_memo {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    var compiler: [32]u8;
+    compiler[0] = 3;
+    var m: Memo = init(?a, ?compiler);
+    fin { dnit(?m); }
+    var s: Stamp = Stamp{size: 12, sec: 100, nsec: 5};
+    s.identity[0] = 1;
+    var d:        Digests      = t_digests(4);
+    val recorded: err[A.Error] = record(?m, "/p/a.mach", ?s, ?d, time.unix(1000, 0));
+    if (sel recorded.err) { ret 2; }
+    var len:     usize             = 0;
+    val encoded: res[*u8, A.Error] = encode(?m, ?a, ?len);
+    if (sel encoded.err) { ret 3; }
+    val bytes: *u8 = encoded.ok;
+    fin { A.deallocate[u8](?a, bytes, len); }
+    val decoded: res[Memo, A.Error] = decode(?a, ?compiler, bytes, len);
+    if (sel decoded.err) { ret 4; }
+    var back: Memo         = decoded.ok;
+    val got:  opt[Digests] = lookup(?back, "/p/a.mach", ?s);
+    dnit(?back);
+    if (sel got.none)            { ret 5; }
+    if (got.some.placed[0] != 6) { ret 5; }
+    var other: [32]u8;
+    other[0] = 4;
+    val foreign: res[Memo, A.Error] = decode(?a, ?other, bytes, len);
+    if (sel foreign.err) { ret 6; }
+    var f:               Memo  = foreign.ok;
+    val foreign_entries: usize = f.entries.len;
+    dnit(?f);
+    if (foreign_entries != 0) { ret 7; }
+    # every truncation and every flipped byte reads as an empty memo
+    var at: usize = 0;
+    for (at < len) {
+        val cut: res[Memo, A.Error] = decode(?a, ?compiler, bytes, at);
+        if (sel cut.err) { ret 8; }
+        var c:           Memo  = cut.ok;
+        val cut_entries: usize = c.entries.len;
+        dnit(?c);
+        if (cut_entries != 0) { ret 9; }
+        bytes[at] = bytes[at] ^ 0x40;
+        val flipped: res[Memo, A.Error] = decode(?a, ?compiler, bytes, len);
+        bytes[at] = bytes[at] ^ 0x40;
+        if (sel flipped.err) { ret 10; }
+        var fl:              Memo  = flipped.ok;
+        val flipped_entries: usize = fl.entries.len;
+        dnit(?fl);
+        if (flipped_entries != 0) { ret 11; }
+        at = at + 1;
+    }
+    ret 0;
+}

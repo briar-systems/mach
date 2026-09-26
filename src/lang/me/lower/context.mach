@@ -2,7 +2,6 @@ use std.allocator.page;
 use std.collections.map;
 use std.format;
 use std.memory;
-use std.print;
 use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -95,6 +94,22 @@ pub rec PackInstance {
     name:     intern.StrId;
 }
 
+# a module's test object holds its tests and `#[testing]` declarations beside its
+# normal object, which it never changes. every definition the normal object already
+# holds is declared in the test object instead, so each symbol has one definition
+# ---
+# defined: the global symbols the normal object defines
+pub rec NormalObject {
+    defined: map.Map[intern.StrId, bool];
+}
+
+# lowering the test object, which declares `name` because the normal object defines it
+pub fun normal_defines(lc: *LowerContext, name: intern.StrId) bool {
+    if (lc.normal_object == nil) { ret false; }
+    val found: opt[*bool] = map.get[intern.StrId, bool](?lc.normal_object.defined, ?name);
+    ret sel found.some;
+}
+
 pub rec ModuleScope {
     a:            *ast.Ast;
     fqn:          intern.StrId;
@@ -117,13 +132,15 @@ pub rec ScopeMark {
 }
 
 pub rec LowerRequest {
-    deps:      *sema.SemaDeps;
-    diags:     *diagnostic.DiagnosticStore;
-    s:         *session.Session;
-    tgt:       *target.Target;
-    malloc:    *A.Allocator;
-    module:    ModuleScope;
-    test_mode: bool;
+    deps:   *sema.SemaDeps;
+    diags:  *diagnostic.DiagnosticStore;
+    s:      *session.Session;
+    tgt:    *target.Target;
+    malloc: *A.Allocator;
+    module: ModuleScope;
+    # nil when lowering the module's normal object; when lowering its test object, what
+    # the normal object defines
+    normal_object: *NormalObject;
     # the artifact this lowering feeds is a shared library, so a `fwd` that
     # exports nothing is worth a warning
     shared_artifact: bool;
@@ -196,7 +213,7 @@ pub rec LowerContext {
 
     ct_insts: *sema.InstWorklist;
 
-    test_mode: bool;
+    normal_object: *NormalObject;
 
     # while armed, the call argument whose aggregate read may use its source in place;
     # borrow_now says the read being lowered is that one, borrow_hit that it did (#3460)
@@ -275,7 +292,7 @@ pub fun request(
     sema_result: *sema.SemaResult,
     rr: *resolve.ResolveResult,
     ctx: *comptime.ComptimeCtx,
-    test_mode: bool,
+    normal_object: *NormalObject,
     shared_artifact: bool,
     debug: bool,
     checks: bool,
@@ -295,7 +312,7 @@ pub fun request(
     req.tgt             = tgt;
     req.malloc          = malloc;
     req.module          = sr.ok;
-    req.test_mode       = test_mode;
+    req.normal_object   = normal_object;
     req.shared_artifact = shared_artifact;
     req.debug           = debug;
     req.checks          = checks;
@@ -359,7 +376,7 @@ pub fun init_context(lc: *LowerContext, req: *LowerRequest, m: *ir.Module) err[f
     lc.scope_cap         = 0;
     lc.scope_generation  = 0;
     lc.scope_top         = 0;
-    lc.test_mode         = req.test_mode;
+    lc.normal_object     = req.normal_object;
     lc.shared_artifact   = req.shared_artifact;
     lc.debug             = req.debug;
     lc.checks            = req.checks;
@@ -1621,16 +1638,86 @@ pub fun function_return_ir(lc: *LowerContext, did: id.DeclId) res[ir_type.IrType
     ret lower_type(lc, t.data.fn.ret_type);
 }
 
+# a function's signature and the extension each parameter declares, which the
+# signless signature does not carry (#3927)
+pub rec FnSig {
+    sig: ir_type.IrTypeId;
+    ext: ir_type.ExtListId;
+}
+
+# the signature of the semantic type `tid` and, when it is a function type,
+# its parameters' extensions
+pub fun lower_fn_sig(lc: *LowerContext, tid: type.TypeId) res[FnSig, fail.Fail] {
+    val res_sig: res[ir_type.IrTypeId, fail.Fail] = lower_type(lc, tid);
+    if (sel res_sig.err) { ret res[FnSig, fail.Fail].err{res_sig.err}; }
+    val res_ext: res[ir_type.ExtListId, fail.Fail] = fun_type_ext(lc, tid);
+    if (sel res_ext.err) { ret res[FnSig, fail.Fail].err{res_ext.err}; }
+    var out: FnSig;
+    out.sig = res_sig.ok;
+    out.ext = res_ext.ok;
+    ret res[FnSig, fail.Fail].ok{out};
+}
+
+# the extensions the parameters of the semantic function type `tid` declare,
+# EXT_LIST_NONE for any other type
+pub fun fun_type_ext(lc: *LowerContext, tid: type.TypeId) res[ir_type.ExtListId, fail.Fail] {
+    val t_opt: opt[*type.Type] = type.get(?lc.s.types, type.strip_secret(?lc.s.types, substituted(lc, tid)));
+    if (sel t_opt.none)                   { ret res[ir_type.ExtListId, fail.Fail].ok{ir_type.EXT_LIST_NONE}; }
+    if (t_opt.some.kind != type.TYPE_FUN) { ret res[ir_type.ExtListId, fail.Fail].ok{ir_type.EXT_LIST_NONE}; }
+    val t: *type.Type = t_opt.some;
+    val n: u32        = t.data.fn.params_len;
+    if (n == 0) { ret res[ir_type.ExtListId, fail.Fail].ok{ir_type.EXT_LIST_NONE}; }
+
+    val res_buf: res[*ir_type.IntExt, A.Error] = A.allocate[ir_type.IntExt](lc.s.alloc, n::usize);
+    if (sel res_buf.err) { ret res[ir_type.ExtListId, fail.Fail].err{fail.refused(res_buf.err)}; }
+    val ext: *ir_type.IntExt = res_buf.ok;
+    fin { A.deallocate[ir_type.IntExt](lc.s.alloc, ext, n::usize); }
+    var i: u32 = 0;
+    for (i < n) {
+        val po: opt[type.TypeId] = type.get_param(?lc.s.types, t.data.fn.params_start + i);
+        ext[i] = ir_type.EXT_NONE;
+        if (sel po.some) { ext[i] = param_int_ext(lc, po.some); }
+        i = i + 1;
+    }
+    ret ir_type.intern_ext_list(?lc.m.types, ext, n);
+}
+
+fun substituted(lc: *LowerContext, tid: type.TypeId) type.TypeId {
+    if (lc.scope.subst == nil || lc.scope.subst_len == 0) { ret tid; }
+    ret recover_type(lc, generics.substitute(lc.s, tid, ?lc.scope.subst_owner, lc.scope.subst, lc.scope.subst_len));
+}
+
+# the extension a caller owes an integer parameter narrower than 64 bits where
+# its platform asks the caller for one: its declared signedness (#3927)
+fun param_int_ext(lc: *LowerContext, sem: type.TypeId) ir_type.IntExt {
+    val t_opt: opt[*type.Type] = type.get(?lc.s.types, type.strip_secret(?lc.s.types, substituted(lc, sem)));
+    if (sel t_opt.none) { ret ir_type.EXT_NONE; }
+    val d: type.PrimDesc = type.prim_desc(t_opt.some.kind);
+    if (d.class != type.PRIM_CLASS_INT || d.bits >= 64) { ret ir_type.EXT_NONE; }
+    if (d.signed)                                       { ret ir_type.EXT_SIGN; }
+    ret ir_type.EXT_ZERO;
+}
+
 pub fun pack_instance_sig(lc: *LowerContext, d: *adecl.Decl, fixed_count: u32,
-    types: *type.TypeId, type_len: u32, ret_ir: ir_type.IrTypeId) res[ir_type.IrTypeId, fail.Fail] {
+    types: *type.TypeId, type_len: u32, ret_ir: ir_type.IrTypeId) res[FnSig, fail.Fail] {
+    var out: FnSig;
+    out.ext = ir_type.EXT_LIST_NONE;
     val total: u32 = fixed_count + type_len;
     if (total == 0) {
-        ret ir_type.intern_fn(?lc.m.types, ret_ir, nil, 0, false);
+        val res_fn: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_fn(?lc.m.types, ret_ir, nil, 0, false);
+        if (sel res_fn.err) { ret res[FnSig, fail.Fail].err{res_fn.err}; }
+        out.sig = res_fn.ok;
+        ret res[FnSig, fail.Fail].ok{out};
     }
 
     val res_buf: res[*ir_type.IrTypeId, A.Error] = A.allocate[ir_type.IrTypeId](lc.s.alloc, total::usize);
-    if (sel res_buf.err) { ret res[ir_type.IrTypeId, fail.Fail].err{fail.refused(res_buf.err)}; }
+    if (sel res_buf.err) { ret res[FnSig, fail.Fail].err{fail.refused(res_buf.err)}; }
     val buf: *ir_type.IrTypeId = res_buf.ok;
+    fin { A.deallocate[ir_type.IrTypeId](lc.s.alloc, buf, total::usize); }
+    val res_ext: res[*ir_type.IntExt, A.Error] = A.allocate[ir_type.IntExt](lc.s.alloc, total::usize);
+    if (sel res_ext.err) { ret res[FnSig, fail.Fail].err{fail.refused(res_ext.err)}; }
+    val ext: *ir_type.IntExt = res_ext.ok;
+    fin { A.deallocate[ir_type.IntExt](lc.s.alloc, ext, total::usize); }
 
     var i: u32 = 0;
     for (i < total) {
@@ -1645,67 +1732,69 @@ pub fun pack_instance_sig(lc: *LowerContext, d: *adecl.Decl, fixed_count: u32,
             elem_sem = types[i - fixed_count];
         }
         val res_elem: res[ir_type.IrTypeId, fail.Fail] = lower_type(lc, elem_sem);
-        if (sel res_elem.err) {
-            A.deallocate[ir_type.IrTypeId](lc.s.alloc, buf, total::usize);
-            ret res_elem;
-        }
+        if (sel res_elem.err) { ret res[FnSig, fail.Fail].err{res_elem.err}; }
         buf[i] = res_elem.ok;
+        ext[i] = param_int_ext(lc, elem_sem);
         i      = i + 1;
     }
 
     val res_fn: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_fn(?lc.m.types, ret_ir, buf, total, false);
-    A.deallocate[ir_type.IrTypeId](lc.s.alloc, buf, total::usize);
-    ret res_fn;
+    if (sel res_fn.err) { ret res[FnSig, fail.Fail].err{res_fn.err}; }
+    out.sig = res_fn.ok;
+    val res_list: res[ir_type.ExtListId, fail.Fail] = ir_type.intern_ext_list(?lc.m.types, ext, total);
+    if (sel res_list.err) { ret res[FnSig, fail.Fail].err{res_list.err}; }
+    out.ext = res_list.ok;
+    ret res[FnSig, fail.Fail].ok{out};
 }
 
 pub fun instance_ref_sig(lc: *LowerContext, decl_id: id.DeclId, origin: session.ModuleId,
-    args: *type.TypeId, arg_len: u32) res[ir_type.IrTypeId, fail.Fail] {
+    args: *type.TypeId, arg_len: u32) res[FnSig, fail.Fail] {
     val acquired: res[ModuleScope, fail.Fail] = origin_scope(lc, origin);
-    if (sel acquired.err) { ret res[ir_type.IrTypeId, fail.Fail].err{acquired.err}; }
+    if (sel acquired.err) { ret res[FnSig, fail.Fail].err{acquired.err}; }
     var sc:    ModuleScope                       = acquired.ok;
     val who_r: res[type.GenericOwner, fail.Fail] = scx.generic_owner_of_decl(lc.s, sc.a, origin, decl_id);
-    if (sel who_r.err) { ret res[ir_type.IrTypeId, fail.Fail].err{who_r.err}; }
+    if (sel who_r.err) { ret res[FnSig, fail.Fail].err{who_r.err}; }
     sc.subst       = args;
     sc.subst_len   = arg_len;
     sc.subst_owner = who_r.ok;
 
     val mark_r: res[ScopeMark, fail.Fail] = scope_enter(lc, sc);
     if (sel mark_r.err) {
-        ret res[ir_type.IrTypeId, fail.Fail].err{mark_r.err};
+        ret res[FnSig, fail.Fail].err{mark_r.err};
     }
 
-    val res_sig: res[ir_type.IrTypeId, fail.Fail] = lower_type(lc, decl_type_of(lc, decl_id));
+    val res_sig: res[FnSig, fail.Fail] = lower_fn_sig(lc, decl_type_of(lc, decl_id));
 
     val leave: err[fail.Fail] = scope_leave(lc, mark_r.ok);
-    if (sel leave.err) { ret res[ir_type.IrTypeId, fail.Fail].err{leave.err}; }
+    if (sel leave.err) { ret res[FnSig, fail.Fail].err{leave.err}; }
     ret res_sig;
 }
 
 pub fun pack_instance_ref_sig(lc: *LowerContext, decl_id: id.DeclId, origin: session.ModuleId,
     args: *type.TypeId, arg_len: u32,
-    types: *type.TypeId, type_len: u32) res[ir_type.IrTypeId, fail.Fail] {
+    types: *type.TypeId, type_len: u32) res[FnSig, fail.Fail] {
     val acquired: res[ModuleScope, fail.Fail] = origin_scope(lc, origin);
-    if (sel acquired.err) { ret res[ir_type.IrTypeId, fail.Fail].err{acquired.err}; }
+    if (sel acquired.err) { ret res[FnSig, fail.Fail].err{acquired.err}; }
     var sc:    ModuleScope      = acquired.ok;
     val opt_d: opt[*adecl.Decl] = ast.get_decl(sc.a, decl_id);
-    if (sel opt_d.none) { ret res[ir_type.IrTypeId, fail.Fail].err{fail.message("lower: pack-instance-reference origin declaration not found")}; }
+    if (sel opt_d.none) { ret res[FnSig, fail.Fail].err{fail.message("lower: pack-instance-reference origin declaration not found")}; }
     val d: *adecl.Decl = opt_d.some;
-    if (d.kind != adecl.DECL_KIND_FUN) { ret res[ir_type.IrTypeId, fail.Fail].err{fail.message("lower: pack-instance-reference origin declaration is not a function")}; }
+    if (d.kind != adecl.DECL_KIND_FUN) { ret res[FnSig, fail.Fail].err{fail.message("lower: pack-instance-reference origin declaration is not a function")}; }
     val who_r: res[type.GenericOwner, fail.Fail] = scx.generic_owner_of_decl(lc.s, sc.a, origin, decl_id);
-    if (sel who_r.err) { ret res[ir_type.IrTypeId, fail.Fail].err{who_r.err}; }
+    if (sel who_r.err) { ret res[FnSig, fail.Fail].err{who_r.err}; }
     sc.subst       = args;
     sc.subst_len   = arg_len;
     sc.subst_owner = who_r.ok;
 
     val mark_r: res[ScopeMark, fail.Fail] = scope_enter(lc, sc);
     if (sel mark_r.err) {
-        ret res[ir_type.IrTypeId, fail.Fail].err{mark_r.err};
+        ret res[FnSig, fail.Fail].err{mark_r.err};
     }
 
-    var res_sig:    res[ir_type.IrTypeId, fail.Fail];
+    var res_sig:    res[FnSig, fail.Fail];
     val res_ret_ir: res[ir_type.IrTypeId, fail.Fail] = function_return_ir(lc, decl_id);
     if (sel res_ret_ir.err) {
-        res_sig = res[ir_type.IrTypeId, fail.Fail].err{res_ret_ir.err};
+        res_sig = res[FnSig, fail.Fail].err{res_ret_ir.err};
     }
     or (sel res_ret_ir.ok) {
         val fixed_count: u32 = d.data.fun_.params_len - 1;
@@ -1713,7 +1802,7 @@ pub fun pack_instance_ref_sig(lc: *LowerContext, decl_id: id.DeclId, origin: ses
     }
 
     val leave: err[fail.Fail] = scope_leave(lc, mark_r.ok);
-    if (sel leave.err) { ret res[ir_type.IrTypeId, fail.Fail].err{leave.err}; }
+    if (sel leave.err) { ret res[FnSig, fail.Fail].err{leave.err}; }
     ret res_sig;
 }
 
@@ -1803,7 +1892,7 @@ pub fun symbol_of(lc: *LowerContext, sid: resolve.SymbolId) opt[*resolve.Symbol]
     ret opt[*resolve.Symbol].some{?lc.scope.rr.symbols[sid]};
 }
 
-pub fun ensure_extern_function(lc: *LowerContext, name: intern.StrId, sig: ir_type.IrTypeId, import_flag: bool) res[u32, fail.Fail] {
+pub fun ensure_extern_function(lc: *LowerContext, name: intern.StrId, sig: FnSig, import_flag: bool) res[u32, fail.Fail] {
     val m:        *ir.Module = lc.m;
     val existing: opt[u32]   = ir.function_lookup(m, name);
     if (sel existing.some) {
@@ -1821,7 +1910,8 @@ pub fun ensure_extern_function(lc: *LowerContext, name: intern.StrId, sig: ir_ty
     }
 
     val idx: u32 = m.function_len;
-    m.functions[idx]           = ir.function_new(m.alloc, name, sig, ir.FN_FLAG_EXTERN);
+    m.functions[idx]           = ir.function_new(m.alloc, name, sig.sig, ir.FN_FLAG_EXTERN);
+    m.functions[idx].param_ext = sig.ext;
     m.functions[idx].is_import = import_flag;
     m.function_len             = m.function_len + 1;
     val res_reg: err[fail.Fail] = ir.function_register(m, name, idx);
@@ -1941,102 +2031,7 @@ fun grow_cap(cap: u32) u32 {
     ret cap * 2;
 }
 
-fun enqueue_distinct_instances(lc: *LowerContext, first: u32, count: u32) err[fail.Fail] {
-    var i: u32 = first;
-    for (i < first + count) {
-        val r: err[fail.Fail] = enqueue_instance(lc, 0::id.DeclId, 0::session.ModuleId, nil, 0, i::intern.StrId, i::intern.StrId);
-        if (sel r.err) { ret r; }
-        i = i + 1;
-    }
-    ret err[fail.Fail].ok{};
-}
-
-# an allocator that forwards to another and counts what passes through it, so a
-# test can assert on the work a population costs without touching a clock
-rec CountingAlloc {
-    inner: *A.Allocator;
-    calls: u64;
-    bytes: u64;
-}
-
-fun counting_allocate(ctx: ptr, size: usize, align: usize) opt[ptr] {
-    val c: *CountingAlloc = ctx::*CountingAlloc;
-    c.calls = c.calls + 1;
-    c.bytes = c.bytes + size::u64;
-    val r: res[ptr, A.Error] = A.allocate_raw(c.inner, size, align);
-    if (sel r.err) { ret opt[ptr].none{}; }
-    ret opt[ptr].some{r.ok};
-}
-
-fun counting_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) opt[ptr] {
-    val c: *CountingAlloc = ctx::*CountingAlloc;
-    c.calls = c.calls + 1;
-    c.bytes = c.bytes + new_size::u64;
-    val r: res[ptr, A.Error] = A.reallocate_raw(c.inner, p, old_size, new_size, align);
-    if (sel r.err) { ret opt[ptr].none{}; }
-    ret opt[ptr].some{r.ok};
-}
-
-fun counting_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64 {
-    val c: *CountingAlloc = ctx::*CountingAlloc;
-    val r: err[A.Error]   = A.deallocate_raw(c.inner, p, size, align);
-    if (sel r.err) { ret 1; }
-    ret 0;
-}
-
-fun counting_make(a: *A.Allocator, c: *CountingAlloc, inner: *A.Allocator) {
-    c.inner         = inner;
-    c.calls         = 0;
-    c.bytes         = 0;
-    a.ctx           = c::ptr;
-    a.fn_allocate   = counting_allocate;
-    a.fn_reallocate = counting_reallocate;
-    a.fn_deallocate = counting_deallocate;
-}
-
-# enqueues count distinct instances into a fresh context and reports the
-# allocator calls and bytes that cost, or none if the enqueue itself refused
-fun count_enqueue_work(count: u32, calls: *u64, bytes: *u64) bool {
-    var page_alloc: A.Allocator;
-    val r_1844:     err[A.Error] = page.make(?page_alloc);
-    if (sel r_1844.err) { ret false; }
-    var counter: CountingAlloc;
-    var alloc:   A.Allocator;
-    counting_make(?alloc, ?counter, ?page_alloc);
-    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
-    if (sel sr.err) { ret false; }
-    var s: session.Session = sr.ok;
-
-    var lc: LowerContext;
-    lc.status       = fail.accepted();
-    lc.s            = ?s;
-    lc.diags        = ?s.diags;
-    lc.scope        = scope_nil();
-    lc.inst_len     = 0;
-    lc.inst_cap     = 0;
-    lc.insts        = nil;
-    lc.inst_by_name = map.init[intern.StrId, u32](?alloc);
-
-    val before_calls: u64            = counter.calls;
-    val before_bytes: u64            = counter.bytes;
-    val ok:           err[fail.Fail] = enqueue_distinct_instances(?lc, 0, count);
-    @calls = counter.calls - before_calls;
-    @bytes = counter.bytes - before_bytes;
-    if (sel ok.err) { ret false; }
-
-    var i: u32 = 0;
-    for (i < lc.inst_len) {
-        if (lc.insts[i].args != nil && lc.insts[i].arg_len > 0) {
-            A.deallocate[type.TypeId](?alloc, lc.insts[i].args, lc.insts[i].arg_len::usize);
-        }
-        i = i + 1;
-    }
-    if (lc.insts != nil && lc.inst_cap > 0) { A.deallocate[Instance](?alloc, lc.insts, lc.inst_cap::usize); }
-    map.dnit[intern.StrId, u32](?lc.inst_by_name);
-    ret true;
-}
-
-test "mach.lang.me.lower.context.scope_leave:refuses_a_stale_or_out_of_order_mark" {
+test scope_leave__refuses_a_stale_or_out_of_order_mark {
     var alloc:  A.Allocator;
     val r_1891: err[A.Error] = page.make(?alloc);
     if (sel r_1891.err) { ret 1; }
@@ -2104,6 +2099,7 @@ test "mach.lang.me.lower.context.scope_leave:refuses_a_stale_or_out_of_order_mar
     ret code;
 }
 
+#[testing]
 fun fixture_definition(raw: ptr, origin: session.ModuleId, phase: scx.DefinitionPhase) res[scx.Definition, fail.Fail] {
     val current: *scx.Definition = raw::*scx.Definition;
     if (current == nil || current.origin != origin) {
@@ -2112,7 +2108,7 @@ fun fixture_definition(raw: ptr, origin: session.ModuleId, phase: scx.Definition
     ret res[scx.Definition, fail.Fail].ok{@current};
 }
 
-test "mach.lang.me.lower.context.module_scope:refuses_a_piece_that_belongs_to_another_module" {
+test module_scope__refuses_a_piece_that_belongs_to_another_module {
     var alloc:  A.Allocator;
     val r_1961: err[A.Error] = page.make(?alloc);
     if (sel r_1961.err) { ret 1; }
@@ -2186,7 +2182,7 @@ test "mach.lang.me.lower.context.module_scope:refuses_a_piece_that_belongs_to_an
     ret code;
 }
 
-test "mach.lang.me.lower.context.request:refuses_a_module_product_that_does_not_correspond" {
+test request__refuses_a_module_product_that_does_not_correspond {
     var alloc:  A.Allocator;
     val r_2024: err[A.Error] = page.make(?alloc);
     if (sel r_2024.err) { ret 1; }
@@ -2226,50 +2222,22 @@ test "mach.lang.me.lower.context.request:refuses_a_module_product_that_does_not_
 
     var code: i32 = 0;
 
-    val good: res[LowerRequest, fail.Fail] = request(?s, ?tgt, ?alloc, ?a1, fqn, mid, ?sm1, ?rr1, ?cc1, false, false, false, true, nil, ?deps);
+    val good: res[LowerRequest, fail.Fail] = request(?s, ?tgt, ?alloc, ?a1, fqn, mid, ?sm1, ?rr1, ?cc1, nil, false, false, true, nil, ?deps);
     if (sel good.err) { ret 1; }
     val req: LowerRequest = good.ok;
     if (req.module.a != ?a1 || req.module.own_module != mid) { code = 1; }
 
-    val r_2066: res[LowerRequest, fail.Fail] = request(?s, nil, ?alloc, ?a1, fqn, mid, ?sm1, ?rr1, ?cc1, false, false, false, true, nil, ?deps);
+    val r_2066: res[LowerRequest, fail.Fail] = request(?s, nil, ?alloc, ?a1, fqn, mid, ?sm1, ?rr1, ?cc1, nil, false, false, true, nil, ?deps);
     if (sel r_2066.ok) { code = 1; }
-    val r_2067: res[LowerRequest, fail.Fail] = request(?s, ?tgt, nil, ?a1, fqn, mid, ?sm1, ?rr1, ?cc1, false, false, false, true, nil, ?deps);
+    val r_2067: res[LowerRequest, fail.Fail] = request(?s, ?tgt, nil, ?a1, fqn, mid, ?sm1, ?rr1, ?cc1, nil, false, false, true, nil, ?deps);
     if (sel r_2067.ok) { code = 1; }
-    val r_2068: res[LowerRequest, fail.Fail] = request(?s, ?tgt, ?alloc, ?a2, fqn, mid, ?sm1, ?rr1, ?cc1, false, false, false, true, nil, ?deps);
+    val r_2068: res[LowerRequest, fail.Fail] = request(?s, ?tgt, ?alloc, ?a2, fqn, mid, ?sm1, ?rr1, ?cc1, nil, false, false, true, nil, ?deps);
     if (sel r_2068.ok) { code = 1; }
 
     ret code;
 }
 
-test "mach.lang.me.lower.context.enqueue_instance:cost_stays_near_linear_as_population_grows" {
-    # the instance vector and the name index both grow geometrically, so
-    # quadrupling the population adds at most two growth steps to each and the
-    # bytes it moves stay within the doubling envelope; a linear growth policy
-    # would add thousands of calls, a per-call copy would square the bytes
-    val small: u32 = 1500;
-    val large: u32 = small * 4;
-
-    var calls_small: u64 = 0;
-    var bytes_small: u64 = 0;
-    var calls_large: u64 = 0;
-    var bytes_large: u64 = 0;
-    if (!count_enqueue_work(small, ?calls_small, ?bytes_small)) { ret 1; }
-    if (!count_enqueue_work(large, ?calls_large, ?bytes_large)) { ret 1; }
-
-    var pa: A.Allocator;
-    page.make(?pa);
-    val msg: res[str, format.FormatError] = format.sprint(?pa,
-        "calls_small={} bytes_small={} calls_large={} bytes_large={}\n",
-        calls_small, bytes_small, calls_large, bytes_large);
-    if (sel msg.ok) { print.eprint(msg.ok); }
-
-    var bad: i32 = 0;
-    if (calls_large > calls_small + 16) { bad = 1; }
-    if (bytes_large > bytes_small * 8)  { bad = 1; }
-    ret bad;
-}
-
-test "mach.lang.me.lower.context.enqueue_pack_instance:refuses_past_the_instance_cap" {
+test enqueue_pack_instance__refuses_past_the_instance_cap {
     var alloc:  A.Allocator;
     val r_2093: err[A.Error] = page.make(?alloc);
     if (sel r_2093.err) { ret 1; }

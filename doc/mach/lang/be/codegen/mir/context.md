@@ -244,6 +244,13 @@ pub fun emit_mov(ctx: *LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, src: mi
 pub fun emit_mov_w(ctx: *LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, src: mir.MirOperand, w: u8) err[fail.Fail];
 ```
 
+## fun emit_promote
+
+```mach
+pub fun emit_promote(ctx: *LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, src: mir.MirOperand,
+dst_w: u8, src_w: u8, signed: bool) err[fail.Fail];
+```
+
 ## fun emit_declassify
 
 ```mach
@@ -368,12 +375,6 @@ pub fun set_slot_origin(ctx: *LowerCtx, value_id: u32, origin: u32);
 ```
 
 record the ir alloca behind the slot just added for `value_id`
-
-## fun add_spill_slot
-
-```mach
-pub fun add_spill_slot(ctx: *LowerCtx, value_id: u32, size: u64) err[fail.Fail];
-```
 
 ## fun alloc_result_storage
 

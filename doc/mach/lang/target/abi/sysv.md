@@ -24,12 +24,6 @@ pub val REG_RDX: i32 = 2
 pub val REG_RBX: i32 = 3
 ```
 
-## val REG_RSP
-
-```mach
-pub val REG_RSP: i32 = 4
-```
-
 ## val REG_RBP
 
 ```mach
@@ -58,18 +52,6 @@ pub val REG_R8:  i32 = 8
 
 ```mach
 pub val REG_R9:  i32 = 9
-```
-
-## val REG_R10
-
-```mach
-pub val REG_R10: i32 = 10
-```
-
-## val REG_R11
-
-```mach
-pub val REG_R11: i32 = 11
 ```
 
 ## val REG_R12

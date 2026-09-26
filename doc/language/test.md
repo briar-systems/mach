@@ -2,21 +2,38 @@
 
 A `test` declaration names a block of statements the test runner can
 execute on its own. Any module may declare them, and `mach test` collects
-every test in the selected artifact's closure into a single test binary.
+every test in the selected artifact's closure and links the selected ones into
+one small test binary.
 What earns a test, and where it sits, is set by the
 [test policy](#test-policy).
 
 ## Grammar
 
 ```mach fragment
-test "label" { ... }
+test <identifier> { ... }
 ```
 
-The label is required: a **string literal**, or an identifier, which
-labels the test exactly as the string literal of the same text does
-(`test leap_year { ... }` is `test "leap_year" { ... }`). The body is a
-block of statements. A test takes no parameters and is not callable from ordinary
-code; it exists only for the runner to invoke.
+The name is an identifier, following the ordinary identifier rules. A string
+in its place (`test "label" { ... }`) is a compile error located at the string
+that names the identifier form. The body is a block of statements. A test takes
+no parameters and is not callable from ordinary code; it exists only for the
+runner to invoke.
+
+Tests live in their own namespace in each module. A test's name is never in
+scope in code, so `test str_len { ... }` and `fun str_len` in one module do not
+conflict, and no code can name, call or reference a test. Two tests with the
+same name in one module are a compile error located at the second.
+
+A test's **qualified name** is its module path, `#`, and its name:
+`std.types.string#str_len__empty`. `#` appears in no identifier or module path,
+so a qualified name never collides with another symbol. It is the test's symbol
+(hidden, like every other symbol that is not exported), and it is the name
+`--list`, `--filter`, the readout and `--format json` show. A debugger takes it
+unquoted: `break std.types.string#str_len__empty` in gdb.
+
+Related tests group under a common subject as `subject__case`
+(`str_len__empty`, `str_len__multibyte`), and a regression test is named
+`regression__*`. Both are conventions the compiler does not check.
 
 `test` is a reserved keyword and appears at module (declaration) scope,
 the same level as `fun`, `rec`, and `val`. Visibility modifiers such as
@@ -43,14 +60,14 @@ fun info(msg: *u8) {
     if (msg == nil) { ret; }
 }
 
-test "date: is_leap_year" {
+test is_leap_year__centuries {
     if (!is_leap_year(2000)) { ret 1; }
     if (is_leap_year(1900))  { ret 1; }
     if (is_leap_year(2023))  { ret 1; }
     ret 0;
 }
 
-test "log: nil message does not crash" {
+test log__nil_message_does_not_crash {
     debug(nil);
     info(nil);
     ret 0;
@@ -68,8 +85,8 @@ artifact: the closure its entry reaches through `use` and `fwd`. A module no
 selected artifact reaches is not loaded under test either, so it is not checked and
 its tests do not run (see [Which tests run](#which-tests-run)). Each
 test then lowers to a zero-parameter, `i32`-returning function tagged as a test entry
-point so the runner can iterate it. The label is interned and becomes the lowered
-function's name. Ordinary builds omit test bodies from IR and object files.
+point so the runner can iterate it. Its qualified name is the lowered function's
+name. Ordinary builds omit test bodies from IR and object files.
 
 A helper or fixture that exists only for tests is marked
 [`#[testing]`](decorators.md#testing--test-only-declaration). It gets the same
@@ -113,20 +130,22 @@ the ordinal of the first failing check instead.
 
 Tests are not tied to a single file. Every `test` declaration in every
 module of the artifact under test that belongs to the current project is
-collected, and `mach test` builds one dispatcher executable in place of the
+collected, and `mach test` links one dispatcher executable in place of the
 artifact's normal entry and runs each test through it in its own process.
 
 By default collection is scoped to the current project's own modules: tests
 declared in dependency modules are excluded, so a library's own suite never
 runs (or fails) as part of your project's `mach test`. Pass `--include-deps`
 to collect dependency tests as well — useful when working on a dependency
-in-tree. `--filter` narrows the run by test name in either mode.
+in-tree. `--filter` narrows the run by qualified name in either mode.
 
 ## The `mach test` workflow
 
-`mach test <path>` is `mach build` with a different goal: it builds one test
-**dispatcher** executable covering every collected test, then runs each
-selected test as its own process (`<exe> <index>`), captures its output, times
+`mach test <path>` is `mach build` with a different goal: it builds the
+artifact's objects exactly as `mach build` does, adds a test object beside each
+module that declares tests, links one test **dispatcher** executable covering
+the selected tests, then runs each of them as its own process
+(`<exe> <index>`), captures its output, times
 it, and renders a per-module readout — collapsing all-passing modules to a
 single roll-up line and expanding any module with a failure to show the
 failing test's captured output and location. The full flag reference is
@@ -134,23 +153,23 @@ failing test's captured output and location. The full flag reference is
 
 ```
 --jobs <n>               run up to n test processes at once (default: host CPUs)
---filter <substr>        run only tests whose label contains the substring
+--filter <substr>        select only tests whose qualified name contains the substring
 --include-deps           also run tests declared in dependency modules
 --list                   list the collected tests and exit
 --format <human|json>    the live readout, or an NDJSON event stream
 --runner <cmd>           launch each test through a host-side command
---timeout_seconds <n>    terminate a test and its process group after n seconds
+--timeout <duration>     terminate a test and its process group after the duration
 ```
 
 A roll-up is `<module>  <ok> ok[  <fail> FAIL]  <duration>`. Each expanded
 failure shows `file:line`, the exit code (`(exit N)`), signal (`(signal N)`)
-or `(timed out after <n>s)`, the child's captured output indented beneath, and
+or `(timed out after <duration>)`, the child's captured output indented beneath, and
 the exact `rerun:` command; a passing test stays quiet. The run closes with a
 summary that re-lists every failure:
 
 ```
 failures:
-  fails on purpose  src/main.mach:11  (exit 3)
+  app.main#fails_on_purpose  src/main.mach:11  (exit 3)
 
 1 passed, 1 failed, 2 total  (1ms)
 ```
@@ -163,47 +182,77 @@ The exit code of `mach test`:
 - `2` — a build or internal error before the tests could run, or a test that
   failed for an infrastructure reason (the harness, not the test).
 
-`--list` enumerates the collected tests and exits without running them.
-`--filter <substr>` selects at run time; the built dispatcher is identical
-regardless of filter. `--emit` is rejected under `mach test`
+`--list` prints each selected test's qualified name and the test object that
+holds it, and exits without linking or running anything:
+
+```
+app.parser#rejects_trailing_comma ./out/linux-x86_64/debug/obj/app/parser.test.o
+```
+
+`--filter <substr>` selects before the dispatcher links, so the dispatcher
+holds only the selected tests and what they reach, and changing the filter
+relinks without recompiling. `--emit` is rejected under `mach test`
 (`--emit is not applicable to 'test'; test always builds its internal test
 dispatcher`).
 
 ### Timeouts
 
-`--timeout_seconds <n>` bounds each spawned test process independently, from
+`--timeout <duration>` bounds each spawned test process independently, from
 its own spawn, on its whole process group, so a process the test started dies
 with it. A test that exceeds the bound is the distinct outcome **timed out**:
-it renders as `(timed out after <n>s)`, is counted separately on the summary
-line, and is still a failing test for the exit code, so the suite exits `1`.
+it renders as `(timed out after <duration>)`, is counted separately on the
+summary line, and is still a failing test for the exit code, so the suite
+exits `1`.
 
 ```
 failures:
-  spins  src/main.mach:4  (timed out after 1s)
+  app.main#spins  src/main.mach:4  (timed out after 1s)
 
 0 passed, 1 failed (1 timed out), 1 total  (1.0s)
 ```
 
-`<n>` is a positive integer number of seconds with no default: omitting the
-flag leaves every test unbounded.
+`<duration>` is a positive integer followed by a unit: `ms`, `s`, `m` or `h`
+(`30ms`, `30s`, `5m`, `1h`). A bare number, a fraction, zero or any other
+unit is a usage error naming the accepted forms. There is no default: omitting
+the flag leaves every test unbounded.
 
 ### JSON output
 
 `--format json` replaces the readout with one JSON object per line on stdout
 (`run_start`, one `test` per result, `summary`; `case` under `--list`), with
-build diagnostics kept on stderr. A timed-out test reports `"kind":"timeout"`
-with its bound in `timeout_seconds`. The schema is versioned (`"schema":1`
-on every event) and its writer is `mach.cli.cmd.testing`.
+build diagnostics kept on stderr. A `test` or `case` event names its test by
+qualified name in `name`, beside its `module`, `file`, `line`, test `object`
+and dispatcher `index`. A timed-out test reports `"kind":"timeout"` with its
+bound in nanoseconds in `timeout_ns`. The schema is versioned (`"schema":2` on
+every event) and its writer is `mach.cli.cmd.testing`.
 
 ## The runner
 
-The compiler (`mach.lang.me.lower.testrunner`) lowers every collected test to
-a zero-parameter, `i32`-returning function under a compiler-private symbol
-that never collides with, reserves, or rewrites a user symbol, and synthesizes
-one dispatcher object whose entry selects a test by its index argument. That
-object links with the project's objects into a single executable, even for a
-library artifact; in a test build the project's own entry is neutralised so
-the dispatcher is the sole program entry.
+A test build compiles every module's object exactly as `mach build` does and
+shares it: after `mach build`, `mach test` recompiles no module object. A module
+that declares tests or `#[testing]` declarations also gets a **test object**,
+`obj/<project>/<module>.test.o`. The compiler (`mach.lang.me.lower.testrunner`)
+lowers each of its tests to a zero-parameter, `i32`-returning function under
+its qualified name, a symbol that never collides with, reserves, or rewrites a
+user symbol.
+
+The test object references every symbol the module's object defines, private
+ones included, so a test reads and writes the same globals and calls the same
+functions the module's own code does, and every symbol has exactly one
+definition. It defines only what the module's object lacks: the tests, the
+`#[testing]` declarations, a private function inlined everywhere or called
+only from tests, a private global only tests use, and generic instances only
+tests use. The module's object never changes for tests, and its cache key
+leaves the module's test declarations out, so editing a test recompiles only
+that module's test object and relinks. The test object's key is the module
+object's key and the module's whole source.
+
+Each run synthesizes one dispatcher object, `test/<artifact>/dispatch.o`,
+whose entry selects a test by its index argument, and links it with the test
+objects and the module objects into `test/<artifact>/<artifact>`, even for a
+library artifact. The link keeps only what the selected tests reach. The
+dispatcher is the program's `main`: an artifact's own `main` yields to it in
+the link, so its object is linked unchanged.
 
 The dispatcher's entry calls the selected test and exits with its result:
 as is when the result is in `0..255`, and `255` otherwise (see
@@ -212,8 +261,9 @@ as is when the result is in `0..255`, and `255` otherwise (see
 
 `mach test` then keeps up to `--jobs` children in flight, each spawned as
 `<exe> <index>`, captures each child's stdout and stderr to a per-test file
-under `log/` beside the dispatcher (a passing test's file is removed on the
-spot, a failing test's file stays), and reads its exit status. Results render
+under `log/` beside the dispatcher, `test/<artifact>/log/` unless `-o` moves
+the dispatcher (a passing test's file is removed on the spot, a failing test's
+file stays), and reads its exit status. Results render
 in collection order regardless of completion order.
 
 ## Which tests run
@@ -226,7 +276,7 @@ artifact's closure, the same module set `mach build` compiles for it, and runs
 the tests declared there. Each run tests one artifact, so `$bin.name` in a test
 block, and in every module the run compiles, is the artifact under test.
 
-An inline `test "..." { }` declaration in a module the artifact reaches runs
+An inline `test name { }` declaration in a module the artifact reaches runs
 with no further wiring. A module that exists only for tests, such as a suite
 that exercises several modules together, is reached by no artifact and so never
 runs on its own. Give such modules a **test artifact**: an ordinary library artifact

@@ -166,6 +166,15 @@ pub def RegArgAlignFn: fun(u32) u32
 the largest alignment the argument registers honor for the instruction set,
 0 when the calling convention's own rule stands
 
+## def RegArgExtendFn
+
+```mach
+pub def RegArgExtendFn: fun(u32) u32
+```
+
+the width in bits the caller widens an integer argument narrower than it to,
+by the argument's signedness, in a register, 0 when the callee does it
+
 ## def ReservedGpFn
 
 ```mach
@@ -364,16 +373,10 @@ pub fun natural_stack_args_for(vt: *OsVTable, arch_id: u32) bool;
 pub fun reg_arg_align_for(vt: *OsVTable, arch_id: u32) u32;
 ```
 
-## fun va_list_for
+## fun reg_arg_extend_for
 
 ```mach
-pub fun va_list_for(vt: *OsVTable, arch_id: u32) opt[VaList];
-```
-
-## fun fs_policy_for
-
-```mach
-pub fun fs_policy_for(vt: *OsVTable, arch_id: u32) opt[FsPolicy];
+pub fun reg_arg_extend_for(vt: *OsVTable, arch_id: u32) u32;
 ```
 
 ## fun va_list_checked_for

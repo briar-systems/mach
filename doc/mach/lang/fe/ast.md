@@ -188,20 +188,6 @@ a: the tree
 offset: byte offset into the tree's source text
 ret: the ExprId with the smallest span containing offset, or EXPR_NIL when none does
 
-## fun offset_to_stmt
-
-```mach
-pub fun offset_to_stmt(a: *Ast, offset: usize) id.StmtId;
-```
-
-the tightest statement enclosing a byte offset
-a linear scan of every statement; among equal spans the later one wins;
-an empty span never matches
-
-a: the tree
-offset: byte offset into the tree's source text
-ret: the StmtId with the smallest span containing offset, or STMT_NIL when none does
-
 ## fun offset_to_decl
 
 ```mach

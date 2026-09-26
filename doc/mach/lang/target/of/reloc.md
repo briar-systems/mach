@@ -73,18 +73,6 @@ pub def RelocTarget: of.RelocTarget
 pub fun target(vaddr: u64, section_vaddr: u64, section_index: u32) RelocTarget;
 ```
 
-## def RelocTraitsFn
-
-```mach
-pub def RelocTraitsFn: of.RelocTraitsFn
-```
-
-## def ApplyRelocFn
-
-```mach
-pub def ApplyRelocFn: of.ApplyRelocFn
-```
-
 ## fun add_signed_to_u64
 
 ```mach
@@ -124,13 +112,6 @@ pub fun apply_abs32(dst: *u8, patch_off: u32, sec_len: u32,
 sym_va: u64, addend: i64) res[bool, RelocError];
 ```
 
-## fun apply_abs16
-
-```mach
-pub fun apply_abs16(dst: *u8, patch_off: u32, sec_len: u32,
-sym_va: u64, addend: i64) res[bool, RelocError];
-```
-
 ## fun apply_pcrel32
 
 ```mach
@@ -143,12 +124,6 @@ sym_va: u64, addend: i64, patch_va: u64) res[bool, RelocError];
 ```mach
 pub fun apply_pcrel64(dst: *u8, patch_off: u32, sec_len: u32,
 sym_va: u64, addend: i64, patch_va: u64) res[bool, RelocError];
-```
-
-## def NormalizeImageFn
-
-```mach
-pub def NormalizeImageFn: of.NormalizeImageFn
 ```
 
 ## fun normalize_image
