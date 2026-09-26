@@ -1188,8 +1188,9 @@ after the module's path (`src/window.mach` in project `glfw` becomes
 objects by name, and because the link takes whichever file survived, the result is
 a binary that is subtly wrong rather than a build that fails.
 
-**The object tree is the object cache.** Under `--cache` a module whose object in
-`obj/` was built under the same key is reused as it is: the module is neither
+**The object tree is the object cache.** `mach build` and `mach test` read it by
+default: a module whose object in `obj/` was built under the same key is reused
+as it is: the module is neither
 lowered nor generated again, and when nothing the build still compiles imports
 it, it is not resolved or type-checked either. Each module has its own key: the
 compiler identity, the build configuration, the module's own source and embedded
@@ -1213,8 +1214,9 @@ and renamed into place, so an interrupted build leaves the previous object or th
 new one, never a torn file. The digests of the sources the keys read are
 remembered in `{project.out}/.cache/digests` under each file's path, size,
 modification time and identity, so an unchanged file is not hashed again for its
-key; a missing or damaged memo is rebuilt. `--no-cache` ignores the tree, and
-`mach clean` removes it with the rest of the output.
+key; a missing or damaged memo is rebuilt. `--no-cache` forces an uncached
+build: it reuses no object and writes each one without a key, and `mach clean`
+removes the tree with the rest of the output.
 
 A step output is therefore rejected in that subtree. A declared `out` inside it
 fails at manifest load, naming the step and the path, before any step runs. A step
