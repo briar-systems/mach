@@ -223,6 +223,10 @@ The standard library a case declares is the checkout's own `dep/std`, so a run
 tests the compiler against the library it was built with and a bisect over mach
 commits is sound. A `[step]` that compiles C runs `../../cc.sh`, which picks the
 host `cc` when it targets the leg and a cross-capable clang when it does not.
+The riscv64-linux leg compiles against a riscv64 sysroot and runs its dynamic
+images under qemu with that sysroot's loader. Both read `MACH_RISCV64_SYSROOT`,
+which defaults to `/usr/riscv64-linux-gnu`, where Ubuntu's
+`libc6-dev-riscv64-cross` installs.
 
 qemu is compute evidence, never ABI evidence: RELRO and page-size behaviour is
 proven only by a native leg.
