@@ -2,6 +2,7 @@ use mach.lang.alloc;
 use std.allocator.page;
 use T: std.allocator.testing;
 use std.collections.map;
+use std.collections.vector;
 use std.format;
 use std.memory;
 use std.text.string.str_free;
@@ -192,6 +193,13 @@ rec Scope {
     cap:     u32;
 }
 
+# a module-scope `use` of a symbol, which is unused until something names it
+rec SymbolImport {
+    name: intern.StrId;
+    span: token.Span;
+    used: bool;
+}
+
 val INITIAL_SCOPE_ENTRY_CAP: u32 = 8;
 val INITIAL_SCOPES_CAP:      u32 = 8;
 val INITIAL_SYMBOLS_CAP:     u32 = 32;
@@ -236,6 +244,10 @@ rec ResolveContext {
 
     # names bound from a refused module: a use of one is that refusal again, not a new error
     refused_names: map.Map[intern.StrId, SymbolId];
+
+    symbol_imports: vector.Vector[SymbolImport];
+    # `fwd` paths, which use the imports they name once every import is collected
+    fwd_paths: vector.Vector[token.Span];
 
     expr_choices:       *interpretation.Choice;
     expr_choices_count: usize;
@@ -409,6 +421,12 @@ pub fun resolve(
         ret res[ResolveResult, fail.Fail].err{b1.err};
     }
 
+    val wu: err[fail.Fail] = warn_unused_imports(?rc);
+    if (sel wu.err) {
+        dnit_context(?rc);
+        ret res[ResolveResult, fail.Fail].err{wu.err};
+    }
+
     ret build_result(?rc);
 }
 
@@ -502,6 +520,8 @@ fun init_context(
     rc.vec_cache      = map.init[intern.StrId, SymbolId](s.alloc);
     rc.module_index   = map.init[intern.StrId, SymbolId](s.alloc);
     rc.refused_names  = map.init[intern.StrId, SymbolId](s.alloc);
+    rc.symbol_imports = vector.init[SymbolImport](s.alloc);
+    rc.fwd_paths      = vector.init[token.Span](s.alloc);
 
     rc.expr_choices       = nil;
     rc.expr_choices_count = 0;
@@ -598,6 +618,8 @@ fun dnit_context(rc: *ResolveContext) {
     map.dnit[intern.StrId, SymbolId](?rc.vec_cache);
     map.dnit[intern.StrId, SymbolId](?rc.module_index);
     map.dnit[intern.StrId, SymbolId](?rc.refused_names);
+    vector.dnit[SymbolImport](?rc.symbol_imports);
+    vector.dnit[token.Span](?rc.fwd_paths);
 }
 
 fun open_scope(rc: *ResolveContext, parent: ScopeId) res[ScopeId, fail.Fail] {
@@ -676,7 +698,10 @@ fun scope_lookup_chain(rc: *ResolveContext, scope: ScopeId, name: intern.StrId) 
     var cur: ScopeId = scope;
     for (cur != SCOPE_NIL) {
         val found: SymbolId = scope_lookup_local(rc, cur, name);
-        if (found != SYMBOL_NIL) { ret found; }
+        if (found != SYMBOL_NIL) {
+            if (cur == rc.module_scope) { mark_import_used(rc, name); }
+            ret found;
+        }
         cur = rc.scopes[cur].parent;
     }
     ret SYMBOL_NIL;
@@ -1463,6 +1488,13 @@ fun bind_imported_symbol(rc: *ResolveContext, decl_id: id.DeclId, bind_span: tok
     if (rc.decl_symbol != nil) {
         rc.decl_symbol[decl_id] = sid;
     }
+    # a symbol that names a module is a module import, which is never unused
+    if (ps.kind == SYM_USE) { ret err[fail.Fail].ok{}; }
+    val pushed: res[usize, A.Error] = vector.push[SymbolImport](?rc.symbol_imports, SymbolImport{name: name_id, span: bind_span, used: false});
+    if (sel pushed.err) {
+        fail.internal(?rc.status, alloc.text(pushed.err));
+        ret err[fail.Fail].err{fail.refused(pushed.err)};
+    }
     ret err[fail.Fail].ok{};
 }
 
@@ -1701,6 +1733,11 @@ fun collect_fwd(rc: *ResolveContext, decl_id: id.DeclId, df: *decl.DeclFwd, flag
     if (df.path.len == 0) {
         ret err[fail.Fail].ok{};
     }
+    val pushed: res[usize, A.Error] = vector.push[token.Span](?rc.fwd_paths, df.path);
+    if (sel pushed.err) {
+        fail.internal(?rc.status, alloc.text(pushed.err));
+        ret err[fail.Fail].err{fail.refused(pushed.err)};
+    }
 
     val r_full: res[intern.StrId, A.Error] = np.intern_path(?rc.s.interner, rc.source, df.path);
     if (sel r_full.err) {
@@ -1914,18 +1951,148 @@ fun bind_comptime_if(rc: *ResolveContext, branches_start: u32, branches_len: u32
         }
         val outcome: comptime.GateOutcome = take_r.ok;
         if (outcome == comptime.GATE_AWAITING_PHASE && !at_decl_scope) {
+            mark_arm_names(rc, branches_start, bi, ARM_NONE, false);
             ret bind_deferred_arms(rc, branches_start + bi, branches_len - bi);
         }
         if (outcome == comptime.GATE_AWAITING_PHASE || outcome == comptime.GATE_REJECTED || outcome == comptime.GATE_FAILED) {
+            mark_arm_names(rc, branches_start, branches_len, ARM_NONE, at_decl_scope);
             ret err[fail.Fail].ok{};
         }
         if (outcome == comptime.GATE_ACTIVE) {
+            mark_arm_names(rc, branches_start, branches_len, bi, at_decl_scope);
             if (at_decl_scope) {
                 ret bind_decl_list(rc, br.body_start, br.body_len);
             }
             ret bind_stmt_list(rc, br.body_start, br.body_len);
         }
         bi = bi + 1;
+    }
+    mark_arm_names(rc, branches_start, branches_len, ARM_NONE, at_decl_scope);
+    ret err[fail.Fail].ok{};
+}
+
+val ARM_NONE: u32 = 0xFFFFFFFF;
+
+# an arm resolution does not bind still references the names it spells, so a symbol import
+# only such an arm uses is not unused. every arm but `bound` is scanned by name.
+fun mark_arm_names(rc: *ResolveContext, start: u32, len: u32, bound: u32, at_decl_scope: bool) {
+    if (rc.symbol_imports.len == 0) { ret; }
+    var i: u32 = 0;
+    for (i < len) {
+        if (i == bound) {
+            i = i + 1;
+            cnt;
+        }
+        val arm: *decl.ComptimeBranch = ?rc.a.comptime_branches[start + i];
+        if (arm.cond != id.EXPR_NIL) {
+            val e_opt: opt[*expr.Expr] = ast.get_expr(rc.a, arm.cond);
+            if (sel e_opt.some) { mark_names_in(rc, e_opt.some.span); }
+        }
+        var k: u32 = 0;
+        for (k < arm.body_len) {
+            if (at_decl_scope) {
+                val d_opt: opt[*decl.Decl] = ast.get_decl(rc.a, rc.a.decl_ids[arm.body_start + k]);
+                if (sel d_opt.some) { mark_names_in(rc, d_opt.some.span); }
+            }
+            or {
+                val s_opt: opt[*stmt.Stmt] = ast.get_stmt(rc.a, rc.a.stmt_ids[arm.body_start + k]);
+                if (sel s_opt.some) { mark_names_in(rc, s_opt.some.span); }
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# an asm body names what it uses in `{name}` substitutions, which lowering binds
+fun mark_asm_names(rc: *ResolveContext, body: token.Span) {
+    if (rc.symbol_imports.len == 0) { ret; }
+    val end: usize = body.offset + body.len;
+    var i:   usize = body.offset;
+    for (i < end) {
+        if (rc.source[i] != '{'::char) {
+            i = i + 1;
+            cnt;
+        }
+        var j: usize = i + 1;
+        for (j < end && rc.source[j] != '}'::char) { j = j + 1; }
+        mark_names_in(rc, token.Span{offset: i + 1, len: j - i - 1});
+        i = j + 1;
+    }
+}
+
+fun name_byte(c: char) bool {
+    ret (c >= 'a'::char && c <= 'z'::char) || (c >= 'A'::char && c <= 'Z'::char) || (c >= '0'::char && c <= '9'::char) || c == '_'::char;
+}
+
+# every identifier spelled in the span uses the symbol import of that name
+fun mark_names_in(rc: *ResolveContext, span: token.Span) {
+    val end: usize = span.offset + span.len;
+    var i:   usize = span.offset;
+    for (i < end) {
+        if (!name_byte(rc.source[i])) {
+            i = i + 1;
+            cnt;
+        }
+        val start: usize = i;
+        for (i < end && name_byte(rc.source[i])) { i = i + 1; }
+        val lead: char = rc.source[start];
+        if (lead < '0'::char || lead > '9'::char) { mark_import_spelled(rc, start, i - start); }
+    }
+}
+
+fun mark_import_spelled(rc: *ResolveContext, offset: usize, len: usize) {
+    var i: usize = 0;
+    for (i < rc.symbol_imports.len) {
+        val b: *SymbolImport = ?rc.symbol_imports.data[i];
+        if (!b.used && b.span.len == len && region_equal(rc.source, b.span.offset, offset, len)) { b.used = true; }
+        i = i + 1;
+    }
+}
+
+fun region_equal(text: str, x: usize, y: usize, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        if (text[x + i] != text[y + i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun mark_import_used(rc: *ResolveContext, name: intern.StrId) {
+    var i: usize = 0;
+    for (i < rc.symbol_imports.len) {
+        val b: *SymbolImport = ?rc.symbol_imports.data[i];
+        if (b.name == name) { b.used = true; }
+        i = i + 1;
+    }
+}
+
+fun warn_unused(rc: *ResolveContext, b: *SymbolImport) err[fail.Fail] {
+    val name: opt[str] = intern.lookup(?rc.s.interner, b.name);
+    if (!sel name.some) { ret err[fail.Fail].err{fail.message("imported name is not interned")}; }
+    val message: res[str, format.FormatError] = format.sprint(rc.s.alloc, "unused import `{}`", name.some);
+    if (sel message.err) { ret err[fail.Fail].err{fail.format_refused(message.err)}; }
+    fin { str_free(rc.s.alloc, message.ok); }
+    ret diagnostic.warning(rc.diags, rc.a.file_id, b.span, message.ok);
+}
+
+# a symbol import nothing in the module names adds nothing to the build. a module import is
+# never reported: it pulls its module into the build, which is an effect of its own (#4007).
+fun warn_unused_imports(rc: *ResolveContext) err[fail.Fail] {
+    var f: usize = 0;
+    for (f < rc.fwd_paths.len) {
+        mark_names_in(rc, rc.fwd_paths.data[f]);
+        f = f + 1;
+    }
+    var i: usize = 0;
+    for (i < rc.symbol_imports.len) {
+        val b: *SymbolImport = ?rc.symbol_imports.data[i];
+        if (!b.used) {
+            val w: err[fail.Fail] = warn_unused(rc, b);
+            if (sel w.err) { ret w; }
+        }
+        i = i + 1;
     }
     ret err[fail.Fail].ok{};
 }
@@ -2132,6 +2299,7 @@ fun bind_stmt(rc: *ResolveContext, sid: id.StmtId) err[fail.Fail] {
         ret bind_local_decl(rc, s.data.decl.decl);
     }
     if (s.kind == stmt.STMT_KIND_ASM) {
+        mark_asm_names(rc, s.data.asm_.body);
         ret err[fail.Fail].ok{};
     }
     if (s.kind == stmt.STMT_KIND_COMPTIME_IF) {
