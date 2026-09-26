@@ -60,7 +60,7 @@ unresolved COFF weak external to its fallback
 
 ```mach
 pub fun build_reloc_refs(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
-codegen_count: u32, sec_base: *u32,
+sec_base: *u32,
 winners: *map.Map[intern.StrId, AtomWinner],
 arch: *isa.IsaVTable, out_total: *u32) res[*AtomRelocRef, fail.Fail];
 ```
@@ -72,7 +72,7 @@ sorted by the flattened section it lands in
 
 ```mach
 pub fun collect_dead_atoms(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
-codegen_count: u32, sec_base: *u32, sec_total: u32,
+sec_base: *u32, sec_total: u32,
 winners: *map.Map[intern.StrId, AtomWinner],
 refs: *AtomRelocRef, ref_total: u32, arch: *isa.IsaVTable,
 roots: *LinkRoots, dead_count: *u32) res[*DeadRange, fail.Fail];

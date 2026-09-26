@@ -35,7 +35,7 @@ pub rec LocalGotPlan;
 
 ```mach
 pub fun patch_relocations(s: *session.Session, out_img: *of.ObjectImage,
-modules: *of.ObjectImage, module_count: u32, codegen_count: u32,
+modules: *of.ObjectImage, module_count: u32,
 placements: *Placement, sec_base: *u32, merged_to_out: *u32,
 sym_locs: *map.Map[intern.StrId, SymbolLoc],
 dyn: *DynState, local_got: *LocalGotPlan,
