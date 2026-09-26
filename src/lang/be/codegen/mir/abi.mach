@@ -657,10 +657,12 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     val sig_it:    opt[*type.IrType] = type.get(ctx.types, sig);
     var sig_is_fn: bool              = false;
     var sig_is_va: bool              = false;
+    var sig_fn:    *type.IrTypeFn    = nil;
     if (sel sig_it.some) {
         val sig_t: *type.IrType = sig_it.some;
         sig_is_fn = sig_t.kind == type.IRT_FN;
         sig_is_va = sig_is_fn && sig_t.data.fn.variadic;
+        if (sig_is_fn) { sig_fn = ?sig_t.data.fn; }
     }
     val variadic_call: bool = !sig_is_fn || sig_is_va || ((inst.operand_count - 1) > layout.param_count);
 
@@ -737,9 +739,11 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         val aag:  bool        = context.value_is_aggregate(ctx, av.ty);
         var slot: abi.ParamSlot;
         var soff: i64         = 0;
+        var ext:  type.IntExt = type.EXT_NONE;
         if (pidx < layout.param_count) {
             slot = layout.params[pidx];
             soff = slot.offset;
+            if (sig_fn != nil) { ext = type.fn_param_ext(sig_fn, pidx); }
         }
         or {
             val aal:  u64  = type.byte_align_for_machine(ctx.types, av.ty, ctx.layout)::u64;
@@ -775,7 +779,7 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         # the carriers, the caller's copy and every temporary between them are secret when any byte of the object is
         ctx.cur_writes_secret = av.secret;
         val er: err[fail.Fail] = emit_arg_slot(ctx, mb, registers, slot, argop, soff, aag, av.ty,
-            natural_stack_slot(ctx.tgt, pidx >= layout.param_count));
+            natural_stack_slot(ctx.tgt, pidx >= layout.param_count), ext);
         ctx.cur_writes_secret = false;
         if (sel er.err) {
             sig_layout_free(ctx, ?layout);
@@ -1087,7 +1091,7 @@ fun materialize_pieces(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.Para
 }
 
 fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, registers: *mir.MirBlock, slot: abi.ParamSlot, argop: mir.MirOperand,
-    stack_off: i64, is_aggr: bool, ty: type.IrTypeId, natural: bool) err[fail.Fail] {
+    stack_off: i64, is_aggr: bool, ty: type.IrTypeId, natural: bool, ext: type.IntExt) err[fail.Fail] {
     val size: u64 = type.byte_size_for_machine(ctx.types, ty, ctx.layout)::u64;
 
     val scalar_byref: bool = int_by_reference(ctx, ty) &&
@@ -1168,7 +1172,32 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, registers: *mir.Mir
         ret emit_slot_lanes(ctx, mb, registers, slot, argop, ty,
             mir.preg_id(ctx.tgt.model.stack_ptr_reg), stack_off, true);
     }
-    ret emit_call_reg(ctx, mb, registers, mir.op_preg(slot.reg), argop, scalar_reg_move_width(ctx.tgt.model.gpr_width, size));
+    var value: mir.MirOperand = argop;
+    if (caller_widens(ctx.tgt, ext, size)) {
+        val wr: res[mir.MirOperand, fail.Fail] = widen_arg(ctx, mb, argop, size, ext);
+        if (sel wr.err) { ret err[fail.Fail].err{wr.err}; }
+        value = wr.ok;
+    }
+    ret emit_call_reg(ctx, mb, registers, mir.op_preg(slot.reg), value, scalar_reg_move_width(ctx.tgt.model.gpr_width, size));
+}
+
+# the platform widens an integer argument narrower than reg_arg_extend in its
+# register by the parameter's signedness, where the convention leaves the
+# upper bits to the callee (darwin aarch64, #3927)
+fun caller_widens(tgt: *target.Target, ext: type.IntExt, size: u64) bool {
+    ret ext != type.EXT_NONE && size * 8 < tgt.reg_arg_extend::u64;
+}
+
+fun widen_arg(ctx: *context.LowerCtx, mb: *mir.MirBlock, argop: mir.MirOperand, size: u64,
+    ext: type.IntExt) res[mir.MirOperand, fail.Fail] {
+    val vr: res[mir.VRegId, fail.Fail] = context.new_vreg(ctx, mir.REG_CLASS_GP);
+    if (sel vr.err) { ret res[mir.MirOperand, fail.Fail].err{vr.err}; }
+    val v: mir.VRegId = vr.ok;
+    ctx.f.vregs[v.n].secret = ctx.cur_writes_secret;
+    val pr: err[fail.Fail] = context.emit_promote(ctx, mb, mir.op_vreg(v), argop,
+        (ctx.tgt.reg_arg_extend / 8)::u8, size::u8, ext == type.EXT_SIGN);
+    if (sel pr.err) { ret res[mir.MirOperand, fail.Fail].err{pr.err}; }
+    ret res[mir.MirOperand, fail.Fail].ok{mir.op_vreg(v)};
 }
 
 # a scalar passed by reference gets a caller-owned copy at its own alignment;
@@ -2188,6 +2217,20 @@ test "mach.lang.be.codegen.mir.abi:natural_stack_args_pack_a_narrow_argument" {
         n    = n + 1;
     }
     if (off != 12 || boff != 24) { ret 1; }
+    ret 0;
+}
+
+# darwin aarch64 declares 32: an 8- or 16-bit integer with a declared
+# signedness is widened, a 32-bit one and a signless one are not (#3927)
+test "mach.lang.be.codegen.mir.abi.caller_widens:only_narrow_signed_or_unsigned_where_declared" {
+    var tgt: target.Target;
+    tgt.reg_arg_extend = 32;
+    if (!caller_widens(?tgt, type.EXT_ZERO, 1)) { ret 1; }
+    if (!caller_widens(?tgt, type.EXT_SIGN, 2)) { ret 2; }
+    if (caller_widens(?tgt, type.EXT_SIGN, 4))  { ret 3; }
+    if (caller_widens(?tgt, type.EXT_NONE, 1))  { ret 4; }
+    tgt.reg_arg_extend = 0;
+    if (caller_widens(?tgt, type.EXT_ZERO, 1)) { ret 5; }
     ret 0;
 }
 
@@ -3408,7 +3451,7 @@ test "mach.lang.be.codegen.mir.abi:rv32_f64_in_a_register_pair_leaves_through_a_
     fin { mir.dnit_block(?alloc, ?mb); }
     fin { mir.dnit_block(?alloc, ?regs_block); }
 
-    val from_reg: err[fail.Fail] = emit_arg_slot(?ctx, ?mb, ?regs_block, slot, mir.op_vreg(fv.ok), 0, false, dr.ok, false);
+    val from_reg: err[fail.Fail] = emit_arg_slot(?ctx, ?mb, ?regs_block, slot, mir.op_vreg(fv.ok), 0, false, dr.ok, false, type.EXT_NONE);
     if (sel from_reg.err) { ret 2; }
     # preparation: the float store to the slot, then the slot loaded as one wide general value
     if (mb.instr_count != 2) { ret 3; }
@@ -3432,7 +3475,7 @@ test "mach.lang.be.codegen.mir.abi:rv32_f64_in_a_register_pair_leaves_through_a_
 
     mb.instr_count         = 0;
     regs_block.instr_count = 0;
-    val from_imm: err[fail.Fail] = emit_arg_slot(?ctx, ?mb, ?regs_block, slot, mir.op_imm(0x3FF0000000000000), 0, false, dr.ok, false);
+    val from_imm: err[fail.Fail] = emit_arg_slot(?ctx, ?mb, ?regs_block, slot, mir.op_imm(0x3FF0000000000000), 0, false, dr.ok, false, type.EXT_NONE);
     if (sel from_imm.err)                                   { ret 8; }
     if (mb.instr_count != 0 || regs_block.instr_count != 2) { ret 9; }
     k = 0;

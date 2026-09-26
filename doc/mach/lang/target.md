@@ -104,11 +104,11 @@ pub fun resolve(reg: *TargetRegistry, req: *TargetRequest) res[resolved.Target, 
 ## val TARGET_FINGERPRINT_VERSION
 
 ```mach
-pub val TARGET_FINGERPRINT_VERSION: u8 = 5
+pub val TARGET_FINGERPRINT_VERSION: u8 = 6
 ```
 
-version 5: the image domain carries the register argument alignment the os
-declares (#3922)
+version 6: the image domain carries the register argument widening the os
+declares (#3927)
 
 ## fun fingerprint
 

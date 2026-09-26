@@ -114,10 +114,47 @@ pub rec IrTypeStruct;
 pub rec IrTypeTag;
 ```
 
+## def IntExt
+
+```mach
+pub def IntExt: u8
+```
+
+how a caller widens an integer argument narrower than 64 bits where its
+platform asks the caller to: the declared signedness the signless integer
+type does not carry (#3927)
+
+## val EXT_NONE
+
+```mach
+pub val EXT_NONE: IntExt = 0
+```
+
+## val EXT_ZERO
+
+```mach
+pub val EXT_ZERO: IntExt = 1
+```
+
+## val EXT_SIGN
+
+```mach
+pub val EXT_SIGN: IntExt = 2
+```
+
 ## rec IrTypeFn
 
 ```mach
 pub rec IrTypeFn;
+```
+
+param_ext holds one IntExt per parameter, or is nil when every one is
+EXT_NONE, so equal signatures have one form
+
+## fun fn_param_ext
+
+```mach
+pub fun fn_param_ext(f: *IrTypeFn, index: u32) IntExt;
 ```
 
 ## rec IrType
@@ -337,6 +374,15 @@ pub fun intern_union(t: *IrTypeTable, fields: *IrTypeId, field_count: u32, align
 ```mach
 pub fun intern_fn(t: *IrTypeTable, ret_type: IrTypeId, params: *IrTypeId, param_count: u32, variadic: bool) res[IrTypeId, fail.Fail];
 ```
+
+## fun intern_fn_ext
+
+```mach
+pub fun intern_fn_ext(t: *IrTypeTable, ret_type: IrTypeId, params: *IrTypeId, param_ext: *IntExt,
+param_count: u32, variadic: bool) res[IrTypeId, fail.Fail];
+```
+
+param_ext is nil or one IntExt per parameter
 
 ## fun intern_tag
 
