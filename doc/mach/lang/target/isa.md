@@ -174,6 +174,14 @@ pub val SYM_MOD_GOT_HI:   SymModifier = 3
 pub val SYM_MOD_GOT_LO:   SymModifier = 4
 ```
 
+## val SYM_MOD_GOT
+
+```mach
+pub val SYM_MOD_GOT: SymModifier = 5
+```
+
+a whole pc-relative reference to the symbol's GOT slot (x86-64 GOTPCREL)
+
 ## rec Operand
 
 ```mach
