@@ -10,16 +10,28 @@ without `pub` are file-private.
 
 ```mach error no symbol `helper` exported by `example.lib`
 # file: src/lib.mach
-pub fun add(a: i64, b: i64) i64 { ret a + b; }
-fun helper() i64 { ret 1; }     # private: only callable inside this file
+pub fun add(a: i64, b: i64) i64 {
+    ret a + b;
+}
+
+# private: only callable inside this file
+fun helper() i64 {
+    ret 1;
+}
+
 pub rec Point { x: i64; y: i64; }
 pub val MAX: i64 = 100;
 
 # file: src/main.mach
 use example.lib;
 
-fun sum() i64 { ret lib.add(lib.MAX, 1); }     # fine: pub
-fun peek() i64 { ret lib.helper(); }           # error: helper is not exported
+fun sum() i64 {
+    ret lib.add(lib.MAX, 1); # fine: pub
+}
+
+fun peek() i64 {
+    ret lib.helper(); # error: helper is not exported
+}
 ```
 
 Applies to: `fun`, `rec`, `uni`, `def`, `val`, `var`, `ext fun`, `ext val`,

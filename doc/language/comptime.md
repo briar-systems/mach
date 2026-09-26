@@ -88,8 +88,8 @@ exactly as it does at runtime:
 val N: i64 = 9;
 
 fun f(k: i64) i64 {
-    val N: i64 = k;      # shadows the module constant
-    var xs: [N]i64;      # error: array length is not a comptime constant
+    val N:  i64 = k; # shadows the module constant
+    var xs: [N]i64; # error: array length is not a comptime constant
     ret xs[0];
 }
 ```
@@ -105,15 +105,15 @@ A binding marked `$` â€” a comptime value parameter, an `$each` loop variable â€
 same way. Inside the `$each` below the name `N` is the element, not the 9:
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
 val N:  i64    = 9;
 val ES: [2]i64 = [2]i64{1, 2};
 
 fun g() i64 {
     var s: i64 = 0;
-    $each N in ES { s = s + N; }   # 3, not 18
+    $each N in ES { s = s + N; } # 3, not 18
     ret s;
 }
 

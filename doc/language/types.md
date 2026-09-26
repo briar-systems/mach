@@ -81,7 +81,7 @@ A vector spelling is recognized only in **type position**, so a *value* may stil
 be named `f32x4` without colliding with the type:
 
 ```mach
-val f32x4: i64 = 7;             # fine: values are a different position
+val f32x4: i64 = 7; # fine: values are a different position
 ```
 
 A **type** may not. `rec`, `uni`, `tag`, and `def` reject a name spelled as a vector
@@ -89,8 +89,8 @@ form, because a type declared with a vector's name would be silently unreachable
 every use in type position resolves to the vector instead:
 
 ```mach error is spelled as a vector type
-rec f32x3 { x: f32; }           # error: `f32x3` is spelled as a vector type
-tag f32x4: u8 { empty; }        # error: `f32x4` is spelled as a vector type
+rec f32x3     { x: f32; } # error: `f32x3` is spelled as a vector type
+tag f32x4: u8 { empty; } # error: `f32x4` is spelled as a vector type
 ```
 
 This holds for any well-formed spelling, so the name cannot be claimed by a type
@@ -165,11 +165,12 @@ val w: i32x4 = i32x4{1, 2, 3, 4};
 An uninitialized vector local default-initializes to all-zero lanes:
 
 ```mach
-var z: i32x4;                   # every lane is 0
+var z: i32x4; # every lane is 0
 ```
 
-A literal is for a constant or for lanes assembled from unrelated scalars. **A
-window onto memory is a range converted to a vector.** `p[i, 4]` is the four
+A literal is for a constant or for lanes assembled from unrelated scalars, and it
+is built lane by lane whatever its lanes read. Loads, stores and halves are ranges.
+**A window onto memory is a range converted to a vector.** `p[i, 4]` is the four
 elements at `p[i]` as a `[4]f32` value, and `::` between `[N]T` and `TxN` moves
 those elements into the lanes and back. The store is the same range as the
 assignment target:
@@ -192,13 +193,6 @@ bytes at `A[i]` as an `f32x4` and stays legal. It lowers to the same load. It
 reads bytes, so the pointer's element type and the vector's lane type must agree
 in size and meaning: `(?A[i]):~*f32x4` over a `*f32` is the four floats at `i`,
 over a `*i32` it is their bits.
-
-A literal whose lanes are the consecutive elements of one pointer at stride one,
-`f32x4{p[i], p[i + 1], p[i + 2], p[i + 3]}`, is recognized as the same load and
-lowers to it. Any other literal of loads (a permuted order, a stride, a second
-pointer, a lane that is not a load) is assembled lane by lane through a stack slot.
-Storing a vector's lanes one at a time (`p[at] = v[0]; p[at + 1] = v[1]; ...`) is that
-many scalar stores. The one-instruction store is the range store shown above.
 
 **Half a vector is a range of its lanes.** `v[start, count]` on a vector is the
 vector of those `count` lanes, so `v[4, 4]` on an `i16x8` is an `i16x4`. Widening
@@ -355,7 +349,7 @@ so an access through `*T` is volatile exactly when `T`'s storage is.
 
 ```mach
 val a: [4]i64    = [4]i64{1, 2, 3, 4};
-val g: [2][2]i64 = [2][2]i64{ [2]i64{1, 2}, [2]i64{3, 4} };
+val g: [2][2]i64 = [2][2]i64{[2]i64{1, 2}, [2]i64{3, 4}};
 ```
 
 **Constant indices are bounds-checked at compile time.** `N` is part of the
@@ -364,9 +358,9 @@ type, so an index the compiler can fold must land in `[0, N)`:
 ```mach error index 4 is out of bounds for `[4]i32` of length 4
 fun read() i32 {
     var xs: [4]i32;
-    val a: i32 = xs[3];             # ok
-    val b: i32 = xs[4];             # error: index 4 is out of bounds for `[4]i32` of length 4
-    val c: i32 = xs[-1];            # error: index -1 is out of bounds ...
+    val a:  i32 = xs[3]; # ok
+    val b:  i32 = xs[4]; # error: index 4 is out of bounds for `[4]i32` of length 4
+    val c:  i32 = xs[-1]; # error: index -1 is out of bounds ...
     ret a + b + c;
 }
 ```
@@ -390,8 +384,8 @@ and may not pass it.
 ```mach error range [3, 2] is out of bounds for `[4]i32` of length 4
 fun window() i32 {
     var xs: [4]i32;
-    val a: [2]i32 = xs[2, 2];       # ok: elements 2 and 3
-    val b: [2]i32 = xs[3, 2];       # error: range [3, 2] is out of bounds for `[4]i32` of length 4
+    val a:  [2]i32 = xs[2, 2]; # ok: elements 2 and 3
+    val b:  [2]i32 = xs[3, 2]; # error: range [3, 2] is out of bounds for `[4]i32` of length 4
     ret a[0] + b[0];
 }
 ```
@@ -407,10 +401,12 @@ stored value's type is exactly `[count]T`. A range read is a value, not a view:
 `fun(T1, T2) R` — first-class function-pointer type.
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
-fun add(a: i64, b: i64) i64 { ret a + b; }
+fun add(a: i64, b: i64) i64 {
+    ret a + b;
+}
 
 def BinOp: fun(i64, i64) i64;
 val op: BinOp = add;

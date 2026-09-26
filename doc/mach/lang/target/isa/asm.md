@@ -514,6 +514,15 @@ pub rec LabelDef;
 pub rec LabelFixup;
 ```
 
+## rec LabelSite
+
+```mach
+pub rec LabelSite;
+```
+
+a local branch the block resolved: a position inside its bytes and the
+offset its label lands on, which the block hands to the branch's note
+
 ## rec Labels
 
 ```mach

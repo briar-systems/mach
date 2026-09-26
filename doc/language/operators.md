@@ -7,8 +7,8 @@ vector types they apply lane-wise, with the honest per-lane table in
 [SIMD vectors](#simd-vectors) below (`+ - * /`, no vector `%`).
 
 ```mach
-val s: i64    = 10 + 20;
-val q: f32    = 1.5 * 2.0;
+val s: i64 = 10 + 20;
+val q: f32 = 1.5 * 2.0;
 ```
 
 `%` is the remainder. On integers it is the native truncated remainder, taking
@@ -19,14 +19,14 @@ nonzero divisor, this applies across the finite operand range, including
 quotients beyond the `i64` range.
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
-    val r: f64 = 5.5 % 3.0;      # 2.5
-    val s: f64 = -5.5 % 3.0;     # -2.5
-    val t: i64 = -7 % 3;         # -1
+    val r: f64 = 5.5 % 3.0; # 2.5
+    val s: f64 = -5.5 % 3.0; # -2.5
+    val t: i64 = -7 % 3; # -1
     print.printlnf("{} {} {}", r, s, t);
     ret 0;
 }
@@ -166,28 +166,30 @@ positive zero for either zero.
 - `@ptr` — dereference; reads through the pointer.
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
     var x: i64  = 9;
     var p: *i64 = ?x;
-    @p = 11;                    # write through
-    val v: i64  = @p;           # read through
+    @p = 11; # write through
+    val v: i64 = @p; # read through
     print.printlnf("{}", v);
     ret 0;
 }
 ```
 
 ```mach error cannot take the address of a call result
-fun g() i64 { ret 1; }
+fun g() i64 {
+    ret 1;
+}
 
 fun addresses(x: i64) {
-    val b: *i64 = ?g();         # error: cannot take the address of a call result
-    val c: *i64 = ?42;          # error: cannot take the address of a literal
-    val d: *u64 = ?(x::u64);    # error: cannot take the address of a cast result
-    val e: *i64 = ?(x + 1);     # error: cannot take the address of an operator result
+    val b: *i64 = ?g(); # error: cannot take the address of a call result
+    val c: *i64 = ?42; # error: cannot take the address of a literal
+    val d: *u64 = ?(x::u64); # error: cannot take the address of a cast result
+    val e: *i64 = ?(x + 1); # error: cannot take the address of an operator result
 }
 ```
 
@@ -226,15 +228,15 @@ read is a value, not a view onto the memory, so its address cannot be taken
 (`cannot take the address of a range`) and it cannot be written into.
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
     var xs: [6]f32 = [6]f32{1.0, 2.0, 3.0, 4.0, 5.0, 6.0};
-    val p: *f32 = ?xs[0];
-    val a: f32x4 = p[1, 4]::f32x4;      # the four floats at p[1]
-    p[2, 4] = (a * a)::[4]f32;          # stored at p[2]
+    val p:  *f32   = ?xs[0];
+    val a:  f32x4  = p[1, 4]::f32x4; # the four floats at p[1]
+    p[2, 4] = (a * a)::[4]f32; # stored at p[2]
     val tail: [2]f32 = xs[4, 2];
     print.printlnf("{} {} {}", xs[2], tail[0], tail[1]);
     ret 0;
@@ -274,15 +276,15 @@ and convert the value read, parenthesize the dereference: `(@p)::T`. The same
 holds for `-x::T`, which is `-(x::T)`.
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
-    var x: i64 = -1;
-    val p: *i64 = ?x;
-    val bits: u64 = @p::*u64;       # @(p::*u64): retype the pointer, read a u64
-    val wide: i128 = (@p)::i128;    # read the i64, then sign-extend it
+    var x:    i64  = -1;
+    val p:    *i64 = ?x;
+    val bits: u64  = @p::*u64; # @(p::*u64): retype the pointer, read a u64
+    val wide: i128 = (@p)::i128; # read the i64, then sign-extend it
     print.printlnf("{:x} {}", bits, wide);
     ret 0;
 }
@@ -293,7 +295,7 @@ applies to `p` and a `u64` cannot be dereferenced:
 
 ```mach error dereference of non-pointer type
 fun widen(p: *i64) u64 {
-    ret @p::u64;                    # error: @(p::u64) dereferences a u64
+    ret @p::u64; # error: @(p::u64) dereferences a u64
 }
 ```
 
@@ -325,18 +327,18 @@ The two differ sharply on int<->float. `::` runs a numeric conversion, while
 `:~` reinterprets the raw bit pattern:
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
     val some_i64: i64 = -1;
-    val a: u64 = some_i64::u64;     # value conversion (resize)
-    val p: *u8 = argv::*u8;         # pointer value, retyped
+    val a:        u64 = some_i64::u64; # value conversion (resize)
+    val p:        *u8 = argv::*u8; # pointer value, retyped
 
-    val n: u64 = 1.5::u64;          # 1                  (float -> int conversion)
-    val b: u64 = 1.5:~u64;          # 0x3FF8000000000000 (raw IEEE-754 bits)
-    val f: f64 = b:~f64;            # 1.5                (bits read back as a float)
+    val n: u64 = 1.5::u64; # 1                  (float -> int conversion)
+    val b: u64 = 1.5:~u64; # 0x3FF8000000000000 (raw IEEE-754 bits)
+    val f: f64 = b:~f64; # 1.5                (bits read back as a float)
     print.printlnf("{} {:x} {}", n, b, f);
     ret 0;
 }
@@ -387,10 +389,10 @@ use std.runtime;
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
     val x: u32x4 = u32x4{1, 2, 0x80000000, 0xF0};
-    val n: u32   = argc::u32 + 31;              # 32 at run time
-    val h: u32x4 = x >> u32x4{4, 4, 4, 4};      # one psrld on x86_64
-    val k: u32x4 = x << u32x4{n, n, n, n};      # at the lane width: every lane is 0
-    val m: u32x4 = x << u32x4{0, 1, 2, 3};      # a count per lane
+    val n: u32   = argc::u32 + 31; # 32 at run time
+    val h: u32x4 = x >> u32x4{4, 4, 4, 4}; # one psrld on x86_64
+    val k: u32x4 = x << u32x4{n, n, n, n}; # at the lane width: every lane is 0
+    val m: u32x4 = x << u32x4{0, 1, 2, 3}; # a count per lane
     if (h[3] != 0x0F || k[2] != 0 || m[1] != 4) { ret 1; }
     ret 0;
 }

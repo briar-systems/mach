@@ -190,6 +190,12 @@ pub val ASM_NOTE_BYTES_WIDTH: usize = notes.ASM_NOTE_BYTES_WIDTH
 pub val NOTE_SEED_MAX: u32 = notes.NOTE_SEED_MAX
 ```
 
+## val NOTE_NO_LANDING
+
+```mach
+pub val NOTE_NO_LANDING: u32 = notes.NOTE_NO_LANDING
+```
+
 ## fun sink_init
 
 ```mach
@@ -240,6 +246,15 @@ pub fun note_at(buf: *ByteBuf, idx: u32) *AsmNote;
 ```mach
 pub fun note_index_at(buf: *ByteBuf, off: u32) i32;
 ```
+
+## fun note_set_landing
+
+```mach
+pub fun note_set_landing(buf: *ByteBuf, first: u32, pos: u32, target: u32);
+```
+
+the instruction note from `first` on whose bytes hold `pos` lands on the
+text offset `target`
 
 ## fun notes_reset
 
@@ -447,7 +462,7 @@ hooks: *EncodeHooks, asm_out: *writer.Writer) res[EncoderOutput, fail.Fail];
 
 ```mach
 pub fun classify_refs(mi: *mir.MirInstr, target_block: *u32, has_block: *bool,
-sym: *intern.StrId, has_sym: *bool, sym_addend: *i32);
+sym: *intern.StrId, has_sym: *bool, sym_addend: *i64);
 ```
 
 ## fun push_symbol
@@ -471,7 +486,7 @@ pub fun push_frame_step(st: *EncodeState, kind: u8, reg: u8, end_off: u32, value
 ## fun push_reloc
 
 ```mach
-pub fun push_reloc(st: *EncodeState, offset: u32, kind: of.RelocKind, sym: intern.StrId, addend: i32) err[fail.Fail];
+pub fun push_reloc(st: *EncodeState, offset: u32, kind: of.RelocKind, sym: intern.StrId, addend: i64) err[fail.Fail];
 ```
 
 ## fun bind_reloc_pair

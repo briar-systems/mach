@@ -66,8 +66,8 @@ fixed per call site. `$if` / `$or` may branch on it: the compiler
 and each instance compiles only the arm its value selects.
 
 ```mach
+use std.print;
 use std.runtime;
-use print: std.print;
 
 val MODE_DOUBLE: u8 = 0;
 val MODE_SQUARE: u8 = 1;
@@ -175,6 +175,7 @@ naming the cycle:
 
 ```mach error depend on each other, so no order decides them
 $if (A == 4) { pub val B: u32 = 4; }
+
 $if (B == 4) { pub val A: u32 = 4; }
 ```
 
