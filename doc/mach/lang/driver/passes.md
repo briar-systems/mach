@@ -91,8 +91,11 @@ pub fun q_typed_exports_compute(p: *project.Project, key: u64, alloc: *A.Allocat
 ## fun back_half_key
 
 ```mach
-pub fun back_half_key(stable: session.StableModuleId, test_mode: bool) u64;
+pub fun back_half_key(stable: session.StableModuleId, test_object: bool) u64;
 ```
+
+a module's lowering and codegen products are keyed by its stable id, and by the
+test bit for its test object
 
 ## fun back_half_key_is_test
 
@@ -105,6 +108,23 @@ pub fun back_half_key_is_test(key: u64) bool;
 ```mach
 pub fun back_half_key_for(p: *project.Project, m: *project.ModuleEntry) u64;
 ```
+
+the normal object's key, the same in every build that compiles the module
+
+## fun test_key_for
+
+```mach
+pub fun test_key_for(m: *project.ModuleEntry) u64;
+```
+
+## fun has_test_object
+
+```mach
+pub fun has_test_object(p: *project.Project, m: *project.ModuleEntry) bool;
+```
+
+the module gets a test object in this build: a test build, and a module whose
+source declares a test or a `#[testing]` declaration
 
 ## fun codegen_reusable
 
@@ -124,8 +144,8 @@ pub fun test_build(p: *project.Project) bool;
 pub fun shared_artifact_build(p: *project.Project) bool;
 ```
 
-the artifact this build links is a shared library. a test build of the same
-project links an executable, so the export surface is not at stake there
+the artifact this build links is a shared library. a test build compiles the
+library's own objects, so it lowers them the way the library's build does
 
 ## fun debug_info_of
 
@@ -144,17 +164,6 @@ pub fun run_lower_pass(p: *project.Project) err[outcome.Fail];
 ```mach
 pub fun prepare_lower_pass(p: *project.Project) err[outcome.Fail];
 ```
-
-## fun q_cell_snapshot_compute
-
-```mach
-pub fun q_cell_snapshot_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
-```
-
-the persistent object key's inputs as one query product: every typed
-definition in the cell, the target configuration and the codegen flags. its
-bytes are the cell digest, so an edit anywhere in the cell advances it and
-every product restored under the old digest recomputes
 
 ## fun load_status
 
@@ -210,16 +219,20 @@ the modules that still lower here are those without a product restored under
 this operation's snapshot; a module restored in the lower operation keeps its
 staged product when the snapshot is unchanged and lowers now if it changed
 
-## fun prepare_persistent_cache
+## fun acquire_test_inputs
 
 ```mach
-pub fun prepare_persistent_cache(p: *project.Project, ph: u8) err[outcome.Fail];
+pub fun acquire_test_inputs(p: *project.Project) err[outcome.Fail];
 ```
 
-once per query operation, after the typed definitions are current: the
-compiler identity (once per project), then the cell snapshot through its
-query so an unchanged cell is not rehashed, then the store directory. its
-items are reported under the readout phase ph that runs it
+the test operation's inputs: the typed definitions and each test object's
+lowered ir, unless the load restored its object from `obj/`
+
+## fun run_test_object_pass
+
+```mach
+pub fun run_test_object_pass(p: *project.Project) err[outcome.Fail];
+```
 
 ## fun run_codegen_pass
 
@@ -230,8 +243,10 @@ pub fun run_codegen_pass(p: *project.Project) err[outcome.Fail];
 ## fun code_sources
 
 ```mach
-pub fun code_sources(p: *project.Project, mid: session.ModuleId, a: *A.Allocator) res[CodeSources, fail.Fail];
+pub fun code_sources(p: *project.Project, mid: session.ModuleId, seed: *ir.Module, a: *A.Allocator) res[CodeSources, fail.Fail];
 ```
+
+the other modules' lowered ir a whole-module backend reads to generate `seed`, module mid's ir
 
 ## rec CodeSources
 
@@ -250,6 +265,30 @@ pub fun sources_empty() CodeSources;
 ```mach
 pub fun sources_dnit(a: *A.Allocator, cs: *CodeSources);
 ```
+
+## fun run_test_object_one
+
+```mach
+pub fun run_test_object_one(p: *project.Project, mid: session.ModuleId) err[fail.Fail];
+```
+
+the module's test object, lowered against its normal object and generated
+
+## fun run_test_lower_one
+
+```mach
+pub fun run_test_lower_one(p: *project.Project, mid: session.ModuleId) err[fail.Fail];
+```
+
+the module's test ir, which test codegen workers read before the query publishes the object
+
+## fun test_codegen_reusable
+
+```mach
+pub fun test_codegen_reusable(p: *project.Project, mid: session.ModuleId) res[bool, fail.Fail];
+```
+
+the test object's codegen product is current or cached, so no worker generates it
 
 ## fun q_codegen_compute
 
@@ -287,16 +326,6 @@ pub fun q_link_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags
 pub fun capture_build_config(p: *project.Project, alloc: *A.Allocator) res[query.QueryOutput, fail.Fail];
 ```
 
-## fun capture_build_identity
-
-```mach
-pub fun capture_build_identity(p: *project.Project, alloc: *A.Allocator) res[query.QueryOutput, fail.Fail];
-```
-
-the configuration without the planner environment: what a persistent product
-may key on. steps that ran are keyed by their own fingerprint chain, and the
-inherited environment reaches an object only through them.
-
 ## fun capture_configuration_identity
 
 ```mach
@@ -305,6 +334,15 @@ pub fun capture_configuration_identity(p: *project.Project, alloc: *A.Allocator)
 
 the build identity without the request: the persistent key hashes the request
 itself, with the project root in canonical form, so the spelled root stays out
+
+## fun prepare_object_cache
+
+```mach
+pub fun prepare_object_cache(p: *project.Project) err[fail.Fail];
+```
+
+key the loaded modules and read `obj/` under their keys (driver/cache),
+reported as the cache phase carved out of resolve, which it precedes
 
 ## fun set_build_config_input
 

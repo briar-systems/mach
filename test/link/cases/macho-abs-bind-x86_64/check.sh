@@ -5,7 +5,7 @@
 #
 # Walk the dyld bind rows for the fixture's two absolute 64-bit references to
 # libSystem's __stdoutp/__stderrp. Each must bind in place inside __DATA (the
-# cell itself is bound - no __GOT slot), one row per site, and the on-disk cell
+# cell itself is bound - no __got slot), one row per site, and the on-disk cell
 # content must be the relocation's zero addend. On the native Intel macOS leg
 # the same PIE is executed and its dereference contract compared exactly.
 produce_macho_abs_bind() {

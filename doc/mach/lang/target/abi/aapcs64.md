@@ -3,49 +3,13 @@
 ## val REG_X0
 
 ```mach
-pub val REG_X0:  i32 = 0
+pub val REG_X0: i32 = 0
 ```
 
 ## val REG_X1
 
 ```mach
-pub val REG_X1:  i32 = 1
-```
-
-## val REG_X2
-
-```mach
-pub val REG_X2:  i32 = 2
-```
-
-## val REG_X3
-
-```mach
-pub val REG_X3:  i32 = 3
-```
-
-## val REG_X4
-
-```mach
-pub val REG_X4:  i32 = 4
-```
-
-## val REG_X5
-
-```mach
-pub val REG_X5:  i32 = 5
-```
-
-## val REG_X6
-
-```mach
-pub val REG_X6:  i32 = 6
-```
-
-## val REG_X7
-
-```mach
-pub val REG_X7:  i32 = 7
+pub val REG_X1: i32 = 1
 ```
 
 ## val REG_X8
@@ -58,60 +22,6 @@ pub val REG_X8:  i32 = 8
 
 ```mach
 pub val REG_X19: i32 = 19
-```
-
-## val REG_X20
-
-```mach
-pub val REG_X20: i32 = 20
-```
-
-## val REG_X21
-
-```mach
-pub val REG_X21: i32 = 21
-```
-
-## val REG_X22
-
-```mach
-pub val REG_X22: i32 = 22
-```
-
-## val REG_X23
-
-```mach
-pub val REG_X23: i32 = 23
-```
-
-## val REG_X24
-
-```mach
-pub val REG_X24: i32 = 24
-```
-
-## val REG_X25
-
-```mach
-pub val REG_X25: i32 = 25
-```
-
-## val REG_X26
-
-```mach
-pub val REG_X26: i32 = 26
-```
-
-## val REG_X27
-
-```mach
-pub val REG_X27: i32 = 27
-```
-
-## val REG_X28
-
-```mach
-pub val REG_X28: i32 = 28
 ```
 
 ## val GP_PARAM_COUNT

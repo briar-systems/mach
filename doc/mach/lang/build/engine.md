@@ -41,25 +41,6 @@ oa: owns the returned outcome
 ev: progress sink for the readout; nil for none
 ret: the outcome of that one unit, released with outcome.outcome_dnit, or an engine failure
 
-## fun execute_warm_all
-
-```mach
-pub fun execute_warm_all(bp: *plan.BuildPlan, s: *session.Session, oa: *A.Allocator,
-ev: *readout.Progress) res[outcome.BuildOutcome, outcome.Fail];
-```
-
-execute_warm over every planned cell in order, merged into one outcome the way
-execute merges its cold units: blocked units recorded and skipped, a failed unit
-recorded and the rest still run, the severity the worst unit's
-
-bp: the plan, read only
-s: the warm session
-oa: owns the returned outcome
-ev: progress sink for the readout; nil for none
-ret: the merged outcome, released with outcome.outcome_dnit, or an engine failure
-the plan is one round of the session's active retainer: every unit's modules stay held until the plan
-ends, so one unit never releases another's, and a plan that stops early or fails keeps what it had
-
 ## fun set_link_config_input
 
 ```mach

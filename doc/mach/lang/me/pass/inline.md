@@ -6,20 +6,6 @@
 pub rec InlineBudget;
 ```
 
-## fun run
-
-```mach
-pub fun run(m: *ir.Module, tgt: *target.Target, out_report: *InlineBudget) res[bool, fail.Fail];
-```
-
-## fun run_available
-
-```mach
-pub fun run_available(m: *ir.Module, tgt: *target.Target, available: *body.Available, out_report: *InlineBudget) res[bool, fail.Fail];
-```
-
-a run that owns its workspace; the pipeline runs `run_in` over one
-
 ## fun run_in
 
 ```mach

@@ -419,19 +419,6 @@ every case field after it
 pub fun tag_payload_offset_for_machine(t: *IrTypeTable, id: IrTypeId, machine: layout.Machine) u32;
 ```
 
-## fun checked_extent_for_machine
-
-```mach
-pub fun checked_extent_for_machine(t: *IrTypeTable, id: IrTypeId, machine: layout.Machine) layout.Extent;
-```
-
-## fun checked_offset_for_machine
-
-```mach
-pub fun checked_offset_for_machine(t: *IrTypeTable, id: IrTypeId, field_ix: u32,
-machine: layout.Machine) layout.Extent;
-```
-
 ## fun content_equal
 
 ```mach

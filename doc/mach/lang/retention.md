@@ -91,22 +91,6 @@ pub fun release(t: *Retention, id: RetainerId) err[fail.Fail];
 
 a retainer that holds nothing any more; its modules no other retainer holds are released
 
-## fun held_count
-
-```mach
-pub fun held_count(t: *Retention) usize;
-```
-
-how many distinct modules the session holds
-
-## fun holds
-
-```mach
-pub fun holds(t: *Retention, id: RetainerId, stable: module.StableModuleId) bool;
-```
-
-whether a retainer holds a module
-
 ## fun retire
 
 ```mach

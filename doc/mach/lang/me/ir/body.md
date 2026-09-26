@@ -75,15 +75,6 @@ owns the module home that allocator comes from
 pub fun available_init(a: *Available, name: intern.StrId) err[fail.Fail];
 ```
 
-## fun available_init_over
-
-```mach
-pub fun available_init_over(a: *Available, name: intern.StrId, alloc: *A.Allocator) err[fail.Fail];
-```
-
-a store over the caller's allocator, which then sees every request the
-cross-module clone makes
-
 ## fun detach
 
 ```mach

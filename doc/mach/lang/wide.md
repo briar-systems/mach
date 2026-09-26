@@ -114,12 +114,6 @@ pub fun neg(a: Wide) Wide;
 pub fun max_u() Wide;
 ```
 
-## fun max_s
-
-```mach
-pub fun max_s() Wide;
-```
-
 ## fun min_s
 
 ```mach
@@ -174,12 +168,6 @@ pub fun mul_overflows_u(a: Wide, b: Wide) bool;
 pub fun mul_overflows_s(a: Wide, b: Wide) bool;
 ```
 
-## fun mul_high_s64
-
-```mach
-pub fun mul_high_s64(a: i64, b: i64) i64;
-```
-
 ## fun divmod_u
 
 ```mach
@@ -226,12 +214,6 @@ pub fun sext(a: Wide, bits: u32) Wide;
 
 ```mach
 pub fun fits_unsigned(a: Wide, bits: u32) bool;
-```
-
-## fun fits_signed
-
-```mach
-pub fun fits_signed(a: Wide, bits: u32) bool;
 ```
 
 ## fun bit_length
@@ -294,12 +276,6 @@ pub fun format_u(a: Wide, buf: *u8, cap: usize) usize;
 pub fun format_s(a: Wide, buf: *u8, cap: usize) usize;
 ```
 
-## fun format_hex
-
-```mach
-pub fun format_hex(a: Wide, buf: *u8, cap: usize) usize;
-```
-
 ## val FORMAT_CAP
 
 ```mach
@@ -323,10 +299,4 @@ pub fun text_s(a: Wide, buf: *u8) str;
 ```
 
 the decimal text of a signed value, terminated, in a FORMAT_CAP buffer
-
-## fun parse_u
-
-```mach
-pub fun parse_u(text: *u8, len: usize, base: u32, out: *Wide) bool;
-```
 

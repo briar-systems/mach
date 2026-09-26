@@ -373,10 +373,10 @@ local statement (see [Statements](#statements)).
 ### `test`
 
 ```ebnf
-test-decl ::= "test" LIT_STR block
+test-decl ::= "test" IDENT block
 ```
 
-A `test` carries a string label and a block body.
+A `test` carries a name and a block body. The name lives in the module's test namespace, apart from every other declaration (see [test.md](test.md#grammar)).
 
 ### Generic parameters
 

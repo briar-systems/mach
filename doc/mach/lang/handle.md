@@ -127,40 +127,10 @@ pub fun table_init[T, Domain](a: *A.Allocator) res[HandleTable[T, Domain], Error
 pub fun table_dnit[T, Domain](t: *HandleTable[T, Domain]);
 ```
 
-## fun table_count
-
-```mach
-pub fun table_count[T, Domain](t: *HandleTable[T, Domain]) usize;
-```
-
 ## fun get
 
 ```mach
 pub fun get[T, Domain](t: *HandleTable[T, Domain], id: HandleId[Domain]) res[*T, Error];
-```
-
-## fun contains
-
-```mach
-pub fun contains[T, Domain](t: *HandleTable[T, Domain], id: HandleId[Domain]) bool;
-```
-
-## fun view
-
-```mach
-pub fun view[T, Domain](t: *HandleTable[T, Domain]) HandleView[T, Domain];
-```
-
-## fun view_valid
-
-```mach
-pub fun view_valid[T, Domain](v: *HandleView[T, Domain]) bool;
-```
-
-## fun view_get
-
-```mach
-pub fun view_get[T, Domain](v: *HandleView[T, Domain], id: HandleId[Domain]) res[*T, Error];
 ```
 
 ## fun edit

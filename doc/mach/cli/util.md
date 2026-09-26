@@ -34,36 +34,6 @@ argv: the arguments
 flag: the exact spelling to find
 ret: the argument after the first match; none when the flag is absent or is the last argument
 
-## fun flag_mark
-
-```mach
-pub fun flag_mark(marks: *bool, argc: usize, argv: *str, flag: str) bool;
-```
-
-find every occurrence of a flag and mark its index
-
-marks: one bool per argv entry, set true at each occurrence; nil to only test presence
-argc: number of entries
-argv: the arguments
-flag: the exact spelling to find
-ret: true when the flag occurred at least once
-
-## fun flag_mark_value
-
-```mach
-pub fun flag_mark_value(marks: *bool, argc: usize, argv: *str, flag: str) opt[str];
-```
-
-find every occurrence of a value flag, mark each flag and its following argument, and
-return the first value
-
-marks: one bool per argv entry; the flag and the argument after it are marked; nil to skip marking
-argc: number of entries
-argv: the arguments
-flag: the exact spelling to find
-ret: the argument after the first occurrence that has one; none when the flag is absent or
-       every occurrence is last
-
 ## fun arg_is_flag
 
 ```mach
@@ -87,35 +57,6 @@ the index of the first "--" at or after argv[1]
 argc: number of entries
 argv: the arguments
 ret: the index, or argc when there is none
-
-## fun arg_index_positional
-
-```mach
-pub fun arg_index_positional(argc: usize, argv: *str, marks: *bool, start: usize) usize;
-```
-
-the first unmarked argument at or after start that is not a flag
-
-argc: number of entries
-argv: the arguments
-marks: one bool per argv entry, true where an option or its value sits
-start: first index to inspect
-ret: the index, or argc when there is none
-
-## fun flag_reject_unknown
-
-```mach
-pub fun flag_reject_unknown(argc: usize, argv: *str, marks: *bool, start: usize, cmd: str) bool;
-```
-
-print "error: unknown flag" for the first unmarked flag at or after start
-
-argc: number of entries
-argv: the arguments
-marks: one bool per argv entry, true where an option or its value sits
-start: first index to inspect
-cmd: the command name printed in the message
-ret: true when an unknown flag was found and reported
 
 ## def OperandClass
 
@@ -178,17 +119,6 @@ and its parent becomes the root
 a: allocator for the returned strings
 arg: the operand; nil is an error asking for a path
 ret: the location, freed with dnit_project_location, or a message naming what was wrong
-
-## fun ensure_dir
-
-```mach
-pub fun ensure_dir(p: str) bool;
-```
-
-create a directory with mode 0755 when it does not exist; not recursive
-
-p: the directory path
-ret: true when the directory exists afterwards
 
 ## fun ensure_parents
 

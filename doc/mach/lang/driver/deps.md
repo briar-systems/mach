@@ -1,11 +1,5 @@
 # mach.lang.driver.deps
 
-## fun set_git_config_env
-
-```mach
-pub fun set_git_config_env(env: **u8);
-```
-
 ## rec RootOverride
 
 ```mach
@@ -270,12 +264,6 @@ root owns the flat closure and a dependency's own dep/ is never realized.
 an empty directory git materializes for a consumed dependency's gitlink is not
 a realization and passes
 
-## fun declared_dep_id
-
-```mach
-pub fun declared_dep_id(s: *session.Session, dep_full: str) res[str, outcome.Fail];
-```
-
 ## fun verify_dep_manifest_id
 
 ```mach
@@ -318,22 +306,10 @@ pub fun dep_full_of(alloc: *A.Allocator, root: str, id: str) res[str, outcome.Fa
 pub fun staged_gitlink(s: *session.Session, root: str, id: str) res[opt[str], outcome.Fail];
 ```
 
-## fun staged_paths
-
-```mach
-pub fun staged_paths(s: *session.Session, root: str, rel: str) res[str, outcome.Fail];
-```
-
 ## fun own_work_tree
 
 ```mach
 pub fun own_work_tree(alloc: *A.Allocator, dep_full: str) bool;
-```
-
-## fun checkout_commit
-
-```mach
-pub fun checkout_commit(s: *session.Session, dep_full: str, commit: str) err[outcome.Fail];
 ```
 
 ## fun checkout_head
@@ -341,15 +317,6 @@ pub fun checkout_commit(s: *session.Session, dep_full: str, commit: str) err[out
 ```mach
 pub fun checkout_head(s: *session.Session, dep_full: str) res[str, outcome.Fail];
 ```
-
-## fun release_at_head
-
-```mach
-pub fun release_at_head(s: *session.Session, dep_full: str) res[str, outcome.Fail];
-```
-
-the release version a checkout's HEAD is tagged with (an owned "" when no `v`-prefixed
-semver tag points at it); the highest wins when several do, and the caller frees the result
 
 ## fun release_at_pin
 
@@ -496,15 +463,6 @@ slot: *GitSlot) res[u8, outcome.Fail];
 ```
 
 bring a slot `refuse_git_slot` accepted to the realization a build verifies
-
-## fun realize_git_dependency
-
-```mach
-pub fun realize_git_dependency(s: *session.Session, root: str, id: str, url: str, ref: str, mode: u8,
-accept: bool) res[u8, outcome.Fail];
-```
-
-observe, refuse and realize one git dependency
 
 ## fun remove_dependency_index
 

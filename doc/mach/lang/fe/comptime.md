@@ -413,12 +413,6 @@ pub rec NoCapabilityContext;
 pub rec PhaseCapabilities[T];
 ```
 
-## fun no_capabilities
-
-```mach
-pub fun no_capabilities() PhaseCapabilities[NoCapabilityContext];
-```
-
 ## fun loading_capabilities
 
 ```mach
@@ -618,36 +612,6 @@ pub fun gate_eval_failure_is_transient(kind: EvalFailKind) bool;
 pub def ConstKind: u8
 ```
 
-## val CONST_INT
-
-```mach
-pub val CONST_INT:     ConstKind = 0
-```
-
-## val CONST_FLOAT
-
-```mach
-pub val CONST_FLOAT:   ConstKind = 1
-```
-
-## val CONST_POINTER
-
-```mach
-pub val CONST_POINTER: ConstKind = 2
-```
-
-## val CONST_SYMBOL
-
-```mach
-pub val CONST_SYMBOL:  ConstKind = 3
-```
-
-## val CONST_ZERO
-
-```mach
-pub val CONST_ZERO:    ConstKind = 4
-```
-
 ## rec ConstAddress
 
 ```mach
@@ -660,92 +624,16 @@ pub rec ConstAddress;
 pub rec TypedConstant;
 ```
 
-## fun const_int
-
-```mach
-pub fun const_int(ty: type.TypeId, bits: u64) TypedConstant;
-```
-
-## fun const_float
-
-```mach
-pub fun const_float(ti: *type.TypeInterner, ty: type.TypeId, f: f64) res[TypedConstant, fail.Fail];
-```
-
-## fun const_zero
-
-```mach
-pub fun const_zero(ty: type.TypeId) TypedConstant;
-```
-
-## fun const_pointer
-
-```mach
-pub fun const_pointer(ty: type.TypeId, symbol: intern.StrId, addend: i64) TypedConstant;
-```
-
-## fun const_symbol
-
-```mach
-pub fun const_symbol(ty: type.TypeId, symbol: intern.StrId) TypedConstant;
-```
-
-## val REINTERPRET_MSG_UNSUPPORTED_SOURCE
-
-```mach
-pub val REINTERPRET_MSG_UNSUPPORTED_SOURCE: str =
-"typed constant reinterpretation: unsupported source kind"
-```
-
-## val REINTERPRET_MSG_UNREPRESENTABLE
-
-```mach
-pub val REINTERPRET_MSG_UNREPRESENTABLE: str =
-"typed constant reinterpretation: unrepresentable operand type"
-```
-
-## val REINTERPRET_MSG_WIDTH_MISMATCH
-
-```mach
-pub val REINTERPRET_MSG_WIDTH_MISMATCH: str =
-"typed constant reinterpretation: bit extent mismatch"
-```
-
-## fun const_reinterpret
-
-```mach
-pub fun const_reinterpret(ti: *type.TypeInterner, c: TypedConstant, dest_ty: type.TypeId, ptr_width: u32) res[TypedConstant, fail.Fail];
-```
-
-## fun const_address_add
-
-```mach
-pub fun const_address_add(c: TypedConstant, delta: i64) res[TypedConstant, fail.Fail];
-```
-
 ## rec DataModel
 
 ```mach
 pub rec DataModel;
 ```
 
-## fun data_model
-
-```mach
-pub fun data_model(ptr_width: u32, big_endian: bool) DataModel;
-```
-
 ## rec RelocationRequest
 
 ```mach
 pub rec RelocationRequest;
-```
-
-## fun encode_scalar
-
-```mach
-pub fun encode_scalar(ti: *type.TypeInterner, c: TypedConstant, dm: DataModel, base_offset: u32,
-out: *u8, out_len: usize, reloc_out: *opt[RelocationRequest]) res[u32, fail.Fail];
 ```
 
 ## rec FrameMark
@@ -1015,12 +903,6 @@ pub fun eval_lit_int(source: str, span: token.Span) res[CTValue, EvalFail];
 pub fun scan_lit_float(source: str, span: token.Span) res[LitFloat, fail.Fail];
 ```
 
-## fun eval_lit_float
-
-```mach
-pub fun eval_lit_float(source: str, span: token.Span) res[CTValue, EvalFail];
-```
-
 ## fun eval_lit_char
 
 ```mach
@@ -1069,14 +951,6 @@ pub fun is_fields_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
 ```mach
 pub fun is_cases_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
 ```
-
-## fun is_descriptor_seq_call
-
-```mach
-pub fun is_descriptor_seq_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
-```
-
-`$fields(T)` and `$cases(T)` are the two descriptor sequences a `$each` walks
 
 ## fun is_descriptor
 
@@ -1446,12 +1320,6 @@ pub fun is_field_descriptor_member(a: *ast.Ast, source: str, eid: id.ExprId) boo
 
 ```mach
 pub fun is_type_query_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
-```
-
-## fun is_type_name_call
-
-```mach
-pub fun is_type_name_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
 ```
 
 ## fun is_type_question_call

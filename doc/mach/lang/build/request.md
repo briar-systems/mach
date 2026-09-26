@@ -178,12 +178,6 @@ subsystem: of.Subsystem, goal: BuildGoal) BuildRequest;
 pub val HASH_SIZE: usize = 32
 ```
 
-## fun request_hash
-
-```mach
-pub fun request_hash(a: *A.Allocator, r: *BuildRequest, digest: *u8) err[outcome.Fail];
-```
-
 ## fun semantic_hash
 
 ```mach

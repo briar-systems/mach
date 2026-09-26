@@ -44,7 +44,7 @@ The parser distinguishes these by structure:
 used for `$mach.{os,arch,abi}.*` comparison. Flat `$project.version` is the whole
 version **string** (`"2.0.0"`); the structured `$project.version.{major,minor,
 patch}` folds its integer components — both are available. `[project]` has
-exactly the keys `id`, `version`, `src`, and `out`
+exactly the keys `id`, `version`, `mach`, `src`, and `out`
 ([manifest.md](manifest.md#project)), and `$project.*` carries exactly `id`
 and `version`. A path the root does not carry, `$project.name` and
 `$project.description` included, reports `` unknown `$project.*` path `` at

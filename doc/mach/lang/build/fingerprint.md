@@ -78,12 +78,6 @@ pub val DOMAIN_IMAGE:        Domain = 11
 pub val DOMAIN_FS_POLICY:    Domain = 12
 ```
 
-## val DOMAIN_IR_FORM
-
-```mach
-pub val DOMAIN_IR_FORM:      Domain = 13
-```
-
 ## val FILE_DIGEST_CHUNK
 
 ```mach

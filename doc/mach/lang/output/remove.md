@@ -44,11 +44,3 @@ pub fun relative(root_fd: usize, rel: str) Removal;
 remove the tree at `rel` beneath `root_fd`, walking to the parent of the
 last component with a descriptor held at each step
 
-## fun t_component
-
-```mach
-pub fun t_component(a: *A.Allocator, n: usize) str;
-```
-
-a nul-terminated component of `n` bytes, or nil
-
