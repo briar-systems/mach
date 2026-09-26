@@ -11,9 +11,10 @@ selected artifact's closure into a single test binary.
 test "label" { ... }
 ```
 
-The label is a **string literal** — it is required, and it must be a
-string literal (not an identifier or a bare word). The body is a block of
-statements. A test takes no parameters and is not callable from ordinary
+The label is required: a **string literal**, or an identifier, which
+labels the test exactly as the string literal of the same text does
+(`test leap_year { ... }` is `test "leap_year" { ... }`). The body is a
+block of statements. A test takes no parameters and is not callable from ordinary
 code; it exists only for the runner to invoke.
 
 `test` is a reserved keyword and appears at module (declaration) scope,
