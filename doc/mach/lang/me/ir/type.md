@@ -430,6 +430,17 @@ pub fun byte_size_for_machine(t: *IrTypeTable, id: IrTypeId, machine: layout.Mac
 pub fun byte_align_for_machine(t: *IrTypeTable, id: IrTypeId, machine: layout.Machine) u32;
 ```
 
+## fun natural_align_for_machine
+
+```mach
+pub fun natural_align_for_machine(t: *IrTypeTable, id: IrTypeId, machine: layout.Machine) u32;
+```
+
+the alignment an aggregate's members give it, before its own #[align] raises
+it: a member's alignment counts whole, #[align] included, and a packed
+aggregate's members are aligned to 1. anything else has its own alignment.
+AAPCS64 places a composite argument by this one (#3929)
+
 ## fun byte_offset_for_machine
 
 ```mach
