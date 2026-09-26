@@ -54,6 +54,15 @@ pub fun equal(left: *[32]u8, right: *[32]u8) bool;
 pub fun object(snapshot: *[32]u8, module: str, out: *[32]u8) err[fail.Fail];
 ```
 
+## fun test_object
+
+```mach
+pub fun test_object(object_key: *[32]u8, source: str, out: *[32]u8) err[fail.Fail];
+```
+
+the key of a module's test object: the key of the normal object it builds on,
+and the module's source, which holds the test bodies the normal key need not cover
+
 ## fun step
 
 ```mach

@@ -666,9 +666,11 @@ rec LowerClosure {
 
 val BACK_HALF_TEST_BIT: u64 = 0x100000000;
 
-pub fun back_half_key(stable: session.StableModuleId, test_mode: bool) u64 {
+# a module's lowering and codegen products are keyed by its stable id, and by the
+# test bit for its test object
+pub fun back_half_key(stable: session.StableModuleId, test_object: bool) u64 {
     var k: u64 = stable::u64;
-    if (test_mode) { k = k | BACK_HALF_TEST_BIT; }
+    if (test_object) { k = k | BACK_HALF_TEST_BIT; }
     ret k;
 }
 
@@ -676,8 +678,22 @@ pub fun back_half_key_is_test(key: u64) bool {
     ret (key & BACK_HALF_TEST_BIT) != 0;
 }
 
+# the normal object's key, the same in every build that compiles the module
 pub fun back_half_key_for(p: *project.Project, m: *project.ModuleEntry) u64 {
-    ret back_half_key(m.stable_id, test_build(p));
+    ret back_half_key(m.stable_id, false);
+}
+
+pub fun test_key_for(m: *project.ModuleEntry) u64 {
+    ret back_half_key(m.stable_id, true);
+}
+
+# the module gets a test object in this build: a test build, and a module whose
+# source declares a test or a `#[testing]` declaration
+pub fun has_test_object(p: *project.Project, m: *project.ModuleEntry) bool {
+    if (!test_build(p) || m.a == nil) { ret false; }
+    val file: opt[*src.SourceFile] = src.get(?p.s.sources, m.a.file_id);
+    if (sel file.none) { ret false; }
+    ret testrunner.declares_tests(m.a, file.some.text);
 }
 
 pub fun codegen_reusable(p: *project.Project, mid: session.ModuleId) res[bool, fail.Fail] {
@@ -694,11 +710,11 @@ pub fun test_build(p: *project.Project) bool {
     ret request.test_goal(p.req.goal);
 }
 
-# the artifact this build links is a shared library. a test build of the same
-# project links an executable, so the export surface is not at stake there
+# the artifact this build links is a shared library. a test build compiles the
+# library's own objects, so it lowers them the way the library's build does
 pub fun shared_artifact_build(p: *project.Project) bool {
-    if (p.req.goal != request.GOAL_EXECUTE) { ret false; }
-    if (p.target_entry == nil)              { ret false; }
+    if (p.req.goal != request.GOAL_EXECUTE && !test_build(p)) { ret false; }
+    if (p.target_entry == nil)                                { ret false; }
     ret p.target_entry.mode == project.MODE_LIBRARY && p.target_entry.lib_kind == manifest.LIBKIND_SHARED;
 }
 
@@ -1106,26 +1122,65 @@ fun lower_inputs(p: *project.Project, key: u64) res[session.ModuleId, fail.Fail]
 }
 
 fun lower_raw_candidate_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
-    val test_mode: bool                             = back_half_key_is_test(key);
-    val inputs:    res[session.ModuleId, fail.Fail] = lower_inputs(p, key);
+    val inputs: res[session.ModuleId, fail.Fail] = lower_inputs(p, key);
     if (sel inputs.err) { ret res[query.QueryOutput, fail.Fail].err{inputs.err}; }
-    val mid: session.ModuleId               = inputs.ok;
-    val m:   *project.ModuleEntry           = project.module_at(p, mid::u32);
-    val hr:  res[*ir.ModuleHome, fail.Fail] = ir_home_new(alloc);
+    val mid: session.ModuleId     = inputs.ok;
+    val m:   *project.ModuleEntry = project.module_at(p, mid::u32);
+
+    # a test object declares what its normal object defines, so it lowers against that object
+    var normal:      lower.NormalObject;
+    var normal_from: *lower.NormalObject = nil;
+    val test_object: bool                = back_half_key_is_test(key);
+    if (test_object) {
+        val defined: res[lower.NormalObject, fail.Fail] = normal_object_of(p, m);
+        if (sel defined.err) { ret res[query.QueryOutput, fail.Fail].err{defined.err}; }
+        normal      = defined.ok;
+        normal_from = ?normal;
+    }
+    fin {
+        if (normal_from != nil) { map.dnit[intern.StrId, bool](?normal.defined); }
+    }
+
+    val hr: res[*ir.ModuleHome, fail.Fail] = ir_home_new(alloc);
     if (sel hr.err) { ret res[query.QueryOutput, fail.Fail].err{hr.err}; }
     val home: *ir.ModuleHome = hr.ok;
 
+    var phase: u8 = readout.PH_LOWER;
+    if (test_object) { phase = readout.PH_TEST; }
     val t_low:  readout.Instant            = readout.item_begin(p.events);
-    val rr_raw: res[*ir.Module, fail.Fail] = lower_raw(p, mid, home, test_mode, diags);
+    val rr_raw: res[*ir.Module, fail.Fail] = lower_raw(p, mid, home, normal_from, diags);
     if (sel rr_raw.err) {
         val stable: fail.Fail = lower_stable_fail(p, rr_raw.err);
         ir_release(alloc, home);
         ret res[query.QueryOutput, fail.Fail].err{stable};
     }
-    readout.item(p.events, readout.PH_LOWER, project.fqn_name(p, m.fqn), t_low);
+    readout.item(p.events, phase, project.fqn_name(p, m.fqn), t_low);
     val irmod: *ir.Module = rr_raw.ok;
 
     ret ir_handle_encode(alloc, irmod, home);
+}
+
+# every global symbol the module's normal object defines, read from its codegen
+# product, which this lowering then depends on
+fun normal_object_of(p: *project.Project, m: *project.ModuleEntry) res[lower.NormalObject, fail.Fail] {
+    val got: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_CODEGEN, back_half_key_for(p, m));
+    if (sel got.err) { ret res[lower.NormalObject, fail.Fail].err{got.err}; }
+    val image: *of.ObjectImage = image_handle_decode(got.ok);
+    if (image == nil) { ret res[lower.NormalObject, fail.Fail].err{fail.message("a test object requires its normal object's image")}; }
+    var normal: lower.NormalObject = lower.NormalObject{defined: map.init[intern.StrId, bool](p.s.alloc)};
+    var i:      u32                = 0;
+    for (i < image.symbol_count) {
+        val sym: *of.Symbol = ?image.symbols[i];
+        if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0 && !of.section_is_external(sym.section)) {
+            val added: res[bool, A.Error] = map.insert[intern.StrId, bool](?normal.defined, sym.name, true);
+            if (sel added.err) {
+                map.dnit[intern.StrId, bool](?normal.defined);
+                ret res[lower.NormalObject, fail.Fail].err{fail.refused(added.err)};
+            }
+        }
+        i = i + 1;
+    }
+    ret res[lower.NormalObject, fail.Fail].ok{normal};
 }
 
 pub fun q_inline_bodies_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
@@ -1190,7 +1245,8 @@ fun release_lower_output(alloc: *A.Allocator, output: query.QueryOutput) {
 }
 
 fun lower_candidate_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
-    if (p.req.opt != pipeline.OPT_RELEASE) { ret lower_raw_candidate_compute(p, key, alloc, diags); }
+    # a test object offers no bodies to inline: its tests are reached only by the dispatcher
+    if (p.req.opt != pipeline.OPT_RELEASE || back_half_key_is_test(key)) { ret lower_raw_candidate_compute(p, key, alloc, diags); }
     val inputs: res[session.ModuleId, fail.Fail] = lower_inputs(p, key);
     if (sel inputs.err) { ret res[query.QueryOutput, fail.Fail].err{inputs.err}; }
     var local: project.RawLowerCapture;
@@ -1211,18 +1267,20 @@ fun lower_candidate_compute(p: *project.Project, key: u64, alloc: *A.Allocator, 
     ret lower_raw_candidate_compute(p, key, alloc, diags);
 }
 
-fun acquire_inline_bodies(p: *project.Project, m: *ir.Module, available: *body.Available, test_mode: bool) err[fail.Fail] {
+# the bodies m may inline come from each defining module's normal lowering. a test
+# object also takes its own module's, whose definitions its normal object holds
+fun acquire_inline_bodies(p: *project.Project, m: *ir.Module, available: *body.Available, test_object: bool) err[fail.Fail] {
     if (p.req.opt != pipeline.OPT_RELEASE) { ret err[fail.Fail].ok{}; }
     var i: u32 = 0;
     for (i < m.function_len) {
         val origin: intern.StrId = m.functions[i].body_module;
-        if ((m.functions[i].flags & ir.FN_FLAG_EXTERN) == 0 || origin == intern.STR_NIL || origin == m.name) {
+        if ((m.functions[i].flags & ir.FN_FLAG_EXTERN) == 0 || origin == intern.STR_NIL || (origin == m.name && !test_object)) {
             i = i + 1;
             cnt;
         }
         val stable: session.StableModuleId = session.stable_module_id_lookup(p.s, origin);
         if (stable == session.STABLE_MODULE_NIL) { ret err[fail.Fail].err{fail.message("inline body: defining module has no stable query identity")}; }
-        val got: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_INLINE_BODIES, back_half_key(stable, test_mode));
+        val got: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_INLINE_BODIES, back_half_key(stable, false));
         if (sel got.err) { ret err[fail.Fail].err{got.err}; }
         val provider: *ir.Module = ir_handle_decode(got.ok);
         if (provider == nil) { ret err[fail.Fail].err{fail.message("inline body: provider has no owned product")}; }
@@ -1279,18 +1337,19 @@ pub fun q_lower_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diag
         val imported: err[fail.Fail] = acquire_inline_bodies(p, irmod, available, back_half_key_is_test(key));
         if (sel imported.err) { ret res[query.QueryOutput, fail.Fail].err{lower_stable_fail(p, imported.err)}; }
     }
-    val main_id: res[intern.StrId, fail.Fail] = neutralize_id(p, back_half_key_is_test(key));
-    if (sel main_id.err) { ret res[query.QueryOutput, fail.Fail].err{main_id.err}; }
     val t_opt:     readout.Instant = readout.span_begin(p.events);
-    val optimized: err[fail.Fail]  = lower_optimize(p, irmod, main_id.ok, available, diags);
-    readout.item(p.events, readout.PH_OPTIMIZE, project.fqn_name(p, irmod.name), t_opt);
-    readout.span_end(p.events, readout.PH_OPTIMIZE, readout.PH_LOWER, t_opt);
+    val optimized: err[fail.Fail]  = lower_optimize(p, irmod, available, diags);
+    # a test object's optimization is part of the test phase's own row
+    if (!back_half_key_is_test(key)) {
+        readout.item(p.events, readout.PH_OPTIMIZE, project.fqn_name(p, irmod.name), t_opt);
+        readout.span_end(p.events, readout.PH_OPTIMIZE, readout.PH_LOWER, t_opt);
+    }
     if (sel optimized.err) { ret res[query.QueryOutput, fail.Fail].err{lower_stable_fail(p, optimized.err)}; }
     transferred = true;
     ret raw;
 }
 
-fun lower_raw(p: *project.Project, mid: session.ModuleId, home: *ir.ModuleHome, test_mode: bool, diags: *diagnostic.DiagnosticStore) res[*ir.Module, fail.Fail] {
+fun lower_raw(p: *project.Project, mid: session.ModuleId, home: *ir.ModuleHome, normal: *lower.NormalObject, diags: *diagnostic.DiagnosticStore) res[*ir.Module, fail.Fail] {
     val s: *session.Session     = p.s;
     val m: *project.ModuleEntry = project.module_at(p, mid::u32);
 
@@ -1299,7 +1358,7 @@ fun lower_raw(p: *project.Project, mid: session.ModuleId, home: *ir.ModuleHome, 
     var deps: sema.SemaDeps = captured.ok;
     fin { free_sema_deps_query(p.s.alloc, ?deps); }
     val req_r: res[lower.LowerRequest, fail.Fail] = lower.request(s, ?p.target, ?home.alloc, m.a, m.fqn, mid,
-        m.sema_result, m.resolve_result, ?m.ctx, test_mode, shared_artifact_build(p), p.req.debug, p.req.opt != pipeline.OPT_RELEASE, diags, ?deps);
+        m.sema_result, m.resolve_result, ?m.ctx, normal, shared_artifact_build(p), p.req.debug, p.req.opt != pipeline.OPT_RELEASE, diags, ?deps);
     if (sel req_r.err) { ret res[*ir.Module, fail.Fail].err{req_r.err}; }
     var req: lower.LowerRequest = req_r.ok;
 
@@ -1317,7 +1376,7 @@ fun lower_raw(p: *project.Project, mid: session.ModuleId, home: *ir.ModuleHome, 
     ret res[*ir.Module, fail.Fail].ok{box};
 }
 
-fun lower_optimize(p: *project.Project, irmod: *ir.Module, main_id: intern.StrId, available: *body.Available, diags: *diagnostic.DiagnosticStore) err[fail.Fail] {
+fun lower_optimize(p: *project.Project, irmod: *ir.Module, available: *body.Available, diags: *diagnostic.DiagnosticStore) err[fail.Fail] {
     var preq: pipeline.PipelineRequest;
     preq.module            = irmod;
     preq.available         = available;
@@ -1331,16 +1390,7 @@ fun lower_optimize(p: *project.Project, irmod: *ir.Module, main_id: intern.StrId
     preq.diags             = diags;
     val res_opt: res[bool, fail.Fail] = pipeline.run(?preq);
     if (sel res_opt.err) { ret err[fail.Fail].err{res_opt.err}; }
-
-    if (main_id != intern.STR_NIL) { testrunner.neutralize_main(main_id, irmod); }
     ret err[fail.Fail].ok{};
-}
-
-fun neutralize_id(p: *project.Project, test_mode: bool) res[intern.StrId, fail.Fail] {
-    if (!test_mode) { ret res[intern.StrId, fail.Fail].ok{intern.STR_NIL}; }
-    val linkage: res[intern.StrId, fail.Fail] = testrunner.main_linkage_id(p.s);
-    if (sel linkage.err) { ret res[intern.StrId, fail.Fail].err{linkage.err}; }
-    ret res[intern.StrId, fail.Fail].ok{linkage.ok};
 }
 
 fun ir_home_new(alloc: *A.Allocator) res[*ir.ModuleHome, fail.Fail] {
@@ -1429,7 +1479,6 @@ rec ParallelLower {
     p:        *project.Project;
     next:     i64;
     stop:     i64;
-    main_id:  intern.StrId;
     slots:    *PlwSlot;
     slot_len: u32;
 }
@@ -1445,7 +1494,7 @@ fun plw_worker_main(arg: *u8) {
 
         val slot: *PlwSlot        = ?pl.slots[idx_raw::usize];
         val t0:   readout.Instant = readout.sample();
-        val r:    err[fail.Fail]  = lower_optimize(pl.p, slot.m, pl.main_id, slot.capture.available, slot.diags);
+        val r:    err[fail.Fail]  = lower_optimize(pl.p, slot.m, slot.capture.available, slot.diags);
         slot.d = readout.elapsed(t0);
         if (sel r.err) {
             slot.fail   = r.err;
@@ -1542,8 +1591,6 @@ fun run_lower_batch(p: *project.Project, slots: *PlwSlot, emit_len: u32) err[fai
         prime = prime + 1;
     }
 
-    val test_mode: bool = test_build(p);
-
     var si: u32 = 0;
     for (si < slot_len) {
         val mid: session.ModuleId     = slots[si].mid;
@@ -1568,16 +1615,10 @@ fun run_lower_batch(p: *project.Project, slots: *PlwSlot, emit_len: u32) err[fai
     if (nworkers == 0)       { nworkers = 1; }
     if (nworkers > slot_len) { nworkers = slot_len; }
 
-    val nid: res[intern.StrId, fail.Fail] = neutralize_id(p, test_mode);
-    if (sel nid.err) {
-        ret err[fail.Fail].err{nid.err};
-    }
-
     var pl: ParallelLower;
     pl.p        = p;
     pl.next     = 0;
     pl.stop     = 0;
-    pl.main_id  = nid.ok;
     pl.slots    = slots;
     pl.slot_len = slot_len;
 
@@ -1807,6 +1848,60 @@ pub fun prepare_persistent_cache(p: *project.Project, ph: u8) err[outcome.Fail] 
     ret err[outcome.Fail].ok{};
 }
 
+# the test operation's inputs: the typed definitions, the persistent cache, and each
+# test object's lowered ir, unless its object is restored from `obj/`
+pub fun acquire_test_inputs(p: *project.Project) err[outcome.Fail] {
+    var clear: u32 = 0;
+    for (clear < project.module_count(p)) {
+        project.module_at(p, clear).test.ir_module = nil;
+        clear                                      = clear + 1;
+    }
+    val frontend: err[outcome.Fail] = acquire_frontend_inputs(p);
+    if (sel frontend.err) { ret frontend; }
+    val cached: err[outcome.Fail] = prepare_persistent_cache(p, readout.PH_TEST);
+    if (sel cached.err) { ret cached; }
+    var i: u32 = 0;
+    for (i < p.emit_len) {
+        val mid: session.ModuleId     = p.topo[i];
+        val m:   *project.ModuleEntry = project.module_at(p, mid::u32);
+        if (!has_test_object(p, m)) {
+            i = i + 1;
+            cnt;
+        }
+        if (p.cache_ready && persistent.early_restore_enabled(p)) {
+            val held: res[bool, fail.Fail] = query.reusable[project.Project](?p.queries, p, query.Q_CODEGEN, test_key_for(m));
+            if (sel held.err) { ret err[outcome.Fail].err{outcome.from_fail(held.err)}; }
+            if (!held.ok) {
+                val restored: res[bool, fail.Fail] = persistent.restore_test(p, mid, readout.PH_TEST);
+                if (sel restored.err) { ret err[outcome.Fail].err{outcome.from_fail(restored.err)}; }
+            }
+        }
+        val lowered: err[fail.Fail] = run_test_lower_one(p, mid);
+        if (sel lowered.err) { ret err[outcome.Fail].err{outcome.from_fail(lowered.err)}; }
+        i = i + 1;
+    }
+    ret err[outcome.Fail].ok{};
+}
+
+pub fun run_test_pass(p: *project.Project) err[outcome.Fail] {
+    val inputs: err[outcome.Fail] = acquire_test_inputs(p);
+    if (sel inputs.err) { ret inputs; }
+    ret run_test_object_pass(p);
+}
+
+pub fun run_test_object_pass(p: *project.Project) err[outcome.Fail] {
+    var i: u32 = 0;
+    for (i < p.emit_len) {
+        val mid: session.ModuleId = p.topo[i];
+        if (has_test_object(p, project.module_at(p, mid::u32))) {
+            val r: err[fail.Fail] = run_test_object_one(p, mid);
+            if (sel r.err) { ret err[outcome.Fail].err{outcome.from_fail(r.err)}; }
+        }
+        i = i + 1;
+    }
+    ret err[outcome.Fail].ok{};
+}
+
 pub fun run_codegen_pass(p: *project.Project) err[outcome.Fail] {
     val inputs: err[outcome.Fail] = acquire_codegen_inputs(p);
     if (sel inputs.err) { ret inputs; }
@@ -1823,7 +1918,8 @@ pub fun run_codegen_pass(p: *project.Project) err[outcome.Fail] {
     ret err[outcome.Fail].ok{};
 }
 
-pub fun code_sources(p: *project.Project, mid: session.ModuleId, a: *A.Allocator) res[CodeSources, fail.Fail] {
+# the other modules' lowered ir a whole-module backend reads to generate `seed`, module mid's ir
+pub fun code_sources(p: *project.Project, mid: session.ModuleId, seed: *ir.Module, a: *A.Allocator) res[CodeSources, fail.Fail] {
     if (!isa.emits_whole_module(p.target.isa)) { ret res[CodeSources, fail.Fail].ok{sources_empty()}; }
     val n: u32 = project.module_count(p);
     if (n == 0) { ret res[CodeSources, fail.Fail].ok{sources_empty()}; }
@@ -1847,7 +1943,8 @@ pub fun code_sources(p: *project.Project, mid: session.ModuleId, a: *A.Allocator
                 i = i + 1;
                 cnt;
             }
-            val im: *ir.Module = project.module_at(p, i).ir_module;
+            var im: *ir.Module = project.module_at(p, i).ir_module;
+            if (i == mid::u32) { im = seed; }
             if (im == nil) {
                 i = i + 1;
                 cnt;
@@ -1887,7 +1984,7 @@ pub fun code_sources(p: *project.Project, mid: session.ModuleId, a: *A.Allocator
     var count: u32 = 0;
     i = 0;
     for (i < n) {
-        if (mark[i] && i != mid::u32 && project.module_at(p, i).ir_module != nil) { count = count + 1; }
+        if (mark[i] && source_of(p, i, mid, seed) != nil) { count = count + 1; }
         i = i + 1;
     }
     if (count == 0) {
@@ -1914,7 +2011,7 @@ pub fun code_sources(p: *project.Project, mid: session.ModuleId, a: *A.Allocator
     var ti: u32 = 0;
     for (ti < p.topo_len) {
         val tid: u32 = p.topo[ti]::u32;
-        if (mark[tid] && tid != mid::u32 && project.module_at(p, tid).ir_module != nil && cs.set.len < count) {
+        if (mark[tid] && source_of(p, tid, mid, seed) != nil && cs.set.len < count) {
             cs.set.mods[cs.set.len] = project.module_at(p, tid).ir_module;
             cs.ids[cs.set.len]      = p.topo[ti];
             cs.set.len              = cs.set.len + 1;
@@ -1923,6 +2020,14 @@ pub fun code_sources(p: *project.Project, mid: session.ModuleId, a: *A.Allocator
     }
     A.deallocate[bool](a, mark, n::usize);
     ret res[CodeSources, fail.Fail].ok{cs};
+}
+
+# module i's ir as a code source for generating `seed`: another module's lowered ir,
+# or the module's own normal ir when `seed` is its test object
+fun source_of(p: *project.Project, i: u32, mid: session.ModuleId, seed: *ir.Module) *ir.Module {
+    val im: *ir.Module = project.module_at(p, i).ir_module;
+    if (i == mid::u32 && im == seed) { ret nil; }
+    ret im;
 }
 
 pub rec CodeSources {
@@ -1984,6 +2089,40 @@ fun run_codegen_one(p: *project.Project, mid: session.ModuleId) err[fail.Fail] {
     ret persistent.publish(p, m, img);
 }
 
+# the module's test object, lowered against its normal object and generated
+pub fun run_test_object_one(p: *project.Project, mid: session.ModuleId) err[fail.Fail] {
+    val m: *project.ModuleEntry = project.module_at(p, mid::u32);
+
+    val e_r: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_CODEGEN, test_key_for(m));
+    if (sel e_r.err) { ret err[fail.Fail].err{e_r.err}; }
+    val img: *of.ObjectImage = image_handle_decode(e_r.ok);
+    if (img == nil) { ret err[fail.Fail].err{fail.message("Q_CODEGEN produced no test object handle")}; }
+
+    m.test.object_image = img;
+    ret persistent.publish_test(p, m, img);
+}
+
+# the module's test ir, which test codegen workers read before the query publishes the object
+pub fun run_test_lower_one(p: *project.Project, mid: session.ModuleId) err[fail.Fail] {
+    val m: *project.ModuleEntry = project.module_at(p, mid::u32);
+    if (persistent.test_restored(p, m)) { ret err[fail.Fail].ok{}; }
+    val e_r: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_LOWER, test_key_for(m));
+    if (sel e_r.err) { ret err[fail.Fail].err{e_r.err}; }
+    val irm: *ir.Module = ir_handle_decode(e_r.ok);
+    if (irm == nil) { ret err[fail.Fail].err{fail.message("Q_LOWER produced no test object handle")}; }
+    m.test.ir_module = irm;
+    ret err[fail.Fail].ok{};
+}
+
+# the test object's codegen product is current or cached, so no worker generates it
+pub fun test_codegen_reusable(p: *project.Project, mid: session.ModuleId) res[bool, fail.Fail] {
+    val m:        *project.ModuleEntry = project.module_at(p, mid::u32);
+    val reusable: res[bool, fail.Fail] = query.reusable[project.Project](?p.queries, p, query.Q_CODEGEN, test_key_for(m));
+    if (sel reusable.err) { ret reusable; }
+    if (reusable.ok)      { ret reusable; }
+    ret persistent.restore_test(p, mid, readout.PH_TEST);
+}
+
 pub fun q_codegen_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail] {
     val db: *query.QueryDb   = ?p.s.queries;
     val s:  *session.Session = p.s;
@@ -1991,19 +2130,22 @@ pub fun q_codegen_compute(p: *project.Project, key: u64, alloc: *A.Allocator, di
     val stable: session.StableModuleId = key::u32::session.StableModuleId;
     val mid:    session.ModuleId       = session.module_id_for_stable(s, stable);
     if (mid == session.MODULE_NIL) { ret res[query.QueryOutput, fail.Fail].err{fail.message("Q_CODEGEN: stable id not loaded this build")}; }
-    val m: *project.ModuleEntry = project.module_at(p, mid::u32);
-    if (persistent.staged_restored(p, m)) { ret q_codegen_restored(p, mid, alloc); }
+    val m:           *project.ModuleEntry = project.module_at(p, mid::u32);
+    val test_object: bool                 = back_half_key_is_test(key);
+    if (!test_object && persistent.staged_restored(p, m))     { ret q_codegen_restored(p, mid, false, alloc); }
+    if (test_object && persistent.test_staged_restored(p, m)) { ret q_codegen_restored(p, mid, true, alloc); }
     val lower_owner: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_LOWER, key);
     if (sel lower_owner.err) { ret res[query.QueryOutput, fail.Fail].err{lower_owner.err}; }
     val irmod: *ir.Module = ir_handle_decode(lower_owner.ok);
     if (irmod == nil) { ret res[query.QueryOutput, fail.Fail].err{fail.message("Q_CODEGEN: module has no lowered IR")}; }
-    m.ir_module = irmod;
+    if (test_object)  { m.test.ir_module = irmod; }
+    or                { m.ir_module = irmod; }
     val rt: err[fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_TARGET, 0);
     if (sel rt.err) { ret res[query.QueryOutput, fail.Fail].err{rt.err}; }
     val rpp: err[fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_CODEGEN_FLAGS, 0);
     if (sel rpp.err) { ret res[query.QueryOutput, fail.Fail].err{rpp.err}; }
 
-    val srcs_r: res[CodeSources, fail.Fail] = code_sources(p, mid, s.alloc);
+    val srcs_r: res[CodeSources, fail.Fail] = code_sources(p, mid, irmod, s.alloc);
     if (sel srcs_r.err) { ret res[query.QueryOutput, fail.Fail].err{srcs_r.err}; }
     var srcs: CodeSources = srcs_r.ok;
     var di:   u32         = 0;
@@ -2017,14 +2159,27 @@ pub fun q_codegen_compute(p: *project.Project, key: u64, alloc: *A.Allocator, di
         di = di + 1;
     }
 
-    if (m.staged_image == nil) {
-        val restored: res[bool, fail.Fail] = persistent.restore(p, mid, readout.PH_CODEGEN);
-        if (sel restored.err) {
-            sources_dnit(s.alloc, ?srcs);
-            ret res[query.QueryOutput, fail.Fail].err{restored.err};
+    var staged: *of.ObjectImage = nil;
+    if (test_object) {
+        if (m.test.staged_image == nil) {
+            val restored: res[bool, fail.Fail] = persistent.restore_test(p, mid, readout.PH_TEST);
+            if (sel restored.err) {
+                sources_dnit(s.alloc, ?srcs);
+                ret res[query.QueryOutput, fail.Fail].err{restored.err};
+            }
         }
+        staged = persistent.take_staged_test(p, m);
     }
-    val staged: *of.ObjectImage = persistent.take_staged(p, m);
+    or {
+        if (m.staged_image == nil) {
+            val restored: res[bool, fail.Fail] = persistent.restore(p, mid, readout.PH_CODEGEN);
+            if (sel restored.err) {
+                sources_dnit(s.alloc, ?srcs);
+                ret res[query.QueryOutput, fail.Fail].err{restored.err};
+            }
+        }
+        staged = persistent.take_staged(p, m);
+    }
     if (staged != nil) {
         sources_dnit(s.alloc, ?srcs);
         ret image_handle_encode(alloc, staged);
@@ -2036,11 +2191,13 @@ pub fun q_codegen_compute(p: *project.Project, key: u64, alloc: *A.Allocator, di
         ret res[query.QueryOutput, fail.Fail].err{dbg_r.err};
     }
 
+    var phase: u8 = readout.PH_CODEGEN;
+    if (test_object) { phase = readout.PH_TEST; }
     val t_cg:   readout.Instant                = readout.item_begin(p.events);
     val res_cg: res[of.ObjectImage, fail.Fail] = codegen.codegen_unit(s, ?p.target, irmod, srcs.set, nil, p.req.placement_policy, dbg_r.ok, diags);
     sources_dnit(s.alloc, ?srcs);
     if (sel res_cg.err) { ret res[query.QueryOutput, fail.Fail].err{res_cg.err}; }
-    readout.item(p.events, readout.PH_CODEGEN, project.fqn_name(p, m.fqn), t_cg);
+    readout.item(p.events, phase, project.fqn_name(p, m.fqn), t_cg);
     var img: of.ObjectImage = res_cg.ok;
 
     val br: res[*of.ObjectImage, A.Error] = A.allocate[of.ObjectImage](alloc, 1::usize);
@@ -2057,7 +2214,7 @@ pub fun q_codegen_compute(p: *project.Project, key: u64, alloc: *A.Allocator, di
 # edges a generated one carries directly (its typed definition, the target and
 # the codegen flags) plus the cell snapshot, which is the persistent key's
 # in-process image: any input the key covers advances it
-fun q_codegen_restored(p: *project.Project, mid: session.ModuleId, alloc: *A.Allocator) res[query.QueryOutput, fail.Fail] {
+fun q_codegen_restored(p: *project.Project, mid: session.ModuleId, test_object: bool, alloc: *A.Allocator) res[query.QueryOutput, fail.Fail] {
     val m:          *project.ModuleEntry           = project.module_at(p, mid::u32);
     val definition: res[scx.Definition, fail.Fail] = read_definition(p::ptr, mid, scx.DEFINITION_TYPED);
     if (sel definition.err) { ret res[query.QueryOutput, fail.Fail].err{definition.err}; }
@@ -2067,7 +2224,9 @@ fun q_codegen_restored(p: *project.Project, mid: session.ModuleId, alloc: *A.All
     if (sel rpp.err) { ret res[query.QueryOutput, fail.Fail].err{rpp.err}; }
     val cell: err[fail.Fail] = query.depend[project.Project](?p.queries, p, query.Q_CELL_SNAPSHOT, 0);
     if (sel cell.err) { ret res[query.QueryOutput, fail.Fail].err{cell.err}; }
-    val staged: *of.ObjectImage = persistent.take_staged(p, m);
+    var staged: *of.ObjectImage = nil;
+    if (test_object)   { staged = persistent.take_staged_test(p, m); }
+    or                 { staged = persistent.take_staged(p, m); }
     if (staged == nil) { ret res[query.QueryOutput, fail.Fail].err{fail.message("Q_CODEGEN: restored product left the module")}; }
     ret image_handle_encode(alloc, staged);
 }
@@ -2153,6 +2312,13 @@ pub fun q_link_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags
         if (sel rd.err) { ret res[query.QueryOutput, fail.Fail].err{rd.err}; }
         val wm: err[fail.Fail] = dq.fp_u64(?fb, rd.ok);
         if (sel wm.err) { ret res[query.QueryOutput, fail.Fail].err{wm.err}; }
+        # a test build links each test object too
+        if (has_test_object(p, m)) {
+            val rtest: res[query.Revision, fail.Fail] = query.revision[project.Project](?p.queries, p, query.Q_CODEGEN, test_key_for(m));
+            if (sel rtest.err) { ret res[query.QueryOutput, fail.Fail].err{rtest.err}; }
+            val wtest: err[fail.Fail] = dq.fp_u64(?fb, rtest.ok);
+            if (sel wtest.err) { ret res[query.QueryOutput, fail.Fail].err{wtest.err}; }
+        }
         i = i + 1;
     }
 

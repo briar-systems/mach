@@ -91,8 +91,11 @@ pub fun q_typed_exports_compute(p: *project.Project, key: u64, alloc: *A.Allocat
 ## fun back_half_key
 
 ```mach
-pub fun back_half_key(stable: session.StableModuleId, test_mode: bool) u64;
+pub fun back_half_key(stable: session.StableModuleId, test_object: bool) u64;
 ```
+
+a module's lowering and codegen products are keyed by its stable id, and by the
+test bit for its test object
 
 ## fun back_half_key_is_test
 
@@ -105,6 +108,23 @@ pub fun back_half_key_is_test(key: u64) bool;
 ```mach
 pub fun back_half_key_for(p: *project.Project, m: *project.ModuleEntry) u64;
 ```
+
+the normal object's key, the same in every build that compiles the module
+
+## fun test_key_for
+
+```mach
+pub fun test_key_for(m: *project.ModuleEntry) u64;
+```
+
+## fun has_test_object
+
+```mach
+pub fun has_test_object(p: *project.Project, m: *project.ModuleEntry) bool;
+```
+
+the module gets a test object in this build: a test build, and a module whose
+source declares a test or a `#[testing]` declaration
 
 ## fun codegen_reusable
 
@@ -124,8 +144,8 @@ pub fun test_build(p: *project.Project) bool;
 pub fun shared_artifact_build(p: *project.Project) bool;
 ```
 
-the artifact this build links is a shared library. a test build of the same
-project links an executable, so the export surface is not at stake there
+the artifact this build links is a shared library. a test build compiles the
+library's own objects, so it lowers them the way the library's build does
 
 ## fun debug_info_of
 
@@ -221,6 +241,27 @@ compiler identity (once per project), then the cell snapshot through its
 query so an unchanged cell is not rehashed, then whether `obj/` is read. its
 items are reported under the readout phase ph that runs it
 
+## fun acquire_test_inputs
+
+```mach
+pub fun acquire_test_inputs(p: *project.Project) err[outcome.Fail];
+```
+
+the test operation's inputs: the typed definitions, the persistent cache, and each
+test object's lowered ir, unless its object is restored from `obj/`
+
+## fun run_test_pass
+
+```mach
+pub fun run_test_pass(p: *project.Project) err[outcome.Fail];
+```
+
+## fun run_test_object_pass
+
+```mach
+pub fun run_test_object_pass(p: *project.Project) err[outcome.Fail];
+```
+
 ## fun run_codegen_pass
 
 ```mach
@@ -230,8 +271,10 @@ pub fun run_codegen_pass(p: *project.Project) err[outcome.Fail];
 ## fun code_sources
 
 ```mach
-pub fun code_sources(p: *project.Project, mid: session.ModuleId, a: *A.Allocator) res[CodeSources, fail.Fail];
+pub fun code_sources(p: *project.Project, mid: session.ModuleId, seed: *ir.Module, a: *A.Allocator) res[CodeSources, fail.Fail];
 ```
+
+the other modules' lowered ir a whole-module backend reads to generate `seed`, module mid's ir
 
 ## rec CodeSources
 
@@ -250,6 +293,30 @@ pub fun sources_empty() CodeSources;
 ```mach
 pub fun sources_dnit(a: *A.Allocator, cs: *CodeSources);
 ```
+
+## fun run_test_object_one
+
+```mach
+pub fun run_test_object_one(p: *project.Project, mid: session.ModuleId) err[fail.Fail];
+```
+
+the module's test object, lowered against its normal object and generated
+
+## fun run_test_lower_one
+
+```mach
+pub fun run_test_lower_one(p: *project.Project, mid: session.ModuleId) err[fail.Fail];
+```
+
+the module's test ir, which test codegen workers read before the query publishes the object
+
+## fun test_codegen_reusable
+
+```mach
+pub fun test_codegen_reusable(p: *project.Project, mid: session.ModuleId) res[bool, fail.Fail];
+```
+
+the test object's codegen product is current or cached, so no worker generates it
 
 ## fun q_codegen_compute
 

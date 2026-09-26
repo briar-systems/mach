@@ -47,6 +47,14 @@ pub fun object_path(p: *project.Project, m: *project.ModuleEntry, a: *A.Allocato
 
 where the build writes module m's object: `obj/<project>/<module path>.<ext>`
 
+## fun test_object_path
+
+```mach
+pub fun test_object_path(p: *project.Project, m: *project.ModuleEntry, a: *A.Allocator) res[str, fail.Fail];
+```
+
+where the build writes module m's test object: `obj/<project>/<module path>.test.<ext>`
+
 ## fun early_restore_enabled
 
 ```mach
@@ -75,6 +83,23 @@ pub fun staged_restored(p: *project.Project, m: *project.ModuleEntry) bool;
 
 restored and still staged, which is what the codegen query publishes
 
+## fun test_restored
+
+```mach
+pub fun test_restored(p: *project.Project, m: *project.ModuleEntry) bool;
+```
+
+the module's test object is its cached object under the current snapshot:
+it does not lower, and it is already in `obj/`
+
+## fun test_staged_restored
+
+```mach
+pub fun test_staged_restored(p: *project.Project, m: *project.ModuleEntry) bool;
+```
+
+the test object is restored and still staged for the codegen query to publish
+
 ## rec Cached
 
 ```mach
@@ -102,6 +127,14 @@ pub fun restore(p: *project.Project, mid: session.ModuleId, ph: u8) res[bool, fa
 
 a hit is reported under the readout phase ph that asked for the module
 
+## fun restore_test
+
+```mach
+pub fun restore_test(p: *project.Project, mid: session.ModuleId, ph: u8) res[bool, fail.Fail];
+```
+
+the module's test object, read back like its normal object
+
 ## fun take_staged
 
 ```mach
@@ -109,6 +142,12 @@ pub fun take_staged(p: *project.Project, m: *project.ModuleEntry) *of.ObjectImag
 ```
 
 hand the staged image to the query that publishes it; the facts stay with the module
+
+## fun take_staged_test
+
+```mach
+pub fun take_staged_test(p: *project.Project, m: *project.ModuleEntry) *of.ObjectImage;
+```
 
 ## fun scalarized
 
@@ -125,6 +164,8 @@ lowered and from the restored facts when it did not
 pub fun collect_tests(p: *project.Project, m: *project.ModuleEntry, mid: u32, c: *testrunner.Collected) err[fail.Fail];
 ```
 
+a module's tests, from its lowered test ir or from the facts its restored test object carries
+
 ## fun publish
 
 ```mach
@@ -133,4 +174,10 @@ pub fun publish(p: *project.Project, m: *project.ModuleEntry, image: *of.ObjectI
 
 a generated image carries its record into `obj/`: the key it was built
 under and the facts its lowered ir holds
+
+## fun publish_test
+
+```mach
+pub fun publish_test(p: *project.Project, m: *project.ModuleEntry, image: *of.ObjectImage) err[fail.Fail];
+```
 
