@@ -12,6 +12,6 @@ an unknown command prints an error and the overview
 
 argc: process argument count
 argv: process arguments, argv[0] the program
-ret: the exit code: 0 success, 1 usage or user error, 2 when the allocator or the
-      invocation could not be set up, otherwise the command's own code
+ret: the exit code: exit.USER for a missing or unknown command, the code `exit.of` maps a
+      failure to set up the invocation to, otherwise the command's own code
 

@@ -13,7 +13,8 @@ the two, or any other verb, is an error
 
 argv: the full process arguments
 inv: the parsed invocation for this command
-ret: 0 success, 1 usage error, 2 target registration or host resolution failure
+ret: exit.OK, exit.USER for a usage error, or the code `exit.of` maps a target registration or
+      host resolution failure to
 
 ## fun render_host
 

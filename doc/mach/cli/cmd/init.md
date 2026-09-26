@@ -17,6 +17,6 @@ is then added at the caret range of the release resolution picks and checked out
 
 argv: the full process arguments
 inv: the parsed invocation for this command
-ret: 0 success, 1 an invalid id, a refused overwrite, or a failed publish, 2 allocator or
-      filesystem failure, 3 the std dependency could not be realized
+ret: exit.OK, exit.USER for an invalid id or a refused overwrite, otherwise the code
+      `exit.of` maps the printed failure to, the std dependency's own when it could not be added
 

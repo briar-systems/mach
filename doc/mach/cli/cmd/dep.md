@@ -11,7 +11,8 @@ deprecated sync, which runs pull after a note
 
 argv: the full process arguments
 inv: the parsed invocation for this command
-ret: 0 success, 1 missing or unknown action, unknown flag, or a failed action, 2 setup failure
+ret: exit.OK, exit.USER for a malformed invocation, or the code `exit.of` maps the
+      action's printed failure to
 
 ## fun pull_project
 
@@ -45,8 +46,7 @@ project in the closure declares is pinned there:
 
 root: the project root directory
 quiet: suppress progress lines
-ret: 0 realized, 1 a manifest, resolution, identity, or checkout error (printed), 2 the
-       allocator or session could not be initialised
+ret: exit.OK when realized, otherwise the code `exit.of` maps the printed failure to
 
 ## fun verify_project
 
@@ -61,8 +61,8 @@ closure is an error here, where pull reports and retains it
 
 root: the project root directory
 release: also refuse a root dependency selected by a branch, a commit or a path
-ret: 0 verified, 1 a mismatch or error (printed), 2 the allocator or session could not
-         be initialised
+ret: exit.OK when verified, exit.USER for a directory outside the closure, otherwise the
+         code `exit.of` maps the printed failure to
 
 ## fun pin_command
 
@@ -102,6 +102,5 @@ name: the dependency identity
 url: its git source
 quiet: suppress progress lines
 realize: check the release out; false only resolves the range and writes the table
-ret: 0 added, 1 a manifest, resolution or checkout error (printed), 2 the allocator or
-         session could not be initialised
+ret: exit.OK when added, otherwise the code `exit.of` maps the printed failure to
 
