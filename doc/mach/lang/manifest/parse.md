@@ -193,21 +193,3 @@ pub fun need_matches(entry: str, category: str, name: str) bool;
 pub fun idstr(itn: *intern.Interner, id: intern.StrId) str;
 ```
 
-## fun tinit
-
-```mach
-pub fun tinit(backing: *A.Allocator, ar: *arena.Arena, alloc: *A.Allocator, itn: *intern.Interner) bool;
-```
-
-## rec PlanAllocProbe
-
-```mach
-pub rec PlanAllocProbe;
-```
-
-## fun plan_probe_make
-
-```mach
-pub fun plan_probe_make(p: *PlanAllocProbe, alloc: *A.Allocator, fail_at: u32) bool;
-```
-
