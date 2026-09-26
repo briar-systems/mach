@@ -59,25 +59,33 @@ struct pk5 c_mk_pk5(unsigned int x) { struct pk5 r; r.d = 1; r.p = x; return r; 
 struct pk9 c_mk_pk9(long long x) { struct pk9 r; r.d = 1; r.p = x; return r; }
 struct pka c_mk_pka(unsigned int x) { struct pka r; r.d = 2; r.p = x; return r; }
 
+/* a mach #[symbol] name is the literal object symbol, and darwin's C compiler
+ * prefixes an underscore to every C name, so the label makes C ask for the literal one */
+#ifdef __APPLE__
+#define MACH_SYM(name) __asm__(#name)
+#else
+#define MACH_SYM(name)
+#endif
+
 /* the reverse direction: C calls mach with the same shapes */
-long long m_t3(struct t3 v, long long next);
-long long m_t9(struct t9 v, long long next);
-long long m_al16(struct al16 v, long long next);
-long long m_al16_after(long long first, struct al16 v, long long next);
-long long m_tf(struct tf v, long long next);
-long long m_tfm(struct tfm v, long long next);
-long long m_o24(struct o24 v, long long next);
-struct t9 m_mk_t9(unsigned char x);
-struct al16 m_mk_al16(unsigned char x);
-struct tf m_mk_tf(double x);
-struct tfm m_mk_tfm(long long x);
-struct t3 m_mk_t3(unsigned char x);
-long long m_pk5(struct pk5 v, long long next);
-long long m_pk9(struct pk9 v, long long next);
-long long m_pka(struct pka v, long long next);
-struct pk5 m_mk_pk5(unsigned int x);
-struct pk9 m_mk_pk9(long long x);
-struct pka m_mk_pka(unsigned int x);
+long long m_t3(struct t3 v, long long next) MACH_SYM(m_t3);
+long long m_t9(struct t9 v, long long next) MACH_SYM(m_t9);
+long long m_al16(struct al16 v, long long next) MACH_SYM(m_al16);
+long long m_al16_after(long long first, struct al16 v, long long next) MACH_SYM(m_al16_after);
+long long m_tf(struct tf v, long long next) MACH_SYM(m_tf);
+long long m_tfm(struct tfm v, long long next) MACH_SYM(m_tfm);
+long long m_o24(struct o24 v, long long next) MACH_SYM(m_o24);
+struct t9 m_mk_t9(unsigned char x) MACH_SYM(m_mk_t9);
+struct al16 m_mk_al16(unsigned char x) MACH_SYM(m_mk_al16);
+struct tf m_mk_tf(double x) MACH_SYM(m_mk_tf);
+struct tfm m_mk_tfm(long long x) MACH_SYM(m_mk_tfm);
+struct t3 m_mk_t3(unsigned char x) MACH_SYM(m_mk_t3);
+long long m_pk5(struct pk5 v, long long next) MACH_SYM(m_pk5);
+long long m_pk9(struct pk9 v, long long next) MACH_SYM(m_pk9);
+long long m_pka(struct pka v, long long next) MACH_SYM(m_pka);
+struct pk5 m_mk_pk5(unsigned int x) MACH_SYM(m_mk_pk5);
+struct pk9 m_mk_pk9(long long x) MACH_SYM(m_mk_pk9);
+struct pka m_mk_pka(unsigned int x) MACH_SYM(m_mk_pka);
 
 long long c_drives_mach(void) {
     struct t3 a = c_mk_t3(4);
