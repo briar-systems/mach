@@ -141,7 +141,8 @@ keys again, and a project that is not keyed processes every module
 pub rec Cached;
 ```
 
-an object read back from `obj/` with the facts its record carries
+the image an `obj/` object's record carries, which is the image codegen
+produced, with the facts beside it
 
 ## fun read
 
@@ -149,10 +150,12 @@ an object read back from `obj/` with the facts its record carries
 pub fun read(p: *project.Project, location: str, expected: *[32]u8) res[opt[Cached], fail.Fail];
 ```
 
-the object at `location` when its record says it was built under `expected`,
-none on a miss: an object that is missing, unreadable, carries no record or
-a damaged one, or was built under another key is rebuilt, never reused.
-err only when allocation fails
+the image the object at `location` records when its record says it was
+built under `expected`, none on a miss: an object that is missing,
+unreadable, carries no record or a damaged one, or was built under another
+key is rebuilt, never reused. the object is parsed only to find its record,
+since what a format spells is not always what the link reads. err only when
+allocation fails
 
 ## fun object_key
 
@@ -236,7 +239,7 @@ pub fun publish(p: *project.Project, m: *project.ModuleEntry, image: *of.ObjectI
 ```
 
 a generated image carries its record into `obj/`: the key it was built
-under and the facts its lowered ir holds
+under, the facts its lowered ir holds, and the image itself
 
 ## fun publish_test
 
