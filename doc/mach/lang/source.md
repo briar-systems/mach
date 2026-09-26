@@ -97,12 +97,6 @@ the slot count including the FILE_NIL sentinel; the next FileId to be issued
 pub fun add(m: *SourceMap, path: str, text: str) res[FileId, fail.Fail];
 ```
 
-## fun update
-
-```mach
-pub fun update(m: *SourceMap, id: FileId, text: str) res[bool, fail.Fail];
-```
-
 ## rec PreparedLoad
 
 ```mach
@@ -135,12 +129,6 @@ pub fun commit_load(prepared: *PreparedLoad) FileId;
 
 an existing file takes the staged payload in place; a new one lands in the
 slot prepare_load reserved. neither moves any other file
-
-## fun load
-
-```mach
-pub fun load(m: *SourceMap, interner: *intern.Interner, path: str, text: str) res[FileId, fail.Fail];
-```
 
 ## fun prepare_release
 
@@ -204,6 +192,8 @@ pub fun position(file: *SourceFile, offset: usize) Position;
 ```mach
 pub fun line_start(file: *SourceFile, line: usize) opt[usize];
 ```
+
+reached only by mach-lsp
 
 ## fun line_bounds
 

@@ -42,12 +42,6 @@ pub val MODE_LIBRARY: BuildMode = 1
 pub def TargetOpt: u8
 ```
 
-## val TARGET_OPT_DEFAULT
-
-```mach
-pub val TARGET_OPT_DEFAULT: TargetOpt = 0
-```
-
 ## val TARGET_OPT_DEBUG
 
 ```mach
@@ -312,18 +306,6 @@ pub fun map_opt(o: manifest.MOpt) opt[TargetOpt];
 
 the pipeline level a manifest profile level selects; absent for a tag
 outside the catalog, which the caller reports through the catalog policy
-
-## fun intern_unwrap
-
-```mach
-pub fun intern_unwrap(itn: *intern.Interner, text: str) intern.StrId;
-```
-
-## fun intern_opt_unwrap
-
-```mach
-pub fun intern_opt_unwrap(itn: *intern.Interner, text: str) intern.StrId;
-```
 
 ## fun fqn_name
 

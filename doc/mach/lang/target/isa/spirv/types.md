@@ -112,12 +112,6 @@ a tag's composite: member 0 is the declared discriminator and member 1 + c is ca
 (the unit composite when the case has none). it is interned apart from a record with the
 same member list so the emitter can map a case index to its ordinal from the type alone.
 
-## fun struct_is_tag
-
-```mach
-pub fun struct_is_tag(tt: *TypeTable, id: u32) bool;
-```
-
 ## fun type_unit
 
 ```mach
@@ -229,11 +223,5 @@ pub fun const_null(tt: *TypeTable, type_id: u32) u32;
 
 ```mach
 pub fun const_int(tt: *TypeTable, bits: u32, value: i64) u32;
-```
-
-## fun const_float
-
-```mach
-pub fun const_float(tt: *TypeTable, bits: u32, pattern: u64) u32;
 ```
 

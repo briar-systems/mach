@@ -18,16 +18,6 @@ pub rec Workspace;
 pub fun init(work: *Workspace) err[fail.Fail];
 ```
 
-## fun init_direct
-
-```mach
-pub fun init_direct(work: *Workspace, alloc: *A.Allocator) err[fail.Fail];
-```
-
-a workspace whose requests go straight to `alloc` and are never reclaimed by
-`run`: the fail-at-N probes count every scratch request through it and hold
-the transform to releasing each one itself
-
 ## fun dnit
 
 ```mach

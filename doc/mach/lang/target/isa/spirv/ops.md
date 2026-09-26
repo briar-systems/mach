@@ -42,12 +42,6 @@ how a MIR opcode reaches SPIR-V: the emitter shape that forms the
 instruction and the opcode for each lane class. an opcode with no float
 pairing names the same opcode in both columns
 
-## val SH_NONE
-
-```mach
-pub val SH_NONE: Shape = 0
-```
-
 ## val SH_BINARY
 
 ```mach
@@ -121,13 +115,4 @@ pub fun float_compare(cc: u8) u32;
 ```
 
 the ordered float comparisons the FCMP condition codes name
-
-## fun shape_arity
-
-```mach
-pub fun shape_arity(shape: Shape) opt[u8];
-```
-
-the arity an emitter shape forms, 0 for the shape that forms none; absent
-for a tag outside the catalog
 

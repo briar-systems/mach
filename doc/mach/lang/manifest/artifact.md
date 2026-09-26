@@ -77,12 +77,6 @@ t: the target
 pn: the profile name
 ret: the variables; `reqs` is nil
 
-## fun tmpl_vars_of_reqs
-
-```mach
-pub fun tmpl_vars_of_reqs(reqs: *ArtifactReq, req_count: u32) TmplVars;
-```
-
 ## tag TemplateError
 
 ```mach

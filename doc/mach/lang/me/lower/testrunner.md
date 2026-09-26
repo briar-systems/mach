@@ -28,12 +28,6 @@ pub fun collect_module(s: *session.Session, c: *Collected, mod: *ir.Module, mod_
 
 the test declarations of one lowered module, in function order
 
-## fun collect
-
-```mach
-pub fun collect(s: *session.Session, modules: *ir.Module, count: u32) res[Collected, fail.Fail];
-```
-
 ## fun free
 
 ```mach

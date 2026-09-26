@@ -62,12 +62,6 @@ pub val PH_TEST: u8 = 9
 
 a test build's test objects, lowered and generated
 
-## val LEVEL_PHASES
-
-```mach
-pub val LEVEL_PHASES: u8 = 1
-```
-
 ## val LEVEL_ITEMS
 
 ```mach

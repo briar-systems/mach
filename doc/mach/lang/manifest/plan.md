@@ -453,22 +453,6 @@ pick: updated in place; untouched when it already names an artifact or fewer
 ret: ok; err from target resolution, when no artifact supports the target,
        when more than one candidate is marked default, or when several are and none is
 
-## fun select_sole_target_artifact
-
-```mach
-pub fun select_sole_target_artifact(alloc: *A.Allocator, itn: *intern.Interner,
-m: *Manifest, pick: *Selection) err[outcome.Fail];
-```
-
-`select_primary_artifact` without the refusal: fill in `pick.artifact` only
-when the default selection holds one artifact, and stay silent otherwise
-
-alloc: owns error text
-itn: resolves names
-m: the manifest
-pick: updated in place when a choice is clear
-ret: ok unless the artifact name cannot be looked up
-
 ## fun select_sole_executable_artifact
 
 ```mach

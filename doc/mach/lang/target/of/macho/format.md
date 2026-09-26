@@ -624,12 +624,6 @@ pub val X86_RIP_STATE_OFFSET: usize = 128
 pub val ARM_PC_STATE_OFFSET:  usize = 256
 ```
 
-## val EXEC_PAGE_SIZE
-
-```mach
-pub val EXEC_PAGE_SIZE: u64 = 4096
-```
-
 ## val CSMAGIC_EMBEDDED_SIGNATURE
 
 ```mach
