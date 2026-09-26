@@ -255,6 +255,37 @@ beyond the secret is accepted. This holds only for sequential layout; a union
 overlays every variant at offset 0, so a differing-shape pair involving one is
 admitted only when neither side has a public-stored byte at all.
 
+So a `::` or `:~` between pointer types retypes storage only when the two
+pointees agree on secrecy:
+
+- the pointee's own `^` matches on both sides, and so does every `^` reached
+  through nested pointers, array elements and function signatures
+- two aggregates agree field by field over their common prefix, in secrecy,
+  size and alignment, or both are secret in every stored byte
+- any other pair, a scalar against an aggregate included, is legal only when
+  neither pointee contains a secret below its own `^`
+
+A type that stores no value (an empty `rec`, a `[0]T`, or an aggregate of only
+those) has no secrecy layout to match, so it compares as a scalar and never as
+a prefix of every aggregate. A cast through one gets the verdict of the direct
+cast:
+
+```mach error cannot add or drop the secret qualifier
+rec Empty {}
+
+rec Key { a: ^u64; b: ^u64; }
+
+# refused
+fun direct(p: *^u8) *^Key {
+    ret p::*^Key;
+}
+
+# refused the same way
+fun hop(p: *^Empty) *^Key {
+    ret p::*^Key;
+}
+```
+
 The comparison reads the same layout the backend emits. Where it cannot
 determine a layout it declines, which rejects.
 
