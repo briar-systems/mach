@@ -302,7 +302,7 @@ fun add(a: i64, b: i64) i64 {
     ret a + b;
 }
 
-test "math.add: basic sum" {
+test add__basic_sum {
     if (add(2, 3) != 5) {
         ret 1;
     }
@@ -310,7 +310,7 @@ test "math.add: basic sum" {
 }
 ```
 
-The test body returns an integer exit code. Returning `0` or falling off the end denotes success. Any non-zero return value fails the test.
+A test is named with an identifier in its module's own test namespace, so it never clashes with a function of the same name, and related tests group as `subject__case`. Its qualified name, `<module path>#<name>`, is what `mach test --list` and `--filter` show. The test body returns an integer exit code. Returning `0` or falling off the end denotes success. Any non-zero return value fails the test.
 
 ## Types and Literals
 

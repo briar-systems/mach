@@ -176,7 +176,7 @@ same-module exemption.
 #[testing]
 pub fun filled(n: u32) Queue { ... }
 
-test "queue: drains in order" {
+test queue__drains_in_order {
     var q: Queue = filled(3);          # a test body may use the fixture
     ...
 }
@@ -234,9 +234,9 @@ argument closes without a bracket — `f[Map[Vec[i64], str], u8]` is
 `m.f$m.Map$$m.Vec$$$i64$$str$u8`. `p$u8` is `*u8`, `sec$u32` is `^u32`,
 `arr4$u8` is `[4]u8`, `fn$$i64$$u8` is `fun(u8) i64`, a record is its own dotted
 origin FQN, a comptime value is its literal, and a variadic-pack instance carries
-a `pack` marker before its element list. A `test "label"` symbol keeps the quoted
-label as its name. There is no prefix: a mangled name always contains a `.`, and
-a C identifier never can. Both `.` and `$` are legal in an inline-asm symbol, so
+a `pack` marker before its element list. A test's symbol is its qualified name,
+`<module path>#<identifier>` (see [test.md](test.md#grammar)). There is no prefix:
+a mangled name always contains a `.` or a `#`, and a C identifier never can. Both `.` and `$` are legal in an inline-asm symbol, so
 any emitted symbol can be named from `asm` — but the spelling is not a stability
 promise, and binding to one from C is not a supported use.
 
