@@ -34,6 +34,7 @@ use mach.lang.target.of;
 use mach.lang.target.of.bin;
 use mach.lang.target.of.buildid;
 use mach.lang.target.of.carrier;
+use mach.lang.target.of.cfi;
 use mach.lang.target.of.exports;
 use mach.lang.target.of.plan;
 use mach.lang.target.of.record;
@@ -146,16 +147,17 @@ pub val EF_RISCV_FLOAT_ABI_SOFT:   u32 = 0x0;
 pub val EF_RISCV_FLOAT_ABI_SINGLE: u32 = 0x2;
 pub val EF_RISCV_FLOAT_ABI_DOUBLE: u32 = 0x4;
 
-val PT_LOAD:      u32 = 1;
-val PT_DYNAMIC:   u32 = 2;
-val PT_INTERP:    u32 = 3;
-val PT_NOTE:      u32 = 4;
-val PT_PHDR:      u32 = 6;
-val PT_GNU_RELRO: u32 = 0x6474E552;
-val PT_GNU_STACK: u32 = 0x6474E551;
-val PF_X:         u32 = 1;
-val PF_W:         u32 = 2;
-val PF_R:         u32 = 4;
+val PT_LOAD:         u32 = 1;
+val PT_DYNAMIC:      u32 = 2;
+val PT_INTERP:       u32 = 3;
+val PT_NOTE:         u32 = 4;
+val PT_PHDR:         u32 = 6;
+val PT_GNU_RELRO:    u32 = 0x6474E552;
+val PT_GNU_STACK:    u32 = 0x6474E551;
+val PT_GNU_EH_FRAME: u32 = 0x6474E550;
+val PF_X:            u32 = 1;
+val PF_W:            u32 = 2;
+val PF_R:            u32 = 4;
 
 val R_X86_64_JUMP_SLOT:  u32 = 7;
 val R_AARCH64_JUMP_SLOT: u32 = 1026;
@@ -1325,6 +1327,7 @@ pub fun register(reg: *of.OfRegistry) err[fail.Fail] {
     elf_vtable.default_stack_reserve       = 0;
     elf_vtable.executable_section_location = nil;
     elf_vtable.stub_shape                  = elf_stub_shape;
+    elf_vtable.unwind_shape                = elf_unwind_shape;
 
     elf_vtable.covers_isa_any   = false;
     elf_vtable.covers_isa_count = 0;
@@ -1374,6 +1377,69 @@ fun debug_align(sec: *of.Section) usize {
     ret sec.align::usize;
 }
 
+# `.eh_frame_hdr` and `.eh_frame` for the frame records a link keeps
+fun elf_unwind_shape(arch_id: u32, frames: *of.FrameUnwind, count: u32) res[of.UnwindShape, fail.Fail] {
+    var shape: of.UnwindShape;
+    val fo:    opt[cfi.FrameIsa] = cfi.frame_isa(arch_id);
+    if (sel fo.none) { ret res[of.UnwindShape, fail.Fail].ok{shape}; }
+    var fi: cfi.FrameIsa          = fo.some;
+    val eh: res[usize, fail.Fail] = cfi.eh_frame_bound(?fi, frames, count);
+    if (sel eh.err) { ret res[of.UnwindShape, fail.Fail].err{eh.err}; }
+    shape.index  = of.TableShape{name: ".eh_frame_hdr", size: cfi.eh_frame_hdr_size(count), align: 4};
+    shape.frames = of.TableShape{name: ".eh_frame", size: eh.ok, align: fi.ptr_size};
+    ret res[of.UnwindShape, fail.Fail].ok{shape};
+}
+
+# fills the unwind tables the linker reserved in the code, trims their sections
+# to what they hold and leaves in `hdr` where the search table lies, which a
+# PT_GNU_EH_FRAME names; `hdr` is absent when the image carries no tables
+fun fill_unwind(alloc: *A.Allocator, arch_id: u32, segs: *of.LoadSegment, seg_count: u32,
+    funcs: *of.ExecFunction, func_count: u32, hdr: *cfi.UnwindRoom) err[fail.Fail] {
+    var index:  cfi.UnwindRoom = cfi.unwind_room(segs, seg_count, of.SEC_FLAG_UNWIND_INDEX);
+    var frames: cfi.UnwindRoom = cfi.unwind_room(segs, seg_count, of.SEC_FLAG_UNWIND_FRAMES);
+    hdr.present = false;
+    if (!index.present && !frames.present) { ret err[fail.Fail].ok{}; }
+    if (!index.present || !frames.present) {
+        ret err[fail.Fail].err{fail.message("elf: the linker reserved only one of the two unwind tables")};
+    }
+    val fo: opt[cfi.FrameIsa] = cfi.frame_isa(arch_id);
+    if (sel fo.none) { ret err[fail.Fail].err{fail.message("elf: unwind tables reserved for an architecture cfi cannot describe")}; }
+    var fi: cfi.FrameIsa = fo.some;
+
+    var n:  u32                           = 0;
+    val fr: res[*cfi.UnwindFn, fail.Fail] = cfi.unwind_functions(alloc, segs, seg_count, funcs, func_count, ?n);
+    if (sel fr.err) { ret err[fail.Fail].err{fr.err}; }
+    val fns: *cfi.UnwindFn = fr.ok;
+    fin {
+        if (fns != nil) { A.deallocate[cfi.UnwindFn](alloc, fns, n::usize); }
+    }
+    var offs: *u32 = nil;
+    if (n > 0) {
+        val oa: res[*u32, A.Error] = A.zallocate[u32](alloc, n::usize);
+        if (sel oa.err) { ret err[fail.Fail].err{fail.refused(oa.err)}; }
+        offs = oa.ok;
+    }
+    fin {
+        if (offs != nil) { A.deallocate[u32](alloc, offs, n::usize); }
+    }
+
+    val eh: res[usize, fail.Fail] = cfi.write_eh_frame(?fi, frames.bytes, frames.cap, frames.vaddr, fns, n, offs);
+    if (sel eh.err) { ret err[fail.Fail].err{eh.err}; }
+    val hw: err[fail.Fail] = cfi.write_eh_frame_hdr(index.bytes, index.cap, index.vaddr, frames.vaddr, fns, n, offs);
+    if (sel hw.err) { ret hw; }
+    cfi.unwind_room_trim(segs, ?frames, eh.ok);
+    cfi.unwind_room_trim(segs, ?index, cfi.eh_frame_hdr_size(n));
+    @hdr    = index;
+    hdr.cap = cfi.eh_frame_hdr_size(n);
+    ret err[fail.Fail].ok{};
+}
+
+fun write_eh_frame_phdr(buf: *u8, pos: usize, fp: *plan.FilePlan, seg_rows: *u32, segs: *of.LoadSegment,
+    hdr: *cfi.UnwindRoom) usize {
+    val off: usize = plan.offset(fp, seg_rows[hdr.seg]) + (hdr.vaddr - segs[hdr.seg].vaddr)::usize;
+    ret write_phdr(buf, pos, PT_GNU_EH_FRAME, PF_R, off, hdr.vaddr, hdr.cap, hdr.cap, 4);
+}
+
 fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *of.ObjectTarget, segs: *of.LoadSegment,
     seg_count: u32, page_size: u64, image_base: u64, entry: u64,
     funcs: *of.ExecFunction,
@@ -1388,6 +1454,10 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *of.ObjectTar
     val widths: err[fail.Fail] = validate_class_segments(?lay, segs, seg_count, entry);
     if (sel widths.err) { ret widths; }
 
+    var eh_hdr:  cfi.UnwindRoom;
+    val unwound: err[fail.Fail] = fill_unwind(alloc, tgt_isa.arch_id, segs, seg_count, funcs, func_count, ?eh_hdr);
+    if (sel unwound.err) { ret unwound; }
+
     val sect_count: u32                         = image_section_count(segs, seg_count);
     val sb_r:       res[SymtabBuild, fail.Fail] = build_symtab_bytes(alloc, itn, ?lay, symtab, symtab_count, segs, seg_count);
     if (sel sb_r.err) { ret err[fail.Fail].err{sb_r.err}; }
@@ -1400,7 +1470,8 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *of.ObjectTar
     val map_headers: bool = image_options.mapped_by_loader;
 
     var phdr_count: u32 = seg_count + 1;
-    if (map_headers) { phdr_count = phdr_count + 1; }
+    if (map_headers)    { phdr_count = phdr_count + 1; }
+    if (eh_hdr.present) { phdr_count = phdr_count + 1; }
 
     if (map_headers && !header_fits_reserved_page(?lay, phdr_count, page_size)) {
         ret err[fail.Fail].err{fail.message("elf: static program headers exceed the one-page header reservation (too many load segments)")};
@@ -1445,7 +1516,7 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *of.ObjectTar
         li           = li + 1;
     }
 
-    val has_sht: bool = attr != nil || debug_count > 0 || symtab_count > 0;
+    val has_sht: bool = attr != nil || debug_count > 0 || symtab_count > 0 || eh_hdr.present;
 
     var attr_row:        u32       = plan.NO_ROW;
     var attr_sz:         usize     = 0;
@@ -1606,6 +1677,11 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *of.ObjectTar
     }
     phdr_pos = write_phdr_at(buf, phdr_pos, ?lay, PT_NOTE, PF_R, note_off::u64, note_vaddr, note_vaddr,
         buildid.ELF_NOTE_SIZE::u64, buildid.ELF_NOTE_SIZE::u64, buildid.ELF_NOTE_ALIGN::u64);
+    if (eh_hdr.present) {
+        val eh_off: usize = plan.offset(?fp, seg_rows[eh_hdr.seg]) + (eh_hdr.vaddr - segs[eh_hdr.seg].vaddr)::usize;
+        phdr_pos = write_phdr_at(buf, phdr_pos, ?lay, PT_GNU_EH_FRAME, PF_R, eh_off::u64, eh_hdr.vaddr, eh_hdr.vaddr,
+            eh_hdr.cap::u64, eh_hdr.cap::u64, 4);
+    }
     val phdr_closed: err[fail.Fail] = plan.close(?fp, phdr_row, phdr_pos);
     if (sel phdr_closed.err) { ret phdr_closed; }
 
@@ -2142,8 +2218,12 @@ fun fill_image_section_aux(alloc: *A.Allocator, itn: *intern.Interner, fp: *plan
             }
             aux[w].sh_type = ty.some;
             if ((sec.flags & of.SEC_FLAG_INIT_FUNCS) != 0) { aux[w].sh_type = SHT_INIT_ARRAY; }
-            aux[w].name    = bin.resolve_name(itn, sec.name);
-            aux[w].flags   = section_flags_for(sec.kind);
+            aux[w].name  = bin.resolve_name(itn, sec.name);
+            aux[w].flags = section_flags_for(sec.kind);
+            if ((sec.flags & (of.SEC_FLAG_UNWIND_INDEX | of.SEC_FLAG_UNWIND_FRAMES)) != 0) {
+                aux[w].sh_type = SHT_PROGBITS;
+                aux[w].flags   = SHF_ALLOC;
+            }
             aux[w].addr    = segs[li].vaddr + sec.offset::u64;
             aux[w].off     = seg_off + sec.offset::usize;
             aux[w].size    = sec.len::usize;
@@ -2198,7 +2278,7 @@ fun write_relative_relocs(buf: *u8, fp: *plan.FilePlan, row: u32, rel_type: u32,
 
 fun emit_pie_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *of.ObjectTarget,
     segs: *of.LoadSegment, seg_count: u32, page_size: u64, entry: u64,
-    dyn: *of.DynamicInfo, debug: *of.Section, debug_count: u32,
+    funcs: *of.ExecFunction, func_count: u32, dyn: *of.DynamicInfo, debug: *of.Section, debug_count: u32,
     symtab: *of.SymtabEntry, symtab_count: u32, destination: str,
     image_options: of.ImageOptions) err[fail.Fail] {
     var elay: ElfLayout = layout_for(tgt_isa);
@@ -2207,6 +2287,10 @@ fun emit_pie_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *of.Objec
     }
 
     val nrel: u32 = dyn.base_reloc_count;
+
+    var eh_hdr:  cfi.UnwindRoom;
+    val unwound: err[fail.Fail] = fill_unwind(alloc, tgt_isa.arch_id, segs, seg_count, funcs, func_count, ?eh_hdr);
+    if (sel unwound.err) { ret unwound; }
 
     val sect_count: u32                         = image_section_count(segs, seg_count);
     val sb_r:       res[SymtabBuild, fail.Fail] = build_symtab_bytes(alloc, itn, ?elay, symtab, symtab_count, segs, seg_count);
@@ -2218,7 +2302,9 @@ fun emit_pie_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *of.Objec
 
     var relro_extra: u32 = 0;
     if (pie_relro_seg(segs, seg_count, dyn) >= 0) { relro_extra = 1; }
-    val phdr_count: u32 = seg_count + 4 + relro_extra;
+    var eh_extra: u32 = 0;
+    if (eh_hdr.present) { eh_extra = 1; }
+    val phdr_count: u32 = seg_count + 4 + relro_extra + eh_extra;
 
     if (!header_fits_reserved_page(?elay, phdr_count, page_size)) {
         ret err[fail.Fail].err{fail.message("elf: PIE program headers exceed the one-page header reservation (too many load segments)")};
@@ -2325,7 +2411,7 @@ fun emit_pie_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *of.Objec
     if (sel dyn_closed.err) { ret dyn_closed; }
 
     val phdr_end: usize = write_pie_phdrs(buf, ?fp, phdr_offset, phdr_count, segs, pro.seg_rows, seg_count,
-        pro.note_off, ro_off, ro_va, ro_size, dyn_off, dyn_va, dyn_size, dyn, page_size, false);
+        pro.note_off, ro_off, ro_va, ro_size, dyn_off, dyn_va, dyn_size, dyn, page_size, false, ?eh_hdr);
     val phdr_closed: err[fail.Fail] = plan.close(?fp, pro.phdr_row, phdr_end);
     if (sel phdr_closed.err) { ret phdr_closed; }
 
@@ -2357,7 +2443,7 @@ fun write_pie_phdrs(buf: *u8, fp: *plan.FilePlan, phdr_offset: usize, phdr_count
     segs: *of.LoadSegment, seg_rows: *u32, seg_count: u32, note_off: usize,
     ro_off: usize, ro_va: u64, ro_size: usize,
     dyn_off: usize, dyn_va: u64, dyn_size: usize, dyn: *of.DynamicInfo, page_size: u64,
-    emit_gnu_stack: bool) usize {
+    emit_gnu_stack: bool, eh_hdr: *cfi.UnwindRoom) usize {
     var pos:        usize = phdr_offset;
     val phdr_bytes: usize = phdr_count::usize * PHDR_SIZE;
 
@@ -2394,6 +2480,10 @@ fun write_pie_phdrs(buf: *u8, fp: *plan.FilePlan, phdr_offset: usize, phdr_count
         val relro_size: usize = segs[ri].memsz;
         pos = write_phdr(buf, pos, PT_GNU_RELRO, PF_R, plan.offset(fp, seg_rows[ri]), segs[ri].vaddr,
             relro_size, relro_size, 1);
+    }
+
+    if (eh_hdr != nil && eh_hdr.present) {
+        pos = write_eh_frame_phdr(buf, pos, fp, seg_rows, segs, eh_hdr);
     }
 
     if (emit_gnu_stack) {
@@ -2722,7 +2812,7 @@ fun emit_shared(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *of.ObjectT
     if (sel dyn_closed.err) { ret dyn_closed; }
 
     val phdr_end: usize = write_pie_phdrs(buf, ?fp, phdr_offset, phdr_count, segs, pro.seg_rows, seg_count,
-        pro.note_off, ro_off, ro_va, ro_size, plan.offset(?fp, dyn_row), dyn_va, plan.size(?fp, dyn_row), dyn, page_size, true);
+        pro.note_off, ro_off, ro_va, ro_size, plan.offset(?fp, dyn_row), dyn_va, plan.size(?fp, dyn_row), dyn, page_size, true, nil::*cfi.UnwindRoom);
     val phdr_closed: err[fail.Fail] = plan.close(?fp, pro.phdr_row, phdr_end);
     if (sel phdr_closed.err) { ret phdr_closed; }
 
@@ -2923,7 +3013,7 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *of.Objec
         if (dyn.import_count > 0 || dyn.lib_count > 0) {
             ret err[fail.Fail].err{fail.message("elf: PIE with dynamic imports is not supported (static-PIE only)")};
         }
-        ret emit_pie_exec(alloc, itn, tgt_isa, segs, seg_count, page_size, entry, dyn, debug, debug_count,
+        ret emit_pie_exec(alloc, itn, tgt_isa, segs, seg_count, page_size, entry, funcs, func_count, dyn, debug, debug_count,
             symtab, symtab_count, destination, image_options);
     }
 
@@ -2941,7 +3031,12 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *of.Objec
 
     val hi_va: u64 = highest_vaddr(segs, seg_count);
 
-    val phdr_count: u32 = seg_count + 6;
+    var eh_hdr:  cfi.UnwindRoom;
+    val unwound: err[fail.Fail] = fill_unwind(alloc, tgt_isa.arch_id, segs, seg_count, funcs, func_count, ?eh_hdr);
+    if (sel unwound.err) { ret unwound; }
+
+    var phdr_count: u32 = seg_count + 6;
+    if (eh_hdr.present) { phdr_count = phdr_count + 1; }
 
     if (!header_fits_reserved_page(?elay, phdr_count, page_size)) {
         ret err[fail.Fail].err{fail.message("elf: dynamic-exec program headers exceed the one-page header reservation (too many load segments)")};
@@ -3064,7 +3159,7 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *of.Objec
         tgt_isa.arch_id);
     if (sel import_r.err) { ret import_r; }
 
-    val phdr_end:    usize          = write_dyn_phdrs(buf, ?fp, phdr_offset, ?lay, segs, pro.seg_rows, seg_count, pro.note_off, page_size);
+    val phdr_end:    usize          = write_dyn_phdrs(buf, ?fp, phdr_offset, phdr_count, ?lay, segs, pro.seg_rows, seg_count, pro.note_off, page_size, ?eh_hdr);
     val phdr_closed: err[fail.Fail] = plan.close(?fp, pro.phdr_row, phdr_end);
     if (sel phdr_closed.err) { ret phdr_closed; }
 
@@ -3710,15 +3805,16 @@ fun func_ordinal(dyn: *of.DynamicInfo, import_index: u32) u32 {
     ret n;
 }
 
-fun write_dyn_phdrs(buf: *u8, fp: *plan.FilePlan, phdr_offset: usize, lay: *DynLayout,
-    segs: *of.LoadSegment, seg_rows: *u32, seg_count: u32, note_off: usize, page_size: u64) usize {
+fun write_dyn_phdrs(buf: *u8, fp: *plan.FilePlan, phdr_offset: usize, phdr_count: u32, lay: *DynLayout,
+    segs: *of.LoadSegment, seg_rows: *u32, seg_count: u32, note_off: usize, page_size: u64,
+    eh_hdr: *cfi.UnwindRoom) usize {
     var pos: usize = phdr_offset;
 
     var hdr_vaddr: u64 = 0;
     if (seg_count > 0) { hdr_vaddr = header_segment_vaddr(segs[0].vaddr, page_size); }
 
     pos = write_phdr(buf, pos, PT_PHDR, PF_R, phdr_offset, hdr_vaddr + phdr_offset::u64,
-        phdr_count_bytes(seg_count), phdr_count_bytes(seg_count), 8);
+        phdr_count::usize * PHDR_SIZE, phdr_count::usize * PHDR_SIZE, 8);
     buildid.write_elf_note_header(buf, note_off);
     pos = write_note_phdr(buf, pos, note_off, hdr_vaddr + note_off::u64);
 
@@ -3746,11 +3842,10 @@ fun write_dyn_phdrs(buf: *u8, fp: *plan.FilePlan, phdr_offset: usize, lay: *DynL
 
     pos = write_phdr(buf, pos, PT_DYNAMIC, PF_R | PF_W, lay.dynamic_off, lay.dynamic_va,
         lay.dynamic_size, lay.dynamic_size, 8);
+    if (eh_hdr.present) {
+        pos = write_eh_frame_phdr(buf, pos, fp, seg_rows, segs, eh_hdr);
+    }
     ret pos;
-}
-
-fun phdr_count_bytes(seg_count: u32) usize {
-    ret (seg_count + 6)::usize * PHDR_SIZE;
 }
 
 fun write_phdr(buf: *u8, pos: usize, p_type: u32, flags: u32, off: usize, vaddr: u64,
@@ -7189,8 +7284,8 @@ fun t_planned_emit_pie_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa:
     dyn: *of.DynamicInfo, debug: *of.Section, debug_count: u32,
     symtab: *of.SymtabEntry, symtab_count: u32, path: *u8,
     image_options: of.ImageOptions) err[fail.Fail] {
-    if (path == nil) { ret emit_pie_exec(alloc, itn, tgt_isa, segs, seg_count, page_size, entry, dyn, debug, debug_count, symtab, symtab_count, nil, image_options); }
-    ret emit_pie_exec(alloc, itn, tgt_isa, segs, seg_count, page_size, entry, dyn, debug, debug_count, symtab, symtab_count, path::str, image_options);
+    if (path == nil) { ret emit_pie_exec(alloc, itn, tgt_isa, segs, seg_count, page_size, entry, nil::*of.ExecFunction, 0, dyn, debug, debug_count, symtab, symtab_count, nil, image_options); }
+    ret emit_pie_exec(alloc, itn, tgt_isa, segs, seg_count, page_size, entry, nil::*of.ExecFunction, 0, dyn, debug, debug_count, symtab, symtab_count, path::str, image_options);
 }
 
 #[testing]
