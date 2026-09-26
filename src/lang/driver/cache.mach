@@ -172,11 +172,11 @@ pub fun snapshot(scratch: *A.Allocator, p: *project.Project, config: *u8, config
 }
 
 use mach.lang.build.cache.compiler;
-use codec: mach.lang.build.cache.image;
-use mach.lang.build.cache.store;
+use cache_record: mach.lang.build.cache.record;
 use mach.lang.build.outcome;
 use mach.lang.me.ir;
 use mach.lang.me.lower.testrunner;
+use mach.lang.output;
 use mach.lang.query;
 use mach.lang.readout;
 use mach.lang.session;
@@ -184,9 +184,7 @@ use mach.lang.target.isa;
 use mach.lang.target.of;
 use std.allocator.page;
 use std.collections.vector;
-use fs:       std.filesystem;
-use io_error: std.io.error;
-use std.system.os;
+use fs: std.filesystem;
 use std.text.string.str_free;
 use std.types.bool.true;
 use std.types.path;
@@ -234,11 +232,20 @@ pub fun prepare(p: *project.Project, snapshot: *[32]u8) err[fail.Fail] {
     if (snapshot == nil || !p.req.object_cache) { ret err[fail.Fail].ok{}; }
     p.cache_snapshot = @snapshot;
     discard_stale(p);
-    ret open_directory(p);
+    p.cache_ready = objects_cached(p);
+    ret err[fail.Fail].ok{};
+}
+
+# `obj/` is the object cache when the build writes its modules there as
+# relocatable objects the target's format reads back
+fun objects_cached(p: *project.Project) bool {
+    val vt: *of.OfVTable = p.target.of;
+    ret p.object_dir != nil && vt != nil && !vt.produces_image
+        && vt.emit_object != nil && vt.parse_object != nil;
 }
 
 # a module's cache verdict and staged product belong to the snapshot they were
-# taken under; a new snapshot asks the store again
+# taken under; a new snapshot reads the object again
 fun discard_stale(p: *project.Project) {
     var i: u32 = 0;
     for (i < project.module_count(p)) {
@@ -248,43 +255,26 @@ fun discard_stale(p: *project.Project) {
     }
 }
 
-fun open_directory(p: *project.Project) err[fail.Fail] {
-    var backing: A.Allocator;
-    val make_r:  err[A.Error] = page.make(?backing);
-    if (sel make_r.err) { ret err[fail.Fail].err{fail.message("cache scratch allocator is unavailable")}; }
-    val root: opt[str] = intern.lookup(?p.s.interner, p.config.home_root);
-    val out:  opt[str] = intern.lookup(?p.s.interner, p.config.project_out);
-    if (sel root.none) { ret err[fail.Fail].err{fail.message("cache directory has no resolved output root")}; }
-    if (sel out.none)  { ret err[fail.Fail].err{fail.message("cache directory has no resolved output root")}; }
-    val output_path: res[str, A.Error] = path.resolve(?backing, root.some, out.some);
-    if (sel output_path.err) { ret err[fail.Fail].err{fail.refused(output_path.err)}; }
-    val output: str = output_path.ok;
-    fin { str_free(?backing, output); }
-    val directory: res[str, A.Error] = path.join(p.alloc, output, ".mach-cache");
-    if (sel directory.err) { ret err[fail.Fail].err{fail.refused(directory.err)}; }
-    val made: i64 = os.make_dir(os.working_dir(), directory.ok, 0o700);
-    if (store.memory_exhausted(made)) {
-        str_free(p.alloc, directory.ok);
-        ret err[fail.Fail].err{fail.message("out of memory creating cache directory")};
-    }
-    if (made < 0 && os.error_kind(made) != io_error.EXISTS) {
-        str_free(p.alloc, directory.ok);
-        ret err[fail.Fail].ok{};
-    }
-    p.cache_dir   = directory.ok;
-    p.cache_ready = true;
-    ret err[fail.Fail].ok{};
+# where the build writes module m's object: `obj/<project>/<module path>.<ext>`
+pub fun object_path(p: *project.Project, m: *project.ModuleEntry, a: *A.Allocator) res[str, fail.Fail] {
+    if (p.object_dir == nil || p.target.of == nil) { ret res[str, fail.Fail].err{fail.message("the build has no object directory")}; }
+    val fqn: opt[str] = intern.lookup(?p.s.interner, m.fqn);
+    if (sel fqn.none) { ret res[str, fail.Fail].err{fail.message("module FQN not interned")}; }
+    val named: res[str, outcome.Fail] = output.mirror_fqn(a, p.object_dir, fqn.some, p.target.of.object_ext);
+    if (sel named.err) { ret res[str, fail.Fail].err{fail.message(outcome.describe(named.err))}; }
+    ret res[str, fail.Fail].ok{named.ok};
 }
 
-# a module whose object the store holds skips lowering when nothing else needs
-# its ir: the ir and asm emitters read it, and a whole-module backend reads
-# every referenced module's ir while generating one object
+# a module whose object is cached skips lowering when nothing else needs its
+# ir: the ir and asm emitters read it, and a whole-module backend reads every
+# referenced module's ir while generating one object
 pub fun early_restore_enabled(p: *project.Project) bool {
     ret p.req.object_cache && !p.req.emit_ir && !p.req.emit_asm && !isa.emits_whole_module(p.target.isa);
 }
 
-# the module's codegen product came from the store under the current snapshot,
-# whether it is still staged or a query already took it: the module does not lower
+# the module's codegen product is its cached object under the current
+# snapshot, whether it is still staged or a query already took it: the module
+# does not lower, and its object is already in `obj/`
 pub fun restored(p: *project.Project, m: *project.ModuleEntry) bool {
     ret m.cache_hit && key.equal(?m.cache_under, ?p.cache_snapshot);
 }
@@ -294,15 +284,47 @@ pub fun staged_restored(p: *project.Project, m: *project.ModuleEntry) bool {
     ret m.staged_image != nil && restored(p, m);
 }
 
-fun remember(p: *project.Project, digest: *[32]u8) err[fail.Fail] {
-    val pushed: res[usize, A.Error] = vector.push[project.CacheKey](?p.cache_keys, project.CacheKey{bytes: @digest});
-    if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
-    ret err[fail.Fail].ok{};
+# an object read back from `obj/` with the facts its record carries
+pub rec Cached {
+    image: of.ObjectImage;
+    facts: cache_record.Facts;
 }
 
-fun protected_keys(p: *project.Project) *[32]u8 {
-    if (p.cache_keys.len == 0) { ret nil; }
-    ret ?p.cache_keys.data[0].bytes;
+# the object at `location` when its record says it was built under `expected`,
+# none on a miss: an object that is missing, unreadable, carries no record or
+# a damaged one, or was built under another key is rebuilt, never reused.
+# err only when allocation fails
+pub fun read(p: *project.Project, location: str, expected: *[32]u8) res[opt[Cached], fail.Fail] {
+    var backing: A.Allocator;
+    val make_r:  err[A.Error] = page.make(?backing);
+    if (sel make_r.err) { ret res[opt[Cached], fail.Fail].err{fail.message("cache scratch allocator is unavailable")}; }
+    val loaded: res[vector.Vector[u8], fs.FsError] = fs.read_bytes(?backing, location);
+    if (sel loaded.err) { ret res[opt[Cached], fail.Fail].ok{opt[Cached].none{}}; }
+    var bytes: vector.Vector[u8] = loaded.ok;
+    fin { vector.dnit[u8](?bytes); }
+    var image:  of.ObjectImage = of.object_image_init(p.s.alloc, ?p.s.interner, intern.STR_NIL);
+    val parsed: err[fail.Fail] = p.target.of.parse_object(p.s.alloc, ?p.s.interner, bytes.data, bytes.len, ?image);
+    if (sel parsed.err) { ret res[opt[Cached], fail.Fail].ok{opt[Cached].none{}}; }
+    val decoded: res[opt[cache_record.Record], fail.Fail] = cache_record.decode(p.s.alloc, ?p.s.interner,
+        image.cache_record, image.cache_record_len::usize);
+    if (sel decoded.err) {
+        of.object_image_dnit(?image);
+        ret res[opt[Cached], fail.Fail].err{decoded.err};
+    }
+    if (sel decoded.ok.none) {
+        of.object_image_dnit(?image);
+        ret res[opt[Cached], fail.Fail].ok{opt[Cached].none{}};
+    }
+    var found: cache_record.Record = decoded.ok.some;
+    if (!key.equal(?found.key, expected)) {
+        cache_record.facts_dnit(p.s.alloc, ?found.facts);
+        of.object_image_dnit(?image);
+        ret res[opt[Cached], fail.Fail].ok{opt[Cached].none{}};
+    }
+    A.deallocate[u8](image.alloc, image.cache_record, image.cache_record_len::usize);
+    image.cache_record     = nil;
+    image.cache_record_len = 0;
+    ret res[opt[Cached], fail.Fail].ok{opt[Cached].some{Cached{image: image, facts: found.facts}}};
 }
 
 # a hit is reported under the readout phase ph that asked for the module
@@ -318,45 +340,33 @@ pub fun restore(p: *project.Project, mid: session.ModuleId, ph: u8) res[bool, fa
     var backing:   A.Allocator;
     val make_r:    err[A.Error]    = page.make(?backing);
     if (sel make_r.err) { ret res[bool, fail.Fail].err{fail.message("cache scratch allocator is unavailable")}; }
-    var digest: [32]u8;
-    val keyed:  err[fail.Fail] = key.object(?p.cache_snapshot, project.fqn_name(p, m.fqn), ?digest);
+    var expected: [32]u8;
+    val keyed:    err[fail.Fail] = key.object(?p.cache_snapshot, project.fqn_name(p, m.fqn), ?expected);
     if (sel keyed.err) { ret res[bool, fail.Fail].err{keyed.err}; }
-    val found: res[store.Lookup, store.Error] = store.read(?backing, p.cache_dir, ?digest);
-    if (sel found.err) { ret res[bool, fail.Fail].err{fail.message(found.err.message)}; }
-    var entry: store.Lookup = found.ok;
-    fin { vector.dnit[u8](?entry.bytes); }
-    if (entry.status.kind != store.HIT) {
-        if (entry.status.kind == store.UNAVAILABLE) { p.cache_ready = false; }
+    val located: res[str, fail.Fail] = object_path(p, m, ?backing);
+    if (sel located.err) { ret res[bool, fail.Fail].err{located.err}; }
+    val found: res[opt[Cached], fail.Fail] = read(p, located.ok, ?expected);
+    str_free(?backing, located.ok);
+    if (sel found.err) { ret res[bool, fail.Fail].err{found.err}; }
+    if (sel found.ok.none) {
         p.cache_misses = p.cache_misses + 1;
         ret res[bool, fail.Fail].ok{false};
     }
-    val decoded: res[codec.Product, codec.Error] = codec.decode(p.s.alloc, ?p.s.interner, entry.bytes.data, entry.bytes.len);
-    if (sel decoded.err) {
-        val error: codec.Error = decoded.err;
-        if (error.kind == codec.INTERNAL) { ret res[bool, fail.Fail].err{fail.message(error.message)}; }
-        p.cache_misses = p.cache_misses + 1;
-        ret res[bool, fail.Fail].ok{false};
-    }
-    var product: codec.Product = decoded.ok;
-    if (product.image.name != m.fqn) {
-        codec.product_dnit(?product);
-        p.cache_misses = p.cache_misses + 1;
-        ret res[bool, fail.Fail].ok{false};
-    }
-    val boxed: res[*of.ObjectImage, A.Error] = A.allocate[of.ObjectImage](p.s.alloc, 1);
+    var cached: Cached                        = found.ok.some;
+    val boxed:  res[*of.ObjectImage, A.Error] = A.allocate[of.ObjectImage](p.s.alloc, 1);
     if (sel boxed.err) {
-        codec.product_dnit(?product);
+        cache_record.facts_dnit(p.s.alloc, ?cached.facts);
+        of.object_image_dnit(?cached.image);
         ret res[bool, fail.Fail].err{fail.refused(boxed.err)};
     }
     val box: *of.ObjectImage = boxed.ok;
-    @box = product.image;
-    codec.facts_dnit(p.s.alloc, ?m.staged_facts);
+    @box     = cached.image;
+    box.name = m.fqn;
+    cache_record.facts_dnit(p.s.alloc, ?m.staged_facts);
     m.staged_image = box;
-    m.staged_facts = product.facts;
+    m.staged_facts = cached.facts;
     m.cache_hit    = true;
-    val remembered: err[fail.Fail] = remember(p, ?digest);
-    if (sel remembered.err) { ret res[bool, fail.Fail].err{remembered.err}; }
-    p.cache_hits = p.cache_hits + 1;
+    p.cache_hits   = p.cache_hits + 1;
     readout.item(p.events, ph, "cached object", t_restore);
     ret res[bool, fail.Fail].ok{true};
 }
@@ -379,15 +389,15 @@ pub fun collect_tests(p: *project.Project, m: *project.ModuleEntry, mid: u32, c:
     if (m.ir_module != nil) { ret testrunner.collect_module(p.s, c, m.ir_module, mid); }
     var i: u32 = 0;
     for (i < m.staged_facts.test_count) {
-        val f:      *codec.TestFact = ?m.staged_facts.tests[i];
-        val pushed: err[fail.Fail]  = testrunner.push(p.s, c, testrunner.Test{linkage: f.linkage, label: f.label, line: f.line, mod_idx: mid});
+        val f:      *cache_record.TestFact = ?m.staged_facts.tests[i];
+        val pushed: err[fail.Fail]         = testrunner.push(p.s, c, testrunner.Test{linkage: f.linkage, label: f.label, line: f.line, mod_idx: mid});
         if (sel pushed.err) { ret pushed; }
         i = i + 1;
     }
     ret err[fail.Fail].ok{};
 }
 
-fun gather_facts(scratch: *A.Allocator, irmod: *ir.Module, facts: *codec.Facts) err[fail.Fail] {
+fun gather_facts(scratch: *A.Allocator, irmod: *ir.Module, facts: *cache_record.Facts) err[fail.Fail] {
     facts.scalarized = irmod.vector_ops_scalarized;
     var tests: u32 = 0;
     var i:     u32 = 0;
@@ -396,7 +406,7 @@ fun gather_facts(scratch: *A.Allocator, irmod: *ir.Module, facts: *codec.Facts) 
         i = i + 1;
     }
     if (tests == 0) { ret err[fail.Fail].ok{}; }
-    val allocated: res[*codec.TestFact, A.Error] = A.allocate[codec.TestFact](scratch, tests::usize);
+    val allocated: res[*cache_record.TestFact, A.Error] = A.allocate[cache_record.TestFact](scratch, tests::usize);
     if (sel allocated.err) { ret err[fail.Fail].err{fail.refused(allocated.err)}; }
     facts.tests      = allocated.ok;
     facts.test_count = tests;
@@ -405,7 +415,7 @@ fun gather_facts(scratch: *A.Allocator, irmod: *ir.Module, facts: *codec.Facts) 
     for (i < irmod.function_len) {
         val fn: *ir.Function = ?irmod.functions[i];
         if ((fn.flags & ir.FN_FLAG_TEST) != 0) {
-            facts.tests[n] = codec.TestFact{linkage: fn.name, label: fn.label, line: fn.line};
+            facts.tests[n] = cache_record.TestFact{linkage: fn.name, label: fn.label, line: fn.line};
             n              = n + 1;
         }
         i = i + 1;
@@ -413,6 +423,8 @@ fun gather_facts(scratch: *A.Allocator, irmod: *ir.Module, facts: *codec.Facts) 
     ret err[fail.Fail].ok{};
 }
 
+# a generated image carries its record into `obj/`: the key it was built
+# under and the facts its lowered ir holds
 pub fun publish(p: *project.Project, m: *project.ModuleEntry, image: *of.ObjectImage) err[fail.Fail] {
     if (!operation_active(p))          { ret err[fail.Fail].err{fail.message("cache publication requires the current query operation")}; }
     if (!p.cache_ready || m.cache_hit) { ret err[fail.Fail].ok{}; }
@@ -420,29 +432,21 @@ pub fun publish(p: *project.Project, m: *project.ModuleEntry, image: *of.ObjectI
     var backing: A.Allocator;
     val make_r:  err[A.Error] = page.make(?backing);
     if (sel make_r.err) { ret err[fail.Fail].err{fail.message("cache scratch allocator is unavailable")}; }
-    var facts: codec.Facts = codec.Facts{};
-    fin { codec.facts_dnit(?backing, ?facts); }
+    var facts: cache_record.Facts = cache_record.Facts{};
+    fin { cache_record.facts_dnit(?backing, ?facts); }
     val gathered: err[fail.Fail] = gather_facts(?backing, m.ir_module, ?facts);
     if (sel gathered.err) { ret gathered; }
-    val encoded: res[vector.Vector[u8], codec.Error] = codec.encode(?backing, image, ?facts);
-    if (sel encoded.err) {
-        val error: codec.Error = encoded.err;
-        if (error.kind == codec.LIMIT) { ret err[fail.Fail].ok{}; }
-        ret err[fail.Fail].err{fail.message(error.message)};
-    }
-    var bytes: vector.Vector[u8] = encoded.ok;
-    fin { vector.dnit[u8](?bytes); }
     var digest: [32]u8;
     val keyed:  err[fail.Fail] = key.object(?p.cache_snapshot, project.fqn_name(p, m.fqn), ?digest);
     if (sel keyed.err) { ret keyed; }
-    val stored: res[store.Status, store.Error] = store.publish(?backing, p.cache_dir, ?digest, bytes.data, bytes.len,
-        protected_keys(p), p.cache_keys.len);
-    if (sel stored.err) { ret err[fail.Fail].err{fail.message(stored.err.message)}; }
-    if (stored.ok.kind == store.UNAVAILABLE) {
-        p.cache_ready = false;
-        ret err[fail.Fail].ok{};
-    }
-    ret remember(p, ?digest);
+    var bytes:   *u8            = nil;
+    var len:     u32            = 0;
+    val encoded: err[fail.Fail] = cache_record.encode(image.alloc, image.interner, ?digest, ?facts, ?bytes, ?len);
+    if (sel encoded.err)           { ret encoded; }
+    if (image.cache_record != nil) { A.deallocate[u8](image.alloc, image.cache_record, image.cache_record_len::usize); }
+    image.cache_record     = bytes;
+    image.cache_record_len = len;
+    ret err[fail.Fail].ok{};
 }
 
 fun t_append_module(p: *project.Project, m: project.ModuleEntry) bool {
@@ -652,18 +656,18 @@ fun t_boxed_image(s: *session.Session) *of.ObjectImage {
     ret staged;
 }
 
+fun t_emit(tgt: *of.ObjectTarget, img: *of.ObjectImage, destination: str) err[fail.Fail] {
+    ret err[fail.Fail].err{fail.message("test format writes nothing")};
+}
+
+fun t_parse(a: *A.Allocator, itn: *intern.Interner, bytes: *u8, len: usize, out: *of.ObjectImage) err[fail.Fail] {
+    ret err[fail.Fail].err{fail.message("test format reads nothing")};
+}
+
 test "mach.lang.driver.cache:operation_reset_keeps_restored_products_under_their_snapshot_and_drops_fresh_ones" {
     var a:      A.Allocator;
     val make_r: err[A.Error] = page.make(?a);
     if (sel make_r.err) { ret 1; }
-    val temporary: res[fs.TempFile, fs.FsError] = fs.temp_create(?a, "mach-cache-ops");
-    if (sel temporary.err) { ret 1; }
-    var temp: fs.TempFile = temporary.ok;
-    fin { str_free(?a, temp.path); }
-    val temp_close_and_remove_r: err[io_error.Error] = fs.temp_close_and_remove(?temp);
-    if (sel temp_close_and_remove_r.err)                     { ret 1; }
-    if (os.make_dir(os.working_dir(), temp.path, 0o700) < 0) { ret 1; }
-    fin { fs.remove_all(?a, temp.path); }
     val initialized: res[session.Session, fail.Fail] = session.init(?a);
     if (sel initialized.err) { ret 2; }
     var s: session.Session = initialized.ok;
@@ -675,20 +679,12 @@ test "mach.lang.driver.cache:operation_reset_keeps_restored_products_under_their
         project.dnit_project(?p);
     }
     if (!t_append_module(?p, project.ModuleEntry{}) || !t_append_module(?p, project.ModuleEntry{})) { ret 2; }
-    val m0:      *project.ModuleEntry       = project.module_at(?p, 0);
-    val m1:      *project.ModuleEntry       = project.module_at(?p, 1);
-    val root_id: res[intern.StrId, A.Error] = intern.intern(?s.interner, temp.path);
-    val out_id:  res[intern.StrId, A.Error] = intern.intern(?s.interner, "out");
-    if (sel root_id.err) { ret 2; }
-    if (sel out_id.err)  { ret 2; }
-    p.config.project_root = root_id.ok;
-    p.config.home_root    = root_id.ok;
-    p.config.project_out  = out_id.ok;
-    val out_dir: res[str, A.Error] = path.join(?a, temp.path, "out");
-    if (sel out_dir.err) { ret 2; }
-    val created: err[fs.FsError] = fs.create_dir_all(?a, out_dir.ok, 0o700);
-    str_free(?a, out_dir.ok);
-    if (sel created.err) { ret 2; }
+    val m0: *project.ModuleEntry = project.module_at(?p, 0);
+    val m1: *project.ModuleEntry = project.module_at(?p, 1);
+    # a relocatable format the cache can read back, and the cell's obj directory
+    var vt: of.OfVTable = of.linker_vtable(1, "test", "o", t_emit, t_parse, nil);
+    p.target.of                     = ?vt;
+    p.object_dir                    = "out/obj";
     p.req.object_cache              = true;
     p.compiler_identity_initialized = true;
     p.compiler_identity_available   = false;
@@ -702,7 +698,7 @@ test "mach.lang.driver.cache:operation_reset_keeps_restored_products_under_their
     if (!p.cache_initialized || p.cache_ready) { ret 4; }
     val finished_disabled: err[outcome.Fail] = project.finish_query_phase(?p, first, nil, 0, err[outcome.Fail].ok{});
     if (sel finished_disabled.err) { ret 4; }
-    # a snapshot: the directory opens and the store is ready
+    # a snapshot: the cache is ready to read `obj/`
     var snapshot_a: [32]u8;
     var snapshot_b: [32]u8;
     snapshot_a[0] = 37;
@@ -711,8 +707,8 @@ test "mach.lang.driver.cache:operation_reset_keeps_restored_products_under_their
     if (sel second_r.err) { ret 5; }
     val second:   query.Operation = second_r.ok;
     val prepared: err[fail.Fail]  = prepare(?p, ?snapshot_a);
-    if (sel prepared.err)                                                  { ret 5; }
-    if (!p.cache_ready || p.cache_snapshot[0] != 37 || p.cache_dir == nil) { ret 5; }
+    if (sel prepared.err)                            { ret 5; }
+    if (!p.cache_ready || p.cache_snapshot[0] != 37) { ret 5; }
     p.cache_hits   = 2;
     p.cache_misses = 3;
     # module 0 holds a product restored under snapshot a; module 1 a fresh image a worker staged
@@ -736,7 +732,7 @@ test "mach.lang.driver.cache:operation_reset_keeps_restored_products_under_their
     if (m0.staged_image != restored || !m0.cache_hit || !m0.cache_checked
         || m1.staged_image != nil || m0.object_image != ?borrowed
         || p.cache_ready || p.cache_initialized || p.cache_operation_sequence != 0
-        || p.cache_hits != 2 || p.cache_misses != 3 || p.cache_dir != nil) { ret 9; }
+        || p.cache_hits != 2 || p.cache_misses != 3) { ret 9; }
     val prepare_r3: err[fail.Fail] = prepare(?p, ?snapshot_a);
     if (sel prepare_r3.ok) { ret 10; }
     val restore_r: res[bool, fail.Fail] = restore(?p, 0, readout.PH_CACHE);
@@ -760,7 +756,7 @@ test "mach.lang.driver.cache:operation_reset_keeps_restored_products_under_their
     val ended_third: err[outcome.Fail] = project.finish_query_phase(?p, third, nil, 0, err[outcome.Fail].ok{});
     if (sel ended_third.err)    { ret 13; }
     if (m0.staged_image == nil) { ret 13; }
-    # a different snapshot discards it and forgets the verdict: the store is asked again
+    # a different snapshot discards it and forgets the verdict: the object is read again
     val fourth_r: res[query.Operation, outcome.Fail] = project.begin_query_phase(?p);
     if (sel fourth_r.err) { ret 14; }
     val fourth:         query.Operation = fourth_r.ok;

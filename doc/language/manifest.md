@@ -1152,6 +1152,20 @@ after the module's path (`src/window.mach` in project `glfw` becomes
 objects by name, and because the link takes whichever file survived, the result is
 a binary that is subtly wrong rather than a build that fails.
 
+**The object tree is the object cache.** Under `--cache` a module whose object in
+`obj/` was built under the same key is reused as it is: the module is neither
+lowered nor generated again. The key is the one the module is built under (the
+compiler identity, the build configuration and the sources the module's cell
+reads), and each object carries it in a section no link loads: `.mach.cache` on
+ELF (not allocated) and COFF (`IMAGE_SCN_LNK_INFO | IMAGE_SCN_LNK_REMOVE`), and
+`__MACH,__mach_cache` on Mach-O (debug-attributed). The parser consumes it, so an
+object links exactly as it would without it. An object that is missing, has no
+key, a damaged one or another key is rebuilt, never linked stale. `obj/` holds one
+object per module, the latest, and each object is written to a sibling temporary
+and renamed into place, so an interrupted build leaves the previous object or the
+new one, never a torn file. `--no-cache` ignores the tree, and `mach clean` removes
+it with the rest of the output.
+
 A step output is therefore rejected in that subtree. A declared `out` inside it
 fails at manifest load, naming the step and the path, before any step runs. A step
 that writes an object there without declaring it is caught after it runs, with the
