@@ -132,10 +132,10 @@ pub val Q_LOAD_VIEW:         QueryKind = 20
 pub val Q_INLINE_BODIES:     QueryKind = 21
 ```
 
-## val Q_CELL_SNAPSHOT
+## val Q_OBJECT_KEY
 
 ```mach
-pub val Q_CELL_SNAPSHOT:     QueryKind = 22
+pub val Q_OBJECT_KEY:        QueryKind = 22
 ```
 
 ## def KeyOwner
