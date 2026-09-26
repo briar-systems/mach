@@ -104,10 +104,11 @@ pub fun resolve(reg: *TargetRegistry, req: *TargetRequest) res[resolved.Target, 
 ## val TARGET_FINGERPRINT_VERSION
 
 ```mach
-pub val TARGET_FINGERPRINT_VERSION: u8 = 4
+pub val TARGET_FINGERPRINT_VERSION: u8 = 5
 ```
 
-version 4: the model's extension set is a 64-bit field of the isa's own vocabulary
+version 5: the image domain carries the register argument alignment the os
+declares (#3922)
 
 ## fun fingerprint
 
