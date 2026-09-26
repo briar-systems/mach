@@ -318,6 +318,33 @@ pub fun own_work_tree(alloc: *A.Allocator, dep_full: str) bool;
 pub fun checkout_head(s: *session.Session, dep_full: str) res[str, outcome.Fail];
 ```
 
+## fun selection_commit
+
+```mach
+pub fun selection_commit(s: *session.Session, root: str, id: str, dep_full: str, ref: str,
+advance: bool, offline: bool) res[str, outcome.Fail];
+```
+
+the commit the fixed selector `ref` picks in the checkout at dep_full: a commit or a tag as
+named, and a branch at dep/<id>'s pin unless `advance` moves it, then at its fetched tip. a
+revision the checkout lacks is fetched, which `offline` refuses; the caller frees the result
+
+## fun manifest_at
+
+```mach
+pub fun manifest_at(alloc: *A.Allocator, dir: str, rev: str) res[toml.Table, outcome.Fail];
+```
+
+the manifest the commit `rev` of the repository at `dir` holds, allocated from `alloc`
+
+## fun gitlink_at
+
+```mach
+pub fun gitlink_at(s: *session.Session, dir: str, rev: str, id: str) res[opt[str], outcome.Fail];
+```
+
+the gitlink the tree of the commit `rev` in the repository at `dir` records for dep/<id>
+
 ## fun release_at_pin
 
 ```mach
