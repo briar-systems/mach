@@ -89,7 +89,7 @@ the memo stored at `file`, empty when there is none or it cannot be read
 ## fun store
 
 ```mach
-pub fun store(m: *Memo, file: str) err[outcome.Fail];
+pub fun store(m: *Memo, out_dir: str, file: str) err[outcome.Fail];
 ```
 
 write the memo to `file` through a sibling temporary when it changed
