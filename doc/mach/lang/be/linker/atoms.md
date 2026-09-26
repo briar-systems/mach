@@ -109,6 +109,16 @@ symbol_name: intern.StrId, sec_base: *u32,
 atoms: *AtomPlan) bool;
 ```
 
+## fun has_got_reloc
+
+```mach
+pub fun has_got_reloc(modules: *of.ObjectImage, module_count: u32,
+symbol_name: intern.StrId, sec_base: *u32,
+atoms: *AtomPlan) bool;
+```
+
+a live relocation loads the symbol's address from a GOT slot
+
 ## fun lt_isa
 
 ```mach
