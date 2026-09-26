@@ -749,6 +749,12 @@ pub val LOWER_ASM:         LowerRoute = 18
 pub val LOWER_CBR:         LowerRoute = 19
 ```
 
+## val LOWER_MASK
+
+```mach
+pub val LOWER_MASK:        LowerRoute = 20
+```
+
 ## val OP_MAX_FIXED_OPERANDS
 
 ```mach
@@ -764,7 +770,7 @@ pub rec IrOpDescriptor;
 ## val IR_OP_DESCRIPTOR_COUNT
 
 ```mach
-pub val IR_OP_DESCRIPTOR_COUNT: usize = 57
+pub val IR_OP_DESCRIPTOR_COUNT: usize = 58
 ```
 
 ## fun is_known

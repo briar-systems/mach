@@ -106,9 +106,9 @@ than the source alone, so they are reported at lowering:
   loop over the dividend's bits
 - a secret **variable shift count** on a target without a barrel shifter. Where
   it is admitted, the saturation of a count at or above the operand width
-  ([operators.md](operators.md#bitwise)) is a compare, a negate and a mask on
-  the count and the result, with no branch, so it reveals nothing the shift
-  itself would not
+  ([operators.md](operators.md#bitwise)) is a compare to an all-ones-or-zero
+  mask and a mask on the count and the value, with no branch, so it reveals
+  nothing the shift itself would not
 
 A secret value passed to a variadic pack is also rejected, including a secret
 wrapped inside an aggregate.
