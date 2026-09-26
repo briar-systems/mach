@@ -24,15 +24,21 @@ pub rec Record;
 pub fun facts_dnit(alloc: *A.Allocator, f: *Facts);
 ```
 
+## fun record_dnit
+
+```mach
+pub fun record_dnit(alloc: *A.Allocator, r: *Record);
+```
+
 ## fun encode
 
 ```mach
 pub fun encode(alloc: *A.Allocator, itn: *intern.Interner, key: *[32]u8, facts: *Facts,
-out_bytes: **u8, out_len: *u32) err[fail.Fail];
+image: *of.ObjectImage, out_bytes: **u8, out_len: *u32) err[fail.Fail];
 ```
 
-the record for an object built under `key` whose module lowered to `facts`;
-the caller owns the bytes, allocated in alloc
+the record for an object built under `key` whose module lowered to `facts`
+and generated `image`; the caller owns the bytes, allocated in alloc
 
 ## fun decode
 
