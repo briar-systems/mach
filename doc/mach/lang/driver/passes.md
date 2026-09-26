@@ -228,12 +228,6 @@ pub fun acquire_test_inputs(p: *project.Project) err[outcome.Fail];
 the test operation's inputs: the typed definitions and each test object's
 lowered ir, unless the load restored its object from `obj/`
 
-## fun run_test_pass
-
-```mach
-pub fun run_test_pass(p: *project.Project) err[outcome.Fail];
-```
-
 ## fun run_test_object_pass
 
 ```mach
@@ -331,16 +325,6 @@ pub fun q_link_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags
 ```mach
 pub fun capture_build_config(p: *project.Project, alloc: *A.Allocator) res[query.QueryOutput, fail.Fail];
 ```
-
-## fun capture_build_identity
-
-```mach
-pub fun capture_build_identity(p: *project.Project, alloc: *A.Allocator) res[query.QueryOutput, fail.Fail];
-```
-
-the configuration without the planner environment: what a persistent product
-may key on. steps that ran are keyed by their own fingerprint chain, and the
-inherited environment reaches an object only through them.
 
 ## fun capture_configuration_identity
 

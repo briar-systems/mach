@@ -12,12 +12,6 @@ pub fun classify_subprocess(term: *subprocess.SubprocessTerminal, expired: bool,
 pub fun classify_setup_failure() validation.ValidationGateResult;
 ```
 
-## fun classify_timeout
-
-```mach
-pub fun classify_timeout() validation.ValidationGateResult;
-```
-
 ## fun classify_wait_failure
 
 ```mach

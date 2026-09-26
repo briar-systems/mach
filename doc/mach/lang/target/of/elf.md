@@ -150,12 +150,6 @@ pub val R_RISCV_32:           u32 = 1
 pub val R_RISCV_64:           u32 = 2
 ```
 
-## val R_RISCV_BRANCH
-
-```mach
-pub val R_RISCV_BRANCH:       u32 = 16
-```
-
 ## val R_RISCV_JAL
 
 ```mach

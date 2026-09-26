@@ -1,11 +1,5 @@
 # mach.lang.driver.config
 
-## fun resolve_artifact_path
-
-```mach
-pub fun resolve_artifact_path(alloc: *A.Allocator, project_root: str, pick: *manifest.Selection) res[str, outcome.Fail];
-```
-
 ## rec RunArtifact
 
 ```mach

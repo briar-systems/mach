@@ -16,17 +16,6 @@ ret: ok when clean; err "mach.toml: source cannot contain NUL bytes" for a raw
      single-line or multi-line. comments and literal (single-quoted) strings are
      skipped without escape checks
 
-## fun validate_source_text
-
-```mach
-pub fun validate_source_text(src: str) err[outcome.Fail];
-```
-
-`validate_source_bytes` over a NUL-terminated string
-
-src: manifest text
-ret: as `validate_source_bytes`
-
 ## rec StrArr
 
 ```mach

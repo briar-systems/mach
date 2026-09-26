@@ -45,12 +45,6 @@ pub rec Identity;
 pub fun identity_clear(id: *Identity);
 ```
 
-## fun identity_equal
-
-```mach
-pub fun identity_equal(a: *Identity, b: *Identity) bool;
-```
-
 ## fun identity
 
 ```mach

@@ -212,12 +212,6 @@ pub val AR_SYM:   u8 = 1
 pub val AR_LOCAL: u8 = 2
 ```
 
-## val CLAUSE_MARK
-
-```mach
-pub val CLAUSE_MARK: str = "::"
-```
-
 ## val ABANK_GP
 
 ```mach

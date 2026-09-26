@@ -60,18 +60,6 @@ pub fun intern_span(itn: *Interner, source: str, span: token.Span) res[StrId, A.
 pub fun intern_bytes(itn: *Interner, data: str, len: usize) res[StrId, A.Error];
 ```
 
-## fun child_base_len
-
-```mach
-pub fun child_base_len(itn: *Interner) usize;
-```
-
-## fun count
-
-```mach
-pub fun count(itn: *Interner) usize;
-```
-
 ## rec ReinternMap
 
 ```mach

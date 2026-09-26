@@ -90,14 +90,6 @@ pub fun is_reported(f: Fail) bool;
 pub fun is_message(f: Fail) bool;
 ```
 
-## fun text
-
-```mach
-pub fun text(f: Fail) opt[str];
-```
-
-the text a failure carries, absent for a reported one
-
 ## val REPORTED_TEXT
 
 ```mach
@@ -155,18 +147,6 @@ pub fun internal(s: *PhaseStatus, text: str);
 
 ```mach
 pub fun is_accepted(s: PhaseStatus) bool;
-```
-
-## fun is_rejected
-
-```mach
-pub fun is_rejected(s: PhaseStatus) bool;
-```
-
-## fun is_internal
-
-```mach
-pub fun is_internal(s: PhaseStatus) bool;
 ```
 
 ## fun internal_text
@@ -309,45 +289,4 @@ pub fun catalog_message_or(itn: *intern.Interner, a: *A.Allocator, c: Catalog, g
 the interned message when the site owns an interner and an allocator, else
 `generic`: a static text the caller writes to still name the catalog. a
 borrowed view or a test fixture has no owner and still refuses the member
-
-## fun catalog_status
-
-```mach
-pub fun catalog_status(s: *PhaseStatus, c: Catalog, message: str);
-```
-
-the phase status a class lands on: input and capability faults are rejections
-the caller reports as a diagnostic, an internal member is an internal failure
-
-## fun io_refused
-
-```mach
-pub fun io_refused(e: io_error.Error) Fail;
-```
-
-a refused native operation whose text the platform names
-
-## fun parse_refused
-
-```mach
-pub fun parse_refused(e: parse.ParseError) Fail;
-```
-
-a refused number parse (a target attribute or an inline-asm operand)
-
-## fun encode_refused
-
-```mach
-pub fun encode_refused(e: binary.EncodeError) Fail;
-```
-
-a refused binary encode (an object writer's encoder)
-
-## fun decode_refused
-
-```mach
-pub fun decode_refused(e: binary.DecodeError) Fail;
-```
-
-a refused binary decode (an object reader's cursor)
 

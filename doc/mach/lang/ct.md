@@ -66,18 +66,6 @@ pub val CT_CAP_MUL:       CtCap = 2
 pub val CT_CAP_VAR_SHIFT: CtCap = 3
 ```
 
-## val CT_OP_COUNT
-
-```mach
-pub val CT_OP_COUNT: u32 = 5
-```
-
-## fun ct_op_valid
-
-```mach
-pub fun ct_op_valid(op: CtOp) bool;
-```
-
 ## fun ct_cap
 
 ```mach
@@ -88,25 +76,10 @@ the capability a target must provide for an operation to be constant-time,
 absent for an operation outside the catalog: an unknown operation is never
 answered with "no capability needed"
 
-## fun ct_cap_or_always
-
-```mach
-pub fun ct_cap_or_always(op: CtOp) CtCap;
-```
-
-tests and the sema gate: the declared capability, or the one no target
-provides for an operation outside the catalog
-
 ## fun cap_at_sema
 
 ```mach
 pub fun cap_at_sema(cap: CtCap) bool;
-```
-
-## fun cap_at_mir
-
-```mach
-pub fun cap_at_mir(cap: CtCap) bool;
 ```
 
 ## def CtMulOp
@@ -302,12 +275,6 @@ pub fun mul_op_name(op: CtMulOp) opt[str];
 
 the spelling `$mach.build.ct_mul` reads, absent for NONE or an unknown tag
 
-## fun mul_op_by_name
-
-```mach
-pub fun mul_op_by_name(name: str) opt[CtMulOp];
-```
-
 ## val MUL_OP_SPELLINGS
 
 ```mach
@@ -320,12 +287,6 @@ the valid op spellings, for a refusal that lists them
 
 ```mach
 pub fun mul_mask_add(mask: *CtMulMask, cell: CtMulCell);
-```
-
-## fun mul_mask_equals
-
-```mach
-pub fun mul_mask_equals(a: CtMulMask, b: CtMulMask) bool;
 ```
 
 ## fun mul_mask_has
@@ -415,18 +376,6 @@ a binding the scan tracks, by the name its `{name}` operand spells
 
 ```mach
 pub fun asm_secret(name: str, secrecy: BindSecrecy) AsmSecret;
-```
-
-## fun asm_secret_value
-
-```mach
-pub fun asm_secret_value(name: str) AsmSecret;
-```
-
-## fun asm_secret_pointee
-
-```mach
-pub fun asm_secret_pointee(name: str) AsmSecret;
 ```
 
 ## rec AsmClass
