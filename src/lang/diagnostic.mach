@@ -21,6 +21,7 @@ use std.types.string.str_len;
 use A: std.allocator;
 use T: std.allocator.testing;
 
+use dkind: mach.lang.diagnostic.kind;
 use mach.lang.fe.token;
 use mach.lang.intern;
 use mach.lang.source;
@@ -35,19 +36,6 @@ pub val SEVERITY_HELP:    Severity = 3;
 
 pub fun severity_valid(s: Severity) bool {
     ret s == SEVERITY_ERROR || s == SEVERITY_WARNING || s == SEVERITY_INFO || s == SEVERITY_HELP;
-}
-
-# the named warning kinds, a closed catalog: a warning that carries a kind can be silenced
-# by its name, and an unnamed one cannot
-pub def WarningKind: u8;
-
-pub val WARNING_UNNAMED:               WarningKind = 0;
-pub val WARNING_INEXACT_FLOAT_LITERAL: WarningKind = 1;
-
-# the stable name of a warning kind; absent for an unnamed warning or a tag outside the catalog
-pub fun warning_kind_name(k: WarningKind) opt[str] {
-    if (k == WARNING_INEXACT_FLOAT_LITERAL) { ret opt[str].some{"inexact-float-literal"}; }
-    ret opt[str].none{};
 }
 
 pub def ChildKind: u8;
@@ -86,7 +74,7 @@ pub rec Diagnostic {
     seq:      u64;
     gate_key: GateDiagKey;
     severity: Severity;
-    warning:  WarningKind;
+    kind:     dkind.Kind;
     loc:      Location;
     message:  str;
     children: Vector[Child];
@@ -112,13 +100,15 @@ pub rec DiagnosticStore {
     lost:        usize;
     next_seq:    u64;
     epoch:       u64;
+    # warnings of these kinds are dropped as they reach the store
+    silenced: dkind.KindSet;
 }
 
 pub rec DiagnosticBuilder {
     a:        *A.Allocator;
     live:     bool;
     severity: Severity;
-    warning:  WarningKind;
+    kind:     dkind.Kind;
     loc:      Location;
     message:  str;
     children: Vector[Child];
@@ -135,7 +125,17 @@ pub fun store_init(a: *A.Allocator) DiagnosticStore {
     store.lost        = 0;
     store.next_seq    = 0;
     store.epoch       = 0;
+    store.silenced    = dkind.set_empty();
     ret store;
+}
+
+# drop every warning of a kind in `set` that reaches the store from now on
+pub fun silence(store: *DiagnosticStore, set: dkind.KindSet) {
+    store.silenced = set;
+}
+
+fun is_silenced(store: *DiagnosticStore, severity: Severity, k: dkind.Kind) bool {
+    ret severity == SEVERITY_WARNING && dkind.set_has(?store.silenced, k);
 }
 
 fun free_related(a: *A.Allocator, r: *Related) {
@@ -294,13 +294,26 @@ pub fun builder_init(a: *A.Allocator, severity: Severity, file_id: source.FileId
     b.a           = a;
     b.live        = true;
     b.severity    = severity;
-    b.warning     = WARNING_UNNAMED;
+    b.kind        = dkind.NONE;
     b.loc.file_id = file_id;
     b.loc.span    = span;
     b.message     = dup_r.ok;
     b.children    = vector.init[Child](a);
     b.related     = vector.init[Related](a);
     b.fixes       = vector.init[Fix](a);
+    ret res[DiagnosticBuilder, fail.Fail].ok{b};
+}
+
+# a builder for a diagnostic of a named kind, at the severity its row declares
+pub fun builder_init_kind(a: *A.Allocator, k: dkind.Kind, file_id: source.FileId, span: token.Span, message: str) res[DiagnosticBuilder, fail.Fail] {
+    val row: *dkind.Spec = dkind.spec(k);
+    if (row == nil) { ret res[DiagnosticBuilder, fail.Fail].err{fail.message("diagnostic names no declared kind")}; }
+    var severity: Severity = SEVERITY_WARNING;
+    if (row.level == dkind.LEVEL_ERROR) { severity = SEVERITY_ERROR; }
+    val b_r: res[DiagnosticBuilder, fail.Fail] = builder_init(a, severity, file_id, span, message);
+    if (sel b_r.err) { ret b_r; }
+    var b: DiagnosticBuilder = b_r.ok;
+    b.kind = k;
     ret res[DiagnosticBuilder, fail.Fail].ok{b};
 }
 
@@ -572,10 +585,17 @@ pub fun fix_valid(fx: *Fix) bool {
     ret true;
 }
 
-pub fun commit(b: *DiagnosticBuilder, store: *DiagnosticStore) res[DiagnosticId, fail.Fail] {
-    if (b == nil || !b.live) { ret res[DiagnosticId, fail.Fail].err{fail.message("diagnostic builder is not live")}; }
-    if (store == nil)        { ret res[DiagnosticId, fail.Fail].err{fail.message("diagnostic store is nil")}; }
-    if (b.a != store.a)      { ret res[DiagnosticId, fail.Fail].err{fail.message("diagnostic builder allocator does not match store allocator")}; }
+# consumes the builder into the store; absent when the store silences the warning's kind,
+# which drops it
+pub fun commit(b: *DiagnosticBuilder, store: *DiagnosticStore) res[opt[DiagnosticId], fail.Fail] {
+    if (b == nil || !b.live)            { ret res[opt[DiagnosticId], fail.Fail].err{fail.message("diagnostic builder is not live")}; }
+    if (store == nil)                   { ret res[opt[DiagnosticId], fail.Fail].err{fail.message("diagnostic store is nil")}; }
+    if (b.a != store.a)                 { ret res[opt[DiagnosticId], fail.Fail].err{fail.message("diagnostic builder allocator does not match store allocator")}; }
+    if (!kind_fits(b.severity, b.kind)) { ret res[opt[DiagnosticId], fail.Fail].err{fail.message("a warning names a declared warning kind, and a named kind is raised at its own severity")}; }
+    if (is_silenced(store, b.severity, b.kind)) {
+        builder_dnit(b);
+        ret res[opt[DiagnosticId], fail.Fail].ok{opt[DiagnosticId].none{}};
+    }
 
     if (b.severity == SEVERITY_ERROR) { note_error(store); }
 
@@ -583,7 +603,7 @@ pub fun commit(b: *DiagnosticBuilder, store: *DiagnosticStore) res[DiagnosticId,
     d.seq      = store.next_seq;
     d.gate_key = GateDiagKey{msg: intern.STR_NIL};
     d.severity = b.severity;
-    d.warning  = b.warning;
+    d.kind     = b.kind;
     d.loc      = b.loc;
     d.message  = b.message;
     d.children = b.children;
@@ -591,7 +611,7 @@ pub fun commit(b: *DiagnosticBuilder, store: *DiagnosticStore) res[DiagnosticId,
     d.fixes    = b.fixes;
 
     val push_r: res[usize, A.Error] = vector.push[Diagnostic](?store.items, d);
-    if (sel push_r.err) { ret res[DiagnosticId, fail.Fail].err{fail.refused(push_r.err)}; }
+    if (sel push_r.err) { ret res[opt[DiagnosticId], fail.Fail].err{fail.refused(push_r.err)}; }
 
     var id: DiagnosticId;
     id.index = store.items.len - 1;
@@ -608,7 +628,7 @@ pub fun commit(b: *DiagnosticBuilder, store: *DiagnosticStore) res[DiagnosticId,
     b.fixes    = empty_fixes;
     b.live     = false;
 
-    ret res[DiagnosticId, fail.Fail].ok{id};
+    ret res[opt[DiagnosticId], fail.Fail].ok{opt[DiagnosticId].some{id}};
 }
 
 # absent when the store is nil or the id no longer names a live diagnostic
@@ -622,15 +642,25 @@ pub fun resolve(store: *DiagnosticStore, id: DiagnosticId) opt[*Diagnostic] {
 
 pub val STALE_ID_TEXT: str = "stale diagnostic id";
 
-fun emit(store: *DiagnosticStore, severity: Severity, file_id: source.FileId, span: token.Span, message: str) err[fail.Fail] {
+# every warning names its kind, and a kind is raised at the severity its row declares
+fun kind_fits(severity: Severity, k: dkind.Kind) bool {
+    if (k == dkind.NONE) { ret severity != SEVERITY_WARNING; }
+    val row: *dkind.Spec = dkind.spec(k);
+    if (row == nil)                       { ret false; }
+    if (row.level == dkind.LEVEL_WARNING) { ret severity == SEVERITY_WARNING; }
+    ret severity == SEVERITY_ERROR;
+}
+
+fun emit(store: *DiagnosticStore, severity: Severity, k: dkind.Kind, file_id: source.FileId, span: token.Span, message: str) err[fail.Fail] {
     val b_r: res[DiagnosticBuilder, fail.Fail] = builder_init(store.a, severity, file_id, span, message);
     if (sel b_r.err) {
         if (severity == SEVERITY_ERROR) { note_error(store); }
         ret err[fail.Fail].err{b_r.err};
     }
     var b: DiagnosticBuilder = b_r.ok;
+    b.kind = k;
 
-    val commit_r: res[DiagnosticId, fail.Fail] = commit(?b, store);
+    val commit_r: res[opt[DiagnosticId], fail.Fail] = commit(?b, store);
     if (sel commit_r.err) {
         builder_dnit(?b);
         ret err[fail.Fail].err{commit_r.err};
@@ -639,7 +669,7 @@ fun emit(store: *DiagnosticStore, severity: Severity, file_id: source.FileId, sp
 }
 
 pub fun error(store: *DiagnosticStore, file_id: source.FileId, span: token.Span, message: str) err[fail.Fail] {
-    val emit_r: err[fail.Fail] = emit(store, SEVERITY_ERROR, file_id, span, message);
+    val emit_r: err[fail.Fail] = emit(store, SEVERITY_ERROR, dkind.NONE, file_id, span, message);
     if (sel emit_r.err) { ret err[fail.Fail].err{emit_r.err}; }
     ret err[fail.Fail].ok{};
 }
@@ -666,26 +696,26 @@ pub fun reject(store: *DiagnosticStore, loc: source.SrcLoc, text: str) fail.Fail
     ret fail.reported();
 }
 
-pub fun warning(store: *DiagnosticStore, file_id: source.FileId, span: token.Span, message: str) err[fail.Fail] {
-    val emit_r: err[fail.Fail] = emit(store, SEVERITY_WARNING, file_id, span, message);
+pub fun warning(store: *DiagnosticStore, k: dkind.Kind, file_id: source.FileId, span: token.Span, message: str) err[fail.Fail] {
+    val emit_r: err[fail.Fail] = emit(store, SEVERITY_WARNING, k, file_id, span, message);
     if (sel emit_r.err) { ret err[fail.Fail].err{emit_r.err}; }
     ret err[fail.Fail].ok{};
 }
 
 pub fun record_error(store: *DiagnosticStore, file_id: source.FileId, span: token.Span, message: str) {
-    record(store, emit(store, SEVERITY_ERROR, file_id, span, message));
+    record(store, emit(store, SEVERITY_ERROR, dkind.NONE, file_id, span, message));
 }
 
-pub fun record_warning(store: *DiagnosticStore, file_id: source.FileId, span: token.Span, message: str) {
-    record(store, emit(store, SEVERITY_WARNING, file_id, span, message));
+pub fun record_warning(store: *DiagnosticStore, k: dkind.Kind, file_id: source.FileId, span: token.Span, message: str) {
+    record(store, emit(store, SEVERITY_WARNING, k, file_id, span, message));
 }
 
 # a warning about the build as a whole, located at no source
-pub fun record_unlocated_warning(store: *DiagnosticStore, message: str) {
+pub fun record_unlocated_warning(store: *DiagnosticStore, k: dkind.Kind, message: str) {
     var span: token.Span;
     span.offset = 0;
     span.len    = 0;
-    record_warning(store, source.FILE_NIL, span, message);
+    record_warning(store, k, source.FILE_NIL, span, message);
 }
 
 pub fun record_note_committed(store: *DiagnosticStore, id: DiagnosticId, text: str) {
@@ -771,7 +801,7 @@ fun copy_diagnostic_into(dst: *DiagnosticStore, d: *Diagnostic) err[fail.Fail] {
     val b_r: res[DiagnosticBuilder, fail.Fail] = builder_init(dst.a, d.severity, d.loc.file_id, d.loc.span, d.message);
     if (sel b_r.err) { ret err[fail.Fail].err{b_r.err}; }
     var b: DiagnosticBuilder = b_r.ok;
-    b.warning = d.warning;
+    b.kind = d.kind;
 
     var c: usize = 0;
     for (c < d.children.len) {
@@ -823,15 +853,15 @@ fun copy_diagnostic_into(dst: *DiagnosticStore, d: *Diagnostic) err[fail.Fail] {
         f = f + 1;
     }
 
-    val commit_r: res[DiagnosticId, fail.Fail] = commit(?b, dst);
+    val commit_r: res[opt[DiagnosticId], fail.Fail] = commit(?b, dst);
     if (sel commit_r.err) {
         builder_dnit(?b);
         ret err[fail.Fail].err{commit_r.err};
     }
     if (d.gate_key.msg != intern.STR_NIL) {
         val inserted: res[bool, A.Error] = map.insert[GateDiagKey, bool](?dst.gates, d.gate_key, true);
-        if (sel inserted.err) { ret err[fail.Fail].err{fail.refused(inserted.err)}; }
-        dst.items.data[commit_r.ok.index].gate_key = d.gate_key;
+        if (sel inserted.err)     { ret err[fail.Fail].err{fail.refused(inserted.err)}; }
+        if (sel commit_r.ok.some) { dst.items.data[commit_r.ok.some.index].gate_key = d.gate_key; }
     }
     ret err[fail.Fail].ok{};
 }
@@ -841,7 +871,7 @@ fun location_equal(left: Location, right: Location) bool {
 }
 
 fun diagnostic_equal(left: *Diagnostic, right: *Diagnostic) bool {
-    if (left.severity != right.severity || left.warning != right.warning || !location_equal(left.loc, right.loc)
+    if (left.severity != right.severity || left.kind != right.kind || !location_equal(left.loc, right.loc)
         || !str_equals(left.message, right.message) || left.children.len != right.children.len
         || left.related.len != right.related.len || left.fixes.len != right.fixes.len) { ret false; }
     var i: usize = 0;
@@ -976,15 +1006,16 @@ pub fun gate_commit(
         ret res[bool, fail.Fail].ok{false};
     }
 
-    val cr: res[DiagnosticId, fail.Fail] = commit(b, store);
+    val cr: res[opt[DiagnosticId], fail.Fail] = commit(b, store);
     if (sel cr.err) {
         # a refused commit leaves the builder live and still owning its message,
         # children, related and fixes; every other exit here hands them back
         builder_dnit(b);
         ret res[bool, fail.Fail].err{cr.err};
     }
+    if (sel cr.ok.none) { ret res[bool, fail.Fail].ok{false}; }
 
-    val committed: DiagnosticId       = cr.ok;
+    val committed: DiagnosticId       = cr.ok.some;
     val insert_r:  res[bool, A.Error] = map.insert[GateDiagKey, bool](?store.gates, key, true);
     if (sel insert_r.err) { ret res[bool, fail.Fail].err{fail.refused(insert_r.err)}; }
     store.items.data[committed.index].gate_key = key;
@@ -1049,7 +1080,7 @@ test builder__preserves_every_note_and_help_in_order {
         ret 1;
     }
 
-    val commit_r: res[DiagnosticId, fail.Fail] = commit(?b, ?store);
+    val commit_r: res[opt[DiagnosticId], fail.Fail] = commit(?b, ?store);
     if (sel commit_r.err) {
         builder_dnit(?b);
         store_dnit(?store);
@@ -1181,7 +1212,7 @@ test attach_fix__accumulates_edits_and_validates {
         ret 1;
     }
 
-    val commit_r: res[DiagnosticId, fail.Fail] = commit(?b, ?store);
+    val commit_r: res[opt[DiagnosticId], fail.Fail] = commit(?b, ?store);
     if (sel commit_r.err) {
         builder_dnit(?b);
         store_dnit(?store);
@@ -1366,7 +1397,7 @@ test mark_truncate__discards_owned_tail_and_rejects_stale_marks {
     var store: DiagnosticStore = store_init(?a);
     val sp:    token.Span      = test_span(1, 2);
 
-    val warning_r: err[fail.Fail] = warning(?store, 0, sp, "kept");
+    val warning_r: err[fail.Fail] = warning(?store, dkind.UNUSED_IMPORT, 0, sp, "kept");
     if (sel warning_r.err) {
         store_dnit(?store);
         ret 1;
@@ -1429,7 +1460,7 @@ test snapshot_replay__round_trips_notes_related_and_fixes {
     page.make(?a);
     var src: DiagnosticStore = store_init(?a);
 
-    val warning_r: err[fail.Fail] = warning(?src, 0::source.FileId, test_span(4, 2), "leading warning");
+    val warning_r: err[fail.Fail] = warning(?src, dkind.UNUSED_IMPORT, 0::source.FileId, test_span(4, 2), "leading warning");
     if (sel warning_r.err) {
         store_dnit(?src);
         ret 1;
@@ -1450,7 +1481,7 @@ test snapshot_replay__round_trips_notes_related_and_fixes {
         store_dnit(?src);
         ret 1;
     }
-    val commit_r: res[DiagnosticId, fail.Fail] = commit(?b, ?src);
+    val commit_r: res[opt[DiagnosticId], fail.Fail] = commit(?b, ?src);
     if (sel commit_r.err) {
         builder_dnit(?b);
         store_dnit(?src);
@@ -1631,7 +1662,7 @@ test commit__builder_survives_a_failed_push_for_retry_or_teardown {
     }
     var b: DiagnosticBuilder = b_r.ok;
 
-    val commit_r: res[DiagnosticId, fail.Fail] = commit(?b, ?store);
+    val commit_r: res[opt[DiagnosticId], fail.Fail] = commit(?b, ?store);
     if (sel commit_r.ok) {
         store_dnit(?store);
         ret 1;
@@ -1670,14 +1701,18 @@ test resolve__rejects_a_diagnostic_id_invalidated_by_truncate {
         store_dnit(?store);
         ret 1;
     }
-    var b:        DiagnosticBuilder            = b_r.ok;
-    val commit_r: res[DiagnosticId, fail.Fail] = commit(?b, ?store);
+    var b:        DiagnosticBuilder                 = b_r.ok;
+    val commit_r: res[opt[DiagnosticId], fail.Fail] = commit(?b, ?store);
     if (sel commit_r.err) {
         builder_dnit(?b);
         store_dnit(?store);
         ret 1;
     }
-    val id: DiagnosticId = commit_r.ok;
+    if (sel commit_r.ok.none) {
+        store_dnit(?store);
+        ret 1;
+    }
+    val id: DiagnosticId = commit_r.ok.some;
 
     val resolve_r: opt[*Diagnostic] = resolve(?store, id);
     if (sel resolve_r.none) {
@@ -1831,7 +1866,7 @@ test record__a_lost_append_is_a_durable_rejection {
         T.fail_at_ordinal(?failing, ordinal::usize);
         var store: DiagnosticStore = store_init(T.allocator_of(?failing));
 
-        record_warning(?store, 0::source.FileId, sp, "a warning");
+        record_warning(?store, dkind.UNUSED_IMPORT, 0::source.FileId, sp, "a warning");
         if (len(?store) == 0) {
             if (lost_count(?store) == 0) {
                 store_dnit(?store);
@@ -1857,7 +1892,7 @@ test record__a_lost_append_is_a_durable_rejection {
     }
 
     var clean: DiagnosticStore = store_init(?backing);
-    record_warning(?clean, 0::source.FileId, sp, "a warning");
+    record_warning(?clean, dkind.UNUSED_IMPORT, 0::source.FileId, sp, "a warning");
     if (len(?clean) != 1) {
         store_dnit(?clean);
         ret 1;

@@ -36,35 +36,6 @@ pub val SEVERITY_HELP:    Severity = 3
 pub fun severity_valid(s: Severity) bool;
 ```
 
-## def WarningKind
-
-```mach
-pub def WarningKind: u8
-```
-
-the named warning kinds, a closed catalog: a warning that carries a kind can be silenced
-by its name, and an unnamed one cannot
-
-## val WARNING_UNNAMED
-
-```mach
-pub val WARNING_UNNAMED:               WarningKind = 0
-```
-
-## val WARNING_INEXACT_FLOAT_LITERAL
-
-```mach
-pub val WARNING_INEXACT_FLOAT_LITERAL: WarningKind = 1
-```
-
-## fun warning_kind_name
-
-```mach
-pub fun warning_kind_name(k: WarningKind) opt[str];
-```
-
-the stable name of a warning kind; absent for an unnamed warning or a tag outside the catalog
-
 ## def ChildKind
 
 ```mach
@@ -155,6 +126,14 @@ pub rec DiagnosticBuilder;
 pub fun store_init(a: *A.Allocator) DiagnosticStore;
 ```
 
+## fun silence
+
+```mach
+pub fun silence(store: *DiagnosticStore, set: dkind.KindSet);
+```
+
+drop every warning of a kind in `set` that reaches the store from now on
+
 ## fun truncate
 
 ```mach
@@ -203,6 +182,14 @@ pub fun note_error(store: *DiagnosticStore);
 ```mach
 pub fun builder_init(a: *A.Allocator, severity: Severity, file_id: source.FileId, span: token.Span, message: str) res[DiagnosticBuilder, fail.Fail];
 ```
+
+## fun builder_init_kind
+
+```mach
+pub fun builder_init_kind(a: *A.Allocator, k: dkind.Kind, file_id: source.FileId, span: token.Span, message: str) res[DiagnosticBuilder, fail.Fail];
+```
+
+a builder for a diagnostic of a named kind, at the severity its row declares
 
 ## fun builder_dnit
 
@@ -285,8 +272,11 @@ pub fun remove_fix_committed(store: *DiagnosticStore, id: DiagnosticId, fix: Fix
 ## fun commit
 
 ```mach
-pub fun commit(b: *DiagnosticBuilder, store: *DiagnosticStore) res[DiagnosticId, fail.Fail];
+pub fun commit(b: *DiagnosticBuilder, store: *DiagnosticStore) res[opt[DiagnosticId], fail.Fail];
 ```
+
+consumes the builder into the store; absent when the store silences the warning's kind,
+which drops it
 
 ## fun resolve
 
@@ -324,7 +314,7 @@ rather than vanishing
 ## fun warning
 
 ```mach
-pub fun warning(store: *DiagnosticStore, file_id: source.FileId, span: token.Span, message: str) err[fail.Fail];
+pub fun warning(store: *DiagnosticStore, k: dkind.Kind, file_id: source.FileId, span: token.Span, message: str) err[fail.Fail];
 ```
 
 ## fun record_error
@@ -336,13 +326,13 @@ pub fun record_error(store: *DiagnosticStore, file_id: source.FileId, span: toke
 ## fun record_warning
 
 ```mach
-pub fun record_warning(store: *DiagnosticStore, file_id: source.FileId, span: token.Span, message: str);
+pub fun record_warning(store: *DiagnosticStore, k: dkind.Kind, file_id: source.FileId, span: token.Span, message: str);
 ```
 
 ## fun record_unlocated_warning
 
 ```mach
-pub fun record_unlocated_warning(store: *DiagnosticStore, message: str);
+pub fun record_unlocated_warning(store: *DiagnosticStore, k: dkind.Kind, message: str);
 ```
 
 a warning about the build as a whole, located at no source
