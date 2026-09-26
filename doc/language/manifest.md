@@ -1215,10 +1215,13 @@ branch. `version` selects among releases.
 ### Releases and resolution
 
 A **release** of a git dependency is a tag `vX.Y.Z` (optionally
-`vX.Y.Z-pre`) together with the `mach.toml` at that tag. A tag whose manifest's
-`[project].version` differs from the tag name is not a candidate (`release
-v1.1.0 (<commit>) is not a candidate: its [project].version does not match the
-tag`).
+`vX.Y.Z-pre`) together with the `mach.toml` at that tag. A tag whose manifest
+does not load, as an old tag's written for an earlier manifest schema, or whose
+`[project].version` differs from the tag name is not a candidate. Resolution
+sets it aside and keeps looking. When nothing fits, the error lists it among the
+requirements (`gl 0.1.0 is not a candidate: its mach.toml does not load: unknown
+key 'name' in [project]`, or `... its [project].version does not match the
+tag`), so the error never reads as one in the project's own `mach.toml`.
 
 Resolution runs in exactly three places: `mach dep add`, `mach dep update` and
 `mach dep outdated`. **Builds never resolve.** They verify, offline (see
