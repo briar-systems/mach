@@ -770,6 +770,7 @@ the warning kinds there are. A name is never reused for a different kind.
 | `debug-dropped` | the linker leaves out an object's debug info that it cannot merge |
 | `target-skipped` | multi-target analysis skips a declared target this build does not support |
 | `native-fallback` | `native` matches no declared target and a declared target is built instead |
+| `inexact-float-literal` | a float literal is not exact at its type and its digits are not the shortest spelling of the value stored |
 
 Only warnings can be silenced. The table also names error kinds, and naming
 one in `allow` is refused rather than read as unknown:

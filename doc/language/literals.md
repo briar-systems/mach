@@ -76,6 +76,32 @@ is what makes it one, so `1f32` is an error and `1.0f32` and `1e0f32` are
 the ways to write it. Any other suffix spelling is an error naming the
 suffixes that exist.
 
+### Float values
+
+A float literal is rounded to its type once that type is known, from its
+suffix or from its context: to the nearest value the type holds, ties to
+even, the IEEE default. The decimal is rounded once, straight to that type.
+
+An inexact literal warns only when its written digits are not the value
+stored. The compiler rounds the literal, takes the shortest decimal that
+reads back as the result, and compares it with the literal's own
+significant digits, leading and trailing zeros and the exponent's spelling
+aside. `0.1` in `f32` is quiet, since `0.1` is how that `f32` value is
+written, while `3.14159265358979` in `f32` warns that the value stored is
+`3.1415927`. An exactly representable literal never warns, however many
+digits it has: `2147483648.0` is exact in `f32`. The warning is the named
+kind `inexact-float-literal`.
+
+A literal that rounds to infinity in its type, or whose nonzero value
+rounds to zero, is an error:
+
+```mach error float literal overflows `f32`
+val a: f32 = 3.4028235e38; # fine: the largest f32
+val b: f64 = 1.0e39; # fine: f64 holds it
+val c: f32 = 1.0e39; # error: float literal overflows `f32`: it rounds to infinity
+val d: f32 = 1.0e-46; # error: float literal underflows `f32`: its nonzero value rounds to zero
+```
+
 Every phase agrees on the type a suffix declares: compile-time evaluation,
 type checking, constant folding, and the emitted code all read the same
 type and the same value.

@@ -35,49 +35,55 @@ a diagnostic that names no row: an error or note not yet given a kind
 ## val UNUSED_IMPORT
 
 ```mach
-pub val UNUSED_IMPORT:   Kind = 1
+pub val UNUSED_IMPORT:         Kind = 1
 ```
 
 ## val DEPRECATED
 
 ```mach
-pub val DEPRECATED:      Kind = 2
+pub val DEPRECATED:            Kind = 2
 ```
 
 ## val DOCLINT
 
 ```mach
-pub val DOCLINT:         Kind = 3
+pub val DOCLINT:               Kind = 3
 ```
 
 ## val FWD_INSTANCES
 
 ```mach
-pub val FWD_INSTANCES:   Kind = 4
+pub val FWD_INSTANCES:         Kind = 4
 ```
 
 ## val DEBUG_DROPPED
 
 ```mach
-pub val DEBUG_DROPPED:   Kind = 5
+pub val DEBUG_DROPPED:         Kind = 5
 ```
 
 ## val TARGET_SKIPPED
 
 ```mach
-pub val TARGET_SKIPPED:  Kind = 6
+pub val TARGET_SKIPPED:        Kind = 6
 ```
 
 ## val NATIVE_FALLBACK
 
 ```mach
-pub val NATIVE_FALLBACK: Kind = 7
+pub val NATIVE_FALLBACK:       Kind = 7
 ```
 
 ## val NOT_OBLIVIOUS
 
 ```mach
-pub val NOT_OBLIVIOUS:   Kind = 8
+pub val NOT_OBLIVIOUS:         Kind = 8
+```
+
+## val INEXACT_FLOAT_LITERAL
+
+```mach
+pub val INEXACT_FLOAT_LITERAL: Kind = 9
 ```
 
 ## rec Spec
@@ -89,7 +95,7 @@ pub rec Spec;
 ## val COUNT
 
 ```mach
-pub val COUNT: usize       = 8
+pub val COUNT: usize       = 9
 ```
 
 ## fun at

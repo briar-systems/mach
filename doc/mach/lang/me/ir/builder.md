@@ -297,6 +297,14 @@ pub fun emit_vec_widen_half(b: *Builder, signed: bool, src: value.Value, base: v
 the lane-halving extension of the half of `src` whose first lane is `base`:
 a vector of half the lanes at twice the width, sign- or zero-extended
 
+## fun emit_vec_range
+
+```mach
+pub fun emit_vec_range(b: *Builder, src: value.Value, start: value.Value, ty: type.IrTypeId) res[value.Value, fail.Fail];
+```
+
+the `ty` lanes of `src` from constant lane `start` on
+
 ## fun emit_vec_build
 
 ```mach
