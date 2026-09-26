@@ -63,6 +63,21 @@ ret: the probe result; never commits an expression type
 pub fun int_bounds_of(sc: *context.SemaContext, to: type.TypeId) opt[type.IntRange];
 ```
 
+## fun check_float_literal
+
+```mach
+pub fun check_float_literal(sc: *context.SemaContext, eid: id.ExprId, ty: type.TypeId);
+```
+
+the float literal rule, applied once the literal's type is final. the literal rounds to
+nearest; one that rounds to infinity, or whose nonzero value rounds to zero, is refused,
+and an inexact one whose written digits are not the shortest spelling of the value stored
+warns with that value. an exact literal never warns
+
+sc: the semantic context the literal was typed in
+eid: a float literal
+ty: its final type; anything but a float type is left alone
+
 ## fun is_assignable
 
 ```mach

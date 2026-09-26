@@ -272,8 +272,11 @@ pub fun remove_fix_committed(store: *DiagnosticStore, id: DiagnosticId, fix: Fix
 ## fun commit
 
 ```mach
-pub fun commit(b: *DiagnosticBuilder, store: *DiagnosticStore) res[DiagnosticId, fail.Fail];
+pub fun commit(b: *DiagnosticBuilder, store: *DiagnosticStore) res[opt[DiagnosticId], fail.Fail];
 ```
+
+consumes the builder into the store; absent when the store silences the warning's kind,
+which drops it
 
 ## fun resolve
 

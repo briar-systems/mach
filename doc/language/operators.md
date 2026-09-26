@@ -99,7 +99,8 @@ one masked below it, such as `x << (n & 31)` on a `u32`, a loop counter its
 guard bounds, as `plane` in `for (plane < 8) { x >> plane }`, and a count a
 dominating compare bounds, as in `if (n < 32) { x << n }`, or sums, differences
 and products of such values, such as `(i & 3) * 16 + (i >> 2) * 4` under
-`i < 16`.
+`i < 16`. A count a loop does not change has its range test computed once,
+before the loop.
 
 ## Comparison
 

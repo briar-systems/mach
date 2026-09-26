@@ -773,6 +773,7 @@ the warning kinds there are. A name is never reused for a different kind.
 | `debug-dropped` | the linker leaves out an object's debug info that it cannot merge |
 | `target-skipped` | multi-target analysis skips a declared target this build does not support |
 | `native-fallback` | `native` matches no declared target and a declared target is built instead |
+| `inexact-float-literal` | a float literal is not exact at its type and its digits are not the shortest spelling of the value stored |
 | `scalarize` | a vector operation falls back to scalar code on the target (see `simd`); portable code silences it |
 
 Only warnings can be silenced. The table also names error kinds, and naming

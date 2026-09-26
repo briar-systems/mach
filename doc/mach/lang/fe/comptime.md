@@ -867,6 +867,32 @@ pub fun eval_lit_int(source: str, span: token.Span) res[CTValue, EvalFail];
 pub fun scan_lit_float(source: str, span: token.Span) res[LitFloat, fail.Fail];
 ```
 
+a literal's value at the width its suffix names, binary64 when it has none
+
+## fun lit_float_at
+
+```mach
+pub fun lit_float_at(source: str, span: token.Span, w: float.FloatWidth) res[float.Rounded, fail.Fail];
+```
+
+a literal rounded once its type is known: at its suffix's width when it has one, else at
+`w`, the width its context gives it. every consumer of a literal's value, the parser, the
+comptime evaluator, lowering, and the rule sema applies, reads it from here
+
+source: the text the span indexes
+span: the literal's token
+w: the width of the literal's type
+ret: the rounded value and how it fit, or the scan's refusal
+
+## fun lit_float_spells
+
+```mach
+pub fun lit_float_spells(source: str, span: token.Span, s: *float.Shortest) bool;
+```
+
+true when the literal's significant digits, leading and trailing zeros and exponent
+spelling aside, are exactly the shortest decimal that rounds back to `s`
+
 ## fun eval_lit_char
 
 ```mach
