@@ -2,7 +2,8 @@
 
 A `test` declaration names a block of statements the test runner can
 execute on its own. Any module may declare them, and `mach test` collects
-every test in the selected artifact's closure into a single test binary.
+every test in the selected artifact's closure and links the selected ones into
+one small test binary.
 What earns a test, and where it sits, is set by the
 [test policy](#test-policy).
 
@@ -129,7 +130,7 @@ the ordinal of the first failing check instead.
 
 Tests are not tied to a single file. Every `test` declaration in every
 module of the artifact under test that belongs to the current project is
-collected, and `mach test` builds one dispatcher executable in place of the
+collected, and `mach test` links one dispatcher executable in place of the
 artifact's normal entry and runs each test through it in its own process.
 
 By default collection is scoped to the current project's own modules: tests
@@ -140,9 +141,11 @@ in-tree. `--filter` narrows the run by qualified name in either mode.
 
 ## The `mach test` workflow
 
-`mach test <path>` is `mach build` with a different goal: it builds one test
-**dispatcher** executable covering every collected test, then runs each
-selected test as its own process (`<exe> <index>`), captures its output, times
+`mach test <path>` is `mach build` with a different goal: it builds the
+artifact's objects exactly as `mach build` does, adds a test object beside each
+module that declares tests, links one test **dispatcher** executable covering
+the selected tests, then runs each of them as its own process
+(`<exe> <index>`), captures its output, times
 it, and renders a per-module readout — collapsing all-passing modules to a
 single roll-up line and expanding any module with a failure to show the
 failing test's captured output and location. The full flag reference is
@@ -150,7 +153,7 @@ failing test's captured output and location. The full flag reference is
 
 ```
 --jobs <n>               run up to n test processes at once (default: host CPUs)
---filter <substr>        run only tests whose qualified name contains the substring
+--filter <substr>        select only tests whose qualified name contains the substring
 --include-deps           also run tests declared in dependency modules
 --list                   list the collected tests and exit
 --format <human|json>    the live readout, or an NDJSON event stream
@@ -179,9 +182,16 @@ The exit code of `mach test`:
 - `2` — a build or internal error before the tests could run, or a test that
   failed for an infrastructure reason (the harness, not the test).
 
-`--list` enumerates the collected tests and exits without running them.
-`--filter <substr>` selects at run time; the built dispatcher is identical
-regardless of filter. `--emit` is rejected under `mach test`
+`--list` prints each selected test's qualified name and the test object that
+holds it, and exits without linking or running anything:
+
+```
+app.parser#rejects_trailing_comma ./out/linux-x86_64/debug/obj/app/parser.test.o
+```
+
+`--filter <substr>` selects before the dispatcher links, so the dispatcher
+holds only the selected tests and what they reach, and changing the filter
+relinks without recompiling. `--emit` is rejected under `mach test`
 (`--emit is not applicable to 'test'; test always builds its internal test
 dispatcher`).
 
@@ -208,20 +218,36 @@ flag leaves every test unbounded.
 `--format json` replaces the readout with one JSON object per line on stdout
 (`run_start`, one `test` per result, `summary`; `case` under `--list`), with
 build diagnostics kept on stderr. A `test` or `case` event names its test by
-qualified name in `name`, beside its `module`, `file`, `line` and dispatcher
-`index`. A timed-out test reports `"kind":"timeout"`
+qualified name in `name`, beside its `module`, `file`, `line`, test `object`
+and dispatcher `index`. A timed-out test reports `"kind":"timeout"`
 with its bound in `timeout_seconds`. The schema is versioned (`"schema":1`
 on every event) and its writer is `mach.cli.cmd.testing`.
 
 ## The runner
 
-The compiler (`mach.lang.me.lower.testrunner`) lowers every collected test to
-a zero-parameter, `i32`-returning function under its qualified name, a symbol
-that never collides with, reserves, or rewrites a user symbol, and synthesizes
-one dispatcher object whose entry selects a test by its index argument. That
-object links with the project's objects into a single executable, even for a
-library artifact; in a test build the project's own entry is neutralised so
-the dispatcher is the sole program entry.
+A test build compiles every module's object exactly as `mach build` does and
+shares it: after `mach build`, `mach test` recompiles no module object. A module
+that declares tests or `#[testing]` declarations also gets a **test object**,
+`obj/<project>/<module>.test.o`. The compiler (`mach.lang.me.lower.testrunner`)
+lowers each of its tests to a zero-parameter, `i32`-returning function under
+its qualified name, a symbol that never collides with, reserves, or rewrites a
+user symbol.
+
+The test object references every symbol the module's object defines, private
+ones included, so a test reads and writes the same globals and calls the same
+functions the module's own code does, and every symbol has exactly one
+definition. It defines only what the module's object lacks: the tests, the
+`#[testing]` declarations, a private function inlined everywhere or called
+only from tests, a private global only tests use, and generic instances only
+tests use. The module's object never changes for tests. The test object's
+cache key is the module object's key and the module's source.
+
+Each run synthesizes one dispatcher object, `test/<artifact>/dispatch.o`,
+whose entry selects a test by its index argument, and links it with the test
+objects and the module objects into `test/<artifact>/<artifact>`, even for a
+library artifact. The link keeps only what the selected tests reach. The
+dispatcher is the program's `main`: an artifact's own `main` yields to it in
+the link, so its object is linked unchanged.
 
 The dispatcher's entry calls the selected test and exits with its result:
 as is when the result is in `0..255`, and `255` otherwise (see
@@ -230,8 +256,9 @@ as is when the result is in `0..255`, and `255` otherwise (see
 
 `mach test` then keeps up to `--jobs` children in flight, each spawned as
 `<exe> <index>`, captures each child's stdout and stderr to a per-test file
-under `log/` beside the dispatcher (a passing test's file is removed on the
-spot, a failing test's file stays), and reads its exit status. Results render
+under `log/` beside the dispatcher, `test/<artifact>/log/` unless `-o` moves
+the dispatcher (a passing test's file is removed on the spot, a failing test's
+file stays), and reads its exit status. Results render
 in collection order regardless of completion order.
 
 ## Which tests run
