@@ -174,6 +174,7 @@ debug: as `ProfileDef`
 simd: as `ProfileDef`
 vectorize: as `ProfileDef`
 float_reassoc: as `ProfileDef`
+allow: as `ProfileDef`
 
 ## fun resolve_profile
 

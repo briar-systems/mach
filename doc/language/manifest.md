@@ -86,6 +86,7 @@ debug = true                           # emit debug info for this profile
 simd  = "scalarize"                    # SIMD lever: "scalarize" | "require"
 vectorize = false                      # auto-vectorization lever
 float_reassoc = false                  # float reassociation permission
+# allow = ["unused-import"]            # optional: warning kinds this profile silences
 
 [artifact.demo]                        # a produced artifact
 kind    = "bin"                        # "bin" | "static" | "shared"
@@ -670,10 +671,11 @@ naming come from `[target.*]` facts, and an absent optional feature such as a
 | `vectorize` | bool | Auto-vectorization lever. When `true`, the release pipeline rewrites provably-safe counted loops to 128-bit SIMD on a target with hardware vectors; `false` skips the pass, so release output stays scalar. A non-boolean is a manifest error. |
 | `float_reassoc` | bool | Permission to treat floating-point addition and multiplication as **associative**. It lets the vectorizer reduce an `f32`/`f64` accumulator through lane-count partial sums, which changes the result — see [Float reassociation](#float-reassociation) for what that costs and what it buys. A non-boolean is a manifest error. |
 | `default` | bool | **Optional.** `true` marks the profile a build uses when several are declared and `--profile` is absent. Exactly one profile may carry it. See [Profile requirement and selection](#profile-requirement-and-selection). |
+| `allow` | array of strings | **Optional.** The warning kinds this profile silences, each named once from the [warning kind table](#silencing-warnings). An unknown name, an error kind, a repeated name or a non-string entry is a manifest error. Absent, nothing is silenced. |
 
 Five keys (`opt`, `debug`, `simd`, `vectorize`, `float_reassoc`) are required
 in a declared profile, in a root and in a dependency manifest alike; only
-`default` is optional. A missing key is a manifest error naming the table and
+`default` and `allow` are optional. A missing key is a manifest error naming the table and
 the key:
 
 ```
@@ -735,6 +737,53 @@ is parsed by the same schema and never read to build the consumer, so a library'
 values are inert — the effective levers come from the consumer's resolved profile.
 Libraries set nothing SIMD-specific and inherit the consumer's choice; there is no
 ecosystem fork and no dual API.
+
+### Silencing warnings
+
+`allow` names warning kinds the build does not report. A silenced warning is
+dropped before it is printed or counted, so the summary's warning count leaves
+it out as well. Nothing else changes: the same code is built, and an error is
+never silenced.
+
+```toml
+[profile.release]
+opt = 2
+debug = false
+simd = "scalarize"
+vectorize = true
+float_reassoc = false
+allow = ["unused-import", "deprecated"]
+```
+
+Every diagnostic kind has one row in one table in the compiler
+(`src/lang/diagnostic/kind.mach`). Each warning names its row where it is
+raised, and `allow` reads the same rows, so a name here is exactly the kind the
+warning carries. The list is closed: a name no row declares is refused, naming
+the warning kinds there are. A name is never reused for a different kind.
+
+| Kind | Warns when |
+|---|---|
+| `unused-import` | a symbol import names something the module never uses |
+| `deprecated` | code outside a `#[deprecated]` declaration's module uses it |
+| `doclint` | a doc comment's component list names no parameter, field, generic or `ret` of its declaration, leaves a component undescribed, or lists them out of declaration order |
+| `fwd-instances` | a shared library `fwd`s a generic, comptime-parameter or pack declaration, which exports no symbol |
+| `debug-dropped` | the linker leaves out an object's debug info that it cannot merge |
+| `target-skipped` | multi-target analysis skips a declared target this build does not support |
+| `native-fallback` | `native` matches no declared target and a declared target is built instead |
+
+Only warnings can be silenced. The table also names error kinds, and naming
+one in `allow` is refused rather than read as unknown:
+
+| Kind | Error |
+|---|---|
+| `not-oblivious` | a function performs a constant-time operation on a secret value without `#[oblivious]` |
+
+```
+error: mach.toml: [profile.release].allow entry "not-oblivious" names an error; only a warning can be silenced
+```
+
+Like the SIMD levers, `allow` is the consumer's: a dependency's profiles are
+never read to build it, so a library cannot silence the consumer's warnings.
 
 ### Float reassociation
 
