@@ -6,6 +6,14 @@
 pub val SPV_MAGIC: u32 = 0x07230203
 ```
 
+## val SPV_MODULE_SECTION
+
+```mach
+pub val SPV_MODULE_SECTION: str = ".spirv"
+```
+
+the one section a SPIR-V object image carries: the finished module
+
 ## val SPV_VERSION_1_0
 
 ```mach
