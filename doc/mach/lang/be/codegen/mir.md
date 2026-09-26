@@ -318,9 +318,9 @@ pub val MIR_ASM:         MirOpcode = 43
 pub val MIR_MUL_WIDE_S: MirOpcode = 50
 ```
 
-the IR widening multiplies, lowered by their IR kind: the full product of two
-integer vectors in lanes twice as wide, which the vec_lane names as a result
-lane carrying its operand lane
+the IR widening multiplies: the full product of two integer vectors in lanes
+twice as wide, which the vec_lane names as a result lane carrying its operand
+lane
 
 ## val MIR_MUL_WIDE_U
 
@@ -334,9 +334,9 @@ pub val MIR_MUL_WIDE_U: MirOpcode = 51
 pub val MIR_VEC_WIDEN_S: MirOpcode = 54
 ```
 
-the IR lane-halving extensions, lowered by their IR kind: half the operand's
-integer lanes extended to twice the width, the low half at immediate base 0
-and the high half at base N (#3738)
+the IR lane-halving extensions: half the operand's integer lanes extended to
+twice the width, the low half at immediate base 0 and the high half at base N
+(#3738)
 
 ## val MIR_VEC_WIDEN_U
 
@@ -459,8 +459,7 @@ pub val MIR_VEC_RANGE: MirOpcode = 0x100E
 ```
 
 the IR lane range (dst, src, first lane in imm): the source's lanes from the
-first on, of the same lane type. its IR kind is taken by MIR_MASK_LT_U here,
-so it lowers to this opcode instead (#3864)
+first on, of the same lane type (#3864)
 
 ## val MIR_SEL_ADD
 
@@ -981,6 +980,14 @@ pub val MCT_VAR_SHIFT:  MirCtClass = 3
 ```mach
 pub val MCT_FLOAT:      MirCtClass = 4
 ```
+
+## fun lowered_opcode
+
+```mach
+pub fun lowered_opcode(k: ir_instr.InstrKind) MirOpcode;
+```
+
+the MIR opcode an IR kind lowers to; MIR_OP_NONE for a kind with no row
 
 ## def OperandBank
 
