@@ -155,12 +155,12 @@ failing test's captured output and location. The full flag reference is
 --list                   list the collected tests and exit
 --format <human|json>    the live readout, or an NDJSON event stream
 --runner <cmd>           launch each test through a host-side command
---timeout_seconds <n>    terminate a test and its process group after n seconds
+--timeout <duration>     terminate a test and its process group after the duration
 ```
 
 A roll-up is `<module>  <ok> ok[  <fail> FAIL]  <duration>`. Each expanded
 failure shows `file:line`, the exit code (`(exit N)`), signal (`(signal N)`)
-or `(timed out after <n>s)`, the child's captured output indented beneath, and
+or `(timed out after <duration>)`, the child's captured output indented beneath, and
 the exact `rerun:` command; a passing test stays quiet. The run closes with a
 summary that re-lists every failure:
 
@@ -187,11 +187,12 @@ dispatcher`).
 
 ### Timeouts
 
-`--timeout_seconds <n>` bounds each spawned test process independently, from
+`--timeout <duration>` bounds each spawned test process independently, from
 its own spawn, on its whole process group, so a process the test started dies
 with it. A test that exceeds the bound is the distinct outcome **timed out**:
-it renders as `(timed out after <n>s)`, is counted separately on the summary
-line, and is still a failing test for the exit code, so the suite exits `1`.
+it renders as `(timed out after <duration>)`, is counted separately on the
+summary line, and is still a failing test for the exit code, so the suite
+exits `1`.
 
 ```
 failures:
@@ -200,8 +201,10 @@ failures:
 0 passed, 1 failed (1 timed out), 1 total  (1.0s)
 ```
 
-`<n>` is a positive integer number of seconds with no default: omitting the
-flag leaves every test unbounded.
+`<duration>` is a positive integer followed by a unit: `ms`, `s`, `m` or `h`
+(`30ms`, `30s`, `5m`, `1h`). A bare number, a fraction, zero or any other
+unit is a usage error naming the accepted forms. There is no default: omitting
+the flag leaves every test unbounded.
 
 ### JSON output
 
@@ -209,9 +212,9 @@ flag leaves every test unbounded.
 (`run_start`, one `test` per result, `summary`; `case` under `--list`), with
 build diagnostics kept on stderr. A `test` or `case` event names its test by
 qualified name in `name`, beside its `module`, `file`, `line` and dispatcher
-`index`. A timed-out test reports `"kind":"timeout"`
-with its bound in `timeout_seconds`. The schema is versioned (`"schema":1`
-on every event) and its writer is `mach.cli.cmd.testing`.
+`index`. A timed-out test reports `"kind":"timeout"` with its bound in
+nanoseconds in `timeout_ns`. The schema is versioned (`"schema":2` on every
+event) and its writer is `mach.cli.cmd.testing`.
 
 ## The runner
 
