@@ -42,12 +42,6 @@ pub val OF_SPV:     u32 = 5
 pub val OF_FORMAT_CATALOG_VERSION: u8 = 1
 ```
 
-## fun of_id_for
-
-```mach
-pub fun of_id_for(name: str) u32;
-```
-
 ## fun of_name_for
 
 ```mach
@@ -532,14 +526,6 @@ pub fun section_is_external(id: SectionId) bool;
 pub fun section_is_absolute(id: SectionId) bool;
 ```
 
-## fun section_defined
-
-```mach
-pub fun section_defined(id: SectionId, count: u32) bool;
-```
-
-true when the id names a real section below `count`
-
 ## fun section_same
 
 ```mach
@@ -825,27 +811,40 @@ pub rec BaseReloc;
 pub rec DynamicInfo;
 ```
 
-## rec StubTable
+## rec TableSpan
 
 ```mach
-pub rec StubTable;
+pub rec TableSpan;
 ```
 
-## rec StubShape
+where a table the linker reserved for a format lies in the image
+
+## rec TableShape
 
 ```mach
-pub rec StubShape;
+pub rec TableShape;
 ```
 
-what a format's call-stub table takes for a count of imported functions: the
-linker reserves it at the end of the code under this section name, so every
-call site reaches its stub whatever data the image carries
+what a table a format asks the linker to reserve takes: the linker lays it out
+under this section name before it gives anything an address, so the code
+reaches it whatever data the image carries
 
 ## def StubShapeFn
 
 ```mach
-pub def StubShapeFn: fun(u32, u32) res[StubShape, fail.Fail]
+pub def StubShapeFn: fun(u32, u32) res[TableShape, fail.Fail]
 ```
+
+the call-stub table for a count of imported functions, at the end of the code
+
+## def GotShapeFn
+
+```mach
+pub def GotShapeFn: fun(u32, *DynamicInfo) res[TableShape, fail.Fail]
+```
+
+the import GOT for the imports of a dynamic link, at the end of the read-only
+data; an empty shape when no import needs a slot
 
 ## rec PltFixup
 
@@ -902,12 +901,6 @@ pub val SYMT_FUNC:   SymbolType = 1
 
 ```mach
 pub val SYMT_OBJECT: SymbolType = 2
-```
-
-## val SYMT_COUNT
-
-```mach
-pub val SYMT_COUNT: u32 = 3
 ```
 
 ## rec SymtabEntry
@@ -980,12 +973,6 @@ pub rec ImageOptions;
 
 ```mach
 pub fun image_options_default(subsystem: Subsystem) ImageOptions;
-```
-
-## fun image_options_flagged
-
-```mach
-pub fun image_options_flagged(subsystem: Subsystem, flags: u32) ImageOptions;
 ```
 
 ## fun effective_stack_reserve
@@ -1360,19 +1347,13 @@ pub fun registered(reg: *OfRegistry, idx: u32) opt[*OfVTable];
 ## val DBG_UNKNOWN
 
 ```mach
-pub val DBG_UNKNOWN:  u32 = 0
+pub val DBG_UNKNOWN: u32 = 0
 ```
 
 ## val DBG_DWARF
 
 ```mach
-pub val DBG_DWARF:    u32 = 1
-```
-
-## val DBG_CODEVIEW
-
-```mach
-pub val DBG_CODEVIEW: u32 = 2
+pub val DBG_DWARF:   u32 = 1
 ```
 
 ## val DBG_SPIRV
@@ -1552,6 +1533,17 @@ bits (#3907)
 ```mach
 pub fun is_pointer_abs_kind(kind: RelocKind, w: u32) bool;
 ```
+
+## fun is_pcrel_address_kind
+
+```mach
+pub fun is_pcrel_address_kind(kind: RelocKind) bool;
+```
+
+a pc-relative materialization of a symbol's address in two parts, a page or
+high part and a low part, as aarch64 and riscv64 take it (x86-64 takes it
+whole with RK_PC32). against a function import each part resolves to the
+import's call stub, as a call does
 
 ## fun reloc_symbol_name
 

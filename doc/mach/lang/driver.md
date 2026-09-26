@@ -6,6 +6,14 @@
 pub fun append_frontend_roots(p: *project.Project, roots: *Vector[query.QueryKey]) err[outcome.Fail];
 ```
 
+## fun append_test_roots
+
+```mach
+pub fun append_test_roots(p: *project.Project, roots: *Vector[query.QueryKey]) err[outcome.Fail];
+```
+
+the backend's roots and each test object's lowering and codegen
+
 ## fun run_sema_pass
 
 ```mach
@@ -16,12 +24,6 @@ pub fun run_sema_pass(p: *project.Project) err[outcome.Fail];
 
 ```mach
 pub fun run_lower_pass(p: *project.Project) err[outcome.Fail];
-```
-
-## fun run_codegen_pass
-
-```mach
-pub fun run_codegen_pass(p: *project.Project) err[outcome.Fail];
 ```
 
 ## fun run_link_pass
@@ -101,20 +103,6 @@ pub val FRONTEND_RESOLVE: FrontendPhase = 1
 pub val FRONTEND_SEMA:    FrontendPhase = 2
 ```
 
-## fun analyze_project
-
-```mach
-pub fun analyze_project(s: *session.Session, m: *manifest.Manifest, req: *request.BuildRequest,
-roots: project.RootSet, extra_roots: *intern.StrId, extra_root_count: u32) res[project.Project, outcome.Fail];
-```
-
-## fun analyze_project_until
-
-```mach
-pub fun analyze_project_until(s: *session.Session, m: *manifest.Manifest, req: *request.BuildRequest,
-roots: project.RootSet, extra_roots: *intern.StrId, extra_root_count: u32, phase: FrontendPhase) res[project.Project, outcome.Fail];
-```
-
 ## fun analyze_project_tolerant
 
 ```mach
@@ -184,25 +172,5 @@ ret: ok(true) when refreshed, a rejection included since the project's standing 
 
 ```mach
 pub fun load_manifest(s: *session.Session, project_root: str) res[manifest.Manifest, outcome.Fail];
-```
-
-## fun build_project_sel
-
-```mach
-pub fun build_project_sel(s: *session.Session, project_root: str, pick: *manifest.Selection) res[project.Project, outcome.Fail];
-```
-
-## fun build_project_sel_req
-
-```mach
-pub fun build_project_sel_req(s: *session.Session, project_root: str, pick: *manifest.Selection, req: *request.BuildRequest) res[project.Project, outcome.Fail];
-```
-
-the caller's request stands in for the composed one; steps still run
-
-## fun build_project_union
-
-```mach
-pub fun build_project_union(s: *session.Session, project_root: str) res[project.Project, outcome.Fail];
 ```
 

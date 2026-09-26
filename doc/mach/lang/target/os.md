@@ -175,15 +175,6 @@ pub def RegArgExtendFn: fun(u32) u32
 the width in bits the caller widens an integer argument narrower than it to,
 by the argument's signedness, in a register, 0 when the callee does it
 
-## def DeclaredAggAlignFn
-
-```mach
-pub def DeclaredAggAlignFn: fun(u32) bool
-```
-
-whether the os places an aggregate argument by its declared alignment on the
-instruction set, #[align] included, where the convention takes the natural one
-
 ## def ReservedGpFn
 
 ```mach
@@ -386,24 +377,6 @@ pub fun reg_arg_align_for(vt: *OsVTable, arch_id: u32) u32;
 
 ```mach
 pub fun reg_arg_extend_for(vt: *OsVTable, arch_id: u32) u32;
-```
-
-## fun declared_agg_align_for
-
-```mach
-pub fun declared_agg_align_for(vt: *OsVTable, arch_id: u32) bool;
-```
-
-## fun va_list_for
-
-```mach
-pub fun va_list_for(vt: *OsVTable, arch_id: u32) opt[VaList];
-```
-
-## fun fs_policy_for
-
-```mach
-pub fun fs_policy_for(vt: *OsVTable, arch_id: u32) opt[FsPolicy];
 ```
 
 ## fun va_list_checked_for

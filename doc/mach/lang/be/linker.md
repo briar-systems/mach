@@ -15,33 +15,6 @@ image_options: of.ImageOptions) err[fail.Fail];
 pub rec LinkedImage;
 ```
 
-## fun linked_image_dnit
-
-```mach
-pub fun linked_image_dnit(img: *LinkedImage, alloc: *A.Allocator);
-```
-
-## fun linked_image_symbol
-
-```mach
-pub fun linked_image_symbol(img: *LinkedImage, itn: *intern.Interner, name: str) opt[u64];
-```
-
-## fun link_images_captured
-
-```mach
-pub fun link_images_captured(s: *session.Session, tgt: *target.Target, images: *of.ObjectImage,
-image_count: u32, dynlibs: *of.DynLib, dynlib_count: u32,
-name: *u8, pie: bool, image_options: of.ImageOptions,
-root_names: *str, root_count: u32, out: *LinkedImage) err[fail.Fail];
-```
-
-link images into an executable handed back in memory
-
-root_names: definitions the caller reaches by name, kept even when the entry
-            does not reach them
-root_count: number of root names
-
 ## fun link_images
 
 ```mach

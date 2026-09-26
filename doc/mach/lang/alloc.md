@@ -1,14 +1,5 @@
 # mach.lang.alloc
 
-## fun refused
-
-```mach
-pub fun refused(r: err[A.Error]) bool;
-```
-
-a unit outcome read where only the yes/no matters (a call operand cannot be
-a `sel` place)
-
 ## fun text
 
 ```mach

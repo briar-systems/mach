@@ -376,12 +376,6 @@ pub fun set_slot_origin(ctx: *LowerCtx, value_id: u32, origin: u32);
 
 record the ir alloca behind the slot just added for `value_id`
 
-## fun add_spill_slot
-
-```mach
-pub fun add_spill_slot(ctx: *LowerCtx, value_id: u32, size: u64) err[fail.Fail];
-```
-
 ## fun alloc_result_storage
 
 ```mach

@@ -9,133 +9,115 @@ pub def QueryKind: u16
 ## val Q_PROJECT_ROOT
 
 ```mach
-pub val Q_PROJECT_ROOT:      QueryKind = 0
+pub val Q_PROJECT_ROOT: QueryKind = 0
 ```
 
 ## val Q_TARGET
 
 ```mach
-pub val Q_TARGET:            QueryKind = 1
+pub val Q_TARGET:       QueryKind = 1
 ```
 
 ## val Q_FILE_TEXT
 
 ```mach
-pub val Q_FILE_TEXT:         QueryKind = 2
-```
-
-## val Q_TOKENIZE
-
-```mach
-pub val Q_TOKENIZE:          QueryKind = 3
+pub val Q_FILE_TEXT:    QueryKind = 2
 ```
 
 ## val Q_PARSE
 
 ```mach
-pub val Q_PARSE:             QueryKind = 4
-```
-
-## val Q_MODULE_ID_FOR_FQN
-
-```mach
-pub val Q_MODULE_ID_FOR_FQN: QueryKind = 5
-```
-
-## val Q_COMPTIME_CTX
-
-```mach
-pub val Q_COMPTIME_CTX:      QueryKind = 6
+pub val Q_PARSE:           QueryKind = 4
 ```
 
 ## val Q_RESOLVE
 
 ```mach
-pub val Q_RESOLVE:           QueryKind = 7
+pub val Q_RESOLVE:         QueryKind = 7
 ```
 
 ## val Q_EXPORTS
 
 ```mach
-pub val Q_EXPORTS:           QueryKind = 8
+pub val Q_EXPORTS:         QueryKind = 8
 ```
 
 ## val Q_SEMA
 
 ```mach
-pub val Q_SEMA:              QueryKind = 9
+pub val Q_SEMA:            QueryKind = 9
 ```
 
 ## val Q_LOWER
 
 ```mach
-pub val Q_LOWER:             QueryKind = 10
+pub val Q_LOWER:           QueryKind = 10
 ```
 
 ## val Q_CODEGEN
 
 ```mach
-pub val Q_CODEGEN:           QueryKind = 11
+pub val Q_CODEGEN:         QueryKind = 11
 ```
 
 ## val Q_LINK
 
 ```mach
-pub val Q_LINK:              QueryKind = 12
+pub val Q_LINK:            QueryKind = 12
 ```
 
 ## val Q_TYPED_EXPORTS
 
 ```mach
-pub val Q_TYPED_EXPORTS:     QueryKind = 13
+pub val Q_TYPED_EXPORTS:   QueryKind = 13
 ```
 
 ## val Q_MODULE_NUMBER
 
 ```mach
-pub val Q_MODULE_NUMBER:     QueryKind = 14
+pub val Q_MODULE_NUMBER:   QueryKind = 14
 ```
 
 ## val Q_LINK_CONFIG
 
 ```mach
-pub val Q_LINK_CONFIG:       QueryKind = 15
+pub val Q_LINK_CONFIG:     QueryKind = 15
 ```
 
 ## val Q_LOWERED_SURFACE
 
 ```mach
-pub val Q_LOWERED_SURFACE:   QueryKind = 17
+pub val Q_LOWERED_SURFACE: QueryKind = 17
 ```
 
 ## val Q_EMBED_FILE
 
 ```mach
-pub val Q_EMBED_FILE:        QueryKind = 18
+pub val Q_EMBED_FILE:      QueryKind = 18
 ```
 
 ## val Q_CODEGEN_FLAGS
 
 ```mach
-pub val Q_CODEGEN_FLAGS:     QueryKind = 19
+pub val Q_CODEGEN_FLAGS:   QueryKind = 19
 ```
 
 ## val Q_LOAD_VIEW
 
 ```mach
-pub val Q_LOAD_VIEW:         QueryKind = 20
+pub val Q_LOAD_VIEW:       QueryKind = 20
 ```
 
 ## val Q_INLINE_BODIES
 
 ```mach
-pub val Q_INLINE_BODIES:     QueryKind = 21
+pub val Q_INLINE_BODIES:   QueryKind = 21
 ```
 
-## val Q_CELL_SNAPSHOT
+## val Q_OBJECT_KEY
 
 ```mach
-pub val Q_CELL_SNAPSHOT:     QueryKind = 22
+pub val Q_OBJECT_KEY:      QueryKind = 22
 ```
 
 ## def KeyOwner
@@ -390,12 +372,6 @@ pub fun register_derived_equatable(db: *QueryDb, kind: QueryKind, finalize: Fina
 equal: fun(*u8, u32, *u8, u32) bool) err[fail.Fail];
 ```
 
-## fun register_metadata
-
-```mach
-pub fun register_metadata(db: *QueryDb, kind: QueryKind, provider: RevisionProvider) err[fail.Fail];
-```
-
 ## fun runtime
 
 ```mach
@@ -490,12 +466,6 @@ pub fun is_registered(db: *QueryDb, kind: QueryKind) bool;
 
 ```mach
 pub fun set_input(db: *QueryDb, kind: QueryKind, key: u64, value: *u8, value_len: u32) err[fail.Fail];
-```
-
-## fun invalidate
-
-```mach
-pub fun invalidate(db: *QueryDb, kind: QueryKind, key: u64) err[fail.Fail];
 ```
 
 ## rec PreparedRetirement
@@ -612,46 +582,17 @@ pub fun revision[T](rt: *QueryRuntime[T], ctx: *T, kind: QueryKind, key: u64) re
 pub fun depend[T](rt: *QueryRuntime[T], ctx: *T, kind: QueryKind, key: u64) err[fail.Fail];
 ```
 
-## fun observe
-
-```mach
-pub fun observe(db: *QueryDb, kind: QueryKind, key: u64) res[MetadataRevision, fail.Fail];
-```
-
-## fun cached_dependency_keys
-
-```mach
-pub fun cached_dependency_keys(db: *QueryDb, kind: QueryKind, key: u64,
-a: *A.Allocator) res[Vector[QueryKey], fail.Fail];
-```
-
-observation copies recorded keys without validating or exposing a cached product
-
-## fun peek_input
-
-```mach
-pub fun peek_input(db: *QueryDb, kind: QueryKind, key: u64) opt[QueryView];
-```
-
-an input's stored bytes, read outside any operation and recording no dependency
-
 ## fun peek_revision
 
 ```mach
 pub fun peek_revision(db: *QueryDb, kind: QueryKind, key: u64) Revision;
 ```
 
-## fun shard_len
+## fun product_diagnostics
 
 ```mach
-pub fun shard_len(db: *QueryDb, kind: QueryKind) u32;
+pub fun product_diagnostics(db: *QueryDb, kind: QueryKind, key: u64) *diagnostic.DiagnosticStore;
 ```
 
-## fun owned_len
-
-```mach
-pub fun owned_len(db: *QueryDb, owner: KeyOwner, id: u32) u32;
-```
-
-how many products of every registered kind a module or file owns
+the diagnostics a ready product carries, nil when the product is absent or has none
 

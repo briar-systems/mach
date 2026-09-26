@@ -18,21 +18,3 @@ pub fun gp_name(idx: u32) str;
 pub fun fp_name(idx: u32) str;
 ```
 
-## fun test_sink_write
-
-```mach
-pub fun test_sink_write(ctx: ptr, buf: *u8, len: usize) res[usize, writer.WriteError];
-```
-
-## fun test_sink_reset
-
-```mach
-pub fun test_sink_reset();
-```
-
-## fun test_sink_text
-
-```mach
-pub fun test_sink_text() str;
-```
-

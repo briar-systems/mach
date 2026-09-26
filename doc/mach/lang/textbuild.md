@@ -37,12 +37,6 @@ pub fun tb_init(a: *A.Allocator) TextBuilder;
 pub fun tb_append(b: *TextBuilder, text: str) err[Error];
 ```
 
-## fun tb_append_all
-
-```mach
-pub fun tb_append_all(b: *TextBuilder, parts: *str, count: usize) err[Error];
-```
-
 ## fun tb_failed
 
 ```mach

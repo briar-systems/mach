@@ -152,15 +152,16 @@ case "$MACH_TARGET_OS-$MACH_TARGET_ISA" in
     # sufficient and is what makes the resolution honest - clang finds
     # <sysroot>/include and stops searching the host's /usr/include, so a probe
     # either compiles against riscv64's own headers or fails naming the one it
-    # wanted. The path is where Ubuntu's `libc6-dev-riscv64-cross` installs, which
-    # ci.yml installs on this leg. Absent, the build stops here naming the package
-    # rather than falling back to the host's headers, which is exactly
-    # the silent wrong-headers outcome this exists to prevent.
+    # wanted. The path is MACH_RISCV64_SYSROOT, which the qemu loader prefix in
+    # link cases reads too, defaulting to where Ubuntu's `libc6-dev-riscv64-cross`
+    # installs, which ci.yml installs on this leg. Absent, the build stops here
+    # naming the variable rather than falling back to the host's headers, which is
+    # exactly the silent wrong-headers outcome this exists to prevent.
     linux-riscv64)
         triple=riscv64-linux-gnu
-        sysroot=/usr/riscv64-linux-gnu
+        sysroot=${MACH_RISCV64_SYSROOT:-/usr/riscv64-linux-gnu}
         if [ ! -d "$sysroot/include" ]; then
-            echo "cc.sh: cross-building linux-riscv64 needs riscv64 libc headers, and none are at '$sysroot/include' - install Ubuntu's libc6-dev-riscv64-cross. compiling against the host's headers instead would emit an object built to the wrong architecture's libc (mach#2741, mach#2771)" >&2
+            echo "cc.sh: cross-building linux-riscv64 needs riscv64 libc headers, and none are at '$sysroot/include' - set MACH_RISCV64_SYSROOT to a riscv64 sysroot, or install Ubuntu's libc6-dev-riscv64-cross. compiling against the host's headers instead would emit an object built to the wrong architecture's libc (mach#2741, mach#2771)" >&2
             exit 1
         fi
         extra="-march=rv64gc -mabi=lp64d -mno-relax -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-jump-tables"

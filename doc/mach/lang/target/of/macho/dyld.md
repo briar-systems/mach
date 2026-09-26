@@ -18,6 +18,8 @@ pub fun func_import_count(dyn: *of.DynamicInfo) u32;
 pub fun import_needs_got(dyn: *of.DynamicInfo, import_index: u32) bool;
 ```
 
+a function's stub loads it from a slot, and a GOT-kind relocation reads one
+
 ## fun got_import_count
 
 ```mach
@@ -33,11 +35,20 @@ pub fun macho_stub_size(arch_id: u32) usize;
 ## fun macho_stub_shape
 
 ```mach
-pub fun macho_stub_shape(arch_id: u32, count: u32) res[of.StubShape, fail.Fail];
+pub fun macho_stub_shape(arch_id: u32, count: u32) res[of.TableShape, fail.Fail];
 ```
 
 the __TEXT,__stubs table the linker reserves at the end of the code, so a
 call site's branch reaches its stub whatever data the image carries
+
+## fun macho_got_shape
+
+```mach
+pub fun macho_got_shape(arch_id: u32, dyn: *of.DynamicInfo) res[of.TableShape, fail.Fail];
+```
+
+the __DATA_CONST,__got table the linker reserves ahead of the zero-fill, so a
+stub or a GOT load reaches its slot whatever zero-fill the image carries (#3903)
 
 ## fun write_macho_stub
 
@@ -55,20 +66,28 @@ pub fun dylib_ordinal_for(dyn: *of.DynamicInfo, import_index: u32) u32;
 
 ```mach
 pub fun measure_bind_info(itn: *intern.Interner, dyn: *of.DynamicInfo,
-segs: *of.LoadSegment, text_va: u64, pz: u32) usize;
+segs: *of.LoadSegment, text_va: u64, pz: u32, got_seg_offset: u64) usize;
 ```
 
 ## fun write_bind_info
 
 ```mach
 pub fun write_bind_info(buf: *u8, off: usize, itn: *intern.Interner, dyn: *of.DynamicInfo,
-segs: *of.LoadSegment, text_va: u64, pz: u32, got_seg_index: u32) usize;
+segs: *of.LoadSegment, text_va: u64, pz: u32, got_seg_index: u32, got_seg_offset: u64) usize;
 ```
 
 ## fun base_reloc_cmp
 
 ```mach
 pub fun base_reloc_cmp(a: *of.BaseReloc, b: *of.BaseReloc) i64;
+```
+
+## fun seg_offset_loc
+
+```mach
+pub fun seg_offset_loc(dyn: *of.DynamicInfo, ls: u32, seg_offset: u32,
+segs: *of.LoadSegment, text_va: u64, pz: u32,
+out_seg: *u32, out_off: *u64);
 ```
 
 ## fun measure_rebase_info

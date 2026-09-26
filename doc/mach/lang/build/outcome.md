@@ -98,18 +98,6 @@ pub fun str_text(e: string.StrError) str;
 pub fun format_text(e: format.FormatError) str;
 ```
 
-## fun encode_text
-
-```mach
-pub fun encode_text(e: binary.EncodeError) str;
-```
-
-## fun decode_text
-
-```mach
-pub fun decode_text(e: binary.DecodeError) str;
-```
-
 ## fun toml_text
 
 ```mach
@@ -120,30 +108,6 @@ pub fun toml_text(e: toml.TomlError) str;
 
 ```mach
 pub fun env_text(e: env.EnvError) str;
-```
-
-## fun exec_text
-
-```mach
-pub fun exec_text(e: exec.Error) str;
-```
-
-## fun parse_text
-
-```mach
-pub fun parse_text(e: parse.ParseError) str;
-```
-
-## fun thread_text
-
-```mach
-pub fun thread_text(e: thread.ThreadError) str;
-```
-
-## fun semver_text
-
-```mach
-pub fun semver_text(e: semver.SemverError) str;
 ```
 
 ## fun unit
@@ -160,22 +124,10 @@ the unit outcome of an operation whose value is not needed
 pub fun is_reported(f: Fail) bool;
 ```
 
-## fun is_user
-
-```mach
-pub fun is_user(f: Fail) bool;
-```
-
 ## fun is_internal
 
 ```mach
 pub fun is_internal(f: Fail) bool;
-```
-
-## fun is_environment
-
-```mach
-pub fun is_environment(f: Fail) bool;
 ```
 
 ## fun text
@@ -291,6 +243,9 @@ pub rec Artifact;
 pub rec TestArtifact;
 ```
 
+a collected test: its qualified name, where it is declared, the test object
+that holds it, and the dispatcher that runs it as `<exe> <idx>`
+
 ## rec BuildUnitEvent
 
 ```mach
@@ -395,8 +350,10 @@ made before the refusal
 ## fun record_test
 
 ```mach
-pub fun record_test(bo: *BuildOutcome, module: str, label: str, file: str, line: u32, exe: str, idx: u32) err[A.Error];
+pub fun record_test(bo: *BuildOutcome, t: TestArtifact) err[A.Error];
 ```
+
+t's text is borrowed; the outcome keeps its own copy. a nil text stays nil
 
 ## fun record_unit
 
@@ -463,21 +420,9 @@ pub rec GateTally;
 pub fun gate_tally_init(a: *A.Allocator) GateTally;
 ```
 
-## fun gate_tally_dnit
-
-```mach
-pub fun gate_tally_dnit(gt: *GateTally);
-```
-
 ## fun record_gate
 
 ```mach
 pub fun record_gate(gt: *GateTally, a: *A.Allocator, r: validation.ValidationGateResult) err[A.Error];
-```
-
-## fun gate_tally_total
-
-```mach
-pub fun gate_tally_total(gt: *GateTally) u32;
 ```
 

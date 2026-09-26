@@ -12,12 +12,6 @@ pub rec DebugInfo;
 pub fun no_debug() DebugInfo;
 ```
 
-## def EmitModuleFn
-
-```mach
-pub def EmitModuleFn: isa.EmitModuleFn
-```
-
 ## fun codegen_unit
 
 ```mach

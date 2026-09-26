@@ -1048,12 +1048,6 @@ pub fun desc(op: MirOpcode) *MirOpDescriptor;
 pub fun has(op: MirOpcode, mask: MirFlags) bool;
 ```
 
-## fun ct_class
-
-```mach
-pub fun ct_class(op: MirOpcode) MirCtClass;
-```
-
 ## fun ct_op
 
 ```mach
@@ -1082,102 +1076,6 @@ lane multiply is keyed by its operand lane width
 
 ```mach
 pub fun is_terminator(op: MirOpcode) bool;
-```
-
-## val SELECTION_REACHABLE_COUNT
-
-```mach
-pub val SELECTION_REACHABLE_COUNT:       u32 = 47
-```
-
-## val SELECTION_REACHABLE_FLOAT_COUNT
-
-```mach
-pub val SELECTION_REACHABLE_FLOAT_COUNT: u32 = 6
-```
-
-## val SELECTION_ELIMINATED_COUNT
-
-```mach
-pub val SELECTION_ELIMINATED_COUNT:      u32 = 7
-```
-
-## val SELECTION_FUSED_COUNT
-
-```mach
-pub val SELECTION_FUSED_COUNT:           u32 = 6
-```
-
-## val SELECTION_LANE_COUNT
-
-```mach
-pub val SELECTION_LANE_COUNT:            u32 = 2
-```
-
-## val SELECTION_WIDENING_MUL_COUNT
-
-```mach
-pub val SELECTION_WIDENING_MUL_COUNT:    u32 = 2
-```
-
-## val SELECTION_PACKED_WIDENING_COUNT
-
-```mach
-pub val SELECTION_PACKED_WIDENING_COUNT: u32 = 4
-```
-
-## val SELECTION_FIXED_PAIR_MUL_COUNT
-
-```mach
-pub val SELECTION_FIXED_PAIR_MUL_COUNT:  u32 = 2
-```
-
-## fun selection_reachable
-
-```mach
-pub fun selection_reachable(out: *u32);
-```
-
-## fun selection_reachable_float
-
-```mach
-pub fun selection_reachable_float(out: *u32);
-```
-
-## fun selection_eliminated
-
-```mach
-pub fun selection_eliminated(out: *u32);
-```
-
-## fun selection_lane
-
-```mach
-pub fun selection_lane(out: *u32);
-```
-
-## fun selection_widening_mul
-
-```mach
-pub fun selection_widening_mul(out: *u32);
-```
-
-## fun selection_packed_widening
-
-```mach
-pub fun selection_packed_widening(out: *u32);
-```
-
-## fun selection_fixed_pair_mul
-
-```mach
-pub fun selection_fixed_pair_mul(out: *u32);
-```
-
-## fun selection_fused
-
-```mach
-pub fun selection_fused(out: *u32);
 ```
 
 ## val FCC_EQ
@@ -1332,12 +1230,6 @@ pub val REG_CLASS_VALUE: u32 = 0xFFFFFFFF
 ```
 
 every vreg of a values convention: never a bank index
-
-## val ALU_MIN_WIDTH
-
-```mach
-pub val ALU_MIN_WIDTH: u8 = 4
-```
 
 ## rec MirOperand
 
