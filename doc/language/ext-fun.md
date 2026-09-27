@@ -449,6 +449,18 @@ bit-compatible with a C `int __attribute__((vector_size(32)))` parameter:
   record of the same size with `__attribute__((aligned(32)))` (or the vector's
   size), which Apple clang places as the psABI places the vector. Mach follows the
   psABI on darwin as on linux.
+- **System V x86-64 with `avx`** (`x86-64-v3` and up): the vector register is
+  `ymm`, so a 32-byte vector (`i32x8`, `f32x8`, `f64x4`) is SSE class and rides one
+  `ymm` register, as an argument and as a result, which is what gcc and clang do at
+  `-mavx`. Once the vector registers are used up it goes on the stack at its C
+  alignment. A 64-byte vector is still wider than the register and MEMORY class, as
+  above. Mach computes on 128-bit halves (256-bit instructions are #4128), so the
+  vector moves between `ymm` and its memory image with `vmovdqu`, and the function
+  runs `vzeroupper` once the value has left the register (after storing incoming
+  `ymm` arguments, and after storing a returned `ymm` value), so the 128-bit
+  instructions that follow do not pay for a dirty upper half. A call that places an
+  argument above the 16-byte stack alignment realigns the caller's stack pointer to
+  that argument's alignment, as the psABI requires of the argument area.
 - **x86_64-windows (Microsoft x64):** the carrier table under [Windows vector
   carriers](#windows-vector-carriers): a pointer to a caller copy, and
   caller-provided result storage.
@@ -456,8 +468,10 @@ bit-compatible with a C `int __attribute__((vector_size(32)))` parameter:
   registers: a pointer to a caller copy for an argument, and the indirect-result
   register for a return. Mach does the same.
 
-The width that decides "wider" is the vector register the target declares, 16
-bytes on every target mach has today.
+The width that decides "wider" is the vector register the target declares under its
+selected extensions: 16 bytes on every target mach has, and 32 on System V x86-64
+once the target selects `avx`. Microsoft x64 passes a 32-byte vector by reference
+whatever the extensions, so `avx` changes nothing there.
 
 A size no C vector type has has no C rule to follow: C's `vector_size` takes a
 power of two, so `i32x5` (20 bytes) and `f32x6` (24 bytes) have no C counterpart.

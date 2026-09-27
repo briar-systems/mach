@@ -104,10 +104,11 @@ pub fun resolve(reg: *TargetRegistry, req: *TargetRequest) res[resolved.Target, 
 ## val TARGET_FINGERPRINT_VERSION
 
 ```mach
-pub val TARGET_FINGERPRINT_VERSION: u8 = 9
+pub val TARGET_FINGERPRINT_VERSION: u8 = 10
 ```
 
-version 9: the image domain carries how the convention passes an f16 (#3800)
+version 9: the image domain carries how the convention passes an f16 (#3800).
+version 10: the model domain carries the vector register-width rows (#3751)
 
 ## fun fingerprint
 

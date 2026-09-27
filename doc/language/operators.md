@@ -457,7 +457,8 @@ by its own.
 | uniform `<<`, `>>` on 16-, 32- and 64-bit lanes | packed `psll*` / `psrl*` / `psra*` | scalar expansion | scalar expansion |
 | uniform arithmetic `>>` on 64-bit lanes | scalar expansion (`psraq` is AVX-512VL) | scalar expansion | scalar expansion |
 | uniform `<<`, `>>` on 8-bit lanes | packed through the 16-bit shifts, each byte shifted with its neighbour cleared | scalar expansion | scalar expansion |
-| per-lane count, any lane width | scalar expansion (SSE2 has no per-lane shift; `vpsllv*` is AVX2) | scalar expansion | scalar expansion |
+| per-lane count on 32- and 64-bit lanes | packed `vpsllv*` / `vpsrlv*` / `vpsravd` under `avx2`, else scalar expansion (the 64-bit arithmetic `vpsravq` is AVX-512VL) | scalar expansion | scalar expansion |
+| per-lane count on 8- and 16-bit lanes | scalar expansion | scalar expansion | scalar expansion |
 
 The packed instructions saturate a count at or above the lane width on their
 own, so they need none of the scalar shift's range test. SPIR-V leaves an

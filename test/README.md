@@ -133,6 +133,11 @@ The `riscv64zkt-linux` column is riscv64-linux with the Zkt extension selected,
 the one corpus target that admits a secret multiply. It serves the `ct` group
 only, which `cases/ONLY.riscv64zkt-linux` states.
 
+The `x86_64v3-linux` column is x86_64-linux with the `x86-64-v3` level selected,
+where the vector cells its extensions add rows for pack (the avx2 per-lane
+shifts among them). It serves the `vec` group only, which
+`cases/ONLY.x86_64v3-linux` states, and runs natively on a host with AVX2.
+
 ## Doc blocks
 
 `--docs` reads every `.md` page of `doc/language` (or of `DOCS`, when set) and

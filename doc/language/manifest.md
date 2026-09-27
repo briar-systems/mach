@@ -299,7 +299,7 @@ selection is closed over that once, when the target resolves. `sse41` brings `ss
 `f` and `f` brings `zicsr`, as the isa string's own grammar has it, so `extensions = ["d"]` on `rv64i` selects
 `rv64ifd` with Zicsr. The isa string and the list feed one set: `isa = "rv64i"` with
 `extensions = ["m"]` selects the same machine as `isa = "rv64im"`. A name nothing in
-the compiler encodes against yet (`avx2`, `avx512f`) is still a declared requirement:
+the compiler encodes against yet (`avx`, `avx512f`) is still a declared requirement:
 the inline assembler has no rows to admit under it, so today it records only the
 promise the binary makes about its hosts, and the promise is the program's to check.
 
