@@ -1,0 +1,583 @@
+# the instruction sequence that divides by a constant: shifts and masks for a
+# power of two of either sign, and a multiply by the divisor's reciprocal
+# (Granlund and Montgomery) for any other divisor on a target that declares a
+# high multiply. a plan is data: the lowering emits its steps as MIR, and
+# `eval` runs the same steps, which is how every sequence is proven against
+# the division it replaces (#3350)
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+
+use mach.lang.be.codegen.mir;
+use mach.lang.wide;
+
+# an operand slot that names no earlier value: the step's immediate, or no
+# second operand at all
+pub val OPERAND_IMM:  u8 = 0xFF;
+pub val OPERAND_NONE: u8 = 0xFE;
+
+pub val MAX_STEPS: u32 = 10;
+
+# one instruction at the plan's width: value `a` and value `b` (or `imm`).
+# value 0 is the dividend extended to the width, value i + 1 the result of
+# step i
+pub rec DivStep {
+    op:  mir.MirOpcode;
+    a:   u8;
+    b:   u8;
+    imm: wide.Wide;
+}
+
+# the steps run at `width` bytes over the dividend of `nbytes`, extended by
+# its signedness, and the last step's value is the quotient or remainder
+pub rec DivPlan {
+    width:  u8;
+    nbytes: u8;
+    signed: bool;
+    len:    u32;
+    steps:  [MAX_STEPS]DivStep;
+}
+
+fun one() wide.Wide {
+    ret wide.from_u64(1);
+}
+
+fun pow2(n: u32) wide.Wide {
+    ret wide.shl(one(), n);
+}
+
+fun push(p: *DivPlan, op: mir.MirOpcode, a: u8, b: u8, imm: wide.Wide) u8 {
+    p.steps[p.len] = DivStep{op: op, a: a, b: b, imm: imm};
+    p.len          = p.len + 1;
+    ret p.len::u8;
+}
+
+fun push_imm(p: *DivPlan, op: mir.MirOpcode, a: u8, imm: wide.Wide) u8 {
+    ret push(p, op, a, OPERAND_IMM, wide.trunc(imm, p.width::u32 * 8));
+}
+
+fun push_val(p: *DivPlan, op: mir.MirOpcode, a: u8, b: u8) u8 {
+    ret push(p, op, a, b, wide.zero());
+}
+
+# the plan for dividing an `nbytes` value by `divisor`, or its remainder, or
+# none when the target's divide is the only sequence: a divisor of magnitude
+# below 2 (a zero divisor keeps its trap, and -1 its overflow behaviour), or a
+# divisor that is no power of two on a target without a high multiply at the
+# dividend's width. `pow2_width` is the width a shift sequence runs at, the
+# dividend's width raised to the target's ALU floor
+pub fun plan(divisor: wide.Wide, nbytes: u8, signed: bool, rem: bool, pow2_width: u8, mul_hi_width: u32) opt[DivPlan] {
+    val n:   u32       = nbytes::u32 * 8;
+    val dv:  wide.Wide = wide.trunc(divisor, n);
+    var mag: wide.Wide = dv;
+    var neg: bool      = false;
+    if (signed && wide.is_negative(wide.sext(dv, n))) {
+        mag = wide.trunc(wide.neg(wide.sext(dv, n)), n + 1);
+        neg = true;
+    }
+    if (wide.lt_u(mag, wide.from_u64(2))) { ret opt[DivPlan].none{}; }
+
+    var p: DivPlan;
+    p.nbytes = nbytes;
+    p.signed = signed;
+    p.len    = 0;
+    if (wide.is_pow2(mag)) {
+        p.width = pow2_width;
+        pow2_steps(?p, wide.trailing_zeros(mag), neg, rem);
+        ret opt[DivPlan].some{p};
+    }
+    if (mul_hi_width == 0 || nbytes::u32 > mul_hi_width) { ret opt[DivPlan].none{}; }
+    p.width = mul_hi_width::u8;
+    var q: u8 = 0;
+    if (signed) { q = signed_steps(?p, mag, neg); }
+    or          { q = unsigned_steps(?p, mag); }
+    if (rem) {
+        val t: u8 = push_imm(?p, mir.MIR_MUL, q, wide.sext(dv, n));
+        push_val(?p, mir.MIR_SUB, 0, t);
+    }
+    ret opt[DivPlan].some{p};
+}
+
+# a quotient by 2^k is the logical shift, and a remainder the low k bits. the
+# signed forms round toward zero by adding 2^k - 1 to a negative dividend
+# before the arithmetic shift; a negative divisor negates the quotient and
+# leaves the remainder, whose sign is the dividend's
+fun pow2_steps(p: *DivPlan, k: u32, neg: bool, rem: bool) {
+    val bits: u32 = p.width::u32 * 8;
+    if (!p.signed) {
+        if (rem) { push_imm(p, mir.MIR_AND, 0, wide.sub(pow2(k), one())); }
+        or       { push_imm(p, mir.MIR_SHR_U, 0, wide.from_u64(k::u64)); }
+        ret;
+    }
+    val s: u8 = push_imm(p, mir.MIR_SHR_S, 0, wide.from_u64((bits - 1)::u64));
+    val b: u8 = push_imm(p, mir.MIR_SHR_U, s, wide.from_u64((bits - k)::u64));
+    val a: u8 = push_val(p, mir.MIR_ADD, 0, b);
+    if (rem) {
+        val m: u8 = push_imm(p, mir.MIR_AND, a, wide.neg(pow2(k)));
+        push_val(p, mir.MIR_SUB, 0, m);
+        ret;
+    }
+    val q: u8 = push_imm(p, mir.MIR_SHR_S, a, wide.from_u64(k::u64));
+    if (neg) { push(p, mir.MIR_NEG, q, OPERAND_NONE, wide.zero()); }
+}
+
+# the largest dividend below 2^n that leaves the remainder d - 1: the one
+# whose rounding error is the largest (Hacker's Delight, 10-9)
+fun worst_dividend(d: wide.Wide, n: u32) wide.Wide {
+    var q: wide.Wide;
+    var r: wide.Wide;
+    wide.divmod_u(pow2(n), d, ?q, ?r);
+    ret wide.sub(wide.sub(pow2(n), one()), r);
+}
+
+# the smallest shift p >= floor with m = ceil(2^p / d) exact for every
+# dividend below 2^n: with e = m*d - 2^p, e * nc < 2^p for the worst dividend
+# nc keeps floor(x*m / 2^p) at floor(x / d). p = n + ceil(log2 d) always
+# qualifies, so m is at most n + 1 bits
+fun unsigned_magic(d: wide.Wide, n: u32, floor: u32, m_out: *wide.Wide) u32 {
+    val nc: wide.Wide = worst_dividend(d, n);
+    var p:  u32       = floor;
+    for (p < 128) {
+        var q: wide.Wide;
+        var r: wide.Wide;
+        wide.divmod_u(pow2(p), d, ?q, ?r);
+        var m: wide.Wide = q;
+        var e: wide.Wide = wide.zero();
+        if (!wide.is_zero(r)) {
+            m = wide.add(q, one());
+            e = wide.sub(d, r);
+        }
+        if (wide.lt_u(wide.mul(e, nc), pow2(p))) {
+            @m_out = m;
+            ret p;
+        }
+        p = p + 1;
+    }
+    @m_out = wide.zero();
+    ret 0;
+}
+
+# the smallest shift p >= n with m = floor(2^p / a) + 1 exact for every
+# dividend of magnitude up to 2^(n-1): with e = m*a - 2^p, e * nc < 2^p for
+# the worst dividend nc below 2^(n-1) keeps floor(x*m / 2^p) at floor(x / a)
+# for x >= 0 and one below trunc(x / a) for x < 0 (Hacker's Delight, 10-1).
+# p = n - 1 + ceil(log2 a) always qualifies, so m <= 2^n
+fun signed_magic(a: wide.Wide, n: u32, m_out: *wide.Wide) u32 {
+    val nc: wide.Wide = worst_dividend(a, n - 1);
+    var p:  u32       = n;
+    for (p < 128) {
+        var q: wide.Wide;
+        var r: wide.Wide;
+        wide.divmod_u(pow2(p), a, ?q, ?r);
+        val e: wide.Wide = wide.sub(a, r);
+        if (wide.lt_u(wide.mul(e, nc), pow2(p))) {
+            @m_out = wide.add(q, one());
+            ret p;
+        }
+        p = p + 1;
+    }
+    @m_out = wide.zero();
+    ret 0;
+}
+
+fun push_shift(p: *DivPlan, op: mir.MirOpcode, a: u8, by: u32) u8 {
+    if (by == 0) { ret a; }
+    ret push_imm(p, op, a, wide.from_u64(by::u64));
+}
+
+# the unsigned quotient by a divisor d that is no power of two
+fun unsigned_steps(p: *DivPlan, d: wide.Wide) u8 {
+    val n:    u32 = p.nbytes::u32 * 8;
+    val bits: u32 = p.width::u32 * 8;
+    # a divisor past half the range divides at most once
+    if (n == bits && wide.lt_u(pow2(n - 1), d)) {
+        val c: u8 = push_imm(p, mir.MIR_CMP_LT_U, 0, d);
+        ret push_imm(p, mir.MIR_XOR, c, one());
+    }
+    var m: wide.Wide;
+    val s: u32 = unsigned_magic(d, n, n, ?m);
+
+    if (n < bits) {
+        # the product of the extended dividend and m fits the width: one low
+        # multiply and a shift. otherwise (2n = width, m past n bits) m scaled
+        # to the width's top is the high multiply's operand and the high half
+        # the quotient
+        if (wide.lt_u(wide.mul(m, wide.sub(pow2(n), one())), pow2(bits))) {
+            val t: u8 = push_imm(p, mir.MIR_MUL, 0, m);
+            ret push_shift(p, mir.MIR_SHR_U, t, s);
+        }
+        ret push_imm(p, mir.MIR_MUL_HI_U, 0, wide.shl(m, bits - s));
+    }
+
+    if (wide.lt_u(m, pow2(n))) {
+        val t: u8 = push_imm(p, mir.MIR_MUL_HI_U, 0, m);
+        ret push_shift(p, mir.MIR_SHR_U, t, s - n);
+    }
+    # an even divisor drops its factors of two from the dividend first, which
+    # leaves a magic that fits the width
+    val pre: u32 = wide.trailing_zeros(d);
+    if (pre > 0) {
+        var m2: wide.Wide;
+        val s2: u32 = unsigned_magic(wide.shr_u(d, pre), n - pre, n, ?m2);
+        val x2: u8  = push_shift(p, mir.MIR_SHR_U, 0, pre);
+        val t:  u8  = push_imm(p, mir.MIR_MUL_HI_U, x2, m2);
+        ret push_shift(p, mir.MIR_SHR_U, t, s2 - n);
+    }
+    # m is n + 1 bits: x*m / 2^n is x + hi(x * (m - 2^n)), halved without
+    # overflow as ((x - t) >> 1) + t before the rest of the shift
+    val t: u8 = push_imm(p, mir.MIR_MUL_HI_U, 0, wide.sub(m, pow2(n)));
+    val u: u8 = push_val(p, mir.MIR_SUB, 0, t);
+    val h: u8 = push_imm(p, mir.MIR_SHR_U, u, one());
+    val v: u8 = push_val(p, mir.MIR_ADD, h, t);
+    ret push_shift(p, mir.MIR_SHR_U, v, s - n - 1);
+}
+
+# the signed quotient by a divisor of magnitude `a`, no power of two: the
+# floor of x*m / 2^p, one added for a negative result, negated for a negative
+# divisor
+fun signed_steps(p: *DivPlan, a: wide.Wide, neg: bool) u8 {
+    val n:    u32 = p.nbytes::u32 * 8;
+    val bits: u32 = p.width::u32 * 8;
+    var m:    wide.Wide;
+    val s:    u32 = signed_magic(a, n, ?m);
+
+    var f: u8 = 0;
+    if (n < bits) {
+        # |x| <= 2^(n-1) and m <= 2^n, so the product is exact at the width
+        val t: u8 = push_imm(p, mir.MIR_MUL, 0, m);
+        f = push_shift(p, mir.MIR_SHR_S, t, s);
+    }
+    or {
+        # an m past n - 1 bits is m - 2^n to the signed high multiply, and the
+        # dividend added back restores x*m / 2^n
+        var t: u8 = 0;
+        if (wide.lt_u(m, pow2(n - 1))) { t = push_imm(p, mir.MIR_MUL_HI_S, 0, m); }
+        or {
+            val h: u8 = push_imm(p, mir.MIR_MUL_HI_S, 0, wide.sub(m, pow2(n)));
+            t = push_val(p, mir.MIR_ADD, h, 0);
+        }
+        f = push_shift(p, mir.MIR_SHR_S, t, s - n);
+    }
+    if (neg) {
+        val sign: u8 = push_imm(p, mir.MIR_SHR_S, f, wide.from_u64((bits - 1)::u64));
+        ret push_val(p, mir.MIR_SUB, sign, f);
+    }
+    val sign: u8 = push_imm(p, mir.MIR_SHR_U, f, wide.from_u64((bits - 1)::u64));
+    ret push_val(p, mir.MIR_ADD, f, sign);
+}
+
+fun operand(vals: *wide.Wide, s: *DivStep) wide.Wide {
+    if (s.b == OPERAND_IMM) { ret s.imm; }
+    ret vals[s.b::u32];
+}
+
+# the high half of the product of two width-wide values, the width at most
+# 8 bytes, where the full product is exact in 128 bits
+fun mul_hi(a: wide.Wide, b: wide.Wide, bits: u32, signed: bool) wide.Wide {
+    if (signed) { ret wide.trunc(wide.shr_s(wide.mul(wide.sext(a, bits), wide.sext(b, bits)), bits), bits); }
+    ret wide.shr_u(wide.mul(a, b), bits);
+}
+
+# the value a plan computes for the dividend `x`, an `nbytes` value, with the
+# steps' machine semantics at the plan's width
+pub fun eval(p: *DivPlan, x: wide.Wide) wide.Wide {
+    val n:    u32 = p.nbytes::u32 * 8;
+    val bits: u32 = p.width::u32 * 8;
+    var vals: [MAX_STEPS + 1]wide.Wide;
+    if (p.signed) { vals[0] = wide.trunc(wide.sext(x, n), bits); }
+    or            { vals[0] = wide.trunc(x, n); }
+    var i: u32 = 0;
+    for (i < p.len) {
+        val s:  *DivStep      = ?p.steps[i];
+        val a:  wide.Wide     = vals[s.a::u32];
+        val b:  wide.Wide     = operand(?vals[0], s);
+        var r:  wide.Wide     = wide.zero();
+        val op: mir.MirOpcode = s.op;
+        if (op == mir.MIR_ADD)                         { r = wide.add(a, b); }
+        or (op == mir.MIR_SUB)                         { r = wide.sub(a, b); }
+        or (op == mir.MIR_MUL)                         { r = wide.mul(a, b); }
+        or (op == mir.MIR_MUL_HI_U)                    { r = mul_hi(a, b, bits, false); }
+        or (op == mir.MIR_MUL_HI_S)                    { r = mul_hi(a, b, bits, true); }
+        or (op == mir.MIR_SHR_U)                       { r = wide.shr_u(a, b.lo::u32); }
+        or (op == mir.MIR_SHR_S)                       { r = wide.shr_s(wide.sext(a, bits), b.lo::u32); }
+        or (op == mir.MIR_AND)                         { r = wide.and(a, b); }
+        or (op == mir.MIR_XOR)                         { r = wide.xor(a, b); }
+        or (op == mir.MIR_NEG)                         { r = wide.neg(a); }
+        or (op == mir.MIR_CMP_LT_U && wide.lt_u(a, b)) { r = one(); }
+        vals[i + 1] = wide.trunc(r, bits);
+        i           = i + 1;
+    }
+    ret wide.trunc(vals[p.len], n);
+}
+
+# the quotient or remainder of x by d as `bits`-wide values, rounding toward
+# zero when signed
+#[testing]
+fun t_ref(x: wide.Wide, d: wide.Wide, bits: u32, signed: bool, rem: bool) wide.Wide {
+    var q: wide.Wide;
+    var r: wide.Wide;
+    if (signed) { wide.divmod_s(wide.sext(x, bits), wide.sext(d, bits), ?q, ?r); }
+    or          { wide.divmod_u(wide.trunc(x, bits), wide.trunc(d, bits), ?q, ?r); }
+    if (rem)    { ret wide.trunc(r, bits); }
+    ret wide.trunc(q, bits);
+}
+
+# the plan's answer for x, compared with the division; true when they agree
+#[testing]
+fun t_agrees(p: *DivPlan, x: wide.Wide, d: wide.Wide, rem: bool) bool {
+    val bits: u32 = p.nbytes::u32 * 8;
+    ret wide.eq(eval(p, x), t_ref(x, d, bits, p.signed, rem));
+}
+
+# a plan exists exactly for a divisor of magnitude 2 or more
+#[testing]
+fun t_plan(d: wide.Wide, nbytes: u8, signed: bool, rem: bool, pow2_width: u8, mul_hi: u32, out: *DivPlan) i32 {
+    val bits: u32          = nbytes::u32 * 8;
+    val got:  opt[DivPlan] = plan(d, nbytes, signed, rem, pow2_width, mul_hi);
+    var mag:  wide.Wide    = wide.trunc(d, bits);
+    if (signed && wide.is_negative(wide.sext(d, bits))) { mag = wide.trunc(wide.neg(wide.sext(d, bits)), bits + 1); }
+    val want: bool = !wide.lt_u(mag, wide.from_u64(2));
+    if (sel got.none) {
+        if (want) { ret 1; }
+        ret 0;
+    }
+    if (!want)                    { ret 2; }
+    if (got.some.len > MAX_STEPS) { ret 3; }
+    @out = got.some;
+    ret 0;
+}
+
+#[testing]
+fun t_has(d: wide.Wide, nbytes: u8, signed: bool, rem: bool, pow2_width: u8, mul_hi: u32) bool {
+    val got: opt[DivPlan] = plan(d, nbytes, signed, rem, pow2_width, mul_hi);
+    if (sel got.some) { ret true; }
+    ret false;
+}
+
+#[testing]
+val T_WIDTHS: [2]u32 = [2]u32{8, 4};
+
+# every 8-bit dividend by every 8-bit divisor, signed and unsigned, quotient
+# and remainder, at both high-multiply widths a target declares
+test plan__every_8bit_dividend_and_divisor {
+    var wi: u32 = 0;
+    for (wi < 2) {
+        val mul_hi: u32 = T_WIDTHS[wi];
+        var mode:   u32 = 0;
+        for (mode < 4) {
+            val signed: bool = (mode & 1) != 0;
+            val rem:    bool = (mode & 2) != 0;
+            var d:      u64  = 0;
+            for (d < 256) {
+                var p: DivPlan;
+                p.len = 0;
+                if (t_plan(wide.from_u64(d), 1, signed, rem, mul_hi::u8, mul_hi, ?p) != 0) { ret 1; }
+                if (p.len > 0) {
+                    var x: u64 = 0;
+                    for (x < 256) {
+                        if (!t_agrees(?p, wide.from_u64(x), wide.from_u64(d), rem)) { ret 2; }
+                        x = x + 1;
+                    }
+                }
+                d = d + 1;
+            }
+            mode = mode + 1;
+        }
+        wi = wi + 1;
+    }
+    ret 0;
+}
+
+# every 16-bit divisor over every 16-bit dividend. each step of the sequence
+# is non-decreasing in the dividend (non-increasing for a negative divisor),
+# on each side of zero when signed, and so is the true quotient, so the two
+# agree on every dividend when they agree at both ends of every run of
+# dividends that share a quotient; the remainder is x - q*d from the same q
+test plan__every_16bit_divisor_at_every_quotient_boundary {
+    var wi: u32 = 0;
+    for (wi < 2) {
+        val mul_hi: u32 = T_WIDTHS[wi];
+        var sv:     u32 = 0;
+        for (sv < 2) {
+            val signed: bool = sv == 1;
+            var d:      u64  = 0;
+            for (d < 65536) {
+                var p: DivPlan;
+                p.len = 0;
+                if (t_plan(wide.from_u64(d), 2, signed, false, 4, mul_hi, ?p) != 0) { ret 1; }
+                if (p.len > 0) {
+                    var r: DivPlan;
+                    r.len = 0;
+                    if (t_plan(wide.from_u64(d), 2, signed, true, 4, mul_hi, ?r) != 0) { ret 2; }
+                    # the magnitude a of the divisor shares one quotient over
+                    # the dividends of magnitude k*a .. k*a + a - 1
+                    var a:   u64 = d;
+                    var top: u64 = 65535;
+                    if (signed) {
+                        top = 32767;
+                        if (d >= 32768) { a = 65536 - d; }
+                    }
+                    var k: u64 = 0;
+                    for (k * a <= top + 1) {
+                        var ends: [2]u64 = [2]u64{k * a, k * a + a - 1};
+                        if (ends[0] <= top) {
+                            if (ends[1] > top) { ends[1] = top; }
+                            var j: u32 = 0;
+                            for (j < 2) {
+                                if (!t_agrees(?p, wide.from_u64(ends[j]), wide.from_u64(d), false)) { ret 3; }
+                                if (!t_agrees(?r, wide.from_u64(ends[j]), wide.from_u64(d), true))  { ret 4; }
+                                j = j + 1;
+                            }
+                        }
+                        # a negative dividend's magnitude runs 1 .. 2^15
+                        var neg: [2]u64 = [2]u64{k * a, k * a + a - 1};
+                        if (neg[0] == 0)    { neg[0] = 1; }
+                        if (neg[1] > 32768) { neg[1] = 32768; }
+                        if (signed && neg[0] <= neg[1]) {
+                            var j: u32 = 0;
+                            for (j < 2) {
+                                val x: wide.Wide = wide.from_u64(65536 - neg[j]);
+                                if (!t_agrees(?p, x, wide.from_u64(d), false)) { ret 5; }
+                                if (!t_agrees(?r, x, wide.from_u64(d), true))  { ret 6; }
+                                j = j + 1;
+                            }
+                        }
+                        k = k + 1;
+                    }
+                }
+                d = d + 1;
+            }
+            sv = sv + 1;
+        }
+        wi = wi + 1;
+    }
+    ret 0;
+}
+
+#[testing]
+fun t_next(s: *u64) u64 {
+    var x: u64 = @s;
+    x  = x ^ (x << 13);
+    x  = x ^ (x >> 7);
+    x  = x ^ (x << 17);
+    @s = x;
+    ret x;
+}
+
+# a value of a random bit length, so small and large divisors both occur
+#[testing]
+fun t_sized(s: *u64, bits: u32) u64 {
+    val len: u64 = t_next(s) % bits::u64 + 1;
+    var v:   u64 = t_next(s);
+    if (len < 64) { v = v & ((1::u64 << len) - 1); }
+    ret v;
+}
+
+# the dividends a 32- or 64-bit divisor is checked at: the range's ends, the
+# neighbourhood of the divisor, the worst dividend of each sign (the largest
+# magnitude with remainder a - 1, a the divisor's magnitude) and its
+# neighbour, and random ones of every size
+#[testing]
+fun t_check_wide(p: *DivPlan, d: u64, bits: u32, rem: bool, s: *u64) bool {
+    val mask: wide.Wide = wide.trunc(wide.from_i64(-1), bits);
+    val dw:   wide.Wide = wide.trunc(wide.from_u64(d), bits);
+    var a:    wide.Wide = dw;
+    var top:  wide.Wide = mask;
+    if (p.signed) {
+        top = wide.shr_u(mask, 1);
+        if (wide.is_negative(wide.sext(dw, bits))) { a = wide.trunc(wide.neg(wide.sext(dw, bits)), bits + 1); }
+    }
+    var q: wide.Wide;
+    var r: wide.Wide;
+    wide.divmod_u(wide.add(top, one()), a, ?q, ?r);
+    val worst: wide.Wide = wide.sub(wide.sub(wide.add(top, one()), r), one());
+    var edge:  [14]wide.Wide;
+    edge[0]  = wide.zero();
+    edge[1]  = one();
+    edge[2]  = mask;
+    edge[3]  = wide.shr_u(mask, 1);
+    edge[4]  = wide.trunc(wide.add(wide.shr_u(mask, 1), one()), bits);
+    edge[5]  = wide.trunc(wide.sub(dw, one()), bits);
+    edge[6]  = dw;
+    edge[7]  = wide.trunc(wide.add(dw, one()), bits);
+    edge[8]  = wide.trunc(wide.neg(dw), bits);
+    edge[9]  = worst;
+    edge[10] = wide.add(worst, one());
+    edge[11] = wide.trunc(wide.neg(worst), bits);
+    edge[12] = wide.trunc(wide.neg(wide.add(worst, one())), bits);
+    edge[13] = wide.trunc(wide.sub(worst, one()), bits);
+    var i: u32 = 0;
+    for (i < 14) {
+        if (!t_agrees(p, wide.trunc(edge[i], bits), dw, rem)) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 64) {
+        if (!t_agrees(p, wide.from_u64(t_sized(s, bits)), dw, rem))                             { ret false; }
+        if (!t_agrees(p, wide.trunc(wide.neg(wide.from_u64(t_sized(s, bits))), bits), dw, rem)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+#[testing]
+val T_DIVISORS: [12]u64 = [12]u64{3, 5, 7, 10, 1000000007, 641, 6700417, 0x7FFFFFFF, 0x80000001, 0xFFFFFFFF, 0x7FFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF};
+
+# 32- and 64-bit divisors, fixed ones and random ones of every size, each at
+# the dividends t_check_wide names, signed and unsigned, quotient and remainder
+test plan__32_and_64_bit_divisors_hold_at_edge_and_random_dividends {
+    var seed: u64 = 0x9E3779B97F4A7C15;
+    var cfg:  u32 = 0;
+    for (cfg < 2) {
+        var bits:   u32 = 64;
+        var mul_hi: u32 = 8;
+        if (cfg == 1) {
+            bits   = 32;
+            mul_hi = 4;
+        }
+        var mode: u32 = 0;
+        for (mode < 4) {
+            val signed: bool = (mode & 1) != 0;
+            val rem:    bool = (mode & 2) != 0;
+            var i:      u32  = 0;
+            for (i < 1012) {
+                var d: u64 = 0;
+                if (i < 12) { d = T_DIVISORS[i]; }
+                or          { d = t_sized(?seed, bits); }
+                var p: DivPlan;
+                p.len = 0;
+                if (t_plan(wide.from_u64(d), (bits / 8)::u8, signed, rem, mul_hi::u8, mul_hi, ?p) != 0) { ret 1; }
+                if (p.len > 0 && !t_check_wide(?p, d, bits, rem, ?seed))                                { ret 2; }
+                i = i + 1;
+            }
+            mode = mode + 1;
+        }
+        cfg = cfg + 1;
+    }
+    ret 0;
+}
+
+# a divisor is read at the dividend's width, both limbs of a 128-bit one; a
+# target without a high multiply keeps the division for any divisor but a
+# power of two, and so does a dividend wider than the high multiply
+test plan__reads_the_divisor_at_the_dividend_width {
+    var p:   DivPlan;
+    val k64: opt[DivPlan] = plan(wide.make(0, 1), 16, false, false, 16, 8);
+    if (sel k64.none)                                                                                 { ret 1; }
+    if (k64.some.len != 1 || k64.some.steps[0].op != mir.MIR_SHR_U || k64.some.steps[0].imm.lo != 64) { ret 1; }
+    val rem64: opt[DivPlan] = plan(wide.make(0, 1), 16, false, true, 16, 8);
+    if (sel rem64.none) { ret 2; }
+    p = rem64.some;
+    if (!wide.eq(eval(?p, wide.make(5, 7)), wide.from_u64(5))) { ret 2; }
+    if (t_has(wide.make(4, 1), 16, false, false, 16, 8))       { ret 3; }
+    if (t_has(wide.make(0, 1), 8, false, false, 8, 8))         { ret 4; }
+    val low8: opt[DivPlan] = plan(wide.from_u64(0x108), 1, false, false, 4, 8);
+    if (sel low8.none)                                  { ret 5; }
+    if (low8.some.steps[0].imm.lo != 3)                 { ret 5; }
+    if (t_has(wide.from_u64(3), 4, false, false, 4, 0)) { ret 6; }
+    if (t_has(wide.from_u64(3), 8, true, false, 4, 4))  { ret 7; }
+    if (!t_has(wide.from_u64(4), 8, true, false, 8, 0)) { ret 8; }
+    if (t_has(wide.from_i64(-1), 8, true, false, 8, 8)) { ret 9; }
+    ret 0;
+}
