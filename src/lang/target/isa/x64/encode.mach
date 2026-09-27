@@ -133,6 +133,14 @@ fun needs_rex_for_byte_reg(reg: i32) bool {
 }
 
 fun encode_mem_operand(buf: *enc.ByteBuf, reg: i32, op: *isa.Operand) {
+    encode_mem_operand_scaled(buf, reg, op, 1);
+}
+
+# the modrm, sib and displacement of a memory operand whose 8-bit displacement
+# counts units of `n` bytes: 1 for the legacy and vex encodings, and the evex
+# disp8*N compression otherwise, where a displacement that is not a multiple
+# of `n`, or whose quotient leaves the byte, takes the 32-bit field
+fun encode_mem_operand_scaled(buf: *enc.ByteBuf, reg: i32, op: *isa.Operand, n: i32) {
     val base:      i32  = op.base;
     val index:     i32  = op.index;
     val disp:      i32  = op.disp;
@@ -212,7 +220,7 @@ fun encode_mem_operand(buf: *enc.ByteBuf, reg: i32, op: *isa.Operand) {
         ret;
     }
 
-    if (disp >= -128 && disp <= 127) {
+    if (disp % n == 0 && disp / n >= -128 && disp / n <= 127) {
         if (use_sib) {
             enc.emit_byte(buf, encode_modrm(1, reg_bits(reg), 4));
             var idx_reg: u8 = 4;
@@ -222,7 +230,7 @@ fun encode_mem_operand(buf: *enc.ByteBuf, reg: i32, op: *isa.Operand) {
         or {
             enc.emit_byte(buf, encode_modrm(1, reg_bits(reg), reg_bits(base)));
         }
-        enc.emit_byte(buf, disp::u8);
+        enc.emit_byte(buf, (disp / n)::u8);
         ret;
     }
 
@@ -4398,7 +4406,103 @@ fun emit_vex_rm(m: OpMap, l: u8, reg: i32, vvvv: i32, rm: isa.Operand, buf: *enc
     or                          { encode_mem_operand(buf, reg, ?rm); }
 }
 
-fun note_vex3(buf: *enc.ByteBuf, start: usize, opcode: u16, dst: isa.Operand, src1: isa.Operand, src2: isa.Operand) {
+# how an evex row scales a compressed 8-bit displacement: the tuple type of
+# its memory operand
+def Tuple: u8;
+
+# a full vector: N is the vector length in bytes, or the element with the
+# broadcast bit set, 4 bytes under W0 and 8 under W1
+val TUPLE_FULL: Tuple = 0;
+
+# an opcode's evex encoding: its place in the opcode space, which the legacy
+# and vex encodings read as well, and the tuple type of its memory operand
+rec EvexRow {
+    m:     OpMap;
+    tuple: Tuple;
+}
+
+# the evex-only rows: instructions with no legacy or vex encoding
+fun evex_row(op: u16) opt[EvexRow] {
+    if (op == x64.VPMULLQ) { ret opt[EvexRow].some{EvexRow{m: OpMap{prefix: 0x66, map: 0x38, opbyte: 0x40, w: 1}, tuple: TUPLE_FULL}}; }
+    ret opt[EvexRow].none{};
+}
+
+# what an evex prefix carries beyond the row and the registers. `ll` is the
+# vector length (0 for 128 bits, 1 for 256, 2 for 512), or the rounding
+# control of a register form with `b` set. `mask` is the opmask register
+# k0-k7 that writes the destination lane by lane, k0 for none, and `zero`
+# clears the lanes it leaves out instead of keeping them. `b` broadcasts one
+# element of a memory source to every lane, or embeds the rounding control
+# (with suppressed exceptions) in a register form
+rec EvexCtl {
+    ll:   u8;
+    mask: u8;
+    zero: bool;
+    b:    bool;
+}
+
+fun evex_unmasked(ll: u8) EvexCtl {
+    ret EvexCtl{ll: ll, mask: 0, zero: false, b: false};
+}
+
+# the disp8*N scale of a row's memory operand under the prefix `e` sets
+fun evex_disp_scale(r: EvexRow, e: EvexCtl) i32 {
+    if (r.tuple != TUPLE_FULL) { panic("encode: evex row names an unmodelled tuple type\n"); }
+    if (e.b) {
+        if (r.m.w == 1) { ret 8; }
+        ret 4;
+    }
+    ret 16 << e.ll::i32;
+}
+
+# bit 3 and bit 4 of a register index, which the prefix carries apart from
+# the three modrm bits; false for no register
+fun reg_bit3(id: i32) bool {
+    ret id >= 0 && (isa.regid_index(id) & 8) != 0;
+}
+
+fun reg_bit4(id: i32) bool {
+    ret id >= 0 && (isa.regid_index(id) & 16) != 0;
+}
+
+# one evex-encoded instruction: 62, then P0 (inverted R X B R', the map),
+# P1 (W, inverted vvvv, a fixed one, pp) and P2 (z, L'L, b, inverted V', aaa).
+# `reg`, `vvvv` and a register `rm` index all 32 vector registers: R' and V'
+# carry bit 4 of reg and vvvv, and X carries it for a register rm, where it
+# names no index. a memory rm's 8-bit displacement is compressed by the row's
+# disp8*N scale
+fun emit_evex_rm(r: EvexRow, e: EvexCtl, reg: i32, vvvv: i32, rm: isa.Operand, buf: *enc.ByteBuf) {
+    if (e.zero && e.mask == 0) { panic("encode: evex zeroing names no opmask register\n"); }
+    val seg: u8 = segment_prefix(?rm);
+    if (seg != 0) { enc.emit_byte(buf, seg); }
+    var p0: u8 = 0xF0 | vex_mmmmm(r.m.map);
+    if (reg_bit3(reg)) { p0 = p0 & 0x7F; }
+    if (reg_bit4(reg)) { p0 = p0 & 0xEF; }
+    if (rm.kind == isa.OPK_REG) {
+        if (reg_bit4(rm.reg)) { p0 = p0 & 0xBF; }
+        if (reg_bit3(rm.reg)) { p0 = p0 & 0xDF; }
+    }
+    or {
+        if (rm_extends_x(?rm)) { p0 = p0 & 0xBF; }
+        if (rm_extends_b(?rm)) { p0 = p0 & 0xDF; }
+    }
+    var v: u8 = 0;
+    if (vvvv >= 0) { v = isa.regid_index(vvvv)::u8 & 0x1F; }
+    val p1: u8 = ((r.m.w & 1) << 7) | ((~v & 0xF) << 3) | 0x04 | vex_pp(r.m.prefix);
+    var p2: u8 = ((e.ll & 3) << 5) | (e.mask & 7);
+    if (e.zero)          { p2 = p2 | 0x80; }
+    if (e.b)             { p2 = p2 | 0x10; }
+    if ((v & 0x10) == 0) { p2 = p2 | 0x08; }
+    enc.emit_byte(buf, 0x62);
+    enc.emit_byte(buf, p0);
+    enc.emit_byte(buf, p1);
+    enc.emit_byte(buf, p2);
+    enc.emit_byte(buf, r.m.opbyte);
+    if (rm.kind == isa.OPK_REG) { enc.emit_byte(buf, encode_modrm(3, reg_bits(reg), reg_bits(rm.reg))); }
+    or                          { encode_mem_operand_scaled(buf, reg, ?rm, evex_disp_scale(r, e)); }
+}
+
+fun note_vec3(buf: *enc.ByteBuf, start: usize, opcode: u16, dst: isa.Operand, src1: isa.Operand, src2: isa.Operand) {
     if (!enc.sink_active(buf)) { ret; }
     var mi: isa.Inst = isa.inst_blank();
     mi.opcode = opcode;
@@ -4409,17 +4513,43 @@ fun note_vex3(buf: *enc.ByteBuf, start: usize, opcode: u16, dst: isa.Operand, sr
     printer.note_inst(buf, ?mi, start);
 }
 
-# a 128-bit vex three-operand instruction: dst from src1 (vvvv) and src2 (rm)
-fun emit_vex3(op: u16, dst_xmm: i32, src1_xmm: i32, src2: isa.Operand, buf: *enc.ByteBuf) err[fail.Fail] {
-    val row: opt[OpMap] = vex_row(op);
-    if (sel row.none) { ret err[fail.Fail].err{fail.message(PACKED_OPCODE_UNKNOWN)}; }
+# a 128-bit three-operand instruction, dst from src1 (vvvv) and src2 (rm),
+# vex-encoded where the opcode has a vex row and evex-encoded, unmasked,
+# where it has an evex one
+fun emit_vec3(op: u16, dst_xmm: i32, src1_xmm: i32, src2: isa.Operand, buf: *enc.ByteBuf) err[fail.Fail] {
     if (src2.kind != isa.OPK_REG && src2.kind != isa.OPK_MEM) {
-        ret err[fail.Fail].err{fail.message("encode: vex vector op source is not a register or aligned frame slot")};
+        ret err[fail.Fail].err{fail.message("encode: vex or evex vector op source is not a register or aligned frame slot")};
     }
-    val start: usize = buf.len;
-    emit_vex_rm(row.some, 0, dst_xmm, src1_xmm, src2, buf);
-    note_vex3(buf, start, op, vec_reg(dst_xmm), vec_reg(src1_xmm), src2);
+    val start: usize        = buf.len;
+    val vex:   opt[OpMap]   = vex_row(op);
+    val evex:  opt[EvexRow] = evex_row(op);
+    if (sel vex.some)  { emit_vex_rm(vex.some, 0, dst_xmm, src1_xmm, src2, buf); }
+    or (sel evex.some) { emit_evex_rm(evex.some, evex_unmasked(0), dst_xmm, src1_xmm, src2, buf); }
+    or                 { ret err[fail.Fail].err{fail.message(PACKED_OPCODE_UNKNOWN)}; }
+    note_vec3(buf, start, op, vec_reg(dst_xmm), vec_reg(src1_xmm), src2);
     ret err[fail.Fail].ok{};
+}
+
+# a three-operand instruction over codegen operands: the first source rides
+# vvvv and so must be a register, the second is a register or frame slot, and
+# the result forms in the destination register, or in scratch0 for a frame slot
+fun emit_vec3_ops(op: u16, dst: isa.Operand, lhs: isa.Operand, rhs: isa.Operand, buf: *enc.ByteBuf) err[fail.Fail] {
+    var work: i32 = float_scratch0();
+    if (dst.kind == isa.OPK_REG) { work = dst.reg; }
+    var src: i32 = work;
+    if (lhs.kind == isa.OPK_REG) { src = lhs.reg; }
+    or {
+        # the second source stays where it is, so one in the work register
+        # would be overwritten by the load: form the result in scratch0
+        if (rhs.kind == isa.OPK_REG && rhs.reg == work) { work = float_scratch0(); }
+        src = work;
+        val ll: err[fail.Fail] = emit_vec_load(lhs, work, buf);
+        if (sel ll.err) { ret ll; }
+    }
+    val r: err[fail.Fail] = emit_vec3(op, work, src, rhs, buf);
+    if (sel r.err)                                  { ret r; }
+    if (dst.kind == isa.OPK_REG && dst.reg == work) { ret err[fail.Fail].ok{}; }
+    ret emit_vec_store(dst, work, buf);
 }
 
 # a 32-byte value between a ymm register and memory: vmovdqu, VEX.256.F3.0F
@@ -5081,25 +5211,7 @@ fun encode_vector_var_shift(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.
     if (sel rl.err) { ret err[fail.Fail].err{rl.err}; }
     val rc: res[isa.Operand, fail.Fail] = mir_to_operand(f, ?mi.operands[2], 16);
     if (sel rc.err) { ret err[fail.Fail].err{rc.err}; }
-    val dst:   isa.Operand = rd.ok;
-    val lhs:   isa.Operand = rl.ok;
-    val count: isa.Operand = rc.ok;
-    var work:  i32         = float_scratch0();
-    if (dst.kind == isa.OPK_REG) { work = dst.reg; }
-    var src: i32 = work;
-    if (lhs.kind == isa.OPK_REG) { src = lhs.reg; }
-    or {
-        # the counts stay where they are, so a count in the work register
-        # would be overwritten by the load: form the result in scratch0
-        if (count.kind == isa.OPK_REG && count.reg == work) { work = float_scratch0(); }
-        src = work;
-        val ll: err[fail.Fail] = emit_vec_load(lhs, work, buf);
-        if (sel ll.err) { ret ll; }
-    }
-    val sh: err[fail.Fail] = emit_vex3(opc, work, src, count, buf);
-    if (sel sh.err)                                 { ret sh; }
-    if (dst.kind == isa.OPK_REG && dst.reg == work) { ret err[fail.Fail].ok{}; }
-    ret emit_vec_store(dst, work, buf);
+    ret emit_vec3_ops(opc, rd.ok, rl.ok, rc.ok, buf);
 }
 
 fun var_shift_vec_op(op: mir.MirOpcode) isa.VecOp {
@@ -5232,8 +5344,10 @@ fun emit_vec_mul_i64_body(lhs: isa.Operand, rhs: isa.Operand, buf: *enc.ByteBuf)
 
 # the integer multiplies the packed table declares without a single baseline
 # instruction: 32-bit lanes are pmulld when the declared set holds sse41 and
-# the pmuludq pair otherwise, 64-bit lanes the three-pmuludq sequence (#3739)
-fun emit_vec_mul_sequence(sse41: bool, eb: u8, dst: isa.Operand, lhs: isa.Operand, rhs: isa.Operand, buf: *enc.ByteBuf) err[fail.Fail] {
+# the pmuludq pair otherwise (#3739), 64-bit lanes vpmullq when it holds
+# avx512dq and avx512vl (#3749) and the three-pmuludq sequence otherwise
+fun emit_vec_mul_sequence(sse41: bool, avx512dq: bool, eb: u8, dst: isa.Operand, lhs: isa.Operand, rhs: isa.Operand, buf: *enc.ByteBuf) err[fail.Fail] {
+    if (eb == 8 && avx512dq) { ret emit_vec3_ops(x64.VPMULLQ, dst, lhs, rhs, buf); }
     if (eb == 4 && sse41) {
         val ll: err[fail.Fail] = emit_vec_load(lhs, float_scratch0(), buf);
         if (sel ll.err) { ret ll; }
@@ -5266,9 +5380,11 @@ fun encode_vector_arith(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirI
     val rhs: isa.Operand = rr.ok;
 
     if (mi.opcode == mir.MIR_SEL_MUL && mir.vec_lane_kind(mi.vec_lane) == mir.VEC_LANE_INT && mir.vec_lane_elem_bytes(mi.vec_lane) >= 4) {
-        # pmulld is the packed table's sse41 row of the 32-bit lane multiply
-        val sse41: bool = isa.packed_row_selected_by(st.model, isa.VEC_OP_MUL, false, 32, 32, x64.EXT_SSE41);
-        ret emit_vec_mul_sequence(sse41, mir.vec_lane_elem_bytes(mi.vec_lane), dst, lhs, rhs, buf);
+        # pmulld is the packed table's sse41 row of the 32-bit lane multiply,
+        # vpmullq its avx512dq and avx512vl row of the 64-bit one
+        val sse41:    bool = isa.packed_row_selected_by(st.model, isa.VEC_OP_MUL, false, 32, 32, x64.EXT_SSE41);
+        val avx512dq: bool = isa.packed_row_selected_by(st.model, isa.VEC_OP_MUL, false, 64, 64, x64.EXT_AVX512DQ | x64.EXT_AVX512VL);
+        ret emit_vec_mul_sequence(sse41, avx512dq, mir.vec_lane_elem_bytes(mi.vec_lane), dst, lhs, rhs, buf);
     }
     val opc: u16 = packed_arith_opcode(mi.opcode, mi.vec_lane);
     if (opc == 0xFFFF) { ret err[fail.Fail].err{fail.message("encode: unsupported packed vector op / lane combination")}; }
@@ -6030,7 +6146,7 @@ fun x64_width_class(flags: u16) u16 {
     ret flags & X64W_MASK;
 }
 
-val X64_MNEMONIC_COUNT: usize = 154;
+val X64_MNEMONIC_COUNT: usize = 155;
 
 val X64_MNEMONICS: [X64_MNEMONIC_COUNT]iasm.Mnemonic = [X64_MNEMONIC_COUNT]iasm.Mnemonic{
     iasm.Mnemonic{name: "syscall", code: x64.SYSCALL::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_SYSCALL_WRITES, flags: X64P_NONE, words: 0},
@@ -6195,6 +6311,7 @@ val X64_MNEMONICS: [X64_MNEMONIC_COUNT]iasm.Mnemonic = [X64_MNEMONIC_COUNT]iasm.
     iasm.Mnemonic{name: "vpsravd", code: x64.VPSRAVD::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC3, words: 0, requires: x64.EXT_AVX2},
     iasm.Mnemonic{name: "vpsllvq", code: x64.VPSLLVQ::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC3, words: 0, requires: x64.EXT_AVX2},
     iasm.Mnemonic{name: "vpsrlvq", code: x64.VPSRLVQ::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC3, words: 0, requires: x64.EXT_AVX2},
+    iasm.Mnemonic{name: "vpmullq", code: x64.VPMULLQ::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC3, words: 0, requires: x64.EXT_AVX512DQ | x64.EXT_AVX512VL},
 };
 
 fun x64_reg_region(body: str, lo: usize, hi: usize, op: *iasm.Operand) bool {
@@ -7042,10 +7159,10 @@ fun x64_emit_vec_gp(st: *enc.EncodeState, item: *iasm.Item, sym: intern.StrId) e
 
 fun x64_vec3_refused(c: *iasm.Cursor, s: *iasm.Stmt) err[fail.Fail] {
     ret x64_vec_refused(c, s, "' takes a vector register destination, a vector register source and a vector register or 128-bit memory source",
-        "an inline-asm vex instruction takes a vector register destination, a vector register source and a vector register or 128-bit memory source");
+        "an inline-asm vex or evex instruction takes a vector register destination, a vector register source and a vector register or 128-bit memory source");
 }
 
-# the vex three-operand form: xmm, xmm, xmm/m128
+# the vex or evex three-operand form: xmm, xmm, xmm/m128
 fun x64_parse_vec3(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) err[fail.Fail] {
     if (s.nargs != 3) { ret x64_vec3_refused(c, s); }
     var i: u32 = 0;
@@ -7073,7 +7190,7 @@ fun x64_emit_vec3(st: *enc.EncodeState, item: *iasm.Item, sym: intern.StrId) err
     val src1:  isa.Operand    = x64_vec_operand(?item.ops[1], sym);
     val src2:  isa.Operand    = x64_vec_operand(?item.ops[2], sym);
     val start: usize          = st.buf.len;
-    val r:     err[fail.Fail] = emit_vex3(item.code::u16, dst.reg, src1.reg, src2, ?st.buf);
+    val r:     err[fail.Fail] = emit_vec3(item.code::u16, dst.reg, src1.reg, src2, ?st.buf);
     if (sel r.err)               { ret r; }
     if (item.ref != iasm.AR_SYM) { ret err[fail.Fail].ok{}; }
     val n: i32 = (st.buf.len - start)::i32;
@@ -7658,7 +7775,7 @@ fun width_flags_for(size: u8) u16 {
 var t_model_x64: isa.MachineModel;
 
 #[testing]
-val T_X64_GATED_ROWS: [18]isa.PackedForm = [18]isa.PackedForm{
+val T_X64_GATED_ROWS: [19]isa.PackedForm = [19]isa.PackedForm{
     isa.PackedForm{op: isa.VEC_OP_RANGE, is_float: false, lane_bits: 8, from_bits: 8, ext: x64.EXT_SSSE3},
     isa.PackedForm{op: isa.VEC_OP_RANGE, is_float: false, lane_bits: 16, from_bits: 16, ext: x64.EXT_SSSE3},
     isa.PackedForm{op: isa.VEC_OP_RANGE, is_float: false, lane_bits: 32, from_bits: 32, ext: x64.EXT_SSSE3},
@@ -7677,6 +7794,7 @@ val T_X64_GATED_ROWS: [18]isa.PackedForm = [18]isa.PackedForm{
     isa.PackedForm{op: isa.VEC_OP_SHR_U_V, is_float: false, lane_bits: 32, from_bits: 32, ext: x64.EXT_AVX2},
     isa.PackedForm{op: isa.VEC_OP_SHR_U_V, is_float: false, lane_bits: 64, from_bits: 64, ext: x64.EXT_AVX2},
     isa.PackedForm{op: isa.VEC_OP_SHR_S_V, is_float: false, lane_bits: 32, from_bits: 32, ext: x64.EXT_AVX2},
+    isa.PackedForm{op: isa.VEC_OP_MUL, is_float: false, lane_bits: 64, from_bits: 64, ext: x64.EXT_AVX512DQ | x64.EXT_AVX512VL},
 };
 
 #[testing]
@@ -7693,7 +7811,7 @@ fun x64_machine() *isa.MachineModel {
     t_model_x64.has_v128        = true;
     t_model_x64.vector_bits     = isa.VECTOR_BITS_128;
     t_model_x64.packed_forms    = ?T_X64_GATED_ROWS[0];
-    t_model_x64.packed_form_len = 18;
+    t_model_x64.packed_form_len = 19;
     ret ?t_model_x64;
 }
 
@@ -8188,7 +8306,7 @@ test asm_ct_scan__a_secret_segment_base_is_an_address {
 
 #[testing]
 val T_EXT_ALL: u64 = x64.EXT_SSSE3 | x64.EXT_SSE41 | x64.EXT_SHA | x64.EXT_FSGSBASE | x64.EXT_POPCNT | x64.EXT_LZCNT | x64.EXT_BMI1 |
-    x64.EXT_AES | x64.EXT_PCLMUL | x64.EXT_AVX | x64.EXT_AVX2;
+    x64.EXT_AES | x64.EXT_PCLMUL | x64.EXT_AVX | x64.EXT_AVX2 | x64.EXT_AVX512DQ | x64.EXT_AVX512VL;
 
 # a body run under a target selecting `exts`, inside a function admitting `f_exts`
 #[testing]
@@ -8373,16 +8491,99 @@ test asm_extensions__avx2_variable_shift_operands_are_refused {
     ret bad;
 }
 
+# vpmullq against GNU as 2.47 (`as --64`, intel syntax): the four-byte evex
+# prefix of the 0F 38 map under W1, extended registers in each of R, vvvv, X
+# and B, and the memory form's disp8*16, compressed where the displacement is
+# a multiple of 16 whose quotient fits the byte and 32 bits wide otherwise;
+# the listing round trips (#3749)
+test asm_extensions__vpmullq_matches_gnu_as_and_round_trips {
+    var bad: i32 = 0;
+    if (!t_ext_hex("vpmullq xmm1, xmm2, xmm3", "62f2ed0840cb"))                         { bad = 1; }
+    if (!t_ext_hex("vpmullq xmm9, xmm10, xmm11", "6252ad0840cb"))                       { bad = 2; }
+    if (!t_ext_hex("vpmullq xmm0, xmm15, xmm8", "62d2850840c0"))                        { bad = 3; }
+    if (!t_ext_hex("vpmullq xmm1, xmm2, [rax]", "62f2ed084008"))                        { bad = 4; }
+    if (!t_ext_hex("vpmullq xmm1, xmm2, xmmword [rbp-32]", "62f2ed08404dfe"))           { bad = 5; }
+    if (!t_ext_hex("vpmullq xmm1, xmm2, xmmword [rbp-8]", "62f2ed08408df8ffffff"))      { bad = 6; }
+    if (!t_ext_hex("vpmullq xmm1, xmm2, xmmword [rsp+2032]", "62f2ed08404c247f"))       { bad = 7; }
+    if (!t_ext_hex("vpmullq xmm1, xmm2, xmmword [rsp+2048]", "62f2ed08408c2400080000")) { bad = 8; }
+    if (!t_ext_hex("vpmullq xmm12, xmm3, xmmword [r12+r13*8+48]", "6212e5084064ec03"))  { bad = 9; }
+    if (!t_ext_hex("vpmullq xmm1, xmm2, [r13]", "62d2ed08404d00"))                      { bad = 10; }
+    ret bad;
+}
+
+# the evex fields inline asm does not spell yet, against GNU as 2.47: xmm16
+# and up through R', V' and X, the opmask with merging and zeroing, the
+# broadcast bit and its element-sized disp8*N, and the 256- and 512-bit
+# vector lengths
+test emit_evex_rm__every_field_matches_gnu_as {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var got: enc.ByteBuf = enc.buf_init(?alloc);
+    fin { enc.buf_dnit(?got); }
+    val row: opt[EvexRow] = evex_row(x64.VPMULLQ);
+    if (sel row.none) { ret 1; }
+    val r:     EvexRow = row.some;
+    val plain: EvexCtl = evex_unmasked(0);
+    var want:  [32]u8;
+    emit_evex_rm(r, plain, t_xmm(17), t_xmm(18), vec_reg(t_xmm(19)), ?got);
+    var n: usize = t_unhex("62a2ed0040cb", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 2; }
+    got.len = 0;
+    emit_evex_rm(r, plain, t_xmm(24), t_xmm(25), vec_reg(t_xmm(31)), ?got);
+    n = t_unhex("6202b50040c7", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 3; }
+    got.len = 0;
+    emit_evex_rm(r, plain, t_xmm(1), t_xmm(20), vec_reg(t_xmm(2)), ?got);
+    n = t_unhex("62f2dd0040ca", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 4; }
+    got.len = 0;
+    emit_evex_rm(r, plain, t_xmm(20), t_xmm(1), isa.make_mem(x64.R9, 16, -1, 0, 16), ?got);
+    n = t_unhex("62c2f508406101", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 5; }
+    got.len = 0;
+    emit_evex_rm(r, EvexCtl{ll: 0, mask: 1, zero: false, b: false}, t_xmm(1), t_xmm(2), vec_reg(t_xmm(3)), ?got);
+    n = t_unhex("62f2ed0940cb", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 6; }
+    got.len = 0;
+    emit_evex_rm(r, EvexCtl{ll: 0, mask: 7, zero: true, b: false}, t_xmm(1), t_xmm(2), vec_reg(t_xmm(3)), ?got);
+    n = t_unhex("62f2ed8f40cb", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 7; }
+    got.len = 0;
+    emit_evex_rm(r, EvexCtl{ll: 0, mask: 0, zero: false, b: true}, t_xmm(1), t_xmm(2), isa.make_mem(x64.RAX, 8, -1, 0, 8), ?got);
+    n = t_unhex("62f2ed18404801", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 8; }
+    got.len = 0;
+    emit_evex_rm(r, evex_unmasked(1), t_xmm(1), t_xmm(2), isa.make_mem(x64.RAX, 32, -1, 0, 32), ?got);
+    n = t_unhex("62f2ed28404801", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 9; }
+    got.len = 0;
+    emit_evex_rm(r, evex_unmasked(2), t_xmm(1), t_xmm(2), vec_reg(t_xmm(3)), ?got);
+    n = t_unhex("62f2ed4840cb", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 10; }
+    ret 0;
+}
+
+test asm_extensions__vpmullq_needs_avx512dq_and_avx512vl {
+    if (!t_ext_refusal("vpmullq xmm0, xmm1, xmm2", x64.EXT_AVX2, 0, "needs the `avx512dq` extension"))                   { ret 1; }
+    if (!t_ext_refusal("vpmullq xmm0, xmm1, xmm2", x64.EXT_AVX512DQ, 0, "needs the `avx512vl` extension"))               { ret 2; }
+    if (!t_ext_refusal("vpmullq xmm0, xmm1, xmm2", x64.EXT_AVX512VL, x64.EXT_AVX512F, "needs the `avx512dq` extension")) { ret 3; }
+    if (!t_ext_admitted("vpmullq xmm0, xmm1, xmm2", x64.LEVEL_V4, 0))                                                    { ret 4; }
+    if (!t_asm_refused("vpmullq xmm0, [rax], xmm1", "a vector register or 128-bit memory source"))                       { ret 5; }
+    if (!t_asm_refused("vpmullq xmm0, xmm1, qword [rax]", "a vector register or 128-bit memory source"))                 { ret 6; }
+    ret 0;
+}
+
 # a symbol-relative source keeps its rip-relative field ahead of the immediate
 test asm_extensions__symbol_sources_relocate_before_the_immediate {
     t_model_x64.extensions = T_EXT_ALL;
     var bad: i32 = 0;
-    if (!t_asm_reloc("pshufb xmm1, [tbl]", "660f38000d00000000", 5, -4))         { bad = 1; }
-    if (!t_asm_reloc("pinsrd xmm1, [tbl], 3", "660f3a220d0000000003", 5, -5))    { bad = 2; }
-    if (!t_asm_reloc("pextrd [tbl], xmm1, 3", "660f3a160d0000000003", 5, -5))    { bad = 3; }
-    if (!t_asm_reloc("aesenc xmm1, [tbl]", "660f38dc0d00000000", 5, -4))         { bad = 4; }
-    if (!t_asm_reloc("pclmulqdq xmm1, [tbl], 1", "660f3a440d0000000001", 5, -5)) { bad = 5; }
-    if (!t_asm_reloc("vpsllvd xmm1, xmm2, [tbl]", "c4e269470d00000000", 5, -4))  { bad = 6; }
+    if (!t_asm_reloc("pshufb xmm1, [tbl]", "660f38000d00000000", 5, -4))          { bad = 1; }
+    if (!t_asm_reloc("pinsrd xmm1, [tbl], 3", "660f3a220d0000000003", 5, -5))     { bad = 2; }
+    if (!t_asm_reloc("pextrd [tbl], xmm1, 3", "660f3a160d0000000003", 5, -5))     { bad = 3; }
+    if (!t_asm_reloc("aesenc xmm1, [tbl]", "660f38dc0d00000000", 5, -4))          { bad = 4; }
+    if (!t_asm_reloc("pclmulqdq xmm1, [tbl], 1", "660f3a440d0000000001", 5, -5))  { bad = 5; }
+    if (!t_asm_reloc("vpsllvd xmm1, xmm2, [tbl]", "c4e269470d00000000", 5, -4))   { bad = 6; }
+    if (!t_asm_reloc("vpmullq xmm1, xmm2, [tbl]", "62f2ed08400d00000000", 6, -4)) { bad = 7; }
     t_model_x64.extensions = 0;
     ret bad;
 }
@@ -8407,7 +8608,7 @@ fun t_ext_admitted(body: str, exts: u64, f_exts: u64) bool {
 }
 
 #[testing]
-val T_EXT_BODY_COUNT: usize = 28;
+val T_EXT_BODY_COUNT: usize = 29;
 
 #[testing]
 val T_EXT_BODIES: [T_EXT_BODY_COUNT]str = [T_EXT_BODY_COUNT]str{
@@ -8419,7 +8620,7 @@ val T_EXT_BODIES: [T_EXT_BODY_COUNT]str = [T_EXT_BODY_COUNT]str{
     "aesenc xmm1, xmm2", "aesenclast xmm1, [rax]", "aesdec xmm1, xmm2", "aesdeclast xmm1, xmm2",
     "aesimc xmm1, xmm2", "aeskeygenassist xmm1, xmm2, 1", "pclmulqdq xmm1, xmm2, 0x11",
     "vpsllvd xmm1, xmm2, xmm3", "vpsrlvd xmm1, xmm2, [rax]", "vpsravd xmm1, xmm2, xmm3", "vpsllvq xmm1, xmm2, xmm3",
-    "vpsrlvq xmm1, xmm2, xmm3",
+    "vpsrlvq xmm1, xmm2, xmm3", "vpmullq xmm1, xmm2, [rax]",
 };
 
 #[testing]
@@ -8432,7 +8633,7 @@ val T_EXT_NEEDS: [T_EXT_BODY_COUNT]u64 = [T_EXT_BODY_COUNT]u64{
     x64.EXT_AES, x64.EXT_AES, x64.EXT_AES, x64.EXT_AES,
     x64.EXT_AES, x64.EXT_AES, x64.EXT_PCLMUL,
     x64.EXT_AVX2, x64.EXT_AVX2, x64.EXT_AVX2, x64.EXT_AVX2,
-    x64.EXT_AVX2,
+    x64.EXT_AVX2, x64.EXT_AVX512DQ | x64.EXT_AVX512VL,
 };
 
 # a row whose extension neither the target nor the enclosing function admits is
@@ -10851,6 +11052,49 @@ test vector_arith__i64x2_multiply_is_the_three_pmuludq_sequence {
     val ext: err[fail.Fail] = encode_vector_arith(?st, ?f, ?mi);
     if (sel ext.err)                    { ret 3; }
     if (!t_bytes_equal(?st.buf, ?want)) { ret 4; }
+
+    # avx512dq without avx512vl has no 128-bit vpmullq
+    t_model_x64.extensions = x64.EXT_AVX512DQ;
+    st.buf.len             = 0;
+    val dq: err[fail.Fail] = encode_vector_arith(?st, ?f, ?mi);
+    if (sel dq.err)                     { ret 5; }
+    if (!t_bytes_equal(?st.buf, ?want)) { ret 6; }
+    ret 0;
+}
+
+# under avx512dq and avx512vl the 64-bit lane multiply is one vpmullq, the gas
+# bytes of `vpmullq xmm1, xmm2, xmm3`; a frame-slot left operand is loaded
+# into xmm14 first, which also holds the result for a frame-slot destination:
+# `movaps xmm14, [rbp-32]; vpmullq xmm14, xmm14, xmm3; movaps [rbp-16], xmm14`
+test vector_arith__i64x2_multiply_is_vpmullq_under_avx512dq_and_avx512vl {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var st: enc.EncodeState;
+    enc.state_blank(?st, ?alloc, x64_machine());
+    fin { t_model_x64.extensions = 0; }
+    var f:   mir.MirFunction;
+    var ops: [3]mir.MirOperand;
+    ops[0] = mir.op_preg(mir.preg_id(t_xmm(x64.XMM1)));
+    ops[1] = mir.op_preg(mir.preg_id(t_xmm(x64.XMM2)));
+    ops[2] = mir.op_preg(mir.preg_id(t_xmm(x64.XMM3)));
+    var mi: mir.MirInstr = mir.instr(mir.MIR_SEL_MUL, ?ops[0], 3, 16, 16);
+    mi.vec_lane            = mir.vec_lane_make(mir.VEC_LANE_INT, 8, 2);
+    t_model_x64.extensions = x64.LEVEL_V4;
+    var want: [32]u8;
+    val r:    err[fail.Fail] = encode_vector_arith(?st, ?f, ?mi);
+    if (sel r.err) { ret 1; }
+    var n: usize = t_unhex("62f2ed0840cb", ?want[0]);
+    if (!t_buf_is(?st.buf, ?want[0], n)) { ret 2; }
+
+    ops[0]      = mir.op_mem_preg(mir.preg_id(x64.RBP), -16);
+    ops[1]      = mir.op_mem_preg(mir.preg_id(x64.RBP), -32);
+    mi          = mir.instr(mir.MIR_SEL_MUL, ?ops[0], 3, 16, 16);
+    mi.vec_lane = mir.vec_lane_make(mir.VEC_LANE_INT, 8, 2);
+    st.buf.len  = 0;
+    val m: err[fail.Fail] = encode_vector_arith(?st, ?f, ?mi);
+    if (sel m.err) { ret 3; }
+    n = t_unhex("440f2875e062728d0840f3440f2975f0", ?want[0]);
+    if (!t_buf_is(?st.buf, ?want[0], n)) { ret 4; }
     ret 0;
 }
 
@@ -11908,16 +12152,17 @@ test asm_ct_class__variable_latency_surface {
     if (asm_ct_class(x64.SHLD::u32, 0).op != ct.CT_OP_VAR_SHIFT) { bad = 1; }
     if (asm_ct_class(x64.SHRD::u32, 0).op != ct.CT_OP_VAR_SHIFT) { bad = 1; }
 
-    # past the shifts, the rows that vary in latency are the five packed
-    # multiplies (pmulld gated on sse41), the float ops, and the one scalar
-    # multiply, imul, whose forms the mul mask gates
+    # past the shifts, the rows that vary in latency are the six packed
+    # multiplies (pmulld gated on sse41, vpmullq on avx512dq and avx512vl),
+    # the float ops, and the one scalar multiply, imul, whose forms the mul
+    # mask gates
     var mul:   u32   = 0;
     var float: u32   = 0;
     var i:     usize = 0;
     for (i < X64_MNEMONIC_COUNT) {
         val row: *iasm.Mnemonic = ?X64_MNEMONICS[i];
         val cls: ct.AsmClass    = asm_ct_class(row.code, row.flags);
-        val vec: bool           = x64_pattern(row.flags) == X64P_VEC || x64_pattern(row.flags) == X64P_VECI;
+        val vec: bool           = x64_pattern(row.flags) == X64P_VEC || x64_pattern(row.flags) == X64P_VECI || x64_pattern(row.flags) == X64P_VEC3;
         if (cls.op == ct.CT_OP_INT_DIVMOD)                           { bad = 1; }
         if (cls.op == ct.CT_OP_INT_MUL && vec)                       { mul = mul + 1; }
         or (cls.op == ct.CT_OP_INT_MUL && row.code != x64.IMUL::u32) { bad = 1; }
@@ -11925,7 +12170,7 @@ test asm_ct_class__variable_latency_surface {
         or (cls.op == ct.CT_OP_FLOAT)                                { bad = 1; }
         i = i + 1;
     }
-    if (mul != 5)    { bad = 1; }
+    if (mul != 6)    { bad = 1; }
     if (float != 16) { bad = 1; }
 
     if (!asm_ct_class(x64.JE::u32, 0).cond_flags)  { bad = 1; }
@@ -12605,9 +12850,10 @@ test describe__family_predicates_read_the_table {
     # lane-halving rows: 3 high unpacks, psrldq and 6 gated extends, the
     # qword shifts of the 64-bit multiply sequence, and the word and dword
     # logical right shifts of the vector shifts, and the 6 aes rows and pclmulqdq
-    # and the two lane-join rows, and the 5 avx2 variable shifts and vmovdqu
-    if (fp != 1 + 2 + 4 + 8 + 2 + 6 + 1 + 30 + 1 + 1 + 11 + 3 + 3 + 7 + 2 + 1 + 3 + 1 + 6 + 2 + 2 + 7 + 2 + 5 + 1) { ret 7; }
-    if (is_jcc(x64.OPCODE_COUNT::u16) || is_setcc(x64.ASM_BLOCK))                                                  { ret 8; }
+    # and the two lane-join rows, and the 5 avx2 variable shifts and vmovdqu,
+    # and vpmullq
+    if (fp != 1 + 2 + 4 + 8 + 2 + 6 + 1 + 30 + 1 + 1 + 11 + 3 + 3 + 7 + 2 + 1 + 3 + 1 + 6 + 2 + 2 + 7 + 2 + 5 + 1 + 1) { ret 7; }
+    if (is_jcc(x64.OPCODE_COUNT::u16) || is_setcc(x64.ASM_BLOCK))                                                      { ret 8; }
     ret 0;
 }
 
