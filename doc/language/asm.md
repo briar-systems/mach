@@ -171,6 +171,57 @@ same width feeding bits, and a count of 0 to 255 or `cl`. A secret in `cl` is a
 variable-latency count for the constant-time check, as it is for `shl`; an
 immediate count is not.
 
+## String instructions (x86-64)
+
+```mach fragment
+asm x86_64 {
+    mov rdi, {dst}
+    mov rsi, {src}
+    mov rcx, {n}
+    rep movsb                 # copy rcx bytes from [rsi] to [rdi]
+    xor eax, eax
+    mov rcx, 8
+    rep stosq                 # store rax into 8 quadwords at [rdi]
+    repne scasb               # step rdi until [rdi] equals al, or rcx runs out
+}
+```
+
+`movs`, `stos`, `lods`, `cmps` and `scas` take a width suffix, `b`, `w`, `d` or
+`q`, and no operands: `movsd` here is the string move, since the scalar-double
+move is not an inline-asm row. Each reaches memory through its implicit
+registers:
+
+| mnemonic | reads | writes | memory |
+|---|---|---|---|
+| `movs` | `rsi`, `rdi` | `rsi`, `rdi` | loads `[rsi]`, stores `[rdi]` |
+| `stos` | `rax`, `rdi` | `rdi` | stores `[rdi]` |
+| `lods` | `rsi` | `rax`, `rsi` | loads `[rsi]` |
+| `cmps` | `rsi`, `rdi` | `rsi`, `rdi`, flags | loads both |
+| `scas` | `rax`, `rdi` | `rdi`, flags | loads `[rdi]` |
+
+A prefix repeats the instruction `rcx` times and counts `rcx` down, so it adds
+`rcx` to what the instruction reads and writes. `rep` repeats a move, store or
+load. A compare repeats under a condition instead, `repe` (or `repz`) while its
+elements are equal and `repne` (or `repnz`) while they differ, and stops early
+when the condition fails. `rep cmpsb` and `repe movsb` are refused, since the
+first says nothing about when to stop and the second names a condition nothing
+sets. The written registers are the block's clobbers like any other, so a value
+the allocator keeps live across the block never sits in one of them.
+
+Every step moves `rsi` and `rdi` forward when the direction flag is clear and
+backward when it is set. The compiler does not track DF. It assumes the ABI's
+guarantee that DF is clear at every call and return, so a block that sets it
+with a raw encoding must clear it with `cld` before the block ends.
+
+The constant-time check treats `rsi` and `rdi` as addresses, so a secret in
+either is refused as one. A single step is a load or store and passes data
+through as `mov` does. A repeated one runs once per element and a compare also
+stops on its data, so its timing is its count and its contents. In an
+`#[oblivious]` function it is refused whenever it reads a secret: a secret
+count, a secret value to store, or memory a pointer to a secret addresses. A
+public count storing public data is admitted even into secret memory, which is
+how a key buffer is cleared with `rep stosb`.
+
 ## Segment-relative memory (x86-64)
 
 A memory operand may lead with `fs:` or `gs:`, after any width keyword. The
