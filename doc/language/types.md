@@ -11,10 +11,28 @@ are stdlib `def`s.
 |---|---|
 | Unsigned int | `u8`, `u16`, `u32`, `u64`, `u128` |
 | Signed int | `i8`, `i16`, `i32`, `i64`, `i128` |
-| Float | `f32`, `f64` |
+| Float | `f16`, `f32`, `f64` |
 | Untyped pointer | `ptr` |
 
-These thirteen names are the complete set of compiler-seeded primitive types.
+These fourteen names are the complete set of compiler-seeded primitive types.
+
+A **type** may not take one of these names. `rec`, `uni`, `tag`, `def` and a
+generic parameter named after a primitive are refused with `name.builtin_type`,
+because every use of the name in type position resolves to the primitive, so the
+declaration would be unreachable. The refusal holds for every primitive the
+compiler ships, so a primitive added later refuses an existing type of its name
+rather than silently changing what the name means:
+
+```mach error is a built-in type
+pub def f16: u16; # error: `f16` is a built-in type
+```
+
+A value, function or field may take the name, since it never stands in type
+position:
+
+```mach
+val f16: i64 = 7; # fine: values are a different position
+```
 
 ### 128-bit integers
 
@@ -84,8 +102,9 @@ be named `f32x4` without colliding with the type:
 val f32x4: i64 = 7; # fine: values are a different position
 ```
 
-A **type** may not. `rec`, `uni`, `tag`, and `def` reject a name spelled as a vector
-form, because a type declared with a vector's name would be silently unreachable:
+A **type** may not. `rec`, `uni`, `tag`, `def` and a generic parameter reject a name
+spelled as a vector form, because a type declared with a vector's name would be
+silently unreachable:
 every use in type position resolves to the vector instead:
 
 ```mach error is spelled as a vector type

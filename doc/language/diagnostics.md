@@ -68,7 +68,7 @@ disappears, moves or changes severity.
 | `syntax` | source that does not parse: an expected token, name, type, expression or declaration is missing, or nesting is too deep |
 | `source` | characters the source may not contain |
 | `literal` | a literal that is malformed, unterminated or out of range for its type |
-| `name`, `use`, `module`, `visibility`, `import`, `fwd` | names that do not resolve, collide or are not exported; `use` and `fwd` paths |
+| `name`, `use`, `module`, `visibility`, `import`, `fwd` | names that do not resolve, collide, take a built-in type's name (`name.builtin_type`) or are not exported; `use` and `fwd` paths |
 | `decl`, `binding`, `global`, `const` | declaration forms: bindings, globals and constants |
 | `type`, `cast`, `operator`, `condition`, `assign`, `address`, `ptr` | type checking: mismatches, conversions, operators, conditions, assignment and addresses |
 | `call`, `variadic`, `pack`, `ret` | calls, C-variadic and pack parameters, and returned values |
