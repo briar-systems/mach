@@ -679,6 +679,15 @@ pub fun is_permute_op(op: VecOp) bool;
 
 the lane rearrangements: a range of one vector's lanes and a join of several
 
+## fun half_native
+
+```mach
+pub fun half_native(m: *MachineModel, op: VecOp, is_float: bool, lane_bits: u32, from_bits: u32) bool;
+```
+
+the target realizes this scalar f16 cell with its own instruction under the
+selected extensions; false is the inlined expansion
+
 ## fun vector_domain_len
 
 ```mach
