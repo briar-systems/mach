@@ -41,12 +41,20 @@ float16x8_t c_mk(int seed) {
     return r;
 }
 
+/* a mach #[symbol] name is the literal object symbol, and darwin's C compiler
+ * prefixes an underscore to every C name, so the label makes C ask for the literal one */
+#ifdef __APPLE__
+#define MACH_SYM(name) __asm__(#name)
+#else
+#define MACH_SYM(name)
+#endif
+
 /* the reverse direction: C calls mach with the same shapes */
-long long m_v8(long long a, float16x8_t x, long long b);
-long long m_v4(long long a, float16x4_t x, long long b);
-long long m_mix(float f, float16x8_t x, double d, _Float16 h, long long next);
-long long m_full(double a, double b, double c, double d, double e, double f, double g, double h, float16x8_t x, long long next);
-float16x8_t m_mk(int seed);
+long long m_v8(long long a, float16x8_t x, long long b) MACH_SYM(m_v8);
+long long m_v4(long long a, float16x4_t x, long long b) MACH_SYM(m_v4);
+long long m_mix(float f, float16x8_t x, double d, _Float16 h, long long next) MACH_SYM(m_mix);
+long long m_full(double a, double b, double c, double d, double e, double f, double g, double h, float16x8_t x, long long next) MACH_SYM(m_full);
+float16x8_t m_mk(int seed) MACH_SYM(m_mk);
 
 long long c_drives_mach(void) {
     unsigned short bx[8], by[8], bq[4];
