@@ -5,6 +5,7 @@ use alloc_test: std.allocator.testing;
 use std.data.toml;
 use std.memory;
 use std.print;
+use std.text.string.str_dup;
 use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -16,9 +17,13 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_contains;
 use std.types.string.str_equals;
+use std.types.string.str_len;
 
 use A:  std.allocator;
 use du: std.chrono.duration;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use fs: std.filesystem;
 
 use dkind: mach.lang.diagnostic.kind;
 use mach.lang.fail;
@@ -41,14 +46,16 @@ use mach.lang.manifest.model.StepDef;
 use mach.lang.manifest.model.TargetDef;
 use mach.lang.manifest.model.dnit;
 use mach.lang.manifest.model.empty;
+use mach.lang.manifest.parse.fail_at;
 use mach.lang.manifest.parse.glob_matches;
 use mach.lang.manifest.parse.idstr;
 use mach.lang.manifest.parse.intern_unwrap;
 use mach.lang.manifest.parse.is_glob;
+use mach.lang.manifest.parse.key_span;
 use mach.lang.manifest.parse.need_pattern;
 use mach.lang.manifest.parse.sfmt;
 use mach.lang.manifest.parse.tinit;
-use mach.lang.manifest.parse.validate_source_text;
+use mach.lang.manifest.parse.validate_source_bytes;
 use mach.lang.manifest.project.MISSING_PROFILE_MESSAGE;
 use mach.lang.manifest.project.find_target_by_name;
 use mach.lang.manifest.project.make_native_target;
@@ -71,7 +78,7 @@ fun check_root_keys(alloc: *A.Allocator, t: *toml.Table) err[outcome.Fail] {
         if (sel k_o.none) { brk; }
         val k: str = k_o.some;
         if (!root_key_known(k)) {
-            ret err[outcome.Fail].err{outcome.user(dkind.MANIFEST_UNKNOWN_KEY, sfmt(alloc, "mach.toml: unknown table or key '{}' at the document root", k))};
+            ret fail_at(outcome.user(dkind.MANIFEST_UNKNOWN_KEY, sfmt(alloc, "mach.toml: unknown table or key '{}' at the document root", k)), key_span(t, i));
         }
         i = i + 1;
     }
@@ -86,7 +93,7 @@ fun check_root_keys(alloc: *A.Allocator, t: *toml.Table) err[outcome.Fail] {
 # ---
 # alloc:   owns the manifest's arrays
 # itn:     receives every string of the manifest
-# t:       the TOML document
+# doc:     the manifest's text and its TOML document
 # as_root: true for the project being built, false for a dependency's manifest.
 #          the root form requires at least one `[profile.*]` table, `[artifact].link`
 #          and `need`, `[link].os`, `isa`, `abi` and `export`, `[step].need`, requires
@@ -102,8 +109,84 @@ fun check_root_keys(alloc: *A.Allocator, t: *toml.Table) err[outcome.Fail] {
 #          must satisfy `is_valid_id`; `[target.native]` and `[dep.<x>].version` are
 #          reserved; a `[step]` with `cmd` or `shell` is rejected by name; `need`
 #          entries are checked by `validate_needs`. `[profile.*]` absent or empty is
-#          an error at the root and synthesizes `debug` and `release` in a dependency
-pub fun parse(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, as_root: bool) res[Manifest, outcome.Fail] {
+#          an error at the root and synthesizes `debug` and `release` in a dependency.
+#          a failure that names a key points at it in `doc`, and the manifest records
+#          where `[project]` and its `mach` value are written
+pub fun parse(alloc: *A.Allocator, itn: *intern.Interner, doc: *Doc, as_root: bool) res[Manifest, outcome.Fail] {
+    val r: res[Manifest, outcome.Fail] = parse_table(alloc, itn, ?doc.table, as_root);
+    if (sel r.err) { ret res[Manifest, outcome.Fail].err{outcome.placed(alloc, r.err, doc.path, doc.text)}; }
+    var m:    Manifest = r.ok;
+    val path: opt[str] = intern.lookup(itn, intern_unwrap(itn, doc.path));
+    if (sel path.some) {
+        m.project_at = site(path.some, doc.text, m.project_at);
+        m.mach_at    = site(path.some, doc.text, m.mach_at);
+    }
+    ret res[Manifest, outcome.Fail].ok{m};
+}
+
+fun site(path: str, text: str, at: outcome.Place) outcome.Place {
+    if (!at.spanned) { ret at; }
+    ret outcome.place(path, text::*u8, str_len(text), at.start, at.end);
+}
+
+# a manifest's text, the file it was read from, and its TOML tree, all owned
+# through the allocator that made it and released with `doc_dnit`. a failure
+# that names a key points into `text` at `path`
+pub rec Doc {
+    path:  str;
+    text:  str;
+    table: toml.Table;
+}
+
+# `text`, the manifest at `path`, as a doc: bytes a manifest refuses and a
+# document that is not TOML are failures pointing at the byte refused. the doc
+# keeps its own copies of both
+pub fun doc_parse(alloc: *A.Allocator, path: str, text: str) res[Doc, outcome.Fail] {
+    val clean: err[outcome.Fail] = validate_source_bytes(text::*u8, str_len(text));
+    if (sel clean.err) { ret res[Doc, outcome.Fail].err{outcome.placed(alloc, clean.err, path, text)}; }
+    val path_r: res[str, A.Error] = str_dup(alloc, path);
+    if (sel path_r.err) { ret res[Doc, outcome.Fail].err{outcome.refused(path_r.err)}; }
+    val text_r: res[str, A.Error] = str_dup(alloc, text);
+    if (sel text_r.err) {
+        str_free(alloc, path_r.ok);
+        ret res[Doc, outcome.Fail].err{outcome.refused(text_r.err)};
+    }
+    val table_r: res[toml.Table, toml.TomlError] = toml.parse(alloc, text_r.ok);
+    if (sel table_r.err) {
+        str_free(alloc, text_r.ok);
+        str_free(alloc, path_r.ok);
+        ret res[Doc, outcome.Fail].err{outcome.placed(alloc, outcome.toml_failure(table_r.err), path, text)};
+    }
+    ret res[Doc, outcome.Fail].ok{Doc{path: path_r.ok, text: text_r.ok, table: table_r.ok}};
+}
+
+# the manifest file at `path` read and parsed as `doc_parse` parses it; a file
+# that cannot be read is the environment's
+pub fun doc_read(alloc: *A.Allocator, path: str) res[Doc, outcome.Fail] {
+    val rb: res[Vector[u8], fs.FsError] = fs.read_bytes(alloc, path);
+    if (sel rb.err) {
+        ret res[Doc, outcome.Fail].err{outcome.environment(dkind.FS_READ, sfmt(alloc, "cannot read '{}': {}", path, outcome.fs_text(rb.err)))};
+    }
+    var bytes: Vector[u8] = rb.ok;
+    fin { vector.dnit[u8](?bytes); }
+    val clean: err[outcome.Fail] = validate_source_bytes(bytes.data, bytes.len);
+    if (sel clean.err) { ret res[Doc, outcome.Fail].err{outcome.placed_bytes(alloc, clean.err, path, bytes.data, bytes.len)}; }
+    val reserved: res[usize, A.Error] = vector.reserve[u8](?bytes, 1);
+    if (sel reserved.err) { ret res[Doc, outcome.Fail].err{outcome.refused(reserved.err)}; }
+    bytes.data[bytes.len] = 0;
+    ret doc_parse(alloc, path, bytes.data::str);
+}
+
+# release a doc and everything it owns
+pub fun doc_dnit(alloc: *A.Allocator, d: *Doc) {
+    toml.dnit(alloc, ?d.table);
+    if (d.text != nil) { str_free(alloc, d.text); }
+    if (d.path != nil) { str_free(alloc, d.path); }
+    d.text = nil;
+    d.path = nil;
+}
+
+fun parse_table(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, as_root: bool) res[Manifest, outcome.Fail] {
     var m:           Manifest = empty();
     var transferred: bool     = false;
     fin {
@@ -135,10 +218,10 @@ pub fun parse(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, as_roo
     val res_steps: err[outcome.Fail] = parse_steps(alloc, itn, t, ?m, as_root);
     if (sel res_steps.err) { ret res[Manifest, outcome.Fail].err{res_steps.err}; }
 
-    val res_needs: err[outcome.Fail] = validate_needs(alloc, itn, ?m);
+    val res_needs: err[outcome.Fail] = validate_needs(alloc, itn, t, ?m);
     if (sel res_needs.err) { ret res[Manifest, outcome.Fail].err{res_needs.err}; }
 
-    val res_link_refs: err[outcome.Fail] = validate_link_refs(alloc, itn, ?m);
+    val res_link_refs: err[outcome.Fail] = validate_link_refs(alloc, itn, t, ?m);
     if (sel res_link_refs.err) { ret res[Manifest, outcome.Fail].err{res_link_refs.err}; }
 
     if (m.target_count == 0) {
@@ -151,14 +234,28 @@ pub fun parse(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, as_roo
     ret res[Manifest, outcome.Fail].ok{m};
 }
 
+# where entry `i` of `[<owner>.<name>].<key>` is written; the zero span when it is not
+fun entry_span(t: *toml.Table, owner: str, name: str, key: str, i: usize) toml.Span {
+    var none:    toml.Span;
+    val section: opt[*toml.Table] = toml.get_table(t, owner);
+    if (sel section.none) { ret none; }
+    val table: opt[*toml.Table] = toml.get_table(section.some, name);
+    if (sel table.none) { ret none; }
+    val list: opt[*toml.Array] = toml.get_array(table.some, key);
+    if (sel list.none) { ret none; }
+    val e: opt[*toml.Value] = toml.array_get(list.some, i);
+    if (sel e.none) { ret none; }
+    ret e.some.span;
+}
+
 fun validate_need_entry(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
-    owner: str, name: str, entry: str) err[outcome.Fail] {
+    owner: str, name: str, entry: str, where: toml.Span) err[outcome.Fail] {
     val step_pattern:     str = need_pattern(entry, "step");
     val artifact_pattern: str = need_pattern(entry, "artifact");
     if (step_pattern == nil && (artifact_pattern == nil || str_equals(owner, "step"))) {
-        ret err[outcome.Fail].err{outcome.user(dkind.NEED_FORM, sfmt(alloc,
+        ret fail_at(outcome.user(dkind.NEED_FORM, sfmt(alloc,
             "mach.toml: [{}.{}].need entry '{}' must use 'step.<name>' or 'artifact.<name>' with optional '*' wildcards; steps may require only steps",
-            owner, name, entry))};
+            owner, name, entry)), where);
     }
     var hits: u32 = 0;
     var i:    u32 = 0;
@@ -167,7 +264,7 @@ fun validate_need_entry(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest
             val other: str = idstr(itn, m.steps[i].name);
             if (glob_matches(step_pattern, other)) {
                 if (str_equals(owner, "step") && str_equals(name, other)) {
-                    if (!is_glob(step_pattern)) { ret err[outcome.Fail].err{outcome.user(dkind.NEED_SELF, sfmt(alloc, "mach.toml: [{}.{}].need requires itself", owner, name))}; }
+                    if (!is_glob(step_pattern)) { ret fail_at(outcome.user(dkind.NEED_SELF, sfmt(alloc, "mach.toml: [{}.{}].need requires itself", owner, name)), where); }
                 }
                 or { hits = hits + 1; }
             }
@@ -179,7 +276,7 @@ fun validate_need_entry(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest
             val other: str = idstr(itn, m.artifacts[i].name);
             if (glob_matches(artifact_pattern, other)) {
                 if (str_equals(name, other)) {
-                    if (!is_glob(artifact_pattern)) { ret err[outcome.Fail].err{outcome.user(dkind.NEED_SELF, sfmt(alloc, "mach.toml: [artifact.{}].need requires itself", name))}; }
+                    if (!is_glob(artifact_pattern)) { ret fail_at(outcome.user(dkind.NEED_SELF, sfmt(alloc, "mach.toml: [artifact.{}].need requires itself", name)), where); }
                 }
                 or { hits = hits + 1; }
             }
@@ -187,19 +284,19 @@ fun validate_need_entry(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest
         }
     }
     if (hits == 0) {
-        ret err[outcome.Fail].err{outcome.user(dkind.NEED_NO_MATCH, sfmt(alloc, "mach.toml: [{}.{}].need entry '{}' matches no declaration in its category", owner, name, entry))};
+        ret fail_at(outcome.user(dkind.NEED_NO_MATCH, sfmt(alloc, "mach.toml: [{}.{}].need entry '{}' matches no declaration in its category", owner, name, entry)), where);
     }
     ret err[outcome.Fail].ok{};
 }
 
-fun validate_needs(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest) err[outcome.Fail] {
+fun validate_needs(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[outcome.Fail] {
     var ai: u32 = 0;
     for (ai < m.artifact_count) {
         val a:  *ArtifactDef = ?m.artifacts[ai];
         var ni: u32          = 0;
         for (ni < a.need_count) {
             val checked: err[outcome.Fail] = validate_need_entry(alloc, itn, m,
-                "artifact", idstr(itn, a.name), idstr(itn, a.need[ni]));
+                "artifact", idstr(itn, a.name), idstr(itn, a.need[ni]), entry_span(t, "artifact", idstr(itn, a.name), "need", ni::usize));
             if (sel checked.err) { ret checked; }
             ni = ni + 1;
         }
@@ -211,7 +308,7 @@ fun validate_needs(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest) err
         var ni: u32      = 0;
         for (ni < s.need_count) {
             val checked: err[outcome.Fail] = validate_need_entry(alloc, itn, m,
-                "step", idstr(itn, s.name), idstr(itn, s.need[ni]));
+                "step", idstr(itn, s.name), idstr(itn, s.need[ni]), entry_span(t, "step", idstr(itn, s.name), "need", ni::usize));
             if (sel checked.err) { ret checked; }
             ni = ni + 1;
         }
@@ -243,7 +340,7 @@ fun validate_needs(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest) err
     ret err[outcome.Fail].ok{};
 }
 
-fun validate_link_refs(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest) err[outcome.Fail] {
+fun validate_link_refs(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[outcome.Fail] {
     var ai: u32 = 0;
     for (ai < m.artifact_count) {
         val a:  *ArtifactDef = ?m.artifacts[ai];
@@ -252,8 +349,8 @@ fun validate_link_refs(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest)
             if (find_link_by_name(m, a.link[li]) == nil) {
                 var known: str = "no [link.*] table is declared";
                 if (m.link_count > 0) { known = sfmt(alloc, "declared: {}", link_table_names(alloc, itn, m)); }
-                ret err[outcome.Fail].err{outcome.user(dkind.LINK_UNKNOWN_TABLE, sfmt(alloc, "mach.toml: [artifact.{}].link names no [link.*] table: '{}' ({})",
-                    idstr(itn, a.name), idstr(itn, a.link[li]), known))};
+                ret fail_at(outcome.user(dkind.LINK_UNKNOWN_TABLE, sfmt(alloc, "mach.toml: [artifact.{}].link names no [link.*] table: '{}' ({})",
+                    idstr(itn, a.name), idstr(itn, a.link[li]), known)), entry_span(t, "artifact", idstr(itn, a.name), "link", li::usize));
             }
             li = li + 1;
         }
@@ -331,25 +428,21 @@ fun step_parse_live_make(p: *StepParseLive, alloc: *A.Allocator) bool {
 
 #[testing]
 pub fun tparse(alloc: *A.Allocator, itn: *intern.Interner, src: str) res[Manifest, outcome.Fail] {
-    val source_r: err[outcome.Fail] = validate_source_text(src);
-    if (sel source_r.err) { ret res[Manifest, outcome.Fail].err{source_r.err}; }
-    val tbl_r: res[toml.Table, toml.TomlError] = toml.parse(alloc, src);
-    if (sel tbl_r.err) { ret res[Manifest, outcome.Fail].err{outcome.toml_failure(tbl_r.err)}; }
-    var tbl: toml.Table                  = tbl_r.ok;
-    val m:   res[Manifest, outcome.Fail] = parse(alloc, itn, ?tbl, true);
-    toml.dnit(alloc, ?tbl);
-    ret m;
+    ret tparse_as(alloc, itn, src, true);
 }
 
 #[testing]
 pub fun tparse_lenient(alloc: *A.Allocator, itn: *intern.Interner, src: str) res[Manifest, outcome.Fail] {
-    val source_r: err[outcome.Fail] = validate_source_text(src);
-    if (sel source_r.err) { ret res[Manifest, outcome.Fail].err{source_r.err}; }
-    val tbl_r: res[toml.Table, toml.TomlError] = toml.parse(alloc, src);
-    if (sel tbl_r.err) { ret res[Manifest, outcome.Fail].err{outcome.toml_failure(tbl_r.err)}; }
-    var tbl: toml.Table                  = tbl_r.ok;
-    val m:   res[Manifest, outcome.Fail] = parse(alloc, itn, ?tbl, false);
-    toml.dnit(alloc, ?tbl);
+    ret tparse_as(alloc, itn, src, false);
+}
+
+#[testing]
+fun tparse_as(alloc: *A.Allocator, itn: *intern.Interner, src: str, as_root: bool) res[Manifest, outcome.Fail] {
+    val doc_r: res[Doc, outcome.Fail] = doc_parse(alloc, "mach.toml", src);
+    if (sel doc_r.err) { ret res[Manifest, outcome.Fail].err{doc_r.err}; }
+    var doc: Doc                         = doc_r.ok;
+    val m:   res[Manifest, outcome.Fail] = parse(alloc, itn, ?doc, as_root);
+    doc_dnit(alloc, ?doc);
     ret m;
 }
 
@@ -706,7 +799,7 @@ test parse__a_late_error_releases_the_owned_arrays {
             ret 2;
         }
         val named: bool = str_contains(outcome.describe(r.err), wants[i]);
-        str_free(?alloc, outcome.describe(r.err));
+        outcome.release(?alloc, r.err);
         intern.dnit(?itn);
         if (!named)          { ret 3; }
         if (probe.live != 0) { ret 4; }
@@ -745,13 +838,13 @@ test parse__an_env_intern_failure_aborts_the_step {
     var seeded: Manifest = seeded_r.ok;
     dnit(?seeded, ?alloc);
 
-    val source:  str                             = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[step.s]\nargv=[\"true\"]\nin=[]\nout=[]\nneed=[]\n[step.s.env]\nUNSEEDED=\"value\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
-    val table_r: res[toml.Table, toml.TomlError] = toml.parse(?alloc, source);
-    if (sel table_r.err) {
+    val source: str                    = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[step.s]\nargv=[\"true\"]\nin=[]\nout=[]\nneed=[]\n[step.s.env]\nUNSEEDED=\"value\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+    val doc_r:  res[Doc, outcome.Fail] = doc_parse(?alloc, "mach.toml", source);
+    if (sel doc_r.err) {
         intern.dnit(?base);
         ret 1;
     }
-    var table: toml.Table = table_r.ok;
+    var doc: Doc = doc_r.ok;
 
     var fail_alloc: A.Allocator;
     fail_alloc.ctx           = nil;
@@ -759,8 +852,8 @@ test parse__an_env_intern_failure_aborts_the_step {
     fail_alloc.fn_reallocate = step_intern_fail_reallocate;
     fail_alloc.fn_deallocate = step_intern_fail_deallocate;
     var child:  intern.Interner             = intern.make_child(?base, ?fail_alloc);
-    val parsed: res[Manifest, outcome.Fail] = parse(?alloc, ?child, ?table, true);
-    toml.dnit(?alloc, ?table);
+    val parsed: res[Manifest, outcome.Fail] = parse(?alloc, ?child, ?doc, true);
+    doc_dnit(?alloc, ?doc);
     val bad: bool = sel parsed.ok || child.len != 0;
     intern.dnit(?child);
     intern.dnit(?base);
@@ -1249,22 +1342,22 @@ test parse__an_unknown_key_rejection_owns_only_its_message {
     if (sel make_r.err) { ret 1; }
     var itn: intern.Interner = intern.init(?backing);
     fin { intern.dnit(?itn); }
-    val table_r: res[toml.Table, toml.TomlError] = toml.parse(?backing, "[project]\nid=\"p\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\nname=\"unused\"\n");
-    if (sel table_r.err) { ret 2; }
-    var table: toml.Table = table_r.ok;
-    fin { toml.dnit(?backing, ?table); }
+    val doc_r: res[Doc, outcome.Fail] = doc_parse(?backing, "mach.toml", "[project]\nid=\"p\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\nname=\"unused\"\n");
+    if (sel doc_r.err) { ret 2; }
+    var doc: Doc = doc_r.ok;
+    fin { doc_dnit(?backing, ?doc); }
     var tracking: alloc_test.Testing;
     val make_r2:  err[A.Error] = alloc_test.make(?tracking);
     if (sel make_r2.err) { ret 3; }
     fin { alloc_test.dnit(?tracking); }
-    val parsed: res[Manifest, outcome.Fail] = parse(?tracking.a, ?itn, ?table, true);
+    val parsed: res[Manifest, outcome.Fail] = parse(?tracking.a, ?itn, ?doc, true);
     if (sel parsed.ok) {
         var unexpected: Manifest = parsed.ok;
         dnit(?unexpected, ?tracking.a);
         ret 4;
     }
     if (!str_contains(outcome.describe(parsed.err), "unknown key 'name' in [project]")) { ret 5; }
-    outcome.release_text(?tracking.a, parsed.err);
+    outcome.release(?tracking.a, parsed.err);
     if (tracking.total < 1 || tracking.live != 0 || tracking.double_frees != 0 || tracking.exhausted != 0) { ret 6; }
     ret 0;
 }
