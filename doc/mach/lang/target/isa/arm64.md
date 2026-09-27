@@ -54,7 +54,7 @@ pub val EXTENSIONS: [EXTENSION_COUNT]extension.Extension = [EXTENSION_COUNT]exte
 ## val X0
 
 ```mach
-pub val X0: i32 = 0
+pub val X0:  i32 = 0
 ```
 
 ## val X9
@@ -108,7 +108,7 @@ pub val SP: i32 = 31
 ## val V0
 
 ```mach
-pub val V0: i32 = 0
+pub val V0:  i32 = 0
 ```
 
 ## val V30

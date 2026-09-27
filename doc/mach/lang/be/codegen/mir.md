@@ -1670,6 +1670,16 @@ pub val INITIAL_SLOT_CAP:  u32 = 8
 pub fun emits_instr(f: *MirFunction, mi: *MirInstr) bool;
 ```
 
+## fun runs_asm
+
+```mach
+pub fun runs_asm(mi: *MirInstr) bool;
+```
+
+whether the instruction is an inline-asm block, before or after selection:
+selection retags the opcode on some instruction sets (x64.ASM_BLOCK), and a
+selected opcode can share MIR_ASM's number, but the payload stays with it
+
 ## fun op_vreg
 
 ```mach

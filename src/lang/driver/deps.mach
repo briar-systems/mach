@@ -2444,9 +2444,18 @@ fun range_satisfied(s: *session.Session, gi: *GitInspector, alias: str, chain: s
     fin { str_free(a, have); }
     var mr: res[str, format.FormatError];
     if (str_empty(have)) {
-        mr = format.sprint(a,
-            "dependency '{}': {} requires version '{}' but the pinned commit '{}' carries no release tag; run `mach dep update <path> {}` for project '{}' to pin a release",
-            alias, chain, want, pin, alias, project_root);
+        val tagged: res[bool, outcome.Fail] = has_tags(a, gi, dep_dir);
+        if (sel tagged.err) { ret err[outcome.Fail].err{tagged.err}; }
+        if (!tagged.ok) {
+            mr = format.sprint(a,
+                "dependency '{}': {} requires version '{}' but the release of the pinned commit '{}' cannot be read: its checkout at {} holds no tags (a shallow clone fetches none); run `mach dep pull <path>` for project '{}' to fetch them",
+                alias, chain, want, pin, dep_dir, project_root);
+        }
+        or {
+            mr = format.sprint(a,
+                "dependency '{}': {} requires version '{}' but no release tag in its checkout names the pinned commit '{}'; run `mach dep pull <path>` for project '{}' to fetch its tags, or `mach dep update <path> {}` to pin a release",
+                alias, chain, want, pin, project_root, alias);
+        }
     }
     or {
         val rr: res[range.Range, range.RangeError] = range.parse_range(want);
@@ -3466,8 +3475,9 @@ pub fun gitlink_at(s: *session.Session, dir: str, rev: str, id: str) res[opt[str
 }
 
 # the release version dep/<id>'s pin is tagged with, read from its checkout's refs (an owned ""
-# when no release tag points at it); the highest wins, and the caller frees the result
-pub fun release_at_pin(s: *session.Session, root: str, id: str, dep_full: str) res[str, outcome.Fail] {
+# when no release tag points at it); the highest wins, and the caller frees the result. with
+# `fetch`, a checkout no release tag of which names the pin fetches its tags first (#4073)
+pub fun release_at_pin(s: *session.Session, root: str, id: str, dep_full: str, fetch: bool) res[str, outcome.Fail] {
     val own: err[outcome.Fail] = require_own_work_tree(s, dep_full);
     if (sel own.err) { ret res[str, outcome.Fail].err{own.err}; }
     val pin: res[str, outcome.Fail] = pinned_commit(s, root, id, dep_full);
@@ -3475,7 +3485,83 @@ pub fun release_at_pin(s: *session.Session, root: str, id: str, dep_full: str) r
     fin { str_free(s.build_alloc, pin.ok); }
     var gi: GitInspector = GitInspector{program: nil};
     fin { git_inspector_dnit(s.build_alloc, ?gi); }
+    val held: res[str, outcome.Fail] = release_at(s.build_alloc, ?gi, dep_full, pin.ok);
+    if (sel held.err)                  { ret held; }
+    if (!fetch || !str_empty(held.ok)) { ret held; }
+    str_free(s.build_alloc, held.ok);
+    val fetched: err[outcome.Fail] = fetch_tags(s.build_alloc, ?gi, dep_full);
+    if (sel fetched.err) { ret res[str, outcome.Fail].err{fetched.err}; }
     ret release_at(s.build_alloc, ?gi, dep_full, pin.ok);
+}
+
+# whether the checkout at `dir` holds any tag: one that holds none, as a shallow clone
+# (`git submodule update --depth 1`) does, cannot say which release a commit is (#4073)
+fun has_tags(a: *A.Allocator, gi: *GitInspector, dir: str) res[bool, outcome.Fail] {
+    val er: err[outcome.Fail] = git_inspector_require(a, gi);
+    if (sel er.err) { ret res[bool, outcome.Fail].err{er.err}; }
+    var args: [3]str                 = [3]str{"for-each-ref", "--count=1", "refs/tags"};
+    val r:    res[str, outcome.Fail] = git_query(a, gi, dir, ?args[0], 3);
+    if (sel r.err) { ret res[bool, outcome.Fail].err{r.err}; }
+    val any: bool = !str_empty(r.ok);
+    str_free(a, r.ok);
+    ret res[bool, outcome.Fail].ok{any};
+}
+
+# whether the checkout at dep_full holds any tag, which a shallow clone may not
+pub fun checkout_has_tags(s: *session.Session, dep_full: str) res[bool, outcome.Fail] {
+    var gi: GitInspector = GitInspector{program: nil};
+    fin { git_inspector_dnit(s.build_alloc, ?gi); }
+    ret has_tags(s.build_alloc, ?gi, dep_full);
+}
+
+fun fetch_tags(a: *A.Allocator, gi: *GitInspector, dir: str) err[outcome.Fail] {
+    val er: err[outcome.Fail] = git_inspector_require(a, gi);
+    if (sel er.err) { ret er; }
+    var args: [2]str                 = [2]str{"fetch", "--tags"};
+    val f:    res[str, outcome.Fail] = git_op(a, gi, dir, ?args[0], 2, nil);
+    if (sel f.err) { ret err[outcome.Fail].err{f.err}; }
+    str_free(a, f.ok);
+    ret err[outcome.Fail].ok{};
+}
+
+# fetch the tags of dep/<id>'s checkout when it lacks the one its selection reads: the tag a
+# `tag/` ref names, or a release tag naming the pin of a version range; whether it fetched
+pub fun fetch_selection_tags(s: *session.Session, root: str, id: str, dep_full: str, ref: str,
+    ranged: bool) res[bool, outcome.Fail] {
+    val a: *A.Allocator = s.build_alloc;
+    if (ranged) {
+        val held: res[str, outcome.Fail] = release_at_pin(s, root, id, dep_full, false);
+        if (sel held.err) { ret res[bool, outcome.Fail].err{held.err}; }
+        val tagged: bool = !str_empty(held.ok);
+        str_free(a, held.ok);
+        if (tagged) { ret res[bool, outcome.Fail].ok{false}; }
+    }
+    or (str_starts_with(ref, "tag/")) {
+        val own: err[outcome.Fail] = require_own_work_tree(s, dep_full);
+        if (sel own.err) { ret res[bool, outcome.Fail].err{own.err}; }
+        val spec_r: res[str, format.FormatError] = format.sprint(a, "refs/tags/{}^{{commit}}", (?ref[4])::str);
+        if (sel spec_r.err) { ret res[bool, outcome.Fail].err{outcome.internal(outcome.format_text(spec_r.err))}; }
+        var args: [4]str            = [4]str{"rev-parse", "--verify", "--quiet", spec_r.ok};
+        var gi:   GitInspector      = GitInspector{program: nil};
+        val er:   err[outcome.Fail] = git_inspector_require(a, ?gi);
+        if (sel er.err) {
+            str_free(a, spec_r.ok);
+            ret res[bool, outcome.Fail].err{er.err};
+        }
+        val held: res[str, outcome.Fail] = git_query(a, ?gi, dep_full, ?args[0], 4);
+        git_inspector_dnit(a, ?gi);
+        str_free(a, spec_r.ok);
+        if (sel held.ok) {
+            str_free(a, held.ok);
+            ret res[bool, outcome.Fail].ok{false};
+        }
+    }
+    or { ret res[bool, outcome.Fail].ok{false}; }
+    var gi: GitInspector = GitInspector{program: nil};
+    fin { git_inspector_dnit(a, ?gi); }
+    val fetched: err[outcome.Fail] = fetch_tags(a, ?gi, dep_full);
+    if (sel fetched.err) { ret res[bool, outcome.Fail].err{fetched.err}; }
+    ret res[bool, outcome.Fail].ok{true};
 }
 
 # whether dep/<id> is pinned at the release `version` and its checkout is at that pin; a

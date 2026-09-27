@@ -9,19 +9,19 @@ pub def QueryKind: u16
 ## val Q_PROJECT_ROOT
 
 ```mach
-pub val Q_PROJECT_ROOT: QueryKind = 0
+pub val Q_PROJECT_ROOT:    QueryKind = 0
 ```
 
 ## val Q_TARGET
 
 ```mach
-pub val Q_TARGET:       QueryKind = 1
+pub val Q_TARGET:          QueryKind = 1
 ```
 
 ## val Q_FILE_TEXT
 
 ```mach
-pub val Q_FILE_TEXT:    QueryKind = 2
+pub val Q_FILE_TEXT:       QueryKind = 2
 ```
 
 ## val Q_PARSE
