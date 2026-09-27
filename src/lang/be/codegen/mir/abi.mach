@@ -74,6 +74,13 @@ val EB_NO_CLASS: u8 = 0;
 val EB_SSE:      u8 = 1;
 val EB_INTEGER:  u8 = 2;
 
+# a type the convention places as a float: a float, or an integer carrying a
+# binary16 where the convention's half row takes the float bank (#3800)
+fun abi_float(ctx: *context.LowerCtx, ty: type.IrTypeId) bool {
+    if (context.value_is_float(ctx, ty)) { ret true; }
+    ret type.int_form(ctx.types, ty) == type.INT_FORM_BINARY16 && abi.half_is_float(ctx.tgt.abi.half);
+}
+
 fun mark_eightbyte_range(classes: *u8, off: u64, size: u64, cls: u8) {
     if (size == 0) { ret; }
     var i:    u64 = off / 8;
@@ -133,7 +140,7 @@ fun mark_eightbytes(ctx: *context.LowerCtx, ty: type.IrTypeId, base_off: u64, cl
     }
 
     var cls: u8 = EB_INTEGER;
-    if (t.kind == type.IRT_FLOAT) { cls = EB_SSE; }
+    if (abi_float(ctx, ty)) { cls = EB_SSE; }
     mark_eightbyte_range(classes, base_off, type.byte_size_for_machine(ctx.types, ty, ctx.layout)::u64, cls);
 }
 
@@ -172,7 +179,7 @@ fun collect_leaves(ctx: *context.LowerCtx, ty: type.IrTypeId, base_off: u64, out
     if (t.kind == type.IRT_UNION || t.kind == type.IRT_TAG) { ret cap + 1; }
 
     if (count < cap) {
-        out[count].is_float = t.kind == type.IRT_FLOAT;
+        out[count].is_float = abi_float(ctx, ty);
         out[count].offset   = base_off::u32;
         out[count].width    = type.byte_size_for_machine(ctx.types, ty, ctx.layout)::u8;
     }
@@ -250,7 +257,7 @@ fun hfa_walk(ctx: *context.LowerCtx, ty: type.IrTypeId, out_elem: *u32, out_coun
     if (!sel it.some) { ret false; }
     val t: *type.IrType = it.some;
 
-    if (t.kind == type.IRT_FLOAT) {
+    if (abi_float(ctx, ty)) {
         @out_elem  = type.byte_size_for_machine(ctx.types, ty, ctx.layout);
         @out_count = 1;
         ret true;
@@ -308,9 +315,9 @@ fun hfa_info(ctx: *context.LowerCtx, ty: type.IrTypeId, out_members: *u8, out_el
     if (!context.value_is_aggregate(ctx, ty)) { ret; }
     var elem:  u32 = 0;
     var count: u32 = 0;
-    if (!hfa_walk(ctx, ty, ?elem, ?count)) { ret; }
-    if (count < 1 || count > 4)            { ret; }
-    if (elem != 4 && elem != 8)            { ret; }
+    if (!hfa_walk(ctx, ty, ?elem, ?count))   { ret; }
+    if (count < 1 || count > 4)              { ret; }
+    if (elem != 2 && elem != 4 && elem != 8) { ret; }
     @out_members = count::u8;
     @out_elem    = elem::u8;
 }
@@ -444,7 +451,7 @@ pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type:
     out.param_count = 0;
 
     val ret_size:  u64  = type.byte_size_for_machine(ctx.types, ret_type, ctx.layout)::u64;
-    val ret_float: bool = context.value_is_float(ctx, ret_type);
+    val ret_float: bool = abi_float(ctx, ret_type);
     val ret_aggr:  bool = context.value_is_aggregate(ctx, ret_type);
     val ret_vec:   bool = context.value_is_vector(ctx, ret_type);
     val ret_eb:    u8   = aggregate_eightbyte_mask(ctx, ret_type);
@@ -493,7 +500,7 @@ pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type:
     for (i < pc) {
         val pty: type.IrTypeId = t.data.fn.params[i];
         val psz: u64           = type.byte_size_for_machine(ctx.types, pty, ctx.layout)::u64;
-        val pfl: bool          = context.value_is_float(ctx, pty);
+        val pfl: bool          = abi_float(ctx, pty);
         val pag: bool          = context.value_is_aggregate(ctx, pty);
         val pal: u64           = arg_align(ctx, pty, pag);
         val peb: u8            = aggregate_eightbyte_mask(ctx, pty);
@@ -1081,6 +1088,16 @@ fun materialize_pieces(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.Para
             val copied: err[fail.Fail] = context.copy_aggregate(ctx, transfers, dst, src, logical_width::u64);
             if (sel copied.err) { ret copied; }
         }
+        or (abi.piece_is_half(?p)) {
+            if (plan.store) {
+                val hr: err[fail.Fail] = emit_half_from_fp_reg(ctx, mb, copies, mem, p.reg);
+                if (sel hr.err) { ret hr; }
+            }
+            or {
+                val hr: err[fail.Fail] = emit_half_to_fp_reg(ctx, mb, registers, p.reg, mem);
+                if (sel hr.err) { ret hr; }
+            }
+        }
         or {
             val reg:    mir.MirOperand = mir.op_preg(p.reg);
             val direct: bool           = carrier_access_legal(ctx, ?p, plan.mem_align);
@@ -1114,6 +1131,45 @@ fun materialize_pieces(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.Para
     }
     if (registers == ?pending) { ret append_deferred(ctx, mb, ?pending); }
     ret err[fail.Fail].ok{};
+}
+
+# a scalar slot of one float piece two bytes wide: a binary16 in a float
+# register (#3800)
+fun slot_carries_half(slot: *abi.ParamSlot) bool {
+    ret slot.class == abi.CLASS_FP && slot.piece_count == 1 && abi.piece_is_half(?slot.pieces[0]);
+}
+
+# a binary16 into a float register: its two bytes, and the convention's
+# padding above them, fill a four-byte carrier that is loaded as a binary32
+# would be. no move of two bytes into a float register is assumed, since
+# baseline x86-64 and RISC-V without Zfhmin have none (#3800)
+fun emit_half_to_fp_reg(ctx: *context.LowerCtx, preparation: *mir.MirBlock, registers: *mir.MirBlock,
+    reg: mir.PRegId, src: mir.MirOperand) err[fail.Fail] {
+    val kr: res[mir.VRegId, fail.Fail] = allocate_carrier(ctx, 4);
+    if (sel kr.err) { ret err[fail.Fail].err{kr.err}; }
+    val carrier: mir.MirOperand = mir.op_mem_slot(kr.ok, 0);
+    var placed:  err[fail.Fail] = err[fail.Fail].ok{};
+    if (src.kind == mir.MIR_OP_MEM) { placed = context.copy_aggregate(ctx, preparation, carrier, src, 2); }
+    or                              { placed = context.emit_store_to_w(ctx, preparation, carrier, src, 2); }
+    if (sel placed.err)             { ret placed; }
+    val pad: err[fail.Fail] = context.push_store_chunk(ctx, preparation, mir.op_mem_slot(kr.ok, 2),
+        mir.op_imm(abi.half_float_padding(ctx.tgt.abi.half)::i64), 2);
+    if (sel pad.err) { ret pad; }
+    ret emit_call_reg(ctx, preparation, registers, mir.op_preg(reg), carrier, 4);
+}
+
+# a binary16 out of a float register: the register stored as a binary32 and
+# its low two bytes read back. a destination in memory is written in `copies`,
+# after every register is read
+fun emit_half_from_fp_reg(ctx: *context.LowerCtx, mb: *mir.MirBlock, copies: *mir.MirBlock,
+    dst: mir.MirOperand, reg: mir.PRegId) err[fail.Fail] {
+    val kr: res[mir.VRegId, fail.Fail] = allocate_carrier(ctx, 4);
+    if (sel kr.err) { ret err[fail.Fail].err{kr.err}; }
+    val carrier: mir.MirOperand = mir.op_mem_slot(kr.ok, 0);
+    val st:      err[fail.Fail] = context.emit_store_to_w(ctx, mb, carrier, mir.op_preg(reg), 4);
+    if (sel st.err)                 { ret st; }
+    if (dst.kind == mir.MIR_OP_MEM) { ret context.copy_aggregate(ctx, copies, dst, carrier, 2); }
+    ret context.emit_mov_w(ctx, mb, dst, carrier, 2);
 }
 
 # a vector the convention passes by value on the stack while the ir holds the
@@ -1191,6 +1247,7 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, registers: *mir.Mir
         plan.stack_ok   = true;
         ret materialize_pieces(ctx, mb, slot, plan);
     }
+    if (slot_carries_half(?slot)) { ret emit_half_to_fp_reg(ctx, mb, registers, slot.reg, argop); }
     if (slot.class == abi.CLASS_FP) {
         if (int_rides_fp_slot(ctx, ty)) { ret emit_int_to_fp_reg(ctx, mb, registers, slot.reg, argop, ty); }
         val fw: res[u8, fail.Fail] = fp_move_width(ctx, ty);
@@ -1373,6 +1430,7 @@ fun fp_move_width(ctx: *context.LowerCtx, ty: type.IrTypeId) res[u8, fail.Fail] 
 }
 
 fun capture_slot_reg(ctx: *context.LowerCtx, mb: *mir.MirBlock, dst: mir.VRegId, slot: abi.ParamSlot, ty: type.IrTypeId) err[fail.Fail] {
+    if (slot_carries_half(?slot)) { ret emit_half_from_fp_reg(ctx, mb, mb, mir.op_vreg(dst), slot.reg); }
     if (slot.class == abi.CLASS_FP) {
         if (int_rides_fp_slot(ctx, ty)) { ret emit_fp_reg_to_int(ctx, mb, dst, slot.reg, ty); }
         val fw: res[u8, fail.Fail] = fp_move_width(ctx, ty);
@@ -2061,6 +2119,10 @@ pub fun lower_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.
         plan.stack_off  = 0;
         plan.stack_ok   = false;
         val mr: err[fail.Fail] = materialize_pieces(ctx, mb, slot, plan);
+        if (sel mr.err) { ret mr; }
+    }
+    or (slot_carries_half(?slot)) {
+        val mr: err[fail.Fail] = emit_half_to_fp_reg(ctx, mb, mb, slot.reg, rvop);
         if (sel mr.err) { ret mr; }
     }
     or (slot.class == abi.CLASS_FP && int_rides_fp_slot(ctx, rt)) {
