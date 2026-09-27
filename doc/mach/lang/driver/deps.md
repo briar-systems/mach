@@ -509,7 +509,8 @@ slot: *GitSlot, offline: bool) res[u8, outcome.Fail];
 ```
 
 bring a slot `refuse_git_slot` accepted to the realization a build verifies. a pin its
-checkout does not hold is fetched, or refused when `offline`
+checkout does not hold is fetched, or refused when `offline`, and an uninitialized gitlink
+is initialized offline only from a module store that holds its pin
 
 ## fun remove_dependency_index
 
