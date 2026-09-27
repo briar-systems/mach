@@ -225,6 +225,17 @@ relocation is correct after a trailing immediate.
 | move, in either direction between a register and memory | `movdqa`, `movdqu`, `movaps`, `movups` |
 | `xmm, xmm/m128` | `paddb` `paddw` `paddd` `paddq`, `psubb` `psubw` `psubd` `psubq` `psubusb` `psubusw`, `pmullw` `pmulhw` `pmulhuw` `pmuludq`, `pand` `por` `pxor`, `pcmpeqb` `pcmpeqw` `pcmpeqd` `pcmpgtb` `pcmpgtw` `pcmpgtd`, `punpcklbw` `punpcklwd` `punpckldq` `punpckhbw` `punpckhwd` `punpckhdq`, `packsswb` `packssdw`, `addps` `subps` `mulps` `divps` `addpd` `subpd` `mulpd` `divpd`, `cvtdq2ps` `cvttps2dq` `cvtdq2pd` `cvttpd2dq` `cvtps2pd` `cvtpd2ps` |
 | `xmm, xmm/m128, imm8` | `pshufd`, `cmpps`, `cmppd` |
+| `xmm, r64` and `r64, xmm` | `movq` |
+| `xmm, imm8` | `pslldq` `psrldq`, `psllq` `psrlq` |
+| `xmm, xmm/m128` (the count is the source's low quadword) | `psllq` `psrlq` |
+
+`movq xmm, r64` writes the low quadword and zeroes the high one, and `movq r64,
+xmm` reads the low quadword. Only the 64-bit general register form is spelled.
+`pslldq` and `psrldq` shift the whole register by bytes, and `psllq` and `psrlq`
+shift each quadword by bits. A count past the width empties the register or the
+lane, as GNU as encodes it, so any immediate from 0 to 255 is accepted. All of
+them are baseline SSE2 and run in fixed time whatever the count, so the
+constant-time check lets a secret through them as data.
 
 **aarch64** spells them `vN.16b`, `vN.8h`, `vN.4s` or `vN.2d`. The suffix is the
 lane arrangement, and every operand of one instruction shares it. `add`, `sub`,
@@ -235,8 +246,21 @@ float members only at `.4s` and `.2d`, and `mul` everywhere except `.2d`.
 | form | mnemonics |
 |---|---|
 | three registers | `add` `sub` `mul`, `and` `orr` `eor`, `cmeq` `cmgt` `cmge` `cmhi` `cmhs`, `fadd` `fsub` `fmul` `fdiv`, `fcmeq` `fcmgt` `fcmge` |
-| two registers | `mov`, `mvn` |
+| two registers | `mov`, `mvn`, `rev64` (not `.2d`) |
 | one element structure | `ld1 {vT.<lanes>}, [Xn]`, `st1 {vT.<lanes>}, [Xn]` |
+| three `.16b` registers and the first byte | `ext vD.16b, vN.16b, vM.16b, 8` |
+| a register from one lane, or from a general register | `dup vD.2d, vN.d[1]`, `dup vD.4s, wN` |
+| one lane from a lane of its width, or from a general register | `ins vD.d[1], xN`, `ins vD.s[0], vN.s[3]` |
+
+A lane is written `vN.b[i]`, `vN.h[i]`, `vN.s[i]` or `vN.d[i]`, with the index
+below the lane count. A lane taken from or put into a general register uses `x`
+for a `.d` lane and `w` for the narrower ones. `mov vD.d[1], xN` is the same
+instruction as `ins`, and the listing spells it that way, as objdump does.
+`ins` writes one lane and keeps the rest, so the register is read as well as
+written. `ext`'s byte index is bare like every other immediate, from 0 to 15.
+`rev x0, x1` and `rev w0, w1` reverse the bytes of a general register. All of
+them are baseline ASIMD and data-independent, so the constant-time check lets
+a secret through them.
 
 `ld1` and `st1` post-index their base by the structure size, `, 16`, or by an X
 register, `, x9`. Either form writes the base register:
