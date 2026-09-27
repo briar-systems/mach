@@ -722,6 +722,20 @@ target_platform: intern.StrId,
 bin_name: intern.StrId);
 ```
 
+## fun set_source_context
+
+```mach
+pub fun set_source_context(c: *ComptimeCtx, module: intern.StrId, file: intern.StrId,
+owner_id: intern.StrId, owner_ver: intern.StrId);
+```
+
+the module a context compiles, what `$mach.source.*` and `$mach.project.*` read
+
+module: the module's fully qualified name
+file: its file, relative to the root of the project that owns it
+owner_id: the owning project's `[project].id`
+owner_ver: the owning project's `[project].version`
+
 ## fun dnit
 
 ```mach
