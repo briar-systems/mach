@@ -48,7 +48,7 @@ key there is exactly the kind the diagnostic carries.
 The table is append-only:
 
 - **A key is never reused.** Once a key has named a kind, it names that kind and
-  no other, in every later release.
+  no other, for good.
 - **A key is never removed.** A kind mach no longer raises is retired: its row
   stays, marked retired, so its key stays reserved and can never be given to a
   new kind.
