@@ -109,14 +109,17 @@ pub fun riscv64_build_attributes(alloc: *A.Allocator, xlen_bits: u32, extension_
 has_compressed: bool, out_len: *u32) res[*u8, fail.Fail];
 ```
 
-## fun validate_selected
+## fun validate_input
 
 ```mach
-pub fun validate_selected(bytes: *u8, len: u32, xlen_bits: u32, selected: u64, flags: u32) err[fail.Fail];
+pub fun validate_input(bytes: *u8, len: u32, xlen_bits: u32, flags: u32) err[fail.Fail];
 ```
 
-refuses an object whose Tag_RISCV_arch or header flags need something the selected
-target lacks: an unknown extension, an unavailable one, another revision or XLEN
+refuses only what cannot link into the target: an attribute section that does not parse,
+a Tag_RISCV_arch of another XLEN, or the RV32E/RV64E calling convention, which no target
+uses. the extensions an object names are merged into the output and never refused, since
+whether mach generates code for one says nothing about linking an object that uses it.
+the float ABI in the flags is checked where every input's flags are merged
 
 ## fun riscv64_merge_attributes
 

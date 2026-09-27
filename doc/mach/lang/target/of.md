@@ -1226,10 +1226,11 @@ pub def MergeAttributesFn: fun(*A.Allocator, *u8, u32, *u8, u32, *u32) res[*u8, 
 ## def ValidateAttributesFn
 
 ```mach
-pub def ValidateAttributesFn: fun(*u8, u32, u32, u64, u32) err[fail.Fail]
+pub def ValidateAttributesFn: fun(*u8, u32, u32, u32) err[fail.Fail]
 ```
 
-validate: (bytes, len, xlen_bits, selected extension bits, object machine flags)
+validate: (bytes, len, xlen_bits, object machine flags), an input's section and flags
+against what the target can link at all, never against the extensions it selects
 
 ## rec ElfAttributes
 
