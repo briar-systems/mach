@@ -12,7 +12,7 @@ initialise a session, load the manifest, and plan a build for parsed CLI argumen
 a: allocator for the request
 root: the project root directory
 cli: the parsed arguments
-goal: what to produce, objects or an executable
+goal: what to produce, objects or the finished artifact
 configure_deps: also resolve every cell against the realized dependency closure,
                 filling in its exported dependency steps and export link requirements. a build
                 that goes on to execute resolves each cell as it runs it, so only a caller that
