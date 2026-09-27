@@ -11,6 +11,7 @@ pub rec Report;
 visited: source files read
 differing: files whose layout is not canonical (rewritten, or listed by --check)
 malformed: files that do not parse; each was reported and left unchanged
+diagnostics: where a malformed file's diagnostics are rendered
 
 ## def Operand
 
@@ -91,7 +92,7 @@ pub val SINK_NAME:   Sink = 2
 ## fun format_project
 
 ```mach
-pub fun format_project(a: *A.Allocator, backing: *A.Allocator, project_root: str, manifest_path: str, sink: Sink) res[Report, outcome.Fail];
+pub fun format_project(a: *A.Allocator, backing: *A.Allocator, project_root: str, manifest_path: str, sink: Sink, diagnostics: *writer.Writer) res[Report, outcome.Fail];
 ```
 
 format or check one project: the manifest names the source directory, the
@@ -101,7 +102,7 @@ visits only the source tree
 ## fun format_one_file
 
 ```mach
-pub fun format_one_file(a: *A.Allocator, backing: *A.Allocator, operand: str, sink: Sink) res[Report, outcome.Fail];
+pub fun format_one_file(a: *A.Allocator, backing: *A.Allocator, operand: str, sink: Sink, diagnostics: *writer.Writer) res[Report, outcome.Fail];
 ```
 
 format one source file named directly, with no manifest read: the file's own
@@ -110,7 +111,7 @@ directory is opened so the leaf is handled exactly as the project walk handles i
 ## fun format_stream
 
 ```mach
-pub fun format_stream(a: *A.Allocator, in_fd: usize, out_fd: usize, sink: Sink) res[Report, outcome.Fail];
+pub fun format_stream(a: *A.Allocator, in_fd: usize, out_fd: usize, sink: Sink, diagnostics: *writer.Writer) res[Report, outcome.Fail];
 ```
 
 format the source arriving on one descriptor onto another; nothing on disk is
