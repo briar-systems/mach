@@ -51,5 +51,6 @@ pub rec VarLoc;
 ```
 
 piece: the lane of a legalized value this location describes, of `pieces`
-lanes each `piece_bytes` wide; `pieces` is 0 for a whole value
+lanes each `piece_bytes` wide but the last, `piece_last_bytes` wide when that
+is not 0; `pieces` is 0 for a whole value
 

@@ -392,11 +392,38 @@ convention, which is the only one mach has, so a call is bit-compatible with a C
   register, which is what the convention says and what a boundary-free call would do
   anyway.
 
-A vector **wider** than the target's vector register (`f32x8` on any target today)
-has no C convention to follow: it is an AVX/SVE type the baseline does not have, so
-no psABI classifies it. Mach gives it the memory class on every convention — a
-hidden pointer to its storage for an argument, the indirect-result pointer for a
-return — which is the placement it already has internally.
+A vector **wider** than the target's vector register (`i32x8`, `f32x16`, …)
+follows the C rule for a vector of that size on each convention, so a call is
+bit-compatible with a C `int __attribute__((vector_size(32)))` parameter:
+
+- **System V x86-64** (`linux` / `darwin`): the psABI makes a vector wider than
+  the vector registers the target declares **MEMORY** class. As an argument its
+  bytes are placed on the stack at its C alignment, its size (32 for `i32x8`, 64
+  for `i32x16`), and it takes no register. As a result it is returned through the
+  hidden result pointer, as gcc does. clang (Apple clang included) returns such a
+  vector in `xmm0` and `xmm1` instead, against the psABI, so a C function built by
+  clang that returns one disagrees with mach; declare the C side's result as a
+  record of the same size, which clang returns as MEMORY. Apple clang also places
+  such a vector *argument* on the stack at 16 bytes rather than at its C
+  alignment, so it disagrees with mach wherever the vector's stack offset is not
+  already a multiple of its size; on darwin declare the C side's argument as a
+  record of the same size with `__attribute__((aligned(32)))` (or the vector's
+  size), which Apple clang places as the psABI places the vector. Mach follows the
+  psABI on darwin as on linux.
+- **x86_64-windows (Microsoft x64):** the carrier table under [Windows vector
+  carriers](#windows-vector-carriers): a pointer to a caller copy, and
+  caller-provided result storage.
+- **AAPCS64 and RISC-V lp64d:** C treats the vector as a composite larger than two
+  registers: a pointer to a caller copy for an argument, and the indirect-result
+  register for a return. Mach does the same.
+
+The width that decides "wider" is the vector register the target declares, 16
+bytes on every target mach has today.
+
+A size no C vector type has has no C rule to follow: C's `vector_size` takes a
+power of two, so `i32x5` (20 bytes) and `f32x6` (24 bytes) have no C counterpart.
+Mach keeps its own placement for such a vector on every convention: a pointer to
+its storage for an argument, and the indirect-result pointer for a return.
 
 Every call edge marshals the same way, because the C convention is the only one mach
 has: a direct call to a declared `ext fun`, an ordinary Mach→Mach call, and a call

@@ -72,6 +72,14 @@ pub fun ctx_dnit(ctx: *LowerCtx);
 pub fun push_pending_dbg(ctx: *LowerCtx, iid: u32, vreg: u32) err[fail.Fail];
 ```
 
+## fun push_pending_dbg_piece
+
+```mach
+pub fun push_pending_dbg_piece(ctx: *LowerCtx, iid: u32, vreg: u32, lane: u8, lanes: u8, lane_bytes: u8, last_bytes: u8) err[fail.Fail];
+```
+
+a pending binding of one piece of a value held in several registers (#3589)
+
 ## fun drain_pending_dbg
 
 ```mach
@@ -139,6 +147,30 @@ pub fun vec_lane_for_type(ctx: *LowerCtx, ty: ir_type.IrTypeId) u32;
 ```mach
 pub fun compute_vec_lane(ctx: *LowerCtx, inst: *instruction.Instruction) u32;
 ```
+
+## fun vector_image
+
+```mach
+pub fun vector_image(ctx: *LowerCtx, declared: ir_type.IrTypeId, ty: ir_type.IrTypeId) bool;
+```
+
+a value the signature declares a vector and the ir carries as the address of
+its memory image, as scalarize places a vector no register holds
+
+## fun param_is_vector_image
+
+```mach
+pub fun param_is_vector_image(ctx: *LowerCtx, i: u32) bool;
+```
+
+## fun sig_param_type
+
+```mach
+pub fun sig_param_type(ctx: *LowerCtx, sig: ir_type.IrTypeId, i: u32) ir_type.IrTypeId;
+```
+
+parameter `i` of a signature, IRT_NIL past its parameters or for a type
+that is not a function's
 
 ## fun fn_return_type
 

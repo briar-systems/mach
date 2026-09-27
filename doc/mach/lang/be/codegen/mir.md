@@ -461,6 +461,16 @@ pub val MIR_VEC_RANGE: MirOpcode = 0x100E
 the IR lane range (dst, src, first lane in imm): the source's lanes from the
 first on, of the same lane type (#3864)
 
+## val MIR_VEC_CONCAT
+
+```mach
+pub val MIR_VEC_CONCAT: MirOpcode = 0x100F
+```
+
+a lane join of two parts (dst, lo, hi, the lanes of lo in imm): the lanes of
+lo and then those of hi, of one lane type, in one register. the IR join of
+more parts lowers to a chain of these (#3589)
+
 ## val MIR_SEL_ADD
 
 ```mach
@@ -1416,7 +1426,9 @@ pub rec MirDbgBinding;
 ```
 
 lane: which lane of a value wider than one register `vreg` holds, of `lanes`
-lanes each `lane_bytes` wide; `lanes` is 0 when `vreg` holds the whole value.
+lanes each `lane_bytes` wide but the last, which is `last_bytes` wide when
+that is not 0 (a split vector whose last piece holds the lanes left, #3589);
+`lanes` is 0 when `vreg` holds the whole value.
 at_end: the binding is published at the end of the instruction that carries
 it, where that instruction's def exists, instead of at its start
 
@@ -1785,6 +1797,17 @@ pub fun instr_attach_dbg_end(a: *A.Allocator, mi: *MirInstr, iid: u32, vreg: u32
 ```
 
 the binding is published where `mi`'s def exists: at its end
+
+## fun instr_attach_dbg_piece
+
+```mach
+pub fun instr_attach_dbg_piece(a: *A.Allocator, mi: *MirInstr, iid: u32, vreg: u32,
+lane: u8, lanes: u8, lane_bytes: u8, last_bytes: u8, at_end: bool) err[fail.Fail];
+```
+
+a binding of one piece of a value held in several registers: `vreg` is its
+`lane`-th piece of `lanes`, each `lane_bytes` wide but a last one of
+`last_bytes` when that is not 0 (#3589)
 
 ## fun instr_pass_dbg
 

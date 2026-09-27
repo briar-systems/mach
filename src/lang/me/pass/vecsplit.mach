@@ -1,0 +1,1399 @@
+use mach.lang.fail;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mach.lang.me.ir;
+use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.opdesc;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use mach.lang.me.scratch;
+use mach.lang.me.vecform;
+use mach.lang.source;
+use mach.lang.target;
+use mach.lang.wide;
+
+# type legalization of vectors wider than one register (#3589). a vector the
+# target splits (vecform.splits: its lanes past the lanes one register of the
+# target's declared vector width holds) becomes its register-width pieces, each
+# an ordinary vector value: piece k holds lanes k*c to k*c+c-1 of the value,
+# where c is vecform.piece_lanes of the lane, and the last piece holds whatever
+# lanes are left, down to one. every operation over such a value then runs on
+# the pieces:
+#
+# - a lane-wise operation (arithmetic, bitwise, compare, shift, conversion,
+#   widening multiply, lane-halving extension, lane range) runs once per chunk:
+#   the lanes between consecutive piece boundaries of its result and of every
+#   operand, so each chunk lies inside one piece of every value. a conversion
+#   that widens has more result pieces than operand pieces, and one that
+#   narrows fewer, so its chunks are the smaller pieces, each read from inside
+#   a larger one by a lane range (or its lane-halving form) and written into
+#   one by a lane join
+# - a load, store, phi, lane read, lane write and lane literal runs per piece
+# - anything else (a call, a return, inline asm) reads the whole value, the
+#   pieces joined, and a whole value it produces is split into pieces by lane
+#   ranges; scalarize gives those whole values their memory image
+#
+# the width is the target's, so a target that declares a wider register keeps
+# the same value whole and nothing here reads an isa. spir-v, whose vectors are
+# values rather than registers, splits nothing
+
+val NONE: u32 = 0xFFFFFFFF;
+
+# the most lanes a lane-wise operation, and so a chunk list, spans
+val MAX_LANES: u32 = 65535;
+
+rec Geo {
+    elem:     ir_type.IrTypeId;
+    lanes:    u32;
+    bits:     u32;
+    is_float: bool;
+    # the lanes of one piece, 0 when the value is whole
+    cap: u32;
+}
+
+rec Split {
+    alloc:   *A.Allocator;
+    m:       *ir.Module;
+    fn:      *ir.Function;
+    tgt:     *target.Target;
+    n:       u32;
+    pn:      u32;
+    ptr_ty:  ir_type.IrTypeId;
+    idx_ty:  ir_type.IrTypeId;
+    void_ty: ir_type.IrTypeId;
+    pool:    Vector[value.Value];
+    # the first piece of each split instruction and parameter, NONE otherwise
+    ipiece: *u32;
+    pparam: *u32;
+    # the whole value of a split instruction, where something reads it whole
+    iwhole:      *value.Value;
+    iwhole_set:  *bool;
+    needs_whole: *bool;
+    # the value that stands for an instruction whose result is not split but
+    # whose operation was
+    repl:     *value.Value;
+    repl_set: *bool;
+    # the block being rebuilt, the instruction being split and the frame slots
+    # a lane rearrangement the target does not pack goes through
+    blk:   *ir.Block;
+    orig:  id.InstructionId;
+    slots: Vector[id.InstructionId];
+    # the split phis something reads whole and their blocks, whose pieces
+    # replace them in the block's phi list
+    joined_phis: Vector[id.InstructionId];
+    joined_blks: Vector[u32];
+}
+
+rec Work {
+    module: *ir.Module;
+    body:   *ir.Function;
+    target: *target.Target;
+}
+
+pub fun run_in(m: *ir.Module, tgt: *target.Target, workspace: *scratch.Workspace) res[bool, fail.Fail] {
+    if (!tgt.model.vectors_in_registers || !tgt.model.has_v128) { ret res[bool, fail.Fail].ok{false}; }
+    var changed: bool = false;
+    var fi:      u32  = 0;
+    for (fi < m.function_len) {
+        val fn: *ir.Function = ?m.functions[fi];
+        if ((fn.flags & ir.FN_FLAG_EXTERN) == 0 && fn.instr_len > 0 && function_splits(m, tgt, fn)) {
+            var work: Work           = Work{module: m, body: fn, target: tgt};
+            val done: err[fail.Fail] = scratch.run_unit[Work](workspace, m.alloc, ?work, split_work);
+            if (sel done.err) { ret res[bool, fail.Fail].err{done.err}; }
+            changed = true;
+        }
+        fi = fi + 1;
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+fun function_splits(m: *ir.Module, tgt: *target.Target, fn: *ir.Function) bool {
+    var p: u32 = 0;
+    for (p < fn.param_count) {
+        if (vecform.splits(m, tgt, fn.params[p].ty)) { ret true; }
+        p = p + 1;
+    }
+    var bi: u32 = 0;
+    for (bi < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[bi];
+        var k:   u32       = 0;
+        for (k < blk.phi_count) {
+            if (instr_splits(m, tgt, ?fn.instrs[blk.phis[k]::u32])) { ret true; }
+            k = k + 1;
+        }
+        k = 0;
+        for (k < blk.instr_count) {
+            if (instr_splits(m, tgt, ?fn.instrs[blk.instructions[k]::u32])) { ret true; }
+            k = k + 1;
+        }
+        if (blk.terminator != id.INSTR_NIL && instr_splits(m, tgt, ?fn.instrs[blk.terminator::u32])) { ret true; }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+fun instr_splits(m: *ir.Module, tgt: *target.Target, inst: *instruction.Instruction) bool {
+    if (vecform.splits(m, tgt, inst.ty)) { ret true; }
+    var o: u32 = 0;
+    for (o < inst.operand_count) {
+        if (operand_is_value(inst, o) && vecform.splits(m, tgt, inst.operands[o].ty)) { ret true; }
+        o = o + 1;
+    }
+    ret false;
+}
+
+# a phi's block operands are constants that name blocks, not values
+fun operand_is_value(inst: *instruction.Instruction, o: u32) bool {
+    val role: opdesc.OperandRole = opdesc.operand_role(inst.kind, o);
+    ret role != opdesc.ROLE_PHI_EDGE && role != opdesc.ROLE_CFG_EDGE;
+}
+
+fun split_work(work: *Work, alloc: *A.Allocator) err[fail.Fail] {
+    var sp: Split;
+    sp.alloc       = alloc;
+    sp.m           = work.module;
+    sp.fn          = work.body;
+    sp.tgt         = work.target;
+    sp.n           = sp.fn.instr_len;
+    sp.pn          = sp.fn.param_count;
+    sp.pool        = vector.init[value.Value](alloc);
+    sp.slots       = vector.init[id.InstructionId](alloc);
+    sp.joined_phis = vector.init[id.InstructionId](alloc);
+    sp.joined_blks = vector.init[u32](alloc);
+    sp.orig        = id.INSTR_NIL;
+    val rp: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?sp.m.types);
+    if (sel rp.err) { ret err[fail.Fail].err{rp.err}; }
+    sp.ptr_ty = rp.ok;
+    val ri: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?sp.m.types, sp.tgt.isa.pointer_width * 8);
+    if (sel ri.err) { ret err[fail.Fail].err{ri.err}; }
+    sp.idx_ty = ri.ok;
+    val rv: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_void(?sp.m.types);
+    if (sel rv.err) { ret err[fail.Fail].err{rv.err}; }
+    sp.void_ty = rv.ok;
+
+    val tables: err[fail.Fail] = alloc_tables(?sp);
+    if (sel tables.err) { ret tables; }
+
+    mark_whole_readers(?sp);
+
+    val order: res[*u32, fail.Fail] = block_order(?sp);
+    if (sel order.err) { ret err[fail.Fail].err{order.err}; }
+
+    val phis: err[fail.Fail] = split_phis(?sp);
+    if (sel phis.err) { ret phis; }
+
+    var i: u32 = 0;
+    for (i < sp.fn.block_count) {
+        val rb: err[fail.Fail] = split_block(?sp, order.ok[i]);
+        if (sel rb.err) { ret rb; }
+        i = i + 1;
+    }
+
+    val filled: err[fail.Fail] = fill_phis(?sp);
+    if (sel filled.err) { ret filled; }
+
+    ret place_slots(?sp);
+}
+
+fun alloc_tables(sp: *Split) err[fail.Fail] {
+    val n: usize              = (sp.n + 1)::usize;
+    val a: res[*u32, A.Error] = A.allocate[u32](sp.alloc, n);
+    if (sel a.err) { ret err[fail.Fail].err{fail.refused(a.err)}; }
+    sp.ipiece = a.ok;
+    val b: res[*u32, A.Error] = A.allocate[u32](sp.alloc, (sp.pn + 1)::usize);
+    if (sel b.err) { ret err[fail.Fail].err{fail.refused(b.err)}; }
+    sp.pparam = b.ok;
+    val c: res[*value.Value, A.Error] = A.allocate[value.Value](sp.alloc, n);
+    if (sel c.err) { ret err[fail.Fail].err{fail.refused(c.err)}; }
+    sp.iwhole = c.ok;
+    val d: res[*bool, A.Error] = A.allocate[bool](sp.alloc, n);
+    if (sel d.err) { ret err[fail.Fail].err{fail.refused(d.err)}; }
+    sp.iwhole_set = d.ok;
+    val e: res[*bool, A.Error] = A.allocate[bool](sp.alloc, n);
+    if (sel e.err) { ret err[fail.Fail].err{fail.refused(e.err)}; }
+    sp.needs_whole = e.ok;
+    val f: res[*value.Value, A.Error] = A.allocate[value.Value](sp.alloc, n);
+    if (sel f.err) { ret err[fail.Fail].err{fail.refused(f.err)}; }
+    sp.repl = f.ok;
+    val g: res[*bool, A.Error] = A.allocate[bool](sp.alloc, n);
+    if (sel g.err) { ret err[fail.Fail].err{fail.refused(g.err)}; }
+    sp.repl_set = g.ok;
+    var i: u32 = 0;
+    for (i < sp.n) {
+        sp.ipiece[i]      = NONE;
+        sp.iwhole_set[i]  = false;
+        sp.needs_whole[i] = false;
+        sp.repl_set[i]    = false;
+        i                 = i + 1;
+    }
+    i = 0;
+    for (i < sp.pn) {
+        sp.pparam[i] = NONE;
+        i            = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun splits(sp: *Split, ty: ir_type.IrTypeId) bool {
+    ret vecform.splits(sp.m, sp.tgt, ty);
+}
+
+# the lane shape of a vector type and the lanes of its pieces; cap 0 for a
+# vector held whole
+fun geo_of(sp: *Split, ty: ir_type.IrTypeId, out: *Geo) bool {
+    val vt: opt[*ir_type.IrType] = ir_type.get(?sp.m.types, ty);
+    if (sel vt.none)                        { ret false; }
+    if (vt.some.kind != ir_type.IRT_VECTOR) { ret false; }
+    val et: opt[*ir_type.IrType] = ir_type.get(?sp.m.types, vt.some.data.vector_.element);
+    if (sel et.none) { ret false; }
+    out.elem     = vt.some.data.vector_.element;
+    out.lanes    = vt.some.data.vector_.lanes;
+    out.bits     = et.some.data.bits;
+    out.is_float = et.some.kind == ir_type.IRT_FLOAT;
+    out.cap      = 0;
+    if (splits(sp, ty)) { out.cap = vecform.piece_lanes(sp.tgt, out.bits); }
+    ret true;
+}
+
+fun piece_count(g: *Geo) u32 {
+    if (g.cap == 0) { ret 1; }
+    ret (g.lanes + g.cap - 1) / g.cap;
+}
+
+fun piece_start(g: *Geo, k: u32) u32 {
+    if (g.cap == 0) { ret 0; }
+    ret k * g.cap;
+}
+
+fun piece_len(g: *Geo, k: u32) u32 {
+    if (g.cap == 0) { ret g.lanes; }
+    val start: u32 = k * g.cap;
+    if (g.lanes - start < g.cap) { ret g.lanes - start; }
+    ret g.cap;
+}
+
+fun vec_ty(sp: *Split, elem: ir_type.IrTypeId, lanes: u32) res[ir_type.IrTypeId, fail.Fail] {
+    ret ir_type.intern_vector(?sp.m.types, elem, lanes);
+}
+
+# what an instruction splits into: the operations whose pieces this pass
+# forms. every other instruction reads a split operand whole
+fun handles(sp: *Split, inst: *instruction.Instruction) bool {
+    val k: instruction.InstrKind = inst.kind;
+    if (k == instruction.OP_PHI)   { ret splits(sp, inst.ty); }
+    if (k == instruction.OP_LOAD)  { ret splits(sp, inst.ty) && inst.operand_count == 1; }
+    if (k == instruction.OP_STORE) { ret inst.operand_count == 2 && splits(sp, inst.operands[0].ty); }
+    if (k == instruction.OP_VEC_EXTRACT || k == instruction.OP_VEC_INSERT) {
+        ret inst.operand_count >= 2 && inst.operands[1].kind == value.VAL_CONST_INT;
+    }
+    if (k == instruction.OP_VEC_BUILD) { ret splits(sp, inst.ty); }
+    if (k == instruction.OP_DBG_VALUE) { ret inst.operand_count == 1; }
+    if (k == instruction.OP_BITCAST)   { ret bitcast_splits(sp, inst); }
+    ret lane_wise(sp, inst);
+}
+
+fun lane_wise(sp: *Split, inst: *instruction.Instruction) bool {
+    if (!ir_type.is_vector(?sp.m.types, inst.ty)) { ret false; }
+    val c: opdesc.VecClass = opdesc.vec_class(inst.kind);
+    if (c == opdesc.VCLASS_BINARY || c == opdesc.VCLASS_UNARY || c == opdesc.VCLASS_COMPARE
+        || c == opdesc.VCLASS_CONVERT || c == opdesc.VCLASS_DISALLOWED || c == opdesc.VCLASS_WIDEN) {
+        ret true;
+    }
+    if (c == opdesc.VCLASS_WIDEN_HALF || c == opdesc.VCLASS_RANGE) {
+        ret inst.operand_count == 2 && inst.operands[1].kind == value.VAL_CONST_INT;
+    }
+    ret inst.kind == instruction.OP_DECLASSIFY && inst.operand_count == 1;
+}
+
+# a reinterpret between two split vectors of one size whose pieces cover the
+# same bytes is a reinterpret of each piece
+fun bitcast_splits(sp: *Split, inst: *instruction.Instruction) bool {
+    if (inst.operand_count != 1)                                  { ret false; }
+    if (!splits(sp, inst.ty) || !splits(sp, inst.operands[0].ty)) { ret false; }
+    var a: Geo;
+    var b: Geo;
+    if (!geo_of(sp, inst.ty, ?a) || !geo_of(sp, inst.operands[0].ty, ?b)) { ret false; }
+    if (a.lanes * a.bits != b.lanes * b.bits)                             { ret false; }
+    ret a.cap * a.bits == b.cap * b.bits;
+}
+
+# a split value some instruction this pass keeps reads whole is joined once,
+# where its pieces are made
+fun mark_whole_readers(sp: *Split) {
+    var bi: u32 = 0;
+    for (bi < sp.fn.block_count) {
+        val blk: *ir.Block = ?sp.fn.blocks[bi];
+        var k:   u32       = 0;
+        for (k < blk.phi_count) {
+            mark_operands(sp, blk.phis[k]);
+            k = k + 1;
+        }
+        k = 0;
+        for (k < blk.instr_count) {
+            mark_operands(sp, blk.instructions[k]);
+            k = k + 1;
+        }
+        if (blk.terminator != id.INSTR_NIL) { mark_operands(sp, blk.terminator); }
+        bi = bi + 1;
+    }
+}
+
+fun mark_operands(sp: *Split, iid: id.InstructionId) {
+    val inst: *instruction.Instruction = ?sp.fn.instrs[iid::u32];
+    if (handles(sp, inst)) { ret; }
+    var o: u32 = 0;
+    for (o < inst.operand_count) {
+        val v: value.Value = inst.operands[o];
+        if (operand_is_value(inst, o) && v.kind == value.VAL_INSTR && v.data.instr::u32 < sp.n && splits(sp, v.ty)) {
+            sp.needs_whole[v.data.instr::u32] = true;
+        }
+        o = o + 1;
+    }
+}
+
+# reverse postorder from the entry, so a value's pieces exist before any
+# instruction outside a phi reads them; blocks the entry does not reach follow
+# in index order
+fun block_order(sp: *Split) res[*u32, fail.Fail] {
+    val bc: u32                = sp.fn.block_count;
+    val ro: res[*u32, A.Error] = A.allocate[u32](sp.alloc, (bc + 1)::usize);
+    if (sel ro.err) { ret res[*u32, fail.Fail].err{fail.refused(ro.err)}; }
+    val out: *u32               = ro.ok;
+    val rs:  res[*u32, A.Error] = A.allocate[u32](sp.alloc, (bc + 1)::usize);
+    if (sel rs.err) { ret res[*u32, fail.Fail].err{fail.refused(rs.err)}; }
+    val stack: *u32               = rs.ok;
+    val rn:    res[*u32, A.Error] = A.allocate[u32](sp.alloc, (bc + 1)::usize);
+    if (sel rn.err) { ret res[*u32, fail.Fail].err{fail.refused(rn.err)}; }
+    val next: *u32                = rn.ok;
+    val rm:   res[*bool, A.Error] = A.allocate[bool](sp.alloc, (bc + 1)::usize);
+    if (sel rm.err) { ret res[*u32, fail.Fail].err{fail.refused(rm.err)}; }
+    val seen: *bool = rm.ok;
+    var i:    u32   = 0;
+    for (i < bc) {
+        seen[i] = false;
+        next[i] = 0;
+        i       = i + 1;
+    }
+    # postorder, written from the back so the array reads in reverse postorder
+    var fill: u32 = bc;
+    var top:  u32 = 0;
+    if (bc > 0) {
+        stack[0] = 0;
+        seen[0]  = true;
+        top      = 1;
+    }
+    for (top > 0) {
+        val b:      u32  = stack[top - 1];
+        var s0:     id.BlockId;
+        var s1:     id.BlockId;
+        val ns:     u32  = ir.block_successors(sp.fn, ?sp.fn.blocks[b], ?s0, ?s1);
+        var pushed: bool = false;
+        for (next[b] < ns && !pushed) {
+            var s: u32 = s0::u32;
+            if (next[b] == 1) { s = s1::u32; }
+            next[b] = next[b] + 1;
+            if (s < bc && !seen[s]) {
+                seen[s]    = true;
+                stack[top] = s;
+                top        = top + 1;
+                pushed     = true;
+            }
+        }
+        if (!pushed) {
+            top       = top - 1;
+            fill      = fill - 1;
+            out[fill] = b;
+        }
+    }
+    # the unreached blocks go first in the array tail; move the order down
+    val reached: u32 = bc - fill;
+    i = 0;
+    for (i < reached) {
+        out[i] = out[fill + i];
+        i      = i + 1;
+    }
+    var w: u32 = reached;
+    i = 0;
+    for (i < bc) {
+        if (!seen[i]) {
+            out[w] = i;
+            w      = w + 1;
+        }
+        i = i + 1;
+    }
+    ret res[*u32, fail.Fail].ok{out};
+}
+
+fun new_instr(sp: *Split, kind: instruction.InstrKind, ty: ir_type.IrTypeId, aux: ir_type.IrTypeId,
+    ops: *value.Value, opn: u32, loc: source.SrcLoc, secret: bool, flags: u16) res[id.InstructionId, fail.Fail] {
+    var owned: *value.Value = nil;
+    if (opn > 0) {
+        val ro: res[*value.Value, A.Error] = A.allocate[value.Value](sp.m.alloc, opn::usize);
+        if (sel ro.err) { ret res[id.InstructionId, fail.Fail].err{fail.refused(ro.err)}; }
+        owned = ro.ok;
+        var i: u32 = 0;
+        for (i < opn) {
+            owned[i] = ops[i];
+            i        = i + 1;
+        }
+    }
+    var ins: instruction.Instruction;
+    ins.kind          = kind;
+    ins.ty            = ty;
+    ins.operands      = owned;
+    ins.operand_count = opn;
+    ins.operand_cap   = opn;
+    ins.flags         = flags;
+    ins.aux_ty        = aux;
+    ins.loc           = loc;
+    ins.secret        = secret;
+    ins.arg_ext       = ir_type.EXT_LIST_NONE;
+    val added: res[id.InstructionId, fail.Fail] = ir.instruction_add(sp.m, sp.fn, ins);
+    if (sel added.err) {
+        if (owned != nil) { A.deallocate[value.Value](sp.m.alloc, owned, opn::usize); }
+        ret added;
+    }
+    if (sp.orig != id.INSTR_NIL) {
+        val site: u32 = ir.instr_inline_site_of(sp.fn, sp.orig);
+        if (site != 0) {
+            val set: err[fail.Fail] = ir.instr_inline_site_set(sp.fn, added.ok, site);
+            if (sel set.err) { ret res[id.InstructionId, fail.Fail].err{set.err}; }
+        }
+    }
+    ret added;
+}
+
+fun result_value(iid: id.InstructionId, ty: ir_type.IrTypeId, secret: bool) value.Value {
+    var v: value.Value = value.instr(iid, ty);
+    v.secret = secret;
+    ret v;
+}
+
+# one new instruction appended to the block being rebuilt
+fun emit(sp: *Split, kind: instruction.InstrKind, ty: ir_type.IrTypeId, aux: ir_type.IrTypeId,
+    ops: *value.Value, opn: u32, loc: source.SrcLoc, secret: bool, flags: u16) res[value.Value, fail.Fail] {
+    val ri: res[id.InstructionId, fail.Fail] = new_instr(sp, kind, ty, aux, ops, opn, loc, secret, flags);
+    if (sel ri.err) { ret res[value.Value, fail.Fail].err{ri.err}; }
+    val ra: err[fail.Fail] = ir.block_append_instr(sp.m, sp.blk, ri.ok);
+    if (sel ra.err) { ret res[value.Value, fail.Fail].err{ra.err}; }
+    ret res[value.Value, fail.Fail].ok{result_value(ri.ok, ty, secret)};
+}
+
+fun resolve(sp: *Split, v: value.Value) value.Value {
+    if (v.kind == value.VAL_INSTR && v.data.instr::u32 < sp.n && sp.repl_set[v.data.instr::u32]) {
+        var r: value.Value = sp.repl[v.data.instr::u32];
+        r.secret = r.secret || v.secret;
+        ret r;
+    }
+    ret v;
+}
+
+fun is_zero_const(v: value.Value) bool {
+    var c: value.Value = v;
+    ret c.kind == value.VAL_CONST_INT && wide.is_zero(value.int_of(?c));
+}
+
+# piece k of a split value
+fun piece_of(sp: *Split, v: value.Value, g: *Geo, k: u32) res[value.Value, fail.Fail] {
+    if (is_zero_const(v)) {
+        val pt: res[ir_type.IrTypeId, fail.Fail] = vec_ty(sp, g.elem, piece_len(g, k));
+        if (sel pt.err) { ret res[value.Value, fail.Fail].err{pt.err}; }
+        ret res[value.Value, fail.Fail].ok{value.const_int(0, pt.ok)};
+    }
+    var first: u32 = NONE;
+    if (v.kind == value.VAL_INSTR && v.data.instr::u32 < sp.n) { first = sp.ipiece[v.data.instr::u32]; }
+    if (v.kind == value.VAL_PARAM && v.data.param_ix < sp.pn)  { first = sp.pparam[v.data.param_ix]; }
+    if (first == NONE) {
+        ret res[value.Value, fail.Fail].err{fail.message("vecsplit: a split vector is read before its pieces are made (internal compiler error, see briar-systems/mach#3589)")};
+    }
+    var p: value.Value = sp.pool.data[(first + k)::usize];
+    p.secret = p.secret || v.secret;
+    ret res[value.Value, fail.Fail].ok{p};
+}
+
+# the whole of a split value, for an instruction that reads it whole
+fun whole_of(sp: *Split, v: value.Value) res[value.Value, fail.Fail] {
+    if (v.kind == value.VAL_INSTR && v.data.instr::u32 < sp.n) {
+        val i: u32 = v.data.instr::u32;
+        if (!sp.iwhole_set[i]) {
+            ret res[value.Value, fail.Fail].err{fail.message("vecsplit: a split vector is read whole before it is joined (internal compiler error, see briar-systems/mach#3589)")};
+        }
+        var w: value.Value = sp.iwhole[i];
+        w.secret = w.secret || v.secret;
+        ret res[value.Value, fail.Fail].ok{w};
+    }
+    ret res[value.Value, fail.Fail].ok{v};
+}
+
+fun record_pieces(sp: *Split, pieces: *value.Value, count: u32) res[u32, fail.Fail] {
+    val first: u32 = sp.pool.len::u32;
+    var k:     u32 = 0;
+    for (k < count) {
+        val pushed: res[usize, A.Error] = vector.push[value.Value](?sp.pool, pieces[k]);
+        if (sel pushed.err) { ret res[u32, fail.Fail].err{fail.refused(pushed.err)}; }
+        k = k + 1;
+    }
+    ret res[u32, fail.Fail].ok{first};
+}
+
+# a frame slot for a lane rearrangement the target does not pack, placed at
+# the head of the entry block once every block is rebuilt
+fun frame_slot(sp: *Split, elem: ir_type.IrTypeId, lanes: u32) res[value.Value, fail.Fail] {
+    val ra: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_array(?sp.m.types, elem, lanes);
+    if (sel ra.err) { ret res[value.Value, fail.Fail].err{ra.err}; }
+    var ops: [1]value.Value;
+    ops[0] = value.const_int(1, sp.idx_ty);
+    val ri: res[id.InstructionId, fail.Fail] = new_instr(sp, instruction.OP_ALLOCA, sp.ptr_ty, ra.ok, ?ops[0], 1,
+        source.loc(source.FILE_NIL, 0), false, 0);
+    if (sel ri.err) { ret res[value.Value, fail.Fail].err{ri.err}; }
+    val pushed: res[usize, A.Error] = vector.push[id.InstructionId](?sp.slots, ri.ok);
+    if (sel pushed.err) { ret res[value.Value, fail.Fail].err{fail.refused(pushed.err)}; }
+    ret res[value.Value, fail.Fail].ok{value.instr(ri.ok, sp.ptr_ty)};
+}
+
+# the address of lane `lane` of a vector of `lanes` `elem` lanes at `base`
+fun lane_addr(sp: *Split, base: value.Value, elem: ir_type.IrTypeId, lanes: u32, lane: u32, loc: source.SrcLoc) res[value.Value, fail.Fail] {
+    if (lane == 0) { ret res[value.Value, fail.Fail].ok{base}; }
+    val ra: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_array(?sp.m.types, elem, lanes);
+    if (sel ra.err) { ret res[value.Value, fail.Fail].err{ra.err}; }
+    var ops: [3]value.Value;
+    ops[0] = base;
+    ops[1] = value.const_int(0, sp.idx_ty);
+    ops[2] = value.const_int(lane::u64, sp.idx_ty);
+    ret emit(sp, instruction.OP_GEP, sp.ptr_ty, ra.ok, ?ops[0], 3, loc, false, 0);
+}
+
+fun emit_store(sp: *Split, v: value.Value, addr: value.Value, loc: source.SrcLoc, flags: u16) err[fail.Fail] {
+    var ops: [2]value.Value;
+    ops[0] = v;
+    ops[1] = addr;
+    val r: res[value.Value, fail.Fail] = emit(sp, instruction.OP_STORE, sp.void_ty, ir_type.IRT_NIL, ?ops[0], 2, loc, v.secret, flags);
+    if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun emit_load(sp: *Split, ty: ir_type.IrTypeId, addr: value.Value, loc: source.SrcLoc, secret: bool, flags: u16) res[value.Value, fail.Fail] {
+    var ops: [1]value.Value;
+    ops[0] = addr;
+    ret emit(sp, instruction.OP_LOAD, ty, ir_type.IRT_NIL, ?ops[0], 1, loc, secret, flags);
+}
+
+# `n` lanes of `src` (a vector of `lanes` `elem` lanes) from lane `off` on:
+# the lane range where the target packs it, else through a frame slot
+fun range_of(sp: *Split, src: value.Value, elem: ir_type.IrTypeId, lanes: u32, off: u32, n: u32, loc: source.SrcLoc) res[value.Value, fail.Fail] {
+    val rt: res[ir_type.IrTypeId, fail.Fail] = vec_ty(sp, elem, n);
+    if (sel rt.err) { ret res[value.Value, fail.Fail].err{rt.err}; }
+    val ty: ir_type.IrTypeId = rt.ok;
+    if (splits(sp, src.ty) || vecform.range_packs(sp.m, sp.tgt, ty, src.ty)) {
+        var ops: [2]value.Value;
+        ops[0] = src;
+        ops[1] = value.const_int(off::u64, sp.idx_ty);
+        ret emit(sp, instruction.OP_VEC_RANGE, ty, ir_type.IRT_NIL, ?ops[0], 2, loc, src.secret, 0);
+    }
+    val slot: res[value.Value, fail.Fail] = frame_slot(sp, elem, lanes);
+    if (sel slot.err) { ret slot; }
+    val st: err[fail.Fail] = emit_store(sp, src, slot.ok, loc, 0);
+    if (sel st.err) { ret res[value.Value, fail.Fail].err{st.err}; }
+    val at: res[value.Value, fail.Fail] = lane_addr(sp, slot.ok, elem, lanes, off, loc);
+    if (sel at.err) { ret at; }
+    ret emit_load(sp, ty, at.ok, loc, src.secret, 0);
+}
+
+# the lanes of `parts` in turn: the lane join where the result is split (whose
+# whole scalarize builds in memory) or the target packs it, else through a
+# frame slot
+fun concat_of(sp: *Split, parts: *value.Value, count: u32, elem: ir_type.IrTypeId, loc: source.SrcLoc) res[value.Value, fail.Fail] {
+    if (count == 1) { ret res[value.Value, fail.Fail].ok{parts[0]}; }
+    var total:  u32  = 0;
+    var secret: bool = false;
+    var i:      u32  = 0;
+    for (i < count) {
+        var g: Geo;
+        if (!geo_of(sp, parts[i].ty, ?g)) {
+            ret res[value.Value, fail.Fail].err{fail.message("vecsplit: a lane join part is not a vector (internal compiler error, see briar-systems/mach#3589)")};
+        }
+        total  = total + g.lanes;
+        secret = secret || parts[i].secret;
+        i      = i + 1;
+    }
+    val rt: res[ir_type.IrTypeId, fail.Fail] = vec_ty(sp, elem, total);
+    if (sel rt.err) { ret res[value.Value, fail.Fail].err{rt.err}; }
+    val ty: ir_type.IrTypeId = rt.ok;
+    if (splits(sp, ty) || vecform.concat_packs(sp.m, sp.tgt, ty)) {
+        ret emit(sp, instruction.OP_VEC_CONCAT, ty, ir_type.IRT_NIL, parts, count, loc, secret, 0);
+    }
+    val slot: res[value.Value, fail.Fail] = frame_slot(sp, elem, total);
+    if (sel slot.err) { ret slot; }
+    var at: u32 = 0;
+    i = 0;
+    for (i < count) {
+        var g: Geo;
+        if (!geo_of(sp, parts[i].ty, ?g)) {
+            ret res[value.Value, fail.Fail].err{fail.message("vecsplit: a lane join part is not a vector (internal compiler error, see briar-systems/mach#3589)")};
+        }
+        val addr: res[value.Value, fail.Fail] = lane_addr(sp, slot.ok, elem, total, at, loc);
+        if (sel addr.err) { ret addr; }
+        val st: err[fail.Fail] = emit_store(sp, parts[i], addr.ok, loc, 0);
+        if (sel st.err) { ret res[value.Value, fail.Fail].err{st.err}; }
+        at = at + g.lanes;
+        i  = i + 1;
+    }
+    ret emit_load(sp, ty, slot.ok, loc, secret, 0);
+}
+
+# where lanes `start` to `start + n - 1` of `v` lie when they lie inside one
+# piece: that piece, its lanes and the first lane inside it
+rec Place {
+    piece: value.Value;
+    lanes: u32;
+    off:   u32;
+}
+
+fun place_of(sp: *Split, v: value.Value, g: *Geo, start: u32, n: u32, out: *Place) res[bool, fail.Fail] {
+    if (g.cap == 0) {
+        out.piece = v;
+        out.lanes = g.lanes;
+        out.off   = start;
+        ret res[bool, fail.Fail].ok{true};
+    }
+    val k: u32 = start / g.cap;
+    val o: u32 = start - k * g.cap;
+    if (o + n > piece_len(g, k)) { ret res[bool, fail.Fail].ok{false}; }
+    val p: res[value.Value, fail.Fail] = piece_of(sp, v, g, k);
+    if (sel p.err) { ret res[bool, fail.Fail].err{p.err}; }
+    out.piece = p.ok;
+    out.lanes = piece_len(g, k);
+    out.off   = o;
+    ret res[bool, fail.Fail].ok{true};
+}
+
+fun take(sp: *Split, pl: *Place, g: *Geo, n: u32, loc: source.SrcLoc) res[value.Value, fail.Fail] {
+    if (pl.off == 0 && n == pl.lanes) { ret res[value.Value, fail.Fail].ok{pl.piece}; }
+    if (is_zero_const(pl.piece)) {
+        val rt: res[ir_type.IrTypeId, fail.Fail] = vec_ty(sp, g.elem, n);
+        if (sel rt.err) { ret res[value.Value, fail.Fail].err{rt.err}; }
+        ret res[value.Value, fail.Fail].ok{value.const_int(0, rt.ok)};
+    }
+    ret range_of(sp, pl.piece, g.elem, pl.lanes, pl.off, n, loc);
+}
+
+# lanes `start` to `start + n - 1` of `v` as one vector: a piece, a range of
+# one, or a join of the ranges of the pieces the lanes cross
+fun slice_of(sp: *Split, v: value.Value, g: *Geo, start: u32, n: u32, loc: source.SrcLoc) res[value.Value, fail.Fail] {
+    var pl:     Place;
+    val inside: res[bool, fail.Fail] = place_of(sp, v, g, start, n, ?pl);
+    if (sel inside.err) { ret res[value.Value, fail.Fail].err{inside.err}; }
+    if (inside.ok)      { ret take(sp, ?pl, g, n, loc); }
+    val count: u32                        = (start + n - 1) / g.cap - start / g.cap + 1;
+    val rb:    res[*value.Value, A.Error] = A.allocate[value.Value](sp.alloc, count::usize);
+    if (sel rb.err) { ret res[value.Value, fail.Fail].err{fail.refused(rb.err)}; }
+    val parts: *value.Value = rb.ok;
+    var at:    u32          = start;
+    var i:     u32          = 0;
+    for (i < count) {
+        val k:      u32 = at / g.cap;
+        var take_n: u32 = piece_start(g, k) + piece_len(g, k) - at;
+        if (at + take_n > start + n) { take_n = start + n - at; }
+        var part:  Place;
+        val found: res[bool, fail.Fail] = place_of(sp, v, g, at, take_n, ?part);
+        if (sel found.err) { ret res[value.Value, fail.Fail].err{found.err}; }
+        val got: res[value.Value, fail.Fail] = take(sp, ?part, g, take_n, loc);
+        if (sel got.err) { ret got; }
+        parts[i] = got.ok;
+        at       = at + take_n;
+        i        = i + 1;
+    }
+    ret concat_of(sp, parts, count, g.elem, loc);
+}
+
+# the pieces of a value an instruction made, joined at once when something
+# reads it whole
+fun define_split(sp: *Split, iid: id.InstructionId, pieces: *value.Value, count: u32, elem: ir_type.IrTypeId, loc: source.SrcLoc) err[fail.Fail] {
+    val first: res[u32, fail.Fail] = record_pieces(sp, pieces, count);
+    if (sel first.err) { ret err[fail.Fail].err{first.err}; }
+    sp.ipiece[iid::u32] = first.ok;
+    if (!sp.needs_whole[iid::u32]) { ret err[fail.Fail].ok{}; }
+    val joined: res[value.Value, fail.Fail] = concat_of(sp, pieces, count, elem, loc);
+    if (sel joined.err) { ret err[fail.Fail].err{joined.err}; }
+    sp.iwhole[iid::u32]     = joined.ok;
+    sp.iwhole_set[iid::u32] = true;
+    ret err[fail.Fail].ok{};
+}
+
+# a whole value (a parameter, or the result of an instruction kept whole)
+# split into pieces by lane ranges over it
+fun slice_whole(sp: *Split, v: value.Value, loc: source.SrcLoc) res[u32, fail.Fail] {
+    var g: Geo;
+    if (!geo_of(sp, v.ty, ?g)) {
+        ret res[u32, fail.Fail].err{fail.message("vecsplit: a split value is not a vector (internal compiler error, see briar-systems/mach#3589)")};
+    }
+    val count: u32                        = piece_count(?g);
+    val rb:    res[*value.Value, A.Error] = A.allocate[value.Value](sp.alloc, count::usize);
+    if (sel rb.err) { ret res[u32, fail.Fail].err{fail.refused(rb.err)}; }
+    val pieces: *value.Value = rb.ok;
+    var k:      u32          = 0;
+    for (k < count) {
+        val r: res[value.Value, fail.Fail] = range_of(sp, v, g.elem, g.lanes, piece_start(?g, k), piece_len(?g, k), loc);
+        if (sel r.err) { ret res[u32, fail.Fail].err{r.err}; }
+        pieces[k] = r.ok;
+        k         = k + 1;
+    }
+    ret record_pieces(sp, pieces, count);
+}
+
+fun split_phis(sp: *Split) err[fail.Fail] {
+    var bi: u32 = 0;
+    for (bi < sp.fn.block_count) {
+        val blk:   *ir.Block = ?sp.fn.blocks[bi];
+        val old_n: u32       = blk.phi_count;
+        if (old_n > 0) {
+            val ro: res[*id.InstructionId, A.Error] = A.allocate[id.InstructionId](sp.alloc, old_n::usize);
+            if (sel ro.err) { ret err[fail.Fail].err{fail.refused(ro.err)}; }
+            val old: *id.InstructionId = ro.ok;
+            var k:   u32               = 0;
+            for (k < old_n) {
+                old[k] = blk.phis[k];
+                k      = k + 1;
+            }
+            blk.phi_count = 0;
+            k             = 0;
+            for (k < old_n) {
+                val pid: id.InstructionId = old[k];
+                val ty:  ir_type.IrTypeId = sp.fn.instrs[pid::u32].ty;
+                if (!splits(sp, ty)) {
+                    val kept: err[fail.Fail] = ir.block_append_phi(sp.m, blk, pid);
+                    if (sel kept.err) { ret kept; }
+                    k = k + 1;
+                    cnt;
+                }
+                val loc:    source.SrcLoc = sp.fn.instrs[pid::u32].loc;
+                val secret: bool          = sp.fn.instrs[pid::u32].secret;
+                var g:      Geo;
+                if (!geo_of(sp, ty, ?g)) { ret err[fail.Fail].err{fail.message("vecsplit: a split phi is not a vector")}; }
+                val count: u32                        = piece_count(?g);
+                val rb:    res[*value.Value, A.Error] = A.allocate[value.Value](sp.alloc, count::usize);
+                if (sel rb.err) { ret err[fail.Fail].err{fail.refused(rb.err)}; }
+                val pieces: *value.Value = rb.ok;
+                sp.orig = pid;
+                var p: u32 = 0;
+                for (p < count) {
+                    val pt: res[ir_type.IrTypeId, fail.Fail] = vec_ty(sp, g.elem, piece_len(?g, p));
+                    if (sel pt.err) { ret err[fail.Fail].err{pt.err}; }
+                    val ri: res[id.InstructionId, fail.Fail] = new_instr(sp, instruction.OP_PHI, pt.ok, ir_type.IRT_NIL, nil, 0, loc, secret, 0);
+                    if (sel ri.err) { ret err[fail.Fail].err{ri.err}; }
+                    val added: err[fail.Fail] = ir.block_append_phi(sp.m, blk, ri.ok);
+                    if (sel added.err) { ret added; }
+                    pieces[p] = result_value(ri.ok, pt.ok, secret);
+                    p         = p + 1;
+                }
+                sp.orig = id.INSTR_NIL;
+                val first: res[u32, fail.Fail] = record_pieces(sp, pieces, count);
+                if (sel first.err) { ret err[fail.Fail].err{first.err}; }
+                sp.ipiece[pid::u32] = first.ok;
+                if (sp.needs_whole[pid::u32]) {
+                    val pp: res[usize, A.Error] = vector.push[id.InstructionId](?sp.joined_phis, pid);
+                    if (sel pp.err) { ret err[fail.Fail].err{fail.refused(pp.err)}; }
+                    val pb: res[usize, A.Error] = vector.push[u32](?sp.joined_blks, bi);
+                    if (sel pb.err) { ret err[fail.Fail].err{fail.refused(pb.err)}; }
+                }
+                k = k + 1;
+            }
+        }
+        bi = bi + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the incoming pieces of every split phi, and the replacements every phi reads
+fun fill_phis(sp: *Split) err[fail.Fail] {
+    var pid: u32 = 0;
+    for (pid < sp.n) {
+        val kind: instruction.InstrKind = sp.fn.instrs[pid].kind;
+        if (kind != instruction.OP_PHI) {
+            pid = pid + 1;
+            cnt;
+        }
+        if (sp.ipiece[pid] == NONE) {
+            val inst: *instruction.Instruction = ?sp.fn.instrs[pid];
+            var o:    u32                      = 1;
+            for (o < inst.operand_count) {
+                inst.operands[o] = resolve(sp, inst.operands[o]);
+                o                = o + 2;
+            }
+            pid = pid + 1;
+            cnt;
+        }
+        var g: Geo;
+        if (!geo_of(sp, sp.fn.instrs[pid].ty, ?g)) { ret err[fail.Fail].err{fail.message("vecsplit: a split phi is not a vector")}; }
+        val count: u32 = piece_count(?g);
+        val nops:  u32 = sp.fn.instrs[pid].operand_count;
+        var o:     u32 = 0;
+        for (o + 1 < nops) {
+            val edge:     value.Value = sp.fn.instrs[pid].operands[o];
+            val incoming: value.Value = sp.fn.instrs[pid].operands[o + 1];
+            var p:        u32         = 0;
+            for (p < count) {
+                val pv: res[value.Value, fail.Fail] = piece_of(sp, incoming, ?g, p);
+                if (sel pv.err) { ret err[fail.Fail].err{pv.err}; }
+                val piece: value.Value    = sp.pool.data[(sp.ipiece[pid] + p)::usize];
+                val app:   err[fail.Fail] = ir.phi_append_incoming(sp.m, ?sp.fn.instrs[piece.data.instr::u32], ir.block_target(edge), pv.ok);
+                if (sel app.err) { ret app; }
+                p = p + 1;
+            }
+            o = o + 2;
+        }
+        pid = pid + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun place_slots(sp: *Split) err[fail.Fail] {
+    if (sp.slots.len == 0 || sp.fn.block_count == 0) { ret err[fail.Fail].ok{}; }
+    val entry: *ir.Block = ?sp.fn.blocks[0];
+    var i:     usize     = sp.slots.len;
+    for (i > 0) {
+        i = i - 1;
+        val r: err[fail.Fail] = ir.block_prepend_instr(sp.m, entry, sp.slots.data[i]);
+        if (sel r.err) { ret r; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun split_block(sp: *Split, bi: u32) err[fail.Fail] {
+    val blk:     *ir.Block         = ?sp.fn.blocks[bi];
+    val old_len: u32               = blk.instr_count;
+    var old:     *id.InstructionId = nil;
+    if (old_len > 0) {
+        val ro: res[*id.InstructionId, A.Error] = A.allocate[id.InstructionId](sp.alloc, old_len::usize);
+        if (sel ro.err) { ret err[fail.Fail].err{fail.refused(ro.err)}; }
+        old = ro.ok;
+        var i: u32 = 0;
+        for (i < old_len) {
+            old[i] = blk.instructions[i];
+            i      = i + 1;
+        }
+    }
+    blk.instr_count = 0;
+    sp.blk          = blk;
+
+    if (bi == 0) {
+        val params: err[fail.Fail] = split_params(sp);
+        if (sel params.err) { ret params; }
+    }
+
+    # a split phi read whole is joined at the head of its block
+    var k: usize = 0;
+    for (k < sp.joined_phis.len) {
+        if (sp.joined_blks.data[k] == bi) {
+            val joined: err[fail.Fail] = join_existing(sp, sp.joined_phis.data[k]);
+            if (sel joined.err) { ret joined; }
+        }
+        k = k + 1;
+    }
+
+    var oi: u32 = 0;
+    for (oi < old_len) {
+        val r: err[fail.Fail] = split_one(sp, old[oi]);
+        if (sel r.err) { ret r; }
+        oi = oi + 1;
+    }
+
+    if (blk.terminator != id.INSTR_NIL) {
+        val rt: err[fail.Fail] = keep_whole(sp, blk.terminator, false);
+        if (sel rt.err) { ret rt; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun join_existing(sp: *Split, iid: id.InstructionId) err[fail.Fail] {
+    var g: Geo;
+    if (!geo_of(sp, sp.fn.instrs[iid::u32].ty, ?g)) { ret err[fail.Fail].err{fail.message("vecsplit: a split value is not a vector")}; }
+    val count: u32           = piece_count(?g);
+    val first: u32           = sp.ipiece[iid::u32];
+    val loc:   source.SrcLoc = sp.fn.instrs[iid::u32].loc;
+    sp.orig = iid;
+    val joined: res[value.Value, fail.Fail] = concat_of(sp, ?sp.pool.data[first::usize], count, g.elem, loc);
+    sp.orig = id.INSTR_NIL;
+    if (sel joined.err) { ret err[fail.Fail].err{joined.err}; }
+    sp.iwhole[iid::u32]     = joined.ok;
+    sp.iwhole_set[iid::u32] = true;
+    ret err[fail.Fail].ok{};
+}
+
+fun split_params(sp: *Split) err[fail.Fail] {
+    var p: u32 = 0;
+    for (p < sp.pn) {
+        val pv: value.Value = sp.fn.params[p];
+        if (splits(sp, pv.ty)) {
+            val first: res[u32, fail.Fail] = slice_whole(sp, pv, sp.fn.decl_loc);
+            if (sel first.err) { ret err[fail.Fail].err{first.err}; }
+            sp.pparam[p] = first.ok;
+        }
+        p = p + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun split_one(sp: *Split, iid: id.InstructionId) err[fail.Fail] {
+    val inst: *instruction.Instruction = ?sp.fn.instrs[iid::u32];
+    if (iid::u32 >= sp.n || !instr_splits(sp.m, sp.tgt, inst)) {
+        ret keep_whole(sp, iid, true);
+    }
+    if (!handles(sp, inst)) { ret keep_whole(sp, iid, true); }
+    sp.orig = iid;
+    fin { sp.orig = id.INSTR_NIL; }
+    val k: instruction.InstrKind = inst.kind;
+    if (k == instruction.OP_LOAD)        { ret split_load(sp, iid); }
+    if (k == instruction.OP_STORE)       { ret split_store(sp, iid); }
+    if (k == instruction.OP_VEC_EXTRACT) { ret split_extract(sp, iid); }
+    if (k == instruction.OP_VEC_INSERT)  { ret split_insert(sp, iid); }
+    if (k == instruction.OP_VEC_BUILD)   { ret split_build(sp, iid); }
+    if (k == instruction.OP_DBG_VALUE)   { ret split_dbg(sp, iid); }
+    if (k == instruction.OP_BITCAST)     { ret split_bitcast(sp, iid); }
+    ret split_lane_wise(sp, iid);
+}
+
+# an instruction kept as it is: its replaced operands resolved, a split
+# operand read whole, and a split result sliced into pieces after it
+fun keep_whole(sp: *Split, iid: id.InstructionId, append: bool) err[fail.Fail] {
+    val nops: u32 = sp.fn.instrs[iid::u32].operand_count;
+    var o:    u32 = 0;
+    for (o < nops) {
+        val inst: *instruction.Instruction = ?sp.fn.instrs[iid::u32];
+        if (operand_is_value(inst, o)) {
+            val v: value.Value = resolve(sp, inst.operands[o]);
+            if (splits(sp, v.ty)) {
+                val w: res[value.Value, fail.Fail] = whole_of(sp, v);
+                if (sel w.err) { ret err[fail.Fail].err{w.err}; }
+                sp.fn.instrs[iid::u32].operands[o] = w.ok;
+            }
+            or { sp.fn.instrs[iid::u32].operands[o] = v; }
+        }
+        o = o + 1;
+    }
+    if (!append) { ret err[fail.Fail].ok{}; }
+    val ra: err[fail.Fail] = ir.block_append_instr(sp.m, sp.blk, iid);
+    if (sel ra.err) { ret ra; }
+    val ty: ir_type.IrTypeId = sp.fn.instrs[iid::u32].ty;
+    if (iid::u32 < sp.n && splits(sp, ty)) {
+        val secret: bool          = sp.fn.instrs[iid::u32].secret;
+        val loc:    source.SrcLoc = sp.fn.instrs[iid::u32].loc;
+        sp.orig = iid;
+        val first: res[u32, fail.Fail] = slice_whole(sp, result_value(iid, ty, secret), loc);
+        sp.orig = id.INSTR_NIL;
+        if (sel first.err) { ret err[fail.Fail].err{first.err}; }
+        sp.ipiece[iid::u32]     = first.ok;
+        sp.iwhole[iid::u32]     = result_value(iid, ty, secret);
+        sp.iwhole_set[iid::u32] = true;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun split_load(sp: *Split, iid: id.InstructionId) err[fail.Fail] {
+    val ty:     ir_type.IrTypeId = sp.fn.instrs[iid::u32].ty;
+    val loc:    source.SrcLoc    = sp.fn.instrs[iid::u32].loc;
+    val secret: bool             = sp.fn.instrs[iid::u32].secret;
+    val flags:  u16              = sp.fn.instrs[iid::u32].flags & instruction.INSTR_FLAG_VOLATILE;
+    val addr:   value.Value      = resolve(sp, sp.fn.instrs[iid::u32].operands[0]);
+    var g:      Geo;
+    if (!geo_of(sp, ty, ?g)) { ret err[fail.Fail].err{fail.message("vecsplit: a split load is not a vector")}; }
+    val count: u32                        = piece_count(?g);
+    val rb:    res[*value.Value, A.Error] = A.allocate[value.Value](sp.alloc, count::usize);
+    if (sel rb.err) { ret err[fail.Fail].err{fail.refused(rb.err)}; }
+    val pieces: *value.Value = rb.ok;
+    var k:      u32          = 0;
+    for (k < count) {
+        val pt: res[ir_type.IrTypeId, fail.Fail] = vec_ty(sp, g.elem, piece_len(?g, k));
+        if (sel pt.err) { ret err[fail.Fail].err{pt.err}; }
+        val at: res[value.Value, fail.Fail] = lane_addr(sp, addr, g.elem, g.lanes, piece_start(?g, k), loc);
+        if (sel at.err) { ret err[fail.Fail].err{at.err}; }
+        val ld: res[value.Value, fail.Fail] = emit_load(sp, pt.ok, at.ok, loc, secret, flags);
+        if (sel ld.err) { ret err[fail.Fail].err{ld.err}; }
+        pieces[k] = ld.ok;
+        k         = k + 1;
+    }
+    ret define_split(sp, iid, pieces, count, g.elem, loc);
+}
+
+fun split_store(sp: *Split, iid: id.InstructionId) err[fail.Fail] {
+    val loc:   source.SrcLoc = sp.fn.instrs[iid::u32].loc;
+    val flags: u16           = sp.fn.instrs[iid::u32].flags & instruction.INSTR_FLAG_VOLATILE;
+    val v:     value.Value   = resolve(sp, sp.fn.instrs[iid::u32].operands[0]);
+    val addr:  value.Value   = resolve(sp, sp.fn.instrs[iid::u32].operands[1]);
+    var g:     Geo;
+    if (!geo_of(sp, v.ty, ?g)) { ret err[fail.Fail].err{fail.message("vecsplit: a split store is not a vector")}; }
+    var k: u32 = 0;
+    for (k < piece_count(?g)) {
+        val pv: res[value.Value, fail.Fail] = piece_of(sp, v, ?g, k);
+        if (sel pv.err) { ret err[fail.Fail].err{pv.err}; }
+        val at: res[value.Value, fail.Fail] = lane_addr(sp, addr, g.elem, g.lanes, piece_start(?g, k), loc);
+        if (sel at.err) { ret err[fail.Fail].err{at.err}; }
+        val st: err[fail.Fail] = emit_store(sp, pv.ok, at.ok, loc, flags);
+        if (sel st.err) { ret st; }
+        k = k + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun split_extract(sp: *Split, iid: id.InstructionId) err[fail.Fail] {
+    val ty:     ir_type.IrTypeId = sp.fn.instrs[iid::u32].ty;
+    val loc:    source.SrcLoc    = sp.fn.instrs[iid::u32].loc;
+    val secret: bool             = sp.fn.instrs[iid::u32].secret;
+    val v:      value.Value      = resolve(sp, sp.fn.instrs[iid::u32].operands[0]);
+    val index:  value.Value      = sp.fn.instrs[iid::u32].operands[1];
+    var g:      Geo;
+    if (!geo_of(sp, v.ty, ?g)) { ret err[fail.Fail].err{fail.message("vecsplit: a split lane read is not of a vector")}; }
+    val lane:  u32                  = index.data.int_lit::u32;
+    var pl:    Place;
+    val found: res[bool, fail.Fail] = place_of(sp, v, ?g, lane, 1, ?pl);
+    if (sel found.err) { ret err[fail.Fail].err{found.err}; }
+    var ops: [2]value.Value;
+    ops[0] = pl.piece;
+    ops[1] = value.const_int(pl.off::u64, index.ty);
+    val r: res[value.Value, fail.Fail] = emit(sp, instruction.OP_VEC_EXTRACT, ty, pl.piece.ty, ?ops[0], 2, loc, secret, 0);
+    if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+    sp.repl[iid::u32]     = r.ok;
+    sp.repl_set[iid::u32] = true;
+    ret err[fail.Fail].ok{};
+}
+
+fun split_insert(sp: *Split, iid: id.InstructionId) err[fail.Fail] {
+    val ty:     ir_type.IrTypeId = sp.fn.instrs[iid::u32].ty;
+    val loc:    source.SrcLoc    = sp.fn.instrs[iid::u32].loc;
+    val secret: bool             = sp.fn.instrs[iid::u32].secret;
+    val v:      value.Value      = resolve(sp, sp.fn.instrs[iid::u32].operands[0]);
+    val index:  value.Value      = sp.fn.instrs[iid::u32].operands[1];
+    val x:      value.Value      = resolve(sp, sp.fn.instrs[iid::u32].operands[2]);
+    var g:      Geo;
+    if (!geo_of(sp, ty, ?g)) { ret err[fail.Fail].err{fail.message("vecsplit: a split lane write is not of a vector")}; }
+    val lane:  u32                        = index.data.int_lit::u32;
+    val count: u32                        = piece_count(?g);
+    val rb:    res[*value.Value, A.Error] = A.allocate[value.Value](sp.alloc, count::usize);
+    if (sel rb.err) { ret err[fail.Fail].err{fail.refused(rb.err)}; }
+    val pieces: *value.Value = rb.ok;
+    var k:      u32          = 0;
+    for (k < count) {
+        val pv: res[value.Value, fail.Fail] = piece_of(sp, v, ?g, k);
+        if (sel pv.err) { ret err[fail.Fail].err{pv.err}; }
+        pieces[k] = pv.ok;
+        val start: u32 = piece_start(?g, k);
+        if (lane >= start && lane < start + piece_len(?g, k)) {
+            var ops: [3]value.Value;
+            ops[0] = pv.ok;
+            ops[1] = value.const_int((lane - start)::u64, index.ty);
+            ops[2] = x;
+            val r: res[value.Value, fail.Fail] = emit(sp, instruction.OP_VEC_INSERT, pv.ok.ty, pv.ok.ty, ?ops[0], 3, loc, secret, 0);
+            if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+            pieces[k] = r.ok;
+        }
+        k = k + 1;
+    }
+    ret define_split(sp, iid, pieces, count, g.elem, loc);
+}
+
+fun split_build(sp: *Split, iid: id.InstructionId) err[fail.Fail] {
+    val ty:     ir_type.IrTypeId = sp.fn.instrs[iid::u32].ty;
+    val loc:    source.SrcLoc    = sp.fn.instrs[iid::u32].loc;
+    val secret: bool             = sp.fn.instrs[iid::u32].secret;
+    var g:      Geo;
+    if (!geo_of(sp, ty, ?g)) { ret err[fail.Fail].err{fail.message("vecsplit: a split lane literal is not a vector")}; }
+    if (sp.fn.instrs[iid::u32].operand_count != g.lanes) {
+        ret err[fail.Fail].err{fail.message("vecsplit: a lane literal does not name every lane")};
+    }
+    val count: u32                        = piece_count(?g);
+    val rb:    res[*value.Value, A.Error] = A.allocate[value.Value](sp.alloc, count::usize);
+    if (sel rb.err) { ret err[fail.Fail].err{fail.refused(rb.err)}; }
+    val pieces: *value.Value               = rb.ok;
+    val rl:     res[*value.Value, A.Error] = A.allocate[value.Value](sp.alloc, g.cap::usize);
+    if (sel rl.err) { ret err[fail.Fail].err{fail.refused(rl.err)}; }
+    val lanes: *value.Value = rl.ok;
+    var k:     u32          = 0;
+    for (k < count) {
+        val n:     u32 = piece_len(?g, k);
+        val start: u32 = piece_start(?g, k);
+        var i:     u32 = 0;
+        for (i < n) {
+            lanes[i] = resolve(sp, sp.fn.instrs[iid::u32].operands[start + i]);
+            i        = i + 1;
+        }
+        val pt: res[ir_type.IrTypeId, fail.Fail] = vec_ty(sp, g.elem, n);
+        if (sel pt.err) { ret err[fail.Fail].err{pt.err}; }
+        val r: res[value.Value, fail.Fail] = emit(sp, instruction.OP_VEC_BUILD, pt.ok, pt.ok, lanes, n, loc, secret, 0);
+        if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+        pieces[k] = r.ok;
+        k         = k + 1;
+    }
+    ret define_split(sp, iid, pieces, count, g.elem, loc);
+}
+
+# a variable bound to a split value is bound to its pieces, each the next
+# register-width part of it; one too wide for a debug location binds none
+fun split_dbg(sp: *Split, iid: id.InstructionId) err[fail.Fail] {
+    val v: value.Value = resolve(sp, sp.fn.instrs[iid::u32].operands[0]);
+    # a binding with no location (a null) or of a constant has no pieces and
+    # stays as it is
+    if (!splits(sp, v.ty) || (v.kind != value.VAL_INSTR && v.kind != value.VAL_PARAM)) {
+        sp.fn.instrs[iid::u32].operands[0] = v;
+        ret ir.block_append_instr(sp.m, sp.blk, iid);
+    }
+    var g: Geo;
+    if (!geo_of(sp, v.ty, ?g)) { ret err[fail.Fail].err{fail.message("vecsplit: a split binding is not a vector")}; }
+    val count: u32 = piece_count(?g);
+    if (count > DBG_PIECES_MAX) {
+        sp.fn.instrs[iid::u32].operands[0] = value.const_null(v.ty);
+        ret ir.block_append_instr(sp.m, sp.blk, iid);
+    }
+    val arr: res[ir.OperandArray, fail.Fail] = ir.operands_alloc(sp.m, count);
+    if (sel arr.err) { ret err[fail.Fail].err{arr.err}; }
+    var k: u32 = 0;
+    for (k < count) {
+        val pv: res[value.Value, fail.Fail] = piece_of(sp, v, ?g, k);
+        if (sel pv.err) { ret err[fail.Fail].err{pv.err}; }
+        arr.ok.ops[k] = pv.ok;
+        k             = k + 1;
+    }
+    ir.instr_replace_operands(sp.m, ?sp.fn.instrs[iid::u32], arr.ok);
+    ret ir.block_append_instr(sp.m, sp.blk, iid);
+}
+
+# the most pieces a variable's debug location describes, as many as a location
+# names lanes (mir.DBG_LANES_MAX)
+val DBG_PIECES_MAX: u32 = 8;
+
+fun split_bitcast(sp: *Split, iid: id.InstructionId) err[fail.Fail] {
+    val ty:     ir_type.IrTypeId = sp.fn.instrs[iid::u32].ty;
+    val loc:    source.SrcLoc    = sp.fn.instrs[iid::u32].loc;
+    val secret: bool             = sp.fn.instrs[iid::u32].secret;
+    val v:      value.Value      = resolve(sp, sp.fn.instrs[iid::u32].operands[0]);
+    var g:      Geo;
+    var from:   Geo;
+    if (!geo_of(sp, ty, ?g) || !geo_of(sp, v.ty, ?from)) { ret err[fail.Fail].err{fail.message("vecsplit: a split reinterpret is not of vectors")}; }
+    val count: u32                        = piece_count(?g);
+    val rb:    res[*value.Value, A.Error] = A.allocate[value.Value](sp.alloc, count::usize);
+    if (sel rb.err) { ret err[fail.Fail].err{fail.refused(rb.err)}; }
+    val pieces: *value.Value = rb.ok;
+    var k:      u32          = 0;
+    for (k < count) {
+        val pv: res[value.Value, fail.Fail] = piece_of(sp, v, ?from, k);
+        if (sel pv.err) { ret err[fail.Fail].err{pv.err}; }
+        val pt: res[ir_type.IrTypeId, fail.Fail] = vec_ty(sp, g.elem, piece_len(?g, k));
+        if (sel pt.err) { ret err[fail.Fail].err{pt.err}; }
+        var ops: [1]value.Value;
+        ops[0] = pv.ok;
+        val r: res[value.Value, fail.Fail] = emit(sp, instruction.OP_BITCAST, pt.ok, ir_type.IRT_NIL, ?ops[0], 1, loc, secret, 0);
+        if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+        pieces[k] = r.ok;
+        k         = k + 1;
+    }
+    ret define_split(sp, iid, pieces, count, g.elem, loc);
+}
+
+# a lane operand of a lane-wise operation: its value, its shape and the lane
+# of it the operation's lane 0 reads
+rec LaneOperand {
+    v:   value.Value;
+    g:   Geo;
+    off: u32;
+}
+
+fun split_lane_wise(sp: *Split, iid: id.InstructionId) err[fail.Fail] {
+    val kind:   instruction.InstrKind = sp.fn.instrs[iid::u32].kind;
+    val ty:     ir_type.IrTypeId      = sp.fn.instrs[iid::u32].ty;
+    val loc:    source.SrcLoc         = sp.fn.instrs[iid::u32].loc;
+    val secret: bool                  = sp.fn.instrs[iid::u32].secret;
+    val flags:  u16                   = sp.fn.instrs[iid::u32].flags;
+    val nops:   u32                   = sp.fn.instrs[iid::u32].operand_count;
+    val vclass: opdesc.VecClass       = opdesc.vec_class(kind);
+    var rg:     Geo;
+    if (!geo_of(sp, ty, ?rg)) { ret err[fail.Fail].err{fail.message("vecsplit: a lane-wise result is not a vector")}; }
+    if (rg.lanes > MAX_LANES) { ret err[fail.Fail].err{fail.message("vecsplit: a vector has more lanes than a lane count holds")}; }
+
+    # the lane operands, the operand a scalar count passes to every chunk as it
+    # is, and the constant first lane a half, a range or a half product reads
+    var lops:       [3]LaneOperand;
+    var nlane:      u32  = 0;
+    var scalar:     value.Value;
+    var has_scalar: bool = false;
+    var base:       u32  = 0;
+    var lane_n:     u32  = nops;
+    if (vclass == opdesc.VCLASS_WIDEN_HALF || vclass == opdesc.VCLASS_RANGE) {
+        base   = sp.fn.instrs[iid::u32].operands[1].data.int_lit::u32;
+        lane_n = 1;
+    }
+    if (vclass == opdesc.VCLASS_WIDEN && nops == 3) {
+        base   = sp.fn.instrs[iid::u32].operands[2].data.int_lit::u32;
+        lane_n = 2;
+    }
+    var o: u32 = 0;
+    for (o < lane_n) {
+        val v: value.Value = resolve(sp, sp.fn.instrs[iid::u32].operands[o]);
+        if (ir_type.is_vector(?sp.m.types, v.ty)) {
+            lops[nlane].v   = v;
+            lops[nlane].off = base;
+            if (!geo_of(sp, v.ty, ?lops[nlane].g)) { ret err[fail.Fail].err{fail.message("vecsplit: a lane operand is not a vector")}; }
+            nlane = nlane + 1;
+        }
+        or {
+            scalar     = v;
+            has_scalar = true;
+        }
+        o = o + 1;
+    }
+
+    # the chunk boundaries: every piece boundary of the result and of each lane
+    # operand, in the result's lanes
+    val rc: res[*bool, A.Error] = A.allocate[bool](sp.alloc, (rg.lanes + 1)::usize);
+    if (sel rc.err) { ret err[fail.Fail].err{fail.refused(rc.err)}; }
+    val cut: *bool = rc.ok;
+    var i:   u32   = 0;
+    for (i <= rg.lanes) {
+        cut[i] = false;
+        i      = i + 1;
+    }
+    cut[0]        = true;
+    cut[rg.lanes] = true;
+    i             = 0;
+    for (i < piece_count(?rg)) {
+        cut[piece_start(?rg, i)] = true;
+        i                        = i + 1;
+    }
+    var j: u32 = 0;
+    for (j < nlane) {
+        val lg: *Geo = ?lops[j].g;
+        i = 0;
+        for (i < piece_count(lg)) {
+            val b: u32 = piece_start(lg, i);
+            if (b > lops[j].off && b - lops[j].off < rg.lanes) { cut[b - lops[j].off] = true; }
+            i = i + 1;
+        }
+        j = j + 1;
+    }
+
+    # each chunk's result, in lane order
+    val rchunks: res[*value.Value, A.Error] = A.allocate[value.Value](sp.alloc, (rg.lanes + 1)::usize);
+    if (sel rchunks.err) { ret err[fail.Fail].err{fail.refused(rchunks.err)}; }
+    val chunks: *value.Value       = rchunks.ok;
+    val rstart: res[*u32, A.Error] = A.allocate[u32](sp.alloc, (rg.lanes + 1)::usize);
+    if (sel rstart.err) { ret err[fail.Fail].err{fail.refused(rstart.err)}; }
+    val starts: *u32 = rstart.ok;
+    var nchunk: u32  = 0;
+    var c:      u32  = 0;
+    for (c < rg.lanes) {
+        var e: u32 = c + 1;
+        for (!cut[e]) { e = e + 1; }
+        val r: res[value.Value, fail.Fail] = chunk_op(sp, kind, vclass, ?rg, ?lops[0], nlane, scalar, has_scalar, c, e - c, loc, secret, flags);
+        if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+        chunks[nchunk] = r.ok;
+        starts[nchunk] = c;
+        nchunk         = nchunk + 1;
+        c              = e;
+    }
+
+    # each result piece is its chunks joined
+    val count: u32                        = piece_count(?rg);
+    val rb:    res[*value.Value, A.Error] = A.allocate[value.Value](sp.alloc, count::usize);
+    if (sel rb.err) { ret err[fail.Fail].err{fail.refused(rb.err)}; }
+    val pieces: *value.Value = rb.ok;
+    var at:     u32          = 0;
+    var k:      u32          = 0;
+    for (k < count) {
+        val end:   u32 = piece_start(?rg, k) + piece_len(?rg, k);
+        val first: u32 = at;
+        for (at < nchunk && starts[at] < end) { at = at + 1; }
+        val r: res[value.Value, fail.Fail] = concat_of(sp, ?chunks[first], at - first, rg.elem, loc);
+        if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+        pieces[k] = r.ok;
+        k         = k + 1;
+    }
+    if (rg.cap == 0) {
+        sp.repl[iid::u32]     = pieces[0];
+        sp.repl_set[iid::u32] = true;
+        ret err[fail.Fail].ok{};
+    }
+    ret define_split(sp, iid, pieces, count, rg.elem, loc);
+}
+
+# lanes `start` to `start + n - 1` of a lane-wise operation's result, from the
+# same lanes of its operands. a lane-halving extension or a widening multiply
+# whose chunk is one half of a full operand piece is that instruction's own
+# half form; any other chunk reads its operands' lanes by range
+fun chunk_op(sp: *Split, kind: instruction.InstrKind, vclass: opdesc.VecClass, rg: *Geo,
+    lops: *LaneOperand, nlane: u32, scalar: value.Value, has_scalar: bool,
+    start: u32, n: u32, loc: source.SrcLoc, secret: bool, flags: u16) res[value.Value, fail.Fail] {
+    val rt: res[ir_type.IrTypeId, fail.Fail] = vec_ty(sp, rg.elem, n);
+    if (sel rt.err) { ret res[value.Value, fail.Fail].err{rt.err}; }
+    val ty: ir_type.IrTypeId = rt.ok;
+
+    var places: [3]Place;
+    var j:      u32 = 0;
+    for (j < nlane) {
+        val found: res[bool, fail.Fail] = place_of(sp, lops[j].v, ?lops[j].g, lops[j].off + start, n, ?places[j]);
+        if (sel found.err) { ret res[value.Value, fail.Fail].err{found.err}; }
+        if (!found.ok) {
+            ret res[value.Value, fail.Fail].err{fail.message("vecsplit: a chunk crosses an operand piece (internal compiler error, see briar-systems/mach#3589)")};
+        }
+        j = j + 1;
+    }
+
+    # the half forms read a full piece of twice the chunk's lanes
+    if (nlane >= 1 && is_half(sp, ?places[0], ?lops[0].g, n)) {
+        if (vclass == opdesc.VCLASS_WIDEN_HALF || kind == instruction.OP_SEXT || kind == instruction.OP_ZEXT) {
+            var wk: instruction.InstrKind = instruction.OP_VEC_WIDEN_U;
+            if (kind == instruction.OP_SEXT || kind == instruction.OP_VEC_WIDEN_S) { wk = instruction.OP_VEC_WIDEN_S; }
+            if (rg.bits == lops[0].g.bits * 2 && !rg.is_float && !lops[0].g.is_float
+                && vecform.widen_half_packs(sp.m, sp.tgt, wk, ty, places[0].piece.ty)) {
+                var ops: [2]value.Value;
+                ops[0] = places[0].piece;
+                ops[1] = value.const_int(places[0].off::u64, sp.idx_ty);
+                ret emit(sp, wk, ty, ir_type.IRT_NIL, ?ops[0], 2, loc, secret, 0);
+            }
+        }
+        if (vclass == opdesc.VCLASS_WIDEN && nlane == 2 && is_half(sp, ?places[1], ?lops[1].g, n)
+            && places[0].off == places[1].off && places[0].piece.ty == places[1].piece.ty
+            && vecform.widening_half_packs(sp.m, sp.tgt, kind, ty, places[0].piece.ty)) {
+            var ops: [3]value.Value;
+            ops[0] = places[0].piece;
+            ops[1] = places[1].piece;
+            ops[2] = value.const_int(places[0].off::u64, sp.idx_ty);
+            ret emit(sp, kind, ty, ir_type.IRT_NIL, ?ops[0], 3, loc, secret, flags);
+        }
+    }
+
+    var ops:  [3]value.Value;
+    var nops: u32 = 0;
+    j = 0;
+    for (j < nlane) {
+        val got: res[value.Value, fail.Fail] = take(sp, ?places[j], ?lops[j].g, n, loc);
+        if (sel got.err) { ret got; }
+        ops[nops] = got.ok;
+        nops      = nops + 1;
+        j         = j + 1;
+    }
+    if (vclass == opdesc.VCLASS_RANGE) { ret res[value.Value, fail.Fail].ok{ops[0]}; }
+    if (has_scalar) {
+        ops[nops] = scalar;
+        nops      = nops + 1;
+    }
+    var k: instruction.InstrKind = kind;
+    if (kind == instruction.OP_VEC_WIDEN_S) { k = instruction.OP_SEXT; }
+    if (kind == instruction.OP_VEC_WIDEN_U) { k = instruction.OP_ZEXT; }
+    ret emit(sp, k, ty, ir_type.IRT_NIL, ?ops[0], nops, loc, secret, flags);
+}
+
+# the chunk is the low or the high half of a piece that fills a register
+fun is_half(sp: *Split, pl: *Place, g: *Geo, n: u32) bool {
+    if (pl.lanes != n * 2)          { ret false; }
+    if (pl.off != 0 && pl.off != n) { ret false; }
+    ret pl.lanes == vecform.piece_lanes(sp.tgt, g.bits);
+}

@@ -314,7 +314,9 @@ pub val OP_MUL_WIDE_S: InstrKind = 50
 
 the full product of two integer vectors of one lane type, in lanes twice as
 wide: the fused form of a lane-wise extension of both operands followed by a
-multiply, formed only where the target packs it
+multiply, formed only where the target packs it. an optional third operand,
+the constant 0 or n, takes the product of the low or high half of two
+2n-lane operands instead, as the lane-halving extension does (#3589)
 
 ## val OP_MUL_WIDE_U
 
@@ -376,6 +378,17 @@ all ones at the result's width when operand 0 is below operand 1, unsigned,
 else zero: the branch-free range test a shift by an unproven count is
 saturated with (#3887). both operands share one integer type, the result is
 an integer of any width
+
+## val OP_VEC_CONCAT
+
+```mach
+pub val OP_VEC_CONCAT: InstrKind = 58
+```
+
+the lanes of each operand in turn, in one vector of their summed count: every
+operand a vector of the result's lane type (#3589). type legalization joins a
+vector wider than the register back from its register-width pieces with it,
+and gathers the parts of a narrowing conversion over those pieces
 
 ## val INSTR_FLAG_NSW
 
