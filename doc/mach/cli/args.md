@@ -1414,7 +1414,7 @@ ret: the message when `tok` names a removed option
 pub fun reject_unknown_from_invocation(inv: *ParsedInvocation, argv: **u8, cmd: str) bool;
 ```
 
-print `error: unknown flag` for the first unrecognized flag-shaped token, or the
+print `error[cli.flag_unknown]: unknown flag` for the first unrecognized flag-shaped token, or the
 removal message when the token names a removed option
 
 inv: the parsed invocation
