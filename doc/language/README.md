@@ -53,6 +53,10 @@ from the index below.
 - [asm.md](asm.md) — inline assembly
 - [policy.md](policy.md) — compiler vs stdlib boundary
 
+## Diagnostics
+
+- [diagnostics.md](diagnostics.md) — diagnostic keys, the code registry and its never-reused rule
+
 ## Formal grammar
 
 - [grammar.md](grammar.md) — full EBNF grammar of the implemented dialect,
