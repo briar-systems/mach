@@ -3,7 +3,7 @@
 ## fun link
 
 ```mach
-pub fun link(s: *session.Session, tgt: *target.Target, inputs: *of.ObjectInput,
+pub fun link(s: *session.Session, diags: *diagnostic.DiagnosticStore, tgt: *target.Target, inputs: *of.ObjectInput,
 input_count: u32, dynlibs: *of.DynLib, dynlib_count: u32,
 destination: str, name: *u8, mode: LinkMode, pie: bool,
 image_options: of.ImageOptions) err[fail.Fail];
@@ -18,7 +18,7 @@ pub rec LinkedImage;
 ## fun link_images
 
 ```mach
-pub fun link_images(s: *session.Session, tgt: *target.Target, images: *of.ObjectImage,
+pub fun link_images(s: *session.Session, diags: *diagnostic.DiagnosticStore, tgt: *target.Target, images: *of.ObjectImage,
 image_count: u32, dynlibs: *of.DynLib, dynlib_count: u32,
 destination: str, name: *u8, mode: LinkMode, pie: bool,
 image_options: of.ImageOptions) err[fail.Fail];
@@ -27,7 +27,7 @@ image_options: of.ImageOptions) err[fail.Fail];
 ## fun link_mixed
 
 ```mach
-pub fun link_mixed(s: *session.Session, tgt: *target.Target,
+pub fun link_mixed(s: *session.Session, diags: *diagnostic.DiagnosticStore, tgt: *target.Target,
 images: *of.ObjectImage, image_count: u32,
 inputs: *of.ObjectInput, input_count: u32,
 dynlibs: *of.DynLib, dynlib_count: u32,

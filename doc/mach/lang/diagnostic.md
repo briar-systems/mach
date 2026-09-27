@@ -94,6 +94,12 @@ pub val ORIGIN_CODEGEN: Origin = 6
 pub val ORIGIN_LINK:    Origin = 7
 ```
 
+## val ORIGIN_TEST
+
+```mach
+pub val ORIGIN_TEST:    Origin = 8
+```
+
 ## fun origin_name
 
 ```mach
