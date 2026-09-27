@@ -159,6 +159,13 @@ fbreg_cross() {
                     while [[ $rest =~ (-?0x[0-9a-f]+)(.*) ]]; do
                         seen[$(( ${BASH_REMATCH[1]} ))]=1; rest=${BASH_REMATCH[2]}
                     done
+                    # a slot at the frame base itself carries no displacement: the
+                    # disassembler prints `addi rd, sp, 0` as `mv rd, sp`, `add xd, sp, #0`
+                    # as `mov xd, sp`, and `lea 0(%rsp)` as `(%rsp)`
+                    if { [[ $op =~ ^(mv|mov)$ ]] && [[ $operands =~ ,\ *$base$ ]]; } \
+                        || [[ $operands =~ (^|[^0-9a-fx])\($base[,\)] ]]; then
+                        seen[0]=1
+                    fi
                     if [ "$isa" = aarch64 ] && [[ $op =~ $ldst ]] && [[ $operands =~ \[$base,\ *(x[0-9]+)\] ]]; then
                         if r=$(gp "${BASH_REMATCH[1]}"); then
                             v=${known[${r% *}]:-}
