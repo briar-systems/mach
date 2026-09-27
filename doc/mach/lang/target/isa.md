@@ -575,6 +575,12 @@ pub val XBANK_4: u32 = 4
 pub val XBANK_4_8: u32 = 4 + 8
 ```
 
+## val XBANK_2_4_8
+
+```mach
+pub val XBANK_2_4_8: u32 = 2 + 4 + 8
+```
+
 ## val SLOT_READ_NONE
 
 ```mach
@@ -1254,8 +1260,11 @@ pub fun with_page_size(vt: *IsaVTable, page_size: u64);
 ## fun with_environments
 
 ```mach
-pub fun with_environments(vt: *IsaVTable, envs: *Environment, count: u32);
+pub fun with_environments(vt: *IsaVTable, envs: *Environment, count: u32, open: u64);
 ```
+
+`open` is what a target naming no environment is granted: with no ceiling
+over it, every extension an environment could guarantee
 
 ## fun environment_lookup
 
@@ -1269,11 +1278,24 @@ pub fun environment_lookup(vt: *IsaVTable, name: str) u32;
 pub fun environment_profile(vt: *IsaVTable, env_id: u32) u32;
 ```
 
+## fun environment_extensions
+
+```mach
+pub fun environment_extensions(vt: *IsaVTable, env_id: u32) u64;
+```
+
+the extensions the target's environment guarantees, which its selection holds
+beside the ones it names
+
 ## rec Environment
 
 ```mach
 pub rec Environment;
 ```
+
+an execution environment an isa defines: its name, its profile, and the
+extensions of the isa's vocabulary it guarantees (spirv's `float16` from
+vulkan1.2)
 
 ## val ENV_NONE
 
@@ -1354,6 +1376,27 @@ pub fun declares_local_got(tgt_isa: *IsaVTable) bool;
 ```mach
 pub fun local_got_kind(tgt_isa: *IsaVTable, kind: of.RelocKind) bool;
 ```
+
+## fun with_branch_thunks
+
+```mach
+pub fun with_branch_thunks(s: *RelocSeam, reach: of.BranchReachFn, thunk: of.BranchThunkFn);
+```
+
+## fun declares_branch_thunks
+
+```mach
+pub fun declares_branch_thunks(tgt_isa: *IsaVTable) bool;
+```
+
+## fun branch_reach
+
+```mach
+pub fun branch_reach(tgt_isa: *IsaVTable, kind: of.RelocKind) opt[of.BranchReach];
+```
+
+the reach of a direct branch a thunk can extend, none for any other kind or
+an instruction set that places no thunks
 
 ## fun with_machine_flags
 

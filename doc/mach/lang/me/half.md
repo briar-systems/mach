@@ -41,7 +41,8 @@ the value, or the first failure on the way to it
 pub fun widen(h: *Half, x: value.Value) value.Value;
 ```
 
-the carried bits `x` widened exactly to binary64
+the carried bits `x` widened exactly to binary64, a NaN as the target's
+rule converts it
 
 ## fun narrow
 
@@ -75,7 +76,9 @@ pub fun compare_operand(h: *Half, x: value.Value) value.Value;
 ```
 
 the operand a comparison of carried bits reads: the f16 itself where the
-target compares at 16 bits, else the exact binary64 widening
+target compares at 16 bits, the exact binary32 widening where it converts
+there (a comparison makes no NaN, so quieting one changes nothing), else the
+exact binary64 widening
 
 ## fun from_float
 
