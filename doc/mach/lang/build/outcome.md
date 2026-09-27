@@ -104,6 +104,14 @@ pub fun format_text(e: format.FormatError) str;
 pub fun toml_text(e: toml.TomlError) str;
 ```
 
+## fun toml_failure
+
+```mach
+pub fun toml_failure(e: toml.TomlError) Fail;
+```
+
+a document that does not parse is the user's, one the allocator refused is internal
+
 ## fun env_text
 
 ```mach

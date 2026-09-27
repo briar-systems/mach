@@ -136,7 +136,6 @@ pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64;
 
 argv: the full process arguments
 inv: the parsed invocation for this command
-ret: 0 every input is canonical (or was made so), 1 an input differs under
-      --check, an input is malformed, or the invocation is a user error, 2 internal
-      failure, 3 filesystem failure
+ret: exit.OK when every input is canonical (or was made so), exit.USER when an input differs
+      under --check or is malformed, otherwise the code `exit.of` maps the printed failure to
 
