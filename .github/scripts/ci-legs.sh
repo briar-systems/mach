@@ -49,6 +49,8 @@ select_path() {
     case "$1" in
         doc/*|*.md|LICENSE|.github/assets/*|.agents/*) ;;
         dist/*) ;;
+        # changes runs the script tests and docs the doc checks on every run
+        .github/scripts/*) ;;
 
         src/lang/be/codegen/dwarf.mach|src/lang/be/codegen/debug_input.mach|\
         src/lang/be/linker/debug.mach|src/lang/target/of/macho/dwarf.mach)
