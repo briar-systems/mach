@@ -66,6 +66,6 @@ outside the catalog describe as unknown
 
 ```mach
 pub fun asm_ct_scan(body: str, secrets: *ct.AsmSecret, n_secret: u32,
-mul: ct.CtMulMask, trust_shift: bool, alloc: *A.Allocator) err[fail.Fail];
+mul: ct.CtMulMask, trust_shift: bool, alloc: *A.Allocator) err[ct.AsmRefusal];
 ```
 

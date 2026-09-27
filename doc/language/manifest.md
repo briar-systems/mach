@@ -350,7 +350,7 @@ A mnemonic that needs an extension the target does not select, outside such a
 function, is refused. The refusal names the line to add:
 
 ```
-error: encode: inline-asm instruction 'sha256rnds2' needs the `sha` extension, which
+error[asm.extension]: inline-asm instruction 'sha256rnds2' needs the `sha` extension, which
 this target does not select; add `extensions = ["sha"]` to the target, or mark the
 function `#[extensions(sha)]` and call it only after detecting the extension at run time
 ```
@@ -413,7 +413,7 @@ A function whose own stack frame exceeds the reserve is refused at build time, n
 the function, its frame size and the reserve:
 
 ```
-error: frame: `main` needs a 1107824-byte stack frame, which its target's
+error[stack.reserve_exceeded]: `main` needs a 1107824-byte stack frame, which its target's
 1048576-byte stack reserve cannot hold; raise `stack_reserve` on the target, or move
 the large locals off the stack
 ```
@@ -777,7 +777,7 @@ Every diagnostic kind has one row in one table in the compiler
 raised, and `allow`, `#[expect]` and the printed key read the same rows, so a
 key here is exactly the kind the warning carries. The list is closed: a key no
 row declares is refused, naming the warning keys there are. A key is never
-reused for a different kind.
+reused for a different kind: see [the registry](diagnostics.md#the-registry).
 
 | Key | Warns when | Decided by source |
 |---|---|---|

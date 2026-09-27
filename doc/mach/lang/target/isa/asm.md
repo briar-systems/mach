@@ -249,7 +249,7 @@ cursor over text with no block (a scan, a test) has neither
 ## fun reject
 
 ```mach
-pub fun reject(c: *Cursor, text: str) fail.Fail;
+pub fun reject(c: *Cursor, k: dkind.Kind, text: str) fail.Fail;
 ```
 
 the inline-asm parser rejects the user's text: an error located at the asm
@@ -587,6 +587,6 @@ predicate (the same `extension.admits`) keeps from ever firing
 
 ```mach
 pub fun ct_scan(g: *Grammar, body: str, secrets: *ct.AsmSecret, n_secret: u32,
-mul: ct.CtMulMask, trust_shift: bool) err[fail.Fail];
+mul: ct.CtMulMask, trust_shift: bool) err[ct.AsmRefusal];
 ```
 

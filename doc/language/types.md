@@ -34,7 +34,7 @@ that declares no 128-bit integer (riscv32, spirv) refuses the type where it
 is used, at the declaration or expression that names it:
 
 ```text
-error: a 128-bit integer is not realized on riscv32: the target declares no integer of that width
+error[target.int_width]: a 128-bit integer is not realized on riscv32: the target declares no integer of that width
 ```
 
 Three operations have a shape worth knowing:

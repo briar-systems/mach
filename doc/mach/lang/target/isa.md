@@ -972,7 +972,7 @@ whether an asm body may write the stack pointer; true for a body it cannot parse
 ## def AsmCtScanFn
 
 ```mach
-pub def AsmCtScanFn: fun(str, *ct.AsmSecret, u32, ct.CtMulMask, bool, *A.Allocator) err[fail.Fail]
+pub def AsmCtScanFn: fun(str, *ct.AsmSecret, u32, ct.CtMulMask, bool, *A.Allocator) err[ct.AsmRefusal]
 ```
 
 the constant-time scan of an asm body: the tracked bindings (`ct.AsmSecret`, by the name
