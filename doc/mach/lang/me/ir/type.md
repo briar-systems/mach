@@ -170,6 +170,29 @@ pub val EXT_LIST_NONE: ExtListId = 0
 pub rec ExtList;
 ```
 
+## def IntForm
+
+```mach
+pub def IntForm: u8
+```
+
+what an integer type's bits encode. every operation on an IRT_INT is integer
+arithmetic whatever its form; a form other than INT_FORM_PLAIN names the
+value those bits carry, which a calling convention places as that value
+rather than as an integer (#3800)
+
+## val INT_FORM_PLAIN
+
+```mach
+pub val INT_FORM_PLAIN:    IntForm = 0
+```
+
+## val INT_FORM_BINARY16
+
+```mach
+pub val INT_FORM_BINARY16: IntForm = 1
+```
+
 ## rec IrType
 
 ```mach
@@ -247,6 +270,14 @@ pub fun is_aggregate(t: *IrTypeTable, id: IrTypeId) bool;
 ```mach
 pub fun is_float_scalar(t: *IrTypeTable, id: IrTypeId) bool;
 ```
+
+## fun int_form
+
+```mach
+pub fun int_form(t: *IrTypeTable, id: IrTypeId) IntForm;
+```
+
+the form of an integer type's bits, INT_FORM_PLAIN for any other type
 
 ## fun bit_width
 
@@ -356,6 +387,12 @@ pub fun intern_void(t: *IrTypeTable) res[IrTypeId, fail.Fail];
 
 ```mach
 pub fun intern_int(t: *IrTypeTable, bits: u32) res[IrTypeId, fail.Fail];
+```
+
+## fun intern_int_form
+
+```mach
+pub fun intern_int_form(t: *IrTypeTable, bits: u32, form: IntForm) res[IrTypeId, fail.Fail];
 ```
 
 ## fun intern_float
