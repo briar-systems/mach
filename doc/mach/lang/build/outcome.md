@@ -5,9 +5,9 @@
 ```mach
 pub tag Fail: u8 {
     reported;
-    user:        str;
+    user:        Keyed;
     internal:    str;
-    environment: str;
+    environment: Keyed;
 }
 ```
 
@@ -17,7 +17,18 @@ was broken, or the machine rather than the input (a tool that could not be
 spawned, a resource that was not there). the exit code derives from the
 case: 1 for user, 2 for internal, 3 where a command distinguishes the
 environment; a compiler failure never renders as a test failure. `reported`
-is declared first so a zero outcome is a failure that invents no text
+is declared first so a zero outcome is a failure that invents no text. a
+user or environment failure names the diagnostic kind it is reported as; an
+internal one is always `compiler.internal`
+
+## rec Keyed
+
+```mach
+pub rec Keyed;
+```
+
+kind: the row of the diagnostic kind table the failure is reported as
+text: the message
 
 ## fun reported
 
@@ -28,8 +39,11 @@ pub fun reported() Fail;
 ## fun user
 
 ```mach
-pub fun user(message: str) Fail;
+pub fun user(k: dkind.Kind, message: str) Fail;
 ```
+
+a failure names a live row of the registry: one that names none, or a
+retired one, is a compiler defect and becomes an internal failure
 
 ## fun internal
 
@@ -40,8 +54,17 @@ pub fun internal(message: str) Fail;
 ## fun environment
 
 ```mach
-pub fun environment(message: str) Fail;
+pub fun environment(k: dkind.Kind, message: str) Fail;
 ```
+
+## fun kind_of
+
+```mach
+pub fun kind_of(f: Fail) dkind.Kind;
+```
+
+the kind the failure is reported as, NONE for a reported one, whose
+diagnostics carry their own
 
 ## fun refused
 
@@ -197,7 +220,7 @@ pub fun from_fail(f: fail.Fail) Fail;
 ## fun user_fail
 
 ```mach
-pub fun user_fail(f: fail.Fail) Fail;
+pub fun user_fail(k: dkind.Kind, f: fail.Fail) Fail;
 ```
 
 a phase failure the user caused (target selection, source loading, import
