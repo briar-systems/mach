@@ -2784,6 +2784,9 @@ fun encode_selected(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32, mi:
     if (mi.opcode == mir.MIR_VEC_RANGE) {
         ret encode_vector_range(st, f, mi);
     }
+    if (mi.opcode == mir.MIR_VEC_CONCAT) {
+        ret encode_vector_concat(f, mi, ?st.buf);
+    }
     if (mir.vec_lane_is_vector(mi.vec_lane) && is_selected_vector_alu(mi.opcode)) {
         ret encode_vector_op(st, f, mi);
     }
@@ -3949,6 +3952,7 @@ fun packed_prefix(op: u16) u8 {
 fun packed_shift_digit(op: u16) u8 {
     if (op == x64.PSRAW || op == x64.PSRAD)                    { ret 4; }
     if (op == x64.PSRLDQ)                                      { ret 3; }
+    if (op == x64.PSLLDQ)                                      { ret 7; }
     if (op == x64.PSRLW || op == x64.PSRLD || op == x64.PSRLQ) { ret 2; }
     ret 6;
 }
@@ -4008,6 +4012,8 @@ fun packed_opbyte(op: u16) opt[u8] {
     if (op == x64.PUNPCKHWD)                                    { ret opt[u8].some{0x69}; }
     if (op == x64.PUNPCKHDQ)                                    { ret opt[u8].some{0x6A}; }
     if (op == x64.PSRLDQ || op == x64.PSRLQ || op == x64.PSLLQ) { ret opt[u8].some{0x73}; }
+    if (op == x64.PSLLDQ)                                       { ret opt[u8].some{0x73}; }
+    if (op == x64.PUNPCKLQDQ)                                   { ret opt[u8].some{0x6C}; }
     if (op == x64.PACKSSWB)                                     { ret opt[u8].some{0x63}; }
     if (op == x64.PACKSSDW)                                     { ret opt[u8].some{0x6B}; }
     if (op == x64.CVTDQ2PS)                                     { ret opt[u8].some{0x5B}; }
@@ -4419,7 +4425,7 @@ fun emit_xconv_to(p: *convplan.Plan, dst: isa.Operand, operand: isa.Operand, buf
 # the widening multiplies the x86_64 packed table declares, from the operand
 # lane width: pmullw beside pmulhw or pmulhuw interleaved into doubled lanes,
 # and pmuludq over 32-bit lanes spread onto the dwords it reads
-fun emit_vec_widen_mul_body(signed: bool, from: u8, lhs: isa.Operand, rhs: isa.Operand, buf: *enc.ByteBuf) err[fail.Fail] {
+fun emit_vec_widen_mul_body(signed: bool, high_half: bool, from: u8, lhs: isa.Operand, rhs: isa.Operand, buf: *enc.ByteBuf) err[fail.Fail] {
     val s0: i32 = float_scratch0();
     val s1: i32 = float_scratch1();
     if (from == 2) {
@@ -4433,16 +4439,20 @@ fun emit_vec_widen_mul_body(signed: bool, from: u8, lhs: isa.Operand, rhs: isa.O
         if (sel lo.err) { ret lo; }
         val hi: err[fail.Fail] = emit_packed_op(high, s1, rhs, buf);
         if (sel hi.err) { ret hi; }
+        if (high_half)  { ret emit_packed_op(x64.PUNPCKHWD, s0, vec_reg(s1), buf); }
         ret emit_packed_op(x64.PUNPCKLWD, s0, vec_reg(s1), buf);
     }
     if (from == 4 && !signed) {
+        # pmuludq reads doublewords 0 and 2: spread the half's two lanes onto them
+        var spread: u8 = 0x50;
+        if (high_half) { spread = 0xFA; }
         val l0: err[fail.Fail] = emit_vec_load(lhs, s0, buf);
         if (sel l0.err) { ret l0; }
-        val p0: err[fail.Fail] = emit_packed_rri(x64.PSHUFD, s0, s0, 0x50, buf);
+        val p0: err[fail.Fail] = emit_packed_rri(x64.PSHUFD, s0, s0, spread, buf);
         if (sel p0.err) { ret p0; }
         val l1: err[fail.Fail] = emit_vec_load(rhs, s1, buf);
         if (sel l1.err) { ret l1; }
-        val p1: err[fail.Fail] = emit_packed_rri(x64.PSHUFD, s1, s1, 0x50, buf);
+        val p1: err[fail.Fail] = emit_packed_rri(x64.PSHUFD, s1, s1, spread, buf);
         if (sel p1.err) { ret p1; }
         ret emit_packed_op(x64.PMULUDQ, s0, vec_reg(s1), buf);
     }
@@ -4461,7 +4471,15 @@ fun encode_vector_widen_mul(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.By
         || mir.vec_lane_elem_bytes(mi.vec_lane) != mir.vec_lane_from_bytes(mi.vec_lane) * 2) {
         ret err[fail.Fail].err{fail.message("encode: widening multiply lanes are not integer lanes doubling in width")};
     }
-    val body: err[fail.Fail] = emit_vec_widen_mul_body(mi.opcode == mir.MIR_MUL_WIDE_S,
+    # a fourth operand selects the high half of two operands of twice the lanes
+    var high_half: bool = false;
+    if (mi.operand_count >= 4) {
+        if (mi.operands[3].kind != mir.MIR_OP_IMM) {
+            ret err[fail.Fail].err{fail.message("encode: widening multiply half is not an immediate")};
+        }
+        high_half = mi.operands[3].imm != 0;
+    }
+    val body: err[fail.Fail] = emit_vec_widen_mul_body(mi.opcode == mir.MIR_MUL_WIDE_S, high_half,
         mir.vec_lane_from_bytes(mi.vec_lane), rl.ok, rr.ok, buf);
     if (sel body.err) { ret body; }
     ret emit_vec_store(rd.ok, float_scratch0(), buf);
@@ -4592,6 +4610,46 @@ fun encode_vector_range(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirI
     val body:     err[fail.Fail] = emit_vec_range_body(first::u32 * eb, ssse3, rs.ok, ?st.buf);
     if (sel body.err) { ret body; }
     ret emit_vec_store(rd.ok, float_scratch0(), ?st.buf);
+}
+
+# the lanes of lo then hi in scratch0, lo holding `k` bytes: one punpcklqdq
+# when lo fills a quadword; otherwise lo cleared above its bytes by a shift up
+# and back down, and hi shifted up by k bytes to meet it with por. the lanes
+# past both parts are left unspecified, as in any narrow vector (#3589)
+fun emit_vec_concat_body(k: u32, lo: isa.Operand, hi: isa.Operand, buf: *enc.ByteBuf) err[fail.Fail] {
+    val s0: i32            = float_scratch0();
+    val s1: i32            = float_scratch1();
+    val l0: err[fail.Fail] = emit_vec_load(lo, s0, buf);
+    if (sel l0.err) { ret l0; }
+    if (k == 8)     { ret emit_packed_op(x64.PUNPCKLQDQ, s0, hi, buf); }
+    val up: err[fail.Fail] = emit_packed_shift_imm(x64.PSLLDQ, s0, (16 - k)::u8, buf);
+    if (sel up.err) { ret up; }
+    val down: err[fail.Fail] = emit_packed_shift_imm(x64.PSRLDQ, s0, (16 - k)::u8, buf);
+    if (sel down.err) { ret down; }
+    val l1: err[fail.Fail] = emit_vec_load(hi, s1, buf);
+    if (sel l1.err) { ret l1; }
+    val sh: err[fail.Fail] = emit_packed_shift_imm(x64.PSLLDQ, s1, k::u8, buf);
+    if (sel sh.err) { ret sh; }
+    ret emit_packed_op(x64.POR, s0, vec_reg(s1), buf);
+}
+
+fun encode_vector_concat(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.ByteBuf) err[fail.Fail] {
+    if (mi.operand_count < 4 || mi.operands[3].kind != mir.MIR_OP_IMM) {
+        ret err[fail.Fail].err{fail.message("encode: lane join missing operands")};
+    }
+    val rd: res[isa.Operand, fail.Fail] = mir_to_operand(f, ?mi.operands[0], 16);
+    if (sel rd.err) { ret err[fail.Fail].err{rd.err}; }
+    val rl: res[isa.Operand, fail.Fail] = mir_to_operand(f, ?mi.operands[1], 16);
+    if (sel rl.err) { ret err[fail.Fail].err{rl.err}; }
+    val rh: res[isa.Operand, fail.Fail] = mir_to_operand(f, ?mi.operands[2], 16);
+    if (sel rh.err) { ret err[fail.Fail].err{rh.err}; }
+    val k: i64 = mi.operands[3].imm * mir.vec_lane_elem_bytes(mi.vec_lane)::i64;
+    if (k <= 0 || k >= 16) {
+        ret err[fail.Fail].err{fail.message("encode: lane join low part does not leave room in the register")};
+    }
+    val body: err[fail.Fail] = emit_vec_concat_body(k::u32, rl.ok, rh.ok, buf);
+    if (sel body.err) { ret body; }
+    ret emit_vec_store(rd.ok, float_scratch0(), buf);
 }
 
 fun encode_vector_op(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) err[fail.Fail] {
@@ -11930,8 +11988,9 @@ test describe__family_predicates_read_the_table {
     # lane-halving rows: 3 high unpacks, psrldq and 6 gated extends, the
     # qword shifts of the 64-bit multiply sequence, and the word and dword
     # logical right shifts of the vector shifts, and the 6 aes rows and pclmulqdq
-    if (fp != 1 + 2 + 4 + 8 + 2 + 6 + 1 + 30 + 1 + 1 + 11 + 3 + 3 + 7 + 2 + 1 + 3 + 1 + 6 + 2 + 2 + 7) { ret 7; }
-    if (is_jcc(x64.OPCODE_COUNT::u16) || is_setcc(x64.ASM_BLOCK))                                      { ret 8; }
+    # and the two lane-join rows
+    if (fp != 1 + 2 + 4 + 8 + 2 + 6 + 1 + 30 + 1 + 1 + 11 + 3 + 3 + 7 + 2 + 1 + 3 + 1 + 6 + 2 + 2 + 7 + 2) { ret 7; }
+    if (is_jcc(x64.OPCODE_COUNT::u16) || is_setcc(x64.ASM_BLOCK))                                          { ret 8; }
     ret 0;
 }
 

@@ -461,6 +461,16 @@ pub val MIR_VEC_RANGE: MirOpcode = 0x100E
 the IR lane range (dst, src, first lane in imm): the source's lanes from the
 first on, of the same lane type (#3864)
 
+## val MIR_VEC_CONCAT
+
+```mach
+pub val MIR_VEC_CONCAT: MirOpcode = 0x100F
+```
+
+a lane join of two parts (dst, lo, hi, the lanes of lo in imm): the lanes of
+lo and then those of hi, of one lane type, in one register. the IR join of
+more parts lowers to a chain of these (#3589)
+
 ## val MIR_SEL_ADD
 
 ```mach
@@ -1785,6 +1795,16 @@ pub fun instr_attach_dbg_end(a: *A.Allocator, mi: *MirInstr, iid: u32, vreg: u32
 ```
 
 the binding is published where `mi`'s def exists: at its end
+
+## fun instr_attach_dbg_piece
+
+```mach
+pub fun instr_attach_dbg_piece(a: *A.Allocator, mi: *MirInstr, iid: u32, vreg: u32,
+lane: u8, lanes: u8, lane_bytes: u8, at_end: bool) err[fail.Fail];
+```
+
+a binding of one piece of a value held in several registers: `vreg` is its
+`lane`-th piece of `lanes`, each `lane_bytes` wide (#3589)
 
 ## fun instr_pass_dbg
 

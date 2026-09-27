@@ -699,6 +699,9 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
     if (route == opdesc.LOWER_PHI) {
         ret err[fail.Fail].ok{};
     }
+    if (route == opdesc.LOWER_DBG && inst.operand_count > 1) {
+        ret lower_dbg_pieces(ctx, mb, inst, iid);
+    }
     if (route == opdesc.LOWER_DBG) {
         var vreg: mir.VRegId = mir.MIR_VREG_NIL;
         if (inst.operand_count > 0) {
@@ -741,6 +744,9 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
     }
     if (route == opdesc.LOWER_VEC_BUILD) {
         ret lower_vec_build(ctx, mb, inst, iid);
+    }
+    if (route == opdesc.LOWER_VEC_CONCAT) {
+        ret lower_vec_concat(ctx, mb, inst, iid);
     }
     if (route == opdesc.LOWER_DECLASSIFY) {
         val ddst:  mir.VRegId                     = lctx.instr_vreg(ctx, iid);
@@ -1931,6 +1937,83 @@ fun lower_vec_insert(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instru
 
     var mi: mir.MirInstr = mir.instr(mir.MIR_VEC_INSERT, ops, 4, lctx.op_width_of(ctx, inst.ty), lctx.op_width_of(ctx, inst.operands[2].ty));
     ret lctx.push_instr(ctx, mb, mi);
+}
+
+# a variable whose value type legalization split is bound to each piece, the
+# k-th register-width part of it (#3589)
+fun lower_dbg_pieces(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) err[fail.Fail] {
+    val lanes: u8  = inst.operand_count::u8;
+    val bytes: u8  = ctx.tgt.model.vector_op_bytes::u8;
+    var k:     u32 = 0;
+    for (k < inst.operand_count) {
+        val op_r: res[mir.MirOperand, fail.Fail] = lctx.lower_value(ctx, inst.operands[k]);
+        if (sel op_r.err) { ret err[fail.Fail].err{op_r.err}; }
+        if (op_r.ok.kind == mir.MIR_OP_VREG) {
+            val vreg:  mir.VRegId = op_r.ok.vreg;
+            var bound: bool       = false;
+            if (mb.instr_count > 0) {
+                val last: *mir.MirInstr = ?mb.instrs[mb.instr_count - 1];
+                if (instr_defines_vreg(last, vreg)) {
+                    val r: err[fail.Fail] = mir.instr_attach_dbg_piece(ctx.alloc, last, iid::u32, vreg.n, k::u8, lanes, bytes, true);
+                    if (sel r.err) { ret r; }
+                    bound = true;
+                }
+            }
+            if (!bound) {
+                val r: err[fail.Fail] = lctx.push_pending_dbg_piece(ctx, iid::u32, vreg.n, k::u8, lanes, bytes);
+                if (sel r.err) { ret r; }
+            }
+        }
+        k = k + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a join of n parts is n - 1 joins of two, each appending the next part to
+# the lanes joined so far, the last into the result (#3589)
+fun lower_vec_concat(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) err[fail.Fail] {
+    val dst: mir.VRegId = lctx.instr_vreg(ctx, iid);
+    if (mir.vreg_is_nil(dst)) {
+        ret err[fail.Fail].err{fail.message("mir.lower_ir: lane join defines no result vreg")};
+    }
+    if (inst.operand_count < 2) {
+        ret err[fail.Fail].err{fail.message("mir.lower_ir: lane join of fewer than two parts")};
+    }
+    val lane:  u32                            = lctx.vec_lane_for_type(ctx, inst.ty);
+    val w:     u8                             = lctx.op_width_of(ctx, inst.ty);
+    val acc_r: res[mir.MirOperand, fail.Fail] = lctx.lower_value(ctx, inst.operands[0]);
+    if (sel acc_r.err) { ret err[fail.Fail].err{acc_r.err}; }
+    var acc:   mir.MirOperand = acc_r.ok;
+    var lanes: u32            = mir.vec_lane_count(lctx.vec_lane_for_type(ctx, inst.operands[0].ty));
+    var i:     u32            = 1;
+    for (i < inst.operand_count) {
+        val part_r: res[mir.MirOperand, fail.Fail] = lctx.lower_value(ctx, inst.operands[i]);
+        if (sel part_r.err) { ret err[fail.Fail].err{part_r.err}; }
+        var out: mir.VRegId = dst;
+        if (i + 1 < inst.operand_count) {
+            val tr: res[mir.VRegId, fail.Fail] = lctx.new_vreg_vec(ctx, ctx.f.vregs[dst.n].class, true);
+            if (sel tr.err) { ret err[fail.Fail].err{tr.err}; }
+            ctx.f.vregs[tr.ok.n].ty = inst.ty::u32;
+            out                     = tr.ok;
+        }
+        val after: u32                           = lanes + mir.vec_lane_count(lctx.vec_lane_for_type(ctx, inst.operands[i].ty));
+        val r:     res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](ctx.alloc, 4::usize);
+        if (sel r.err) { ret err[fail.Fail].err{fail.refused(r.err)}; }
+        val ops: *mir.MirOperand = r.ok;
+        ops[0]           = mir.op_vreg(out);
+        ops[1]           = acc;
+        ops[2]           = part_r.ok;
+        ops[3]           = mir.op_imm(lanes::i64);
+        ctx.cur_vec_lane = mir.vec_lane_make(mir.vec_lane_kind(lane), mir.vec_lane_elem_bytes(lane), after);
+        var mi: mir.MirInstr   = mir.instr(mir.MIR_VEC_CONCAT, ops, 4, w, w);
+        val pe: err[fail.Fail] = lctx.push_instr(ctx, mb, mi);
+        ctx.cur_vec_lane = lane;
+        if (sel pe.err) { ret pe; }
+        acc   = mir.op_vreg(out);
+        lanes = after;
+        i     = i + 1;
+    }
+    ret err[fail.Fail].ok{};
 }
 
 fun lower_vec_build(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) err[fail.Fail] {

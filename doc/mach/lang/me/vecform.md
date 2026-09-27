@@ -65,11 +65,36 @@ pub fun decide(m: *ir.Module, tgt: *target.Target, inst: *instruction.Instructio
 the target's declared outcome for one vector operator: packed, the scalar
 expansion, or undeclared when the catalog names neither for its lane shape
 
+## fun piece_lanes
+
+```mach
+pub fun piece_lanes(tgt: *target.Target, lane_bits: u32) u32;
+```
+
+the lanes of one register-width piece a vector of `lane_bits` lanes wider
+than the register is split into (#3589): the target's declared vector width
+over the lane, capped by its lane count. 0 where a vector is not split: no
+vector register, or a target whose vectors are values rather than registers
+(spir-v), which realizes a vector of any declared width whole
+
+## fun splits
+
+```mach
+pub fun splits(m: *ir.Module, tgt: *target.Target, ty: ir_type.IrTypeId) bool;
+```
+
+a vector the target splits at type legalization: wider than one register, of
+a lane shape the vocabulary retains, on a target that splits
+
 ## fun realizes_packed
 
 ```mach
 pub fun realizes_packed(m: *ir.Module, tgt: *target.Target, inst: *instruction.Instruction) bool;
 ```
+
+packed where the catalog packs the cell and both sides are realized in
+registers, whole or as the pieces a wider vector is split into, each of which
+runs the packed instruction
 
 ## fun widening_of
 
@@ -88,6 +113,23 @@ pub fun widening_packs(m: *ir.Module, tgt: *target.Target, kind: instruction.Ins
 
 whether a widening multiply of two `from_ty` vectors into `ty` is a cell the
 target packs at these lanes; the catalog is the only judge
+
+## fun widening_half_packs
+
+```mach
+pub fun widening_half_packs(m: *ir.Module, tgt: *target.Target, kind: instruction.InstrKind, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
+```
+
+whether the widening multiply of one half of two `from_ty` vectors into the
+`ty` of half their lanes is a cell the target packs (#3589)
+
+## fun concat_packs
+
+```mach
+pub fun concat_packs(m: *ir.Module, tgt: *target.Target, ty: ir_type.IrTypeId) bool;
+```
+
+whether a lane join into `ty` is a cell the target packs (#3589)
 
 ## fun widen_half_packs
 
