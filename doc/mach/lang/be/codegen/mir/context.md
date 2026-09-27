@@ -75,7 +75,7 @@ pub fun push_pending_dbg(ctx: *LowerCtx, iid: u32, vreg: u32) err[fail.Fail];
 ## fun push_pending_dbg_piece
 
 ```mach
-pub fun push_pending_dbg_piece(ctx: *LowerCtx, iid: u32, vreg: u32, lane: u8, lanes: u8, lane_bytes: u8) err[fail.Fail];
+pub fun push_pending_dbg_piece(ctx: *LowerCtx, iid: u32, vreg: u32, lane: u8, lanes: u8, lane_bytes: u8, last_bytes: u8) err[fail.Fail];
 ```
 
 a pending binding of one piece of a value held in several registers (#3589)

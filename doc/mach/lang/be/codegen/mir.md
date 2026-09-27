@@ -1426,7 +1426,9 @@ pub rec MirDbgBinding;
 ```
 
 lane: which lane of a value wider than one register `vreg` holds, of `lanes`
-lanes each `lane_bytes` wide; `lanes` is 0 when `vreg` holds the whole value.
+lanes each `lane_bytes` wide but the last, which is `last_bytes` wide when
+that is not 0 (a split vector whose last piece holds the lanes left, #3589);
+`lanes` is 0 when `vreg` holds the whole value.
 at_end: the binding is published at the end of the instruction that carries
 it, where that instruction's def exists, instead of at its start
 
@@ -1800,11 +1802,12 @@ the binding is published where `mi`'s def exists: at its end
 
 ```mach
 pub fun instr_attach_dbg_piece(a: *A.Allocator, mi: *MirInstr, iid: u32, vreg: u32,
-lane: u8, lanes: u8, lane_bytes: u8, at_end: bool) err[fail.Fail];
+lane: u8, lanes: u8, lane_bytes: u8, last_bytes: u8, at_end: bool) err[fail.Fail];
 ```
 
 a binding of one piece of a value held in several registers: `vreg` is its
-`lane`-th piece of `lanes`, each `lane_bytes` wide (#3589)
+`lane`-th piece of `lanes`, each `lane_bytes` wide but a last one of
+`last_bytes` when that is not 0 (#3589)
 
 ## fun instr_pass_dbg
 
