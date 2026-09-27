@@ -16,11 +16,19 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_contains;
 use std.types.string.str_empty;
+use std.types.string.str_equals;
 use std.types.string.str_len;
+use std.types.string.str_starts_with;
 
-use A:   std.allocator;
+use A: std.allocator;
+use std.allocator.arena;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.data.json;
 use fmt: std.format;
 use std.io.writer;
+use std.process.env;
+use std.types.string;
 
 use mach.cli.exit;
 use mach.lang.build.outcome;
@@ -879,15 +887,279 @@ fun render_outcome_w(w: *writer.Writer, bo: *outcome.BuildOutcome, quiet: bool) 
     }
 }
 
-# render a build outcome's events to stderr in order: unit banners, failures,
-# and diagnostics
+# render a build outcome's events to stderr in order. human text renders unit
+# banners, failures, diagnostics and the closing tally; json renders each
+# diagnostic as one record, and a failure that is not a diagnostic as text
 # ---
 # bo:    the outcome
 # quiet: suppress the "building <artifact> (<target>)" banner, which prints only when the
 #        outcome has more than one unit
-pub fun render_outcome(bo: *outcome.BuildOutcome, quiet: bool) {
+# r:     the format, and the project root json paths are relative to
+pub fun render_outcome(bo: *outcome.BuildOutcome, quiet: bool, r: *Rendering) {
     var w: writer.Writer = stderr_writer();
-    render_outcome_w(?w, bo, quiet);
+    if (r.format == FORMAT_JSON) { render_outcome_json_w(?w, bo, r.root); }
+    or                           { render_outcome_w(?w, bo, quiet); }
+}
+
+# how a command writes its diagnostics to stderr: `--diagnostics=human`, the
+# default, or `--diagnostics=json`
+pub def Format: u8;
+
+pub val FORMAT_HUMAN: Format = 0;
+pub val FORMAT_JSON:  Format = 1;
+
+# the format a `--diagnostics` value names
+# ---
+# name: the value
+# ret:  the format, or none for a name outside `human` and `json`
+pub fun format_named(name: str) opt[Format] {
+    if (str_equals(name, "human")) { ret opt[Format].some{FORMAT_HUMAN}; }
+    if (str_equals(name, "json"))  { ret opt[Format].some{FORMAT_JSON}; }
+    ret opt[Format].none{};
+}
+
+# what rendering an outcome needs beyond the outcome
+# ---
+# format: human text or json records
+# root:   the project root as the command resolved it; a json record names a
+#         file inside it relative to it
+pub rec Rendering {
+    format: Format;
+    root:   str;
+}
+
+# the version every json record carries in `schema`. adding a field, a record
+# type or a value of an enumerated field keeps it; changing or removing one
+# bumps it (doc/language/diagnostics-json.md)
+pub val SCHEMA_VERSION: i64 = 1;
+
+# where record paths are measured from: the working directory a relative
+# source path is spelled against, and the project root resolved against it
+rec PathBase {
+    a:    *A.Allocator;
+    cwd:  str;
+    root: str;
+}
+
+fun path_base(a: *A.Allocator, root: str) PathBase {
+    var pb: PathBase;
+    pb.a    = a;
+    pb.cwd  = nil;
+    pb.root = nil;
+    val cwd_r: res[string.OwnedString, env.EnvError] = env.current_dir(a);
+    if (sel cwd_r.ok) { pb.cwd = cwd_r.ok.data; }
+    pb.root = absolute(?pb, root);
+    ret pb;
+}
+
+# a path resolved against the working directory and cleaned; nil when the
+# allocator refuses
+fun absolute(pb: *PathBase, p: str) str {
+    var full: str = p;
+    if (pb.cwd != nil) {
+        val joined: res[path.Path, A.Error] = path.resolve(pb.a, pb.cwd, p);
+        if (sel joined.err) { ret nil; }
+        full = joined.ok;
+    }
+    val cleaned: res[path.Path, A.Error] = path.clean(pb.a, full);
+    if (sel cleaned.err) { ret nil; }
+    ret cleaned.ok;
+}
+
+# the path a record names a source file by: relative to the project root for a
+# file inside it, otherwise absolute
+fun record_path(pb: *PathBase, p: str) str {
+    val full: str = absolute(pb, p);
+    if (full == nil || pb.root == nil) { ret p; }
+    val rl: usize = str_len(pb.root);
+    if (rl == 0 || !str_starts_with(full, pb.root)) { ret full; }
+    if (path.is_separator(pb.root[rl - 1]))         { ret (?full[rl])::str; }
+    if (full[rl] == 0)                              { ret "."; }
+    if (path.is_separator(full[rl]))                { ret (?full[rl + 1])::str; }
+    ret full;
+}
+
+# the severity a record names: `error`, `warning`, or `note` for the
+# informational severities; absent for a tag outside the catalog
+fun severity_record_name(severity: diagnostic.Severity) opt[str] {
+    if (severity == diagnostic.SEVERITY_ERROR)   { ret opt[str].some{"error"}; }
+    if (severity == diagnostic.SEVERITY_WARNING) { ret opt[str].some{"warning"}; }
+    if (severity == diagnostic.SEVERITY_INFO)    { ret opt[str].some{"note"}; }
+    if (severity == diagnostic.SEVERITY_HELP)    { ret opt[str].some{"note"}; }
+    ret opt[str].none{};
+}
+
+# a located span's members: `file`, 1-based `line` and `column` of its first
+# byte, `end_line` and `end_column` of the position just past its last byte,
+# columns counted in UTF-8 bytes, and the 0-based `byte_start` and exclusive
+# `byte_end`
+fun put_span(o: *json.Object, pb: *PathBase, f: *Frame) {
+    val end_pos: source.Position = source.position(f.sf, f.end);
+    json.field_str(o, "file", record_path(pb, f.sf.path));
+    json.field_i64(o, "line", f.line_s::i64);
+    json.field_i64(o, "column", f.col_s::i64);
+    json.field_i64(o, "end_line", end_pos.line::i64);
+    json.field_i64(o, "end_column", end_pos.col::i64);
+    json.field_i64(o, "byte_start", f.off::i64);
+    json.field_i64(o, "byte_end", f.end::i64);
+}
+
+fun put_text_element(arr: *json.Array, text: str) {
+    if (!arr.first) { fmt.write_str(arr.w, ","); }
+    arr.first = false;
+    json.write_json_string(arr.w, text);
+}
+
+# one diagnostic as one NDJSON record, members in the order the schema
+# documents them
+fun render_record(w: *writer.Writer, sources: *source.SourceMap, pb: *PathBase, d: *diagnostic.Diagnostic) {
+    var o: json.Object;
+    json.object_begin(w, ?o);
+    json.field_i64(?o, "schema", SCHEMA_VERSION);
+    json.field_str(?o, "record", "diagnostic");
+
+    var message: str      = d.message;
+    var code:    str      = dkind.key_of(d.kind);
+    val sev:     opt[str] = severity_record_name(d.severity);
+    if (sel sev.some) { json.field_str(?o, "severity", sev.some); }
+    or {
+        # a severity outside the catalog is a defect, reported as the human text reports it
+        json.field_str(?o, "severity", "error");
+        code = dkind.key_of(dkind.COMPILER_INTERNAL);
+        val said: res[str, fmt.FormatError] = fmt.sprint(pb.a, "unknown Severity tag {}: {}", d.severity, d.message);
+        if (sel said.ok) { message = said.ok; }
+    }
+    json.field_str_or_null(?o, "code", code);
+    json.field_str(?o, "message", message);
+    val origin: opt[str] = diagnostic.origin_name(d.origin);
+    if (sel origin.some) { json.field_str(?o, "origin", origin.some); }
+
+    val opt_pf: opt[Frame] = locate(sources, d.loc);
+    if (sel opt_pf.some) {
+        var pf:   Frame = opt_pf.some;
+        var prim: json.Object;
+        json.field_object_begin(?o, "primary", ?prim);
+        put_span(?prim, pb, ?pf);
+        json.object_end_value(?prim);
+    }
+    or { json.field_null(?o, "primary"); }
+
+    var related: json.Array;
+    json.field_array_begin(?o, "related", ?related);
+    var i: usize = 0;
+    for (i < d.related.len) {
+        val rel:    *diagnostic.Related = ?d.related.data[i];
+        val opt_rf: opt[Frame]          = locate(sources, rel.loc);
+        if (sel opt_rf.some) {
+            var rf: Frame = opt_rf.some;
+            var ro: json.Object;
+            json.array_object_begin(?related, ?ro);
+            put_span(?ro, pb, ?rf);
+            json.field_str_or_null(?ro, "label", rel.label);
+            json.object_end_value(?ro);
+        }
+        i = i + 1;
+    }
+    json.array_end(?related);
+
+    # a related site mach cannot locate stands as a note, as the text shows it
+    var notes: json.Array;
+    json.field_array_begin(?o, "notes", ?notes);
+    i = 0;
+    for (i < d.related.len) {
+        val rel:    *diagnostic.Related = ?d.related.data[i];
+        val opt_rf: opt[Frame]          = locate(sources, rel.loc);
+        if (rel.label != nil && sel opt_rf.none) { put_text_element(?notes, rel.label); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < d.children.len) {
+        if (d.children.data[i].kind != diagnostic.CHILD_HELP) { put_text_element(?notes, d.children.data[i].text); }
+        i = i + 1;
+    }
+    json.array_end(?notes);
+
+    var help: json.Array;
+    json.field_array_begin(?o, "help", ?help);
+    i = 0;
+    for (i < d.children.len) {
+        if (d.children.data[i].kind == diagnostic.CHILD_HELP) { put_text_element(?help, d.children.data[i].text); }
+        i = i + 1;
+    }
+    json.array_end(?help);
+
+    var fixes: json.Array;
+    json.field_array_begin(?o, "fixes", ?fixes);
+    i = 0;
+    for (i < d.fixes.len) {
+        val fx: *diagnostic.Fix = ?d.fixes.data[i];
+        var fo: json.Object;
+        json.array_object_begin(?fixes, ?fo);
+        json.field_str(?fo, "label", fx.label);
+        var edits: json.Array;
+        json.field_array_begin(?fo, "edits", ?edits);
+        var e: usize = 0;
+        for (e < fx.edits.len) {
+            val ed:     *diagnostic.Edit = ?fx.edits.data[e];
+            val opt_ef: opt[Frame]       = locate(sources, ed.loc);
+            if (sel opt_ef.some) {
+                var ef: Frame = opt_ef.some;
+                var eo: json.Object;
+                json.array_object_begin(?edits, ?eo);
+                put_span(?eo, pb, ?ef);
+                json.field_str(?eo, "replacement", ed.replacement);
+                json.object_end_value(?eo);
+            }
+            e = e + 1;
+        }
+        json.array_end(?edits);
+        json.object_end_value(?fo);
+        i = i + 1;
+    }
+    json.array_end(?fixes);
+    json.object_end(?o);
+}
+
+fun render_store_json(w: *writer.Writer, sources: *source.SourceMap, list: *diagnostic.DiagnosticStore, pb: *PathBase) {
+    var i: usize = 0;
+    for (i < diagnostic.len(list)) {
+        render_record(w, sources, pb, ?list.items.data[i]);
+        i = i + 1;
+    }
+}
+
+# the json rendering of an outcome: every diagnostic as a record in event
+# order. a failure recorded outside a store still prints as text, and banners
+# and the closing tally are human rendering only
+fun render_outcome_json_w(w: *writer.Writer, bo: *outcome.BuildOutcome, root: str) {
+    var backing: A.Allocator;
+    val made:    err[A.Error] = page.make(?backing);
+    if (sel made.err) {
+        emit_headline(w, diagnostic.SEVERITY_ERROR, dkind.COMPILER_INTERNAL, "out of memory");
+        ret;
+    }
+    var ar:     arena.Arena;
+    val opened: err[A.Error] = arena.init(?ar, ?backing, 0);
+    if (sel opened.err) {
+        emit_headline(w, diagnostic.SEVERITY_ERROR, dkind.COMPILER_INTERNAL, "out of memory");
+        ret;
+    }
+    fin { arena.dnit(?ar); }
+    var a:     A.Allocator;
+    val armed: err[A.Error] = arena.make(?a, ?ar);
+    if (sel armed.err) {
+        emit_headline(w, diagnostic.SEVERITY_ERROR, dkind.COMPILER_INTERNAL, "out of memory");
+        ret;
+    }
+    var pb: PathBase = path_base(?a, root);
+
+    var i: usize = 0;
+    for (i < bo.events.len) {
+        val ev: *outcome.BuildEvent = ?bo.events.data[i];
+        if (sel ev.fail)        { render_fail_w(w, ?ev.fail); }
+        or (sel ev.diagnostics) { render_store_json(w, ev.diagnostics.sources, ev.diagnostics.diags, ?pb); }
+        i = i + 1;
+    }
 }
 
 test render_fail__classifies_exit_code_and_suppresses_reported_output {
@@ -1555,5 +1827,404 @@ test simd_require__a_declared_extension_lowers_the_cell_packed {
     val generated: err[outcome.Fail] = driver.run_codegen_pass(?p);
     if (sel generated.err)      { ret 8; }
     if (!t_text_has_pmulld(?p)) { ret 9; }
+    ret 0;
+}
+
+# a string value's logical text, decoded into `buf` and terminated; nil when
+# the value is not a string or does not fit
+#[testing]
+fun t_text(v: *json.Value, buf: *u8, cap: usize) str {
+    if (!json.value_is_string(v)) { ret nil; }
+    val n: res[usize, json.JsonError] = json.value_string_decode(v, buf, cap - 1);
+    if (sel n.err)   { ret nil; }
+    if (n.ok >= cap) { ret nil; }
+    buf[n.ok] = 0;
+    ret buf::str;
+}
+
+#[testing]
+fun t_member(o: *json.Value, key: str) *json.Value {
+    val found: opt[*json.Value] = json.value_find(o, key);
+    if (sel found.none) { ret nil; }
+    ret found.some;
+}
+
+#[testing]
+fun t_int_at_least(o: *json.Value, key: str, least: i64) bool {
+    val v: *json.Value = t_member(o, key);
+    ret v != nil && json.value_is_number(v) && !json.value_is_float(v) && json.value_number(v) >= least;
+}
+
+#[testing]
+fun t_is_string(o: *json.Value, key: str) bool {
+    val v: *json.Value = t_member(o, key);
+    ret v != nil && json.value_is_string(v);
+}
+
+#[testing]
+fun t_is_one_of(o: *json.Value, key: str, names: *str, n: usize) bool {
+    var buf: [64]u8;
+    val v:   *json.Value = t_member(o, key);
+    if (v == nil) { ret false; }
+    val text: str = t_text(v, ?buf[0], 64);
+    if (text == nil) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (str_equals(text, names[i])) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# a span as the schema documents it: a non-empty file, 1-based positions whose
+# end is not before the start, and byte offsets in the same order
+#[testing]
+fun t_valid_span(o: *json.Value) bool {
+    if (o == nil || !json.value_is_object(o)) { ret false; }
+    val file: *json.Value = t_member(o, "file");
+    if (file == nil || !json.value_is_string(file) || file.str_len == 0) { ret false; }
+    if (!t_int_at_least(o, "line", 1) || !t_int_at_least(o, "column", 1)
+        || !t_int_at_least(o, "end_line", 1) || !t_int_at_least(o, "end_column", 1)
+        || !t_int_at_least(o, "byte_start", 0) || !t_int_at_least(o, "byte_end", 0)) { ret false; }
+    val line:     i64 = json.value_number(t_member(o, "line"));
+    val end_line: i64 = json.value_number(t_member(o, "end_line"));
+    if (end_line < line)                                                                                             { ret false; }
+    if (end_line == line && json.value_number(t_member(o, "end_column")) < json.value_number(t_member(o, "column"))) { ret false; }
+    ret json.value_number(t_member(o, "byte_end")) >= json.value_number(t_member(o, "byte_start"));
+}
+
+#[testing]
+fun t_string_array(o: *json.Value, key: str) bool {
+    val v: *json.Value = t_member(o, key);
+    if (v == nil || !json.value_is_array(v)) { ret false; }
+    var i: usize = 0;
+    for (i < json.value_count(v)) {
+        if (!json.value_is_string(?v.children[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+#[testing]
+val T_SEVERITIES: [3]str = [3]str{"error", "warning", "note"};
+
+#[testing]
+val T_ORIGINS: [7]str = [7]str{"build", "load", "resolve", "sema", "lower", "codegen", "link"};
+
+# a diagnostic record as doc/language/diagnostics-json.md documents it
+#[testing]
+fun t_valid_record(r: *json.Value) bool {
+    if (!json.value_is_object(r)) { ret false; }
+    val schema: *json.Value = t_member(r, "schema");
+    if (schema == nil || !json.value_is_number(schema) || json.value_number(schema) != SCHEMA_VERSION) { ret false; }
+    var buf:  [64]u8;
+    val kind: *json.Value = t_member(r, "record");
+    if (kind == nil || !str_equals(t_text(kind, ?buf[0], 64), "diagnostic"))         { ret false; }
+    if (!t_is_one_of(r, "severity", ?T_SEVERITIES[0], 3))                            { ret false; }
+    if (!t_is_string(r, "code") || !t_is_string(r, "message"))                       { ret false; }
+    if (t_member(r, "origin") != nil && !t_is_one_of(r, "origin", ?T_ORIGINS[0], 7)) { ret false; }
+    val primary: *json.Value = t_member(r, "primary");
+    if (primary == nil || (!json.value_is_null(primary) && !t_valid_span(primary))) { ret false; }
+    val related: *json.Value = t_member(r, "related");
+    if (related == nil || !json.value_is_array(related)) { ret false; }
+    var i: usize = 0;
+    for (i < json.value_count(related)) {
+        val rel:   *json.Value = ?related.children[i];
+        val label: *json.Value = t_member(rel, "label");
+        if (!t_valid_span(rel) || label == nil || (!json.value_is_null(label) && !json.value_is_string(label))) { ret false; }
+        i = i + 1;
+    }
+    if (!t_string_array(r, "notes") || !t_string_array(r, "help")) { ret false; }
+    val fixes: *json.Value = t_member(r, "fixes");
+    if (fixes == nil || !json.value_is_array(fixes)) { ret false; }
+    i = 0;
+    for (i < json.value_count(fixes)) {
+        val fx:    *json.Value = ?fixes.children[i];
+        val edits: *json.Value = t_member(fx, "edits");
+        if (!t_is_string(fx, "label") || edits == nil || !json.value_is_array(edits)) { ret false; }
+        var e: usize = 0;
+        for (e < json.value_count(edits)) {
+            if (!t_valid_span(?edits.children[e]) || !t_is_string(?edits.children[e], "replacement")) { ret false; }
+            e = e + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# one line of a rendering: its bytes and where the next line starts
+#[testing]
+rec TLine {
+    at:   usize;
+    len:  usize;
+    next: usize;
+}
+
+#[testing]
+fun t_line(s: *MemSink, at: usize) TLine {
+    var l: TLine;
+    l.at = at;
+    var i: usize = at;
+    for (i < s.len && s.buf[i] != '\n') { i = i + 1; }
+    l.len  = i - at;
+    l.next = i + 1;
+    ret l;
+}
+
+#[testing]
+fun t_line_is(s: *MemSink, l: TLine, want: str) bool {
+    ret l.len == str_len(want) && sink_match_at(s, l.at, want, l.len);
+}
+
+# the text after `marker` on a line, as a terminated copy; nil when the line
+# does not hold it
+#[testing]
+fun t_after(a: *A.Allocator, s: *MemSink, l: TLine, marker: str) str {
+    val ml: usize = str_len(marker);
+    var i:  usize = l.at;
+    for (i + ml <= l.at + l.len) {
+        if (sink_match_at(s, i, marker, ml)) {
+            val n:   usize             = l.at + l.len - i - ml;
+            val buf: res[*u8, A.Error] = A.allocate[u8](a, n + 1);
+            if (sel buf.err) { ret nil; }
+            var j: usize = 0;
+            for (j < n) {
+                buf.ok[j] = s.buf[i + ml + j];
+                j         = j + 1;
+            }
+            buf.ok[n] = 0;
+            ret buf.ok::str;
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+#[testing]
+fun t_is_headline(s: *MemSink, l: TLine) bool {
+    ret sink_match_at(s, l.at, "error[", 6) || sink_match_at(s, l.at, "warning[", 8);
+}
+
+# the lines of one diagnostic's human rendering that carry `marker`, in
+# order, against the record's strings in `want`
+#[testing]
+fun t_lines_match(a: *A.Allocator, s: *MemSink, from: usize, to: usize, marker: str, want: *Vector[str]) bool {
+    var n:  usize = 0;
+    var at: usize = from;
+    for (at < to) {
+        val l:    TLine = t_line(s, at);
+        val text: str   = t_after(a, s, l, marker);
+        if (text != nil) {
+            if (n >= want.len || !str_equals(text, want.data[n])) { ret false; }
+            n = n + 1;
+        }
+        at = l.next;
+    }
+    ret n == want.len;
+}
+
+#[testing]
+fun t_push_text(a: *A.Allocator, into: *Vector[str], v: *json.Value) bool {
+    var buf:  [1024]u8;
+    val text: str = t_text(v, ?buf[0], 1024);
+    if (text == nil) { ret false; }
+    val kept: res[str, A.Error] = str_dup(a, text);
+    if (sel kept.err) { ret false; }
+    val pushed: res[usize, A.Error] = vector.push[str](into, kept.ok);
+    ret sel pushed.ok;
+}
+
+# `<root>/<file>:<line>:<column>`, the location the text renders for a span
+#[testing]
+fun t_push_loc(a: *A.Allocator, into: *Vector[str], root: str, span: *json.Value) bool {
+    var buf:  [1024]u8;
+    val file: str                     = t_text(t_member(span, "file"), ?buf[0], 1024);
+    val full: res[path.Path, A.Error] = path.join(a, root, file);
+    if (sel full.err) { ret false; }
+    val loc: res[str, fmt.FormatError] = fmt.sprint(a, "{}:{}:{}", full.ok, json.value_number(t_member(span, "line")), json.value_number(t_member(span, "column")));
+    if (sel loc.err) { ret false; }
+    val pushed: res[usize, A.Error] = vector.push[str](into, loc.ok);
+    ret sel pushed.ok;
+}
+
+# one record against the human rendering of the same diagnostic, lines
+# [from, to): the headline, every location in order, the notes, help and fix
+# labels, and each related label beside its frame
+#[testing]
+fun t_record_matches(a: *A.Allocator, s: *MemSink, from: usize, to: usize, root: str, r: *json.Value) bool {
+    var sev_buf:  [16]u8;
+    var code_buf: [128]u8;
+    var msg_buf:  [1024]u8;
+    val headline: res[str, fmt.FormatError] = fmt.sprint(a, "{}[{}]: {}",
+        t_text(t_member(r, "severity"), ?sev_buf[0], 16),
+        t_text(t_member(r, "code"), ?code_buf[0], 128),
+        t_text(t_member(r, "message"), ?msg_buf[0], 1024));
+    if (sel headline.err)                            { ret false; }
+    if (!t_line_is(s, t_line(s, from), headline.ok)) { ret false; }
+
+    var locs:    Vector[str] = vector.init[str](a);
+    val primary: *json.Value = t_member(r, "primary");
+    if (!json.value_is_null(primary) && !t_push_loc(a, ?locs, root, primary)) { ret false; }
+    val related: *json.Value = t_member(r, "related");
+    var i:       usize       = 0;
+    for (i < json.value_count(related)) {
+        val rel: *json.Value = ?related.children[i];
+        if (!t_push_loc(a, ?locs, root, rel)) { ret false; }
+        val label: *json.Value = t_member(rel, "label");
+        if (json.value_is_string(label)) {
+            var lb:    [1024]u8;
+            val shown: res[str, fmt.FormatError] = fmt.sprint(a, " {}\n", t_text(label, ?lb[0], 1024));
+            if (sel shown.err) { ret false; }
+            var j:    usize = from;
+            var seen: bool  = false;
+            for (j + str_len(shown.ok) <= to && !seen) {
+                seen = sink_match_at(s, j, shown.ok, str_len(shown.ok));
+                j    = j + 1;
+            }
+            if (!seen) { ret false; }
+        }
+        i = i + 1;
+    }
+    var fix_labels: Vector[str] = vector.init[str](a);
+    val fixes:      *json.Value = t_member(r, "fixes");
+    i = 0;
+    for (i < json.value_count(fixes)) {
+        val fx: *json.Value = ?fixes.children[i];
+        if (!t_push_text(a, ?fix_labels, t_member(fx, "label"))) { ret false; }
+        val edits: *json.Value = t_member(fx, "edits");
+        var e:     usize       = 0;
+        for (e < json.value_count(edits)) {
+            if (!t_push_loc(a, ?locs, root, ?edits.children[e])) { ret false; }
+            e = e + 1;
+        }
+        i = i + 1;
+    }
+    var notes: Vector[str] = vector.init[str](a);
+    var help:  Vector[str] = vector.init[str](a);
+    val nv:    *json.Value = t_member(r, "notes");
+    val hv:    *json.Value = t_member(r, "help");
+    i = 0;
+    for (i < json.value_count(nv)) {
+        if (!t_push_text(a, ?notes, ?nv.children[i])) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < json.value_count(hv)) {
+        if (!t_push_text(a, ?help, ?hv.children[i])) { ret false; }
+        i = i + 1;
+    }
+    ret t_lines_match(a, s, from, to, "--> ", ?locs) && t_lines_match(a, s, from, to, "= note: ", ?notes)
+        && t_lines_match(a, s, from, to, "= help: ", ?help) && t_lines_match(a, s, from, to, "= fix: ", ?fix_labels);
+}
+
+# a record whose primary spans lines and whose related site is another file
+#[testing]
+fun t_spans_lines_and_files(r: *json.Value) bool {
+    val primary: *json.Value = t_member(r, "primary");
+    val related: *json.Value = t_member(r, "related");
+    if (json.value_is_null(primary) || json.value_count(related) == 0)                                    { ret false; }
+    if (json.value_number(t_member(primary, "end_line")) <= json.value_number(t_member(primary, "line"))) { ret false; }
+    var pb: [256]u8;
+    var rb: [256]u8;
+    ret !str_equals(t_text(t_member(primary, "file"), ?pb[0], 256), t_text(t_member(?related.children[0], "file"), ?rb[0], 256));
+}
+
+# check a scratch project through type checking, render what it reports both
+# ways, and hold the records to the text: as many records as headlines, each
+# valid under the schema and matching its diagnostic's text. `want` is the
+# diagnostic count, and with `spans` one record must span lines and files.
+# 0 on a match, otherwise the step that failed
+#[testing]
+fun t_parity(main_text: str, lib_text: str, want: usize, spans: bool) i32 {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val manifest_text: str                 = "[project]\nmach = \">=5\"\nid = \"par\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[profile.debug]\ndefault = true\nopt = 0\ndebug = false\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n\n[artifact.par]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/par\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
+    val root_r:        res[str, fail.Fail] = t_scaffold(?a, manifest_text, main_text);
+    if (sel root_r.err) { ret 2; }
+    val root: str = root_r.ok;
+    fin { fs.remove_all(?a, root); }
+    val lib_path_r: res[str, A.Error] = path.join(?a, root, "src/lib.mach");
+    if (sel lib_path_r.err) { ret 2; }
+    val wrote_lib: err[fs.FsError] = fs.write_bytes(lib_path_r.ok, lib_text::*u8, str_len(lib_text), 0o644);
+    if (sel wrote_lib.err) { ret 2; }
+
+    val session_r: res[session.Session, fail.Fail] = session.init(?a);
+    if (sel session_r.err) { ret 3; }
+    var s: session.Session = session_r.ok;
+    fin { session.dnit(?s); }
+    val registered: err[outcome.Fail] = driver.setup_registry(s.registry);
+    if (sel registered.err) { ret 3; }
+    var pick: manifest.Selection;
+    pick.target       = "linux";
+    pick.profile      = "";
+    pick.artifact     = "";
+    pick.want_lib     = false;
+    pick.has_artifact = false;
+    val project_r: res[project.Project, outcome.Fail] = driver.build_project(?s, root, ?pick);
+    if (sel project_r.ok) {
+        var p: project.Project = project_r.ok;
+        driver.run_sema_pass(?p);
+        project.dnit_project(?p);
+    }
+
+    var bo: outcome.BuildOutcome = outcome.outcome_init(?a);
+    fin { outcome.outcome_dnit(?bo); }
+    val recorded: err[outcome.Fail] = outcome.record_diagnostics(?bo, ?s.sources, ?s.diags);
+    if (sel recorded.err) { ret 4; }
+
+    var hbuf:  [16384]u8;
+    var hsink: MemSink;
+    var hw:    writer.Writer;
+    mem_writer(?hw, ?hsink, ?hbuf[0], 16384);
+    render_outcome_w(?hw, ?bo, false);
+    var jbuf:  [16384]u8;
+    var jsink: MemSink;
+    var jw:    writer.Writer;
+    mem_writer(?jw, ?jsink, ?jbuf[0], 16384);
+    render_outcome_json_w(?jw, ?bo, root);
+    if (hsink.len >= 16384 || jsink.len >= 16384) { ret 5; }
+
+    var records: usize = 0;
+    var spanned: bool  = false;
+    var jat:     usize = 0;
+    var hat:     usize = 0;
+    for (jat < jsink.len) {
+        val jl: TLine                           = t_line(?jsink, jat);
+        val pr: res[json.Value, json.JsonError] = json.parse(?jsink.buf[jl.at], jl.len, ?a);
+        if (sel pr.err) { ret 6; }
+        var r: json.Value = pr.ok;
+        if (!t_valid_record(?r))                  { ret 7; }
+        if (spans && t_spans_lines_and_files(?r)) { spanned = true; }
+
+        for (hat < hsink.len && !t_is_headline(?hsink, t_line(?hsink, hat))) { hat = t_line(?hsink, hat).next; }
+        if (hat >= hsink.len) { ret 8; }
+        var end: usize = t_line(?hsink, hat).next;
+        for (end < hsink.len && !t_is_headline(?hsink, t_line(?hsink, end))) { end = t_line(?hsink, end).next; }
+        if (!t_record_matches(?a, ?hsink, hat, end, root, ?r)) { ret (20 + records)::i32; }
+        hat     = end;
+        records = records + 1;
+        jat     = jl.next;
+    }
+    if (records != want)   { ret 9; }
+    if (hat < hsink.len)   { ret 10; }
+    if (spans && !spanned) { ret 11; }
+    ret 0;
+}
+
+# every diagnostic the text renders is a record with the same severity, code,
+# message, locations, labels, notes, help and fixes, and every record is valid
+# under the schema: resolve errors carrying help and a fix beside an unused
+# import warning, and a generic instance's type error whose primary spans two
+# lines with its related site in the other file (#3793)
+test json__records_match_the_human_rendering {
+    val resolve_main: str = "use par.lib.helper;\nuse par.lib.nope;\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 {\n    val x: i32 = helpr(1);\n    ret 0;\n}\n";
+    val resolve_lib:  str = "pub fun helper(x: i32) i32 { ret x; }\n";
+    val code_a:       i32 = t_parity(resolve_main, resolve_lib, 3, false);
+    if (code_a != 0) { ret code_a; }
+    val sema_main: str = "use par.lib.g;\nuse par.lib.R;\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 {\n    var r: R;\n    val s: R = g[R](\n        r);\n    ret 0;\n}\n";
+    val sema_lib:  str = "pub rec R { a: i32; }\npub fun g[T](x: T) T {\n    ret x + 1;\n}\n";
+    val code_b:    i32 = t_parity(sema_main, sema_lib, 1, true);
+    if (code_b != 0) { ret 100 + code_b; }
     ret 0;
 }

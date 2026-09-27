@@ -36,6 +36,75 @@ pub val SEVERITY_HELP:    Severity = 3
 pub fun severity_valid(s: Severity) bool;
 ```
 
+## def Origin
+
+```mach
+pub def Origin: u8
+```
+
+the phase or command that produced a diagnostic. ORIGIN_NONE is a store
+nothing has attributed yet; every other member has a stable name that the
+machine-readable rendering carries
+
+## val ORIGIN_NONE
+
+```mach
+pub val ORIGIN_NONE:    Origin = 0
+```
+
+## val ORIGIN_BUILD
+
+```mach
+pub val ORIGIN_BUILD:   Origin = 1
+```
+
+## val ORIGIN_LOAD
+
+```mach
+pub val ORIGIN_LOAD:    Origin = 2
+```
+
+## val ORIGIN_RESOLVE
+
+```mach
+pub val ORIGIN_RESOLVE: Origin = 3
+```
+
+## val ORIGIN_SEMA
+
+```mach
+pub val ORIGIN_SEMA:    Origin = 4
+```
+
+## val ORIGIN_LOWER
+
+```mach
+pub val ORIGIN_LOWER:   Origin = 5
+```
+
+## val ORIGIN_CODEGEN
+
+```mach
+pub val ORIGIN_CODEGEN: Origin = 6
+```
+
+## val ORIGIN_LINK
+
+```mach
+pub val ORIGIN_LINK:    Origin = 7
+```
+
+## fun origin_name
+
+```mach
+pub fun origin_name(o: Origin) opt[str];
+```
+
+the stable name of an origin
+
+o: the origin
+ret: its name, or none for ORIGIN_NONE and a tag outside the catalog
+
 ## def ChildKind
 
 ```mach
@@ -146,6 +215,15 @@ pub rec DiagnosticBuilder;
 pub fun store_init(a: *A.Allocator) DiagnosticStore;
 ```
 
+## fun set_origin
+
+```mach
+pub fun set_origin(store: *DiagnosticStore, o: Origin);
+```
+
+attribute every diagnostic committed to the store from now on whose builder
+names no origin to `o`; a diagnostic already committed keeps its own
+
 ## fun silence
 
 ```mach
@@ -171,7 +249,8 @@ pub fun report_unfulfilled(store: *DiagnosticStore);
 
 an expectation nothing fulfilled is itself a warning, where it is judged: a
 build with errors judges none, since a pass it stopped may have been the one
-to raise the warning
+to raise the warning. the judgement is type checking's, whatever the store
+stamps otherwise
 
 ## fun truncate
 

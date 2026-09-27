@@ -199,6 +199,24 @@ the object cache by default: a module whose object there carries the build's
 key is reused instead of lowered and generated. `--no-cache` forces an
 uncached build
 
+## val DIAG_N
+
+```mach
+pub val DIAG_N: usize = 1
+```
+
+row count of DIAG
+
+## val DIAG
+
+```mach
+pub val DIAG: [DIAG_N]FlagSpec = [DIAG_N]FlagSpec;
+```
+
+the `--diagnostics=<human|json>` option, consumed by build, check and test: how
+the diagnostics reach stderr. the value is attached, so a bare
+`--diagnostics` carries none and is refused by diagnostics_format
+
 ## val RUN_OWN_N
 
 ```mach
@@ -610,7 +628,7 @@ accepted: per-row acceptance parallel to table, or nil to accept every row; an u
 ## val BUILD_SCHEMA_N
 
 ```mach
-pub val BUILD_SCHEMA_N: usize = 8
+pub val BUILD_SCHEMA_N: usize = 9
 ```
 
 length of BUILD_SCHEMA
@@ -621,7 +639,7 @@ length of BUILD_SCHEMA
 pub val BUILD_SCHEMA: [BUILD_SCHEMA_N]TableRef = [BUILD_SCHEMA_N]TableRef;
 ```
 
-the option tables mach build accepts: SEL, RDO, CGEN, OPT, EMIT, JOBS, LINKIN, BUILD_OWN, all fully visible
+the option tables mach build accepts: SEL, RDO, CGEN, OPT, EMIT, JOBS, LINKIN, BUILD_OWN, DIAG, all fully visible
 
 ## val CHECK_SEL_ACCEPTED
 
@@ -634,7 +652,7 @@ SEL rows check accepts: every row but `-o`, since nothing is written
 ## val CHECK_SCHEMA_N
 
 ```mach
-pub val CHECK_SCHEMA_N: usize = 2
+pub val CHECK_SCHEMA_N: usize = 3
 ```
 
 length of CHECK_SCHEMA
@@ -645,7 +663,7 @@ length of CHECK_SCHEMA
 pub val CHECK_SCHEMA: [CHECK_SCHEMA_N]TableRef = [CHECK_SCHEMA_N]TableRef;
 ```
 
-the option tables mach check accepts: SEL masked by CHECK_SEL_ACCEPTED, and RDO
+the option tables mach check accepts: SEL masked by CHECK_SEL_ACCEPTED, RDO and DIAG
 
 ## val FMT_OWN_N
 
@@ -706,7 +724,7 @@ the option tables mach run accepts: SEL masked by RUN_SEL_ACCEPTED, and RUN_OWN
 ## val TEST_SCHEMA_N
 
 ```mach
-pub val TEST_SCHEMA_N: usize = 6
+pub val TEST_SCHEMA_N: usize = 7
 ```
 
 length of TEST_SCHEMA
@@ -717,7 +735,7 @@ length of TEST_SCHEMA
 pub val TEST_SCHEMA: [TEST_SCHEMA_N]TableRef = [TEST_SCHEMA_N]TableRef;
 ```
 
-the option tables mach test accepts: SEL, RDO, CGEN, OPT, LINKIN, TEST_OWN, all fully visible
+the option tables mach test accepts: SEL, RDO, CGEN, OPT, LINKIN, TEST_OWN, DIAG, all fully visible
 
 ## val DOC_SEL_ACCEPTED
 
@@ -1316,6 +1334,20 @@ ret: true when some occurrence carries the flag's key
 ```mach
 pub fun invocation_value(cmd: CommandId, inv: *ParsedInvocation, argv: **u8, flag: str) opt[*u8];
 ```
+
+## fun diagnostics_format
+
+```mach
+pub fun diagnostics_format(cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[cli_diag.Format, outcome.Fail];
+```
+
+the diagnostics format `--diagnostics=<human|json>` selects for a command
+that takes the DIAG table; human when the option is absent
+
+cmd: the command
+inv: the parsed invocation
+argv: the argument vector inv was parsed from
+ret: the format, or a user failure for a bare `--diagnostics` or any other value
 
 ## fun build_cli_invocation
 

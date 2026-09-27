@@ -56,6 +56,7 @@ from the index below.
 ## Diagnostics
 
 - [diagnostics.md](diagnostics.md) — diagnostic keys, the code registry and its never-reused rule
+- [diagnostics-json.md](diagnostics-json.md) — `--diagnostics=json`, the versioned NDJSON record schema
 
 ## Formal grammar
 
