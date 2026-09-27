@@ -22,10 +22,10 @@ a binary16, so a calling convention can place it as the float it is (#3800)
 ## fun init
 
 ```mach
-pub fun init(b: *builder.Builder, model: *isa.MachineModel) res[Half, fail.Fail];
+pub fun init(b: *builder.Builder, tgt: *target.Target) res[Half, fail.Fail];
 ```
 
-model is the target's machine model: its half rows and its NaN rule
+tgt is the target: its machine model's half rows, packed rows and NaN rule
 
 ## fun done
 
@@ -115,4 +115,35 @@ pub fun to_int(h: *Half, x: value.Value, ity: ir_type.IrTypeId, bits: u32, signe
 carried bits converted to the integer type `ity` of `bits`, truncating toward
 zero; an operand out of range converts as the target's binary64 conversion
 does, the rule every float width follows
+
+## fun vec_arith
+
+```mach
+pub fun vec_arith(h: *Half, k: instruction.InstrKind, a: value.Value, b: value.Value) value.Value;
+```
+
+the lanes `a k b` of two f16 vectors, k one of OP_ADD, OP_SUB, OP_MUL and
+OP_DIV_U, the float division
+
+## fun vec_compare
+
+```mach
+pub fun vec_compare(h: *Half, k: instruction.InstrKind, a: value.Value, b: value.Value, mask_ty: ir_type.IrTypeId) value.Value;
+```
+
+the lane mask of `a k b` over two f16 vectors, k one of OP_CMP_EQ, OP_CMP_NE,
+OP_CMP_LT_U and OP_CMP_LE_U: all ones where it holds. a comparison makes no
+NaN and every widening is exact, so the f16 lanes, their binary32 lanes and
+each lane's scalar comparison agree
+
+## fun vec_convert
+
+```mach
+pub fun vec_convert(h: *Half, v: value.Value, dst: ir_type.IrTypeId, from_fp: bool, from_bits: u32, from_signed: bool,
+to_fp: bool, to_bits: u32, to_signed: bool) value.Value;
+```
+
+the lane-wise `::` of a vector with f16 lanes on one side or both into
+`dst`: `from_fp`, `from_bits` and `from_signed` describe the operand's lanes
+and the `to_` ones the result's, as the scalar conversions above take them
 
