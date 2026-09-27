@@ -45,8 +45,11 @@ pub fun substitute_for_use(sub: value.Value, use: value.Value) value.Value;
 ## fun rewrite_apply
 
 ```mach
-pub fun rewrite_apply(fn: *ir.Function, rw: *Rewrite);
+pub fun rewrite_apply(fn: *ir.Function, rw: *Rewrite) bool;
 ```
+
+rewrites every operand that reads a replaced instruction and answers whether
+any did: a replacement nothing reads leaves the function as it was
 
 ## fun replace_uses
 
