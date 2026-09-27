@@ -96,6 +96,15 @@ pub val AOF_WIDE:      u8 = 0x20
 pub val AOF_MEM_ABS:   u8 = 0x40
 ```
 
+## val AOF_LANE
+
+```mach
+pub val AOF_LANE: u8 = 0x80
+```
+
+one element of a vector register (aarch64's v1.d[1]): elem is its width in
+bytes and imm its index
+
 ## rec Operand
 
 ```mach

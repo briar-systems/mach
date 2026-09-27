@@ -973,10 +973,38 @@ pub val CSEL: MachOp = 152
 the first source when the condition holds, else the second: the
 branch-free select (#3346)
 
+## val REV
+
+```mach
+pub val REV:       MachOp = 153
+```
+
+the byte reversal of a general register, the byte reversal within each
+doubleword of a vector, and the vector broadcast of one lane or of a general
+register, reached only from inline asm (#3915)
+
+## val V_REV64
+
+```mach
+pub val V_REV64:   MachOp = 154
+```
+
+## val V_DUP
+
+```mach
+pub val V_DUP:     MachOp = 155
+```
+
+## val V_DUP_GEN
+
+```mach
+pub val V_DUP_GEN: MachOp = 156
+```
+
 ## val MOP_LAST
 
 ```mach
-pub val MOP_LAST:  MachOp = CSEL
+pub val MOP_LAST:  MachOp = V_DUP_GEN
 ```
 
 ## fun known
@@ -1098,7 +1126,7 @@ dst, src1, src2 vectors at the arrangement the element width names
 pub val L_NEON_2MISC: Layout = 12
 ```
 
-dst, src1 vectors, always .16b
+dst, src1 vectors at the arrangement the element width names, .16b for the bitwise members
 
 ## val L_NEON_LANE_RD
 
@@ -1230,6 +1258,15 @@ pub val L_CSEL: Layout = 28
 
 dst, src1, src2 registers and the condition in the flags
 
+## val L_NEON_DUP
+
+```mach
+pub val L_NEON_DUP: Layout = 29
+```
+
+dst vector at the arrangement the element width names, from src1.elem[src2]
+or from the general register src1
+
 ## def WidthRule
 
 ```mach
@@ -1316,6 +1353,14 @@ pub val W_FMOV_GEN: WidthRule = 9
 ```
 
 FMOV (general): sf and ftype as W_SF_FTYPE, the direction from the banks
+
+## val W_SF_REV
+
+```mach
+pub val W_SF_REV: WidthRule = 10
+```
+
+rev: sf and the low opc bit set for a 64-bit register, whose bytes it reverses whole
 
 ## def LaneClass
 
