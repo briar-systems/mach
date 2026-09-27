@@ -16,7 +16,9 @@ error[name.unresolved]: unresolved identifier `helpr`
 
 The key sits between the severity and the message: `error[<key>]` or
 `warning[<key>]`. The message says what went wrong in words, and its wording
-may improve from release to release. The key does not change.
+may improve from release to release. The key does not change. A tool reads the
+key, the location and the rest as data with
+[`--diagnostics=json`](diagnostics-json.md) rather than from this text.
 
 ## Keys
 
@@ -94,5 +96,6 @@ The full list is the table itself.
 
 ## See also
 
+- [diagnostics-json.md](diagnostics-json.md) — `--diagnostics=json`, the same diagnostics as versioned NDJSON records
 - [manifest.md](manifest.md#silencing-warnings) — silencing warnings with `allow`
 - [decorators.md](decorators.md#expectkey--acknowledge-a-warning) — acknowledging a warning with `#[expect]`

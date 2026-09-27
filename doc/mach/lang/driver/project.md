@@ -269,6 +269,15 @@ pub fun release_all_staged(p: *Project);
 pub fun dnit_project(p: *Project);
 ```
 
+## fun set_origin
+
+```mach
+pub fun set_origin(p: *Project, o: diagnostic.Origin);
+```
+
+attribute what the project's phases report directly, outside a query, to the
+phase now running: both the project's store and the session's
+
 ## fun init_project
 
 ```mach
