@@ -1,0 +1,896 @@
+# block layout after allocation: a block that only jumps is threaded away by
+# retargeting whatever names it, then every block is ordered so the successor
+# a loop keeps running through follows it and a block ending in a trap goes
+# last. a conditional branch whose then arm ends up next is inverted by the
+# encoder, so either arm can be the fallthrough (#3349)
+use mach.lang.fail;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mach.lang.be.codegen.mir;
+use mach.lang.target;
+
+# the absent entry in every table here (block index, rpo number)
+val NONE: u32 = 0xFFFFFFFF;
+
+pub fun run(tgt: *target.Target, m: *mir.MirModule) err[fail.Fail] {
+    if (m == nil) { ret err[fail.Fail].err{fail.message("blocklayout: nil mir module")}; }
+    var fi: u32 = 0;
+    for (fi < m.function_len) {
+        val f: *mir.MirFunction = ?m.functions[fi];
+        if (f.block_count > 0) {
+            val th: err[fail.Fail] = thread_jumps(m.alloc, f);
+            if (sel th.err) { ret th; }
+            val ob: err[fail.Fail] = order_blocks(m.alloc, f, tgt);
+            if (sel ob.err) { ret ob; }
+        }
+        fi = fi + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun table(alloc: *A.Allocator, n: u32, fill: u32) res[*u32, fail.Fail] {
+    var cap: u32 = n;
+    if (cap == 0) { cap = 1; }
+    val r: res[*u32, A.Error] = A.allocate[u32](alloc, cap::usize);
+    if (sel r.err) { ret res[*u32, fail.Fail].err{fail.refused(r.err)}; }
+    val t: *u32 = r.ok;
+    var i: u32  = 0;
+    for (i < cap) {
+        t[i] = fill;
+        i    = i + 1;
+    }
+    ret res[*u32, fail.Fail].ok{t};
+}
+
+fun table_free(alloc: *A.Allocator, t: *u32, n: u32) {
+    var cap: u32 = n;
+    if (cap == 0) { cap = 1; }
+    A.deallocate[u32](alloc, t, cap::usize);
+}
+
+# block index by block id, ids being unique within a function
+rec IdIndex {
+    at:  *u32;
+    cap: u32;
+}
+
+fun id_index(alloc: *A.Allocator, f: *mir.MirFunction, ix: *IdIndex) err[fail.Fail] {
+    var max_id: u32 = 0;
+    var b:      u32 = 0;
+    for (b < f.block_count) {
+        if (f.blocks[b].id > max_id) { max_id = f.blocks[b].id; }
+        b = b + 1;
+    }
+    val r: res[*u32, fail.Fail] = table(alloc, max_id + 1, NONE);
+    if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+    ix.at  = r.ok;
+    ix.cap = max_id + 1;
+    b      = 0;
+    for (b < f.block_count) {
+        ix.at[f.blocks[b].id] = b;
+        b                     = b + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun id_index_free(alloc: *A.Allocator, ix: *IdIndex) {
+    table_free(alloc, ix.at, ix.cap);
+}
+
+fun index_of(ix: *IdIndex, id: i64) u32 {
+    if (id < 0 || id >= ix.cap::i64) { ret NONE; }
+    ret ix.at[id::u32];
+}
+
+# the block a block that does nothing but jump jumps to: one instruction whose
+# only operand names a block, the shape an unconditional branch has on every
+# target before and after selection. the entry block stays, and so does a
+# jump to itself
+fun lone_jump_target(f: *mir.MirFunction, ix: *IdIndex, b: u32) u32 {
+    if (b == 0) { ret NONE; }
+    val blk: *mir.MirBlock = ?f.blocks[b];
+    if (blk.instr_count != 1) { ret NONE; }
+    val mi: *mir.MirInstr = ?blk.instrs[0];
+    if (mi.asm_block != nil || mi.operand_count != 1) { ret NONE; }
+    if (mi.operands[0].kind != mir.MIR_OP_BLOCK)      { ret NONE; }
+    val t: u32 = index_of(ix, mi.operands[0].imm);
+    if (t == b) { ret NONE; }
+    ret t;
+}
+
+# every name of a block that only jumps becomes the name of the block its
+# chain of such jumps ends at, and the jumping blocks go. a jump's debug
+# bindings describe the program point the jump passes control to, which is
+# the start of the block it reaches, so they move there, the nearest jump's
+# ahead of the target's own and each farther jump's ahead of those
+fun thread_jumps(alloc: *A.Allocator, f: *mir.MirFunction) err[fail.Fail] {
+    val n: u32 = f.block_count;
+    if (n <= 1) { ret err[fail.Fail].ok{}; }
+
+    var ix: IdIndex;
+    val ri: err[fail.Fail] = id_index(alloc, f, ?ix);
+    if (sel ri.err) { ret ri; }
+    fin { id_index_free(alloc, ?ix); }
+
+    val rf: res[*u32, fail.Fail] = table(alloc, n, NONE);
+    if (sel rf.err) { ret err[fail.Fail].err{rf.err}; }
+    val jump: *u32 = rf.ok;
+    fin { table_free(alloc, jump, n); }
+    var any: bool = false;
+    var b:   u32  = 0;
+    for (b < n) {
+        jump[b] = lone_jump_target(f, ?ix, b);
+        if (jump[b] != NONE) { any = true; }
+        b = b + 1;
+    }
+    if (!any) { ret err[fail.Fail].ok{}; }
+
+    val rl: res[*u32, fail.Fail] = table(alloc, n, NONE);
+    if (sel rl.err) { ret err[fail.Fail].err{rl.err}; }
+    val land: *u32 = rl.ok;
+    fin { table_free(alloc, land, n); }
+    val rd: res[*u32, fail.Fail] = table(alloc, n, 0);
+    if (sel rd.err) { ret err[fail.Fail].err{rd.err}; }
+    val dist: *u32 = rd.ok;
+    fin { table_free(alloc, dist, n); }
+
+    # a chain that closes on itself is a loop of jumps and stays
+    var far: u32 = 0;
+    b = 0;
+    for (b < n) {
+        if (jump[b] != NONE) {
+            var x:     u32 = b;
+            var steps: u32 = 0;
+            for (jump[x] != NONE && steps <= n) {
+                x     = jump[x];
+                steps = steps + 1;
+            }
+            if (jump[x] == NONE && f.blocks[x].instr_count > 0) {
+                land[b] = x;
+                dist[b] = steps;
+                if (steps > far) { far = steps; }
+            }
+        }
+        b = b + 1;
+    }
+
+    var d: u32 = 1;
+    for (d <= far) {
+        b = 0;
+        for (b < n) {
+            if (land[b] != NONE && dist[b] == d && f.blocks[b].instrs[0].dbg_binding_count > 0) {
+                val moved: err[fail.Fail] = mir.instr_pass_dbg(alloc, ?f.blocks[b].instrs[0], ?f.blocks[land[b]].instrs[0]);
+                if (sel moved.err) { ret moved; }
+            }
+            b = b + 1;
+        }
+        d = d + 1;
+    }
+
+    b = 0;
+    for (b < n) {
+        if (land[b] == NONE) {
+            val blk: *mir.MirBlock = ?f.blocks[b];
+            var ii:  u32           = 0;
+            for (ii < blk.instr_count) {
+                val mi: *mir.MirInstr = ?blk.instrs[ii];
+                var k:  u32           = 0;
+                for (k < mi.operand_count) {
+                    val op: *mir.MirOperand = ?mi.operands[k];
+                    if (op.kind == mir.MIR_OP_BLOCK) {
+                        val t: u32 = index_of(?ix, op.imm);
+                        if (t != NONE && land[t] != NONE) { op.imm = f.blocks[land[t]].id::i64; }
+                    }
+                    k = k + 1;
+                }
+                ii = ii + 1;
+            }
+        }
+        b = b + 1;
+    }
+
+    var w: u32 = 0;
+    b = 0;
+    for (b < n) {
+        if (land[b] != NONE) {
+            mir.dnit_block(alloc, ?f.blocks[b]);
+        }
+        or {
+            if (w != b) { f.blocks[w] = f.blocks[b]; }
+            w = w + 1;
+        }
+        b = b + 1;
+    }
+    f.block_count = w;
+    ret rebuild_preds(alloc, f);
+}
+
+fun rebuild_preds(alloc: *A.Allocator, f: *mir.MirFunction) err[fail.Fail] {
+    var ix: IdIndex;
+    val ri: err[fail.Fail] = id_index(alloc, f, ?ix);
+    if (sel ri.err) { ret ri; }
+    fin { id_index_free(alloc, ?ix); }
+
+    var b: u32 = 0;
+    for (b < f.block_count) {
+        f.blocks[b].pred_count = 0;
+        b                      = b + 1;
+    }
+    b = 0;
+    for (b < f.block_count) {
+        val t: *mir.MirInstr = terminator(f, b);
+        if (t != nil) {
+            var k: u32 = 0;
+            for (k < t.operand_count) {
+                val s: u32 = successor_at(t, ?ix, k);
+                if (s != NONE) {
+                    val ap: err[fail.Fail] = pred_append(alloc, ?f.blocks[s], f.blocks[b].id);
+                    if (sel ap.err) { ret ap; }
+                }
+                k = k + 1;
+            }
+        }
+        b = b + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun pred_append(alloc: *A.Allocator, mb: *mir.MirBlock, pred: u32) err[fail.Fail] {
+    if (mb.pred_count >= mb.pred_cap) {
+        var new_cap: u32 = mb.pred_cap * 2;
+        if (new_cap < mir.INITIAL_INSTR_CAP) { new_cap = mir.INITIAL_INSTR_CAP; }
+        val rg: res[*u32, A.Error] = A.reallocate[u32](alloc, mb.preds, mb.pred_cap::usize, new_cap::usize);
+        if (sel rg.err) { ret err[fail.Fail].err{fail.refused(rg.err)}; }
+        mb.preds    = rg.ok;
+        mb.pred_cap = new_cap;
+    }
+    mb.preds[mb.pred_count] = pred;
+    mb.pred_count           = mb.pred_count + 1;
+    ret err[fail.Fail].ok{};
+}
+
+fun terminator(f: *mir.MirFunction, b: u32) *mir.MirInstr {
+    val blk: *mir.MirBlock = ?f.blocks[b];
+    if (blk.instr_count == 0) { ret nil; }
+    ret ?blk.instrs[blk.instr_count - 1];
+}
+
+# the block the terminator's operand k names the first time it names it, or
+# NONE: a branch naming one block from both arms has one edge to it
+fun successor_at(t: *mir.MirInstr, ix: *IdIndex, k: u32) u32 {
+    val op: *mir.MirOperand = ?t.operands[k];
+    if (op.kind != mir.MIR_OP_BLOCK) { ret NONE; }
+    var j: u32 = 0;
+    for (j < k) {
+        if (t.operands[j].kind == mir.MIR_OP_BLOCK && t.operands[j].imm == op.imm) { ret NONE; }
+        j = j + 1;
+    }
+    ret index_of(ix, op.imm);
+}
+
+fun is_trap_terminated(f: *mir.MirFunction, b: u32, tgt: *target.Target) bool {
+    val t: *mir.MirInstr = terminator(f, b);
+    if (t == nil)                                                            { ret false; }
+    if (tgt == nil || tgt.arch == nil || tgt.arch.is_trap_terminator == nil) { ret false; }
+    ret tgt.arch.is_trap_terminator(t.opcode::u32);
+}
+
+# the control flow graph as successor and predecessor lists, the reverse
+# postorder of the blocks the entry reaches, and each block's loop depth
+rec Cfg {
+    n:          u32;
+    succ_start: *u32;
+    succ:       *u32;
+    edge_count: u32;
+    pred_start: *u32;
+    pred:       *u32;
+    rpo_num:    *u32;
+    rpo_block:  *u32;
+    reached:    u32;
+    depth:      *u32;
+}
+
+fun cfg_free(alloc: *A.Allocator, g: *Cfg) {
+    if (g.succ_start != nil) { table_free(alloc, g.succ_start, g.n + 1); }
+    if (g.succ != nil)       { table_free(alloc, g.succ, g.edge_count); }
+    if (g.pred_start != nil) { table_free(alloc, g.pred_start, g.n + 1); }
+    if (g.pred != nil)       { table_free(alloc, g.pred, g.edge_count); }
+    if (g.rpo_num != nil)    { table_free(alloc, g.rpo_num, g.n); }
+    if (g.rpo_block != nil)  { table_free(alloc, g.rpo_block, g.n); }
+    if (g.depth != nil)      { table_free(alloc, g.depth, g.n); }
+}
+
+fun cfg_build(alloc: *A.Allocator, f: *mir.MirFunction, g: *Cfg) err[fail.Fail] {
+    val n: u32 = f.block_count;
+    g.n          = n;
+    g.succ_start = nil;
+    g.succ       = nil;
+    g.edge_count = 0;
+    g.pred_start = nil;
+    g.pred       = nil;
+    g.rpo_num    = nil;
+    g.rpo_block  = nil;
+    g.reached    = 0;
+    g.depth      = nil;
+
+    var ix: IdIndex;
+    val ri: err[fail.Fail] = id_index(alloc, f, ?ix);
+    if (sel ri.err) { ret ri; }
+    fin { id_index_free(alloc, ?ix); }
+
+    val rs: res[*u32, fail.Fail] = table(alloc, n + 1, 0);
+    if (sel rs.err) { ret err[fail.Fail].err{rs.err}; }
+    g.succ_start = rs.ok;
+    var b: u32 = 0;
+    for (b < n) {
+        g.succ_start[b] = g.edge_count;
+        val t: *mir.MirInstr = terminator(f, b);
+        if (t != nil) {
+            var k: u32 = 0;
+            for (k < t.operand_count) {
+                if (successor_at(t, ?ix, k) != NONE) { g.edge_count = g.edge_count + 1; }
+                k = k + 1;
+            }
+        }
+        b = b + 1;
+    }
+    g.succ_start[n] = g.edge_count;
+    val re: res[*u32, fail.Fail] = table(alloc, g.edge_count, NONE);
+    if (sel re.err) { ret err[fail.Fail].err{re.err}; }
+    g.succ = re.ok;
+    b      = 0;
+    for (b < n) {
+        var e: u32           = g.succ_start[b];
+        val t: *mir.MirInstr = terminator(f, b);
+        if (t != nil) {
+            var k: u32 = 0;
+            for (k < t.operand_count) {
+                val s: u32 = successor_at(t, ?ix, k);
+                if (s != NONE) {
+                    g.succ[e] = s;
+                    e         = e + 1;
+                }
+                k = k + 1;
+            }
+        }
+        b = b + 1;
+    }
+
+    val rr: err[fail.Fail] = cfg_rpo(alloc, g);
+    if (sel rr.err) { ret rr; }
+    val rp: err[fail.Fail] = cfg_preds(alloc, g);
+    if (sel rp.err) { ret rp; }
+    ret cfg_depth(alloc, g);
+}
+
+# depth-first from the entry, each block's successors in operand order
+fun cfg_rpo(alloc: *A.Allocator, g: *Cfg) err[fail.Fail] {
+    val n:  u32                  = g.n;
+    val rn: res[*u32, fail.Fail] = table(alloc, n, NONE);
+    if (sel rn.err) { ret err[fail.Fail].err{rn.err}; }
+    g.rpo_num = rn.ok;
+    val rb: res[*u32, fail.Fail] = table(alloc, n, NONE);
+    if (sel rb.err) { ret err[fail.Fail].err{rb.err}; }
+    g.rpo_block = rb.ok;
+
+    val rs: res[*u32, fail.Fail] = table(alloc, n, 0);
+    if (sel rs.err) { ret err[fail.Fail].err{rs.err}; }
+    val stack: *u32 = rs.ok;
+    fin { table_free(alloc, stack, n); }
+    val rc: res[*u32, fail.Fail] = table(alloc, n, 0);
+    if (sel rc.err) { ret err[fail.Fail].err{rc.err}; }
+    val cursor: *u32 = rc.ok;
+    fin { table_free(alloc, cursor, n); }
+    val rp: res[*u32, fail.Fail] = table(alloc, n, 0);
+    if (sel rp.err) { ret err[fail.Fail].err{rp.err}; }
+    val post: *u32 = rp.ok;
+    fin { table_free(alloc, post, n); }
+
+    # rpo_num marks a visited block with 0 until the numbering below
+    var pc: u32 = 0;
+    var sp: u32 = 1;
+    stack[0]     = 0;
+    cursor[0]    = g.succ_start[0];
+    g.rpo_num[0] = 0;
+    for (sp > 0) {
+        val b: u32 = stack[sp - 1];
+        if (cursor[sp - 1] < g.succ_start[b + 1]) {
+            val s: u32 = g.succ[cursor[sp - 1]];
+            cursor[sp - 1] = cursor[sp - 1] + 1;
+            if (g.rpo_num[s] == NONE) {
+                g.rpo_num[s] = 0;
+                stack[sp]    = s;
+                cursor[sp]   = g.succ_start[s];
+                sp           = sp + 1;
+            }
+        }
+        or {
+            post[pc] = b;
+            pc       = pc + 1;
+            sp       = sp - 1;
+        }
+    }
+    var k: u32 = 0;
+    for (k < pc) {
+        val b: u32 = post[pc - 1 - k];
+        g.rpo_block[k] = b;
+        g.rpo_num[b]   = k;
+        k              = k + 1;
+    }
+    g.reached = pc;
+    ret err[fail.Fail].ok{};
+}
+
+fun reached(g: *Cfg, b: u32) bool {
+    ret g.rpo_num[b] != NONE;
+}
+
+# an edge to a block no later in the reverse postorder closes a loop
+fun is_back_edge(g: *Cfg, from: u32, to: u32) bool {
+    ret g.rpo_num[to] <= g.rpo_num[from];
+}
+
+fun cfg_preds(alloc: *A.Allocator, g: *Cfg) err[fail.Fail] {
+    val n:  u32                  = g.n;
+    val rs: res[*u32, fail.Fail] = table(alloc, n + 1, 0);
+    if (sel rs.err) { ret err[fail.Fail].err{rs.err}; }
+    g.pred_start = rs.ok;
+    val rp: res[*u32, fail.Fail] = table(alloc, g.edge_count, NONE);
+    if (sel rp.err) { ret err[fail.Fail].err{rp.err}; }
+    g.pred = rp.ok;
+
+    var b: u32 = 0;
+    for (b < n) {
+        if (reached(g, b)) {
+            var e: u32 = g.succ_start[b];
+            for (e < g.succ_start[b + 1]) {
+                g.pred_start[g.succ[e] + 1] = g.pred_start[g.succ[e] + 1] + 1;
+                e                           = e + 1;
+            }
+        }
+        b = b + 1;
+    }
+    b = 0;
+    for (b < n) {
+        g.pred_start[b + 1] = g.pred_start[b + 1] + g.pred_start[b];
+        b                   = b + 1;
+    }
+    val rf: res[*u32, fail.Fail] = table(alloc, n, 0);
+    if (sel rf.err) { ret err[fail.Fail].err{rf.err}; }
+    val fill: *u32 = rf.ok;
+    fin { table_free(alloc, fill, n); }
+    b = 0;
+    for (b < n) {
+        if (reached(g, b)) {
+            var e: u32 = g.succ_start[b];
+            for (e < g.succ_start[b + 1]) {
+                val s: u32 = g.succ[e];
+                g.pred[g.pred_start[s] + fill[s]] = b;
+                fill[s]                           = fill[s] + 1;
+                e                                 = e + 1;
+            }
+        }
+        b = b + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a block's loop depth counts the natural loops holding it: a header and every
+# block that reaches one of its back edges without passing through it. the
+# walk stays among the blocks after the header in reverse postorder, where the
+# body of a loop the header dominates lies
+fun cfg_depth(alloc: *A.Allocator, g: *Cfg) err[fail.Fail] {
+    val n:  u32                  = g.n;
+    val rd: res[*u32, fail.Fail] = table(alloc, n, 0);
+    if (sel rd.err) { ret err[fail.Fail].err{rd.err}; }
+    g.depth = rd.ok;
+    val rm: res[*u32, fail.Fail] = table(alloc, n, NONE);
+    if (sel rm.err) { ret err[fail.Fail].err{rm.err}; }
+    val mark: *u32 = rm.ok;
+    fin { table_free(alloc, mark, n); }
+    val rw: res[*u32, fail.Fail] = table(alloc, n, 0);
+    if (sel rw.err) { ret err[fail.Fail].err{rw.err}; }
+    val work: *u32 = rw.ok;
+    fin { table_free(alloc, work, n); }
+
+    var h: u32 = 0;
+    for (h < n) {
+        if (reached(g, h)) {
+            var sp: u32 = 0;
+            var e:  u32 = g.pred_start[h];
+            for (e < g.pred_start[h + 1]) {
+                val p: u32 = g.pred[e];
+                if (is_back_edge(g, p, h)) {
+                    if (mark[h] != h) {
+                        mark[h]    = h;
+                        g.depth[h] = g.depth[h] + 1;
+                    }
+                    if (mark[p] != h) {
+                        mark[p]    = h;
+                        g.depth[p] = g.depth[p] + 1;
+                        work[sp]   = p;
+                        sp         = sp + 1;
+                    }
+                }
+                e = e + 1;
+            }
+            for (sp > 0) {
+                sp = sp - 1;
+                val x:  u32 = work[sp];
+                var pe: u32 = g.pred_start[x];
+                for (pe < g.pred_start[x + 1]) {
+                    val p: u32 = g.pred[pe];
+                    if (mark[p] != h && g.rpo_num[p] >= g.rpo_num[h]) {
+                        mark[p]    = h;
+                        g.depth[p] = g.depth[p] + 1;
+                        work[sp]   = p;
+                        sp         = sp + 1;
+                    }
+                    pe = pe + 1;
+                }
+            }
+        }
+        h = h + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a min-heap of reverse postorder numbers: the ready blocks, earliest first
+rec Ready {
+    at:  *u32;
+    len: u32;
+}
+
+fun ready_push(r: *Ready, v: u32) {
+    var i: u32 = r.len;
+    r.len = r.len + 1;
+    for (i > 0) {
+        val parent: u32 = (i - 1) / 2;
+        if (r.at[parent] <= v) { brk; }
+        r.at[i] = r.at[parent];
+        i       = parent;
+    }
+    r.at[i] = v;
+}
+
+fun ready_pop(r: *Ready) u32 {
+    val top: u32 = r.at[0];
+    r.len = r.len - 1;
+    val last: u32 = r.at[r.len];
+    var i:    u32 = 0;
+    for (true) {
+        var c: u32 = 2 * i + 1;
+        if (c >= r.len)                             { brk; }
+        if (c + 1 < r.len && r.at[c + 1] < r.at[c]) { c = c + 1; }
+        if (last <= r.at[c])                        { brk; }
+        r.at[i] = r.at[c];
+        i       = c;
+    }
+    if (r.len > 0) { r.at[i] = last; }
+    ret top;
+}
+
+# the placement state: which blocks are placed, how many forward edges into
+# each are still unplaced, the blocks that are ready, and the order so far
+rec Placement {
+    placed: *u32;
+    fwd_in: *u32;
+    ready:  Ready;
+    order:  *u32;
+    count:  u32;
+    cold:   *u32;
+    cold_n: u32;
+}
+
+fun place(g: *Cfg, p: *Placement, b: u32) {
+    p.placed[b]      = 1;
+    p.order[p.count] = b;
+    p.count          = p.count + 1;
+    release(g, p, b);
+}
+
+fun release(g: *Cfg, p: *Placement, b: u32) {
+    var e: u32 = g.succ_start[b];
+    for (e < g.succ_start[b + 1]) {
+        val s: u32 = g.succ[e];
+        if (!is_back_edge(g, b, s)) {
+            p.fwd_in[s] = p.fwd_in[s] - 1;
+            if (p.fwd_in[s] == 0 && p.placed[s] == 0) { ready_push(?p.ready, g.rpo_num[s]); }
+        }
+        e = e + 1;
+    }
+}
+
+# the successor to place right after b: one whose forward predecessors are
+# all placed, never a block that ends in a trap, the deepest in loops first,
+# so a loop's own successor wins over the way out of it, then the last arm:
+# a branch's then arm is the guarded case (an error return, a match) and its
+# else arm the way the code goes on
+fun likely_successor(f: *mir.MirFunction, tgt: *target.Target, g: *Cfg, p: *Placement, b: u32) u32 {
+    var best: u32 = NONE;
+    var e:    u32 = g.succ_start[b];
+    for (e < g.succ_start[b + 1]) {
+        val s: u32 = g.succ[e];
+        if (p.placed[s] == 0 && p.fwd_in[s] == 0 && !is_back_edge(g, b, s) && !is_trap_terminated(f, s, tgt)) {
+            if (best == NONE || g.depth[s] >= g.depth[best]) { best = s; }
+        }
+        e = e + 1;
+    }
+    ret best;
+}
+
+# a greedy topological order over the forward edges: each block is followed
+# by its likely successor when that one is ready, and otherwise by the ready
+# block earliest in reverse postorder. blocks the entry does not reach follow
+# in index order, and blocks that end in a trap go last
+fun order_blocks(alloc: *A.Allocator, f: *mir.MirFunction, tgt: *target.Target) err[fail.Fail] {
+    val n:  u32            = f.block_count;
+    var g:  Cfg;
+    val rg: err[fail.Fail] = cfg_build(alloc, f, ?g);
+    if (sel rg.err) {
+        cfg_free(alloc, ?g);
+        ret rg;
+    }
+    fin { cfg_free(alloc, ?g); }
+
+    var p:  Placement;
+    val rp: res[*u32, fail.Fail] = table(alloc, n, 0);
+    if (sel rp.err) { ret err[fail.Fail].err{rp.err}; }
+    p.placed = rp.ok;
+    fin { table_free(alloc, p.placed, n); }
+    val rf: res[*u32, fail.Fail] = table(alloc, n, 0);
+    if (sel rf.err) { ret err[fail.Fail].err{rf.err}; }
+    p.fwd_in = rf.ok;
+    fin { table_free(alloc, p.fwd_in, n); }
+    val rr: res[*u32, fail.Fail] = table(alloc, n, 0);
+    if (sel rr.err) { ret err[fail.Fail].err{rr.err}; }
+    p.ready.at  = rr.ok;
+    p.ready.len = 0;
+    fin { table_free(alloc, p.ready.at, n); }
+    val rc: res[*u32, fail.Fail] = table(alloc, n, 0);
+    if (sel rc.err) { ret err[fail.Fail].err{rc.err}; }
+    p.cold   = rc.ok;
+    p.cold_n = 0;
+    fin { table_free(alloc, p.cold, n); }
+    # the order is the function's own, released with it
+    val ro: res[*u32, A.Error] = A.allocate[u32](alloc, n::usize);
+    if (sel ro.err) { ret err[fail.Fail].err{fail.refused(ro.err)}; }
+    p.order = ro.ok;
+    p.count = 0;
+
+    var b: u32 = 0;
+    for (b < n) {
+        if (reached(?g, b)) {
+            var e: u32 = g.succ_start[b];
+            for (e < g.succ_start[b + 1]) {
+                val s: u32 = g.succ[e];
+                if (!is_back_edge(?g, b, s)) { p.fwd_in[s] = p.fwd_in[s] + 1; }
+                e = e + 1;
+            }
+        }
+        b = b + 1;
+    }
+
+    place(?g, ?p, 0);
+    for (true) {
+        var next: u32 = likely_successor(f, tgt, ?g, ?p, p.order[p.count - 1]);
+        for (next == NONE && p.ready.len > 0) {
+            val c: u32 = g.rpo_block[ready_pop(?p.ready)];
+            if (p.placed[c] == 0) {
+                if (is_trap_terminated(f, c, tgt)) {
+                    p.placed[c]      = 1;
+                    p.cold[p.cold_n] = c;
+                    p.cold_n         = p.cold_n + 1;
+                    release(?g, ?p, c);
+                }
+                or { next = c; }
+            }
+        }
+        if (next == NONE) { brk; }
+        place(?g, ?p, next);
+    }
+
+    b = 0;
+    for (b < n) {
+        if (p.placed[b] == 0) {
+            p.order[p.count] = b;
+            p.count          = p.count + 1;
+        }
+        b = b + 1;
+    }
+    var c: u32 = 0;
+    for (c < p.cold_n) {
+        p.order[p.count] = p.cold[c];
+        p.count          = p.count + 1;
+        c                = c + 1;
+    }
+    f.emit_order = p.order;
+    ret err[fail.Fail].ok{};
+}
+
+use mach.lang.target.isa;
+use std.allocator.page;
+
+# a block holding one terminator: a jump to a (b NONE), a branch on vreg 0 to
+# a or b, or with a NONE the given leaf opcode
+#[testing]
+fun t_block(alloc: *A.Allocator, id: u32, op: mir.MirOpcode, a: u32, b: u32) mir.MirBlock {
+    var blk: mir.MirBlock;
+    blk.id          = id;
+    blk.instrs      = nil;
+    blk.instr_count = 0;
+    blk.instr_cap   = 0;
+    blk.preds       = nil;
+    blk.pred_count  = 0;
+    blk.pred_cap    = 0;
+    val ro: res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](alloc, 3::usize);
+    if (sel ro.err) { ret blk; }
+    val ops: *mir.MirOperand = ro.ok;
+    var n:   u32             = 0;
+    if (a != NONE && b != NONE) {
+        ops[0] = mir.op_vreg(mir.vreg_id(0));
+        ops[1] = mir.op_block(a);
+        ops[2] = mir.op_block(b);
+        n      = 3;
+    }
+    or (a != NONE) {
+        ops[0] = mir.op_block(a);
+        n      = 1;
+    }
+    val ri: res[*mir.MirInstr, A.Error] = A.allocate[mir.MirInstr](alloc, 1::usize);
+    if (sel ri.err) { ret blk; }
+    var mi: mir.MirInstr = mir.instr(op, ops, n, 8, 8);
+    if (n == 0) {
+        A.deallocate[mir.MirOperand](alloc, ops, 3::usize);
+        mi.operands = nil;
+    }
+    or { mi.operand_count = n; }
+    mi.asm_block         = nil;
+    mi.dbg_bindings      = nil;
+    mi.dbg_binding_count = 0;
+    mi.inline_site       = 0;
+    blk.instrs           = ri.ok;
+    blk.instrs[0]        = mi;
+    blk.instr_count      = 1;
+    blk.instr_cap        = 1;
+    ret blk;
+}
+
+#[testing]
+fun t_fn(blocks: *mir.MirBlock, n: u32) mir.MirFunction {
+    var f: mir.MirFunction;
+    f.blocks      = blocks;
+    f.block_count = n;
+    f.block_cap   = n;
+    f.emit_order  = nil;
+    ret f;
+}
+
+#[testing]
+fun t_is_trap(opcode: u32) bool {
+    ret opcode == mir.MIR_UNREACHABLE::u32;
+}
+
+#[testing]
+fun t_is_reg_move(opcode: u32) bool {
+    ret false;
+}
+
+#[testing]
+fun t_order_is(f: *mir.MirFunction, ids: *u32, n: u32) bool {
+    if (f.emit_order == nil) { ret false; }
+    var i: u32 = 0;
+    for (i < n) {
+        if (f.blocks[f.emit_order[i]].id != ids[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# a loop whose body may leave by a brk: the body's way on through the loop
+# follows it although it is the branch's then arm, and the loop's exit waits
+# for the latch, its last forward predecessor
+test order_blocks__a_loop_body_falls_through_its_own_successor {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var machine: isa.RegMachine = isa.reg_machine(nil, nil, t_is_reg_move, t_is_trap, nil, 0, nil, 0, -1, -1, -1, -1, 0, -1, -1, -1);
+    var tgt:     target.Target;
+    tgt.arch = ?machine;
+
+    var blocks: [6]mir.MirBlock;
+    blocks[0] = t_block(?alloc, 0, mir.MIR_CBR, 1, 5);
+    blocks[1] = t_block(?alloc, 1, mir.MIR_CBR, 2, 3);
+    blocks[2] = t_block(?alloc, 2, mir.MIR_CBR, 1, 5);
+    blocks[3] = t_block(?alloc, 3, mir.MIR_BR, 4, NONE);
+    blocks[4] = t_block(?alloc, 4, mir.MIR_RET, NONE, NONE);
+    blocks[5] = t_block(?alloc, 5, mir.MIR_BR, 4, NONE);
+    var f: mir.MirFunction = t_fn(?blocks[0], 6);
+    val r: err[fail.Fail]  = order_blocks(?alloc, ?f, ?tgt);
+    if (sel r.err) { ret 1; }
+
+    var want: [6]u32;
+    want[0] = 0;
+    want[1] = 1;
+    want[2] = 2;
+    want[3] = 5;
+    want[4] = 3;
+    want[5] = 4;
+    if (!t_order_is(?f, ?want[0], 6)) { ret 2; }
+    ret 0;
+}
+
+# a block ending in a trap goes last, never the entry, and block ids and
+# array positions do not steer the order, only the branch operands do
+test order_blocks__sinks_a_trap_but_not_the_entry {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var machine: isa.RegMachine = isa.reg_machine(nil, nil, t_is_reg_move, t_is_trap, nil, 0, nil, 0, -1, -1, -1, -1, 0, -1, -1, -1);
+    var tgt:     target.Target;
+    tgt.arch = ?machine;
+
+    var blocks: [4]mir.MirBlock;
+    blocks[0] = t_block(?alloc, 0, mir.MIR_CBR, 9, 4);
+    blocks[1] = t_block(?alloc, 4, mir.MIR_BR, 7, NONE);
+    blocks[2] = t_block(?alloc, 9, mir.MIR_UNREACHABLE, NONE, NONE);
+    blocks[3] = t_block(?alloc, 7, mir.MIR_RET, NONE, NONE);
+    var f: mir.MirFunction = t_fn(?blocks[0], 4);
+    val r: err[fail.Fail]  = order_blocks(?alloc, ?f, ?tgt);
+    if (sel r.err) { ret 1; }
+    var want: [4]u32;
+    want[0] = 0;
+    want[1] = 4;
+    want[2] = 7;
+    want[3] = 9;
+    if (!t_order_is(?f, ?want[0], 4)) { ret 2; }
+
+    var cold: [2]mir.MirBlock;
+    cold[0] = t_block(?alloc, 0, mir.MIR_UNREACHABLE, NONE, NONE);
+    cold[1] = t_block(?alloc, 1, mir.MIR_RET, NONE, NONE);
+    var g:  mir.MirFunction = t_fn(?cold[0], 2);
+    val rg: err[fail.Fail]  = order_blocks(?alloc, ?g, ?tgt);
+    if (sel rg.err) { ret 3; }
+    var entry: [2]u32;
+    entry[0] = 0;
+    entry[1] = 1;
+    if (!t_order_is(?g, ?entry[0], 2)) { ret 4; }
+    ret 0;
+}
+
+# a chain of blocks that only jump goes: the branch names the block the chain
+# ends at, once, and the jumps' bindings open where that block starts, the
+# first jump's ahead of the second's and both ahead of the block's own
+test thread_jumps__retargets_a_chain_and_keeps_its_bindings {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var blocks: [4]mir.MirBlock;
+    blocks[0] = t_block(?alloc, 0, mir.MIR_CBR, 1, 3);
+    blocks[1] = t_block(?alloc, 1, mir.MIR_BR, 2, NONE);
+    blocks[2] = t_block(?alloc, 2, mir.MIR_BR, 3, NONE);
+    blocks[3] = t_block(?alloc, 3, mir.MIR_RET, NONE, NONE);
+    val b1: err[fail.Fail] = mir.instr_attach_dbg(?alloc, ?blocks[1].instrs[0], 7, 0);
+    if (sel b1.err) { ret 1; }
+    val b2: err[fail.Fail] = mir.instr_attach_dbg(?alloc, ?blocks[2].instrs[0], 8, 0);
+    if (sel b2.err) { ret 1; }
+    val b3: err[fail.Fail] = mir.instr_attach_dbg(?alloc, ?blocks[3].instrs[0], 9, 0);
+    if (sel b3.err) { ret 1; }
+    var f: mir.MirFunction = t_fn(?blocks[0], 4);
+    val r: err[fail.Fail]  = thread_jumps(?alloc, ?f);
+    if (sel r.err) { ret 2; }
+
+    if (f.block_count != 2)                                                              { ret 3; }
+    if (f.blocks[0].instrs[0].operands[1].imm != 3)                                      { ret 4; }
+    if (f.blocks[0].instrs[0].operands[2].imm != 3)                                      { ret 4; }
+    if (f.blocks[1].id != 3 || f.blocks[1].pred_count != 1 || f.blocks[1].preds[0] != 0) { ret 5; }
+    val ret_instr: *mir.MirInstr = ?f.blocks[1].instrs[0];
+    if (ret_instr.dbg_binding_count != 3)                                                                               { ret 6; }
+    if (ret_instr.dbg_bindings[0].iid != 7 || ret_instr.dbg_bindings[1].iid != 8 || ret_instr.dbg_bindings[2].iid != 9) { ret 7; }
+    ret 0;
+}
