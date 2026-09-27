@@ -1434,7 +1434,10 @@ dependency's repository: one `git ls-remote --tags` per URL, and the manifest
 at a release through a shallow fetch of its tag. With `--offline` they use only
 the tags already present in the realized checkouts, and they say so
 (`resolving from releases already fetched (--offline)`). A resolution that
-needs a candidate it doesn't have fails, naming the identity.
+needs a candidate it doesn't have fails, naming the identity. Realizing a
+checkout fetches nothing either. A missing checkout is initialized from the
+submodule store Git kept for it, and a pin that no local checkout or store
+holds fails, naming the dependency and the commit.
 
 **`--lowest`.** `mach dep update <path> --all --lowest` picks the lowest
 release every range accepts. A library's CI runs it in a scratch checkout and
