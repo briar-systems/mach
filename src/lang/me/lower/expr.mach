@@ -31,6 +31,7 @@ use mach.lang.fe.sema.generics;
 use mach.lang.fe.token;
 use mach.lang.float;
 use mach.lang.intern;
+use mach.lang.me.half;
 use mach.lang.me.ir;
 use mach.lang.me.ir.builder;
 use mach.lang.me.ir.instruction;
@@ -158,7 +159,15 @@ fun lower_lit_float(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) r
     if (sel res_ir.err) { ret res[value.Value, fail.Fail].err{res_ir.err}; }
     val lit: res[float.Rounded, fail.Fail] = comptime.lit_float_at(context.module_source(ctx), e.data.lit_float.tok, context.expr_float_width(ctx, eid));
     if (sel lit.err) { ret res[value.Value, fail.Fail].err{lit.err}; }
-    ret res[value.Value, fail.Fail].ok{value.const_float(lit.ok.value, res_ir.ok)};
+    ret res[value.Value, fail.Fail].ok{float_constant(ctx, lit.ok.value, res_ir.ok)};
+}
+
+# a float constant of the ir type `ty`: an f16's carrier holds the value's encoding
+fun float_constant(ctx: *context.LowerContext, f: f64, ty: ir_type.IrTypeId) value.Value {
+    val opt_ty: opt[*ir_type.IrType] = ir_type.get(?ctx.m.types, ty);
+    if (sel opt_ty.none)                     { ret value.const_float(f, ty); }
+    if (opt_ty.some.kind != ir_type.IRT_INT) { ret value.const_float(f, ty); }
+    ret value.const_int(float.bits_at(f, float.width_of_bits(opt_ty.some.data.bits)), ty);
 }
 
 fun lower_lit_char(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) res[value.Value, fail.Fail] {
@@ -2031,7 +2040,8 @@ fun lower_binary(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) res[
         ret lower_vector_binary(ctx, op, lhs, rhs, lty);
     }
 
-    if (is_compare_binop(op)) { ret lower_cmp(ctx, op, lhs, lty, rhs, rty); }
+    if (is_compare_binop(op))   { ret lower_cmp(ctx, op, lhs, lty, rhs, rty); }
+    if (is_half_type(ctx, lty)) { ret lower_half_binary(ctx, op, lhs, rhs); }
 
     if (op == expr.BIN_ADD) { ret builder.emit_add(?ctx.builder, lhs, rhs); }
     if (op == expr.BIN_SUB) { ret builder.emit_sub(?ctx.builder, lhs, rhs); }
@@ -2055,6 +2065,41 @@ fun lower_binary(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) res[
     }
 
     ret res[value.Value, fail.Fail].err{fail.message("lower: unsupported binary operator")};
+}
+
+fun half_of(ctx: *context.LowerContext) res[half.Half, fail.Fail] {
+    var model: *isa.MachineModel = nil;
+    if (ctx.tgt != nil) { model = ?ctx.tgt.model; }
+    ret half.init(?ctx.builder, model);
+}
+
+# an f16 operator: `%` is exact, so the binary64 remainder of the widened
+# operands narrows without rounding
+fun lower_half_binary(ctx: *context.LowerContext, op: expr.BinOp, lhs: value.Value, rhs: value.Value) res[value.Value, fail.Fail] {
+    val res_h: res[half.Half, fail.Fail] = half_of(ctx);
+    if (sel res_h.err) { ret res[value.Value, fail.Fail].err{res_h.err}; }
+    var h: half.Half = res_h.ok;
+    if (op == expr.BIN_ADD) { ret half.done(?h, half.arith(?h, instruction.OP_ADD, lhs, rhs)); }
+    if (op == expr.BIN_SUB) { ret half.done(?h, half.arith(?h, instruction.OP_SUB, lhs, rhs)); }
+    if (op == expr.BIN_MUL) { ret half.done(?h, half.arith(?h, instruction.OP_MUL, lhs, rhs)); }
+    if (op == expr.BIN_DIV) { ret half.done(?h, half.arith(?h, instruction.OP_DIV_U, lhs, rhs)); }
+    if (op != expr.BIN_MOD) { ret res[value.Value, fail.Fail].err{fail.message("lower: unsupported f16 operator")}; }
+    val wl: res[value.Value, fail.Fail] = half.done(?h, half.widen(?h, lhs));
+    if (sel wl.err) { ret wl; }
+    val wr: res[value.Value, fail.Fail] = half.done(?h, half.widen(?h, rhs));
+    if (sel wr.err) { ret wr; }
+    val r: res[value.Value, fail.Fail] = lower_float_rem(ctx, wl.ok, wr.ok);
+    if (sel r.err) { ret r; }
+    ret half.done(?h, half.narrow(?h, r.ok));
+}
+
+# a comparison operand: an f16 as its exact widening, and a narrower float
+# beside a wider one extended to it
+fun half_compare_operand(ctx: *context.LowerContext, h: *half.Half, v: value.Value, tid: type.TypeId, bits: u32) res[value.Value, fail.Fail] {
+    if (is_half_type(ctx, tid) && bits == 16) { ret half.done(h, half.compare_operand(h, v)); }
+    if (is_half_type(ctx, tid))               { ret half.done(h, half.to_float(h, v, 64)); }
+    if (scalar_bits(ctx, tid) < 64)           { ret builder.emit_fp_ext(?ctx.builder, v, h.f64t); }
+    ret res[value.Value, fail.Fail].ok{v};
 }
 
 fun lower_vector_binary(ctx: *context.LowerContext, op: expr.BinOp, lhs: value.Value, rhs: value.Value, lty: type.TypeId) res[value.Value, fail.Fail] {
@@ -2497,6 +2542,19 @@ fun is_compare_binop(op: expr.BinOp) bool {
 }
 
 fun lower_cmp(ctx: *context.LowerContext, op: expr.BinOp, lhs: value.Value, lty: type.TypeId, rhs: value.Value, rty: type.TypeId) res[value.Value, fail.Fail] {
+    if (is_half_type(ctx, lty) || is_half_type(ctx, rty)) {
+        val res_h: res[half.Half, fail.Fail] = half_of(ctx);
+        if (sel res_h.err) { ret res[value.Value, fail.Fail].err{res_h.err}; }
+        var h: half.Half = res_h.ok;
+        # both sides meet at binary64 unless both are f16 the target compares natively
+        var bits: u32 = 64;
+        if (is_half_type(ctx, lty) && is_half_type(ctx, rty)) { bits = 16; }
+        val hl: res[value.Value, fail.Fail] = half_compare_operand(ctx, ?h, lhs, lty, bits);
+        if (sel hl.err) { ret hl; }
+        val hr: res[value.Value, fail.Fail] = half_compare_operand(ctx, ?h, rhs, rty, bits);
+        if (sel hr.err) { ret hr; }
+        ret emit_cmp_int(ctx, op, false, hl.ok, hr.ok);
+    }
     if (is_float_type(ctx, lty) || is_float_type(ctx, rty)) {
         var fl:        value.Value    = lhs;
         var fr:        value.Value    = rhs;
@@ -2900,6 +2958,12 @@ fun lower_unary(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) res[v
     if (sel res_v.err) { ret res_v; }
     val v: value.Value = res_v.ok;
 
+    if (op == expr.UN_NEG && is_half_type(ctx, context.expr_type_of(ctx, e.data.unary.operand))) {
+        val res_h: res[half.Half, fail.Fail] = half_of(ctx);
+        if (sel res_h.err) { ret res[value.Value, fail.Fail].err{res_h.err}; }
+        var h: half.Half = res_h.ok;
+        ret half.done(?h, half.neg(?h, v));
+    }
     if (op == expr.UN_NEG)     { ret builder.emit_neg(?ctx.builder, v); }
     if (op == expr.UN_BIT_NOT) { ret builder.emit_not(?ctx.builder, v); }
     if (op == expr.UN_NOT)     { ret builder.emit_cmp_ne(?ctx.builder, v, value.const_int(1, v.ty)); }
@@ -2964,6 +3028,10 @@ fun lower_cast(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) res[va
     val from_bits:   u32  = scalar_bits(ctx, from_rule);
     val to_bits:     u32  = scalar_bits(ctx, to_rule);
 
+    if (!lanewise && ((from_float && from_bits == 16) || (to_float && to_bits == 16))) {
+        ret lower_half_cast(ctx, v, dst, from_float, from_bits, from_signed, to_float, to_bits, to_signed);
+    }
+
     if (from_float && to_float) {
         if (to_bits < from_bits) { ret builder.emit_fp_trunc(?ctx.builder, v, dst); }
         if (to_bits > from_bits) { ret builder.emit_fp_ext(?ctx.builder, v, dst); }
@@ -2984,6 +3052,21 @@ fun lower_cast(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) res[va
         ret builder.emit_zext(?ctx.builder, v, dst);
     }
     ret emit_retype(ctx, v, dst);
+}
+
+# a `::` with an f16 on either side
+fun lower_half_cast(ctx: *context.LowerContext, v: value.Value, dst: ir_type.IrTypeId, from_float: bool, from_bits: u32, from_signed: bool,
+    to_float: bool, to_bits: u32, to_signed: bool) res[value.Value, fail.Fail] {
+    if (from_float && to_float && from_bits == to_bits) { ret emit_retype(ctx, v, dst); }
+    val res_h: res[half.Half, fail.Fail] = half_of(ctx);
+    if (sel res_h.err) { ret res[value.Value, fail.Fail].err{res_h.err}; }
+    var h: half.Half = res_h.ok;
+    if (from_float && from_bits == 16) {
+        if (to_float) { ret half.done(?h, half.to_float(?h, v, to_bits)); }
+        ret half.done(?h, half.to_int(?h, v, dst, to_bits, to_signed));
+    }
+    if (from_float) { ret half.done(?h, half.from_float(?h, v, from_bits)); }
+    ret half.done(?h, half.from_int(?h, v, from_bits, from_signed));
 }
 
 # the conversions whose operand's shape is their lowering: an array in memory
@@ -3401,7 +3484,7 @@ fun materialize_const_value(ctx: *context.LowerContext, eid: id.ExprId, v: compt
     val ty_id: ir_type.IrTypeId = res_ir.ok;
 
     if (v.kind == comptime.CT_KIND_INT)   { ret res[value.Value, fail.Fail].ok{value.const_int_wide(v.data.w, ty_id)}; }
-    if (v.kind == comptime.CT_KIND_FLOAT) { ret res[value.Value, fail.Fail].ok{value.const_float(v.data.f, ty_id)}; }
+    if (v.kind == comptime.CT_KIND_FLOAT) { ret res[value.Value, fail.Fail].ok{float_constant(ctx, v.data.f, ty_id)}; }
     if (v.kind == comptime.CT_KIND_STR) {
         val opt_txt: opt[str] = intern.lookup(?ctx.s.interner, v.data.s);
         if (sel opt_txt.none) { ret res[value.Value, fail.Fail].err{fail.message("lower: comptime string lookup failed")}; }
@@ -3595,6 +3678,13 @@ fun is_signed_type(ctx: *context.LowerContext, tid: type.TypeId) bool {
     val ok: opt[type.TypeKind] = repr_kind(ctx, tid);
     if (sel ok.none) { ret false; }
     ret type.prim_desc(ok.some).signed;
+}
+
+fun is_half_type(ctx: *context.LowerContext, tid: type.TypeId) bool {
+    val ok: opt[type.TypeKind] = repr_kind(ctx, tid);
+    if (sel ok.none) { ret false; }
+    val d: type.PrimDesc = type.prim_desc(ok.some);
+    ret d.class == type.PRIM_CLASS_FLOAT && d.bits == 16;
 }
 
 fun is_float_type(ctx: *context.LowerContext, tid: type.TypeId) bool {
