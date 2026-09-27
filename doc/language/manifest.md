@@ -17,7 +17,7 @@ and `[dep.X]`. TOML itself enforces name uniqueness within a section.
 A manifest is required. A project directory without one does not build:
 
 ```
-error: no mach.toml in the project directory
+error[project.no_manifest]: no mach.toml in the project directory
 ```
 
 Nothing is inferred from the directory layout. `mach init` writes a complete
@@ -46,7 +46,7 @@ A dependency's `mach.toml` is read by the same closed schema, once, and an
 unknown or removed key in it fails the consumer's build naming the dependency:
 
 ```
-error: dep 'std': mach.toml: unknown key 'bogus' in [project]
+error[manifest.unknown_key]: dep 'std': mach.toml: unknown key 'bogus' in [project]
 ```
 
 What a consumer *uses* from a dependency's manifest is its export surface: the
@@ -158,7 +158,7 @@ compiler outside any of those ranges is refused once, with every unmet
 requirement and the chain that states it:
 
 ```
-error: this is mach 5.2.1, and the dependency closure does not accept it:
+error[mach.version_unaccepted]: this is mach 5.2.1, and the dependency closure does not accept it:
     app (mach.toml) requires mach ^5.3
     app -> gfx -> glfw requires mach >=5.4, <6
 ```
@@ -269,7 +269,7 @@ A name the selected isa does not hold is refused when the target resolves, with 
 names it does hold:
 
 ```
-error: target: `sha2` is not an extension or level of isa 'x86_64'; its extensions are:
+error[target.invalid]: target: `sha2` is not an extension or level of isa 'x86_64'; its extensions are:
 ssse3, sse41, sha, fsgsbase, popcnt, lzcnt, bmi1, sse42, cx16, avx, avx2, bmi2, fma,
 movbe, f16c, avx512f, avx512bw, avx512cd, avx512dq, avx512vl, aes, pclmul; its levels are:
 x86-64-v2, x86-64-v3, x86-64-v4
@@ -350,7 +350,7 @@ A mnemonic that needs an extension the target does not select, outside such a
 function, is refused. The refusal names the line to add:
 
 ```
-error: encode: inline-asm instruction 'sha256rnds2' needs the `sha` extension, which
+error[asm.extension]: inline-asm instruction 'sha256rnds2' needs the `sha` extension, which
 this target does not select; add `extensions = ["sha"]` to the target, or mark the
 function `#[extensions(sha)]` and call it only after detecting the extension at run time
 ```
@@ -402,7 +402,7 @@ size is refused when the manifest is read, naming the key, the target and the fo
 before anything builds:
 
 ```
-error: mach.toml: [target.lin].stack_reserve is not expressible on the `elf` object
+error[target.stack_size]: mach.toml: [target.lin].stack_reserve is not expressible on the `elf` object
 format, which carries no stack size in its image headers
 ```
 
@@ -413,7 +413,7 @@ A function whose own stack frame exceeds the reserve is refused at build time, n
 the function, its frame size and the reserve:
 
 ```
-error: frame: `main` needs a 1107824-byte stack frame, which its target's
+error[stack.reserve_exceeded]: `main` needs a 1107824-byte stack frame, which its target's
 1048576-byte stack reserve cannot hold; raise `stack_reserve` on the target, or move
 the large locals off the stack
 ```
@@ -682,7 +682,7 @@ in a declared profile, in a root and in a dependency manifest alike; only
 the key:
 
 ```
-error: mach.toml: [profile.debug] is missing required key 'vectorize'; a profile declares opt, debug, simd, vectorize and float_reassoc
+error[manifest.missing_required]: mach.toml: [profile.debug] is missing required key 'vectorize'; a profile declares opt, debug, simd, vectorize and float_reassoc
 ```
 
 ### Profile requirement and selection
@@ -691,7 +691,7 @@ A root manifest declares at least one `[profile.*]` table. A root that
 declares none does not build:
 
 ```
-error: mach.toml: no [profile.<name>] table is declared; a build needs an explicit profile declaring opt, debug, simd, vectorize and float_reassoc
+error[manifest.missing_required]: mach.toml: no [profile.<name>] table is declared; a build needs an explicit profile declaring opt, debug, simd, vectorize and float_reassoc
 ```
 
 `mach init` writes `debug` (`opt = 0`, `debug = true`, `default = true`) and
@@ -714,7 +714,7 @@ Table order carries no meaning. A manifest that declares several profiles and
 marks none is refused wherever a command must pick one:
 
 ```
-error: mach.toml: several profiles are declared and none is marked `default = true`; no profile is selected by table order: mark exactly one [profile.<name>] with `default = true` or select one with --profile
+error[selection.ambiguous]: mach.toml: several profiles are declared and none is marked `default = true`; no profile is selected by table order: mark exactly one [profile.<name>] with `default = true` or select one with --profile
 ```
 Emission of the human-readable IR and assembly side-artifacts is **not** a profile
 concern — it is controlled only by the `--emit-ir` / `--emit-asm` flags of
@@ -777,7 +777,7 @@ Every diagnostic kind has one row in one table in the compiler
 raised, and `allow`, `#[expect]` and the printed key read the same rows, so a
 key here is exactly the kind the warning carries. The list is closed: a key no
 row declares is refused, naming the warning keys there are. A key is never
-reused for a different kind.
+reused for a different kind: see [the registry](diagnostics.md#the-registry).
 
 | Key | Warns when | Decided by source |
 |---|---|---|
@@ -806,7 +806,7 @@ unknown:
 | `secret.not_oblivious` | a function performs a constant-time operation on a secret value without `#[oblivious]` |
 
 ```
-error: mach.toml: [profile.release].allow entry "secret.not_oblivious" names an error; only a warning can be silenced
+error[allow.error_key]: mach.toml: [profile.release].allow entry "secret.not_oblivious" names an error; only a warning can be silenced
 ```
 
 Like the SIMD levers, `allow` is the consumer's: a dependency's profiles are
@@ -1401,7 +1401,7 @@ When nothing fits, the error lists every requirement that took part and names
 the identity the root can settle:
 
 ```
-error: no set of releases satisfies every requirement:
+error[dep.unsatisfiable]: no set of releases satisfies every requirement:
     root requires b ^1.2
     a 1.0.0 requires b ^2.0
   the root decides by declaring the identity itself, for example:
@@ -1511,7 +1511,7 @@ stops when it reaches one, and verification (and so every build) refuses it,
 naming the chain and the offending line:
 
 ```
-error: root -> a is a release (ref = "tag/v1.1.0"), and its manifest selects
+error[dep.release_selector]: root -> a is a release (ref = "tag/v1.1.0"), and its manifest selects
 [dep.b] by ref = "branch/main"; a release may select its dependencies only by
 `version` or an exact `tag/`, so it cannot be reproduced from its tag
 ```
@@ -1571,7 +1571,7 @@ diagnostic prints both requiring chains and the exact root declaration that
 would resolve it:
 
 ```
-error: dependency conflict: project id 'b' is reached with two different selections:
+error[dep.conflict]: dependency conflict: project id 'b' is reached with two different selections:
     root -> a -> b requires git <url> @ tag/v1.0.0
     root -> c -> b requires git <url> @ tag/v2.0.0
   the root decides by declaring the identity itself, for example:
@@ -1620,9 +1620,15 @@ verify` as a command) checks, offline, that:
 A pin outside a range names the requirer chain, the range, the pinned release
 and a runnable remedy (`dependency 'vb': root -> vb requires version '^1.2' but
 the pinned release is 1.1.0; run `mach dep update <path> vb` for project
-'<root>' to re-pin it, or declare the identity at the root to override`). An
-untagged pin reads `... but the pinned commit '<commit>' carries no release
-tag`.
+'<root>' to re-pin it, or declare the identity at the root to override`). A
+pin no tag in the checkout names reads `... but no release tag in its checkout
+names the pinned commit '<commit>'`, and names `mach dep pull` beside `mach dep
+update`. A checkout that holds no tags at all, as a shallow clone (`git
+submodule update --depth 1`) does, cannot say which release its pin is, and
+the refusal says so rather than claim the pin is outside the range (`... but
+the release of the pinned commit '<commit>' cannot be read: its checkout at
+<dir> holds no tags (a shallow clone fetches none); run `mach dep pull <path>`
+for project '<root>' to fetch them`).
 
 The recorded gitlink is the pin, and two kinds of drift from it are refused,
 each naming the identity and the command that fixes it:
@@ -1668,6 +1674,11 @@ verifies:
   existing checkout)`);
 - with neither, the submodule is added at the selector, reusing a module
   directory Git retained from an earlier removal.
+
+Then, when the checkout lacks the tag its selection is read by (the tag a
+`tag/` names, or a release tag naming a `version` selection's pin), pull
+fetches its tags (`fetched the tags of std`). `update` and `outdated` fetch
+them the same way to read a pin's release, unless `--offline`.
 
 A symlink, a file, a directory that is not a checkout of its own, and a dirty
 checkout that would be registered are refused and left as they are. `mach dep
@@ -2009,7 +2020,7 @@ several declared targets select the one marked `default = true` (or an explicit
 table order carries no meaning:
 
 ```
-error: mach.toml: several targets are declared, none matches the host and none is marked `default = true`; no target is selected by table order: mark exactly one [target.<name>] with `default = true` or select one with --target
+error[selection.ambiguous]: mach.toml: several targets are declared, none matches the host and none is marked `default = true`; no target is selected by table order: mark exactly one [target.<name>] with `default = true` or select one with --target
 ```
 
 The same rule applies to `[profile.*]` and to `[artifact.*]` when a command

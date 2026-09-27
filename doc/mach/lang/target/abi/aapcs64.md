@@ -3,13 +3,13 @@
 ## val REG_X0
 
 ```mach
-pub val REG_X0: i32 = 0
+pub val REG_X0:  i32 = 0
 ```
 
 ## val REG_X1
 
 ```mach
-pub val REG_X1: i32 = 1
+pub val REG_X1:  i32 = 1
 ```
 
 ## val REG_X8

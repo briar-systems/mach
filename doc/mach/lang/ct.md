@@ -1,5 +1,16 @@
 # mach.lang.ct
 
+## rec AsmRefusal
+
+```mach
+pub rec AsmRefusal;
+```
+
+an inline-asm block the constant-time scan refuses
+
+kind: the diagnostic kind the refusal is reported as
+message: what the block does with the secret
+
 ## def CtOp
 
 ```mach

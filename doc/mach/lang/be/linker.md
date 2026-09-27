@@ -3,8 +3,8 @@
 ## fun link
 
 ```mach
-pub fun link(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
-obj_count: u32, dynlibs: *of.DynLib, dynlib_count: u32,
+pub fun link(s: *session.Session, tgt: *target.Target, inputs: *of.ObjectInput,
+input_count: u32, dynlibs: *of.DynLib, dynlib_count: u32,
 destination: str, name: *u8, mode: LinkMode, pie: bool,
 image_options: of.ImageOptions) err[fail.Fail];
 ```
@@ -29,7 +29,7 @@ image_options: of.ImageOptions) err[fail.Fail];
 ```mach
 pub fun link_mixed(s: *session.Session, tgt: *target.Target,
 images: *of.ObjectImage, image_count: u32,
-obj_paths: **u8, obj_count: u32,
+inputs: *of.ObjectInput, input_count: u32,
 dynlibs: *of.DynLib, dynlib_count: u32,
 destination: str, name: *u8, mode: LinkMode, pie: bool,
 image_options: of.ImageOptions) err[fail.Fail];

@@ -1588,7 +1588,7 @@ same store the front-end passes of the module wrote; owned by the caller
 ## fun reject
 
 ```mach
-pub fun reject(diags: *diagnostic.DiagnosticStore, loc: source.SrcLoc, text: str) fail.Fail;
+pub fun reject(diags: *diagnostic.DiagnosticStore, k: dkind.Kind, loc: source.SrcLoc, text: str) fail.Fail;
 ```
 
 a backend pass rejects the program through the shared located refusal
@@ -1605,19 +1605,19 @@ has one, else the function's declaration
 ## fun reject_instr
 
 ```mach
-pub fun reject_instr(m: *MirModule, f: *MirFunction, mi: *MirInstr, text: str) fail.Fail;
+pub fun reject_instr(m: *MirModule, k: dkind.Kind, f: *MirFunction, mi: *MirInstr, text: str) fail.Fail;
 ```
 
 ## fun reject_instr_at
 
 ```mach
-pub fun reject_instr_at(diags: *diagnostic.DiagnosticStore, f: *MirFunction, mi: *MirInstr, text: str) fail.Fail;
+pub fun reject_instr_at(diags: *diagnostic.DiagnosticStore, k: dkind.Kind, f: *MirFunction, mi: *MirInstr, text: str) fail.Fail;
 ```
 
 ## fun reject_function
 
 ```mach
-pub fun reject_function(m: *MirModule, f: *MirFunction, text: str) fail.Fail;
+pub fun reject_function(m: *MirModule, k: dkind.Kind, f: *MirFunction, text: str) fail.Fail;
 ```
 
 ## fun catalog_failure
@@ -1669,6 +1669,16 @@ pub val INITIAL_SLOT_CAP:  u32 = 8
 ```mach
 pub fun emits_instr(f: *MirFunction, mi: *MirInstr) bool;
 ```
+
+## fun runs_asm
+
+```mach
+pub fun runs_asm(mi: *MirInstr) bool;
+```
+
+whether the instruction is an inline-asm block, before or after selection:
+selection retags the opcode on some instruction sets (x64.ASM_BLOCK), and a
+selected opcode can share MIR_ASM's number, but the payload stays with it
 
 ## fun op_vreg
 

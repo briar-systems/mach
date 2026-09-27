@@ -94,7 +94,7 @@ A type that genuinely does not support the operator is refused at the
 instantiation that asked for it, naming that type:
 
 ```
-error: `Point` has no ordering: `<`, `<=`, `>` and `>=` order integers and floats
+error[operator.operand_type]: `Point` has no ordering: `<`, `<=`, `>` and `>=` order integers and floats
   --> src/main.mach:12:5
    |
 12 |     maxof[Point](p, q);

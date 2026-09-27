@@ -24,13 +24,22 @@ out: the destination
 sources: the SourceMap that locates each diagnostic
 list: the diagnostics, rendered in order; nothing is written when it is empty
 
+## fun headline_lead
+
+```mach
+pub fun headline_lead(k: dkind.Kind);
+```
+
+write the lead of an error of kind `k` to stderr, `error[<key>]: `, for a
+command that prints the rest of the message itself
+
 ## fun render_fail
 
 ```mach
 pub fun render_fail(f: *outcome.Fail) i64;
 ```
 
-print a Fail to stderr as "error: <message>" and map it to an exit code
+print a Fail to stderr as "error[<key>]: <message>" and map it to an exit code
 a reported Fail prints nothing, its diagnostics having been rendered already
 
 f: the Fail

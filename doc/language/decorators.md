@@ -186,7 +186,7 @@ test queue__drains_in_order {
 fun drained() Queue { ret filled(0); } # so may another testing declaration
 
 pub fun reset() Queue { ret filled(0); }
-# error: `filled` is a `#[testing]` declaration: only a test body or another
+# error[testing.use]: `filled` is a `#[testing]` declaration: only a test body or another
 #        `#[testing]` declaration may reference it
 ```
 
@@ -254,7 +254,7 @@ errors, and a key named twice are refused, since an error is never
 acknowledged:
 
 ```
-error: `secret.not_oblivious` names an error, and an error is never acknowledged
+error[expect.error_key]: `secret.not_oblivious` names an error, and an error is never acknowledged
 ```
 
 ### `symbol(str)` — linker name

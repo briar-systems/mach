@@ -27,7 +27,13 @@ add() { for l in "$@"; do legs="$legs $l"; done; }
 corpus() { for t in "$@"; do add "corpus:$t"; done; }
 link() { for t in "$@"; do add "link:$t"; done; }
 every_corpus() { corpus $corpus_all; }
-every_link() { link $link_all; add darwin; }
+link_legs() { link $link_all; }
+every_link() { link_legs; add darwin; }
+# every column of the corpus, executed where anything can execute it
+differential() { every_corpus; add qemu riscv32 spirv; }
+# what feeds every backend reaches every consumer of emitted code: the corpus,
+# the debug model and the link cases. darwin stays with the darwin rows and main.
+backend() { add compiler dwarf; differential; link_legs; }
 x64() { corpus x86_64-linux x86_64-windows x86_64-darwin; }
 arm64() { corpus aarch64-linux aarch64-darwin; }
 riscv() { corpus riscv64-linux riscv64zkt-linux riscv32; add qemu riscv32; }
@@ -40,35 +46,42 @@ column() {
         *) corpus "$1" ;;
     esac
 }
-everything() { add compiler qemu riscv32 spirv dwarf release; every_corpus; every_link; }
+everything() { backend; add release darwin; }
 light() { add compiler; every_corpus; }
 
 # the table: first match wins, so a narrow row sits above the wider one it
 # refines. every src/ row adds compiler, since every file there is the compiler.
+# a row names every consumer of what its paths produce: code, an ABI, an object
+# format or debug info reaches the link cases on the legs that build or run it
+# (x86_64-linux cross-builds every foreign format, riscv under qemu), and
+# anything that places code or values reaches the dwarf verify.
 select_path() {
     case "$1" in
         doc/*|*.md|LICENSE|.github/assets/*|.agents/*) ;;
         dist/*) ;;
+        # changes runs the script tests and docs the doc checks on every run
+        .github/scripts/*) ;;
 
-        src/lang/be/codegen/dwarf.mach|src/lang/be/codegen/debug_input.mach|\
-        src/lang/be/linker/debug.mach|src/lang/target/of/macho/dwarf.mach)
-            add compiler dwarf ;;
+        src/lang/be/codegen/dwarf.mach|src/lang/be/codegen/debug_input.mach|src/lang/be/linker/debug.mach)
+            add compiler dwarf; link_legs ;;
+        src/lang/target/of/macho/dwarf.mach)
+            add compiler dwarf darwin; link x86_64-linux ;;
         src/lang/target/isa/spirv/*|src/lang/target/isa/spirv.mach|\
         src/lang/target/abi/spirv.mach|src/lang/target/of/spv.mach)
-            add compiler spirv ;;
+            add compiler spirv; link x86_64-linux ;;
 
         src/lang/target/isa/x64/*|src/lang/target/isa/x64.mach)
-            add compiler; x64 ;;
+            add compiler dwarf; x64; link x86_64-linux x86_64-windows ;;
         src/lang/target/isa/arm64/*|src/lang/target/isa/arm64.mach)
-            add compiler; arm64 ;;
+            add compiler dwarf; arm64; link x86_64-linux aarch64-linux ;;
         src/lang/target/isa/riscv/*|src/lang/target/isa/riscv.mach|src/lang/target/abi/riscv.mach)
-            add compiler; riscv ;;
+            add compiler dwarf; riscv; link x86_64-linux ;;
         src/lang/target/abi/sysv.mach)
-            add compiler; corpus x86_64-linux x86_64-darwin ;;
+            add compiler dwarf; corpus x86_64-linux x86_64-darwin; link x86_64-linux ;;
         src/lang/target/abi/aapcs64.mach)
-            add compiler; arm64 ;;
+            add compiler dwarf; arm64; link x86_64-linux aarch64-linux ;;
         src/lang/target/abi/win64.mach)
-            add compiler; corpus x86_64-windows ;;
+            add compiler dwarf; corpus x86_64-windows; link x86_64-linux x86_64-windows ;;
 
         src/lang/target/os/linux.mach)
             add compiler; corpus x86_64-linux aarch64-linux riscv64-linux riscv64zkt-linux; link x86_64-linux aarch64-linux ;;
@@ -77,26 +90,40 @@ select_path() {
         src/lang/target/os/darwin.mach)
             add compiler darwin; corpus x86_64-darwin aarch64-darwin; link x86_64-linux ;;
         src/lang/target/os/freestanding.mach)
-            add compiler spirv riscv32; corpus riscv32 ;;
+            add compiler spirv riscv32; corpus riscv32; link x86_64-linux ;;
 
         src/lang/target/of/elf.mach)
-            add compiler; link x86_64-linux aarch64-linux ;;
+            add compiler dwarf; link x86_64-linux aarch64-linux ;;
         src/lang/target/of/coff/*|src/lang/target/of/coff.mach|src/lang/target/of/coff_unwind_runtime.mach|\
         src/lang/target/of/rsrc.mach)
-            add compiler; link x86_64-linux x86_64-windows ;;
+            add compiler dwarf; link x86_64-linux x86_64-windows ;;
         src/lang/target/of/macho/*|src/lang/target/of/macho.mach)
-            add compiler darwin; link x86_64-linux ;;
+            add compiler dwarf darwin; link x86_64-linux ;;
         src/lang/target/of/*|src/lang/target/of.mach|src/lang/be/linker/*|src/lang/be/linker.mach|src/lang/be/obj.mach)
-            add compiler; every_link ;;
+            add compiler dwarf; every_link ;;
 
-        src/lang/target/*|src/lang/target.mach|src/lang/be/*|src/lang/me/*)
-            add compiler; every_corpus ;;
-        src/*|mach.toml|dep/*|.gitmodules|test/fuzz/*)
+        # codegen, the target model, the IR and type layout feed every backend
+        src/lang/target/*|src/lang/target.mach|src/lang/be/*|src/lang/me/*|\
+        src/lang/layout.mach|src/lang/type.mach)
+            backend ;;
+        # constant values and the constant-time policy: what a program computes
+        src/lang/fe/comptime.mach|src/lang/wide.mach|src/lang/float.mach|src/lang/ct.mach)
+            add compiler; differential ;;
+        # the project model: dependencies, artifacts, link entries and embeds
+        src/lang/driver/*|src/lang/driver.mach|src/lang/build/*|src/lang/manifest/*|src/lang/manifest.mach|\
+        src/lang/embed.mach)
+            add compiler; link x86_64-linux ;;
+        # std is linked into every program the corpus and the link cases build
+        dep/*|.gitmodules|mach.toml)
+            backend ;;
+        src/*|test/fuzz/*)
             add compiler ;;
 
         test/cases/SKIPS.*|test/cases/NORUN.*|test/cases/ONLY.*)
             column "${1#test/cases/*.}" ;;
-        test/cases/*|test/ref/*|test/lib/*)
+        test/cases/*|test/lib/*)
+            differential; add dwarf ;;
+        test/ref/*)
             every_corpus; add qemu riscv32 ;;
         test/link/*)
             every_link ;;

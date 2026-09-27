@@ -5,16 +5,31 @@
 ```mach
 pub tag Fail: u8 {
     reported;
-    message: str;
+    message:     str;
+    user:        Keyed;
+    environment: Keyed;
 }
 ```
 
 the language layer's failure: the phase already recorded it as a diagnostic
-on the session and there is nothing further to say, or an internal failure
-whose text must be preserved. `reported` is declared first so a zero
-outcome is a failure that reports nothing new, never one that invents text.
-an allocation refusal is an internal failure; the compiler recovers from
-none of them at the site that met them
+on the session and there is nothing further to say; an internal failure
+whose text must be preserved; or a failure a pass with no diagnostic store
+of its own meets (the linker, an object reader), which is the user's (the
+input is wrong or unsupported) or the environment's (a file could not be
+read or written) and names the diagnostic kind it is reported as.
+`reported` is declared first so a zero outcome is a failure that reports
+nothing new, never one that invents text. an allocation refusal is an
+internal failure; the compiler recovers from none of them at the site that
+met them
+
+## rec Keyed
+
+```mach
+pub rec Keyed;
+```
+
+kind: the row of the diagnostic kind table the failure is reported as
+text: the message
 
 ## fun reported
 
@@ -27,6 +42,34 @@ pub fun reported() Fail;
 ```mach
 pub fun message(text: str) Fail;
 ```
+
+an internal failure: a compiler defect, reported as `compiler.internal`
+
+## fun user
+
+```mach
+pub fun user(k: dkind.Kind, text: str) Fail;
+```
+
+the input is wrong or unsupported; a kind no live row declares makes it
+the compiler defect it is
+
+## fun environment
+
+```mach
+pub fun environment(k: dkind.Kind, text: str) Fail;
+```
+
+the machine refused: a file could not be read or written
+
+## fun kind_of
+
+```mach
+pub fun kind_of(f: Fail) dkind.Kind;
+```
+
+the kind the failure is reported as, NONE for a reported one, whose
+diagnostics carry their own
 
 ## fun refused
 
@@ -69,6 +112,33 @@ pub fun fs_refused(e: fs.FsError) Fail;
 a refused filesystem operation met by the compiler: the step that refused
 names its own cause
 
+## fun fs_environment
+
+```mach
+pub fun fs_environment(k: dkind.Kind, e: fs.FsError) Fail;
+```
+
+a filesystem operation on a file the build was handed (an object, an
+archive, a library) that the machine refused: the environment's under `k`,
+save an allocation refusal, which stays internal
+
+## fun read_environment
+
+```mach
+pub fun read_environment(k: dkind.Kind, e: reader.ReadError) Fail;
+```
+
+a read of a file the build was handed that the machine refused, as
+`fs_environment`
+
+## fun write_environment
+
+```mach
+pub fun write_environment(k: dkind.Kind, e: writer.WriteError) Fail;
+```
+
+a write of a file the build produces that the machine refused
+
 ## fun format_refused
 
 ```mach
@@ -98,6 +168,14 @@ pub val REPORTED_TEXT: str = "failure was reported through diagnostics"
 
 the failure as one line of presentation text; a reported failure has no
 text of its own and is named as such, never as an empty message
+
+## fun with_text
+
+```mach
+pub fun with_text(f: Fail, text: str) Fail;
+```
+
+the same failure carrying `text` instead: the class and the kind are kept
 
 ## fun describe
 

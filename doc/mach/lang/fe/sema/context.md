@@ -277,7 +277,7 @@ pub rec SemaContext;
 ## fun report_deferred_name
 
 ```mach
-pub fun report_deferred_name(sc: *SemaContext, span: token.Span, prefix: str);
+pub fun report_deferred_name(sc: *SemaContext, k: dkind.Kind, span: token.Span, prefix: str);
 ```
 
 a name resolve left for the arm sema selects (#3485), reported once at the name itself
@@ -405,7 +405,7 @@ pub val TEMPLATE_TRAIL_LABEL: str = "in this generic body, checked against this 
 ## fun report
 
 ```mach
-pub fun report(sc: *SemaContext, span: token.Span, message: str);
+pub fun report(sc: *SemaContext, k: dkind.Kind, span: token.Span, message: str);
 ```
 
 ## fun report_internal
@@ -435,13 +435,13 @@ pub fun reported_since(sc: *SemaContext, mark: u64) bool;
 ## fun report_note
 
 ```mach
-pub fun report_note(sc: *SemaContext, span: token.Span, message: str, note: str);
+pub fun report_note(sc: *SemaContext, k: dkind.Kind, span: token.Span, message: str, note: str);
 ```
 
 ## fun report_numbered
 
 ```mach
-pub fun report_numbered(sc: *SemaContext, span: token.Span, prefix: str, n: usize, suffix: str, fallback: str);
+pub fun report_numbered(sc: *SemaContext, k: dkind.Kind, span: token.Span, prefix: str, n: usize, suffix: str, fallback: str);
 ```
 
 ## fun field_table_stage

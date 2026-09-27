@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.4.0] - 2026-09-27
+
+### Added
+- Every diagnostic mach emits has a stable dotted key from one registry, `src/lang/diagnostic/kind.mach`, which grows from 11 keys to 493. The registry is append-only: a key is never reused or renamed, and a retired key stays reserved. `doc/language/diagnostics.md` documents the registry and lists its families. The 10 warning keys and `secret.not_oblivious` from 6.3.0 keep their names and levels, so every `[profile].allow` list and `#[expect]` written for 6.3 still reads the same way (#3792, #4087).
+- `mach dep pull` fetches the tags of a checkout that lacks the one its selection reads (a `tag/` selector's tag, or a release tag at a version pin) and prints `fetched the tags of <id>` unless `--quiet`. `mach dep update` and `mach dep outdated` fetch the same way unless `--offline`, and `mach dep list` shows `release unknown` for a checkout with no tags (#4073).
+
+### Changed
+- Every compiler diagnostic prints its key: `error[<key>]: ...` for load, lex and parse, resolve, sema, comptime, lowering, codegen, inline asm and SPIR-V errors, where most printed a bare `error:` before. Message texts are unchanged. A compiler defect that still reaches the user as a diagnostic prints `error[compiler.internal]` (#3792).
+- Every build, manifest, dependency, test-runner and CLI failure prints its key the same way, from the `manifest`, `toml`, `allow`, `selection`, `need`, `template`, `version`, `project`, `artifact`, `output`, `path`, `glob`, `step`, `link`, `dep`, `mach`, `git`, `test`, `cli`, `editor`, `fs`, `process`, `env` and `catalog` families. The hand-printed errors of `mach run`, `dep`, `clean`, `init`, `doc`, `test` and of an unknown command or flag carry their key with the rest of their text unchanged (#3792).
+- Failures that reported a compiler defect as the user's or the machine's fault now exit 2 (they exited 1 or 3), with their text unchanged: the `internal: ... not interned` failures and `target os/isa/abi name not interned`, the string, format and allocator refusals in configuration, planning, request, `fmt`, `clean`, `dep`, artifact, step and output handling, `unknown frontend analysis phase`, `cli schema: unreachable command spec`, `build step reached an invalid terminal state`, and the three `selected target ... unavailable` failures (#3792).
+- Linker and object-reader failures print a key by class and exit by it. A user problem exits 1 (it exited 2): `link.undefined_symbol`, `link.duplicate_symbol`, `link.relocation_overflow`, `link.relocation_unsupported`, `link.size_limit`, `link.section_unsupported`, `link.entry_missing`, `link.no_loader`, `link.import_conflict` and the rest of the `link` family, a malformed, unsupported or mismatched input object (`object.malformed`, `object.unsupported`, `object.format_mismatch`) and a bad PE icon or metadata input (`resource.*`). An unreadable archive member file (`fs.read`) and an output write refused while writing an image (`fs.*`) exit 3 (they exited 2). A relocation kind the linker cannot handle is the user's when inline asm or an input object asked for it and `compiler.internal` when codegen made it. Defects stay `compiler.internal` and exit 2 (#4087).
+- A version pin whose checkout holds no tags, as `git submodule update --depth 1` leaves, is refused with `the release of the pinned commit '<c>' cannot be read: its checkout at <dir> holds no tags` and names `mach dep pull`. It no longer claims the pin is outside the range. A checkout with tags but none naming the pin names `mach dep pull` beside `mach dep update` (#4073).
+- `mach fmt` carries column alignment across `#[...]` decorator lines, so a `#[testing]` member no longer splits an aligned run. Source that was canonical under 6.3 can now fail `fmt --check` (#4057).
+- A leaf function that still needs a frame addresses it from the stack pointer and sets no frame pointer on x86_64, aarch64 and riscv64, with or without `-g`. Unwind info and DWARF stay exact, and the compiler's own self-build runs 0.73% fewer instructions (#3348, #4094).
+- CI selects every consumer of a changed producer, so a codegen, ISA, ABI, IR or object-format change also runs the link and dwarf legs, and a change under `.github/scripts` runs no heavy legs (#4084, #4095).
+
+### Fixed
+- An x86-64 instruction staged through r10 or r11 no longer clobbers an operand held in that register. Every staging goes through a chooser that avoids the instruction's live operands (#4050).
+- On x86-64, a function containing an `addss` no longer loses its fixed stack pointer or is treated as containing inline asm, and a function that does contain inline asm keeps its asm-bound slots nearest the stack pointer and releases its asm payload (#4049).
+- A realigned x86-64 frame saves its callee-saved registers before realigning, so its Windows unwind info records every save from the right base and `RtlVirtualUnwind` restores them (#4024).
+- The algebraic, dce, scalarize, constfold and cse passes report a change only when they changed the IR (#3995).
+- The artifact-keying test runs through the object cache it claims to test (#4063).
+- A release page's `## Issues resolved` list counts an issue closed by a pull request or commit only when that closer is in the range, so an older comment naming an in-range pull request no longer adds it (#4029).
+
 ## [6.3.0] - 2026-09-26
 
 ### Added
