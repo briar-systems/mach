@@ -36,6 +36,12 @@ pub fun init_section_groups(g: *SectionGroups);
 pub fun free_section_groups(alloc: *A.Allocator, g: *SectionGroups);
 ```
 
+## fun section_group_index
+
+```mach
+pub fun section_group_index(g: *SectionGroups, slot: u32, name: intern.StrId, flags: u32) u32;
+```
+
 ## fun section_group_add
 
 ```mach
