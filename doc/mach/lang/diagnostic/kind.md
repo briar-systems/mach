@@ -1,5 +1,18 @@
 # mach.lang.diagnostic.kind
 
+the diagnostic code registry
+
+one closed table, and the only place a kind is declared. every diagnostic
+names its row when it is raised, and each row carries a dotted key named by
+the subject it concerns: the key is the diagnostic's stable code, which the
+renderer prints and a profile's `allow` and a declaration's `#[expect]`
+select by. a key's leading components name a family, so `vector` selects
+every key under `vector.`. the table is append-only: a row is never removed
+or reordered and its key never changes meaning, and a retired kind keeps its
+row so its key is never reused. only a warning row can be silenced or
+expected; a selection naming an error row is refused rather than read as
+unknown
+
 ## def Kind
 
 ```mach

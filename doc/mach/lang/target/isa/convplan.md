@@ -1,5 +1,12 @@
 # mach.lang.target.isa.convplan
 
+a packed vector conversion is a short sequence of steps over three places: the operand, the work
+register the result forms in, and a temporary. every target encoder builds its sequence here first,
+and the one property that decides where the work register is comes from the sequence itself: a step
+that reads the operand after the work register was first written would read a clobbered value if
+the work register were the operand's own register. without such a step the destination is the work
+register, whatever it aliases; with one, an aliasing destination falls back to a scratch register
+
 ## def Place
 
 ```mach

@@ -1,5 +1,15 @@
 # mach.lang.target.extension
 
+the extension vocabulary of an instruction set
+
+each isa module declares one table of named bits, and that table is the
+authority for every surface that spells an extension: the manifest's
+`[target.X].extensions`, `$mach.build.extensions.<name>`, `#[extensions(...)]` and the
+inline-asm refusals. a name is an identifier, so it can be a comptime member
+and a field of a runtime feature record. a bit is the isa's own: the same
+bit means different things on different instruction sets, and only a name
+crosses between them
+
 ## rec Extension
 
 ```mach

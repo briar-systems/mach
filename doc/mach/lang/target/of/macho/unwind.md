@@ -1,5 +1,10 @@
 # mach.lang.target.of.macho.unwind
 
+mach-o unwind: `__TEXT,__unwind_info` holds one compact encoding per
+function, and a frame compact unwind cannot say points into `__TEXT,__eh_frame`
+instead. both are sized from the frame records' steps before layout and
+filled once every function has its address
+
 ## fun macho_unwind_shape
 
 ```mach

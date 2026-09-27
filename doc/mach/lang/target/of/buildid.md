@@ -1,5 +1,13 @@
 # mach.lang.target.of.buildid
 
+the build id: a content identity every linked image carries, written by the
+format writer after layout and read back by a running compiler from its own
+mapped headers. it is the compiler-identity component of the object cache
+key: a sha-256 over the bytes the loader maps with the note payload as zero,
+so byte-identical images carry identical ids and nothing outside the image
+bytes enters it. the byte layouts live here so the writers and the run-time
+reader share one definition.
+
 ## val DIGEST_LEN
 
 ```mach

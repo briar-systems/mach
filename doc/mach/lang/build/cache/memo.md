@@ -1,5 +1,16 @@
 # mach.lang.build.cache.memo
 
+the per-file digest memo: what a source file's bytes digest to, remembered
+under the path, size, modification time and identity the file had when it
+was hashed, so an unchanged file costs a stat and not a hash. the memo lives
+at `<out>/.cache/digests` and belongs to one compiler identity, whose
+parser decides the surface digests; a memo written by another compiler, or
+one that is missing, truncated or damaged, reads as empty. the layout is
+`"MDM2"`, the 32-byte compiler digest, the entry count, the entries, then
+the sha-256 of everything before it. an entry is its path (length then
+bytes), its size, modification seconds and nanoseconds, its 41-byte
+identity, then its five digests, every number little endian
+
 ## rec Digests
 
 ```mach

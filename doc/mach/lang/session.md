@@ -1,5 +1,37 @@
 # mach.lang.session
 
+## fwd module.ModuleId
+
+```mach
+fwd module.ModuleId
+```
+
+forwards [`mach.lang.module.ModuleId`](module.md#def-moduleid)
+
+## fwd module.MODULE_NIL
+
+```mach
+fwd module.MODULE_NIL
+```
+
+forwards [`mach.lang.module.MODULE_NIL`](module.md#val-module_nil)
+
+## fwd module.StableModuleId
+
+```mach
+fwd module.StableModuleId
+```
+
+forwards [`mach.lang.module.StableModuleId`](module.md#def-stablemoduleid)
+
+## fwd module.STABLE_MODULE_NIL
+
+```mach
+fwd module.STABLE_MODULE_NIL
+```
+
+forwards [`mach.lang.module.STABLE_MODULE_NIL`](module.md#val-stable_module_nil)
+
 ## rec Overlay
 
 ```mach

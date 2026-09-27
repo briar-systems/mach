@@ -1,5 +1,12 @@
 # mach.lang.wide
 
+128-bit integer carrier over two u64 limbs
+
+the compiler cannot yet spell u128 in its own source, so this module is the
+exact arithmetic behind 128-bit literals, comptime evaluation, constant
+folding and IR constants. every operation is total: wrapping where the name
+says so, flagged where the caller must know, never undefined.
+
 ## rec Wide
 
 ```mach

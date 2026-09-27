@@ -1,5 +1,17 @@
 # mach.lang.driver.cache
 
+the persistent object cache. every module the build emits is keyed once per
+load, after the load walk and before anything is resolved: its key covers
+the build configuration and compiler identity, the module's own source and
+embedded files, and the surface of every module it imports, transitively.
+an import's surface is its source without the bodies no importer compiles
+(see driver/surface), so an edit inside such a body keys only its own
+module. a release build inlines bodies across modules, so there an import's
+whole source is its surface. a module whose `obj/` object carries its key
+is reused, and when nothing the build still compiles imports it, it is not
+resolved, typed or lowered at all. source digests come from the per-file
+digest memo in the cell's `.cache` directory (build/cache/memo)
+
 ## fun configuration
 
 ```mach
