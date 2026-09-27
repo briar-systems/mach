@@ -32,6 +32,21 @@ fun main(argc: i64, argv: **u8) i64 {
 }
 ```
 
+**`f16` arithmetic.** `+ - * /` on `f16` give the correctly rounded binary16
+result, to nearest with ties to even, on every target: in the target's own
+half-precision instructions where it has them (aarch64 `fp16`, riscv `zfh`), and
+otherwise by widening both operands exactly, computing once in binary32 (x86-64
+with F16C) or binary64, and narrowing once. That is proven, not assumed: the
+exhaustive proof `test/run.sh --f16proof` (#3804) checks every pair of `f16`
+operands for each operator, and every input of the `f16` conversions, against a
+reference computed in integers. On x86-64 with and without `x86-64-v3`, aarch64
+with and without `fp16`, and riscv64 with and without `zfh` (under qemu-user), every result is
+bit-identical to it, NaNs by the target's rule, and so is the same operation
+widened to binary32 by hand and narrowed once. binary32 is enough for all four
+operators, and none needs binary64 for its rounding. aarch64 without `fp16` still
+computes in binary64, but only so that it picks the same NaN as a native half
+instruction, since the conversion to binary32 quiets a signaling operand.
+
 **Widening multiply.** A multiply whose operands are both conversions from
 one narrower integer type to a type exactly twice as wide is the full
 product of the narrow operands, and compiles to the target's widening
