@@ -1437,7 +1437,10 @@ the tags already present in the realized checkouts, and they say so
 needs a candidate it doesn't have fails, naming the identity. Realizing a
 checkout fetches nothing either. A missing checkout is initialized from the
 submodule store Git kept for it, and a pin that no local checkout or store
-holds fails, naming the dependency and the commit.
+holds fails, naming the dependency and the commit. A dependency added over a
+retained checkout or store is checked out at its selector as held there, and
+one with neither is not cloned. A selector nothing local holds fails, naming
+the dependency and the selector.
 
 **`--lowest`.** `mach dep update <path> --all --lowest` picks the lowest
 release every range accepts. A library's CI runs it in a scratch checkout and
