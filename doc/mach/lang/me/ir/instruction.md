@@ -390,6 +390,18 @@ operand a vector of the result's lane type (#3589). type legalization joins a
 vector wider than the register back from its register-width pieces with it,
 and gathers the parts of a narrowing conversion over those pieces
 
+## val OP_SELECT
+
+```mach
+pub val OP_SELECT: InstrKind = 59
+```
+
+operand 1 when operand 0 is nonzero, else operand 2: the branch-free choice
+if-conversion flattens a small diamond into (#3346). operand 0 is an i8
+condition, both choices and the result share one scalar integer or pointer
+type, and every target lowers it without a branch, so a secret condition
+stays constant-time
+
 ## val INSTR_FLAG_NSW
 
 ```mach
