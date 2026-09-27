@@ -144,6 +144,13 @@ The `aarch64fp16-linux` column is aarch64-linux with `fp16` selected, and the
 half-precision instructions where the base column runs the expansion. Each
 serves the f16 cases only, which its `cases/ONLY.<target>` states.
 
+A case with no C reference is an exact pair: `cases/EXACT.<target>` names the
+case, then the column it is held to, then the reason, and the case's checksum on
+the target must equal that column's at O0 and O2. The case is served only where
+such a line names it. `float/f16_bits` is one: which NaN an f16 operation makes
+is the target's, so its bits, NaNs included, are held on each native column to
+the base column that runs the expansion on the same target.
+
 ## Doc blocks
 
 `--docs` reads every `.md` page of `doc/language` (or of `DOCS`, when set) and

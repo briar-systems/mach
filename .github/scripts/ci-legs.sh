@@ -119,7 +119,7 @@ select_path() {
         src/*|test/fuzz/*)
             add compiler ;;
 
-        test/cases/SKIPS.*|test/cases/NORUN.*|test/cases/ONLY.*)
+        test/cases/SKIPS.*|test/cases/NORUN.*|test/cases/ONLY.*|test/cases/EXACT.*)
             column "${1#test/cases/*.}" ;;
         test/cases/*|test/lib/*)
             differential; add dwarf ;;
