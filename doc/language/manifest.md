@@ -275,7 +275,7 @@ comptime member, `$mach.build.extensions.<name>` (see [`$mach`](comptime-mach.md
 |-------|----------|------------|
 | `x86_64` | SSE2 | `ssse3`, `sse41`, `sse42`, `sha`, `fsgsbase`, `popcnt`, `lzcnt`, `bmi1`, `bmi2`, `cx16`, `avx`, `avx2`, `fma`, `movbe`, `f16c`, `avx512f`, `avx512bw`, `avx512cd`, `avx512dq`, `avx512vl`, `aes`, `pclmul` |
 | `aarch64` | AdvSIMD | `sha2`, `sb`, `aes`, `pmull` |
-| `riscv64`, `riscv32` | the isa string's selection | `i`, `m`, `a`, `f`, `d`, `c`, `zicsr`, `zifencei`, `zkt` |
+| `riscv64`, `riscv32` | the isa string's selection | `i`, `m`, `a`, `f`, `d`, `c`, `zicond`, `zicsr`, `zifencei`, `zkt` |
 | `spirv` | | none |
 
 A name the selected isa does not hold is refused when the target resolves, with the
@@ -349,8 +349,8 @@ selection mach never emits, and `f` and `d` select the float register file and t
 calling convention's float registers, and `zkt` is a promise about the machine's
 execution timing that the constant-time rows read, so none of them may be named in
 [`#[extensions(...)]`](decorators.md#extensionsnames--an-outlier-function); the
-refusal says why. Every x86_64 and aarch64 row, and riscv `m`, `a`, `zicsr` and
-`zifencei`, may be.
+refusal says why. Every x86_64 and aarch64 row, and riscv `m`, `a`, `zicond`,
+`zicsr` and `zifencei`, may be.
 
 Selecting an extension is a promise about **every** machine the binary runs on. The
 inline assembler admits the extension's mnemonics anywhere in the build, and a host
@@ -466,13 +466,16 @@ emits a finished GPU module rather than machine code (see
 `riscv64` and `riscv32` are width-only spellings, and each names a **default
 profile**: `riscv64` is `rv64gc` and `riscv32` is `rv32imac`. A canonical
 extension string such as `rv32imc` or `rv64imafd` selects a smaller machine.
-The retained vocabulary is I, M, A, F, D, C, Zicsr, Zifencei and Zkt, written in
-lowercase canonical order with multi-letter names after an underscore; `g`
-expands to IMAFD plus Zicsr and Zifencei. F carries its required Zicsr, and D
-requires F. Zkt changes no instruction. It states that the listed operations run
-in data-independent time, which is what lets a secret multiply compile (see
-`secrecy.md`). An optional version must be the one mach models: I 2.1, M 2.0,
-A 2.1, F and D 2.2, C 2.0, Zicsr and Zifencei 2.0, Zkt 1.0. Unknown extensions,
+The retained vocabulary is I, M, A, F, D, C, Zicond, Zicsr, Zifencei and Zkt,
+written in lowercase canonical order with multi-letter names after an
+underscore, so `rv64gc_zicond`; `g` expands to IMAFD plus Zicsr and Zifencei.
+F carries its required Zicsr, and D requires F. Zicond adds `czero.eqz` and
+`czero.nez`, which a branch-free select compiles to where a selection holds it
+and the xor-and-mask sequence it replaces does otherwise. Zkt changes no
+instruction. It states that the listed operations run in data-independent time,
+which is what lets a secret multiply compile (see `secrecy.md`). An optional
+version must be the one mach models: I 2.1, M 2.0, A 2.1, F and D 2.2, C 2.0,
+Zicond 1.0, Zicsr and Zifencei 2.0, Zkt 1.0. Unknown extensions,
 other versions, duplicates, noncanonical order and the E base are refused
 rather than rounded up to the default machine.
 
