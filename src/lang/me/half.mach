@@ -7,13 +7,17 @@
 # arithmetic widens both operands exactly to binary64, computes there and
 # narrows once. binary64 carries more than twice binary16's precision plus two
 # bits, so that one rounding is the correctly rounded binary16 result, the rule
-# comptime folds by. a conversion goes through binary64 the same way, and a
-# comparison compares the widened values. widening and narrowing are integer
-# code on the halves of the binary64 encoding: sign, exponent and significand
-# extraction, round to nearest even, subnormals, overflow to infinity, and a NaN
-# made by the target's NaN rule, as float.narrow_bits and float.widen_bits
-# define them, so the expansion converts as the target's own half instructions
-# would. every step is branch-free, a select being a mask
+# comptime folds by. a target whose rows convert f16 to and from binary32
+# computes in binary32 instead, which carries exactly that much (#3801). an
+# arithmetic operand widens with a NaN kept as it is, signaling or quiet, so
+# the binary64 unit picks and quiets the NaN as the target's half unit would.
+# a conversion goes through binary64 the same way, and a comparison compares
+# the widened values. widening and narrowing are integer code on the halves of
+# the binary64 encoding: sign, exponent and significand extraction, round to
+# nearest even, subnormals, overflow to infinity, and a converted NaN made by
+# the target's NaN rule, as float.narrow_bits and float.widen_bits define them,
+# so the expansion converts as the target's own half instructions would. every
+# step is branch-free, a select being a mask
 
 use mach.lang.fail;
 use mach.lang.float;
@@ -180,11 +184,24 @@ fun pick(h: *Half, c: value.Value, a: value.Value, b: value.Value) value.Value {
     ret bxor(h, b, band(h, bxor(h, a, b), mask));
 }
 
-# the carried bits `x` widened exactly to binary64
+# the carried bits `x` widened exactly to binary64, a NaN as the target's
+# rule converts it
 pub fun widen(h: *Half, x: value.Value) value.Value {
     if (native(h, isa.VEC_OP_FP_EXT, true, 64, 16)) {
         ret take(h, builder.emit_fp_ext(h.b, bitcast(h, x, f16_type(h)), h.f64t));
     }
+    ret widen_bits(h, x, false);
+}
+
+# `x` widened to binary64 as an operand of + - * /: a NaN keeps its sign, its
+# payload and whether it signals, so the target's binary64 unit applies its own
+# NaN selection, as a native half instruction does (#3801)
+fun widen_operand(h: *Half, x: value.Value) value.Value {
+    ret widen_bits(h, x, true);
+}
+
+# the integer widening: `exact` keeps a NaN as it is, otherwise it follows the rule
+fun widen_bits(h: *Half, x: value.Value, exact: bool) value.Value {
     val w:    value.Value = zext(h, x, h.i32t);
     val sign: value.Value = shl(h, band(h, w, k32(h, 0x8000)), k32(h, 16));
     val e:    value.Value = band(h, shr(h, w, k32(h, 10)), k32(h, 0x1F));
@@ -196,7 +213,8 @@ pub fun widen(h: *Half, x: value.Value) value.Value {
     val norm: value.Value = bor(h, bor(h, sign, shl(h, add(h, e, k32(h, 1008)), k32(h, 20))), mhi);
     val inf:  value.Value = bor(h, sign, k32(h, 0x7FF00000));
     var spec: value.Value = pick(h, eq(h, m, k32(h, 0)), inf, k32(h, 0x7FF80000));
-    if (h.nan == float.NAN_PRESERVE) {
+    if (exact) { spec = bor(h, inf, mhi); }
+    or (h.nan == float.NAN_PRESERVE) {
         spec = bor(h, bor(h, inf, mhi), shl(h, zext(h, ne(h, m, k32(h, 0)), h.i32t), k32(h, 19)));
     }
     # a subnormal or zero is m * 2^-24, exact in binary64, and its low word is zero
@@ -269,6 +287,22 @@ fun emit_arith(h: *Half, k: instruction.InstrKind, a: value.Value, b: value.Valu
     ret take(h, builder.emit_div_u(h.b, a, b));
 }
 
+# the target converts between f16 and binary32 both ways with its own
+# instructions. binary32 carries 24 bits, twice binary16's 11 plus two, so one
+# operation there on two widened operands and one rounding back is the
+# correctly rounded binary16 result for + - * / (the 2p+2 bound). the
+# conversion quiets a signaling operand, so the path is taken only where that
+# leaves the NaN result as the exact operands give it: the units return the
+# first NaN whatever signals, or every NaN is the canonical one
+fun through_f32(h: *Half) bool {
+    if (!h.model.nan_first_operand && h.nan != float.NAN_CANONICAL) { ret false; }
+    ret converts_f32(h);
+}
+
+fun converts_f32(h: *Half) bool {
+    ret native(h, isa.VEC_OP_FP_EXT, true, 32, 16) && native(h, isa.VEC_OP_FP_TRUNC, true, 16, 32);
+}
+
 # `a k b` on carried bits, k one of OP_ADD, OP_SUB, OP_MUL and OP_DIV_U, the
 # float division
 pub fun arith(h: *Half, k: instruction.InstrKind, a: value.Value, b: value.Value) value.Value {
@@ -276,13 +310,17 @@ pub fun arith(h: *Half, k: instruction.InstrKind, a: value.Value, b: value.Value
         val ft: ir_type.IrTypeId = f16_type(h);
         ret bitcast(h, emit_arith(h, k, bitcast(h, a, ft), bitcast(h, b, ft)), h.bits_t);
     }
-    ret narrow(h, emit_arith(h, k, widen(h, a), widen(h, b)));
+    if (through_f32(h)) { ret from_float(h, emit_arith(h, k, to_float(h, a, 32), to_float(h, b, 32)), 32); }
+    ret narrow(h, emit_arith(h, k, widen_operand(h, a), widen_operand(h, b)));
 }
 
 # the operand a comparison of carried bits reads: the f16 itself where the
-# target compares at 16 bits, else the exact binary64 widening
+# target compares at 16 bits, the exact binary32 widening where it converts
+# there (a comparison makes no NaN, so quieting one changes nothing), else the
+# exact binary64 widening
 pub fun compare_operand(h: *Half, x: value.Value) value.Value {
     if (native(h, isa.VEC_OP_CMP, true, 16, 16)) { ret bitcast(h, x, f16_type(h)); }
+    if (converts_f32(h))                         { ret to_float(h, x, 32); }
     ret widen(h, x);
 }
 

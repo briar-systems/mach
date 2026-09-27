@@ -39,10 +39,20 @@ pub val EXT_PMULL: u64 = 0x8
 FEAT_PMULL, the 64x64 carry-less pmull and pmull2. the architecture reports
 it as a higher value of the one ID_AA64ISAR0_EL1.AES field, so it brings aes
 
+## val EXT_FP16
+
+```mach
+pub val EXT_FP16: u64 = 0x10
+```
+
+FEAT_FP16, half-precision arithmetic, comparison and integer conversion on
+the h registers (Armv8.2 optional). converting between half and single or
+double precision is the base FP and needs no extension
+
 ## val EXTENSION_COUNT
 
 ```mach
-pub val EXTENSION_COUNT: u32 = 4
+pub val EXTENSION_COUNT: u32 = 5
 ```
 
 ## val EXTENSIONS

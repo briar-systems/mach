@@ -274,9 +274,9 @@ comptime member, `$mach.build.extensions.<name>` (see [`$mach`](comptime-mach.md
 | `isa` | Baseline | Extensions |
 |-------|----------|------------|
 | `x86_64` | SSE2 | `ssse3`, `sse41`, `sse42`, `sha`, `fsgsbase`, `popcnt`, `lzcnt`, `bmi1`, `bmi2`, `cx16`, `avx`, `avx2`, `fma`, `movbe`, `f16c`, `avx512f`, `avx512bw`, `avx512cd`, `avx512dq`, `avx512vl`, `aes`, `pclmul` |
-| `aarch64` | AdvSIMD | `sha2`, `sb`, `aes`, `pmull` |
-| `riscv64`, `riscv32` | the isa string's selection | `i`, `m`, `a`, `f`, `d`, `c`, `zicond`, `zicsr`, `zifencei`, `zkt` |
-| `spirv` | | none |
+| `aarch64` | AdvSIMD | `sha2`, `sb`, `aes`, `pmull`, `fp16` |
+| `riscv64`, `riscv32` | the isa string's selection | `i`, `m`, `a`, `f`, `d`, `c`, `zicond`, `zicsr`, `zifencei`, `zfhmin`, `zfh`, `zkt` |
+| `spirv` | | `float16`, which `env` selects |
 
 A name the selected isa does not hold is refused when the target resolves, with the
 names it does hold:
@@ -296,7 +296,7 @@ selection is closed over that once, when the target resolves. `sse41` brings `ss
 (the chain stops there; SSE3 is not modelled), `sse42` brings `sse41`, `avx` brings
 `sse42`, `avx2`, `fma` and `f16c` bring `avx`, and every `avx512*` set brings
 `avx512f`, which brings `avx2`. On aarch64 `pmull` brings `aes`. On riscv `d` brings
-`f` and `f` brings `zicsr`, as the isa string's own grammar has it, so `extensions = ["d"]` on `rv64i` selects
+`f`, `zfh` brings `zfhmin`, `zfhmin` brings `f`, and `f` brings `zicsr`, as the isa string's own grammar has it, so `extensions = ["d"]` on `rv64i` selects
 `rv64ifd` with Zicsr. The isa string and the list feed one set: `isa = "rv64i"` with
 `extensions = ["m"]` selects the same machine as `isa = "rv64im"`. A name nothing in
 the compiler encodes against yet (`avx`, `avx512f`) is still a declared requirement:
@@ -349,8 +349,9 @@ selection mach never emits, and `f` and `d` select the float register file and t
 calling convention's float registers, and `zkt` is a promise about the machine's
 execution timing that the constant-time rows read, so none of them may be named in
 [`#[extensions(...)]`](decorators.md#extensionsnames--an-outlier-function); the
-refusal says why. Every x86_64 and aarch64 row, and riscv `m`, `a`, `zicond`,
-`zicsr` and `zifencei`, may be.
+refusal says why. So is spirv `float16`, the Float16 capability the target's `env`
+guarantees for the whole module. Every x86_64 and aarch64 row, and riscv `m`, `a`,
+`zicond`, `zicsr`, `zifencei`, `zfhmin` and `zfh`, may be.
 
 Selecting an extension is a promise about **every** machine the binary runs on. The
 inline assembler admits the extension's mnemonics anywhere in the build, and a host
@@ -596,6 +597,12 @@ The environment fixes the SPIR-V version word and the capability ceiling:
 the compiler derives the minimal capability set a module needs and refuses a
 module that needs more than the ceiling, naming the capability and the
 environment. Without `env` a module is written as SPIR-V 1.6 with no ceiling.
+
+The environment also selects the `float16` extension where its ceiling holds
+Float16, and a module without `env` has it too. Under it an `f16` is the native
+`OpTypeFloat 16`, computed and converted by the core float instructions, and a stage
+input or output of `f16` is declared as that type. Without it, under `vulkan1.0`
+and `vulkan1.1`, an `f16` is the software expansion on its 16 bits.
 
 | `env` | SPIR-V | capabilities within the ceiling |
 |---|---|---|

@@ -13,11 +13,13 @@
 # test/ref/<group>/<case>.c. spirv is built and validated with spirv-val. a case
 # named in test/cases/SKIPS.<target> is not built for that target; one named in
 # its NORUN.<target> is built and its differential disagreement is not a failure.
+# a case with no C reference is held instead to the column its EXACT.<target>
+# line names, and is served only where such a line names it.
 #
 #   --target <t>   one target (repeatable); default every target
 #   --case <g/n>   one case (repeatable)
-#   --qemu         execute aarch64-linux, riscv64-linux, riscv64zkt-linux and riscv32 under
-#                  qemu-user when this host cannot run them natively
+#   --qemu         execute aarch64-linux, aarch64fp16-linux, riscv64-linux, riscv64zkt-linux,
+#                  riscv64zfh-linux and riscv32 under qemu-user when this host cannot run them natively
 #                  (a missing emulator is announced and its target is only built)
 #   --link         run the link cases (test/link/cases) instead of the corpus
 #   --dwarf        build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
@@ -49,8 +51,10 @@ targets_all='
 x86_64-linux      x86_64      linux         sysv64   -    bin     hosted  -             -
 x86_64v3-linux    x86_64      linux         sysv64   -    bin     hosted  -             x86-64-v3
 aarch64-linux     aarch64     linux         aapcs64  -    bin     hosted  qemu-aarch64  -
+aarch64fp16-linux aarch64     linux         aapcs64  -    bin     hosted  qemu-aarch64  fp16
 riscv64-linux     riscv64     linux         lp64d    -    bin     hosted  qemu-riscv64  -
 riscv64zkt-linux  rv64gc_zkt  linux         lp64d    -    bin     hosted  qemu-riscv64  -
+riscv64zfh-linux  rv64gc_zfh  linux         lp64d    -    bin     hosted  qemu-riscv64  -
 x86_64-windows    x86_64      windows       win64    -    bin     hosted  -             -
 x86_64-darwin     x86_64      darwin        sysv64   -    bin     hosted  -             -
 aarch64-darwin    aarch64     darwin        aapcs64  -    bin     hosted  -             -
@@ -199,7 +203,19 @@ listed() {
 # SKIPS and NORUN are claims about a case and are checked, not trusted: a skipped
 # case that builds and a norun case whose differential agrees are stale lines, and
 # the run fails on them. ONLY is a decision about the column, not a claim, so it is not.
-served()  { [ ! -f "$here/cases/ONLY.$1" ] || listed ONLY "$1" "$2"; }
+# exact_base <target> <case>: the column an EXACT.<target> line holds the case to
+exact_base() {
+    [ -f "$here/cases/EXACT.$1" ] || return 1
+    while read -r pat base rest; do
+        case "$pat" in ''|\#*) continue ;; esac
+        case "$2" in $pat) echo "$base"; return 0 ;; esac
+    done <"$here/cases/EXACT.$1"
+    return 1
+}
+served() {
+    [ -f "$here/ref/$2.c" ] || exact_base "$1" "$2" >/dev/null || return 1
+    [ ! -f "$here/cases/ONLY.$1" ] || listed ONLY "$1" "$2"
+}
 skipped() { listed SKIPS "$1" "$2"; }
 norun()   { listed NORUN "$1" "$2"; }
 
@@ -329,9 +345,15 @@ build() {
 # 0 when both agree, otherwise 1 with the disagreement in why
 differential() {
     t=$1; c=$2; eng=$3
-    ref=$(reference "$c" 2>"$out/log/ref.$(art "$c").err") || {
-        why="reference: $(cat "$out/log/ref.$(art "$c").err")"; return 1
-    }
+    if xb=$(exact_base "$t" "$c"); then
+        ref=$(exact_reference "$xb" "$c" 2>"$out/log/exact.$t.$(art "$c").err") || {
+            why="$xb reference: $(cat "$out/log/exact.$t.$(art "$c").err")"; return 1
+        }
+    else
+        ref=$(reference "$c" 2>"$out/log/ref.$(art "$c").err") || {
+            why="reference: $(cat "$out/log/ref.$(art "$c").err")"; return 1
+        }
+    fi
     # a hosted o2 build above is already the run bin, a direct one is not
     for p in o0 o2; do
         if { [ "$p" = o0 ] || runs_bare "$t"; } && ! build "$t" "$p" "$c" run; then
@@ -352,9 +374,28 @@ differential() {
         fi
         if [ "$rc" -ne 0 ]; then why="$p: exit $rc"; return 1; fi
         if [ -s "$out/log/$t.$p.$(art "$c").err" ]; then why="$p: wrote to stderr"; return 1; fi
-        if [ "$got" != "$ref" ]; then why="$p: mach says $got, C reference says $ref"; return 1; fi
+        if [ "$got" != "$ref" ]; then why="$p: mach says $got, the reference says $ref"; return 1; fi
     done
     return 0
+}
+
+# exact_reference <base> <case>: the base column's own answer, which its O0 and
+# O2 builds must agree on; the base runs under its own engine on this host. it
+# runs in a substitution, so a refusal is its stderr
+exact_reference() {
+    xt=$1; xc=$2; xeng=$(engine "$xt")
+    [ "$xeng" != - ] || { echo "this host cannot run $xt" >&2; return 1; }
+    xans=
+    for xp in o0 o2; do
+        build "$xt" "$xp" "$xc" run || { echo "build $xp: $(first_error "$(log_of "$xt" "$xp" "$xc" run)")" >&2; return 1; }
+        xo=$out/log/$xt.$xp.$(art "$xc").out
+        timeout 60 $xeng "$(artifact "$xt" "$xp" "$xc" run)" >"$xo" 2>/dev/null; xrc=$?
+        [ "$xrc" -eq 0 ] || { echo "$xp: exit $xrc" >&2; return 1; }
+        xv=$(tr -d '\0' <"$xo")
+        [ -z "$xans" ] || [ "$xv" = "$xans" ] || { echo "its O0 and O2 disagree ($xans vs $xv)" >&2; return 1; }
+        xans=$xv
+    done
+    echo "$xans"
 }
 
 # log_of <target> <profile> <case> [run]
