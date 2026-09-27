@@ -1874,41 +1874,55 @@ fun encode_cvt(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
     ret 0;
 }
 
+# a memory source beside a memory destination is staged through a scratch
+# register where the row admits one r/m operand: a shift's count and a swap's
+# second operand are never staged
+fun staged_source(mi: *isa.Inst) bool {
+    if (mi.src1.kind != isa.OPK_MEM || mi.dst.kind != isa.OPK_MEM) { ret false; }
+    val desc: x64.OpDesc = x64.describe(mi.opcode);
+    if ((desc.mem & x64.MEM_OPERAND) == 0) { ret false; }
+    ret desc.form != x64.FORM_SHIFT && desc.shape != x64.SHAPE_SWAP;
+}
+
+# the load staging a source into the scratch the instruction then reads, none
+# when no scratch is free
+fun staging_load(mi: *isa.Inst) opt[isa.Inst] {
+    var scratch: i32 = float_scratch0();
+    if (mi.size != 16) {
+        scratch = pick_stage_scratch(?mi.dst, ?mi.src1);
+        if (scratch < 0) { ret opt[isa.Inst].none{}; }
+    }
+    var ld: isa.Inst = isa.inst_blank();
+    ld.opcode = x64.MOV;
+    ld.dst    = isa.make_reg(scratch, mi.size);
+    ld.src1   = mi.src1;
+    ld.size   = mi.size;
+    ld.flags  = mi.flags;
+    ret opt[isa.Inst].some{ld};
+}
+
 fun encode_inst(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
     if (mi == nil || buf == nil) { ret 0; }
     val opcode: u16 = mi.opcode;
 
     if (opcode == isa.ISA_PCOPY || opcode == isa.ISA_PCOPY_FENCE) { ret 0; }
 
-    # a memory source beside a memory destination is staged through a
-    # scratch register where the row admits one r/m operand: a shift's
-    # count and a swap's second operand are never staged
-    val desc: x64.OpDesc = x64.describe(opcode);
-    if (mi.src1.kind == isa.OPK_MEM && mi.dst.kind == isa.OPK_MEM &&
-        (desc.mem & x64.MEM_OPERAND) != 0 &&
-        desc.form != x64.FORM_SHIFT && desc.shape != x64.SHAPE_SWAP) {
-        var scratch: i32 = float_scratch0();
-        if (mi.size != 16) {
-            scratch = pick_stage_scratch(?mi.dst, ?mi.src1);
-            if (scratch < 0) { ret 0; }
-        }
-        var ld: isa.Inst = isa.inst_blank();
-        ld.opcode = x64.MOV;
-        ld.dst    = isa.make_reg(scratch, mi.size);
-        ld.src1   = mi.src1;
-        ld.size   = mi.size;
-        ld.flags  = mi.flags;
-        val ld_sz: i32 = encode_inst(?ld, buf);
+    if (staged_source(mi)) {
+        val staged: opt[isa.Inst] = staging_load(mi);
+        if (!sel staged.some) { ret 0; }
+        var ld:    isa.Inst = staged.some;
+        val ld_sz: i32      = encode_inst(?ld, buf);
         if (ld_sz <= 0) { ret 0; }
-        mi.src1 = isa.make_reg(scratch, mi.size);
+        mi.src1 = ld.dst;
         val rest: i32 = encode_inst(mi, buf);
         if (rest <= 0) { ret 0; }
         ret ld_sz + rest;
     }
 
-    val start: usize = buf.len;
-    val seg:   u8    = inst_segment_prefix(mi);
-    var lead:  i32   = 0;
+    val desc:  x64.OpDesc = x64.describe(opcode);
+    val start: usize      = buf.len;
+    val seg:   u8         = inst_segment_prefix(mi);
+    var lead:  i32        = 0;
     if (seg != 0) {
         # an address operand is never accessed, so an override on it relocates nothing
         if ((desc.mem & x64.MEM_ADDR) != 0) { ret 0; }
@@ -2925,6 +2939,19 @@ fun encode_selected(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32, mi:
     var sym_addend:   i64          = 0;
     enc.classify_refs(mi, ?target_block, ?has_block, ?sym, ?has_sym, ?sym_addend);
 
+    # a symbol source staged ahead of a memory destination carries its patch
+    # site in the staging load, so that load is placed as its own instruction
+    if (has_sym && is_rip_mem(?inst.src1) && staged_source(?inst)) {
+        val staged: opt[isa.Inst] = staging_load(?inst);
+        if (sel staged.some) {
+            var ld:     isa.Inst       = staged.some;
+            val placed: err[fail.Fail] = place_sym_inst(st, f, mi, ?ld, sym, sym_addend);
+            if (sel placed.err) { ret placed; }
+            inst.src1 = ld.dst;
+            has_sym   = false;
+        }
+    }
+
     val inst_start: usize = st.buf.len;
     val inst_size:  i32   = encode_inst(?inst, ?st.buf);
     if (inst_size <= 0) {
@@ -2946,27 +2973,38 @@ fun encode_selected(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32, mi:
     }
 
     if (has_sym) {
-        if (sym == intern.STR_NIL) {
-            ret err[fail.Fail].err{fail.message("encode: symbol-referencing instruction has no resolved symbol name")};
-        }
-        val reloc_off: i32 = x86_reloc_offset(nil, ?inst, inst_size);
-        if (reloc_off < 0) {
-            ret err[fail.Fail].err{fail.message("encode: symbol-referencing instruction has no relocation patch site")};
-        }
-        val patch_pos: u32          = (inst_start + reloc_off::usize)::u32;
-        var kind:      of.RelocKind = of.RK_PC32;
-        var addend:    i64          = sym_addend - (inst_size - reloc_off)::i64;
-        if (inst.opcode == x64.MOVABS::u16) {
-            kind   = of.RK_ABS64;
-            addend = sym_addend;
-        }
-        val r_2445: err[fail.Fail] = enc.push_inst_reloc(st, patch_pos, kind, sym, addend,
-            (inst_size - reloc_off)::u8);
-        if (sel r_2445.err) { ret err[fail.Fail].err{r_2445.err}; }
-        ret err[fail.Fail].ok{};
+        ret sym_reloc(st, ?inst, inst_start, inst_size, sym, sym_addend);
     }
 
     ret err[fail.Fail].ok{};
+}
+
+# one machine instruction naming a symbol, encoded with its relocation
+fun place_sym_inst(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr, inst: *isa.Inst,
+    sym: intern.StrId, sym_addend: i64) err[fail.Fail] {
+    val inst_start: usize = st.buf.len;
+    val inst_size:  i32   = encode_inst(inst, ?st.buf);
+    if (inst_size <= 0) { ret enc.opcode_failure(st, f, "x64", mi.opcode); }
+    ret sym_reloc(st, inst, inst_start, inst_size, sym, sym_addend);
+}
+
+fun sym_reloc(st: *enc.EncodeState, inst: *isa.Inst, inst_start: usize, inst_size: i32,
+    sym: intern.StrId, sym_addend: i64) err[fail.Fail] {
+    if (sym == intern.STR_NIL) {
+        ret err[fail.Fail].err{fail.message("encode: symbol-referencing instruction has no resolved symbol name")};
+    }
+    val reloc_off: i32 = x86_reloc_offset(nil, inst, inst_size);
+    if (reloc_off < 0) {
+        ret err[fail.Fail].err{fail.message("encode: symbol-referencing instruction has no relocation patch site")};
+    }
+    val patch_pos: u32          = (inst_start + reloc_off::usize)::u32;
+    var kind:      of.RelocKind = of.RK_PC32;
+    var addend:    i64          = sym_addend - (inst_size - reloc_off)::i64;
+    if (inst.opcode == x64.MOVABS::u16) {
+        kind   = of.RK_ABS64;
+        addend = sym_addend;
+    }
+    ret enc.push_inst_reloc(st, patch_pos, kind, sym, addend, (inst_size - reloc_off)::u8);
 }
 
 fun is_got_addr(mi: *mir.MirInstr) bool {
