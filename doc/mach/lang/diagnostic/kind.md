@@ -1886,982 +1886,976 @@ pub val DEP_ID_MISMATCH:                  Kind = 308
 pub val DEP_INDEX_CONFLICT:               Kind = 309
 ```
 
-## val DEP_INJECTED_FAILURE
-
-```mach
-pub val DEP_INJECTED_FAILURE:             Kind = 310
-```
-
 ## val DEP_INVALID_PATH
 
 ```mach
-pub val DEP_INVALID_PATH:                 Kind = 311
+pub val DEP_INVALID_PATH:                 Kind = 310
 ```
 
 ## val DEP_LIMIT
 
 ```mach
-pub val DEP_LIMIT:                        Kind = 312
+pub val DEP_LIMIT:                        Kind = 311
 ```
 
 ## val DEP_MANUAL_EDIT
 
 ```mach
-pub val DEP_MANUAL_EDIT:                  Kind = 313
+pub val DEP_MANUAL_EDIT:                  Kind = 312
 ```
 
 ## val DEP_NESTED
 
 ```mach
-pub val DEP_NESTED:                       Kind = 314
+pub val DEP_NESTED:                       Kind = 313
 ```
 
 ## val DEP_NO_PROJECT_ID
 
 ```mach
-pub val DEP_NO_PROJECT_ID:                Kind = 315
+pub val DEP_NO_PROJECT_ID:                Kind = 314
 ```
 
 ## val DEP_NO_RELEASE
 
 ```mach
-pub val DEP_NO_RELEASE:                   Kind = 316
+pub val DEP_NO_RELEASE:                   Kind = 315
 ```
 
 ## val DEP_NO_REPOSITORY
 
 ```mach
-pub val DEP_NO_REPOSITORY:                Kind = 317
+pub val DEP_NO_REPOSITORY:                Kind = 316
 ```
 
 ## val DEP_NO_SOURCE
 
 ```mach
-pub val DEP_NO_SOURCE:                    Kind = 318
+pub val DEP_NO_SOURCE:                    Kind = 317
 ```
 
 ## val DEP_NOT_DECLARED
 
 ```mach
-pub val DEP_NOT_DECLARED:                 Kind = 319
+pub val DEP_NOT_DECLARED:                 Kind = 318
 ```
 
 ## val DEP_NOT_DIRECTORY
 
 ```mach
-pub val DEP_NOT_DIRECTORY:                Kind = 320
+pub val DEP_NOT_DIRECTORY:                Kind = 319
 ```
 
 ## val DEP_NOT_GITLINK
 
 ```mach
-pub val DEP_NOT_GITLINK:                  Kind = 321
+pub val DEP_NOT_GITLINK:                  Kind = 320
 ```
 
 ## val DEP_NOT_IN_CLOSURE
 
 ```mach
-pub val DEP_NOT_IN_CLOSURE:               Kind = 322
+pub val DEP_NOT_IN_CLOSURE:               Kind = 321
 ```
 
 ## val DEP_NOT_REPOSITORY_ROOT
 
 ```mach
-pub val DEP_NOT_REPOSITORY_ROOT:          Kind = 323
+pub val DEP_NOT_REPOSITORY_ROOT:          Kind = 322
 ```
 
 ## val DEP_OFFLINE
 
 ```mach
-pub val DEP_OFFLINE:                      Kind = 324
+pub val DEP_OFFLINE:                      Kind = 323
 ```
 
 ## val DEP_PATH_EMPTY
 
 ```mach
-pub val DEP_PATH_EMPTY:                   Kind = 325
+pub val DEP_PATH_EMPTY:                   Kind = 324
 ```
 
 ## val DEP_PATH_ESCAPE
 
 ```mach
-pub val DEP_PATH_ESCAPE:                  Kind = 326
+pub val DEP_PATH_ESCAPE:                  Kind = 325
 ```
 
 ## val DEP_PATH_SAME
 
 ```mach
-pub val DEP_PATH_SAME:                    Kind = 327
+pub val DEP_PATH_SAME:                    Kind = 326
 ```
 
 ## val DEP_REF_INVALID
 
 ```mach
-pub val DEP_REF_INVALID:                  Kind = 328
+pub val DEP_REF_INVALID:                  Kind = 327
 ```
 
 ## val DEP_REF_MISMATCH
 
 ```mach
-pub val DEP_REF_MISMATCH:                 Kind = 329
+pub val DEP_REF_MISMATCH:                 Kind = 328
 ```
 
 ## val DEP_RELEASE_EXCLUDED
 
 ```mach
-pub val DEP_RELEASE_EXCLUDED:             Kind = 330
+pub val DEP_RELEASE_EXCLUDED:             Kind = 329
 ```
 
 ## val DEP_RELEASE_SELECTOR
 
 ```mach
-pub val DEP_RELEASE_SELECTOR:             Kind = 331
+pub val DEP_RELEASE_SELECTOR:             Kind = 330
 ```
 
 ## val DEP_REPOSITORY_METADATA
 
 ```mach
-pub val DEP_REPOSITORY_METADATA:          Kind = 332
+pub val DEP_REPOSITORY_METADATA:          Kind = 331
 ```
 
 ## val DEP_SHADOWS_PROJECT
 
 ```mach
-pub val DEP_SHADOWS_PROJECT:              Kind = 333
+pub val DEP_SHADOWS_PROJECT:              Kind = 332
 ```
 
 ## val DEP_SLOT_OCCUPIED
 
 ```mach
-pub val DEP_SLOT_OCCUPIED:                Kind = 334
+pub val DEP_SLOT_OCCUPIED:                Kind = 333
 ```
 
 ## val DEP_SOURCE_COUNT
 
 ```mach
-pub val DEP_SOURCE_COUNT:                 Kind = 335
+pub val DEP_SOURCE_COUNT:                 Kind = 334
 ```
 
 ## val DEP_STILL_REQUIRED
 
 ```mach
-pub val DEP_STILL_REQUIRED:               Kind = 336
+pub val DEP_STILL_REQUIRED:               Kind = 335
 ```
 
 ## val DEP_SYMLINK
 
 ```mach
-pub val DEP_SYMLINK:                      Kind = 337
+pub val DEP_SYMLINK:                      Kind = 336
 ```
 
 ## val DEP_TREE_MISMATCH
 
 ```mach
-pub val DEP_TREE_MISMATCH:                Kind = 338
+pub val DEP_TREE_MISMATCH:                Kind = 337
 ```
 
 ## val DEP_UNPINNED
 
 ```mach
-pub val DEP_UNPINNED:                     Kind = 339
+pub val DEP_UNPINNED:                     Kind = 338
 ```
 
 ## val DEP_UNREALIZED
 
 ```mach
-pub val DEP_UNREALIZED:                   Kind = 340
+pub val DEP_UNREALIZED:                   Kind = 339
 ```
 
 ## val DEP_UNREPRODUCIBLE
 
 ```mach
-pub val DEP_UNREPRODUCIBLE:               Kind = 341
+pub val DEP_UNREPRODUCIBLE:               Kind = 340
 ```
 
 ## val DEP_UNSATISFIABLE
 
 ```mach
-pub val DEP_UNSATISFIABLE:                Kind = 342
+pub val DEP_UNSATISFIABLE:                Kind = 341
 ```
 
 ## val DEP_UNSTAGED
 
 ```mach
-pub val DEP_UNSTAGED:                     Kind = 343
+pub val DEP_UNSTAGED:                     Kind = 342
 ```
 
 ## val DEP_VERSION_UNMET
 
 ```mach
-pub val DEP_VERSION_UNMET:                Kind = 344
+pub val DEP_VERSION_UNMET:                Kind = 343
 ```
 
 ## val EDITOR_NO_BUFFER
 
 ```mach
-pub val EDITOR_NO_BUFFER:                 Kind = 345
+pub val EDITOR_NO_BUFFER:                 Kind = 344
 ```
 
 ## val EDITOR_TARGET_SELECTION
 
 ```mach
-pub val EDITOR_TARGET_SELECTION:          Kind = 346
+pub val EDITOR_TARGET_SELECTION:          Kind = 345
 ```
 
 ## val ENV_NAME_COMPARE
 
 ```mach
-pub val ENV_NAME_COMPARE:                 Kind = 347
+pub val ENV_NAME_COMPARE:                 Kind = 346
 ```
 
 ## val ENV_READ
 
 ```mach
-pub val ENV_READ:                         Kind = 348
+pub val ENV_READ:                         Kind = 347
 ```
 
 ## val EXTENSION_INVALID_NAME
 
 ```mach
-pub val EXTENSION_INVALID_NAME:           Kind = 349
+pub val EXTENSION_INVALID_NAME:           Kind = 348
 ```
 
 ## val EXTENSION_TOO_MANY
 
 ```mach
-pub val EXTENSION_TOO_MANY:               Kind = 350
+pub val EXTENSION_TOO_MANY:               Kind = 349
 ```
 
 ## val FS_CLOSE
 
 ```mach
-pub val FS_CLOSE:                         Kind = 351
+pub val FS_CLOSE:                         Kind = 350
 ```
 
 ## val FS_CREATE
 
 ```mach
-pub val FS_CREATE:                        Kind = 352
+pub val FS_CREATE:                        Kind = 351
 ```
 
 ## val FS_CURRENT_DIR
 
 ```mach
-pub val FS_CURRENT_DIR:                   Kind = 353
+pub val FS_CURRENT_DIR:                   Kind = 352
 ```
 
 ## val FS_IO
 
 ```mach
-pub val FS_IO:                            Kind = 354
+pub val FS_IO:                            Kind = 353
 ```
 
 ## val FS_OPEN
 
 ```mach
-pub val FS_OPEN:                          Kind = 355
+pub val FS_OPEN:                          Kind = 354
 ```
 
 ## val FS_READ
 
 ```mach
-pub val FS_READ:                          Kind = 356
+pub val FS_READ:                          Kind = 355
 ```
 
 ## val FS_REMOVE
 
 ```mach
-pub val FS_REMOVE:                        Kind = 357
+pub val FS_REMOVE:                        Kind = 356
 ```
 
 ## val FS_STAT
 
 ```mach
-pub val FS_STAT:                          Kind = 358
+pub val FS_STAT:                          Kind = 357
 ```
 
 ## val FS_TEMP
 
 ```mach
-pub val FS_TEMP:                          Kind = 359
+pub val FS_TEMP:                          Kind = 358
 ```
 
 ## val FS_WRITE
 
 ```mach
-pub val FS_WRITE:                         Kind = 360
+pub val FS_WRITE:                         Kind = 359
 ```
 
 ## val GIT_COMMAND
 
 ```mach
-pub val GIT_COMMAND:                      Kind = 361
+pub val GIT_COMMAND:                      Kind = 360
 ```
 
 ## val GIT_MISSING
 
 ```mach
-pub val GIT_MISSING:                      Kind = 362
+pub val GIT_MISSING:                      Kind = 361
 ```
 
 ## val GIT_OUTPUT_MALFORMED
 
 ```mach
-pub val GIT_OUTPUT_MALFORMED:             Kind = 363
+pub val GIT_OUTPUT_MALFORMED:             Kind = 362
 ```
 
 ## val GLOB_INACCESSIBLE
 
 ```mach
-pub val GLOB_INACCESSIBLE:                Kind = 364
+pub val GLOB_INACCESSIBLE:                Kind = 363
 ```
 
 ## val GLOB_NO_MATCH
 
 ```mach
-pub val GLOB_NO_MATCH:                    Kind = 365
+pub val GLOB_NO_MATCH:                    Kind = 364
 ```
 
 ## val GLOB_SHAPE
 
 ```mach
-pub val GLOB_SHAPE:                       Kind = 366
+pub val GLOB_SHAPE:                       Kind = 365
 ```
 
 ## val GLOB_SPECIAL_ENTRY
 
 ```mach
-pub val GLOB_SPECIAL_ENTRY:               Kind = 367
+pub val GLOB_SPECIAL_ENTRY:               Kind = 366
 ```
 
 ## val GLOB_SYMLINK
 
 ```mach
-pub val GLOB_SYMLINK:                     Kind = 368
+pub val GLOB_SYMLINK:                     Kind = 367
 ```
 
 ## val LINK_IMPORT_LIBRARY
 
 ```mach
-pub val LINK_IMPORT_LIBRARY:              Kind = 369
+pub val LINK_IMPORT_LIBRARY:              Kind = 368
 ```
 
 ## val LINK_INPUT_FORMAT
 
 ```mach
-pub val LINK_INPUT_FORMAT:                Kind = 370
+pub val LINK_INPUT_FORMAT:                Kind = 369
 ```
 
 ## val LINK_INPUT_INVALID
 
 ```mach
-pub val LINK_INPUT_INVALID:               Kind = 371
+pub val LINK_INPUT_INVALID:               Kind = 370
 ```
 
 ## val LINK_INPUT_NOT_FOUND
 
 ```mach
-pub val LINK_INPUT_NOT_FOUND:             Kind = 372
+pub val LINK_INPUT_NOT_FOUND:             Kind = 371
 ```
 
 ## val LINK_INPUT_UNREADABLE
 
 ```mach
-pub val LINK_INPUT_UNREADABLE:            Kind = 373
+pub val LINK_INPUT_UNREADABLE:            Kind = 372
 ```
 
 ## val LINK_LOADER_NAME_CONFLICT
 
 ```mach
-pub val LINK_LOADER_NAME_CONFLICT:        Kind = 374
+pub val LINK_LOADER_NAME_CONFLICT:        Kind = 373
 ```
 
 ## val LINK_LOCAL_MISSING
 
 ```mach
-pub val LINK_LOCAL_MISSING:               Kind = 375
+pub val LINK_LOCAL_MISSING:               Kind = 374
 ```
 
 ## val LINK_RPATH_MISMATCH
 
 ```mach
-pub val LINK_RPATH_MISMATCH:              Kind = 376
+pub val LINK_RPATH_MISMATCH:              Kind = 375
 ```
 
 ## val LINK_RPATH_UNRESOLVED
 
 ```mach
-pub val LINK_RPATH_UNRESOLVED:            Kind = 377
+pub val LINK_RPATH_UNRESOLVED:            Kind = 376
 ```
 
 ## val LINK_STATIC_CLAIMS_SYMBOLS
 
 ```mach
-pub val LINK_STATIC_CLAIMS_SYMBOLS:       Kind = 378
+pub val LINK_STATIC_CLAIMS_SYMBOLS:       Kind = 377
 ```
 
 ## val LINK_SYMBOL_CLAIM_CONFLICT
 
 ```mach
-pub val LINK_SYMBOL_CLAIM_CONFLICT:       Kind = 379
+pub val LINK_SYMBOL_CLAIM_CONFLICT:       Kind = 378
 ```
 
 ## val LINK_UNKNOWN_TABLE
 
 ```mach
-pub val LINK_UNKNOWN_TABLE:               Kind = 380
+pub val LINK_UNKNOWN_TABLE:               Kind = 379
 ```
 
 ## val MACH_RANGE_MISSING
 
 ```mach
-pub val MACH_RANGE_MISSING:               Kind = 381
+pub val MACH_RANGE_MISSING:               Kind = 380
 ```
 
 ## val MACH_VERSION_UNACCEPTED
 
 ```mach
-pub val MACH_VERSION_UNACCEPTED:          Kind = 382
+pub val MACH_VERSION_UNACCEPTED:          Kind = 381
 ```
 
 ## val MANIFEST_CHANGED
 
 ```mach
-pub val MANIFEST_CHANGED:                 Kind = 383
+pub val MANIFEST_CHANGED:                 Kind = 382
 ```
 
 ## val MANIFEST_DUPLICATE_ENTRY
 
 ```mach
-pub val MANIFEST_DUPLICATE_ENTRY:         Kind = 384
+pub val MANIFEST_DUPLICATE_ENTRY:         Kind = 383
 ```
 
 ## val MANIFEST_INVALID_NAME
 
 ```mach
-pub val MANIFEST_INVALID_NAME:            Kind = 385
+pub val MANIFEST_INVALID_NAME:            Kind = 384
 ```
 
 ## val MANIFEST_INVALID_VALUE
 
 ```mach
-pub val MANIFEST_INVALID_VALUE:           Kind = 386
+pub val MANIFEST_INVALID_VALUE:           Kind = 385
 ```
 
 ## val MANIFEST_KEY_CONFLICT
 
 ```mach
-pub val MANIFEST_KEY_CONFLICT:            Kind = 387
+pub val MANIFEST_KEY_CONFLICT:            Kind = 386
 ```
 
 ## val MANIFEST_MISSING_REQUIRED
 
 ```mach
-pub val MANIFEST_MISSING_REQUIRED:        Kind = 388
+pub val MANIFEST_MISSING_REQUIRED:        Kind = 387
 ```
 
 ## val MANIFEST_NUL_BYTE
 
 ```mach
-pub val MANIFEST_NUL_BYTE:                Kind = 389
+pub val MANIFEST_NUL_BYTE:                Kind = 388
 ```
 
 ## val MANIFEST_PATH
 
 ```mach
-pub val MANIFEST_PATH:                    Kind = 390
+pub val MANIFEST_PATH:                    Kind = 389
 ```
 
 ## val MANIFEST_REMOVED_KEY
 
 ```mach
-pub val MANIFEST_REMOVED_KEY:             Kind = 391
+pub val MANIFEST_REMOVED_KEY:             Kind = 390
 ```
 
 ## val MANIFEST_TOO_MANY_ENTRIES
 
 ```mach
-pub val MANIFEST_TOO_MANY_ENTRIES:        Kind = 392
+pub val MANIFEST_TOO_MANY_ENTRIES:        Kind = 391
 ```
 
 ## val MANIFEST_UNKNOWN_KEY
 
 ```mach
-pub val MANIFEST_UNKNOWN_KEY:             Kind = 393
+pub val MANIFEST_UNKNOWN_KEY:             Kind = 392
 ```
 
 ## val MANIFEST_UNREADABLE
 
 ```mach
-pub val MANIFEST_UNREADABLE:              Kind = 394
+pub val MANIFEST_UNREADABLE:              Kind = 393
 ```
 
 ## val MANIFEST_VALUE_TYPE
 
 ```mach
-pub val MANIFEST_VALUE_TYPE:              Kind = 395
+pub val MANIFEST_VALUE_TYPE:              Kind = 394
 ```
 
 ## val NEED_CYCLE
 
 ```mach
-pub val NEED_CYCLE:                       Kind = 396
+pub val NEED_CYCLE:                       Kind = 395
 ```
 
 ## val NEED_FORM
 
 ```mach
-pub val NEED_FORM:                        Kind = 397
+pub val NEED_FORM:                        Kind = 396
 ```
 
 ## val NEED_NO_MATCH
 
 ```mach
-pub val NEED_NO_MATCH:                    Kind = 398
+pub val NEED_NO_MATCH:                    Kind = 397
 ```
 
 ## val NEED_SELF
 
 ```mach
-pub val NEED_SELF:                        Kind = 399
+pub val NEED_SELF:                        Kind = 398
 ```
 
 ## val OUTPUT_AMBIGUOUS
 
 ```mach
-pub val OUTPUT_AMBIGUOUS:                 Kind = 400
+pub val OUTPUT_AMBIGUOUS:                 Kind = 399
 ```
 
 ## val OUTPUT_COLLISION
 
 ```mach
-pub val OUTPUT_COLLISION:                 Kind = 401
+pub val OUTPUT_COLLISION:                 Kind = 400
 ```
 
 ## val OUTPUT_PATH_INVALID
 
 ```mach
-pub val OUTPUT_PATH_INVALID:              Kind = 402
+pub val OUTPUT_PATH_INVALID:              Kind = 401
 ```
 
 ## val OUTPUT_WRITE
 
 ```mach
-pub val OUTPUT_WRITE:                     Kind = 403
+pub val OUTPUT_WRITE:                     Kind = 402
 ```
 
 ## val PATH_CREATE
 
 ```mach
-pub val PATH_CREATE:                      Kind = 404
+pub val PATH_CREATE:                      Kind = 403
 ```
 
 ## val PATH_ENTRY_TYPE
 
 ```mach
-pub val PATH_ENTRY_TYPE:                  Kind = 405
+pub val PATH_ENTRY_TYPE:                  Kind = 404
 ```
 
 ## val PATH_INACCESSIBLE
 
 ```mach
-pub val PATH_INACCESSIBLE:                Kind = 406
+pub val PATH_INACCESSIBLE:                Kind = 405
 ```
 
 ## val PATH_NOT_CANONICAL
 
 ```mach
-pub val PATH_NOT_CANONICAL:               Kind = 407
+pub val PATH_NOT_CANONICAL:               Kind = 406
 ```
 
 ## val PATH_SYMLINK
 
 ```mach
-pub val PATH_SYMLINK:                     Kind = 408
+pub val PATH_SYMLINK:                     Kind = 407
 ```
 
 ## val PROCESS_NAME_EMPTY
 
 ```mach
-pub val PROCESS_NAME_EMPTY:               Kind = 409
+pub val PROCESS_NAME_EMPTY:               Kind = 408
 ```
 
 ## val PROCESS_NO_STATUS
 
 ```mach
-pub val PROCESS_NO_STATUS:                Kind = 410
+pub val PROCESS_NO_STATUS:                Kind = 409
 ```
 
 ## val PROCESS_NOT_EXECUTABLE
 
 ```mach
-pub val PROCESS_NOT_EXECUTABLE:           Kind = 411
+pub val PROCESS_NOT_EXECUTABLE:           Kind = 410
 ```
 
 ## val PROCESS_NOT_FOUND
 
 ```mach
-pub val PROCESS_NOT_FOUND:                Kind = 412
+pub val PROCESS_NOT_FOUND:                Kind = 411
 ```
 
 ## val PROCESS_PATH_ENV
 
 ```mach
-pub val PROCESS_PATH_ENV:                 Kind = 413
+pub val PROCESS_PATH_ENV:                 Kind = 412
 ```
 
 ## val PROCESS_SPAWN
 
 ```mach
-pub val PROCESS_SPAWN:                    Kind = 414
+pub val PROCESS_SPAWN:                    Kind = 413
 ```
 
 ## val PROCESS_TIMEOUT
 
 ```mach
-pub val PROCESS_TIMEOUT:                  Kind = 415
+pub val PROCESS_TIMEOUT:                  Kind = 414
 ```
 
 ## val PROCESS_WAIT
 
 ```mach
-pub val PROCESS_WAIT:                     Kind = 416
+pub val PROCESS_WAIT:                     Kind = 415
 ```
 
 ## val PROJECT_EMPTY
 
 ```mach
-pub val PROJECT_EMPTY:                    Kind = 417
+pub val PROJECT_EMPTY:                    Kind = 416
 ```
 
 ## val PROJECT_FILE_EXISTS
 
 ```mach
-pub val PROJECT_FILE_EXISTS:              Kind = 418
+pub val PROJECT_FILE_EXISTS:              Kind = 417
 ```
 
 ## val PROJECT_FILE_KIND
 
 ```mach
-pub val PROJECT_FILE_KIND:                Kind = 419
+pub val PROJECT_FILE_KIND:                Kind = 418
 ```
 
 ## val PROJECT_INVALID_ID
 
 ```mach
-pub val PROJECT_INVALID_ID:               Kind = 420
+pub val PROJECT_INVALID_ID:               Kind = 419
 ```
 
 ## val PROJECT_MANIFEST_NAME
 
 ```mach
-pub val PROJECT_MANIFEST_NAME:            Kind = 421
+pub val PROJECT_MANIFEST_NAME:            Kind = 420
 ```
 
 ## val PROJECT_NO_MANIFEST
 
 ```mach
-pub val PROJECT_NO_MANIFEST:              Kind = 422
+pub val PROJECT_NO_MANIFEST:              Kind = 421
 ```
 
 ## val PROJECT_PATH_INVALID
 
 ```mach
-pub val PROJECT_PATH_INVALID:             Kind = 423
+pub val PROJECT_PATH_INVALID:             Kind = 422
 ```
 
 ## val SELECTION_AMBIGUOUS
 
 ```mach
-pub val SELECTION_AMBIGUOUS:              Kind = 424
+pub val SELECTION_AMBIGUOUS:              Kind = 423
 ```
 
 ## val SELECTION_DUPLICATE_DEFAULT
 
 ```mach
-pub val SELECTION_DUPLICATE_DEFAULT:      Kind = 425
+pub val SELECTION_DUPLICATE_DEFAULT:      Kind = 424
 ```
 
 ## val SELECTION_UNKNOWN
 
 ```mach
-pub val SELECTION_UNKNOWN:                Kind = 426
+pub val SELECTION_UNKNOWN:                Kind = 425
 ```
 
 ## val SELECTION_UNSUPPORTED_TARGET
 
 ```mach
-pub val SELECTION_UNSUPPORTED_TARGET:     Kind = 427
+pub val SELECTION_UNSUPPORTED_TARGET:     Kind = 426
 ```
 
 ## val SOURCE_DEPENDENCY_TREE
 
 ```mach
-pub val SOURCE_DEPENDENCY_TREE:           Kind = 428
+pub val SOURCE_DEPENDENCY_TREE:           Kind = 427
 ```
 
 ## val SOURCE_LOAD
 
 ```mach
-pub val SOURCE_LOAD:                      Kind = 429
+pub val SOURCE_LOAD:                      Kind = 428
 ```
 
 ## val SOURCE_NESTING_DEPTH
 
 ```mach
-pub val SOURCE_NESTING_DEPTH:             Kind = 430
+pub val SOURCE_NESTING_DEPTH:             Kind = 429
 ```
 
 ## val SOURCE_NOT_REGULAR
 
 ```mach
-pub val SOURCE_NOT_REGULAR:               Kind = 431
+pub val SOURCE_NOT_REGULAR:               Kind = 430
 ```
 
 ## val SOURCE_NUL_BYTE
 
 ```mach
-pub val SOURCE_NUL_BYTE:                  Kind = 432
+pub val SOURCE_NUL_BYTE:                  Kind = 431
 ```
 
 ## val STEP_ARGV_EMPTY
 
 ```mach
-pub val STEP_ARGV_EMPTY:                  Kind = 433
+pub val STEP_ARGV_EMPTY:                  Kind = 432
 ```
 
 ## val STEP_CACHE_RECORD
 
 ```mach
-pub val STEP_CACHE_RECORD:                Kind = 434
+pub val STEP_CACHE_RECORD:                Kind = 433
 ```
 
 ## val STEP_ENVIRONMENT
 
 ```mach
-pub val STEP_ENVIRONMENT:                 Kind = 435
+pub val STEP_ENVIRONMENT:                 Kind = 434
 ```
 
 ## val STEP_EXECUTABLE_NOT_FOUND
 
 ```mach
-pub val STEP_EXECUTABLE_NOT_FOUND:        Kind = 436
+pub val STEP_EXECUTABLE_NOT_FOUND:        Kind = 435
 ```
 
 ## val STEP_EXIT
 
 ```mach
-pub val STEP_EXIT:                        Kind = 437
+pub val STEP_EXIT:                        Kind = 436
 ```
 
 ## val STEP_OUTPUT_COLLISION
 
 ```mach
-pub val STEP_OUTPUT_COLLISION:            Kind = 438
+pub val STEP_OUTPUT_COLLISION:            Kind = 437
 ```
 
 ## val STEP_OUTPUT_DUPLICATE
 
 ```mach
-pub val STEP_OUTPUT_DUPLICATE:            Kind = 439
+pub val STEP_OUTPUT_DUPLICATE:            Kind = 438
 ```
 
 ## val STEP_OUTPUT_MISSING
 
 ```mach
-pub val STEP_OUTPUT_MISSING:              Kind = 440
+pub val STEP_OUTPUT_MISSING:              Kind = 439
 ```
 
 ## val STEP_OUTPUT_RESERVED
 
 ```mach
-pub val STEP_OUTPUT_RESERVED:             Kind = 441
+pub val STEP_OUTPUT_RESERVED:             Kind = 440
 ```
 
 ## val STEP_OUTPUT_UNDECLARED
 
 ```mach
-pub val STEP_OUTPUT_UNDECLARED:           Kind = 442
+pub val STEP_OUTPUT_UNDECLARED:           Kind = 441
 ```
 
 ## val STEP_OUTPUT_UNVERIFIABLE
 
 ```mach
-pub val STEP_OUTPUT_UNVERIFIABLE:         Kind = 443
+pub val STEP_OUTPUT_UNVERIFIABLE:         Kind = 442
 ```
 
 ## val STEP_PATH_OUTSIDE
 
 ```mach
-pub val STEP_PATH_OUTSIDE:                Kind = 444
+pub val STEP_PATH_OUTSIDE:                Kind = 443
 ```
 
 ## val STEP_PUBLISH
 
 ```mach
-pub val STEP_PUBLISH:                     Kind = 445
+pub val STEP_PUBLISH:                     Kind = 444
 ```
 
 ## val STEP_SIGNAL
 
 ```mach
-pub val STEP_SIGNAL:                      Kind = 446
+pub val STEP_SIGNAL:                      Kind = 445
 ```
 
 ## val STEP_SNAPSHOT
 
 ```mach
-pub val STEP_SNAPSHOT:                    Kind = 447
+pub val STEP_SNAPSHOT:                    Kind = 446
 ```
 
 ## val STEP_SPAWN
 
 ```mach
-pub val STEP_SPAWN:                       Kind = 448
+pub val STEP_SPAWN:                       Kind = 447
 ```
 
 ## val STEP_STAGING
 
 ```mach
-pub val STEP_STAGING:                     Kind = 449
+pub val STEP_STAGING:                     Kind = 448
 ```
 
 ## val STEP_TIMEOUT
 
 ```mach
-pub val STEP_TIMEOUT:                     Kind = 450
+pub val STEP_TIMEOUT:                     Kind = 449
 ```
 
 ## val STEP_TOO_MANY_PATHS
 
 ```mach
-pub val STEP_TOO_MANY_PATHS:              Kind = 451
+pub val STEP_TOO_MANY_PATHS:              Kind = 450
 ```
 
 ## val STEP_WAIT
 
 ```mach
-pub val STEP_WAIT:                        Kind = 452
+pub val STEP_WAIT:                        Kind = 451
 ```
 
 ## val TARGET_INVALID
 
 ```mach
-pub val TARGET_INVALID:                   Kind = 453
+pub val TARGET_INVALID:                   Kind = 452
 ```
 
 ## val TARGET_NO_ARTIFACTS
 
 ```mach
-pub val TARGET_NO_ARTIFACTS:              Kind = 454
+pub val TARGET_NO_ARTIFACTS:              Kind = 453
 ```
 
 ## val TARGET_NONE_DECLARED
 
 ```mach
-pub val TARGET_NONE_DECLARED:             Kind = 455
+pub val TARGET_NONE_DECLARED:             Kind = 454
 ```
 
 ## val TARGET_NOT_RUNNABLE
 
 ```mach
-pub val TARGET_NOT_RUNNABLE:              Kind = 456
+pub val TARGET_NOT_RUNNABLE:              Kind = 455
 ```
 
 ## val TARGET_OUTPUT_UNSUPPORTED
 
 ```mach
-pub val TARGET_OUTPUT_UNSUPPORTED:        Kind = 457
+pub val TARGET_OUTPUT_UNSUPPORTED:        Kind = 456
 ```
 
 ## val TARGET_RESERVED_NAME
 
 ```mach
-pub val TARGET_RESERVED_NAME:             Kind = 458
+pub val TARGET_RESERVED_NAME:             Kind = 457
 ```
 
 ## val TARGET_STACK_SIZE
 
 ```mach
-pub val TARGET_STACK_SIZE:                Kind = 459
+pub val TARGET_STACK_SIZE:                Kind = 458
 ```
 
 ## val TARGET_UNSUPPORTED
 
 ```mach
-pub val TARGET_UNSUPPORTED:               Kind = 460
+pub val TARGET_UNSUPPORTED:               Kind = 459
 ```
 
 ## val TEMPLATE_AMBIGUOUS_ARTIFACT
 
 ```mach
-pub val TEMPLATE_AMBIGUOUS_ARTIFACT:      Kind = 461
+pub val TEMPLATE_AMBIGUOUS_ARTIFACT:      Kind = 460
 ```
 
 ## val TEMPLATE_ARTIFACT_NOT_REQUIRED
 
 ```mach
-pub val TEMPLATE_ARTIFACT_NOT_REQUIRED:   Kind = 462
+pub val TEMPLATE_ARTIFACT_NOT_REQUIRED:   Kind = 461
 ```
 
 ## val TEMPLATE_TOO_LARGE
 
 ```mach
-pub val TEMPLATE_TOO_LARGE:               Kind = 463
+pub val TEMPLATE_TOO_LARGE:               Kind = 462
 ```
 
 ## val TEMPLATE_UNAVAILABLE
 
 ```mach
-pub val TEMPLATE_UNAVAILABLE:             Kind = 464
+pub val TEMPLATE_UNAVAILABLE:             Kind = 463
 ```
 
 ## val TEMPLATE_UNKNOWN_VARIABLE
 
 ```mach
-pub val TEMPLATE_UNKNOWN_VARIABLE:        Kind = 465
+pub val TEMPLATE_UNKNOWN_VARIABLE:        Kind = 464
 ```
 
 ## val TEMPLATE_UNTERMINATED
 
 ```mach
-pub val TEMPLATE_UNTERMINATED:            Kind = 466
+pub val TEMPLATE_UNTERMINATED:            Kind = 465
 ```
 
 ## val TEST_NONE_DECLARED
 
 ```mach
-pub val TEST_NONE_DECLARED:               Kind = 467
+pub val TEST_NONE_DECLARED:               Kind = 466
 ```
 
 ## val TOML_MALFORMED
 
 ```mach
-pub val TOML_MALFORMED:                   Kind = 468
+pub val TOML_MALFORMED:                   Kind = 467
 ```
 
 ## val TOML_VALUE_TOO_LONG
 
 ```mach
-pub val TOML_VALUE_TOO_LONG:              Kind = 469
+pub val TOML_VALUE_TOO_LONG:              Kind = 468
 ```
 
 ## val USE_NO_PUBLIC_MODULE
 
 ```mach
-pub val USE_NO_PUBLIC_MODULE:             Kind = 470
+pub val USE_NO_PUBLIC_MODULE:             Kind = 469
 ```
 
 ## val VERSION_INVALID
 
 ```mach
-pub val VERSION_INVALID:                  Kind = 471
+pub val VERSION_INVALID:                  Kind = 470
 ```
 
 ## val VERSION_INVALID_RANGE
 
 ```mach
-pub val VERSION_INVALID_RANGE:            Kind = 472
+pub val VERSION_INVALID_RANGE:            Kind = 471
 ```
 
 ## rec Spec
@@ -2881,7 +2875,7 @@ retired: nothing raises the kind any more; the row stays so its key is
 ## val COUNT
 
 ```mach
-pub val COUNT: usize       = 472
+pub val COUNT: usize       = 471
 ```
 
 ## fun at
