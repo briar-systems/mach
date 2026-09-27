@@ -184,6 +184,14 @@ that is not a function's
 pub fun fn_return_type(ctx: *LowerCtx) ir_type.IrTypeId;
 ```
 
+## fun sig_return_type
+
+```mach
+pub fun sig_return_type(ctx: *LowerCtx, sig: ir_type.IrTypeId) ir_type.IrTypeId;
+```
+
+the return type of a signature, IRT_NIL for a type that is not a function's
+
 ## fun ret_align
 
 ```mach
