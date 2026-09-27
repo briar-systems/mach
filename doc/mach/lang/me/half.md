@@ -16,7 +16,8 @@ the nil value and is never used: the caller reads `done` before its result
 pub fun carrier(types: *ir_type.IrTypeTable) res[ir_type.IrTypeId, fail.Fail];
 ```
 
-the ir type an f16 value is carried in
+the ir type an f16 value is carried in: an i16 whose form says its bits are
+a binary16, so a calling convention can place it as the float it is (#3800)
 
 ## fun init
 

@@ -412,16 +412,6 @@ pub fun expr_float_width(lc: *LowerContext, eid: id.ExprId) float.FloatWidth;
 pub fun float_width_of_type(lc: *LowerContext, tid: type.TypeId) float.FloatWidth;
 ```
 
-## fun carries_half
-
-```mach
-pub fun carries_half(lc: *LowerContext, tid: type.TypeId, depth: u32) bool;
-```
-
-an f16 crosses a call with a value of this type: the type is one, holds one
-by value, or is a function that takes or returns one. a pointer does not carry
-its pointee across the call, so it does not count
-
 ## fun expr_is_secret
 
 ```mach

@@ -307,6 +307,64 @@ pub def RegFileFn: isa.RegFileFn
 pub def VaModelFn: fun() VaModel
 ```
 
+## def HalfRule
+
+```mach
+pub def HalfRule: u8
+```
+
+how a binary16 crosses a call, a row of each convention's table (#3800).
+HALF_INTEGER passes its bits in the integer slot a u16 takes. the float rows
+classify it as a float of two bytes, so it takes the float registers, float
+eightbytes and homogeneous-aggregate members a float does, and in a float
+register it is the low 16 bits: HALF_FLOAT leaves the rest unspecified, and
+HALF_FLOAT_NANBOX sets them, as the RISC-V psABI boxes a float narrower than
+its register
+
+## val HALF_INTEGER
+
+```mach
+pub val HALF_INTEGER:      HalfRule = 0
+```
+
+## val HALF_FLOAT
+
+```mach
+pub val HALF_FLOAT:        HalfRule = 1
+```
+
+## val HALF_FLOAT_NANBOX
+
+```mach
+pub val HALF_FLOAT_NANBOX: HalfRule = 2
+```
+
+## fun half_is_float
+
+```mach
+pub fun half_is_float(rule: HalfRule) bool;
+```
+
+a binary16 takes the float bank under this rule
+
+## fun half_float_padding
+
+```mach
+pub fun half_float_padding(rule: HalfRule) u16;
+```
+
+the bits above a binary16 in its four-byte float carrier. a register wider
+than four bytes is boxed by the four-byte load itself, as a binary32 is
+
+## fun piece_is_half
+
+```mach
+pub fun piece_is_half(p: *ParamPiece) bool;
+```
+
+a piece of a float register two bytes wide carries a binary16: no other
+float or vector a convention places is that narrow
+
 ## def PassingModel
 
 ```mach
