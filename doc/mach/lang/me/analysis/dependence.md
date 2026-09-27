@@ -60,6 +60,16 @@ pub fun ivs_only_recurrence(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: 
 pub rec ReductionInfo;
 ```
 
+a loop's accumulator, `acc = acc op rv` each iteration. a predicated update
+applies `op` only where the compare `pred_cmp` holds (fails, when
+`pred_on_true` is false) and keeps the accumulator otherwise: `pred_join` is
+the select if-conversion left, or the join phi of a diamond whose arm computes
+the update, whose branch block and arms are named (an arm is BLOCK_NIL for a
+direct edge into the join). `rv` is then the value the update combines in,
+and the update instruction and the join are read only by each other and the
+accumulator. `elem_ty` is the element the loop loads, which sets the lanes;
+`acc_ty` is the accumulator's, the same type or a wider integer
+
 ## fun reduction_dnit
 
 ```mach
