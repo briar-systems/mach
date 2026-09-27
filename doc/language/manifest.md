@@ -1620,9 +1620,15 @@ verify` as a command) checks, offline, that:
 A pin outside a range names the requirer chain, the range, the pinned release
 and a runnable remedy (`dependency 'vb': root -> vb requires version '^1.2' but
 the pinned release is 1.1.0; run `mach dep update <path> vb` for project
-'<root>' to re-pin it, or declare the identity at the root to override`). An
-untagged pin reads `... but the pinned commit '<commit>' carries no release
-tag`.
+'<root>' to re-pin it, or declare the identity at the root to override`). A
+pin no tag in the checkout names reads `... but no release tag in its checkout
+names the pinned commit '<commit>'`, and names `mach dep pull` beside `mach dep
+update`. A checkout that holds no tags at all, as a shallow clone (`git
+submodule update --depth 1`) does, cannot say which release its pin is, and
+the refusal says so rather than claim the pin is outside the range (`... but
+the release of the pinned commit '<commit>' cannot be read: its checkout at
+<dir> holds no tags (a shallow clone fetches none); run `mach dep pull <path>`
+for project '<root>' to fetch them`).
 
 The recorded gitlink is the pin, and two kinds of drift from it are refused,
 each naming the identity and the command that fixes it:
@@ -1668,6 +1674,11 @@ verifies:
   existing checkout)`);
 - with neither, the submodule is added at the selector, reusing a module
   directory Git retained from an earlier removal.
+
+Then, when the checkout lacks the tag its selection is read by (the tag a
+`tag/` names, or a release tag naming a `version` selection's pin), pull
+fetches its tags (`fetched the tags of std`). `update` and `outdated` fetch
+them the same way to read a pin's release, unless `--offline`.
 
 A symlink, a file, a directory that is not a checkout of its own, and a dirty
 checkout that would be registered are refused and left as they are. `mach dep

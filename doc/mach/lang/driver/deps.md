@@ -348,11 +348,30 @@ the gitlink the tree of the commit `rev` in the repository at `dir` records for 
 ## fun release_at_pin
 
 ```mach
-pub fun release_at_pin(s: *session.Session, root: str, id: str, dep_full: str) res[str, outcome.Fail];
+pub fun release_at_pin(s: *session.Session, root: str, id: str, dep_full: str, fetch: bool) res[str, outcome.Fail];
 ```
 
 the release version dep/<id>'s pin is tagged with, read from its checkout's refs (an owned ""
-when no release tag points at it); the highest wins, and the caller frees the result
+when no release tag points at it); the highest wins, and the caller frees the result. with
+`fetch`, a checkout no release tag of which names the pin fetches its tags first (#4073)
+
+## fun checkout_has_tags
+
+```mach
+pub fun checkout_has_tags(s: *session.Session, dep_full: str) res[bool, outcome.Fail];
+```
+
+whether the checkout at dep_full holds any tag, which a shallow clone may not
+
+## fun fetch_selection_tags
+
+```mach
+pub fun fetch_selection_tags(s: *session.Session, root: str, id: str, dep_full: str, ref: str,
+ranged: bool) res[bool, outcome.Fail];
+```
+
+fetch the tags of dep/<id>'s checkout when it lacks the one its selection reads: the tag a
+`tag/` ref names, or a release tag naming the pin of a version range; whether it fetched
 
 ## fun pinned_at_release
 
