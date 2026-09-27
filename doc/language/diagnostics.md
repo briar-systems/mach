@@ -1,7 +1,7 @@
 # Diagnostics
 
-Every diagnostic mach prints names its kind by a key, a stable code a tool can
-match instead of the wording:
+Every diagnostic the compiler raises names its kind by a key, a stable code a
+tool can match instead of the wording:
 
 ```
 error[name.unresolved]: unresolved identifier `helpr`
