@@ -32,21 +32,6 @@ fun main(argc: i64, argv: **u8) i64 {
 }
 ```
 
-**`f16` arithmetic.** `+ - * /` on `f16` give the correctly rounded binary16
-result, to nearest with ties to even, on every target: in the target's own
-half-precision instructions where it has them (aarch64 `fp16`, riscv `zfh`), and
-otherwise by widening both operands exactly, computing once in binary32 (x86-64
-with F16C) or binary64, and narrowing once. That is proven, not assumed: the
-exhaustive proof `test/run.sh --f16proof` (#3804) checks every pair of `f16`
-operands for each operator, and every input of the `f16` conversions, against a
-reference computed in integers. On x86-64 with and without `x86-64-v3`, aarch64
-with and without `fp16`, and riscv64 with and without `zfh` (under qemu-user), every result is
-bit-identical to it, NaNs by the target's rule, and so is the same operation
-widened to binary32 by hand and narrowed once. binary32 is enough for all four
-operators, and none needs binary64 for its rounding. aarch64 without `fp16` still
-computes in binary64, but only so that it picks the same NaN as a native half
-instruction, since the conversion to binary32 quiets a signaling operand.
-
 **Widening multiply.** A multiply whose operands are both conversions from
 one narrower integer type to a type exactly twice as wide is the full
 product of the narrow operands, and compiles to the target's widening
@@ -80,6 +65,66 @@ table and the conditions are in
 [secrecy.md](secrecy.md#constant-time-multiply-by-instruction-set), and
 `$mach.build.ct_mul(op, width)` answers the same question at comptime
 ([comptime-mach.md](comptime-mach.md)).
+
+### Half-precision arithmetic
+
+`+ - * /` on `f16` give the correctly rounded binary16 result, to nearest with
+ties to even, on every target. `%` is the truncated remainder of the other float
+widths, computed on the operands' exact binary64 widening; the remainder of two
+`f16` values is itself an `f16`, so narrowing it back does not round. Unary `-`
+flips the sign bit, and a comparison relates the exact values, against an `f16`
+or any other float width ([Comparison](#comparison)). No operator is added or
+removed for the width, and a secret `f16` operand is refused in each of them as
+it is at every float width ([secrecy.md](secrecy.md)).
+
+```mach
+use std.runtime;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    val third: f16 = 1.0f16 / 3.0; # 0.333251953125, the nearest binary16
+    val r:     f16 = 5.5f16 % 3.0; # 2.5, exact
+    val lt:    u8  = third < 0.3333333333333333f64; # 1: compared exactly, not rounded
+    if (third:~u16 != 0x3555 || r != 2.5 || lt != 1) { ret 1; }
+    ret 0;
+}
+```
+
+The target's own half-precision instructions compute where it has them. Where it
+does not, the operands are widened exactly, the operation runs once in binary32
+or binary64 and the result is narrowed once. binary32 carries 24 significand
+bits, more than twice binary16's 11 plus two, so that single rounding is already
+the correctly rounded binary16 result for `+ - * /`; binary64 carries more. A
+widening or narrowing the target has no instruction for is inline integer code,
+never a call:
+
+| target | `+ - * /` | comparisons |
+|---|---|---|
+| x86-64 | binary64, the conversions inline | binary64, the widening inline |
+| x86-64 with `f16c` (`x86-64-v3` and up) | binary32 through `vcvtph2ps` and `vcvtps2ph` | binary32 through `vcvtph2ps` |
+| aarch64 | binary64, the operands widened inline and the result narrowed by `fcvt` | binary32 through `fcvt` |
+| aarch64 with `fp16` | native on the `h` registers (`fadd`, `fsub`, `fmul`, `fdiv`) | native (`fcmp`) |
+| riscv64, riscv32 | binary64, the conversions inline | binary64, the widening inline |
+| riscv with `zfhmin` | binary32 through `fcvt.s.h` and `fcvt.h.s` | binary32 through `fcvt.s.h` |
+| riscv with `zfh` | native (`fadd.h`, `fsub.h`, `fmul.h`, `fdiv.h`) | native (`feq.h`, `flt.h`, `fle.h`) |
+| spirv with `float16` | native, the core float instructions on `OpTypeFloat 16` | native |
+| spirv without `float16` (`vulkan1.0`, `vulkan1.1`) | binary64, the conversions inline | binary64, the widening inline |
+
+aarch64 without `fp16` computes in binary64 even though `fcvt` converts to
+binary32, because that conversion quiets a signaling operand and the half unit
+would give a signaling NaN priority. Where the NaN the operation makes is the
+target's (see [A NaN between float widths](#a-nan-between-float-widths)), every
+path above makes the one the target's native half instruction would.
+x86-64's native rows under AVX-512 FP16 are #4159.
+
+That is proven, not assumed: the exhaustive proof `test/run.sh --f16proof`
+(#3804) checks every pair of `f16` operands for each operator, and every input of
+the `f16` conversions, against a reference computed in integers. On x86-64 with
+and without `x86-64-v3`, aarch64 with and without `fp16`, and riscv64 with and
+without `zfh` (under qemu-user), every result is bit-identical to it, NaNs by the
+target's rule, and so is the same operation widened to binary32 by hand and
+narrowed once. binary32 is enough for all four operators, and none needs binary64
+for its rounding.
 
 ## Bitwise
 
@@ -127,7 +172,7 @@ values**, so the result is identical in either operand order:
   the true values (e.g. a negative `i64` is never equal to, and always less
   than, any `u64`). Width aliases (`usize`, `isize`) follow their backing type.
 - **float vs float** — any width mix is legal; the narrower operand widens
-  exactly (`f32` -> `f64`).
+  exactly (`f16` -> `f32` -> `f64`).
 - **integer vs float** — a compile error; cast one operand explicitly with
   `::`. An implicit widening would hide `f64` rounding above `2^53`.
 
@@ -360,6 +405,58 @@ fun main(argc: i64, argv: **u8) i64 {
 }
 ```
 
+### `f16` conversions
+
+`::` to and from `f16` follows the rule of the other float widths:
+
+- **`f16` to `f32` or `f64`** is exact: every binary16 value, subnormals
+  included, is a binary32 and a binary64 value.
+- **`f32` or `f64` to `f16`** rounds once, to nearest with ties to even, straight
+  from the source (never through binary32 on the way from binary64). A value past
+  the largest finite `f16`, 65504, by half a unit or more rounds to infinity of
+  its sign, and a nonzero value of at most half the smallest subnormal, 2^-25,
+  rounds to zero of its sign.
+- **An integer to `f16`** rounds to nearest with ties to even, and one of
+  magnitude 65520 or more overflows to infinity. Every integer width converts,
+  `u8` to `u64` and `i8` to `i64`.
+- **`f16` to an integer** truncates toward zero. A value out of the integer's
+  range, an infinity or a NaN gives the target's result for the same conversion
+  from `f64`, the rule every float width follows.
+- **`:~`** reads an `f16`'s bits as a `u16` or an `i16` and back, exactly, NaN
+  payloads included.
+
+```mach
+use std.runtime;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    val d:    f64 = 0.1;
+    val h:    f16 = d::f16; # 0.0999755859375, rounded once
+    val back: f64 = h::f64; # exact: the f16 value itself
+    val n:    i32 = (-2.75f16)::i32; # -2, truncated toward zero
+    val big:  f16 = 100000::f16; # past 65504: infinity
+    val bits: u16 = h:~u16; # 0x2E66
+    if (back != 0.0999755859375 || n != -2 || big:~u16 != 0x7C00 || bits != 0x2E66) { ret 1; }
+    ret 0;
+}
+```
+
+The target's own conversion instruction runs where it has one, and it gives the
+same result:
+
+- x86-64 with `f16c`: `vcvtph2ps` and `vcvtps2ph` to and from `f32`;
+- aarch64: `fcvt` to and from `f32` and `f64` on every aarch64 target, and with
+  `fp16` the integer conversions on the `h` registers (`fcvtzs`, `fcvtzu`,
+  `scvtf`, `ucvtf`);
+- riscv with `zfhmin`: `fcvt.s.h` and `fcvt.h.s`, and with `d` also `fcvt.d.h`
+  and `fcvt.h.d`; with `zfh` the integer conversions (`fcvt.w.h`, `fcvt.h.w` and
+  their unsigned and, on riscv64, 64-bit forms);
+- spirv with `float16`: the core float conversions.
+
+Every other conversion is inline integer code on the binary16 encoding, joined to
+the target's binary64 conversion for an integer, never a call. Vectors convert lane by lane with the
+same rule ([types.md](types.md#simd-vectors)).
+
 ### A NaN between float widths
 
 `::` between two float widths (`f16`, `f32`, `f64`) rounds a number once, to nearest
@@ -395,7 +492,7 @@ the two differ only in how they are realized.
 
 | Lane family | `+` `-` | `*` | `/` | `%` | `& \| ^ ~` | `<< >>` | `== != < > <= >=` |
 |---|---|---|---|---|---|---|---|
-| float — `f32x4`, `f64x2` | yes | yes | yes | no | — | no | → same-shape unsigned mask |
+| float — `f16x8`, `f32x4`, `f64x2` | yes | yes | yes | no | — | no | → same-shape unsigned mask |
 | integer — `i8x16` `i16x8` `i32x4` `i64x2` (+ unsigned) | yes | yes | yes | no | yes | yes, by a same-shape count | → same-shape unsigned mask |
 
 Both operands of a binary operator must be the **same** vector shape: there is no
@@ -513,6 +610,13 @@ widening multiply for that cell:
 A wider product, such as `i16x8` → `i32x8`, is a 256-bit value and keeps the
 extend-then-multiply path. Either path gives the same lanes.
 
+`f16` lanes realize per target as [types.md](types.md#simd-vectors) lists: packed
+on aarch64 with `fp16` and on spirv with `float16`, through packed `f32` lanes on
+x86-64 with `f16c` (and for comparisons on aarch64 without `fp16`), and otherwise
+each lane's scalar `f16` operation
+([Half-precision arithmetic](#half-precision-arithmetic)). Every form gives each
+lane the bits of the scalar operation.
+
 A project that cannot afford a scalar expansion sets `simd = "require"` in its
 profile (see [manifest.md](manifest.md)), which turns the shortfall into a
 build error naming the operation, its lane width, the function and the target.
@@ -521,7 +625,7 @@ A comparison produces the same-shape **unsigned mask** vector — one lane per i
 lane, all-ones bits (`0xFF…`) for true and all-zeros for false, exactly what the
 hardware compare yields. There is no vector-bool type. The mask element is the
 unsigned integer of the input's lane width: `f32x4` / `i32x4` / `u32x4` → `u32x4`;
-`f64x2` / `i64x2` → `u64x2`; `i16x8` → `u16x8`; `i8x16` → `u8x16`. Select/blend is
+`f64x2` / `i64x2` → `u64x2`; `f16x8` / `i16x8` → `u16x8`; `i8x16` → `u8x16`. Select/blend is
 not an operator; it is the library idiom `(mask & a) | (~mask & b)` over matching
 integer lanes (the tier-3 simd library, #2021).
 
