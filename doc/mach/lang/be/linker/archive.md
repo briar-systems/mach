@@ -10,10 +10,13 @@ pub fun validate_link_inputs(images: *of.ObjectImage, count: u32) err[fail.Fail]
 
 ```mach
 pub fun read_objects(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
-obj_count: u32, seed: *of.ObjectImage, seed_count: u32,
+obj_count: u32, own_count: u32, seed: *of.ObjectImage, seed_count: u32,
 required: intern.StrId,
 module_count: *u32) res[*of.ObjectImage, fail.Fail];
 ```
+
+the first `own_count` paths are objects mach wrote; the rest are the user's
+inputs, whose relocations are theirs and whose defects are the input's
 
 ## fun free_modules
 

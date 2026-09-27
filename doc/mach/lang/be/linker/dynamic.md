@@ -133,7 +133,7 @@ import_index: u32, patch_vaddr: u64, kind: of.RelocKind, addend: i64) err[fail.F
 pub fun dynstate_add_import_addr_fixup(s: *session.Session, dyn: *DynState,
 seg_index: u32, seg_offset: u32,
 import_index: u32, patch_vaddr: u64,
-kind: of.RelocKind, addend: i64) err[fail.Fail];
+kind: of.RelocKind, addend: i64, origin: of.RelocOrigin) err[fail.Fail];
 ```
 
 ## fun dynstate_add_base_reloc
