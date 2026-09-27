@@ -283,6 +283,16 @@ caller reverses it. That is the same price a 16-byte vector pays on Win64.
 is the C record or array holding `_Float16`. Every convention mach has passes it
 as the float it is, two bytes wide, the way GCC and clang do:
 
+```mach
+# _Float16 scale(_Float16 x, _Float16 k);
+ext fun scale(x: f16, k: f16) f16;
+
+pub rec Vertex {
+    pos: [3]f16;
+    u:   f16; # a C struct of four _Float16
+}
+```
+
 | Convention | Argument | Return | As a record member |
 |---|---|---|---|
 | System V x86-64 | SSE class: the low 16 bits of the next xmm register, the stack past xmm7 | `xmm0` | a float in its eightbyte, so an eightbyte holding only floats is SSE |
@@ -313,8 +323,25 @@ slot under both compilers.
 SPIR-V has no C boundary: a SPIR-V function takes and returns an `f16` as a
 value like any other.
 
-An `f16` in a C-variadic tail is refused like any float narrower than `f64`
-(see [Arguments in the variadic tail](#arguments-in-the-variadic-tail)).
+No convention refuses `f16` in a declared parameter or result, since each of
+them has a C type to match. The one refusal is the C-variadic tail, where an
+`f16` is held to the rule for a `float`: the callee reads a `double`, and mach
+inserts no implicit conversion, so the argument is refused with the cast to
+write, `::f64` (see
+[Arguments in the variadic tail](#arguments-in-the-variadic-tail)):
+
+```mach error is promoted to `f64` in a C-variadic argument
+ext fun printf(fmt: *u8, ...) i32;
+
+fun show(h: f16) i32 {
+    ret printf("%f\n"::*u8, h); # error: `f16` is promoted to `f64`; write the cast
+}
+```
+
+A vector of `f16` lanes is a vector like any other at the boundary and follows
+[Vector arguments and the C ABI](#vector-arguments-and-the-c-abi) for its size:
+on AAPCS64 an `f16x8` is arm_neon.h's `float16x8_t` and an `f16x4` its
+`float16x4_t`, each in the next `v` register.
 
 ## Symbol name
 
