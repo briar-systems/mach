@@ -345,6 +345,23 @@ fun main(argc: i64, argv: **u8) i64 {
 }
 ```
 
+### A NaN between float widths
+
+`::` between two float widths (`f16`, `f32`, `f64`) rounds a number once, to nearest
+with ties to even, the same on every target. What it makes of a NaN is the target's,
+because it is what the target's own conversion instruction does:
+
+| target | a NaN converted to another float width |
+|---|---|
+| x86-64, aarch64 | keeps its sign and the top of its payload, with the quiet bit set |
+| riscv32, riscv64 | the canonical NaN, positive and quiet with an empty payload |
+| spirv | the canonical NaN (SPIR-V leaves the payload unspecified, so a device may differ) |
+
+A conversion folded at compile time follows the build target's rule, so a folded
+`::` gives the bits the same `::` gives at run time on that target. An `f16`
+conversion the target has no instruction for follows the same rule. `:~` never
+converts, so it reads and writes a NaN's bits exactly on every target.
+
 Neither `::` nor `:~` may add or drop the `^` secret qualifier, and neither can
 erase a secret-welded pointer to `ptr`. Representation-changing `::` and `:~` casts
 are rejected when either by-value representation contains a tag, including through
