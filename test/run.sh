@@ -16,8 +16,8 @@
 #
 #   --target <t>   one target (repeatable); default every target
 #   --case <g/n>   one case (repeatable)
-#   --qemu         execute aarch64-linux, riscv64-linux, riscv64zkt-linux and riscv32 under
-#                  qemu-user when this host cannot run them natively
+#   --qemu         execute aarch64-linux, aarch64fp16-linux, riscv64-linux, riscv64zkt-linux,
+#                  riscv64zfh-linux and riscv32 under qemu-user when this host cannot run them natively
 #                  (a missing emulator is announced and its target is only built)
 #   --link         run the link cases (test/link/cases) instead of the corpus
 #   --dwarf        build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
@@ -49,8 +49,10 @@ targets_all='
 x86_64-linux      x86_64      linux         sysv64   -    bin     hosted  -             -
 x86_64v3-linux    x86_64      linux         sysv64   -    bin     hosted  -             x86-64-v3
 aarch64-linux     aarch64     linux         aapcs64  -    bin     hosted  qemu-aarch64  -
+aarch64fp16-linux aarch64     linux         aapcs64  -    bin     hosted  qemu-aarch64  fp16
 riscv64-linux     riscv64     linux         lp64d    -    bin     hosted  qemu-riscv64  -
 riscv64zkt-linux  rv64gc_zkt  linux         lp64d    -    bin     hosted  qemu-riscv64  -
+riscv64zfh-linux  rv64gc_zfh  linux         lp64d    -    bin     hosted  qemu-riscv64  -
 x86_64-windows    x86_64      windows       win64    -    bin     hosted  -             -
 x86_64-darwin     x86_64      darwin        sysv64   -    bin     hosted  -             -
 aarch64-darwin    aarch64     darwin        aapcs64  -    bin     hosted  -             -
