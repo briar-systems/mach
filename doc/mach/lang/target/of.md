@@ -1409,13 +1409,13 @@ pub fun registered(reg: *OfRegistry, idx: u32) opt[*OfVTable];
 ## val DBG_UNKNOWN
 
 ```mach
-pub val DBG_UNKNOWN: u32 = 0
+pub val DBG_UNKNOWN:  u32 = 0
 ```
 
 ## val DBG_DWARF
 
 ```mach
-pub val DBG_DWARF:   u32 = 1
+pub val DBG_DWARF:    u32 = 1
 ```
 
 ## val DBG_SPIRV
