@@ -60,11 +60,27 @@ time independent of their operand values (riscv-crypto scalar spec, Zkt)
 ## val ZICOND
 
 ```mach
-pub val ZICOND:    u64 = 512
+pub val ZICOND: u64 = 512
 ```
 
 the integer conditional operations czero.eqz and czero.nez, the branch-free
 select (#3346)
+
+## val ZFHMIN
+
+```mach
+pub val ZFHMIN:    u64 = 1024
+```
+
+the half-precision float extensions (#3801): Zfhmin moves, loads, stores and
+converts binary16 in the f registers, and Zfh, which brings it, adds the
+arithmetic, comparison and integer conversions. both need F
+
+## val ZFH
+
+```mach
+pub val ZFH:       u64 = 2048
+```
 
 ## val G
 
@@ -87,13 +103,13 @@ pub val DEFAULT64: u64 = G | C
 ## val ALL
 
 ```mach
-pub val ALL:       u64 = DEFAULT64 | ZKT | ZICOND
+pub val ALL:       u64 = DEFAULT64 | ZKT | ZICOND | ZFHMIN | ZFH
 ```
 
 ## val NAME_COUNT
 
 ```mach
-pub val NAME_COUNT: u32 = 10
+pub val NAME_COUNT: u32 = 12
 ```
 
 the riscv extension vocabulary: the letters and z-extensions a selection
@@ -168,7 +184,7 @@ name subsets no selection can spell.
 ## val EXT_COUNT
 
 ```mach
-pub val EXT_COUNT: usize = 16
+pub val EXT_COUNT: usize = 18
 ```
 
 ## val EXTS
@@ -244,7 +260,8 @@ the extension letters a mask holds, in canonical order, for diagnostics
 pub fun float_requirement(bits: u32) u64;
 ```
 
-the extension a floating-point width needs: F for 32-bit values, F and D for 64
+the extension a floating-point width needs: Zfhmin for 16-bit values, F for
+32-bit ones, F and D for 64
 
 ## fun spell
 
