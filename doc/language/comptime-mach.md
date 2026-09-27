@@ -1,19 +1,17 @@
 # `$mach.*` — compiler-owned namespace
 
 The `$mach.*` subtree is the compiler's view of the world: the resolved build
-context, the compiler identity, and source position. All reads, all comptime
-constants. The tags `$mach.{os,arch,abi,mode}.*` exist for path-value
-comparison against the resolved-build facts.
+context, the compiler identity, the project that owns the module, and source
+position. All reads, all comptime constants. The tags `$mach.{os,arch,abi,mode}.*`
+exist for path-value comparison against the resolved-build facts.
 
-> **Live and reserved paths.** The resolved-build facts (`$mach.build.{os,arch,
-> abi,pointer_width,mode,pie,platform}`, `$mach.build.extensions.<name>` and the
-> `$mach.build.ct_mul(op, width)` query), the tag tables (`$mach.{os,arch,abi,mode}.*`),
-> the compiler version (`$mach.version` and `$mach.version.{major,minor,patch}`),
-> and `$mach.compiler.{name,version}` are live. The `$mach.build.{timestamp,
-> host}`, `$mach.build.git.*`, `$mach.project.*`, and `$mach.source.*` paths are
-> reserved: the spelling is held for a later release (#3590) and reading one is
-> a compile error naming the subtree (`` `$mach.source.*` is not yet available ``).
-> Each subtree below notes which it is.
+Every path is deterministic: a function of the source, the manifests and the
+selected build, never of the clock, the host machine or the checkout. The same
+source built at a different path, at a different time or on a different machine
+reads the same values, so a module's compiled output can be cached and reused.
+There is no build timestamp, host name or version-control state. A build that
+wants one generates a source file from a
+[build step](manifest.md#stepname--build-steps).
 
 ## Subtrees
 
@@ -33,10 +31,6 @@ $mach.build.pie                 # live; 1 when building position-independent, el
 $mach.build.platform            # live; the target's open platform tag as a string, "" when unset
 $mach.build.ct_mul(op, width)   # live; 1 when a secret multiply of that cell is admitted, else 0
 $mach.build.extensions.<name>   # live; 1 when the target selects that instruction-set extension, else 0
-$mach.build.timestamp           # stub — not yet available
-$mach.build.host                # stub — not yet available
-$mach.build.git.commit          # stub — not yet available
-$mach.build.git.dirty           # stub — not yet available
 ```
 
 The members above are the whole subtree, and no manifest key adds one. The
@@ -166,23 +160,53 @@ $mach.compiler.name             # live
 $mach.compiler.version          # live; same value as $mach.version
 ```
 
-### `$mach.project.*` — values from mach.toml (stubs)
+### `$mach.project.*` — the project that owns the module
 
-```mach error `$mach.project.*` is not yet available
-val root: u64 = $mach.project.root;
+```mach fragment
+$mach.project.id                # the owning project's [project].id
+$mach.project.version           # the owning project's [project].version string
+$mach.project.version.major     # integer component
+$mach.project.version.minor     # integer component
+$mach.project.version.patch     # integer component
 ```
 
-> Project metadata lives at the top-level `$project.*` root
-> (`$project.{id,version}` and the declared target tuple
-> `$project.target.{os,arch,abi}`), fed from `[project]` / `[target.*]` in
-> `mach.toml` — see [comptime.md](comptime.md). These `$mach.project.*` paths
-> remain reserved stubs.
+The project that owns the module being compiled, read from that project's own
+`mach.toml`. A module of the root project reads the root's manifest. A module of
+a dependency reads the dependency's, whichever project is being built. The top-level
+[`$project.*`](comptime.md#compiler-owned-roots) root is the other half: it names
+the project the build is for, the same in every module. In a root module the two
+agree.
 
-### `$mach.source.*` — current source position (stubs)
+A library reports its own version with it, and the value stays right in every
+consumer's build:
 
-```mach error `$mach.source.*` is not yet available
-val line: u64 = $mach.source.line;
+```mach
+use std.types.string.str;
+
+pub val VERSION: str = $mach.project.version;
 ```
+
+`$project.version` in the same place would read each consumer's version instead.
+A member the subtree does not carry is `` unknown `$mach.project.*` path ``.
+
+### `$mach.source.*` — current source position
+
+```mach fragment
+$mach.source.file               # the module's file, relative to its project's root: "src/lib/hedge.mach"
+$mach.source.line               # the 1-based line the path is written on
+$mach.source.module             # the module's fully qualified name: "hedge.lib.hedge"
+```
+
+`file` is relative to the root of the project that owns the module, `/`-separated,
+never an absolute host path, so a checkout at another path reads the same value.
+`line` is the line of the `$mach.source.line` read itself. `module` is the name a
+`use` imports the module by.
+
+```mach
+val LINE: u64 = $mach.source.line;
+```
+
+A member the subtree does not carry is `` unknown `$mach.source.*` path ``.
 
 ### `$mach.os.*`, `$mach.arch.*`, `$mach.abi.*`, `$mach.mode.*` — tag values
 
@@ -246,6 +270,7 @@ pub val WIDTH:    u64 = $mach.build.pointer_width;
 
 - [comptime-control.md](comptime-control.md) — `$if` / `$or` using these
   reads
-- [comptime.md](comptime.md) — the `$project.*` / `$bin.*` roots
+- [comptime.md](comptime.md) — the `$project.*` / `$bin.*` roots, and which
+  project each root names
 - [val-var.md](val-var.md) — binding compiler values into runtime
   constants
