@@ -43,14 +43,18 @@ rec MapShape {
     is_float: bool;
 }
 
+# `to` is IRT_NIL for a splat, and for a shift's uniform count the lane type
+# it is converted to, the scalar standing in for it
 rec SplatSite {
     instr: id.InstructionId;
     slot:  u32;
     val:   value.Value;
+    to:    ir_type.IrTypeId;
 }
 
 rec SplatEntry {
     key: value.Value;
+    to:  ir_type.IrTypeId;
     vec: value.Value;
 }
 
@@ -485,9 +489,16 @@ fun build_vset(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, la: *loops.
             for (ii < blk.instr_count) {
                 val iid: id.InstructionId = blk.instructions[ii];
                 if (vset[iid::u32] == false) {
-                    val inst: *instruction.Instruction = ?fn.instrs[iid::u32];
-                    if (lane_wise(m, tgt, inst, iid, elem_ty, wide_ty, is_float, mask_cmp)
-                        && operands_vectorizable(inst, fn, la, lx, operand_lane_ty(inst, elem_ty), allow_splat, vset)) {
+                    val inst:  *instruction.Instruction = ?fn.instrs[iid::u32];
+                    var joins: bool                     = false;
+                    if (is_shift(inst.kind)) {
+                        joins = !is_float && shift_lane_wise(m, tgt, fn, la, lx, inst, elem_ty, wide_ty, allow_splat, vset);
+                    }
+                    or {
+                        joins = lane_wise(m, tgt, inst, iid, elem_ty, wide_ty, is_float, mask_cmp)
+                            && operands_vectorizable(inst, fn, la, lx, operand_lane_ty(inst, elem_ty), allow_splat, vset);
+                    }
+                    if (joins) {
                         vset[iid::u32] = true;
                         changed        = true;
                     }
@@ -509,6 +520,14 @@ fun lane_wise(m: *ir.Module, tgt: *target.Target, inst: *instruction.Instruction
     if (inst.kind == instruction.OP_SEXT || inst.kind == instruction.OP_ZEXT) {
         if (wide_ty == elem_ty || inst.ty != wide_ty || inst.operand_count != 1 || inst.operands[0].ty != elem_ty) { ret false; }
         ret vecform.extends(tgt, inst.kind, vecform.scalar_bits(m, wide_ty), vecform.scalar_bits(m, elem_ty));
+    }
+    # the range test a shift by a count the loop computes is saturated with
+    # (#3887): at one lane width it is the unsigned compare, whose lanes are
+    # all ones or zero, and it widens to that
+    if (inst.kind == instruction.OP_MASK_LT_U) {
+        if (is_float || inst.operand_count != 2 || inst.operands[0].ty != inst.ty) { ret false; }
+        if (inst.ty != elem_ty && inst.ty != wide_ty)                              { ret false; }
+        ret supported_vector_op(tgt, instruction.OP_CMP_LT_U, false, vecform.scalar_bits(m, inst.ty));
     }
     if (inst.ty != elem_ty && inst.ty != wide_ty) { ret false; }
     ret supported_vector_op(tgt, inst.kind, is_float, vecform.scalar_bits(m, inst.ty));
@@ -570,7 +589,57 @@ fun pred_mask(p: *PredShape) id.InstructionId {
 
 fun supported_vector_op(tgt: *target.Target, k: instruction.InstrKind, is_float: bool, lane_bits: u32) bool {
     if (!in_increment_table(k, is_float)) { ret false; }
-    ret vecform.packs(tgt, k, is_float, lane_bits);
+    ret vecform.packs(tgt, k, is_float, lane_bits, false);
+}
+
+fun is_shift(k: instruction.InstrKind) bool {
+    ret k == instruction.OP_SHL || k == instruction.OP_SHR_U || k == instruction.OP_SHR_S;
+}
+
+fun in_vset(fn: *ir.Function, vset: *bool, v: value.Value) bool {
+    ret v.kind == value.VAL_INSTR && v.data.instr::u32 < fn.instr_len && vset[v.data.instr::u32];
+}
+
+# a shift widens by its count's form (#3853). a count the loop computes per
+# element is lane-wise itself, and the shift is the per-lane form, whose count
+# is that vector. a count the loop does not change stays one scalar, and the
+# shift is the uniform form. the target must pack the cell of that form at the
+# lane width, else the shift, and the loop with it, stays scalar. either form
+# saturates each lane as the scalar shift does (#3756), so the widened loop
+# answers what the scalar one does for every count
+fun shift_lane_wise(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, inst: *instruction.Instruction, elem_ty: ir_type.IrTypeId, wide_ty: ir_type.IrTypeId, allow_splat: bool, vset: *bool) bool {
+    if (inst.operand_count != 2 || (inst.ty != elem_ty && inst.ty != wide_ty)) { ret false; }
+    if (!in_increment_table(inst.kind, false))                                 { ret false; }
+    val v:     value.Value = inst.operands[0];
+    val c:     value.Value = inst.operands[1];
+    val bits:  u32         = vecform.scalar_bits(m, inst.ty);
+    val lanes: bool        = in_vset(fn, vset, v);
+    if (!lanes && !(allow_splat && splattable(v, la, lx, inst.ty))) { ret false; }
+    if (in_vset(fn, vset, c)) {
+        ret c.ty == inst.ty && vecform.packs(tgt, inst.kind, false, bits, false);
+    }
+    if (!lanes || !allow_splat || !uniform_count_ok(m, la, lx, inst, c)) { ret false; }
+    ret vecform.packs(tgt, inst.kind, false, bits, true);
+}
+
+# a loop-invariant integer count the uniform form reads as one scalar of the
+# lane type: of that type, or of a narrower integer type, which zero-extends
+# to it by value, or of a wider one when the shift is count-bounded, whose
+# count is below the width and so truncates to it by value
+fun uniform_count_ok(m: *ir.Module, la: *loops.LoopAnalysis, lx: u32, inst: *instruction.Instruction, c: value.Value) bool {
+    if (c.kind != value.VAL_CONST_INT && c.kind != value.VAL_PARAM && c.kind != value.VAL_INSTR) { ret false; }
+    if (!loops.is_invariant(la, lx, c))                                                          { ret false; }
+    if (c.ty == inst.ty)                                                                         { ret true; }
+    if (!plain_int(m, c.ty) || !plain_int(m, inst.ty))                                           { ret false; }
+    val cb: u32 = vecform.scalar_bits(m, c.ty);
+    val lb: u32 = vecform.scalar_bits(m, inst.ty);
+    ret cb < lb || (inst.flags & instruction.INSTR_FLAG_COUNT_BOUNDED) != 0;
+}
+
+fun plain_int(m: *ir.Module, ty: ir_type.IrTypeId) bool {
+    val t: opt[*ir_type.IrType] = ir_type.get(?m.types, ty);
+    if (sel t.none) { ret false; }
+    ret t.some.kind == ir_type.IRT_INT && ir_type.int_form(?m.types, ty) == ir_type.INT_FORM_PLAIN;
 }
 
 fun in_increment_table(k: instruction.InstrKind, is_float: bool) bool {
@@ -910,6 +979,7 @@ fun retype_to_vector(m: *ir.Module, fn: *ir.Function, lp: *loops.Loop, vset: *bo
             val rv: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_vector(?m.types, fn.instrs[i].ty, lanes);
             if (sel rv.err) { ret err[fail.Fail].err{rv.err}; }
             fn.instrs[i].ty = rv.ok;
+            if (fn.instrs[i].kind == instruction.OP_MASK_LT_U) { fn.instrs[i].kind = instruction.OP_CMP_LT_U; }
         }
         i = i + 1;
     }
@@ -957,7 +1027,9 @@ fun body_operand_slots(fn: *ir.Function, lp: *loops.Loop) u32 {
 
 # each operand of a lane-wise computation that is not itself lane-wise is
 # loop-invariant, and becomes one splat of `lanes` lanes of its type, built
-# once in a block ahead of the loop
+# once in a block ahead of the loop. a shift's invariant count is the uniform
+# form's one scalar instead (#3853), converted there to the lane type when it
+# is of another width
 fun splat_invariants(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, lp: *loops.Loop, vset: *bool, vpre: id.BlockId, fast_header: id.BlockId, lanes: u32, itn: *intern.Interner) err[fail.Fail] {
     val cap: u32 = body_operand_slots(fn, lp);
     if (cap == 0) { ret err[fail.Fail].ok{}; }
@@ -984,10 +1056,15 @@ fun splat_invariants(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, lp: *
                 for (o < inst.operand_count) {
                     val op: value.Value = inst.operands[o];
                     if (op.kind != value.VAL_INSTR || op.data.instr::u32 >= fn.instr_len || !vset[op.data.instr::u32]) {
-                        sites[n].instr = iid;
-                        sites[n].slot  = o;
-                        sites[n].val   = op;
-                        n              = n + 1;
+                        var to: ir_type.IrTypeId = ir_type.IRT_NIL;
+                        if (is_shift(inst.kind) && o == 1) { to = lane_type(m, inst.ty); }
+                        if (to != op.ty) {
+                            sites[n].instr = iid;
+                            sites[n].slot  = o;
+                            sites[n].val   = op;
+                            sites[n].to    = to;
+                            n              = n + 1;
+                        }
                     }
                     o = o + 1;
                 }
@@ -1013,13 +1090,16 @@ fun splat_invariants(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, lp: *
     var cn: u32 = 0;
     var i:  u32 = 0;
     for (i < n) {
-        if (splat_lookup(cache, cn, sites[i].val) == ver.NONE_U32) {
-            val rsv: res[value.Value, fail.Fail] = emit_lane_splat(?b, sites[i].val, lanes, tgt, itn);
+        if (splat_lookup(cache, cn, sites[i].val, sites[i].to) == ver.NONE_U32) {
+            var rsv: res[value.Value, fail.Fail] = res[value.Value, fail.Fail].err{fail.message("vectorize: splat site")};
+            if (sites[i].to == ir_type.IRT_NIL) { rsv = emit_lane_splat(?b, sites[i].val, lanes, tgt, itn); }
+            or                                  { rsv = emit_uniform_count(?b, sites[i].val, sites[i].to); }
             if (sel rsv.err) {
                 splat_free(m, sites, cache, cap);
                 ret err[fail.Fail].err{rsv.err};
             }
             cache[cn].key = sites[i].val;
+            cache[cn].to  = sites[i].to;
             cache[cn].vec = rsv.ok;
             cn            = cn + 1;
         }
@@ -1035,7 +1115,7 @@ fun splat_invariants(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, lp: *
 
     i = 0;
     for (i < n) {
-        val ci: u32 = splat_lookup(cache, cn, sites[i].val);
+        val ci: u32 = splat_lookup(cache, cn, sites[i].val, sites[i].to);
         if (ci != ver.NONE_U32) {
             val inst: *instruction.Instruction = ?fn.instrs[sites[i].instr::u32];
             inst.operands[sites[i].slot] = cache[ci].vec;
@@ -1051,13 +1131,28 @@ fun splat_free(m: *ir.Module, sites: *SplatSite, cache: *SplatEntry, cap: u32) {
     A.deallocate[SplatEntry](m.alloc, cache, cap::usize);
 }
 
-fun splat_lookup(cache: *SplatEntry, cn: u32, v: value.Value) u32 {
+fun splat_lookup(cache: *SplatEntry, cn: u32, v: value.Value, to: ir_type.IrTypeId) u32 {
     var i: u32 = 0;
     for (i < cn) {
-        if (dep.equal(cache[i].key, v)) { ret i; }
+        if (cache[i].to == to && dep.equal(cache[i].key, v)) { ret i; }
         i = i + 1;
     }
     ret ver.NONE_U32;
+}
+
+# the element type of a vector type, IRT_NIL for any other
+fun lane_type(m: *ir.Module, ty: ir_type.IrTypeId) ir_type.IrTypeId {
+    val t: opt[*ir_type.IrType] = ir_type.get(?m.types, ty);
+    if (sel t.none)                        { ret ir_type.IRT_NIL; }
+    if (t.some.kind != ir_type.IRT_VECTOR) { ret ir_type.IRT_NIL; }
+    ret t.some.data.vector_.element;
+}
+
+# a uniform count of another integer width as the lane type, which admission
+# held to a narrower count or a count-bounded shift's, so its value is kept
+fun emit_uniform_count(b: *builder.Builder, v: value.Value, to: ir_type.IrTypeId) res[value.Value, fail.Fail] {
+    if (vecform.scalar_bits(b.m, v.ty) < vecform.scalar_bits(b.m, to)) { ret builder.emit_zext(b, v, to); }
+    ret builder.emit_trunc(b, v, to);
 }
 
 fun emit_lane_splat(b: *builder.Builder, v: value.Value, lanes: u32, tgt: *target.Target, itn: *intern.Interner) res[value.Value, fail.Fail] {
