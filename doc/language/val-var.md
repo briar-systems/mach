@@ -81,9 +81,9 @@ forward reference the linker resolves, so it is **storage-less** and carries no
 initializer:
 
 ```mach
-ext var errno: i32; # imported mutable datum
+ext var errno:     i32; # imported mutable datum
 #[symbol("environ")]
-ext var env: **u8; # renamed import
+ext var env:       **u8; # renamed import
 #[library("libfoo.so")]
 ext val foo_flags: u32; # library-pinned import
 ```

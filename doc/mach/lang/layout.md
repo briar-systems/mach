@@ -9,7 +9,7 @@ pub def CheckCause: u8
 ## val CHECK_ADD_OVERFLOW
 
 ```mach
-pub val CHECK_ADD_OVERFLOW: CheckCause = 1
+pub val CHECK_ADD_OVERFLOW:        CheckCause = 1
 ```
 
 ## val CHECK_MUL_OVERFLOW
