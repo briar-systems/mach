@@ -93,7 +93,7 @@ pub val TYPE_PTR:   TypeKind = 10
 ## val PRIM_COUNT
 
 ```mach
-pub val PRIM_COUNT: u32      = 13
+pub val PRIM_COUNT: u32      = 14
 ```
 
 ## val TYPE_POINTER
@@ -200,6 +200,14 @@ numbering, decides what is primitive
 ```mach
 pub val TYPE_I128: TypeKind = 26
 ```
+
+## val TYPE_F16
+
+```mach
+pub val TYPE_F16: TypeKind = 27
+```
+
+IEEE binary16, appended like the 128-bit integers (#3798)
 
 ## def PrimClass
 
@@ -377,8 +385,15 @@ pub fun int_fits_either_sign(value: wide.Wide, kind: TypeKind) bool;
 pub fun float_width_of(kind: TypeKind) float.FloatWidth;
 ```
 
-the width of a float kind; FLOAT_W_NONE for every other kind (a partition,
-enumerated by its test)
+the width of a float kind; FLOAT_W_NONE for every other kind
+
+## fun float_kind_of
+
+```mach
+pub fun float_kind_of(w: float.FloatWidth) TypeKind;
+```
+
+the float kind of a width, f64 for FLOAT_W_NONE, the unsuffixed default
 
 ## def VecFormStatus
 
@@ -443,7 +458,8 @@ pub fun vec_lane_kind_ok(kind: TypeKind) bool;
 ```
 
 whether a primitive is a legal vector lane: a declared set, never "every
-primitive but ptr". a 128-bit lane has no packed form on any ISA (#3511)
+primitive but ptr". a 128-bit lane has no packed form on any ISA (#3511),
+and an f16 lane is its own step of the f16 work (#3802)
 
 ## rec VecForm
 
