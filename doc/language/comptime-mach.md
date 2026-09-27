@@ -197,8 +197,9 @@ $mach.source.line               # the 1-based line the path is written on
 $mach.source.module             # the module's fully qualified name: "hedge.lib.hedge"
 ```
 
-`file` is relative to the root of the project that owns the module, `/`-separated,
-never an absolute host path, so a checkout at another path reads the same value.
+`file` is relative to the root of the project that owns the module and never an
+absolute host path. It is `/`-separated on every host, Windows included, so a
+checkout at another path or on another host reads the same value.
 `line` is the line of the `$mach.source.line` read itself. `module` is the name a
 `use` imports the module by.
 
