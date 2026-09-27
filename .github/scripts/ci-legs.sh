@@ -14,6 +14,8 @@
 #   compiler            the fixpoint, the unit suite and the warm build path
 #   corpus:<target>     that target's column of the corpus differential
 #   qemu riscv32 spirv dwarf darwin release   the heavy job of that name
+#   f16proof            the exhaustive f16 proof (#3804), selected only by name:
+#                       no path, no pull request into main and not heavy=all
 #   link:<leg>          the link cases on that host leg (x86_64-linux carries
 #                       every cross-built format)
 # docs runs on every pull request and is not a leg.
@@ -61,6 +63,8 @@ select_path() {
         dist/*) ;;
         # changes runs the script tests and docs the doc checks on every run
         .github/scripts/*) ;;
+        # the f16 proof runs only when dispatched by name
+        test/f16proof/*) ;;
 
         src/lang/be/codegen/dwarf.mach|src/lang/be/codegen/debug_input.mach|src/lang/be/linker/debug.mach)
             add compiler dwarf; link_legs ;;
@@ -141,7 +145,7 @@ case "${1:-}" in
             none) ;;
             all) everything ;;
             link) every_link ;;
-            qemu|spirv|riscv32|dwarf|darwin|release) add "$2" ;;
+            qemu|spirv|riscv32|dwarf|darwin|release|f16proof) add "$2" ;;
             *) echo "ci-legs: unknown heavy job '${2:-}'" >&2; exit 2 ;;
         esac ;;
     paths)
@@ -166,11 +170,11 @@ json_list() {
 
 corpus_json=$(json_list corpus $corpus_all)
 link_json=$(json_list link $link_all)
-for leg in compiler qemu riscv32 spirv dwarf darwin release; do flag "$leg"; done
+for leg in compiler qemu riscv32 spirv dwarf darwin release f16proof; do flag "$leg"; done
 echo "corpus=$corpus_json"
 echo "link=$link_json"
 # build carries the compiler artifact every leg but docs, darwin and release reads
-if has compiler || has qemu || has riscv32 || has spirv || has dwarf ||
+if has compiler || has qemu || has riscv32 || has spirv || has dwarf || has f16proof ||
    [ "$corpus_json" != '[]' ] || [ "$link_json" != '[]' ]; then
     echo build=true
 else

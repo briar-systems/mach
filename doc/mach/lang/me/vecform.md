@@ -50,6 +50,15 @@ pub fun packs(tgt: *target.Target, k: instruction.InstrKind, is_float: bool, lan
 
 a loop's lanes carry their own values, so a shift here counts by lanes
 
+## fun extends
+
+```mach
+pub fun extends(tgt: *target.Target, k: instruction.InstrKind, lane_bits: u32, from_bits: u32) bool;
+```
+
+a loop's lane-wise integer extension `k` from `from_bits` lanes to
+`lane_bits` lanes, packed
+
 ## fun packed_lanes
 
 ```mach
