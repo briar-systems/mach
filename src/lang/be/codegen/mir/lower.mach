@@ -639,7 +639,8 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
         ret err[fail.Fail].err{fail.message("mir.lower_ir: dangling instruction id")};
     }
     val inst: *instr.Instruction = gi.some;
-    if (lctx.count_mask_folds(ctx, iid)) { ret err[fail.Fail].ok{}; }
+    if (lctx.count_mask_folds(ctx, iid))      { ret err[fail.Fail].ok{}; }
+    if (lctx.cmp_folds_into_select(ctx, iid)) { ret err[fail.Fail].ok{}; }
 
     ctx.cur_loc           = inst.loc;
     ctx.cur_inline_site   = ir.instr_inline_site_of(fn, iid);
@@ -773,6 +774,9 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
     }
     if (route == opdesc.LOWER_MASK) {
         ret lower_mask_lt_u(ctx, mb, inst, iid);
+    }
+    if (route == opdesc.LOWER_SELECT) {
+        ret lower_select(ctx, mb, inst, iid);
     }
 
     if (route == opdesc.LOWER_ASM) {
@@ -1185,6 +1189,216 @@ fun lower_mask_lt_u(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruc
     val pe: err[fail.Fail] = lctx.push_instr(ctx, mb, mi);
     if (sel pe.err || lw == mw) { ret pe; }
     ret lctx.emit_promote(ctx, mb, mir.op_vreg(dst), mir.op_vreg(narrow), mw, lw, true);
+}
+
+# a select whose condition is a compare folded into it compares for itself,
+# and one that chooses between 1 and 0 is its condition's 0/1 answer widened
+# to the result (a setcc and a widen); either way no branch is emitted, so a
+# secret condition stays constant-time (#3346)
+fun lower_select(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) err[fail.Fail] {
+    if (inst.operand_count != 3) {
+        ret err[fail.Fail].err{fail.message("mir.lower_ir: select needs a condition and two choices")};
+    }
+    val dst: mir.VRegId = lctx.instr_vreg(ctx, iid);
+    if (mir.vreg_is_nil(dst)) {
+        ret err[fail.Fail].err{fail.message("mir.lower_ir: select defines no result vreg")};
+    }
+    val natural_w: u8  = lctx.op_width_of(ctx, inst.ty);
+    val maw:       u32 = ctx.tgt.model.max_alu_width;
+    if (maw != 0 && natural_w::u32 > maw) {
+        ret err[fail.Fail].err{fail.message("mir.lower_ir: a select wider than the alu reached lowering")};
+    }
+    val w: u8 = lctx.clamp_alu_width(ctx.tgt.model.alu_min_width, natural_w);
+
+    val ar: res[mir.MirOperand, fail.Fail] = lctx.lower_value(ctx, inst.operands[1]);
+    if (sel ar.err) { ret err[fail.Fail].err{ar.err}; }
+    val br: res[mir.MirOperand, fail.Fail] = lctx.lower_value(ctx, inst.operands[2]);
+    if (sel br.err) { ret err[fail.Fail].err{br.err}; }
+
+    var cmp: *instr.Instruction = nil;
+    val c:   value.Value        = inst.operands[0];
+    if (c.kind == value.VAL_INSTR && lctx.cmp_folds_into_select(ctx, c.data.instr)) {
+        cmp = ?ctx.fn.instrs[c.data.instr::u32];
+    }
+
+    if (imm_is(ar.ok, 1) && imm_is(br.ok, 0)) { ret lower_select_bool(ctx, mb, c, cmp, dst, w, false); }
+    if (imm_is(ar.ok, 0) && imm_is(br.ok, 1)) { ret lower_select_bool(ctx, mb, c, cmp, dst, w, true); }
+
+    val ra: res[mir.MirOperand, fail.Fail] = in_register(ctx, mb, ar.ok, w);
+    if (sel ra.err) { ret err[fail.Fail].err{ra.err}; }
+    val rb: res[mir.MirOperand, fail.Fail] = in_register(ctx, mb, br.ok, w);
+    if (sel rb.err) { ret err[fail.Fail].err{rb.err}; }
+
+    if (cmp != nil) {
+        var fc: FoldedCompare;
+        val fr: err[fail.Fail] = fold_compare(ctx, mb, cmp, false, true, ?fc);
+        if (sel fr.err) { ret fr; }
+        # the negated compare picks the other choice
+        var a: mir.MirOperand = ra.ok;
+        var b: mir.MirOperand = rb.ok;
+        if (fc.negated) {
+            a = rb.ok;
+            b = ra.ok;
+        }
+        val r: res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](ctx.alloc, 6::usize);
+        if (sel r.err) { ret err[fail.Fail].err{fail.refused(r.err)}; }
+        val ops: *mir.MirOperand = r.ok;
+        ops[0] = mir.op_vreg(dst);
+        ops[1] = fc.lhs;
+        ops[2] = fc.rhs;
+        ops[3] = a;
+        ops[4] = b;
+        ops[5] = mir.op_imm(fc.op::i64);
+        var mi: mir.MirInstr = mir.instr(mir.MIR_SELECT_CMP, ops, 6, w, fc.width);
+        ret lctx.push_instr(ctx, mb, mi);
+    }
+
+    val cr: res[mir.MirOperand, fail.Fail] = lctx.lower_value(ctx, c);
+    if (sel cr.err) { ret err[fail.Fail].err{cr.err}; }
+    # a condition constfold never saw is already decided
+    if (cr.ok.kind == mir.MIR_OP_IMM) {
+        if ((cr.ok.imm & 0xFF) != 0) { ret lctx.emit_mov_w(ctx, mb, mir.op_vreg(dst), ra.ok, w); }
+        ret lctx.emit_mov_w(ctx, mb, mir.op_vreg(dst), rb.ok, w);
+    }
+    val cw: u8                             = lctx.op_width_of(ctx, c.ty);
+    val rc: res[mir.MirOperand, fail.Fail] = in_register(ctx, mb, cr.ok, cw);
+    if (sel rc.err) { ret err[fail.Fail].err{rc.err}; }
+    val r: res[*mir.MirOperand, A.Error] = A.allocate[mir.MirOperand](ctx.alloc, 4::usize);
+    if (sel r.err) { ret err[fail.Fail].err{fail.refused(r.err)}; }
+    val ops: *mir.MirOperand = r.ok;
+    ops[0] = mir.op_vreg(dst);
+    ops[1] = rc.ok;
+    ops[2] = ra.ok;
+    ops[3] = rb.ok;
+    var mi: mir.MirInstr = mir.instr(mir.MIR_SELECT, ops, 4, w, cw);
+    ret lctx.push_instr(ctx, mb, mi);
+}
+
+# `select c, 1, 0` is c widened and `select c, 0, 1` its inverse widened:
+# the folded compare's own 0/1 answer, else the condition's
+fun lower_select_bool(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, c: value.Value, cmp: *instr.Instruction,
+    dst: mir.VRegId, w: u8, invert: bool) err[fail.Fail] {
+    if (cmp != nil) {
+        var fc: FoldedCompare;
+        val fr: err[fail.Fail] = fold_compare(ctx, mb, cmp, invert, false, ?fc);
+        if (sel fr.err) { ret fr; }
+        val tr: res[mir.VRegId, fail.Fail] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
+        if (sel tr.err) { ret err[fail.Fail].err{tr.err}; }
+        val ce: err[fail.Fail] = emit_alu3(ctx, mb, fc.op, mir.op_vreg(tr.ok), fc.lhs, fc.rhs, fc.width);
+        if (sel ce.err) { ret ce; }
+        ret lctx.emit_promote(ctx, mb, mir.op_vreg(dst), mir.op_vreg(tr.ok), w, 1, false);
+    }
+    val cr: res[mir.MirOperand, fail.Fail] = lctx.lower_value(ctx, c);
+    if (sel cr.err) { ret err[fail.Fail].err{cr.err}; }
+    if (cr.ok.kind == mir.MIR_OP_IMM) {
+        var bit: i64 = 0;
+        if (((cr.ok.imm & 0xFF) != 0) != invert) { bit = 1; }
+        ret lctx.emit_mov_w(ctx, mb, mir.op_vreg(dst), mir.op_imm(bit), w);
+    }
+    if (!invert) { ret lctx.emit_promote(ctx, mb, mir.op_vreg(dst), cr.ok, w, 1, false); }
+    val tr: res[mir.VRegId, fail.Fail] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
+    if (sel tr.err) { ret err[fail.Fail].err{tr.err}; }
+    val bw: u8             = lctx.clamp_alu_width(ctx.tgt.model.alu_min_width, 1);
+    val xe: err[fail.Fail] = emit_alu3(ctx, mb, mir.MIR_XOR, mir.op_vreg(tr.ok), cr.ok, mir.op_imm(1), bw);
+    if (sel xe.err) { ret xe; }
+    ret lctx.emit_promote(ctx, mb, mir.op_vreg(dst), mir.op_vreg(tr.ok), w, 1, false);
+}
+
+# a compare folded into a select: `op` of `lhs`, which a register holds, and
+# `rhs`, read at `width`, answers the IR compare, or its negation when
+# `negated` is set
+rec FoldedCompare {
+    op:      mir.MirOpcode;
+    lhs:     mir.MirOperand;
+    rhs:     mir.MirOperand;
+    width:   u8;
+    negated: bool;
+}
+
+# `invert` asks for the negated compare. an equality negates by its opcode and
+# commutes; an ordered compare negates by trading its operands for its dual
+# (not a < b is b <= a), so a constant on the left trades sides only when the
+# caller takes a negated answer, and is loaded into a register otherwise
+fun fold_compare(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, cmp: *instr.Instruction, invert: bool,
+    negation_ok: bool, out: *FoldedCompare) err[fail.Fail] {
+    val mapped: res[mir.MirOpcode, fail.Fail] = lowered_opcode(cmp.kind);
+    if (sel mapped.err) { ret err[fail.Fail].err{mapped.err}; }
+    val lr: res[mir.MirOperand, fail.Fail] = lctx.lower_value(ctx, cmp.operands[0]);
+    if (sel lr.err) { ret err[fail.Fail].err{lr.err}; }
+    val rr: res[mir.MirOperand, fail.Fail] = lctx.lower_value(ctx, cmp.operands[1]);
+    if (sel rr.err) { ret err[fail.Fail].err{rr.err}; }
+    val cw: u8 = lctx.op_width_of(ctx, cmp.operands[0].ty);
+
+    var op:       mir.MirOpcode = mapped.ok;
+    var swap:     bool          = false;
+    var negated:  bool          = false;
+    val left_imm: bool          = lr.ok.kind == mir.MIR_OP_IMM && rr.ok.kind != mir.MIR_OP_IMM;
+    if (op == mir.MIR_CMP_EQ || op == mir.MIR_CMP_NE) {
+        if (invert && op == mir.MIR_CMP_EQ) { op = mir.MIR_CMP_NE; }
+        or (invert && op == mir.MIR_CMP_NE) { op = mir.MIR_CMP_EQ; }
+        swap = left_imm;
+    }
+    or (invert) {
+        op   = ordered_dual(op);
+        swap = true;
+    }
+    or (left_imm && negation_ok) {
+        op      = ordered_dual(op);
+        swap    = true;
+        negated = true;
+    }
+    var l: mir.MirOperand = lr.ok;
+    var r: mir.MirOperand = rr.ok;
+    if (swap) {
+        l = rr.ok;
+        r = lr.ok;
+    }
+    val rl: res[mir.MirOperand, fail.Fail] = in_register(ctx, mb, l, cw);
+    if (sel rl.err) { ret err[fail.Fail].err{rl.err}; }
+    var rhs: mir.MirOperand = r;
+    if (r.kind != mir.MIR_OP_IMM) {
+        val rs: res[mir.MirOperand, fail.Fail] = in_register(ctx, mb, r, cw);
+        if (sel rs.err) { ret err[fail.Fail].err{rs.err}; }
+        rhs = rs.ok;
+    }
+    out.op      = op;
+    out.lhs     = rl.ok;
+    out.rhs     = rhs;
+    out.width   = cw;
+    out.negated = negated;
+    ret err[fail.Fail].ok{};
+}
+
+# a < b is b <= a negated, and a <= b is b < a negated
+fun ordered_dual(op: mir.MirOpcode) mir.MirOpcode {
+    if (op == mir.MIR_CMP_LT_S) { ret mir.MIR_CMP_LE_S; }
+    if (op == mir.MIR_CMP_LE_S) { ret mir.MIR_CMP_LT_S; }
+    if (op == mir.MIR_CMP_LT_U) { ret mir.MIR_CMP_LE_U; }
+    ret mir.MIR_CMP_LT_U;
+}
+
+fun imm_is(op: mir.MirOperand, v: i64) bool {
+    ret op.kind == mir.MIR_OP_IMM && op.imm == v && op.imm_hi == 0;
+}
+
+# a select reads its choices and its compared left side from registers: a
+# constant is loaded into one and a symbol's address computed into one
+fun in_register(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, op: mir.MirOperand, w: u8) res[mir.MirOperand, fail.Fail] {
+    if (op.kind == mir.MIR_OP_VREG) { ret res[mir.MirOperand, fail.Fail].ok{op}; }
+    if (op.kind == mir.MIR_OP_SYM) {
+        var av: mir.VRegId     = mir.MIR_VREG_NIL;
+        val ae: err[fail.Fail] = lctx.addr_to_vreg(ctx, mb, op, ?av);
+        if (sel ae.err) { ret res[mir.MirOperand, fail.Fail].err{ae.err}; }
+        ret res[mir.MirOperand, fail.Fail].ok{mir.op_vreg(av)};
+    }
+    if (op.kind != mir.MIR_OP_IMM) {
+        ret res[mir.MirOperand, fail.Fail].err{fail.message("mir.lower_ir: a select operand is neither a register, a constant nor a symbol")};
+    }
+    val vr: res[mir.VRegId, fail.Fail] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
+    if (sel vr.err) { ret res[mir.MirOperand, fail.Fail].err{vr.err}; }
+    val me: err[fail.Fail] = lctx.emit_mov_w(ctx, mb, mir.op_vreg(vr.ok), op, w);
+    if (sel me.err) { ret res[mir.MirOperand, fail.Fail].err{me.err}; }
+    ret res[mir.MirOperand, fail.Fail].ok{mir.op_vreg(vr.ok)};
 }
 
 fun count_is_folded_mask(ctx: *lctx.LowerCtx, v: value.Value) bool {

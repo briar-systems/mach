@@ -51,11 +51,20 @@ pub val ZIFENCEI: u64 = 128
 ## val ZKT
 
 ```mach
-pub val ZKT:       u64 = 256
+pub val ZKT: u64 = 256
 ```
 
 data-independent execution latency: the listed M, Zb and base operations run in
 time independent of their operand values (riscv-crypto scalar spec, Zkt)
+
+## val ZICOND
+
+```mach
+pub val ZICOND:    u64 = 512
+```
+
+the integer conditional operations czero.eqz and czero.nez, the branch-free
+select (#3346)
 
 ## val G
 
@@ -78,13 +87,13 @@ pub val DEFAULT64: u64 = G | C
 ## val ALL
 
 ```mach
-pub val ALL:       u64 = DEFAULT64 | ZKT
+pub val ALL:       u64 = DEFAULT64 | ZKT | ZICOND
 ```
 
 ## val NAME_COUNT
 
 ```mach
-pub val NAME_COUNT: u32 = 9
+pub val NAME_COUNT: u32 = 10
 ```
 
 the riscv extension vocabulary: the letters and z-extensions a selection
@@ -159,7 +168,7 @@ name subsets no selection can spell.
 ## val EXT_COUNT
 
 ```mach
-pub val EXT_COUNT: usize = 15
+pub val EXT_COUNT: usize = 16
 ```
 
 ## val EXTS

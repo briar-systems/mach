@@ -852,16 +852,31 @@ pub val CSRRSI: MachOp = 139
 pub val CSRRCI: MachOp = 140
 ```
 
+## val CZERO_EQZ
+
+```mach
+pub val CZERO_EQZ: MachOp = 141
+```
+
+zero when the condition register is zero (eqz) or nonzero (nez), else the
+first source: the Zicond halves of a branch-free select (#3346)
+
+## val CZERO_NEZ
+
+```mach
+pub val CZERO_NEZ: MachOp = 142
+```
+
 ## val MOP_LAST
 
 ```mach
-pub val MOP_LAST: MachOp = CSRRCI
+pub val MOP_LAST: MachOp = CZERO_NEZ
 ```
 
 ## val ROW_COUNT
 
 ```mach
-pub val ROW_COUNT: usize = 141
+pub val ROW_COUNT: usize = 143
 ```
 
 ROW_COUNT is MOP_LAST + 1 spelled as a literal so the array length is
@@ -1258,19 +1273,37 @@ pub val RM_DYN: u32 = 0x7
 ## val F7_ZERO
 
 ```mach
-pub val F7_ZERO:   u32 = 0x00
+pub val F7_ZERO:      u32 = 0x00
 ```
 
 ## val F7_MULDIV
 
 ```mach
-pub val F7_MULDIV: u32 = 0x01
+pub val F7_MULDIV:    u32 = 0x01
+```
+
+## val F7_CZERO
+
+```mach
+pub val F7_CZERO:     u32 = 0x07
+```
+
+## val F3_CZERO_EQZ
+
+```mach
+pub val F3_CZERO_EQZ: u32 = 0x5
+```
+
+## val F3_CZERO_NEZ
+
+```mach
+pub val F3_CZERO_NEZ: u32 = 0x7
 ```
 
 ## val F7_SUB
 
 ```mach
-pub val F7_SUB:    u32 = 0x20
+pub val F7_SUB:       u32 = 0x20
 ```
 
 ## val F7_FADD

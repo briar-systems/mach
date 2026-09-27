@@ -168,6 +168,14 @@ pub fun emit_cmp_le_s(b: *Builder, lhs: value.Value, rhs: value.Value) res[value
 pub fun emit_cmp_le_u(b: *Builder, lhs: value.Value, rhs: value.Value) res[value.Value, fail.Fail];
 ```
 
+## fun emit_select
+
+```mach
+pub fun emit_select(b: *Builder, cond: value.Value, a: value.Value, other: value.Value) res[value.Value, fail.Fail];
+```
+
+`a` when `cond` is nonzero, else `other`, typed as `a`
+
 ## fun emit_trunc
 
 ```mach
