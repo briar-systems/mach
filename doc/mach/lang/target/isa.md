@@ -1355,6 +1355,27 @@ pub fun declares_local_got(tgt_isa: *IsaVTable) bool;
 pub fun local_got_kind(tgt_isa: *IsaVTable, kind: of.RelocKind) bool;
 ```
 
+## fun with_branch_thunks
+
+```mach
+pub fun with_branch_thunks(s: *RelocSeam, reach: of.BranchReachFn, thunk: of.BranchThunkFn);
+```
+
+## fun declares_branch_thunks
+
+```mach
+pub fun declares_branch_thunks(tgt_isa: *IsaVTable) bool;
+```
+
+## fun branch_reach
+
+```mach
+pub fun branch_reach(tgt_isa: *IsaVTable, kind: of.RelocKind) opt[of.BranchReach];
+```
+
+the reach of a direct branch a thunk can extend, none for any other kind or
+an instruction set that places no thunks
+
 ## fun with_machine_flags
 
 ```mach
