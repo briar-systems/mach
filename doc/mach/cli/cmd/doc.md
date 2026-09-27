@@ -13,5 +13,6 @@ not. a summary line prints unless `--quiet`
 
 argv: the full process arguments
 inv: the parsed invocation for this command
-ret: 0 success, 1 project or manifest error, 2 allocator, session, registry, or write failure
+ret: exit.OK, or the shared code of the failure: exit.USER for a project or manifest error,
+      exit.INTERNAL for an allocator, session or registry failure, exit.ENVIRONMENT for a write failure
 
