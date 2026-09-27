@@ -70,9 +70,35 @@ static uint64_t divrem_i128(uint64_t seed) {
     return h;
 }
 
+/* quotients and remainders by constant powers of two past the low limb and
+ * of either sign, down to the most negative divisor (#3350) */
+static uint64_t divconst_128(uint64_t seed) {
+    uint64_t h = fold_init();
+    const corpus_u128 s = (corpus_u128)(seed & 1023);
+    const corpus_u128 big = U128(0xF123456789ABCDEF, 0xFEDCBA9876543210) + s;
+    const corpus_u128 ns[6] = {0, 7 + s, big, big >> 1, ~(corpus_u128)0 - s, ((corpus_u128)1 << 127) + s};
+    const corpus_i128 imin = (corpus_i128)((corpus_u128)1 << 127);
+    for (uint64_t i = 0; i < 6; i++) {
+        const corpus_u128 x = ns[i];
+        h = mix_u128(h, x / ((corpus_u128)1 << 70));
+        h = mix_u128(h, x % ((corpus_u128)1 << 70));
+        h = mix_u128(h, x / ((corpus_u128)1 << 64));
+        h = mix_u128(h, x % ((corpus_u128)1 << 100));
+        const corpus_i128 y = (corpus_i128)x;
+        h = mix_i128(h, y / -((corpus_i128)1 << 70));
+        h = mix_i128(h, y % -((corpus_i128)1 << 70));
+        h = mix_i128(h, y / ((corpus_i128)1 << 65));
+        h = mix_i128(h, y % ((corpus_i128)1 << 65));
+        h = mix_i128(h, y / imin);
+        h = mix_i128(h, y % imin);
+    }
+    return h;
+}
+
 uint64_t checksum(uint64_t seed) {
     uint64_t h = fold_init();
     h = mix_u64(h, divrem_u128(seed));
     h = mix_u64(h, divrem_i128(seed));
+    h = mix_u64(h, divconst_128(seed));
     return h;
 }
