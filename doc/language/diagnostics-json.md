@@ -21,8 +21,8 @@ A bare `--diagnostics` or any other value is refused with
   events of `mach test --format json`.
 - Every record is a JSON object on a line of its own, and every record line
   starts with `{`. A line that does not start with `{` is not a record: a
-  failure mach does not yet report as a record still prints as human text, and
-  a tool skips such a line or shows it as it is.
+  failure mach does not yet report as a record (#3794) still prints as human
+  text, and a tool skips such a line or shows it as it is.
 - The text is ASCII. A non-ASCII character in a message, a label or a path is
   written as a `\u` escape, and a byte that is not valid UTF-8 as `�`, so
   every line is valid UTF-8 and valid JSON.
@@ -115,7 +115,7 @@ the constant-time validator does.
 ## Reserved record types
 
 These record types are reserved in schema 1 for reports mach does not yet
-write as records. Each carries `schema` and `record` as above.
+write as records (#3794). Each carries `schema` and `record` as above.
 
 - `"record": "failure"`: a build, link, manifest, dependency or command-line
   failure reported outside the diagnostic store. It has the members of a
