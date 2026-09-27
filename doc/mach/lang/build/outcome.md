@@ -31,6 +31,20 @@ kind: the row of the diagnostic kind table the failure is reported as
 text: the message
 at:   where in the file that caused it the failure points, the zero place
       when it points nowhere
+also: the other places the failure names, none when it names no other
+
+## rec Related
+
+```mach
+pub rec Related;
+```
+
+the other places a failure names, in order, each in its own file: the other
+edges of a cycle, the other claims a collision is between. the array and
+each resolved place's path share the failure's lifetime as `at`'s path does
+
+items: the places, nil when there are none
+count: how many
 
 ## rec Place
 
@@ -90,9 +104,9 @@ place, the innermost site knowing best, and one with no kind points nowhere
 pub fun placed(a: *A.Allocator, f: Fail, path: str, text: str) Fail;
 ```
 
-the same failure with its range resolved in `text`, the file at `path`, as
-`located` places it; a failure without a range, or one already resolved, is
-returned as it is
+the same failure with its ranges resolved in `text`, the file at `path`, as
+`located` places them: its own and each related one still without a file. a
+failure without a range, or one already resolved, is returned as it is
 
 ## fun placed_bytes
 
@@ -101,6 +115,35 @@ pub fun placed_bytes(a: *A.Allocator, f: Fail, path: str, data: *u8, n: usize) F
 ```
 
 `placed` over the `n` bytes at `data`, for a file that may hold a NUL
+
+## fun at
+
+```mach
+pub fun at(a: *A.Allocator, f: Fail, p: Place) Fail;
+```
+
+the same failure pointing at `p`, a place a model recorded: one without a
+file is a range `placed` resolves, one with a file is copied as `located`
+copies it. a failure that already points somewhere keeps its place
+
+## fun with_related
+
+```mach
+pub fun with_related(a: *A.Allocator, f: Fail, ps: *Place, n: usize) Fail;
+```
+
+the same failure naming the `n` places at `ps` as its related places, in
+order, each copied through `a` as `at` copies a place; an unspanned place is
+skipped. a failure that already names related places keeps them, and one
+whose copy is refused is that refusal
+
+## fun related_of
+
+```mach
+pub fun related_of(f: Fail) Related;
+```
+
+the related places a failure names, none for one that names no other
 
 ## fun located
 
@@ -120,6 +163,41 @@ pub fun place(path: str, data: *u8, n: usize, start: usize, end: usize) Place;
 
 the bytes [start, end) of the `n` bytes at `data`, the file at `path`, as a
 place; a range past the end is clamped to it
+
+## rec Lines
+
+```mach
+pub rec Lines;
+```
+
+the offsets the lines of one file start at, for resolving many places in it
+as `place` resolves one, each in time logarithmic in the file's lines
+
+path: the file, which every place resolved here names
+n: the file's length in bytes
+starts: the offset of each line's first byte, the first line's 0
+
+## fun lines_of
+
+```mach
+pub fun lines_of(a: *A.Allocator, path: str, data: *u8, n: usize) res[Lines, A.Error];
+```
+
+the lines of the `n` bytes at `data`, the file at `path`; released with `lines_dnit`
+
+## fun lines_dnit
+
+```mach
+pub fun lines_dnit(l: *Lines);
+```
+
+## fun lines_place
+
+```mach
+pub fun lines_place(l: *Lines, start: usize, end: usize) Place;
+```
+
+the bytes [start, end) of the file `l` indexes as a place, as `place` makes it
 
 ## fun place_of
 
@@ -266,24 +344,15 @@ pub fun with_text(f: Fail, message: str) Fail;
 the same failure carrying `message` instead: the case and the place are
 kept, the text replaced (a caller that copies the message into storage it owns)
 
-## fun with_path
-
-```mach
-pub fun with_path(f: Fail, path: str) Fail;
-```
-
-the same failure pointing at the file `path` instead, its range kept (a
-caller that copies the path into storage it owns)
-
 ## fun retain
 
 ```mach
 pub fun retain(a: *A.Allocator, f: Fail) res[Fail, A.Error];
 ```
 
-a copy of the failure that owns its text and its place's path through `a`,
-for a failure that outlives the storage its message was made in; released
-with `release`
+a copy of the failure that owns its text and its places through `a`, for a
+failure that outlives the storage its message was made in; released with
+`release`
 
 ## fun release
 
@@ -291,7 +360,43 @@ with `release`
 pub fun release(a: *A.Allocator, f: Fail);
 ```
 
-release what a retained failure owns through `a`: its text and its place's path
+release what a retained failure owns through `a`: its text and its places
+
+## fun retain_places
+
+```mach
+pub fun retain_places(a: *A.Allocator, f: Fail) res[Fail, A.Error];
+```
+
+a copy of the failure whose places, its own path and every related place,
+are owned through `a`, its text left as it is; for a holder that keeps the
+text apart. released with `release_places`
+
+## fun release_places
+
+```mach
+pub fun release_places(a: *A.Allocator, f: Fail);
+```
+
+release the places a failure owns through `a`, as `retain_places` made them
+
+## fun without_places
+
+```mach
+pub fun without_places(f: Fail) Fail;
+```
+
+the same failure pointing nowhere and naming no related place, for a holder
+whose places were released or never copied
+
+## fun same_places
+
+```mach
+pub fun same_places(x: Fail, y: Fail) bool;
+```
+
+whether two failures hold the same places: the same path storage and the
+same related array, as a holder that copied them once sees its own copy
 
 ## fun catalog
 
