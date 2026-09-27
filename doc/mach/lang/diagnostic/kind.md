@@ -2858,6 +2858,138 @@ pub val VERSION_INVALID:                  Kind = 470
 pub val VERSION_INVALID_RANGE:            Kind = 471
 ```
 
+## val LINK_ABI_MISMATCH
+
+```mach
+pub val LINK_ABI_MISMATCH:                Kind = 472
+```
+
+## val LINK_DUPLICATE_SYMBOL
+
+```mach
+pub val LINK_DUPLICATE_SYMBOL:            Kind = 473
+```
+
+## val LINK_EMPTY_IMAGE
+
+```mach
+pub val LINK_EMPTY_IMAGE:                 Kind = 474
+```
+
+## val LINK_ENTRY_MISSING
+
+```mach
+pub val LINK_ENTRY_MISSING:               Kind = 475
+```
+
+## val LINK_ENTRY_PLACEMENT
+
+```mach
+pub val LINK_ENTRY_PLACEMENT:             Kind = 476
+```
+
+## val LINK_IMPORT_ALIAS
+
+```mach
+pub val LINK_IMPORT_ALIAS:                Kind = 477
+```
+
+## val LINK_IMPORT_CONFLICT
+
+```mach
+pub val LINK_IMPORT_CONFLICT:             Kind = 478
+```
+
+## val LINK_IMPORT_UNATTRIBUTED
+
+```mach
+pub val LINK_IMPORT_UNATTRIBUTED:         Kind = 479
+```
+
+## val LINK_NO_EXPORTS
+
+```mach
+pub val LINK_NO_EXPORTS:                  Kind = 480
+```
+
+## val LINK_NO_LOADER
+
+```mach
+pub val LINK_NO_LOADER:                   Kind = 481
+```
+
+## val LINK_RELOCATION_OVERFLOW
+
+```mach
+pub val LINK_RELOCATION_OVERFLOW:         Kind = 482
+```
+
+## val LINK_RELOCATION_UNSUPPORTED
+
+```mach
+pub val LINK_RELOCATION_UNSUPPORTED:      Kind = 483
+```
+
+## val LINK_SECTION_UNSUPPORTED
+
+```mach
+pub val LINK_SECTION_UNSUPPORTED:         Kind = 484
+```
+
+## val LINK_SIZE_LIMIT
+
+```mach
+pub val LINK_SIZE_LIMIT:                  Kind = 485
+```
+
+## val LINK_UNDEFINED_SYMBOL
+
+```mach
+pub val LINK_UNDEFINED_SYMBOL:            Kind = 486
+```
+
+## val LINK_WEAK_FALLBACK
+
+```mach
+pub val LINK_WEAK_FALLBACK:               Kind = 487
+```
+
+## val OBJECT_FORMAT_MISMATCH
+
+```mach
+pub val OBJECT_FORMAT_MISMATCH:           Kind = 488
+```
+
+## val OBJECT_MALFORMED
+
+```mach
+pub val OBJECT_MALFORMED:                 Kind = 489
+```
+
+## val OBJECT_UNSUPPORTED
+
+```mach
+pub val OBJECT_UNSUPPORTED:               Kind = 490
+```
+
+## val RESOURCE_ICON_MALFORMED
+
+```mach
+pub val RESOURCE_ICON_MALFORMED:          Kind = 491
+```
+
+## val RESOURCE_METADATA_INVALID
+
+```mach
+pub val RESOURCE_METADATA_INVALID:        Kind = 492
+```
+
+## val RESOURCE_SIZE_LIMIT
+
+```mach
+pub val RESOURCE_SIZE_LIMIT:              Kind = 493
+```
+
 ## rec Spec
 
 ```mach
@@ -2875,7 +3007,7 @@ retired: nothing raises the kind any more; the row stays so its key is
 ## val COUNT
 
 ```mach
-pub val COUNT: usize       = 471
+pub val COUNT: usize       = 493
 ```
 
 ## fun at
