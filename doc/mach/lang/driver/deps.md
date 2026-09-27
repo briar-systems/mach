@@ -505,10 +505,11 @@ refuse a slot whose realization would replace or record work mach did not make
 
 ```mach
 pub fun realize_git_slot(s: *session.Session, root: str, id: str, url: str, ref: str, mode: u8,
-slot: *GitSlot) res[u8, outcome.Fail];
+slot: *GitSlot, offline: bool) res[u8, outcome.Fail];
 ```
 
-bring a slot `refuse_git_slot` accepted to the realization a build verifies
+bring a slot `refuse_git_slot` accepted to the realization a build verifies. a pin its
+checkout does not hold is fetched, or refused when `offline`
 
 ## fun remove_dependency_index
 
