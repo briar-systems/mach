@@ -131,7 +131,7 @@ the path it was read at, as it names a source file.
 {"schema":1,"record":"failure","severity":"error","code":"version.invalid_range","message":"mach.toml: [project].mach = \"^x\": expected a number (clause 1)","origin":"build","primary":{"file":"mach.toml","line":2,"column":8,"end_line":2,"end_column":12,"byte_start":17,"byte_end":21},"related":[],"notes":[],"help":[],"fixes":[]}
 ```
 
-A refusal raised later from the parsed manifest, while a build is planned or
+A refusal raised later from the parsed manifest, while a build is laid out or
 its steps run, points at the entry that caused it the same way:
 
 - a path template that does not expand, at its value: `[project].out`, an
