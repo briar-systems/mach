@@ -32,7 +32,7 @@ ret: the manifest, or the first error as a "mach.toml: ..." message. the
          entries are checked by `validate_needs`. `[profile.*]` absent or empty is
          an error at the root and synthesizes `debug` and `release` in a dependency.
          a failure that names a key points at it in `doc`, and the manifest records
-         where `[project]` and its `mach` value are written
+         where each field a later refusal names is written, resolved in `doc`
 
 ## rec Doc
 

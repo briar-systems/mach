@@ -192,6 +192,81 @@ value as written
 pub fun free_strarr(alloc: *A.Allocator, items: *intern.StrId, count: u32);
 ```
 
+## fun span_site
+
+```mach
+pub fun span_site(sp: toml.Span) outcome.Place;
+```
+
+where `sp` is written in the manifest being parsed, as a range whose file
+`parse` names once the manifest parses; the zero place for a value the
+parser did not write
+
+## fun element_sites
+
+```mach
+pub fun element_sites(alloc: *A.Allocator, arr: *toml.Array) res[*outcome.Place, outcome.Fail];
+```
+
+where each element of `arr` is written, in order, as `span_site` places it;
+nil for an empty array. freed with `free_sites`
+
+## fun site_of
+
+```mach
+pub fun site_of(sites: *outcome.Place, i: u32) outcome.Place;
+```
+
+the place `i` of a model's per-entry places, the zero place when none were recorded
+
+## fun free_sites
+
+```mach
+pub fun free_sites(alloc: *A.Allocator, sites: *outcome.Place, count: u32);
+```
+
+## rec Sites
+
+```mach
+pub rec Sites;
+```
+
+the places a refusal names, gathered in order: it points at the first and
+names the rest as related
+
+list: the places, an unspanned one skipped
+refused: the allocator refused to hold one, which the refusal becomes
+
+## fun sites_init
+
+```mach
+pub fun sites_init(alloc: *A.Allocator) Sites;
+```
+
+## fun sites_add
+
+```mach
+pub fun sites_add(s: *Sites, p: outcome.Place);
+```
+
+## fun sites_fail
+
+```mach
+pub fun sites_fail(alloc: *A.Allocator, s: *Sites, f: outcome.Fail) outcome.Fail;
+```
+
+`f` pointing at the first place gathered, naming the others as related; the
+gathered places are released
+
+## fun at_sites
+
+```mach
+pub fun at_sites(alloc: *A.Allocator, f: outcome.Fail, sites: *outcome.Place, n: usize) outcome.Fail;
+```
+
+`f` pointing at the first spanned place of the `n` at `sites`, naming the
+spanned ones after it as related
+
 ## fun must_lookup
 
 ```mach

@@ -110,8 +110,8 @@ the constant-time validator does.
 A failure raised outside the compiler's diagnostics, the ones the human
 rendering prints as an `error[<key>]: <message>` line with no source excerpt,
 is a record with `"record": "failure"` and the members of a diagnostic record.
-Its `severity` is `"error"`, its `code` the failure's key, and `related`,
-`notes`, `help` and `fixes` are empty.
+Its `severity` is `"error"`, its `code` the failure's key, and `notes`, `help`
+and `fixes` are empty.
 
 ```json
 {"schema":1,"record":"failure","severity":"error","code":"link.entry_missing","message":"undefined entry symbol '_start'; ensure the target startup library is linked","origin":"link","primary":null,"related":[],"notes":[],"help":[],"fixes":[]}
@@ -131,9 +131,37 @@ the path it was read at, as it names a source file.
 {"schema":1,"record":"failure","severity":"error","code":"version.invalid_range","message":"mach.toml: [project].mach = \"^x\": expected a number (clause 1)","origin":"build","primary":{"file":"mach.toml","line":2,"column":8,"end_line":2,"end_column":12,"byte_start":17,"byte_end":21},"related":[],"notes":[],"help":[],"fixes":[]}
 ```
 
-A refusal no single place in the manifest states, such as a cycle among
-`need` entries, and one raised while a build expands a path template, is not
-located.
+A refusal raised later from the parsed manifest, while a build is planned or
+its steps run, points at the entry that caused it the same way:
+
+- a path template that does not expand, at its value: `[project].out`, an
+  artifact's `out`, a local link's `path`, and a step's `argv`, `env`, `in` and
+  `out` entries
+- a step output under a directory the compiler owns, at the output
+- a local link found neither among the step outputs nor on disk, at its `path`
+- an artifact that does not build for the selected target, at its `targets`
+- no artifact building for the selected target, at every artifact's `targets`
+
+A refusal between several entries points at the first and lists the others in
+`related`, each with a `null` label:
+
+- two steps declaring one output, or two artifacts writing one path, at the
+  first claim
+- more than one `default = true` target, profile or artifact, at the first
+  `default` value
+- a selection several declarations could satisfy (`native` matching several
+  targets, several targets, profiles or artifacts with none marked default), at
+  the first candidate's table key
+- a cycle among `need` entries, at the entry of its first edge, the entries of
+  the other edges related
+
+The human rendering shows each related place on its own `-->` line after the
+primary's. A target or profile named on the command line that the manifest does
+not declare is caused by no entry in it, so its refusal has no `primary`.
+
+```json
+{"schema":1,"record":"failure","severity":"error","code":"need.cycle","message":"mach.toml: build step 'a' is part of a 'need' cycle","origin":"build","primary":{"file":"mach.toml","line":12,"column":9,"end_line":12,"end_column":17,"byte_start":141,"byte_end":149},"related":[{"file":"mach.toml","line":18,"column":9,"end_line":18,"end_column":17,"byte_start":216,"byte_end":224,"label":null}],"notes":[],"help":[],"fixes":[]}
+```
 
 `origin` names the phase the failure came from: `build` for the manifest,
 dependency resolution and build steps, the phase that failed for a failure

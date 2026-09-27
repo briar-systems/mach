@@ -232,12 +232,22 @@ pub fun find_artifact_by_name(m: *Manifest, name: intern.StrId) *ArtifactDef;
 pub fun artifact_needs_artifact(itn: *intern.Interner, a: *ArtifactDef, other: *ArtifactDef) bool;
 ```
 
+## fun expand_project_out
+
+```mach
+pub fun expand_project_out(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, v: *TmplVars) res[str, outcome.Fail];
+```
+
+expand `m`'s `[project].out` with `v`; a refusal points at the `out` value
+
 ## fun expand_artifact_output
 
 ```mach
 pub fun expand_artifact_output(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt.TargetRegistry,
 a: *ArtifactDef, project_out: str, vars: *TmplVars) res[str, outcome.Fail];
 ```
+
+expand an artifact's `out` for the target `vars` names; a refusal points at the `out` value
 
 ## fun validate_need_cycles
 

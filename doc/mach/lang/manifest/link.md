@@ -104,6 +104,15 @@ proj_out: the expanded `[project].out`
 v: the template values
 ret: the requirement; on error nothing is left allocated
 
+## fun expand_local_path
+
+```mach
+pub fun expand_local_path(alloc: *A.Allocator, itn: *intern.Interner, l: *LinkDef,
+proj_out: str, v: *TmplVars) res[str, outcome.Fail];
+```
+
+expand a local link's `path` with `v`; a refusal points at the `path` value
+
 ## fun find_link_by_name
 
 ```mach
