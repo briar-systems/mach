@@ -309,7 +309,7 @@ pub rec DiagnosticBatch;
 ```mach
 pub tag BuildEvent: u8 {
     unit:        BuildUnitEvent;
-    fail:        Fail;
+    fail:        FailEvent;
     diagnostics: DiagnosticBatch;
 }
 ```
@@ -317,6 +317,14 @@ pub tag BuildEvent: u8 {
 what a build recorded, in order: a unit finished, a failure, or a batch of
 diagnostics with the sources they refer to. every payload is owned by the
 outcome's allocator
+
+## rec FailEvent
+
+```mach
+pub rec FailEvent;
+```
+
+a failure recorded outside a diagnostic store, and the phase it is reported under
 
 ## def BuildSeverity
 
@@ -406,10 +414,12 @@ pub fun record_unit(bo: *BuildOutcome, artifact: str, target: str, verb: str, ha
 ## fun record_fail
 
 ```mach
-pub fun record_fail(bo: *BuildOutcome, f: *Fail) err[A.Error];
+pub fun record_fail(bo: *BuildOutcome, f: *Fail, origin: diagnostic.Origin) err[A.Error];
 ```
 
 the failure is copied whole: its text into the outcome's allocator
+
+origin: the phase the failure is reported under
 
 ## fun record_diagnostics
 

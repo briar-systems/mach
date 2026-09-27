@@ -236,6 +236,15 @@ pub fun phase_name(k: PhaseKind) opt[str];
 
 the name of a declared build phase, absent for an unknown catalog member
 
+## fun phase_origin
+
+```mach
+pub fun phase_origin(k: PhaseKind) diagnostic.Origin;
+```
+
+the origin a failure of the phase is reported under: a build step is the
+build's, a test build's test objects are generated code
+
 ## fun unknown_phase
 
 ```mach
