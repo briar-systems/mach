@@ -173,6 +173,6 @@ a: allocator for the text buffer
 out: overview, command and action pages go here
 fault: malformed-request and unknown-action errors go here
 route: from resolve_help_route
-ret: 0 for a rendered page, 1 for a malformed request, an unknown action or HELP_ROUTE_NONE,
-       2 when rendering failed
+ret: exit.OK for a rendered page, exit.USER for a malformed request, an unknown action or
+       HELP_ROUTE_NONE, or the code `exit.of` maps a rendering failure to
 

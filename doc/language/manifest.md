@@ -86,7 +86,7 @@ debug = true                           # emit debug info for this profile
 simd  = "scalarize"                    # SIMD lever: "scalarize" | "require"
 vectorize = false                      # auto-vectorization lever
 float_reassoc = false                  # float reassociation permission
-# allow = ["unused-import"]            # optional: warning kinds this profile silences
+# allow = ["import.unused"]            # optional: warning keys this profile silences
 
 [artifact.demo]                        # a produced artifact
 kind    = "bin"                        # "bin" | "static" | "shared"
@@ -670,11 +670,11 @@ naming come from `[target.*]` facts, and an absent optional feature such as a
 |---------|---------|---------|
 | `opt`   | integer | Optimization level: `0` selects the debug pipeline (the always-on passes only), `1` and `2` select the release pipeline. `1` and `2` currently share a pass set, which includes loop auto-vectorization (see `vectorize` below). Any other integer — or a non-integer — is a manifest error. |
 | `debug` | bool    | Emit debug info for this profile: DWARF in ELF, Mach-O and COFF objects alike, and the core SPIR-V debug instructions on a `spirv` target (see [Finished-module targets](#finished-module-targets)). A PE image carries its DWARF in `.debug_*` sections, which gdb, lldb and the LLVM tools read and Visual Studio and WinDbg do not. Gates emission only, never the optimizer, so a `release` profile can keep symbols with `debug = true`. A non-boolean is a manifest error. |
-| `simd`  | string  | SIMD scalarization lever. `"scalarize"` emits a defined unrolled scalar expansion wherever the target has no packed instruction for a vector operator, with one `scalarize` warning at each such operation naming the operation, its lanes, the function, the target and the extension that would pack it (or that none would). `"require"` makes each of those sites a hard error with the same text. It applies **per operation on every target**, not only to targets with no vector unit: x86-64's SSE2 baseline has no 32-bit lane integer multiply and NEON has no 64-bit one, so a capable target scalarizes too. Any other string is a manifest error. |
+| `simd`  | string  | SIMD scalarization lever. `"scalarize"` emits a defined unrolled scalar expansion wherever the target has no packed instruction for a vector operator, with one `vector.scalarize` warning at each such operation naming the operation, its lanes, the function, the target and the extension that would pack it (or that none would). `"require"` makes each of those sites a hard error with the same text. It applies **per operation on every target**, not only to targets with no vector unit: x86-64's SSE2 baseline has no 32-bit lane integer multiply and NEON has no 64-bit one, so a capable target scalarizes too. Any other string is a manifest error. |
 | `vectorize` | bool | Auto-vectorization lever. When `true`, the release pipeline rewrites provably-safe counted loops to 128-bit SIMD on a target with hardware vectors; `false` skips the pass, so release output stays scalar. A non-boolean is a manifest error. |
 | `float_reassoc` | bool | Permission to treat floating-point addition and multiplication as **associative**. It lets the vectorizer reduce an `f32`/`f64` accumulator through lane-count partial sums, which changes the result — see [Float reassociation](#float-reassociation) for what that costs and what it buys. A non-boolean is a manifest error. |
 | `default` | bool | **Optional.** `true` marks the profile a build uses when several are declared and `--profile` is absent. Exactly one profile may carry it. See [Profile requirement and selection](#profile-requirement-and-selection). |
-| `allow` | array of strings | **Optional.** The warning kinds this profile silences, each named once from the [warning kind table](#silencing-warnings). An unknown name, an error kind, a repeated name or a non-string entry is a manifest error. Absent, nothing is silenced. |
+| `allow` | array of strings | **Optional.** The warnings this profile silences, each entry a key or a family of keys from the [warning key table](#silencing-warnings), named once. An unknown key, an entry that covers only errors, a repeated entry or a non-string entry is a manifest error. Absent, nothing is silenced. |
 
 Five keys (`opt`, `debug`, `simd`, `vectorize`, `float_reassoc`) are required
 in a declared profile, in a root and in a dependency manifest alike; only
@@ -743,7 +743,14 @@ ecosystem fork and no dual API.
 
 ### Silencing warnings
 
-`allow` names warning kinds the build does not report. A silenced warning is
+Every diagnostic kind has a dotted key, named by the subject it concerns, and
+every diagnostic that has one prints it:
+
+```
+warning[vector.scalarize]: vector divide on 4 lanes of 32-bit integers in 'app.main.kernel' scalarizes on x86_64: no packed form for it at any extension
+```
+
+`allow` names warning keys the build does not report. A silenced warning is
 dropped before it is printed or counted, so the summary's warning count leaves
 it out as well. Nothing else changes: the same code is built, and an error is
 never silenced.
@@ -755,36 +762,51 @@ debug = false
 simd = "scalarize"
 vectorize = true
 float_reassoc = false
-allow = ["unused-import", "deprecated"]
+allow = ["import.unused", "target"]
 ```
+
+A key's leading components name a family: `"target"` covers
+`target.skipped` and `target.native_fallback`, and `"vector"` covers
+`vector.scalarize`. A family covers whole components only, so `"vec"` is not a
+key. To acknowledge one warning where it is raised instead of across the whole
+build, put [`#[expect]`](decorators.md#expectkey--acknowledge-a-warning) on the
+declaration that raises it.
 
 Every diagnostic kind has one row in one table in the compiler
 (`src/lang/diagnostic/kind.mach`). Each warning names its row where it is
-raised, and `allow` reads the same rows, so a name here is exactly the kind the
-warning carries. The list is closed: a name no row declares is refused, naming
-the warning kinds there are. A name is never reused for a different kind.
+raised, and `allow`, `#[expect]` and the printed key read the same rows, so a
+key here is exactly the kind the warning carries. The list is closed: a key no
+row declares is refused, naming the warning keys there are. A key is never
+reused for a different kind.
 
-| Kind | Warns when |
+| Key | Warns when | Decided by source |
+|---|---|---|
+| `import.unused` | a symbol import names something the module never uses | yes |
+| `decl.deprecated` | code outside a `#[deprecated]` declaration's module uses it | yes |
+| `doc.lint` | a doc comment's component list names no parameter, field, generic or `ret` of its declaration, leaves a component undescribed, or lists them out of declaration order | yes |
+| `float.inexact` | a float literal is not exact at its type and its digits are not the shortest spelling of the value stored | yes |
+| `fwd.instances` | a shared library `fwd`s a generic, comptime-parameter or pack declaration, which exports no symbol | no |
+| `debug.dropped` | the linker leaves out an object's debug info that it cannot merge | no |
+| `target.skipped` | multi-target analysis skips a declared target this build does not support | no |
+| `target.native_fallback` | `native` matches no declared target and a declared target is built instead | no |
+| `vector.scalarize` | a vector operation falls back to scalar code on the target (see `simd`); portable code silences it | no |
+| `expect.unfulfilled` | an `#[expect]` names a key decided by source and no such warning is raised inside its declaration | no |
+
+A kind decided by source warns or not from the source text alone, whatever the
+target, goal or profile. Only such a key is reported when an `#[expect]`
+naming it goes unfulfilled; the others depend on what the build compiles and
+for which target, so an expectation of one can be quiet in a given build.
+
+Only warnings can be silenced. The table also keys error kinds, which print
+their key as well, and naming one in `allow` is refused rather than read as
+unknown:
+
+| Key | Error |
 |---|---|
-| `unused-import` | a symbol import names something the module never uses |
-| `deprecated` | code outside a `#[deprecated]` declaration's module uses it |
-| `doclint` | a doc comment's component list names no parameter, field, generic or `ret` of its declaration, leaves a component undescribed, or lists them out of declaration order |
-| `fwd-instances` | a shared library `fwd`s a generic, comptime-parameter or pack declaration, which exports no symbol |
-| `debug-dropped` | the linker leaves out an object's debug info that it cannot merge |
-| `target-skipped` | multi-target analysis skips a declared target this build does not support |
-| `native-fallback` | `native` matches no declared target and a declared target is built instead |
-| `inexact-float-literal` | a float literal is not exact at its type and its digits are not the shortest spelling of the value stored |
-| `scalarize` | a vector operation falls back to scalar code on the target (see `simd`); portable code silences it |
-
-Only warnings can be silenced. The table also names error kinds, and naming
-one in `allow` is refused rather than read as unknown:
-
-| Kind | Error |
-|---|---|
-| `not-oblivious` | a function performs a constant-time operation on a secret value without `#[oblivious]` |
+| `secret.not_oblivious` | a function performs a constant-time operation on a secret value without `#[oblivious]` |
 
 ```
-error: mach.toml: [profile.release].allow entry "not-oblivious" names an error; only a warning can be silenced
+error: mach.toml: [profile.release].allow entry "secret.not_oblivious" names an error; only a warning can be silenced
 ```
 
 Like the SIMD levers, `allow` is the consumer's: a dependency's profiles are

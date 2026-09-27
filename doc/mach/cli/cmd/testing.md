@@ -15,7 +15,6 @@ do not collide
 
 argv: the full process arguments
 inv: the parsed invocation for this command
-ret: 0 every test passed, 1 a usage error, a build user error, or at least one failed
-      test, 2 an internal or infrastructure failure or out of memory, 3 an environment
-      failure during the build
+ret: exit.OK when every test passed, exit.USER for at least one failed test, exit.INTERNAL
+      for an infrastructure failure, otherwise the code `exit.of` maps the printed failure to
 

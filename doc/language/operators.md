@@ -424,7 +424,7 @@ falls back to the scalar expansion is one warning at its own site, never one per
 lane. The warning names the operation, its lanes and the target:
 
 ```
-warning: vector divide on 4 lanes of 32-bit integers in 'app.main.kernel' scalarizes on x86_64: no packed form for it at any extension
+warning[vector.scalarize]: vector divide on 4 lanes of 32-bit integers in 'app.main.kernel' scalarizes on x86_64: no packed form for it at any extension
 ```
 
 Every packed row in a target's catalog declares the extension its instruction
@@ -432,8 +432,10 @@ needs, and the warning reads those rows. When a row declared under an extension
 would pack the operation, the warning names that extension in place of "no
 packed form", for example "declaring `sse41` in the target's `extensions` packs it", and
 declaring it in [`[target.<name>].extensions`](manifest.md#instruction-set-extensions)
-makes the warning go away. Code that is portable on purpose silences the kind
-with `allow = ["scalarize"]` in its profile, and
+makes the warning go away. Code that is portable on purpose silences the key
+with `allow = ["vector.scalarize"]` in its profile, a declaration that
+scalarizes on purpose acknowledges it with
+[`#[expect("vector.scalarize")]`](decorators.md#expectkey--acknowledge-a-warning), and
 [`simd = "require"`](manifest.md#profilename) turns the same sites into errors
 with the same text.
 

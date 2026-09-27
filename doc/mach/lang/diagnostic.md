@@ -114,6 +114,26 @@ pub rec DiagMark;
 pub rec DiagnosticStore;
 ```
 
+## rec Expectation
+
+```mach
+pub rec Expectation;
+```
+
+one key of a declaration's `#[expect]`: a warning of a kind it selects,
+located in the declaration's own file between `start` and `end`, is
+acknowledged there and dropped
+
+file_id:   the declaration's file
+start:     the offset the declaration begins at, its doc comment included
+end:       the offset just past the declaration
+key:       where the key is spelled, which an unfulfilled report points at
+text:      the key as written, owned by the interner it was decoded into
+kinds:     the warning kinds the key selects
+judged:    the key selects a kind the source alone decides and the
+           declaration was checked this build, so fulfilment is reported
+fulfilled: a warning matched it
+
 ## rec DiagnosticBuilder
 
 ```mach
@@ -133,6 +153,25 @@ pub fun silence(store: *DiagnosticStore, set: dkind.KindSet);
 ```
 
 drop every warning of a kind in `set` that reaches the store from now on
+
+## fun expect
+
+```mach
+pub fun expect(store: *DiagnosticStore, list: Vector[Expectation]);
+```
+
+acknowledge every warning an expectation in `list` covers as it reaches the
+store; the store takes the list
+
+## fun report_unfulfilled
+
+```mach
+pub fun report_unfulfilled(store: *DiagnosticStore);
+```
+
+an expectation nothing fulfilled is itself a warning, where it is judged: a
+build with errors judges none, since a pass it stopped may have been the one
+to raise the warning
 
 ## fun truncate
 
@@ -275,8 +314,8 @@ pub fun remove_fix_committed(store: *DiagnosticStore, id: DiagnosticId, fix: Fix
 pub fun commit(b: *DiagnosticBuilder, store: *DiagnosticStore) res[opt[DiagnosticId], fail.Fail];
 ```
 
-consumes the builder into the store; absent when the store silences the warning's kind,
-which drops it
+consumes the builder into the store; absent when the store silences the warning's kind
+or an expectation acknowledges it, which drops it
 
 ## fun resolve
 

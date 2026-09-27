@@ -50,5 +50,6 @@ not an error; "nothing to clean" prints when nothing was removed
 
 argv: the full process arguments
 inv: the parsed invocation for this command
-ret: 0 success, 1 manifest error or escaping target, 2 allocator failure, 3 read or removal failure
+ret: exit.OK, or the shared code of the failure: exit.USER for a manifest error or an escaping
+      target, exit.INTERNAL for an allocator failure, exit.ENVIRONMENT for a read or removal failure
 

@@ -219,7 +219,9 @@ pub fun refresh_diagnostics(p: *Project) err[outcome.Fail];
 ```
 
 the session's store is rebuilt from the project's and the query presentation's,
-dropping the warnings the profile's `allow` silences
+dropping the warnings a declaration's `#[expect]` acknowledges and the ones the
+profile's `allow` silences, then reporting each judged expectation nothing
+fulfilled. a warning replayed from the cache passes through here as a fresh one does
 
 ## fun finish_query_phase
 

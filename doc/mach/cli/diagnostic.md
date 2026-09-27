@@ -36,6 +36,17 @@ a reported Fail prints nothing, its diagnostics having been rendered already
 f: the Fail
 ret: the exit code `exit.of` maps the failure to
 
+## fun refuse
+
+```mach
+pub fun refuse(f: outcome.Fail) i64;
+```
+
+render_fail for a failure built in place
+
+f: the Fail
+ret: the exit code `exit.of` maps the failure to
+
 ## fun outcome_code_w
 
 ```mach
