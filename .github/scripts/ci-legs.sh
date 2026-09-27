@@ -19,7 +19,7 @@
 # docs runs on every pull request and is not a leg.
 set -euo pipefail
 
-corpus_all='x86_64-linux aarch64-linux riscv64-linux riscv64zkt-linux x86_64-windows x86_64-darwin aarch64-darwin riscv32'
+corpus_all='x86_64-linux x86_64v3-linux aarch64-linux riscv64-linux riscv64zkt-linux x86_64-windows x86_64-darwin aarch64-darwin riscv32'
 link_all='x86_64-linux aarch64-linux x86_64-windows'
 
 legs=
@@ -34,7 +34,7 @@ differential() { every_corpus; add qemu riscv32 spirv; }
 # what feeds every backend reaches every consumer of emitted code: the corpus,
 # the debug model and the link cases. darwin stays with the darwin rows and main.
 backend() { add compiler dwarf; differential; link_legs; }
-x64() { corpus x86_64-linux x86_64-windows x86_64-darwin; }
+x64() { corpus x86_64-linux x86_64v3-linux x86_64-windows x86_64-darwin; }
 arm64() { corpus aarch64-linux aarch64-darwin; }
 riscv() { corpus riscv64-linux riscv64zkt-linux riscv32; add qemu riscv32; }
 # column <target>: one test/run.sh column with whichever job executes it
@@ -77,14 +77,14 @@ select_path() {
         src/lang/target/isa/riscv/*|src/lang/target/isa/riscv.mach|src/lang/target/abi/riscv.mach)
             add compiler dwarf; riscv; link x86_64-linux ;;
         src/lang/target/abi/sysv.mach)
-            add compiler dwarf; corpus x86_64-linux x86_64-darwin; link x86_64-linux ;;
+            add compiler dwarf; corpus x86_64-linux x86_64v3-linux x86_64-darwin; link x86_64-linux ;;
         src/lang/target/abi/aapcs64.mach)
             add compiler dwarf; arm64; link x86_64-linux aarch64-linux ;;
         src/lang/target/abi/win64.mach)
             add compiler dwarf; corpus x86_64-windows; link x86_64-linux x86_64-windows ;;
 
         src/lang/target/os/linux.mach)
-            add compiler; corpus x86_64-linux aarch64-linux riscv64-linux riscv64zkt-linux; link x86_64-linux aarch64-linux ;;
+            add compiler; corpus x86_64-linux x86_64v3-linux aarch64-linux riscv64-linux riscv64zkt-linux; link x86_64-linux aarch64-linux ;;
         src/lang/target/os/windows.mach)
             add compiler; corpus x86_64-windows; link x86_64-linux x86_64-windows ;;
         src/lang/target/os/darwin.mach)

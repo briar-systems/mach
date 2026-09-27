@@ -40,20 +40,22 @@ cflags_O0="-std=c11 -O0 -ffp-contract=off -Wall -Wextra"
 cflags_O2="-std=c11 -O2 -ffp-contract=off -Wall -Wextra"
 cflags_ubsan="-std=c11 -O0 -ffp-contract=off -fsanitize=undefined -fno-sanitize-recover=all"
 
-# the targets: name isa os abi of kind entry qemu. qemu names the
+# the targets: name isa os abi of kind entry qemu ext. qemu names the
 # qemu-user command that runs the target under --qemu, or - for none. a direct
 # target with one also builds a run bin from test/lib/start_<name>.mach, re-laid
 # by test/lib/elf_loadable.py, since qemu-user cannot map a freestanding image.
+# ext is the manifest `extensions` entry the target selects, or - for none.
 targets_all='
-x86_64-linux      x86_64      linux         sysv64   -    bin     hosted  -
-aarch64-linux     aarch64     linux         aapcs64  -    bin     hosted  qemu-aarch64
-riscv64-linux     riscv64     linux         lp64d    -    bin     hosted  qemu-riscv64
-riscv64zkt-linux  rv64gc_zkt  linux         lp64d    -    bin     hosted  qemu-riscv64
-x86_64-windows    x86_64      windows       win64    -    bin     hosted  -
-x86_64-darwin     x86_64      darwin        sysv64   -    bin     hosted  -
-aarch64-darwin    aarch64     darwin        aapcs64  -    bin     hosted  -
-spirv             spirv       freestanding  spirv    -    bin     direct  -
-riscv32           rv32imafdc  freestanding  ilp32d   elf  static  direct  qemu-riscv32
+x86_64-linux      x86_64      linux         sysv64   -    bin     hosted  -             -
+x86_64v3-linux    x86_64      linux         sysv64   -    bin     hosted  -             x86-64-v3
+aarch64-linux     aarch64     linux         aapcs64  -    bin     hosted  qemu-aarch64  -
+riscv64-linux     riscv64     linux         lp64d    -    bin     hosted  qemu-riscv64  -
+riscv64zkt-linux  rv64gc_zkt  linux         lp64d    -    bin     hosted  qemu-riscv64  -
+x86_64-windows    x86_64      windows       win64    -    bin     hosted  -             -
+x86_64-darwin     x86_64      darwin        sysv64   -    bin     hosted  -             -
+aarch64-darwin    aarch64     darwin        aapcs64  -    bin     hosted  -             -
+spirv             spirv       freestanding  spirv    -    bin     direct  -             -
+riscv32           rv32imafdc  freestanding  ilp32d   elf  static  direct  qemu-riscv32  -
 '
 # where a run bin is based: above the host's mmap floor with a page for its headers
 run_base=0x20000
@@ -261,10 +263,11 @@ manifest() {
     echo '[project]'; echo 'id = "corpus"'; echo 'version = "0.0.0"'; echo 'mach = ">=5"'; echo 'src = "src"'
     echo 'out = "o/{target.name}/{profile.name}"'; echo
     names=
-    printf '%s\n' "$targets_all" | while read -r name isa os abi of kind entry q; do
+    printf '%s\n' "$targets_all" | while read -r name isa os abi of kind entry q ext; do
         [ -n "$name" ] && [ "$entry" = "$shape" ] || continue
         echo "[target.$name]"; echo "isa = \"$isa\""; echo "os  = \"$os\""; echo "abi = \"$abi\""
         [ "$of" != - ] && echo "of  = \"$of\""
+        [ "$ext" != - ] && echo "extensions = [\"$ext\"]"
         [ "$shape" = direct ] && runs_bare "$name" && echo "base = $run_base"
         echo
     done
@@ -284,7 +287,7 @@ manifest() {
             echo "targets = [$(printf '%s\n' "$targets_all" | awk '$7 == "hosted" { printf "%s\"%s\"", (n++ ? ", " : ""), $1 }')]"
             echo 'link = []'; echo 'need = []'; echo
         else
-            printf '%s\n' "$targets_all" | while read -r name isa os abi of kind entry q; do
+            printf '%s\n' "$targets_all" | while read -r name isa os abi of kind entry q ext; do
                 [ -n "$name" ] && [ "$entry" = direct ] || continue
                 echo "[artifact.${a}_$kind]"; echo "kind = \"$kind\""; echo "entry = \"cases/$c.mach\""
                 if [ "$kind" = static ]; then echo "out = \"lib/$a.a\""; else echo "out = \"bin/$a\""; fi
