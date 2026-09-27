@@ -403,7 +403,13 @@ bit-compatible with a C `int __attribute__((vector_size(32)))` parameter:
   hidden result pointer, as gcc does. clang (Apple clang included) returns such a
   vector in `xmm0` and `xmm1` instead, against the psABI, so a C function built by
   clang that returns one disagrees with mach; declare the C side's result as a
-  record of the same size, which clang returns as MEMORY.
+  record of the same size, which clang returns as MEMORY. Apple clang also places
+  such a vector *argument* on the stack at 16 bytes rather than at its C
+  alignment, so it disagrees with mach wherever the vector's stack offset is not
+  already a multiple of its size; on darwin declare the C side's argument as a
+  record of the same size with `__attribute__((aligned(32)))` (or the vector's
+  size), which Apple clang places as the psABI places the vector. Mach follows the
+  psABI on darwin as on linux.
 - **x86_64-windows (Microsoft x64):** the carrier table under [Windows vector
   carriers](#windows-vector-carriers): a pointer to a caller copy, and
   caller-provided result storage.

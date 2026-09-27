@@ -8,10 +8,17 @@ int _fltused = 0;
  * as a byte-array record (doc/language/ext-fun.md, "Windows vector carriers"),
  * which the convention passes as a pointer to a caller copy and returns through
  * caller-provided storage; an int array of the same extent is placed the same
- * way. Every other convention takes C's own vector type. */
-#ifdef _WIN32
+ * way. Apple clang places a System V vector argument on the stack at 16 bytes
+ * rather than at its C alignment, so on x86_64 darwin the record of the same
+ * extent raised to that alignment, which Apple clang places as the psABI places
+ * the vector, stands for it. Every other convention takes C's own vector type. */
+#if defined(_WIN32)
 typedef struct { int v[8]; } v8;
 typedef struct { int v[16]; } v16;
+#define LANE(x, i) ((x).v[i])
+#elif defined(__APPLE__) && defined(__x86_64__)
+typedef struct __attribute__((aligned(32))) { int v[8]; } v8;
+typedef struct __attribute__((aligned(64))) { int v[16]; } v16;
 #define LANE(x, i) ((x).v[i])
 #else
 typedef int v8 __attribute__((vector_size(32)));
