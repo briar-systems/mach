@@ -40,13 +40,13 @@ exe_path: *u8) res[LoadedImageOptions, outcome.Fail];
 ## fun emit_static_archive
 
 ```mach
-pub fun emit_static_archive(p: *driver.Project, destination: str, images: *of.ObjectImage, paths: **u8, out_path: **u8) err[outcome.Fail];
+pub fun emit_static_archive(p: *driver.Project, destination: str, images: *of.ObjectImage, inputs: *of.ObjectInput, out_path: **u8) err[outcome.Fail];
 ```
 
 ## fun emit_shared_library
 
 ```mach
-pub fun emit_shared_library(p: *driver.Project, destination: str, paths: **u8, len: u32,
+pub fun emit_shared_library(p: *driver.Project, destination: str, inputs: *of.ObjectInput, len: u32,
 dynlibs: *of.DynLib, dynlib_len: u32, out_path: **u8) err[outcome.Fail];
 ```
 
@@ -54,14 +54,14 @@ dynlibs: *of.DynLib, dynlib_len: u32, out_path: **u8) err[outcome.Fail];
 
 ```mach
 pub fun link_shared_images(p: *driver.Project, images: *of.ObjectImage,
-ext_paths: **u8, ext_count: u32,
+ext: *of.ObjectInput, ext_count: u32,
 dynlibs: *of.DynLib, dynlib_len: u32, destination: str, out_path: **u8) err[outcome.Fail];
 ```
 
 ## fun link_executable
 
 ```mach
-pub fun link_executable(p: *driver.Project, paths: **u8, len: u32,
+pub fun link_executable(p: *driver.Project, inputs: *of.ObjectInput, len: u32,
 dynlibs: *of.DynLib, dynlib_len: u32, destination: str,
 image_options: of.ImageOptions) err[outcome.Fail];
 ```
@@ -86,7 +86,7 @@ format that object is the complete deliverable, so no other module takes part
 
 ```mach
 pub fun link_mixed_images(p: *driver.Project, images: *of.ObjectImage,
-ext_paths: **u8, ext_count: u32,
+ext: *of.ObjectInput, ext_count: u32,
 dynlibs: *of.DynLib, dynlib_len: u32, destination: str,
 image_options: of.ImageOptions) err[outcome.Fail];
 ```
@@ -95,9 +95,12 @@ image_options: of.ImageOptions) err[outcome.Fail];
 
 ```mach
 pub fun append_external_inputs(p: *driver.Project, unit: *plan.BuildUnit,
-paths: ***u8, len: *u32,
+inputs: **of.ObjectInput, len: *u32,
 dynlibs: **of.DynLib, dynlib_len: *u32) err[outcome.Fail];
 ```
+
+the unit's static link inputs, each the user's (RELOC_INPUT), appended to
+`inputs` after whatever it already holds
 
 ## fun free_dynlibs
 
@@ -109,7 +112,7 @@ pub fun free_dynlibs(a: *A.Allocator, dynlibs: *of.DynLib, dynlib_len: u32);
 
 ```mach
 pub fun write_objects(p: *driver.Project, images: *of.ObjectImage,
-destinations: *str, paths_out: ***u8) err[outcome.Fail];
+destinations: *str, inputs_out: **of.ObjectInput) err[outcome.Fail];
 ```
 
 every module's object reaches `obj/` through a sibling temporary, since the
@@ -125,9 +128,9 @@ each test object reaches `obj/` beside its module's object, the same way
 
 destinations: per emitted module, its test object's path, nil for a module without one
 
-## fun free_paths
+## fun free_inputs
 
 ```mach
-pub fun free_paths(a: *A.Allocator, paths: **u8, n: u32, cap: u32);
+pub fun free_inputs(a: *A.Allocator, inputs: *of.ObjectInput, n: u32, cap: u32);
 ```
 

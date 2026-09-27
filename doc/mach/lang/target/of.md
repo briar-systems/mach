@@ -771,13 +771,23 @@ a relocation the link or the object writer refuses is the user's when their
 inline asm or an input object asked for it, and a compiler defect when
 codegen made it
 
-## fun mark_input_relocations
+## rec ObjectInput
 
 ```mach
-pub fun mark_input_relocations(img: *ObjectImage);
+pub rec ObjectInput;
 ```
 
-every relocation of an image mach did not make is the input's
+an object or archive the link reads from a path, and who produced it: an
+object mach wrote (RELOC_CODEGEN) or an input mach did not make
+(RELOC_INPUT). the origin travels with the path from where the list is built
+
+## fun set_relocation_origin
+
+```mach
+pub fun set_relocation_origin(img: *ObjectImage, origin: RelocOrigin);
+```
+
+every relocation of an image read from an input takes that input's origin
 
 ## val INDIRECT_LOCAL
 

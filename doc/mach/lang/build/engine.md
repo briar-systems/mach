@@ -45,7 +45,7 @@ ret: the outcome of that one unit, released with outcome.outcome_dnit, or an eng
 
 ```mach
 pub fun set_link_config_input(p: *driver.Project, out_path: *u8, product: *u8, out_kind: u32,
-ext_paths: **u8, ext_count: u32,
+ext: *of.ObjectInput, ext_count: u32,
 dynlibs: *of.DynLib, dynlib_count: u32,
 image: *emit.LoadedImageOptions) err[outcome.Fail];
 ```
