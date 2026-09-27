@@ -52,13 +52,14 @@ uint64_t checksum(uint64_t seed) {
     h = mix_i32(h, (int32_t)skip);
     h = mix_i64(h, (int64_t)ws);
 
+    const int64_t g = (int64_t)(seed & UINT64_C(4095)) - 2047;
     uint32_t ma = 0;
     uint64_t mw = 0;
     for (i = 0; i < n; i++) {
         ma = (uint32_t)(ma + (uint32_t)((uint32_t)x[i] * (uint32_t)y[i]));
     }
     for (i = 0; i < n; i++) {
-        mw = (uint64_t)(mw + (uint64_t)((int64_t)x[i] * (int64_t)y[i]));
+        mw = (uint64_t)(mw + (uint64_t)((int64_t)x[i] * g));
     }
     h = mix_i32(h, (int32_t)ma);
     h = mix_i64(h, (int64_t)mw);
