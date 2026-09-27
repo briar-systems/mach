@@ -41,7 +41,7 @@ sym_locs: *map.Map[intern.StrId, SymbolLoc],
 dyn: *DynState, local_got: *LocalGotPlan,
 strm: *StrMerge, format: *of.OfVTable,
 arch: *isa.IsaVTable,
-image_base: u64, atoms: *AtomPlan) err[fail.Fail];
+image_base: u64, atoms: *AtomPlan, thunks: *ThunkPlan) err[fail.Fail];
 ```
 
 ## fun init_local_got_plan

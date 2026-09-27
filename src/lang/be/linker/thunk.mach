@@ -1,0 +1,979 @@
+# range-extension thunks: a direct branch whose target lies beyond the reach of
+# its instruction is sent through a thunk the link places within reach of it,
+# which forms the destination's address and jumps there (#3898). thunks sit in
+# islands the link opens in the code, each at a point the code may be split,
+# and one thunk serves every branch to its destination that reaches its island.
+#
+# the plan is made once the code's layout is otherwise final, in the code's own
+# offsets, before any address the islands would move is used. an island shifts
+# everything after it by a multiple of the code's alignment, so the plan finds
+# every position after the islands by adding up the islands before it.
+
+use std.collections.map;
+use std.collections.sort;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use dkind: mach.lang.diagnostic.kind;
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.session;
+use mach.lang.target.isa;
+use mach.lang.target.of;
+use rel: mach.lang.target.of.reloc;
+
+use mach.lang.be.linker.atoms.AtomGap;
+use mach.lang.be.linker.atoms.AtomPlan;
+use mach.lang.be.linker.atoms.atom_live_len;
+use mach.lang.be.linker.atoms.atom_live_offset;
+use mach.lang.be.linker.atoms.atom_offset_dead;
+use mach.lang.be.linker.atoms.atom_plan_open_gaps;
+use mach.lang.be.linker.common.grow_cap;
+use mach.lang.be.linker.dynamic.DynState;
+use mach.lang.be.linker.dynamic.dynstate_add_fixup;
+use mach.lang.be.linker.dynamic.dynstate_import_index;
+use mach.lang.be.linker.dynamic.dynstate_import_is_func;
+use mach.lang.be.linker.merge.MergedSection;
+use mach.lang.be.linker.merge.Placement;
+use mach.lang.be.linker.merge.SectionGroups;
+use mach.lang.be.linker.merge.section_group_index;
+use mach.lang.be.linker.merge.segment_index_for;
+use mach.lang.be.linker.resolve.SymbolLoc;
+use mach.lang.be.linker.resolve.resolved_symbol_name;
+
+val NONE: u32 = 0xFFFFFFFF;
+
+# the passes the plan may take before it gives up on reaching a fixed point
+val MAX_PASSES: u32 = 64;
+
+# a branch the link may send through a thunk, at its position in the code
+rec ThunkBranch {
+    module: u32;
+    reloc:  u32;
+    src:    u64;
+    target: u32;
+    thunk:  u32;
+    reach:  of.BranchReach;
+}
+
+# a destination branches reach: a position in the code plus the branch's
+# addend, or an imported function's call stub somewhere in the stub table at
+# `pos`, `span` bytes long
+rec ThunkTarget {
+    import_index: u32;
+    pos:          u64;
+    span:         u64;
+    addend:       i64;
+}
+
+# a point the code may be split at: input offset `offset` of section `flat`,
+# at position `pos` in the code
+rec ThunkSite {
+    flat:   u32;
+    offset: u32;
+    pos:    u64;
+}
+
+rec ThunkIsland {
+    site:  u32;
+    pos:   u64;
+    count: u32;
+    size:  u64;
+}
+
+rec Thunk {
+    island: u32;
+    slot:   u32;
+    target: u32;
+}
+
+# a nonzero-addend reference into a code section, the input offsets (lo, hi]
+# no island may split
+rec ThunkSpan {
+    flat: u32;
+    lo:   u32;
+    hi:   u32;
+}
+
+pub rec ThunkPlan {
+    shape:        of.BranchThunk;
+    unit:         u64;
+    text_vaddr:   u64;
+    branches:     *ThunkBranch;
+    branch_count: u32;
+    branch_cap:   u32;
+    targets:      *ThunkTarget;
+    target_count: u32;
+    target_cap:   u32;
+    sites:        *ThunkSite;
+    site_count:   u32;
+    site_cap:     u32;
+    islands:      *ThunkIsland;
+    island_count: u32;
+    island_cap:   u32;
+    thunks:       *Thunk;
+    thunk_count:  u32;
+    thunk_cap:    u32;
+    # target << 32 | island to the thunk that island holds for the target
+    slots: map.Map[u64, u32];
+    # module << 32 | relocation to the thunk the branch goes through
+    by_reloc: map.Map[u64, u32];
+    # target key to target
+    target_keys: map.Map[u64, u32];
+    active:      bool;
+}
+
+pub fun init_thunk_plan(plan: *ThunkPlan) {
+    plan.unit         = 0;
+    plan.text_vaddr   = 0;
+    plan.branches     = nil;
+    plan.branch_count = 0;
+    plan.branch_cap   = 0;
+    plan.targets      = nil;
+    plan.target_count = 0;
+    plan.target_cap   = 0;
+    plan.sites        = nil;
+    plan.site_count   = 0;
+    plan.site_cap     = 0;
+    plan.islands      = nil;
+    plan.island_count = 0;
+    plan.island_cap   = 0;
+    plan.thunks       = nil;
+    plan.thunk_count  = 0;
+    plan.thunk_cap    = 0;
+    plan.active       = false;
+}
+
+pub fun free_thunk_plan(alloc: *A.Allocator, plan: *ThunkPlan) {
+    if (plan.branches != nil) { A.deallocate[ThunkBranch](alloc, plan.branches, plan.branch_cap::usize); }
+    if (plan.targets != nil)  { A.deallocate[ThunkTarget](alloc, plan.targets, plan.target_cap::usize); }
+    if (plan.sites != nil)    { A.deallocate[ThunkSite](alloc, plan.sites, plan.site_cap::usize); }
+    if (plan.islands != nil)  { A.deallocate[ThunkIsland](alloc, plan.islands, plan.island_cap::usize); }
+    if (plan.thunks != nil)   { A.deallocate[Thunk](alloc, plan.thunks, plan.thunk_cap::usize); }
+    if (plan.active) {
+        map.dnit[u64, u32](?plan.slots);
+        map.dnit[u64, u32](?plan.by_reloc);
+        map.dnit[u64, u32](?plan.target_keys);
+    }
+    init_thunk_plan(plan);
+}
+
+# whether the link placed any thunk, so the code's layout moved
+pub fun thunks_placed(plan: *ThunkPlan) bool {
+    ret plan.island_count > 0;
+}
+
+fun reach_ok(reach: of.BranchReach, disp: i64) bool {
+    if (disp < reach.min || disp > reach.max) { ret false; }
+    ret reach.align < 2 || (disp & (reach.align::i64 - 1)) == 0;
+}
+
+# where base position `b` lands once the islands open
+fun plan_pos(plan: *ThunkPlan, b: u64) u64 {
+    var r: u64 = b;
+    var i: u32 = 0;
+    for (i < plan.island_count) {
+        if (plan.islands[i].pos <= b) { r = r + plan.islands[i].size; }
+        i = i + 1;
+    }
+    ret r;
+}
+
+fun island_start(plan: *ThunkPlan, k: u32) u64 {
+    val at: u64 = plan.islands[k].pos;
+    var r:  u64 = at;
+    var i:  u32 = 0;
+    for (i < plan.island_count) {
+        if (plan.islands[i].pos < at) { r = r + plan.islands[i].size; }
+        i = i + 1;
+    }
+    ret r;
+}
+
+fun thunk_pos(plan: *ThunkPlan, t: u32) u64 {
+    ret island_start(plan, plan.thunks[t].island) + plan.thunks[t].slot::u64 * plan.shape.size::u64;
+}
+
+fun direct_ok(plan: *ThunkPlan, br: *ThunkBranch, p: i64) bool {
+    val tgt: *ThunkTarget = ?plan.targets[br.target];
+    val lo:  i64          = plan_pos(plan, tgt.pos)::i64 + tgt.addend - p;
+    if (!reach_ok(br.reach, lo)) { ret false; }
+    if (tgt.span == 0)           { ret true; }
+    ret reach_ok(br.reach, lo + tgt.span::i64);
+}
+
+fun add_site(alloc: *A.Allocator, plan: *ThunkPlan, flat: u32, offset: u32, pos: u64) err[fail.Fail] {
+    if (plan.site_count == plan.site_cap) {
+        val g: err[fail.Fail] = grow_cap[ThunkSite](alloc, ?plan.sites, ?plan.site_cap, 64);
+        if (sel g.err) { ret g; }
+    }
+    plan.sites[plan.site_count].flat   = flat;
+    plan.sites[plan.site_count].offset = offset;
+    plan.sites[plan.site_count].pos    = pos;
+    plan.site_count                    = plan.site_count + 1;
+    ret err[fail.Fail].ok{};
+}
+
+fun site_by_flat(a: *ThunkSite, b: *ThunkSite) i64 {
+    if (a.flat < b.flat)     { ret -1; }
+    if (a.flat > b.flat)     { ret 1; }
+    if (a.offset < b.offset) { ret -1; }
+    if (a.offset > b.offset) { ret 1; }
+    ret 0;
+}
+
+fun site_by_pos(a: *ThunkSite, b: *ThunkSite) i64 {
+    if (a.pos < b.pos) { ret -1; }
+    if (a.pos > b.pos) { ret 1; }
+    ret site_by_flat(a, b);
+}
+
+fun span_by_flat(a: *ThunkSpan, b: *ThunkSpan) i64 {
+    if (a.flat < b.flat) { ret -1; }
+    if (a.flat > b.flat) { ret 1; }
+    if (a.lo < b.lo)     { ret -1; }
+    if (a.lo > b.lo)     { ret 1; }
+    ret 0;
+}
+
+fun gap_order(a: *AtomGap, b: *AtomGap) i64 {
+    if (a.section < b.section) { ret -1; }
+    if (a.section > b.section) { ret 1; }
+    if (a.offset < b.offset)   { ret -1; }
+    if (a.offset > b.offset)   { ret 1; }
+    ret 0;
+}
+
+fun in_text(placements: *Placement, flat: u32) bool {
+    ret placements[flat].merged_index == of.SK_TEXT::u32;
+}
+
+# the points the code may be split at: every contribution's start, the code's
+# end, and each function mach's codegen emitted, whose atoms the link may
+# split (the same boundaries dead-code elimination cuts at). a foreign section is
+# never split inside, since its references may reach across its functions
+fun collect_sites(s: *session.Session, arch: *isa.IsaVTable, plan: *ThunkPlan,
+    modules: *of.ObjectImage, module_count: u32,
+    placements: *Placement, sec_base: *u32, atoms: *AtomPlan) err[fail.Fail] {
+    val alloc:    *A.Allocator = s.alloc;
+    var end_flat: u32          = NONE;
+    var end_pos:  u64          = 0;
+    var m:        u32          = 0;
+    for (m < module_count) {
+        var sc: u32 = 0;
+        for (sc < modules[m].section_count) {
+            val flat: u32         = sec_base[m] + sc;
+            val sec:  *of.Section = ?modules[m].sections[sc];
+            val live: u32         = atom_live_len(atoms, flat, sec.len);
+            if (in_text(placements, flat) && sec.kind == of.SK_TEXT && live > 0) {
+                val start: u64            = placements[flat].offset::u64;
+                val r:     err[fail.Fail] = add_site(alloc, plan, flat, 0, start);
+                if (sel r.err) { ret r; }
+                if (end_flat == NONE || start + live::u64 >= end_pos) {
+                    end_flat = flat;
+                    end_pos  = start + live::u64;
+                }
+            }
+            sc = sc + 1;
+        }
+        if (modules[m].codegen) {
+            var sy: u32 = 0;
+            for (sy < modules[m].symbol_count) {
+                val sym: *of.Symbol = ?modules[m].symbols[sy];
+                if ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) == 0 || of.section_is_external(sym.section)
+                    || of.section_is_absolute(sym.section)
+                    || of.section_index(sym.section) >= modules[m].section_count) {
+                    sy = sy + 1;
+                    cnt;
+                }
+                val sc2:  u32 = of.section_index(sym.section);
+                val flat: u32 = sec_base[m] + sc2;
+                if (!in_text(placements, flat) || modules[m].sections[sc2].kind != of.SK_TEXT
+                    || sym.offset == 0 || sym.offset >= modules[m].sections[sc2].len
+                    || atom_offset_dead(atoms, flat, sym.offset)) {
+                    sy = sy + 1;
+                    cnt;
+                }
+                val pos: u64            = placements[flat].offset::u64 + atom_live_offset(atoms, flat, sym.offset)::u64;
+                val r:   err[fail.Fail] = add_site(alloc, plan, flat, sym.offset, pos);
+                if (sel r.err) { ret r; }
+                sy = sy + 1;
+            }
+        }
+        m = m + 1;
+    }
+    if (end_flat != NONE) {
+        val sec_len: u32            = sec_len_of(modules, module_count, sec_base, end_flat);
+        val r:       err[fail.Fail] = add_site(alloc, plan, end_flat, sec_len, end_pos);
+        if (sel r.err) { ret r; }
+    }
+    if (plan.site_count == 0) { ret err[fail.Fail].ok{}; }
+
+    sort.sort_by[ThunkSite](plan.sites, plan.site_count::usize, site_by_flat);
+    val spans_r: err[fail.Fail] = drop_straddled_sites(s, arch, plan, modules, module_count, placements, sec_base);
+    if (sel spans_r.err) { ret spans_r; }
+
+    sort.sort_by[ThunkSite](plan.sites, plan.site_count::usize, site_by_pos);
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < plan.site_count) {
+        if (plan.sites[i].flat != NONE && (n == 0 || plan.sites[n - 1].pos != plan.sites[i].pos)) {
+            plan.sites[n] = plan.sites[i];
+            n             = n + 1;
+        }
+        i = i + 1;
+    }
+    plan.site_count = n;
+    ret err[fail.Fail].ok{};
+}
+
+fun sec_len_of(modules: *of.ObjectImage, module_count: u32, sec_base: *u32, flat: u32) u32 {
+    var m: u32 = 0;
+    for (m < module_count) {
+        if (flat >= sec_base[m] && flat - sec_base[m] < modules[m].section_count) {
+            ret modules[m].sections[flat - sec_base[m]].len;
+        }
+        m = m + 1;
+    }
+    ret 0;
+}
+
+# a symbol plus a nonzero addend into a code section is resolved as the
+# symbol's new place plus the addend, so no island may open between the two;
+# every site such a reference straddles is struck (its flat set to NONE).
+# expects the sites sorted by section and offset
+fun drop_straddled_sites(s: *session.Session, arch: *isa.IsaVTable, plan: *ThunkPlan,
+    modules: *of.ObjectImage, module_count: u32,
+    placements: *Placement, sec_base: *u32) err[fail.Fail] {
+    var spans:      *ThunkSpan = nil;
+    var span_count: u32        = 0;
+    var span_cap:   u32        = 0;
+    fin {
+        if (spans != nil) { A.deallocate[ThunkSpan](s.alloc, spans, span_cap::usize); }
+    }
+    var m: u32 = 0;
+    for (m < module_count) {
+        var ri: u32 = 0;
+        for (ri < modules[m].reloc_count) {
+            val op_r: res[of.RelocOperand, fail.Fail] = rel.resolve_operand(arch, ?modules[m], ri);
+            if (sel op_r.err) {
+                ri = ri + 1;
+                cnt;
+            }
+            val op: of.RelocOperand = op_r.ok;
+            if (op.addend == 0 || op.sym >= modules[m].symbol_count) {
+                ri = ri + 1;
+                cnt;
+            }
+            val sym: *of.Symbol = ?modules[m].symbols[op.sym];
+            if (of.section_is_external(sym.section) || of.section_is_absolute(sym.section)
+                || of.section_index(sym.section) >= modules[m].section_count) {
+                ri = ri + 1;
+                cnt;
+            }
+            val flat: u32 = sec_base[m] + of.section_index(sym.section);
+            if (!in_text(placements, flat)) {
+                ri = ri + 1;
+                cnt;
+            }
+            var e: i64 = sym.offset::i64 + op.addend;
+            if (e < 0)          { e = 0; }
+            if (e > 0xFFFFFFFF) { e = 0xFFFFFFFF; }
+            var lo: u32 = sym.offset;
+            var hi: u32 = e::u32;
+            if (hi < lo) {
+                lo = e::u32;
+                hi = sym.offset;
+            }
+            if (span_count == span_cap) {
+                val g: err[fail.Fail] = grow_cap[ThunkSpan](s.alloc, ?spans, ?span_cap, 64);
+                if (sel g.err) { ret g; }
+            }
+            spans[span_count].flat = flat;
+            spans[span_count].lo   = lo;
+            spans[span_count].hi   = hi;
+            span_count             = span_count + 1;
+            ri                     = ri + 1;
+        }
+        m = m + 1;
+    }
+    if (span_count == 0) { ret err[fail.Fail].ok{}; }
+    sort.sort_by[ThunkSpan](spans, span_count::usize, span_by_flat);
+
+    # both lists run in section and offset order, so one walk strikes every
+    # site a span covers, keeping the widest reach of the spans begun so far
+    var si:    u32 = 0;
+    var cur:   u32 = NONE;
+    var reach: u32 = 0;
+    var k:     u32 = 0;
+    for (k < plan.site_count) {
+        val site: *ThunkSite = ?plan.sites[k];
+        if (site.flat != cur) {
+            cur   = site.flat;
+            reach = 0;
+            for (si < span_count && spans[si].flat < cur) { si = si + 1; }
+        }
+        for (si < span_count && spans[si].flat == cur && spans[si].lo < site.offset) {
+            if (spans[si].hi > reach) { reach = spans[si].hi; }
+            si = si + 1;
+        }
+        val interior: bool = site.offset > 0 && site.offset < sec_len_of(modules, module_count, sec_base, site.flat);
+        if (interior && site.offset <= reach) { site.flat = NONE; }
+        k = k + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun target_key(import_index: u32, pos: u64, addend: i64) opt[u64] {
+    if (addend < 0 || addend > 0x7FFFFFFF) { ret opt[u64].none{}; }
+    if (import_index != NONE) {
+        ret opt[u64].some{(1::u64 << 63) | (addend::u64 << 32) | import_index::u64};
+    }
+    ret opt[u64].some{(addend::u64 << 32) | pos};
+}
+
+fun add_target(alloc: *A.Allocator, plan: *ThunkPlan, import_index: u32, pos: u64,
+    span: u64, addend: i64) res[u32, fail.Fail] {
+    val key: opt[u64] = target_key(import_index, pos, addend);
+    if (sel key.some) {
+        var k:     u64       = key.some;
+        val found: opt[*u32] = map.get[u64, u32](?plan.target_keys, ?k);
+        if (sel found.some) { ret res[u32, fail.Fail].ok{@found.some}; }
+    }
+    if (plan.target_count == plan.target_cap) {
+        val g: err[fail.Fail] = grow_cap[ThunkTarget](alloc, ?plan.targets, ?plan.target_cap, 64);
+        if (sel g.err) { ret res[u32, fail.Fail].err{g.err}; }
+    }
+    val ti: u32 = plan.target_count;
+    plan.targets[ti].import_index = import_index;
+    plan.targets[ti].pos          = pos;
+    plan.targets[ti].span         = span;
+    plan.targets[ti].addend       = addend;
+    plan.target_count             = ti + 1;
+    if (sel key.some) {
+        val ins: res[bool, A.Error] = map.insert[u64, u32](?plan.target_keys, key.some, ti);
+        if (sel ins.err) { ret res[u32, fail.Fail].err{fail.refused(ins.err)}; }
+    }
+    ret res[u32, fail.Fail].ok{ti};
+}
+
+# every live branch in the code a thunk could extend, with the destination
+# it reaches, resolved the way patching resolves it. a branch whose target is
+# not in the code (an absolute or an unresolved name) is left to patching
+fun collect_branches(s: *session.Session, arch: *isa.IsaVTable, plan: *ThunkPlan,
+    modules: *of.ObjectImage, module_count: u32,
+    placements: *Placement, sec_base: *u32, atoms: *AtomPlan,
+    sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState) err[fail.Fail] {
+    val alloc: *A.Allocator = s.alloc;
+    var m:     u32          = 0;
+    for (m < module_count) {
+        var ri: u32 = 0;
+        for (ri < modules[m].reloc_count) {
+            val r:       *of.Relocation      = ?modules[m].relocations[ri];
+            val reach_r: opt[of.BranchReach] = isa.branch_reach(arch, r.kind);
+            if (sel reach_r.none) {
+                ri = ri + 1;
+                cnt;
+            }
+            val reach: of.BranchReach = reach_r.some;
+            val sc:    u32            = of.section_index(r.section);
+            if (sc >= modules[m].section_count) {
+                ri = ri + 1;
+                cnt;
+            }
+            val flat: u32 = sec_base[m] + sc;
+            if (!in_text(placements, flat) || atom_offset_dead(atoms, flat, r.offset)) {
+                ri = ri + 1;
+                cnt;
+            }
+            val op_r: res[of.RelocOperand, fail.Fail] = rel.resolve_operand(arch, ?modules[m], ri);
+            if (sel op_r.err) {
+                ri = ri + 1;
+                cnt;
+            }
+            val op: of.RelocOperand = op_r.ok;
+            if (op.sym >= modules[m].symbol_count) {
+                ri = ri + 1;
+                cnt;
+            }
+            val sym: *of.Symbol = ?modules[m].symbols[op.sym];
+
+            var import_index: u32  = NONE;
+            var pos:          u64  = 0;
+            var span:         u64  = 0;
+            var found:        bool = false;
+            if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0 && !of.section_is_external(sym.section)) {
+                if (!of.section_is_absolute(sym.section) && of.section_index(sym.section) < modules[m].section_count) {
+                    val tflat: u32 = sec_base[m] + of.section_index(sym.section);
+                    if (in_text(placements, tflat) && !atom_offset_dead(atoms, tflat, sym.offset)) {
+                        pos   = placements[tflat].offset::u64 + atom_live_offset(atoms, tflat, sym.offset)::u64;
+                        found = true;
+                    }
+                }
+            }
+            or {
+                val rn: res[intern.StrId, fail.Fail] = resolved_symbol_name(sym_locs, sym.name);
+                if (sel rn.ok) {
+                    var name: intern.StrId    = rn.ok;
+                    val sl:   opt[*SymbolLoc] = map.get[intern.StrId, SymbolLoc](sym_locs, ?name);
+                    if (sel sl.some) {
+                        if (sl.some.merged_index == of.SK_TEXT::u32) {
+                            pos   = sl.some.vaddr - sl.some.section_vaddr;
+                            found = true;
+                        }
+                    }
+                    or (dyn.info.stubs.size > 0) {
+                        val imp: res[u32, fail.Fail] = dynstate_import_index(dyn, name);
+                        if (sel imp.ok) {
+                            if (dynstate_import_is_func(dyn, imp.ok)) {
+                                import_index = imp.ok;
+                                pos          = dyn.stubs_offset::u64;
+                                span         = dyn.info.stubs.size::u64;
+                                found        = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if (!found) {
+                ri = ri + 1;
+                cnt;
+            }
+
+            val ti: res[u32, fail.Fail] = add_target(alloc, plan, import_index, pos, span, op.addend);
+            if (sel ti.err) { ret err[fail.Fail].err{ti.err}; }
+            if (plan.branch_count == plan.branch_cap) {
+                val g: err[fail.Fail] = grow_cap[ThunkBranch](alloc, ?plan.branches, ?plan.branch_cap, 256);
+                if (sel g.err) { ret g; }
+            }
+            val bi: u32 = plan.branch_count;
+            plan.branches[bi].module = m;
+            plan.branches[bi].reloc  = ri;
+            plan.branches[bi].src    = placements[flat].offset::u64 + atom_live_offset(atoms, flat, r.offset)::u64;
+            plan.branches[bi].target = ti.ok;
+            plan.branches[bi].thunk  = NONE;
+            plan.branches[bi].reach  = reach;
+            plan.branch_count        = bi + 1;
+            ri                       = ri + 1;
+        }
+        m = m + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun island_at_site(plan: *ThunkPlan, site: u32) u32 {
+    var k: u32 = 0;
+    for (k < plan.island_count) {
+        if (plan.islands[k].site == site) { ret k; }
+        k = k + 1;
+    }
+    ret NONE;
+}
+
+fun add_island(alloc: *A.Allocator, plan: *ThunkPlan, site: u32) res[u32, fail.Fail] {
+    if (plan.island_count == plan.island_cap) {
+        val g: err[fail.Fail] = grow_cap[ThunkIsland](alloc, ?plan.islands, ?plan.island_cap, 8);
+        if (sel g.err) { ret res[u32, fail.Fail].err{g.err}; }
+    }
+    val k: u32 = plan.island_count;
+    plan.islands[k].site  = site;
+    plan.islands[k].pos   = plan.sites[site].pos;
+    plan.islands[k].count = 0;
+    plan.islands[k].size  = 0;
+    plan.island_count     = k + 1;
+    ret res[u32, fail.Fail].ok{k};
+}
+
+fun add_thunk(alloc: *A.Allocator, plan: *ThunkPlan, k: u32, target: u32) res[u32, fail.Fail] {
+    if (plan.thunk_count == plan.thunk_cap) {
+        val g: err[fail.Fail] = grow_cap[Thunk](alloc, ?plan.thunks, ?plan.thunk_cap, 16);
+        if (sel g.err) { ret res[u32, fail.Fail].err{g.err}; }
+    }
+    val t: u32 = plan.thunk_count;
+    plan.thunks[t].island = k;
+    plan.thunks[t].slot   = plan.islands[k].count;
+    plan.thunks[t].target = target;
+    plan.thunk_count      = t + 1;
+
+    val island: *ThunkIsland = ?plan.islands[k];
+    island.count = island.count + 1;
+    val bytes: u64 = island.count::u64 * plan.shape.size::u64;
+    island.size = (bytes + plan.unit - 1) / plan.unit * plan.unit;
+
+    val ins: res[bool, A.Error] =
+        map.insert[u64, u32](?plan.slots, (target::u64 << 32) | k::u64, t);
+    if (sel ins.err) { ret res[u32, fail.Fail].err{fail.refused(ins.err)}; }
+    ret res[u32, fail.Fail].ok{t};
+}
+
+# a thunk in reach of `p` already sending branches to the target
+fun reachable_thunk(plan: *ThunkPlan, br: *ThunkBranch, p: i64) u32 {
+    var k: u32 = 0;
+    for (k < plan.island_count) {
+        var key:   u64       = (br.target::u64 << 32) | k::u64;
+        val found: opt[*u32] = map.get[u64, u32](?plan.slots, ?key);
+        if (sel found.some) {
+            val t: u32 = @found.some;
+            if (reach_ok(br.reach, thunk_pos(plan, t)::i64 - p)) { ret t; }
+        }
+        k = k + 1;
+    }
+    ret NONE;
+}
+
+# the reach less a margin, so the islands later passes open between a branch
+# and the island it is given seldom push the island out of reach again
+fun within_margin(reach: of.BranchReach, disp: i64) bool {
+    val margin: i64 = reach.max / 8;
+    ret disp >= reach.min + margin && disp <= reach.max - margin;
+}
+
+# the island a new thunk for a branch at `p` goes in: the nearest existing one
+# in reach, else a new one at the nearest free site in reach, else none
+fun island_for(alloc: *A.Allocator, plan: *ThunkPlan, br: *ThunkBranch, p: i64) res[u32, fail.Fail] {
+    var best:      u32 = NONE;
+    var best_dist: i64 = 0;
+    var k:         u32 = 0;
+    for (k < plan.island_count) {
+        val at: i64 = (island_start(plan, k) + plan.islands[k].count::u64 * plan.shape.size::u64)::i64;
+        if (within_margin(br.reach, at - p)) {
+            var dist: i64 = at - p;
+            if (dist < 0) { dist = 0 - dist; }
+            if (best == NONE || dist < best_dist) {
+                best      = k;
+                best_dist = dist;
+            }
+        }
+        k = k + 1;
+    }
+    if (best != NONE) { ret res[u32, fail.Fail].ok{best}; }
+
+    # the first site at or after p, then outward both ways while in reach
+    var lo: u32 = 0;
+    var hi: u32 = plan.site_count;
+    for (lo < hi) {
+        val mid: u32 = lo + (hi - lo) / 2;
+        if (plan_pos(plan, plan.sites[mid].pos)::i64 < p) { lo = mid + 1; }
+        or                                                { hi = mid; }
+    }
+    var right: u32 = lo;
+    var left:  u32 = lo;
+    for (true) {
+        var have_r: bool = false;
+        var have_l: bool = false;
+        var dr:     i64  = 0;
+        var dl:     i64  = 0;
+        if (right < plan.site_count) {
+            dr     = plan_pos(plan, plan.sites[right].pos)::i64 - p;
+            have_r = dr <= br.reach.max;
+        }
+        if (left > 0) {
+            dl     = p - plan_pos(plan, plan.sites[left - 1].pos)::i64;
+            have_l = 0 - dl >= br.reach.min;
+        }
+        if (!have_r && !have_l) { brk; }
+        var pick: u32 = NONE;
+        if (have_r && (!have_l || dr <= dl)) {
+            pick  = right;
+            right = right + 1;
+        }
+        or {
+            pick = left - 1;
+            left = left - 1;
+        }
+        val disp: i64 = plan_pos(plan, plan.sites[pick].pos)::i64 - p;
+        if (within_margin(br.reach, disp) && island_at_site(plan, pick) == NONE) {
+            ret add_island(alloc, plan, pick);
+        }
+    }
+    ret res[u32, fail.Fail].ok{NONE};
+}
+
+# one pass over every branch: true when it placed a thunk, which moves code
+fun plan_pass(alloc: *A.Allocator, plan: *ThunkPlan) res[bool, fail.Fail] {
+    var changed: bool = false;
+    var bi:      u32  = 0;
+    for (bi < plan.branch_count) {
+        val br: *ThunkBranch = ?plan.branches[bi];
+        val p:  i64          = plan_pos(plan, br.src)::i64;
+        if (direct_ok(plan, br, p)) {
+            br.thunk = NONE;
+            bi       = bi + 1;
+            cnt;
+        }
+        if (br.thunk != NONE && reach_ok(br.reach, thunk_pos(plan, br.thunk)::i64 - p)) {
+            bi = bi + 1;
+            cnt;
+        }
+        br.thunk = reachable_thunk(plan, br, p);
+        if (br.thunk != NONE) {
+            bi = bi + 1;
+            cnt;
+        }
+        val kr: res[u32, fail.Fail] = island_for(alloc, plan, br, p);
+        if (sel kr.err) { ret res[bool, fail.Fail].err{kr.err}; }
+        if (kr.ok != NONE) {
+            val tr: res[u32, fail.Fail] = add_thunk(alloc, plan, kr.ok, br.target);
+            if (sel tr.err) { ret res[bool, fail.Fail].err{tr.err}; }
+            br.thunk = tr.ok;
+            changed  = true;
+        }
+        bi = bi + 1;
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+# the flat whose contribution comes first in the code
+fun placed_before(placements: *Placement, a: u32, b: u32) bool {
+    ret placements[a].offset < placements[b].offset
+        || (placements[a].offset == placements[b].offset && a < b);
+}
+
+fun group_of(modules: *of.ObjectImage, module_count: u32, sec_base: *u32,
+    groups: *SectionGroups, flat: u32) u32 {
+    var m: u32 = 0;
+    for (m < module_count) {
+        if (flat >= sec_base[m] && flat - sec_base[m] < modules[m].section_count) {
+            val sec: *of.Section = ?modules[m].sections[flat - sec_base[m]];
+            ret section_group_index(groups, of.SK_TEXT::u32, sec.name, sec.flags & of.SEC_FLAG_IMAGE_MASK);
+        }
+        m = m + 1;
+    }
+    ret NONE;
+}
+
+# opens the islands: each becomes a gap in its section's live bytes, and every
+# contribution, section group and the call-stub table after it moves on by it
+fun open_islands(s: *session.Session, plan: *ThunkPlan,
+    modules: *of.ObjectImage, module_count: u32, sec_total: u32,
+    merged: *MergedSection, placements: *Placement, sec_base: *u32,
+    atoms: *AtomPlan, groups: *SectionGroups, dyn: *DynState) err[fail.Fail] {
+    val alloc: *A.Allocator = s.alloc;
+    val text:  u32          = of.SK_TEXT::u32;
+    var total: u64          = 0;
+    var k:     u32          = 0;
+    for (k < plan.island_count) {
+        total = total + plan.islands[k].size;
+        k     = k + 1;
+    }
+    if (merged[text].len::u64 + total > 0xFFFFFFFF) {
+        ret err[fail.Fail].err{fail.user(dkind.LINK_SIZE_LIMIT, "linker: range-extension thunks take the code past the maximum section size")};
+    }
+
+    val gr: res[*AtomGap, A.Error] = A.allocate[AtomGap](alloc, plan.island_count::usize);
+    if (sel gr.err) { ret err[fail.Fail].err{fail.refused(gr.err)}; }
+    val gaps: *AtomGap = gr.ok;
+    fin { A.deallocate[AtomGap](alloc, gaps, plan.island_count::usize); }
+    k = 0;
+    for (k < plan.island_count) {
+        val site: *ThunkSite = ?plan.sites[plan.islands[k].site];
+        gaps[k].section = site.flat;
+        gaps[k].offset  = site.offset;
+        gaps[k].len     = plan.islands[k].size::u32;
+        k               = k + 1;
+    }
+    sort.sort_by[AtomGap](gaps, plan.island_count::usize, gap_order);
+
+    # each group grows by the islands of its own contributions and moves by
+    # those of the groups before it; the stub table, after every group, by all
+    var gi: u32 = 0;
+    for (gi < groups.count) {
+        if (groups.items[gi].slot != text) {
+            gi = gi + 1;
+            cnt;
+        }
+        var shift: u64 = 0;
+        var grow:  u64 = 0;
+        k = 0;
+        for (k < plan.island_count) {
+            val owner: u32 = group_of(modules, module_count, sec_base, groups, gaps[k].section);
+            if (owner == gi) { grow = grow + gaps[k].len::u64; }
+            or (owner == NONE || groups.items[owner].base < groups.items[gi].base) {
+                shift = shift + gaps[k].len::u64;
+            }
+            k = k + 1;
+        }
+        groups.items[gi].base   = (groups.items[gi].base::u64 + shift)::u32;
+        groups.items[gi].cursor = (groups.items[gi].cursor::u64 + shift + grow)::u32;
+        groups.items[gi].len    = (groups.items[gi].len::u64 + grow)::u32;
+        gi                      = gi + 1;
+    }
+
+    var f: u32 = 0;
+    for (f < sec_total) {
+        if (!in_text(placements, f)) {
+            f = f + 1;
+            cnt;
+        }
+        var shift: u64 = 0;
+        var grow:  u64 = 0;
+        k = 0;
+        for (k < plan.island_count) {
+            if (gaps[k].section == f) { grow = grow + gaps[k].len::u64; }
+            or (placed_before(placements, gaps[k].section, f)) {
+                shift = shift + gaps[k].len::u64;
+            }
+            k = k + 1;
+        }
+        placements[f].offset = (placements[f].offset::u64 + shift)::u32;
+        if (placements[f].extent != 0) {
+            placements[f].extent = (placements[f].extent::u64 + grow)::u32;
+        }
+        f = f + 1;
+    }
+
+    merged[text].len = (merged[text].len::u64 + total)::u32;
+    if (dyn.info.stubs.size > 0) {
+        dyn.stubs_offset = (dyn.stubs_offset::u64 + total)::u32;
+    }
+    ret atom_plan_open_gaps(alloc, modules, module_count, sec_total, atoms, gaps, plan.island_count);
+}
+
+# plans and opens the islands a link's out-of-reach branches need. runs once
+# the code's contents and the call-stub table are laid out and before anything
+# reads an address the islands move; the caller lays the image out again when
+# thunks_placed says the code moved
+pub fun plan_thunks(s: *session.Session, arch: *isa.IsaVTable, plan: *ThunkPlan,
+    modules: *of.ObjectImage, module_count: u32, sec_total: u32,
+    merged: *MergedSection, placements: *Placement, sec_base: *u32,
+    atoms: *AtomPlan, groups: *SectionGroups,
+    sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState) err[fail.Fail] {
+    if (!isa.declares_branch_thunks(arch)) { ret err[fail.Fail].ok{}; }
+    val text: u32 = of.SK_TEXT::u32;
+    if (!merged[text].used) { ret err[fail.Fail].ok{}; }
+
+    plan.shape = arch.reloc.branch_thunk();
+    if (plan.shape.size == 0 || plan.shape.size > 16 || plan.shape.field_count > 4) {
+        ret err[fail.Fail].err{fail.message("linker: the instruction set declared a malformed branch thunk")};
+    }
+    var unit: u64 = merged[text].align::u64;
+    if (plan.shape.align::u64 > unit) { unit = plan.shape.align::u64; }
+    if (unit == 0)                    { unit = 1; }
+    plan.unit = unit;
+
+    plan.slots       = map.init[u64, u32](s.alloc);
+    plan.by_reloc    = map.init[u64, u32](s.alloc);
+    plan.target_keys = map.init[u64, u32](s.alloc);
+    plan.active      = true;
+
+    val cb: err[fail.Fail] = collect_branches(s, arch, plan, modules, module_count,
+        placements, sec_base, atoms, sym_locs, dyn);
+    if (sel cb.err) { ret cb; }
+
+    # nothing is out of reach while the whole code fits the shortest reach
+    var shortest: i64 = 0x7FFFFFFFFFFFFFFF;
+    var bi:       u32 = 0;
+    for (bi < plan.branch_count) {
+        if (plan.branches[bi].reach.max < shortest)     { shortest = plan.branches[bi].reach.max; }
+        if (0 - plan.branches[bi].reach.min < shortest) { shortest = 0 - plan.branches[bi].reach.min; }
+        bi = bi + 1;
+    }
+    if (plan.branch_count == 0 || merged[text].len::i64 <= shortest) { ret err[fail.Fail].ok{}; }
+
+    var any: bool = false;
+    bi = 0;
+    for (bi < plan.branch_count && !any) {
+        any = !direct_ok(plan, ?plan.branches[bi], plan.branches[bi].src::i64);
+        bi  = bi + 1;
+    }
+    if (!any) { ret err[fail.Fail].ok{}; }
+
+    val cs: err[fail.Fail] = collect_sites(s, arch, plan, modules, module_count,
+        placements, sec_base, atoms);
+    if (sel cs.err) { ret cs; }
+
+    var pass:   u32  = 0;
+    var stable: bool = false;
+    for (pass < MAX_PASSES && !stable) {
+        val pr: res[bool, fail.Fail] = plan_pass(s.alloc, plan);
+        if (sel pr.err) { ret err[fail.Fail].err{pr.err}; }
+        stable = !pr.ok;
+        pass   = pass + 1;
+    }
+    if (!stable) {
+        ret err[fail.Fail].err{fail.message("linker: range-extension thunk placement did not settle")};
+    }
+
+    bi = 0;
+    for (bi < plan.branch_count) {
+        val br: *ThunkBranch = ?plan.branches[bi];
+        if (br.thunk != NONE) {
+            val ins: res[bool, A.Error] = map.insert[u64, u32](?plan.by_reloc,
+                (br.module::u64 << 32) | br.reloc::u64, br.thunk);
+            if (sel ins.err) { ret err[fail.Fail].err{fail.refused(ins.err)}; }
+        }
+        bi = bi + 1;
+    }
+    if (plan.island_count == 0) { ret err[fail.Fail].ok{}; }
+
+    ret open_islands(s, plan, modules, module_count, sec_total, merged, placements,
+        sec_base, atoms, groups, dyn);
+}
+
+# the address of the thunk a branch relocation goes through, none when it
+# branches straight to its target
+pub fun thunk_for(plan: *ThunkPlan, module: u32, reloc: u32) opt[u64] {
+    if (plan == nil || !plan.active || plan.thunk_count == 0) { ret opt[u64].none{}; }
+    var key:   u64       = (module::u64 << 32) | reloc::u64;
+    val found: opt[*u32] = map.get[u64, u32](?plan.by_reloc, ?key);
+    if (sel found.none) { ret opt[u64].none{}; }
+    ret opt[u64].some{plan.text_vaddr + thunk_pos(plan, @found.some)};
+}
+
+# writes every thunk into the linked code once its addresses are final: the
+# template's fields resolve against the destination, or for an imported
+# function become call-site fixups the format binds to its stub
+pub fun write_thunks(s: *session.Session, plan: *ThunkPlan, out_img: *of.ObjectImage,
+    merged: *MergedSection, merged_to_out: *u32, dyn: *DynState,
+    arch: *isa.IsaVTable, image_base: u64) err[fail.Fail] {
+    if (!plan.active || plan.thunk_count == 0) { ret err[fail.Fail].ok{}; }
+    val text:   u32 = of.SK_TEXT::u32;
+    val out_ix: u32 = merged_to_out[text];
+    if (out_ix == NONE || out_ix >= out_img.section_count || out_img.sections[out_ix].bytes == nil) {
+        ret err[fail.Fail].err{fail.message("linker: range-extension thunks have no code section to live in")};
+    }
+    plan.text_vaddr = merged[text].vaddr;
+    val dst:     *u8 = out_img.sections[out_ix].bytes;
+    val sec_len: u32 = out_img.sections[out_ix].len;
+    val seg:     u32 = segment_index_for(out_img, out_ix);
+
+    var t: u32 = 0;
+    for (t < plan.thunk_count) {
+        val off: u64 = thunk_pos(plan, t);
+        if (off + plan.shape.size::u64 > sec_len::u64) {
+            ret err[fail.Fail].err{fail.message("linker: a range-extension thunk lies past the end of the code")};
+        }
+        memory.copy[u8](?dst[off::usize], ?plan.shape.bytes[0], plan.shape.size::usize);
+        val tgt: *ThunkTarget = ?plan.targets[plan.thunks[t].target];
+        var fi:  u32          = 0;
+        for (fi < plan.shape.field_count) {
+            val field: of.ThunkField = plan.shape.fields[fi];
+            val foff:  u32           = (off + field.offset::u64)::u32;
+            val fva:   u64           = plan.text_vaddr + foff::u64;
+            if (tgt.import_index != NONE) {
+                val fr: err[fail.Fail] = dynstate_add_fixup(s, dyn, seg, foff,
+                    tgt.import_index, fva, field.kind, tgt.addend);
+                if (sel fr.err) { ret fr; }
+            }
+            or {
+                val dest: u64                       = ((plan.text_vaddr + plan_pos(plan, tgt.pos))::i64 + tgt.addend)::u64;
+                val ar:   res[bool, rel.RelocError] = arch.reloc.apply(field.kind, dst, foff, sec_len,
+                    rel.target(dest, 0, 0), 0, fva, image_base);
+                if (sel ar.err) {
+                    ret err[fail.Fail].err{fail.user(dkind.LINK_RELOCATION_OVERFLOW, "linker: a range-extension thunk cannot reach its destination")};
+                }
+            }
+            fi = fi + 1;
+        }
+        t = t + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
