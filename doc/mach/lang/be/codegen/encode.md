@@ -542,6 +542,15 @@ pub fun set_fallthrough(st: *EncodeState, f: *mir.MirFunction, bi: u32);
 pub fun branch_falls_through(st: *EncodeState, target_block: u32) bool;
 ```
 
+## fun cbr_inverts
+
+```mach
+pub fun cbr_inverts(st: *EncodeState, then_block: u32, else_block: u32) bool;
+```
+
+a conditional branch whose then arm is the next block and whose else arm is
+not jumps to the else arm on the inverse condition and falls into the then arm
+
 ## fun push_row
 
 ```mach
