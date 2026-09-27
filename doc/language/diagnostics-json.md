@@ -2,27 +2,31 @@
 
 `mach build`, `mach check` and `mach test` take `--diagnostics=<human|json>`.
 `human`, the default, is the rendering shown in [diagnostics.md](diagnostics.md).
-`json` writes each diagnostic as one JSON object on one line of stderr
-(NDJSON), for editors, CI and other tools. The records are the contract: the
-human text may change from release to release, and a record changes only under
-the [stability rule](#stability). The flag changes no exit code.
+`json` writes everything the command reports as JSON objects, one per line of
+stderr (NDJSON), for editors, CI and other tools: each diagnostic, each failure
+raised outside the compiler's diagnostics (a manifest, dependency, build-step,
+link or command-line refusal), each test result under `mach test`, and a
+closing summary. The records are the contract: the human text may change from
+release to release, and a record changes only under the
+[stability rule](#stability). The flag changes no exit code.
 
 ```
 mach check . --diagnostics=json
 ```
 
 A bare `--diagnostics` or any other value is refused with
-`error[cli.flag_value]`.
+`error[cli.flag_value]`, in human text since no format has been chosen. `-v`
+and `-vv`, whose phase readout is text on stderr, are refused beside `json`
+with a `cli.flag_conflict` failure record.
 
 ## The stream
 
 - Records go to stderr, one per line, in the order the human rendering shows
-  the same diagnostics. Stdout keeps what the command writes there, such as the
-  events of `mach test --format json`.
-- Every record is a JSON object on a line of its own, and every record line
-  starts with `{`. A line that does not start with `{` is not a record: a
-  failure mach does not yet report as a record (#3794) still prints as human
-  text, and a tool skips such a line or shows it as it is.
+  the same reports. Stdout keeps what the command writes there, such as the
+  events of `mach test --format json` or a build step's banner.
+- Every line mach writes to stderr is a record, a JSON object on a line of its
+  own, and the last one is the [summary](#the-summary-record). Output a build
+  step or a test writes itself is not mach's and is not a record.
 - The text is ASCII. A non-ASCII character in a message, a label or a path is
   written as a `\u` escape, and a byte that is not valid UTF-8 as `�`, so
   every line is valid UTF-8 and valid JSON.
@@ -45,7 +49,7 @@ whose related site is in another file:
 | Member | Type | Meaning |
 |---|---|---|
 | `schema` | integer | the schema version, `1` |
-| `record` | string | the record type, `"diagnostic"` |
+| `record` | string | the record type, `"diagnostic"`, or `"failure"` for a [failure](#failure-records) |
 | `severity` | string | `"error"`, `"warning"` or `"note"` |
 | `code` | string | the diagnostic's key from the [registry](diagnostics.md#the-registry), such as `name.unresolved`; the stable identity of the kind |
 | `message` | string | the primary text; its wording may change, the `code` does not |
@@ -95,10 +99,67 @@ span.
 | `lower` | lowering to IR and the optimizer, such as `vector.scalarize` |
 | `codegen` | code generation and the constant-time validation of emitted code |
 | `link` | linking an executable or library |
+| `test` | the test runner of `mach test`: running the collected tests |
 
 A key names a rule, not a phase, so one key can arrive from two origins:
 `secret.branch` is `sema` when the type checker finds it and `codegen` when
 the constant-time validator does.
+
+## Failure records
+
+A failure raised outside the compiler's diagnostics, the ones the human
+rendering prints as a lone `error[<key>]: <message>` line, is a record with
+`"record": "failure"` and the members of a diagnostic record. Its `severity`
+is `"error"`, its `code` the failure's key, and `primary` is `null`, with
+`related`, `notes`, `help` and `fixes` empty.
+
+```json
+{"schema":1,"record":"failure","severity":"error","code":"link.entry_missing","message":"undefined entry symbol '_start'; ensure the target startup library is linked","origin":"link","primary":null,"related":[],"notes":[],"help":[],"fixes":[]}
+```
+
+`origin` names the phase the failure came from: `build` for the manifest,
+dependency resolution and build steps, the phase that failed for a failure
+inside the compiler (`link` for the linker), and `test` for the test runner. A
+refusal of the command line itself, such as an unknown flag or a project path
+that names nothing, has no `origin`.
+
+## Test records
+
+Under `mach test` each test's result is a record, in the order the tests
+finish:
+
+```json
+{"schema":1,"record":"test","name":"app.main#parses","module":"app.main","file":"src/main.mach","line":10,"outcome":"exit","code":3,"origin":"test"}
+```
+
+| Member | Type | Meaning |
+|---|---|---|
+| `name` | string | the test's qualified name |
+| `module` | string | the module that declares it |
+| `file` | string | the source file, spelled as a span's `file` is |
+| `line` | integer | the line of its declaration, from 1 |
+| `outcome` | string | how it ended, the `kind` `mach test --format json` reports: `"pass"`, `"exit"`, `"signal"`, `"timeout"`, `"spawn"` or `"other"` |
+| `code` | integer | its exit code, or `0` when it has none |
+| `origin` | string | `"test"` |
+
+A test record carries no `severity` and counts in no summary total; the
+summary's `outcome` and `exit_code` say whether a test failed.
+
+## The summary record
+
+Every run ends with one summary record, the last line on stderr:
+
+```json
+{"schema":1,"record":"summary","errors":1,"warnings":0,"notes":0,"outcome":"failure","exit_code":1}
+```
+
+| Member | Type | Meaning |
+|---|---|---|
+| `errors` | integer | the diagnostic and failure records before it with severity `"error"` |
+| `warnings` | integer | those with severity `"warning"` |
+| `notes` | integer | those with severity `"note"` |
+| `outcome` | string | `"success"` when the command exits 0, otherwise `"failure"` |
+| `exit_code` | integer | the command's exit code |
 
 ## Stability
 
@@ -109,23 +170,8 @@ the constant-time validator does.
   whose `record` it does not know, and accepts an `origin` it does not know.
 - **Any other change bumps the version:** removing or renaming a member,
   changing its type or meaning, or changing the span convention.
-- A `code` keeps its meaning for good, under the rules of the
+- A diagnostic or failure `code` keeps its meaning for good, under the rules of the
   [registry](diagnostics.md#the-registry).
-
-## Reserved record types
-
-These record types are reserved in schema 1 for reports mach does not yet
-write as records (#3794). Each carries `schema` and `record` as above.
-
-- `"record": "failure"`: a build, link, manifest, dependency or command-line
-  failure reported outside the diagnostic store. It has the members of a
-  diagnostic record, with `primary` `null` when the failure has no location.
-- `"record": "test"`: one test's result under `mach test`, naming the test by
-  `name`, `module`, `file` and `line`, with its `outcome` (the kinds
-  `mach test --format json` reports) and its exit `code`.
-- `"record": "summary"`: the last record of a run: `errors`, `warnings` and
-  `notes` counts over the records before it, the `outcome` (`"success"` or
-  `"failure"`) and the `exit_code`.
 
 ## See also
 

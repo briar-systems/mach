@@ -558,6 +558,11 @@ link_cell() {
             grep -E '^error(\[[^]]*\])?:' "$tmp/build.log" >"$tmp/out.txt"
             [ -s "$tmp/out.txt" ] || { fail "$label failed without an 'error:' diagnostic: $(tail -n1 "$tmp/build.log")"; rm -rf "$tmp"; return; }
             ;;
+        build-warns)
+            if [ "$built" -eq 0 ]; then fail "$label $case_goal: $(first_error "$tmp/build.log")"; rm -rf "$tmp"; return; fi
+            grep -E '^warning(\[[^]]*\])?:' "$tmp/build.log" >"$tmp/out.txt"
+            [ -s "$tmp/out.txt" ] || { fail "$label built without a 'warning:' diagnostic"; rm -rf "$tmp"; return; }
+            ;;
         *)
             if [ "$built" -eq 0 ]; then
                 fail "$label $case_goal: $(first_error "$tmp/build.log")"; tail -n 6 "$tmp/build.log" | sed 's/^/    /'; rm -rf "$tmp"; return

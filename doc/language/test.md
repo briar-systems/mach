@@ -225,8 +225,9 @@ the flag leaves every test unbounded.
 
 `--format json` replaces the readout with one JSON object per line on stdout
 (`run_start`, one `test` per result, `summary`; `case` under `--list`), with
-build diagnostics kept on stderr, where `--diagnostics=json` writes them as the
-records of [diagnostics-json.md](diagnostics-json.md). A `test` or `case` event names its test by
+build diagnostics kept on stderr, where `--diagnostics=json` writes them, a
+`test` record per result and a closing `summary` as the records of
+[diagnostics-json.md](diagnostics-json.md). A `test` or `case` event names its test by
 qualified name in `name`, beside its `module`, `file`, `line`, test `object`
 and dispatcher `index`. A timed-out test reports `"kind":"timeout"` with its
 bound in nanoseconds in `timeout_ns`. The schema is versioned (`"schema":2` on

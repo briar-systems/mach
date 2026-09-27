@@ -1050,7 +1050,7 @@ Indexed by search, not by DepAction
 ## val BUILD_CONSTRAINT_N
 
 ```mach
-pub val BUILD_CONSTRAINT_N: usize = 4
+pub val BUILD_CONSTRAINT_N: usize = 5
 ```
 
 length of BUILD_CONSTRAINT
@@ -1063,12 +1063,13 @@ pub val BUILD_CONSTRAINT: [BUILD_CONSTRAINT_N]str = [BUILD_CONSTRAINT_N]str;
 
 the constraint sentences help prints for build; the first is enforced by
 build_cli_invocation, the second by selection_from_config, the third by the
-build command, the fourth by the build plan's output path
+build command, the fourth by the build plan's output path, the fifth by
+readout_allowed
 
 ## val TEST_CONSTRAINT_N
 
 ```mach
-pub val TEST_CONSTRAINT_N: usize = 2
+pub val TEST_CONSTRAINT_N: usize = 3
 ```
 
 length of TEST_CONSTRAINT
@@ -1080,7 +1081,7 @@ pub val TEST_CONSTRAINT: [TEST_CONSTRAINT_N]str = [TEST_CONSTRAINT_N]str;
 ```
 
 the constraint sentences help prints for test; enforced by
-build_cli_invocation and selection_from_config
+build_cli_invocation, selection_from_config and readout_allowed
 
 ## val INFO_CONSTRAINT_N
 
@@ -1349,6 +1350,19 @@ inv: the parsed invocation
 argv: the argument vector inv was parsed from
 ret: the format, or a user failure for a bare `--diagnostics` or any other value
 
+## fun readout_allowed
+
+```mach
+pub fun readout_allowed(c: *request.CliArgs, format: cli_diag.Format) err[outcome.Fail];
+```
+
+`-v` and `-vv` render the phase readout to stderr as text, which a json run
+keeps to records
+
+c: the command's arguments
+format: the diagnostics format
+ret: ok, or a user failure when a readout is asked for under json
+
 ## fun build_cli_invocation
 
 ```mach
@@ -1440,14 +1454,28 @@ the removal message for an option that used to exist, so every command refuses i
 tok: the flag-shaped token
 ret: the message when `tok` names a removed option
 
+## fun unknown_flag
+
+```mach
+pub fun unknown_flag(a: *A.Allocator, inv: *ParsedInvocation, argv: **u8, cmd: str) opt[outcome.Fail];
+```
+
+the refusal of the first unrecognized flag-shaped token: `cli.flag_unknown`, or
+`cli.flag_removed` with the removal message when the token names a removed option
+
+a: owns the message
+inv: the parsed invocation
+argv: the argument vector inv was parsed from
+cmd: the command name the message names
+ret: the refusal, or none when every token was recognized
+
 ## fun reject_unknown_from_invocation
 
 ```mach
 pub fun reject_unknown_from_invocation(inv: *ParsedInvocation, argv: **u8, cmd: str) bool;
 ```
 
-print `error[cli.flag_unknown]: unknown flag` for the first unrecognized flag-shaped token, or the
-removal message when the token names a removed option
+print the refusal `unknown_flag` names for the first unrecognized flag-shaped token
 
 inv: the parsed invocation
 argv: the argument vector inv was parsed from
