@@ -7,9 +7,11 @@
 # issue when it links it (closingIssuesReferences), names it on a
 # `Closes|Fixes|Resolves #N` line (the integration branch is not the default, so
 # github links nothing on merge), or when the issue's closing event or closing
-# comment names the pull request (an issue closed by hand). an issue counts only
-# when it is closed and closed no earlier than the pull request naming it was
-# opened, which drops stale references to issues closed long before.
+# comment names the pull request. a closing event with a pull request or a commit
+# as its closer decides alone; the references and the closing comment speak only
+# for an issue closed by hand. an issue counts only when it is closed and closed
+# no earlier than the pull request naming it was opened, which drops stale
+# references to issues closed long before. the selection is release-notes.jq.
 #
 # needs the full tag history and an authenticated gh. the repository is
 # $GITHUB_REPOSITORY, else the one gh resolves from the checkout. any failure
@@ -79,25 +81,7 @@ done
 
 commits=$(git rev-list "$prev..$tag" | jq -Rsc 'split("\n") | map(select(. != ""))')
 
-list=$(jq -r --argjson prs "$prs" --argjson commits "$commits" '
-  def ev: .timelineItems.nodes[0] // {};
-  def closing_comment:
-    ev as $e
-    | [.comments.nodes[] | select(.author.login == $e.actor.login and .createdAt <= $e.createdAt)]
-    | last // {body: ""};
-  # the pull requests in the range that the issue names as its closer
-  def closers:
-    (ev.closer // {}) as $c
-    | [closing_comment.body | scan("(?:^|[^/\\w])#([0-9]+)") | .[0] | tonumber] as $named
-    | [$prs[] | select(.number as $n
-        | ($c.__typename == "PullRequest" and $c.number == $n) or ($named | index($n)))];
-  # a commit in the range that closed the issue binds it to the whole range
-  def by_commit: (ev.closer // {}) as $c | $c.__typename == "Commit" and ($commits | index($c.oid));
-  map((.closedAt | fromdateiso8601) as $at | .number as $n
-      | select(by_commit
-               or ([$prs[] | select(.refs | index($n))] + closers | any(.created <= $at))))
-  | sort_by(.number)
-  | .[] | "- [#\(.number)](\(.url)) \(.title)"' <<<"$closed")
+list=$(jq -r --argjson prs "$prs" --argjson commits "$commits" -f "$(dirname "$0")/release-notes.jq" <<<"$closed")
 
 count=$(grep -c . <<<"$list" || true)
 
