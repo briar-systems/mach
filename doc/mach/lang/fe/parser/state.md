@@ -186,19 +186,19 @@ pub fun diag_dnit(p: *Parser, alloc: *A.Allocator);
 ## fun error_at_current
 
 ```mach
-pub fun error_at_current(p: *Parser, message: str);
+pub fun error_at_current(p: *Parser, k: dkind.Kind, message: str);
 ```
 
 ## fun error_recover_advance
 
 ```mach
-pub fun error_recover_advance(p: *Parser, message: str);
+pub fun error_recover_advance(p: *Parser, k: dkind.Kind, message: str);
 ```
 
 ## fun error_at
 
 ```mach
-pub fun error_at(p: *Parser, span: token.Span, message: str);
+pub fun error_at(p: *Parser, k: dkind.Kind, span: token.Span, message: str);
 ```
 
 ## fun fatal_oom_at

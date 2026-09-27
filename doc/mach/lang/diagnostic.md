@@ -216,19 +216,20 @@ pub fun error_count(store: *DiagnosticStore) usize;
 pub fun note_error(store: *DiagnosticStore);
 ```
 
+## val UNKEYED_TEXT
+
+```mach
+pub val UNKEYED_TEXT: str = "a diagnostic names no live kind of the registry"
+```
+
 ## fun builder_init
 
 ```mach
-pub fun builder_init(a: *A.Allocator, severity: Severity, file_id: source.FileId, span: token.Span, message: str) res[DiagnosticBuilder, fail.Fail];
+pub fun builder_init(a: *A.Allocator, k: dkind.Kind, file_id: source.FileId, span: token.Span, message: str) res[DiagnosticBuilder, fail.Fail];
 ```
 
-## fun builder_init_kind
-
-```mach
-pub fun builder_init_kind(a: *A.Allocator, k: dkind.Kind, file_id: source.FileId, span: token.Span, message: str) res[DiagnosticBuilder, fail.Fail];
-```
-
-a builder for a diagnostic of a named kind, at the severity its row declares
+a builder for a diagnostic of kind `k`, raised at the severity its row
+declares
 
 ## fun builder_dnit
 
@@ -334,13 +335,15 @@ pub val STALE_ID_TEXT: str = "stale diagnostic id"
 ## fun error
 
 ```mach
-pub fun error(store: *DiagnosticStore, file_id: source.FileId, span: token.Span, message: str) err[fail.Fail];
+pub fun error(store: *DiagnosticStore, k: dkind.Kind, file_id: source.FileId, span: token.Span, message: str) err[fail.Fail];
 ```
+
+an error of kind `k`
 
 ## fun reject
 
 ```mach
-pub fun reject(store: *DiagnosticStore, loc: source.SrcLoc, text: str) fail.Fail;
+pub fun reject(store: *DiagnosticStore, k: dkind.Kind, loc: source.SrcLoc, text: str) fail.Fail;
 ```
 
 a pass past the front end rejects the program: the refusal is an error
@@ -364,10 +367,12 @@ a warning of kind `k` located at `loc`, as `reject` locates an error
 pub fun warning(store: *DiagnosticStore, k: dkind.Kind, file_id: source.FileId, span: token.Span, message: str) err[fail.Fail];
 ```
 
+a warning of kind `k`
+
 ## fun record_error
 
 ```mach
-pub fun record_error(store: *DiagnosticStore, file_id: source.FileId, span: token.Span, message: str);
+pub fun record_error(store: *DiagnosticStore, k: dkind.Kind, file_id: source.FileId, span: token.Span, message: str);
 ```
 
 ## fun record_warning
@@ -440,6 +445,7 @@ pub val GATE_NEVER_DECIDED_SUFFIX: str =
 pub fun gate_error_named(
 store: *DiagnosticStore,
 itn: *intern.Interner,
+k: dkind.Kind,
 file_id: source.FileId,
 span: token.Span,
 name_id: intern.StrId,
@@ -499,6 +505,7 @@ b: *DiagnosticBuilder) res[bool, fail.Fail];
 pub fun gate_error(
 store: *DiagnosticStore,
 itn: *intern.Interner,
+k: dkind.Kind,
 file_id: source.FileId,
 span: token.Span,
 message: str) res[bool, fail.Fail];

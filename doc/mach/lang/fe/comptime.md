@@ -582,16 +582,26 @@ pub val EVAL_FAIL_NOT_INTEGER:    EvalFailKind = 8
 pub rec EvalFail;
 ```
 
+diag: the diagnostic kind the failure is reported as, where it reaches the user
+
 ## fun eval_error
 
 ```mach
-pub fun eval_error(kind: EvalFailKind, message: str) EvalFail;
+pub fun eval_error(kind: EvalFailKind, diag: dkind.Kind, message: str) EvalFail;
 ```
+
+## fun eval_internal
+
+```mach
+pub fun eval_internal(message: str) EvalFail;
+```
+
+an internal failure of the evaluator, a compiler defect wherever it surfaces
 
 ## fun eval_from_fail
 
 ```mach
-pub fun eval_from_fail(f: fail.Fail, rejected_message: str) EvalFail;
+pub fun eval_from_fail(f: fail.Fail, diag: dkind.Kind, rejected_message: str) EvalFail;
 ```
 
 ## fun gate_eval_failure_is_transient
@@ -852,7 +862,7 @@ pub rec LitFloat;
 ## fun scan_lit_int
 
 ```mach
-pub fun scan_lit_int(source: str, span: token.Span) res[LitInt, fail.Fail];
+pub fun scan_lit_int(source: str, span: token.Span) res[LitInt, EvalFail];
 ```
 
 ## fun eval_lit_int
@@ -864,7 +874,7 @@ pub fun eval_lit_int(source: str, span: token.Span) res[CTValue, EvalFail];
 ## fun scan_lit_float
 
 ```mach
-pub fun scan_lit_float(source: str, span: token.Span) res[LitFloat, fail.Fail];
+pub fun scan_lit_float(source: str, span: token.Span) res[LitFloat, EvalFail];
 ```
 
 a literal's value at the width its suffix names, binary64 when it has none

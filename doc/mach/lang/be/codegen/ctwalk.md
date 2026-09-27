@@ -42,6 +42,7 @@ pub rec Refusal;
 
 a refusal names the notification it stopped at; the detail is allocated
 with the walk's allocator and released by refusal_free
+kind: the diagnostic kind the refusal is reported as
 
 ## fun refusal_free
 
