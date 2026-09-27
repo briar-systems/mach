@@ -88,22 +88,25 @@ One `u8` member per extension name of the selected isa, like `$mach.build.pie`. 
 with the target's `extensions` key and, on riscv, its isa string, closed over what
 each one implies (see
 [Instruction-set extensions](manifest.md#instruction-set-extensions)), so
-`extensions = ["sse41"]` answers 1 for `ssse3` too.
+`extensions = ["sse41"]` answers 1 for `ssse3` too. On spirv the target's `env`
+selects them.
 
 The names are the selected isa's vocabulary and nothing else:
 
 - `x86_64`: `ssse3`, `sse41`, `sha`, `fsgsbase`, `popcnt`, `lzcnt`, `bmi1`, `sse42`,
   `cx16`, `avx`, `avx2`, `bmi2`, `fma`, `movbe`, `f16c`, `avx512f`, `avx512bw`,
   `avx512cd`, `avx512dq`, `avx512vl`, `aes`, `pclmul`;
-- `aarch64`: `sha2`, `sb`, `aes`, `pmull`;
-- `riscv64` and `riscv32`: `i`, `m`, `a`, `f`, `d`, `c`, `zicond`, `zicsr`, `zifencei`, `zkt`.
+- `aarch64`: `sha2`, `sb`, `aes`, `pmull`, `fp16`;
+- `riscv64` and `riscv32`: `i`, `m`, `a`, `f`, `d`, `c`, `zicond`, `zicsr`, `zifencei`,
+  `zfhmin`, `zfh`, `zkt`;
+- `spirv`: `float16`.
 
 A name the selected isa does not declare is a compile error, never a silent 0, as
 `$mach.arch.*` refuses an unknown architecture:
 
 ```
 `$mach.build.extensions.sha`: `sha` is not an extension of isa 'aarch64'; its
-extensions are: sha2, sb, aes, pmull
+extensions are: sha2, sb, aes, pmull, fp16
 ```
 
 So a source that serves several isas nests the extension question under an

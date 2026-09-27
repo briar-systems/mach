@@ -6,6 +6,23 @@
 pub fun is_local_got_kind(kind: of.RelocKind) bool;
 ```
 
+## fun branch_reach
+
+```mach
+pub fun branch_reach(kind: of.RelocKind) opt[of.BranchReach];
+```
+
+b and bl encode a signed 26-bit word displacement, +-128 MiB
+
+## fun branch_thunk
+
+```mach
+pub fun branch_thunk() of.BranchThunk;
+```
+
+adrp x16 / add x16, x16, lo12 / br x16: ip0 is the register aapcs64 gives a
+veneer to clobber, and adrp reaches +-4 GiB, the whole of the code
+
 ## fun reloc_traits
 
 ```mach

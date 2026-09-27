@@ -758,6 +758,42 @@ a Uniform variable whose block is decorated BufferBlock
 pub fun storage_block_decoration(version: u32) u32;
 ```
 
+## val EXT_FLOAT16
+
+```mach
+pub val EXT_FLOAT16: u64 = 0x1
+```
+
+the spirv extension vocabulary: capabilities an environment guarantees
+beyond the core, which the catalog's rows read. float16 is the Float16
+capability, so f16 is the native OpTypeFloat 16 (#3801)
+
+## val EXTENSION_COUNT
+
+```mach
+pub val EXTENSION_COUNT: u32 = 1
+```
+
+## val ONLY_ENVIRONMENT
+
+```mach
+pub val ONLY_ENVIRONMENT: str = "it is a capability the target's `env` guarantees for the whole module"
+```
+
+## val EXTENSIONS
+
+```mach
+pub val EXTENSIONS: [EXTENSION_COUNT]extension.Extension = [EXTENSION_COUNT]extension.Extension;
+```
+
+## fun env_extensions
+
+```mach
+pub fun env_extensions(id: u32) u64;
+```
+
+the extensions an environment's ceiling guarantees
+
 ## fun env_profile
 
 ```mach

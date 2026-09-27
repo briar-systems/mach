@@ -83,6 +83,17 @@ mid: the module whose text changed
 ret: ok(true) when the surface is unchanged; ok(false) when the caller must reload;
      or the parse or walk failure
 
+## fun target_context
+
+```mach
+pub fun target_context(alloc: *A.Allocator, t: *target.Target, req: *request.BuildRequest,
+compiler_name: intern.StrId, compiler_ver: intern.StrId) comptime.ComptimeCtx;
+```
+
+the comptime context of a build for `t` under `req`: every fact comptime reads from
+the target and the build options, and nothing of a project, so the build and the
+editor fold the same program the same way
+
 ## fun parsed_definition
 
 ```mach

@@ -1244,6 +1244,50 @@ pub rec ElfAttributes;
 pub rec ElfRelocationCapabilities;
 ```
 
+## rec BranchReach
+
+```mach
+pub rec BranchReach;
+```
+
+how far a direct branch reaches: the least and greatest displacement from the
+branch to its target the instruction encodes, and the granule it counts in
+
+## rec ThunkField
+
+```mach
+pub rec ThunkField;
+```
+
+one field of a range-extension thunk, resolved against the thunk's destination
+as a relocation of `kind` at `offset` into the thunk would be
+
+## rec BranchThunk
+
+```mach
+pub rec BranchThunk;
+```
+
+a range-extension thunk (a veneer): the code the linker places within reach of
+a branch whose target lies beyond it. once each field is resolved against the
+destination the bytes transfer there, touching only what the ABI lets a call
+veneer clobber
+
+## def BranchReachFn
+
+```mach
+pub def BranchReachFn: fun(RelocKind) opt[BranchReach]
+```
+
+the reach of a relocation kind that is a direct branch a thunk can extend, none
+for every other kind
+
+## def BranchThunkFn
+
+```mach
+pub def BranchThunkFn: fun() BranchThunk
+```
+
 ## rec RelocationCapabilities
 
 ```mach

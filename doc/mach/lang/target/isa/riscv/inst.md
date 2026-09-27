@@ -867,16 +867,170 @@ first source: the Zicond halves of a branch-free select (#3346)
 pub val CZERO_NEZ: MachOp = 142
 ```
 
+## val FLH
+
+```mach
+pub val FLH:       MachOp = 143
+```
+
+the half-precision forms (#3801): Zfhmin's loads, stores, moves and
+conversions between formats, and Zfh's arithmetic, sign injection,
+comparisons and integer conversions
+
+## val FSH
+
+```mach
+pub val FSH:       MachOp = 144
+```
+
+## val FMV_X_H
+
+```mach
+pub val FMV_X_H:   MachOp = 145
+```
+
+## val FMV_H_X
+
+```mach
+pub val FMV_H_X:   MachOp = 146
+```
+
+## val FCVT_S_H
+
+```mach
+pub val FCVT_S_H:  MachOp = 147
+```
+
+## val FCVT_H_S
+
+```mach
+pub val FCVT_H_S:  MachOp = 148
+```
+
+## val FCVT_D_H
+
+```mach
+pub val FCVT_D_H:  MachOp = 149
+```
+
+## val FCVT_H_D
+
+```mach
+pub val FCVT_H_D:  MachOp = 150
+```
+
+## val FADD_H
+
+```mach
+pub val FADD_H:    MachOp = 151
+```
+
+## val FSUB_H
+
+```mach
+pub val FSUB_H:    MachOp = 152
+```
+
+## val FMUL_H
+
+```mach
+pub val FMUL_H:    MachOp = 153
+```
+
+## val FDIV_H
+
+```mach
+pub val FDIV_H:    MachOp = 154
+```
+
+## val FSGNJ_H
+
+```mach
+pub val FSGNJ_H:   MachOp = 155
+```
+
+## val FSGNJN_H
+
+```mach
+pub val FSGNJN_H:  MachOp = 156
+```
+
+## val FEQ_H
+
+```mach
+pub val FEQ_H:     MachOp = 157
+```
+
+## val FLT_H
+
+```mach
+pub val FLT_H:     MachOp = 158
+```
+
+## val FLE_H
+
+```mach
+pub val FLE_H:     MachOp = 159
+```
+
+## val FCVT_W_H
+
+```mach
+pub val FCVT_W_H:  MachOp = 160
+```
+
+## val FCVT_WU_H
+
+```mach
+pub val FCVT_WU_H: MachOp = 161
+```
+
+## val FCVT_L_H
+
+```mach
+pub val FCVT_L_H:  MachOp = 162
+```
+
+## val FCVT_LU_H
+
+```mach
+pub val FCVT_LU_H: MachOp = 163
+```
+
+## val FCVT_H_W
+
+```mach
+pub val FCVT_H_W:  MachOp = 164
+```
+
+## val FCVT_H_WU
+
+```mach
+pub val FCVT_H_WU: MachOp = 165
+```
+
+## val FCVT_H_L
+
+```mach
+pub val FCVT_H_L:  MachOp = 166
+```
+
+## val FCVT_H_LU
+
+```mach
+pub val FCVT_H_LU: MachOp = 167
+```
+
 ## val MOP_LAST
 
 ```mach
-pub val MOP_LAST: MachOp = CZERO_NEZ
+pub val MOP_LAST: MachOp = FCVT_H_LU
 ```
 
 ## val ROW_COUNT
 
 ```mach
-pub val ROW_COUNT: usize = 143
+pub val ROW_COUNT: usize = 168
 ```
 
 ROW_COUNT is MOP_LAST + 1 spelled as a literal so the array length is
@@ -1384,6 +1538,12 @@ pub val FMT_S_BIT: u32 = 0x0
 
 ```mach
 pub val FMT_D_BIT: u32 = 0x1
+```
+
+## val FMT_H_BIT
+
+```mach
+pub val FMT_H_BIT: u32 = 0x2
 ```
 
 ## val FCVT_W
