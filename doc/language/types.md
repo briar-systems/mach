@@ -34,6 +34,43 @@ position:
 val f16: i64 = 7; # fine: values are a different position
 ```
 
+### Half precision
+
+`f16` is IEEE 754 binary16: a sign bit, 5 exponent bits and 10 significand
+bits, with `$size_of` 2 and `$align_of` 2, which is what C's `_Float16` has on
+every ABI mach targets. Its largest finite value is 65504, its smallest normal
+2^-14 and its smallest subnormal 2^-24. It is a float like the other two:
+`$is_float(f16)` holds, every float operator applies with the result correctly
+rounded to binary16, literals take the `f16` suffix
+([literals.md](literals.md#typed-suffixes)), and compile-time evaluation
+computes in binary16 exactly, with the rounding, subnormals and overflow to
+infinity of the emitted code:
+
+```mach
+use std.runtime;
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    val a:   f16 = 1.5;
+    val b:   f16 = a * 2.0 + 0.25f16; # 3.25, rounded once to binary16
+    val max: f16 = 65504.0; # the largest finite f16
+    val inf: f16 = max + max; # overflows to infinity
+    if (b:~u16 != 0x4280 || inf:~u16 != 0x7C00)    { ret 1; }
+    if ($size_of(f16) != 2 || $align_of(f16) != 2) { ret 2; }
+    ret 0;
+}
+```
+
+Every target realizes `f16`, including one with no half-precision hardware:
+where the target has no instruction for an operation, the compiler emits it as
+inline integer and binary64 code, never a call to a runtime helper, so a
+freestanding link needs nothing extra. Which targets compute natively, and why
+the result is the same bits either way, is on
+[operators.md](operators.md#half-precision-arithmetic). The conversions are on
+[operators.md](operators.md#f16-conversions), the lane form `f16xN` under
+[SIMD vectors](#simd-vectors) below, and the calling conventions on
+[ext-fun.md](ext-fun.md#f16-and-_float16).
+
 ### 128-bit integers
 
 `u128` and `i128` are integers like the others: every arithmetic, bitwise,
@@ -85,7 +122,7 @@ followed by `x` and a lane count.
 On a 128-bit target the spellings this currently accepts are:
 
 ```mach fragment
-f32x4  f64x2                    # float lanes
+f16x8  f32x4  f64x2             # float lanes
 i8x16  i16x8  i32x4  i64x2      # signed integer lanes
 u8x16  u16x8  u32x4  u64x2      # unsigned integer lanes
 ```
@@ -158,7 +195,32 @@ whose vectors are values rather than registers, splits nothing. A secret vector
 keeps its secrecy on every piece.
 
 `ptr` is not a lane element: its width is target-defined rather than a scalar bit
-count, so `ptrx2` is not a vector spelling.
+count, so `ptrx2` is not a vector spelling. A lane is an integer of 8 to 64 bits,
+an `f16`, an `f32` or an `f64`.
+
+**`f16` lanes.** `f16xN` is a vector like any other: `+ - * /` and the
+comparisons apply lane-wise, a comparison gives a `u16xN` mask, `::` converts each
+lane with the scalar `f16` rule, and `:~` reads the bits (`f16x8:~u16x8`). Every
+lane is bit for bit what the scalar operation gives on the same target, whichever
+way the target realizes the shape:
+
+| target | `f16` lane arithmetic | `f16` lane comparisons |
+|---|---|---|
+| aarch64 with `fp16` | packed `.8h` and `.4h` instructions | packed `.8h` and `.4h` compares |
+| aarch64 without `fp16` | each lane's scalar `f16` operation | the lanes widened to `f32` (`fcvtl`) and compared there |
+| x86-64 with `f16c` (`x86-64-v3` and up) | four lanes at a time widened to `f32` lanes (`vcvtph2ps`), computed there and narrowed back (`vcvtps2ph`) | four lanes at a time widened to `f32` lanes and compared there |
+| x86-64 without `f16c` | each lane's scalar `f16` operation | each lane's scalar comparison |
+| riscv64, riscv32 | each lane's scalar `f16` operation (no vector unit) | each lane's scalar comparison |
+| spirv with `float16` | the core float instructions on an `f16` vector | the same |
+| spirv without `float16` (`vulkan1.0`, `vulkan1.1`) | each lane's scalar `f16` operation | each lane's scalar comparison |
+
+A lane's scalar operation is the target's own half instruction where it has one
+and the inline expansion otherwise (see
+[operators.md](operators.md#half-precision-arithmetic)). On aarch64 the
+conversions between `f16` and `f32` lanes are packed (`fcvtl`, `fcvtn`) with or
+without `fp16`. A comparison makes no NaN and every widening is exact, so
+comparing in `f32` lanes gives the scalar mask. x86-64 has no packed `f16`
+arithmetic below AVX-512 FP16, and the AVX-512 FP16 rows are #4159.
 
 ### Size and alignment
 
@@ -167,6 +229,8 @@ at any width.
 
 | type | `$size_of` | `$align_of` |
 |---|---|---|
+| `f16x4` | 8 | 2 |
+| `f16x8` | 16 | 16 |
 | `f32x2` | 8 | 4 |
 | `f32x3` | 12 | 4 |
 | `f32x4` | 16 | 16 |

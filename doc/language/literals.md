@@ -20,8 +20,8 @@ context an integer literal is `i64` and a float literal is `f64`.
 
 A suffix is the spelling of the primitive type the literal has: `u8`,
 `u16`, `u32`, `u64`, `u128`, `i8`, `i16`, `i32`, `i64`, `i128` on an
-integer literal, and `f32` or `f64` on a float literal. It works with every radix and with
-digit separators (`0xFFu8`, `0b1010u16`, `1_000_000u32`, `1.5e2f32`).
+integer literal, and `f16`, `f32` or `f64` on a float literal. It works with every radix
+and with digit separators (`0xFFu8`, `0b1010u16`, `1_000_000u32`, `1.5e2f32`, `0.25f16`).
 
 A suffixed literal *is* that type, in the same way a variable of that type
 is. It is not a hint, and it is never silently retyped:
@@ -90,7 +90,13 @@ aside. `0.1` in `f32` is quiet, since `0.1` is how that `f32` value is
 written, while `3.14159265358979` in `f32` warns that the value stored is
 `3.1415927`. An exactly representable literal never warns, however many
 digits it has: `2147483648.0` is exact in `f32`. The warning is the named
-kind `inexact-float-literal`.
+kind `float.inexact`.
+
+The rule is the same at every float width, and it matters most for `f16`,
+whose 11 significant bits hold about three decimal digits. `0.1` in `f16` is
+quiet, since it stores 0.0999755859375 and `0.1` is how that value is written,
+while `3.14159` in `f16` warns that the value stored is `3.14`, which is
+3.140625.
 
 A literal that rounds to infinity in its type, or whose nonzero value
 rounds to zero, is an error:
@@ -100,6 +106,15 @@ val a: f32 = 3.4028235e38; # fine: the largest f32
 val b: f64 = 1.0e39; # fine: f64 holds it
 val c: f32 = 1.0e39; # error: float literal overflows `f32`: it rounds to infinity
 val d: f32 = 1.0e-46; # error: float literal underflows `f32`: its nonzero value rounds to zero
+```
+
+`f16` holds much less, so its bounds come early:
+
+```mach error float literal overflows `f16`
+val a: f16 = 65504.0; # fine: the largest f16
+val b: f16 = 0.00000006; # fine: rounds to the smallest subnormal, 2^-24
+val c: f16 = 70000.0; # error: float literal overflows `f16`: it rounds to infinity
+val d: f16 = 1.0e-8; # error: float literal underflows `f16`: its nonzero value rounds to zero
 ```
 
 Every phase agrees on the type a suffix declares: compile-time evaluation,
