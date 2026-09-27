@@ -47,6 +47,15 @@ pub val CT_OP_INT_MUL:    CtOp = 3
 pub val CT_OP_VAR_SHIFT:  CtOp = 4
 ```
 
+## val CT_OP_REP_STRING
+
+```mach
+pub val CT_OP_REP_STRING: CtOp = 5
+```
+
+a repeated string instruction: it runs once per element of its count, and a
+compare stops at the first element that differs, so its timing is its data
+
 ## def CtCap
 
 ```mach

@@ -780,6 +780,16 @@ pub fun scalar_permute_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
 the same for the lane ranges and joins: a cell the packed table leaves keeps
 the lane path
 
+## fun scalar_half_lane_rows
+
+```mach
+pub fun scalar_half_lane_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
+```
+
+the same for the arithmetic and comparisons of f16 lanes: a cell the packed
+table leaves is each lane's scalar f16 operation, the half expansion or the
+target's own half row (#3802)
+
 ## fun ct_mul_rows_admit
 
 ```mach

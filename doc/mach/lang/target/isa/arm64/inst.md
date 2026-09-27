@@ -1625,7 +1625,9 @@ pub fun neon_conv_field(op: MachOp, eb: u8) u32;
 ```
 
 the operand-width field of a lane-wise conversion: the shift-left-long
-immh marker, the narrowing size of its result, or the double-precision bit
+immh marker, the narrowing size of its result, or the double-precision bit.
+fcvtl lengthens half to single (eb 2) or single to double (eb 4), and fcvtn
+narrows single to half (eb 4) or double to single (eb 8)
 
 ## fun logical_imm
 
