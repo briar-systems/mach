@@ -104,11 +104,10 @@ pub fun resolve(reg: *TargetRegistry, req: *TargetRequest) res[resolved.Target, 
 ## val TARGET_FINGERPRINT_VERSION
 
 ```mach
-pub val TARGET_FINGERPRINT_VERSION: u8 = 7
+pub val TARGET_FINGERPRINT_VERSION: u8 = 8
 ```
 
-version 7: the image domain carries whether an aggregate argument is placed
-by its natural alignment (#3929)
+version 8: the model domain carries the scalar f16 rows (#3799)
 
 ## fun fingerprint
 
