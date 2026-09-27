@@ -29,6 +29,29 @@ pub rec Keyed;
 
 kind: the row of the diagnostic kind table the failure is reported as
 text: the message
+at:   where in the file that caused it the failure points, the zero place
+      when it points nowhere
+
+## rec Place
+
+```mach
+pub rec Place;
+```
+
+where a failure points: the bytes [start, end) of the file at `path`, and the
+line and column of `start` and of `end`, each from 1 with columns counted in
+UTF-8 bytes. a place whose range is known before its file is `spanned` with a
+nil path until `placed` names the file. the path shares the message's
+lifetime: a copy of the failure that outlives its message copies both
+
+path: the file, nil until the place is resolved
+spanned: whether a range is known; false with a nil path is no place
+start: the byte offset of the first byte
+end: the byte offset just past the last byte
+line: the line of `start`
+col: the column of `start`
+end_line: the line of `end`
+end_col: the column of `end`
 
 ## fun reported
 
@@ -50,6 +73,61 @@ retired one, is a compiler defect and becomes an internal failure
 ```mach
 pub fun internal(message: str) Fail;
 ```
+
+## fun spanned
+
+```mach
+pub fun spanned(f: Fail, start: usize, end: usize) Fail;
+```
+
+the same failure pointing at the bytes [start, end) of the file that caused
+it, which `placed` names. a failure that already points somewhere keeps its
+place, the innermost site knowing best, and one with no kind points nowhere
+
+## fun placed
+
+```mach
+pub fun placed(a: *A.Allocator, f: Fail, path: str, text: str) Fail;
+```
+
+the same failure with its range resolved in `text`, the file at `path`, as
+`located` places it; a failure without a range, or one already resolved, is
+returned as it is
+
+## fun placed_bytes
+
+```mach
+pub fun placed_bytes(a: *A.Allocator, f: Fail, path: str, data: *u8, n: usize) Fail;
+```
+
+`placed` over the `n` bytes at `data`, for a file that may hold a NUL
+
+## fun located
+
+```mach
+pub fun located(a: *A.Allocator, f: Fail, at: Place) Fail;
+```
+
+the same failure pointing at `at`, its path copied through `a` so the failure
+owns it as it owns its text. a failure with no kind points nowhere, and one
+whose copy is refused is that refusal
+
+## fun place
+
+```mach
+pub fun place(path: str, data: *u8, n: usize, start: usize, end: usize) Place;
+```
+
+the bytes [start, end) of the `n` bytes at `data`, the file at `path`, as a
+place; a range past the end is clamped to it
+
+## fun place_of
+
+```mach
+pub fun place_of(f: Fail) opt[Place];
+```
+
+where the failure points, when it points at a file
 
 ## fun environment
 
@@ -133,7 +211,8 @@ pub fun toml_text(e: toml.TomlError) str;
 pub fun toml_failure(e: toml.TomlError) Fail;
 ```
 
-a document that does not parse is the user's, one the allocator refused is internal
+a document that does not parse is the user's, pointing at the byte the parser
+refused; one the allocator refused is internal
 
 ## fun env_text
 
@@ -178,22 +257,41 @@ pub fun describe(f: Fail) str;
 the failure as one line of presentation text; a reported failure has no
 text of its own and is named as such, never as an empty message
 
-## fun release_text
-
-```mach
-pub fun release_text(a: *A.Allocator, f: Fail);
-```
-
-release the text a failure owns through `a`; a reported failure owns nothing
-
 ## fun with_text
 
 ```mach
 pub fun with_text(f: Fail, message: str) Fail;
 ```
 
-the same failure carrying `message` instead: the case is kept, the text
-replaced (a caller that copies the message into storage it owns)
+the same failure carrying `message` instead: the case and the place are
+kept, the text replaced (a caller that copies the message into storage it owns)
+
+## fun with_path
+
+```mach
+pub fun with_path(f: Fail, path: str) Fail;
+```
+
+the same failure pointing at the file `path` instead, its range kept (a
+caller that copies the path into storage it owns)
+
+## fun retain
+
+```mach
+pub fun retain(a: *A.Allocator, f: Fail) res[Fail, A.Error];
+```
+
+a copy of the failure that owns its text and its place's path through `a`,
+for a failure that outlives the storage its message was made in; released
+with `release`
+
+## fun release
+
+```mach
+pub fun release(a: *A.Allocator, f: Fail);
+```
+
+release what a retained failure owns through `a`: its text and its place's path
 
 ## fun catalog
 

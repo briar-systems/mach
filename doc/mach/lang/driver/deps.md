@@ -210,12 +210,6 @@ what: how `m` was selected, as its manifest line spells it
 m: the manifest to check
 ret: err naming the first dependency selected by a branch, a commit or a path
 
-## fun parse_toml_file
-
-```mach
-pub fun parse_toml_file(alloc: *A.Allocator, path: str) res[toml.Table, outcome.Fail];
-```
-
 ## fun cell_tmpl_vars
 
 ```mach
@@ -332,7 +326,7 @@ revision the checkout lacks is fetched, which `offline` refuses; the caller free
 ## fun manifest_at
 
 ```mach
-pub fun manifest_at(alloc: *A.Allocator, dir: str, rev: str) res[toml.Table, outcome.Fail];
+pub fun manifest_at(alloc: *A.Allocator, dir: str, rev: str) res[manifest.Doc, outcome.Fail];
 ```
 
 the manifest the commit `rev` of the repository at `dir` holds, allocated from `alloc`

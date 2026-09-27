@@ -108,14 +108,29 @@ the constant-time validator does.
 ## Failure records
 
 A failure raised outside the compiler's diagnostics, the ones the human
-rendering prints as a lone `error[<key>]: <message>` line, is a record with
-`"record": "failure"` and the members of a diagnostic record. Its `severity`
-is `"error"`, its `code` the failure's key, and `primary` is `null`, with
-`related`, `notes`, `help` and `fixes` empty.
+rendering prints as an `error[<key>]: <message>` line with no source excerpt,
+is a record with `"record": "failure"` and the members of a diagnostic record.
+Its `severity` is `"error"`, its `code` the failure's key, and `related`,
+`notes`, `help` and `fixes` are empty.
 
 ```json
 {"schema":1,"record":"failure","severity":"error","code":"link.entry_missing","message":"undefined entry symbol '_start'; ensure the target startup library is linked","origin":"link","primary":null,"related":[],"notes":[],"help":[],"fixes":[]}
 ```
+
+`primary` is the span in the file that caused the failure, or `null` when no
+file did. A manifest refusal points into the `mach.toml` that made the claim it
+refuses: a value it rejects, the key token of a name or key it rejects, or the
+table a required key is missing from. A dependency's refusal points into the
+dependency's own manifest, not the root that imported it. The human rendering
+shows the same place on the line after the headline, as `--> <file>:<line>:<column>`.
+
+```json
+{"schema":1,"record":"failure","severity":"error","code":"version.invalid_range","message":"mach.toml: [project].mach = \"^x\": expected a number (clause 1)","origin":"build","primary":{"file":"mach.toml","line":2,"column":8,"end_line":2,"end_column":12,"byte_start":17,"byte_end":21},"related":[],"notes":[],"help":[],"fixes":[]}
+```
+
+A refusal no single place in the manifest states, such as a cycle among
+`need` entries, and one raised while a build expands a path template, is not
+located.
 
 `origin` names the phase the failure came from: `build` for the manifest,
 dependency resolution and build steps, the phase that failed for a failure
