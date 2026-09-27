@@ -17,6 +17,7 @@ test/
   lib/start_<target>.mach       the process entry a direct target's run bin reports through
   lib/elf_loadable.py           re-lays a freestanding ELF so qemu-user can map it
   link/cases/<name>/            one link case: a project, case.conf, expect*.txt
+  f16proof/                     the exhaustive f16 proof: its subject project and check.c
   link/check/                   the shared image readers
   fuzz/corpus/                  inputs replayed by the unit suite (see fuzz/README.md)
   out/                          build products, gitignored
@@ -34,6 +35,7 @@ bash test/run.sh --link [--qemu]          # the link cases instead of the corpus
 bash test/run.sh --incremental            # warm rebuilds of the compiler and a manifest fixture match clean builds
 bash test/run.sh --docs [--case <page>]   # the mach code blocks of doc/language compile, are fmt-canonical, and the ones with a main run
 bash test/run.sh --docs --target <t>      # the same blocks compiled for one other hosted target, run only natively
+bash test/run.sh --f16proof [--qemu] [--shard <i>/<n>]   # every f16 operation against a correctly rounded reference (hours; CI heavy=f16proof)
 ```
 
 `MACH` names the compiler under test; the default is the checkout's
@@ -239,3 +241,42 @@ which defaults to `/usr/riscv64-linux-gnu`, where Ubuntu's
 
 qemu is compute evidence, never ABI evidence: RELRO and page-size behaviour is
 proven only by a native leg.
+
+## The f16 proof
+
+`--f16proof` proves every `f16` operation exhaustively (#3804), on the columns
+that compute `f16`: `x86_64-linux` and `aarch64-linux` and `riscv64-linux` run
+the software expansion, `x86_64v3-linux` (F16C), `aarch64fp16-linux` (FP16) and
+`riscv64zfh-linux` (Zfh) their native rows. `f16proof/` is a project whose one
+program, built at O2 for the column, writes the bits of every result of one
+mode over a slice of its input domain, and `f16proof/check.c` holds each to a
+reference computed in integers alone: an exact sum, product or quotient
+(remainder as a sticky bit) rounded once to binary16, to nearest with ties to
+even, with subnormals and overflow to infinity. A NaN result is held to the
+target's rule: x86 returns the first NaN operand quieted and makes the negative
+default NaN, arm gives a signaling operand priority and makes the positive
+default NaN, riscv makes the canonical NaN, and a converted NaN follows the
+rule of [operators.md](../doc/language/operators.md#a-nan-between-float-widths).
+
+| mode | inputs | what is checked |
+|---|---|---|
+| `add` `sub` `mul` `div` | every pair of f16 operands, 2^32 | the operator; the same operation widened to binary32 and to binary64 by `::` and narrowed once; two mutations |
+| `narrow32` | every binary32 encoding, 2^32 | `f32` to `f16` |
+| `narrow64` | every binary64 high word, with a low word of 0 and of 1 | `f64` to `f16`, the low word as a sticky bit |
+| `int32` | every 32-bit integer | to `f16` as `i32`, `u32`, `i64`, `u64`, and shifted into the top half of a `u64` and an `i64` |
+| `int16` | every 16-bit integer | to `f16` as `i16`, `u16`, `i8`, `u8` |
+| `widen` | every f16 | to `f32` and `f64` |
+| `toint` | every f16 | to every integer width: truncated exactly in range, and out of range the same as the `f64` conversion, the rule every float width follows |
+
+The two widened forms are compared by value, a NaN only as a NaN, since `::`
+quiets an operand before the operation. The mutations are the control: the
+result rounded to 13 bits and then narrowed (twice rounded through a format
+short of the 2p+2 bits one rounding needs), and truncated to f16 precision
+before the narrowing. Each must mismatch, or the run fails. Narrowing through
+binary32 is not a mutation: it is exactly the binary32 form.
+
+`--shard i/n` takes the i-th of n equal slices of every mode's domain, and each
+slice runs as `JOBS` pieces at once (default: every processor). A column this
+host cannot execute fails, so the riscv64 columns need `--qemu`. At 2^32 cases
+per operation per column it is long, and runs in CI only when dispatched as
+`heavy=f16proof`, four shards per column.
