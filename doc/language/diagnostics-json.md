@@ -121,8 +121,11 @@ Its `severity` is `"error"`, its `code` the failure's key, and `related`,
 file did. A manifest refusal points into the `mach.toml` that made the claim it
 refuses: a value it rejects, the key token of a name or key it rejects, or the
 table a required key is missing from. A dependency's refusal points into the
-dependency's own manifest, not the root that imported it. The human rendering
-shows the same place on the line after the headline, as `--> <file>:<line>:<column>`.
+dependency's own manifest, not the root that imported it. Its `file` follows
+the rule for every span, so a dependency's manifest is `dep/libx/mach.toml`,
+and `dep\libx\mach.toml` on Windows. The human rendering shows the same place on
+the line after the headline, as `--> <file>:<line>:<column>`, naming the file by
+the path it was read at, as it names a source file.
 
 ```json
 {"schema":1,"record":"failure","severity":"error","code":"version.invalid_range","message":"mach.toml: [project].mach = \"^x\": expected a number (clause 1)","origin":"build","primary":{"file":"mach.toml","line":2,"column":8,"end_line":2,"end_column":12,"byte_start":17,"byte_end":21},"related":[],"notes":[],"help":[],"fixes":[]}
