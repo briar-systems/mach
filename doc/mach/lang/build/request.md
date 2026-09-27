@@ -54,11 +54,13 @@ pub fun subsystem_from_flag(f: SubsystemFlag) opt[of.Subsystem];
 pub def BuildGoal: u8
 ```
 
-## val GOAL_EXECUTE
+## val GOAL_ARTIFACT
 
 ```mach
-pub val GOAL_EXECUTE: BuildGoal = 0
+pub val GOAL_ARTIFACT: BuildGoal = 0
 ```
+
+the finished artifact of the unit's kind: an executable, a static archive or a shared library
 
 ## val GOAL_OBJECTS
 

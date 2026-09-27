@@ -73,6 +73,8 @@ stack_commit: the `stack_commit` byte count, 0 when absent
 extensions: the `extensions` names, each an identifier and listed once; the isa
                  refuses a name its vocabulary does not hold when the target resolves
 extension_count: how many of `extensions` are set
+at: where the table's key is written
+default_at: where its `default` value is written, the zero place when absent
 
 ## rec ArtifactDef
 
@@ -101,6 +103,11 @@ is_default: `default = true`; false when the key is absent
 subsystem: the `subsystem` key, console when absent; only "console" and "gui" parse
 icon: the `icon` path, or STR_NIL when absent; `bin` artifacts only
 app_manifest: the `manifest` path, or STR_NIL when absent; `bin` artifacts only
+at: where the table's key is written
+default_at: where its `default` value is written, the zero place when absent
+out_at: where its `out` value is written
+targets_at: where its `targets` value is written
+need_at: where each `need` entry is written, parallel to `need`
 
 ## rec ProfileDef
 
@@ -123,6 +130,8 @@ vectorize: the required `vectorize` key
 float_reassoc: the required `float_reassoc` key
 allow: the optional `allow` key: the warning kinds the profile silences,
                empty when the key is absent
+at: where the table's key is written, the zero place when synthesized
+default_at: where its `default` value is written, the zero place when absent
 
 ## rec DepDef
 
@@ -203,6 +212,8 @@ abi_count: length of `abi`
 abi_present: as `os_present`
 export: the `export` key, required at the root; false when absent in a dependency
 include_referenced: the `include` key: false for "always" (the default), true for "referenced"
+at: where the table's key is written
+path_at: where the `path` value is written, the zero place when absent
 
 ## rec StepDef
 
@@ -228,6 +239,12 @@ need: the `need` array of step-qualified names or globs; required at the root (`
             optional in a dependency
 need_count: length of `need`
 timeout: the `timeout` key, a duration such as "30s"; 0 when absent
+at: where the table's key is written
+argv_at: where each `argv` entry is written, parallel to `argv`
+env_at: where each `env` value is written, parallel to `env_values`
+in_at: where each `in` entry is written, parallel to `in`
+out_at: where each `out` entry is written, parallel to `out`
+need_at: where each `need` entry is written, parallel to `need`
 
 ## rec Manifest
 
@@ -236,12 +253,16 @@ pub rec Manifest;
 ```
 
 a parsed `mach.toml`. every string is an interned id; every array is owned and
-freed by `dnit`, so the counts are the allocation extents
+freed by `dnit`, so the counts are the allocation extents. every place a
+definition records is resolved in the file the manifest was read from, its
+path the interner's, so a refusal made from the model points at the entry
+that caused it
 
 id: the required `[project].id`, a portable identifier
 version: the required `[project].version`, carried verbatim
 src: the required `[project].src`, a project-relative path
 out_tmpl: the required `[project].out`, an unexpanded path template
+out_at: where `[project].out` is written
 default_target: always the interned string "native"
 targets: the `[target.*]` tables, nil when none
 target_count: length of `targets`
@@ -280,4 +301,13 @@ result of `empty` and on a manifest already released
 
 m: the manifest
 alloc: the allocator `parse` was given
+
+## fun step_dnit
+
+```mach
+pub fun step_dnit(alloc: *A.Allocator, s: *StepDef);
+```
+
+free every array a step owns, its entries and the places they are written at;
+the step itself is its owner's
 

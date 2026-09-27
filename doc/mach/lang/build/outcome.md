@@ -29,6 +29,43 @@ pub rec Keyed;
 
 kind: the row of the diagnostic kind table the failure is reported as
 text: the message
+at:   where in the file that caused it the failure points, the zero place
+      when it points nowhere
+also: the other places the failure names, none when it names no other
+
+## rec Related
+
+```mach
+pub rec Related;
+```
+
+the other places a failure names, in order, each in its own file: the other
+edges of a cycle, the other claims a collision is between. the array and
+each resolved place's path share the failure's lifetime as `at`'s path does
+
+items: the places, nil when there are none
+count: how many
+
+## rec Place
+
+```mach
+pub rec Place;
+```
+
+where a failure points: the bytes [start, end) of the file at `path`, and the
+line and column of `start` and of `end`, each from 1 with columns counted in
+UTF-8 bytes. a place whose range is known before its file is `spanned` with a
+nil path until `placed` names the file. the path shares the message's
+lifetime: a copy of the failure that outlives its message copies both
+
+path: the file, nil until the place is resolved
+spanned: whether a range is known; false with a nil path is no place
+start: the byte offset of the first byte
+end: the byte offset just past the last byte
+line: the line of `start`
+col: the column of `start`
+end_line: the line of `end`
+end_col: the column of `end`
 
 ## fun reported
 
@@ -50,6 +87,125 @@ retired one, is a compiler defect and becomes an internal failure
 ```mach
 pub fun internal(message: str) Fail;
 ```
+
+## fun spanned
+
+```mach
+pub fun spanned(f: Fail, start: usize, end: usize) Fail;
+```
+
+the same failure pointing at the bytes [start, end) of the file that caused
+it, which `placed` names. a failure that already points somewhere keeps its
+place, the innermost site knowing best, and one with no kind points nowhere
+
+## fun placed
+
+```mach
+pub fun placed(a: *A.Allocator, f: Fail, path: str, text: str) Fail;
+```
+
+the same failure with its ranges resolved in `text`, the file at `path`, as
+`located` places them: its own and each related one still without a file. a
+failure without a range, or one already resolved, is returned as it is
+
+## fun placed_bytes
+
+```mach
+pub fun placed_bytes(a: *A.Allocator, f: Fail, path: str, data: *u8, n: usize) Fail;
+```
+
+`placed` over the `n` bytes at `data`, for a file that may hold a NUL
+
+## fun at
+
+```mach
+pub fun at(a: *A.Allocator, f: Fail, p: Place) Fail;
+```
+
+the same failure pointing at `p`, a place a model recorded: one without a
+file is a range `placed` resolves, one with a file is copied as `located`
+copies it. a failure that already points somewhere keeps its place
+
+## fun with_related
+
+```mach
+pub fun with_related(a: *A.Allocator, f: Fail, ps: *Place, n: usize) Fail;
+```
+
+the same failure naming the `n` places at `ps` as its related places, in
+order, each copied through `a` as `at` copies a place; an unspanned place is
+skipped. a failure that already names related places keeps them, and one
+whose copy is refused is that refusal
+
+## fun related_of
+
+```mach
+pub fun related_of(f: Fail) Related;
+```
+
+the related places a failure names, none for one that names no other
+
+## fun located
+
+```mach
+pub fun located(a: *A.Allocator, f: Fail, at: Place) Fail;
+```
+
+the same failure pointing at `at`, its path copied through `a` so the failure
+owns it as it owns its text. a failure with no kind points nowhere, and one
+whose copy is refused is that refusal
+
+## fun place
+
+```mach
+pub fun place(path: str, data: *u8, n: usize, start: usize, end: usize) Place;
+```
+
+the bytes [start, end) of the `n` bytes at `data`, the file at `path`, as a
+place; a range past the end is clamped to it
+
+## rec Lines
+
+```mach
+pub rec Lines;
+```
+
+the offsets the lines of one file start at, for resolving many places in it
+as `place` resolves one, each in time logarithmic in the file's lines
+
+path: the file, which every place resolved here names
+n: the file's length in bytes
+starts: the offset of each line's first byte, the first line's 0
+
+## fun lines_of
+
+```mach
+pub fun lines_of(a: *A.Allocator, path: str, data: *u8, n: usize) res[Lines, A.Error];
+```
+
+the lines of the `n` bytes at `data`, the file at `path`; released with `lines_dnit`
+
+## fun lines_dnit
+
+```mach
+pub fun lines_dnit(l: *Lines);
+```
+
+## fun lines_place
+
+```mach
+pub fun lines_place(l: *Lines, start: usize, end: usize) Place;
+```
+
+the bytes [start, end) of the file `l` indexes as a place, as `place` makes it
+
+## fun place_of
+
+```mach
+pub fun place_of(f: Fail) opt[Place];
+```
+
+where the failure points, when it points at a file
 
 ## fun environment
 
@@ -133,7 +289,8 @@ pub fun toml_text(e: toml.TomlError) str;
 pub fun toml_failure(e: toml.TomlError) Fail;
 ```
 
-a document that does not parse is the user's, one the allocator refused is internal
+a document that does not parse is the user's, pointing at the byte the parser
+refused; one the allocator refused is internal
 
 ## fun env_text
 
@@ -178,22 +335,68 @@ pub fun describe(f: Fail) str;
 the failure as one line of presentation text; a reported failure has no
 text of its own and is named as such, never as an empty message
 
-## fun release_text
-
-```mach
-pub fun release_text(a: *A.Allocator, f: Fail);
-```
-
-release the text a failure owns through `a`; a reported failure owns nothing
-
 ## fun with_text
 
 ```mach
 pub fun with_text(f: Fail, message: str) Fail;
 ```
 
-the same failure carrying `message` instead: the case is kept, the text
-replaced (a caller that copies the message into storage it owns)
+the same failure carrying `message` instead: the case and the place are
+kept, the text replaced (a caller that copies the message into storage it owns)
+
+## fun retain
+
+```mach
+pub fun retain(a: *A.Allocator, f: Fail) res[Fail, A.Error];
+```
+
+a copy of the failure that owns its text and its places through `a`, for a
+failure that outlives the storage its message was made in; released with
+`release`
+
+## fun release
+
+```mach
+pub fun release(a: *A.Allocator, f: Fail);
+```
+
+release what a retained failure owns through `a`: its text and its places
+
+## fun retain_places
+
+```mach
+pub fun retain_places(a: *A.Allocator, f: Fail) res[Fail, A.Error];
+```
+
+a copy of the failure whose places, its own path and every related place,
+are owned through `a`, its text left as it is; for a holder that keeps the
+text apart. released with `release_places`
+
+## fun release_places
+
+```mach
+pub fun release_places(a: *A.Allocator, f: Fail);
+```
+
+release the places a failure owns through `a`, as `retain_places` made them
+
+## fun without_places
+
+```mach
+pub fun without_places(f: Fail) Fail;
+```
+
+the same failure pointing nowhere and naming no related place, for a holder
+whose places were released or never copied
+
+## fun same_places
+
+```mach
+pub fun same_places(x: Fail, y: Fail) bool;
+```
+
+whether two failures hold the same places: the same path storage and the
+same related array, as a holder that copied them once sees its own copy
 
 ## fun catalog
 
@@ -309,7 +512,7 @@ pub rec DiagnosticBatch;
 ```mach
 pub tag BuildEvent: u8 {
     unit:        BuildUnitEvent;
-    fail:        Fail;
+    fail:        FailEvent;
     diagnostics: DiagnosticBatch;
 }
 ```
@@ -317,6 +520,14 @@ pub tag BuildEvent: u8 {
 what a build recorded, in order: a unit finished, a failure, or a batch of
 diagnostics with the sources they refer to. every payload is owned by the
 outcome's allocator
+
+## rec FailEvent
+
+```mach
+pub rec FailEvent;
+```
+
+a failure recorded outside a diagnostic store, and the phase it is reported under
 
 ## def BuildSeverity
 
@@ -406,10 +617,12 @@ pub fun record_unit(bo: *BuildOutcome, artifact: str, target: str, verb: str, ha
 ## fun record_fail
 
 ```mach
-pub fun record_fail(bo: *BuildOutcome, f: *Fail) err[A.Error];
+pub fun record_fail(bo: *BuildOutcome, f: *Fail, origin: diagnostic.Origin) err[A.Error];
 ```
 
 the failure is copied whole: its text into the outcome's allocator
+
+origin: the phase the failure is reported under
 
 ## fun record_diagnostics
 

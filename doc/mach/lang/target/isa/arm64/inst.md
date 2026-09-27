@@ -943,10 +943,40 @@ pub val PMULL:  MachOp = 147
 pub val PMULL2: MachOp = 148
 ```
 
+## val V_SMULL2
+
+```mach
+pub val V_SMULL2: MachOp = 149
+```
+
+the long multiplies of the upper halves, and the byte extract across two
+registers a lane range and a lane join are made of (#3589)
+
+## val V_UMULL2
+
+```mach
+pub val V_UMULL2: MachOp = 150
+```
+
+## val V_EXT
+
+```mach
+pub val V_EXT:    MachOp = 151
+```
+
+## val CSEL
+
+```mach
+pub val CSEL: MachOp = 152
+```
+
+the first source when the condition holds, else the second: the
+branch-free select (#3346)
+
 ## val MOP_LAST
 
 ```mach
-pub val MOP_LAST:  MachOp = PMULL2
+pub val MOP_LAST:  MachOp = CSEL
 ```
 
 ## fun known
@@ -1183,6 +1213,22 @@ pub val L_NEON_CRYPTO: Layout = 26
 
 a cryptographic row at the one arrangement per operand its CRYPTO_ROWS entry
 names: dst, src1 and an optional src2, packed as rd, rn and rm
+
+## val L_NEON_EXT
+
+```mach
+pub val L_NEON_EXT: Layout = 27
+```
+
+dst, src1, src2 vectors, always .16b, and the first byte of src1 in src3
+
+## val L_CSEL
+
+```mach
+pub val L_CSEL: Layout = 28
+```
+
+dst, src1, src2 registers and the condition in the flags
 
 ## def WidthRule
 

@@ -60,6 +60,10 @@ pub rec LowerCtx {
     # shift takes `c` as its count (#3893)
     count_mask_fold: *bool;
 
+    # an integer compare whose every use is the condition of a select in its
+    # own block is never materialized: each select compares for itself (#3346)
+    select_cmp_fold: *bool;
+
     instr_count: u32;
     interner:    *intern.Interner;
     # the module's diagnostic store, where a refusal of the program lands
@@ -116,6 +120,9 @@ pub fun ctx_setup(ctx: *LowerCtx, tgt: *target.Target, fn: *ir.Function) err[fai
         val res_mask: res[*bool, A.Error] = A.allocate[bool](ctx.alloc, ctx.instr_count::usize);
         if (sel res_mask.err) { ret err[fail.Fail].err{fail.refused(res_mask.err)}; }
         ctx.count_mask_fold = res_mask.ok;
+        val res_cmp: res[*bool, A.Error] = A.allocate[bool](ctx.alloc, ctx.instr_count::usize);
+        if (sel res_cmp.err) { ret err[fail.Fail].err{fail.refused(res_cmp.err)}; }
+        ctx.select_cmp_fold = res_cmp.ok;
 
         var i: u32 = 0;
         for (i < ctx.instr_count) {
@@ -125,6 +132,7 @@ pub fun ctx_setup(ctx: *LowerCtx, tgt: *target.Target, fn: *ir.Function) err[fai
         }
         mark_foldable_geps(ctx, tgt, fn);
         mark_foldable_count_masks(ctx, fn);
+        mark_foldable_select_cmps(ctx, fn);
     }
 
     var i: u32 = 0;
@@ -135,7 +143,7 @@ pub fun ctx_setup(ctx: *LowerCtx, tgt: *target.Target, fn: *ir.Function) err[fai
         val pv: mir.VRegId = res_vreg.ok;
         ctx.param_vregs[i]   = pv;
         ctx.f.vregs[pv.n].ty = fn.params[i].ty::u32;
-        if (fn.params[i].secret && !value_is_aggregate(ctx, fn.params[i].ty)) { ctx.f.vregs[pv.n].secret = true; }
+        if (fn.params[i].secret && param_holds_value(ctx, i)) { ctx.f.vregs[pv.n].secret = true; }
         i = i + 1;
     }
 
@@ -151,7 +159,7 @@ pub fun ctx_setup(ctx: *LowerCtx, tgt: *target.Target, fn: *ir.Function) err[fai
             ctx.instr_vregs[i]   = rv;
             ctx.f.vregs[rv.n].ty = inst.ty::u32;
             if (inst.secret && (inst.kind == instruction.OP_LOAD || inst.kind == instruction.OP_CALL)
-                && !value_is_aggregate(ctx, inst.ty)) {
+                && instr_holds_value(ctx, inst)) {
                 ctx.f.vregs[rv.n].secret = true;
             }
         }
@@ -263,6 +271,78 @@ pub fun mark_foldable_count_masks(ctx: *LowerCtx, fn: *ir.Function) {
     }
 }
 
+pub fun cmp_folds_into_select(ctx: *LowerCtx, iid: id.InstructionId) bool {
+    if (ctx.select_cmp_fold == nil || iid::u32 >= ctx.instr_count) { ret false; }
+    ret ctx.select_cmp_fold[iid::u32];
+}
+
+# a scalar integer compare the alu reads whole
+fun select_cmp_candidate(ctx: *LowerCtx, inst: *instruction.Instruction) bool {
+    if (!opdesc.has(inst.kind, opdesc.EFF_COMPARE) || inst.operand_count != 2) { ret false; }
+    val ty: ir_type.IrTypeId = inst.operands[0].ty;
+    if (value_is_vector(ctx, ty) || value_is_float(ctx, ty) || value_is_aggregate(ctx, ty)) { ret false; }
+    val maw: u32 = ctx.tgt.model.max_alu_width;
+    ret maw == 0 || op_width_of(ctx, ty)::u32 <= maw;
+}
+
+# a compare folds into its selects when it has one and every use is the
+# condition of a select in the compare's own block; a debug binding or any
+# other reader needs the 0/1 answer itself
+fun mark_foldable_select_cmps(ctx: *LowerCtx, fn: *ir.Function) {
+    var i: u32 = 0;
+    for (i < ctx.instr_count) {
+        ctx.select_cmp_fold[i] = false;
+        i                      = i + 1;
+    }
+    if (map.length[id.InstructionId, ir.IrAsm](fn.asm_blocks) > 0) { ret; }
+
+    var b: u32 = 0;
+    for (b < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[b];
+        var k:   u32       = 0;
+        for (k < blk.instr_count) {
+            val iid: u32 = blk.instructions[k]::u32;
+            if (iid < ctx.instr_count && select_cmp_candidate(ctx, ?fn.instrs[iid])) { ctx.select_cmp_fold[iid] = true; }
+            k = k + 1;
+        }
+        b = b + 1;
+    }
+    b = 0;
+    for (b < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[b];
+        var k:   u32       = 0;
+        for (k < blk.phi_count + blk.instr_count + 1) {
+            var iid: id.InstructionId = blk.terminator;
+            if (k < blk.phi_count)                   { iid = blk.phis[k]; }
+            or (k < blk.phi_count + blk.instr_count) { iid = blk.instructions[k - blk.phi_count]; }
+            k = k + 1;
+            if (iid == id.INSTR_NIL || iid::u32 >= ctx.instr_count) { cnt; }
+            val inst: *instruction.Instruction = ?fn.instrs[iid::u32];
+            var o:    u32                      = 0;
+            for (o < inst.operand_count) {
+                val v: value.Value = inst.operands[o];
+                o = o + 1;
+                if (v.kind != value.VAL_INSTR || v.data.instr::u32 >= ctx.instr_count) { cnt; }
+                val g: u32 = v.data.instr::u32;
+                if (!ctx.select_cmp_fold[g]) { cnt; }
+                if (inst.kind != instruction.OP_SELECT || o != 1 || !defined_in(blk, v.data.instr)) {
+                    ctx.select_cmp_fold[g] = false;
+                }
+            }
+        }
+        b = b + 1;
+    }
+}
+
+fun defined_in(blk: *ir.Block, iid: id.InstructionId) bool {
+    var k: u32 = 0;
+    for (k < blk.instr_count) {
+        if (blk.instructions[k] == iid) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
 fun gep_use_folds(ctx: *LowerCtx, inst: *instruction.Instruction, o: u32) bool {
     if ((inst.flags & instruction.INSTR_FLAG_VOLATILE) != 0) { ret false; }
     if (inst.kind == instruction.OP_LOAD && o == 0) {
@@ -307,6 +387,10 @@ pub fun ctx_dnit(ctx: *LowerCtx) {
         A.deallocate[bool](ctx.alloc, ctx.count_mask_fold, ctx.instr_count::usize);
         ctx.count_mask_fold = nil;
     }
+    if (ctx.select_cmp_fold != nil && ctx.instr_count > 0) {
+        A.deallocate[bool](ctx.alloc, ctx.select_cmp_fold, ctx.instr_count::usize);
+        ctx.select_cmp_fold = nil;
+    }
     if (ctx.param_vregs != nil && ctx.param_count > 0) {
         A.deallocate[mir.VRegId](ctx.alloc, ctx.param_vregs, ctx.param_count::usize);
         ctx.param_vregs = nil;
@@ -326,6 +410,11 @@ pub fun ctx_dnit(ctx: *LowerCtx) {
 }
 
 pub fun push_pending_dbg(ctx: *LowerCtx, iid: u32, vreg: u32) err[fail.Fail] {
+    ret push_pending_dbg_piece(ctx, iid, vreg, 0, 0, 0, 0);
+}
+
+# a pending binding of one piece of a value held in several registers (#3589)
+pub fun push_pending_dbg_piece(ctx: *LowerCtx, iid: u32, vreg: u32, lane: u8, lanes: u8, lane_bytes: u8, last_bytes: u8) err[fail.Fail] {
     if (ctx.pending_count >= ctx.pending_cap) {
         var new_cap: u32 = ctx.pending_cap * 2;
         if (new_cap < 4) { new_cap = 4; }
@@ -341,16 +430,21 @@ pub fun push_pending_dbg(ctx: *LowerCtx, iid: u32, vreg: u32) err[fail.Fail] {
         }
         ctx.pending_cap = new_cap;
     }
-    ctx.pending[ctx.pending_count].iid  = iid;
-    ctx.pending[ctx.pending_count].vreg = vreg;
-    ctx.pending_count                   = ctx.pending_count + 1;
+    ctx.pending[ctx.pending_count].iid        = iid;
+    ctx.pending[ctx.pending_count].vreg       = vreg;
+    ctx.pending[ctx.pending_count].lane       = lane;
+    ctx.pending[ctx.pending_count].lanes      = lanes;
+    ctx.pending[ctx.pending_count].lane_bytes = lane_bytes;
+    ctx.pending[ctx.pending_count].last_bytes = last_bytes;
+    ctx.pending_count                         = ctx.pending_count + 1;
     ret err[fail.Fail].ok{};
 }
 
 pub fun drain_pending_dbg(ctx: *LowerCtx, mi: *mir.MirInstr) err[fail.Fail] {
     var i: u32 = 0;
     for (i < ctx.pending_count) {
-        val ra: err[fail.Fail] = mir.instr_attach_dbg(ctx.alloc, mi, ctx.pending[i].iid, ctx.pending[i].vreg);
+        val pb: *mir.MirDbgBinding = ?ctx.pending[i];
+        val ra: err[fail.Fail]     = mir.instr_attach_dbg_piece(ctx.alloc, mi, pb.iid, pb.vreg, pb.lane, pb.lanes, pb.lane_bytes, pb.last_bytes, false);
         if (sel ra.err) { ret ra; }
         i = i + 1;
     }
@@ -447,8 +541,53 @@ pub fun compute_vec_lane(ctx: *LowerCtx, inst: *instruction.Instruction) u32 {
     ret vec_lane_for_type(ctx, inst.ty);
 }
 
+# a parameter's vreg holds its value, rather than the address of it: an
+# aggregate, and a vector the middle end places in memory (its ir parameter a
+# pointer where the signature declares the vector), arrive as the address of
+# their storage, which is public whatever the value's secrecy (#3589)
+fun param_holds_value(ctx: *LowerCtx, i: u32) bool {
+    val ty: ir_type.IrTypeId = ctx.fn.params[i].ty;
+    if (value_is_aggregate(ctx, ty)) { ret false; }
+    ret !vector_image(ctx, sig_param_type(ctx, ctx.fn.sig, i), ty);
+}
+
+# a secret load or call's vreg holds its value, rather than the address of
+# it: an aggregate, and a vector result the middle end places in memory (the
+# call's ir type a pointer where its signature returns the vector), arrive as
+# the address of their storage, which is public (#4133)
+fun instr_holds_value(ctx: *LowerCtx, inst: *instruction.Instruction) bool {
+    if (value_is_aggregate(ctx, inst.ty)) { ret false; }
+    if (inst.kind != instruction.OP_CALL) { ret true; }
+    ret !vector_image(ctx, sig_return_type(ctx, inst.aux_ty), inst.ty);
+}
+
+# a value the signature declares a vector and the ir carries as the address of
+# its memory image, as scalarize places a vector no register holds
+pub fun vector_image(ctx: *LowerCtx, declared: ir_type.IrTypeId, ty: ir_type.IrTypeId) bool {
+    ret value_is_vector(ctx, declared) && !value_is_vector(ctx, ty);
+}
+
+pub fun param_is_vector_image(ctx: *LowerCtx, i: u32) bool {
+    ret vector_image(ctx, sig_param_type(ctx, ctx.fn.sig, i), ctx.fn.params[i].ty);
+}
+
+# parameter `i` of a signature, IRT_NIL past its parameters or for a type
+# that is not a function's
+pub fun sig_param_type(ctx: *LowerCtx, sig: ir_type.IrTypeId, i: u32) ir_type.IrTypeId {
+    val opt_type: opt[*ir_type.IrType] = ir_type.get(ctx.types, sig);
+    if (sel opt_type.none) { ret ir_type.IRT_NIL; }
+    val t: *ir_type.IrType = opt_type.some;
+    if (t.kind != ir_type.IRT_FN || i >= t.data.fn.param_count) { ret ir_type.IRT_NIL; }
+    ret t.data.fn.params[i];
+}
+
 pub fun fn_return_type(ctx: *LowerCtx) ir_type.IrTypeId {
-    val opt_type: opt[*ir_type.IrType] = ir_type.get(ctx.types, ctx.fn.sig);
+    ret sig_return_type(ctx, ctx.fn.sig);
+}
+
+# the return type of a signature, IRT_NIL for a type that is not a function's
+pub fun sig_return_type(ctx: *LowerCtx, sig: ir_type.IrTypeId) ir_type.IrTypeId {
+    val opt_type: opt[*ir_type.IrType] = ir_type.get(ctx.types, sig);
     if (sel opt_type.none) { ret ir_type.IRT_NIL; }
     val t: *ir_type.IrType = opt_type.some;
     if (t.kind != ir_type.IRT_FN) { ret ir_type.IRT_NIL; }
@@ -605,13 +744,19 @@ pub fun mem_operand_of_plain(ctx: *LowerCtx, v: value.Value) res[mir.MirOperand,
     ret res[mir.MirOperand, fail.Fail].ok{op};
 }
 
+# an address names storage and is public whatever the bytes there hold, so an
+# instruction that forms one never declares a secret write (#4133)
+fun forms_address(op: mir.MirOpcode) bool {
+    ret op == mir.MIR_GEP || op == mir.MIR_ALLOCA;
+}
+
 pub fun push_instr(ctx: *LowerCtx, mb: *mir.MirBlock, mi: mir.MirInstr) err[fail.Fail] {
     var ni: mir.MirInstr = mi;
     if (ni.opcode != mir.MIR_ASM) { ni.asm_block = nil; }
     ni.loc               = ctx.cur_loc;
     ni.inline_site       = ctx.cur_inline_site;
     ni.vec_lane          = ctx.cur_vec_lane;
-    ni.writes_secret     = ctx.cur_writes_secret;
+    ni.writes_secret     = ctx.cur_writes_secret && !forms_address(ni.opcode);
     ni.memory_flags      = ctx.cur_memory_flags;
     ni.dbg_bindings      = nil;
     ni.dbg_binding_count = 0;

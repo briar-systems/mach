@@ -210,12 +210,6 @@ what: how `m` was selected, as its manifest line spells it
 m: the manifest to check
 ret: err naming the first dependency selected by a branch, a commit or a path
 
-## fun parse_toml_file
-
-```mach
-pub fun parse_toml_file(alloc: *A.Allocator, path: str) res[toml.Table, outcome.Fail];
-```
-
 ## fun cell_tmpl_vars
 
 ```mach
@@ -332,7 +326,7 @@ revision the checkout lacks is fetched, which `offline` refuses; the caller free
 ## fun manifest_at
 
 ```mach
-pub fun manifest_at(alloc: *A.Allocator, dir: str, rev: str) res[toml.Table, outcome.Fail];
+pub fun manifest_at(alloc: *A.Allocator, dir: str, rev: str) res[manifest.Doc, outcome.Fail];
 ```
 
 the manifest the commit `rev` of the repository at `dir` holds, allocated from `alloc`
@@ -367,11 +361,12 @@ whether the checkout at dep_full holds any tag, which a shallow clone may not
 
 ```mach
 pub fun fetch_selection_tags(s: *session.Session, root: str, id: str, dep_full: str, ref: str,
-ranged: bool) res[bool, outcome.Fail];
+ranged: bool, offline: bool) res[bool, outcome.Fail];
 ```
 
 fetch the tags of dep/<id>'s checkout when it lacks the one its selection reads: the tag a
-`tag/` ref names, or a release tag naming the pin of a version range; whether it fetched
+`tag/` ref names, or a release tag naming the pin of a version range; whether it fetched.
+`offline` fetches nothing
 
 ## fun pinned_at_release
 
@@ -505,10 +500,13 @@ refuse a slot whose realization would replace or record work mach did not make
 
 ```mach
 pub fun realize_git_slot(s: *session.Session, root: str, id: str, url: str, ref: str, mode: u8,
-slot: *GitSlot) res[u8, outcome.Fail];
+slot: *GitSlot, offline: bool) res[u8, outcome.Fail];
 ```
 
-bring a slot `refuse_git_slot` accepted to the realization a build verifies
+bring a slot `refuse_git_slot` accepted to the realization a build verifies. a pin its
+checkout does not hold is fetched, or refused when `offline`. offline, an uninitialized gitlink
+is initialized only from a module store that holds its pin, a subproject's dependency is never
+cloned, and a dependency with no gitlink is added only over a checkout or store holding its selector
 
 ## fun remove_dependency_index
 
@@ -538,8 +536,11 @@ a dependency slot is a directory under dep/ named by a valid project id
 ## fun fetch_and_checkout
 
 ```mach
-pub fun fetch_and_checkout(s: *session.Session, dep_full: str, ref: str) err[outcome.Fail];
+pub fun fetch_and_checkout(s: *session.Session, id: str, dep_full: str, ref: str, offline: bool) err[outcome.Fail];
 ```
+
+check dep/<id>'s checkout out at the selector `ref` after fetching every ref; `offline` fetches
+nothing, so a selector the checkout does not hold is refused
 
 ## fun gitlink_recorded
 

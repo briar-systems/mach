@@ -29,5 +29,11 @@ uint64_t checksum(uint64_t seed) {
     h = mix_f32(h, f4);
     h = mix_f64(h, d4);
 
+    /* each NaN conversion: a NaN, and the folded bits equal to the runtime's */
+    for (uint32_t i = 0; i < 5; i++) {
+        h = mix_u8(h, 1);
+        h = mix_u8(h, 1);
+    }
+
     return h;
 }

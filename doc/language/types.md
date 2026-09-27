@@ -11,10 +11,28 @@ are stdlib `def`s.
 |---|---|
 | Unsigned int | `u8`, `u16`, `u32`, `u64`, `u128` |
 | Signed int | `i8`, `i16`, `i32`, `i64`, `i128` |
-| Float | `f32`, `f64` |
+| Float | `f16`, `f32`, `f64` |
 | Untyped pointer | `ptr` |
 
-These thirteen names are the complete set of compiler-seeded primitive types.
+These fourteen names are the complete set of compiler-seeded primitive types.
+
+A **type** may not take one of these names. `rec`, `uni`, `tag`, `def` and a
+generic parameter named after a primitive are refused with `name.builtin_type`,
+because every use of the name in type position resolves to the primitive, so the
+declaration would be unreachable. The refusal holds for every primitive the
+compiler ships, so a primitive added later refuses an existing type of its name
+rather than silently changing what the name means:
+
+```mach error is a built-in type
+pub def f16: u16; # error: `f16` is a built-in type
+```
+
+A value, function or field may take the name, since it never stands in type
+position:
+
+```mach
+val f16: i64 = 7; # fine: values are a different position
+```
 
 ### 128-bit integers
 
@@ -84,8 +102,9 @@ be named `f32x4` without colliding with the type:
 val f32x4: i64 = 7; # fine: values are a different position
 ```
 
-A **type** may not. `rec`, `uni`, `tag`, and `def` reject a name spelled as a vector
-form, because a type declared with a vector's name would be silently unreachable:
+A **type** may not. `rec`, `uni`, `tag`, `def` and a generic parameter reject a name
+spelled as a vector form, because a type declared with a vector's name would be
+silently unreachable:
 every use in type position resolves to the vector instead:
 
 ```mach error is spelled as a vector type
@@ -107,21 +126,36 @@ both compile on every target — including one with no vector unit at all.
 
 **Width is a realization question, not a legality one.** How a shape is realized
 does depend on the target, and there are three answers: one packed instruction
-when the shape fits a vector register and the operation has a packed form; a
-value placed in memory and worked one lane at a time when it does not; and
-per-lane scalar code on a target with no vector unit (rv64gc today). All three
+when the shape fits a vector register and the operation has a packed form; one
+packed instruction per register-width piece when the shape is wider than the
+register; and per-lane scalar code where the operation has no packed form for the
+lane shape, or on a target with no vector unit (rv64gc today). All three
 compute identical lanes — the expansion is a fixed unroll, never a reassociation
 — so only performance varies. The `simd` manifest lever (see
 [manifest.md](manifest.md)) reports or refuses the scalar cases if a project
 cannot afford them.
 
-A target that gains wider vector registers therefore gets **better code**, not
-new spellings. Until then a shape wider than the register is the second answer:
-`f32x8` and `i32x8` compile on x86-64, where the vector register is 128 bits, as
-one scalar operation per lane through a stack slot, eight for one `+`; under
-`simd = "scalarize"` each such operation warns at its site and `simd = "require"`
-refuses them. A kernel written for the 128-bit seed uses the register-width shapes (`f32x4`,
-`i32x4`, `i16x8`) and takes the wider ones only where the cost is accepted.
+**A shape wider than the register is split into register-width pieces.** On
+x86-64 and aarch64, whose vector register is 128 bits, an `i32x8` is two `i32x4`
+pieces, each its own register, and one `+` is two packed adds. The last piece
+holds whatever lanes are left, so an `i32x9` is two `i32x4` pieces and a
+one-lane piece. A lane-wise operation (arithmetic, bitwise, compare, select,
+shift, a conversion that keeps its lanes in place) runs on each piece. One that
+moves lanes between pieces has its own lowering over the pieces: a range
+`v[start, count]` reads the pieces it crosses and joins them, a widening
+conversion or multiply writes each half of a source piece into its own result
+piece (`i16x8 → i32x8` is `pmullw`/`pmulhw` with `punpcklwd`/`punpckhwd` on
+x86-64, and `smull` with `smull2` on aarch64), and a narrowing one joins the
+narrowed lanes of its pieces. A reduction written over the lanes reads each lane
+from its piece. An operation with no packed form for the lane shape (a 64-bit
+lane multiply on x86-64) runs lane by lane on each piece, and under
+`simd = "scalarize"` it warns at its site while `simd = "require"` refuses it.
+
+The piece width is the target's **declared** vector width, not its name, so a
+target that gains wider vector registers gets **better code**, not new
+spellings: one that declares a 256-bit register holds an `i32x8` whole. SPIR-V,
+whose vectors are values rather than registers, splits nothing. A secret vector
+keeps its secrecy on every piece.
 
 `ptr` is not a lane element: its width is target-defined rather than a scalar bit
 count, so `ptrx2` is not a vector spelling.
@@ -143,10 +177,10 @@ at any width.
 `$align_of` has **two rungs, each for its own reason**. A vector *narrower* than
 the vector register is a packed aggregate that loads piecewise, so it aligns to a
 single lane. One that *fills* the register aligns to its whole size, because the
-machine's vector load requires it. One *wider* than the register is placed as
-several register-width pieces, so it aligns to the register width — 16 for
-`f32x8`, not 32, because there is no 32-byte vector load on a 16-byte register
-for a larger alignment to serve.
+machine's vector load requires it. One *wider* than the register is split into
+register-width pieces, each loaded and stored on its own, so it aligns to the
+register width — 16 for `f32x8`, not 32, because each piece is one 16-byte load
+and a larger alignment would serve none of them.
 
 The first rung is what makes `[N]f32x3` a usable packed vertex buffer: padding
 `f32x3` to 16 bytes would make it indistinguishable from `f32x4` in memory.

@@ -3,7 +3,7 @@
 ## fun parse
 
 ```mach
-pub fun parse(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, as_root: bool) res[Manifest, outcome.Fail];
+pub fun parse(alloc: *A.Allocator, itn: *intern.Interner, doc: *Doc, as_root: bool) res[Manifest, outcome.Fail];
 ```
 
 build a `Manifest` from a parsed TOML document. accepted root tables are
@@ -14,7 +14,7 @@ freed before returning
 
 alloc: owns the manifest's arrays
 itn: receives every string of the manifest
-t: the TOML document
+doc: the manifest's text and its TOML document
 as_root: true for the project being built, false for a dependency's manifest.
          the root form requires at least one `[profile.*]` table, `[artifact].link`
          and `need`, `[link].os`, `isa`, `abi` and `export`, `[step].need`, requires
@@ -30,5 +30,44 @@ ret: the manifest, or the first error as a "mach.toml: ..." message. the
          must satisfy `is_valid_id`; `[target.native]` and `[dep.<x>].version` are
          reserved; a `[step]` with `cmd` or `shell` is rejected by name; `need`
          entries are checked by `validate_needs`. `[profile.*]` absent or empty is
-         an error at the root and synthesizes `debug` and `release` in a dependency
+         an error at the root and synthesizes `debug` and `release` in a dependency.
+         a failure that names a key points at it in `doc`, and the manifest records
+         where each field a later refusal names is written, resolved in `doc`
+
+## rec Doc
+
+```mach
+pub rec Doc;
+```
+
+a manifest's text, the file it was read from, and its TOML tree, all owned
+through the allocator that made it and released with `doc_dnit`. a failure
+that names a key points into `text` at `path`
+
+## fun doc_parse
+
+```mach
+pub fun doc_parse(alloc: *A.Allocator, path: str, text: str) res[Doc, outcome.Fail];
+```
+
+`text`, the manifest at `path`, as a doc: bytes a manifest refuses and a
+document that is not TOML are failures pointing at the byte refused. the doc
+keeps its own copies of both
+
+## fun doc_read
+
+```mach
+pub fun doc_read(alloc: *A.Allocator, path: str) res[Doc, outcome.Fail];
+```
+
+the manifest file at `path` read and parsed as `doc_parse` parses it; a file
+that cannot be read is the environment's
+
+## fun doc_dnit
+
+```mach
+pub fun doc_dnit(alloc: *A.Allocator, d: *Doc);
+```
+
+release a doc and everything it owns
 

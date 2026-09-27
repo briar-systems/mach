@@ -133,6 +133,11 @@ The `riscv64zkt-linux` column is riscv64-linux with the Zkt extension selected,
 the one corpus target that admits a secret multiply. It serves the `ct` group
 only, which `cases/ONLY.riscv64zkt-linux` states.
 
+The `x86_64v3-linux` column is x86_64-linux with the `x86-64-v3` level selected,
+where the vector cells its extensions add rows for pack (the avx2 per-lane
+shifts among them). It serves the `vec` group only, which
+`cases/ONLY.x86_64v3-linux` states, and runs natively on a host with AVX2.
+
 ## Doc blocks
 
 `--docs` reads every `.md` page of `doc/language` (or of `DOCS`, when set) and
@@ -183,7 +188,7 @@ here.
   skip: x86_64-windows               # a leg subtracted, the reason in a comment
   target: x86_64-windows             # the mach target to build (default: the leg)
   profiles: debug release            # (default: both)
-  run: pe-imports                    # exec (default), built, build-fails, or a reader in link/check/
+  run: pe-imports                    # exec (default), built, build-fails, build-warns, or a reader in link/check/
   build-flags: --pie
   gbuild: yes                        # also build the -g twin, handed to the check
   self-host: linux-riscv64           # cross-build the compiler for the leg and let it compile the case
@@ -195,7 +200,8 @@ here.
   readers; its stdout is the observable. A case with no `check.sh` uses the
   reader `run:` names under `link/check/`, or the built-in modes: `exec` runs
   the program and records its stdout, `built` records that an artifact was
-  emitted, `build-fails` records the compiler's `error:` lines.
+  emitted, `build-fails` records the compiler's `error:` lines, and
+  `build-warns` the `warning:` lines of a build that succeeds.
 - `goal: test` makes the compile step `mach test` with the same target, profile
   and flags, so the tests in the artifact's closure (the modules a build of it
   loads) are collected and run as part of that step, through the leg's engine

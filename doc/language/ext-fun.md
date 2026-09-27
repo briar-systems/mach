@@ -277,6 +277,45 @@ caller reverses it. That is the same price a 16-byte vector pays on Win64.
 
 [115052]: https://github.com/llvm/llvm-project/pull/115052
 
+## `f16` and `_Float16`
+
+`f16` is C's `_Float16` at every boundary, and a record or array holding `f16`
+is the C record or array holding `_Float16`. Every convention mach has passes it
+as the float it is, two bytes wide, the way GCC and clang do:
+
+| Convention | Argument | Return | As a record member |
+|---|---|---|---|
+| System V x86-64 | SSE class: the low 16 bits of the next xmm register, the stack past xmm7 | `xmm0` | a float in its eightbyte, so an eightbyte holding only floats is SSE |
+| Win64 | the xmm register of its positional slot, the stack past the fourth slot | `xmm0` | no change: a record of 1, 2, 4 or 8 bytes rides its integer slot |
+| AAPCS64 | the next `h` register, the stack past `v7` | `h0` | a two-byte member of a homogeneous float aggregate, so up to four `f16` ride `h` registers |
+| RISC-V `lp64d`, `lp64f`, `ilp32d`, `ilp32f` | the next `f` register, NaN-boxed to its width, and by the integer rule once they run out | `fa0` | a float leaf of the two-leaf rule |
+| RISC-V `lp64`, `ilp32` | the integer rule, as a `u16` | `a0` | an integer leaf |
+
+The float registers above the 16 bits belong to nobody on System V, Win64 and
+AAPCS64: mach writes zeros there and reads only the low 16 bits. The RISC-V
+psABI boxes a float narrower than its register, so mach sets those bits to ones,
+as clang does. The rule depends on the ABI, not on Zfh: without Zfh the value
+still rides an `f` register.
+
+The Win64 row is clang's. Mach's windows target is the Microsoft x64
+convention, and MSVC has no half type, so clang is the only compiler for that
+convention that has one. clang places `_Float16` the same way under
+`x86_64-pc-windows-msvc` and `x86_64-w64-windows-gnu`. mingw-w64 GCC does not.
+It places a scalar `_Float16` as it would a 2-byte integer: in the integer
+register of its positional slot, and returned in `AX`. GCC's
+`function_arg_ms_64` sends only `float` and `double` to an xmm register. So a
+scalar `f16` crossing to or from code GCC built for Windows disagrees with mach.
+On that side, declare the parameter or result as a `float` whose low 16 bits
+are the `f16`, which GCC places where clang places the `_Float16`. `f16` record
+members are unaffected, since a record of 1, 2, 4 or 8 bytes rides its integer
+slot under both compilers.
+
+SPIR-V has no C boundary: a SPIR-V function takes and returns an `f16` as a
+value like any other.
+
+An `f16` in a C-variadic tail is refused like any float narrower than `f64`
+(see [Arguments in the variadic tail](#arguments-in-the-variadic-tail)).
+
 ## Symbol name
 
 The declaration names a C declaration, so its linker symbol is whatever the
@@ -392,11 +431,52 @@ convention, which is the only one mach has, so a call is bit-compatible with a C
   register, which is what the convention says and what a boundary-free call would do
   anyway.
 
-A vector **wider** than the target's vector register (`f32x8` on any target today)
-has no C convention to follow: it is an AVX/SVE type the baseline does not have, so
-no psABI classifies it. Mach gives it the memory class on every convention — a
-hidden pointer to its storage for an argument, the indirect-result pointer for a
-return — which is the placement it already has internally.
+A vector **wider** than the target's vector register (`i32x8`, `f32x16`, …)
+follows the C rule for a vector of that size on each convention, so a call is
+bit-compatible with a C `int __attribute__((vector_size(32)))` parameter:
+
+- **System V x86-64** (`linux` / `darwin`): the psABI makes a vector wider than
+  the vector registers the target declares **MEMORY** class. As an argument its
+  bytes are placed on the stack at its C alignment, its size (32 for `i32x8`, 64
+  for `i32x16`), and it takes no register. As a result it is returned through the
+  hidden result pointer, as gcc does. clang (Apple clang included) returns such a
+  vector in `xmm0` and `xmm1` instead, against the psABI, so a C function built by
+  clang that returns one disagrees with mach; declare the C side's result as a
+  record of the same size, which clang returns as MEMORY. Apple clang also places
+  such a vector *argument* on the stack at 16 bytes rather than at its C
+  alignment, so it disagrees with mach wherever the vector's stack offset is not
+  already a multiple of its size; on darwin declare the C side's argument as a
+  record of the same size with `__attribute__((aligned(32)))` (or the vector's
+  size), which Apple clang places as the psABI places the vector. Mach follows the
+  psABI on darwin as on linux.
+- **System V x86-64 with `avx`** (`x86-64-v3` and up): the vector register is
+  `ymm`, so a 32-byte vector (`i32x8`, `f32x8`, `f64x4`) is SSE class and rides one
+  `ymm` register, as an argument and as a result, which is what gcc and clang do at
+  `-mavx`. Once the vector registers are used up it goes on the stack at its C
+  alignment. A 64-byte vector is still wider than the register and MEMORY class, as
+  above. Mach computes on 128-bit halves (256-bit instructions are #4128), so the
+  vector moves between `ymm` and its memory image with `vmovdqu`, and the function
+  runs `vzeroupper` once the value has left the register (after storing incoming
+  `ymm` arguments, and after storing a returned `ymm` value), so the 128-bit
+  instructions that follow do not pay for a dirty upper half. A call that places an
+  argument above the 16-byte stack alignment realigns the caller's stack pointer to
+  that argument's alignment, as the psABI requires of the argument area.
+- **x86_64-windows (Microsoft x64):** the carrier table under [Windows vector
+  carriers](#windows-vector-carriers): a pointer to a caller copy, and
+  caller-provided result storage.
+- **AAPCS64 and RISC-V lp64d:** C treats the vector as a composite larger than two
+  registers: a pointer to a caller copy for an argument, and the indirect-result
+  register for a return. Mach does the same.
+
+The width that decides "wider" is the vector register the target declares under its
+selected extensions: 16 bytes on every target mach has, and 32 on System V x86-64
+once the target selects `avx`. Microsoft x64 passes a 32-byte vector by reference
+whatever the extensions, so `avx` changes nothing there.
+
+A size no C vector type has has no C rule to follow: C's `vector_size` takes a
+power of two, so `i32x5` (20 bytes) and `f32x6` (24 bytes) have no C counterpart.
+Mach keeps its own placement for such a vector on every convention: a pointer to
+its storage for an argument, and the indirect-result pointer for a return.
 
 Every call edge marshals the same way, because the C convention is the only one mach
 has: a direct call to a declared `ext fun`, an ordinary Mach→Mach call, and a call

@@ -345,6 +345,23 @@ fun main(argc: i64, argv: **u8) i64 {
 }
 ```
 
+### A NaN between float widths
+
+`::` between two float widths (`f16`, `f32`, `f64`) rounds a number once, to nearest
+with ties to even, the same on every target. What it makes of a NaN is the target's,
+because it is what the target's own conversion instruction does:
+
+| target | a NaN converted to another float width |
+|---|---|
+| x86-64, aarch64 | keeps its sign and the top of its payload, with the quiet bit set |
+| riscv32, riscv64 | the canonical NaN, positive and quiet with an empty payload |
+| spirv | the canonical NaN (SPIR-V leaves the payload unspecified, so a device may differ) |
+
+A conversion folded at compile time follows the build target's rule, so a folded
+`::` gives the bits the same `::` gives at run time on that target. An `f16`
+conversion the target has no instruction for follows the same rule. `:~` never
+converts, so it reads and writes a NaN's bits exactly on every target.
+
 Neither `::` nor `:~` may add or drop the `^` secret qualifier, and neither can
 erase a secret-welded pointer to `ptr`. Representation-changing `::` and `:~` casts
 are rejected when either by-value representation contains a tag, including through
@@ -457,7 +474,8 @@ by its own.
 | uniform `<<`, `>>` on 16-, 32- and 64-bit lanes | packed `psll*` / `psrl*` / `psra*` | scalar expansion | scalar expansion |
 | uniform arithmetic `>>` on 64-bit lanes | scalar expansion (`psraq` is AVX-512VL) | scalar expansion | scalar expansion |
 | uniform `<<`, `>>` on 8-bit lanes | packed through the 16-bit shifts, each byte shifted with its neighbour cleared | scalar expansion | scalar expansion |
-| per-lane count, any lane width | scalar expansion (SSE2 has no per-lane shift; `vpsllv*` is AVX2) | scalar expansion | scalar expansion |
+| per-lane count on 32- and 64-bit lanes | packed `vpsllv*` / `vpsrlv*` / `vpsravd` under `avx2`, else scalar expansion (the 64-bit arithmetic `vpsravq` is AVX-512VL) | scalar expansion | scalar expansion |
+| per-lane count on 8- and 16-bit lanes | scalar expansion | scalar expansion | scalar expansion |
 
 The packed instructions saturate a count at or above the lane width on their
 own, so they need none of the scalar shift's range test. SPIR-V leaves an

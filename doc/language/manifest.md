@@ -35,6 +35,17 @@ The sole exception is **shape-dependence**: a field whose presence follows anoth
 value in the same table. A dependency is `git` *or* `path`; a `[link.X]` names a
 `name` *or* a `path` according to its `source`. Nothing else defaults.
 
+A manifest refusal points at what it refuses, on the line after the message:
+the value it rejects, the key token of a name or key it rejects, or the table a
+required key is missing from, in the manifest that states it, a dependency's
+own included. [`--diagnostics=json`](diagnostics-json.md#failure-records)
+carries the same place as the failure's `primary` span.
+
+```
+error[manifest.invalid_value]: mach.toml: profile 'debug': opt must be 0, 1, or 2 (got 7)
+ --> mach.toml:15:7
+```
+
 Unknown sections and unknown keys are always errors. A path value is always
 `/`-separated; a literal `\` is rejected (`manifest paths use '/'`), so the same
 manifest is portable and is normalized to the host separator at the filesystem
@@ -155,18 +166,20 @@ name a path inside `obj/<project.id>/`, `.cache/` or `.stage/` (see
 reads the dependency closure (build, test, check, `mach dep verify`, the
 language server) checks it for the root and for every realized dependency. A
 compiler outside any of those ranges is refused once, with every unmet
-requirement and the chain that states it:
+requirement and the chain that states it, pointing at the first unmet range in
+the manifest that states it:
 
 ```
 error[mach.version_unaccepted]: this is mach 5.2.1, and the dependency closure does not accept it:
     app (mach.toml) requires mach ^5.3
     app -> gfx -> glfw requires mach >=5.4, <6
+ --> mach.toml:2:11
 ```
 
 A root manifest must state `mach`. One without it is refused with the line to
 add (`mach.toml: [project] states no compiler range; add mach = "^5.3", the
 oldest release that reads the key, and raise it when the project uses a later
-feature`). A dependency without it states no constraint. `mach init` writes the same range. It is the oldest
+feature`), pointing at its `[project]` header. A dependency without it states no constraint. `mach init` writes the same range. It is the oldest
 release of the running compiler's major that reads the key: `^5.3` for every
 5.x compiler, since 5.3.0 is the first release that accepts `mach`, and `^N.0`
 for a later major N, since a caret cannot span majors. The range depends only on
@@ -262,7 +275,7 @@ comptime member, `$mach.build.extensions.<name>` (see [`$mach`](comptime-mach.md
 |-------|----------|------------|
 | `x86_64` | SSE2 | `ssse3`, `sse41`, `sse42`, `sha`, `fsgsbase`, `popcnt`, `lzcnt`, `bmi1`, `bmi2`, `cx16`, `avx`, `avx2`, `fma`, `movbe`, `f16c`, `avx512f`, `avx512bw`, `avx512cd`, `avx512dq`, `avx512vl`, `aes`, `pclmul` |
 | `aarch64` | AdvSIMD | `sha2`, `sb`, `aes`, `pmull` |
-| `riscv64`, `riscv32` | the isa string's selection | `i`, `m`, `a`, `f`, `d`, `c`, `zicsr`, `zifencei`, `zkt` |
+| `riscv64`, `riscv32` | the isa string's selection | `i`, `m`, `a`, `f`, `d`, `c`, `zicond`, `zicsr`, `zifencei`, `zkt` |
 | `spirv` | | none |
 
 A name the selected isa does not hold is refused when the target resolves, with the
@@ -286,7 +299,7 @@ selection is closed over that once, when the target resolves. `sse41` brings `ss
 `f` and `f` brings `zicsr`, as the isa string's own grammar has it, so `extensions = ["d"]` on `rv64i` selects
 `rv64ifd` with Zicsr. The isa string and the list feed one set: `isa = "rv64i"` with
 `extensions = ["m"]` selects the same machine as `isa = "rv64im"`. A name nothing in
-the compiler encodes against yet (`avx2`, `avx512f`) is still a declared requirement:
+the compiler encodes against yet (`avx`, `avx512f`) is still a declared requirement:
 the inline assembler has no rows to admit under it, so today it records only the
 promise the binary makes about its hosts, and the promise is the program's to check.
 
@@ -336,8 +349,8 @@ selection mach never emits, and `f` and `d` select the float register file and t
 calling convention's float registers, and `zkt` is a promise about the machine's
 execution timing that the constant-time rows read, so none of them may be named in
 [`#[extensions(...)]`](decorators.md#extensionsnames--an-outlier-function); the
-refusal says why. Every x86_64 and aarch64 row, and riscv `m`, `a`, `zicsr` and
-`zifencei`, may be.
+refusal says why. Every x86_64 and aarch64 row, and riscv `m`, `a`, `zicond`,
+`zicsr` and `zifencei`, may be.
 
 Selecting an extension is a promise about **every** machine the binary runs on. The
 inline assembler admits the extension's mnemonics anywhere in the build, and a host
@@ -453,13 +466,16 @@ emits a finished GPU module rather than machine code (see
 `riscv64` and `riscv32` are width-only spellings, and each names a **default
 profile**: `riscv64` is `rv64gc` and `riscv32` is `rv32imac`. A canonical
 extension string such as `rv32imc` or `rv64imafd` selects a smaller machine.
-The retained vocabulary is I, M, A, F, D, C, Zicsr, Zifencei and Zkt, written in
-lowercase canonical order with multi-letter names after an underscore; `g`
-expands to IMAFD plus Zicsr and Zifencei. F carries its required Zicsr, and D
-requires F. Zkt changes no instruction. It states that the listed operations run
-in data-independent time, which is what lets a secret multiply compile (see
-`secrecy.md`). An optional version must be the one mach models: I 2.1, M 2.0,
-A 2.1, F and D 2.2, C 2.0, Zicsr and Zifencei 2.0, Zkt 1.0. Unknown extensions,
+The retained vocabulary is I, M, A, F, D, C, Zicond, Zicsr, Zifencei and Zkt,
+written in lowercase canonical order with multi-letter names after an
+underscore, so `rv64gc_zicond`; `g` expands to IMAFD plus Zicsr and Zifencei.
+F carries its required Zicsr, and D requires F. Zicond adds `czero.eqz` and
+`czero.nez`, which a branch-free select compiles to where a selection holds it
+and the xor-and-mask sequence it replaces does otherwise. Zkt changes no
+instruction. It states that the listed operations run in data-independent time,
+which is what lets a secret multiply compile (see `secrecy.md`). An optional
+version must be the one mach models: I 2.1, M 2.0, A 2.1, F and D 2.2, C 2.0,
+Zicond 1.0, Zicsr and Zifencei 2.0, Zkt 1.0. Unknown extensions,
 other versions, duplicates, noncanonical order and the E base are refused
 rather than rounded up to the default machine.
 
@@ -1434,7 +1450,13 @@ dependency's repository: one `git ls-remote --tags` per URL, and the manifest
 at a release through a shallow fetch of its tag. With `--offline` they use only
 the tags already present in the realized checkouts, and they say so
 (`resolving from releases already fetched (--offline)`). A resolution that
-needs a candidate it doesn't have fails, naming the identity.
+needs a candidate it doesn't have fails, naming the identity. Realizing a
+checkout fetches nothing either. A missing checkout is initialized from the
+submodule store Git kept for it, and a pin that no local checkout or store
+holds fails, naming the dependency and the commit. A dependency added over a
+retained checkout or store is checked out at its selector as held there, and
+one with neither is not cloned. A selector nothing local holds fails, naming
+the dependency and the selector.
 
 **`--lowest`.** `mach dep update <path> --all --lowest` picks the lowest
 release every range accepts. A library's CI runs it in a scratch checkout and

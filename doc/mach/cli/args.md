@@ -199,6 +199,24 @@ the object cache by default: a module whose object there carries the build's
 key is reused instead of lowered and generated. `--no-cache` forces an
 uncached build
 
+## val DIAG_N
+
+```mach
+pub val DIAG_N: usize = 1
+```
+
+row count of DIAG
+
+## val DIAG
+
+```mach
+pub val DIAG: [DIAG_N]FlagSpec = [DIAG_N]FlagSpec;
+```
+
+the `--diagnostics=<human|json>` option, consumed by build, check and test: how
+the diagnostics reach stderr. the value is attached, so a bare
+`--diagnostics` carries none and is refused by diagnostics_format
+
 ## val RUN_OWN_N
 
 ```mach
@@ -610,7 +628,7 @@ accepted: per-row acceptance parallel to table, or nil to accept every row; an u
 ## val BUILD_SCHEMA_N
 
 ```mach
-pub val BUILD_SCHEMA_N: usize = 8
+pub val BUILD_SCHEMA_N: usize = 9
 ```
 
 length of BUILD_SCHEMA
@@ -621,7 +639,7 @@ length of BUILD_SCHEMA
 pub val BUILD_SCHEMA: [BUILD_SCHEMA_N]TableRef = [BUILD_SCHEMA_N]TableRef;
 ```
 
-the option tables mach build accepts: SEL, RDO, CGEN, OPT, EMIT, JOBS, LINKIN, BUILD_OWN, all fully visible
+the option tables mach build accepts: SEL, RDO, CGEN, OPT, EMIT, JOBS, LINKIN, BUILD_OWN, DIAG, all fully visible
 
 ## val CHECK_SEL_ACCEPTED
 
@@ -634,7 +652,7 @@ SEL rows check accepts: every row but `-o`, since nothing is written
 ## val CHECK_SCHEMA_N
 
 ```mach
-pub val CHECK_SCHEMA_N: usize = 2
+pub val CHECK_SCHEMA_N: usize = 3
 ```
 
 length of CHECK_SCHEMA
@@ -645,7 +663,7 @@ length of CHECK_SCHEMA
 pub val CHECK_SCHEMA: [CHECK_SCHEMA_N]TableRef = [CHECK_SCHEMA_N]TableRef;
 ```
 
-the option tables mach check accepts: SEL masked by CHECK_SEL_ACCEPTED, and RDO
+the option tables mach check accepts: SEL masked by CHECK_SEL_ACCEPTED, RDO and DIAG
 
 ## val FMT_OWN_N
 
@@ -706,7 +724,7 @@ the option tables mach run accepts: SEL masked by RUN_SEL_ACCEPTED, and RUN_OWN
 ## val TEST_SCHEMA_N
 
 ```mach
-pub val TEST_SCHEMA_N: usize = 6
+pub val TEST_SCHEMA_N: usize = 7
 ```
 
 length of TEST_SCHEMA
@@ -717,7 +735,7 @@ length of TEST_SCHEMA
 pub val TEST_SCHEMA: [TEST_SCHEMA_N]TableRef = [TEST_SCHEMA_N]TableRef;
 ```
 
-the option tables mach test accepts: SEL, RDO, CGEN, OPT, LINKIN, TEST_OWN, all fully visible
+the option tables mach test accepts: SEL, RDO, CGEN, OPT, LINKIN, TEST_OWN, DIAG, all fully visible
 
 ## val DOC_SEL_ACCEPTED
 
@@ -1032,7 +1050,7 @@ Indexed by search, not by DepAction
 ## val BUILD_CONSTRAINT_N
 
 ```mach
-pub val BUILD_CONSTRAINT_N: usize = 4
+pub val BUILD_CONSTRAINT_N: usize = 5
 ```
 
 length of BUILD_CONSTRAINT
@@ -1045,12 +1063,13 @@ pub val BUILD_CONSTRAINT: [BUILD_CONSTRAINT_N]str = [BUILD_CONSTRAINT_N]str;
 
 the constraint sentences help prints for build; the first is enforced by
 build_cli_invocation, the second by selection_from_config, the third by the
-build command, the fourth by the build plan's output path
+build command, the fourth by the build plan's output path, the fifth by
+readout_allowed
 
 ## val TEST_CONSTRAINT_N
 
 ```mach
-pub val TEST_CONSTRAINT_N: usize = 2
+pub val TEST_CONSTRAINT_N: usize = 3
 ```
 
 length of TEST_CONSTRAINT
@@ -1062,7 +1081,7 @@ pub val TEST_CONSTRAINT: [TEST_CONSTRAINT_N]str = [TEST_CONSTRAINT_N]str;
 ```
 
 the constraint sentences help prints for test; enforced by
-build_cli_invocation and selection_from_config
+build_cli_invocation, selection_from_config and readout_allowed
 
 ## val INFO_CONSTRAINT_N
 
@@ -1317,6 +1336,33 @@ ret: true when some occurrence carries the flag's key
 pub fun invocation_value(cmd: CommandId, inv: *ParsedInvocation, argv: **u8, flag: str) opt[*u8];
 ```
 
+## fun diagnostics_format
+
+```mach
+pub fun diagnostics_format(cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[cli_diag.Format, outcome.Fail];
+```
+
+the diagnostics format `--diagnostics=<human|json>` selects for a command
+that takes the DIAG table; human when the option is absent
+
+cmd: the command
+inv: the parsed invocation
+argv: the argument vector inv was parsed from
+ret: the format, or a user failure for a bare `--diagnostics` or any other value
+
+## fun readout_allowed
+
+```mach
+pub fun readout_allowed(c: *request.CliArgs, format: cli_diag.Format) err[outcome.Fail];
+```
+
+`-v` and `-vv` render the phase readout to stderr as text, which a json run
+keeps to records
+
+c: the command's arguments
+format: the diagnostics format
+ret: ok, or a user failure when a readout is asked for under json
+
 ## fun build_cli_invocation
 
 ```mach
@@ -1408,14 +1454,28 @@ the removal message for an option that used to exist, so every command refuses i
 tok: the flag-shaped token
 ret: the message when `tok` names a removed option
 
+## fun unknown_flag
+
+```mach
+pub fun unknown_flag(a: *A.Allocator, inv: *ParsedInvocation, argv: **u8, cmd: str) opt[outcome.Fail];
+```
+
+the refusal of the first unrecognized flag-shaped token: `cli.flag_unknown`, or
+`cli.flag_removed` with the removal message when the token names a removed option
+
+a: owns the message
+inv: the parsed invocation
+argv: the argument vector inv was parsed from
+cmd: the command name the message names
+ret: the refusal, or none when every token was recognized
+
 ## fun reject_unknown_from_invocation
 
 ```mach
 pub fun reject_unknown_from_invocation(inv: *ParsedInvocation, argv: **u8, cmd: str) bool;
 ```
 
-print `error[cli.flag_unknown]: unknown flag` for the first unrecognized flag-shaped token, or the
-removal message when the token names a removed option
+print the refusal `unknown_flag` names for the first unrecognized flag-shaped token
 
 inv: the parsed invocation
 argv: the argument vector inv was parsed from

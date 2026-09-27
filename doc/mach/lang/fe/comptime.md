@@ -690,6 +690,12 @@ pub fun set_union_build(c: *ComptimeCtx, v: bool);
 pub fun set_target_defs(c: *ComptimeCtx, d: *isa.TargetDefs);
 ```
 
+## fun set_nan_rule
+
+```mach
+pub fun set_nan_rule(c: *ComptimeCtx, rule: float.NanRule);
+```
+
 ## fun set_ct_mul
 
 ```mach
@@ -721,6 +727,20 @@ target_abi: intern.StrId,
 target_platform: intern.StrId,
 bin_name: intern.StrId);
 ```
+
+## fun set_source_context
+
+```mach
+pub fun set_source_context(c: *ComptimeCtx, module: intern.StrId, file: intern.StrId,
+owner_id: intern.StrId, owner_ver: intern.StrId);
+```
+
+the module a context compiles, what `$mach.source.*` and `$mach.project.*` read
+
+module: the module's fully qualified name
+file: its file, relative to the root of the project that owns it
+owner_id: the owning project's `[project].id`
+owner_ver: the owning project's `[project].version`
 
 ## fun dnit
 
@@ -918,9 +938,12 @@ pub fun eval_lit_str(source: str, span: token.Span, interner: *intern.Interner) 
 ## fun cast_scalar
 
 ```mach
-pub fun cast_scalar(types: *type.TypeInterner, pointer_width: u32, value: CTValue,
+pub fun cast_scalar(types: *type.TypeInterner, pointer_width: u32, nan_rule: float.NanRule, value: CTValue,
 from_ty: type.TypeId, to_ty: type.TypeId, reinterpret: bool) res[CTValue, EvalFail];
 ```
+
+a float converted to another float width folds by `nan_rule`, the target's, so the
+folded conversion is the one the target makes at run time
 
 ## fun intrinsic_takes_type_operand
 

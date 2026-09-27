@@ -30,6 +30,14 @@ pub rec Session;
 pub fun init(alloc: *A.Allocator) res[Session, fail.Fail];
 ```
 
+## fun drop_query_failure
+
+```mach
+pub fun drop_query_failure(s: *Session);
+```
+
+release the text and the places of the last query failure the session holds
+
 ## fun dnit
 
 ```mach

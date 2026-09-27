@@ -12,6 +12,12 @@ pub def FloatWidth: u8
 pub val FLOAT_W_NONE: FloatWidth = 0
 ```
 
+## val FLOAT_W_16
+
+```mach
+pub val FLOAT_W_16:   FloatWidth = 16
+```
+
 ## val FLOAT_W_32
 
 ```mach
@@ -31,6 +37,14 @@ pub fun width_name(w: FloatWidth) str;
 ```
 
 the float type a width names, as its source spelling
+
+## fun width_of_bits
+
+```mach
+pub fun width_of_bits(bits: u32) FloatWidth;
+```
+
+the width of a float `bits` wide, FLOAT_W_NONE for a width no float type has
 
 ## fun f64_bits
 
@@ -56,11 +70,53 @@ pub fun f64_neg(f: f64) f64;
 pub fun f64_signbit(f: f64) bool;
 ```
 
+## def NanRule
+
+```mach
+pub def NanRule: u8
+```
+
+what a conversion between two float formats makes of a NaN, a fact of the target's
+conversion instructions that comptime folds by (see doc/language/operators.md)
+
+## val NAN_RULE_NONE
+
+```mach
+pub val NAN_RULE_NONE: NanRule = 0
+```
+
+no rule declared: a machine model that leaves it here is refused
+
+## val NAN_PRESERVE
+
+```mach
+pub val NAN_PRESERVE: NanRule = 1
+```
+
+the sign and the top of the payload kept, the quiet bit set: x86-64 and aarch64
+
+## val NAN_CANONICAL
+
+```mach
+pub val NAN_CANONICAL: NanRule = 2
+```
+
+the canonical NaN, positive and quiet with an empty payload: RISC-V
+
+## fun nan_rule_valid
+
+```mach
+pub fun nan_rule_valid(r: NanRule) bool;
+```
+
 ## fun f64_to_f32_bits
 
 ```mach
 pub fun f64_to_f32_bits(d: u64) u32;
 ```
+
+the binary32 encoding of binary64 bits that carry a binary32 value: rounded to
+nearest even, a NaN keeping every bit binary32 has
 
 ## fun f32_bits_to_f64_bits
 
@@ -73,6 +129,36 @@ pub fun f32_bits_to_f64_bits(s: u32) u64;
 ```mach
 pub fun round_at(f: f64, w: FloatWidth) f64;
 ```
+
+`f` rounded once, to nearest with ties to even, to the format of `w`, and carried back
+exactly in an f64. binary64 holds every narrower format exactly with more than twice its
+precision plus two bits, so a `+ - * /` of two values at `w` computed in f64 and rounded
+here is the correctly rounded result at `w`
+
+## fun bits_at
+
+```mach
+pub fun bits_at(v: f64, w: FloatWidth) u64;
+```
+
+the encoding at `w` of `v`, a value already representable at `w`: the bits `:~` reads
+
+## fun value_of_bits
+
+```mach
+pub fun value_of_bits(bits: u64, w: FloatWidth) f64;
+```
+
+the value an encoding at `w` holds, carried exactly in an f64: the value `:~` makes
+
+## fun convert
+
+```mach
+pub fun convert(f: f64, from: FloatWidth, to: FloatWidth, rule: NanRule) f64;
+```
+
+`f`, a value at `from`, converted to `to` as the target's conversion instruction
+does, carried exactly in an f64: rounded once, a NaN made by `rule`
 
 ## fun widths_agree
 
@@ -141,6 +227,35 @@ pub rec Rounded;
 
 a decimal rounded to one format: the value, carried exactly in an f64, and how it fit.
 an overflow carries +inf and an underflow of a nonzero decimal carries +0
+
+## fun narrow_bits
+
+```mach
+pub fun narrow_bits(d: u64, f: Format, rule: NanRule) u64;
+```
+
+binary64 bits `d` rounded to nearest with ties to even into the encoding of `f`, a format
+narrower than binary64: a value past the largest finite overflows to infinity, one below
+the smallest normal rounds into the subnormals, and a NaN is made by `rule`
+
+d: the binary64 encoding to narrow
+f: the format to round into
+rule: what the conversion makes of a NaN
+ret: the encoding in `f`, in the low bits
+
+## fun widen_bits
+
+```mach
+pub fun widen_bits(b: u64, f: Format, rule: NanRule) u64;
+```
+
+an encoding of `f`, a format narrower than binary64, as binary64 bits: exact, a subnormal
+normalised and a NaN made by `rule`
+
+b: the encoding in `f`, in the low bits
+f: the format it is encoded in
+rule: what the conversion makes of a NaN
+ret: the same value as binary64 bits
 
 ## fun round_decimal
 

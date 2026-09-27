@@ -1,0 +1,668 @@
+# if-conversion of small diamonds (#3346)
+#
+# a block ending in a conditional branch whose arms are blocks entered only
+# from it and leaving straight to one join (a diamond), or whose one arm does
+# and whose other edge is the join itself (a triangle), is flattened: the arm
+# instructions move into the block ahead of its branch, each join phi takes
+# one `select` on the branch's condition in place of its arm incomings, and
+# the block branches to the join unconditionally. the emptied arms, which
+# nothing enters any more, are pruned.
+#
+# an arm qualifies when it has no phis and every instruction is a scalar,
+# speculatable computation. a load, store or call is never speculatable, so no
+# read of memory the branch guards moves, such as a tag payload read under its
+# tag test; a declassify stays behind its branch, since running it on the
+# untaken path would disclose there too; a shift by a variable count stays,
+# since the branch may be what proves the count in range; and an aggregate
+# operand or result is refused, since reading one reads its memory. every phi the conversion
+# selects is an integer or pointer scalar the target holds in one register.
+#
+# the conversion trades a branch the predictor may miss for work done on both
+# paths, so it is taken only while the speculated instructions and the selects
+# stay within SPECULATION_BUDGET cost units.
+#
+# a dbg_value in an arm binds its variable to a value the untaken path never
+# computed, so it loses its location there; the join's own bindings, now of
+# the selects, restore the variable after the flattened arms.
+
+use mach.lang.fail;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mach.lang.me.ir;
+use mach.lang.me.ir.effect;
+use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.mutate;
+use mach.lang.me.ir.opdesc;
+use mach.lang.me.ir.reachability;
+use mach.lang.me.ir.refs;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use mach.lang.me.scratch;
+use mach.lang.source;
+use mach.lang.target;
+
+# the cost units a conversion may add to the path that would have run: a
+# mispredicted branch costs well over this many simple instructions, a
+# predicted one about one, so a small budget pays on unpredictable data and
+# costs little on predictable data
+val SPECULATION_BUDGET: u32 = 8;
+
+# a multiply or a float operation outlasts a simple one by a few cycles
+val SIMPLE_COST: u32 = 1;
+val MUL_COST:    u32 = 3;
+val FLOAT_COST:  u32 = 4;
+
+rec FunctionWork {
+    module: *ir.Module;
+    body:   *ir.Function;
+    target: *target.Target;
+}
+
+# an arm: the blocks one outcome of the branch runs, in order, each entered
+# only from the one before it (the first from the branch), until the block the
+# last one branches to, the join. a lowered `or` arm is a chain, not one block
+val ARM_BLOCKS_MAX: u32 = 4;
+
+rec Arm {
+    blocks: [ARM_BLOCKS_MAX]id.BlockId;
+    count:  u32;
+    join:   id.BlockId;
+    cost:   u32;
+}
+
+# the edges into the join that the flattened diamond replaces: the last arm
+# block or the header each outcome of the branch reaches the join from
+rec Shape {
+    join:   id.BlockId;
+    arm_t:  Arm;
+    arm_f:  Arm;
+    from_t: id.BlockId;
+    from_f: id.BlockId;
+    cost:   u32;
+}
+
+# a run that owns its workspace; the pipeline runs `run_in` over one
+#[testing]
+pub fun run(m: *ir.Module, tgt: *target.Target) res[bool, fail.Fail] {
+    var workspace:   scratch.Workspace;
+    val initialized: err[fail.Fail] = scratch.init(?workspace);
+    if (sel initialized.err) { ret res[bool, fail.Fail].err{initialized.err}; }
+    fin { scratch.dnit(?workspace); }
+    ret run_in(m, tgt, ?workspace);
+}
+
+pub fun run_in(m: *ir.Module, tgt: *target.Target, workspace: *scratch.Workspace) res[bool, fail.Fail] {
+    var changed: bool = false;
+    var fi:      u32  = 0;
+    for (fi < m.function_len) {
+        val fn: *ir.Function = ?m.functions[fi];
+        fi = fi + 1;
+        if (fn.block_count == 0 || (fn.flags & ir.FN_FLAG_EXTERN) != 0) { cnt; }
+        var work:      FunctionWork         = FunctionWork{module: m, body: fn, target: tgt};
+        val changed_r: res[bool, fail.Fail] = scratch.run[FunctionWork, bool](workspace, m.alloc, ?work, convert_function);
+        if (sel changed_r.err) { ret changed_r; }
+        if (changed_r.ok)      { changed = true; }
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+# an inner diamond flattened can make the one around it a diamond, so the
+# sweep repeats until nothing converts; each conversion removes a branch, so
+# it ends within the block count
+fun convert_function(work: *FunctionWork, alloc: *A.Allocator) res[bool, fail.Fail] {
+    val m:  *ir.Module     = work.module;
+    val fn: *ir.Function   = work.body;
+    val rp: err[fail.Fail] = ir.preds_rebuild(m, fn);
+    if (sel rp.err) { ret res[bool, fail.Fail].err{rp.err}; }
+
+    var changed: bool = false;
+    var again:   bool = true;
+    for (again) {
+        again = false;
+        var bi: u32 = 0;
+        for (bi < fn.block_count) {
+            val r: res[bool, fail.Fail] = convert_block(m, fn, work.target, bi::id.BlockId);
+            if (sel r.err) { ret r; }
+            if (r.ok) {
+                changed = true;
+                again   = true;
+                # the emptied arms go now, so a join they entered has one
+                # predecessor again for a diamond around this one; pruning
+                # renumbers the blocks, so the sweep starts over
+                val rp: res[bool, fail.Fail] = reachability.prune(m, fn, alloc);
+                if (sel rp.err) { ret rp; }
+                val rb: err[fail.Fail] = ir.preds_rebuild(m, fn);
+                if (sel rb.err) { ret res[bool, fail.Fail].err{rb.err}; }
+                brk;
+            }
+            bi = bi + 1;
+        }
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+fun terminator_of(fn: *ir.Function, bid: id.BlockId) opt[*instruction.Instruction] {
+    val blk: *ir.Block = ?fn.blocks[bid::u32];
+    if (blk.terminator == id.INSTR_NIL) { ret opt[*instruction.Instruction].none{}; }
+    ret ir.instruction_get(fn, blk.terminator);
+}
+
+fun convert_block(m: *ir.Module, fn: *ir.Function, tgt: *target.Target, h: id.BlockId) res[bool, fail.Fail] {
+    val topt: opt[*instruction.Instruction] = terminator_of(fn, h);
+    if (!sel topt.some) { ret res[bool, fail.Fail].ok{false}; }
+    val term: *instruction.Instruction = topt.some;
+    if (term.kind != instruction.OP_CBR || term.operand_count != 3) { ret res[bool, fail.Fail].ok{false}; }
+    val cond: value.Value = term.operands[0];
+    if (!is_int_of_bits(m, cond.ty, 8)) { ret res[bool, fail.Fail].ok{false}; }
+
+    var shape: Shape;
+    if (!find_shape(m, fn, h, ir.block_target(term.operands[1]), ir.block_target(term.operands[2]), ?shape)) {
+        ret res[bool, fail.Fail].ok{false};
+    }
+    if (!phis_admit(m, fn, tgt, ?shape)) { ret res[bool, fail.Fail].ok{false}; }
+
+    val r: err[fail.Fail] = flatten(m, fn, h, term, cond, ?shape);
+    if (sel r.err) { ret res[bool, fail.Fail].err{r.err}; }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# a diamond when both targets are arms into one join, a triangle when one
+# target is an arm into the other
+fun find_shape(m: *ir.Module, fn: *ir.Function, h: id.BlockId, on_true: id.BlockId, on_false: id.BlockId, out: *Shape) bool {
+    if (on_true == on_false || on_true == h || on_false == h) { ret false; }
+    val is_t: bool = arm_walk(m, fn, h, on_true, ?out.arm_t);
+    val is_f: bool = arm_walk(m, fn, h, on_false, ?out.arm_f);
+    out.from_t = h;
+    out.from_f = h;
+    out.cost   = 0;
+
+    if (is_t && is_f && out.arm_t.join == out.arm_f.join) {
+        out.join   = out.arm_t.join;
+        out.from_t = arm_last(?out.arm_t);
+        out.from_f = arm_last(?out.arm_f);
+        out.cost   = out.arm_t.cost + out.arm_f.cost;
+        ret out.join != h;
+    }
+    if (is_t && out.arm_t.join == on_false) {
+        out.join        = on_false;
+        out.from_t      = arm_last(?out.arm_t);
+        out.cost        = out.arm_t.cost;
+        out.arm_f.count = 0;
+        ret true;
+    }
+    if (is_f && out.arm_f.join == on_true) {
+        out.join        = on_true;
+        out.from_f      = arm_last(?out.arm_f);
+        out.cost        = out.arm_f.cost;
+        out.arm_t.count = 0;
+        ret true;
+    }
+    ret false;
+}
+
+fun arm_last(arm: *Arm) id.BlockId {
+    ret arm.blocks[(arm.count - 1)::usize];
+}
+
+# the arm that starts at `first`, false when there is none: each block has no
+# phis, is entered only from the block before it, ends in a plain branch, and
+# holds only instructions it may run on both paths, whose cost it adds up.
+# the walk stops at the first block that is not such a block, the join
+fun arm_walk(m: *ir.Module, fn: *ir.Function, h: id.BlockId, first: id.BlockId, out: *Arm) bool {
+    out.count = 0;
+    out.cost  = 0;
+    out.join  = id.BLOCK_NIL;
+    var pred: id.BlockId = h;
+    var b:    id.BlockId = first;
+    for (b::u32 < fn.block_count && b != h && arm_member(fn, b, pred)) {
+        if (out.count == ARM_BLOCKS_MAX) { ret false; }
+        val blk: *ir.Block = ?fn.blocks[b::u32];
+        var i:   u32       = 0;
+        for (i < blk.instr_count) {
+            val iopt: opt[*instruction.Instruction] = ir.instruction_get(fn, blk.instructions[i]);
+            i = i + 1;
+            if (!sel iopt.some) { ret false; }
+            val inst: *instruction.Instruction = iopt.some;
+            if (inst.kind == instruction.OP_DBG_VALUE) { cnt; }
+            if (!speculates(m, inst))                  { ret false; }
+            out.cost = out.cost + op_cost(m, inst);
+            if (out.cost > SPECULATION_BUDGET) { ret false; }
+        }
+        out.blocks[out.count::usize] = b;
+        out.count                    = out.count + 1;
+        pred                         = b;
+        b                            = ir.block_target(fn.instrs[blk.terminator::u32].operands[0]);
+    }
+    if (out.count == 0 || b::u32 >= fn.block_count || b == first) { ret false; }
+    out.join = b;
+    ret true;
+}
+
+fun arm_member(fn: *ir.Function, b: id.BlockId, pred: id.BlockId) bool {
+    val blk: *ir.Block = ?fn.blocks[b::u32];
+    if (blk.phi_count != 0 || blk.pred_count != 1 || blk.preds[0] != pred) { ret false; }
+    val topt: opt[*instruction.Instruction] = terminator_of(fn, b);
+    if (!sel topt.some) { ret false; }
+    ret topt.some.kind == instruction.OP_BR && topt.some.operand_count == 1;
+}
+
+fun speculates(m: *ir.Module, inst: *instruction.Instruction) bool {
+    if (!effect.speculatable(inst))             { ret false; }
+    if (inst.kind == instruction.OP_DECLASSIFY) { ret false; }
+    # the branch may be the proof that bounds a variable count, and moved past
+    # it the shift is saturated instead of bare
+    val shift: bool = inst.kind == instruction.OP_SHL || inst.kind == instruction.OP_SHR_U || inst.kind == instruction.OP_SHR_S;
+    if (shift && inst.operand_count == 2 && inst.operands[1].kind != value.VAL_CONST_INT) { ret false; }
+    if (opdesc.produces_value(inst.kind) && !scalar(m, inst.ty))                          { ret false; }
+    var o: u32 = 0;
+    for (o < inst.operand_count) {
+        if (refs.operand_is_value_use(inst.kind, o) && !scalar(m, inst.operands[o].ty)) { ret false; }
+        o = o + 1;
+    }
+    ret true;
+}
+
+fun op_cost(m: *ir.Module, inst: *instruction.Instruction) u32 {
+    if (is_float(m, inst.ty))                                       { ret FLOAT_COST; }
+    if (inst.operand_count > 0 && is_float(m, inst.operands[0].ty)) { ret FLOAT_COST; }
+    val k: instruction.InstrKind = inst.kind;
+    if (k == instruction.OP_MUL || k == instruction.OP_MUL_HIGH_S || k == instruction.OP_MUL_HIGH_U
+        || k == instruction.OP_MUL_WIDE_S || k == instruction.OP_MUL_WIDE_U) {
+        ret MUL_COST;
+    }
+    ret SIMPLE_COST;
+}
+
+# every join phi reads one incoming along each outcome; the ones that differ
+# become selects, which must fit a register and the budget
+fun phis_admit(m: *ir.Module, fn: *ir.Function, tgt: *target.Target, shape: *Shape) bool {
+    val jb:    *ir.Block = ?fn.blocks[shape.join::u32];
+    var total: u32       = shape.cost;
+    var pi:    u32       = 0;
+    for (pi < jb.phi_count) {
+        val popt: opt[*instruction.Instruction] = ir.instruction_get(fn, jb.phis[pi]);
+        pi = pi + 1;
+        if (!sel popt.some) { ret false; }
+        val phi: *instruction.Instruction = popt.some;
+        var vt:  value.Value;
+        var vf:  value.Value;
+        if (!incoming(phi, shape.from_t, ?vt) || !incoming(phi, shape.from_f, ?vf)) { ret false; }
+        if (read_as_aggregate(m, fn, jb.phis[pi - 1]))                              { ret false; }
+        if (same_value(vt, vf))                                                     { cnt; }
+        if (!selectable(m, tgt, phi.ty))                                            { ret false; }
+        total = total + SIMPLE_COST;
+    }
+    ret total <= SPECULATION_BUDGET;
+}
+
+# a value some instruction reads at an aggregate type is the address of that
+# aggregate's memory, and only an address-producing instruction may stand
+# for one: the phi is, and neither a select nor an incoming it would be
+# replaced by need be
+fun read_as_aggregate(m: *ir.Module, fn: *ir.Function, phi_id: id.InstructionId) bool {
+    var i: u32 = 0;
+    for (i < fn.instr_len) {
+        val inst: *instruction.Instruction = ?fn.instrs[i];
+        var o:    u32                      = 0;
+        for (o < inst.operand_count) {
+            val v: value.Value = inst.operands[o];
+            if (v.kind == value.VAL_INSTR && v.data.instr == phi_id && ir_type.is_aggregate(?m.types, v.ty)) { ret true; }
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun incoming(phi: *instruction.Instruction, from: id.BlockId, out: *value.Value) bool {
+    var found: bool = false;
+    var o:     u32  = 0;
+    for (o + 1 < phi.operand_count) {
+        if (ir.block_target(phi.operands[o]) == from) {
+            if (found) { ret false; }
+            @out  = phi.operands[o + 1];
+            found = true;
+        }
+        o = o + 2;
+    }
+    ret found;
+}
+
+fun same_value(a: value.Value, b: value.Value) bool {
+    if (a.kind != b.kind)          { ret false; }
+    if (a.kind == value.VAL_INSTR) { ret a.data.instr == b.data.instr; }
+    if (a.kind == value.VAL_PARAM) { ret a.data.param_ix == b.data.param_ix; }
+    ret false;
+}
+
+fun flatten(m: *ir.Module, fn: *ir.Function, h: id.BlockId, term: *instruction.Instruction, cond: value.Value, shape: *Shape) err[fail.Fail] {
+    # adding a select can move the instruction array, so nothing holds a pointer into it across one
+    val loc:  source.SrcLoc    = term.loc;
+    val tid:  id.InstructionId = fn.blocks[h::u32].terminator;
+    val site: u32              = ir.instr_inline_site_of(fn, tid);
+    val rt:   err[fail.Fail]   = hoist_arm(m, fn, h, ?shape.arm_t);
+    if (sel rt.err) { ret rt; }
+    val rf: err[fail.Fail] = hoist_arm(m, fn, h, ?shape.arm_f);
+    if (sel rf.err) { ret rf; }
+
+    # a phi left one incoming, the header's, is that value, so the join is
+    # an arm block again for a diamond around this one
+    val jb:   *ir.Block = ?fn.blocks[shape.join::u32];
+    var kept: u32       = 0;
+    var pi:   u32       = 0;
+    for (pi < jb.phi_count) {
+        val phi_id: id.InstructionId              = jb.phis[pi];
+        val popt:   opt[*instruction.Instruction] = ir.instruction_get(fn, phi_id);
+        pi = pi + 1;
+        if (!sel popt.some) { cnt; }
+        var vt: value.Value;
+        var vf: value.Value;
+        if (!incoming(popt.some, shape.from_t, ?vt) || !incoming(popt.some, shape.from_f, ?vf)) {
+            ret err[fail.Fail].err{fail.message("ifconv: a join phi lost an incoming it was admitted with")};
+        }
+        var chosen: value.Value = vt;
+        if (!same_value(vt, vf)) {
+            val rs: res[value.Value, fail.Fail] = add_select(m, fn, h, loc, cond, vt, vf, phi_id, site);
+            if (sel rs.err) { ret err[fail.Fail].err{rs.err}; }
+            chosen = rs.ok;
+        }
+        val phi: *instruction.Instruction = ?fn.instrs[phi_id::u32];
+        drop_incoming(phi, shape.from_t);
+        drop_incoming(phi, shape.from_f);
+        if (phi.operand_count == 0) {
+            mutate.replace_uses(fn, phi_id, chosen);
+            cnt;
+        }
+        val ra: err[fail.Fail] = ir.phi_append_incoming(m, phi, h, chosen);
+        if (sel ra.err) { ret ra; }
+        jb.phis[kept] = phi_id;
+        kept          = kept + 1;
+    }
+    jb.phi_count = kept;
+
+    val tb: *instruction.Instruction        = ?fn.instrs[tid::u32];
+    val ro: res[ir.OperandArray, fail.Fail] = ir.operands_alloc(m, 1);
+    if (sel ro.err) { ret err[fail.Fail].err{ro.err}; }
+    val arr: ir.OperandArray             = ro.ok;
+    val rj:  res[value.Value, fail.Fail] = ir.block_target_make(m, shape.join);
+    if (sel rj.err) { ret err[fail.Fail].err{rj.err}; }
+    arr.ops[0] = rj.ok;
+    tb.kind    = instruction.OP_BR;
+    ir.instr_replace_operands(m, tb, arr);
+    ret err[fail.Fail].ok{};
+}
+
+# the arm's instructions run in `h` now, ahead of its branch, and its blocks,
+# which nothing enters any more, are pruned with their branches. a fact a flag asserts held only on the arm's path, so
+# the flags go; its variable bindings describe values the untaken path never
+# computed, so they lose their location
+fun hoist_arm(m: *ir.Module, fn: *ir.Function, h: id.BlockId, arm: *Arm) err[fail.Fail] {
+    val path_facts: u16 = instruction.INSTR_FLAG_NSW | instruction.INSTR_FLAG_NUW | instruction.INSTR_FLAG_EXACT;
+    var k:          u32 = 0;
+    for (k < arm.count) {
+        val b: u32 = arm.blocks[k::usize]::u32;
+        k = k + 1;
+        var i: u32 = 0;
+        for (i < fn.blocks[b].instr_count) {
+            val iid:  id.InstructionId         = fn.blocks[b].instructions[i];
+            val inst: *instruction.Instruction = ?fn.instrs[iid::u32];
+            inst.flags = inst.flags & ~path_facts;
+            if (inst.kind == instruction.OP_DBG_VALUE) {
+                var o: u32 = 0;
+                for (o < inst.operand_count) {
+                    inst.operands[o] = value.const_null(inst.operands[o].ty);
+                    o                = o + 1;
+                }
+            }
+            val ra: err[fail.Fail] = ir.block_append_instr(m, ?fn.blocks[h::u32], iid);
+            if (sel ra.err) { ret ra; }
+            i = i + 1;
+        }
+        fn.blocks[b].instr_count = 0;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun add_select(m: *ir.Module, fn: *ir.Function, h: id.BlockId, loc: source.SrcLoc, cond: value.Value,
+    vt: value.Value, vf: value.Value, phi_id: id.InstructionId, site: u32) res[value.Value, fail.Fail] {
+    val ro: res[ir.OperandArray, fail.Fail] = ir.operands_alloc(m, 3);
+    if (sel ro.err) { ret res[value.Value, fail.Fail].err{ro.err}; }
+    val ops: *value.Value             = ro.ok.ops;
+    val phi: *instruction.Instruction = ?fn.instrs[phi_id::u32];
+    ops[0] = cond;
+    ops[1] = value.retype(vt, phi.ty);
+    ops[2] = value.retype(vf, phi.ty);
+
+    var sel_i: instruction.Instruction;
+    sel_i.kind          = instruction.OP_SELECT;
+    sel_i.ty            = phi.ty;
+    sel_i.operands      = ops;
+    sel_i.operand_count = 3;
+    sel_i.operand_cap   = 3;
+    sel_i.flags         = 0;
+    sel_i.aux_ty        = ir_type.IRT_NIL;
+    sel_i.loc           = loc;
+    sel_i.secret        = phi.secret;
+    sel_i.arg_ext       = ir_type.EXT_LIST_NONE;
+
+    val ri: res[id.InstructionId, fail.Fail] = ir.instruction_add(m, fn, sel_i);
+    if (sel ri.err) { ret res[value.Value, fail.Fail].err{ri.err}; }
+    val iid: id.InstructionId = ri.ok;
+    val ra:  err[fail.Fail]   = ir.block_append_instr(m, ?fn.blocks[h::u32], iid);
+    if (sel ra.err) { ret res[value.Value, fail.Fail].err{ra.err}; }
+    if (site != 0) {
+        val rs: err[fail.Fail] = ir.instr_inline_site_set(fn, iid, site);
+        if (sel rs.err) { ret res[value.Value, fail.Fail].err{rs.err}; }
+    }
+    ret res[value.Value, fail.Fail].ok{value.instr(iid, sel_i.ty)};
+}
+
+fun drop_incoming(phi: *instruction.Instruction, from: id.BlockId) {
+    var o: u32 = 0;
+    for (o + 1 < phi.operand_count) {
+        if (ir.block_target(phi.operands[o]) == from) {
+            var k: u32 = o;
+            for (k + 2 < phi.operand_count) {
+                phi.operands[k]     = phi.operands[k + 2];
+                phi.operands[k + 1] = phi.operands[k + 3];
+                k                   = k + 2;
+            }
+            phi.operand_count = phi.operand_count - 2;
+            ret;
+        }
+        o = o + 2;
+    }
+}
+
+fun type_of(m: *ir.Module, ty: ir_type.IrTypeId) opt[*ir_type.IrType] {
+    ret ir_type.get(?m.types, ty);
+}
+
+fun is_int_of_bits(m: *ir.Module, ty: ir_type.IrTypeId, bits: u32) bool {
+    val t: opt[*ir_type.IrType] = type_of(m, ty);
+    if (!sel t.some) { ret false; }
+    ret t.some.kind == ir_type.IRT_INT && t.some.data.bits == bits;
+}
+
+fun is_float(m: *ir.Module, ty: ir_type.IrTypeId) bool {
+    val t: opt[*ir_type.IrType] = type_of(m, ty);
+    if (!sel t.some) { ret false; }
+    ret t.some.kind == ir_type.IRT_FLOAT;
+}
+
+# a value one register holds with no memory behind it
+fun scalar(m: *ir.Module, ty: ir_type.IrTypeId) bool {
+    val t: opt[*ir_type.IrType] = type_of(m, ty);
+    if (!sel t.some) { ret false; }
+    val k: ir_type.IrTypeKind = t.some.kind;
+    ret k == ir_type.IRT_INT || k == ir_type.IRT_PTR || k == ir_type.IRT_FLOAT;
+}
+
+# what a select chooses: an integer no wider than a general register, or a pointer
+fun selectable(m: *ir.Module, tgt: *target.Target, ty: ir_type.IrTypeId) bool {
+    val t: opt[*ir_type.IrType] = type_of(m, ty);
+    if (!sel t.some)                    { ret false; }
+    if (t.some.kind == ir_type.IRT_PTR) { ret true; }
+    if (t.some.kind != ir_type.IRT_INT) { ret false; }
+    val bits: u32 = t.some.data.bits;
+    ret bits >= 8 && bits <= tgt.model.gpr_width * 8;
+}
+
+use mach.lang.intern;
+use mach.lang.me.ir.builder;
+use mach.lang.target.resolved;
+use target_testing: mach.lang.target.testing;
+use std.allocator.page;
+
+# the arms of the test diamonds, one shape the conversion takes and three it
+# refuses
+val T_ARM_COMPUTE:   u32 = 0;
+val T_ARM_LOAD:      u32 = 1;
+val T_ARM_AGGREGATE: u32 = 2;
+val T_ARM_TRAP:      u32 = 3;
+
+# `r = p1; if (p0 < p1) { r = p0 + arm; }` with `arm` computed in the arm
+# (T_ARM_COMPUTE), or loaded there as a tag payload is under its guard
+# (T_ARM_LOAD). T_ARM_AGGREGATE joins two pointers the return reads as the
+# aggregate they address, and T_ARM_TRAP is a tag guard whose failing arm is
+# its trap
+#[testing]
+fun t_diamond(m: *ir.Module, i64t: ir_type.IrTypeId, ptrt: ir_type.IrTypeId, rect: ir_type.IrTypeId, shape: u32) i32 {
+    val rf: res[u32, fail.Fail] = ir.function_add(m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) { ret 1; }
+    var bld: builder.Builder = builder.init(m);
+    builder.set_function(?bld, ?m.functions[rf.ok]);
+    var b: [4]id.BlockId;
+    var i: usize = 0;
+    for (i < 4) {
+        val rb: res[id.BlockId, fail.Fail] = builder.new_block(?bld);
+        if (sel rb.err) { ret 1; }
+        b[i] = rb.ok;
+        i    = i + 1;
+    }
+    val p0: value.Value = value.param(0, i64t);
+    val p1: value.Value = value.param(1, i64t);
+
+    builder.set_block(?bld, b[0]);
+    val rc: res[value.Value, fail.Fail] = builder.emit_cmp_lt_s(?bld, p0, p1);
+    if (sel rc.err) { ret 1; }
+    val r0: err[fail.Fail] = builder.emit_cbr(?bld, rc.ok, b[1], b[2]);
+    if (sel r0.err) { ret 1; }
+
+    builder.set_block(?bld, b[1]);
+    var got: value.Value = value.param(2, ptrt);
+    if (shape == T_ARM_TRAP) {
+        val rt: err[fail.Fail] = builder.emit_unreachable(?bld);
+        if (sel rt.err) { ret 1; }
+    }
+    or {
+        if (shape == T_ARM_COMPUTE || shape == T_ARM_LOAD) {
+            var arm: value.Value = value.const_int(3, i64t);
+            if (shape == T_ARM_LOAD) {
+                val rl: res[value.Value, fail.Fail] = builder.emit_load(?bld, value.param(2, ptrt), i64t);
+                if (sel rl.err) { ret 1; }
+                arm = rl.ok;
+            }
+            val ra: res[value.Value, fail.Fail] = builder.emit_add(?bld, p0, arm);
+            if (sel ra.err) { ret 1; }
+            got = ra.ok;
+        }
+        val r1: err[fail.Fail] = builder.emit_br(?bld, b[3]);
+        if (sel r1.err) { ret 1; }
+    }
+    builder.set_block(?bld, b[2]);
+    val r2: err[fail.Fail] = builder.emit_br(?bld, b[3]);
+    if (sel r2.err) { ret 1; }
+
+    builder.set_block(?bld, b[3]);
+    if (shape == T_ARM_TRAP) {
+        val rr: err[fail.Fail] = builder.emit_ret(?bld, p1);
+        if (sel rr.err) { ret 1; }
+        ret 0;
+    }
+    var other: value.Value      = p1;
+    var ty:    ir_type.IrTypeId = i64t;
+    if (shape == T_ARM_AGGREGATE) {
+        other = value.param(3, ptrt);
+        ty    = ptrt;
+    }
+    val rp: res[value.Value, fail.Fail] = builder.emit_phi(?bld, ty);
+    if (sel rp.err) { ret 1; }
+    val i1: err[fail.Fail] = builder.phi_add_incoming(?bld, rp.ok, b[1], got);
+    if (sel i1.err) { ret 1; }
+    val i2: err[fail.Fail] = builder.phi_add_incoming(?bld, rp.ok, b[2], other);
+    if (sel i2.err) { ret 1; }
+    var out: value.Value = rp.ok;
+    if (shape == T_ARM_AGGREGATE) { out = value.retype(rp.ok, rect); }
+    val rr: err[fail.Fail] = builder.emit_ret(?bld, out);
+    if (sel rr.err) { ret 1; }
+    ret 0;
+}
+
+# the diamond flattens into its header: a select of the arm's sum and the
+# other incoming feeds the return, and the header branches on nothing. the
+# rest keep their branch: an arm that loads, since the branch may be what
+# makes the load valid (a tag payload under its guard); a join read as an
+# aggregate, since only an address-producing instruction may stand for one;
+# and a guard whose arm is its trap
+test run__flattens_a_diamond_and_keeps_the_branch_it_must {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var reg: target.TargetRegistry = target.registry_init();
+    fin { target.registry_dnit(?reg); }
+    val rreg: err[fail.Fail] = target.register_all(?reg, target_testing.debug_descriptor);
+    if (sel rreg.err) { ret 1; }
+    val rt: res[resolved.Target, fail.Fail] = target.select(?reg, "x86_64", "linux", "sysv64");
+    if (sel rt.err) { ret 1; }
+    var tgt: resolved.Target = rt.ok;
+
+    val rm: res[ir.Module, fail.Fail] = ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 1; }
+    var m: ir.Module = rm.ok;
+    fin { ir.dnit(?m); }
+    val r64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel r64.err) { ret 1; }
+    val rptr: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?m.types);
+    if (sel rptr.err) { ret 1; }
+    var fields: [2]ir_type.IrTypeId              = [2]ir_type.IrTypeId{r64.ok, r64.ok};
+    val rrec:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_struct(?m.types, ?fields[0], 2, 8, false);
+    if (sel rrec.err) { ret 1; }
+    var shape: u32 = T_ARM_COMPUTE;
+    for (shape <= T_ARM_TRAP) {
+        if (t_diamond(?m, r64.ok, rptr.ok, rrec.ok, shape) != 0) { ret 1; }
+        shape = shape + 1;
+    }
+
+    val ran: res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel ran.err) { ret 2; }
+    if (!ran.ok)     { ret 2; }
+
+    # the arms are pruned, and the join is the second block
+    val flat: *ir.Function = ?m.functions[0];
+    val head: *ir.Block    = ?flat.blocks[0];
+    if (flat.block_count != 2) { ret 3; }
+    val ret0: *instruction.Instruction = ?flat.instrs[flat.blocks[1].terminator::u32];
+    if (flat.instrs[head.terminator::u32].kind != instruction.OP_BR) { ret 3; }
+    if (ret0.operands[0].kind != value.VAL_INSTR)                    { ret 4; }
+    val chosen: *instruction.Instruction = ?flat.instrs[ret0.operands[0].data.instr::u32];
+    if (chosen.kind != instruction.OP_SELECT)                                                { ret 5; }
+    if (chosen.operands[2].kind != value.VAL_PARAM || chosen.operands[2].data.param_ix != 1) { ret 6; }
+
+    var f: u32 = 1;
+    for (f < 4) {
+        val kept: *ir.Function = ?m.functions[f];
+        if (kept.block_count != 4)                                                  { ret 7 + f::i32; }
+        if (kept.instrs[kept.blocks[0].terminator::u32].kind != instruction.OP_CBR) { ret 7 + f::i32; }
+        f = f + 1;
+    }
+    ret 0;
+}

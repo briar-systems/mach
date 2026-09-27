@@ -522,6 +522,12 @@ pub val IVEC_SHR_S:      IrVecOp = 26
 pub val IVEC_RANGE:      IrVecOp = 27
 ```
 
+## val IVEC_CONCAT
+
+```mach
+pub val IVEC_CONCAT:     IrVecOp = 28
+```
+
 ## def VecClass
 
 ```mach
@@ -592,6 +598,14 @@ pub val VCLASS_RANGE: VecClass = 8
 
 a lane range: the result has at most the operand's lanes, of the same type,
 taken from a constant first lane on
+
+## val VCLASS_CONCAT
+
+```mach
+pub val VCLASS_CONCAT: VecClass = 9
+```
+
+a lane join: the result has the operands' lanes in turn, all of its lane type
 
 ## def CtClass
 
@@ -755,6 +769,18 @@ pub val LOWER_CBR:         LowerRoute = 19
 pub val LOWER_MASK:        LowerRoute = 20
 ```
 
+## val LOWER_VEC_CONCAT
+
+```mach
+pub val LOWER_VEC_CONCAT:  LowerRoute = 21
+```
+
+## val LOWER_SELECT
+
+```mach
+pub val LOWER_SELECT:      LowerRoute = 22
+```
+
 ## val OP_MAX_FIXED_OPERANDS
 
 ```mach
@@ -770,7 +796,7 @@ pub rec IrOpDescriptor;
 ## val IR_OP_DESCRIPTOR_COUNT
 
 ```mach
-pub val IR_OP_DESCRIPTOR_COUNT: usize = 58
+pub val IR_OP_DESCRIPTOR_COUNT: usize = 60
 ```
 
 ## fun is_known

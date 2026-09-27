@@ -355,6 +355,25 @@ source width, zero otherwise, written at the instruction's width: the mask
 a saturating shift keeps its result by, one compare-to-mask sequence on
 every target (#3885). both widths are at most the alu width
 
+## val MIR_SELECT
+
+```mach
+pub val MIR_SELECT:     MirOpcode = 57
+```
+
+the IR select (#3346): [dst, cond, a, b] writes a when cond, read at the
+source width, is nonzero, else b. [dst, lhs, rhs, a, b, cmp] of
+MIR_SELECT_CMP decides by the integer compare opcode in the immediate
+`cmp` of lhs and rhs, read at the source width, whose 0/1 answer lowering
+never materialized. both write at the instruction's width, at most the alu
+width, and every target selects them without a branch
+
+## val MIR_SELECT_CMP
+
+```mach
+pub val MIR_SELECT_CMP: MirOpcode = 58
+```
+
 ## val MIR_MOV
 
 ```mach
@@ -460,6 +479,28 @@ pub val MIR_VEC_RANGE: MirOpcode = 0x100E
 
 the IR lane range (dst, src, first lane in imm): the source's lanes from the
 first on, of the same lane type (#3864)
+
+## val MIR_VEC_CONCAT
+
+```mach
+pub val MIR_VEC_CONCAT: MirOpcode = 0x100F
+```
+
+a lane join of two parts (dst, lo, hi, the lanes of lo in imm): the lanes of
+lo and then those of hi, of one lane type, in one register. the IR join of
+more parts lowers to a chain of these (#3589)
+
+## val MIR_VEC_UPPER_CLEAR
+
+```mach
+pub val MIR_VEC_UPPER_CLEAR: MirOpcode = 0x1010
+```
+
+the upper bytes of the vector registers above the compute width are
+cleared: a value wider than `vector_bits` a convention carried has left its
+register, and nothing the function holds lives above the compute width.
+emitted only where the model's register-width row says the narrower code
+pays for that state (isa.vector_upper_clear), x86-64's vzeroupper (#3751)
 
 ## val MIR_SEL_ADD
 
@@ -653,6 +694,20 @@ pub val MIR_SEL_MASK_LT_U: MirOpcode = 0x112A
 ```
 
 the selected compare-to-mask (#3885)
+
+## val MIR_SEL_SELECT
+
+```mach
+pub val MIR_SEL_SELECT:     MirOpcode = 0x112B
+```
+
+the selected selects (#3346)
+
+## val MIR_SEL_SELECT_CMP
+
+```mach
+pub val MIR_SEL_SELECT_CMP: MirOpcode = 0x112C
+```
 
 ## fun is_cmp_opcode
 
@@ -1416,7 +1471,9 @@ pub rec MirDbgBinding;
 ```
 
 lane: which lane of a value wider than one register `vreg` holds, of `lanes`
-lanes each `lane_bytes` wide; `lanes` is 0 when `vreg` holds the whole value.
+lanes each `lane_bytes` wide but the last, which is `last_bytes` wide when
+that is not 0 (a split vector whose last piece holds the lanes left, #3589);
+`lanes` is 0 when `vreg` holds the whole value.
 at_end: the binding is published at the end of the instruction that carries
 it, where that instruction's def exists, instead of at its start
 
@@ -1785,6 +1842,17 @@ pub fun instr_attach_dbg_end(a: *A.Allocator, mi: *MirInstr, iid: u32, vreg: u32
 ```
 
 the binding is published where `mi`'s def exists: at its end
+
+## fun instr_attach_dbg_piece
+
+```mach
+pub fun instr_attach_dbg_piece(a: *A.Allocator, mi: *MirInstr, iid: u32, vreg: u32,
+lane: u8, lanes: u8, lane_bytes: u8, last_bytes: u8, at_end: bool) err[fail.Fail];
+```
+
+a binding of one piece of a value held in several registers: `vreg` is its
+`lane`-th piece of `lanes`, each `lane_bytes` wide but a last one of
+`last_bytes` when that is not 0 (#3589)
 
 ## fun instr_pass_dbg
 

@@ -16,7 +16,9 @@ error[name.unresolved]: unresolved identifier `helpr`
 
 The key sits between the severity and the message: `error[<key>]` or
 `warning[<key>]`. The message says what went wrong in words, and its wording
-may improve from release to release. The key does not change.
+may improve from release to release. The key does not change. A tool reads the
+key, the location and the rest as data with
+[`--diagnostics=json`](diagnostics-json.md) rather than from this text.
 
 ## Keys
 
@@ -66,7 +68,7 @@ disappears, moves or changes severity.
 | `syntax` | source that does not parse: an expected token, name, type, expression or declaration is missing, or nesting is too deep |
 | `source` | characters the source may not contain |
 | `literal` | a literal that is malformed, unterminated or out of range for its type |
-| `name`, `use`, `module`, `visibility`, `import`, `fwd` | names that do not resolve, collide or are not exported; `use` and `fwd` paths |
+| `name`, `use`, `module`, `visibility`, `import`, `fwd` | names that do not resolve, collide, take a built-in type's name (`name.builtin_type`) or are not exported; `use` and `fwd` paths |
 | `decl`, `binding`, `global`, `const` | declaration forms: bindings, globals and constants |
 | `type`, `cast`, `operator`, `condition`, `assign`, `address`, `ptr` | type checking: mismatches, conversions, operators, conditions, assignment and addresses |
 | `call`, `variadic`, `pack`, `ret` | calls, C-variadic and pack parameters, and returned values |
@@ -94,5 +96,6 @@ The full list is the table itself.
 
 ## See also
 
+- [diagnostics-json.md](diagnostics-json.md) — `--diagnostics=json`, the same diagnostics as versioned NDJSON records
 - [manifest.md](manifest.md#silencing-warnings) — silencing warnings with `allow`
 - [decorators.md](decorators.md#expectkey--acknowledge-a-warning) — acknowledging a warning with `#[expect]`

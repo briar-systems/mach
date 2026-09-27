@@ -447,10 +447,23 @@ same lane type, in a vector of at most as many lanes. a cell names the lane
 kind and width, which the operation keeps; its scalar row is the lane path,
 each lane extracted and the result built or written through memory (#3864)
 
+## val VEC_OP_CONCAT
+
+```mach
+pub val VEC_OP_CONCAT: VecOp = 33
+```
+
+a lane join: the lanes of each operand in turn, all of one lane type, in one
+vector of their summed count. it is how a vector wider than the register is
+put back together from its register-width pieces, and how a narrowing
+conversion over those pieces gathers its halves (#3589). a cell names the
+lane kind and width, which the operation keeps; its scalar row is the lane
+path through memory
+
 ## val VEC_OP_LAST
 
 ```mach
-pub val VEC_OP_LAST:  VecOp = VEC_OP_RANGE
+pub val VEC_OP_LAST:   VecOp = VEC_OP_CONCAT
 ```
 
 ## rec PackedForm
@@ -504,6 +517,21 @@ pub val FORM_PACKED:     VectorForm = 2
 ```mach
 pub val VECTOR_BITS_128: u32 = 128
 ```
+
+## rec VectorRegisterRow
+
+```mach
+pub rec VectorRegisterRow;
+```
+
+a width the vector register file takes under an extension: with `ext`
+selected a register carries `bytes`, more than the compute width
+`vector_bits` the packed rows run at. a convention that places a vector by
+the register it fits reads the widest selected row (#3751). `upper_clear`
+says the narrower code the target emits pays for a register's upper bytes
+while they hold a value, so the upper state is cleared once a value of this
+width has been moved out of its register (x86-64's vzeroupper after a ymm
+value, which the legacy-encoded 128-bit instructions otherwise stall on)
 
 ## val VECTOR_LANES_UNBOUNDED
 
@@ -658,6 +686,41 @@ pub fun is_shift_op(op: VecOp) bool;
 pub fun is_range_op(op: VecOp) bool;
 ```
 
+## fun is_permute_op
+
+```mach
+pub fun is_permute_op(op: VecOp) bool;
+```
+
+the lane rearrangements: a range of one vector's lanes and a join of several
+
+## fun half_native
+
+```mach
+pub fun half_native(m: *MachineModel, op: VecOp, is_float: bool, lane_bits: u32, from_bits: u32) bool;
+```
+
+the target realizes this scalar f16 cell with its own instruction under the
+selected extensions; false is the inlined expansion
+
+## fun vector_register_bytes
+
+```mach
+pub fun vector_register_bytes(m: *MachineModel) u32;
+```
+
+the widest vector one register carries under the selected extensions: the
+compute width, or a selected row's wider register
+
+## fun vector_upper_clear
+
+```mach
+pub fun vector_upper_clear(m: *MachineModel, bytes: u32) bool;
+```
+
+a value `bytes` wide moved out of its register leaves upper state the
+target clears afterwards
+
 ## fun vector_domain_len
 
 ```mach
@@ -702,14 +765,14 @@ pub fun scalar_shift_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
 the same for the shifts: a cell the packed table leaves is shifted lane by
 lane through the scalar shift, which saturates the same way
 
-## fun scalar_range_rows
+## fun scalar_permute_rows
 
 ```mach
-pub fun scalar_range_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
+pub fun scalar_permute_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
 ```
 
-the same for the lane ranges: a cell the packed table leaves keeps the lane
-path
+the same for the lane ranges and joins: a cell the packed table leaves keeps
+the lane path
 
 ## fun ct_mul_rows_admit
 
