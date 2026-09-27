@@ -1,0 +1,1005 @@
+use mach.lang.fail;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use dep: mach.lang.me.analysis.dependence;
+use mach.lang.me.analysis.loops;
+use mach.lang.me.ir;
+use mach.lang.me.ir.effect;
+use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.mutate;
+use mach.lang.me.ir.opdesc;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use mach.lang.me.scratch;
+use mach.lang.target;
+use mach.lang.target.resolved;
+use mach.lang.wide;
+
+val MAX_DEPTH: u32 = 8;
+
+rec FunctionWork {
+    module: *ir.Module;
+    body:   *ir.Function;
+    target: *target.Target;
+}
+
+rec Iv {
+    phi:  id.InstructionId;
+    ty:   ir_type.IrTypeId;
+    bits: u32;
+    init: value.Value;
+    step: value.Value;
+    loc:  id.InstructionId;
+}
+
+# a value this loop already reduced, and what stands for it: a multiply's
+# iv, an address's stepped pointer or an address's hoisted base
+rec Made {
+    shape: u8;
+    base:  value.Value;
+    elem:  ir_type.IrTypeId;
+    ty:    ir_type.IrTypeId;
+    index: value.Value;
+    to:    value.Value;
+}
+
+val MADE_MUL:  u8 = 0;
+val MADE_STEP: u8 = 1;
+val MADE_BASE: u8 = 2;
+
+rec LoopWork {
+    m:      *ir.Module;
+    fn:     *ir.Function;
+    la:     *loops.LoopAnalysis;
+    lx:     u32;
+    tgt:    *target.Target;
+    alloc:  *A.Allocator;
+    pre:    id.BlockId;
+    header: id.BlockId;
+    latch:  id.BlockId;
+
+    ivs:    *Iv;
+    iv_len: u32;
+    iv_cap: u32;
+
+    made:     *Made;
+    made_len: u32;
+    made_cap: u32;
+}
+
+# a run that owns its workspace; the pipeline runs `run_in` over one
+#[testing]
+pub fun run(m: *ir.Module, tgt: *target.Target) res[bool, fail.Fail] {
+    var workspace:   scratch.Workspace;
+    val initialized: err[fail.Fail] = scratch.init(?workspace);
+    if (sel initialized.err) { ret res[bool, fail.Fail].err{initialized.err}; }
+    fin { scratch.dnit(?workspace); }
+    ret run_in(m, tgt, ?workspace);
+}
+
+# induction-variable strength reduction (#3347). a value that is an affine
+# function `a * iv + b` of a loop's induction variable, with a constant `a` and
+# a loop-invariant `b`, is stepped by `a * step` each iteration instead of
+# recomputed. every operation involved is a wrapping add or multiply at the
+# iv's own width, so the stepped value equals the recomputed one modulo 2^n on
+# every iteration: no overflow case differs and nothing that can trap is read.
+# an address `base + index * size` becomes a pointer the latch steps, or keeps
+# a scaled index over a base hoisted to the preheader where the target folds
+# the scale into the access; an integer multiply becomes an integer iv
+pub fun run_in(m: *ir.Module, tgt: *target.Target, workspace: *scratch.Workspace) res[bool, fail.Fail] {
+    var changed: bool = false;
+    var fi:      u32  = 0;
+    for (fi < m.function_len) {
+        val fn: *ir.Function = ?m.functions[fi];
+        if (fn.block_count == 0 || (fn.flags & ir.FN_FLAG_EXTERN) != 0) {
+            fi = fi + 1;
+            cnt;
+        }
+        var work:      FunctionWork         = FunctionWork{module: m, body: fn, target: tgt};
+        val changed_r: res[bool, fail.Fail] = scratch.run[FunctionWork, bool](workspace, m.alloc, ?work, reduce_function);
+        if (sel changed_r.err) { ret changed_r; }
+        if (changed_r.ok)      { changed = true; }
+        fi = fi + 1;
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+fun reduce_function(work: *FunctionWork, alloc: *A.Allocator) res[bool, fail.Fail] {
+    val m:   *ir.Module                         = work.module;
+    val fn:  *ir.Function                       = work.body;
+    val ral: res[loops.LoopAnalysis, fail.Fail] = loops.analyze(fn, ?m.types, alloc);
+    if (sel ral.err) { ret res[bool, fail.Fail].err{ral.err}; }
+    var la: loops.LoopAnalysis = ral.ok;
+    fin { loops.dnit(?la); }
+    if (la.loop_len == 0) { ret res[bool, fail.Fail].ok{false}; }
+
+    val n:  u32                = la.loop_len;
+    val ro: res[*u32, A.Error] = A.allocate[u32](alloc, n::usize);
+    if (sel ro.err) { ret res[bool, fail.Fail].err{fail.refused(ro.err)}; }
+    val order: *u32 = ro.ok;
+    fin { A.deallocate[u32](alloc, order, n::usize); }
+    loops.innermost_first(?la, order);
+
+    var changed: bool = false;
+    var oi:      u32  = 0;
+    for (oi < n) {
+        val lr: res[bool, fail.Fail] = reduce_loop(m, fn, ?la, order[oi], work.target, alloc);
+        if (sel lr.err) { ret lr; }
+        if (lr.ok)      { changed = true; }
+        oi = oi + 1;
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+fun reduce_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, tgt: *target.Target,
+    alloc: *A.Allocator) res[bool, fail.Fail] {
+    val lp: *loops.Loop = ?la.loops[lx];
+    if (lp.preheader == id.BLOCK_NIL || lp.latch == id.BLOCK_NIL) { ret res[bool, fail.Fail].ok{false}; }
+
+    var w: LoopWork;
+    w.m        = m;
+    w.fn       = fn;
+    w.la       = la;
+    w.lx       = lx;
+    w.tgt      = tgt;
+    w.alloc    = alloc;
+    w.pre      = lp.preheader;
+    w.header   = lp.header;
+    w.latch    = lp.latch;
+    w.ivs      = nil;
+    w.iv_len   = 0;
+    w.iv_cap   = 0;
+    w.made     = nil;
+    w.made_len = 0;
+    w.made_cap = 0;
+    fin { work_dnit(?w); }
+
+    val hblk: *ir.Block = ?fn.blocks[w.header::u32];
+    var pj:   u32       = 0;
+    for (pj < hblk.phi_count) {
+        var ind: loops.InductionVar;
+        if (loops.induction(la, fn, lx, hblk.phis[pj], ?ind)) {
+            val ra: err[fail.Fail] = add_iv(?w, ind.phi, ind.init, ind.step, ind.update);
+            if (sel ra.err) { ret res[bool, fail.Fail].err{ra.err}; }
+        }
+        pj = pj + 1;
+    }
+    if (w.iv_len == 0) { ret res[bool, fail.Fail].ok{false}; }
+
+    # the body as it stands: what the reduction appends to the latch is its own
+    var changed: bool = false;
+    var ri:      u32  = 0;
+    for (ri < la.rpo_len) {
+        val b: id.BlockId = la.rpo[ri];
+        ri = ri + 1;
+        if (!loops.loop_contains(la, lx, b)) { cnt; }
+
+        val count: u32 = fn.blocks[b::u32].instr_count;
+        var k:     u32 = 0;
+        for (k < count) {
+            val iid: id.InstructionId = fn.blocks[b::u32].instructions[k];
+            k = k + 1;
+            val kind: instruction.InstrKind = fn.instrs[iid::u32].kind;
+
+            var r: res[bool, fail.Fail] = res[bool, fail.Fail].ok{false};
+            if (kind == instruction.OP_GEP) { r = reduce_gep(?w, iid); }
+            or (kind == instruction.OP_MUL) { r = reduce_mul(?w, iid); }
+            if (sel r.err)                  { ret r; }
+            if (r.ok)                       { changed = true; }
+        }
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+fun work_dnit(w: *LoopWork) {
+    if (w.ivs != nil)  { A.deallocate[Iv](w.alloc, w.ivs, w.iv_cap::usize); }
+    if (w.made != nil) { A.deallocate[Made](w.alloc, w.made, w.made_cap::usize); }
+    w.ivs  = nil;
+    w.made = nil;
+}
+
+# an iv the reduction can step: an integer the target's arithmetic wraps at
+# its width, with an invariant step
+fun add_iv(w: *LoopWork, phi: id.InstructionId, init: value.Value, step: value.Value, update: id.InstructionId) err[fail.Fail] {
+    val ty:   ir_type.IrTypeId = w.fn.instrs[phi::u32].ty;
+    val bits: u32              = int_bits(w.m, ty);
+    if (bits == 0 || bits > 128) { ret err[fail.Fail].ok{}; }
+    if (step.ty != ty)           { ret err[fail.Fail].ok{}; }
+
+    if (w.iv_len == w.iv_cap) {
+        val cap: u32               = w.iv_cap * 2 + 4;
+        val rg:  res[*Iv, A.Error] = A.reallocate[Iv](w.alloc, w.ivs, w.iv_cap::usize, cap::usize);
+        if (sel rg.err) { ret err[fail.Fail].err{fail.refused(rg.err)}; }
+        w.ivs    = rg.ok;
+        w.iv_cap = cap;
+    }
+    w.ivs[w.iv_len] = Iv{phi: phi, ty: ty, bits: bits, init: init, step: step, loc: update};
+    w.iv_len        = w.iv_len + 1;
+    ret err[fail.Fail].ok{};
+}
+
+fun int_bits(m: *ir.Module, ty: ir_type.IrTypeId) u32 {
+    val found: opt[*ir_type.IrType] = ir_type.get(?m.types, ty);
+    if (sel found.none)                     { ret 0; }
+    if (found.some.kind != ir_type.IRT_INT) { ret 0; }
+    ret found.some.data.bits;
+}
+
+fun iv_of(w: *LoopWork, iid: id.InstructionId) u32 {
+    var i: u32 = 0;
+    for (i < w.iv_len) {
+        if (w.ivs[i].phi == iid) { ret i; }
+        i = i + 1;
+    }
+    ret loops.NONE_U32;
+}
+
+# whether `v` is `a * iv + b` for one of the loop's ivs, a constant `a` and an
+# invariant `b`, through adds, subtracts and multiplies by a constant at the
+# iv's own type; none of them can trap
+fun affine(w: *LoopWork, v: value.Value, depth: u32, out_iv: *u32, out_coef: *wide.Wide) bool {
+    if (depth > MAX_DEPTH)         { ret false; }
+    if (v.kind != value.VAL_INSTR) { ret false; }
+    val iid: id.InstructionId = v.data.instr;
+    if (iid::u32 >= w.fn.instr_len) { ret false; }
+    val ix: u32 = iv_of(w, iid);
+    if (ix != loops.NONE_U32) {
+        @out_iv   = ix;
+        @out_coef = wide.from_u64(1);
+        ret true;
+    }
+    if (loops.is_invariant(w.la, w.lx, v)) { ret false; }
+
+    val ins: *instruction.Instruction = ?w.fn.instrs[iid::u32];
+    val k:   instruction.InstrKind    = ins.kind;
+    if (k != instruction.OP_ADD && k != instruction.OP_SUB && k != instruction.OP_MUL) { ret false; }
+    if (ins.operand_count != 2)                                                        { ret false; }
+    if (opdesc.has(k, opdesc.EFF_MAY_TRAP) || effect.is_volatile(ins))                 { ret false; }
+
+    val a:    value.Value = ins.operands[0];
+    val b:    value.Value = ins.operands[1];
+    var ix2:  u32         = 0;
+    var coef: wide.Wide   = wide.zero();
+    var ok:   bool        = false;
+    if (k == instruction.OP_MUL) {
+        if (b.kind == value.VAL_CONST_INT && affine(w, a, depth + 1, ?ix2, ?coef)) {
+            coef = wide.mul(coef, value.int_of(?b));
+            ok   = true;
+        }
+        or (a.kind == value.VAL_CONST_INT && affine(w, b, depth + 1, ?ix2, ?coef)) {
+            coef = wide.mul(coef, value.int_of(?a));
+            ok   = true;
+        }
+    }
+    or {
+        if (loops.is_invariant(w.la, w.lx, b) && affine(w, a, depth + 1, ?ix2, ?coef)) {
+            ok = true;
+        }
+        or (loops.is_invariant(w.la, w.lx, a) && affine(w, b, depth + 1, ?ix2, ?coef)) {
+            if (k == instruction.OP_SUB) { coef = wide.neg(coef); }
+            ok = true;
+        }
+    }
+    if (!ok)                     { ret false; }
+    if (ins.ty != w.ivs[ix2].ty) { ret false; }
+    @out_iv   = ix2;
+    @out_coef = wide.trunc(coef, w.ivs[ix2].bits);
+    ret true;
+}
+
+fun is_const(v: value.Value, bits: u32, c: u64) bool {
+    if (v.kind != value.VAL_CONST_INT) { ret false; }
+    ret wide.eq(wide.trunc(value.int_of(?v), bits), wide.from_u64(c));
+}
+
+# the value of the affine `v` at the iteration where iv `ix` is `repl`: its
+# chain rebuilt in the preheader, the iv read as `repl` and every invariant
+# as itself, folded where both sides are constants
+fun materialize(w: *LoopWork, v: value.Value, ix: u32, repl: value.Value, out: *value.Value) err[fail.Fail] {
+    if (v.kind == value.VAL_INSTR && v.data.instr == w.ivs[ix].phi) {
+        @out = mutate.substitute_for_use(repl, v);
+        ret err[fail.Fail].ok{};
+    }
+    if (loops.is_invariant(w.la, w.lx, v)) {
+        @out = v;
+        ret err[fail.Fail].ok{};
+    }
+
+    val iid:  id.InstructionId      = v.data.instr;
+    val k:    instruction.InstrKind = w.fn.instrs[iid::u32].kind;
+    val ty:   ir_type.IrTypeId      = w.fn.instrs[iid::u32].ty;
+    val bits: u32                   = w.ivs[ix].bits;
+
+    var x:  value.Value;
+    var y:  value.Value;
+    val rx: err[fail.Fail] = materialize(w, w.fn.instrs[iid::u32].operands[0], ix, repl, ?x);
+    if (sel rx.err) { ret rx; }
+    val ry: err[fail.Fail] = materialize(w, w.fn.instrs[iid::u32].operands[1], ix, repl, ?y);
+    if (sel ry.err) { ret ry; }
+
+    if (x.kind == value.VAL_CONST_INT && y.kind == value.VAL_CONST_INT) {
+        var r: wide.Wide = wide.zero();
+        if (k == instruction.OP_ADD) { r = wide.add(value.int_of(?x), value.int_of(?y)); }
+        or (k == instruction.OP_SUB) { r = wide.sub(value.int_of(?x), value.int_of(?y)); }
+        or                           { r = wide.mul(value.int_of(?x), value.int_of(?y)); }
+        var c: value.Value = value.const_int_wide(wide.trunc(r, bits), ty);
+        c.secret = x.secret || y.secret;
+        @out     = c;
+        ret err[fail.Fail].ok{};
+    }
+    if (k == instruction.OP_ADD && is_const(y, bits, 0)) {
+        @out = x;
+        ret err[fail.Fail].ok{};
+    }
+    if (k == instruction.OP_ADD && is_const(x, bits, 0)) {
+        @out = y;
+        ret err[fail.Fail].ok{};
+    }
+    if (k == instruction.OP_SUB && is_const(y, bits, 0)) {
+        @out = x;
+        ret err[fail.Fail].ok{};
+    }
+    if (k == instruction.OP_MUL && is_const(y, bits, 1)) {
+        @out = x;
+        ret err[fail.Fail].ok{};
+    }
+    if (k == instruction.OP_MUL && is_const(x, bits, 1)) {
+        @out = y;
+        ret err[fail.Fail].ok{};
+    }
+
+    ret emit_binary(w, k, ty, x, y, iid, w.pre, out);
+}
+
+# a new instruction, not yet listed in a block, located where `origin` is; it
+# claims no fact the operation it came from carried
+fun create(w: *LoopWork, k: instruction.InstrKind, ty: ir_type.IrTypeId, ops: *value.Value, n: u32,
+    aux: ir_type.IrTypeId, origin: id.InstructionId, secret: bool, out: *value.Value) err[fail.Fail] {
+    var ni: instruction.Instruction;
+    ni.kind          = k;
+    ni.ty            = ty;
+    ni.operands      = ops;
+    ni.operand_count = n;
+    ni.operand_cap   = n;
+    ni.flags         = 0;
+    ni.aux_ty        = aux;
+    ni.loc           = w.fn.instrs[origin::u32].loc;
+    ni.secret        = secret;
+    ni.arg_ext       = ir_type.EXT_LIST_NONE;
+
+    val ri: res[id.InstructionId, fail.Fail] = ir.instruction_add(w.m, w.fn, ni);
+    if (sel ri.err) {
+        if (ops != nil) { A.deallocate[value.Value](w.m.alloc, ops, n::usize); }
+        ret err[fail.Fail].err{ri.err};
+    }
+    var v: value.Value = value.instr(ri.ok, ty);
+    v.secret = secret;
+    @out     = v;
+    ret err[fail.Fail].ok{};
+}
+
+# a listed instruction's place in the loop analysis, and the inlined scope of
+# `origin`, so the line table and the inlined scopes read it as that source
+fun settle(w: *LoopWork, nid: id.InstructionId, b: id.BlockId, origin: id.InstructionId) err[fail.Fail] {
+    val rs: err[fail.Fail] = loops.set_instr_block(w.la, nid, b);
+    if (sel rs.err) { ret rs; }
+    ret ir.clone_instr_inline_site(w.fn, w.fn, origin, nid);
+}
+
+# a new instruction appended to block `b`
+fun emit(w: *LoopWork, k: instruction.InstrKind, ty: ir_type.IrTypeId, ops: *value.Value, n: u32,
+    aux: ir_type.IrTypeId, origin: id.InstructionId, secret: bool, b: id.BlockId, out: *value.Value) err[fail.Fail] {
+    var v:  value.Value;
+    val rc: err[fail.Fail] = create(w, k, ty, ops, n, aux, origin, secret, ?v);
+    if (sel rc.err) { ret rc; }
+    val placed: err[fail.Fail] = ir.block_append_instr(w.m, ?w.fn.blocks[b::u32], v.data.instr);
+    if (sel placed.err) { ret placed; }
+    @out = v;
+    ret settle(w, v.data.instr, b, origin);
+}
+
+fun emit_binary(w: *LoopWork, k: instruction.InstrKind, ty: ir_type.IrTypeId, x: value.Value, y: value.Value,
+    origin: id.InstructionId, b: id.BlockId, out: *value.Value) err[fail.Fail] {
+    val ra: res[*value.Value, A.Error] = A.allocate[value.Value](w.m.alloc, 2);
+    if (sel ra.err) { ret err[fail.Fail].err{fail.refused(ra.err)}; }
+    val ops: *value.Value = ra.ok;
+    ops[0] = x;
+    ops[1] = y;
+    ret emit(w, k, ty, ops, 2, ir_type.IRT_NIL, origin, x.secret || y.secret, b, out);
+}
+
+# the address of `iid` up to its reduced level `k`, indexed there by `v`
+# instead: `gep base, v` or `gep base, 0, v`, formed in the preheader
+fun emit_head(w: *LoopWork, iid: id.InstructionId, k: u32, v: value.Value, out: *value.Value) err[fail.Fail] {
+    val ra: res[*value.Value, A.Error] = A.allocate[value.Value](w.m.alloc, (k + 1)::usize);
+    if (sel ra.err) { ret err[fail.Fail].err{fail.refused(ra.err)}; }
+    val ops: *value.Value = ra.ok;
+    var j:   u32          = 0;
+    for (j < k) {
+        ops[j] = w.fn.instrs[iid::u32].operands[j];
+        j      = j + 1;
+    }
+    ops[k] = v;
+    ret emit(w, instruction.OP_GEP, w.fn.instrs[iid::u32].ty, ops, k + 1, w.fn.instrs[iid::u32].aux_ty, iid,
+        w.fn.instrs[iid::u32].secret, w.pre, out);
+}
+
+# what iv `ix` scaled by `coef` adds each iteration, formed in the preheader
+fun scaled_step(w: *LoopWork, ix: u32, coef: wide.Wide, out: *value.Value) err[fail.Fail] {
+    val s:  value.Value      = w.ivs[ix].step;
+    val ty: ir_type.IrTypeId = w.ivs[ix].ty;
+    if (s.kind == value.VAL_CONST_INT) {
+        var c: value.Value = value.const_int_wide(wide.trunc(wide.mul(value.int_of(?s), coef), w.ivs[ix].bits), ty);
+        c.secret = s.secret;
+        @out     = c;
+        ret err[fail.Fail].ok{};
+    }
+    if (wide.eq(coef, wide.from_u64(1))) {
+        @out = s;
+        ret err[fail.Fail].ok{};
+    }
+    ret emit_binary(w, instruction.OP_MUL, ty, s, value.const_int_wide(coef, ty), w.ivs[ix].loc, w.pre, out);
+}
+
+# a header phi entered as `init` and stepped by `step` on the latch edge, a
+# pointer stepped by elements of `aux` or an integer when `aux` is nil; it
+# takes its edges in the order the iv's own phi lists them. the phi and its
+# step are made unlisted and then listed together: a refusal between the two
+# listings takes the step back out, so no block lists one without the other
+fun make_iv(w: *LoopWork, ix: u32, ty: ir_type.IrTypeId, secret: bool, init: value.Value, step: value.Value,
+    aux: ir_type.IrTypeId, out: *value.Value) err[fail.Fail] {
+    var p:  value.Value;
+    val rp: err[fail.Fail] = create(w, instruction.OP_PHI, ty, nil, 0, ir_type.IRT_NIL, w.ivs[ix].phi, secret, ?p);
+    if (sel rp.err) { ret rp; }
+
+    val ra: res[*value.Value, A.Error] = A.allocate[value.Value](w.m.alloc, 2);
+    if (sel ra.err) { ret err[fail.Fail].err{fail.refused(ra.err)}; }
+    val ops: *value.Value = ra.ok;
+    ops[0] = p;
+    ops[1] = step;
+    var k: instruction.InstrKind = instruction.OP_ADD;
+    if (aux != ir_type.IRT_NIL) { k = instruction.OP_GEP; }
+    var next: value.Value;
+    val rn:   err[fail.Fail] = create(w, k, ty, ops, 2, aux, w.ivs[ix].loc, secret, ?next);
+    if (sel rn.err) { ret rn; }
+
+    val n:  u32                             = w.fn.instrs[w.ivs[ix].phi::u32].operand_count;
+    val rb: res[ir.OperandArray, fail.Fail] = ir.operands_alloc(w.m, n);
+    if (sel rb.err) { ret err[fail.Fail].err{rb.err}; }
+    val arr: ir.OperandArray = rb.ok;
+    var j:   u32             = 0;
+    for (j + 1 < n) {
+        val edge: value.Value = w.fn.instrs[w.ivs[ix].phi::u32].operands[j];
+        arr.ops[j] = edge;
+        if (ir.block_target(edge) == w.pre) { arr.ops[j + 1] = init; }
+        or                                  { arr.ops[j + 1] = next; }
+        j = j + 2;
+    }
+    ir.instr_replace_operands(w.m, ?w.fn.instrs[p.data.instr::u32], arr);
+
+    val latch: *ir.Block      = ?w.fn.blocks[w.latch::u32];
+    val rl:    err[fail.Fail] = ir.block_append_instr(w.m, latch, next.data.instr);
+    if (sel rl.err) { ret rl; }
+    val rh: err[fail.Fail] = ir.block_append_phi(w.m, ?w.fn.blocks[w.header::u32], p.data.instr);
+    if (sel rh.err) {
+        latch.instr_count = latch.instr_count - 1;
+        ret rh;
+    }
+
+    @out = p;
+    val sp: err[fail.Fail] = settle(w, p.data.instr, w.header, w.ivs[ix].phi);
+    if (sel sp.err) { ret sp; }
+    ret settle(w, next.data.instr, w.latch, w.ivs[ix].loc);
+}
+
+# an element address in either shape the vectorizer reads: `gep base, i, ...`
+# scaled by the gep's type, or `gep base, 0, i, ...` into an array, scaled by
+# its element. `k` is the index's operand and `elem` what it scales by
+fun reduce_gep(w: *LoopWork, iid: id.InstructionId) res[bool, fail.Fail] {
+    if (!w.tgt.model.flat_addressing) { ret res[bool, fail.Fail].ok{false}; }
+    val g: *instruction.Instruction = ?w.fn.instrs[iid::u32];
+    if (g.operand_count < 2 || g.aux_ty == ir_type.IRT_NIL || effect.is_volatile(g)) { ret res[bool, fail.Fail].ok{false}; }
+    if (!loops.is_invariant(w.la, w.lx, g.operands[0]))                              { ret res[bool, fail.Fail].ok{false}; }
+
+    var k:    u32              = 1;
+    var elem: ir_type.IrTypeId = g.aux_ty;
+    var ix:   u32              = 0;
+    var coef: wide.Wide        = wide.zero();
+    if (!affine(w, g.operands[1], 0, ?ix, ?coef)) {
+        if (g.operand_count < 3)                         { ret res[bool, fail.Fail].ok{false}; }
+        if (g.operands[1].kind != value.VAL_CONST_INT)   { ret res[bool, fail.Fail].ok{false}; }
+        if (!wide.is_zero(value.int_of(?g.operands[1]))) { ret res[bool, fail.Fail].ok{false}; }
+        val at: opt[*ir_type.IrType] = ir_type.get(?w.m.types, g.aux_ty);
+        if (sel at.none)                              { ret res[bool, fail.Fail].ok{false}; }
+        if (at.some.kind != ir_type.IRT_ARRAY)        { ret res[bool, fail.Fail].ok{false}; }
+        if (!affine(w, g.operands[2], 0, ?ix, ?coef)) { ret res[bool, fail.Fail].ok{false}; }
+        k    = 2;
+        elem = at.some.data.array_.element;
+    }
+    # the address is computed at the index width, so a narrower iv would wrap
+    # where the address does not
+    if (w.ivs[ix].bits != w.tgt.model.index_width) { ret res[bool, fail.Fail].ok{false}; }
+    if (wide.is_zero(coef))                        { ret res[bool, fail.Fail].ok{false}; }
+
+    val size: u32 = ir_type.byte_size_for_machine(?w.m.types, elem, resolved.layout_machine(w.tgt));
+    if (size == 0) { ret res[bool, fail.Fail].ok{false}; }
+
+    val idx:    value.Value = g.operands[k];
+    val unit:   bool        = wide.eq(coef, wide.from_u64(1));
+    val folded: bool        = w.tgt.model.indexed_memory && (size == 1 || size == 2 || size == 4 || size == 8);
+    if (unit && folded) {
+        if (idx.kind == value.VAL_INSTR && idx.data.instr == w.ivs[ix].phi) { ret res[bool, fail.Fail].ok{false}; }
+        ret reassociate_gep(w, iid, ix, k, elem);
+    }
+    ret stepped_gep(w, iid, ix, coef, k, elem);
+}
+
+# the operands `iid` keeps past its reduced level, behind a new base and
+# index, as one array made before anything changes
+fun tail_ops(w: *LoopWork, iid: id.InstructionId, k: u32) res[ir.OperandArray, fail.Fail] {
+    val n:  u32                             = w.fn.instrs[iid::u32].operand_count - (k - 1);
+    val rb: res[ir.OperandArray, fail.Fail] = ir.operands_alloc(w.m, n);
+    if (sel rb.err) { ret rb; }
+    var j: u32 = 2;
+    for (j < n) {
+        rb.ok.ops[j] = w.fn.instrs[iid::u32].operands[j + k - 1];
+        j            = j + 1;
+    }
+    ret rb;
+}
+
+fun rebase(w: *LoopWork, iid: id.InstructionId, arr: ir.OperandArray, base: value.Value, index: value.Value, elem: ir_type.IrTypeId) {
+    arr.ops[0] = base;
+    arr.ops[1] = index;
+    ir.instr_replace_operands(w.m, ?w.fn.instrs[iid::u32], arr);
+    w.fn.instrs[iid::u32].aux_ty = elem;
+}
+
+fun drop_ops(w: *LoopWork, arr: ir.OperandArray) {
+    if (arr.ops != nil) { A.deallocate[value.Value](w.m.alloc, arr.ops, arr.len::usize); }
+}
+
+# `gep base, iv + b` is `gep (gep base, b), iv`: the invariant part of the
+# address goes to the preheader and the access keeps the iv as its index
+fun reassociate_gep(w: *LoopWork, iid: id.InstructionId, ix: u32, k: u32, elem: ir_type.IrTypeId) res[bool, fail.Fail] {
+    val ty:  ir_type.IrTypeId                = w.ivs[ix].ty;
+    val idx: value.Value                     = w.fn.instrs[iid::u32].operands[k];
+    val rt:  res[ir.OperandArray, fail.Fail] = tail_ops(w, iid, k);
+    if (sel rt.err) { ret res[bool, fail.Fail].err{rt.err}; }
+    val arr: ir.OperandArray = rt.ok;
+
+    val from: value.Value      = w.fn.instrs[iid::u32].operands[0];
+    val pty:  ir_type.IrTypeId = w.fn.instrs[iid::u32].ty;
+    var base: value.Value;
+    if (!made_like(w, MADE_BASE, from, elem, pty, idx, ?base)) {
+        var b:  value.Value;
+        val rb: err[fail.Fail] = materialize(w, idx, ix, value.const_int(0, ty), ?b);
+        if (sel rb.err) {
+            drop_ops(w, arr);
+            ret res[bool, fail.Fail].err{rb.err};
+        }
+        val rg: err[fail.Fail] = emit_head(w, iid, k, b, ?base);
+        if (sel rg.err) {
+            drop_ops(w, arr);
+            ret res[bool, fail.Fail].err{rg.err};
+        }
+        val rm: err[fail.Fail] = note_made(w, Made{shape: MADE_BASE, base: from, elem: elem, ty: pty, index: idx, to: base});
+        if (sel rm.err) {
+            drop_ops(w, arr);
+            ret res[bool, fail.Fail].err{rm.err};
+        }
+    }
+
+    var iv: value.Value = value.instr(w.ivs[ix].phi, ty);
+    iv.secret = idx.secret || w.fn.instrs[w.ivs[ix].phi::u32].secret;
+    rebase(w, iid, arr, base, iv, elem);
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# `gep base, a * iv + b` is a pointer entered at the iv's first value and
+# stepped by `a * step` elements on the latch; the access reads the pointer
+fun stepped_gep(w: *LoopWork, iid: id.InstructionId, ix: u32, coef: wide.Wide, k: u32, elem: ir_type.IrTypeId) res[bool, fail.Fail] {
+    val pty:    ir_type.IrTypeId                = w.fn.instrs[iid::u32].ty;
+    val secret: bool                            = w.fn.instrs[iid::u32].secret;
+    val idx:    value.Value                     = w.fn.instrs[iid::u32].operands[k];
+    val rt:     res[ir.OperandArray, fail.Fail] = tail_ops(w, iid, k);
+    if (sel rt.err) { ret res[bool, fail.Fail].err{rt.err}; }
+    val arr: ir.OperandArray = rt.ok;
+
+    val from: value.Value = w.fn.instrs[iid::u32].operands[0];
+    var p:    value.Value;
+    if (!made_like(w, MADE_STEP, from, elem, pty, idx, ?p)) {
+        var first: value.Value;
+        val rf:    err[fail.Fail] = materialize(w, idx, ix, w.ivs[ix].init, ?first);
+        if (sel rf.err) {
+            drop_ops(w, arr);
+            ret res[bool, fail.Fail].err{rf.err};
+        }
+        # a first index of zero is the base itself in either shape
+        var start: value.Value = w.fn.instrs[iid::u32].operands[0];
+        if (!is_const(first, w.ivs[ix].bits, 0)) {
+            val rs: err[fail.Fail] = emit_head(w, iid, k, first, ?start);
+            if (sel rs.err) {
+                drop_ops(w, arr);
+                ret res[bool, fail.Fail].err{rs.err};
+            }
+        }
+        var step: value.Value;
+        val rp:   err[fail.Fail] = scaled_step(w, ix, coef, ?step);
+        if (sel rp.err) {
+            drop_ops(w, arr);
+            ret res[bool, fail.Fail].err{rp.err};
+        }
+        val rm: err[fail.Fail] = make_iv(w, ix, pty, secret, start, step, elem, ?p);
+        if (sel rm.err) {
+            drop_ops(w, arr);
+            ret res[bool, fail.Fail].err{rm.err};
+        }
+        val rn: err[fail.Fail] = note_made(w, Made{shape: MADE_STEP, base: from, elem: elem, ty: pty, index: idx, to: p});
+        if (sel rn.err) {
+            drop_ops(w, arr);
+            ret res[bool, fail.Fail].err{rn.err};
+        }
+    }
+
+    # the access is the pointer itself; a use past the loop still reads the
+    # element of the last iteration through it
+    rebase(w, iid, arr, p, value.const_int(0, idx.ty), elem);
+    if (arr.len == 2) { replace_in_loop(w, iid, p); }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# `a * iv + b` behind a multiply by a constant that is not a shift becomes an
+# iv of its own; one read past the loop keeps the multiply, so it is left
+fun reduce_mul(w: *LoopWork, iid: id.InstructionId) res[bool, fail.Fail] {
+    val mi: *instruction.Instruction = ?w.fn.instrs[iid::u32];
+    if (mi.operand_count != 2) { ret res[bool, fail.Fail].ok{false}; }
+    var c: value.Value = mi.operands[1];
+    if (c.kind != value.VAL_CONST_INT) { c = mi.operands[0]; }
+    if (c.kind != value.VAL_CONST_INT) { ret res[bool, fail.Fail].ok{false}; }
+
+    var ix:   u32       = 0;
+    var coef: wide.Wide = wide.zero();
+    if (!affine(w, value.instr(iid, mi.ty), 0, ?ix, ?coef)) { ret res[bool, fail.Fail].ok{false}; }
+    val cw: wide.Wide = wide.trunc(value.int_of(?c), w.ivs[ix].bits);
+    if (wide.is_zero(cw) || wide.is_pow2(cw)) { ret res[bool, fail.Fail].ok{false}; }
+    if (used_past_loop(w, iid))               { ret res[bool, fail.Fail].ok{false}; }
+
+    var same: value.Value;
+    if (made_like(w, MADE_MUL, value.const_null(ir_type.IRT_NIL), ir_type.IRT_NIL, mi.ty, value.instr(iid, mi.ty), ?same)) {
+        replace_in_loop(w, iid, same);
+        ret res[bool, fail.Fail].ok{true};
+    }
+
+    val ty:     ir_type.IrTypeId = mi.ty;
+    val secret: bool             = mi.secret;
+    var first:  value.Value;
+    val rf:     err[fail.Fail]   = materialize(w, value.instr(iid, ty), ix, w.ivs[ix].init, ?first);
+    if (sel rf.err) { ret res[bool, fail.Fail].err{rf.err}; }
+    var step: value.Value;
+    val rt:   err[fail.Fail] = scaled_step(w, ix, coef, ?step);
+    if (sel rt.err) { ret res[bool, fail.Fail].err{rt.err}; }
+
+    var q:  value.Value;
+    val rq: err[fail.Fail] = make_iv(w, ix, ty, secret, first, step, ir_type.IRT_NIL, ?q);
+    if (sel rq.err) { ret res[bool, fail.Fail].err{rq.err}; }
+
+    val rm: err[fail.Fail] = note_made(w, Made{shape: MADE_MUL, base: value.const_null(ir_type.IRT_NIL),
+        elem: ir_type.IRT_NIL, ty: ty, index: value.instr(iid, ty), to: q});
+    if (sel rm.err) { ret res[bool, fail.Fail].err{rm.err}; }
+    val ra: err[fail.Fail] = add_iv(w, q.data.instr, first, step, w.ivs[ix].loc);
+    if (sel ra.err) { ret res[bool, fail.Fail].err{ra.err}; }
+    replace_in_loop(w, iid, q);
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# whether `a` and `b` compute one value: the same operand, or the same
+# arithmetic over operands that do
+fun same_value(w: *LoopWork, a: value.Value, b: value.Value, depth: u32) bool {
+    if (dep.equal(a, b))                                                            { ret true; }
+    if (depth > MAX_DEPTH)                                                          { ret false; }
+    if (a.kind != value.VAL_INSTR || b.kind != value.VAL_INSTR)                     { ret false; }
+    if (a.data.instr::u32 >= w.fn.instr_len || b.data.instr::u32 >= w.fn.instr_len) { ret false; }
+    val x: *instruction.Instruction = ?w.fn.instrs[a.data.instr::u32];
+    val y: *instruction.Instruction = ?w.fn.instrs[b.data.instr::u32];
+    if (x.kind != y.kind || x.ty != y.ty || x.operand_count != 2 || y.operand_count != 2)             { ret false; }
+    if (x.kind != instruction.OP_ADD && x.kind != instruction.OP_SUB && x.kind != instruction.OP_MUL) { ret false; }
+    ret same_value(w, x.operands[0], y.operands[0], depth + 1) && same_value(w, x.operands[1], y.operands[1], depth + 1);
+}
+
+fun made_like(w: *LoopWork, shape: u8, base: value.Value, elem: ir_type.IrTypeId, ty: ir_type.IrTypeId,
+    index: value.Value, out: *value.Value) bool {
+    var i: u32 = 0;
+    for (i < w.made_len) {
+        val d: *Made = ?w.made[i];
+        i = i + 1;
+        if (d.shape != shape || d.elem != elem || d.ty != ty) { cnt; }
+        if (shape != MADE_MUL && !dep.equal(d.base, base))    { cnt; }
+        if (!same_value(w, d.index, index, 0))                { cnt; }
+        @out = d.to;
+        ret true;
+    }
+    ret false;
+}
+
+fun note_made(w: *LoopWork, d: Made) err[fail.Fail] {
+    if (w.made_len == w.made_cap) {
+        val cap: u32                 = w.made_cap * 2 + 4;
+        val rg:  res[*Made, A.Error] = A.reallocate[Made](w.alloc, w.made, w.made_cap::usize, cap::usize);
+        if (sel rg.err) { ret err[fail.Fail].err{fail.refused(rg.err)}; }
+        w.made     = rg.ok;
+        w.made_cap = cap;
+    }
+    w.made[w.made_len] = d;
+    w.made_len         = w.made_len + 1;
+    ret err[fail.Fail].ok{};
+}
+
+# whether a block outside the loop reads `iid` as a value. a debug binding is
+# not a read, so -g never moves the decision
+fun used_past_loop(w: *LoopWork, iid: id.InstructionId) bool {
+    var b: u32 = 0;
+    for (b < w.fn.block_count) {
+        if (loops.loop_contains(w.la, w.lx, b::id.BlockId)) {
+            b = b + 1;
+            cnt;
+        }
+        val blk: *ir.Block = ?w.fn.blocks[b];
+        var k:   u32       = 0;
+        for (k < blk.phi_count) {
+            if (reads(w.fn, blk.phis[k], iid, false)) { ret true; }
+            k = k + 1;
+        }
+        k = 0;
+        for (k < blk.instr_count) {
+            if (reads(w.fn, blk.instructions[k], iid, false)) { ret true; }
+            k = k + 1;
+        }
+        if (blk.terminator != id.INSTR_NIL && reads(w.fn, blk.terminator, iid, false)) { ret true; }
+        b = b + 1;
+    }
+    ret false;
+}
+
+fun reads(fn: *ir.Function, user: id.InstructionId, iid: id.InstructionId, debug: bool) bool {
+    if (user::u32 >= fn.instr_len) { ret false; }
+    val ins: *instruction.Instruction = ?fn.instrs[user::u32];
+    var o:   u32                      = 0;
+    for (o < ins.operand_count) {
+        val v: value.Value = ins.operands[o];
+        if (v.kind == value.VAL_INSTR && v.data.instr == iid && operand_reads(ins.kind, o, debug)) { ret true; }
+        o = o + 1;
+    }
+    ret false;
+}
+
+fun operand_reads(k: instruction.InstrKind, o: u32, debug: bool) bool {
+    val role: opdesc.OperandRole = opdesc.operand_role(k, o);
+    if (role == opdesc.ROLE_CFG_EDGE || role == opdesc.ROLE_PHI_EDGE) { ret false; }
+    if (role == opdesc.ROLE_DEBUG)                                    { ret debug; }
+    ret true;
+}
+
+# every read of `iid` inside the loop, debug bindings included, reads `to`:
+# the two are one value on every iteration, so a variable bound to it keeps
+# its location
+fun replace_in_loop(w: *LoopWork, iid: id.InstructionId, to: value.Value) {
+    val lp: *loops.Loop = ?w.la.loops[w.lx];
+    var bi: u32         = 0;
+    for (bi < lp.body_len) {
+        val blk: *ir.Block = ?w.fn.blocks[lp.body[bi]::u32];
+        bi = bi + 1;
+        var k: u32 = 0;
+        for (k < blk.phi_count) {
+            replace_operands(w.fn, blk.phis[k], iid, to);
+            k = k + 1;
+        }
+        k = 0;
+        for (k < blk.instr_count) {
+            replace_operands(w.fn, blk.instructions[k], iid, to);
+            k = k + 1;
+        }
+        if (blk.terminator != id.INSTR_NIL) { replace_operands(w.fn, blk.terminator, iid, to); }
+    }
+}
+
+fun replace_operands(fn: *ir.Function, user: id.InstructionId, iid: id.InstructionId, to: value.Value) {
+    if (user == iid || user::u32 >= fn.instr_len) { ret; }
+    val ins: *instruction.Instruction = ?fn.instrs[user::u32];
+    var o:   u32                      = 0;
+    for (o < ins.operand_count) {
+        val v: value.Value = ins.operands[o];
+        if (v.kind == value.VAL_INSTR && v.data.instr == iid && operand_reads(ins.kind, o, true)) {
+            ins.operands[o] = mutate.substitute_for_use(to, v);
+        }
+        o = o + 1;
+    }
+}
+
+use mach.lang.intern;
+use mach.lang.me.ir.builder;
+use mach.lang.me.ir.equal;
+use me_testing:     mach.lang.me.testing;
+use target_testing: mach.lang.target.testing;
+use std.allocator.page;
+
+# a loop over records of 24 bytes read through `gep p1, i`, and `i * 96` added
+# to each and stored through `gep p2, 0, i` into an array of words: the record
+# address is a stepped pointer, the product an iv of its own, and the word
+# address, whose scale the access folds, keeps its index
+#[testing]
+fun probe_build(a: *me_testing.Attempt, m: *ir.Module) i32 {
+    val ri: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel ri.err) { ret 1; }
+    val i64t: ir_type.IrTypeId                 = ri.ok;
+    val rp:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_ptr(?m.types);
+    if (sel rp.err) { ret 1; }
+    val ptrt: ir_type.IrTypeId                 = rp.ok;
+    val rr:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_array(?m.types, i64t, 3);
+    if (sel rr.err) { ret 1; }
+    val rect: ir_type.IrTypeId                 = rr.ok;
+    val rw:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_array(?m.types, i64t, 16);
+    if (sel rw.err) { ret 1; }
+    val wordst: ir_type.IrTypeId    = rw.ok;
+    val rf:     res[u32, fail.Fail] = ir.function_add(m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rf.err) { ret 2; }
+    var bld: builder.Builder = builder.init(m);
+    builder.set_function(?bld, ?m.functions[rf.ok]);
+
+    val re: res[id.BlockId, fail.Fail] = builder.new_block(?bld);
+    val rh: res[id.BlockId, fail.Fail] = builder.new_block(?bld);
+    val rb: res[id.BlockId, fail.Fail] = builder.new_block(?bld);
+    val rx: res[id.BlockId, fail.Fail] = builder.new_block(?bld);
+    if (sel re.err) { ret 3; }
+    if (sel rh.err) { ret 3; }
+    if (sel rb.err) { ret 3; }
+    if (sel rx.err) { ret 3; }
+    builder.set_block(?bld, re.ok);
+    val r_1: err[fail.Fail] = builder.emit_br(?bld, rh.ok);
+    if (sel r_1.err) { ret 4; }
+
+    builder.set_block(?bld, rh.ok);
+    val rphi: res[value.Value, fail.Fail] = builder.emit_phi(?bld, i64t);
+    if (sel rphi.err) { ret 5; }
+    val iv: value.Value                 = rphi.ok;
+    val rc: res[value.Value, fail.Fail] = builder.emit_cmp_lt_s(?bld, iv, value.param(0, i64t));
+    if (sel rc.err) { ret 5; }
+    val r_2: err[fail.Fail] = builder.emit_cbr(?bld, rc.ok, rb.ok, rx.ok);
+    if (sel r_2.err) { ret 5; }
+    builder.set_block(?bld, rx.ok);
+    val r_3: err[fail.Fail] = builder.emit_ret_void(?bld);
+    if (sel r_3.err) { ret 6; }
+
+    builder.set_block(?bld, rb.ok);
+    var one: [1]value.Value;
+    one[0] = iv;
+    val rg: res[value.Value, fail.Fail] = builder.emit_gep(?bld, value.param(1, ptrt), rect, ?one[0], 1);
+    if (sel rg.err) { ret 7; }
+    val rl: res[value.Value, fail.Fail] = builder.emit_load(?bld, rg.ok, i64t);
+    if (sel rl.err) { ret 7; }
+    val rk: res[value.Value, fail.Fail] = builder.emit_mul(?bld, iv, value.const_int(96, i64t));
+    if (sel rk.err) { ret 8; }
+    val rs: res[value.Value, fail.Fail] = builder.emit_add(?bld, rk.ok, rl.ok);
+    if (sel rs.err) { ret 8; }
+    var two: [2]value.Value;
+    two[0] = value.const_int(0, i64t);
+    two[1] = iv;
+    val rq: res[value.Value, fail.Fail] = builder.emit_gep(?bld, value.param(2, ptrt), wordst, ?two[0], 2);
+    if (sel rq.err) { ret 9; }
+    val r_4: err[fail.Fail] = builder.emit_store(?bld, rs.ok, rq.ok);
+    if (sel r_4.err) { ret 9; }
+    val ru: res[value.Value, fail.Fail] = builder.emit_add(?bld, iv, value.const_int(1, i64t));
+    if (sel ru.err) { ret 10; }
+    val r_5: err[fail.Fail] = builder.emit_br(?bld, rh.ok);
+    if (sel r_5.err) { ret 10; }
+    val r_6: err[fail.Fail] = builder.phi_add_incoming(?bld, iv, re.ok, value.const_int(0, i64t));
+    if (sel r_6.err) { ret 10; }
+    val r_7: err[fail.Fail] = builder.phi_add_incoming(?bld, iv, rb.ok, ru.ok);
+    if (sel r_7.err) { ret 10; }
+    ret 0;
+}
+
+#[testing]
+fun is_header_phi(fn: *ir.Function, v: value.Value, ty: ir_type.IrTypeId) bool {
+    if (v.kind != value.VAL_INSTR) { ret false; }
+    val blk: *ir.Block = ?fn.blocks[1];
+    var j:   u32       = 0;
+    for (j < blk.phi_count) {
+        if (blk.phis[j] == v.data.instr) { ret fn.instrs[v.data.instr::u32].ty == ty; }
+        j = j + 1;
+    }
+    ret false;
+}
+
+#[testing]
+fun mk_target(reg: *target.TargetRegistry, o: *resolved.Target) i32 {
+    @reg = target.registry_init();
+    val r_8: err[fail.Fail] = target.register_all(reg, target_testing.debug_descriptor);
+    if (sel r_8.err) { ret 1; }
+    val tr: res[resolved.Target, fail.Fail] = target.select(reg, "x86_64", "linux", "sysv64");
+    if (sel tr.err) { ret 1; }
+    @o = tr.ok;
+    ret 0;
+}
+
+test run__steps_a_record_address_and_a_product_with_the_iv {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var reg: target.TargetRegistry;
+    fin { target.registry_dnit(?reg); }
+    var tgt: resolved.Target;
+    if (mk_target(?reg, ?tgt) != 0) { ret 1; }
+    val rm: res[ir.Module, fail.Fail] = ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 1; }
+    var m: ir.Module = rm.ok;
+    fin { ir.dnit(?m); }
+    if (probe_build(nil, ?m) != 0) { ret 2; }
+
+    val rr: res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel rr.err)                     { ret 3; }
+    if (!rr.ok)                         { ret 4; }
+    if (!me_testing.verifies(?m, true)) { ret 5; }
+
+    val fn:   *ir.Function     = ?m.functions[0];
+    val body: *ir.Block        = ?fn.blocks[2];
+    val i64t: ir_type.IrTypeId = fn.instrs[fn.blocks[1].phis[0]::u32].ty;
+    var k:    u32              = 0;
+    var seen: u32              = 0;
+    for (k < body.instr_count) {
+        val ins: *instruction.Instruction = ?fn.instrs[body.instructions[k]::u32];
+        k = k + 1;
+        if (ins.kind == instruction.OP_LOAD) {
+            if (!is_header_phi(fn, ins.operands[0], ins.operands[0].ty)) { ret 6; }
+            seen = seen + 1;
+        }
+        if (ins.kind == instruction.OP_STORE) {
+            val sum:  *instruction.Instruction = ?fn.instrs[ins.operands[0].data.instr::u32];
+            val addr: *instruction.Instruction = ?fn.instrs[ins.operands[1].data.instr::u32];
+            if (!is_header_phi(fn, sum.operands[0], i64t))                             { ret 7; }
+            if (!dep.equal(addr.operands[2], value.instr(fn.blocks[1].phis[0], i64t))) { ret 8; }
+            seen = seen + 1;
+        }
+    }
+    if (seen != 2) { ret 10; }
+    ret 0;
+}
+
+#[testing]
+fun probe_transform(a: *me_testing.Attempt, m: *ir.Module, workspace: *scratch.Workspace) err[fail.Fail] {
+    val r: res[bool, fail.Fail] = run_in(m, a.target, workspace);
+    if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+    ret err[fail.Fail].ok{};
+}
+
+# a refusal leaves the input, or some values reduced and the rest as they
+# were, every new iv listed with its step and the function verifying
+#[testing]
+fun probe_contract(a: *me_testing.Attempt, m: *ir.Module, ordinal: usize) bool {
+    if (equal.content_equal(m, a.control)) { ret true; }
+    ret me_testing.listed(m) >= me_testing.listed(a.control) && me_testing.verifies(m, true);
+}
+
+test run_in__refusal_at_every_ordinal_leaves_the_input_or_a_consistent_partial_reduction {
+    var owner: A.Allocator;
+    val r_9:   err[A.Error] = page.make(?owner);
+    if (sel r_9.err) { ret 1; }
+    var reg: target.TargetRegistry;
+    fin { target.registry_dnit(?reg); }
+    var tgt: resolved.Target;
+    if (mk_target(?reg, ?tgt) != 0) { ret 2; }
+    var a: me_testing.Attempt = me_testing.Attempt{build: probe_build, transform: probe_transform,
+        contract: probe_contract, target: ?tgt, control: nil, context: (?owner)::ptr};
+    var control: ir.Module;
+    if (me_testing.control(?a, ?owner, ?control) != 0) { ret 3; }
+    fin { ir.dnit(?control); }
+    ret me_testing.walk(?a);
+}
