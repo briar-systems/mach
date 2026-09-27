@@ -486,16 +486,23 @@ by its own.
 
 | shape | x86_64 (SSE2) | aarch64 (NEON) | riscv64 (no vector unit) |
 |---|---|---|---|
-| uniform `<<`, `>>` on 16-, 32- and 64-bit lanes | packed `psll*` / `psrl*` / `psra*` | scalar expansion | scalar expansion |
-| uniform arithmetic `>>` on 64-bit lanes | scalar expansion (`psraq` is AVX-512VL) | scalar expansion | scalar expansion |
-| uniform `<<`, `>>` on 8-bit lanes | packed through the 16-bit shifts, each byte shifted with its neighbour cleared | scalar expansion | scalar expansion |
-| per-lane count on 32- and 64-bit lanes | packed `vpsllv*` / `vpsrlv*` / `vpsravd` under `avx2`, else scalar expansion (the 64-bit arithmetic `vpsravq` is AVX-512VL) | scalar expansion | scalar expansion |
-| per-lane count on 8- and 16-bit lanes | scalar expansion | scalar expansion | scalar expansion |
+| uniform `<<`, `>>` on 16-, 32- and 64-bit lanes | packed `psll*` / `psrl*` / `psra*` | packed `shl` / `ushr` / `sshr` by a constant, `dup` then `ushl` / `sshl` by a register | scalar expansion |
+| uniform arithmetic `>>` on 64-bit lanes | scalar expansion (`psraq` is AVX-512VL) | packed, as above | scalar expansion |
+| uniform `<<`, `>>` on 8-bit lanes | packed through the 16-bit shifts, each byte shifted with its neighbour cleared | packed, as above | scalar expansion |
+| per-lane count on 32- and 64-bit lanes | packed `vpsllv*` / `vpsrlv*` / `vpsravd` under `avx2`, else scalar expansion (the 64-bit arithmetic `vpsravq` is AVX-512VL) | packed `ushl` / `sshl` | scalar expansion |
+| per-lane count on 8- and 16-bit lanes | scalar expansion | packed `ushl` / `sshl` | scalar expansion |
 
-The packed instructions saturate a count at or above the lane width on their
-own, so they need none of the scalar shift's range test. SPIR-V leaves an
-`OpShift*` by the component width or more undefined, so it shifts lane by lane
-through the scalar shift as well.
+The x86_64 packed instructions saturate a count at or above the lane width on
+their own, so they need none of the scalar shift's range test. aarch64's
+`ushl` and `sshl` read only a count's low byte, as a signed amount that shifts
+right when negative, so a count is first clamped with `uqshl` and `ushr` to at
+most 127, which every lane width saturates at, and negated for a right shift.
+A constant count at or above the width is the fill itself. SPIR-V leaves an
+`OpShift*` by the component width or more undefined, so it packs the shift
+beside an `OpULessThan` against the width and an `OpSelect` of 0, or of the
+shift by the width less one for an arithmetic `>>`, where the count is out of
+range. A uniform count is splatted by `OpCompositeConstruct`, since `OpShift*`
+takes a count per component.
 
 Operators never widen implicitly, so a widening multiply is spelled as two lane
 casts and a multiply: `a::i32x4 * b::i32x4` for `a, b: i16x4`. When both operands
