@@ -781,6 +781,12 @@ pub val LOWER_VEC_CONCAT:  LowerRoute = 21
 pub val LOWER_SELECT:      LowerRoute = 22
 ```
 
+## val LOWER_CONST
+
+```mach
+pub val LOWER_CONST:       LowerRoute = 23
+```
+
 ## val OP_MAX_FIXED_OPERANDS
 
 ```mach
@@ -796,7 +802,7 @@ pub rec IrOpDescriptor;
 ## val IR_OP_DESCRIPTOR_COUNT
 
 ```mach
-pub val IR_OP_DESCRIPTOR_COUNT: usize = 60
+pub val IR_OP_DESCRIPTOR_COUNT: usize = 61
 ```
 
 ## fun is_known

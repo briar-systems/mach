@@ -355,6 +355,17 @@ pub fun global_lookup(m: *Module, name: intern.StrId) opt[u32];
 pub fun instruction_get(fn: *Function, i: id.InstructionId) opt[*instruction.Instruction];
 ```
 
+## fun constant_behind
+
+```mach
+pub fun constant_behind(fn: *Function, v: value.Value) value.Value;
+```
+
+the constant a value is: the operand of the `const` that materializes it
+(#3807), read at the use's type and secrecy, and any other value as itself.
+a pass that reads constants reads through this, so a materialized constant
+folds and compares as the constant it holds
+
 ## fun instruction_add
 
 ```mach

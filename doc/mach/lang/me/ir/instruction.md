@@ -402,6 +402,17 @@ condition, both choices and the result share one scalar integer or pointer
 type, and every target lowers it without a branch, so a secret condition
 stays constant-time
 
+## val OP_CONST
+
+```mach
+pub val OP_CONST: InstrKind = 60
+```
+
+its one operand, an integer or float constant, as a value of its own: the
+materialization of a constant a loop reads, placed ahead of the loop so the
+loop reads a register rather than rebuilding the constant (#3807). every
+pass that reads a constant reads through it with `ir.constant_behind`
+
 ## val INSTR_FLAG_NSW
 
 ```mach
