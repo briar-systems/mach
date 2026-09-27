@@ -9,7 +9,7 @@ pub rec LowerCtx;
 ## fun reject
 
 ```mach
-pub fun reject(ctx: *LowerCtx, text: str) fail.Fail;
+pub fun reject(ctx: *LowerCtx, k: dkind.Kind, text: str) fail.Fail;
 ```
 
 lowering rejects the program at the instruction under translation, or at
