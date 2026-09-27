@@ -102,8 +102,9 @@ be named `f32x4` without colliding with the type:
 val f32x4: i64 = 7; # fine: values are a different position
 ```
 
-A **type** may not. `rec`, `uni`, `tag`, and `def` reject a name spelled as a vector
-form, because a type declared with a vector's name would be silently unreachable:
+A **type** may not. `rec`, `uni`, `tag`, `def` and a generic parameter reject a name
+spelled as a vector form, because a type declared with a vector's name would be
+silently unreachable:
 every use in type position resolves to the vector instead:
 
 ```mach error is spelled as a vector type
