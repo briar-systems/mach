@@ -222,6 +222,14 @@ pub val EF_RISCV_FLOAT_ABI_SINGLE: u32 = 0x2
 pub val EF_RISCV_FLOAT_ABI_DOUBLE: u32 = 0x4
 ```
 
+## val EF_RISCV_RVE
+
+```mach
+pub val EF_RISCV_RVE: u32 = 0x8
+```
+
+the RV32E/RV64E register file and calling convention
+
 ## rec ElfLayout
 
 ```mach

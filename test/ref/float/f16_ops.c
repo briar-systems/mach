@@ -78,6 +78,11 @@ static uint64_t fold_f16_ops(uint64_t h, uint16_t v) {
     return mix_u16(h, v);
 }
 
+static uint64_t fold64_f16_ops(uint64_t h, double v) {
+    if (v != v) { return mix_u64(h, UINT64_C(0xFFFFFFFFFFFFFFFF)); }
+    return mix_f64(h, v);
+}
+
 static uint64_t fold32_f16_ops(uint64_t h, float v) {
     if (v != v) { return mix_u32(h, UINT32_C(0xFFFFFFFF)); }
     return mix_f32(h, v);
@@ -202,7 +207,7 @@ static uint64_t widen_part_f16_ops(uint64_t seed) {
             }
         }
     }
-    h = mix_f64(h, widen_f16_ops(opaque_f16_ops(0x7F55u, s)));
+    h = fold64_f16_ops(h, widen_f16_ops(opaque_f16_ops(0x7F55u, s)));
     return h;
 }
 
@@ -248,7 +253,7 @@ static uint64_t narrow_part_f16_ops(uint64_t seed) {
     d[23] = UINT64_C(0x3F10000000000000);
 
     for (uint32_t i = 0; i < 24u; i++) {
-        h = mix_u16(h, narrow_f16_ops(f64_of_f16_ops(d[i] + s)));
+        h = fold_f16_ops(h, narrow_f16_ops(f64_of_f16_ops(d[i] + s)));
     }
 
     const uint32_t s32 = (uint32_t)seed;
@@ -257,7 +262,7 @@ static uint64_t narrow_part_f16_ops(uint64_t seed) {
     h = mix_u16(h, narrow_f16_ops((double)f32_of_f16_ops(UINT32_C(0x33800000) + s32)));
     h = mix_u16(h, narrow_f16_ops((double)f32_of_f16_ops(UINT32_C(0x33000000) + s32)));
     h = mix_u16(h, narrow_f16_ops((double)f32_of_f16_ops(UINT32_C(0x45001000) + s32)));
-    h = mix_u16(h, narrow_f16_ops((double)f32_of_f16_ops(UINT32_C(0x7FC00001) + s32)));
+    h = fold_f16_ops(h, narrow_f16_ops((double)f32_of_f16_ops(UINT32_C(0x7FC00001) + s32)));
 
     const int32_t si = (int32_t)(uint32_t)seed;
     h = mix_u16(h, narrow_f16_ops((double)(int32_t)(2049 + si)));

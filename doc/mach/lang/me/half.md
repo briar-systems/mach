@@ -25,7 +25,7 @@ a binary16, so a calling convention can place it as the float it is (#3800)
 pub fun init(b: *builder.Builder, model: *isa.MachineModel) res[Half, fail.Fail];
 ```
 
-model is the target's machine model, nil for none: every operation expands
+model is the target's machine model: its half rows and its NaN rule
 
 ## fun done
 

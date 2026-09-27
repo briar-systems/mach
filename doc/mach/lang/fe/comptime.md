@@ -690,6 +690,12 @@ pub fun set_union_build(c: *ComptimeCtx, v: bool);
 pub fun set_target_defs(c: *ComptimeCtx, d: *isa.TargetDefs);
 ```
 
+## fun set_nan_rule
+
+```mach
+pub fun set_nan_rule(c: *ComptimeCtx, rule: float.NanRule);
+```
+
 ## fun set_ct_mul
 
 ```mach
@@ -932,9 +938,12 @@ pub fun eval_lit_str(source: str, span: token.Span, interner: *intern.Interner) 
 ## fun cast_scalar
 
 ```mach
-pub fun cast_scalar(types: *type.TypeInterner, pointer_width: u32, value: CTValue,
+pub fun cast_scalar(types: *type.TypeInterner, pointer_width: u32, nan_rule: float.NanRule, value: CTValue,
 from_ty: type.TypeId, to_ty: type.TypeId, reinterpret: bool) res[CTValue, EvalFail];
 ```
+
+a float converted to another float width folds by `nan_rule`, the target's, so the
+folded conversion is the one the target makes at run time
 
 ## fun intrinsic_takes_type_operand
 
