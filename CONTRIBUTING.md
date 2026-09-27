@@ -39,7 +39,7 @@ t=x86_64-linux
 gh release download "v$v" -R briar-systems/mach -p "mach-$v-$t.tar.gz" -p SHA256SUMS -D ../mach-seed
 (cd ../mach-seed && grep " mach-$v-$t.tar.gz\$" SHA256SUMS | sha256sum -c - && tar -xzf "mach-$v-$t.tar.gz" mach)
 ../mach-seed/mach dep pull .
-../mach-seed/mach build . --bin mach -o a
+../mach-seed/mach build . -o a
 ./a build . -o b
 ./b build . -o c
 cmp b c
@@ -54,9 +54,8 @@ formatting](#testing-and-formatting), because the test code may use language
 the seed release predates. A release newer than the pin builds `a` too, and an
 older one is not supported. On macOS use `aarch64-darwin` or `x86_64-darwin`
 and `shasum -a 256 -c`. On Windows the archive is `mach-$v-x86_64-windows.zip`
-holding `mach.exe`, the seed builds `--bin mach-windows`, and the outputs are
-`a.exe`, `b.exe` and `c.exe`. Add `--profile release` to every build for the
-release fixpoint.
+holding `mach.exe`, and the outputs are `a.exe`, `b.exe` and `c.exe`. Add
+`--profile release` to every build for the release fixpoint.
 
 `-o` names a canonical path inside the project root: relative, `/`-separated,
 with no `.` or `..` component. `-o ../a`, `-o ./a` and an absolute path are
