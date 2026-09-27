@@ -29,6 +29,7 @@ A decorator is written as an attribute:
 #[deprecated]        # external uses warn
 #[deprecated("msg")] # external uses warn with this message
 #[testing]           # exists only for tests; omitted from ordinary builds
+#[expect("key", ..)] # acknowledge the named warnings inside this declaration
 #[symbol("name")]    # linker name override
 #[library("dep")]    # dynamic import attribution (ext only)
 #[inline]            # force inlining (no arguments)
@@ -207,6 +208,54 @@ locals, so they never reference a declaration.
 The mark is not a cycle escape: `mach test` builds with testing declarations
 present, so a `use` cycle that only tests need is still an error. `mach doc`
 omits testing declarations.
+
+### `expect(key)` — acknowledge a warning
+
+Acknowledges warnings a declaration raises on purpose. Each argument is a
+string literal naming a warning key, or a family of keys, from the
+[diagnostic key table](manifest.md#silencing-warnings). A warning of a named
+kind raised inside the declaration, its doc comment and body included, is
+neither printed nor counted. Warnings elsewhere, and warnings of other kinds,
+still report.
+
+```mach fragment
+#[expect("vector.scalarize")]
+#[testing]
+fun divide_i32x4(a: i32x4, b: i32x4) i32x4 {
+    ret a / b; # scalarizes on x86_64 and aarch64, by design
+}
+
+#[expect("float")]
+test float__rounding {
+    val x: f32 = 3.14159265358979; # float.inexact, acknowledged by its family
+    ...
+}
+```
+
+A warning is matched to the declaration whose source contains its site. That
+holds for a warning raised late in the build, such as `vector.scalarize` from
+lowering, and for a generic instance, whose warnings belong to the generic's
+declaration. A warning replayed from the build cache is matched exactly as a
+fresh one, and a warning `#[expect]` covers counts as acknowledged even when a
+profile's `allow` silences its key too.
+
+An acknowledgement cannot rot silently. When a key the source alone decides
+(`import.unused`, `decl.deprecated`, `doc.lint`, `float.inexact`) names no
+warning raised inside the declaration, that is itself a warning,
+`expect.unfulfilled`. A key whose warning depends on the target or on what the
+build compiles, such as `vector.scalarize`, may be quiet in a given build, so
+its expectation is not reported. A build with errors judges no expectation.
+
+It applies to `fun`, `rec`, `uni`, `tag`, `val`, `var` and `test` declarations
+and may appear once, naming every key it acknowledges. There is no
+module-wide form: a profile's [`allow`](manifest.md#silencing-warnings)
+silences a key across the build. An unknown key, a key that covers only
+errors, and a key named twice are refused, since an error is never
+acknowledged:
+
+```
+error: `secret.not_oblivious` names an error, and an error is never acknowledged
+```
 
 ### `symbol(str)` — linker name
 
