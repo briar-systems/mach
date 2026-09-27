@@ -463,7 +463,7 @@ Integer `*` is where this is most visible today:
 | `i8x16 * i8x16` | scalar expansion | packed `mul .16b` | scalar expansion |
 | `i16x8 * i16x8` | packed `pmullw` | packed `mul .8h` | scalar expansion |
 | `i32x4 * i32x4` | packed `pmuludq` pair (`pmulld` under `sse41`) | packed `mul .4s` | scalar expansion |
-| `i64x2 * i64x2` | packed `pmuludq` triple | scalar expansion (NEON has no `.2d` multiply) | scalar expansion |
+| `i64x2 * i64x2` | packed `pmuludq` triple (`vpmullq` under `avx512dq` and `avx512vl`) | scalar expansion (NEON has no `.2d` multiply) | scalar expansion |
 
 Shifts realize by the count's form: a count that is the same value in every
 lane shifts every lane by that one scalar, and any other count shifts each lane

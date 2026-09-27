@@ -284,6 +284,7 @@ inherits its function's set.
 | x86_64 | `aes` | `aesenc` `aesenclast` `aesdec` `aesdeclast` `xmm, xmm/m128`, `aesimc xmm, xmm/m128`, `aeskeygenassist xmm, xmm/m128, imm8` (CPUID leaf 1, ECX bit 25) |
 | x86_64 | `pclmul` | `pclmulqdq xmm, xmm/m128, imm8` (CPUID leaf 1, ECX bit 1) |
 | x86_64 | `avx2` | `vpsllvd` `vpsrlvd` `vpsravd` `vpsllvq` `vpsrlvq` `xmm, xmm, xmm/m128` (VEX.128, CPUID leaf 7, EBX bit 5) |
+| x86_64 | `avx512dq` and `avx512vl` | `vpmullq xmm, xmm, xmm/m128` (EVEX.128, CPUID leaf 7, EBX bits 17 and 31) |
 | aarch64 | `sha2` | `sha256h qN, qN, vN.4s`, `sha256h2 qN, qN, vN.4s`, `sha256su0 vN.4s, vN.4s`, `sha256su1 vN.4s, vN.4s, vN.4s` |
 | aarch64 | `sb` | `sb` (the FEAT_SB speculation barrier) |
 | aarch64 | `aes` | `aese vN.16b, vN.16b`, `aesd vN.16b, vN.16b`, `aesmc vN.16b, vN.16b`, `aesimc vN.16b, vN.16b` (FEAT_AES) |
@@ -291,14 +292,22 @@ inherits its function's set.
 
 A manifest [level](manifest.md#levels) (`extensions = ["x86-64-v2"]`) selects every
 member name, so it admits the rows of each: `pmulld` assembles under `x86-64-v2`, and
-`tzcnt`, `lzcnt` and `vpsllvd` under `x86-64-v3`. The names a level brings that have no
-rows yet (`sse42`, `avx`, `avx512*`) admit nothing until an encoding lands for them.
+`tzcnt`, `lzcnt` and `vpsllvd` under `x86-64-v3`, and `vpmullq` under `x86-64-v4`. The
+names a level brings that have no rows yet (`sse42`, `avx`, `avx512f`, `avx512bw`,
+`avx512cd`) admit nothing until an encoding lands for them.
 
 The `avx2` rows are VEX-encoded three-operand instructions: the destination, then the
 shifted vector, then the per-lane counts, as GNU as spells them. Each shifts every lane
 by the count in the same lane of the last operand, and a count at or above the lane
 width empties the lane (or, for `vpsravd`, fills it with the sign). The 128-bit form is
 the only one inline asm spells; `ymm` registers are not operands.
+
+`vpmullq` is EVEX-encoded and takes its operands the same way: the destination, then
+the two factors, and it keeps the low 64 bits of each lane's product. Its 128-bit form
+needs `avx512vl` beside `avx512dq`, so a target selecting only one of them refuses it,
+naming the other. A memory source's displacement is scaled by 16 when that fits a
+byte, as GNU as does. Opmask registers, broadcast, `xmm16` to `xmm31`, and the `ymm`
+and `zmm` forms are not operands inline asm spells.
 
 `sha256rnds2` also reads `xmm0`, the round keys, without naming it, and the
 constant-time check follows a secret through it. `ptest` sets ZF and CF; the
