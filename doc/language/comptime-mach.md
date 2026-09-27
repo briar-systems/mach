@@ -96,7 +96,7 @@ The names are the selected isa's vocabulary and nothing else:
   `cx16`, `avx`, `avx2`, `bmi2`, `fma`, `movbe`, `f16c`, `avx512f`, `avx512bw`,
   `avx512cd`, `avx512dq`, `avx512vl`, `aes`, `pclmul`;
 - `aarch64`: `sha2`, `sb`, `aes`, `pmull`;
-- `riscv64` and `riscv32`: `i`, `m`, `a`, `f`, `d`, `c`, `zicsr`, `zifencei`, `zkt`.
+- `riscv64` and `riscv32`: `i`, `m`, `a`, `f`, `d`, `c`, `zicond`, `zicsr`, `zifencei`, `zkt`.
 
 A name the selected isa does not declare is a compile error, never a silent 0, as
 `$mach.arch.*` refuses an unknown architecture:

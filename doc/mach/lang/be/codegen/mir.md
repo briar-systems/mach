@@ -355,6 +355,25 @@ source width, zero otherwise, written at the instruction's width: the mask
 a saturating shift keeps its result by, one compare-to-mask sequence on
 every target (#3885). both widths are at most the alu width
 
+## val MIR_SELECT
+
+```mach
+pub val MIR_SELECT:     MirOpcode = 57
+```
+
+the IR select (#3346): [dst, cond, a, b] writes a when cond, read at the
+source width, is nonzero, else b. [dst, lhs, rhs, a, b, cmp] of
+MIR_SELECT_CMP decides by the integer compare opcode in the immediate
+`cmp` of lhs and rhs, read at the source width, whose 0/1 answer lowering
+never materialized. both write at the instruction's width, at most the alu
+width, and every target selects them without a branch
+
+## val MIR_SELECT_CMP
+
+```mach
+pub val MIR_SELECT_CMP: MirOpcode = 58
+```
+
 ## val MIR_MOV
 
 ```mach
@@ -675,6 +694,20 @@ pub val MIR_SEL_MASK_LT_U: MirOpcode = 0x112A
 ```
 
 the selected compare-to-mask (#3885)
+
+## val MIR_SEL_SELECT
+
+```mach
+pub val MIR_SEL_SELECT:     MirOpcode = 0x112B
+```
+
+the selected selects (#3346)
+
+## val MIR_SEL_SELECT_CMP
+
+```mach
+pub val MIR_SEL_SELECT_CMP: MirOpcode = 0x112C
+```
 
 ## fun is_cmp_opcode
 

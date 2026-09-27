@@ -45,6 +45,12 @@ pub fun mark_foldable_count_masks(ctx: *LowerCtx, fn: *ir.Function);
 a count mask folds when every use of it is a shift count that
 count_mask_use_folds admits; any other use needs the masked value itself
 
+## fun cmp_folds_into_select
+
+```mach
+pub fun cmp_folds_into_select(ctx: *LowerCtx, iid: id.InstructionId) bool;
+```
+
 ## fun gep_folds
 
 ```mach
