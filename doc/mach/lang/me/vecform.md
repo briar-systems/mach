@@ -149,6 +149,15 @@ pub fun conversion_packs(m: *ir.Module, tgt: *target.Target, kind: instruction.I
 whether the lane-wise conversion `kind` of a `from_ty` vector into `ty` is a
 cell the target packs at these lanes; the catalog is the only judge
 
+## fun operation_packs
+
+```mach
+pub fun operation_packs(m: *ir.Module, tgt: *target.Target, kind: instruction.InstrKind, ty: ir_type.IrTypeId, operand_ty: ir_type.IrTypeId, n: u32) bool;
+```
+
+whether `kind` over `n` operands of `operand_ty` (one or two) into `ty` is a
+cell the target packs at these lanes; the catalog is the only judge
+
 ## fun range_packs
 
 ```mach

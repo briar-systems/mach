@@ -458,8 +458,7 @@ pub fun vec_lane_kind_ok(kind: TypeKind) bool;
 ```
 
 whether a primitive is a legal vector lane: a declared set, never "every
-primitive but ptr". a 128-bit lane has no packed form on any ISA (#3511),
-and an f16 lane is its own step of the f16 work (#3802)
+primitive but ptr". a 128-bit lane has no packed form on any ISA (#3511)
 
 ## rec VecForm
 
