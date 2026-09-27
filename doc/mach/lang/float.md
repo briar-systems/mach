@@ -76,6 +76,9 @@ pub fun f64_signbit(f: f64) bool;
 pub fun f64_to_f32_bits(d: u64) u32;
 ```
 
+binary64 bits narrowed to binary32 by the one rule every narrower format shares: a NaN
+keeps its sign and the top of its payload with the quiet bit set
+
 ## fun f32_bits_to_f64_bits
 
 ```mach
