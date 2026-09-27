@@ -2170,9 +2170,17 @@ fun slot_base_reg(f: *mir.MirFunction) i32 {
     ret x64.RBP;
 }
 
-fun slot_base_bias(f: *mir.MirFunction) i64 {
-    if (!codegen_frame.slots_from_sp(?f.frame)) { ret 0; }
-    ret f.frame.base_dist::i64;
+# how far below rbp the callee-saved area starts: under the slots when rbp
+# addresses them, and right under rbp in a realigned frame, which saves before
+# it realigns so that every save sits at a known distance from the frame
+fun save_top(f: *mir.MirFunction) u32 {
+    if (f.frame.realign != 0) { ret 0; }
+    ret f.frame.size;
+}
+
+# the bytes a realigned frame drops rsp by to hold its saves before realigning
+fun realign_save_size(st: *enc.EncodeState, f: *mir.MirFunction) usize {
+    ret fp_save_base(st.callee_saved, 0, f.callee_mask) + common.popcount32(f.callee_mask_fp)::usize * 16;
 }
 
 fun fp_save_base(fill: isa.RegFileFn, frame_size: u32, callee_mask: u32) usize {
@@ -2292,11 +2300,30 @@ fun emit_stack_probe(st: *enc.EncodeState, total: usize, page_bytes: usize) err[
     ret err[fail.Fail].ok{};
 }
 
+# drops rsp by the frame's `total` bytes, probing each page where the target
+# asks; the drop is a frame step only where rsp keeps a known distance
+fun emit_frame_alloc(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32, total: usize) err[fail.Fail] {
+    if (total == 0) { ret err[fail.Fail].ok{}; }
+    if (needs_stack_probe(st.stack_probe, st.page_size, total)) {
+        val pr: err[fail.Fail] = emit_stack_probe(st, total, st.page_size::usize);
+        if (sel pr.err) { ret pr; }
+    }
+    or {
+        var sub_rsp: isa.Inst = isa.inst_blank();
+        sub_rsp.opcode = x64.SUB;
+        sub_rsp.dst    = isa.make_reg(x64.RSP, 8);
+        sub_rsp.src1   = isa.make_imm(total::i64, 8);
+        sub_rsp.size   = 8;
+        sub_rsp.flags  = x64.FLAG_REX_W;
+        emit_inst(st, ?sub_rsp);
+    }
+    if (f.frame.realign != 0) { ret err[fail.Fail].ok{}; }
+    ret enc.push_frame_step(st, of.FRAME_STEP_ALLOC, 0, st.buf.len::u32 - fn_base, total::u64);
+}
+
 fun emit_prologue(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32) err[fail.Fail] {
-    val frame_size:     u32 = f.frame.size;
     val callee_mask:    u32 = f.callee_mask;
     val callee_mask_fp: u32 = f.callee_mask_fp;
-    val outgoing_size:  u32 = f.frame.outgoing_size;
 
     val rf: err[fail.Fail] = enc.push_frame(st, fn_base);
     if (sel rf.err) { ret err[fail.Fail].err{rf.err}; }
@@ -2318,11 +2345,70 @@ fun emit_prologue(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32) err[f
     mov_rbp.size   = 8;
     mov_rbp.flags  = x64.FLAG_REX_W;
     emit_inst(st, ?mov_rbp);
+
+    # a realigned frame saves before it realigns, since windows unwind info
+    # cannot address a save below a realigned rsp: rsp drops by the save area
+    # and rbp is recorded as that rsp plus the area
+    val realigned: bool  = f.frame.realign != 0;
+    var sp_below:  usize = 0;
+    if (realigned) {
+        sp_below = realign_save_size(st, f);
+        if (sp_below > 0) {
+            var sub_save: isa.Inst = isa.inst_blank();
+            sub_save.opcode = x64.SUB;
+            sub_save.dst    = isa.make_reg(x64.RSP, 8);
+            sub_save.src1   = isa.make_imm(sp_below::i64, 8);
+            sub_save.size   = 8;
+            sub_save.flags  = x64.FLAG_REX_W;
+            emit_inst(st, ?sub_save);
+            val rs_save_alloc: err[fail.Fail] = enc.push_frame_step(st, of.FRAME_STEP_ALLOC, 0,
+                st.buf.len::u32 - fn_base, sp_below::u64);
+            if (sel rs_save_alloc.err) { ret err[fail.Fail].err{rs_save_alloc.err}; }
+        }
+    }
     val rs_fp: err[fail.Fail] = enc.push_frame_step(st, of.FRAME_STEP_SET_FP, x64.RBP::u8,
-        st.buf.len::u32 - fn_base, 0);
+        st.buf.len::u32 - fn_base, sp_below::u64);
     if (sel rs_fp.err) { ret err[fail.Fail].err{rs_fp.err}; }
 
-    val realigned: bool = f.frame.realign != 0;
+    val total: usize = f.frame.base_dist::usize;
+    if (!realigned) {
+        val ra: err[fail.Fail] = emit_frame_alloc(st, f, fn_base, total);
+        if (sel ra.err) { ret ra; }
+        sp_below = total;
+    }
+
+    var list: [16]i32;
+    val ln:   i32 = x64.callee_saved_gp_list_from(st.callee_saved, ?list[0]);
+    val top:  u32 = save_top(f);
+    var coff: i32 = top::i32 + 8;
+    var i:    i32 = 0;
+    for (i < ln) {
+        if ((callee_mask & (1::u32 << list[i]::u32)) != 0) {
+            emit_frame_store(st, list[i], x64.RBP, 0 - coff);
+            val rs_save: err[fail.Fail] = enc.push_frame_step(st, of.FRAME_STEP_SAVE, list[i]::u8,
+                st.buf.len::u32 - fn_base,
+                (sp_below::i64 - coff::i64)::u64);
+            if (sel rs_save.err) { ret err[fail.Fail].err{rs_save.err}; }
+            coff = coff + 8;
+        }
+        i = i + 1;
+    }
+
+    val xbase: i32 = fp_save_base(st.callee_saved, top, callee_mask)::i32;
+    var xoff:  i32 = xbase + 16;
+    var x:     i32 = 0;
+    for (x < 16) {
+        if ((callee_mask_fp & (1::u32 << x::u32)) != 0) {
+            emit_xmm_store(st, x, x64.RBP, 0 - xoff);
+            val rs_xsave: err[fail.Fail] = enc.push_frame_step(st, of.FRAME_STEP_SAVE_VEC, x::u8,
+                st.buf.len::u32 - fn_base,
+                (sp_below::i64 - xoff::i64)::u64);
+            if (sel rs_xsave.err) { ret err[fail.Fail].err{rs_xsave.err}; }
+            xoff = xoff + 16;
+        }
+        x = x + 1;
+    }
+
     if (realigned) {
         var and_rsp: isa.Inst = isa.inst_blank();
         and_rsp.opcode = x64.AND;
@@ -2334,79 +2420,22 @@ fun emit_prologue(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32) err[f
         val rs_align: err[fail.Fail] = enc.push_frame_step(st, of.FRAME_STEP_REALIGN, 0,
             st.buf.len::u32 - fn_base, f.frame.realign::u64);
         if (sel rs_align.err) { ret err[fail.Fail].err{rs_align.err}; }
-    }
-
-    val total: usize = f.frame.base_dist::usize;
-    if (total > 0) {
-        if (needs_stack_probe(st.stack_probe, st.page_size, total)) {
-            val pr: err[fail.Fail] = emit_stack_probe(st, total, st.page_size::usize);
-            if (sel pr.err) { ret pr; }
-        }
-        or {
-            var sub_rsp: isa.Inst = isa.inst_blank();
-            sub_rsp.opcode = x64.SUB;
-            sub_rsp.dst    = isa.make_reg(x64.RSP, 8);
-            sub_rsp.src1   = isa.make_imm(total::i64, 8);
-            sub_rsp.size   = 8;
-            sub_rsp.flags  = x64.FLAG_REX_W;
-            emit_inst(st, ?sub_rsp);
-        }
-        if (!realigned) {
-            val rs_alloc: err[fail.Fail] = enc.push_frame_step(st, of.FRAME_STEP_ALLOC, 0,
-                st.buf.len::u32 - fn_base, total::u64);
-            if (sel rs_alloc.err) { ret err[fail.Fail].err{rs_alloc.err}; }
-        }
-    }
-
-    val sbase: i32 = slot_base_reg(f);
-    val sbias: i64 = slot_base_bias(f);
-
-    var list: [16]i32;
-    val ln:   i32 = x64.callee_saved_gp_list_from(st.callee_saved, ?list[0]);
-    var coff: i32 = frame_size::i32 + 8;
-    var i:    i32 = 0;
-    for (i < ln) {
-        if ((callee_mask & (1::u32 << list[i]::u32)) != 0) {
-            emit_frame_store(st, list[i], sbase, (sbias - coff::i64)::i32);
-            val rs_save: err[fail.Fail] = enc.push_frame_step(st, of.FRAME_STEP_SAVE, list[i]::u8,
-                st.buf.len::u32 - fn_base,
-                (total::i64 - coff::i64)::u64);
-            if (sel rs_save.err) { ret err[fail.Fail].err{rs_save.err}; }
-            coff = coff + 8;
-        }
-        i = i + 1;
-    }
-
-    val xbase: i32 = fp_save_base(st.callee_saved, frame_size, callee_mask)::i32;
-    var xoff:  i32 = xbase + 16;
-    var x:     i32 = 0;
-    for (x < 16) {
-        if ((callee_mask_fp & (1::u32 << x::u32)) != 0) {
-            emit_xmm_store(st, x, sbase, (sbias - xoff::i64)::i32);
-            val rs_xsave: err[fail.Fail] = enc.push_frame_step(st, of.FRAME_STEP_SAVE_VEC, x::u8,
-                st.buf.len::u32 - fn_base,
-                (total::i64 - xoff::i64)::u64);
-            if (sel rs_xsave.err) { ret err[fail.Fail].err{rs_xsave.err}; }
-            xoff = xoff + 16;
-        }
-        x = x + 1;
+        ret emit_frame_alloc(st, f, fn_base, total);
     }
     ret err[fail.Fail].ok{};
 }
 
 fun emit_epilogue(st: *enc.EncodeState, f: *mir.MirFunction) {
-    val frame_size:     u32 = f.frame.size;
     val callee_mask:    u32 = f.callee_mask;
     val callee_mask_fp: u32 = f.callee_mask_fp;
-    val sbase:          i32 = slot_base_reg(f);
-    val sbias:          i64 = slot_base_bias(f);
+    val top:            u32 = save_top(f);
 
-    val xbase: i32 = fp_save_base(st.callee_saved, frame_size, callee_mask)::i32;
+    val xbase: i32 = fp_save_base(st.callee_saved, top, callee_mask)::i32;
     var xoff:  i32 = xbase + 16;
     var x:     i32 = 0;
     for (x < 16) {
         if ((callee_mask_fp & (1::u32 << x::u32)) != 0) {
-            emit_xmm_load(st, x, sbase, (sbias - xoff::i64)::i32);
+            emit_xmm_load(st, x, x64.RBP, 0 - xoff);
             xoff = xoff + 16;
         }
         x = x + 1;
@@ -2414,11 +2443,11 @@ fun emit_epilogue(st: *enc.EncodeState, f: *mir.MirFunction) {
 
     var list: [16]i32;
     val ln:   i32 = x64.callee_saved_gp_list_from(st.callee_saved, ?list[0]);
-    var coff: i32 = frame_size::i32 + 8;
+    var coff: i32 = top::i32 + 8;
     var i:    i32 = 0;
     for (i < ln) {
         if ((callee_mask & (1::u32 << list[i]::u32)) != 0) {
-            emit_frame_load(st, list[i], sbase, (sbias - coff::i64)::i32);
+            emit_frame_load(st, list[i], x64.RBP, 0 - coff);
             coff = coff + 8;
         }
         i = i + 1;
