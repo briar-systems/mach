@@ -277,6 +277,32 @@ caller reverses it. That is the same price a 16-byte vector pays on Win64.
 
 [115052]: https://github.com/llvm/llvm-project/pull/115052
 
+## `f16` and `_Float16`
+
+`f16` is C's `_Float16` at every boundary, and a record or array holding `f16`
+is the C record or array holding `_Float16`. Every convention mach has passes it
+as the float it is, two bytes wide, the way GCC and clang do:
+
+| Convention | Argument | Return | As a record member |
+|---|---|---|---|
+| System V x86-64 | SSE class: the low 16 bits of the next xmm register, the stack past xmm7 | `xmm0` | a float in its eightbyte, so an eightbyte holding only floats is SSE |
+| Win64 | the xmm register of its positional slot, the stack past the fourth slot | `xmm0` | no change: a record of 1, 2, 4 or 8 bytes rides its integer slot |
+| AAPCS64 | the next `h` register, the stack past `v7` | `h0` | a two-byte member of a homogeneous float aggregate, so up to four `f16` ride `h` registers |
+| RISC-V `lp64d`, `lp64f`, `ilp32d`, `ilp32f` | the next `f` register, NaN-boxed to its width, and by the integer rule once they run out | `fa0` | a float leaf of the two-leaf rule |
+| RISC-V `lp64`, `ilp32` | the integer rule, as a `u16` | `a0` | an integer leaf |
+
+The float registers above the 16 bits belong to nobody on System V, Win64 and
+AAPCS64: mach writes zeros there and reads only the low 16 bits. The RISC-V
+psABI boxes a float narrower than its register, so mach sets those bits to ones,
+as clang does. The rule depends on the ABI, not on Zfh: without Zfh the value
+still rides an `f` register.
+
+The Win64 row is clang's, since MSVC has no half type. SPIR-V has no C boundary:
+a SPIR-V function takes and returns an `f16` as a value like any other.
+
+An `f16` in a C-variadic tail is refused like any float narrower than `f64`
+(see [Arguments in the variadic tail](#arguments-in-the-variadic-tail)).
+
 ## Symbol name
 
 The declaration names a C declaration, so its linker symbol is whatever the
