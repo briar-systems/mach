@@ -12,6 +12,12 @@ pub def FloatWidth: u8
 pub val FLOAT_W_NONE: FloatWidth = 0
 ```
 
+## val FLOAT_W_16
+
+```mach
+pub val FLOAT_W_16:   FloatWidth = 16
+```
+
 ## val FLOAT_W_32
 
 ```mach
@@ -31,6 +37,14 @@ pub fun width_name(w: FloatWidth) str;
 ```
 
 the float type a width names, as its source spelling
+
+## fun width_of_bits
+
+```mach
+pub fun width_of_bits(bits: u32) FloatWidth;
+```
+
+the width of a float `bits` wide, FLOAT_W_NONE for a width no float type has
 
 ## fun f64_bits
 
@@ -73,6 +87,27 @@ pub fun f32_bits_to_f64_bits(s: u32) u64;
 ```mach
 pub fun round_at(f: f64, w: FloatWidth) f64;
 ```
+
+`f` rounded once, to nearest with ties to even, to the format of `w`, and carried back
+exactly in an f64. binary64 holds every narrower format exactly with more than twice its
+precision plus two bits, so a `+ - * /` of two values at `w` computed in f64 and rounded
+here is the correctly rounded result at `w`
+
+## fun bits_at
+
+```mach
+pub fun bits_at(v: f64, w: FloatWidth) u64;
+```
+
+the encoding at `w` of `v`, a value already representable at `w`: the bits `:~` reads
+
+## fun value_of_bits
+
+```mach
+pub fun value_of_bits(bits: u64, w: FloatWidth) f64;
+```
+
+the value an encoding at `w` holds, carried exactly in an f64: the value `:~` makes
 
 ## fun widths_agree
 
@@ -141,6 +176,34 @@ pub rec Rounded;
 
 a decimal rounded to one format: the value, carried exactly in an f64, and how it fit.
 an overflow carries +inf and an underflow of a nonzero decimal carries +0
+
+## fun narrow_bits
+
+```mach
+pub fun narrow_bits(d: u64, f: Format) u64;
+```
+
+binary64 bits `d` rounded to nearest with ties to even into the encoding of `f`, a format
+narrower than binary64: a value past the largest finite overflows to infinity, one below
+the smallest normal rounds into the subnormals, and a NaN keeps its sign and the top of its
+payload with the quiet bit set, as hardware narrowing does
+
+d: the binary64 encoding to narrow
+f: the format to round into
+ret: the encoding in `f`, in the low bits
+
+## fun widen_bits
+
+```mach
+pub fun widen_bits(b: u64, f: Format) u64;
+```
+
+an encoding of `f`, a format narrower than binary64, as binary64 bits: exact, a subnormal
+normalised and a NaN's payload kept in its top bits
+
+b: the encoding in `f`, in the low bits
+f: the format it is encoded in
+ret: the same value as binary64 bits
 
 ## fun round_decimal
 

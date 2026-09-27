@@ -52,6 +52,23 @@ pub fun key_text(t: *toml.Table, key: str) str;
 a string key as the manifest reads it: absent and empty are the same err
 (`is missing required key`), so both read as the empty string
 
+## fun point_at
+
+```mach
+pub fun point_at(f: outcome.Fail, sp: toml.Span) outcome.Fail;
+```
+
+the same failure pointing at `sp` in the manifest being parsed; the zero span
+of a value the parser did not write points nowhere
+
+## fun fail_at
+
+```mach
+pub fun fail_at(f: outcome.Fail, sp: toml.Span) err[outcome.Fail];
+```
+
+a failure pointing at `sp`, as `point_at` places it
+
 ## fun intern_unwrap
 
 ```mach
@@ -119,7 +136,33 @@ pub fun duplicate_default_err(alloc: *A.Allocator, kind: str, d: *DefaultTables)
 pub fun check_keys(alloc: *A.Allocator, tab: *toml.Table, label: str, known: fun(str) bool) err[outcome.Fail];
 ```
 
-refuse the first key of a table that its section's `known` predicate does not admit
+refuse the first key of a table that its section's `known` predicate does
+not admit, pointing at the key as written
+
+## fun key_span
+
+```mach
+pub fun key_span(tab: *toml.Table, i: usize) toml.Span;
+```
+
+the key token of a table's entry `i` as written; the zero span when absent
+
+## fun value_span
+
+```mach
+pub fun value_span(tab: *toml.Table, key: str) toml.Span;
+```
+
+the literal of the value `key` names in a table; the zero span when absent
+
+## fun required_span
+
+```mach
+pub fun required_span(tab: *toml.Table, key: str, where: toml.Span) toml.Span;
+```
+
+a required key's value when it is written, otherwise its table (`where`, the
+table's own span): where a refusal of a required key points
 
 ## fun is_project_path
 
@@ -137,8 +180,11 @@ ret: true when every rule holds
 ## fun check_path
 
 ```mach
-pub fun check_path(alloc: *A.Allocator, value: str, field: str) err[outcome.Fail];
+pub fun check_path(alloc: *A.Allocator, value: str, field: str, sp: toml.Span) err[outcome.Fail];
 ```
+
+refuse a path that `is_project_path` does not admit, pointing at `sp`, the
+value as written
 
 ## fun free_strarr
 

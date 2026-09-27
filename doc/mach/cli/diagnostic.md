@@ -39,7 +39,9 @@ command that prints the rest of the message itself
 pub fun render_fail(f: *outcome.Fail) i64;
 ```
 
-print a Fail to stderr as "error[<key>]: <message>" and map it to an exit code
+print a Fail to stderr as "error[<key>]: <message>", followed by the
+" --> <file>:<line>:<column>" it points at when it names one, and map it to
+an exit code
 a reported Fail prints nothing, its diagnostics having been rendered already
 
 f: the Fail

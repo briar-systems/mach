@@ -35,6 +35,17 @@ The sole exception is **shape-dependence**: a field whose presence follows anoth
 value in the same table. A dependency is `git` *or* `path`; a `[link.X]` names a
 `name` *or* a `path` according to its `source`. Nothing else defaults.
 
+A manifest refusal points at what it refuses, on the line after the message:
+the value it rejects, the key token of a name or key it rejects, or the table a
+required key is missing from, in the manifest that states it, a dependency's
+own included. [`--diagnostics=json`](diagnostics-json.md#failure-records)
+carries the same place as the failure's `primary` span.
+
+```
+error[manifest.invalid_value]: mach.toml: profile 'debug': opt must be 0, 1, or 2 (got 7)
+ --> mach.toml:15:7
+```
+
 Unknown sections and unknown keys are always errors. A path value is always
 `/`-separated; a literal `\` is rejected (`manifest paths use '/'`), so the same
 manifest is portable and is normalized to the host separator at the filesystem
@@ -155,18 +166,20 @@ name a path inside `obj/<project.id>/`, `.cache/` or `.stage/` (see
 reads the dependency closure (build, test, check, `mach dep verify`, the
 language server) checks it for the root and for every realized dependency. A
 compiler outside any of those ranges is refused once, with every unmet
-requirement and the chain that states it:
+requirement and the chain that states it, pointing at the first unmet range in
+the manifest that states it:
 
 ```
 error[mach.version_unaccepted]: this is mach 5.2.1, and the dependency closure does not accept it:
     app (mach.toml) requires mach ^5.3
     app -> gfx -> glfw requires mach >=5.4, <6
+ --> mach.toml:2:11
 ```
 
 A root manifest must state `mach`. One without it is refused with the line to
 add (`mach.toml: [project] states no compiler range; add mach = "^5.3", the
 oldest release that reads the key, and raise it when the project uses a later
-feature`). A dependency without it states no constraint. `mach init` writes the same range. It is the oldest
+feature`), pointing at its `[project]` header. A dependency without it states no constraint. `mach init` writes the same range. It is the oldest
 release of the running compiler's major that reads the key: `^5.3` for every
 5.x compiler, since 5.3.0 is the first release that accepts `mach`, and `^N.0`
 for a later major N, since a caret cannot span majors. The range depends only on
