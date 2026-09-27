@@ -9,11 +9,8 @@ pub val DEFAULT_STACK_ALIGN: u32 = 16
 ## fun run
 
 ```mach
-pub fun run(tgt: *target.Target, m: *mir.MirModule, debug: bool) err[fail.Fail];
+pub fun run(tgt: *target.Target, m: *mir.MirModule) err[fail.Fail];
 ```
-
-`debug` keeps a frame pointer in every function with a frame, since the
-frame chain is what a debugger walks
 
 ## fun omits_frame
 
