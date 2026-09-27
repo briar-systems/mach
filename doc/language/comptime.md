@@ -34,10 +34,27 @@ The parser distinguishes these by structure:
 | Root | Reads | Source |
 |---|---|---|
 | `$mach.*` | resolved build os/arch/abi/mode tags, pointer width, compiler identity | active build + compiler |
-| `$project.{id,version}` | project metadata | `[project]` in `mach.toml` |
-| `$project.version.{major,minor,patch}` | structured version components | `[project].version` |
+| `$mach.project.{id,version}` | the **owning** project's metadata | `[project]` in the `mach.toml` of the project that owns the module |
+| `$mach.project.version.{major,minor,patch}` | its structured version components | that `[project].version` |
+| `$mach.source.{file,line,module}` | the module's project-relative file, the line, the module name | the module |
+| `$project.{id,version}` | the **root** project's metadata | `[project]` in the root `mach.toml` |
+| `$project.version.{major,minor,patch}` | structured version components | the root's `[project].version` |
 | `$project.target.{os,arch,abi}` | the selected target's declared tuple, as strings | the selected `mach.toml` target |
 | `$bin.name` | the artifact being built | the selected build unit (`[artifact.*]`) |
+
+Two roots read a project's identity, and they differ in which project:
+
+- `$project.*` is the **root**: the project being built, the same in every module
+  of the build, dependencies' modules included. A dependency built as another
+  artifact's requirement is the root of that build.
+- `$mach.project.*` is the **owner**: the project whose source tree holds the
+  module being compiled, read from its own manifest. It follows the module, as
+  `{artifact.<id>.out}` does ([manifest.md](manifest.md)).
+
+In a root module the two read the same manifest. In a dependency's module
+`$project.version` is the consumer's version and `$mach.project.version` the
+dependency's own, so a library that reports its version reads
+`$mach.project.version`.
 
 `$project.target.*` carries the manifest's declared **string** spellings
 (`"linux"`, `"x86_64"`, `"sysv64"`), distinct from `$mach.build.*`'s numeric tags
