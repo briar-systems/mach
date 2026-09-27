@@ -351,3 +351,23 @@ pub val VEC_CMHI: Opcode = 0x10c
 pub val VEC_CMHS: Opcode = 0x10d
 ```
 
+## val VEC_SHL
+
+```mach
+pub val VEC_SHL:   Opcode = 0x10e
+```
+
+the lane-wise shifts, by an immediate or by a uniform or per-lane count (#3852)
+
+## val VEC_SHR_U
+
+```mach
+pub val VEC_SHR_U: Opcode = 0x10f
+```
+
+## val VEC_SHR_S
+
+```mach
+pub val VEC_SHR_S: Opcode = 0x110
+```
+
