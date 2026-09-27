@@ -1059,6 +1059,15 @@ pub def IsRegMoveFn: fun(u32) bool
 pub def IsTrapTerminatorFn: fun(u32) bool
 ```
 
+## def IntImmFitsFn
+
+```mach
+pub def IntImmFitsFn: fun(u64, u32) bool
+```
+
+whether one instruction materializes the integer `value`, read at `bits`
+(at most 64): the rule the middle end hoists a loop's constants by (#3807)
+
 ## def DwarfRegFn
 
 ```mach
@@ -1344,6 +1353,12 @@ pub fun with_codeview_regs(m: *RegMachine, f: CvRegFn);
 
 ```mach
 pub fun with_frame_dist(m: *RegMachine, f: FrameDistFn);
+```
+
+## fun with_int_imm_rule
+
+```mach
+pub fun with_int_imm_rule(m: *RegMachine, f: IntImmFitsFn);
 ```
 
 ## fun reloc_seam

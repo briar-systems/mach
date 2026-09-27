@@ -1,5 +1,15 @@
 # mach.lang.target.isa.arm64.encode
 
+## fun int_imm_fits
+
+```mach
+pub fun int_imm_fits(value: u64, bits: u32) bool;
+```
+
+whether one instruction builds the integer: one movz or movn, or one orr of
+a logical immediate, the rule the middle end hoists a loop's constants by
+(#3807). a value narrower than 64 bits is built at 32
+
 ## fun encode_arm64
 
 ```mach
