@@ -75,7 +75,8 @@ pub fun compare_operand(h: *Half, x: value.Value) value.Value;
 ```
 
 the operand a comparison of carried bits reads: the f16 itself where the
-target compares at 16 bits, else the exact binary64 widening
+target compares at 16 bits, the exact binary32 widening where it converts
+there, else the exact binary64 widening
 
 ## fun from_float
 
