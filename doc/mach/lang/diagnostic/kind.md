@@ -2996,6 +2996,12 @@ pub val RESOURCE_SIZE_LIMIT:              Kind = 493
 pub val TARGET_FLOAT_WIDTH:               Kind = 494
 ```
 
+## val NAME_BUILTIN_TYPE
+
+```mach
+pub val NAME_BUILTIN_TYPE:                Kind = 495
+```
+
 ## rec Spec
 
 ```mach
@@ -3013,7 +3019,7 @@ retired: nothing raises the kind any more; the row stays so its key is
 ## val COUNT
 
 ```mach
-pub val COUNT: usize       = 494
+pub val COUNT: usize       = 495
 ```
 
 ## fun at
