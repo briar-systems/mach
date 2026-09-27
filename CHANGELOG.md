@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.2.1] - 2026-09-26
+
+### Fixed
+- A module whose object the build cache restores has its constants bound before any lowering reads them. `mach test` after `mach build` rejected a dependency's `#[testing]` global initialiser as non-constant when it folded a constant that needs a layout, such as `$size_of(T)`, and a build after editing one module rejected its constant built from an unchanged module's layout constant the same way. A clean build was not affected (#4056).
+- `mach dep update` reads a dependency selected by `ref` at the commit it names, fetching that commit when the checkout lacks it (refused under `--offline`), instead of from its checkout under `dep/`. A subproject that reaches a dependency only through a path dependency resolved against the stale checkout's requirements and refused the update. `update --all` now moves every fixed selector in the closure to its selected commit, not only the root's own (#4060).
+
 ## [6.2.0] - 2026-09-26
 
 ### Added
