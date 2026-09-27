@@ -454,7 +454,8 @@ pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type:
     val wants_agg: bool          = ctx.tgt.abi.consumes_agg_layout;
     var ret_agg:   abi.AggLayout = abi.agg_none();
     if (wants_agg) { ret_agg = agg_layout(ctx, ret_type, ret_aggr); }
-    out.ret_slot = classify_ret(ret_size, 0, ret_float, ret_eb, ret_aggr, ret_vec, ret_hm, ret_he, ret_agg);
+    val vec_bytes: u64 = vector_register_bytes(ctx);
+    out.ret_slot = classify_ret(ret_size, 0, ret_float, ret_eb, ret_aggr, ret_vec, ret_hm, ret_he, ret_agg, vec_bytes);
 
     val fixed_natural: bool = natural_stack_slot(ctx.tgt, false);
 
@@ -503,7 +504,7 @@ pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type:
         var pagg: abi.AggLayout = abi.agg_none();
         if (wants_agg) { pagg = agg_layout(ctx, pty, pag); }
         val pvec: bool          = context.value_is_vector(ctx, pty);
-        var slot: abi.ParamSlot = classify_arg(i::i32, psz, reg_arg_align(ctx.tgt, pal), pfl, peb, pag, pvec, gp_used, fp_used, phm, phe, pagg);
+        var slot: abi.ParamSlot = classify_arg(i::i32, psz, reg_arg_align(ctx.tgt, pal), pfl, peb, pag, pvec, gp_used, fp_used, phm, phe, pagg, vec_bytes);
 
         if (is_stack_slot_class(slot.class)) {
             val pnat: bool = fixed_natural && !word_composite(pag, phm);
@@ -531,6 +532,27 @@ pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type:
     out.fp_used     = fp_used;
     out.stack_off   = stack_off;
     ret err[fail.Fail].ok{};
+}
+
+# the widest vector one register of the target carries under its selected
+# extensions, which the convention places a vector by (#3751)
+fun vector_register_bytes(ctx: *context.LowerCtx) u64 {
+    ret isa.vector_register_bytes(?ctx.tgt.model)::u64;
+}
+
+# a vector whose ir value is the address of its memory image rides a vector
+# register wider than the compute width: it moves between the register and
+# the image whole, and the upper state the move leaves is the target's to clear
+fun register_image(ctx: *context.LowerCtx, slot: *abi.ParamSlot, declared: type.IrTypeId, ty: type.IrTypeId) bool {
+    ret slot.class == abi.CLASS_FP && context.vector_image(ctx, declared, ty);
+}
+
+# the upper state a register-width move of `bytes` leaves is cleared, where the
+# target's register-width row asks for it
+fun emit_upper_clear(ctx: *context.LowerCtx, mb: *mir.MirBlock, bytes: u64) err[fail.Fail] {
+    if (!isa.vector_upper_clear(?ctx.tgt.model, bytes::u32)) { ret err[fail.Fail].ok{}; }
+    var mi: mir.MirInstr = mir.instr(mir.MIR_VEC_UPPER_CLEAR, nil, 0, 0, 0);
+    ret context.push_instr(ctx, mb, mi);
 }
 
 pub fun sig_layout_free(ctx: *context.LowerCtx, layout: *abi.SigLayout) {
@@ -692,6 +714,7 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     val ret_vector_register: bool = context.value_is_vector(ctx, inst.ty);
     val ret_mem:             bool = ret_aggr || (context.value_is_vector(ctx, ret_type) && !ret_vector_register && rslot.class == abi.CLASS_SRET);
     val ret_sret_register:   bool = rslot.class == abi.CLASS_SRET && !ret_mem;
+    val ret_register_image:  bool = register_image(ctx, ?rslot, ret_type, inst.ty);
 
     var gp_used:   i32 = layout.gp_used;
     var fp_used:   i32 = layout.fp_used;
@@ -724,6 +747,13 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
             ret ra_1;
         }
         sret_ptr = res_dst;
+    }
+    or (ret_register_image && !mir.vreg_is_nil(res_dst)) {
+        val ra_1: err[fail.Fail] = context.alloc_result_storage(ctx, mb, res_dst, ret_size, ret_storage_align);
+        if (sel ra_1.err) {
+            sig_layout_free(ctx, ?layout);
+            ret ra_1;
+        }
     }
     or (ret_sret_register && !mir.vreg_is_nil(res_dst)) {
         val sa: res[mir.VRegId, fail.Fail] = context.new_vreg(ctx, mir.REG_CLASS_GP);
@@ -778,7 +808,8 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
                 }
                 if (!abi.variadic_float_in_fp_bank(?vafl, asz)) { afl = false; }
             }
-            slot = classify_arg(pidx::i32, asz, reg_arg_align(ctx.tgt, aal), afl, 0, aag, avec, gp_used, fp_used, 0, 0, abi.agg_none());
+            slot = classify_arg(pidx::i32, asz, reg_arg_align(ctx.tgt, aal), afl, 0, aag, avec, gp_used, fp_used, 0, 0, abi.agg_none(),
+                vector_register_bytes(ctx));
             if (ctx.tgt.variadic_args_on_stack) { slot = stack_only_tail_slot(slot); }
             if (is_stack_slot_class(slot.class)) {
                 stack_off = round_up_i64(stack_off, stack_arg_align(ctx.tgt, ?slot, aal, false));
@@ -796,11 +827,15 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         }
         val argop: mir.MirOperand = aor.ok;
 
+        record_outgoing_align(ctx, ?slot);
         # the carriers, the caller's copy and every temporary between them are secret when any byte of the object is
         ctx.cur_writes_secret = av.secret;
         var er: err[fail.Fail] = err[fail.Fail].ok{};
         if (slot.class == abi.CLASS_STACK && context.vector_image(ctx, context.sig_param_type(ctx, sig, pidx), av.ty)) {
             er = emit_stack_image_arg(ctx, mb, slot, argop, soff);
+        }
+        or (register_image(ctx, ?slot, context.sig_param_type(ctx, sig, pidx), av.ty)) {
+            er = emit_register_image_arg(ctx, mb, registers, slot, argop);
         }
         or {
             er = emit_arg_slot(ctx, mb, registers, slot, argop, soff, aag, av.ty,
@@ -880,7 +915,13 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     if (sel pc.err) { ret pc; }
 
     val dst: mir.VRegId = context.instr_vreg(ctx, iid);
-    if (!mir.vreg_is_nil(dst) && rslot.class != abi.CLASS_SRET) {
+    if (ret_register_image) {
+        ctx.cur_writes_secret = inst.secret;
+        val rr: err[fail.Fail] = capture_register_image(ctx, mb, rslot, dst);
+        ctx.cur_writes_secret = false;
+        if (sel rr.err) { ret rr; }
+    }
+    or (!mir.vreg_is_nil(dst) && rslot.class != abi.CLASS_SRET) {
         ctx.cur_writes_secret = inst.secret;
         val rr: err[fail.Fail] = emit_ret_slot_to_vreg(ctx, mb, rslot, dst, ret_aggr, ret_type, ret_storage_align);
         ctx.cur_writes_secret = false;
@@ -1114,6 +1155,25 @@ fun materialize_pieces(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.Para
     }
     if (registers == ?pending) { ret append_deferred(ctx, mb, ?pending); }
     ret err[fail.Fail].ok{};
+}
+
+# a vector a register wider than the compute width carries while the ir holds
+# the address of its memory image: the image is loaded into the register whole
+fun emit_register_image_arg(ctx: *context.LowerCtx, mb: *mir.MirBlock, registers: *mir.MirBlock, slot: abi.ParamSlot, argop: mir.MirOperand) err[fail.Fail] {
+    var base: mir.VRegId     = mir.MIR_VREG_NIL;
+    val ar:   err[fail.Fail] = context.addr_to_vreg(ctx, mb, argop, ?base);
+    if (sel ar.err) { ret ar; }
+    ret context.emit_mov_w(ctx, registers, mir.op_preg(slot.reg), mir.op_mem_value(base, 0), slot.size::u8);
+}
+
+# the register a register image arrived in is stored whole into the image
+# `dst` addresses, when there is one, and the upper state it leaves is cleared
+fun capture_register_image(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, dst: mir.VRegId) err[fail.Fail] {
+    if (!mir.vreg_is_nil(dst)) {
+        val st: err[fail.Fail] = context.emit_store_to_w(ctx, mb, mir.op_mem_value(dst, 0), mir.op_preg(slot.reg), slot.size::u8);
+        if (sel st.err) { ret st; }
+    }
+    ret emit_upper_clear(ctx, mb, slot.size);
 }
 
 # a vector the convention passes by value on the stack while the ir holds the
@@ -1604,6 +1664,13 @@ fun ptr_move_width(ctx: *context.LowerCtx) u8 {
     ret ctx.tgt.model.pointer_width::u8;
 }
 
+# a stack argument placed above the stack alignment raises the alignment the
+# outgoing area starts at, which the frame realigns the stack pointer to
+fun record_outgoing_align(ctx: *context.LowerCtx, slot: *abi.ParamSlot) {
+    if (!is_stack_slot_class(slot.class) || slot.stack_align <= ctx.tgt.abi.stack_align) { ret; }
+    if (slot.stack_align > ctx.f.frame.outgoing_align)                                   { ctx.f.frame.outgoing_align = slot.stack_align; }
+}
+
 fun record_outgoing_size(ctx: *context.LowerCtx, bytes: i64) {
     if (bytes <= 0) { ret; }
     val need: u32 = bytes::u32;
@@ -1820,14 +1887,30 @@ pub fun lower_params(ctx: *context.LowerCtx, mb: *mir.MirBlock) err[fail.Fail] {
 
     var bound: u32 = ctx.param_count;
     if (layout.param_count < bound) { bound = layout.param_count; }
-    var i: u32 = 0;
+    var wide: u64 = 0;
+    var i:    u32 = 0;
     for (i < bound) {
         val pv:   mir.VRegId    = ctx.param_vregs[i];
         val pty:  type.IrTypeId = ctx.fn.params[i].ty;
         val pag:  bool          = context.value_is_aggregate(ctx, pty);
         val slot: abi.ParamSlot = layout.params[i];
 
-        if (pag || param_has_use(ctx.fn, i)) {
+        # every register image is stored before any upper state is cleared,
+        # an unused one included, whose upper state is live all the same
+        val declared: type.IrTypeId = context.sig_param_type(ctx, ctx.fn.sig, i);
+        if (register_image(ctx, ?slot, declared, pty)) {
+            if (slot.size > wide) { wide = slot.size; }
+            if (param_has_use(ctx.fn, i)) {
+                ctx.cur_writes_secret = ctx.fn.params[i].secret;
+                val er: err[fail.Fail] = capture_param_image(ctx, mb, slot, pv, declared);
+                ctx.cur_writes_secret = false;
+                if (sel er.err) {
+                    sig_layout_free(ctx, ?layout);
+                    ret er;
+                }
+            }
+        }
+        or (pag || param_has_use(ctx.fn, i)) {
             ctx.cur_writes_secret = ctx.fn.params[i].secret;
             # a vector passed by value on the stack whose ir parameter is the
             # address of its image is addressed where it lies, as an aggregate is
@@ -1843,7 +1926,23 @@ pub fun lower_params(ctx: *context.LowerCtx, mb: *mir.MirBlock) err[fail.Fail] {
     }
 
     sig_layout_free(ctx, ?layout);
+    if (wide != 0) {
+        val cr: err[fail.Fail] = emit_upper_clear(ctx, mb, wide);
+        if (sel cr.err) { ret cr; }
+    }
     ret append_deferred(ctx, mb, ?copies);
+}
+
+# a register image parameter's home is fresh storage `pv` addresses, at the
+# declared vector's alignment, which the register is stored into whole. the
+# address is public even when the bytes it names are secret
+fun capture_param_image(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, pv: mir.VRegId, declared: type.IrTypeId) err[fail.Fail] {
+    val was_secret: bool = ctx.cur_writes_secret;
+    ctx.cur_writes_secret = false;
+    val hr: err[fail.Fail] = context.alloc_result_storage(ctx, mb, pv, slot.size, context.ret_align(ctx, declared));
+    ctx.cur_writes_secret = was_secret;
+    if (sel hr.err) { ret hr; }
+    ret context.emit_store_to_w(ctx, mb, mir.op_mem_value(pv, 0), mir.op_preg(slot.reg), slot.size::u8);
 }
 
 # an integer the convention passes by reference (Win64's 16-byte integer); a
@@ -2063,6 +2162,13 @@ pub fun lower_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.
         val mr: err[fail.Fail] = materialize_pieces(ctx, mb, slot, plan);
         if (sel mr.err) { ret mr; }
     }
+    or (register_image(ctx, ?slot, rt, rv.ty)) {
+        var base: mir.VRegId     = mir.MIR_VREG_NIL;
+        val ar:   err[fail.Fail] = context.addr_to_vreg(ctx, mb, rvop, ?base);
+        if (sel ar.err) { ret ar; }
+        val mr: err[fail.Fail] = context.emit_mov_w(ctx, mb, mir.op_preg(slot.reg), mir.op_mem_value(base, 0), slot.size::u8);
+        if (sel mr.err) { ret mr; }
+    }
     or (slot.class == abi.CLASS_FP && int_rides_fp_slot(ctx, rt)) {
         val mr: err[fail.Fail] = emit_int_to_fp_reg(ctx, mb, mb, slot.reg, rvop, rt);
         if (sel mr.err) { ret mr; }
@@ -2246,14 +2352,14 @@ test stack_only_tail_slot__moves_placement_not_form {
 fun probe_arg(index: i32, size: u64, align: u64, is_float: bool, fp_eightbytes: u8,
     is_aggregate: bool, is_vector: bool,
     gp_used: i32, fp_used: i32,
-    hfa_members: u8, hfa_elem: u8, agg: abi.AggLayout) abi.ParamSlot {
+    hfa_members: u8, hfa_elem: u8, agg: abi.AggLayout, vec_bytes: u64) abi.ParamSlot {
     ret abi.make_slot(abi.CLASS_GP, index, 0, size, 8);
 }
 
 #[testing]
 fun probe_ret(size: u64, align: u64, is_float: bool, fp_eightbytes: u8,
     is_aggregate: bool, is_vector: bool, hfa_members: u8, hfa_elem: u8,
-    agg: abi.AggLayout) abi.ParamSlot {
+    agg: abi.AggLayout, vec_bytes: u64) abi.ParamSlot {
     ret abi.make_slot(abi.CLASS_GP, 0, 0, size, 8);
 }
 
@@ -2984,8 +3090,8 @@ test carrier_memory__exact_extent_and_padding {
         val word:           u32              = tgt.model.gpr_width;
         val arg:            abi.ArgPassingFn = tgt.abi.arg_passing;
         val result:         abi.RetPassingFn = tgt.abi.ret_passing;
-        val classified_arg: abi.ParamSlot    = arg(0, 4, 4, false, 0, true, false, 0, 0, 0, 0, abi.agg_none());
-        val classified_ret: abi.ParamSlot    = result(4, 4, false, 0, true, false, 0, 0, abi.agg_none());
+        val classified_arg: abi.ParamSlot    = arg(0, 4, 4, false, 0, true, false, 0, 0, 0, 0, abi.agg_none(), 16);
+        val classified_ret: abi.ParamSlot    = result(4, 4, false, 0, true, false, 0, 0, abi.agg_none(), 16);
         if (classified_arg.size != 4 || classified_ret.size != 4 ||
             classified_arg.piece_count != 1 || classified_ret.piece_count != 1 ||
             classified_arg.pieces[0].width != word::u8 || classified_ret.pieces[0].width != word::u8) { ret 10; }
@@ -3061,7 +3167,7 @@ test carrier_memory__requires_legal_base_and_piece_alignment {
 #[testing]
 fun t_incoming_arg(index: i32, size: u64, align: u64, is_float: bool, fp_eightbytes: u8,
     is_aggregate: bool, variadic: bool, gp_used: i32, fp_used: i32,
-    hfa_count: u8, hfa_width: u8, leaves: abi.AggLayout) abi.ParamSlot {
+    hfa_count: u8, hfa_width: u8, leaves: abi.AggLayout, vec_bytes: u64) abi.ParamSlot {
     if (index == 2) { ret abi.make_slot(abi.CLASS_FP, isa.regid_make(isa.REG_CLASS_ID_XMM, 1), 0, size, 16); }
     if (index != 0) { ret abi.make_slot(abi.CLASS_GP, 1, 0, size, 8); }
     var slot: abi.ParamSlot = abi.make_slot(abi.CLASS_GP, 0, 0, size, 4);

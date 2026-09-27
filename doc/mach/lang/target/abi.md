@@ -282,17 +282,20 @@ pub val EB_UNALIGNED: u8 = 16
 ## def ArgPassingFn
 
 ```mach
-pub def ArgPassingFn: fun(i32, u64, u64, bool, u8, bool, bool, i32, i32, u8, u8, AggLayout) ParamSlot
+pub def ArgPassingFn: fun(i32, u64, u64, bool, u8, bool, bool, i32, i32, u8, u8, AggLayout, u64) ParamSlot
 ```
 
 the arguments are index, size, align, is_float, eightbytes, is_aggregate, is_vector, gp_used, fp_used,
-hfa_members, hfa_elem and the aggregate layout. align is the alignment the register assignment honors: the
-type's own, capped where the platform relaxes it (darwin aarch64 starts a 16-byte value in any x register)
+hfa_members, hfa_elem, the aggregate layout and the vector register bytes. align is the alignment the
+register assignment honors: the type's own, capped where the platform relaxes it (darwin aarch64 starts a
+16-byte value in any x register). the vector register bytes are the widest vector one register of the
+target carries under its selected extensions (isa.vector_register_bytes), which a convention that places
+a vector by its register width reads (System V's ymm under avx, #3751)
 
 ## def RetPassingFn
 
 ```mach
-pub def RetPassingFn: fun(u64, u64, bool, u8, bool, bool, u8, u8, AggLayout) ParamSlot
+pub def RetPassingFn: fun(u64, u64, bool, u8, bool, bool, u8, u8, AggLayout, u64) ParamSlot
 ```
 
 ## def RegFileFn

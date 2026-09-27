@@ -170,7 +170,7 @@ pub fun fp_param_reg(index: i32) i32;
 pub fun classify_arg(index: i32, size: u64, align: u64,
 is_float: bool, fp_eightbytes: u8, is_aggregate: bool, is_vector: bool,
 gp_used: i32, fp_used: i32, hfa_members: u8, hfa_elem: u8,
-agg: abi.AggLayout) abi.ParamSlot;
+agg: abi.AggLayout, vec_bytes: u64) abi.ParamSlot;
 ```
 
 ## fun classify_return
@@ -178,7 +178,7 @@ agg: abi.AggLayout) abi.ParamSlot;
 ```mach
 pub fun classify_return(size: u64, align: u64,
 is_float: bool, fp_eightbytes: u8, is_aggregate: bool, is_vector: bool,
-hfa_members: u8, hfa_elem: u8, agg: abi.AggLayout) abi.ParamSlot;
+hfa_members: u8, hfa_elem: u8, agg: abi.AggLayout, vec_bytes: u64) abi.ParamSlot;
 ```
 
 ## fun gp_param_regs

@@ -471,6 +471,18 @@ a lane join of two parts (dst, lo, hi, the lanes of lo in imm): the lanes of
 lo and then those of hi, of one lane type, in one register. the IR join of
 more parts lowers to a chain of these (#3589)
 
+## val MIR_VEC_UPPER_CLEAR
+
+```mach
+pub val MIR_VEC_UPPER_CLEAR: MirOpcode = 0x1010
+```
+
+the upper bytes of the vector registers above the compute width are
+cleared: a value wider than `vector_bits` a convention carried has left its
+register, and nothing the function holds lives above the compute width.
+emitted only where the model's register-width row says the narrower code
+pays for that state (isa.vector_upper_clear), x86-64's vzeroupper (#3751)
+
 ## val MIR_SEL_ADD
 
 ```mach

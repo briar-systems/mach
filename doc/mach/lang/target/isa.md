@@ -518,6 +518,21 @@ pub val FORM_PACKED:     VectorForm = 2
 pub val VECTOR_BITS_128: u32 = 128
 ```
 
+## rec VectorRegisterRow
+
+```mach
+pub rec VectorRegisterRow;
+```
+
+a width the vector register file takes under an extension: with `ext`
+selected a register carries `bytes`, more than the compute width
+`vector_bits` the packed rows run at. a convention that places a vector by
+the register it fits reads the widest selected row (#3751). `upper_clear`
+says the narrower code the target emits pays for a register's upper bytes
+while they hold a value, so the upper state is cleared once a value of this
+width has been moved out of its register (x86-64's vzeroupper after a ymm
+value, which the legacy-encoded 128-bit instructions otherwise stall on)
+
 ## val VECTOR_LANES_UNBOUNDED
 
 ```mach
@@ -687,6 +702,24 @@ pub fun half_native(m: *MachineModel, op: VecOp, is_float: bool, lane_bits: u32,
 
 the target realizes this scalar f16 cell with its own instruction under the
 selected extensions; false is the inlined expansion
+
+## fun vector_register_bytes
+
+```mach
+pub fun vector_register_bytes(m: *MachineModel) u32;
+```
+
+the widest vector one register carries under the selected extensions: the
+compute width, or a selected row's wider register
+
+## fun vector_upper_clear
+
+```mach
+pub fun vector_upper_clear(m: *MachineModel, bytes: u32) bool;
+```
+
+a value `bytes` wide moved out of its register leaves upper state the
+target clears afterwards
 
 ## fun vector_domain_len
 
