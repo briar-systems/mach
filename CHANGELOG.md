@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.3.0] - 2026-09-26
+
+### Added
+- `#[expect("<key>", ...)]` acknowledges the named warnings a declaration raises on purpose. A warning of a named kind whose site lies inside the declaration, its doc comment and body included, is neither printed nor counted, and warnings elsewhere or of other kinds still report. A warning raised late in the build, such as `vector.scalarize` from lowering, a generic instance's warning and a warning replayed from the build cache are matched through their source site. It applies to `fun`, `rec`, `uni`, `tag`, `val`, `var` and `test`, once per declaration naming every key it acknowledges, and is refused on `use`, `fwd`, `def` and `$if`, since there is no module-wide form. An unknown key, a key that covers only errors, a key named twice and a second `#[expect]` are errors. When a key decided by the source alone (`import.unused`, `decl.deprecated`, `doc.lint`, `float.inexact`) names no warning raised inside the declaration, that is itself a warning, `expect.unfulfilled`. A key whose warning depends on the target or on what the build compiles, such as `vector.scalarize`, is never reported unfulfilled, and a build with errors judges no expectation. A warning `#[expect]` covers counts as acknowledged even when `allow` also silences it (#4065).
+- A key's leading components name a family that `allow` and `#[expect]` both accept: `"target"` selects `target.skipped` and `target.native_fallback`, and `"vector"` selects `vector.scalarize`. A family covers whole components only, so `"vec"` is not a key (#4065).
+
+### Changed
+- The `[profile].allow` names changed. Every diagnostic kind now has a dotted key named by its subject, and the flat names 6.2.0 introduced are replaced outright, with no aliases, so an `allow` list written for 6.2 must be renamed. An old name is refused as unknown, naming the keys there are (#4065).
+
+  | 6.2 name | 6.3 key |
+  |---|---|
+  | `unused-import` | `import.unused` |
+  | `deprecated` | `decl.deprecated` |
+  | `doclint` | `doc.lint` |
+  | `inexact-float-literal` | `float.inexact` |
+  | `fwd-instances` | `fwd.instances` |
+  | `debug-dropped` | `debug.dropped` |
+  | `target-skipped` | `target.skipped` |
+  | `native-fallback` | `target.native_fallback` |
+  | `scalarize` | `vector.scalarize` |
+  | `not-oblivious` (error) | `secret.not_oblivious` (error) |
+  | (new) | `expect.unfulfilled` |
+
+- Every keyed diagnostic prints its key: `warning[vector.scalarize]: ...`, `error[secret.not_oblivious]: ...` (#4065).
+- Every command's exit code comes from its failure's class: 1 for a user problem, 2 for an internal fault and 3 for an environment failure. No command path returns a literal code any more, apart from `mach run` passing through the program's own exit code and `128 + signal`, and a test function's numeric step codes. The codes that change (#4046):
+  - `mach dep`: a git, network or filesystem failure exits 3 wherever it happens (it exited 1 at most call sites, and 2 after a failed gitlink check or stage). A user problem found while realizing a slot, such as a cloned manifest whose id does not match, exits 1 (it exited 3). An allocator or session failure stays 2.
+  - `mach build`, `mach check` and `mach dep verify`: a git or filesystem failure while verifying the dependency closure exits 3 (was 1), and so does a dependency's uninitialised gitlink (was 1).
+  - `mach doc`: failing to create the output directory or write a page or the index exits 3 (was 2). Registry and configuration failures follow their class.
+  - `mach test`: a `--runner` that does not resolve exits by its class, usually 1 (was 2). Link-input and log-directory failures follow their class, so a directory failure exits 3 (was 2).
+  - `mach init`: a filesystem failure while scaffolding, or failing to read the working directory, exits 3 (was 2). A std dependency that cannot be added exits with that failure's own code (was always 3).
+  - `mach help`: a failed write to stdout or stderr exits 3 (was 2).
+  - `mach run --runner` and `mach test --runner`: an unset `PATH` exits 3 (was 1).
+  - `mach run`: a child that ended with neither an exit status nor a signal exits 3 (was 1).
+  - `mach info` and command dispatch: registry and invocation setup failures follow their class (were always 2).
+- The compiler builds against std 9 (`[dep.std] version = "^9.0"`, gitlink at v9.0.0, from `~7.4.1`) and states `mach = "^6"`, and CI and CD seed from mach 6.2.1. The source builds against std 8 and 9 unchanged: the one production call std 9's empty-needle match reaches, the test filter, already returns early on an empty filter. The seed stage builds the host's default artifact, without the `--bin` selection seeds older than 5.12 needed (#4053).
+
 ## [6.2.1] - 2026-09-26
 
 ### Fixed
