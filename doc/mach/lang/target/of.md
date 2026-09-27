@@ -734,6 +734,61 @@ pub rec FrameUnwind;
 pub rec Relocation;
 ```
 
+## def RelocOrigin
+
+```mach
+pub def RelocOrigin: u8
+```
+
+who produced a relocation: mach's codegen (the zero value), the user's
+inline asm, or an input object mach did not make
+
+## val RELOC_CODEGEN
+
+```mach
+pub val RELOC_CODEGEN: RelocOrigin = 0
+```
+
+## val RELOC_ASM
+
+```mach
+pub val RELOC_ASM:     RelocOrigin = 1
+```
+
+## val RELOC_INPUT
+
+```mach
+pub val RELOC_INPUT:   RelocOrigin = 2
+```
+
+## fun reloc_refusal
+
+```mach
+pub fun reloc_refusal(origin: RelocOrigin, k: dkind.Kind, text: str) fail.Fail;
+```
+
+a relocation the link or the object writer refuses is the user's when their
+inline asm or an input object asked for it, and a compiler defect when
+codegen made it
+
+## rec ObjectInput
+
+```mach
+pub rec ObjectInput;
+```
+
+an object or archive the link reads from a path, and who produced it: an
+object mach wrote (RELOC_CODEGEN) or an input mach did not make
+(RELOC_INPUT). the origin travels with the path from where the list is built
+
+## fun set_relocation_origin
+
+```mach
+pub fun set_relocation_origin(img: *ObjectImage, origin: RelocOrigin);
+```
+
+every relocation of an image read from an input takes that input's origin
+
 ## val INDIRECT_LOCAL
 
 ```mach

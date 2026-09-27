@@ -72,6 +72,8 @@ pub fun region_ok(buf_size: usize, offset: usize, len: usize) bool;
 pub fun require_region(buf_size: usize, offset: usize, len: usize, msg: str) err[fail.Fail];
 ```
 
+an input object's region that its own bytes do not hold: the object is malformed
+
 ## fun cstr_at
 
 ```mach

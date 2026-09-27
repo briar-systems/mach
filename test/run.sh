@@ -380,7 +380,7 @@ artifact() {
 }
 
 # first_error <log>
-first_error() { grep -m1 -E '^error:|: error' "$1" || tail -n1 "$1"; }
+first_error() { grep -m1 -E '^error(\[[^]]*\])?:|: error' "$1" || tail -n1 "$1"; }
 
 # reference <case>: the C answer, built and run once per case at O0, O2 and ubsan;
 # the three must agree before either is compared with mach. the answer is kept
@@ -555,7 +555,7 @@ link_cell() {
     case "$case_run" in
         build-fails)
             if [ "$built" -eq 1 ]; then fail "$label built, expected a link error"; rm -rf "$tmp"; return; fi
-            grep '^error:' "$tmp/build.log" >"$tmp/out.txt"
+            grep -E '^error(\[[^]]*\])?:' "$tmp/build.log" >"$tmp/out.txt"
             [ -s "$tmp/out.txt" ] || { fail "$label failed without an 'error:' diagnostic: $(tail -n1 "$tmp/build.log")"; rm -rf "$tmp"; return; }
             ;;
         *)

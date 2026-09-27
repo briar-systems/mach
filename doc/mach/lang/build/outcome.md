@@ -217,6 +217,17 @@ pub fun unknown_catalog(a: *A.Allocator, catalog_name: str, tag: u32) Fail;
 pub fun from_fail(f: fail.Fail) Fail;
 ```
 
+a language failure keeps its class and its kind
+
+## fun to_fail
+
+```mach
+pub fun to_fail(f: Fail) fail.Fail;
+```
+
+a driver failure met inside a language pass (an output write): the class
+and the kind are kept
+
 ## fun user_fail
 
 ```mach
@@ -224,7 +235,8 @@ pub fun user_fail(k: dkind.Kind, f: fail.Fail) Fail;
 ```
 
 a phase failure the user caused (target selection, source loading, import
-libraries): its text becomes the user class, a reported failure stays reported
+libraries): an unkeyed text becomes the user class under `k`, a keyed
+failure keeps its own class and kind, a reported failure stays reported
 
 ## def ArtifactKind
 

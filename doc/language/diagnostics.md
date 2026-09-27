@@ -81,11 +81,12 @@ disappears, moves or changes severity.
 | `target`, `layout`, `stack`, `alloca`, `spirv` | what a target cannot realize: widths, operations, frame sizes, SPIR-V rules |
 | `import.unused`, `decl.deprecated`, `doc.lint`, `float.inexact`, `fwd.instances`, `debug.dropped`, `target.skipped`, `target.native_fallback`, `expect.unfulfilled` | the warnings, listed with what raises them under [Silencing warnings](manifest.md#silencing-warnings) |
 | `manifest`, `toml`, `allow`, `selection`, `need`, `template`, `version` | `mach.toml`: its keys and values, profile `allow` lists, target, profile and artifact selection, `need` entries, path templates and version ranges |
-| `project`, `artifact`, `output`, `source`, `path`, `glob`, `step`, `link`, `clean` | the build: finding the project, artifacts and their outputs, build steps, link inputs, and `mach clean` |
+| `project`, `artifact`, `output`, `source`, `path`, `glob`, `step`, `clean` | the build: finding the project, artifacts and their outputs, build steps, and `mach clean` |
 | `dep`, `mach`, `git` | dependencies: declaration, resolution, realization and pins, the compiler range the closure accepts, and the Git operations behind them |
 | `test` | the test runner, alongside `test` blocks |
 | `cli`, `editor` | command-line flags, commands and operands, and the editor analysis entry points |
 | `fs`, `process`, `env` | the machine: a file, process or environment operation that failed |
+| `link`, `object`, `resource` | the link: its declared inputs, undefined and duplicate symbols, relocations that overflow or are unsupported, images over a format limit, and input objects, archives, libraries or resources that are malformed, unsupported or of another format |
 | `catalog` | a member of a closed catalog read from input that is malformed or that the target cannot honor |
 | `compiler` | `compiler.internal`, a defect in mach |
 
