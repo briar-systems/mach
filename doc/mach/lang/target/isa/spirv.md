@@ -815,7 +815,7 @@ pub val ADDRESSING_LOGICAL: u32 = 0
 ## val DIM_1D
 
 ```mach
-pub val DIM_1D: u32 = 0
+pub val DIM_1D:   u32 = 0
 ```
 
 ## val DIM_CUBE

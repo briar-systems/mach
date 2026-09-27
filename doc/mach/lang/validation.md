@@ -57,13 +57,13 @@ pub def ValidationCause: u8
 ## val CAUSE_PASS
 
 ```mach
-pub val CAUSE_PASS: ValidationCause = 0
+pub val CAUSE_PASS:                 ValidationCause = 0
 ```
 
 ## val CAUSE_ORACLE_TIMEOUT
 
 ```mach
-pub val CAUSE_ORACLE_TIMEOUT:      ValidationCause = 6
+pub val CAUSE_ORACLE_TIMEOUT:       ValidationCause = 6
 ```
 
 ## val CAUSE_ORACLE_SPAWN_FAILURE
