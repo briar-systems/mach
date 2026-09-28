@@ -172,6 +172,12 @@ pub val ASM_NOTE_BYTES:   u8 = notes.ASM_NOTE_BYTES
 pub val ASM_NOTE_BARRIER: u8 = notes.ASM_NOTE_BARRIER
 ```
 
+## val ASM_NOTE_LABEL
+
+```mach
+pub val ASM_NOTE_LABEL:   u8 = notes.ASM_NOTE_LABEL
+```
+
 ## val ASM_NOTE_BYTES_WIDTH
 
 ```mach

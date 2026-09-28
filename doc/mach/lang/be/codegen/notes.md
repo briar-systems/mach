@@ -32,6 +32,14 @@ pub val ASM_NOTE_BARRIER: u8 = 4
 
 a declassify barrier: no bytes, the MirInstr names the register it downgrades
 
+## val ASM_NOTE_LABEL
+
+```mach
+pub val ASM_NOTE_LABEL: u8 = 5
+```
+
+a numbered local label's definition in an asm block: no bytes, id is its number
+
 ## val ASM_NOTE_BYTES_WIDTH
 
 ```mach

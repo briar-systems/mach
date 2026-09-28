@@ -12,6 +12,15 @@ pub fun note_function(buf: *enc.ByteBuf, interner: *intern.Interner, f: *mir.Mir
 pub fun note_block(buf: *enc.ByteBuf, id: u32) err[fail.Fail];
 ```
 
+## fun note_local_label
+
+```mach
+pub fun note_local_label(buf: *enc.ByteBuf, number: u32) err[fail.Fail];
+```
+
+an asm block's numbered label, spelled as the block spells it: GNU as and
+the block both resolve `1f` to the next `1:` and `1b` to the last one
+
 ## fun note_inst
 
 ```mach
