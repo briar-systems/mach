@@ -74,14 +74,41 @@ Each directive is wrapped in its own clause: `#[name]` for a bare flag or
 `#[name(args)]` for a directive that takes arguments. Arguments are comptime
 expressions.
 
+### Constant arguments
+
+Where a directive takes a string or an integer, the argument is a constant
+expression of that type, evaluated at compile time in the declaring module. A
+literal is one. So is a `val`, one an `$if` arm selects, or one imported from
+another module. A directive's argument never depends on the build that
+evaluates it, only on the constants in scope. `#[symbol]` stays exactly the
+name you give it: the compiler adds no platform decoration of its own, and a
+`val` gated by comptime is how one declaration names its symbol per target.
+
+```mach
+$if ($mach.build.os == $mach.os.darwin) {
+    val SPIN: *u8 = "_spin";
+}
+$or {
+    val SPIN: *u8 = "spin";
+}
+
+#[symbol(SPIN)]
+pub fun spin() i64 {
+    ret 0;
+}
+```
+
+An argument that is not a constant expression, such as a `var` or a call, is
+refused with `decorator.not_constant`, naming the directive. A constant of the
+wrong type is refused with `decorator.argument`.
+
 ## Directives
 
 ### `deprecated` / `deprecated(str)` — source-use notice
 
-Marks a declaration deprecated. The optional argument is one string literal
-carrying a message, decoded with the ordinary literal escapes; repeating the
-attribute or giving it more than one argument, or a non-literal argument, is an
-error. The attribute changes nothing about visibility, type identity, ABI or
+Marks a declaration deprecated. The optional argument is one constant string
+carrying a message. Repeating the attribute, giving it more than one argument,
+or giving it an argument that is not a constant string is an error. The attribute changes nothing about visibility, type identity, ABI or
 codegen.
 
 A use of the deprecated declaration from another source module warns at the
@@ -212,7 +239,7 @@ omits testing declarations.
 ### `expect(key)` — acknowledge a warning
 
 Acknowledges warnings a declaration raises on purpose. Each argument is a
-string literal naming a warning key, or a family of keys, from the
+constant string naming a warning key, or a family of keys, from the
 [diagnostic key table](manifest.md#silencing-warnings). A warning of a named
 kind raised inside the declaration, its doc comment and body included, is
 neither printed nor counted. Warnings elsewhere, and warnings of other kinds,
@@ -820,7 +847,7 @@ processor's features and when that answer holds.
 Sources a `val`'s bytes from a file at compile time: the file's content **is**
 the initializer. Applies to `val` only — not `var` (the storage is read-only
 data) and not an `ext` data import (which has no storage here). Takes one
-string-literal argument.
+constant string argument.
 
 ```mach fragment
 #[embed("assets/logo.qoi")]
@@ -834,8 +861,8 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
   `embed` is rejected. This is a second exemption to `val`'s
   requires-an-initializer rule, alongside `ext` (see
   [val-var.md](val-var.md#ext--foreign-data-imports)).
-- Exactly one argument, a string literal. Escapes are **not** decoded, matching
-  `symbol` and `section` — the path is taken as written.
+- Exactly one argument, a constant string, decoded like any string: a literal's
+  escapes are its value, as they are for `symbol` and `section`.
 - The path resolves relative to the **declaring source file's** directory. An
   absolute path is taken as written. The resolved file must lie inside the
   project root: an embed that escapes it (`../../outside.txt` from `src/`) is
@@ -1097,8 +1124,8 @@ pub def Sampler2D;
 ```
 
 The first argument names the target and the second the type constructor within it.
-Both are matched against the target's own definition table rather than evaluated,
-so both must be string literals. Everything after them is **operands to that
+Both are constant strings matched against the target's own definition table.
+Everything after them is **operands to that
 constructor**, never rule knobs: the rules a handle carries are fixed and closed
 (see [types.md](types.md)) and never vary per declaration.
 
