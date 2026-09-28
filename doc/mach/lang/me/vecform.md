@@ -73,7 +73,7 @@ instruction on the target, rather than a chain of doublings (#4161)
 ## fun packed_lanes
 
 ```mach
-pub fun packed_lanes(tgt: *target.Target, lane_bits: u32) u32;
+pub fun packed_lanes(tgt: *target.Target, is_float: bool, lane_bits: u32) u32;
 ```
 
 ## fun decide
@@ -88,14 +88,15 @@ expansion, or undeclared when the catalog names neither for its lane shape
 ## fun piece_lanes
 
 ```mach
-pub fun piece_lanes(tgt: *target.Target, lane_bits: u32) u32;
+pub fun piece_lanes(tgt: *target.Target, is_float: bool, lane_bits: u32) u32;
 ```
 
 the lanes of one register-width piece a vector of `lane_bits` lanes wider
 than the register is split into (#3589): the target's declared vector width
-over the lane, capped by its lane count. 0 where a vector is not split: no
-vector register, or a target whose vectors are values rather than registers
-(spir-v), which realizes a vector of any declared width whole
+over the lane's kind and width, capped by its lane count. 0 where a vector
+is not split: no vector register, or a target whose vectors are values
+rather than registers (spir-v), which realizes a vector of any declared
+width whole
 
 ## fun splits
 

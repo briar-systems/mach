@@ -109,8 +109,17 @@ pub fun new_vreg(ctx: *LowerCtx, reg_class: u32) res[mir.VRegId, fail.Fail];
 ## fun new_vreg_vec
 
 ```mach
-pub fun new_vreg_vec(ctx: *LowerCtx, reg_class: u32, vector: bool) res[mir.VRegId, fail.Fail];
+pub fun new_vreg_vec(ctx: *LowerCtx, reg_class: u32, vec_bytes: u8) res[mir.VRegId, fail.Fail];
 ```
+
+## fun vec_bytes_of
+
+```mach
+pub fun vec_bytes_of(ctx: *LowerCtx, ty: ir_type.IrTypeId) u8;
+```
+
+the register bytes a value of `ty` is realized in when it is a vector, 0
+for any other value
 
 ## fun instr_vreg
 

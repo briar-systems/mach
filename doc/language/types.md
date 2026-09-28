@@ -190,9 +190,13 @@ lane multiply on x86-64) runs lane by lane on each piece, and under
 
 The piece width is the target's **declared** vector width, not its name, so a
 target that gains wider vector registers gets **better code**, not new
-spellings: one that declares a 256-bit register holds an `i32x8` whole. SPIR-V,
-whose vectors are values rather than registers, splits nothing. A secret vector
-keeps its secrecy on every piece.
+spellings: one that declares a 256-bit register holds an `i32x8` whole. x86-64
+declares one per lane kind: with `avx` its float lanes (`f16`, `f32`, `f64`)
+compute at 256 bits, and with `avx2` (`x86-64-v3`) its integer lanes do too, so
+under `x86-64-v3` an `i32x8`, an `i16x16` or an `f64x4` is one `ymm` register
+and one VEX.256 instruction per operation, and an `i32x16` is two such pieces.
+SPIR-V, whose vectors are values rather than registers, splits nothing. A secret
+vector keeps its secrecy on every piece.
 
 `ptr` is not a lane element: its width is target-defined rather than a scalar bit
 count, so `ptrx2` is not a vector spelling. A lane is an integer of 8 to 64 bits,
@@ -236,7 +240,7 @@ at any width.
 | `f32x4` | 16 | 16 |
 | `i16x4` | 8 | 2 |
 | `f32x5` | 20 | 16 |
-| `f32x8` | 32 | 16 |
+| `f32x8` | 32 | 16 (32 where the target's vector register is 256 bits) |
 
 `$align_of` has **two rungs, each for its own reason**. A vector *narrower* than
 the vector register is a packed aggregate that loads piecewise, so it aligns to a
@@ -245,6 +249,12 @@ machine's vector load requires it. One *wider* than the register is split into
 register-width pieces, each loaded and stored on its own, so it aligns to the
 register width — 16 for `f32x8`, not 32, because each piece is one 16-byte load
 and a larger alignment would serve none of them.
+
+The register is the widest the target's selected extensions give it. On x86-64
+with `avx` it is the 32-byte `ymm`, and a vector aligns to the widest register it
+fills: 32 for `f32x8`, `i32x8` and every wider vector, 16 for `f32x4` and for a
+20- or 24-byte vector, and a lane for one narrower than 16 bytes, as C aligns
+`__m256` and `__m128`.
 
 The first rung is what makes `[N]f32x3` a usable packed vertex buffer: padding
 `f32x3` to 16 bytes would make it indistinguishable from `f32x4` in memory.

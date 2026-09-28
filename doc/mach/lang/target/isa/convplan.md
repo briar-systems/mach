@@ -37,10 +37,12 @@ pub val PLACE_TEMP:    Place = 2
 pub rec Step;
 ```
 
-op:  the target's machine opcode
-dst: the place the step writes
-src: the place the step reads besides a two-address destination
-arg: the target's per-step argument, an immediate or a lane width
+op:    the target's machine opcode
+dst:   the place the step writes
+src:   the place the step reads besides a two-address destination
+arg:   the target's per-step argument, an immediate or a lane width
+width: the register width in bytes the step runs at, 0 for the target's
+       narrowest vector register
 
 ## val STEPS_MAX
 
@@ -69,6 +71,14 @@ pub fun plan() Plan;
 ```mach
 pub fun push(p: *Plan, op: u32, dst: Place, src: Place, arg: u32);
 ```
+
+## fun push_at
+
+```mach
+pub fun push_at(p: *Plan, op: u32, dst: Place, src: Place, arg: u32, width: u32);
+```
+
+a step at a register width wider than the target's narrowest
 
 ## fun late_operand_read
 

@@ -586,6 +586,21 @@ while they hold a value, so the upper state is cleared once a value of this
 width has been moved out of its register (x86-64's vzeroupper after a ymm
 value, which the legacy-encoded 128-bit instructions otherwise stall on)
 
+## rec VectorWidthRow
+
+```mach
+pub rec VectorWidthRow;
+```
+
+a compute width an extension gives the packed rows over one kind of lane:
+with `ext` selected, the rows over float lanes (`is_float`) or integer ones
+of the byte widths `lanes` names (a sum of 1, 2, 4 and 8, as vec_mem_widths)
+run at `bits` rather than the baseline `vector_bits`. a vector of those
+lanes is then realized whole in a register that wide, and type legalization
+splits it only past it (#4128). the kinds widen apart on a target whose
+extensions do: x86-64's avx computes binary32 and binary64 at 256 bits and
+leaves integers at 128 until avx2
+
 ## val VECTOR_LANES_UNBOUNDED
 
 ```mach
@@ -795,6 +810,15 @@ pub fun vector_register_bytes(m: *MachineModel) u32;
 the widest vector one register carries under the selected extensions: the
 compute width, or a selected row's wider register
 
+## fun vector_register_bits
+
+```mach
+pub fun vector_register_bits(m: *MachineModel) u32;
+```
+
+the widest vector register the selected extensions give, in bits: the
+layout aligns a vector as wide as one to it (#4128)
+
 ## fun vector_upper_clear
 
 ```mach
@@ -803,6 +827,15 @@ pub fun vector_upper_clear(m: *MachineModel, bytes: u32) bool;
 
 a value `bytes` wide moved out of its register leaves upper state the
 target clears afterwards
+
+## fun vector_width
+
+```mach
+pub fun vector_width(m: *MachineModel, is_float: bool, lane_bits: u32) u32;
+```
+
+the width in bits the packed rows over lanes of this kind and width run at
+under the selected extensions: the widest selected row's, or `vector_bits`
 
 ## fun vector_domain_len
 
@@ -1014,13 +1047,23 @@ domain is every extension bit the target model knows
 pub fun vector_domain_complete(m: *MachineModel) bool;
 ```
 
+## fun from_is_float
+
+```mach
+pub fun from_is_float(op: VecOp, is_float: bool) bool;
+```
+
+the lane kind of a cell's operand: a conversion between the kinds reads
+the other kind, and every other cell its result's
+
 ## fun packed_width
 
 ```mach
 pub fun packed_width(m: *MachineModel, op: VecOp, is_float: bool, lane_bits: u32, from_bits: u32) u32;
 ```
 
-a conversion's register holds its wider side, so that side sets the extent
+a conversion's register holds its wider side, so that side sets the extent,
+and each side's lanes stay within its own kind's width
 
 ## fun packing_extension
 
@@ -1061,8 +1104,19 @@ the one declared outcome for a cell: packed, the scalar expansion, or nothing
 ## fun packed_lane_cap
 
 ```mach
-pub fun packed_lane_cap(m: *MachineModel, lane_bits: u32) u32;
+pub fun packed_lane_cap(m: *MachineModel, is_float: bool, lane_bits: u32) u32;
 ```
+
+## fun vector_op_bytes
+
+```mach
+pub fun vector_op_bytes(m: *MachineModel, is_float: bool, lane_bits: u32, bytes: u32) u32;
+```
+
+the bytes of the register that realizes a vector of `bytes` over lanes of
+this kind whole: the narrowest register width the kind computes at that
+holds it, `vector_op_bytes` at the least. a vector wider than every such
+register is not realized in one and keeps the narrowest (#4128)
 
 ## fun moves_unaligned_gp
 
@@ -1095,6 +1149,10 @@ pub fun mem_disp_folds(m: *MachineModel, off: i64) bool;
 ```mach
 pub fun moves_vector_memory(m: *MachineModel, bytes: u32) bool;
 ```
+
+a vector of `bytes` moves between memory and its register in one access:
+a width the target declares, or a register width its extensions give past
+the compute width (#4128)
 
 ## fun reads_slot_operand
 
@@ -1132,7 +1190,7 @@ of this many bytes
 ## fun fits_vector_register
 
 ```mach
-pub fun fits_vector_register(m: *MachineModel, lane_bits: u32, lanes: u32) bool;
+pub fun fits_vector_register(m: *MachineModel, is_float: bool, lane_bits: u32, lanes: u32) bool;
 ```
 
 ## def AsmClobbersFn
