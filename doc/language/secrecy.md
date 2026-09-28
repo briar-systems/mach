@@ -804,7 +804,7 @@ direction. Note that a flat null is necessary and not sufficient: it must also b
 sampled at a comparable cost to the probe it is bounding, or a quiet control at one
 magnitude certifies nothing about noise at another.
 
-**The x86-64 inline-asm flags table is measured, not inferred.** The eighteen-row
+**The x86-64 inline-asm flags table is measured, not inferred.** The twenty-two-row
 classification the `#[oblivious]` asm model rests on, naming which instructions
 *define* ZF and CF, which merely write them, and which read them, is re-derived on x86-64
 hosts by `mach.lang.target.isa.x64.probe`, which runs each instruction twice with
@@ -815,7 +815,8 @@ exempt and classified by reasoning instead: `popfq`, `iretq` and `syscall` pass 
 writer probe cleanly and are still not definers, because the flags came from the
 stack, the interrupt frame, or an existing value masked through `IA32_FMASK`, and
 where a value came *from* is structural rather than measurable. A non-x86-64 host
-declines the probe by name.
+declines the probe by name, and an extension row runs only on a host whose cpuid
+reports the extension.
 
 **What a timing harness can and cannot assure.** The leakage model has three
 channels and no single sampling regime covers them (briar-systems/mach#2363):
