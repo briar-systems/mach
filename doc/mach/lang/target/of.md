@@ -963,7 +963,7 @@ data; an empty shape when no import needs a slot
 pub rec UnwindShape;
 ```
 
-the unwind tables of an executable: an index an unwinder searches by address
+the unwind tables of an image: an index an unwinder searches by address
 and the frame descriptions it reaches, each empty when the format needs none
 
 ## rec ForeignUnwind
@@ -1367,7 +1367,7 @@ str, *u8, ImageOptions) err[fail.Fail]
 
 ```mach
 pub def SharedFn: fun(*A.Allocator, *intern.Interner, *ObjectTarget, *LoadSegment, u32, u64,
-*ExportSym, u32, *DynamicInfo, *Section, u32,
+*ExecFunction, u32, *ExportSym, u32, *DynamicInfo, *Section, u32,
 *SymtabEntry, u32, str, ImageOptions) err[fail.Fail]
 ```
 
