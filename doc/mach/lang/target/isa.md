@@ -460,10 +460,39 @@ conversion over those pieces gathers its halves (#3589). a cell names the
 lane kind and width, which the operation keeps; its scalar row is the lane
 path through memory
 
+## val VEC_OP_MUL_HIGH_S
+
+```mach
+pub val VEC_OP_MUL_HIGH_S: VecOp = 34
+```
+
+the high half of the full product of two integer lanes, in lanes of their
+own width, under the operation's signedness: the upper word of the widening
+multiply, whose lower word is the plain multiply. a cell names the lane width
+twice; its scalar row is each lane's own high multiply (#4119)
+
+## val VEC_OP_MUL_HIGH_U
+
+```mach
+pub val VEC_OP_MUL_HIGH_U: VecOp = 35
+```
+
+## val VEC_OP_INTERLEAVE
+
+```mach
+pub val VEC_OP_INTERLEAVE: VecOp = 36
+```
+
+a lane interleave: lane i of the low operand and lane i of the high operand
+joined into one lane twice as wide, the low operand's lane in its low half.
+it is how a target whose widening multiply is the low and the high multiply
+pairs the two into full products. a cell names the result lane width and the
+operand lane width; its scalar row is each lane joined on its own (#4119)
+
 ## val VEC_OP_LAST
 
 ```mach
-pub val VEC_OP_LAST:   VecOp = VEC_OP_CONCAT
+pub val VEC_OP_LAST:       VecOp = VEC_OP_INTERLEAVE
 ```
 
 ## rec PackedForm
@@ -674,6 +703,18 @@ pub fun is_convert_op(op: VecOp) bool;
 pub fun is_widen_op(op: VecOp) bool;
 ```
 
+## fun is_mul_high_op
+
+```mach
+pub fun is_mul_high_op(op: VecOp) bool;
+```
+
+## fun is_interleave_op
+
+```mach
+pub fun is_interleave_op(op: VecOp) bool;
+```
+
 ## fun is_widen_half_op
 
 ```mach
@@ -759,8 +800,9 @@ declares the rest through this, so each conversion cell is decided once
 pub fun scalar_widening_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
 ```
 
-the same for the widening multiplies and the lane-halving extensions: a
-cell the packed table leaves keeps the per-lane path
+the same for the widening multiplies, their high halves, the lane interleave
+and the lane-halving extensions: a cell the packed table leaves keeps the
+per-lane path
 
 ## fun scalar_shift_rows
 
