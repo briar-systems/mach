@@ -9,6 +9,9 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
 
 use A: std.allocator;
 
@@ -20,6 +23,7 @@ use mach.lang.session;
 use mach.lang.target;
 use mach.lang.target.isa;
 use mach.lang.target.of;
+use mach.lang.target.of.cfi;
 use rel:            mach.lang.target.of.reloc;
 use target_testing: mach.lang.target.testing;
 
@@ -50,6 +54,10 @@ pub rec LinkRoots {
     name_count: u32;
     # the `fwd` re-exports the link's objects asked for; nil outside a link that exports
     surface: *ExportSurface;
+    # the link carries foreign frame descriptions into its unwind tables and
+    # rebases the ones it keeps, so each lives only with its function; false
+    # keeps every frame description section whole
+    carries_frames: bool;
 }
 
 pub rec AtomWinner {
@@ -78,12 +86,17 @@ pub rec DeadRange {
 }
 
 # how reachability treats a section: a root is kept whole unconditionally, a
-# whole section is one atom, a split section is one atom per defined symbol
+# whole section is one atom, a split section is one atom per defined symbol, a
+# dependent section lives exactly while the section it belongs to does, and a
+# records section is cut into unwind records, each living exactly while the
+# function it describes does
 def Disposition: u8;
 
-val DISPOSITION_ROOT:  Disposition = 0;
-val DISPOSITION_WHOLE: Disposition = 1;
-val DISPOSITION_SPLIT: Disposition = 2;
+val DISPOSITION_ROOT:      Disposition = 0;
+val DISPOSITION_WHOLE:     Disposition = 1;
+val DISPOSITION_SPLIT:     Disposition = 2;
+val DISPOSITION_DEPENDENT: Disposition = 3;
+val DISPOSITION_RECORDS:   Disposition = 4;
 
 val GC_NONE: u32 = 0xFFFFFFFF;
 
@@ -93,6 +106,12 @@ rec GcAtom {
     start:  u32;
     end:    u32;
     cover:  u32;
+    # a record's field whose relocation names the function it describes
+    field: u32;
+    # the atom this one lives through, GC_NONE for one reachable on its own
+    owner: u32;
+    # the next atom sharing this one's owner
+    sibling: u32;
 }
 
 rec GcSym {
@@ -127,6 +146,15 @@ rec GcState {
     live:        *u8;
     work:        *u32;
     work_count:  u32;
+    # per atom: the first atom living through it
+    dependents: *u32;
+    # per section: whether any of its atoms is live, the first section living
+    # through it, the next section sharing its owner, and the next member of
+    # its group
+    sec_live:      *u8;
+    sec_dependent: *u32;
+    sec_sibling:   *u32;
+    group_next:    *u32;
 }
 
 pub fun reloc_ref_cmp(a: *AtomRelocRef, b: *AtomRelocRef) i64 {
@@ -251,7 +279,7 @@ pub fun build_reloc_refs(s: *session.Session, modules: *of.ObjectImage, module_c
                 A.deallocate[AtomRelocRef](s.alloc, refs, ref_total::usize);
                 ret res[*AtomRelocRef, fail.Fail].err{fail.user(dkind.OBJECT_MALFORMED, named_message(s, "linker: object '", modules[m].name, "' has a relocation against a section it does not carry", "linker: a relocation names a section its object does not carry"))};
             }
-            val from_debug: bool            = modules[m].sections[of.section_index(relocation.section)].kind == of.SK_DEBUG;
+            val from_debug: bool            = !reloc_section_reaches(?modules[m].sections[of.section_index(relocation.section)]);
             var traits:     rel.RelocTraits = rel.traits(0, rel.RELOC_ADDEND_IGNORED, 0, 0);
             if (!from_debug) {
                 val ref_traits: res[rel.RelocTraits, rel.RelocError] = atom_reloc_traits(
@@ -298,14 +326,77 @@ pub fun build_reloc_refs(s: *session.Session, modules: *of.ObjectImage, module_c
     ret res[*AtomRelocRef, fail.Fail].ok{refs};
 }
 
+# whether a section's relocations can reach anything: debug information only
+# describes code, but an unwind index kept in a debug section (mach-o
+# `__compact_unwind`) names the lsda and personality of the functions it keeps
+fun reloc_section_reaches(sec: *of.Section) bool {
+    ret sec.kind != of.SK_DEBUG || (sec.flags & of.SEC_FLAG_UNWIND_INDEX) != 0;
+}
+
 # the disposition a section starts from; a split candidate falls back to whole
-# when its atom boundaries cannot be trusted
-fun section_disposition(modules: *of.ObjectImage, m: u32, sc: u32) Disposition {
+# when its atom boundaries cannot be trusted, and a records candidate to a root
+# when its records cannot be read
+fun section_disposition(modules: *of.ObjectImage, m: u32, sc: u32, carries_frames: bool) Disposition {
     val sec: *of.Section = ?modules[m].sections[sc];
-    if (!modules[m].codegen)                                              { ret DISPOSITION_ROOT; }
-    if (!is_loadable_kind(sec.kind))                                      { ret DISPOSITION_ROOT; }
     if ((sec.flags & (of.SEC_FLAG_INIT_FUNCS | of.SEC_FLAG_RETAIN)) != 0) { ret DISPOSITION_ROOT; }
-    ret DISPOSITION_SPLIT;
+    if ((sec.flags & of.SEC_FLAG_ASSOCIATED) != 0)                        { ret DISPOSITION_DEPENDENT; }
+    if ((sec.flags & of.SEC_FLAG_UNWIND_FRAMES) != 0) {
+        if (carries_frames) { ret DISPOSITION_RECORDS; }
+        ret DISPOSITION_ROOT;
+    }
+    if ((sec.flags & of.SEC_FLAG_UNWIND_INDEX) != 0) { ret DISPOSITION_RECORDS; }
+    if (!is_loadable_kind(sec.kind))                 { ret DISPOSITION_ROOT; }
+    val atoms_by_symbol: bool = modules[m].codegen || modules[m].symbol_atoms;
+    if (!atoms_by_symbol && of.section_format_retained(sec)) { ret DISPOSITION_ROOT; }
+    if (atoms_by_symbol)                                     { ret DISPOSITION_SPLIT; }
+    ret DISPOSITION_WHOLE;
+}
+
+# the unwind record at `off`: `end` receives where it ends and `field` the
+# offset of the field whose relocation names the function it describes, or
+# GC_NONE for a record no function owns (a cie). a frame description section
+# is read entry by entry, and an unwind index is a table of entries of its
+# section's `native.entry_size` bytes, each naming its function first.
+# false where the records end
+fun unwind_record(sec: *of.Section, off: u32, end: *u32, field: *u32) res[bool, fail.Fail] {
+    if ((sec.flags & of.SEC_FLAG_UNWIND_FRAMES) != 0) {
+        if (sec.bytes == nil) { ret res[bool, fail.Fail].ok{false}; }
+        val er: res[opt[cfi.EhEntry], fail.Fail] = cfi.eh_entry(sec.bytes, sec.len::usize, off::usize);
+        if (sel er.err)     { ret res[bool, fail.Fail].err{er.err}; }
+        if (sel er.ok.none) { ret res[bool, fail.Fail].ok{false}; }
+        val e: cfi.EhEntry = er.ok.some;
+        @end   = (e.off + e.size)::u32;
+        @field = GC_NONE;
+        if (!e.cie) { @field = off + 8; }
+        ret res[bool, fail.Fail].ok{true};
+    }
+    val size: u64 = sec.native.entry_size;
+    if (size == 0 || size > sec.len::u64 || sec.len::u64 % size != 0) {
+        ret res[bool, fail.Fail].err{fail.user(dkind.OBJECT_MALFORMED, "linker: an unwind index is not whole entries")};
+    }
+    if (off >= sec.len) { ret res[bool, fail.Fail].ok{false}; }
+    @end   = off + size::u32;
+    @field = off;
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# the number of atoms a records section is cut into, none when its records
+# cannot be read: one per record, and one for whatever follows the last
+fun unwind_record_count(sec: *of.Section) opt[u32] {
+    var n:     u32 = 0;
+    var off:   u32 = 0;
+    var end:   u32 = 0;
+    var field: u32 = 0;
+    for (off < sec.len) {
+        val rr: res[bool, fail.Fail] = unwind_record(sec, off, ?end, ?field);
+        if (sel rr.err) { ret opt[u32].none{}; }
+        if (!rr.ok) {
+            ret opt[u32].some{n + 1};
+        }
+        n   = n + 1;
+        off = end;
+    }
+    ret opt[u32].some{n};
 }
 
 fun gc_sym_cmp(a: *GcSym, b: *GcSym) i64 {
@@ -320,18 +411,42 @@ fun gc_sym_cmp(a: *GcSym, b: *GcSym) i64 {
 
 fun gc_state_free(alloc: *A.Allocator, st: *GcState) {
     val sections: usize = st.sec_total::usize;
-    if (st.syms != nil)        { A.deallocate[GcSym](alloc, st.syms, st.sym_total::usize); }
-    if (st.sites != nil)       { A.deallocate[GcSite](alloc, st.sites, st.site_total::usize); }
-    if (st.atoms != nil)       { A.deallocate[GcAtom](alloc, st.atoms, st.atom_cap::usize); }
-    if (st.live != nil)        { A.deallocate[u8](alloc, st.live, st.atom_cap::usize); }
-    if (st.work != nil)        { A.deallocate[u32](alloc, st.work, st.atom_cap::usize); }
-    if (st.sym_first != nil)   { A.deallocate[u32](alloc, st.sym_first, sections); }
-    if (st.sym_count != nil)   { A.deallocate[u32](alloc, st.sym_count, sections); }
-    if (st.site_first != nil)  { A.deallocate[u32](alloc, st.site_first, sections); }
-    if (st.site_count != nil)  { A.deallocate[u32](alloc, st.site_count, sections); }
-    if (st.atom_first != nil)  { A.deallocate[u32](alloc, st.atom_first, sections); }
-    if (st.atom_count != nil)  { A.deallocate[u32](alloc, st.atom_count, sections); }
-    if (st.disposition != nil) { A.deallocate[Disposition](alloc, st.disposition, sections); }
+    if (st.syms != nil)          { A.deallocate[GcSym](alloc, st.syms, st.sym_total::usize); }
+    if (st.sites != nil)         { A.deallocate[GcSite](alloc, st.sites, st.site_total::usize); }
+    if (st.atoms != nil)         { A.deallocate[GcAtom](alloc, st.atoms, st.atom_cap::usize); }
+    if (st.live != nil)          { A.deallocate[u8](alloc, st.live, st.atom_cap::usize); }
+    if (st.work != nil)          { A.deallocate[u32](alloc, st.work, st.atom_cap::usize); }
+    if (st.sym_first != nil)     { A.deallocate[u32](alloc, st.sym_first, sections); }
+    if (st.sym_count != nil)     { A.deallocate[u32](alloc, st.sym_count, sections); }
+    if (st.site_first != nil)    { A.deallocate[u32](alloc, st.site_first, sections); }
+    if (st.site_count != nil)    { A.deallocate[u32](alloc, st.site_count, sections); }
+    if (st.atom_first != nil)    { A.deallocate[u32](alloc, st.atom_first, sections); }
+    if (st.atom_count != nil)    { A.deallocate[u32](alloc, st.atom_count, sections); }
+    if (st.disposition != nil)   { A.deallocate[Disposition](alloc, st.disposition, sections); }
+    if (st.dependents != nil)    { A.deallocate[u32](alloc, st.dependents, st.atom_cap::usize); }
+    if (st.sec_live != nil)      { A.deallocate[u8](alloc, st.sec_live, sections); }
+    if (st.sec_dependent != nil) { A.deallocate[u32](alloc, st.sec_dependent, sections); }
+    if (st.sec_sibling != nil)   { A.deallocate[u32](alloc, st.sec_sibling, sections); }
+    if (st.group_next != nil)    { A.deallocate[u32](alloc, st.group_next, sections); }
+}
+
+fun gc_fill_none(dst: *u32, count: u32) {
+    var i: u32 = 0;
+    for (i < count) {
+        dst[i] = GC_NONE;
+        i      = i + 1;
+    }
+}
+
+fun gc_atom_set(st: *GcState, at: u32, m: u32, flat: u32, start: u32, end: u32, cover: u32) {
+    st.atoms[at].module  = m;
+    st.atoms[at].flat    = flat;
+    st.atoms[at].start   = start;
+    st.atoms[at].end     = end;
+    st.atoms[at].cover   = cover;
+    st.atoms[at].field   = GC_NONE;
+    st.atoms[at].owner   = GC_NONE;
+    st.atoms[at].sibling = GC_NONE;
 }
 
 fun gc_zallocate_u32(alloc: *A.Allocator, count: u32, out: **u32) err[fail.Fail] {
@@ -419,7 +534,7 @@ fun gc_index_sites(alloc: *A.Allocator, st: *GcState, modules: *of.ObjectImage,
     for (m < module_count) {
         var ri: u32 = 0;
         for (ri < modules[m].reloc_count) {
-            if (modules[m].sections[of.section_index(modules[m].relocations[ri].section)].kind != of.SK_DEBUG) {
+            if (reloc_section_reaches(?modules[m].sections[of.section_index(modules[m].relocations[ri].section)])) {
                 total = total + 1;
             }
             ri = ri + 1;
@@ -442,7 +557,7 @@ fun gc_index_sites(alloc: *A.Allocator, st: *GcState, modules: *of.ObjectImage,
         var ri: u32 = 0;
         for (ri < modules[m].reloc_count) {
             val r: *of.Relocation = ?modules[m].relocations[ri];
-            if (modules[m].sections[of.section_index(r.section)].kind != of.SK_DEBUG) {
+            if (reloc_section_reaches(?modules[m].sections[of.section_index(r.section)])) {
                 st.sites[w].flat   = sec_base[m] + of.section_index(r.section);
                 st.sites[w].offset = r.offset;
                 st.sites[w].reloc  = ri;
@@ -464,13 +579,15 @@ fun gc_index_sites(alloc: *A.Allocator, st: *GcState, modules: *of.ObjectImage,
 }
 
 # the section offsets a relocation operand may address around its target: the
-# symbol alone when the addend is ignored, otherwise the addend and the field
-# bias atom_field_bias gives; false when that span leaves the u32 range
+# symbol alone when the addend is ignored or belongs to a difference, otherwise
+# the addend and the field bias atom_field_bias gives, clamped to the section's
+# start; false when that span leaves the u32 range
 fun reference_span(r: *of.Relocation, traits: rel.RelocTraits, source_text: bool,
     second_operand: bool, target_offset: u32, lo: *u32, hi: *u32) bool {
     @lo = target_offset;
     @hi = target_offset;
-    if (second_operand || traits.addend_mode == rel.RELOC_ADDEND_IGNORED) { ret true; }
+    # a difference's constant belongs to the difference, not to either operand
+    if (second_operand || of.is_difference(r.kind) || traits.addend_mode == rel.RELOC_ADDEND_IGNORED) { ret true; }
     var bias_min: i64 = 0;
     var bias_max: i64 = 0;
     atom_field_bias(r, traits.addend_mode, traits.text_bias_min, traits.text_bias_max, source_text,
@@ -481,8 +598,12 @@ fun reference_span(r: *of.Relocation, traits: rel.RelocTraits, source_text: bool
         || (bias_max < 0 && r.addend < (-9223372036854775807 - 1) - bias_max)) {
         ret false;
     }
-    ret atom_effective_offset(target_offset, r.addend + bias_min, lo)
-        && atom_effective_offset(target_offset, r.addend + bias_max, hi);
+    if (!atom_effective_offset(target_offset, r.addend + bias_max, hi)) { ret false; }
+    if (atom_effective_offset(target_offset, r.addend + bias_min, lo))  { ret true; }
+    # an operand addresses no byte before its section, whatever low bias a field of unknown instruction allows
+    if (target_offset::i64 + r.addend + bias_min >= 0) { ret false; }
+    @lo = 0;
+    ret true;
 }
 
 # one atom per distinct sized symbol start, each running to the next start;
@@ -513,13 +634,9 @@ fun split_atoms(st: *GcState, modules: *of.ObjectImage, m: u32, sc: u32, flat: u
             if (sym.offset < prev.cover) { ret false; }
             prev.end = sym.offset;
         }
-        st.atoms[first + n].module = m;
-        st.atoms[first + n].flat   = flat;
-        st.atoms[first + n].start  = sym.offset;
-        st.atoms[first + n].end    = sec.len;
-        st.atoms[first + n].cover  = sym.offset + sym.size;
-        n                          = n + 1;
-        i                          = i + 1;
+        gc_atom_set(st, first + n, m, flat, sym.offset, sec.len, sym.offset + sym.size);
+        n = n + 1;
+        i = i + 1;
     }
     if (n == 0) { ret false; }
     st.atom_total       = first + n;
@@ -567,6 +684,72 @@ fun split_atoms(st: *GcState, modules: *of.ObjectImage, m: u32, sc: u32, flat: u
     ret true;
 }
 
+# one atom per unwind record, and one for whatever follows the last
+fun record_atoms(st: *GcState, modules: *of.ObjectImage, m: u32, sc: u32, flat: u32) {
+    val sec:   *of.Section = ?modules[m].sections[sc];
+    val first: u32         = st.atom_total;
+    var n:     u32         = 0;
+    var off:   u32         = 0;
+    var end:   u32         = 0;
+    var field: u32         = 0;
+    for (off < sec.len) {
+        val rr:   res[bool, fail.Fail] = unwind_record(sec, off, ?end, ?field);
+        var more: bool                 = false;
+        if (sel rr.ok) { more = rr.ok; }
+        if (!more) {
+            gc_atom_set(st, first + n, m, flat, off, sec.len, sec.len);
+            n   = n + 1;
+            off = sec.len;
+            cnt;
+        }
+        gc_atom_set(st, first + n, m, flat, off, end, end);
+        st.atoms[first + n].field = field;
+        n                         = n + 1;
+        off                       = end;
+    }
+    if (n == 0) {
+        gc_atom_set(st, first, m, flat, 0, sec.len, sec.len);
+        n = 1;
+    }
+    st.atom_total       = first + n;
+    st.atom_count[flat] = n;
+}
+
+# settles each section's disposition, and the number of atoms the records
+# sections add beyond one per section
+fun gc_classify(st: *GcState, modules: *of.ObjectImage, module_count: u32, sec_base: *u32,
+    carries_frames: bool, extra: *u32) bool {
+    @extra = 0;
+    var m: u32 = 0;
+    for (m < module_count) {
+        var sc: u32 = 0;
+        for (sc < modules[m].section_count) {
+            val flat: u32         = sec_base[m] + sc;
+            val sec:  *of.Section = ?modules[m].sections[sc];
+            # debug information about one function (a coff associative .debug$S) goes with it
+            st.disposition[flat] = DISPOSITION_ROOT;
+            if (reloc_section_reaches(sec)) {
+                st.disposition[flat] = section_disposition(modules, m, sc, carries_frames);
+            }
+            or ((sec.flags & of.SEC_FLAG_ASSOCIATED) != 0) { st.disposition[flat] = DISPOSITION_DEPENDENT; }
+            if (st.disposition[flat] == DISPOSITION_RECORDS) {
+                val count: opt[u32] = unwind_record_count(sec);
+                if (sel count.none) { st.disposition[flat] = DISPOSITION_ROOT; }
+                if (sel count.some) {
+                    val n: u32 = count.some;
+                    if (n > 1) {
+                        if (@extra > 0xFFFFFFFF - n) { ret false; }
+                        @extra = @extra + n - 1;
+                    }
+                }
+            }
+            sc = sc + 1;
+        }
+        m = m + 1;
+    }
+    ret true;
+}
+
 fun gc_atomize(st: *GcState, modules: *of.ObjectImage, module_count: u32,
     sec_base: *u32, refs: *AtomRelocRef, ref_total: u32,
     arch: *isa.IsaVTable) {
@@ -579,28 +762,166 @@ fun gc_atomize(st: *GcState, modules: *of.ObjectImage, module_count: u32,
             val at:   u32         = st.atom_total;
             st.atom_first[flat] = at;
             st.atom_count[flat] = 0;
-            if (sec.kind == of.SK_DEBUG) {
+            if (sec.kind == of.SK_DEBUG && st.disposition[flat] != DISPOSITION_DEPENDENT
+                && st.disposition[flat] != DISPOSITION_RECORDS) {
                 sc = sc + 1;
                 cnt;
             }
-            st.disposition[flat] = section_disposition(modules, m, sc);
+            if (st.disposition[flat] == DISPOSITION_RECORDS) {
+                record_atoms(st, modules, m, sc, flat);
+                sc = sc + 1;
+                cnt;
+            }
             if (st.disposition[flat] == DISPOSITION_SPLIT
                 && split_atoms(st, modules, m, sc, flat, refs, ref_total, arch)) {
                 sc = sc + 1;
                 cnt;
             }
             if (st.disposition[flat] == DISPOSITION_SPLIT) { st.disposition[flat] = DISPOSITION_WHOLE; }
+            gc_atom_set(st, at, m, flat, 0, sec.len, sec.len);
             st.atom_total       = at + 1;
             st.atom_count[flat] = 1;
-            st.atoms[at].module = m;
-            st.atoms[at].flat   = flat;
-            st.atoms[at].start  = 0;
-            st.atoms[at].end    = sec.len;
-            st.atoms[at].cover  = sec.len;
             sc                  = sc + 1;
         }
         m = m + 1;
     }
+}
+
+# the section and the offsets a relocation operand reaches, false when it names
+# nothing the link places; a span it cannot compute is an error only against a
+# split section, whose one atom it would have to choose
+fun gc_reference_target(st: *GcState, modules: *of.ObjectImage, m: u32, r: *of.Relocation,
+    traits: rel.RelocTraits, second_operand: bool, sec_base: *u32,
+    winners: *map.Map[intern.StrId, AtomWinner], flat: *u32, lo: *u32, hi: *u32) res[bool, fail.Fail] {
+    var sy: u32 = r.sym;
+    if (second_operand) { sy = r.sym2; }
+    var winner: AtomWinner;
+    if (!resolve_reference(modules, m, sy, winners, ?winner)) { ret res[bool, fail.Fail].ok{false}; }
+    val target: *of.Symbol = ?modules[winner.module].symbols[winner.symbol];
+    if (of.section_is_external(target.section)
+        || of.section_index(target.section) >= modules[winner.module].section_count) {
+        ret res[bool, fail.Fail].ok{false};
+    }
+    @flat = sec_base[winner.module] + of.section_index(target.section);
+    if (st.atom_count[@flat] == 0) { ret res[bool, fail.Fail].ok{false}; }
+    @lo = target.offset;
+    @hi = target.offset;
+    if (!reference_span(r, traits, modules[m].sections[of.section_index(r.section)].kind == of.SK_TEXT,
+        second_operand, target.offset, lo, hi)) {
+        if (st.atom_count[@flat] > 1) {
+            ret res[bool, fail.Fail].err{fail.message("linker: internal: a reference into a split section has no computable span")};
+        }
+        # a foreign field bias can put the span before a whole section's start; its one atom covers every byte
+        @lo = target.offset;
+        @hi = target.offset;
+    }
+    if (target.offset < @lo) { @lo = target.offset; }
+    if (target.offset > @hi) { @hi = target.offset; }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# the relocation of module m at `off` in flattened section `flat`, GC_NONE
+# when none sits there
+fun gc_site_at(st: *GcState, flat: u32, off: u32) u32 {
+    val first: u32 = st.site_first[flat];
+    var lo:    u32 = 0;
+    var hi:    u32 = st.site_count[flat];
+    for (lo < hi) {
+        val mid: u32 = lo + (hi - lo) / 2;
+        if (st.sites[first + mid].offset < off) { lo = mid + 1; }
+        or                                      { hi = mid; }
+    }
+    if (lo < st.site_count[flat] && st.sites[first + lo].offset == off) { ret st.sites[first + lo].reloc; }
+    ret GC_NONE;
+}
+
+# ties each record to the atom holding the function its field names and each
+# dependent section to its owner, and rings each section group; a record or
+# section whose owner the link does not place stands on its own as a root
+fun gc_link_owners(st: *GcState, modules: *of.ObjectImage, module_count: u32, sec_base: *u32,
+    winners: *map.Map[intern.StrId, AtomWinner], arch: *isa.IsaVTable) err[fail.Fail] {
+    var a: u32 = 0;
+    for (a < st.atom_total) {
+        val atom: *GcAtom = ?st.atoms[a];
+        if (atom.field == GC_NONE) {
+            a = a + 1;
+            cnt;
+        }
+        val m:  u32 = atom.module;
+        val ri: u32 = gc_site_at(st, atom.flat, atom.field);
+        if (ri == GC_NONE) {
+            a = a + 1;
+            cnt;
+        }
+        val r:      *of.Relocation                       = ?modules[m].relocations[ri];
+        val traits: res[rel.RelocTraits, rel.RelocError] = atom_reloc_traits(
+            r, ?modules[m].sections[of.section_index(r.section)], arch, modules[m].codegen);
+        if (sel traits.err) {
+            a = a + 1;
+            cnt;
+        }
+        var flat: u32                  = 0;
+        var lo:   u32                  = 0;
+        var hi:   u32                  = 0;
+        val tr:   res[bool, fail.Fail] = gc_reference_target(st, modules, m, r, traits.ok, false, sec_base, winners,
+            ?flat, ?lo, ?hi);
+        if (sel tr.err) { ret err[fail.Fail].err{tr.err}; }
+        if (tr.ok) {
+            val owner: u32 = gc_atom_at(st, flat, lo);
+            if (owner != GC_NONE && owner != a) {
+                atom.owner           = owner;
+                atom.sibling         = st.dependents[owner];
+                st.dependents[owner] = a;
+            }
+        }
+        a = a + 1;
+    }
+
+    var m: u32 = 0;
+    for (m < module_count) {
+        var sc: u32 = 0;
+        for (sc < modules[m].section_count) {
+            val flat: u32         = sec_base[m] + sc;
+            val sec:  *of.Section = ?modules[m].sections[sc];
+            if (st.disposition[flat] == DISPOSITION_DEPENDENT) {
+                val link: u32 = sec.native.link_section;
+                if (link == 0 || link > modules[m].section_count || st.atom_count[sec_base[m] + link - 1] == 0) {
+                    st.disposition[flat] = DISPOSITION_ROOT;
+                }
+                or {
+                    val owner: u32 = sec_base[m] + link - 1;
+                    st.sec_sibling[flat]    = st.sec_dependent[owner];
+                    st.sec_dependent[owner] = flat;
+                }
+            }
+            if (sec.native.format == of.OF_ELF && sec.native.kind == of.NATIVE_GROUP && sec.bytes != nil) {
+                gc_ring_group(st, modules, m, sec, sec_base);
+            }
+            sc = sc + 1;
+        }
+        m = m + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# rings the placed members of one elf section group, so reaching any of them
+# reaches them all
+fun gc_ring_group(st: *GcState, modules: *of.ObjectImage, m: u32, group: *of.Section, sec_base: *u32) {
+    var first: u32 = GC_NONE;
+    var prev:  u32 = GC_NONE;
+    var at:    u32 = 4;
+    for (at + 4 <= group.len) {
+        val member: u32 = (group.bytes[at]::u32 | (group.bytes[at + 1]::u32 << 8)
+            | (group.bytes[at + 2]::u32 << 16) | (group.bytes[at + 3]::u32 << 24));
+        at = at + 4;
+        if ((member & of.NATIVE_GROUP_RELOC) != 0 || member == 0 || member > modules[m].section_count) { cnt; }
+        val flat: u32 = sec_base[m] + member - 1;
+        if (st.atom_count[flat] == 0 || st.group_next[flat] != GC_NONE) { cnt; }
+        if (first == GC_NONE)                                           { first = flat; }
+        or                                                              { st.group_next[prev] = flat; }
+        prev = flat;
+    }
+    if (prev != GC_NONE && prev != first) { st.group_next[prev] = first; }
 }
 
 fun gc_mark_atom(st: *GcState, atom: u32) {
@@ -608,6 +929,14 @@ fun gc_mark_atom(st: *GcState, atom: u32) {
     st.live[atom]          = 1;
     st.work[st.work_count] = atom;
     st.work_count          = st.work_count + 1;
+}
+
+fun gc_mark_section(st: *GcState, flat: u32) {
+    var a: u32 = 0;
+    for (a < st.atom_count[flat]) {
+        gc_mark_atom(st, st.atom_first[flat] + a);
+        a = a + 1;
+    }
 }
 
 fun gc_mark_symbol(st: *GcState, modules: *of.ObjectImage, m: u32, sy: u32, sec_base: *u32) {
@@ -623,35 +952,56 @@ fun gc_mark_name(st: *GcState, modules: *of.ObjectImage, sec_base: *u32,
     if (sel wr.some) { gc_mark_symbol(st, modules, wr.some.module, wr.some.symbol, sec_base); }
 }
 
+val GC_START_PREFIX: str = "__start_";
+val GC_STOP_PREFIX:  str = "__stop_";
+
+# a reference nothing defines to `__start_<name>` or `__stop_<name>` is to the
+# bounds of every section called <name>, which keeps each of them whole
+fun gc_mark_encapsulated(st: *GcState, modules: *of.ObjectImage, module_count: u32, sec_base: *u32,
+    m: u32, sy: u32) {
+    val nm: opt[str] = intern.lookup(modules[m].interner, modules[m].symbols[sy].name);
+    if (sel nm.none) { ret; }
+    var skip: usize = 0;
+    if (str_starts_with(nm.some, GC_START_PREFIX)) { skip = str_len(GC_START_PREFIX); }
+    or (str_starts_with(nm.some, GC_STOP_PREFIX))  { skip = str_len(GC_STOP_PREFIX); }
+    or                                             { ret; }
+    val wanted: str = (nm.some::usize + skip)::str;
+    if (str_len(wanted) == 0) { ret; }
+    var tm: u32 = 0;
+    for (tm < module_count) {
+        var sc: u32 = 0;
+        for (sc < modules[tm].section_count) {
+            val flat: u32 = sec_base[tm] + sc;
+            if (st.atom_count[flat] > 0) {
+                val sn: opt[str] = intern.lookup(modules[tm].interner, modules[tm].sections[sc].name);
+                if (sel sn.some && str_equals(sn.some, wanted)) { gc_mark_section(st, flat); }
+            }
+            sc = sc + 1;
+        }
+        tm = tm + 1;
+    }
+}
+
 # marks every atom a relocation operand's span touches, so no byte between the
 # target symbol and the address the field really holds is dropped
-fun gc_mark_reference(st: *GcState, modules: *of.ObjectImage, m: u32, r: *of.Relocation,
+fun gc_mark_reference(st: *GcState, modules: *of.ObjectImage, module_count: u32, m: u32, r: *of.Relocation,
     traits: rel.RelocTraits, second_operand: bool, sec_base: *u32,
     winners: *map.Map[intern.StrId, AtomWinner]) err[fail.Fail] {
-    var sy: u32 = r.sym;
-    if (second_operand) { sy = r.sym2; }
-    var winner: AtomWinner;
-    if (!resolve_reference(modules, m, sy, winners, ?winner)) { ret err[fail.Fail].ok{}; }
-    val target: *of.Symbol = ?modules[winner.module].symbols[winner.symbol];
-    if (of.section_is_external(target.section)
-        || of.section_index(target.section) >= modules[winner.module].section_count) {
+    var flat: u32                  = 0;
+    var lo:   u32                  = 0;
+    var hi:   u32                  = 0;
+    val tr:   res[bool, fail.Fail] = gc_reference_target(st, modules, m, r, traits, second_operand, sec_base, winners,
+        ?flat, ?lo, ?hi);
+    if (sel tr.err) { ret err[fail.Fail].err{tr.err}; }
+    if (!tr.ok) {
+        var sy: u32 = r.sym;
+        if (second_operand) { sy = r.sym2; }
+        var winner: AtomWinner;
+        if (sy < modules[m].symbol_count && !resolve_reference(modules, m, sy, winners, ?winner)) {
+            gc_mark_encapsulated(st, modules, module_count, sec_base, m, sy);
+        }
         ret err[fail.Fail].ok{};
     }
-    val flat: u32 = sec_base[winner.module] + of.section_index(target.section);
-    if (st.atom_count[flat] == 0) { ret err[fail.Fail].ok{}; }
-    var lo: u32 = target.offset;
-    var hi: u32 = target.offset;
-    if (!reference_span(r, traits, modules[m].sections[of.section_index(r.section)].kind == of.SK_TEXT,
-        second_operand, target.offset, ?lo, ?hi)) {
-        if (st.atom_count[flat] > 1) {
-            ret err[fail.Fail].err{fail.message("linker: internal: a reference into a split section has no computable span")};
-        }
-        # a foreign field bias can put the span before a whole section's start; its one atom covers every byte
-        lo = target.offset;
-        hi = target.offset;
-    }
-    if (target.offset < lo) { lo = target.offset; }
-    if (target.offset > hi) { hi = target.offset; }
     var atom: u32 = gc_atom_at(st, flat, lo);
     val last: u32 = gc_atom_at(st, flat, hi);
     for (atom <= last) {
@@ -665,14 +1015,24 @@ fun gc_mark_roots(st: *GcState, modules: *of.ObjectImage, module_count: u32, sec
     winners: *map.Map[intern.StrId, AtomWinner], roots: *LinkRoots) {
     var flat: u32 = 0;
     for (flat < st.sec_total) {
-        if (st.atom_count[flat] > 0 && st.disposition[flat] == DISPOSITION_ROOT) {
+        if (st.disposition[flat] == DISPOSITION_ROOT) { gc_mark_section(st, flat); }
+        or (st.disposition[flat] == DISPOSITION_RECORDS) {
             var a: u32 = 0;
             for (a < st.atom_count[flat]) {
-                gc_mark_atom(st, st.atom_first[flat] + a);
+                if (st.atoms[st.atom_first[flat] + a].owner == GC_NONE) { gc_mark_atom(st, st.atom_first[flat] + a); }
                 a = a + 1;
             }
         }
         flat = flat + 1;
+    }
+    var km: u32 = 0;
+    for (km < module_count) {
+        var ks: u32 = 0;
+        for (ks < modules[km].symbol_count) {
+            if ((modules[km].symbols[ks].flags & of.SYM_OBJ_FLAG_RETAIN) != 0) { gc_mark_symbol(st, modules, km, ks, sec_base); }
+            ks = ks + 1;
+        }
+        km = km + 1;
     }
     if (roots.entry != intern.STR_NIL) { gc_mark_name(st, modules, sec_base, winners, roots.entry); }
     var ni: u32 = 0;
@@ -694,15 +1054,33 @@ fun gc_mark_roots(st: *GcState, modules: *of.ObjectImage, module_count: u32, sec
     }
 }
 
-fun gc_propagate(st: *GcState, modules: *of.ObjectImage, sec_base: *u32,
+# a live atom reaches what its relocations name, the records describing it,
+# and, the first time its section is reached, the sections living through that
+# section and the rest of its group
+fun gc_propagate(st: *GcState, modules: *of.ObjectImage, module_count: u32, sec_base: *u32,
     winners: *map.Map[intern.StrId, AtomWinner], arch: *isa.IsaVTable) err[fail.Fail] {
     for (st.work_count > 0) {
         st.work_count = st.work_count - 1;
-        val atom:  *GcAtom = ?st.atoms[st.work[st.work_count]];
-        val m:     u32     = atom.module;
-        val first: u32     = st.site_first[atom.flat];
-        var lo:    u32     = 0;
-        var hi:    u32     = st.site_count[atom.flat];
+        val ai:   u32     = st.work[st.work_count];
+        val atom: *GcAtom = ?st.atoms[ai];
+        val m:    u32     = atom.module;
+        if (st.sec_live[atom.flat] == 0) {
+            st.sec_live[atom.flat] = 1;
+            if (st.group_next[atom.flat] != GC_NONE) { gc_mark_section(st, st.group_next[atom.flat]); }
+            var dep_sec: u32 = st.sec_dependent[atom.flat];
+            for (dep_sec != GC_NONE) {
+                gc_mark_section(st, dep_sec);
+                dep_sec = st.sec_sibling[dep_sec];
+            }
+        }
+        var dep: u32 = st.dependents[ai];
+        for (dep != GC_NONE) {
+            gc_mark_atom(st, dep);
+            dep = st.atoms[dep].sibling;
+        }
+        val first: u32 = st.site_first[atom.flat];
+        var lo:    u32 = 0;
+        var hi:    u32 = st.site_count[atom.flat];
         for (lo < hi) {
             val mid: u32 = lo + (hi - lo) / 2;
             if (st.sites[first + mid].offset < atom.start) { lo = mid + 1; }
@@ -717,10 +1095,10 @@ fun gc_propagate(st: *GcState, modules: *of.ObjectImage, sec_base: *u32,
             if (sel traits.err) {
                 ret err[fail.Fail].err{fail.message("linker: internal: a live relocation lost its traits after the reference table described it")};
             }
-            val first_r: err[fail.Fail] = gc_mark_reference(st, modules, m, r, traits.ok, false, sec_base, winners);
+            val first_r: err[fail.Fail] = gc_mark_reference(st, modules, module_count, m, r, traits.ok, false, sec_base, winners);
             if (sel first_r.err) { ret first_r; }
             if (of.is_difference(r.kind)) {
-                val second_r: err[fail.Fail] = gc_mark_reference(st, modules, m, r, traits.ok, true, sec_base, winners);
+                val second_r: err[fail.Fail] = gc_mark_reference(st, modules, module_count, m, r, traits.ok, true, sec_base, winners);
                 if (sel second_r.err) { ret second_r; }
             }
             si = si + 1;
@@ -729,7 +1107,10 @@ fun gc_propagate(st: *GcState, modules: *of.ObjectImage, sec_base: *u32,
     ret err[fail.Fail].ok{};
 }
 
-# the byte ranges of a final image that no root reaches through relocations
+# the byte ranges of a final image that no root reaches through relocations.
+# an unwind record, an associated section and a section group member are
+# reached with the function, owner or group they belong to, and a reference to
+# `__start_<name>` or `__stop_<name>` reaches every section called <name>
 # ---
 # refs:       the sorted reference table from build_reloc_refs
 # roots:      what the image keeps regardless of references
@@ -752,7 +1133,17 @@ pub fun collect_dead_atoms(s: *session.Session, modules: *of.ObjectImage, module
     val sites_r: err[fail.Fail] = gc_index_sites(alloc, ?st, modules, module_count, sec_base);
     if (sel sites_r.err) { ret res[*DeadRange, fail.Fail].err{sites_r.err}; }
 
-    val cap_r: res[u32, layout.CheckCause] = add_u32_counts[GcAtomCountUnit](st.sym_total, sec_total);
+    val dr: res[*Disposition, A.Error] = A.zallocate[Disposition](alloc, sec_total::usize);
+    if (sel dr.err) { ret res[*DeadRange, fail.Fail].err{fail.refused(dr.err)}; }
+    st.disposition = dr.ok;
+    var record_atoms: u32 = 0;
+    if (!gc_classify(?st, modules, module_count, sec_base, roots.carries_frames, ?record_atoms)) {
+        ret res[*DeadRange, fail.Fail].err{fail.message("linker: reachability atom count exceeds the u32 limit")};
+    }
+
+    val base_r: res[u32, layout.CheckCause] = add_u32_counts[GcAtomCountUnit](st.sym_total, sec_total);
+    if (sel base_r.err) { ret res[*DeadRange, fail.Fail].err{fail.message("linker: reachability atom count exceeds the u32 limit")}; }
+    val cap_r: res[u32, layout.CheckCause] = add_u32_counts[GcAtomCountUnit](base_r.ok, record_atoms);
     if (sel cap_r.err) { ret res[*DeadRange, fail.Fail].err{fail.message("linker: reachability atom count exceeds the u32 limit")}; }
     st.atom_cap = cap_r.ok;
     val ar: res[*GcAtom, A.Error] = A.zallocate[GcAtom](alloc, st.atom_cap::usize);
@@ -763,17 +1154,31 @@ pub fun collect_dead_atoms(s: *session.Session, modules: *of.ObjectImage, module
     st.live = lr.ok;
     val wr: err[fail.Fail] = gc_zallocate_u32(alloc, st.atom_cap, ?st.work);
     if (sel wr.err) { ret res[*DeadRange, fail.Fail].err{wr.err}; }
+    val depr: err[fail.Fail] = gc_zallocate_u32(alloc, st.atom_cap, ?st.dependents);
+    if (sel depr.err) { ret res[*DeadRange, fail.Fail].err{depr.err}; }
+    gc_fill_none(st.dependents, st.atom_cap);
     val fr: err[fail.Fail] = gc_zallocate_u32(alloc, sec_total, ?st.atom_first);
     if (sel fr.err) { ret res[*DeadRange, fail.Fail].err{fr.err}; }
     val cr: err[fail.Fail] = gc_zallocate_u32(alloc, sec_total, ?st.atom_count);
     if (sel cr.err) { ret res[*DeadRange, fail.Fail].err{cr.err}; }
-    val dr: res[*Disposition, A.Error] = A.zallocate[Disposition](alloc, sec_total::usize);
-    if (sel dr.err) { ret res[*DeadRange, fail.Fail].err{fail.refused(dr.err)}; }
-    st.disposition = dr.ok;
+    val slr: res[*u8, A.Error] = A.zallocate[u8](alloc, sec_total::usize);
+    if (sel slr.err) { ret res[*DeadRange, fail.Fail].err{fail.refused(slr.err)}; }
+    st.sec_live = slr.ok;
+    val sdr: err[fail.Fail] = gc_zallocate_u32(alloc, sec_total, ?st.sec_dependent);
+    if (sel sdr.err) { ret res[*DeadRange, fail.Fail].err{sdr.err}; }
+    gc_fill_none(st.sec_dependent, sec_total);
+    val ssr: err[fail.Fail] = gc_zallocate_u32(alloc, sec_total, ?st.sec_sibling);
+    if (sel ssr.err) { ret res[*DeadRange, fail.Fail].err{ssr.err}; }
+    gc_fill_none(st.sec_sibling, sec_total);
+    val gnr: err[fail.Fail] = gc_zallocate_u32(alloc, sec_total, ?st.group_next);
+    if (sel gnr.err) { ret res[*DeadRange, fail.Fail].err{gnr.err}; }
+    gc_fill_none(st.group_next, sec_total);
 
     gc_atomize(?st, modules, module_count, sec_base, refs, ref_total, arch);
+    val linked: err[fail.Fail] = gc_link_owners(?st, modules, module_count, sec_base, winners, arch);
+    if (sel linked.err) { ret res[*DeadRange, fail.Fail].err{linked.err}; }
     gc_mark_roots(?st, modules, module_count, sec_base, winners, roots);
-    val propagated: err[fail.Fail] = gc_propagate(?st, modules, sec_base, winners, arch);
+    val propagated: err[fail.Fail] = gc_propagate(?st, modules, module_count, sec_base, winners, arch);
     if (sel propagated.err) { ret res[*DeadRange, fail.Fail].err{propagated.err}; }
 
     var count: u32 = 0;
@@ -888,10 +1293,12 @@ fun gt_name(h: *GtHarness, name: str) intern.StrId {
 #[testing]
 fun gt_roots(entry: intern.StrId) LinkRoots {
     var roots: LinkRoots;
-    roots.entry      = entry;
-    roots.exports    = false;
-    roots.names      = nil;
-    roots.name_count = 0;
+    roots.entry          = entry;
+    roots.exports        = false;
+    roots.names          = nil;
+    roots.name_count     = 0;
+    roots.surface        = nil;
+    roots.carries_frames = false;
     ret roots;
 }
 
@@ -995,7 +1402,7 @@ test collect_dead_atoms__the_entry_keeps_only_what_it_reaches {
     ret 0;
 }
 
-test collect_dead_atoms__exports_named_roots_and_foreign_inputs_are_roots {
+test collect_dead_atoms__exports_named_roots_and_foreign_inputs_reached_through_them {
     var h: GtHarness;
     if (!gt_init(?h)) { ret 1; }
     fin { gt_dnit(?h); }
@@ -1006,7 +1413,7 @@ test collect_dead_atoms__exports_named_roots_and_foreign_inputs_are_roots {
     syms[0] = gt_sym(gt_name(?h, "exported"), 0, 0, 8, GT_FN);
     syms[1] = gt_sym(gt_name(?h, "local_fn"), 0, 8, 8, of.SYM_OBJ_FLAG_FUNCTION);
     syms[2] = gt_sym(gt_name(?h, "probe"), 0, 16, 8, GT_FN);
-    var mods: [2]of.ObjectImage;
+    var mods: [3]of.ObjectImage;
     mods[0]         = lt_image(?h.s, gt_name(?h, "m"), ?secs[0], 1, ?syms[0], 3, nil::*of.Relocation, 0);
     mods[0].codegen = true;
 
@@ -1024,17 +1431,41 @@ test collect_dead_atoms__exports_named_roots_and_foreign_inputs_are_roots {
     val named: i64 = gt_dead(?h, ?mods[0], 1, ?roots, h.x64, ?dead[0], 8);
     if (named != 2 || !gt_has(?dead[0], named, 0, 0, 8) || !gt_has(?dead[0], named, 0, 8, 16)) { ret 3; }
 
+    # a foreign input is no root: it lives when something reaches it, and what it reaches lives with it
     var ftext: [8]u8;
     var fsecs: [1]of.Section;
     fsecs[0] = gt_sec(gt_name(?h, ".text"), of.SK_TEXT, ?ftext[0], 8, 0);
-    var fsyms: [1]of.Symbol;
+    var fsyms: [2]of.Symbol;
     fsyms[0] = gt_extern(syms[0].name);
+    fsyms[1] = gt_sym(gt_name(?h, "foreign_probe"), 0, 0, 8, GT_FN);
     var frels: [1]of.Relocation;
     frels[0] = gt_rel(0, 0, of.RK_ABS64, 0, 0);
-    mods[1]  = lt_image(?h.s, gt_name(?h, "foreign"), ?fsecs[0], 1, ?fsyms[0], 1, ?frels[0], 1);
+    mods[1]  = lt_image(?h.s, gt_name(?h, "foreign"), ?fsecs[0], 1, ?fsyms[0], 2, ?frels[0], 1);
     roots    = gt_roots(intern.STR_NIL);
+    val unreached: i64 = gt_dead(?h, ?mods[0], 2, ?roots, h.x64, ?dead[0], 8);
+    if (unreached != 4 || !gt_has(?dead[0], unreached, 1, 0, 8)) { ret 4; }
+    fsyms[1].flags = fsyms[1].flags | of.SYM_OBJ_FLAG_RETAIN;
+    if (gt_dead(?h, ?mods[0], 2, ?roots, h.x64, ?dead[0], 8) != 2) { ret 8; }
+    fsyms[1].flags   = GT_FN;
+    names[0]         = fsyms[1].name;
+    roots.names      = ?names[0];
+    roots.name_count = 1;
     val foreign: i64 = gt_dead(?h, ?mods[0], 2, ?roots, h.x64, ?dead[0], 8);
-    if (foreign != 2 || !gt_has(?dead[0], foreign, 0, 8, 16) || !gt_has(?dead[0], foreign, 0, 16, 24)) { ret 4; }
+    if (foreign != 2 || !gt_has(?dead[0], foreign, 0, 8, 16) || !gt_has(?dead[0], foreign, 0, 16, 24)) { ret 5; }
+
+    # storage the link lays out itself splits per symbol, so an unreached common goes alone
+    var bss: [1]of.Section;
+    bss[0] = gt_sec(gt_name(?h, ".bss"), of.SK_BSS, nil::*u8, 16, 0);
+    var commons: [2]of.Symbol;
+    commons[0]           = gt_sym(gt_name(?h, "common_used"), 0, 0, 8, GT_OBJ);
+    commons[1]           = gt_sym(gt_name(?h, "common_unused"), 0, 8, 8, GT_OBJ);
+    fsyms[0]             = gt_extern(commons[0].name);
+    mods[2]              = lt_image(?h.s, gt_name(?h, "commons"), ?bss[0], 1, ?commons[0], 2, nil::*of.Relocation, 0);
+    mods[2].symbol_atoms = true;
+    val split: i64 = gt_dead(?h, ?mods[0], 3, ?roots, h.x64, ?dead[0], 8);
+    if (split != 4 || !gt_has(?dead[0], split, 2, 8, 16)) { ret 6; }
+    mods[2].symbol_atoms = false;
+    if (gt_dead(?h, ?mods[0], 3, ?roots, h.x64, ?dead[0], 8) != 3) { ret 7; }
     ret 0;
 }
 
@@ -1274,5 +1705,266 @@ test collect_dead_atoms__untrustworthy_boundaries_keep_the_section_whole {
     if (gt_fallback_case(?h, ?syms[0], 3, ?rels[0], 1) != 1) { ret 11; }
     rels[0] = gt_rel(0, 0, of.RK_ABS64, 2, -17);
     if (gt_fallback_case(?h, ?syms[0], 3, ?rels[0], 1) != 0) { ret 12; }
+    ret 0;
+}
+
+#[testing]
+fun gt_put32(buf: *u8, at: u32, value: u32) {
+    buf[at]     = value::u8;
+    buf[at + 1] = (value >> 8)::u8;
+    buf[at + 2] = (value >> 16)::u8;
+    buf[at + 3] = (value >> 24)::u8;
+}
+
+# an input of two functions, each in its own section, and `extra` sections
+# after them; `a` is the entry
+#[testing]
+fun gt_two_functions(h: *GtHarness, secs: *of.Section, a: *u8, b: *u8, syms: *of.Symbol) {
+    secs[0] = gt_sec(gt_name(h, ".text.a"), of.SK_TEXT, a, 8, 0);
+    secs[1] = gt_sec(gt_name(h, ".text.b"), of.SK_TEXT, b, 8, 0);
+    syms[0] = gt_sym(gt_name(h, "fn_a"), 0, 0, 8, GT_FN);
+    syms[1] = gt_sym(gt_name(h, "fn_b"), 1, 0, 8, GT_FN);
+}
+
+test collect_dead_atoms__a_frame_description_lives_with_its_function {
+    var h: GtHarness;
+    if (!gt_init(?h)) { ret 1; }
+    fin { gt_dnit(?h); }
+    var a:     [8]u8;
+    var b:     [8]u8;
+    var frame: [48]u8;
+    var i:     u32 = 0;
+    for (i < 48) {
+        frame[i] = 0;
+        i        = i + 1;
+    }
+    # a cie, then an fde for each function: length, cie pointer, pc begin, pc range
+    gt_put32(?frame[0], 0, 12);
+    gt_put32(?frame[0], 16, 12);
+    gt_put32(?frame[0], 20, 20);
+    gt_put32(?frame[0], 32, 12);
+    gt_put32(?frame[0], 36, 36);
+    var secs: [3]of.Section;
+    var syms: [2]of.Symbol;
+    gt_two_functions(?h, ?secs[0], ?a[0], ?b[0], ?syms[0]);
+    secs[2] = gt_sec(gt_name(?h, ".eh_frame"), of.SK_RODATA, ?frame[0], 48, of.SEC_FLAG_UNWIND_FRAMES);
+    var rels: [2]of.Relocation;
+    rels[0] = gt_rel(2, 24, of.RK_PC32, 0, 0);
+    rels[1] = gt_rel(2, 40, of.RK_PC32, 1, 0);
+    var mods: [1]of.ObjectImage;
+    mods[0] = lt_image(?h.s, gt_name(?h, "foreign"), ?secs[0], 3, ?syms[0], 2, ?rels[0], 2);
+
+    var roots: LinkRoots = gt_roots(syms[0].name);
+    roots.carries_frames = true;
+    var dead: [8]DeadRange;
+    val n:    i64 = gt_dead(?h, ?mods[0], 1, ?roots, h.x64, ?dead[0], 8);
+    if (n != 2 || !gt_has(?dead[0], n, 1, 0, 8) || !gt_has(?dead[0], n, 2, 32, 48)) { ret 2; }
+
+    # a link that places the frame descriptions whole keeps them, and what they name
+    roots.carries_frames = false;
+    if (gt_dead(?h, ?mods[0], 1, ?roots, h.x64, ?dead[0], 8) != 0) { ret 3; }
+    ret 0;
+}
+
+test collect_dead_atoms__a_function_table_entry_lives_with_its_function {
+    var h: GtHarness;
+    if (!gt_init(?h)) { ret 1; }
+    fin { gt_dnit(?h); }
+    var a:     [8]u8;
+    var b:     [8]u8;
+    var table: [24]u8;
+    var secs:  [3]of.Section;
+    var syms:  [2]of.Symbol;
+    gt_two_functions(?h, ?secs[0], ?a[0], ?b[0], ?syms[0]);
+    secs[0].native.format     = of.OF_COFF;
+    secs[0].native.selection  = 2;
+    secs[1].native.format     = of.OF_COFF;
+    secs[1].native.selection  = 2;
+    secs[2]                   = gt_sec(gt_name(?h, ".pdata"), of.SK_EXCEPTION, ?table[0], 24, of.SEC_FLAG_UNWIND_INDEX);
+    secs[2].native.format     = of.OF_COFF;
+    secs[2].native.entry_size = 12;
+    var rels: [4]of.Relocation;
+    rels[0] = gt_rel(2, 0, of.RK_ADDR32NB, 0, 0);
+    rels[1] = gt_rel(2, 4, of.RK_ADDR32NB, 0, 8);
+    rels[2] = gt_rel(2, 12, of.RK_ADDR32NB, 1, 0);
+    rels[3] = gt_rel(2, 16, of.RK_ADDR32NB, 1, 8);
+    var mods: [1]of.ObjectImage;
+    mods[0] = lt_image(?h.s, gt_name(?h, "foreign"), ?secs[0], 3, ?syms[0], 2, ?rels[0], 4);
+
+    var roots: LinkRoots = gt_roots(syms[0].name);
+    var dead:  [8]DeadRange;
+    val n:     i64       = gt_dead(?h, ?mods[0], 1, ?roots, h.x64, ?dead[0], 8);
+    if (n != 2 || !gt_has(?dead[0], n, 1, 0, 8) || !gt_has(?dead[0], n, 2, 12, 24)) { ret 2; }
+
+    # a table read as a whole names, and so keeps, every function it describes
+    secs[2].flags = 0;
+    if (gt_dead(?h, ?mods[0], 1, ?roots, h.x64, ?dead[0], 8) != 0) { ret 3; }
+
+    # coff keeps a section outside every comdat whatever reaches it
+    secs[2].flags            = of.SEC_FLAG_UNWIND_INDEX;
+    secs[1].native.selection = 0;
+    if (gt_dead(?h, ?mods[0], 1, ?roots, h.x64, ?dead[0], 8) != 0) { ret 4; }
+    ret 0;
+}
+
+test collect_dead_atoms__an_associated_section_lives_with_its_owner {
+    var h: GtHarness;
+    if (!gt_init(?h)) { ret 1; }
+    fin { gt_dnit(?h); }
+    var a:       [8]u8;
+    var b:       [8]u8;
+    var comdat:  [8]u8;
+    var ordered: [8]u8;
+    var symbols: [8]u8;
+    var secs:    [5]of.Section;
+    var syms:    [2]of.Symbol;
+    gt_two_functions(?h, ?secs[0], ?a[0], ?b[0], ?syms[0]);
+    # a coff associative comdat member, an elf section ordered after its owner
+    # (SHF_LINK_ORDER), and the owner's own coff debug records
+    secs[2]                     = gt_sec(gt_name(?h, ".xdata"), of.SK_RODATA, ?comdat[0], 8, of.SEC_FLAG_ASSOCIATED);
+    secs[2].native.format       = of.OF_COFF;
+    secs[2].native.selection    = 5;
+    secs[2].native.link_section = 2;
+    secs[3]                     = gt_sec(gt_name(?h, "__patchable_function_entries"), of.SK_DATA, ?ordered[0], 8, of.SEC_FLAG_ASSOCIATED);
+    secs[3].native.format       = of.OF_ELF;
+    secs[3].native.link_section = 2;
+    secs[4]                     = gt_sec(gt_name(?h, ".debug$S"), of.SK_DEBUG, ?symbols[0], 8, of.SEC_FLAG_ASSOCIATED);
+    secs[4].native.format       = of.OF_COFF;
+    secs[4].native.selection    = 5;
+    secs[4].native.link_section = 2;
+    var rels: [2]of.Relocation;
+    rels[0] = gt_rel(3, 0, of.RK_ABS64, 1, 0);
+    rels[1] = gt_rel(0, 1, of.RK_PC32, 1, -4);
+    var mods: [1]of.ObjectImage;
+    mods[0] = lt_image(?h.s, gt_name(?h, "foreign"), ?secs[0], 5, ?syms[0], 2, ?rels[0], 1);
+
+    # nothing reaches the owner, and the ordered section's own reference to it reaches nothing
+    var roots: LinkRoots = gt_roots(syms[0].name);
+    var dead:  [8]DeadRange;
+    val n:     i64       = gt_dead(?h, ?mods[0], 1, ?roots, h.x64, ?dead[0], 8);
+    if (n != 4 || !gt_has(?dead[0], n, 1, 0, 8) || !gt_has(?dead[0], n, 2, 0, 8) || !gt_has(?dead[0], n, 3, 0, 8)
+        || !gt_has(?dead[0], n, 4, 0, 8)) {
+        ret 2;
+    }
+
+    # the owner reached keeps both, though nothing reaches them
+    mods[0].reloc_count = 2;
+    if (gt_dead(?h, ?mods[0], 1, ?roots, h.x64, ?dead[0], 8) != 0) { ret 3; }
+
+    # unassociated, nothing keeps them, and debug records stay whatever they describe
+    secs[2].flags = 0;
+    secs[3].flags = 0;
+    secs[4].flags = 0;
+    val loose: i64 = gt_dead(?h, ?mods[0], 1, ?roots, h.x64, ?dead[0], 8);
+    if (loose != 2 || !gt_has(?dead[0], loose, 2, 0, 8) || !gt_has(?dead[0], loose, 3, 0, 8)) { ret 4; }
+    ret 0;
+}
+
+test collect_dead_atoms__a_start_or_stop_reference_keeps_the_named_section {
+    var h: GtHarness;
+    if (!gt_init(?h)) { ret 1; }
+    fin { gt_dnit(?h); }
+    var text: [8]u8;
+    var set:  [8]u8;
+    var secs: [2]of.Section;
+    secs[0] = gt_sec(gt_name(?h, ".text"), of.SK_TEXT, ?text[0], 8, 0);
+    secs[1] = gt_sec(gt_name(?h, "my_set"), of.SK_DATA, ?set[0], 8, 0);
+    var syms: [2]of.Symbol;
+    syms[0]       = gt_sym(gt_name(?h, "_start"), 0, 0, 8, GT_FN);
+    syms[1]       = gt_extern(gt_name(?h, "__start_my_set"));
+    syms[1].flags = syms[1].flags | of.SYM_OBJ_FLAG_WEAK;
+    var rels: [1]of.Relocation;
+    rels[0] = gt_rel(0, 0, of.RK_ABS64, 1, 0);
+    var mods: [1]of.ObjectImage;
+    mods[0] = lt_image(?h.s, gt_name(?h, "foreign"), ?secs[0], 2, ?syms[0], 2, ?rels[0], 1);
+
+    var roots: LinkRoots = gt_roots(syms[0].name);
+    var dead:  [8]DeadRange;
+    if (gt_dead(?h, ?mods[0], 1, ?roots, h.x64, ?dead[0], 8) != 0) { ret 2; }
+    syms[1].name = gt_name(?h, "__stop_my_set");
+    if (gt_dead(?h, ?mods[0], 1, ?roots, h.x64, ?dead[0], 8) != 0) { ret 3; }
+
+    syms[1].name = gt_name(?h, "__begin_my_set");
+    val other: i64 = gt_dead(?h, ?mods[0], 1, ?roots, h.x64, ?dead[0], 8);
+    if (other != 1 || !gt_has(?dead[0], other, 1, 0, 8)) { ret 4; }
+    ret 0;
+}
+
+test collect_dead_atoms__a_section_group_lives_or_dies_together {
+    var h: GtHarness;
+    if (!gt_init(?h)) { ret 1; }
+    fin { gt_dnit(?h); }
+    var a:     [8]u8;
+    var b:     [8]u8;
+    var data:  [8]u8;
+    var group: [12]u8;
+    gt_put32(?group[0], 0, 1);
+    gt_put32(?group[0], 4, 1);
+    gt_put32(?group[0], 8, 3);
+    var secs: [4]of.Section;
+    var syms: [2]of.Symbol;
+    gt_two_functions(?h, ?secs[0], ?a[0], ?b[0], ?syms[0]);
+    secs[2]                    = gt_sec(gt_name(?h, ".data.a"), of.SK_DATA, ?data[0], 8, 0);
+    secs[3]                    = gt_sec(gt_name(?h, ".group"), of.SK_DEBUG, ?group[0], 12, 0);
+    secs[3].native.format      = of.OF_ELF;
+    secs[3].native.kind        = of.NATIVE_GROUP;
+    secs[3].native.link_symbol = 1;
+    var mods: [1]of.ObjectImage;
+    mods[0] = lt_image(?h.s, gt_name(?h, "foreign"), ?secs[0], 4, ?syms[0], 2, nil::*of.Relocation, 0);
+
+    var roots: LinkRoots = gt_roots(syms[0].name);
+    var dead:  [8]DeadRange;
+    val n:     i64       = gt_dead(?h, ?mods[0], 1, ?roots, h.x64, ?dead[0], 8);
+    if (n != 1 || !gt_has(?dead[0], n, 1, 0, 8)) { ret 2; }
+
+    # out of the group, nothing keeps the data
+    gt_put32(?group[0], 8, 1);
+    val apart: i64 = gt_dead(?h, ?mods[0], 1, ?roots, h.x64, ?dead[0], 8);
+    if (apart != 2 || !gt_has(?dead[0], apart, 2, 0, 8)) { ret 3; }
+
+    # a group of the unreached function and the data dies whole
+    gt_put32(?group[0], 4, 2);
+    gt_put32(?group[0], 8, 3);
+    val both: i64 = gt_dead(?h, ?mods[0], 1, ?roots, h.x64, ?dead[0], 8);
+    if (both != 2 || !gt_has(?dead[0], both, 1, 0, 8) || !gt_has(?dead[0], both, 2, 0, 8)) { ret 4; }
+    ret 0;
+}
+
+test collect_dead_atoms__a_kept_unwind_entry_keeps_its_lsda {
+    var h: GtHarness;
+    if (!gt_init(?h)) { ret 1; }
+    fin { gt_dnit(?h); }
+    var a:     [8]u8;
+    var b:     [8]u8;
+    var table: [64]u8;
+    var lsda:  [16]u8;
+    var secs:  [4]of.Section;
+    var syms:  [4]of.Symbol;
+    gt_two_functions(?h, ?secs[0], ?a[0], ?b[0], ?syms[0]);
+    # a mach-o compact unwind index, a debug section, whose entries name each function and its lsda
+    secs[2]                   = gt_sec(gt_name(?h, "__compact_unwind"), of.SK_DEBUG, ?table[0], 64, of.SEC_FLAG_UNWIND_INDEX);
+    secs[2].native.format     = of.OF_MACHO;
+    secs[2].native.entry_size = 32;
+    secs[3]                   = gt_sec(gt_name(?h, "__gcc_except_tab"), of.SK_RODATA, ?lsda[0], 16, 0);
+    syms[2]                   = gt_sym(gt_name(?h, "lsda_a"), 3, 0, 8, 0);
+    syms[3]                   = gt_sym(gt_name(?h, "lsda_b"), 3, 8, 8, 0);
+    var rels: [4]of.Relocation;
+    rels[0] = gt_rel(2, 0, of.RK_ABS64, 0, 0);
+    rels[1] = gt_rel(2, 24, of.RK_ABS64, 2, 0);
+    rels[2] = gt_rel(2, 32, of.RK_ABS64, 1, 0);
+    rels[3] = gt_rel(2, 56, of.RK_ABS64, 3, 0);
+    var mods: [1]of.ObjectImage;
+    mods[0]              = lt_image(?h.s, gt_name(?h, "foreign"), ?secs[0], 4, ?syms[0], 4, ?rels[0], 4);
+    mods[0].symbol_atoms = true;
+
+    var roots: LinkRoots = gt_roots(syms[0].name);
+    var dead:  [8]DeadRange;
+    val n:     i64       = gt_dead(?h, ?mods[0], 1, ?roots, h.x64, ?dead[0], 8);
+    if (n != 3 || !gt_has(?dead[0], n, 1, 0, 8) || !gt_has(?dead[0], n, 2, 32, 64) || !gt_has(?dead[0], n, 3, 8, 16)) { ret 2; }
+
+    # an index read as debug information reaches nothing, not even the lsda of a function the link keeps
+    secs[2].flags = 0;
+    val unread: i64 = gt_dead(?h, ?mods[0], 1, ?roots, h.x64, ?dead[0], 8);
+    if (unread != 3 || !gt_has(?dead[0], unread, 1, 0, 8) || !gt_has(?dead[0], unread, 3, 0, 8)) { ret 3; }
     ret 0;
 }

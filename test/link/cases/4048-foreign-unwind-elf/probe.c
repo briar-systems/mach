@@ -1,6 +1,8 @@
 /* the C half of the ELF foreign-unwind case (mach #4048): the frames between
  * the mach functions. compiled by the runner's own toolchain, which describes
- * each function in the object's .eh_frame. */
+ * each function in the object's .eh_frame, and with a section per function and
+ * debug info, so the link can collect the one nothing calls and tombstone what
+ * the debug info says of it (mach #3410). */
 
 extern long long unwind_inner(long long depth);
 
@@ -64,6 +66,14 @@ __asm__(
     ".cfi_endproc\n"
     ".size c_dwarf, .-c_dwarf\n");
 #endif
+
+/* nothing calls c_unused, so the link collects it and the frame description
+ * its object gives it (mach #3410) */
+long long c_unused(long long depth) {
+    volatile long long pad[2];
+    pad[0] = depth;
+    return c_dwarf(pad[0] * 7) + 3;
+}
 
 __attribute__((noinline)) long long c_middle(long long depth) {
     volatile long long pad[4];

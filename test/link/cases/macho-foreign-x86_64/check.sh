@@ -7,7 +7,8 @@
 # __TEXT. The instruction-tail constants (7, 9, 10 bytes from instruction start)
 # independently embody SIGNED_1/_2/_4's P+4+N convention. Exact equality with
 # the three marker VAs proves more than a successful cross-link: every relocation
-# selected the intended target byte.
+# selected the intended target byte, with the object's __text split at its
+# symbols and the function nothing calls collected (#3410).
 produce_macho_signed() {
     bin=$3
     text_fields=$(macho_segment_fields "$bin" __TEXT) || return 2
@@ -74,6 +75,11 @@ produce_macho_signed() {
     echo "SIGNED_1=exact"
     echo "SIGNED_2=exact"
     echo "SIGNED_4=exact"
+
+    # nothing calls mad_device_unused, whose imull $0x3410 marks it: the link
+    # collects it from the object's split __text
+    unused=$(od -An -v -tx1 -j "$text_file" -N "$text_size" "$bin" | tr -d ' \n' | grep -o '69c710340000' | wc -l)
+    [ "$unused" -eq 0 ] && echo "unused=collected" || echo "unused=kept"
 }
 
 produce_macho_signed "$@"
