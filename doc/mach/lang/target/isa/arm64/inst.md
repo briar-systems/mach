@@ -1027,10 +1027,32 @@ pub val V_UQSHL: MachOp = 159
 pub val DUP_GEN: MachOp = 160
 ```
 
+## val REV
+
+```mach
+pub val REV:     MachOp = 161
+```
+
+the byte reversal of a general register, the byte reversal within each
+doubleword of a vector, and the vector broadcast of one lane, reached only
+from inline asm (#3915)
+
+## val V_REV64
+
+```mach
+pub val V_REV64: MachOp = 162
+```
+
+## val V_DUP
+
+```mach
+pub val V_DUP:   MachOp = 163
+```
+
 ## val MOP_LAST
 
 ```mach
-pub val MOP_LAST:  MachOp = DUP_GEN
+pub val MOP_LAST:  MachOp = V_DUP
 ```
 
 ## fun known
@@ -1300,8 +1322,8 @@ amount in src2
 pub val L_NEON_DUP: Layout = 30
 ```
 
-dst vector at the arrangement the element width names, and a src1 general
-register
+dst vector at the arrangement the element width names, from the general
+register src1, or from src1.elem[src2] for a vector src1
 
 ## def WidthRule
 
@@ -1389,6 +1411,14 @@ pub val W_FMOV_GEN: WidthRule = 9
 ```
 
 FMOV (general): sf and ftype as W_SF_FTYPE, the direction from the banks
+
+## val W_SF_REV
+
+```mach
+pub val W_SF_REV: WidthRule = 10
+```
+
+rev: sf and the low opc bit set for a 64-bit register, whose bytes it reverses whole
 
 ## def LaneClass
 
