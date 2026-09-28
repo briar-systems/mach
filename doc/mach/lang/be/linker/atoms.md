@@ -120,7 +120,8 @@ atoms: *AtomPlan) bool;
 ```
 
 whether a live relocation still names symbol_name; a reference from debug
-information describes code rather than needing the symbol, so it never counts
+information describes code rather than needing the symbol, so it never
+counts, except an unwind entry's personality, which the unwinder calls
 
 ## fun has_function_branch_reloc
 
@@ -138,5 +139,6 @@ symbol_name: intern.StrId, sec_base: *u32,
 atoms: *AtomPlan) bool;
 ```
 
-a live relocation loads the symbol's address from a GOT slot
+a live relocation loads the symbol's address from a GOT slot, or names it as
+an unwind entry's personality, which the image reaches through one
 

@@ -24,8 +24,12 @@ use mach.lang.be.linker.atoms.AtomPlan;
 use mach.lang.be.linker.atoms.atom_live_len;
 use mach.lang.be.linker.atoms.atom_live_offset;
 use mach.lang.be.linker.atoms.atom_offset_dead;
+use mach.lang.be.linker.common.COMPACT_ENTRY_SIZE;
+use mach.lang.be.linker.common.COMPACT_LSDA;
+use mach.lang.be.linker.common.COMPACT_PERSONALITY;
 use mach.lang.be.linker.common.grow_cap;
 use mach.lang.be.linker.common.join3;
+use mach.lang.be.linker.dynamic.DynState;
 use mach.lang.be.linker.merge.MergedSection;
 use mach.lang.be.linker.merge.PLACE_UNWIND_FRAMES;
 use mach.lang.be.linker.merge.PLACE_UNWIND_INDEX;
@@ -33,19 +37,20 @@ use mach.lang.be.linker.merge.Placement;
 use mach.lang.be.linker.merge.SectionGroups;
 use mach.lang.be.linker.merge.align_up_u64_checked;
 use mach.lang.be.linker.merge.section_group_add;
+use mach.lang.be.linker.reloc.LocalGotPlan;
+use mach.lang.be.linker.reloc.personality_slot;
 use mach.lang.be.linker.reloc.relocation_target_vaddr;
 use mach.lang.be.linker.resolve.SymbolLoc;
 
-# a mach-o `__compact_unwind` entry: the function start is the relocation of
-# its first field, `handler` when it names a personality or an lsda
-val COMPACT_ENTRY_SIZE: u32 = 32;
-
+# an unwind index entry: its function start, personality and lsda are the
+# relocations of their fields, SYMBOL_NONE for a field the entry leaves empty
 rec NativeInput {
-    module:   u32;
-    reloc:    u32;
-    size:     u32;
-    encoding: u32;
-    handler:  bool;
+    module:      u32;
+    reloc:       u32;
+    size:        u32;
+    encoding:    u32;
+    personality: u32;
+    lsda:        u32;
 }
 
 # what the unwind tables take from the link's foreign objects, gathered when
@@ -234,8 +239,8 @@ fun measure_frames(s: *session.Session, modules: *of.ObjectImage, m: u32, sc: u3
     ret err[fail.Fail].ok{};
 }
 
-# one object's unwind index: an entry per function, its start the relocation
-# of the entry's first field
+# one object's unwind index: an entry per function, its start, personality and
+# lsda the relocations of their fields
 fun read_index(s: *session.Session, modules: *of.ObjectImage, m: u32, sc: u32, plan: *UnwindPlan) err[fail.Fail] {
     val img: *of.ObjectImage = ?modules[m];
     val sec: *of.Section     = ?img.sections[sc];
@@ -243,46 +248,45 @@ fun read_index(s: *session.Session, modules: *of.ObjectImage, m: u32, sc: u32, p
     if (sec.bytes == nil || sec.len % COMPACT_ENTRY_SIZE != 0) {
         ret err[fail.Fail].err{foreign_refusal(s, img, dkind.OBJECT_MALFORMED, "' has a compact unwind section that is not whole entries")};
     }
-    val entries: u32                = sec.len / COMPACT_ENTRY_SIZE;
-    val sr:      res[*u32, A.Error] = A.allocate[u32](s.alloc, entries::usize);
-    if (sel sr.err) { ret err[fail.Fail].err{fail.refused(sr.err)}; }
-    val start: *u32 = sr.ok;
-    fin { A.deallocate[u32](s.alloc, start, entries::usize); }
-    val hr: res[*bool, A.Error] = A.zallocate[bool](s.alloc, entries::usize);
-    if (sel hr.err) { ret err[fail.Fail].err{fail.refused(hr.err)}; }
-    val handler: *bool = hr.ok;
-    fin { A.deallocate[bool](s.alloc, handler, entries::usize); }
-    var k: u32 = 0;
+    val entries: u32 = sec.len / COMPACT_ENTRY_SIZE;
+    val first:   u32 = plan.native_count;
+    var k:       u32 = 0;
     for (k < entries) {
-        start[k] = of.SYMBOL_NONE;
-        k        = k + 1;
+        val base: usize = (k * COMPACT_ENTRY_SIZE)::usize;
+        if (plan.native_count == plan.native_cap) {
+            val grown: err[fail.Fail] = grow_cap[NativeInput](s.alloc, ?plan.natives, ?plan.native_cap, 16);
+            if (sel grown.err) { ret grown; }
+        }
+        plan.natives[plan.native_count] = NativeInput{module: m, reloc: of.SYMBOL_NONE,
+            size:        bin.read_u32_le(sec.bytes, base + 8), encoding: bin.read_u32_le(sec.bytes, base + 12),
+            personality: of.SYMBOL_NONE, lsda: of.SYMBOL_NONE};
+        plan.native_count = plan.native_count + 1;
+        k                 = k + 1;
     }
     var ri: u32 = 0;
     for (ri < img.reloc_count) {
         val r: *of.Relocation = ?img.relocations[ri];
         if (of.section_index(r.section) == sc && r.offset < sec.len) {
-            val slot: u32 = r.offset / COMPACT_ENTRY_SIZE;
-            val at:   u32 = r.offset % COMPACT_ENTRY_SIZE;
-            if (at == 0)  { start[slot] = ri; }
-            or (at >= 16) { handler[slot] = true; }
+            val entry: *NativeInput = ?plan.natives[first + r.offset / COMPACT_ENTRY_SIZE];
+            val at:    u32          = r.offset % COMPACT_ENTRY_SIZE;
+            if (at == 0)                   { entry.reloc = ri; }
+            or (at == COMPACT_PERSONALITY) { entry.personality = ri; }
+            or (at == COMPACT_LSDA)        { entry.lsda = ri; }
         }
         ri = ri + 1;
     }
     k = 0;
     for (k < entries) {
-        val base: usize = (k * COMPACT_ENTRY_SIZE)::usize;
-        if (start[k] == of.SYMBOL_NONE) {
+        val base:  usize        = (k * COMPACT_ENTRY_SIZE)::usize;
+        val entry: *NativeInput = ?plan.natives[first + k];
+        if (entry.reloc == of.SYMBOL_NONE) {
             ret err[fail.Fail].err{foreign_refusal(s, img, dkind.OBJECT_MALFORMED, "' has a compact unwind entry that names no function")};
         }
-        val named: bool = handler[k] || bin.read_u64_le(sec.bytes, base + 16) != 0 || bin.read_u64_le(sec.bytes, base + 24) != 0;
-        if (plan.native_count == plan.native_cap) {
-            val grown: err[fail.Fail] = grow_cap[NativeInput](s.alloc, ?plan.natives, ?plan.native_cap, 16);
-            if (sel grown.err) { ret grown; }
+        if ((entry.personality == of.SYMBOL_NONE && bin.read_u64_le(sec.bytes, base + COMPACT_PERSONALITY::usize) != 0)
+            || (entry.lsda == of.SYMBOL_NONE && bin.read_u64_le(sec.bytes, base + COMPACT_LSDA::usize) != 0)) {
+            ret err[fail.Fail].err{foreign_refusal(s, img, dkind.OBJECT_MALFORMED, "' has a compact unwind entry that names a personality or an lsda without relocating it")};
         }
-        plan.natives[plan.native_count] = NativeInput{module: m, reloc: start[k],
-            size: bin.read_u32_le(sec.bytes, base + 8), encoding: bin.read_u32_le(sec.bytes, base + 12), handler: named};
-        plan.native_count = plan.native_count + 1;
-        k                 = k + 1;
+        k = k + 1;
     }
     ret err[fail.Fail].ok{};
 }
@@ -345,12 +349,13 @@ fun reserve_table(s: *session.Session, merged: *MergedSection, groups: *SectionG
 }
 
 # the functions the foreign unwind indexes describe, at their final addresses,
-# once the layout is final; an entry whose function the link collected is
-# dropped. `count` entries the caller frees
+# once the layout is final, with the slot each one's personality is read
+# through and the address of its lsda; an entry whose function the link
+# collected is dropped. `count` entries the caller frees
 pub fun resolve_native_unwind(s: *session.Session, plan: *UnwindPlan, modules: *of.ObjectImage,
     placements: *Placement, sec_base: *u32, merged_to_out: *u32, out_img: *of.ObjectImage,
-    sym_locs: *map.Map[intern.StrId, SymbolLoc], format: *of.OfVTable, arch: *isa.IsaVTable,
-    image_base: u64, atoms: *AtomPlan, count: *u32) res[*of.NativeUnwind, fail.Fail] {
+    sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState, local_got: *LocalGotPlan,
+    format: *of.OfVTable, arch: *isa.IsaVTable, image_base: u64, atoms: *AtomPlan, count: *u32) res[*of.NativeUnwind, fail.Fail] {
     @count = 0;
     if (plan.native_count == 0) { ret res[*of.NativeUnwind, fail.Fail].ok{nil}; }
     val ar: res[*of.NativeUnwind, A.Error] = A.allocate[of.NativeUnwind](s.alloc, plan.native_count::usize);
@@ -368,8 +373,17 @@ pub fun resolve_native_unwind(s: *session.Session, plan: *UnwindPlan, modules: *
         }
         if (sel at.ok.some) {
             if (ni.size > 0) {
-                out[w] = of.NativeUnwind{vaddr: at.ok.some, size: ni.size, encoding: ni.encoding, handler: ni.handler};
-                w      = w + 1;
+                val handler: res[of.NativeUnwind, fail.Fail] = resolve_handler(s, ni, modules, placements, sec_base,
+                    merged_to_out, out_img, sym_locs, dyn, local_got, format, arch, image_base, atoms);
+                if (sel handler.err) {
+                    A.deallocate[of.NativeUnwind](s.alloc, out, plan.native_count::usize);
+                    ret res[*of.NativeUnwind, fail.Fail].err{handler.err};
+                }
+                out[w]          = handler.ok;
+                out[w].vaddr    = at.ok.some;
+                out[w].size     = ni.size;
+                out[w].encoding = ni.encoding;
+                w               = w + 1;
             }
         }
         i = i + 1;
@@ -389,4 +403,29 @@ pub fun resolve_native_unwind(s: *session.Session, plan: *UnwindPlan, modules: *
     }
     @count = w;
     ret res[*of.NativeUnwind, fail.Fail].ok{out};
+}
+
+# the personality and lsda an unwind index entry names, none for a field it
+# leaves empty
+fun resolve_handler(s: *session.Session, ni: *NativeInput, modules: *of.ObjectImage,
+    placements: *Placement, sec_base: *u32, merged_to_out: *u32, out_img: *of.ObjectImage,
+    sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState, local_got: *LocalGotPlan,
+    format: *of.OfVTable, arch: *isa.IsaVTable, image_base: u64, atoms: *AtomPlan) res[of.NativeUnwind, fail.Fail] {
+    var nv: of.NativeUnwind = of.NativeUnwind{vaddr: 0, size: 0, encoding: 0, personality: of.no_personality(), lsda: 0};
+    if (ni.personality != of.SYMBOL_NONE) {
+        val p: res[of.UnwindPersonality, fail.Fail] = personality_slot(s, modules, ni.module, ni.personality,
+            placements, sec_base, merged_to_out, out_img, sym_locs, dyn, local_got, format, arch, image_base, atoms);
+        if (sel p.err) { ret res[of.NativeUnwind, fail.Fail].err{p.err}; }
+        nv.personality = p.ok;
+    }
+    if (ni.lsda != of.SYMBOL_NONE) {
+        val l: res[opt[u64], fail.Fail] = relocation_target_vaddr(s, modules, ni.module, ni.lsda,
+            placements, sec_base, merged_to_out, out_img, sym_locs, format, arch, image_base, atoms);
+        if (sel l.err) { ret res[of.NativeUnwind, fail.Fail].err{l.err}; }
+        if (sel l.ok.none) {
+            ret res[of.NativeUnwind, fail.Fail].err{foreign_refusal(s, ?modules[ni.module], dkind.OBJECT_MALFORMED, "' has a compact unwind entry whose lsda the link does not keep")};
+        }
+        nv.lsda = l.ok.some;
+    }
+    ret res[of.NativeUnwind, fail.Fail].ok{nv};
 }
