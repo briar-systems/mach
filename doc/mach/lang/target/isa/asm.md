@@ -336,7 +336,7 @@ pub def DeclRegFn: fun(str, *u8, *u32) bool
 ## def NoteLabelFn
 
 ```mach
-pub def NoteLabelFn: fun(*encode.EncodeState, u64) err[fail.Fail]
+pub def NoteLabelFn: fun(*encode.EncodeState, u32) err[fail.Fail]
 ```
 
 the listing's definition of a numbered local label, at the current offset
@@ -465,6 +465,15 @@ binds the cursor to the block it parses, so a refusal is located there
 pub fun claim(c: *Cursor, off: usize, len: usize) err[fail.Fail];
 ```
 
+## val LABEL_NUMBER_MAX
+
+```mach
+pub val LABEL_NUMBER_MAX: u64 = 0xFFFFFFFF
+```
+
+the largest numbered local label: the branch operand and the listing carry it
+as a u32, and a longer number is refused rather than cut short
+
 ## fun label_def_span
 
 ```mach
@@ -476,6 +485,15 @@ pub fun label_def_span(body: str, lo: usize, hi: usize, num_out: *u64) usize;
 ```mach
 pub fun label_ref_span(body: str, lo: usize, hi: usize, num_out: *u64, fwd_out: *bool) bool;
 ```
+
+## fun local_ref
+
+```mach
+pub fun local_ref(c: *Cursor, lo: usize, hi: usize, item: *Item) res[bool, fail.Fail];
+```
+
+a numbered local-label reference (`1f`, `1b`) at [lo, hi) into item, false
+when the span is not one
 
 ## fun next
 
@@ -555,26 +573,26 @@ pub fun labels_dnit(l: *Labels);
 ## fun label_lookup
 
 ```mach
-pub fun label_lookup(l: *Labels, number: u64) opt[u32];
+pub fun label_lookup(l: *Labels, number: u32) opt[u32];
 ```
 
 ## fun label_push_fixup
 
 ```mach
-pub fun label_push_fixup(l: *Labels, patch_pos: u32, number: u64) err[fail.Fail];
+pub fun label_push_fixup(l: *Labels, patch_pos: u32, number: u32) err[fail.Fail];
 ```
 
 ## fun label_record_def
 
 ```mach
-pub fun label_record_def(st: *encode.EncodeState, g: *Grammar, l: *Labels, number: u64, off: u32) err[fail.Fail];
+pub fun label_record_def(st: *encode.EncodeState, g: *Grammar, l: *Labels, number: u32, off: u32) err[fail.Fail];
 ```
 
 ## fun resolve_local
 
 ```mach
 pub fun resolve_local(st: *encode.EncodeState, c: *Cursor, l: *Labels, patch_pos: u32,
-number: u64, fwd: bool) err[fail.Fail];
+number: u32, fwd: bool) err[fail.Fail];
 ```
 
 ## fun encode_block
