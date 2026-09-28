@@ -376,6 +376,15 @@ pub rec BranchFixup;
 pub rec RelocPairSite;
 ```
 
+## val STACK_PROBE_INTERVAL
+
+```mach
+pub val STACK_PROBE_INTERVAL: u64 = 4096
+```
+
+the step a probed frame allocation touches the stack at: the smallest page any
+target has, so no guard a target keeps is narrower than it
+
 ## rec EncodeState
 
 ```mach
