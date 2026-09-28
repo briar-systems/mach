@@ -1475,7 +1475,9 @@ lanes each `lane_bytes` wide but the last, which is `last_bytes` wide when
 that is not 0 (a split vector whose last piece holds the lanes left, #3589);
 `lanes` is 0 when `vreg` holds the whole value.
 at_end: the binding is published at the end of the instruction that carries
-it, where that instruction's def exists, instead of at its start
+it, where that instruction's def exists, instead of at its start.
+lhs_is_imm on a binding that is not a compare: the value is the constant
+`imm` rather than any vreg's, a value the allocator builds at its reads (#4185)
 
 ## val DBG_LANES_MAX
 
