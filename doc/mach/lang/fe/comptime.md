@@ -401,11 +401,27 @@ pub val PHASE_CAP_SEMANTIC_TYPES: PhaseCapabilityKind = 4
 pub val PHASE_CAP_LOWERING:       PhaseCapabilityKind = 5
 ```
 
+## rec NoCapabilityContext
+
+```mach
+pub rec NoCapabilityContext;
+```
+
+the context of an evaluation that holds no phase capability
+
 ## rec PhaseCapabilities
 
 ```mach
 pub rec PhaseCapabilities[T];
 ```
+
+## fun no_capabilities
+
+```mach
+pub fun no_capabilities() PhaseCapabilities[NoCapabilityContext];
+```
+
+no phase capability: an expression reads literals and the constants its context binds
 
 ## fun loading_capabilities
 

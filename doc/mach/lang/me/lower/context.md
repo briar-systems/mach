@@ -546,7 +546,7 @@ pub fun ast_source(lc: *LowerContext, a: *ast.Ast) str;
 ## fun decl_target_op
 
 ```mach
-pub fun decl_target_op(a: *ast.Ast, src: str, d: *adecl.Decl, defs: *isa.TargetDefs, out_op: *u32) u32;
+pub fun decl_target_op(s: *session.Session, mid: session.ModuleId, a: *ast.Ast, src: str, d: *adecl.Decl, defs: *isa.TargetDefs, out_op: *u32) u32;
 ```
 
 ## fun emit_dbg_birth
