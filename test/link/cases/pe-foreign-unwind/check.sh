@@ -7,7 +7,8 @@
 # fixture's stable first nine instruction bytes identify qz_answer without a
 # linked symbol table; its patched call displacement begins immediately after
 # that signature. the row's 22-byte extent and exact UNWIND_INFO distinguish the
-# foreign entry from mach-generated unwind rows in the same sorted table.
+# foreign entry from mach-generated unwind rows in the same sorted table. the
+# fixture's qz_unused, which nothing calls, is collected with its row (#3410).
 produce_pe_exceptions() {
     bin=$3
     elfanew=$(read_le_uint "$bin" 60 4)
@@ -44,6 +45,10 @@ produce_pe_exceptions() {
             return 2
         }
         sig=$(dd if="$bin" bs=1 skip="$begin_off" count=9 2>/dev/null | od -An -tx1 | tr -d ' \n')
+        if [ "${sig:0:14}" = "4883ec288d0c49" ]; then
+            echo "link: pe-exceptions: qz_unused, which nothing calls, kept its runtime row" >&2
+            return 2
+        fi
         if [ "$sig" = "4883ec28b928000000" ]; then
             found=$((found + 1))
             if [ $((end - begin)) -ne 22 ]; then
@@ -65,6 +70,13 @@ produce_pe_exceptions() {
     if [ "$found" -ne 1 ]; then
         echo "link: pe-exceptions: found $found qz_answer runtime rows, want 1" >&2
         return 2
+    fi
+
+    # nothing calls qz_unused, so the link collects its comdat and the unwind data associated with it
+    if od -An -v -tx1 "$bin" | tr -d ' \n' | grep -q '4883ec288d0c49e8'; then
+        echo "foreign_unused=kept"
+    else
+        echo "foreign_unused=collected"
     fi
 
     echo "exception_directory=present"

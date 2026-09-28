@@ -1,6 +1,7 @@
 /* the C half of the foreign-unwind case (mach #4048): the frames between the
  * mach functions, and the walk that records where each frame's function
- * starts. compiled by the runner's own toolchain. */
+ * starts. compiled by the runner's own toolchain, with a section per function
+ * where the format has them, so the link can collect what nothing calls. */
 
 /* a mach #[symbol] name is the literal object symbol, and darwin's C compiler
  * prefixes an underscore to every C name, so the label makes C ask for the literal one */
@@ -139,6 +140,14 @@ __attribute__((noinline)) long long c_middle(long long depth) {
     volatile long long pad[4];
     pad[0] = depth;
     return c_dwarf(pad[0] + 1) + 1;
+}
+
+/* nothing calls c_unused, so the link collects it and its unwind records,
+ * and the walk still unwinds the functions kept around it (mach #3410) */
+long long c_unused(long long depth) {
+    volatile long long pad[2];
+    pad[0] = depth;
+    return c_middle(pad[0] * 7) + 3;
 }
 
 /* the frame the walk reached each function in, innermost first, or -1 */

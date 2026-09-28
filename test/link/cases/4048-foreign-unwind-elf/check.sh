@@ -6,7 +6,8 @@
 # (the function names of its backtrace, outermost last). the image has one
 # `.eh_frame`, the objects' descriptions folded into the image's own, and every
 # function an fde in it covers has a row of `.eh_frame_hdr`'s search table, the
-# two C functions in particular
+# two C functions in particular. the C function nothing calls is collected with
+# its fde (#3410), so every fde left starts at a function the image keeps
 produce_foreign_unwind() {
     b=$3
     for tool in gdb llvm-dwarfdump llvm-readobj llvm-readelf llvm-nm; do
@@ -28,6 +29,20 @@ produce_foreign_unwind() {
         at=$(llvm-nm "$b" 2>/dev/null | sed -n "s/^\([0-9a-f]*\) [Tt] $fn\$/\1/p" | sed 's/^0*//')
         if [ -n "$at" ] && printf '%s\n' "$rows" | grep -qx "$at"; then echo "${fn}_indexed=yes"; else echo "${fn}_indexed=no"; fi
     done
+    # the function nothing calls is collected, and so is its frame description:
+    # every fde left starts at a function the image keeps, both readers take the
+    # tables whole, and the object's debug info, which still names the collected
+    # function, verifies
+    if llvm-nm "$b" 2>/dev/null | grep -q ' c_unused$'; then echo "c_unused=kept"; else echo "c_unused=collected"; fi
+    starts=$(llvm-nm "$b" 2>/dev/null | sed -n 's/^\([0-9a-f]*\) [Tt] .*/\1/p' | sed 's/^0*//' | sort -u)
+    dangling=$(printf '%s\n' "$fdes" | grep -vxF -f <(printf '%s\n' "$starts") | grep -c .)
+    echo "fdes_dangling=$dangling"
+    if llvm-dwarfdump --eh-frame "$b" >/dev/null 2>&1 && llvm-readobj --unwind "$b" >/dev/null 2>&1 \
+        && llvm-dwarfdump --verify "$b" >/dev/null 2>&1; then
+        echo "tables_read=yes"
+    else
+        echo "tables_read=no"
+    fi
 }
 
 produce_foreign_unwind "$@"
