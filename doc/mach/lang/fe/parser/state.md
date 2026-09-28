@@ -59,11 +59,13 @@ it recorded, in order.
 pub val MAX_NEST_DEPTH: usize = 2048
 ```
 
-the deepest nesting the parser will descend into. this is the last-resort
-stack guard, not the semantic limit: the recursive-type checker refuses at
-1024 (REACHES_MAX_DEPTH in fe/sema/infer.mach) with a message that says what
-to do about it, so the parser must sit above that or sema never gets to speak.
-the compiler's own source and the standard library reach 14.
+the deepest nesting the parser will descend into, a sanity limit. the stack
+is guarded by the margin check in descend (mach.lang.stack), which refuses
+first wherever the stack runs short of this. it is not the semantic limit:
+the recursive-type checker refuses at 1024 (REACHES_MAX_DEPTH in
+fe/sema/infer.mach) with a message that says what to do about it, so the
+parser must sit above that or sema never gets to speak. the compiler's own
+source and the standard library reach 14.
 
 ## rec ListBuf
 
