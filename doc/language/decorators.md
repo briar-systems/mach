@@ -379,7 +379,8 @@ caller's instruction cache, or to hold code size down on a constrained target.
 
 ### `align(expr)` — alignment override
 
-Sets the alignment of a global variable or a record/union type. `expr` must
+Sets the alignment of a global variable, a record/union type, or a function's
+entry. `expr` must
 be a comptime integer — either a literal or a comptime expression such as
 `$size_of(T)` or `$align_of(T)`, in both positions.
 
@@ -398,6 +399,9 @@ pub var g_cmp: u8 = 0;
 
 #[align($align_of(Pair))]
 rec Over { a: u8; }
+
+#[align(64)]
+fun hot(n: i64) i64 { ret n + 1; }
 ```
 
 A type aligned to a measurement of itself — `#[align($size_of(Self))]`, or two
@@ -408,6 +412,11 @@ naming the type that closes it.
   alignment.
 - On a `rec` or `uni`, sets the type's own alignment, which is then inherited
   by any global of that type.
+- On a `fun`, sets the alignment of the function's entry address. Without it
+  a function still starts at the target's own entry alignment: 16 bytes on
+  x86-64 and aarch64, as gcc and llvm align them, and no padding on riscv. The
+  bytes before an entry are an instruction that traps. `align` only raises the
+  target's alignment, so a value below it changes nothing.
 - `align` does not apply to `def` aliases (transparent, no layout of their
   own).
 
