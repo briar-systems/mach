@@ -1,0 +1,643 @@
+# tail calls (#3417)
+#
+# a call is in tail position when its block returns the call's result, or
+# returns nothing after a call that returns nothing, with only debug
+# annotations between the call and the return. no `fin` can be pending there,
+# since a fin's code runs between the two. a function takes part only when
+# nothing of its frame can outlive it into the callee: it is not naked or
+# oblivious, it runs no inline asm, and no stack allocation's address
+# escapes. an aggregate a call takes by value does not escape, since the
+# convention hands the callee a copy.
+#
+# `recurse` turns a self call in tail position into a branch back to a loop
+# header whose phis carry the parameters. `ret f(args) op x` with op an
+# integer add, multiply, or or xor is the same loop with an accumulator phi
+# holding the pending operands, and every other return returns the
+# accumulator combined with its value. it runs before inlining, so recursion
+# peeling sees the loop, and the loop is what licm and the vectorizer read.
+#
+# `mark` flags every call left in tail position. it runs last in the release
+# pipeline, so no pass moves anything between a flagged call and its return,
+# and the backend makes a flagged call a jump where the calling convention
+# lets the callee take over the caller's frame.
+#
+# a debug annotation of a call's result is dropped with the call, so the
+# variable reads as optimized out there; -g annotates and never decides
+
+use mach.lang.fail;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mach.lang.me.ir;
+use mach.lang.me.ir.builder;
+use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.mutate;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use mach.lang.me.scratch;
+use mach.lang.source;
+
+rec Work {
+    module: *ir.Module;
+    body:   *ir.Function;
+    index:  u32;
+}
+
+val SITE_NONE:  u8 = 0;
+val SITE_PLAIN: u8 = 1;
+val SITE_ACCUM: u8 = 2;
+
+rec Sites {
+    kind: *u8;
+    call: *id.InstructionId;
+    # the combining instruction of an accumulating site
+    comb: *id.InstructionId;
+    # its operand that is not the call
+    rest: *value.Value;
+    len:  u32;
+    op:   instruction.InstrKind;
+    # the accumulator's type, the combining instructions'
+    ty:  ir_type.IrTypeId;
+    any: bool;
+}
+
+pub fun recurse_in(m: *ir.Module, workspace: *scratch.Workspace) res[bool, fail.Fail] {
+    ret each_function(m, workspace, recurse_function);
+}
+
+pub fun mark_in(m: *ir.Module, workspace: *scratch.Workspace) res[bool, fail.Fail] {
+    ret each_function(m, workspace, mark_function);
+}
+
+fun each_function(m: *ir.Module, workspace: *scratch.Workspace, action: fun(*Work, *A.Allocator) res[bool, fail.Fail]) res[bool, fail.Fail] {
+    var changed: bool = false;
+    var fi:      u32  = 0;
+    for (fi < m.function_len) {
+        val fn: *ir.Function = ?m.functions[fi];
+        if (fn.block_count > 0 && (fn.flags & ir.FN_FLAG_EXTERN) == 0) {
+            var work: Work                 = Work{module: m, body: fn, index: fi};
+            val r:    res[bool, fail.Fail] = scratch.run[Work, bool](workspace, m.alloc, ?work, action);
+            if (sel r.err) { ret r; }
+            if (r.ok)      { changed = true; }
+        }
+        fi = fi + 1;
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+fun mark_function(work: *Work, alloc: *A.Allocator) res[bool, fail.Fail] {
+    val fn:   *ir.Function         = work.body;
+    val part: res[bool, fail.Fail] = takes_part(work.module, fn, alloc);
+    if (sel part.err) { ret part; }
+    if (!part.ok)     { ret res[bool, fail.Fail].ok{false}; }
+    var changed: bool = false;
+    var bi:      u32  = 0;
+    for (bi < fn.block_count) {
+        val c: id.InstructionId = tail_call(work.module, fn, ?fn.blocks[bi]);
+        if (c != id.INSTR_NIL) {
+            fn.instrs[c::u32].flags = fn.instrs[c::u32].flags | instruction.INSTR_FLAG_TAIL;
+            changed                 = true;
+        }
+        bi = bi + 1;
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+# the call a block returns in tail position, or INSTR_NIL
+fun tail_call(m: *ir.Module, fn: *ir.Function, blk: *ir.Block) id.InstructionId {
+    if (blk.terminator == id.INSTR_NIL) { ret id.INSTR_NIL; }
+    val term: *instruction.Instruction = ?fn.instrs[blk.terminator::u32];
+    if (term.kind != instruction.OP_RET) { ret id.INSTR_NIL; }
+    val k: u32 = last_computing(fn, blk, blk.instr_count);
+    if (k == 0) { ret id.INSTR_NIL; }
+    val cid: id.InstructionId         = blk.instructions[k - 1];
+    val c:   *instruction.Instruction = ?fn.instrs[cid::u32];
+    if (c.kind != instruction.OP_CALL) { ret id.INSTR_NIL; }
+    if (term.operand_count == 0) {
+        if (!is_void(m, c.ty)) { ret id.INSTR_NIL; }
+        ret cid;
+    }
+    val rv: value.Value = term.operands[0];
+    if (rv.kind != value.VAL_INSTR || rv.data.instr != cid) { ret id.INSTR_NIL; }
+    ret cid;
+}
+
+# one past the last instruction before `end` that is not a debug annotation
+fun last_computing(fn: *ir.Function, blk: *ir.Block, end: u32) u32 {
+    var k: u32 = end;
+    for (k > 0 && fn.instrs[blk.instructions[k - 1]::u32].kind == instruction.OP_DBG_VALUE) {
+        k = k - 1;
+    }
+    ret k;
+}
+
+fun is_void(m: *ir.Module, ty: ir_type.IrTypeId) bool {
+    val t: opt[*ir_type.IrType] = ir_type.get(?m.types, ty);
+    if (sel t.none) { ret false; }
+    ret t.some.kind == ir_type.IRT_VOID;
+}
+
+# whether nothing of the function's frame can outlive it: see the header
+fun takes_part(m: *ir.Module, fn: *ir.Function, alloc: *A.Allocator) res[bool, fail.Fail] {
+    if ((fn.flags & (ir.FN_FLAG_NAKED | ir.FN_FLAG_OBLIVIOUS)) != 0) { ret res[bool, fail.Fail].ok{false}; }
+    val n: u32 = fn.instr_len;
+    if (n == 0) { ret res[bool, fail.Fail].ok{false}; }
+    val rd: res[*bool, A.Error] = A.zallocate[bool](alloc, n::usize);
+    if (sel rd.err) { ret res[bool, fail.Fail].err{fail.refused(rd.err)}; }
+    val frame: *bool = rd.ok;
+    fin { A.deallocate[bool](alloc, frame, n::usize); }
+
+    var bi: u32 = 0;
+    for (bi < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[bi];
+        var ii:  u32       = 0;
+        for (ii < blk.instr_count) {
+            val iid: id.InstructionId      = blk.instructions[ii];
+            val k:   instruction.InstrKind = fn.instrs[iid::u32].kind;
+            if (k == instruction.OP_ASM)    { ret res[bool, fail.Fail].ok{false}; }
+            if (k == instruction.OP_ALLOCA) { frame[iid::u32] = true; }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    # an element address of a frame address is one too
+    var grew: bool = true;
+    for (grew) {
+        grew = false;
+        bi   = 0;
+        for (bi < fn.block_count) {
+            val blk: *ir.Block = ?fn.blocks[bi];
+            var ii:  u32       = 0;
+            for (ii < blk.instr_count) {
+                val iid: id.InstructionId         = blk.instructions[ii];
+                val ins: *instruction.Instruction = ?fn.instrs[iid::u32];
+                if (ins.kind == instruction.OP_GEP && !frame[iid::u32] && ins.operand_count > 0
+                    && names(frame, n, ins.operands[0])) {
+                    frame[iid::u32] = true;
+                    grew            = true;
+                }
+                ii = ii + 1;
+            }
+            bi = bi + 1;
+        }
+    }
+
+    bi = 0;
+    for (bi < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[bi];
+        var pi:  u32       = 0;
+        for (pi < blk.phi_count) {
+            if (escapes(m, fn, frame, n, blk.phis[pi])) { ret res[bool, fail.Fail].ok{false}; }
+            pi = pi + 1;
+        }
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            if (escapes(m, fn, frame, n, blk.instructions[ii])) { ret res[bool, fail.Fail].ok{false}; }
+            ii = ii + 1;
+        }
+        if (blk.terminator != id.INSTR_NIL && escapes(m, fn, frame, n, blk.terminator)) {
+            ret res[bool, fail.Fail].ok{false};
+        }
+        bi = bi + 1;
+    }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+fun names(frame: *bool, n: u32, v: value.Value) bool {
+    ret v.kind == value.VAL_INSTR && v.data.instr::u32 < n && frame[v.data.instr::u32];
+}
+
+# whether an instruction lets a frame address go anywhere but a load, store,
+# clear or element address through it, or a by-value aggregate argument
+fun escapes(m: *ir.Module, fn: *ir.Function, frame: *bool, n: u32, iid: id.InstructionId) bool {
+    val ins: *instruction.Instruction = ?fn.instrs[iid::u32];
+    val k:   instruction.InstrKind    = ins.kind;
+    if (k == instruction.OP_DBG_VALUE) { ret false; }
+    var o: u32 = 0;
+    for (o < ins.operand_count) {
+        if (names(frame, n, ins.operands[o])) {
+            var kept: bool = false;
+            if (k == instruction.OP_LOAD && o == 0)                                                      { kept = true; }
+            if (k == instruction.OP_STORE && o == 1)                                                     { kept = true; }
+            if (k == instruction.OP_MEMZERO && o == 0)                                                   { kept = true; }
+            if (k == instruction.OP_GEP && o == 0)                                                       { kept = true; }
+            if (k == instruction.OP_CALL && o > 0 && ir_type.is_aggregate(?m.types, ins.operands[o].ty)) { kept = true; }
+            if (!kept)                                                                                   { ret true; }
+        }
+        o = o + 1;
+    }
+    ret false;
+}
+
+fun recurse_function(work: *Work, alloc: *A.Allocator) res[bool, fail.Fail] {
+    val m:  *ir.Module   = work.module;
+    val fn: *ir.Function = work.body;
+    var pi: u32          = 0;
+    for (pi < fn.param_count) {
+        if (!carried(m, fn.params[pi].ty)) { ret res[bool, fail.Fail].ok{false}; }
+        pi = pi + 1;
+    }
+    if (enters_entry(fn)) { ret res[bool, fail.Fail].ok{false}; }
+    val part: res[bool, fail.Fail] = takes_part(m, fn, alloc);
+    if (sel part.err) { ret part; }
+    if (!part.ok)     { ret res[bool, fail.Fail].ok{false}; }
+
+    var sites: Sites;
+    val found: err[fail.Fail] = find_sites(m, fn, work.index, alloc, ?sites);
+    if (sel found.err) { ret res[bool, fail.Fail].err{found.err}; }
+    fin { sites_free(alloc, ?sites); }
+    if (!sites.any) { ret res[bool, fail.Fail].ok{false}; }
+
+    val looped: err[fail.Fail] = make_loop(m, fn, alloc, ?sites);
+    if (sel looped.err) { ret res[bool, fail.Fail].err{looped.err}; }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# a parameter a phi can carry: a scalar held in registers
+fun carried(m: *ir.Module, ty: ir_type.IrTypeId) bool {
+    val t: opt[*ir_type.IrType] = ir_type.get(?m.types, ty);
+    if (sel t.none) { ret false; }
+    val k: ir_type.IrTypeKind = t.some.kind;
+    ret k == ir_type.IRT_INT || k == ir_type.IRT_FLOAT || k == ir_type.IRT_PTR;
+}
+
+# whether any branch enters the entry block, which then cannot open the loop
+fun enters_entry(fn: *ir.Function) bool {
+    var bi: u32 = 0;
+    for (bi < fn.block_count) {
+        var s0: id.BlockId = id.BLOCK_NIL;
+        var s1: id.BlockId = id.BLOCK_NIL;
+        val sn: u32        = ir.block_successors(fn, ?fn.blocks[bi], ?s0, ?s1);
+        if (sn >= 1 && s0 == 0) { ret true; }
+        if (sn >= 2 && s1 == 0) { ret true; }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+fun sites_free(alloc: *A.Allocator, s: *Sites) {
+    if (s.len == 0) { ret; }
+    A.deallocate[u8](alloc, s.kind, s.len::usize);
+    A.deallocate[id.InstructionId](alloc, s.call, s.len::usize);
+    A.deallocate[id.InstructionId](alloc, s.comb, s.len::usize);
+    A.deallocate[value.Value](alloc, s.rest, s.len::usize);
+    s.len = 0;
+}
+
+fun find_sites(m: *ir.Module, fn: *ir.Function, me_ix: u32, alloc: *A.Allocator, s: *Sites) err[fail.Fail] {
+    val n: u32 = fn.block_count;
+    s.len = 0;
+    s.any = false;
+    s.op  = instruction.OP_RET;
+    s.ty  = ir_type.IRT_NIL;
+    val rk: res[*u8, A.Error] = A.zallocate[u8](alloc, n::usize);
+    if (sel rk.err) { ret err[fail.Fail].err{fail.refused(rk.err)}; }
+    s.kind = rk.ok;
+    val rc: res[*id.InstructionId, A.Error] = A.allocate[id.InstructionId](alloc, n::usize);
+    if (sel rc.err) {
+        A.deallocate[u8](alloc, s.kind, n::usize);
+        ret err[fail.Fail].err{fail.refused(rc.err)};
+    }
+    s.call = rc.ok;
+    val rb: res[*id.InstructionId, A.Error] = A.allocate[id.InstructionId](alloc, n::usize);
+    if (sel rb.err) {
+        A.deallocate[u8](alloc, s.kind, n::usize);
+        A.deallocate[id.InstructionId](alloc, s.call, n::usize);
+        ret err[fail.Fail].err{fail.refused(rb.err)};
+    }
+    s.comb = rb.ok;
+    val rr: res[*value.Value, A.Error] = A.allocate[value.Value](alloc, n::usize);
+    if (sel rr.err) {
+        A.deallocate[u8](alloc, s.kind, n::usize);
+        A.deallocate[id.InstructionId](alloc, s.call, n::usize);
+        A.deallocate[id.InstructionId](alloc, s.comb, n::usize);
+        ret err[fail.Fail].err{fail.refused(rr.err)};
+    }
+    s.rest = rr.ok;
+    s.len  = n;
+
+    var bi: u32 = 0;
+    for (bi < n) {
+        val blk: *ir.Block = ?fn.blocks[bi];
+        s.call[bi] = id.INSTR_NIL;
+        s.comb[bi] = id.INSTR_NIL;
+        val c: id.InstructionId = tail_call(m, fn, blk);
+        if (c != id.INSTR_NIL) {
+            if (self_call(fn, c, me_ix)) {
+                s.kind[bi] = SITE_PLAIN;
+                s.call[bi] = c;
+                s.any      = true;
+            }
+        }
+        or {
+            accumulating(m, fn, blk, bi, me_ix, s);
+        }
+        bi = bi + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun self_call(fn: *ir.Function, c: id.InstructionId, me_ix: u32) bool {
+    val call: *instruction.Instruction = ?fn.instrs[c::u32];
+    if (call.operand_count != fn.param_count + 1) { ret false; }
+    val callee: value.Value = call.operands[0];
+    ret callee.kind == value.VAL_FN && callee.data.fn_ix == me_ix;
+}
+
+# `ret op(f(args), x)`: the block returns an integer add, multiply, or or xor
+# computed last, whose one operand is a self call computed just before it
+fun accumulating(m: *ir.Module, fn: *ir.Function, blk: *ir.Block, bi: u32, me_ix: u32, s: *Sites) {
+    if (blk.terminator == id.INSTR_NIL) { ret; }
+    val term: *instruction.Instruction = ?fn.instrs[blk.terminator::u32];
+    if (term.kind != instruction.OP_RET || term.operand_count != 1) { ret; }
+    val k: u32 = last_computing(fn, blk, blk.instr_count);
+    if (k < 2) { ret; }
+    val aid: id.InstructionId = blk.instructions[k - 1];
+    val rv:  value.Value      = term.operands[0];
+    if (rv.kind != value.VAL_INSTR || rv.data.instr != aid) { ret; }
+    val a: *instruction.Instruction = ?fn.instrs[aid::u32];
+    if (!combines(a.kind) || a.operand_count != 2)             { ret; }
+    if (!is_int(m, a.ty))                                      { ret; }
+    if (s.any && s.op != instruction.OP_RET && s.op != a.kind) { ret; }
+    val j: u32 = last_computing(fn, blk, k - 1);
+    if (j == 0) { ret; }
+    val cid: id.InstructionId = blk.instructions[j - 1];
+    if (fn.instrs[cid::u32].kind != instruction.OP_CALL || !self_call(fn, cid, me_ix)) { ret; }
+    var rest: value.Value = a.operands[1];
+    if (!names_instr(a.operands[0], cid)) {
+        if (!names_instr(a.operands[1], cid)) { ret; }
+        rest = a.operands[0];
+    }
+    if (names_instr(rest, cid)) { ret; }
+    s.kind[bi] = SITE_ACCUM;
+    s.call[bi] = cid;
+    s.comb[bi] = aid;
+    s.rest[bi] = rest;
+    s.op       = a.kind;
+    s.ty       = a.ty;
+    s.any      = true;
+}
+
+fun is_int(m: *ir.Module, ty: ir_type.IrTypeId) bool {
+    val t: opt[*ir_type.IrType] = ir_type.get(?m.types, ty);
+    if (sel t.none) { ret false; }
+    ret t.some.kind == ir_type.IRT_INT;
+}
+
+fun names_instr(v: value.Value, iid: id.InstructionId) bool {
+    ret v.kind == value.VAL_INSTR && v.data.instr == iid;
+}
+
+fun combines(k: instruction.InstrKind) bool {
+    ret k == instruction.OP_ADD || k == instruction.OP_MUL || k == instruction.OP_OR || k == instruction.OP_XOR;
+}
+
+fun identity(op: instruction.InstrKind, ty: ir_type.IrTypeId) value.Value {
+    if (op == instruction.OP_MUL) { ret value.const_int(1, ty); }
+    ret value.const_int(0, ty);
+}
+
+fun emit_combine(b: *builder.Builder, op: instruction.InstrKind, lhs: value.Value, rhs: value.Value) res[value.Value, fail.Fail] {
+    if (op == instruction.OP_MUL) { ret builder.emit_mul(b, lhs, rhs); }
+    if (op == instruction.OP_OR)  { ret builder.emit_or(b, lhs, rhs); }
+    if (op == instruction.OP_XOR) { ret builder.emit_xor(b, lhs, rhs); }
+    ret builder.emit_add(b, lhs, rhs);
+}
+
+# the entry keeps its allocations and branches to a new header holding the
+# rest of its body, where one phi per parameter (and the accumulator) meets
+# the entry's values and each site's arguments
+fun make_loop(m: *ir.Module, fn: *ir.Function, alloc: *A.Allocator, s: *Sites) err[fail.Fail] {
+    val rh: res[id.BlockId, fail.Fail] = ir.block_add(m, fn);
+    if (sel rh.err) { ret err[fail.Fail].err{rh.err}; }
+    val head: id.BlockId = rh.ok;
+
+    val entry: *ir.Block = ?fn.blocks[0];
+    val hb:    *ir.Block = ?fn.blocks[head::u32];
+    var w:     u32       = 0;
+    var r:     u32       = 0;
+    for (r < entry.instr_count) {
+        val iid: id.InstructionId = entry.instructions[r];
+        if (fn.instrs[iid::u32].kind == instruction.OP_ALLOCA) {
+            entry.instructions[w] = iid;
+            w                     = w + 1;
+        }
+        or {
+            val moved: err[fail.Fail] = ir.block_append_instr(m, hb, iid);
+            if (sel moved.err) { ret moved; }
+        }
+        r = r + 1;
+    }
+    entry.instr_count = w;
+    hb.terminator     = entry.terminator;
+    entry.terminator  = id.INSTR_NIL;
+
+    # an edge the old entry made is the header's now
+    var bi: u32 = 1;
+    for (bi < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[bi];
+        var pi:  u32       = 0;
+        for (pi < blk.phi_count) {
+            val phi: *instruction.Instruction = ?fn.instrs[blk.phis[pi]::u32];
+            var o:   u32                      = 0;
+            for (o + 1 < phi.operand_count) {
+                if (ir.block_target(phi.operands[o]) == 0) { phi.operands[o].data.int_lit = head::u64; }
+                o = o + 2;
+            }
+            pi = pi + 1;
+        }
+        bi = bi + 1;
+    }
+
+    val np:   u32             = fn.param_count;
+    val base: u32             = fn.instr_len;
+    var bld:  builder.Builder = builder.init(m);
+    builder.set_function(?bld, fn);
+    builder.set_loc(?bld, fn.decl_loc);
+    builder.set_block(?bld, head);
+    var carriers: *value.Value = nil;
+    if (np > 0) {
+        val rc: res[*value.Value, A.Error] = A.allocate[value.Value](alloc, np::usize);
+        if (sel rc.err) { ret err[fail.Fail].err{fail.refused(rc.err)}; }
+        carriers = rc.ok;
+    }
+    fin {
+        if (np > 0) { A.deallocate[value.Value](alloc, carriers, np::usize); }
+    }
+    var pi: u32 = 0;
+    for (pi < np) {
+        val param: value.Value                 = fn.params[pi];
+        val rp:    res[value.Value, fail.Fail] = builder.emit_phi(?bld, param.ty);
+        if (sel rp.err) { ret err[fail.Fail].err{rp.err}; }
+        var phi: value.Value = rp.ok;
+        if (param.secret) {
+            phi.secret = true;
+            instruction.mark_result_secret(fn.instrs, fn.instr_len, phi);
+        }
+        carriers[pi] = phi;
+        pi           = pi + 1;
+    }
+    var acc:    value.Value = value.const_int(0, 0);
+    val accum:  bool        = s.op != instruction.OP_RET;
+    var secret: bool        = false;
+    if (accum) {
+        secret = accum_secret(fn, s);
+        val ra: res[value.Value, fail.Fail] = builder.emit_phi(?bld, s.ty);
+        if (sel ra.err) { ret err[fail.Fail].err{ra.err}; }
+        acc = ra.ok;
+        if (secret) {
+            acc.secret = true;
+            instruction.mark_result_secret(fn.instrs, fn.instr_len, acc);
+        }
+    }
+
+    # every read of a parameter, but the header's own phis, reads its carrier
+    var i: u32 = 0;
+    for (i < base) {
+        val ins: *instruction.Instruction = ?fn.instrs[i];
+        var o:   u32                      = 0;
+        for (o < ins.operand_count) {
+            val op: value.Value = ins.operands[o];
+            if (op.kind == value.VAL_PARAM && op.data.param_ix < np) {
+                ins.operands[o] = mutate.substitute_for_use(carriers[op.data.param_ix], op);
+            }
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+
+    builder.set_block(?bld, 0);
+    val re: err[fail.Fail] = builder.emit_br(?bld, head);
+    if (sel re.err) { ret re; }
+    pi = 0;
+    for (pi < np) {
+        val ri: err[fail.Fail] = builder.phi_add_incoming(?bld, carriers[pi], 0, fn.params[pi]);
+        if (sel ri.err) { ret ri; }
+        pi = pi + 1;
+    }
+    if (accum) {
+        val ri: err[fail.Fail] = builder.phi_add_incoming(?bld, acc, 0, identity(s.op, acc.ty));
+        if (sel ri.err) { ret ri; }
+    }
+
+    # the entry's own site, or return, moved to the header with its body
+    bi = 0;
+    for (bi < s.len) {
+        var at: u32 = bi;
+        if (bi == 0) { at = head::u32; }
+        val kind: u8 = s.kind[bi];
+        if (kind == SITE_PLAIN || kind == SITE_ACCUM) {
+            val closed: err[fail.Fail] = close_site(fn, ?bld, at, head, s.call[bi], s.comb[bi], kind, s, carriers, acc, s.rest[bi], secret);
+            if (sel closed.err) { ret closed; }
+        }
+        or (accum) {
+            val folded: err[fail.Fail] = fold_return(fn, ?bld, at, s.op, acc, secret);
+            if (sel folded.err) { ret folded; }
+        }
+        bi = bi + 1;
+    }
+    ret ir.preds_rebuild(m, fn);
+}
+
+fun accum_secret(fn: *ir.Function, s: *Sites) bool {
+    var bi: u32 = 0;
+    for (bi < s.len) {
+        if (s.kind[bi] == SITE_ACCUM && fn.instrs[s.comb[bi]::u32].secret) { ret true; }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+# a site branches back to the header with its arguments, and an accumulating
+# one with the accumulator combined with its pending operand; the call, the
+# combining instruction and any annotation of either leave the block
+fun close_site(fn: *ir.Function, bld: *builder.Builder, bi: u32, head: id.BlockId, cid: id.InstructionId,
+    aid: id.InstructionId, kind: u8, s: *Sites, carriers: *value.Value, acc: value.Value, rest: value.Value,
+    secret: bool) err[fail.Fail] {
+    val blk: *ir.Block     = ?fn.blocks[bi];
+    val loc: source.SrcLoc = fn.instrs[cid::u32].loc;
+    var w:   u32           = 0;
+    var r:   u32           = 0;
+    for (r < blk.instr_count) {
+        val iid:  id.InstructionId         = blk.instructions[r];
+        val ins:  *instruction.Instruction = ?fn.instrs[iid::u32];
+        var drop: bool                     = iid == cid || iid == aid;
+        if (ins.kind == instruction.OP_DBG_VALUE && ins.operand_count > 0
+            && (names_instr(ins.operands[0], cid) || names_instr(ins.operands[0], aid))) {
+            drop = true;
+        }
+        if (!drop) {
+            blk.instructions[w] = iid;
+            w                   = w + 1;
+        }
+        r = r + 1;
+    }
+    blk.instr_count = w;
+    blk.terminator  = id.INSTR_NIL;
+
+    builder.set_block(bld, bi::id.BlockId);
+    builder.set_loc(bld, loc);
+    var next: value.Value = acc;
+    if (kind == SITE_ACCUM) {
+        val rc: res[value.Value, fail.Fail] = emit_combine(bld, s.op, acc, rest);
+        if (sel rc.err) { ret err[fail.Fail].err{rc.err}; }
+        next = rc.ok;
+        if (secret) {
+            next.secret = true;
+            instruction.mark_result_secret(fn.instrs, fn.instr_len, next);
+        }
+    }
+    val rb: err[fail.Fail] = builder.emit_br(bld, head);
+    if (sel rb.err) { ret rb; }
+    ret add_site_incoming(fn, bld, bi, cid, carriers, acc, next, s.op != instruction.OP_RET);
+}
+
+fun add_site_incoming(fn: *ir.Function, bld: *builder.Builder, bi: u32, cid: id.InstructionId,
+    carriers: *value.Value, acc: value.Value, next: value.Value, accum: bool) err[fail.Fail] {
+    val call: *instruction.Instruction = ?fn.instrs[cid::u32];
+    var pi:   u32                      = 0;
+    for (pi < fn.param_count) {
+        val ri: err[fail.Fail] = builder.phi_add_incoming(bld, carriers[pi], bi::id.BlockId, call.operands[pi + 1]);
+        if (sel ri.err) { ret ri; }
+        pi = pi + 1;
+    }
+    if (accum) {
+        val ri: err[fail.Fail] = builder.phi_add_incoming(bld, acc, bi::id.BlockId, next);
+        if (sel ri.err) { ret ri; }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# every other return returns the accumulator combined with its value
+fun fold_return(fn: *ir.Function, bld: *builder.Builder, bi: u32, op: instruction.InstrKind,
+    acc: value.Value, secret: bool) err[fail.Fail] {
+    val blk: *ir.Block = ?fn.blocks[bi];
+    if (blk.terminator == id.INSTR_NIL) { ret err[fail.Fail].ok{}; }
+    val tid:  id.InstructionId         = blk.terminator;
+    val term: *instruction.Instruction = ?fn.instrs[tid::u32];
+    if (term.kind != instruction.OP_RET || term.operand_count != 1) { ret err[fail.Fail].ok{}; }
+    val loc: source.SrcLoc = term.loc;
+    val rv:  value.Value   = term.operands[0];
+    blk.terminator = id.INSTR_NIL;
+    builder.set_block(bld, bi::id.BlockId);
+    builder.set_loc(bld, loc);
+    val rc: res[value.Value, fail.Fail] = emit_combine(bld, op, acc, rv);
+    fn.blocks[bi].terminator = tid;
+    if (sel rc.err) { ret err[fail.Fail].err{rc.err}; }
+    var folded: value.Value = rc.ok;
+    if (secret || rv.secret) {
+        folded.secret = true;
+        instruction.mark_result_secret(fn.instrs, fn.instr_len, folded);
+    }
+    fn.instrs[tid::u32].operands[0] = folded;
+    ret err[fail.Fail].ok{};
+}

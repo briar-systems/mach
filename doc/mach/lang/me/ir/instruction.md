@@ -496,6 +496,16 @@ analysis, or made so by the saturation shiftbound expands around it (#3885,
 #3887). lowering emits the bare machine shift for it and refuses a variable
 count without it
 
+## val INSTR_FLAG_TAIL
+
+```mach
+pub val INSTR_FLAG_TAIL: u16 = 0x40
+```
+
+a call in tail position of a function whose frame nothing outlives, set by
+the last pass of the release pipeline (#3417). the backend makes it a jump
+where the calling convention lets the callee take over the frame
+
 ## rec Instruction
 
 ```mach
