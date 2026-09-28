@@ -428,6 +428,18 @@ widening multiply does. type legalization forms it where the target realizes
 a widening multiply half as the low and the high product interleaved, so the
 two halves of one product share the pair (#4119)
 
+## val OP_VEC_WIDEN_SUM_U
+
+```mach
+pub val OP_VEC_WIDEN_SUM_U: InstrKind = 62
+```
+
+each result lane the sum of the operand lanes it covers, zero-extended: an
+integer vector of n lanes into n * w / W lanes of the wider width W, lane r
+summing operand lanes r * W / w up to the next result lane's first. formed
+only where the target packs it, the per-block fold of a count accumulated in
+narrow lanes (#4161)
+
 ## val INSTR_FLAG_NSW
 
 ```mach

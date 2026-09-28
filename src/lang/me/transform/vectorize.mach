@@ -1604,6 +1604,206 @@ fun drop_phi(blk: *ir.Block, pid: id.InstructionId) {
     blk.phi_count = w;
 }
 
+# a count accumulated in narrow lanes (#4161): the predicated update adds a
+# constant `c` to an accumulator wider than the compared element, so each lane
+# gains at most `c` per iteration. the lanes count at the element's width
+# instead, and every `block` iterations, before any lane can wrap, they fold
+# into the wide accumulator: `wide` lanes of the accumulator's type, through
+# the widening group sum where the target packs it (x86-64 psadbw) and the
+# lane-wise zero extension otherwise
+rec NarrowCount {
+    mask_ty: ir_type.IrTypeId;
+    nvec_ty: ir_type.IrTypeId;
+    narr_ty: ir_type.IrTypeId;
+    c:       u64;
+    block:   u64;
+    wide:    u32;
+    wvec_ty: ir_type.IrTypeId;
+    warr_ty: ir_type.IrTypeId;
+    group:   bool;
+}
+
+fun narrow_count(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, ri: *dep.ReductionInfo, out: *NarrowCount) res[bool, fail.Fail] {
+    if (ri.is_float || ri.op != instruction.OP_ADD || ri.pred_join == id.INSTR_NIL) { ret res[bool, fail.Fail].ok{false}; }
+    val rv: value.Value = ir.constant_behind(fn, ri.rv);
+    if (rv.kind != value.VAL_CONST_INT) { ret res[bool, fail.Fail].ok{false}; }
+    val mask_ty:   ir_type.IrTypeId = fn.instrs[ri.pred_cmp::u32].operands[0].ty;
+    val mask_bits: u32              = vecform.scalar_bits(m, mask_ty);
+    val acc_bits:  u32              = vecform.scalar_bits(m, ri.acc_ty);
+    if (!plain_int(m, mask_ty) || mask_bits != vecform.scalar_bits(m, ri.elem_ty) || mask_bits >= acc_bits) {
+        ret res[bool, fail.Fail].ok{false};
+    }
+    val c:   u64 = rv.data.int_lit;
+    val top: u64 = (1::u64 << mask_bits::u64) - 1;
+    if (c == 0 || c > top) { ret res[bool, fail.Fail].ok{false}; }
+    if (!supported_vector_op(tgt, instruction.OP_ADD, false, mask_bits) || !supported_vector_op(tgt, instruction.OP_AND, false, mask_bits)) {
+        ret res[bool, fail.Fail].ok{false};
+    }
+    if (!ri.pred_on_true && !supported_vector_op(tgt, instruction.OP_NOT, false, mask_bits)) { ret res[bool, fail.Fail].ok{false}; }
+    val lanes: u32 = ri.lanes;
+    if ((lanes * mask_bits) % acc_bits != 0) { ret res[bool, fail.Fail].ok{false}; }
+    val rn: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_vector(?m.types, mask_ty, lanes);
+    if (sel rn.err) { ret res[bool, fail.Fail].err{rn.err}; }
+    val rna: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_array(?m.types, mask_ty, lanes);
+    if (sel rna.err) { ret res[bool, fail.Fail].err{rna.err}; }
+    var wide: u32                              = lanes * mask_bits / acc_bits;
+    val rg:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_vector(?m.types, ri.acc_ty, wide);
+    if (sel rg.err) { ret res[bool, fail.Fail].err{rg.err}; }
+    var group: bool = vecform.widen_sum_packs(m, tgt, rg.ok, rn.ok);
+    if (!group) {
+        if (!vecform.extends(tgt, instruction.OP_ZEXT, acc_bits, mask_bits)) { ret res[bool, fail.Fail].ok{false}; }
+        wide = lanes;
+    }
+    val rw: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_vector(?m.types, ri.acc_ty, wide);
+    if (sel rw.err) { ret res[bool, fail.Fail].err{rw.err}; }
+    val rwa: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_array(?m.types, ri.acc_ty, wide);
+    if (sel rwa.err) { ret res[bool, fail.Fail].err{rwa.err}; }
+    out.mask_ty = mask_ty;
+    out.nvec_ty = rn.ok;
+    out.narr_ty = rna.ok;
+    out.c       = c;
+    out.block   = top / c;
+    out.wide    = wide;
+    out.wvec_ty = rw.ok;
+    out.warr_ty = rwa.ok;
+    out.group   = group;
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# the narrow lanes folded into `wide` lanes of the accumulator's type
+fun emit_narrow_fold(b: *builder.Builder, nc: *NarrowCount, narrow: value.Value) res[value.Value, fail.Fail] {
+    if (nc.group) { ret builder.emit_vec_widen_sum_u(b, narrow, nc.wvec_ty); }
+    ret builder.emit_zext(b, narrow, nc.wvec_ty);
+}
+
+# the predicated update of a narrow count: `accn + (mask & c)` at the
+# element's width, `accn` the narrow accumulator's header phi. the wide
+# accumulator is no longer updated in the body; its latch value is itself
+fun unpredicate_narrow(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, ri: *dep.ReductionInfo, nc: *NarrowCount, accn: value.Value, vset_out: *id.InstructionId, out_upd: *id.InstructionId) err[fail.Fail] {
+    var at: id.BlockId = la.instr_block[ri.pred_join::u32];
+    if (ri.pred_entry != id.BLOCK_NIL) {
+        at = ri.pred_entry;
+        val rt: err[fail.Fail] = hoist_arm(m, fn, ri.pred_arm_t, at);
+        if (sel rt.err) { ret rt; }
+        val rf: err[fail.Fail] = hoist_arm(m, fn, ri.pred_arm_f, at);
+        if (sel rf.err) { ret rf; }
+        val ru: err[fail.Fail] = make_unconditional(m, fn, at, ri.pred_block);
+        if (sel ru.err) { ret ru; }
+    }
+    fn.instrs[ri.pred_cmp::u32].ty = nc.mask_ty;
+
+    val term: id.InstructionId = fn.blocks[at::u32].terminator;
+    fn.blocks[at::u32].terminator = id.INSTR_NIL;
+    var b: builder.Builder = builder.init(m);
+    builder.set_function(?b, fn);
+    builder.set_block(?b, at);
+    builder.set_loc(?b, fn.instrs[ri.pred_join::u32].loc);
+    var mask: value.Value = value.instr(ri.pred_cmp, nc.mask_ty);
+    var n:    u32         = 0;
+    if (!ri.pred_on_true) {
+        val rn: res[value.Value, fail.Fail] = builder.emit_not(?b, mask);
+        if (sel rn.err) {
+            fn.blocks[at::u32].terminator = term;
+            ret err[fail.Fail].err{rn.err};
+        }
+        mask        = rn.ok;
+        vset_out[n] = mask.data.instr;
+        n           = n + 1;
+    }
+    val ra: res[value.Value, fail.Fail] = builder.emit_and(?b, mask, value.const_int(nc.c, nc.mask_ty));
+    if (sel ra.err) {
+        fn.blocks[at::u32].terminator = term;
+        ret err[fail.Fail].err{ra.err};
+    }
+    vset_out[n] = ra.ok.data.instr;
+    n           = n + 1;
+    val rs: res[value.Value, fail.Fail] = builder.emit_add(?b, accn, ra.ok);
+    fn.blocks[at::u32].terminator = term;
+    if (sel rs.err) { ret err[fail.Fail].err{rs.err}; }
+    vset_out[n] = rs.ok.data.instr;
+
+    val wide_self: value.Value = value.instr(ri.acc_phi, ri.acc_ty);
+    mutate.replace_uses(fn, ri.pred_join, wide_self);
+    mutate.replace_uses(fn, ri.acc_update, wide_self);
+    drop_instr(fn, ri.acc_update);
+    if (ri.pred_entry != id.BLOCK_NIL) { drop_phi(?fn.blocks[ri.pred_block::u32], ri.pred_join); }
+    or                                 { drop_instr(fn, ri.pred_join); }
+    @out_upd = rs.ok.data.instr;
+    ret err[fail.Fail].ok{};
+}
+
+# the fold of the narrow lanes every `block` iterations: a counter beside the
+# induction variable, and the latch taking the loop through a fold block when
+# it reaches the block, which adds the narrow lanes into the wide accumulator
+# and restarts them and the counter at zero
+fun emit_narrow_flush(m: *ir.Module, fn: *ir.Function, nc: *NarrowCount, header: id.BlockId, latch: id.BlockId,
+    iv_ty: ir_type.IrTypeId, acc_phi: id.InstructionId, accn_phi: id.InstructionId, upd: id.InstructionId, nacc0: value.Value) err[fail.Fail] {
+    val wide_acc: value.Value              = value.instr(acc_phi, nc.wvec_ty);
+    val ap:       *instruction.Instruction = ?fn.instrs[acc_phi::u32];
+    ap.ty = nc.wvec_ty;
+    # the loop is entered from the block splatting placed ahead of it
+    var entry: id.BlockId = id.BLOCK_NIL;
+    var o:     u32        = 0;
+    for (o < ap.operand_count) {
+        if (refs.operand_is_block(ap.kind, o)) {
+            if (ir.block_target(ap.operands[o]) != latch) { entry = ir.block_target(ap.operands[o]); }
+        }
+        or (ap.operands[o].kind == value.VAL_INSTR && ap.operands[o].data.instr == acc_phi) { ap.operands[o] = wide_acc; }
+        o = o + 1;
+    }
+
+    var b: builder.Builder = builder.init(m);
+    builder.set_function(?b, fn);
+    builder.set_block(?b, header);
+    val rj: res[value.Value, fail.Fail] = builder.emit_phi(?b, iv_ty);
+    if (sel rj.err) { ret err[fail.Fail].err{rj.err}; }
+    val j: value.Value = rj.ok;
+
+    val rfb: res[id.BlockId, fail.Fail] = ir.block_add(m, fn);
+    if (sel rfb.err) { ret err[fail.Fail].err{rfb.err}; }
+    val flush: id.BlockId = rfb.ok;
+
+    fn.blocks[latch::u32].terminator = id.INSTR_NIL;
+    builder.set_block(?b, latch);
+    val rj1: res[value.Value, fail.Fail] = builder.emit_add(?b, j, value.const_int(1, iv_ty));
+    if (sel rj1.err) { ret err[fail.Fail].err{rj1.err}; }
+    val req: res[value.Value, fail.Fail] = builder.emit_cmp_eq(?b, rj1.ok, value.const_int(nc.block, iv_ty));
+    if (sel req.err) { ret err[fail.Fail].err{req.err}; }
+    val rcb: err[fail.Fail] = builder.emit_cbr(?b, req.ok, flush, header);
+    if (sel rcb.err) { ret rcb; }
+
+    builder.set_block(?b, flush);
+    val rw: res[value.Value, fail.Fail] = emit_narrow_fold(?b, nc, value.instr(upd, nc.nvec_ty));
+    if (sel rw.err) { ret err[fail.Fail].err{rw.err}; }
+    val ra: res[value.Value, fail.Fail] = builder.emit_add(?b, wide_acc, rw.ok);
+    if (sel ra.err) { ret err[fail.Fail].err{ra.err}; }
+    val rbr: err[fail.Fail] = builder.emit_br(?b, header);
+    if (sel rbr.err) { ret rbr; }
+
+    val zero: value.Value    = value.const_int(0, iv_ty);
+    val r0:   err[fail.Fail] = builder.phi_add_incoming(?b, j, entry, zero);
+    if (sel r0.err) { ret r0; }
+    val r1: err[fail.Fail] = builder.phi_add_incoming(?b, j, latch, rj1.ok);
+    if (sel r1.err) { ret r1; }
+    val r2: err[fail.Fail] = builder.phi_add_incoming(?b, j, flush, zero);
+    if (sel r2.err) { ret r2; }
+    val r3: err[fail.Fail] = builder.phi_add_incoming(?b, value.instr(acc_phi, nc.wvec_ty), flush, ra.ok);
+    if (sel r3.err) { ret r3; }
+    val r4: err[fail.Fail] = builder.phi_add_incoming(?b, value.instr(accn_phi, nc.nvec_ty), flush, nacc0);
+    if (sel r4.err) { ret r4; }
+    val hblk: *ir.Block = ?fn.blocks[header::u32];
+    var k:    u32       = 0;
+    for (k < hblk.phi_count) {
+        val pid: id.InstructionId = hblk.phis[k];
+        if (pid != acc_phi && pid != accn_phi && pid != j.data.instr) {
+            val r5: err[fail.Fail] = builder.phi_add_incoming(?b, value.instr(pid, fn.instrs[pid::u32].ty), flush, phi_value_from(fn, pid, latch));
+            if (sel r5.err) { ret r5; }
+        }
+        k = k + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
 fun vectorize_reduction(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, ri: *dep.ReductionInfo, itn: *intern.Interner) res[bool, fail.Fail] {
     val lp: *loops.Loop = ?la.loops[lx];
     if (!reduction_shape_ok(lp)) { ret res[bool, fail.Fail].ok{false}; }
@@ -1633,6 +1833,19 @@ fun vectorize_reduction(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, la
     val rot:    res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
     if (sel rot.err) { ret res[bool, fail.Fail].err{rot.err}; }
     val ord_ty: ir_type.IrTypeId = rot.ok;
+
+    var nc:  NarrowCount;
+    val rnc: res[bool, fail.Fail] = narrow_count(m, tgt, fn, ri, ?nc);
+    if (sel rnc.err) { ret rnc; }
+    val narrow:    bool             = rnc.ok;
+    var acc_vec:   ir_type.IrTypeId = vec_ty;
+    var acc_arr:   ir_type.IrTypeId = arr_ty;
+    var acc_lanes: u32              = lanes;
+    if (narrow) {
+        acc_vec   = nc.wvec_ty;
+        acc_arr   = nc.warr_ty;
+        acc_lanes = nc.wide;
+    }
 
     val hblk:    *ir.Block = ?fn.blocks[header::u32];
     val acc_idx: u32       = phi_index(hblk, acc_phi);
@@ -1673,10 +1886,16 @@ fun vectorize_reduction(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, la
     if (sel rvp.err) { ret res[bool, fail.Fail].err{rvp.err}; }
     val vpre: id.BlockId = rvp.ok;
     builder.set_block(?b, vpre);
-    val rv0: res[value.Value, fail.Fail] = build_accumulator_init(?b, red_op, acc_init, acc_ty, is_float, arr_ty, vec_ty, ord_ty, lanes);
+    val rv0: res[value.Value, fail.Fail] = build_accumulator_init(?b, red_op, acc_init, acc_ty, is_float, acc_arr, acc_vec, ord_ty, acc_lanes);
     if (sel rv0.err) { ret res[bool, fail.Fail].err{rv0.err}; }
-    val vacc0: value.Value                 = rv0.ok;
-    val rbe:   res[value.Value, fail.Fail] = ver.emit_exclusive_bound(?b, ?lp.counted);
+    val vacc0: value.Value = rv0.ok;
+    var nacc0: value.Value = vacc0;
+    if (narrow) {
+        val rn0: res[value.Value, fail.Fail] = build_accumulator_init(?b, instruction.OP_ADD, value.const_int(0, nc.mask_ty), nc.mask_ty, false, nc.narr_ty, nc.nvec_ty, ord_ty, lanes);
+        if (sel rn0.err) { ret res[bool, fail.Fail].err{rn0.err}; }
+        nacc0 = rn0.ok;
+    }
+    val rbe: res[value.Value, fail.Fail] = ver.emit_exclusive_bound(?b, ?lp.counted);
     if (sel rbe.err) { ret res[bool, fail.Fail].err{rbe.err}; }
     val bound_ex: value.Value                 = rbe.ok;
     val rlb:      res[value.Value, fail.Fail] = emit_lane_bound(?b, bound_ex, lanes, iv_ty, orig_pred);
@@ -1691,11 +1910,30 @@ fun vectorize_reduction(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, la
     val rrp: err[fail.Fail] = replace_out_of_loop_uses(m, fn, acc_phi, value.instr(sacc, acc_ty), lp.body, lp.body_len, fn.instr_len);
     if (sel rrp.err) { ret res[bool, fail.Fail].err{rrp.err}; }
 
+    # the narrow accumulator, beside the wide one in the header
+    var accn_phi: id.InstructionId = id.INSTR_NIL;
+    if (narrow) {
+        builder.set_block(?b, header);
+        val rp: res[value.Value, fail.Fail] = builder.emit_phi(?b, nc.mask_ty);
+        if (sel rp.err) { ret res[bool, fail.Fail].err{rp.err}; }
+        accn_phi = rp.ok.data.instr;
+        val ri0: err[fail.Fail] = builder.phi_add_incoming(?b, rp.ok, vpre, nacc0);
+        if (sel ri0.err) { ret res[bool, fail.Fail].err{ri0.err}; }
+    }
+
     val rcb: res[id.BlockId, fail.Fail] = ir.block_add(m, fn);
     if (sel rcb.err) { ret res[bool, fail.Fail].err{rcb.err}; }
     val combine: id.BlockId = rcb.ok;
     builder.set_block(?b, combine);
-    val rhc: res[value.Value, fail.Fail] = emit_horizontal_combine(?b, red_op, value.instr(acc_phi, vec_ty), acc_ty, arr_ty, vec_ty, ord_ty, lanes);
+    var vfinal: value.Value = value.instr(acc_phi, acc_vec);
+    if (narrow) {
+        val rf: res[value.Value, fail.Fail] = emit_narrow_fold(?b, ?nc, value.instr(accn_phi, nc.nvec_ty));
+        if (sel rf.err) { ret res[bool, fail.Fail].err{rf.err}; }
+        val rfa: res[value.Value, fail.Fail] = builder.emit_add(?b, vfinal, rf.ok);
+        if (sel rfa.err) { ret res[bool, fail.Fail].err{rfa.err}; }
+        vfinal = rfa.ok;
+    }
+    val rhc: res[value.Value, fail.Fail] = emit_horizontal_combine(?b, red_op, vfinal, acc_ty, acc_arr, acc_vec, ord_ty, acc_lanes);
     if (sel rhc.err) { ret res[bool, fail.Fail].err{rhc.err}; }
     val s0:     value.Value    = rhc.ok;
     val r_1152: err[fail.Fail] = builder.emit_br(?b, rem_header);
@@ -1708,7 +1946,17 @@ fun vectorize_reduction(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, la
 
     var acc_upd: id.InstructionId = ri.acc_update;
     var rv:      value.Value      = ri.rv;
-    if (ri.pred_join != id.INSTR_NIL) {
+    var nset:    [3]id.InstructionId;
+    nset[0] = id.INSTR_NIL;
+    nset[1] = id.INSTR_NIL;
+    nset[2] = id.INSTR_NIL;
+    if (narrow) {
+        val rup: err[fail.Fail] = unpredicate_narrow(m, fn, la, ri, ?nc, value.instr(accn_phi, nc.mask_ty), ?nset[0], ?acc_upd);
+        if (sel rup.err) { ret res[bool, fail.Fail].err{rup.err}; }
+        val rl: err[fail.Fail] = ir.phi_append_incoming(m, ?fn.instrs[accn_phi::u32], latch, value.instr(acc_upd, nc.nvec_ty));
+        if (sel rl.err) { ret res[bool, fail.Fail].err{rl.err}; }
+    }
+    or (ri.pred_join != id.INSTR_NIL) {
         val rup: err[fail.Fail] = unpredicate(m, fn, la, ri, ?acc_upd, ?rv);
         if (sel rup.err) { ret res[bool, fail.Fail].err{rup.err}; }
     }
@@ -1718,11 +1966,21 @@ fun vectorize_reduction(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, la
     if (sel rset.err) { ret res[bool, fail.Fail].err{fail.refused(rset.err)}; }
     val vset: *bool = rset.ok;
     build_vset(m, tgt, fn, la, lx, ri.accesses, ri.access_count, ri.elem_ty, acc_ty, is_float, !is_float, false, ri.pred_cmp, vset);
-    if (!in_set(fn, vset, rv)) {
-        A.deallocate[bool](m.alloc, vset, vset_len::usize);
-        panic("mach.lang.me.transform.vectorize: a reduction's combined value left the lane set its unmutated loop was proven to have; reduction_vectorizes() must be the sole gate\n");
+    if (narrow) {
+        var ni: u32 = 0;
+        for (ni < 3) {
+            if (nset[ni] != id.INSTR_NIL) { vset[nset[ni]::u32] = true; }
+            ni = ni + 1;
+        }
+        vset[accn_phi::u32] = true;
     }
-    vset[acc_phi::u32] = true;
+    or {
+        if (!in_set(fn, vset, rv)) {
+            A.deallocate[bool](m.alloc, vset, vset_len::usize);
+            panic("mach.lang.me.transform.vectorize: a reduction's combined value left the lane set its unmutated loop was proven to have; reduction_vectorizes() must be the sole gate\n");
+        }
+        vset[acc_phi::u32] = true;
+    }
     vset[acc_upd::u32] = true;
     val rrt: err[fail.Fail] = retype_then_splat(m, tgt, fn, lp, vset, vpre, header, lanes, itn);
     A.deallocate[bool](m.alloc, vset, vset_len::usize);
@@ -1732,6 +1990,11 @@ fun vectorize_reduction(m: *ir.Module, tgt: *target.Target, fn: *ir.Function, la
 
     val rbt: err[fail.Fail] = rewrite_lane_bound_test(m, fn, header, value.instr(iv_phi, iv_ty), lanes, iv_ty, lane_bound, orig_pred, cmp_id);
     if (sel rbt.err) { ret res[bool, fail.Fail].err{rbt.err}; }
+
+    if (narrow) {
+        val rfl: err[fail.Fail] = emit_narrow_flush(m, fn, ?nc, header, latch, iv_ty, acc_phi, accn_phi, acc_upd, nacc0);
+        if (sel rfl.err) { ret res[bool, fail.Fail].err{rfl.err}; }
+    }
 
     val rpr: err[fail.Fail] = ir.preds_rebuild(m, fn);
     if (sel rpr.err) { ret res[bool, fail.Fail].err{rpr.err}; }

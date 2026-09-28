@@ -514,6 +514,16 @@ pub val MIR_VEC_INTERLEAVE: MirOpcode = 0x1011
 the IR lane interleave (dst, lo, hi, the first lane of the half in imm): lane
 i of lo and of hi from that lane on, joined into one lane twice as wide (#4119)
 
+## val MIR_VEC_WIDEN_SUM_U
+
+```mach
+pub val MIR_VEC_WIDEN_SUM_U: MirOpcode = 0x1012
+```
+
+the IR widening group sum (dst, src): each result lane the zero-extended
+sum of the operand lanes it covers, the vec_lane naming the result lane and
+carrying the operand's (#4161)
+
 ## val MIR_SEL_ADD
 
 ```mach

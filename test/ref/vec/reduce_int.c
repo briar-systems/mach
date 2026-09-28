@@ -34,6 +34,18 @@ uint64_t checksum(uint64_t seed) {
     h = mix_u64(h, cnt);
     h = mix_u32(h, big);
 
+    uint8_t bb[1400];
+    const uint64_t nb = (uint64_t)(UINT64_C(1400) - (seed & UINT64_C(1)));
+    for (i = 0; i < nb; i++) {
+        bb[i] = (uint8_t)((uint32_t)((uint32_t)((uint32_t)i * UINT32_C(40503)) + s) >> 11);
+    }
+    const uint8_t kb = (uint8_t)((seed & UINT64_C(63)) + UINT64_C(64));
+    uint64_t c3 = 5;
+    for (i = 0; i < nb; i++) {
+        if (!(bb[i] < kb)) { c3 = c3 + 3; }
+    }
+    h = mix_u64(h, c3);
+
     const int32_t t = (int32_t)(s & UINT32_C(1023));
     uint32_t cs = 0;
     uint32_t skip = 0;

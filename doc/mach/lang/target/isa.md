@@ -489,10 +489,22 @@ it is how a target whose widening multiply is the low and the high multiply
 pairs the two into full products. a cell names the result lane width and the
 operand lane width; its scalar row is each lane joined on its own (#4119)
 
+## val VEC_OP_WIDEN_SUM_U
+
+```mach
+pub val VEC_OP_WIDEN_SUM_U: VecOp = 37
+```
+
+a widening group sum: each result lane the zero-extended sum of the operand
+integer lanes it covers, so the result holds the operand's bits in fewer,
+wider lanes. a cell names the result lane width and the operand lane width;
+its scalar row is the per-lane sum, and only a packed cell is ever formed,
+as the fold of a count accumulated in narrow lanes (#4161)
+
 ## val VEC_OP_LAST
 
 ```mach
-pub val VEC_OP_LAST:       VecOp = VEC_OP_INTERLEAVE
+pub val VEC_OP_LAST:        VecOp = VEC_OP_WIDEN_SUM_U
 ```
 
 ## rec PackedForm
@@ -721,6 +733,12 @@ pub fun is_interleave_op(op: VecOp) bool;
 pub fun is_widen_half_op(op: VecOp) bool;
 ```
 
+## fun is_widen_sum_op
+
+```mach
+pub fun is_widen_sum_op(op: VecOp) bool;
+```
+
 ## fun is_shift_op
 
 ```mach
@@ -800,9 +818,9 @@ declares the rest through this, so each conversion cell is decided once
 pub fun scalar_widening_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
 ```
 
-the same for the widening multiplies, their high halves, the lane interleave
-and the lane-halving extensions: a cell the packed table leaves keeps the
-per-lane path
+the same for the widening multiplies, their high halves, the lane
+interleave, the lane-halving extensions and the widening group sums: a cell
+the packed table leaves keeps the per-lane path
 
 ## fun scalar_shift_rows
 
@@ -984,6 +1002,15 @@ pub fun packed_row_selected_by(m: *MachineModel, op: VecOp, is_float: bool, lane
 
 whether the model selects the row of this cell gated on exactly `ext`: the
 lowering's choice between the baseline form and an extension's instruction
+
+## fun extends_directly
+
+```mach
+pub fun extends_directly(m: *MachineModel) bool;
+```
+
+a lane-wise integer extension of any ratio is one instruction under the
+selected extensions, rather than a chain of doublings
 
 ## fun vector_form
 
