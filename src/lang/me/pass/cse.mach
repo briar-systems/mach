@@ -19,6 +19,7 @@ use mach.lang.me.ir.effect;
 use mach.lang.me.ir.id;
 use mach.lang.me.ir.instruction;
 use mach.lang.me.ir.mutate;
+use mach.lang.me.ir.opdesc;
 use mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.me.scratch;
@@ -29,9 +30,16 @@ rec SeenTable {
     bucket: *id.InstructionId;
     stamp:  *u32;
     chain:  *id.InstructionId;
-    mask:   u32;
-    epoch:  u32;
-    len:    u32;
+    # the memory generation each load was seen at: a load equals an earlier
+    # one of its address only while nothing between them may write memory
+    loaded: *u32;
+    # the loads an earlier one of the block stands for, which go once their
+    # reads are rewritten: a load is kept for the fault it could raise, and
+    # the earlier load of the address raised it already
+    redundant: *bool;
+    mask:      u32;
+    epoch:     u32;
+    len:       u32;
 }
 
 # a run that owns its workspace; the pipeline runs `run_in` over one
@@ -86,23 +94,43 @@ fun cse_function(request: *scratch.Function, alloc: *A.Allocator) res[bool, fail
         if (cse_block(fn, ?fn.blocks[i], ?subst, ?seen)) { any = true; }
         i = i + 1;
     }
-    val applied: bool = any && mutate.rewrite_apply(fn, ?subst);
+    var applied: bool = any && mutate.rewrite_apply(fn, ?subst);
+    if (any) {
+        val erased: res[bool, fail.Fail] = mutate.erase_marked[SeenTable](m, fn, alloc, ?seen, redundant_load);
+        if (sel erased.err) {
+            seen_dnit(?seen, alloc);
+            mutate.rewrite_dnit(?subst, alloc);
+            ret erased;
+        }
+        if (erased.ok) { applied = true; }
+    }
 
     seen_dnit(?seen, alloc);
     mutate.rewrite_dnit(?subst, alloc);
     ret res[bool, fail.Fail].ok{applied};
 }
 
+fun redundant_load(seen: *SeenTable, iid: id.InstructionId) bool {
+    ret iid::u32 < seen.len && seen.redundant[iid::u32];
+}
+
+# a load of an address an earlier load of the block read, with nothing
+# between them that may write memory, reads the same value and is that load
+# (#4230): the memory generation counts the writes so far
 fun cse_block(fn: *ir.Function, blk: *ir.Block, subst: *mutate.Rewrite, seen: *SeenTable) bool {
     var any: bool = false;
+    var mem: u32  = 0;
     var i:   u32  = 0;
     for (i < blk.instr_count) {
         val iid:      id.InstructionId              = blk.instructions[i];
         val opt_inst: opt[*instruction.Instruction] = ir.instruction_get(fn, iid);
         if (sel opt_inst.some) {
             val inst: *instruction.Instruction = opt_inst.some;
-            if (is_candidate(inst)) {
-                val h:   u64 = hash_candidate(fn, inst, subst);
+            if (is_load(inst)) { seen.loaded[iid::u32] = mem; }
+            seen.redundant[iid::u32] = false;
+            if (is_candidate(inst) || is_load(inst)) {
+                var h: u64 = hash_candidate(fn, inst, subst);
+                if (is_load(inst)) { h = fnv1a.step_u32(h, mem); }
                 val idx: u32 = (h::u32) & seen.mask;
 
                 var matched: bool             = false;
@@ -111,10 +139,11 @@ fun cse_block(fn: *ir.Function, blk: *ir.Block, subst: *mutate.Rewrite, seen: *S
                     val opt_cand: opt[*instruction.Instruction] = ir.instruction_get(fn, cur);
                     if (sel opt_cand.some) {
                         val cand: *instruction.Instruction = opt_cand.some;
-                        if (instrs_equal(fn, inst, cand, subst)) {
+                        if (instrs_equal(fn, inst, cand, subst) && same_memory(seen, inst, iid, cand, cur)) {
                             mutate.replace_value(subst, iid, value.instr(cur, inst.ty));
-                            matched = true;
-                            any     = true;
+                            seen.redundant[iid::u32] = is_load(inst);
+                            matched                  = true;
+                            any                      = true;
                         }
                     }
                     cur = seen_next(seen, cur);
@@ -122,6 +151,7 @@ fun cse_block(fn: *ir.Function, blk: *ir.Block, subst: *mutate.Rewrite, seen: *S
 
                 if (matched == false) { seen_add(seen, idx, iid); }
             }
+            if (writes_memory(inst)) { mem = mem + 1; }
         }
         i = i + 1;
     }
@@ -130,6 +160,25 @@ fun cse_block(fn: *ir.Function, blk: *ir.Block, subst: *mutate.Rewrite, seen: *S
 
 fun is_candidate(inst: *instruction.Instruction) bool {
     ret effect.cse_safe(inst);
+}
+
+# a plain load, which reads memory and nothing else
+fun is_load(inst: *instruction.Instruction) bool {
+    ret inst.kind == instruction.OP_LOAD && !effect.is_volatile(inst);
+}
+
+# an instruction that may change what a later load reads: a store, a call,
+# or anything volatile
+fun writes_memory(inst: *instruction.Instruction) bool {
+    if (effect.is_volatile(inst)) { ret true; }
+    ret opdesc.has(inst.kind, opdesc.EFF_WRITES_MEMORY) || opdesc.has(inst.kind, opdesc.EFF_MAY_CALL);
+}
+
+# two loads are one value when they read in one memory generation and agree
+# on the secrecy of what they read; anything else compares by its operands
+fun same_memory(seen: *SeenTable, a: *instruction.Instruction, ai: id.InstructionId, b: *instruction.Instruction, bi: id.InstructionId) bool {
+    if (!is_load(a)) { ret true; }
+    ret seen.loaded[ai::u32] == seen.loaded[bi::u32] && a.secret == b.secret;
 }
 
 fun hash_candidate(fn: *ir.Function, inst: *instruction.Instruction, subst: *mutate.Rewrite) u64 {
@@ -224,6 +273,28 @@ fun seen_init(s: *SeenTable, a: *A.Allocator, len: u32) err[fail.Fail] {
         A.deallocate[u32](a, res_stamp.ok, tsize::usize);
         ret err[fail.Fail].err{fail.refused(res_chain.err)};
     }
+    val res_loaded: res[*u32, A.Error] = A.allocate[u32](a, len::usize);
+    if (sel res_loaded.err) {
+        A.deallocate[id.InstructionId](a, res_bucket.ok, tsize::usize);
+        A.deallocate[u32](a, res_stamp.ok, tsize::usize);
+        A.deallocate[id.InstructionId](a, res_chain.ok, len::usize);
+        ret err[fail.Fail].err{fail.refused(res_loaded.err)};
+    }
+    s.loaded = res_loaded.ok;
+    val res_redundant: res[*bool, A.Error] = A.allocate[bool](a, len::usize);
+    if (sel res_redundant.err) {
+        A.deallocate[id.InstructionId](a, res_bucket.ok, tsize::usize);
+        A.deallocate[u32](a, res_stamp.ok, tsize::usize);
+        A.deallocate[id.InstructionId](a, res_chain.ok, len::usize);
+        A.deallocate[u32](a, res_loaded.ok, len::usize);
+        ret err[fail.Fail].err{fail.refused(res_redundant.err)};
+    }
+    s.redundant = res_redundant.ok;
+    var k: u32 = 0;
+    for (k < len) {
+        s.redundant[k] = false;
+        k              = k + 1;
+    }
 
     s.bucket = res_bucket.ok;
     s.stamp  = res_stamp.ok;
@@ -245,12 +316,16 @@ fun seen_dnit(s: *SeenTable, a: *A.Allocator) {
     A.deallocate[id.InstructionId](a, s.bucket, tsize::usize);
     A.deallocate[u32](a, s.stamp, tsize::usize);
     A.deallocate[id.InstructionId](a, s.chain, s.len::usize);
-    s.bucket = nil;
-    s.stamp  = nil;
-    s.chain  = nil;
-    s.mask   = 0;
-    s.epoch  = 0;
-    s.len    = 0;
+    A.deallocate[u32](a, s.loaded, s.len::usize);
+    A.deallocate[bool](a, s.redundant, s.len::usize);
+    s.loaded    = nil;
+    s.redundant = nil;
+    s.bucket    = nil;
+    s.stamp     = nil;
+    s.chain     = nil;
+    s.mask      = 0;
+    s.epoch     = 0;
+    s.len       = 0;
 }
 
 fun seen_block_begin(s: *SeenTable) {
@@ -429,6 +504,60 @@ test run__merges_two_identical_selects {
     val add: *instruction.Instruction = ?fn.instrs[ra.ok.data.instr::u32];
     if (add.operands[1].kind != value.VAL_INSTR || add.operands[1].data.instr != r1.ok.data.instr) { ret 4; }
     if (!me_testing.verifies(?m, true))                                                            { ret 5; }
+    ret 0;
+}
+
+# a second load of an address is the first while nothing between them may
+# write memory, and goes; a store between them, or a volatile second load,
+# keeps both (#4230)
+test run__merges_a_reload_only_across_no_write {
+    var mode: u32 = 0;
+    for (mode < 3) {
+        var alloc: A.Allocator;
+        page.make(?alloc);
+        val res_m: res[ir.Module, fail.Fail] = ir.init(?alloc, intern.STR_NIL);
+        if (sel res_m.err) { ret 1; }
+        var m: ir.Module = res_m.ok;
+        fin { ir.dnit(?m); }
+        val res_i64: res[type.IrTypeId, fail.Fail] = type.intern_int(?m.types, 64);
+        if (sel res_i64.err) { ret 1; }
+        val res_ptr: res[type.IrTypeId, fail.Fail] = type.intern_ptr(?m.types);
+        if (sel res_ptr.err) { ret 1; }
+        val res_fn: res[u32, fail.Fail] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+        if (sel res_fn.err) { ret 1; }
+        val fn: *ir.Function = ?m.functions[res_fn.ok];
+
+        var bld: builder.Builder = builder.init(?m);
+        builder.set_function(?bld, fn);
+        val rb: res[id.BlockId, fail.Fail] = builder.new_block(?bld);
+        if (sel rb.err) { ret 1; }
+        builder.set_block(?bld, rb.ok);
+
+        val p:  value.Value                 = value.param(0, res_ptr.ok);
+        val l1: res[value.Value, fail.Fail] = builder.emit_load(?bld, p, res_i64.ok);
+        if (sel l1.err) { ret 1; }
+        if (mode == 1) {
+            val rs: err[fail.Fail] = builder.emit_store(?bld, value.param(1, res_i64.ok), p);
+            if (sel rs.err) { ret 1; }
+        }
+        val l2: res[value.Value, fail.Fail] = builder.emit_load(?bld, p, res_i64.ok);
+        if (sel l2.err) { ret 1; }
+        if (mode == 2)  { builder.mark_last_volatile(?bld); }
+        val ra: res[value.Value, fail.Fail] = builder.emit_add(?bld, l1.ok, l2.ok);
+        if (sel ra.err) { ret 1; }
+        val rr: err[fail.Fail] = builder.emit_ret(?bld, ra.ok);
+        if (sel rr.err) { ret 1; }
+        val before: u32 = fn.blocks[rb.ok::u32].instr_count;
+
+        val ran: res[bool, fail.Fail] = run(?m);
+        if (sel ran.err) { ret 2; }
+        val add:    *instruction.Instruction = ?fn.instrs[ra.ok.data.instr::u32];
+        val merged: bool                     = add.operands[1].data.instr == l1.ok.data.instr;
+        val erased: bool                     = fn.blocks[rb.ok::u32].instr_count == before - 1;
+        if (merged != (mode == 0) || erased != (mode == 0)) { ret 3 + (mode::i32); }
+        if (!me_testing.verifies(?m, true))                 { ret 6; }
+        mode = mode + 1;
+    }
     ret 0;
 }
 
