@@ -19,6 +19,7 @@ use A: std.allocator;
 use T: std.allocator.testing;
 
 use mach.lang.intern;
+use mach.lang.layout;
 use mach.lang.me.ir;
 use mach.lang.me.ir.builder;
 use mach.lang.me.ir.effect;
@@ -34,6 +35,7 @@ use mach.lang.me.vecform;
 use mach.lang.source;
 use mach.lang.target;
 use mach.lang.target.isa;
+use mach.lang.target.resolved;
 use target_testing: mach.lang.target.testing;
 
 rec FunctionWork {
@@ -66,10 +68,15 @@ rec Ctx {
     # an earlier pass unlisted, and those get no stack home (#4160)
     listed: *bool;
 
-    # entry-block stack homes a lane-wise conversion builds its result in, by instruction
+    # entry-block stack homes a lane-wise conversion or a reinterpret into a
+    # memory image builds its result in, by instruction
     conv_slot:   *value.Value;
     conv_allocs: *id.InstructionId;
     conv_len:    u32;
+
+    # which instructions have a home, decided before a vector reinterpret is
+    # retyped to the pointer it aliases
+    homed: *bool;
 }
 
 fun lane_scratch(c: *Ctx, n: u32) res[*value.Value, fail.Fail] {
@@ -126,6 +133,27 @@ fun convert_touches_mem_image(c: *Ctx, inst: *instruction.Instruction) bool {
     if (!is_convert_op(inst.kind) || inst.operand_count < 1) { ret false; }
     if (!ir_type.is_vector(?c.m.types, inst.ty))             { ret false; }
     ret mem_image(c, inst.ty) || mem_image(c, inst.operands[0].ty);
+}
+
+# a reinterpret of a non-vector value into a memory image: the value's bytes,
+# stored whole, are the image's lanes
+fun reinterprets_into_image(c: *Ctx, inst: *instruction.Instruction) bool {
+    if (inst.kind != instruction.OP_BITCAST || inst.operand_count < 1) { ret false; }
+    if (!mem_image(c, inst.ty))                                        { ret false; }
+    ret !ir_type.is_vector(?c.m.types, inst.operands[0].ty);
+}
+
+# a reinterpret of a memory image into a non-vector value: the image's lanes,
+# copied into a home the value aligns, are read back whole
+fun reinterprets_from_image(c: *Ctx, inst: *instruction.Instruction) bool {
+    if (inst.kind != instruction.OP_BITCAST || inst.operand_count < 1) { ret false; }
+    if (ir_type.is_vector(?c.m.types, inst.ty))                        { ret false; }
+    val src: ir_type.IrTypeId = inst.operands[0].ty;
+    ret ir_type.is_vector(?c.m.types, src) && mem_image(c, src);
+}
+
+fun needs_home(c: *Ctx, inst: *instruction.Instruction) bool {
+    ret convert_touches_mem_image(c, inst) || reinterprets_into_image(c, inst) || reinterprets_from_image(c, inst);
 }
 
 fun is_vector_bitcast(c: *Ctx, inst: *instruction.Instruction) bool {
@@ -488,8 +516,17 @@ fun expand_convert(c: *Ctx, blk: *ir.Block, kind: instruction.InstrKind, slot: v
 }
 
 # the stack home of a conversion result: the lane array of a memory image, or
-# the vector itself when the result is held in a register
-fun make_conv_slot(c: *Ctx, iid: u32, vty: ir_type.IrTypeId) err[fail.Fail] {
+# the vector itself when the result is held in a register. a reinterpret's home
+# holds the non-vector side whole and the image's lanes, so it takes whichever
+# of the two types aligns it more strictly
+fun make_conv_slot(c: *Ctx, iid: u32, inst: *instruction.Instruction) err[fail.Fail] {
+    var vty:    ir_type.IrTypeId = inst.ty;
+    var scalar: ir_type.IrTypeId = ir_type.IRT_NIL;
+    if (reinterprets_into_image(c, inst)) { scalar = inst.operands[0].ty; }
+    if (reinterprets_from_image(c, inst)) {
+        vty    = inst.operands[0].ty;
+        scalar = inst.ty;
+    }
     var aux: ir_type.IrTypeId = vty;
     if (mem_image(c, vty)) {
         var vi: VInfo;
@@ -498,12 +535,18 @@ fun make_conv_slot(c: *Ctx, iid: u32, vty: ir_type.IrTypeId) err[fail.Fail] {
         val ra: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_array(?c.m.types, vi.elem, vi.lanes);
         if (sel ra.err) { ret err[fail.Fail].err{ra.err}; }
         aux = ra.ok;
+        val machine: layout.Machine = resolved.layout_machine(c.tgt);
+        if (scalar != ir_type.IRT_NIL
+            && ir_type.byte_align_for_machine(?c.m.types, scalar, machine) > ir_type.byte_align_for_machine(?c.m.types, aux, machine)) {
+            aux = scalar;
+        }
     }
     var ops: [1]value.Value;
     ops[0] = value.const_int(1, c.idx_ty);
     val ri: res[id.InstructionId, fail.Fail] = new_instr(c.m, c.fn, instruction.OP_ALLOCA, c.ptr_ty, aux, ?ops[0], 1, source.loc(source.FILE_NIL, 0));
     if (sel ri.err) { ret err[fail.Fail].err{ri.err}; }
     c.conv_slot[iid]          = value.instr(ri.ok, c.ptr_ty);
+    c.homed[iid]              = true;
     c.conv_allocs[c.conv_len] = ri.ok;
     c.conv_len                = c.conv_len + 1;
     ret err[fail.Fail].ok{};
@@ -524,11 +567,14 @@ fun reserve_conv_slots(c: *Ctx, wanted: fun(*Ctx, *instruction.Instruction) bool
     val ra: res[*id.InstructionId, A.Error] = A.allocate[id.InstructionId](c.alloc, c.n::usize);
     if (sel ra.err) { ret err[fail.Fail].err{fail.refused(ra.err)}; }
     c.conv_allocs = ra.ok;
-    i             = 0;
+    val rh: res[*bool, A.Error] = A.zallocate[bool](c.alloc, c.n::usize);
+    if (sel rh.err) { ret err[fail.Fail].err{fail.refused(rh.err)}; }
+    c.homed = rh.ok;
+    i       = 0;
     for (i < c.n) {
         val inst: *instruction.Instruction = ?c.fn.instrs[i];
         if (c.listed[i] && wanted(c, inst)) {
-            val r: err[fail.Fail] = make_conv_slot(c, i, inst.ty);
+            val r: err[fail.Fail] = make_conv_slot(c, i, inst);
             if (sel r.err) { ret r; }
         }
         i = i + 1;
@@ -670,7 +716,7 @@ fun scalarize_function(c: *Ctx, i8_ty: ir_type.IrTypeId) err[fail.Fail] {
         slots = rs.ok;
     }
 
-    val reserved: err[fail.Fail] = reserve_conv_slots(c, convert_touches_mem_image);
+    val reserved: err[fail.Fail] = reserve_conv_slots(c, needs_home);
     if (sel reserved.err) {
         slots_free(c, slots);
         ret reserved;
@@ -687,12 +733,6 @@ fun scalarize_function(c: *Ctx, i8_ty: ir_type.IrTypeId) err[fail.Fail] {
             slots_free(c, slots);
             ret err[fail.Fail].err{fail.message("scalarize: vector operator is not in the increment-1 table (remainder / negate)")};
         }
-        if (inst.kind == instruction.OP_BITCAST && inst.operand_count >= 1
-            && mem_image(c, inst.ty)
-            && !ir_type.is_vector(?c.m.types, inst.operands[0].ty)) {
-            slots_free(c, slots);
-            ret err[fail.Fail].err{fail.message("scalarize: a bit reinterpret into a vector from a non-vector type is not expanded on a target without SIMD")};
-        }
         if (inst.kind == instruction.OP_ALLOCA || inst.kind == instruction.OP_GEP) {
             val rr: err[fail.Fail] = retype_aux(c, inst);
             if (sel rr.err) {
@@ -705,6 +745,10 @@ fun scalarize_function(c: *Ctx, i8_ty: ir_type.IrTypeId) err[fail.Fail] {
                 c.pval[iid]     = c.conv_slot[iid];
                 c.pval_set[iid] = true;
             }
+        }
+        or (reinterprets_into_image(c, inst)) {
+            c.pval[iid]     = c.conv_slot[iid];
+            c.pval_set[iid] = true;
         }
         or (produces_vector(c, inst)) {
             val vty: ir_type.IrTypeId            = inst.ty;
@@ -920,6 +964,23 @@ fun expand_range_from_image(c: *Ctx, blk: *ir.Block, cur: id.InstructionId) err[
     ret err[fail.Fail].ok{};
 }
 
+fun expand_reinterpret_from_image(c: *Ctx, blk: *ir.Block, cur: id.InstructionId) err[fail.Fail] {
+    val ty:     ir_type.IrTypeId = c.fn.instrs[cur::u32].ty;
+    val loc:    source.SrcLoc    = c.fn.instrs[cur::u32].loc;
+    val secret: bool             = c.fn.instrs[cur::u32].operands[0].secret;
+    val home:   value.Value      = c.conv_slot[cur::u32];
+    var vi:     VInfo;
+    val rv:     err[fail.Fail]   = vec_info(c.m, c.fn.instrs[cur::u32].operands[0].ty, ?vi);
+    if (sel rv.err) { ret rv; }
+    val rc: err[fail.Fail] = copy_vector(c, blk, home, resolve(c, c.fn.instrs[cur::u32].operands[0]), vi, loc, 0, 0);
+    if (sel rc.err) { ret rc; }
+    val rl: res[value.Value, fail.Fail] = emit_load(c, blk, home, ty, loc, 0);
+    if (sel rl.err) { ret err[fail.Fail].err{rl.err}; }
+    c.pval[cur::u32]     = lane_secret(c, rl.ok, secret);
+    c.pval_set[cur::u32] = true;
+    ret err[fail.Fail].ok{};
+}
+
 fun fill_one(c: *Ctx, blk: *ir.Block, cur: id.InstructionId, i8_ty: ir_type.IrTypeId) err[fail.Fail] {
     val fn: *ir.Function = c.fn;
 
@@ -937,6 +998,11 @@ fun fill_one(c: *Ctx, blk: *ir.Block, cur: id.InstructionId, i8_ty: ir_type.IrTy
         c.pval[cur::u32]     = rv.ok;
         c.pval_set[cur::u32] = true;
         ret err[fail.Fail].ok{};
+    }
+
+    if (kind == instruction.OP_BITCAST && c.homed != nil && c.homed[cur::u32]) {
+        if (ir_type.is_vector(?c.m.types, ip.operands[0].ty)) { ret expand_reinterpret_from_image(c, blk, cur); }
+        ret emit_store(c, blk, resolve(c, ip.operands[0]), c.conv_slot[cur::u32], loc, 0);
     }
 
     if (is_vec_ty && (is_binary_op(kind) || is_unary_op(kind) || is_compare_op(kind)
@@ -2057,12 +2123,14 @@ fun ctx_free(c: *Ctx) {
     if (c.is_vp != nil && c.pcount > 0)  { A.deallocate[bool](c.alloc, c.is_vp, c.pcount::usize); }
     if (c.conv_slot != nil && c.n > 0)   { A.deallocate[value.Value](c.alloc, c.conv_slot, c.n::usize); }
     if (c.conv_allocs != nil && c.n > 0) { A.deallocate[id.InstructionId](c.alloc, c.conv_allocs, c.n::usize); }
+    if (c.homed != nil && c.n > 0)       { A.deallocate[bool](c.alloc, c.homed, c.n::usize); }
     if (c.listed != nil && c.n > 0)      { A.deallocate[bool](c.alloc, c.listed, c.n::usize); }
     c.pval        = nil;
     c.pval_set    = nil;
     c.is_vp       = nil;
     c.conv_slot   = nil;
     c.conv_allocs = nil;
+    c.homed       = nil;
     c.conv_len    = 0;
     c.listed      = nil;
 }
