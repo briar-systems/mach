@@ -331,8 +331,9 @@ pub val OP_MUL_HIGH_S: InstrKind = 52
 ```
 
 the high half of the full product of two integers at their own width
-(#3511): claimed ahead of the widening recognition that will form them, so
-nothing emits either yet
+(#3511), or of each pair of lanes of two integer vectors at their own lane
+width. type legalization forms the vector form where the target realizes a
+widening multiply half as the low and the high product interleaved (#4119)
 
 ## val OP_MUL_HIGH_U
 
@@ -413,10 +414,24 @@ materialization of a constant a loop reads, placed ahead of the loop so the
 loop reads a register rather than rebuilding the constant (#3807). every
 pass that reads a constant reads through it with `ir.constant_behind`
 
+## val OP_VEC_INTERLEAVE
+
+```mach
+pub val OP_VEC_INTERLEAVE: InstrKind = 61
+```
+
+lane i of operand 0 and lane i of operand 1, two integer vectors of one type,
+joined into lane i of the result, an integer lane twice as wide holding
+operand 0's lane in its low half. an optional third operand, the constant 0
+or n, joins the low or high half of two 2n-lane operands instead, as the
+widening multiply does. type legalization forms it where the target realizes
+a widening multiply half as the low and the high product interleaved, so the
+two halves of one product share the pair (#4119)
+
 ## val OP_VEC_WIDEN_SUM_U
 
 ```mach
-pub val OP_VEC_WIDEN_SUM_U: InstrKind = 61
+pub val OP_VEC_WIDEN_SUM_U: InstrKind = 62
 ```
 
 each result lane the sum of the operand lanes it covers, zero-extended: an

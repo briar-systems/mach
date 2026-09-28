@@ -143,6 +143,26 @@ pub fun widening_half_packs(m: *ir.Module, tgt: *target.Target, kind: instructio
 whether the widening multiply of one half of two `from_ty` vectors into the
 `ty` of half their lanes is a cell the target packs (#3589)
 
+## fun high_of
+
+```mach
+pub fun high_of(kind: instruction.InstrKind) opt[instruction.InstrKind];
+```
+
+the high multiply that pairs with the plain multiply into the widening
+multiply `kind`; absent for any other kind
+
+## fun widening_pair_packs
+
+```mach
+pub fun widening_pair_packs(m: *ir.Module, tgt: *target.Target, kind: instruction.InstrKind, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
+```
+
+whether the target realizes the half `ty` of a widening multiply `kind` of
+two `from_ty` vectors as the plain and the high multiply of the operands,
+interleaved: every piece of the pair is a cell it packs (#4119). both halves
+of one product then read the same pair
+
 ## fun concat_packs
 
 ```mach

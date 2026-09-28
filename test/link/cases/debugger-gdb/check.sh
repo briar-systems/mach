@@ -65,7 +65,10 @@ break main.mach:39
 break main.mach:50
 GDBEOF
         fi
+        # line 121 is pinned's `ret`, where remat_mark is a constant the
+        # allocator builds at its read rather than keeps anywhere (#4185)
         cat <<'GDBEOF'
+break main.mach:121
 run
 echo SENTINEL:addone_stop\n
 frame 0
@@ -149,18 +152,27 @@ print v
 continue
 GDBEOF
         fi
+        # both profiles end in pinned, whose remat_mark reads the constant it
+        # holds (#4185)
+        cat <<'GDBEOF'
+echo SENTINEL:remat_stop\n
+frame 0
+echo SENTINEL:remat_mark\n
+print remat_mark
+continue
+GDBEOF
     } >"$script"
 
     transcript=$gdbtmp/transcript.txt
     gdb --batch -q -x "$script" "$g" >"$transcript" 2>&1
 
     # the program's own stdout is ground truth for the values gdb is asked to read
-    # back: a=addone's result, b=accumulate's, c=deadlocal's, d=dies's, e=staysalive's
-    # (main.mach calls all five at both profiles, so this line needs no profile
+    # back: a=addone's result, b=accumulate's, c=deadlocal's, d=dies's, e=staysalive's,
+    # f=pinned's (main.mach calls all six at both profiles, so this line needs no profile
     # branch even though only debug walks the gdb-side d/e probes below). cross-
     # checking it against the golden's hand-computed values is what would catch a
     # normalizer bug that made every gdb-side assertion vacuously agree with itself.
-    stdout=$(grep -E '^[a-e]=[0-9]+$' "$transcript" | paste -sd, -)
+    stdout=$(grep -E '^[a-f]=[0-9]+$' "$transcript" | paste -sd, -)
     echo "program_stdout=$stdout"
     if grep -q 'exited normally' "$transcript"; then
         echo "exit=normal"

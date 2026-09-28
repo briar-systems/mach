@@ -528,10 +528,28 @@ pub val IVEC_RANGE:       IrVecOp = 27
 pub val IVEC_CONCAT:      IrVecOp = 28
 ```
 
+## val IVEC_MUL_HIGH_S
+
+```mach
+pub val IVEC_MUL_HIGH_S:  IrVecOp = 29
+```
+
+## val IVEC_MUL_HIGH_U
+
+```mach
+pub val IVEC_MUL_HIGH_U:  IrVecOp = 30
+```
+
+## val IVEC_INTERLEAVE
+
+```mach
+pub val IVEC_INTERLEAVE:  IrVecOp = 31
+```
+
 ## val IVEC_WIDEN_SUM_U
 
 ```mach
-pub val IVEC_WIDEN_SUM_U: IrVecOp = 29
+pub val IVEC_WIDEN_SUM_U: IrVecOp = 32
 ```
 
 ## def VecClass
@@ -817,7 +835,7 @@ pub rec IrOpDescriptor;
 ## val IR_OP_DESCRIPTOR_COUNT
 
 ```mach
-pub val IR_OP_DESCRIPTOR_COUNT: usize = 62
+pub val IR_OP_DESCRIPTOR_COUNT: usize = 63
 ```
 
 ## fun is_known
