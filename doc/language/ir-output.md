@@ -17,8 +17,9 @@ Every sized memory operand is written `qword ptr [...]`, a direct branch
 carries `{disp32}` because mach always encodes a 32-bit displacement, and a
 block's label is `.L<function>_<block>`, numbered within the module. A symbol a
 module calls or addresses stays undefined in the listing, as it is a
-relocation in the object. An `asm` block's own branches are listed without
-their targets, so a module holding one does not assemble.
+relocation in the object. An `asm` block's branch names its target as the block
+does: the symbol, or the numbered label (`1f`, `1b`) that the listing defines
+where the block does, which GNU as resolves to the same definition.
 
 ## `debug` — the ir-debug dump
 
