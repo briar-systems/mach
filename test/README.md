@@ -31,7 +31,7 @@ bash test/run.sh --target x86_64-linux    # one target (repeatable)
 bash test/run.sh --case bits/logic        # one case (repeatable)
 bash test/run.sh --qemu                   # also execute aarch64-linux, aarch64fp16-linux, riscv64-linux, riscv64zkt-linux, riscv64zfh-linux and riscv32 under qemu-user
 bash test/run.sh --dwarf                  # also build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
-bash test/run.sh --asm                    # also reassemble every x86_64 ELF column's --emit-asm listing with GNU as and compare .text bytes
+bash test/run.sh --asm                    # also reassemble every x86_64 ELF column's --emit-asm listings, std's included, with GNU as and compare .text bytes
 bash test/run.sh --link [--qemu]          # the link cases instead of the corpus (--case <name> selects one)
 bash test/run.sh --incremental            # warm rebuilds of the compiler and a manifest fixture match clean builds
 bash test/run.sh --docs [--case <page>]   # the mach code blocks of doc/language compile, are fmt-canonical, and the ones with a main run
@@ -58,7 +58,8 @@ newer than it.
 `--asm` holds the x86-64 `--emit-asm` listing to the object it lists. On the
 x86_64-linux and x86_64v3-linux columns each case is also built at O0 and O2
 with `--emit-asm`, and the listings of the case's module and of the fold are
-assembled by GNU as (`as --64`). Each `.text` must equal the `.text` of mach's
+assembled by GNU as (`as --64`), as is every std module's listing once per
+column and profile. Each `.text` must equal the `.text` of mach's
 own object byte for byte. A relocated field is zero in both, since the addend
 lives in the relocation. CI runs it in those two columns.
 

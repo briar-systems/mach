@@ -24,8 +24,8 @@
 #                  (a missing emulator is announced and its target is only built)
 #   --link         run the link cases (test/link/cases) instead of the corpus
 #   --dwarf        build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
-#   --asm          on an x86_64 ELF column, reassemble every case's --emit-asm listing at O0 and O2
-#                  with GNU as and require the same .text bytes as mach's own object
+#   --asm          on an x86_64 ELF column, reassemble every case's and every std module's --emit-asm
+#                  listing at O0 and O2 with GNU as and require the same .text bytes as mach's own object
 #   --incremental  warm rebuilds of this compiler and of a manifest fixture match clean builds
 #   --docs         compile every mach block in doc/language, check it against mach fmt and run each one with a main
 #                  (--case <page> selects one page, such as --case operators; one hosted
@@ -545,10 +545,8 @@ run_case() {
 lists_asm() { [ "$(target_field "$1" 2)" = x86_64 ] && [ "$(object_format "$1")" = elf ]; }
 
 # relisted <target> <profile> <case>: each corpus listing of the case's build (the
-# case's own module and the shared fold), assembled by GNU as, is byte for byte the
-# .text of mach's object for that module, 0 when every one is and otherwise 1 with
-# the first difference in why. a relocated field is zero in both objects, since
-# each addend lives in its relocation
+# case's own module and the shared fold) reassembles to its object, 0 when every
+# one does and otherwise 1 with the first difference in why
 relisted() {
     t=$1; p=$2; c=$3
     a=$(art "$c")
@@ -556,14 +554,34 @@ relisted() {
     "$mach" build "$out/hosted" --target "$t" --profile "$p" --bin "$a" --emit obj --emit-asm >"$log" 2>&1 || {
         why="build: $(first_error "$log")"; return 1
     }
+    relist "$t" "$p" "$a" "corpus/cases/$c" corpus/lib/fold
+}
+
+# relisted_std <target> <profile>: every std listing the corpus builds wrote
+# reassembles to its object; std is the same module in every case's build, so
+# its listings are held to their objects once per column and profile
+relisted_std() {
+    t=$1; p=$2
+    ms=$(cd "$out/hosted/o/$t/$p/asm" 2>/dev/null && find std -name '*.s' | sed 's/\.s$//' | sort)
+    [ -n "$ms" ] || { why="no build wrote a std listing"; return 1; }
+    relist "$t" "$p" std $ms
+}
+
+# relist <target> <profile> <tag> <module>...: each module's listing, assembled by
+# GNU as, is byte for byte the .text of mach's object for that module, 0 when every
+# one is and otherwise 1 with the first difference in why. a relocated field is zero
+# in both objects, since each addend lives in its relocation
+relist() {
+    t=$1; p=$2; tag=$3; shift 3
     d=$out/hosted/o/$t/$p
-    for m in "cases/$c" lib/fold; do
-        s=$d/asm/corpus/$m.s
-        g=$out/log/$t.$p.$a.$(art "$m")
+    log=$out/log/$t.$p.$tag.as.log
+    for m in "$@"; do
+        s=$d/asm/$m.s
+        g=$out/log/$t.$p.$tag.$(art "$m")
         if ! as --64 -o "$g.o" "$s" >"$log" 2>&1; then
             why="GNU as on $m: $(grep -m1 -E 'Error|error' "$log")"; return 1
         fi
-        if ! objcopy -O binary --only-section=.text "$d/obj/corpus/$m.o" "$g.mach" ||
+        if ! objcopy -O binary --only-section=.text "$d/obj/$m.o" "$g.mach" ||
             ! objcopy -O binary --only-section=.text "$g.o" "$g.as"; then
             why="objcopy could not extract the .text of $m"; return 1
         fi
@@ -607,6 +625,9 @@ for t in $targets; do
     echo "target:  $t ($how)"
     before=$noruns
     for c in $cases; do run_case "$t" "$c"; done
+    if [ "$asm" -eq 1 ] && lists_asm "$t"; then
+        for p in o0 o2; do relisted_std "$t" "$p" || fail "$t std $p listing: $why"; done
+    fi
     [ "$noruns" -eq "$before" ] || echo "norun:   $t $((noruns - before)) cases build only, listed in NORUN.$t"
 done
 fi
