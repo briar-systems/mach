@@ -8,6 +8,7 @@ use mach.lang.target.isa;
 use mach.lang.target.of;
 use mach.lang.target.of.bin;
 use mach.lang.target.of.carrier;
+use mach.lang.target.of.cfi;
 use mach.lang.target.of.exports;
 use mach.lang.target.of.macho.format;
 use mach.lang.target.of.macho.object;
@@ -289,6 +290,13 @@ fun parse_object_into(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
                 if ((flags & format.S_ATTR_NO_DEAD_STRIP) != 0) {
                     out.sections[sec_i].flags = out.sections[sec_i].flags | of.SEC_FLAG_RETAIN;
                 }
+                # the object's own unwind input, which a link building unwind tables takes into them
+                if (is_text && format.fixed16_equals(buf, sh, "__eh_frame")) {
+                    out.sections[sec_i].flags = out.sections[sec_i].flags | of.SEC_FLAG_UNWIND_FRAMES;
+                }
+                if (format.fixed16_equals(buf, sh + 16, "__LD") && format.fixed16_equals(buf, sh, "__compact_unwind")) {
+                    out.sections[sec_i].flags = out.sections[sec_i].flags | of.SEC_FLAG_UNWIND_INDEX;
+                }
                 out.sections[sec_i].len   = size::u32;
                 out.sections[sec_i].align = (1::u32) << align_l;
                 out.sections[sec_i].bytes = nil;
@@ -416,8 +424,13 @@ fun parse_object_into(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
 
     val rp: err[fail.Fail] = populate_relocs(alloc, itn, buf, buf_size, cputype, ncmds,
         sec_base, sec_anchor, nsyms, out);
+    if (sel rp.err) {
+        free_parse_scratch(alloc, sec_base, sec_anchor, sec_n);
+        ret rp;
+    }
+    val eh: err[fail.Fail] = relocate_eh_frames(alloc, itn, out, sec_base, sec_anchor, nsyms, sec_n);
     free_parse_scratch(alloc, sec_base, sec_anchor, sec_n);
-    if (sel rp.err) { ret rp; }
+    if (sel eh.err) { ret eh; }
     val indirects: err[fail.Fail] = populate_indirects(alloc, buf, indirect_off, indirect_count, nsyms, out);
     if (sel indirects.err) { ret indirects; }
     val requests: err[fail.Fail] = decode_export_requests(alloc, itn, out);
@@ -514,6 +527,139 @@ fun populate_indirects(alloc: *A.Allocator, buf: *u8, table: usize, table_count:
         section = section + 1;
     }
     ret err[fail.Fail].ok{};
+}
+
+# mach-o leaves the pointers an `__eh_frame` fde holds into its own object
+# without relocations: the assembler resolves each one against the object's
+# section addresses, and ld64 relocates the table itself. each such pointer
+# becomes an explicit relocation here, from the anchor of the section its
+# address falls in, so a link relocates the table like any other section
+fun relocate_eh_frames(alloc: *A.Allocator, itn: *intern.Interner, out: *of.ObjectImage,
+    sec_base: *u64, sec_anchor: *u32, nsyms: u32, sec_n: u32) err[fail.Fail] {
+    var e: u32 = 0;
+    for (e < sec_n) {
+        val sec: *of.Section = ?out.sections[e];
+        if ((sec.flags & of.SEC_FLAG_UNWIND_FRAMES) == 0 || sec.bytes == nil || sec.len == 0) {
+            e = e + 1;
+            cnt;
+        }
+        val mr: res[*bool, A.Error] = A.zallocate[bool](alloc, sec.len::usize);
+        if (sel mr.err) { ret err[fail.Fail].err{fail.refused(mr.err)}; }
+        val relocated: *bool = mr.ok;
+        fin { A.deallocate[bool](alloc, relocated, sec.len::usize); }
+        var ri: u32 = 0;
+        for (ri < out.reloc_count) {
+            val r: *of.Relocation = ?out.relocations[ri];
+            if (of.section_index(r.section) == e && r.offset < sec.len) { relocated[r.offset] = true; }
+            ri = ri + 1;
+        }
+
+        var off: usize = 0;
+        for (true) {
+            val er: res[opt[cfi.EhEntry], fail.Fail] = cfi.eh_entry(sec.bytes, sec.len::usize, off);
+            if (sel er.err)     { ret err[fail.Fail].err{er.err}; }
+            if (sel er.ok.none) { brk; }
+            var ent: cfi.EhEntry = er.ok.some;
+            off = off + ent.size;
+            if (ent.cie) { cnt; }
+            val cr: res[opt[cfi.EhEntry], fail.Fail] = cfi.eh_entry(sec.bytes, sec.len::usize, ent.cie_off);
+            if (sel cr.err) { ret err[fail.Fail].err{cr.err}; }
+            if (sel cr.ok.none) {
+                ret err[fail.Fail].err{fail.user(dkind.OBJECT_MALFORMED, "macho: an __eh_frame fde names no cie")};
+            }
+            var ce: cfi.EhEntry = cr.ok.some;
+            if (!ce.cie) {
+                ret err[fail.Fail].err{fail.user(dkind.OBJECT_MALFORMED, "macho: an __eh_frame fde names no cie")};
+            }
+            val ci: res[cfi.EhCie, fail.Fail] = cfi.eh_cie(sec.bytes, ?ce, 8);
+            if (sel ci.err) { ret err[fail.Fail].err{ci.err}; }
+            var cie: cfi.EhCie                 = ci.ok;
+            val fd:  res[cfi.EhFde, fail.Fail] = cfi.eh_fde(sec.bytes, ?ent, ?cie, 8);
+            if (sel fd.err) { ret err[fail.Fail].err{fd.err}; }
+            if (!relocated[fd.ok.pc_field]) {
+                val pr: err[fail.Fail] = relocate_eh_pointer(itn, out, e, sec_base, sec_anchor, nsyms, sec_n,
+                    fd.ok.pc_field, fd.ok.pc_size, fd.ok.pc_enc);
+                if (sel pr.err) { ret pr; }
+            }
+            if (fd.ok.lsda_size > 0 && !relocated[fd.ok.lsda_field]
+                && cfi.eh_read(sec.bytes, fd.ok.lsda_field, fd.ok.lsda_size, fd.ok.lsda_enc & 0x0F) != 0) {
+                val lr: err[fail.Fail] = relocate_eh_pointer(itn, out, e, sec_base, sec_anchor, nsyms, sec_n,
+                    fd.ok.lsda_field, fd.ok.lsda_size, fd.ok.lsda_enc);
+                if (sel lr.err) { ret lr; }
+            }
+        }
+        e = e + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun relocate_eh_pointer(itn: *intern.Interner, out: *of.ObjectImage, e: u32, sec_base: *u64, sec_anchor: *u32,
+    nsyms: u32, sec_n: u32, field: usize, size: usize, enc: u8) err[fail.Fail] {
+    val raw:    i64  = cfi.eh_read(out.sections[e].bytes, field, size, enc & 0x0F);
+    val pcrel:  bool = (enc & 0x70) == 0x10;
+    var target: u64  = raw::u64;
+    var kind:   of.RelocKind;
+    if (pcrel) {
+        target = sec_base[e] + field::u64 + raw::u64;
+        if (size == 8) { kind = of.RK_PC64; }
+        or (size == 4) { kind = of.RK_PC32; }
+        or             { ret err[fail.Fail].err{fail.user(dkind.OBJECT_UNSUPPORTED, "macho: an __eh_frame pointer is neither 4 nor 8 bytes")}; }
+    }
+    or ((enc & 0x70) == 0) {
+        if (size == 8) { kind = of.RK_ABS64; }
+        or (size == 4) { kind = of.RK_ABS32; }
+        or             { ret err[fail.Fail].err{fail.user(dkind.OBJECT_UNSUPPORTED, "macho: an __eh_frame pointer is neither 4 nor 8 bytes")}; }
+    }
+    or {
+        ret err[fail.Fail].err{fail.user(dkind.OBJECT_UNSUPPORTED, "macho: an __eh_frame pointer is relative to a base this linker does not read")};
+    }
+    var t: u32 = 0;
+    for (t < sec_n && !(target >= sec_base[t] && target < sec_base[t] + out.sections[t].len::u64)) { t = t + 1; }
+    if (t == sec_n) {
+        ret err[fail.Fail].err{fail.user(dkind.OBJECT_MALFORMED, "macho: an __eh_frame pointer names no section of its object")};
+    }
+    if (sec_anchor[t] == format.ANCHOR_NONE) {
+        var ident_buf: [format.SECTION_IDENTITY_SIZE]u8;
+        val rid:       res[intern.StrId, A.Error] = intern.intern(itn, native_identity(?out.sections[t], ?ident_buf[0]));
+        if (sel rid.err) { ret err[fail.Fail].err{fail.refused(rid.err)}; }
+        var anchor: of.Symbol;
+        anchor.name           = rid.ok;
+        anchor.section        = of.section_id(t);
+        anchor.offset         = 0;
+        anchor.size           = 0;
+        anchor.flags          = 0;
+        anchor.fallback       = 0;
+        anchor.align          = 0;
+        anchor.absolute_value = 0;
+        anchor.native         = of.NativeSymbol{format: 0, kind: 0, flags: 0};
+        val added: res[u32, fail.Fail] = of.symbol_add(out, anchor);
+        if (sel added.err) { ret err[fail.Fail].err{added.err}; }
+        sec_anchor[t] = added.ok - nsyms;
+    }
+    ret of.add_relocation(out, of.Relocation{section: of.section_id(e), offset: field::u32, kind: kind,
+        sym:    nsyms + sec_anchor[t], addend: (target - sec_base[t])::i64, sym2: 0, pair: 0, inst_end: 0,
+        origin: of.RELOC_INPUT});
+}
+
+# a section's anchor name from the names its header gave it
+fun native_identity(sec: *of.Section, out: *u8) str {
+    var w: usize = 0;
+    var i: usize = 0;
+    for (i < 16 && sec.native.segment[i] != 0) {
+        out[w] = sec.native.segment[i];
+        w      = w + 1;
+        i      = i + 1;
+    }
+    out[w] = ',';
+    w      = w + 1;
+    i      = 0;
+    for (i < 16 && sec.native.name[i] != 0) {
+        out[w] = sec.native.name[i];
+        w      = w + 1;
+        i      = i + 1;
+    }
+    out[w] = 0;
+    ret out::str;
 }
 
 fun free_parse_scratch(alloc: *A.Allocator, sec_base: *u64, sec_anchor: *u32, sec_n: u32) {

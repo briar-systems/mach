@@ -56,6 +56,7 @@ use mach.lang.be.linker.dynamic.dynstate_import_index;
 use mach.lang.be.linker.dynamic.dynstate_import_is_func;
 use mach.lang.be.linker.dynamic.pinned_attribution_message;
 use mach.lang.be.linker.merge.MergedSection;
+use mach.lang.be.linker.merge.PLACE_UNWIND_INDEX;
 use mach.lang.be.linker.merge.Placement;
 use mach.lang.be.linker.merge.SectionGroups;
 use mach.lang.be.linker.merge.align_up_u64_checked;
@@ -223,6 +224,44 @@ fun local_symbol_target(modules: *of.ObjectImage, m: u32, sy: u32,
     ret true;
 }
 
+# where relocation `ri` of module `m` points once the layout is final: its
+# target's address plus its addend, none when the link collected the target or
+# defines no such symbol
+pub fun relocation_target_vaddr(s: *session.Session, modules: *of.ObjectImage, m: u32, ri: u32,
+    placements: *Placement, sec_base: *u32, merged_to_out: *u32, out_img: *of.ObjectImage,
+    sym_locs: *map.Map[intern.StrId, SymbolLoc], format: *of.OfVTable, arch: *isa.IsaVTable,
+    image_base: u64, atoms: *AtomPlan) res[opt[u64], fail.Fail] {
+    val operand_r: res[of.RelocOperand, fail.Fail] = rel.resolve_operand(arch, ?modules[m], ri);
+    if (sel operand_r.err) { ret res[opt[u64], fail.Fail].err{operand_r.err}; }
+    val sy: u32 = operand_r.ok.sym;
+    if (sy >= modules[m].symbol_count) {
+        ret res[opt[u64], fail.Fail].err{fail.user(dkind.OBJECT_MALFORMED, "linker: relocation references a symbol outside its module's symbol table")};
+    }
+    val target: *of.Symbol = ?modules[m].symbols[sy];
+    var base:   u64        = 0;
+    if ((target.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0 && !of.section_is_external(target.section)) {
+        if (!of.section_is_absolute(target.section) && of.section_index(target.section) >= modules[m].section_count) {
+            ret res[opt[u64], fail.Fail].err{fail.user(dkind.OBJECT_MALFORMED, oor_section_message(s, target.name, modules[m].name))};
+        }
+        var t: rel.RelocTarget = rel.target(0, 0, 0);
+        if (!local_symbol_target(modules, m, sy, placements, sec_base, merged_to_out, out_img, format, image_base, atoms, ?t)) {
+            ret res[opt[u64], fail.Fail].ok{opt[u64].none{}};
+        }
+        base = t.vaddr;
+    }
+    or {
+        val rn: res[intern.StrId, fail.Fail] = resolved_symbol_name(sym_locs, target.name);
+        if (sel rn.err) { ret res[opt[u64], fail.Fail].err{rn.err}; }
+        val name: intern.StrId    = rn.ok;
+        val sl:   opt[*SymbolLoc] = map.get[intern.StrId, SymbolLoc](sym_locs, ?name);
+        if (sel sl.none) { ret res[opt[u64], fail.Fail].ok{opt[u64].none{}}; }
+        base = sl.some.vaddr;
+    }
+    val at: res[u64, rel.RelocError] = rel.add_signed_to_u64(base, operand_r.ok.addend);
+    if (sel at.err) { ret res[opt[u64], fail.Fail].ok{opt[u64].none{}}; }
+    ret res[opt[u64], fail.Fail].ok{opt[u64].some{at.ok}};
+}
+
 # the module's first defined symbol per name, built once for a module with
 # debug sections so each debug relocation asks a map rather than a scan
 fun index_defined_symbols(alloc: *A.Allocator, modules: *of.ObjectImage, m: u32) res[map.Map[intern.StrId, u32], fail.Fail] {
@@ -353,7 +392,8 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
         }
 
         val flat: u32 = sec_base[m] + of.section_index(r.section);
-        if (atom_offset_dead(atoms, flat, r.offset)) {
+        # an unwind index is read by the unwind tables, never placed
+        if (atom_offset_dead(atoms, flat, r.offset) || placements[flat].claim == PLACE_UNWIND_INDEX) {
             ri = ri + 1;
             cnt;
         }
@@ -579,6 +619,7 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
             ret err[fail.Fail].err{of.reloc_refusal(r.origin, dkind.LINK_RELOCATION_UNSUPPORTED, "link: position-independent relocation to an absolute definition requires unsupported runtime adjustment")};
         }
         var apply_kind: of.RelocKind = r.kind;
+        var apply_from: u64          = patch_va;
         if (of.is_difference(r.kind)) {
             val sv: res[u64, fail.Fail] = difference_subtrahend_vaddr(
                 s, modules, m, r.sym2, r.origin, placements, sec_base, merged_to_out, out_img,
@@ -599,22 +640,30 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
                     ret err[fail.Fail].err{of.reloc_refusal(r.origin, dkind.LINK_RELOCATION_UNSUPPORTED, "link: position-independent difference mixes absolute and image-relative definitions")};
                 }
             }
-            val adjusted: res[i64, fail.Fail] = difference_relocation_addend(
-                apply_addend, sv.ok);
-            if (sel adjusted.err) {
-                ret err[fail.Fail].err{adjusted.err};
-            }
-            apply_addend = adjusted.ok;
             val applied: opt[of.RelocKind] = of.difference_apply_kind(r.kind);
             if (sel applied.none) {
                 ret err[fail.Fail].err{of.reloc_refusal(r.origin, dkind.LINK_RELOCATION_UNSUPPORTED, of.reloc_kind_rejection(?s.interner, s.alloc, r.kind, ""))};
             }
             apply_kind = applied.some;
+            # a 64-bit difference is its target's displacement from the
+            # subtrahend, which may be negative; a 32-bit one is applied as a
+            # signed absolute value carrying the subtrahend in its addend
+            if (apply_kind == of.RK_PC64) {
+                apply_from = sv.ok;
+            }
+            or {
+                val adjusted: res[i64, fail.Fail] = difference_relocation_addend(
+                    apply_addend, sv.ok);
+                if (sel adjusted.err) {
+                    ret err[fail.Fail].err{adjusted.err};
+                }
+                apply_addend = adjusted.ok;
+            }
         }
 
         val pr: err[fail.Fail] =
             apply_one(s, apply_kind, r.origin, dst, patch_off, out_img.sections[out_ix].len, resolved,
-            apply_addend, patch_va, target_name, arch, image_base);
+            apply_addend, apply_from, target_name, arch, image_base);
         if (sel pr.err) {
             ret pr;
         }
