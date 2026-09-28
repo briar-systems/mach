@@ -401,7 +401,9 @@ pub var g_cmp: u8 = 0;
 rec Over { a: u8; }
 
 #[align(64)]
-fun hot(n: i64) i64 { ret n + 1; }
+fun hot(n: i64) i64 {
+    ret n + 1;
+}
 ```
 
 A type aligned to a measurement of itself — `#[align($size_of(Self))]`, or two
