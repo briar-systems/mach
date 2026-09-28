@@ -1384,22 +1384,26 @@ fun debug_align(sec: *of.Section) usize {
     ret sec.align::usize;
 }
 
-# `.eh_frame_hdr` and `.eh_frame` for the frame records a link keeps
-fun elf_unwind_shape(arch_id: u32, frames: *of.FrameUnwind, count: u32) res[of.UnwindShape, fail.Fail] {
+# `.eh_frame_hdr` and `.eh_frame` for the frame records a link keeps and the
+# frame descriptions its foreign objects carry in ahead of them
+fun elf_unwind_shape(arch_id: u32, frames: *of.FrameUnwind, count: u32, foreign: *of.ForeignUnwind) res[of.UnwindShape, fail.Fail] {
     var shape: of.UnwindShape;
     val fo:    opt[cfi.FrameIsa] = cfi.frame_isa(arch_id);
     if (sel fo.none) { ret res[of.UnwindShape, fail.Fail].ok{shape}; }
     var fi: cfi.FrameIsa          = fo.some;
     val eh: res[usize, fail.Fail] = cfi.eh_frame_bound(?fi, frames, count);
     if (sel eh.err) { ret res[of.UnwindShape, fail.Fail].err{eh.err}; }
-    shape.index  = of.TableShape{name: ".eh_frame_hdr", size: cfi.eh_frame_hdr_size(count), align: 4};
-    shape.frames = of.TableShape{name: ".eh_frame", size: eh.ok, align: fi.ptr_size};
+    shape.index  = of.TableShape{name: ".eh_frame_hdr", size: cfi.eh_frame_hdr_size(count + foreign.fde_count), align: 4};
+    shape.frames = of.TableShape{name: ".eh_frame", size: foreign.frames_len + eh.ok, align: fi.ptr_size};
     ret res[of.UnwindShape, fail.Fail].ok{shape};
 }
 
 # fills the unwind tables the linker reserved in the code, trims their sections
 # to what they hold and leaves in `hdr` where the search table lies, which a
-# PT_GNU_EH_FRAME names; `hdr` is absent when the image carries no tables
+# PT_GNU_EH_FRAME names; `hdr` is absent when the image carries no tables. the
+# frame descriptions of the foreign objects lie first in `.eh_frame`, carried
+# and relocated by the linker; this table's own cie and fdes follow them, and
+# the search table covers both
 fun fill_unwind(alloc: *A.Allocator, arch_id: u32, segs: *of.LoadSegment, seg_count: u32,
     funcs: *of.ExecFunction, func_count: u32, hdr: *cfi.UnwindRoom) err[fail.Fail] {
     var index:  cfi.UnwindRoom = cfi.unwind_room(segs, seg_count, of.SEC_FLAG_UNWIND_INDEX);
@@ -1412,6 +1416,16 @@ fun fill_unwind(alloc: *A.Allocator, arch_id: u32, segs: *of.LoadSegment, seg_co
     val fo: opt[cfi.FrameIsa] = cfi.frame_isa(arch_id);
     if (sel fo.none) { ret err[fail.Fail].err{fail.message("elf: unwind tables reserved for an architecture cfi cannot describe")}; }
     var fi: cfi.FrameIsa = fo.some;
+
+    var foreign:       *cfi.EhFn             = nil;
+    var foreign_count: u32                   = 0;
+    val scanned:       res[usize, fail.Fail] = cfi.eh_frame_scan(alloc, frames.bytes, frames.cap, frames.vaddr,
+        fi.ptr_size, ?foreign, ?foreign_count);
+    if (sel scanned.err) { ret err[fail.Fail].err{scanned.err}; }
+    fin {
+        if (foreign != nil) { A.deallocate[cfi.EhFn](alloc, foreign, foreign_count::usize); }
+    }
+    val base: usize = scanned.ok;
 
     var n:  u32                           = 0;
     val fr: res[*cfi.UnwindFn, fail.Fail] = cfi.unwind_functions(alloc, segs, seg_count, funcs, func_count, ?n);
@@ -1430,14 +1444,37 @@ fun fill_unwind(alloc: *A.Allocator, arch_id: u32, segs: *of.LoadSegment, seg_co
         if (offs != nil) { A.deallocate[u32](alloc, offs, n::usize); }
     }
 
-    val eh: res[usize, fail.Fail] = cfi.write_eh_frame(?fi, frames.bytes, frames.cap, frames.vaddr, fns, n, offs);
+    val own_vaddr: u64                   = frames.vaddr + base::u64;
+    val eh:        res[usize, fail.Fail] = cfi.write_eh_frame(?fi, (frames.bytes::usize + base)::*u8, frames.cap - base,
+        own_vaddr, fns, n, offs);
     if (sel eh.err) { ret err[fail.Fail].err{eh.err}; }
-    val hw: err[fail.Fail] = cfi.write_eh_frame_hdr(index.bytes, index.cap, index.vaddr, frames.vaddr, fns, n, offs);
+
+    val rows_n: u32         = n + foreign_count;
+    var rows:   *cfi.HdrRow = nil;
+    if (rows_n > 0) {
+        val ra: res[*cfi.HdrRow, A.Error] = A.allocate[cfi.HdrRow](alloc, rows_n::usize);
+        if (sel ra.err) { ret err[fail.Fail].err{fail.refused(ra.err)}; }
+        rows = ra.ok;
+    }
+    fin {
+        if (rows != nil) { A.deallocate[cfi.HdrRow](alloc, rows, rows_n::usize); }
+    }
+    var i: u32 = 0;
+    for (i < n) {
+        rows[i] = cfi.HdrRow{pc: fns[i].addr, fde: own_vaddr + offs[i]::u64};
+        i       = i + 1;
+    }
+    i = 0;
+    for (i < foreign_count) {
+        rows[n + i] = cfi.HdrRow{pc: foreign[i].pc, fde: frames.vaddr + foreign[i].fde_off::u64};
+        i           = i + 1;
+    }
+    val hw: err[fail.Fail] = cfi.write_eh_frame_hdr(index.bytes, index.cap, index.vaddr, frames.vaddr, rows, rows_n);
     if (sel hw.err) { ret hw; }
-    cfi.unwind_room_trim(segs, ?frames, eh.ok);
-    cfi.unwind_room_trim(segs, ?index, cfi.eh_frame_hdr_size(n));
+    cfi.unwind_room_trim(segs, ?frames, base + eh.ok);
+    cfi.unwind_room_trim(segs, ?index, cfi.eh_frame_hdr_size(rows_n));
     @hdr    = index;
-    hdr.cap = cfi.eh_frame_hdr_size(n);
+    hdr.cap = cfi.eh_frame_hdr_size(rows_n);
     ret err[fail.Fail].ok{};
 }
 
@@ -4186,6 +4223,10 @@ fun parse_object_into(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
             }
             if ((flags & SHF_GNU_RETAIN) != 0 || ty == SHT_FINI_ARRAY || ty == SHT_PREINIT_ARRAY) {
                 out.sections[idx].flags = out.sections[idx].flags | of.SEC_FLAG_RETAIN;
+            }
+            # the object's own frame descriptions, which a link building unwind tables carries into them
+            if ((flags & SHF_ALLOC) != 0 && (ty == SHT_X86_64_UNWIND || str_equals(sec_name, ".eh_frame"))) {
+                out.sections[idx].flags = out.sections[idx].flags | of.SEC_FLAG_UNWIND_FRAMES;
             }
             if (ty != SHT_NOBITS && out.sections[idx].len > 0) {
                 val sz:      usize = out.sections[idx].len::usize;

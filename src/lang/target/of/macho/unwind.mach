@@ -10,6 +10,7 @@ use mach.lang.target.of;
 use mach.lang.target.of.bin;
 use mach.lang.target.of.cfi;
 use A: std.allocator;
+use std.collections.sort;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -156,12 +157,15 @@ fun unwind_info_size(entries: u32) usize {
 }
 
 # `__unwind_info` for a function and a gap after each, and `__eh_frame` for
-# the frames compact unwind cannot say
-pub fun macho_unwind_shape(arch_id: u32, frames: *of.FrameUnwind, count: u32) res[of.UnwindShape, fail.Fail] {
+# the frames compact unwind cannot say, after the frame descriptions the
+# foreign objects carry in. a foreign function has an entry from its object's
+# compact unwind or its frame description, so every one is counted twice at most
+pub fun macho_unwind_shape(arch_id: u32, frames: *of.FrameUnwind, count: u32, foreign: *of.ForeignUnwind) res[of.UnwindShape, fail.Fail] {
     var shape: of.UnwindShape;
     val fo:    opt[cfi.FrameIsa] = cfi.frame_isa(arch_id);
     if (sel fo.none) { ret res[of.UnwindShape, fail.Fail].ok{shape}; }
-    if (count == 0)  { ret res[of.UnwindShape, fail.Fail].ok{shape}; }
+    val functions: u32 = count + foreign.native_count + foreign.fde_count;
+    if (functions == 0 && foreign.frames_len == 0) { ret res[of.UnwindShape, fail.Fail].ok{shape}; }
     var fi: cfi.FrameIsa = fo.some;
 
     var eh: usize = 0;
@@ -176,9 +180,10 @@ pub fun macho_unwind_shape(arch_id: u32, frames: *of.FrameUnwind, count: u32) re
         }
         i = i + 1;
     }
-    shape.index = of.TableShape{name: "__unwind_info", size: unwind_info_size(2 * count), align: 4};
-    if (eh > 0) {
-        shape.frames = of.TableShape{name: "__eh_frame", size: cfi.cie_size(?fi) + eh + 4, align: 8};
+    shape.index = of.TableShape{name: "__unwind_info", size: unwind_info_size(2 * functions), align: 4};
+    if (eh > 0) { eh = eh + cfi.cie_size(?fi); }
+    if (eh > 0 || foreign.frames_len > 0) {
+        shape.frames = of.TableShape{name: "__eh_frame", size: foreign.frames_len + eh + 4, align: 8};
     }
     ret res[of.UnwindShape, fail.Fail].ok{shape};
 }
@@ -188,10 +193,60 @@ rec Entry {
     encoding: u32;
 }
 
-# fills the unwind tables the linker reserved: an encoding per function with a
-# frame record in address order, a zero one across each gap no such function
-# covers, and the dwarf descriptions the encodings that need them point to.
-# every function offset counts from `mh_addr`, where the mach header is mapped
+# a function the index covers, before the gaps between them are filled
+rec Span {
+    addr:     u64;
+    size:     u32;
+    encoding: u32;
+}
+
+fun span_cmp(a: *Span, b: *Span) i64 {
+    if (a.addr < b.addr) { ret -1; }
+    if (a.addr > b.addr) { ret 1; }
+    ret 0;
+}
+
+val MODE_MASK:        u32 = 0x0F000000;
+val PERSONALITY_LSDA: u32 = 0x70000000;
+
+fun dwarf_entry(fi: *cfi.FrameIsa, off: usize) res[u32, fail.Fail] {
+    if (off > DWARF_SECTION_OFFSET::usize) {
+        ret res[u32, fail.Fail].err{fail.user(dkind.LINK_SIZE_LIMIT, "macho: a frame description lies past what a compact encoding can point to")};
+    }
+    ret res[u32, fail.Fail].ok{dwarf_mode(fi) | off::u32};
+}
+
+fun foreign_fde(foreign: *cfi.EhFn, count: u32, addr: u64) opt[usize] {
+    var i: u32 = 0;
+    for (i < count) {
+        if (foreign[i].pc == addr) { ret opt[usize].some{foreign[i].fde_off}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# a foreign function's entry from its object's compact unwind: a frame the
+# encoding leaves to dwarf, or one whose personality or lsda compact unwind
+# would need the image's own personality table for, points at the object's
+# frame description instead, which carries both
+fun native_encoding(fi: *cfi.FrameIsa, f: *of.ExecFunction, addr: u64, foreign: *cfi.EhFn, foreign_count: u32) res[u32, fail.Fail] {
+    val to_dwarf: bool = (f.encoding & MODE_MASK) == dwarf_mode(fi);
+    if (!to_dwarf && !f.handler) { ret res[u32, fail.Fail].ok{f.encoding}; }
+    val fde: opt[usize] = foreign_fde(foreign, foreign_count, addr);
+    if (sel fde.some) { ret dwarf_entry(fi, fde.some); }
+    if (to_dwarf) {
+        ret res[u32, fail.Fail].err{fail.user(dkind.OBJECT_MALFORMED, "macho: a foreign function's compact unwind entry leaves its frame to __eh_frame, and its object carries no description of it")};
+    }
+    ret res[u32, fail.Fail].ok{f.encoding & ~PERSONALITY_LSDA};
+}
+
+# fills the unwind tables the linker reserved: an encoding per function in
+# address order, a zero one across each gap no function covers, and the dwarf
+# descriptions the encodings that need them point to. a mach function's entry
+# follows from its frame record, a foreign one's from its object's compact
+# unwind or, lacking one, from the frame description its object carried into
+# `__eh_frame` ahead of this table's own. every function offset counts from
+# `mh_addr`, where the mach header is mapped
 pub fun fill_unwind(alloc: *A.Allocator, arch_id: u32, segs: *of.LoadSegment, seg_count: u32,
     funcs: *of.ExecFunction, func_count: u32, mh_addr: u64) err[fail.Fail] {
     var index:  cfi.UnwindRoom = cfi.unwind_room(segs, seg_count, of.SEC_FLAG_UNWIND_INDEX);
@@ -204,6 +259,19 @@ pub fun fill_unwind(alloc: *A.Allocator, arch_id: u32, segs: *of.LoadSegment, se
     if (sel fo.none) { ret err[fail.Fail].err{fail.message("macho: unwind tables reserved for an architecture compact unwind cannot describe")}; }
     var fi: cfi.FrameIsa = fo.some;
 
+    var foreign:       *cfi.EhFn = nil;
+    var foreign_count: u32       = 0;
+    var base:          usize     = 0;
+    if (frames.present) {
+        val scanned: res[usize, fail.Fail] = cfi.eh_frame_scan(alloc, frames.bytes, frames.cap, frames.vaddr,
+            fi.ptr_size, ?foreign, ?foreign_count);
+        if (sel scanned.err) { ret err[fail.Fail].err{scanned.err}; }
+        base = scanned.ok;
+    }
+    fin {
+        if (foreign != nil) { A.deallocate[cfi.EhFn](alloc, foreign, foreign_count::usize); }
+    }
+
     var n:  u32                           = 0;
     val fr: res[*cfi.UnwindFn, fail.Fail] = cfi.unwind_functions(alloc, segs, seg_count, funcs, func_count, ?n);
     if (sel fr.err) { ret err[fail.Fail].err{fr.err}; }
@@ -211,83 +279,146 @@ pub fun fill_unwind(alloc: *A.Allocator, arch_id: u32, segs: *of.LoadSegment, se
     fin {
         if (fns != nil) { A.deallocate[cfi.UnwindFn](alloc, fns, n::usize); }
     }
-    if (n == 0) {
+    var natives: u32 = 0;
+    var i:       u32 = 0;
+    for (i < func_count) {
+        if (funcs[i].native && funcs[i].seg_index < seg_count) { natives = natives + 1; }
+        i = i + 1;
+    }
+
+    val cap: u32 = n + natives + foreign_count;
+    if (cap == 0) {
         cfi.unwind_room_trim(segs, ?frames, 0);
         val bare: res[usize, fail.Fail] = write_unwind_info(index.bytes, index.cap, nil, 0, 0);
         if (sel bare.err) { ret err[fail.Fail].err{bare.err}; }
         cfi.unwind_room_trim(segs, ?index, bare.ok);
         ret err[fail.Fail].ok{};
     }
+    val sr: res[*Span, A.Error] = A.allocate[Span](alloc, cap::usize);
+    if (sel sr.err) { ret err[fail.Fail].err{fail.refused(sr.err)}; }
+    val spans: *Span = sr.ok;
+    fin { A.deallocate[Span](alloc, spans, cap::usize); }
+    var sc: u32 = 0;
 
-    val er: res[*u32, A.Error] = A.zallocate[u32](alloc, n::usize);
-    if (sel er.err) { ret err[fail.Fail].err{fail.refused(er.err)}; }
-    val encodings: *u32 = er.ok;
-    fin { A.deallocate[u32](alloc, encodings, n::usize); }
-    val dr: res[*cfi.UnwindFn, A.Error] = A.allocate[cfi.UnwindFn](alloc, n::usize);
-    if (sel dr.err) { ret err[fail.Fail].err{fail.refused(dr.err)}; }
-    val dwarf: *cfi.UnwindFn = dr.ok;
-    fin { A.deallocate[cfi.UnwindFn](alloc, dwarf, n::usize); }
-    val dor: res[*u32, A.Error] = A.zallocate[u32](alloc, n::usize);
-    if (sel dor.err) { ret err[fail.Fail].err{fail.refused(dor.err)}; }
-    val dwarf_of: *u32 = dor.ok;
-    fin { A.deallocate[u32](alloc, dwarf_of, n::usize); }
-
-    var m: u32 = 0;
-    var i: u32 = 0;
-    for (i < n) {
-        val c: res[opt[u32], fail.Fail] = compact(?fi, fns[i].steps, fns[i].step_count);
-        if (sel c.err)     { ret err[fail.Fail].err{c.err}; }
-        if (sel c.ok.some) { encodings[i] = c.ok.some; }
-        or {
-            dwarf[m]    = fns[i];
-            dwarf_of[m] = i;
-            m           = m + 1;
+    var dwarf:    *cfi.UnwindFn = nil;
+    var dwarf_of: *u32          = nil;
+    if (n > 0) {
+        val dr: res[*cfi.UnwindFn, A.Error] = A.allocate[cfi.UnwindFn](alloc, n::usize);
+        if (sel dr.err) { ret err[fail.Fail].err{fail.refused(dr.err)}; }
+        dwarf = dr.ok;
+        val dor: res[*u32, A.Error] = A.zallocate[u32](alloc, n::usize);
+        if (sel dor.err) {
+            A.deallocate[cfi.UnwindFn](alloc, dwarf, n::usize);
+            ret err[fail.Fail].err{fail.refused(dor.err)};
         }
-        i = i + 1;
+        dwarf_of = dor.ok;
+    }
+    fin {
+        if (dwarf != nil)    { A.deallocate[cfi.UnwindFn](alloc, dwarf, n::usize); }
+        if (dwarf_of != nil) { A.deallocate[u32](alloc, dwarf_of, n::usize); }
     }
 
-    var eh_len: usize = 0;
+    var m: u32 = 0;
+    i = 0;
+    for (i < n) {
+        val c: res[opt[u32], fail.Fail] = compact(?fi, fns[i].steps, fns[i].step_count);
+        if (sel c.err) { ret err[fail.Fail].err{c.err}; }
+        spans[sc] = Span{addr: fns[i].addr, size: fns[i].size, encoding: 0};
+        if (sel c.ok.some) { spans[sc].encoding = c.ok.some; }
+        or {
+            dwarf[m]    = fns[i];
+            dwarf_of[m] = sc;
+            m           = m + 1;
+        }
+        sc = sc + 1;
+        i  = i + 1;
+    }
+
+    var eh_len: usize = base;
     if (m > 0) {
         if (!frames.present) { ret err[fail.Fail].err{fail.message("macho: a frame compact unwind cannot say has no reserved __eh_frame")}; }
         val ofr: res[*u32, A.Error] = A.zallocate[u32](alloc, m::usize);
         if (sel ofr.err) { ret err[fail.Fail].err{fail.refused(ofr.err)}; }
         val offs: *u32 = ofr.ok;
         fin { A.deallocate[u32](alloc, offs, m::usize); }
-        val eh: res[usize, fail.Fail] = cfi.write_eh_frame(?fi, frames.bytes, frames.cap, frames.vaddr, dwarf, m, offs);
+        val eh: res[usize, fail.Fail] = cfi.write_eh_frame(?fi, (frames.bytes::usize + base)::*u8, frames.cap - base,
+            frames.vaddr + base::u64, dwarf, m, offs);
         if (sel eh.err) { ret err[fail.Fail].err{eh.err}; }
-        eh_len = eh.ok;
+        eh_len = base + eh.ok;
         var k: u32 = 0;
         for (k < m) {
-            if (offs[k] > DWARF_SECTION_OFFSET) {
-                ret err[fail.Fail].err{fail.user(dkind.LINK_SIZE_LIMIT, "macho: a frame description lies past what a compact encoding can point to")};
-            }
-            encodings[dwarf_of[k]] = dwarf_mode(?fi) | offs[k];
-            k                      = k + 1;
+            val de: res[u32, fail.Fail] = dwarf_entry(?fi, base + offs[k]::usize);
+            if (sel de.err) { ret err[fail.Fail].err{de.err}; }
+            spans[dwarf_of[k]].encoding = de.ok;
+            k                           = k + 1;
         }
+    }
+    or (base > 0) {
+        if (frames.cap - base < 4) { ret err[fail.Fail].err{fail.message("macho: the frame descriptions outgrew the room the linker reserved for them")}; }
+        bin.write_u32_le(frames.bytes, base, 0);
+        eh_len = base + 4;
     }
     cfi.unwind_room_trim(segs, ?frames, eh_len);
 
-    val entr: res[*Entry, A.Error] = A.allocate[Entry](alloc, (2 * n)::usize);
+    i = 0;
+    for (i < func_count) {
+        val f: *of.ExecFunction = ?funcs[i];
+        if (f.native && f.seg_index < seg_count) {
+            val addr: u64                 = segs[f.seg_index].vaddr + f.seg_offset::u64;
+            val enc:  res[u32, fail.Fail] = native_encoding(?fi, f, addr, foreign, foreign_count);
+            if (sel enc.err) { ret err[fail.Fail].err{enc.err}; }
+            spans[sc] = Span{addr: addr, size: f.size, encoding: enc.ok};
+            sc        = sc + 1;
+        }
+        i = i + 1;
+    }
+    # a foreign function its object describes only in dwarf
+    i = 0;
+    for (i < foreign_count) {
+        var covered: bool = false;
+        var k:       u32  = 0;
+        for (k < sc && !covered) {
+            covered = spans[k].addr == foreign[i].pc;
+            k       = k + 1;
+        }
+        if (!covered && foreign[i].range > 0) {
+            val de: res[u32, fail.Fail] = dwarf_entry(?fi, foreign[i].fde_off);
+            if (sel de.err)                    { ret err[fail.Fail].err{de.err}; }
+            if (foreign[i].range > 0xFFFFFFFF) { ret err[fail.Fail].err{fail.user(dkind.LINK_SIZE_LIMIT, "macho: a function lies outside the image's 32-bit unwind range")}; }
+            spans[sc] = Span{addr: foreign[i].pc, size: foreign[i].range::u32, encoding: de.ok};
+            sc        = sc + 1;
+        }
+        i = i + 1;
+    }
+    sort.sort_by[Span](spans, sc::usize, span_cmp);
+
+    val entr: res[*Entry, A.Error] = A.allocate[Entry](alloc, (2 * sc)::usize);
     if (sel entr.err) { ret err[fail.Fail].err{fail.refused(entr.err)}; }
     val entries: *Entry = entr.ok;
-    fin { A.deallocate[Entry](alloc, entries, (2 * n)::usize); }
+    fin { A.deallocate[Entry](alloc, entries, (2 * sc)::usize); }
     var e: u32 = 0;
     i = 0;
-    for (i < n) {
-        if (fns[i].addr < mh_addr || fns[i].addr + fns[i].size::u64 - mh_addr > 0xFFFFFFFF) {
+    for (i < sc) {
+        if (spans[i].addr < mh_addr || spans[i].addr + spans[i].size::u64 - mh_addr > 0xFFFFFFFF) {
             ret err[fail.Fail].err{fail.user(dkind.LINK_SIZE_LIMIT, "macho: a function lies outside the image's 32-bit unwind range")};
         }
-        entries[e] = Entry{func_off: (fns[i].addr - mh_addr)::u32, encoding: encodings[i]};
+        entries[e] = Entry{func_off: (spans[i].addr - mh_addr)::u32, encoding: spans[i].encoding};
         e          = e + 1;
-        val end: u64 = fns[i].addr + fns[i].size::u64;
-        if (i + 1 < n && fns[i + 1].addr > end) {
+        val end: u64 = spans[i].addr + spans[i].size::u64;
+        if (i + 1 < sc && spans[i + 1].addr > end) {
             entries[e] = Entry{func_off: (end - mh_addr)::u32, encoding: 0};
             e          = e + 1;
         }
         i = i + 1;
     }
-    val last_end: u64                   = fns[n - 1].addr + fns[n - 1].size::u64 - mh_addr;
-    val written:  res[usize, fail.Fail] = write_unwind_info(index.bytes, index.cap, entries, e, last_end::u32);
+    var last_end: u64 = 0;
+    i = 0;
+    for (i < sc) {
+        val end: u64 = spans[i].addr + spans[i].size::u64 - mh_addr;
+        if (end > last_end) { last_end = end; }
+        i = i + 1;
+    }
+    val written: res[usize, fail.Fail] = write_unwind_info(index.bytes, index.cap, entries, e, last_end::u32);
     if (sel written.err) { ret err[fail.Fail].err{written.err}; }
     cfi.unwind_room_trim(segs, ?index, written.ok);
     ret err[fail.Fail].ok{};
