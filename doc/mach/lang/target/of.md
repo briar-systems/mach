@@ -615,6 +615,25 @@ table, and an index (mach-o `__compact_unwind`) is read, never placed
 pub val SEC_FLAG_UNWIND_FRAMES: u32 = 0x20
 ```
 
+## val SEC_FLAG_ASSOCIATED
+
+```mach
+pub val SEC_FLAG_ASSOCIATED: u32 = 0x40
+```
+
+the section lives and dies with the one `native.link_section` names: a coff
+associative comdat member, or an elf section ordered after its owner
+(SHF_LINK_ORDER). a final link keeps it exactly while it keeps that owner
+
+## fun section_format_retained
+
+```mach
+pub fun section_format_retained(sec: *Section) bool;
+```
+
+whether the format's own linkers keep a foreign section whatever references
+it: coff collects only comdat sections, so any other section is kept
+
 ## val NATIVE_GROUP
 
 ```mach

@@ -204,6 +204,12 @@ pub val S_ZEROFILL:               u32 = 0x1
 pub val S_MOD_INIT_FUNC_POINTERS: u32 = 0x9
 ```
 
+## val S_MOD_TERM_FUNC_POINTERS
+
+```mach
+pub val S_MOD_TERM_FUNC_POINTERS: u32 = 0xa
+```
+
 ## val S_ATTR_NO_DEAD_STRIP
 
 ```mach
