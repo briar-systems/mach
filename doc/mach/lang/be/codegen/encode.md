@@ -563,6 +563,14 @@ pub fun push_row(st: *EncodeState, text_offset: u32, loc: source.SrcLoc) err[fai
 pub fun push_varloc(st: *EncodeState, text_offset: u32, fn: *mir.MirFunction, vreg: u32, iid: u32) err[fail.Fail];
 ```
 
+## fun push_const_varloc
+
+```mach
+pub fun push_const_varloc(st: *EncodeState, text_offset: u32, value: i64, iid: u32) err[fail.Fail];
+```
+
+a variable whose value is the constant `value` from here, held in no storage (#4185)
+
 ## fun push_cmp_varloc
 
 ```mach
