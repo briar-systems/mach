@@ -973,38 +973,86 @@ pub val CSEL: MachOp = 152
 the first source when the condition holds, else the second: the
 branch-free select (#3346)
 
+## val V_USHL
+
+```mach
+pub val V_USHL:  MachOp = 153
+```
+
+the lane-wise shifts (#3852): ushl and sshl by a count per lane, whose low
+byte is read as signed and shifts right when negative; the vector negate
+that turns a right shift's count into that; shl, ushr and sshr by an
+immediate; uqshl by an immediate, the saturating shift a count is clamped
+with; and dup (general), a register's low lane copied to every lane
+
+## val V_SSHL
+
+```mach
+pub val V_SSHL:  MachOp = 154
+```
+
+## val V_NEG
+
+```mach
+pub val V_NEG:   MachOp = 155
+```
+
+## val V_SHL
+
+```mach
+pub val V_SHL:   MachOp = 156
+```
+
+## val V_USHR
+
+```mach
+pub val V_USHR:  MachOp = 157
+```
+
+## val V_SSHR
+
+```mach
+pub val V_SSHR:  MachOp = 158
+```
+
+## val V_UQSHL
+
+```mach
+pub val V_UQSHL: MachOp = 159
+```
+
+## val DUP_GEN
+
+```mach
+pub val DUP_GEN: MachOp = 160
+```
+
 ## val REV
 
 ```mach
-pub val REV:       MachOp = 153
+pub val REV:     MachOp = 161
 ```
 
 the byte reversal of a general register, the byte reversal within each
-doubleword of a vector, and the vector broadcast of one lane or of a general
-register, reached only from inline asm (#3915)
+doubleword of a vector, and the vector broadcast of one lane, reached only
+from inline asm (#3915)
 
 ## val V_REV64
 
 ```mach
-pub val V_REV64:   MachOp = 154
+pub val V_REV64: MachOp = 162
 ```
 
 ## val V_DUP
 
 ```mach
-pub val V_DUP:     MachOp = 155
-```
-
-## val V_DUP_GEN
-
-```mach
-pub val V_DUP_GEN: MachOp = 156
+pub val V_DUP:   MachOp = 163
 ```
 
 ## val MOP_LAST
 
 ```mach
-pub val MOP_LAST:  MachOp = V_DUP_GEN
+pub val MOP_LAST:  MachOp = V_DUP
 ```
 
 ## fun known
@@ -1126,7 +1174,8 @@ dst, src1, src2 vectors at the arrangement the element width names
 pub val L_NEON_2MISC: Layout = 12
 ```
 
-dst, src1 vectors at the arrangement the element width names, .16b for the bitwise members
+dst, src1 vectors at the arrangement the element width names, .16b for
+the bitwise members
 
 ## val L_NEON_LANE_RD
 
@@ -1258,14 +1307,23 @@ pub val L_CSEL: Layout = 28
 
 dst, src1, src2 registers and the condition in the flags
 
+## val L_NEON_SHIFT_IMM
+
+```mach
+pub val L_NEON_SHIFT_IMM: Layout = 29
+```
+
+dst, src1 vectors at the arrangement the element width names, and the shift
+amount in src2
+
 ## val L_NEON_DUP
 
 ```mach
-pub val L_NEON_DUP: Layout = 29
+pub val L_NEON_DUP: Layout = 30
 ```
 
-dst vector at the arrangement the element width names, from src1.elem[src2]
-or from the general register src1
+dst vector at the arrangement the element width names, from the general
+register src1, or from src1.elem[src2] for a vector src1
 
 ## def WidthRule
 

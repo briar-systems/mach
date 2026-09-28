@@ -1,5 +1,21 @@
 # mach.cli.args
 
+## fwd request.CliArgs
+
+```mach
+fwd request.CliArgs
+```
+
+forwards [`mach.lang.build.request.CliArgs`](../lang/build/request.md#rec-cliargs)
+
+## fwd request.is_object_path
+
+```mach
+fwd request.is_object_path
+```
+
+forwards [`mach.lang.build.request.is_object_path`](../lang/build/request.md#fun-is_object_path)
+
 ## def OptionArity
 
 ```mach

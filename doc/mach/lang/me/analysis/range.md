@@ -1,5 +1,19 @@
 # mach.lang.me.analysis.range
 
+the unsigned range of an integer value where a block reads it (#3885)
+
+a range comes from what the ir already states: a constant, the operation
+that defines the value (a mask, an extension, a sum or difference of bounded
+terms), the counted loops the loop analysis recognizes, and the compares
+whose branch edge dominates the reading block. a range where block `at`
+reads a value holds for every execution of `at`, because an ssa value is
+only redefined by re-running its definition, which the guarding edge would
+then run again before `at`. every answer is sound on its own: a cycle, a
+recursion past MAX_DEPTH or an operation with no rule answers the value's
+whole width. a range reads its value as unsigned at the value's own width,
+and UNBOUNDED as its top means no bound below 2^64 - 1, which includes a
+value wider than 64 bits whose bound does not fit
+
 ## val UNBOUNDED
 
 ```mach

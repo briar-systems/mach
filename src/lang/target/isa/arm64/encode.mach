@@ -854,6 +854,28 @@ fun emit_neon_2misc(st: *encode.EncodeState, op: mop.MachOp, rd: u32, rn: u32) {
     emit_inst(st, ?mi);
 }
 
+# a 2misc member at the lane's arrangement
+fun emit_neon_2misc_lanes(st: *encode.EncodeState, op: mop.MachOp, rd: u32, rn: u32, lane: u32) {
+    var mi: isa.Inst = inst_of(op, mop.vec(rd, 16), mop.vec(rn, 16), isa.make_none());
+    mi.flags = lane_flags(lane);
+    emit_inst(st, ?mi);
+}
+
+fun emit_neon_shift_imm(st: *encode.EncodeState, op: mop.MachOp, rd: u32, rn: u32, sh: u32, lane: u32) {
+    var mi: isa.Inst = inst_of(op, mop.vec(rd, 16), mop.vec(rn, 16), isa.make_imm(sh::i64, 1));
+    mi.flags = lane_flags(lane);
+    emit_inst(st, ?mi);
+}
+
+# every lane of `rd` the general register's low lane: w for lanes up to 32 bits, x for 64
+fun emit_neon_dup_gp(st: *encode.EncodeState, rd: u32, rn: u32, lane: u32) {
+    var w: u8 = 4;
+    if (mir.vec_lane_elem_bytes(lane) == 8) { w = 8; }
+    var mi: isa.Inst = inst_of(mop.DUP_GEN, mop.vec(rd, 16), mop.gp(rn, w), isa.make_none());
+    mi.flags = lane_flags(lane);
+    emit_inst(st, ?mi);
+}
+
 fun emit_neon_conv(st: *encode.EncodeState, op: mop.MachOp, rd: u32, rn: u32, from_bytes: u8) {
     var mi: isa.Inst = inst_of(op, mop.vec(rd, 16), mop.vec(rn, 16), isa.make_none());
     mi.flags = mop.with_elem_bytes(0, from_bytes);
@@ -2431,6 +2453,95 @@ fun encode_neon(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
     ret err[fail.Fail].ok{};
 }
 
+# a shift count of lane counts, in a vector register or the frame slot of a
+# spilled vector value; a uniform count is a general scalar
+fun shift_count_is_vector(f: *mir.MirFunction, op: *mir.MirOperand) bool {
+    if (op.kind == mir.MIR_OP_PREG) { ret reg_is_vec(op); }
+    ret is_fp_slot(f, op);
+}
+
+# a lane-wise shift, whose lanes saturate as the scalar shift does (#3756): a
+# count at or above the lane width answers 0, or the sign fill for an
+# arithmetic right shift (#3852). a constant count is shl, ushr or sshr by the
+# immediate, and a constant out of range is the fill itself. any other count
+# is a vector of lane counts in scratch1, dup'd from a uniform count's
+# register, and ushl or sshl shift by it. those read a lane count's low byte
+# as signed, shifting right when it is negative, so a count is first clamped
+# to 127 by uqshl then ushr by the lane width less 7, which keeps a count below
+# 128 and makes any larger one 127, at or above every lane width; a right
+# shift then negates it. shifted by 127 either way, every bit leaves the lane
+fun encode_neon_shift(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) err[fail.Fail] {
+    if (mi.operand_count < 3) { ret err[fail.Fail].err{fail.message("encode: vector shift missing operands")}; }
+    val vl: u32 = mi.vec_lane;
+    val eb: u8  = mir.vec_lane_elem_bytes(vl);
+    if (mir.vec_lane_kind(vl) != mir.VEC_LANE_INT || (eb != 1 && eb != 2 && eb != 4 && eb != 8)) {
+        ret err[fail.Fail].err{fail.message("encode: vector shift lane is not an integer lane NEON shifts")};
+    }
+    val esize: u32  = eb::u32 * 8;
+    val right: bool = mi.opcode != arm64.VEC_SHL::u32;
+    val arith: bool = mi.opcode == arm64.VEC_SHR_S::u32;
+    val bytes: u32  = mir.vec_lane_make(mir.VEC_LANE_INT, 1, 16);
+
+    val dst:     *mir.MirOperand = ?mi.operands[0];
+    var rd:      u32             = FP_SCRATCH0;
+    var to_slot: bool            = dst.kind == mir.MIR_OP_MEM;
+    if (!to_slot) {
+        val rdr: res[i32, fail.Fail] = req_vec(dst);
+        if (sel rdr.err) { ret err[fail.Fail].err{rdr.err}; }
+        rd = rdr.ok::u32;
+    }
+
+    val cnt: *mir.MirOperand = ?mi.operands[2];
+    if (cnt.kind != mir.MIR_OP_IMM) {
+        var counts: u32 = FP_SCRATCH1;
+        if (shift_count_is_vector(f, cnt)) {
+            val cr: res[i32, fail.Fail] = resolve_fp_source(st, f, cnt, FP_SCRATCH1, 16);
+            if (sel cr.err) { ret err[fail.Fail].err{cr.err}; }
+            counts = cr.ok::u32;
+        }
+        or {
+            var g: u32 = SCRATCH1;
+            if (cnt.kind == mir.MIR_OP_MEM) {
+                val mr: res[A64Mem, fail.Fail] = resolve_mem(f, cnt, eb);
+                if (sel mr.err)      { ret err[fail.Fail].err{mr.err}; }
+                if (mr.ok.has_index) { ret err[fail.Fail].err{fail.message("encode: indexed shift count spill not expected")}; }
+                val lr: err[fail.Fail] = emit_mem_access(st, SCRATCH1, mr.ok.base, mr.ok.off, eb, true);
+                if (sel lr.err) { ret lr; }
+            }
+            or {
+                val gr: res[i32, fail.Fail] = req_gpr(cnt);
+                if (sel gr.err) { ret err[fail.Fail].err{gr.err}; }
+                g = gr.ok::u32;
+            }
+            emit_neon_dup_gp(st, FP_SCRATCH1, g, vl);
+        }
+        emit_neon_shift_imm(st, mop.V_UQSHL, FP_SCRATCH1, counts, esize - 7, vl);
+        emit_neon_shift_imm(st, mop.V_USHR, FP_SCRATCH1, FP_SCRATCH1, esize - 7, vl);
+        if (right) { emit_neon_2misc_lanes(st, mop.V_NEG, FP_SCRATCH1, FP_SCRATCH1, vl); }
+        val rnr: res[i32, fail.Fail] = resolve_fp_source(st, f, ?mi.operands[1], FP_SCRATCH0, 16);
+        if (sel rnr.err) { ret err[fail.Fail].err{rnr.err}; }
+        var by: mop.MachOp = mop.V_USHL;
+        if (arith) { by = mop.V_SSHL; }
+        emit_neon_3same(st, by, rd, rnr.ok::u32, FP_SCRATCH1, vl);
+    }
+    or {
+        val rnr: res[i32, fail.Fail] = resolve_fp_source(st, f, ?mi.operands[1], FP_SCRATCH0, 16);
+        if (sel rnr.err) { ret err[fail.Fail].err{rnr.err}; }
+        val rn:  u32  = rnr.ok::u32;
+        val sh:  i64  = cnt.imm;
+        val out: bool = sh < 0 || sh >= esize::i64;
+        if (out && arith)        { emit_neon_shift_imm(st, mop.V_SSHR, rd, rn, esize, vl); }
+        or (out)                 { emit_neon_3same(st, mop.V_EOR, rd, rd, rd, bytes); }
+        or (!right)              { emit_neon_shift_imm(st, mop.V_SHL, rd, rn, sh::u32, vl); }
+        or (sh == 0 && rd != rn) { emit_neon_3same(st, mop.V_ORR, rd, rn, rn, bytes); }
+        or (sh != 0 && arith)    { emit_neon_shift_imm(st, mop.V_SSHR, rd, rn, sh::u32, vl); }
+        or (sh != 0)             { emit_neon_shift_imm(st, mop.V_USHR, rd, rn, sh::u32, vl); }
+    }
+
+    if (to_slot) { ret emit_fp_slot_store(st, f, dst, rd, 16); }
+    ret err[fail.Fail].ok{};
+}
+
 fun encode_fp_neg(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) err[fail.Fail] {
     if (mi.operand_count < 2) { ret err[fail.Fail].err{fail.message("encode: float negate missing operands")}; }
     val w: u8 = mi.width;
@@ -3262,23 +3373,24 @@ fun encode_mir_instr(st: *encode.EncodeState, f: *mir.MirFunction, fn_base: u32,
         ret encode_asm_block_arm64(st, f, fn_base, mi);
     }
 
-    if (op >= arm64.VEC_ADD::u32 && op <= arm64.VEC_CMHS::u32) { ret encode_neon(st, f, mi); }
-    if (op == arm64.ADD::u32)                                  { ret encode_addsub(st, mi, false); }
-    if (op == arm64.SUB::u32)                                  { ret encode_addsub(st, mi, true); }
-    if (op == arm64.MUL::u32)                                  { ret encode_alu3(st, mi, mop.MUL); }
-    if (op == arm64.UMULH::u32)                                { ret encode_mulh(st, mi, mop.UMULH); }
-    if (op == arm64.SMULH::u32)                                { ret encode_mulh(st, mi, mop.SMULH); }
-    if (op == arm64.AND::u32)                                  { ret encode_alu3(st, mi, mop.AND); }
-    if (op == arm64.ORR::u32)                                  { ret encode_alu3(st, mi, mop.ORR); }
-    if (op == arm64.EOR::u32)                                  { ret encode_alu3(st, mi, mop.EOR); }
-    if (op == arm64.LSL::u32)                                  { ret encode_shift(st, mi, arm64.LSL::u32); }
-    if (op == arm64.LSR::u32)                                  { ret encode_shift(st, mi, arm64.LSR::u32); }
-    if (op == arm64.ASR::u32)                                  { ret encode_shift(st, mi, arm64.ASR::u32); }
-    if (op == arm64.NEG::u32)                                  { ret encode_neg_mvn(st, mi, mop.SUB); }
-    if (op == arm64.MVN::u32)                                  { ret encode_neg_mvn(st, mi, mop.ORN); }
-    if (op == arm64.MOV::u32)                                  { ret encode_mov(st, f, mi); }
-    if (op == arm64.FMOV::u32)                                 { ret encode_fmov(st, f, mi); }
-    if (op == arm64.B::u32)                                    { ret encode_branch(st, fn_base, mi); }
+    if (op >= arm64.VEC_ADD::u32 && op <= arm64.VEC_CMHS::u32)  { ret encode_neon(st, f, mi); }
+    if (op >= arm64.VEC_SHL::u32 && op <= arm64.VEC_SHR_S::u32) { ret encode_neon_shift(st, f, mi); }
+    if (op == arm64.ADD::u32)                                   { ret encode_addsub(st, mi, false); }
+    if (op == arm64.SUB::u32)                                   { ret encode_addsub(st, mi, true); }
+    if (op == arm64.MUL::u32)                                   { ret encode_alu3(st, mi, mop.MUL); }
+    if (op == arm64.UMULH::u32)                                 { ret encode_mulh(st, mi, mop.UMULH); }
+    if (op == arm64.SMULH::u32)                                 { ret encode_mulh(st, mi, mop.SMULH); }
+    if (op == arm64.AND::u32)                                   { ret encode_alu3(st, mi, mop.AND); }
+    if (op == arm64.ORR::u32)                                   { ret encode_alu3(st, mi, mop.ORR); }
+    if (op == arm64.EOR::u32)                                   { ret encode_alu3(st, mi, mop.EOR); }
+    if (op == arm64.LSL::u32)                                   { ret encode_shift(st, mi, arm64.LSL::u32); }
+    if (op == arm64.LSR::u32)                                   { ret encode_shift(st, mi, arm64.LSR::u32); }
+    if (op == arm64.ASR::u32)                                   { ret encode_shift(st, mi, arm64.ASR::u32); }
+    if (op == arm64.NEG::u32)                                   { ret encode_neg_mvn(st, mi, mop.SUB); }
+    if (op == arm64.MVN::u32)                                   { ret encode_neg_mvn(st, mi, mop.ORN); }
+    if (op == arm64.MOV::u32)                                   { ret encode_mov(st, f, mi); }
+    if (op == arm64.FMOV::u32)                                  { ret encode_fmov(st, f, mi); }
+    if (op == arm64.B::u32)                                     { ret encode_branch(st, fn_base, mi); }
     if (op == arm64.RET::u32) {
         emit_ret(st);
         ret err[fail.Fail].ok{};
@@ -4467,7 +4579,7 @@ fun a64_parse_dup(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) err[fail.Fai
     if (s.nargs == 2 && a64_lanes(?item.ops[0])) {
         val elem: u8 = item.ops[0].elem;
         if (a64_lane_fits(?item.ops[1], elem) || a64_lane_gp(?item.ops[1], elem)) {
-            if (!a64_is_lane(?item.ops[1])) { item.code = mop.V_DUP_GEN::u32; }
+            if (!a64_is_lane(?item.ops[1])) { item.code = mop.DUP_GEN::u32; }
             item.flags = mop.with_elem_bytes(item.flags, elem);
             ret err[fail.Fail].ok{};
         }
@@ -8847,6 +8959,63 @@ test encode_neon__integer_multiply_refuses_64bit_lanes {
     ret bad;
 }
 
+#[testing]
+fun t_shift_words(st: *encode.EncodeState, op: arm64.Opcode, lane: u32, count: mir.MirOperand, want: *u32, n: u32) bool {
+    var f:   mir.MirFunction;
+    var ops: [3]mir.MirOperand;
+    ops[0] = tvec(0);
+    ops[1] = tvec(1);
+    ops[2] = count;
+    var mi: mir.MirInstr = mir.instr(mir.MIR_ADD, ?ops[0], 3, 0, 0);
+    mi.opcode   = op::u32;
+    mi.vec_lane = lane;
+    st.buf.len  = 0;
+    val r: err[fail.Fail] = encode_neon_shift(st, ?f, ?mi);
+    if (sel r.err || st.buf.len != (n * 4)::usize) { ret false; }
+    var i: u32 = 0;
+    for (i < n) {
+        if (read_word(?st.buf, (i * 4)::usize) != want[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# each vector shift form against the words llvm-mc assembles for it: a count
+# vector or a dup'd register count is clamped by uqshl and ushr, negated for a
+# right shift and shifted by, and a constant is the immediate form or, out of
+# range, the fill (#3852)
+test encode_neon_shift__forms_are_byte_exact {
+    var bad:   i32 = 0;
+    var st:    encode.EncodeState;
+    var alloc: A.Allocator;
+    tbuf(?st, ?alloc);
+    val x3: mir.MirOperand = mir.op_preg(mir.preg_id(isa.regid_make(isa.REG_CLASS_ID_GP, 3)));
+
+    val lanes_s32: [4]u32 = [4]u32{0x6F39745E, 0x6F2707DE, 0x6EA0BBDE, 0x4EBE4420};
+    if (!t_shift_words(?st, arm64.VEC_SHR_S, mir.vec_lane_make(mir.VEC_LANE_INT, 4, 4), tvec(2), ?lanes_s32[0], 4)) { bad = 1; }
+    val lanes_u8: [3]u32 = [3]u32{0x6F09745E, 0x6F0F07DE, 0x6E3E4420};
+    if (!t_shift_words(?st, arm64.VEC_SHL, mir.vec_lane_make(mir.VEC_LANE_INT, 1, 16), tvec(2), ?lanes_u8[0], 3)) { bad = 2; }
+    val uniform_u16: [4]u32 = [4]u32{0x4E020C7E, 0x6F1977DE, 0x6F1707DE, 0x6E7E4420};
+    if (!t_shift_words(?st, arm64.VEC_SHL, mir.vec_lane_make(mir.VEC_LANE_INT, 2, 8), x3, ?uniform_u16[0], 4)) { bad = 3; }
+    val uniform_u64: [5]u32 = [5]u32{0x4E080C7E, 0x6F7977DE, 0x6F4707DE, 0x6EE0BBDE, 0x6EFE4420};
+    if (!t_shift_words(?st, arm64.VEC_SHR_U, mir.vec_lane_make(mir.VEC_LANE_INT, 8, 2), x3, ?uniform_u64[0], 5)) { bad = 4; }
+
+    var one: [1]u32 = [1]u32{0x4F0B5420};
+    if (!t_shift_words(?st, arm64.VEC_SHL, mir.vec_lane_make(mir.VEC_LANE_INT, 1, 16), mir.op_imm(3), ?one[0], 1)) { bad = 5; }
+    one[0] = 0x6F3B0420;
+    if (!t_shift_words(?st, arm64.VEC_SHR_U, mir.vec_lane_make(mir.VEC_LANE_INT, 4, 4), mir.op_imm(5), ?one[0], 1)) { bad = 6; }
+    one[0] = 0x4EA11C20;
+    if (!t_shift_words(?st, arm64.VEC_SHR_U, mir.vec_lane_make(mir.VEC_LANE_INT, 4, 4), mir.op_imm(0), ?one[0], 1)) { bad = 7; }
+    one[0] = 0x4F400420;
+    if (!t_shift_words(?st, arm64.VEC_SHR_S, mir.vec_lane_make(mir.VEC_LANE_INT, 8, 2), mir.op_imm(64), ?one[0], 1)) { bad = 8; }
+    one[0] = 0x6E201C00;
+    if (!t_shift_words(?st, arm64.VEC_SHR_U, mir.vec_lane_make(mir.VEC_LANE_INT, 2, 8), mir.op_imm(20), ?one[0], 1)) { bad = 9; }
+    if (!t_shift_words(?st, arm64.VEC_SHL, mir.vec_lane_make(mir.VEC_LANE_INT, 2, 8), mir.op_imm(-1), ?one[0], 1))   { bad = 10; }
+
+    encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
 test vec_lane__index_out_of_range_refused {
     var bad:   i32 = 0;
     var st:    encode.EncodeState;
@@ -9033,7 +9202,8 @@ pub fun asm_ct_class(code: u32, flags: u16) ct.AsmClass {
     if (code == mop.LSL::u32 || code == mop.LSR::u32 || code == mop.ASR::u32) {
         ret ct.flags_untouched(ct.asm_op(ct.CT_OP_NONE));
     }
-    if (code == mop.LSLV::u32 || code == mop.LSRV::u32 || code == mop.ASRV::u32) {
+    if (code == mop.LSLV::u32 || code == mop.LSRV::u32 || code == mop.ASRV::u32 ||
+        code == mop.V_USHL::u32 || code == mop.V_SSHL::u32) {
         ret ct.flags_untouched(ct.asm_op(ct.CT_OP_VAR_SHIFT));
     }
     if (code == mop.LDAXR::u32 || code == mop.LDAR::u32 || code == mop.STLXR::u32 ||
@@ -9103,7 +9273,9 @@ pub fun asm_ct_class(code: u32, flags: u16) ct.AsmClass {
         code == mop.SHA256H::u32 || code == mop.SHA256H2::u32 || code == mop.SHA256SU0::u32 || code == mop.SHA256SU1::u32 ||
         code == mop.AESE::u32 || code == mop.AESD::u32 || code == mop.AESMC::u32 || code == mop.AESIMC::u32 ||
         code == mop.PMULL::u32 || code == mop.PMULL2::u32 || code == mop.V_EXT::u32 ||
-        code == mop.REV::u32 || code == mop.V_REV64::u32 || code == mop.V_DUP::u32 || code == mop.V_DUP_GEN::u32) {
+        code == mop.V_NEG::u32 || code == mop.V_SHL::u32 || code == mop.V_USHR::u32 || code == mop.V_SSHR::u32 ||
+        code == mop.V_UQSHL::u32 || code == mop.DUP_GEN::u32 ||
+        code == mop.REV::u32 || code == mop.V_REV64::u32 || code == mop.V_DUP::u32) {
         ret ct.flags_untouched(ct.asm_op(ct.CT_OP_NONE));
     }
     if (code == mop.FADD::u32 || code == mop.FSUB::u32 || code == mop.FMUL::u32 || code == mop.FDIV::u32 ||
@@ -10098,6 +10270,15 @@ test stream__translation_round_trips_against_the_printer_for_every_emitted_base 
     }
     emit_neon_3same(?st, mop.V_ORR, 5, 6, 6, mir.vec_lane_make(mir.VEC_LANE_INT, 1, 16));
     emit_neon_2misc(?st, mop.V_MVN, 0, 1);
+    emit_neon_3same(?st, mop.V_USHL, 0, 1, 2, lane);
+    emit_neon_3same(?st, mop.V_SSHL, 0, 1, 2, mir.vec_lane_make(mir.VEC_LANE_INT, 8, 2));
+    emit_neon_2misc_lanes(?st, mop.V_NEG, 0, 1, lane);
+    emit_neon_shift_imm(?st, mop.V_SHL, 0, 1, 3, lane);
+    emit_neon_shift_imm(?st, mop.V_USHR, 0, 1, 32, lane);
+    emit_neon_shift_imm(?st, mop.V_SSHR, 0, 1, 1, mir.vec_lane_make(mir.VEC_LANE_INT, 1, 16));
+    emit_neon_shift_imm(?st, mop.V_UQSHL, 0, 1, 57, mir.vec_lane_make(mir.VEC_LANE_INT, 8, 2));
+    emit_neon_dup_gp(?st, 0, 1, lane);
+    emit_neon_dup_gp(?st, 0, 1, mir.vec_lane_make(mir.VEC_LANE_INT, 8, 2));
     emit_neon_umov(?st, 1, 0, 1, mir.vec_lane_make(mir.VEC_LANE_INT, 1, 16));
     emit_neon_umov(?st, 1, 0, 1, lane);
     emit_neon_umov(?st, 1, 0, 1, mir.vec_lane_make(mir.VEC_LANE_INT, 8, 2));

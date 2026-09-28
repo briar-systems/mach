@@ -1,5 +1,26 @@
 # mach.lang.target.of.carrier
 
+mach's link carrier: what the link needs to treat a mach-built object as the
+image codegen made and its native format cannot spell. a writer describes the
+image it serializes when that image is a codegen image, the parser applies
+the carrier after its own decode, and an object that carries one is a codegen
+image. foreign objects carry none and keep their native reading.
+
+the described sections are the first sections of the serialized image. each
+names where it lies in the image the parser reads back (a host section and an
+offset there), which is itself unless the format merged sections, as mach-o
+does. symbols, relocations and frames name described sections. the tables
+are optional so a format carries only what it cannot say: section flags and
+placement, symbol sizes and types, the instruction end of a relocation and
+unwind frames.
+
+the layout is `u32 magic`, `u32 tables`, then per present table its count
+and entries: a section `host, offset, len, align, flags`, a symbol
+`section, offset, size, flags` then its name's length and bytes, a
+relocation `section, offset` and its `u8` instruction end, a frame
+`section, offset, step count` then per step `u8 kind, u8 reg, u32 end, u64
+value`. every number is little-endian
+
 ## val SECTION_NAME
 
 ```mach

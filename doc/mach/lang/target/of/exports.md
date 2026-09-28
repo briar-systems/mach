@@ -1,5 +1,13 @@
 # mach.lang.target.of.exports
 
+the export-request list of a relocatable object: the names a module asks the
+link to export whoever defines them, one per `fwd` re-export. no format shared
+by elf and mach-o has a native per-object export directive, so both carry the
+list in a mach-specific section the emitter writes and the parser consumes:
+`u32 version`, `u32 count`, then per name `u32 len`, the bytes, padded to 4.
+coff spells the same request natively as a `.drectve /EXPORT:` of a name the
+object does not define, so it does not carry this section.
+
 ## val SECTION_NAME
 
 ```mach

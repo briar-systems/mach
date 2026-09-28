@@ -1,5 +1,13 @@
 # mach.lang.driver.surface
 
+a module's lowered surface: its source text without the bodies no importer
+compiles, which are the bodies of test declarations and of functions that
+are neither generic nor take a comptime parameter. what remains is every
+declaration an importer reads, and every body an importer instantiates.
+the in-process lowered-surface query and the persistent cache key read it.
+the same walk also finds a module's test declarations, which only its test
+object compiles, so its normal object is keyed without them
+
 ## fun omitted
 
 ```mach

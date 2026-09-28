@@ -1,5 +1,7 @@
 # mach.lang.output.remove
 
+descriptor-relative removal beneath a project root: every component is
+
 ## val MAX_DEPTH
 
 ```mach

@@ -45,10 +45,12 @@ pub fun scalar_bits(m: *ir.Module, ty: ir_type.IrTypeId) u32;
 ## fun packs
 
 ```mach
-pub fun packs(tgt: *target.Target, k: instruction.InstrKind, is_float: bool, lane_bits: u32) bool;
+pub fun packs(tgt: *target.Target, k: instruction.InstrKind, is_float: bool, lane_bits: u32, uniform_count: bool) bool;
 ```
 
-a loop's lanes carry their own values, so a shift here counts by lanes
+whether the target packs `k` over lanes of `lane_bits`; a shift is the cell
+of its count's form, one scalar for every lane when `uniform_count` and a
+count per lane otherwise
 
 ## fun extends
 
