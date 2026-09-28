@@ -400,7 +400,7 @@ arg_passing: ArgPassingFn, ret_passing: RetPassingFn,
 gp_arg_regs: RegFileFn, callee_saved: RegFileFn,
 stack_align: u32, red_zone: u32, shadow_space: u32,
 indirect_result_reg: i32, indirect_result_in_argfile: bool,
-consumes_agg_layout: bool, fp_callee_saved_full_vector: bool,
+consumes_agg_layout: bool, fp_callee_saved_bytes: u32,
 float_arg_bits: u32, arg_slot_granularity: u32,
 va_model: VaModelFn) AbiVTable;
 ```

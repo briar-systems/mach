@@ -319,10 +319,14 @@ pub val NODE_TAG:       NodeKind = 8
 pub rec Machine;
 ```
 
+`vector_bits` is the narrowest vector register and `register_bits` the
+widest the selected extensions give, each a power of two times the one
+before: 128 and 256 on x86-64 with avx (#4128)
+
 ## fun machine
 
 ```mach
-pub fun machine(ptr_width: u32, vector_bits: u32) Machine;
+pub fun machine(ptr_width: u32, vector_bits: u32, register_bits: u32) Machine;
 ```
 
 ## rec Node

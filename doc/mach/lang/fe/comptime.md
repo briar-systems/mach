@@ -689,6 +689,7 @@ build_mode_id: u32,
 build_pie: u32,
 pointer_width: u32,
 vector_bits: u32,
+register_bits: u32,
 has_float: bool,
 compiler_name: intern.StrId,
 compiler_ver: intern.StrId) ComptimeCtx;

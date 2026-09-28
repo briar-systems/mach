@@ -615,7 +615,10 @@ widening multiply for that cell:
 | `u32x2` → `u64x2` | `pmuludq` | `umull .2s` | extend, then multiply |
 
 A wider product, such as `i16x8` → `i32x8`, is a 256-bit value and keeps the
-extend-then-multiply path. Either path gives the same lanes.
+extend-then-multiply path where the vector register is 128 bits. x86-64 under
+`avx2` holds it in one `ymm` register, and the same widening multiply fills it:
+`pmullw` beside `pmulhw` over the operands, interleaved by `vpunpcklwd` into the
+32-byte product. Either path gives the same lanes.
 
 `f16` lanes realize per target as [types.md](types.md#simd-vectors) lists: packed
 on aarch64 with `fp16` and on spirv with `float16`, through packed `f32` lanes on

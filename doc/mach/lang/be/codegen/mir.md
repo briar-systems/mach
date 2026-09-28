@@ -1539,7 +1539,7 @@ pub val VREG_TY_NIL: u32 = 0xFFFFFFFF
 ## fun vreg
 
 ```mach
-pub fun vreg(id: u32, class: u32, vector: bool, secret: bool) MirVReg;
+pub fun vreg(id: u32, class: u32, vec_bytes: u8, secret: bool) MirVReg;
 ```
 
 ## def MirSlotKind
