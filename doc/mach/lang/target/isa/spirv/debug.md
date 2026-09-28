@@ -1,5 +1,7 @@
 # mach.lang.target.isa.spirv.debug
 
+the spirv debug model, all core instructions so it fits every environment without a capability
+
 ## rec Debug
 
 ```mach

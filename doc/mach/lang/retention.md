@@ -1,5 +1,11 @@
 # mach.lang.retention
 
+which modules a session keeps products for between builds. every party that keeps products
+alive across builds (a build path, an editor root, an engine plan) holds a retainer, and a
+module's products stay while any retainer holds it. a build records the modules it loaded under
+its retainer in rounds; a module no retainer holds any more is released, and its products are
+retired the next time the session is idle
+
 ## def RetainerId
 
 ```mach

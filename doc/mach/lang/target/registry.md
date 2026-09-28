@@ -1,5 +1,16 @@
 # mach.lang.target.registry
 
+the target registry as one owned object
+
+a registry is born fresh, published once by `target.register_all`, and
+released once by `registry_dnit`; release is terminal, so a registry is
+never re-initialized under a target that borrowed from it (a publication
+that fails part way rolls back to fresh, nothing has borrowed yet).
+`registry_new` is the heap form the session owns and every worker borrows
+by pointer; `registry_init` is the in-place form a fixture owns on its own
+stack. a `resolved.Target` borrows the registry it was resolved against and
+`resolved.live` refuses the borrow once the registry is released.
+
 ## rec TargetRegistry
 
 ```mach

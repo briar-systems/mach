@@ -1,5 +1,101 @@
 # mach.lang.target
 
+## fwd isa.ENDIAN_LITTLE
+
+```mach
+fwd isa.ENDIAN_LITTLE
+```
+
+forwards [`mach.lang.target.isa.ENDIAN_LITTLE`](target/isa.md#val-endian_little)
+
+## fwd isa.ENDIAN_BIG
+
+```mach
+fwd isa.ENDIAN_BIG
+```
+
+forwards [`mach.lang.target.isa.ENDIAN_BIG`](target/isa.md#val-endian_big)
+
+## fwd resolved.Target
+
+```mach
+fwd resolved.Target
+```
+
+forwards [`mach.lang.target.resolved.Target`](target/resolved.md#rec-target)
+
+## fwd resolved.live
+
+```mach
+fwd resolved.live
+```
+
+forwards [`mach.lang.target.resolved.live`](target/resolved.md#fun-live)
+
+## fwd resolved.ct_mul_admitted
+
+```mach
+fwd resolved.ct_mul_admitted
+```
+
+forwards [`mach.lang.target.resolved.ct_mul_admitted`](target/resolved.md#fun-ct_mul_admitted)
+
+## fwd resolved.ct_mul_dit_cells
+
+```mach
+fwd resolved.ct_mul_dit_cells
+```
+
+forwards [`mach.lang.target.resolved.ct_mul_dit_cells`](target/resolved.md#fun-ct_mul_dit_cells)
+
+## fwd resolved.dit_mode_guaranteed
+
+```mach
+fwd resolved.dit_mode_guaranteed
+```
+
+forwards [`mach.lang.target.resolved.dit_mode_guaranteed`](target/resolved.md#fun-dit_mode_guaranteed)
+
+## fwd treg.TargetRegistry
+
+```mach
+fwd treg.TargetRegistry
+```
+
+forwards [`mach.lang.target.registry.TargetRegistry`](target/registry.md#rec-targetregistry)
+
+## fwd treg.registry_init
+
+```mach
+fwd treg.registry_init
+```
+
+forwards [`mach.lang.target.registry.registry_init`](target/registry.md#fun-registry_init)
+
+## fwd treg.registry_new
+
+```mach
+fwd treg.registry_new
+```
+
+forwards [`mach.lang.target.registry.registry_new`](target/registry.md#fun-registry_new)
+
+## fwd treg.registry_dnit
+
+```mach
+fwd treg.registry_dnit
+```
+
+forwards [`mach.lang.target.registry.registry_dnit`](target/registry.md#fun-registry_dnit)
+
+## fwd treg.registry_published
+
+```mach
+fwd treg.registry_published
+```
+
+forwards [`mach.lang.target.registry.registry_published`](target/registry.md#fun-registry_published)
+
 ## fun host_os_id
 
 ```mach

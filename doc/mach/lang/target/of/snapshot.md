@@ -1,5 +1,14 @@
 # mach.lang.target.of.snapshot
 
+a lossless encoding of an object image: every section with its bytes, every
+symbol, relocation, frame, import, indirect symbol and export request, the
+machine flags, the attributes and whether codegen made it, each with its
+native metadata. decoding
+gives back the image that was encoded, whatever an object format can spell,
+so a module read back from it links exactly as the image did. the image's
+cache record is not part of it. names are their length then their bytes, a
+nil name the length 0xFFFFFFFF, and every number is little-endian
+
 ## fun encode
 
 ```mach

@@ -1,5 +1,12 @@
 # mach.lang.target.of.cfi
 
+dwarf call frame information from the linker's frame records: how each isa's
+registers read in cfi, the frame a function's prologue steps leave, and the
+`.eh_frame` and `.eh_frame_hdr` tables elf images carry and mach-o falls back
+to where compact unwind cannot say a frame. a table's size depends on the
+steps alone, so the linker reserves it before layout and the writer fills it
+after
+
 ## rec FrameIsa
 
 ```mach

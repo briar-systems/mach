@@ -1,5 +1,9 @@
 # mach.lang.target.isa.common
 
+the target-independent helpers every isa backend reads: predicates over the
+selected MIR, bit and decimal arithmetic, and the relocation type a backend
+may leave unset
+
 ## fun is_mir_compare
 
 ```mach

@@ -1,5 +1,17 @@
 # mach.lang.build.cache.record
 
+the record an `obj/` object carries for the object cache (see
+target/of/record for the section it rides in): the key the object was built
+under, what the engine reads from a module's lowered ir besides its object,
+so a module whose object is reused never has to lower, and the image codegen
+produced, which is what a reused module links: an object format need not
+spell everything a link reads. the layout is `"MCR6"`, the 32-byte key, the
+32-byte digest of the module source it was built from, the scalarization
+count, the test count, then per test its qualified name and its line, then
+the length and bytes of the module's warnings (driver/cache encodes them),
+then the length and bytes of the image's snapshot (see target/of/snapshot),
+every number a little-endian u32 and every name its length then its bytes
+
 ## rec TestFact
 
 ```mach

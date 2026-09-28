@@ -1,5 +1,15 @@
 # mach.lang.output
 
+output: how a compiler-controlled file reaches its final name. a build
+product under `out/` is regenerable by the next build or `mach clean`, so
+it is written in place with no staging, lock or journal, except an `obj/`
+object: the object cache reads it back, so it goes through
+`through_temporary`. a file in the source tree goes through `replace`. both
+write a sibling temporary and rename it over the destination, so an
+interrupted write leaves the original intact. the build owns its output
+layout: `directory` and `reserve` replace a stale entry of the wrong kind,
+and every failure names the path and the operation
+
 ## val DIR_MODE
 
 ```mach
