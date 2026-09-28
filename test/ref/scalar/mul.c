@@ -1,5 +1,5 @@
 /* products that exceed the width at 32 and 64 bits, signed and unsigned, seeded so the
- * wrap cannot fold. one noinline part per type. */
+ * wrap cannot fold, and 32 by 32 to 64 bit widening products. one noinline part per type. */
 #include "corpus.h"
 
 static uint64_t mul_u32(uint64_t seed) {
@@ -102,11 +102,40 @@ static uint64_t mul_i64(uint64_t seed) {
     return h;
 }
 
+/* the signed operands are held as their uint32_t bit patterns, sign-extended
+ * through int32_t only at the widening, so the step arithmetic wraps without UB.
+ * the signed 64-bit product of two int32_t values cannot overflow. */
+static uint64_t mul_widen(uint64_t seed) {
+    uint64_t h = fold_init();
+    const uint32_t s = (uint32_t)seed;
+
+    uint32_t a = (uint32_t)(UINT32_C(2654435769) + s); /* bits of -1640531527 */
+    uint32_t b = (uint32_t)(UINT32_C(2147483000) + s);
+    uint32_t c = (uint32_t)(UINT32_C(4294967231) + s);
+    uint32_t d = (uint32_t)(UINT32_C(2654435761) + s);
+    for (uint32_t i = 0; i < UINT32_C(8); i = (uint32_t)(i + UINT32_C(1))) {
+        const int64_t p = (int64_t)as_i32_mul_i32(a) * (int64_t)as_i32_mul_i32(b);
+        const uint64_t q = (uint64_t)c * (uint64_t)d;
+        h = mix_i64(h, p);
+        h = mix_u64(h, q);
+        h = mix_i32(h, as_i32_mul_i32((uint32_t)(uint64_t)p));
+        h = mix_i32(h, as_i32_mul_i32((uint32_t)((uint64_t)p >> 32)));
+        h = mix_u32(h, (uint32_t)q);
+        h = mix_u32(h, (uint32_t)(q >> 32));
+        a = (uint32_t)(a * UINT32_C(3) + UINT32_C(1));
+        b = (uint32_t)(b - UINT32_C(12345));
+        c = (uint32_t)(c * UINT32_C(5) + UINT32_C(7));
+        d = (uint32_t)(d + UINT32_C(40503));
+    }
+    return h;
+}
+
 uint64_t checksum(uint64_t seed) {
     uint64_t h = fold_init();
     h = mix_u64(h, mul_u32(seed));
     h = mix_u64(h, mul_i32(seed));
     h = mix_u64(h, mul_u64(seed));
     h = mix_u64(h, mul_i64(seed));
+    h = mix_u64(h, mul_widen(seed));
     return h;
 }

@@ -171,6 +171,57 @@ same width feeding bits, and a count of 0 to 255 or `cl`. A secret in `cl` is a
 variable-latency count for the constant-time check, as it is for `shl`; an
 immediate count is not.
 
+## String instructions (x86-64)
+
+```mach fragment
+asm x86_64 {
+    mov rdi, {dst}
+    mov rsi, {src}
+    mov rcx, {n}
+    rep movsb                 # copy rcx bytes from [rsi] to [rdi]
+    xor eax, eax
+    mov rcx, 8
+    rep stosq                 # store rax into 8 quadwords at [rdi]
+    repne scasb               # step rdi until [rdi] equals al, or rcx runs out
+}
+```
+
+`movs`, `stos`, `lods`, `cmps` and `scas` take a width suffix, `b`, `w`, `d` or
+`q`, and no operands: `movsd` here is the string move, since the scalar-double
+move is not an inline-asm row. Each reaches memory through its implicit
+registers:
+
+| mnemonic | reads | writes | memory |
+|---|---|---|---|
+| `movs` | `rsi`, `rdi` | `rsi`, `rdi` | loads `[rsi]`, stores `[rdi]` |
+| `stos` | `rax`, `rdi` | `rdi` | stores `[rdi]` |
+| `lods` | `rsi` | `rax`, `rsi` | loads `[rsi]` |
+| `cmps` | `rsi`, `rdi` | `rsi`, `rdi`, flags | loads both |
+| `scas` | `rax`, `rdi` | `rdi`, flags | loads `[rdi]` |
+
+A prefix repeats the instruction `rcx` times and counts `rcx` down, so it adds
+`rcx` to what the instruction reads and writes. `rep` repeats a move, store or
+load. A compare repeats under a condition instead, `repe` (or `repz`) while its
+elements are equal and `repne` (or `repnz`) while they differ, and stops early
+when the condition fails. `rep cmpsb` and `repe movsb` are refused, since the
+first says nothing about when to stop and the second names a condition nothing
+sets. The written registers are the block's clobbers like any other, so a value
+the allocator keeps live across the block never sits in one of them.
+
+Every step moves `rsi` and `rdi` forward when the direction flag is clear and
+backward when it is set. The compiler does not track DF. It assumes the ABI's
+guarantee that DF is clear at every call and return, so a block that sets it
+with a raw encoding must clear it with `cld` before the block ends.
+
+The constant-time check treats `rsi` and `rdi` as addresses, so a secret in
+either is refused as one. A single step is a load or store and passes data
+through as `mov` does. A repeated one runs once per element and a compare also
+stops on its data, so its timing is its count and its contents. In an
+`#[oblivious]` function it is refused whenever it reads a secret: a secret
+count, a secret value to store, or memory a pointer to a secret addresses. A
+public count storing public data is admitted even into secret memory, which is
+how a key buffer is cleared with `rep stosb`.
+
 ## Segment-relative memory (x86-64)
 
 A memory operand may lead with `fs:` or `gs:`, after any width keyword. The
@@ -223,8 +274,19 @@ relocation is correct after a trailing immediate.
 | form | mnemonics |
 |---|---|
 | move, in either direction between a register and memory | `movdqa`, `movdqu`, `movaps`, `movups` |
-| `xmm, xmm/m128` | `paddb` `paddw` `paddd` `paddq`, `psubb` `psubw` `psubd` `psubq` `psubusb` `psubusw`, `pmullw` `pmulhw` `pmulhuw` `pmuludq`, `pand` `por` `pxor`, `pcmpeqb` `pcmpeqw` `pcmpeqd` `pcmpgtb` `pcmpgtw` `pcmpgtd`, `punpcklbw` `punpcklwd` `punpckldq` `punpckhbw` `punpckhwd` `punpckhdq`, `packsswb` `packssdw`, `addps` `subps` `mulps` `divps` `addpd` `subpd` `mulpd` `divpd`, `cvtdq2ps` `cvttps2dq` `cvtdq2pd` `cvttpd2dq` `cvtps2pd` `cvtpd2ps` |
+| `xmm, xmm/m128` | `paddb` `paddw` `paddd` `paddq`, `psubb` `psubw` `psubd` `psubq` `psubusb` `psubusw`, `pmullw` `pmulhw` `pmulhuw` `pmuludq`, `psadbw`, `pand` `por` `pxor`, `pcmpeqb` `pcmpeqw` `pcmpeqd` `pcmpgtb` `pcmpgtw` `pcmpgtd`, `punpcklbw` `punpcklwd` `punpckldq` `punpckhbw` `punpckhwd` `punpckhdq`, `packsswb` `packssdw`, `addps` `subps` `mulps` `divps` `addpd` `subpd` `mulpd` `divpd`, `cvtdq2ps` `cvttps2dq` `cvtdq2pd` `cvttpd2dq` `cvtps2pd` `cvtpd2ps` |
 | `xmm, xmm/m128, imm8` | `pshufd`, `cmpps`, `cmppd` |
+| `xmm, r64` and `r64, xmm` | `movq` |
+| `xmm, imm8` | `pslldq` `psrldq`, `psllq` `psrlq` |
+| `xmm, xmm/m128` (the count is the source's low quadword) | `psllq` `psrlq` |
+
+`movq xmm, r64` writes the low quadword and zeroes the high one, and `movq r64,
+xmm` reads the low quadword. Only the 64-bit general register form is spelled.
+`pslldq` and `psrldq` shift the whole register by bytes, and `psllq` and `psrlq`
+shift each quadword by bits. A count past the width empties the register or the
+lane, as GNU as encodes it, so any immediate from 0 to 255 is accepted. All of
+them are baseline SSE2 and run in fixed time whatever the count, so the
+constant-time check lets a secret through them as data.
 
 **aarch64** spells them `vN.16b`, `vN.8h`, `vN.4s` or `vN.2d`. The suffix is the
 lane arrangement, and every operand of one instruction shares it. `add`, `sub`,
@@ -235,8 +297,21 @@ float members only at `.4s` and `.2d`, and `mul` everywhere except `.2d`.
 | form | mnemonics |
 |---|---|
 | three registers | `add` `sub` `mul`, `and` `orr` `eor`, `cmeq` `cmgt` `cmge` `cmhi` `cmhs`, `fadd` `fsub` `fmul` `fdiv`, `fcmeq` `fcmgt` `fcmge` |
-| two registers | `mov`, `mvn` |
+| two registers | `mov`, `mvn`, `rev64` (not `.2d`) |
 | one element structure | `ld1 {vT.<lanes>}, [Xn]`, `st1 {vT.<lanes>}, [Xn]` |
+| three `.16b` registers and the first byte | `ext vD.16b, vN.16b, vM.16b, 8` |
+| a register from one lane, or from a general register | `dup vD.2d, vN.d[1]`, `dup vD.4s, wN` |
+| one lane from a lane of its width, or from a general register | `ins vD.d[1], xN`, `ins vD.s[0], vN.s[3]` |
+
+A lane is written `vN.b[i]`, `vN.h[i]`, `vN.s[i]` or `vN.d[i]`, with the index
+below the lane count. A lane taken from or put into a general register uses `x`
+for a `.d` lane and `w` for the narrower ones. `mov vD.d[1], xN` is the same
+instruction as `ins`, and the listing spells it that way, as objdump does.
+`ins` writes one lane and keeps the rest, so the register is read as well as
+written. `ext`'s byte index is bare like every other immediate, from 0 to 15.
+`rev x0, x1` and `rev w0, w1` reverse the bytes of a general register. All of
+them are baseline ASIMD and data-independent, so the constant-time check lets
+a secret through them.
 
 `ld1` and `st1` post-index their base by the structure size, `, 16`, or by an X
 register, `, x9`. Either form writes the base register:
@@ -275,7 +350,7 @@ inherits its function's set.
 | isa | extension | mnemonics |
 |---|---|---|
 | x86_64 | `ssse3` | `pshufb xmm, xmm/m128`, `palignr xmm, xmm/m128, imm8` |
-| x86_64 | `sse41` | `pblendw xmm, xmm/m128, imm8`, `ptest xmm, xmm/m128`, `pinsrd xmm, r32/m32, imm8`, `pextrd r32/m32, xmm, imm8`, `pmulld xmm, xmm/m128`, `pmovsxbw` `pmovsxwd` `pmovsxdq` `pmovzxbw` `pmovzxwd` `pmovzxdq` `xmm, xmm/m64` |
+| x86_64 | `sse41` | `pblendw xmm, xmm/m128, imm8`, `ptest xmm, xmm/m128`, `pinsrd xmm, r32/m32, imm8`, `pextrd r32/m32, xmm, imm8`, `pmulld xmm, xmm/m128`, `pmovsxbw` `pmovsxwd` `pmovsxdq` `pmovzxbw` `pmovzxwd` `pmovzxdq` `xmm, xmm/m64`, `pmovsxbd` `pmovsxwq` `pmovzxbd` `pmovzxwq` `xmm, xmm/m32`, `pmovsxbq` `pmovzxbq` `xmm, xmm/m16` |
 | x86_64 | `sha` | `sha256rnds2 xmm, xmm/m128`, `sha256msg1 xmm, xmm/m128`, `sha256msg2 xmm, xmm/m128` |
 | x86_64 | `fsgsbase` | `rdfsbase r32/r64`, `rdgsbase r32/r64`, `wrfsbase r32/r64`, `wrgsbase r32/r64` |
 | x86_64 | `popcnt` | `popcnt r16/32/64, r/m` (CPUID leaf 1, ECX bit 23) |
@@ -284,6 +359,7 @@ inherits its function's set.
 | x86_64 | `aes` | `aesenc` `aesenclast` `aesdec` `aesdeclast` `xmm, xmm/m128`, `aesimc xmm, xmm/m128`, `aeskeygenassist xmm, xmm/m128, imm8` (CPUID leaf 1, ECX bit 25) |
 | x86_64 | `pclmul` | `pclmulqdq xmm, xmm/m128, imm8` (CPUID leaf 1, ECX bit 1) |
 | x86_64 | `avx2` | `vpsllvd` `vpsrlvd` `vpsravd` `vpsllvq` `vpsrlvq` `xmm, xmm, xmm/m128` (VEX.128, CPUID leaf 7, EBX bit 5) |
+| x86_64 | `avx512dq` and `avx512vl` | `vpmullq xmm, xmm, xmm/m128` (EVEX.128, CPUID leaf 7, EBX bits 17 and 31) |
 | aarch64 | `sha2` | `sha256h qN, qN, vN.4s`, `sha256h2 qN, qN, vN.4s`, `sha256su0 vN.4s, vN.4s`, `sha256su1 vN.4s, vN.4s, vN.4s` |
 | aarch64 | `sb` | `sb` (the FEAT_SB speculation barrier) |
 | aarch64 | `aes` | `aese vN.16b, vN.16b`, `aesd vN.16b, vN.16b`, `aesmc vN.16b, vN.16b`, `aesimc vN.16b, vN.16b` (FEAT_AES) |
@@ -291,14 +367,22 @@ inherits its function's set.
 
 A manifest [level](manifest.md#levels) (`extensions = ["x86-64-v2"]`) selects every
 member name, so it admits the rows of each: `pmulld` assembles under `x86-64-v2`, and
-`tzcnt`, `lzcnt` and `vpsllvd` under `x86-64-v3`. The names a level brings that have no
-rows yet (`sse42`, `avx`, `avx512*`) admit nothing until an encoding lands for them.
+`tzcnt`, `lzcnt` and `vpsllvd` under `x86-64-v3`, and `vpmullq` under `x86-64-v4`. The
+names a level brings that have no rows yet (`sse42`, `avx`, `avx512f`, `avx512bw`,
+`avx512cd`) admit nothing until an encoding lands for them.
 
 The `avx2` rows are VEX-encoded three-operand instructions: the destination, then the
 shifted vector, then the per-lane counts, as GNU as spells them. Each shifts every lane
 by the count in the same lane of the last operand, and a count at or above the lane
 width empties the lane (or, for `vpsravd`, fills it with the sign). The 128-bit form is
 the only one inline asm spells; `ymm` registers are not operands.
+
+`vpmullq` is EVEX-encoded and takes its operands the same way: the destination, then
+the two factors, and it keeps the low 64 bits of each lane's product. Its 128-bit form
+needs `avx512vl` beside `avx512dq`, so a target selecting only one of them refuses it,
+naming the other. A memory source's displacement is scaled by 16 when that fits a
+byte, as GNU as does. Opmask registers, broadcast, `xmm16` to `xmm31`, and the `ymm`
+and `zmm` forms are not operands inline asm spells.
 
 `sha256rnds2` also reads `xmm0`, the round keys, without naming it, and the
 constant-time check follows a secret through it. `ptest` sets ZF and CF; the

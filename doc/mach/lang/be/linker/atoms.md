@@ -56,6 +56,27 @@ pub fun atom_live_len(plan: *AtomPlan, section: u32, original_len: u32) u32;
 pub fun copy_live_section(dst: *u8, src: *u8, src_len: u32, plan: *AtomPlan, section: u32);
 ```
 
+## rec AtomGap
+
+```mach
+pub rec AtomGap;
+```
+
+a gap the link opens in a section's live bytes: `len` bytes placed before the
+byte at input offset `offset`, or after the last when offset is the length
+
+## fun atom_plan_open_gaps
+
+```mach
+pub fun atom_plan_open_gaps(alloc: *A.Allocator, modules: *of.ObjectImage, module_count: u32,
+sec_total: u32, plan: *AtomPlan, gaps: *AtomGap, gap_count: u32) err[fail.Fail];
+```
+
+opens each gap as an empty drop whose resume lies `len` bytes on, so every
+offset at or past it moves with the bytes after it and whatever maps an offset
+through the plan sees the gap. gaps come sorted by section and offset, at live
+offsets, each a multiple of its section's alignment so no drop's padding moves
+
 ## fun build_atom_plan
 
 ```mach

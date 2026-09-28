@@ -1,5 +1,37 @@
 # mach.lang.me.ir
 
+## fwd id.BlockId
+
+```mach
+fwd id.BlockId
+```
+
+forwards [`mach.lang.me.ir.id.BlockId`](ir/id.md#def-blockid)
+
+## fwd id.InstructionId
+
+```mach
+fwd id.InstructionId
+```
+
+forwards [`mach.lang.me.ir.id.InstructionId`](ir/id.md#def-instructionid)
+
+## fwd id.BLOCK_NIL
+
+```mach
+fwd id.BLOCK_NIL
+```
+
+forwards [`mach.lang.me.ir.id.BLOCK_NIL`](ir/id.md#val-block_nil)
+
+## fwd id.INSTR_NIL
+
+```mach
+fwd id.INSTR_NIL
+```
+
+forwards [`mach.lang.me.ir.id.INSTR_NIL`](ir/id.md#val-instr_nil)
+
 ## val FN_FLAG_PUB
 
 ```mach
@@ -354,6 +386,17 @@ pub fun global_lookup(m: *Module, name: intern.StrId) opt[u32];
 ```mach
 pub fun instruction_get(fn: *Function, i: id.InstructionId) opt[*instruction.Instruction];
 ```
+
+## fun constant_behind
+
+```mach
+pub fun constant_behind(fn: *Function, v: value.Value) value.Value;
+```
+
+the constant a value is: the operand of the `const` that materializes it
+(#3807), read at the use's type and secrecy, and any other value as itself.
+a pass that reads constants reads through this, so a materialized constant
+folds and compares as the constant it holds
 
 ## fun instruction_add
 

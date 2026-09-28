@@ -428,6 +428,9 @@ pub val MIR_VEC_BUILD:   MirOpcode = 0x1007
 pub val MIR_MUL_HI_U: MirOpcode = 0x1008
 ```
 
+the high half of the full product, at the operands' width; on vector lanes
+the packed high multiply of each lane pair (#4119)
+
 ## val MIR_MUL_HI_S
 
 ```mach
@@ -501,6 +504,25 @@ cleared: a value wider than `vector_bits` a convention carried has left its
 register, and nothing the function holds lives above the compute width.
 emitted only where the model's register-width row says the narrower code
 pays for that state (isa.vector_upper_clear), x86-64's vzeroupper (#3751)
+
+## val MIR_VEC_INTERLEAVE
+
+```mach
+pub val MIR_VEC_INTERLEAVE: MirOpcode = 0x1011
+```
+
+the IR lane interleave (dst, lo, hi, the first lane of the half in imm): lane
+i of lo and of hi from that lane on, joined into one lane twice as wide (#4119)
+
+## val MIR_VEC_WIDEN_SUM_U
+
+```mach
+pub val MIR_VEC_WIDEN_SUM_U: MirOpcode = 0x1012
+```
+
+the IR widening group sum (dst, src): each result lane the zero-extended
+sum of the operand lanes it covers, the vec_lane naming the result lane and
+carrying the operand's (#4161)
 
 ## val MIR_SEL_ADD
 
@@ -1475,7 +1497,9 @@ lanes each `lane_bytes` wide but the last, which is `last_bytes` wide when
 that is not 0 (a split vector whose last piece holds the lanes left, #3589);
 `lanes` is 0 when `vreg` holds the whole value.
 at_end: the binding is published at the end of the instruction that carries
-it, where that instruction's def exists, instead of at its start
+it, where that instruction's def exists, instead of at its start.
+lhs_is_imm on a binding that is not a compare: the value is the constant
+`imm` rather than any vreg's, a value the allocator builds at its reads (#4185)
 
 ## val DBG_LANES_MAX
 

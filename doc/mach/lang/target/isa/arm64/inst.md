@@ -973,10 +973,86 @@ pub val CSEL: MachOp = 152
 the first source when the condition holds, else the second: the
 branch-free select (#3346)
 
+## val V_USHL
+
+```mach
+pub val V_USHL:  MachOp = 153
+```
+
+the lane-wise shifts (#3852): ushl and sshl by a count per lane, whose low
+byte is read as signed and shifts right when negative; the vector negate
+that turns a right shift's count into that; shl, ushr and sshr by an
+immediate; uqshl by an immediate, the saturating shift a count is clamped
+with; and dup (general), a register's low lane copied to every lane
+
+## val V_SSHL
+
+```mach
+pub val V_SSHL:  MachOp = 154
+```
+
+## val V_NEG
+
+```mach
+pub val V_NEG:   MachOp = 155
+```
+
+## val V_SHL
+
+```mach
+pub val V_SHL:   MachOp = 156
+```
+
+## val V_USHR
+
+```mach
+pub val V_USHR:  MachOp = 157
+```
+
+## val V_SSHR
+
+```mach
+pub val V_SSHR:  MachOp = 158
+```
+
+## val V_UQSHL
+
+```mach
+pub val V_UQSHL: MachOp = 159
+```
+
+## val DUP_GEN
+
+```mach
+pub val DUP_GEN: MachOp = 160
+```
+
+## val REV
+
+```mach
+pub val REV:     MachOp = 161
+```
+
+the byte reversal of a general register, the byte reversal within each
+doubleword of a vector, and the vector broadcast of one lane, reached only
+from inline asm (#3915)
+
+## val V_REV64
+
+```mach
+pub val V_REV64: MachOp = 162
+```
+
+## val V_DUP
+
+```mach
+pub val V_DUP:   MachOp = 163
+```
+
 ## val MOP_LAST
 
 ```mach
-pub val MOP_LAST:  MachOp = CSEL
+pub val MOP_LAST:  MachOp = V_DUP
 ```
 
 ## fun known
@@ -1098,7 +1174,8 @@ dst, src1, src2 vectors at the arrangement the element width names
 pub val L_NEON_2MISC: Layout = 12
 ```
 
-dst, src1 vectors, always .16b
+dst, src1 vectors at the arrangement the element width names, .16b for
+the bitwise members
 
 ## val L_NEON_LANE_RD
 
@@ -1230,6 +1307,24 @@ pub val L_CSEL: Layout = 28
 
 dst, src1, src2 registers and the condition in the flags
 
+## val L_NEON_SHIFT_IMM
+
+```mach
+pub val L_NEON_SHIFT_IMM: Layout = 29
+```
+
+dst, src1 vectors at the arrangement the element width names, and the shift
+amount in src2
+
+## val L_NEON_DUP
+
+```mach
+pub val L_NEON_DUP: Layout = 30
+```
+
+dst vector at the arrangement the element width names, from the general
+register src1, or from src1.elem[src2] for a vector src1
+
 ## def WidthRule
 
 ```mach
@@ -1316,6 +1411,14 @@ pub val W_FMOV_GEN: WidthRule = 9
 ```
 
 FMOV (general): sf and ftype as W_SF_FTYPE, the direction from the banks
+
+## val W_SF_REV
+
+```mach
+pub val W_SF_REV: WidthRule = 10
+```
+
+rev: sf and the low opc bit set for a 64-bit register, whose bytes it reverses whole
 
 ## def LaneClass
 
@@ -1625,18 +1728,25 @@ pub fun neon_conv_field(op: MachOp, eb: u8) u32;
 ```
 
 the operand-width field of a lane-wise conversion: the shift-left-long
-immh marker, the narrowing size of its result, or the double-precision bit
+immh marker, the narrowing size of its result, or the double-precision bit.
+fcvtl lengthens half to single (eb 2) or single to double (eb 4), and fcvtn
+narrows single to half (eb 4) or double to single (eb 8)
+
+## fun logical_imm
+
+```mach
+pub fun logical_imm(value: u64, use64: bool) opt[u32];
+```
+
+the N:immr:imms field of a logical immediate, the element of 2 to 64 bits
+that repeats across the register being a rotated run of ones; none for a
+value no element spells, all zeros and all ones among them
 
 ## fun assemble
 
 ```mach
 pub fun assemble(mi: *isa.Inst) u32;
 ```
-
-the instruction word of a notification-shaped instruction: the row's base
-word with the widths applied and the operands packed by the layout. the
-operands are the assembler's, so an alias member (never assembled) and a
-member whose row cannot hold the operands it was given assemble to none
 
 ## fun signed_at_width
 

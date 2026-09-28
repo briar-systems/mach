@@ -27,8 +27,8 @@ pub rec LaneDesc;
 ```
 
 from_bits and from_lanes are the operand's lane width and lane count, which
-only a conversion, a widening multiply, a lane-halving extension or a lane
-range changes
+only a conversion, a widening multiply, a lane-halving extension, a lane
+range or a widening group sum changes
 
 ## fun lane_desc
 
@@ -45,10 +45,30 @@ pub fun scalar_bits(m: *ir.Module, ty: ir_type.IrTypeId) u32;
 ## fun packs
 
 ```mach
-pub fun packs(tgt: *target.Target, k: instruction.InstrKind, is_float: bool, lane_bits: u32) bool;
+pub fun packs(tgt: *target.Target, k: instruction.InstrKind, is_float: bool, lane_bits: u32, uniform_count: bool) bool;
 ```
 
-a loop's lanes carry their own values, so a shift here counts by lanes
+whether the target packs `k` over lanes of `lane_bits`; a shift is the cell
+of its count's form, one scalar for every lane when `uniform_count` and a
+count per lane otherwise
+
+## fun extends
+
+```mach
+pub fun extends(tgt: *target.Target, k: instruction.InstrKind, lane_bits: u32, from_bits: u32) bool;
+```
+
+a loop's lane-wise integer extension `k` from `from_bits` lanes to
+`lane_bits` lanes, packed
+
+## fun extends_directly
+
+```mach
+pub fun extends_directly(tgt: *target.Target) bool;
+```
+
+a lane-wise integer extension over more than one doubling is one
+instruction on the target, rather than a chain of doublings (#4161)
 
 ## fun packed_lanes
 
@@ -123,6 +143,26 @@ pub fun widening_half_packs(m: *ir.Module, tgt: *target.Target, kind: instructio
 whether the widening multiply of one half of two `from_ty` vectors into the
 `ty` of half their lanes is a cell the target packs (#3589)
 
+## fun high_of
+
+```mach
+pub fun high_of(kind: instruction.InstrKind) opt[instruction.InstrKind];
+```
+
+the high multiply that pairs with the plain multiply into the widening
+multiply `kind`; absent for any other kind
+
+## fun widening_pair_packs
+
+```mach
+pub fun widening_pair_packs(m: *ir.Module, tgt: *target.Target, kind: instruction.InstrKind, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
+```
+
+whether the target realizes the half `ty` of a widening multiply `kind` of
+two `from_ty` vectors as the plain and the high multiply of the operands,
+interleaved: every piece of the pair is a cell it packs (#4119). both halves
+of one product then read the same pair
+
 ## fun concat_packs
 
 ```mach
@@ -148,6 +188,24 @@ pub fun conversion_packs(m: *ir.Module, tgt: *target.Target, kind: instruction.I
 
 whether the lane-wise conversion `kind` of a `from_ty` vector into `ty` is a
 cell the target packs at these lanes; the catalog is the only judge
+
+## fun operation_packs
+
+```mach
+pub fun operation_packs(m: *ir.Module, tgt: *target.Target, kind: instruction.InstrKind, ty: ir_type.IrTypeId, operand_ty: ir_type.IrTypeId, n: u32) bool;
+```
+
+whether `kind` over `n` operands of `operand_ty` (one or two) into `ty` is a
+cell the target packs at these lanes; the catalog is the only judge
+
+## fun widen_sum_packs
+
+```mach
+pub fun widen_sum_packs(m: *ir.Module, tgt: *target.Target, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
+```
+
+whether the widening group sum of a `from_ty` vector into `ty` is a cell
+the target packs, both sides whole in one register (#4161)
 
 ## fun range_packs
 

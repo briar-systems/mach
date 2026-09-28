@@ -1,5 +1,12 @@
 # mach.lang.target.of.record
 
+the object cache's record: opaque bytes an object carries for the build
+that wrote it, in a section no link loads. elf and coff name it
+`.mach.cache`, mach-o `__MACH,__mach_cache`. the emitter writes the section
+when the image carries a record, and the parser moves its bytes back into
+the image, leaving the zero-length husk the linker already skips, so an
+object with a record links exactly as one without
+
 ## val SECTION_NAME
 
 ```mach

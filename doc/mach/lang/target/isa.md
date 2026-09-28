@@ -460,10 +460,51 @@ conversion over those pieces gathers its halves (#3589). a cell names the
 lane kind and width, which the operation keeps; its scalar row is the lane
 path through memory
 
+## val VEC_OP_MUL_HIGH_S
+
+```mach
+pub val VEC_OP_MUL_HIGH_S: VecOp = 34
+```
+
+the high half of the full product of two integer lanes, in lanes of their
+own width, under the operation's signedness: the upper word of the widening
+multiply, whose lower word is the plain multiply. a cell names the lane width
+twice; its scalar row is each lane's own high multiply (#4119)
+
+## val VEC_OP_MUL_HIGH_U
+
+```mach
+pub val VEC_OP_MUL_HIGH_U: VecOp = 35
+```
+
+## val VEC_OP_INTERLEAVE
+
+```mach
+pub val VEC_OP_INTERLEAVE: VecOp = 36
+```
+
+a lane interleave: lane i of the low operand and lane i of the high operand
+joined into one lane twice as wide, the low operand's lane in its low half.
+it is how a target whose widening multiply is the low and the high multiply
+pairs the two into full products. a cell names the result lane width and the
+operand lane width; its scalar row is each lane joined on its own (#4119)
+
+## val VEC_OP_WIDEN_SUM_U
+
+```mach
+pub val VEC_OP_WIDEN_SUM_U: VecOp = 37
+```
+
+a widening group sum: each result lane the zero-extended sum of the operand
+integer lanes it covers, so the result holds the operand's bits in fewer,
+wider lanes. a cell names the result lane width and the operand lane width;
+its scalar row is the per-lane sum, and only a packed cell is ever formed,
+as the fold of a count accumulated in narrow lanes (#4161)
+
 ## val VEC_OP_LAST
 
 ```mach
-pub val VEC_OP_LAST:   VecOp = VEC_OP_CONCAT
+pub val VEC_OP_LAST:        VecOp = VEC_OP_WIDEN_SUM_U
 ```
 
 ## rec PackedForm
@@ -575,6 +616,12 @@ pub val XBANK_4: u32 = 4
 pub val XBANK_4_8: u32 = 4 + 8
 ```
 
+## val XBANK_2_4_8
+
+```mach
+pub val XBANK_2_4_8: u32 = 2 + 4 + 8
+```
+
 ## val SLOT_READ_NONE
 
 ```mach
@@ -668,10 +715,28 @@ pub fun is_convert_op(op: VecOp) bool;
 pub fun is_widen_op(op: VecOp) bool;
 ```
 
+## fun is_mul_high_op
+
+```mach
+pub fun is_mul_high_op(op: VecOp) bool;
+```
+
+## fun is_interleave_op
+
+```mach
+pub fun is_interleave_op(op: VecOp) bool;
+```
+
 ## fun is_widen_half_op
 
 ```mach
 pub fun is_widen_half_op(op: VecOp) bool;
+```
+
+## fun is_widen_sum_op
+
+```mach
+pub fun is_widen_sum_op(op: VecOp) bool;
 ```
 
 ## fun is_shift_op
@@ -753,8 +818,9 @@ declares the rest through this, so each conversion cell is decided once
 pub fun scalar_widening_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
 ```
 
-the same for the widening multiplies and the lane-halving extensions: a
-cell the packed table leaves keeps the per-lane path
+the same for the widening multiplies, their high halves, the lane
+interleave, the lane-halving extensions and the widening group sums: a cell
+the packed table leaves keeps the per-lane path
 
 ## fun scalar_shift_rows
 
@@ -773,6 +839,16 @@ pub fun scalar_permute_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
 
 the same for the lane ranges and joins: a cell the packed table leaves keeps
 the lane path
+
+## fun scalar_half_lane_rows
+
+```mach
+pub fun scalar_half_lane_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
+```
+
+the same for the arithmetic and comparisons of f16 lanes: a cell the packed
+table leaves is each lane's scalar f16 operation, the half expansion or the
+target's own half row (#3802)
 
 ## fun ct_mul_rows_admit
 
@@ -927,6 +1003,15 @@ pub fun packed_row_selected_by(m: *MachineModel, op: VecOp, is_float: bool, lane
 whether the model selects the row of this cell gated on exactly `ext`: the
 lowering's choice between the baseline form and an extension's instruction
 
+## fun extends_directly
+
+```mach
+pub fun extends_directly(m: *MachineModel) bool;
+```
+
+a lane-wise integer extension of any ratio is one instruction under the
+selected extensions, rather than a chain of doublings
+
 ## fun vector_form
 
 ```mach
@@ -1052,6 +1137,25 @@ pub def IsRegMoveFn: fun(u32) bool
 ```mach
 pub def IsTrapTerminatorFn: fun(u32) bool
 ```
+
+## def IntImmFitsFn
+
+```mach
+pub def IntImmFitsFn: fun(u64, u32) bool
+```
+
+whether one instruction materializes the integer `value`, read at `bits`
+(at most 64): the rule the middle end hoists a loop's constants by (#3807)
+
+## def ReadsConstFn
+
+```mach
+pub def ReadsConstFn: fun(*mir.MirInstr, u32) bool
+```
+
+whether the selected instruction reads operand `index` as a constant in
+place, as a constant-pool memory operand, at no instruction of its own: the
+rule the allocator folds a rebuilt constant into its reader by (#4184)
 
 ## def DwarfRegFn
 
@@ -1254,8 +1358,11 @@ pub fun with_page_size(vt: *IsaVTable, page_size: u64);
 ## fun with_environments
 
 ```mach
-pub fun with_environments(vt: *IsaVTable, envs: *Environment, count: u32);
+pub fun with_environments(vt: *IsaVTable, envs: *Environment, count: u32, open: u64);
 ```
+
+`open` is what a target naming no environment is granted: with no ceiling
+over it, every extension an environment could guarantee
 
 ## fun environment_lookup
 
@@ -1269,11 +1376,24 @@ pub fun environment_lookup(vt: *IsaVTable, name: str) u32;
 pub fun environment_profile(vt: *IsaVTable, env_id: u32) u32;
 ```
 
+## fun environment_extensions
+
+```mach
+pub fun environment_extensions(vt: *IsaVTable, env_id: u32) u64;
+```
+
+the extensions the target's environment guarantees, which its selection holds
+beside the ones it names
+
 ## rec Environment
 
 ```mach
 pub rec Environment;
 ```
+
+an execution environment an isa defines: its name, its profile, and the
+extensions of the isa's vocabulary it guarantees (spirv's `float16` from
+vulkan1.2)
 
 ## val ENV_NONE
 
@@ -1324,6 +1444,18 @@ pub fun with_codeview_regs(m: *RegMachine, f: CvRegFn);
 pub fun with_frame_dist(m: *RegMachine, f: FrameDistFn);
 ```
 
+## fun with_int_imm_rule
+
+```mach
+pub fun with_int_imm_rule(m: *RegMachine, f: IntImmFitsFn);
+```
+
+## fun with_const_operand_rule
+
+```mach
+pub fun with_const_operand_rule(m: *RegMachine, f: ReadsConstFn);
+```
+
 ## fun reloc_seam
 
 ```mach
@@ -1354,6 +1486,27 @@ pub fun declares_local_got(tgt_isa: *IsaVTable) bool;
 ```mach
 pub fun local_got_kind(tgt_isa: *IsaVTable, kind: of.RelocKind) bool;
 ```
+
+## fun with_branch_thunks
+
+```mach
+pub fun with_branch_thunks(s: *RelocSeam, reach: of.BranchReachFn, thunk: of.BranchThunkFn);
+```
+
+## fun declares_branch_thunks
+
+```mach
+pub fun declares_branch_thunks(tgt_isa: *IsaVTable) bool;
+```
+
+## fun branch_reach
+
+```mach
+pub fun branch_reach(tgt_isa: *IsaVTable, kind: of.RelocKind) opt[of.BranchReach];
+```
+
+the reach of a direct branch a thunk can extend, none for any other kind or
+an instruction set that places no thunks
 
 ## fun with_machine_flags
 

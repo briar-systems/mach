@@ -331,8 +331,9 @@ pub val OP_MUL_HIGH_S: InstrKind = 52
 ```
 
 the high half of the full product of two integers at their own width
-(#3511): claimed ahead of the widening recognition that will form them, so
-nothing emits either yet
+(#3511), or of each pair of lanes of two integer vectors at their own lane
+width. type legalization forms the vector form where the target realizes a
+widening multiply half as the low and the high product interleaved (#4119)
 
 ## val OP_MUL_HIGH_U
 
@@ -401,6 +402,43 @@ if-conversion flattens a small diamond into (#3346). operand 0 is an i8
 condition, both choices and the result share one scalar integer or pointer
 type, and every target lowers it without a branch, so a secret condition
 stays constant-time
+
+## val OP_CONST
+
+```mach
+pub val OP_CONST: InstrKind = 60
+```
+
+its one operand, an integer or float constant, as a value of its own: the
+materialization of a constant a loop reads, placed ahead of the loop so the
+loop reads a register rather than rebuilding the constant (#3807). every
+pass that reads a constant reads through it with `ir.constant_behind`
+
+## val OP_VEC_INTERLEAVE
+
+```mach
+pub val OP_VEC_INTERLEAVE: InstrKind = 61
+```
+
+lane i of operand 0 and lane i of operand 1, two integer vectors of one type,
+joined into lane i of the result, an integer lane twice as wide holding
+operand 0's lane in its low half. an optional third operand, the constant 0
+or n, joins the low or high half of two 2n-lane operands instead, as the
+widening multiply does. type legalization forms it where the target realizes
+a widening multiply half as the low and the high product interleaved, so the
+two halves of one product share the pair (#4119)
+
+## val OP_VEC_WIDEN_SUM_U
+
+```mach
+pub val OP_VEC_WIDEN_SUM_U: InstrKind = 62
+```
+
+each result lane the sum of the operand lanes it covers, zero-extended: an
+integer vector of n lanes into n * w / W lanes of the wider width W, lane r
+summing operand lanes r * W / w up to the next result lane's first. formed
+only where the target packs it, the per-block fold of a count accumulated in
+narrow lanes (#4161)
 
 ## val INSTR_FLAG_NSW
 

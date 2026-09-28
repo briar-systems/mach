@@ -14,12 +14,14 @@
 #   compiler            the fixpoint, the unit suite and the warm build path
 #   corpus:<target>     that target's column of the corpus differential
 #   qemu riscv32 spirv dwarf darwin release   the heavy job of that name
+#   f16proof            the exhaustive f16 proof (#3804), selected only by name:
+#                       no path, no pull request into main and not heavy=all
 #   link:<leg>          the link cases on that host leg (x86_64-linux carries
 #                       every cross-built format)
 # docs runs on every pull request and is not a leg.
 set -euo pipefail
 
-corpus_all='x86_64-linux x86_64v3-linux aarch64-linux riscv64-linux riscv64zkt-linux x86_64-windows x86_64-darwin aarch64-darwin riscv32'
+corpus_all='x86_64-linux x86_64v3-linux aarch64-linux aarch64fp16-linux riscv64-linux riscv64zkt-linux riscv64zfh-linux x86_64-windows x86_64-darwin aarch64-darwin riscv32'
 link_all='x86_64-linux aarch64-linux x86_64-windows'
 
 legs=
@@ -35,8 +37,8 @@ differential() { every_corpus; add qemu riscv32 spirv; }
 # the debug model and the link cases. darwin stays with the darwin rows and main.
 backend() { add compiler dwarf; differential; link_legs; }
 x64() { corpus x86_64-linux x86_64v3-linux x86_64-windows x86_64-darwin; }
-arm64() { corpus aarch64-linux aarch64-darwin; }
-riscv() { corpus riscv64-linux riscv64zkt-linux riscv32; add qemu riscv32; }
+arm64() { corpus aarch64-linux aarch64fp16-linux aarch64-darwin; }
+riscv() { corpus riscv64-linux riscv64zkt-linux riscv64zfh-linux riscv32; add qemu riscv32; }
 # column <target>: one test/run.sh column with whichever job executes it
 column() {
     case "$1" in
@@ -61,6 +63,8 @@ select_path() {
         dist/*) ;;
         # changes runs the script tests and docs the doc checks on every run
         .github/scripts/*) ;;
+        # the f16 proof runs only when dispatched by name
+        test/f16proof/*) ;;
 
         src/lang/be/codegen/dwarf.mach|src/lang/be/codegen/debug_input.mach|src/lang/be/linker/debug.mach)
             add compiler dwarf; link_legs ;;
@@ -84,7 +88,7 @@ select_path() {
             add compiler dwarf; corpus x86_64-windows; link x86_64-linux x86_64-windows ;;
 
         src/lang/target/os/linux.mach)
-            add compiler; corpus x86_64-linux x86_64v3-linux aarch64-linux riscv64-linux riscv64zkt-linux; link x86_64-linux aarch64-linux ;;
+            add compiler; corpus x86_64-linux x86_64v3-linux aarch64-linux aarch64fp16-linux riscv64-linux riscv64zkt-linux riscv64zfh-linux; link x86_64-linux aarch64-linux ;;
         src/lang/target/os/windows.mach)
             add compiler; corpus x86_64-windows; link x86_64-linux x86_64-windows ;;
         src/lang/target/os/darwin.mach)
@@ -119,7 +123,7 @@ select_path() {
         src/*|test/fuzz/*)
             add compiler ;;
 
-        test/cases/SKIPS.*|test/cases/NORUN.*|test/cases/ONLY.*)
+        test/cases/SKIPS.*|test/cases/NORUN.*|test/cases/ONLY.*|test/cases/EXACT.*)
             column "${1#test/cases/*.}" ;;
         test/cases/*|test/lib/*)
             differential; add dwarf ;;
@@ -141,7 +145,7 @@ case "${1:-}" in
             none) ;;
             all) everything ;;
             link) every_link ;;
-            qemu|spirv|riscv32|dwarf|darwin|release) add "$2" ;;
+            qemu|spirv|riscv32|dwarf|darwin|release|f16proof) add "$2" ;;
             *) echo "ci-legs: unknown heavy job '${2:-}'" >&2; exit 2 ;;
         esac ;;
     paths)
@@ -166,11 +170,11 @@ json_list() {
 
 corpus_json=$(json_list corpus $corpus_all)
 link_json=$(json_list link $link_all)
-for leg in compiler qemu riscv32 spirv dwarf darwin release; do flag "$leg"; done
+for leg in compiler qemu riscv32 spirv dwarf darwin release f16proof; do flag "$leg"; done
 echo "corpus=$corpus_json"
 echo "link=$link_json"
 # build carries the compiler artifact every leg but docs, darwin and release reads
-if has compiler || has qemu || has riscv32 || has spirv || has dwarf ||
+if has compiler || has qemu || has riscv32 || has spirv || has dwarf || has f16proof ||
    [ "$corpus_json" != '[]' ] || [ "$link_json" != '[]' ]; then
     echo build=true
 else

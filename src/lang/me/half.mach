@@ -7,13 +7,17 @@
 # arithmetic widens both operands exactly to binary64, computes there and
 # narrows once. binary64 carries more than twice binary16's precision plus two
 # bits, so that one rounding is the correctly rounded binary16 result, the rule
-# comptime folds by. a conversion goes through binary64 the same way, and a
-# comparison compares the widened values. widening and narrowing are integer
-# code on the halves of the binary64 encoding: sign, exponent and significand
-# extraction, round to nearest even, subnormals, overflow to infinity, and a NaN
-# made by the target's NaN rule, as float.narrow_bits and float.widen_bits
-# define them, so the expansion converts as the target's own half instructions
-# would. every step is branch-free, a select being a mask
+# comptime folds by. a target whose rows convert f16 to and from binary32
+# computes in binary32 instead, which carries exactly that much (#3801). an
+# arithmetic operand widens with a NaN kept as it is, signaling or quiet, so
+# the binary64 unit picks and quiets the NaN as the target's half unit would.
+# a conversion goes through binary64 the same way, and a comparison compares
+# the widened values. widening and narrowing are integer code on the halves of
+# the binary64 encoding: sign, exponent and significand extraction, round to
+# nearest even, subnormals, overflow to infinity, and a converted NaN made by
+# the target's NaN rule, as float.narrow_bits and float.widen_bits define them,
+# so the expansion converts as the target's own half instructions would. every
+# step is branch-free, a select being a mask
 
 use mach.lang.fail;
 use mach.lang.float;
@@ -22,10 +26,14 @@ use mach.lang.me.ir.builder;
 use mach.lang.me.ir.instruction;
 use ir_type: mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
+use mach.lang.me.vecform;
+use mach.lang.target;
 use mach.lang.target.isa;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 
 # an emitter over the caller's builder that remembers the first failure, so
@@ -33,6 +41,7 @@ use std.types.result.res;
 # the nil value and is never used: the caller reads `done` before its result
 pub rec Half {
     b:      *builder.Builder;
+    tgt:    *target.Target;
     model:  *isa.MachineModel;
     nan:    float.NanRule;
     failed: bool;
@@ -49,15 +58,16 @@ pub fun carrier(types: *ir_type.IrTypeTable) res[ir_type.IrTypeId, fail.Fail] {
     ret ir_type.intern_int_form(types, 16, ir_type.INT_FORM_BINARY16);
 }
 
-# model is the target's machine model: its half rows and its NaN rule
-pub fun init(b: *builder.Builder, model: *isa.MachineModel) res[Half, fail.Fail] {
-    if (model == nil || !float.nan_rule_valid(model.nan_rule)) {
+# tgt is the target: its machine model's half rows, packed rows and NaN rule
+pub fun init(b: *builder.Builder, tgt: *target.Target) res[Half, fail.Fail] {
+    if (tgt == nil || !float.nan_rule_valid(tgt.model.nan_rule)) {
         ret res[Half, fail.Fail].err{fail.message("half: expansion requires the target's machine model")};
     }
     var h: Half;
     h.b      = b;
-    h.model  = model;
-    h.nan    = model.nan_rule;
+    h.tgt    = tgt;
+    h.model  = ?tgt.model;
+    h.nan    = tgt.model.nan_rule;
     h.failed = false;
     val t16: res[ir_type.IrTypeId, fail.Fail] = carrier(?b.m.types);
     if (sel t16.err) { ret res[Half, fail.Fail].err{t16.err}; }
@@ -180,11 +190,24 @@ fun pick(h: *Half, c: value.Value, a: value.Value, b: value.Value) value.Value {
     ret bxor(h, b, band(h, bxor(h, a, b), mask));
 }
 
-# the carried bits `x` widened exactly to binary64
+# the carried bits `x` widened exactly to binary64, a NaN as the target's
+# rule converts it
 pub fun widen(h: *Half, x: value.Value) value.Value {
     if (native(h, isa.VEC_OP_FP_EXT, true, 64, 16)) {
         ret take(h, builder.emit_fp_ext(h.b, bitcast(h, x, f16_type(h)), h.f64t));
     }
+    ret widen_bits(h, x, false);
+}
+
+# `x` widened to binary64 as an operand of + - * /: a NaN keeps its sign, its
+# payload and whether it signals, so the target's binary64 unit applies its own
+# NaN selection, as a native half instruction does (#3801)
+fun widen_operand(h: *Half, x: value.Value) value.Value {
+    ret widen_bits(h, x, true);
+}
+
+# the integer widening: `exact` keeps a NaN as it is, otherwise it follows the rule
+fun widen_bits(h: *Half, x: value.Value, exact: bool) value.Value {
     val w:    value.Value = zext(h, x, h.i32t);
     val sign: value.Value = shl(h, band(h, w, k32(h, 0x8000)), k32(h, 16));
     val e:    value.Value = band(h, shr(h, w, k32(h, 10)), k32(h, 0x1F));
@@ -196,7 +219,8 @@ pub fun widen(h: *Half, x: value.Value) value.Value {
     val norm: value.Value = bor(h, bor(h, sign, shl(h, add(h, e, k32(h, 1008)), k32(h, 20))), mhi);
     val inf:  value.Value = bor(h, sign, k32(h, 0x7FF00000));
     var spec: value.Value = pick(h, eq(h, m, k32(h, 0)), inf, k32(h, 0x7FF80000));
-    if (h.nan == float.NAN_PRESERVE) {
+    if (exact) { spec = bor(h, inf, mhi); }
+    or (h.nan == float.NAN_PRESERVE) {
         spec = bor(h, bor(h, inf, mhi), shl(h, zext(h, ne(h, m, k32(h, 0)), h.i32t), k32(h, 19)));
     }
     # a subnormal or zero is m * 2^-24, exact in binary64, and its low word is zero
@@ -269,6 +293,22 @@ fun emit_arith(h: *Half, k: instruction.InstrKind, a: value.Value, b: value.Valu
     ret take(h, builder.emit_div_u(h.b, a, b));
 }
 
+# the target converts between f16 and binary32 both ways with its own
+# instructions. binary32 carries 24 bits, twice binary16's 11 plus two, so one
+# operation there on two widened operands and one rounding back is the
+# correctly rounded binary16 result for + - * / (the 2p+2 bound). the
+# conversion quiets a signaling operand, so the path is taken only where that
+# leaves the NaN result as the exact operands give it: the units return the
+# first NaN whatever signals, or every NaN is the canonical one
+fun through_f32(h: *Half) bool {
+    if (!h.model.nan_first_operand && h.nan != float.NAN_CANONICAL) { ret false; }
+    ret converts_f32(h);
+}
+
+fun converts_f32(h: *Half) bool {
+    ret native(h, isa.VEC_OP_FP_EXT, true, 32, 16) && native(h, isa.VEC_OP_FP_TRUNC, true, 16, 32);
+}
+
 # `a k b` on carried bits, k one of OP_ADD, OP_SUB, OP_MUL and OP_DIV_U, the
 # float division
 pub fun arith(h: *Half, k: instruction.InstrKind, a: value.Value, b: value.Value) value.Value {
@@ -276,13 +316,17 @@ pub fun arith(h: *Half, k: instruction.InstrKind, a: value.Value, b: value.Value
         val ft: ir_type.IrTypeId = f16_type(h);
         ret bitcast(h, emit_arith(h, k, bitcast(h, a, ft), bitcast(h, b, ft)), h.bits_t);
     }
-    ret narrow(h, emit_arith(h, k, widen(h, a), widen(h, b)));
+    if (through_f32(h)) { ret from_float(h, emit_arith(h, k, to_float(h, a, 32), to_float(h, b, 32)), 32); }
+    ret narrow(h, emit_arith(h, k, widen_operand(h, a), widen_operand(h, b)));
 }
 
 # the operand a comparison of carried bits reads: the f16 itself where the
-# target compares at 16 bits, else the exact binary64 widening
+# target compares at 16 bits, the exact binary32 widening where it converts
+# there (a comparison makes no NaN, so quieting one changes nothing), else the
+# exact binary64 widening
 pub fun compare_operand(h: *Half, x: value.Value) value.Value {
     if (native(h, isa.VEC_OP_CMP, true, 16, 16)) { ret bitcast(h, x, f16_type(h)); }
+    if (converts_f32(h))                         { ret to_float(h, x, 32); }
     ret widen(h, x);
 }
 
@@ -332,4 +376,185 @@ pub fun to_int(h: *Half, x: value.Value, ity: ir_type.IrTypeId, bits: u32, signe
     or                                  { src = widen(h, x); }
     if (signed)                         { ret take(h, builder.emit_fp_to_si(h.b, src, ity)); }
     ret take(h, builder.emit_fp_to_ui(h.b, src, ity));
+}
+
+# f16 lanes (#3802). a vector of f16 lanes is carried as a vector of the
+# carrier, and each lane-wise operation is bit for bit the scalar one above on
+# every lane: the target's packed row where it packs the cell of f16 lanes, the
+# binary32 lanes its packed conversions reach where the scalar rule computes in
+# binary32 too, and otherwise each lane's scalar operation, the expansion or the
+# target's own half row. the lanes are read one by one and the result built from
+# them as a vector literal is
+
+# the lane count and element of a vector type, 0 lanes when it is not one
+fun vec_shape(h: *Half, ty: ir_type.IrTypeId, elem: *ir_type.IrTypeId) u32 {
+    val o: opt[*ir_type.IrType] = ir_type.get(?h.b.m.types, ty);
+    if (sel o.none) { ret 0; }
+    val t: *ir_type.IrType = o.some;
+    if (t.kind != ir_type.IRT_VECTOR) { ret 0; }
+    @elem = t.data.vector_.element;
+    ret t.data.vector_.lanes;
+}
+
+fun vec_of(h: *Half, elem: ir_type.IrTypeId, lanes: u32) ir_type.IrTypeId {
+    ret type_of(h, ir_type.intern_vector(?h.b.m.types, elem, lanes));
+}
+
+fun index_t(h: *Half) ir_type.IrTypeId {
+    ret type_of(h, ir_type.intern_int(?h.b.m.types, h.model.index_width));
+}
+
+fun lane_of(h: *Half, v: value.Value, k: u32, elem: ir_type.IrTypeId) value.Value {
+    ret take(h, builder.emit_vec_extract(h.b, v, value.const_int(k::u64, index_t(h)), elem));
+}
+
+# the cell of `kind` over `operand` vectors into a `ty` vector is one the
+# target packs at these lanes
+fun vec_packs(h: *Half, kind: instruction.InstrKind, ty: ir_type.IrTypeId, operand: ir_type.IrTypeId, n: u32) bool {
+    ret vecform.operation_packs(h.b.m, h.tgt, kind, ty, operand, n);
+}
+
+# a vector of `vty` built from lanes as a vector literal is: one build where
+# the target builds vectors from lanes, otherwise a slot written lane by lane
+# and read whole. `at` yields lane k
+rec Build {
+    vty:   ir_type.IrTypeId;
+    lanes: u32;
+    slot:  value.Value;
+    built: [16]value.Value;
+    whole: bool;
+}
+
+fun build_start(h: *Half, vty: ir_type.IrTypeId, lanes: u32) Build {
+    var bl: Build;
+    bl.vty   = vty;
+    bl.lanes = lanes;
+    bl.whole = h.model.has_vec_build && lanes <= 16;
+    if (!bl.whole) { bl.slot = take(h, builder.emit_alloca(h.b, vty, value.const_int(1, index_t(h)))); }
+    ret bl;
+}
+
+fun build_lane(h: *Half, bl: *Build, k: u32, x: value.Value) {
+    if (bl.whole) {
+        bl.built[k] = x;
+        ret;
+    }
+    var idx: [2]value.Value;
+    idx[0] = value.const_int(0, index_t(h));
+    idx[1] = value.const_int(k::u64, index_t(h));
+    val at: value.Value    = take(h, builder.emit_gep(h.b, bl.slot, bl.vty, ?idx[0], 2));
+    val st: err[fail.Fail] = builder.emit_store(h.b, x, at);
+    if (sel st.err) {
+        if (!h.failed) {
+            h.failed = true;
+            h.first  = st.err;
+        }
+    }
+}
+
+fun build_end(h: *Half, bl: *Build) value.Value {
+    if (h.failed) { ret value.const_null(ir_type.IRT_NIL); }
+    if (bl.whole) { ret take(h, builder.emit_vec_build(h.b, bl.vty, ?bl.built[0], bl.lanes)); }
+    ret take(h, builder.emit_load(h.b, bl.slot, bl.vty));
+}
+
+fun f16_vec(h: *Half, lanes: u32) ir_type.IrTypeId {
+    ret vec_of(h, f16_type(h), lanes);
+}
+
+fun carrier_vec(h: *Half, lanes: u32) ir_type.IrTypeId {
+    ret vec_of(h, h.bits_t, lanes);
+}
+
+# the lanes `a k b` of two f16 vectors, k one of OP_ADD, OP_SUB, OP_MUL and
+# OP_DIV_U, the float division
+pub fun vec_arith(h: *Half, k: instruction.InstrKind, a: value.Value, b: value.Value) value.Value {
+    var elem: ir_type.IrTypeId = ir_type.IRT_NIL;
+    val n:    u32              = vec_shape(h, a.ty, ?elem);
+    val fv:   ir_type.IrTypeId = f16_vec(h, n);
+    if (vec_packs(h, k, fv, fv, 2)) {
+        ret bitcast(h, emit_arith(h, k, bitcast(h, a, fv), bitcast(h, b, fv)), a.ty);
+    }
+    val sv: ir_type.IrTypeId = vec_of(h, float_type(h, 32), n);
+    if (through_f32(h) && vec_packs(h, instruction.OP_FP_EXT, sv, fv, 1) && vec_packs(h, instruction.OP_FP_TRUNC, fv, sv, 1)) {
+        val wa: value.Value = take(h, builder.emit_fp_ext(h.b, bitcast(h, a, fv), sv));
+        val wb: value.Value = take(h, builder.emit_fp_ext(h.b, bitcast(h, b, fv), sv));
+        ret bitcast(h, take(h, builder.emit_fp_trunc(h.b, emit_arith(h, k, wa, wb), fv)), a.ty);
+    }
+    var bl: Build = build_start(h, a.ty, n);
+    var i:  u32   = 0;
+    for (i < n) {
+        build_lane(h, ?bl, i, arith(h, k, lane_of(h, a, i, elem), lane_of(h, b, i, elem)));
+        i = i + 1;
+    }
+    ret build_end(h, ?bl);
+}
+
+fun emit_compare(h: *Half, k: instruction.InstrKind, a: value.Value, b: value.Value) value.Value {
+    if (k == instruction.OP_CMP_EQ)   { ret take(h, builder.emit_cmp_eq(h.b, a, b)); }
+    if (k == instruction.OP_CMP_NE)   { ret take(h, builder.emit_cmp_ne(h.b, a, b)); }
+    if (k == instruction.OP_CMP_LT_U) { ret take(h, builder.emit_cmp_lt_u(h.b, a, b)); }
+    ret take(h, builder.emit_cmp_le_u(h.b, a, b));
+}
+
+# the lane mask of `a k b` over two f16 vectors, k one of OP_CMP_EQ, OP_CMP_NE,
+# OP_CMP_LT_U and OP_CMP_LE_U: all ones where it holds. a comparison makes no
+# NaN and every widening is exact, so the f16 lanes, their binary32 lanes and
+# each lane's scalar comparison agree
+pub fun vec_compare(h: *Half, k: instruction.InstrKind, a: value.Value, b: value.Value, mask_ty: ir_type.IrTypeId) value.Value {
+    var elem: ir_type.IrTypeId = ir_type.IRT_NIL;
+    val n:    u32              = vec_shape(h, a.ty, ?elem);
+    val fv:   ir_type.IrTypeId = f16_vec(h, n);
+    if (vec_packs(h, k, mask_ty, fv, 2)) {
+        ret take(h, builder.emit_vcompare(h.b, k, bitcast(h, a, fv), bitcast(h, b, fv), mask_ty));
+    }
+    val sv: ir_type.IrTypeId = vec_of(h, float_type(h, 32), n);
+    val sm: ir_type.IrTypeId = vec_of(h, h.i32t, n);
+    if (vec_packs(h, instruction.OP_FP_EXT, sv, fv, 1) && vec_packs(h, k, sm, sv, 2)) {
+        val wa: value.Value = take(h, builder.emit_fp_ext(h.b, bitcast(h, a, fv), sv));
+        val wb: value.Value = take(h, builder.emit_fp_ext(h.b, bitcast(h, b, fv), sv));
+        ret take(h, builder.emit_trunc(h.b, take(h, builder.emit_vcompare(h.b, k, wa, wb, sm)), mask_ty));
+    }
+    var mask_elem: ir_type.IrTypeId = ir_type.IRT_NIL;
+    vec_shape(h, mask_ty, ?mask_elem);
+    var bl: Build = build_start(h, mask_ty, n);
+    var i:  u32   = 0;
+    for (i < n) {
+        val c: value.Value = emit_compare(h, k, compare_operand(h, lane_of(h, a, i, elem)), compare_operand(h, lane_of(h, b, i, elem)));
+        build_lane(h, ?bl, i, take(h, builder.emit_sub(h.b, value.const_int(0, mask_elem), zext(h, c, mask_elem))));
+        i = i + 1;
+    }
+    ret build_end(h, ?bl);
+}
+
+# the lane-wise `::` of a vector with f16 lanes on one side or both into
+# `dst`: `from_fp`, `from_bits` and `from_signed` describe the operand's lanes
+# and the `to_` ones the result's, as the scalar conversions above take them
+pub fun vec_convert(h: *Half, v: value.Value, dst: ir_type.IrTypeId, from_fp: bool, from_bits: u32, from_signed: bool,
+    to_fp: bool, to_bits: u32, to_signed: bool) value.Value {
+    var from_elem: ir_type.IrTypeId = ir_type.IRT_NIL;
+    var to_elem:   ir_type.IrTypeId = ir_type.IRT_NIL;
+    val n:         u32              = vec_shape(h, v.ty, ?from_elem);
+    vec_shape(h, dst, ?to_elem);
+    if (from_fp && to_fp && from_bits == 16 && to_bits > 16) {
+        val fv: ir_type.IrTypeId = f16_vec(h, n);
+        if (vec_packs(h, instruction.OP_FP_EXT, dst, fv, 1)) { ret take(h, builder.emit_fp_ext(h.b, bitcast(h, v, fv), dst)); }
+    }
+    if (from_fp && to_fp && to_bits == 16 && from_bits > 16) {
+        val fv: ir_type.IrTypeId = f16_vec(h, n);
+        if (vec_packs(h, instruction.OP_FP_TRUNC, fv, v.ty, 1)) { ret bitcast(h, take(h, builder.emit_fp_trunc(h.b, v, fv)), dst); }
+    }
+    var bl: Build = build_start(h, dst, n);
+    var i:  u32   = 0;
+    for (i < n) {
+        val x: value.Value = lane_of(h, v, i, from_elem);
+        var y: value.Value = x;
+        if (from_fp && from_bits == 16 && to_fp) { y = to_float(h, x, to_bits); }
+        or (from_fp && from_bits == 16)          { y = to_int(h, x, to_elem, to_bits, to_signed); }
+        or (from_fp)                             { y = from_float(h, x, from_bits); }
+        or                                       { y = from_int(h, x, from_bits, from_signed); }
+        build_lane(h, ?bl, i, y);
+        i = i + 1;
+    }
+    ret build_end(h, ?bl);
 }

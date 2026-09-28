@@ -7,17 +7,20 @@
 #
 # usage: test/run.sh [--target <t>]... [--case <group>/<name>]...
 #                    [--qemu] [--link] [--dwarf] [--incremental] [--docs]
+#                    [--f16proof [--shard <i>/<n>]]
 #
 # per case and target: build in release; on a target this host can execute, build
 # at O0 and O2, run both, and compare the checksums to the C reference built from
 # test/ref/<group>/<case>.c. spirv is built and validated with spirv-val. a case
 # named in test/cases/SKIPS.<target> is not built for that target; one named in
 # its NORUN.<target> is built and its differential disagreement is not a failure.
+# a case with no C reference is held instead to the column its EXACT.<target>
+# line names, and is served only where such a line names it.
 #
 #   --target <t>   one target (repeatable); default every target
 #   --case <g/n>   one case (repeatable)
-#   --qemu         execute aarch64-linux, riscv64-linux, riscv64zkt-linux and riscv32 under
-#                  qemu-user when this host cannot run them natively
+#   --qemu         execute aarch64-linux, aarch64fp16-linux, riscv64-linux, riscv64zkt-linux,
+#                  riscv64zfh-linux and riscv32 under qemu-user when this host cannot run them natively
 #                  (a missing emulator is announced and its target is only built)
 #   --link         run the link cases (test/link/cases) instead of the corpus
 #   --dwarf        build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
@@ -25,6 +28,10 @@
 #   --docs         compile every mach block in doc/language, check it against mach fmt and run each one with a main
 #                  (--case <page> selects one page, such as --case operators; one hosted
 #                  --target compiles for it instead of the host, running only natively)
+#   --f16proof     the exhaustive f16 proof (test/f16proof, #3804) instead of the corpus: every
+#                  f16 operation against a correctly rounded reference, on the f16 columns
+#                  (--case <mode> selects one mode, such as --case add)
+#   --shard <i>/<n>  with --f16proof, the i-th of n equal slices of every mode's domain (default 0/1)
 #   MACH           the compiler under test, default out/<host>/debug/bin/mach
 #   DOCS           the pages --docs reads, default doc/language
 set -u
@@ -49,8 +56,10 @@ targets_all='
 x86_64-linux      x86_64      linux         sysv64   -    bin     hosted  -             -
 x86_64v3-linux    x86_64      linux         sysv64   -    bin     hosted  -             x86-64-v3
 aarch64-linux     aarch64     linux         aapcs64  -    bin     hosted  qemu-aarch64  -
+aarch64fp16-linux aarch64     linux         aapcs64  -    bin     hosted  qemu-aarch64  fp16
 riscv64-linux     riscv64     linux         lp64d    -    bin     hosted  qemu-riscv64  -
 riscv64zkt-linux  rv64gc_zkt  linux         lp64d    -    bin     hosted  qemu-riscv64  -
+riscv64zfh-linux  rv64gc_zfh  linux         lp64d    -    bin     hosted  qemu-riscv64  -
 x86_64-windows    x86_64      windows       win64    -    bin     hosted  -             -
 x86_64-darwin     x86_64      darwin        sysv64   -    bin     hosted  -             -
 aarch64-darwin    aarch64     darwin        aapcs64  -    bin     hosted  -             -
@@ -67,6 +76,7 @@ want_cases=
 qemu=0
 mode=corpus
 dwarf=0
+shard=0/1
 while [ $# -gt 0 ]; do
     case "$1" in
         --target) shift; [ $# -gt 0 ] || usage; want_targets="$want_targets $1" ;;
@@ -75,6 +85,8 @@ while [ $# -gt 0 ]; do
         --link)   mode=link ;;
         --incremental) mode=incremental ;;
         --docs)   mode=docs ;;
+        --f16proof) mode=f16proof ;;
+        --shard)  shift; [ $# -gt 0 ] || usage; shard=$1 ;;
         --dwarf)  dwarf=1 ;;
         -h|--help) usage ;;
         *) echo "run.sh: unknown option '$1'" >&2; usage ;;
@@ -169,6 +181,8 @@ if [ "$mode" = docs ]; then
     for c in $want_cases; do
         [ -f "$docs/$c.md" ] || { echo "run.sh: no such page '$docs/$c.md'" >&2; exit 2; }
     done
+elif [ "$mode" = f16proof ]; then
+    cases=
 elif [ -n "$want_cases" ]; then
     cases=
     for c in $want_cases; do
@@ -199,7 +213,19 @@ listed() {
 # SKIPS and NORUN are claims about a case and are checked, not trusted: a skipped
 # case that builds and a norun case whose differential agrees are stale lines, and
 # the run fails on them. ONLY is a decision about the column, not a claim, so it is not.
-served()  { [ ! -f "$here/cases/ONLY.$1" ] || listed ONLY "$1" "$2"; }
+# exact_base <target> <case>: the column an EXACT.<target> line holds the case to
+exact_base() {
+    [ -f "$here/cases/EXACT.$1" ] || return 1
+    while read -r pat base rest; do
+        case "$pat" in ''|\#*) continue ;; esac
+        case "$2" in $pat) echo "$base"; return 0 ;; esac
+    done <"$here/cases/EXACT.$1"
+    return 1
+}
+served() {
+    [ -f "$here/ref/$2.c" ] || exact_base "$1" "$2" >/dev/null || return 1
+    [ ! -f "$here/cases/ONLY.$1" ] || listed ONLY "$1" "$2"
+}
 skipped() { listed SKIPS "$1" "$2"; }
 norun()   { listed NORUN "$1" "$2"; }
 
@@ -329,9 +355,15 @@ build() {
 # 0 when both agree, otherwise 1 with the disagreement in why
 differential() {
     t=$1; c=$2; eng=$3
-    ref=$(reference "$c" 2>"$out/log/ref.$(art "$c").err") || {
-        why="reference: $(cat "$out/log/ref.$(art "$c").err")"; return 1
-    }
+    if xb=$(exact_base "$t" "$c"); then
+        ref=$(exact_reference "$xb" "$c" 2>"$out/log/exact.$t.$(art "$c").err") || {
+            why="$xb reference: $(cat "$out/log/exact.$t.$(art "$c").err")"; return 1
+        }
+    else
+        ref=$(reference "$c" 2>"$out/log/ref.$(art "$c").err") || {
+            why="reference: $(cat "$out/log/ref.$(art "$c").err")"; return 1
+        }
+    fi
     # a hosted o2 build above is already the run bin, a direct one is not
     for p in o0 o2; do
         if { [ "$p" = o0 ] || runs_bare "$t"; } && ! build "$t" "$p" "$c" run; then
@@ -352,9 +384,28 @@ differential() {
         fi
         if [ "$rc" -ne 0 ]; then why="$p: exit $rc"; return 1; fi
         if [ -s "$out/log/$t.$p.$(art "$c").err" ]; then why="$p: wrote to stderr"; return 1; fi
-        if [ "$got" != "$ref" ]; then why="$p: mach says $got, C reference says $ref"; return 1; fi
+        if [ "$got" != "$ref" ]; then why="$p: mach says $got, the reference says $ref"; return 1; fi
     done
     return 0
+}
+
+# exact_reference <base> <case>: the base column's own answer, which its O0 and
+# O2 builds must agree on; the base runs under its own engine on this host. it
+# runs in a substitution, so a refusal is its stderr
+exact_reference() {
+    xt=$1; xc=$2; xeng=$(engine "$xt")
+    [ "$xeng" != - ] || { echo "this host cannot run $xt" >&2; return 1; }
+    xans=
+    for xp in o0 o2; do
+        build "$xt" "$xp" "$xc" run || { echo "build $xp: $(first_error "$(log_of "$xt" "$xp" "$xc" run)")" >&2; return 1; }
+        xo=$out/log/$xt.$xp.$(art "$xc").out
+        timeout 60 $xeng "$(artifact "$xt" "$xp" "$xc" run)" >"$xo" 2>/dev/null; xrc=$?
+        [ "$xrc" -eq 0 ] || { echo "$xp: exit $xrc" >&2; return 1; }
+        xv=$(tr -d '\0' <"$xo")
+        [ -z "$xans" ] || [ "$xv" = "$xans" ] || { echo "its O0 and O2 disagree ($xans vs $xv)" >&2; return 1; }
+        xans=$xv
+    done
+    echo "$xans"
 }
 
 # log_of <target> <profile> <case> [run]
@@ -983,6 +1034,120 @@ if [ "$mode" = docs ]; then
         done
     done
     echo "docs: $total blocks, $compiled compiled ($ran run), $errors error, $fragments fragment"
+fi
+
+# the exhaustive f16 proof (#3804): test/f16proof's subject, built for each f16
+# column at O2, writes every result of a mode over its slice of the mode's
+# domain, and test/f16proof/check.c holds each one to a correctly rounded
+# reference computed in integers, NaNs by the target's rule. every pair of
+# f16 operands for + - * / (2^32 per operation), every f16 for the widenings
+# and the f16 to integer conversions, every binary32 and every 32-bit integer
+# for the narrowings, and every binary64 high word with a low word of 0 and 1.
+# each arithmetic mode also checks the operation widened to binary32 and to
+# binary64 by hand and narrowed once, the question which width suffices, and
+# two mutations that must go red: narrowed twice through 13 bits, and
+# truncated before the narrowing. --shard i/n takes the i-th of n equal slices
+# of every domain, and each slice runs as $JOBS pieces in parallel.
+
+# f16proof_rule <target>: the NaN rule check.c applies
+f16proof_rule() {
+    case "$(target_field "$1" 2)" in
+        x86_64*) echo x86 ;;
+        aarch64*) echo arm ;;
+        rv64*|riscv64*) echo riscv ;;
+        *) echo - ;;
+    esac
+}
+# f16proof_domain <mode>: how many inputs the mode's outer loop runs over
+f16proof_domain() {
+    case "$1" in
+        narrow32|narrow64|int32) echo 4294967296 ;;
+        *) echo 65536 ;;
+    esac
+}
+
+if [ "$mode" = f16proof ]; then
+    proof=$here/f16proof
+    pout=$out/f16proof
+    f16proof_modes='add sub mul div narrow32 narrow64 int32 int16 widen toint'
+    f16proof_columns='x86_64-linux x86_64v3-linux aarch64-linux aarch64fp16-linux riscv64-linux riscv64zfh-linux'
+    [ -n "$want_targets" ] || targets=$f16proof_columns
+    for t in $targets; do
+        case " $f16proof_columns " in *" $t "*) ;; *) echo "run.sh: --f16proof has no column '$t' (it has: $f16proof_columns)" >&2; exit 2 ;; esac
+    done
+    modes=$f16proof_modes
+    if [ -n "$want_cases" ]; then
+        modes=
+        for m in $want_cases; do
+            case " $f16proof_modes " in *" $m "*) modes="$modes $m" ;; *) echo "run.sh: --f16proof has no mode '$m' (it has: $f16proof_modes)" >&2; exit 2 ;; esac
+        done
+    fi
+    case "$shard" in
+        [0-9]*/[0-9]*) shard_i=${shard%/*}; shard_n=${shard#*/} ;;
+        *) echo "run.sh: --shard takes <i>/<n>" >&2; exit 2 ;;
+    esac
+    [ "$shard_n" -ge 1 ] && [ "$shard_i" -lt "$shard_n" ] || { echo "run.sh: --shard $shard is not a slice" >&2; exit 2; }
+    need_tool "${CC:-cc}" "--f16proof"
+    jobs_max=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
+    rm -rf "$pout"
+    mkdir -p "$pout/log"
+    echo "shard:   $shard, $jobs_max pieces at a time"
+    echo "modes:  $modes"
+    if ! ${CC:-cc} -std=c11 -O2 -Wall -Wextra -Werror -o "$pout/check" "$proof/check.c" >"$pout/log/check.log" 2>&1; then
+        fail "f16proof: cc failed to build the reference: $(first_error "$pout/log/check.log")"
+    elif ! (cd "$proof" && "$mach" dep pull .) >"$pout/log/dep.log" 2>&1; then
+        fail "f16proof: dep pull: $(first_error "$pout/log/dep.log")"
+    else
+        for t in $targets; do
+            eng=$(engine "$t")
+            if [ "$eng" = - ]; then
+                fail "f16proof $t: this host cannot run it (qemu columns need --qemu)"; continue
+            fi
+            echo "target:  $t (${eng:-native}, NaN rule $(f16proof_rule "$t"))"
+            if ! "$mach" build "$proof" --target "$t" --profile o2 >"$pout/log/$t.build.log" 2>&1; then
+                fail "f16proof $t build: $(first_error "$pout/log/$t.build.log")"; continue
+            fi
+            bin=$proof/out/$t/o2/bin/f16proof
+            for m in $modes; do
+                dom=$(f16proof_domain "$m")
+                lo=$((dom * shard_i / shard_n)); hi=$((dom * (shard_i + 1) / shard_n))
+                pids=
+                p=0
+                for p in $(seq 0 $((jobs_max - 1))); do
+                    plo=$((lo + (hi - lo) * p / jobs_max)); phi=$((lo + (hi - lo) * (p + 1) / jobs_max))
+                    [ "$plo" -lt "$phi" ] || continue
+                    piece=$pout/log/$t.$m.$p
+                    (set -o pipefail; $eng "$bin" "$m" "$plo" "$phi" | "$pout/check" "$m" "$plo" "$phi" "$(f16proof_rule "$t")") >"$piece.out" 2>"$piece.err" &
+                    pids="$pids $!:$p"
+                done
+                bad=
+                for pp in $pids; do
+                    wait "${pp%%:*}" || bad="$bad ${pp#*:}"
+                done
+                if [ -n "$bad" ]; then
+                    for p in $bad; do fail "f16proof $t $m piece $p: $(head -n1 "$pout/log/$t.$m.$p.err")"; done
+                    continue
+                fi
+                grep -h '^mismatch ' "$pout/log/$t.$m".*.out | head -n 5 | sed "s/^/  $t /"
+                # one line per variant: its cases and mismatches summed over the pieces
+                awk '$1 == "result" { k = $3 " " $4; if (!(k in c)) o[n++] = k; c[k] += $5; x[k] += $6 }
+                     END { for (i = 0; i < n; i++) print o[i], c[o[i]], x[o[i]] }' "$pout/log/$t.$m".*.out >"$pout/log/$t.$m.sum"
+                [ -s "$pout/log/$t.$m.sum" ] || { fail "f16proof $t $m: the reference reported nothing"; continue; }
+                while read -r variant role cases mism; do
+                    line="$t $m $variant: $cases cases, $mism mismatches"
+                    if [ "$role" = proof ] && [ "$mism" -eq 0 ]; then
+                        echo "proof    $line"; passes=$((passes + 1))
+                    elif [ "$role" = control ] && [ "$mism" -gt 0 ]; then
+                        echo "control  $line (red, as a mutation must be)"; passes=$((passes + 1))
+                    elif [ "$role" = control ]; then
+                        fail "f16proof $line: the mutation went unnoticed"
+                    else
+                        fail "f16proof $line"
+                    fi
+                done <"$pout/log/$t.$m.sum"
+            done
+        done
+    fi
 fi
 
 tail=; [ "$unruns" -eq 0 ] || tail=", $unruns differential not run"

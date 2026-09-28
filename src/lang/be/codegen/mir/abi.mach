@@ -705,6 +705,13 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
 
     val rslot: abi.ParamSlot = layout.ret_slot;
 
+    # the call's own lane is its first vector operand's, which is no piece's in
+    # particular: each argument and the result carry their own type's lane, and
+    # every other instruction here is scalar
+    val call_lane: u32 = ctx.cur_vec_lane;
+    fin { ctx.cur_vec_lane = call_lane; }
+    ctx.cur_vec_lane = mir.VEC_LANE_NONE;
+
     val sig_it:    opt[*type.IrType] = type.get(ctx.types, sig);
     var sig_is_fn: bool              = false;
     var sig_is_va: bool              = false;
@@ -837,6 +844,7 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         record_outgoing_align(ctx, ?slot);
         # the carriers, the caller's copy and every temporary between them are secret when any byte of the object is
         ctx.cur_writes_secret = av.secret;
+        ctx.cur_vec_lane      = context.vec_lane_for_type(ctx, av.ty);
         var er: err[fail.Fail] = err[fail.Fail].ok{};
         if (slot.class == abi.CLASS_STACK && context.vector_image(ctx, context.sig_param_type(ctx, sig, pidx), av.ty)) {
             er = emit_stack_image_arg(ctx, mb, slot, argop, soff);
@@ -849,6 +857,7 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
                 natural_stack_slot(ctx.tgt, pidx >= layout.param_count), ext);
         }
         ctx.cur_writes_secret = false;
+        ctx.cur_vec_lane      = mir.VEC_LANE_NONE;
         if (sel er.err) {
             sig_layout_free(ctx, ?layout);
             ret er;
@@ -922,6 +931,7 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     if (sel pc.err) { ret pc; }
 
     val dst: mir.VRegId = context.instr_vreg(ctx, iid);
+    ctx.cur_vec_lane = context.vec_lane_for_type(ctx, inst.ty);
     if (ret_register_image) {
         ctx.cur_writes_secret = inst.secret;
         val rr: err[fail.Fail] = capture_register_image(ctx, mb, rslot, dst);
@@ -1352,13 +1362,9 @@ fun caller_widens(tgt: *target.Target, ext: type.IntExt, size: u64) bool {
 }
 
 # the value is moved into a general register first, as the register move
-# without widening does, since it may live in another bank or in memory. the
-# widening is scalar even inside a call that also passes a vector
+# without widening does, since it may live in another bank or in memory
 fun widen_arg(ctx: *context.LowerCtx, mb: *mir.MirBlock, argop: mir.MirOperand, size: u64,
     ext: type.IntExt) res[mir.MirOperand, fail.Fail] {
-    val lane: u32 = ctx.cur_vec_lane;
-    ctx.cur_vec_lane = mir.VEC_LANE_NONE;
-    fin { ctx.cur_vec_lane = lane; }
     var src: mir.MirOperand = argop;
     if (argop.kind != mir.MIR_OP_IMM) {
         val gr: res[mir.VRegId, fail.Fail] = context.new_vreg(ctx, mir.REG_CLASS_GP);
@@ -1954,6 +1960,15 @@ pub fun lower_params(ctx: *context.LowerCtx, mb: *mir.MirBlock) err[fail.Fail] {
             ret mv;
         }
         ctx.sret_vreg = sv;
+        val found: res[opt[id.InstructionId], fail.Fail] = result_image(ctx, ret_type);
+        if (sel found.err) {
+            sig_layout_free(ctx, ?layout);
+            ret err[fail.Fail].err{found.err};
+        }
+        if (sel found.ok.some) {
+            ctx.result_image    = found.ok.some;
+            ctx.result_in_place = true;
+        }
     }
 
     var bound: u32 = ctx.param_count;
@@ -2157,6 +2172,120 @@ fun instr_names_param(fn: *ir.Function, iid: id.InstructionId, param_ix: u32) bo
     ret false;
 }
 
+# the alloca every return of the function returns, when the caller's result
+# storage can stand in for it: of the returned size at no stricter alignment,
+# and its address used only to load, store or clear through, directly or by
+# an element address, so nothing else observes which storage it is (#4120)
+fun result_image(ctx: *context.LowerCtx, ret_type: type.IrTypeId) res[opt[id.InstructionId], fail.Fail] {
+    val fn:   *ir.Function          = ctx.fn;
+    val none: opt[id.InstructionId] = opt[id.InstructionId].none{};
+    var cand: id.InstructionId      = id.INSTR_NIL;
+    var bi:   u32                   = 0;
+    for (bi < fn.block_count) {
+        val t: id.InstructionId = fn.blocks[bi].terminator;
+        if (t != id.INSTR_NIL && fn.instrs[t::u32].kind == instruction.OP_RET && fn.instrs[t::u32].operand_count > 0) {
+            val rv: value.Value = fn.instrs[t::u32].operands[0];
+            if (rv.kind != value.VAL_INSTR)                    { ret res[opt[id.InstructionId], fail.Fail].ok{none}; }
+            if (cand != id.INSTR_NIL && rv.data.instr != cand) { ret res[opt[id.InstructionId], fail.Fail].ok{none}; }
+            cand = rv.data.instr;
+        }
+        bi = bi + 1;
+    }
+    if (cand == id.INSTR_NIL || cand::u32 >= fn.instr_len) { ret res[opt[id.InstructionId], fail.Fail].ok{none}; }
+    val a: *instruction.Instruction = ?fn.instrs[cand::u32];
+    if (a.kind != instruction.OP_ALLOCA || a.operand_count == 0 || a.operands[0].kind != value.VAL_CONST_INT) {
+        ret res[opt[id.InstructionId], fail.Fail].ok{none};
+    }
+    val size: u64 = type.byte_size_for_machine(ctx.types, a.aux_ty, ctx.layout)::u64 * a.operands[0].data.int_lit;
+    if (size != type.byte_size_for_machine(ctx.types, ret_type, ctx.layout)::u64
+        || type.byte_align_for_machine(ctx.types, a.aux_ty, ctx.layout) > context.ret_align(ctx, ret_type)) {
+        ret res[opt[id.InstructionId], fail.Fail].ok{none};
+    }
+
+    # the alloca and every element address formed from it
+    val rd: res[*bool, A.Error] = A.allocate[bool](ctx.alloc, fn.instr_len::usize);
+    if (sel rd.err) { ret res[opt[id.InstructionId], fail.Fail].err{fail.refused(rd.err)}; }
+    val derived: *bool = rd.ok;
+    fin { A.deallocate[bool](ctx.alloc, derived, fn.instr_len::usize); }
+    var i: u32 = 0;
+    for (i < fn.instr_len) {
+        derived[i] = false;
+        i          = i + 1;
+    }
+    derived[cand::u32] = true;
+    var grew: bool = true;
+    for (grew) {
+        grew = false;
+        bi   = 0;
+        for (bi < fn.block_count) {
+            var k: u32 = 0;
+            for (k < fn.blocks[bi].instr_count) {
+                val g:  id.InstructionId         = fn.blocks[bi].instructions[k];
+                val gi: *instruction.Instruction = ?fn.instrs[g::u32];
+                if (gi.kind == instruction.OP_GEP && !derived[g::u32] && gi.operand_count > 0
+                    && reads_derived(gi.operands[0], derived)) {
+                    derived[g::u32] = true;
+                    grew            = true;
+                }
+                k = k + 1;
+            }
+            bi = bi + 1;
+        }
+    }
+
+    bi = 0;
+    for (bi < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[bi];
+        var k:   u32       = 0;
+        for (k < blk.phi_count) {
+            if (!uses_derived_in_place(?fn.instrs[blk.phis[k]::u32], derived)) { ret res[opt[id.InstructionId], fail.Fail].ok{none}; }
+            k = k + 1;
+        }
+        k = 0;
+        for (k < blk.instr_count) {
+            if (!uses_derived_in_place(?fn.instrs[blk.instructions[k]::u32], derived)) { ret res[opt[id.InstructionId], fail.Fail].ok{none}; }
+            k = k + 1;
+        }
+        if (blk.terminator != id.INSTR_NIL && fn.instrs[blk.terminator::u32].kind != instruction.OP_RET
+            && !uses_derived_in_place(?fn.instrs[blk.terminator::u32], derived)) {
+            ret res[opt[id.InstructionId], fail.Fail].ok{none};
+        }
+        bi = bi + 1;
+    }
+    ret res[opt[id.InstructionId], fail.Fail].ok{opt[id.InstructionId].some{cand}};
+}
+
+fun reads_derived(v: value.Value, derived: *bool) bool {
+    ret v.kind == value.VAL_INSTR && v.data.instr != id.INSTR_NIL && derived[v.data.instr::u32];
+}
+
+# every operand of `inst` that names the storage is an address it loads,
+# stores or clears through, or the base of an element address
+fun uses_derived_in_place(inst: *instruction.Instruction, derived: *bool) bool {
+    var o: u32 = 0;
+    for (o < inst.operand_count) {
+        if (reads_derived(inst.operands[o], derived)) {
+            val k:       instruction.InstrKind = inst.kind;
+            val through: bool                  = (k == instruction.OP_LOAD && o == 0) || (k == instruction.OP_STORE && o == 1)
+                || (k == instruction.OP_MEMZERO && o == 0) || (k == instruction.OP_GEP && o == 0);
+            if (!through) { ret false; }
+        }
+        o = o + 1;
+    }
+    ret true;
+}
+
+# the returned value written to the result storage the caller passed
+fun store_result(ctx: *context.LowerCtx, mb: *mir.MirBlock, rv: value.Value, rvop: mir.MirOperand, rt: type.IrTypeId, rsz: u64, rag: bool) err[fail.Fail] {
+    if (context.value_is_vector(ctx, rv.ty)) {
+        ret context.store_subwidth_vector(ctx, mb, mir.op_mem_value(ctx.sret_vreg, 0), rvop, rt);
+    }
+    if (rag || context.value_is_vector(ctx, rt)) {
+        ret context.copy_aggregate(ctx, mb, mir.op_mem_value(ctx.sret_vreg, 0), rvop, rsz);
+    }
+    ret context.emit_store_to_w(ctx, mb, mir.op_mem_value(ctx.sret_vreg, 0), rvop, rsz::u8);
+}
+
 pub fun lower_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.Instruction) err[fail.Fail] {
     if (inst.operand_count == 0) {
         ret emit_bare_ret(ctx, mb);
@@ -2190,16 +2319,9 @@ pub fun lower_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.
         if (mir.vreg_is_nil(ctx.sret_vreg)) {
             ret err[fail.Fail].err{fail.message("mir.lower_ir: sret return without a captured result-storage pointer")};
         }
-        if (context.value_is_vector(ctx, rv.ty)) {
-            val sr: err[fail.Fail] = context.store_subwidth_vector(ctx, mb, mir.op_mem_value(ctx.sret_vreg, 0), rvop, rt);
-            if (sel sr.err) { ret sr; }
-        }
-        or (rag || context.value_is_vector(ctx, rt)) {
-            val cr: err[fail.Fail] = context.copy_aggregate(ctx, mb, mir.op_mem_value(ctx.sret_vreg, 0), rvop, rsz);
-            if (sel cr.err) { ret cr; }
-        }
-        or {
-            val sr: err[fail.Fail] = context.emit_store_to_w(ctx, mb, mir.op_mem_value(ctx.sret_vreg, 0), rvop, rsz::u8);
+        # a value built in the result storage is already there
+        if (rv.kind != value.VAL_INSTR || !context.is_result_image(ctx, rv.data.instr)) {
+            val sr: err[fail.Fail] = store_result(ctx, mb, rv, rvop, rt, rsz, rag);
             if (sel sr.err) { ret sr; }
         }
         val mr: err[fail.Fail] = move_address(ctx, mb, mir.op_preg(slot.reg), mir.op_vreg(ctx.sret_vreg));

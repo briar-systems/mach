@@ -192,6 +192,14 @@ pub fun sig_return_type(ctx: *LowerCtx, sig: ir_type.IrTypeId) ir_type.IrTypeId;
 
 the return type of a signature, IRT_NIL for a type that is not a function's
 
+## fun is_result_image
+
+```mach
+pub fun is_result_image(ctx: *LowerCtx, iid: id.InstructionId) bool;
+```
+
+the alloca `iid` is the result storage the caller passed (#4120)
+
 ## fun ret_align
 
 ```mach

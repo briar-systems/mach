@@ -71,3 +71,22 @@ pub fun is_invariant(la: *LoopAnalysis, loop_ix: u32, v: value.Value) bool;
 pub fun set_instr_block(la: *LoopAnalysis, iid: id.InstructionId, b: id.BlockId) err[fail.Fail];
 ```
 
+## fun induction
+
+```mach
+pub fun induction(la: *LoopAnalysis, fn: *ir.Function, loop_ix: u32, phi_id: id.InstructionId, out: *InductionVar) bool;
+```
+
+whether a header phi is an induction, entered as `init` from the preheader
+and stepped by an invariant `step` on the latch, recognized as the loop's
+own iv is
+
+## fun innermost_first
+
+```mach
+pub fun innermost_first(la: *LoopAnalysis, order: *u32);
+```
+
+the loop indices deepest first, so a pass that moves code outward meets an
+inner loop before the loop around it
+

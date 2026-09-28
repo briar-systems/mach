@@ -60,5 +60,23 @@ uint64_t checksum(uint64_t seed) {
     h = mix_i128(h, (corpus_i128)(1.5e38 + (double)seed));
     h = mix_i128(h, (corpus_i128)(-1.5e38 - (double)seed));
     h = mix_u128(h, (corpus_u128)(float)1.0e20);
+
+    const corpus_u128 lit_2p64 = (corpus_u128)1 << 64;
+    const corpus_u128 lit_1e19 = (corpus_u128)UINT64_C(10000000000000000000);
+    const corpus_i128 lit_neg_2p64 = -((corpus_i128)1 << 64);
+    const corpus_u128 lit_u128_max = ~(corpus_u128)0;
+    const corpus_i128 lit_i128_max = (corpus_i128)(lit_u128_max >> 1);
+    const corpus_i128 lit_i128_min = -lit_i128_max - 1;
+    for (int pass = 0; pass < 2; pass++) {
+        const uint64_t s = pass ? seed : 0;
+        h = mix_u128(h, lit_2p64 ^ (corpus_u128)s);
+        h = mix_u128(h, lit_1e19 ^ (corpus_u128)s);
+        h = mix_i128(h, lit_neg_2p64 ^ (corpus_i128)s);
+        h = mix_u128(h, lit_u128_max ^ (corpus_u128)s);
+        h = mix_i128(h, lit_i128_max ^ (corpus_i128)s);
+        h = mix_i128(h, lit_i128_min ^ (corpus_i128)s);
+        h = mix_u64(h, UINT64_MAX ^ s);
+        h = mix_u64(h, 0 ^ s);
+    }
     return h;
 }

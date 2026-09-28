@@ -1,5 +1,13 @@
 # mach.lang.me.pass.widehelper
 
+the helpers the compiler provides with the program for an operation on an
+integer wider than the target's ALU that no target has an instruction for:
+division and remainder (widediv) and the float conversions (wideconv). a
+helper is an ordinary function of the module that needs it, weak so every
+module's copy coalesces at link, as a generic instantiation does, and never
+inlined so a program pays for the code once. this module holds what the two
+passes share: the width test and the function synthesis (#3511)
+
 ## val INLINE_BITS
 
 ```mach

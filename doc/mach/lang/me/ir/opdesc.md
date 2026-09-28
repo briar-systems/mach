@@ -357,175 +357,199 @@ pub def IrVecOp: u8
 ## val IVEC_NONE
 
 ```mach
-pub val IVEC_NONE:       IrVecOp = 0
+pub val IVEC_NONE:        IrVecOp = 0
 ```
 
 ## val IVEC_ADD
 
 ```mach
-pub val IVEC_ADD:        IrVecOp = 1
+pub val IVEC_ADD:         IrVecOp = 1
 ```
 
 ## val IVEC_SUB
 
 ```mach
-pub val IVEC_SUB:        IrVecOp = 2
+pub val IVEC_SUB:         IrVecOp = 2
 ```
 
 ## val IVEC_MUL
 
 ```mach
-pub val IVEC_MUL:        IrVecOp = 3
+pub val IVEC_MUL:         IrVecOp = 3
 ```
 
 ## val IVEC_DIV
 
 ```mach
-pub val IVEC_DIV:        IrVecOp = 4
+pub val IVEC_DIV:         IrVecOp = 4
 ```
 
 ## val IVEC_AND
 
 ```mach
-pub val IVEC_AND:        IrVecOp = 5
+pub val IVEC_AND:         IrVecOp = 5
 ```
 
 ## val IVEC_OR
 
 ```mach
-pub val IVEC_OR:         IrVecOp = 6
+pub val IVEC_OR:          IrVecOp = 6
 ```
 
 ## val IVEC_XOR
 
 ```mach
-pub val IVEC_XOR:        IrVecOp = 7
+pub val IVEC_XOR:         IrVecOp = 7
 ```
 
 ## val IVEC_NOT
 
 ```mach
-pub val IVEC_NOT:        IrVecOp = 8
+pub val IVEC_NOT:         IrVecOp = 8
 ```
 
 ## val IVEC_NEG
 
 ```mach
-pub val IVEC_NEG:        IrVecOp = 9
+pub val IVEC_NEG:         IrVecOp = 9
 ```
 
 ## val IVEC_SHL
 
 ```mach
-pub val IVEC_SHL:        IrVecOp = 10
+pub val IVEC_SHL:         IrVecOp = 10
 ```
 
 ## val IVEC_SHR_U
 
 ```mach
-pub val IVEC_SHR_U:      IrVecOp = 11
+pub val IVEC_SHR_U:       IrVecOp = 11
 ```
 
 ## val IVEC_CMP
 
 ```mach
-pub val IVEC_CMP:        IrVecOp = 12
+pub val IVEC_CMP:         IrVecOp = 12
 ```
 
 ## val IVEC_TRUNC
 
 ```mach
-pub val IVEC_TRUNC:      IrVecOp = 13
+pub val IVEC_TRUNC:       IrVecOp = 13
 ```
 
 ## val IVEC_SEXT
 
 ```mach
-pub val IVEC_SEXT:       IrVecOp = 14
+pub val IVEC_SEXT:        IrVecOp = 14
 ```
 
 ## val IVEC_ZEXT
 
 ```mach
-pub val IVEC_ZEXT:       IrVecOp = 15
+pub val IVEC_ZEXT:        IrVecOp = 15
 ```
 
 ## val IVEC_FP_TRUNC
 
 ```mach
-pub val IVEC_FP_TRUNC:   IrVecOp = 16
+pub val IVEC_FP_TRUNC:    IrVecOp = 16
 ```
 
 ## val IVEC_FP_EXT
 
 ```mach
-pub val IVEC_FP_EXT:     IrVecOp = 17
+pub val IVEC_FP_EXT:      IrVecOp = 17
 ```
 
 ## val IVEC_FP_TO_SI
 
 ```mach
-pub val IVEC_FP_TO_SI:   IrVecOp = 18
+pub val IVEC_FP_TO_SI:    IrVecOp = 18
 ```
 
 ## val IVEC_FP_TO_UI
 
 ```mach
-pub val IVEC_FP_TO_UI:   IrVecOp = 19
+pub val IVEC_FP_TO_UI:    IrVecOp = 19
 ```
 
 ## val IVEC_SI_TO_FP
 
 ```mach
-pub val IVEC_SI_TO_FP:   IrVecOp = 20
+pub val IVEC_SI_TO_FP:    IrVecOp = 20
 ```
 
 ## val IVEC_UI_TO_FP
 
 ```mach
-pub val IVEC_UI_TO_FP:   IrVecOp = 21
+pub val IVEC_UI_TO_FP:    IrVecOp = 21
 ```
 
 ## val IVEC_MUL_WIDE_S
 
 ```mach
-pub val IVEC_MUL_WIDE_S: IrVecOp = 22
+pub val IVEC_MUL_WIDE_S:  IrVecOp = 22
 ```
 
 ## val IVEC_MUL_WIDE_U
 
 ```mach
-pub val IVEC_MUL_WIDE_U: IrVecOp = 23
+pub val IVEC_MUL_WIDE_U:  IrVecOp = 23
 ```
 
 ## val IVEC_WIDEN_S
 
 ```mach
-pub val IVEC_WIDEN_S:    IrVecOp = 24
+pub val IVEC_WIDEN_S:     IrVecOp = 24
 ```
 
 ## val IVEC_WIDEN_U
 
 ```mach
-pub val IVEC_WIDEN_U:    IrVecOp = 25
+pub val IVEC_WIDEN_U:     IrVecOp = 25
 ```
 
 ## val IVEC_SHR_S
 
 ```mach
-pub val IVEC_SHR_S:      IrVecOp = 26
+pub val IVEC_SHR_S:       IrVecOp = 26
 ```
 
 ## val IVEC_RANGE
 
 ```mach
-pub val IVEC_RANGE:      IrVecOp = 27
+pub val IVEC_RANGE:       IrVecOp = 27
 ```
 
 ## val IVEC_CONCAT
 
 ```mach
-pub val IVEC_CONCAT:     IrVecOp = 28
+pub val IVEC_CONCAT:      IrVecOp = 28
+```
+
+## val IVEC_MUL_HIGH_S
+
+```mach
+pub val IVEC_MUL_HIGH_S:  IrVecOp = 29
+```
+
+## val IVEC_MUL_HIGH_U
+
+```mach
+pub val IVEC_MUL_HIGH_U:  IrVecOp = 30
+```
+
+## val IVEC_INTERLEAVE
+
+```mach
+pub val IVEC_INTERLEAVE:  IrVecOp = 31
+```
+
+## val IVEC_WIDEN_SUM_U
+
+```mach
+pub val IVEC_WIDEN_SUM_U: IrVecOp = 32
 ```
 
 ## def VecClass
@@ -606,6 +630,15 @@ pub val VCLASS_CONCAT: VecClass = 9
 ```
 
 a lane join: the result has the operands' lanes in turn, all of its lane type
+
+## val VCLASS_WIDEN_SUM
+
+```mach
+pub val VCLASS_WIDEN_SUM: VecClass = 10
+```
+
+a widening group sum: the result lanes are wider and fewer, each the sum of
+the operand lanes it covers
 
 ## def CtClass
 
@@ -781,6 +814,12 @@ pub val LOWER_VEC_CONCAT:  LowerRoute = 21
 pub val LOWER_SELECT:      LowerRoute = 22
 ```
 
+## val LOWER_CONST
+
+```mach
+pub val LOWER_CONST:       LowerRoute = 23
+```
+
 ## val OP_MAX_FIXED_OPERANDS
 
 ```mach
@@ -796,7 +835,7 @@ pub rec IrOpDescriptor;
 ## val IR_OP_DESCRIPTOR_COUNT
 
 ```mach
-pub val IR_OP_DESCRIPTOR_COUNT: usize = 60
+pub val IR_OP_DESCRIPTOR_COUNT: usize = 63
 ```
 
 ## fun is_known

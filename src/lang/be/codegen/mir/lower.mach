@@ -147,6 +147,8 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, alloc: 
     ctx.interner          = interner;
     ctx.diags             = diags;
     ctx.sret_vreg         = mir.MIR_VREG_NIL;
+    ctx.result_image      = id.INSTR_NIL;
+    ctx.result_in_place   = false;
     ctx.cur_loc           = source.loc_nil();
     ctx.cur_inline_site   = 0;
     ctx.cur_vec_lane      = mir.VEC_LANE_NONE;
@@ -691,6 +693,9 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
         if (ctx.tgt.model.vector_compute_generic && is_vector_compute(inst.kind)) {
             ret lower_generic(ctx, mb, inst, iid);
         }
+        if (bitcast_crosses_wide(ctx, inst)) {
+            ret lower_wide_bitcast(ctx, mb, inst, iid);
+        }
     }
 
     if (route == opdesc.LOWER_CALL) {
@@ -779,6 +784,9 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
     if (route == opdesc.LOWER_SELECT) {
         ret lower_select(ctx, mb, inst, iid);
     }
+    if (route == opdesc.LOWER_CONST) {
+        ret lower_const(ctx, mb, inst, iid);
+    }
 
     if (route == opdesc.LOWER_ASM) {
         ret lower_asm_instr(ctx, mb, iid);
@@ -789,6 +797,22 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
     }
 
     ret lower_generic(ctx, mb, inst, iid);
+}
+
+# a materialized constant is one move of the constant into its register: an
+# immediate move, or the constant-pool load the target selects for a float
+# (#3807). the allocator rematerializes it rather than spill it
+fun lower_const(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) err[fail.Fail] {
+    if (inst.operand_count != 1) {
+        ret err[fail.Fail].err{fail.message("mir.lower_ir: const needs one operand")};
+    }
+    val dst: mir.VRegId = lctx.instr_vreg(ctx, iid);
+    if (mir.vreg_is_nil(dst)) {
+        ret err[fail.Fail].err{fail.message("mir.lower_ir: const defines no result vreg")};
+    }
+    val src: res[mir.MirOperand, fail.Fail] = lctx.lower_value(ctx, inst.operands[0]);
+    if (sel src.err) { ret err[fail.Fail].err{src.err}; }
+    ret lctx.emit_mov_w(ctx, mb, mir.op_vreg(dst), src.ok, lctx.op_width_of(ctx, inst.ty));
 }
 
 # an integer the target does not realize is refused at the first instruction
@@ -826,6 +850,54 @@ fun unrealized_int_message(ctx: *lctx.LowerCtx, bytes: u32) str {
         "a {}-bit integer is not realized on {}: the target declares no integer of that width", bytes * 8, arch);
     if (sel rm.err) { ret fallback; }
     ret intern_owned(ctx, rm.ok, fallback);
+}
+
+# a reinterpret between a vector and an integer wider than the ALU: the integer
+# lives as one register per lane, so no one move carries it across banks
+fun bitcast_crosses_wide(ctx: *lctx.LowerCtx, inst: *instr.Instruction) bool {
+    if (inst.kind != instr.OP_BITCAST || inst.operand_count != 1 || lctx.values_convention(ctx)) { ret false; }
+    var scalar: ir_type.IrTypeId = inst.ty;
+    if (lctx.value_is_vector(ctx, inst.ty))                                                                            { scalar = inst.operands[0].ty; }
+    if (lctx.value_is_vector(ctx, scalar) || lctx.value_is_float(ctx, scalar) || lctx.value_is_aggregate(ctx, scalar)) { ret false; }
+    ret lctx.op_width_of(ctx, scalar)::u64 > ctx.tgt.model.max_alu_width::u64;
+}
+
+# the value crosses through a frame slot: the vector side moves whole in its
+# bank, and the integer side is a wide memory access legalize splits into one
+# access per lane
+fun lower_wide_bitcast(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) err[fail.Fail] {
+    val dst: mir.VRegId = lctx.instr_vreg(ctx, iid);
+    if (mir.vreg_is_nil(dst)) {
+        ret err[fail.Fail].err{fail.message("mir.lower_ir: a wide reinterpret defines no result vreg")};
+    }
+    val src_r: res[mir.MirOperand, fail.Fail] = lctx.lower_value(ctx, inst.operands[0]);
+    if (sel src_r.err) { ret err[fail.Fail].err{src_r.err}; }
+    val to_vector: bool             = lctx.value_is_vector(ctx, inst.ty);
+    var vector_ty: ir_type.IrTypeId = inst.operands[0].ty;
+    if (to_vector) { vector_ty = inst.ty; }
+    val size:  u64 = ir_type.byte_size_for_machine(ctx.types, vector_ty, ctx.layout)::u64;
+    val align: u32 = ir_type.byte_align_for_machine(ctx.types, vector_ty, ctx.layout);
+
+    val skr: res[mir.VRegId, fail.Fail] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
+    if (sel skr.err) { ret err[fail.Fail].err{skr.err}; }
+    val slot: mir.MirOperand = mir.op_mem_slot(skr.ok, 0);
+    val ar:   err[fail.Fail] = lctx.add_spill_slot_aligned(ctx, skr.ok.n, size, align);
+    if (sel ar.err) { ret ar; }
+
+    val lane: u32 = ctx.cur_vec_lane;
+    fin { ctx.cur_vec_lane = lane; }
+    if (to_vector) {
+        ctx.cur_vec_lane = mir.VEC_LANE_NONE;
+        val st: err[fail.Fail] = lctx.push_store_chunk(ctx, mb, slot, src_r.ok, size::u8);
+        if (sel st.err) { ret st; }
+        ctx.cur_vec_lane = lctx.vec_lane_for_type(ctx, vector_ty);
+        ret lctx.load_subwidth_vector(ctx, mb, mir.op_vreg(dst), slot, vector_ty);
+    }
+    ctx.cur_vec_lane = lctx.vec_lane_for_type(ctx, vector_ty);
+    val st: err[fail.Fail] = lctx.store_subwidth_vector(ctx, mb, slot, src_r.ok, vector_ty);
+    if (sel st.err) { ret st; }
+    ctx.cur_vec_lane = mir.VEC_LANE_NONE;
+    ret lctx.emit_load_from_w(ctx, mb, dst, slot, size::u8);
 }
 
 fun instr_touches_vector(ctx: *lctx.LowerCtx, inst: *instr.Instruction) bool {
@@ -1839,10 +1911,12 @@ fun set_generic_widths(ctx: *lctx.LowerCtx, inst: *instr.Instruction, mi: *mir.M
         sw = lctx.op_width_of(ctx, inst.operands[0].ty);
     }
     # a widening multiply's source width is its operand's, half its result; a
-    # lane-halving extension and a lane range read their operand the same way
+    # lane-halving extension, a lane interleave, a lane range and a widening
+    # group sum read their operand the same way
     if ((inst.kind == instr.OP_MUL_WIDE_S || inst.kind == instr.OP_MUL_WIDE_U
         || inst.kind == instr.OP_VEC_WIDEN_S || inst.kind == instr.OP_VEC_WIDEN_U
-        || inst.kind == instr.OP_VEC_RANGE) && inst.operand_count >= 1) {
+        || inst.kind == instr.OP_VEC_INTERLEAVE || inst.kind == instr.OP_VEC_RANGE
+        || inst.kind == instr.OP_VEC_WIDEN_SUM_U) && inst.operand_count >= 1) {
         sw = lctx.op_width_of(ctx, inst.operands[0].ty);
     }
     mi.width     = dw;
@@ -2056,6 +2130,11 @@ fun lower_alloca(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instructio
     val dst: mir.VRegId = lctx.instr_vreg(ctx, iid);
     if (mir.vreg_is_nil(dst)) {
         ret err[fail.Fail].err{fail.message("mir.lower_ir: alloca defines no result vreg")};
+    }
+
+    # the image of the returned value is the caller's result storage (#4120)
+    if (lctx.is_result_image(ctx, iid)) {
+        ret lctx.emit_mov_w(ctx, mb, mir.op_vreg(dst), mir.op_vreg(ctx.sret_vreg), ctx.tgt.model.pointer_width::u8);
     }
 
     val skr: res[mir.VRegId, fail.Fail] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);

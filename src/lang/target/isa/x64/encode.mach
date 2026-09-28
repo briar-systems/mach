@@ -133,6 +133,14 @@ fun needs_rex_for_byte_reg(reg: i32) bool {
 }
 
 fun encode_mem_operand(buf: *enc.ByteBuf, reg: i32, op: *isa.Operand) {
+    encode_mem_operand_scaled(buf, reg, op, 1);
+}
+
+# the modrm, sib and displacement of a memory operand whose 8-bit displacement
+# counts units of `n` bytes: 1 for the legacy and vex encodings, and the evex
+# disp8*N compression otherwise, where a displacement that is not a multiple
+# of `n`, or whose quotient leaves the byte, takes the 32-bit field
+fun encode_mem_operand_scaled(buf: *enc.ByteBuf, reg: i32, op: *isa.Operand, n: i32) {
     val base:      i32  = op.base;
     val index:     i32  = op.index;
     val disp:      i32  = op.disp;
@@ -212,7 +220,7 @@ fun encode_mem_operand(buf: *enc.ByteBuf, reg: i32, op: *isa.Operand) {
         ret;
     }
 
-    if (disp >= -128 && disp <= 127) {
+    if (disp % n == 0 && disp / n >= -128 && disp / n <= 127) {
         if (use_sib) {
             enc.emit_byte(buf, encode_modrm(1, reg_bits(reg), 4));
             var idx_reg: u8 = 4;
@@ -222,7 +230,7 @@ fun encode_mem_operand(buf: *enc.ByteBuf, reg: i32, op: *isa.Operand) {
         or {
             enc.emit_byte(buf, encode_modrm(1, reg_bits(reg), reg_bits(base)));
         }
-        enc.emit_byte(buf, disp::u8);
+        enc.emit_byte(buf, (disp / n)::u8);
         ret;
     }
 
@@ -468,8 +476,13 @@ fun encode_fp_mov(mi: *isa.Inst, buf: *enc.ByteBuf) res[i32, fail.Fail] {
     }
 
     val w: u8 = mi.size;
+    if (w == 2) {
+        val hm: err[fail.Fail] = emit_half_move(@dst, @src1, buf);
+        if (sel hm.err) { ret res[i32, fail.Fail].err{hm.err}; }
+        ret res[i32, fail.Fail].ok{(buf.len - start)::i32};
+    }
     if (!common.is_float_width(w)) {
-        ret res[i32, fail.Fail].err{fail.message("internal compiler error: float move has a non-float operand width (expected 4, 8 or 16)")};
+        ret res[i32, fail.Fail].err{fail.message("internal compiler error: float move has a non-float operand width (expected 2, 4, 8 or 16)")};
     }
 
     if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG &&
@@ -1874,41 +1887,55 @@ fun encode_cvt(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
     ret 0;
 }
 
+# a memory source beside a memory destination is staged through a scratch
+# register where the row admits one r/m operand: a shift's count and a swap's
+# second operand are never staged
+fun staged_source(mi: *isa.Inst) bool {
+    if (mi.src1.kind != isa.OPK_MEM || mi.dst.kind != isa.OPK_MEM) { ret false; }
+    val desc: x64.OpDesc = x64.describe(mi.opcode);
+    if ((desc.mem & x64.MEM_OPERAND) == 0) { ret false; }
+    ret desc.form != x64.FORM_SHIFT && desc.shape != x64.SHAPE_SWAP;
+}
+
+# the load staging a source into the scratch the instruction then reads, none
+# when no scratch is free
+fun staging_load(mi: *isa.Inst) opt[isa.Inst] {
+    var scratch: i32 = float_scratch0();
+    if (mi.size != 16) {
+        scratch = pick_stage_scratch(?mi.dst, ?mi.src1);
+        if (scratch < 0) { ret opt[isa.Inst].none{}; }
+    }
+    var ld: isa.Inst = isa.inst_blank();
+    ld.opcode = x64.MOV;
+    ld.dst    = isa.make_reg(scratch, mi.size);
+    ld.src1   = mi.src1;
+    ld.size   = mi.size;
+    ld.flags  = mi.flags;
+    ret opt[isa.Inst].some{ld};
+}
+
 fun encode_inst(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
     if (mi == nil || buf == nil) { ret 0; }
     val opcode: u16 = mi.opcode;
 
     if (opcode == isa.ISA_PCOPY || opcode == isa.ISA_PCOPY_FENCE) { ret 0; }
 
-    # a memory source beside a memory destination is staged through a
-    # scratch register where the row admits one r/m operand: a shift's
-    # count and a swap's second operand are never staged
-    val desc: x64.OpDesc = x64.describe(opcode);
-    if (mi.src1.kind == isa.OPK_MEM && mi.dst.kind == isa.OPK_MEM &&
-        (desc.mem & x64.MEM_OPERAND) != 0 &&
-        desc.form != x64.FORM_SHIFT && desc.shape != x64.SHAPE_SWAP) {
-        var scratch: i32 = float_scratch0();
-        if (mi.size != 16) {
-            scratch = pick_stage_scratch(?mi.dst, ?mi.src1);
-            if (scratch < 0) { ret 0; }
-        }
-        var ld: isa.Inst = isa.inst_blank();
-        ld.opcode = x64.MOV;
-        ld.dst    = isa.make_reg(scratch, mi.size);
-        ld.src1   = mi.src1;
-        ld.size   = mi.size;
-        ld.flags  = mi.flags;
-        val ld_sz: i32 = encode_inst(?ld, buf);
+    if (staged_source(mi)) {
+        val staged: opt[isa.Inst] = staging_load(mi);
+        if (!sel staged.some) { ret 0; }
+        var ld:    isa.Inst = staged.some;
+        val ld_sz: i32      = encode_inst(?ld, buf);
         if (ld_sz <= 0) { ret 0; }
-        mi.src1 = isa.make_reg(scratch, mi.size);
+        mi.src1 = ld.dst;
         val rest: i32 = encode_inst(mi, buf);
         if (rest <= 0) { ret 0; }
         ret ld_sz + rest;
     }
 
-    val start: usize = buf.len;
-    val seg:   u8    = inst_segment_prefix(mi);
-    var lead:  i32   = 0;
+    val desc:  x64.OpDesc = x64.describe(opcode);
+    val start: usize      = buf.len;
+    val seg:   u8         = inst_segment_prefix(mi);
+    var lead:  i32        = 0;
     if (seg != 0) {
         # an address operand is never accessed, so an override on it relocates nothing
         if ((desc.mem & x64.MEM_ADDR) != 0) { ret 0; }
@@ -2202,18 +2229,65 @@ fun encode_inst_one(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
         ret 2;
     }
 
-    if (opcode == x64.MOVSB) {
-        var count: i32 = 0;
-        if ((mi.flags & x64.FLAG_REP::u16) != 0) {
-            enc.emit_byte(buf, 0xF3);
-            count = count + 1;
-        }
-        enc.emit_byte(buf, 0xA4);
-        count = count + 1;
-        ret count;
-    }
+    if (desc.form == x64.FORM_STRING) { ret encode_string(mi, buf); }
 
     ret 0;
+}
+
+# the opcode byte and element width of each string instruction
+rec StringRow {
+    op:    u16;
+    byte:  u8;
+    width: u8;
+}
+
+val STRING_ROW_COUNT: usize = 20;
+
+val STRING_ROWS: [STRING_ROW_COUNT]StringRow = [STRING_ROW_COUNT]StringRow{
+    StringRow{op: x64.MOVSB, byte: 0xA4, width: 1},
+    StringRow{op: x64.MOVSW, byte: 0xA5, width: 2},
+    StringRow{op: x64.MOVSD_STRING, byte: 0xA5, width: 4},
+    StringRow{op: x64.MOVSQ, byte: 0xA5, width: 8},
+    StringRow{op: x64.CMPSB, byte: 0xA6, width: 1},
+    StringRow{op: x64.CMPSW, byte: 0xA7, width: 2},
+    StringRow{op: x64.CMPSD, byte: 0xA7, width: 4},
+    StringRow{op: x64.CMPSQ, byte: 0xA7, width: 8},
+    StringRow{op: x64.STOSB, byte: 0xAA, width: 1},
+    StringRow{op: x64.STOSW, byte: 0xAB, width: 2},
+    StringRow{op: x64.STOSD, byte: 0xAB, width: 4},
+    StringRow{op: x64.STOSQ, byte: 0xAB, width: 8},
+    StringRow{op: x64.LODSB, byte: 0xAC, width: 1},
+    StringRow{op: x64.LODSW, byte: 0xAD, width: 2},
+    StringRow{op: x64.LODSD, byte: 0xAD, width: 4},
+    StringRow{op: x64.LODSQ, byte: 0xAD, width: 8},
+    StringRow{op: x64.SCASB, byte: 0xAE, width: 1},
+    StringRow{op: x64.SCASW, byte: 0xAF, width: 2},
+    StringRow{op: x64.SCASD, byte: 0xAF, width: 4},
+    StringRow{op: x64.SCASQ, byte: 0xAF, width: 8},
+};
+
+# the row of a string opcode; a width of 0 for anything else
+fun x64_string_row(op: u16) StringRow {
+    var i: usize = 0;
+    for (i < STRING_ROW_COUNT) {
+        if (STRING_ROWS[i].op == op) { ret STRING_ROWS[i]; }
+        i = i + 1;
+    }
+    ret StringRow{op: op, byte: 0, width: 0};
+}
+
+# the operand-size prefix, the repeat prefix, rex.w and the opcode byte, in
+# the order GNU as emits them
+fun encode_string(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
+    val row: StringRow = x64_string_row(mi.opcode);
+    if (row.width == 0) { ret 0; }
+    val start: usize = buf.len;
+    if (row.width == 2)                        { enc.emit_byte(buf, 0x66); }
+    if ((mi.flags & x64.FLAG_REP::u16) != 0)   { enc.emit_byte(buf, 0xF3); }
+    or ((mi.flags & x64.FLAG_REPNE::u16) != 0) { enc.emit_byte(buf, 0xF2); }
+    if (row.width == 8)                        { enc.emit_byte(buf, 0x48); }
+    enc.emit_byte(buf, row.byte);
+    ret (buf.len - start)::i32;
 }
 
 fun count_callee_saved(fill: isa.RegFileFn, mask: u32) i32 {
@@ -2830,14 +2904,23 @@ fun encode_selected(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32, mi:
     if (mi.opcode == mir.MIR_VEC_RANGE) {
         ret encode_vector_range(st, f, mi);
     }
+    if (mi.opcode == mir.MIR_VEC_WIDEN_SUM_U) {
+        ret encode_vector_widen_sum(f, mi, ?st.buf);
+    }
     if (mi.opcode == mir.MIR_VEC_CONCAT) {
         ret encode_vector_concat(f, mi, ?st.buf);
+    }
+    if (mi.opcode == mir.MIR_VEC_INTERLEAVE) {
+        ret encode_vector_interleave(f, mi, ?st.buf);
+    }
+    if (mir.vec_lane_is_vector(mi.vec_lane) && (mi.opcode == mir.MIR_MUL_HI_S || mi.opcode == mir.MIR_MUL_HI_U)) {
+        ret encode_vector_arith(st, f, mi);
     }
     if (mir.vec_lane_is_vector(mi.vec_lane) && is_selected_vector_alu(mi.opcode)) {
         ret encode_vector_op(st, f, mi);
     }
     if (mir.vec_lane_is_convert(mi.vec_lane)) {
-        ret encode_vector_convert(f, mi, ?st.buf);
+        ret encode_vector_convert(f, mi, isa.extends_directly(st.model), ?st.buf);
     }
 
     if (common.is_mir_compare(mi.opcode)) {
@@ -2925,6 +3008,19 @@ fun encode_selected(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32, mi:
     var sym_addend:   i64          = 0;
     enc.classify_refs(mi, ?target_block, ?has_block, ?sym, ?has_sym, ?sym_addend);
 
+    # a symbol source staged ahead of a memory destination carries its patch
+    # site in the staging load, so that load is placed as its own instruction
+    if (has_sym && is_rip_mem(?inst.src1) && staged_source(?inst)) {
+        val staged: opt[isa.Inst] = staging_load(?inst);
+        if (sel staged.some) {
+            var ld:     isa.Inst       = staged.some;
+            val placed: err[fail.Fail] = place_sym_inst(st, f, mi, ?ld, sym, sym_addend);
+            if (sel placed.err) { ret placed; }
+            inst.src1 = ld.dst;
+            has_sym   = false;
+        }
+    }
+
     val inst_start: usize = st.buf.len;
     val inst_size:  i32   = encode_inst(?inst, ?st.buf);
     if (inst_size <= 0) {
@@ -2946,27 +3042,38 @@ fun encode_selected(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32, mi:
     }
 
     if (has_sym) {
-        if (sym == intern.STR_NIL) {
-            ret err[fail.Fail].err{fail.message("encode: symbol-referencing instruction has no resolved symbol name")};
-        }
-        val reloc_off: i32 = x86_reloc_offset(nil, ?inst, inst_size);
-        if (reloc_off < 0) {
-            ret err[fail.Fail].err{fail.message("encode: symbol-referencing instruction has no relocation patch site")};
-        }
-        val patch_pos: u32          = (inst_start + reloc_off::usize)::u32;
-        var kind:      of.RelocKind = of.RK_PC32;
-        var addend:    i64          = sym_addend - (inst_size - reloc_off)::i64;
-        if (inst.opcode == x64.MOVABS::u16) {
-            kind   = of.RK_ABS64;
-            addend = sym_addend;
-        }
-        val r_2445: err[fail.Fail] = enc.push_inst_reloc(st, patch_pos, kind, sym, addend,
-            (inst_size - reloc_off)::u8);
-        if (sel r_2445.err) { ret err[fail.Fail].err{r_2445.err}; }
-        ret err[fail.Fail].ok{};
+        ret sym_reloc(st, ?inst, inst_start, inst_size, sym, sym_addend);
     }
 
     ret err[fail.Fail].ok{};
+}
+
+# one machine instruction naming a symbol, encoded with its relocation
+fun place_sym_inst(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr, inst: *isa.Inst,
+    sym: intern.StrId, sym_addend: i64) err[fail.Fail] {
+    val inst_start: usize = st.buf.len;
+    val inst_size:  i32   = encode_inst(inst, ?st.buf);
+    if (inst_size <= 0) { ret enc.opcode_failure(st, f, "x64", mi.opcode); }
+    ret sym_reloc(st, inst, inst_start, inst_size, sym, sym_addend);
+}
+
+fun sym_reloc(st: *enc.EncodeState, inst: *isa.Inst, inst_start: usize, inst_size: i32,
+    sym: intern.StrId, sym_addend: i64) err[fail.Fail] {
+    if (sym == intern.STR_NIL) {
+        ret err[fail.Fail].err{fail.message("encode: symbol-referencing instruction has no resolved symbol name")};
+    }
+    val reloc_off: i32 = x86_reloc_offset(nil, inst, inst_size);
+    if (reloc_off < 0) {
+        ret err[fail.Fail].err{fail.message("encode: symbol-referencing instruction has no relocation patch site")};
+    }
+    val patch_pos: u32          = (inst_start + reloc_off::usize)::u32;
+    var kind:      of.RelocKind = of.RK_PC32;
+    var addend:    i64          = sym_addend - (inst_size - reloc_off)::i64;
+    if (inst.opcode == x64.MOVABS::u16) {
+        kind   = of.RK_ABS64;
+        addend = sym_addend;
+    }
+    ret enc.push_inst_reloc(st, patch_pos, kind, sym, addend, (inst_size - reloc_off)::u8);
 }
 
 fun is_got_addr(mi: *mir.MirInstr) bool {
@@ -3376,6 +3483,11 @@ fun float_alu_opcode(op: mir.MirOpcode, w: u8) u16 {
 }
 
 fun emit_float_load(st: *enc.EncodeState, op: isa.Operand, xmm: i32, w: u8) err[fail.Fail] {
+    if (w == 2 && op.kind == isa.OPK_IMM) {
+        # an f16 constant is the low word of a binary32 pool entry
+        ret emit_float_load(st, isa.make_imm((op.imm::u64 & 0xFFFF)::i64, 4), xmm, 4);
+    }
+    if (w == 2) { ret emit_half_move(isa.make_reg(xmm, 16), op, ?st.buf); }
     if (!common.is_float_width(w)) {
         ret err[fail.Fail].err{fail.message("internal compiler error: float load has a non-float access width (expected 4 or 8)")};
     }
@@ -3397,6 +3509,7 @@ fun emit_float_load(st: *enc.EncodeState, op: isa.Operand, xmm: i32, w: u8) err[
 }
 
 fun emit_float_reg_or_slot_load(op: isa.Operand, xmm: i32, w: u8, buf: *enc.ByteBuf) err[fail.Fail] {
+    if (w == 2) { ret emit_half_move(isa.make_reg(xmm, 16), op, buf); }
     if (!common.is_float_width(w)) {
         ret err[fail.Fail].err{fail.message("internal compiler error: float load has a non-float access width (expected 4 or 8)")};
     }
@@ -3519,6 +3632,18 @@ fun float_src_operand(st: *enc.EncodeState, op: isa.Operand, scratch: i32, w: u8
     ret res[isa.Operand, fail.Fail].ok{isa.make_reg(scratch, 16)};
 }
 
+# the scalar float arithmetic and compare read their second source, a
+# constant there included, as the r/m operand: a constant is one pool
+# reference inside the instruction (#4184). a compare's second source is its
+# right operand, or its left where the condition swaps them
+pub fun reads_const_operand(mi: *mir.MirInstr, index: u32) bool {
+    if (mi.operand_count != 3 || mir.vec_lane_is_vector(mi.vec_lane) || !common.is_float_width(mi.width)) { ret false; }
+    if (is_mir_float_arith(mi.opcode))                                                                    { ret index == 2; }
+    if (mi.opcode != mir.MIR_FCMP)                                                                        { ret false; }
+    if (float_cmp_swap(mi.src_width))                                                                     { ret index == 1; }
+    ret index == 2;
+}
+
 fun float_rhs_operand(st: *enc.EncodeState, rhs: isa.Operand, work: i32, w: u8) res[isa.Operand, fail.Fail] {
     if (rhs.kind == isa.OPK_REG && rhs.reg == work) {
         val ld: err[fail.Fail] = emit_float_load(st, rhs, float_scratch1(), w);
@@ -3537,6 +3662,7 @@ fun float_reg_operand(st: *enc.EncodeState, op: isa.Operand, scratch: i32, w: u8
 }
 
 fun emit_float_store(dst: isa.Operand, xmm: i32, w: u8, buf: *enc.ByteBuf) err[fail.Fail] {
+    if (w == 2) { ret emit_half_move(dst, isa.make_reg(xmm, 16), buf); }
     if (!common.is_float_width(w)) {
         ret err[fail.Fail].err{fail.message("internal compiler error: float store has a non-float access width (expected 4 or 8)")};
     }
@@ -3562,6 +3688,55 @@ fun emit_float_store(dst: isa.Operand, xmm: i32, w: u8, buf: *enc.ByteBuf) err[f
         ret err[fail.Fail].ok{};
     }
     ret err[fail.Fail].err{fail.message("encode: float destination is not a register or frame slot")};
+}
+
+# an f16 lives in the low word of an xmm register (#3801): a register copy
+# moves the whole register, memory is reached as a word by pinsrw and pextrw,
+# and a general register by movd, whose bits above the word are no part of
+# the value
+fun emit_half_move(dst: isa.Operand, src: isa.Operand, buf: *enc.ByteBuf) err[fail.Fail] {
+    val start: usize = buf.len;
+    if (reg_is_xmm(?dst) && reg_is_xmm(?src)) {
+        if (dst.reg != src.reg) { emit_movaps_rr(dst.reg, src.reg, buf); }
+        ret err[fail.Fail].ok{};
+    }
+    if (reg_is_xmm(?dst) && src.kind == isa.OPK_REG) {
+        emit_movd_movq_reg(src.reg, dst.reg, 4, true, buf);
+        ret err[fail.Fail].ok{};
+    }
+    if (reg_is_xmm(?src) && dst.kind == isa.OPK_REG) {
+        emit_movd_movq_reg(dst.reg, src.reg, 4, false, buf);
+        ret err[fail.Fail].ok{};
+    }
+    if (reg_is_xmm(?dst) && src.kind == isa.OPK_MEM) {
+        emit_sse_rm(0x66, 0xC4, dst.reg, src, buf);
+        enc.emit_byte(buf, 0);
+        note_packed_imm(buf, start, x64.PINSRW, vec_reg(dst.reg), src, 0);
+        ret err[fail.Fail].ok{};
+    }
+    if (reg_is_xmm(?src) && dst.kind == isa.OPK_MEM) {
+        emit_sse_map_rm(0x66, 0x3A, 0x15, src.reg, dst, buf);
+        enc.emit_byte(buf, 0);
+        note_packed_imm(buf, start, x64.PEXTRW, dst, vec_reg(src.reg), 0);
+        ret err[fail.Fail].ok{};
+    }
+    ret err[fail.Fail].err{fail.message("encode: an f16 move names no xmm register beside a register or frame slot")};
+}
+
+# the f16c conversions at 128 bits: vcvtph2ps widens the four f16 in the
+# source's low quadword to binary32, and vcvtps2ph rounds four binary32 to f16
+# to nearest even (immediate 0) into the destination's low quadword. a scalar
+# f16 is lane 0 of each
+fun emit_f16c(widen: bool, dst_xmm: i32, src_xmm: i32, buf: *enc.ByteBuf) {
+    val start: usize = buf.len;
+    if (widen) {
+        emit_vex_rm(OpMap{prefix: 0x66, map: 0x38, opbyte: 0x13, w: 0}, 0, dst_xmm, -1, vec_reg(src_xmm), buf);
+        note_packed(buf, start, x64.VCVTPH2PS, vec_reg(dst_xmm), vec_reg(src_xmm));
+        ret;
+    }
+    emit_vex_rm(OpMap{prefix: 0x66, map: 0x3A, opbyte: 0x1D, w: 0}, 0, src_xmm, -1, vec_reg(dst_xmm), buf);
+    enc.emit_byte(buf, 0);
+    note_packed_imm(buf, start, x64.VCVTPS2PH, vec_reg(dst_xmm), vec_reg(src_xmm), 0);
 }
 
 fun encode_float_arith(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) err[fail.Fail] {
@@ -3880,6 +4055,26 @@ fun emit_fp_to_u64(st: *enc.EncodeState, src_reg: i32, src_w: u8, cvt_op: u16, l
     ret err[fail.Fail].ok{};
 }
 
+# an f16 widened to binary32 or binary32 rounded to f16, the two cells the
+# f16c half rows declare
+fun encode_half_conv(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) err[fail.Fail] {
+    val widen: bool = mi.opcode == mir.MIR_FP_EXT;
+    if ((widen && mi.width != 4) || (!widen && mi.src_width != 4)) {
+        ret err[fail.Fail].err{fail.message("internal compiler error: an f16 conversion names a width other than binary32, which no x86-64 half row declares")};
+    }
+    val rd: res[isa.Operand, fail.Fail] = mir_to_operand(f, ?mi.operands[0], 16);
+    if (sel rd.err) { ret err[fail.Fail].err{rd.err}; }
+    val dst: isa.Operand                 = rd.ok;
+    val rs:  res[isa.Operand, fail.Fail] = mir_to_operand(f, ?mi.operands[1], mi.src_width);
+    if (sel rs.err) { ret err[fail.Fail].err{rs.err}; }
+    val sr: res[i32, fail.Fail] = float_reg_operand(st, rs.ok, float_scratch1(), mi.src_width);
+    if (sel sr.err) { ret err[fail.Fail].err{sr.err}; }
+    val work: i32 = float_work_reg(dst);
+    emit_f16c(widen, work, sr.ok, ?st.buf);
+    if (dst.kind == isa.OPK_REG) { ret err[fail.Fail].ok{}; }
+    ret emit_float_store(dst, work, mi.width, ?st.buf);
+}
+
 fun encode_float_conv(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) err[fail.Fail] {
     if (mi.operand_count < 2) {
         ret err[fail.Fail].err{fail.message("encode: float conversion missing operands")};
@@ -3889,6 +4084,9 @@ fun encode_float_conv(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirIns
     val dst_w: u8            = mi.width;
     val src_w: u8            = mi.src_width;
 
+    if ((op == mir.MIR_FP_EXT && src_w == 2) || (op == mir.MIR_FP_TRUNC && dst_w == 2)) {
+        ret encode_half_conv(st, f, mi);
+    }
     if (op == mir.MIR_FP_TRUNC || op == mir.MIR_FP_EXT) {
         if (!common.is_float_width(dst_w) || !common.is_float_width(src_w)) {
             ret err[fail.Fail].err{fail.message("internal compiler error: float conversion has a non-float width on a float side (expected 4 or 8)")};
@@ -4156,6 +4354,7 @@ fun packed_opbyte(op: u16) opt[u8] {
     if (op == x64.PMULHW)                                       { ret opt[u8].some{0xE5}; }
     if (op == x64.PMULHUW)                                      { ret opt[u8].some{0xE4}; }
     if (op == x64.PMULUDQ)                                      { ret opt[u8].some{0xF4}; }
+    if (op == x64.PSADBW)                                       { ret opt[u8].some{0xF6}; }
     if (op == x64.PAND)                                         { ret opt[u8].some{0xDB}; }
     if (op == x64.POR)                                          { ret opt[u8].some{0xEB}; }
     if (op == x64.PXOR)                                         { ret opt[u8].some{0xEF}; }
@@ -4273,6 +4472,12 @@ fun mapped_opbytes(op: u16, prefix: *u8, map: *u8, opbyte: *u8) bool {
     or (op == x64.PMOVZXBW)                                                    { @opbyte = 0x30; }
     or (op == x64.PMOVZXWD)                                                    { @opbyte = 0x33; }
     or (op == x64.PMOVZXDQ)                                                    { @opbyte = 0x35; }
+    or (op == x64.PMOVSXBD)                                                    { @opbyte = 0x21; }
+    or (op == x64.PMOVSXBQ)                                                    { @opbyte = 0x22; }
+    or (op == x64.PMOVSXWQ)                                                    { @opbyte = 0x24; }
+    or (op == x64.PMOVZXBD)                                                    { @opbyte = 0x31; }
+    or (op == x64.PMOVZXBQ)                                                    { @opbyte = 0x32; }
+    or (op == x64.PMOVZXWQ)                                                    { @opbyte = 0x34; }
     or (op == x64.PTEST)                                                       { @opbyte = 0x17; }
     or (op == x64.AESIMC)                                                      { @opbyte = 0xDB; }
     or (op == x64.AESENC)                                                      { @opbyte = 0xDC; }
@@ -4398,7 +4603,103 @@ fun emit_vex_rm(m: OpMap, l: u8, reg: i32, vvvv: i32, rm: isa.Operand, buf: *enc
     or                          { encode_mem_operand(buf, reg, ?rm); }
 }
 
-fun note_vex3(buf: *enc.ByteBuf, start: usize, opcode: u16, dst: isa.Operand, src1: isa.Operand, src2: isa.Operand) {
+# how an evex row scales a compressed 8-bit displacement: the tuple type of
+# its memory operand
+def Tuple: u8;
+
+# a full vector: N is the vector length in bytes, or the element with the
+# broadcast bit set, 4 bytes under W0 and 8 under W1
+val TUPLE_FULL: Tuple = 0;
+
+# an opcode's evex encoding: its place in the opcode space, which the legacy
+# and vex encodings read as well, and the tuple type of its memory operand
+rec EvexRow {
+    m:     OpMap;
+    tuple: Tuple;
+}
+
+# the evex-only rows: instructions with no legacy or vex encoding
+fun evex_row(op: u16) opt[EvexRow] {
+    if (op == x64.VPMULLQ) { ret opt[EvexRow].some{EvexRow{m: OpMap{prefix: 0x66, map: 0x38, opbyte: 0x40, w: 1}, tuple: TUPLE_FULL}}; }
+    ret opt[EvexRow].none{};
+}
+
+# what an evex prefix carries beyond the row and the registers. `ll` is the
+# vector length (0 for 128 bits, 1 for 256, 2 for 512), or the rounding
+# control of a register form with `b` set. `mask` is the opmask register
+# k0-k7 that writes the destination lane by lane, k0 for none, and `zero`
+# clears the lanes it leaves out instead of keeping them. `b` broadcasts one
+# element of a memory source to every lane, or embeds the rounding control
+# (with suppressed exceptions) in a register form
+rec EvexCtl {
+    ll:   u8;
+    mask: u8;
+    zero: bool;
+    b:    bool;
+}
+
+fun evex_unmasked(ll: u8) EvexCtl {
+    ret EvexCtl{ll: ll, mask: 0, zero: false, b: false};
+}
+
+# the disp8*N scale of a row's memory operand under the prefix `e` sets
+fun evex_disp_scale(r: EvexRow, e: EvexCtl) i32 {
+    if (r.tuple != TUPLE_FULL) { panic("encode: evex row names an unmodelled tuple type\n"); }
+    if (e.b) {
+        if (r.m.w == 1) { ret 8; }
+        ret 4;
+    }
+    ret 16 << e.ll::i32;
+}
+
+# bit 3 and bit 4 of a register index, which the prefix carries apart from
+# the three modrm bits; false for no register
+fun reg_bit3(id: i32) bool {
+    ret id >= 0 && (isa.regid_index(id) & 8) != 0;
+}
+
+fun reg_bit4(id: i32) bool {
+    ret id >= 0 && (isa.regid_index(id) & 16) != 0;
+}
+
+# one evex-encoded instruction: 62, then P0 (inverted R X B R', the map),
+# P1 (W, inverted vvvv, a fixed one, pp) and P2 (z, L'L, b, inverted V', aaa).
+# `reg`, `vvvv` and a register `rm` index all 32 vector registers: R' and V'
+# carry bit 4 of reg and vvvv, and X carries it for a register rm, where it
+# names no index. a memory rm's 8-bit displacement is compressed by the row's
+# disp8*N scale
+fun emit_evex_rm(r: EvexRow, e: EvexCtl, reg: i32, vvvv: i32, rm: isa.Operand, buf: *enc.ByteBuf) {
+    if (e.zero && e.mask == 0) { panic("encode: evex zeroing names no opmask register\n"); }
+    val seg: u8 = segment_prefix(?rm);
+    if (seg != 0) { enc.emit_byte(buf, seg); }
+    var p0: u8 = 0xF0 | vex_mmmmm(r.m.map);
+    if (reg_bit3(reg)) { p0 = p0 & 0x7F; }
+    if (reg_bit4(reg)) { p0 = p0 & 0xEF; }
+    if (rm.kind == isa.OPK_REG) {
+        if (reg_bit4(rm.reg)) { p0 = p0 & 0xBF; }
+        if (reg_bit3(rm.reg)) { p0 = p0 & 0xDF; }
+    }
+    or {
+        if (rm_extends_x(?rm)) { p0 = p0 & 0xBF; }
+        if (rm_extends_b(?rm)) { p0 = p0 & 0xDF; }
+    }
+    var v: u8 = 0;
+    if (vvvv >= 0) { v = isa.regid_index(vvvv)::u8 & 0x1F; }
+    val p1: u8 = ((r.m.w & 1) << 7) | ((~v & 0xF) << 3) | 0x04 | vex_pp(r.m.prefix);
+    var p2: u8 = ((e.ll & 3) << 5) | (e.mask & 7);
+    if (e.zero)          { p2 = p2 | 0x80; }
+    if (e.b)             { p2 = p2 | 0x10; }
+    if ((v & 0x10) == 0) { p2 = p2 | 0x08; }
+    enc.emit_byte(buf, 0x62);
+    enc.emit_byte(buf, p0);
+    enc.emit_byte(buf, p1);
+    enc.emit_byte(buf, p2);
+    enc.emit_byte(buf, r.m.opbyte);
+    if (rm.kind == isa.OPK_REG) { enc.emit_byte(buf, encode_modrm(3, reg_bits(reg), reg_bits(rm.reg))); }
+    or                          { encode_mem_operand_scaled(buf, reg, ?rm, evex_disp_scale(r, e)); }
+}
+
+fun note_vec3(buf: *enc.ByteBuf, start: usize, opcode: u16, dst: isa.Operand, src1: isa.Operand, src2: isa.Operand) {
     if (!enc.sink_active(buf)) { ret; }
     var mi: isa.Inst = isa.inst_blank();
     mi.opcode = opcode;
@@ -4409,17 +4710,43 @@ fun note_vex3(buf: *enc.ByteBuf, start: usize, opcode: u16, dst: isa.Operand, sr
     printer.note_inst(buf, ?mi, start);
 }
 
-# a 128-bit vex three-operand instruction: dst from src1 (vvvv) and src2 (rm)
-fun emit_vex3(op: u16, dst_xmm: i32, src1_xmm: i32, src2: isa.Operand, buf: *enc.ByteBuf) err[fail.Fail] {
-    val row: opt[OpMap] = vex_row(op);
-    if (sel row.none) { ret err[fail.Fail].err{fail.message(PACKED_OPCODE_UNKNOWN)}; }
+# a 128-bit three-operand instruction, dst from src1 (vvvv) and src2 (rm),
+# vex-encoded where the opcode has a vex row and evex-encoded, unmasked,
+# where it has an evex one
+fun emit_vec3(op: u16, dst_xmm: i32, src1_xmm: i32, src2: isa.Operand, buf: *enc.ByteBuf) err[fail.Fail] {
     if (src2.kind != isa.OPK_REG && src2.kind != isa.OPK_MEM) {
-        ret err[fail.Fail].err{fail.message("encode: vex vector op source is not a register or aligned frame slot")};
+        ret err[fail.Fail].err{fail.message("encode: vex or evex vector op source is not a register or aligned frame slot")};
     }
-    val start: usize = buf.len;
-    emit_vex_rm(row.some, 0, dst_xmm, src1_xmm, src2, buf);
-    note_vex3(buf, start, op, vec_reg(dst_xmm), vec_reg(src1_xmm), src2);
+    val start: usize        = buf.len;
+    val vex:   opt[OpMap]   = vex_row(op);
+    val evex:  opt[EvexRow] = evex_row(op);
+    if (sel vex.some)  { emit_vex_rm(vex.some, 0, dst_xmm, src1_xmm, src2, buf); }
+    or (sel evex.some) { emit_evex_rm(evex.some, evex_unmasked(0), dst_xmm, src1_xmm, src2, buf); }
+    or                 { ret err[fail.Fail].err{fail.message(PACKED_OPCODE_UNKNOWN)}; }
+    note_vec3(buf, start, op, vec_reg(dst_xmm), vec_reg(src1_xmm), src2);
     ret err[fail.Fail].ok{};
+}
+
+# a three-operand instruction over codegen operands: the first source rides
+# vvvv and so must be a register, the second is a register or frame slot, and
+# the result forms in the destination register, or in scratch0 for a frame slot
+fun emit_vec3_ops(op: u16, dst: isa.Operand, lhs: isa.Operand, rhs: isa.Operand, buf: *enc.ByteBuf) err[fail.Fail] {
+    var work: i32 = float_scratch0();
+    if (dst.kind == isa.OPK_REG) { work = dst.reg; }
+    var src: i32 = work;
+    if (lhs.kind == isa.OPK_REG) { src = lhs.reg; }
+    or {
+        # the second source stays where it is, so one in the work register
+        # would be overwritten by the load: form the result in scratch0
+        if (rhs.kind == isa.OPK_REG && rhs.reg == work) { work = float_scratch0(); }
+        src = work;
+        val ll: err[fail.Fail] = emit_vec_load(lhs, work, buf);
+        if (sel ll.err) { ret ll; }
+    }
+    val r: err[fail.Fail] = emit_vec3(op, work, src, rhs, buf);
+    if (sel r.err)                                  { ret r; }
+    if (dst.kind == isa.OPK_REG && dst.reg == work) { ret err[fail.Fail].ok{}; }
+    ret emit_vec_store(dst, work, buf);
 }
 
 # a 32-byte value between a ymm register and memory: vmovdqu, VEX.256.F3.0F
@@ -4593,9 +4920,21 @@ fun xconv_cvt(p: *convplan.Plan, loaded: *bool, op: u16) {
     @loaded = true;
 }
 
-# widen the lanes from `from` to `to` bytes, doubling each step:
-# the high half is the sign mask of a signed lane and zero otherwise
-fun xconv_widen(p: *convplan.Plan, loaded: *bool, from: u8, to: u8, signed: bool) {
+# an f16c conversion of the low four lanes, in the work register: the vex
+# forms read and write registers here
+fun xconv_half(p: *convplan.Plan, loaded: *bool, op: u16) {
+    xconv_load(p, loaded);
+    convplan.push(p, op::u32, convplan.PLACE_WORK, convplan.PLACE_WORK, 0);
+}
+
+# widen the lanes from `from` to `to` bytes: one pmovsx or pmovzx where the
+# model extends directly (sse41), else doubling each step, the high half the
+# sign mask of a signed lane and zero otherwise
+fun xconv_widen(p: *convplan.Plan, loaded: *bool, from: u8, to: u8, signed: bool, direct: bool) {
+    if (direct) {
+        xconv_cvt(p, loaded, pmov_op(signed, from, to));
+        ret;
+    }
     xconv_load(p, loaded);
     var w: u8 = from;
     for (w < to) {
@@ -4635,15 +4974,17 @@ fun xconv_narrow(p: *convplan.Plan, loaded: *bool, from: u8, to: u8) {
 
 # the packed conversion sequence, for the cells the x86_64 packed table
 # declares; each one agrees bit for bit with the scalar conversion of a lane
-fun xconv_plan(op: mir.MirOpcode, to_float: bool, to: u8, from_float: bool, from: u8) opt[convplan.Plan] {
+fun xconv_plan(op: mir.MirOpcode, to_float: bool, to: u8, from_float: bool, from: u8, direct: bool) opt[convplan.Plan] {
     var p:      convplan.Plan = convplan.plan();
     var loaded: bool          = false;
-    if (op == mir.MIR_SEXT || op == mir.MIR_ZEXT)       { xconv_widen(?p, ?loaded, from, to, op == mir.MIR_SEXT); }
+    if (op == mir.MIR_SEXT || op == mir.MIR_ZEXT)       { xconv_widen(?p, ?loaded, from, to, op == mir.MIR_SEXT, direct); }
     or (op == mir.MIR_TRUNC)                            { xconv_narrow(?p, ?loaded, from, to); }
     or (op == mir.MIR_FP_EXT && from == 4 && to == 8)   { xconv_cvt(?p, ?loaded, x64.CVTPS2PD); }
     or (op == mir.MIR_FP_TRUNC && from == 8 && to == 4) { xconv_cvt(?p, ?loaded, x64.CVTPD2PS); }
+    or (op == mir.MIR_FP_EXT && from == 2 && to == 4)   { xconv_half(?p, ?loaded, x64.VCVTPH2PS); }
+    or (op == mir.MIR_FP_TRUNC && from == 4 && to == 2) { xconv_half(?p, ?loaded, x64.VCVTPS2PH); }
     or ((op == mir.MIR_SI_TO_FP || (op == mir.MIR_UI_TO_FP && from < 4)) && from <= 4 && !from_float && to_float) {
-        if (from < 4) { xconv_widen(?p, ?loaded, from, 4, op == mir.MIR_SI_TO_FP); }
+        if (from < 4) { xconv_widen(?p, ?loaded, from, 4, op == mir.MIR_SI_TO_FP, direct); }
         var cvt: u16 = x64.CVTDQ2PS;
         if (to == 8) { cvt = x64.CVTDQ2PD; }
         xconv_cvt(?p, ?loaded, cvt);
@@ -4685,6 +5026,10 @@ fun emit_xconv(p: *convplan.Plan, operand: isa.Operand, work: i32, buf: *enc.Byt
         or (op == x64.PSLLW || op == x64.PSLLD || op == x64.PSRAW || op == x64.PSRAD) {
             done = emit_packed_shift_imm(op, dst.reg, step.arg::u8, buf);
         }
+        or (op == x64.VCVTPH2PS || op == x64.VCVTPS2PH) {
+            if (src.kind != isa.OPK_REG) { ret err[fail.Fail].err{fail.message("encode: packed f16 conversion reads memory")}; }
+            emit_f16c(op == x64.VCVTPH2PS, dst.reg, src.reg, buf);
+        }
         or                { done = emit_packed_op(op, dst.reg, src, buf); }
         if (sel done.err) { ret done; }
         i = i + 1;
@@ -4692,7 +5037,7 @@ fun emit_xconv(p: *convplan.Plan, operand: isa.Operand, work: i32, buf: *enc.Byt
     ret err[fail.Fail].ok{};
 }
 
-fun encode_vector_convert(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.ByteBuf) err[fail.Fail] {
+fun encode_vector_convert(f: *mir.MirFunction, mi: *mir.MirInstr, direct: bool, buf: *enc.ByteBuf) err[fail.Fail] {
     if (mi.operand_count < 2) { ret err[fail.Fail].err{fail.message("encode: packed vector conversion missing operands")}; }
     val rd: res[isa.Operand, fail.Fail] = mir_to_operand(f, ?mi.operands[0], 16);
     if (sel rd.err) { ret err[fail.Fail].err{rd.err}; }
@@ -4700,7 +5045,7 @@ fun encode_vector_convert(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.Byte
     if (sel rs.err) { ret err[fail.Fail].err{rs.err}; }
     val planned: opt[convplan.Plan] = xconv_plan(mi.opcode,
         mir.vec_lane_kind(mi.vec_lane) == mir.VEC_LANE_FLOAT, mir.vec_lane_elem_bytes(mi.vec_lane),
-        mir.vec_lane_from_kind(mi.vec_lane) == mir.VEC_LANE_FLOAT, mir.vec_lane_from_bytes(mi.vec_lane));
+        mir.vec_lane_from_kind(mi.vec_lane) == mir.VEC_LANE_FLOAT, mir.vec_lane_from_bytes(mi.vec_lane), direct);
     if (sel planned.none) { ret err[fail.Fail].err{fail.message("encode: vector conversion outside the x86_64 packed table")}; }
     var p: convplan.Plan = planned.some;
     ret emit_xconv_to(?p, rd.ok, rs.ok, buf);
@@ -4801,6 +5146,22 @@ fun pmovzx_op(w: u8) u16 {
     ret x64.PMOVZXDQ;
 }
 
+# the one sse41 extension from `from`-byte to `to`-byte lanes
+fun pmov_op(signed: bool, from: u8, to: u8) u16 {
+    if (to == from * 2) {
+        if (signed) { ret pmovsx_op(from); }
+        ret pmovzx_op(from);
+    }
+    if (signed) {
+        if (from == 2) { ret x64.PMOVSXWQ; }
+        if (to == 4)   { ret x64.PMOVSXBD; }
+        ret x64.PMOVSXBQ;
+    }
+    if (from == 2) { ret x64.PMOVZXWQ; }
+    if (to == 4)   { ret x64.PMOVZXBD; }
+    ret x64.PMOVZXBQ;
+}
+
 # the lane-halving extension the x86_64 packed table declares at every integer
 # width (#3738): on the SSE2 baseline the half is unpacked against zero or
 # against its own sign mask, low half through punpckl*, high half through
@@ -4857,6 +5218,33 @@ fun encode_vector_widen_half(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir
     val body:  err[fail.Fail] = emit_vec_widen_half_body(mi.opcode == mir.MIR_VEC_WIDEN_S, base != 0, from, sse41, rs.ok, ?st.buf);
     if (sel body.err) { ret body; }
     ret emit_vec_store(rd.ok, float_scratch0(), ?st.buf);
+}
+
+# the widening group sum the x86_64 packed table declares, bytes into
+# quadwords: psadbw against zero sums each quadword's eight bytes into it
+fun encode_vector_widen_sum(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.ByteBuf) err[fail.Fail] {
+    if (mi.operand_count < 2) { ret err[fail.Fail].err{fail.message("encode: widening lane sum missing operands")}; }
+    if (mir.vec_lane_kind(mi.vec_lane) != mir.VEC_LANE_INT || mir.vec_lane_from_kind(mi.vec_lane) != mir.VEC_LANE_INT
+        || mir.vec_lane_elem_bytes(mi.vec_lane) != 8 || mir.vec_lane_from_bytes(mi.vec_lane) != 1) {
+        ret err[fail.Fail].err{fail.message("encode: widening lane sum outside the x86_64 packed table")};
+    }
+    val rd: res[isa.Operand, fail.Fail] = mir_to_operand(f, ?mi.operands[0], 16);
+    if (sel rd.err) { ret err[fail.Fail].err{rd.err}; }
+    val rs: res[isa.Operand, fail.Fail] = mir_to_operand(f, ?mi.operands[1], 16);
+    if (sel rs.err) { ret err[fail.Fail].err{rs.err}; }
+    val body: err[fail.Fail] = emit_vec_widen_sum_body(rs.ok, buf);
+    if (sel body.err) { ret body; }
+    ret emit_vec_store(rd.ok, float_scratch0(), buf);
+}
+
+fun emit_vec_widen_sum_body(src: isa.Operand, buf: *enc.ByteBuf) err[fail.Fail] {
+    val s0: i32            = float_scratch0();
+    val s1: i32            = float_scratch1();
+    val l0: err[fail.Fail] = emit_vec_load(src, s0, buf);
+    if (sel l0.err) { ret l0; }
+    val z: err[fail.Fail] = emit_packed_op(x64.PXOR, s1, vec_reg(s1), buf);
+    if (sel z.err) { ret z; }
+    ret emit_packed_op(x64.PSADBW, s0, vec_reg(s1), buf);
 }
 
 # the pshufd selector that moves doubleword `first` and those above it to the
@@ -5081,25 +5469,7 @@ fun encode_vector_var_shift(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.
     if (sel rl.err) { ret err[fail.Fail].err{rl.err}; }
     val rc: res[isa.Operand, fail.Fail] = mir_to_operand(f, ?mi.operands[2], 16);
     if (sel rc.err) { ret err[fail.Fail].err{rc.err}; }
-    val dst:   isa.Operand = rd.ok;
-    val lhs:   isa.Operand = rl.ok;
-    val count: isa.Operand = rc.ok;
-    var work:  i32         = float_scratch0();
-    if (dst.kind == isa.OPK_REG) { work = dst.reg; }
-    var src: i32 = work;
-    if (lhs.kind == isa.OPK_REG) { src = lhs.reg; }
-    or {
-        # the counts stay where they are, so a count in the work register
-        # would be overwritten by the load: form the result in scratch0
-        if (count.kind == isa.OPK_REG && count.reg == work) { work = float_scratch0(); }
-        src = work;
-        val ll: err[fail.Fail] = emit_vec_load(lhs, work, buf);
-        if (sel ll.err) { ret ll; }
-    }
-    val sh: err[fail.Fail] = emit_vex3(opc, work, src, count, buf);
-    if (sel sh.err)                                 { ret sh; }
-    if (dst.kind == isa.OPK_REG && dst.reg == work) { ret err[fail.Fail].ok{}; }
-    ret emit_vec_store(dst, work, buf);
+    ret emit_vec3_ops(opc, rd.ok, rl.ok, rc.ok, buf);
 }
 
 fun var_shift_vec_op(op: mir.MirOpcode) isa.VecOp {
@@ -5167,6 +5537,8 @@ fun packed_arith_opcode(op: mir.MirOpcode, vec_lane: u32) u16 {
         }
         if (eb == 2) { ret x64.PMULLW; }
     }
+    if (op == mir.MIR_MUL_HI_S && !is_float && eb == 2) { ret x64.PMULHW; }
+    if (op == mir.MIR_MUL_HI_U && !is_float && eb == 2) { ret x64.PMULHUW; }
     if (op == mir.MIR_SEL_DIV_U || op == mir.MIR_SEL_DIV_S) {
         if (is_float) {
             if (eb == 4) { ret x64.DIVPS; }
@@ -5232,8 +5604,10 @@ fun emit_vec_mul_i64_body(lhs: isa.Operand, rhs: isa.Operand, buf: *enc.ByteBuf)
 
 # the integer multiplies the packed table declares without a single baseline
 # instruction: 32-bit lanes are pmulld when the declared set holds sse41 and
-# the pmuludq pair otherwise, 64-bit lanes the three-pmuludq sequence (#3739)
-fun emit_vec_mul_sequence(sse41: bool, eb: u8, dst: isa.Operand, lhs: isa.Operand, rhs: isa.Operand, buf: *enc.ByteBuf) err[fail.Fail] {
+# the pmuludq pair otherwise (#3739), 64-bit lanes vpmullq when it holds
+# avx512dq and avx512vl (#3749) and the three-pmuludq sequence otherwise
+fun emit_vec_mul_sequence(sse41: bool, avx512dq: bool, eb: u8, dst: isa.Operand, lhs: isa.Operand, rhs: isa.Operand, buf: *enc.ByteBuf) err[fail.Fail] {
+    if (eb == 8 && avx512dq) { ret emit_vec3_ops(x64.VPMULLQ, dst, lhs, rhs, buf); }
     if (eb == 4 && sse41) {
         val ll: err[fail.Fail] = emit_vec_load(lhs, float_scratch0(), buf);
         if (sel ll.err) { ret ll; }
@@ -5266,13 +5640,51 @@ fun encode_vector_arith(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirI
     val rhs: isa.Operand = rr.ok;
 
     if (mi.opcode == mir.MIR_SEL_MUL && mir.vec_lane_kind(mi.vec_lane) == mir.VEC_LANE_INT && mir.vec_lane_elem_bytes(mi.vec_lane) >= 4) {
-        # pmulld is the packed table's sse41 row of the 32-bit lane multiply
-        val sse41: bool = isa.packed_row_selected_by(st.model, isa.VEC_OP_MUL, false, 32, 32, x64.EXT_SSE41);
-        ret emit_vec_mul_sequence(sse41, mir.vec_lane_elem_bytes(mi.vec_lane), dst, lhs, rhs, buf);
+        # pmulld is the packed table's sse41 row of the 32-bit lane multiply,
+        # vpmullq its avx512dq and avx512vl row of the 64-bit one
+        val sse41:    bool = isa.packed_row_selected_by(st.model, isa.VEC_OP_MUL, false, 32, 32, x64.EXT_SSE41);
+        val avx512dq: bool = isa.packed_row_selected_by(st.model, isa.VEC_OP_MUL, false, 64, 64, x64.EXT_AVX512DQ | x64.EXT_AVX512VL);
+        ret emit_vec_mul_sequence(sse41, avx512dq, mir.vec_lane_elem_bytes(mi.vec_lane), dst, lhs, rhs, buf);
     }
     val opc: u16 = packed_arith_opcode(mi.opcode, mi.vec_lane);
     if (opc == 0xFFFF) { ret err[fail.Fail].err{fail.message("encode: unsupported packed vector op / lane combination")}; }
+    ret emit_packed_binary(opc, dst, lhs, rhs, buf);
+}
 
+# the lanes of lo and hi from the half's first lane on, interleaved into lanes
+# twice as wide: punpckl* for the low half, punpckh* for the high (#4119)
+fun encode_vector_interleave(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.ByteBuf) err[fail.Fail] {
+    if (mi.operand_count < 3) { ret err[fail.Fail].err{fail.message("encode: lane interleave missing operands")}; }
+    val rd: res[isa.Operand, fail.Fail] = mir_to_operand(f, ?mi.operands[0], 16);
+    if (sel rd.err) { ret err[fail.Fail].err{rd.err}; }
+    val rl: res[isa.Operand, fail.Fail] = mir_to_operand(f, ?mi.operands[1], 16);
+    if (sel rl.err) { ret err[fail.Fail].err{rl.err}; }
+    val rh: res[isa.Operand, fail.Fail] = mir_to_operand(f, ?mi.operands[2], 16);
+    if (sel rh.err) { ret err[fail.Fail].err{rh.err}; }
+    val from: u8 = mir.vec_lane_from_bytes(mi.vec_lane);
+    if (mir.vec_lane_kind(mi.vec_lane) != mir.VEC_LANE_INT || mir.vec_lane_from_kind(mi.vec_lane) != mir.VEC_LANE_INT
+        || mir.vec_lane_elem_bytes(mi.vec_lane) != from * 2 || from > 4) {
+        ret err[fail.Fail].err{fail.message("encode: lane interleave lanes are not integer lanes doubling in width")};
+    }
+    var high: bool = false;
+    if (mi.operand_count >= 4) {
+        if (mi.operands[3].kind != mir.MIR_OP_IMM) {
+            ret err[fail.Fail].err{fail.message("encode: lane interleave half is not an immediate")};
+        }
+        val base: i64 = mi.operands[3].imm;
+        if (base != 0 && base != mir.vec_lane_count(mi.vec_lane)::i64) {
+            ret err[fail.Fail].err{fail.message("encode: lane interleave base names neither half")};
+        }
+        high = base != 0;
+    }
+    var opc: u16 = punpckl_op(from);
+    if (high) { opc = punpckh_op(from); }
+    ret emit_packed_binary(opc, rd.ok, rl.ok, rh.ok, buf);
+}
+
+# dst = lhs op rhs for a two-operand packed instruction that writes its first
+# operand
+fun emit_packed_binary(opc: u16, dst: isa.Operand, lhs: isa.Operand, rhs: isa.Operand, buf: *enc.ByteBuf) err[fail.Fail] {
     # a register destination is the work register: the op runs in place when
     # the allocator tied it to the left operand, and otherwise after one copy
     # of the left operand, unless the right operand is the destination itself
@@ -5785,21 +6197,27 @@ fun encode_cbr(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32, mi: *mir
     test_inst.flags  = width_flags(mi.width);
     encode_inst(?test_inst, ?st.buf);
 
+    val invert:    bool     = enc.cbr_inverts(st, then_block, else_block);
+    var taken:     u32      = then_block;
     val jne_start: usize    = st.buf.len;
     var jne:       isa.Inst = isa.inst_blank();
     jne.opcode = x64.JNE;
+    if (invert) {
+        jne.opcode = x64.JE;
+        taken      = else_block;
+    }
     val fp: err[fail.Fail] = flags_pair(test_inst.opcode, jne.opcode);
     if (sel fp.err) { ret fp; }
-    jne.dst  = isa.make_block_label(then_block);
+    jne.dst  = isa.make_block_label(taken);
     jne.size = DEFAULT_OPERAND_SIZE;
     val jne_size: i32 = encode_inst(?jne, ?st.buf);
     if (jne_size <= 0) { ret err[fail.Fail].err{fail.message("encode: conditional branch failed to encode")}; }
     val jne_patch: u32            = (jne_start + (jne_size - 4)::usize)::u32;
     val jne_next:  u32            = (jne_start + jne_size::usize)::u32;
-    val fj:        err[fail.Fail] = enc.push_fixup(st, jne_patch, jne_next, then_block, fn_base);
+    val fj:        err[fail.Fail] = enc.push_fixup(st, jne_patch, jne_next, taken, fn_base);
     if (sel fj.err) { ret err[fail.Fail].err{fj.err}; }
 
-    if (enc.branch_falls_through(st, else_block)) { ret err[fail.Fail].ok{}; }
+    if (invert || enc.branch_falls_through(st, else_block)) { ret err[fail.Fail].ok{}; }
     val jmp_start: usize    = st.buf.len;
     var jmp:       isa.Inst = isa.inst_blank();
     jmp.opcode = x64.JMP;
@@ -5823,6 +6241,19 @@ fun fused_jcc_opcode(op: mir.MirOpcode) u16 {
     ret x64.JBE;
 }
 
+fun inverse_jcc(op: u16) u16 {
+    if (op == x64.JE)  { ret x64.JNE; }
+    if (op == x64.JNE) { ret x64.JE; }
+    if (op == x64.JL)  { ret x64.JGE; }
+    if (op == x64.JGE) { ret x64.JL; }
+    if (op == x64.JLE) { ret x64.JG; }
+    if (op == x64.JG)  { ret x64.JLE; }
+    if (op == x64.JB)  { ret x64.JAE; }
+    if (op == x64.JAE) { ret x64.JB; }
+    if (op == x64.JBE) { ret x64.JA; }
+    ret x64.JBE;
+}
+
 fun encode_fused_cbr(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32, mi: *mir.MirInstr) err[fail.Fail] {
     if (mi.operand_count < 4) {
         ret err[fail.Fail].err{fail.message("encode: fused compare-branch missing operands")};
@@ -5837,21 +6268,27 @@ fun encode_fused_cbr(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32, mi
     val rc: res[u16, fail.Fail] = emit_flag_cmp(f, ?mi.operands[0], ?mi.operands[1], mi.width, ?st.buf);
     if (sel rc.err) { ret err[fail.Fail].err{rc.err}; }
 
+    val invert:    bool     = enc.cbr_inverts(st, then_block, else_block);
+    var taken:     u32      = then_block;
     val jcc_start: usize    = st.buf.len;
     var jcc:       isa.Inst = isa.inst_blank();
     jcc.opcode = fused_jcc_opcode(mi.opcode);
+    if (invert) {
+        jcc.opcode = inverse_jcc(jcc.opcode);
+        taken      = else_block;
+    }
     val fp: err[fail.Fail] = flags_pair(rc.ok, jcc.opcode);
     if (sel fp.err) { ret fp; }
-    jcc.dst  = isa.make_block_label(then_block);
+    jcc.dst  = isa.make_block_label(taken);
     jcc.size = DEFAULT_OPERAND_SIZE;
     val jcc_size: i32 = encode_inst(?jcc, ?st.buf);
     if (jcc_size <= 0) { ret err[fail.Fail].err{fail.message("encode: fused compare-branch failed to encode")}; }
     val jcc_patch: u32            = (jcc_start + (jcc_size - 4)::usize)::u32;
     val jcc_next:  u32            = (jcc_start + jcc_size::usize)::u32;
-    val fj:        err[fail.Fail] = enc.push_fixup(st, jcc_patch, jcc_next, then_block, fn_base);
+    val fj:        err[fail.Fail] = enc.push_fixup(st, jcc_patch, jcc_next, taken, fn_base);
     if (sel fj.err) { ret err[fail.Fail].err{fj.err}; }
 
-    if (enc.branch_falls_through(st, else_block)) {
+    if (invert || enc.branch_falls_through(st, else_block)) {
         enc.close_cmp_varlocs(st, instr_start, st.buf.len::u32);
         ret err[fail.Fail].ok{};
     }
@@ -5996,6 +6433,14 @@ val X64P_VEC:    u16 = 6;
 val X64P_VECI:   u16 = 7;
 # a vector register written from a vector register and a vector register or memory
 val X64P_VEC3: u16 = 12;
+# a string instruction: no operand, rsi, rdi and rcx implicit, and an optional
+# repeat prefix (X64_PREFIXES)
+val X64P_STRING: u16 = 13;
+# movq between a vector register's low quadword and a 64-bit general register
+val X64P_MOVQ: u16 = 14;
+# a packed shift of a vector register by an 8-bit immediate, or for a row with
+# a count form by a vector register or memory's low quadword
+val X64P_VSHIFT: u16 = 15;
 
 val X64W_MASK:    u16 = 0x3000;
 val X64W_NARROW:  u16 = 0x1000;
@@ -6009,6 +6454,12 @@ val X64F_INDIRECT: u16 = 0x0200;
 # a packed move, which may also store its vector register into memory
 val X64F_VSTORE: u16 = 0x0400;
 
+# a string instruction's repeat prefix: f3 or f2, and whether it was spelled
+# with a condition (repe, repz, repne, repnz), which only a compare takes
+val X64F_REP:    u16 = 0x0800;
+val X64F_REPNE:  u16 = 0x4000;
+val X64F_REPCND: u16 = 0x8000;
+
 val X64_SYSCALL_WRITES: u32 = 0x803;
 
 val X64_EDX_EAX_WRITES: u32 = 0x5;
@@ -6018,6 +6469,12 @@ val X64_RAX_WRITE:      u32 = 0x1;
 val X64_CPUID_WRITES: u32 = 0xF;
 
 val X64_XMM0_READ: u32 = 0x1;
+
+# the registers a string instruction reaches without naming them
+val X64_S_RAX: u32 = 0x01;
+val X64_S_RCX: u32 = 0x02;
+val X64_S_RSI: u32 = 0x40;
+val X64_S_RDI: u32 = 0x80;
 
 val X64_ALL_GP: u32 = 0xFFFF;
 val X64_ALL_FP: u32 = 0xFFFF;
@@ -6030,7 +6487,7 @@ fun x64_width_class(flags: u16) u16 {
     ret flags & X64W_MASK;
 }
 
-val X64_MNEMONIC_COUNT: usize = 154;
+val X64_MNEMONIC_COUNT: usize = 187;
 
 val X64_MNEMONICS: [X64_MNEMONIC_COUNT]iasm.Mnemonic = [X64_MNEMONIC_COUNT]iasm.Mnemonic{
     iasm.Mnemonic{name: "syscall", code: x64.SYSCALL::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_SYSCALL_WRITES, flags: X64P_NONE, words: 0},
@@ -6132,6 +6589,7 @@ val X64_MNEMONICS: [X64_MNEMONIC_COUNT]iasm.Mnemonic = [X64_MNEMONIC_COUNT]iasm.
     iasm.Mnemonic{name: "pmulhw", code: x64.PMULHW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC, words: 0},
     iasm.Mnemonic{name: "pmulhuw", code: x64.PMULHUW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC, words: 0},
     iasm.Mnemonic{name: "pmuludq", code: x64.PMULUDQ::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC, words: 0},
+    iasm.Mnemonic{name: "psadbw", code: x64.PSADBW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC, words: 0},
     iasm.Mnemonic{name: "pand", code: x64.PAND::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC, words: 0},
     iasm.Mnemonic{name: "por", code: x64.POR::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC, words: 0},
     iasm.Mnemonic{name: "pxor", code: x64.PXOR::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC, words: 0},
@@ -6179,6 +6637,12 @@ val X64_MNEMONICS: [X64_MNEMONIC_COUNT]iasm.Mnemonic = [X64_MNEMONIC_COUNT]iasm.
     iasm.Mnemonic{name: "pmovzxbw", code: x64.PMOVZXBW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC, words: 0, requires: x64.EXT_SSE41},
     iasm.Mnemonic{name: "pmovzxwd", code: x64.PMOVZXWD::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC, words: 0, requires: x64.EXT_SSE41},
     iasm.Mnemonic{name: "pmovzxdq", code: x64.PMOVZXDQ::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC, words: 0, requires: x64.EXT_SSE41},
+    iasm.Mnemonic{name: "pmovsxbd", code: x64.PMOVSXBD::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC, words: 0, requires: x64.EXT_SSE41},
+    iasm.Mnemonic{name: "pmovsxbq", code: x64.PMOVSXBQ::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC, words: 0, requires: x64.EXT_SSE41},
+    iasm.Mnemonic{name: "pmovsxwq", code: x64.PMOVSXWQ::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC, words: 0, requires: x64.EXT_SSE41},
+    iasm.Mnemonic{name: "pmovzxbd", code: x64.PMOVZXBD::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC, words: 0, requires: x64.EXT_SSE41},
+    iasm.Mnemonic{name: "pmovzxbq", code: x64.PMOVZXBQ::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC, words: 0, requires: x64.EXT_SSE41},
+    iasm.Mnemonic{name: "pmovzxwq", code: x64.PMOVZXWQ::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC, words: 0, requires: x64.EXT_SSE41},
     iasm.Mnemonic{name: "pblendw", code: x64.PBLENDW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VECI, words: 0, requires: x64.EXT_SSE41},
     iasm.Mnemonic{name: "pinsrd", code: x64.PINSRD::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VECG, words: 0, requires: x64.EXT_SSE41},
     iasm.Mnemonic{name: "pextrd", code: x64.PEXTRD::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VECG, words: 0, requires: x64.EXT_SSE41},
@@ -6195,7 +6659,79 @@ val X64_MNEMONICS: [X64_MNEMONIC_COUNT]iasm.Mnemonic = [X64_MNEMONIC_COUNT]iasm.
     iasm.Mnemonic{name: "vpsravd", code: x64.VPSRAVD::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC3, words: 0, requires: x64.EXT_AVX2},
     iasm.Mnemonic{name: "vpsllvq", code: x64.VPSLLVQ::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC3, words: 0, requires: x64.EXT_AVX2},
     iasm.Mnemonic{name: "vpsrlvq", code: x64.VPSRLVQ::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC3, words: 0, requires: x64.EXT_AVX2},
+    iasm.Mnemonic{name: "vpmullq", code: x64.VPMULLQ::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VEC3, words: 0, requires: x64.EXT_AVX512DQ | x64.EXT_AVX512VL},
+    iasm.Mnemonic{name: "movq", code: x64.MOVQ::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_MOVQ, words: 0},
+    iasm.Mnemonic{name: "pslldq", code: x64.PSLLDQ::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VSHIFT, words: 0},
+    iasm.Mnemonic{name: "psrldq", code: x64.PSRLDQ::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VSHIFT, words: 0},
+    iasm.Mnemonic{name: "psllq", code: x64.PSLLQ::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VSHIFT, words: 0},
+    iasm.Mnemonic{name: "psrlq", code: x64.PSRLQ::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: X64P_VSHIFT, words: 0},
+
+    iasm.Mnemonic{name: "movsb", code: x64.MOVSB::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_S_RSI | X64_S_RDI, flags: X64P_STRING, words: 0, reads_gp: X64_S_RSI | X64_S_RDI, addr_gp: X64_S_RSI | X64_S_RDI, loads_gp: X64_S_RSI},
+    iasm.Mnemonic{name: "movsw", code: x64.MOVSW::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_S_RSI | X64_S_RDI, flags: X64P_STRING, words: 0, reads_gp: X64_S_RSI | X64_S_RDI, addr_gp: X64_S_RSI | X64_S_RDI, loads_gp: X64_S_RSI},
+    iasm.Mnemonic{name: "movsd", code: x64.MOVSD_STRING::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_S_RSI | X64_S_RDI, flags: X64P_STRING, words: 0, reads_gp: X64_S_RSI | X64_S_RDI, addr_gp: X64_S_RSI | X64_S_RDI, loads_gp: X64_S_RSI},
+    iasm.Mnemonic{name: "movsq", code: x64.MOVSQ::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_S_RSI | X64_S_RDI, flags: X64P_STRING, words: 0, reads_gp: X64_S_RSI | X64_S_RDI, addr_gp: X64_S_RSI | X64_S_RDI, loads_gp: X64_S_RSI},
+    iasm.Mnemonic{name: "stosb", code: x64.STOSB::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_S_RDI, flags: X64P_STRING, words: 0, reads_gp: X64_S_RAX | X64_S_RDI, addr_gp: X64_S_RDI, loads_gp: 0},
+    iasm.Mnemonic{name: "stosw", code: x64.STOSW::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_S_RDI, flags: X64P_STRING, words: 0, reads_gp: X64_S_RAX | X64_S_RDI, addr_gp: X64_S_RDI, loads_gp: 0},
+    iasm.Mnemonic{name: "stosd", code: x64.STOSD::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_S_RDI, flags: X64P_STRING, words: 0, reads_gp: X64_S_RAX | X64_S_RDI, addr_gp: X64_S_RDI, loads_gp: 0},
+    iasm.Mnemonic{name: "stosq", code: x64.STOSQ::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_S_RDI, flags: X64P_STRING, words: 0, reads_gp: X64_S_RAX | X64_S_RDI, addr_gp: X64_S_RDI, loads_gp: 0},
+    iasm.Mnemonic{name: "lodsb", code: x64.LODSB::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_S_RAX | X64_S_RSI, flags: X64P_STRING, words: 0, reads_gp: X64_S_RSI, addr_gp: X64_S_RSI, loads_gp: X64_S_RSI},
+    iasm.Mnemonic{name: "lodsw", code: x64.LODSW::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_S_RAX | X64_S_RSI, flags: X64P_STRING, words: 0, reads_gp: X64_S_RSI, addr_gp: X64_S_RSI, loads_gp: X64_S_RSI},
+    iasm.Mnemonic{name: "lodsd", code: x64.LODSD::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_S_RAX | X64_S_RSI, flags: X64P_STRING, words: 0, reads_gp: X64_S_RSI, addr_gp: X64_S_RSI, loads_gp: X64_S_RSI},
+    iasm.Mnemonic{name: "lodsq", code: x64.LODSQ::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_S_RAX | X64_S_RSI, flags: X64P_STRING, words: 0, reads_gp: X64_S_RSI, addr_gp: X64_S_RSI, loads_gp: X64_S_RSI},
+    iasm.Mnemonic{name: "cmpsb", code: x64.CMPSB::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_S_RSI | X64_S_RDI, flags: X64P_STRING, words: 0, reads_gp: X64_S_RSI | X64_S_RDI, addr_gp: X64_S_RSI | X64_S_RDI, loads_gp: X64_S_RSI | X64_S_RDI},
+    iasm.Mnemonic{name: "cmpsw", code: x64.CMPSW::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_S_RSI | X64_S_RDI, flags: X64P_STRING, words: 0, reads_gp: X64_S_RSI | X64_S_RDI, addr_gp: X64_S_RSI | X64_S_RDI, loads_gp: X64_S_RSI | X64_S_RDI},
+    iasm.Mnemonic{name: "cmpsd", code: x64.CMPSD::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_S_RSI | X64_S_RDI, flags: X64P_STRING, words: 0, reads_gp: X64_S_RSI | X64_S_RDI, addr_gp: X64_S_RSI | X64_S_RDI, loads_gp: X64_S_RSI | X64_S_RDI},
+    iasm.Mnemonic{name: "cmpsq", code: x64.CMPSQ::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_S_RSI | X64_S_RDI, flags: X64P_STRING, words: 0, reads_gp: X64_S_RSI | X64_S_RDI, addr_gp: X64_S_RSI | X64_S_RDI, loads_gp: X64_S_RSI | X64_S_RDI},
+    iasm.Mnemonic{name: "scasb", code: x64.SCASB::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_S_RDI, flags: X64P_STRING, words: 0, reads_gp: X64_S_RAX | X64_S_RDI, addr_gp: X64_S_RDI, loads_gp: X64_S_RDI},
+    iasm.Mnemonic{name: "scasw", code: x64.SCASW::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_S_RDI, flags: X64P_STRING, words: 0, reads_gp: X64_S_RAX | X64_S_RDI, addr_gp: X64_S_RDI, loads_gp: X64_S_RDI},
+    iasm.Mnemonic{name: "scasd", code: x64.SCASD::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_S_RDI, flags: X64P_STRING, words: 0, reads_gp: X64_S_RAX | X64_S_RDI, addr_gp: X64_S_RDI, loads_gp: X64_S_RDI},
+    iasm.Mnemonic{name: "scasq", code: x64.SCASQ::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_S_RDI, flags: X64P_STRING, words: 0, reads_gp: X64_S_RAX | X64_S_RDI, addr_gp: X64_S_RDI, loads_gp: X64_S_RDI},
 };
+
+# a string instruction's repeat prefixes as GNU as spells them. rep repeats a
+# move, store or load rcx times; the conditioned spellings repeat a compare
+# while its elements are equal (f3) or differ (f2), rcx times at most
+rec X64Prefix {
+    name:  str;
+    flags: u16;
+}
+
+val X64_PREFIX_COUNT: usize = 5;
+
+val X64_PREFIXES: [X64_PREFIX_COUNT]X64Prefix = [X64_PREFIX_COUNT]X64Prefix{
+    X64Prefix{name: "rep", flags: X64F_REP},
+    X64Prefix{name: "repe", flags: X64F_REP | X64F_REPCND},
+    X64Prefix{name: "repz", flags: X64F_REP | X64F_REPCND},
+    X64Prefix{name: "repne", flags: X64F_REPNE | X64F_REPCND},
+    X64Prefix{name: "repnz", flags: X64F_REPNE | X64F_REPCND},
+};
+
+# a repeat prefix and the string row it leads, which also reads and writes
+# rcx, its count
+fun x64_decode(body: str, lo: usize, hi: usize, m: *iasm.Mnemonic, mlen: *usize) bool {
+    var p: usize = 0;
+    for (p < X64_PREFIX_COUNT) {
+        val pre:  *X64Prefix = ?X64_PREFIXES[p];
+        val plen: usize      = str_len(pre.name);
+        p = p + 1;
+        if (lo + plen >= hi || !str_region_equals(body, lo, plen, pre.name) || !iasm.is_space(body[lo + plen])) { cnt; }
+        var a: usize = lo + plen;
+        for (a < hi && iasm.is_space(body[a])) { a = a + 1; }
+        var i: usize = 0;
+        for (i < X64_MNEMONIC_COUNT) {
+            val row: *iasm.Mnemonic = ?X64_MNEMONICS[i];
+            i = i + 1;
+            if (x64_pattern(row.flags) != X64P_STRING || !str_region_equals(body, a, hi - a, row.name)) { cnt; }
+            @m         = @row;
+            m.flags    = m.flags | pre.flags;
+            m.implicit = m.implicit | X64_S_RCX;
+            m.reads_gp = m.reads_gp | X64_S_RCX;
+            @mlen      = hi - lo;
+            ret true;
+        }
+    }
+    ret false;
+}
 
 fun x64_reg_region(body: str, lo: usize, hi: usize, op: *iasm.Operand) bool {
     val len: usize = hi - lo;
@@ -6821,6 +7357,7 @@ fun x64_parse(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) err[fail.Fail] {
         if (n != 0) { ret err[fail.Fail].err{iasm.reject(c, dkind.ASM_OPERAND, "inline-asm instruction takes no operands")}; }
         ret err[fail.Fail].ok{};
     }
+    if (pat == X64P_STRING) { ret x64_check_rep(c, s); }
     if (pat == X64P_BRANCH) {
         if (n != 1) { ret err[fail.Fail].err{iasm.reject(c, dkind.ASM_OPERAND, "inline-asm branch expects one target")}; }
         ret x64_branch_target(c, s, item);
@@ -6835,6 +7372,8 @@ fun x64_parse(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) err[fail.Fail] {
     if (pat == X64P_VEC || pat == X64P_VECI) { ret x64_parse_vec(c, s, item); }
     if (pat == X64P_VECG)                    { ret x64_parse_vec_gp(c, s, item); }
     if (pat == X64P_VEC3)                    { ret x64_parse_vec3(c, s, item); }
+    if (pat == X64P_MOVQ)                    { ret x64_parse_movq(c, s, item); }
+    if (pat == X64P_VSHIFT)                  { ret x64_parse_vshift(c, s, item); }
     if (pat == X64P_WIDEREG)                 { ret x64_parse_widereg(c, s, item); }
 
     if (s.m.code == x64.MOV::u32 && n == 2) {
@@ -6907,6 +7446,24 @@ fun x64_parse(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) err[fail.Fail] {
         item.ref_len = item.ops[1].name_len;
     }
     ret x64_check_widths(c, s, item);
+}
+
+# a compare repeats under a condition, and a move, store or load under plain rep
+fun x64_check_rep(c: *iasm.Cursor, s: *iasm.Stmt) err[fail.Fail] {
+    if ((s.m.flags & (X64F_REP | X64F_REPNE)) == 0) { ret err[fail.Fail].ok{}; }
+    val compares: bool = x64.describe(s.m.code::u16).cls.writes_flags;
+    val cond:     bool = (s.m.flags & X64F_REPCND) != 0;
+    if (compares && !cond) {
+        ret err[fail.Fail].err{iasm.reject(c, dkind.ASM_OPERAND, iasm.span_message(c, "inline-asm '", s.lo, s.hi,
+            "' repeats a compare with rep; spell the condition it stops on, repe or repne",
+            "an inline-asm string compare repeats under repe or repne, not rep"))};
+    }
+    if (!compares && cond) {
+        ret err[fail.Fail].err{iasm.reject(c, dkind.ASM_OPERAND, iasm.span_message(c, "inline-asm '", s.lo, s.hi,
+            "' conditions a string instruction that compares nothing; repeat it with rep",
+            "an inline-asm string move, store or load repeats under rep, not repe or repne"))};
+    }
+    ret err[fail.Fail].ok{};
 }
 
 # a memory operand naming a symbol becomes the item's reference, as on the two-operand forms
@@ -7042,10 +7599,10 @@ fun x64_emit_vec_gp(st: *enc.EncodeState, item: *iasm.Item, sym: intern.StrId) e
 
 fun x64_vec3_refused(c: *iasm.Cursor, s: *iasm.Stmt) err[fail.Fail] {
     ret x64_vec_refused(c, s, "' takes a vector register destination, a vector register source and a vector register or 128-bit memory source",
-        "an inline-asm vex instruction takes a vector register destination, a vector register source and a vector register or 128-bit memory source");
+        "an inline-asm vex or evex instruction takes a vector register destination, a vector register source and a vector register or 128-bit memory source");
 }
 
-# the vex three-operand form: xmm, xmm, xmm/m128
+# the vex or evex three-operand form: xmm, xmm, xmm/m128
 fun x64_parse_vec3(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) err[fail.Fail] {
     if (s.nargs != 3) { ret x64_vec3_refused(c, s); }
     var i: u32 = 0;
@@ -7073,8 +7630,106 @@ fun x64_emit_vec3(st: *enc.EncodeState, item: *iasm.Item, sym: intern.StrId) err
     val src1:  isa.Operand    = x64_vec_operand(?item.ops[1], sym);
     val src2:  isa.Operand    = x64_vec_operand(?item.ops[2], sym);
     val start: usize          = st.buf.len;
-    val r:     err[fail.Fail] = emit_vex3(item.code::u16, dst.reg, src1.reg, src2, ?st.buf);
+    val r:     err[fail.Fail] = emit_vec3(item.code::u16, dst.reg, src1.reg, src2, ?st.buf);
     if (sel r.err)               { ret r; }
+    if (item.ref != iasm.AR_SYM) { ret err[fail.Fail].ok{}; }
+    val n: i32 = (st.buf.len - start)::i32;
+    ret x64_push_pc32(st, sym, start, n - 4, n);
+}
+
+fun x64_movq_refused(c: *iasm.Cursor, s: *iasm.Stmt) err[fail.Fail] {
+    ret x64_vec_refused(c, s, "' moves between a vector register and a 64-bit general register, such as movq xmm0, rax",
+        "an inline-asm movq moves between a vector register and a 64-bit general register, such as movq xmm0, rax");
+}
+
+# movq xmm, r64 zeroes the upper quadword; movq r64, xmm reads the lower one
+fun x64_parse_movq(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) err[fail.Fail] {
+    if (s.nargs != 2) { ret x64_movq_refused(c, s); }
+    var i: u32 = 0;
+    for (i < 2) {
+        var role: str = "source ";
+        if (i == 0) { role = "destination "; }
+        val r: err[fail.Fail] = x64_operand(c, s.arg_lo[i::usize], s.arg_hi[i::usize], role, ?item.ops[i::usize]);
+        if (sel r.err) { ret r; }
+        i = i + 1;
+    }
+    val a:    *iasm.Operand = ?item.ops[0];
+    val b:    *iasm.Operand = ?item.ops[1];
+    val a_gp: bool          = a.kind == iasm.AOP_REG && !iasm.is_vreg(a) && a.size == 8;
+    val b_gp: bool          = b.kind == iasm.AOP_REG && !iasm.is_vreg(b) && b.size == 8;
+    if ((iasm.is_vreg(a) && b_gp) || (a_gp && iasm.is_vreg(b))) { ret err[fail.Fail].ok{}; }
+    ret x64_movq_refused(c, s);
+}
+
+fun x64_emit_movq(st: *enc.EncodeState, item: *iasm.Item) err[fail.Fail] {
+    var mi: isa.Inst = isa.inst_blank();
+    mi.opcode = x64.MOVQ;
+    mi.size   = 8;
+    mi.flags  = x64.FLAG_REX_W::u16;
+    mi.dst    = x64_movq_operand(?item.ops[0]);
+    mi.src1   = x64_movq_operand(?item.ops[1]);
+    if (encode_inst(?mi, ?st.buf) <= 0) { ret err[fail.Fail].err{fail.message("encode: inline-asm movq encoded to no bytes")}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun x64_movq_operand(op: *iasm.Operand) isa.Operand {
+    if (iasm.is_vreg(op)) { ret vec_reg(isa.regid_make(isa.REG_CLASS_ID_XMM, op.reg)); }
+    ret isa.make_reg(op.reg, 8);
+}
+
+# whether a packed shift also takes its count from a vector register or memory
+fun x64_vshift_counts(code: u32) bool {
+    val op: u16 = code::u16;
+    ret op == x64.PSLLQ || op == x64.PSRLQ;
+}
+
+fun x64_vshift_refused(c: *iasm.Cursor, s: *iasm.Stmt) err[fail.Fail] {
+    if (x64_vshift_counts(s.m.code)) {
+        ret x64_vec_refused(c, s, "' shifts a vector register by an immediate from 0 to 255, or by the low quadword of a vector register or 128-bit memory",
+            "an inline-asm packed shift shifts a vector register by an immediate from 0 to 255, or by the low quadword of a vector register or 128-bit memory");
+    }
+    ret x64_vec_refused(c, s, "' shifts a vector register by an immediate from 0 to 255",
+        "an inline-asm byte shift shifts a vector register by an immediate from 0 to 255");
+}
+
+fun x64_parse_vshift(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) err[fail.Fail] {
+    if (s.nargs != 2) { ret x64_vshift_refused(c, s); }
+    var i: u32 = 0;
+    for (i < 2) {
+        var role: str = "source ";
+        if (i == 0) { role = "destination "; }
+        val r: err[fail.Fail] = x64_operand(c, s.arg_lo[i::usize], s.arg_hi[i::usize], role, ?item.ops[i::usize]);
+        if (sel r.err) { ret r; }
+        i = i + 1;
+    }
+    val dst: *iasm.Operand = ?item.ops[0];
+    val cnt: *iasm.Operand = ?item.ops[1];
+    if (!iasm.is_vreg(dst)) { ret x64_vshift_refused(c, s); }
+    if (cnt.kind == iasm.AOP_IMM) {
+        if (cnt.imm < 0 || cnt.imm > 255) { ret x64_vshift_refused(c, s); }
+        ret err[fail.Fail].ok{};
+    }
+    if (!x64_vshift_counts(s.m.code) || !(iasm.is_vreg(cnt) || x64_vec_mem(cnt))) { ret x64_vshift_refused(c, s); }
+    if (cnt.kind == iasm.AOP_MEM && cnt.size != 0 && cnt.size != 16)              { ret x64_vshift_refused(c, s); }
+    if ((cnt.flags & iasm.AOF_MEM_SYM) != 0) {
+        item.ref     = iasm.AR_SYM;
+        item.ref_off = cnt.name_off;
+        item.ref_len = cnt.name_len;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun x64_emit_vshift(st: *enc.EncodeState, item: *iasm.Item, sym: intern.StrId) err[fail.Fail] {
+    val op:  u16           = item.code::u16;
+    val dst: isa.Operand   = x64_vec_operand(?item.ops[0], sym);
+    val cnt: *iasm.Operand = ?item.ops[1];
+    if (cnt.kind == iasm.AOP_IMM) { ret emit_packed_shift_imm(op, dst.reg, cnt.imm::u8, ?st.buf); }
+    val by:     isa.Operand = x64_vec_operand(cnt, sym);
+    val opbyte: opt[u8]     = packed_shift_count_opbyte(op);
+    if (sel opbyte.none) { ret err[fail.Fail].err{fail.message(PACKED_OPCODE_UNKNOWN)}; }
+    val start: usize = st.buf.len;
+    emit_sse_rm(0x66, opbyte.some, dst.reg, by, ?st.buf);
+    note_packed(?st.buf, start, op, dst, by);
     if (item.ref != iasm.AR_SYM) { ret err[fail.Fail].ok{}; }
     val n: i32 = (st.buf.len - start)::i32;
     ret x64_push_pc32(st, sym, start, n - 4, n);
@@ -7402,6 +8057,13 @@ fun x64_build(item: *iasm.Item, sym: intern.StrId) isa.Inst {
         mi.flags = enc_flags;
         ret mi;
     }
+    if (pat == X64P_STRING) {
+        if ((item.flags & X64F_REP) != 0)   { enc_flags = enc_flags | x64.FLAG_REP::u16; }
+        if ((item.flags & X64F_REPNE) != 0) { enc_flags = enc_flags | x64.FLAG_REPNE::u16; }
+        mi.flags = enc_flags;
+        mi.size  = x64_string_row(mi.opcode).width;
+        ret mi;
+    }
     if (pat == X64P_XFER) {
         if ((item.flags & X64F_INDIRECT) == 0) {
             mi.flags = enc_flags;
@@ -7478,6 +8140,8 @@ fun x64_emit(st: *enc.EncodeState, c: *iasm.Cursor, l: *iasm.Labels, item: *iasm
     if (pat == X64P_VEC || pat == X64P_VECI) { ret x64_emit_vec(st, item, sym); }
     if (pat == X64P_VECG)                    { ret x64_emit_vec_gp(st, item, sym); }
     if (pat == X64P_VEC3)                    { ret x64_emit_vec3(st, item, sym); }
+    if (pat == X64P_MOVQ)                    { ret x64_emit_movq(st, item); }
+    if (pat == X64P_VSHIFT)                  { ret x64_emit_vshift(st, item, sym); }
 
     var mi: isa.Inst = x64_build(item, sym);
 
@@ -7549,7 +8213,7 @@ fun x64_grammar() iasm.Grammar {
     g.row_count  = X64_MNEMONIC_COUNT;
     g.data       = ?iasm.DIRECTIVES_WORD16[0];
     g.data_count = iasm.DIRECTIVE_COUNT;
-    g.decode     = nil;
+    g.decode     = x64_decode;
     g.parse      = x64_parse;
     g.emit       = x64_emit;
     g.patch      = x64_patch;
@@ -7658,7 +8322,7 @@ fun width_flags_for(size: u8) u16 {
 var t_model_x64: isa.MachineModel;
 
 #[testing]
-val T_X64_GATED_ROWS: [18]isa.PackedForm = [18]isa.PackedForm{
+val T_X64_GATED_ROWS: [19]isa.PackedForm = [19]isa.PackedForm{
     isa.PackedForm{op: isa.VEC_OP_RANGE, is_float: false, lane_bits: 8, from_bits: 8, ext: x64.EXT_SSSE3},
     isa.PackedForm{op: isa.VEC_OP_RANGE, is_float: false, lane_bits: 16, from_bits: 16, ext: x64.EXT_SSSE3},
     isa.PackedForm{op: isa.VEC_OP_RANGE, is_float: false, lane_bits: 32, from_bits: 32, ext: x64.EXT_SSSE3},
@@ -7677,6 +8341,7 @@ val T_X64_GATED_ROWS: [18]isa.PackedForm = [18]isa.PackedForm{
     isa.PackedForm{op: isa.VEC_OP_SHR_U_V, is_float: false, lane_bits: 32, from_bits: 32, ext: x64.EXT_AVX2},
     isa.PackedForm{op: isa.VEC_OP_SHR_U_V, is_float: false, lane_bits: 64, from_bits: 64, ext: x64.EXT_AVX2},
     isa.PackedForm{op: isa.VEC_OP_SHR_S_V, is_float: false, lane_bits: 32, from_bits: 32, ext: x64.EXT_AVX2},
+    isa.PackedForm{op: isa.VEC_OP_MUL, is_float: false, lane_bits: 64, from_bits: 64, ext: x64.EXT_AVX512DQ | x64.EXT_AVX512VL},
 };
 
 #[testing]
@@ -7693,7 +8358,7 @@ fun x64_machine() *isa.MachineModel {
     t_model_x64.has_v128        = true;
     t_model_x64.vector_bits     = isa.VECTOR_BITS_128;
     t_model_x64.packed_forms    = ?T_X64_GATED_ROWS[0];
-    t_model_x64.packed_form_len = 18;
+    t_model_x64.packed_form_len = 19;
     ret ?t_model_x64;
 }
 
@@ -8188,7 +8853,7 @@ test asm_ct_scan__a_secret_segment_base_is_an_address {
 
 #[testing]
 val T_EXT_ALL: u64 = x64.EXT_SSSE3 | x64.EXT_SSE41 | x64.EXT_SHA | x64.EXT_FSGSBASE | x64.EXT_POPCNT | x64.EXT_LZCNT | x64.EXT_BMI1 |
-    x64.EXT_AES | x64.EXT_PCLMUL | x64.EXT_AVX | x64.EXT_AVX2;
+    x64.EXT_AES | x64.EXT_PCLMUL | x64.EXT_AVX | x64.EXT_AVX2 | x64.EXT_AVX512DQ | x64.EXT_AVX512VL;
 
 # a body run under a target selecting `exts`, inside a function admitting `f_exts`
 #[testing]
@@ -8281,6 +8946,14 @@ test asm_extensions__rows_match_gnu_as_and_round_trip {
     if (!t_ext_hex("ptest xmm0, xmm1", "660f3817c1"))                              { bad = 19; }
     if (!t_ext_hex("ptest xmm11, [r8]", "66450f381718"))                           { bad = 20; }
     if (!t_asm_hex("cpuid", "0fa2"))                                               { bad = 21; }
+    if (!t_ext_hex("pmovsxbd xmm1, xmm2", "660f3821ca"))                           { bad = 22; }
+    if (!t_ext_hex("pmovsxbq xmm9, xmm3", "66440f3822cb"))                         { bad = 23; }
+    if (!t_ext_hex("pmovsxwq xmm0, xmm15", "66410f3824c7"))                        { bad = 24; }
+    if (!t_ext_hex("pmovzxbd xmm4, [rsp+8]", "660f3831642408"))                    { bad = 25; }
+    if (!t_ext_hex("pmovzxbq xmm10, xmm11", "66450f3832d3"))                       { bad = 26; }
+    if (!t_ext_hex("pmovzxwq xmm2, [rbx]", "660f383413"))                          { bad = 27; }
+    if (!t_asm_hex("psadbw xmm1, xmm2", "660ff6ca"))                               { bad = 28; }
+    if (!t_asm_hex("psadbw xmm12, [r13]", "66450ff66500"))                         { bad = 29; }
     ret bad;
 }
 
@@ -8327,6 +9000,215 @@ test asm_extensions__avx2_variable_shifts_match_gnu_as_and_round_trip {
     ret bad;
 }
 
+# the bytes GNU as gives an operand-less body, its listing, and the listing
+# assembled back to the same bytes
+#[testing]
+fun t_listed_hex(body: str, listed_want: str, hex: str) bool {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var want: [32]u8;
+    val n:    usize = t_unhex(hex, ?want[0]);
+    var w:    writer.Writer;
+    printer.test_sink_writer(?w);
+    var st: enc.EncodeState;
+    val r:  err[fail.Fail] = t_ext_run(body, 0, 0, ?st, ?alloc, ?w);
+    if (sel r.err)                       { ret false; }
+    if (!t_buf_is(?st.buf, ?want[0], n)) { ret false; }
+    val listed: str = printer.test_sink_text();
+    if (!str_contains(listed, listed_want)) { ret false; }
+    var again: enc.EncodeState;
+    val rr:    err[fail.Fail] = t_ext_run(listed, 0, 0, ?again, ?alloc, nil);
+    if (sel rr.err) { ret false; }
+    ret t_buf_is(?again.buf, ?want[0], n);
+}
+
+# every string instruction at every width, bare and under each prefix spelling,
+# against GNU as 2.47 (`as --64`, intel syntax): 66 leads the repeat prefix and
+# rex.w follows it. the listing round trips, spelling f3 as repe on a compare
+# (#3897)
+test asm_string__rows_match_gnu_as_and_round_trip {
+    var bad: i32 = 0;
+    if (!t_listed_hex("movsb", "movsb", "a4"))                 { bad = 1; }
+    if (!t_listed_hex("movsw", "movsw", "66a5"))               { bad = 2; }
+    if (!t_listed_hex("movsd", "movsd", "a5"))                 { bad = 3; }
+    if (!t_listed_hex("movsq", "movsq", "48a5"))               { bad = 4; }
+    if (!t_listed_hex("stosb", "stosb", "aa"))                 { bad = 5; }
+    if (!t_listed_hex("stosw", "stosw", "66ab"))               { bad = 6; }
+    if (!t_listed_hex("stosd", "stosd", "ab"))                 { bad = 7; }
+    if (!t_listed_hex("stosq", "stosq", "48ab"))               { bad = 8; }
+    if (!t_listed_hex("lodsb", "lodsb", "ac"))                 { bad = 9; }
+    if (!t_listed_hex("lodsw", "lodsw", "66ad"))               { bad = 10; }
+    if (!t_listed_hex("lodsd", "lodsd", "ad"))                 { bad = 11; }
+    if (!t_listed_hex("lodsq", "lodsq", "48ad"))               { bad = 12; }
+    if (!t_listed_hex("cmpsb", "cmpsb", "a6"))                 { bad = 13; }
+    if (!t_listed_hex("cmpsw", "cmpsw", "66a7"))               { bad = 14; }
+    if (!t_listed_hex("cmpsd", "cmpsd", "a7"))                 { bad = 15; }
+    if (!t_listed_hex("cmpsq", "cmpsq", "48a7"))               { bad = 16; }
+    if (!t_listed_hex("scasb", "scasb", "ae"))                 { bad = 17; }
+    if (!t_listed_hex("scasw", "scasw", "66af"))               { bad = 18; }
+    if (!t_listed_hex("scasd", "scasd", "af"))                 { bad = 19; }
+    if (!t_listed_hex("scasq", "scasq", "48af"))               { bad = 20; }
+    if (!t_listed_hex("rep movsb", "rep movsb", "f3a4"))       { bad = 21; }
+    if (!t_listed_hex("rep movsw", "rep movsw", "66f3a5"))     { bad = 22; }
+    if (!t_listed_hex("rep movsd", "rep movsd", "f3a5"))       { bad = 23; }
+    if (!t_listed_hex("rep movsq", "rep movsq", "f348a5"))     { bad = 24; }
+    if (!t_listed_hex("rep stosb", "rep stosb", "f3aa"))       { bad = 25; }
+    if (!t_listed_hex("rep stosw", "rep stosw", "66f3ab"))     { bad = 26; }
+    if (!t_listed_hex("rep stosq", "rep stosq", "f348ab"))     { bad = 27; }
+    if (!t_listed_hex("rep lodsb", "rep lodsb", "f3ac"))       { bad = 28; }
+    if (!t_listed_hex("rep lodsq", "rep lodsq", "f348ad"))     { bad = 29; }
+    if (!t_listed_hex("repe cmpsb", "repe cmpsb", "f3a6"))     { bad = 30; }
+    if (!t_listed_hex("repz cmpsq", "repe cmpsq", "f348a7"))   { bad = 31; }
+    if (!t_listed_hex("repne cmpsb", "repne cmpsb", "f2a6"))   { bad = 32; }
+    if (!t_listed_hex("repnz cmpsw", "repne cmpsw", "66f2a7")) { bad = 33; }
+    if (!t_listed_hex("repe scasb", "repe scasb", "f3ae"))     { bad = 34; }
+    if (!t_listed_hex("repne scasd", "repne scasd", "f2af"))   { bad = 35; }
+    if (!t_listed_hex("repne scasq", "repne scasq", "f248af")) { bad = 36; }
+    ret bad;
+}
+
+# a compare repeats under a condition and nothing else does, and the explicit
+# operand spelling is not a form this table holds
+test asm_string__refuses_prefixes_outside_the_form {
+    var bad: i32 = 0;
+    if (!t_asm_refused("rep cmpsb", "repeats under repe or repne, not rep"))         { bad = bad + 1; }
+    if (!t_asm_refused("rep scasq", "repeats under repe or repne, not rep"))         { bad = bad + 2; }
+    if (!t_asm_refused("repe movsb", "repeats under rep, not repe or repne"))        { bad = bad + 4; }
+    if (!t_asm_refused("repne stosq", "repeats under rep, not repe or repne"))       { bad = bad + 8; }
+    if (!t_asm_refused("rep mov rax, rcx", "unknown inline-asm instruction"))        { bad = bad + 16; }
+    if (!t_asm_refused("movsb byte [rdi], [rsi]", "unknown inline-asm instruction")) { bad = bad + 32; }
+    if (!t_asm_refused("stosb al", "unknown inline-asm instruction"))                { bad = bad + 64; }
+    ret bad;
+}
+
+# each row clobbers the registers it steps, and a repeat prefix adds its count
+test asm_string__clobbers_are_the_implicit_registers {
+    val a: u32 = 1::u32 << x64.RAX::u32;
+    val c: u32 = 1::u32 << x64.RCX::u32;
+    val s: u32 = 1::u32 << x64.RSI::u32;
+    val d: u32 = 1::u32 << x64.RDI::u32;
+    if (!t_clobbers_are("movsq", s | d, 0))          { ret 1; }
+    if (!t_clobbers_are("rep movsb", s | d | c, 0))  { ret 2; }
+    if (!t_clobbers_are("rep stosq", d | c, 0))      { ret 3; }
+    if (!t_clobbers_are("lodsw", a | s, 0))          { ret 4; }
+    if (!t_clobbers_are("repe cmpsd", s | d | c, 0)) { ret 5; }
+    if (!t_clobbers_are("repne scasb", d | c, 0))    { ret 6; }
+    ret 0;
+}
+
+# the emitted instruction's effects: the registers each row reads, writes and
+# addresses through, and a repeat prefix reading rcx and taking the class
+# whose timing is its data; a compare writes the flags
+test inst_effects__string_rows {
+    var e:  ct.InstEffects;
+    var mi: isa.Inst = isa.inst_blank();
+    mi.opcode = x64.STOSQ;
+    inst_effects(?mi, ?e);
+    if (!e.cls.known || e.cls.op != ct.CT_OP_NONE || e.cls.writes_flags)         { ret 1; }
+    if (e.implicit_reads != (X64_RAX | X64_RDI) || e.implicit_writes != X64_RDI) { ret 2; }
+    if (e.implicit_addr != X64_RDI || e.implicit_mem)                            { ret 3; }
+
+    mi.flags = x64.FLAG_REP::u16;
+    inst_effects(?mi, ?e);
+    if (e.cls.op != ct.CT_OP_REP_STRING)                                                               { ret 4; }
+    if (e.implicit_reads != (X64_RAX | X64_RDI | X64_RCX) || e.implicit_writes != (X64_RDI | X64_RCX)) { ret 5; }
+
+    mi        = isa.inst_blank();
+    mi.opcode = x64.CMPSB;
+    mi.flags  = x64.FLAG_REPNE::u16;
+    inst_effects(?mi, ?e);
+    if (e.cls.op != ct.CT_OP_REP_STRING || !e.cls.writes_flags)    { ret 6; }
+    if (e.implicit_addr != (X64_RSI | X64_RDI) || !e.implicit_mem) { ret 7; }
+    ret 0;
+}
+
+# a repeated string instruction is refused on any secret it reads: a count, an
+# address it loads secret memory through, or a value it stores. a public count
+# storing public data into secret memory is admitted, a single step keeps its
+# address registers public, and a secret address is refused as one (#3897)
+test asm_ct_scan__repeated_strings_refuse_secret_data {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var binds: [2]ct.AsmSecret;
+    binds[0] = ct.asm_secret_pointee("p");
+    binds[1] = ct.asm_secret_value("k");
+    val none: ct.CtMulMask = ct.mul_mask_none();
+    var bad:  i32          = 0;
+
+    val zero: err[ct.AsmRefusal] = asm_ct_scan("mov rdi, {p}\nmov rcx, 32\nxor eax, eax\nrep stosb", ?binds[0], 2, none, false, ?alloc);
+    if (sel zero.err) { bad = bad + 1; }
+    val count: err[ct.AsmRefusal] = asm_ct_scan("mov rcx, {k}\nrep movsb", ?binds[0], 2, none, false, ?alloc);
+    if (sel count.err) {
+        if (!str_contains(count.err.message, "variable-latency")) { bad = bad + 2; }
+    }
+    or { bad = bad + 2; }
+    val copy: err[ct.AsmRefusal] = asm_ct_scan("mov rsi, {p}\nmov rcx, 32\nrep movsb", ?binds[0], 2, none, false, ?alloc);
+    if (!sel copy.err) { bad = bad + 4; }
+    val cmp: err[ct.AsmRefusal] = asm_ct_scan("mov rdi, {p}\nmov rcx, 32\nrepe cmpsb", ?binds[0], 2, none, false, ?alloc);
+    if (!sel cmp.err) { bad = bad + 8; }
+    val fill: err[ct.AsmRefusal] = asm_ct_scan("mov rax, {k}\nmov rcx, 32\nrep stosq", ?binds[0], 2, none, false, ?alloc);
+    if (!sel fill.err) { bad = bad + 16; }
+    val step: err[ct.AsmRefusal] = asm_ct_scan("mov rsi, {p}\nlodsb\nlodsb\nmovsb", ?binds[0], 2, none, false, ?alloc);
+    if (sel step.err) { bad = bad + 32; }
+    val loaded: err[ct.AsmRefusal] = asm_ct_scan("mov rsi, {p}\nlodsq\nmov rcx, [rax]", ?binds[0], 2, none, false, ?alloc);
+    if (!sel loaded.err) { bad = bad + 64; }
+    val addr: err[ct.AsmRefusal] = asm_ct_scan("mov rsi, {k}\nmovsb", ?binds[0], 2, none, false, ?alloc);
+    if (sel addr.err) {
+        if (!str_contains(addr.err.message, "addresses memory with a secret value")) { bad = bad + 128; }
+    }
+    or { bad = bad + 128; }
+    ret bad;
+}
+
+# movq between a vector register and a 64-bit general register, and the byte
+# and quadword shifts by an immediate and, for psllq and psrlq, by a vector
+# register or memory, against GNU as 2.47 (`as --64`, intel syntax), low and
+# high registers each, and the listing round trips (#3915)
+test asm_sse2_moves_and_shifts__rows_match_gnu_as_and_round_trip {
+    var bad: i32 = 0;
+    if (!t_ext_hex("movq xmm1, rax", "66480f6ec8"))               { bad = 1; }
+    if (!t_ext_hex("movq xmm9, r10", "664d0f6eca"))               { bad = 2; }
+    if (!t_ext_hex("movq xmm0, r15", "66490f6ec7"))               { bad = 3; }
+    if (!t_ext_hex("movq rax, xmm1", "66480f7ec8"))               { bad = 4; }
+    if (!t_ext_hex("movq r11, xmm13", "664d0f7eeb"))              { bad = 5; }
+    if (!t_ext_hex("pslldq xmm1, 8", "660f73f908"))               { bad = 6; }
+    if (!t_ext_hex("pslldq xmm12, 4", "66410f73fc04"))            { bad = 7; }
+    if (!t_ext_hex("psrldq xmm2, 8", "660f73da08"))               { bad = 8; }
+    if (!t_ext_hex("psrldq xmm15, 15", "66410f73df0f"))           { bad = 9; }
+    if (!t_ext_hex("psllq xmm3, 1", "660f73f301"))                { bad = 10; }
+    if (!t_ext_hex("psllq xmm10, 63", "66410f73f23f"))            { bad = 11; }
+    if (!t_ext_hex("psrlq xmm4, 63", "660f73d43f"))               { bad = 12; }
+    if (!t_ext_hex("psrlq xmm11, 32", "66410f73d320"))            { bad = 13; }
+    if (!t_ext_hex("psllq xmm1, xmm2", "660ff3ca"))               { bad = 14; }
+    if (!t_ext_hex("psllq xmm9, xmm14", "66450ff3ce"))            { bad = 15; }
+    if (!t_ext_hex("psllq xmm5, xmmword [rax+16]", "660ff36810")) { bad = 16; }
+    if (!t_ext_hex("psrlq xmm6, xmm7", "660fd3f7"))               { bad = 17; }
+    if (!t_ext_hex("psrlq xmm8, [r12]", "66450fd30424"))          { bad = 18; }
+    ret bad;
+}
+
+# movq moves only between a vector register and a 64-bit general register,
+# and a byte shift counts only by an immediate
+test asm_sse2_moves_and_shifts__refuse_operands_outside_the_form {
+    var bad: i32 = 0;
+    if (!t_asm_refused("movq xmm1, eax", "64-bit general register"))    { bad = bad + 1; }
+    if (!t_asm_refused("movq xmm1, xmm2", "64-bit general register"))   { bad = bad + 2; }
+    if (!t_asm_refused("movq xmm1, [rax]", "64-bit general register"))  { bad = bad + 4; }
+    if (!t_asm_refused("movq rax, rcx", "64-bit general register"))     { bad = bad + 8; }
+    if (!t_asm_refused("pslldq xmm1, xmm2", "immediate from 0 to 255")) { bad = bad + 16; }
+    if (!t_asm_refused("psrldq xmm1, 256", "immediate from 0 to 255"))  { bad = bad + 32; }
+    if (!t_asm_refused("psllq rax, 1", "immediate from 0 to 255"))      { bad = bad + 64; }
+    ret bad;
+}
+
+# the destination is the one register each row writes, in its own bank
+test asm_sse2_moves_and_shifts__clobbers_are_the_destination {
+    if (!t_clobbers_are("movq xmm3, rax", 0, 0x8))                    { ret 1; }
+    if (!t_clobbers_are("movq r9, xmm3", 1::u32 << x64.R9::u32, 0))   { ret 2; }
+    if (!t_clobbers_are("pslldq xmm4, 8\npsrlq xmm5, xmm0", 0, 0x30)) { ret 3; }
+    ret 0;
+}
+
 # the two-byte c5 prefix carries R, vvvv, L and pp, so a 0F-map row whose index
 # and base are low takes it even with extended registers in reg and vvvv; an
 # extended base, W or another map needs c4. goldens from GNU as 2.47
@@ -8360,6 +9242,53 @@ test emit_vex_rm__c5_where_it_suffices_and_c4_otherwise {
     ret 0;
 }
 
+# the f16c conversions and the word moves an f16 in an xmm register takes to
+# and from its frame slot (#3801). goldens from GNU as 2.47
+test emit_f16c__conversions_and_word_moves_match_gnu_as {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var got: enc.ByteBuf = enc.buf_init(?alloc);
+    fin { enc.buf_dnit(?got); }
+    var want: [32]u8;
+    emit_f16c(true, t_xmm(1), t_xmm(2), ?got);
+    var n: usize = t_unhex("c4e27913ca", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 1; }
+    got.len = 0;
+    emit_f16c(true, t_xmm(9), t_xmm(12), ?got);
+    n = t_unhex("c4427913cc", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 2; }
+    got.len = 0;
+    emit_f16c(false, t_xmm(3), t_xmm(4), ?got);
+    n = t_unhex("c4e3791de300", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 3; }
+    got.len = 0;
+    emit_f16c(false, t_xmm(12), t_xmm(9), ?got);
+    n = t_unhex("c443791dcc00", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 4; }
+    val slot: isa.Operand = isa.make_mem(x64.RBP, -24, -1, 0, 2);
+    got.len = 0;
+    val hm1: err[fail.Fail] = emit_half_move(vec_reg(t_xmm(1)), slot, ?got);
+    if (sel hm1.err) { ret 5; }
+    n = t_unhex("660fc44de800", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 6; }
+    got.len = 0;
+    val hm2: err[fail.Fail] = emit_half_move(vec_reg(t_xmm(9)), slot, ?got);
+    if (sel hm2.err) { ret 7; }
+    n = t_unhex("66440fc44de800", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 8; }
+    got.len = 0;
+    val hm3: err[fail.Fail] = emit_half_move(slot, vec_reg(t_xmm(1)), ?got);
+    if (sel hm3.err) { ret 9; }
+    n = t_unhex("660f3a154de800", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 10; }
+    got.len = 0;
+    val hm4: err[fail.Fail] = emit_half_move(slot, vec_reg(t_xmm(9)), ?got);
+    if (sel hm4.err) { ret 11; }
+    n = t_unhex("66440f3a154de800", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 12; }
+    ret 0;
+}
+
 test asm_extensions__avx2_variable_shift_operands_are_refused {
     t_model_x64.extensions = x64.EXT_AVX2;
     var bad: i32 = 0;
@@ -8373,16 +9302,99 @@ test asm_extensions__avx2_variable_shift_operands_are_refused {
     ret bad;
 }
 
+# vpmullq against GNU as 2.47 (`as --64`, intel syntax): the four-byte evex
+# prefix of the 0F 38 map under W1, extended registers in each of R, vvvv, X
+# and B, and the memory form's disp8*16, compressed where the displacement is
+# a multiple of 16 whose quotient fits the byte and 32 bits wide otherwise;
+# the listing round trips (#3749)
+test asm_extensions__vpmullq_matches_gnu_as_and_round_trips {
+    var bad: i32 = 0;
+    if (!t_ext_hex("vpmullq xmm1, xmm2, xmm3", "62f2ed0840cb"))                         { bad = 1; }
+    if (!t_ext_hex("vpmullq xmm9, xmm10, xmm11", "6252ad0840cb"))                       { bad = 2; }
+    if (!t_ext_hex("vpmullq xmm0, xmm15, xmm8", "62d2850840c0"))                        { bad = 3; }
+    if (!t_ext_hex("vpmullq xmm1, xmm2, [rax]", "62f2ed084008"))                        { bad = 4; }
+    if (!t_ext_hex("vpmullq xmm1, xmm2, xmmword [rbp-32]", "62f2ed08404dfe"))           { bad = 5; }
+    if (!t_ext_hex("vpmullq xmm1, xmm2, xmmword [rbp-8]", "62f2ed08408df8ffffff"))      { bad = 6; }
+    if (!t_ext_hex("vpmullq xmm1, xmm2, xmmword [rsp+2032]", "62f2ed08404c247f"))       { bad = 7; }
+    if (!t_ext_hex("vpmullq xmm1, xmm2, xmmword [rsp+2048]", "62f2ed08408c2400080000")) { bad = 8; }
+    if (!t_ext_hex("vpmullq xmm12, xmm3, xmmword [r12+r13*8+48]", "6212e5084064ec03"))  { bad = 9; }
+    if (!t_ext_hex("vpmullq xmm1, xmm2, [r13]", "62d2ed08404d00"))                      { bad = 10; }
+    ret bad;
+}
+
+# the evex fields inline asm does not spell yet, against GNU as 2.47: xmm16
+# and up through R', V' and X, the opmask with merging and zeroing, the
+# broadcast bit and its element-sized disp8*N, and the 256- and 512-bit
+# vector lengths
+test emit_evex_rm__every_field_matches_gnu_as {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var got: enc.ByteBuf = enc.buf_init(?alloc);
+    fin { enc.buf_dnit(?got); }
+    val row: opt[EvexRow] = evex_row(x64.VPMULLQ);
+    if (sel row.none) { ret 1; }
+    val r:     EvexRow = row.some;
+    val plain: EvexCtl = evex_unmasked(0);
+    var want:  [32]u8;
+    emit_evex_rm(r, plain, t_xmm(17), t_xmm(18), vec_reg(t_xmm(19)), ?got);
+    var n: usize = t_unhex("62a2ed0040cb", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 2; }
+    got.len = 0;
+    emit_evex_rm(r, plain, t_xmm(24), t_xmm(25), vec_reg(t_xmm(31)), ?got);
+    n = t_unhex("6202b50040c7", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 3; }
+    got.len = 0;
+    emit_evex_rm(r, plain, t_xmm(1), t_xmm(20), vec_reg(t_xmm(2)), ?got);
+    n = t_unhex("62f2dd0040ca", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 4; }
+    got.len = 0;
+    emit_evex_rm(r, plain, t_xmm(20), t_xmm(1), isa.make_mem(x64.R9, 16, -1, 0, 16), ?got);
+    n = t_unhex("62c2f508406101", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 5; }
+    got.len = 0;
+    emit_evex_rm(r, EvexCtl{ll: 0, mask: 1, zero: false, b: false}, t_xmm(1), t_xmm(2), vec_reg(t_xmm(3)), ?got);
+    n = t_unhex("62f2ed0940cb", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 6; }
+    got.len = 0;
+    emit_evex_rm(r, EvexCtl{ll: 0, mask: 7, zero: true, b: false}, t_xmm(1), t_xmm(2), vec_reg(t_xmm(3)), ?got);
+    n = t_unhex("62f2ed8f40cb", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 7; }
+    got.len = 0;
+    emit_evex_rm(r, EvexCtl{ll: 0, mask: 0, zero: false, b: true}, t_xmm(1), t_xmm(2), isa.make_mem(x64.RAX, 8, -1, 0, 8), ?got);
+    n = t_unhex("62f2ed18404801", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 8; }
+    got.len = 0;
+    emit_evex_rm(r, evex_unmasked(1), t_xmm(1), t_xmm(2), isa.make_mem(x64.RAX, 32, -1, 0, 32), ?got);
+    n = t_unhex("62f2ed28404801", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 9; }
+    got.len = 0;
+    emit_evex_rm(r, evex_unmasked(2), t_xmm(1), t_xmm(2), vec_reg(t_xmm(3)), ?got);
+    n = t_unhex("62f2ed4840cb", ?want[0]);
+    if (!t_buf_is(?got, ?want[0], n)) { ret 10; }
+    ret 0;
+}
+
+test asm_extensions__vpmullq_needs_avx512dq_and_avx512vl {
+    if (!t_ext_refusal("vpmullq xmm0, xmm1, xmm2", x64.EXT_AVX2, 0, "needs the `avx512dq` extension"))                   { ret 1; }
+    if (!t_ext_refusal("vpmullq xmm0, xmm1, xmm2", x64.EXT_AVX512DQ, 0, "needs the `avx512vl` extension"))               { ret 2; }
+    if (!t_ext_refusal("vpmullq xmm0, xmm1, xmm2", x64.EXT_AVX512VL, x64.EXT_AVX512F, "needs the `avx512dq` extension")) { ret 3; }
+    if (!t_ext_admitted("vpmullq xmm0, xmm1, xmm2", x64.LEVEL_V4, 0))                                                    { ret 4; }
+    if (!t_asm_refused("vpmullq xmm0, [rax], xmm1", "a vector register or 128-bit memory source"))                       { ret 5; }
+    if (!t_asm_refused("vpmullq xmm0, xmm1, qword [rax]", "a vector register or 128-bit memory source"))                 { ret 6; }
+    ret 0;
+}
+
 # a symbol-relative source keeps its rip-relative field ahead of the immediate
 test asm_extensions__symbol_sources_relocate_before_the_immediate {
     t_model_x64.extensions = T_EXT_ALL;
     var bad: i32 = 0;
-    if (!t_asm_reloc("pshufb xmm1, [tbl]", "660f38000d00000000", 5, -4))         { bad = 1; }
-    if (!t_asm_reloc("pinsrd xmm1, [tbl], 3", "660f3a220d0000000003", 5, -5))    { bad = 2; }
-    if (!t_asm_reloc("pextrd [tbl], xmm1, 3", "660f3a160d0000000003", 5, -5))    { bad = 3; }
-    if (!t_asm_reloc("aesenc xmm1, [tbl]", "660f38dc0d00000000", 5, -4))         { bad = 4; }
-    if (!t_asm_reloc("pclmulqdq xmm1, [tbl], 1", "660f3a440d0000000001", 5, -5)) { bad = 5; }
-    if (!t_asm_reloc("vpsllvd xmm1, xmm2, [tbl]", "c4e269470d00000000", 5, -4))  { bad = 6; }
+    if (!t_asm_reloc("pshufb xmm1, [tbl]", "660f38000d00000000", 5, -4))          { bad = 1; }
+    if (!t_asm_reloc("pinsrd xmm1, [tbl], 3", "660f3a220d0000000003", 5, -5))     { bad = 2; }
+    if (!t_asm_reloc("pextrd [tbl], xmm1, 3", "660f3a160d0000000003", 5, -5))     { bad = 3; }
+    if (!t_asm_reloc("aesenc xmm1, [tbl]", "660f38dc0d00000000", 5, -4))          { bad = 4; }
+    if (!t_asm_reloc("pclmulqdq xmm1, [tbl], 1", "660f3a440d0000000001", 5, -5))  { bad = 5; }
+    if (!t_asm_reloc("vpsllvd xmm1, xmm2, [tbl]", "c4e269470d00000000", 5, -4))   { bad = 6; }
+    if (!t_asm_reloc("vpmullq xmm1, xmm2, [tbl]", "62f2ed08400d00000000", 6, -4)) { bad = 7; }
     t_model_x64.extensions = 0;
     ret bad;
 }
@@ -8407,7 +9419,7 @@ fun t_ext_admitted(body: str, exts: u64, f_exts: u64) bool {
 }
 
 #[testing]
-val T_EXT_BODY_COUNT: usize = 28;
+val T_EXT_BODY_COUNT: usize = 29;
 
 #[testing]
 val T_EXT_BODIES: [T_EXT_BODY_COUNT]str = [T_EXT_BODY_COUNT]str{
@@ -8419,7 +9431,7 @@ val T_EXT_BODIES: [T_EXT_BODY_COUNT]str = [T_EXT_BODY_COUNT]str{
     "aesenc xmm1, xmm2", "aesenclast xmm1, [rax]", "aesdec xmm1, xmm2", "aesdeclast xmm1, xmm2",
     "aesimc xmm1, xmm2", "aeskeygenassist xmm1, xmm2, 1", "pclmulqdq xmm1, xmm2, 0x11",
     "vpsllvd xmm1, xmm2, xmm3", "vpsrlvd xmm1, xmm2, [rax]", "vpsravd xmm1, xmm2, xmm3", "vpsllvq xmm1, xmm2, xmm3",
-    "vpsrlvq xmm1, xmm2, xmm3",
+    "vpsrlvq xmm1, xmm2, xmm3", "vpmullq xmm1, xmm2, [rax]",
 };
 
 #[testing]
@@ -8432,7 +9444,7 @@ val T_EXT_NEEDS: [T_EXT_BODY_COUNT]u64 = [T_EXT_BODY_COUNT]u64{
     x64.EXT_AES, x64.EXT_AES, x64.EXT_AES, x64.EXT_AES,
     x64.EXT_AES, x64.EXT_AES, x64.EXT_PCLMUL,
     x64.EXT_AVX2, x64.EXT_AVX2, x64.EXT_AVX2, x64.EXT_AVX2,
-    x64.EXT_AVX2,
+    x64.EXT_AVX2, x64.EXT_AVX512DQ | x64.EXT_AVX512VL,
 };
 
 # a row whose extension neither the target nor the enclosing function admits is
@@ -8642,12 +9654,12 @@ val T_MEMS: [T_MEM_COUNT]x64.MemEffect = [T_MEM_COUNT]x64.MemEffect{
 };
 
 #[testing]
-val T_PATTERN_COUNT: usize = 12;
+val T_PATTERN_COUNT: usize = 15;
 
 #[testing]
 val T_PATTERNS: [T_PATTERN_COUNT]u16 = [T_PATTERN_COUNT]u16{
     X64P_NONE, X64P_ONE, X64P_TWO, X64P_BRANCH, X64P_XFER, X64P_VEC, X64P_VECI, X64P_PORTIO,
-    X64P_WIDEREG, X64P_VECG, X64P_TRIPLE, X64P_VEC3,
+    X64P_WIDEREG, X64P_VECG, X64P_TRIPLE, X64P_VEC3, X64P_STRING, X64P_MOVQ, X64P_VSHIFT,
 };
 
 # the enumerations are dense and collision free: two branches that each add a
@@ -10851,6 +11863,49 @@ test vector_arith__i64x2_multiply_is_the_three_pmuludq_sequence {
     val ext: err[fail.Fail] = encode_vector_arith(?st, ?f, ?mi);
     if (sel ext.err)                    { ret 3; }
     if (!t_bytes_equal(?st.buf, ?want)) { ret 4; }
+
+    # avx512dq without avx512vl has no 128-bit vpmullq
+    t_model_x64.extensions = x64.EXT_AVX512DQ;
+    st.buf.len             = 0;
+    val dq: err[fail.Fail] = encode_vector_arith(?st, ?f, ?mi);
+    if (sel dq.err)                     { ret 5; }
+    if (!t_bytes_equal(?st.buf, ?want)) { ret 6; }
+    ret 0;
+}
+
+# under avx512dq and avx512vl the 64-bit lane multiply is one vpmullq, the gas
+# bytes of `vpmullq xmm1, xmm2, xmm3`; a frame-slot left operand is loaded
+# into xmm14 first, which also holds the result for a frame-slot destination:
+# `movaps xmm14, [rbp-32]; vpmullq xmm14, xmm14, xmm3; movaps [rbp-16], xmm14`
+test vector_arith__i64x2_multiply_is_vpmullq_under_avx512dq_and_avx512vl {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var st: enc.EncodeState;
+    enc.state_blank(?st, ?alloc, x64_machine());
+    fin { t_model_x64.extensions = 0; }
+    var f:   mir.MirFunction;
+    var ops: [3]mir.MirOperand;
+    ops[0] = mir.op_preg(mir.preg_id(t_xmm(x64.XMM1)));
+    ops[1] = mir.op_preg(mir.preg_id(t_xmm(x64.XMM2)));
+    ops[2] = mir.op_preg(mir.preg_id(t_xmm(x64.XMM3)));
+    var mi: mir.MirInstr = mir.instr(mir.MIR_SEL_MUL, ?ops[0], 3, 16, 16);
+    mi.vec_lane            = mir.vec_lane_make(mir.VEC_LANE_INT, 8, 2);
+    t_model_x64.extensions = x64.LEVEL_V4;
+    var want: [32]u8;
+    val r:    err[fail.Fail] = encode_vector_arith(?st, ?f, ?mi);
+    if (sel r.err) { ret 1; }
+    var n: usize = t_unhex("62f2ed0840cb", ?want[0]);
+    if (!t_buf_is(?st.buf, ?want[0], n)) { ret 2; }
+
+    ops[0]      = mir.op_mem_preg(mir.preg_id(x64.RBP), -16);
+    ops[1]      = mir.op_mem_preg(mir.preg_id(x64.RBP), -32);
+    mi          = mir.instr(mir.MIR_SEL_MUL, ?ops[0], 3, 16, 16);
+    mi.vec_lane = mir.vec_lane_make(mir.VEC_LANE_INT, 8, 2);
+    st.buf.len  = 0;
+    val m: err[fail.Fail] = encode_vector_arith(?st, ?f, ?mi);
+    if (sel m.err) { ret 3; }
+    n = t_unhex("440f2875e062728d0840f3440f2975f0", ?want[0]);
+    if (!t_buf_is(?st.buf, ?want[0], n)) { ret 4; }
     ret 0;
 }
 
@@ -11528,7 +12583,25 @@ test float_encode__width_refusals_emit_nothing {
 # effect walk read it: the class column of the one description table
 pub fun asm_ct_class(code: u32, flags: u16) ct.AsmClass {
     if (code > 0xFFFF) { ret ct.asm_unknown(); }
-    ret x64.describe(code::u16).cls;
+    ret x64_rep_class(x64.describe(code::u16), (flags & (X64F_REP | X64F_REPNE)) != 0);
+}
+
+# a repeated string instruction's timing is its count, and a compare's also
+# the elements it stops at
+fun x64_rep_class(d: x64.OpDesc, repeated: bool) ct.AsmClass {
+    var cls: ct.AsmClass = d.cls;
+    if (repeated && d.form == x64.FORM_STRING) { cls.op = ct.CT_OP_REP_STRING; }
+    ret cls;
+}
+
+# the grammar row of a string opcode, spelled without a prefix
+fun x64_string_mnemonic(code: u32) *iasm.Mnemonic {
+    var i: usize = 0;
+    for (i < X64_MNEMONIC_COUNT) {
+        if (X64_MNEMONICS[i].code == code && x64_pattern(X64_MNEMONICS[i].flags) == X64P_STRING) { ret ?X64_MNEMONICS[i]; }
+        i = i + 1;
+    }
+    ret nil;
 }
 
 # the machine opcodes a notification can carry: every x64.Opcode except the
@@ -11619,8 +12692,9 @@ pub fun inst_effects(mi: *isa.Inst, e: *ct.InstEffects) {
     @e = ct.inst_effects_unknown();
     val op: u16 = mi.opcode;
     if (!notifiable_opcode(op)) { ret; }
-    val d: x64.OpDesc = x64.describe(op);
-    e.cls = d.cls;
+    val d:        x64.OpDesc = x64.describe(op);
+    val repeated: bool       = (mi.flags & (x64.FLAG_REP::u16 | x64.FLAG_REPNE::u16)) != 0;
+    e.cls = x64_rep_class(d, repeated);
 
     var pos: [4]u32;
     val n:   u32 = x64_present(mi, ?pos[0]);
@@ -11628,7 +12702,6 @@ pub fun inst_effects(mi: *isa.Inst, e: *ct.InstEffects) {
     e.implicit_writes   = e.implicit_reads;
     e.implicit_fp_reads = x64_grammar_reads_fp(op::u32)::u64;
     e.implicit_mem      = (d.mem & x64.MEM_STACK) != 0;
-    if ((d.mem & x64.MEM_STRING) != 0) { e.implicit_addr = X64_RSI | X64_RDI; }
     if ((d.mem & x64.MEM_BASE) != 0 && n >= 1) {
         val base: *isa.Operand = x64_slot(mi, pos[0]);
         if (base.kind == isa.OPK_REG) { e.implicit_addr = e.implicit_addr | (1::u64 << isa.regid_index(base.reg)::u64); }
@@ -11687,8 +12760,17 @@ pub fun inst_effects(mi: *isa.Inst, e: *ct.InstEffects) {
     }
     if (op == x64.CPUID) { e.implicit_reads = X64_RAX | X64_RCX; }
     if (d.form == x64.FORM_STRING) {
-        e.implicit_reads  = X64_RSI | X64_RDI | X64_RCX;
-        e.implicit_writes = X64_RSI | X64_RDI | X64_RCX;
+        val row: *iasm.Mnemonic = x64_string_mnemonic(op::u32);
+        if (row != nil) {
+            e.implicit_reads  = row.reads_gp::u64;
+            e.implicit_writes = row.implicit::u64;
+            e.implicit_addr   = row.addr_gp::u64;
+            e.implicit_mem    = row.loads_gp != 0;
+        }
+        if (repeated) {
+            e.implicit_reads  = e.implicit_reads | X64_RCX;
+            e.implicit_writes = e.implicit_writes | X64_RCX;
+        }
     }
     if (d.form == x64.FORM_PUSH || d.form == x64.FORM_POP || op == x64.PUSHFQ || op == x64.POPFQ) {
         e.implicit_reads  = X64_RSP;
@@ -11908,16 +12990,17 @@ test asm_ct_class__variable_latency_surface {
     if (asm_ct_class(x64.SHLD::u32, 0).op != ct.CT_OP_VAR_SHIFT) { bad = 1; }
     if (asm_ct_class(x64.SHRD::u32, 0).op != ct.CT_OP_VAR_SHIFT) { bad = 1; }
 
-    # past the shifts, the rows that vary in latency are the five packed
-    # multiplies (pmulld gated on sse41), the float ops, and the one scalar
-    # multiply, imul, whose forms the mul mask gates
+    # past the shifts, the rows that vary in latency are the six packed
+    # multiplies (pmulld gated on sse41, vpmullq on avx512dq and avx512vl),
+    # the float ops, and the one scalar multiply, imul, whose forms the mul
+    # mask gates
     var mul:   u32   = 0;
     var float: u32   = 0;
     var i:     usize = 0;
     for (i < X64_MNEMONIC_COUNT) {
         val row: *iasm.Mnemonic = ?X64_MNEMONICS[i];
         val cls: ct.AsmClass    = asm_ct_class(row.code, row.flags);
-        val vec: bool           = x64_pattern(row.flags) == X64P_VEC || x64_pattern(row.flags) == X64P_VECI;
+        val vec: bool           = x64_pattern(row.flags) == X64P_VEC || x64_pattern(row.flags) == X64P_VECI || x64_pattern(row.flags) == X64P_VEC3;
         if (cls.op == ct.CT_OP_INT_DIVMOD)                           { bad = 1; }
         if (cls.op == ct.CT_OP_INT_MUL && vec)                       { mul = mul + 1; }
         or (cls.op == ct.CT_OP_INT_MUL && row.code != x64.IMUL::u32) { bad = 1; }
@@ -11925,7 +13008,7 @@ test asm_ct_class__variable_latency_surface {
         or (cls.op == ct.CT_OP_FLOAT)                                { bad = 1; }
         i = i + 1;
     }
-    if (mul != 5)    { bad = 1; }
+    if (mul != 6)    { bad = 1; }
     if (float != 16) { bad = 1; }
 
     if (!asm_ct_class(x64.JE::u32, 0).cond_flags)  { bad = 1; }
@@ -12605,9 +13688,11 @@ test describe__family_predicates_read_the_table {
     # lane-halving rows: 3 high unpacks, psrldq and 6 gated extends, the
     # qword shifts of the 64-bit multiply sequence, and the word and dword
     # logical right shifts of the vector shifts, and the 6 aes rows and pclmulqdq
-    # and the two lane-join rows, and the 5 avx2 variable shifts and vmovdqu
-    if (fp != 1 + 2 + 4 + 8 + 2 + 6 + 1 + 30 + 1 + 1 + 11 + 3 + 3 + 7 + 2 + 1 + 3 + 1 + 6 + 2 + 2 + 7 + 2 + 5 + 1) { ret 7; }
-    if (is_jcc(x64.OPCODE_COUNT::u16) || is_setcc(x64.ASM_BLOCK))                                                  { ret 8; }
+    # and the two lane-join rows, and the 5 avx2 variable shifts and vmovdqu,
+    # and the two f16c conversions and the pinsrw/pextrw word moves, and vpmullq,
+    # and the 6 sse41 extensions over several doublings and psadbw
+    if (fp != 1 + 2 + 4 + 8 + 2 + 6 + 1 + 30 + 1 + 1 + 11 + 3 + 3 + 7 + 2 + 1 + 3 + 1 + 6 + 2 + 2 + 7 + 2 + 5 + 1 + 2 + 2 + 1 + 6 + 1) { ret 7; }
+    if (is_jcc(x64.OPCODE_COUNT::u16) || is_setcc(x64.ASM_BLOCK))                                                                      { ret 8; }
     ret 0;
 }
 
@@ -13611,14 +14696,16 @@ test vector_convert__every_table_plan_forms_in_an_aliasing_destination {
     val xmm3:   i32   = isa.regid_make(isa.REG_CLASS_ID_XMM, x64.XMM3);
     var plans:  u32   = 0;
     var oi:     u32   = 0;
-    for (oi < 8) {
+    for (oi < 16) {
         var fi: u32 = 0;
         for (fi < 4) {
             var ti: u32 = 0;
             for (ti < 4) {
-                val from_float: bool               = ops[oi] == mir.MIR_FP_EXT || ops[oi] == mir.MIR_FP_TRUNC || ops[oi] == mir.MIR_FP_TO_SI;
-                val to_float:   bool               = ops[oi] == mir.MIR_FP_EXT || ops[oi] == mir.MIR_FP_TRUNC || ops[oi] == mir.MIR_SI_TO_FP || ops[oi] == mir.MIR_UI_TO_FP;
-                val planned:    opt[convplan.Plan] = xconv_plan(ops[oi], to_float, widths[ti], from_float, widths[fi]);
+                # the second pass plans under a model that extends directly
+                val op:         mir.MirOpcode      = ops[oi % 8];
+                val from_float: bool               = op == mir.MIR_FP_EXT || op == mir.MIR_FP_TRUNC || op == mir.MIR_FP_TO_SI;
+                val to_float:   bool               = op == mir.MIR_FP_EXT || op == mir.MIR_FP_TRUNC || op == mir.MIR_SI_TO_FP || op == mir.MIR_UI_TO_FP;
+                val planned:    opt[convplan.Plan] = xconv_plan(op, to_float, widths[ti], from_float, widths[fi], oi >= 8);
                 if (sel planned.some) {
                     var p: convplan.Plan = planned.some;
                     if (!convplan.alias_safe(?p)) { ret 1; }

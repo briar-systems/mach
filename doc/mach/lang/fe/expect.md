@@ -1,5 +1,12 @@
 # mach.lang.fe.expect
 
+`#[expect("<key>", ...)]`: a declaration's acknowledgement of named warnings
+
+type checking validates each `#[expect]` where it stands; this module reads the
+keys back out of a parsed module into the expectations a diagnostic store
+matches warnings against, so a warning replayed from the cache is matched
+exactly as a fresh one is
+
 ## val DIRECTIVE
 
 ```mach

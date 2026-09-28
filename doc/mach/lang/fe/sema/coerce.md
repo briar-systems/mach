@@ -57,6 +57,19 @@ eid: the expression to probe
 to: the integer type whose range is asked about
 ret: the probe result; never commits an expression type
 
+## fun is_untyped_int_literal
+
+```mach
+pub fun is_untyped_int_literal(sc: *context.SemaContext, eid: id.ExprId) bool;
+```
+
+whether an expression is built only from unsuffixed integer literals under the
+operators a literal coerces through, so its exact value is still untyped
+
+sc: the semantic context
+eid: the expression to ask about
+ret: true when every leaf is an unsuffixed integer literal
+
 ## fun int_bounds_of
 
 ```mach

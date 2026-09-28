@@ -2,6 +2,7 @@ use std.collections.map;
 use fs: std.filesystem;
 use std.format;
 use io_error: std.io.error;
+use std.system.os;
 use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -12,7 +13,9 @@ use std.types.option.opt;
 use std.types.path;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.StrError;
 use std.types.string.str;
+use std.types.string.str_copy_slice;
 use std.types.string.str_ends_with;
 use std.types.string.str_len;
 use std.types.view.View;
@@ -601,6 +604,25 @@ fun same_pub_consts(a: *project.PubConst, an: u32, b: *project.PubConst, bn: u32
     ret true;
 }
 
+# the comptime context of a build for `t` under `req`: every fact comptime reads from
+# the target and the build options, and nothing of a project, so the build and the
+# editor fold the same program the same way
+pub fun target_context(alloc: *A.Allocator, t: *target.Target, req: *request.BuildRequest,
+    compiler_name: intern.StrId, compiler_ver: intern.StrId) comptime.ComptimeCtx {
+    var build_mode_id: u32 = comptime.MODE_DEBUG;
+    if (request.release(req)) { build_mode_id = comptime.MODE_RELEASE; }
+    var build_pie: u32 = 0;
+    if (req.pie) { build_pie = 1; }
+    var ctx: comptime.ComptimeCtx = comptime.init(alloc, t.os_id, t.arch_id, t.abi_id, build_mode_id, build_pie,
+        t.isa.pointer_width, t.model.vector_bits, t.model.has_float, compiler_name, compiler_ver);
+    comptime.set_target_defs(?ctx, t.isa.defs);
+    comptime.set_va_list(?ctx, t.va_list_size, t.va_list_align);
+    comptime.set_ct_mul(?ctx, target.ct_mul_admitted(t));
+    comptime.set_extensions(?ctx, isa.extension_view(?t.model));
+    comptime.set_nan_rule(?ctx, t.model.nan_rule);
+    ret ctx;
+}
+
 # the comptime context a module's gates and bodies evaluate in; `fqn` names the module,
 # and `artifact` is the one it is attributed to, what `$bin.name` reads
 fun module_context(p: *project.Project, req: *request.BuildRequest, fqn: intern.StrId, artifact: intern.StrId) res[comptime.ComptimeCtx, fail.Fail] {
@@ -608,28 +630,7 @@ fun module_context(p: *project.Project, req: *request.BuildRequest, fqn: intern.
         ret res[comptime.ComptimeCtx, fail.Fail].err{fail.message("driver: module context requires an opened project and request")};
     }
 
-    var build_mode_id: u32 = comptime.MODE_DEBUG;
-    if (request.release(req)) { build_mode_id = comptime.MODE_RELEASE; }
-    var build_pie: u32 = 0;
-    if (req.pie) { build_pie = 1; }
-
-    var ctx: comptime.ComptimeCtx = comptime.init(
-        p.alloc,
-        p.target.os_id,
-        p.target.arch_id,
-        p.target.abi_id,
-        build_mode_id,
-        build_pie,
-        p.target.isa.pointer_width,
-        p.target.model.vector_bits,
-        p.target.model.has_float,
-        p.compiler_name,
-        p.compiler_ver);
-    comptime.set_target_defs(?ctx, p.target.isa.defs);
-    comptime.set_va_list(?ctx, p.target.va_list_size, p.target.va_list_align);
-    comptime.set_ct_mul(?ctx, target.ct_mul_admitted(?p.target));
-    comptime.set_extensions(?ctx, isa.extension_view(?p.target.model));
-    comptime.set_nan_rule(?ctx, p.target.model.nan_rule);
+    var ctx: comptime.ComptimeCtx = target_context(p.alloc, ?p.target, req, p.compiler_name, p.compiler_ver);
     comptime.set_union_build(?ctx, p.union);
     comptime.set_build_context(?ctx,
         p.config.id, p.config.version,
@@ -2288,6 +2289,8 @@ fun diag_undeclared_root(s: *session.Session, full_id: intern.StrId, root_id: in
     ret fallback;
 }
 
+# a module path names a file only when every segment is spelled as its entry
+# on disk, so a case-insensitive filesystem resolves it as linux does
 fun fqn_names_file(p: *project.Project, fqn: intern.StrId) bool {
     val path_r: res[str, fail.Fail] = fqn_to_file_path(p, fqn);
     if (sel path_r.err) { ret false; }
@@ -2295,7 +2298,79 @@ fun fqn_names_file(p: *project.Project, fqn: intern.StrId) bool {
     val is_file_r: res[bool, io_error.Error] = fs.is_file(file_path);
     val ok_:       bool                      = (sel is_file_r.ok && is_file_r.ok);
     str_free(p.alloc, file_path);
-    ret ok_;
+    ret ok_ && module_path_exact(p, fqn);
+}
+
+fun module_path_exact(p: *project.Project, fqn: intern.StrId) bool {
+    val home: res[ModuleHome, fail.Fail] = module_home(p, fqn);
+    if (sel home.err) { ret false; }
+    val tail:  View              = home.ok.tail;
+    val dir_r: res[str, A.Error] = path.join(p.alloc, home.ok.root, home.ok.src_dir);
+    if (sel dir_r.err) { ret false; }
+    var dir:   str   = dir_r.ok;
+    var start: usize = 0;
+    for (start < tail.len) {
+        var end: usize = start;
+        for (end < tail.len && tail.data[end] != '.') { end = end + 1; }
+        val segment: View = view(?tail.data[start], end - start);
+        if (end == tail.len) {
+            val found: bool = dir_holds_exact(dir, segment, ".mach");
+            str_free(p.alloc, dir);
+            ret found;
+        }
+        val next: opt[str] = descend(p.alloc, dir, segment);
+        str_free(p.alloc, dir);
+        if (sel next.none) { ret false; }
+        dir   = next.some;
+        start = end + 1;
+    }
+    str_free(p.alloc, dir);
+    ret false;
+}
+
+# the subdirectory `segment` of `dir`, when `dir` holds it spelled exactly so
+fun descend(a: *A.Allocator, dir: str, segment: View) opt[str] {
+    if (!dir_holds_exact(dir, segment, "")) { ret opt[str].none{}; }
+    val name_r: res[str, StrError] = str_copy_slice(a, segment.data::str, 0, segment.len);
+    if (sel name_r.err) { ret opt[str].none{}; }
+    val next_r: res[str, A.Error] = path.join(a, dir, name_r.ok);
+    str_free(a, name_r.ok);
+    if (sel next_r.err) { ret opt[str].none{}; }
+    ret opt[str].some{next_r.ok};
+}
+
+# whether the directory holds an entry spelled `segment` then `suffix`, byte for byte
+fun dir_holds_exact(dir: str, segment: View, suffix: str) bool {
+    var handle: usize = os.INVALID_HANDLE;
+    if (os.open(os.working_dir(), dir, os.O_RDONLY | os.O_DIRECTORY, 0, ?handle) < 0) { ret false; }
+    var cursor: os.DirectoryCursor = os.DirectoryCursor{};
+    var found:  bool               = false;
+    if (os.directory_init(?cursor, handle).code >= 0) {
+        for (!found) {
+            var entry: os.DirectoryEntry;
+            if (os.directory_next(?cursor, ?entry) <= 0) { brk; }
+            found = entry_spells(entry.name, entry.length, segment, suffix);
+        }
+        os.directory_close(?cursor);
+    }
+    os.close(handle);
+    ret found;
+}
+
+fun entry_spells(name: str, length: usize, segment: View, suffix: str) bool {
+    val suffix_len: usize = str_len(suffix);
+    if (length != segment.len + suffix_len) { ret false; }
+    var i: usize = 0;
+    for (i < segment.len) {
+        if (name[i] != segment.data[i]::u8) { ret false; }
+        i = i + 1;
+    }
+    var j: usize = 0;
+    for (j < suffix_len) {
+        if (name[segment.len + j] != suffix[j]) { ret false; }
+        j = j + 1;
+    }
+    ret true;
 }
 
 fun leaf_name(i: *intern.Interner, source: str, path: token.Span) res[intern.StrId, fail.Fail] {
@@ -3157,4 +3232,33 @@ pub fun collect_loaded_parses(p: *project.Project, primary: err[outcome.Fail]) e
         i = i + 1;
     }
     ret project.finish_query_phase(p, operation, roots.data, roots.len, result);
+}
+
+use fixture: mach.lang.output.testing;
+use std.allocator.page;
+
+test dir_holds_exact__compares_each_entry_byte_for_byte {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val created: res[fixture.Output, outcome.Fail] = fixture.create(?a, "mach-module-case");
+    if (sel created.err) { ret 2; }
+    var owner: fixture.Output = created.ok;
+    fin { fixture.dnit(?owner); }
+    val dir_r: res[str, A.Error] = path.join(?a, owner.directory, "m");
+    if (sel dir_r.err) { ret 3; }
+    val dir:  str             = dir_r.ok;
+    val made: err[fs.FsError] = fs.create_dir_all(?a, dir, 0o700);
+    if (sel made.err) { ret 4; }
+    val file_r: res[str, A.Error] = path.join(?a, dir, "item.mach");
+    if (sel file_r.err) { ret 5; }
+    val written: err[fs.FsError] = fs.write_bytes(file_r.ok, "", 0, 0o600);
+    if (sel written.err)                                            { ret 6; }
+    if (!dir_holds_exact(owner.directory, view("m"::*char, 1), "")) { ret 7; }
+    if (dir_holds_exact(owner.directory, view("M"::*char, 1), ""))  { ret 8; }
+    if (!dir_holds_exact(dir, view("item"::*char, 4), ".mach"))     { ret 9; }
+    if (dir_holds_exact(dir, view("Item"::*char, 4), ".mach"))      { ret 10; }
+    if (dir_holds_exact(dir, view("ite"::*char, 3), ".mach"))       { ret 11; }
+    if (dir_holds_exact(dir, view("item"::*char, 4), ""))           { ret 12; }
+    ret 0;
 }

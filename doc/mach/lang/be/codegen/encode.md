@@ -542,6 +542,15 @@ pub fun set_fallthrough(st: *EncodeState, f: *mir.MirFunction, bi: u32);
 pub fun branch_falls_through(st: *EncodeState, target_block: u32) bool;
 ```
 
+## fun cbr_inverts
+
+```mach
+pub fun cbr_inverts(st: *EncodeState, then_block: u32, else_block: u32) bool;
+```
+
+a conditional branch whose then arm is the next block and whose else arm is
+not jumps to the else arm on the inverse condition and falls into the then arm
+
 ## fun push_row
 
 ```mach
@@ -553,6 +562,14 @@ pub fun push_row(st: *EncodeState, text_offset: u32, loc: source.SrcLoc) err[fai
 ```mach
 pub fun push_varloc(st: *EncodeState, text_offset: u32, fn: *mir.MirFunction, vreg: u32, iid: u32) err[fail.Fail];
 ```
+
+## fun push_const_varloc
+
+```mach
+pub fun push_const_varloc(st: *EncodeState, text_offset: u32, value: i64, iid: u32) err[fail.Fail];
+```
+
+a variable whose value is the constant `value` from here, held in no storage (#4185)
 
 ## fun push_cmp_varloc
 
