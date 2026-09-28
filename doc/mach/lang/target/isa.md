@@ -501,10 +501,22 @@ wider lanes. a cell names the result lane width and the operand lane width;
 its scalar row is the per-lane sum, and only a packed cell is ever formed,
 as the fold of a count accumulated in narrow lanes (#4161)
 
+## val VEC_OP_SIGN_MASK
+
+```mach
+pub val VEC_OP_SIGN_MASK: VecOp = 38
+```
+
+a lane sign mask: each integer lane all ones when it is negative, else zero,
+in lanes of its own width. it is the high half a signed lane-halving
+extension interleaves its lanes with, so both halves of one extension share
+it; its scalar row is each lane shifted right by its width less one, and
+only a packed cell is ever formed (#4198)
+
 ## val VEC_OP_LAST
 
 ```mach
-pub val VEC_OP_LAST:        VecOp = VEC_OP_WIDEN_SUM_U
+pub val VEC_OP_LAST:      VecOp = VEC_OP_SIGN_MASK
 ```
 
 ## rec PackedForm
@@ -739,6 +751,12 @@ pub fun is_widen_half_op(op: VecOp) bool;
 pub fun is_widen_sum_op(op: VecOp) bool;
 ```
 
+## fun is_sign_mask_op
+
+```mach
+pub fun is_sign_mask_op(op: VecOp) bool;
+```
+
 ## fun is_shift_op
 
 ```mach
@@ -811,7 +829,7 @@ pub def ScalarFamily: u32
 the families of retained cells a model leaves to the scalar path wherever
 its packed table does not claim them: the conversions; the widening
 multiplies with their high halves, the lane interleave, the lane-halving
-extensions and the widening group sums; the shifts, lane by lane through the
+extensions with their sign masks and the widening group sums; the shifts, lane by lane through the
 scalar shift, which saturates the same way; the lane ranges and joins; and
 the f16 lane arithmetic and comparisons, each lane's scalar f16 operation (#3802)
 
