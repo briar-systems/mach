@@ -156,6 +156,15 @@ pub val MACOS_MIN_VERSION: u32 = 0x000B0000
 pub val MH_PIE: u32 = 0x200000
 ```
 
+## val MH_SUBSECTIONS_VIA_SYMBOLS
+
+```mach
+pub val MH_SUBSECTIONS_VIA_SYMBOLS: u32 = 0x2000
+```
+
+each symbol that starts an atom bounds one: the assembler relocates every
+reference between atoms, so a link may split sections at those symbols
+
 ## val SG_NORELOC
 
 ```mach
@@ -289,6 +298,18 @@ pub val N_ABS:  u8 = 0x02
 
 ```mach
 pub val N_NO_DEAD_STRIP: u16 = 0x0020
+```
+
+## val N_ALT_ENTRY
+
+```mach
+pub val N_ALT_ENTRY:     u16 = 0x0200
+```
+
+## val N_STAB
+
+```mach
+pub val N_STAB:          u8  = 0xe0
 ```
 
 ## val N_WEAK_DEF
