@@ -434,6 +434,15 @@ pub fun encode_module_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.
 hooks: *EncodeHooks, asm_out: *writer.Writer) res[EncoderOutput, fail.Fail];
 ```
 
+## fun entry_align
+
+```mach
+pub fun entry_align(model: *isa.MachineModel, explicit: u32) u32;
+```
+
+a function's entry alignment: its own `#[align]` or the target's rule,
+whichever is larger
+
 ## fun classify_refs
 
 ```mach
