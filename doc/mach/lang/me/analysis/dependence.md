@@ -68,7 +68,9 @@ the update, whose branch block and arms are named (an arm is BLOCK_NIL for a
 direct edge into the join). `rv` is then the value the update combines in,
 and the update instruction and the join are read only by each other and the
 accumulator. `elem_ty` is the element the loop loads, which sets the lanes;
-`acc_ty` is the accumulator's, the same type or a wider integer
+`acc_ty` is the accumulator's, the same type or a wider integer. `ordered`
+marks a float update without reassociation, which must combine the values in
+program order, one at a time
 
 ## fun reduction_dnit
 
