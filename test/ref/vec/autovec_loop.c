@@ -2,7 +2,7 @@
 
 /* no vector type appears here: the loops are scalar and the question is whether
  * mach's -O2 vectorizes them into the same answer its -O0 produces. every integer
- * operation is unsigned, so every wrap is defined, and the float reduction is
+ * operation is unsigned, so every wrap is defined, and the float reductions are
  * written in element order so -ffp-contract=off and the absence of -ffast-math keep
  * the reference strictly ordered. */
 
@@ -96,5 +96,26 @@ uint64_t checksum(uint64_t seed) {
         fs = fs + fd[i];
     }
     h = mix_f32(h, fs);
+
+    float fp = 0.0f;
+    for (i = 0; i < m; i = (uint64_t)(i + UINT64_C(1))) {
+        fp = fp + fa[i] * fd[i];
+    }
+    h = mix_f32(h, fp);
+
+    double ga[37];
+    for (i = 0; i < m; i = (uint64_t)(i + UINT64_C(1))) {
+        ga[i] = (double)fd[i] / 3.0;
+    }
+    double gd = 0.0;
+    for (i = 0; i < m; i = (uint64_t)(i + UINT64_C(1))) {
+        gd = ga[i] * ga[i] + gd;
+    }
+    h = mix_f64(h, gd);
+    double gp = 1.0;
+    for (i = 0; i < m; i = (uint64_t)(i + UINT64_C(1))) {
+        gp = gp * (ga[i] + 0.75);
+    }
+    h = mix_f64(h, gp);
     return h;
 }
