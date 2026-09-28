@@ -145,9 +145,9 @@ only, which `cases/ONLY.riscv64zkt-linux` states.
 
 The `x86_64v3-linux` column is x86_64-linux with the `x86-64-v3` level selected,
 where the vector cells its extensions add rows for pack (the avx2 per-lane
-shifts among them) and f16 converts with f16c. It serves the `vec` group and the
-f16 cases, which `cases/ONLY.x86_64v3-linux` states, and runs natively on a host
-with AVX2.
+shifts among them), vectors compute in 256-bit `ymm` registers, f16 converts
+with f16c, and every sse instruction is written in its vex form. It serves every
+case and runs natively on a host with AVX2.
 
 The `aarch64fp16-linux` column is aarch64-linux with `fp16` selected, and the
 `riscv64zfh-linux` column riscv64-linux with Zfh: each computes f16 with its own
