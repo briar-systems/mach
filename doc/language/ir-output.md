@@ -11,6 +11,15 @@ object, as `<out>/ir/<artifact>/<module>.ir`. The flag takes an optional form:
 
 `--emit-asm` is the same idea one stage later, and takes no form.
 
+On x86-64 the asm listing is GNU as source in intel syntax: a module's listing
+assembles with `as --64` to the same `.text` bytes as the module's object.
+Every sized memory operand is written `qword ptr [...]`, a direct branch
+carries `{disp32}` because mach always encodes a 32-bit displacement, and a
+block's label is `.L<function>_<block>`, numbered within the module. A symbol a
+module calls or addresses stays undefined in the listing, as it is a
+relocation in the object. An `asm` block's own branches are listed without
+their targets, so a module holding one does not assemble.
+
 ## `debug` — the ir-debug dump
 
 The dump is the compiler's own debugging view. Every instruction carries its

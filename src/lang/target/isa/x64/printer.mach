@@ -35,6 +35,7 @@ pub fun note_function(buf: *enc.ByteBuf, interner: *intern.Interner, f: *mir.Mir
     val kept: err[fail.Fail] = enc.note_push(buf, ?note);
     if (sel kept.err)           { ret err[fail.Fail].err{kept.err}; }
     if (!enc.sink_renders(buf)) { ret err[fail.Fail].ok{}; }
+    buf.asm.functions = buf.asm.functions + 1;
     val out:    *writer.Writer = buf.asm.out;
     val res_nl: err[fail.Fail] = emit_str(out, "\n# ");
     if (sel res_nl.err) { ret res_nl; }
@@ -51,12 +52,22 @@ pub fun note_block(buf: *enc.ByteBuf, id: u32) err[fail.Fail] {
     val kept: err[fail.Fail] = enc.note_push(buf, ?note);
     if (sel kept.err)           { ret err[fail.Fail].err{kept.err}; }
     if (!enc.sink_renders(buf)) { ret err[fail.Fail].ok{}; }
+    val res_label: err[fail.Fail] = emit_block_label(buf, id::u64);
+    if (sel res_label.err) { ret res_label; }
+    ret emit_str(buf.asm.out, ":\n");
+}
+
+# a block's label, local to the assembler and apart from every other
+# function's block of the same number, since one listing holds the module
+fun emit_block_label(buf: *enc.ByteBuf, id: u64) err[fail.Fail] {
     val out:     *writer.Writer = buf.asm.out;
-    val res_dot: err[fail.Fail] = emit_str(out, ".");
-    if (sel res_dot.err) { ret res_dot; }
-    val res_id: err[fail.Fail] = emit_u64(out, id::u64);
-    if (sel res_id.err) { ret res_id; }
-    ret emit_str(out, ":\n");
+    val res_pre: err[fail.Fail] = emit_str(out, ".L");
+    if (sel res_pre.err) { ret res_pre; }
+    val res_fn: err[fail.Fail] = emit_u64(out, buf.asm.functions::u64);
+    if (sel res_fn.err) { ret res_fn; }
+    val res_sep: err[fail.Fail] = emit_str(out, "_");
+    if (sel res_sep.err) { ret res_sep; }
+    ret emit_u64(out, id);
 }
 
 # notify first, render only for a writer: the stream is the same on every build
@@ -107,6 +118,12 @@ fun render_inst(buf: *enc.ByteBuf, mi: *isa.Inst) err[fail.Fail] {
     if (mnem == nil) {
         ret err[fail.Fail].err{fail.message("--emit-asm: no x86-64 mnemonic for the emitted opcode")};
     }
+    # a direct branch is always encoded with a 32-bit displacement, which the
+    # assembler would otherwise relax to 8 bits where the target is near
+    if (is_direct_branch(mi)) {
+        val res_disp: err[fail.Fail] = emit_str(out, "{disp32} ");
+        if (sel res_disp.err) { ret res_disp; }
+    }
     val res_write: err[fail.Fail] = emit_str(out, mnem);
     if (sel res_write.err) { ret res_write; }
 
@@ -125,6 +142,12 @@ fun render_inst(buf: *enc.ByteBuf, mi: *isa.Inst) err[fail.Fail] {
     }
 
     ret emit_str(out, "\n");
+}
+
+fun is_direct_branch(mi: *isa.Inst) bool {
+    val form: x64.Form = x64.describe(mi.opcode).form;
+    if (form != x64.FORM_JCC && form != x64.FORM_JMP) { ret false; }
+    ret (mi.flags & x64.FLAG_INDIRECT::u16) == 0;
 }
 
 fun is_packed_compare(mi: *isa.Inst) bool {
@@ -295,15 +318,73 @@ fun render_label(buf: *enc.ByteBuf, op: *isa.Operand) err[fail.Fail] {
         ret emit_str(out, "b");
     }
 
-    val res_dot: err[fail.Fail] = emit_str(out, ".");
-    if (sel res_dot.err) { ret res_dot; }
-    ret emit_u64(out, op.imm::u64);
+    ret emit_block_label(buf, op.imm::u64);
 }
 
+# the width the encoder encodes an operand at, which is what the assembler has
+# to read back: a general-purpose form encodes every operand at the
+# instruction's size whatever width its operand was selected at, a variable
+# shift count is cl, and an extension reads its source at the source's width
 fun operand_width(mi: *isa.Inst, op: *isa.Operand) u8 {
-    if (op.size != 0) { ret op.size; }
-    if (mi.size != 0) { ret mi.size; }
+    val form: x64.Form = x64.describe(mi.opcode).form;
+    if (op.kind == isa.OPK_REG && is_shift_count(mi, form, op)) { ret 1; }
+    if (op.kind == isa.OPK_REG && form == x64.FORM_CVT && isa.regid_class(op.reg) != isa.REG_CLASS_ID_XMM) {
+        # rex.w selects a 64-bit integer side, and every other width is 32
+        if (mi.size == 8) { ret 8; }
+        ret 4;
+    }
+    if (op.kind == isa.OPK_MEM) {
+        val scalar: u8 = scalar_float_width(mi.opcode);
+        if (scalar != 0) { ret scalar; }
+    }
+    if (form == x64.FORM_MOVX && op == ?mi.src1 && op.size != 0) { ret op.size; }
+    if (form == x64.FORM_MOVX && op == ?mi.dst) {
+        # an extension never carries the 16-bit prefix, so a narrower
+        # destination is written at 32 bits
+        if (encoded_size(mi) == 8) { ret 8; }
+        ret 4;
+    }
+    if (mi.size != 0 && gp_sized(form, op)) { ret encoded_size(mi); }
+    if (op.size != 0)                       { ret op.size; }
+    if (mi.size != 0)                       { ret mi.size; }
     ret 8;
+}
+
+# the element a scalar float instruction reads or writes in memory, 0 for
+# any other opcode
+fun scalar_float_width(opcode: u16) u8 {
+    if (opcode == x64.MOVSS || opcode == x64.ADDSS || opcode == x64.SUBSS || opcode == x64.MULSS
+        || opcode == x64.DIVSS || opcode == x64.UCOMISS || opcode == x64.CVTSS2SD || opcode == x64.CVTTSS2SI) {
+        ret 4;
+    }
+    if (opcode == x64.MOVSD || opcode == x64.ADDSD || opcode == x64.SUBSD || opcode == x64.MULSD
+        || opcode == x64.DIVSD || opcode == x64.UCOMISD || opcode == x64.CVTSD2SS || opcode == x64.CVTTSD2SI) {
+        ret 8;
+    }
+    ret 0;
+}
+
+# the operand size the encoding carries: rex.w and the 16-bit prefix are
+# flags over the instruction's size
+fun encoded_size(mi: *isa.Inst) u8 {
+    if ((mi.flags & x64.FLAG_REX_W::u16) != 0) { ret 8; }
+    if ((mi.flags & x64.FLAG_16BIT::u16) != 0) { ret 2; }
+    ret mi.size;
+}
+
+fun is_shift_count(mi: *isa.Inst, form: x64.Form, op: *isa.Operand) bool {
+    if (form == x64.FORM_SHIFT)  { ret op == ?mi.src1; }
+    if (form == x64.FORM_DSHIFT) { ret op == ?mi.src2; }
+    ret false;
+}
+
+# the forms whose general-purpose operands all take the instruction's size
+fun gp_sized(form: x64.Form, op: *isa.Operand) bool {
+    if (op.kind == isa.OPK_REG && isa.regid_class(op.reg) == isa.REG_CLASS_ID_XMM) { ret false; }
+    ret form == x64.FORM_MOV || form == x64.FORM_ALU || form == x64.FORM_TEST || form == x64.FORM_IMUL
+        || form == x64.FORM_DIV || form == x64.FORM_MUL1 || form == x64.FORM_SHIFT || form == x64.FORM_DSHIFT
+        || form == x64.FORM_GRP3 || form == x64.FORM_GRP5 || form == x64.FORM_XCHG || form == x64.FORM_XADD
+        || form == x64.FORM_CMOV || form == x64.FORM_BITSCAN || form == x64.FORM_CARRY || form == x64.FORM_BSWAP;
 }
 
 fun emit_reg(out: *writer.Writer, id: i32, width: u8) err[fail.Fail] {
@@ -333,13 +414,15 @@ fun emit_segreg(out: *writer.Writer, num: i64) err[fail.Fail] {
     ret err[fail.Fail].err{fail.message("--emit-asm: no x86-64 segment-register name for the emitted number")};
 }
 
+# GNU as reads a size keyword without `ptr` as that keyword's value, so
+# `qword [rbx]` would assemble as `[rbx + 8]`
 fun size_prefix(width: u8) str {
-    if (width == 1)  { ret "byte "; }
-    if (width == 2)  { ret "word "; }
-    if (width == 4)  { ret "dword "; }
-    if (width == 8)  { ret "qword "; }
-    if (width == 16) { ret "xmmword "; }
-    if (width == 32) { ret "ymmword "; }
+    if (width == 1)  { ret "byte ptr "; }
+    if (width == 2)  { ret "word ptr "; }
+    if (width == 4)  { ret "dword ptr "; }
+    if (width == 8)  { ret "qword ptr "; }
+    if (width == 16) { ret "xmmword ptr "; }
+    if (width == 32) { ret "ymmword ptr "; }
     ret "";
 }
 
@@ -520,7 +603,7 @@ test render_inst__freestanding_surface_and_unmapped_sysregs {
     i6.size   = 4;
     i6.dst    = isa.make_reg(x64.RAX, 4);
     i6.src1   = isa.make_mem(x64.RCX, 0, -1, 0, 2);
-    bad       = bad | rendered_is(?buf, ?i6, "movzx eax, word [rcx]");
+    bad       = bad | rendered_is(?buf, ?i6, "movzx eax, word ptr [rcx]");
 
     enc.buf_dnit(?buf);
     ret bad;
@@ -554,9 +637,9 @@ test render_inst__prefixes_are_part_of_the_instruction {
     add.size   = 8;
     add.dst    = isa.make_mem(x64.RCX, 0, -1, 0, 8);
     add.src1   = isa.make_reg(x64.RAX, 8);
-    bad        = bad | rendered_is(?buf, ?add, "add qword [rcx], rax");
+    bad        = bad | rendered_is(?buf, ?add, "add qword ptr [rcx], rax");
     add.flags  = x64.FLAG_LOCK::u16;
-    bad        = bad | rendered_is(?buf, ?add, "lock add qword [rcx], rax");
+    bad        = bad | rendered_is(?buf, ?add, "lock add qword ptr [rcx], rax");
 
     enc.buf_dnit(?buf);
     ret bad;
@@ -577,10 +660,10 @@ test render_inst__segment_override_leads_the_address {
     rd.dst        = isa.make_reg(x64.RAX, 8);
     rd.src1       = isa.make_mem(x64.MEM_BASE_ABS, 40, -1, 0, 8);
     rd.src1.seg   = x64.SEG_FS;
-    bad           = bad | rendered_is(?buf, ?rd, "mov rax, qword fs:[40]");
+    bad           = bad | rendered_is(?buf, ?rd, "mov rax, qword ptr fs:[40]");
     rd.src1       = isa.make_mem(x64.RBX, -8, -1, 0, 4);
     rd.src1.seg   = x64.SEG_GS;
-    bad           = bad | rendered_is(?buf, ?rd, "mov rax, dword gs:[rbx - 8]");
+    bad           = bad | rendered_is(?buf, ?rd, "mov rax, qword ptr gs:[rbx - 8]");
     rd.src1.seg   = 7;
     test_sink_len = 0;
     val unmapped: err[fail.Fail] = render_inst(?buf, ?rd);
@@ -625,15 +708,15 @@ test render_inst__a_symbol_addend_is_part_of_the_address {
     lo.dst         = isa.make_reg(x64.RAX, 8);
     lo.src1        = isa.make_mem(-1, 0, -1, 0, 8);
     lo.src1.sym_id = g::u32;
-    bad            = bad | rendered_is(?buf, ?lo, "lea rax, qword [rip + g]");
+    bad            = bad | rendered_is(?buf, ?lo, "lea rax, qword ptr [rip + g]");
 
     var hi: isa.Inst = lo;
     hi.src1.sym_addend = 8;
-    bad                = bad | rendered_is(?buf, ?hi, "lea rax, qword [rip + g+8]");
+    bad                = bad | rendered_is(?buf, ?hi, "lea rax, qword ptr [rip + g+8]");
 
     var neg: isa.Inst = lo;
     neg.src1.sym_addend = 0 - 8;
-    bad                 = bad | rendered_is(?buf, ?neg, "lea rax, qword [rip + g-8]");
+    bad                 = bad | rendered_is(?buf, ?neg, "lea rax, qword ptr [rip + g-8]");
 
     var call_lo: isa.Inst = isa.inst_blank();
     call_lo.opcode = x64.CALL;
