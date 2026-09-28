@@ -184,6 +184,14 @@ pub fun report_typed2(sc: *context.SemaContext, k: dkind.Kind, span: token.Span,
 pub fun report_out_of_range(sc: *context.SemaContext, span: token.Span, cr: coerce.CoerceResult);
 ```
 
+## fun report_default_out_of_range
+
+```mach
+pub fun report_default_out_of_range(sc: *context.SemaContext, span: token.Span, cr: coerce.CoerceResult);
+```
+
+the range refusal of a literal no context typed, which took the i64 default
+
 ## fun report_instantiation_limit
 
 ```mach
