@@ -13,6 +13,17 @@ pub fun encode_x64_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.Mir
 out: *writer.Writer) res[enc.EncoderOutput, fail.Fail];
 ```
 
+## fun reads_const_operand
+
+```mach
+pub fun reads_const_operand(mi: *mir.MirInstr, index: u32) bool;
+```
+
+the scalar float arithmetic and compare read their second source, a
+constant there included, as the r/m operand: a constant is one pool
+reference inside the instruction (#4184). a compare's second source is its
+right operand, or its left where the condition swaps them
+
 ## fun asm_returns
 
 ```mach

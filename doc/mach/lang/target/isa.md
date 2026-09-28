@@ -1078,6 +1078,16 @@ pub def IntImmFitsFn: fun(u64, u32) bool
 whether one instruction materializes the integer `value`, read at `bits`
 (at most 64): the rule the middle end hoists a loop's constants by (#3807)
 
+## def ReadsConstFn
+
+```mach
+pub def ReadsConstFn: fun(*mir.MirInstr, u32) bool
+```
+
+whether the selected instruction reads operand `index` as a constant in
+place, as a constant-pool memory operand, at no instruction of its own: the
+rule the allocator folds a rebuilt constant into its reader by (#4184)
+
 ## def DwarfRegFn
 
 ```mach
@@ -1369,6 +1379,12 @@ pub fun with_frame_dist(m: *RegMachine, f: FrameDistFn);
 
 ```mach
 pub fun with_int_imm_rule(m: *RegMachine, f: IntImmFitsFn);
+```
+
+## fun with_const_operand_rule
+
+```mach
+pub fun with_const_operand_rule(m: *RegMachine, f: ReadsConstFn);
 ```
 
 ## fun reloc_seam
