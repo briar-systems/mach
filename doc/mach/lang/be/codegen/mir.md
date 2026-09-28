@@ -502,6 +502,16 @@ register, and nothing the function holds lives above the compute width.
 emitted only where the model's register-width row says the narrower code
 pays for that state (isa.vector_upper_clear), x86-64's vzeroupper (#3751)
 
+## val MIR_VEC_WIDEN_SUM_U
+
+```mach
+pub val MIR_VEC_WIDEN_SUM_U: MirOpcode = 0x1011
+```
+
+the IR widening group sum (dst, src): each result lane the zero-extended
+sum of the operand lanes it covers, the vec_lane naming the result lane and
+carrying the operand's (#4161)
+
 ## val MIR_SEL_ADD
 
 ```mach

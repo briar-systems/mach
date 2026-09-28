@@ -305,6 +305,14 @@ pub fun emit_vec_widen_half(b: *Builder, signed: bool, src: value.Value, base: v
 the lane-halving extension of the half of `src` whose first lane is `base`:
 a vector of half the lanes at twice the width, sign- or zero-extended
 
+## fun emit_vec_widen_sum_u
+
+```mach
+pub fun emit_vec_widen_sum_u(b: *Builder, src: value.Value, ty: type.IrTypeId) res[value.Value, fail.Fail];
+```
+
+each lane of `ty` the zero-extended sum of the lanes of `src` it covers
+
 ## fun emit_vec_range
 
 ```mach

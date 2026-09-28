@@ -27,8 +27,8 @@ pub rec LaneDesc;
 ```
 
 from_bits and from_lanes are the operand's lane width and lane count, which
-only a conversion, a widening multiply, a lane-halving extension or a lane
-range changes
+only a conversion, a widening multiply, a lane-halving extension, a lane
+range or a widening group sum changes
 
 ## fun lane_desc
 
@@ -60,6 +60,15 @@ pub fun extends(tgt: *target.Target, k: instruction.InstrKind, lane_bits: u32, f
 
 a loop's lane-wise integer extension `k` from `from_bits` lanes to
 `lane_bits` lanes, packed
+
+## fun extends_directly
+
+```mach
+pub fun extends_directly(tgt: *target.Target) bool;
+```
+
+a lane-wise integer extension over more than one doubling is one
+instruction on the target, rather than a chain of doublings (#4161)
 
 ## fun packed_lanes
 
@@ -168,6 +177,15 @@ pub fun operation_packs(m: *ir.Module, tgt: *target.Target, kind: instruction.In
 
 whether `kind` over `n` operands of `operand_ty` (one or two) into `ty` is a
 cell the target packs at these lanes; the catalog is the only judge
+
+## fun widen_sum_packs
+
+```mach
+pub fun widen_sum_packs(m: *ir.Module, tgt: *target.Target, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
+```
+
+whether the widening group sum of a `from_ty` vector into `ty` is a cell
+the target packs, both sides whole in one register (#4161)
 
 ## fun range_packs
 
