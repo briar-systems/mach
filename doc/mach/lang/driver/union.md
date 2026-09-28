@@ -30,6 +30,17 @@ pub fun register_export_names(p: *project.Project) err[fail.Fail];
 pub fun register_import_libraries(p: *project.Project) err[fail.Fail];
 ```
 
+## fun register_attribute_strings
+
+```mach
+pub fun register_attribute_strings(p: *project.Project) err[fail.Fail];
+```
+
+the string every attribute argument that takes one evaluates to, recorded for
+each later phase to read. it runs once the load walk has bound every constant
+a live declaration can name; an argument that is not a constant string is
+left out, and type checking reports it where it stands
+
 ## fun register_embed_inputs
 
 ```mach
@@ -39,7 +50,7 @@ pub fun register_embed_inputs(p: *project.Project) err[fail.Fail];
 ## fun module_embeds
 
 ```mach
-pub fun module_embeds(p: *project.Project, m: *project.ModuleEntry, paths: *vector.Vector[str]) err[fail.Fail];
+pub fun module_embeds(p: *project.Project, mid: session.ModuleId, paths: *vector.Vector[str]) err[fail.Fail];
 ```
 
 the resolved paths of the files module m embeds, each owned by the caller in p.s.alloc

@@ -255,7 +255,7 @@ diags: *diagnostic.DiagnosticStore) res[ResolveResult, fail.Fail];
 ## fun declaration_deprecation
 
 ```mach
-pub fun declaration_deprecation(a: *ast.Ast, source: str, interner: *intern.Interner, did: id.DeclId) res[deprecation.Deprecation, fail.Fail];
+pub fun declaration_deprecation(s: *session.Session, mid: session.ModuleId, a: *ast.Ast, source: str, did: id.DeclId) res[deprecation.Deprecation, fail.Fail];
 ```
 
 the notice a declaration's own `#[deprecated]` decorator records; a malformed decorator is
@@ -264,8 +264,11 @@ reported by type checking and records nothing here
 ## fun decorators_deprecation
 
 ```mach
-pub fun decorators_deprecation(a: *ast.Ast, source: str, interner: *intern.Interner, start: u32, len: u32) res[deprecation.Deprecation, fail.Fail];
+pub fun decorators_deprecation(s: *session.Session, mid: session.ModuleId, a: *ast.Ast, source: str, start: u32, len: u32) res[deprecation.Deprecation, fail.Fail];
 ```
+
+the message is the string the argument evaluates to; one that is not a
+constant string is reported by type checking and leaves the notice bare
 
 ## fun declaration_testing
 

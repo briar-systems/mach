@@ -149,9 +149,3 @@ pub fun insert(c: *EmbedCache, e: EmbedFile) res[*EmbedFile, fail.Fail];
 add an entry under a path the cache does not hold yet, into a chunk it never
 leaves; the entry's bytes belong to the cache from here and dnit frees them
 
-## fun path_arg_span
-
-```mach
-pub fun path_arg_span(a: *ast.Ast, dec: *decl.Decorator) opt[token.Span];
-```
-

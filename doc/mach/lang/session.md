@@ -190,6 +190,38 @@ pub fun register_export_library(s: *Session, mid: module.ModuleId, did: u32, lib
 pub fun export_library(s: *Session, mid: module.ModuleId, did: u32) opt[intern.StrId];
 ```
 
+## fun register_attr_string
+
+```mach
+pub fun register_attr_string(s: *Session, mid: module.ModuleId, eid: u32, value: intern.StrId) err[fail.Fail];
+```
+
+records the string an attribute argument evaluates to
+
+## fun attr_string
+
+```mach
+pub fun attr_string(s: *Session, mid: module.ModuleId, eid: u32) opt[intern.StrId];
+```
+
+the string an attribute argument evaluates to; none when it is not a constant string
+
+## fun forget_attr_string
+
+```mach
+pub fun forget_attr_string(s: *Session, mid: module.ModuleId, eid: u32);
+```
+
+drops the string recorded for one attribute argument
+
+## fun forget_attr_strings
+
+```mach
+pub fun forget_attr_strings(s: *Session);
+```
+
+drops every recorded attribute string, before the table is drawn again
+
 ## fun reset_type_projection
 
 ```mach
