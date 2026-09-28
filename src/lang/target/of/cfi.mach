@@ -10,6 +10,7 @@ use mach.lang.fail;
 use mach.lang.target.isa;
 use mach.lang.target.of;
 use mach.lang.target.of.bin;
+use std.collections.sort;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -459,14 +460,25 @@ pub fun eh_frame_hdr_size(count: u32) usize {
     ret 12 + 8 * count::usize;
 }
 
+# a row of `.eh_frame_hdr`'s search table: a function's start and its fde
+pub rec HdrRow {
+    pc:  u64;
+    fde: u64;
+}
+
+fun hdr_row_cmp(a: *HdrRow, b: *HdrRow) i64 {
+    if (a.pc < b.pc) { ret -1; }
+    if (a.pc > b.pc) { ret 1; }
+    ret 0;
+}
+
 # `.eh_frame_hdr`: the frame table's address and a search table of each
-# function's start and its fde, both relative to the header. `fns` is in
-# address order and `fde_offs` is what write_eh_frame returned
-pub fun write_eh_frame_hdr(buf: *u8, cap: usize, vaddr: u64, eh_vaddr: u64, fns: *UnwindFn, count: u32,
-    fde_offs: *u32) err[fail.Fail] {
+# function's start and its fde, both relative to the header, in address order
+pub fun write_eh_frame_hdr(buf: *u8, cap: usize, vaddr: u64, eh_vaddr: u64, rows: *HdrRow, count: u32) err[fail.Fail] {
     if (eh_frame_hdr_size(count) > cap) {
         ret err[fail.Fail].err{fail.message("cfi: the frame search table outgrew the room the linker reserved for it")};
     }
+    if (count > 0) { sort.sort_by[HdrRow](rows, count::usize, hdr_row_cmp); }
     buf[0] = 1;
     buf[1] = DW_EH_PE_PCREL_SDATA4;
     buf[2] = DW_EH_PE_UDATA4;
@@ -476,8 +488,8 @@ pub fun write_eh_frame_hdr(buf: *u8, cap: usize, vaddr: u64, eh_vaddr: u64, fns:
     var i: u32 = 0;
     for (i < count) {
         val at: usize = 12 + 8 * i::usize;
-        bin.write_u32_le(buf, at, (fns[i].addr - vaddr)::u32);
-        bin.write_u32_le(buf, at + 4, (eh_vaddr + fde_offs[i]::u64 - vaddr)::u32);
+        bin.write_u32_le(buf, at, (rows[i].pc - vaddr)::u32);
+        bin.write_u32_le(buf, at + 4, (rows[i].fde - vaddr)::u32);
         i = i + 1;
     }
     ret err[fail.Fail].ok{};
@@ -576,4 +588,295 @@ pub fun unwind_functions(alloc: *A.Allocator, segs: *of.LoadSegment, seg_count: 
     }
     @count = w;
     ret res[*UnwindFn, fail.Fail].ok{fns};
+}
+
+# an `.eh_frame` stream an object wrote: the linker carries a foreign object's
+# frame descriptions into the image whole, relocated in place, and reads them
+# only as far as it must: where each entry lies, the cie an fde names, and the
+# pointer fields that say which function an fde describes
+
+pub val DW_EH_PE_OMIT: u8 = 0xFF;
+
+val DW_EH_PE_PCREL: u8 = 0x10;
+
+val EH_MALFORMED: str = "cfi: a frame description table is malformed";
+
+# one entry of the stream: `off` is where its length word sits and `size` the
+# whole entry with that word. `cie_off` is the cie an fde names
+pub rec EhEntry {
+    off:     usize;
+    size:    usize;
+    cie:     bool;
+    cie_off: usize;
+}
+
+fun eh_malformed() fail.Fail {
+    ret fail.user(dkind.OBJECT_MALFORMED, EH_MALFORMED);
+}
+
+# the entry at `off`, none at a zero terminator or where the bytes end
+pub fun eh_entry(buf: *u8, len: usize, off: usize) res[opt[EhEntry], fail.Fail] {
+    if (off >= len)    { ret res[opt[EhEntry], fail.Fail].ok{opt[EhEntry].none{}}; }
+    if (len - off < 4) { ret res[opt[EhEntry], fail.Fail].err{eh_malformed()}; }
+    val length: u32 = bin.read_u32_le(buf, off);
+    if (length == 0) { ret res[opt[EhEntry], fail.Fail].ok{opt[EhEntry].none{}}; }
+    if (length == 0xFFFFFFFF) {
+        ret res[opt[EhEntry], fail.Fail].err{fail.user(dkind.OBJECT_UNSUPPORTED, "cfi: a frame description table uses the 64-bit dwarf format")};
+    }
+    if (length < 4 || length::usize > len - off - 4) { ret res[opt[EhEntry], fail.Fail].err{eh_malformed()}; }
+    val id: u32     = bin.read_u32_le(buf, off + 4);
+    var e:  EhEntry = EhEntry{off: off, size: 4 + length::usize, cie: id == 0, cie_off: 0};
+    if (!e.cie) {
+        if (id::usize > off + 4) { ret res[opt[EhEntry], fail.Fail].err{eh_malformed()}; }
+        e.cie_off = off + 4 - id::usize;
+    }
+    ret res[opt[EhEntry], fail.Fail].ok{opt[EhEntry].some{e}};
+}
+
+# what a cie says about the pointers of its fdes: how each fde's function start
+# is encoded and whether an lsda pointer follows in each fde's augmentation
+pub rec EhCie {
+    fde_enc:  u8;
+    lsda_enc: u8;
+    aug_data: bool;
+}
+
+# the bytes an encoded pointer takes, none for a form a table field cannot use
+fun enc_size(enc: u8, ptr_size: u32) opt[usize] {
+    if (enc == DW_EH_PE_OMIT) { ret opt[usize].some{0}; }
+    val form: u8 = enc & 0x0F;
+    if (form == 0)                  { ret opt[usize].some{ptr_size::usize}; }
+    if (form == 0x2 || form == 0xA) { ret opt[usize].some{2}; }
+    if (form == 0x3 || form == 0xB) { ret opt[usize].some{4}; }
+    if (form == 0x4 || form == 0xC) { ret opt[usize].some{8}; }
+    ret opt[usize].none{};
+}
+
+fun read_uleb(buf: *u8, end: usize, at: *usize) res[u64, fail.Fail] {
+    var value: u64 = 0;
+    var shift: u32 = 0;
+    for (true) {
+        if (@at >= end || shift > 63) { ret res[u64, fail.Fail].err{eh_malformed()}; }
+        val byte: u8 = buf[@at];
+        @at   = @at + 1;
+        value = value | ((byte & 0x7F)::u64 << shift);
+        shift = shift + 7;
+        if ((byte & 0x80) == 0) { ret res[u64, fail.Fail].ok{value}; }
+    }
+    ret res[u64, fail.Fail].err{eh_malformed()};
+}
+
+pub fun eh_cie(buf: *u8, e: *EhEntry, ptr_size: u32) res[EhCie, fail.Fail] {
+    val end: usize = e.off + e.size;
+    var cie: EhCie = EhCie{fde_enc: 0, lsda_enc: DW_EH_PE_OMIT, aug_data: false};
+    var at:  usize = e.off + 8;
+    if (at >= end) { ret res[EhCie, fail.Fail].err{eh_malformed()}; }
+    val version: u8 = buf[at];
+    at = at + 1;
+    if (version != 1 && version != 3) {
+        ret res[EhCie, fail.Fail].err{fail.user(dkind.OBJECT_UNSUPPORTED, "cfi: a frame description table has a cie version this linker does not read")};
+    }
+    val aug: usize = at;
+    for (at < end && buf[at] != 0) { at = at + 1; }
+    if (at >= end) { ret res[EhCie, fail.Fail].err{eh_malformed()}; }
+    val aug_end: usize = at;
+    at = at + 1;
+    if (aug_end > aug && buf[aug] != 'z') {
+        ret res[EhCie, fail.Fail].err{fail.user(dkind.OBJECT_UNSUPPORTED, "cfi: a frame description table has a cie augmentation this linker does not read")};
+    }
+    val ca: res[u64, fail.Fail] = read_uleb(buf, end, ?at);
+    if (sel ca.err) { ret res[EhCie, fail.Fail].err{ca.err}; }
+    val da: res[u64, fail.Fail] = read_uleb(buf, end, ?at);
+    if (sel da.err) { ret res[EhCie, fail.Fail].err{da.err}; }
+    if (version == 1) {
+        if (at >= end) { ret res[EhCie, fail.Fail].err{eh_malformed()}; }
+        at = at + 1;
+    }
+    or {
+        val ra: res[u64, fail.Fail] = read_uleb(buf, end, ?at);
+        if (sel ra.err) { ret res[EhCie, fail.Fail].err{ra.err}; }
+    }
+    if (aug_end == aug) { ret res[EhCie, fail.Fail].ok{cie}; }
+    cie.aug_data = true;
+    val al: res[u64, fail.Fail] = read_uleb(buf, end, ?at);
+    if (sel al.err)              { ret res[EhCie, fail.Fail].err{al.err}; }
+    if (al.ok > (end - at)::u64) { ret res[EhCie, fail.Fail].err{eh_malformed()}; }
+    val data_end: usize = at + al.ok::usize;
+    var c:        usize = aug + 1;
+    for (c < aug_end) {
+        val ch: u8 = buf[c];
+        if (ch == 'R' || ch == 'L' || ch == 'P') {
+            if (at >= data_end) { ret res[EhCie, fail.Fail].err{eh_malformed()}; }
+            val enc: u8 = buf[at];
+            at = at + 1;
+            if (ch == 'R') { cie.fde_enc = enc; }
+            or (ch == 'L') { cie.lsda_enc = enc; }
+            or {
+                val sz: opt[usize] = enc_size(enc, ptr_size);
+                if (sel sz.some) { at = at + sz.some; }
+                or {
+                    val skip: res[u64, fail.Fail] = read_uleb(buf, data_end, ?at);
+                    if (sel skip.err) { ret res[EhCie, fail.Fail].err{skip.err}; }
+                }
+            }
+        }
+        or (ch != 'S' && ch != 'B' && ch != 'G') {
+            # the rest of the augmentation data is the augmentation length's to skip
+            ret res[EhCie, fail.Fail].ok{cie};
+        }
+        c = c + 1;
+    }
+    if (at > data_end) { ret res[EhCie, fail.Fail].err{eh_malformed()}; }
+    ret res[EhCie, fail.Fail].ok{cie};
+}
+
+# where an fde's pointer fields sit: the function start and, when its cie
+# names one, the lsda. an absent lsda field has size 0
+pub rec EhFde {
+    pc_field:   usize;
+    pc_size:    usize;
+    pc_enc:     u8;
+    range:      u64;
+    lsda_field: usize;
+    lsda_size:  usize;
+    lsda_enc:   u8;
+}
+
+pub fun eh_fde(buf: *u8, e: *EhEntry, cie: *EhCie, ptr_size: u32) res[EhFde, fail.Fail] {
+    val end:     usize      = e.off + e.size;
+    val ps:      opt[usize] = enc_size(cie.fde_enc, ptr_size);
+    var pc_size: usize      = 0;
+    if (sel ps.some) { pc_size = ps.some; }
+    if (pc_size == 0 || (cie.fde_enc & 0x80) != 0) {
+        ret res[EhFde, fail.Fail].err{fail.user(dkind.OBJECT_UNSUPPORTED, "cfi: a frame description encodes its function start in a form this linker does not read")};
+    }
+    var f: EhFde = EhFde{pc_field: e.off + 8, pc_size: pc_size, pc_enc: cie.fde_enc, range: 0,
+        lsda_field: 0, lsda_size: 0, lsda_enc: cie.lsda_enc};
+    var at: usize = f.pc_field + 2 * f.pc_size;
+    if (at > end) { ret res[EhFde, fail.Fail].err{eh_malformed()}; }
+    f.range = eh_read(buf, f.pc_field + f.pc_size, f.pc_size, cie.fde_enc & 0x0F)::u64;
+    if (!cie.aug_data) { ret res[EhFde, fail.Fail].ok{f}; }
+    val al: res[u64, fail.Fail] = read_uleb(buf, end, ?at);
+    if (sel al.err)              { ret res[EhFde, fail.Fail].err{al.err}; }
+    if (al.ok > (end - at)::u64) { ret res[EhFde, fail.Fail].err{eh_malformed()}; }
+    if (cie.lsda_enc != DW_EH_PE_OMIT) {
+        val ls:        opt[usize] = enc_size(cie.lsda_enc, ptr_size);
+        var lsda_size: usize      = 0xFFFFFFFF;
+        if (sel ls.some) { lsda_size = ls.some; }
+        if (lsda_size > al.ok::usize) {
+            ret res[EhFde, fail.Fail].err{fail.user(dkind.OBJECT_UNSUPPORTED, "cfi: a frame description encodes its lsda in a form this linker does not read")};
+        }
+        f.lsda_field = at;
+        f.lsda_size  = lsda_size;
+    }
+    ret res[EhFde, fail.Fail].ok{f};
+}
+
+# a field's value as its encoding's form reads it, sign-extended for a signed form
+pub fun eh_read(buf: *u8, field: usize, size: usize, form: u8) i64 {
+    val signed: bool = (form & 0x08) != 0;
+    if (size == 2) {
+        val v: u16 = bin.read_u16_le(buf, field);
+        if (signed) { ret v::i16::i64; }
+        ret v::i64;
+    }
+    if (size == 4) {
+        val v: u32 = bin.read_u32_le(buf, field);
+        if (signed) { ret v::i32::i64; }
+        ret v::i64;
+    }
+    if (size == 8) { ret bin.read_u64_le(buf, field)::i64; }
+    ret 0;
+}
+
+# the address an encoded pointer names, the field lying at `field_vaddr`
+pub fun eh_pointer(raw: i64, enc: u8, field_vaddr: u64) res[u64, fail.Fail] {
+    val app: u8 = enc & 0x70;
+    if (app == 0)              { ret res[u64, fail.Fail].ok{raw::u64}; }
+    if (app == DW_EH_PE_PCREL) { ret res[u64, fail.Fail].ok{field_vaddr + raw::u64}; }
+    ret res[u64, fail.Fail].err{fail.user(dkind.OBJECT_UNSUPPORTED, "cfi: a frame description encodes a pointer relative to a base this linker does not read")};
+}
+
+# a function a carried frame description covers, and where that fde lies
+pub rec EhFn {
+    pc:      u64;
+    range:   u64;
+    fde_off: usize;
+}
+
+# the frame descriptions the link's foreign objects left at the start of a
+# frames table mapped at `vaddr`: the offset their stream ends at, which is
+# where the table's own entries go, and in `fns` each fde's function, `count`
+# entries the caller frees
+pub fun eh_frame_scan(alloc: *A.Allocator, buf: *u8, cap: usize, vaddr: u64, ptr_size: u32,
+    fns: **EhFn, count: *u32) res[usize, fail.Fail] {
+    @fns   = nil;
+    @count = 0;
+    var n:   u32   = 0;
+    var off: usize = 0;
+    for (true) {
+        val er: res[opt[EhEntry], fail.Fail] = eh_entry(buf, cap, off);
+        if (sel er.err)      { ret res[usize, fail.Fail].err{er.err}; }
+        if (sel er.ok.none)  { brk; }
+        if (!er.ok.some.cie) { n = n + 1; }
+        off = off + er.ok.some.size;
+    }
+    val end: usize = off;
+    if (n == 0) { ret res[usize, fail.Fail].ok{end}; }
+    val ar: res[*EhFn, A.Error] = A.allocate[EhFn](alloc, n::usize);
+    if (sel ar.err) { ret res[usize, fail.Fail].err{fail.refused(ar.err)}; }
+    val out: *EhFn = ar.ok;
+    var w:   u32   = 0;
+    off = 0;
+    for (off < end) {
+        val er: res[opt[EhEntry], fail.Fail] = eh_entry(buf, cap, off);
+        if (sel er.err) {
+            A.deallocate[EhFn](alloc, out, n::usize);
+            ret res[usize, fail.Fail].err{er.err};
+        }
+        if (sel er.ok.none) {
+            A.deallocate[EhFn](alloc, out, n::usize);
+            ret res[usize, fail.Fail].err{eh_malformed()};
+        }
+        var e: EhEntry = er.ok.some;
+        if (!e.cie) {
+            val cr: res[opt[EhEntry], fail.Fail] = eh_entry(buf, cap, e.cie_off);
+            if (sel cr.err) {
+                A.deallocate[EhFn](alloc, out, n::usize);
+                ret res[usize, fail.Fail].err{cr.err};
+            }
+            if (sel cr.ok.none) {
+                A.deallocate[EhFn](alloc, out, n::usize);
+                ret res[usize, fail.Fail].err{eh_malformed()};
+            }
+            var ce: EhEntry = cr.ok.some;
+            if (!ce.cie) {
+                A.deallocate[EhFn](alloc, out, n::usize);
+                ret res[usize, fail.Fail].err{eh_malformed()};
+            }
+            val ci: res[EhCie, fail.Fail] = eh_cie(buf, ?ce, ptr_size);
+            if (sel ci.err) {
+                A.deallocate[EhFn](alloc, out, n::usize);
+                ret res[usize, fail.Fail].err{ci.err};
+            }
+            var cie: EhCie                 = ci.ok;
+            val fd:  res[EhFde, fail.Fail] = eh_fde(buf, ?e, ?cie, ptr_size);
+            if (sel fd.err) {
+                A.deallocate[EhFn](alloc, out, n::usize);
+                ret res[usize, fail.Fail].err{fd.err};
+            }
+            val raw: i64                 = eh_read(buf, fd.ok.pc_field, fd.ok.pc_size, fd.ok.pc_enc & 0x0F);
+            val pc:  res[u64, fail.Fail] = eh_pointer(raw, fd.ok.pc_enc, vaddr + fd.ok.pc_field::u64);
+            if (sel pc.err) {
+                A.deallocate[EhFn](alloc, out, n::usize);
+                ret res[usize, fail.Fail].err{pc.err};
+            }
+            out[w] = EhFn{pc: pc.ok, range: fd.ok.range, fde_off: e.off};
+            w      = w + 1;
+        }
+        off = off + e.size;
+    }
+    @fns   = out;
+    @count = n;
+    ret res[usize, fail.Fail].ok{end};
 }

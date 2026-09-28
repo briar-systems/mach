@@ -802,53 +802,73 @@ checked against it
 pub fun vector_domain_cell(index: u32, cell: *ScalarForm) bool;
 ```
 
-## fun scalar_conversion_rows
+## def ScalarFamily
 
 ```mach
-pub fun scalar_conversion_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
+pub def ScalarFamily: u32
 ```
 
-the scalar rows for every conversion cell the model's packed table does not
-claim, written from `at`; an ISA registers its packed conversions first and
-declares the rest through this, so each conversion cell is decided once
+the families of retained cells a model leaves to the scalar path wherever
+its packed table does not claim them: the conversions; the widening
+multiplies with their high halves, the lane interleave, the lane-halving
+extensions and the widening group sums; the shifts, lane by lane through the
+scalar shift, which saturates the same way; the lane ranges and joins; and
+the f16 lane arithmetic and comparisons, each lane's scalar f16 operation (#3802)
 
-## fun scalar_widening_rows
+## val SCALAR_CONVERSIONS
 
 ```mach
-pub fun scalar_widening_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
+pub val SCALAR_CONVERSIONS: ScalarFamily = 1
 ```
 
-the same for the widening multiplies, their high halves, the lane
-interleave, the lane-halving extensions and the widening group sums: a cell
-the packed table leaves keeps the per-lane path
-
-## fun scalar_shift_rows
+## val SCALAR_WIDENING
 
 ```mach
-pub fun scalar_shift_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
+pub val SCALAR_WIDENING:    ScalarFamily = 2
 ```
 
-the same for the shifts: a cell the packed table leaves is shifted lane by
-lane through the scalar shift, which saturates the same way
-
-## fun scalar_permute_rows
+## val SCALAR_SHIFTS
 
 ```mach
-pub fun scalar_permute_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
+pub val SCALAR_SHIFTS:      ScalarFamily = 4
 ```
 
-the same for the lane ranges and joins: a cell the packed table leaves keeps
-the lane path
-
-## fun scalar_half_lane_rows
+## val SCALAR_PERMUTES
 
 ```mach
-pub fun scalar_half_lane_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
+pub val SCALAR_PERMUTES:    ScalarFamily = 8
 ```
 
-the same for the arithmetic and comparisons of f16 lanes: a cell the packed
-table leaves is each lane's scalar f16 operation, the half expansion or the
-target's own half row (#3802)
+## val SCALAR_HALF_LANES
+
+```mach
+pub val SCALAR_HALF_LANES:  ScalarFamily = 16
+```
+
+## fun declare_scalar_rows
+
+```mach
+pub fun declare_scalar_rows(reg: *IsaRegistry, m: *MachineModel, explicit: *ScalarForm, explicit_len: u32, families: ScalarFamily) err[fail.Fail];
+```
+
+declare the model's scalar table: `explicit`, then every cell of `families`
+its packed table leaves, family by family, in storage from the registry's
+allocator sized to exactly those rows. the caller releases it with
+release_scalar_rows once the model is registered, which copies it
+
+reg: the registry whose allocator backs the rows
+m: the model; its packed table is final, its scalar table is set
+explicit: the rows the model names itself
+explicit_len: how many
+families: the families whose unclaimed cells are scalar rows
+
+## fun release_scalar_rows
+
+```mach
+pub fun release_scalar_rows(reg: *IsaRegistry, m: *MachineModel);
+```
+
+free the table declare_scalar_rows gave the model
 
 ## fun ct_mul_rows_admit
 

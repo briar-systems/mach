@@ -38,9 +38,12 @@ pub fun free_load_segments(alloc: *A.Allocator, segs: *of.LoadSegment, count: u3
 
 ```mach
 pub fun build_exec_functions(alloc: *A.Allocator, out_img: *of.ObjectImage,
-segs: *of.LoadSegment, seg_count: u32,
+segs: *of.LoadSegment, seg_count: u32, natives: *of.NativeUnwind, native_count: u32,
 func_count: *u32) res[*of.ExecFunction, fail.Fail];
 ```
+
+the image's functions, each with its frame record when it has one, and the
+foreign functions an object's unwind index describes, merged by address
 
 ## fun build_symtab_entries
 

@@ -44,6 +44,19 @@ arch: *isa.IsaVTable,
 image_base: u64, atoms: *AtomPlan, thunks: *ThunkPlan) err[fail.Fail];
 ```
 
+## fun relocation_target_vaddr
+
+```mach
+pub fun relocation_target_vaddr(s: *session.Session, modules: *of.ObjectImage, m: u32, ri: u32,
+placements: *Placement, sec_base: *u32, merged_to_out: *u32, out_img: *of.ObjectImage,
+sym_locs: *map.Map[intern.StrId, SymbolLoc], format: *of.OfVTable, arch: *isa.IsaVTable,
+image_base: u64, atoms: *AtomPlan) res[opt[u64], fail.Fail];
+```
+
+where relocation `ri` of module `m` points once the layout is final: its
+target's address plus its addend, none when the link collected the target or
+defines no such symbol
+
 ## fun init_local_got_plan
 
 ```mach

@@ -8,11 +8,13 @@ filled once every function has its address
 ## fun macho_unwind_shape
 
 ```mach
-pub fun macho_unwind_shape(arch_id: u32, frames: *of.FrameUnwind, count: u32) res[of.UnwindShape, fail.Fail];
+pub fun macho_unwind_shape(arch_id: u32, frames: *of.FrameUnwind, count: u32, foreign: *of.ForeignUnwind) res[of.UnwindShape, fail.Fail];
 ```
 
 `__unwind_info` for a function and a gap after each, and `__eh_frame` for
-the frames compact unwind cannot say
+the frames compact unwind cannot say, after the frame descriptions the
+foreign objects carry in. a foreign function has an entry from its object's
+compact unwind or its frame description, so every one is counted twice at most
 
 ## fun fill_unwind
 
@@ -21,8 +23,11 @@ pub fun fill_unwind(alloc: *A.Allocator, arch_id: u32, segs: *of.LoadSegment, se
 funcs: *of.ExecFunction, func_count: u32, mh_addr: u64) err[fail.Fail];
 ```
 
-fills the unwind tables the linker reserved: an encoding per function with a
-frame record in address order, a zero one across each gap no such function
-covers, and the dwarf descriptions the encodings that need them point to.
-every function offset counts from `mh_addr`, where the mach header is mapped
+fills the unwind tables the linker reserved: an encoding per function in
+address order, a zero one across each gap no function covers, and the dwarf
+descriptions the encodings that need them point to. a mach function's entry
+follows from its frame record, a foreign one's from its object's compact
+unwind or, lacking one, from the frame description its object carried into
+`__eh_frame` ahead of this table's own. every function offset counts from
+`mh_addr`, where the mach header is mapped
 

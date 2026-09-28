@@ -178,6 +178,12 @@ pub fun report_typed(sc: *context.SemaContext, k: dkind.Kind, span: token.Span, 
 pub fun report_typed2(sc: *context.SemaContext, k: dkind.Kind, span: token.Span, prefix: str, a: type.TypeId, mid: str, b: type.TypeId, suffix: str, fallback: str);
 ```
 
+## fun expr_span_of
+
+```mach
+pub fun expr_span_of(sc: *context.SemaContext, eid: id.ExprId, fallback: token.Span) token.Span;
+```
+
 ## fun report_out_of_range
 
 ```mach

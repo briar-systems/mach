@@ -42,6 +42,12 @@ pub val R_X86_64_32:       u32 = 10
 pub val R_X86_64_32S:      u32 = 11
 ```
 
+## val R_X86_64_PC64
+
+```mach
+pub val R_X86_64_PC64:     u32 = 24
+```
+
 ## val R_X86_64_GOTPCRELX
 
 ```mach
@@ -64,6 +70,12 @@ pub val R_AARCH64_ABS64:               u32 = 257
 
 ```mach
 pub val R_AARCH64_ABS32:               u32 = 258
+```
+
+## val R_AARCH64_PREL64
+
+```mach
+pub val R_AARCH64_PREL64:              u32 = 260
 ```
 
 ## val R_AARCH64_PREL32
