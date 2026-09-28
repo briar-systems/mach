@@ -1,8 +1,9 @@
 /* the C half of the ELF foreign-unwind case (mach #4048): the frames between
  * the mach functions. compiled by the runner's own toolchain, which describes
  * each function in the object's .eh_frame, and with a section per function and
- * debug info, so the link can collect the one nothing calls and tombstone what
- * the debug info says of it (mach #3410). */
+ * zlib-compressed debug info, so the link can collect the one nothing calls,
+ * tombstone what the debug info says of it (mach #3410) and inflate the debug
+ * sections it reads (mach #4224). */
 
 extern long long unwind_inner(long long depth);
 
