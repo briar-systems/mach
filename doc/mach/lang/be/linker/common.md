@@ -124,6 +124,36 @@ pub fun is_function_branch_kind(kind: of.RelocKind) bool;
 pub fun is_got_kind(kind: of.RelocKind) bool;
 ```
 
+## val COMPACT_ENTRY_SIZE
+
+```mach
+pub val COMPACT_ENTRY_SIZE:  u32 = 32
+```
+
+a mach-o `__compact_unwind` entry: the function start, its length and its
+encoding, then the personality and the lsda, each a pointer its relocation fills
+
+## val COMPACT_PERSONALITY
+
+```mach
+pub val COMPACT_PERSONALITY: u32 = 16
+```
+
+## val COMPACT_LSDA
+
+```mach
+pub val COMPACT_LSDA:        u32 = 24
+```
+
+## fun is_personality_reloc
+
+```mach
+pub fun is_personality_reloc(img: *of.ObjectImage, r: *of.Relocation) bool;
+```
+
+a relocation naming an unwind index entry's personality, which the image
+reaches through a pointer slot as a GOT-kind relocation would
+
 ## fun named_message
 
 ```mach

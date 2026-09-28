@@ -1023,7 +1023,36 @@ pub rec ExecFunction;
 pub rec NativeUnwind;
 ```
 
-a foreign function its object's unwind index describes, at its final address
+a foreign function its object's unwind index describes, at its final
+address, and the personality and lsda (zero for none) its entry names
+
+## rec UnwindPersonality
+
+```mach
+pub rec UnwindPersonality;
+```
+
+the pointer slot an unwind entry's personality is read through: one the link
+filled, at `slot`, or the import GOT's slot for `import_index`. neither when
+the entry names no personality
+
+## val PERSONALITY_NO_IMPORT
+
+```mach
+pub val PERSONALITY_NO_IMPORT: u32 = 0xFFFFFFFF
+```
+
+## fun no_personality
+
+```mach
+pub fun no_personality() UnwindPersonality;
+```
+
+## fun has_personality
+
+```mach
+pub fun has_personality(p: *UnwindPersonality) bool;
+```
 
 ## def SymbolType
 

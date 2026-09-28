@@ -54,11 +54,12 @@ after the code
 ```mach
 pub fun resolve_native_unwind(s: *session.Session, plan: *UnwindPlan, modules: *of.ObjectImage,
 placements: *Placement, sec_base: *u32, merged_to_out: *u32, out_img: *of.ObjectImage,
-sym_locs: *map.Map[intern.StrId, SymbolLoc], format: *of.OfVTable, arch: *isa.IsaVTable,
-image_base: u64, atoms: *AtomPlan, count: *u32) res[*of.NativeUnwind, fail.Fail];
+sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState, local_got: *LocalGotPlan,
+format: *of.OfVTable, arch: *isa.IsaVTable, image_base: u64, atoms: *AtomPlan, count: *u32) res[*of.NativeUnwind, fail.Fail];
 ```
 
 the functions the foreign unwind indexes describe, at their final addresses,
-once the layout is final; an entry whose function the link collected is
-dropped. `count` entries the caller frees
+once the layout is final, with the slot each one's personality is read
+through and the address of its lsda; an entry whose function the link
+collected is dropped. `count` entries the caller frees
 
