@@ -14,7 +14,10 @@
 
 Numeric literals without a suffix are untyped until they flow into a
 binding or expression context that constrains their type. With no such
-context an integer literal is `i64` and a float literal is `f64`.
+context an integer literal is `i64` and a float literal is `f64`, and an
+integer literal that takes that default must fit `i64`: one that does not,
+such as `10000000000000000000::f64`, is refused, and a suffix
+(`10000000000000000000u64`) or a typed context gives it the type it needs.
 
 ### Typed suffixes
 
