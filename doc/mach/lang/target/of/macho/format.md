@@ -210,28 +210,43 @@ pub val S_MOD_INIT_FUNC_POINTERS: u32 = 0x9
 pub val S_MOD_TERM_FUNC_POINTERS: u32 = 0xa
 ```
 
+## val S_INTERPOSING
+
+```mach
+pub val S_INTERPOSING:            u32 = 0xd
+```
+
 ## val S_ATTR_NO_DEAD_STRIP
 
 ```mach
 pub val S_ATTR_NO_DEAD_STRIP:     u32 = 0x10000000
 ```
 
+## val COMPACT_UNWIND_ENTRY_SIZE
+
+```mach
+pub val COMPACT_UNWIND_ENTRY_SIZE: u32 = 32
+```
+
+a 64-bit `__LD,__compact_unwind` entry: function start, length, encoding,
+personality and lsda
+
 ## val S_ATTR_DEBUG
 
 ```mach
-pub val S_ATTR_DEBUG:             u32 = 0x02000000
+pub val S_ATTR_DEBUG:              u32 = 0x02000000
 ```
 
 ## val S_ATTR_SOME_INSTRUCTIONS
 
 ```mach
-pub val S_ATTR_SOME_INSTRUCTIONS: u32 = 0x00000400
+pub val S_ATTR_SOME_INSTRUCTIONS:  u32 = 0x00000400
 ```
 
 ## val S_ATTR_PURE_INSTRUCTIONS
 
 ```mach
-pub val S_ATTR_PURE_INSTRUCTIONS: u32 = 0x80000000
+pub val S_ATTR_PURE_INSTRUCTIONS:  u32 = 0x80000000
 ```
 
 ## val N_EXT
@@ -270,16 +285,22 @@ pub val N_SECT: u8 = 0x0e
 pub val N_ABS:  u8 = 0x02
 ```
 
+## val N_NO_DEAD_STRIP
+
+```mach
+pub val N_NO_DEAD_STRIP: u16 = 0x0020
+```
+
 ## val N_WEAK_DEF
 
 ```mach
-pub val N_WEAK_DEF: u16 = 0x0080
+pub val N_WEAK_DEF:      u16 = 0x0080
 ```
 
 ## val N_WEAK_REF
 
 ```mach
-pub val N_WEAK_REF: u16 = 0x0040
+pub val N_WEAK_REF:      u16 = 0x0040
 ```
 
 ## val REFERENCE_TYPE_MASK

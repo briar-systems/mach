@@ -472,6 +472,15 @@ pub val SYM_OBJ_FLAG_HIDDEN: u32 = 0x400
 a definition every module in the link may reference and no linked image
 exports: ELF STV_HIDDEN, Mach-O N_PEXT, absent from a PE export table
 
+## val SYM_OBJ_FLAG_RETAIN
+
+```mach
+pub val SYM_OBJ_FLAG_RETAIN: u32 = 0x800
+```
+
+a final link keeps the definition even when nothing references it: Mach-O
+N_NO_DEAD_STRIP, which `__attribute__((used))` sets
+
 ## val SECTION_EXTERNAL
 
 ```mach
