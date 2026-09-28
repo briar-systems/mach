@@ -78,7 +78,10 @@ refs: *AtomRelocRef, ref_total: u32, arch: *isa.IsaVTable,
 roots: *LinkRoots, dead_count: *u32) res[*DeadRange, fail.Fail];
 ```
 
-the byte ranges of a final image that no root reaches through relocations
+the byte ranges of a final image that no root reaches through relocations.
+an unwind record, an associated section and a section group member are
+reached with the function, owner or group they belong to, and a reference to
+`__start_<name>` or `__stop_<name>` reaches every section called <name>
 
 refs: the sorted reference table from build_reloc_refs
 roots: what the image keeps regardless of references
