@@ -333,6 +333,14 @@ pub def NoteBytesFn: fun(*encode.EncodeState, *u8, usize, usize) err[fail.Fail]
 pub def DeclRegFn: fun(str, *u8, *u32) bool
 ```
 
+## def NoteLabelFn
+
+```mach
+pub def NoteLabelFn: fun(*encode.EncodeState, u64) err[fail.Fail]
+```
+
+the listing's definition of a numbered local label, at the current offset
+
 ## rec Grammar
 
 ```mach
