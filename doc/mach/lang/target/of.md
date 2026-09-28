@@ -332,10 +332,18 @@ pub val RK_JAL20: RelocKind = 28
 
 the riscv jal 20-bit j-type field, +-1 MiB, even displacement
 
+## val RK_PC64
+
+```mach
+pub val RK_PC64: RelocKind = 29
+```
+
+a 64-bit field holding the target's distance from the field
+
 ## val RK_CATALOG_COUNT
 
 ```mach
-pub val RK_CATALOG_COUNT: u32 = 29
+pub val RK_CATALOG_COUNT: u32 = 30
 ```
 
 ## rec RelocKindDesc
@@ -594,8 +602,12 @@ pub val SEC_FLAG_IMAGE_MASK: u32 = SEC_FLAG_INIT_FUNCS
 pub val SEC_FLAG_UNWIND_INDEX:  u32 = 0x10
 ```
 
-a load section the linker reserved for the format's unwind tables: the index
-an unwinder searches first and the frame descriptions it leads to
+the unwind tables: the index an unwinder searches first and the frame
+descriptions it leads to. on a load section, the room the linker reserved for
+the format's table. on an input section, the object's own contribution to
+that table, which a link building the tables takes into them: frame
+descriptions (`.eh_frame`, mach-o `__eh_frame`) are carried into the frames
+table, and an index (mach-o `__compact_unwind`) is read, never placed
 
 ## val SEC_FLAG_UNWIND_FRAMES
 
@@ -954,14 +966,26 @@ pub rec UnwindShape;
 the unwind tables of an executable: an index an unwinder searches by address
 and the frame descriptions it reaches, each empty when the format needs none
 
+## rec ForeignUnwind
+
+```mach
+pub rec ForeignUnwind;
+```
+
+what the link's foreign objects bring to its unwind tables, measured before
+layout: the bytes of their own frame descriptions, which the frames table
+carries first, the entries among them that describe a function, and the
+functions their unwind index describes
+
 ## def UnwindShapeFn
 
 ```mach
-pub def UnwindShapeFn: fun(u32, *FrameUnwind, u32) res[UnwindShape, fail.Fail]
+pub def UnwindShapeFn: fun(u32, *FrameUnwind, u32, *ForeignUnwind) res[UnwindShape, fail.Fail]
 ```
 
-the unwind tables for the frame records a link keeps, at the end of the code,
-sized from the records' steps alone so the linker reserves them before layout
+the unwind tables for the frame records a link keeps and what its foreign
+objects bring, at the end of the code, sized from the records' steps and the
+foreign measure alone so the linker reserves them before layout
 
 ## rec PltFixup
 
@@ -992,6 +1016,14 @@ pub rec LoadSegment;
 ```mach
 pub rec ExecFunction;
 ```
+
+## rec NativeUnwind
+
+```mach
+pub rec NativeUnwind;
+```
+
+a foreign function its object's unwind index describes, at its final address
 
 ## def SymbolType
 

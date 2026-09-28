@@ -126,16 +126,22 @@ keeps has at most one frame record
 pub fun eh_frame_hdr_size(count: u32) usize;
 ```
 
+## rec HdrRow
+
+```mach
+pub rec HdrRow;
+```
+
+a row of `.eh_frame_hdr`'s search table: a function's start and its fde
+
 ## fun write_eh_frame_hdr
 
 ```mach
-pub fun write_eh_frame_hdr(buf: *u8, cap: usize, vaddr: u64, eh_vaddr: u64, fns: *UnwindFn, count: u32,
-fde_offs: *u32) err[fail.Fail];
+pub fun write_eh_frame_hdr(buf: *u8, cap: usize, vaddr: u64, eh_vaddr: u64, rows: *HdrRow, count: u32) err[fail.Fail];
 ```
 
 `.eh_frame_hdr`: the frame table's address and a search table of each
-function's start and its fde, both relative to the header. `fns` is in
-address order and `fde_offs` is what write_eh_frame returned
+function's start and its fde, both relative to the header, in address order
 
 ## rec UnwindRoom
 
@@ -168,4 +174,93 @@ funcs: *of.ExecFunction, func_count: u32, count: *u32) res[*UnwindFn, fail.Fail]
 
 the functions with frame records at their final addresses, in address order
 with an alias of an earlier start dropped; `count` entries the caller frees
+
+## val DW_EH_PE_OMIT
+
+```mach
+pub val DW_EH_PE_OMIT: u8 = 0xFF
+```
+
+## rec EhEntry
+
+```mach
+pub rec EhEntry;
+```
+
+one entry of the stream: `off` is where its length word sits and `size` the
+whole entry with that word. `cie_off` is the cie an fde names
+
+## fun eh_entry
+
+```mach
+pub fun eh_entry(buf: *u8, len: usize, off: usize) res[opt[EhEntry], fail.Fail];
+```
+
+the entry at `off`, none at a zero terminator or where the bytes end
+
+## rec EhCie
+
+```mach
+pub rec EhCie;
+```
+
+what a cie says about the pointers of its fdes: how each fde's function start
+is encoded and whether an lsda pointer follows in each fde's augmentation
+
+## fun eh_cie
+
+```mach
+pub fun eh_cie(buf: *u8, e: *EhEntry, ptr_size: u32) res[EhCie, fail.Fail];
+```
+
+## rec EhFde
+
+```mach
+pub rec EhFde;
+```
+
+where an fde's pointer fields sit: the function start and, when its cie
+names one, the lsda. an absent lsda field has size 0
+
+## fun eh_fde
+
+```mach
+pub fun eh_fde(buf: *u8, e: *EhEntry, cie: *EhCie, ptr_size: u32) res[EhFde, fail.Fail];
+```
+
+## fun eh_read
+
+```mach
+pub fun eh_read(buf: *u8, field: usize, size: usize, form: u8) i64;
+```
+
+a field's value as its encoding's form reads it, sign-extended for a signed form
+
+## fun eh_pointer
+
+```mach
+pub fun eh_pointer(raw: i64, enc: u8, field_vaddr: u64) res[u64, fail.Fail];
+```
+
+the address an encoded pointer names, the field lying at `field_vaddr`
+
+## rec EhFn
+
+```mach
+pub rec EhFn;
+```
+
+a function a carried frame description covers, and where that fde lies
+
+## fun eh_frame_scan
+
+```mach
+pub fun eh_frame_scan(alloc: *A.Allocator, buf: *u8, cap: usize, vaddr: u64, ptr_size: u32,
+fns: **EhFn, count: *u32) res[usize, fail.Fail];
+```
+
+the frame descriptions the link's foreign objects left at the start of a
+frames table mapped at `vaddr`: the offset their stream ends at, which is
+where the table's own entries go, and in `fns` each fde's function, `count`
+entries the caller frees
 
