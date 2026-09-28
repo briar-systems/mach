@@ -123,7 +123,10 @@ asm x86_64 {
 
 `byte`, `word`, `dword` and `qword` are accepted before a memory operand and
 nowhere else — on a register they would be redundant or contradictory, so
-`mov qword rax, rcx` is refused rather than ignored.
+`mov qword rax, rcx` is refused rather than ignored. GNU as's spelling with
+`ptr` (`mov dword ptr [rcx], 1`) means the same, and it is how the x86-64
+`--emit-asm` listing writes every sized memory operand, so a listed
+instruction pastes back into a block unchanged.
 
 **A prefix that contradicts the instruction is a build error, not a dropped
 token.** What counts as a contradiction is per mnemonic:
