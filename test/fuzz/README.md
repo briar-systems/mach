@@ -14,12 +14,9 @@ a finding. To retain a new input, put the file in its boundary's directory. A
 single candidate can be answered on its own with `MACH_FUZZ_INPUT` and
 `MACH_FUZZ_BOUNDARY` set for the `one_input_named_by_the_environment` test.
 
-The parser inputs named `unbounded-*` nest past `MAX_NEST_DEPTH` (2048, in
-`src/lang/fe/parser/state.mach`) and are answered by the depth refusal, so they
-descend the full bound before answering. Release frames are larger than debug
-ones and differ by ABI: at O2 one `if (1) {` level costs 3568 bytes on sysv64,
-3632 on aapcs64 and 4208 on win64, so the bound needs 7.0 MiB, 7.1 MiB and
-8.2 MiB of stack. Linux and darwin run on the 8 MiB main-thread default; the
-windows-x86_64 target reserves 16 MiB in `mach.toml` for it (#3325). Widening a
-frame in that cycle or raising the bound moves these numbers, and an input that
-answers in debug can still exhaust the stack in release.
+The parser inputs named `unbounded-*` nest deeper than the parser will
+descend. The parser refuses them with its located depth refusal: at
+`MAX_NEST_DEPTH` (in `src/lang/fe/parser/state.mach`), or sooner when the stack
+left drops under the margin in `src/lang/stack.mach`. The replay runs on the
+thread the compiler sizes for itself where the host has threads, as the driver
+does, so the answer does not follow the platform's reserve or `ulimit -s`.
