@@ -1,0 +1,470 @@
+use mach.lang.fail;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mach.lang.float;
+use mach.lang.me.analysis.loops;
+use mach.lang.me.ir;
+use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use mach.lang.me.scratch;
+use mach.lang.target;
+use mach.lang.wide;
+
+rec FunctionWork {
+    module: *ir.Module;
+    body:   *ir.Function;
+    target: *target.Target;
+}
+
+# a constant this loop already materialized in its preheader
+rec Made {
+    ty:   ir_type.IrTypeId;
+    bits: wide.Wide;
+    iid:  id.InstructionId;
+}
+
+rec LoopWork {
+    m:     *ir.Module;
+    fn:    *ir.Function;
+    la:    *loops.LoopAnalysis;
+    tgt:   *target.Target;
+    alloc: *A.Allocator;
+    pre:   id.BlockId;
+
+    made:     *Made;
+    made_len: u32;
+    made_cap: u32;
+}
+
+# a run that owns its workspace; the pipeline runs `run_in` over one
+#[testing]
+pub fun run(m: *ir.Module, tgt: *target.Target) res[bool, fail.Fail] {
+    var workspace:   scratch.Workspace;
+    val initialized: err[fail.Fail] = scratch.init(?workspace);
+    if (sel initialized.err) { ret res[bool, fail.Fail].err{initialized.err}; }
+    fin { scratch.dnit(?workspace); }
+    ret run_in(m, tgt, ?workspace);
+}
+
+# the constants a loop rebuilds on every iteration, materialized once in its
+# preheader instead (#3807): a float other than +0.0, which is a constant-pool
+# load or a register built from its bits, and an integer the instruction set
+# cannot build in one instruction, by its own rule. each loop, innermost first,
+# gives the constants its body reads a `const` in its own preheader, so an
+# inner loop's constant is built once per entry and lives only across that
+# loop. only the operands whose lowering reads any value are rewritten: an
+# operand a later pass or the lowering needs as a literal (a shift count, a
+# divisor, a power-of-two multiplier, a low-bit mask, an index) keeps it, and a
+# debug binding keeps the constant it names. the allocator rematerializes a
+# `const` rather than spill it, so the hoist never costs the loop a reload. an
+# instruction set without the rule hoists nothing
+pub fun run_in(m: *ir.Module, tgt: *target.Target, workspace: *scratch.Workspace) res[bool, fail.Fail] {
+    if (tgt.arch == nil || tgt.arch.int_imm_fits == nil) { ret res[bool, fail.Fail].ok{false}; }
+    var changed: bool = false;
+    var fi:      u32  = 0;
+    for (fi < m.function_len) {
+        val fn: *ir.Function = ?m.functions[fi];
+        if (fn.block_count == 0 || (fn.flags & ir.FN_FLAG_EXTERN) != 0) {
+            fi = fi + 1;
+            cnt;
+        }
+        var work:      FunctionWork         = FunctionWork{module: m, body: fn, target: tgt};
+        val changed_r: res[bool, fail.Fail] = scratch.run[FunctionWork, bool](workspace, m.alloc, ?work, hoist_function);
+        if (sel changed_r.err) { ret changed_r; }
+        if (changed_r.ok)      { changed = true; }
+        fi = fi + 1;
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+fun hoist_function(work: *FunctionWork, alloc: *A.Allocator) res[bool, fail.Fail] {
+    val m:   *ir.Module                         = work.module;
+    val fn:  *ir.Function                       = work.body;
+    val ral: res[loops.LoopAnalysis, fail.Fail] = loops.analyze(fn, ?m.types, alloc);
+    if (sel ral.err) { ret res[bool, fail.Fail].err{ral.err}; }
+    var la: loops.LoopAnalysis = ral.ok;
+    fin { loops.dnit(?la); }
+    if (la.loop_len == 0) { ret res[bool, fail.Fail].ok{false}; }
+
+    val n:  u32                = la.loop_len;
+    val ro: res[*u32, A.Error] = A.allocate[u32](alloc, n::usize);
+    if (sel ro.err) { ret res[bool, fail.Fail].err{fail.refused(ro.err)}; }
+    val order: *u32 = ro.ok;
+    fin { A.deallocate[u32](alloc, order, n::usize); }
+    loops.innermost_first(?la, order);
+
+    var changed: bool = false;
+    var oi:      u32  = 0;
+    for (oi < n) {
+        val lr: res[bool, fail.Fail] = hoist_loop(m, fn, ?la, order[oi], work.target, alloc);
+        if (sel lr.err) { ret lr; }
+        if (lr.ok)      { changed = true; }
+        oi = oi + 1;
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+fun hoist_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, tgt: *target.Target,
+    alloc: *A.Allocator) res[bool, fail.Fail] {
+    val lp: *loops.Loop = ?la.loops[lx];
+    if (lp.preheader == id.BLOCK_NIL) { ret res[bool, fail.Fail].ok{false}; }
+
+    var w: LoopWork;
+    w.m        = m;
+    w.fn       = fn;
+    w.la       = la;
+    w.tgt      = tgt;
+    w.alloc    = alloc;
+    w.pre      = lp.preheader;
+    w.made     = nil;
+    w.made_len = 0;
+    w.made_cap = 0;
+    fin {
+        if (w.made != nil) { A.deallocate[Made](alloc, w.made, w.made_cap::usize); }
+    }
+
+    var changed: bool = false;
+    var bi:      u32  = 0;
+    for (bi < lp.body_len) {
+        val b: id.BlockId = lp.body[bi];
+        bi = bi + 1;
+        # an inner loop's own constants are already in its preheader
+        if (inner_owner(la, lx, b)) { cnt; }
+        val count: u32 = fn.blocks[b::u32].instr_count;
+        var k:     u32 = 0;
+        for (k < count) {
+            val iid: id.InstructionId = fn.blocks[b::u32].instructions[k];
+            k = k + 1;
+            var o: u32 = 0;
+            for (o < fn.instrs[iid::u32].operand_count) {
+                if (hoistable(?w, iid, o)) {
+                    val rh: err[fail.Fail] = rewrite_use(?w, iid, o);
+                    if (sel rh.err) { ret res[bool, fail.Fail].err{rh.err}; }
+                    changed = true;
+                }
+                o = o + 1;
+            }
+        }
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+# whether block b is in a loop nested inside loop lx that has a preheader of
+# its own, so that loop, visited first, placed b's constants there
+fun inner_owner(la: *loops.LoopAnalysis, lx: u32, b: id.BlockId) bool {
+    var i: u32 = 0;
+    for (i < la.loop_len) {
+        if (i != lx && la.loops[i].preheader != id.BLOCK_NIL && la.loops[i].depth > la.loops[lx].depth
+            && loops.loop_contains(la, i, b) && loops.loop_contains(la, lx, la.loops[i].header)) {
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun hoistable(w: *LoopWork, iid: id.InstructionId, o: u32) bool {
+    val ins: *instruction.Instruction = ?w.fn.instrs[iid::u32];
+    val v:   value.Value              = ins.operands[o];
+    if (v.kind != value.VAL_CONST_INT && v.kind != value.VAL_CONST_FLOAT) { ret false; }
+    if (!reads_any_value(ins, o))                                         { ret false; }
+
+    val found: opt[*ir_type.IrType] = ir_type.get(?w.m.types, v.ty);
+    if (sel found.none) { ret false; }
+    val t: *ir_type.IrType = found.some;
+
+    if (v.kind == value.VAL_CONST_FLOAT) {
+        if (t.kind != ir_type.IRT_FLOAT)            { ret false; }
+        if (t.data.bits != 32 && t.data.bits != 64) { ret false; }
+        ret float.f64_bits(v.data.float_lit) != 0;
+    }
+
+    if (t.kind != ir_type.IRT_INT) { ret false; }
+    val bits: u32 = t.data.bits;
+    if (bits == 0 || bits > 64 || bits > w.tgt.model.gpr_width::u32 * 8) { ret false; }
+    val lit: wide.Wide = wide.trunc(value.int_of(?v), bits);
+    if (w.tgt.arch.int_imm_fits(lit.lo, bits))                                                          { ret false; }
+    if (ins.kind == instruction.OP_MUL && power_of_two(lit, bits))                                      { ret false; }
+    if (ins.kind == instruction.OP_AND && wide.is_zero(wide.and(lit, wide.add(lit, wide.from_u64(1))))) { ret false; }
+    ret true;
+}
+
+# a multiply by plus or minus a power of two is a shift to the lowering
+fun power_of_two(lit: wide.Wide, bits: u32) bool {
+    if (wide.is_pow2(lit)) { ret true; }
+    ret wide.is_pow2(wide.trunc(wide.neg(lit), bits));
+}
+
+# the operands whose lowering reads any value in a register: the operands of
+# arithmetic, logic and comparison, a stored value and a choice of a select.
+# an integer division keeps its literal divisor, and a shift its count
+fun reads_any_value(ins: *instruction.Instruction, o: u32) bool {
+    val k: instruction.InstrKind = ins.kind;
+    if (k == instruction.OP_STORE)                                                     { ret o == 0; }
+    if (k == instruction.OP_SELECT)                                                    { ret o == 1 || o == 2; }
+    if (ins.operand_count != 2)                                                        { ret false; }
+    if (k == instruction.OP_ADD || k == instruction.OP_SUB || k == instruction.OP_MUL) { ret true; }
+    if (k == instruction.OP_AND || k == instruction.OP_OR || k == instruction.OP_XOR)  { ret true; }
+    if (k >= instruction.OP_CMP_EQ && k <= instruction.OP_CMP_LE_U)                    { ret true; }
+    if (k == instruction.OP_DIV_S || k == instruction.OP_DIV_U) {
+        ret ins.operands[o].kind == value.VAL_CONST_FLOAT;
+    }
+    ret false;
+}
+
+fun rewrite_use(w: *LoopWork, iid: id.InstructionId, o: u32) err[fail.Fail] {
+    val v:   value.Value      = w.fn.instrs[iid::u32].operands[o];
+    val key: wide.Wide        = constant_key(v);
+    var c:   id.InstructionId = find_made(w, v.ty, key);
+    if (c == id.INSTR_NIL) {
+        val rc: res[id.InstructionId, fail.Fail] = materialize(w, v);
+        if (sel rc.err) { ret err[fail.Fail].err{rc.err}; }
+        c = rc.ok;
+        val rn: err[fail.Fail] = note_made(w, v.ty, key, c);
+        if (sel rn.err) { ret rn; }
+    }
+    var use: value.Value = value.instr(c, v.ty);
+    use.secret                        = v.secret;
+    w.fn.instrs[iid::u32].operands[o] = use;
+    ret err[fail.Fail].ok{};
+}
+
+fun constant_key(v: value.Value) wide.Wide {
+    if (v.kind == value.VAL_CONST_FLOAT) { ret wide.from_u64(float.f64_bits(v.data.float_lit)); }
+    ret value.int_of(?v);
+}
+
+fun find_made(w: *LoopWork, ty: ir_type.IrTypeId, key: wide.Wide) id.InstructionId {
+    var i: u32 = 0;
+    for (i < w.made_len) {
+        if (w.made[i].ty == ty && wide.eq(w.made[i].bits, key)) { ret w.made[i].iid; }
+        i = i + 1;
+    }
+    ret id.INSTR_NIL;
+}
+
+fun note_made(w: *LoopWork, ty: ir_type.IrTypeId, key: wide.Wide, c: id.InstructionId) err[fail.Fail] {
+    if (w.made_len == w.made_cap) {
+        val cap: u32                 = w.made_cap * 2 + 4;
+        val rg:  res[*Made, A.Error] = A.reallocate[Made](w.alloc, w.made, w.made_cap::usize, cap::usize);
+        if (sel rg.err) { ret err[fail.Fail].err{fail.refused(rg.err)}; }
+        w.made     = rg.ok;
+        w.made_cap = cap;
+    }
+    w.made[w.made_len] = Made{ty: ty, bits: key, iid: c};
+    w.made_len         = w.made_len + 1;
+    ret err[fail.Fail].ok{};
+}
+
+# the `const` in the preheader, located at the preheader's branch into the
+# loop and in its inlined scope, so a debugger stepping into the loop sees no
+# line from the loop's body before it
+fun materialize(w: *LoopWork, v: value.Value) res[id.InstructionId, fail.Fail] {
+    val ra: res[*value.Value, A.Error] = A.allocate[value.Value](w.m.alloc, 1);
+    if (sel ra.err) { ret res[id.InstructionId, fail.Fail].err{fail.refused(ra.err)}; }
+    val ops: *value.Value = ra.ok;
+    ops[0] = v;
+
+    val pre:  *ir.Block        = ?w.fn.blocks[w.pre::u32];
+    val term: id.InstructionId = pre.terminator;
+    var ni:   instruction.Instruction;
+    ni.kind          = instruction.OP_CONST;
+    ni.ty            = v.ty;
+    ni.operands      = ops;
+    ni.operand_count = 1;
+    ni.operand_cap   = 1;
+    ni.flags         = 0;
+    ni.aux_ty        = ir_type.IRT_NIL;
+    ni.loc           = w.fn.instrs[term::u32].loc;
+    ni.secret        = v.secret;
+    ni.arg_ext       = ir_type.EXT_LIST_NONE;
+
+    val ri: res[id.InstructionId, fail.Fail] = ir.instruction_add(w.m, w.fn, ni);
+    if (sel ri.err) {
+        A.deallocate[value.Value](w.m.alloc, ops, 1);
+        ret ri;
+    }
+    val c:  id.InstructionId = ri.ok;
+    val rp: err[fail.Fail]   = ir.block_append_instr(w.m, pre, c);
+    if (sel rp.err) { ret res[id.InstructionId, fail.Fail].err{rp.err}; }
+    val rs: err[fail.Fail] = loops.set_instr_block(w.la, c, w.pre);
+    if (sel rs.err) { ret res[id.InstructionId, fail.Fail].err{rs.err}; }
+    val rsite: err[fail.Fail] = ir.clone_instr_inline_site(w.fn, w.fn, term, c);
+    if (sel rsite.err) { ret res[id.InstructionId, fail.Fail].err{rsite.err}; }
+    ret res[id.InstructionId, fail.Fail].ok{c};
+}
+
+use mach.lang.intern;
+use mach.lang.me.ir.builder;
+use me_testing: mach.lang.me.testing;
+use mach.lang.target.resolved;
+use target_testing: mach.lang.target.testing;
+use semtype:        mach.lang.type;
+use std.allocator.page;
+
+# a loop reading a float constant, a wide integer twice, a wide integer as a
+# divisor and a shift count, and binding a variable to the float: the float
+# and the wide integer are one `const` each in the preheader, the divisor, the
+# count and the binding keep their literals
+#[testing]
+fun probe_build(a: *me_testing.Attempt, m: *ir.Module) i32 {
+    val ri: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel ri.err) { ret 1; }
+    val i64t: ir_type.IrTypeId                 = ri.ok;
+    val rf:   res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_float(?m.types, 64);
+    if (sel rf.err) { ret 1; }
+    val f64t: ir_type.IrTypeId    = rf.ok;
+    val rfn:  res[u32, fail.Fail] = ir.function_add(m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel rfn.err) { ret 2; }
+    var bld: builder.Builder = builder.init(m);
+    builder.set_function(?bld, ?m.functions[rfn.ok]);
+
+    val re: res[id.BlockId, fail.Fail] = builder.new_block(?bld);
+    val rh: res[id.BlockId, fail.Fail] = builder.new_block(?bld);
+    val rb: res[id.BlockId, fail.Fail] = builder.new_block(?bld);
+    val rx: res[id.BlockId, fail.Fail] = builder.new_block(?bld);
+    if (sel re.err) { ret 3; }
+    if (sel rh.err) { ret 3; }
+    if (sel rb.err) { ret 3; }
+    if (sel rx.err) { ret 3; }
+    builder.set_block(?bld, re.ok);
+    val r1: err[fail.Fail] = builder.emit_br(?bld, rh.ok);
+    if (sel r1.err) { ret 4; }
+
+    builder.set_block(?bld, rh.ok);
+    val rphi: res[value.Value, fail.Fail] = builder.emit_phi(?bld, i64t);
+    if (sel rphi.err) { ret 5; }
+    val iv: value.Value                 = rphi.ok;
+    val rc: res[value.Value, fail.Fail] = builder.emit_cmp_lt_s(?bld, iv, value.param(0, i64t));
+    if (sel rc.err) { ret 5; }
+    val r2: err[fail.Fail] = builder.emit_cbr(?bld, rc.ok, rb.ok, rx.ok);
+    if (sel r2.err) { ret 5; }
+    builder.set_block(?bld, rx.ok);
+    val r3: err[fail.Fail] = builder.emit_ret_void(?bld);
+    if (sel r3.err) { ret 6; }
+
+    builder.set_block(?bld, rb.ok);
+    val big: value.Value                 = value.const_int(1099511628211, i64t);
+    val rm:  res[value.Value, fail.Fail] = builder.emit_mul(?bld, iv, big);
+    if (sel rm.err) { ret 7; }
+    val rx2: res[value.Value, fail.Fail] = builder.emit_xor(?bld, rm.ok, big);
+    if (sel rx2.err) { ret 7; }
+    val rd: res[value.Value, fail.Fail] = builder.emit_div_u(?bld, rx2.ok, big);
+    if (sel rd.err) { ret 8; }
+    val rs: res[value.Value, fail.Fail] = builder.emit_shl(?bld, rd.ok, value.const_int(3, i64t));
+    if (sel rs.err) { ret 8; }
+    val half: value.Value                 = value.const_float(1.5, f64t);
+    val ra:   res[value.Value, fail.Fail] = builder.emit_add(?bld, value.param(1, f64t), half);
+    if (sel ra.err) { ret 9; }
+    val r4: err[fail.Fail] = builder.emit_dbg_value(?bld, half, intern.STR_NIL, f64t, semtype.TYPE_NIL, false, 0);
+    if (sel r4.err) { ret 9; }
+    val ru: res[value.Value, fail.Fail] = builder.emit_add(?bld, iv, value.const_int(1, i64t));
+    if (sel ru.err) { ret 10; }
+    val r5: err[fail.Fail] = builder.emit_br(?bld, rh.ok);
+    if (sel r5.err) { ret 10; }
+    val r6: err[fail.Fail] = builder.phi_add_incoming(?bld, iv, re.ok, value.const_int(0, i64t));
+    if (sel r6.err) { ret 10; }
+    val r7: err[fail.Fail] = builder.phi_add_incoming(?bld, iv, rb.ok, ru.ok);
+    if (sel r7.err) { ret 10; }
+    ret 0;
+}
+
+#[testing]
+fun mk_target(reg: *target.TargetRegistry, o: *resolved.Target) i32 {
+    @reg = target.registry_init();
+    val rr: err[fail.Fail] = target.register_all(reg, target_testing.debug_descriptor);
+    if (sel rr.err) { ret 1; }
+    val tr: res[resolved.Target, fail.Fail] = target.select(reg, "x86_64", "linux", "sysv64");
+    if (sel tr.err) { ret 1; }
+    @o = tr.ok;
+    ret 0;
+}
+
+#[testing]
+fun reads_const(fn: *ir.Function, v: value.Value, kind: value.ValueKind) bool {
+    if (v.kind != value.VAL_INSTR) { ret false; }
+    val c: *instruction.Instruction = ?fn.instrs[v.data.instr::u32];
+    ret c.kind == instruction.OP_CONST && c.operands[0].kind == kind;
+}
+
+test run__builds_each_constant_once_ahead_of_its_loop {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var reg: target.TargetRegistry;
+    fin { target.registry_dnit(?reg); }
+    var tgt: resolved.Target;
+    if (mk_target(?reg, ?tgt) != 0) { ret 1; }
+    val rm: res[ir.Module, fail.Fail] = ir.init(?alloc, intern.STR_NIL);
+    if (sel rm.err) { ret 1; }
+    var m: ir.Module = rm.ok;
+    fin { ir.dnit(?m); }
+    if (probe_build(nil, ?m) != 0) { ret 2; }
+
+    val rr: res[bool, fail.Fail] = run(?m, ?tgt);
+    if (sel rr.err)                     { ret 3; }
+    if (!rr.ok)                         { ret 4; }
+    if (!me_testing.verifies(?m, true)) { ret 5; }
+
+    val fn:  *ir.Function = ?m.functions[0];
+    val pre: *ir.Block    = ?fn.blocks[0];
+    if (pre.instr_count != 2) { ret 6; }
+    val body: *ir.Block                = ?fn.blocks[2];
+    val mul:  *instruction.Instruction = ?fn.instrs[body.instructions[0]::u32];
+    val xor:  *instruction.Instruction = ?fn.instrs[body.instructions[1]::u32];
+    val div:  *instruction.Instruction = ?fn.instrs[body.instructions[2]::u32];
+    val shl:  *instruction.Instruction = ?fn.instrs[body.instructions[3]::u32];
+    val add:  *instruction.Instruction = ?fn.instrs[body.instructions[4]::u32];
+    val dbg:  *instruction.Instruction = ?fn.instrs[body.instructions[5]::u32];
+    if (!reads_const(fn, mul.operands[1], value.VAL_CONST_INT))                                { ret 7; }
+    if (!dep_equal_instr(mul.operands[1], xor.operands[1]))                                    { ret 8; }
+    if (div.operands[1].kind != value.VAL_CONST_INT)                                           { ret 9; }
+    if (shl.operands[1].kind != value.VAL_CONST_INT)                                           { ret 10; }
+    if (!reads_const(fn, add.operands[1], value.VAL_CONST_FLOAT))                              { ret 11; }
+    if (dbg.kind != instruction.OP_DBG_VALUE || dbg.operands[0].kind != value.VAL_CONST_FLOAT) { ret 12; }
+    ret 0;
+}
+
+#[testing]
+fun dep_equal_instr(a: value.Value, b: value.Value) bool {
+    ret a.kind == value.VAL_INSTR && b.kind == value.VAL_INSTR && a.data.instr == b.data.instr;
+}
+
+#[testing]
+fun probe_transform(a: *me_testing.Attempt, m: *ir.Module, workspace: *scratch.Workspace) err[fail.Fail] {
+    val r: res[bool, fail.Fail] = run_in(m, a.target, workspace);
+    if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+    ret err[fail.Fail].ok{};
+}
+
+# a refusal leaves the input or some constants built ahead of the loop and
+# the rest in place, every listed `const` read by the uses it replaced
+#[testing]
+fun probe_contract(a: *me_testing.Attempt, m: *ir.Module, ordinal: usize) bool {
+    ret me_testing.verifies(m, true);
+}
+
+test run_in__refusal_at_every_ordinal_leaves_a_verifying_function {
+    var owner: A.Allocator;
+    val made:  err[A.Error] = page.make(?owner);
+    if (sel made.err) { ret 1; }
+    var reg: target.TargetRegistry;
+    fin { target.registry_dnit(?reg); }
+    var tgt: resolved.Target;
+    if (mk_target(?reg, ?tgt) != 0) { ret 2; }
+    var a: me_testing.Attempt = me_testing.Attempt{build: probe_build, transform: probe_transform,
+        contract: probe_contract, target: ?tgt, control: nil, context: (?owner)::ptr};
+    var control: ir.Module;
+    if (me_testing.control(?a, ?owner, ?control) != 0) { ret 3; }
+    fin { ir.dnit(?control); }
+    ret me_testing.walk(?a);
+}

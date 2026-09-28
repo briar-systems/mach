@@ -1732,16 +1732,21 @@ immh marker, the narrowing size of its result, or the double-precision bit.
 fcvtl lengthens half to single (eb 2) or single to double (eb 4), and fcvtn
 narrows single to half (eb 4) or double to single (eb 8)
 
+## fun logical_imm
+
+```mach
+pub fun logical_imm(value: u64, use64: bool) opt[u32];
+```
+
+the N:immr:imms field of a logical immediate, the element of 2 to 64 bits
+that repeats across the register being a rotated run of ones; none for a
+value no element spells, all zeros and all ones among them
+
 ## fun assemble
 
 ```mach
 pub fun assemble(mi: *isa.Inst) u32;
 ```
-
-the instruction word of a notification-shaped instruction: the row's base
-word with the widths applied and the operands packed by the layout. the
-operands are the assembler's, so an alias member (never assembled) and a
-member whose row cannot hold the operands it was given assemble to none
 
 ## fun signed_at_width
 
