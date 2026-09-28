@@ -3015,6 +3015,12 @@ pub val TARGET_FLOAT_WIDTH:               Kind = 494
 pub val NAME_BUILTIN_TYPE:                Kind = 495
 ```
 
+## val DECORATOR_NOT_CONSTANT
+
+```mach
+pub val DECORATOR_NOT_CONSTANT:           Kind = 496
+```
+
 ## rec Spec
 
 ```mach
@@ -3032,7 +3038,7 @@ retired: nothing raises the kind any more; the row stays so its key is
 ## val COUNT
 
 ```mach
-pub val COUNT: usize       = 495
+pub val COUNT: usize       = 496
 ```
 
 ## fun at
