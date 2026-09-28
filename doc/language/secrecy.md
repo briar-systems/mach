@@ -122,11 +122,23 @@ in full would be.
 
 ## Asking about secrecy at comptime
 
-`$is_secret(T)` folds true when `T` is `^`-qualified **at the outermost level**,
-and false otherwise. It is a type predicate like `$is_record` / `$is_union` /
-`$is_pointer`: comptime-only, valid as a `$if` / `$or` gate condition, answered
-per instantiation inside a generic. The full reference is in
+Secrecy is asked about at comptime through two predicates, because a library has
+two different questions and each needs its own answer:
+
+- `$is_secret(T)` is the **per-field** question a reflection walk asks: is this
+  type `^`-qualified at the outermost level?
+- `$holds_secret(T)` is the **byte-class** question a memory primitive asks: is
+  any byte of this type secret?
+
+Both are type predicates like `$is_record` / `$is_union` / `$is_pointer`:
+comptime-only, valid as a `$if` / `$or` gate condition, answered per
+instantiation inside a generic. The full reference is in
 [comptime-intrinsics.md](comptime-intrinsics.md).
+
+### `$is_secret`: the question a walk asks
+
+`$is_secret(T)` folds true when `T` is `^`-qualified **at the outermost level**,
+and false otherwise.
 
 It exists because secrecy was otherwise invisible to a library. Every other
 predicate asks about the shape *under* the `^` and so answers false for every
@@ -157,10 +169,39 @@ $each f in $fields(Session) {
 - a record with a secret field is not — the **field** is, and that is where a
   walk meets the question
 
-There is deliberately no transitive "contains a secret anywhere" query. The
-per-field question is the one a walk actually has, and answering the transitive
-one in its place would make the common case wrong: a formatter would redact a
-whole record over one field and could not say which.
+### `$holds_secret`: the question a memory primitive asks
+
+`$holds_secret(T)` folds true when any part of `T` is secret: `^u8`, `[32]^u8`,
+`Session` above, and `Box[^u64]` all answer true, while `u64`, `[32]u8` and a
+record of public fields answer false. It is the answer the compiler already
+computes when it refuses to erase a typed pointer to the raw `ptr` (see
+[Welded-storage pointers](#welded-storage-pointers)), one implementation rather
+than two, so a gate on it and the cast check can never disagree. That walk
+follows typed pointers, so `*^u8` holds a secret too: erasing a `**^u8` to `ptr`
+is refused for the same reason.
+
+That makes it the question a primitive like `std.memory.zero[T]` needs. A word
+kernel over `ptr` is legal only for a type with no secret byte, a wholly secret
+type goes to the constant-time kernel, and a type that mixes the two is handled
+element by element:
+
+```mach fragment
+pub fun zero[T](p: *T, count: usize) {
+    $if (!$holds_secret(T)) { raw_zero(p::ptr, $size_of(T) * count); }
+    $or ($is_secret(T))     { ct.zeroize(p::*^u8, $size_of(T) * count); }
+    $or                     { zero_typed[T](p, count); }
+}
+```
+
+### Why a walk must not ask the deep question
+
+A walk that gated on `$holds_secret` instead of `$is_secret` would be wrong in
+the common case. A formatter walking a record whose one field is secret would see
+`$holds_secret` answer true for the record and redact all of it, public `id`
+included, and it still could not say which field was the secret. The per-field
+question is the one a walk actually has, and `$is_secret(f.type)` is exactly it.
+The deep question belongs to code that treats a type as bytes, where one secret
+byte decides how every byte is moved.
 
 Note that a walk which skips a secret field is pinned by the flow rules rather
 than by convention — reading one into a public accumulator does not compile, so a
@@ -804,7 +845,7 @@ direction. Note that a flat null is necessary and not sufficient: it must also b
 sampled at a comparable cost to the probe it is bounding, or a quiet control at one
 magnitude certifies nothing about noise at another.
 
-**The x86-64 inline-asm flags table is measured, not inferred.** The eighteen-row
+**The x86-64 inline-asm flags table is measured, not inferred.** The twenty-two-row
 classification the `#[oblivious]` asm model rests on, naming which instructions
 *define* ZF and CF, which merely write them, and which read them, is re-derived on x86-64
 hosts by `mach.lang.target.isa.x64.probe`, which runs each instruction twice with
@@ -815,7 +856,8 @@ exempt and classified by reasoning instead: `popfq`, `iretq` and `syscall` pass 
 writer probe cleanly and are still not definers, because the flags came from the
 stack, the interrupt frame, or an existing value masked through `IA32_FMASK`, and
 where a value came *from* is structural rather than measurable. A non-x86-64 host
-declines the probe by name.
+declines the probe by name, and an extension row runs only on a host whose cpuid
+reports the extension.
 
 **What a timing harness can and cannot assure.** The leakage model has three
 channels and no single sampling regime covers them (briar-systems/mach#2363):
@@ -862,7 +904,7 @@ is refused rather than assumed.
 
 - [types.md](types.md) - the compound type grammar ^ qualifies
 - [tag.md](tag.md) - tagged values and outer-secret ^Tag rules
-- [comptime-intrinsics.md](comptime-intrinsics.md) - $is_secret and the rest of the type-predicate family
+- [comptime-intrinsics.md](comptime-intrinsics.md) - $is_secret, $holds_secret and the rest of the type-predicate family
 - [operators.md](operators.md) - the :: / :~ casts that preserve secrecy and :>T
 - [decorators.md](decorators.md) - the #[oblivious] decorator reference
 - [grammar.md](grammar.md) - the formal grammar of ^ and :>T

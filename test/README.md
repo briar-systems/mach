@@ -2,7 +2,7 @@
 
 `mach test .` is the unit suite. Everything here proves correctness at the codegen
 and image level against something external: the host C compiler, qemu, a real
-linker and loader, `spirv-val`, `llvm-dwarfdump`.
+linker and loader, `spirv-val`, `llvm-dwarfdump`, GNU as.
 
 ```
 test/
@@ -31,6 +31,7 @@ bash test/run.sh --target x86_64-linux    # one target (repeatable)
 bash test/run.sh --case bits/logic        # one case (repeatable)
 bash test/run.sh --qemu                   # also execute aarch64-linux, aarch64fp16-linux, riscv64-linux, riscv64zkt-linux, riscv64zfh-linux and riscv32 under qemu-user
 bash test/run.sh --dwarf                  # also build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
+bash test/run.sh --asm                    # also reassemble every x86_64 ELF column's --emit-asm listings, std's included, with GNU as and compare .text bytes
 bash test/run.sh --link [--qemu]          # the link cases instead of the corpus (--case <name> selects one)
 bash test/run.sh --incremental            # warm rebuilds of the compiler and a manifest fixture match clean builds
 bash test/run.sh --docs [--case <page>]   # the mach code blocks of doc/language compile, are fmt-canonical, and the ones with a main run
@@ -53,6 +54,14 @@ A case whose differential never executed (its build failed first) is counted in
 the summary as `differential not run`, and no such case counts as a pass. The C
 reference answer is rebuilt whenever `ref/<group>/<case>.c` or `lib/corpus.h` is
 newer than it.
+
+`--asm` holds the x86-64 `--emit-asm` listing to the object it lists. On the
+x86_64-linux and x86_64v3-linux columns each case is also built at O0 and O2
+with `--emit-asm`, and the listings of the case's module and of the fold are
+assembled by GNU as (`as --64`), as is every std module's listing once per
+column and profile. Each `.text` must equal the `.text` of mach's
+own object byte for byte. A relocated field is zero in both, since the addend
+lives in the relocation. CI runs it in those two columns.
 
 `--qemu` adds the targets this host does not run natively: `aarch64-linux` under
 `qemu-aarch64` on a host that is not aarch64 linux, `riscv64-linux` under
@@ -137,9 +146,9 @@ only, which `cases/ONLY.riscv64zkt-linux` states.
 
 The `x86_64v3-linux` column is x86_64-linux with the `x86-64-v3` level selected,
 where the vector cells its extensions add rows for pack (the avx2 per-lane
-shifts among them) and f16 converts with f16c. It serves the `vec` group and the
-f16 cases, which `cases/ONLY.x86_64v3-linux` states, and runs natively on a host
-with AVX2.
+shifts among them), vectors compute in 256-bit `ymm` registers, f16 converts
+with f16c, and every sse instruction is written in its vex form. It serves every
+case and runs natively on a host with AVX2.
 
 The `aarch64fp16-linux` column is aarch64-linux with `fp16` selected, and the
 `riscv64zfh-linux` column riscv64-linux with Zfh: each computes f16 with its own

@@ -175,6 +175,7 @@ $is_pointer(T)          # T is a reference: the raw `ptr` or a typed `*U`
 $is_integer(T)          # T is an integer: i8..i64, u8..u64
 $is_float(T)            # T is a float: f32 or f64
 $is_secret(T)           # T is `^`-qualified at the outermost level
+$holds_secret(T)        # any byte of T is secret
 ```
 
 `$is_integer` and `$is_float` are the scalar half of the family, and they exist so
@@ -247,11 +248,44 @@ wrong: a `fmt` derive gating on a transitive answer would redact a whole record 
 one field, and could not tell which field to redact. The per-field question is the
 one a walk actually has, and `$is_secret(f.type)` is exactly it.
 
-Where the transitive question is genuinely wanted through a reference, it is
-**composed** rather than built in: `$is_secret($pointee_of(f.type))` says whether a
-pointer field points at secret storage. Note that `$pointee_of(^*U)` is refused, so
-there is no route through a secret pointer — which is correct, since `$is_secret` has
-already answered true for it and a walk should stop there.
+Through a reference, the per-field question **composes**:
+`$is_secret($pointee_of(f.type))` says whether a pointer field points at secret
+storage. Note that `$pointee_of(^*U)` is refused, so there is no route through a
+secret pointer — which is correct, since `$is_secret` has already answered true for
+it and a walk should stop there.
+
+### `$holds_secret`
+
+`$holds_secret(T)` is the transitive question, asked by code that treats a type as
+bytes rather than walking it. It folds true when any part of `T` is secret, and it
+is the answer the compiler already computes when it refuses to erase a typed pointer
+to the raw `ptr`: one implementation, so a gate on it and that cast check cannot
+disagree.
+
+| operand | `$is_secret` | `$holds_secret` |
+|---|---|---|
+| `^u8`, `^Pair` | true | true |
+| `[32]^u8` | false | true |
+| `rec S { id: u64; key: ^[32]u8; }` | false | true |
+| `Box[^u64]` | false | true |
+| `*^u8` | false | true: the walk follows typed pointers, as the cast check does |
+| `u64`, `[32]u8`, `Pair`, `Box[u64]` | false | false |
+
+A memory primitive dispatches on byte class with the two together. A word kernel
+over `ptr` is legal only when no byte is secret, a wholly secret type takes the
+constant-time kernel, and a mixed one is handled element by element:
+
+```mach fragment
+pub fun zero[T](p: *T, count: usize) {
+    $if (!$holds_secret(T)) { raw_zero(p::ptr, $size_of(T) * count); }
+    $or ($is_secret(T))     { ct.zeroize(p::*^u8, $size_of(T) * count); }
+    $or                     { zero_typed[T](p, count); }
+}
+```
+
+A walk must not use it in place of `$is_secret`, for the reason above. The two
+questions and when each is asked are set out in
+[secrecy.md](secrecy.md#asking-about-secrecy-at-comptime).
 
 Because the shape predicates answer false for `^T`, "nothing classifies it" remains
 a usable signal on its own: a walk that gates on the shapes and refuses the
@@ -412,7 +446,7 @@ about storage.**
 |---|---|
 | `$size_of` / `$length_of` / `$align_of` / `$offset_of` / `$discriminant_of` | yes: a secret occupies its base type storage and exposes storage width |
 | `$is_record` / `$is_union` / `$is_tag` / `$is_pointer` / `$is_integer` / `$is_float` | no: `^T` is a secret, not a `T` |
-| `$is_secret` | no: and it is the one query *about* the `^` |
+| `$is_secret` / `$holds_secret` | no: they are the queries *about* the `^` |
 | `$pointee_of` | no: `^*U` is a secret, and is refused rather than followed |
 | `$type_name` | no: the spelling is `^T` |
 | `$type_id` | no: `^T` is a different type from `T` |

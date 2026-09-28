@@ -524,6 +524,15 @@ the IR widening group sum (dst, src): each result lane the zero-extended
 sum of the operand lanes it covers, the vec_lane naming the result lane and
 carrying the operand's (#4161)
 
+## val MIR_VEC_SIGN_MASK
+
+```mach
+pub val MIR_VEC_SIGN_MASK: MirOpcode = 0x1013
+```
+
+the IR lane sign mask (dst, src): each integer lane of src all ones when it
+is negative, else zero (#4198)
+
 ## val MIR_SEL_ADD
 
 ```mach
@@ -1530,7 +1539,7 @@ pub val VREG_TY_NIL: u32 = 0xFFFFFFFF
 ## fun vreg
 
 ```mach
-pub fun vreg(id: u32, class: u32, vector: bool, secret: bool) MirVReg;
+pub fun vreg(id: u32, class: u32, vec_bytes: u8, secret: bool) MirVReg;
 ```
 
 ## def MirSlotKind

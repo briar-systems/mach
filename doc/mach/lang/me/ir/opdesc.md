@@ -552,6 +552,12 @@ pub val IVEC_INTERLEAVE:  IrVecOp = 31
 pub val IVEC_WIDEN_SUM_U: IrVecOp = 32
 ```
 
+## val IVEC_SIGN_MASK
+
+```mach
+pub val IVEC_SIGN_MASK:   IrVecOp = 33
+```
+
 ## def VecClass
 
 ```mach
@@ -835,7 +841,7 @@ pub rec IrOpDescriptor;
 ## val IR_OP_DESCRIPTOR_COUNT
 
 ```mach
-pub val IR_OP_DESCRIPTOR_COUNT: usize = 63
+pub val IR_OP_DESCRIPTOR_COUNT: usize = 64
 ```
 
 ## fun is_known

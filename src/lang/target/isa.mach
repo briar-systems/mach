@@ -213,7 +213,14 @@ pub val VEC_OP_INTERLEAVE: VecOp = 36;
 # its scalar row is the per-lane sum, and only a packed cell is ever formed,
 # as the fold of a count accumulated in narrow lanes (#4161)
 pub val VEC_OP_WIDEN_SUM_U: VecOp = 37;
-pub val VEC_OP_LAST:        VecOp = VEC_OP_WIDEN_SUM_U;
+
+# a lane sign mask: each integer lane all ones when it is negative, else zero,
+# in lanes of its own width. it is the high half a signed lane-halving
+# extension interleaves its lanes with, so both halves of one extension share
+# it; its scalar row is each lane shifted right by its width less one, and
+# only a packed cell is ever formed (#4198)
+pub val VEC_OP_SIGN_MASK: VecOp = 38;
+pub val VEC_OP_LAST:      VecOp = VEC_OP_SIGN_MASK;
 
 # a cell is the operation, the result lane kind and width, and the operand
 # lane width; an operation that keeps its lanes repeats lane_bits there. ext
@@ -257,6 +264,21 @@ pub rec VectorRegisterRow {
     ext:         u64;
     bytes:       u32;
     upper_clear: bool;
+}
+
+# a compute width an extension gives the packed rows over one kind of lane:
+# with `ext` selected, the rows over float lanes (`is_float`) or integer ones
+# of the byte widths `lanes` names (a sum of 1, 2, 4 and 8, as vec_mem_widths)
+# run at `bits` rather than the baseline `vector_bits`. a vector of those
+# lanes is then realized whole in a register that wide, and type legalization
+# splits it only past it (#4128). the kinds widen apart on a target whose
+# extensions do: x86-64's avx computes binary32 and binary64 at 256 bits and
+# leaves integers at 128 until avx2
+pub rec VectorWidthRow {
+    ext:      u64;
+    is_float: bool;
+    lanes:    u32;
+    bits:     u32;
 }
 
 pub val VECTOR_LANES_UNBOUNDED: u32 = 0;
@@ -400,6 +422,16 @@ pub rec MachineModel {
     # is no bound, where the encoder materializes any displacement (#3907)
     mem_disp_bits: u32;
 
+    # the byte alignment of a function's entry: the encoder pads the text
+    # before each function to it, or to the function's own `#[align]` when
+    # larger, so where a function's code falls against fetch and branch
+    # boundaries does not depend on the size of the code before it (#4079)
+    function_align: u32;
+
+    # the byte the padding between functions is filled with, one whose
+    # instruction traps, since nothing ever executes it
+    code_fill: u8;
+
     # control flow is emitted as nested constructs whose edges must enter and
     # leave through their merge, break and continue blocks, so a pass may not
     # redirect an edge across a construct boundary
@@ -434,6 +466,11 @@ pub rec MachineModel {
     # compute width, none where the register is always `vector_bits` wide
     vector_register_rows:    *VectorRegisterRow;
     vector_register_row_len: u32;
+
+    # the compute widths extensions give the packed rows beyond `vector_bits`,
+    # per lane kind, none where every row runs at `vector_bits`
+    vector_width_rows:    *VectorWidthRow;
+    vector_width_row_len: u32;
 
     # every lane-wise integer extension, over any number of doublings of the
     # lane, is one instruction under the extensions `direct_extend_ext` names
@@ -496,6 +533,10 @@ pub fun is_widen_sum_op(op: VecOp) bool {
     ret op == VEC_OP_WIDEN_SUM_U;
 }
 
+pub fun is_sign_mask_op(op: VecOp) bool {
+    ret op == VEC_OP_SIGN_MASK;
+}
+
 pub fun is_shift_op(op: VecOp) bool {
     ret op >= VEC_OP_SHL_U && op <= VEC_OP_SHR_S_V;
 }
@@ -542,7 +583,7 @@ fun packed_form_valid(op: VecOp, is_float: bool, lane_bits: u32, from_bits: u32)
     ret op == VEC_OP_ADD || op == VEC_OP_SUB || op == VEC_OP_MUL
         || op == VEC_OP_DIV || op == VEC_OP_AND || op == VEC_OP_OR
         || op == VEC_OP_XOR || op == VEC_OP_NOT || op == VEC_OP_CMP
-        || is_shift_op(op) || is_permute_op(op) || is_mul_high_op(op);
+        || is_shift_op(op) || is_permute_op(op) || is_mul_high_op(op) || is_sign_mask_op(op);
 }
 
 # a scalar f16 cell: arithmetic and comparison at 16 bits, or a conversion
@@ -611,6 +652,12 @@ pub fun vector_register_bytes(m: *MachineModel) u32 {
     ret m.vector_bits / 8;
 }
 
+# the widest vector register the selected extensions give, in bits: the
+# layout aligns a vector as wide as one to it (#4128)
+pub fun vector_register_bits(m: *MachineModel) u32 {
+    ret vector_register_bytes(m) * 8;
+}
+
 # a value `bytes` wide moved out of its register leaves upper state the
 # target clears afterwards
 pub fun vector_upper_clear(m: *MachineModel, bytes: u32) bool {
@@ -639,6 +686,43 @@ fun vector_register_rows_valid(m: *MachineModel) bool {
             if (m.vector_register_rows[j].bytes == row.bytes) { ret false; }
             j = j + 1;
         }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the width in bits the packed rows over lanes of this kind and width run at
+# under the selected extensions: the widest selected row's, or `vector_bits`
+pub fun vector_width(m: *MachineModel, is_float: bool, lane_bits: u32) u32 {
+    var bits: u32 = m.vector_bits;
+    if (m.vector_width_rows == nil) { ret bits; }
+    val lane: u32 = width_bit(lane_bits / 8);
+    var i:    u32 = 0;
+    for (i < m.vector_width_row_len) {
+        val row: *VectorWidthRow = ?m.vector_width_rows[i];
+        if ((m.extensions & row.ext) == row.ext && row.is_float == is_float && (row.lanes & lane) != 0 && row.bits > bits) {
+            bits = row.bits;
+        }
+        i = i + 1;
+    }
+    ret bits;
+}
+
+# every row names an extension the isa has, lanes of the kind's widths, and
+# a power-of-two width above `vector_bits` that a register the row's
+# extensions select holds
+fun vector_width_rows_valid(m: *MachineModel) bool {
+    if (m.vector_width_row_len == 0) { ret true; }
+    if (m.vector_width_rows == nil)  { ret false; }
+    var i: u32 = 0;
+    for (i < m.vector_width_row_len) {
+        val row: *VectorWidthRow = ?m.vector_width_rows[i];
+        if (row.ext == 0 || (row.ext & ~extension_domain(m)) != 0)         { ret false; }
+        if (row.lanes == 0 || (row.lanes & ~(1 + 2 + 4 + 8)::u32) != 0)    { ret false; }
+        if (row.bits <= m.vector_bits || (row.bits & (row.bits - 1)) != 0) { ret false; }
+        var held: MachineModel = @m;
+        held.extensions = extension.close(m.extension_table, m.extension_count, row.ext);
+        if (vector_register_bytes(?held) * 8 < row.bits) { ret false; }
         i = i + 1;
     }
     ret true;
@@ -749,42 +833,70 @@ pub fun vector_domain_cell(index: u32, cell: *ScalarForm) bool {
 pub val CONVERT_CELL_COUNT: u32 = 72;
 
 #[testing]
-pub val WIDEN_CELL_COUNT: u32 = 29;
+pub val WIDEN_CELL_COUNT: u32 = 33;
 
 #[testing]
 pub val SHIFT_CELL_COUNT: u32 = 24;
 
-# the scalar rows for every conversion cell the model's packed table does not
-# claim, written from `at`; an ISA registers its packed conversions first and
-# declares the rest through this, so each conversion cell is decided once
-pub fun scalar_conversion_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32 {
-    ret scalar_rows_where(m, rows, at, is_convert_cell);
+# the families of retained cells a model leaves to the scalar path wherever
+# its packed table does not claim them: the conversions; the widening
+# multiplies with their high halves, the lane interleave, the lane-halving
+# extensions with their sign masks and the widening group sums; the shifts, lane by lane through the
+# scalar shift, which saturates the same way; the lane ranges and joins; and
+# the f16 lane arithmetic and comparisons, each lane's scalar f16 operation (#3802)
+pub def ScalarFamily: u32;
+pub val SCALAR_CONVERSIONS: ScalarFamily = 1;
+pub val SCALAR_WIDENING:    ScalarFamily = 2;
+pub val SCALAR_SHIFTS:      ScalarFamily = 4;
+pub val SCALAR_PERMUTES:    ScalarFamily = 8;
+pub val SCALAR_HALF_LANES:  ScalarFamily = 16;
+
+# declare the model's scalar table: `explicit`, then every cell of `families`
+# its packed table leaves, family by family, in storage from the registry's
+# allocator sized to exactly those rows. the caller releases it with
+# release_scalar_rows once the model is registered, which copies it
+# ---
+# reg:          the registry whose allocator backs the rows
+# m:            the model; its packed table is final, its scalar table is set
+# explicit:     the rows the model names itself
+# explicit_len: how many
+# families:     the families whose unclaimed cells are scalar rows
+pub fun declare_scalar_rows(reg: *IsaRegistry, m: *MachineModel, explicit: *ScalarForm, explicit_len: u32, families: ScalarFamily) err[fail.Fail] {
+    if (reg == nil || !reg.alloc_ready) {
+        ret err[fail.Fail].err{fail.message("mach.lang.target.isa: registry backing allocator is unavailable")};
+    }
+    val len:   u32                         = explicit_len + scalar_family_rows(m, nil, 0, families);
+    val space: res[*ScalarForm, fail.Fail] = own_space[ScalarForm](?reg.alloc, len::usize);
+    if (sel space.err) { ret err[fail.Fail].err{space.err}; }
+    val rows: *ScalarForm = space.ok;
+    var i:    u32         = 0;
+    for (i < explicit_len) {
+        rows[i] = explicit[i];
+        i       = i + 1;
+    }
+    scalar_family_rows(m, rows, explicit_len, families);
+    m.scalar_forms    = rows;
+    m.scalar_form_len = len;
+    ret err[fail.Fail].ok{};
 }
 
-# the same for the widening multiplies, their high halves, the lane
-# interleave, the lane-halving extensions and the widening group sums: a cell
-# the packed table leaves keeps the per-lane path
-pub fun scalar_widening_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32 {
-    ret scalar_rows_where(m, rows, at, is_widening_cell);
+# free the table declare_scalar_rows gave the model
+pub fun release_scalar_rows(reg: *IsaRegistry, m: *MachineModel) {
+    if (m.scalar_forms != nil) { A.deallocate[ScalarForm](?reg.alloc, m.scalar_forms, m.scalar_form_len::usize); }
+    m.scalar_forms    = nil;
+    m.scalar_form_len = 0;
 }
 
-# the same for the shifts: a cell the packed table leaves is shifted lane by
-# lane through the scalar shift, which saturates the same way
-pub fun scalar_shift_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32 {
-    ret scalar_rows_where(m, rows, at, is_shift_cell);
-}
-
-# the same for the lane ranges and joins: a cell the packed table leaves keeps
-# the lane path
-pub fun scalar_permute_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32 {
-    ret scalar_rows_where(m, rows, at, is_permute_cell);
-}
-
-# the same for the arithmetic and comparisons of f16 lanes: a cell the packed
-# table leaves is each lane's scalar f16 operation, the half expansion or the
-# target's own half row (#3802)
-pub fun scalar_half_lane_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32 {
-    ret scalar_rows_where(m, rows, at, is_half_lane_cell);
+# the rows of `families` the packed table leaves, written from `at` unless
+# `rows` is nil; how many
+fun scalar_family_rows(m: *MachineModel, rows: *ScalarForm, at: u32, families: ScalarFamily) u32 {
+    var n: u32 = 0;
+    if ((families & SCALAR_CONVERSIONS) != 0) { n = n + scalar_rows_where(m, rows, at + n, is_convert_cell); }
+    if ((families & SCALAR_WIDENING) != 0)    { n = n + scalar_rows_where(m, rows, at + n, is_widening_cell); }
+    if ((families & SCALAR_SHIFTS) != 0)      { n = n + scalar_rows_where(m, rows, at + n, is_shift_cell); }
+    if ((families & SCALAR_PERMUTES) != 0)    { n = n + scalar_rows_where(m, rows, at + n, is_permute_cell); }
+    if ((families & SCALAR_HALF_LANES) != 0)  { n = n + scalar_rows_where(m, rows, at + n, is_half_lane_cell); }
+    ret n;
 }
 
 fun is_convert_cell(cell: *ScalarForm) bool {
@@ -793,7 +905,7 @@ fun is_convert_cell(cell: *ScalarForm) bool {
 
 fun is_widening_cell(cell: *ScalarForm) bool {
     ret is_widen_op(cell.op) || is_widen_half_op(cell.op) || is_mul_high_op(cell.op) || is_interleave_op(cell.op)
-        || is_widen_sum_op(cell.op);
+        || is_widen_sum_op(cell.op) || is_sign_mask_op(cell.op);
 }
 
 fun is_shift_cell(cell: *ScalarForm) bool {
@@ -817,8 +929,8 @@ fun scalar_rows_where(m: *MachineModel, rows: *ScalarForm, at: u32, admits: fun(
         if (!vector_domain_cell(i, ?cell)) { ret n; }
         if (admits(?cell)
             && packed_width(m, cell.op, cell.is_float, cell.lane_bits, cell.from_bits) == 0) {
-            rows[at + n] = cell;
-            n            = n + 1;
+            if (rows != nil) { rows[at + n] = cell; }
+            n = n + 1;
         }
         i = i + 1;
     }
@@ -1048,7 +1160,16 @@ pub fun vector_domain_complete(m: *MachineModel) bool {
     ret true;
 }
 
-# a conversion's register holds its wider side, so that side sets the extent
+# the lane kind of a cell's operand: a conversion between the kinds reads
+# the other kind, and every other cell its result's
+pub fun from_is_float(op: VecOp, is_float: bool) bool {
+    if (op == VEC_OP_FP_TO_SI || op == VEC_OP_FP_TO_UI) { ret true; }
+    if (op == VEC_OP_SI_TO_FP || op == VEC_OP_UI_TO_FP) { ret false; }
+    ret is_float;
+}
+
+# a conversion's register holds its wider side, so that side sets the extent,
+# and each side's lanes stay within its own kind's width
 pub fun packed_width(m: *MachineModel, op: VecOp, is_float: bool, lane_bits: u32, from_bits: u32) u32 {
     if (!m.has_v128 || m.packed_forms == nil)                   { ret 0; }
     if (!packed_form_valid(op, is_float, lane_bits, from_bits)) { ret 0; }
@@ -1057,12 +1178,22 @@ pub fun packed_width(m: *MachineModel, op: VecOp, is_float: bool, lane_bits: u32
         val row: *PackedForm = ?m.packed_forms[i];
         if (row.op == op && row.is_float == is_float && row.lane_bits == lane_bits && row.from_bits == from_bits
             && packed_row_selected(m, row)) {
-            if (from_bits > lane_bits) { ret packed_extent(m, from_bits); }
-            ret packed_extent(m, lane_bits);
+            val lanes: u32 = cell_lanes(m, is_float, lane_bits, from_is_float(op, is_float), from_bits);
+            if (from_bits > lane_bits) { ret lanes * from_bits; }
+            ret lanes * lane_bits;
         }
         i = i + 1;
     }
     ret 0;
+}
+
+# the lanes one packed instruction over a cell carries: those of the side
+# whose kind and lane leave fewer
+fun cell_lanes(m: *MachineModel, is_float: bool, lane_bits: u32, from_float: bool, from_bits: u32) u32 {
+    val out: u32 = packed_lane_cap(m, is_float, lane_bits);
+    val src: u32 = packed_lane_cap(m, from_float, from_bits);
+    if (src < out) { ret src; }
+    ret out;
 }
 
 fun cell_is(row: *PackedForm, op: VecOp, is_float: bool, lane_bits: u32, from_bits: u32) bool {
@@ -1123,20 +1254,32 @@ pub fun vector_form(m: *MachineModel, op: VecOp, is_float: bool, lane_bits: u32,
     ret FORM_UNDECLARED;
 }
 
-fun packed_extent(m: *MachineModel, lane_bits: u32) u32 {
+fun packed_extent(m: *MachineModel, is_float: bool, lane_bits: u32) u32 {
     if (!m.has_v128)    { ret 0; }
     if (lane_bits == 0) { ret 0; }
-    val by_width: u32 = m.vector_bits;
+    val by_width: u32 = vector_width(m, is_float, lane_bits);
     if (m.max_vector_lanes == VECTOR_LANES_UNBOUNDED) { ret by_width; }
     val by_count: u64 = m.max_vector_lanes::u64 * lane_bits::u64;
     if (by_count < by_width::u64) { ret by_count::u32; }
     ret by_width;
 }
 
-pub fun packed_lane_cap(m: *MachineModel, lane_bits: u32) u32 {
-    val w: u32 = packed_extent(m, lane_bits);
+pub fun packed_lane_cap(m: *MachineModel, is_float: bool, lane_bits: u32) u32 {
+    val w: u32 = packed_extent(m, is_float, lane_bits);
     if (w == 0) { ret 0; }
     ret w / lane_bits;
+}
+
+# the bytes of the register that realizes a vector of `bytes` over lanes of
+# this kind whole: the narrowest register width the kind computes at that
+# holds it, `vector_op_bytes` at the least. a vector wider than every such
+# register is not realized in one and keeps the narrowest (#4128)
+pub fun vector_op_bytes(m: *MachineModel, is_float: bool, lane_bits: u32, bytes: u32) u32 {
+    var w:     u32 = m.vector_op_bytes;
+    val limit: u32 = vector_width(m, is_float, lane_bits) / 8;
+    if (bytes > limit) { ret w; }
+    for (w != 0 && w < bytes && w * 2 <= limit) { w = w * 2; }
+    ret w;
 }
 
 fun width_bit(bytes: u32) u32 {
@@ -1169,7 +1312,11 @@ pub fun mem_disp_folds(m: *MachineModel, off: i64) bool {
     ret offset_fits(m.mem_disp_bits, off);
 }
 
+# a vector of `bytes` moves between memory and its register in one access:
+# a width the target declares, or a register width its extensions give past
+# the compute width (#4128)
 pub fun moves_vector_memory(m: *MachineModel, bytes: u32) bool {
+    if (bytes > m.vector_bits / 8 && bytes <= vector_register_bytes(m) && (bytes & (bytes - 1)) == 0) { ret true; }
     val b: u32 = width_bit(bytes);
     if (b == 0) { ret false; }
     ret (m.vec_mem_widths & b) != 0;
@@ -1203,8 +1350,8 @@ pub fun realizes_int_width(m: *MachineModel, bytes: u32) bool {
     ret (m.int_widths & b) != 0;
 }
 
-pub fun fits_vector_register(m: *MachineModel, lane_bits: u32, lanes: u32) bool {
-    val w: u32 = packed_extent(m, lane_bits);
+pub fun fits_vector_register(m: *MachineModel, is_float: bool, lane_bits: u32, lanes: u32) bool {
+    val w: u32 = packed_extent(m, is_float, lane_bits);
     if (w == 0 || lanes == 0) { ret false; }
     ret lanes <= w / lane_bits;
 }
@@ -1255,21 +1402,21 @@ pub rec BackendIdentity {
 }
 
 pub rec BackendAbi {
-    gp_arg_regs:                 RegFileFn;
-    callee_saved:                RegFileFn;
-    indirect_result_reg:         i32;
-    indirect_result_in_argfile:  bool;
-    consumes_agg_layout:         bool;
-    fp_callee_saved_full_vector: bool;
-    float_arg_bits:              u32;
-    arg_slot_granularity:        u32;
-    variadic_args_on_stack:      bool;
-    fixed_args_natural_size:     bool;
-    reg_arg_align:               u32;
-    reg_arg_extend:              u32;
-    agg_arg_natural_align:       bool;
-    va_list_size:                u32;
-    va_list_align:               u32;
+    gp_arg_regs:                RegFileFn;
+    callee_saved:               RegFileFn;
+    indirect_result_reg:        i32;
+    indirect_result_in_argfile: bool;
+    consumes_agg_layout:        bool;
+    fp_callee_saved_bytes:      u32;
+    float_arg_bits:             u32;
+    arg_slot_granularity:       u32;
+    variadic_args_on_stack:     bool;
+    fixed_args_natural_size:    bool;
+    reg_arg_align:              u32;
+    reg_arg_extend:             u32;
+    agg_arg_natural_align:      bool;
+    va_list_size:               u32;
+    va_list_align:              u32;
 }
 
 pub rec BackendOs {
@@ -1798,6 +1945,7 @@ pub rec IsaRegistryEntry {
     scalar_forms:       *ScalarForm;
     half_forms:         *PackedForm;
     register_rows:      *VectorRegisterRow;
+    width_rows:         *VectorWidthRow;
     ct_mul_forms:       *ct.CtMulForm;
     envs:               *Environment;
     op_defs:            *OpDef;
@@ -2035,6 +2183,7 @@ pub fun registry_init_with_allocator(alloc: *A.Allocator) IsaRegistry {
         reg.entries[i].scalar_forms       = nil;
         reg.entries[i].half_forms         = nil;
         reg.entries[i].register_rows      = nil;
+        reg.entries[i].width_rows         = nil;
         reg.entries[i].ct_mul_forms       = nil;
         reg.entries[i].envs               = nil;
         reg.entries[i].op_defs            = nil;
@@ -2121,6 +2270,9 @@ fun release_entry(reg: *IsaRegistry, entry: *IsaRegistryEntry) {
     if (entry.register_rows != nil) {
         A.deallocate[VectorRegisterRow](?reg.alloc, entry.register_rows, entry.model.vector_register_row_len::usize);
     }
+    if (entry.width_rows != nil) {
+        A.deallocate[VectorWidthRow](?reg.alloc, entry.width_rows, entry.model.vector_width_row_len::usize);
+    }
     if (entry.ct_mul_forms != nil) {
         A.deallocate[ct.CtMulForm](?reg.alloc, entry.ct_mul_forms, entry.model.ct_mul_form_len::usize);
     }
@@ -2173,6 +2325,7 @@ fun release_entry(reg: *IsaRegistry, entry: *IsaRegistryEntry) {
     entry.scalar_forms       = nil;
     entry.half_forms         = nil;
     entry.register_rows      = nil;
+    entry.width_rows         = nil;
     entry.ct_mul_forms       = nil;
     entry.envs               = nil;
     entry.op_defs            = nil;
@@ -2268,7 +2421,7 @@ fun descriptor_valid(vt: *IsaVTable) bool {
         || (vt.model.half_form_len > 0 && vt.model.half_forms == nil)) { ret false; }
     if (!packed_forms_valid(vt.model) || !scalar_forms_valid(vt.model) || !half_forms_valid(vt.model)) { ret false; }
     if (!float.nan_rule_valid(vt.model.nan_rule))                                                      { ret false; }
-    if (!vector_register_rows_valid(vt.model))                                                         { ret false; }
+    if (!vector_register_rows_valid(vt.model) || !vector_width_rows_valid(vt.model))                   { ret false; }
     val mul_bad: opt[str] = ct_mul_forms_refusal(vt.model);
     if (sel mul_bad.some)                  { ret false; }
     if (!vector_domain_complete(vt.model)) { ret false; }
@@ -2341,6 +2494,7 @@ pub fun registry_validate(reg: *IsaRegistry) err[fail.Fail] {
             || (entry.model.scalar_form_len > 0 && entry.scalar_forms == nil)
             || (entry.model.half_form_len > 0 && entry.half_forms == nil)
             || (entry.model.vector_register_row_len > 0 && entry.register_rows == nil)
+            || (entry.model.vector_width_row_len > 0 && entry.width_rows == nil)
             || (vt.machine != nil && vt.machine.reserved_reg_count > 0 && entry.machine_reserved == nil)
             || (vt.machine != nil && vt.machine.reload_scratch_count > 0 && entry.reload_scratch == nil)
             || (vt.defs != nil && vt.defs.op_count > 0 && entry.op_defs == nil)
@@ -2513,6 +2667,10 @@ pub fun register(reg: *IsaRegistry, vt: *IsaVTable) err[fail.Fail] {
             ret err[fail.Fail].err{fail.message(errf("mach.lang.target.isa: machine model declares a malformed vector register width",
                 "mach.lang.target.isa: instruction set '{}' declares a vector register width that is not a power of two above its compute width, repeated, or gated on an extension it does not name", vt.name))};
         }
+        if (!vector_width_rows_valid(vt.model)) {
+            ret err[fail.Fail].err{fail.message(errf("mach.lang.target.isa: machine model declares a malformed vector compute width",
+                "mach.lang.target.isa: instruction set '{}' declares a vector compute width that is not a power of two above its baseline, names no lane it has, is wider than the register its extensions select, or is gated on an extension it does not name", vt.name))};
+        }
         if ((vt.model.extension_count > 0 && vt.model.extension_table == nil)
             || (vt.model.extension_table != nil && !extension.table_valid(vt.model.extension_table, vt.model.extension_count))
             || (vt.model.extensions & ~extension_domain(vt.model)) != 0) {
@@ -2594,6 +2752,7 @@ pub fun register(reg: *IsaRegistry, vt: *IsaVTable) err[fail.Fail] {
     entry.scalar_forms       = nil;
     entry.half_forms         = nil;
     entry.register_rows      = nil;
+    entry.width_rows         = nil;
     entry.ct_mul_forms       = nil;
     entry.envs               = nil;
     entry.op_defs            = nil;
@@ -2708,6 +2867,13 @@ pub fun register(reg: *IsaRegistry, vt: *IsaVTable) err[fail.Fail] {
         }
         entry.register_rows              = r_register_rows.ok;
         entry.model.vector_register_rows = entry.register_rows;
+        val r_width_rows: res[*VectorWidthRow, fail.Fail] = own_copy[VectorWidthRow](?reg.alloc, vt.model.vector_width_rows, vt.model.vector_width_row_len::usize);
+        if (sel r_width_rows.err) {
+            release_entry(reg, entry);
+            ret err[fail.Fail].err{r_width_rows.err};
+        }
+        entry.width_rows              = r_width_rows.ok;
+        entry.model.vector_width_rows = entry.width_rows;
         val r_ct_mul_forms: res[*ct.CtMulForm, fail.Fail] = own_copy[ct.CtMulForm](?reg.alloc, vt.model.ct_mul_forms, vt.model.ct_mul_form_len::usize);
         if (sel r_ct_mul_forms.err) {
             release_entry(reg, entry);
@@ -3166,20 +3332,26 @@ fun t_model(width: u32) MachineModel {
 }
 
 # every retained cell but the one packed row, as the scalar table a test model
-# with a vector unit needs to register
+# with a vector unit needs to register, in storage from `alloc` that holds the
+# whole domain; nil when it cannot be had
 #[testing]
-val T_SCALAR_CAP: u32 = 200;
+fun t_scalar_rest(alloc: *A.Allocator, count: *u32, packed_op: VecOp, packed_float: bool, packed_bits: u32) *ScalarForm {
+    val space: res[*ScalarForm, fail.Fail] = own_space[ScalarForm](alloc, vector_domain_len()::usize);
+    if (sel space.err) { ret nil; }
+    @count = t_scalar_fill(space.ok, packed_op, packed_float, packed_bits);
+    ret space.ok;
+}
 
-# 0 when the rest does not fit T_SCALAR_CAP rows
+# write every retained cell but the packed row's into `scalar`, which holds the
+# whole domain; how many
 #[testing]
-fun t_scalar_rest(scalar: *ScalarForm, packed_op: VecOp, packed_float: bool, packed_bits: u32) u32 {
+fun t_scalar_fill(scalar: *ScalarForm, packed_op: VecOp, packed_float: bool, packed_bits: u32) u32 {
     var n:   u32 = 0;
     var i:   u32 = 0;
     val len: u32 = vector_domain_len();
-    if (len > T_SCALAR_CAP) { ret 0; }
     for (i < len) {
         var cell: ScalarForm;
-        if (!vector_domain_cell(i, ?cell)) { ret 0; }
+        if (!vector_domain_cell(i, ?cell)) { ret n; }
         if (cell.op != packed_op || cell.is_float != packed_float || cell.lane_bits != packed_bits) {
             scalar[n] = cell;
             n         = n + 1;
@@ -3187,6 +3359,11 @@ fun t_scalar_rest(scalar: *ScalarForm, packed_op: VecOp, packed_float: bool, pac
         i = i + 1;
     }
     ret n;
+}
+
+#[testing]
+fun t_scalar_free(alloc: *A.Allocator, scalar: *ScalarForm) {
+    A.deallocate[ScalarForm](alloc, scalar, vector_domain_len()::usize);
 }
 
 #[testing]
@@ -3559,8 +3736,8 @@ test packed_width__lane_count_ceiling {
     if (packed_width(?unbounded, VEC_OP_ADD, false, 16, 16) != 128) { ret 1; }
     if (packed_width(?unbounded, VEC_OP_ADD, false, 32, 32) != 128) { ret 1; }
     if (packed_width(?unbounded, VEC_OP_ADD, true, 64, 64) != 128)  { ret 1; }
-    if (packed_lane_cap(?unbounded, 8) != 16)                       { ret 1; }
-    if (packed_lane_cap(?unbounded, 32) != 4)                       { ret 1; }
+    if (packed_lane_cap(?unbounded, false, 8) != 16)                { ret 1; }
+    if (packed_lane_cap(?unbounded, false, 32) != 4)                { ret 1; }
 
     var capped: MachineModel;
     capped.has_v128         = true;
@@ -3573,10 +3750,10 @@ test packed_width__lane_count_ceiling {
     if (packed_width(?capped, VEC_OP_ADD, false, 16, 16) != 64)  { ret 1; }
     if (packed_width(?capped, VEC_OP_ADD, false, 32, 32) != 128) { ret 1; }
     if (packed_width(?capped, VEC_OP_ADD, true, 64, 64) != 128)  { ret 1; }
-    if (packed_lane_cap(?capped, 8) != 4)                        { ret 1; }
-    if (packed_lane_cap(?capped, 16) != 4)                       { ret 1; }
-    if (packed_lane_cap(?capped, 32) != 4)                       { ret 1; }
-    if (packed_lane_cap(?capped, 64) != 2)                       { ret 1; }
+    if (packed_lane_cap(?capped, false, 8) != 4)                 { ret 1; }
+    if (packed_lane_cap(?capped, false, 16) != 4)                { ret 1; }
+    if (packed_lane_cap(?capped, false, 32) != 4)                { ret 1; }
+    if (packed_lane_cap(?capped, false, 64) != 2)                { ret 1; }
 
     var mul: [1]PackedForm;
     mul[0]                 = PackedForm{op: VEC_OP_MUL, is_float: true, lane_bits: 32, from_bits: 32};
@@ -3591,13 +3768,13 @@ test packed_width__lane_count_ceiling {
     capped.packed_forms    = nil;
     capped.packed_form_len = 0;
     if (packed_width(?capped, VEC_OP_ADD, false, 32, 32) != 0) { ret 5; }
-    if (packed_lane_cap(?capped, 32) != 4)                     { ret 6; }
+    if (packed_lane_cap(?capped, false, 32) != 4)              { ret 6; }
 
     var none: MachineModel;
     none.has_v128         = false;
     none.max_vector_lanes = 4;
     if (packed_width(?none, VEC_OP_ADD, false, 32, 32) != 0) { ret 1; }
-    if (packed_lane_cap(?none, 32) != 0)                     { ret 1; }
+    if (packed_lane_cap(?none, false, 32) != 0)              { ret 1; }
     ret 0;
 }
 
@@ -3611,10 +3788,10 @@ test packed_width__honors_the_target_own_vector_width {
     wide.packed_form_len  = 1;
 
     if (packed_width(?wide, VEC_OP_ADD, false, 32, 32) != 256) { ret 1; }
-    if (packed_lane_cap(?wide, 32) != 8)                       { ret 1; }
-    if (packed_lane_cap(?wide, 64) != 4)                       { ret 1; }
-    if (fits_vector_register(?wide, 32, 0)
-        || fits_vector_register(?wide, 32, 0x80000000)) { ret 2; }
+    if (packed_lane_cap(?wide, false, 32) != 8)                { ret 1; }
+    if (packed_lane_cap(?wide, false, 64) != 4)                { ret 1; }
+    if (fits_vector_register(?wide, false, 32, 0)
+        || fits_vector_register(?wide, false, 32, 0x80000000)) { ret 2; }
     wide.max_vector_lanes = 0x80000000;
     if (packed_width(?wide, VEC_OP_ADD, false, 32, 32) != 256) { ret 3; }
 
@@ -3626,7 +3803,7 @@ test packed_width__honors_the_target_own_vector_width {
     narrow.packed_form_len  = 1;
 
     if (packed_width(?narrow, VEC_OP_ADD, false, 32, 32) != 64) { ret 1; }
-    if (packed_lane_cap(?narrow, 32) != 2)                      { ret 1; }
+    if (packed_lane_cap(?narrow, false, 32) != 2)               { ret 1; }
 
     var unset: MachineModel;
     unset.has_v128         = true;
@@ -3636,7 +3813,7 @@ test packed_width__honors_the_target_own_vector_width {
     unset.packed_form_len  = 1;
 
     if (packed_width(?unset, VEC_OP_ADD, false, 32, 32) != 0) { ret 1; }
-    if (packed_lane_cap(?unset, 32) != 0)                     { ret 1; }
+    if (packed_lane_cap(?unset, false, 32) != 0)              { ret 1; }
     ret 0;
 }
 
@@ -3947,10 +4124,12 @@ test register__rejects_ambiguous_nested_identities {
     vt.name            = "incomplete_domain";
     val r_2506: err[fail.Fail] = register(?reg, ?vt);
     if (!sel r_2506.err) { ret 9; }
-    var scalar:     [T_SCALAR_CAP]ScalarForm;
-    val scalar_len: u32 = t_scalar_rest(?scalar[0], VEC_OP_ADD, false, 32);
+    var scalar_len: u32         = 0;
+    val scalar:     *ScalarForm = t_scalar_rest(?reg.alloc, ?scalar_len, VEC_OP_ADD, false, 32);
+    if (scalar == nil) { ret 91; }
+    fin { t_scalar_free(?reg.alloc, scalar); }
     if (scalar_len + 1 != vector_domain_len()) { ret 10; }
-    model.scalar_forms    = ?scalar[0];
+    model.scalar_forms    = scalar;
     model.scalar_form_len = scalar_len;
     scalar[0]             = ScalarForm{op: VEC_OP_ADD, is_float: false, lane_bits: 32, from_bits: 32};
     vt.name               = "scalar_row_also_packed";
@@ -3964,7 +4143,7 @@ test register__rejects_ambiguous_nested_identities {
     vt.name   = "scalar_row_outside_vocabulary";
     val r_2519: err[fail.Fail] = register(?reg, ?vt);
     if (!sel r_2519.err) { ret 13; }
-    model.scalar_form_len = t_scalar_rest(?scalar[0], VEC_OP_ADD, false, 32);
+    model.scalar_form_len = t_scalar_fill(scalar, VEC_OP_ADD, false, 32);
     model.has_v128        = false;
     vt.name               = "no_unit_with_rows";
     val r_2523: err[fail.Fail] = register(?reg, ?vt);
@@ -3978,14 +4157,18 @@ test register__rejects_ambiguous_nested_identities {
     ret 0;
 }
 
-test scalar_conversion_rows__declares_every_conversion_the_packed_table_leaves {
+test declare_scalar_rows__declares_every_conversion_the_packed_table_leaves {
     var m: MachineModel = t_model(8);
     m.has_v128         = true;
     m.vector_bits      = VECTOR_BITS_128;
     m.max_vector_lanes = VECTOR_LANES_UNBOUNDED;
-    var rows: [72]ScalarForm;
-    if (scalar_conversion_rows(?m, ?rows[0], 0) != CONVERT_CELL_COUNT) { ret 1; }
-    var i: u32 = 0;
+    var reg: IsaRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    val all: err[fail.Fail] = declare_scalar_rows(?reg, ?m, nil, 0, SCALAR_CONVERSIONS);
+    if (sel all.err || m.scalar_form_len != CONVERT_CELL_COUNT) { ret 1; }
+    fin { release_scalar_rows(?reg, ?m); }
+    var rows: *ScalarForm = m.scalar_forms;
+    var i:    u32         = 0;
     for (i < CONVERT_CELL_COUNT) {
         if (!is_convert_op(rows[i].op) || is_widen_op(rows[i].op)) { ret 2; }
         i = i + 1;
@@ -3994,7 +4177,11 @@ test scalar_conversion_rows__declares_every_conversion_the_packed_table_leaves {
     packed[0]         = PackedForm{op: VEC_OP_SEXT, is_float: false, lane_bits: 32, from_bits: 16};
     m.packed_forms    = ?packed[0];
     m.packed_form_len = 1;
-    val left: u32 = scalar_conversion_rows(?m, ?rows[0], 0);
+    release_scalar_rows(?reg, ?m);
+    val rest: err[fail.Fail] = declare_scalar_rows(?reg, ?m, nil, 0, SCALAR_CONVERSIONS);
+    if (sel rest.err) { ret 3; }
+    val left: u32 = m.scalar_form_len;
+    rows = m.scalar_forms;
     if (left != CONVERT_CELL_COUNT - 1) { ret 3; }
     i = 0;
     for (i < left) {
@@ -4007,17 +4194,21 @@ test scalar_conversion_rows__declares_every_conversion_the_packed_table_leaves {
     ret 0;
 }
 
-test scalar_widening_rows__declares_every_widening_multiply_the_packed_table_leaves {
+test declare_scalar_rows__declares_every_widening_multiply_the_packed_table_leaves {
     var m: MachineModel = t_model(8);
     m.has_v128         = true;
     m.vector_bits      = VECTOR_BITS_128;
     m.max_vector_lanes = VECTOR_LANES_UNBOUNDED;
-    var rows: [29]ScalarForm;
-    if (scalar_widening_rows(?m, ?rows[0], 0) != WIDEN_CELL_COUNT) { ret 1; }
-    var i: u32 = 0;
+    var reg: IsaRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    val all: err[fail.Fail] = declare_scalar_rows(?reg, ?m, nil, 0, SCALAR_WIDENING);
+    if (sel all.err || m.scalar_form_len != WIDEN_CELL_COUNT) { ret 1; }
+    fin { release_scalar_rows(?reg, ?m); }
+    var rows: *ScalarForm = m.scalar_forms;
+    var i:    u32         = 0;
     for (i < WIDEN_CELL_COUNT) {
         if (!is_widening_cell(?rows[i]) || is_convert_op(rows[i].op)) { ret 2; }
-        if (is_mul_high_op(rows[i].op)) {
+        if (is_mul_high_op(rows[i].op) || is_sign_mask_op(rows[i].op)) {
             if (rows[i].lane_bits != rows[i].from_bits) { ret 2; }
         }
         or (is_widen_sum_op(rows[i].op)) {
@@ -4030,7 +4221,11 @@ test scalar_widening_rows__declares_every_widening_multiply_the_packed_table_lea
     packed[0]         = PackedForm{op: VEC_OP_MUL_WIDE_U, is_float: false, lane_bits: 32, from_bits: 16};
     m.packed_forms    = ?packed[0];
     m.packed_form_len = 1;
-    val left: u32 = scalar_widening_rows(?m, ?rows[0], 0);
+    release_scalar_rows(?reg, ?m);
+    val rest: err[fail.Fail] = declare_scalar_rows(?reg, ?m, nil, 0, SCALAR_WIDENING);
+    if (sel rest.err) { ret 3; }
+    val left: u32 = m.scalar_form_len;
+    rows = m.scalar_forms;
     if (left != WIDEN_CELL_COUNT - 1) { ret 3; }
     i = 0;
     for (i < left) {
@@ -4047,14 +4242,18 @@ test scalar_widening_rows__declares_every_widening_multiply_the_packed_table_lea
     ret 0;
 }
 
-test scalar_shift_rows__declares_every_shift_the_packed_table_leaves {
+test declare_scalar_rows__declares_every_shift_the_packed_table_leaves {
     var m: MachineModel = t_model(8);
     m.has_v128         = true;
     m.vector_bits      = VECTOR_BITS_128;
     m.max_vector_lanes = VECTOR_LANES_UNBOUNDED;
-    var rows: [24]ScalarForm;
-    if (scalar_shift_rows(?m, ?rows[0], 0) != SHIFT_CELL_COUNT) { ret 1; }
-    var i: u32 = 0;
+    var reg: IsaRegistry = registry_init();
+    fin { registry_dnit(?reg); }
+    val all: err[fail.Fail] = declare_scalar_rows(?reg, ?m, nil, 0, SCALAR_SHIFTS);
+    if (sel all.err || m.scalar_form_len != SHIFT_CELL_COUNT) { ret 1; }
+    fin { release_scalar_rows(?reg, ?m); }
+    var rows: *ScalarForm = m.scalar_forms;
+    var i:    u32         = 0;
     for (i < SHIFT_CELL_COUNT) {
         if (!is_shift_op(rows[i].op) || rows[i].is_float || rows[i].lane_bits != rows[i].from_bits) { ret 2; }
         i = i + 1;
@@ -4063,7 +4262,11 @@ test scalar_shift_rows__declares_every_shift_the_packed_table_leaves {
     packed[0]         = PackedForm{op: VEC_OP_SHR_S_U, is_float: false, lane_bits: 16, from_bits: 16};
     m.packed_forms    = ?packed[0];
     m.packed_form_len = 1;
-    val left: u32 = scalar_shift_rows(?m, ?rows[0], 0);
+    release_scalar_rows(?reg, ?m);
+    val rest: err[fail.Fail] = declare_scalar_rows(?reg, ?m, nil, 0, SCALAR_SHIFTS);
+    if (sel rest.err) { ret 3; }
+    val left: u32 = m.scalar_form_len;
+    rows = m.scalar_forms;
     if (left != SHIFT_CELL_COUNT - 1) { ret 3; }
     i = 0;
     for (i < left) {
@@ -4084,8 +4287,8 @@ test scalar_shift_rows__declares_every_shift_the_packed_table_leaves {
 test vector_form__every_retained_cell_has_one_declared_outcome {
     # 51 lane-keeping cells, 72 conversions, 6 widening multiplies, 6
     # lane-halving extensions, 24 shifts, 7 lane ranges, 7 lane joins, 8 high
-    # multiplies, 3 lane interleaves and 6 widening group sums
-    if (vector_domain_len() != 190) { ret 1; }
+    # multiplies, 3 lane interleaves, 6 widening group sums and 4 sign masks
+    if (vector_domain_len() != 194) { ret 1; }
     var cell: ScalarForm;
     if (!vector_domain_cell(0, ?cell)
         || cell.op != VEC_OP_ADD || cell.is_float || cell.lane_bits != 8 || cell.from_bits != 8) { ret 2; }
@@ -4125,19 +4328,28 @@ test vector_form__every_retained_cell_has_one_declared_outcome {
         || cell.op != VEC_OP_WIDEN_SUM_U || cell.is_float || cell.lane_bits != 16 || cell.from_bits != 8) { ret 34; }
     if (!vector_domain_cell(189, ?cell)
         || cell.op != VEC_OP_WIDEN_SUM_U || cell.is_float || cell.lane_bits != 64 || cell.from_bits != 32) { ret 35; }
-    if (vector_domain_cell(190, ?cell)) { ret 4; }
+    if (!vector_domain_cell(190, ?cell)
+        || cell.op != VEC_OP_SIGN_MASK || cell.is_float || cell.lane_bits != 8 || cell.from_bits != 8) { ret 36; }
+    if (!vector_domain_cell(193, ?cell)
+        || cell.op != VEC_OP_SIGN_MASK || cell.is_float || cell.lane_bits != 64 || cell.from_bits != 64) { ret 37; }
+    if (vector_domain_cell(194, ?cell)) { ret 4; }
 
     var packed: [1]PackedForm;
     packed[0] = PackedForm{op: VEC_OP_MUL, is_float: true, lane_bits: 32, from_bits: 32};
-    var scalar:     [T_SCALAR_CAP]ScalarForm;
-    val scalar_len: u32          = t_scalar_rest(?scalar[0], VEC_OP_MUL, true, 32);
-    var m:          MachineModel = t_model(8);
+    var rest_alloc: A.Allocator;
+    val rest_made:  err[A.Error] = page.make(?rest_alloc);
+    if (sel rest_made.err) { ret 90; }
+    var scalar_len: u32         = 0;
+    val scalar:     *ScalarForm = t_scalar_rest(?rest_alloc, ?scalar_len, VEC_OP_MUL, true, 32);
+    if (scalar == nil) { ret 91; }
+    fin { t_scalar_free(?rest_alloc, scalar); }
+    var m: MachineModel = t_model(8);
     m.has_v128         = true;
     m.vector_bits      = VECTOR_BITS_128;
     m.max_vector_lanes = VECTOR_LANES_UNBOUNDED;
     m.packed_forms     = ?packed[0];
     m.packed_form_len  = 1;
-    m.scalar_forms     = ?scalar[0];
+    m.scalar_forms     = scalar;
     m.scalar_form_len  = scalar_len;
     if (!vector_domain_complete(?m))                               { ret 5; }
     if (vector_form(?m, VEC_OP_MUL, true, 32, 32) != FORM_PACKED)  { ret 6; }
@@ -4365,9 +4577,11 @@ test registry__owns_nested_storage_and_strings {
     packed[0].is_float  = false;
     packed[0].lane_bits = 32;
     packed[0].from_bits = 32;
-    var scalar:     [T_SCALAR_CAP]ScalarForm;
-    val scalar_len: u32          = t_scalar_rest(?scalar[0], VEC_OP_MUL, false, 32);
-    var model:      MachineModel = t_model(8);
+    var scalar_len: u32         = 0;
+    val scalar:     *ScalarForm = t_scalar_rest(?reg.alloc, ?scalar_len, VEC_OP_MUL, false, 32);
+    if (scalar == nil) { ret 91; }
+    fin { t_scalar_free(?reg.alloc, scalar); }
+    var model: MachineModel = t_model(8);
     model.reg_classes     = ?classes[0];
     model.reg_class_len   = 1;
     model.reserved_regs   = ?model_reserved[0];
@@ -4376,7 +4590,7 @@ test registry__owns_nested_storage_and_strings {
     model.vector_bits     = VECTOR_BITS_128;
     model.packed_forms    = ?packed[0];
     model.packed_form_len = 1;
-    model.scalar_forms    = ?scalar[0];
+    model.scalar_forms    = scalar;
     model.scalar_form_len = scalar_len;
 
     var machine_reserved: [1]Register;
@@ -4558,9 +4772,11 @@ test registry__partial_allocation_rolls_back {
     forms[0].is_float  = false;
     forms[0].lane_bits = 32;
     forms[0].from_bits = 32;
-    var scalar:     [T_SCALAR_CAP]ScalarForm;
-    val scalar_len: u32          = t_scalar_rest(?scalar[0], VEC_OP_MUL, false, 32);
-    var model:      MachineModel = t_model(8);
+    var scalar_len: u32         = 0;
+    val scalar:     *ScalarForm = t_scalar_rest(?probe.backing, ?scalar_len, VEC_OP_MUL, false, 32);
+    if (scalar == nil) { ret 91; }
+    fin { t_scalar_free(?probe.backing, scalar); }
+    var model: MachineModel = t_model(8);
     model.reg_classes     = ?classes[0];
     model.reg_class_len   = 1;
     model.reserved_regs   = ?model_reserved[0];
@@ -4569,7 +4785,7 @@ test registry__partial_allocation_rolls_back {
     model.vector_bits     = VECTOR_BITS_128;
     model.packed_forms    = ?forms[0];
     model.packed_form_len = 1;
-    model.scalar_forms    = ?scalar[0];
+    model.scalar_forms    = scalar;
     model.scalar_form_len = scalar_len;
 
     var machine_reserved: [1]Register;
@@ -4726,5 +4942,47 @@ test vector_register_rows__widest_selected_and_valid {
     if (vector_register_rows_valid(?m)) { ret 6; }
     rows[1] = VectorRegisterRow{ext: rvfeatures.D, bytes: 32, upper_clear: false};
     if (vector_register_rows_valid(?m)) { ret 7; }
+    ret 0;
+}
+
+# the compute widths widen per lane kind: a register row selected by F and
+# width rows for float lanes under F and integer ones under D, which brings
+# F, as x86-64's avx and avx2 do (#4128)
+test vector_width_rows__per_lane_kind_under_the_selection {
+    var reg:  [1]VectorRegisterRow = [1]VectorRegisterRow{VectorRegisterRow{ext: rvfeatures.F, bytes: 32, upper_clear: true}};
+    var rows: [2]VectorWidthRow;
+    rows[0] = VectorWidthRow{ext: rvfeatures.F, is_float: true, lanes: 4 + 8, bits: 256};
+    rows[1] = VectorWidthRow{ext: rvfeatures.D, is_float: false, lanes: 1 + 2 + 4 + 8, bits: 256};
+    var m: MachineModel = t_model(8);
+    m.has_v128                = true;
+    m.vector_bits             = VECTOR_BITS_128;
+    m.vector_op_bytes         = 16;
+    m.max_vector_lanes        = VECTOR_LANES_UNBOUNDED;
+    m.vector_register_rows    = ?reg[0];
+    m.vector_register_row_len = 1;
+    m.vector_width_rows       = ?rows[0];
+    m.vector_width_row_len    = 2;
+    m.extensions              = 0;
+    if (!vector_width_rows_valid(?m))                                             { ret 1; }
+    if (vector_width(?m, true, 32) != 128 || packed_lane_cap(?m, false, 32) != 4) { ret 2; }
+    m.extensions = rvfeatures.F;
+    if (vector_width(?m, true, 32) != 256 || vector_width(?m, true, 16) != 128)              { ret 3; }
+    if (vector_width(?m, false, 32) != 128 || packed_lane_cap(?m, true, 64) != 4)            { ret 4; }
+    if (vector_op_bytes(?m, true, 32, 32) != 32 || vector_op_bytes(?m, true, 32, 20) != 32)  { ret 5; }
+    if (vector_op_bytes(?m, false, 32, 32) != 16 || vector_op_bytes(?m, true, 32, 12) != 16) { ret 6; }
+    if (vector_op_bytes(?m, true, 32, 64) != 16)                                             { ret 7; }
+    m.extensions = rvfeatures.F | rvfeatures.D;
+    if (vector_width(?m, false, 8) != 256 || packed_lane_cap(?m, false, 16) != 16)      { ret 8; }
+    if (!from_is_float(VEC_OP_FP_TO_SI, false) || from_is_float(VEC_OP_SI_TO_FP, true)) { ret 9; }
+    # a width past the register the row's extensions select, no lane, a width
+    # at the baseline, and no extension are each malformed
+    rows[1] = VectorWidthRow{ext: rvfeatures.D, is_float: false, lanes: 4, bits: 512};
+    if (vector_width_rows_valid(?m)) { ret 10; }
+    rows[1] = VectorWidthRow{ext: rvfeatures.D, is_float: false, lanes: 0, bits: 256};
+    if (vector_width_rows_valid(?m)) { ret 11; }
+    rows[1] = VectorWidthRow{ext: rvfeatures.D, is_float: false, lanes: 4, bits: 128};
+    if (vector_width_rows_valid(?m)) { ret 12; }
+    rows[1] = VectorWidthRow{ext: 0, is_float: false, lanes: 4, bits: 256};
+    if (vector_width_rows_valid(?m)) { ret 13; }
     ret 0;
 }

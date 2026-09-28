@@ -12,6 +12,24 @@ pub val MERGED_KIND_COUNT: u32 = of.SK_COUNT
 pub rec Placement;
 ```
 
+## val PLACE_MERGED
+
+```mach
+pub val PLACE_MERGED:        u8 = 0
+```
+
+## val PLACE_UNWIND_FRAMES
+
+```mach
+pub val PLACE_UNWIND_FRAMES: u8 = 1
+```
+
+## val PLACE_UNWIND_INDEX
+
+```mach
+pub val PLACE_UNWIND_INDEX:  u8 = 2
+```
+
 ## rec MergedSection
 
 ```mach

@@ -44,6 +44,32 @@ arch: *isa.IsaVTable,
 image_base: u64, atoms: *AtomPlan, thunks: *ThunkPlan) err[fail.Fail];
 ```
 
+## fun relocation_target_vaddr
+
+```mach
+pub fun relocation_target_vaddr(s: *session.Session, modules: *of.ObjectImage, m: u32, ri: u32,
+placements: *Placement, sec_base: *u32, merged_to_out: *u32, out_img: *of.ObjectImage,
+sym_locs: *map.Map[intern.StrId, SymbolLoc], format: *of.OfVTable, arch: *isa.IsaVTable,
+image_base: u64, atoms: *AtomPlan) res[opt[u64], fail.Fail];
+```
+
+where relocation `ri` of module `m` points once the layout is final: its
+target's address plus its addend, none when the link collected the target or
+defines no such symbol
+
+## fun personality_slot
+
+```mach
+pub fun personality_slot(s: *session.Session, modules: *of.ObjectImage, m: u32, ri: u32,
+placements: *Placement, sec_base: *u32, merged_to_out: *u32, out_img: *of.ObjectImage,
+sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState, local_got: *LocalGotPlan,
+format: *of.OfVTable, arch: *isa.IsaVTable, image_base: u64, atoms: *AtomPlan) res[of.UnwindPersonality, fail.Fail];
+```
+
+the pointer slot relocation `ri` of module `m` reaches a personality through:
+the local GOT slot of a symbol the link defines, filled with its address, or
+the import GOT slot of one the loader binds
+
 ## fun init_local_got_plan
 
 ```mach
@@ -66,6 +92,17 @@ sec_base: *u32, atoms: *AtomPlan,
 merged: *MergedSection, groups: *SectionGroups,
 plan: *LocalGotPlan) err[fail.Fail];
 ```
+
+## fun fill_local_got_slot
+
+```mach
+pub fun fill_local_got_slot(s: *session.Session, out_img: *of.ObjectImage, merged_to_out: *u32, dyn: *DynState,
+plan: *LocalGotPlan, arch: *isa.IsaVTable, module: u32, symbol: u32, name: intern.StrId, local: bool,
+vaddr: u64, absolute: bool) res[u32, fail.Fail];
+```
+
+the local GOT slot a defined symbol is read through, holding its address from
+the first reference on and rebased when the image moves and the symbol does
 
 ## fun finalize_local_got_vaddrs
 

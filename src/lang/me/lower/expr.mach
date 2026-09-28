@@ -607,7 +607,7 @@ fun stamp_spirv_op(ctx: *context.LowerContext, sym: *resolve.Symbol, v: value.Va
     val opt_d: opt[*decl.Decl] = ast.get_decl(origin_ast, current.symbol.decl);
     if (sel opt_d.none) { ret; }
     val fi:    u32 = v.data.fn_ix;
-    val set_v: u32 = context.decl_target_op(origin_ast, context.ast_source(ctx, origin_ast),
+    val set_v: u32 = context.decl_target_op(ctx.s, current.symbol.origin, origin_ast, context.ast_source(ctx, origin_ast),
         opt_d.some, ctx.tgt.isa.defs,
         ?ctx.m.functions[fi].op_code);
     if (set_v != isa.NO_OP_SET) { ctx.m.functions[fi].op_set = set_v; }
@@ -2021,7 +2021,7 @@ fun free_type_args(ctx: *context.LowerContext, args: *type.TypeId, argc: u32) {
 fun lower_binary(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) res[value.Value, fail.Fail] {
     val op: expr.BinOp = e.data.binary.op;
 
-    if (op == expr.BIN_ASSIGN)                   { ret lower_assign(ctx, e); }
+    if (op == expr.BIN_ASSIGN)                   { ret lower_assign(ctx, eid, e); }
     if (op == expr.BIN_AND || op == expr.BIN_OR) { ret lower_logical(ctx, e); }
 
     val res_lhs: res[value.Value, fail.Fail] = lower_rvalue(ctx, e.data.binary.lhs);
@@ -2748,11 +2748,15 @@ fun extend_int_value(ctx: *context.LowerContext, v: value.Value, from: type.Type
     ret builder.emit_zext(?ctx.builder, v, to);
 }
 
-fun lower_assign(ctx: *context.LowerContext, e: *expr.Expr) res[value.Value, fail.Fail] {
+fun lower_assign(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) res[value.Value, fail.Fail] {
     val stored: opt[res[value.Value, fail.Fail]] = lower_vector_store(ctx, e);
     if (sel stored.some) { ret stored.some; }
 
-    val res_rhs: res[value.Value, fail.Fail] = lower_rvalue(ctx, e.data.binary.rhs);
+    # the snapshot is only needed when the value is used again or the destination's address
+    # expression can write memory (#4235)
+    var borrowed: bool                        = false;
+    val res_rhs:  res[value.Value, fail.Fail] = lower_stored_rvalue(ctx, e.data.binary.rhs,
+        eid == ctx.discard_eid && expr_write_free(ctx, e.data.binary.lhs, 0), ?borrowed);
     if (sel res_rhs.err) { ret res_rhs; }
     val rhs: value.Value = res_rhs.ok;
 
@@ -2768,7 +2772,31 @@ fun lower_assign(ctx: *context.LowerContext, e: *expr.Expr) res[value.Value, fai
     if (sel res_store.err)                          { ret res[value.Value, fail.Fail].err{res_store.err}; }
     if (access_is_volatile(ctx, e.data.binary.lhs)) { builder.mark_last_volatile(?ctx.builder); }
 
+    # a borrowed source may change later, and the destination holds the value it wrote
+    if (borrowed) { ret assign_epilogue(ctx, e, value.retype(ptr, rhs.ty)); }
     ret assign_epilogue(ctx, e, rhs);
+}
+
+# the value a store consumes. when `in_place` holds, nothing writes memory between this read
+# and the store, so an aggregate place is read where it lies and the store copies from it:
+# the aggregate copy is overlap-safe, so no snapshot sits between them (#4235, #4241)
+pub fun lower_stored_rvalue(ctx: *context.LowerContext, eid: id.ExprId, in_place: bool, borrowed: *bool) res[value.Value, fail.Fail] {
+    val saved_armed: bool      = ctx.borrow_armed;
+    val saved_eid:   id.ExprId = ctx.borrow_eid;
+    val saved_hit:   bool      = ctx.borrow_hit;
+    ctx.borrow_armed = in_place;
+    ctx.borrow_eid   = eid;
+    ctx.borrow_hit   = false;
+    val res_v: res[value.Value, fail.Fail] = lower_rvalue(ctx, eid);
+    @borrowed        = ctx.borrow_hit;
+    ctx.borrow_armed = saved_armed;
+    ctx.borrow_eid   = saved_eid;
+    ctx.borrow_hit   = saved_hit;
+    if (sel res_v.err) { ret res_v; }
+    var v: value.Value = res_v.ok;
+    # the store reads the source itself, so it carries the secrecy the snapshot copy did
+    if (@borrowed && context.type_carries_secret(ctx, context.expr_type_of(ctx, eid))) { v.secret = true; }
+    ret res[value.Value, fail.Fail].ok{v};
 }
 
 # `place = v::[N]T` stores the vector where the array lives: one vector store,
@@ -3093,14 +3121,14 @@ fun lower_half_cast(ctx: *context.LowerContext, v: value.Value, dst: ir_type.IrT
 }
 
 # the conversions whose operand's shape is their lowering: an array in memory
-# read as a vector is one vector load, and a half of a vector widened lane by
-# lane is one lane-halving extension where the target packs that cell
+# read as a vector is one vector load, and a range of a vector widened lane by
+# lane extends straight from the vector
 fun lower_cast_shape(ctx: *context.LowerContext, operand: id.ExprId, from_ty: type.TypeId, to_ty: type.TypeId) opt[res[value.Value, fail.Fail]] {
     if (!type.is_vector(?ctx.s.types, to_ty)) { ret opt[res[value.Value, fail.Fail]].none{}; }
     if (is_array_type(ctx, from_ty)) {
         ret opt[res[value.Value, fail.Fail]].some{lower_array_as_vector(ctx, operand, to_ty)};
     }
-    if (type.is_vector(?ctx.s.types, from_ty)) { ret lower_widen_half(ctx, operand, from_ty, to_ty); }
+    if (type.is_vector(?ctx.s.types, from_ty)) { ret lower_range_cast(ctx, operand, from_ty, to_ty); }
     ret opt[res[value.Value, fail.Fail]].none{};
 }
 
@@ -3129,10 +3157,11 @@ fun array_address(ctx: *context.LowerContext, eid: id.ExprId) res[value.Value, f
     ret lower_rvalue(ctx, eid);
 }
 
-# `v[0, n]::T` or `v[n, n]::T` over a `2n`-lane integer vector, where each lane
-# of `T` is twice as wide: the lane-halving extension of that half where the
-# target packs it, and otherwise each lane extended straight from `v`
-fun lower_widen_half(ctx: *context.LowerContext, operand: id.ExprId, from_ty: type.TypeId, to_ty: type.TypeId) opt[res[value.Value, fail.Fail]] {
+# `v[a, n]::T` over an integer vector, where each lane of `T` is wider: a half
+# (`v[0, n]` or `v[n, n]` of `2n` lanes) at twice the width is the lane-halving
+# extension where the target packs that cell, and any other range is extracted
+# with each lane extended straight from `v`
+fun lower_range_cast(ctx: *context.LowerContext, operand: id.ExprId, from_ty: type.TypeId, to_ty: type.TypeId) opt[res[value.Value, fail.Fail]] {
     val e_opt: res[expr.Expr, fail.Fail] = context.expression(ctx, operand);
     if (sel e_opt.err) { ret opt[res[value.Value, fail.Fail]].none{}; }
     var e_value: expr.Expr  = e_opt.ok;
@@ -3142,16 +3171,14 @@ fun lower_widen_half(ctx: *context.LowerContext, operand: id.ExprId, from_ty: ty
     val src_ty: type.TypeId      = context.expr_type_of(ctx, e.data.index.object);
     val lf:     opt[type.TypeId] = type.prim(?ctx.s.types, type.vector_element(?ctx.s.types, from_ty));
     val lt:     opt[type.TypeId] = type.prim(?ctx.s.types, type.vector_element(?ctx.s.types, to_ty));
-    val half:   u32              = type.vector_lanes(?ctx.s.types, from_ty);
+    val lanes:  u32              = type.vector_lanes(?ctx.s.types, from_ty);
     if (sel lf.none)                                                { ret opt[res[value.Value, fail.Fail]].none{}; }
     if (sel lt.none)                                                { ret opt[res[value.Value, fail.Fail]].none{}; }
     if (is_float_type(ctx, lf.some) || is_float_type(ctx, lt.some)) { ret opt[res[value.Value, fail.Fail]].none{}; }
-    if (scalar_bits(ctx, lt.some) != scalar_bits(ctx, lf.some) * 2) { ret opt[res[value.Value, fail.Fail]].none{}; }
-    if (type.vector_lanes(?ctx.s.types, src_ty) != half * 2)        { ret opt[res[value.Value, fail.Fail]].none{}; }
+    if (scalar_bits(ctx, lt.some) <= scalar_bits(ctx, lf.some))     { ret opt[res[value.Value, fail.Fail]].none{}; }
 
     val start: res[u64, fail.Fail] = vector_range_start(ctx, e);
-    if (sel start.err)                          { ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{start.err}}; }
-    if (start.ok != 0 && start.ok != half::u64) { ret opt[res[value.Value, fail.Fail]].none{}; }
+    if (sel start.err) { ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{start.err}}; }
 
     val res_dst: res[ir_type.IrTypeId, fail.Fail] = context.lower_type(ctx, to_ty);
     if (sel res_dst.err) { ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{res_dst.err}}; }
@@ -3165,11 +3192,13 @@ fun lower_widen_half(ctx: *context.LowerContext, operand: id.ExprId, from_ty: ty
     if (sel res_xty.err) { ret opt[res[value.Value, fail.Fail]].some{res[value.Value, fail.Fail].err{res_xty.err}}; }
     val res_vec: res[value.Value, fail.Fail] = lower_rvalue(ctx, e.data.index.object);
     if (sel res_vec.err) { ret opt[res[value.Value, fail.Fail]].some{res_vec}; }
-    if (!vecform.widen_half_packs(ctx.m, ctx.tgt, kind, res_dst.ok, res_src.ok)) {
-        ret opt[res[value.Value, fail.Fail]].some{extract_lanes(ctx, res_vec.ok, start.ok, res_dst.ok, opt[bool].some{signed})};
+    var half: bool = scalar_bits(ctx, lt.some) == scalar_bits(ctx, lf.some) * 2 && type.vector_lanes(?ctx.s.types, src_ty) == lanes * 2;
+    if (start.ok != 0 && start.ok != lanes::u64) { half = false; }
+    if (half && vecform.widen_half_packs(ctx.m, ctx.tgt, kind, res_dst.ok, res_src.ok)) {
+        ret opt[res[value.Value, fail.Fail]].some{builder.emit_vec_widen_half(?ctx.builder, signed, res_vec.ok,
+            value.const_int(start.ok, res_xty.ok), res_dst.ok)};
     }
-    ret opt[res[value.Value, fail.Fail]].some{builder.emit_vec_widen_half(?ctx.builder, signed, res_vec.ok,
-        value.const_int(start.ok, res_xty.ok), res_dst.ok)};
+    ret opt[res[value.Value, fail.Fail]].some{extract_lanes(ctx, res_vec.ok, start.ok, res_dst.ok, opt[bool].some{signed})};
 }
 
 fun emit_retype(ctx: *context.LowerContext, v: value.Value, dst: ir_type.IrTypeId) res[value.Value, fail.Fail] {

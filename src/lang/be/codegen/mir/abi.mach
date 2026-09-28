@@ -722,6 +722,16 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     }
     val variadic_call: bool = !sig_is_fn || sig_is_va || ((inst.operand_count - 1) > layout.param_count);
 
+    var sibling: bool = false;
+    if ((inst.flags & instruction.INSTR_FLAG_TAIL) != 0 && !variadic_call) {
+        val judged: res[bool, fail.Fail] = sibling_call(ctx, inst, ret_type, ?layout);
+        if (sel judged.err) {
+            sig_layout_free(ctx, ?layout);
+            ret err[fail.Fail].err{judged.err};
+        }
+        sibling = judged.ok;
+    }
+
     val ret_size:            u64  = type.byte_size_for_machine(ctx.types, ret_type, ctx.layout)::u64;
     var ret_storage_align:   u32  = context.ret_align(ctx, ret_type);
     val ret_aggr:            bool = context.value_is_aggregate(ctx, ret_type);
@@ -736,7 +746,11 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
 
     val res_dst:  mir.VRegId = context.instr_vreg(ctx, iid);
     var sret_ptr: mir.VRegId = mir.MIR_VREG_NIL;
-    if (ret_mem && !mir.vreg_is_nil(res_dst)) {
+    if (sibling) {
+        # the callee writes the result where the caller's own caller asked
+        if (rslot.class == abi.CLASS_SRET) { sret_ptr = ctx.sret_vreg; }
+    }
+    or (ret_mem && !mir.vreg_is_nil(res_dst)) {
         var ra:         err[fail.Fail] = err[fail.Fail].ok{};
         var owned_size: u64            = ret_size;
         if (rslot.class != abi.CLASS_SRET) {
@@ -795,7 +809,8 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         }
     }
 
-    var i: u32 = 1;
+    var keeps_upper: bool = false;
+    var i:           u32  = 1;
     for (i < inst.operand_count) {
         val av:   value.Value = inst.operands[i];
         val pidx: u32         = i - 1;
@@ -841,12 +856,18 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         }
         val argop: mir.MirOperand = aor.ok;
 
-        record_outgoing_align(ctx, ?slot);
+        if (!sibling)                { record_outgoing_align(ctx, ?slot); }
+        if (rides_upper(ctx, ?slot)) { keeps_upper = true; }
         # the carriers, the caller's copy and every temporary between them are secret when any byte of the object is
         ctx.cur_writes_secret = av.secret;
         ctx.cur_vec_lane      = context.vec_lane_for_type(ctx, av.ty);
         var er: err[fail.Fail] = err[fail.Fail].ok{};
-        if (slot.class == abi.CLASS_STACK && context.vector_image(ctx, context.sig_param_type(ctx, sig, pidx), av.ty)) {
+        if (sibling && slot.class == abi.CLASS_STACK) {
+            val fp: mir.PRegId = mir.preg_id(ctx.tgt.model.frame_ptr_reg);
+            er = context.emit_store_to_w(ctx, mb, mir.op_mem_preg(fp, ctx.tgt.model.incoming_arg_base + soff), argop,
+                scalar_mem_move_width(ctx.tgt.model.gpr_width, asz, natural_stack_slot(ctx.tgt, false)));
+        }
+        or (slot.class == abi.CLASS_STACK && context.vector_image(ctx, context.sig_param_type(ctx, sig, pidx), av.ty)) {
             er = emit_stack_image_arg(ctx, mb, slot, argop, soff);
         }
         or (register_image(ctx, ?slot, context.sig_param_type(ctx, sig, pidx), av.ty)) {
@@ -903,7 +924,7 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
 
     sig_layout_free(ctx, ?layout);
 
-    record_outgoing_size(ctx, stack_off);
+    if (!sibling) { record_outgoing_size(ctx, stack_off); }
 
     if (variadic_call) {
         var vamodel: abi.VaModel;
@@ -927,8 +948,15 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     callops[0] = lowered_16.ok;
     var cmi: mir.MirInstr = mir.instr(mir.MIR_CALL, callops, 1,
         ctx.tgt.model.gpr_width::u8, ctx.tgt.model.gpr_width::u8);
+    cmi.tail        = sibling;
+    cmi.keeps_upper = keeps_upper;
     val pc: err[fail.Fail] = context.push_instr(ctx, mb, cmi);
     if (sel pc.err) { ret pc; }
+    if (sibling) {
+        ctx.in_tail   = true;
+        ctx.tail_call = iid;
+        ret err[fail.Fail].ok{};
+    }
 
     val dst: mir.VRegId = context.instr_vreg(ctx, iid);
     ctx.cur_vec_lane = context.vec_lane_for_type(ctx, inst.ty);
@@ -968,12 +996,68 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     ret err[fail.Fail].ok{};
 }
 
+# whether a call the middle end flagged in tail position becomes a jump: the
+# callee then returns straight to the caller's caller, which the convention
+# admits when the callee returns the caller's result where the caller would,
+# and its arguments need nothing of the caller's frame. every argument rides a
+# register or, as a scalar, the caller's own incoming argument area, which
+# must hold the callee's; a copy the caller makes for the callee (a
+# by-reference aggregate or vector) would die with the frame, and an
+# aggregate the caller received on the stack could be overwritten under it
+# (#3417)
+fun sibling_call(ctx: *context.LowerCtx, inst: *instruction.Instruction, ret_type: type.IrTypeId,
+    layout: *abi.SigLayout) res[bool, fail.Fail] {
+    if (ctx.f.naked || ctx.f.oblivious) { ret res[bool, fail.Fail].ok{false}; }
+    val callee: value.Value = inst.operands[0];
+    if (callee.kind != value.VAL_FN) { ret res[bool, fail.Fail].ok{false}; }
+    if (ctx.tgt.of != nil && ctx.tgt.of.epilogue_by_code && callee.data.fn_ix < ctx.m.function_len
+        && ctx.m.functions[callee.data.fn_ix].name == ctx.fn.name) {
+        ret res[bool, fail.Fail].ok{false};
+    }
+    val own_ret: type.IrTypeId = context.fn_return_type(ctx);
+    if (own_ret != ret_type) { ret res[bool, fail.Fail].ok{false}; }
+
+    var own: abi.SigLayout;
+    val cls: err[fail.Fail] = classify_signature(ctx, ctx.fn.sig, own_ret, ?own);
+    if (sel cls.err) { ret res[bool, fail.Fail].err{cls.err}; }
+    fin { sig_layout_free(ctx, ?own); }
+
+    if (own.ret_slot.class != layout.ret_slot.class)                               { ret res[bool, fail.Fail].ok{false}; }
+    if (layout.ret_slot.class == abi.CLASS_SRET && mir.vreg_is_nil(ctx.sret_vreg)) { ret res[bool, fail.Fail].ok{false}; }
+    if (layout.stack_off > own.stack_off)                                          { ret res[bool, fail.Fail].ok{false}; }
+    val stacked: bool = layout.stack_off > ctx.tgt.abi.shadow_space::i64;
+
+    var i: u32 = 0;
+    for (i < layout.param_count) {
+        val slot:    *abi.ParamSlot = ?layout.params[i];
+        val carried: bool           = slot.class == abi.CLASS_GP || slot.class == abi.CLASS_FP || slot.class == abi.CLASS_STACK;
+        if (!carried || slot_has_stack_piece(slot)) { ret res[bool, fail.Fail].ok{false}; }
+        if (slot.class == abi.CLASS_STACK) {
+            val ty: type.IrTypeId = inst.operands[i + 1].ty;
+            if (context.value_is_aggregate(ctx, ty) || context.value_is_vector(ctx, ty)) { ret res[bool, fail.Fail].ok{false}; }
+        }
+        i = i + 1;
+    }
+    if (stacked) {
+        i = 0;
+        for (i < own.param_count && i < ctx.fn.param_count) {
+            if (own.params[i].class == abi.CLASS_STACK && context.value_is_aggregate(ctx, ctx.fn.params[i].ty)) {
+                ret res[bool, fail.Fail].ok{false};
+            }
+            i = i + 1;
+        }
+    }
+    ret res[bool, fail.Fail].ok{true};
+}
+
 fun emit_call_reg(ctx: *context.LowerCtx, preparation: *mir.MirBlock, registers: *mir.MirBlock,
     dst: mir.MirOperand, src: mir.MirOperand, width: u8) err[fail.Fail] {
     var value: mir.MirOperand = src;
     if (registers != preparation && src.kind == mir.MIR_OP_MEM) {
-        val class: u32                        = isa.regid_class(mir.preg_regid(dst.preg))::u32;
-        val rv:    res[mir.VRegId, fail.Fail] = context.new_vreg_vec(ctx, class, class != mir.REG_CLASS_GP && width > 8);
+        val class: u32 = isa.regid_class(mir.preg_regid(dst.preg))::u32;
+        var vb:    u8  = 0;
+        if (class != mir.REG_CLASS_GP && width > 8) { vb = width; }
+        val rv: res[mir.VRegId, fail.Fail] = context.new_vreg_vec(ctx, class, vb);
         if (sel rv.err) { ret err[fail.Fail].err{rv.err}; }
         val v: mir.VRegId = rv.ok;
         ctx.f.vregs[v.n].secret = ctx.cur_writes_secret;
@@ -1291,6 +1375,18 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, registers: *mir.Mir
         if (sel sr.err) { ret sr; }
         ret pass_address(ctx, mb, registers, slot, stack_off, addr);
     }
+    # a vector held whole that the convention passes as a pointer to a copy (a
+    # System V vector of a size no C vector type has, once a wider register
+    # holds it, #4128): the copy is a temporary of the vector's own layout
+    if ((slot.class == abi.CLASS_BYREF || slot.class == abi.CLASS_STACK_BYREF) && context.value_is_vector(ctx, ty)) {
+        var copy: abi.ParamSlot = slot;
+        copy.indirect_size  = size;
+        copy.indirect_align = type.byte_align_for_machine(ctx.types, ty, ctx.layout);
+        var addr: mir.VRegId     = mir.MIR_VREG_NIL;
+        val sr:   err[fail.Fail] = spill_vector_to_temp(ctx, mb, copy, argop, ty, ?addr);
+        if (sel sr.err) { ret sr; }
+        ret pass_address(ctx, mb, registers, slot, stack_off, addr);
+    }
     if (slot.class == abi.CLASS_STACK_BYREF) {
         var base: mir.VRegId     = mir.MIR_VREG_NIL;
         val ar:   err[fail.Fail] = context.addr_to_vreg(ctx, mb, argop, ?base);
@@ -1497,7 +1593,7 @@ fun emit_fp_reg_to_int(ctx: *context.LowerCtx, mb: *mir.MirBlock, dst: mir.VRegI
 fun fp_move_width(ctx: *context.LowerCtx, ty: type.IrTypeId) res[u8, fail.Fail] {
     val size: u64 = type.byte_size_for_machine(ctx.types, ty, ctx.layout)::u64;
     if (context.value_is_vector(ctx, ty)) {
-        val vw: u64 = (ctx.tgt.model.vector_bits / 8)::u64;
+        val vw: u64 = context.op_width_of(ctx, ty)::u64;
         if (vw == 0 || size > vw) {
             ret res[u8, fail.Fail].err{fail.message("mir.abi.fp_move_width: vector wider than the target's vector register; an over-width vector's placement is a multi-piece split the convention classifier must decide")};
         }
@@ -2079,7 +2175,7 @@ fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, copies: *mir.MirB
         if (int_by_reference(ctx, ty)) {
             ret capture_scalar_byref(ctx, mb, pv, ty, mir.op_mem_preg(fp, arg_base + stack_off));
         }
-        ret move_address(ctx, mb, mir.op_vreg(pv), mir.op_mem_preg(fp, arg_base + stack_off));
+        ret capture_vector_byref(ctx, mb, pv, ty, mir.op_mem_preg(fp, arg_base + stack_off));
     }
     if (slot.class == abi.CLASS_STACK) {
         val fp: mir.PRegId = mir.preg_id(ctx.tgt.model.frame_ptr_reg);
@@ -2096,7 +2192,7 @@ fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, copies: *mir.MirB
     }
     if (slot.class == abi.CLASS_BYREF) {
         if (int_by_reference(ctx, ty)) { ret capture_scalar_byref(ctx, mb, pv, ty, mir.op_preg(slot.reg)); }
-        ret move_address(ctx, mb, mir.op_vreg(pv), mir.op_preg(slot.reg));
+        ret capture_vector_byref(ctx, mb, pv, ty, mir.op_preg(slot.reg));
     }
 
     if (is_aggr) {
@@ -2287,6 +2383,12 @@ fun store_result(ctx: *context.LowerCtx, mb: *mir.MirBlock, rv: value.Value, rvo
 }
 
 pub fun lower_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.Instruction) err[fail.Fail] {
+    # the callee returns for the caller, so the return is never reached
+    if (ctx.in_tail) {
+        val jumped: bool = inst.operand_count == 0 || context.names_tail_call(ctx, inst.operands[0]);
+        ctx.in_tail = false;
+        if (jumped) { ret emit_bare_ret(ctx, mb); }
+    }
     if (inst.operand_count == 0) {
         ret emit_bare_ret(ctx, mb);
     }
@@ -2377,12 +2479,23 @@ pub fun lower_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.
         if (sel mr.err) { ret mr; }
     }
 
-    ret emit_bare_ret(ctx, mb);
+    ret emit_ret(ctx, mb, rides_upper(ctx, ?slot));
 }
 
 fun emit_bare_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock) err[fail.Fail] {
+    ret emit_ret(ctx, mb, false);
+}
+
+fun emit_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, keeps_upper: bool) err[fail.Fail] {
     var mi: mir.MirInstr = mir.instr(mir.MIR_RET, nil, 0, ctx.tgt.model.gpr_width::u8, ctx.tgt.model.gpr_width::u8);
+    mi.keeps_upper = keeps_upper;
     ret context.push_instr(ctx, mb, mi);
+}
+
+# a float register slot wider than the compute width, which carries its value
+# in the upper state the target clears at a call or a return (#4128)
+fun rides_upper(ctx: *context.LowerCtx, slot: *abi.ParamSlot) bool {
+    ret slot.class == abi.CLASS_FP && isa.vector_upper_clear(?ctx.tgt.model, slot.size::u32);
 }
 
 test classify_signature__win64_uses_one_platform_boundary {
@@ -2556,7 +2669,7 @@ test require_abi__variadic_facts_are_not_call_preconditions {
         nil, nil,
         0, 0, 0,
         -1, false,
-        false, false,
+        false, 8,
         0, 8,
         nil);
 
@@ -2960,9 +3073,9 @@ fun t_call_preparation(indirect: bool, sret: bool) i32 {
     f.vregs      = fr.ok;
     f.vreg_cap   = 8;
     f.vreg_count = 3;
-    f.vregs[0]   = mir.vreg(0, mir.REG_CLASS_GP, false, false);
-    f.vregs[1]   = mir.vreg(1, mir.REG_CLASS_GP, false, false);
-    f.vregs[2]   = mir.vreg(2, mir.REG_CLASS_GP, false, false);
+    f.vregs[0]   = mir.vreg(0, mir.REG_CLASS_GP, 0, false);
+    f.vregs[1]   = mir.vreg(1, mir.REG_CLASS_GP, 0, false);
+    f.vregs[2]   = mir.vreg(2, mir.REG_CLASS_GP, 0, false);
     var pv:  [2]mir.VRegId = [2]mir.VRegId{mir.vreg_id(0), mir.vreg_id(1)};
     var iv:  [1]mir.VRegId = [1]mir.VRegId{mir.vreg_id(2)};
     var ctx: context.LowerCtx;

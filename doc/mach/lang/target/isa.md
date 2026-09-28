@@ -501,10 +501,22 @@ wider lanes. a cell names the result lane width and the operand lane width;
 its scalar row is the per-lane sum, and only a packed cell is ever formed,
 as the fold of a count accumulated in narrow lanes (#4161)
 
+## val VEC_OP_SIGN_MASK
+
+```mach
+pub val VEC_OP_SIGN_MASK: VecOp = 38
+```
+
+a lane sign mask: each integer lane all ones when it is negative, else zero,
+in lanes of its own width. it is the high half a signed lane-halving
+extension interleaves its lanes with, so both halves of one extension share
+it; its scalar row is each lane shifted right by its width less one, and
+only a packed cell is ever formed (#4198)
+
 ## val VEC_OP_LAST
 
 ```mach
-pub val VEC_OP_LAST:        VecOp = VEC_OP_WIDEN_SUM_U
+pub val VEC_OP_LAST:      VecOp = VEC_OP_SIGN_MASK
 ```
 
 ## rec PackedForm
@@ -573,6 +585,21 @@ says the narrower code the target emits pays for a register's upper bytes
 while they hold a value, so the upper state is cleared once a value of this
 width has been moved out of its register (x86-64's vzeroupper after a ymm
 value, which the legacy-encoded 128-bit instructions otherwise stall on)
+
+## rec VectorWidthRow
+
+```mach
+pub rec VectorWidthRow;
+```
+
+a compute width an extension gives the packed rows over one kind of lane:
+with `ext` selected, the rows over float lanes (`is_float`) or integer ones
+of the byte widths `lanes` names (a sum of 1, 2, 4 and 8, as vec_mem_widths)
+run at `bits` rather than the baseline `vector_bits`. a vector of those
+lanes is then realized whole in a register that wide, and type legalization
+splits it only past it (#4128). the kinds widen apart on a target whose
+extensions do: x86-64's avx computes binary32 and binary64 at 256 bits and
+leaves integers at 128 until avx2
 
 ## val VECTOR_LANES_UNBOUNDED
 
@@ -739,6 +766,12 @@ pub fun is_widen_half_op(op: VecOp) bool;
 pub fun is_widen_sum_op(op: VecOp) bool;
 ```
 
+## fun is_sign_mask_op
+
+```mach
+pub fun is_sign_mask_op(op: VecOp) bool;
+```
+
 ## fun is_shift_op
 
 ```mach
@@ -777,6 +810,15 @@ pub fun vector_register_bytes(m: *MachineModel) u32;
 the widest vector one register carries under the selected extensions: the
 compute width, or a selected row's wider register
 
+## fun vector_register_bits
+
+```mach
+pub fun vector_register_bits(m: *MachineModel) u32;
+```
+
+the widest vector register the selected extensions give, in bits: the
+layout aligns a vector as wide as one to it (#4128)
+
 ## fun vector_upper_clear
 
 ```mach
@@ -785,6 +827,15 @@ pub fun vector_upper_clear(m: *MachineModel, bytes: u32) bool;
 
 a value `bytes` wide moved out of its register leaves upper state the
 target clears afterwards
+
+## fun vector_width
+
+```mach
+pub fun vector_width(m: *MachineModel, is_float: bool, lane_bits: u32) u32;
+```
+
+the width in bits the packed rows over lanes of this kind and width run at
+under the selected extensions: the widest selected row's, or `vector_bits`
 
 ## fun vector_domain_len
 
@@ -802,53 +853,73 @@ checked against it
 pub fun vector_domain_cell(index: u32, cell: *ScalarForm) bool;
 ```
 
-## fun scalar_conversion_rows
+## def ScalarFamily
 
 ```mach
-pub fun scalar_conversion_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
+pub def ScalarFamily: u32
 ```
 
-the scalar rows for every conversion cell the model's packed table does not
-claim, written from `at`; an ISA registers its packed conversions first and
-declares the rest through this, so each conversion cell is decided once
+the families of retained cells a model leaves to the scalar path wherever
+its packed table does not claim them: the conversions; the widening
+multiplies with their high halves, the lane interleave, the lane-halving
+extensions with their sign masks and the widening group sums; the shifts, lane by lane through the
+scalar shift, which saturates the same way; the lane ranges and joins; and
+the f16 lane arithmetic and comparisons, each lane's scalar f16 operation (#3802)
 
-## fun scalar_widening_rows
+## val SCALAR_CONVERSIONS
 
 ```mach
-pub fun scalar_widening_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
+pub val SCALAR_CONVERSIONS: ScalarFamily = 1
 ```
 
-the same for the widening multiplies, their high halves, the lane
-interleave, the lane-halving extensions and the widening group sums: a cell
-the packed table leaves keeps the per-lane path
-
-## fun scalar_shift_rows
+## val SCALAR_WIDENING
 
 ```mach
-pub fun scalar_shift_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
+pub val SCALAR_WIDENING:    ScalarFamily = 2
 ```
 
-the same for the shifts: a cell the packed table leaves is shifted lane by
-lane through the scalar shift, which saturates the same way
-
-## fun scalar_permute_rows
+## val SCALAR_SHIFTS
 
 ```mach
-pub fun scalar_permute_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
+pub val SCALAR_SHIFTS:      ScalarFamily = 4
 ```
 
-the same for the lane ranges and joins: a cell the packed table leaves keeps
-the lane path
-
-## fun scalar_half_lane_rows
+## val SCALAR_PERMUTES
 
 ```mach
-pub fun scalar_half_lane_rows(m: *MachineModel, rows: *ScalarForm, at: u32) u32;
+pub val SCALAR_PERMUTES:    ScalarFamily = 8
 ```
 
-the same for the arithmetic and comparisons of f16 lanes: a cell the packed
-table leaves is each lane's scalar f16 operation, the half expansion or the
-target's own half row (#3802)
+## val SCALAR_HALF_LANES
+
+```mach
+pub val SCALAR_HALF_LANES:  ScalarFamily = 16
+```
+
+## fun declare_scalar_rows
+
+```mach
+pub fun declare_scalar_rows(reg: *IsaRegistry, m: *MachineModel, explicit: *ScalarForm, explicit_len: u32, families: ScalarFamily) err[fail.Fail];
+```
+
+declare the model's scalar table: `explicit`, then every cell of `families`
+its packed table leaves, family by family, in storage from the registry's
+allocator sized to exactly those rows. the caller releases it with
+release_scalar_rows once the model is registered, which copies it
+
+reg: the registry whose allocator backs the rows
+m: the model; its packed table is final, its scalar table is set
+explicit: the rows the model names itself
+explicit_len: how many
+families: the families whose unclaimed cells are scalar rows
+
+## fun release_scalar_rows
+
+```mach
+pub fun release_scalar_rows(reg: *IsaRegistry, m: *MachineModel);
+```
+
+free the table declare_scalar_rows gave the model
 
 ## fun ct_mul_rows_admit
 
@@ -976,13 +1047,23 @@ domain is every extension bit the target model knows
 pub fun vector_domain_complete(m: *MachineModel) bool;
 ```
 
+## fun from_is_float
+
+```mach
+pub fun from_is_float(op: VecOp, is_float: bool) bool;
+```
+
+the lane kind of a cell's operand: a conversion between the kinds reads
+the other kind, and every other cell its result's
+
 ## fun packed_width
 
 ```mach
 pub fun packed_width(m: *MachineModel, op: VecOp, is_float: bool, lane_bits: u32, from_bits: u32) u32;
 ```
 
-a conversion's register holds its wider side, so that side sets the extent
+a conversion's register holds its wider side, so that side sets the extent,
+and each side's lanes stay within its own kind's width
 
 ## fun packing_extension
 
@@ -1023,8 +1104,19 @@ the one declared outcome for a cell: packed, the scalar expansion, or nothing
 ## fun packed_lane_cap
 
 ```mach
-pub fun packed_lane_cap(m: *MachineModel, lane_bits: u32) u32;
+pub fun packed_lane_cap(m: *MachineModel, is_float: bool, lane_bits: u32) u32;
 ```
+
+## fun vector_op_bytes
+
+```mach
+pub fun vector_op_bytes(m: *MachineModel, is_float: bool, lane_bits: u32, bytes: u32) u32;
+```
+
+the bytes of the register that realizes a vector of `bytes` over lanes of
+this kind whole: the narrowest register width the kind computes at that
+holds it, `vector_op_bytes` at the least. a vector wider than every such
+register is not realized in one and keeps the narrowest (#4128)
 
 ## fun moves_unaligned_gp
 
@@ -1057,6 +1149,10 @@ pub fun mem_disp_folds(m: *MachineModel, off: i64) bool;
 ```mach
 pub fun moves_vector_memory(m: *MachineModel, bytes: u32) bool;
 ```
+
+a vector of `bytes` moves between memory and its register in one access:
+a width the target declares, or a register width its extensions give past
+the compute width (#4128)
 
 ## fun reads_slot_operand
 
@@ -1094,7 +1190,7 @@ of this many bytes
 ## fun fits_vector_register
 
 ```mach
-pub fun fits_vector_register(m: *MachineModel, lane_bits: u32, lanes: u32) bool;
+pub fun fits_vector_register(m: *MachineModel, is_float: bool, lane_bits: u32, lanes: u32) bool;
 ```
 
 ## def AsmClobbersFn

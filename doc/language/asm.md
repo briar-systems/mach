@@ -123,7 +123,10 @@ asm x86_64 {
 
 `byte`, `word`, `dword` and `qword` are accepted before a memory operand and
 nowhere else — on a register they would be redundant or contradictory, so
-`mov qword rax, rcx` is refused rather than ignored.
+`mov qword rax, rcx` is refused rather than ignored. GNU as's spelling with
+`ptr` (`mov dword ptr [rcx], 1`) means the same, and it is how the x86-64
+`--emit-asm` listing writes every sized memory operand, so a listed
+instruction pastes back into a block unchanged.
 
 **A prefix that contradicts the instruction is a build error, not a dropped
 token.** What counts as a contradiction is per mnemonic:
@@ -161,8 +164,9 @@ asm x86_64 {
 
 The scans and counts take a 16-, 32- or 64-bit register destination and a
 register or memory source of the same width. `bsf` and `bsr` set ZF on a zero
-source and leave the destination undefined, which the effect model reports as
-writing the flags; the three counts need their extension, listed under
+source and leave the destination and CF undefined, which the effect model reports
+as writing the flags. `popcnt`, `lzcnt` and `tzcnt` define ZF and CF, and need
+their extension, listed under
 [Extension instructions](#extension-instructions). `bswap` takes one 32- or
 64-bit register, and has no 16-bit form. `imul` in two or three operands is the
 signed multiply with the low half kept; the one-operand widening form is not
@@ -385,10 +389,9 @@ byte, as GNU as does. Opmask registers, broadcast, `xmm16` to `xmm31`, and the `
 and `zmm` forms are not operands inline asm spells.
 
 `sha256rnds2` also reads `xmm0`, the round keys, without naming it, and the
-constant-time check follows a secret through it. `ptest` sets ZF and CF; the
-check treats it as writing the flags rather than defining them, so a branch after
-a `ptest` of public data still counts a secret an earlier instruction left in the
-flags.
+constant-time check follows a secret through it. `ptest` defines ZF and CF, so a
+branch after a `ptest` of public data no longer counts a secret an earlier
+instruction left in the flags.
 
 The aes rounds and the carry-less multiplies are data-independent: Intel lists
 `aesenc`, `aesenclast`, `aesdec`, `aesdeclast`, `aesimc`, `aeskeygenassist` and

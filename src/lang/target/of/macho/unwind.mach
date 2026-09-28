@@ -1,7 +1,8 @@
 # mach-o unwind: `__TEXT,__unwind_info` holds one compact encoding per
-# function, and a frame compact unwind cannot say points into `__TEXT,__eh_frame`
-# instead. both are sized from the frame records' steps before layout and
-# filled once every function has its address
+# function, with the personalities and lsdas foreign functions name, and a
+# frame compact unwind cannot say points into `__TEXT,__eh_frame` instead. both
+# are sized from the frame records' steps before layout and filled once every
+# function has its address
 
 use dkind: mach.lang.diagnostic.kind;
 use mach.lang.fail;
@@ -9,7 +10,9 @@ use mach.lang.target.isa;
 use mach.lang.target.of;
 use mach.lang.target.of.bin;
 use mach.lang.target.of.cfi;
+use mach.lang.target.of.macho.dyld;
 use A: std.allocator;
+use std.collections.sort;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -17,6 +20,7 @@ use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use std.types.string.str;
 
 val X86_64_MODE_RBP_FRAME:  u32   = 0x01000000;
 val X86_64_MODE_STACK_IMMD: u32   = 0x02000000;
@@ -30,6 +34,13 @@ val HEADER_SIZE:            usize = 28;
 val INDEX_ENTRY_SIZE:       usize = 12;
 val PAGE_HEADER_SIZE:       usize = 8;
 val PAGE_ENTRY_SIZE:        usize = 8;
+val PERSONALITY_SIZE:       usize = 4;
+val LSDA_ENTRY_SIZE:        usize = 8;
+# an encoding names its personality by a two-bit index into the table, one based
+val PERSONALITY_CAP:   u32 = 3;
+val PERSONALITY_SHIFT: u32 = 28;
+val PERSONALITY_MASK:  u32 = 0x30000000;
+val HAS_LSDA:          u32 = 0x40000000;
 # entries per second-level page, as ld64 fills a four-kilobyte page
 val PAGE_CAP: u32 = 511;
 
@@ -149,19 +160,24 @@ fun page_count(entries: u32) u32 {
     ret (entries + PAGE_CAP - 1) / PAGE_CAP;
 }
 
-fun unwind_info_size(entries: u32) usize {
+fun unwind_info_size(entries: u32, personalities: u32, lsdas: u32) usize {
     val pages: u32 = page_count(entries);
-    ret HEADER_SIZE + INDEX_ENTRY_SIZE * (pages + 1)::usize
-        + PAGE_HEADER_SIZE * pages::usize + PAGE_ENTRY_SIZE * entries::usize;
+    ret HEADER_SIZE + PERSONALITY_SIZE * personalities::usize + INDEX_ENTRY_SIZE * (pages + 1)::usize
+        + LSDA_ENTRY_SIZE * lsdas::usize + PAGE_HEADER_SIZE * pages::usize + PAGE_ENTRY_SIZE * entries::usize;
 }
 
-# `__unwind_info` for a function and a gap after each, and `__eh_frame` for
-# the frames compact unwind cannot say
-pub fun macho_unwind_shape(arch_id: u32, frames: *of.FrameUnwind, count: u32) res[of.UnwindShape, fail.Fail] {
+# `__unwind_info` for a function and a gap after each, with a full personality
+# table and an lsda for every foreign entry when there are any, and
+# `__eh_frame` for the frames compact unwind cannot say, after the frame
+# descriptions the foreign objects carry in. a foreign function has an entry
+# from its object's compact unwind or its frame description, so every one is
+# counted twice at most
+pub fun macho_unwind_shape(arch_id: u32, frames: *of.FrameUnwind, count: u32, foreign: *of.ForeignUnwind) res[of.UnwindShape, fail.Fail] {
     var shape: of.UnwindShape;
     val fo:    opt[cfi.FrameIsa] = cfi.frame_isa(arch_id);
     if (sel fo.none) { ret res[of.UnwindShape, fail.Fail].ok{shape}; }
-    if (count == 0)  { ret res[of.UnwindShape, fail.Fail].ok{shape}; }
+    val functions: u32 = count + foreign.native_count + foreign.fde_count;
+    if (functions == 0 && foreign.frames_len == 0) { ret res[of.UnwindShape, fail.Fail].ok{shape}; }
     var fi: cfi.FrameIsa = fo.some;
 
     var eh: usize = 0;
@@ -176,9 +192,12 @@ pub fun macho_unwind_shape(arch_id: u32, frames: *of.FrameUnwind, count: u32) re
         }
         i = i + 1;
     }
-    shape.index = of.TableShape{name: "__unwind_info", size: unwind_info_size(2 * count), align: 4};
-    if (eh > 0) {
-        shape.frames = of.TableShape{name: "__eh_frame", size: cfi.cie_size(?fi) + eh + 4, align: 8};
+    var personalities: u32 = 0;
+    if (foreign.native_count > 0) { personalities = PERSONALITY_CAP; }
+    shape.index = of.TableShape{name: "__unwind_info", size: unwind_info_size(2 * functions, personalities, foreign.native_count), align: 4};
+    if (eh > 0) { eh = eh + cfi.cie_size(?fi); }
+    if (eh > 0 || foreign.frames_len > 0) {
+        shape.frames = of.TableShape{name: "__eh_frame", size: foreign.frames_len + eh + 4, align: 8};
     }
     ret res[of.UnwindShape, fail.Fail].ok{shape};
 }
@@ -186,14 +205,123 @@ pub fun macho_unwind_shape(arch_id: u32, frames: *of.FrameUnwind, count: u32) re
 rec Entry {
     func_off: u32;
     encoding: u32;
+    lsda_off: u32;
 }
 
-# fills the unwind tables the linker reserved: an encoding per function with a
-# frame record in address order, a zero one across each gap no such function
-# covers, and the dwarf descriptions the encodings that need them point to.
-# every function offset counts from `mh_addr`, where the mach header is mapped
+# a function the index covers, before the gaps between them are filled, and
+# its lsda (zero for none)
+rec Span {
+    addr:     u64;
+    size:     u32;
+    encoding: u32;
+    lsda:     u64;
+}
+
+# the slots the image's personalities are read through, in the order the
+# encodings index them
+rec Personalities {
+    slots: [PERSONALITY_CAP]u64;
+    count: u32;
+}
+
+fun span_cmp(a: *Span, b: *Span) i64 {
+    if (a.addr < b.addr) { ret -1; }
+    if (a.addr > b.addr) { ret 1; }
+    ret 0;
+}
+
+val MODE_MASK: u32 = 0x0F000000;
+
+fun dwarf_entry(fi: *cfi.FrameIsa, off: usize) res[u32, fail.Fail] {
+    if (off > DWARF_SECTION_OFFSET::usize) {
+        ret res[u32, fail.Fail].err{fail.user(dkind.LINK_SIZE_LIMIT, "macho: a frame description lies past what a compact encoding can point to")};
+    }
+    ret res[u32, fail.Fail].ok{dwarf_mode(fi) | off::u32};
+}
+
+fun foreign_fde(foreign: *cfi.EhFn, count: u32, addr: u64) opt[usize] {
+    var i: u32 = 0;
+    for (i < count) {
+        if (foreign[i].pc == addr) { ret opt[usize].some{foreign[i].fde_off}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# the slot an entry's personality is read through: one the link filled, or
+# the import GOT's slot the loader binds
+fun personality_slot(p: *of.UnwindPersonality, dyn: *of.DynamicInfo) res[u64, fail.Fail] {
+    if (p.import_index == of.PERSONALITY_NO_IMPORT) { ret res[u64, fail.Fail].ok{p.slot}; }
+    if (dyn == nil) {
+        ret res[u64, fail.Fail].err{fail.message("macho: an unwind entry's personality is an import of an image that binds none")};
+    }
+    val ordinal: u32 = dyld.macho_got_ordinal(dyn, p.import_index);
+    if (ordinal == 0xFFFFFFFF || (ordinal::usize + 1) * 8 > dyn.got.size) {
+        ret res[u64, fail.Fail].err{fail.message("macho: an unwind entry's personality has no import GOT slot")};
+    }
+    ret res[u64, fail.Fail].ok{dyn.got.vaddr + ordinal::u64 * 8};
+}
+
+# the encoding's one-based index of `slot`, which takes the next free place in
+# the table; none once the table is full
+fun personality_index(table: *Personalities, slot: u64) opt[u32] {
+    var i: u32 = 0;
+    for (i < table.count) {
+        if (table.slots[i::usize] == slot) { ret opt[u32].some{i + 1}; }
+        i = i + 1;
+    }
+    if (table.count == PERSONALITY_CAP) { ret opt[u32].none{}; }
+    table.slots[table.count::usize] = slot;
+    table.count                     = table.count + 1;
+    ret opt[u32].some{table.count};
+}
+
+# a foreign function's entry from its object's compact unwind, which keeps
+# the personality and lsda it names. a frame the encoding leaves to dwarf, or
+# one whose personality the full table has no place for, points at the
+# object's frame description instead, which carries both
+fun native_span(fi: *cfi.FrameIsa, f: *of.ExecFunction, addr: u64, foreign: *cfi.EhFn, foreign_count: u32,
+    table: *Personalities, dyn: *of.DynamicInfo) res[Span, fail.Fail] {
+    var span:  Span       = Span{addr: addr, size: f.size, encoding: f.encoding & ~(PERSONALITY_MASK | HAS_LSDA), lsda: 0};
+    val fde:   opt[usize] = foreign_fde(foreign, foreign_count, addr);
+    var dwarf: bool       = (f.encoding & MODE_MASK) == dwarf_mode(fi);
+    if (!dwarf && of.has_personality(?f.personality)) {
+        val slot: res[u64, fail.Fail] = personality_slot(?f.personality, dyn);
+        if (sel slot.err) { ret res[Span, fail.Fail].err{slot.err}; }
+        val index: opt[u32] = personality_index(table, slot.ok);
+        if (sel index.some) { span.encoding = span.encoding | (index.some << PERSONALITY_SHIFT); }
+        or (sel fde.some)   { dwarf = true; }
+        or {
+            ret res[Span, fail.Fail].err{fail.user(dkind.LINK_SIZE_LIMIT, "macho: compact unwind names at most three personalities, and a foreign function with a fourth has no frame description to fall back to")};
+        }
+    }
+    if (dwarf) {
+        if (sel fde.none) {
+            ret res[Span, fail.Fail].err{fail.user(dkind.OBJECT_MALFORMED, "macho: a foreign function's compact unwind entry leaves its frame to __eh_frame, and its object carries no description of it")};
+        }
+        val de: res[u32, fail.Fail] = dwarf_entry(fi, fde.some);
+        if (sel de.err) { ret res[Span, fail.Fail].err{de.err}; }
+        span.encoding = de.ok;
+        ret res[Span, fail.Fail].ok{span};
+    }
+    if (f.lsda != 0) {
+        span.encoding = span.encoding | HAS_LSDA;
+        span.lsda     = f.lsda;
+    }
+    ret res[Span, fail.Fail].ok{span};
+}
+
+# fills the unwind tables the linker reserved: an encoding per function in
+# address order, a zero one across each gap no function covers, and the dwarf
+# descriptions the encodings that need them point to. a mach function's entry
+# follows from its frame record, a foreign one's from its object's compact
+# unwind or, lacking one, from the frame description its object carried into
+# `__eh_frame` ahead of this table's own. a foreign function's personality is
+# read through a slot the link filled or through `dyn`'s import GOT, nil for
+# an image that binds nothing. every function offset counts from `mh_addr`,
+# where the mach header is mapped
 pub fun fill_unwind(alloc: *A.Allocator, arch_id: u32, segs: *of.LoadSegment, seg_count: u32,
-    funcs: *of.ExecFunction, func_count: u32, mh_addr: u64) err[fail.Fail] {
+    funcs: *of.ExecFunction, func_count: u32, mh_addr: u64, dyn: *of.DynamicInfo) err[fail.Fail] {
     var index:  cfi.UnwindRoom = cfi.unwind_room(segs, seg_count, of.SEC_FLAG_UNWIND_INDEX);
     var frames: cfi.UnwindRoom = cfi.unwind_room(segs, seg_count, of.SEC_FLAG_UNWIND_FRAMES);
     if (!index.present) {
@@ -204,6 +332,19 @@ pub fun fill_unwind(alloc: *A.Allocator, arch_id: u32, segs: *of.LoadSegment, se
     if (sel fo.none) { ret err[fail.Fail].err{fail.message("macho: unwind tables reserved for an architecture compact unwind cannot describe")}; }
     var fi: cfi.FrameIsa = fo.some;
 
+    var foreign:       *cfi.EhFn = nil;
+    var foreign_count: u32       = 0;
+    var base:          usize     = 0;
+    if (frames.present) {
+        val scanned: res[usize, fail.Fail] = cfi.eh_frame_scan(alloc, frames.bytes, frames.cap, frames.vaddr,
+            fi.ptr_size, ?foreign, ?foreign_count);
+        if (sel scanned.err) { ret err[fail.Fail].err{scanned.err}; }
+        base = scanned.ok;
+    }
+    fin {
+        if (foreign != nil) { A.deallocate[cfi.EhFn](alloc, foreign, foreign_count::usize); }
+    }
+
     var n:  u32                           = 0;
     val fr: res[*cfi.UnwindFn, fail.Fail] = cfi.unwind_functions(alloc, segs, seg_count, funcs, func_count, ?n);
     if (sel fr.err) { ret err[fail.Fail].err{fr.err}; }
@@ -211,132 +352,235 @@ pub fun fill_unwind(alloc: *A.Allocator, arch_id: u32, segs: *of.LoadSegment, se
     fin {
         if (fns != nil) { A.deallocate[cfi.UnwindFn](alloc, fns, n::usize); }
     }
-    if (n == 0) {
+    var natives: u32 = 0;
+    var i:       u32 = 0;
+    for (i < func_count) {
+        if (funcs[i].native && funcs[i].seg_index < seg_count) { natives = natives + 1; }
+        i = i + 1;
+    }
+
+    val cap: u32 = n + natives + foreign_count;
+    if (cap == 0) {
         cfi.unwind_room_trim(segs, ?frames, 0);
-        val bare: res[usize, fail.Fail] = write_unwind_info(index.bytes, index.cap, nil, 0, 0);
+        var none: Personalities;
+        none.count = 0;
+        val bare: res[usize, fail.Fail] = write_unwind_info(index.bytes, index.cap, nil, 0, 0, ?none, mh_addr);
         if (sel bare.err) { ret err[fail.Fail].err{bare.err}; }
         cfi.unwind_room_trim(segs, ?index, bare.ok);
         ret err[fail.Fail].ok{};
     }
+    val sr: res[*Span, A.Error] = A.allocate[Span](alloc, cap::usize);
+    if (sel sr.err) { ret err[fail.Fail].err{fail.refused(sr.err)}; }
+    val spans: *Span = sr.ok;
+    fin { A.deallocate[Span](alloc, spans, cap::usize); }
+    var sc: u32 = 0;
 
-    val er: res[*u32, A.Error] = A.zallocate[u32](alloc, n::usize);
-    if (sel er.err) { ret err[fail.Fail].err{fail.refused(er.err)}; }
-    val encodings: *u32 = er.ok;
-    fin { A.deallocate[u32](alloc, encodings, n::usize); }
-    val dr: res[*cfi.UnwindFn, A.Error] = A.allocate[cfi.UnwindFn](alloc, n::usize);
-    if (sel dr.err) { ret err[fail.Fail].err{fail.refused(dr.err)}; }
-    val dwarf: *cfi.UnwindFn = dr.ok;
-    fin { A.deallocate[cfi.UnwindFn](alloc, dwarf, n::usize); }
-    val dor: res[*u32, A.Error] = A.zallocate[u32](alloc, n::usize);
-    if (sel dor.err) { ret err[fail.Fail].err{fail.refused(dor.err)}; }
-    val dwarf_of: *u32 = dor.ok;
-    fin { A.deallocate[u32](alloc, dwarf_of, n::usize); }
-
-    var m: u32 = 0;
-    var i: u32 = 0;
-    for (i < n) {
-        val c: res[opt[u32], fail.Fail] = compact(?fi, fns[i].steps, fns[i].step_count);
-        if (sel c.err)     { ret err[fail.Fail].err{c.err}; }
-        if (sel c.ok.some) { encodings[i] = c.ok.some; }
-        or {
-            dwarf[m]    = fns[i];
-            dwarf_of[m] = i;
-            m           = m + 1;
+    var dwarf:    *cfi.UnwindFn = nil;
+    var dwarf_of: *u32          = nil;
+    if (n > 0) {
+        val dr: res[*cfi.UnwindFn, A.Error] = A.allocate[cfi.UnwindFn](alloc, n::usize);
+        if (sel dr.err) { ret err[fail.Fail].err{fail.refused(dr.err)}; }
+        dwarf = dr.ok;
+        val dor: res[*u32, A.Error] = A.zallocate[u32](alloc, n::usize);
+        if (sel dor.err) {
+            A.deallocate[cfi.UnwindFn](alloc, dwarf, n::usize);
+            ret err[fail.Fail].err{fail.refused(dor.err)};
         }
-        i = i + 1;
+        dwarf_of = dor.ok;
+    }
+    fin {
+        if (dwarf != nil)    { A.deallocate[cfi.UnwindFn](alloc, dwarf, n::usize); }
+        if (dwarf_of != nil) { A.deallocate[u32](alloc, dwarf_of, n::usize); }
     }
 
-    var eh_len: usize = 0;
+    var m: u32 = 0;
+    i = 0;
+    for (i < n) {
+        val c: res[opt[u32], fail.Fail] = compact(?fi, fns[i].steps, fns[i].step_count);
+        if (sel c.err) { ret err[fail.Fail].err{c.err}; }
+        spans[sc] = Span{addr: fns[i].addr, size: fns[i].size, encoding: 0, lsda: 0};
+        if (sel c.ok.some) { spans[sc].encoding = c.ok.some; }
+        or {
+            dwarf[m]    = fns[i];
+            dwarf_of[m] = sc;
+            m           = m + 1;
+        }
+        sc = sc + 1;
+        i  = i + 1;
+    }
+
+    var eh_len: usize = base;
     if (m > 0) {
         if (!frames.present) { ret err[fail.Fail].err{fail.message("macho: a frame compact unwind cannot say has no reserved __eh_frame")}; }
         val ofr: res[*u32, A.Error] = A.zallocate[u32](alloc, m::usize);
         if (sel ofr.err) { ret err[fail.Fail].err{fail.refused(ofr.err)}; }
         val offs: *u32 = ofr.ok;
         fin { A.deallocate[u32](alloc, offs, m::usize); }
-        val eh: res[usize, fail.Fail] = cfi.write_eh_frame(?fi, frames.bytes, frames.cap, frames.vaddr, dwarf, m, offs);
+        val eh: res[usize, fail.Fail] = cfi.write_eh_frame(?fi, (frames.bytes::usize + base)::*u8, frames.cap - base,
+            frames.vaddr + base::u64, dwarf, m, offs);
         if (sel eh.err) { ret err[fail.Fail].err{eh.err}; }
-        eh_len = eh.ok;
+        eh_len = base + eh.ok;
         var k: u32 = 0;
         for (k < m) {
-            if (offs[k] > DWARF_SECTION_OFFSET) {
-                ret err[fail.Fail].err{fail.user(dkind.LINK_SIZE_LIMIT, "macho: a frame description lies past what a compact encoding can point to")};
-            }
-            encodings[dwarf_of[k]] = dwarf_mode(?fi) | offs[k];
-            k                      = k + 1;
+            val de: res[u32, fail.Fail] = dwarf_entry(?fi, base + offs[k]::usize);
+            if (sel de.err) { ret err[fail.Fail].err{de.err}; }
+            spans[dwarf_of[k]].encoding = de.ok;
+            k                           = k + 1;
         }
+    }
+    or (base > 0) {
+        if (frames.cap - base < 4) { ret err[fail.Fail].err{fail.message("macho: the frame descriptions outgrew the room the linker reserved for them")}; }
+        bin.write_u32_le(frames.bytes, base, 0);
+        eh_len = base + 4;
     }
     cfi.unwind_room_trim(segs, ?frames, eh_len);
 
-    val entr: res[*Entry, A.Error] = A.allocate[Entry](alloc, (2 * n)::usize);
+    var table: Personalities;
+    table.count = 0;
+    i           = 0;
+    for (i < func_count) {
+        val f: *of.ExecFunction = ?funcs[i];
+        if (f.native && f.seg_index < seg_count) {
+            val addr: u64                  = segs[f.seg_index].vaddr + f.seg_offset::u64;
+            val span: res[Span, fail.Fail] = native_span(?fi, f, addr, foreign, foreign_count, ?table, dyn);
+            if (sel span.err) { ret err[fail.Fail].err{span.err}; }
+            spans[sc] = span.ok;
+            sc        = sc + 1;
+        }
+        i = i + 1;
+    }
+    # a foreign function its object describes only in dwarf
+    i = 0;
+    for (i < foreign_count) {
+        var covered: bool = false;
+        var k:       u32  = 0;
+        for (k < sc && !covered) {
+            covered = spans[k].addr == foreign[i].pc;
+            k       = k + 1;
+        }
+        if (!covered && foreign[i].range > 0) {
+            val de: res[u32, fail.Fail] = dwarf_entry(?fi, foreign[i].fde_off);
+            if (sel de.err)                    { ret err[fail.Fail].err{de.err}; }
+            if (foreign[i].range > 0xFFFFFFFF) { ret err[fail.Fail].err{fail.user(dkind.LINK_SIZE_LIMIT, "macho: a function lies outside the image's 32-bit unwind range")}; }
+            spans[sc] = Span{addr: foreign[i].pc, size: foreign[i].range::u32, encoding: de.ok, lsda: 0};
+            sc        = sc + 1;
+        }
+        i = i + 1;
+    }
+    sort.sort_by[Span](spans, sc::usize, span_cmp);
+
+    val entr: res[*Entry, A.Error] = A.allocate[Entry](alloc, (2 * sc)::usize);
     if (sel entr.err) { ret err[fail.Fail].err{fail.refused(entr.err)}; }
     val entries: *Entry = entr.ok;
-    fin { A.deallocate[Entry](alloc, entries, (2 * n)::usize); }
+    fin { A.deallocate[Entry](alloc, entries, (2 * sc)::usize); }
     var e: u32 = 0;
     i = 0;
-    for (i < n) {
-        if (fns[i].addr < mh_addr || fns[i].addr + fns[i].size::u64 - mh_addr > 0xFFFFFFFF) {
+    for (i < sc) {
+        if (spans[i].addr < mh_addr || spans[i].addr + spans[i].size::u64 - mh_addr > 0xFFFFFFFF) {
             ret err[fail.Fail].err{fail.user(dkind.LINK_SIZE_LIMIT, "macho: a function lies outside the image's 32-bit unwind range")};
         }
-        entries[e] = Entry{func_off: (fns[i].addr - mh_addr)::u32, encoding: encodings[i]};
+        val lo: res[u32, fail.Fail] = image_offset(spans[i].lsda, mh_addr, "macho: an lsda lies outside the image's 32-bit unwind range");
+        if (sel lo.err) { ret err[fail.Fail].err{lo.err}; }
+        entries[e] = Entry{func_off: (spans[i].addr - mh_addr)::u32, encoding: spans[i].encoding, lsda_off: lo.ok};
         e          = e + 1;
-        val end: u64 = fns[i].addr + fns[i].size::u64;
-        if (i + 1 < n && fns[i + 1].addr > end) {
-            entries[e] = Entry{func_off: (end - mh_addr)::u32, encoding: 0};
+        val end: u64 = spans[i].addr + spans[i].size::u64;
+        if (i + 1 < sc && spans[i + 1].addr > end) {
+            entries[e] = Entry{func_off: (end - mh_addr)::u32, encoding: 0, lsda_off: 0};
             e          = e + 1;
         }
         i = i + 1;
     }
-    val last_end: u64                   = fns[n - 1].addr + fns[n - 1].size::u64 - mh_addr;
-    val written:  res[usize, fail.Fail] = write_unwind_info(index.bytes, index.cap, entries, e, last_end::u32);
+    var last_end: u64 = 0;
+    i = 0;
+    for (i < sc) {
+        val end: u64 = spans[i].addr + spans[i].size::u64 - mh_addr;
+        if (end > last_end) { last_end = end; }
+        i = i + 1;
+    }
+    val written: res[usize, fail.Fail] = write_unwind_info(index.bytes, index.cap, entries, e, last_end::u32, ?table, mh_addr);
     if (sel written.err) { ret err[fail.Fail].err{written.err}; }
     cfi.unwind_room_trim(segs, ?index, written.ok);
     ret err[fail.Fail].ok{};
 }
 
-# version 1 with no common encodings, personalities or lsdas: the first-level
-# index names each regular second-level page and ends at `end`
-fun write_unwind_info(buf: *u8, cap: usize, entries: *Entry, count: u32, end: u32) res[usize, fail.Fail] {
-    val size: usize = unwind_info_size(count);
+# an address's offset from the mach header, zero for none
+fun image_offset(addr: u64, mh_addr: u64, what: str) res[u32, fail.Fail] {
+    if (addr == 0) { ret res[u32, fail.Fail].ok{0}; }
+    if (addr < mh_addr || addr - mh_addr > 0xFFFFFFFF) {
+        ret res[u32, fail.Fail].err{fail.user(dkind.LINK_SIZE_LIMIT, what)};
+    }
+    ret res[u32, fail.Fail].ok{(addr - mh_addr)::u32};
+}
+
+# version 1 with no common encodings: the personality table, then the
+# first-level index naming each regular second-level page and ending at `end`,
+# then the lsda of every entry that has one in function order, each index
+# entry pointing at the first lsda of its page
+fun write_unwind_info(buf: *u8, cap: usize, entries: *Entry, count: u32, end: u32,
+    table: *Personalities, mh_addr: u64) res[usize, fail.Fail] {
+    var lsdas: u32 = 0;
+    var k:     u32 = 0;
+    for (k < count) {
+        if ((entries[k].encoding & HAS_LSDA) != 0) { lsdas = lsdas + 1; }
+        k = k + 1;
+    }
+    val size: usize = unwind_info_size(count, table.count, lsdas);
     if (size > cap) {
         ret res[usize, fail.Fail].err{fail.message("macho: the unwind index outgrew the room the linker reserved for it")};
     }
-    val pages:    u32   = page_count(count);
-    val lsda_off: usize = HEADER_SIZE + INDEX_ENTRY_SIZE * (pages + 1)::usize;
+    val pages:     u32   = page_count(count);
+    val index_off: usize = HEADER_SIZE + PERSONALITY_SIZE * table.count::usize;
+    val lsda_off:  usize = index_off + INDEX_ENTRY_SIZE * (pages + 1)::usize;
     bin.write_u32_le(buf, 0, 1);
     bin.write_u32_le(buf, 4, HEADER_SIZE::u32);
     bin.write_u32_le(buf, 8, 0);
     bin.write_u32_le(buf, 12, HEADER_SIZE::u32);
-    bin.write_u32_le(buf, 16, 0);
-    bin.write_u32_le(buf, 20, HEADER_SIZE::u32);
+    bin.write_u32_le(buf, 16, table.count);
+    bin.write_u32_le(buf, 20, index_off::u32);
     bin.write_u32_le(buf, 24, pages + 1);
 
-    var page_off: usize = lsda_off;
-    var p:        u32   = 0;
+    var p: u32 = 0;
+    for (p < table.count) {
+        val po: res[u32, fail.Fail] = image_offset(table.slots[p::usize], mh_addr, "macho: a personality slot lies outside the image's 32-bit unwind range");
+        if (sel po.err) { ret res[usize, fail.Fail].err{po.err}; }
+        bin.write_u32_le(buf, HEADER_SIZE + PERSONALITY_SIZE * p::usize, po.ok);
+        p = p + 1;
+    }
+
+    var lsda_at:  usize = lsda_off;
+    var page_off: usize = lsda_off + LSDA_ENTRY_SIZE * lsdas::usize;
+    p = 0;
     for (p < pages) {
         val first: u32 = p * PAGE_CAP;
         var take:  u32 = count - first;
         if (take > PAGE_CAP) { take = PAGE_CAP; }
-        val at: usize = HEADER_SIZE + INDEX_ENTRY_SIZE * p::usize;
+        val at: usize = index_off + INDEX_ENTRY_SIZE * p::usize;
         bin.write_u32_le(buf, at, entries[first].func_off);
         bin.write_u32_le(buf, at + 4, page_off::u32);
-        bin.write_u32_le(buf, at + 8, lsda_off::u32);
+        bin.write_u32_le(buf, at + 8, lsda_at::u32);
 
         bin.write_u32_le(buf, page_off, SECOND_LEVEL_REGULAR);
         bin.write_u16_le(buf, page_off + 4, PAGE_HEADER_SIZE::u16);
         bin.write_u16_le(buf, page_off + 6, take::u16);
-        var k: u32 = 0;
+        k = 0;
         for (k < take) {
-            val eo: usize = page_off + PAGE_HEADER_SIZE + PAGE_ENTRY_SIZE * k::usize;
-            bin.write_u32_le(buf, eo, entries[first + k].func_off);
-            bin.write_u32_le(buf, eo + 4, entries[first + k].encoding);
+            val en: *Entry = ?entries[first + k];
+            val eo: usize  = page_off + PAGE_HEADER_SIZE + PAGE_ENTRY_SIZE * k::usize;
+            bin.write_u32_le(buf, eo, en.func_off);
+            bin.write_u32_le(buf, eo + 4, en.encoding);
+            if ((en.encoding & HAS_LSDA) != 0) {
+                bin.write_u32_le(buf, lsda_at, en.func_off);
+                bin.write_u32_le(buf, lsda_at + 4, en.lsda_off);
+                lsda_at = lsda_at + LSDA_ENTRY_SIZE;
+            }
             k = k + 1;
         }
         page_off = page_off + PAGE_HEADER_SIZE + PAGE_ENTRY_SIZE * take::usize;
         p        = p + 1;
     }
-    val sentinel: usize = HEADER_SIZE + INDEX_ENTRY_SIZE * pages::usize;
+    val sentinel: usize = index_off + INDEX_ENTRY_SIZE * pages::usize;
     bin.write_u32_le(buf, sentinel, end);
     bin.write_u32_le(buf, sentinel + 4, 0);
-    bin.write_u32_le(buf, sentinel + 8, lsda_off::u32);
+    bin.write_u32_le(buf, sentinel + 8, lsda_at::u32);
     ret res[usize, fail.Fail].ok{size};
 }

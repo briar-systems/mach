@@ -20,3 +20,11 @@ int mad_device_open(int a) {
     signed4_target = 0x12345678;
     return a + signed1_target + signed2_target + signed4_target;
 }
+
+/* nothing calls it: the object is built with subsections via symbols, so the
+   link collects this function, its unwind entry and what its debug info says
+   of it (briar-systems/mach#3410). its multiply by 0x3410 is the marker the
+   producer looks for */
+int mad_device_unused(int a) {
+    return a * 0x3410 + 0x77;
+}

@@ -332,10 +332,18 @@ pub val RK_JAL20: RelocKind = 28
 
 the riscv jal 20-bit j-type field, +-1 MiB, even displacement
 
+## val RK_PC64
+
+```mach
+pub val RK_PC64: RelocKind = 29
+```
+
+a 64-bit field holding the target's distance from the field
+
 ## val RK_CATALOG_COUNT
 
 ```mach
-pub val RK_CATALOG_COUNT: u32 = 29
+pub val RK_CATALOG_COUNT: u32 = 30
 ```
 
 ## rec RelocKindDesc
@@ -463,6 +471,15 @@ pub val SYM_OBJ_FLAG_HIDDEN: u32 = 0x400
 
 a definition every module in the link may reference and no linked image
 exports: ELF STV_HIDDEN, Mach-O N_PEXT, absent from a PE export table
+
+## val SYM_OBJ_FLAG_RETAIN
+
+```mach
+pub val SYM_OBJ_FLAG_RETAIN: u32 = 0x800
+```
+
+a final link keeps the definition even when nothing references it: Mach-O
+N_NO_DEAD_STRIP, which `__attribute__((used))` sets
 
 ## val SECTION_EXTERNAL
 
@@ -594,14 +611,37 @@ pub val SEC_FLAG_IMAGE_MASK: u32 = SEC_FLAG_INIT_FUNCS
 pub val SEC_FLAG_UNWIND_INDEX:  u32 = 0x10
 ```
 
-a load section the linker reserved for the format's unwind tables: the index
-an unwinder searches first and the frame descriptions it leads to
+the unwind tables: the index an unwinder searches first and the frame
+descriptions it leads to. on a load section, the room the linker reserved for
+the format's table. on an input section, the object's own contribution to
+that table, which a link building the tables takes into them: frame
+descriptions (`.eh_frame`, mach-o `__eh_frame`) are carried into the frames
+table, and an index (mach-o `__compact_unwind`) is read, never placed
 
 ## val SEC_FLAG_UNWIND_FRAMES
 
 ```mach
 pub val SEC_FLAG_UNWIND_FRAMES: u32 = 0x20
 ```
+
+## val SEC_FLAG_ASSOCIATED
+
+```mach
+pub val SEC_FLAG_ASSOCIATED: u32 = 0x40
+```
+
+the section lives and dies with the one `native.link_section` names: a coff
+associative comdat member, or an elf section ordered after its owner
+(SHF_LINK_ORDER). a final link keeps it exactly while it keeps that owner
+
+## fun section_format_retained
+
+```mach
+pub fun section_format_retained(sec: *Section) bool;
+```
+
+whether the format's own linkers keep a foreign section whatever references
+it: coff collects only comdat sections, so any other section is kept
 
 ## val NATIVE_GROUP
 
@@ -951,17 +991,29 @@ data; an empty shape when no import needs a slot
 pub rec UnwindShape;
 ```
 
-the unwind tables of an executable: an index an unwinder searches by address
+the unwind tables of an image: an index an unwinder searches by address
 and the frame descriptions it reaches, each empty when the format needs none
+
+## rec ForeignUnwind
+
+```mach
+pub rec ForeignUnwind;
+```
+
+what the link's foreign objects bring to its unwind tables, measured before
+layout: the bytes of their own frame descriptions, which the frames table
+carries first, the entries among them that describe a function, and the
+functions their unwind index describes
 
 ## def UnwindShapeFn
 
 ```mach
-pub def UnwindShapeFn: fun(u32, *FrameUnwind, u32) res[UnwindShape, fail.Fail]
+pub def UnwindShapeFn: fun(u32, *FrameUnwind, u32, *ForeignUnwind) res[UnwindShape, fail.Fail]
 ```
 
-the unwind tables for the frame records a link keeps, at the end of the code,
-sized from the records' steps alone so the linker reserves them before layout
+the unwind tables for the frame records a link keeps and what its foreign
+objects bring, at the end of the code, sized from the records' steps and the
+foreign measure alone so the linker reserves them before layout
 
 ## rec PltFixup
 
@@ -991,6 +1043,43 @@ pub rec LoadSegment;
 
 ```mach
 pub rec ExecFunction;
+```
+
+## rec NativeUnwind
+
+```mach
+pub rec NativeUnwind;
+```
+
+a foreign function its object's unwind index describes, at its final
+address, and the personality and lsda (zero for none) its entry names
+
+## rec UnwindPersonality
+
+```mach
+pub rec UnwindPersonality;
+```
+
+the pointer slot an unwind entry's personality is read through: one the link
+filled, at `slot`, or the import GOT's slot for `import_index`. neither when
+the entry names no personality
+
+## val PERSONALITY_NO_IMPORT
+
+```mach
+pub val PERSONALITY_NO_IMPORT: u32 = 0xFFFFFFFF
+```
+
+## fun no_personality
+
+```mach
+pub fun no_personality() UnwindPersonality;
+```
+
+## fun has_personality
+
+```mach
+pub fun has_personality(p: *UnwindPersonality) bool;
 ```
 
 ## def SymbolType
@@ -1335,7 +1424,7 @@ str, *u8, ImageOptions) err[fail.Fail]
 
 ```mach
 pub def SharedFn: fun(*A.Allocator, *intern.Interner, *ObjectTarget, *LoadSegment, u32, u64,
-*ExportSym, u32, *DynamicInfo, *Section, u32,
+*ExecFunction, u32, *ExportSym, u32, *DynamicInfo, *Section, u32,
 *SymtabEntry, u32, str, ImageOptions) err[fail.Fail]
 ```
 

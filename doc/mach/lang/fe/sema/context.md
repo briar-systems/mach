@@ -580,6 +580,25 @@ pub fun record_result(sc: *SemaContext, r: err[fail.Fail]);
 pub fun record_eval_result(sc: *SemaContext, r: res[comptime.CTValue, comptime.EvalFail]);
 ```
 
+## fun attr_string_arg
+
+```mach
+pub fun attr_string_arg(sc: *SemaContext, dec: *decl.Decorator, ord: u32, kind: dkind.Kind, kind_msg: str) opt[str];
+```
+
+the string argument `ord` of an attribute evaluates to (#4022). one that is
+not a constant expression is refused with `decorator.not_constant`, naming
+the attribute, and a constant that is no string with `kind` and `kind_msg`
+
+## fun require_constant_arg
+
+```mach
+pub fun require_constant_arg(sc: *SemaContext, dec: *decl.Decorator, ord: u32);
+```
+
+an integer argument that is not a constant expression is refused as one;
+a question only a later phase answers, a layout or an instance, is left to it
+
 ## def StmtListVisitor
 
 ```mach

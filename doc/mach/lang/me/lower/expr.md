@@ -54,6 +54,16 @@ pub fun try_lower_comptime_intrinsic(ctx: *context.LowerContext, eid: id.ExprId,
 pub fun try_lower_comptime_cast(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) opt[res[value.Value, fail.Fail]];
 ```
 
+## fun lower_stored_rvalue
+
+```mach
+pub fun lower_stored_rvalue(ctx: *context.LowerContext, eid: id.ExprId, in_place: bool, borrowed: *bool) res[value.Value, fail.Fail];
+```
+
+the value a store consumes. when `in_place` holds, nothing writes memory between this read
+and the store, so an aggregate place is read where it lies and the store copies from it:
+the aggregate copy is overlap-safe, so no snapshot sits between them (#4235, #4241)
+
 ## fun condition_value
 
 ```mach

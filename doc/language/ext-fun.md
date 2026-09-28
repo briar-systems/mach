@@ -481,13 +481,17 @@ bit-compatible with a C `int __attribute__((vector_size(32)))` parameter:
   `ymm` register, as an argument and as a result, which is what gcc and clang do at
   `-mavx`. Once the vector registers are used up it goes on the stack at its C
   alignment. A 64-byte vector is still wider than the register and MEMORY class, as
-  above. Mach computes on 128-bit halves (256-bit instructions are #4128), so the
-  vector moves between `ymm` and its memory image with `vmovdqu`, and the function
-  runs `vzeroupper` once the value has left the register (after storing incoming
-  `ymm` arguments, and after storing a returned `ymm` value), so the 128-bit
-  instructions that follow do not pay for a dirty upper half. A call that places an
-  argument above the 16-byte stack alignment realigns the caller's stack pointer to
-  that argument's alignment, as the psABI requires of the argument area.
+  above. A vector whose lanes compute at 256 bits there (every lane under `avx2`,
+  the float lanes under `avx` alone) travels whole in its `ymm` register. An
+  integer vector under `avx` without `avx2` computes on 128-bit halves, so it moves
+  between `ymm` and its memory image with `vmovdqu`, and the function runs
+  `vzeroupper` once the value has left the register (after storing incoming `ymm`
+  arguments, and after storing a returned `ymm` value). A function that holds a
+  value in a `ymm` register runs `vzeroupper` before each call and return that
+  passes none in one, so the 128-bit instructions outside it do not pay for a
+  dirty upper half. A call that places an argument above the 16-byte stack
+  alignment realigns the caller's stack pointer to that argument's alignment, as
+  the psABI requires of the argument area.
 - **x86_64-windows (Microsoft x64):** the carrier table under [Windows vector
   carriers](#windows-vector-carriers): a pointer to a caller copy, and
   caller-provided result storage.

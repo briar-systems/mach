@@ -172,6 +172,12 @@ pub val ASM_NOTE_BYTES:   u8 = notes.ASM_NOTE_BYTES
 pub val ASM_NOTE_BARRIER: u8 = notes.ASM_NOTE_BARRIER
 ```
 
+## val ASM_NOTE_LABEL
+
+```mach
+pub val ASM_NOTE_LABEL:   u8 = notes.ASM_NOTE_LABEL
+```
+
 ## val ASM_NOTE_BYTES_WIDTH
 
 ```mach
@@ -376,6 +382,15 @@ pub rec BranchFixup;
 pub rec RelocPairSite;
 ```
 
+## val STACK_PROBE_INTERVAL
+
+```mach
+pub val STACK_PROBE_INTERVAL: u64 = 4096
+```
+
+the step a probed frame allocation touches the stack at: the smallest page any
+target has, so no guard a target keeps is narrower than it
+
 ## rec EncodeState
 
 ```mach
@@ -433,6 +448,15 @@ pub fun encode_module(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.MirM
 pub fun encode_module_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.MirModule,
 hooks: *EncodeHooks, asm_out: *writer.Writer) res[EncoderOutput, fail.Fail];
 ```
+
+## fun entry_align
+
+```mach
+pub fun entry_align(model: *isa.MachineModel, explicit: u32) u32;
+```
+
+a function's entry alignment: its own `#[align]` or the target's rule,
+whichever is larger
 
 ## fun classify_refs
 

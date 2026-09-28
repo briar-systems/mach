@@ -534,7 +534,7 @@ pub fun print_all(va: ...) {
 - `$type_of(expr)`: compile-time type value for comparison inside `$if` conditions.
 - `$fields(T)`: sequence of record or union field descriptors, consumed with `$each f in $fields(T) { val field_val = instance.[f]; }`.
 - `$cases(T)`: sequence of tag case descriptors, consumed with `$each c in $cases(T)`.
-- `$is_tag(T)`, `$is_record(T)`, `$is_union(T)`, `$is_pointer(T)`, `$is_secret(T)`: type reflection predicates.
+- `$is_tag(T)`, `$is_record(T)`, `$is_union(T)`, `$is_pointer(T)`, `$is_secret(T)`, `$holds_secret(T)`: type reflection predicates. `$is_secret` asks whether `T` is outermost `^`, `$holds_secret` whether any byte of `T` is secret.
 - `$error("message")`: produces a compile error when encountered in an active branch.
 
 ## Decorators

@@ -6,7 +6,7 @@
 # see test/README.md for the case contract and how to add a case.
 #
 # usage: test/run.sh [--target <t>]... [--case <group>/<name>]...
-#                    [--qemu] [--link] [--dwarf] [--incremental] [--docs]
+#                    [--qemu] [--link] [--dwarf] [--asm] [--incremental] [--docs]
 #                    [--f16proof [--shard <i>/<n>]]
 #
 # per case and target: build in release; on a target this host can execute, build
@@ -24,6 +24,8 @@
 #                  (a missing emulator is announced and its target is only built)
 #   --link         run the link cases (test/link/cases) instead of the corpus
 #   --dwarf        build every case with -g and verify its debug model (llvm-dwarfdump --verify, spirv-val)
+#   --asm          on an x86_64 ELF column, reassemble every case's and every std module's --emit-asm
+#                  listing at O0 and O2 with GNU as and require the same .text bytes as mach's own object
 #   --incremental  warm rebuilds of this compiler and of a manifest fixture match clean builds
 #   --docs         compile every mach block in doc/language, check it against mach fmt and run each one with a main
 #                  (--case <page> selects one page, such as --case operators; one hosted
@@ -76,6 +78,7 @@ want_cases=
 qemu=0
 mode=corpus
 dwarf=0
+asm=0
 shard=0/1
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -88,6 +91,7 @@ while [ $# -gt 0 ]; do
         --f16proof) mode=f16proof ;;
         --shard)  shift; [ $# -gt 0 ] || usage; shard=$1 ;;
         --dwarf)  dwarf=1 ;;
+        --asm)    asm=1 ;;
         -h|--help) usage ;;
         *) echo "run.sh: unknown option '$1'" >&2; usage ;;
     esac
@@ -529,7 +533,63 @@ run_case() {
         fi
         spirv-dis "$o" 2>/dev/null | grep -q ' OpLine ' || { fail "$t $c -g: the module carries no OpLine"; return; }
     fi
+    if [ "$asm" -eq 1 ] && lists_asm "$t"; then
+        for p in o0 o2; do
+            if ! relisted "$t" "$p" "$c"; then fail "$t $c $p listing: $why"; return; fi
+        done
+    fi
     passes=$((passes + 1))
+}
+
+# lists_asm <target>: the columns whose --emit-asm listing GNU as reassembles
+lists_asm() { [ "$(target_field "$1" 2)" = x86_64 ] && [ "$(object_format "$1")" = elf ]; }
+
+# relisted <target> <profile> <case>: each corpus listing of the case's build (the
+# case's own module and the shared fold) reassembles to its object, 0 when every
+# one does and otherwise 1 with the first difference in why
+relisted() {
+    t=$1; p=$2; c=$3
+    a=$(art "$c")
+    log=$out/log/$t.$p.$a.asm.log
+    "$mach" build "$out/hosted" --target "$t" --profile "$p" --bin "$a" --emit obj --emit-asm >"$log" 2>&1 || {
+        why="build: $(first_error "$log")"; return 1
+    }
+    relist "$t" "$p" "$a" "corpus/cases/$c" corpus/lib/fold
+}
+
+# relisted_std <target> <profile>: every std listing the corpus builds wrote
+# reassembles to its object; std is the same module in every case's build, so
+# its listings are held to their objects once per column and profile
+relisted_std() {
+    t=$1; p=$2
+    ms=$(cd "$out/hosted/o/$t/$p/asm" 2>/dev/null && find std -name '*.s' | sed 's/\.s$//' | sort)
+    [ -n "$ms" ] || { why="no build wrote a std listing"; return 1; }
+    relist "$t" "$p" std $ms
+}
+
+# relist <target> <profile> <tag> <module>...: each module's listing, assembled by
+# GNU as, is byte for byte the .text of mach's object for that module, 0 when every
+# one is and otherwise 1 with the first difference in why. a relocated field is zero
+# in both objects, since each addend lives in its relocation
+relist() {
+    t=$1; p=$2; tag=$3; shift 3
+    d=$out/hosted/o/$t/$p
+    log=$out/log/$t.$p.$tag.as.log
+    for m in "$@"; do
+        s=$d/asm/$m.s
+        g=$out/log/$t.$p.$tag.$(art "$m")
+        if ! as --64 -o "$g.o" "$s" >"$log" 2>&1; then
+            why="GNU as on $m: $(grep -m1 -E 'Error|error' "$log")"; return 1
+        fi
+        if ! objcopy -O binary --only-section=.text "$d/obj/$m.o" "$g.mach" ||
+            ! objcopy -O binary --only-section=.text "$g.o" "$g.as"; then
+            why="objcopy could not extract the .text of $m"; return 1
+        fi
+        if ! first=$(cmp "$g.mach" "$g.as" 2>&1); then
+            why="GNU as assembles $m to other bytes than mach emits: $first"; return 1
+        fi
+    done
+    return 0
 }
 
 # the tools the selected columns reach, checked before anything is built
@@ -547,6 +607,7 @@ for t in $targets; do
     [ "$(engine "$t")" = - ] || need_tool "${CC:-cc}" "the $t differential"
     if [ "$(engine "$t")" != - ] && runs_bare "$t"; then need_tool python3 "the $t differential"; fi
     case "$(object_format "$t")" in elf|macho|coff) [ "$dwarf" -eq 0 ] || need_tool llvm-dwarfdump --dwarf ;; esac
+    if [ "$asm" -eq 1 ] && lists_asm "$t"; then need_tool as --asm; need_tool objcopy --asm; fi
 done
 echo "targets: $targets"
 echo "cases:   $(echo $cases | wc -w)"
@@ -560,9 +621,13 @@ for t in $targets; do
         *) how="differential under $eng" ;;
     esac
     [ "$dwarf" -eq 1 ] && how="$how + dwarf"
+    [ "$asm" -eq 1 ] && lists_asm "$t" && how="$how + listing"
     echo "target:  $t ($how)"
     before=$noruns
     for c in $cases; do run_case "$t" "$c"; done
+    if [ "$asm" -eq 1 ] && lists_asm "$t"; then
+        for p in o0 o2; do relisted_std "$t" "$p" || fail "$t std $p listing: $why"; done
+    fi
     [ "$noruns" -eq "$before" ] || echo "norun:   $t $((noruns - before)) cases build only, listed in NORUN.$t"
 done
 fi

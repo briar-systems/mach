@@ -411,8 +411,10 @@ pub val OP_CONST: InstrKind = 60
 
 its one operand, an integer or float constant, as a value of its own: the
 materialization of a constant a loop reads, placed ahead of the loop so the
-loop reads a register rather than rebuilding the constant (#3807). every
-pass that reads a constant reads through it with `ir.constant_behind`
+loop reads a register rather than rebuilding the constant (#3807), or the
+zero integer vector type legalization materializes once for the halves of
+zero extensions to share (#4198). every pass that reads a constant reads
+through it with `ir.constant_behind`
 
 ## val OP_VEC_INTERLEAVE
 
@@ -439,6 +441,17 @@ integer vector of n lanes into n * w / W lanes of the wider width W, lane r
 summing operand lanes r * W / w up to the next result lane's first. formed
 only where the target packs it, the per-block fold of a count accumulated in
 narrow lanes (#4161)
+
+## val OP_VEC_SIGN_MASK
+
+```mach
+pub val OP_VEC_SIGN_MASK: InstrKind = 63
+```
+
+each lane of an integer vector all ones when it is negative, else zero, in
+the operand's own type: the high half a signed lane-halving extension
+interleaves its lanes with. formed only where the target packs it, by type
+legalization, so both halves of one extension share it (#4198)
 
 ## val INSTR_FLAG_NSW
 
@@ -482,6 +495,16 @@ a scalar shift whose count is below its operand's width: proven by the range
 analysis, or made so by the saturation shiftbound expands around it (#3885,
 #3887). lowering emits the bare machine shift for it and refuses a variable
 count without it
+
+## val INSTR_FLAG_TAIL
+
+```mach
+pub val INSTR_FLAG_TAIL: u16 = 0x40
+```
+
+a call in tail position of a function whose frame nothing outlives, set by
+the last pass of the release pipeline (#3417). the backend makes it a jump
+where the calling convention lets the callee take over the frame
 
 ## rec Instruction
 

@@ -31,10 +31,10 @@ pub fun is_expect(source: str, dec: *decl.Decorator) bool;
 ## fun key_of
 
 ```mach
-pub fun key_of(a: *ast.Ast, source: str, itn: *intern.Interner, eid: id.ExprId) opt[str];
+pub fun key_of(s: *session.Session, mid: session.ModuleId, eid: id.ExprId) opt[str];
 ```
 
-the key an argument spells, decoded; none when the argument is not a string literal
+the key an argument evaluates to; none when the argument is not a constant string
 
 ## fun arg_span
 
@@ -47,7 +47,7 @@ the span an argument occupies, where a refused or unfulfilled key is reported
 ## fun collect
 
 ```mach
-pub fun collect(a: *ast.Ast, source: str, itn: *intern.Interner, ctx: *comptime.ComptimeCtx, checked: bool,
+pub fun collect(s: *session.Session, mid: session.ModuleId, a: *ast.Ast, source: str, ctx: *comptime.ComptimeCtx, checked: bool,
 out: *Vector[diagnostic.Expectation]) err[fail.Fail];
 ```
 
@@ -55,7 +55,8 @@ every `#[expect]` key in the module, one expectation each
 
 a:       the parsed module
 source:  its text
-itn:     the interner its string literals decode into
+s:       the session whose attribute strings hold its keys
+mid:     the module
 ctx:     the comptime context whose gate decisions say which `$if` branch is taken
 checked: the module was type checked this build, or its warnings replayed
 out:     the list the expectations are appended to

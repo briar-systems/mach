@@ -314,49 +314,55 @@ pub val FLOAT_WIDTH_MISMATCH_MSG: str =
 ## val TYPE_QUERY_IS_RECORD
 
 ```mach
-pub val TYPE_QUERY_IS_RECORD:  u8 = 0
+pub val TYPE_QUERY_IS_RECORD:    u8 = 0
 ```
 
 ## val TYPE_QUERY_IS_UNION
 
 ```mach
-pub val TYPE_QUERY_IS_UNION:   u8 = 1
+pub val TYPE_QUERY_IS_UNION:     u8 = 1
 ```
 
 ## val TYPE_QUERY_IS_POINTER
 
 ```mach
-pub val TYPE_QUERY_IS_POINTER: u8 = 2
+pub val TYPE_QUERY_IS_POINTER:   u8 = 2
 ```
 
 ## val TYPE_QUERY_NAME
 
 ```mach
-pub val TYPE_QUERY_NAME:       u8 = 3
+pub val TYPE_QUERY_NAME:         u8 = 3
 ```
 
 ## val TYPE_QUERY_IS_SECRET
 
 ```mach
-pub val TYPE_QUERY_IS_SECRET:  u8 = 4
+pub val TYPE_QUERY_IS_SECRET:    u8 = 4
 ```
 
 ## val TYPE_QUERY_IS_TAG
 
 ```mach
-pub val TYPE_QUERY_IS_TAG:     u8 = 5
+pub val TYPE_QUERY_IS_TAG:       u8 = 5
 ```
 
 ## val TYPE_QUERY_IS_INTEGER
 
 ```mach
-pub val TYPE_QUERY_IS_INTEGER: u8 = 6
+pub val TYPE_QUERY_IS_INTEGER:   u8 = 6
 ```
 
 ## val TYPE_QUERY_IS_FLOAT
 
 ```mach
-pub val TYPE_QUERY_IS_FLOAT:   u8 = 7
+pub val TYPE_QUERY_IS_FLOAT:     u8 = 7
+```
+
+## val TYPE_QUERY_HOLDS_SECRET
+
+```mach
+pub val TYPE_QUERY_HOLDS_SECRET: u8 = 8
 ```
 
 ## def PhaseCapabilityKind
@@ -401,11 +407,27 @@ pub val PHASE_CAP_SEMANTIC_TYPES: PhaseCapabilityKind = 4
 pub val PHASE_CAP_LOWERING:       PhaseCapabilityKind = 5
 ```
 
+## rec NoCapabilityContext
+
+```mach
+pub rec NoCapabilityContext;
+```
+
+the context of an evaluation that holds no phase capability
+
 ## rec PhaseCapabilities
 
 ```mach
 pub rec PhaseCapabilities[T];
 ```
+
+## fun no_capabilities
+
+```mach
+pub fun no_capabilities() PhaseCapabilities[NoCapabilityContext];
+```
+
+no phase capability: an expression reads literals and the constants its context binds
 
 ## fun loading_capabilities
 
@@ -673,6 +695,7 @@ build_mode_id: u32,
 build_pie: u32,
 pointer_width: u32,
 vector_bits: u32,
+register_bits: u32,
 has_float: bool,
 compiler_name: intern.StrId,
 compiler_ver: intern.StrId) ComptimeCtx;

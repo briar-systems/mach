@@ -1,0 +1,382 @@
+# tail calls through the release pipeline to the object (#3417): a call in
+# tail position leaves its caller as a jump on every isa when the contract
+# holds, and each rule that fails keeps it a call
+
+use mach.lang.fail;
+use std.allocator.page;
+use fs: std.filesystem;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+
+use mach.lang.build.outcome;
+use mach.lang.driver;
+use mach.lang.driver.project;
+use mach.lang.intern;
+use mach.lang.manifest;
+use mach.lang.me.ir;
+use mach.lang.me.ir.instruction;
+use mach.lang.session;
+use mach.lang.target.of;
+
+use mach.lang.driver.tests.testing.ut_cc3;
+use mach.lang.driver.tests.testing.ut_inline_function;
+use mach.lang.driver.tests.testing.ut_inline_ops;
+use mach.lang.driver.tests.testing.ut_mid;
+use mach.lang.driver.tests.testing.ut_name_tail_is;
+use mach.lang.driver.tests.testing.ut_scaffold;
+use mach.lang.driver.tests.testing.ut_target_sel;
+
+val UT_JUMP: i32 = 1;
+val UT_CALL: i32 = 0;
+
+val UT_X64:   u8 = 0;
+val UT_ARM64: u8 = 1;
+val UT_RV64:  u8 = 2;
+
+#[testing]
+fun ut_isa_of(target_name: str) u8 {
+    if (str_equals(target_name, "linux-arm64") || str_equals(target_name, "darwin-arm64")) { ret UT_ARM64; }
+    if (str_equals(target_name, "linux-riscv64"))                                          { ret UT_RV64; }
+    ret UT_X64;
+}
+
+# how `caller` reaches `callee` in the release object of `text` built for
+# `target_name`: UT_JUMP, UT_CALL, or a failure below zero. `text` is saved
+# into `out_text` when it is not nil, the caller's own bytes
+#[testing]
+fun ut_tail_form(target_name: str, text: str, caller: str, callee: str, debug: bool, out_text: *u8, out_len: *u32) i32 {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret -1; }
+    var names:    [1]str              = [1]str{"main.mach"};
+    var texts:    [1]str              = [1]str{text};
+    val scaffold: res[str, fail.Fail] = ut_scaffold(?alloc, ?names[0], ?texts[0], 1);
+    if (sel scaffold.err) { ret -2; }
+    val root: str = scaffold.ok;
+    fin {
+        fs.remove_all(?alloc, root);
+        str_free(?alloc, root);
+    }
+    val initialized: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel initialized.err) { ret -3; }
+    var s: session.Session = initialized.ok;
+    fin { session.dnit(?s); }
+    val registered: err[outcome.Fail] = driver.setup_registry(s.registry);
+    if (sel registered.err) { ret -4; }
+    var selection: manifest.Selection = ut_target_sel(target_name);
+    selection.profile = "release";
+    val opened: res[project.Project, outcome.Fail] = driver.build_project(?s, root, ?selection);
+    if (sel opened.err) { ret -5; }
+    var p: project.Project = opened.ok;
+    fin { project.dnit_project(?p); }
+    p.req.debug = debug;
+    val sema: err[outcome.Fail] = driver.run_sema_pass(?p);
+    if (sel sema.err) { ret -6; }
+    val lowered: err[outcome.Fail] = driver.run_lower_pass(?p);
+    if (sel lowered.err) { ret -7; }
+    val generated: err[outcome.Fail] = driver.run_codegen_pass(?p);
+    if (sel generated.err) { ret -8; }
+    val mid: session.ModuleId = ut_mid(?p, ?s, "uniontest.main");
+    if (mid == session.MODULE_NIL) { ret -9; }
+    val image: *of.ObjectImage = project.module_at(?p, mid::u32).object_image;
+    if (image == nil) { ret -10; }
+
+    val from: i32 = ut_symbol(image, caller, true);
+    val to:   i32 = ut_symbol(image, callee, false);
+    if (from < 0 || to < 0) { ret -11; }
+    val fn:  *of.Symbol  = ?image.symbols[from::u32];
+    val sec: *of.Section = ?image.sections[fn.section.index];
+    if (out_text != nil) {
+        var k: u32 = 0;
+        for (k < fn.size) {
+            out_text[k] = sec.bytes[fn.offset + k];
+            k           = k + 1;
+        }
+        @out_len = fn.size;
+    }
+    var hits: u32            = 0;
+    var at:   *of.Relocation = nil;
+    var ri:   u32            = 0;
+    for (ri < image.reloc_count) {
+        val rl: *of.Relocation = ?image.relocations[ri];
+        if (rl.section.index == fn.section.index && rl.sym == to::u32
+            && rl.offset >= fn.offset && rl.offset < fn.offset + fn.size) {
+            at   = rl;
+            hits = hits + 1;
+        }
+        ri = ri + 1;
+    }
+    if (hits != 1) { ret -12; }
+
+    val isa: u8 = ut_isa_of(target_name);
+    if (isa == UT_ARM64) {
+        if (at.kind == of.RK_JUMP26) { ret UT_JUMP; }
+        if (at.kind == of.RK_PLT32)  { ret UT_CALL; }
+        ret -13;
+    }
+    if (isa == UT_RV64) {
+        # the jalr of the pair links ra for a call and nothing for a jump
+        val w:  u32 = ut_word(sec.bytes, at.offset + 4);
+        val rd: u32 = (w >> 7) & 31;
+        if (rd == 0) { ret UT_JUMP; }
+        if (rd == 1) { ret UT_CALL; }
+        ret -13;
+    }
+    if (at.offset == 0) { ret -13; }
+    val op: u8 = sec.bytes[at.offset - 1];
+    if (op == 0xE9) { ret UT_JUMP; }
+    if (op == 0xE8) { ret UT_CALL; }
+    ret -13;
+}
+
+#[testing]
+fun ut_word(bytes: *u8, at: u32) u32 {
+    ret bytes[at]::u32 | (bytes[at + 1]::u32 << 8) | (bytes[at + 2]::u32 << 16) | (bytes[at + 3]::u32 << 24);
+}
+
+# the one symbol whose name ends in `.tail`, defined in the object or not
+#[testing]
+fun ut_symbol(img: *of.ObjectImage, tail: str, defined: bool) i32 {
+    var found: i32 = -1;
+    var sy:    u32 = 0;
+    for (sy < img.symbol_count) {
+        val sym:    *of.Symbol = ?img.symbols[sy];
+        val looked: opt[str]   = intern.lookup(img.interner, sym.name);
+        val here:   bool       = (sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0 && !of.section_is_external(sym.section);
+        if (sel looked.some) {
+            if ((here || !defined) && ut_name_tail_is(looked.some, tail)) {
+                if (found >= 0) { ret -1; }
+                found = sy::i32;
+            }
+        }
+        sy = sy + 1;
+    }
+    ret found;
+}
+
+#[testing]
+fun ut_form(target_name: str, text: str) i32 {
+    ret ut_tail_form(target_name, text, "f", "g", false, nil, nil);
+}
+
+val UT_TARGETS: [6]str = [6]str{"linux", "windows", "darwin-x86_64", "linux-arm64", "darwin-arm64", "linux-riscv64"};
+
+# every form below is a call on every target, however the call is placed
+#[testing]
+fun ut_call_everywhere(text: str) i32 {
+    var t: u32 = 0;
+    for (t < 6) {
+        val form: i32 = ut_form(UT_TARGETS[t], text);
+        if (form != UT_CALL) { ret 1 + t::i32 * 100 + form; }
+        t = t + 1;
+    }
+    ret 0;
+}
+
+#[testing]
+fun ut_jump_everywhere(text: str) i32 {
+    var t: u32 = 0;
+    for (t < 6) {
+        val form: i32 = ut_form(UT_TARGETS[t], text);
+        if (form != UT_JUMP) { ret 1 + t::i32 * 100 + form; }
+        t = t + 1;
+    }
+    ret 0;
+}
+
+test tail__a_sibling_call_is_a_jump_on_every_isa {
+    ret ut_jump_everywhere(
+        "#[noinline] fun g(a: i64, b: i64) i64 { ret a * 3 + b; }\n#[noinline] pub fun f(a: i64, b: i64) i64 { ret g(b + 1, a - 1); }\nfun main() i64 { ret f(1, 2); }\n");
+}
+
+# the callee writes its record where the caller's own caller asked, through
+# the hidden pointer the caller was handed
+test tail__a_returned_record_passes_the_callers_own_result_storage {
+    ret ut_jump_everywhere(
+        "rec W { a: i64; b: i64; c: i64; d: i64; e: i64; }\n#[noinline] fun g(v: i64) W { ret W{a: v, b: v + 1, c: v + 2, d: v + 3, e: v + 4}; }\n#[noinline] pub fun f(v: i64) W { ret g(v * 2); }\nfun main() i64 { ret f(1).e; }\n");
+}
+
+# the caller returns a conversion of the callee's result, which it would
+# have to make after the callee returned
+test tail__a_converted_result_keeps_a_call {
+    ret ut_call_everywhere(
+        "#[noinline] fun g(a: i64, b: i64) i32 { ret (a * 3 + b)::i32; }\n#[noinline] pub fun f(a: i64, b: i64) i64 { ret g(b, a)::i64; }\nfun main() i64 { ret f(1, 2); }\n");
+}
+
+# a fin runs between the call and the return, so the call is not the last
+# thing the function does
+test tail__a_pending_fin_keeps_a_call {
+    ret ut_call_everywhere(
+        "var hits: i64 = 0;\n#[noinline] fun bump() { hits = hits + 1; }\n#[noinline] fun g(a: i64, b: i64) i64 { ret a * 3 + b; }\n#[noinline] pub fun f(a: i64, b: i64) i64 { fin { bump(); } ret g(b, a); }\nfun main() i64 { ret f(1, 2); }\n");
+}
+
+# the callee reads the caller's local through its argument
+test tail__an_argument_into_the_callers_frame_keeps_a_call {
+    ret ut_call_everywhere(
+        "#[noinline] fun g(p: *i64, b: i64) i64 { ret @p + b; }\n#[noinline] pub fun f(a: i64, b: i64) i64 { var x: i64 = a * 5; ret g(?x, b); }\nfun main() i64 { ret f(1, 2); }\n");
+}
+
+# the address of a local escaped to an earlier call, where anything can keep it
+test tail__a_local_escaped_before_keeps_a_call {
+    ret ut_call_everywhere(
+        "var kept: *i64 = nil;\n#[noinline] fun stash(p: *i64) { kept = p; }\n#[noinline] fun g(a: i64, b: i64) i64 { ret a * 3 + b + @kept; }\n#[noinline] pub fun f(a: i64, b: i64) i64 { var x: i64 = a; stash(?x); ret g(b, a); }\nfun main() i64 { ret f(1, 2); }\n");
+}
+
+test tail__an_oblivious_caller_keeps_a_call {
+    ret ut_call_everywhere(
+        "#[noinline] fun g(a: i64, b: i64) i64 { ret a * 3 + b; }\n#[oblivious] #[noinline] pub fun f(a: i64, b: i64) i64 { ret g(b, a); }\nfun main() i64 { ret f(1, 2); }\n");
+}
+
+test tail__inline_asm_in_the_caller_keeps_a_call {
+    val x64: i32 = ut_form("linux",
+        "#[noinline] fun g(a: i64, b: i64) i64 { ret a * 3 + b; }\n#[noinline] pub fun f(a: i64, b: i64) i64 { var r: i64 = a; asm x86_64 { mov rax, {r}\n add rax, 1\n mov {r}, rax } ret g(r, b); }\nfun main() i64 { ret f(1, 2); }\n");
+    if (x64 != UT_CALL) { ret 1; }
+    val a64: i32 = ut_form("linux-arm64",
+        "#[noinline] fun g(a: i64, b: i64) i64 { ret a * 3 + b; }\n#[noinline] pub fun f(a: i64, b: i64) i64 { asm aarch64 { nop } ret g(b, a); }\nfun main() i64 { ret f(1, 2); }\n");
+    if (a64 != UT_CALL) { ret 2; }
+    ret 0;
+}
+
+# stack arguments of the callee land in the caller's incoming argument area,
+# which must hold them: eight integer arguments fit an eight-argument caller
+# and not a two-argument one where the ninth argument onward rides the stack
+test tail__stack_arguments_must_fit_the_callers_incoming_area {
+    val many:  str = "#[noinline] fun g(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, h: i64, i: i64, j: i64, k: i64) i64 { ret a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + h * 7 + i * 8 + j * 9 + k * 10; }\n";
+    val fits:  str = "#[noinline] pub fun f(a: i64, b: i64, c: i64, d: i64, e: i64, v: i64, h: i64, i: i64, j: i64, k: i64) i64 { ret g(k, j, i, h, v, e, d, c, b, a); }\nfun main() i64 { ret f(1, 2, 3, 4, 5, 6, 7, 8, 9, 10); }\n";
+    val over:  str = "#[noinline] pub fun f(a: i64, b: i64) i64 { ret g(a, b, a, b, a, b, a, b, a, b); }\nfun main() i64 { ret f(1, 2); }\n";
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val fitting:  str = ut_cc3(?alloc, many, fits, "");
+    val spilling: str = ut_cc3(?alloc, many, over, "");
+    var t:        u32 = 0;
+    for (t < 6) {
+        val fit: i32 = ut_form(UT_TARGETS[t], fitting);
+        if (fit != UT_JUMP) { ret 1 + t::i32 * 100 + fit; }
+        val big: i32 = ut_form(UT_TARGETS[t], spilling);
+        if (big != UT_CALL) { ret 50 + t::i32 * 100 + big; }
+        t = t + 1;
+    }
+    ret 0;
+}
+
+# a record too large for registers travels as the caller's copy, in its
+# frame or its outgoing stack area, and the frame dies with the jump
+test tail__a_by_value_record_the_caller_copies_keeps_a_call {
+    ret ut_call_everywhere(
+        "rec W { a: i64; b: i64; c: i64; d: i64; e: i64; }\n#[noinline] fun g(w: W, b: i64) i64 { ret w.a + w.e + b; }\n#[noinline] pub fun f(a: i64, b: i64) i64 { ret g(W{a: a, b: b, c: a, d: b, e: a}, b); }\nfun main() i64 { ret f(1, 2); }\n");
+}
+
+# windows finds an epilogue by decoding it, and a jump into the function's own
+# range is none to it, so a self call the loop transform left is a call there
+test tail__a_self_call_stays_a_call_where_the_unwinder_decodes_epilogues {
+    val text: str = "rec P { a: i32; b: i32; }\n#[noinline] pub fun f(p: P, n: i64) i64 { if (n <= 0) { ret p.a::i64; } ret f(p, n - 1); }\nfun main() i64 { ret f(P{a: 1, b: 2}, 3); }\n";
+    val win:  i32 = ut_tail_form("windows", text, "f", "f", false, nil, nil);
+    if (win != UT_CALL) { ret 1; }
+    val lin: i32 = ut_tail_form("linux", text, "f", "f", false, nil, nil);
+    if (lin != UT_JUMP) { ret 2; }
+    ret 0;
+}
+
+# -g annotates and never decides: the caller's text is the same with and
+# without debug information, the jump included
+test tail__debug_information_leaves_the_jump_alone {
+    val text:   str = "#[noinline] fun g(a: i64, b: i64) i64 { ret a * 3 + b; }\n#[noinline] pub fun f(a: i64, b: i64) i64 { val s: i64 = b + 1; val r: i64 = g(s, a - 1); ret r; }\nfun main() i64 { ret f(1, 2); }\n";
+    var plain:  [256]u8;
+    var noted:  [256]u8;
+    var plen:   u32 = 0;
+    var nlen:   u32 = 0;
+    val p_form: i32 = ut_tail_form("linux", text, "f", "g", false, ?plain[0], ?plen);
+    val n_form: i32 = ut_tail_form("linux", text, "f", "g", true, ?noted[0], ?nlen);
+    if (p_form != UT_JUMP || n_form != UT_JUMP)  { ret 1; }
+    if (plen == 0 || plen != nlen || plen > 256) { ret 2; }
+    var i: u32 = 0;
+    for (i < plen) {
+        if (plain[i] != noted[i]) { ret 3; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# the calls and phis left in `name` once the release pipeline has run over
+# `text` for x86_64 linux
+#[testing]
+fun ut_release_shape(text: str, name: str, calls: *u32, phis: *u32) i32 {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var names:    [1]str              = [1]str{"main.mach"};
+    var texts:    [1]str              = [1]str{text};
+    val scaffold: res[str, fail.Fail] = ut_scaffold(?alloc, ?names[0], ?texts[0], 1);
+    if (sel scaffold.err) { ret 2; }
+    val root: str = scaffold.ok;
+    fin {
+        fs.remove_all(?alloc, root);
+        str_free(?alloc, root);
+    }
+    val initialized: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel initialized.err) { ret 3; }
+    var s: session.Session = initialized.ok;
+    fin { session.dnit(?s); }
+    val registered: err[outcome.Fail] = driver.setup_registry(s.registry);
+    if (sel registered.err) { ret 4; }
+    var selection: manifest.Selection = ut_target_sel("linux");
+    selection.profile = "release";
+    val opened: res[project.Project, outcome.Fail] = driver.build_project(?s, root, ?selection);
+    if (sel opened.err) { ret 5; }
+    var p: project.Project = opened.ok;
+    fin { project.dnit_project(?p); }
+    val sema: err[outcome.Fail] = driver.run_sema_pass(?p);
+    if (sel sema.err) { ret 6; }
+    val lowered: err[outcome.Fail] = driver.run_lower_pass(?p);
+    if (sel lowered.err) { ret 7; }
+    val mid: session.ModuleId = ut_mid(?p, ?s, "uniontest.main");
+    if (mid == session.MODULE_NIL) { ret 8; }
+    val fn: *ir.Function = ut_inline_function(?s, project.module_at(?p, mid::u32).ir_module, name);
+    if (fn == nil) { ret 9; }
+    @calls = ut_inline_ops(fn, instruction.OP_CALL);
+    var n:  u32 = 0;
+    var bi: u32 = 0;
+    for (bi < fn.block_count) {
+        n  = n + fn.blocks[bi].phi_count;
+        bi = bi + 1;
+    }
+    @phis = n;
+    ret 0;
+}
+
+# a self call in tail position is a loop, so no call is left, and at depth
+# 1e7 it runs in the stack of one frame
+test tail__self_tail_recursion_is_a_loop {
+    var calls: u32 = 0;
+    var phis:  u32 = 0;
+    val r:     i32 = ut_release_shape(
+        "#[noinline] pub fun count(n: i64, acc: i64) i64 { if (n == 0) { ret acc; } ret count(n - 1, acc + n); }\nfun main() i64 { ret count(10000000, 0); }\n",
+        "uniontest.main.count", ?calls, ?phis);
+    if (r != 0)     { ret r; }
+    if (calls != 0) { ret 20; }
+    if (phis < 2)   { ret 21; }
+    ret 0;
+}
+
+# `fib(n - 1) + fib(n - 2)` keeps the first call and carries the second as
+# the loop, the pending sum in an accumulator
+test tail__the_accumulator_shape_is_one_call_and_a_loop {
+    var calls: u32 = 0;
+    var phis:  u32 = 0;
+    val r:     i32 = ut_release_shape(
+        "#[noinline] pub fun fib(n: i64) i64 { if (n < 2) { ret n; } ret fib(n - 1) + fib(n - 2); }\nfun main() i64 { ret fib(20); }\n",
+        "uniontest.main.fib", ?calls, ?phis);
+    if (r != 0)     { ret r; }
+    if (calls != 1) { ret 20; }
+    if (phis < 2)   { ret 21; }
+    ret 0;
+}

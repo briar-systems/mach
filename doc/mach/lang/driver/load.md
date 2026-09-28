@@ -130,6 +130,15 @@ pub rec UseTarget;
 pub fun check_gated_const_imports(p: *project.Project) err[fail.Fail];
 ```
 
+## fun record_attribute_strings
+
+```mach
+pub fun record_attribute_strings(p: *project.Project, mid: session.ModuleId) err[fail.Fail];
+```
+
+records the strings the module's attribute arguments evaluate to, read in the
+build target's frame the load walk bound (#4022)
+
 ## fun eval_for_load
 
 ```mach
