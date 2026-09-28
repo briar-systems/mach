@@ -163,6 +163,29 @@ two `from_ty` vectors as the plain and the high multiply of the operands,
 interleaved: every piece of the pair is a cell it packs (#4119). both halves
 of one product then read the same pair
 
+## fun sign_interleave_packs
+
+```mach
+pub fun sign_interleave_packs(m: *ir.Module, tgt: *target.Target, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
+```
+
+whether the target realizes the signed lane-halving extension of a
+`from_ty` vector into the `ty` of half its lanes as the vector interleaved
+with its sign mask: both are cells it packs, and an extension is not one
+instruction of its own there. both halves of one extension then read the
+same mask (#4198)
+
+## fun zero_interleave_packs
+
+```mach
+pub fun zero_interleave_packs(m: *ir.Module, tgt: *target.Target, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
+```
+
+whether the target realizes the unsigned lane-halving extension of a
+`from_ty` vector into the `ty` of half its lanes as the vector interleaved
+with zero: the interleave is a cell it packs, and an extension is not one
+instruction of its own there. every such half then reads one zero (#4198)
+
 ## fun concat_packs
 
 ```mach
