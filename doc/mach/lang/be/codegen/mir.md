@@ -428,6 +428,9 @@ pub val MIR_VEC_BUILD:   MirOpcode = 0x1007
 pub val MIR_MUL_HI_U: MirOpcode = 0x1008
 ```
 
+the high half of the full product, at the operands' width; on vector lanes
+the packed high multiply of each lane pair (#4119)
+
 ## val MIR_MUL_HI_S
 
 ```mach
@@ -501,6 +504,15 @@ cleared: a value wider than `vector_bits` a convention carried has left its
 register, and nothing the function holds lives above the compute width.
 emitted only where the model's register-width row says the narrower code
 pays for that state (isa.vector_upper_clear), x86-64's vzeroupper (#3751)
+
+## val MIR_VEC_INTERLEAVE
+
+```mach
+pub val MIR_VEC_INTERLEAVE: MirOpcode = 0x1011
+```
+
+the IR lane interleave (dst, lo, hi, the first lane of the half in imm): lane
+i of lo and of hi from that lane on, joined into one lane twice as wide (#4119)
 
 ## val MIR_SEL_ADD
 
