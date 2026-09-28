@@ -200,6 +200,14 @@ pub fun is_result_image(ctx: *LowerCtx, iid: id.InstructionId) bool;
 
 the alloca `iid` is the result storage the caller passed (#4120)
 
+## fun names_tail_call
+
+```mach
+pub fun names_tail_call(ctx: *LowerCtx, v: value.Value) bool;
+```
+
+whether `v` is the result of the call lowered as a jump
+
 ## fun ret_align
 
 ```mach
