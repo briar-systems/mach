@@ -145,6 +145,22 @@ pub rec SemaDeps;
 the imported surfaces are borrowed: the driver owns each one and shares it
 between every importer in a pass (#3472)
 
+## fwd type.FieldEntry
+
+```mach
+fwd type.FieldEntry
+```
+
+forwards [`mach.lang.type.FieldEntry`](../../type.md#rec-fieldentry)
+
+## fwd type.FieldTable
+
+```mach
+fwd type.FieldTable
+```
+
+forwards [`mach.lang.type.FieldTable`](../../type.md#rec-fieldtable)
+
 ## rec InstReq
 
 ```mach

@@ -3382,10 +3382,11 @@ fun emit_instr(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, mi: *mir.MirInstr, pa
     val m: *ops.MirMap = ops.map_of(op);
     if (m != nil) {
         val code: u32 = ops.select(m, lf);
-        if (m.shape == ops.SH_BINARY)  { ret emit_binary(e, vm, mi, code, false); }
-        if (m.shape == ops.SH_SHIFT)   { ret emit_binary(e, vm, mi, code, true); }
-        if (m.shape == ops.SH_UNARY)   { ret emit_unary(e, vm, mi, code); }
-        if (m.shape == ops.SH_COMPARE) { ret emit_compare(e, vm, mi, code); }
+        if (m.shape == ops.SH_BINARY)                                       { ret emit_binary(e, vm, mi, code, false); }
+        if (m.shape == ops.SH_SHIFT && mir.vec_lane_is_vector(mi.vec_lane)) { ret emit_vector_shift(e, vm, mi, code); }
+        if (m.shape == ops.SH_SHIFT)                                        { ret emit_binary(e, vm, mi, code, true); }
+        if (m.shape == ops.SH_UNARY)                                        { ret emit_unary(e, vm, mi, code); }
+        if (m.shape == ops.SH_COMPARE)                                      { ret emit_compare(e, vm, mi, code); }
         ret emit_convert(e, vm, mi, code, m.src_float);
     }
 
@@ -3697,6 +3698,118 @@ fun emit_binary(e: *Emit, vm: *VMaps, mi: *mir.MirInstr, op_code: u32, shift: bo
     words[3] = b;
     spirv.inst(e.b, ?e.b.functions, op_code, ?words[0], ops.operand_words(row));
     ret store_vreg(e, vm, dst, result);
+}
+
+# a lane-wise shift saturates each lane as the scalar shift does (#3756), and
+# OpShift* leaves a component shifted by its width or more undefined (#3852).
+# the fill a lane saturates to is 0, or for an arithmetic shift the shift by
+# width - 1. a constant count is the bare shift, or the fill when it is out of
+# range. any other count keeps the shift where the count is below the width
+# and selects the fill elsewhere. a uniform count is one scalar, splatted
+# since OpShift* shifts by a count per component
+fun emit_vector_shift(e: *Emit, vm: *VMaps, mi: *mir.MirInstr, op_code: u32) err[fail.Fail] {
+    if (mi.operand_count != 3 || mi.operands[0].kind != mir.MIR_OP_VREG) {
+        ret emit_fail(e, "spirv.emit: malformed vector shift instruction");
+    }
+    val dst: u32 = mi.operands[0].vreg.n;
+    if (dst >= vm.n) { ret emit_fail(e, "spirv.emit: vector shift result vreg out of range"); }
+    val ty:      u32 = vm.type_id[dst];
+    val lanes:   u32 = mir.vec_lane_count(mi.vec_lane);
+    val bits:    u32 = mir.vec_lane_elem_bytes(mi.vec_lane)::u32 * 8;
+    val lane_ty: u32 = types.type_int(e.tt, bits);
+    val bvec_ty: u32 = types.type_vector(e.tt, types.type_bool(e.tt), lanes);
+    if (ty == 0 || lane_ty == 0 || bvec_ty == 0 || !operand_matches_type(vm, ?mi.operands[1], ty)) {
+        ret unsupported(e, unsupported_value_type(e, mi));
+    }
+    val a: u32 = read_operand(e, vm, ?mi.operands[1], ty);
+    if (e.b.err) { ret emit_fail(e, "spirv.emit: unreadable operand in vector shift"); }
+
+    val cnt: *mir.MirOperand = ?mi.operands[2];
+    if (cnt.kind == mir.MIR_OP_IMM) {
+        if (cnt.imm < 0 || cnt.imm >= bits::i64) {
+            val out: u32 = shift_fill(e, op_code, ty, lanes, bits, a);
+            if (out == 0) { ret emit_fail(e, "spirv.emit: could not build a vector shift fill"); }
+            ret store_vreg(e, vm, dst, out);
+        }
+        val by: u32 = mask_splat(e, ty, lanes, cnt.imm::u32, 0);
+        if (by == 0) { ret emit_fail(e, "spirv.emit: could not build a vector shift count constant"); }
+        ret store_vreg(e, vm, dst, shift_words(e, op_code, ty, a, by));
+    }
+    var c: u32 = 0;
+    if (operand_carries_type(vm, cnt) && vm.type_id[cnt.vreg.n] == ty) {
+        c = read_operand(e, vm, cnt, ty);
+    }
+    or {
+        var one: u32 = read_operand(e, vm, cnt, lane_ty);
+        if (e.b.err) { ret emit_fail(e, "spirv.emit: unreadable count in vector shift"); }
+        if (operand_carries_type(vm, cnt) && vm.type_id[cnt.vreg.n] != lane_ty) {
+            val from: u32 = vm.type_id[cnt.vreg.n];
+            # a narrower count widens to the lane by its value; a wider one
+            # would lose the bits that saturate it
+            if (types.type_is_float(e.tt, from) || types.type_is_opaque(e.tt, from)
+                || types.type_bits(e.tt, from) == 0 || types.type_bits(e.tt, from) > bits) {
+                ret emit_fail(e, "spirv.emit: a uniform shift count is not an integer as wide as the lane or narrower");
+            }
+            val cv: u32 = spirv.alloc_id(e.b);
+            var uw: [3]u32;
+            uw[0] = lane_ty;
+            uw[1] = cv;
+            uw[2] = one;
+            spirv.inst(e.b, ?e.b.functions, spirv.OP_U_CONVERT, ?uw[0], 3);
+            one = cv;
+        }
+        c = spirv.alloc_id(e.b);
+        var cw: [6]u32;
+        cw[0] = ty;
+        cw[1] = c;
+        var i: u32 = 0;
+        for (i < lanes) {
+            cw[2 + i] = one;
+            i         = i + 1;
+        }
+        spirv.inst(e.b, ?e.b.functions, spirv.OP_COMPOSITE_CONSTRUCT, ?cw[0], 2 + lanes);
+    }
+    val width: u32 = mask_splat(e, ty, lanes, bits, 0);
+    if (e.b.err || c == 0 || width == 0) { ret emit_fail(e, "spirv.emit: unreadable count in vector shift"); }
+
+    val below: u32 = spirv.alloc_id(e.b);
+    var lw:    [4]u32;
+    lw[0] = bvec_ty;
+    lw[1] = below;
+    lw[2] = c;
+    lw[3] = width;
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_U_LESS_THAN, ?lw[0], 4);
+    val shifted: u32 = shift_words(e, op_code, ty, a, c);
+    val fill:    u32 = shift_fill(e, op_code, ty, lanes, bits, a);
+    if (fill == 0) { ret emit_fail(e, "spirv.emit: could not build a vector shift fill"); }
+    val result: u32 = spirv.alloc_id(e.b);
+    var sw:     [5]u32;
+    sw[0] = ty;
+    sw[1] = result;
+    sw[2] = below;
+    sw[3] = shifted;
+    sw[4] = fill;
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_SELECT, ?sw[0], 5);
+    ret store_vreg(e, vm, dst, result);
+}
+
+# what a lane shifted by its width or more answers: 0, or the sign fill
+fun shift_fill(e: *Emit, op_code: u32, ty: u32, lanes: u32, bits: u32, a: u32) u32 {
+    if (op_code != spirv.OP_SHIFT_RIGHT_ARITHMETIC) { ret mask_splat(e, ty, lanes, 0, 0); }
+    val top: u32 = mask_splat(e, ty, lanes, bits - 1, 0);
+    if (top == 0) { ret 0; }
+    ret shift_words(e, op_code, ty, a, top);
+}
+
+fun shift_words(e: *Emit, op_code: u32, ty: u32, a: u32, by: u32) u32 {
+    val result: u32 = spirv.alloc_id(e.b);
+    var words:  [4]u32;
+    words[0] = ty;
+    words[1] = result;
+    words[2] = a;
+    words[3] = by;
+    spirv.inst(e.b, ?e.b.functions, op_code, ?words[0], 4);
+    ret result;
 }
 
 fun emit_unary(e: *Emit, vm: *VMaps, mi: *mir.MirInstr, op_code: u32) err[fail.Fail] {

@@ -1,5 +1,26 @@
 # mach.lang.me.half
 
+scalar f16 as ordinary ir, written once and shared by every target (#3799).
+an f16 value is carried as its 16 bits in an i16. an operation the target
+declares in its half rows (isa.half_native) is its own instruction on those
+bits; every other one is the expansion here, which calls nothing, so no
+runtime symbol appears for a freestanding link to provide.
+
+arithmetic widens both operands exactly to binary64, computes there and
+narrows once. binary64 carries more than twice binary16's precision plus two
+bits, so that one rounding is the correctly rounded binary16 result, the rule
+comptime folds by. a target whose rows convert f16 to and from binary32
+computes in binary32 instead, which carries exactly that much (#3801). an
+arithmetic operand widens with a NaN kept as it is, signaling or quiet, so
+the binary64 unit picks and quiets the NaN as the target's half unit would.
+a conversion goes through binary64 the same way, and a comparison compares
+the widened values. widening and narrowing are integer code on the halves of
+the binary64 encoding: sign, exponent and significand extraction, round to
+nearest even, subnormals, overflow to infinity, and a converted NaN made by
+the target's NaN rule, as float.narrow_bits and float.widen_bits define them,
+so the expansion converts as the target's own half instructions would. every
+step is branch-free, a select being a mask
+
 ## rec Half
 
 ```mach

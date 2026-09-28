@@ -1,5 +1,16 @@
 # mach.lang.be.linker.thunk
 
+range-extension thunks: a direct branch whose target lies beyond the reach of
+its instruction is sent through a thunk the link places within reach of it,
+which forms the destination's address and jumps there (#3898). thunks sit in
+islands the link opens in the code, each at a point the code may be split,
+and one thunk serves every branch to its destination that reaches its island.
+
+the plan is made once the code's layout is otherwise final, in the code's own
+offsets, before any address the islands would move is used. an island shifts
+everything after it by a multiple of the code's alignment, so the plan finds
+every position after the islands by adding up the islands before it.
+
 ## rec ThunkPlan
 
 ```mach

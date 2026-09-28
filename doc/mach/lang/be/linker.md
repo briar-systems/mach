@@ -1,5 +1,37 @@
 # mach.lang.be.linker
 
+## fwd mach.lang.be.linker.mode.LinkMode
+
+```mach
+fwd mach.lang.be.linker.mode.LinkMode
+```
+
+forwards [`mach.lang.be.linker.mode.LinkMode`](linker/mode.md#def-linkmode)
+
+## fwd mach.lang.be.linker.mode.LINK_EXE
+
+```mach
+fwd mach.lang.be.linker.mode.LINK_EXE
+```
+
+forwards [`mach.lang.be.linker.mode.LINK_EXE`](linker/mode.md#val-link_exe)
+
+## fwd mach.lang.be.linker.mode.LINK_RELOCATABLE
+
+```mach
+fwd mach.lang.be.linker.mode.LINK_RELOCATABLE
+```
+
+forwards [`mach.lang.be.linker.mode.LINK_RELOCATABLE`](linker/mode.md#val-link_relocatable)
+
+## fwd mach.lang.be.linker.mode.LINK_SHARED
+
+```mach
+fwd mach.lang.be.linker.mode.LINK_SHARED
+```
+
+forwards [`mach.lang.be.linker.mode.LINK_SHARED`](linker/mode.md#val-link_shared)
+
 ## fun link
 
 ```mach

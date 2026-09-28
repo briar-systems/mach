@@ -1,5 +1,37 @@
 # mach.lang.me.ir
 
+## fwd id.BlockId
+
+```mach
+fwd id.BlockId
+```
+
+forwards [`mach.lang.me.ir.id.BlockId`](ir/id.md#def-blockid)
+
+## fwd id.InstructionId
+
+```mach
+fwd id.InstructionId
+```
+
+forwards [`mach.lang.me.ir.id.InstructionId`](ir/id.md#def-instructionid)
+
+## fwd id.BLOCK_NIL
+
+```mach
+fwd id.BLOCK_NIL
+```
+
+forwards [`mach.lang.me.ir.id.BLOCK_NIL`](ir/id.md#val-block_nil)
+
+## fwd id.INSTR_NIL
+
+```mach
+fwd id.INSTR_NIL
+```
+
+forwards [`mach.lang.me.ir.id.INSTR_NIL`](ir/id.md#val-instr_nil)
+
 ## val FN_FLAG_PUB
 
 ```mach
