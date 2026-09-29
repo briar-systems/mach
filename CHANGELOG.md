@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.7.1] - 2026-09-29
+
+### Fixed
+- A windows link resolves a COFF weak external whose only definition is its fallback, as zig's mingw `compiler_rt.lib` defines `strlen` and `memcmp`. A reference from another object to such a name keeps the fallback's section alive, where the dead-atom pass dropped it and the link refused `.weak.<name>.default` as an unattributed import, and an unreferenced weak external in the same member is no longer imported. A windows x86_64 link of mach-glfw and mach-audio together links again (#4251).
+
 ## [6.7.0] - 2026-09-28
 
 ### Added
