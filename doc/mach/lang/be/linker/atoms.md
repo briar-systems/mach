@@ -123,6 +123,17 @@ whether a live relocation still names symbol_name; a reference from debug
 information describes code rather than needing the symbol, so it never
 counts, except an unwind entry's personality, which the unwinder calls
 
+## fun symbol_reference_live
+
+```mach
+pub fun symbol_reference_live(modules: *of.ObjectImage, module_count: u32,
+symbol_name: intern.StrId, sec_base: *u32,
+atoms: *AtomPlan) bool;
+```
+
+whether a live relocation names symbol_name, a name nothing relocates
+counting as unreferenced
+
 ## fun has_function_branch_reloc
 
 ```mach
