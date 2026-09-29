@@ -45,6 +45,17 @@ pub fun reloc_ref_cmp(a: *AtomRelocRef, b: *AtomRelocRef) i64;
 pub fun reloc_ref_lower(refs: *AtomRelocRef, count: u32, section: u32) u32;
 ```
 
+## fun add_fallback_winners
+
+```mach
+pub fun add_fallback_winners(modules: *of.ObjectImage, module_count: u32,
+winners: *map.Map[intern.StrId, AtomWinner]) err[fail.Fail];
+```
+
+a name no object defines binds to the fallback of the first COFF weak
+external naming it, as the address resolution binds it, so that weak
+external stands as the name's winner
+
 ## fun resolve_reference
 
 ```mach
@@ -54,7 +65,7 @@ winners: *map.Map[intern.StrId, AtomWinner], out: *AtomWinner) bool;
 
 the definition a reference to symbol sy of module m binds to: a local
 definition binds to itself, a global name to its link-wide winner, and an
-unresolved COFF weak external to its fallback
+unresolved COFF weak external, in whichever object it stands, to its fallback
 
 ## fun build_reloc_refs
 
