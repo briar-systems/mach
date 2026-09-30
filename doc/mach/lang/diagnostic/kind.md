@@ -3033,16 +3033,28 @@ pub val SELECTION_NO_HOST_TARGET:         Kind = 497
 pub val TARGET_DEFAULT_DEPRECATED:        Kind = 498
 ```
 
+## val READ_WRITEONLY_STORAGE
+
+```mach
+pub val READ_WRITEONLY_STORAGE:           Kind = 499
+```
+
+## val SPIRV_WRITEONLY_LOAD
+
+```mach
+pub val SPIRV_WRITEONLY_LOAD:             Kind = 500
+```
+
 ## val OP_SIGNATURE
 
 ```mach
-pub val OP_SIGNATURE:                     Kind = 499
+pub val OP_SIGNATURE:                     Kind = 501
 ```
 
 ## val OP_OPERAND_NOT_CONSTANT
 
 ```mach
-pub val OP_OPERAND_NOT_CONSTANT:          Kind = 500
+pub val OP_OPERAND_NOT_CONSTANT:          Kind = 502
 ```
 
 ## rec Spec
@@ -3062,7 +3074,7 @@ retired: nothing raises the kind any more; the row stays so its key is
 ## val COUNT
 
 ```mach
-pub val COUNT: usize       = 500
+pub val COUNT: usize       = 502
 ```
 
 ## fun at
