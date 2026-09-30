@@ -161,6 +161,12 @@ pub val IFACE_STORAGE: u8 = 5
 pub val IFACE_SAMPLER: u8 = 6
 ```
 
+## val IFACE_SHARED
+
+```mach
+pub val IFACE_SHARED:  u8 = 7
+```
+
 ## val IFACE_FLAG_READONLY
 
 ```mach
