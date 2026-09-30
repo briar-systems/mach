@@ -203,6 +203,17 @@ pub fun error_recover_advance(p: *Parser, k: dkind.Kind, message: str);
 pub fun error_at(p: *Parser, k: dkind.Kind, span: token.Span, message: str);
 ```
 
+## fun error_naming
+
+```mach
+pub fun error_naming(p: *Parser, k: dkind.Kind, span: token.Span, fmt: str, name: token.Span);
+```
+
+an error at `span` whose text fills the one `{}` of `fmt` with the source
+text of `name`. it leaves panic alone, so the reading goes on where it
+stands. the text is released once the store holds its own copy, so it is
+never buffered: a caller reads outside every deciding walk
+
 ## fun fatal_oom_at
 
 ```mach
