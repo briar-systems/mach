@@ -1212,7 +1212,18 @@ compiler treats it:
   constant once the pipeline exists, so there is nothing to write. Copy it into a
   local to change the value. Handing its address to a function counts as a store.
 
-The type must be a scalar integer or float. On `spirv` each one becomes an
+The type must be a scalar integer or float. There is no boolean specialization
+constant, because mach has no boolean type the compiler knows: `bool` is an alias
+of `u8`. Write a flag as an integer spec var, which the host sets with the same 4
+bytes as a `VkBool32`:
+
+```mach
+#[spec(3)]
+var use_fog: u32 = 1;
+```
+
+A narrower integer such as `u8` works too, but it needs the capability for its
+width like any other `u8` in a shader. On `spirv` each one becomes an
 `OpSpecConstant` whose literal is the initializer, decorated with `SpecId`, and a
 read uses that constant directly with no load. Two `#[spec]` vars with one id in
 the same module are refused, since the host names the constant by its id. On a
