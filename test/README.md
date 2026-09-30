@@ -36,7 +36,7 @@ bash test/run.sh --link [--qemu]          # the link cases instead of the corpus
 bash test/run.sh --incremental            # warm rebuilds of the compiler and a manifest fixture match clean builds
 bash test/run.sh --docs [--case <page>]   # the mach code blocks of doc/language compile, are fmt-canonical, and the ones with a main run
 bash test/run.sh --docs --target <t>      # the same blocks compiled for one other hosted target, run only natively
-bash test/run.sh --f16proof [--qemu] [--shard <i>/<n>]   # every f16 operation against a correctly rounded reference (hours; CI heavy=f16proof)
+bash test/run.sh --f16proof [--qemu] [--shard <i>/<n>]   # every f16 operation against a correctly rounded reference (hours; in CI only on dispatch with lane=f16proof)
 ```
 
 `MACH` names the compiler under test; the default is the checkout's

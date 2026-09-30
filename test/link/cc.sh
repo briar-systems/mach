@@ -154,7 +154,7 @@ case "$MACH_TARGET_OS-$MACH_TARGET_ISA" in
     # either compiles against riscv64's own headers or fails naming the one it
     # wanted. The path is MACH_RISCV64_SYSROOT, which the qemu loader prefix in
     # link cases reads too, defaulting to where Ubuntu's `libc6-dev-riscv64-cross`
-    # installs, which ci.yml installs on this leg. Absent, the build stops here
+    # installs. CI never runs this leg. Absent, the build stops here
     # naming the variable rather than falling back to the host's headers, which is
     # exactly the silent wrong-headers outcome this exists to prevent.
     linux-riscv64)
