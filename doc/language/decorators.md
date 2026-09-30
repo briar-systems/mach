@@ -1206,7 +1206,8 @@ requires an `OpSampledImage` result be consumed in the block that produced it,
 which is the same rule that makes a handle-typed local a compile error.
 
 `shared` declares **workgroup memory**: one instance per workgroup of a compute
-stage, which every invocation of that workgroup reads and writes. It takes no
+stage, which every invocation of that workgroup reads and writes. It applies to a
+`var` only, since a `val` of workgroup memory could only ever read zero. It takes no
 arguments, and the variable has no descriptor and no location, because the pipeline
 never binds it.
 
