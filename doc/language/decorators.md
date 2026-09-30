@@ -52,6 +52,7 @@ A decorator is written as an attribute:
 #[storage(set, bnd)] # descriptor-bound storage buffer, read-write (global only)
 #[storage(set, bnd, "readonly")] # the same buffer, with writes refused
 #[sampler(set, bnd)] # descriptor-bound image / sampler handle (global only)
+#[shared]            # compute workgroup memory, zero when a stage starts (global only)
 #[op(tgt,set,name)]   # the target instruction this function is (bodyless fun only)
 #[handle(tgt,ctor,..)] # the target type this declares (bodyless def only)
 #[abi_type("name")]   # a C type whose layout the target declares (bodyless def only)
@@ -979,7 +980,7 @@ stage takes the single-invocation default `(1, 1, 1)`; the dimensions are always
 declared in the emitted module, since a compute stage that does not state its
 workgroup size is not one a consumer can dispatch.
 
-### `input(n)` / `output(n)` / `builtin(str)` / `uniform(set, binding)` / `storage(set, binding)` / `sampler(set, binding)` — shader interface
+### `input(n)` / `output(n)` / `builtin(str)` / `uniform(set, binding)` / `storage(set, binding)` / `sampler(set, binding)` / `shared` — shader interface
 
 A pipeline stage does not receive its inputs or return its results through a call.
 It reads and writes **module-scope variables** that the pipeline binds, and these
@@ -1113,13 +1114,51 @@ The combined value is handed straight to the sample rather than named: SPIR-V
 requires an `OpSampledImage` result be consumed in the block that produced it,
 which is the same rule that makes a handle-typed local a compile error.
 
+`shared` declares **workgroup memory**: one instance per workgroup of a compute
+stage, which every invocation of that workgroup reads and writes. It takes no
+arguments, and the variable has no descriptor and no location, because the pipeline
+never binds it.
+
+```mach fragment
+#[builtin("local_invocation")] var local_id: u32x3;
+#[shared] var tile: [256]f32;
+
+#[stage("compute")]
+#[workgroup(64, 1, 1)]
+fun blur() { tile[local_id[0]] = 1.0; }
+```
+
+Workgroup memory exists only in a compute stage, so a `#[shared]` variable used from
+a vertex or fragment stage, directly or through a function the stage calls, is a
+compile error naming the stage.
+
+A `#[shared]` variable is **zero** when a compute stage starts, as every mach
+variable is, on every environment. How depends on the environment:
+
+- Where workgroup memory is zero-initialized by the consumer, the variable carries an
+  `OpConstantNull` initializer. `vulkan1.3` guarantees that
+  (`shaderZeroInitializeWorkgroupMemory` is core there), and a target that selects the
+  `zero_init_workgroup` extension declares it for an earlier version (see
+  [manifest.md](manifest.md#instruction-set-extensions)). The consumer then has to
+  enable the feature (`VK_KHR_zero_initialize_workgroup_memory`).
+- Otherwise the compiler zeroes it itself, at the start of each compute stage that uses
+  it. Each invocation stores zero to its own slice, the elements of an array its local
+  invocation index reaches in steps of the workgroup size and the whole of any other
+  type for invocation 0, and then the stage executes one workgroup `OpControlBarrier`.
+  The barrier precedes all of the stage's own code, so every invocation reaches it.
+
+Because the value on entry is always zero, a `#[shared]` variable cannot have an
+initializer. Assign it inside the stage.
+
 As with `#[stage(...)]`, these are accepted on every target and acted on only by a
 target that forms pipeline stages. On `spirv` each becomes an `OpVariable` in the
 matching storage class, carrying the matching decoration, and the Input and Output
 variables are named in every entry point's interface list. A `sampler` binding
 becomes an `OpVariable` in the `UniformConstant` class — the one class Vulkan
 permits an image, sampler or sampled-image variable in — carrying `DescriptorSet`
-and `Binding` exactly as a `uniform` does.
+and `Binding` exactly as a `uniform` does. A `shared` variable becomes an
+`OpVariable` in the `Workgroup` class, named in the interface of each entry point that
+uses it from SPIR-V 1.4.
 
 ### `handle(target, constructor, operands...)` — a type the target mints
 
