@@ -1008,18 +1008,18 @@ stage's outputs line up with the next stage's inputs: the producer's
 `builtin` names a value the pipeline supplies or consumes instead of one a
 location carries. The accepted set is closed:
 
-| Value                      | Meaning                                | Type    | Direction |
-|----------------------------|----------------------------------------|---------|-----------|
-| `"position"`               | clip-space vertex position             | `f32x4` | written   |
-| `"point_size"`             | rasterized point size                  | `f32`   | written   |
-| `"vertex_index"`           | index of the current vertex            | `u32`   | read      |
-| `"instance_index"`         | index of the current instance          | `u32`   | read      |
-| `"frag_coord"`             | fragment window coordinate             | `f32x4` | read      |
-| `"global_invocation"`      | compute global invocation id           | `u32x3` | read      |
-| `"local_invocation"`       | compute local invocation id            | `u32x3` | read      |
-| `"workgroup_id"`           | compute workgroup id                   | `u32x3` | read      |
-| `"num_workgroups"`         | compute workgroup count of a dispatch  | `u32x3` | read      |
-| `"local_invocation_index"` | compute local invocation id, flattened | `u32`   | read      |
+| Value                      | Meaning                                | Type    | Direction | Stage    |
+|----------------------------|----------------------------------------|---------|-----------|----------|
+| `"position"`               | clip-space vertex position             | `f32x4` | written   | vertex   |
+| `"point_size"`             | rasterized point size                  | `f32`   | written   | vertex   |
+| `"vertex_index"`           | index of the current vertex            | `u32`   | read      | vertex   |
+| `"instance_index"`         | index of the current instance          | `u32`   | read      | vertex   |
+| `"frag_coord"`             | fragment window coordinate             | `f32x4` | read      | fragment |
+| `"global_invocation"`      | compute global invocation id           | `u32x3` | read      | compute  |
+| `"local_invocation"`       | compute local invocation id            | `u32x3` | read      | compute  |
+| `"workgroup_id"`           | compute workgroup id                   | `u32x3` | read      | compute  |
+| `"num_workgroups"`         | compute workgroup count of a dispatch  | `u32x3` | read      | compute  |
+| `"local_invocation_index"` | compute local invocation id, flattened | `u32`   | read      | compute  |
 
 The direction is a property of the built-in, not something you restate — a stage
 writes its position and reads what the pipeline hands it — so there is no
@@ -1032,10 +1032,13 @@ other type is a compile error naming both the declared type and the required one
 The scalar integer rows accept `i32` as well as `u32`, because the compiler carries
 an integer's width and not its sign and the emitted type is sign-less either way.
 
-The five compute rows exist only in a compute stage. The pipeline supplies them to
-the `GLCompute` execution model alone, so a vertex or fragment stage that reads one,
-directly or through a function it calls, is a compile error naming the built-in and
-the stage.
+The **stage** is a property of the built-in as well. Each row exists in one stage
+only, in its direction: the pipeline supplies an input built-in to that execution
+model alone and consumes an output one from it alone, so `position` and
+`point_size` are a vertex stage's outputs, `frag_coord` is a fragment stage's
+input, and the five compute rows are the `GLCompute` execution model's. A stage
+that uses a built-in outside its row, directly or through a function it calls, is
+a compile error naming the built-in and both stages.
 
 `uniform` binds a read-only block by descriptor set and binding. Its type **must
 be a `rec`**: a uniform is a block with a host-visible layout, and a bare scalar
