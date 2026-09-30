@@ -1362,43 +1362,49 @@ pub def OpOperandKind: u8
 
 how one operand of an `#[op]` instruction is written: an ordinary value id, an
 id that must be an integer constant by emission, a literal word inline, or a
-pointer whose storage class the call site's access chain decides, read only
-or possibly written through
+pointer whose storage class the call site's access chain decides, which the
+instruction only reads through, only stores through, or reads and writes
 
 ## val OP_OPERAND_VALUE
 
 ```mach
-pub val OP_OPERAND_VALUE:         OpOperandKind = 0
+pub val OP_OPERAND_VALUE:          OpOperandKind = 0
 ```
 
 ## val OP_OPERAND_CONSTANT
 
 ```mach
-pub val OP_OPERAND_CONSTANT:      OpOperandKind = 1
+pub val OP_OPERAND_CONSTANT:       OpOperandKind = 1
 ```
 
 ## val OP_OPERAND_LITERAL
 
 ```mach
-pub val OP_OPERAND_LITERAL:       OpOperandKind = 2
+pub val OP_OPERAND_LITERAL:        OpOperandKind = 2
 ```
 
 ## val OP_OPERAND_POINTER_READ
 
 ```mach
-pub val OP_OPERAND_POINTER_READ:  OpOperandKind = 3
+pub val OP_OPERAND_POINTER_READ:   OpOperandKind = 3
 ```
 
 ## val OP_OPERAND_POINTER_WRITE
 
 ```mach
-pub val OP_OPERAND_POINTER_WRITE: OpOperandKind = 4
+pub val OP_OPERAND_POINTER_WRITE:  OpOperandKind = 4
+```
+
+## val OP_OPERAND_POINTER_UPDATE
+
+```mach
+pub val OP_OPERAND_POINTER_UPDATE: OpOperandKind = 5
 ```
 
 ## val OP_OPERAND_KIND_COUNT
 
 ```mach
-pub val OP_OPERAND_KIND_COUNT:    OpOperandKind = 5
+pub val OP_OPERAND_KIND_COUNT:     OpOperandKind = 6
 ```
 
 ## def OpResult
@@ -1498,9 +1504,9 @@ result: OpResult, result_space: u32, signature: str) OpDef;
 ```
 
 a row spelled by its operand signature, one letter per operand in order: `v` a
-value, `c` a constant id, `l` a literal word, `r` a pointer read through, `w` a
-pointer written through. a letter outside the set is an invalid kind, which
-registration refuses
+value, `c` a constant id, `l` a literal word, `r` a pointer only read through, `w`
+a pointer only stored through, `u` a pointer read and written (read-modify-write).
+a letter outside the set is an invalid kind, which registration refuses
 
 ## fun op_operand_kind
 

@@ -614,6 +614,12 @@ pub val OP_CONTROL_BARRIER:           u32 = 224
 pub val OP_ATOMIC_LOAD:               u32 = 227
 ```
 
+## val OP_ATOMIC_STORE
+
+```mach
+pub val OP_ATOMIC_STORE:              u32 = 228
+```
+
 ## val OP_ATOMIC_I_ADD
 
 ```mach
