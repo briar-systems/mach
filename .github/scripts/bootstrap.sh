@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# installs the pinned seed release with dist/ and builds this compiler from it:
-# the seed builds a, a builds b, and --fixpoint adds c and requires b == c.
-# the last stage is exported to later steps as MACH.
+# installs the pinned seed release with dist/ and builds this compiler from it,
+# in release unless --profile says otherwise: the seed builds a, a builds b, and
+# --fixpoint adds c and requires b == c. the last stage is exported as MACH.
 #
 # usage: bootstrap.sh [--fixpoint] [--profile <name>]
 set -euo pipefail
@@ -9,7 +9,7 @@ set -euo pipefail
 seed=6.2.1
 
 fixpoint=0
-profile=debug
+profile=release
 while [ $# -gt 0 ]; do
     case "$1" in
         --fixpoint) fixpoint=1 ;;
