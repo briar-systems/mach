@@ -170,7 +170,19 @@ pub val IFACE_PUSH:    u8 = 7
 ## val IFACE_FLAG_READONLY
 
 ```mach
-pub val IFACE_FLAG_READONLY: u32 = 1
+pub val IFACE_FLAG_READONLY:  u32 = 1
+```
+
+## val IFACE_FLAG_WRITEONLY
+
+```mach
+pub val IFACE_FLAG_WRITEONLY: u32 = 2
+```
+
+## val IFACE_FLAG_COHERENT
+
+```mach
+pub val IFACE_FLAG_COHERENT:  u32 = 4
 ```
 
 ## val BUILTIN_POSITION
