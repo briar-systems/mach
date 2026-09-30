@@ -4,6 +4,9 @@
 # MACH_VERSION      version to install (e.g. 1.2.3); defaults to the latest release
 # MACH_INSTALL_DIR  install directory; set to skip the prompt; defaults to ~/.local/bin
 # MACH_BASE_URL     release base url override (for testing)
+#
+# the archive is verified against the release's SHA256SUMS before it is
+# extracted; a mismatch or a missing entry installs nothing
 
 set -eu
 
@@ -77,6 +80,19 @@ EOF
 
     printf '\ndownloading %s...\n' "$archive"
     curl -fsSL -o "$tmp/$archive" "$base/download/$tag/$archive"
+    curl -fsSL -o "$tmp/SHA256SUMS" "$base/download/$tag/SHA256SUMS" || err "could not download SHA256SUMS for $tag"
+
+    printf 'verifying %s...\n' "$archive"
+    want="$(awk -v f="$archive" '$2 == f || $2 == "*" f { print $1; exit }' "$tmp/SHA256SUMS")"
+    [ -n "$want" ] || err "SHA256SUMS for $tag has no entry for $archive"
+    if command -v sha256sum >/dev/null; then
+        got="$(sha256sum "$tmp/$archive" | awk '{ print $1 }')"
+    elif command -v shasum >/dev/null; then
+        got="$(shasum -a 256 "$tmp/$archive" | awk '{ print $1 }')"
+    else
+        err "sha256sum or shasum is required to verify $archive"
+    fi
+    [ "$got" = "$want" ] || err "checksum mismatch for $archive: SHA256SUMS lists $want, the download is $got"
 
     printf 'extracting %s...\n' "$archive"
     tar -xzf "$tmp/$archive" -C "$tmp" mach

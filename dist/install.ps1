@@ -3,6 +3,9 @@
 # MACH_VERSION      version to install (e.g. 1.2.3); defaults to the latest release
 # MACH_INSTALL_DIR  install directory; set to skip the prompt; defaults to $env:LOCALAPPDATA\mach\bin
 # MACH_BASE_URL     release base url override (for testing)
+#
+# the archive is verified against the release's SHA256SUMS before it is
+# extracted; a mismatch or a missing entry installs nothing
 
 $ErrorActionPreference = 'Stop'
 
@@ -81,7 +84,18 @@ try {
     & {
         $ProgressPreference = 'SilentlyContinue'
         Invoke-WebRequest -UseBasicParsing -Uri "$base/download/$tag/$archive" -OutFile (Join-Path $tmp $archive)
+        Invoke-WebRequest -UseBasicParsing -Uri "$base/download/$tag/SHA256SUMS" -OutFile (Join-Path $tmp 'SHA256SUMS')
     }
+
+    Write-Host "verifying $archive..."
+    $want = $null
+    foreach ($line in Get-Content (Join-Path $tmp 'SHA256SUMS')) {
+        $fields = $line.Trim() -split '\s+', 2
+        if ($fields.Count -eq 2 -and $fields[1].TrimStart('*') -eq $archive) { $want = $fields[0].ToLowerInvariant(); break }
+    }
+    if (-not $want) { throw "install.ps1: SHA256SUMS for $tag has no entry for $archive" }
+    $got = (Get-FileHash -Algorithm SHA256 -Path (Join-Path $tmp $archive)).Hash.ToLowerInvariant()
+    if ($got -ne $want) { throw "install.ps1: checksum mismatch for ${archive}: SHA256SUMS lists $want, the download is $got" }
 
     Write-Host "extracting $archive..."
     Expand-Archive -Path (Join-Path $tmp $archive) -DestinationPath $tmp -Force
