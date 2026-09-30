@@ -20,6 +20,12 @@ the one section a SPIR-V object image carries: the finished module
 pub val SPV_VERSION_1_0: u32 = 0x00010000
 ```
 
+## val SPV_VERSION_1_2
+
+```mach
+pub val SPV_VERSION_1_2: u32 = 0x00010200
+```
+
 ## val SPV_VERSION_1_3
 
 ```mach
@@ -128,6 +134,12 @@ pub val OP_ENTRY_POINT:               u32 = 15
 pub val OP_EXECUTION_MODE:            u32 = 16
 ```
 
+## val OP_EXECUTION_MODE_ID
+
+```mach
+pub val OP_EXECUTION_MODE_ID:         u32 = 331
+```
+
 ## val OP_CAPABILITY
 
 ```mach
@@ -234,6 +246,30 @@ pub val OP_CONSTANT_COMPOSITE:        u32 = 44
 
 ```mach
 pub val OP_CONSTANT_NULL:             u32 = 46
+```
+
+## val OP_SPEC_CONSTANT_TRUE
+
+```mach
+pub val OP_SPEC_CONSTANT_TRUE:        u32 = 48
+```
+
+## val OP_SPEC_CONSTANT_FALSE
+
+```mach
+pub val OP_SPEC_CONSTANT_FALSE:       u32 = 49
+```
+
+## val OP_SPEC_CONSTANT
+
+```mach
+pub val OP_SPEC_CONSTANT:             u32 = 50
+```
+
+## val OP_SPEC_CONSTANT_COMPOSITE
+
+```mach
+pub val OP_SPEC_CONSTANT_COMPOSITE:   u32 = 51
 ```
 
 ## val OP_FUNCTION
@@ -842,6 +878,12 @@ pub val EXEC_MODE_ORIGIN_UPPER_LEFT: u32 = 7
 pub val EXEC_MODE_LOCAL_SIZE:        u32 = 17
 ```
 
+## val EXEC_MODE_LOCAL_SIZE_ID
+
+```mach
+pub val EXEC_MODE_LOCAL_SIZE_ID:     u32 = 38
+```
+
 ## val ADDRESSING_LOGICAL
 
 ```mach
@@ -974,6 +1016,12 @@ pub val DECOR_NON_WRITABLE: u32 = 24
 pub val DECOR_FLAT: u32 = 14
 ```
 
+## val DECOR_SPEC_ID
+
+```mach
+pub val DECOR_SPEC_ID: u32 = 1
+```
+
 ## val BUILTIN_POSITION
 
 ```mach
@@ -990,6 +1038,12 @@ pub val BUILTIN_POINT_SIZE:           u32 = 1
 
 ```mach
 pub val BUILTIN_FRAG_COORD:           u32 = 15
+```
+
+## val BUILTIN_WORKGROUP_SIZE
+
+```mach
+pub val BUILTIN_WORKGROUP_SIZE:       u32 = 25
 ```
 
 ## val BUILTIN_WORKGROUP_ID
