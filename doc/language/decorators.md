@@ -1374,11 +1374,12 @@ pub fun dot(a: f32x4, b: f32x4) f32;
 
 The first argument names the **target**, the second the instruction set, and the
 third the instruction within it. The target is the ISA name the manifest selects
-with, so nothing about this directive is specific to one back end. All three value
-sets are closed and checked at compile time, on **every** target: the directive is
-legal everywhere, so a typo caught only where it is acted on would go unreported on
-a CPU build. The parameter count is checked against the instruction's own operand
-count, which is not uniform across a family that looks it.
+with, so nothing about this directive is specific to one back end. The arguments
+must be strings on every target, but the instruction set and name are checked only
+when the named target is the one selected: a declaration for any other target is
+inert, and that target's table is not consulted. When it is checked, the parameter
+count is held to the instruction's own operand count, which is not uniform across a
+family that looks it.
 
 | Set              | Meaning                                                     |
 |------------------|-------------------------------------------------------------|
@@ -1390,6 +1391,43 @@ function's declared return type** and its **operands are the function's paramete
 in declaration order**. That is what lets `dot` and `length` return a scalar from
 vectors, and `refract` mix a scalar operand with vector ones, without any of them
 being a special case.
+
+Each instruction's row in the target's table also says **how each operand is
+written** and **whether the instruction has a result**, and when the target is
+selected the declaration's types are checked against both:
+
+| Kind            | The operand is                                              | Parameter type |
+|-----------------|-------------------------------------------------------------|----------------|
+| value           | an ordinary id, the argument's value                        | not a pointer  |
+| constant id     | an id that must be an integer constant by emission, such as a `Scope` or `MemorySemantics` | an integer |
+| literal         | a constant written inline as a literal word, such as an image-operands mask | an integer |
+| pointer read    | the argument's address, only read through                   | a pointer      |
+| pointer write   | the argument's address, only stored through                 | a pointer      |
+| pointer update  | the argument's address, read and written (read-modify-write) | a pointer     |
+
+A **pointer operand takes its storage class from the call site**: the argument's
+own access chain decides whether it points into a storage buffer, workgroup memory,
+a function-local object or an image, since an `op` has no body and so no boundary at
+which its parameter's pointer could be given one. Any access chain is accepted, a
+member or element as well as a whole object. The kinds are also what the
+`"readonly"` and `"writeonly"` qualifiers of a `storage` binding are checked
+against: an atomic load through a `readonly` binding is accepted and an atomic add
+on it is refused, and an atomic store into a `writeonly` binding is accepted and an
+atomic load from it is refused.
+
+A non-constant argument to a constant id or a literal is refused at the call,
+naming the operand. A row **without a result** is declared with no return type,
+and a row with one must return it. A row may also **return a pointer** into a
+storage class the row itself declares, as `OpImageTexelPointer` returns an `Image`
+pointer, and that result is accepted as a later instruction's pointer operand.
+
+```mach
+#[op("spirv", "core", "OpControlBarrier")]
+pub fun barrier(execution: u32, memory: u32, semantics: u32);
+
+#[op("spirv", "core", "OpAtomicIAdd")]
+pub fun atomic_add(p: *u32, scope: u32, semantics: u32, v: u32) u32;
+```
 
 `OpExtInstImport "GLSL.std.450"` is emitted **once per module and only when that
 module uses the set**. A module that calls none of these carries no import.
@@ -1406,9 +1444,9 @@ part, not a property of the directive: a decorated function may have a body, and
 it does, that body is what every non-`spirv` target runs while `spirv` substitutes
 the instruction. A `spirv` build never emits the body at all.
 
-The set of accepted instruction names is a table in `mach.lang.spirvop`, which also
-records why each omission from GLSL.std.450 is one. Adding an instruction is a row
-in it.
+The set of accepted instructions is the table in
+`src/lang/target/isa/spirv/defs.mach`, where each row carries its operand kinds and
+its result. Adding an instruction is a row in it.
 
 ## Applicability
 

@@ -1354,6 +1354,98 @@ pub rec ModuleEmitter;
 pub def RelocSeam: of.RelocationCapabilities
 ```
 
+## def OpOperandKind
+
+```mach
+pub def OpOperandKind: u8
+```
+
+how one operand of an `#[op]` instruction is written: an ordinary value id, an
+id that must be an integer constant by emission, a literal word inline, or a
+pointer whose storage class the call site's access chain decides, which the
+instruction only reads through, only stores through, or reads and writes
+
+## val OP_OPERAND_VALUE
+
+```mach
+pub val OP_OPERAND_VALUE:          OpOperandKind = 0
+```
+
+## val OP_OPERAND_CONSTANT
+
+```mach
+pub val OP_OPERAND_CONSTANT:       OpOperandKind = 1
+```
+
+## val OP_OPERAND_LITERAL
+
+```mach
+pub val OP_OPERAND_LITERAL:        OpOperandKind = 2
+```
+
+## val OP_OPERAND_POINTER_READ
+
+```mach
+pub val OP_OPERAND_POINTER_READ:   OpOperandKind = 3
+```
+
+## val OP_OPERAND_POINTER_WRITE
+
+```mach
+pub val OP_OPERAND_POINTER_WRITE:  OpOperandKind = 4
+```
+
+## val OP_OPERAND_POINTER_UPDATE
+
+```mach
+pub val OP_OPERAND_POINTER_UPDATE: OpOperandKind = 5
+```
+
+## val OP_OPERAND_KIND_COUNT
+
+```mach
+pub val OP_OPERAND_KIND_COUNT:     OpOperandKind = 6
+```
+
+## def OpResult
+
+```mach
+pub def OpResult: u8
+```
+
+whether an `#[op]` instruction has a result id, and whether that result is a
+pointer into the space the row declares
+
+## val OP_RESULT_VALUE
+
+```mach
+pub val OP_RESULT_VALUE:   OpResult = 0
+```
+
+## val OP_RESULT_NONE
+
+```mach
+pub val OP_RESULT_NONE:    OpResult = 1
+```
+
+## val OP_RESULT_POINTER
+
+```mach
+pub val OP_RESULT_POINTER: OpResult = 2
+```
+
+## val OP_MAX_OPERANDS
+
+```mach
+pub val OP_MAX_OPERANDS: u32 = 16
+```
+
+## val NO_OP_SPACE
+
+```mach
+pub val NO_OP_SPACE: u32 = 0xFFFFFFFF
+```
+
 ## rec OpDef
 
 ```mach
@@ -1400,6 +1492,46 @@ pub val NO_OP_SET: u32 = definition.NO_OP_SET
 
 ```mach
 pub fun op_def(set: str, name: str, set_tag: u32, opcode: u32, arity: u32) OpDef;
+```
+
+a row whose every operand is a value and whose result is a value
+
+## fun op_def_shaped
+
+```mach
+pub fun op_def_shaped(set: str, name: str, set_tag: u32, opcode: u32,
+result: OpResult, result_space: u32, signature: str) OpDef;
+```
+
+a row spelled by its operand signature, one letter per operand in order: `v` a
+value, `c` a constant id, `l` a literal word, `r` a pointer only read through, `w`
+a pointer only stored through, `u` a pointer read and written (read-modify-write).
+a letter outside the set is an invalid kind, which registration refuses
+
+## fun op_operand_kind
+
+```mach
+pub fun op_operand_kind(d: *OpDef, i: u32) OpOperandKind;
+```
+
+## fun op_kind_is_pointer
+
+```mach
+pub fun op_kind_is_pointer(k: OpOperandKind) bool;
+```
+
+## fun op_def_shape_refusal
+
+```mach
+pub fun op_def_shape_refusal(d: *OpDef) str;
+```
+
+the reason a row's shape is malformed, nil when it is well formed
+
+## fun op_def_by_code
+
+```mach
+pub fun op_def_by_code(defs: *TargetDefs, set_tag: u32, opcode: u32) *OpDef;
 ```
 
 ## fun type_def
