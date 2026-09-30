@@ -143,8 +143,9 @@ chore: update dependencies
   commits when `dev` is released to `main`.
 - Say briefly what changed and which tests you ran. Every pull request runs
   the same CI lanes on the linux runners. The windows, darwin and slow lanes
-  run on a release tag, or on any ref when the CI workflow is dispatched with a
-  `lane`, which is worth doing before a windows or darwin change reaches `dev`.
+  run when the CI workflow is dispatched with a `lane`, which is worth doing
+  before a windows or darwin change reaches `dev`, and `lane=all` runs green on
+  `dev` before every release.
 - Merge with a merge commit. Never rebase or fast-forward.
 - When the target is not the default branch, close the linked issue by hand
   after the merge.
@@ -160,7 +161,7 @@ File issues through the templates. Issues use an orthogonal, faceted tagging sys
 - Severity and state: `critical`, `blocked`, `security`
 - Discussion: `discussion` (design proposals, RFCs, and open debates)
 
-Tags mix and match across sets (for example, `patch`, `fix`, `tooling`). When opening an issue, select the applicable tags in the sidebar. Milestones record where an issue stands in the current plan and change freely, so the list on GitHub is the reference. There are three: `active` is the current slice, in flight or queued next, `deferred` is planned for after it, and `parked` is deliberately set aside until something changes. An issue with no milestone is backlog. An issue moves to `active` when work on it starts. `blocked` is a tag that records state, never a milestone. Themes are epic issues with native sub-issues. SemVer impact comes from the `major`, `minor` and `patch` tags, never from a milestone.
+Tags mix and match across sets (for example, `patch`, `fix`, `tooling`). When opening an issue, select the applicable tags in the sidebar. There are no milestones. Work in flight is an open draft pull request, `parked` marks an issue deliberately set aside until something changes, and every other open issue is backlog. `blocked` is a tag that records state. Themes are epic issues with native sub-issues. SemVer impact comes from the `major`, `minor` and `patch` tags, never from a milestone.
 
 
 ## Versioning
