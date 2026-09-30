@@ -983,49 +983,61 @@ pub val DECOR_FLAT: u32 = 14
 ## val BUILTIN_POSITION
 
 ```mach
-pub val BUILTIN_POSITION:             u32 = 0
+pub val BUILTIN_POSITION:               u32 = 0
 ```
 
 ## val BUILTIN_POINT_SIZE
 
 ```mach
-pub val BUILTIN_POINT_SIZE:           u32 = 1
+pub val BUILTIN_POINT_SIZE:             u32 = 1
 ```
 
 ## val BUILTIN_FRAG_COORD
 
 ```mach
-pub val BUILTIN_FRAG_COORD:           u32 = 15
+pub val BUILTIN_FRAG_COORD:             u32 = 15
+```
+
+## val BUILTIN_NUM_WORKGROUPS
+
+```mach
+pub val BUILTIN_NUM_WORKGROUPS:         u32 = 24
 ```
 
 ## val BUILTIN_WORKGROUP_ID
 
 ```mach
-pub val BUILTIN_WORKGROUP_ID:         u32 = 26
+pub val BUILTIN_WORKGROUP_ID:           u32 = 26
 ```
 
 ## val BUILTIN_LOCAL_INVOCATION_ID
 
 ```mach
-pub val BUILTIN_LOCAL_INVOCATION_ID:  u32 = 27
+pub val BUILTIN_LOCAL_INVOCATION_ID:    u32 = 27
 ```
 
 ## val BUILTIN_GLOBAL_INVOCATION_ID
 
 ```mach
-pub val BUILTIN_GLOBAL_INVOCATION_ID: u32 = 28
+pub val BUILTIN_GLOBAL_INVOCATION_ID:   u32 = 28
+```
+
+## val BUILTIN_LOCAL_INVOCATION_INDEX
+
+```mach
+pub val BUILTIN_LOCAL_INVOCATION_INDEX: u32 = 29
 ```
 
 ## val BUILTIN_VERTEX_INDEX
 
 ```mach
-pub val BUILTIN_VERTEX_INDEX:         u32 = 42
+pub val BUILTIN_VERTEX_INDEX:           u32 = 42
 ```
 
 ## val BUILTIN_INSTANCE_INDEX
 
 ```mach
-pub val BUILTIN_INSTANCE_INDEX:       u32 = 43
+pub val BUILTIN_INSTANCE_INDEX:         u32 = 43
 ```
 
 ## val DECOR_LINKAGE_ATTRIBUTES
