@@ -143,8 +143,9 @@ chore: update dependencies
   commits when `dev` is released to `main`.
 - Say briefly what changed and which tests you ran. Every pull request runs
   the same CI lanes on the linux runners. The windows, darwin and slow lanes
-  run on a release tag, or on any ref when the CI workflow is dispatched with a
-  `lane`, which is worth doing before a windows or darwin change reaches `dev`.
+  run when the CI workflow is dispatched with a `lane`, which is worth doing
+  before a windows or darwin change reaches `dev`, and `lane=all` runs green on
+  `dev` before every release.
 - Merge with a merge commit. Never rebase or fast-forward.
 - When the target is not the default branch, close the linked issue by hand
   after the merge.
