@@ -123,7 +123,7 @@ pub val IMAGE_OP_SAMPLED: u32 = 5
 ## val OP_DEF_COUNT
 
 ```mach
-pub val OP_DEF_COUNT:   usize = 44
+pub val OP_DEF_COUNT:   usize = 56
 ```
 
 ## val TYPE_DEF_COUNT

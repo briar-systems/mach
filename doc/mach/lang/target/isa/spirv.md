@@ -644,10 +644,82 @@ pub val OP_ATOMIC_LOAD:               u32 = 227
 pub val OP_ATOMIC_STORE:              u32 = 228
 ```
 
+## val OP_ATOMIC_EXCHANGE
+
+```mach
+pub val OP_ATOMIC_EXCHANGE:           u32 = 229
+```
+
+## val OP_ATOMIC_COMPARE_EXCHANGE
+
+```mach
+pub val OP_ATOMIC_COMPARE_EXCHANGE:   u32 = 230
+```
+
+## val OP_ATOMIC_I_INCREMENT
+
+```mach
+pub val OP_ATOMIC_I_INCREMENT:        u32 = 232
+```
+
+## val OP_ATOMIC_I_DECREMENT
+
+```mach
+pub val OP_ATOMIC_I_DECREMENT:        u32 = 233
+```
+
 ## val OP_ATOMIC_I_ADD
 
 ```mach
 pub val OP_ATOMIC_I_ADD:              u32 = 234
+```
+
+## val OP_ATOMIC_I_SUB
+
+```mach
+pub val OP_ATOMIC_I_SUB:              u32 = 235
+```
+
+## val OP_ATOMIC_S_MIN
+
+```mach
+pub val OP_ATOMIC_S_MIN:              u32 = 236
+```
+
+## val OP_ATOMIC_U_MIN
+
+```mach
+pub val OP_ATOMIC_U_MIN:              u32 = 237
+```
+
+## val OP_ATOMIC_S_MAX
+
+```mach
+pub val OP_ATOMIC_S_MAX:              u32 = 238
+```
+
+## val OP_ATOMIC_U_MAX
+
+```mach
+pub val OP_ATOMIC_U_MAX:              u32 = 239
+```
+
+## val OP_ATOMIC_AND
+
+```mach
+pub val OP_ATOMIC_AND:                u32 = 240
+```
+
+## val OP_ATOMIC_OR
+
+```mach
+pub val OP_ATOMIC_OR:                 u32 = 241
+```
+
+## val OP_ATOMIC_XOR
+
+```mach
+pub val OP_ATOMIC_XOR:                u32 = 242
 ```
 
 ## val OP_LOOP_MERGE
