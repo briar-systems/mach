@@ -59,7 +59,8 @@ one `[target.<name>]` table as parsed; the string fields hold interned copies of
 the manifest text, unvalidated against the target registry
 
 name: the table key; a portable identifier, never `native`
-is_default: `default = true`; false when the key is absent
+is_default: `default = true`; false when the key is absent. deprecated and ignored: `native` never
+                 selects by it, and the driver warns where it is written
 env: the `env` key, or STR_NIL when absent; parse checks only that it is a
                  non-empty string, the isa validates the value later
 isa: the required `isa` key

@@ -752,14 +752,6 @@ fwd mach.lang.manifest.plan.cell_supported
 
 forwards [`mach.lang.manifest.plan.cell_supported`](manifest/plan.md#fun-cell_supported)
 
-## fwd mach.lang.manifest.plan.AMBIGUOUS_TARGET_MSG
-
-```mach
-fwd mach.lang.manifest.plan.AMBIGUOUS_TARGET_MSG
-```
-
-forwards [`mach.lang.manifest.plan.AMBIGUOUS_TARGET_MSG`](manifest/plan.md#val-ambiguous_target_msg)
-
 ## fwd mach.lang.manifest.plan.AMBIGUOUS_PROFILE_MSG
 
 ```mach

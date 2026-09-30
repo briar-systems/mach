@@ -252,7 +252,7 @@ to whichever *declared* target matches the host.
 | `platform` | no  | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
 | `stack_reserve` | no | Thread stack reserve in bytes. See [Image stack size](#image-stack-size). |
 | `stack_commit` | no | Thread stack commit in bytes. See [Image stack size](#image-stack-size). |
-| `default` | no | `true` marks the target `native` resolves to when no declared target matches the host and several are declared. Exactly one may carry it: two are refused at parse (`2 targets declare `default = true` ([target.linux-x86_64], [target.darwin-x86_64]); exactly one is allowed`). See [`native` target resolution](#native-target-resolution). |
+| `default` | no | Deprecated and ignored. It once marked the target `native` fell back to when none matched the host. The key is still accepted, so a published dependency keeps building, and warns as `target.default_deprecated`; it will be removed in a later major release. See [`native` target resolution](#native-target-resolution). |
 | `extensions` | no | Array of instruction-set extension names the target may assume, such as `["sha", "ssse3"]`. Each name must be in the isa's vocabulary. See [Instruction-set extensions](#instruction-set-extensions). |
 | `env` | no | Consumer environment (string). The values are owned by the target's isa: an `env` the isa does not define is a manifest error naming the target and the known values, and an isa that defines none refuses the key outright. Today only `spirv` defines any; see [Finished-module targets](#finished-module-targets). |
 
@@ -789,7 +789,7 @@ allow = ["import.unused", "target"]
 ```
 
 A key's leading components name a family: `"target"` covers
-`target.skipped` and `target.native_fallback`, and `"vector"` covers
+`target.skipped` and `target.default_deprecated`, and `"vector"` covers
 `vector.scalarize`. A family covers whole components only, so `"vec"` is not a
 key. To acknowledge one warning where it is raised instead of across the whole
 build, put [`#[expect]`](decorators.md#expectkey--acknowledge-a-warning) on the
@@ -811,7 +811,7 @@ reused for a different kind: see [the registry](diagnostics.md#the-registry).
 | `fwd.instances` | a shared library `fwd`s a generic, comptime-parameter or pack declaration, which exports no symbol | no |
 | `debug.dropped` | the linker leaves out an object's debug info that it cannot merge | no |
 | `target.skipped` | multi-target analysis skips a declared target this build does not support | no |
-| `target.native_fallback` | `native` matches no declared target and a declared target is built instead | no |
+| `target.default_deprecated` | a `[target.*]` table carries the deprecated `default = true`, which selects nothing | no |
 | `vector.scalarize` | a vector operation falls back to scalar code on the target (see `simd`); portable code silences it | no |
 | `expect.unfulfilled` | an `#[expect]` names a key decided by source and no such warning is raised inside its declaration | no |
 
@@ -2002,7 +2002,8 @@ succeeding with an empty plan.
 its `targets` list may already leave only one answer:
 
 - exactly one declared target: that target is used, and `--target` would only
-  repeat what the manifest already said
+  repeat what the manifest already said. A hosted target that does not match the
+  host is refused instead (see [`native` target resolution](#native-target-resolution))
 - several, one of which matches the host: the host target, as before
 - several, none matching the host: refused, naming the targets the artifact does
   declare so the choice is visible without opening `mach.toml`
@@ -2041,16 +2042,35 @@ collide is rejected before the build starts.
 ### `native` target resolution
 
 `native` resolves the host's `(isa, os)` against the **declared** targets only —
-never a synthesized tuple. Exactly one host match is chosen; several matching tuples
-is an ambiguity error naming the candidates. With no match, a sole declared target
-is chosen with a warning, so a cross-only project still builds on a foreign host;
-several declared targets select the one marked `default = true` (or an explicit
-`--target`). A manifest that declares several and marks none is refused, since
-table order carries no meaning:
+never a synthesized tuple, and never a target the host cannot run. Exactly one host
+match is chosen; several matching tuples is an ambiguity error naming the candidates.
+With no match `native` is an error, however many targets are declared and however
+they are marked, and it is raised before any step runs. A declared target that does
+not match the host is built only when `--target` names it:
 
 ```
-error[selection.ambiguous]: mach.toml: several targets are declared, none matches the host and none is marked `default = true`; no target is selected by table order: mark exactly one [target.<name>] with `default = true` or select one with --target
+error[selection.no_host_target]: mach.toml: 'native' matches no declared target: the host is aarch64-linux and the declared targets are linux-x86_64 (x86_64-linux), windows-x86_64 (x86_64-windows); declare a [target.<name>] for the host or select one with --target
 ```
+
+A cross-only project whose targets are hosted (`linux`, `darwin`, `windows`)
+selects its target with `--target`.
+
+With no `--target`, [an artifact can settle the target](#a-named-artifact-can-settle-the-target)
+when its `targets` list leaves one answer. The same rule holds there. An artifact whose
+only target is hosted and does not match the host is refused with
+`selection.no_host_target`, naming the artifact, because building it would be the same
+fallback. An artifact whose only target no host runs as `native` (a `freestanding`
+target, including a finished-module target such as `spirv`) is still pinned to it:
+such a target is never `native`, so naming the artifact selects it explicitly, and a
+host artifact that `need`s it builds it on any host. This path is taken whenever an
+artifact is settled before its target: `mach build`, `mach check` and `mach clean` with
+`--bin`/`--lib`, `mach run` and `mach test` (which also settle on a sole artifact), and
+editor analysis. A plain `mach build` or `mach check` resolves `native` first and never
+reaches it. A manifest with no `[target.*]` table has the synthesized host
+target. `[target.*] default = true` no longer means anything: it is accepted and
+ignored, with a `target.default_deprecated` warning, and will be removed in a later
+major release. Migrate by deleting the key and declaring a target for each host the
+project builds on, or passing `--target`.
 
 The same rule applies to `[profile.*]` and to `[artifact.*]` when a command
 needs one artifact.

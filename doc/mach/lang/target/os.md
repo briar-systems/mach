@@ -48,6 +48,14 @@ pub fun os_id_for(name: str) u32;
 pub fun os_name_for(id: u32) str;
 ```
 
+## fun os_is_hosted
+
+```mach
+pub fun os_is_hosted(id: u32) bool;
+```
+
+whether the os can be a build host; false for an unknown id
+
 ## fun os_catalog_len
 
 ```mach
