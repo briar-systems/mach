@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.7.2] - 2026-09-30
+
+### Fixed
+- A Mach-O link on arm64 or x86_64 synthesizes the `_objc_msgSend$<selector>` stubs that Apple clang emits for Objective-C message sends, as ld64 does: one stub per selector, loading its `__objc_selrefs` cell and jumping through the `objc_msgSend` import, with the selector string in `__objc_methname`. The link refused them as unattributed imports, so an aarch64-darwin link of mach-glfw's Cocoa backend failed (#4256).
+
 ## [6.7.1] - 2026-09-29
 
 ### Fixed
