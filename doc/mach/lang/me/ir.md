@@ -161,10 +161,16 @@ pub val IFACE_STORAGE: u8 = 5
 pub val IFACE_SAMPLER: u8 = 6
 ```
 
+## val IFACE_PUSH
+
+```mach
+pub val IFACE_PUSH:    u8 = 7
+```
+
 ## val IFACE_SPEC
 
 ```mach
-pub val IFACE_SPEC: u8 = 7
+pub val IFACE_SPEC: u8 = 8
 ```
 
 a specialization constant: iface_a is its SpecId, the initializer its default
