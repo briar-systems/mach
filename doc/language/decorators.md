@@ -1261,16 +1261,19 @@ selected the declaration's types are checked against both:
 | value           | an ordinary id, the argument's value                        | not a pointer  |
 | constant id     | an id that must be an integer constant by emission, such as a `Scope` or `MemorySemantics` | an integer |
 | literal         | a constant written inline as a literal word, such as an image-operands mask | an integer |
-| pointer read    | the argument's address, read through                        | a pointer      |
-| pointer write   | the argument's address, possibly written through            | a pointer      |
+| pointer read    | the argument's address, only read through                   | a pointer      |
+| pointer write   | the argument's address, only stored through                 | a pointer      |
+| pointer update  | the argument's address, read and written (read-modify-write) | a pointer     |
 
 A **pointer operand takes its storage class from the call site**: the argument's
 own access chain decides whether it points into a storage buffer, workgroup memory,
 a function-local object or an image, since an `op` has no body and so no boundary at
 which its parameter's pointer could be given one. Any access chain is accepted, a
 member or element as well as a whole object. The kinds are also what the
-`"readonly"` qualifier of a `storage` binding is checked against: an atomic load
-through a `readonly` binding is accepted, and an atomic add on it is refused.
+`"readonly"` and `"writeonly"` qualifiers of a `storage` binding are checked
+against: an atomic load through a `readonly` binding is accepted and an atomic add
+on it is refused, and an atomic store into a `writeonly` binding is accepted and an
+atomic load from it is refused.
 
 A non-constant argument to a constant id or a literal is refused at the call,
 naming the operand. A row **without a result** is declared with no return type,
