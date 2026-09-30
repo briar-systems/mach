@@ -60,6 +60,9 @@ rec Emit {
     iface_len: u32;
     gslot:     *u32;
     iface_use: *u8;
+    # the LocalInvocationId variable the emitter adds for the zeroing of `#[shared]`
+    # memory when no global declares one, 0 until a stage needs it
+    zero_lid: u32;
 
     gwrite: *u8;
 
@@ -137,6 +140,7 @@ pub fun emit_module(out_alloc: *A.Allocator, tgt: *isa.BackendTarget, u: *unit.U
     e.iface_len = 0;
     e.gslot     = nil;
     e.iface_use = nil;
+    e.zero_lid  = 0;
     e.gwrite    = nil;
     var xi: u32 = 0;
     for (xi < 8) {
@@ -808,6 +812,7 @@ fun declare_interface(e: *Emit) err[fail.Fail] {
         or (g.iface == ir.IFACE_STORAGE) { storage = spirv.storage_buffer_class(e.b.version); }
         or (g.iface == ir.IFACE_SAMPLER) { storage = spirv.STORAGE_UNIFORM_CONSTANT; }
         or (g.iface == ir.IFACE_BUILTIN) { storage = builtin_storage(g.iface_a); }
+        or (g.iface == ir.IFACE_SHARED)  { storage = spirv.STORAGE_WORKGROUP; }
 
         val handle: bool = is_image_type(e, gt, g.ty);
         if (handle && g.iface != ir.IFACE_SAMPLER) {
@@ -830,11 +835,16 @@ fun declare_interface(e: *Emit) err[fail.Fail] {
         }
         val ptr_ty: u32 = types.type_ptr(e.tt, storage, value_ty);
         val var_id: u32 = spirv.alloc_id(e.b);
-        var vop:    [3]u32;
+        var vop:    [4]u32;
         vop[0] = ptr_ty;
         vop[1] = var_id;
         vop[2] = storage;
-        spirv.inst(e.b, ?e.b.types_consts, spirv.OP_VARIABLE, ?vop[0], 3);
+        var vn: u32 = 3;
+        if (g.iface == ir.IFACE_SHARED && shared_native_zero(e)) {
+            vop[3] = types.const_null(e.tt, value_ty);
+            vn     = 4;
+        }
+        spirv.inst(e.b, ?e.b.types_consts, spirv.OP_VARIABLE, ?vop[0], vn);
         e.gvar_ids[i]  = var_id;
         e.gtype_ids[i] = value_ty;
         e.gstorage[i]  = storage;
@@ -1340,6 +1350,11 @@ fun check_stage_interfaces(e: *Emit) err[fail.Fail] {
                 cnt;
             }
             val gi: *ir.Global = gl_ir(e, i);
+            if (gi.iface == ir.IFACE_SHARED && fn.stage != ir.STAGE_COMPUTE) {
+                msg = shared_stage_refusal(e, fx, i);
+                i   = n;
+                cnt;
+            }
             if (e.gstorage[i] == spirv.STORAGE_INPUT && needs_flat(gl_types(e, i), gi.ty)) {
                 if (fn.stage == ir.STAGE_FRAGMENT) { flat[i] = flat[i] | 1; }
                 or (fn.stage == ir.STAGE_VERTEX)   { flat[i] = flat[i] | 2; }
@@ -1379,6 +1394,17 @@ fun check_stage_interfaces(e: *Emit) err[fail.Fail] {
     A.deallocate[u8](e.alloc, flat, n::usize);
     if (msg != nil) { ret err[fail.Fail].err{reject_module(e, dkind.SPIRV_INTERFACE, msg)}; }
     ret err[fail.Fail].ok{};
+}
+
+fun shared_stage_refusal(e: *Emit, fx: u32, gi: u32) str {
+    val g: *ir.Global                   = gl_ir(e, gi);
+    val r: res[str, format.FormatError] = format.sprint(e.alloc,
+        "this `#[shared]` variable, {}{}, is used by the stage `{}`, which is not a compute stage: workgroup memory exists only in a compute stage, where one workgroup's invocations share it. a vertex or fragment stage has no workgroup to share it with",
+        ir_type_spelling(gl_types(e, gi), e.alloc, g.ty), gl_mod_prefix(e, gi), ir_fn_spelling(e, fx));
+    if (sel r.err) {
+        ret "a `#[shared]` variable is used by a stage that is not a compute stage: workgroup memory exists only in a compute stage";
+    }
+    ret r.ok;
 }
 
 fun flat_conflict(e: *Emit, gi: u32) str {
@@ -2005,8 +2031,12 @@ fun emit_function(e: *Emit, fx: u32) err[fail.Fail] {
         li         = li + 1;
     }
 
-    var lb: [1]u32;
+    # a stage that zeroes its `#[shared]` memory opens on a block of its own, so the
+    # first user block is an ordinary one the prologue branches to
+    val zeroing: bool = zeroes_shared(e, fx, irfn);
+    var lb:      [1]u32;
     lb[0] = labels[st.order[0]];
+    if (zeroing) { lb[0] = spirv.alloc_id(e.b); }
     spirv.inst(e.b, ?e.b.functions, spirv.OP_LABEL, ?lb[0], 1);
     dbgm.block(?e.dbg);
 
@@ -2020,9 +2050,11 @@ fun emit_function(e: *Emit, fx: u32) err[fail.Fail] {
     }
 
     var body: err[fail.Fail] = err[fail.Fail].ok{};
-    var oi:   u32            = 0;
+    if (zeroing) { body = emit_shared_zeroing(e, fx, irfn, lb[0], labels[st.order[0]]); }
+    var oi: u32 = 0;
+    if (sel body.err) { oi = st.count; }
     for (oi < st.count) {
-        body = emit_node(e, mf, ?st, st.order[oi], oi == 0, labels, ?vm,
+        body = emit_node(e, mf, ?st, st.order[oi], oi == 0 && !zeroing, labels, ?vm,
             ?param_ids[0], irfn.param_count, returns_void, ret_ty);
         if (sel body.err) {
             oi = st.count;
@@ -2268,6 +2300,17 @@ fun emit_entry_point(e: *Emit, irfn: *ir.Function, fn_ix: u32, fn_id: u32, name:
         if (entry_lists(e, fn_ix, gi)) { used = used + 1; }
         gi = gi + 1;
     }
+    # the zeroing reads LocalInvocationId, an Input the interface names even where
+    # the stage's own code never reads it
+    var lid: u32 = 0;
+    if (zeroes_shared(e, fn_ix, irfn)) {
+        val lx: u32 = local_invocation_global(e);
+        if (lx == GL_NONE || !entry_lists(e, fn_ix, lx)) {
+            var lty: u32 = 0;
+            lid  = zero_lid(e, ?lty);
+            used = used + 1;
+        }
+    }
     val total: u32                = 2 + sw + used;
     val ra:    res[*u32, A.Error] = A.allocate[u32](e.alloc, total::usize);
     if (sel ra.err) { ret err[fail.Fail].err{fail.refused(ra.err)}; }
@@ -2284,6 +2327,7 @@ fun emit_entry_point(e: *Emit, irfn: *ir.Function, fn_ix: u32, fn_id: u32, name:
         }
         gi = gi + 1;
     }
+    if (lid != 0) { ops[2 + sw + ii] = lid; }
     spirv.inst(e.b, ?e.b.entry_points, spirv.OP_ENTRY_POINT, ops, total);
     A.deallocate[u32](e.alloc, ops, total::usize);
 
@@ -2303,6 +2347,183 @@ fun emit_entry_point(e: *Emit, irfn: *ir.Function, fn_ix: u32, fn_id: u32, name:
         spirv.inst(e.b, ?e.b.exec_modes, spirv.OP_EXECUTION_MODE, ?cm[0], 5);
     }
     ret err[fail.Fail].ok{};
+}
+
+# a `#[shared]` variable carries an OpConstantNull initializer where the selection
+# holds zero_init_workgroup, and each compute stage reaching one zeroes it otherwise (#4270)
+fun shared_native_zero(e: *Emit) bool {
+    ret (e.tgt.model.extensions & spirv.EXT_ZERO_INIT_WORKGROUP) != 0;
+}
+
+fun zeroes_shared(e: *Emit, fx: u32, irfn: *ir.Function) bool {
+    if (irfn.stage != ir.STAGE_COMPUTE || shared_native_zero(e)) { ret false; }
+    var gx: u32 = 0;
+    for (gx < e.gl_len) {
+        if (gl_ir(e, gx).iface == ir.IFACE_SHARED && e.gslot[gx] != 0
+            && uses_iface(e, fx, e.gslot[gx] - 1)) {
+            ret true;
+        }
+        gx = gx + 1;
+    }
+    ret false;
+}
+
+fun local_invocation_global(e: *Emit) u32 {
+    var gx: u32 = 0;
+    for (gx < e.gl_len) {
+        val g: *ir.Global = gl_ir(e, gx);
+        if (g.iface == ir.IFACE_BUILTIN && g.iface_a == ir.BUILTIN_LOCAL_INVOCATION
+            && e.gvar_ids[gx] != 0) {
+            ret gx;
+        }
+        gx = gx + 1;
+    }
+    ret GL_NONE;
+}
+
+# the LocalInvocationId variable and its value type: a declared
+# `#[builtin("local_invocation")]` where there is one, else one the emitter adds once
+fun zero_lid(e: *Emit, out_ty: *u32) u32 {
+    val gx: u32 = local_invocation_global(e);
+    if (gx != GL_NONE) {
+        @out_ty = e.gtype_ids[gx];
+        ret e.gvar_ids[gx];
+    }
+    val vty: u32 = types.type_vector(e.tt, types.type_int(e.tt, 32), 3);
+    @out_ty = vty;
+    if (e.zero_lid != 0) { ret e.zero_lid; }
+    val var_id: u32 = spirv.alloc_id(e.b);
+    var vop:    [3]u32;
+    vop[0] = types.type_ptr(e.tt, spirv.STORAGE_INPUT, vty);
+    vop[1] = var_id;
+    vop[2] = spirv.STORAGE_INPUT;
+    spirv.inst(e.b, ?e.b.types_consts, spirv.OP_VARIABLE, ?vop[0], 3);
+    decorate(e, var_id, spirv.DECOR_BUILTIN, spirv.BUILTIN_LOCAL_INVOCATION_ID);
+    e.zero_lid = var_id;
+    ret var_id;
+}
+
+fun emit_words(e: *Emit, opcode: u32, w0: u32, w1: u32, w2: u32, w3: u32, n: u32) {
+    var ops: [4]u32;
+    ops[0] = w0;
+    ops[1] = w1;
+    ops[2] = w2;
+    ops[3] = w3;
+    spirv.inst(e.b, ?e.b.functions, opcode, ?ops[0], n);
+}
+
+fun emit_label(e: *Emit, label: u32) {
+    emit_words(e, spirv.OP_LABEL, label, 0, 0, 0, 1);
+    dbgm.block(?e.dbg);
+}
+
+fun emit_pair(e: *Emit, opcode: u32, ty: u32, a: u32, b: u32) u32 {
+    val result: u32 = spirv.alloc_id(e.b);
+    emit_words(e, opcode, ty, result, a, b, 4);
+    ret result;
+}
+
+# the prologue of a compute stage that zeroes the `#[shared]` memory it reaches:
+# invocation i of a workgroup of w stores zero to the elements i, i + w, ... of each
+# array and invocation 0 to each whole value, then one workgroup barrier makes the
+# stores visible. it precedes all user code, so every invocation reaches the barrier
+fun emit_shared_zeroing(e: *Emit, fx: u32, irfn: *ir.Function, first: u32, next: u32) err[fail.Fail] {
+    val u32t: u32 = types.type_int(e.tt, 32);
+    var lty:  u32 = 0;
+    val lid:  u32 = zero_lid(e, ?lty);
+    val v:    u32 = spirv.alloc_id(e.b);
+    emit_words(e, spirv.OP_LOAD, lty, v, lid, 0, 3);
+    val x: u32 = spirv.alloc_id(e.b);
+    emit_words(e, spirv.OP_COMPOSITE_EXTRACT, u32t, x, v, 0, 4);
+    val y: u32 = spirv.alloc_id(e.b);
+    emit_words(e, spirv.OP_COMPOSITE_EXTRACT, u32t, y, v, 1, 4);
+    val z: u32 = spirv.alloc_id(e.b);
+    emit_words(e, spirv.OP_COMPOSITE_EXTRACT, u32t, z, v, 2, 4);
+    val zy:   u32 = emit_pair(e, spirv.OP_I_MUL, u32t, z, types.const_int(e.tt, 32, irfn.wg_y::i64));
+    val row:  u32 = emit_pair(e, spirv.OP_I_ADD, u32t, y, zy);
+    val rx:   u32 = emit_pair(e, spirv.OP_I_MUL, u32t, row, types.const_int(e.tt, 32, irfn.wg_x::i64));
+    val idx:  u32 = emit_pair(e, spirv.OP_I_ADD, u32t, x, rx);
+    val step: u32 = types.const_int(e.tt, 32, (irfn.wg_x * irfn.wg_y * irfn.wg_z)::i64);
+
+    var pred: u32 = first;
+    var gx:   u32 = 0;
+    for (gx < e.gl_len) {
+        val g: *ir.Global = gl_ir(e, gx);
+        if (g.iface != ir.IFACE_SHARED || e.gslot[gx] == 0 || !uses_iface(e, fx, e.gslot[gx] - 1)) {
+            gx = gx + 1;
+            cnt;
+        }
+        var count:   u32               = 1;
+        var elem_ty: u32               = e.gtype_ids[gx];
+        var indexed: bool              = false;
+        val gt:      *type.IrTypeTable = gl_types(e, gx);
+        val to:      opt[*type.IrType] = type.get(gt, g.ty);
+        if (sel to.some) {
+            val t: *type.IrType = to.some;
+            if (t.kind == type.IRT_ARRAY && t.data.array_.count > 0) {
+                count   = t.data.array_.count;
+                elem_ty = spv_type_of(e, gt, t.data.array_.element);
+                indexed = true;
+            }
+        }
+        if (elem_ty == 0) {
+            ret unsupported(e, "unsupported `#[shared]` variable type in the SPIR-V target");
+        }
+        pred = emit_zero_loop(e, pred, e.gvar_ids[gx], elem_ty, indexed, count, idx, step);
+        gx   = gx + 1;
+    }
+
+    val wg:  u32 = types.const_int(e.tt, 32, spirv.SCOPE_WORKGROUP::i64);
+    val sem: u32 = types.const_int(e.tt, 32,
+        (spirv.SEMANTICS_ACQUIRE_RELEASE | spirv.SEMANTICS_WORKGROUP_MEMORY)::i64);
+    emit_words(e, spirv.OP_CONTROL_BARRIER, wg, wg, sem, 0, 3);
+    emit_branch(e, next);
+    if (e.b.err) { ret err[fail.Fail].err{fail.message("spirv.emit: module builder hit an allocation error")}; }
+    ret err[fail.Fail].ok{};
+}
+
+# for (j = idx; j < count; j += step) var[j] = null, or the whole variable when
+# not indexed; returns the merge block, where the code after it continues
+fun emit_zero_loop(e: *Emit, pred: u32, var_id: u32, elem_ty: u32, indexed: bool,
+    count: u32, idx: u32, step: u32) u32 {
+    val u32t:   u32 = types.type_int(e.tt, 32);
+    val header: u32 = spirv.alloc_id(e.b);
+    val body:   u32 = spirv.alloc_id(e.b);
+    val cont:   u32 = spirv.alloc_id(e.b);
+    val merge:  u32 = spirv.alloc_id(e.b);
+    val j:      u32 = spirv.alloc_id(e.b);
+    val jn:     u32 = spirv.alloc_id(e.b);
+    emit_branch(e, header);
+
+    emit_label(e, header);
+    var phi: [6]u32;
+    phi[0] = u32t;
+    phi[1] = j;
+    phi[2] = idx;
+    phi[3] = pred;
+    phi[4] = jn;
+    phi[5] = cont;
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_PHI, ?phi[0], 6);
+    val more: u32 = emit_pair(e, spirv.OP_U_LESS_THAN, types.type_bool(e.tt), j,
+        types.const_int(e.tt, 32, count::i64));
+    emit_words(e, spirv.OP_LOOP_MERGE, merge, cont, spirv.LOOP_CONTROL_NONE, 0, 3);
+    emit_words(e, spirv.OP_BRANCH_CONDITIONAL, more, body, merge, 0, 3);
+
+    emit_label(e, body);
+    var ptr: u32 = var_id;
+    if (indexed) {
+        ptr = spirv.alloc_id(e.b);
+        emit_words(e, spirv.OP_ACCESS_CHAIN, types.type_ptr(e.tt, spirv.STORAGE_WORKGROUP, elem_ty), ptr, var_id, j, 4);
+    }
+    emit_words(e, spirv.OP_STORE, ptr, types.const_null(e.tt, elem_ty), 0, 0, 2);
+    emit_branch(e, cont);
+
+    emit_label(e, cont);
+    emit_words(e, spirv.OP_I_ADD, u32t, jn, j, step, 4);
+    emit_branch(e, header);
+
+    emit_label(e, merge);
+    ret merge;
 }
 
 fun entry_lists(e: *Emit, fn_ix: u32, gx: u32) bool {
@@ -2880,7 +3101,7 @@ fun addressed_memory_refusal(e: *Emit, mf: *mir.MirFunction, op: *mir.MirOperand
     }
     val g: *ir.Global = gl_ir(e, gix);
     if (g.iface == ir.IFACE_NONE) {
-        ret "a plain module-scope variable is not reachable from the SPIR-V target: a shader has no general global storage, so a module-scope `val` / `var` reaches a stage only by carrying an interface role (`#[input]`, `#[output]`, `#[builtin]`, or `#[uniform]`)";
+        ret "a plain module-scope variable is not reachable from the SPIR-V target: a shader has no general global storage, so a module-scope `val` / `var` reaches a stage only by carrying an interface role (`#[input]`, `#[output]`, `#[builtin]`, `#[uniform]`, `#[storage]`, `#[sampler]`, or `#[shared]`)";
     }
     val r: res[str, format.FormatError] = format.sprint(e.alloc,
         "this shader interface variable carries a role, so it is reachable - but the access reached the back end as COMPUTED ADDRESSING rather than as a direct reference to the variable, which is the one shape the SPIR-V target can name. that is a lowering that ran where it should not have, not a limit of the declaration: the variable is {}",
