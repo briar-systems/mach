@@ -51,6 +51,8 @@ A decorator is written as an attribute:
 #[uniform(set, bnd)] # descriptor-bound uniform block, read-only (global only)
 #[storage(set, bnd)] # descriptor-bound storage buffer, read-write (global only)
 #[storage(set, bnd, "readonly")] # the same buffer, with writes refused
+#[storage(set, bnd, "writeonly")] # the same buffer, with reads refused
+#[storage(set, bnd, "coherent")] # the same buffer, its writes visible across workgroups
 #[sampler(set, bnd)] # descriptor-bound image / sampler handle (global only)
 #[spec(id)]          # specialization constant the host supplies (module var only)
 #[op(tgt,set,name)]   # the target instruction this function is (bodyless fun only)
@@ -1083,8 +1085,9 @@ A compute stage's data path is `storage`: Vulkan forbids the `Output` storage cl
 in a compute execution model, so a compute shader reads and writes buffers rather
 than varyings.
 
-`storage` takes **memory qualifiers** after the descriptor pair. There is one,
-`"readonly"`, and it says that nothing writes the binding:
+`storage` takes **memory qualifiers** after the descriptor pair, any number of them
+in any order: `"readonly"`, `"writeonly"` and `"coherent"`. `"readonly"` says that
+nothing writes the binding:
 
 ```mach
 rec Palette { columns: [512]f32x4; }
@@ -1104,6 +1107,36 @@ diagnostic instead.
 The inference is one-sided on purpose. Anything the compiler cannot follow, such as
 the binding's address handed to a function, counts as a write, so a missing
 decoration is possible and a wrong one is not.
+
+`"writeonly"` is the mirror: it says that nothing reads the binding, and the buffer
+is emitted `NonReadable`.
+
+```mach
+rec Frame { texels: [4096]f32x4; }
+#[storage(0, 4, "writeonly")]
+var frame: Frame;
+```
+
+A read of a `"writeonly"` binding is a compile error on every target, naming the
+expression that read it. Storing into a field or an element reads nothing, and
+neither does taking the binding's address, so `frame.texels[i] = c` and
+`?frame.texels[i]` are accepted. Writing **one lane** of a vector inside it is
+refused, because a lane write loads the whole vector and stores it back: store the
+whole vector instead. On SPIR-V, a load the compiler follows through the binding's
+address is refused as well, with the same caution as `"readonly"`: anything the
+compiler cannot follow counts as a read. `"readonly"` and `"writeonly"` together
+are refused, since that binding would be neither read nor written.
+
+`"coherent"` decorates the buffer `Coherent`, so a write one invocation makes is
+visible to invocations in other workgroups under the GLSL450 memory model, which
+is what atomics and flags shared across workgroups rely on. It combines with
+either of the other two.
+
+```mach
+rec Counters { done: u32; }
+#[storage(0, 5, "coherent")]
+var counters: Counters;
+```
 
 `sampler` binds a **handle** by descriptor set and binding, at the same descriptor
 addressing `uniform` and `storage` use, so a host binds one the way it binds the
