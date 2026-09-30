@@ -99,7 +99,7 @@ The names are the selected isa's vocabulary and nothing else:
 - `aarch64`: `sha2`, `sb`, `aes`, `pmull`, `fp16`;
 - `riscv64` and `riscv32`: `i`, `m`, `a`, `f`, `d`, `c`, `zicond`, `zicsr`, `zifencei`,
   `zfhmin`, `zfh`, `zkt`;
-- `spirv`: `float16`.
+- `spirv`: `float16`, `zero_init_workgroup`.
 
 A name the selected isa does not declare is a compile error, never a silent 0, as
 `$mach.arch.*` refuses an unknown architecture:
