@@ -650,6 +650,12 @@ pub val OP_ATOMIC_STORE:              u32 = 228
 pub val OP_ATOMIC_I_ADD:              u32 = 234
 ```
 
+## val OP_PHI
+
+```mach
+pub val OP_PHI:                       u32 = 245
+```
+
 ## val OP_LOOP_MERGE
 
 ```mach
@@ -821,17 +827,26 @@ pub fun storage_block_decoration(version: u32) u32;
 ## val EXT_FLOAT16
 
 ```mach
-pub val EXT_FLOAT16: u64 = 0x1
+pub val EXT_FLOAT16:             u64 = 0x1
 ```
 
-the spirv extension vocabulary: capabilities an environment guarantees
-beyond the core, which the catalog's rows read. float16 is the Float16
-capability, so f16 is the native OpTypeFloat 16 (#3801)
+the spirv extension vocabulary: capabilities and device features an
+environment guarantees beyond the core, which the catalog's rows and the
+emitter read. float16 is the Float16 capability, so f16 is the native
+OpTypeFloat 16 (#3801). zero_init_workgroup is the
+shaderZeroInitializeWorkgroupMemory feature, so a `#[shared]` variable takes
+an OpConstantNull initializer instead of the zeroing the compiler inserts (#4270)
+
+## val EXT_ZERO_INIT_WORKGROUP
+
+```mach
+pub val EXT_ZERO_INIT_WORKGROUP: u64 = 0x2
+```
 
 ## val EXTENSION_COUNT
 
 ```mach
-pub val EXTENSION_COUNT: u32 = 1
+pub val EXTENSION_COUNT: u32 = 2
 ```
 
 ## val ONLY_ENVIRONMENT
@@ -840,11 +855,25 @@ pub val EXTENSION_COUNT: u32 = 1
 pub val ONLY_ENVIRONMENT: str = "it is a capability the target's `env` guarantees for the whole module"
 ```
 
+## val ONLY_DEVICE
+
+```mach
+pub val ONLY_DEVICE:      str = "it is a device feature the consumer enables for the whole module"
+```
+
 ## val EXTENSIONS
 
 ```mach
 pub val EXTENSIONS: [EXTENSION_COUNT]extension.Extension = [EXTENSION_COUNT]extension.Extension;
 ```
+
+## val EXT_OPEN
+
+```mach
+pub val EXT_OPEN: u64 = EXT_FLOAT16 | EXT_ZERO_INIT_WORKGROUP
+```
+
+every extension of the vocabulary, which a module naming no environment holds
 
 ## fun env_extensions
 
@@ -852,7 +881,8 @@ pub val EXTENSIONS: [EXTENSION_COUNT]extension.Extension = [EXTENSION_COUNT]exte
 pub fun env_extensions(id: u32) u64;
 ```
 
-the extensions an environment's ceiling guarantees
+the extensions an environment guarantees: float16 where its ceiling holds
+Float16, and zero_init_workgroup from vulkan1.3, where the feature is core
 
 ## fun env_profile
 
@@ -966,6 +996,12 @@ pub val STORAGE_UNIFORM: u32 = 2
 
 ```mach
 pub val STORAGE_OUTPUT:  u32 = 3
+```
+
+## val STORAGE_WORKGROUP
+
+```mach
+pub val STORAGE_WORKGROUP: u32 = 4
 ```
 
 ## val STORAGE_PUSH_CONSTANT
@@ -1164,6 +1200,24 @@ pub val LOOP_CONTROL_NONE: u32 = 0
 
 ```mach
 pub val SELECTION_CONTROL_NONE: u32 = 0
+```
+
+## val SCOPE_WORKGROUP
+
+```mach
+pub val SCOPE_WORKGROUP: u32 = 2
+```
+
+## val SEMANTICS_ACQUIRE_RELEASE
+
+```mach
+pub val SEMANTICS_ACQUIRE_RELEASE:  u32 = 0x8
+```
+
+## val SEMANTICS_WORKGROUP_MEMORY
+
+```mach
+pub val SEMANTICS_WORKGROUP_MEMORY: u32 = 0x100
 ```
 
 ## rec Builder
