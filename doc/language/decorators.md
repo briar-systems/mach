@@ -54,6 +54,7 @@ A decorator is written as an attribute:
 #[storage(set, bnd, "writeonly")] # the same buffer, with reads refused
 #[storage(set, bnd, "coherent")] # the same buffer, its writes visible across workgroups
 #[sampler(set, bnd)] # descriptor-bound image / sampler handle (global only)
+#[push]              # push-constant block, read-only (global only)
 #[op(tgt,set,name)]   # the target instruction this function is (bodyless fun only)
 #[handle(tgt,ctor,..)] # the target type this declares (bodyless def only)
 #[abi_type("name")]   # a C type whose layout the target declares (bodyless def only)
@@ -230,7 +231,7 @@ It applies to `fun`, `rec`, `uni`, `tag`, `def`, `val`, `var`, `use` and `fwd`
 declarations at module scope. `test` blocks reject it because they are already
 test-only, and comptime directives reject it too. It cannot combine with
 `ext` or with `symbol`, `section`, `stage`, `input`, `output`, `builtin`,
-`uniform`, `storage` or `sampler`, because each names a consumer outside Mach
+`uniform`, `storage`, `sampler` or `push`, because each names a consumer outside Mach
 source that the check cannot see. Inline `asm` `{name}` operands bind only
 locals, so they never reference a declaration.
 
@@ -591,7 +592,7 @@ What the refusal still waits on is the other half,
 footprint through aggregate layout and ABI classification. This is a sequencing
 decision and is expected to be lifted, not a permanent rule.
 
-**Interface blocks.** `packed` cannot apply to a `#[uniform]` or `#[storage]` block:
+**Interface blocks.** `packed` cannot apply to a `#[uniform]`, `#[storage]` or `#[push]` block:
 its member offsets are fixed by the std140 / std430 layout rules and emitted as
 explicit SPIR-V `Offset` decorations, which packing would contradict.
 
@@ -981,7 +982,7 @@ stage takes the single-invocation default `(1, 1, 1)`; the dimensions are always
 declared in the emitted module, since a compute stage that does not state its
 workgroup size is not one a consumer can dispatch.
 
-### `input(n)` / `output(n)` / `builtin(str)` / `uniform(set, binding)` / `storage(set, binding)` / `sampler(set, binding)` — shader interface
+### `input(n)` / `output(n)` / `builtin(str)` / `uniform(set, binding)` / `storage(set, binding)` / `sampler(set, binding)` / `push` — shader interface
 
 A pipeline stage does not receive its inputs or return its results through a call.
 It reads and writes **module-scope variables** that the pipeline binds, and these
@@ -1001,6 +1002,9 @@ rec Particles { pos: [64]f32x4; }
 #[storage(0, 1)] var particles: Particles;
 
 #[sampler(1, 0)] var albedo: Sampler2D;
+
+rec Params { tint: f32x4; count: u32; }
+#[push] var params: Params;
 ```
 
 `input` and `output` number a **varying** with a location, which is how one
@@ -1122,6 +1126,26 @@ names a descriptor rather than an object with storage, so one with no descriptor
 address is reachable from no stage. A handle cannot sit behind a pointer, inside an
 array, or in a local binding, and each of those is a compile error naming why.
 
+`push` binds a **push-constant block**, a small `rec` the host supplies with the
+command that records a dispatch or draw rather than through a descriptor, so it
+takes no arguments: there is no set or binding to name. Like `uniform` and
+`storage` it must be a `rec`, and it is emitted as a `Block`-decorated struct with
+an explicit offset on every member. Its layout rules are std430-shaped, the same
+ones a `storage` buffer follows and checked the same way, so `[8]f32` is fine in a
+push block.
+
+A push block is **read-only** in the shader. A store to it is a compile error on
+every target, and on `spirv` so is a store the compiler follows through its address
+handed to a function. Vulkan admits **one push-constant block per entry point**:
+two push blocks used by the same stage are refused, naming both, while two stages
+that each use a different one are accepted.
+
+```mach
+rec Params { scale: f32; slot: u32; }
+#[push]
+var params: Params;
+```
+
 Sampling a handle is an `#[op(...)]` declaration rather than a language form,
 because a sample IS one SPIR-V instruction like `sqrt` and `dot` are:
 
@@ -1159,7 +1183,8 @@ matching storage class, carrying the matching decoration, and the Input and Outp
 variables are named in every entry point's interface list. A `sampler` binding
 becomes an `OpVariable` in the `UniformConstant` class — the one class Vulkan
 permits an image, sampler or sampled-image variable in — carrying `DescriptorSet`
-and `Binding` exactly as a `uniform` does.
+and `Binding` exactly as a `uniform` does. A `push` block becomes an `OpVariable`
+in the `PushConstant` class, with no `DescriptorSet` or `Binding`.
 
 ### `handle(target, constructor, operands...)` — a type the target mints
 
@@ -1333,6 +1358,7 @@ its result. Adding an instruction is a row in it.
 | `builtin`   |  no   |    no     |      yes      |      no       |
 | `uniform`   |  no   |    no     |      yes      |      no       |
 | `storage`   |  no   |    no     |      yes      |      no       |
+| `push`      |  no   |    no     |      yes      |      no       |
 | `op`        |  yes  |    no     |      no       |      no       |
 | `handle`    |  no   |    no     |      no       |      no       |
 | `abi_type`  |  no   |    no     |      no       |      no       |
