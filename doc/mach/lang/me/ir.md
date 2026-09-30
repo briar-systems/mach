@@ -170,49 +170,61 @@ pub val IFACE_FLAG_READONLY: u32 = 1
 ## val BUILTIN_POSITION
 
 ```mach
-pub val BUILTIN_POSITION:          u32 = 0
+pub val BUILTIN_POSITION:               u32 = 0
 ```
 
 ## val BUILTIN_VERTEX_INDEX
 
 ```mach
-pub val BUILTIN_VERTEX_INDEX:      u32 = 1
+pub val BUILTIN_VERTEX_INDEX:           u32 = 1
 ```
 
 ## val BUILTIN_INSTANCE_INDEX
 
 ```mach
-pub val BUILTIN_INSTANCE_INDEX:    u32 = 2
+pub val BUILTIN_INSTANCE_INDEX:         u32 = 2
 ```
 
 ## val BUILTIN_FRAG_COORD
 
 ```mach
-pub val BUILTIN_FRAG_COORD:        u32 = 3
+pub val BUILTIN_FRAG_COORD:             u32 = 3
 ```
 
 ## val BUILTIN_POINT_SIZE
 
 ```mach
-pub val BUILTIN_POINT_SIZE:        u32 = 4
+pub val BUILTIN_POINT_SIZE:             u32 = 4
 ```
 
 ## val BUILTIN_GLOBAL_INVOCATION
 
 ```mach
-pub val BUILTIN_GLOBAL_INVOCATION: u32 = 5
+pub val BUILTIN_GLOBAL_INVOCATION:      u32 = 5
 ```
 
 ## val BUILTIN_LOCAL_INVOCATION
 
 ```mach
-pub val BUILTIN_LOCAL_INVOCATION:  u32 = 6
+pub val BUILTIN_LOCAL_INVOCATION:       u32 = 6
 ```
 
 ## val BUILTIN_WORKGROUP_ID
 
 ```mach
-pub val BUILTIN_WORKGROUP_ID:      u32 = 7
+pub val BUILTIN_WORKGROUP_ID:           u32 = 7
+```
+
+## val BUILTIN_NUM_WORKGROUPS
+
+```mach
+pub val BUILTIN_NUM_WORKGROUPS:         u32 = 8
+```
+
+## val BUILTIN_LOCAL_INVOCATION_INDEX
+
+```mach
+pub val BUILTIN_LOCAL_INVOCATION_INDEX: u32 = 9
 ```
 
 ## rec IrAsmBind
