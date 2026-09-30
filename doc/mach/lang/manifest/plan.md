@@ -470,7 +470,8 @@ pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt
 
 resolve a selection into one `BuildUnit`. with no target named, an artifact
 that supports exactly one declared target, or exactly one host-matching
-target, pins it; otherwise `native` resolution applies. the profile comes
+target, pins it, except that a sole hosted target the host cannot run is refused
+as `native` refuses it; otherwise `native` resolution applies. the profile comes
 from `resolve_profile`, the artifact from `resolve_artifact`, and every path
 is expanded with `expand_project_path`
 

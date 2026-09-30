@@ -88,6 +88,16 @@ host_os: an os id from `mach.lang.target.os`
 host_arch: an arch id from `mach.lang.target.isa`
 ret: true when both ids match; false when either string is unknown to `itn`
 
+## fun target_is_hosted
+
+```mach
+pub fun target_is_hosted(itn: *intern.Interner, d: *TargetDef) bool;
+```
+
+whether `native` could ever name the target: its os is one a build host runs. a
+target of any other os (freestanding, or a finished-module target such as spirv)
+is only ever selected by name
+
 ## fun make_native_target
 
 ```mach

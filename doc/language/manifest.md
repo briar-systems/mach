@@ -2002,7 +2002,8 @@ succeeding with an empty plan.
 its `targets` list may already leave only one answer:
 
 - exactly one declared target: that target is used, and `--target` would only
-  repeat what the manifest already said
+  repeat what the manifest already said. A hosted target that does not match the
+  host is refused instead (see [`native` target resolution](#native-target-resolution))
 - several, one of which matches the host: the host target, as before
 - several, none matching the host: refused, naming the targets the artifact does
   declare so the choice is visible without opening `mach.toml`
@@ -2051,9 +2052,21 @@ not match the host is built only when `--target` names it:
 error[selection.no_host_target]: mach.toml: 'native' matches no declared target: the host is aarch64-linux and the declared targets are linux-x86_64 (x86_64-linux), windows-x86_64 (x86_64-windows); declare a [target.<name>] for the host or select one with --target
 ```
 
-A cross-only project, such as a freestanding firmware image, selects its target
-with `--target`. [A named artifact can settle the target](#a-named-artifact-can-settle-the-target)
-when its `targets` list leaves one answer, and that path is unchanged. A manifest with no `[target.*]` table has the synthesized host
+A cross-only project whose targets are hosted (`linux`, `darwin`, `windows`)
+selects its target with `--target`.
+
+With no `--target`, [an artifact can settle the target](#a-named-artifact-can-settle-the-target)
+when its `targets` list leaves one answer. The same rule holds there. An artifact whose
+only target is hosted and does not match the host is refused with
+`selection.no_host_target`, naming the artifact, because building it would be the same
+fallback. An artifact whose only target no host runs as `native` (a `freestanding`
+target, including a finished-module target such as `spirv`) is still pinned to it:
+such a target is never `native`, so naming the artifact selects it explicitly, and a
+host artifact that `need`s it builds it on any host. This path is taken whenever an
+artifact is settled before its target: `mach build`, `mach check` and `mach clean` with
+`--bin`/`--lib`, `mach run` and `mach test` (which also settle on a sole artifact), and
+editor analysis. A plain `mach build` or `mach check` resolves `native` first and never
+reaches it. A manifest with no `[target.*]` table has the synthesized host
 target. `[target.*] default = true` no longer means anything: it is accepted and
 ignored, with a `target.default_deprecated` warning, and will be removed in a later
 major release. Migrate by deleting the key and declaring a target for each host the
