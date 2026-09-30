@@ -65,6 +65,10 @@ rec Emit {
 
     ext_ids: [8]u32;
 
+    # this target's own instruction table, which an `op` call's row is read from
+    op_table: defs.DefStorage;
+    op_defs:  *isa.TargetDefs;
+
     srcmap: *source.SourceMap;
     # the root module's diagnostic store, where a refusal of the program lands
     diags:     *diagnostic.DiagnosticStore;
@@ -138,6 +142,7 @@ pub fun emit_module(out_alloc: *A.Allocator, tgt: *isa.BackendTarget, u: *unit.U
     e.gslot     = nil;
     e.iface_use = nil;
     e.gwrite    = nil;
+    e.op_defs   = defs.register_defs(?e.op_table);
     var xi: u32 = 0;
     for (xi < 8) {
         e.ext_ids[xi] = 0;
@@ -600,11 +605,14 @@ fun scan_fn_writes(e: *Emit, fx: u32, mf: *mir.MirFunction) err[fail.Fail] {
             for (ii < blk.instr_count) {
                 val mi: *mir.MirInstr = ?blk.instrs[ii];
                 ii = ii + 1;
-                if (mi.opcode != mir.MIR_GEP || mi.operand_count < 2) { cnt; }
-                if (mi.operands[0].kind != mir.MIR_OP_VREG)           { cnt; }
-                val dst: u32 = mi.operands[0].vreg.n;
+                # an access chain, and an `op` pointer result, point into what their base names
+                var dst_at:  u32 = 0;
+                var base_at: u32 = 0;
+                if (!derived_pointer(e, fx, mi, ?dst_at, ?base_at)) { cnt; }
+                if (mi.operands[dst_at].kind != mir.MIR_OP_VREG)    { cnt; }
+                val dst: u32 = mi.operands[dst_at].vreg.n;
                 if (origin == nil || dst == mir.MIR_VREG_NIL.n || dst >= n) { cnt; }
-                val g: u32 = operand_origin(e, origin, n, ?mi.operands[1]);
+                val g: u32 = operand_origin(e, origin, n, ?mi.operands[base_at]);
                 if (g == GL_NONE || origin[dst] == g) { cnt; }
                 if (origin[dst] != GL_NONE) {
                     val ra: err[fail.Fail] = mark_written(e, fx, mi, origin[dst]);
@@ -631,15 +639,16 @@ fun scan_fn_writes(e: *Emit, fx: u32, mf: *mir.MirFunction) err[fail.Fail] {
         val blk: *mir.MirBlock = ?mf.blocks[bi2];
         var ii:  u32           = 0;
         for (ii < blk.instr_count) {
-            val mi: *mir.MirInstr = ?blk.instrs[ii];
-            var oi: u32           = 0;
+            val mi:  *mir.MirInstr = ?blk.instrs[ii];
+            val row: *isa.OpDef    = call_op_row(e, fx, mi);
+            var oi:  u32           = 0;
             for (oi < mi.operand_count) {
                 val g: u32 = operand_origin(e, origin, n, ?mi.operands[oi]);
                 if (g == GL_NONE) {
                     oi = oi + 1;
                     cnt;
                 }
-                if (operand_only_reads(mi, oi)) {
+                if (operand_only_reads(mi, oi, row)) {
                     oi = oi + 1;
                     cnt;
                 }
@@ -658,8 +667,41 @@ fun scan_fn_writes(e: *Emit, fx: u32, mf: *mir.MirFunction) err[fail.Fail] {
     ret err[fail.Fail].ok{};
 }
 
-fun operand_only_reads(mi: *mir.MirInstr, oi: u32) bool {
+# the instruction row an `op` call assembles, nil for any other instruction
+fun call_op_row(e: *Emit, fx: u32, mi: *mir.MirInstr) *isa.OpDef {
+    if (mi.opcode != mir.MIR_VALUE_CALL || mi.operand_count < 2) { ret nil; }
+    if (mi.operands[0].kind != mir.MIR_OP_SYM)                   { ret nil; }
+    val callee: *ir.Function = ir_function_record(fn_mod(e, fx), mi.operands[0].sym);
+    if (callee == nil || callee.op_set == defs.SPV_SET_NONE) { ret nil; }
+    ret isa.op_def_by_code(e.op_defs, callee.op_set, callee.op_code);
+}
+
+# the operand an instruction defines as a pointer into what another operand
+# names: a chain's base, or an `op` pointer result's first pointer operand
+fun derived_pointer(e: *Emit, fx: u32, mi: *mir.MirInstr, out_dst: *u32, out_base: *u32) bool {
+    if (mi.opcode == mir.MIR_GEP && mi.operand_count >= 2) {
+        @out_dst  = 0;
+        @out_base = 1;
+        ret true;
+    }
+    val row: *isa.OpDef = call_op_row(e, fx, mi);
+    if (row == nil || row.result != isa.OP_RESULT_POINTER) { ret false; }
+    var i: u32 = 0;
+    for (i < row.arity && i + 2 < mi.operand_count) {
+        if (isa.op_kind_is_pointer(isa.op_operand_kind(row, i))) {
+            @out_dst  = 1;
+            @out_base = i + 2;
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun operand_only_reads(mi: *mir.MirInstr, oi: u32, row: *isa.OpDef) bool {
     val op: mir.MirOpcode = mi.opcode;
+    # an `op` call writes through exactly the operands its row says it writes
+    if (row != nil)           { ret oi < 2 || isa.op_operand_kind(row, oi - 2) != isa.OP_OPERAND_POINTER_WRITE; }
     if (op == mir.MIR_LOAD)   { ret oi == 1; }
     if (op == mir.MIR_GEP)    { ret oi < 2; }
     if (op == mir.MIR_MEMCPY) { ret oi == 1; }
@@ -3471,7 +3513,7 @@ fun foreign_call_refusal(e: *Emit, fn: *ir.Function) str {
     var who: str      = "this function";
     if (sel nm.some) { who = nm.some; }
     val r: res[str, format.FormatError] = format.sprint(e.alloc,
-        "`{}` is declared `ext`, and a SPIR-V module cannot call a foreign import: the module a shader compiles to is self-contained, so there is no symbol to bind at load time. give the operation a `#[spirv_op(set, name)]` mapping so the call becomes that instruction, or write it in mach so its body can be emitted here",
+        "`{}` is declared `ext`, and a SPIR-V module cannot call a foreign import: the module a shader compiles to is self-contained, so there is no symbol to bind at load time. give the operation an `#[op(\"spirv\", set, name)]` mapping so the call becomes that instruction, or write it in mach so its body can be emitted here",
         who);
     if (sel r.err) {
         ret "a SPIR-V module cannot call a foreign `ext` import: the module is self-contained and has no symbol to bind at load time";
@@ -3502,36 +3544,58 @@ fun unresolved_call_refusal(e: *Emit, name: intern.StrId, fx: u32) str {
     ret r.ok;
 }
 
+# a call to an `#[op]` declaration is the instruction its row names: the row says
+# whether it has a result id, and how each operand is written, so a pointer operand
+# takes the storage class of the argument's own access chain rather than a
+# parameter type's
 fun emit_spirv_op(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, mi: *mir.MirInstr, fn: *ir.Function) err[fail.Fail] {
     val sig_opt: opt[*type.IrType] = type.get(?e.ir.types, fn.sig);
     if (sel sig_opt.none) {
-        ret emit_fail(e, "spirv.emit: a `spirv_op` callee has no signature type");
+        ret emit_fail(e, "spirv.emit: an `op` callee has no signature type");
     }
     val sig: *type.IrType = sig_opt.some;
     if (sig.kind != type.IRT_FN) {
-        ret emit_fail(e, "spirv.emit: a `spirv_op` callee's signature is not a function type");
+        ret emit_fail(e, "spirv.emit: an `op` callee's signature is not a function type");
     }
     val argc: u32 = sig.data.fn.param_count;
     if (argc != mi.operand_count - 2)             { ret emit_fail(e, "spirv.emit: mapped logical call arity mismatch"); }
     if (!types.instruction_operands_fit(4, argc)) { ret unsupported(e, "SPIR-V mapped instruction arguments exceed its 65535-word encoding"); }
+    val row: *isa.OpDef = isa.op_def_by_code(e.op_defs, fn.op_set, fn.op_code);
+    if (row == nil || row.arity != argc) { ret emit_fail(e, "spirv.emit: an `op` callee has no instruction row of its arity"); }
 
     var returns_void: bool = false;
-    val ret_ty:       u32  = ir_return_spv_type(e, fn, ?returns_void);
-    if (ret_ty == 0) { ret unsupported(e, "unsupported return type in the SPIR-V target"); }
-    if (returns_void) {
-        ret unsupported(e, "a `spirv_op` function must return a value; a SPIR-V instruction has a result id");
+    var ret_ty:       u32  = 0;
+    var pointee:      u32  = 0;
+    if (row.result == isa.OP_RESULT_POINTER) {
+        pointee = ir_pointee_spv_type(e, sig.data.fn.ret_type);
+        if (pointee == 0) { ret unsupported(e, "the type an `op` pointer result addresses has no SPIR-V form"); }
+        ret_ty = types.type_ptr(e.tt, row.result_space, pointee);
     }
+    or {
+        ret_ty = ir_return_spv_type(e, fn, ?returns_void);
+        if (ret_ty == 0) { ret unsupported(e, "unsupported return type in the SPIR-V target"); }
+    }
+    if ((row.result == isa.OP_RESULT_NONE) != returns_void) {
+        ret emit_fail(e, "spirv.emit: an `op` declaration's return disagrees with its instruction's result");
+    }
+
+    # an extended instruction always has a result id, void when it produces nothing
+    val core:       bool = fn.op_set == defs.SPV_SET_CORE;
+    val has_result: bool = !core || row.result != isa.OP_RESULT_NONE;
 
     val ar: res[*u32, A.Error] = A.allocate[u32](e.alloc, (argc + 4)::usize);
     if (sel ar.err) { ret err[fail.Fail].err{fail.refused(ar.err)}; }
     val ops: *u32 = ar.ok;
     fin { A.deallocate[u32](e.alloc, ops, (argc + 4)::usize); }
-    var base: u32 = 2;
-    ops[0] = ret_ty;
-    if (fn.op_set != defs.SPV_SET_CORE) {
+    var base: u32 = 0;
+    if (has_result) {
+        ops[0] = ret_ty;
+        base   = 2;
+    }
+    if (!core) {
         val set_id: u32 = ext_set_id(e, fn.op_set);
         if (set_id == 0) {
-            ret emit_fail(e, "spirv.emit: a `spirv_op` names an instruction set with no import name");
+            ret emit_fail(e, "spirv.emit: an `op` names an instruction set with no import name");
         }
         ops[2] = set_id;
         ops[3] = fn.op_code;
@@ -3540,20 +3604,99 @@ fun emit_spirv_op(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, mi: *mir.MirInstr,
 
     var i: u32 = 0;
     for (i < argc) {
-        val value: res[u32, fail.Fail] = read_value(e, mf, vm, ?mi.operands[i + 2],
-            ir_value_spv_type(e, sig.data.fn.params[i]), mi.memory_flags);
-        if (sel value.err) { ret emit_inner(e, value.err); }
-        ops[base + i] = value.ok;
+        val word: res[u32, fail.Fail] = op_operand(e, mf, vm, mi, row, i, sig.data.fn.params[i]);
+        if (sel word.err) { ret emit_inner(e, word.err); }
+        ops[base + i] = word.ok;
         i             = i + 1;
     }
-    val result: u32 = spirv.alloc_id(e.b);
-    ops[1] = result;
+    var result: u32 = 0;
+    if (has_result) {
+        result = spirv.alloc_id(e.b);
+        ops[1] = result;
+    }
 
     var opcode: u32 = spirv.OP_EXT_INST;
-    if (fn.op_set == defs.SPV_SET_CORE) { opcode = fn.op_code; }
+    if (core) { opcode = fn.op_code; }
     spirv.inst(e.b, ?e.b.functions, opcode, ?ops[0], base + argc);
 
+    if (row.result == isa.OP_RESULT_NONE) {
+        if (mi.operands[1].kind != mir.MIR_OP_VREG || !mir.vreg_is_nil(mi.operands[1].vreg)) {
+            ret emit_fail(e, "spirv.emit: a void `op` call names a result");
+        }
+        ret err[fail.Fail].ok{};
+    }
+    if (row.result == isa.OP_RESULT_POINTER) {
+        val dst: *mir.MirOperand = ?mi.operands[1];
+        if (dst.kind != mir.MIR_OP_VREG || dst.vreg.n >= vm.n) {
+            ret emit_fail(e, "spirv.emit: an `op` pointer result is not bound to a register");
+        }
+        vm.chain_id[dst.vreg.n]     = result;
+        vm.chain_ty[dst.vreg.n]     = pointee;
+        vm.chain_sc[dst.vreg.n]     = row.result_space;
+        vm.chain_object[dst.vreg.n] = false;
+        ret err[fail.Fail].ok{};
+    }
     ret write_value(e, mf, vm, ?mi.operands[1], result, ret_ty, mi.memory_flags);
+}
+
+# the word operand `i` of an `op` call contributes, written as its row's kind says
+fun op_operand(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, mi: *mir.MirInstr, row: *isa.OpDef,
+    i: u32, param: type.IrTypeId) res[u32, fail.Fail] {
+    val op:   *mir.MirOperand   = ?mi.operands[i + 2];
+    val kind: isa.OpOperandKind = isa.op_operand_kind(row, i);
+    if (isa.op_kind_is_pointer(kind)) { ret op_pointer_operand(e, mf, vm, row, i, op, param); }
+    if (kind == isa.OP_OPERAND_CONSTANT || kind == isa.OP_OPERAND_LITERAL) {
+        if (op.kind != mir.MIR_OP_IMM) {
+            ret res[u32, fail.Fail].err{reject_at(e, dkind.OP_OPERAND_NOT_CONSTANT, mir.refusal_loc(mf, e.cur_instr),
+                op_operand_text(e, row, i, "is an integer constant the instruction takes by value (a scope, memory semantics or operand mask), and this argument is not a constant by emission: pass a literal or a constant, not a value computed at run time"))};
+        }
+        if (kind == isa.OP_OPERAND_LITERAL) {
+            if (op.imm < -2147483648 || op.imm > 4294967295) {
+                ret res[u32, fail.Fail].err{reject_at(e, dkind.OP_OPERAND_NOT_CONSTANT, mir.refusal_loc(mf, e.cur_instr),
+                    op_operand_text(e, row, i, "is a literal word written inline, and this constant does not fit one 32-bit word"))};
+            }
+            ret res[u32, fail.Fail].ok{(op.imm & 0xFFFFFFFF)::u32};
+        }
+    }
+    ret read_value(e, mf, vm, op, ir_value_spv_type(e, param), mi.memory_flags);
+}
+
+# a pointer operand is the argument's own address: an access chain, a function-local
+# object or an interface variable, in the storage class that memory lives in
+fun op_pointer_operand(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, row: *isa.OpDef, i: u32,
+    op: *mir.MirOperand, param: type.IrTypeId) res[u32, fail.Fail] {
+    var ty:  u32 = 0;
+    var ptr: u32 = chain_target(vm, op, ?ty);
+    if (ptr == 0 && op.kind == mir.MIR_OP_SYM && op.sym_off == 0) {
+        val gx: u32 = gl_lookup(e, op.sym);
+        if (gx != GL_NONE && gl_ir(e, gx).iface != ir.IFACE_NONE) {
+            ptr = e.gvar_ids[gx];
+            ty  = e.gtype_ids[gx];
+        }
+    }
+    if (ptr == 0 || ty == 0) {
+        ret res[u32, fail.Fail].err{reject_at(e, dkind.SPIRV_UNSUPPORTED, mir.refusal_loc(mf, e.cur_instr),
+            op_operand_text(e, row, i, "is a pointer, and this argument names no memory the module can address: pass the address of a shader interface variable, a local, or an element or member of one"))};
+    }
+    val want: u32 = ir_pointee_spv_type(e, param);
+    if (want == 0 || want != ty) {
+        ret res[u32, fail.Fail].err{reject_at(e, dkind.SPIRV_UNSUPPORTED, mir.refusal_loc(mf, e.cur_instr),
+            op_operand_text(e, row, i, "is a pointer whose pointee is not the type the argument addresses in its storage class: an explicitly laid out block member and its function-local counterpart are distinct SPIR-V types, so point at a scalar or vector element"))};
+    }
+    ret res[u32, fail.Fail].ok{ptr};
+}
+
+fun ir_pointee_spv_type(e: *Emit, ptr: type.IrTypeId) u32 {
+    val opt_: opt[*type.IrType] = type.get(?e.ir.types, ptr);
+    if (sel opt_.none)                                                            { ret 0; }
+    if (opt_.some.kind != type.IRT_PTR || opt_.some.data.pointee == type.IRT_NIL) { ret 0; }
+    ret ir_value_spv_type(e, opt_.some.data.pointee);
+}
+
+fun op_operand_text(e: *Emit, row: *isa.OpDef, i: u32, why: str) str {
+    val r: res[str, format.FormatError] = format.sprint(e.alloc, "operand {} of `{}` {}", i + 1, row.name, why);
+    if (sel r.err) { ret why; }
+    ret r.ok;
 }
 
 fun ext_set_id(e: *Emit, set: u32) u32 {
