@@ -2,6 +2,7 @@ use mach.lang.fail;
 use std.allocator.arena;
 use std.allocator.page;
 use fs:       std.filesystem;
+use fmt:      std.format;
 use io_error: std.io.error;
 use std.io.writer;
 use std.system.os;
@@ -46,26 +47,38 @@ use mach.lang.readout;
 use mach.lang.session;
 use mach.lang.source;
 
-# initialise a session, load the manifest, and plan a build for parsed CLI arguments
+# a command's selection, planned: the cells the selectors resolved to, and one
+# plan per selected profile in the order the cells name them
+# ---
+# cells: the resolved (artifact, target, profile) cells
+# plans: one plan per profile; each plans that profile's cells
+pub rec Planned {
+    cells: Vector[manifest.Cell];
+    plans: Vector[plan.BuildPlan];
+}
+
+# initialise a session, load the manifest, resolve the selectors and plan a
+# build of every resolved cell, one plan per profile
 # ---
 # a:              allocator for the request
 # root:           the project root directory
 # cli:            the parsed arguments
 # goal:           what to produce, objects or the finished artifact
+# mode:           how an artifact axis given no pattern is filled without `--all`
 # configure_deps: also resolve every cell against the realized dependency closure,
 #                 filling in its exported dependency steps and export link requirements. a build
 #                 that goes on to execute resolves each cell as it runs it, so only a caller that
 #                 reports the plan instead of running it asks for this
-# ps:             out; the session the plan refers to, initialised here; on an error it has already been
+# ps:             out; the session the plans refer to, initialised here; on an error it has already been
 #                 torn down and the returned failure message is owned by `a`
-# ret:            the plan, configured against the realized dependency closure, or a Fail:
-#                 internal for session or registry setup, user for manifest, selection, request
-#                 and dependency-configuration errors, and whatever plan.plan returns
+# ret:            the plans, or a Fail: internal for session or registry setup, user for manifest,
+#                 selection, request and dependency-configuration errors, `-o` over several cells,
+#                 and whatever planning returns
 pub fun plan_invocation(a: *A.Allocator, root: str, cli: *args.CliArgs, goal: request.BuildGoal,
-    configure_deps: bool, ps: *session.Session) res[plan.BuildPlan, outcome.Fail] {
+    mode: manifest.ArtifactDefault, configure_deps: bool, ps: *session.Session) res[Planned, outcome.Fail] {
     val res_session: res[session.Session, fail.Fail] = session.init(a);
     if (sel res_session.err) {
-        ret res[plan.BuildPlan, outcome.Fail].err{outcome.internal("failed to initialise compiler session")};
+        ret res[Planned, outcome.Fail].err{outcome.internal("failed to initialise compiler session")};
     }
     @ps = res_session.ok;
 
@@ -80,46 +93,85 @@ pub fun plan_invocation(a: *A.Allocator, root: str, cli: *args.CliArgs, goal: re
     }
     var m: manifest.Manifest = res_manifest.ok;
 
-    var pick: manifest.Selection;
-    val sr:   err[outcome.Fail] = args.selection_from_config(cli, ?pick);
-    if (sel sr.err) {
-        ret plan_failure(a, ps, sr.err);
+    val resolved: res[Vector[manifest.Cell], outcome.Fail] = manifest.resolve_cells(ps.alloc, ?ps.interner, ?m, ?cli.selectors, mode);
+    if (sel resolved.err) {
+        ret plan_failure(a, ps, resolved.err);
+    }
+    var planned: Planned;
+    planned.cells = resolved.ok;
+    planned.plans = vector.init[plan.BuildPlan](ps.alloc);
+    if (cli.output != nil && planned.cells.len != 1) {
+        ret plan_failure(a, ps, outcome.user(dkind.OUTPUT_AMBIGUOUS, manifest.single_selection_msg(ps.alloc, "-o names one output", ?planned.cells)));
     }
 
-    val res_req: res[request.BuildRequest, outcome.Fail] = request.compose(a, ?ps.interner, ?m, cli, root, goal, ?pick);
-    if (sel res_req.err) {
-        ret plan_failure(a, ps, res_req.err);
-    }
+    var first: usize = 0;
+    for (first < planned.cells.len) {
+        val profile: str                   = planned.cells.data[first].profile;
+        var group:   Vector[manifest.Cell] = vector.init[manifest.Cell](ps.alloc);
+        var next:    usize                 = first;
+        for (next < planned.cells.len && str_equals(planned.cells.data[next].profile, profile)) {
+            vector.push[manifest.Cell](?group, planned.cells.data[next]);
+            next = next + 1;
+        }
+        first = next;
 
-    val plan_r: res[plan.BuildPlan, outcome.Fail] = plan.plan(ps.alloc, ?ps.interner, ps.registry, ?m,
-        res_req.ok);
-    if (sel plan_r.err) {
-        ret plan_failure(a, ps, plan_r.err);
-    }
-    var bp: plan.BuildPlan = plan_r.ok;
+        var pick:    manifest.Selection                      = manifest.Selection{target: "", profile: profile, artifact: "", want_lib: false, has_artifact: false};
+        val res_req: res[request.BuildRequest, outcome.Fail] = request.compose(a, ?ps.interner, ?m, cli, root, goal, ?pick);
+        if (sel res_req.err) {
+            ret plan_failure(a, ps, res_req.err);
+        }
+        val plan_r: res[plan.BuildPlan, outcome.Fail] = plan.plan_cells(ps.alloc, ?ps.interner, ps.registry, ?m,
+            res_req.ok, ?group);
+        if (sel plan_r.err) {
+            ret plan_failure(a, ps, plan_r.err);
+        }
+        var bp: plan.BuildPlan = plan_r.ok;
 
-    val required: err[outcome.Fail] = plan.plan_dependency_requirements(ps, ?m, ?bp);
-    if (sel required.err) {
-        ret plan_failure(a, ps, required.err);
-    }
+        val required: err[outcome.Fail] = plan.plan_dependency_requirements(ps, ?m, ?bp);
+        if (sel required.err) {
+            ret plan_failure(a, ps, required.err);
+        }
 
-    if (configure_deps) {
-        val configured: err[outcome.Fail] = plan.configure(ps, ?m, ?bp);
-        if (sel configured.err) {
-            ret plan_failure(a, ps, configured.err);
+        if (configure_deps) {
+            val configured: err[outcome.Fail] = plan.configure(ps, ?m, ?bp);
+            if (sel configured.err) {
+                ret plan_failure(a, ps, configured.err);
+            }
+        }
+        val pushed: res[usize, A.Error] = vector.push[plan.BuildPlan](?planned.plans, bp);
+        if (sel pushed.err) {
+            ret plan_failure(a, ps, outcome.refused(pushed.err));
         }
     }
-    ret res[plan.BuildPlan, outcome.Fail].ok{bp};
+    val disjoint: err[outcome.Fail] = plan.check_plan_outputs(ps.alloc, ?planned.plans);
+    if (sel disjoint.err) {
+        ret plan_failure(a, ps, disjoint.err);
+    }
+    ret res[Planned, outcome.Fail].ok{planned};
+}
+
+# name the profile a plan builds before its progress lines, when a selection
+# spans several profiles and the report is for a person
+# ---
+# r:       the report
+# planned: the planned selection
+# bp:      the plan about to run
+# quiet:   `--quiet`
+pub fun announce_profile(r: *cli_diag.Report, planned: *Planned, bp: *plan.BuildPlan, quiet: bool) {
+    if (quiet || planned.plans.len < 2 || r.format != cli_diag.FORMAT_HUMAN) { ret; }
+    fmt.write_str(?r.w, "profile ");
+    fmt.write_str(?r.w, bp.request.profile);
+    fmt.write_str(?r.w, ":\n");
 }
 
 # tear the session down and return a failure whose message outlives it: a message
 # the session allocated dies with `session.dnit`, and every caller renders it after
-fun plan_failure(a: *A.Allocator, ps: *session.Session, failure: outcome.Fail) res[plan.BuildPlan, outcome.Fail] {
+fun plan_failure(a: *A.Allocator, ps: *session.Session, failure: outcome.Fail) res[Planned, outcome.Fail] {
     var stable: outcome.Fail               = outcome.internal("failed to retain the build planning error");
     val kept:   res[outcome.Fail, A.Error] = outcome.retain(a, failure);
     if (sel kept.ok) { stable = kept.ok; }
     session.dnit(ps);
-    ret res[plan.BuildPlan, outcome.Fail].err{stable};
+    ret res[Planned, outcome.Fail].err{stable};
 }
 
 # `mach build`: plan and execute a build of the project operand, rendering diagnostics and
@@ -178,12 +230,9 @@ fun run_reported(r: *cli_diag.Report, argv: **u8, inv: *args.ParsedInvocation, c
         ret cli_diag.report_fail(r, outcome.internal("failed to initialise allocator"), diagnostic.ORIGIN_NONE);
     }
 
-    val res_config: res[args.CliArgs, outcome.Fail] = args.build_cli_invocation(cmd, inv, argv);
+    val res_config: res[args.CliArgs, outcome.Fail] = args.build_cli_invocation(?backing, cmd, inv, argv);
     if (sel res_config.err) { ret cli_diag.report_fail(r, res_config.err, diagnostic.ORIGIN_NONE); }
     var config: args.CliArgs = res_config.ok;
-    if (config.bin != nil && config.lib != nil) {
-        ret cli_diag.report_fail(r, outcome.user(dkind.CLI_FLAG_CONFLICT, "--bin and --lib cannot be combined"), diagnostic.ORIGIN_NONE);
-    }
 
     val plan_only: bool = args.invocation_flag(cmd, inv, "--plan");
     if (quiet_plan_conflict(config.quiet, plan_only)) {
@@ -221,34 +270,43 @@ fun run_reported(r: *cli_diag.Report, argv: **u8, inv: *args.ParsedInvocation, c
     }
 
     var ps:     session.Session;
-    val plan_r: res[plan.BuildPlan, outcome.Fail] = plan_invocation(?menu_alloc, root, ?config, goal, plan_only, ?ps);
+    val plan_r: res[Planned, outcome.Fail] = plan_invocation(?menu_alloc, root, ?config, goal,
+        manifest.ARTIFACT_DEFAULT_SET, plan_only, ?ps);
     if (sel plan_r.err) { ret cli_diag.report_fail(r, plan_r.err, diagnostic.ORIGIN_BUILD); }
     fin { session.dnit(?ps); }
-    val bp: plan.BuildPlan = plan_r.ok;
+    var planned: Planned = plan_r.ok;
 
-    if (plan_only) {
-        val shown: err[outcome.Fail] = plan.explain(?menu_alloc, ?bp, ?ps.interner);
-        if (sel shown.err) { ret cli_diag.report_fail(r, shown.err, diagnostic.ORIGIN_BUILD); }
-        ret exit.OK;
-    }
+    # every plan runs, as every cell of one plan does; the worst outcome is the exit
+    var code: i64   = exit.OK;
+    var pi:   usize = 0;
+    for (pi < planned.plans.len) {
+        val bp: *plan.BuildPlan = ?planned.plans.data[pi];
+        pi = pi + 1;
+        if (plan_only) {
+            val shown: err[outcome.Fail] = plan.explain(?menu_alloc, bp, ?ps.interner);
+            if (sel shown.err) { ret cli_diag.report_fail(r, shown.err, diagnostic.ORIGIN_BUILD); }
+            cnt;
+        }
 
-    var pr: readout.Progress;
-    var ev: *readout.Progress = nil;
-    if (config.verbosity > 0) {
-        readout.init(?pr, ?menu_alloc, config.verbosity);
-        ev = ?pr;
-    }
+        announce_profile(r, ?planned, bp, config.quiet);
+        var pr: readout.Progress;
+        var ev: *readout.Progress = nil;
+        if (config.verbosity > 0) {
+            readout.init(?pr, ?menu_alloc, config.verbosity);
+            ev = ?pr;
+        }
 
-    val ex_r: res[outcome.BuildOutcome, outcome.Fail] = engine.execute(?bp, ?backing, ?menu_alloc, ev);
-    if (ev != nil) {
-        readout.render(ev);
-        readout.dnit(ev);
+        val ex_r: res[outcome.BuildOutcome, outcome.Fail] = engine.execute(bp, ?backing, ?menu_alloc, ev);
+        if (ev != nil) {
+            readout.render(ev);
+            readout.dnit(ev);
+        }
+        if (sel ex_r.err) { ret cli_diag.report_fail(r, ex_r.err, diagnostic.ORIGIN_BUILD); }
+        var bo: outcome.BuildOutcome = ex_r.ok;
+        cli_diag.report_outcome(r, ?bo, config.quiet);
+        code = exit.worst(code, cli_diag.outcome_code(?bo));
+        outcome.outcome_dnit(?bo);
     }
-    if (sel ex_r.err) { ret cli_diag.report_fail(r, ex_r.err, diagnostic.ORIGIN_BUILD); }
-    var bo: outcome.BuildOutcome = ex_r.ok;
-    cli_diag.report_outcome(r, ?bo, config.quiet);
-    val code: i64 = cli_diag.outcome_code(?bo);
-    outcome.outcome_dnit(?bo);
     ret code;
 }
 
@@ -467,13 +525,14 @@ fun str_index(s: str, sub: str) usize {
     ret at.some;
 }
 
+# the arguments of `-t <target> -a <artifact>`, either left out when empty, with `--all` when all
 #[testing]
-fun t_plan_cli(target: str, artifact: str, all_targets: bool) args.CliArgs {
+fun t_plan_cli(a: *A.Allocator, target: str, artifact: str, all: bool) args.CliArgs {
     var cli: args.CliArgs;
-    cli.target = target;
-    cli.bin    = artifact::*u8;
-    if (str_empty(artifact)) { cli.bin = nil; }
-    cli.all_targets = all_targets;
+    cli.selectors     = manifest.selectors_init(a);
+    cli.selectors.all = all;
+    if (!str_empty(target))   { vector.push[str](?cli.selectors.targets, target); }
+    if (!str_empty(artifact)) { vector.push[str](?cli.selectors.artifacts, artifact); }
     ret cli;
 }
 
@@ -493,12 +552,12 @@ fun t_text_sink_write(ctx: ptr, buf: *u8, len: usize) res[usize, writer.WriteErr
 fun t_plan_text(a: *A.Allocator, root: str, cli: *args.CliArgs, configure_deps: bool,
     out_text: *str) err[outcome.Fail] {
     var ps:      session.Session;
-    val planned: res[plan.BuildPlan, outcome.Fail] = plan_invocation(a, root, cli,
-        request.GOAL_ARTIFACT, configure_deps, ?ps);
+    val planned: res[Planned, outcome.Fail] = plan_invocation(a, root, cli,
+        request.GOAL_ARTIFACT, manifest.ARTIFACT_DEFAULT_SET, configure_deps, ?ps);
     if (sel planned.err) {
         ret err[outcome.Fail].err{planned.err};
     }
-    var bp: plan.BuildPlan = planned.ok;
+    var bp: plan.BuildPlan = planned.ok.plans.data[0];
 
     var sink: Vector[u8] = vector.init[u8](a);
     var w:    writer.Writer;
@@ -549,7 +608,7 @@ test plan__displays_the_selection_the_build_produces_and_executes_nothing {
     if (!t_plan_scaffold(?a, T_PLAN_MANIFEST, ?root)) { ret 2; }
     fin { fs.remove_all(?a, root); }
 
-    var cli:      args.CliArgs      = t_plan_cli("", "", true);
+    var cli:      args.CliArgs      = t_plan_cli(?a, "", "", true);
     var text:     str               = "";
     val rendered: err[outcome.Fail] = t_plan_text(?a, root, ?cli, true, ?text);
     if (sel rendered.err) { ret 3; }
@@ -606,7 +665,7 @@ test plan__an_unconfigured_plan_does_not_claim_an_empty_dependency_closure {
     var root: str = "";
     if (!t_plan_scaffold(?a, T_PLAN_MANIFEST, ?root)) { ret 2; }
     fin { fs.remove_all(?a, root); }
-    var cli:           args.CliArgs      = t_plan_cli("host", "app", false);
+    var cli:           args.CliArgs      = t_plan_cli(?a, "host", "app", false);
     var text:          str               = "";
     val t_plan_text_r: err[outcome.Fail] = t_plan_text(?a, root, ?cli, false, ?text);
     if (sel t_plan_text_r.err)                                                { ret 3; }
@@ -629,12 +688,12 @@ test plan__the_object_cache_is_on_by_default_off_under_no_cache_and_for_check {
     var goals: [3]request.BuildGoal = [3]request.BuildGoal{request.GOAL_ARTIFACT, request.GOAL_TESTS, request.GOAL_CHECK};
     var i:     usize                = 0;
     for (i < 6) {
-        var cli: args.CliArgs = t_plan_cli("host", "app", false);
+        var cli: args.CliArgs = t_plan_cli(?a, "host", "app", false);
         cli.no_cache = i >= 3;
         var ps:      session.Session;
-        val planned: res[plan.BuildPlan, outcome.Fail] = plan_invocation(?a, root, ?cli, goals[i % 3], false, ?ps);
+        val planned: res[Planned, outcome.Fail] = plan_invocation(?a, root, ?cli, goals[i % 3], manifest.ARTIFACT_DEFAULT_SET, false, ?ps);
         if (sel planned.err) { ret 3; }
-        val cached: bool = planned.ok.request.object_cache;
+        val cached: bool = planned.ok.plans.data[0].request.object_cache;
         session.dnit(?ps);
         if (cached != (i < 2)) { ret 4 + i::i32; }
         i = i + 1;
@@ -650,7 +709,7 @@ test plan__dependency_prerequisites_missing_realizations_and_cycles_use_the_shar
     val with_dep: str = plan.join_msg(?a, T_PLAN_MANIFEST, "\n[dep.vendor]\npath = \"../source-must-not-be-read\"\n");
     if (!t_plan_scaffold(?a, with_dep, ?root)) { ret 2; }
     fin { fs.remove_all(?a, root); }
-    var cli:  args.CliArgs = t_plan_cli("host", "app", false);
+    var cli:  args.CliArgs = t_plan_cli(?a, "host", "app", false);
     var text: str          = "";
 
     # a dependency that is not realized fails planning exactly as a build fails it
@@ -718,8 +777,8 @@ test plan_failure__the_message_outlives_the_session_it_came_from {
         session.dnit(?s);
         ret 3;
     }
-    val session_owned: str                               = copied.ok;
-    val result:        res[plan.BuildPlan, outcome.Fail] = plan_failure(?a, ?s, outcome.user(dkind.ARTIFACT_NO_OUTPUT, session_owned));
+    val session_owned: str                        = copied.ok;
+    val result:        res[Planned, outcome.Fail] = plan_failure(?a, ?s, outcome.user(dkind.ARTIFACT_NO_OUTPUT, session_owned));
     if (sel result.ok) { ret 4; }
     val failure: outcome.Fail = result.err;
     if (outcome.describe(failure) == session_owned) { ret 5; }
@@ -807,10 +866,9 @@ test check__checks_the_selected_graph_and_runs_no_step {
     narrowed[2] = root::*u8;
     narrowed[3] = "--target"::*u8;
     narrowed[4] = "host"::*u8;
-    narrowed[5] = "--lib"::*u8;
+    narrowed[5] = "-a"::*u8;
     narrowed[6] = "support"::*u8;
     if (t_check(7, ?narrowed[0]) != 0) { ret 14; }
-    narrowed[5] = "--bin"::*u8;
     narrowed[6] = "app"::*u8;
     if (t_check(7, ?narrowed[0]) != 1) { ret 15; }
 
@@ -884,11 +942,11 @@ test check__an_unbuilt_required_artifact_is_named_and_every_cell_reads_as_checke
         || !t_req_write(?a, src, "shader.mach", T_REQ_SHADER)
         || !t_req_write(?a, src, "main.mach", T_REQ_MAIN)) { ret 3; }
 
-    var cli:     args.CliArgs                      = t_plan_cli("host", "app", false);
+    var cli:     args.CliArgs               = t_plan_cli(?a, "host", "app", false);
     var ps:      session.Session;
-    val planned: res[plan.BuildPlan, outcome.Fail] = plan_invocation(?a, root, ?cli, request.GOAL_CHECK, false, ?ps);
+    val planned: res[Planned, outcome.Fail] = plan_invocation(?a, root, ?cli, request.GOAL_CHECK, manifest.ARTIFACT_DEFAULT_SET, false, ?ps);
     if (sel planned.err) { ret 4; }
-    var bp: plan.BuildPlan = planned.ok;
+    var bp: plan.BuildPlan = planned.ok.plans.data[0];
     fin { session.dnit(?ps); }
 
     var oa:      A.Allocator;
@@ -953,11 +1011,11 @@ test check__the_outcome_carries_located_diagnostics_and_a_typed_classification {
     val src: str = t_req_join(?a, root, "src");
     if (!t_req_write(?a, src, "main.mach", "use planfx.support;\nfun start() u64 { ret support.absent(1); }\n")) { ret 3; }
 
-    var cli:     args.CliArgs                      = t_plan_cli("host", "app", false);
+    var cli:     args.CliArgs               = t_plan_cli(?a, "host", "app", false);
     var ps:      session.Session;
-    val planned: res[plan.BuildPlan, outcome.Fail] = plan_invocation(?a, root, ?cli, request.GOAL_CHECK, false, ?ps);
+    val planned: res[Planned, outcome.Fail] = plan_invocation(?a, root, ?cli, request.GOAL_CHECK, manifest.ARTIFACT_DEFAULT_SET, false, ?ps);
     if (sel planned.err) { ret 4; }
-    var bp: plan.BuildPlan = planned.ok;
+    var bp: plan.BuildPlan = planned.ok.plans.data[0];
     fin { session.dnit(?ps); }
     # the selected binary and the artifact it requires are both checked, neither built
     if (bp.units.len != 2) { ret 5; }
@@ -1000,5 +1058,29 @@ test check__the_outcome_carries_located_diagnostics_and_a_typed_classification {
     val exists_r: res[bool, io_error.Error] = fs.exists(t_req_join(?a, root, "out"));
     if (sel exists_r.err)                 { ret 99; }
     if ((sel exists_r.ok && exists_r.ok)) { ret 14; }
+    ret 0;
+}
+
+# `-o` names one output, so a selection resolving to several cells is refused
+# before anything is planned, naming each; one artifact on one target takes it
+test plan_invocation__o_needs_the_selection_to_be_one_cell {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    var root: str = "";
+    if (!t_plan_scaffold(?a, T_PLAN_MANIFEST, ?root)) { ret 2; }
+    fin { fs.remove_all(?a, root); }
+    var cli: args.CliArgs = t_plan_cli(?a, "*", "app", false);
+    cli.output = "bin/app";
+    var ps:   session.Session;
+    val many: res[Planned, outcome.Fail] = plan_invocation(?a, root, ?cli, request.GOAL_ARTIFACT, manifest.ARTIFACT_DEFAULT_SET, false, ?ps);
+    if (sel many.ok)                                                                          { ret 3; }
+    if (outcome.kind_of(many.err) != dkind.OUTPUT_AMBIGUOUS)                                  { ret 4; }
+    if (!str_contains(outcome.describe(many.err), "app on host (debug), app on win (debug)")) { ret 5; }
+    cli        = t_plan_cli(?a, "host", "app", false);
+    cli.output = "bin/app";
+    val one: res[Planned, outcome.Fail] = plan_invocation(?a, root, ?cli, request.GOAL_ARTIFACT, manifest.ARTIFACT_DEFAULT_SET, false, ?ps);
+    if (sel one.err) { ret 6; }
+    session.dnit(?ps);
     ret 0;
 }

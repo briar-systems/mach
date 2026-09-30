@@ -98,6 +98,15 @@ the exit code a failure maps to
 f: the failure
 ret: USER for reported and user failures, ENVIRONMENT for environment, INTERNAL for internal
 
+## fun worst
+
+```mach
+pub fun worst(a: i64, b: i64) i64;
+```
+
+the worse of two shared codes, as a run over several cells reports them:
+INTERNAL over ENVIRONMENT over USER over OK
+
 ## fun notes_valid
 
 ```mach

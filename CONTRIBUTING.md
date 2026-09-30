@@ -55,7 +55,7 @@ the seed release predates. A release newer than the pin builds `a` too, and an
 older one is not supported. On macOS use `aarch64-darwin` or `x86_64-darwin`
 and `shasum -a 256 -c`. On Windows the archive is `mach-$v-x86_64-windows.zip`
 holding `mach.exe`, and the outputs are `a.exe`, `b.exe` and `c.exe`. Add
-`--profile release` to every build for the release fixpoint.
+`-p release` to every build for the release fixpoint.
 
 `-o` names a canonical path inside the project root: relative, `/`-separated,
 with no `.` or `..` component. `-o ../a`, `-o ./a` and an absolute path are
@@ -70,9 +70,9 @@ the seed on `PATH`:
 
 ```bash
 out/linux-x86_64/debug/bin/mach test .
-out/linux-x86_64/debug/bin/mach test . --profile release
-out/linux-x86_64/debug/bin/mach test . --lib tests
-out/linux-x86_64/debug/bin/mach test . --lib tests --profile release
+out/linux-x86_64/debug/bin/mach test . -p release
+out/linux-x86_64/debug/bin/mach test . -a tests
+out/linux-x86_64/debug/bin/mach test . -a tests -p release
 out/linux-x86_64/debug/bin/mach fmt .
 ```
 

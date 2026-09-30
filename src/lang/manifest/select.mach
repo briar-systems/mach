@@ -1,0 +1,575 @@
+# the selection a command's `-a`, `-t` and `-p` options and `--all` describe,
+# resolved against a manifest into the (artifact, target, profile) cells it
+# covers. each axis takes exact names and globs (`*` any run, `?` any one
+# byte); an axis given no pattern is `*` under `--all` and otherwise the
+# manifest's default. no cell is chosen by table order
+use mach.lang.build.outcome;
+use std.allocator.arena;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use fs:       std.filesystem;
+use io_error: std.io.error;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_contains;
+use std.types.string.str_empty;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+
+use dkind: mach.lang.diagnostic.kind;
+use mach.lang.intern;
+use tgt: mach.lang.target;
+
+use mach.lang.manifest.artifact.artifact_supports_target;
+use mach.lang.manifest.load.tparse;
+use mach.lang.manifest.model.ArtifactDef;
+use mach.lang.manifest.model.Manifest;
+use mach.lang.manifest.model.TargetDef;
+use mach.lang.manifest.parse.glob_matches;
+use mach.lang.manifest.parse.idstr;
+use mach.lang.manifest.parse.is_glob;
+use mach.lang.manifest.parse.sfmt;
+use mach.lang.manifest.parse.tinit;
+use mach.lang.manifest.plan.ResolvedProfile;
+use mach.lang.manifest.plan.ResolvedTarget;
+use mach.lang.manifest.plan.Selection;
+use mach.lang.manifest.plan.default_selection_includes;
+use mach.lang.manifest.plan.resolve_profile;
+use mach.lang.manifest.plan.resolve_target;
+use mach.lang.manifest.plan.select_primary_artifact;
+use mach.lang.manifest.plan.select_sole_executable_artifact;
+use mach.lang.manifest.project.host_isa_name;
+use mach.lang.manifest.project.host_os_name;
+use mach.lang.manifest.project.host_target_table;
+use mach.lang.manifest.project.target_matches_host;
+
+# how an artifact axis given no pattern is filled when `--all` does not fill it
+pub def ArtifactDefault: u8;
+# every artifact the default selection holds for the target: build and check
+pub val ARTIFACT_DEFAULT_SET: ArtifactDefault = 0;
+# the one artifact the default selection holds, refused when it holds several: test and doc
+pub val ARTIFACT_DEFAULT_ONE: ArtifactDefault = 1;
+# the one `bin` the default selection holds, else the sole declared artifact: run
+pub val ARTIFACT_DEFAULT_EXECUTABLE: ArtifactDefault = 2;
+
+# the selector axes as a command gave them
+# ---
+# artifacts: `-a` patterns in the order given
+# targets:   `-t` patterns in the order given
+# profiles:  `-p` patterns in the order given
+# all:       `--all`: every axis given no pattern is `*`
+pub rec Selectors {
+    artifacts: Vector[str];
+    targets:   Vector[str];
+    profiles:  Vector[str];
+    all:       bool;
+}
+
+# one resolved cell of a selection
+# ---
+# artifact:    the declared artifact name
+# target:      the target the cell is planned with: the declared name, or "" when
+#              the target axis took the manifest's default, so planning resolves it
+#              (and warns about a fallback) exactly as an unselected build does
+# target_name: the declared target the cell resolves to
+# profile:     the declared profile name
+# native:      the target's `os` and `isa` are the host's, so its programs run here
+pub rec Cell {
+    artifact:    str;
+    target:      str;
+    target_name: str;
+    profile:     str;
+    native:      bool;
+}
+
+# empty selectors: every axis takes the manifest's default
+# ---
+# alloc: backs the three pattern vectors
+pub fun selectors_init(alloc: *A.Allocator) Selectors {
+    ret Selectors{
+        artifacts: vector.init[str](alloc), targets: vector.init[str](alloc),
+        profiles:  vector.init[str](alloc), all: false
+    };
+}
+
+# the host as `mach info` names it, `<os>-<isa>`, which a cell is native to when
+# its target's os and isa are these
+pub fun host_label(alloc: *A.Allocator) str {
+    ret sfmt(alloc, "{}-{}", host_os_name(), host_isa_name());
+}
+
+# the cell as a person names it: `<artifact> on <target> (<profile>)`
+pub fun cell_label(alloc: *A.Allocator, c: *Cell) str {
+    ret sfmt(alloc, "{} on {} ({})", c.artifact, c.target_name, c.profile);
+}
+
+# every cell's label, comma separated, for a refusal that names the selection
+pub fun cell_labels(alloc: *A.Allocator, cells: *Vector[Cell]) str {
+    var s: str   = "";
+    var i: usize = 0;
+    for (i < cells.len) {
+        if (i > 0) { s = sfmt(alloc, "{}, ", s); }
+        s = sfmt(alloc, "{}{}", s, cell_label(alloc, ?cells.data[i]));
+        i = i + 1;
+    }
+    ret s;
+}
+
+# the refusal of an option or command that needs one (artifact, target, profile)
+# when the selection resolved to several, naming each
+# ---
+# alloc: owns the message
+# what:  what needs one, such as "-o names one output"
+# cells: the resolved cells
+pub fun single_selection_msg(alloc: *A.Allocator, what: str, cells: *Vector[Cell]) str {
+    ret sfmt(alloc, "{} but the selection resolves to {} (artifact, target, profile) combinations ({}); narrow it with -a, -t and -p",
+        what, cells.len::i64, cell_labels(alloc, cells));
+}
+
+# one entry an axis selected, and whether an exact name selected it rather than a glob
+rec Pick {
+    index: u32;
+    exact: bool;
+}
+
+# the names one axis selects from, in declaration order
+rec Axis {
+    flag:  str;
+    noun:  str;
+    names: Vector[str];
+}
+
+fun axis_listing(alloc: *A.Allocator, ax: *Axis) str {
+    if (ax.names.len == 0) { ret "none declared"; }
+    var s: str   = "declared: ";
+    var i: usize = 0;
+    for (i < ax.names.len) {
+        if (i > 0) { s = sfmt(alloc, "{}, ", s); }
+        s = sfmt(alloc, "{}{}", s, ax.names.data[i]);
+        i = i + 1;
+    }
+    ret s;
+}
+
+# an exact value that names nothing on its axis but a path in the working
+# directory is almost always the shell expanding an unquoted `*`
+fun unknown_name(alloc: *A.Allocator, ax: *Axis, value: str) outcome.Fail {
+    val present: res[bool, io_error.Error] = fs.exists(value);
+    if (sel present.ok && present.ok) {
+        ret outcome.user(dkind.CLI_FLAG_VALUE, sfmt(alloc,
+            "{} '{}' names no {} but names a path in the current directory: the shell probably expanded an unquoted wildcard; quote the pattern, as in {} '*' ({})",
+            ax.flag, value, ax.noun, ax.flag, axis_listing(alloc, ax)));
+    }
+    ret outcome.user(dkind.SELECTION_UNKNOWN, sfmt(alloc, "mach.toml: no {} named '{}' ({})", ax.noun, value, axis_listing(alloc, ax)));
+}
+
+# the entries an axis's patterns select, in declaration order; every exact
+# name must be declared and every glob must match at least one entry
+fun pick_axis(alloc: *A.Allocator, ax: *Axis, patterns: *Vector[str], out: *Vector[Pick]) err[outcome.Fail] {
+    var pi: usize = 0;
+    for (pi < patterns.len) {
+        val pattern: str   = patterns.data[pi];
+        var hit:     bool  = false;
+        var ni:      usize = 0;
+        for (ni < ax.names.len) {
+            if (glob_matches(pattern, ax.names.data[ni])) { hit = true; }
+            ni = ni + 1;
+        }
+        if (!hit) {
+            if (!is_glob(pattern)) { ret err[outcome.Fail].err{unknown_name(alloc, ax, pattern)}; }
+            ret err[outcome.Fail].err{outcome.user(dkind.SELECTION_UNKNOWN, sfmt(alloc,
+                "{} '{}' matches no {} ({})", ax.flag, pattern, ax.noun, axis_listing(alloc, ax)))};
+        }
+        pi = pi + 1;
+    }
+    var ni: usize = 0;
+    for (ni < ax.names.len) {
+        var matched: bool  = false;
+        var exact:   bool  = false;
+        var qi:      usize = 0;
+        for (qi < patterns.len) {
+            if (glob_matches(patterns.data[qi], ax.names.data[ni])) {
+                matched = true;
+                if (!is_glob(patterns.data[qi])) { exact = true; }
+            }
+            qi = qi + 1;
+        }
+        if (matched) {
+            val pushed: res[usize, A.Error] = vector.push[Pick](out, Pick{index: ni::u32, exact: exact});
+            if (sel pushed.err) { ret err[outcome.Fail].err{outcome.refused(pushed.err)}; }
+        }
+        ni = ni + 1;
+    }
+    ret err[outcome.Fail].ok{};
+}
+
+fun axis_init(alloc: *A.Allocator, flag: str, noun: str) Axis {
+    ret Axis{flag: flag, noun: noun, names: vector.init[str](alloc)};
+}
+
+fun axis_add(ax: *Axis, itn: *intern.Interner, id: intern.StrId) err[outcome.Fail] {
+    val pushed: res[usize, A.Error] = vector.push[str](?ax.names, idstr(itn, id));
+    if (sel pushed.err) { ret err[outcome.Fail].err{outcome.refused(pushed.err)}; }
+    ret err[outcome.Fail].ok{};
+}
+
+# the patterns an axis is resolved with: the given ones, `*` under `--all`, none otherwise
+fun axis_patterns(alloc: *A.Allocator, given: *Vector[str], all: bool) Vector[str] {
+    if (given.len > 0 || !all) { ret @given; }
+    var star: Vector[str] = vector.init[str](alloc);
+    vector.push[str](?star, "*");
+    ret star;
+}
+
+# the targets the target axis chooses among: the declared ones, or the host
+# target synthesized for a manifest that declares none
+fun target_def_at(m: *Manifest, i: u32) *TargetDef {
+    if (m.target_count == 0) { ret m.native_target; }
+    ret ?m.targets[i];
+}
+
+fun target_candidates(m: *Manifest) u32 {
+    if (m.target_count == 0 && m.native_target != nil) { ret 1; }
+    ret m.target_count;
+}
+
+# one (artifact, target) pair of the selection before profiles cross it
+rec Pair {
+    artifact: *ArtifactDef;
+    target:   str;
+    def:      *TargetDef;
+}
+
+fun push_pair(pairs: *Vector[Pair], a: *ArtifactDef, target: str, def: *TargetDef) err[outcome.Fail] {
+    var i: usize = 0;
+    for (i < pairs.len) {
+        if (pairs.data[i].artifact == a && pairs.data[i].def == def) { ret err[outcome.Fail].ok{}; }
+        i = i + 1;
+    }
+    val pushed: res[usize, A.Error] = vector.push[Pair](pairs, Pair{artifact: a, target: target, def: def});
+    if (sel pushed.err) { ret err[outcome.Fail].err{outcome.refused(pushed.err)}; }
+    ret err[outcome.Fail].ok{};
+}
+
+fun artifact_named(itn: *intern.Interner, m: *Manifest, name: str) *ArtifactDef {
+    var i: u32 = 0;
+    for (i < m.artifact_count) {
+        if (str_equals(idstr(itn, m.artifacts[i].name), name)) { ret ?m.artifacts[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun supporting_count(itn: *intern.Interner, m: *Manifest, def: *TargetDef, executables_only: bool) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < m.artifact_count) {
+        val a: *ArtifactDef = ?m.artifacts[i];
+        if (!(executables_only && a.is_lib) && artifact_supports_target(itn, a, def.name)) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+fun no_artifact_for(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, def: *TargetDef) outcome.Fail {
+    var names: str = "";
+    var i:     u32 = 0;
+    for (i < m.artifact_count) {
+        if (i > 0) { names = sfmt(alloc, "{}, ", names); }
+        names = sfmt(alloc, "{}{}", names, idstr(itn, m.artifacts[i].name));
+        i     = i + 1;
+    }
+    ret outcome.user(dkind.TARGET_NO_ARTIFACTS, sfmt(alloc, "mach.toml: no artifact declares target '{}'; declared artifacts: {}", idstr(itn, def.name), names));
+}
+
+# the artifacts the default selection holds for one target, by `mode`. an
+# exact target the default selection is empty for is refused; a globbed one is
+# skipped, as its other targets may well hold artifacts
+fun default_pairs(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, mode: ArtifactDefault,
+    target: str, def: *TargetDef, exact: bool, pairs: *Vector[Pair]) err[outcome.Fail] {
+    if (m.artifact_count == 0) {
+        ret err[outcome.Fail].err{outcome.user(dkind.ARTIFACT_NONE_DECLARED, "mach.toml: no [artifact.*] artifacts declared")};
+    }
+    if (supporting_count(itn, m, def, false) == 0) {
+        if (exact) { ret err[outcome.Fail].err{no_artifact_for(alloc, itn, m, def)}; }
+        ret err[outcome.Fail].ok{};
+    }
+    if (mode == ARTIFACT_DEFAULT_SET) {
+        var i: u32 = 0;
+        for (i < m.artifact_count) {
+            val a: *ArtifactDef = ?m.artifacts[i];
+            if (default_selection_includes(itn, m, a, def.name, false)) {
+                val pushed: err[outcome.Fail] = push_pair(pairs, a, target, def);
+                if (sel pushed.err) { ret pushed; }
+            }
+            i = i + 1;
+        }
+        ret err[outcome.Fail].ok{};
+    }
+
+    var pick: Selection = Selection{target: target, profile: "", artifact: "", want_lib: false, has_artifact: false};
+    if (mode == ARTIFACT_DEFAULT_ONE) {
+        val chosen: err[outcome.Fail] = select_primary_artifact(alloc, itn, m, ?pick);
+        if (sel chosen.err) { ret chosen; }
+    }
+    or {
+        val chosen: err[outcome.Fail] = select_sole_executable_artifact(alloc, itn, m, ?pick);
+        if (sel chosen.err) { ret chosen; }
+    }
+    var a: *ArtifactDef = nil;
+    if (pick.has_artifact)     { a = artifact_named(itn, m, pick.artifact); }
+    or (m.artifact_count == 1) { a = ?m.artifacts[0]; }
+    if (a == nil) {
+        ret err[outcome.Fail].err{outcome.user(dkind.SELECTION_AMBIGUOUS, sfmt(alloc,
+            "mach.toml: several artifacts support target '{}' and none is a sole default; select one with -a", idstr(itn, def.name)))};
+    }
+    if (!artifact_supports_target(itn, a, def.name)) {
+        if (exact) { ret err[outcome.Fail].err{no_artifact_for(alloc, itn, m, def)}; }
+        ret err[outcome.Fail].ok{};
+    }
+    ret push_pair(pairs, a, target, def);
+}
+
+fun unsupported(alloc: *A.Allocator, itn: *intern.Interner, a: *ArtifactDef, def: *TargetDef) outcome.Fail {
+    ret outcome.at(alloc, outcome.user(dkind.SELECTION_UNSUPPORTED_TARGET, sfmt(alloc,
+        "mach.toml: artifact '{}' does not support target '{}'", idstr(itn, a.name), idstr(itn, def.name))), a.targets_at);
+}
+
+# resolve selectors against a manifest into the cells they cover, profiles
+# outermost, then targets, then artifacts, each in declaration order. an
+# artifact is paired only with the targets its `targets` list supports: an
+# exact artifact with an exact target it does not support is refused, any
+# other unsupported pair is left out. an empty selection is refused
+# ---
+# alloc: owns the cells and every message
+# itn:   resolves names
+# m:     the root manifest
+# s:     the selectors
+# mode:  how an artifact axis given no pattern is filled without `--all`
+# ret:   the cells, never empty; err for an unknown name, a glob matching
+#        nothing, an unsupported exact pair, an ambiguous default or an empty selection
+pub fun resolve_cells(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, s: *Selectors,
+    mode: ArtifactDefault) res[Vector[Cell], outcome.Fail] {
+    var profiles:         Vector[str] = vector.init[str](alloc);
+    val profile_patterns: Vector[str] = axis_patterns(alloc, ?s.profiles, s.all);
+    if (profile_patterns.len > 0) {
+        var ax: Axis = axis_init(alloc, "-p", "profile");
+        var i:  u32  = 0;
+        for (i < m.profile_count) {
+            val added: err[outcome.Fail] = axis_add(?ax, itn, m.profiles[i].name);
+            if (sel added.err) { ret res[Vector[Cell], outcome.Fail].err{added.err}; }
+            i = i + 1;
+        }
+        var picks:  Vector[Pick]      = vector.init[Pick](alloc);
+        val picked: err[outcome.Fail] = pick_axis(alloc, ?ax, ?profile_patterns, ?picks);
+        if (sel picked.err) { ret res[Vector[Cell], outcome.Fail].err{picked.err}; }
+        var k: usize = 0;
+        for (k < picks.len) {
+            vector.push[str](?profiles, ax.names.data[picks.data[k].index]);
+            k = k + 1;
+        }
+    }
+    or {
+        val rp: res[ResolvedProfile, outcome.Fail] = resolve_profile(alloc, itn, m, "");
+        if (sel rp.err) { ret res[Vector[Cell], outcome.Fail].err{rp.err}; }
+        vector.push[str](?profiles, idstr(itn, rp.ok.name));
+    }
+
+    var artifacts:         Vector[Pick] = vector.init[Pick](alloc);
+    val artifact_patterns: Vector[str]  = axis_patterns(alloc, ?s.artifacts, s.all);
+    val artifacts_given:   bool         = artifact_patterns.len > 0;
+    if (artifacts_given) {
+        var ax: Axis = axis_init(alloc, "-a", "artifact");
+        var i:  u32  = 0;
+        for (i < m.artifact_count) {
+            val added: err[outcome.Fail] = axis_add(?ax, itn, m.artifacts[i].name);
+            if (sel added.err) { ret res[Vector[Cell], outcome.Fail].err{added.err}; }
+            i = i + 1;
+        }
+        val picked: err[outcome.Fail] = pick_axis(alloc, ?ax, ?artifact_patterns, ?artifacts);
+        if (sel picked.err) { ret res[Vector[Cell], outcome.Fail].err{picked.err}; }
+    }
+
+    var pairs:           Vector[Pair] = vector.init[Pair](alloc);
+    var skipped:         bool         = false;
+    var skipped_fail:    outcome.Fail;
+    val target_patterns: Vector[str]  = axis_patterns(alloc, ?s.targets, s.all);
+    if (target_patterns.len > 0) {
+        var ax: Axis = axis_init(alloc, "-t", "target");
+        val n:  u32  = target_candidates(m);
+        var i:  u32  = 0;
+        for (i < n) {
+            val added: err[outcome.Fail] = axis_add(?ax, itn, target_def_at(m, i).name);
+            if (sel added.err) { ret res[Vector[Cell], outcome.Fail].err{added.err}; }
+            i = i + 1;
+        }
+        var targets: Vector[Pick]      = vector.init[Pick](alloc);
+        val picked:  err[outcome.Fail] = pick_axis(alloc, ?ax, ?target_patterns, ?targets);
+        if (sel picked.err) { ret res[Vector[Cell], outcome.Fail].err{picked.err}; }
+        var ti: usize = 0;
+        for (ti < targets.len) {
+            val tp:    Pick       = targets.data[ti];
+            val def:   *TargetDef = target_def_at(m, tp.index);
+            val tname: str        = ax.names.data[tp.index];
+            if (artifacts_given) {
+                var ai: usize = 0;
+                for (ai < artifacts.len) {
+                    val ap: Pick         = artifacts.data[ai];
+                    val a:  *ArtifactDef = ?m.artifacts[ap.index];
+                    if (artifact_supports_target(itn, a, def.name)) {
+                        val pushed: err[outcome.Fail] = push_pair(?pairs, a, tname, def);
+                        if (sel pushed.err) { ret res[Vector[Cell], outcome.Fail].err{pushed.err}; }
+                    }
+                    or (ap.exact && tp.exact) { ret res[Vector[Cell], outcome.Fail].err{unsupported(alloc, itn, a, def)}; }
+                    ai = ai + 1;
+                }
+            }
+            or {
+                val filled: err[outcome.Fail] = default_pairs(alloc, itn, m, mode, tname, def, tp.exact, ?pairs);
+                if (sel filled.err) { ret res[Vector[Cell], outcome.Fail].err{filled.err}; }
+            }
+            ti = ti + 1;
+        }
+    }
+    or (artifacts_given) {
+        var ai: usize = 0;
+        for (ai < artifacts.len) {
+            val ap: Pick                              = artifacts.data[ai];
+            val a:  *ArtifactDef                      = ?m.artifacts[ap.index];
+            val rt: res[ResolvedTarget, outcome.Fail] = resolve_target(alloc, itn, m, "", a);
+            # a globbed artifact with no default target is left out; its refusal
+            # stands only when nothing else was selected
+            if (sel rt.err) {
+                if (ap.exact) { ret res[Vector[Cell], outcome.Fail].err{rt.err}; }
+                if (!skipped) {
+                    skipped      = true;
+                    skipped_fail = rt.err;
+                }
+                ai = ai + 1;
+                cnt;
+            }
+            val def: *TargetDef = rt.ok.target;
+            if (artifact_supports_target(itn, a, def.name)) {
+                val pushed: err[outcome.Fail] = push_pair(?pairs, a, "", def);
+                if (sel pushed.err) { ret res[Vector[Cell], outcome.Fail].err{pushed.err}; }
+            }
+            or (ap.exact) {
+                ret res[Vector[Cell], outcome.Fail].err{outcome.at(alloc, outcome.user(dkind.SELECTION_UNSUPPORTED_TARGET, sfmt(alloc,
+                    "mach.toml: artifact '{}' does not support the default target '{}'; select one of its targets with -t",
+                    idstr(itn, a.name), idstr(itn, def.name))), a.targets_at)};
+            }
+            ai = ai + 1;
+        }
+    }
+    or {
+        val rt: res[ResolvedTarget, outcome.Fail] = resolve_target(alloc, itn, m, "", nil);
+        if (sel rt.err) { ret res[Vector[Cell], outcome.Fail].err{rt.err}; }
+        val filled: err[outcome.Fail] = default_pairs(alloc, itn, m, mode, "", rt.ok.target, true, ?pairs);
+        if (sel filled.err) { ret res[Vector[Cell], outcome.Fail].err{filled.err}; }
+    }
+
+    if (pairs.len == 0) {
+        if (skipped) { ret res[Vector[Cell], outcome.Fail].err{skipped_fail}; }
+        ret res[Vector[Cell], outcome.Fail].err{outcome.user(dkind.TARGET_NO_ARTIFACTS,
+            "mach.toml: the selection holds no artifact on a target it supports; widen -a or -t")};
+    }
+
+    val host_os:   u32          = tgt.host_os_id();
+    val host_arch: u32          = tgt.host_arch_id();
+    var cells:     Vector[Cell] = vector.init[Cell](alloc);
+    var pi:        usize        = 0;
+    for (pi < profiles.len) {
+        var qi: usize = 0;
+        for (qi < pairs.len) {
+            val p: Pair = pairs.data[qi];
+            val c: Cell = Cell{
+                artifact: idstr(itn, p.artifact.name), target: p.target, target_name: idstr(itn, p.def.name),
+                profile:  profiles.data[pi], native: target_matches_host(itn, p.def, host_os, host_arch)
+            };
+            val pushed: res[usize, A.Error] = vector.push[Cell](?cells, c);
+            if (sel pushed.err) { ret res[Vector[Cell], outcome.Fail].err{outcome.refused(pushed.err)}; }
+            qi = qi + 1;
+        }
+        pi = pi + 1;
+    }
+    ret res[Vector[Cell], outcome.Fail].ok{cells};
+}
+
+#[testing]
+fun ut_cells(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, a: str, t: str, p: str, all: bool,
+    mode: ArtifactDefault) res[Vector[Cell], outcome.Fail] {
+    var s: Selectors = selectors_init(alloc);
+    s.all = all;
+    if (!str_empty(a)) { vector.push[str](?s.artifacts, a); }
+    if (!str_empty(t)) { vector.push[str](?s.targets, t); }
+    if (!str_empty(p)) { vector.push[str](?s.profiles, p); }
+    ret resolve_cells(alloc, itn, m, ?s, mode);
+}
+
+#[testing]
+fun ut_refused(r: res[Vector[Cell], outcome.Fail], kind: dkind.Kind, text: str) bool {
+    if (sel r.ok) { ret false; }
+    ret outcome.kind_of(r.err) == kind && str_contains(outcome.describe(r.err), text);
+}
+
+# each axis takes exact names and globs, `--all` fills the axes no option names,
+# a glob filters unsupported pairs while two exact names are refused, and a
+# selection that names nothing is refused rather than planned empty
+test resolve_cells__patterns_all_and_filters {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    fin { arena.dnit(?ar); }
+    val src: str = sfmt(?alloc, "{}{}{}",
+        "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}/{profile.name}\"\n",
+        host_target_table(?alloc, "lin"),
+        "[target.fs]\nisa=\"x86_64\"\nos=\"freestanding\"\nabi=\"sysv64\"\n[target.win]\nisa=\"x86_64\"\nos=\"windows\"\nabi=\"win64\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n[artifact.app]\nkind=\"bin\"\nentry=\"app.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n[artifact.tool]\nkind=\"bin\"\nentry=\"tool.mach\"\nout=\"bin/tool\"\ntargets=[\"lin\"]\nlink=[]\nneed=[]\n[artifact.lib]\nkind=\"static\"\nentry=\"lib.mach\"\nout=\"lib/lib\"\ntargets=[\"lin\", \"fs\"]\nlink=[]\nneed=[]\n");
+    val parsed: res[Manifest, outcome.Fail] = tparse(?alloc, ?itn, src);
+    if (sel parsed.err) { ret 2; }
+    var m: Manifest = parsed.ok;
+
+    # no option: the native target's default selection in the default profile
+    val none: res[Vector[Cell], outcome.Fail] = ut_cells(?alloc, ?itn, ?m, "", "", "", false, ARTIFACT_DEFAULT_SET);
+    if (sel none.err)                                                                                                                { ret 3; }
+    if (none.ok.len != 3)                                                                                                            { ret 3; }
+    if (!str_equals(none.ok.data[0].target_name, "lin") || !str_equals(none.ok.data[0].profile, "debug") || !none.ok.data[0].native) { ret 4; }
+
+    # --all: every supported pair in every profile, profiles outermost
+    val every: res[Vector[Cell], outcome.Fail] = ut_cells(?alloc, ?itn, ?m, "", "", "", true, ARTIFACT_DEFAULT_SET);
+    if (sel every.err)                                                              { ret 5; }
+    if (every.ok.len != 12)                                                         { ret 5; }
+    if (!str_equals(every.ok.data[6].profile, "release"))                           { ret 6; }
+    if (!str_equals(every.ok.data[3].target_name, "fs") || every.ok.data[3].native) { ret 7; }
+
+    # --all with -p debug narrows only the profile axis
+    val debug: res[Vector[Cell], outcome.Fail] = ut_cells(?alloc, ?itn, ?m, "", "", "debug", true, ARTIFACT_DEFAULT_SET);
+    if (sel debug.err)     { ret 8; }
+    if (debug.ok.len != 6) { ret 8; }
+
+    # `?` matches one byte; a glob target filters the pairs the artifact does not support
+    val app: res[Vector[Cell], outcome.Fail] = ut_cells(?alloc, ?itn, ?m, "a?p", "*", "", false, ARTIFACT_DEFAULT_SET);
+    if (sel app.err)     { ret 9; }
+    if (app.ok.len != 3) { ret 9; }
+    val tool: res[Vector[Cell], outcome.Fail] = ut_cells(?alloc, ?itn, ?m, "tool", "*", "", false, ARTIFACT_DEFAULT_SET);
+    if (sel tool.err)                                                   { ret 10; }
+    if (tool.ok.len != 1 || !str_equals(tool.ok.data[0].target, "lin")) { ret 10; }
+
+    if (!ut_refused(ut_cells(?alloc, ?itn, ?m, "tool", "win", "", false, ARTIFACT_DEFAULT_SET), dkind.SELECTION_UNSUPPORTED_TARGET, "does not support target 'win'")) { ret 11; }
+    if (!ut_refused(ut_cells(?alloc, ?itn, ?m, "tool", "w*", "", false, ARTIFACT_DEFAULT_SET), dkind.TARGET_NO_ARTIFACTS, "holds no artifact"))                       { ret 12; }
+    if (!ut_refused(ut_cells(?alloc, ?itn, ?m, "nope", "", "", false, ARTIFACT_DEFAULT_SET), dkind.SELECTION_UNKNOWN, "declared: app, tool, lib"))                    { ret 13; }
+    if (!ut_refused(ut_cells(?alloc, ?itn, ?m, "z*", "", "", false, ARTIFACT_DEFAULT_SET), dkind.SELECTION_UNKNOWN, "-a 'z*' matches no artifact"))                   { ret 14; }
+    if (!ut_refused(ut_cells(?alloc, ?itn, ?m, "", "", "fast", false, ARTIFACT_DEFAULT_SET), dkind.SELECTION_UNKNOWN, "no profile named 'fast'"))                     { ret 15; }
+    # a value naming no entry but an existing path is the shell's expansion of an unquoted glob
+    if (!ut_refused(ut_cells(?alloc, ?itn, ?m, "", "/", "", false, ARTIFACT_DEFAULT_SET), dkind.CLI_FLAG_VALUE, "quote the pattern, as in -t '*'")) { ret 16; }
+    # a command that needs one artifact refuses a default selection of three
+    if (!ut_refused(ut_cells(?alloc, ?itn, ?m, "", "lin", "", false, ARTIFACT_DEFAULT_ONE), dkind.SELECTION_AMBIGUOUS, "none is marked `default = true`")) { ret 17; }
+    ret 0;
+}

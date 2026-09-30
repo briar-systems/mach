@@ -490,7 +490,8 @@ pub rec TestArtifact;
 ```
 
 a collected test: its qualified name, where it is declared, the test object
-that holds it, and the dispatcher that runs it as `<exe> <idx>`
+that holds it, the dispatcher that runs it as `<exe> <idx>`, and the target and
+profile that dispatcher was built for
 
 ## rec BuildUnitEvent
 

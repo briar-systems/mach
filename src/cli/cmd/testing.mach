@@ -1,6 +1,8 @@
 use mach.lang.alloc;
 use std.allocator.arena;
 use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
 use io_error: std.io.error;
 use std.print;
 use std.process.env;
@@ -40,6 +42,7 @@ use btest: mach.lang.build.testing;
 use mach.lang.diagnostic;
 use dkind: mach.lang.diagnostic.kind;
 use mach.lang.duration;
+use mach.lang.manifest;
 use mach.lang.output;
 use mach.lang.readout;
 use mach.lang.session;
@@ -102,7 +105,7 @@ fun run_reported(r: *cli_diag.Report, argv: **u8, inv: *args.ParsedInvocation) i
     val make_r2: err[A.Error] = arena.make(?a, ?ar);
     if (sel make_r2.err) { ret cli_diag.report_fail(r, outcome.refused(make_r2.err), diagnostic.ORIGIN_NONE); }
 
-    val res_cfg: res[args.CliArgs, outcome.Fail] = args.build_cli_invocation(cmd, inv, argv);
+    val res_cfg: res[args.CliArgs, outcome.Fail] = args.build_cli_invocation(?a, cmd, inv, argv);
     if (sel res_cfg.err) { ret cli_diag.report_fail(r, res_cfg.err, diagnostic.ORIGIN_NONE); }
     var config: args.CliArgs = res_cfg.ok;
 
@@ -168,43 +171,84 @@ fun run_reported(r: *cli_diag.Report, argv: **u8, inv: *args.ParsedInvocation) i
     if (list) { goal = request.GOAL_TEST_LIST; }
 
     var ps:     session.Session;
-    val plan_r: res[plan.BuildPlan, outcome.Fail] = build.plan_invocation(?a, root, ?config, goal, false, ?ps);
+    val plan_r: res[build.Planned, outcome.Fail] = build.plan_invocation(?a, root, ?config, goal,
+        manifest.ARTIFACT_DEFAULT_ONE, false, ?ps);
     if (sel plan_r.err) { ret cli_diag.report_fail(r, plan_r.err, diagnostic.ORIGIN_BUILD); }
-    var bp: plan.BuildPlan = plan_r.ok;
-    # the filter selects the tests the dispatcher is linked over
-    if (sel opt_filter.some) { bp.request.test_filter = opt_filter.some::str; }
-
-    var pr: readout.Progress;
-    var ev: *readout.Progress = nil;
-    if (level > 0) {
-        readout.init(?pr, ?a, level);
-        ev = ?pr;
+    var planned: build.Planned = plan_r.ok;
+    if (sel opt_runner.some && planned.cells.len != 1) {
+        val msg: str = manifest.single_selection_msg(?a, "--runner launches the tests of one selection", ?planned.cells);
+        session.dnit(?ps);
+        ret cli_diag.report_fail(r, outcome.user(dkind.SELECTION_AMBIGUOUS, msg), diagnostic.ORIGIN_NONE);
     }
 
-    val ex_r: res[outcome.BuildOutcome, outcome.Fail] = engine.execute(?bp, ?backing, ?a, ev);
-    if (ev != nil) {
-        readout.render(ev);
-        readout.dnit(ev);
+    # every selected combination is built before any test runs, and none runs
+    # when one failed to build
+    var collected: Vector[outcome.TestArtifact] = vector.init[outcome.TestArtifact](?a);
+    var built:     i64                          = exit.OK;
+    var pi:        usize                        = 0;
+    for (pi < planned.plans.len) {
+        val bp: *plan.BuildPlan = ?planned.plans.data[pi];
+        pi = pi + 1;
+        # the filter selects the tests the dispatcher is linked over
+        if (sel opt_filter.some) { bp.request.test_filter = opt_filter.some::str; }
+
+        build.announce_profile(r, ?planned, bp, config.quiet);
+        var pr: readout.Progress;
+        var ev: *readout.Progress = nil;
+        if (level > 0) {
+            readout.init(?pr, ?a, level);
+            ev = ?pr;
+        }
+
+        val ex_r: res[outcome.BuildOutcome, outcome.Fail] = engine.execute(bp, ?backing, ?a, ev);
+        if (ev != nil) {
+            readout.render(ev);
+            readout.dnit(ev);
+        }
+        if (sel ex_r.err) {
+            session.dnit(?ps);
+            ret cli_diag.report_fail(r, ex_r.err, diagnostic.ORIGIN_BUILD);
+        }
+        var bo: outcome.BuildOutcome = ex_r.ok;
+        cli_diag.report_outcome(r, ?bo, config.quiet);
+        if (bo.severity != outcome.BUILD_OK) {
+            built = exit.worst(built, cli_diag.outcome_code(?bo));
+            cnt;
+        }
+        var ti: usize = 0;
+        for (ti < bo.tests.len) {
+            val pushed: res[usize, A.Error] = vector.push[outcome.TestArtifact](?collected, bo.tests.data[ti]);
+            if (sel pushed.err) {
+                session.dnit(?ps);
+                ret cli_diag.report_fail(r, outcome.refused(pushed.err), diagnostic.ORIGIN_TEST);
+            }
+            ti = ti + 1;
+        }
     }
     session.dnit(?ps);
-    if (sel ex_r.err) { ret cli_diag.report_fail(r, ex_r.err, diagnostic.ORIGIN_BUILD); }
-    var bo: outcome.BuildOutcome = ex_r.ok;
-    cli_diag.report_outcome(r, ?bo, config.quiet);
-    if (bo.severity != outcome.BUILD_OK) { ret cli_diag.outcome_code(?bo); }
-    val selected: *outcome.TestArtifact = bo.tests.data;
-    val sel_len:  u32                   = bo.tests.len::u32;
+    if (built != exit.OK) { ret built; }
+
+    var groups: Vector[Group] = group_cells(?a, ?planned.cells);
+    val many:   bool          = groups.len > 1;
 
     if (list) {
         var lw: writer.Writer;
         if (json_out) { lw = fs.writer(fs.STDOUT); }
-        var i: u32 = 0;
-        for (i < sel_len) {
-            if (json_out) { emit_list_case(?lw, ?selected[i]); }
-            or {
-                artifact_report(?selected[i]);
-                print.print("\n");
+        var gi: usize = 0;
+        for (gi < groups.len) {
+            val g:   *Group                       = ?groups.data[gi];
+            var run: Vector[outcome.TestArtifact] = group_tests(?a, g, ?collected);
+            if (many && !json_out) { print.printf("{} ({}):\n", g.target, g.profile); }
+            var i: usize = 0;
+            for (i < run.len) {
+                if (json_out) { emit_list_case(?lw, ?run.data[i]); }
+                or {
+                    artifact_report(?run.data[i]);
+                    print.print("\n");
+                }
+                i = i + 1;
             }
-            i = i + 1;
+            gi = gi + 1;
         }
         ret exit.OK;
     }
@@ -221,11 +265,112 @@ fun run_reported(r: *cli_diag.Report, argv: **u8, inv: *args.ParsedInvocation) i
         runner = res_resolve.ok;
     }
 
+    # a (target, profile) whose programs the host cannot run is built and not run;
+    # only --runner, over a single selection, launches it anyway
+    var code:     i64   = exit.OK;
+    var executed: u32   = 0;
+    var gi:       usize = 0;
+    for (gi < groups.len) {
+        val g: *Group = ?groups.data[gi];
+        gi = gi + 1;
+        if (!g.native && runner == nil) {
+            report_skip(?a, g, json_out);
+            cnt;
+        }
+        executed = executed + 1;
+        if (many && !json_out) { print.printf("{} ({}):\n", g.target, g.profile); }
+        var run: Vector[outcome.TestArtifact] = group_tests(?a, g, ?collected);
+        code = exit.worst(code, run_group(?a, r, ?run, runner, level, jobs, timeout, json_out));
+    }
+    if (executed == 0) {
+        val said: res[str, fmt.FormatError] = fmt.sprint(?a,
+            "nothing was runnable on this host ({}): every selected target's os or isa differs from the host's, so its tests were built and not run; select a target native to this host with -t, or pass --runner for a single selection",
+            manifest.host_label(?a));
+        if (sel said.err) { ret cli_diag.report_fail(r, outcome.internal("out of memory"), diagnostic.ORIGIN_TEST); }
+        ret cli_diag.report_fail(r, outcome.user(dkind.TARGET_NOT_RUNNABLE, said.ok), diagnostic.ORIGIN_TEST);
+    }
+    ret code;
+}
+
+# the tests of one (target, profile), from every artifact the selection built there
+# ---
+# target:  the declared target name
+# profile: the profile name
+# native:  the target's os and isa are the host's
+rec Group {
+    target:  str;
+    profile: str;
+    native:  bool;
+}
+
+# the (target, profile) pairs the cells cover, in cell order
+fun group_cells(a: *A.Allocator, cells: *Vector[manifest.Cell]) Vector[Group] {
+    var groups: Vector[Group] = vector.init[Group](a);
+    var i:      usize         = 0;
+    for (i < cells.len) {
+        val c:    *manifest.Cell = ?cells.data[i];
+        var seen: bool           = false;
+        var j:    usize          = 0;
+        for (j < groups.len) {
+            if (str_equals(groups.data[j].target, c.target_name) && str_equals(groups.data[j].profile, c.profile)) { seen = true; }
+            j = j + 1;
+        }
+        if (!seen) { vector.push[Group](?groups, Group{target: c.target_name, profile: c.profile, native: c.native}); }
+        i = i + 1;
+    }
+    ret groups;
+}
+
+# the group's tests, each qualified name once: a test several selected artifacts
+# reach runs from the first artifact's dispatcher
+fun group_tests(a: *A.Allocator, g: *Group, tests: *Vector[outcome.TestArtifact]) Vector[outcome.TestArtifact] {
+    var run: Vector[outcome.TestArtifact] = vector.init[outcome.TestArtifact](a);
+    var i:   usize                        = 0;
+    for (i < tests.len) {
+        val t: *outcome.TestArtifact = ?tests.data[i];
+        if (str_equals(t.target::str, g.target) && str_equals(t.profile::str, g.profile)) {
+            var dup: bool  = false;
+            var j:   usize = 0;
+            for (j < run.len) {
+                if (str_equals(run.data[j].name::str, t.name::str)) { dup = true; }
+                j = j + 1;
+            }
+            if (!dup) { vector.push[outcome.TestArtifact](?run, @t); }
+        }
+        i = i + 1;
+    }
+    ret run;
+}
+
+# one line naming a (target, profile) that was built and not run, and why
+fun report_skip(a: *A.Allocator, g: *Group, json_out: bool) {
+    if (json_out) {
+        var w: writer.Writer = fs.writer(fs.STDOUT);
+        var o: json.Object;
+        json_event_begin(?w, ?o, "skip");
+        json.field_str(?o, "target", g.target::*u8);
+        json.field_str(?o, "profile", g.profile::*u8);
+        json.field_str(?o, "reason", "not native to this host");
+        json.object_end(?o);
+        ret;
+    }
+    print.printf("skip  {} ({}): not native to this host ({}); built, not run\n",
+        g.target, g.profile, manifest.host_label(a));
+}
+
+# run one (target, profile)'s tests and render them with their summary
+# ---
+# ret: exit.OK when every test passed, exit.USER for a failed test, exit.INTERNAL
+#      for an infrastructure failure
+fun run_group(a: *A.Allocator, r: *cli_diag.Report, tests: *Vector[outcome.TestArtifact], runner: *u8,
+    level: u8, jobs: u32, timeout: du.Duration, json_out: bool) i64 {
+    val selected: *outcome.TestArtifact = tests.data;
+    val sel_len:  u32                   = tests.len::u32;
     if (sel_len == 0) {
-        var empty_tally: outcome.GateTally = outcome.gate_tally_init(?a);
+        var empty_tally: outcome.GateTally = outcome.gate_tally_init(a);
         if (json_out) {
             var jc: JsonCtx;
-            json_ctx_init(?jc, ?a, nil);
+            json_ctx_init(?jc, a, nil);
             json_start(?jc, nil, 0);
             json_summary(?jc, nil, 0, 0, 0, 0, ?empty_tally);
         }
@@ -233,38 +378,34 @@ fun run_reported(r: *cli_diag.Report, argv: **u8, inv: *args.ParsedInvocation) i
         ret exit.OK;
     }
 
-    val res_out: res[*Outcome, A.Error] = A.allocate[Outcome](?a, sel_len::usize);
+    val res_out: res[*Outcome, A.Error] = A.allocate[Outcome](a, sel_len::usize);
     if (sel res_out.err) { ret cli_diag.report_fail(r, outcome.refused(res_out.err), diagnostic.ORIGIN_TEST); }
     val outcomes: *Outcome = res_out.ok;
 
-    val ld_r: res[str, outcome.Fail] = capture_log_dir(?a, selected[0].exe);
+    val ld_r: res[str, outcome.Fail] = capture_log_dir(a, selected[0].exe);
     if (sel ld_r.err) {
-        val said: res[str, fmt.FormatError] = fmt.sprint(?a, "could not derive the test log directory: {}", outcome.describe(ld_r.err));
+        val said: res[str, fmt.FormatError] = fmt.sprint(a, "could not derive the test log directory: {}", outcome.describe(ld_r.err));
         if (sel said.err) { ret cli_diag.report_fail(r, outcome.internal("out of memory"), diagnostic.ORIGIN_TEST); }
         ret cli_diag.report_fail(r, outcome.with_text(ld_r.err, said.ok), diagnostic.ORIGIN_TEST);
     }
     val log_dir:  str               = ld_r.ok;
-    val prepared: err[outcome.Fail] = prepare_logs(?a, log_dir, sel_len);
+    val prepared: err[outcome.Fail] = prepare_logs(a, log_dir, sel_len);
     if (sel prepared.err) { ret cli_diag.report_fail(r, prepared.err, diagnostic.ORIGIN_TEST); }
 
-    var code: i64 = exit.OK;
     if (json_out) {
         var jc: JsonCtx;
-        json_ctx_init(?jc, ?a, log_dir);
-        code = execute_rendered[JsonCtx](?a, r, selected, sel_len, runner, outcomes, level, jobs,
+        json_ctx_init(?jc, a, log_dir);
+        ret execute_rendered[JsonCtx](a, r, selected, sel_len, runner, outcomes, level, jobs,
             log_dir, false, timeout, ?jc, json_start, json_test,
             json_summary);
     }
-    or {
-        var hc:     HumanCtx;
-        val mod_w:  usize = module_col_width(selected, sel_len);
-        val name_w: usize = name_col_width(selected, sel_len);
-        human_ctx_init(?a, ?hc, level, mod_w, name_w, runner, log_dir);
-        code = execute_rendered[HumanCtx](?a, r, selected, sel_len, runner, outcomes, level, jobs,
-            log_dir, true, timeout, ?hc, human_start, human_test,
-            human_summary);
-    }
-    ret code;
+    var hc:     HumanCtx;
+    val mod_w:  usize = module_col_width(selected, sel_len);
+    val name_w: usize = name_col_width(selected, sel_len);
+    human_ctx_init(a, ?hc, level, mod_w, name_w, runner, log_dir);
+    ret execute_rendered[HumanCtx](a, r, selected, sel_len, runner, outcomes, level, jobs,
+        log_dir, true, timeout, ?hc, human_start, human_test,
+        human_summary);
 }
 
 fun exit_code(failed: u32, tally: *outcome.GateTally) i64 {
@@ -535,7 +676,7 @@ fun human_test(hc: *HumanCtx, outcomes: *Outcome, arts: *outcome.TestArtifact, i
         val c:        u32 = hc.cursor;
         val mod_name: str = arts[c].module;
         if (hc.level > 0 && c == hc.first) { print.printf("{}\n", mod_name); }
-        if (hc.level > 0)                  { print_verbose_test(hc.a, ?outcomes[c], hc.name_w, hc.runner, hc.log_dir); }
+        if (hc.level > 0)                  { print_verbose_test(hc.a, ?outcomes[c], c, hc.name_w, hc.runner, hc.log_dir); }
         val last_of_module: bool = c + 1 == hc.n
             || !str_equals(arts[c + 1].module, mod_name);
         if (last_of_module) {
@@ -587,8 +728,10 @@ fun json_test(jc: *JsonCtx, outcomes: *Outcome, arts: *outcome.TestArtifact, idx
     json.field_i64(?o, "duration_ns", du.duration_nsec(o0.elapsed));
     json.field_i64(?o, "index", art.idx::i64);
     json.field_str(?o, "exe", art.exe);
+    json.field_str_or_null(?o, "target", art.target);
+    json.field_str_or_null(?o, "profile", art.profile);
     if (has_capture(?o0.result)) {
-        json.field_str_or_null(?o, "output", json_output_ref(jc, art.idx));
+        json.field_str_or_null(?o, "output", json_output_ref(jc, idx));
     }
     or {
         json.field_str_or_null(?o, "output", nil);
@@ -629,6 +772,8 @@ fun emit_list_case(w: *writer.Writer, art: *outcome.TestArtifact) {
     json.field_i64(?o, "line", art.line::i64);
     json.field_str(?o, "object", art.object);
     json.field_i64(?o, "index", art.idx::i64);
+    json.field_str_or_null(?o, "target", art.target);
+    json.field_str_or_null(?o, "profile", art.profile);
     json.object_end(?o);
 }
 
@@ -654,7 +799,7 @@ fun spawn_one(a: *A.Allocator, processes: *subprocess.OwnedSubprocess, slots: *S
     for (s < window && slots[s].active) { s = s + 1; }
     if (s == window) { ret opt[validation.ValidationGateResult].some{btest.classify_setup_failure()}; }
 
-    val lp_r: res[str, outcome.Fail] = log_path(a, log_dir, art.idx);
+    val lp_r: res[str, outcome.Fail] = log_path(a, log_dir, idx);
     if (sel lp_r.err) { ret opt[validation.ValidationGateResult].some{btest.classify_setup_failure()}; }
     val lp: str = lp_r.ok;
 
@@ -744,7 +889,7 @@ fun finalize_slot(a: *A.Allocator, process: *subprocess.OwnedSubprocess, slot: *
 
     subprocess.dnit(a, process);
     if (o.result.kind == validation.RESULT_PASS) {
-        val lp_r: res[str, outcome.Fail] = log_path(a, log_dir, slot.art.idx);
+        val lp_r: res[str, outcome.Fail] = log_path(a, log_dir, slot.idx);
         if (sel lp_r.ok) { fs.remove_file(lp_r.ok); }
     }
     outcomes[slot.idx] = o;
@@ -767,7 +912,7 @@ fun render_module_run(a: *A.Allocator, outcomes: *Outcome, first: u32, last: u32
     if (fail > 0) {
         j = first;
         for (j <= last) {
-            if (outcomes[j].result.kind != validation.RESULT_PASS) { print_fail_detail(a, ?outcomes[j], runner, log_dir); }
+            if (outcomes[j].result.kind != validation.RESULT_PASS) { print_fail_detail(a, ?outcomes[j], j, runner, log_dir); }
             j = j + 1;
         }
     }
@@ -832,18 +977,21 @@ fun print_rollup(mod_name: str, ok: u32, fail: u32, elapsed: du.Duration, mod_w:
     print.print("\n");
 }
 
-fun print_fail_detail(a: *A.Allocator, o: *Outcome, runner: *u8, log_dir: *u8) {
+fun print_fail_detail(a: *A.Allocator, o: *Outcome, pos: u32, runner: *u8, log_dir: *u8) {
     val name: str = o.art.name;
     print.printf("  FAIL  {}  {}:{}  ", name, o.art.file, o.art.line::i64);
     print_reason(o);
     print.print("\n");
     print_captured(o);
-    print_fail_pointers(a, o, runner, log_dir);
+    print_fail_pointers(a, o, pos, runner, log_dir);
 }
 
-fun print_fail_pointers(a: *A.Allocator, o: *Outcome, runner: *u8, log_dir: *u8) {
+# where a failed test's full output is and how to rerun it alone
+# ---
+# pos: the test's position in the run, which names its log
+fun print_fail_pointers(a: *A.Allocator, o: *Outcome, pos: u32, runner: *u8, log_dir: *u8) {
     if (o.truncated) {
-        val lp_r: res[str, outcome.Fail] = log_path(a, log_dir, o.art.idx);
+        val lp_r: res[str, outcome.Fail] = log_path(a, log_dir, pos);
         if (sel lp_r.ok) {
             print.printf("    full output: {}\n", lp_r.ok);
         }
@@ -859,7 +1007,7 @@ fun print_fail_pointers(a: *A.Allocator, o: *Outcome, runner: *u8, log_dir: *u8)
     print.print("\n");
 }
 
-fun print_verbose_test(a: *A.Allocator, o: *Outcome, name_w: usize, runner: *u8, log_dir: *u8) {
+fun print_verbose_test(a: *A.Allocator, o: *Outcome, pos: u32, name_w: usize, runner: *u8, log_dir: *u8) {
     val name: str = o.art.name;
     if (o.result.kind == validation.RESULT_PASS) {
         print.print("  ok    ");
@@ -876,7 +1024,7 @@ fun print_verbose_test(a: *A.Allocator, o: *Outcome, name_w: usize, runner: *u8,
         print_reason(o);
         print.printf("  {}:{}\n", o.art.file, o.art.line::i64);
         print_captured(o);
-        print_fail_pointers(a, o, runner, log_dir);
+        print_fail_pointers(a, o, pos, runner, log_dir);
     }
 }
 
@@ -1383,4 +1531,86 @@ test run_one__a_test_that_beats_its_bound_keeps_its_own_outcome {
     }
     t_probe_free(?a, ?pr);
     ret bad;
+}
+
+#[testing]
+val T_SKIP_MANIFEST: str = "[project]\nmach = \">=5\"\nid = \"skipfx\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.here]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[target.away]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\n\n[profile.debug]\ndefault = true\nopt = 0\ndebug = false\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n\n[artifact.lib]\nkind = \"static\"\nentry = \"lib.mach\"\nout = \"lib/lib{artifact.suffix}\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
+
+# the dispatcher's startup on either target, with no std: linux enters main
+# directly, windows is only ever built
+#[testing]
+val T_SKIP_LIB: str = "$if ($mach.build.os == $mach.os.windows) {\n    #[symbol(\"mainCRTStartup\")]\n    pub fun start() i32 { ret 0; }\n}\n$or {\n    #[symbol(\"_start\")]\n    pub fun start() {\n        asm x86_64 {\n            mov rax, rsp\n            mov rdi, [rax]\n            lea rsi, [rax+8]\n            and rsp, -16\n            call main\n            mov rdi, rax\n            mov rax, 60\n            syscall\n        }\n    }\n}\n\ntest one { ret 0; }\n";
+
+# `mach test <root> <extra...> --diagnostics=json` over the records it writes:
+# 0 when the run holds under cli_diag.t_json_run with exit `code` and, when `key`
+# is not nil, a failure record naming it from origin `test`
+#[testing]
+fun t_json_test(root: str, extra: *str, n: usize, code: i64, key: str) i32 {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 100; }
+    var argv: [8]*u8;
+    argv[0] = "mach";
+    argv[1] = "test";
+    argv[2] = root::*u8;
+    var i: usize = 0;
+    for (i < n) {
+        argv[3 + i] = extra[i]::*u8;
+        i           = i + 1;
+    }
+    argv[3 + n] = "--diagnostics=json";
+    val ir: res[args.ParsedInvocation, outcome.Fail] = args.parse_invocation(?a, 4 + n, ?argv[0]);
+    if (sel ir.err) { ret 101; }
+    var inv: args.ParsedInvocation = ir.ok;
+
+    var buf:  [8192]u8;
+    var sink: cli_diag.MemSink;
+    var r:    cli_diag.Report;
+    cli_diag.report_init(?r, cli_diag.FORMAT_JSON);
+    cli_diag.mem_writer(?r.w, ?sink, ?buf[0], 8192);
+    val got: i64 = cli_diag.report_close(?r, run_reported(?r, ?argv[0], ?inv));
+    if (sink.len >= 8192) { ret 102; }
+    if (got != code)      { ret 103; }
+    if (key == nil)       { ret cli_diag.t_json_run(?sink, code, nil, nil, nil); }
+    ret cli_diag.t_json_run(?sink, code, "failure", key, "test");
+}
+
+# every selected (target, profile) is built, and only one the host runs natively
+# runs: the foreign one is skipped, a run that executes nothing exits 1 instead of
+# passing empty, and --runner needs the selection to be one cell
+test run__a_foreign_target_is_built_skipped_and_never_a_green_empty_run {
+    $if ($mach.build.os != $mach.os.linux)      { ret 0; }
+    $if ($mach.build.arch != $mach.arch.x86_64) { ret 0; }
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val tf_r: res[fs.TempFile, fs.FsError] = fs.temp_create(?a, "mach_test_skip");
+    if (sel tf_r.err) { ret 1; }
+    var tf:   fs.TempFile = tf_r.ok;
+    val root: str         = fs.temp_path(?tf);
+    fs.temp_close_and_remove(?tf);
+    fin { fs.remove_all(?a, root); }
+    val src_r: res[str, A.Error] = path.join(?a, root, "src");
+    if (sel src_r.err) { ret 1; }
+    val made: err[fs.FsError] = fs.create_dir_all(?a, src_r.ok, 0o755);
+    if (sel made.err) { ret 1; }
+    val mp: res[str, A.Error] = path.join(?a, root, "mach.toml");
+    if (sel mp.err) { ret 1; }
+    val lp: res[str, A.Error] = path.join(?a, src_r.ok, "lib.mach");
+    if (sel lp.err) { ret 1; }
+    val wm: err[fs.FsError] = fs.write_bytes(mp.ok, T_SKIP_MANIFEST, str_len(T_SKIP_MANIFEST), 0o644);
+    if (sel wm.err) { ret 1; }
+    val wl: err[fs.FsError] = fs.write_bytes(lp.ok, T_SKIP_LIB, str_len(T_SKIP_LIB), 0o644);
+    if (sel wl.err) { ret 1; }
+
+    var every: [2]str = [2]str{"-t", "*"};
+    val both:  i32    = t_json_test(root, ?every[0], 2, 0, nil);
+    if (both != 0) { ret 10 + both; }
+    var away: [2]str = [2]str{"-t", "away"};
+    val none: i32    = t_json_test(root, ?away[0], 2, 1, "target.not_runnable");
+    if (none != 0) { ret 20 + none; }
+    var runner: [4]str = [4]str{"-t", "*", "--runner", "true"};
+    val two:    i32    = t_json_test(root, ?runner[0], 4, 1, nil);
+    if (two != 0) { ret 30 + two; }
+    ret 0;
 }

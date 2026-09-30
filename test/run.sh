@@ -341,13 +341,13 @@ build() {
     a=$(art "$c")
     run_bin=
     if [ "$(target_field "$t" 7)" = hosted ]; then
-        proj=$out/hosted; sel="--bin $a"
+        proj=$out/hosted; sel="-a $a"
     elif [ "$role" = run ]; then
-        proj=$out/bare; sel="--bin ${a}_run_$t"; run_bin=$out/bare/o/$t/$p/run/$a
+        proj=$out/bare; sel="-a ${a}_run_$t"; run_bin=$out/bare/o/$t/$p/run/$a
     else
         proj=$out/bare
         kind=$(target_field "$t" 6)
-        if [ "$kind" = static ]; then sel="--lib ${a}_$kind"; else sel="--bin ${a}_$kind"; fi
+        sel="-a ${a}_$kind"
     fi
     log=$(log_of "$t" "$p" "$c" "$role")
     mkdir -p "$out/log"
@@ -551,7 +551,7 @@ relisted() {
     t=$1; p=$2; c=$3
     a=$(art "$c")
     log=$out/log/$t.$p.$a.asm.log
-    "$mach" build "$out/hosted" --target "$t" --profile "$p" --bin "$a" --emit obj --emit-asm >"$log" 2>&1 || {
+    "$mach" build "$out/hosted" --target "$t" --profile "$p" -a "$a" --emit obj --emit-asm >"$log" 2>&1 || {
         why="build: $(first_error "$log")"; return 1
     }
     relist "$t" "$p" "$a" "corpus/cases/$c" corpus/lib/fold

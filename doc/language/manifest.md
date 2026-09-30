@@ -237,7 +237,7 @@ Either can be added later without changing what an existing range means.
 
 ## `[target.<name>]`
 
-Each `<name>` is a selector you pass to `--target <name>`. A target is a
+Each `<name>` is a selector you pass to `-t <name>`. A target is a
 fully-spelled platform tuple; nothing is inferred from another key. `native` is a
 reserved name — declaring `[target.native]` is an error, because `native` resolves
 to whichever *declared* target matches the host.
@@ -729,7 +729,7 @@ root.
 Which profile a build uses follows one rule, the same one that selects a
 target and an artifact:
 
-1. an explicit `--profile <name>` wins;
+1. an explicit `-p <name>` wins;
 2. otherwise a sole declared profile is chosen;
 3. otherwise the one marked `default = true` is chosen.
 
@@ -737,7 +737,7 @@ Table order carries no meaning. A manifest that declares several profiles and
 marks none is refused wherever a command must pick one:
 
 ```
-error[selection.ambiguous]: mach.toml: several profiles are declared and none is marked `default = true`; no profile is selected by table order: mark exactly one [profile.<name>] with `default = true` or select one with --profile
+error[selection.ambiguous]: mach.toml: several profiles are declared and none is marked `default = true`; no profile is selected by table order: mark exactly one [profile.<name>] with `default = true` or select one with -p
 ```
 Emission of the human-readable IR and assembly side-artifacts is **not** a profile
 concern — it is controlled only by the `--emit-ir` / `--emit-asm` flags of
@@ -896,7 +896,7 @@ Integer reductions are untouched by this key. They vectorize unconditionally and
 bit-identical to the scalar reference, because integer add / xor / or / and reassociate
 exactly.
 
-The CLI selects and overrides at invocation time: `--profile <name>` picks the
+The CLI selects and overrides at invocation time: `-p <name>` picks the
 profile; `-g` forces `debug` on for one build regardless of the profile's key
 (precedence `-g` > profile > off — there is no flag to force it off over a
 `debug = true` profile; edit the manifest or pick another profile). `-O0` and
@@ -919,7 +919,7 @@ reads the selected artifact's name.
 | `subsystem` | no | `"console"` (default) or `"gui"` — the environment a windows executable declares it runs under; refused on a target whose image format has no subsystem (see below). |
 | `icon` | no | Project-root-relative `.ico` path embedded in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
 | `manifest` | no | Project-root-relative application-manifest path embedded byte-for-byte in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
-| `default` | no | `true` puts the artifact in the [default selection](#selection-and-the-build-matrix): with no `--bin`/`--lib`, `mach build` and `mach check` take the marked artifacts among those supporting the selected target (every one of them when none is marked), and a command that needs one artifact (`mach test`, `mach run`, the editor's union build) takes the marked one. A command that needs one artifact refuses two marked candidates; an explicit `--bin`/`--lib` always wins, and a sole candidate needs no marker. |
+| `default` | no | `true` puts the artifact in the [default selection](#selection-and-the-build-matrix): with no `-a`, `mach build` and `mach check` take the marked artifacts among those supporting the selected target (every one of them when none is marked), and a command that needs one artifact (`mach test`, `mach run`, the editor's union build) takes the marked one. A command that needs one artifact refuses two marked candidates; an explicit `-a` always wins, and a sole candidate needs no marker. |
 
 `entry` is the build cell's source root. The build follows its active `use` and
 `fwd` edges transitively and compiles that reachable module set; another file under
@@ -1963,63 +1963,94 @@ the requirement the dependency declared.
 
 A build cell is one artifact × one target × one profile.
 
-With no `--bin`/`--lib`, every command reads one rule, the **default selection**:
-of the artifacts whose `targets` includes the selected target, those marked
-`default = true` when any is marked, and every one of them when none is.
+Every command that builds, checks, tests, runs or documents cells selects them
+with three options, one per axis:
 
-- `mach build <path>` and `mach check <path>` build and check the default selection
-  for the selected target, for the default profile. `--all-targets` crosses every
-  artifact with every target in its `targets`, applying the default selection per
-  target. `--bin <name>` / `--lib <name>` narrow to one artifact, marked or not;
-  `--target <name>` selects a declared target; `--profile <name>` selects a profile.
-- `mach run <path>` consumes exactly one artifact. With no `--bin`/`--lib`, it selects
-  one when exactly one artifact declares the resolved target; if several do, it asks
-  you to pick one, naming every candidate.
-- `mach test <path>` and `mach doc <path>` need one artifact as their primary
-  context and take the default selection when it holds one artifact: `--bin`/`--lib`
-  wins, a sole artifact that declares the resolved target is chosen, several
-  need exactly one `default = true` (several with none marked is refused).
-  `mach test` builds that artifact's cell as `mach build` would, its closure, its
-  `link` entries, its `need` and exported dependency entries, and links the test
-  dispatcher in place of its entry. Foreign-target tests require a compatible
-  `--runner`.
+- `-a, --artifact <pattern>` selects `[artifact.<name>]` entries;
+- `-t, --target <pattern>` selects `[target.<name>]` entries;
+- `-p, --profile <pattern>` selects `[profile.<name>]` entries.
+
+A pattern is an exact name, which must be declared, or a glob in which `*`
+matches any run of characters and `?` any one character, which must match at
+least one entry. Each option repeats, and the axis takes every entry any of its
+patterns names, in declaration order. Artifact names are unique table keys, so
+an artifact's kind never needs naming. Quote a glob so the shell leaves it alone:
+`-a '*'`. A value that names no entry but does name a file or directory in the
+working directory is refused as the shell's expansion of an unquoted wildcard,
+with a hint to quote it.
+
+`--all` fills every axis no option names with `*`: `mach build . --all` builds
+every artifact on every target it supports in every profile, and
+`mach test . --all -p debug` does the same in `debug` only.
+
+An axis no option names, without `--all`, takes the manifest's default:
+
+- the target is the [`native` target](#native-target-resolution), or the one a
+  named artifact settles (see [below](#a-named-artifact-can-settle-the-target));
+- the profile is the sole declared one, or the one marked `default = true`;
+- the artifacts are the **default selection** for each selected target: of the
+  artifacts whose `targets` includes it, those marked `default = true` when any is
+  marked, and every one of them when none is. `mach build` and `mach check` take the
+  whole default selection. `mach test` and `mach doc` need one artifact and take the
+  default selection when it holds one; several with none marked are refused.
+  `mach run` takes the sole `bin` the target builds.
+
+No default is chosen by table order: several candidates with none marked are
+refused, naming them.
+
+- `mach build <path>` and `mach check <path>` build and check every selected cell.
+  A selection that spans several profiles plans and runs one profile after another.
+- `mach test <path>` builds a test dispatcher for every selected cell as
+  `mach build` would build the cell, its closure, its `link` entries, its `need` and
+  exported dependency entries, and links the dispatcher in place of its entry. Tests
+  then run once per (target, profile): the tests every selected artifact reaches
+  there are combined, each qualified name running once. Only a target whose `os` and
+  `isa` are the host's runs; every other (target, profile) is built, reported on a
+  `skip` line, and not run, whatever emulation the host has. `--runner <cmd>` runs a
+  foreign target's tests through a command and needs the selection to resolve to one
+  cell. A run in which nothing was runnable exits `1`, so a green run always ran
+  something.
+- `mach run <path>` and `mach doc <path>` consume exactly one cell and refuse a
+  selection that resolves to several, naming them. `mach run` takes no `--all`, and
+  `mach doc` selects with `-a` and `-t` only.
 
 ### Enumerated cells are filtered; named ones are not
 
 A cell whose artifact does not list the cell's target is a cell the manifest never
-declared, so enumerating skips it. Naming that pair is a different act: `--bin
-kernel --target host` is refused by name, because you asked for a cell that does not
-exist. `--bin kernel --all-targets` re-enumerates the target axis and so filters
-back to the targets `kernel` declares.
+declared, so a selection that reaches it through a glob skips it. Naming both halves
+of that pair exactly is a different act: `-a kernel -t linux-x86_64` is refused by
+name, because you asked for a cell that does not exist. `-a kernel -t '*'` globs
+the target axis and so filters back to the targets `kernel` declares.
 
-If a selection is well-formed but enumerates nothing — a `--target` no artifact
-lists — the build fails naming that target and the declared artifacts, rather than
-succeeding with an empty plan.
+If a selection is well-formed but holds no cell — a `-t` no artifact lists, or
+globs that only pair unsupported cells — it fails naming what it selected, rather
+than succeeding with an empty plan.
 
 ### A named artifact can settle the target
 
-`--bin <name>` / `--lib <name>` with no `--target` lets the artifact decide, since
-its `targets` list may already leave only one answer:
+`-a <name>` with no `-t` lets the artifact decide, since its `targets` list may
+already leave only one answer:
 
-- exactly one declared target: that target is used, and `--target` would only
+- exactly one declared target: that target is used, and `-t` would only
   repeat what the manifest already said. A hosted target that does not match the
   host is refused instead (see [`native` target resolution](#native-target-resolution))
 - several, one of which matches the host: the host target, as before
 - several, none matching the host: refused, naming the targets the artifact does
   declare so the choice is visible without opening `mach.toml`
 
-An explicit `--target` always wins, including when it names a target the artifact
+An explicit `-t` always wins, including when it names a target the artifact
 does not list — that pair is still refused by name. This only applies to a named
-artifact: enumerating the artifact axis keeps the target fixed for the whole
+artifact: an artifact axis left to the default keeps the target fixed for the whole
 matrix, so a bare `mach build <path>` never widens into a target it was not asked
 for.
 
 ### `-o` names one output
 
-`-o` is accepted exactly when the selection resolves to a single build cell, and
-refused otherwise, naming the cells it resolved to. Two artifacts collide on one
-output path the same way two targets do: each would link over the previous, leaving
-only the last with no warning. Narrow with `--bin`/`--lib` and `--target`.
+`-o` is accepted exactly when the selection resolves to a single (artifact, target,
+profile), and refused otherwise, naming the cells it resolved to. Two artifacts
+collide on one output path the same way two targets or two profiles do: each would
+link over the previous, leaving only the last with no warning. Narrow with `-a`, `-t`
+and `-p`.
 
 `-o` names a canonical path inside the project root, as an artifact's `out` does:
 relative, `/`-separated, with no `.` or `..` component and no empty one.
@@ -2037,7 +2068,8 @@ among them: `2` when any cell failed internally, else `3` when any failed for th
 environment, and `1` otherwise.
 
 Artifacts cannot share an output path: a manifest whose expanded `out` templates
-collide is rejected before the build starts.
+collide is rejected before the build starts, and so is a selection spanning
+profiles whose `[project].out` has no `{profile.name}` to keep them apart.
 
 ### `native` target resolution
 
@@ -2046,16 +2078,16 @@ never a synthesized tuple, and never a target the host cannot run. Exactly one h
 match is chosen; several matching tuples is an ambiguity error naming the candidates.
 With no match `native` is an error, however many targets are declared and however
 they are marked, and it is raised before any step runs. A declared target that does
-not match the host is built only when `--target` names it:
+not match the host is built only when `-t` names it:
 
 ```
-error[selection.no_host_target]: mach.toml: 'native' matches no declared target: the host is aarch64-linux and the declared targets are linux-x86_64 (x86_64-linux), windows-x86_64 (x86_64-windows); declare a [target.<name>] for the host or select one with --target
+error[selection.no_host_target]: mach.toml: 'native' matches no declared target: the host is aarch64-linux and the declared targets are linux-x86_64 (x86_64-linux), windows-x86_64 (x86_64-windows); declare a [target.<name>] for the host or select one with -t
 ```
 
 A cross-only project whose targets are hosted (`linux`, `darwin`, `windows`)
-selects its target with `--target`.
+selects its target with `-t`.
 
-With no `--target`, [an artifact can settle the target](#a-named-artifact-can-settle-the-target)
+With no `-t`, [an artifact can settle the target](#a-named-artifact-can-settle-the-target)
 when its `targets` list leaves one answer. The same rule holds there. An artifact whose
 only target is hosted and does not match the host is refused with
 `selection.no_host_target`, naming the artifact, because building it would be the same
@@ -2063,14 +2095,14 @@ fallback. An artifact whose only target no host runs as `native` (a `freestandin
 target, including a finished-module target such as `spirv`) is still pinned to it:
 such a target is never `native`, so naming the artifact selects it explicitly, and a
 host artifact that `need`s it builds it on any host. This path is taken whenever an
-artifact is settled before its target: `mach build`, `mach check` and `mach clean` with
-`--bin`/`--lib`, `mach run` and `mach test` (which also settle on a sole artifact), and
+artifact is settled before its target: `mach build` and `mach check` with
+`-a`, `mach run` and `mach test` (which also settle on a sole artifact), and
 editor analysis. A plain `mach build` or `mach check` resolves `native` first and never
 reaches it. A manifest with no `[target.*]` table has the synthesized host
 target. `[target.*] default = true` no longer means anything: it is accepted and
 ignored, with a `target.default_deprecated` warning, and will be removed in a later
 major release. Migrate by deleting the key and declaring a target for each host the
-project builds on, or passing `--target`.
+project builds on, or passing `-t`.
 
 The same rule applies to `[profile.*]` and to `[artifact.*]` when a command
 needs one artifact.

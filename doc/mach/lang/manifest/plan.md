@@ -173,6 +173,17 @@ vectorize: as `ProfileDef`
 float_reassoc: as `ProfileDef`
 allow: as `ProfileDef`
 
+## fun resolve_target
+
+```mach
+pub fun resolve_target(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, selector: str,
+art: *ArtifactDef) res[ResolvedTarget, outcome.Fail];
+```
+
+the target a selector names: a declared name, `native` for the declared
+target matching the host, or "" for the artifact's pinned target and
+otherwise `native`
+
 ## fun resolve_profile
 
 ```mach
@@ -360,22 +371,6 @@ out_order: receives the step indices in run order, sized exactly; nil when none
 out_count: receives the length
 ret: ok; the `plan_steps` errors
 
-## fun cell_supported
-
-```mach
-pub fun cell_supported(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, pick: Selection) res[bool, outcome.Fail];
-```
-
-whether the selection's artifact builds for the selection's target. the target
-is resolved as `native` would be, never pinned by the artifact
-
-alloc: owns error text
-itn: resolves names
-m: the manifest
-pick: the selection
-ret: the support bit; err from target resolution, or when `resolve_artifact`
-       finds nothing
-
 ## val AMBIGUOUS_PROFILE_MSG
 
 ```mach
@@ -398,7 +393,7 @@ pub fun default_selection_includes(itn: *intern.Interner, m: *Manifest, a: *Arti
 target: intern.StrId, executables_only: bool) bool;
 ```
 
-the default selection: what a command takes for a target when no `--bin`/`--lib`
+the default selection: what a command takes for a target when no `-a`
 names an artifact. of the artifacts the target builds, those marked
 `default = true` when any is, otherwise every one. build and check take the whole
 selection, and a command that needs one artifact takes it only when it holds one
@@ -409,22 +404,6 @@ a: the artifact asked about
 target: the resolved target's name
 executables_only: consider `bin` artifacts only, so a library beside them is never taken
 ret: true when the default selection holds `a`
-
-## fun default_selection_takes
-
-```mach
-pub fun default_selection_takes(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
-target: str, a: *ArtifactDef) res[bool, outcome.Fail];
-```
-
-`default_selection_includes` for a target selector not yet resolved
-
-alloc: owns error text
-itn: resolves names
-m: the manifest
-target: the target selector, "" for the default target
-a: the artifact asked about
-ret: whether the default selection holds `a`; err from target resolution
 
 ## fun select_primary_artifact
 
