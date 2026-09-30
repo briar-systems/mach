@@ -75,8 +75,6 @@ kind: LIBKIND_SHARED for `kind = "shared"`, LIBKIND_STATIC otherwise, including 
 libs: the artifact's `link` entries that match the target, resolved in `link`
                order and sized exactly; a `link` name matching no `[link.*]` table is skipped
 lib_count: length of `libs`
-warned: `native` matched no declared target for the host and a declared target
-               was chosen anyway; the driver prints the warning
 
 ## rec Scope
 
@@ -157,7 +155,6 @@ the outcome of target resolution for a selection
 
 target: the chosen target; points into the manifest unless synthesized for a
         manifest with no `[target.*]`, in which case it is allocated and never freed by `dnit`
-warned: `native` matched no host target and a declared target was chosen anyway
 target borrows its manifest-owned declaration until manifest destruction
 
 ## rec ResolvedProfile
@@ -379,20 +376,14 @@ pick: the selection
 ret: the support bit; err from target resolution, or when `resolve_artifact`
        finds nothing
 
-## val AMBIGUOUS_TARGET_MSG
-
-```mach
-pub val AMBIGUOUS_TARGET_MSG:   str = "mach.toml: several targets are declared, none matches the host and none is marked `default = true`
-```
-
-a selection several candidates could satisfy is refused where a command
-must pick one; table order carries no meaning (#3222, #3226)
-
 ## val AMBIGUOUS_PROFILE_MSG
 
 ```mach
 pub val AMBIGUOUS_PROFILE_MSG:  str = "mach.toml: several profiles are declared and none is marked `default = true`
 ```
+
+a selection several candidates could satisfy is refused where a command
+must pick one; table order carries no meaning (#3222, #3226)
 
 ## val AMBIGUOUS_ARTIFACT_MSG
 

@@ -33,17 +33,8 @@ pub fun parse_project(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table
 ## fun parse_targets
 
 ```mach
-pub fun parse_targets(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, as_root: bool) err[outcome.Fail];
+pub fun parse_targets(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[outcome.Fail];
 ```
-
-## fun duplicate_targets
-
-```mach
-pub fun duplicate_targets(alloc: *A.Allocator, m: *Manifest, message: str) outcome.Fail;
-```
-
-a refusal of more than one `default = true` target, pointing at the first
-`default` value and naming the others as related
 
 ## fun duplicate_profiles
 
@@ -51,7 +42,8 @@ a refusal of more than one `default = true` target, pointing at the first
 pub fun duplicate_profiles(alloc: *A.Allocator, m: *Manifest, message: str) outcome.Fail;
 ```
 
-`duplicate_targets` for profiles
+a refusal of more than one `default = true` profile, pointing at the first
+`default` value and naming the others as related
 
 ## val MISSING_PROFILE_MESSAGE
 
