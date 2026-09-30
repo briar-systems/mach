@@ -944,6 +944,12 @@ pub val STORAGE_OUTPUT:  u32 = 3
 pub val STORAGE_WORKGROUP: u32 = 4
 ```
 
+## val STORAGE_PUSH_CONSTANT
+
+```mach
+pub val STORAGE_PUSH_CONSTANT: u32 = 9
+```
+
 ## val STORAGE_STORAGE_BUFFER
 
 ```mach
