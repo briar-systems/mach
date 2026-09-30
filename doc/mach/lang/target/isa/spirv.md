@@ -248,18 +248,6 @@ pub val OP_CONSTANT_COMPOSITE:        u32 = 44
 pub val OP_CONSTANT_NULL:             u32 = 46
 ```
 
-## val OP_SPEC_CONSTANT_TRUE
-
-```mach
-pub val OP_SPEC_CONSTANT_TRUE:        u32 = 48
-```
-
-## val OP_SPEC_CONSTANT_FALSE
-
-```mach
-pub val OP_SPEC_CONSTANT_FALSE:       u32 = 49
-```
-
 ## val OP_SPEC_CONSTANT
 
 ```mach
