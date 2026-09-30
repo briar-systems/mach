@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.7.3] - 2026-09-30
+
+### Fixed
+- On aarch64 and riscv64 linux, a `source = "system"` link input is also searched for in `/lib64` and `/usr/lib64`, where Fedora, RHEL, openSUSE and Fedora Asahi Remix install their libraries. Only the multiarch directories and `/usr/lib` and `/lib` were searched, so `pthread` and other system libraries were not found there (#4261).
+
 ## [6.7.2] - 2026-09-30
 
 ### Fixed
