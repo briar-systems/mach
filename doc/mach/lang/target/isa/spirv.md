@@ -1004,10 +1004,22 @@ pub val DECOR_OFFSET:         u32 = 35
 pub val DECOR_ARRAY_STRIDE:   u32 = 6
 ```
 
+## val DECOR_COHERENT
+
+```mach
+pub val DECOR_COHERENT:     u32 = 23
+```
+
 ## val DECOR_NON_WRITABLE
 
 ```mach
 pub val DECOR_NON_WRITABLE: u32 = 24
+```
+
+## val DECOR_NON_READABLE
+
+```mach
+pub val DECOR_NON_READABLE: u32 = 25
 ```
 
 ## val DECOR_FLAT
