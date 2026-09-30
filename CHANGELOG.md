@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.8.0] - 2026-09-30
+
+### Added
+- `build`, `check`, `test`, `run` and `doc` select what they work on with three uniform selectors: `-a`/`--artifact`, `-t`/`--target` and `-p`/`--profile`. Each takes an exact name, which must be declared, or a glob with `*` and `?`, which must match, and each repeats. `--all` fills every axis no selector names, so `mach build . --all` builds every artifact for every target in every profile, and `mach test . --all -p debug` narrows that to debug. An axis left out keeps the manifest default. An artifact pairs only with the targets its `targets` list supports, an empty selection is refused, and a value that names no entry but an existing path is refused as an unquoted shell wildcard. `-o`, `--runner` and `mach run` need the selection to resolve to exactly one artifact, target and profile.
+- `mach test` builds every selected combination and runs the tests of each target whose os and isa are the host's, or of the one target `--runner` names. Every other target is built and reported on a `skip` line, and a run that executes nothing exits 1. The tests of several selected artifacts run once per target and profile, deduplicated by qualified name. JSON test events carry `target` and `profile`, and a new `skip` event reports each skipped target.
+- `install.sh` and `install.ps1` verify the downloaded archive against the release's `SHA256SUMS` before extracting it, and fail the install on a mismatch, a missing entry or a missing `SHA256SUMS`.
+
+### Changed
+- With no `--target`, `mach` builds for the declared target that matches the host and nothing else. It used to fall back to the sole declared target, or the one marked `default = true`, with a `target.native_fallback` warning, so a hosted target the host cannot run failed far from the cause. When no declared target matches the host, the new error `selection.no_host_target` names the host tuple, the declared targets and the `--target` remedy before any step runs. An artifact whose only supported target is a foreign hosted one is refused the same way, while a sole freestanding or spirv target is still selected. `default = true` on a `[target.*]` table is accepted and ignored with the warning `target.default_deprecated` (#4260).
+
+### Removed
+- `--bin` and `--lib` on `build`, `check`, `test`, `run` and `doc`. Use `-a <name>`. `mach init --lib`, which picks the library layout, is unchanged.
+- `--all-targets`. Use `-t '*'` or `--all`. `mach test --all-targets` tested only the default target while reporting every one.
+- The diagnostic keys `target.native_fallback` and `target.none_declared` are retired.
+
 ## [6.7.3] - 2026-09-30
 
 ### Fixed

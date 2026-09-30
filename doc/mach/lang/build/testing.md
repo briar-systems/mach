@@ -41,7 +41,7 @@ pub fun free_scope(p: *driver.Project, sc: *TestScope);
 ## fun record_tests
 
 ```mach
-pub fun record_tests(p: *driver.Project, sc: *TestScope, exe: *u8,
+pub fun record_tests(p: *driver.Project, sc: *TestScope, exe: *u8, target: str, profile: str,
 bo: *outcome.BuildOutcome, oa: *A.Allocator) err[outcome.Fail];
 ```
 

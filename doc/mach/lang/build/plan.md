@@ -132,6 +132,38 @@ pub fun plan(a: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry
 m: *manifest.Manifest, owned_req: request.BuildRequest) res[BuildPlan, outcome.Fail];
 ```
 
+plan the request's own selection: `req.artifact` on `req.target`, each an
+exact name or a glob, or empty for the manifest's default, as
+`manifest.resolve_cells` reads them. a test goal takes the one artifact the
+default selection holds, any other goal every one
+
+a: owns the plan
+itn: resolves names
+reg: the target registry
+m: the root manifest
+owned_req: the request; its `profile` is the plan's
+ret: the plan; err from request validation, selection or planning
+
+## fun plan_cells
+
+```mach
+pub fun plan_cells(a: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry,
+m: *manifest.Manifest, owned_req: request.BuildRequest, cells: *Vector[manifest.Cell]) res[BuildPlan, outcome.Fail];
+```
+
+plan resolved cells for one profile: each cell's artifact on its target, and
+before it every artifact it requires. the request's `profile` is the plan's;
+a cell's own profile is its caller's grouping and is not read here
+
+a: owns the plan
+itn: resolves names
+reg: the target registry
+m: the root manifest
+owned_req: the request the cells share
+cells: the cells, from `manifest.resolve_cells`
+ret: the plan; err from validation or a cell's planning, or when `-o`
+           names one output and several cells are selected
+
 ## fun configure
 
 ```mach
@@ -170,6 +202,20 @@ m: the root manifest
 bp: the plan, mutated in place
 ret: ok; err from closure realization, a dependency cell's planning, or an
      output collision
+
+## fun check_plan_outputs
+
+```mach
+pub fun check_plan_outputs(a: *A.Allocator, plans: *Vector[BuildPlan]) err[outcome.Fail];
+```
+
+refuse two plans of one selection, one per profile, that would write one
+file: a `[project].out` without `{profile.name}` puts every profile's
+outputs at the same paths
+
+a: owns the message
+plans: the plans, one per profile
+ret: ok; err naming the two cells and the path
 
 ## fun replan_unit
 

@@ -744,22 +744,6 @@ fwd mach.lang.manifest.plan.plan_export_steps
 
 forwards [`mach.lang.manifest.plan.plan_export_steps`](manifest/plan.md#fun-plan_export_steps)
 
-## fwd mach.lang.manifest.plan.cell_supported
-
-```mach
-fwd mach.lang.manifest.plan.cell_supported
-```
-
-forwards [`mach.lang.manifest.plan.cell_supported`](manifest/plan.md#fun-cell_supported)
-
-## fwd mach.lang.manifest.plan.AMBIGUOUS_TARGET_MSG
-
-```mach
-fwd mach.lang.manifest.plan.AMBIGUOUS_TARGET_MSG
-```
-
-forwards [`mach.lang.manifest.plan.AMBIGUOUS_TARGET_MSG`](manifest/plan.md#val-ambiguous_target_msg)
-
 ## fwd mach.lang.manifest.plan.AMBIGUOUS_PROFILE_MSG
 
 ```mach
@@ -775,14 +759,6 @@ fwd mach.lang.manifest.plan.AMBIGUOUS_ARTIFACT_MSG
 ```
 
 forwards [`mach.lang.manifest.plan.AMBIGUOUS_ARTIFACT_MSG`](manifest/plan.md#val-ambiguous_artifact_msg)
-
-## fwd mach.lang.manifest.plan.default_selection_takes
-
-```mach
-fwd mach.lang.manifest.plan.default_selection_takes
-```
-
-forwards [`mach.lang.manifest.plan.default_selection_takes`](manifest/plan.md#fun-default_selection_takes)
 
 ## fwd mach.lang.manifest.plan.select_primary_artifact
 
@@ -823,6 +799,102 @@ fwd mach.lang.manifest.plan.check_collisions
 ```
 
 forwards [`mach.lang.manifest.plan.check_collisions`](manifest/plan.md#fun-check_collisions)
+
+## fwd mach.lang.manifest.select.ArtifactDefault
+
+```mach
+fwd mach.lang.manifest.select.ArtifactDefault
+```
+
+forwards [`mach.lang.manifest.select.ArtifactDefault`](manifest/select.md#def-artifactdefault)
+
+## fwd mach.lang.manifest.select.ARTIFACT_DEFAULT_SET
+
+```mach
+fwd mach.lang.manifest.select.ARTIFACT_DEFAULT_SET
+```
+
+forwards [`mach.lang.manifest.select.ARTIFACT_DEFAULT_SET`](manifest/select.md#val-artifact_default_set)
+
+## fwd mach.lang.manifest.select.ARTIFACT_DEFAULT_ONE
+
+```mach
+fwd mach.lang.manifest.select.ARTIFACT_DEFAULT_ONE
+```
+
+forwards [`mach.lang.manifest.select.ARTIFACT_DEFAULT_ONE`](manifest/select.md#val-artifact_default_one)
+
+## fwd mach.lang.manifest.select.ARTIFACT_DEFAULT_EXECUTABLE
+
+```mach
+fwd mach.lang.manifest.select.ARTIFACT_DEFAULT_EXECUTABLE
+```
+
+forwards [`mach.lang.manifest.select.ARTIFACT_DEFAULT_EXECUTABLE`](manifest/select.md#val-artifact_default_executable)
+
+## fwd mach.lang.manifest.select.Selectors
+
+```mach
+fwd mach.lang.manifest.select.Selectors
+```
+
+forwards [`mach.lang.manifest.select.Selectors`](manifest/select.md#rec-selectors)
+
+## fwd mach.lang.manifest.select.Cell
+
+```mach
+fwd mach.lang.manifest.select.Cell
+```
+
+forwards [`mach.lang.manifest.select.Cell`](manifest/select.md#rec-cell)
+
+## fwd mach.lang.manifest.select.selectors_init
+
+```mach
+fwd mach.lang.manifest.select.selectors_init
+```
+
+forwards [`mach.lang.manifest.select.selectors_init`](manifest/select.md#fun-selectors_init)
+
+## fwd mach.lang.manifest.select.cell_label
+
+```mach
+fwd mach.lang.manifest.select.cell_label
+```
+
+forwards [`mach.lang.manifest.select.cell_label`](manifest/select.md#fun-cell_label)
+
+## fwd mach.lang.manifest.select.cell_labels
+
+```mach
+fwd mach.lang.manifest.select.cell_labels
+```
+
+forwards [`mach.lang.manifest.select.cell_labels`](manifest/select.md#fun-cell_labels)
+
+## fwd mach.lang.manifest.select.single_selection_msg
+
+```mach
+fwd mach.lang.manifest.select.single_selection_msg
+```
+
+forwards [`mach.lang.manifest.select.single_selection_msg`](manifest/select.md#fun-single_selection_msg)
+
+## fwd mach.lang.manifest.select.host_label
+
+```mach
+fwd mach.lang.manifest.select.host_label
+```
+
+forwards [`mach.lang.manifest.select.host_label`](manifest/select.md#fun-host_label)
+
+## fwd mach.lang.manifest.select.resolve_cells
+
+```mach
+fwd mach.lang.manifest.select.resolve_cells
+```
+
+forwards [`mach.lang.manifest.select.resolve_cells`](manifest/select.md#fun-resolve_cells)
 
 ## val MANIFEST_FILE
 

@@ -152,7 +152,7 @@ env = "vulkan1.3"
 ```
 
 ```sh
-mach build . --all-targets
+mach build . -t '*'
 ```
 
 A target's extensions are comptime facts, so one module can carry a hardware path and a portable fallback. The branch a target does not select is dropped before it is type-checked.

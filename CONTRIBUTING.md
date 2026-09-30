@@ -10,7 +10,7 @@ community like family.
 Mach is self-hosting, so building it needs an existing Mach compiler. Install
 the latest [release](https://github.com/briar-systems/mach/releases) for your
 host and put `mach` on `PATH`; CI seeds from the same archive
-(`.github/actions/seed-mach`).
+(`.github/scripts/bootstrap.sh`).
 
 ```bash
 git clone https://github.com/briar-systems/mach.git
@@ -29,12 +29,12 @@ The compiler is written to `out/<target>/<profile>/bin/mach`, or
 A change to the compiler has to reach the self-host fixpoint: the compiler it
 builds must build itself byte for byte. The stages start from a seed, a
 published release fetched and checked against the release's `SHA256SUMS`, as
-CI does in `.github/actions/seed-mach`. The seed is the tag that action pins
-(its `default: v...` line), not whichever `mach` happens to be on `PATH`. From
+CI does in `.github/scripts/bootstrap.sh`. The seed is the release that script
+pins (its `seed=` line), not whichever `mach` happens to be on `PATH`. From
 the repository root on x86_64 Linux:
 
 ```bash
-v=$(sed -n 's/^ *default: v//p' .github/actions/seed-mach/action.yml)
+v=$(sed -n 's/^seed=//p' .github/scripts/bootstrap.sh)
 t=x86_64-linux
 gh release download "v$v" -R briar-systems/mach -p "mach-$v-$t.tar.gz" -p SHA256SUMS -D ../mach-seed
 (cd ../mach-seed && grep " mach-$v-$t.tar.gz\$" SHA256SUMS | sha256sum -c - && tar -xzf "mach-$v-$t.tar.gz" mach)
@@ -47,7 +47,7 @@ cmp b c
 
 The seed builds `a` from your tree. `a` builds `b`, and `b` builds `c`. `cmp`
 prints nothing and exits 0 when `b` and `c` are identical. CI runs the
-fixpoint on every pull request that touches the compiler, so run it locally
+fixpoint on every pull request, so run it locally
 only when a change needs it. The seed builds the `mach` binary and nothing
 else. Run the unit suites with `c`, as in [Testing and
 formatting](#testing-and-formatting), because the test code may use language
@@ -55,7 +55,7 @@ the seed release predates. A release newer than the pin builds `a` too, and an
 older one is not supported. On macOS use `aarch64-darwin` or `x86_64-darwin`
 and `shasum -a 256 -c`. On Windows the archive is `mach-$v-x86_64-windows.zip`
 holding `mach.exe`, and the outputs are `a.exe`, `b.exe` and `c.exe`. Add
-`--profile release` to every build for the release fixpoint.
+`-p release` to every build for the release fixpoint.
 
 `-o` names a canonical path inside the project root: relative, `/`-separated,
 with no `.` or `..` component. `-o ../a`, `-o ./a` and an absolute path are
@@ -70,9 +70,9 @@ the seed on `PATH`:
 
 ```bash
 out/linux-x86_64/debug/bin/mach test .
-out/linux-x86_64/debug/bin/mach test . --profile release
-out/linux-x86_64/debug/bin/mach test . --lib tests
-out/linux-x86_64/debug/bin/mach test . --lib tests --profile release
+out/linux-x86_64/debug/bin/mach test . -p release
+out/linux-x86_64/debug/bin/mach test . -a tests
+out/linux-x86_64/debug/bin/mach test . -a tests -p release
 out/linux-x86_64/debug/bin/mach fmt .
 ```
 
@@ -141,9 +141,10 @@ chore: update dependencies
 - Link the issue with `Closes #N`.
 - Leave `CHANGELOG.md` alone. The changelog is written from the merged
   commits when `dev` is released to `main`.
-- Say briefly what changed and which tests you ran. CI runs the legs the
-  changed paths select (`.github/scripts/ci-legs.sh`), and the pull request
-  from `dev` to `main` runs everything.
+- Say briefly what changed and which tests you ran. Every pull request runs
+  the same CI lanes on the linux runners. The windows, darwin and slow lanes
+  run on a release tag, or on any ref when the CI workflow is dispatched with a
+  `lane`, which is worth doing before a windows or darwin change reaches `dev`.
 - Merge with a merge commit. Never rebase or fast-forward.
 - When the target is not the default branch, close the linked issue by hand
   after the merge.

@@ -9,9 +9,19 @@ pub rec RunArtifact;
 ## fun resolve_run_artifact
 
 ```mach
-pub fun resolve_run_artifact(alloc: *A.Allocator, project_root: str, pick: *manifest.Selection,
+pub fun resolve_run_artifact(alloc: *A.Allocator, project_root: str, selectors: *manifest.Selectors,
 output_override: str) res[RunArtifact, outcome.Fail];
 ```
+
+the built executable `mach run` launches: the one (artifact, target, profile)
+the selectors name, which must be a `bin`
+
+alloc: owns the result and every message
+project_root: the project root
+selectors: the `-a`, `-t` and `-p` patterns; an artifact axis given none takes the sole `bin`
+output_override: `-o`, the path to run instead of the artifact's output, or nil
+ret: the executable; err from the manifest or selection, when the selection
+                 names several cells or a library, or for an unusable `-o`
 
 ## fun load_project_config
 

@@ -3021,6 +3021,18 @@ pub val NAME_BUILTIN_TYPE:                Kind = 495
 pub val DECORATOR_NOT_CONSTANT:           Kind = 496
 ```
 
+## val SELECTION_NO_HOST_TARGET
+
+```mach
+pub val SELECTION_NO_HOST_TARGET:         Kind = 497
+```
+
+## val TARGET_DEFAULT_DEPRECATED
+
+```mach
+pub val TARGET_DEFAULT_DEPRECATED:        Kind = 498
+```
+
 ## rec Spec
 
 ```mach
@@ -3038,7 +3050,7 @@ retired: nothing raises the kind any more; the row stays so its key is
 ## val COUNT
 
 ```mach
-pub val COUNT: usize       = 496
+pub val COUNT: usize       = 498
 ```
 
 ## fun at

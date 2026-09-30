@@ -147,11 +147,13 @@ A refusal between several entries points at the first and lists the others in
 
 - two steps declaring one output, or two artifacts writing one path, at the
   first claim
-- more than one `default = true` target, profile or artifact, at the first
+- more than one `default = true` profile or artifact, at the first
   `default` value
 - a selection several declarations could satisfy (`native` matching several
-  targets, several targets, profiles or artifacts with none marked default), at
+  targets, several profiles or artifacts with none marked default), at
   the first candidate's table key
+- `native` matching no declared target, at the first declared target's table key,
+  the other declared targets related
 - a cycle among `need` entries, at the entry of its first edge, the entries of
   the other edges related
 

@@ -3,7 +3,7 @@
 #
 # the image needs its leg's loader, so under qemu the loader comes from the leg's
 # sysroot: MACH_RISCV64_SYSROOT, the one cc.sh compiles against, or where Ubuntu's
-# libc6-<arch>-cross installs it, which ci.yml installs for riscv64
+# libc6-<arch>-cross installs it
 . "$(dirname "$0")/common.sh"
 
 produce_exec_dynamic() {

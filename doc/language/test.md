@@ -269,19 +269,29 @@ as is when the result is in `0..255`, and `255` otherwise (see
 `mach test` then keeps up to `--jobs` children in flight, each spawned as
 `<exe> <index>`, captures each child's stdout and stderr to a per-test file
 under `log/` beside the dispatcher, `test/<artifact>/log/` unless `-o` moves
-the dispatcher (a passing test's file is removed on the spot, a failing test's
+the dispatcher, named by the test's position in the run (a passing test's file is removed on the spot, a failing test's
 file stays), and reads its exit status. Results render
 in collection order regardless of completion order.
 
 ## Which tests run
 
-`mach test` selects the artifact under test the way every command that needs
-one artifact does: `--bin <name>` or `--lib <name>` names it; otherwise the sole
-artifact the selected target builds is chosen, or among several the one marked
-`default = true` (see [manifest.md](manifest.md#artifactname)). It then builds that
-artifact's closure, the same module set `mach build` compiles for it, and runs
-the tests declared there. Each run tests one artifact, so `$bin.name` in a test
-block, and in every module the run compiles, is the artifact under test.
+`mach test` selects its cells with `-a`, `-t` and `-p` as every command does (see
+[manifest.md](manifest.md#selection-and-the-build-matrix)): each takes an exact
+name or a glob and repeats, and `--all` fills every axis no option names with
+`*`. With no `-a`, the sole artifact the selected target builds is chosen, or
+among several the one marked `default = true` (see
+[manifest.md](manifest.md#artifactname)). Each selected artifact's closure, the
+same module set `mach build` compiles for it, is built into a test dispatcher for
+each selected target and profile, so `$bin.name` in a test block, and in every
+module a dispatcher compiles, is the artifact under test.
+
+Tests run once per (target, profile). When several artifacts are selected there,
+the tests they reach are combined and each qualified name runs once. Only a target
+whose `os` and `isa` are the host's runs its tests; any other is built and reported
+on a `skip` line, since an emulator the host happens to have is not the target.
+`--runner <cmd>` launches each test as `<cmd> <exe> <index>` and needs the selection
+to resolve to one (artifact, target, profile), foreign or not. A run that executed
+nothing exits `1`, naming the host, so a passing run always ran tests.
 
 An inline `test name { }` declaration in a module the artifact reaches runs
 with no further wiring. A module that exists only for tests, such as a suite
@@ -317,11 +327,11 @@ use app.test.parser;
 use app.test.roundtrip;
 ```
 
-`mach test .` then runs the tests `app` reaches and `mach test . --lib tests`
+`mach test .` then runs the tests `app` reaches and `mach test . -a tests`
 the test-only suites. The entry reaches the runtime's startup (`use std.runtime;`)
 because a library artifact's closure is all the test dispatcher links. Marking
 `app` `default = true` keeps `mach build .` and `mach check .` to `app`, since with
-no selector they take the marked artifacts; `mach build . --lib tests` builds the
+no selector they take the marked artifacts; `mach build . -a tests` builds the
 test artifact.
 
 ## Test policy

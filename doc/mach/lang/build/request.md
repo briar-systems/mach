@@ -6,6 +6,10 @@
 pub rec CliArgs;
 ```
 
+the typed options of a build-shaped command
+
+selectors: the `-a`, `-t` and `-p` patterns and `--all`
+
 ## fun is_object_path
 
 ```mach

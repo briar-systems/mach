@@ -71,7 +71,7 @@ alias_of: the canonical spelling this option is an alias of, which must occur ex
 ## val SEL_N
 
 ```mach
-pub val SEL_N: usize = 5
+pub val SEL_N: usize = 8
 ```
 
 row count of SEL
@@ -82,9 +82,11 @@ row count of SEL
 pub val SEL: [SEL_N]FlagSpec = [SEL_N]FlagSpec;
 ```
 
-the artifact-selection options `--target`, `--profile`, `-o`, `--bin`, `--lib`,
-consumed by build, run, test, and doc; run hides `--lib` and doc hides all but
-`--target` through visibility masks, and both still parse the hidden rows
+the selection options `--artifact`, `--target`, `--profile` with their short
+forms `-a`, `-t`, `-p`, then `--all` and `-o`, consumed by build, check, run,
+test and doc. each selector takes an exact name or a glob and repeats; `--all`
+fills every selector not given with `*`. check hides `-o`, run hides `--all`,
+and doc accepts only `--artifact` and `--target`
 
 ## val RDO_N
 
@@ -106,7 +108,7 @@ and doc; doc hides `-v` and `-vv`. `-q` is the alias of `--quiet`
 ## val CGEN_N
 
 ```mach
-pub val CGEN_N: usize = 6
+pub val CGEN_N: usize = 5
 ```
 
 row count of CGEN
@@ -117,7 +119,7 @@ row count of CGEN
 pub val CGEN: [CGEN_N]FlagSpec = [CGEN_N]FlagSpec;
 ```
 
-the codegen options `--all-targets`, `--pie`, `--subsystem`, `-g`,
+the codegen options `--pie`, `--subsystem`, `-g`,
 `--emit-asm`, `--emit-ir`, consumed by build and test; doc parses them with
 every row hidden. `--emit-ir` is the one attached-value row: bare it writes
 the ir-debug dump, `--emit-ir=<form>` selects a row of printer.IR_FORMS
@@ -719,7 +721,7 @@ the option tables mach fmt accepts: FMT_OWN alone
 pub val RUN_SEL_ACCEPTED: [SEL_N]bool = [SEL_N]bool;
 ```
 
-SEL rows run accepts: every row but `--lib`
+SEL rows run accepts: every row but `--all`, since run executes one artifact
 
 ## val RUN_SCHEMA_N
 
@@ -759,7 +761,7 @@ the option tables mach test accepts: SEL, RDO, CGEN, OPT, LINKIN, TEST_OWN, DIAG
 pub val DOC_SEL_ACCEPTED: [SEL_N]bool = [SEL_N]bool;
 ```
 
-SEL rows doc accepts: `--target`, `--bin`, `--lib`
+SEL rows doc accepts: `--artifact`, `-a`, `--target`, `-t`, since doc renders one artifact
 
 ## val DOC_RDO_ACCEPTED
 
@@ -1066,7 +1068,7 @@ Indexed by search, not by DepAction
 ## val BUILD_CONSTRAINT_N
 
 ```mach
-pub val BUILD_CONSTRAINT_N: usize = 5
+pub val BUILD_CONSTRAINT_N: usize = 6
 ```
 
 length of BUILD_CONSTRAINT
@@ -1077,15 +1079,23 @@ length of BUILD_CONSTRAINT
 pub val BUILD_CONSTRAINT: [BUILD_CONSTRAINT_N]str = [BUILD_CONSTRAINT_N]str;
 ```
 
-the constraint sentences help prints for build; the first is enforced by
-build_cli_invocation, the second by selection_from_config, the third by the
-build command, the fourth by the build plan's output path, the fifth by
-readout_allowed
+the constraint sentences help prints for build and check; the first is
+enforced by build_cli_invocation, the second by manifest.resolve_cells, the
+third and fourth by the build command, the fifth by the build plan's output
+path, the sixth by readout_allowed
+
+## val SELECTOR_CONSTRAINT
+
+```mach
+pub val SELECTOR_CONSTRAINT: str = "-a, -t and -p take an exact name, which must be declared, or a glob with * and ?, which must match
+```
+
+the rule every selector keeps, shared by the constraint tables
 
 ## val TEST_CONSTRAINT_N
 
 ```mach
-pub val TEST_CONSTRAINT_N: usize = 3
+pub val TEST_CONSTRAINT_N: usize = 5
 ```
 
 length of TEST_CONSTRAINT
@@ -1097,7 +1107,55 @@ pub val TEST_CONSTRAINT: [TEST_CONSTRAINT_N]str = [TEST_CONSTRAINT_N]str;
 ```
 
 the constraint sentences help prints for test; enforced by
-build_cli_invocation, selection_from_config and readout_allowed
+build_cli_invocation, manifest.resolve_cells, the test command and readout_allowed
+
+## val CHECK_CONSTRAINT_N
+
+```mach
+pub val CHECK_CONSTRAINT_N: usize = 3
+```
+
+length of CHECK_CONSTRAINT
+
+## val CHECK_CONSTRAINT
+
+```mach
+pub val CHECK_CONSTRAINT: [CHECK_CONSTRAINT_N]str = [CHECK_CONSTRAINT_N]str;
+```
+
+the constraint sentences help prints for check
+
+## val RUN_CONSTRAINT_N
+
+```mach
+pub val RUN_CONSTRAINT_N: usize = 2
+```
+
+length of RUN_CONSTRAINT
+
+## val RUN_CONSTRAINT
+
+```mach
+pub val RUN_CONSTRAINT: [RUN_CONSTRAINT_N]str = [RUN_CONSTRAINT_N]str;
+```
+
+the constraint sentences help prints for run; the second is enforced by the run command
+
+## val DOC_CONSTRAINT_N
+
+```mach
+pub val DOC_CONSTRAINT_N: usize = 2
+```
+
+length of DOC_CONSTRAINT
+
+## val DOC_CONSTRAINT
+
+```mach
+pub val DOC_CONSTRAINT: [DOC_CONSTRAINT_N]str = [DOC_CONSTRAINT_N]str;
+```
+
+the constraint sentences help prints for doc; the second is enforced by the doc command
 
 ## val INFO_CONSTRAINT_N
 
@@ -1379,22 +1437,53 @@ c: the command's arguments
 format: the diagnostics format
 ret: ok, or a user failure when a readout is asked for under json
 
+## fun invocation_values
+
+```mach
+pub fun invocation_values(a: *A.Allocator, cmd: CommandId, inv: *ParsedInvocation, argv: **u8, flag: str) res[Vector[str], outcome.Fail];
+```
+
+every value given to flag or to an alias of it, in argv order
+
+a: backs the vector
+cmd: the command
+inv: the parsed invocation
+argv: the argument vector inv was parsed from
+flag: the canonical spelling
+ret: the values; err when an occurrence has no value
+
+## fun collect_selectors
+
+```mach
+pub fun collect_selectors(a: *A.Allocator, cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[manifest.Selectors, outcome.Fail];
+```
+
+the `-a`, `-t` and `-p` patterns and `--all` a command was given
+
+a: backs the pattern vectors
+cmd: the command
+inv: the parsed invocation
+argv: the argument vector inv was parsed from
+ret: the selectors; err when a selector has no value
+
 ## fun build_cli_invocation
 
 ```mach
-pub fun build_cli_invocation(cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[request.CliArgs, outcome.Fail];
+pub fun build_cli_invocation(a: *A.Allocator, cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[request.CliArgs, outcome.Fail];
 ```
 
 the typed request.CliArgs of a build-shaped command: verbosity 0, 1, or 2
-from `-v` and `-vv`, quiet from `--quiet` or `-q`, the CGEN flags, the SEL
-values and `--jobs` as raw argv pointers or nil, opt_set and opt_release
-from `-O0` and `-O2` with `-O0` winning when both occur, include_deps.
-link_tokens and lib_dirs are left empty for collect_link_inputs
+from `-v` and `-vv`, quiet from `--quiet` or `-q`, the CGEN flags, the
+selectors, `-o` and `--jobs` as raw argv pointers or nil, opt_set and
+opt_release from `-O0` and `-O2` with `-O0` winning when both occur,
+include_deps. link_tokens and lib_dirs are left empty for collect_link_inputs
 
+a: backs the selector patterns
 cmd: the command
 inv: the parsed invocation
 argv: the argument vector inv was parsed from
 ret: the arguments, or err when `-v` or `-vv` is combined with `--quiet` or `-q`
+      or a selector has no value
 
 ## fun collect_link_inputs
 
@@ -1413,20 +1502,6 @@ cmd: the command
 inv: the parsed invocation
 argv: the argument vector inv was parsed from
 ret: ok, or err when a push fails
-
-## fun selection_from_config
-
-```mach
-pub fun selection_from_config(config: *request.CliArgs, out_sel: *manifest.Selection) err[outcome.Fail];
-```
-
-derive the manifest Selection from CliArgs: profile, target, and artifact
-as strings that are empty when unset, want_lib when `--lib` was given,
-has_artifact when either `--bin` or `--lib` was
-
-config: the arguments
-out_sel: receives the selection
-ret: ok, or err when both `--bin` and `--lib` are set
 
 ## rec InitInvocation
 
@@ -1590,17 +1665,11 @@ pub fun build_dep_invocation(inv: *ParsedInvocation, argv: **u8) DepInvocation;
 pub rec RunInvocation;
 ```
 
-the typed arguments of mach run; each value option is an index into argv
+the typed arguments of mach run beside its selectors; each value option is an index into argv
 
-has_target: `--target` occurred with a value
-target_idx: argv index of the target value
-has_profile: `--profile` occurred with a value
-profile_idx: argv index of the profile value
 has_output: `-o` occurred with a value
 output_idx: argv index of the output value
 output_seen: `-o` occurred at all, with or without a value
-has_bin: `--bin` occurred with a value
-bin_idx: argv index of the bin value
 has_runner: `--runner` occurred with a value
 runner_idx: argv index of the runner value
 has_timeout: `--timeout` occurred with a value

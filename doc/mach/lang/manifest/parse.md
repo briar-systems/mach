@@ -279,6 +279,8 @@ pub fun must_lookup(itn: *intern.Interner, id: intern.StrId) res[str, outcome.Fa
 pub fun is_glob(s: str) bool;
 ```
 
+whether a pattern holds a wildcard: `*` matches any run of bytes, `?` any one byte
+
 ## fun glob_matches
 
 ```mach
