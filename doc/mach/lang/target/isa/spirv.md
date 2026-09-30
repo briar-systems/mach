@@ -302,6 +302,12 @@ pub val OP_LOAD:                      u32 = 61
 pub val OP_STORE:                     u32 = 62
 ```
 
+## val OP_IMAGE_TEXEL_POINTER
+
+```mach
+pub val OP_IMAGE_TEXEL_POINTER:       u32 = 60
+```
+
 ## val OP_ACCESS_CHAIN
 
 ```mach
@@ -354,6 +360,12 @@ pub val OP_SAMPLED_IMAGE:             u32 = 86
 
 ```mach
 pub val OP_IMAGE_SAMPLE_IMPLICIT_LOD: u32 = 87
+```
+
+## val OP_IMAGE_SAMPLE_EXPLICIT_LOD
+
+```mach
+pub val OP_IMAGE_SAMPLE_EXPLICIT_LOD: u32 = 88
 ```
 
 ## val OP_CONVERT_F_TO_U
@@ -612,6 +624,30 @@ pub val OP_BITWISE_AND:               u32 = 199
 
 ```mach
 pub val OP_NOT:                       u32 = 200
+```
+
+## val OP_CONTROL_BARRIER
+
+```mach
+pub val OP_CONTROL_BARRIER:           u32 = 224
+```
+
+## val OP_ATOMIC_LOAD
+
+```mach
+pub val OP_ATOMIC_LOAD:               u32 = 227
+```
+
+## val OP_ATOMIC_STORE
+
+```mach
+pub val OP_ATOMIC_STORE:              u32 = 228
+```
+
+## val OP_ATOMIC_I_ADD
+
+```mach
+pub val OP_ATOMIC_I_ADD:              u32 = 234
 ```
 
 ## val OP_LOOP_MERGE
@@ -942,6 +978,12 @@ pub val STORAGE_PUSH_CONSTANT: u32 = 9
 
 ```mach
 pub val STORAGE_STORAGE_BUFFER: u32 = 12
+```
+
+## val STORAGE_IMAGE
+
+```mach
+pub val STORAGE_IMAGE: u32 = 11
 ```
 
 ## val STORAGE_UNIFORM_CONSTANT
