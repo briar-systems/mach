@@ -22,11 +22,13 @@ use mach.lang.be.codegen.mir;
 use mach.lang.be.codegen.unit;
 use mach.lang.diagnostic;
 use dkind: mach.lang.diagnostic.kind;
+use mach.lang.float;
 use mach.lang.intern;
 use mach.lang.layout;
 use mach.lang.me.ir;
 use mach.lang.me.ir.id;
 use mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
 use mach.lang.source;
 use mach.lang.target.isa;
 use mach.lang.target.isa.spirv;
@@ -63,6 +65,10 @@ rec Emit {
 
     # what each reached global's memory may undergo, as ACCESS_* bits
     gaccess: *u8;
+    # the OpSpecConstant id of each `#[spec]` global, 0 for any other
+    gspec: *u32;
+    # the module sizes its compute stages through one WorkgroupSize built-in
+    wg_builtin: bool;
 
     ext_ids: [8]u32;
 
@@ -118,27 +124,29 @@ pub fun emit_module(out_alloc: *A.Allocator, tgt: *isa.BackendTarget, u: *unit.U
     var tt: types.TypeTable = types.types_init(?b);
 
     var e: Emit;
-    e.alloc     = out_alloc;
-    e.interner  = mirmod.interner;
-    e.tgt       = tgt;
-    e.layout    = layout.machine(tgt.model.pointer_width, tgt.model.vector_bits, isa.vector_register_bits(?tgt.model));
-    e.u         = u;
-    e.root      = irmod;
-    e.ir        = irmod;
-    e.cur_mi    = u.root;
-    e.b         = ?b;
-    e.tt        = ?tt;
-    e.fns       = nil;
-    e.fn_len    = 0;
-    e.gls       = nil;
-    e.gl_len    = 0;
-    e.gvar_ids  = nil;
-    e.gtype_ids = nil;
-    e.gstorage  = nil;
-    e.iface_len = 0;
-    e.gslot     = nil;
-    e.iface_use = nil;
-    e.gaccess   = nil;
+    e.alloc      = out_alloc;
+    e.interner   = mirmod.interner;
+    e.tgt        = tgt;
+    e.layout     = layout.machine(tgt.model.pointer_width, tgt.model.vector_bits, isa.vector_register_bits(?tgt.model));
+    e.u          = u;
+    e.root       = irmod;
+    e.ir         = irmod;
+    e.cur_mi     = u.root;
+    e.b          = ?b;
+    e.tt         = ?tt;
+    e.fns        = nil;
+    e.fn_len     = 0;
+    e.gls        = nil;
+    e.gl_len     = 0;
+    e.gvar_ids   = nil;
+    e.gtype_ids  = nil;
+    e.gstorage   = nil;
+    e.iface_len  = 0;
+    e.gslot      = nil;
+    e.iface_use  = nil;
+    e.gaccess    = nil;
+    e.gspec      = nil;
+    e.wg_builtin = false;
     var xi: u32 = 0;
     for (xi < 8) {
         e.ext_ids[xi] = 0;
@@ -230,6 +238,14 @@ pub fun emit_module(out_alloc: *A.Allocator, tgt: *isa.BackendTarget, u: *unit.U
         ret sir;
     }
 
+    val wgr: err[fail.Fail] = plan_workgroup(?e);
+    if (sel wgr.err) {
+        emit_dnit(?e);
+        types.types_dnit(?tt);
+        spirv.builder_dnit(?b);
+        ret wgr;
+    }
+
     var fi: u32 = 0;
     for (fi < e.fn_len) {
         if (!e.fns[fi].emit) {
@@ -311,6 +327,10 @@ fun emit_dnit(e: *Emit) {
         A.deallocate[u8](e.alloc, e.gaccess, e.gl_len::usize);
     }
     e.gaccess = nil;
+    if (e.gspec != nil && e.gl_len > 0) {
+        A.deallocate[u32](e.alloc, e.gspec, e.gl_len::usize);
+    }
+    e.gspec = nil;
     if (e.gls != nil && e.gl_len > 0) { A.deallocate[GlobalEnt](e.alloc, e.gls, e.gl_len::usize); }
     e.gls    = nil;
     e.gl_len = 0;
@@ -745,6 +765,15 @@ fun mark_access(e: *Emit, mi: *mir.MirInstr, gix: u32, how: u8) err[fail.Fail] {
     e.gaccess[gix] = e.gaccess[gix] | fresh;
     val g: *ir.Global = gl_ir(e, gix);
     if ((fresh & ACCESS_WRITE) != 0 && (g.iface_flags & ir.IFACE_FLAG_READONLY) != 0) {
+        if (g.iface == ir.IFACE_SPEC) {
+            val sr: res[str, format.FormatError] = format.sprint(e.alloc,
+                "a store reaches the `#[spec({})]` var{}: a specialization constant is supplied by the host at pipeline creation and is a constant from then on, so a shader has no storage to write it through. copy it into a local to change the value",
+                g.iface_a, gl_mod_prefix(e, gix));
+            if (sel sr.err) {
+                ret err[fail.Fail].err{fail.message("spirv.emit: a store reaches a `#[spec]` var")};
+            }
+            ret err[fail.Fail].err{reject_at(e, dkind.SPIRV_READONLY_STORE, mir.refusal_loc(e.cur_fn, mi), sr.ok)};
+        }
         if (g.iface == ir.IFACE_PUSH) {
             val pr: res[str, format.FormatError] = format.sprint(e.alloc,
                 "a store reaches the `#[push]` block{}: a push-constant block is written by the host with the command that records the dispatch or draw, and a shader only reads it. copy the value into a local to change it",
@@ -788,6 +817,8 @@ fun global_is_reached(e: *Emit, name: intern.StrId) bool {
             fx = fx + 1;
             cnt;
         }
+        val fn: *ir.Function = fn_ir(e, fx);
+        if (fn.wg_spec[0] == name || fn.wg_spec[1] == name || fn.wg_spec[2] == name) { ret true; }
         val mf: *mir.MirFunction = fn_mir(e, fx);
         if (mf == nil) {
             fx = fx + 1;
@@ -861,6 +892,9 @@ fun declare_interface(e: *Emit) err[fail.Fail] {
     val rc: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
     if (sel rc.err) { ret err[fail.Fail].err{fail.refused(rc.err)}; }
     e.gstorage = rc.ok;
+    val rp: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+    if (sel rp.err) { ret err[fail.Fail].err{fail.refused(rp.err)}; }
+    e.gspec = rp.ok;
 
     var i: u32 = 0;
     for (i < n) {
@@ -868,6 +902,7 @@ fun declare_interface(e: *Emit) err[fail.Fail] {
         e.gslot[i]     = 0;
         e.gtype_ids[i] = 0;
         e.gstorage[i]  = 0;
+        e.gspec[i]     = 0;
         i              = i + 1;
     }
 
@@ -876,6 +911,12 @@ fun declare_interface(e: *Emit) err[fail.Fail] {
         val g:  *ir.Global        = gl_ir(e, i);
         val gt: *type.IrTypeTable = gl_types(e, i);
         if (g.iface == ir.IFACE_NONE) {
+            i = i + 1;
+            cnt;
+        }
+        if (g.iface == ir.IFACE_SPEC) {
+            val sr: err[fail.Fail] = declare_spec(e, i);
+            if (sel sr.err) { ret sr; }
             i = i + 1;
             cnt;
         }
@@ -944,6 +985,165 @@ fun declare_interface(e: *Emit) err[fail.Fail] {
         e.iface_len = e.iface_len + 1;
         i           = i + 1;
     }
+    ret err[fail.Fail].ok{};
+}
+
+# a specialization constant is no variable: it is an OpSpecConstant whose literal is the
+# initializer, the default a pipeline keeps unless it supplies the SpecId
+fun declare_spec(e: *Emit, i: u32) err[fail.Fail] {
+    val g:      *ir.Global        = gl_ir(e, i);
+    val gt:     *type.IrTypeTable = gl_types(e, i);
+    val t:      opt[*type.IrType] = type.get(gt, g.ty);
+    var scalar: bool              = false;
+    if (sel t.some) { scalar = t.some.kind == type.IRT_INT || t.some.kind == type.IRT_FLOAT; }
+    if (!scalar) {
+        val nr: res[str, format.FormatError] = format.sprint(e.alloc,
+            "a `#[spec({})]` var must be a scalar integer or float{}: a specialization constant is one literal the host supplies, and this one is {}",
+            g.iface_a, gl_mod_prefix(e, i), ir_type_spelling(gt, e.alloc, g.ty));
+        if (sel nr.err) { ret err[fail.Fail].err{reject_module(e, dkind.SPIRV_INTERFACE, "a `#[spec]` var must be a scalar integer or float")}; }
+        ret err[fail.Fail].err{reject_module(e, dkind.SPIRV_INTERFACE, nr.ok)};
+    }
+    var j: u32 = 0;
+    for (j < i) {
+        val o: *ir.Global = gl_ir(e, j);
+        if (o.iface == ir.IFACE_SPEC && o.iface_a == g.iface_a) {
+            val dr: res[str, format.FormatError] = format.sprint(e.alloc,
+                "two `#[spec({})]` vars share one SpecId: `{}`{} and `{}`{}. a pipeline supplies a specialization constant by its id, so one id names one constant in a module. give them different ids",
+                g.iface_a, spec_name(e, j), gl_mod_prefix(e, j), spec_name(e, i), gl_mod_prefix(e, i));
+            if (sel dr.err) { ret err[fail.Fail].err{reject_module(e, dkind.SPIRV_INTERFACE, "two `#[spec]` vars share one SpecId")}; }
+            ret err[fail.Fail].err{reject_module(e, dkind.SPIRV_INTERFACE, dr.ok)};
+        }
+        j = j + 1;
+    }
+    val value_ty: u32 = global_spv_type(e, gt, g.ty);
+    if (value_ty == 0) { ret unsupported(e, "unsupported specialization constant type in the SPIR-V target"); }
+    val bits: u32 = types.type_bits(e.tt, value_ty);
+    var lit:  u64 = g.init.data.int_lit;
+    if (g.init.kind == value.VAL_CONST_FLOAT) {
+        lit = float.bits_at(float.bits_f64(g.init.data.int_lit), float.width_of_bits(bits));
+    }
+    or (g.init.kind != value.VAL_CONST_INT) { lit = 0; }
+    if (bits < 64)                          { lit = lit & ((1::u64 << bits::u64) - 1); }
+    val id:  u32 = spirv.alloc_id(e.b);
+    var ops: [4]u32;
+    ops[0] = value_ty;
+    ops[1] = id;
+    ops[2] = (lit & 0xFFFFFFFF)::u32;
+    ops[3] = (lit >> 32)::u32;
+    var n: u32 = 3;
+    if (bits > 32) { n = 4; }
+    spirv.inst(e.b, ?e.b.types_consts, spirv.OP_SPEC_CONSTANT, ?ops[0], n);
+    decorate(e, id, spirv.DECOR_SPEC_ID, g.iface_a);
+    dbgm.name_shown(?e.dbg, id, g.disp, g.name);
+    e.gspec[i]     = id;
+    e.gtype_ids[i] = value_ty;
+    ret err[fail.Fail].ok{};
+}
+
+fun spec_name(e: *Emit, i: u32) str {
+    val g: *ir.Global   = gl_ir(e, i);
+    var n: intern.StrId = g.disp;
+    if (n == intern.STR_NIL) { n = g.name; }
+    val o: opt[str] = intern.lookup(e.interner, n);
+    if (sel o.none) { ret "?"; }
+    ret o.some;
+}
+
+fun spec_target(e: *Emit, op: *mir.MirOperand) u32 {
+    if (e.gspec == nil || op.kind != mir.MIR_OP_SYM || op.sym_off != 0) { ret 0; }
+    val gx: u32 = gl_lookup(e, op.sym);
+    if (gx == GL_NONE) { ret 0; }
+    ret e.gspec[gx];
+}
+
+# the environment admits LocalSizeId: SPIR-V 1.2 without an environment, and on
+# Vulkan the maintenance4 feature only Vulkan 1.3 guarantees
+fun local_size_id_admitted(e: *Emit) bool {
+    if (e.tgt.identity.env_id == isa.ENV_NONE) { ret e.b.version >= spirv.SPV_VERSION_1_2; }
+    val p: *spirv.EnvProfile = spirv.env_profile(e.tgt.identity.env_profile);
+    ret p != nil && p.local_size_id;
+}
+
+fun wg_is_spec(fn: *ir.Function) bool {
+    ret fn.wg_spec[0] != intern.STR_NIL || fn.wg_spec[1] != intern.STR_NIL || fn.wg_spec[2] != intern.STR_NIL;
+}
+
+fun wg_literal(fn: *ir.Function, d: u32) u32 {
+    if (d == 0) { ret fn.wg_x; }
+    if (d == 1) { ret fn.wg_y; }
+    ret fn.wg_z;
+}
+
+# the id a workgroup dimension is: its `#[spec]` var's constant, or a 32-bit OpConstant
+fun wg_dim_id(e: *Emit, fn: *ir.Function, d: u32) res[u32, fail.Fail] {
+    val name: intern.StrId = fn.wg_spec[d];
+    if (name == intern.STR_NIL) { ret res[u32, fail.Fail].ok{types.const_int(e.tt, 32, wg_literal(fn, d)::i64)}; }
+    val gx: u32 = gl_lookup(e, name);
+    var id: u32 = 0;
+    if (gx != GL_NONE && e.gspec != nil) { id = e.gspec[gx]; }
+    if (id == 0) {
+        ret res[u32, fail.Fail].err{reject_module(e, dkind.SPIRV_INTERFACE, "a `#[workgroup]` dimension names a var that is not a `#[spec(id)]` var: a dimension is a constant or a specialization constant the host supplies at pipeline creation")};
+    }
+    val ty: u32 = e.gtype_ids[gx];
+    if (types.type_is_float(e.tt, ty) || types.type_bits(e.tt, ty) != 32) {
+        ret res[u32, fail.Fail].err{reject_module(e, dkind.SPIRV_INTERFACE, "a `#[spec]` var sizing a `#[workgroup]` dimension must be a 32-bit integer: a workgroup size is three 32-bit integers")};
+    }
+    ret res[u32, fail.Fail].ok{id};
+}
+
+fun wg_same(a: *ir.Function, b: *ir.Function) bool {
+    var d: u32 = 0;
+    for (d < 3) {
+        if (a.wg_spec[d] != b.wg_spec[d])                                           { ret false; }
+        if (a.wg_spec[d] == intern.STR_NIL && wg_literal(a, d) != wg_literal(b, d)) { ret false; }
+        d = d + 1;
+    }
+    ret true;
+}
+
+# without LocalSizeId a specialized workgroup is the WorkgroupSize built-in over a
+# spec composite, which sizes every compute stage in the module, so they must agree
+fun plan_workgroup(e: *Emit) err[fail.Fail] {
+    var first: *ir.Function = nil;
+    var spec:  bool         = false;
+    var fx:    u32          = 0;
+    for (fx < e.fn_len) {
+        if (!e.fns[fx].emit) {
+            fx = fx + 1;
+            cnt;
+        }
+        val fn: *ir.Function = fn_ir(e, fx);
+        if (fn.stage != ir.STAGE_COMPUTE) {
+            fx = fx + 1;
+            cnt;
+        }
+        if (wg_is_spec(fn)) { spec = true; }
+        if (first == nil)   { first = fn; }
+        or (!wg_same(first, fn) && (spec || wg_is_spec(first)) && !local_size_id_admitted(e)) {
+            ret err[fail.Fail].err{reject_module(e, dkind.SPIRV_INTERFACE, "compute stages in one module size their workgroups differently and one of them by a `#[spec]` var: this environment has no LocalSizeId, so a specialized workgroup is the WorkgroupSize built-in, which sizes every compute stage in the module at once. give the stages one workgroup, split them into modules, or target vulkan1.3")};
+        }
+        fx = fx + 1;
+    }
+    if (!spec || local_size_id_admitted(e)) { ret err[fail.Fail].ok{}; }
+    var parts: [3]u32;
+    var d:     u32 = 0;
+    for (d < 3) {
+        val r: res[u32, fail.Fail] = wg_dim_id(e, first, d);
+        if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+        parts[d] = r.ok;
+        d        = d + 1;
+    }
+    val vec: u32 = types.type_vector(e.tt, types.type_int(e.tt, 32), 3);
+    val id:  u32 = spirv.alloc_id(e.b);
+    var ops: [5]u32;
+    ops[0] = vec;
+    ops[1] = id;
+    ops[2] = parts[0];
+    ops[3] = parts[1];
+    ops[4] = parts[2];
+    spirv.inst(e.b, ?e.b.types_consts, spirv.OP_SPEC_CONSTANT_COMPOSITE, ?ops[0], 5);
+    decorate(e, id, spirv.DECOR_BUILTIN, spirv.BUILTIN_WORKGROUP_SIZE);
+    e.wg_builtin = true;
     ret err[fail.Fail].ok{};
 }
 
@@ -2495,14 +2695,27 @@ fun emit_entry_point(e: *Emit, irfn: *ir.Function, fn_ix: u32, fn_id: u32, name:
         fm[1] = spirv.EXEC_MODE_ORIGIN_UPPER_LEFT;
         spirv.inst(e.b, ?e.b.exec_modes, spirv.OP_EXECUTION_MODE, ?fm[0], 2);
     }
-    if (irfn.stage == ir.STAGE_COMPUTE) {
+    if (irfn.stage == ir.STAGE_COMPUTE && !e.wg_builtin) {
         var cm: [5]u32;
         cm[0] = fn_id;
-        cm[1] = spirv.EXEC_MODE_LOCAL_SIZE;
-        cm[2] = irfn.wg_x;
-        cm[3] = irfn.wg_y;
-        cm[4] = irfn.wg_z;
-        spirv.inst(e.b, ?e.b.exec_modes, spirv.OP_EXECUTION_MODE, ?cm[0], 5);
+        if (wg_is_spec(irfn)) {
+            cm[1] = spirv.EXEC_MODE_LOCAL_SIZE_ID;
+            var d: u32 = 0;
+            for (d < 3) {
+                val r: res[u32, fail.Fail] = wg_dim_id(e, irfn, d);
+                if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+                cm[2 + d] = r.ok;
+                d         = d + 1;
+            }
+            spirv.inst(e.b, ?e.b.exec_modes, spirv.OP_EXECUTION_MODE_ID, ?cm[0], 5);
+        }
+        or {
+            cm[1] = spirv.EXEC_MODE_LOCAL_SIZE;
+            cm[2] = irfn.wg_x;
+            cm[3] = irfn.wg_y;
+            cm[4] = irfn.wg_z;
+            spirv.inst(e.b, ?e.b.exec_modes, spirv.OP_EXECUTION_MODE, ?cm[0], 5);
+        }
     }
     ret err[fail.Fail].ok{};
 }
@@ -3177,6 +3390,9 @@ fun emit_global_load(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, mi: *mir.MirIns
     if (mi.operand_count != 2 || mi.operands[0].kind != mir.MIR_OP_VREG) {
         ret unsupported(e, addressed_memory_refusal(e, mf, ?mi.operands[0]));
     }
+    # a specialization constant is read as the constant it is, with no load
+    val spec_id: u32 = spec_target(e, ?mi.operands[1]);
+    if (spec_id != 0) { ret store_vreg(e, vm, mi.operands[0].vreg.n, spec_id); }
     var chain_ty:       u32  = 0;
     var var_id:         u32  = chain_target(vm, ?mi.operands[1], ?chain_ty);
     var from_interface: bool = false;

@@ -44,7 +44,7 @@ A decorator is written as an attribute:
 #[extensions(a, b)]  # the function may use these instruction-set extensions
 #[embed("path")]     # compile-time file embedding (val only)
 #[stage("name")]     # GPU pipeline stage; makes the function an entry point
-#[workgroup(x,y,z)]  # compute workgroup dimensions (with #[stage("compute")])
+#[workgroup(x,y,z)]  # compute workgroup dimensions, constants or #[spec] vars (with #[stage("compute")])
 #[input(n)]          # shader interface input at location n (global only)
 #[output(n)]         # shader interface output at location n (global only)
 #[builtin("name")]   # pipeline built-in variable (global only)
@@ -55,6 +55,7 @@ A decorator is written as an attribute:
 #[storage(set, bnd, "coherent")] # the same buffer, its writes visible across workgroups
 #[sampler(set, bnd)] # descriptor-bound image / sampler handle (global only)
 #[push]              # push-constant block, read-only (global only)
+#[spec(id)]          # specialization constant the host supplies (module var only)
 #[op(tgt,set,name)]   # the target instruction this function is (bodyless fun only)
 #[handle(tgt,ctor,..)] # the target type this declares (bodyless def only)
 #[abi_type("name")]   # a C type whose layout the target declares (bodyless def only)
@@ -982,13 +983,36 @@ stage takes the single-invocation default `(1, 1, 1)`; the dimensions are always
 declared in the emitted module, since a compute stage that does not state its
 workgroup size is not one a consumer can dispatch.
 
-### `input(n)` / `output(n)` / `builtin(str)` / `uniform(set, binding)` / `storage(set, binding)` / `sampler(set, binding)` / `push` — shader interface
+Any dimension may instead name a `#[spec]` var (see
+[`spec`](#specid--specialization-constants)), which the host sets when it creates
+the pipeline. The var must be a `u32` or `i32`, and any other variable is refused.
+
+```mach fragment
+#[spec(0)] var tile: u32 = 64;
+
+#[stage("compute")]
+#[workgroup(tile, 1, 1)]
+fun compute_main() {}
+```
+
+On `spirv` how a specialized workgroup is emitted depends on the environment.
+Where it allows it, the stage carries `LocalSizeId` over the spec constant. That
+needs SPIR-V 1.2 and, on Vulkan, the `maintenance4` feature, which only Vulkan
+1.3 requires of every device, so the form is used with no `env` and with
+`vulkan1.3`. Every other environment gets a `WorkgroupSize` built-in over an
+`OpSpecConstantComposite`. That built-in sizes **every** compute stage in the
+module, so a module in such an environment whose compute stages size their
+workgroups differently, and at least one of them through a `#[spec]` var, is
+refused. Give the stages one workgroup or put them in separate modules.
+
+### `input(n)` / `output(n)` / `builtin(str)` / `uniform(set, binding)` / `storage(set, binding)` / `sampler(set, binding)` / `push` / `spec(id)` — shader interface
 
 A pipeline stage does not receive its inputs or return its results through a call.
 It reads and writes **module-scope variables** that the pipeline binds, and these
 directives say which kind each variable is. They apply only to module-level
 `val` / `var` bindings, and a variable carries **exactly one** of them — they
-are mutually exclusive.
+are mutually exclusive. `spec`, described in its own section below, is one of
+them too.
 
 ```mach fragment
 #[input(0)]            var in_position: f32x4;
@@ -1189,6 +1213,53 @@ permits an image, sampler or sampled-image variable in — carrying `DescriptorS
 and `Binding` exactly as a `uniform` does. A `push` block becomes an `OpVariable`
 in the `PushConstant` class, with no `DescriptorSet` or `Binding`.
 
+### `spec(id)` — specialization constants
+
+A specialization constant is a value the host supplies when it creates the
+pipeline, after the shader has been compiled. It is declared as a module-level
+`var` carrying the constant's id, and its initializer is the default the pipeline
+keeps when the host supplies nothing for that id:
+
+```mach
+#[spec(0)]
+var tile_size: u32 = 64;
+#[spec(1)]
+var gain:      f32 = 0.5;
+```
+
+It is a `var` like every other value the host supplies, and that settles how the
+compiler treats it:
+
+- It is **never a compile-time value**. It cannot be an array length or a comptime
+  operand, since what it holds is decided after the build. A `#[spec]` on a `val`
+  is refused for the same reason.
+- The optimizer **never folds it to its initializer**, even when nothing in the
+  module writes it. A mutable global is never replaced by its initial value, and
+  that is exactly what keeps the host's value live.
+- A **store to it is refused**, naming the line that wrote it. On the GPU it is a
+  constant once the pipeline exists, so there is nothing to write. Copy it into a
+  local to change the value. Handing its address to a function counts as a store.
+
+The type must be a scalar integer or float. There is no boolean specialization
+constant, because mach has no boolean type the compiler knows: `bool` is an alias
+of `u8`. Write a flag as an integer spec var, which the host sets with the same 4
+bytes as a `VkBool32`:
+
+```mach
+#[spec(3)]
+var use_fog: u32 = 1;
+```
+
+A narrower integer such as `u8` works too, but it needs the capability for its
+width like any other `u8` in a shader. On `spirv` each one becomes an
+`OpSpecConstant` whose literal is the initializer, decorated with `SpecId`, and a
+read uses that constant directly with no load. Two `#[spec]` vars with one id in
+the same module are refused, since the host names the constant by its id. On a
+machine target the decorator has no effect and the var is an ordinary global.
+
+A `#[spec]` var may also size a compute workgroup (see
+[`workgroup`](#workgroupx-y-z--compute-workgroup-dimensions)).
+
 ### `handle(target, constructor, operands...)` — a type the target mints
 
 A bodyless `def` carrying this directive declares a type whose representation is
@@ -1363,12 +1434,15 @@ its result. Adding an instruction is a row in it.
 | `uniform`   |  no   |    no     |      yes      |      no       |
 | `storage`   |  no   |    no     |      yes      |      no       |
 | `push`      |  no   |    no     |      yes      |      no       |
+| `spec`      |  no   |    no     |      yes      |      no       |
 | `op`        |  yes  |    no     |      no       |      no       |
 | `handle`    |  no   |    no     |      no       |      no       |
 | `abi_type`  |  no   |    no     |      no       |      no       |
 
 The `val` / `var` column is shared, but `embed` accepts only `val` — a `var`
 is refused (see [`embed`](#embedstr--compile-time-file-embedding) above).
+`spec` is the reverse and accepts only `var` (see
+[`spec`](#specid--specialization-constants)).
 `deprecated` also applies to `tag`, `def`, `use` and `fwd` declarations and to a
 tag case, and `testing` to `tag`, `def`, `use` and `fwd` declarations, none of
 which the table columns cover.
