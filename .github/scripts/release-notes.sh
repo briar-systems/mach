@@ -55,7 +55,9 @@ done | jq -sc .)
 opened=$(jq -r 'map(.created) | min | todateiso8601' <<<"$prs")
 
 # every issue touched since the earliest of them opened, closed, with what closed it
-closed='[]'
+# pages go through a file: a busy window holds more issues than one argument can
+nodes=$(mktemp)
+trap 'rm -f "$nodes"' EXIT
 cursor=null
 while :; do
   page=$(gh api graphql -F owner="$owner" -F name="$name" -F since="$opened" -F cursor="$cursor" -f query='
@@ -74,10 +76,11 @@ while :; do
         }
       }
     }')
-  closed=$(jq -c --argjson acc "$closed" '$acc + .data.repository.issues.nodes' <<<"$page")
+  jq -c '.data.repository.issues.nodes[]' <<<"$page" >>"$nodes"
   [ "$(jq -r .data.repository.issues.pageInfo.hasNextPage <<<"$page")" = true ] || break
   cursor=$(jq -r .data.repository.issues.pageInfo.endCursor <<<"$page")
 done
+closed=$(jq -sc . "$nodes")
 
 commits=$(git rev-list "$prev..$tag" | jq -Rsc 'split("\n") | map(select(. != ""))')
 
