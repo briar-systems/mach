@@ -1260,11 +1260,12 @@ pub fun dot(a: f32x4, b: f32x4) f32;
 
 The first argument names the **target**, the second the instruction set, and the
 third the instruction within it. The target is the ISA name the manifest selects
-with, so nothing about this directive is specific to one back end. All three value
-sets are closed and checked at compile time, on **every** target: the directive is
-legal everywhere, so a typo caught only where it is acted on would go unreported on
-a CPU build. The parameter count is checked against the instruction's own operand
-count, which is not uniform across a family that looks it.
+with, so nothing about this directive is specific to one back end. The arguments
+must be strings on every target, but the instruction set and name are checked only
+when the named target is the one selected: a declaration for any other target is
+inert, and that target's table is not consulted. When it is checked, the parameter
+count is held to the instruction's own operand count, which is not uniform across a
+family that looks it.
 
 | Set              | Meaning                                                     |
 |------------------|-------------------------------------------------------------|
