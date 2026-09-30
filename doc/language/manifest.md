@@ -352,7 +352,7 @@ execution timing that the constant-time rows read, so none of them may be named 
 refusal says why. So is spirv `float16`, the Float16 capability the target's `env`
 guarantees for the whole module, and spirv `zero_init_workgroup`, the device feature
 that zero-initializes the workgroup memory of every
-[`#[shared]`](decorators.md#inputn--outputn--builtinstr--uniformset-binding--storageset-binding--samplerset-binding--push--shared--shader-interface)
+[`#[shared]`](decorators.md#inputn--outputn--builtinstr--uniformset-binding--storageset-binding--samplerset-binding--push--specid--shared--shader-interface)
 variable in the module. Every x86_64 and aarch64 row, and riscv `m`, `a`,
 `zicond`, `zicsr`, `zifencei`, `zfhmin` and `zfh`, may be.
 
