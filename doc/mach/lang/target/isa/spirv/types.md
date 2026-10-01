@@ -84,6 +84,15 @@ pub fun holds_pointer(tt: *TypeTable, id: u32, storage: u32) bool;
 whether a value of the type holds a pointer of storage class `storage`, which has no
 null constant
 
+## fun array_shape
+
+```mach
+pub fun array_shape(tt: *TypeTable, id: u32, out_count: *u32) u32;
+```
+
+the element type of the sized array `id`, laid out or plain, with its length in
+`out_count`. 0 when it is no sized array
+
 ## fun logically_match
 
 ```mach
