@@ -644,6 +644,12 @@ pub val OP_NOT:                       u32 = 200
 pub val OP_CONTROL_BARRIER:           u32 = 224
 ```
 
+## val OP_MEMORY_BARRIER
+
+```mach
+pub val OP_MEMORY_BARRIER:            u32 = 225
+```
+
 ## val OP_ATOMIC_LOAD
 
 ```mach

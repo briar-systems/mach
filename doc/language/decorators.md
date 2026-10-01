@@ -1449,9 +1449,27 @@ pointer, and that result is accepted as a later instruction's pointer operand.
 #[op("spirv", "core", "OpControlBarrier")]
 pub fun barrier(execution: u32, memory: u32, semantics: u32);
 
+#[op("spirv", "core", "OpMemoryBarrier")]
+pub fun memory_barrier(memory: u32, semantics: u32);
+
 #[op("spirv", "core", "OpAtomicIAdd")]
 pub fun atomic_add(p: *u32, scope: u32, semantics: u32, v: u32) u32;
 ```
+
+On the target that owns the instruction, a decorated function **is the
+instruction and never its body**, so a call to it is never inlined away or
+deleted, and the optimizer treats it as reading and writing all memory. No
+load or store is moved across a barrier or an atomic, at any optimization
+level. `OpControlBarrier` takes an execution scope, a memory scope and memory
+semantics, and `OpMemoryBarrier` a memory scope and semantics, each an integer
+constant.
+
+A control barrier must be reached in **uniform control flow**: every
+invocation of its execution scope executes it, or none does. That is the
+program's obligation, as it is in GLSL and WGSL, because whether a branch is
+uniform is not statically decidable in general. The compiler does not check
+it, and a barrier inside a branch or loop that some invocations of the scope
+skip is undefined behavior on the device.
 
 `OpExtInstImport "GLSL.std.450"` is emitted **once per module and only when that
 module uses the set**. A module that calls none of these carries no import.

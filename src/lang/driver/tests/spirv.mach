@@ -19,6 +19,7 @@ use std.types.string.str;
 use std.types.string.str_empty;
 use std.types.string.str_equals;
 use std.types.string.str_len;
+use std.types.string.str_region_equals;
 
 use A: std.allocator;
 
@@ -4108,6 +4109,111 @@ test op__refusals {
         "#[stage(\"compute\")]\n#[workgroup(1, 1, 1)]\nfun cs_main() { atomic_store(?counts.total, SCOPE_DEVICE, 0, atomic_load(?sink.total, SCOPE_DEVICE, 0)); }\n"),
         "a load reaches the `#[storage(0, 4, \"writeonly\")]` binding", false);
     if (loaded != 0) { ret 30 + loaded; }
+    ret 0;
+}
+
+# the module's barriers and its loads and stores through buffer pointers, in word order:
+# `B` a control or memory barrier, `L` a load, `S` a store and `|` the start of a block
+#[testing]
+fun ut_barrier_order(w: *u32, n: u32, out: *u8, cap: u32) u32 {
+    var c: u32 = 0;
+    var i: u32 = 0;
+    for (i < n && c < cap) {
+        val len: u32 = w[i] >> 16;
+        if (len == 0) { ret c; }
+        val op:  u32 = w[i] & 0xFFFF;
+        var ev:  u8  = 0;
+        var ptr: u32 = 0xFFFFFFFF;
+        if (op == spirv.OP_LABEL)                                            { ev = '|'; }
+        or (op == spirv.OP_CONTROL_BARRIER || op == spirv.OP_MEMORY_BARRIER) { ev = 'B'; }
+        or (op == spirv.OP_LOAD && len >= 4) {
+            ev  = 'L';
+            ptr = w[i + 3];
+        }
+        or (op == spirv.OP_STORE && len >= 3) {
+            ev  = 'S';
+            ptr = w[i + 1];
+        }
+        if (ptr != 0xFFFFFFFF) {
+            val class: u32 = ut_op_ptr_class(w, n, ptr);
+            if (class != spirv.STORAGE_STORAGE_BUFFER && class != spirv.STORAGE_UNIFORM) { ev = 0; }
+        }
+        if (ev != 0) {
+            out[c] = ev;
+            c      = c + 1;
+        }
+        i = i + len;
+    }
+    ret c;
+}
+
+# whether one block's events in `seq` are exactly `want`
+#[testing]
+fun ut_barrier_block(seq: *u8, n: u32, want: str) bool {
+    val wl: u32 = str_len(want)::u32;
+    var i:  u32 = 0;
+    for (i < n) {
+        if (seq[i] == '|') {
+            var e: u32 = i + 1;
+            for (e < n && seq[e] != '|') { e = e + 1; }
+            if (e - i - 1 == wl && str_region_equals(seq::str, (i + 1)::usize, wl::usize, want)) { ret true; }
+            i = e;
+            cnt;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the stage every barrier case shares: a store, a control barrier and the load that must read
+# after it, a memory barrier between two loads of one element that must stay two, and a loop
+# whose barrier keeps its load of an invariant element inside it. the two bodied declarations
+# are the instructions on spirv, never bodies to inline
+#[testing]
+val UT_BARRIER_STAGE: str = "#[op(\"spirv\", \"core\", \"OpControlBarrier\")] fun group_barrier(exec: u32, mem: u32, sem: u32) {}\n#[op(\"spirv\", \"core\", \"OpMemoryBarrier\")] fun memory_barrier(mem: u32, sem: u32) {}\n#[stage(\"compute\")]\n#[workgroup(64, 1, 1)]\nfun cs_main() {\n    val i: u32 = gid[0];\n    counts.n[i] = i;\n    group_barrier(SCOPE_WORKGROUP, SCOPE_WORKGROUP, 0x108);\n    val a: u32 = counts.n[i];\n    memory_barrier(SCOPE_DEVICE, 0x48);\n    val b: u32 = counts.n[i];\n    var acc: u32 = 0;\n    var k: u32 = 0;\n    for (k < 4) {\n        barrier(SCOPE_WORKGROUP, SCOPE_WORKGROUP, 0x108);\n        acc = acc + counts.total;\n        k = k + 1;\n    }\n    counts.n[63] = a + b + acc;\n}\n";
+
+# a workgroup control barrier and a memory barrier validate under vulkan1.0 and vulkan1.3, and at
+# O0 and O2 no load or store crosses either one: the calls stay, a load after a barrier is not
+# forwarded from the store before it, merged with the load before it, or hoisted out of its loop
+test op__barriers_validate_and_hold_memory_order {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val src: str = ut_op_src(?alloc, UT_BARRIER_STAGE);
+    if (src == nil)                                                                    { ret 1; }
+    if (ut_l6_env(?alloc, src, "env = \"vulkan1.0\"\n", "vulkan1.0", "", 0, nil) != 0) { ret 2; }
+    if (ut_l6_env(?alloc, src, "env = \"vulkan1.3\"\n", "vulkan1.3", "", 0, nil) != 0) { ret 3; }
+    var profile: u32 = 0;
+    for (profile < 2) {
+        var img:   of.ObjectImage;
+        var fault: str = nil;
+        if (ut_l6_module(?alloc, src, profile == 1, ?img, ?fault) != 0) {
+            if (fault != nil) { print.eprintlnf("{}", fault); }
+            ret 4;
+        }
+        fin { obj.dnit(?img); }
+        if (!ut_l6_validates(?img)) { ret 5; }
+        var n: u32  = 0;
+        val w: *u32 = ut_spv_words(?img, ?n);
+        if (w == nil || n == 0) { ret 6; }
+        var len: u32  = 0;
+        val mem: *u32 = ut_op_nth(w, n, spirv.OP_MEMORY_BARRIER, 0, ?len);
+        if (mem == nil || len != 3 || ut_spv_count(w, n, spirv.OP_MEMORY_BARRIER) != 1) { ret 7; }
+        # the straight-line barriers and their accesses share a block, and the loop's barrier
+        # still precedes its load inside the body
+        var seq: [64]u8;
+        val got: u32 = ut_barrier_order(w, n, ?seq[0], 63);
+        seq[got] = 0;
+        if (!ut_barrier_block(?seq[0], got, "SBLBL") || !ut_barrier_block(?seq[0], got, "BL")) {
+            print.eprintlnf("barrier order at profile {}: {}", profile, (?seq[0])::str);
+            ret 8;
+        }
+        profile = profile + 1;
+    }
+    val computed: i32 = ut_spv_reference_refusal(ut_op_src(?alloc,
+        "#[op(\"spirv\", \"core\", \"OpMemoryBarrier\")] fun memory_barrier(mem: u32, sem: u32);\n#[stage(\"compute\")]\n#[workgroup(1, 1, 1)]\nfun cs_main() { memory_barrier(SCOPE_DEVICE, gid[0]); }\n"),
+        "operand 2 of `OpMemoryBarrier` is an integer constant", false);
+    if (computed != 0) { ret 10 + computed; }
     ret 0;
 }
 

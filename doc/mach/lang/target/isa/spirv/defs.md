@@ -66,12 +66,6 @@ pub val SPV_CTOR_SAMPLED_IMAGE: u32 = 1
 pub val SPV_CTOR_SAMPLER:       u32 = 2
 ```
 
-## val TEXEL_F32
-
-```mach
-pub val TEXEL_F32: u32 = 0
-```
-
 ## val TEXEL_I32
 
 ```mach
@@ -87,7 +81,7 @@ pub val TEXEL_U32: u32 = 2
 ## val IMAGE_ARITY
 
 ```mach
-pub val IMAGE_ARITY:      u32 = 7
+pub val IMAGE_ARITY:      u32 = 6
 ```
 
 ## val IMAGE_OP_TEXEL
@@ -126,16 +120,10 @@ pub val IMAGE_OP_MS:      u32 = 4
 pub val IMAGE_OP_SAMPLED: u32 = 5
 ```
 
-## val IMAGE_OP_FORMAT
-
-```mach
-pub val IMAGE_OP_FORMAT:  u32 = 6
-```
-
 ## val OP_DEF_COUNT
 
 ```mach
-pub val OP_DEF_COUNT:   usize = 46
+pub val OP_DEF_COUNT:   usize = 45
 ```
 
 ## val TYPE_DEF_COUNT
