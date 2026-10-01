@@ -56,6 +56,7 @@ A decorator is written as an attribute:
 #[sampler(set, bnd)] # descriptor-bound image / sampler handle (global only)
 #[push]              # push-constant block, read-only (global only)
 #[spec(id)]          # specialization constant the host supplies (module var only)
+#[shared]            # compute workgroup memory, zero when a stage starts (global only)
 #[op(tgt,set,name)]   # the target instruction this function is (bodyless fun only)
 #[handle(tgt,ctor,..)] # the target type this declares (bodyless def only)
 #[abi_type("name")]   # a C type whose layout the target declares (bodyless def only)
@@ -1005,7 +1006,7 @@ module, so a module in such an environment whose compute stages size their
 workgroups differently, and at least one of them through a `#[spec]` var, is
 refused. Give the stages one workgroup or put them in separate modules.
 
-### `input(n)` / `output(n)` / `builtin(str)` / `uniform(set, binding)` / `storage(set, binding)` / `sampler(set, binding)` / `push` / `spec(id)` — shader interface
+### `input(n)` / `output(n)` / `builtin(str)` / `uniform(set, binding)` / `storage(set, binding)` / `sampler(set, binding)` / `push` / `spec(id)` / `shared` — shader interface
 
 A pipeline stage does not receive its inputs or return its results through a call.
 It reads and writes **module-scope variables** that the pipeline binds, and these
@@ -1204,6 +1205,67 @@ The combined value is handed straight to the sample rather than named: SPIR-V
 requires an `OpSampledImage` result be consumed in the block that produced it,
 which is the same rule that makes a handle-typed local a compile error.
 
+`shared` declares **workgroup memory**: one instance per workgroup of a compute
+stage, which every invocation of that workgroup reads and writes. It applies to a
+`var` only, since a `val` of workgroup memory could only ever read zero. It takes no
+arguments, and the variable has no descriptor and no location, because the pipeline
+never binds it.
+
+```mach fragment
+#[builtin("local_invocation")] var local_id: u32x3;
+#[shared] var tile: [256]f32;
+
+#[stage("compute")]
+#[workgroup(64, 1, 1)]
+fun blur() { tile[local_id[0]] = 1.0; }
+```
+
+Workgroup memory exists only in a compute stage, so a `#[shared]` variable used from
+a vertex or fragment stage, directly or through a function the stage calls, is a
+compile error naming the stage.
+
+A `#[shared]` variable is **zero** when a compute stage starts, as every mach
+variable is, on every environment. How depends on the environment:
+
+- Where workgroup memory is zero-initialized by the consumer, the variable carries an
+  `OpConstantNull` initializer. `vulkan1.3` guarantees that
+  (`shaderZeroInitializeWorkgroupMemory` is core there), and a target that selects the
+  `zero_init_workgroup` extension declares it for an earlier version (see
+  [manifest.md](manifest.md#instruction-set-extensions)). The consumer then has to
+  enable the feature (`VK_KHR_zero_initialize_workgroup_memory`).
+- Otherwise the compiler zeroes it itself, at the start of each compute stage that uses
+  it. Each invocation stores zero to its own slice, the elements of an array its local
+  invocation index reaches in steps of the workgroup size and the whole of any other
+  type for invocation 0, and then the stage executes one workgroup `OpControlBarrier`.
+  The barrier precedes all of the stage's own code, so every invocation reaches it.
+
+Because the value on entry is always zero, a `#[shared]` variable cannot have an
+initializer. Assign it inside the stage.
+
+Whether a variable may carry an **initializer** is settled by its role, since the
+role says who puts the first value in it:
+
+| Role                                             | Initializer | Why                                                   |
+|--------------------------------------------------|-------------|-------------------------------------------------------|
+| `input`, a read built-in                         | refused     | the previous stage or the pipeline supplies the value |
+| `uniform`, `storage`, `sampler`, `push`          | refused     | the host binds or supplies the memory                 |
+| `shared`                                         | refused     | workgroup memory is zero when a stage starts          |
+| `spec`                                           | required    | it is the default the pipeline keeps                  |
+| `output`, a written built-in                     | allowed     | it is the value the variable starts at                |
+
+A refused initializer is a compile error, because the value it writes would never be
+the one the shader sees. An `output` or a written built-in starts at its
+initializer, and at zero without one, as every mach `var` does:
+
+```mach fragment
+#[output(0)] var out_colour: f32x4 = f32x4{0.0, 0.0, 0.0, 1.0};
+#[output(1)] var out_mask:   u32;
+```
+
+On `spirv` the Output `OpVariable` carries that value as its initializer: the
+constant the initializer spells, or `OpConstantNull` where it is zero or absent.
+SPIR-V and Vulkan both admit an initializer on an Output variable.
+
 As with `#[stage(...)]`, these are accepted on every target and acted on only by a
 target that forms pipeline stages. On `spirv` each becomes an `OpVariable` in the
 matching storage class, carrying the matching decoration, and the Input and Output
@@ -1211,14 +1273,16 @@ variables are named in every entry point's interface list. A `sampler` binding
 becomes an `OpVariable` in the `UniformConstant` class — the one class Vulkan
 permits an image, sampler or sampled-image variable in — carrying `DescriptorSet`
 and `Binding` exactly as a `uniform` does. A `push` block becomes an `OpVariable`
-in the `PushConstant` class, with no `DescriptorSet` or `Binding`.
+in the `PushConstant` class, with no `DescriptorSet` or `Binding`. A `shared` variable
+becomes an `OpVariable` in the `Workgroup` class, named in the interface of each entry
+point that uses it from SPIR-V 1.4.
 
 ### `spec(id)` — specialization constants
 
 A specialization constant is a value the host supplies when it creates the
 pipeline, after the shader has been compiled. It is declared as a module-level
 `var` carrying the constant's id, and its initializer is the default the pipeline
-keeps when the host supplies nothing for that id:
+keeps when the host supplies nothing for that id. The initializer is required:
 
 ```mach
 #[spec(0)]
@@ -1385,9 +1449,64 @@ pointer, and that result is accepted as a later instruction's pointer operand.
 #[op("spirv", "core", "OpControlBarrier")]
 pub fun barrier(execution: u32, memory: u32, semantics: u32);
 
+#[op("spirv", "core", "OpMemoryBarrier")]
+pub fun memory_barrier(memory: u32, semantics: u32);
+
 #[op("spirv", "core", "OpAtomicIAdd")]
 pub fun atomic_add(p: *u32, scope: u32, semantics: u32, v: u32) u32;
 ```
+
+On the target that owns the instruction, a decorated function **is the
+instruction and never its body**, so a call to it is never inlined away or
+deleted, and the optimizer treats it as reading and writing all memory. No
+load or store is moved across a barrier or an atomic, at any optimization
+level. `OpControlBarrier` takes an execution scope, a memory scope and memory
+semantics, and `OpMemoryBarrier` a memory scope and semantics, each an integer
+constant.
+
+A control barrier must be reached in **uniform control flow**: every
+invocation of its execution scope executes it, or none does. That is the
+program's obligation, as it is in GLSL and WGSL, because whether a branch is
+uniform is not statically decidable in general. The compiler does not check
+it, and a barrier inside a branch or loop that some invocations of the scope
+skip is undefined behavior on the device.
+
+A row may also carry **requirements**: a capability and the extensions of the
+target's vocabulary that every use of it needs. A **literal operand can be
+enumerated**, so that its value is one of a closed set the row names (or, for a
+mask, a union of that set's bits), and each value brings a requirement of its own
+and, where the instruction grows with it, operands at the end of the instruction.
+Such a row has an **optional tail**: a declaration may take its required operands
+alone or the tail too, and each call must pass exactly the operands its literal's
+value brings. `OpGroupNonUniformIAdd` is one:
+
+```mach
+#[op("spirv", "core", "OpGroupNonUniformIAdd")]
+pub fun subgroup_add(scope: u32, operation: u32, v: u32) u32;
+
+#[op("spirv", "core", "OpGroupNonUniformIAdd")]
+pub fun subgroup_cluster_add(scope: u32, operation: u32, v: u32, cluster_size: u32) u32;
+```
+
+Its operation is a `GroupOperation`. `Reduce` (0), `InclusiveScan` (1) and
+`ExclusiveScan` (2) need the `subgroup_arithmetic` extension and declare
+`GroupNonUniformArithmetic`, and `ClusteredReduce` (3) needs `subgroup_clustered`,
+declares `GroupNonUniformClustered` and is followed by the ClusterSize operand, so
+it is passed only to the four-parameter declaration. Each is checked at the call,
+where the literal's value is known:
+
+| At the call                                            | Is refused with                    |
+|--------------------------------------------------------|------------------------------------|
+| a value outside the operand's enumeration              | `op.operand_value`, naming the values |
+| a value whose operands the declaration does not pass, or passes without it | `op.operand_value`, naming the count |
+| a requirement's extension the target does not select   | `spirv.capability`, naming the extension |
+| a capability whose SPIR-V version the environment is below | `spirv.capability`, naming the first `env` that reaches it |
+
+A device feature is an extension the target names in its `extensions` once the
+consumer enables it, since no environment guarantees it: `subgroup_arithmetic` is
+Vulkan's `VK_SUBGROUP_FEATURE_ARITHMETIC_BIT`, and a target naming no `env` holds
+every extension. A module declares a capability only when something it emits needs
+it, with `OpExtension` for a capability a SPIR-V extension defines.
 
 `OpExtInstImport "GLSL.std.450"` is emitted **once per module and only when that
 module uses the set**. A module that calls none of these carries no import.
@@ -1405,8 +1524,10 @@ it does, that body is what every non-`spirv` target runs while `spirv` substitut
 the instruction. A `spirv` build never emits the body at all.
 
 The set of accepted instructions is the table in
-`src/lang/target/isa/spirv/defs.mach`, where each row carries its operand kinds and
-its result. Adding an instruction is a row in it.
+`src/lang/target/isa/spirv/defs.mach`, where each row carries its operand kinds, its
+result, its requirements and the enumerations of its literals. The capabilities, with
+the SPIR-V version and extension each needs, are the table in
+`src/lang/target/isa/spirv.mach`. Adding an instruction is a row in it.
 
 ## Applicability
 

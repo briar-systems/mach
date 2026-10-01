@@ -30,6 +30,7 @@ use mach.lang.me.ir.id;
 use mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.source;
+use mach.lang.target.extension;
 use mach.lang.target.isa;
 use mach.lang.target.isa.spirv;
 use mach.lang.target.isa.spirv.cfg;
@@ -62,6 +63,9 @@ rec Emit {
     iface_len: u32;
     gslot:     *u32;
     iface_use: *u8;
+    # the LocalInvocationIndex variable the emitter adds for the zeroing of `#[shared]`
+    # memory when no global declares one, 0 until a stage needs it
+    zero_lid: u32;
 
     # what each reached global's memory may undergo, as ACCESS_* bits
     gaccess: *u8;
@@ -144,6 +148,7 @@ pub fun emit_module(out_alloc: *A.Allocator, tgt: *isa.BackendTarget, u: *unit.U
     e.iface_len  = 0;
     e.gslot      = nil;
     e.iface_use  = nil;
+    e.zero_lid   = 0;
     e.gaccess    = nil;
     e.gspec      = nil;
     e.wg_builtin = false;
@@ -933,6 +938,7 @@ fun declare_interface(e: *Emit) err[fail.Fail] {
         or (g.iface == ir.IFACE_SAMPLER) { storage = spirv.STORAGE_UNIFORM_CONSTANT; }
         or (g.iface == ir.IFACE_PUSH)    { storage = spirv.STORAGE_PUSH_CONSTANT; }
         or (g.iface == ir.IFACE_BUILTIN) { storage = builtin_storage(g.iface_a); }
+        or (g.iface == ir.IFACE_SHARED)  { storage = spirv.STORAGE_WORKGROUP; }
 
         val handle: bool = is_image_type(e, gt, g.ty);
         if (handle && g.iface != ir.IFACE_SAMPLER) {
@@ -955,11 +961,23 @@ fun declare_interface(e: *Emit) err[fail.Fail] {
         }
         val ptr_ty: u32 = types.type_ptr(e.tt, storage, value_ty);
         val var_id: u32 = spirv.alloc_id(e.b);
-        var vop:    [3]u32;
+        var vop:    [4]u32;
         vop[0] = ptr_ty;
         vop[1] = var_id;
         vop[2] = storage;
-        spirv.inst(e.b, ?e.b.types_consts, spirv.OP_VARIABLE, ?vop[0], 3);
+        var vn: u32 = 3;
+        if (g.iface == ir.IFACE_SHARED && shared_native_zero(e)) {
+            vop[3] = types.const_null(e.tt, value_ty);
+            vn     = 4;
+        }
+        or (storage == spirv.STORAGE_OUTPUT) {
+            vop[3] = output_initializer(e, gt, g, value_ty);
+            vn     = 4;
+            if (vop[3] == 0) {
+                ret unsupported(e, "an output's initializer is not a constant the SPIR-V target can spell: an output starts at a constant of its own type, and this one holds an address or a type no constant composite has");
+            }
+        }
+        spirv.inst(e.b, ?e.b.types_consts, spirv.OP_VARIABLE, ?vop[0], vn);
         e.gvar_ids[i]  = var_id;
         e.gtype_ids[i] = value_ty;
         e.gstorage[i]  = storage;
@@ -1018,14 +1036,9 @@ fun declare_spec(e: *Emit, i: u32) err[fail.Fail] {
     val value_ty: u32 = global_spv_type(e, gt, g.ty);
     if (value_ty == 0) { ret unsupported(e, "unsupported specialization constant type in the SPIR-V target"); }
     val bits: u32 = types.type_bits(e.tt, value_ty);
-    var lit:  u64 = g.init.data.int_lit;
-    if (g.init.kind == value.VAL_CONST_FLOAT) {
-        lit = float.bits_at(float.bits_f64(g.init.data.int_lit), float.width_of_bits(bits));
-    }
-    or (g.init.kind != value.VAL_CONST_INT) { lit = 0; }
-    if (bits < 64)                          { lit = lit & ((1::u64 << bits::u64) - 1); }
-    val id:  u32 = spirv.alloc_id(e.b);
-    var ops: [4]u32;
+    val lit:  u64 = scalar_literal(?g.init, bits);
+    val id:   u32 = spirv.alloc_id(e.b);
+    var ops:  [4]u32;
     ops[0] = value_ty;
     ops[1] = id;
     ops[2] = (lit & 0xFFFFFFFF)::u32;
@@ -1038,6 +1051,108 @@ fun declare_spec(e: *Emit, i: u32) err[fail.Fail] {
     e.gspec[i]     = id;
     e.gtype_ids[i] = value_ty;
     ret err[fail.Fail].ok{};
+}
+
+# the bits of a scalar constant as a `bits`-wide literal
+fun scalar_literal(v: *value.Value, bits: u32) u64 {
+    var lit: u64 = v.data.int_lit;
+    if (v.kind == value.VAL_CONST_FLOAT) {
+        lit = float.bits_at(float.bits_f64(v.data.int_lit), float.width_of_bits(bits));
+    }
+    or (v.kind != value.VAL_CONST_INT) { lit = 0; }
+    if (bits < 64)                     { lit = lit & ((1::u64 << bits::u64) - 1); }
+    ret lit;
+}
+
+# the constant an Output variable starts at (#4287): its initializer, spelled as
+# OpConstantNull where that is zero, which is also what an output declared without one
+# holds, as every mach `var` does. 0 where the initializer has no constant form
+fun output_initializer(e: *Emit, gt: *type.IrTypeTable, g: *ir.Global, value_ty: u32) u32 {
+    val v:    *value.Value      = ?g.init;
+    val half: bool              = g.iface == ir.IFACE_OUTPUT && stage_half(e);
+    val t:    opt[*type.IrType] = type.get(gt, g.ty);
+    if (sel t.none)                     { ret 0; }
+    if (v.kind == value.VAL_CONST_NULL) { ret types.const_null(e.tt, value_ty); }
+    if (v.kind == value.VAL_CONST_INT || v.kind == value.VAL_CONST_FLOAT) {
+        val scalar: bool = t.some.kind == type.IRT_INT || t.some.kind == type.IRT_FLOAT;
+        if (v.data.int_lit == 0 && v.kind == value.VAL_CONST_INT) { ret types.const_null(e.tt, value_ty); }
+        if (!scalar)                                              { ret 0; }
+        val lit: u64 = scalar_literal(v, types.type_bits(e.tt, value_ty));
+        if (lit == 0) { ret types.const_null(e.tt, value_ty); }
+        ret types.const_scalar(e.tt, value_ty, (lit & 0xFFFFFFFF)::u32, (lit >> 32)::u32);
+    }
+    if (v.kind == value.VAL_CONST_AGG) {
+        if (v.data.agg.reloc_count != 0) { ret 0; }
+        ret image_constant(e, gt, g.ty, value_ty, half, v.data.agg.bytes, v.data.agg.len, 0);
+    }
+    if (v.kind == value.VAL_CONST_BYTES) {
+        ret image_constant(e, gt, g.ty, value_ty, half, v.data.bytes.ptr, v.data.bytes.len, 0);
+    }
+    ret 0;
+}
+
+# the constant of `spv_ty` that the byte image of ir type `id` at `off` spells, laid out
+# as the target lays the type out; a byte past the image is zero
+fun image_constant(e: *Emit, gt: *type.IrTypeTable, id: type.IrTypeId, spv_ty: u32, half: bool,
+    bytes: *u8, len: u32, off: u32) u32 {
+    if (spv_ty == 0) { ret 0; }
+    val size: u32  = type.byte_size_for_machine(gt, id, e.layout);
+    var zero: bool = true;
+    var k:    u32  = 0;
+    for (k < size && zero) {
+        if (off + k < len && bytes[off + k] != 0) { zero = false; }
+        k = k + 1;
+    }
+    if (zero) { ret types.const_null(e.tt, spv_ty); }
+
+    val opt_: opt[*type.IrType] = type.get(gt, id);
+    if (sel opt_.none) { ret 0; }
+    val t: *type.IrType = opt_.some;
+    if (t.kind == type.IRT_INT || t.kind == type.IRT_FLOAT) {
+        if (size > 8) { ret 0; }
+        var lit: u64 = 0;
+        k = 0;
+        for (k < size) {
+            if (off + k < len) { lit = lit | (bytes[off + k]::u64 << (k * 8)::u64); }
+            k = k + 1;
+        }
+        ret types.const_scalar(e.tt, spv_ty, (lit & 0xFFFFFFFF)::u32, (lit >> 32)::u32);
+    }
+    var n:    u32           = 0;
+    var elem: type.IrTypeId = type.IRT_NIL;
+    if (t.kind == type.IRT_VECTOR) {
+        n    = t.data.vector_.lanes;
+        elem = t.data.vector_.element;
+    }
+    or (t.kind == type.IRT_ARRAY) {
+        n    = t.data.array_.count;
+        elem = t.data.array_.element;
+    }
+    or (t.kind == type.IRT_STRUCT) { n = t.data.struct_.field_count; }
+    or                             { ret 0; }
+    if (n == 0)                    { ret 0; }
+
+    val rp: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+    if (sel rp.err) { ret 0; }
+    val parts: *u32 = rp.ok;
+    var ok:    bool = true;
+    var i:     u32  = 0;
+    for (i < n && ok) {
+        var mid:  type.IrTypeId = elem;
+        var moff: u32           = off;
+        if (t.kind == type.IRT_STRUCT) {
+            mid  = t.data.struct_.fields[i];
+            moff = off + type.byte_offset_for_machine(gt, id, i, e.layout);
+        }
+        or { moff = off + i * type.byte_size_for_machine(gt, elem, e.layout); }
+        parts[i] = image_constant(e, gt, mid, spv_type_shaped(e, gt, mid, half), half, bytes, len, moff);
+        if (parts[i] == 0) { ok = false; }
+        i = i + 1;
+    }
+    var c: u32 = 0;
+    if (ok) { c = types.const_composite(e.tt, spv_ty, parts, n); }
+    A.deallocate[u32](e.alloc, parts, n::usize);
+    ret c;
 }
 
 fun spec_name(e: *Emit, i: u32) str {
@@ -1640,6 +1755,11 @@ fun check_stage_interfaces(e: *Emit) err[fail.Fail] {
                 cnt;
             }
             val gi: *ir.Global = gl_ir(e, i);
+            if (gi.iface == ir.IFACE_SHARED && fn.stage != ir.STAGE_COMPUTE) {
+                msg = shared_stage_refusal(e, fx, i);
+                i   = n;
+                cnt;
+            }
             if (e.gstorage[i] == spirv.STORAGE_INPUT && needs_flat(gl_types(e, i), gi.ty)) {
                 if (fn.stage == ir.STAGE_FRAGMENT) { flat[i] = flat[i] | 1; }
                 or (fn.stage == ir.STAGE_VERTEX)   { flat[i] = flat[i] | 2; }
@@ -1693,6 +1813,17 @@ fun check_stage_interfaces(e: *Emit) err[fail.Fail] {
     A.deallocate[u8](e.alloc, flat, n::usize);
     if (msg != nil) { ret err[fail.Fail].err{reject_module(e, dkind.SPIRV_INTERFACE, msg)}; }
     ret err[fail.Fail].ok{};
+}
+
+fun shared_stage_refusal(e: *Emit, fx: u32, gi: u32) str {
+    val g: *ir.Global                   = gl_ir(e, gi);
+    val r: res[str, format.FormatError] = format.sprint(e.alloc,
+        "this `#[shared]` variable, {}{}, is used by the stage `{}`, which is not a compute stage: workgroup memory exists only in a compute stage, where one workgroup's invocations share it. a vertex or fragment stage has no workgroup to share it with",
+        ir_type_spelling(gl_types(e, gi), e.alloc, g.ty), gl_mod_prefix(e, gi), ir_fn_spelling(e, fx));
+    if (sel r.err) {
+        ret "a `#[shared]` variable is used by a stage that is not a compute stage: workgroup memory exists only in a compute stage";
+    }
+    ret r.ok;
 }
 
 fun flat_conflict(e: *Emit, gi: u32) str {
@@ -2096,9 +2227,9 @@ fun check_environment(e: *Emit) err[fail.Fail] {
     if (env_id == isa.ENV_NONE) { ret err[fail.Fail].ok{}; }
     val profile: *spirv.EnvProfile = spirv.env_profile(e.tgt.identity.env_profile);
     if (profile == nil) { ret err[fail.Fail].err{fail.message("spirv: the target names an environment this backend has no profile for")}; }
-    val excess: u32 = e.b.caps_needed & ~profile.ceiling;
+    val excess: u64 = e.b.caps_needed & spirv.CEILING_DOMAIN & ~profile.ceiling;
     if (excess == 0) { ret err[fail.Fail].ok{}; }
-    var bit: u32 = 1;
+    var bit: u64 = 1;
     for ((excess & bit) == 0) { bit = bit << 1; }
     val msg: res[str, format.FormatError] = format.sprint(e.alloc,
         "this module needs the {} capability, which the `{}` environment does not guarantee; raise `env` on the target or avoid the type that needs it",
@@ -2107,21 +2238,68 @@ fun check_environment(e: *Emit) err[fail.Fail] {
     ret err[fail.Fail].err{reject_module(e, dkind.SPIRV_CAPABILITY, msg.ok)};
 }
 
+# the one path a requirement takes, whatever raised it: an instruction row, a literal's
+# value, or an operand's type (such as a 64-bit atomic's Int64Atomics). `what` names the
+# use in a refusal. the extensions must be selected and the capability's SPIR-V version
+# reached, and the capability is then declared, with the SPIR-V extension defining it
+fun require(e: *Emit, mf: *mir.MirFunction, capability: u32, requires: u64, what: str) err[fail.Fail] {
+    val missing: u64 = requires & ~e.tgt.model.extensions;
+    if (missing != 0) {
+        val name: str                          = extension.first_name(e.tgt.model.extension_table, e.tgt.model.extension_count, missing);
+        val r:    res[str, format.FormatError] = format.sprint(e.alloc,
+            "{} needs the `{}` extension, a device feature the target does not select: name it in the target's `extensions` once the consumer enables the feature",
+            what, name);
+        if (sel r.err) { ret err[fail.Fail].err{fail.format_refused(r.err)}; }
+        ret err[fail.Fail].err{reject_at(e, dkind.SPIRV_CAPABILITY, mir.refusal_loc(mf, e.cur_instr), r.ok)};
+    }
+    if (capability == isa.NO_OP_CAPABILITY) { ret err[fail.Fail].ok{}; }
+    val c: *spirv.Capability = spirv.capability_of(capability);
+    if (c == nil) { ret emit_fail(e, "spirv.emit: a requirement names a capability the capability table does not carry"); }
+    if (e.b.version < c.min_version) {
+        val r: res[str, format.FormatError] = format.sprint(e.alloc,
+            "{} needs the {} capability, which SPIR-V defines from {}.{}, and the `{}` environment selects SPIR-V {}.{}: raise `env` to `{}` or later",
+            what, c.name, spirv.version_major(c.min_version), spirv.version_minor(c.min_version),
+            spirv.env_profile_name(e.tgt.identity.env_profile), spirv.version_major(e.b.version),
+            spirv.version_minor(e.b.version), spirv.env_name_from(c.min_version));
+        if (sel r.err) { ret err[fail.Fail].err{fail.format_refused(r.err)}; }
+        ret err[fail.Fail].err{reject_at(e, dkind.SPIRV_CAPABILITY, mir.refusal_loc(mf, e.cur_instr), r.ok)};
+    }
+    e.b.caps_needed = e.b.caps_needed | c.need;
+    ret err[fail.Fail].ok{};
+}
+
+# the capabilities in the table's order, then each SPIR-V extension one of them needs, once
 fun emit_preamble(e: *Emit) {
     emit_cap(e, spirv.CAP_SHADER);
     if (!e.has_entry) { emit_cap(e, spirv.CAP_LINKAGE); }
-    val need: u32 = e.b.caps_needed;
-    if ((need & spirv.NEED_INT8) != 0)               { emit_cap(e, spirv.CAP_INT8); }
-    if ((need & spirv.NEED_INT16) != 0)              { emit_cap(e, spirv.CAP_INT16); }
-    if ((need & spirv.NEED_INT64) != 0)              { emit_cap(e, spirv.CAP_INT64); }
-    if ((need & spirv.NEED_FLOAT16) != 0)            { emit_cap(e, spirv.CAP_FLOAT16); }
-    if ((need & spirv.NEED_FLOAT64) != 0)            { emit_cap(e, spirv.CAP_FLOAT64); }
-    if ((need & spirv.NEED_SAMPLED_1D) != 0)         { emit_cap(e, spirv.CAP_SAMPLED_1D); }
-    if ((need & spirv.NEED_SAMPLED_CUBE_ARRAY) != 0) { emit_cap(e, spirv.CAP_SAMPLED_CUBE_ARRAY); }
+    val need: u64 = e.b.caps_needed;
+    var i:    u32 = 0;
+    for (i < spirv.CAPABILITY_COUNT) {
+        if ((need & spirv.CAPABILITIES[i].need) != 0) { emit_cap(e, spirv.CAPABILITIES[i].word); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < spirv.CAPABILITY_COUNT) {
+        val ext: str = spirv.CAPABILITIES[i].extension;
+        if ((need & spirv.CAPABILITIES[i].need) != 0 && ext != nil && !extension_declared_before(need, i, ext)) {
+            spirv.inst_string(e.b, ?e.b.extensions, spirv.OP_EXTENSION, nil, 0, ext);
+        }
+        i = i + 1;
+    }
     var mm: [2]u32;
     mm[0] = spirv.ADDRESSING_LOGICAL;
     mm[1] = spirv.MEMORY_GLSL450;
     spirv.inst(e.b, ?e.b.memory_model, spirv.OP_MEMORY_MODEL, ?mm[0], 2);
+}
+
+fun extension_declared_before(need: u64, upto: u32, ext: str) bool {
+    var i: u32 = 0;
+    for (i < upto) {
+        val other: str = spirv.CAPABILITIES[i].extension;
+        if ((need & spirv.CAPABILITIES[i].need) != 0 && other != nil && str_equals(other, ext)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 fun emit_cap(e: *Emit, cap: u32) {
@@ -2407,8 +2585,12 @@ fun emit_function(e: *Emit, fx: u32) err[fail.Fail] {
         li         = li + 1;
     }
 
-    var lb: [1]u32;
+    # a stage that zeroes its `#[shared]` memory opens on a block of its own, so the
+    # first user block is an ordinary one the prologue branches to
+    val zeroing: bool = zeroes_shared(e, fx, irfn);
+    var lb:      [1]u32;
     lb[0] = labels[st.order[0]];
+    if (zeroing) { lb[0] = spirv.alloc_id(e.b); }
     spirv.inst(e.b, ?e.b.functions, spirv.OP_LABEL, ?lb[0], 1);
     dbgm.block(?e.dbg);
 
@@ -2422,9 +2604,11 @@ fun emit_function(e: *Emit, fx: u32) err[fail.Fail] {
     }
 
     var body: err[fail.Fail] = err[fail.Fail].ok{};
-    var oi:   u32            = 0;
+    if (zeroing) { body = emit_shared_zeroing(e, fx, irfn, lb[0], labels[st.order[0]]); }
+    var oi: u32 = 0;
+    if (sel body.err) { oi = st.count; }
     for (oi < st.count) {
-        body = emit_node(e, mf, ?st, st.order[oi], oi == 0, labels, ?vm,
+        body = emit_node(e, mf, ?st, st.order[oi], oi == 0 && !zeroing, labels, ?vm,
             ?param_ids[0], irfn.param_count, returns_void, ret_ty);
         if (sel body.err) {
             oi = st.count;
@@ -2670,6 +2854,17 @@ fun emit_entry_point(e: *Emit, irfn: *ir.Function, fn_ix: u32, fn_id: u32, name:
         if (entry_lists(e, fn_ix, gi)) { used = used + 1; }
         gi = gi + 1;
     }
+    # the zeroing reads LocalInvocationIndex, an Input the interface names even where
+    # the stage's own code never reads it
+    var lid: u32 = 0;
+    if (zeroes_shared(e, fn_ix, irfn)) {
+        val lx: u32 = local_invocation_global(e);
+        if (lx == GL_NONE || !entry_lists(e, fn_ix, lx)) {
+            var lty: u32 = 0;
+            lid  = zero_lid(e, ?lty);
+            used = used + 1;
+        }
+    }
     val total: u32                = 2 + sw + used;
     val ra:    res[*u32, A.Error] = A.allocate[u32](e.alloc, total::usize);
     if (sel ra.err) { ret err[fail.Fail].err{fail.refused(ra.err)}; }
@@ -2686,6 +2881,7 @@ fun emit_entry_point(e: *Emit, irfn: *ir.Function, fn_ix: u32, fn_id: u32, name:
         }
         gi = gi + 1;
     }
+    if (lid != 0) { ops[2 + sw + ii] = lid; }
     spirv.inst(e.b, ?e.b.entry_points, spirv.OP_ENTRY_POINT, ops, total);
     A.deallocate[u32](e.alloc, ops, total::usize);
 
@@ -2718,6 +2914,193 @@ fun emit_entry_point(e: *Emit, irfn: *ir.Function, fn_ix: u32, fn_id: u32, name:
         }
     }
     ret err[fail.Fail].ok{};
+}
+
+# a `#[shared]` variable carries an OpConstantNull initializer where the selection
+# holds zero_init_workgroup, and each compute stage reaching one zeroes it otherwise (#4270)
+fun shared_native_zero(e: *Emit) bool {
+    ret (e.tgt.model.extensions & spirv.EXT_ZERO_INIT_WORKGROUP) != 0;
+}
+
+fun zeroes_shared(e: *Emit, fx: u32, irfn: *ir.Function) bool {
+    if (irfn.stage != ir.STAGE_COMPUTE || shared_native_zero(e)) { ret false; }
+    var gx: u32 = 0;
+    for (gx < e.gl_len) {
+        if (gl_ir(e, gx).iface == ir.IFACE_SHARED && e.gslot[gx] != 0
+            && uses_iface(e, fx, e.gslot[gx] - 1)) {
+            ret true;
+        }
+        gx = gx + 1;
+    }
+    ret false;
+}
+
+fun local_invocation_global(e: *Emit) u32 {
+    var gx: u32 = 0;
+    for (gx < e.gl_len) {
+        val g: *ir.Global = gl_ir(e, gx);
+        if (g.iface == ir.IFACE_BUILTIN && g.iface_a == ir.BUILTIN_LOCAL_INVOCATION_INDEX
+            && e.gvar_ids[gx] != 0) {
+            ret gx;
+        }
+        gx = gx + 1;
+    }
+    ret GL_NONE;
+}
+
+# the LocalInvocationIndex variable and its value type: a declared
+# `#[builtin("local_invocation_index")]` where there is one, else one the emitter adds once
+fun zero_lid(e: *Emit, out_ty: *u32) u32 {
+    val gx: u32 = local_invocation_global(e);
+    if (gx != GL_NONE) {
+        @out_ty = e.gtype_ids[gx];
+        ret e.gvar_ids[gx];
+    }
+    val u32t: u32 = types.type_int(e.tt, 32);
+    @out_ty = u32t;
+    if (e.zero_lid != 0) { ret e.zero_lid; }
+    val var_id: u32 = spirv.alloc_id(e.b);
+    var vop:    [3]u32;
+    vop[0] = types.type_ptr(e.tt, spirv.STORAGE_INPUT, u32t);
+    vop[1] = var_id;
+    vop[2] = spirv.STORAGE_INPUT;
+    spirv.inst(e.b, ?e.b.types_consts, spirv.OP_VARIABLE, ?vop[0], 3);
+    decorate(e, var_id, spirv.DECOR_BUILTIN, spirv.BUILTIN_LOCAL_INVOCATION_INDEX);
+    e.zero_lid = var_id;
+    ret var_id;
+}
+
+fun emit_words(e: *Emit, opcode: u32, w0: u32, w1: u32, w2: u32, w3: u32, n: u32) {
+    var ops: [4]u32;
+    ops[0] = w0;
+    ops[1] = w1;
+    ops[2] = w2;
+    ops[3] = w3;
+    spirv.inst(e.b, ?e.b.functions, opcode, ?ops[0], n);
+}
+
+fun emit_label(e: *Emit, label: u32) {
+    emit_words(e, spirv.OP_LABEL, label, 0, 0, 0, 1);
+    dbgm.block(?e.dbg);
+}
+
+fun emit_pair(e: *Emit, opcode: u32, ty: u32, a: u32, b: u32) u32 {
+    val result: u32 = spirv.alloc_id(e.b);
+    emit_words(e, opcode, ty, result, a, b, 4);
+    ret result;
+}
+
+# the prologue of a compute stage that zeroes the `#[shared]` memory it reaches:
+# invocation i of a workgroup of w stores zero to the elements i, i + w, ... of each
+# array and invocation 0 to each whole value, then one workgroup barrier makes the
+# stores visible. it precedes all user code, so every invocation reaches the barrier
+fun emit_shared_zeroing(e: *Emit, fx: u32, irfn: *ir.Function, first: u32, next: u32) err[fail.Fail] {
+    var lty: u32 = 0;
+    val lid: u32 = zero_lid(e, ?lty);
+    val idx: u32 = spirv.alloc_id(e.b);
+    emit_words(e, spirv.OP_LOAD, lty, idx, lid, 0, 3);
+    val sr: res[u32, fail.Fail] = workgroup_invocations(e, irfn);
+    if (sel sr.err) { ret err[fail.Fail].err{sr.err}; }
+    val step: u32 = sr.ok;
+
+    var pred: u32 = first;
+    var gx:   u32 = 0;
+    for (gx < e.gl_len) {
+        val g: *ir.Global = gl_ir(e, gx);
+        if (g.iface != ir.IFACE_SHARED || e.gslot[gx] == 0 || !uses_iface(e, fx, e.gslot[gx] - 1)) {
+            gx = gx + 1;
+            cnt;
+        }
+        var count:   u32               = 1;
+        var elem_ty: u32               = e.gtype_ids[gx];
+        var indexed: bool              = false;
+        val gt:      *type.IrTypeTable = gl_types(e, gx);
+        val to:      opt[*type.IrType] = type.get(gt, g.ty);
+        if (sel to.some) {
+            val t: *type.IrType = to.some;
+            if (t.kind == type.IRT_ARRAY && t.data.array_.count > 0) {
+                count   = t.data.array_.count;
+                elem_ty = spv_type_of(e, gt, t.data.array_.element);
+                indexed = true;
+            }
+        }
+        if (elem_ty == 0) {
+            ret unsupported(e, "unsupported `#[shared]` variable type in the SPIR-V target");
+        }
+        pred = emit_zero_loop(e, pred, e.gvar_ids[gx], elem_ty, indexed, count, idx, step);
+        gx   = gx + 1;
+    }
+
+    val wg:  u32 = types.const_int(e.tt, 32, spirv.SCOPE_WORKGROUP::i64);
+    val sem: u32 = types.const_int(e.tt, 32,
+        (spirv.SEMANTICS_ACQUIRE_RELEASE | spirv.SEMANTICS_WORKGROUP_MEMORY)::i64);
+    emit_words(e, spirv.OP_CONTROL_BARRIER, wg, wg, sem, 0, 3);
+    emit_branch(e, next);
+    if (e.b.err) { ret err[fail.Fail].err{fail.message("spirv.emit: module builder hit an allocation error")}; }
+    ret err[fail.Fail].ok{};
+}
+
+# the id of the stage's invocation count per workgroup: a constant, or where a
+# `#[spec]` var sizes a dimension the product the specialized size gives
+fun workgroup_invocations(e: *Emit, irfn: *ir.Function) res[u32, fail.Fail] {
+    if (!wg_is_spec(irfn)) {
+        ret res[u32, fail.Fail].ok{types.const_int(e.tt, 32, (irfn.wg_x * irfn.wg_y * irfn.wg_z)::i64)};
+    }
+    val u32t: u32 = types.type_int(e.tt, 32);
+    var n:    u32 = 0;
+    var d:    u32 = 0;
+    for (d < 3) {
+        val r: res[u32, fail.Fail] = wg_dim_id(e, irfn, d);
+        if (sel r.err) { ret r; }
+        if (d == 0)    { n = r.ok; }
+        or             { n = emit_pair(e, spirv.OP_I_MUL, u32t, n, r.ok); }
+        d = d + 1;
+    }
+    ret res[u32, fail.Fail].ok{n};
+}
+
+# for (j = idx; j < count; j += step) var[j] = null, or the whole variable when
+# not indexed; returns the merge block, where the code after it continues
+fun emit_zero_loop(e: *Emit, pred: u32, var_id: u32, elem_ty: u32, indexed: bool,
+    count: u32, idx: u32, step: u32) u32 {
+    val u32t:   u32 = types.type_int(e.tt, 32);
+    val header: u32 = spirv.alloc_id(e.b);
+    val body:   u32 = spirv.alloc_id(e.b);
+    val cont:   u32 = spirv.alloc_id(e.b);
+    val merge:  u32 = spirv.alloc_id(e.b);
+    val j:      u32 = spirv.alloc_id(e.b);
+    val jn:     u32 = spirv.alloc_id(e.b);
+    emit_branch(e, header);
+
+    emit_label(e, header);
+    var phi: [6]u32;
+    phi[0] = u32t;
+    phi[1] = j;
+    phi[2] = idx;
+    phi[3] = pred;
+    phi[4] = jn;
+    phi[5] = cont;
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_PHI, ?phi[0], 6);
+    val more: u32 = emit_pair(e, spirv.OP_U_LESS_THAN, types.type_bool(e.tt), j,
+        types.const_int(e.tt, 32, count::i64));
+    emit_words(e, spirv.OP_LOOP_MERGE, merge, cont, spirv.LOOP_CONTROL_NONE, 0, 3);
+    emit_words(e, spirv.OP_BRANCH_CONDITIONAL, more, body, merge, 0, 3);
+
+    emit_label(e, body);
+    var ptr: u32 = var_id;
+    if (indexed) {
+        ptr = spirv.alloc_id(e.b);
+        emit_words(e, spirv.OP_ACCESS_CHAIN, types.type_ptr(e.tt, spirv.STORAGE_WORKGROUP, elem_ty), ptr, var_id, j, 4);
+    }
+    emit_words(e, spirv.OP_STORE, ptr, types.const_null(e.tt, elem_ty), 0, 0, 2);
+    emit_branch(e, cont);
+
+    emit_label(e, cont);
+    emit_words(e, spirv.OP_I_ADD, u32t, jn, j, step, 4);
+    emit_branch(e, header);
+
+    emit_label(e, merge);
+    ret merge;
 }
 
 fun entry_lists(e: *Emit, fn_ix: u32, gx: u32) bool {
@@ -3295,7 +3678,7 @@ fun addressed_memory_refusal(e: *Emit, mf: *mir.MirFunction, op: *mir.MirOperand
     }
     val g: *ir.Global = gl_ir(e, gix);
     if (g.iface == ir.IFACE_NONE) {
-        ret "a plain module-scope variable is not reachable from the SPIR-V target: a shader has no general global storage, so a module-scope `val` / `var` reaches a stage only by carrying an interface role (`#[input]`, `#[output]`, `#[builtin]`, or `#[uniform]`)";
+        ret "a plain module-scope variable is not reachable from the SPIR-V target: a shader has no general global storage, so a module-scope `val` / `var` reaches a stage only by carrying an interface role (`#[input]`, `#[output]`, `#[builtin]`, `#[uniform]`, `#[storage]`, `#[sampler]`, `#[push]`, or `#[shared]`)";
     }
     val r: res[str, format.FormatError] = format.sprint(e.alloc,
         "this shader interface variable carries a role, so it is reachable - but the access reached the back end as COMPUTED ADDRESSING rather than as a direct reference to the variable, which is the one shape the SPIR-V target can name. that is a lowering that ran where it should not have, not a limit of the declaration: the variable is {}",
@@ -3937,7 +4320,11 @@ fun emit_spirv_op(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, mi: *mir.MirInstr,
     if (argc != mi.operand_count - 2)             { ret emit_fail(e, "spirv.emit: mapped logical call arity mismatch"); }
     if (!types.instruction_operands_fit(4, argc)) { ret unsupported(e, "SPIR-V mapped instruction arguments exceed its 65535-word encoding"); }
     val row: *isa.OpDef = isa.op_def_by_code(e.tgt.defs, fn.op_set, fn.op_code);
-    if (row == nil || row.arity != argc) { ret emit_fail(e, "spirv.emit: an `op` callee has no instruction row of its arity"); }
+    if (row == nil || argc < row.min_arity || argc > row.arity) {
+        ret emit_fail(e, "spirv.emit: an `op` callee has no instruction row of its arity");
+    }
+    val rq: err[fail.Fail] = require(e, mf, row.capability, row.requires, op_use_text(e, row, nil));
+    if (sel rq.err) { ret rq; }
 
     var returns_void: bool = false;
     var ret_ty:       u32  = 0;
@@ -3985,6 +4372,8 @@ fun emit_spirv_op(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, mi: *mir.MirInstr,
         ops[base + i] = word.ok;
         i             = i + 1;
     }
+    val er: err[fail.Fail] = op_enumerated_operands(e, mf, row, argc, ?ops[base]);
+    if (sel er.err) { ret er; }
     var result: u32 = 0;
     if (has_result) {
         result = spirv.alloc_id(e.b);
@@ -4013,6 +4402,93 @@ fun emit_spirv_op(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, mi: *mir.MirInstr,
         ret err[fail.Fail].ok{};
     }
     ret write_value(e, mf, vm, ?mi.operands[1], result, ret_ty, mi.memory_flags);
+}
+
+# each enumerated literal's value against its enumeration: it must be one of its values,
+# the operands it brings must be the optional tail the call passes, and each value's
+# requirement is collected like the row's
+fun op_enumerated_operands(e: *Emit, mf: *mir.MirFunction, row: *isa.OpDef, argc: u32, words: *u32) err[fail.Fail] {
+    var trailing: u32 = 0;
+    var i:        u32 = 0;
+    for (i < row.min_arity) {
+        val en: *isa.OpEnum = isa.op_operand_enum(row, i);
+        if (en == nil) {
+            i = i + 1;
+            cnt;
+        }
+        val value:  u32 = words[i];
+        var brings: u32 = 0;
+        if (!isa.op_enum_admits(en, value, ?brings)) {
+            ret err[fail.Fail].err{reject_at(e, dkind.OP_OPERAND_VALUE, mir.refusal_loc(mf, e.cur_instr),
+                op_operand_value_text(e, row, i, en, value))};
+        }
+        trailing = trailing + brings;
+        if (!en.mask) {
+            val one: *isa.OpEnumerant = isa.op_enumerant_of(en, value);
+            val rq:  err[fail.Fail]   = require(e, mf, one.capability, one.requires, op_use_text(e, row, one.name));
+            if (sel rq.err) { ret rq; }
+        }
+        or {
+            var bit: u32 = 1;
+            for (bit != 0 && bit <= value) {
+                if ((value & bit) != 0) {
+                    val one: *isa.OpEnumerant = isa.op_enumerant_of(en, bit);
+                    val rq:  err[fail.Fail]   = require(e, mf, one.capability, one.requires, op_use_text(e, row, one.name));
+                    if (sel rq.err) { ret rq; }
+                }
+                bit = bit << 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (row.min_arity + trailing != argc) {
+        val r: res[str, format.FormatError] = format.sprint(e.alloc,
+            "`{}` takes {} operands with the literal values this call passes, and the declaration passes {}: the operands after the {} it always takes are present exactly as far as a literal's value brings them, so declare the instruction once per shape",
+            row.name, row.min_arity + trailing, argc, row.min_arity);
+        if (sel r.err) { ret err[fail.Fail].err{fail.format_refused(r.err)}; }
+        ret err[fail.Fail].err{reject_at(e, dkind.OP_OPERAND_VALUE, mir.refusal_loc(mf, e.cur_instr), r.ok)};
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun op_operand_value_text(e: *Emit, row: *isa.OpDef, i: u32, en: *isa.OpEnum, value: u32) str {
+    var names: [256]u8;
+    var at:    usize = 0;
+    var k:     u32   = 0;
+    for (k < en.count) {
+        val nm: str   = en.values[k].name;
+        val nl: usize = str_len(nm);
+        if (at + nl + 3 >= 256) { brk; }
+        if (k > 0) {
+            names[at]     = ',';
+            names[at + 1] = ' ';
+            at            = at + 2;
+        }
+        var c: usize = 0;
+        for (c < nl) {
+            names[at + c] = nm[c]::u8;
+            c             = c + 1;
+        }
+        at = at + nl;
+        k  = k + 1;
+    }
+    names[at] = 0;
+    var form: str = "one of";
+    if (en.mask) { form = "a union of"; }
+    val r: res[str, format.FormatError] = format.sprint(e.alloc,
+        "operand {} of `{}` is a `{}`, and {} is not {} its values ({}): the word would be written into the module as a value the specification does not define",
+        i + 1, row.name, en.name, value, form, (?names[0])::str);
+    if (sel r.err) { ret "an `op` literal operand's value is not one its enumeration defines"; }
+    ret r.ok;
+}
+
+# "`OpGroupNonUniformIAdd`", or with the literal value that raised the requirement
+fun op_use_text(e: *Emit, row: *isa.OpDef, value: str) str {
+    var r: res[str, format.FormatError];
+    if (value == nil) { r = format.sprint(e.alloc, "`{}`", row.name); }
+    or                { r = format.sprint(e.alloc, "`{}` with `{}`", row.name, value); }
+    if (sel r.err)    { ret row.name; }
+    ret r.ok;
 }
 
 # the word operand `i` of an `op` call contributes, written as its row's kind says

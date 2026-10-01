@@ -170,10 +170,16 @@ pub val IFACE_PUSH:    u8 = 7
 ## val IFACE_SPEC
 
 ```mach
-pub val IFACE_SPEC: u8 = 8
+pub val IFACE_SPEC:   u8 = 8
 ```
 
 a specialization constant: iface_a is its SpecId, the initializer its default
+
+## val IFACE_SHARED
+
+```mach
+pub val IFACE_SHARED: u8 = 9
+```
 
 ## val IFACE_FLAG_READONLY
 
