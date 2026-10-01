@@ -27,8 +27,13 @@ static uint64_t fold32_special_f32(uint64_t h, float v) {
 }
 
 /* mach's `%` is a - trunc(a / b) * b, and every quotient it is taken on here is
- * an infinity or a NaN, which truncation leaves alone */
-static float rem_special_f32(float a, float b) { return a - (a / b) * b; }
+ * a zero, an infinity or a NaN, which truncation leaves alone. a zero quotient is
+ * a finite dividend over an infinite divisor, which gives the dividend as in fmod */
+static float rem_special_f32(float a, float b) {
+    const float q = a / b;
+    if (q == 0) { return a; }
+    return a - q * b;
+}
 
 static uint64_t special_f32(uint64_t seed) {
     uint64_t h = fold_init();
@@ -106,6 +111,11 @@ static uint64_t special_f32(uint64_t seed) {
     h = fold32_special_f32(h, rem_special_f32(one, pz));
     h = fold32_special_f32(h, rem_special_f32(mone, nz));
     h = fold32_special_f32(h, rem_special_f32(pz, pz));
+    h = fold32_special_f32(h, rem_special_f32(one, pinf));
+    h = fold32_special_f32(h, rem_special_f32(mone, ninf));
+    h = fold32_special_f32(h, rem_special_f32(nz, pinf));
+    h = fold32_special_f32(h, rem_special_f32(fmax, ninf));
+    h = fold32_special_f32(h, rem_special_f32(pinf, ninf));
 
     h = mix_u32(h, f32_to_bits_special_f32(nan_));
     h = mix_u8(h, (uint8_t)(nan_ != nan_));
@@ -208,8 +218,13 @@ static uint64_t fold64_special_f64(uint64_t h, double v) {
 }
 
 /* mach's `%` is a - trunc(a / b) * b, and every quotient it is taken on here is
- * an infinity or a NaN, which truncation leaves alone */
-static double rem_special_f64(double a, double b) { return a - (a / b) * b; }
+ * a zero, an infinity or a NaN, which truncation leaves alone. a zero quotient is
+ * a finite dividend over an infinite divisor, which gives the dividend as in fmod */
+static double rem_special_f64(double a, double b) {
+    const double q = a / b;
+    if (q == 0) { return a; }
+    return a - q * b;
+}
 
 static uint64_t special_f64(uint64_t seed) {
     uint64_t h = fold_init();
@@ -286,6 +301,11 @@ static uint64_t special_f64(uint64_t seed) {
     h = fold64_special_f64(h, rem_special_f64(one, pz));
     h = fold64_special_f64(h, rem_special_f64(mone, nz));
     h = fold64_special_f64(h, rem_special_f64(pz, pz));
+    h = fold64_special_f64(h, rem_special_f64(one, pinf));
+    h = fold64_special_f64(h, rem_special_f64(mone, ninf));
+    h = fold64_special_f64(h, rem_special_f64(nz, pinf));
+    h = fold64_special_f64(h, rem_special_f64(dmax, ninf));
+    h = fold64_special_f64(h, rem_special_f64(pinf, ninf));
 
     h = mix_u64(h, f64_to_bits_special_f64(nan_));
     h = mix_u8(h, (uint8_t)(nan_ != nan_));
