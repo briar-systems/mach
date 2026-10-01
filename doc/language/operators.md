@@ -16,7 +16,12 @@ the sign of the dividend (`-7 % 3 == -1`). On floats it is the truncated (C
 `fmod`) remainder `a - trunc(a / b) * b`, likewise taking the sign of the
 dividend (`5.5 % 3.0 == 2.5`, `-5.5 % 3.0 == -2.5`). For finite operands and a
 nonzero divisor, this applies across the finite operand range, including
-quotients beyond the `i64` range.
+quotients beyond the `i64` range. A zero divisor or an infinite dividend gives
+NaN on every target, as IEEE 754 and C `fmod` do. So does a NaN operand, and
+so does an infinite divisor, where the formula multiplies a zero quotient by
+the infinity (C `fmod` returns the dividend there). Only the NaN is defined,
+not its sign or payload. In a constant expression a zero divisor is refused as
+division by zero, and the other cases fold to NaN.
 
 ```mach
 use std.print;
