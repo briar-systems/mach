@@ -1684,7 +1684,8 @@ is, with as many components as the row's texel count states, for a pointer resul
 only, a pointer to that sampled type, into the memory of the handle the typing's pointer
 operand addresses, or, for a value result only, a handle whose constructor composes over
 the handle the typing's operand is, taking its texels from it as a sampled image does
-from its image
+from its image. an operand may also be a sampler, a handle whose constructor states how
+texels are sampled, whatever the data type
 
 ## val OP_RELATION_NONE
 
@@ -1716,10 +1717,16 @@ pub val OP_RELATION_POINTEE:  OpRelation = 3
 pub val OP_RELATION_COMPOSED: OpRelation = 4
 ```
 
+## val OP_RELATION_SAMPLER
+
+```mach
+pub val OP_RELATION_SAMPLER:  OpRelation = 5
+```
+
 ## val OP_RELATION_COUNT
 
 ```mach
-pub val OP_RELATION_COUNT:    OpRelation = 5
+pub val OP_RELATION_COUNT:    OpRelation = 6
 ```
 
 ## def OpCountKind
@@ -1936,7 +1943,7 @@ pub fun op_related(d: OpDef, result: OpRelation, operands: str) OpDef;
 
 `d` with its result's type related to its data type by `result`, and each operand's by
 one letter of `operands` in order: `-` unrelated, `=` the data type itself, `t` a texel
-of the handle the typing's operand is. a letter outside the set is an invalid relation,
+of the handle the typing's operand is, `s` a sampler. a letter outside the set is an invalid relation,
 which registration refuses
 
 ## fun op_confined
