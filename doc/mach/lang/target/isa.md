@@ -1680,38 +1680,53 @@ pub def OpRelation: u8
 how an operand's or the result's type relates to the row's data type, the type of its
 typing's operand (a pointer operand's pointee): unrelated, that same type, a texel, a
 scalar or vector whose component is the sampled type of the handle the typing's operand
-is, with as many components as the row's texel count states, or, for a pointer result
+is, with as many components as the row's texel count states, for a pointer result
 only, a pointer to that sampled type, into the memory of the handle the typing's pointer
-operand addresses
+operand addresses, or, for a value result only, a handle whose constructor composes over
+the handle the typing's operand is, taking its texels from it as a sampled image does
+from its image. an operand may also be a sampler, a handle whose constructor states how
+texels are sampled, whatever the data type
 
 ## val OP_RELATION_NONE
 
 ```mach
-pub val OP_RELATION_NONE:    OpRelation = 0
+pub val OP_RELATION_NONE:     OpRelation = 0
 ```
 
 ## val OP_RELATION_DATA
 
 ```mach
-pub val OP_RELATION_DATA:    OpRelation = 1
+pub val OP_RELATION_DATA:     OpRelation = 1
 ```
 
 ## val OP_RELATION_TEXEL
 
 ```mach
-pub val OP_RELATION_TEXEL:   OpRelation = 2
+pub val OP_RELATION_TEXEL:    OpRelation = 2
 ```
 
 ## val OP_RELATION_POINTEE
 
 ```mach
-pub val OP_RELATION_POINTEE: OpRelation = 3
+pub val OP_RELATION_POINTEE:  OpRelation = 3
+```
+
+## val OP_RELATION_COMPOSED
+
+```mach
+pub val OP_RELATION_COMPOSED: OpRelation = 4
+```
+
+## val OP_RELATION_SAMPLER
+
+```mach
+pub val OP_RELATION_SAMPLER:  OpRelation = 5
 ```
 
 ## val OP_RELATION_COUNT
 
 ```mach
-pub val OP_RELATION_COUNT:   OpRelation = 4
+pub val OP_RELATION_COUNT:    OpRelation = 6
 ```
 
 ## def OpCountKind
@@ -1928,8 +1943,16 @@ pub fun op_related(d: OpDef, result: OpRelation, operands: str) OpDef;
 
 `d` with its result's type related to its data type by `result`, and each operand's by
 one letter of `operands` in order: `-` unrelated, `=` the data type itself, `t` a texel
-of the handle the typing's operand is. a letter outside the set is an invalid relation,
+of the handle the typing's operand is, `s` a sampler. a letter outside the set is an invalid relation,
 which registration refuses
+
+## fun op_confined
+
+```mach
+pub fun op_confined(d: OpDef) OpDef;
+```
+
+`d` with its result consumed only by another row's operand in the block that produces it
 
 ## fun op_derived
 
