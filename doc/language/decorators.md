@@ -1242,6 +1242,30 @@ variable is, on every environment. How depends on the environment:
 Because the value on entry is always zero, a `#[shared]` variable cannot have an
 initializer. Assign it inside the stage.
 
+Whether a variable may carry an **initializer** is settled by its role, since the
+role says who puts the first value in it:
+
+| Role                                             | Initializer | Why                                                   |
+|--------------------------------------------------|-------------|-------------------------------------------------------|
+| `input`, a read built-in                         | refused     | the previous stage or the pipeline supplies the value |
+| `uniform`, `storage`, `sampler`, `push`          | refused     | the host binds or supplies the memory                 |
+| `shared`                                         | refused     | workgroup memory is zero when a stage starts          |
+| `spec`                                           | required    | it is the default the pipeline keeps                  |
+| `output`, a written built-in                     | allowed     | it is the value the variable starts at                |
+
+A refused initializer is a compile error, because the value it writes would never be
+the one the shader sees. An `output` or a written built-in starts at its
+initializer, and at zero without one, as every mach `var` does:
+
+```mach fragment
+#[output(0)] var out_colour: f32x4 = f32x4{0.0, 0.0, 0.0, 1.0};
+#[output(1)] var out_mask:   u32;
+```
+
+On `spirv` the Output `OpVariable` carries that value as its initializer: the
+constant the initializer spells, or `OpConstantNull` where it is zero or absent.
+SPIR-V and Vulkan both admit an initializer on an Output variable.
+
 As with `#[stage(...)]`, these are accepted on every target and acted on only by a
 target that forms pipeline stages. On `spirv` each becomes an `OpVariable` in the
 matching storage class, carrying the matching decoration, and the Input and Output
@@ -1258,7 +1282,7 @@ point that uses it from SPIR-V 1.4.
 A specialization constant is a value the host supplies when it creates the
 pipeline, after the shader has been compiled. It is declared as a module-level
 `var` carrying the constant's id, and its initializer is the default the pipeline
-keeps when the host supplies nothing for that id:
+keeps when the host supplies nothing for that id. The initializer is required:
 
 ```mach
 #[spec(0)]
