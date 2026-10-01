@@ -1684,8 +1684,9 @@ pub fun atomic_fadd(p: *f32, scope: u32, semantics: u32, v: f32) f32;
 
 A 32-bit integer atomic is core in every storage class. Every other type needs the
 Vulkan device feature of its storage class, named for its `shaderBuffer*`,
-`shaderShared*` or `shaderImage*` member: `buffer_*` on a storage buffer
-(`StorageBuffer`, or `Uniform` before SPIR-V 1.3), `shared_*` on [`#[shared]`](#inputn--outputn--builtinstr--uniformset-binding--storageset-binding--samplerset-binding--push--specid--shared--shader-interface)
+`shaderShared*` or `shaderImage*` member: `buffer_*` on buffer memory
+(`StorageBuffer`, `Uniform` before SPIR-V 1.3, or `PhysicalStorageBuffer` through a
+[physical pointer](types.md#pointers-on-spir-v)), `shared_*` on [`#[shared]`](#inputn--outputn--builtinstr--uniformset-binding--storageset-binding--samplerset-binding--push--specid--shared--shader-interface)
 workgroup memory, and `image_*` on a storage image texel (`Image`, through
 `OpImageTexelPointer`), where Vulkan defines only a 64-bit integer and an `f32`. Any
 other storage class is refused. An image of 64-bit texels (`R64ui` or `R64i`) declares
