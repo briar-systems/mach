@@ -94,8 +94,8 @@ static uint16_t mul_f16_ops(uint16_t a, uint16_t b) { return narrow_f16_ops(wide
 static uint16_t div_f16_ops(uint16_t a, uint16_t b) { return narrow_f16_ops(widen_f16_ops(a) / widen_f16_ops(b)); }
 
 /* mach's float `%` is the truncated remainder a - trunc(a / b) * b, exact and
- * so always representable, and the NaN that formula makes for an infinite or
- * NaN divisor or a NaN dividend. every binary16 value is an integer
+ * so always representable, and the NaN that formula makes for a zero, infinite
+ * or NaN divisor or an infinite or NaN dividend. every binary16 value is an integer
  * multiple of 2^-24 below 2^40 of them, so the remainder is taken on those
  * integers; a zero result keeps the dividend's sign */
 static uint16_t rem_f16_ops(uint16_t a, uint16_t b) {
@@ -150,9 +150,7 @@ static uint64_t arith_f16_ops(uint64_t seed) {
             h = fold_f16_ops(h, sub_f16_ops(a, b));
             h = fold_f16_ops(h, mul_f16_ops(a, b));
             h = fold_f16_ops(h, div_f16_ops(a, b));
-            if ((table_f16_ops(i) & 0x7FFFu) != 0x7C00u && (table_f16_ops(j) & 0x7FFFu) != 0) {
-                h = fold_f16_ops(h, rem_f16_ops(a, b));
-            }
+            h = fold_f16_ops(h, rem_f16_ops(a, b));
         }
     }
 
