@@ -1246,6 +1246,18 @@ pub val CAP_ATOMIC_FLOAT32_ADD:                 u32 = 6033
 pub val CAP_ATOMIC_FLOAT64_ADD:                 u32 = 6034
 ```
 
+## val CAP_VULKAN_MEMORY_MODEL
+
+```mach
+pub val CAP_VULKAN_MEMORY_MODEL:                u32 = 5345
+```
+
+## val CAP_VULKAN_MEMORY_MODEL_DEVICE_SCOPE
+
+```mach
+pub val CAP_VULKAN_MEMORY_MODEL_DEVICE_SCOPE:   u32 = 5346
+```
+
 ## rec Capability
 
 ```mach
@@ -1442,10 +1454,22 @@ pub val NEED_STORAGE_IMAGE_MULTISAMPLE: u64 = 0x10000000
 pub val NEED_IMAGE_MS_ARRAY:            u64 = 0x20000000
 ```
 
+## val NEED_VULKAN_MEMORY_MODEL
+
+```mach
+pub val NEED_VULKAN_MEMORY_MODEL:              u64 = 0x40000000
+```
+
+## val NEED_VULKAN_MEMORY_MODEL_DEVICE_SCOPE
+
+```mach
+pub val NEED_VULKAN_MEMORY_MODEL_DEVICE_SCOPE: u64 = 0x80000000
+```
+
 ## val CAPABILITY_COUNT
 
 ```mach
-pub val CAPABILITY_COUNT: u32 = 30
+pub val CAPABILITY_COUNT: u32 = 32
 ```
 
 ## val SPV_EXT_ATOMIC_FLOAT_ADD
@@ -1459,6 +1483,16 @@ pub val SPV_EXT_ATOMIC_FLOAT_ADD:     str = "SPV_EXT_shader_atomic_float_add"
 ```mach
 pub val SPV_EXT_ATOMIC_FLOAT_MIN_MAX: str = "SPV_EXT_shader_atomic_float_min_max"
 ```
+
+## val SPV_KHR_VULKAN_MEMORY_MODEL
+
+```mach
+pub val SPV_KHR_VULKAN_MEMORY_MODEL: str = "SPV_KHR_vulkan_memory_model"
+```
+
+the extension defining the Vulkan memory model below SPIR-V 1.5, where it is core.
+the module declares it with the model rather than with a capability, since it
+covers both of the model's capabilities
 
 ## val CAPABILITIES
 
@@ -1542,7 +1576,10 @@ storage_write_without_format are the shaderStorageImageReadWithoutFormat and
 shaderStorageImageWriteWithoutFormat features, so a storage image of Unknown
 format may be read or written (#4272). storage_image_multisample is the
 shaderStorageImageMultisample feature, which enables both StorageImageMultisample
-and ImageMSArray, so a storage image may be multisampled, arrayed or not (#4298)
+and ImageMSArray, so a storage image may be multisampled, arrayed or not (#4298).
+vulkan_memory_model is the vulkanMemoryModel feature, and holding it selects the
+Vulkan memory model in place of GLSL450. vulkan_memory_model_device_scope is
+vulkanMemoryModelDeviceScope, which the Device scope needs under that model (#4308)
 
 ## val EXT_ZERO_INIT_WORKGROUP
 
@@ -1613,7 +1650,7 @@ pub val EXT_SUBGROUP_GRAPHICS_STAGES:     u64 = 0x800
 ## val EXT_BUFFER_INT64_ATOMICS
 
 ```mach
-pub val EXT_BUFFER_INT64_ATOMICS:          u64 = 0x1000
+pub val EXT_BUFFER_INT64_ATOMICS:             u64 = 0x1000
 ```
 
 the atomic features of VkPhysicalDeviceShaderAtomicInt64Features,
@@ -1624,85 +1661,97 @@ each named for its shaderBuffer* or shaderShared* member: an atomic on a type be
 ## val EXT_SHARED_INT64_ATOMICS
 
 ```mach
-pub val EXT_SHARED_INT64_ATOMICS:          u64 = 0x2000
+pub val EXT_SHARED_INT64_ATOMICS:             u64 = 0x2000
 ```
 
 ## val EXT_BUFFER_FLOAT32_ATOMICS
 
 ```mach
-pub val EXT_BUFFER_FLOAT32_ATOMICS:        u64 = 0x4000
+pub val EXT_BUFFER_FLOAT32_ATOMICS:           u64 = 0x4000
 ```
 
 ## val EXT_BUFFER_FLOAT32_ATOMIC_ADD
 
 ```mach
-pub val EXT_BUFFER_FLOAT32_ATOMIC_ADD:     u64 = 0x8000
+pub val EXT_BUFFER_FLOAT32_ATOMIC_ADD:        u64 = 0x8000
 ```
 
 ## val EXT_BUFFER_FLOAT32_ATOMIC_MIN_MAX
 
 ```mach
-pub val EXT_BUFFER_FLOAT32_ATOMIC_MIN_MAX: u64 = 0x10000
+pub val EXT_BUFFER_FLOAT32_ATOMIC_MIN_MAX:    u64 = 0x10000
 ```
 
 ## val EXT_BUFFER_FLOAT64_ATOMICS
 
 ```mach
-pub val EXT_BUFFER_FLOAT64_ATOMICS:        u64 = 0x20000
+pub val EXT_BUFFER_FLOAT64_ATOMICS:           u64 = 0x20000
 ```
 
 ## val EXT_BUFFER_FLOAT64_ATOMIC_ADD
 
 ```mach
-pub val EXT_BUFFER_FLOAT64_ATOMIC_ADD:     u64 = 0x40000
+pub val EXT_BUFFER_FLOAT64_ATOMIC_ADD:        u64 = 0x40000
 ```
 
 ## val EXT_BUFFER_FLOAT64_ATOMIC_MIN_MAX
 
 ```mach
-pub val EXT_BUFFER_FLOAT64_ATOMIC_MIN_MAX: u64 = 0x80000
+pub val EXT_BUFFER_FLOAT64_ATOMIC_MIN_MAX:    u64 = 0x80000
 ```
 
 ## val EXT_SHARED_FLOAT32_ATOMICS
 
 ```mach
-pub val EXT_SHARED_FLOAT32_ATOMICS:        u64 = 0x100000
+pub val EXT_SHARED_FLOAT32_ATOMICS:           u64 = 0x100000
 ```
 
 ## val EXT_SHARED_FLOAT32_ATOMIC_ADD
 
 ```mach
-pub val EXT_SHARED_FLOAT32_ATOMIC_ADD:     u64 = 0x200000
+pub val EXT_SHARED_FLOAT32_ATOMIC_ADD:        u64 = 0x200000
 ```
 
 ## val EXT_SHARED_FLOAT32_ATOMIC_MIN_MAX
 
 ```mach
-pub val EXT_SHARED_FLOAT32_ATOMIC_MIN_MAX: u64 = 0x400000
+pub val EXT_SHARED_FLOAT32_ATOMIC_MIN_MAX:    u64 = 0x400000
 ```
 
 ## val EXT_SHARED_FLOAT64_ATOMICS
 
 ```mach
-pub val EXT_SHARED_FLOAT64_ATOMICS:        u64 = 0x800000
+pub val EXT_SHARED_FLOAT64_ATOMICS:           u64 = 0x800000
 ```
 
 ## val EXT_SHARED_FLOAT64_ATOMIC_ADD
 
 ```mach
-pub val EXT_SHARED_FLOAT64_ATOMIC_ADD:     u64 = 0x1000000
+pub val EXT_SHARED_FLOAT64_ATOMIC_ADD:        u64 = 0x1000000
 ```
 
 ## val EXT_SHARED_FLOAT64_ATOMIC_MIN_MAX
 
 ```mach
-pub val EXT_SHARED_FLOAT64_ATOMIC_MIN_MAX: u64 = 0x2000000
+pub val EXT_SHARED_FLOAT64_ATOMIC_MIN_MAX:    u64 = 0x2000000
 ```
 
 ## val EXT_STORAGE_IMAGE_MULTISAMPLE
 
 ```mach
-pub val EXT_STORAGE_IMAGE_MULTISAMPLE:     u64 = 0x4000000
+pub val EXT_STORAGE_IMAGE_MULTISAMPLE:        u64 = 0x4000000
+```
+
+## val EXT_VULKAN_MEMORY_MODEL
+
+```mach
+pub val EXT_VULKAN_MEMORY_MODEL:              u64 = 0x8000000
+```
+
+## val EXT_VULKAN_MEMORY_MODEL_DEVICE_SCOPE
+
+```mach
+pub val EXT_VULKAN_MEMORY_MODEL_DEVICE_SCOPE: u64 = 0x10000000
 ```
 
 ## val EXT_ATOMICS
@@ -1716,7 +1765,7 @@ every atomic feature
 ## val EXTENSION_COUNT
 
 ```mach
-pub val EXTENSION_COUNT: u32 = 27
+pub val EXTENSION_COUNT: u32 = 29
 ```
 
 ## val ONLY_ENVIRONMENT
@@ -1743,7 +1792,8 @@ pub val EXTENSIONS: [EXTENSION_COUNT]extension.Extension = [EXTENSION_COUNT]exte
 pub val EXT_OPEN: u64 = EXT_FLOAT16 | EXT_ZERO_INIT_WORKGROUP | EXT_SUBGROUP_ARITHMETIC | EXT_SUBGROUP_CLUSTERED
 | EXT_STORAGE_READ_WITHOUT_FORMAT | EXT_STORAGE_WRITE_WITHOUT_FORMAT
 | EXT_SUBGROUP_VOTE | EXT_SUBGROUP_BALLOT | EXT_SUBGROUP_SHUFFLE | EXT_SUBGROUP_SHUFFLE_RELATIVE | EXT_SUBGROUP_QUAD
-| EXT_SUBGROUP_GRAPHICS_STAGES | EXT_ATOMICS | EXT_STORAGE_IMAGE_MULTISAMPLE
+| EXT_SUBGROUP_GRAPHICS_STAGES | EXT_ATOMICS | EXT_STORAGE_IMAGE_MULTISAMPLE | EXT_VULKAN_MEMORY_MODEL
+| EXT_VULKAN_MEMORY_MODEL_DEVICE_SCOPE
 ```
 
 every extension of the vocabulary, which a module naming no environment holds
@@ -1755,8 +1805,9 @@ pub fun env_extensions(id: u32) u64;
 ```
 
 the extensions an environment guarantees: float16 where its ceiling holds
-Float16, and from vulkan1.3 zero_init_workgroup, where the feature is core, and
-the two without-format features, whose capabilities it accepts with none enabled
+Float16, and from vulkan1.3 zero_init_workgroup, where the feature is core, the
+two without-format features, whose capabilities it accepts with none enabled, and
+the two memory model features, which vulkan1.3 requires of every device
 
 ## fun env_profile
 
@@ -1917,6 +1968,20 @@ needs StorageImageExtendedFormats
 ```mach
 pub val MEMORY_GLSL450: u32 = 1
 ```
+
+## val MEMORY_VULKAN
+
+```mach
+pub val MEMORY_VULKAN:  u32 = 3
+```
+
+## fun vulkan_memory_model
+
+```mach
+pub fun vulkan_memory_model(extensions: u64) bool;
+```
+
+the Vulkan memory model is selected where the target holds its feature
 
 ## val STORAGE_FUNCTION
 
@@ -2170,10 +2235,22 @@ pub val LOOP_CONTROL_NONE: u32 = 0
 pub val SELECTION_CONTROL_NONE: u32 = 0
 ```
 
+## val SCOPE_DEVICE
+
+```mach
+pub val SCOPE_DEVICE:       u32 = 1
+```
+
 ## val SCOPE_WORKGROUP
 
 ```mach
-pub val SCOPE_WORKGROUP: u32 = 2
+pub val SCOPE_WORKGROUP:    u32 = 2
+```
+
+## val SCOPE_QUEUE_FAMILY
+
+```mach
+pub val SCOPE_QUEUE_FAMILY: u32 = 5
 ```
 
 ## val SEMANTICS_ACQUIRE_RELEASE
@@ -2186,6 +2263,59 @@ pub val SEMANTICS_ACQUIRE_RELEASE:  u32 = 0x8
 
 ```mach
 pub val SEMANTICS_WORKGROUP_MEMORY: u32 = 0x100
+```
+
+## val SEMANTICS_MAKE_AVAILABLE
+
+```mach
+pub val SEMANTICS_MAKE_AVAILABLE:   u32 = 0x2000
+```
+
+## val SEMANTICS_MAKE_VISIBLE
+
+```mach
+pub val SEMANTICS_MAKE_VISIBLE:     u32 = 0x4000
+```
+
+## val SEMANTICS_VOLATILE
+
+```mach
+pub val SEMANTICS_VOLATILE:         u32 = 0x8000
+```
+
+## val SEMANTICS_VULKAN_ONLY
+
+```mach
+pub val SEMANTICS_VULKAN_ONLY: u32 = SEMANTICS_MAKE_AVAILABLE | SEMANTICS_MAKE_VISIBLE | SEMANTICS_VOLATILE
+```
+
+the semantics bits only the Vulkan memory model defines
+
+## val MEMORY_ACCESS_VOLATILE
+
+```mach
+pub val MEMORY_ACCESS_VOLATILE:               u32 = 0x1
+```
+
+the Memory Operands of OpLoad and OpStore. the availability and visibility bits are
+followed by their scope id, and each needs NonPrivatePointer beside it
+
+## val MEMORY_ACCESS_MAKE_POINTER_AVAILABLE
+
+```mach
+pub val MEMORY_ACCESS_MAKE_POINTER_AVAILABLE: u32 = 0x8
+```
+
+## val MEMORY_ACCESS_MAKE_POINTER_VISIBLE
+
+```mach
+pub val MEMORY_ACCESS_MAKE_POINTER_VISIBLE:   u32 = 0x10
+```
+
+## val MEMORY_ACCESS_NON_PRIVATE_POINTER
+
+```mach
+pub val MEMORY_ACCESS_NON_PRIVATE_POINTER:    u32 = 0x20
 ```
 
 ## rec Builder

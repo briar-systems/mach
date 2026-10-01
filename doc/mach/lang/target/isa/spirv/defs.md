@@ -186,6 +186,28 @@ pub val IMAGE_OPERANDS_LOD:    u32 = 0x2
 pub val IMAGE_OPERANDS_SAMPLE: u32 = 0x40
 ```
 
+## val IMAGE_OPERANDS_MAKE_TEXEL_AVAILABLE
+
+```mach
+pub val IMAGE_OPERANDS_MAKE_TEXEL_AVAILABLE: u32 = 0x100
+```
+
+the Image Operands the emitter adds to a coherent storage image's access under the
+Vulkan memory model. no row admits them from a call: a call's bits name operands of
+their own kinds, which the row's tail does not yet type per bit (#4303)
+
+## val IMAGE_OPERANDS_MAKE_TEXEL_VISIBLE
+
+```mach
+pub val IMAGE_OPERANDS_MAKE_TEXEL_VISIBLE:   u32 = 0x200
+```
+
+## val IMAGE_OPERANDS_NON_PRIVATE_TEXEL
+
+```mach
+pub val IMAGE_OPERANDS_NON_PRIVATE_TEXEL:    u32 = 0x400
+```
+
 ## val SAMPLE_LOD_OPERANDS
 
 ```mach
