@@ -73,10 +73,13 @@ rec Emit {
     gaccess: *u8;
     # what each function does through each of its parameters, as ACCESS_* bits,
     # function fx's parameter k at pacc[pbase[fx] + k]
-    pacc:      *u8;
-    pbase:     *u32;
-    pacc_len:  u32;
-    pacc_grew: bool;
+    pacc:     *u8;
+    pbase:    *u32;
+    pacc_len: u32;
+    # the root of the handle each function returns: a global, a parameter's origin,
+    # GL_NONE while none is seen, or ORIGIN_UNKNOWN once two meet
+    rsum:     *u32;
+    sum_grew: bool;
     # the OpSpecConstant id of each `#[spec]` global, 0 for any other
     gspec: *u32;
     # the module sizes its compute stages through one WorkgroupSize built-in
@@ -236,7 +239,8 @@ pub fun emit_module(out_alloc: *A.Allocator, tgt: *isa.BackendTarget, u: *unit.U
     e.pacc       = nil;
     e.pbase      = nil;
     e.pacc_len   = 0;
-    e.pacc_grew  = false;
+    e.rsum       = nil;
+    e.sum_grew   = false;
     e.copies     = vector.init[Copy](out_alloc);
     e.keys       = vector.init[u32](out_alloc);
     e.cur_copy   = COPY_NONE;
@@ -428,6 +432,8 @@ fun emit_dnit(e: *Emit) {
     e.iface_len = 0;
     if (e.pbase != nil && e.fn_len > 0) { A.deallocate[u32](e.alloc, e.pbase, e.fn_len::usize); }
     e.pbase = nil;
+    if (e.rsum != nil && e.fn_len > 0) { A.deallocate[u32](e.alloc, e.rsum, e.fn_len::usize); }
+    e.rsum = nil;
     if (e.fns != nil && e.fn_len > 0) { A.deallocate[FnEnt](e.alloc, e.fns, e.fn_len::usize); }
     e.fns    = nil;
     e.fn_len = 0;
@@ -1149,6 +1155,8 @@ val ACCESS_READ:  u8 = 2;
 
 # a parameter's origin, beside a global's index
 val ORIGIN_PARAM: u32 = 0x80000000;
+# a function that returns handles of more than one root
+val ORIGIN_UNKNOWN: u32 = 0xFFFFFFFE;
 
 fun build_gl_access(e: *Emit) err[fail.Fail] {
     if (e.gl_len == 0 || e.fn_len == 0) { ret err[fail.Fail].ok{}; }
@@ -1164,10 +1172,14 @@ fun build_gl_access(e: *Emit) err[fail.Fail] {
     val rb: res[*u32, A.Error] = A.allocate[u32](e.alloc, e.fn_len::usize);
     if (sel rb.err) { ret err[fail.Fail].err{fail.refused(rb.err)}; }
     e.pbase = rb.ok;
+    val rr: res[*u32, A.Error] = A.allocate[u32](e.alloc, e.fn_len::usize);
+    if (sel rr.err) { ret err[fail.Fail].err{fail.refused(rr.err)}; }
+    e.rsum = rr.ok;
     var total: u32 = 0;
     var fx:    u32 = 0;
     for (fx < e.fn_len) {
         e.pbase[fx] = total;
+        e.rsum[fx]  = GL_NONE;
         total       = total + fn_ir(e, fx).param_count;
         fx          = fx + 1;
     }
@@ -1184,12 +1196,13 @@ fun build_gl_access(e: *Emit) err[fail.Fail] {
     }
 
     # a call touches what a pointer argument names as its callee does through the
-    # parameter, so the scan repeats until no parameter's access grows; the marks on
-    # the globals only grow, so a refusal fires only for an access the program makes
+    # parameter, and its result names what the callee returns, so the scan repeats
+    # until no parameter's access or return's root grows; the marks on the globals
+    # only grow, so a refusal fires only for an access the program makes
     var again: bool = true;
     for (again) {
-        e.pacc_grew = false;
-        fx          = 0;
+        e.sum_grew = false;
+        fx         = 0;
         for (fx < e.fn_len) {
             if (!e.fns[fx].emit) {
                 fx = fx + 1;
@@ -1204,7 +1217,7 @@ fun build_gl_access(e: *Emit) err[fail.Fail] {
             if (sel r.err) { ret r; }
             fx = fx + 1;
         }
-        again = e.pacc_grew;
+        again = e.sum_grew;
     }
     ret err[fail.Fail].ok{};
 }
@@ -1303,17 +1316,48 @@ fun scan_fn_access_in(e: *Emit, fx: u32, mf: *mir.MirFunction, n: u32, origin: *
         }
     }
 
-    # a handle read through a pointer holds the descriptor the pointer names
-    var hp: u32 = 0;
-    for (hp < mf.block_count && horigin != nil) {
-        val blk: *mir.MirBlock = ?mf.blocks[hp];
-        var ii:  u32           = 0;
-        for (ii < blk.instr_count) {
-            val mi: *mir.MirInstr = ?blk.instrs[ii];
-            if (pointer_handle_load(?fn_mod(e, fx).types, mf, mi)) { horigin[mi.operands[0].vreg.n] = operand_origin(e, origin, n, ?mi.operands[1]); }
-            ii = ii + 1;
+    # a handle read through a pointer holds the descriptor the pointer names, and a
+    # call's handle result the one its callee returns
+    var hchanged: bool = horigin != nil;
+    for (hchanged) {
+        hchanged = false;
+        var hp: u32 = 0;
+        for (hp < mf.block_count) {
+            val blk: *mir.MirBlock = ?mf.blocks[hp];
+            var ii:  u32           = 0;
+            for (ii < blk.instr_count) {
+                val mi: *mir.MirInstr = ?blk.instrs[ii];
+                ii = ii + 1;
+                var at: u32 = GL_NONE;
+                var d:  u32 = 0;
+                if (pointer_handle_load(?fn_mod(e, fx).types, mf, mi)) {
+                    at = operand_origin(e, origin, n, ?mi.operands[1]);
+                    d  = mi.operands[0].vreg.n;
+                }
+                or (call_handle_result(e, fx, mf, mi)) {
+                    at = call_result_origin(e, fx, mi, n, origin, horigin);
+                    d  = mi.operands[1].vreg.n;
+                }
+                or { cnt; }
+                if (horigin[d] != at) {
+                    horigin[d] = at;
+                    hchanged   = true;
+                }
+            }
+            hp = hp + 1;
         }
-        hp = hp + 1;
+    }
+
+    # what a returned handle names joins the function's return summary
+    var hr: u32 = 0;
+    for (hr < mf.block_count && horigin != nil) {
+        val blk: *mir.MirBlock = ?mf.blocks[hr];
+        hr = hr + 1;
+        if (blk.instr_count == 0) { cnt; }
+        val mi: *mir.MirInstr = ?blk.instrs[blk.instr_count - 1];
+        if (mi.opcode != mir.MIR_RET || mi.operand_count != 1 || !handle_vreg(?fn_mod(e, fx).types, mf, ?mi.operands[0])) { cnt; }
+        val rj: err[fail.Fail] = join_return(e, fx, mi, operand_origin(e, horigin, n, ?mi.operands[0]));
+        if (sel rj.err) { ret rj; }
     }
 
     var bi2: u32 = 0;
@@ -1389,10 +1433,56 @@ fun descriptor_load(e: *Emit, mi: *mir.MirInstr) u32 {
 fun pointer_handle_load(tys: *type.IrTypeTable, mf: *mir.MirFunction, mi: *mir.MirInstr) bool {
     if (mi.opcode != mir.MIR_LOAD || mi.operand_count != 2)                              { ret false; }
     if (mi.operands[1].kind != mir.MIR_OP_MEM && mi.operands[1].kind != mir.MIR_OP_VREG) { ret false; }
-    val d: *mir.MirOperand = ?mi.operands[0];
+    ret handle_vreg(tys, mf, ?mi.operands[0]);
+}
+
+fun handle_vreg(tys: *type.IrTypeTable, mf: *mir.MirFunction, d: *mir.MirOperand) bool {
     if (d.kind != mir.MIR_OP_VREG || d.vreg.n >= mf.vreg_count || mf.vregs[d.vreg.n].ty == mir.VREG_TY_NIL) { ret false; }
     val t: opt[*type.IrType] = type.get(tys, mf.vregs[d.vreg.n].ty);
     ret sel t.some && t.some.kind == type.IRT_HANDLE;
+}
+
+# a call to an emitted function that defines a handle result
+fun call_handle_result(e: *Emit, fx: u32, mf: *mir.MirFunction, mi: *mir.MirInstr) bool {
+    if (mach_callee(e, fx, mi) == FN_NONE) { ret false; }
+    ret handle_vreg(?fn_mod(e, fx).types, mf, ?mi.operands[1]);
+}
+
+# the root of a call's handle result: what its callee returns, through the argument
+# when that is one of its parameters, GL_NONE where the summary names none
+fun call_result_origin(e: *Emit, fx: u32, mi: *mir.MirInstr, n: u32, origin: *u32, horigin: *u32) u32 {
+    val gx: u32 = mach_callee(e, fx, mi);
+    val s:  u32 = e.rsum[gx];
+    if (s == GL_NONE || s == ORIGIN_UNKNOWN) { ret GL_NONE; }
+    if ((s & ORIGIN_PARAM) == 0)             { ret s; }
+    val k: u32 = s & ~ORIGIN_PARAM;
+    if (k + 2 >= mi.operand_count)  { ret GL_NONE; }
+    if (param_is_pointer(e, gx, k)) { ret operand_origin(e, origin, n, ?mi.operands[k + 2]); }
+    ret operand_origin(e, horigin, n, ?mi.operands[k + 2]);
+}
+
+# joins a returned handle's root into the function's summary: a handle that names no
+# root adds none, as it marks none where it is used, and once two roots meet every
+# root returned is read and written, since the caller can no longer tell which it holds
+fun join_return(e: *Emit, fx: u32, mi: *mir.MirInstr, o: u32) err[fail.Fail] {
+    val cur: u32 = e.rsum[fx];
+    if (o == GL_NONE || cur == o) { ret err[fail.Fail].ok{}; }
+    if (cur == GL_NONE) {
+        e.rsum[fx] = o;
+        e.sum_grew = true;
+        ret err[fail.Fail].ok{};
+    }
+    if (cur != ORIGIN_UNKNOWN) {
+        val rc: err[fail.Fail] = mark_origin(e, fx, mi, cur, ACCESS_WRITE | ACCESS_READ);
+        if (sel rc.err) { ret rc; }
+    }
+    val ro: err[fail.Fail] = mark_origin(e, fx, mi, o, ACCESS_WRITE | ACCESS_READ);
+    if (sel ro.err) { ret ro; }
+    if (cur != ORIGIN_UNKNOWN) {
+        e.rsum[fx] = ORIGIN_UNKNOWN;
+        e.sum_grew = true;
+    }
+    ret err[fail.Fail].ok{};
 }
 
 # the instruction row an `op` call assembles, nil for any other instruction
@@ -1463,8 +1553,8 @@ fun mark_origin(e: *Emit, fx: u32, mi: *mir.MirInstr, o: u32, how: u8) err[fail.
     val at: u32 = e.pbase[fx] + (o & ~ORIGIN_PARAM);
     if (e.pacc == nil || at >= e.pacc_len) { ret err[fail.Fail].ok{}; }
     if ((how & ~e.pacc[at]) != 0) {
-        e.pacc[at]  = e.pacc[at] | how;
-        e.pacc_grew = true;
+        e.pacc[at] = e.pacc[at] | how;
+        e.sum_grew = true;
     }
     ret err[fail.Fail].ok{};
 }
