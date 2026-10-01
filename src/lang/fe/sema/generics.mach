@@ -2,6 +2,9 @@ use mach.lang.alloc;
 use mach.lang.build.outcome;
 use dkind: mach.lang.diagnostic.kind;
 use std.allocator.page;
+use std.collections.map;
+use std.collections.vector;
+use std.collections.vector.Vector;
 use std.format;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -185,19 +188,6 @@ fun ensure_fields_inner(g: *GenericOp, tid: type.TypeId) {
     build_instance_table(g, tid, gnom);
 }
 
-fun contains_secret_deep_inner(g: *GenericOp, tid: type.TypeId) bool {
-    val s:      *session.Session = g.s;
-    var scan:   type.TypeScan;
-    val scan_r: err[fail.Fail]   = type.type_scan_begin(?s.types, ?scan);
-    if (sel scan_r.err) {
-        fail.internal(g.status, fail.describe(scan_r.err));
-        ret false;
-    }
-    val found: bool = secret_deep_walk(g, tid, ?scan);
-    type.type_scan_end(?s.types, ?scan);
-    ret found;
-}
-
 # the kinds that carry no secret of their own; false for every other kind,
 # which the walk descends (a partition, enumerated by its test)
 fun kind_is_public_leaf(k: type.TypeKind) bool {
@@ -210,127 +200,247 @@ fun kind_is_public_leaf(k: type.TypeKind) bool {
     ret false;
 }
 
-fun fn_sig_carries_secret(g: *GenericOp, t: *type.Type, scan: *type.TypeScan) bool {
-    val s: *session.Session = g.s;
-    if (secret_deep_walk(g, t.data.fn.ret_type, scan)) { ret true; }
-    var pi: u32 = 0;
-    for (pi < t.data.fn.params_len) {
-        val pp: opt[type.TypeId] = type.get_param(?s.types, t.data.fn.params_start + pi);
-        if (sel pp.some) {
-            if (secret_deep_walk(g, pp.some, scan)) { ret true; }
-        }
-        pi = pi + 1;
-    }
-    ret false;
-}
-
-fun secret_deep_walk(g: *GenericOp, tid: type.TypeId, scan: *type.TypeScan) bool {
-    val s: *session.Session = g.s;
-    if (tid == type.TYPE_NIL || tid == type.TYPE_ERROR) { ret false; }
-
-    val opt_type: opt[*type.Type] = type.get(?s.types, tid);
-    if (!sel opt_type.some) { ret true; }
-    val t: *type.Type = opt_type.some;
-
-    if (t.kind == type.TYPE_SECRET)  { ret true; }
-    if (t.kind == type.TYPE_POINTER) { ret secret_deep_walk(g, t.data.pointer.base, scan); }
-    if (t.kind == type.TYPE_ARRAY)   { ret secret_deep_walk(g, t.data.array.base, scan); }
-    if (t.kind == type.TYPE_FUN)     { ret fn_sig_carries_secret(g, t, scan); }
-
-    if (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI || t.kind == type.TYPE_TAG || t.kind == type.TYPE_INSTANCE) {
-        val mark_r: res[type.VisitMark, fail.Fail] = type.type_scan_mark(?s.types, scan, tid);
-        if (sel mark_r.err) {
-            fail.internal(g.status, fail.describe(mark_r.err));
-            ret true;
-        }
-        val mark: type.VisitMark = mark_r.ok;
-        if (mark == type.VISIT_SEEN) { ret false; }
-
-        if (t.kind == type.TYPE_INSTANCE) { ensure_fields_inner(g, tid); }
-
-        val opt_tab: opt[*type.FieldTable] = type.field_table_for(?s.types, tid);
-        if (!sel opt_tab.some) { ret true; }
-        val fields_len: u32 = opt_tab.some.fields_len;
-
-        var f: u32 = 0;
-        for (f < fields_len) {
-            val opt_e: opt[*type.FieldEntry] = type.field_at(?s.types, tid, f);
-            if (sel opt_e.some) {
-                if (secret_deep_walk(g, opt_e.some.ty, scan)) { ret true; }
-            }
-            f = f + 1;
-        }
-        ret false;
-    }
-
-    if (kind_is_public_leaf(t.kind)) { ret false; }
-    ret true;
+fun contains_secret_deep_inner(g: *GenericOp, tid: type.TypeId) bool {
+    ret deep_query(g, DEEP_SECRET, tid);
 }
 
 fun contains_float_deep_inner(g: *GenericOp, tid: type.TypeId) bool {
-    val s:      *session.Session = g.s;
-    var scan:   type.TypeScan;
-    val scan_r: err[fail.Fail]   = type.type_scan_begin(?s.types, ?scan);
-    if (sel scan_r.err) {
-        fail.internal(g.status, fail.describe(scan_r.err));
-        ret false;
+    ret deep_query(g, DEEP_FLOAT, tid);
+}
+
+# what a deep query looks for anywhere a type reaches, through pointers included
+def DeepProp: u8;
+
+val DEEP_SECRET: DeepProp = 0;
+val DEEP_FLOAT:  DeepProp = 1;
+
+val DEEP_NONE: u32 = 0xFFFFFFFF;
+
+# one nominal's answer over the declaration graph, never the instance graph: a
+# generic reached through a pointer can mint a fresh instance at every level
+# (`rec L[T] { next: *L[*T]; }`), so the instances are unbounded but the
+# declarations are not. `found` is the property reached by the fields on their
+# own, and `reach` lists the owner's parameters the fields reach, so an instance
+# answers `found`, or any reached parameter's argument answering
+rec DeepEntry {
+    nominal: type.TypeId;
+    found:   bool;
+    owned:   bool;
+    owner:   type.GenericOwner;
+    reach:   u32;
+}
+
+rec DeepReach {
+    param: u32;
+    next:  u32;
+}
+
+rec DeepQuery {
+    g:       *GenericOp;
+    prop:    DeepProp;
+    index:   map.Map[type.TypeId, u32];
+    entries: Vector[DeepEntry];
+    reach:   Vector[DeepReach];
+    # a pass changed an answer or met a new nominal, so another pass is owed
+    grew: bool;
+}
+
+# the summaries are a least fixpoint: every answer starts false and only turns
+# true, so passes repeat until one changes nothing, and the root's answer from
+# that pass is final
+fun deep_query(g: *GenericOp, prop: DeepProp, tid: type.TypeId) bool {
+    val s: *session.Session = g.s;
+    var q: DeepQuery;
+    q.g       = g;
+    q.prop    = prop;
+    q.index   = map.init[type.TypeId, u32](s.types.a);
+    q.entries = vector.init[DeepEntry](s.types.a);
+    q.reach   = vector.init[DeepReach](s.types.a);
+    q.grew    = false;
+
+    var found: bool                = true;
+    val room:  res[usize, A.Error] = vector.reserve[DeepEntry](?q.entries, 8);
+    if (sel room.err) { fail.internal(g.status, alloc.text(room.err)); }
+    or {
+        for (true) {
+            q.grew = false;
+            if (deep_eval(?q, tid, DEEP_NONE)) { brk; }
+            var i: usize = 0;
+            for (i < q.entries.len) {
+                deep_settle(?q, i::u32);
+                i = i + 1;
+            }
+            if (sel g.status.kind.internal) { brk; }
+            if (!q.grew) {
+                found = false;
+                brk;
+            }
+        }
     }
-    val found: bool = float_deep_walk(g, tid, ?scan);
-    type.type_scan_end(?s.types, ?scan);
+
+    map.dnit[type.TypeId, u32](?q.index);
+    vector.dnit[DeepEntry](?q.entries);
+    vector.dnit[DeepReach](?q.reach);
     ret found;
 }
 
-fun fn_sig_carries_float(g: *GenericOp, t: *type.Type, scan: *type.TypeScan) bool {
-    val s: *session.Session = g.s;
-    if (float_deep_walk(g, t.data.fn.ret_type, scan)) { ret true; }
-    var pi: u32 = 0;
-    for (pi < t.data.fn.params_len) {
-        val pp: opt[type.TypeId] = type.get_param(?s.types, t.data.fn.params_start + pi);
-        if (sel pp.some) {
-            if (float_deep_walk(g, pp.some, scan)) { ret true; }
+# the summary slot of `nominal`, opened on first sight; DEEP_NONE when out of memory
+fun deep_entry(q: *DeepQuery, nominal: type.TypeId) u32 {
+    val s:    *session.Session = q.g.s;
+    val have: opt[*u32]        = map.get[type.TypeId, u32](?q.index, ?nominal);
+    if (sel have.some) { ret @have.some; }
+
+    var e: DeepEntry;
+    e.nominal = nominal;
+    e.found   = false;
+    e.owned   = false;
+    e.reach   = DEEP_NONE;
+    # a nominal with no field table cannot be shown clear
+    val table: opt[*type.FieldTable] = type.field_table_for(?s.types, nominal);
+    if (!sel table.some) { e.found = true; }
+    or {
+        val of: opt[type.GenericOwner] = nominal_param_owner(q.g, nominal);
+        if (sel of.some) {
+            e.owned = true;
+            e.owner = of.some;
         }
-        pi = pi + 1;
+    }
+    if (sel q.g.status.kind.internal) { ret DEEP_NONE; }
+
+    val ix:     u32                 = q.entries.len::u32;
+    val pushed: res[usize, A.Error] = vector.push[DeepEntry](?q.entries, e);
+    if (sel pushed.err) {
+        fail.internal(q.g.status, alloc.text(pushed.err));
+        ret DEEP_NONE;
+    }
+    val indexed: res[bool, A.Error] = map.insert[type.TypeId, u32](?q.index, nominal, ix);
+    if (sel indexed.err) {
+        fail.internal(q.g.status, alloc.text(indexed.err));
+        ret DEEP_NONE;
+    }
+    q.grew = true;
+    ret ix;
+}
+
+fun deep_reaches(q: *DeepQuery, ix: u32, param: u32) bool {
+    var r: u32 = q.entries.data[ix].reach;
+    for (r != DEEP_NONE) {
+        if (q.reach.data[r].param == param) { ret true; }
+        r = q.reach.data[r].next;
     }
     ret false;
 }
 
-fun float_deep_walk(g: *GenericOp, tid: type.TypeId, scan: *type.TypeScan) bool {
-    val s: *session.Session = g.s;
+fun deep_add_reach(q: *DeepQuery, ix: u32, param: u32) {
+    if (deep_reaches(q, ix, param)) { ret; }
+    var link: DeepReach;
+    link.param = param;
+    link.next  = q.entries.data[ix].reach;
+    val at:     u32                 = q.reach.len::u32;
+    val pushed: res[usize, A.Error] = vector.push[DeepReach](?q.reach, link);
+    if (sel pushed.err) {
+        fail.internal(q.g.status, alloc.text(pushed.err));
+        ret;
+    }
+    q.entries.data[ix].reach = at;
+    q.grew                   = true;
+}
+
+fun deep_settle(q: *DeepQuery, ix: u32) {
+    val s: *session.Session = q.g.s;
+    if (q.entries.data[ix].found) { ret; }
+    val nominal: type.TypeId           = q.entries.data[ix].nominal;
+    val table:   opt[*type.FieldTable] = type.field_table_for(?s.types, nominal);
+    if (!sel table.some) { ret; }
+    val fields_len: u32 = table.some.fields_len;
+
+    var f: u32 = 0;
+    for (f < fields_len) {
+        val entry: opt[*type.FieldEntry] = type.field_at(?s.types, nominal, f);
+        if (sel entry.some && deep_eval(q, entry.some.ty, ix)) {
+            q.entries.data[ix].found = true;
+            q.grew                   = true;
+            ret;
+        }
+        f = f + 1;
+    }
+}
+
+# whether `tid` reaches the property under the current summaries; inside the
+# fields of entry `ctx`, a parameter of its owner is recorded as reached instead
+fun deep_eval(q: *DeepQuery, tid: type.TypeId, ctx: u32) bool {
+    val s: *session.Session = q.g.s;
     if (tid == type.TYPE_NIL || tid == type.TYPE_ERROR) { ret false; }
+    if (sel q.g.status.kind.internal)                   { ret true; }
 
     val opt_type: opt[*type.Type] = type.get(?s.types, tid);
     if (!sel opt_type.some) { ret true; }
     val t: *type.Type = opt_type.some;
 
-    if (type.prim_desc(t.kind).class == type.PRIM_CLASS_FLOAT) { ret true; }
-    if (t.kind == type.TYPE_SECRET)                            { ret float_deep_walk(g, t.data.secret.base, scan); }
-    if (t.kind == type.TYPE_POINTER)                           { ret float_deep_walk(g, t.data.pointer.base, scan); }
-    if (t.kind == type.TYPE_ARRAY)                             { ret float_deep_walk(g, t.data.array.base, scan); }
-    if (t.kind == type.TYPE_VECTOR)                            { ret type.prim_desc(t.data.vector.element).class == type.PRIM_CLASS_FLOAT; }
-    if (t.kind == type.TYPE_FUN)                               { ret fn_sig_carries_float(g, t, scan); }
+    if (q.prop == DEEP_SECRET) {
+        if (t.kind == type.TYPE_SECRET) { ret true; }
+    }
+    or {
+        if (type.prim_desc(t.kind).class == type.PRIM_CLASS_FLOAT) { ret true; }
+        if (t.kind == type.TYPE_SECRET)                            { ret deep_eval(q, t.data.secret.base, ctx); }
+        if (t.kind == type.TYPE_VECTOR)                            { ret type.prim_desc(t.data.vector.element).class == type.PRIM_CLASS_FLOAT; }
+    }
+    if (t.kind == type.TYPE_POINTER) { ret deep_eval(q, t.data.pointer.base, ctx); }
+    if (t.kind == type.TYPE_ARRAY)   { ret deep_eval(q, t.data.array.base, ctx); }
 
-    if (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI || t.kind == type.TYPE_TAG || t.kind == type.TYPE_INSTANCE) {
-        val mark_r: res[type.VisitMark, fail.Fail] = type.type_scan_mark(?s.types, scan, tid);
-        if (sel mark_r.err) {
-            fail.internal(g.status, fail.describe(mark_r.err));
-            ret true;
+    if (t.kind == type.TYPE_FUN) {
+        if (deep_eval(q, t.data.fn.ret_type, ctx)) { ret true; }
+        var pi: u32 = 0;
+        for (pi < t.data.fn.params_len) {
+            val pp: opt[type.TypeId] = type.get_param(?s.types, t.data.fn.params_start + pi);
+            if (sel pp.some && deep_eval(q, pp.some, ctx)) { ret true; }
+            pi = pi + 1;
         }
-        val mark: type.VisitMark = mark_r.ok;
-        if (mark == type.VISIT_SEEN) { ret false; }
+        ret false;
+    }
 
-        if (t.kind == type.TYPE_INSTANCE) { ensure_fields_inner(g, tid); }
+    if (t.kind == type.TYPE_GENERIC_PARAM) {
+        if (ctx != DEEP_NONE && q.entries.data[ctx].owned
+            && type.param_owned_by(?t.data.generic_param, ?q.entries.data[ctx].owner)) {
+            deep_add_reach(q, ctx, t.data.generic_param.index);
+        }
+        ret false;
+    }
 
-        val opt_tab: opt[*type.FieldTable] = type.field_table_for(?s.types, tid);
-        if (!sel opt_tab.some) { ret true; }
-        val fields_len: u32 = opt_tab.some.fields_len;
-
-        var f: u32 = 0;
-        for (f < fields_len) {
-            val opt_e: opt[*type.FieldEntry] = type.field_at(?s.types, tid, f);
-            if (sel opt_e.some) {
-                if (float_deep_walk(g, opt_e.some.ty, scan)) { ret true; }
+    if (t.kind == type.TYPE_INSTANCE) {
+        val ix: u32 = deep_entry(q, t.data.instance.nominal);
+        if (ix == DEEP_NONE)          { ret true; }
+        if (q.entries.data[ix].found) { ret true; }
+        val args_start: u32 = t.data.instance.args_start;
+        val args_len:   u32 = t.data.instance.args_len;
+        var r:          u32 = q.entries.data[ix].reach;
+        for (r != DEEP_NONE) {
+            val param: u32 = q.reach.data[r].param;
+            r = q.reach.data[r].next;
+            if (param < args_len) {
+                val arg: opt[type.TypeId] = type.get_param(?s.types, args_start + param);
+                if (!sel arg.some)               { ret true; }
+                if (deep_eval(q, arg.some, ctx)) { ret true; }
             }
-            f = f + 1;
+        }
+        ret false;
+    }
+
+    # a bare nominal mentioning parameters is an anonymous aggregate inside a
+    # generic: its parameters are the enclosing declaration's, so what it
+    # reaches is reached by the fields that hold it, under that same owner
+    if (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI || t.kind == type.TYPE_TAG) {
+        val ix: u32 = deep_entry(q, tid);
+        if (ix == DEEP_NONE)          { ret true; }
+        if (q.entries.data[ix].found) { ret true; }
+        if (ctx != DEEP_NONE && q.entries.data[ix].owned && q.entries.data[ctx].owned
+            && type.generic_owner_equals(?q.entries.data[ix].owner, ?q.entries.data[ctx].owner)) {
+            var r: u32 = q.entries.data[ix].reach;
+            for (r != DEEP_NONE) {
+                val param: u32 = q.reach.data[r].param;
+                r = q.reach.data[r].next;
+                deep_add_reach(q, ctx, param);
+            }
         }
         ret false;
     }
@@ -446,6 +556,70 @@ rec SecrecyWalk {
     g:    *GenericOp;
     m:    layout.Machine;
     scan: *type.PairScan;
+    # the walk met two pointees it cannot compare, which no answer can settle
+    unbounded: bool;
+}
+
+# how two storages compare on secrecy: they agree, they disagree, or the
+# comparison would follow pointers into an expansive generic, whose instances
+# are unbounded, so it cannot be decided and is refused
+pub def Agreement: u8;
+
+pub val AGREE:       Agreement = 0;
+pub val DISAGREE:    Agreement = 1;
+pub val UNDECIDABLE: Agreement = 2;
+
+fun agreement_of(agree: bool, unbounded: bool) Agreement {
+    if (agree)     { ret AGREE; }
+    if (unbounded) { ret UNDECIDABLE; }
+    ret DISAGREE;
+}
+
+# whether `tid` holds, by value, an instance of an expansive generic
+fun holds_expansive(g: *GenericOp, tid: type.TypeId, scan: *type.TypeScan) bool {
+    val s:    *session.Session = g.s;
+    val base: type.TypeId      = type.strip_secret(?s.types, tid);
+    val ot:   opt[*type.Type]  = type.get(?s.types, base);
+    if (!sel ot.some) { ret false; }
+    val t: *type.Type = ot.some;
+    if (t.kind == type.TYPE_ARRAY)                                                                                     { ret holds_expansive(g, t.data.array.base, scan); }
+    if (t.kind != type.TYPE_REC && t.kind != type.TYPE_UNI && t.kind != type.TYPE_TAG && t.kind != type.TYPE_INSTANCE) { ret false; }
+    val mark: res[type.VisitMark, fail.Fail] = type.type_scan_mark(?s.types, scan, base);
+    if (sel mark.err) {
+        fail.internal(g.status, fail.describe(mark.err));
+        ret true;
+    }
+    if (mark.ok == type.VISIT_SEEN) { ret false; }
+    if (t.kind == type.TYPE_INSTANCE) {
+        if (nominal_expansive(g, t.data.instance.nominal)) { ret true; }
+        ensure_fields_inner(g, base);
+    }
+    val n: u32 = type.field_count(?s.types, base);
+    var i: u32 = 0;
+    for (i < n) {
+        val fe: opt[*type.FieldEntry] = type.field_at(?s.types, base, i);
+        if (sel fe.some && holds_expansive(g, fe.some.ty, scan)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# a pointee pair the walk can compare: equal ones need no walk, and distinct ones
+# holding an expansive instance would mint a fresh pair below every pointer
+fun pointees_bounded(w: *SecrecyWalk, a: type.TypeId, b: type.TypeId) bool {
+    val g: *GenericOp       = w.g;
+    val s: *session.Session = g.s;
+    if (a == b) { ret true; }
+    var scan:   type.TypeScan;
+    val opened: err[fail.Fail] = type.type_scan_begin(?s.types, ?scan);
+    if (sel opened.err) {
+        fail.internal(g.status, fail.describe(opened.err));
+        ret false;
+    }
+    val holds: bool = holds_expansive(g, a, ?scan) || holds_expansive(g, b, ?scan);
+    type.type_scan_end(?s.types, ?scan);
+    if (holds) { w.unbounded = true; }
+    ret !holds;
 }
 
 fun data_run(start: u32, end: u32, secret: bool) SecrecyRun {
@@ -614,6 +788,7 @@ fun pointer_leaves_equal(w: *SecrecyWalk, a: type.TypeId, b: type.TypeId) bool {
     val tb: *type.Type = ob.some;
 
     if (ta.kind == type.TYPE_POINTER && tb.kind == type.TYPE_POINTER) {
+        if (!pointees_bounded(w, ta.data.pointer.base, tb.data.pointer.base)) { ret false; }
         ret storage_equal(w, ta.data.pointer.base, tb.data.pointer.base);
     }
     if (ta.kind == type.TYPE_FUN && tb.kind == type.TYPE_FUN) {
@@ -637,6 +812,7 @@ fun storage_equal(w: *SecrecyWalk, a: type.TypeId, b: type.TypeId) bool {
     val g: *GenericOp       = w.g;
     val s: *session.Session = g.s;
     if (a == type.TYPE_NIL || b == type.TYPE_NIL)                               { ret a == b; }
+    if (a == b)                                                                 { ret true; }
     if (!contains_secret_deep_inner(g, a) && !contains_secret_deep_inner(g, b)) { ret true; }
 
     val mark_r: res[type.VisitMark, fail.Fail] = type.pair_scan_mark(?s.types, w.scan, a, b);
@@ -710,7 +886,7 @@ fun is_data_leaf(g: *GenericOp, tid: type.TypeId) bool {
     ret n.kind == layout.NODE_SCALAR || n.kind == layout.NODE_VECTOR;
 }
 
-fun secrecy_cast_allowed_inner(g: *GenericOp, m: layout.Machine, from: type.TypeId, to: type.TypeId) bool {
+fun secrecy_cast_allowed_inner(g: *GenericOp, m: layout.Machine, from: type.TypeId, to: type.TypeId, unbounded: *bool) bool {
     val s: *session.Session = g.s;
     if (!contains_secret_deep_inner(g, from) && !contains_secret_deep_inner(g, to)) { ret true; }
 
@@ -720,7 +896,7 @@ fun secrecy_cast_allowed_inner(g: *GenericOp, m: layout.Machine, from: type.Type
         fail.internal(g.status, fail.describe(scan_r.err));
         ret false;
     }
-    var w: SecrecyWalk = SecrecyWalk{g: g, m: m, scan: ?scan};
+    var w: SecrecyWalk = SecrecyWalk{g: g, m: m, scan: ?scan, unbounded: false};
 
     val sf:      type.TypeId     = type.strip_secret(?s.types, from);
     val st:      type.TypeId     = type.strip_secret(?s.types, to);
@@ -742,6 +918,7 @@ fun secrecy_cast_allowed_inner(g: *GenericOp, m: layout.Machine, from: type.Type
         }
     }
     type.pair_scan_end(?s.types, ?scan);
+    @unbounded = w.unbounded;
     ret allowed;
 }
 
@@ -758,7 +935,7 @@ fun overlay_agrees_walk(w: *SecrecyWalk, a: type.TypeId, b: type.TypeId) bool {
 
 # two types laid over one storage from offset 0, as union variants are: every
 # byte both cover has one class on both sides
-fun secrecy_overlay_agrees_inner(g: *GenericOp, m: layout.Machine, a: type.TypeId, b: type.TypeId) bool {
+fun secrecy_overlay_agrees_inner(g: *GenericOp, m: layout.Machine, a: type.TypeId, b: type.TypeId, unbounded: *bool) bool {
     val s: *session.Session = g.s;
     if (!contains_secret_deep_inner(g, a) && !contains_secret_deep_inner(g, b)) { ret true; }
 
@@ -768,9 +945,10 @@ fun secrecy_overlay_agrees_inner(g: *GenericOp, m: layout.Machine, a: type.TypeI
         fail.internal(g.status, fail.describe(scan_r.err));
         ret false;
     }
-    var w:     SecrecyWalk = SecrecyWalk{g: g, m: m, scan: ?scan};
+    var w:     SecrecyWalk = SecrecyWalk{g: g, m: m, scan: ?scan, unbounded: false};
     val agree: bool        = overlay_agrees_walk(?w, a, b);
     type.pair_scan_end(?s.types, ?scan);
+    @unbounded = w.unbounded;
     ret agree;
 }
 
@@ -1212,6 +1390,14 @@ fun uni_inst_walk_instance(sc: *sema.SemaContext, tid: type.TypeId, who: *type.G
         i = i + 1;
     }
 
+    # an expansive generic's instances are unbounded, so the walk cannot visit
+    # them all; it needs to only when a secret and a generic union lie below
+    if (gnom != type.TYPE_ERROR && nominal_expansive(g, gnom)) {
+        if (contains_secret_deep_inner(g, tid) && reaches_generic_union(g, gnom)) { report_unbounded(sc, scan, span); }
+        A.deallocate[type.TypeId](s.alloc, raw, args_len::usize);
+        ret;
+    }
+
     if (gnom == type.TYPE_ERROR) {
         sema.report_internal(sc, span, "internal: #2225 union-secrecy instance walk: generic instance target declaration unavailable (pristine-type invariant violated)");
         A.deallocate[type.TypeId](s.alloc, raw, args_len::usize);
@@ -1304,6 +1490,91 @@ fun uni_inst_walk_nominal(sc: *sema.SemaContext, nom: type.TypeId, args: *type.T
     }
 }
 
+fun report_unbounded(sc: *sema.SemaContext, scan: *UniInstScan, span: token.Span) {
+    if (scan.unprovable_reported) { ret; }
+    scan.unprovable_reported = true;
+    sema.report(sc, dkind.SECRET_VARIANT_UNPROVABLE, span, "constant-time: cannot prove that every generic union this type reaches has variants agreeing on secrecy - it reaches them through a generic whose argument grows through a pointer, so the unions are instantiated unboundedly many ways");
+}
+
+# whether a generic union is reachable from the fields of `nominal`, through any
+# member, element, pointee, parameter, argument or declaration a mention names
+fun reaches_generic_union(g: *GenericOp, nominal: type.TypeId) bool {
+    val s:       *session.Session    = g.s;
+    var pending: Vector[type.TypeId] = vector.init[type.TypeId](s.types.a);
+    var scan:    type.TypeScan;
+    val opened:  err[fail.Fail]      = type.type_scan_begin(?s.types, ?scan);
+    if (sel opened.err) {
+        fail.internal(g.status, fail.describe(opened.err));
+        ret true;
+    }
+    fin {
+        type.type_scan_end(?s.types, ?scan);
+        vector.dnit[type.TypeId](?pending);
+    }
+    if (!union_walk_push(g, ?pending, ?scan, nominal)) { ret true; }
+
+    var next: usize = 0;
+    for (next < pending.len) {
+        val tid: type.TypeId = pending.data[next];
+        next = next + 1;
+        val ot: opt[*type.Type] = type.get(?s.types, tid);
+        if (sel ot.none) { cnt; }
+        val t:  *type.Type = ot.some;
+        var ok: bool       = true;
+        if (t.kind == type.TYPE_POINTER) { ok = union_walk_push(g, ?pending, ?scan, t.data.pointer.base); }
+        or (t.kind == type.TYPE_ARRAY)   { ok = union_walk_push(g, ?pending, ?scan, t.data.array.base); }
+        or (t.kind == type.TYPE_SECRET)  { ok = union_walk_push(g, ?pending, ?scan, t.data.secret.base); }
+        or (t.kind == type.TYPE_FUN) {
+            ok = union_walk_push(g, ?pending, ?scan, t.data.fn.ret_type);
+            var pi: u32 = 0;
+            for (ok && pi < t.data.fn.params_len) {
+                val pp: opt[type.TypeId] = type.get_param(?s.types, t.data.fn.params_start + pi);
+                if (sel pp.some) { ok = union_walk_push(g, ?pending, ?scan, pp.some); }
+                pi = pi + 1;
+            }
+        }
+        or (t.kind == type.TYPE_INSTANCE) {
+            ok = union_walk_push(g, ?pending, ?scan, t.data.instance.nominal);
+            var ai: u32 = 0;
+            for (ok && ai < t.data.instance.args_len) {
+                val arg: opt[type.TypeId] = type.get_param(?s.types, t.data.instance.args_start + ai);
+                if (sel arg.some) { ok = union_walk_push(g, ?pending, ?scan, arg.some); }
+                ai = ai + 1;
+            }
+        }
+        or (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI || t.kind == type.TYPE_TAG) {
+            if (t.kind == type.TYPE_UNI && nominal_has_gparam(g, tid)) { ret true; }
+            val table: opt[*type.FieldTable] = type.field_table_for(?s.types, tid);
+            if (sel table.none) { ret true; }
+            var f: u32 = 0;
+            for (ok && f < table.some.fields_len) {
+                val entry: opt[*type.FieldEntry] = type.field_at(?s.types, tid, f);
+                if (sel entry.some) { ok = union_walk_push(g, ?pending, ?scan, entry.some.ty); }
+                f = f + 1;
+            }
+        }
+        if (!ok) { ret true; }
+    }
+    ret false;
+}
+
+fun union_walk_push(g: *GenericOp, pending: *Vector[type.TypeId], scan: *type.TypeScan, tid: type.TypeId) bool {
+    val s: *session.Session = g.s;
+    if (tid == type.TYPE_NIL || tid == type.TYPE_ERROR) { ret true; }
+    val mark: res[type.VisitMark, fail.Fail] = type.type_scan_mark(?s.types, scan, tid);
+    if (sel mark.err) {
+        fail.internal(g.status, fail.describe(mark.err));
+        ret false;
+    }
+    if (mark.ok == type.VISIT_SEEN) { ret true; }
+    val pushed: res[usize, A.Error] = vector.push[type.TypeId](pending, tid);
+    if (sel pushed.err) {
+        fail.internal(g.status, alloc.text(pushed.err));
+        ret false;
+    }
+    ret true;
+}
+
 fun report_unprovable(sc: *sema.SemaContext, scan: *UniInstScan, span: token.Span) {
     if (scan.unprovable_reported) { ret; }
     scan.unprovable_reported = true;
@@ -1346,8 +1617,15 @@ fun check_uni_variants(sc: *sema.SemaContext, nom: type.TypeId, who: *type.Gener
             val vj: opt[type.TypeId] = uni_variant(g, nom, j, who, args, arg_len);
             if (sel vi.some) {
                 if (sel vj.some) {
-                    val agree: bool = secrecy_overlay_agrees_inner(g, sema.machine_of(sc), vj.some, vi.some);
+                    var unbounded: bool = false;
+                    val agree:     bool = secrecy_overlay_agrees_inner(g, sema.machine_of(sc), vj.some, vi.some, ?unbounded);
                     if (sel g.status.kind.internal) { ret; }
+                    if (!agree && unbounded) {
+                        if (sema.uni_report_mark(sc.uni_reports, key)) {
+                            sema.report(sc, dkind.SECRET_VARIANT_UNPROVABLE, span, UNBOUNDED_VARIANTS_MSG);
+                        }
+                        ret;
+                    }
                     if (!agree) {
                         if (sema.uni_report_mark(sc.uni_reports, key)) {
                             sema.report(sc, dkind.SECRET_VARIANT_MISMATCH, span, "union variants must agree on secrecy: this instantiation makes overlapping fields part secret `^` and part public, which would alias the same storage at two classifications");
@@ -1961,26 +2239,31 @@ pub fun type_field_offset(s: *session.Session, m: layout.Machine, tid: type.Type
 }
 
 # whether a `::` or `:~` from `from` to `to` keeps every byte's secrecy class
-pub fun secrecy_cast_allowed(s: *session.Session, m: layout.Machine, from: type.TypeId, to: type.TypeId) res[bool, fail.Fail] {
-    var status: fail.PhaseStatus = fail.accepted();
-    var op:     GenericOp;
+pub fun secrecy_cast_allowed(s: *session.Session, m: layout.Machine, from: type.TypeId, to: type.TypeId) res[Agreement, fail.Fail] {
+    var status:    fail.PhaseStatus = fail.accepted();
+    var op:        GenericOp;
+    var unbounded: bool             = false;
     op.s      = s;
     op.status = ?status;
-    val value: bool = secrecy_cast_allowed_inner(?op, m, from, to);
-    if (sel status.kind.internal) { ret res[bool, fail.Fail].err{fail.message(status.kind.internal)}; }
-    ret res[bool, fail.Fail].ok{value};
+    val value: bool = secrecy_cast_allowed_inner(?op, m, from, to, ?unbounded);
+    if (sel status.kind.internal) { ret res[Agreement, fail.Fail].err{fail.message(status.kind.internal)}; }
+    ret res[Agreement, fail.Fail].ok{agreement_of(value, unbounded)};
 }
 
 # whether two union variants overlaying one storage agree on every byte they share
-pub fun secrecy_overlay_agrees(s: *session.Session, m: layout.Machine, a: type.TypeId, b: type.TypeId) res[bool, fail.Fail] {
-    var status: fail.PhaseStatus = fail.accepted();
-    var op:     GenericOp;
+pub fun secrecy_overlay_agrees(s: *session.Session, m: layout.Machine, a: type.TypeId, b: type.TypeId) res[Agreement, fail.Fail] {
+    var status:    fail.PhaseStatus = fail.accepted();
+    var op:        GenericOp;
+    var unbounded: bool             = false;
     op.s      = s;
     op.status = ?status;
-    val value: bool = secrecy_overlay_agrees_inner(?op, m, a, b);
-    if (sel status.kind.internal) { ret res[bool, fail.Fail].err{fail.message(status.kind.internal)}; }
-    ret res[bool, fail.Fail].ok{value};
+    val value: bool = secrecy_overlay_agrees_inner(?op, m, a, b, ?unbounded);
+    if (sel status.kind.internal) { ret res[Agreement, fail.Fail].err{fail.message(status.kind.internal)}; }
+    ret res[Agreement, fail.Fail].ok{agreement_of(value, unbounded)};
 }
+
+pub val UNBOUNDED_VARIANTS_MSG: str = "union variants: cannot prove that overlapping fields agree on secrecy - they point into a generic whose argument grows through a pointer, which has unboundedly many instances, so the storage below the pointers cannot be compared";
+pub val UNBOUNDED_CAST_MSG:     str = "cast: cannot prove that the two types agree on secrecy - they point into a generic whose argument grows through a pointer, which has unboundedly many instances, so the storage below the pointers cannot be compared";
 
 pub fun module_reaches_secret(s: *session.Session, resolved: *type.TypeId, len: u32) res[bool, fail.Fail] {
     var status: fail.PhaseStatus = fail.accepted();
@@ -2062,4 +2345,570 @@ test kind_is_public_leaf__partition_typekind {
         i = i + 1;
     }
     ret 0;
+}
+
+# the instantiation graph over declarations: a node is one parameter of one
+# generic, and an edge says that parameter flows into an argument of a generic
+# its fields mention. An edge grows when the argument wraps the parameter
+# (`L[*T]` in `L[T]`) rather than being it, `^T` included as the parameter
+# itself since `^` is idempotent. A cycle with a growing edge mints a fresh
+# instance at every trip, so its generics have unboundedly many instances
+rec ExpEdge {
+    from:  u32;
+    to:    u32;
+    grows: bool;
+}
+
+rec ExpGraph {
+    g:     *GenericOp;
+    key:   map.Map[u64, u32];
+    nodes: Vector[type.TypeId];
+    edges: Vector[ExpEdge];
+    # the generics whose fields the graph holds, in the order they were met
+    found: map.Map[type.TypeId, bool];
+    work:  Vector[type.TypeId];
+    occ:   Vector[u32];
+    # a generic met had no field table, so its edges are unknown
+    incomplete: bool;
+}
+
+fun exp_init(g: *GenericOp) ExpGraph {
+    val s: *session.Session = g.s;
+    var x: ExpGraph;
+    x.g          = g;
+    x.key        = map.init[u64, u32](s.types.a);
+    x.nodes      = vector.init[type.TypeId](s.types.a);
+    x.edges      = vector.init[ExpEdge](s.types.a);
+    x.found      = map.init[type.TypeId, bool](s.types.a);
+    x.work       = vector.init[type.TypeId](s.types.a);
+    x.occ        = vector.init[u32](s.types.a);
+    x.incomplete = false;
+    ret x;
+}
+
+fun exp_dnit(x: *ExpGraph) {
+    map.dnit[u64, u32](?x.key);
+    vector.dnit[type.TypeId](?x.nodes);
+    vector.dnit[ExpEdge](?x.edges);
+    map.dnit[type.TypeId, bool](?x.found);
+    vector.dnit[type.TypeId](?x.work);
+    vector.dnit[u32](?x.occ);
+}
+
+fun exp_enqueue(x: *ExpGraph, body: type.TypeId) {
+    val seen: opt[*bool] = map.get[type.TypeId, bool](?x.found, ?body);
+    if (sel seen.some) { ret; }
+    val put: res[bool, A.Error] = map.insert[type.TypeId, bool](?x.found, body, true);
+    if (sel put.err) {
+        fail.internal(x.g.status, alloc.text(put.err));
+        ret;
+    }
+    val pushed: res[usize, A.Error] = vector.push[type.TypeId](?x.work, body);
+    if (sel pushed.err) { fail.internal(x.g.status, alloc.text(pushed.err)); }
+}
+
+fun exp_node(x: *ExpGraph, nominal: type.TypeId, param: u32) u32 {
+    val k:    u64       = (nominal::u64 << 32) | param::u64;
+    val have: opt[*u32] = map.get[u64, u32](?x.key, ?k);
+    if (sel have.some) { ret @have.some; }
+    val ix:     u32                 = x.nodes.len::u32;
+    val pushed: res[usize, A.Error] = vector.push[type.TypeId](?x.nodes, nominal);
+    if (sel pushed.err) {
+        fail.internal(x.g.status, alloc.text(pushed.err));
+        ret DEEP_NONE;
+    }
+    val put: res[bool, A.Error] = map.insert[u64, u32](?x.key, k, ix);
+    if (sel put.err) {
+        fail.internal(x.g.status, alloc.text(put.err));
+        ret DEEP_NONE;
+    }
+    ret ix;
+}
+
+# the parameters of `owner` that `tid` mentions, appended to x.occ
+fun exp_occurrences(x: *ExpGraph, tid: type.TypeId, owner: *type.GenericOwner, scan: *type.TypeScan) {
+    val s:        *session.Session = x.g.s;
+    val opt_type: opt[*type.Type]  = type.get(?s.types, tid);
+    if (!sel opt_type.some) { ret; }
+    val t: *type.Type = opt_type.some;
+
+    if (t.kind == type.TYPE_GENERIC_PARAM) {
+        if (type.param_owned_by(?t.data.generic_param, owner)) {
+            val pushed: res[usize, A.Error] = vector.push[u32](?x.occ, t.data.generic_param.index);
+            if (sel pushed.err) { fail.internal(x.g.status, alloc.text(pushed.err)); }
+        }
+        ret;
+    }
+    if (t.kind == type.TYPE_POINTER) {
+        exp_occurrences(x, t.data.pointer.base, owner, scan);
+        ret;
+    }
+    if (t.kind == type.TYPE_ARRAY) {
+        exp_occurrences(x, t.data.array.base, owner, scan);
+        ret;
+    }
+    if (t.kind == type.TYPE_SECRET) {
+        exp_occurrences(x, t.data.secret.base, owner, scan);
+        ret;
+    }
+    if (t.kind == type.TYPE_FUN) {
+        exp_occurrences(x, t.data.fn.ret_type, owner, scan);
+        var pi: u32 = 0;
+        for (pi < t.data.fn.params_len) {
+            val pp: opt[type.TypeId] = type.get_param(?s.types, t.data.fn.params_start + pi);
+            if (sel pp.some) { exp_occurrences(x, pp.some, owner, scan); }
+            pi = pi + 1;
+        }
+        ret;
+    }
+    if (t.kind == type.TYPE_INSTANCE) {
+        var i: u32 = 0;
+        for (i < t.data.instance.args_len) {
+            val arg: opt[type.TypeId] = type.get_param(?s.types, t.data.instance.args_start + i);
+            if (sel arg.some) { exp_occurrences(x, arg.some, owner, scan); }
+            i = i + 1;
+        }
+        ret;
+    }
+    if (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI || t.kind == type.TYPE_TAG) {
+        if (!exp_same_owner(x, tid, owner, scan)) { ret; }
+        val table: opt[*type.FieldTable] = type.field_table_for(?s.types, tid);
+        if (!sel table.some) { ret; }
+        var f: u32 = 0;
+        for (f < table.some.fields_len) {
+            val entry: opt[*type.FieldEntry] = type.field_at(?s.types, tid, f);
+            if (sel entry.some) { exp_occurrences(x, entry.some.ty, owner, scan); }
+            f = f + 1;
+        }
+    }
+}
+
+# an anonymous aggregate of `owner`'s body, first seen by this scan
+fun exp_same_owner(x: *ExpGraph, tid: type.TypeId, owner: *type.GenericOwner, scan: *type.TypeScan) bool {
+    val s: *session.Session = x.g.s;
+    if (!nominal_has_gparam(x.g, tid)) { ret false; }
+    val of: opt[type.GenericOwner] = nominal_param_owner(x.g, tid);
+    if (!sel of.some) { ret false; }
+    var who: type.GenericOwner = of.some;
+    if (!type.generic_owner_equals(?who, owner)) { ret false; }
+    val mark: res[type.VisitMark, fail.Fail] = type.type_scan_mark(?s.types, scan, tid);
+    if (sel mark.err) {
+        fail.internal(x.g.status, fail.describe(mark.err));
+        ret false;
+    }
+    ret mark.ok == type.VISIT_FRESH;
+}
+
+# whether `arg` is parameter `param` of `owner` itself, a `^` around it included
+fun exp_is_param(x: *ExpGraph, arg: type.TypeId, owner: *type.GenericOwner, param: u32) bool {
+    val s: *session.Session = x.g.s;
+    val t: opt[*type.Type]  = type.get(?s.types, type.strip_secret(?s.types, arg));
+    if (!sel t.some)                              { ret false; }
+    if (t.some.kind != type.TYPE_GENERIC_PARAM)   { ret false; }
+    if (t.some.data.generic_param.index != param) { ret false; }
+    ret type.param_owned_by(?t.some.data.generic_param, owner);
+}
+
+# the edges out of `body`'s parameters that `tid`, part of its fields, adds
+fun exp_edges(x: *ExpGraph, body: type.TypeId, tid: type.TypeId, owner: *type.GenericOwner, scan: *type.TypeScan) {
+    val s: *session.Session = x.g.s;
+    if (sel x.g.status.kind.internal) { ret; }
+    val opt_type: opt[*type.Type] = type.get(?s.types, tid);
+    if (!sel opt_type.some) { ret; }
+    val t: *type.Type = opt_type.some;
+
+    if (t.kind == type.TYPE_POINTER) {
+        exp_edges(x, body, t.data.pointer.base, owner, scan);
+        ret;
+    }
+    if (t.kind == type.TYPE_ARRAY) {
+        exp_edges(x, body, t.data.array.base, owner, scan);
+        ret;
+    }
+    if (t.kind == type.TYPE_SECRET) {
+        exp_edges(x, body, t.data.secret.base, owner, scan);
+        ret;
+    }
+    if (t.kind == type.TYPE_FUN) {
+        exp_edges(x, body, t.data.fn.ret_type, owner, scan);
+        var pi: u32 = 0;
+        for (pi < t.data.fn.params_len) {
+            val pp: opt[type.TypeId] = type.get_param(?s.types, t.data.fn.params_start + pi);
+            if (sel pp.some) { exp_edges(x, body, pp.some, owner, scan); }
+            pi = pi + 1;
+        }
+        ret;
+    }
+    if (t.kind == type.TYPE_INSTANCE) {
+        val target: type.TypeId = t.data.instance.nominal;
+        var j:      u32         = 0;
+        for (j < t.data.instance.args_len) {
+            val arg: opt[type.TypeId] = type.get_param(?s.types, t.data.instance.args_start + j);
+            if (sel arg.some) {
+                vector.clear[u32](?x.occ);
+                var inner:  type.TypeScan;
+                val opened: err[fail.Fail] = type.type_scan_begin(?s.types, ?inner);
+                if (sel opened.err) {
+                    fail.internal(x.g.status, fail.describe(opened.err));
+                    ret;
+                }
+                exp_occurrences(x, arg.some, owner, ?inner);
+                type.type_scan_end(?s.types, ?inner);
+                var k: usize = 0;
+                for (k < x.occ.len) {
+                    val param: u32 = x.occ.data[k];
+                    var edge:  ExpEdge;
+                    edge.from  = exp_node(x, body, param);
+                    edge.to    = exp_node(x, target, j);
+                    edge.grows = !exp_is_param(x, arg.some, owner, param);
+                    if (edge.from == DEEP_NONE || edge.to == DEEP_NONE) { ret; }
+                    val pushed: res[usize, A.Error] = vector.push[ExpEdge](?x.edges, edge);
+                    if (sel pushed.err) {
+                        fail.internal(x.g.status, alloc.text(pushed.err));
+                        ret;
+                    }
+                    exp_enqueue(x, target);
+                    k = k + 1;
+                }
+                exp_edges(x, body, arg.some, owner, scan);
+            }
+            j = j + 1;
+        }
+        ret;
+    }
+    if (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI || t.kind == type.TYPE_TAG) {
+        if (!exp_same_owner(x, tid, owner, scan)) { ret; }
+        exp_fields(x, body, tid, owner, scan);
+    }
+}
+
+fun exp_fields(x: *ExpGraph, body: type.TypeId, nominal: type.TypeId, owner: *type.GenericOwner, scan: *type.TypeScan) {
+    val s:     *session.Session      = x.g.s;
+    val table: opt[*type.FieldTable] = type.field_table_for(?s.types, nominal);
+    if (!sel table.some) {
+        x.incomplete = true;
+        ret;
+    }
+    var f: u32 = 0;
+    for (f < table.some.fields_len) {
+        val entry: opt[*type.FieldEntry] = type.field_at(?s.types, nominal, f);
+        if (sel entry.some) { exp_edges(x, body, entry.some.ty, owner, scan); }
+        f = f + 1;
+    }
+}
+
+fun exp_push(x: *ExpGraph, v: *Vector[u32], value: u32) bool {
+    val pushed: res[usize, A.Error] = vector.push[u32](v, value);
+    if (sel pushed.err) {
+        fail.internal(x.g.status, alloc.text(pushed.err));
+        ret false;
+    }
+    ret true;
+}
+
+fun exp_push_flag(x: *ExpGraph, v: *Vector[bool]) bool {
+    val pushed: res[usize, A.Error] = vector.push[bool](v, false);
+    if (sel pushed.err) {
+        fail.internal(x.g.status, alloc.text(pushed.err));
+        ret false;
+    }
+    ret true;
+}
+
+# Tarjan's strongly connected components, iteratively; `comp` gets each node's
+# component and the result is the component count
+fun exp_components(x: *ExpGraph, comp: *u32) u32 {
+    val s: *session.Session = x.g.s;
+    val n: u32              = x.nodes.len::u32;
+    val e: u32              = x.edges.len::u32;
+
+    var start: Vector[u32]  = vector.init[u32](s.types.a);
+    var adj:   Vector[u32]  = vector.init[u32](s.types.a);
+    var order: Vector[u32]  = vector.init[u32](s.types.a);
+    var low:   Vector[u32]  = vector.init[u32](s.types.a);
+    var stack: Vector[u32]  = vector.init[u32](s.types.a);
+    var calls: Vector[u32]  = vector.init[u32](s.types.a);
+    var curs:  Vector[u32]  = vector.init[u32](s.types.a);
+    var on:    Vector[bool] = vector.init[bool](s.types.a);
+    fin {
+        vector.dnit[u32](?start);
+        vector.dnit[u32](?adj);
+        vector.dnit[u32](?order);
+        vector.dnit[u32](?low);
+        vector.dnit[u32](?stack);
+        vector.dnit[u32](?calls);
+        vector.dnit[u32](?curs);
+        vector.dnit[bool](?on);
+    }
+
+    var i: u32 = 0;
+    for (i <= n) {
+        if (!exp_push(x, ?start, 0)) { ret 0; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < e) {
+        start.data[x.edges.data[i].from + 1] = start.data[x.edges.data[i].from + 1] + 1;
+        if (!exp_push(x, ?adj, 0)) { ret 0; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < n) {
+        start.data[i + 1] = start.data[i + 1] + start.data[i];
+        if (!exp_push(x, ?order, DEEP_NONE)) { ret 0; }
+        if (!exp_push(x, ?low, 0))           { ret 0; }
+        if (!exp_push(x, ?curs, 0))          { ret 0; }
+        if (!exp_push_flag(x, ?on))          { ret 0; }
+        comp[i] = DEEP_NONE;
+        i       = i + 1;
+    }
+    i = 0;
+    for (i < e) {
+        val from: u32 = x.edges.data[i].from;
+        adj.data[start.data[from] + curs.data[from]] = x.edges.data[i].to;
+        curs.data[from]                              = curs.data[from] + 1;
+        i                                            = i + 1;
+    }
+
+    var counter: u32 = 0;
+    var comps:   u32 = 0;
+    var root:    u32 = 0;
+    for (root < n) {
+        if (order.data[root] != DEEP_NONE) {
+            root = root + 1;
+            cnt;
+        }
+        order.data[root] = counter;
+        low.data[root]   = counter;
+        counter          = counter + 1;
+        curs.data[root]  = start.data[root];
+        on.data[root]    = true;
+        if (!exp_push(x, ?stack, root)) { ret 0; }
+        if (!exp_push(x, ?calls, root)) { ret 0; }
+
+        for (calls.len > 0) {
+            val v: u32 = calls.data[calls.len - 1];
+            if (curs.data[v] < start.data[v + 1]) {
+                val w: u32 = adj.data[curs.data[v]];
+                curs.data[v] = curs.data[v] + 1;
+                if (order.data[w] == DEEP_NONE) {
+                    order.data[w] = counter;
+                    low.data[w]   = counter;
+                    counter       = counter + 1;
+                    curs.data[w]  = start.data[w];
+                    on.data[w]    = true;
+                    if (!exp_push(x, ?stack, w)) { ret 0; }
+                    if (!exp_push(x, ?calls, w)) { ret 0; }
+                }
+                or (on.data[w] && order.data[w] < low.data[v]) {
+                    low.data[v] = order.data[w];
+                }
+                cnt;
+            }
+            calls.len = calls.len - 1;
+            if (calls.len > 0) {
+                val p: u32 = calls.data[calls.len - 1];
+                if (low.data[v] < low.data[p]) { low.data[p] = low.data[v]; }
+            }
+            if (low.data[v] == order.data[v]) {
+                for (true) {
+                    stack.len = stack.len - 1;
+                    val m: u32 = stack.data[stack.len];
+                    on.data[m] = false;
+                    comp[m]    = comps;
+                    if (m == v) { brk; }
+                }
+                comps = comps + 1;
+            }
+        }
+        root = root + 1;
+    }
+    ret comps;
+}
+
+# walks every queued generic's fields, queueing what they flow into, then
+# decides each one met: expansive when one of its parameters sits in a
+# component holding a growing edge. A component is closed under the walk, so
+# each decision is exact; the queue order makes the graph deterministic
+fun exp_analyze(x: *ExpGraph, decided: *Vector[type.TypeId], expansive: *Vector[bool]) {
+    val g: *GenericOp       = x.g;
+    val s: *session.Session = g.s;
+
+    var next: usize = 0;
+    for (next < x.work.len) {
+        val body: type.TypeId            = x.work.data[next];
+        val of:   opt[type.GenericOwner] = nominal_param_owner(g, body);
+        if (sel of.some) {
+            var owner:  type.GenericOwner = of.some;
+            var scan:   type.TypeScan;
+            val opened: err[fail.Fail]    = type.type_scan_begin(?s.types, ?scan);
+            if (sel opened.err) {
+                fail.internal(g.status, fail.describe(opened.err));
+                ret;
+            }
+            exp_fields(x, body, body, ?owner, ?scan);
+            type.type_scan_end(?s.types, ?scan);
+        }
+        or {
+            val table: opt[*type.FieldTable] = type.field_table_for(?s.types, body);
+            if (sel table.none) { x.incomplete = true; }
+        }
+        if (sel g.status.kind.internal) { ret; }
+        next = next + 1;
+    }
+
+    val n:        u32          = x.nodes.len::u32;
+    var grows_of: Vector[bool] = vector.init[bool](s.types.a);
+    var comp_of:  Vector[u32]  = vector.init[u32](s.types.a);
+    fin {
+        vector.dnit[bool](?grows_of);
+        vector.dnit[u32](?comp_of);
+    }
+    var v: u32 = 0;
+    for (v < n) {
+        if (!exp_push(x, ?comp_of, DEEP_NONE)) { ret; }
+        v = v + 1;
+    }
+    var comps: u32 = 0;
+    if (n > 0)                      { comps = exp_components(x, comp_of.data); }
+    if (sel g.status.kind.internal) { ret; }
+    var c: u32 = 0;
+    for (c < comps) {
+        if (!exp_push_flag(x, ?grows_of)) { ret; }
+        c = c + 1;
+    }
+    var i: usize = 0;
+    for (i < x.edges.len) {
+        val edge: *ExpEdge = ?x.edges.data[i];
+        if (edge.grows && comp_of.data[edge.from] == comp_of.data[edge.to]) { grows_of.data[comp_of.data[edge.from]] = true; }
+        i = i + 1;
+    }
+
+    var b: usize = 0;
+    for (b < x.work.len) {
+        val pushed: res[usize, A.Error] = vector.push[type.TypeId](decided, x.work.data[b]);
+        if (sel pushed.err) {
+            fail.internal(g.status, alloc.text(pushed.err));
+            ret;
+        }
+        val flagged: res[usize, A.Error] = vector.push[bool](expansive, false);
+        if (sel flagged.err) {
+            fail.internal(g.status, alloc.text(flagged.err));
+            ret;
+        }
+        b = b + 1;
+    }
+    var w: u32 = 0;
+    for (w < n) {
+        if (grows_of.data[comp_of.data[w]]) {
+            var d: usize = 0;
+            for (d < decided.len) {
+                if (decided.data[d] == x.nodes.data[w]) { expansive.data[d] = true; }
+                d = d + 1;
+            }
+        }
+        w = w + 1;
+    }
+}
+
+fun exp_record(g: *GenericOp, decided: *Vector[type.TypeId], expansive: *Vector[bool]) {
+    val s: *session.Session = g.s;
+    var d: usize            = 0;
+    for (d < decided.len) {
+        val put: err[fail.Fail] = type.expansive_decide(?s.types, decided.data[d], expansive.data[d]);
+        if (sel put.err) {
+            fail.internal(g.status, fail.describe(put.err));
+            ret;
+        }
+        d = d + 1;
+    }
+}
+
+# whether generic nominal `nominal` lies on an instantiation cycle that grows an
+# argument, so it has unboundedly many instances; true when that cannot be shown
+# either way
+fun nominal_expansive(g: *GenericOp, nominal: type.TypeId) bool {
+    val s:     *session.Session = g.s;
+    val prior: opt[bool]        = type.expansive_decided(?s.types, nominal);
+    if (sel prior.some) { ret prior.some; }
+
+    var x:         ExpGraph            = exp_init(g);
+    var decided:   Vector[type.TypeId] = vector.init[type.TypeId](s.types.a);
+    var expansive: Vector[bool]        = vector.init[bool](s.types.a);
+    fin {
+        exp_dnit(?x);
+        vector.dnit[type.TypeId](?decided);
+        vector.dnit[bool](?expansive);
+    }
+    exp_enqueue(?x, nominal);
+    exp_analyze(?x, ?decided, ?expansive);
+    if (sel g.status.kind.internal) { ret true; }
+    if (x.incomplete)               { ret true; }
+    exp_record(g, ?decided, ?expansive);
+    val now: opt[bool] = type.expansive_decided(?s.types, nominal);
+    if (sel now.some) { ret now.some; }
+    ret true;
+}
+
+fun mark_expansive_inner(g: *GenericOp) {
+    val s:         *session.Session    = g.s;
+    var x:         ExpGraph            = exp_init(g);
+    var decided:   Vector[type.TypeId] = vector.init[type.TypeId](s.types.a);
+    var expansive: Vector[bool]        = vector.init[bool](s.types.a);
+    fin {
+        exp_dnit(?x);
+        vector.dnit[type.TypeId](?decided);
+        vector.dnit[bool](?expansive);
+    }
+    # every generic mention is an interned instance, so the instances name every
+    # generic whose instances could grow
+    val count: u32 = type.type_count(?s.types);
+    var tid:   u32 = 0;
+    for (tid < count) {
+        val t:    opt[*type.Type] = type.get(?s.types, tid::type.TypeId);
+        var body: type.TypeId     = type.TYPE_NIL;
+        if (sel t.some) {
+            if (t.some.kind == type.TYPE_INSTANCE) { body = t.some.data.instance.nominal; }
+        }
+        if (body != type.TYPE_NIL) {
+            val prior: opt[bool] = type.expansive_decided(?s.types, body);
+            if (sel prior.none) { exp_enqueue(?x, body); }
+        }
+        if (sel g.status.kind.internal) { ret; }
+        tid = tid + 1;
+    }
+    exp_analyze(?x, ?decided, ?expansive);
+    if (sel g.status.kind.internal) { ret; }
+    exp_record(g, ?decided, ?expansive);
+    if (sel g.status.kind.internal) { ret; }
+    type.expansive_sweep_done(?s.types);
+}
+
+# whether `tid` holds, by value, an instance of a generic whose argument grows
+# through a pointer, so its instances are unbounded
+pub fun holds_expansive_instance(s: *session.Session, tid: type.TypeId) res[bool, fail.Fail] {
+    var status: fail.PhaseStatus = fail.accepted();
+    var op:     GenericOp;
+    op.s      = s;
+    op.status = ?status;
+    var scan:   type.TypeScan;
+    val opened: err[fail.Fail] = type.type_scan_begin(?s.types, ?scan);
+    if (sel opened.err) { ret res[bool, fail.Fail].err{opened.err}; }
+    val holds: bool = holds_expansive(?op, tid, ?scan);
+    type.type_scan_end(?s.types, ?scan);
+    if (sel status.kind.internal) { ret res[bool, fail.Fail].err{fail.message(status.kind.internal)}; }
+    ret res[bool, fail.Fail].ok{holds};
+}
+
+# decides every generic the program instantiates (see ExpGraph) and records the
+# decisions on the type store, for a consumer that follows pointers to cut at
+# the expansive ones
+pub fun mark_expansive(s: *session.Session) err[fail.Fail] {
+    var status: fail.PhaseStatus = fail.accepted();
+    var op:     GenericOp;
+    op.s      = s;
+    op.status = ?status;
+    mark_expansive_inner(?op);
+    if (sel status.kind.internal) { ret err[fail.Fail].err{fail.message(status.kind.internal)}; }
+    ret err[fail.Fail].ok{};
 }
