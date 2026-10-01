@@ -209,6 +209,16 @@ pub val TYPE_F16: TypeKind = 27
 
 IEEE binary16, appended like the 128-bit integers (#3798)
 
+## val TYPE_KIND_COUNT
+
+```mach
+pub val TYPE_KIND_COUNT: u32 = TYPE_F16::u32 + 1
+```
+
+one past the last kind, so an appended kind takes over this reference. the
+type table refuses a kind at or past it, so a walker over 0..TYPE_KIND_COUNT
+meets every kind a type can carry
+
 ## def PrimClass
 
 ```mach
@@ -312,6 +322,14 @@ pub rec TypeAbi;
 ```mach
 pub val ABI_TYPE_VA_LIST: u32 = 0
 ```
+
+## fun abi_type_c_name
+
+```mach
+pub fun abi_type_c_name(tag: u32) opt[str];
+```
+
+the C type an ABI type tag stands for, absent for a tag outside the catalog
 
 ## rec VecShape
 
@@ -874,6 +892,23 @@ pub fun handle_in_array(ti: *TypeInterner, tid: TypeId) bool;
 ```
 
 an array whose elements carry a handle, reached directly or through a pointer or secret
+
+## fun handle_pointer_pointer
+
+```mach
+pub fun handle_pointer_pointer(ti: *TypeInterner, tid: TypeId) bool;
+```
+
+a pointer to a pointer to a handle, through any secret: the innermost double indirection
+of every deeper one, so a chain of pointers over a handle matches at exactly one level
+
+## fun has_handle_pointer_pointer
+
+```mach
+pub fun has_handle_pointer_pointer(ti: *TypeInterner, tid: TypeId) bool;
+```
+
+a pointer to a pointer to a handle anywhere under the pointers, arrays and secrets of a type
 
 ## fun intern_abi_type
 
