@@ -70,8 +70,9 @@ table and the conditions are in
 
 `+ - * /` on `f16` give the correctly rounded binary16 result, to nearest with
 ties to even, on every target. `%` is the truncated remainder of the other float
-widths, computed on the operands' exact binary64 widening; the remainder of two
-`f16` values is itself an `f16`, so narrowing it back does not round. Unary `-`
+widths, computed on the operands' exact widening to the format the operation
+runs in; the remainder of two `f16` values is itself an `f16`, so narrowing it
+back does not round. Unary `-`
 flips the sign bit, and a comparison relates the exact values, against an `f16`
 or any other float width ([Comparison](#comparison)). No operator is added or
 removed for the width, and a secret `f16` operand is refused in each of them as
@@ -108,7 +109,7 @@ never a call:
 | riscv with `zfhmin` | binary32 through `fcvt.s.h` and `fcvt.h.s` | binary32 through `fcvt.s.h` |
 | riscv with `zfh` | native (`fadd.h`, `fsub.h`, `fmul.h`, `fdiv.h`) | native (`feq.h`, `flt.h`, `fle.h`) |
 | spirv with `float16` | native, the core float instructions on `OpTypeFloat 16` | native |
-| spirv without `float16` | binary64, the conversions inline | binary64, the widening inline |
+| spirv without `float16` | binary32, the conversions inline | binary32, the widening inline |
 
 aarch64 without `fp16` computes in binary64 even though `fcvt` converts to
 binary32, because that conversion quiets a signaling operand and the half unit
