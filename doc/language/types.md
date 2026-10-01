@@ -521,7 +521,11 @@ pointers, like `Node` above, is a recursive type, and so is a set of records tha
 reach each other. A tag cannot sit behind a physical pointer.
 
 Every load and store through a physical pointer carries the pointee's alignment, so
-an address made from an integer must be aligned for the type it points at. Every
+an address made from an integer must be aligned for the type it points at. An atomic
+through one takes no memory operands, so it carries no alignment of its own either,
+and the semantics passed to it name its memory `UniformMemory`, as on a storage buffer. A
+64-bit or float atomic needs the `buffer_*` feature of its operation (see
+[decorators.md](decorators.md)). Every
 variable and parameter holding one is decorated aliased, since mach makes no
 promise that two pointers do not overlap. Accesses through one are private under
 the Vulkan memory model: no `"coherent"` qualifier reaches device memory.
