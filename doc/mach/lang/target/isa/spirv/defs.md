@@ -30,6 +30,20 @@ pub val SET_CORE_NAME:    str = "core"
 pub val SET_GLSL450_NAME: str = "GLSL.std.450"
 ```
 
+## val GLSL450_PACK_HALF_2X16
+
+```mach
+pub val GLSL450_PACK_HALF_2X16:   u32 = 58
+```
+
+the GLSL.std.450 instructions the emitter itself moves an f16's bits through
+
+## val GLSL450_UNPACK_HALF_2X16
+
+```mach
+pub val GLSL450_UNPACK_HALF_2X16: u32 = 62
+```
+
 ## val CTOR_IMAGE_NAME
 
 ```mach
