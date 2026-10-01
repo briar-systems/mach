@@ -276,7 +276,7 @@ comptime member, `$mach.build.extensions.<name>` (see [`$mach`](comptime-mach.md
 | `x86_64` | SSE2 | `ssse3`, `sse41`, `sse42`, `sha`, `fsgsbase`, `popcnt`, `lzcnt`, `bmi1`, `bmi2`, `cx16`, `avx`, `avx2`, `fma`, `movbe`, `f16c`, `avx512f`, `avx512bw`, `avx512cd`, `avx512dq`, `avx512vl`, `aes`, `pclmul` |
 | `aarch64` | AdvSIMD | `sha2`, `sb`, `aes`, `pmull`, `fp16` |
 | `riscv64`, `riscv32` | the isa string's selection | `i`, `m`, `a`, `f`, `d`, `c`, `zicond`, `zicsr`, `zifencei`, `zfhmin`, `zfh`, `zkt` |
-| `spirv` | | the type device features `float16`, `int8`, `int16`, `int64` and `float64`; `zero_init_workgroup`, `storage_read_without_format`, `storage_write_without_format`, `vulkan_memory_model`, `vulkan_memory_model_device_scope` and `buffer_device_address`, which `vulkan1.3` selects; the subgroup device features `subgroup_arithmetic`, `subgroup_clustered`, `subgroup_vote`, `subgroup_ballot`, `subgroup_shuffle`, `subgroup_shuffle_relative`, `subgroup_quad` and `subgroup_graphics_stages`; the atomic device features `buffer_int64_atomics`, `shared_int64_atomics`, `buffer_float32_atomics`, `buffer_float32_atomic_add`, `buffer_float32_atomic_min_max`, `buffer_float64_atomics`, `buffer_float64_atomic_add`, `buffer_float64_atomic_min_max`, `shared_float32_atomics`, `shared_float32_atomic_add`, `shared_float32_atomic_min_max`, `shared_float64_atomics`, `shared_float64_atomic_add` `shared_float64_atomic_min_max`, `image_int64_atomics`, `image_float32_atomics`, `image_float32_atomic_add` and `image_float32_atomic_min_max` ([decorators.md](decorators.md#optarget-set-name--a-function-that-is-a-target-instruction)); the image device features `storage_image_multisample` ([types.md](types.md#handles)) and the sampling device features `resource_min_lod`, `image_gather_extended` and `maintenance8` ([decorators.md](decorators.md#optarget-set-name--a-function-that-is-a-target-instruction)) |
+| `spirv` | | the type device features `float16`, `int8`, `int16`, `int64` and `float64`; `zero_init_workgroup`, `storage_read_without_format`, `storage_write_without_format`, `vulkan_memory_model`, `vulkan_memory_model_device_scope` and `buffer_device_address`, which `vulkan1.3` selects; the subgroup device features `subgroup_arithmetic`, `subgroup_clustered`, `subgroup_vote`, `subgroup_ballot`, `subgroup_shuffle`, `subgroup_shuffle_relative`, `subgroup_quad` and `subgroup_graphics_stages`; the atomic device features `buffer_int64_atomics`, `shared_int64_atomics`, `buffer_float32_atomics`, `buffer_float32_atomic_add`, `buffer_float32_atomic_min_max`, `buffer_float64_atomics`, `buffer_float64_atomic_add`, `buffer_float64_atomic_min_max`, `shared_float32_atomics`, `shared_float32_atomic_add`, `shared_float32_atomic_min_max`, `shared_float64_atomics`, `shared_float64_atomic_add` `shared_float64_atomic_min_max`, `buffer_float16_atomics`, `buffer_float16_atomic_add`, `buffer_float16_atomic_min_max`, `shared_float16_atomics`, `shared_float16_atomic_add`, `shared_float16_atomic_min_max`, `image_int64_atomics`, `image_float32_atomics`, `image_float32_atomic_add` and `image_float32_atomic_min_max` ([decorators.md](decorators.md#optarget-set-name--a-function-that-is-a-target-instruction)); the image device features `storage_image_multisample` ([types.md](types.md#handles)) and the sampling device features `resource_min_lod`, `image_gather_extended` and `maintenance8` ([decorators.md](decorators.md#optarget-set-name--a-function-that-is-a-target-instruction)); the storage device features `storage_buffer_16bit_access`, `uniform_and_storage_buffer_16bit_access`, `storage_push_constant16`, `storage_input_output16`, `storage_buffer_8bit_access`, `uniform_and_storage_buffer_8bit_access` and `storage_push_constant8` |
 
 A name the selected isa does not hold is refused when the target resolves, with the
 names it does hold:
@@ -677,8 +677,11 @@ without `env` has all five. The ceiling below still bounds them, so `int8` or
 `float16` under `vulkan1.0` is refused for the environment, not the feature.
 
 Under `float16` an `f16` is the native `OpTypeFloat 16`, computed and converted by
-the core float instructions, and a stage input or output of `f16` is declared as
-that type. Without it an `f16` is the software expansion on its 16 bits, which
+the core float instructions, and an `f16` in memory the host or the workgroup shares,
+a stage input or output, a storage buffer, a uniform or push block, a record a
+physical pointer reaches or a `#[shared]` variable, is declared as that type, so an
+atomic can operate on it. A whole record copied between that memory and a local is
+moved member by member where an `f16` is held apart. Without it an `f16` is the software expansion on its 16 bits, which
 computes on 64-bit integers and floats, so under an `env` it needs `int64` and
 `float64`.
 
@@ -687,9 +690,34 @@ Without the feature, an integer of that width is carried, wherever it lives in a
 function, in a 32-bit integer, which needs no capability: a `u8`, `i8`, `u16` or
 `i16` local, and a `bool`, is wrapped and extended at its own width where the
 program can tell. A member of an aggregate or of a vector keeps its declared width,
-as does memory the host shares, so an 8-bit or 16-bit one there needs its feature,
-and the module is refused, naming it, without. Nothing carries a 64-bit type, so a
-module holding a `u64`, `i64` or `f64` anywhere needs `int64` or `float64`.
+so an 8-bit or 16-bit one in a local or in `#[shared]` memory needs its feature, and
+the module is refused, naming it, without. Memory the host shares keeps its width
+too, under the storage feature below rather than `int8` or `int16`, and a load from
+it or a store to it converts to and from the wider integer the function computes in.
+Nothing carries a 64-bit type, so a module holding a `u64`, `i64` or `f64` anywhere
+needs `int64` or `float64`.
+
+An 8- or 16-bit scalar, an `f16` included, in memory the host shares needs Vulkan's
+storage feature for its width and memory, which no environment selects: a target
+names each one its consumer enables, and a target naming no `env` holds them all.
+Each enables the capability of its name, declared with its SPIR-V extension below
+the version that took it into the core.
+
+| Memory | 16-bit | 8-bit |
+|---|---|---|
+| `#[storage(...)]`, or a record a physical pointer reaches | `storage_buffer_16bit_access` (`StorageBuffer16BitAccess`) | `storage_buffer_8bit_access` (`StorageBuffer8BitAccess`) |
+| `#[uniform(...)]` | `uniform_and_storage_buffer_16bit_access` (`UniformAndStorageBuffer16BitAccess`) | `uniform_and_storage_buffer_8bit_access` (`UniformAndStorageBuffer8BitAccess`) |
+| `#[push]` | `storage_push_constant16` (`StoragePushConstant16`) | `storage_push_constant8` (`StoragePushConstant8`) |
+| `#[input(n)]`, `#[output(n)]` | `storage_input_output16` (`StorageInputOutput16`) | refused |
+
+A stage output starts at a zero constant, and a constant of an 8- or 16-bit type
+needs the type's own feature, `int8`, `int16` or `float16`, so an output holding
+one needs that as well as `storage_input_output16`. The 16-bit capabilities need
+`SPV_KHR_16bit_storage` below SPIR-V 1.3 and the 8-bit ones `SPV_KHR_8bit_storage`
+below SPIR-V 1.5. Vulkan defines no 8-bit stage input or
+output, so one is refused, and an 8-bit member of a `#[storage(...)]` buffer is
+refused under `vulkan1.0`, whose storage buffer is a `BufferBlock` in the `Uniform`
+class, which the 8-bit feature does not reach.
 
 ```toml
 [target.gpu]
