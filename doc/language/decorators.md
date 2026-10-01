@@ -1162,6 +1162,11 @@ do to a buffer, checked against the instructions that read and write its texels.
 storage texel buffer, an image of `Dim` `Buffer` with `Sampled` `2`, binds the same
 way, and a uniform texel buffer (`Sampled` `1`) keeps `sampler`. Binding a storage
 image through `sampler`, or any other handle through `storage`, is a compile error.
+A storage image is read and written by `OpImageRead` and `OpImageWrite`, a uniform
+texel buffer or a sampled image is fetched texel by texel by `OpImageFetch`, and
+`OpImageQuerySize`, `OpImageQuerySizeLod`, `OpImageQueryLevels` and
+`OpImageQuerySamples` read an image's descriptor under the `ImageQuery` capability,
+which every Vulkan version accepts.
 
 ```mach fragment
 #[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, STORAGE, FORMAT_RGBA8)]
@@ -1261,6 +1266,30 @@ variable is, on every environment. How depends on the environment:
 Because the value on entry is always zero, a `#[shared]` variable cannot have an
 initializer. Assign it inside the stage.
 
+Whether a variable may carry an **initializer** is settled by its role, since the
+role says who puts the first value in it:
+
+| Role                                             | Initializer | Why                                                   |
+|--------------------------------------------------|-------------|-------------------------------------------------------|
+| `input`, a read built-in                         | refused     | the previous stage or the pipeline supplies the value |
+| `uniform`, `storage`, `sampler`, `push`          | refused     | the host binds or supplies the memory                 |
+| `shared`                                         | refused     | workgroup memory is zero when a stage starts          |
+| `spec`                                           | required    | it is the default the pipeline keeps                  |
+| `output`, a written built-in                     | allowed     | it is the value the variable starts at                |
+
+A refused initializer is a compile error, because the value it writes would never be
+the one the shader sees. An `output` or a written built-in starts at its
+initializer, and at zero without one, as every mach `var` does:
+
+```mach fragment
+#[output(0)] var out_colour: f32x4 = f32x4{0.0, 0.0, 0.0, 1.0};
+#[output(1)] var out_mask:   u32;
+```
+
+On `spirv` the Output `OpVariable` carries that value as its initializer: the
+constant the initializer spells, or `OpConstantNull` where it is zero or absent.
+SPIR-V and Vulkan both admit an initializer on an Output variable.
+
 As with `#[stage(...)]`, these are accepted on every target and acted on only by a
 target that forms pipeline stages. On `spirv` each becomes an `OpVariable` in the
 matching storage class, carrying the matching decoration, and the Input and Output
@@ -1277,7 +1306,7 @@ point that uses it from SPIR-V 1.4.
 A specialization constant is a value the host supplies when it creates the
 pipeline, after the shader has been compiled. It is declared as a module-level
 `var` carrying the constant's id, and its initializer is the default the pipeline
-keeps when the host supplies nothing for that id:
+keeps when the host supplies nothing for that id. The initializer is required:
 
 ```mach
 #[spec(0)]
@@ -1471,6 +1500,43 @@ uniform is not statically decidable in general. The compiler does not check
 it, and a barrier inside a branch or loop that some invocations of the scope
 skip is undefined behavior on the device.
 
+A row may also carry **requirements**: a capability and the extensions of the
+target's vocabulary that every use of it needs. A **literal operand can be
+enumerated**, so that its value is one of a closed set the row names (or, for a
+mask, a union of that set's bits), and each value brings a requirement of its own
+and, where the instruction grows with it, operands at the end of the instruction.
+Such a row has an **optional tail**: a declaration may take its required operands
+alone or the tail too, and each call must pass exactly the operands its literal's
+value brings. `OpGroupNonUniformIAdd` is one:
+
+```mach
+#[op("spirv", "core", "OpGroupNonUniformIAdd")]
+pub fun subgroup_add(scope: u32, operation: u32, v: u32) u32;
+
+#[op("spirv", "core", "OpGroupNonUniformIAdd")]
+pub fun subgroup_cluster_add(scope: u32, operation: u32, v: u32, cluster_size: u32) u32;
+```
+
+Its operation is a `GroupOperation`. `Reduce` (0), `InclusiveScan` (1) and
+`ExclusiveScan` (2) need the `subgroup_arithmetic` extension and declare
+`GroupNonUniformArithmetic`, and `ClusteredReduce` (3) needs `subgroup_clustered`,
+declares `GroupNonUniformClustered` and is followed by the ClusterSize operand, so
+it is passed only to the four-parameter declaration. Each is checked at the call,
+where the literal's value is known:
+
+| At the call                                            | Is refused with                    |
+|--------------------------------------------------------|------------------------------------|
+| a value outside the operand's enumeration              | `op.operand_value`, naming the values |
+| a value whose operands the declaration does not pass, or passes without it | `op.operand_value`, naming the count |
+| a requirement's extension the target does not select   | `spirv.capability`, naming the extension |
+| a capability whose SPIR-V version the environment is below | `spirv.capability`, naming the first `env` that reaches it |
+
+A device feature is an extension the target names in its `extensions` once the
+consumer enables it, since no environment guarantees it: `subgroup_arithmetic` is
+Vulkan's `VK_SUBGROUP_FEATURE_ARITHMETIC_BIT`, and a target naming no `env` holds
+every extension. A module declares a capability only when something it emits needs
+it, with `OpExtension` for a capability a SPIR-V extension defines.
+
 `OpExtInstImport "GLSL.std.450"` is emitted **once per module and only when that
 module uses the set**. A module that calls none of these carries no import.
 
@@ -1487,8 +1553,10 @@ it does, that body is what every non-`spirv` target runs while `spirv` substitut
 the instruction. A `spirv` build never emits the body at all.
 
 The set of accepted instructions is the table in
-`src/lang/target/isa/spirv/defs.mach`, where each row carries its operand kinds and
-its result. Adding an instruction is a row in it.
+`src/lang/target/isa/spirv/defs.mach`, where each row carries its operand kinds, its
+result, its requirements and the enumerations of its literals. The capabilities, with
+the SPIR-V version and extension each needs, are the table in
+`src/lang/target/isa/spirv.mach`. Adding an instruction is a row in it.
 
 ## Applicability
 

@@ -135,13 +135,43 @@ pub val IMAGE_OP_FORMAT:  u32 = 6
 ## val OP_DEF_COUNT
 
 ```mach
-pub val OP_DEF_COUNT:   usize = 47
+pub val OP_DEF_COUNT:   usize = 53
 ```
 
 ## val TYPE_DEF_COUNT
 
 ```mach
 pub val TYPE_DEF_COUNT: usize = 3
+```
+
+## val GROUP_OPERATION_REDUCE
+
+```mach
+pub val GROUP_OPERATION_REDUCE:           u32 = 0
+```
+
+## val GROUP_OPERATION_INCLUSIVE_SCAN
+
+```mach
+pub val GROUP_OPERATION_INCLUSIVE_SCAN:   u32 = 1
+```
+
+## val GROUP_OPERATION_EXCLUSIVE_SCAN
+
+```mach
+pub val GROUP_OPERATION_EXCLUSIVE_SCAN:   u32 = 2
+```
+
+## val GROUP_OPERATION_CLUSTERED_REDUCE
+
+```mach
+pub val GROUP_OPERATION_CLUSTERED_REDUCE: u32 = 3
+```
+
+## val ARITHMETIC_GROUP_OPERATION
+
+```mach
+pub val ARITHMETIC_GROUP_OPERATION: isa.OpEnum = isa.OpEnum;
 ```
 
 ## rec DefStorage

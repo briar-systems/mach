@@ -1460,6 +1460,33 @@ pub val OP_MAX_OPERANDS: u32 = 16
 pub val NO_OP_SPACE: u32 = 0xFFFFFFFF
 ```
 
+## val NO_OP_CAPABILITY
+
+```mach
+pub val NO_OP_CAPABILITY: u32 = 0xFFFFFFFF
+```
+
+## rec OpEnumerant
+
+```mach
+pub rec OpEnumerant;
+```
+
+one value a literal operand may take and what that value brings: the target's
+own capability word it needs (NO_OP_CAPABILITY for none), the extensions of the
+isa's vocabulary that capability needs selected, and how many operands of the
+row's optional tail it adds to the end of the instruction
+
+## rec OpEnum
+
+```mach
+pub rec OpEnum;
+```
+
+the closed set of values a literal operand takes. a value enumeration admits
+exactly one of its values. a mask admits any union of its single-bit values,
+each set bit bringing its own requirement and operands, and 0 is the empty mask
+
 ## rec OpDef
 
 ```mach
@@ -1554,7 +1581,48 @@ a row spelled by its operand signature, one letter per operand in order: `v` a
 value, `c` a constant id, `l` a literal word, `r` a pointer only read through, `w`
 a pointer only stored through, `u` a pointer read and written (read-modify-write),
 `i` a handle whose memory is read, `o` a handle whose memory is written.
-a letter outside the set is an invalid kind, which registration refuses
+the letters after a `|` are the optional tail (`"clv|c"`), present only as far as a
+literal enumerant's value brings them. a letter outside the set is an invalid
+kind, which registration refuses
+
+## fun op_requiring
+
+```mach
+pub fun op_requiring(d: OpDef, capability: u32, requires: u64) OpDef;
+```
+
+`d` needing the target's capability word `capability` and the extensions `requires` on every use
+
+## fun op_enumerated
+
+```mach
+pub fun op_enumerated(d: OpDef, operand: u32, e: *OpEnum) OpDef;
+```
+
+`d` with its literal operand `operand` held to the values of `e`
+
+## fun op_operand_enum
+
+```mach
+pub fun op_operand_enum(d: *OpDef, i: u32) *OpEnum;
+```
+
+## fun op_enumerant_of
+
+```mach
+pub fun op_enumerant_of(e: *OpEnum, value: u32) *OpEnumerant;
+```
+
+the enumerant of `e` whose value is exactly `value`, nil when none is
+
+## fun op_enum_admits
+
+```mach
+pub fun op_enum_admits(e: *OpEnum, value: u32, out_trailing: *u32) bool;
+```
+
+whether `value` is a value of `e`: one of its values, or for a mask a union of its
+bits. `out_trailing` receives the tail operands the value brings
 
 ## fun op_operand_kind
 
