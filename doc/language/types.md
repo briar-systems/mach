@@ -382,6 +382,14 @@ format as `i32` and an unsigned one as `u32`. `R64ui` and `R64i` hold 64-bit tex
 the texel scalar `u64` or `i64`, and declare `Int64ImageEXT`, which needs the
 `image_int64_atomics` extension.
 
+`MS` `1` is a **multisampled** image, which only a `2D` image is, arrayed or not:
+it is refused on `1D`, `3D`, `Cube` and `Buffer`. A multisampled image is never
+sampled, so a `sampled_image` cannot compose over one, and its texels are read per
+sample with the `Sample` image operand (see [decorators.md](decorators.md)). A
+multisampled sampled image needs no capability. A multisampled storage image
+declares `StorageImageMultisample`, and an arrayed one `ImageMSArray` too, under
+the `storage_image_multisample` extension.
+
 The operands are ordinary comptime constants. One position is not: a constructor
 that composes over another handle takes a **type name**, so `Sampler2D` names the
 image it wraps rather than restating that image's operands and cannot disagree with

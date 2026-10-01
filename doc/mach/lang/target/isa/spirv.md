@@ -1096,6 +1096,12 @@ pub val CAP_INT16:   u32 = 22
 pub val CAP_INT8:    u32 = 39
 ```
 
+## val CAP_STORAGE_IMAGE_MULTISAMPLE
+
+```mach
+pub val CAP_STORAGE_IMAGE_MULTISAMPLE:      u32 = 27
+```
+
 ## val CAP_IMAGE_CUBE_ARRAY
 
 ```mach
@@ -1130,6 +1136,12 @@ pub val CAP_SAMPLED_BUFFER:                 u32 = 46
 
 ```mach
 pub val CAP_IMAGE_BUFFER:                   u32 = 47
+```
+
+## val CAP_IMAGE_MS_ARRAY
+
+```mach
+pub val CAP_IMAGE_MS_ARRAY:                 u32 = 48
 ```
 
 ## val CAP_STORAGE_IMAGE_EXTENDED_FORMATS
@@ -1397,43 +1409,55 @@ pub val NEED_GROUP_NON_UNIFORM_QUAD:             u64 = 0x400000
 ## val NEED_INT64_ATOMICS
 
 ```mach
-pub val NEED_INT64_ATOMICS:          u64 = 0x800000
+pub val NEED_INT64_ATOMICS:             u64 = 0x800000
 ```
 
 ## val NEED_ATOMIC_FLOAT32_ADD
 
 ```mach
-pub val NEED_ATOMIC_FLOAT32_ADD:     u64 = 0x1000000
+pub val NEED_ATOMIC_FLOAT32_ADD:        u64 = 0x1000000
 ```
 
 ## val NEED_ATOMIC_FLOAT64_ADD
 
 ```mach
-pub val NEED_ATOMIC_FLOAT64_ADD:     u64 = 0x2000000
+pub val NEED_ATOMIC_FLOAT64_ADD:        u64 = 0x2000000
 ```
 
 ## val NEED_ATOMIC_FLOAT32_MIN_MAX
 
 ```mach
-pub val NEED_ATOMIC_FLOAT32_MIN_MAX: u64 = 0x4000000
+pub val NEED_ATOMIC_FLOAT32_MIN_MAX:    u64 = 0x4000000
 ```
 
 ## val NEED_ATOMIC_FLOAT64_MIN_MAX
 
 ```mach
-pub val NEED_ATOMIC_FLOAT64_MIN_MAX: u64 = 0x8000000
+pub val NEED_ATOMIC_FLOAT64_MIN_MAX:    u64 = 0x8000000
+```
+
+## val NEED_STORAGE_IMAGE_MULTISAMPLE
+
+```mach
+pub val NEED_STORAGE_IMAGE_MULTISAMPLE: u64 = 0x10000000
+```
+
+## val NEED_IMAGE_MS_ARRAY
+
+```mach
+pub val NEED_IMAGE_MS_ARRAY:            u64 = 0x20000000
 ```
 
 ## val NEED_INT64_IMAGE
 
 ```mach
-pub val NEED_INT64_IMAGE:            u64 = 0x10000000
+pub val NEED_INT64_IMAGE:               u64 = 0x40000000
 ```
 
 ## val CAPABILITY_COUNT
 
 ```mach
-pub val CAPABILITY_COUNT: u32 = 29
+pub val CAPABILITY_COUNT: u32 = 31
 ```
 
 ## val SPV_EXT_ATOMIC_FLOAT_ADD
@@ -1534,7 +1558,9 @@ subgroup_graphics_stages is subgroupSupportedStages reaching the vertex and
 fragment stages, where Vulkan guarantees only compute. storage_read_without_format and
 storage_write_without_format are the shaderStorageImageReadWithoutFormat and
 shaderStorageImageWriteWithoutFormat features, so a storage image of Unknown
-format may be read or written (#4272)
+format may be read or written (#4272). storage_image_multisample is the
+shaderStorageImageMultisample feature, which enables both StorageImageMultisample
+and ImageMSArray, so a storage image may be multisampled, arrayed or not (#4298)
 
 ## val EXT_ZERO_INIT_WORKGROUP
 
@@ -1693,28 +1719,34 @@ pub val EXT_SHARED_FLOAT64_ATOMIC_ADD:     u64 = 0x1000000
 pub val EXT_SHARED_FLOAT64_ATOMIC_MIN_MAX: u64 = 0x2000000
 ```
 
+## val EXT_STORAGE_IMAGE_MULTISAMPLE
+
+```mach
+pub val EXT_STORAGE_IMAGE_MULTISAMPLE:     u64 = 0x4000000
+```
+
 ## val EXT_IMAGE_INT64_ATOMICS
 
 ```mach
-pub val EXT_IMAGE_INT64_ATOMICS:           u64 = 0x4000000
+pub val EXT_IMAGE_INT64_ATOMICS:           u64 = 0x8000000
 ```
 
 ## val EXT_IMAGE_FLOAT32_ATOMICS
 
 ```mach
-pub val EXT_IMAGE_FLOAT32_ATOMICS:         u64 = 0x8000000
+pub val EXT_IMAGE_FLOAT32_ATOMICS:         u64 = 0x10000000
 ```
 
 ## val EXT_IMAGE_FLOAT32_ATOMIC_ADD
 
 ```mach
-pub val EXT_IMAGE_FLOAT32_ATOMIC_ADD:      u64 = 0x10000000
+pub val EXT_IMAGE_FLOAT32_ATOMIC_ADD:      u64 = 0x20000000
 ```
 
 ## val EXT_IMAGE_FLOAT32_ATOMIC_MIN_MAX
 
 ```mach
-pub val EXT_IMAGE_FLOAT32_ATOMIC_MIN_MAX:  u64 = 0x20000000
+pub val EXT_IMAGE_FLOAT32_ATOMIC_MIN_MAX:  u64 = 0x40000000
 ```
 
 ## val EXT_ATOMICS
@@ -1729,7 +1761,7 @@ every atomic feature
 ## val EXTENSION_COUNT
 
 ```mach
-pub val EXTENSION_COUNT: u32 = 30
+pub val EXTENSION_COUNT: u32 = 31
 ```
 
 ## val ONLY_ENVIRONMENT
@@ -1756,7 +1788,7 @@ pub val EXTENSIONS: [EXTENSION_COUNT]extension.Extension = [EXTENSION_COUNT]exte
 pub val EXT_OPEN: u64 = EXT_FLOAT16 | EXT_ZERO_INIT_WORKGROUP | EXT_SUBGROUP_ARITHMETIC | EXT_SUBGROUP_CLUSTERED
 | EXT_STORAGE_READ_WITHOUT_FORMAT | EXT_STORAGE_WRITE_WITHOUT_FORMAT
 | EXT_SUBGROUP_VOTE | EXT_SUBGROUP_BALLOT | EXT_SUBGROUP_SHUFFLE | EXT_SUBGROUP_SHUFFLE_RELATIVE | EXT_SUBGROUP_QUAD
-| EXT_SUBGROUP_GRAPHICS_STAGES | EXT_ATOMICS
+| EXT_SUBGROUP_GRAPHICS_STAGES | EXT_ATOMICS | EXT_STORAGE_IMAGE_MULTISAMPLE
 ```
 
 every extension of the vocabulary, which a module naming no environment holds
@@ -1843,6 +1875,18 @@ pub val ADDRESSING_LOGICAL: u32 = 0
 
 ```mach
 pub val DIM_1D:     u32 = 0
+```
+
+## val DIM_2D
+
+```mach
+pub val DIM_2D:     u32 = 1
+```
+
+## val DIM_3D
+
+```mach
+pub val DIM_3D:     u32 = 2
 ```
 
 ## val DIM_CUBE
