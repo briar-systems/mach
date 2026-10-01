@@ -155,10 +155,21 @@ The `aarch64fp16-linux` column is aarch64-linux with `fp16` selected, and the
 half-precision instructions where the base column runs the expansion. Each
 serves the f16 cases only, which its `cases/ONLY.<target>` states.
 
+The `spirv-vk12` and `spirv-vk13` columns are spirv under `env = "vulkan1.2"` and
+`env = "vulkan1.3"`, selecting the device features most cases need (`int8`,
+`int16`, `int64`, `float64`, `float16`, `storage_buffer_8bit_access` and
+`storage_buffer_16bit_access`). The `spirv` column names no env, so its modules
+hold every feature and a defect that depends on the environment is invisible
+to it. A corpus module is a Linkage module, which `spirv-val` refuses under a
+Vulkan environment, so each env column is validated as the plain SPIR-V version
+its env fixes: `spv1.5` for `vulkan1.2` and `spv1.6` for `vulkan1.3`. A new env
+column is a row in the target table, and `val_env` in `run.sh` maps its env.
+
 A case with no C reference is an exact pair: `cases/EXACT.<target>` names the
 case, then the column it is held to, then the reason, and the case's checksum on
 the target must equal that column's at O0 and O2. The case is served only where
-such a line names it. `float/f16_bits` is one: which NaN an f16 operation makes
+such a line names it, and on a column nothing runs (spirv and its env columns),
+which only builds and validates and so serves every case. `float/f16_bits` is one: which NaN an f16 operation makes
 is the target's, so its bits, NaNs included, are held on each native column to
 the base column that runs the expansion on the same target.
 

@@ -15,7 +15,9 @@
 # named in test/cases/SKIPS.<target> is not built for that target; one named in
 # its NORUN.<target> is built and its differential disagreement is not a failure.
 # a case with no C reference is held instead to the column its EXACT.<target>
-# line names, and is served only where such a line names it.
+# line names, and is served only where such a line names it or on a column
+# nothing runs, which only builds and validates. the spirv-vk columns are spirv
+# under a vulkan env, validated as the plain SPIR-V version the env fixes.
 #
 #   --target <t>   one target (repeatable); default every target
 #   --case <g/n>   one case (repeatable)
@@ -49,24 +51,27 @@ cflags_O0="-std=c11 -O0 -ffp-contract=off -Wall -Wextra"
 cflags_O2="-std=c11 -O2 -ffp-contract=off -Wall -Wextra"
 cflags_ubsan="-std=c11 -O0 -ffp-contract=off -fsanitize=undefined -fno-sanitize-recover=all"
 
-# the targets: name isa os abi of kind entry qemu ext. qemu names the
+# the targets: name isa os abi of kind entry qemu env ext. qemu names the
 # qemu-user command that runs the target under --qemu, or - for none. a direct
 # target with one also builds a run bin from test/lib/start_<name>.mach, re-laid
 # by test/lib/elf_loadable.py, since qemu-user cannot map a freestanding image.
-# ext is the manifest `extensions` entry the target selects, or - for none.
+# env is the manifest `env` the target declares, or - for none. ext is the
+# manifest `extensions` the target selects, comma-separated, or - for none.
 targets_all='
-x86_64-linux      x86_64      linux         sysv64   -    bin     hosted  -             -
-x86_64v3-linux    x86_64      linux         sysv64   -    bin     hosted  -             x86-64-v3
-aarch64-linux     aarch64     linux         aapcs64  -    bin     hosted  qemu-aarch64  -
-aarch64fp16-linux aarch64     linux         aapcs64  -    bin     hosted  qemu-aarch64  fp16
-riscv64-linux     riscv64     linux         lp64d    -    bin     hosted  qemu-riscv64  -
-riscv64zkt-linux  rv64gc_zkt  linux         lp64d    -    bin     hosted  qemu-riscv64  -
-riscv64zfh-linux  rv64gc_zfh  linux         lp64d    -    bin     hosted  qemu-riscv64  -
-x86_64-windows    x86_64      windows       win64    -    bin     hosted  -             -
-x86_64-darwin     x86_64      darwin        sysv64   -    bin     hosted  -             -
-aarch64-darwin    aarch64     darwin        aapcs64  -    bin     hosted  -             -
-spirv             spirv       freestanding  spirv    -    bin     direct  -             -
-riscv32           rv32imafdc  freestanding  ilp32d   elf  static  direct  qemu-riscv32  -
+x86_64-linux       x86_64      linux         sysv64   -    bin     hosted  -             -          -
+x86_64v3-linux     x86_64      linux         sysv64   -    bin     hosted  -             -          x86-64-v3
+aarch64-linux      aarch64     linux         aapcs64  -    bin     hosted  qemu-aarch64  -          -
+aarch64fp16-linux  aarch64     linux         aapcs64  -    bin     hosted  qemu-aarch64  -          fp16
+riscv64-linux      riscv64     linux         lp64d    -    bin     hosted  qemu-riscv64  -          -
+riscv64zkt-linux   rv64gc_zkt  linux         lp64d    -    bin     hosted  qemu-riscv64  -          -
+riscv64zfh-linux   rv64gc_zfh  linux         lp64d    -    bin     hosted  qemu-riscv64  -          -
+x86_64-windows     x86_64      windows       win64    -    bin     hosted  -             -          -
+x86_64-darwin      x86_64      darwin        sysv64   -    bin     hosted  -             -          -
+aarch64-darwin     aarch64     darwin        aapcs64  -    bin     hosted  -             -          -
+spirv              spirv       freestanding  spirv    -    bin     direct  -             -          -
+spirv-vk12         spirv       freestanding  spirv    -    bin     direct  -             vulkan1.2  int8,int16,int64,float64,float16,storage_buffer_8bit_access,storage_buffer_16bit_access
+spirv-vk13         spirv       freestanding  spirv    -    bin     direct  -             vulkan1.3  int8,int16,int64,float64,float16,storage_buffer_8bit_access,storage_buffer_16bit_access
+riscv32            rv32imafdc  freestanding  ilp32d   elf  static  direct  qemu-riscv32  -          -
 '
 # where a run bin is based: above the host's mmap floor with a page for its headers
 run_base=0x20000
@@ -173,6 +178,21 @@ engine() {
     echo -
 }
 
+# val_env <target>: the spirv-val --target-env for the column. a corpus module is a
+# Linkage module, which spirv-val refuses under a vulkan env, so a vulkan env is
+# validated as the plain SPIR-V version it fixes; a column with no env takes
+# spirv-val's default
+val_env() {
+    case "$(target_field "$1" 9)" in
+        vulkan1.0) echo "--target-env spv1.0" ;;
+        vulkan1.1) echo "--target-env spv1.3" ;;
+        vulkan1.2) echo "--target-env spv1.5" ;;
+        vulkan1.3) echo "--target-env spv1.6" ;;
+        -) ;;
+        *) echo "run.sh: $1 declares env $(target_field "$1" 9), which val_env does not map" >&2; return 1 ;;
+    esac
+}
+
 # runs_bare <target>: a direct target the differential executes
 runs_bare() { [ "$(target_field "$1" 7)" = direct ] && [ "$(target_field "$1" 8)" != - ]; }
 
@@ -226,8 +246,11 @@ exact_base() {
     done <"$here/cases/EXACT.$1"
     return 1
 }
+# a column nothing ever runs (a direct target with no qemu) asks only whether a case
+# builds and validates, which needs no reference, so it serves every case
+never_runs() { [ "$(target_field "$1" 7)" = direct ] && [ "$(target_field "$1" 8)" = - ]; }
 served() {
-    [ -f "$here/ref/$2.c" ] || exact_base "$1" "$2" >/dev/null || return 1
+    never_runs "$1" || [ -f "$here/ref/$2.c" ] || exact_base "$1" "$2" >/dev/null || return 1
     [ ! -f "$here/cases/ONLY.$1" ] || listed ONLY "$1" "$2"
 }
 skipped() { listed SKIPS "$1" "$2"; }
@@ -293,11 +316,12 @@ manifest() {
     echo '[project]'; echo 'id = "corpus"'; echo 'version = "0.0.0"'; echo 'mach = ">=5"'; echo 'src = "src"'
     echo 'out = "o/{target.name}/{profile.name}"'; echo
     names=
-    printf '%s\n' "$targets_all" | while read -r name isa os abi of kind entry q ext; do
+    printf '%s\n' "$targets_all" | while read -r name isa os abi of kind entry q env ext; do
         [ -n "$name" ] && [ "$entry" = "$shape" ] || continue
         echo "[target.$name]"; echo "isa = \"$isa\""; echo "os  = \"$os\""; echo "abi = \"$abi\""
         [ "$of" != - ] && echo "of  = \"$of\""
-        [ "$ext" != - ] && echo "extensions = [\"$ext\"]"
+        [ "$env" != - ] && echo "env = \"$env\""
+        [ "$ext" != - ] && echo "extensions = [\"$(echo "$ext" | sed 's/,/", "/g')\"]"
         [ "$shape" = direct ] && runs_bare "$name" && echo "base = $run_base"
         echo
     done
@@ -317,12 +341,15 @@ manifest() {
             echo "targets = [$(printf '%s\n' "$targets_all" | awk '$7 == "hosted" { printf "%s\"%s\"", (n++ ? ", " : ""), $1 }')]"
             echo 'link = []'; echo 'need = []'; echo
         else
-            printf '%s\n' "$targets_all" | while read -r name isa os abi of kind entry q ext; do
-                [ -n "$name" ] && [ "$entry" = direct ] || continue
+            # one artifact per kind, built for every direct target of that kind
+            for kind in $(printf '%s\n' "$targets_all" | awk '$7 == "direct" && !s[$6]++ { print $6 }'); do
                 echo "[artifact.${a}_$kind]"; echo "kind = \"$kind\""; echo "entry = \"cases/$c.mach\""
                 if [ "$kind" = static ]; then echo "out = \"lib/$a.a\""; else echo "out = \"bin/$a\""; fi
-                echo "targets = [\"$name\"]"; echo 'link = []'; echo 'need = []'; echo
-                [ "$q" != - ] || continue
+                echo "targets = [$(printf '%s\n' "$targets_all" | awk -v k="$kind" '$7 == "direct" && $6 == k { printf "%s\"%s\"", (n++ ? ", " : ""), $1 }')]"
+                echo 'link = []'; echo 'need = []'; echo
+            done
+            printf '%s\n' "$targets_all" | while read -r name isa os abi of kind entry q env ext; do
+                [ -n "$name" ] && [ "$entry" = direct ] && [ "$q" != - ] || continue
                 echo "[artifact.${a}_run_$name]"; echo 'kind = "bin"'; echo "entry = \"run/$name/$a.mach\""
                 echo "out = \"run/$a\""
                 echo "targets = [\"$name\"]"; echo 'link = []'; echo 'need = []'; echo
@@ -488,7 +515,7 @@ run_case() {
         fail "$t $c build o2: $(first_error "$out/log/$t.o2.$(art "$c").log")"; unrun "$t"; return
     fi
     if [ "$fmt" = spv ]; then
-        if ! spirv-val "$(object "$t" o2 "$c")" >"$out/log/$t.val.$(art "$c").log" 2>&1; then
+        if ! spirv-val $(val_env "$t") "$(object "$t" o2 "$c")" >"$out/log/$t.val.$(art "$c").log" 2>&1; then
             fail "$t $c spirv-val: $(head -n1 "$out/log/$t.val.$(art "$c").log")"; return
         fi
     fi
@@ -528,7 +555,7 @@ run_case() {
             fail "$t $c build g2: $(first_error "$out/log/$t.g2.$(art "$c").log")"; return
         fi
         o=$(object "$t" g2 "$c")
-        if ! spirv-val "$o" >"$out/log/$t.g2.$(art "$c").verify" 2>&1; then
+        if ! spirv-val $(val_env "$t") "$o" >"$out/log/$t.g2.$(art "$c").verify" 2>&1; then
             fail "$t $c -g spirv-val: $(head -n1 "$out/log/$t.g2.$(art "$c").verify")"; return
         fi
         spirv-dis "$o" 2>/dev/null | grep -q ' OpLine ' || { fail "$t $c -g: the module carries no OpLine"; return; }
@@ -598,6 +625,7 @@ if [ "$mode" = corpus ]; then
 for t in $targets; do
     if [ "$(object_format "$t")" = spv ]; then
         need_tool spirv-val "$t"
+        val_env "$t" >/dev/null || exit 2
         [ "$dwarf" -eq 0 ] || need_tool spirv-dis --dwarf
     fi
     q=$(target_field "$t" 8)
