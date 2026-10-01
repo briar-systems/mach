@@ -1199,15 +1199,20 @@ derives, and is reached only from a fragment stage, the one stage with the coord
 derivatives it derives that level from. A fetch, a sample and a gather take
 `ConstOffset` (`0x8`), an integer constant added to the coordinate, or `Offset`
 (`0x10`), the same computed at run time, one component per dimension of the
-coordinate, one of the two and never on a `Cube` image. `Offset` needs the
-`image_gather_extended` extension, and on a fetch or a sample `maintenance8` as well,
+coordinate, and never on a `Cube` image. A gather may take `ConstOffsets` (`0x20`)
+instead, a constant `[4]i32x2` of the offsets of the four texels it reads. An
+instruction takes one offset bit at most. `Offset` and `ConstOffsets` need the
+`image_gather_extended` extension, and `Offset` on a fetch or a sample `maintenance8` as well,
 since Vulkan admits it outside a gather only under that feature. A sample takes
 `MinLod` (`0x80`), the least level of detail it reads, which an explicit-lod sample
 takes only with `Grad` and which needs the `resource_min_lod` extension.
 `OpImageGather` reads one component, a constant id, of the four texels a sample of a
 `2D` or `Cube` image would filter. A constant operand is a constant by emission: a
-literal, a vector of literals directly or through a binding, or a module-scope `val`,
-which a shader reads as the constant it is. `OpImageQuerySamples` reads the sample
+literal, a vector of literals directly or through a binding, a module-scope `val`,
+which a shader reads as the constant it is, or an aggregate passed whole as an array
+literal of constants or a copy of a `val`, written as one composite constant. An
+aggregate any run-time value writes, or one written only in part, is a value, and is
+refused with `op.operand_not_constant`. `OpImageQuerySamples` reads the sample
 count of a multisampled image only, and `OpImageQuerySizeLod` does not take one.
 `OpImageQuerySize` reads an image with no level of detail to choose, a multisampled
 image, a storage image or a texel buffer, so a single-sampled sampled image is
