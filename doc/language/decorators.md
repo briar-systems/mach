@@ -1753,9 +1753,11 @@ pub fun frexp(x: f32x4, exp: *i32x4) f32x4;
 
 A declaration that returns a handle is refused with `op.signature` unless its row
 names the operand its result derives from, since a handle holds a binding's
-descriptor and only that operand says whose. The math rows and the subgroup rows
-operate on a scalar or vector of integers or floats, so a handle, a pointer or an
-aggregate as their data operand is refused with `op.signature` too.
+descriptor and only that operand says whose. Each math row and subgroup row states the
+class of number it operates on. The GLSL.std.450 math rows and `OpDot` operate on a
+scalar or vector of floats, and the subgroup rows on a scalar or vector of integers or
+floats. A data operand of any other type is refused with `op.signature`: an integer
+for `FAbs`, a handle, a pointer or an aggregate.
 
 Each image row names the rule its texel's component count comes from, and the
 refusal quotes it: the 4-vector read result is Vulkan's `VUID-StandaloneSpirv-Result-04780`,
