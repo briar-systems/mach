@@ -1564,32 +1564,40 @@ pub def OpRelation: u8
 ```
 
 how an operand's or the result's type relates to the row's data type, the type of its
-typing's operand (a pointer operand's pointee): unrelated, that same type, or a texel,
-a scalar or vector whose component is the sampled type of the handle the typing's
-operand is, with as many components as the row's texel count states
+typing's operand (a pointer operand's pointee): unrelated, that same type, a texel, a
+scalar or vector whose component is the sampled type of the handle the typing's operand
+is, with as many components as the row's texel count states, or, for a pointer result
+only, a pointer to that sampled type, into the memory of the handle the typing's pointer
+operand addresses
 
 ## val OP_RELATION_NONE
 
 ```mach
-pub val OP_RELATION_NONE:  OpRelation = 0
+pub val OP_RELATION_NONE:    OpRelation = 0
 ```
 
 ## val OP_RELATION_DATA
 
 ```mach
-pub val OP_RELATION_DATA:  OpRelation = 1
+pub val OP_RELATION_DATA:    OpRelation = 1
 ```
 
 ## val OP_RELATION_TEXEL
 
 ```mach
-pub val OP_RELATION_TEXEL: OpRelation = 2
+pub val OP_RELATION_TEXEL:   OpRelation = 2
+```
+
+## val OP_RELATION_POINTEE
+
+```mach
+pub val OP_RELATION_POINTEE: OpRelation = 3
 ```
 
 ## val OP_RELATION_COUNT
 
 ```mach
-pub val OP_RELATION_COUNT: OpRelation = 3
+pub val OP_RELATION_COUNT:   OpRelation = 4
 ```
 
 ## def OpCountKind
@@ -1703,6 +1711,15 @@ pub val NO_TEXEL_OPERAND: u32 = 0xFFFFFFFF
 ```
 
 a constructor whose handles state their own texels, or have none
+
+## def TypeAddressFn
+
+```mach
+pub def TypeAddressFn: fun(*u32, u32) str
+```
+
+why no instruction may derive a pointer into a handle's memory, from its operands, nil
+when one may
 
 ## val HANDLE_BIND_SAMPLER
 
@@ -1992,6 +2009,15 @@ pub fun type_def_components(td: *TypeDef, ops: *u32, n: u32) u32;
 
 the number of components a handle of constructor `td` with operands `ops` stores each
 texel in, 0 when its format is unknown or the constructor declares none
+
+## fun type_def_address
+
+```mach
+pub fun type_def_address(td: *TypeDef, ops: *u32, n: u32) str;
+```
+
+why no instruction may derive a pointer into a handle of constructor `td` with operands
+`ops`, nil when one may
 
 ## fun target_defs
 
