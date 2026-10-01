@@ -99,7 +99,8 @@ The names are the selected isa's vocabulary and nothing else:
 - `aarch64`: `sha2`, `sb`, `aes`, `pmull`, `fp16`;
 - `riscv64` and `riscv32`: `i`, `m`, `a`, `f`, `d`, `c`, `zicond`, `zicsr`, `zifencei`,
   `zfhmin`, `zfh`, `zkt`;
-- `spirv`: `float16`, `zero_init_workgroup`, and the atomic device features
+- `spirv`: `float16`, `zero_init_workgroup`, `storage_read_without_format`,
+  `storage_write_without_format`, and the atomic device features
   `buffer_int64_atomics`, `shared_int64_atomics` and `{buffer,shared}_float{16,32,64}_atomics`,
   `_atomic_add` and `_atomic_min_max`.
 

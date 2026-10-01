@@ -276,7 +276,7 @@ comptime member, `$mach.build.extensions.<name>` (see [`$mach`](comptime-mach.md
 | `x86_64` | SSE2 | `ssse3`, `sse41`, `sse42`, `sha`, `fsgsbase`, `popcnt`, `lzcnt`, `bmi1`, `bmi2`, `cx16`, `avx`, `avx2`, `fma`, `movbe`, `f16c`, `avx512f`, `avx512bw`, `avx512cd`, `avx512dq`, `avx512vl`, `aes`, `pclmul` |
 | `aarch64` | AdvSIMD | `sha2`, `sb`, `aes`, `pmull`, `fp16` |
 | `riscv64`, `riscv32` | the isa string's selection | `i`, `m`, `a`, `f`, `d`, `c`, `zicond`, `zicsr`, `zifencei`, `zfhmin`, `zfh`, `zkt` |
-| `spirv` | | `float16`, which `env` selects; `zero_init_workgroup`, which `vulkan1.3` selects; the atomic device features `buffer_int64_atomics`, `shared_int64_atomics` and `buffer_*` / `shared_*` `float16_atomics`, `float16_atomic_add`, `float16_atomic_min_max` and the same for `float32` and `float64` ([decorators.md](decorators.md#optarget-set-name--a-function-that-is-a-target-instruction)) |
+| `spirv` | | `float16`, which `env` selects; `zero_init_workgroup`, `storage_read_without_format` and `storage_write_without_format`, which `vulkan1.3` selects; the atomic device features `buffer_int64_atomics`, `shared_int64_atomics` and `buffer_*` / `shared_*` `float16_atomics`, `float16_atomic_add`, `float16_atomic_min_max` and the same for `float32` and `float64` ([decorators.md](decorators.md#optarget-set-name--a-function-that-is-a-target-instruction)) |
 
 A name the selected isa does not hold is refused when the target resolves, with the
 names it does hold:
@@ -353,7 +353,9 @@ refusal says why. So is spirv `float16`, the Float16 capability the target's `en
 guarantees for the whole module, and spirv `zero_init_workgroup`, the device feature
 that zero-initializes the workgroup memory of every
 [`#[shared]`](decorators.md#inputn--outputn--builtinstr--uniformset-binding--storageset-binding--samplerset-binding--push--specid--shared--shader-interface)
-variable in the module. Every x86_64 and aarch64 row, and riscv `m`, `a`,
+variable in the module, and spirv `storage_read_without_format` and
+`storage_write_without_format`, the device features that let a storage image of
+`Unknown` format be read and written. Every x86_64 and aarch64 row, and riscv `m`, `a`,
 `zicond`, `zicsr`, `zifencei`, `zfhmin` and `zfh`, may be.
 
 Selecting an extension is a promise about **every** machine the binary runs on. The
@@ -606,6 +608,15 @@ where `shaderZeroInitializeWorkgroupMemory` is core, and a module without `env` 
 it too. A target for an earlier version selects it with `extensions` when its consumer
 enables `VK_KHR_zero_initialize_workgroup_memory`.
 
+The environment also selects `storage_read_without_format` and
+`storage_write_without_format` from `vulkan1.3`, which accepts the
+`StorageImageReadWithoutFormat` and `StorageImageWriteWithoutFormat` capabilities
+with no feature enabled, and a module without `env` has them too. A module reading
+or writing a storage image of `Unknown` format for an earlier version is refused
+unless the target selects the matching extension, which it does when its consumer
+enables `shaderStorageImageReadWithoutFormat` or
+`shaderStorageImageWriteWithoutFormat`.
+
 The environment also selects the `float16` extension where its ceiling holds
 Float16, and a module without `env` has it too. Under it an `f16` is the native
 `OpTypeFloat 16`, computed and converted by the core float instructions, and a stage
@@ -614,7 +625,7 @@ and `vulkan1.1`, an `f16` is the software expansion on its 16 bits.
 
 | `env` | SPIR-V | capabilities within the ceiling |
 |---|---|---|
-| `vulkan1.0` | 1.0 | Int16, Int64, Float64, Sampled1D, SampledCubeArray |
+| `vulkan1.0` | 1.0 | Int16, Int64, Float64, Sampled1D, SampledCubeArray, Image1D, ImageCubeArray, SampledBuffer, ImageBuffer, StorageImageExtendedFormats |
 | `vulkan1.1` | 1.3 | same as `vulkan1.0` |
 | `vulkan1.2` | 1.5 | the above plus Int8, Float16 |
 | `vulkan1.3` | 1.6 | same as `vulkan1.2` |
@@ -624,7 +635,8 @@ enable through core device features alone, with no extension: from the Vulkan
 specification's "Vulkan Environment for SPIR-V" appendix, the capabilities table
 maps `Int64`, `Int16`, `Float64` and `SampledCubeArray` to the `shaderInt64`,
 `shaderInt16`, `shaderFloat64` and `imageCubeArray` features of Vulkan 1.0,
-`Sampled1D` to core, and `Int8` and `Float16` to `shaderInt8` and
+`ImageCubeArray` to `imageCubeArray` as well, `Sampled1D`, `Image1D`,
+`SampledBuffer`, `ImageBuffer` and `StorageImageExtendedFormats` to core, and `Int8` and `Float16` to `shaderInt8` and
 `shaderFloat16`, which became core features in Vulkan 1.2 (promoted from
 `VK_KHR_shader_float16_int8`). The SPIR-V version per Vulkan version is the
 appendix's required version: 1.0, 1.3, 1.5 and 1.6.
