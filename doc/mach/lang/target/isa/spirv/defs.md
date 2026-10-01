@@ -189,31 +189,31 @@ pub val ARITHMETIC_GROUP_OPERATION: isa.OpEnum = isa.OpEnum;
 ## val IMAGE_OPERANDS_BIAS
 
 ```mach
-pub val IMAGE_OPERANDS_BIAS:         u32 = 0x1
+pub val IMAGE_OPERANDS_BIAS:          u32 = 0x1
 ```
 
 ## val IMAGE_OPERANDS_LOD
 
 ```mach
-pub val IMAGE_OPERANDS_LOD:          u32 = 0x2
+pub val IMAGE_OPERANDS_LOD:           u32 = 0x2
 ```
 
 ## val IMAGE_OPERANDS_GRAD
 
 ```mach
-pub val IMAGE_OPERANDS_GRAD:         u32 = 0x4
+pub val IMAGE_OPERANDS_GRAD:          u32 = 0x4
 ```
 
 ## val IMAGE_OPERANDS_CONST_OFFSET
 
 ```mach
-pub val IMAGE_OPERANDS_CONST_OFFSET: u32 = 0x8
+pub val IMAGE_OPERANDS_CONST_OFFSET:  u32 = 0x8
 ```
 
 ## val IMAGE_OPERANDS_OFFSET
 
 ```mach
-pub val IMAGE_OPERANDS_OFFSET:       u32 = 0x10
+pub val IMAGE_OPERANDS_OFFSET:        u32 = 0x10
 ```
 
 ## val IMAGE_OPERANDS_CONST_OFFSETS
@@ -225,13 +225,13 @@ pub val IMAGE_OPERANDS_CONST_OFFSETS: u32 = 0x20
 ## val IMAGE_OPERANDS_SAMPLE
 
 ```mach
-pub val IMAGE_OPERANDS_SAMPLE:       u32 = 0x40
+pub val IMAGE_OPERANDS_SAMPLE:        u32 = 0x40
 ```
 
 ## val IMAGE_OPERANDS_MIN_LOD
 
 ```mach
-pub val IMAGE_OPERANDS_MIN_LOD:      u32 = 0x80
+pub val IMAGE_OPERANDS_MIN_LOD:       u32 = 0x80
 ```
 
 ## val IMAGE_OPERANDS_OFFSETS
