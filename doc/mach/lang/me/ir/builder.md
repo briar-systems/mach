@@ -321,6 +321,22 @@ pub fun emit_vec_range(b: *Builder, src: value.Value, start: value.Value, ty: ty
 
 the `ty` lanes of `src` from constant lane `start` on
 
+## fun lanes_reserve
+
+```mach
+pub fun lanes_reserve(b: *Builder, n: u32) res[*value.Value, fail.Fail];
+```
+
+a buffer for the `n` lanes of a vector build, sized from the lane count since a
+target that builds vectors from lanes has no register ceiling on it; released
+with `lanes_release`
+
+## fun lanes_release
+
+```mach
+pub fun lanes_release(b: *Builder, lanes: *value.Value, n: u32);
+```
+
 ## fun emit_vec_build
 
 ```mach
