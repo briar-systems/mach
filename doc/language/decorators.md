@@ -1736,7 +1736,7 @@ at the declaration rather than as an invalid module.
 | `OpImageTexelPointer` | the result points to the image's texel scalar, into a storage image of `R32ui`, `R32i`, `R32f`, `R64ui` or `R64i` format |
 | `OpSampledImage` | the result is a sampled image composed over the image operand's own type, and the second operand is a `sampler` |
 | `OpGroupNonUniformBroadcast*`, `Shuffle*`, `Quad*` and the arithmetic rows | the result is the value operand's type |
-| the GLSL.std.450 math rows | the result and every operand are the first operand's type, except `Refract`'s `eta`, and `Length` and `Distance`, whose result is a scalar |
+| the GLSL.std.450 math rows, float and integer | the result and every operand are the first operand's type, except `Refract`'s `eta`, and `Length` and `Distance`, whose result is a scalar |
 | `Modf` | the result is the value's type, and the out-pointer points to the value's type, where the whole part is stored |
 | `Frexp` | the result is the value's type, and the out-pointer points to an `i32` scalar or vector with as many components as the value, where the exponent is stored |
 | `OpDot` | the second vector is the first's type |
@@ -1754,10 +1754,14 @@ pub fun frexp(x: f32x4, exp: *i32x4) f32x4;
 A declaration that returns a handle is refused with `op.signature` unless its row
 names the operand its result derives from, since a handle holds a binding's
 descriptor and only that operand says whose. Each math row and subgroup row states the
-class of number it operates on. The GLSL.std.450 math rows and `OpDot` operate on a
+class of number it operates on. The GLSL.std.450 float rows and `OpDot` operate on a
 scalar or vector of floats, and the subgroup rows on a scalar or vector of integers or
-floats. A data operand of any other type is refused with `op.signature`: an integer
-for `FAbs`, a handle, a pointer or an aggregate.
+floats. The GLSL.std.450 integer rows operate on the signedness their name states:
+`SAbs`, `SSign`, `SMin`, `SMax`, `SClamp` and `FindSMsb` on signed integers, `UMin`,
+`UMax`, `UClamp` and `FindUMsb` on unsigned ones, and `FindILsb` on either. A data
+operand of any other type is refused with `op.signature`: an integer for `FAbs`, an
+`i32` for `UMin`, a handle, a pointer or an aggregate. GLSL.std.450 removed `IMix`, so
+it has no row.
 
 Each image row names the rule its texel's component count comes from, and the
 refusal quotes it: the 4-vector read result is Vulkan's `VUID-StandaloneSpirv-Result-04780`,
