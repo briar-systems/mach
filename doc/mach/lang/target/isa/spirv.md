@@ -380,6 +380,12 @@ pub val OP_IMAGE_SAMPLE_EXPLICIT_LOD: u32 = 88
 pub val OP_IMAGE_FETCH:               u32 = 95
 ```
 
+## val OP_IMAGE_GATHER
+
+```mach
+pub val OP_IMAGE_GATHER:              u32 = 96
+```
+
 ## val OP_IMAGE_READ
 
 ```mach
@@ -1096,6 +1102,12 @@ pub val CAP_INT16:   u32 = 22
 pub val CAP_INT8:    u32 = 39
 ```
 
+## val CAP_IMAGE_GATHER_EXTENDED
+
+```mach
+pub val CAP_IMAGE_GATHER_EXTENDED:          u32 = 25
+```
+
 ## val CAP_STORAGE_IMAGE_MULTISAMPLE
 
 ```mach
@@ -1106,6 +1118,12 @@ pub val CAP_STORAGE_IMAGE_MULTISAMPLE:      u32 = 27
 
 ```mach
 pub val CAP_IMAGE_CUBE_ARRAY:               u32 = 34
+```
+
+## val CAP_MIN_LOD
+
+```mach
+pub val CAP_MIN_LOD:                        u32 = 42
 ```
 
 ## val CAP_SAMPLED_1D
@@ -1244,6 +1262,12 @@ pub val CAP_ATOMIC_FLOAT32_ADD:                 u32 = 6033
 
 ```mach
 pub val CAP_ATOMIC_FLOAT64_ADD:                 u32 = 6034
+```
+
+## val CAP_INT64_IMAGE
+
+```mach
+pub val CAP_INT64_IMAGE:                        u32 = 5016
 ```
 
 ## rec Capability
@@ -1442,10 +1466,28 @@ pub val NEED_STORAGE_IMAGE_MULTISAMPLE: u64 = 0x10000000
 pub val NEED_IMAGE_MS_ARRAY:            u64 = 0x20000000
 ```
 
+## val NEED_MIN_LOD
+
+```mach
+pub val NEED_MIN_LOD:                   u64 = 0x40000000
+```
+
+## val NEED_IMAGE_GATHER_EXTENDED
+
+```mach
+pub val NEED_IMAGE_GATHER_EXTENDED:     u64 = 0x80000000
+```
+
+## val NEED_INT64_IMAGE
+
+```mach
+pub val NEED_INT64_IMAGE:               u64 = 0x100000000
+```
+
 ## val CAPABILITY_COUNT
 
 ```mach
-pub val CAPABILITY_COUNT: u32 = 30
+pub val CAPABILITY_COUNT: u32 = 33
 ```
 
 ## val SPV_EXT_ATOMIC_FLOAT_ADD
@@ -1458,6 +1500,12 @@ pub val SPV_EXT_ATOMIC_FLOAT_ADD:     str = "SPV_EXT_shader_atomic_float_add"
 
 ```mach
 pub val SPV_EXT_ATOMIC_FLOAT_MIN_MAX: str = "SPV_EXT_shader_atomic_float_min_max"
+```
+
+## val SPV_EXT_IMAGE_INT64
+
+```mach
+pub val SPV_EXT_IMAGE_INT64:          str = "SPV_EXT_shader_image_int64"
 ```
 
 ## val CAPABILITIES
@@ -1543,8 +1591,12 @@ shaderStorageImageWriteWithoutFormat features, so a storage image of Unknown
 format may be read or written (#4272). storage_image_multisample is the
 shaderStorageImageMultisample feature, which enables both StorageImageMultisample
 and ImageMSArray, so a storage image may be multisampled, arrayed or not (#4298).
-int8 and int16 are the Int8 and Int16 capabilities, so an integer of that width
-is computed at its own width rather than carried in a wider one (#4302)
+resource_min_lod is the shaderResourceMinLod feature, which enables MinLod, so a
+sample may name the least level of detail it reads. image_gather_extended is the
+shaderImageGatherExtended feature, which enables ImageGatherExtended, so a gather
+may take an offset computed at run time. maintenance8 is the
+maintenance8 feature, under which a fetch or a sample takes a run-time offset too
+(VUID-RuntimeSpirv-Offset-10213) (#4303)
 
 ## val EXT_ZERO_INIT_WORKGROUP
 
@@ -1619,9 +1671,11 @@ pub val EXT_BUFFER_INT64_ATOMICS:          u64 = 0x1000
 ```
 
 the atomic features of VkPhysicalDeviceShaderAtomicInt64Features,
-VkPhysicalDeviceShaderAtomicFloatFeaturesEXT and VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT,
-each named for its shaderBuffer* or shaderShared* member: an atomic on a type beyond
-32-bit integers needs the one for its storage class, which no Vulkan version guarantees
+VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT, VkPhysicalDeviceShaderAtomicFloatFeaturesEXT
+and VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT, each named for its shaderBuffer*,
+shaderShared* or shaderImage* member: an atomic on a type beyond 32-bit integers needs the
+one for its storage class, which no Vulkan version guarantees. image_int64_atomics is also
+the feature that enables Int64ImageEXT, which any image of 64-bit texels declares
 
 ## val EXT_SHARED_INT64_ATOMICS
 
@@ -1707,22 +1761,53 @@ pub val EXT_SHARED_FLOAT64_ATOMIC_MIN_MAX: u64 = 0x2000000
 pub val EXT_STORAGE_IMAGE_MULTISAMPLE:     u64 = 0x4000000
 ```
 
-## val EXT_INT8
+## val EXT_RESOURCE_MIN_LOD
 
 ```mach
-pub val EXT_INT8:                          u64 = 0x8000000
+pub val EXT_RESOURCE_MIN_LOD:              u64 = 0x8000000
 ```
 
-## val EXT_INT16
+## val EXT_IMAGE_GATHER_EXTENDED
 
 ```mach
-pub val EXT_INT16:                         u64 = 0x10000000
+pub val EXT_IMAGE_GATHER_EXTENDED:         u64 = 0x10000000
+```
+
+## val EXT_MAINTENANCE8
+
+```mach
+pub val EXT_MAINTENANCE8:                  u64 = 0x20000000
+```
+
+## val EXT_IMAGE_INT64_ATOMICS
+
+```mach
+pub val EXT_IMAGE_INT64_ATOMICS:           u64 = 0x40000000
+```
+
+## val EXT_IMAGE_FLOAT32_ATOMICS
+
+```mach
+pub val EXT_IMAGE_FLOAT32_ATOMICS:         u64 = 0x80000000
+```
+
+## val EXT_IMAGE_FLOAT32_ATOMIC_ADD
+
+```mach
+pub val EXT_IMAGE_FLOAT32_ATOMIC_ADD:      u64 = 0x100000000
+```
+
+## val EXT_IMAGE_FLOAT32_ATOMIC_MIN_MAX
+
+```mach
+pub val EXT_IMAGE_FLOAT32_ATOMIC_MIN_MAX:  u64 = 0x200000000
 ```
 
 ## val EXT_ATOMICS
 
 ```mach
 pub val EXT_ATOMICS: u64 = EXT_BUFFER_INT64_ATOMICS | EXT_SHARED_INT64_ATOMICS | EXT_BUFFER_FLOAT32_ATOMICS | EXT_BUFFER_FLOAT32_ATOMIC_ADD | EXT_BUFFER_FLOAT32_ATOMIC_MIN_MAX | EXT_BUFFER_FLOAT64_ATOMICS | EXT_BUFFER_FLOAT64_ATOMIC_ADD | EXT_BUFFER_FLOAT64_ATOMIC_MIN_MAX | EXT_SHARED_FLOAT32_ATOMICS | EXT_SHARED_FLOAT32_ATOMIC_ADD | EXT_SHARED_FLOAT32_ATOMIC_MIN_MAX | EXT_SHARED_FLOAT64_ATOMICS | EXT_SHARED_FLOAT64_ATOMIC_ADD | EXT_SHARED_FLOAT64_ATOMIC_MIN_MAX
+| EXT_IMAGE_INT64_ATOMICS | EXT_IMAGE_FLOAT32_ATOMICS | EXT_IMAGE_FLOAT32_ATOMIC_ADD | EXT_IMAGE_FLOAT32_ATOMIC_MIN_MAX
 ```
 
 every atomic feature
@@ -1730,7 +1815,7 @@ every atomic feature
 ## val EXTENSION_COUNT
 
 ```mach
-pub val EXTENSION_COUNT: u32 = 29
+pub val EXTENSION_COUNT: u32 = 34
 ```
 
 ## val ONLY_ENVIRONMENT
@@ -1757,8 +1842,8 @@ pub val EXTENSIONS: [EXTENSION_COUNT]extension.Extension = [EXTENSION_COUNT]exte
 pub val EXT_OPEN: u64 = EXT_FLOAT16 | EXT_ZERO_INIT_WORKGROUP | EXT_SUBGROUP_ARITHMETIC | EXT_SUBGROUP_CLUSTERED
 | EXT_STORAGE_READ_WITHOUT_FORMAT | EXT_STORAGE_WRITE_WITHOUT_FORMAT
 | EXT_SUBGROUP_VOTE | EXT_SUBGROUP_BALLOT | EXT_SUBGROUP_SHUFFLE | EXT_SUBGROUP_SHUFFLE_RELATIVE | EXT_SUBGROUP_QUAD
-| EXT_SUBGROUP_GRAPHICS_STAGES | EXT_ATOMICS | EXT_STORAGE_IMAGE_MULTISAMPLE
-| EXT_INT8 | EXT_INT16
+| EXT_SUBGROUP_GRAPHICS_STAGES | EXT_ATOMICS | EXT_STORAGE_IMAGE_MULTISAMPLE | EXT_RESOURCE_MIN_LOD
+| EXT_IMAGE_GATHER_EXTENDED | EXT_MAINTENANCE8
 ```
 
 every extension of the vocabulary, which a module naming no environment holds
@@ -1769,8 +1854,8 @@ every extension of the vocabulary, which a module naming no environment holds
 pub fun env_extensions(id: u32) u64;
 ```
 
-the extensions an environment guarantees: float16, int8 and int16 where its
-ceiling holds Float16, Int8 and Int16, and from vulkan1.3 zero_init_workgroup, where the feature is core, and
+the extensions an environment guarantees: float16 where its ceiling holds
+Float16, and from vulkan1.3 zero_init_workgroup, where the feature is core, and
 the two without-format features, whose capabilities it accepts with none enabled
 
 ## fun env_profile
@@ -1897,13 +1982,37 @@ pub val IMAGE_FORMAT_LAST_SINT:  u32 = 29
 pub val IMAGE_FORMAT_LAST_UINT:  u32 = 39
 ```
 
-## val IMAGE_FORMAT_FIRST_INT64
+## val IMAGE_FORMAT_R32F
 
 ```mach
-pub val IMAGE_FORMAT_FIRST_INT64: u32 = 40
+pub val IMAGE_FORMAT_R32F:  u32 = 3
 ```
 
-R64ui and R64i, which need Int64ImageEXT
+the formats an image atomic is defined on, the 64-bit ones under Int64ImageEXT
+
+## val IMAGE_FORMAT_R32I
+
+```mach
+pub val IMAGE_FORMAT_R32I:  u32 = 24
+```
+
+## val IMAGE_FORMAT_R32UI
+
+```mach
+pub val IMAGE_FORMAT_R32UI: u32 = 33
+```
+
+## val IMAGE_FORMAT_R64UI
+
+```mach
+pub val IMAGE_FORMAT_R64UI: u32 = 40
+```
+
+## val IMAGE_FORMAT_R64I
+
+```mach
+pub val IMAGE_FORMAT_R64I:  u32 = 41
+```
 
 ## val IMAGE_SAMPLED_YES
 

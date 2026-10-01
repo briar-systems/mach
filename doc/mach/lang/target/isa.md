@@ -1585,8 +1585,10 @@ pub rec OpEnumerant;
 
 one value a literal operand may take and what that value brings: the target's
 own capability word it needs (NO_OP_CAPABILITY for none), the extensions of the
-isa's vocabulary that capability needs selected, and how many operands of the
-row's optional tail it adds to the end of the instruction
+isa's vocabulary that capability needs selected, and the operands it adds to the end
+of the instruction, one letter each as `op_def_shaped` spells them (`""` for none).
+what a value brings is never a pointer or a handle: a row's memory effects are known
+before a call's literal is
 
 ## rec OpEnum
 
@@ -1658,31 +1660,39 @@ pub def OpRelation: u8
 ```
 
 how an operand's or the result's type relates to the row's data type, the type of its
-typing's operand (a pointer operand's pointee): unrelated, that same type, or a vector
-whose component is the sampled type of the handle the typing's operand is
+typing's operand (a pointer operand's pointee): unrelated, that same type, a vector
+whose component is the sampled type of the handle the typing's operand is, or, for a
+pointer result only, a pointer to that sampled type, into the memory of the handle the
+typing's pointer operand addresses
 
 ## val OP_RELATION_NONE
 
 ```mach
-pub val OP_RELATION_NONE:  OpRelation = 0
+pub val OP_RELATION_NONE:    OpRelation = 0
 ```
 
 ## val OP_RELATION_DATA
 
 ```mach
-pub val OP_RELATION_DATA:  OpRelation = 1
+pub val OP_RELATION_DATA:    OpRelation = 1
 ```
 
 ## val OP_RELATION_TEXEL
 
 ```mach
-pub val OP_RELATION_TEXEL: OpRelation = 2
+pub val OP_RELATION_TEXEL:   OpRelation = 2
+```
+
+## val OP_RELATION_POINTEE
+
+```mach
+pub val OP_RELATION_POINTEE: OpRelation = 3
 ```
 
 ## val OP_RELATION_COUNT
 
 ```mach
-pub val OP_RELATION_COUNT: OpRelation = 3
+pub val OP_RELATION_COUNT:   OpRelation = 4
 ```
 
 ## rec OpScalar
@@ -1743,6 +1753,15 @@ pub def TypeSampledFn: fun(*u32, u32) OpScalar
 the scalar a handle's texels are read and written as, from its operands, class
 OP_DATA_OTHER when it has none
 
+## def TypeAddressFn
+
+```mach
+pub def TypeAddressFn: fun(*u32, u32) str
+```
+
+why no instruction may derive a pointer into a handle's memory, from its operands, nil
+when one may
+
 ## val HANDLE_BIND_SAMPLER
 
 ```mach
@@ -1797,9 +1816,10 @@ value, `c` a constant id, `l` a literal word, `r` a pointer only read through, `
 a pointer only stored through, `u` a pointer read and written (read-modify-write),
 `i` a handle whose memory is read, `o` a handle whose memory is written, `b` a
 truth value.
-the letters after a `|` are the optional tail (`"clv|c"`), present only as far as a
-literal enumerant's value brings them. a tail may lead with the enumerated literal
-that decides it (`"iv|lv"`), which a call passes or leaves out with its operands.
+a row spells only its own operands: the ones an enumerated literal's value brings
+follow them, typed by the enumerant (`op_enumerated`). a `|` makes the literal after
+it optional (`"iv|l"`), a call passing it or leaving it out with every operand its
+value would bring, and nothing else follows it.
 a letter outside the set is an invalid kind, which registration refuses
 
 ## fun op_requiring
@@ -1816,7 +1836,8 @@ pub fun op_requiring(d: OpDef, capability: u32, requires: u64) OpDef;
 pub fun op_enumerated(d: OpDef, operand: u32, e: *OpEnum) OpDef;
 ```
 
-`d` with its literal operand `operand` held to the values of `e`
+`d` with its literal operand `operand` held to the values of `e`, and room after the
+operands it spells for the most every enumerated literal's value brings
 
 ## fun op_typed
 
@@ -1874,6 +1895,22 @@ pub fun op_tail_literal(d: *OpDef) *OpEnum;
 
 the enumeration of the optional literal that leads `d`'s tail, nil when the tail has none
 
+## fun op_enumerant_brings
+
+```mach
+pub fun op_enumerant_brings(v: *OpEnumerant) u32;
+```
+
+how many operands the enumerant `v` brings
+
+## fun op_enumerant_kind
+
+```mach
+pub fun op_enumerant_kind(v: *OpEnumerant, k: u32) OpOperandKind;
+```
+
+the kind of the `k`th operand the enumerant `v` brings
+
 ## fun op_enumerant_of
 
 ```mach
@@ -1917,11 +1954,27 @@ the operands before its tail, the literal leading the tail when the call passes 
 and every operand an enumerated value brings. `out_bad` receives the first
 enumerated operand whose word is no value of its enumeration, else NO_OPERAND
 
+## fun op_call_kinds
+
+```mach
+pub fun op_call_kinds(d: *OpDef, argc: u32, words: *u32, out: *OpOperandKind);
+```
+
+the kind of each operand of a call of `d` passing `argc` operands with the literal
+words `words`, into `out` (OP_MAX_OPERANDS long): the operands the row spells by the
+row, then each operand a literal's value brings by the enumerant that brings it, in
+the order of the literals and of each mask's bits. a call `op_call_arity` refuses
+has the kinds of the operands it does take, and the rest are values
+
 ## fun op_operand_kind
 
 ```mach
 pub fun op_operand_kind(d: *OpDef, i: u32) OpOperandKind;
 ```
+
+the kind of operand `i` as the row spells it. an operand a literal's value brings is
+typed by its enumerant (`op_call_kinds`), and is never a pointer or a handle, so it
+reads here as a value
 
 ## fun op_kind_is_pointer
 
@@ -1971,6 +2024,15 @@ pub fun type_def_sampled(td: *TypeDef, ops: *u32, n: u32) OpScalar;
 
 the scalar texels of a handle of constructor `td` with operands `ops` are, class
 OP_DATA_OTHER when the constructor declares none
+
+## fun type_def_address
+
+```mach
+pub fun type_def_address(td: *TypeDef, ops: *u32, n: u32) str;
+```
+
+why no instruction may derive a pointer into a handle of constructor `td` with operands
+`ops`, nil when one may
 
 ## fun target_defs
 
