@@ -1614,22 +1614,27 @@ pub fun atomic_fadd(p: *f32, scope: u32, semantics: u32, v: f32) f32;
 ```
 
 A 32-bit integer atomic is core in every storage class. Every other type needs the
-Vulkan device feature of its storage class, named for its `shaderBuffer*` or
-`shaderShared*` member: `buffer_*` on a storage buffer (`StorageBuffer`, or `Uniform`
-before SPIR-V 1.3), `shared_*` on [`#[shared]`](#inputn--outputn--builtinstr--uniformset-binding--storageset-binding--samplerset-binding--push--specid--shared--shader-interface)
-workgroup memory. Any other storage class is refused. An `f16` atomic is refused: its
+Vulkan device feature of its storage class, named for its `shaderBuffer*`,
+`shaderShared*` or `shaderImage*` member: `buffer_*` on a storage buffer
+(`StorageBuffer`, or `Uniform` before SPIR-V 1.3), `shared_*` on [`#[shared]`](#inputn--outputn--builtinstr--uniformset-binding--storageset-binding--samplerset-binding--push--specid--shared--shader-interface)
+workgroup memory, and `image_*` on a storage image texel (`Image`, through
+`OpImageTexelPointer`), where Vulkan defines only a 64-bit integer and an `f32`. Any
+other storage class is refused. An image of 64-bit texels (`R64ui` or `R64i`) declares
+`Int64ImageEXT` (`SPV_EXT_shader_image_int64`), which `image_int64_atomics` enables, so
+the image itself needs that feature whatever reaches it. An `f16` atomic is refused: its
 pointee must be an `OpTypeFloat 16`, and an `f16` in memory is carried as its 16-bit
 integer.
 
 | Rows | Type | Extensions | Vulkan feature | Capability (SPIR-V extension) |
 |------|------|-----------|----------------|-------------------------------|
 | all 15 integer atomics | `u32`, `i32` | none | core | none |
-| all 15 integer atomics | `u64`, `i64` | `buffer_int64_atomics`, `shared_int64_atomics` | `shaderBufferInt64Atomics`, `shaderSharedInt64Atomics` | `Int64Atomics` |
-| `OpAtomicLoad`, `OpAtomicStore`, `OpAtomicExchange` | `f32`, `f64` | `buffer_float{32,64}_atomics`, `shared_float{32,64}_atomics` | `shader{Buffer,Shared}Float{32,64}Atomics` | none |
-| `OpAtomicFAddEXT` | `f32`, `f64` | `buffer_float{32,64}_atomic_add`, `shared_float{32,64}_atomic_add` | `shader{Buffer,Shared}Float{32,64}AtomicAdd` | `AtomicFloat{32,64}AddEXT` (`SPV_EXT_shader_atomic_float_add`) |
-| `OpAtomicFMinEXT`, `OpAtomicFMaxEXT` | `f32`, `f64` | `buffer_float{32,64}_atomic_min_max`, `shared_float{32,64}_atomic_min_max` | `shader{Buffer,Shared}Float{32,64}AtomicMinMax` | `AtomicFloat{32,64}MinMaxEXT` (`SPV_EXT_shader_atomic_float_min_max`) |
+| all 15 integer atomics | `u64`, `i64` | `buffer_int64_atomics`, `shared_int64_atomics`, `image_int64_atomics` | `shaderBufferInt64Atomics`, `shaderSharedInt64Atomics`, `shaderImageInt64Atomics` | `Int64Atomics` |
+| `OpAtomicLoad`, `OpAtomicStore`, `OpAtomicExchange` | `f32`, `f64` | `buffer_float{32,64}_atomics`, `shared_float{32,64}_atomics`, `image_float32_atomics` | `shader{Buffer,Shared}Float{32,64}Atomics`, `shaderImageFloat32Atomics` | none |
+| `OpAtomicFAddEXT` | `f32`, `f64` | `buffer_float{32,64}_atomic_add`, `shared_float{32,64}_atomic_add`, `image_float32_atomic_add` | `shader{Buffer,Shared}Float{32,64}AtomicAdd`, `shaderImageFloat32AtomicAdd` | `AtomicFloat{32,64}AddEXT` (`SPV_EXT_shader_atomic_float_add`) |
+| `OpAtomicFMinEXT`, `OpAtomicFMaxEXT` | `f32`, `f64` | `buffer_float{32,64}_atomic_min_max`, `shared_float{32,64}_atomic_min_max`, `image_float32_atomic_min_max` | `shader{Buffer,Shared}Float{32,64}AtomicMinMax`, `shaderImageFloat32AtomicMinMax` | `AtomicFloat{32,64}MinMaxEXT` (`SPV_EXT_shader_atomic_float_min_max`) |
 
 The features come from `VkPhysicalDeviceShaderAtomicInt64Features`,
+`VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT`,
 `VkPhysicalDeviceShaderAtomicFloatFeaturesEXT` and
 `VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT`. No environment guarantees any of
 them, so a target names each one its consumer enables, and a target naming no `env`
@@ -1653,6 +1658,7 @@ at the declaration rather than as an invalid module.
 |------|----------|
 | every atomic | the result and each value operand are the pointer's pointee |
 | `OpImageRead`, `OpImageFetch`, `OpImageWrite` | the texel, the result or the last operand, is a vector of the image's texel scalar |
+| `OpImageTexelPointer` | the result points to the image's texel scalar, into a storage image of `R32ui`, `R32i`, `R32f`, `R64ui` or `R64i` format |
 | `OpGroupNonUniformBroadcast*`, `Shuffle*`, `Quad*` and the arithmetic rows | the result is the value operand's type |
 | the GLSL.std.450 math rows | the result and every operand are the first operand's type, except `Refract`'s `eta`, and `Length` and `Distance`, whose result is a scalar |
 | `OpDot` | the second vector is the first's type |
