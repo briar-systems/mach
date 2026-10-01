@@ -1367,7 +1367,9 @@ instruction only reads through, only stores through, or reads and writes, a
 handle value whose memory the instruction reads or writes (a handle passed as
 an ordinary value names its descriptor and touches none of its memory), or a
 truth value the target writes as its boolean type, from an integer argument
-whose nonzero is true
+whose nonzero is true. a memory scope or a memory semantics operand is a
+constant id too, one the target reads by value and holds to what that value
+needs under its memory model
 
 ## val OP_OPERAND_VALUE
 
@@ -1423,10 +1425,22 @@ pub val OP_OPERAND_HANDLE_WRITE:   OpOperandKind = 7
 pub val OP_OPERAND_BOOL:           OpOperandKind = 8
 ```
 
+## val OP_OPERAND_SCOPE
+
+```mach
+pub val OP_OPERAND_SCOPE:          OpOperandKind = 9
+```
+
+## val OP_OPERAND_SEMANTICS
+
+```mach
+pub val OP_OPERAND_SEMANTICS:      OpOperandKind = 10
+```
+
 ## val OP_OPERAND_KIND_COUNT
 
 ```mach
-pub val OP_OPERAND_KIND_COUNT:     OpOperandKind = 9
+pub val OP_OPERAND_KIND_COUNT:     OpOperandKind = 11
 ```
 
 ## def OpResult
@@ -1719,7 +1733,7 @@ a row spelled by its operand signature, one letter per operand in order: `v` a
 value, `c` a constant id, `l` a literal word, `r` a pointer only read through, `w`
 a pointer only stored through, `u` a pointer read and written (read-modify-write),
 `i` a handle whose memory is read, `o` a handle whose memory is written, `b` a
-truth value.
+truth value, `s` a memory scope and `m` a memory semantics, each a constant id.
 a row spells only its own operands: the ones an enumerated literal's value brings
 follow them, typed by the enumerant (`op_enumerated`). a `|` makes the literal after
 it optional (`"iv|l"`), a call passing it or leaving it out with every operand its
@@ -1885,6 +1899,14 @@ reads here as a value
 ```mach
 pub fun op_kind_is_pointer(k: OpOperandKind) bool;
 ```
+
+## fun op_kind_is_constant
+
+```mach
+pub fun op_kind_is_constant(k: OpOperandKind) bool;
+```
+
+an id that must be an integer constant by emission, whatever the target reads its value as
 
 ## fun op_kind_is_handle
 
