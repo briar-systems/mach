@@ -477,6 +477,61 @@ of a declared record, union or tag (`#[volatile]`, see
 [decorators.md](decorators.md#volatile--every-access-to-the-type-is-a-volatile-access)),
 so an access through `*T` is volatile exactly when `T`'s storage is.
 
+### Pointers on SPIR-V
+
+A SPIR-V target has two kinds of pointer, and mach spells both `*T`. The compiler
+works out which one a pointer is from where it comes from, the same way it works out
+the storage class of every pointer on that target.
+
+- A **logical** pointer names memory the module declares: a local, a shader
+  interface variable, or an element or member of one. `?place` makes one, and so
+  does an access through one. It has no address. It can be handed to a function,
+  but it cannot be stored in memory, returned, compared, ordered, cast to an
+  integer or stepped across whole objects.
+- A **physical** pointer is an address in a buffer the host passes by its device
+  address (`vkGetBufferDeviceAddress`). A pointer read from memory is one, since
+  memory holds no logical pointer. So is one made from an integer (`addr::*Node`),
+  one a function returns, one passed for a physical pointer parameter, `nil`, and
+  one reached through a physical pointer.
+
+```mach fragment
+rec Node { next: *Node; value: u32; }
+rec Head { first: *Node; total: u32; }
+#[storage(0, 0)] var head: Head;
+
+#[stage("compute")]
+#[workgroup(1, 1, 1)]
+fun walk() {
+    var p:   *Node = head.first;
+    var sum: u32   = 0;
+    for (p != nil) {
+        sum = sum + p.value;
+        p   = p.next;
+    }
+    head.total = sum;
+}
+```
+
+A physical pointer is a full `*T`. It is dereferenced, indexed, stepped (`?p[i]`),
+compared, ordered as an unsigned 64-bit address and cast to and from `u64`, and it
+can be held in memory, passed and returned. Its pointee is laid out by the std430
+rules a `#[storage]` block follows (see [decorators.md](decorators.md)), refused
+where mach's layout disagrees with them. A record that reaches itself through
+pointers, like `Node` above, is a recursive type, and so is a set of records that
+reach each other. A tag cannot sit behind a physical pointer.
+
+Every load and store through a physical pointer carries the pointee's alignment, so
+an address made from an integer must be aligned for the type it points at. Every
+variable and parameter holding one is decorated aliased, since mach makes no
+promise that two pointers do not overlap. Accesses through one are private under
+the Vulkan memory model: no `"coherent"` qualifier reaches device memory.
+
+A register that one path makes logical and another physical is refused, as is
+every operation a logical pointer has no form for, each naming why. Physical
+pointers need the `buffer_device_address` device feature (see
+[manifest.md](manifest.md#finished-module-targets)). A module that holds no physical
+pointer keeps the Logical addressing model and is unchanged by them.
+
 ## Array
 
 `[N]T` — array of exactly `N` values of type `T`. Nested: `[N][M]T`.
