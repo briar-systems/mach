@@ -89,7 +89,8 @@ the wide `d` rounded once, to nearest with ties to even, into the carried bits
 pub fun neg(h: *Half, x: value.Value) value.Value;
 ```
 
-the carried bits negated: the sign flipped, as every float negation does
+the carried bits negated: the sign flipped, as every float negation does. a target
+that negates an f16 itself does so on the f16, where it may hold no 16-bit integer
 
 ## fun arith
 

@@ -676,12 +676,14 @@ and the target selects one with `extensions` when its consumer enables it. A mod
 without `env` has all five. The ceiling below still bounds them, so `int8` or
 `float16` under `vulkan1.0` is refused for the environment, not the feature.
 
-Under `float16` an `f16` is the native `OpTypeFloat 16`, computed and converted by
-the core float instructions, and an `f16` in memory the host or the workgroup shares,
-a stage input or output, a storage buffer, a uniform or push block, a record a
-physical pointer reaches or a `#[shared]` variable, is declared as that type, so an
-atomic can operate on it. A whole record copied between that memory and a local is
-moved member by member where an `f16` is held apart. Without it an `f16` is the software expansion on its 16 bits, which
+Under `float16` an `f16` is the native `OpTypeFloat 16` wherever it lives, computed,
+negated and converted by the core float instructions, so an `f16` shader needs
+`float16` alone. A local, a parameter or a result is that type, and so is an `f16` in
+memory the host or the workgroup shares, a stage input or output, a storage buffer, a
+uniform or push block, a record a physical pointer reaches or a `#[shared]` variable,
+so an atomic can operate on it and a whole record moves between that memory and a
+local as it is. Reading an `f16`'s bits with `:~` into a `u16` or `i16` local, or
+back, needs no `int16` either. Without it an `f16` is the software expansion on its 16 bits, which
 computes in binary32 on 32-bit integers, so it needs neither `int64` nor
 `float64` of its own. An `f64` it converts to or from needs `float64` as any
 `f64` does, and `%` needs `int64`, as it does at every float width.
