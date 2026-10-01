@@ -36,6 +36,14 @@ pub fun types_dnit(tt: *TypeTable);
 pub fun composite_member(tt: *TypeTable, id: u32, index: u32) u32;
 ```
 
+## fun composite_count
+
+```mach
+pub fun composite_count(tt: *TypeTable, id: u32) u32;
+```
+
+how many members, elements or lanes the composite `id` has, 0 when it is none or a runtime array
+
 ## fun logically_match
 
 ```mach
