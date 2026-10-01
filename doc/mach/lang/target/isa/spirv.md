@@ -104,6 +104,12 @@ pub val OP_LINE:                      u32 = 8
 pub val OP_NO_LINE:                   u32 = 317
 ```
 
+## val OP_EXTENSION
+
+```mach
+pub val OP_EXTENSION:                 u32 = 10
+```
+
 ## val OP_EXT_INST_IMPORT
 
 ```mach
@@ -656,6 +662,12 @@ pub val OP_ATOMIC_STORE:              u32 = 228
 pub val OP_ATOMIC_I_ADD:              u32 = 234
 ```
 
+## val OP_GROUP_NON_UNIFORM_I_ADD
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_I_ADD:   u32 = 349
+```
+
 ## val OP_PHI
 
 ```mach
@@ -764,46 +776,139 @@ pub val CAP_SAMPLED_1D:         u32 = 43
 pub val CAP_SAMPLED_CUBE_ARRAY: u32 = 45
 ```
 
+## val CAP_GROUP_NON_UNIFORM
+
+```mach
+pub val CAP_GROUP_NON_UNIFORM:            u32 = 61
+```
+
+## val CAP_GROUP_NON_UNIFORM_ARITHMETIC
+
+```mach
+pub val CAP_GROUP_NON_UNIFORM_ARITHMETIC: u32 = 63
+```
+
+## val CAP_GROUP_NON_UNIFORM_CLUSTERED
+
+```mach
+pub val CAP_GROUP_NON_UNIFORM_CLUSTERED:  u32 = 67
+```
+
+## rec Capability
+
+```mach
+pub rec Capability;
+```
+
+a capability beyond Shader and Linkage, which a module declares only when something
+it emits needs it: a type's width or dimensionality, an instruction row, a literal's
+value or an operand's type. `need` is its bit in Builder.caps_needed and the table's
+order is the order the module declares them in. an environment's ceiling decides the
+capabilities in CEILING_DOMAIN, and every capability needs its SPIR-V version and,
+when `extension` is not nil, the SPIR-V extension that defines it, which the module
+then declares with OpExtension
+
 ## val NEED_INT8
 
 ```mach
-pub val NEED_INT8:               u32 = 0x01
+pub val NEED_INT8:                         u64 = 0x001
 ```
 
 ## val NEED_INT16
 
 ```mach
-pub val NEED_INT16:              u32 = 0x02
+pub val NEED_INT16:                        u64 = 0x002
 ```
 
 ## val NEED_INT64
 
 ```mach
-pub val NEED_INT64:              u32 = 0x04
+pub val NEED_INT64:                        u64 = 0x004
 ```
 
 ## val NEED_FLOAT16
 
 ```mach
-pub val NEED_FLOAT16:            u32 = 0x08
+pub val NEED_FLOAT16:                      u64 = 0x008
 ```
 
 ## val NEED_FLOAT64
 
 ```mach
-pub val NEED_FLOAT64:            u32 = 0x10
+pub val NEED_FLOAT64:                      u64 = 0x010
 ```
 
 ## val NEED_SAMPLED_1D
 
 ```mach
-pub val NEED_SAMPLED_1D:         u32 = 0x20
+pub val NEED_SAMPLED_1D:                   u64 = 0x020
 ```
 
 ## val NEED_SAMPLED_CUBE_ARRAY
 
 ```mach
-pub val NEED_SAMPLED_CUBE_ARRAY: u32 = 0x40
+pub val NEED_SAMPLED_CUBE_ARRAY:           u64 = 0x040
+```
+
+## val NEED_GROUP_NON_UNIFORM
+
+```mach
+pub val NEED_GROUP_NON_UNIFORM:            u64 = 0x080
+```
+
+## val NEED_GROUP_NON_UNIFORM_ARITHMETIC
+
+```mach
+pub val NEED_GROUP_NON_UNIFORM_ARITHMETIC: u64 = 0x100
+```
+
+## val NEED_GROUP_NON_UNIFORM_CLUSTERED
+
+```mach
+pub val NEED_GROUP_NON_UNIFORM_CLUSTERED:  u64 = 0x200
+```
+
+## val CAPABILITY_COUNT
+
+```mach
+pub val CAPABILITY_COUNT: u32 = 10
+```
+
+## val CAPABILITIES
+
+```mach
+pub val CAPABILITIES: [CAPABILITY_COUNT]Capability = [CAPABILITY_COUNT]Capability;
+```
+
+## val CEILING_DOMAIN
+
+```mach
+pub val CEILING_DOMAIN: u64 = NEED_INT8 | NEED_INT16 | NEED_INT64 | NEED_FLOAT16 | NEED_FLOAT64 | NEED_SAMPLED_1D | NEED_SAMPLED_CUBE_ARRAY
+```
+
+the capabilities an environment's ceiling speaks for. the others are held to their
+version and to the extensions the row that needs them names
+
+## fun capability_of
+
+```mach
+pub fun capability_of(word: u32) *Capability;
+```
+
+the table row of the capability word `word`, nil when the table has none
+
+## fun version_major
+
+```mach
+pub fun version_major(version: u32) u32;
+```
+
+`SPIR-V 1.3` for 0x00010300
+
+## fun version_minor
+
+```mach
+pub fun version_minor(version: u32) u32;
 ```
 
 ## fun entry_interface_lists
@@ -837,11 +942,14 @@ pub val EXT_FLOAT16:             u64 = 0x1
 ```
 
 the spirv extension vocabulary: capabilities and device features an
-environment guarantees beyond the core, which the catalog's rows and the
-emitter read. float16 is the Float16 capability, so f16 is the native
-OpTypeFloat 16 (#3801). zero_init_workgroup is the
-shaderZeroInitializeWorkgroupMemory feature, so a `#[shared]` variable takes
-an OpConstantNull initializer instead of the zeroing the compiler inserts (#4270)
+environment guarantees beyond the core, or a consumer enables, which the
+catalog's rows, the instruction rows and the emitter read. float16 is the
+Float16 capability, so f16 is the native OpTypeFloat 16 (#3801).
+zero_init_workgroup is the shaderZeroInitializeWorkgroupMemory feature, so a
+`#[shared]` variable takes an OpConstantNull initializer instead of the zeroing
+the compiler inserts (#4270). subgroup_arithmetic and subgroup_clustered are
+the ARITHMETIC and CLUSTERED bits of Vulkan's subgroupSupportedOperations,
+which no Vulkan version guarantees
 
 ## val EXT_ZERO_INIT_WORKGROUP
 
@@ -849,10 +957,22 @@ an OpConstantNull initializer instead of the zeroing the compiler inserts (#4270
 pub val EXT_ZERO_INIT_WORKGROUP: u64 = 0x2
 ```
 
+## val EXT_SUBGROUP_ARITHMETIC
+
+```mach
+pub val EXT_SUBGROUP_ARITHMETIC: u64 = 0x4
+```
+
+## val EXT_SUBGROUP_CLUSTERED
+
+```mach
+pub val EXT_SUBGROUP_CLUSTERED:  u64 = 0x8
+```
+
 ## val EXTENSION_COUNT
 
 ```mach
-pub val EXTENSION_COUNT: u32 = 2
+pub val EXTENSION_COUNT: u32 = 4
 ```
 
 ## val ONLY_ENVIRONMENT
@@ -876,7 +996,7 @@ pub val EXTENSIONS: [EXTENSION_COUNT]extension.Extension = [EXTENSION_COUNT]exte
 ## val EXT_OPEN
 
 ```mach
-pub val EXT_OPEN: u64 = EXT_FLOAT16 | EXT_ZERO_INIT_WORKGROUP
+pub val EXT_OPEN: u64 = EXT_FLOAT16 | EXT_ZERO_INIT_WORKGROUP | EXT_SUBGROUP_ARITHMETIC | EXT_SUBGROUP_CLUSTERED
 ```
 
 every extension of the vocabulary, which a module naming no environment holds
@@ -902,10 +1022,18 @@ pub fun env_profile(id: u32) *EnvProfile;
 pub fun env_profile_name(id: u32) str;
 ```
 
+## fun env_name_from
+
+```mach
+pub fun env_name_from(version: u32) str;
+```
+
+the first environment whose version reaches `version`
+
 ## fun need_name
 
 ```mach
-pub fun need_name(bit: u32) str;
+pub fun need_name(bit: u64) str;
 ```
 
 ## val EXEC_MODEL_VERTEX

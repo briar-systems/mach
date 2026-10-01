@@ -1471,6 +1471,43 @@ uniform is not statically decidable in general. The compiler does not check
 it, and a barrier inside a branch or loop that some invocations of the scope
 skip is undefined behavior on the device.
 
+A row may also carry **requirements**: a capability and the extensions of the
+target's vocabulary that every use of it needs. A **literal operand can be
+enumerated**, so that its value is one of a closed set the row names (or, for a
+mask, a union of that set's bits), and each value brings a requirement of its own
+and, where the instruction grows with it, operands at the end of the instruction.
+Such a row has an **optional tail**: a declaration may take its required operands
+alone or the tail too, and each call must pass exactly the operands its literal's
+value brings. `OpGroupNonUniformIAdd` is one:
+
+```mach
+#[op("spirv", "core", "OpGroupNonUniformIAdd")]
+pub fun subgroup_add(scope: u32, operation: u32, v: u32) u32;
+
+#[op("spirv", "core", "OpGroupNonUniformIAdd")]
+pub fun subgroup_cluster_add(scope: u32, operation: u32, v: u32, cluster_size: u32) u32;
+```
+
+Its operation is a `GroupOperation`. `Reduce` (0), `InclusiveScan` (1) and
+`ExclusiveScan` (2) need the `subgroup_arithmetic` extension and declare
+`GroupNonUniformArithmetic`, and `ClusteredReduce` (3) needs `subgroup_clustered`,
+declares `GroupNonUniformClustered` and is followed by the ClusterSize operand, so
+it is passed only to the four-parameter declaration. Each is checked at the call,
+where the literal's value is known:
+
+| At the call                                            | Is refused with                    |
+|--------------------------------------------------------|------------------------------------|
+| a value outside the operand's enumeration              | `op.operand_value`, naming the values |
+| a value whose operands the declaration does not pass, or passes without it | `op.operand_value`, naming the count |
+| a requirement's extension the target does not select   | `spirv.capability`, naming the extension |
+| a capability whose SPIR-V version the environment is below | `spirv.capability`, naming the first `env` that reaches it |
+
+A device feature is an extension the target names in its `extensions` once the
+consumer enables it, since no environment guarantees it: `subgroup_arithmetic` is
+Vulkan's `VK_SUBGROUP_FEATURE_ARITHMETIC_BIT`, and a target naming no `env` holds
+every extension. A module declares a capability only when something it emits needs
+it, with `OpExtension` for a capability a SPIR-V extension defines.
+
 `OpExtInstImport "GLSL.std.450"` is emitted **once per module and only when that
 module uses the set**. A module that calls none of these carries no import.
 
@@ -1487,8 +1524,10 @@ it does, that body is what every non-`spirv` target runs while `spirv` substitut
 the instruction. A `spirv` build never emits the body at all.
 
 The set of accepted instructions is the table in
-`src/lang/target/isa/spirv/defs.mach`, where each row carries its operand kinds and
-its result. Adding an instruction is a row in it.
+`src/lang/target/isa/spirv/defs.mach`, where each row carries its operand kinds, its
+result, its requirements and the enumerations of its literals. The capabilities, with
+the SPIR-V version and extension each needs, are the table in
+`src/lang/target/isa/spirv.mach`. Adding an instruction is a row in it.
 
 ## Applicability
 
