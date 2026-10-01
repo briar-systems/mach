@@ -239,11 +239,12 @@ whether `en` is an instruction's view of the Image Operands mask
 ## fun image_use_refusal
 
 ```mach
-pub fun image_use_refusal(opcode: u32, image: bool, ms: bool, mask: u32) str;
+pub fun image_use_refusal(opcode: u32, image: bool, ms: bool, storage: bool, dim: u32, mask: u32) str;
 ```
 
 why an image instruction's use is invalid, nil when it is valid: `image` says whether
-its first operand is an image, `ms` whether that image is multisampled, and `mask`
-is the Image Operands mask it passes, 0 when it passes none. a multisampled image's
-texel is named by its sample, and only a multisampled image has samples
+its first operand is an image, `ms` whether that image is multisampled, `storage`
+whether it is a storage image and `dim` its dimensionality, and `mask` is the Image
+Operands mask it passes, 0 when it passes none. a multisampled image's texel is named
+by its sample, and only a multisampled image has samples
 

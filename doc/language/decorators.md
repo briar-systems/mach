@@ -1183,6 +1183,9 @@ the level it reads. A multisampled image is read, written and fetched only with
 `Sample`, and only a multisampled image takes it. `OpImageSampleExplicitLod`
 always takes the mask, which must set `Lod`. `OpImageQuerySamples` reads the sample
 count of a multisampled image only, and `OpImageQuerySizeLod` does not take one.
+`OpImageQuerySize` reads an image with no level of detail to choose, a multisampled
+image, a storage image or a texel buffer, so a single-sampled sampled image is
+queried with `OpImageQuerySizeLod` instead.
 Each is refused at the call with `op.operand_value`.
 
 ```mach fragment
