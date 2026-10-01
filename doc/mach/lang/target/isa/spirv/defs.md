@@ -161,7 +161,7 @@ pub val IMAGE_OP_FORMAT:  u32 = 6
 ## val OP_DEF_COUNT
 
 ```mach
-pub val OP_DEF_COUNT:   usize = 105
+pub val OP_DEF_COUNT:   usize = 107
 ```
 
 ## val TYPE_DEF_COUNT
@@ -414,6 +414,14 @@ pub val DREF_REFERENCE: isa.OpOperandScalar = isa.OpOperandScalar;
 
 the reference a depth comparison compares each texel against, a 32-bit float whatever the
 image's sampled type
+
+## val FREXP_EXPONENT
+
+```mach
+pub val FREXP_EXPONENT: isa.OpOperandScalar = isa.OpOperandScalar;
+```
+
+the exponent `Frexp` stores through its out-pointer, shaped like the value it splits
 
 ## rec DefStorage
 

@@ -1737,7 +1737,19 @@ at the declaration rather than as an invalid module.
 | `OpSampledImage` | the result is a sampled image composed over the image operand's own type, and the second operand is a `sampler` |
 | `OpGroupNonUniformBroadcast*`, `Shuffle*`, `Quad*` and the arithmetic rows | the result is the value operand's type |
 | the GLSL.std.450 math rows | the result and every operand are the first operand's type, except `Refract`'s `eta`, and `Length` and `Distance`, whose result is a scalar |
+| `Modf` | the result is the value's type, and the out-pointer points to the value's type, where the whole part is stored |
+| `Frexp` | the result is the value's type, and the out-pointer points to an `i32` scalar or vector with as many components as the value, where the exponent is stored |
 | `OpDot` | the second vector is the first's type |
+
+A relation on a pointer operand, such as the out-pointer `Modf` and `Frexp` store
+their second part through, holds the type it points to. The pointer may address a
+local, a `#[shared]` variable or a storage buffer, or any part of one, and the store
+counts as a write to that binding, so a `readonly` one is refused.
+
+```mach
+#[op("spirv", "GLSL.std.450", "Frexp")]
+pub fun frexp(x: f32x4, exp: *i32x4) f32x4;
+```
 
 A declaration that returns a handle is refused with `op.signature` unless its row
 names the operand its result derives from, since a handle holds a binding's
