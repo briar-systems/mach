@@ -695,11 +695,15 @@ Under `int8` and `int16` an integer of that width computes at its own width.
 Without the feature, an integer of that width is carried, wherever it lives in a
 function, in a 32-bit integer, which needs no capability: a `u8`, `i8`, `u16` or
 `i16` local, and a `bool`, is wrapped and extended at its own width where the
-program can tell. A member of an aggregate or of a vector keeps its declared width,
-so an 8-bit or 16-bit one in a local or in `#[shared]` memory needs its feature, and
-the module is refused, naming it, without. Memory the host shares keeps its width
-too, under the storage feature below rather than `int8` or `int16`, and a load from
-it or a store to it converts to and from the wider integer the function computes in.
+program can tell. A vector is carried lane by lane the same way, so a `u8x4`,
+`i16x4` or `u16x8` local, and without `float16` an `f16x4`, needs no feature either,
+and its lanes are wrapped and extended at their own width where the program can
+tell, a reinterpret with `:~` included. A member of an aggregate keeps its declared
+width, so an 8-bit or 16-bit one, or a vector of them, in a local or in `#[shared]`
+memory needs its feature, and the module is refused, naming it, without. Memory the
+host shares keeps its width too, under the storage feature below rather than `int8`
+or `int16`, and a load from it or a store to it converts to and from the wider integer
+the function computes in.
 Nothing carries a 64-bit type, so a module holding a `u64`, `i64` or `f64` anywhere
 needs `int64` or `float64`.
 
@@ -716,9 +720,12 @@ the version that took it into the core.
 | `#[push]` | `storage_push_constant16` (`StoragePushConstant16`) | `storage_push_constant8` (`StoragePushConstant8`) |
 | `#[input(n)]`, `#[output(n)]` | `storage_input_output16` (`StorageInputOutput16`) | refused |
 
-A stage output starts at a zero constant, and a constant of an 8- or 16-bit type
-needs the type's own feature, `int8`, `int16` or `float16`, so an output holding
-one needs that as well as `storage_input_output16`. The 16-bit capabilities need
+A stage output starts at its initializer, and at zero without one. A constant of a
+16-bit type needs the type's own feature, `int16` or `float16`, so an output holding a
+16-bit scalar without it carries no zero constant: each stage that reaches it stores
+the zero first, converted from a 32-bit one, and the output needs
+`storage_input_output16` alone. One initialized to anything but zero starts at that
+constant, which needs the type's feature as well. The 16-bit capabilities need
 `SPV_KHR_16bit_storage` below SPIR-V 1.3 and the 8-bit ones `SPV_KHR_8bit_storage`
 below SPIR-V 1.5. Vulkan defines no 8-bit stage input or
 output, so one is refused, and an 8-bit member of a `#[storage(...)]` buffer is
