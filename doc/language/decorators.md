@@ -1521,8 +1521,14 @@ Its operation is a `GroupOperation`. `Reduce` (0), `InclusiveScan` (1) and
 `ExclusiveScan` (2) need the `subgroup_arithmetic` extension and declare
 `GroupNonUniformArithmetic`, and `ClusteredReduce` (3) needs `subgroup_clustered`,
 declares `GroupNonUniformClustered` and is followed by the ClusterSize operand, so
-it is passed only to the four-parameter declaration. Each is checked at the call,
-where the literal's value is known:
+it is passed only to the four-parameter declaration.
+
+Where the specification makes the literal itself optional, as it does an
+instruction's `Image Operands` or `Memory Operands`, the literal **leads the tail**:
+a declaration leaves it out with every operand it would bring, or takes it followed
+by those operands. A mask's set bits bring theirs in ascending bit order, the order
+the specification writes them in, so the parameters after the mask are declared in
+that order. Each is checked at the call, where the literal's value is known:
 
 | At the call                                            | Is refused with                    |
 |--------------------------------------------------------|------------------------------------|
