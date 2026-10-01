@@ -368,6 +368,18 @@ pub val OP_IMAGE_SAMPLE_IMPLICIT_LOD: u32 = 87
 pub val OP_IMAGE_SAMPLE_EXPLICIT_LOD: u32 = 88
 ```
 
+## val OP_IMAGE_READ
+
+```mach
+pub val OP_IMAGE_READ:                u32 = 98
+```
+
+## val OP_IMAGE_WRITE
+
+```mach
+pub val OP_IMAGE_WRITE:               u32 = 99
+```
+
 ## val OP_CONVERT_F_TO_U
 
 ```mach
@@ -746,58 +758,142 @@ pub val CAP_INT16:   u32 = 22
 pub val CAP_INT8:    u32 = 39
 ```
 
+## val CAP_IMAGE_CUBE_ARRAY
+
+```mach
+pub val CAP_IMAGE_CUBE_ARRAY:               u32 = 34
+```
+
 ## val CAP_SAMPLED_1D
 
 ```mach
-pub val CAP_SAMPLED_1D:         u32 = 43
+pub val CAP_SAMPLED_1D:                     u32 = 43
+```
+
+## val CAP_IMAGE_1D
+
+```mach
+pub val CAP_IMAGE_1D:                       u32 = 44
 ```
 
 ## val CAP_SAMPLED_CUBE_ARRAY
 
 ```mach
-pub val CAP_SAMPLED_CUBE_ARRAY: u32 = 45
+pub val CAP_SAMPLED_CUBE_ARRAY:             u32 = 45
+```
+
+## val CAP_SAMPLED_BUFFER
+
+```mach
+pub val CAP_SAMPLED_BUFFER:                 u32 = 46
+```
+
+## val CAP_IMAGE_BUFFER
+
+```mach
+pub val CAP_IMAGE_BUFFER:                   u32 = 47
+```
+
+## val CAP_STORAGE_IMAGE_EXTENDED_FORMATS
+
+```mach
+pub val CAP_STORAGE_IMAGE_EXTENDED_FORMATS: u32 = 49
+```
+
+## val CAP_STORAGE_IMAGE_READ_NO_FORMAT
+
+```mach
+pub val CAP_STORAGE_IMAGE_READ_NO_FORMAT:   u32 = 55
+```
+
+## val CAP_STORAGE_IMAGE_WRITE_NO_FORMAT
+
+```mach
+pub val CAP_STORAGE_IMAGE_WRITE_NO_FORMAT:  u32 = 56
 ```
 
 ## val NEED_INT8
 
 ```mach
-pub val NEED_INT8:               u32 = 0x01
+pub val NEED_INT8:                     u32 = 0x01
 ```
 
 ## val NEED_INT16
 
 ```mach
-pub val NEED_INT16:              u32 = 0x02
+pub val NEED_INT16:                    u32 = 0x02
 ```
 
 ## val NEED_INT64
 
 ```mach
-pub val NEED_INT64:              u32 = 0x04
+pub val NEED_INT64:                    u32 = 0x04
 ```
 
 ## val NEED_FLOAT16
 
 ```mach
-pub val NEED_FLOAT16:            u32 = 0x08
+pub val NEED_FLOAT16:                  u32 = 0x08
 ```
 
 ## val NEED_FLOAT64
 
 ```mach
-pub val NEED_FLOAT64:            u32 = 0x10
+pub val NEED_FLOAT64:                  u32 = 0x10
 ```
 
 ## val NEED_SAMPLED_1D
 
 ```mach
-pub val NEED_SAMPLED_1D:         u32 = 0x20
+pub val NEED_SAMPLED_1D:               u32 = 0x20
 ```
 
 ## val NEED_SAMPLED_CUBE_ARRAY
 
 ```mach
-pub val NEED_SAMPLED_CUBE_ARRAY: u32 = 0x40
+pub val NEED_SAMPLED_CUBE_ARRAY:       u32 = 0x40
+```
+
+## val NEED_IMAGE_1D
+
+```mach
+pub val NEED_IMAGE_1D:                 u32 = 0x80
+```
+
+## val NEED_IMAGE_CUBE_ARRAY
+
+```mach
+pub val NEED_IMAGE_CUBE_ARRAY:         u32 = 0x100
+```
+
+## val NEED_SAMPLED_BUFFER
+
+```mach
+pub val NEED_SAMPLED_BUFFER:           u32 = 0x200
+```
+
+## val NEED_IMAGE_BUFFER
+
+```mach
+pub val NEED_IMAGE_BUFFER:             u32 = 0x400
+```
+
+## val NEED_STORAGE_EXTENDED_FORMATS
+
+```mach
+pub val NEED_STORAGE_EXTENDED_FORMATS: u32 = 0x800
+```
+
+## val NEED_READ_WITHOUT_FORMAT
+
+```mach
+pub val NEED_READ_WITHOUT_FORMAT:      u32 = 0x1000
+```
+
+## val NEED_WRITE_WITHOUT_FORMAT
+
+```mach
+pub val NEED_WRITE_WITHOUT_FORMAT:     u32 = 0x2000
 ```
 
 ## fun entry_interface_lists
@@ -827,7 +923,7 @@ pub fun storage_block_decoration(version: u32) u32;
 ## val EXT_FLOAT16
 
 ```mach
-pub val EXT_FLOAT16:             u64 = 0x1
+pub val EXT_FLOAT16:                      u64 = 0x1
 ```
 
 the spirv extension vocabulary: capabilities and device features an
@@ -835,18 +931,33 @@ environment guarantees beyond the core, which the catalog's rows and the
 emitter read. float16 is the Float16 capability, so f16 is the native
 OpTypeFloat 16 (#3801). zero_init_workgroup is the
 shaderZeroInitializeWorkgroupMemory feature, so a `#[shared]` variable takes
-an OpConstantNull initializer instead of the zeroing the compiler inserts (#4270)
+an OpConstantNull initializer instead of the zeroing the compiler inserts (#4270).
+storage_read_without_format and storage_write_without_format are the
+shaderStorageImageReadWithoutFormat and shaderStorageImageWriteWithoutFormat
+features, so a storage image of Unknown format may be read or written (#4272)
 
 ## val EXT_ZERO_INIT_WORKGROUP
 
 ```mach
-pub val EXT_ZERO_INIT_WORKGROUP: u64 = 0x2
+pub val EXT_ZERO_INIT_WORKGROUP:          u64 = 0x2
+```
+
+## val EXT_STORAGE_READ_WITHOUT_FORMAT
+
+```mach
+pub val EXT_STORAGE_READ_WITHOUT_FORMAT:  u64 = 0x4
+```
+
+## val EXT_STORAGE_WRITE_WITHOUT_FORMAT
+
+```mach
+pub val EXT_STORAGE_WRITE_WITHOUT_FORMAT: u64 = 0x8
 ```
 
 ## val EXTENSION_COUNT
 
 ```mach
-pub val EXTENSION_COUNT: u32 = 2
+pub val EXTENSION_COUNT: u32 = 4
 ```
 
 ## val ONLY_ENVIRONMENT
@@ -870,7 +981,8 @@ pub val EXTENSIONS: [EXTENSION_COUNT]extension.Extension = [EXTENSION_COUNT]exte
 ## val EXT_OPEN
 
 ```mach
-pub val EXT_OPEN: u64 = EXT_FLOAT16 | EXT_ZERO_INIT_WORKGROUP
+pub val EXT_OPEN: u64 = EXT_FLOAT16 | EXT_ZERO_INIT_WORKGROUP | EXT_STORAGE_READ_WITHOUT_FORMAT
+| EXT_STORAGE_WRITE_WITHOUT_FORMAT
 ```
 
 every extension of the vocabulary, which a module naming no environment holds
@@ -882,7 +994,25 @@ pub fun env_extensions(id: u32) u64;
 ```
 
 the extensions an environment guarantees: float16 where its ceiling holds
-Float16, and zero_init_workgroup from vulkan1.3, where the feature is core
+Float16, and from vulkan1.3 zero_init_workgroup, where the feature is core, and
+the two without-format features, whose capabilities it accepts with none enabled
+
+## fun env_allows
+
+```mach
+pub fun env_allows(ceiling: u32, extensions: u64) u32;
+```
+
+the capabilities an environment accepts: its ceiling, and the ones the selected
+extensions open
+
+## fun need_extension
+
+```mach
+pub fun need_extension(bit: u32) str;
+```
+
+the extension that opens a capability the ceiling does not hold, "" for none
 
 ## fun env_profile
 
@@ -947,13 +1077,19 @@ pub val ADDRESSING_LOGICAL: u32 = 0
 ## val DIM_1D
 
 ```mach
-pub val DIM_1D:   u32 = 0
+pub val DIM_1D:     u32 = 0
 ```
 
 ## val DIM_CUBE
 
 ```mach
-pub val DIM_CUBE: u32 = 3
+pub val DIM_CUBE:   u32 = 3
+```
+
+## val DIM_BUFFER
+
+```mach
+pub val DIM_BUFFER: u32 = 5
 ```
 
 ## val IMAGE_FORMAT_UNKNOWN
@@ -962,11 +1098,55 @@ pub val DIM_CUBE: u32 = 3
 pub val IMAGE_FORMAT_UNKNOWN: u32 = 0
 ```
 
+## val IMAGE_FORMAT_LAST_FLOAT
+
+```mach
+pub val IMAGE_FORMAT_LAST_FLOAT: u32 = 20
+```
+
+the last format of each texel class: float formats, then signed, then unsigned integer
+
+## val IMAGE_FORMAT_LAST_SINT
+
+```mach
+pub val IMAGE_FORMAT_LAST_SINT:  u32 = 29
+```
+
+## val IMAGE_FORMAT_LAST_UINT
+
+```mach
+pub val IMAGE_FORMAT_LAST_UINT:  u32 = 39
+```
+
+## val IMAGE_FORMAT_FIRST_INT64
+
+```mach
+pub val IMAGE_FORMAT_FIRST_INT64: u32 = 40
+```
+
+R64ui and R64i, which need Int64ImageEXT
+
 ## val IMAGE_SAMPLED_YES
 
 ```mach
-pub val IMAGE_SAMPLED_YES: u32 = 1
+pub val IMAGE_SAMPLED_YES:     u32 = 1
 ```
+
+## val IMAGE_SAMPLED_STORAGE
+
+```mach
+pub val IMAGE_SAMPLED_STORAGE: u32 = 2
+```
+
+## fun image_format_is_base
+
+```mach
+pub fun image_format_is_base(fmt: u32) bool;
+```
+
+a format the Shader capability declares: Rgba32f, Rgba16f, R32f, Rgba8 and Rgba8Snorm,
+their Rgba32/Rgba16/Rgba8/R32 signed and unsigned integer forms. every other format
+needs StorageImageExtendedFormats
 
 ## val MEMORY_GLSL450
 
