@@ -1255,6 +1255,14 @@ pub fun max_alu_width(m: *MachineModel) u32;
 the widest legal alu width, above which legalize splits an operation into
 lanes; 0 for a model that declares none
 
+## fun alu_width_floor_set
+
+```mach
+pub fun alu_width_floor_set(m: *MachineModel) u32;
+```
+
+the alu widths legal under every extension set, encoded like int_widths
+
 ## fun clamp_alu_width
 
 ```mach
@@ -1262,8 +1270,9 @@ pub fun clamp_alu_width(m: *MachineModel, w: u8) u8;
 ```
 
 the width an integer operation of `w` bytes computes at: w itself when it is
-legal, otherwise the narrowest legal width above it, and w again when none is
-(legalize splits it)
+legal, otherwise the narrowest width above it that is legal whatever the
+extensions, so a lift never needs a capability the program did not spell; w
+again when none is (legalize splits it)
 
 ## fun realizes_int_width
 

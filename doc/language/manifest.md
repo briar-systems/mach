@@ -633,10 +633,11 @@ and `vulkan1.1`, an `f16` is the software expansion on its 16 bits.
 
 The environment likewise selects `int8` and `int16` where its ceiling holds Int8
 and Int16, and a module without `env` has both. An integer of a width the
-environment lacks is carried, wherever it lives in a function, in the narrowest
-wider integer it has: under `vulkan1.0` and `vulkan1.1` a `u8` or `i8` local, and a
-`bool`, is a 16-bit integer, wrapped and extended at 8 bits where the program can
-tell, so the module needs no Int8. A member of an aggregate or of a vector keeps
+environment lacks is carried, wherever it lives in a function, in a 32-bit
+integer, which needs no capability: under `vulkan1.0` and `vulkan1.1` a `u8` or
+`i8` local, and a `bool`, is wrapped and extended at 8 bits where the program can
+tell, so the module needs neither Int8 nor Int16. A `u16` the program spells is
+still a 16-bit integer under Int16. A member of an aggregate or of a vector keeps
 its declared width, as does memory the host shares, so an 8-bit one there still
 needs Int8.
 
