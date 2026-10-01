@@ -259,6 +259,30 @@ pub val BUILTIN_NUM_WORKGROUPS:         u32 = 8
 pub val BUILTIN_LOCAL_INVOCATION_INDEX: u32 = 9
 ```
 
+## val BUILTIN_SUBGROUP_SIZE
+
+```mach
+pub val BUILTIN_SUBGROUP_SIZE:          u32 = 10
+```
+
+## val BUILTIN_SUBGROUP_INVOCATION
+
+```mach
+pub val BUILTIN_SUBGROUP_INVOCATION:    u32 = 11
+```
+
+## val BUILTIN_SUBGROUP_ID
+
+```mach
+pub val BUILTIN_SUBGROUP_ID:            u32 = 12
+```
+
+## val BUILTIN_NUM_SUBGROUPS
+
+```mach
+pub val BUILTIN_NUM_SUBGROUPS:          u32 = 13
+```
+
 ## rec IrAsmBind
 
 ```mach
