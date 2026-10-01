@@ -204,6 +204,27 @@ pub val ATOMIC_FLOAT_ADD:     isa.OpTyping = isa.OpTyping;
 pub val ATOMIC_FLOAT_MIN_MAX: isa.OpTyping = isa.OpTyping;
 ```
 
+## val FIRST_OPERAND
+
+```mach
+pub val FIRST_OPERAND:         isa.OpTyping = isa.OpTyping;
+```
+
+the operand an untyped row's relations are stated against, holding its type to nothing:
+the first for a math instruction or an image's handle, the value for a subgroup operation
+
+## val SUBGROUP_VALUE
+
+```mach
+pub val SUBGROUP_VALUE:        isa.OpTyping = isa.OpTyping;
+```
+
+## val GROUP_OPERATION_VALUE
+
+```mach
+pub val GROUP_OPERATION_VALUE: isa.OpTyping = isa.OpTyping;
+```
+
 ## rec DefStorage
 
 ```mach
