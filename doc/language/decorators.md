@@ -1508,6 +1508,50 @@ Vulkan's `VK_SUBGROUP_FEATURE_ARITHMETIC_BIT`, and a target naming no `env` hold
 every extension. A module declares a capability only when something it emits needs
 it, with `OpExtension` for a capability a SPIR-V extension defines.
 
+A row may also be **typed**: its requirement depends on the type it operates on, read
+from one operand (a pointer's pointee), and on the storage class that operand's
+memory lives in. The atomics are typed. A declaration whose type the row admits in no
+storage class is refused with `op.signature`, and each call is checked where its
+storage class is known. A load reads its pointer and every other atomic writes it, so
+a `"readonly"` binding admits only an atomic load.
+
+```mach
+#[op("spirv", "core", "OpAtomicIAdd")]
+pub fun atomic_add64(p: *u64, scope: u32, semantics: u32, v: u64) u64;
+
+#[op("spirv", "core", "OpAtomicFAddEXT")]
+pub fun atomic_fadd(p: *f32, scope: u32, semantics: u32, v: f32) f32;
+```
+
+A 32-bit integer atomic is core in every storage class. Every other type needs the
+Vulkan device feature of its storage class, named for its `shaderBuffer*` or
+`shaderShared*` member: `buffer_*` on a storage buffer (`StorageBuffer`, or `Uniform`
+before SPIR-V 1.3), `shared_*` on [`#[shared]`](#inputn--outputn--builtinstr--uniformset-binding--storageset-binding--samplerset-binding--push--specid--shared--shader-interface)
+workgroup memory. Any other storage class is refused. An `f16` also needs `float16`.
+
+| Rows | Type | Extensions | Vulkan feature | Capability (SPIR-V extension) |
+|------|------|-----------|----------------|-------------------------------|
+| all 15 integer atomics | `u32`, `i32` | none | core | none |
+| all 15 integer atomics | `u64`, `i64` | `buffer_int64_atomics`, `shared_int64_atomics` | `shaderBufferInt64Atomics`, `shaderSharedInt64Atomics` | `Int64Atomics` |
+| `OpAtomicLoad`, `OpAtomicStore`, `OpAtomicExchange` | `f16`, `f32`, `f64` | `buffer_float{16,32,64}_atomics`, `shared_float{16,32,64}_atomics` | `shader{Buffer,Shared}Float{16,32,64}Atomics` | none |
+| `OpAtomicFAddEXT` | `f32`, `f64` | `buffer_float{32,64}_atomic_add`, `shared_float{32,64}_atomic_add` | `shader{Buffer,Shared}Float{32,64}AtomicAdd` | `AtomicFloat{32,64}AddEXT` (`SPV_EXT_shader_atomic_float_add`) |
+| `OpAtomicFAddEXT` | `f16` | `buffer_float16_atomic_add`, `shared_float16_atomic_add` | `shader{Buffer,Shared}Float16AtomicAdd` | `AtomicFloat16AddEXT` (`SPV_EXT_shader_atomic_float16_add`) |
+| `OpAtomicFMinEXT`, `OpAtomicFMaxEXT` | `f16`, `f32`, `f64` | `buffer_float{16,32,64}_atomic_min_max`, `shared_float{16,32,64}_atomic_min_max` | `shader{Buffer,Shared}Float{16,32,64}AtomicMinMax` | `AtomicFloat{16,32,64}MinMaxEXT` (`SPV_EXT_shader_atomic_float_min_max`) |
+
+The features come from `VkPhysicalDeviceShaderAtomicInt64Features`,
+`VkPhysicalDeviceShaderAtomicFloatFeaturesEXT` and
+`VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT`. No environment guarantees any of
+them, so a target names each one its consumer enables, and a target naming no `env`
+holds them all. The integer atomics are `OpAtomicLoad`, `OpAtomicStore`,
+`OpAtomicExchange`, `OpAtomicCompareExchange`, `OpAtomicIIncrement`,
+`OpAtomicIDecrement`, `OpAtomicIAdd`, `OpAtomicISub`, `OpAtomicSMin`, `OpAtomicUMin`,
+`OpAtomicSMax`, `OpAtomicUMax`, `OpAtomicAnd`, `OpAtomicOr` and `OpAtomicXor`.
+
+| At the call                                            | Is refused with                    |
+|--------------------------------------------------------|------------------------------------|
+| a type the row admits only in other storage classes    | `spirv.capability`, naming the class |
+| a type whose feature the target does not select        | `spirv.capability`, naming the feature |
+
 `OpExtInstImport "GLSL.std.450"` is emitted **once per module and only when that
 module uses the set**. A module that calls none of these carries no import.
 
@@ -1525,7 +1569,7 @@ the instruction. A `spirv` build never emits the body at all.
 
 The set of accepted instructions is the table in
 `src/lang/target/isa/spirv/defs.mach`, where each row carries its operand kinds, its
-result, its requirements and the enumerations of its literals. The capabilities, with
+result, its requirements, its typing and the enumerations of its literals. The capabilities, with
 the SPIR-V version and extension each needs, are the table in
 `src/lang/target/isa/spirv.mach`. Adding an instruction is a row in it.
 
