@@ -1312,6 +1312,60 @@ pub val CAP_VULKAN_MEMORY_MODEL_DEVICE_SCOPE:   u32 = 5346
 pub val CAP_PHYSICAL_STORAGE_BUFFER_ADDRESSES:  u32 = 5347
 ```
 
+## val CAP_ATOMIC_FLOAT16_ADD
+
+```mach
+pub val CAP_ATOMIC_FLOAT16_ADD:                 u32 = 6095
+```
+
+## val CAP_ATOMIC_FLOAT16_MIN_MAX
+
+```mach
+pub val CAP_ATOMIC_FLOAT16_MIN_MAX:             u32 = 5616
+```
+
+## val CAP_STORAGE_BUFFER_16BIT_ACCESS
+
+```mach
+pub val CAP_STORAGE_BUFFER_16BIT_ACCESS:             u32 = 4433
+```
+
+## val CAP_UNIFORM_AND_STORAGE_BUFFER_16BIT_ACCESS
+
+```mach
+pub val CAP_UNIFORM_AND_STORAGE_BUFFER_16BIT_ACCESS: u32 = 4434
+```
+
+## val CAP_STORAGE_PUSH_CONSTANT16
+
+```mach
+pub val CAP_STORAGE_PUSH_CONSTANT16:                 u32 = 4435
+```
+
+## val CAP_STORAGE_INPUT_OUTPUT16
+
+```mach
+pub val CAP_STORAGE_INPUT_OUTPUT16:                  u32 = 4436
+```
+
+## val CAP_STORAGE_BUFFER_8BIT_ACCESS
+
+```mach
+pub val CAP_STORAGE_BUFFER_8BIT_ACCESS:              u32 = 4448
+```
+
+## val CAP_UNIFORM_AND_STORAGE_BUFFER_8BIT_ACCESS
+
+```mach
+pub val CAP_UNIFORM_AND_STORAGE_BUFFER_8BIT_ACCESS:  u32 = 4449
+```
+
+## val CAP_STORAGE_PUSH_CONSTANT8
+
+```mach
+pub val CAP_STORAGE_PUSH_CONSTANT8:                  u32 = 4450
+```
+
 ## rec Capability
 
 ```mach
@@ -1324,7 +1378,8 @@ value or an operand's type. `need` is its bit in Builder.caps_needed and the tab
 order is the order the module declares them in. an environment's ceiling decides the
 capabilities in CEILING_DOMAIN, and every capability needs its SPIR-V version and,
 when `extension` is not nil, the SPIR-V extension that defines it, which the module
-then declares with OpExtension. `graphics` is the extension a use from a vertex or
+then declares with OpExtension below `ext_core`, the version that made it core (0 for
+an extension no version took in). `graphics` is the extension a use from a vertex or
 fragment stage needs beyond what the use itself names, 0 when every stage has the
 capability alike
 
@@ -1544,10 +1599,64 @@ pub val NEED_VULKAN_MEMORY_MODEL_DEVICE_SCOPE: u64 = 0x400000000
 pub val NEED_PHYSICAL_STORAGE_BUFFER:          u64 = 0x800000000
 ```
 
+## val NEED_ATOMIC_FLOAT16_ADD
+
+```mach
+pub val NEED_ATOMIC_FLOAT16_ADD:     u64 = 0x1000000000
+```
+
+## val NEED_ATOMIC_FLOAT16_MIN_MAX
+
+```mach
+pub val NEED_ATOMIC_FLOAT16_MIN_MAX: u64 = 0x2000000000
+```
+
+## val NEED_STORAGE_BUFFER_16BIT_ACCESS
+
+```mach
+pub val NEED_STORAGE_BUFFER_16BIT_ACCESS:             u64 = 0x4000000000
+```
+
+## val NEED_UNIFORM_AND_STORAGE_BUFFER_16BIT_ACCESS
+
+```mach
+pub val NEED_UNIFORM_AND_STORAGE_BUFFER_16BIT_ACCESS: u64 = 0x8000000000
+```
+
+## val NEED_STORAGE_PUSH_CONSTANT16
+
+```mach
+pub val NEED_STORAGE_PUSH_CONSTANT16:                 u64 = 0x10000000000
+```
+
+## val NEED_STORAGE_INPUT_OUTPUT16
+
+```mach
+pub val NEED_STORAGE_INPUT_OUTPUT16:                  u64 = 0x20000000000
+```
+
+## val NEED_STORAGE_BUFFER_8BIT_ACCESS
+
+```mach
+pub val NEED_STORAGE_BUFFER_8BIT_ACCESS:              u64 = 0x40000000000
+```
+
+## val NEED_UNIFORM_AND_STORAGE_BUFFER_8BIT_ACCESS
+
+```mach
+pub val NEED_UNIFORM_AND_STORAGE_BUFFER_8BIT_ACCESS:  u64 = 0x80000000000
+```
+
+## val NEED_STORAGE_PUSH_CONSTANT8
+
+```mach
+pub val NEED_STORAGE_PUSH_CONSTANT8:                  u64 = 0x100000000000
+```
+
 ## val CAPABILITY_COUNT
 
 ```mach
-pub val CAPABILITY_COUNT: u32 = 36
+pub val CAPABILITY_COUNT: u32 = 45
 ```
 
 ## val SPV_EXT_ATOMIC_FLOAT_ADD
@@ -1566,6 +1675,27 @@ pub val SPV_EXT_ATOMIC_FLOAT_MIN_MAX: str = "SPV_EXT_shader_atomic_float_min_max
 
 ```mach
 pub val SPV_EXT_IMAGE_INT64:          str = "SPV_EXT_shader_image_int64"
+```
+
+## val SPV_EXT_ATOMIC_FLOAT16_ADD
+
+```mach
+pub val SPV_EXT_ATOMIC_FLOAT16_ADD:   str = "SPV_EXT_shader_atomic_float16_add"
+```
+
+## val SPV_KHR_16BIT_STORAGE
+
+```mach
+pub val SPV_KHR_16BIT_STORAGE: str = "SPV_KHR_16bit_storage"
+```
+
+the extensions defining the 16- and 8-bit storage access capabilities, core from
+SPIR-V 1.3 and 1.5
+
+## val SPV_KHR_8BIT_STORAGE
+
+```mach
+pub val SPV_KHR_8BIT_STORAGE:  str = "SPV_KHR_8bit_storage"
 ```
 
 ## val SPV_KHR_VULKAN_MEMORY_MODEL
@@ -1682,7 +1812,14 @@ vulkanMemoryModelDeviceScope, which the Device scope needs under that model (#43
 int8 and int16 are the Int8 and Int16 capabilities, so an integer of that width
 is computed at its own width rather than carried in a wider one (#4302).
 buffer_device_address is the bufferDeviceAddress feature, under which a pointer held in
-memory is a physical pointer into a buffer the host passes by address (#4307)
+memory is a physical pointer into a buffer the host passes by address (#4307).
+the storage features are Vulkan's 16- and 8-bit storage features, each the one
+capability of its name: storage_buffer_16bit_access is storageBuffer16BitAccess,
+so a storage buffer, or a buffer reached through a physical pointer, may hold a
+16-bit member, uniform_and_storage_buffer_16bit_access
+a uniform block, storage_push_constant16 a push block and storage_input_output16 a
+stage interface, and the 8-bit three the same for an 8-bit member. no Vulkan version
+guarantees one, and Vulkan has no 8-bit stage interface (#4299)
 
 ## val EXT_ZERO_INIT_WORKGROUP
 
@@ -1919,11 +2056,99 @@ pub val EXT_INT16:                            u64 = 0x2000000000
 pub val EXT_BUFFER_DEVICE_ADDRESS:            u64 = 0x4000000000
 ```
 
+## val EXT_BUFFER_FLOAT16_ATOMICS
+
+```mach
+pub val EXT_BUFFER_FLOAT16_ATOMICS:           u64 = 0x8000000000
+```
+
+## val EXT_BUFFER_FLOAT16_ATOMIC_ADD
+
+```mach
+pub val EXT_BUFFER_FLOAT16_ATOMIC_ADD:        u64 = 0x10000000000
+```
+
+## val EXT_BUFFER_FLOAT16_ATOMIC_MIN_MAX
+
+```mach
+pub val EXT_BUFFER_FLOAT16_ATOMIC_MIN_MAX:    u64 = 0x20000000000
+```
+
+## val EXT_SHARED_FLOAT16_ATOMICS
+
+```mach
+pub val EXT_SHARED_FLOAT16_ATOMICS:           u64 = 0x40000000000
+```
+
+## val EXT_SHARED_FLOAT16_ATOMIC_ADD
+
+```mach
+pub val EXT_SHARED_FLOAT16_ATOMIC_ADD:        u64 = 0x80000000000
+```
+
+## val EXT_SHARED_FLOAT16_ATOMIC_MIN_MAX
+
+```mach
+pub val EXT_SHARED_FLOAT16_ATOMIC_MIN_MAX:    u64 = 0x100000000000
+```
+
+## val EXT_STORAGE_BUFFER_16BIT_ACCESS
+
+```mach
+pub val EXT_STORAGE_BUFFER_16BIT_ACCESS:             u64 = 0x200000000000
+```
+
+## val EXT_UNIFORM_AND_STORAGE_BUFFER_16BIT_ACCESS
+
+```mach
+pub val EXT_UNIFORM_AND_STORAGE_BUFFER_16BIT_ACCESS: u64 = 0x400000000000
+```
+
+## val EXT_STORAGE_PUSH_CONSTANT16
+
+```mach
+pub val EXT_STORAGE_PUSH_CONSTANT16:                 u64 = 0x800000000000
+```
+
+## val EXT_STORAGE_INPUT_OUTPUT16
+
+```mach
+pub val EXT_STORAGE_INPUT_OUTPUT16:                  u64 = 0x1000000000000
+```
+
+## val EXT_STORAGE_BUFFER_8BIT_ACCESS
+
+```mach
+pub val EXT_STORAGE_BUFFER_8BIT_ACCESS:              u64 = 0x2000000000000
+```
+
+## val EXT_UNIFORM_AND_STORAGE_BUFFER_8BIT_ACCESS
+
+```mach
+pub val EXT_UNIFORM_AND_STORAGE_BUFFER_8BIT_ACCESS:  u64 = 0x4000000000000
+```
+
+## val EXT_STORAGE_PUSH_CONSTANT8
+
+```mach
+pub val EXT_STORAGE_PUSH_CONSTANT8:                  u64 = 0x8000000000000
+```
+
+## val EXT_STORAGE_ACCESS
+
+```mach
+pub val EXT_STORAGE_ACCESS: u64 = EXT_STORAGE_BUFFER_16BIT_ACCESS | EXT_UNIFORM_AND_STORAGE_BUFFER_16BIT_ACCESS | EXT_STORAGE_PUSH_CONSTANT16
+| EXT_STORAGE_INPUT_OUTPUT16 | EXT_STORAGE_BUFFER_8BIT_ACCESS | EXT_UNIFORM_AND_STORAGE_BUFFER_8BIT_ACCESS | EXT_STORAGE_PUSH_CONSTANT8
+```
+
+every storage feature
+
 ## val EXT_ATOMICS
 
 ```mach
 pub val EXT_ATOMICS: u64 = EXT_BUFFER_INT64_ATOMICS | EXT_SHARED_INT64_ATOMICS | EXT_BUFFER_FLOAT32_ATOMICS | EXT_BUFFER_FLOAT32_ATOMIC_ADD | EXT_BUFFER_FLOAT32_ATOMIC_MIN_MAX | EXT_BUFFER_FLOAT64_ATOMICS | EXT_BUFFER_FLOAT64_ATOMIC_ADD | EXT_BUFFER_FLOAT64_ATOMIC_MIN_MAX | EXT_SHARED_FLOAT32_ATOMICS | EXT_SHARED_FLOAT32_ATOMIC_ADD | EXT_SHARED_FLOAT32_ATOMIC_MIN_MAX | EXT_SHARED_FLOAT64_ATOMICS | EXT_SHARED_FLOAT64_ATOMIC_ADD | EXT_SHARED_FLOAT64_ATOMIC_MIN_MAX
 | EXT_IMAGE_INT64_ATOMICS | EXT_IMAGE_FLOAT32_ATOMICS | EXT_IMAGE_FLOAT32_ATOMIC_ADD | EXT_IMAGE_FLOAT32_ATOMIC_MIN_MAX
+| EXT_BUFFER_FLOAT16_ATOMICS | EXT_BUFFER_FLOAT16_ATOMIC_ADD | EXT_BUFFER_FLOAT16_ATOMIC_MIN_MAX | EXT_SHARED_FLOAT16_ATOMICS | EXT_SHARED_FLOAT16_ATOMIC_ADD | EXT_SHARED_FLOAT16_ATOMIC_MIN_MAX
 ```
 
 every atomic feature
@@ -1931,7 +2156,7 @@ every atomic feature
 ## val EXTENSION_COUNT
 
 ```mach
-pub val EXTENSION_COUNT: u32 = 39
+pub val EXTENSION_COUNT: u32 = 52
 ```
 
 ## val ONLY_ENVIRONMENT
@@ -1960,7 +2185,7 @@ pub val EXT_OPEN: u64 = EXT_FLOAT16 | EXT_ZERO_INIT_WORKGROUP | EXT_SUBGROUP_ARI
 | EXT_SUBGROUP_VOTE | EXT_SUBGROUP_BALLOT | EXT_SUBGROUP_SHUFFLE | EXT_SUBGROUP_SHUFFLE_RELATIVE | EXT_SUBGROUP_QUAD
 | EXT_SUBGROUP_GRAPHICS_STAGES | EXT_ATOMICS | EXT_STORAGE_IMAGE_MULTISAMPLE | EXT_RESOURCE_MIN_LOD
 | EXT_IMAGE_GATHER_EXTENDED | EXT_MAINTENANCE8 | EXT_VULKAN_MEMORY_MODEL | EXT_VULKAN_MEMORY_MODEL_DEVICE_SCOPE
-| EXT_INT8 | EXT_INT16 | EXT_BUFFER_DEVICE_ADDRESS
+| EXT_INT8 | EXT_INT16 | EXT_BUFFER_DEVICE_ADDRESS | EXT_STORAGE_ACCESS
 ```
 
 every extension of the vocabulary, which a module naming no environment holds
