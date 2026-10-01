@@ -1264,6 +1264,12 @@ pub val CAP_ATOMIC_FLOAT32_ADD:                 u32 = 6033
 pub val CAP_ATOMIC_FLOAT64_ADD:                 u32 = 6034
 ```
 
+## val CAP_INT64_IMAGE
+
+```mach
+pub val CAP_INT64_IMAGE:                        u32 = 5016
+```
+
 ## val CAP_VULKAN_MEMORY_MODEL
 
 ```mach
@@ -1484,22 +1490,28 @@ pub val NEED_MIN_LOD:                   u64 = 0x40000000
 pub val NEED_IMAGE_GATHER_EXTENDED:     u64 = 0x80000000
 ```
 
+## val NEED_INT64_IMAGE
+
+```mach
+pub val NEED_INT64_IMAGE:               u64 = 0x100000000
+```
+
 ## val NEED_VULKAN_MEMORY_MODEL
 
 ```mach
-pub val NEED_VULKAN_MEMORY_MODEL:              u64 = 0x100000000
+pub val NEED_VULKAN_MEMORY_MODEL:              u64 = 0x200000000
 ```
 
 ## val NEED_VULKAN_MEMORY_MODEL_DEVICE_SCOPE
 
 ```mach
-pub val NEED_VULKAN_MEMORY_MODEL_DEVICE_SCOPE: u64 = 0x200000000
+pub val NEED_VULKAN_MEMORY_MODEL_DEVICE_SCOPE: u64 = 0x400000000
 ```
 
 ## val CAPABILITY_COUNT
 
 ```mach
-pub val CAPABILITY_COUNT: u32 = 34
+pub val CAPABILITY_COUNT: u32 = 35
 ```
 
 ## val SPV_EXT_ATOMIC_FLOAT_ADD
@@ -1512,6 +1524,12 @@ pub val SPV_EXT_ATOMIC_FLOAT_ADD:     str = "SPV_EXT_shader_atomic_float_add"
 
 ```mach
 pub val SPV_EXT_ATOMIC_FLOAT_MIN_MAX: str = "SPV_EXT_shader_atomic_float_min_max"
+```
+
+## val SPV_EXT_IMAGE_INT64
+
+```mach
+pub val SPV_EXT_IMAGE_INT64:          str = "SPV_EXT_shader_image_int64"
 ```
 
 ## val SPV_KHR_VULKAN_MEMORY_MODEL
@@ -1690,9 +1708,11 @@ pub val EXT_BUFFER_INT64_ATOMICS:             u64 = 0x1000
 ```
 
 the atomic features of VkPhysicalDeviceShaderAtomicInt64Features,
-VkPhysicalDeviceShaderAtomicFloatFeaturesEXT and VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT,
-each named for its shaderBuffer* or shaderShared* member: an atomic on a type beyond
-32-bit integers needs the one for its storage class, which no Vulkan version guarantees
+VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT, VkPhysicalDeviceShaderAtomicFloatFeaturesEXT
+and VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT, each named for its shaderBuffer*,
+shaderShared* or shaderImage* member: an atomic on a type beyond 32-bit integers needs the
+one for its storage class, which no Vulkan version guarantees. image_int64_atomics is also
+the feature that enables Int64ImageEXT, which any image of 64-bit texels declares
 
 ## val EXT_SHARED_INT64_ATOMICS
 
@@ -1796,22 +1816,47 @@ pub val EXT_IMAGE_GATHER_EXTENDED:            u64 = 0x10000000
 pub val EXT_MAINTENANCE8:                     u64 = 0x20000000
 ```
 
+## val EXT_IMAGE_INT64_ATOMICS
+
+```mach
+pub val EXT_IMAGE_INT64_ATOMICS:              u64 = 0x40000000
+```
+
+## val EXT_IMAGE_FLOAT32_ATOMICS
+
+```mach
+pub val EXT_IMAGE_FLOAT32_ATOMICS:            u64 = 0x80000000
+```
+
+## val EXT_IMAGE_FLOAT32_ATOMIC_ADD
+
+```mach
+pub val EXT_IMAGE_FLOAT32_ATOMIC_ADD:         u64 = 0x100000000
+```
+
+## val EXT_IMAGE_FLOAT32_ATOMIC_MIN_MAX
+
+```mach
+pub val EXT_IMAGE_FLOAT32_ATOMIC_MIN_MAX:     u64 = 0x200000000
+```
+
 ## val EXT_VULKAN_MEMORY_MODEL
 
 ```mach
-pub val EXT_VULKAN_MEMORY_MODEL:              u64 = 0x40000000
+pub val EXT_VULKAN_MEMORY_MODEL:              u64 = 0x400000000
 ```
 
 ## val EXT_VULKAN_MEMORY_MODEL_DEVICE_SCOPE
 
 ```mach
-pub val EXT_VULKAN_MEMORY_MODEL_DEVICE_SCOPE: u64 = 0x80000000
+pub val EXT_VULKAN_MEMORY_MODEL_DEVICE_SCOPE: u64 = 0x800000000
 ```
 
 ## val EXT_ATOMICS
 
 ```mach
 pub val EXT_ATOMICS: u64 = EXT_BUFFER_INT64_ATOMICS | EXT_SHARED_INT64_ATOMICS | EXT_BUFFER_FLOAT32_ATOMICS | EXT_BUFFER_FLOAT32_ATOMIC_ADD | EXT_BUFFER_FLOAT32_ATOMIC_MIN_MAX | EXT_BUFFER_FLOAT64_ATOMICS | EXT_BUFFER_FLOAT64_ATOMIC_ADD | EXT_BUFFER_FLOAT64_ATOMIC_MIN_MAX | EXT_SHARED_FLOAT32_ATOMICS | EXT_SHARED_FLOAT32_ATOMIC_ADD | EXT_SHARED_FLOAT32_ATOMIC_MIN_MAX | EXT_SHARED_FLOAT64_ATOMICS | EXT_SHARED_FLOAT64_ATOMIC_ADD | EXT_SHARED_FLOAT64_ATOMIC_MIN_MAX
+| EXT_IMAGE_INT64_ATOMICS | EXT_IMAGE_FLOAT32_ATOMICS | EXT_IMAGE_FLOAT32_ATOMIC_ADD | EXT_IMAGE_FLOAT32_ATOMIC_MIN_MAX
 ```
 
 every atomic feature
@@ -1819,7 +1864,7 @@ every atomic feature
 ## val EXTENSION_COUNT
 
 ```mach
-pub val EXTENSION_COUNT: u32 = 32
+pub val EXTENSION_COUNT: u32 = 36
 ```
 
 ## val ONLY_ENVIRONMENT
@@ -1987,13 +2032,37 @@ pub val IMAGE_FORMAT_LAST_SINT:  u32 = 29
 pub val IMAGE_FORMAT_LAST_UINT:  u32 = 39
 ```
 
-## val IMAGE_FORMAT_FIRST_INT64
+## val IMAGE_FORMAT_R32F
 
 ```mach
-pub val IMAGE_FORMAT_FIRST_INT64: u32 = 40
+pub val IMAGE_FORMAT_R32F:  u32 = 3
 ```
 
-R64ui and R64i, which need Int64ImageEXT
+the formats an image atomic is defined on, the 64-bit ones under Int64ImageEXT
+
+## val IMAGE_FORMAT_R32I
+
+```mach
+pub val IMAGE_FORMAT_R32I:  u32 = 24
+```
+
+## val IMAGE_FORMAT_R32UI
+
+```mach
+pub val IMAGE_FORMAT_R32UI: u32 = 33
+```
+
+## val IMAGE_FORMAT_R64UI
+
+```mach
+pub val IMAGE_FORMAT_R64UI: u32 = 40
+```
+
+## val IMAGE_FORMAT_R64I
+
+```mach
+pub val IMAGE_FORMAT_R64I:  u32 = 41
+```
 
 ## val IMAGE_SAMPLED_YES
 

@@ -108,7 +108,8 @@ The names are the selected isa's vocabulary and nothing else:
   `buffer_float64_atomic_min_max`, `shared_float32_atomics`, `shared_float32_atomic_add`,
   `shared_float32_atomic_min_max`, `shared_float64_atomics`, `shared_float64_atomic_add`,
   `shared_float64_atomic_min_max`, `storage_image_multisample`, `resource_min_lod`,
-  `image_gather_extended`, `maintenance8`, `vulkan_memory_model`,
+  `image_gather_extended`, `maintenance8`, `image_int64_atomics`, `image_float32_atomics`,
+  `image_float32_atomic_add`, `image_float32_atomic_min_max`, `vulkan_memory_model`,
   `vulkan_memory_model_device_scope`.
 
 A name the selected isa does not declare is a compile error, never a silent 0, as
