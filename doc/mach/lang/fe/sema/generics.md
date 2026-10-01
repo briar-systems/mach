@@ -45,6 +45,7 @@ pub fun check_annotation_handles(sc: *sema.SemaContext, ast_tid: id.TypeId);
 a generic record, union or tag instantiated so that a field or payload holds a handle,
 directly or through a pointer, array or secret: the instance is the declaration its
 arguments spell, and the same declaration written out is refused for that field
+and, in any annotation, a pointer to a pointer to a handle, which roots the handle at no binding
 
 ## fun check_type_uni_secrecy
 
