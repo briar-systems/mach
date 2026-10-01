@@ -1633,10 +1633,17 @@ at the declaration rather than as an invalid module.
 | Rows | Relation |
 |------|----------|
 | every atomic | the result and each value operand are the pointer's pointee |
-| `OpImageRead`, `OpImageFetch`, `OpImageWrite` | the texel, the result or the last operand, is a vector of the image's texel scalar |
+| `OpImageRead`, `OpImageFetch`, `OpImageSample*Lod` | the result is a 4-vector of the image's texel scalar, a sampled image's being its image's |
+| `OpImageWrite` | the texel is a scalar or vector of the image's texel scalar, with at least as many components as the image's format stores (any for `Unknown`) |
 | `OpGroupNonUniformBroadcast*`, `Shuffle*`, `Quad*` and the arithmetic rows | the result is the value operand's type |
 | the GLSL.std.450 math rows | the result and every operand are the first operand's type, except `Refract`'s `eta`, and `Length` and `Distance`, whose result is a scalar |
 | `OpDot` | the second vector is the first's type |
+
+Each image row names the rule its texel's component count comes from, and the
+refusal quotes it: the 4-vector read result is Vulkan's `VUID-StandaloneSpirv-Result-04780`,
+the 4-vector fetch and sample results are SPIR-V's own, and the write's count against the
+format is Vulkan's `VUID-RuntimeSpirv-OpImageWrite-07112`, which spirv-val cannot check
+because it sees no `VkFormat`.
 
 
 The **subgroup operations** are the `OpGroupNonUniform*` rows, each taking the
