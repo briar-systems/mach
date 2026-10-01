@@ -6,7 +6,7 @@
 # usage: bootstrap.sh [--fixpoint] [--profile <name>]
 set -euo pipefail
 
-seed=6.2.1
+seed=6.8.0
 
 fixpoint=0
 profile=debug

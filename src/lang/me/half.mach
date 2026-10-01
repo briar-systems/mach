@@ -4,20 +4,22 @@
 # bits; every other one is the expansion here, which calls nothing, so no
 # runtime symbol appears for a freestanding link to provide.
 #
-# arithmetic widens both operands exactly to binary64, computes there and
-# narrows once. binary64 carries more than twice binary16's precision plus two
-# bits, so that one rounding is the correctly rounded binary16 result, the rule
-# comptime folds by. a target whose rows convert f16 to and from binary32
-# computes in binary32 instead, which carries exactly that much (#3801). an
-# arithmetic operand widens with a NaN kept as it is, signaling or quiet, so
-# the binary64 unit picks and quiets the NaN as the target's half unit would.
-# a conversion goes through binary64 the same way, and a comparison compares
-# the widened values. widening and narrowing are integer code on the halves of
-# the binary64 encoding: sign, exponent and significand extraction, round to
-# nearest even, subnormals, overflow to infinity, and a converted NaN made by
-# the target's NaN rule, as float.narrow_bits and float.widen_bits define them,
-# so the expansion converts as the target's own half instructions would. every
-# step is branch-free, a select being a mask
+# arithmetic widens both operands exactly to the wide format, binary64 or
+# binary32 where the model says (#4332), computes there and narrows once. both
+# carry at least twice binary16's precision plus two bits, binary32 exactly
+# that much, so that one rounding is the correctly rounded binary16 result, the
+# rule comptime folds by. a target whose rows convert f16 to and from binary32
+# computes in binary32 through them (#3801). an arithmetic operand widens with
+# a NaN kept as it is, signaling or quiet, so the wide unit picks and quiets
+# the NaN as the target's half unit would. a conversion goes through the wide
+# format the same way, and a comparison compares the widened values. widening
+# and narrowing are integer code on the wide encoding in 32-bit words (a
+# binary64 narrowed under binary32 rounds to odd there first): sign, exponent
+# and significand extraction, round to nearest even,
+# subnormals, overflow to infinity, and a converted NaN made by the target's
+# NaN rule, as float.narrow_bits and float.widen_bits define them, so the
+# expansion converts as the target's own half instructions would. every step
+# is branch-free, a select being a mask
 
 use mach.lang.fail;
 use mach.lang.float;
@@ -124,6 +126,17 @@ fun float_type(h: *Half, bits: u32) ir_type.IrTypeId {
     ret type_of(h, ir_type.intern_float(?h.b.m.types, bits));
 }
 
+# the width of the format the expansion computes in, 32 or 64
+pub fun wide_bits(h: *Half) u32 {
+    if (h.model.half_binary32) { ret 32; }
+    ret 64;
+}
+
+fun wide_float(h: *Half) ir_type.IrTypeId {
+    if (h.model.half_binary32) { ret float_type(h, 32); }
+    ret h.f64t;
+}
+
 fun k32(h: *Half, n: u64) value.Value {
     ret value.const_int(n, h.i32t);
 }
@@ -190,24 +203,53 @@ fun pick(h: *Half, c: value.Value, a: value.Value, b: value.Value) value.Value {
     ret bxor(h, b, band(h, bxor(h, a, b), mask));
 }
 
-# the carried bits `x` widened exactly to binary64, a NaN as the target's
-# rule converts it
+# the carried bits `x` widened exactly to the wide format, a NaN as the
+# target's rule converts it
 pub fun widen(h: *Half, x: value.Value) value.Value {
-    if (native(h, isa.VEC_OP_FP_EXT, true, 64, 16)) {
-        ret take(h, builder.emit_fp_ext(h.b, bitcast(h, x, f16_type(h)), h.f64t));
+    if (native(h, isa.VEC_OP_FP_EXT, true, wide_bits(h), 16)) {
+        ret take(h, builder.emit_fp_ext(h.b, bitcast(h, x, f16_type(h)), wide_float(h)));
     }
     ret widen_bits(h, x, false);
 }
 
-# `x` widened to binary64 as an operand of + - * /: a NaN keeps its sign, its
-# payload and whether it signals, so the target's binary64 unit applies its own
-# NaN selection, as a native half instruction does (#3801)
+# `x` widened to the wide format as an operand of + - * /: a NaN keeps its
+# sign, its payload and whether it signals, so the target's wide unit applies
+# its own NaN selection, as a native half instruction does (#3801)
 fun widen_operand(h: *Half, x: value.Value) value.Value {
     ret widen_bits(h, x, true);
 }
 
 # the integer widening: `exact` keeps a NaN as it is, otherwise it follows the rule
 fun widen_bits(h: *Half, x: value.Value, exact: bool) value.Value {
+    if (h.model.half_binary32) { ret widen32_bits(h, x, exact); }
+    ret widen64_bits(h, x, exact);
+}
+
+# the integer widening to binary32: the whole encoding is one word
+fun widen32_bits(h: *Half, x: value.Value, exact: bool) value.Value {
+    val f32t: ir_type.IrTypeId = float_type(h, 32);
+    val w:    value.Value      = zext(h, x, h.i32t);
+    val sign: value.Value      = shl(h, band(h, w, k32(h, 0x8000)), k32(h, 16));
+    val e:    value.Value      = band(h, shr(h, w, k32(h, 10)), k32(h, 0x1F));
+    val m:    value.Value      = band(h, w, k32(h, 0x3FF));
+    val mhi:  value.Value      = shl(h, m, k32(h, 13));
+    val norm: value.Value      = bor(h, bor(h, sign, shl(h, add(h, e, k32(h, 112)), k32(h, 23))), mhi);
+    val inf:  value.Value      = bor(h, sign, k32(h, 0x7F800000));
+    var spec: value.Value      = pick(h, eq(h, m, k32(h, 0)), inf, k32(h, 0x7FC00000));
+    if (exact) { spec = bor(h, inf, mhi); }
+    or (h.nan == float.NAN_PRESERVE) {
+        spec = bor(h, bor(h, inf, mhi), shl(h, zext(h, ne(h, m, k32(h, 0)), h.i32t), k32(h, 22)));
+    }
+    # a subnormal or zero is m * 2^-24, a normal binary32
+    val subf: value.Value = take(h, builder.emit_mul(h.b, take(h, builder.emit_si_to_fp(h.b, m, f32t)),
+        value.const_float(1.0 / 16777216.0, f32t)));
+    val sub_w: value.Value = bor(h, sign, bitcast(h, subf, h.i32t));
+    val bits:  value.Value = pick(h, eq(h, e, k32(h, 0)), sub_w, pick(h, eq(h, e, k32(h, 0x1F)), spec, norm));
+    ret bitcast(h, bits, f32t);
+}
+
+# the integer widening to binary64: the high word, under a zero low word
+fun widen64_bits(h: *Half, x: value.Value, exact: bool) value.Value {
     val w:    value.Value = zext(h, x, h.i32t);
     val sign: value.Value = shl(h, band(h, w, k32(h, 0x8000)), k32(h, 16));
     val e:    value.Value = band(h, shr(h, w, k32(h, 10)), k32(h, 0x1F));
@@ -232,11 +274,58 @@ fun widen_bits(h: *Half, x: value.Value, exact: bool) value.Value {
     ret bitcast(h, bits, h.f64t);
 }
 
-# the binary64 `d` rounded once, to nearest with ties to even, into the carried bits
+# the wide `d` rounded once, to nearest with ties to even, into the carried bits
 pub fun narrow(h: *Half, d: value.Value) value.Value {
-    if (native(h, isa.VEC_OP_FP_TRUNC, true, 16, 64)) {
+    ret narrow_from(h, d, wide_bits(h));
+}
+
+# the float `d` of `bits` (32 or 64) rounded once into the carried bits
+fun narrow_from(h: *Half, d: value.Value, bits: u32) value.Value {
+    if (native(h, isa.VEC_OP_FP_TRUNC, true, 16, bits)) {
         ret bitcast(h, take(h, builder.emit_fp_trunc(h.b, d, f16_type(h))), h.bits_t);
     }
+    if (bits == 32) { ret narrow32_bits(h, d); }
+    ret narrow64_bits(h, d);
+}
+
+# the integer narrowing of a binary32, one word: 13 of its 23 significand
+# bits go for a normal result, more for a subnormal one, and 25 once the value
+# lies below a quarter of the smallest subnormal, where every bit goes and the
+# result is zero
+fun narrow32_bits(h: *Half, d: value.Value) value.Value {
+    ret narrow32_word(h, bitcast(h, d, h.i32t));
+}
+
+fun narrow32_word(h: *Half, w: value.Value) value.Value {
+    val sign:  value.Value = band(h, shr(h, w, k32(h, 16)), k32(h, 0x8000));
+    val ex:    value.Value = shr(h, band(h, w, k32(h, 0x7FFFFFFF)), k32(h, 23));
+    val m:     value.Value = band(h, w, k32(h, 0x7FFFFF));
+    val sig:   value.Value = bor(h, m, k32(h, 0x800000));
+    val t:     value.Value = sub(h, k32(h, 113), ex);
+    val below: value.Value = pick(h, lt_s(h, t, k32(h, 0)), k32(h, 0), t);
+    val s0:    value.Value = add(h, below, k32(h, 13));
+    val s:     value.Value = pick(h, lt_u(h, k32(h, 25), s0), k32(h, 25), s0);
+    ret round_half(h, sign, ex, m, sig, s, 113, 0xFF, m, 13);
+}
+
+# the binary64 `d` rounded to odd at binary32's 24 bits, as its encoding: the
+# conversion's result stepped back toward zero where it lies beyond `d`, and
+# its last bit set where it is inexact. 24 bits is more than binary16's 11 plus
+# two, so rounding that once more to binary16 is the one correct rounding, on
+# 32-bit words, whichever neighbour the conversion picked
+fun round_odd32(h: *Half, d: value.Value) value.Value {
+    val r:     value.Value = take(h, builder.emit_fp_trunc(h.b, d, float_type(h, 32)));
+    val back:  value.Value = take(h, builder.emit_fp_ext(h.b, r, h.f64t));
+    val w:     value.Value = bitcast(h, r, h.i32t);
+    val below: value.Value = zext(h, take(h, builder.emit_cmp_lt_u(h.b, back, d)), h.i32t);
+    val above: value.Value = zext(h, take(h, builder.emit_cmp_lt_u(h.b, d, back)), h.i32t);
+    val neg:   value.Value = ne(h, shr(h, w, k32(h, 31)), k32(h, 0));
+    val away:  value.Value = pick(h, neg, below, above);
+    ret bor(h, sub(h, w, away), bor(h, below, above));
+}
+
+# the integer narrowing of a binary64, on the halves of its encoding
+fun narrow64_bits(h: *Half, d: value.Value) value.Value {
     val bits: value.Value = bitcast(h, d, h.i64t);
     val hi:   value.Value = trunc(h, take(h, builder.emit_shr_u(h.b, bits, value.const_int(32, h.i64t))), h.i32t);
     val lo:   value.Value = trunc(h, bits, h.i32t);
@@ -254,28 +343,42 @@ pub fun narrow(h: *Half, d: value.Value) value.Value {
     val below: value.Value = pick(h, lt_s(h, t, k32(h, 0)), k32(h, 0), t);
     val s0:    value.Value = add(h, below, k32(h, 10));
     val s:     value.Value = pick(h, lt_u(h, k32(h, 22), s0), k32(h, 22), s0);
-    val q:     value.Value = shr(h, sig, s);
-    val rem:   value.Value = band(h, sig, sub(h, shl(h, k32(h, 1), s), k32(h, 1)));
-    val half:  value.Value = shl(h, k32(h, 1), sub(h, s, k32(h, 1)));
-    val odd:   value.Value = ne(h, band(h, q, k32(h, 1)), k32(h, 0));
-    val up:    value.Value = bor(h, zext(h, lt_u(h, half, rem), h.i32t), band(h, zext(h, eq(h, rem, half), h.i32t), zext(h, odd, h.i32t)));
+    ret round_half(h, sign, ex, m, sig, s, 1009, 0x7FF, mhi, 10);
+}
+
+# the carried bits of the significand `sig`, its implicit bit set, shifted
+# right by `s` and rounded to nearest even. `ex` is the wide biased exponent,
+# `base` the one that lands on binary16's exponent 1, `ex_nan` the all-ones
+# one, `m` the significand a NaN is told by, and `payload` the bits whose top
+# ten a kept NaN carries, `payload_shift` above them
+fun round_half(h: *Half, sign: value.Value, ex: value.Value, m: value.Value, sig: value.Value, s: value.Value,
+    base: u64, ex_nan: u64, payload: value.Value, payload_shift: u64) value.Value {
+    val q:    value.Value = shr(h, sig, s);
+    val rem:  value.Value = band(h, sig, sub(h, shl(h, k32(h, 1), s), k32(h, 1)));
+    val half: value.Value = shl(h, k32(h, 1), sub(h, s, k32(h, 1)));
+    val odd:  value.Value = ne(h, band(h, q, k32(h, 1)), k32(h, 0));
+    val up:   value.Value = bor(h, zext(h, lt_u(h, half, rem), h.i32t), band(h, zext(h, eq(h, rem, half), h.i32t), zext(h, odd, h.i32t)));
     # a carry out of the significand steps the exponent, and a subnormal that
     # rounds up to the smallest normal already spells its encoding
-    val eo:   value.Value = sub(h, ex, k32(h, 1009));
+    val eo:   value.Value = sub(h, ex, k32(h, base));
     val ebit: value.Value = pick(h, lt_s(h, eo, k32(h, 0)), k32(h, 0), eo);
     val fin:  value.Value = add(h, add(h, q, up), shl(h, ebit, k32(h, 10)));
     val sat:  value.Value = pick(h, lt_u(h, fin, k32(h, 0x7C00)), fin, k32(h, 0x7C00));
-    val nan:  value.Value = band(h, zext(h, eq(h, ex, k32(h, 0x7FF)), h.i32t), zext(h, ne(h, m, k32(h, 0)), h.i32t));
+    val nan:  value.Value = band(h, zext(h, eq(h, ex, k32(h, ex_nan)), h.i32t), zext(h, ne(h, m, k32(h, 0)), h.i32t));
     var out:  value.Value = pick(h, ne(h, nan, k32(h, 0)), k32(h, 0x7E00), bor(h, sign, sat));
     if (h.nan == float.NAN_PRESERVE) {
-        val qnan: value.Value = bor(h, k32(h, 0x7E00), shr(h, mhi, k32(h, 10)));
+        val qnan: value.Value = bor(h, k32(h, 0x7E00), shr(h, payload, k32(h, payload_shift)));
         out = bor(h, sign, pick(h, ne(h, nan, k32(h, 0)), qnan, sat));
     }
     ret trunc(h, out, h.bits_t);
 }
 
-# the carried bits negated: the sign flipped, as every float negation does
+# the carried bits negated: the sign flipped, as every float negation does. a target
+# that negates an f16 itself does so on the f16, where it may hold no 16-bit integer
 pub fun neg(h: *Half, x: value.Value) value.Value {
+    if (native(h, isa.VEC_OP_NEG, true, 16, 16)) {
+        ret bitcast(h, take(h, builder.emit_neg(h.b, bitcast(h, x, f16_type(h)))), h.bits_t);
+    }
     ret bxor(h, x, value.const_int(0x8000, h.bits_t));
 }
 
@@ -323,7 +426,7 @@ pub fun arith(h: *Half, k: instruction.InstrKind, a: value.Value, b: value.Value
 # the operand a comparison of carried bits reads: the f16 itself where the
 # target compares at 16 bits, the exact binary32 widening where it converts
 # there (a comparison makes no NaN, so quieting one changes nothing), else the
-# exact binary64 widening
+# exact wide widening
 pub fun compare_operand(h: *Half, x: value.Value) value.Value {
     if (native(h, isa.VEC_OP_CMP, true, 16, 16)) { ret bitcast(h, x, f16_type(h)); }
     if (converts_f32(h))                         { ret to_float(h, x, 32); }
@@ -335,7 +438,9 @@ pub fun from_float(h: *Half, v: value.Value, bits: u32) value.Value {
     if (native(h, isa.VEC_OP_FP_TRUNC, true, 16, bits)) {
         ret bitcast(h, take(h, builder.emit_fp_trunc(h.b, v, f16_type(h))), h.bits_t);
     }
-    if (bits == 64) { ret narrow(h, v); }
+    if (bits == wide_bits(h)) { ret narrow_from(h, v, bits); }
+    # a binary64 through binary32 rounds to odd there first, or it would round twice
+    if (bits == 64) { ret narrow32_word(h, round_odd32(h, v)); }
     # binary32 widens exactly, so one rounding still happens
     ret narrow(h, take(h, builder.emit_fp_ext(h.b, v, h.f64t)));
 }
@@ -346,13 +451,15 @@ pub fun to_float(h: *Half, x: value.Value, bits: u32) value.Value {
         ret take(h, builder.emit_fp_ext(h.b, bitcast(h, x, f16_type(h)), float_type(h, bits)));
     }
     val d: value.Value = widen(h, x);
-    if (bits == 64) { ret d; }
+    if (bits == wide_bits(h)) { ret d; }
+    if (bits == 64)           { ret take(h, builder.emit_fp_ext(h.b, d, h.f64t)); }
     ret take(h, builder.emit_fp_trunc(h.b, d, float_type(h, bits)));
 }
 
 # the integer `v` of `bits` converted to carried bits, rounding to nearest even
-# and overflowing to infinity. binary64 rounds an integer past 2^53, but any
-# such value lies past binary16's range, where the narrowing saturates anyway
+# and overflowing to infinity. the wide format rounds an integer only past
+# 2^24 (binary32) or 2^53 (binary64), but any such value lies past binary16's
+# range, where the narrowing saturates anyway
 pub fun from_int(h: *Half, v: value.Value, bits: u32, signed: bool) value.Value {
     var op: isa.VecOp = isa.VEC_OP_UI_TO_FP;
     if (signed) { op = isa.VEC_OP_SI_TO_FP; }
@@ -361,13 +468,13 @@ pub fun from_int(h: *Half, v: value.Value, bits: u32, signed: bool) value.Value 
         if (signed) { r = builder.emit_si_to_fp(h.b, v, f16_type(h)); }
         ret bitcast(h, take(h, r), h.bits_t);
     }
-    if (signed) { ret narrow(h, take(h, builder.emit_si_to_fp(h.b, v, h.f64t))); }
-    ret narrow(h, take(h, builder.emit_ui_to_fp(h.b, v, h.f64t)));
+    if (signed) { ret narrow(h, take(h, builder.emit_si_to_fp(h.b, v, wide_float(h)))); }
+    ret narrow(h, take(h, builder.emit_ui_to_fp(h.b, v, wide_float(h))));
 }
 
 # carried bits converted to the integer type `ity` of `bits`, truncating toward
-# zero; an operand out of range converts as the target's binary64 conversion
-# does, the rule every float width follows
+# zero; an operand out of range converts as the target's conversion from the
+# wide format does, the rule every float width follows
 pub fun to_int(h: *Half, x: value.Value, ity: ir_type.IrTypeId, bits: u32, signed: bool) value.Value {
     var op: isa.VecOp = isa.VEC_OP_FP_TO_UI;
     if (signed) { op = isa.VEC_OP_FP_TO_SI; }

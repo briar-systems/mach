@@ -94,13 +94,15 @@ static uint16_t mul_f16_ops(uint16_t a, uint16_t b) { return narrow_f16_ops(wide
 static uint16_t div_f16_ops(uint16_t a, uint16_t b) { return narrow_f16_ops(widen_f16_ops(a) / widen_f16_ops(b)); }
 
 /* mach's float `%` is the truncated remainder a - trunc(a / b) * b, exact and
- * so always representable, and the NaN that formula makes for an infinite or
- * NaN divisor or a NaN dividend. every binary16 value is an integer
+ * so always representable, and the NaN that formula makes for a zero or NaN
+ * divisor or an infinite or NaN dividend. a finite dividend over an infinite
+ * divisor is the dividend, as in fmod. every binary16 value is an integer
  * multiple of 2^-24 below 2^40 of them, so the remainder is taken on those
  * integers; a zero result keeps the dividend's sign */
 static uint16_t rem_f16_ops(uint16_t a, uint16_t b) {
     const double x = widen_f16_ops(a);
     const double y = widen_f16_ops(b);
+    if (x - x == 0.0 && y - y != 0.0 && y == y) { return a; }
     if (x - x != 0.0 || y - y != 0.0 || y == 0.0) { return 0x7E00u; }
     const int64_t xi = (int64_t)(x * 16777216.0);
     const int64_t yi = (int64_t)(y * 16777216.0);
@@ -150,9 +152,7 @@ static uint64_t arith_f16_ops(uint64_t seed) {
             h = fold_f16_ops(h, sub_f16_ops(a, b));
             h = fold_f16_ops(h, mul_f16_ops(a, b));
             h = fold_f16_ops(h, div_f16_ops(a, b));
-            if ((table_f16_ops(i) & 0x7FFFu) != 0x7C00u && (table_f16_ops(j) & 0x7FFFu) != 0) {
-                h = fold_f16_ops(h, rem_f16_ops(a, b));
-            }
+            h = fold_f16_ops(h, rem_f16_ops(a, b));
         }
     }
 

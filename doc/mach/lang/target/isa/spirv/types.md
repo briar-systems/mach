@@ -18,11 +18,42 @@ pub val MAX_STRUCT_MEMBERS: u32 = 16
 pub rec TypeTable;
 ```
 
+`storage_only` is set while a type is built for host-shared memory, where an 8- or
+16-bit scalar is declared under its storage access capability: a request then raises
+no Int8, Int16 or Float16, which every other request of the width does (#4299).
+`use_loc` is the source use the emitter is building types for, and `need_loc` the
+first located use of each Builder.caps_needed bit, by bit position, which a refusal
+of the capability points at (#4334)
+
 ## fun types_init
 
 ```mach
 pub fun types_init(b: *spirv.Builder) TypeTable;
 ```
+
+## fun raise
+
+```mach
+pub fun raise(tt: *TypeTable, need: u64);
+```
+
+raises `need` for the use types are being built for
+
+## fun raise_at
+
+```mach
+pub fun raise_at(tt: *TypeTable, need: u64, loc: source.SrcLoc);
+```
+
+raises `need` for the use at `loc`, which locates each bit no earlier use located
+
+## fun need_loc
+
+```mach
+pub fun need_loc(tt: *TypeTable, need: u64) source.SrcLoc;
+```
+
+the first located use of the lowest bit of `need`, nil where no use was located
 
 ## fun types_dnit
 
@@ -35,6 +66,32 @@ pub fun types_dnit(tt: *TypeTable);
 ```mach
 pub fun composite_member(tt: *TypeTable, id: u32, index: u32) u32;
 ```
+
+## fun composite_count
+
+```mach
+pub fun composite_count(tt: *TypeTable, id: u32) u32;
+```
+
+how many members, elements or lanes the composite `id` has, 0 when it is none or a runtime array
+
+## fun holds_pointer
+
+```mach
+pub fun holds_pointer(tt: *TypeTable, id: u32, storage: u32) bool;
+```
+
+whether a value of the type holds a pointer of storage class `storage`, which has no
+null constant
+
+## fun array_shape
+
+```mach
+pub fun array_shape(tt: *TypeTable, id: u32, out_count: *u32) u32;
+```
+
+the element type of the sized array `id`, laid out or plain, with its length in
+`out_count`. 0 when it is no sized array
 
 ## fun logically_match
 
@@ -132,7 +189,7 @@ a struct or array: something an access chain descends into
 
 ```mach
 pub fun type_image(tt: *TypeTable, sampled: u32, dim: u32, depth: u32, arrayed: u32,
-ms: u32, sampled_op: u32) u32;
+ms: u32, sampled_op: u32, format: u32) u32;
 ```
 
 ## fun type_sampled_image
@@ -158,6 +215,23 @@ pub fun type_is_opaque(tt: *TypeTable, id: u32) bool;
 ```mach
 pub fun type_ptr(tt: *TypeTable, storage: u32, pointee: u32) u32;
 ```
+
+## fun type_ptr_at
+
+```mach
+pub fun type_ptr_at(tt: *TypeTable, id: u32, storage: u32, pointee: u32) u32;
+```
+
+declares the pointer `id` reserved for a record a cycle of pointers reaches, once the
+record is declared, so a later request for the same pointer finds it
+
+## fun type_forward_pointer
+
+```mach
+pub fun type_forward_pointer(tt: *TypeTable, id: u32, storage: u32);
+```
+
+names the pointer `id` before its record is declared, for a member of that record's cycle
 
 ## fun pointer_shape
 

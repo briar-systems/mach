@@ -16,7 +16,13 @@ the sign of the dividend (`-7 % 3 == -1`). On floats it is the truncated (C
 `fmod`) remainder `a - trunc(a / b) * b`, likewise taking the sign of the
 dividend (`5.5 % 3.0 == 2.5`, `-5.5 % 3.0 == -2.5`). For finite operands and a
 nonzero divisor, this applies across the finite operand range, including
-quotients beyond the `i64` range.
+quotients beyond the `i64` range. A zero divisor or an infinite dividend gives
+NaN on every target, as IEEE 754 and C `fmod` do. So does a NaN operand. A
+finite dividend over an infinite divisor gives the dividend unchanged, its sign
+and a zero dividend's sign included, as C `fmod` does. Where the result is NaN,
+only the NaN is defined, not its sign or payload. In a constant expression a
+zero divisor is refused as division by zero, and the other cases fold to the
+same results as at run time.
 
 ```mach
 use std.print;
@@ -70,8 +76,9 @@ table and the conditions are in
 
 `+ - * /` on `f16` give the correctly rounded binary16 result, to nearest with
 ties to even, on every target. `%` is the truncated remainder of the other float
-widths, computed on the operands' exact binary64 widening; the remainder of two
-`f16` values is itself an `f16`, so narrowing it back does not round. Unary `-`
+widths, computed on the operands' exact widening to the format the operation
+runs in; the remainder of two `f16` values is itself an `f16`, so narrowing it
+back does not round. Unary `-`
 flips the sign bit, and a comparison relates the exact values, against an `f16`
 or any other float width ([Comparison](#comparison)). No operator is added or
 removed for the width, and a secret `f16` operand is refused in each of them as
@@ -108,7 +115,7 @@ never a call:
 | riscv with `zfhmin` | binary32 through `fcvt.s.h` and `fcvt.h.s` | binary32 through `fcvt.s.h` |
 | riscv with `zfh` | native (`fadd.h`, `fsub.h`, `fmul.h`, `fdiv.h`) | native (`feq.h`, `flt.h`, `fle.h`) |
 | spirv with `float16` | native, the core float instructions on `OpTypeFloat 16` | native |
-| spirv without `float16` (`vulkan1.0`, `vulkan1.1`) | binary64, the conversions inline | binary64, the widening inline |
+| spirv without `float16` | binary32, the conversions inline | binary32, the widening inline |
 
 aarch64 without `fp16` computes in binary64 even though `fcvt` converts to
 binary32, because that conversion quiets a signaling operand and the half unit

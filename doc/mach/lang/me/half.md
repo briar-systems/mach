@@ -6,20 +6,22 @@ declares in its half rows (isa.half_native) is its own instruction on those
 bits; every other one is the expansion here, which calls nothing, so no
 runtime symbol appears for a freestanding link to provide.
 
-arithmetic widens both operands exactly to binary64, computes there and
-narrows once. binary64 carries more than twice binary16's precision plus two
-bits, so that one rounding is the correctly rounded binary16 result, the rule
-comptime folds by. a target whose rows convert f16 to and from binary32
-computes in binary32 instead, which carries exactly that much (#3801). an
-arithmetic operand widens with a NaN kept as it is, signaling or quiet, so
-the binary64 unit picks and quiets the NaN as the target's half unit would.
-a conversion goes through binary64 the same way, and a comparison compares
-the widened values. widening and narrowing are integer code on the halves of
-the binary64 encoding: sign, exponent and significand extraction, round to
-nearest even, subnormals, overflow to infinity, and a converted NaN made by
-the target's NaN rule, as float.narrow_bits and float.widen_bits define them,
-so the expansion converts as the target's own half instructions would. every
-step is branch-free, a select being a mask
+arithmetic widens both operands exactly to the wide format, binary64 or
+binary32 where the model says (#4332), computes there and narrows once. both
+carry at least twice binary16's precision plus two bits, binary32 exactly
+that much, so that one rounding is the correctly rounded binary16 result, the
+rule comptime folds by. a target whose rows convert f16 to and from binary32
+computes in binary32 through them (#3801). an arithmetic operand widens with
+a NaN kept as it is, signaling or quiet, so the wide unit picks and quiets
+the NaN as the target's half unit would. a conversion goes through the wide
+format the same way, and a comparison compares the widened values. widening
+and narrowing are integer code on the wide encoding in 32-bit words (a
+binary64 narrowed under binary32 rounds to odd there first): sign, exponent
+and significand extraction, round to nearest even,
+subnormals, overflow to infinity, and a converted NaN made by the target's
+NaN rule, as float.narrow_bits and float.widen_bits define them, so the
+expansion converts as the target's own half instructions would. every step
+is branch-free, a select being a mask
 
 ## rec Half
 
@@ -56,14 +58,22 @@ pub fun done(h: *Half, v: value.Value) res[value.Value, fail.Fail];
 
 the value, or the first failure on the way to it
 
+## fun wide_bits
+
+```mach
+pub fun wide_bits(h: *Half) u32;
+```
+
+the width of the format the expansion computes in, 32 or 64
+
 ## fun widen
 
 ```mach
 pub fun widen(h: *Half, x: value.Value) value.Value;
 ```
 
-the carried bits `x` widened exactly to binary64, a NaN as the target's
-rule converts it
+the carried bits `x` widened exactly to the wide format, a NaN as the
+target's rule converts it
 
 ## fun narrow
 
@@ -71,7 +81,7 @@ rule converts it
 pub fun narrow(h: *Half, d: value.Value) value.Value;
 ```
 
-the binary64 `d` rounded once, to nearest with ties to even, into the carried bits
+the wide `d` rounded once, to nearest with ties to even, into the carried bits
 
 ## fun neg
 
@@ -79,7 +89,8 @@ the binary64 `d` rounded once, to nearest with ties to even, into the carried bi
 pub fun neg(h: *Half, x: value.Value) value.Value;
 ```
 
-the carried bits negated: the sign flipped, as every float negation does
+the carried bits negated: the sign flipped, as every float negation does. a target
+that negates an f16 itself does so on the f16, where it may hold no 16-bit integer
 
 ## fun arith
 
@@ -99,7 +110,7 @@ pub fun compare_operand(h: *Half, x: value.Value) value.Value;
 the operand a comparison of carried bits reads: the f16 itself where the
 target compares at 16 bits, the exact binary32 widening where it converts
 there (a comparison makes no NaN, so quieting one changes nothing), else the
-exact binary64 widening
+exact wide widening
 
 ## fun from_float
 
@@ -124,8 +135,9 @@ pub fun from_int(h: *Half, v: value.Value, bits: u32, signed: bool) value.Value;
 ```
 
 the integer `v` of `bits` converted to carried bits, rounding to nearest even
-and overflowing to infinity. binary64 rounds an integer past 2^53, but any
-such value lies past binary16's range, where the narrowing saturates anyway
+and overflowing to infinity. the wide format rounds an integer only past
+2^24 (binary32) or 2^53 (binary64), but any such value lies past binary16's
+range, where the narrowing saturates anyway
 
 ## fun to_int
 
@@ -134,8 +146,8 @@ pub fun to_int(h: *Half, x: value.Value, ity: ir_type.IrTypeId, bits: u32, signe
 ```
 
 carried bits converted to the integer type `ity` of `bits`, truncating toward
-zero; an operand out of range converts as the target's binary64 conversion
-does, the rule every float width follows
+zero; an operand out of range converts as the target's conversion from the
+wide format does, the rule every float width follows
 
 ## fun vec_arith
 

@@ -27,6 +27,25 @@ span: token.Span) bool;
 pub fun check_annotation_uni_secrecy(sc: *sema.SemaContext, ast_tid: id.TypeId);
 ```
 
+## fun check_annotation
+
+```mach
+pub fun check_annotation(sc: *sema.SemaContext, ast_tid: id.TypeId);
+```
+
+the checks an instance owes each type annotation it resolves, which no check of the
+generic declaration can answer before its parameters are known
+
+## fun check_annotation_handles
+
+```mach
+pub fun check_annotation_handles(sc: *sema.SemaContext, ast_tid: id.TypeId);
+```
+
+a generic record, union or tag instantiated so that a field or payload holds a handle,
+directly or through a pointer, array or secret: the instance is the declaration its
+arguments spell, and the same declaration written out is refused for that field
+
 ## fun check_type_uni_secrecy
 
 ```mach

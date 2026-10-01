@@ -695,6 +695,26 @@ and none the 128-bit one (#3511)
 pub val INT_WIDTHS_1_2_4_8_16: u32 = 1 + 2 + 4 + 8 + 16
 ```
 
+## val ALU_WIDTHS_4
+
+```mach
+pub val ALU_WIDTHS_4:       u32 = 4
+```
+
+alu width sets for declare_alu_widths, encoded like int_widths
+
+## val ALU_WIDTHS_4_8
+
+```mach
+pub val ALU_WIDTHS_4_8:     u32 = 4 + 8
+```
+
+## val ALU_WIDTHS_1_2_4_8
+
+```mach
+pub val ALU_WIDTHS_1_2_4_8: u32 = 1 + 2 + 4 + 8
+```
+
 ## def MulWideForm
 
 ```mach
@@ -722,6 +742,21 @@ pub val MULW_THREE_ADDRESS: MulWideForm = 1
 
 ```mach
 pub val MULW_FIXED_PAIR:    MulWideForm = 2
+```
+
+## rec AluWidth
+
+```mach
+pub rec AluWidth;
+```
+
+one width the alu computes an integer at, in bytes, legal while the model
+holds every extension in `ext` (0 when it always is)
+
+## val ALU_WIDTH_CAP
+
+```mach
+pub val ALU_WIDTH_CAP: u32 = 5
 ```
 
 ## rec MachineModel
@@ -1178,6 +1213,67 @@ pub fun shift_count_mod_width(m: *MachineModel, bytes: u32) bool;
 pub fun moves_cross_bank(m: *MachineModel, bytes: u32) bool;
 ```
 
+## fun declare_alu_widths
+
+```mach
+pub fun declare_alu_widths(m: *MachineModel, widths: u32);
+```
+
+declares the alu widths `widths` (encoded like int_widths), each one legal
+under every extension set, in place of any declared before
+
+## fun gate_alu_width
+
+```mach
+pub fun gate_alu_width(m: *MachineModel, bytes: u32, ext: u64);
+```
+
+declares the alu width `bytes`, legal only while the model holds `ext`
+
+## fun alu_width_set
+
+```mach
+pub fun alu_width_set(m: *MachineModel) u32;
+```
+
+the alu widths legal under the model's extensions, encoded like int_widths
+
+## fun alu_min_width
+
+```mach
+pub fun alu_min_width(m: *MachineModel) u32;
+```
+
+the narrowest legal alu width, 0 for a model that declares none
+
+## fun max_alu_width
+
+```mach
+pub fun max_alu_width(m: *MachineModel) u32;
+```
+
+the widest legal alu width, above which legalize splits an operation into
+lanes; 0 for a model that declares none
+
+## fun alu_width_floor_set
+
+```mach
+pub fun alu_width_floor_set(m: *MachineModel) u32;
+```
+
+the alu widths legal under every extension set, encoded like int_widths
+
+## fun clamp_alu_width
+
+```mach
+pub fun clamp_alu_width(m: *MachineModel, w: u8) u8;
+```
+
+the width an integer operation of `w` bytes computes at: w itself when it is
+legal, otherwise the narrowest width above it that is legal whatever the
+extensions, so a lift never needs a capability the program did not spell; w
+again when none is (legalize splits it)
+
 ## fun realizes_int_width
 
 ```mach
@@ -1354,6 +1450,340 @@ pub rec ModuleEmitter;
 pub def RelocSeam: of.RelocationCapabilities
 ```
 
+## def OpOperandKind
+
+```mach
+pub def OpOperandKind: u8
+```
+
+how one operand of an `#[op]` instruction is written: an ordinary value id, an
+id that must be an integer constant by emission, a literal word inline, a
+pointer whose storage class the call site's access chain decides, which the
+instruction only reads through, only stores through, or reads and writes, a
+handle value whose memory the instruction reads or writes (a handle passed as
+an ordinary value names its descriptor and touches none of its memory), or a
+truth value the target writes as its boolean type, from an integer argument
+whose nonzero is true. a memory scope or a memory semantics operand is a
+constant id too, one the target reads by value and holds to what that value
+needs under its memory model
+
+## val OP_OPERAND_VALUE
+
+```mach
+pub val OP_OPERAND_VALUE:          OpOperandKind = 0
+```
+
+## val OP_OPERAND_CONSTANT
+
+```mach
+pub val OP_OPERAND_CONSTANT:       OpOperandKind = 1
+```
+
+## val OP_OPERAND_LITERAL
+
+```mach
+pub val OP_OPERAND_LITERAL:        OpOperandKind = 2
+```
+
+## val OP_OPERAND_POINTER_READ
+
+```mach
+pub val OP_OPERAND_POINTER_READ:   OpOperandKind = 3
+```
+
+## val OP_OPERAND_POINTER_WRITE
+
+```mach
+pub val OP_OPERAND_POINTER_WRITE:  OpOperandKind = 4
+```
+
+## val OP_OPERAND_POINTER_UPDATE
+
+```mach
+pub val OP_OPERAND_POINTER_UPDATE: OpOperandKind = 5
+```
+
+## val OP_OPERAND_HANDLE_READ
+
+```mach
+pub val OP_OPERAND_HANDLE_READ:    OpOperandKind = 6
+```
+
+## val OP_OPERAND_HANDLE_WRITE
+
+```mach
+pub val OP_OPERAND_HANDLE_WRITE:   OpOperandKind = 7
+```
+
+## val OP_OPERAND_BOOL
+
+```mach
+pub val OP_OPERAND_BOOL:           OpOperandKind = 8
+```
+
+## val OP_OPERAND_SCOPE
+
+```mach
+pub val OP_OPERAND_SCOPE:          OpOperandKind = 9
+```
+
+## val OP_OPERAND_SEMANTICS
+
+```mach
+pub val OP_OPERAND_SEMANTICS:      OpOperandKind = 10
+```
+
+## val OP_OPERAND_KIND_COUNT
+
+```mach
+pub val OP_OPERAND_KIND_COUNT:     OpOperandKind = 11
+```
+
+## def OpResult
+
+```mach
+pub def OpResult: u8
+```
+
+whether an `#[op]` instruction has a result id, and whether that result is a
+pointer into the space the row declares, or a truth value of the target's boolean
+type, which the declaration's integer return type receives as 1 or 0
+
+## val OP_RESULT_VALUE
+
+```mach
+pub val OP_RESULT_VALUE:   OpResult = 0
+```
+
+## val OP_RESULT_NONE
+
+```mach
+pub val OP_RESULT_NONE:    OpResult = 1
+```
+
+## val OP_RESULT_POINTER
+
+```mach
+pub val OP_RESULT_POINTER: OpResult = 2
+```
+
+## val OP_RESULT_BOOL
+
+```mach
+pub val OP_RESULT_BOOL:    OpResult = 3
+```
+
+## val OP_MAX_OPERANDS
+
+```mach
+pub val OP_MAX_OPERANDS: u32 = 16
+```
+
+## val NO_OP_SPACE
+
+```mach
+pub val NO_OP_SPACE: u32 = 0xFFFFFFFF
+```
+
+## val NO_OP_CAPABILITY
+
+```mach
+pub val NO_OP_CAPABILITY: u32 = 0xFFFFFFFF
+```
+
+## val NO_OP_SOURCE
+
+```mach
+pub val NO_OP_SOURCE: u32 = 0xFFFFFFFF
+```
+
+## rec OpEnumerant
+
+```mach
+pub rec OpEnumerant;
+```
+
+one value a literal operand may take and what that value brings: the target's
+own capability word it needs (NO_OP_CAPABILITY for none), the extensions of the
+isa's vocabulary that capability needs selected, and the operands it adds to the end
+of the instruction, one letter each as `op_def_shaped` spells them (`""` for none).
+what a value brings is never a pointer or a handle: a row's memory effects are known
+before a call's literal is
+
+## rec OpEnum
+
+```mach
+pub rec OpEnum;
+```
+
+the closed set of values a literal operand takes. a value enumeration admits
+exactly one of its values. a mask admits any union of its single-bit values,
+each set bit bringing its own requirement and operands, which follow in
+ascending bit order, and 0 is the empty mask
+
+## def OpDataClass
+
+```mach
+pub def OpDataClass: u8
+```
+
+the class of the data type a typed row operates on: an integer, a float, or anything
+else (a vector, an aggregate, a handle), which no requirement admits
+
+## val OP_DATA_INT
+
+```mach
+pub val OP_DATA_INT:   OpDataClass = 0
+```
+
+## val OP_DATA_FLOAT
+
+```mach
+pub val OP_DATA_FLOAT: OpDataClass = 1
+```
+
+## val OP_DATA_OTHER
+
+```mach
+pub val OP_DATA_OTHER: OpDataClass = 2
+```
+
+## rec OpTypeRequirement
+
+```mach
+pub rec OpTypeRequirement;
+```
+
+one data type a typed row admits in one of the target's address spaces (NO_OP_SPACE
+for every space), and what a use of it there needs: the target's capability word
+(NO_OP_CAPABILITY for none) and the extensions of the isa's vocabulary
+
+## rec OpTyping
+
+```mach
+pub rec OpTyping;
+```
+
+the data types a row operates on, read from its operand `operand` (a pointer's
+pointee), and what each needs in each address space. a type no requirement admits in
+any space is refused at the declaration, and one admitted only in other spaces at the
+call. a typing with no requirements admits every type and needs nothing: it only names
+the operand the row's relations are stated against. static data the target owns for
+the life of the program, like an OpEnum
+
+## def OpRelation
+
+```mach
+pub def OpRelation: u8
+```
+
+how an operand's or the result's type relates to the row's data type, the type of its
+typing's operand (a pointer operand's pointee): unrelated, that same type, a texel, a
+scalar or vector whose component is the sampled type of the handle the typing's operand
+is, with as many components as the row's texel count states, for a pointer result
+only, a pointer to that sampled type, into the memory of the handle the typing's pointer
+operand addresses, or, for a value result only, a handle whose constructor composes over
+the handle the typing's operand is, taking its texels from it as a sampled image does
+from its image. an operand may also be a sampler, a handle whose constructor states how
+texels are sampled, whatever the data type
+
+## val OP_RELATION_NONE
+
+```mach
+pub val OP_RELATION_NONE:     OpRelation = 0
+```
+
+## val OP_RELATION_DATA
+
+```mach
+pub val OP_RELATION_DATA:     OpRelation = 1
+```
+
+## val OP_RELATION_TEXEL
+
+```mach
+pub val OP_RELATION_TEXEL:    OpRelation = 2
+```
+
+## val OP_RELATION_POINTEE
+
+```mach
+pub val OP_RELATION_POINTEE:  OpRelation = 3
+```
+
+## val OP_RELATION_COMPOSED
+
+```mach
+pub val OP_RELATION_COMPOSED: OpRelation = 4
+```
+
+## val OP_RELATION_SAMPLER
+
+```mach
+pub val OP_RELATION_SAMPLER:  OpRelation = 5
+```
+
+## val OP_RELATION_COUNT
+
+```mach
+pub val OP_RELATION_COUNT:    OpRelation = 6
+```
+
+## def OpCountKind
+
+```mach
+pub def OpCountKind: u8
+```
+
+how a row's texel count is stated: exactly a number of components, or at least as many
+as the handle's format stores, any number when its format is unknown
+
+## val OP_COUNT_EXACT
+
+```mach
+pub val OP_COUNT_EXACT:      OpCountKind = 0
+```
+
+## val OP_COUNT_FORMAT
+
+```mach
+pub val OP_COUNT_FORMAT:     OpCountKind = 1
+```
+
+## val OP_COUNT_KIND_COUNT
+
+```mach
+pub val OP_COUNT_KIND_COUNT: OpCountKind = 2
+```
+
+## rec OpTexelCount
+
+```mach
+pub rec OpTexelCount;
+```
+
+the number of components a row's texel has, a scalar being one: `components` exactly,
+or as `kind` says. `rule` names the rule a refusal cites. static data the target owns
+for the life of the program, like an OpTyping
+
+## rec OpScalar
+
+```mach
+pub rec OpScalar;
+```
+
+a scalar data type by class, width and signedness, such as a handle's sampled type
+
+## rec OpOperandScalar
+
+```mach
+pub rec OpOperandScalar;
+```
+
+the one scalar type an operand must be whatever the row's data type, such as the 32-bit
+float reference a depth comparison takes. `rule` names the rule a refusal cites. static
+data the target owns for the life of the program, like an OpTexelCount
+
 ## rec OpDef
 
 ```mach
@@ -1377,6 +1807,74 @@ pub val NO_TYPE_CTOR: u32 = 0xFFFFFFFF
 ```mach
 pub def TypeRefuseFn: fun(*u32, u32) str
 ```
+
+## def TypeBindFn
+
+```mach
+pub def TypeBindFn: fun(*u32, u32) u32
+```
+
+the descriptor role a handle binds through, from its operands
+
+## def TypeComposeFn
+
+```mach
+pub def TypeComposeFn: fun(u32, *u32, u32) str
+```
+
+why a composing constructor refuses the handle named as its operand `index`, from
+that handle's own operands, nil when it composes over it
+
+## def TypeSampledFn
+
+```mach
+pub def TypeSampledFn: fun(*u32, u32) OpScalar
+```
+
+the scalar a handle's texels are read and written as, from its operands, class
+OP_DATA_OTHER when it has none
+
+## def TypeComponentsFn
+
+```mach
+pub def TypeComponentsFn: fun(*u32, u32) u32
+```
+
+the number of components a handle's format stores each texel in, from its operands, 0
+when its format is unknown
+
+## val NO_TEXEL_OPERAND
+
+```mach
+pub val NO_TEXEL_OPERAND: u32 = 0xFFFFFFFF
+```
+
+a constructor whose handles state their own texels, or have none
+
+## def TypeAddressFn
+
+```mach
+pub def TypeAddressFn: fun(*u32, u32) str
+```
+
+why no instruction may derive a pointer into a handle's memory, from its operands, nil
+when one may
+
+## val HANDLE_BIND_SAMPLER
+
+```mach
+pub val HANDLE_BIND_SAMPLER: u32 = 0
+```
+
+a handle bound as a sampled descriptor, `#[sampler(set, binding)]`
+
+## val HANDLE_BIND_STORAGE
+
+```mach
+pub val HANDLE_BIND_STORAGE: u32 = 1
+```
+
+a handle bound as a storage descriptor, `#[storage(set, binding, ...)]`
 
 ## rec TypeDef
 
@@ -1402,11 +1900,305 @@ pub val NO_OP_SET: u32 = definition.NO_OP_SET
 pub fun op_def(set: str, name: str, set_tag: u32, opcode: u32, arity: u32) OpDef;
 ```
 
+a row whose every operand is a value and whose result is a value
+
+## fun op_def_shaped
+
+```mach
+pub fun op_def_shaped(set: str, name: str, set_tag: u32, opcode: u32,
+result: OpResult, result_space: u32, signature: str) OpDef;
+```
+
+a row spelled by its operand signature, one letter per operand in order: `v` a
+value, `c` a constant id, `l` a literal word, `r` a pointer only read through, `w`
+a pointer only stored through, `u` a pointer read and written (read-modify-write),
+`i` a handle whose memory is read, `o` a handle whose memory is written, `b` a
+truth value, `s` a memory scope and `m` a memory semantics, each a constant id.
+a row spells only its own operands: the ones an enumerated literal's value brings
+follow them, typed by the enumerant (`op_enumerated`). a `|` makes the literal after
+it optional (`"iv|l"`), a call passing it or leaving it out with every operand its
+value would bring, and nothing else follows it.
+a letter outside the set is an invalid kind, which registration refuses
+
+## fun op_requiring
+
+```mach
+pub fun op_requiring(d: OpDef, capability: u32, requires: u64) OpDef;
+```
+
+`d` needing the target's capability word `capability` and the extensions `requires` on every use
+
+## fun op_enumerated
+
+```mach
+pub fun op_enumerated(d: OpDef, operand: u32, e: *OpEnum) OpDef;
+```
+
+`d` with its literal operand `operand` held to the values of `e`, and room after the
+operands it spells for the most every enumerated literal's value brings
+
+## fun op_typed
+
+```mach
+pub fun op_typed(d: OpDef, t: *OpTyping) OpDef;
+```
+
+`d` operating on the data types `t` admits, each with its own requirement
+
+## fun op_related
+
+```mach
+pub fun op_related(d: OpDef, result: OpRelation, operands: str) OpDef;
+```
+
+`d` with its result's type related to its data type by `result`, and each operand's by
+one letter of `operands` in order: `-` unrelated, `=` the data type itself, `t` a texel
+of the handle the typing's operand is, `s` a sampler. a letter outside the set is an invalid relation,
+which registration refuses
+
+## fun op_confined
+
+```mach
+pub fun op_confined(d: OpDef) OpDef;
+```
+
+`d` with its result consumed only by another row's operand in the block that produces it
+
+## fun op_derived
+
+```mach
+pub fun op_derived(d: OpDef, operand: u32) OpDef;
+```
+
+`d` with its pointer or handle result derived from its operand `operand`: a pointer
+result points into what that pointer operand addresses, a handle result holds the
+descriptor that operand holds
+
+## fun op_scalar_operand
+
+```mach
+pub fun op_scalar_operand(d: OpDef, operand: u32, s: *OpOperandScalar) OpDef;
+```
+
+`d` with its operand `operand` held to the one scalar type `s` states
+
+## fun op_operand_scalar
+
+```mach
+pub fun op_operand_scalar(d: *OpDef, i: u32) *OpOperandScalar;
+```
+
+the scalar type operand `i` of `d` must be, nil when the row fixes none
+
+## fun op_texel_counted
+
+```mach
+pub fun op_texel_counted(d: OpDef, count: *OpTexelCount) OpDef;
+```
+
+`d` with the texel it relates holding `count` components
+
+## fun op_texel_count_admits
+
+```mach
+pub fun op_texel_count_admits(count: *OpTexelCount, n: u32, stored: u32) bool;
+```
+
+whether `n` components meet `count`, against a handle whose format stores `stored`, 0
+when its format is unknown
+
+## fun op_operand_relation
+
+```mach
+pub fun op_operand_relation(d: *OpDef, i: u32) OpRelation;
+```
+
+## fun op_typing_constrains
+
+```mach
+pub fun op_typing_constrains(t: *OpTyping) bool;
+```
+
+whether `t` holds the row's data type to requirements, rather than only naming its operand
+
+## fun op_type_requirement
+
+```mach
+pub fun op_type_requirement(t: *OpTyping, class: OpDataClass, bits: u32, space: u32) *OpTypeRequirement;
+```
+
+the requirement of `t` admitting a `class` of `bits` in `space`, nil when none does.
+`space` NO_OP_SPACE asks whether any space admits the type
+
+## fun op_operand_enum
+
+```mach
+pub fun op_operand_enum(d: *OpDef, i: u32) *OpEnum;
+```
+
+## fun op_tail_literal
+
+```mach
+pub fun op_tail_literal(d: *OpDef) *OpEnum;
+```
+
+the enumeration of the optional literal that leads `d`'s tail, nil when the tail has none
+
+## fun op_enumerant_brings
+
+```mach
+pub fun op_enumerant_brings(v: *OpEnumerant) u32;
+```
+
+how many operands the enumerant `v` brings
+
+## fun op_enumerant_kind
+
+```mach
+pub fun op_enumerant_kind(v: *OpEnumerant, k: u32) OpOperandKind;
+```
+
+the kind of the `k`th operand the enumerant `v` brings
+
+## fun op_enumerant_of
+
+```mach
+pub fun op_enumerant_of(e: *OpEnum, value: u32) *OpEnumerant;
+```
+
+the enumerant of `e` whose value is exactly `value`, nil when none is
+
+## fun op_enum_admits
+
+```mach
+pub fun op_enum_admits(e: *OpEnum, value: u32, out_trailing: *u32) bool;
+```
+
+whether `value` is a value of `e`: one of its values, or for a mask a union of its
+bits. `out_trailing` receives the tail operands the value brings
+
+## val NO_OPERAND
+
+```mach
+pub val NO_OPERAND: u32 = 0xFFFFFFFF
+```
+
+## fun op_literal_span
+
+```mach
+pub fun op_literal_span(d: *OpDef, argc: u32) u32;
+```
+
+how many of a call's leading operands are enumerated-literal positions it passes: the
+required operands, and the literal leading the tail when the call passes more than them
+
+## fun op_call_arity
+
+```mach
+pub fun op_call_arity(d: *OpDef, argc: u32, words: *u32, out_bad: *u32) u32;
+```
+
+the operand count a call of `d` takes with the literal words `words` it passes:
+the operands before its tail, the literal leading the tail when the call passes one,
+and every operand an enumerated value brings. `out_bad` receives the first
+enumerated operand whose word is no value of its enumeration, else NO_OPERAND
+
+## fun op_call_kinds
+
+```mach
+pub fun op_call_kinds(d: *OpDef, argc: u32, words: *u32, out: *OpOperandKind);
+```
+
+the kind of each operand of a call of `d` passing `argc` operands with the literal
+words `words`, into `out` (OP_MAX_OPERANDS long): the operands the row spells by the
+row, then each operand a literal's value brings by the enumerant that brings it, in
+the order of the literals and of each mask's bits. a call `op_call_arity` refuses
+has the kinds of the operands it does take, and the rest are values
+
+## fun op_operand_kind
+
+```mach
+pub fun op_operand_kind(d: *OpDef, i: u32) OpOperandKind;
+```
+
+the kind of operand `i` as the row spells it. an operand a literal's value brings is
+typed by its enumerant (`op_call_kinds`), and is never a pointer or a handle, so it
+reads here as a value
+
+## fun op_kind_is_pointer
+
+```mach
+pub fun op_kind_is_pointer(k: OpOperandKind) bool;
+```
+
+## fun op_kind_is_constant
+
+```mach
+pub fun op_kind_is_constant(k: OpOperandKind) bool;
+```
+
+an id that must be an integer constant by emission, whatever the target reads its value as
+
+## fun op_kind_is_handle
+
+```mach
+pub fun op_kind_is_handle(k: OpOperandKind) bool;
+```
+
+## fun op_def_shape_refusal
+
+```mach
+pub fun op_def_shape_refusal(d: *OpDef) str;
+```
+
+the reason a row's shape is malformed, nil when it is well formed
+
+## fun op_def_by_code
+
+```mach
+pub fun op_def_by_code(defs: *TargetDefs, set_tag: u32, opcode: u32) *OpDef;
+```
+
 ## fun type_def
 
 ```mach
 pub fun type_def(name: str, tag: u32, operands: *u32, arity: u32, refuse: TypeRefuseFn) TypeDef;
 ```
+
+## fun type_def_binding
+
+```mach
+pub fun type_def_binding(td: *TypeDef, ops: *u32, n: u32) u32;
+```
+
+the role a handle of constructor `td` with operands `ops` binds through
+
+## fun type_def_sampled
+
+```mach
+pub fun type_def_sampled(td: *TypeDef, ops: *u32, n: u32) OpScalar;
+```
+
+the scalar texels of a handle of constructor `td` with operands `ops` are, class
+OP_DATA_OTHER when the constructor declares none
+
+## fun type_def_components
+
+```mach
+pub fun type_def_components(td: *TypeDef, ops: *u32, n: u32) u32;
+```
+
+the number of components a handle of constructor `td` with operands `ops` stores each
+texel in, 0 when its format is unknown or the constructor declares none
+
+## fun type_def_address
+
+```mach
+pub fun type_def_address(td: *TypeDef, ops: *u32, n: u32) str;
+```
+
+why no instruction may derive a pointer into a handle of constructor `td` with operands
+`ops`, nil when one may
 
 ## fun target_defs
 
@@ -1488,8 +2280,8 @@ pub rec Environment;
 ```
 
 an execution environment an isa defines: its name, its profile, and the
-extensions of the isa's vocabulary it guarantees (spirv's `float16` from
-vulkan1.2)
+extensions of the isa's vocabulary it guarantees (spirv's `zero_init_workgroup`
+from vulkan1.3)
 
 ## val ENV_NONE
 

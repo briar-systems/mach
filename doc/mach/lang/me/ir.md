@@ -161,58 +161,126 @@ pub val IFACE_STORAGE: u8 = 5
 pub val IFACE_SAMPLER: u8 = 6
 ```
 
+## val IFACE_PUSH
+
+```mach
+pub val IFACE_PUSH:    u8 = 7
+```
+
+## val IFACE_SPEC
+
+```mach
+pub val IFACE_SPEC:   u8 = 8
+```
+
+a specialization constant: iface_a is its SpecId, the initializer its default
+
+## val IFACE_SHARED
+
+```mach
+pub val IFACE_SHARED: u8 = 9
+```
+
 ## val IFACE_FLAG_READONLY
 
 ```mach
-pub val IFACE_FLAG_READONLY: u32 = 1
+pub val IFACE_FLAG_READONLY:  u32 = 1
+```
+
+## val IFACE_FLAG_WRITEONLY
+
+```mach
+pub val IFACE_FLAG_WRITEONLY: u32 = 2
+```
+
+## val IFACE_FLAG_COHERENT
+
+```mach
+pub val IFACE_FLAG_COHERENT:  u32 = 4
 ```
 
 ## val BUILTIN_POSITION
 
 ```mach
-pub val BUILTIN_POSITION:          u32 = 0
+pub val BUILTIN_POSITION:               u32 = 0
 ```
 
 ## val BUILTIN_VERTEX_INDEX
 
 ```mach
-pub val BUILTIN_VERTEX_INDEX:      u32 = 1
+pub val BUILTIN_VERTEX_INDEX:           u32 = 1
 ```
 
 ## val BUILTIN_INSTANCE_INDEX
 
 ```mach
-pub val BUILTIN_INSTANCE_INDEX:    u32 = 2
+pub val BUILTIN_INSTANCE_INDEX:         u32 = 2
 ```
 
 ## val BUILTIN_FRAG_COORD
 
 ```mach
-pub val BUILTIN_FRAG_COORD:        u32 = 3
+pub val BUILTIN_FRAG_COORD:             u32 = 3
 ```
 
 ## val BUILTIN_POINT_SIZE
 
 ```mach
-pub val BUILTIN_POINT_SIZE:        u32 = 4
+pub val BUILTIN_POINT_SIZE:             u32 = 4
 ```
 
 ## val BUILTIN_GLOBAL_INVOCATION
 
 ```mach
-pub val BUILTIN_GLOBAL_INVOCATION: u32 = 5
+pub val BUILTIN_GLOBAL_INVOCATION:      u32 = 5
 ```
 
 ## val BUILTIN_LOCAL_INVOCATION
 
 ```mach
-pub val BUILTIN_LOCAL_INVOCATION:  u32 = 6
+pub val BUILTIN_LOCAL_INVOCATION:       u32 = 6
 ```
 
 ## val BUILTIN_WORKGROUP_ID
 
 ```mach
-pub val BUILTIN_WORKGROUP_ID:      u32 = 7
+pub val BUILTIN_WORKGROUP_ID:           u32 = 7
+```
+
+## val BUILTIN_NUM_WORKGROUPS
+
+```mach
+pub val BUILTIN_NUM_WORKGROUPS:         u32 = 8
+```
+
+## val BUILTIN_LOCAL_INVOCATION_INDEX
+
+```mach
+pub val BUILTIN_LOCAL_INVOCATION_INDEX: u32 = 9
+```
+
+## val BUILTIN_SUBGROUP_SIZE
+
+```mach
+pub val BUILTIN_SUBGROUP_SIZE:          u32 = 10
+```
+
+## val BUILTIN_SUBGROUP_INVOCATION
+
+```mach
+pub val BUILTIN_SUBGROUP_INVOCATION:    u32 = 11
+```
+
+## val BUILTIN_SUBGROUP_ID
+
+```mach
+pub val BUILTIN_SUBGROUP_ID:            u32 = 12
+```
+
+## val BUILTIN_NUM_SUBGROUPS
+
+```mach
+pub val BUILTIN_NUM_SUBGROUPS:          u32 = 13
 ```
 
 ## rec IrAsmBind

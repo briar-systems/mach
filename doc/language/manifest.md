@@ -276,7 +276,7 @@ comptime member, `$mach.build.extensions.<name>` (see [`$mach`](comptime-mach.md
 | `x86_64` | SSE2 | `ssse3`, `sse41`, `sse42`, `sha`, `fsgsbase`, `popcnt`, `lzcnt`, `bmi1`, `bmi2`, `cx16`, `avx`, `avx2`, `fma`, `movbe`, `f16c`, `avx512f`, `avx512bw`, `avx512cd`, `avx512dq`, `avx512vl`, `aes`, `pclmul` |
 | `aarch64` | AdvSIMD | `sha2`, `sb`, `aes`, `pmull`, `fp16` |
 | `riscv64`, `riscv32` | the isa string's selection | `i`, `m`, `a`, `f`, `d`, `c`, `zicond`, `zicsr`, `zifencei`, `zfhmin`, `zfh`, `zkt` |
-| `spirv` | | `float16`, which `env` selects |
+| `spirv` | | the type device features `float16`, `int8`, `int16`, `int64` and `float64`; `zero_init_workgroup`, `storage_read_without_format`, `storage_write_without_format`, `vulkan_memory_model`, `vulkan_memory_model_device_scope` and `buffer_device_address`, which `vulkan1.3` selects; the subgroup device features `subgroup_arithmetic`, `subgroup_clustered`, `subgroup_vote`, `subgroup_ballot`, `subgroup_shuffle`, `subgroup_shuffle_relative`, `subgroup_quad` and `subgroup_graphics_stages`; the atomic device features `buffer_int64_atomics`, `shared_int64_atomics`, `buffer_float32_atomics`, `buffer_float32_atomic_add`, `buffer_float32_atomic_min_max`, `buffer_float64_atomics`, `buffer_float64_atomic_add`, `buffer_float64_atomic_min_max`, `shared_float32_atomics`, `shared_float32_atomic_add`, `shared_float32_atomic_min_max`, `shared_float64_atomics`, `shared_float64_atomic_add` `shared_float64_atomic_min_max`, `buffer_float16_atomics`, `buffer_float16_atomic_add`, `buffer_float16_atomic_min_max`, `shared_float16_atomics`, `shared_float16_atomic_add`, `shared_float16_atomic_min_max`, `image_int64_atomics`, `image_float32_atomics`, `image_float32_atomic_add` and `image_float32_atomic_min_max` ([decorators.md](decorators.md#optarget-set-name--a-function-that-is-a-target-instruction)); the image device features `storage_image_multisample` ([types.md](types.md#handles)) and the sampling device features `resource_min_lod`, `image_gather_extended` and `maintenance8` ([decorators.md](decorators.md#optarget-set-name--a-function-that-is-a-target-instruction)); the storage device features `storage_buffer_16bit_access`, `uniform_and_storage_buffer_16bit_access`, `storage_push_constant16`, `storage_input_output16`, `storage_buffer_8bit_access`, `uniform_and_storage_buffer_8bit_access` and `storage_push_constant8` |
 
 A name the selected isa does not hold is refused when the target resolves, with the
 names it does hold:
@@ -349,8 +349,22 @@ selection mach never emits, and `f` and `d` select the float register file and t
 calling convention's float registers, and `zkt` is a promise about the machine's
 execution timing that the constant-time rows read, so none of them may be named in
 [`#[extensions(...)]`](decorators.md#extensionsnames--an-outlier-function); the
-refusal says why. So is spirv `float16`, the Float16 capability the target's `env`
-guarantees for the whole module. Every x86_64 and aarch64 row, and riscv `m`, `a`,
+refusal says why. So are spirv `float16`, `int8`, `int16`, `int64` and `float64`,
+the device features that let the whole module use a type of that width, and spirv
+`zero_init_workgroup`, the device feature
+that zero-initializes the workgroup memory of every
+[`#[shared]`](decorators.md#inputn--outputn--builtinstr--uniformset-binding--storageset-binding--samplerset-binding--push--specid--shared--shader-interface)
+variable in the module, and spirv `storage_read_without_format` and
+`storage_write_without_format`, the device features that let a storage image of
+`Unknown` format be read and written, spirv `storage_image_multisample`, the
+device feature that lets a storage image be multisampled, spirv
+`resource_min_lod`, `image_gather_extended` and `maintenance8`, the device features
+that let a sample clamp its level of detail, a gather take a run-time offset, and a
+fetch or a sample take one too, and spirv `vulkan_memory_model` and
+`vulkan_memory_model_device_scope`, the device features that select the Vulkan memory
+model for the whole module and let it use the `Device` scope, and spirv
+`buffer_device_address`, the device feature that lets a module hold physical
+pointers. Every x86_64 and aarch64 row, and riscv `m`, `a`,
 `zicond`, `zicsr`, `zifencei`, `zfhmin` and `zfh`, may be.
 
 Selecting an extension is a promise about **every** machine the binary runs on. The
@@ -596,27 +610,151 @@ validation layers and capture tools report names and source lines.
 The environment fixes the SPIR-V version word and the capability ceiling:
 the compiler derives the minimal capability set a module needs and refuses a
 module that needs more than the ceiling, naming the capability and the
-environment. Without `env` a module is written as SPIR-V 1.6 with no ceiling.
+environment. The ceiling only admits a capability. One that Vulkan leaves to an
+optional device feature also needs the target to select that feature, as below.
+Without `env` a module is written as SPIR-V 1.6 with no ceiling, and holds every
+feature.
 
-The environment also selects the `float16` extension where its ceiling holds
-Float16, and a module without `env` has it too. Under it an `f16` is the native
-`OpTypeFloat 16`, computed and converted by the core float instructions, and a stage
-input or output of `f16` is declared as that type. Without it, under `vulkan1.0`
-and `vulkan1.1`, an `f16` is the software expansion on its 16 bits.
+The environment also selects the `zero_init_workgroup` extension from `vulkan1.3`,
+where `shaderZeroInitializeWorkgroupMemory` is core, and a module without `env` has
+it too. A target for an earlier version selects it with `extensions` when its consumer
+enables `VK_KHR_zero_initialize_workgroup_memory`.
 
-| `env` | SPIR-V | capabilities within the ceiling |
+The environment also selects `storage_read_without_format` and
+`storage_write_without_format` from `vulkan1.3`, which accepts the
+`StorageImageReadWithoutFormat` and `StorageImageWriteWithoutFormat` capabilities
+with no feature enabled, and a module without `env` has them too. A module reading
+or writing a storage image of `Unknown` format for an earlier version is refused
+unless the target selects the matching extension, which it does when its consumer
+enables `shaderStorageImageReadWithoutFormat` or
+`shaderStorageImageWriteWithoutFormat`.
+
+The memory model follows the same selection. A module is written under the GLSL450
+memory model unless its target selects `vulkan_memory_model`, Vulkan's
+`vulkanMemoryModel` feature, and then under the Vulkan memory model, declaring the
+`VulkanMemoryModel` capability and, below SPIR-V 1.5, the
+`SPV_KHR_vulkan_memory_model` extension. `vulkan1.3` requires the feature of every
+device, so it selects the extension, and a module without `env` has it too. A target
+for `vulkan1.1` or `vulkan1.2` selects it with `extensions` when its consumer enables
+the feature, and one for `vulkan1.0` is refused, since the model needs SPIR-V 1.3.
+Under the Vulkan model a memory scope of `Device` needs
+`vulkanMemoryModelDeviceScope` as well, which `vulkan1.3` also requires: an
+instruction taking that scope is refused unless the target selects
+`vulkan_memory_model_device_scope`, which brings `vulkan_memory_model` with it. Under
+GLSL450 the `QueueFamily` scope and the `MakeAvailable`, `MakeVisible` and `Volatile`
+memory semantics, which only the Vulkan model defines, are refused. What
+`"coherent"` and `#[shared]` mean under each model is in
+[decorators.md](decorators.md#inputn--outputn--builtinstr--uniformset-binding--storageset-binding--samplerset-binding--push--specid--shared--shader-interface).
+
+Physical pointers follow it too. A module holding one, a pointer stored in memory or
+made from an address ([types.md](types.md#pointers-on-spir-v)), is refused unless the
+target selects `buffer_device_address`, Vulkan's `bufferDeviceAddress` feature, and
+then declares the `PhysicalStorageBufferAddresses` capability, the
+`PhysicalStorageBuffer64` addressing model and, below SPIR-V 1.5, the
+`SPV_KHR_physical_storage_buffer` extension. `vulkan1.3` requires the feature of every
+device, so it selects the extension, and a module without `env` has it too. A target
+for an earlier version selects it with `extensions` when its consumer enables the
+feature.
+
+No environment selects `storage_image_multisample`, Vulkan's
+`shaderStorageImageMultisample`, which every version leaves optional. A module
+declaring a multisampled storage image is refused unless the target selects it,
+and with it the module declares `StorageImageMultisample`, and `ImageMSArray` as
+well for an arrayed one. A multisampled sampled image needs no feature.
+
+No environment selects `resource_min_lod` either, Vulkan's `shaderResourceMinLod`. A
+sample passing the `MinLod` image operand is refused unless the target selects it,
+and with it the module declares `MinLod`. Nor does any select `image_gather_extended`,
+`shaderImageGatherExtended`, which a run-time `Offset` image operand needs and with
+which the module declares `ImageGatherExtended`, or `maintenance8`, under which Vulkan
+admits that operand on a fetch or a sample as well as a gather.
+
+No environment selects a type's feature, since every Vulkan version leaves them
+optional: `int8`, `int16`, `int64`, `float16` and `float64` are Vulkan's
+`shaderInt8`, `shaderInt16`, `shaderInt64`, `shaderFloat16` and `shaderFloat64`,
+and the target selects one with `extensions` when its consumer enables it. A module
+without `env` has all five. The ceiling below still bounds them, so `int8` or
+`float16` under `vulkan1.0` is refused for the environment, not the feature.
+
+Under `float16` an `f16` is the native `OpTypeFloat 16` wherever it lives, computed,
+negated and converted by the core float instructions, so an `f16` shader needs
+`float16` alone. A local, a parameter or a result is that type, and so is an `f16` in
+memory the host or the workgroup shares, a stage input or output, a storage buffer, a
+uniform or push block, a record a physical pointer reaches or a `#[shared]` variable,
+so an atomic can operate on it and a whole record moves between that memory and a
+local as it is. Reading an `f16`'s bits with `:~` into a `u16` or `i16` local, or
+back, needs no `int16` either. Without it an `f16` is the software expansion on its 16 bits, which
+computes in binary32 on 32-bit integers, so it needs neither `int64` nor
+`float64` of its own. An `f64` it converts to or from needs `float64` as any
+`f64` does. `%` needs no `int64` at any float width. A stage input or output is
+`OpTypeFloat 16` with or without `float16`, so a pipeline interpolates an `f16`
+varying as it does an `f32` one, and only an integer or 64-bit fragment input is
+`Flat`.
+
+Under `int8` and `int16` an integer of that width computes at its own width.
+Without the feature, an integer of that width is carried, wherever it lives in a
+function, in a 32-bit integer, which needs no capability: a `u8`, `i8`, `u16` or
+`i16` local, and a `bool`, is wrapped and extended at its own width where the
+program can tell. A vector is carried lane by lane the same way, so a `u8x4`,
+`i16x4` or `u16x8` local, and without `float16` an `f16x4`, needs no feature either,
+and its lanes are wrapped and extended at their own width where the program can
+tell, a reinterpret with `:~` included. A member of an aggregate keeps its declared
+width, so an 8-bit or 16-bit one, or a vector of them, in a local or in `#[shared]`
+memory needs its feature, and the module is refused, naming it, without. Memory the
+host shares keeps its width too, under the storage feature below rather than `int8`
+or `int16`, and a load from it or a store to it converts to and from the wider integer
+the function computes in.
+Nothing carries a 64-bit type, so a module holding a `u64`, `i64` or `f64` anywhere
+needs `int64` or `float64`.
+
+An 8- or 16-bit scalar, an `f16` included, in memory the host shares needs Vulkan's
+storage feature for its width and memory, which no environment selects: a target
+names each one its consumer enables, and a target naming no `env` holds them all.
+Each enables the capability of its name, declared with its SPIR-V extension below
+the version that took it into the core.
+
+| Memory | 16-bit | 8-bit |
 |---|---|---|
-| `vulkan1.0` | 1.0 | Int16, Int64, Float64, Sampled1D, SampledCubeArray |
+| `#[storage(...)]`, or a record a physical pointer reaches | `storage_buffer_16bit_access` (`StorageBuffer16BitAccess`) | `storage_buffer_8bit_access` (`StorageBuffer8BitAccess`) |
+| `#[uniform(...)]` | `uniform_and_storage_buffer_16bit_access` (`UniformAndStorageBuffer16BitAccess`) | `uniform_and_storage_buffer_8bit_access` (`UniformAndStorageBuffer8BitAccess`) |
+| `#[push]` | `storage_push_constant16` (`StoragePushConstant16`) | `storage_push_constant8` (`StoragePushConstant8`) |
+| `#[input(n)]`, `#[output(n)]` | `storage_input_output16` (`StorageInputOutput16`) | refused |
+
+A stage output starts at its initializer, and at zero without one. A constant of a
+16-bit type needs the type's own feature, `int16` or `float16`, so an output holding a
+16-bit scalar without it carries no zero constant: each stage that reaches it stores
+the zero first, converted from a 32-bit one, and the output needs
+`storage_input_output16` alone. One initialized to anything but zero starts at that
+constant, which needs the type's feature as well. The 16-bit capabilities need
+`SPV_KHR_16bit_storage` below SPIR-V 1.3 and the 8-bit ones `SPV_KHR_8bit_storage`
+below SPIR-V 1.5. Vulkan defines no 8-bit stage input or
+output, so one is refused, and an 8-bit member of a `#[storage(...)]` buffer is
+refused under `vulkan1.0`, whose storage buffer is a `BufferBlock` in the `Uniform`
+class, which the 8-bit feature does not reach.
+
+```toml
+[target.gpu]
+isa        = "spirv"
+os         = "freestanding"
+abi        = "spirv"
+env        = "vulkan1.0"
+extensions = ["int16", "int64", "float64"]
+```
+
+| `env` | SPIR-V | capabilities the ceiling admits |
+|---|---|---|
+| `vulkan1.0` | 1.0 | Int16, Int64, Float64, Sampled1D, SampledCubeArray, Image1D, ImageCubeArray, SampledBuffer, ImageBuffer, StorageImageExtendedFormats |
 | `vulkan1.1` | 1.3 | same as `vulkan1.0` |
 | `vulkan1.2` | 1.5 | the above plus Int8, Float16 |
 | `vulkan1.3` | 1.6 | same as `vulkan1.2` |
 
 The ceiling is what a conforming implementation of that Vulkan version can
-enable through core device features alone, with no extension: from the Vulkan
+enable through core device features alone, with no device extension: from the Vulkan
 specification's "Vulkan Environment for SPIR-V" appendix, the capabilities table
 maps `Int64`, `Int16`, `Float64` and `SampledCubeArray` to the `shaderInt64`,
 `shaderInt16`, `shaderFloat64` and `imageCubeArray` features of Vulkan 1.0,
-`Sampled1D` to core, and `Int8` and `Float16` to `shaderInt8` and
+`ImageCubeArray` to `imageCubeArray` as well, `Sampled1D`, `Image1D`,
+`SampledBuffer`, `ImageBuffer` and `StorageImageExtendedFormats` to core, and `Int8` and `Float16` to `shaderInt8` and
 `shaderFloat16`, which became core features in Vulkan 1.2 (promoted from
 `VK_KHR_shader_float16_int8`). The SPIR-V version per Vulkan version is the
 appendix's required version: 1.0, 1.3, 1.5 and 1.6.

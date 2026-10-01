@@ -216,7 +216,7 @@ way the target realizes the shape:
 | x86-64 without `f16c` | each lane's scalar `f16` operation | each lane's scalar comparison |
 | riscv64, riscv32 | each lane's scalar `f16` operation (no vector unit) | each lane's scalar comparison |
 | spirv with `float16` | the core float instructions on an `f16` vector | the same |
-| spirv without `float16` (`vulkan1.0`, `vulkan1.1`) | each lane's scalar `f16` operation | each lane's scalar comparison |
+| spirv without `float16` | each lane's scalar `f16` operation | each lane's scalar comparison |
 
 A lane's scalar operation is the target's own half instruction where it has one
 and the inline expansion otherwise (see
@@ -350,7 +350,7 @@ The language knows only the machinery. A handle is a **bodyless `def`** carrying
 operands each takes, and what an operand means all belong to the named target:
 
 ```mach fragment
-#[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED)]
+#[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED, FORMAT_UNKNOWN)]
 pub def Texture2D;
 
 #[handle("spirv", "sampled_image", Texture2D)]
@@ -363,6 +363,47 @@ pub def Sampler;
 `def` is the carrier because it already means "this name denotes a type" and
 promises no fields and no storage, which is exactly what a handle is. There is no
 body because the target supplies the definition.
+
+The spirv `image` constructor takes the seven operands of `OpTypeImage` in its
+order: the texel scalar (`0` `f32`, `1` `i32`, `2` `u32`, `3` `i64`, `4` `u64`), `Dim`, `Depth`, `Arrayed`, `MS`, `Sampled` and the
+`Image Format`. The format is required, and `0` (`Unknown`) is the usual choice for
+a sampled image. `Sampled` `1` is an image read through a sampler and `2` a storage
+image, read and written directly and bound through `#[storage]` (see
+[decorators.md](decorators.md)). A storage image of a known format needs no device
+feature to read or write, and a format other than `Rgba32f`, `Rgba16f`, `R32f`,
+`Rgba8`, `Rgba8Snorm` and the `Rgba32`, `Rgba16`, `Rgba8` and `R32` integer forms
+declares `StorageImageExtendedFormats`. An `Unknown` storage image is read and
+written under `StorageImageReadWithoutFormat` and `StorageImageWriteWithoutFormat`,
+which `vulkan1.3` accepts and an earlier `env` accepts only with the
+`storage_read_without_format` and `storage_write_without_format` extensions (see
+[manifest.md](manifest.md#instruction-set-extensions)). A format must match the
+texel scalar: a float or normalized format is read as `f32`, a signed integer
+format as `i32` and an unsigned one as `u32`. `R64ui` and `R64i` hold 64-bit texels,
+the texel scalar `u64` or `i64`, and declare `Int64ImageEXT`, which needs the
+`image_int64_atomics` extension.
+
+`Depth` `1` is a **depth image**, the shadow map a depth comparison samples, and
+`0` any other. Only a depth image is sampled by the `OpImage*Dref*` comparisons
+(see [decorators.md](decorators.md)), and it is read without one like any other
+image. Vulkan places no `Depth` constraint on a storage image, so a storage image
+may declare `1` too, though no comparison reads it: a comparison samples through a
+sampler. `2`, which states no indication either way, is refused.
+
+```mach fragment
+#[handle("spirv", "image", TEXEL_F32, DIM_2D, DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED, FORMAT_UNKNOWN)]
+pub def ShadowMap;
+
+#[handle("spirv", "sampled_image", ShadowMap)]
+pub def ShadowSampler;
+```
+
+`MS` `1` is a **multisampled** image, which only a `2D` image is, arrayed or not:
+it is refused on `1D`, `3D`, `Cube` and `Buffer`. A multisampled image is never
+sampled, so a `sampled_image` cannot compose over one, and its texels are read per
+sample with the `Sample` image operand (see [decorators.md](decorators.md)). A
+multisampled sampled image needs no capability. A multisampled storage image
+declares `StorageImageMultisample`, and an arrayed one `ImageMSArray` too, under
+the `storage_image_multisample` extension.
 
 The operands are ordinary comptime constants. One position is not: a constructor
 that composes over another handle takes a **type name**, so `Sampler2D` names the
@@ -379,6 +420,13 @@ set is fixed and closed rather than varied per declaration:
 - it reaches an operation only by being passed to one, bound as a descriptor
 - its extent is declared by the owning target
 
+A generic function takes a handle as a type argument, and each instance is held to
+these rules as the same function written out would be: the handle is passed by value,
+behind a pointer to its binding, or returned, and never named as a local or placed in an
+array. A generic record, union or tag is refused a type argument that would put a handle
+in one of its fields or payloads, directly or behind a pointer, array or secret, since
+that instance is a record holding a handle.
+
 `$size_of` a handle is the target's pointer size: it is a name for a resource, and
 a pointer is the shape every target already has for that. On a target that mints no
 such type the declaration is **inert**: it still denotes a type and still sizes, and
@@ -386,8 +434,9 @@ an operation over it is an undefined symbol at link.
 
 A target refuses an operand combination its constructor spells but it cannot emit,
 naming the operand rather than the declaration. The SPIR-V target refuses a
-non-zero `Depth`, a non-zero `MS`, a `Dim` past `Cube`, and a `Sampled` other than
-`1`, each with what SPIR-V would need instead.
+`Depth` other than `0` or `1`, an `MS` other than `0` or `1`, a `Dim` past `Cube`
+other than `Buffer`, and a `Sampled` other than `1` or `2`, each with what SPIR-V
+would need instead.
 
 See [decorators.md](decorators.md) for `#[handle]` and `#[sampler(set, binding)]`,
 and the shader library for the handles a SPIR-V target declares.
@@ -450,6 +499,65 @@ Immutability is a property of the binding (`val`), and volatility is a property
 of a declared record, union or tag (`#[volatile]`, see
 [decorators.md](decorators.md#volatile--every-access-to-the-type-is-a-volatile-access)),
 so an access through `*T` is volatile exactly when `T`'s storage is.
+
+### Pointers on SPIR-V
+
+A SPIR-V target has two kinds of pointer, and mach spells both `*T`. The compiler
+works out which one a pointer is from where it comes from, the same way it works out
+the storage class of every pointer on that target.
+
+- A **logical** pointer names memory the module declares: a local, a shader
+  interface variable, or an element or member of one. `?place` makes one, and so
+  does an access through one. It has no address. It can be handed to a function,
+  but it cannot be stored in memory, returned, compared, ordered, cast to an
+  integer or stepped across whole objects.
+- A **physical** pointer is an address in a buffer the host passes by its device
+  address (`vkGetBufferDeviceAddress`). A pointer read from memory is one, since
+  memory holds no logical pointer. So is one made from an integer (`addr::*Node`),
+  one a function returns, one passed for a physical pointer parameter, `nil`, and
+  one reached through a physical pointer.
+
+```mach fragment
+rec Node { next: *Node; value: u32; }
+rec Head { first: *Node; total: u32; }
+#[storage(0, 0)] var head: Head;
+
+#[stage("compute")]
+#[workgroup(1, 1, 1)]
+fun walk() {
+    var p:   *Node = head.first;
+    var sum: u32   = 0;
+    for (p != nil) {
+        sum = sum + p.value;
+        p   = p.next;
+    }
+    head.total = sum;
+}
+```
+
+A physical pointer is a full `*T`. It is dereferenced, indexed, stepped (`?p[i]`),
+compared, ordered as an unsigned 64-bit address and cast to and from `u64`, and it
+can be held in memory, passed and returned. Its pointee is laid out by the std430
+rules a `#[storage]` block follows (see [decorators.md](decorators.md)), refused
+where mach's layout disagrees with them. A record that reaches itself through
+pointers, like `Node` above, is a recursive type, and so is a set of records that
+reach each other. A tag cannot sit behind a physical pointer.
+
+Every load and store through a physical pointer carries the pointee's alignment, so
+an address made from an integer must be aligned for the type it points at. An atomic
+through one takes no memory operands and carries no alignment, so its address is held
+to the same rule, and the semantics passed to it name its memory `UniformMemory`, as
+on a storage buffer. A 64-bit or float atomic needs the `buffer_*` feature of its
+operation (see [decorators.md](decorators.md)). Every
+variable and parameter holding one is decorated aliased, since mach makes no
+promise that two pointers do not overlap. Accesses through one are private under
+the Vulkan memory model: no `"coherent"` qualifier reaches device memory.
+
+A register that one path makes logical and another physical is refused, as is
+every operation a logical pointer has no form for, each naming why. Physical
+pointers need the `buffer_device_address` device feature (see
+[manifest.md](manifest.md#finished-module-targets)). A module that holds no physical
+pointer keeps the Logical addressing model and is unchanged by them.
 
 ## Array
 

@@ -1913,7 +1913,7 @@ fun lower_generic_instance(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.
     val args: *type.TypeId = res_args.ok;
 
     val fqn:      intern.StrId                 = session.module_fqn(ctx.s, sym.origin);
-    val res_link: res[intern.StrId, fail.Fail] = mangle.instance_name(ctx.s, fqn, sym.canon, args, argc);
+    val res_link: res[intern.StrId, fail.Fail] = mangle.instance_name(ctx.s, ctx.scope.env.target_defs, fqn, sym.canon, args, argc);
     if (sel res_link.err) {
         free_type_args(ctx, args, argc);
         ret res[value.Value, fail.Fail].err{res_link.err};
@@ -1992,7 +1992,7 @@ fun lower_pack_callee(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr,
     }
 
     val fqn:      intern.StrId                 = session.module_fqn(ctx.s, sym.origin);
-    val res_link: res[intern.StrId, fail.Fail] = mangle.pack_instance_name(ctx.s, fqn, sym.canon, args, argc, types, elem_len);
+    val res_link: res[intern.StrId, fail.Fail] = mangle.pack_instance_name(ctx.s, ctx.scope.env.target_defs, fqn, sym.canon, args, argc, types, elem_len);
     if (sel res_link.err) {
         if (owns_types && types != nil) { A.deallocate[type.TypeId](ctx.s.alloc, types, elem_len::usize); }
         free_type_args(ctx, args, argc);
@@ -2071,8 +2071,8 @@ fun half_of(ctx: *context.LowerContext) res[half.Half, fail.Fail] {
     ret half.init(?ctx.builder, ctx.tgt);
 }
 
-# an f16 operator: `%` is exact, so the binary64 remainder of the widened
-# operands narrows without rounding
+# an f16 operator: `%` is exact, so the remainder of the operands widened to
+# the expansion's format narrows without rounding
 fun lower_half_binary(ctx: *context.LowerContext, op: expr.BinOp, lhs: value.Value, rhs: value.Value) res[value.Value, fail.Fail] {
     val res_h: res[half.Half, fail.Fail] = half_of(ctx);
     if (sel res_h.err) { ret res[value.Value, fail.Fail].err{res_h.err}; }
@@ -2091,13 +2091,16 @@ fun lower_half_binary(ctx: *context.LowerContext, op: expr.BinOp, lhs: value.Val
     ret half.done(?h, half.narrow(?h, r.ok));
 }
 
-# a comparison operand: an f16 as its exact widening, and a narrower float
-# beside a wider one extended to it
+# a comparison operand at `bits`: an f16 as its exact widening, and a narrower
+# float beside a wider one extended to it
 fun half_compare_operand(ctx: *context.LowerContext, h: *half.Half, v: value.Value, tid: type.TypeId, bits: u32) res[value.Value, fail.Fail] {
     if (is_half_type(ctx, tid) && bits == 16) { ret half.done(h, half.compare_operand(h, v)); }
-    if (is_half_type(ctx, tid))               { ret half.done(h, half.to_float(h, v, 64)); }
-    if (scalar_bits(ctx, tid) < 64)           { ret builder.emit_fp_ext(?ctx.builder, v, h.f64t); }
-    ret res[value.Value, fail.Fail].ok{v};
+    if (is_half_type(ctx, tid))               { ret half.done(h, half.to_float(h, v, bits)); }
+    if (scalar_bits(ctx, tid) >= bits)        { ret res[value.Value, fail.Fail].ok{v}; }
+    if (bits == 64)                           { ret builder.emit_fp_ext(?ctx.builder, v, h.f64t); }
+    val ft: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_float(?ctx.builder.m.types, bits);
+    if (sel ft.err) { ret res[value.Value, fail.Fail].err{ft.err}; }
+    ret builder.emit_fp_ext(?ctx.builder, v, ft.ok);
 }
 
 fun lower_vector_binary(ctx: *context.LowerContext, op: expr.BinOp, lhs: value.Value, rhs: value.Value, lty: type.TypeId) res[value.Value, fail.Fail] {
@@ -2189,28 +2192,49 @@ fun vector_mask_ir(ctx: *context.LowerContext, vec_ir: ir_type.IrTypeId) res[ir_
     ret ir_type.intern_vector(?ctx.m.types, res_elem.ok, lanes);
 }
 
+# the quotient of the operands float_rem_needs_narrow selects is a zero, an
+# infinity or a NaN, which truncation leaves unchanged, so the formula is taken
+# in floating point as it stands: a zero divisor and an infinite dividend give
+# NaN on every target (#4348). a zero quotient means a finite dividend over an
+# infinite divisor, where `0 * inf` would be NaN, so the dividend is the result
+# as in C fmod (#4357)
 fun float_rem_narrow(ctx: *context.LowerContext, lhs: value.Value, rhs: value.Value) res[value.Value, fail.Fail] {
-    val res_i64: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?ctx.m.types, 64);
-    if (sel res_i64.err) { ret res[value.Value, fail.Fail].err{res_i64.err}; }
-    val i64ty: ir_type.IrTypeId = res_i64.ok;
-
     val res_q: res[value.Value, fail.Fail] = builder.emit_div_u(?ctx.builder, lhs, rhs);
     if (sel res_q.err) { ret res_q; }
     val q: value.Value = res_q.ok;
 
-    val res_qi: res[value.Value, fail.Fail] = builder.emit_fp_to_si(?ctx.builder, q, i64ty);
-    if (sel res_qi.err) { ret res_qi; }
-    val qi: value.Value = res_qi.ok;
+    val res_qzero: res[value.Value, fail.Fail] = builder.emit_cmp_eq(?ctx.builder, q, value.const_float(0.0, q.ty));
+    if (sel res_qzero.err) { ret res_qzero; }
+    val q_zero:    value.Value = res_qzero.ok;
+    val blk_entry: ir.BlockId  = ctx.builder.block;
 
-    val res_qf: res[value.Value, fail.Fail] = builder.emit_si_to_fp(?ctx.builder, qi, lhs.ty);
-    if (sel res_qf.err) { ret res_qf; }
-    val qf: value.Value = res_qf.ok;
+    val res_bf: res[ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
+    if (sel res_bf.err) { ret res[value.Value, fail.Fail].err{res_bf.err}; }
+    val blk_formula: ir.BlockId                 = res_bf.ok;
+    val res_bj:      res[ir.BlockId, fail.Fail] = builder.new_block(?ctx.builder);
+    if (sel res_bj.err) { ret res[value.Value, fail.Fail].err{res_bj.err}; }
+    val blk_join: ir.BlockId     = res_bj.ok;
+    val res_cbr:  err[fail.Fail] = builder.emit_cbr(?ctx.builder, q_zero, blk_join, blk_formula);
+    if (sel res_cbr.err) { ret res[value.Value, fail.Fail].err{res_cbr.err}; }
 
-    val res_prod: res[value.Value, fail.Fail] = builder.emit_mul(?ctx.builder, qf, rhs);
+    builder.set_block(?ctx.builder, blk_formula);
+    val res_prod: res[value.Value, fail.Fail] = builder.emit_mul(?ctx.builder, q, rhs);
     if (sel res_prod.err) { ret res_prod; }
-    val prod: value.Value = res_prod.ok;
+    val res_diff: res[value.Value, fail.Fail] = builder.emit_sub(?ctx.builder, lhs, res_prod.ok);
+    if (sel res_diff.err) { ret res_diff; }
+    val diff:   value.Value    = res_diff.ok;
+    val res_br: err[fail.Fail] = builder.emit_br(?ctx.builder, blk_join);
+    if (sel res_br.err) { ret res[value.Value, fail.Fail].err{res_br.err}; }
 
-    ret builder.emit_sub(?ctx.builder, lhs, prod);
+    builder.set_block(?ctx.builder, blk_join);
+    val res_phi: res[value.Value, fail.Fail] = builder.emit_phi(?ctx.builder, lhs.ty);
+    if (sel res_phi.err) { ret res_phi; }
+    val phi:     value.Value    = res_phi.ok;
+    val res_in0: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, phi, blk_entry, lhs);
+    if (sel res_in0.err) { ret res[value.Value, fail.Fail].err{res_in0.err}; }
+    val res_in1: err[fail.Fail] = builder.phi_add_incoming(?ctx.builder, phi, blk_formula, diff);
+    if (sel res_in1.err) { ret res[value.Value, fail.Fail].err{res_in1.err}; }
+    ret res[value.Value, fail.Fail].ok{phi};
 }
 
 fun float_abs(ctx: *context.LowerContext, v: value.Value, zero: value.Value) res[value.Value, fail.Fail] {
@@ -2442,9 +2466,9 @@ fun float_rem_general(ctx: *context.LowerContext, lhs: value.Value, rhs: value.V
     ret res[value.Value, fail.Fail].ok{phi};
 }
 
-# the operands `a - trunc(a / b) * b` answers directly, as comptime does: a
-# zero, infinite or NaN divisor, where the reduction would never finish or
-# would drop the NaN, and an infinite dividend
+# the operands float_rem_narrow answers directly, as comptime does: a zero,
+# infinite or NaN divisor, where the reduction would never finish or would drop
+# the NaN, and an infinite dividend
 fun float_rem_needs_narrow(ctx: *context.LowerContext, lhs: value.Value, rhs: value.Value, zero: value.Value, two: value.Value) res[value.Value, fail.Fail] {
     # b / b is exactly 1 for every finite nonzero b and NaN for the rest
     val res_bb: res[value.Value, fail.Fail] = builder.emit_div_u(?ctx.builder, rhs, rhs);
@@ -2566,9 +2590,12 @@ fun lower_cmp(ctx: *context.LowerContext, op: expr.BinOp, lhs: value.Value, lty:
         val res_h: res[half.Half, fail.Fail] = half_of(ctx);
         if (sel res_h.err) { ret res[value.Value, fail.Fail].err{res_h.err}; }
         var h: half.Half = res_h.ok;
-        # both sides meet at binary64 unless both are f16 the target compares natively
-        var bits: u32 = 64;
-        if (is_half_type(ctx, lty) && is_half_type(ctx, rty)) { bits = 16; }
+        # both sides meet at the wider of the expansion's format and the other
+        # side's width, unless both are f16 the target compares natively
+        var bits: u32 = half.wide_bits(?h);
+        if (is_half_type(ctx, lty) && is_half_type(ctx, rty))        { bits = 16; }
+        or (!is_half_type(ctx, lty) && scalar_bits(ctx, lty) > bits) { bits = scalar_bits(ctx, lty); }
+        or (!is_half_type(ctx, rty) && scalar_bits(ctx, rty) > bits) { bits = scalar_bits(ctx, rty); }
         val hl: res[value.Value, fail.Fail] = half_compare_operand(ctx, ?h, lhs, lty, bits);
         if (sel hl.err) { ret hl; }
         val hr: res[value.Value, fail.Fail] = half_compare_operand(ctx, ?h, rhs, rty, bits);
@@ -3286,6 +3313,21 @@ fun lower_array_lit(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) r
     ret res[value.Value, fail.Fail].ok{value.retype(slot, arr_ir)};
 }
 
+fun build_vector_lit(ctx: *context.LowerContext, e: *expr.Expr, vec_ir: ir_type.IrTypeId, lanes: *value.Value) res[value.Value, fail.Fail] {
+    var li: u32 = 0;
+    for (li < e.data.vector_lit.elems_len) {
+        val lpool_ix: u32 = e.data.vector_lit.elems_start + li;
+        if (lpool_ix::usize >= ctx.scope.a.expr_id_len) {
+            ret res[value.Value, fail.Fail].err{fail.message("lower: vector literal element index out of range")};
+        }
+        val lres: res[value.Value, fail.Fail] = lower_rvalue(ctx, ctx.scope.a.expr_ids[lpool_ix]);
+        if (sel lres.err) { ret lres; }
+        lanes[li] = lres.ok;
+        li        = li + 1;
+    }
+    ret builder.emit_vec_build(?ctx.builder, vec_ir, lanes, e.data.vector_lit.elems_len);
+}
+
 fun lower_vector_lit(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) res[value.Value, fail.Fail] {
     val vec_ty:     type.TypeId                      = context.expr_type_of(ctx, eid);
     val res_vec_ir: res[ir_type.IrTypeId, fail.Fail] = context.lower_type(ctx, vec_ty);
@@ -3300,23 +3342,15 @@ fun lower_vector_lit(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) 
     if (sel res_xty.err) { ret res[value.Value, fail.Fail].err{res_xty.err}; }
     val xty: ir_type.IrTypeId = res_xty.ok;
 
+    # a target that builds vectors from lanes has no register ceiling on the lane count
     if (ctx.tgt != nil && ctx.tgt.model.has_vec_build) {
-        if (e.data.vector_lit.elems_len > 16) {
-            ret res[value.Value, fail.Fail].err{fail.message("lower: vector literal has more lanes than any 128-bit vector")};
-        }
-        var lanes: [16]value.Value;
-        var li:    u32 = 0;
-        for (li < e.data.vector_lit.elems_len) {
-            val lpool_ix: u32 = e.data.vector_lit.elems_start + li;
-            if (lpool_ix::usize >= ctx.scope.a.expr_id_len) {
-                ret res[value.Value, fail.Fail].err{fail.message("lower: vector literal element index out of range")};
-            }
-            val lres: res[value.Value, fail.Fail] = lower_rvalue(ctx, ctx.scope.a.expr_ids[lpool_ix]);
-            if (sel lres.err) { ret lres; }
-            lanes[li] = lres.ok;
-            li        = li + 1;
-        }
-        ret builder.emit_vec_build(?ctx.builder, vec_ir, ?lanes[0], e.data.vector_lit.elems_len);
+        val n:         u32                        = e.data.vector_lit.elems_len;
+        val res_lanes: res[*value.Value, A.Error] = A.allocate[value.Value](ctx.s.alloc, n::usize);
+        if (sel res_lanes.err) { ret res[value.Value, fail.Fail].err{fail.refused(res_lanes.err)}; }
+        val lanes: *value.Value                = res_lanes.ok;
+        val built: res[value.Value, fail.Fail] = build_vector_lit(ctx, e, vec_ir, lanes);
+        A.deallocate[value.Value](ctx.s.alloc, lanes, n::usize);
+        ret built;
     }
 
     val res_slot: res[value.Value, fail.Fail] = builder.emit_alloca(?ctx.builder, vec_ir, value.const_int(1, xty));
