@@ -1562,31 +1562,39 @@ pub def OpRelation: u8
 ```
 
 how an operand's or the result's type relates to the row's data type, the type of its
-typing's operand (a pointer operand's pointee): unrelated, that same type, or a vector
-whose component is the sampled type of the handle the typing's operand is
+typing's operand (a pointer operand's pointee): unrelated, that same type, a vector
+whose component is the sampled type of the handle the typing's operand is, or, for a
+pointer result only, a pointer to that sampled type, into the memory of the handle the
+typing's pointer operand addresses
 
 ## val OP_RELATION_NONE
 
 ```mach
-pub val OP_RELATION_NONE:  OpRelation = 0
+pub val OP_RELATION_NONE:    OpRelation = 0
 ```
 
 ## val OP_RELATION_DATA
 
 ```mach
-pub val OP_RELATION_DATA:  OpRelation = 1
+pub val OP_RELATION_DATA:    OpRelation = 1
 ```
 
 ## val OP_RELATION_TEXEL
 
 ```mach
-pub val OP_RELATION_TEXEL: OpRelation = 2
+pub val OP_RELATION_TEXEL:   OpRelation = 2
+```
+
+## val OP_RELATION_POINTEE
+
+```mach
+pub val OP_RELATION_POINTEE: OpRelation = 3
 ```
 
 ## val OP_RELATION_COUNT
 
 ```mach
-pub val OP_RELATION_COUNT: OpRelation = 3
+pub val OP_RELATION_COUNT:   OpRelation = 4
 ```
 
 ## rec OpScalar
@@ -1647,14 +1655,14 @@ pub def TypeSampledFn: fun(*u32, u32) OpScalar
 the scalar a handle's texels are read and written as, from its operands, class
 OP_DATA_OTHER when it has none
 
-## def TypeElementFn
+## def TypeAddressFn
 
 ```mach
-pub def TypeElementFn: fun(*u32, u32, OpDataClass, u32, bool) str
+pub def TypeAddressFn: fun(*u32, u32) str
 ```
 
-why a pointer an instruction derives into a handle's memory cannot address a scalar of
-`class`, `bits` and signedness, from the handle's operands, nil when it can
+why no instruction may derive a pointer into a handle's memory, from its operands, nil
+when one may
 
 ## val HANDLE_BIND_SAMPLER
 
@@ -1885,14 +1893,14 @@ pub fun type_def_sampled(td: *TypeDef, ops: *u32, n: u32) OpScalar;
 the scalar texels of a handle of constructor `td` with operands `ops` are, class
 OP_DATA_OTHER when the constructor declares none
 
-## fun type_def_element
+## fun type_def_address
 
 ```mach
-pub fun type_def_element(td: *TypeDef, ops: *u32, n: u32, class: OpDataClass, bits: u32, signed: bool) str;
+pub fun type_def_address(td: *TypeDef, ops: *u32, n: u32) str;
 ```
 
-why a pointer into a handle of constructor `td` with operands `ops` cannot address a
-`class` of `bits`, nil when it can
+why no instruction may derive a pointer into a handle of constructor `td` with operands
+`ops`, nil when one may
 
 ## fun target_defs
 

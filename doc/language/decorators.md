@@ -1505,11 +1505,6 @@ naming the operand. A row **without a result** is declared with no return type,
 and a row with one must return it. A row may also **return a pointer** into a
 storage class the row itself declares, as `OpImageTexelPointer` returns an `Image`
 pointer, and that result is accepted as a later instruction's pointer operand. A
-pointer result derived from a handle addresses that handle's memory, so its pointee
-must be a scalar the handle admits there, refused with `op.handle_element` otherwise:
-a texel pointer is used only by an atomic, so it is defined only into a storage image
-of `R32ui`, `R32i`, `R32f`, `R64ui` or `R64i` format, and it points to the scalar that
-format holds, a `u32`, `i32`, `f32`, `u64` or `i64`. A
 row whose result is a **truth value**, such as `OpGroupNonUniformElect`, is declared
 returning an integer, which receives 1 or 0. A `bool` return is an 8-bit integer,
 which a module may hold only where the environment has Int8 (from `vulkan1.2`), so
@@ -1644,6 +1639,7 @@ at the declaration rather than as an invalid module.
 |------|----------|
 | every atomic | the result and each value operand are the pointer's pointee |
 | `OpImageRead`, `OpImageFetch`, `OpImageWrite` | the texel, the result or the last operand, is a vector of the image's texel scalar |
+| `OpImageTexelPointer` | the result points to the image's texel scalar, into a storage image of `R32ui`, `R32i`, `R32f`, `R64ui` or `R64i` format |
 | `OpGroupNonUniformBroadcast*`, `Shuffle*`, `Quad*` and the arithmetic rows | the result is the value operand's type |
 | the GLSL.std.450 math rows | the result and every operand are the first operand's type, except `Refract`'s `eta`, and `Length` and `Distance`, whose result is a scalar |
 | `OpDot` | the second vector is the first's type |
