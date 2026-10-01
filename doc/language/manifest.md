@@ -710,8 +710,11 @@ the version that took it into the core.
 | `#[push]` | `storage_push_constant16` (`StoragePushConstant16`) | `storage_push_constant8` (`StoragePushConstant8`) |
 | `#[input(n)]`, `#[output(n)]` | `storage_input_output16` (`StorageInputOutput16`) | refused |
 
-The 16-bit capabilities need `SPV_KHR_16bit_storage` below SPIR-V 1.3 and the 8-bit
-ones `SPV_KHR_8bit_storage` below SPIR-V 1.5. Vulkan defines no 8-bit stage input or
+A stage output starts at a zero constant, and a constant of an 8- or 16-bit type
+needs the type's own feature, `int8`, `int16` or `float16`, so an output holding
+one needs that as well as `storage_input_output16`. The 16-bit capabilities need
+`SPV_KHR_16bit_storage` below SPIR-V 1.3 and the 8-bit ones `SPV_KHR_8bit_storage`
+below SPIR-V 1.5. Vulkan defines no 8-bit stage input or
 output, so one is refused, and an 8-bit member of a `#[storage(...)]` buffer is
 refused under `vulkan1.0`, whose storage buffer is a `BufferBlock` in the `Uniform`
 class, which the 8-bit feature does not reach.
