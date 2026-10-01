@@ -420,6 +420,13 @@ set is fixed and closed rather than varied per declaration:
 - it reaches an operation only by being passed to one, bound as a descriptor
 - its extent is declared by the owning target
 
+A generic function takes a handle as a type argument, and each instance is held to
+these rules as the same function written out would be: the handle is passed by value,
+behind a pointer to its binding, or returned, and never named as a local or placed in an
+array. A generic record, union or tag is refused a type argument that would put a handle
+in one of its fields or payloads, directly or behind a pointer, array or secret, since
+that instance is a record holding a handle.
+
 `$size_of` a handle is the target's pointer size: it is a name for a resource, and
 a pointer is the shape every target already has for that. On a target that mints no
 such type the declaration is **inert**: it still denotes a type and still sizes, and
