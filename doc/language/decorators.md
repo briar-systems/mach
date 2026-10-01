@@ -1175,6 +1175,30 @@ texel buffer or a sampled image is fetched texel by texel by `OpImageFetch`, and
 `OpImageQuerySamples` read an image's descriptor under the `ImageQuery` capability,
 which every Vulkan version accepts.
 
+`OpImageRead`, `OpImageWrite` and `OpImageFetch` take an optional `Image Operands`
+mask leading their tail, so a declaration either stops at the instruction's
+required operands or passes the mask and the operands its bits bring. `Sample`
+(`0x40`) names one sample of a multisampled image, and a fetch's `Lod` (`0x2`)
+the level it reads. A multisampled image is read, written and fetched only with
+`Sample`, and only a multisampled image takes it. `OpImageSampleExplicitLod`
+always takes the mask, which must set `Lod`. `OpImageQuerySamples` reads the sample
+count of a multisampled image only, and `OpImageQuerySizeLod` does not take one.
+`OpImageQuerySize` reads an image with no level of detail to choose, a multisampled
+image, a storage image or a texel buffer, so a single-sampled sampled image is
+queried with `OpImageQuerySizeLod` instead.
+Each is refused at the call with `op.operand_value`.
+
+```mach fragment
+#[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, MULTISAMPLED, SAMPLED, FORMAT_UNKNOWN)]
+pub def TextureMS;
+
+#[op("spirv", "core", "OpImageFetch")]
+fun fetch_sample(img: TextureMS, at: i32x2, mask: u32, sample: i32) f32x4;
+
+#[op("spirv", "core", "OpImageQuerySamples")]
+fun sample_count(img: TextureMS) i32;
+```
+
 ```mach fragment
 #[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, STORAGE, FORMAT_RGBA8)]
 pub def Target2D;
@@ -1533,8 +1557,14 @@ Its operation is a `GroupOperation`. `Reduce` (0), `InclusiveScan` (1) and
 `ExclusiveScan` (2) need the `subgroup_arithmetic` extension and declare
 `GroupNonUniformArithmetic`, and `ClusteredReduce` (3) needs `subgroup_clustered`,
 declares `GroupNonUniformClustered` and is followed by the ClusterSize operand, so
-it is passed only to the four-parameter declaration. Each is checked at the call,
-where the literal's value is known:
+it is passed only to the four-parameter declaration.
+
+Where the specification makes the literal itself optional, as it does an
+instruction's `Image Operands` or `Memory Operands`, the literal **leads the tail**:
+a declaration leaves it out with every operand it would bring, or takes it followed
+by those operands. A mask's set bits bring theirs in ascending bit order, the order
+the specification writes them in, so the parameters after the mask are declared in
+that order. Each is checked at the call, where the literal's value is known:
 
 | At the call                                            | Is refused with                    |
 |--------------------------------------------------------|------------------------------------|
@@ -1548,6 +1578,66 @@ consumer enables it, since no environment guarantees it: `subgroup_arithmetic` i
 Vulkan's `VK_SUBGROUP_FEATURE_ARITHMETIC_BIT`, and a target naming no `env` holds
 every extension. A module declares a capability only when something it emits needs
 it, with `OpExtension` for a capability a SPIR-V extension defines.
+
+A row may also be **typed**: its requirement depends on the type it operates on, read
+from one operand (a pointer's pointee), and on the storage class that operand's
+memory lives in. The atomics are typed. A declaration whose type the row admits in no
+storage class is refused with `op.signature`, and each call is checked where its
+storage class is known. A load reads its pointer and every other atomic writes it, so
+a `"readonly"` binding admits only an atomic load.
+
+```mach
+#[op("spirv", "core", "OpAtomicIAdd")]
+pub fun atomic_add64(p: *u64, scope: u32, semantics: u32, v: u64) u64;
+
+#[op("spirv", "core", "OpAtomicFAddEXT")]
+pub fun atomic_fadd(p: *f32, scope: u32, semantics: u32, v: f32) f32;
+```
+
+A 32-bit integer atomic is core in every storage class. Every other type needs the
+Vulkan device feature of its storage class, named for its `shaderBuffer*` or
+`shaderShared*` member: `buffer_*` on a storage buffer (`StorageBuffer`, or `Uniform`
+before SPIR-V 1.3), `shared_*` on [`#[shared]`](#inputn--outputn--builtinstr--uniformset-binding--storageset-binding--samplerset-binding--push--specid--shared--shader-interface)
+workgroup memory. Any other storage class is refused. An `f16` atomic is refused: its
+pointee must be an `OpTypeFloat 16`, and an `f16` in memory is carried as its 16-bit
+integer.
+
+| Rows | Type | Extensions | Vulkan feature | Capability (SPIR-V extension) |
+|------|------|-----------|----------------|-------------------------------|
+| all 15 integer atomics | `u32`, `i32` | none | core | none |
+| all 15 integer atomics | `u64`, `i64` | `buffer_int64_atomics`, `shared_int64_atomics` | `shaderBufferInt64Atomics`, `shaderSharedInt64Atomics` | `Int64Atomics` |
+| `OpAtomicLoad`, `OpAtomicStore`, `OpAtomicExchange` | `f32`, `f64` | `buffer_float{32,64}_atomics`, `shared_float{32,64}_atomics` | `shader{Buffer,Shared}Float{32,64}Atomics` | none |
+| `OpAtomicFAddEXT` | `f32`, `f64` | `buffer_float{32,64}_atomic_add`, `shared_float{32,64}_atomic_add` | `shader{Buffer,Shared}Float{32,64}AtomicAdd` | `AtomicFloat{32,64}AddEXT` (`SPV_EXT_shader_atomic_float_add`) |
+| `OpAtomicFMinEXT`, `OpAtomicFMaxEXT` | `f32`, `f64` | `buffer_float{32,64}_atomic_min_max`, `shared_float{32,64}_atomic_min_max` | `shader{Buffer,Shared}Float{32,64}AtomicMinMax` | `AtomicFloat{32,64}MinMaxEXT` (`SPV_EXT_shader_atomic_float_min_max`) |
+
+The features come from `VkPhysicalDeviceShaderAtomicInt64Features`,
+`VkPhysicalDeviceShaderAtomicFloatFeaturesEXT` and
+`VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT`. No environment guarantees any of
+them, so a target names each one its consumer enables, and a target naming no `env`
+holds them all. The integer atomics are `OpAtomicLoad`, `OpAtomicStore`,
+`OpAtomicExchange`, `OpAtomicCompareExchange`, `OpAtomicIIncrement`,
+`OpAtomicIDecrement`, `OpAtomicIAdd`, `OpAtomicISub`, `OpAtomicSMin`, `OpAtomicUMin`,
+`OpAtomicSMax`, `OpAtomicUMax`, `OpAtomicAnd`, `OpAtomicOr` and `OpAtomicXor`.
+
+| At the call                                            | Is refused with                    |
+|--------------------------------------------------------|------------------------------------|
+| a type the row admits only in other storage classes    | `spirv.capability`, naming the class |
+| a type whose feature the target does not select        | `spirv.capability`, naming the feature |
+
+A row also states how its operands' types and its result's **relate** to the type it
+operates on, the type of the one operand its typing reads (a pointer's pointee). A
+declaration that breaks a relation is refused with `op.signature`, naming both the
+parameter (or the return type) and the operand it relates to, so a mismatch is caught
+at the declaration rather than as an invalid module.
+
+| Rows | Relation |
+|------|----------|
+| every atomic | the result and each value operand are the pointer's pointee |
+| `OpImageRead`, `OpImageFetch`, `OpImageWrite` | the texel, the result or the last operand, is a vector of the image's texel scalar |
+| `OpGroupNonUniformBroadcast*`, `Shuffle*`, `Quad*` and the arithmetic rows | the result is the value operand's type |
+| the GLSL.std.450 math rows | the result and every operand are the first operand's type, except `Refract`'s `eta`, and `Length` and `Distance`, whose result is a scalar |
+| `OpDot` | the second vector is the first's type |
+
 
 The **subgroup operations** are the `OpGroupNonUniform*` rows, each taking the
 Subgroup scope (3) as its first operand. Every one needs SPIR-V 1.3, so `vulkan1.1`
@@ -1598,7 +1688,7 @@ the instruction. A `spirv` build never emits the body at all.
 
 The set of accepted instructions is the table in
 `src/lang/target/isa/spirv/defs.mach`, where each row carries its operand kinds, its
-result, its requirements and the enumerations of its literals. The capabilities, with
+result, its requirements, its typing and the enumerations of its literals. The capabilities, with
 the SPIR-V version and extension each needs, are the table in
 `src/lang/target/isa/spirv.mach`. Adding an instruction is a row in it.
 

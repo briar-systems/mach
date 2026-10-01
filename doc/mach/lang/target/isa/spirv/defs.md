@@ -135,7 +135,7 @@ pub val IMAGE_OP_FORMAT:  u32 = 6
 ## val OP_DEF_COUNT
 
 ```mach
-pub val OP_DEF_COUNT:   usize = 86
+pub val OP_DEF_COUNT:   usize = 101
 ```
 
 ## val TYPE_DEF_COUNT
@@ -174,10 +174,85 @@ pub val GROUP_OPERATION_CLUSTERED_REDUCE: u32 = 3
 pub val ARITHMETIC_GROUP_OPERATION: isa.OpEnum = isa.OpEnum;
 ```
 
+## val IMAGE_OPERANDS_LOD
+
+```mach
+pub val IMAGE_OPERANDS_LOD:    u32 = 0x2
+```
+
+## val IMAGE_OPERANDS_SAMPLE
+
+```mach
+pub val IMAGE_OPERANDS_SAMPLE: u32 = 0x40
+```
+
+## val SAMPLE_LOD_OPERANDS
+
+```mach
+pub val SAMPLE_LOD_OPERANDS: isa.OpEnum = isa.OpEnum;
+```
+
+## val FETCH_OPERANDS
+
+```mach
+pub val FETCH_OPERANDS:      isa.OpEnum = isa.OpEnum;
+```
+
+## val STORAGE_OPERANDS
+
+```mach
+pub val STORAGE_OPERANDS:    isa.OpEnum = isa.OpEnum;
+```
+
 ## val BALLOT_GROUP_OPERATION
 
 ```mach
 pub val BALLOT_GROUP_OPERATION: isa.OpEnum = isa.OpEnum;
+```
+
+## val ATOMIC_INTEGER
+
+```mach
+pub val ATOMIC_INTEGER:       isa.OpTyping = isa.OpTyping;
+```
+
+## val ATOMIC_MEMORY
+
+```mach
+pub val ATOMIC_MEMORY:        isa.OpTyping = isa.OpTyping;
+```
+
+## val ATOMIC_FLOAT_ADD
+
+```mach
+pub val ATOMIC_FLOAT_ADD:     isa.OpTyping = isa.OpTyping;
+```
+
+## val ATOMIC_FLOAT_MIN_MAX
+
+```mach
+pub val ATOMIC_FLOAT_MIN_MAX: isa.OpTyping = isa.OpTyping;
+```
+
+## val FIRST_OPERAND
+
+```mach
+pub val FIRST_OPERAND:         isa.OpTyping = isa.OpTyping;
+```
+
+the operand an untyped row's relations are stated against, holding its type to nothing:
+the first for a math instruction or an image's handle, the value for a subgroup operation
+
+## val SUBGROUP_VALUE
+
+```mach
+pub val SUBGROUP_VALUE:        isa.OpTyping = isa.OpTyping;
+```
+
+## val GROUP_OPERATION_VALUE
+
+```mach
+pub val GROUP_OPERATION_VALUE: isa.OpTyping = isa.OpTyping;
 ```
 
 ## rec DefStorage
@@ -197,4 +272,24 @@ pub fun set_import_name(set: u8) str;
 ```mach
 pub fun register_defs(storage: *DefStorage) *isa.TargetDefs;
 ```
+
+## fun is_image_operands
+
+```mach
+pub fun is_image_operands(en: *isa.OpEnum) bool;
+```
+
+whether `en` is an instruction's view of the Image Operands mask
+
+## fun image_use_refusal
+
+```mach
+pub fun image_use_refusal(opcode: u32, image: bool, ms: bool, storage: bool, dim: u32, mask: u32) str;
+```
+
+why an image instruction's use is invalid, nil when it is valid: `image` says whether
+its first operand is an image, `ms` whether that image is multisampled, `storage`
+whether it is a storage image and `dim` its dimensionality, and `mask` is the Image
+Operands mask it passes, 0 when it passes none. a multisampled image's texel is named
+by its sample, and only a multisampled image has samples
 
