@@ -1175,20 +1175,28 @@ texel buffer or a sampled image is fetched texel by texel by `OpImageFetch`, and
 `OpImageQuerySamples` read an image's descriptor under the `ImageQuery` capability,
 which every Vulkan version accepts.
 
-`OpImageRead`, `OpImageWrite`, `OpImageFetch` and `OpImageSampleImplicitLod` take an
-optional `Image Operands` mask leading their tail, so a declaration either stops at
+`OpImageRead`, `OpImageWrite`, `OpImageFetch`, `OpImageSampleImplicitLod` and
+`OpImageGather` take an optional `Image Operands` mask leading their tail, so a declaration either stops at
 the instruction's required operands or passes the mask and the operands its bits
 bring, each typed by its bit. `Sample` (`0x40`) names one sample of a multisampled
 image, and a fetch's `Lod` (`0x2`) the level it reads. A multisampled image is read,
 written and fetched only with `Sample`, and only a multisampled image takes it.
 `OpImageSampleExplicitLod` always takes the mask, which must set `Lod` or `Grad`
 (`0x4`), whose two operands are the coordinate's derivatives along x and y, and never
-both. A fetch and a sample also take `ConstOffset` (`0x8`), an integer constant added
-to the coordinate, one component per dimension of it and never on a `Cube` image, and
-a sample takes `MinLod` (`0x80`), the least level of detail it reads, which an
-explicit-lod sample takes only with `Grad` and which needs the `resource_min_lod`
-extension. An offset is a constant by emission: a literal, or a vector of literals
-directly or through a binding. `OpImageQuerySamples` reads the sample
+both. An implicit-lod sample takes `Bias` (`0x1`), a float added to the level it
+derives, and is reached only from a fragment stage, the one stage with the coordinate
+derivatives it derives that level from. A fetch, a sample and a gather take
+`ConstOffset` (`0x8`), an integer constant added to the coordinate, or `Offset`
+(`0x10`), the same computed at run time, one component per dimension of the
+coordinate, one of the two and never on a `Cube` image. `Offset` needs the
+`image_gather_extended` extension, and on a fetch or a sample `maintenance8` as well,
+since Vulkan admits it outside a gather only under that feature. A sample takes
+`MinLod` (`0x80`), the least level of detail it reads, which an explicit-lod sample
+takes only with `Grad` and which needs the `resource_min_lod` extension.
+`OpImageGather` reads one component, a constant id, of the four texels a sample of a
+`2D` or `Cube` image would filter. A constant operand is a constant by emission: a
+literal, a vector of literals directly or through a binding, or a module-scope `val`,
+which a shader reads as the constant it is. `OpImageQuerySamples` reads the sample
 count of a multisampled image only, and `OpImageQuerySizeLod` does not take one.
 `OpImageQuerySize` reads an image with no level of detail to choose, a multisampled
 image, a storage image or a texel buffer, so a single-sampled sampled image is

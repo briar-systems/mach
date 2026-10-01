@@ -380,6 +380,12 @@ pub val OP_IMAGE_SAMPLE_EXPLICIT_LOD: u32 = 88
 pub val OP_IMAGE_FETCH:               u32 = 95
 ```
 
+## val OP_IMAGE_GATHER
+
+```mach
+pub val OP_IMAGE_GATHER:              u32 = 96
+```
+
 ## val OP_IMAGE_READ
 
 ```mach
@@ -1096,6 +1102,12 @@ pub val CAP_INT16:   u32 = 22
 pub val CAP_INT8:    u32 = 39
 ```
 
+## val CAP_IMAGE_GATHER_EXTENDED
+
+```mach
+pub val CAP_IMAGE_GATHER_EXTENDED:          u32 = 25
+```
+
 ## val CAP_STORAGE_IMAGE_MULTISAMPLE
 
 ```mach
@@ -1454,10 +1466,16 @@ pub val NEED_IMAGE_MS_ARRAY:            u64 = 0x20000000
 pub val NEED_MIN_LOD:                   u64 = 0x40000000
 ```
 
+## val NEED_IMAGE_GATHER_EXTENDED
+
+```mach
+pub val NEED_IMAGE_GATHER_EXTENDED:     u64 = 0x80000000
+```
+
 ## val CAPABILITY_COUNT
 
 ```mach
-pub val CAPABILITY_COUNT: u32 = 31
+pub val CAPABILITY_COUNT: u32 = 32
 ```
 
 ## val SPV_EXT_ATOMIC_FLOAT_ADD
@@ -1556,7 +1574,11 @@ format may be read or written (#4272). storage_image_multisample is the
 shaderStorageImageMultisample feature, which enables both StorageImageMultisample
 and ImageMSArray, so a storage image may be multisampled, arrayed or not (#4298).
 resource_min_lod is the shaderResourceMinLod feature, which enables MinLod, so a
-sample may name the least level of detail it reads (#4303)
+sample may name the least level of detail it reads. image_gather_extended is the
+shaderImageGatherExtended feature, which enables ImageGatherExtended, so a gather
+may take an offset computed at run time. maintenance8 is the
+maintenance8 feature, under which a fetch or a sample takes a run-time offset too
+(VUID-RuntimeSpirv-Offset-10213) (#4303)
 
 ## val EXT_ZERO_INIT_WORKGROUP
 
@@ -1725,6 +1747,18 @@ pub val EXT_STORAGE_IMAGE_MULTISAMPLE:     u64 = 0x4000000
 pub val EXT_RESOURCE_MIN_LOD:              u64 = 0x8000000
 ```
 
+## val EXT_IMAGE_GATHER_EXTENDED
+
+```mach
+pub val EXT_IMAGE_GATHER_EXTENDED:         u64 = 0x10000000
+```
+
+## val EXT_MAINTENANCE8
+
+```mach
+pub val EXT_MAINTENANCE8:                  u64 = 0x20000000
+```
+
 ## val EXT_ATOMICS
 
 ```mach
@@ -1736,7 +1770,7 @@ every atomic feature
 ## val EXTENSION_COUNT
 
 ```mach
-pub val EXTENSION_COUNT: u32 = 28
+pub val EXTENSION_COUNT: u32 = 30
 ```
 
 ## val ONLY_ENVIRONMENT
@@ -1764,6 +1798,7 @@ pub val EXT_OPEN: u64 = EXT_FLOAT16 | EXT_ZERO_INIT_WORKGROUP | EXT_SUBGROUP_ARI
 | EXT_STORAGE_READ_WITHOUT_FORMAT | EXT_STORAGE_WRITE_WITHOUT_FORMAT
 | EXT_SUBGROUP_VOTE | EXT_SUBGROUP_BALLOT | EXT_SUBGROUP_SHUFFLE | EXT_SUBGROUP_SHUFFLE_RELATIVE | EXT_SUBGROUP_QUAD
 | EXT_SUBGROUP_GRAPHICS_STAGES | EXT_ATOMICS | EXT_STORAGE_IMAGE_MULTISAMPLE | EXT_RESOURCE_MIN_LOD
+| EXT_IMAGE_GATHER_EXTENDED | EXT_MAINTENANCE8
 ```
 
 every extension of the vocabulary, which a module naming no environment holds
