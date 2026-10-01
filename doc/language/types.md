@@ -382,6 +382,21 @@ format as `i32` and an unsigned one as `u32`. `R64ui` and `R64i` hold 64-bit tex
 the texel scalar `u64` or `i64`, and declare `Int64ImageEXT`, which needs the
 `image_int64_atomics` extension.
 
+`Depth` `1` is a **depth image**, the shadow map a depth comparison samples, and
+`0` any other. Only a depth image is sampled by the `OpImage*Dref*` comparisons
+(see [decorators.md](decorators.md)), and it is read without one like any other
+image. Vulkan places no `Depth` constraint on a storage image, so a storage image
+may declare `1` too, though no comparison reads it: a comparison samples through a
+sampler. `2`, which states no indication either way, is refused.
+
+```mach fragment
+#[handle("spirv", "image", TEXEL_F32, DIM_2D, DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED, FORMAT_UNKNOWN)]
+pub def ShadowMap;
+
+#[handle("spirv", "sampled_image", ShadowMap)]
+pub def ShadowSampler;
+```
+
 `MS` `1` is a **multisampled** image, which only a `2D` image is, arrayed or not:
 it is refused on `1D`, `3D`, `Cube` and `Buffer`. A multisampled image is never
 sampled, so a `sampled_image` cannot compose over one, and its texels are read per
@@ -412,8 +427,9 @@ an operation over it is an undefined symbol at link.
 
 A target refuses an operand combination its constructor spells but it cannot emit,
 naming the operand rather than the declaration. The SPIR-V target refuses a
-non-zero `Depth`, a non-zero `MS`, a `Dim` past `Cube`, and a `Sampled` other than
-`1`, each with what SPIR-V would need instead.
+`Depth` other than `0` or `1`, an `MS` other than `0` or `1`, a `Dim` past `Cube`
+other than `Buffer`, and a `Sampled` other than `1` or `2`, each with what SPIR-V
+would need instead.
 
 See [decorators.md](decorators.md) for `#[handle]` and `#[sampler(set, binding)]`,
 and the shader library for the handles a SPIR-V target declares.
