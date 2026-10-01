@@ -2259,6 +2259,12 @@ pub val SCOPE_QUEUE_FAMILY: u32 = 5
 pub val SEMANTICS_ACQUIRE_RELEASE:  u32 = 0x8
 ```
 
+## val SEMANTICS_SEQ_CST
+
+```mach
+pub val SEMANTICS_SEQ_CST:          u32 = 0x10
+```
+
 ## val SEMANTICS_WORKGROUP_MEMORY
 
 ```mach
