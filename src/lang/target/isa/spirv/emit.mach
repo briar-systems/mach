@@ -5564,7 +5564,7 @@ fun value_type_for(e: *Emit, mf: *mir.MirFunction, mi: *mir.MirInstr, vreg: u32,
     if (vreg < mf.vreg_count && mf.vregs[vreg].ty != mir.VREG_TY_NIL && is_half_value(e, mf.vregs[vreg].ty)) {
         ret spv_type_of(e, ?e.ir.types, mf.vregs[vreg].ty);
     }
-    if (mir.vec_lane_is_vector(mi.vec_lane)) {
+    if (mir.vec_lane_is_vector(mi.vec_lane) && !reinterprets_to_scalar(e, mf, mi, vreg)) {
         if (mi.opcode == mir.MIR_VEC_EXTRACT) { ret carried_lane_type(e, lane_type_of(e, mi.vec_lane)); }
         val as_int: bool = mir.is_cmp_opcode(mi.opcode) || mi.opcode == mir.MIR_FCMP;
         ret vector_type_of(e, mi.vec_lane, as_int);
@@ -5588,6 +5588,15 @@ fun value_type_for(e: *Emit, mf: *mir.MirFunction, mi: *mir.MirInstr, vreg: u32,
     }
     if (bits == 8 || bits == 16 || bits == 32 || bits == 64) { ret types.type_int(e.tt, carrier_bits(e, bits)); }
     ret 0;
+}
+
+# a vector reinterpreted as a scalar carries its operand's lanes, since its result has
+# none, and is the scalar its register declares (#4319)
+fun reinterprets_to_scalar(e: *Emit, mf: *mir.MirFunction, mi: *mir.MirInstr, vreg: u32) bool {
+    if (mi.opcode != mir.MIR_BITCAST || vreg >= mf.vreg_count || mf.vregs[vreg].ty == mir.VREG_TY_NIL) { ret false; }
+    val declared: opt[*type.IrType] = type.get(?e.ir.types, mf.vregs[vreg].ty);
+    if (sel declared.none) { ret false; }
+    ret declared.some.kind != type.IRT_VECTOR;
 }
 
 # an ir f16 carrier, or a vector of them, that half_memory makes an OpTypeFloat 16
@@ -8651,7 +8660,11 @@ fun emit_convert(e: *Emit, vm: *VMaps, mi: *mir.MirInstr,
     if ((zext || sext) && mi.operands[1].kind == mir.MIR_OP_VREG) {
         a = narrow_extend(e, a, a_ty, mi.src_width::u32 * 8, sext);
     }
-    if (op_code == spirv.OP_BITCAST) { ret store_vreg(e, vm, dst, bits_as(e, a, a_ty, vm.type_id[dst])); }
+    if (op_code == spirv.OP_BITCAST) {
+        val bits: u32 = bits_as(e, a, a_ty, vm.type_id[dst]);
+        if (bits == 0 || e.b.err) { ret emit_fail(e, "spirv.emit: a reinterpret between types of unequal widths"); }
+        ret store_vreg(e, vm, dst, bits);
+    }
     # an integer width change within one carrier is no instruction: OpUConvert
     # and OpSConvert need two widths
     if ((op_code == spirv.OP_U_CONVERT || op_code == spirv.OP_S_CONVERT) && a_ty != 0 && a_ty == vm.type_id[dst]) {
@@ -8674,6 +8687,7 @@ fun emit_convert(e: *Emit, vm: *VMaps, mi: *mir.MirInstr,
 # so the reinterpretation needs no 16-bit integer type
 fun bits_as(e: *Emit, value: u32, from_ty: u32, to_ty: u32) u32 {
     if (value == 0 || from_ty == to_ty || from_ty == 0 || to_ty == 0) { ret value; }
+    if (lanes_in_array(e, from_ty) || lanes_in_array(e, to_ty))       { ret lanes_as(e, value, from_ty, to_ty); }
     val half_from: bool = types.type_is_float(e.tt, from_ty) && types.type_bits(e.tt, from_ty) == 16;
     val half_to:   bool = types.type_is_float(e.tt, to_ty) && types.type_bits(e.tt, to_ty) == 16;
     val wide_from: bool = !types.type_is_float(e.tt, from_ty) && types.type_bits(e.tt, from_ty) == 32;
@@ -8701,6 +8715,150 @@ fun bits_as(e: *Emit, value: u32, from_ty: u32, to_ty: u32) u32 {
         ret low;
     }
     ret emit_bitcast(e, to_ty, value);
+}
+
+# a vector wider than SPIR-V's is carried as an array of its lanes, which OpBitcast cannot take
+fun lanes_in_array(e: *Emit, ty: u32) bool {
+    var n: u32 = 0;
+    ret types.vector_shape(e.tt, ty, ?n) == 0 && types.vector_value_shape(e.tt, ty, ?n) != 0;
+}
+
+# the lane type and count of a vector value, a scalar being one lane of itself
+fun lane_shape(e: *Emit, ty: u32, out_count: *u32) u32 {
+    val lane: u32 = types.vector_value_shape(e.tt, ty, out_count);
+    if (lane != 0) { ret lane; }
+    @out_count = 0;
+    if (types.type_bits(e.tt, ty) == 0) { ret 0; }
+    @out_count = 1;
+    ret ty;
+}
+
+fun lane_extract(e: *Emit, value: u32, lane_ty: u32, index: u32) u32 {
+    val part:  u32 = spirv.alloc_id(e.b);
+    var words: [4]u32;
+    words[0] = lane_ty;
+    words[1] = part;
+    words[2] = value;
+    words[3] = index;
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_COMPOSITE_EXTRACT, ?words[0], 4);
+    ret part;
+}
+
+# a vector value reinterpreted where one side is carried as an array. its lanes are
+# regrouped at the wider lane width, each group reinterpreted through a vector SPIR-V
+# can bitcast, and the result built from the regrouped lanes (#4319). 0 when the two
+# are not the same number of bits
+fun lanes_as(e: *Emit, value: u32, from_ty: u32, to_ty: u32) u32 {
+    var nf: u32 = 0;
+    var nt: u32 = 0;
+    val fl: u32 = lane_shape(e, from_ty, ?nf);
+    val tl: u32 = lane_shape(e, to_ty, ?nt);
+    val fw: u32 = types.type_bits(e.tt, fl);
+    val tw: u32 = types.type_bits(e.tt, tl);
+    if (fw == 0 || tw == 0 || fw * nf != tw * nt || !types.instruction_operands_fit(2, nt)) { ret 0; }
+    val sr: res[*u32, A.Error] = A.allocate[u32](e.alloc, nf::usize);
+    if (sel sr.err) { ret 0; }
+    val src: *u32 = sr.ok;
+    fin { A.deallocate[u32](e.alloc, src, nf::usize); }
+    val wr: res[*u32, A.Error] = A.allocate[u32](e.alloc, (nt + 2)::usize);
+    if (sel wr.err) { ret 0; }
+    val words: *u32 = wr.ok;
+    fin { A.deallocate[u32](e.alloc, words, (nt + 2)::usize); }
+    var i: u32 = 0;
+    for (i < nf) {
+        if (nf == 1) { src[i] = value; }
+        or           { src[i] = lane_extract(e, value, fl, i); }
+        i = i + 1;
+    }
+    i = 0;
+    if (fw == tw) {
+        for (i < nt) {
+            words[2 + i] = bits_as(e, src[i], fl, tl);
+            i            = i + 1;
+        }
+    }
+    or (fw < tw) {
+        val k: u32 = tw / fw;
+        for (i < nt) {
+            words[2 + i] = lanes_packed(e, ?src[i * k], k, fl, tl);
+            i            = i + 1;
+        }
+    }
+    or {
+        val k: u32 = fw / tw;
+        for (i < nf) {
+            if (!lanes_unpacked(e, src[i], k, tl, ?words[2 + i * k])) { ret 0; }
+            i = i + 1;
+        }
+    }
+    i = 0;
+    for (i < nt) {
+        if (words[2 + i] == 0) { ret 0; }
+        i = i + 1;
+    }
+    if (nt == 1) { ret words[2]; }
+    words[0] = to_ty;
+    words[1] = spirv.alloc_id(e.b);
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_COMPOSITE_CONSTRUCT, words, nt + 2);
+    ret words[1];
+}
+
+# `count` lanes of `lane_ty` as one `to_ty`, through a vector of them. more lanes than a
+# vector holds are first packed into integers of as many lanes as one holds
+fun lanes_packed(e: *Emit, parts: *u32, count: u32, lane_ty: u32, to_ty: u32) u32 {
+    val max: u32 = types.MAX_VECTOR_COMPONENTS;
+    if (count > max) {
+        val groups: u32 = count / max;
+        val mid:    u32 = types.type_int(e.tt, types.type_bits(e.tt, lane_ty) * max);
+        var inner:  [4]u32;
+        if (mid == 0 || groups > max || groups * max != count) { ret 0; }
+        var g: u32 = 0;
+        for (g < groups) {
+            inner[g] = lanes_packed(e, ?parts[g * max], max, lane_ty, mid);
+            if (inner[g] == 0) { ret 0; }
+            g = g + 1;
+        }
+        ret lanes_packed(e, ?inner[0], groups, mid, to_ty);
+    }
+    val vec_ty: u32 = types.type_vector(e.tt, lane_ty, count);
+    if (vec_ty == 0) { ret 0; }
+    var words: [6]u32;
+    words[0] = vec_ty;
+    words[1] = spirv.alloc_id(e.b);
+    var i: u32 = 0;
+    for (i < count) {
+        words[2 + i] = parts[i];
+        i            = i + 1;
+    }
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_COMPOSITE_CONSTRUCT, ?words[0], count + 2);
+    ret emit_bitcast(e, to_ty, words[1]);
+}
+
+# one value as `count` lanes of `lane_ty` into `out`, the inverse of lanes_packed
+fun lanes_unpacked(e: *Emit, value: u32, count: u32, lane_ty: u32, out: *u32) bool {
+    val max: u32 = types.MAX_VECTOR_COMPONENTS;
+    if (count > max) {
+        val groups: u32 = count / max;
+        val mid:    u32 = types.type_int(e.tt, types.type_bits(e.tt, lane_ty) * max);
+        var inner:  [4]u32;
+        if (mid == 0 || groups > max || groups * max != count) { ret false; }
+        if (!lanes_unpacked(e, value, groups, mid, ?inner[0])) { ret false; }
+        var g: u32 = 0;
+        for (g < groups) {
+            if (!lanes_unpacked(e, inner[g], max, lane_ty, ?out[g * max])) { ret false; }
+            g = g + 1;
+        }
+        ret true;
+    }
+    val vec_ty: u32 = types.type_vector(e.tt, lane_ty, count);
+    if (vec_ty == 0) { ret false; }
+    val vec: u32 = emit_bitcast(e, vec_ty, value);
+    var i:   u32 = 0;
+    for (i < count) {
+        out[i] = lane_extract(e, vec, lane_ty, i);
+        i      = i + 1;
+    }
+    ret true;
 }
 
 fun emit_mov(e: *Emit, vm: *VMaps, mi: *mir.MirInstr) err[fail.Fail] {
