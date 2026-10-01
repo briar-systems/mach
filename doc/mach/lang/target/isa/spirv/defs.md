@@ -312,7 +312,7 @@ pub val READ_TEXEL_COUNT:   isa.OpTexelCount = isa.OpTexelCount;
 ```
 
 how many components each image instruction's texel has. a read's result is a 4-vector in
-Vulkan, a fetch's and a sample's in every environment, and a write's texel needs at
+Vulkan, a fetch's, a sample's and a gather's in every environment, and a write's texel needs at
 least the components its image's format stores, which spirv-val cannot see: the format
 is matched to a VkFormat only when the descriptor is bound
 
@@ -326,6 +326,12 @@ pub val FETCH_TEXEL_COUNT:  isa.OpTexelCount = isa.OpTexelCount;
 
 ```mach
 pub val SAMPLE_TEXEL_COUNT: isa.OpTexelCount = isa.OpTexelCount;
+```
+
+## val GATHER_TEXEL_COUNT
+
+```mach
+pub val GATHER_TEXEL_COUNT: isa.OpTexelCount = isa.OpTexelCount;
 ```
 
 ## val WRITE_TEXEL_COUNT
