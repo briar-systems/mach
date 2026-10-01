@@ -143,7 +143,8 @@ rec GlobalEnt {
 #   BIND_GLOBAL, global, n, step * n            a path into a global, named in the copy
 #   BIND_LOCAL, module, ir type, n, step * n    a path into a Function-storage root of
 #                                               that type, passed first
-# where a step is a constant ordinal, or STEP_RUNTIME for an index passed after the root
+# where a step is a member ordinal, which OpAccessChain takes only as a constant, or
+# STEP_RUNTIME for an array element, whose index (constant or not) is passed after the root
 rec Copy {
     fx:      u32;
     id:      u32;
@@ -164,7 +165,7 @@ val ROOT_GLOBAL: u8 = 1;
 val ROOT_ALLOCA: u8 = 2;
 val ROOT_PARAM:  u8 = 3;
 
-# one step of an address: a constant ordinal, or a runtime index that a chain of this
+# one step of an address: a member ordinal, or an element index that a chain of this
 # function read (its result vreg and the index's position) or that this copy receives
 # (the parameter and the index's slot among that parameter's runtime indices)
 rec AddrStep {
@@ -182,7 +183,11 @@ rec Addr {
     param:   u32;
     root_mi: u32;
     root_ty: type.IrTypeId;
-    steps:   Vector[AddrStep];
+    # the type the address points at so far, in module cur_mi's types, which says
+    # whether the next step selects a member or an element
+    cur_mi: u32;
+    cur_ty: type.IrTypeId;
+    steps:  Vector[AddrStep];
 }
 
 pub fun emit_module(out_alloc: *A.Allocator, tgt: *isa.BackendTarget, u: *unit.Unit,
@@ -655,6 +660,8 @@ fun addr_init(e: *Emit) Addr {
     ad.param   = 0;
     ad.root_mi = 0;
     ad.root_ty = type.IRT_NIL;
+    ad.cur_mi  = 0;
+    ad.cur_ty  = type.IRT_NIL;
     ad.steps   = vector.init[AddrStep](e.alloc);
     ret ad;
 }
@@ -884,8 +891,10 @@ fun trace_from(e: *Emit, cx: u32, mf: *mir.MirFunction, op: *mir.MirOperand, ad:
         if (op.sym_off != 0) { ret res[bool, fail.Fail].ok{false}; }
         val gx: u32 = gl_lookup(e, op.sym);
         if (gx == GL_NONE || e.gvar_ids == nil || e.gvar_ids[gx] == 0) { ret res[bool, fail.Fail].ok{false}; }
-        ad.root = ROOT_GLOBAL;
-        ad.gix  = gx;
+        ad.root   = ROOT_GLOBAL;
+        ad.gix    = gx;
+        ad.cur_mi = e.gls[gx].mi;
+        ad.cur_ty = gl_ir(e, gx).ty;
         ret res[bool, fail.Fail].ok{true};
     }
     var v: u32 = mir.MIR_VREG_NIL.n;
@@ -904,6 +913,8 @@ fun trace_from(e: *Emit, cx: u32, mf: *mir.MirFunction, op: *mir.MirOperand, ad:
         ad.vreg    = v;
         ad.root_mi = e.fns[fx].mi;
         ad.root_ty = slot.ty::type.IrTypeId;
+        ad.cur_mi  = ad.root_mi;
+        ad.cur_ty  = ad.root_ty;
         ret res[bool, fail.Fail].ok{true};
     }
     if (is_reg_copy(def)) {
@@ -925,11 +936,18 @@ fun trace_from(e: *Emit, cx: u32, mf: *mir.MirFunction, op: *mir.MirOperand, ad:
             st.from_param = false;
             st.a          = v;
             st.b          = k - 3;
-            if (ix.kind == mir.MIR_OP_IMM) {
-                if (ix.imm < 0 || ix.imm >= STEP_RUNTIME::i64) { ret res[bool, fail.Fail].ok{false}; }
-                st.ord = ix.imm::u32;
+            if (ix.kind != mir.MIR_OP_IMM && ix.kind != mir.MIR_OP_VREG)                  { ret res[bool, fail.Fail].ok{false}; }
+            if (ix.kind == mir.MIR_OP_IMM && (ix.imm < 0 || ix.imm >= STEP_RUNTIME::i64)) { ret res[bool, fail.Fail].ok{false}; }
+            # an element index, constant or not, is passed; a member ordinal is part of the key
+            val tys: *type.IrTypeTable = ?e.u.mods[ad.cur_mi].ir.types;
+            val to:  opt[*type.IrType] = type.get(tys, ad.cur_ty);
+            if (sel to.none)                    { ret res[bool, fail.Fail].ok{false}; }
+            if (to.some.kind == type.IRT_ARRAY) { ad.cur_ty = to.some.data.array_.element; }
+            or {
+                if (ix.kind != mir.MIR_OP_IMM) { ret res[bool, fail.Fail].ok{false}; }
+                st.ord    = ix.imm::u32;
+                ad.cur_ty = ir_member_type(tys, to.some, ad.cur_ty, st.ord);
             }
-            or (ix.kind != mir.MIR_OP_VREG) { ret res[bool, fail.Fail].ok{false}; }
             val pr: res[usize, A.Error] = vector.push[AddrStep](?ad.steps, st);
             if (sel pr.err) { ret res[bool, fail.Fail].err{fail.refused(pr.err)}; }
             k = k + 1;
@@ -945,10 +963,13 @@ fun trace_from(e: *Emit, cx: u32, mf: *mir.MirFunction, op: *mir.MirOperand, ad:
         val p:    u32 = key_param(e, e.copies.data[cx].key_at, k);
         val bind: u32 = e.keys.data[p];
         if (bind == BIND_VALUE) { ret res[bool, fail.Fail].ok{false}; }
+        val fn: *ir.Function      = fn_ir(e, fx);
+        val t:  opt[*type.IrType] = type.get(?fn_mod(e, fx).types, fn.params[k].ty);
+        if (sel t.none) { ret res[bool, fail.Fail].ok{false}; }
+        # whatever the binding, what the parameter points at is its declared pointee
+        ad.cur_mi = e.fns[fx].mi;
+        ad.cur_ty = t.some.data.pointee;
         if (bind == BIND_WHOLE) {
-            val fn: *ir.Function      = fn_ir(e, fx);
-            val t:  opt[*type.IrType] = type.get(?fn_mod(e, fx).types, fn.params[k].ty);
-            if (sel t.none) { ret res[bool, fail.Fail].ok{false}; }
             ad.root    = ROOT_PARAM;
             ad.param   = k;
             ad.root_mi = e.fns[fx].mi;
@@ -983,6 +1004,21 @@ fun trace_from(e: *Emit, cx: u32, mf: *mir.MirFunction, op: *mir.MirOperand, ad:
         ret res[bool, fail.Fail].ok{true};
     }
     ret res[bool, fail.Fail].ok{false};
+}
+
+# the type member `ord` of a composite `t` (id `id`) has, IRT_NIL where no further step can follow
+fun ir_member_type(tys: *type.IrTypeTable, t: *type.IrType, id: type.IrTypeId, ord: u32) type.IrTypeId {
+    if (t.kind == type.IRT_STRUCT) {
+        if (ord >= t.data.struct_.field_count) { ret type.IRT_NIL; }
+        ret t.data.struct_.fields[ord];
+    }
+    if (t.kind == type.IRT_VECTOR) { ret t.data.vector_.element; }
+    # a tag's member 0 is its discriminator, and member 1 + c case c's payload
+    if (t.kind == type.IRT_TAG && ord > 0 && ord <= type.tag_case_count(tys, id)
+        && type.tag_case_has_payload(tys, id, ord - 1)) {
+        ret type.tag_case_type(tys, id, ord - 1);
+    }
+    ret type.IRT_NIL;
 }
 
 # the one instruction that defines `v`, nil when none or several do
