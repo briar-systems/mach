@@ -1175,6 +1175,30 @@ texel buffer or a sampled image is fetched texel by texel by `OpImageFetch`, and
 `OpImageQuerySamples` read an image's descriptor under the `ImageQuery` capability,
 which every Vulkan version accepts.
 
+`OpImageRead`, `OpImageWrite` and `OpImageFetch` take an optional `Image Operands`
+mask leading their tail, so a declaration either stops at the instruction's
+required operands or passes the mask and the operands its bits bring. `Sample`
+(`0x40`) names one sample of a multisampled image, and a fetch's `Lod` (`0x2`)
+the level it reads. A multisampled image is read, written and fetched only with
+`Sample`, and only a multisampled image takes it. `OpImageSampleExplicitLod`
+always takes the mask, which must set `Lod`. `OpImageQuerySamples` reads the sample
+count of a multisampled image only, and `OpImageQuerySizeLod` does not take one.
+`OpImageQuerySize` reads an image with no level of detail to choose, a multisampled
+image, a storage image or a texel buffer, so a single-sampled sampled image is
+queried with `OpImageQuerySizeLod` instead.
+Each is refused at the call with `op.operand_value`.
+
+```mach fragment
+#[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, MULTISAMPLED, SAMPLED, FORMAT_UNKNOWN)]
+pub def TextureMS;
+
+#[op("spirv", "core", "OpImageFetch")]
+fun fetch_sample(img: TextureMS, at: i32x2, mask: u32, sample: i32) f32x4;
+
+#[op("spirv", "core", "OpImageQuerySamples")]
+fun sample_count(img: TextureMS) i32;
+```
+
 ```mach fragment
 #[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, STORAGE, FORMAT_RGBA8)]
 pub def Target2D;
@@ -1533,8 +1557,14 @@ Its operation is a `GroupOperation`. `Reduce` (0), `InclusiveScan` (1) and
 `ExclusiveScan` (2) need the `subgroup_arithmetic` extension and declare
 `GroupNonUniformArithmetic`, and `ClusteredReduce` (3) needs `subgroup_clustered`,
 declares `GroupNonUniformClustered` and is followed by the ClusterSize operand, so
-it is passed only to the four-parameter declaration. Each is checked at the call,
-where the literal's value is known:
+it is passed only to the four-parameter declaration.
+
+Where the specification makes the literal itself optional, as it does an
+instruction's `Image Operands` or `Memory Operands`, the literal **leads the tail**:
+a declaration leaves it out with every operand it would bring, or takes it followed
+by those operands. A mask's set bits bring theirs in ascending bit order, the order
+the specification writes them in, so the parameters after the mask are declared in
+that order. Each is checked at the call, where the literal's value is known:
 
 | At the call                                            | Is refused with                    |
 |--------------------------------------------------------|------------------------------------|

@@ -1500,7 +1500,8 @@ pub rec OpEnum;
 
 the closed set of values a literal operand takes. a value enumeration admits
 exactly one of its values. a mask admits any union of its single-bit values,
-each set bit bringing its own requirement and operands, and 0 is the empty mask
+each set bit bringing its own requirement and operands, which follow in
+ascending bit order, and 0 is the empty mask
 
 ## def OpDataClass
 
@@ -1701,8 +1702,9 @@ a pointer only stored through, `u` a pointer read and written (read-modify-write
 `i` a handle whose memory is read, `o` a handle whose memory is written, `b` a
 truth value.
 the letters after a `|` are the optional tail (`"clv|c"`), present only as far as a
-literal enumerant's value brings them. a letter outside the set is an invalid
-kind, which registration refuses
+literal enumerant's value brings them. a tail may lead with the enumerated literal
+that decides it (`"iv|lv"`), which a call passes or leaves out with its operands.
+a letter outside the set is an invalid kind, which registration refuses
 
 ## fun op_requiring
 
@@ -1768,6 +1770,14 @@ the requirement of `t` admitting a `class` of `bits` in `space`, nil when none d
 pub fun op_operand_enum(d: *OpDef, i: u32) *OpEnum;
 ```
 
+## fun op_tail_literal
+
+```mach
+pub fun op_tail_literal(d: *OpDef) *OpEnum;
+```
+
+the enumeration of the optional literal that leads `d`'s tail, nil when the tail has none
+
 ## fun op_enumerant_of
 
 ```mach
@@ -1784,6 +1794,32 @@ pub fun op_enum_admits(e: *OpEnum, value: u32, out_trailing: *u32) bool;
 
 whether `value` is a value of `e`: one of its values, or for a mask a union of its
 bits. `out_trailing` receives the tail operands the value brings
+
+## val NO_OPERAND
+
+```mach
+pub val NO_OPERAND: u32 = 0xFFFFFFFF
+```
+
+## fun op_literal_span
+
+```mach
+pub fun op_literal_span(d: *OpDef, argc: u32) u32;
+```
+
+how many of a call's leading operands are enumerated-literal positions it passes: the
+required operands, and the literal leading the tail when the call passes more than them
+
+## fun op_call_arity
+
+```mach
+pub fun op_call_arity(d: *OpDef, argc: u32, words: *u32, out_bad: *u32) u32;
+```
+
+the operand count a call of `d` takes with the literal words `words` it passes:
+the operands before its tail, the literal leading the tail when the call passes one,
+and every operand an enumerated value brings. `out_bad` receives the first
+enumerated operand whose word is no value of its enumeration, else NO_OPERAND
 
 ## fun op_operand_kind
 
