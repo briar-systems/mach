@@ -177,31 +177,55 @@ pub val ARITHMETIC_GROUP_OPERATION: isa.OpEnum = isa.OpEnum;
 ## val IMAGE_OPERANDS_LOD
 
 ```mach
-pub val IMAGE_OPERANDS_LOD:    u32 = 0x2
+pub val IMAGE_OPERANDS_LOD:          u32 = 0x2
+```
+
+## val IMAGE_OPERANDS_GRAD
+
+```mach
+pub val IMAGE_OPERANDS_GRAD:         u32 = 0x4
+```
+
+## val IMAGE_OPERANDS_CONST_OFFSET
+
+```mach
+pub val IMAGE_OPERANDS_CONST_OFFSET: u32 = 0x8
 ```
 
 ## val IMAGE_OPERANDS_SAMPLE
 
 ```mach
-pub val IMAGE_OPERANDS_SAMPLE: u32 = 0x40
+pub val IMAGE_OPERANDS_SAMPLE:       u32 = 0x40
+```
+
+## val IMAGE_OPERANDS_MIN_LOD
+
+```mach
+pub val IMAGE_OPERANDS_MIN_LOD:      u32 = 0x80
+```
+
+## val IMPLICIT_LOD_OPERANDS
+
+```mach
+pub val IMPLICIT_LOD_OPERANDS: isa.OpEnum = isa.OpEnum;
 ```
 
 ## val SAMPLE_LOD_OPERANDS
 
 ```mach
-pub val SAMPLE_LOD_OPERANDS: isa.OpEnum = isa.OpEnum;
+pub val SAMPLE_LOD_OPERANDS:   isa.OpEnum = isa.OpEnum;
 ```
 
 ## val FETCH_OPERANDS
 
 ```mach
-pub val FETCH_OPERANDS:      isa.OpEnum = isa.OpEnum;
+pub val FETCH_OPERANDS:        isa.OpEnum = isa.OpEnum;
 ```
 
 ## val STORAGE_OPERANDS
 
 ```mach
-pub val STORAGE_OPERANDS:    isa.OpEnum = isa.OpEnum;
+pub val STORAGE_OPERANDS:      isa.OpEnum = isa.OpEnum;
 ```
 
 ## val BALLOT_GROUP_OPERATION
@@ -280,6 +304,26 @@ pub fun is_image_operands(en: *isa.OpEnum) bool;
 ```
 
 whether `en` is an instruction's view of the Image Operands mask
+
+## fun image_coordinate_components
+
+```mach
+pub fun image_coordinate_components(dim: u32) u32;
+```
+
+how many components an image of `dim` is addressed by, besides an array layer: what
+an offset added to its coordinate, and each derivative of it, has
+
+## fun image_operand_shape_refusal
+
+```mach
+pub fun image_operand_shape_refusal(bit: u32, dim: u32, float: bool, components: u32) str;
+```
+
+why the operands the Image Operands bit `bit` brings do not fit an image of `dim`, nil
+when they do: each is a `float` (else integer) scalar or vector of `components`
+components. an offset or a derivative has one component per dimension of the image's
+coordinate, and a least level of detail is one float
 
 ## fun image_use_refusal
 

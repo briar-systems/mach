@@ -1175,13 +1175,20 @@ texel buffer or a sampled image is fetched texel by texel by `OpImageFetch`, and
 `OpImageQuerySamples` read an image's descriptor under the `ImageQuery` capability,
 which every Vulkan version accepts.
 
-`OpImageRead`, `OpImageWrite` and `OpImageFetch` take an optional `Image Operands`
-mask leading their tail, so a declaration either stops at the instruction's
-required operands or passes the mask and the operands its bits bring. `Sample`
-(`0x40`) names one sample of a multisampled image, and a fetch's `Lod` (`0x2`)
-the level it reads. A multisampled image is read, written and fetched only with
-`Sample`, and only a multisampled image takes it. `OpImageSampleExplicitLod`
-always takes the mask, which must set `Lod`. `OpImageQuerySamples` reads the sample
+`OpImageRead`, `OpImageWrite`, `OpImageFetch` and `OpImageSampleImplicitLod` take an
+optional `Image Operands` mask leading their tail, so a declaration either stops at
+the instruction's required operands or passes the mask and the operands its bits
+bring, each typed by its bit. `Sample` (`0x40`) names one sample of a multisampled
+image, and a fetch's `Lod` (`0x2`) the level it reads. A multisampled image is read,
+written and fetched only with `Sample`, and only a multisampled image takes it.
+`OpImageSampleExplicitLod` always takes the mask, which must set `Lod` or `Grad`
+(`0x4`), whose two operands are the coordinate's derivatives along x and y, and never
+both. A fetch and a sample also take `ConstOffset` (`0x8`), an integer constant added
+to the coordinate, one component per dimension of it and never on a `Cube` image, and
+a sample takes `MinLod` (`0x80`), the least level of detail it reads, which an
+explicit-lod sample takes only with `Grad` and which needs the `resource_min_lod`
+extension. An offset is a constant by emission: a literal, or a vector of literals
+directly or through a binding. `OpImageQuerySamples` reads the sample
 count of a multisampled image only, and `OpImageQuerySizeLod` does not take one.
 `OpImageQuerySize` reads an image with no level of detail to choose, a multisampled
 image, a storage image or a texel buffer, so a single-sampled sampled image is
@@ -1564,12 +1571,16 @@ instruction's `Image Operands` or `Memory Operands`, the literal **leads the tai
 a declaration leaves it out with every operand it would bring, or takes it followed
 by those operands. A mask's set bits bring theirs in ascending bit order, the order
 the specification writes them in, so the parameters after the mask are declared in
-that order. Each is checked at the call, where the literal's value is known:
+that order. Each value types the operands it brings, so `Grad` brings two values and
+`ConstOffset` one constant wherever they land after the mask, and a parameter
+receiving one is held to its kind at the call rather than at the declaration. Each is
+checked at the call, where the literal's value is known:
 
 | At the call                                            | Is refused with                    |
 |--------------------------------------------------------|------------------------------------|
 | a value outside the operand's enumeration              | `op.operand_value`, naming the values |
 | a value whose operands the declaration does not pass, or passes without it | `op.operand_value`, naming the count |
+| a parameter the value's operand kind does not admit     | `op.signature`, naming the operand |
 | a requirement's extension the target does not select   | `spirv.capability`, naming the extension |
 | a capability whose SPIR-V version the environment is below | `spirv.capability`, naming the first `env` that reaches it |
 
