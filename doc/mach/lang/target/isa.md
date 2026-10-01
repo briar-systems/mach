@@ -695,6 +695,26 @@ and none the 128-bit one (#3511)
 pub val INT_WIDTHS_1_2_4_8_16: u32 = 1 + 2 + 4 + 8 + 16
 ```
 
+## val ALU_WIDTHS_4
+
+```mach
+pub val ALU_WIDTHS_4:       u32 = 4
+```
+
+alu width sets for declare_alu_widths, encoded like int_widths
+
+## val ALU_WIDTHS_4_8
+
+```mach
+pub val ALU_WIDTHS_4_8:     u32 = 4 + 8
+```
+
+## val ALU_WIDTHS_1_2_4_8
+
+```mach
+pub val ALU_WIDTHS_1_2_4_8: u32 = 1 + 2 + 4 + 8
+```
+
 ## def MulWideForm
 
 ```mach
@@ -722,6 +742,21 @@ pub val MULW_THREE_ADDRESS: MulWideForm = 1
 
 ```mach
 pub val MULW_FIXED_PAIR:    MulWideForm = 2
+```
+
+## rec AluWidth
+
+```mach
+pub rec AluWidth;
+```
+
+one width the alu computes an integer at, in bytes, legal while the model
+holds every extension in `ext` (0 when it always is)
+
+## val ALU_WIDTH_CAP
+
+```mach
+pub val ALU_WIDTH_CAP: u32 = 5
 ```
 
 ## rec MachineModel
@@ -1177,6 +1212,58 @@ pub fun shift_count_mod_width(m: *MachineModel, bytes: u32) bool;
 ```mach
 pub fun moves_cross_bank(m: *MachineModel, bytes: u32) bool;
 ```
+
+## fun declare_alu_widths
+
+```mach
+pub fun declare_alu_widths(m: *MachineModel, widths: u32);
+```
+
+declares the alu widths `widths` (encoded like int_widths), each one legal
+under every extension set, in place of any declared before
+
+## fun gate_alu_width
+
+```mach
+pub fun gate_alu_width(m: *MachineModel, bytes: u32, ext: u64);
+```
+
+declares the alu width `bytes`, legal only while the model holds `ext`
+
+## fun alu_width_set
+
+```mach
+pub fun alu_width_set(m: *MachineModel) u32;
+```
+
+the alu widths legal under the model's extensions, encoded like int_widths
+
+## fun alu_min_width
+
+```mach
+pub fun alu_min_width(m: *MachineModel) u32;
+```
+
+the narrowest legal alu width, 0 for a model that declares none
+
+## fun max_alu_width
+
+```mach
+pub fun max_alu_width(m: *MachineModel) u32;
+```
+
+the widest legal alu width, above which legalize splits an operation into
+lanes; 0 for a model that declares none
+
+## fun clamp_alu_width
+
+```mach
+pub fun clamp_alu_width(m: *MachineModel, w: u8) u8;
+```
+
+the width an integer operation of `w` bytes computes at: w itself when it is
+legal, otherwise the narrowest legal width above it, and w again when none is
+(legalize splits it)
 
 ## fun realizes_int_width
 

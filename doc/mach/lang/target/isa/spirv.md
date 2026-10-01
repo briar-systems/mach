@@ -1542,7 +1542,9 @@ storage_write_without_format are the shaderStorageImageReadWithoutFormat and
 shaderStorageImageWriteWithoutFormat features, so a storage image of Unknown
 format may be read or written (#4272). storage_image_multisample is the
 shaderStorageImageMultisample feature, which enables both StorageImageMultisample
-and ImageMSArray, so a storage image may be multisampled, arrayed or not (#4298)
+and ImageMSArray, so a storage image may be multisampled, arrayed or not (#4298).
+int8 and int16 are the Int8 and Int16 capabilities, so an integer of that width
+is computed at its own width rather than carried in a wider one (#4302)
 
 ## val EXT_ZERO_INIT_WORKGROUP
 
@@ -1705,6 +1707,18 @@ pub val EXT_SHARED_FLOAT64_ATOMIC_MIN_MAX: u64 = 0x2000000
 pub val EXT_STORAGE_IMAGE_MULTISAMPLE:     u64 = 0x4000000
 ```
 
+## val EXT_INT8
+
+```mach
+pub val EXT_INT8:                          u64 = 0x8000000
+```
+
+## val EXT_INT16
+
+```mach
+pub val EXT_INT16:                         u64 = 0x10000000
+```
+
 ## val EXT_ATOMICS
 
 ```mach
@@ -1716,7 +1730,7 @@ every atomic feature
 ## val EXTENSION_COUNT
 
 ```mach
-pub val EXTENSION_COUNT: u32 = 27
+pub val EXTENSION_COUNT: u32 = 29
 ```
 
 ## val ONLY_ENVIRONMENT
@@ -1744,6 +1758,7 @@ pub val EXT_OPEN: u64 = EXT_FLOAT16 | EXT_ZERO_INIT_WORKGROUP | EXT_SUBGROUP_ARI
 | EXT_STORAGE_READ_WITHOUT_FORMAT | EXT_STORAGE_WRITE_WITHOUT_FORMAT
 | EXT_SUBGROUP_VOTE | EXT_SUBGROUP_BALLOT | EXT_SUBGROUP_SHUFFLE | EXT_SUBGROUP_SHUFFLE_RELATIVE | EXT_SUBGROUP_QUAD
 | EXT_SUBGROUP_GRAPHICS_STAGES | EXT_ATOMICS | EXT_STORAGE_IMAGE_MULTISAMPLE
+| EXT_INT8 | EXT_INT16
 ```
 
 every extension of the vocabulary, which a module naming no environment holds
@@ -1754,8 +1769,8 @@ every extension of the vocabulary, which a module naming no environment holds
 pub fun env_extensions(id: u32) u64;
 ```
 
-the extensions an environment guarantees: float16 where its ceiling holds
-Float16, and from vulkan1.3 zero_init_workgroup, where the feature is core, and
+the extensions an environment guarantees: float16, int8 and int16 where its
+ceiling holds Float16, Int8 and Int16, and from vulkan1.3 zero_init_workgroup, where the feature is core, and
 the two without-format features, whose capabilities it accepts with none enabled
 
 ## fun env_profile
