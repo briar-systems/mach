@@ -686,7 +686,7 @@ local as it is. Reading an `f16`'s bits with `:~` into a `u16` or `i16` local, o
 back, needs no `int16` either. Without it an `f16` is the software expansion on its 16 bits, which
 computes in binary32 on 32-bit integers, so it needs neither `int64` nor
 `float64` of its own. An `f64` it converts to or from needs `float64` as any
-`f64` does, and `%` needs `int64`, as it does at every float width.
+`f64` does. `%` needs no `int64` at any float width.
 
 Under `int8` and `int16` an integer of that width computes at its own width.
 Without the feature, an integer of that width is carried, wherever it lives in a
