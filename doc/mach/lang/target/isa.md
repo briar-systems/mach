@@ -1774,6 +1774,16 @@ pub rec OpScalar;
 
 a scalar data type by class, width and signedness, such as a handle's sampled type
 
+## rec OpOperandScalar
+
+```mach
+pub rec OpOperandScalar;
+```
+
+the one scalar type an operand must be whatever the row's data type, such as the 32-bit
+float reference a depth comparison takes. `rule` names the rule a refusal cites. static
+data the target owns for the life of the program, like an OpTexelCount
+
 ## rec OpDef
 
 ```mach
@@ -1963,6 +1973,22 @@ pub fun op_derived(d: OpDef, operand: u32) OpDef;
 `d` with its pointer or handle result derived from its operand `operand`: a pointer
 result points into what that pointer operand addresses, a handle result holds the
 descriptor that operand holds
+
+## fun op_scalar_operand
+
+```mach
+pub fun op_scalar_operand(d: OpDef, operand: u32, s: *OpOperandScalar) OpDef;
+```
+
+`d` with its operand `operand` held to the one scalar type `s` states
+
+## fun op_operand_scalar
+
+```mach
+pub fun op_operand_scalar(d: *OpDef, i: u32) *OpOperandScalar;
+```
+
+the scalar type operand `i` of `d` must be, nil when the row fixes none
 
 ## fun op_texel_counted
 

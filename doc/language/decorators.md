@@ -1240,6 +1240,38 @@ fun image_write(img: Target2D, at: i32x2, texel: f32x4);
 #[storage(0, 6, "writeonly")] var target: Target2D;
 ```
 
+A **depth comparison** samples a depth image, one whose `Depth` operand is `1`
+(see [types.md](types.md)), and compares each texel it reads against a reference
+value, an `f32` scalar that follows the coordinate. `OpImageSampleDrefImplicitLod`
+and `OpImageSampleDrefExplicitLod` filter the comparisons into one scalar of the
+image's texel scalar, and `OpImageDrefGather` returns the comparisons of the four
+texels a gather reads. Each takes the `Image Operands` its plain form takes, after
+the reference, under the same rules: the implicit-lod comparison takes `Bias`,
+an offset and `MinLod` and is reached only from a fragment stage, the explicit-lod
+one always takes the mask with `Lod` or `Grad`, and the gather takes an offset or
+`ConstOffsets` and reads only a `2D` or `Cube` image. A comparison of an image
+whose `Depth` is `0` is refused with `op.operand_value`, and so is one of a `3D`
+image, which Vulkan never compares (`VUID-StandaloneSpirv-OpImage-04777`).
+
+```mach fragment
+#[op("spirv", "core", "OpImageSampleDrefImplicitLod")]
+fun shadow(s: ShadowSampler, uv: f32x2, depth: f32) f32;
+
+#[op("spirv", "core", "OpImageSampleDrefExplicitLod")]
+fun shadow_lod(s: ShadowSampler, uv: f32x2, depth: f32, mask: u32, lod: f32) f32;
+
+#[op("spirv", "core", "OpImageDrefGather")]
+fun shadow_gather(s: ShadowSampler, uv: f32x2, depth: f32, mask: u32, offset: i32x2) f32x4;
+```
+
+The projective forms, `OpImageSampleProj*` and `OpImageSampleProjDref*`, have no
+row. Each divides the coordinate, and a comparison's reference, by the
+coordinate's last component before sampling, which a shader writes as that
+division and passes to the plain form: they add no sampling a row here does not
+already give, HLSL, MSL and WGSL have none, and each brings its own refusals (no
+`Cube` image, no arrayed one). A declaration naming one is refused as an
+instruction the target does not define.
+
 `push` binds a **push-constant block**, a small `rec` the host supplies with the
 command that records a dispatch or draw rather than through a descriptor, so it
 takes no arguments: there is no set or binding to name. Like `uniform` and
@@ -1697,6 +1729,8 @@ at the declaration rather than as an invalid module.
 |------|----------|
 | every atomic | the result and each value operand are the pointer's pointee |
 | `OpImageRead`, `OpImageFetch`, `OpImageSample*Lod`, `OpImageGather` | the result is a 4-vector of the image's texel scalar, a sampled image's being its image's |
+| `OpImageSampleDref*Lod` | the result is a scalar of the image's texel scalar, and the reference is an `f32` scalar |
+| `OpImageDrefGather` | the result is a 4-vector of the image's texel scalar, and the reference is an `f32` scalar |
 | `OpImageWrite` | the texel is a scalar or vector of the image's texel scalar, with at least as many components as the image's format stores (any for `Unknown`) |
 | `OpImageTexelPointer` | the result points to the image's texel scalar, into a storage image of `R32ui`, `R32i`, `R32f`, `R64ui` or `R64i` format |
 | `OpSampledImage` | the result is a sampled image composed over the image operand's own type, and the second operand is a `sampler` |
@@ -1712,7 +1746,7 @@ aggregate as their data operand is refused with `op.signature` too.
 
 Each image row names the rule its texel's component count comes from, and the
 refusal quotes it: the 4-vector read result is Vulkan's `VUID-StandaloneSpirv-Result-04780`,
-the 4-vector fetch, sample and gather results are SPIR-V's own, and the write's count against the
+the 4-vector fetch, sample and gather results and the scalar depth-comparison result are SPIR-V's own, and the write's count against the
 format is Vulkan's `VUID-RuntimeSpirv-OpImageWrite-07112`, which spirv-val cannot check
 because it sees no `VkFormat`.
 

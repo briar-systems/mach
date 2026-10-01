@@ -147,7 +147,7 @@ pub val IMAGE_OP_FORMAT:  u32 = 6
 ## val OP_DEF_COUNT
 
 ```mach
-pub val OP_DEF_COUNT:   usize = 102
+pub val OP_DEF_COUNT:   usize = 105
 ```
 
 ## val TYPE_DEF_COUNT
@@ -380,11 +380,26 @@ pub val SAMPLE_TEXEL_COUNT: isa.OpTexelCount = isa.OpTexelCount;
 pub val GATHER_TEXEL_COUNT: isa.OpTexelCount = isa.OpTexelCount;
 ```
 
+## val DREF_TEXEL_COUNT
+
+```mach
+pub val DREF_TEXEL_COUNT:   isa.OpTexelCount = isa.OpTexelCount;
+```
+
 ## val WRITE_TEXEL_COUNT
 
 ```mach
 pub val WRITE_TEXEL_COUNT:  isa.OpTexelCount = isa.OpTexelCount;
 ```
+
+## val DREF_REFERENCE
+
+```mach
+pub val DREF_REFERENCE: isa.OpOperandScalar = isa.OpOperandScalar;
+```
+
+the reference a depth comparison compares each texel against, a 32-bit float whatever the
+image's sampled type
 
 ## rec DefStorage
 
@@ -442,16 +457,24 @@ pub val NO_IMAGE_DIM: u32 = 0xFFFFFFFF
 the dimensionality of an instruction's first operand when it is neither an image nor
 a sampled image of one
 
+## fun is_dref
+
+```mach
+pub fun is_dref(opcode: u32) bool;
+```
+
+whether `opcode` is one of the `OpImage*Dref*` depth comparisons
+
 ## fun image_use_refusal
 
 ```mach
-pub fun image_use_refusal(opcode: u32, image: bool, ms: bool, storage: bool, dim: u32, mask: u32) str;
+pub fun image_use_refusal(opcode: u32, image: bool, ms: bool, storage: bool, dim: u32, depth: bool, mask: u32) str;
 ```
 
 why an image instruction's use is invalid, nil when it is valid: `image` says whether
 its first operand is an image, `ms` whether that image is multisampled, `storage`
-whether it is a storage image and `dim` the dimensionality of the image it is or
-samples (NO_IMAGE_DIM for neither), and `mask` is the Image
-Operands mask it passes, 0 when it passes none. a multisampled image's texel is named
-by its sample, and only a multisampled image has samples
+whether it is a storage image, `dim` the dimensionality of the image it is or
+samples (NO_IMAGE_DIM for neither) and `depth` whether that image is a depth image,
+and `mask` is the Image Operands mask it passes, 0 when it passes none. a multisampled
+image's texel is named by its sample, and only a multisampled image has samples
 
