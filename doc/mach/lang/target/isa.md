@@ -1551,7 +1551,51 @@ pub rec OpTyping;
 the data types a row operates on, read from its operand `operand` (a pointer's
 pointee), and what each needs in each address space. a type no requirement admits in
 any space is refused at the declaration, and one admitted only in other spaces at the
-call. static data the target owns for the life of the program, like an OpEnum
+call. a typing with no requirements admits every type and needs nothing: it only names
+the operand the row's relations are stated against. static data the target owns for
+the life of the program, like an OpEnum
+
+## def OpRelation
+
+```mach
+pub def OpRelation: u8
+```
+
+how an operand's or the result's type relates to the row's data type, the type of its
+typing's operand (a pointer operand's pointee): unrelated, that same type, or a vector
+whose component is the sampled type of the handle the typing's operand is
+
+## val OP_RELATION_NONE
+
+```mach
+pub val OP_RELATION_NONE:  OpRelation = 0
+```
+
+## val OP_RELATION_DATA
+
+```mach
+pub val OP_RELATION_DATA:  OpRelation = 1
+```
+
+## val OP_RELATION_TEXEL
+
+```mach
+pub val OP_RELATION_TEXEL: OpRelation = 2
+```
+
+## val OP_RELATION_COUNT
+
+```mach
+pub val OP_RELATION_COUNT: OpRelation = 3
+```
+
+## rec OpScalar
+
+```mach
+pub rec OpScalar;
+```
+
+a scalar data type by class, width and signedness, such as a handle's sampled type
 
 ## rec OpDef
 
@@ -1593,6 +1637,15 @@ pub def TypeComposeFn: fun(u32, *u32, u32) str
 
 why a composing constructor refuses the handle named as its operand `index`, from
 that handle's own operands, nil when it composes over it
+
+## def TypeSampledFn
+
+```mach
+pub def TypeSampledFn: fun(*u32, u32) OpScalar
+```
+
+the scalar a handle's texels are read and written as, from its operands, class
+OP_DATA_OTHER when it has none
 
 ## val HANDLE_BIND_SAMPLER
 
@@ -1676,6 +1729,31 @@ pub fun op_typed(d: OpDef, t: *OpTyping) OpDef;
 ```
 
 `d` operating on the data types `t` admits, each with its own requirement
+
+## fun op_related
+
+```mach
+pub fun op_related(d: OpDef, result: OpRelation, operands: str) OpDef;
+```
+
+`d` with its result's type related to its data type by `result`, and each operand's by
+one letter of `operands` in order: `-` unrelated, `=` the data type itself, `t` a vector
+of the sampled type of the handle the typing's operand is. a letter outside the set is
+an invalid relation, which registration refuses
+
+## fun op_operand_relation
+
+```mach
+pub fun op_operand_relation(d: *OpDef, i: u32) OpRelation;
+```
+
+## fun op_typing_constrains
+
+```mach
+pub fun op_typing_constrains(t: *OpTyping) bool;
+```
+
+whether `t` holds the row's data type to requirements, rather than only naming its operand
 
 ## fun op_type_requirement
 
@@ -1788,6 +1866,15 @@ pub fun type_def_binding(td: *TypeDef, ops: *u32, n: u32) u32;
 ```
 
 the role a handle of constructor `td` with operands `ops` binds through
+
+## fun type_def_sampled
+
+```mach
+pub fun type_def_sampled(td: *TypeDef, ops: *u32, n: u32) OpScalar;
+```
+
+the scalar texels of a handle of constructor `td` with operands `ops` are, class
+OP_DATA_OTHER when the constructor declares none
 
 ## fun target_defs
 
