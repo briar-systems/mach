@@ -111,7 +111,12 @@ The names are the selected isa's vocabulary and nothing else:
   `image_gather_extended`, `maintenance8`, `image_int64_atomics`, `image_float32_atomics`,
   `image_float32_atomic_add`, `image_float32_atomic_min_max`, `vulkan_memory_model`,
   `vulkan_memory_model_device_scope`, `int8`, `int16`, `buffer_device_address`, `int64`,
-  `float64`.
+  `float64`, `buffer_float16_atomics`, `buffer_float16_atomic_add`,
+  `buffer_float16_atomic_min_max`, `shared_float16_atomics`, `shared_float16_atomic_add`,
+  `shared_float16_atomic_min_max`, `storage_buffer_16bit_access`,
+  `uniform_and_storage_buffer_16bit_access`, `storage_push_constant16`,
+  `storage_input_output16`, `storage_buffer_8bit_access`,
+  `uniform_and_storage_buffer_8bit_access`, `storage_push_constant8`.
 
 A name the selected isa does not declare is a compile error, never a silent 0, as
 `$mach.arch.*` refuses an unknown architecture:

@@ -18,6 +18,10 @@ pub val MAX_STRUCT_MEMBERS: u32 = 16
 pub rec TypeTable;
 ```
 
+`storage_only` is set while a type is built for host-shared memory, where an 8- or
+16-bit scalar is declared under its storage access capability: a request then raises
+no Int8, Int16 or Float16, which every other request of the width does (#4299)
+
 ## fun types_init
 
 ```mach
