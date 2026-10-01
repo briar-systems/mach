@@ -216,7 +216,7 @@ way the target realizes the shape:
 | x86-64 without `f16c` | each lane's scalar `f16` operation | each lane's scalar comparison |
 | riscv64, riscv32 | each lane's scalar `f16` operation (no vector unit) | each lane's scalar comparison |
 | spirv with `float16` | the core float instructions on an `f16` vector | the same |
-| spirv without `float16` (`vulkan1.0`, `vulkan1.1`) | each lane's scalar `f16` operation | each lane's scalar comparison |
+| spirv without `float16` | each lane's scalar `f16` operation | each lane's scalar comparison |
 
 A lane's scalar operation is the target's own half instruction where it has one
 and the inline expansion otherwise (see
