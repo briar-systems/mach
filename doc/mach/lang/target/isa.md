@@ -2217,8 +2217,8 @@ pub rec Environment;
 ```
 
 an execution environment an isa defines: its name, its profile, and the
-extensions of the isa's vocabulary it guarantees (spirv's `float16` from
-vulkan1.2)
+extensions of the isa's vocabulary it guarantees (spirv's `zero_init_workgroup`
+from vulkan1.3)
 
 ## val ENV_NONE
 

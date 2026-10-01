@@ -1546,8 +1546,8 @@ storage class the row itself declares, as `OpImageTexelPointer` returns an `Imag
 pointer, and that result is accepted as a later instruction's pointer operand. A
 row whose result is a **truth value**, such as `OpGroupNonUniformElect`, is declared
 returning an integer, which receives 1 or 0. A `bool` return is an 8-bit integer,
-which a module may hold only where the environment has Int8 (from `vulkan1.2`), so
-below that a truth result is declared `u32` and compared, as in `elect(3) == 1`.
+which a target without `int8` carries at 32 bits like any other 8-bit local
+([manifest.md](manifest.md#finished-module-targets)), so the module needs no Int8 for it.
 
 ```mach
 #[op("spirv", "core", "OpControlBarrier")]

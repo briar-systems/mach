@@ -108,7 +108,7 @@ never a call:
 | riscv with `zfhmin` | binary32 through `fcvt.s.h` and `fcvt.h.s` | binary32 through `fcvt.s.h` |
 | riscv with `zfh` | native (`fadd.h`, `fsub.h`, `fmul.h`, `fdiv.h`) | native (`feq.h`, `flt.h`, `fle.h`) |
 | spirv with `float16` | native, the core float instructions on `OpTypeFloat 16` | native |
-| spirv without `float16` (`vulkan1.0`, `vulkan1.1`) | binary64, the conversions inline | binary64, the widening inline |
+| spirv without `float16` | binary64, the conversions inline | binary64, the widening inline |
 
 aarch64 without `fp16` computes in binary64 even though `fcvt` converts to
 binary32, because that conversion quiets a signaling operand and the half unit

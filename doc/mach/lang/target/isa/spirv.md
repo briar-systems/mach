@@ -1326,7 +1326,9 @@ capabilities in CEILING_DOMAIN, and every capability needs its SPIR-V version an
 when `extension` is not nil, the SPIR-V extension that defines it, which the module
 then declares with OpExtension. `graphics` is the extension a use from a vertex or
 fragment stage needs beyond what the use itself names, 0 when every stage has the
-capability alike
+capability alike. `feature` is the device feature a type's capability needs under an
+environment, whose ceiling only admits it (#4318), 0 for a capability raised by a use,
+which names its own
 
 ## val NEED_INT8
 
@@ -1679,8 +1681,11 @@ maintenance8 feature, under which a fetch or a sample takes a run-time offset to
 vulkan_memory_model is the vulkanMemoryModel feature, and holding it selects the
 Vulkan memory model in place of GLSL450. vulkan_memory_model_device_scope is
 vulkanMemoryModelDeviceScope, which the Device scope needs under that model (#4308).
-int8 and int16 are the Int8 and Int16 capabilities, so an integer of that width
-is computed at its own width rather than carried in a wider one (#4302).
+int8, int16, int64, float16 and float64 are the shaderInt8, shaderInt16, shaderInt64,
+shaderFloat16 and shaderFloat64 features, which no Vulkan version guarantees: an
+environment's ceiling only admits their capabilities (#4318). under int8 and int16 an
+integer of that width is computed at its own width rather than carried in a wider
+one (#4302), and under float16 an f16 is the native OpTypeFloat 16 (#3801)
 buffer_device_address is the bufferDeviceAddress feature, under which a pointer held in
 memory is a physical pointer into a buffer the host passes by address (#4307)
 
@@ -1919,6 +1924,18 @@ pub val EXT_INT16:                            u64 = 0x2000000000
 pub val EXT_BUFFER_DEVICE_ADDRESS:            u64 = 0x4000000000
 ```
 
+## val EXT_INT64
+
+```mach
+pub val EXT_INT64:                            u64 = 0x8000000000
+```
+
+## val EXT_FLOAT64
+
+```mach
+pub val EXT_FLOAT64:                          u64 = 0x10000000000
+```
+
 ## val EXT_ATOMICS
 
 ```mach
@@ -1931,19 +1948,13 @@ every atomic feature
 ## val EXTENSION_COUNT
 
 ```mach
-pub val EXTENSION_COUNT: u32 = 39
-```
-
-## val ONLY_ENVIRONMENT
-
-```mach
-pub val ONLY_ENVIRONMENT: str = "it is a capability the target's `env` guarantees for the whole module"
+pub val EXTENSION_COUNT: u32 = 41
 ```
 
 ## val ONLY_DEVICE
 
 ```mach
-pub val ONLY_DEVICE:      str = "it is a device feature the consumer enables for the whole module"
+pub val ONLY_DEVICE: str = "it is a device feature the consumer enables for the whole module"
 ```
 
 ## val EXTENSIONS
@@ -1960,7 +1971,7 @@ pub val EXT_OPEN: u64 = EXT_FLOAT16 | EXT_ZERO_INIT_WORKGROUP | EXT_SUBGROUP_ARI
 | EXT_SUBGROUP_VOTE | EXT_SUBGROUP_BALLOT | EXT_SUBGROUP_SHUFFLE | EXT_SUBGROUP_SHUFFLE_RELATIVE | EXT_SUBGROUP_QUAD
 | EXT_SUBGROUP_GRAPHICS_STAGES | EXT_ATOMICS | EXT_STORAGE_IMAGE_MULTISAMPLE | EXT_RESOURCE_MIN_LOD
 | EXT_IMAGE_GATHER_EXTENDED | EXT_MAINTENANCE8 | EXT_VULKAN_MEMORY_MODEL | EXT_VULKAN_MEMORY_MODEL_DEVICE_SCOPE
-| EXT_INT8 | EXT_INT16 | EXT_BUFFER_DEVICE_ADDRESS
+| EXT_INT8 | EXT_INT16 | EXT_BUFFER_DEVICE_ADDRESS | EXT_INT64 | EXT_FLOAT64
 ```
 
 every extension of the vocabulary, which a module naming no environment holds
@@ -1971,11 +1982,11 @@ every extension of the vocabulary, which a module naming no environment holds
 pub fun env_extensions(id: u32) u64;
 ```
 
-the extensions an environment guarantees: float16, int8 and int16 where its
-ceiling holds Float16, Int8 and Int16, and from vulkan1.3 zero_init_workgroup, where the feature is core, the
-two without-format features, whose capabilities it accepts with none enabled, and
-the two memory model features and buffer device address, which vulkan1.3 requires of
-every device
+the extensions an environment guarantees: from vulkan1.3 zero_init_workgroup, where
+the feature is core, the two without-format features, whose capabilities it accepts
+with none enabled, and the two memory model features and buffer device address, which
+vulkan1.3 requires of every device. no version guarantees a type's feature, which its
+ceiling only admits
 
 ## fun env_profile
 
