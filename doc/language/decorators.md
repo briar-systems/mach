@@ -1051,6 +1051,10 @@ location carries. The accepted set is closed:
 | `"workgroup_id"`           | compute workgroup id                   | `u32x3` | read      | compute  |
 | `"num_workgroups"`         | compute workgroup count of a dispatch  | `u32x3` | read      | compute  |
 | `"local_invocation_index"` | compute local invocation id, flattened | `u32`   | read      | compute  |
+| `"subgroup_size"`          | invocations in a subgroup              | `u32`   | read      | every    |
+| `"subgroup_invocation"`    | the invocation's index in its subgroup | `u32`   | read      | every    |
+| `"subgroup_id"`            | the subgroup's index in its workgroup  | `u32`   | read      | compute  |
+| `"num_subgroups"`          | subgroups in the workgroup             | `u32`   | read      | compute  |
 
 The direction is a property of the built-in, not something you restate — a stage
 writes its position and reads what the pipeline hands it — so there is no
@@ -1063,13 +1067,16 @@ other type is a compile error naming both the declared type and the required one
 The scalar integer rows accept `i32` as well as `u32`, because the compiler carries
 an integer's width and not its sign and the emitted type is sign-less either way.
 
-The **stage** is a property of the built-in as well. Each row exists in one stage
-only, in its direction: the pipeline supplies an input built-in to that execution
-model alone and consumes an output one from it alone, so `position` and
-`point_size` are a vertex stage's outputs, `frag_coord` is a fragment stage's
-input, and the five compute rows are the `GLCompute` execution model's. A stage
-that uses a built-in outside its row, directly or through a function it calls, is
-a compile error naming the built-in and both stages.
+The **stage** is a property of the built-in as well. Each row exists in the stages
+SPIR-V defines it in, in its direction: the pipeline supplies an input built-in to
+those execution models alone and consumes an output one from them alone, so
+`position` and `point_size` are a vertex stage's outputs, `frag_coord` is a
+fragment stage's input, the seven compute rows are the `GLCompute` execution
+model's, and `subgroup_size` and `subgroup_invocation` are every stage's, decorated
+`Flat` as a fragment stage's integer inputs. A stage that uses a built-in outside
+its row, directly or through a function it calls, is a compile error naming the
+built-in and both stages. The four subgroup built-ins need SPIR-V 1.3, and outside
+a compute stage the `subgroup_graphics_stages` feature, as the subgroup operations do.
 
 `uniform` binds a read-only block by descriptor set and binding. Its type **must
 be a `rec`**: a uniform is a block with a host-visible layout, and a bare scalar
@@ -1454,6 +1461,7 @@ selected the declaration's types are checked against both:
 | pointer update  | the argument's address, read and written (read-modify-write) | a pointer     |
 | handle read     | a handle whose memory the instruction reads, such as a storage image's texels | a handle |
 | handle write    | a handle whose memory the instruction writes                | a handle       |
+| truth value     | a predicate the instruction takes as SPIR-V's boolean, true where the argument is nonzero | an integer |
 
 A **pointer operand takes its storage class from the call site**: the argument's
 own access chain decides whether it points into a storage buffer, workgroup memory,
@@ -1472,7 +1480,11 @@ A non-constant argument to a constant id or a literal is refused at the call,
 naming the operand. A row **without a result** is declared with no return type,
 and a row with one must return it. A row may also **return a pointer** into a
 storage class the row itself declares, as `OpImageTexelPointer` returns an `Image`
-pointer, and that result is accepted as a later instruction's pointer operand.
+pointer, and that result is accepted as a later instruction's pointer operand. A
+row whose result is a **truth value**, such as `OpGroupNonUniformElect`, is declared
+returning an integer, which receives 1 or 0. A `bool` return is an 8-bit integer,
+which a module may hold only where the environment has Int8 (from `vulkan1.2`), so
+below that a truth result is declared `u32` and compared, as in `elect(3) == 1`.
 
 ```mach
 #[op("spirv", "core", "OpControlBarrier")]
@@ -1542,6 +1554,38 @@ consumer enables it, since no environment guarantees it: `subgroup_arithmetic` i
 Vulkan's `VK_SUBGROUP_FEATURE_ARITHMETIC_BIT`, and a target naming no `env` holds
 every extension. A module declares a capability only when something it emits needs
 it, with `OpExtension` for a capability a SPIR-V extension defines.
+
+The **subgroup operations** are the `OpGroupNonUniform*` rows, each taking the
+Subgroup scope (3) as its first operand. Every one needs SPIR-V 1.3, so `vulkan1.1`
+or later, and each family needs its capability and the feature Vulkan reports it by:
+
+| Family            | Rows                                                         | Feature                     |
+|-------------------|--------------------------------------------------------------|-----------------------------|
+| basic             | `Elect`                                                      | none: every vulkan1.1 device |
+| vote              | `All`, `Any`, `AllEqual`                                     | `subgroup_vote`             |
+| arithmetic        | `IAdd`, `FAdd`, `IMul`, `FMul`, `SMin`, `UMin`, `FMin`, `SMax`, `UMax`, `FMax`, `BitwiseAnd`, `BitwiseOr`, `BitwiseXor`, `LogicalAnd`, `LogicalOr`, `LogicalXor` with `Reduce` or a scan | `subgroup_arithmetic` |
+| clustered         | the same rows with `ClusteredReduce` and a ClusterSize       | `subgroup_clustered`        |
+| ballot            | `Ballot`, `InverseBallot`, `BallotBitExtract`, `BallotBitCount`, `BallotFindLSB`, `BallotFindMSB`, `Broadcast`, `BroadcastFirst` | `subgroup_ballot` |
+| shuffle           | `Shuffle`, `ShuffleXor`                                      | `subgroup_shuffle`          |
+| relative shuffle  | `ShuffleUp`, `ShuffleDown`                                   | `subgroup_shuffle_relative` |
+| quad              | `QuadBroadcast`, `QuadSwap`                                  | `subgroup_quad`             |
+
+`BallotBitCount` takes a `GroupOperation` too, which its ballot capability covers
+and which has no clustered form. `Broadcast`'s lane, `QuadBroadcast`'s index and
+`QuadSwap`'s direction are constant ids, which every SPIR-V version accepts. Vulkan
+guarantees subgroup operations only in compute stages, so a use reached from a
+vertex or fragment stage, an operation or a subgroup built-in alike, also needs
+`subgroup_graphics_stages`, the device's `subgroupSupportedStages`.
+
+```mach
+use std.types.bool.bool;
+
+#[op("spirv", "core", "OpGroupNonUniformBallot")]
+pub fun subgroup_ballot(scope: u32, predicate: bool) u32x4;
+
+#[op("spirv", "core", "OpGroupNonUniformShuffleXor")]
+pub fun subgroup_shuffle_xor(scope: u32, v: u32, mask: u32) u32;
+```
 
 `OpExtInstImport "GLSL.std.450"` is emitted **once per module and only when that
 module uses the set**. A module that calls none of these carries no import.
