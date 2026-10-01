@@ -12,6 +12,9 @@ pub val NO_BLOCK: u32 = 0xFFFFFFFF
 pub val CK_PLAIN:     u8 = 0
 ```
 
+the construct a node heads: a two-way selection, a loop, or a switch, which
+branches to one of any number of successors and merges like a selection
+
 ## val CK_SELECTION
 
 ```mach
@@ -24,11 +27,25 @@ pub val CK_SELECTION: u8 = 1
 pub val CK_LOOP:      u8 = 2
 ```
 
+## val CK_SWITCH
+
+```mach
+pub val CK_SWITCH:    u8 = 3
+```
+
 ## val ROLE_REAL
 
 ```mach
 pub val ROLE_REAL:        u8 = 0
 ```
+
+what a node executes. a real node is its MIR block, whose terminator's block
+operands are its successors in operand order. a split node carries the
+terminator of the loop header it was split from, below the header's merge.
+continue and forward nodes branch to their one successor. an exit node stores
+its `case` into the selector of its `dispatch` node and branches to it, and a
+dispatch node branches to the successor its stored case names. nothing reaches
+an unreachable node
 
 ## val ROLE_CONTINUE
 
@@ -42,16 +59,28 @@ pub val ROLE_CONTINUE:    u8 = 1
 pub val ROLE_UNREACHABLE: u8 = 2
 ```
 
+## val ROLE_SPLIT
+
+```mach
+pub val ROLE_SPLIT:       u8 = 3
+```
+
 ## val ROLE_FORWARD
 
 ```mach
 pub val ROLE_FORWARD:     u8 = 4
 ```
 
-## val ROLE_SPLIT
+## val ROLE_EXIT
 
 ```mach
-pub val ROLE_SPLIT:       u8 = 3
+pub val ROLE_EXIT:        u8 = 5
+```
+
+## val ROLE_DISPATCH
+
+```mach
+pub val ROLE_DISPATCH:    u8 = 6
 ```
 
 ## val CFG_OK
@@ -78,18 +107,6 @@ pub val CFG_UNREACHABLE:   u8 = 2
 pub val CFG_MULTIWAY:      u8 = 3
 ```
 
-## val CFG_LOOP_MERGE
-
-```mach
-pub val CFG_LOOP_MERGE:    u8 = 4
-```
-
-## val CFG_MERGE_CLAIMED
-
-```mach
-pub val CFG_MERGE_CLAIMED: u8 = 5
-```
-
 ## val CFG_CROSSING_EDGE
 
 ```mach
@@ -114,6 +131,14 @@ pub rec Node;
 pub rec Structure;
 ```
 
+## fun succ
+
+```mach
+pub fun succ(st: *Structure, x: u32, k: u32) u32;
+```
+
+successor k of node x, for k below its nsucc
+
 ## fun analyze
 
 ```mach
@@ -126,11 +151,31 @@ pub fun analyze(mf: *mir.MirFunction, alloc: *A.Allocator) res[Structure, fail.F
 pub fun dnit(st: *Structure);
 ```
 
-## fun status_message
+## fun analyze_module
 
 ```mach
-pub fun status_message(status: u8) str;
+pub fun analyze_module(m: *mir.MirModule, alloc: *A.Allocator) res[*Structure, fail.Fail];
 ```
+
+the structure of every function of a MIR module, in function order. a
+function the target cannot structure carries its refusal in its status, which
+the emitter reports where it emits that function
+
+## fun dnit_module
+
+```mach
+pub fun dnit_module(shapes: *Structure, n: u32, alloc: *A.Allocator);
+```
+
+releases the first n structures of an analyze_module result and the array
+
+## fun refusal_text
+
+```mach
+pub fun refusal_text(alloc: *A.Allocator, name: str, status: u8, target: str) res[str, format.FormatError];
+```
+
+the refusal a function with this status is rejected by, prefixed with its name
 
 ## fun dominates
 

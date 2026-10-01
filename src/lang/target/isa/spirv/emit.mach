@@ -9,7 +9,6 @@ use std.types.size.usize;
 use std.types.string;
 use std.types.string.str;
 use std.types.string.str_equals;
-use std.types.string.str_join;
 use std.types.string.str_len;
 
 use std.allocator.page;
@@ -4493,12 +4492,11 @@ fun emit_function(e: *Emit, cx: u32) err[fail.Fail] {
     }
     or (!e.has_entry && e.fns[fx].mi == e.u.root && copy_is_primary(e, cx)) { emit_linkage_export(e, fn_id, fn_name); }
 
-    val cr: res[structure.Structure, fail.Fail] = structure.analyze(mf, e.alloc);
-    if (sel cr.err) { ret err[fail.Fail].err{cr.err}; }
-    var st: structure.Structure = cr.ok;
+    val shapes: *structure.Structure = e.u.mods[e.fns[fx].mi].shapes;
+    if (shapes == nil) { ret emit_fail(e, "spirv.emit: the unit reached the emitter without its control-flow structure"); }
+    val st: *structure.Structure = ?shapes[e.fns[fx].mir_ix];
     if (st.status != structure.CFG_OK) {
-        val msg: str = cfg_refusal(e, fn_name, ?st);
-        structure.dnit(?st);
+        val msg: str = cfg_refusal(e, fn_name, st);
         ret err[fail.Fail].err{reject_at(e, dkind.SPIRV_CONTROL_FLOW, mf.decl_loc, msg)};
     }
 
@@ -4525,10 +4523,7 @@ fun emit_function(e: *Emit, cx: u32) err[fail.Fail] {
     }
 
     val rl: res[*u32, A.Error] = A.allocate[u32](e.alloc, st.count::usize);
-    if (sel rl.err) {
-        structure.dnit(?st);
-        ret err[fail.Fail].err{fail.refused(rl.err)};
-    }
+    if (sel rl.err) { ret err[fail.Fail].err{fail.refused(rl.err)}; }
     val labels: *u32 = rl.ok;
     var li:     u32  = 0;
     for (li < st.count) {
@@ -4551,8 +4546,19 @@ fun emit_function(e: *Emit, cx: u32) err[fail.Fail] {
     if (sel mr.err) {
         vmaps_dnit(e, ?vm);
         A.deallocate[u32](e.alloc, labels, st.count::usize);
-        structure.dnit(?st);
         ret mr;
+    }
+    # a dispatch reads the case its exits stored in a variable of its own
+    var selectors: *u32 = nil;
+    if (has_dispatch(st)) {
+        val rv: res[*u32, A.Error] = A.allocate[u32](e.alloc, st.count::usize);
+        if (sel rv.err) {
+            vmaps_dnit(e, ?vm);
+            A.deallocate[u32](e.alloc, labels, st.count::usize);
+            ret err[fail.Fail].err{fail.refused(rv.err)};
+        }
+        selectors = rv.ok;
+        declare_selectors(e, st, selectors);
     }
     use_at(e, mf.decl_loc);
 
@@ -4567,7 +4573,7 @@ fun emit_function(e: *Emit, cx: u32) err[fail.Fail] {
     var oi: u32 = 0;
     if (sel body.err) { oi = st.count; }
     for (oi < st.count) {
-        body = emit_node(e, mf, ?st, st.order[oi], oi == 0 && !zeroing, labels, ?vm, returns_void, ret_ty);
+        body = emit_node(e, mf, st, st.order[oi], oi == 0 && !zeroing, labels, selectors, ?vm, returns_void, ret_ty);
         if (sel body.err) {
             oi = st.count;
             cnt;
@@ -4580,8 +4586,8 @@ fun emit_function(e: *Emit, cx: u32) err[fail.Fail] {
 
     vmaps_dnit(e, ?vm);
     A.deallocate[u32](e.alloc, labels, st.count::usize);
-    structure.dnit(?st);
-    if (sel body.err) { ret body; }
+    if (selectors != nil) { A.deallocate[u32](e.alloc, selectors, st.count::usize); }
+    if (sel body.err)     { ret body; }
 
     spirv.inst(e.b, ?e.b.functions, spirv.OP_FUNCTION_END, nil, 0);
     if (e.b.err) { ret err[fail.Fail].err{fail.message("spirv.emit: module builder hit an allocation error")}; }
@@ -4636,8 +4642,8 @@ fun defining_instr(mf: *mir.MirFunction, vreg: u32) *mir.MirInstr {
 }
 
 fun cfg_refusal(e: *Emit, name: str, st: *structure.Structure) str {
-    val reason: str                       = structure.status_message(st.status);
-    val jr:     res[str, string.StrError] = str_join(e.alloc, "", name, ": ", reason);
+    val reason: str                          = "this function's control flow has no structured form";
+    val jr:     res[str, format.FormatError] = structure.refusal_text(e.alloc, name, st.status, e.tgt.identity.arch_name);
     if (sel jr.err) { ret reason; }
     val buf: str                        = jr.ok;
     val ir:  res[intern.StrId, A.Error] = intern.intern(e.interner, buf);
@@ -4648,8 +4654,38 @@ fun cfg_refusal(e: *Emit, name: str, st: *structure.Structure) str {
     ret io.some;
 }
 
+fun has_dispatch(st: *structure.Structure) bool {
+    var i: u32 = st.real;
+    for (i < st.count) {
+        if (st.nodes[i].role == structure.ROLE_DISPATCH) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# one Function variable per dispatch, in the function's first block with the
+# other variables
+fun declare_selectors(e: *Emit, st: *structure.Structure, selectors: *u32) {
+    val ty:     u32 = types.type_int(e.tt, 32);
+    val ptr_ty: u32 = types.type_ptr(e.tt, spirv.STORAGE_FUNCTION, ty);
+    var i:      u32 = 0;
+    for (i < st.count) {
+        selectors[i] = 0;
+        if (st.nodes[i].role == structure.ROLE_DISPATCH) {
+            val id:  u32 = spirv.alloc_id(e.b);
+            var vop: [3]u32;
+            vop[0] = ptr_ty;
+            vop[1] = id;
+            vop[2] = spirv.STORAGE_FUNCTION;
+            spirv.inst(e.b, ?e.b.functions, spirv.OP_VARIABLE, ?vop[0], 3);
+            selectors[i] = id;
+        }
+        i = i + 1;
+    }
+}
+
 fun emit_node(e: *Emit, mf: *mir.MirFunction, st: *structure.Structure, ix: u32, is_entry: bool,
-    labels: *u32, vm: *VMaps, returns_void: bool, ret_ty: u32) err[fail.Fail] {
+    labels: *u32, selectors: *u32, vm: *VMaps, returns_void: bool, ret_ty: u32) err[fail.Fail] {
     if (!is_entry) {
         var lb: [1]u32;
         lb[0] = labels[ix];
@@ -4663,7 +4699,19 @@ fun emit_node(e: *Emit, mf: *mir.MirFunction, st: *structure.Structure, ix: u32,
         ret err[fail.Fail].ok{};
     }
     if (role == structure.ROLE_CONTINUE || role == structure.ROLE_FORWARD) {
-        emit_branch(e, labels[st.nodes[ix].succ0]);
+        emit_branch(e, labels[structure.succ(st, ix, 0)]);
+        ret err[fail.Fail].ok{};
+    }
+    if (role == structure.ROLE_EXIT) {
+        var so: [2]u32;
+        so[0] = selectors[st.nodes[ix].dispatch];
+        so[1] = types.const_scalar(e.tt, types.type_int(e.tt, 32), st.nodes[ix].case, 0);
+        spirv.inst(e.b, ?e.b.functions, spirv.OP_STORE, ?so[0], 2);
+        emit_branch(e, labels[structure.succ(st, ix, 0)]);
+        ret err[fail.Fail].ok{};
+    }
+    if (role == structure.ROLE_DISPATCH) {
+        emit_dispatch(e, st, ix, labels, selectors);
         ret err[fail.Fail].ok{};
     }
 
@@ -4690,12 +4738,44 @@ fun emit_merge(e: *Emit, st: *structure.Structure, ix: u32, labels: *u32) {
         spirv.inst(e.b, ?e.b.functions, spirv.OP_LOOP_MERGE, ?lm[0], 3);
         ret;
     }
-    if (st.nodes[ix].kind == structure.CK_SELECTION) {
+    if (st.nodes[ix].kind == structure.CK_SELECTION || st.nodes[ix].kind == structure.CK_SWITCH) {
         var sm: [2]u32;
         sm[0] = labels[st.nodes[ix].merge];
         sm[1] = spirv.SELECTION_CONTROL_NONE;
         spirv.inst(e.b, ?e.b.functions, spirv.OP_SELECTION_MERGE, ?sm[0], 2);
     }
+}
+
+# a switch over the case the dispatch's exits stored: the first successor is the
+# default, and case k branches to successor k
+fun emit_dispatch(e: *Emit, st: *structure.Structure, ix: u32, labels: *u32, selectors: *u32) {
+    val ty:     u32 = types.type_int(e.tt, 32);
+    val chosen: u32 = spirv.alloc_id(e.b);
+    var lo:     [3]u32;
+    lo[0] = ty;
+    lo[1] = chosen;
+    lo[2] = selectors[ix];
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_LOAD, ?lo[0], 3);
+    emit_merge(e, st, ix, labels);
+
+    val n:  u32                = st.nodes[ix].nsucc;
+    val wn: u32                = 2 + (n - 1) * 2;
+    val ra: res[*u32, A.Error] = A.allocate[u32](e.alloc, wn::usize);
+    if (sel ra.err) {
+        e.b.err = true;
+        ret;
+    }
+    val ops: *u32 = ra.ok;
+    ops[0] = chosen;
+    ops[1] = labels[structure.succ(st, ix, 0)];
+    var k: u32 = 1;
+    for (k < n) {
+        ops[2 + (k - 1) * 2]     = k;
+        ops[2 + (k - 1) * 2 + 1] = labels[structure.succ(st, ix, k)];
+        k                        = k + 1;
+    }
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_SWITCH, ops, wn);
+    A.deallocate[u32](e.alloc, ops, wn::usize);
 }
 
 fun emit_branch(e: *Emit, label: u32) {
@@ -4720,7 +4800,7 @@ fun emit_terminator(e: *Emit, mf: *mir.MirFunction, st: *structure.Structure, ix
 
     if (term.opcode == mir.MIR_BR) {
         emit_merge(e, st, ix, labels);
-        emit_branch(e, labels[st.nodes[ix].succ0]);
+        emit_branch(e, labels[structure.succ(st, ix, 0)]);
         ret err[fail.Fail].ok{};
     }
     if (term.opcode == mir.MIR_CBR) {
@@ -4729,8 +4809,8 @@ fun emit_terminator(e: *Emit, mf: *mir.MirFunction, st: *structure.Structure, ix
         emit_merge(e, st, ix, labels);
         var bc: [3]u32;
         bc[0] = cond;
-        bc[1] = labels[st.nodes[ix].succ0];
-        bc[2] = labels[st.nodes[ix].succ1];
+        bc[1] = labels[structure.succ(st, ix, 0)];
+        bc[2] = labels[structure.succ(st, ix, 1)];
         spirv.inst(e.b, ?e.b.functions, spirv.OP_BRANCH_CONDITIONAL, ?bc[0], 3);
         ret err[fail.Fail].ok{};
     }
