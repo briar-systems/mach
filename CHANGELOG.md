@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The spirv `image` handle constructor takes a required seventh operand, the Image Format, which `OpTypeImage` carries. The six-operand form is no longer accepted: `#[handle("spirv", "image", ...)]` with six operands is a compile error, and adding `0` (`Unknown`) as the seventh keeps the image it declared before. This ships as a minor because mach-shader is the only consumer and moves in lockstep (#4272).
+
+### Added
+- Storage images and texel buffers on spirv. An `image` handle whose `Sampled` operand is `2` is a storage image, bound through `#[storage(set, binding)]` with the `"readonly"`, `"writeonly"` and `"coherent"` qualifiers a buffer takes, and every other handle keeps `#[sampler]`. `OpImageRead` and `OpImageWrite` are `#[op]` rows whose image is a handle operand, so a write to a `"readonly"` image and a read of a `"writeonly"` one are refused. A `Buffer` image is a uniform (`Sampled` `1`) or storage (`Sampled` `2`) texel buffer. The format declares `StorageImageExtendedFormats` outside the base set, and an `Unknown` storage image is read and written under `StorageImageReadWithoutFormat` and `StorageImageWriteWithoutFormat`, which `vulkan1.3` accepts and an earlier `env` accepts through the new `storage_read_without_format` and `storage_write_without_format` extensions (#4272).
+
 ## [6.8.0] - 2026-09-30
 
 ### Added
