@@ -858,6 +858,23 @@ pub fun intern_handle(ti: *TypeInterner, name: intern.StrId, ctor: u32, ops: *u3
 pub fun is_handle(ti: *TypeInterner, tid: TypeId) bool;
 ```
 
+## fun carries_handle
+
+```mach
+pub fun carries_handle(ti: *TypeInterner, tid: TypeId) bool;
+```
+
+a handle, or a pointer, array or secret over one: every shape that places a handle
+where the program would own its storage
+
+## fun handle_in_array
+
+```mach
+pub fun handle_in_array(ti: *TypeInterner, tid: TypeId) bool;
+```
+
+an array whose elements carry a handle, reached directly or through a pointer or secret
+
 ## fun intern_abi_type
 
 ```mach

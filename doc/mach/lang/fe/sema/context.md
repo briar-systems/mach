@@ -424,6 +424,12 @@ pub val TEMPLATE_TRAIL_LABEL: str = "in this generic body, checked against this 
 pub fun report(sc: *SemaContext, k: dkind.Kind, span: token.Span, message: str);
 ```
 
+## fun check_handle_in_array
+
+```mach
+pub fun check_handle_in_array(sc: *SemaContext, ty: type.TypeId, span: token.Span);
+```
+
 ## fun report_internal
 
 ```mach
