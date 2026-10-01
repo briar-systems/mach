@@ -679,8 +679,9 @@ without `env` has all five. The ceiling below still bounds them, so `int8` or
 Under `float16` an `f16` is the native `OpTypeFloat 16`, computed and converted by
 the core float instructions, and a stage input or output of `f16` is declared as
 that type. Without it an `f16` is the software expansion on its 16 bits, which
-computes on 64-bit integers and floats, so under an `env` it needs `int64` and
-`float64`.
+computes in binary32 on 32-bit integers, so it needs neither `int64` nor
+`float64` of its own. An `f64` it converts to or from needs `float64` as any
+`f64` does, and `%` needs `int64`, as it does at every float width.
 
 Under `int8` and `int16` an integer of that width computes at its own width.
 Without the feature, an integer of that width is carried, wherever it lives in a
