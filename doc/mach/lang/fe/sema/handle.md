@@ -48,6 +48,12 @@ pub fun decorator_of(sc: *context.SemaContext, d: *decl.Decl) *decl.Decorator;
 pub fun arg_is_type(sc: *context.SemaContext, dec: *decl.Decorator, index: u32) bool;
 ```
 
+## val MAX_COMPOSE_DEPTH
+
+```mach
+pub val MAX_COMPOSE_DEPTH: u32 = 8
+```
+
 ## fun read
 
 ```mach

@@ -189,49 +189,55 @@ pub val ARITHMETIC_GROUP_OPERATION: isa.OpEnum = isa.OpEnum;
 ## val IMAGE_OPERANDS_BIAS
 
 ```mach
-pub val IMAGE_OPERANDS_BIAS:         u32 = 0x1
+pub val IMAGE_OPERANDS_BIAS:          u32 = 0x1
 ```
 
 ## val IMAGE_OPERANDS_LOD
 
 ```mach
-pub val IMAGE_OPERANDS_LOD:          u32 = 0x2
+pub val IMAGE_OPERANDS_LOD:           u32 = 0x2
 ```
 
 ## val IMAGE_OPERANDS_GRAD
 
 ```mach
-pub val IMAGE_OPERANDS_GRAD:         u32 = 0x4
+pub val IMAGE_OPERANDS_GRAD:          u32 = 0x4
 ```
 
 ## val IMAGE_OPERANDS_CONST_OFFSET
 
 ```mach
-pub val IMAGE_OPERANDS_CONST_OFFSET: u32 = 0x8
+pub val IMAGE_OPERANDS_CONST_OFFSET:  u32 = 0x8
 ```
 
 ## val IMAGE_OPERANDS_OFFSET
 
 ```mach
-pub val IMAGE_OPERANDS_OFFSET:       u32 = 0x10
+pub val IMAGE_OPERANDS_OFFSET:        u32 = 0x10
+```
+
+## val IMAGE_OPERANDS_CONST_OFFSETS
+
+```mach
+pub val IMAGE_OPERANDS_CONST_OFFSETS: u32 = 0x20
 ```
 
 ## val IMAGE_OPERANDS_SAMPLE
 
 ```mach
-pub val IMAGE_OPERANDS_SAMPLE:       u32 = 0x40
+pub val IMAGE_OPERANDS_SAMPLE:        u32 = 0x40
 ```
 
 ## val IMAGE_OPERANDS_MIN_LOD
 
 ```mach
-pub val IMAGE_OPERANDS_MIN_LOD:      u32 = 0x80
+pub val IMAGE_OPERANDS_MIN_LOD:       u32 = 0x80
 ```
 
 ## val IMAGE_OPERANDS_OFFSETS
 
 ```mach
-pub val IMAGE_OPERANDS_OFFSETS: u32 = IMAGE_OPERANDS_CONST_OFFSET | IMAGE_OPERANDS_OFFSET
+pub val IMAGE_OPERANDS_OFFSETS: u32 = IMAGE_OPERANDS_CONST_OFFSET | IMAGE_OPERANDS_OFFSET | IMAGE_OPERANDS_CONST_OFFSETS
 ```
 
 the bits that offset a coordinate, of which an instruction takes one
@@ -338,6 +344,41 @@ pub val SUBGROUP_VALUE:        isa.OpTyping = isa.OpTyping;
 pub val GROUP_OPERATION_VALUE: isa.OpTyping = isa.OpTyping;
 ```
 
+## val READ_TEXEL_COUNT
+
+```mach
+pub val READ_TEXEL_COUNT:   isa.OpTexelCount = isa.OpTexelCount;
+```
+
+how many components each image instruction's texel has. a read's result is a 4-vector in
+Vulkan, a fetch's, a sample's and a gather's in every environment, and a write's texel needs at
+least the components its image's format stores, which spirv-val cannot see: the format
+is matched to a VkFormat only when the descriptor is bound
+
+## val FETCH_TEXEL_COUNT
+
+```mach
+pub val FETCH_TEXEL_COUNT:  isa.OpTexelCount = isa.OpTexelCount;
+```
+
+## val SAMPLE_TEXEL_COUNT
+
+```mach
+pub val SAMPLE_TEXEL_COUNT: isa.OpTexelCount = isa.OpTexelCount;
+```
+
+## val GATHER_TEXEL_COUNT
+
+```mach
+pub val GATHER_TEXEL_COUNT: isa.OpTexelCount = isa.OpTexelCount;
+```
+
+## val WRITE_TEXEL_COUNT
+
+```mach
+pub val WRITE_TEXEL_COUNT:  isa.OpTexelCount = isa.OpTexelCount;
+```
+
 ## rec DefStorage
 
 ```mach
@@ -376,13 +417,14 @@ an offset added to its coordinate, and each derivative of it, has
 ## fun image_operand_shape_refusal
 
 ```mach
-pub fun image_operand_shape_refusal(bit: u32, dim: u32, float: bool, components: u32) str;
+pub fun image_operand_shape_refusal(bit: u32, dim: u32, float: bool, components: u32, elements: u32) str;
 ```
 
 why the operands the Image Operands bit `bit` brings do not fit an image of `dim`, nil
 when they do: each is a `float` (else integer) scalar or vector of `components`
-components. an offset or a derivative has one component per dimension of the image's
-coordinate, and a least level of detail is one float
+components, or an array of `elements` of them (0 for none). an offset or a derivative
+has one component per dimension of the image's coordinate, a least level of detail is
+one float, and only a gather's four offsets are an array
 
 ## val NO_IMAGE_DIM
 
