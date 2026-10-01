@@ -1552,7 +1552,10 @@ extension, and under GLSL450 the `QueueFamily` scope and the `MakeAvailable`,
 `MakeVisible` and `Volatile` semantics need `vulkan_memory_model` (see
 [manifest.md](manifest.md#finished-module-targets)). An atomic's scope and semantics
 are held the same way. The execution scope is not, since a Vulkan barrier executes
-at `Workgroup` or `Subgroup` only.
+at `Workgroup` or `Subgroup` only. `SequentiallyConsistent` semantics are refused under
+either model, since Vulkan defines no sequentially consistent order
+(VUID-StandaloneSpirv-MemorySemantics-10866): use `Acquire`, `Release` or
+`AcquireRelease`.
 
 A control barrier must be reached in **uniform control flow**: every
 invocation of its execution scope executes it, or none does. That is the
