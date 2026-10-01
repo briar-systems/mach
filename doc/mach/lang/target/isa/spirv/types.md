@@ -44,6 +44,15 @@ pub fun composite_count(tt: *TypeTable, id: u32) u32;
 
 how many members, elements or lanes the composite `id` has, 0 when it is none or a runtime array
 
+## fun holds_pointer
+
+```mach
+pub fun holds_pointer(tt: *TypeTable, id: u32, storage: u32) bool;
+```
+
+whether a value of the type holds a pointer of storage class `storage`, which has no
+null constant
+
 ## fun logically_match
 
 ```mach
@@ -166,6 +175,23 @@ pub fun type_is_opaque(tt: *TypeTable, id: u32) bool;
 ```mach
 pub fun type_ptr(tt: *TypeTable, storage: u32, pointee: u32) u32;
 ```
+
+## fun type_ptr_at
+
+```mach
+pub fun type_ptr_at(tt: *TypeTable, id: u32, storage: u32, pointee: u32) u32;
+```
+
+declares the pointer `id` reserved for a record a cycle of pointers reaches, once the
+record is declared, so a later request for the same pointer finds it
+
+## fun type_forward_pointer
+
+```mach
+pub fun type_forward_pointer(tt: *TypeTable, id: u32, storage: u32);
+```
+
+names the pointer `id` before its record is declared, for a member of that record's cycle
 
 ## fun pointer_shape
 
