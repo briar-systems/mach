@@ -427,6 +427,12 @@ array. A generic record, union or tag is refused a type argument that would put 
 in one of its fields or payloads, directly or behind a pointer, array or secret, since
 that instance is a record holding a handle.
 
+A pointer to a handle is the address of its binding, and that is the only indirection
+a handle takes. A pointer to a pointer to a handle, or any deeper chain, is refused in
+every annotation (a parameter, a result, a local, a field or a type argument), since
+the inner pointer would be one the program stores and may reassign, so the handle
+would trace to no binding.
+
 `$size_of` a handle is the target's pointer size: it is a name for a resource, and
 a pointer is the shape every target already has for that. On a target that mints no
 such type the declaration is **inert**: it still denotes a type and still sizes, and
