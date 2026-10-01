@@ -21,6 +21,34 @@ arg_count: u32,
 span: token.Span) bool;
 ```
 
+## def Agreement
+
+```mach
+pub def Agreement: u8
+```
+
+how two storages compare on secrecy: they agree, they disagree, or the
+comparison would follow pointers into an expansive generic, whose instances
+are unbounded, so it cannot be decided and is refused
+
+## val AGREE
+
+```mach
+pub val AGREE:       Agreement = 0
+```
+
+## val DISAGREE
+
+```mach
+pub val DISAGREE:    Agreement = 1
+```
+
+## val UNDECIDABLE
+
+```mach
+pub val UNDECIDABLE: Agreement = 2
+```
+
 ## fun check_annotation_uni_secrecy
 
 ```mach
@@ -100,7 +128,7 @@ the byte offset of a record field or tag payload from the same checked layout th
 ## fun secrecy_cast_allowed
 
 ```mach
-pub fun secrecy_cast_allowed(s: *session.Session, m: layout.Machine, from: type.TypeId, to: type.TypeId) res[bool, fail.Fail];
+pub fun secrecy_cast_allowed(s: *session.Session, m: layout.Machine, from: type.TypeId, to: type.TypeId) res[Agreement, fail.Fail];
 ```
 
 whether a `::` or `:~` from `from` to `to` keeps every byte's secrecy class
@@ -108,10 +136,22 @@ whether a `::` or `:~` from `from` to `to` keeps every byte's secrecy class
 ## fun secrecy_overlay_agrees
 
 ```mach
-pub fun secrecy_overlay_agrees(s: *session.Session, m: layout.Machine, a: type.TypeId, b: type.TypeId) res[bool, fail.Fail];
+pub fun secrecy_overlay_agrees(s: *session.Session, m: layout.Machine, a: type.TypeId, b: type.TypeId) res[Agreement, fail.Fail];
 ```
 
 whether two union variants overlaying one storage agree on every byte they share
+
+## val UNBOUNDED_VARIANTS_MSG
+
+```mach
+pub val UNBOUNDED_VARIANTS_MSG: str = "union variants: cannot prove that overlapping fields agree on secrecy - they point into a generic whose argument grows through a pointer, which has unboundedly many instances, so the storage below the pointers cannot be compared"
+```
+
+## val UNBOUNDED_CAST_MSG
+
+```mach
+pub val UNBOUNDED_CAST_MSG:     str = "cast: cannot prove that the two types agree on secrecy - they point into a generic whose argument grows through a pointer, which has unboundedly many instances, so the storage below the pointers cannot be compared"
+```
 
 ## fun module_reaches_secret
 
@@ -124,4 +164,23 @@ pub fun module_reaches_secret(s: *session.Session, resolved: *type.TypeId, len: 
 ```mach
 pub fun contains_tag_value(s: *session.Session, tid: type.TypeId) res[bool, fail.Fail];
 ```
+
+## fun holds_expansive_instance
+
+```mach
+pub fun holds_expansive_instance(s: *session.Session, tid: type.TypeId) res[bool, fail.Fail];
+```
+
+whether `tid` holds, by value, an instance of a generic whose argument grows
+through a pointer, so its instances are unbounded
+
+## fun mark_expansive
+
+```mach
+pub fun mark_expansive(s: *session.Session) err[fail.Fail];
+```
+
+decides every generic the program instantiates (see ExpGraph) and records the
+decisions on the type store, for a consumer that follows pointers to cut at
+the expansive ones
 
