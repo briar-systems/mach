@@ -276,7 +276,7 @@ comptime member, `$mach.build.extensions.<name>` (see [`$mach`](comptime-mach.md
 | `x86_64` | SSE2 | `ssse3`, `sse41`, `sse42`, `sha`, `fsgsbase`, `popcnt`, `lzcnt`, `bmi1`, `bmi2`, `cx16`, `avx`, `avx2`, `fma`, `movbe`, `f16c`, `avx512f`, `avx512bw`, `avx512cd`, `avx512dq`, `avx512vl`, `aes`, `pclmul` |
 | `aarch64` | AdvSIMD | `sha2`, `sb`, `aes`, `pmull`, `fp16` |
 | `riscv64`, `riscv32` | the isa string's selection | `i`, `m`, `a`, `f`, `d`, `c`, `zicond`, `zicsr`, `zifencei`, `zfhmin`, `zfh`, `zkt` |
-| `spirv` | | `float16`, which `env` selects; `zero_init_workgroup`, `storage_read_without_format` and `storage_write_without_format`, which `vulkan1.3` selects; the atomic device features `buffer_int64_atomics`, `shared_int64_atomics` and `buffer_*` / `shared_*` `float16_atomics`, `float16_atomic_add`, `float16_atomic_min_max` and the same for `float32` and `float64` ([decorators.md](decorators.md#optarget-set-name--a-function-that-is-a-target-instruction)) |
+| `spirv` | | `float16`, which `env` selects; `zero_init_workgroup`, `storage_read_without_format` and `storage_write_without_format`, which `vulkan1.3` selects; the atomic device features `buffer_int64_atomics`, `shared_int64_atomics` and `buffer_*` / `shared_*` `float32_atomics`, `float32_atomic_add`, `float32_atomic_min_max` and the same for `float64` ([decorators.md](decorators.md#optarget-set-name--a-function-that-is-a-target-instruction)) |
 
 A name the selected isa does not hold is refused when the target resolves, with the
 names it does hold:

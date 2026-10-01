@@ -1522,7 +1522,9 @@ pub rec OpTypeRequirement;
 
 one data type a typed row admits in one of the target's address spaces (NO_OP_SPACE
 for every space), and what a use of it there needs: the target's capability word
-(NO_OP_CAPABILITY for none) and the extensions of the isa's vocabulary
+(NO_OP_CAPABILITY for none) and the extensions of the isa's vocabulary. `refused`,
+when not nil, is why the target cannot emit the type yet, and the declaration is
+refused with it
 
 ## rec OpTyping
 

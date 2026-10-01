@@ -101,7 +101,7 @@ The names are the selected isa's vocabulary and nothing else:
   `zfhmin`, `zfh`, `zkt`;
 - `spirv`: `float16`, `zero_init_workgroup`, `storage_read_without_format`,
   `storage_write_without_format`, and the atomic device features
-  `buffer_int64_atomics`, `shared_int64_atomics` and `{buffer,shared}_float{16,32,64}_atomics`,
+  `buffer_int64_atomics`, `shared_int64_atomics` and `{buffer,shared}_float{32,64}_atomics`,
   `_atomic_add` and `_atomic_min_max`.
 
 A name the selected isa does not declare is a compile error, never a silent 0, as
