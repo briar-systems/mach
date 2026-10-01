@@ -329,8 +329,15 @@ pub val ATOMIC_FLOAT_MIN_MAX: isa.OpTyping = isa.OpTyping;
 pub val FIRST_OPERAND:         isa.OpTyping = isa.OpTyping;
 ```
 
-the operand an untyped row's relations are stated against, holding its type to nothing:
-the first for a math instruction or an image's handle, the value for a subgroup operation
+the operand an untyped row's relations are stated against: the first for an image's
+handle, holding its type to nothing, and the first for a math instruction and the value for
+a subgroup operation, each a scalar or vector of integers or floats
+
+## val MATH_OPERAND
+
+```mach
+pub val MATH_OPERAND:          isa.OpTyping = isa.OpTyping;
+```
 
 ## val SUBGROUP_VALUE
 
