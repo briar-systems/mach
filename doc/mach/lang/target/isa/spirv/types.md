@@ -105,6 +105,41 @@ pub fun logically_match(tt: *TypeTable, a: u32, b: u32) bool;
 pub fun type_int(tt: *TypeTable, bits: u32) u32;
 ```
 
+## fun type_int_signed
+
+```mach
+pub fun type_int_signed(tt: *TypeTable, bits: u32) u32;
+```
+
+an integer whose Signedness is 1. every integer the module computes on is unsigned, and
+only the sampled type of an image of a signed format, and the values its instructions
+read and write, are signed (VUID-StandaloneSpirv-Image-04965)
+
+## fun signed_twin
+
+```mach
+pub fun signed_twin(tt: *TypeTable, id: u32) u32;
+```
+
+`id`, an integer scalar or vector, with its components signed, 0 when it is no integer
+
+## fun signed_twins
+
+```mach
+pub fun signed_twins(tt: *TypeTable, a: u32, b: u32) bool;
+```
+
+whether `a` is a signed integer scalar or vector that `b` is the unsigned form of, the
+same width and component count. it declares no type
+
+## fun type_is_signed
+
+```mach
+pub fun type_is_signed(tt: *TypeTable, id: u32) bool;
+```
+
+whether `id` is a signed integer scalar or vector
+
 ## fun type_float
 
 ```mach
