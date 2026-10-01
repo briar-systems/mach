@@ -1634,6 +1634,20 @@ holds them all. The integer atomics are `OpAtomicLoad`, `OpAtomicStore`,
 | a type the row admits only in other storage classes    | `spirv.capability`, naming the class |
 | a type whose feature the target does not select        | `spirv.capability`, naming the feature |
 
+A row also states how its operands' types and its result's **relate** to the type it
+operates on, the type of the one operand its typing reads (a pointer's pointee). A
+declaration that breaks a relation is refused with `op.signature`, naming both the
+parameter (or the return type) and the operand it relates to, so a mismatch is caught
+at the declaration rather than as an invalid module.
+
+| Rows | Relation |
+|------|----------|
+| every atomic | the result and each value operand are the pointer's pointee |
+| `OpImageRead`, `OpImageFetch`, `OpImageWrite` | the texel, the result or the last operand, is a vector of the image's texel scalar |
+| `OpGroupNonUniformBroadcast*`, `Shuffle*`, `Quad*` and the arithmetic rows | the result is the value operand's type |
+| the GLSL.std.450 math rows | the result and every operand are the first operand's type, except `Refract`'s `eta`, and `Length` and `Distance`, whose result is a scalar |
+| `OpDot` | the second vector is the first's type |
+
 
 The **subgroup operations** are the `OpGroupNonUniform*` rows, each taking the
 Subgroup scope (3) as its first operand. Every one needs SPIR-V 1.3, so `vulkan1.1`
