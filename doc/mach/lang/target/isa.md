@@ -1591,6 +1591,12 @@ pub val NO_OP_SPACE: u32 = 0xFFFFFFFF
 pub val NO_OP_CAPABILITY: u32 = 0xFFFFFFFF
 ```
 
+## val NO_OP_SOURCE
+
+```mach
+pub val NO_OP_SOURCE: u32 = 0xFFFFFFFF
+```
+
 ## rec OpEnumerant
 
 ```mach
@@ -1650,9 +1656,7 @@ pub rec OpTypeRequirement;
 
 one data type a typed row admits in one of the target's address spaces (NO_OP_SPACE
 for every space), and what a use of it there needs: the target's capability word
-(NO_OP_CAPABILITY for none) and the extensions of the isa's vocabulary. `refused`,
-when not nil, is why the target cannot emit the type yet, and the declaration is
-refused with it
+(NO_OP_CAPABILITY for none) and the extensions of the isa's vocabulary
 
 ## rec OpTyping
 
@@ -1942,6 +1946,16 @@ pub fun op_confined(d: OpDef) OpDef;
 ```
 
 `d` with its result consumed only by another row's operand in the block that produces it
+
+## fun op_derived
+
+```mach
+pub fun op_derived(d: OpDef, operand: u32) OpDef;
+```
+
+`d` with its pointer or handle result derived from its operand `operand`: a pointer
+result points into what that pointer operand addresses, a handle result holds the
+descriptor that operand holds
 
 ## fun op_texel_counted
 
