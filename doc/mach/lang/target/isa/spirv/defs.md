@@ -135,7 +135,7 @@ pub val IMAGE_OP_FORMAT:  u32 = 6
 ## val OP_DEF_COUNT
 
 ```mach
-pub val OP_DEF_COUNT:   usize = 68
+pub val OP_DEF_COUNT:   usize = 101
 ```
 
 ## val TYPE_DEF_COUNT
@@ -172,6 +172,12 @@ pub val GROUP_OPERATION_CLUSTERED_REDUCE: u32 = 3
 
 ```mach
 pub val ARITHMETIC_GROUP_OPERATION: isa.OpEnum = isa.OpEnum;
+```
+
+## val BALLOT_GROUP_OPERATION
+
+```mach
+pub val BALLOT_GROUP_OPERATION: isa.OpEnum = isa.OpEnum;
 ```
 
 ## val ATOMIC_INTEGER

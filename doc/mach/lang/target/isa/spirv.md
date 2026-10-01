@@ -854,6 +854,206 @@ pub val OP_RETURN_VALUE:              u32 = 254
 pub val OP_UNREACHABLE:               u32 = 255
 ```
 
+## val OP_GROUP_NON_UNIFORM_ELECT
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_ELECT:              u32 = 333
+```
+
+the non-uniform subgroup instructions beside OpGroupNonUniformIAdd
+
+## val OP_GROUP_NON_UNIFORM_ALL
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_ALL:                u32 = 334
+```
+
+## val OP_GROUP_NON_UNIFORM_ANY
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_ANY:                u32 = 335
+```
+
+## val OP_GROUP_NON_UNIFORM_ALL_EQUAL
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_ALL_EQUAL:          u32 = 336
+```
+
+## val OP_GROUP_NON_UNIFORM_BROADCAST
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_BROADCAST:          u32 = 337
+```
+
+## val OP_GROUP_NON_UNIFORM_BROADCAST_FIRST
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_BROADCAST_FIRST:    u32 = 338
+```
+
+## val OP_GROUP_NON_UNIFORM_BALLOT
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_BALLOT:             u32 = 339
+```
+
+## val OP_GROUP_NON_UNIFORM_INVERSE_BALLOT
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_INVERSE_BALLOT:     u32 = 340
+```
+
+## val OP_GROUP_NON_UNIFORM_BALLOT_BIT_EXTRACT
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_BALLOT_BIT_EXTRACT: u32 = 341
+```
+
+## val OP_GROUP_NON_UNIFORM_BALLOT_BIT_COUNT
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_BALLOT_BIT_COUNT:   u32 = 342
+```
+
+## val OP_GROUP_NON_UNIFORM_BALLOT_FIND_LSB
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_BALLOT_FIND_LSB:    u32 = 343
+```
+
+## val OP_GROUP_NON_UNIFORM_BALLOT_FIND_MSB
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_BALLOT_FIND_MSB:    u32 = 344
+```
+
+## val OP_GROUP_NON_UNIFORM_SHUFFLE
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_SHUFFLE:            u32 = 345
+```
+
+## val OP_GROUP_NON_UNIFORM_SHUFFLE_XOR
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_SHUFFLE_XOR:        u32 = 346
+```
+
+## val OP_GROUP_NON_UNIFORM_SHUFFLE_UP
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_SHUFFLE_UP:         u32 = 347
+```
+
+## val OP_GROUP_NON_UNIFORM_SHUFFLE_DOWN
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_SHUFFLE_DOWN:       u32 = 348
+```
+
+## val OP_GROUP_NON_UNIFORM_F_ADD
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_F_ADD:              u32 = 350
+```
+
+## val OP_GROUP_NON_UNIFORM_I_MUL
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_I_MUL:              u32 = 351
+```
+
+## val OP_GROUP_NON_UNIFORM_F_MUL
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_F_MUL:              u32 = 352
+```
+
+## val OP_GROUP_NON_UNIFORM_S_MIN
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_S_MIN:              u32 = 353
+```
+
+## val OP_GROUP_NON_UNIFORM_U_MIN
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_U_MIN:              u32 = 354
+```
+
+## val OP_GROUP_NON_UNIFORM_F_MIN
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_F_MIN:              u32 = 355
+```
+
+## val OP_GROUP_NON_UNIFORM_S_MAX
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_S_MAX:              u32 = 356
+```
+
+## val OP_GROUP_NON_UNIFORM_U_MAX
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_U_MAX:              u32 = 357
+```
+
+## val OP_GROUP_NON_UNIFORM_F_MAX
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_F_MAX:              u32 = 358
+```
+
+## val OP_GROUP_NON_UNIFORM_BITWISE_AND
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_BITWISE_AND:        u32 = 359
+```
+
+## val OP_GROUP_NON_UNIFORM_BITWISE_OR
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_BITWISE_OR:         u32 = 360
+```
+
+## val OP_GROUP_NON_UNIFORM_BITWISE_XOR
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_BITWISE_XOR:        u32 = 361
+```
+
+## val OP_GROUP_NON_UNIFORM_LOGICAL_AND
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_LOGICAL_AND:        u32 = 362
+```
+
+## val OP_GROUP_NON_UNIFORM_LOGICAL_OR
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_LOGICAL_OR:         u32 = 363
+```
+
+## val OP_GROUP_NON_UNIFORM_LOGICAL_XOR
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_LOGICAL_XOR:        u32 = 364
+```
+
+## val OP_GROUP_NON_UNIFORM_QUAD_BROADCAST
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_QUAD_BROADCAST:     u32 = 365
+```
+
+## val OP_GROUP_NON_UNIFORM_QUAD_SWAP
+
+```mach
+pub val OP_GROUP_NON_UNIFORM_QUAD_SWAP:          u32 = 366
+```
+
 ## val CAP_SHADER
 
 ```mach
@@ -974,34 +1174,64 @@ pub val CAP_GROUP_NON_UNIFORM_ARITHMETIC: u32 = 63
 pub val CAP_GROUP_NON_UNIFORM_CLUSTERED:  u32 = 67
 ```
 
+## val CAP_GROUP_NON_UNIFORM_VOTE
+
+```mach
+pub val CAP_GROUP_NON_UNIFORM_VOTE:             u32 = 62
+```
+
+## val CAP_GROUP_NON_UNIFORM_BALLOT
+
+```mach
+pub val CAP_GROUP_NON_UNIFORM_BALLOT:           u32 = 64
+```
+
+## val CAP_GROUP_NON_UNIFORM_SHUFFLE
+
+```mach
+pub val CAP_GROUP_NON_UNIFORM_SHUFFLE:          u32 = 65
+```
+
+## val CAP_GROUP_NON_UNIFORM_SHUFFLE_RELATIVE
+
+```mach
+pub val CAP_GROUP_NON_UNIFORM_SHUFFLE_RELATIVE: u32 = 66
+```
+
+## val CAP_GROUP_NON_UNIFORM_QUAD
+
+```mach
+pub val CAP_GROUP_NON_UNIFORM_QUAD:             u32 = 68
+```
+
 ## val CAP_INT64_ATOMICS
 
 ```mach
-pub val CAP_INT64_ATOMICS:          u32 = 12
+pub val CAP_INT64_ATOMICS:                      u32 = 12
 ```
 
 ## val CAP_ATOMIC_FLOAT32_MIN_MAX
 
 ```mach
-pub val CAP_ATOMIC_FLOAT32_MIN_MAX: u32 = 5612
+pub val CAP_ATOMIC_FLOAT32_MIN_MAX:             u32 = 5612
 ```
 
 ## val CAP_ATOMIC_FLOAT64_MIN_MAX
 
 ```mach
-pub val CAP_ATOMIC_FLOAT64_MIN_MAX: u32 = 5613
+pub val CAP_ATOMIC_FLOAT64_MIN_MAX:             u32 = 5613
 ```
 
 ## val CAP_ATOMIC_FLOAT32_ADD
 
 ```mach
-pub val CAP_ATOMIC_FLOAT32_ADD:     u32 = 6033
+pub val CAP_ATOMIC_FLOAT32_ADD:                 u32 = 6033
 ```
 
 ## val CAP_ATOMIC_FLOAT64_ADD
 
 ```mach
-pub val CAP_ATOMIC_FLOAT64_ADD:     u32 = 6034
+pub val CAP_ATOMIC_FLOAT64_ADD:                 u32 = 6034
 ```
 
 ## rec Capability
@@ -1016,150 +1246,182 @@ value or an operand's type. `need` is its bit in Builder.caps_needed and the tab
 order is the order the module declares them in. an environment's ceiling decides the
 capabilities in CEILING_DOMAIN, and every capability needs its SPIR-V version and,
 when `extension` is not nil, the SPIR-V extension that defines it, which the module
-then declares with OpExtension
+then declares with OpExtension. `graphics` is the extension a use from a vertex or
+fragment stage needs beyond what the use itself names, 0 when every stage has the
+capability alike
 
 ## val NEED_INT8
 
 ```mach
-pub val NEED_INT8:                         u64 = 0x001
+pub val NEED_INT8:                               u64 = 0x001
 ```
 
 ## val NEED_INT16
 
 ```mach
-pub val NEED_INT16:                        u64 = 0x002
+pub val NEED_INT16:                              u64 = 0x002
 ```
 
 ## val NEED_INT64
 
 ```mach
-pub val NEED_INT64:                        u64 = 0x004
+pub val NEED_INT64:                              u64 = 0x004
 ```
 
 ## val NEED_FLOAT16
 
 ```mach
-pub val NEED_FLOAT16:                      u64 = 0x008
+pub val NEED_FLOAT16:                            u64 = 0x008
 ```
 
 ## val NEED_FLOAT64
 
 ```mach
-pub val NEED_FLOAT64:                      u64 = 0x010
+pub val NEED_FLOAT64:                            u64 = 0x010
 ```
 
 ## val NEED_SAMPLED_1D
 
 ```mach
-pub val NEED_SAMPLED_1D:                   u64 = 0x020
+pub val NEED_SAMPLED_1D:                         u64 = 0x020
 ```
 
 ## val NEED_SAMPLED_CUBE_ARRAY
 
 ```mach
-pub val NEED_SAMPLED_CUBE_ARRAY:           u64 = 0x040
+pub val NEED_SAMPLED_CUBE_ARRAY:                 u64 = 0x040
 ```
 
 ## val NEED_GROUP_NON_UNIFORM
 
 ```mach
-pub val NEED_GROUP_NON_UNIFORM:            u64 = 0x080
+pub val NEED_GROUP_NON_UNIFORM:                  u64 = 0x080
 ```
 
 ## val NEED_GROUP_NON_UNIFORM_ARITHMETIC
 
 ```mach
-pub val NEED_GROUP_NON_UNIFORM_ARITHMETIC: u64 = 0x100
+pub val NEED_GROUP_NON_UNIFORM_ARITHMETIC:       u64 = 0x100
 ```
 
 ## val NEED_GROUP_NON_UNIFORM_CLUSTERED
 
 ```mach
-pub val NEED_GROUP_NON_UNIFORM_CLUSTERED:  u64 = 0x200
+pub val NEED_GROUP_NON_UNIFORM_CLUSTERED:        u64 = 0x200
 ```
 
 ## val NEED_IMAGE_1D
 
 ```mach
-pub val NEED_IMAGE_1D:                     u64 = 0x400
+pub val NEED_IMAGE_1D:                           u64 = 0x400
 ```
 
 ## val NEED_IMAGE_CUBE_ARRAY
 
 ```mach
-pub val NEED_IMAGE_CUBE_ARRAY:             u64 = 0x800
+pub val NEED_IMAGE_CUBE_ARRAY:                   u64 = 0x800
 ```
 
 ## val NEED_SAMPLED_BUFFER
 
 ```mach
-pub val NEED_SAMPLED_BUFFER:               u64 = 0x1000
+pub val NEED_SAMPLED_BUFFER:                     u64 = 0x1000
 ```
 
 ## val NEED_IMAGE_BUFFER
 
 ```mach
-pub val NEED_IMAGE_BUFFER:                 u64 = 0x2000
+pub val NEED_IMAGE_BUFFER:                       u64 = 0x2000
 ```
 
 ## val NEED_STORAGE_EXTENDED_FORMATS
 
 ```mach
-pub val NEED_STORAGE_EXTENDED_FORMATS:     u64 = 0x4000
+pub val NEED_STORAGE_EXTENDED_FORMATS:           u64 = 0x4000
 ```
 
 ## val NEED_IMAGE_QUERY
 
 ```mach
-pub val NEED_IMAGE_QUERY:                  u64 = 0x8000
+pub val NEED_IMAGE_QUERY:                        u64 = 0x8000
 ```
 
 ## val NEED_READ_WITHOUT_FORMAT
 
 ```mach
-pub val NEED_READ_WITHOUT_FORMAT:          u64 = 0x10000
+pub val NEED_READ_WITHOUT_FORMAT:                u64 = 0x10000
 ```
 
 ## val NEED_WRITE_WITHOUT_FORMAT
 
 ```mach
-pub val NEED_WRITE_WITHOUT_FORMAT:         u64 = 0x20000
+pub val NEED_WRITE_WITHOUT_FORMAT:               u64 = 0x20000
+```
+
+## val NEED_GROUP_NON_UNIFORM_VOTE
+
+```mach
+pub val NEED_GROUP_NON_UNIFORM_VOTE:             u64 = 0x40000
+```
+
+## val NEED_GROUP_NON_UNIFORM_BALLOT
+
+```mach
+pub val NEED_GROUP_NON_UNIFORM_BALLOT:           u64 = 0x80000
+```
+
+## val NEED_GROUP_NON_UNIFORM_SHUFFLE
+
+```mach
+pub val NEED_GROUP_NON_UNIFORM_SHUFFLE:          u64 = 0x100000
+```
+
+## val NEED_GROUP_NON_UNIFORM_SHUFFLE_RELATIVE
+
+```mach
+pub val NEED_GROUP_NON_UNIFORM_SHUFFLE_RELATIVE: u64 = 0x200000
+```
+
+## val NEED_GROUP_NON_UNIFORM_QUAD
+
+```mach
+pub val NEED_GROUP_NON_UNIFORM_QUAD:             u64 = 0x400000
 ```
 
 ## val NEED_INT64_ATOMICS
 
 ```mach
-pub val NEED_INT64_ATOMICS:                u64 = 0x40000
+pub val NEED_INT64_ATOMICS:          u64 = 0x800000
 ```
 
 ## val NEED_ATOMIC_FLOAT32_ADD
 
 ```mach
-pub val NEED_ATOMIC_FLOAT32_ADD:           u64 = 0x80000
+pub val NEED_ATOMIC_FLOAT32_ADD:     u64 = 0x1000000
 ```
 
 ## val NEED_ATOMIC_FLOAT64_ADD
 
 ```mach
-pub val NEED_ATOMIC_FLOAT64_ADD:           u64 = 0x100000
+pub val NEED_ATOMIC_FLOAT64_ADD:     u64 = 0x2000000
 ```
 
 ## val NEED_ATOMIC_FLOAT32_MIN_MAX
 
 ```mach
-pub val NEED_ATOMIC_FLOAT32_MIN_MAX:       u64 = 0x200000
+pub val NEED_ATOMIC_FLOAT32_MIN_MAX: u64 = 0x4000000
 ```
 
 ## val NEED_ATOMIC_FLOAT64_MIN_MAX
 
 ```mach
-pub val NEED_ATOMIC_FLOAT64_MIN_MAX:       u64 = 0x400000
+pub val NEED_ATOMIC_FLOAT64_MIN_MAX: u64 = 0x8000000
 ```
 
 ## val CAPABILITY_COUNT
 
 ```mach
-pub val CAPABILITY_COUNT: u32 = 23
+pub val CAPABILITY_COUNT: u32 = 28
 ```
 
 ## val SPV_EXT_ATOMIC_FLOAT_ADD
@@ -1247,9 +1509,11 @@ catalog's rows, the instruction rows and the emitter read. float16 is the
 Float16 capability, so f16 is the native OpTypeFloat 16 (#3801).
 zero_init_workgroup is the shaderZeroInitializeWorkgroupMemory feature, so a
 `#[shared]` variable takes an OpConstantNull initializer instead of the zeroing
-the compiler inserts (#4270). subgroup_arithmetic and subgroup_clustered are
-the ARITHMETIC and CLUSTERED bits of Vulkan's subgroupSupportedOperations,
-which no Vulkan version guarantees. storage_read_without_format and
+the compiler inserts (#4270). the subgroup_ family are the VOTE, ARITHMETIC,
+BALLOT, SHUFFLE, SHUFFLE_RELATIVE, CLUSTERED and QUAD bits of Vulkan's
+subgroupSupportedOperations, which no Vulkan version guarantees, and
+subgroup_graphics_stages is subgroupSupportedStages reaching the vertex and
+fragment stages, where Vulkan guarantees only compute. storage_read_without_format and
 storage_write_without_format are the shaderStorageImageReadWithoutFormat and
 shaderStorageImageWriteWithoutFormat features, so a storage image of Unknown
 format may be read or written (#4272)
@@ -1284,10 +1548,46 @@ pub val EXT_STORAGE_READ_WITHOUT_FORMAT:  u64 = 0x10
 pub val EXT_STORAGE_WRITE_WITHOUT_FORMAT: u64 = 0x20
 ```
 
+## val EXT_SUBGROUP_VOTE
+
+```mach
+pub val EXT_SUBGROUP_VOTE:                u64 = 0x40
+```
+
+## val EXT_SUBGROUP_BALLOT
+
+```mach
+pub val EXT_SUBGROUP_BALLOT:              u64 = 0x80
+```
+
+## val EXT_SUBGROUP_SHUFFLE
+
+```mach
+pub val EXT_SUBGROUP_SHUFFLE:             u64 = 0x100
+```
+
+## val EXT_SUBGROUP_SHUFFLE_RELATIVE
+
+```mach
+pub val EXT_SUBGROUP_SHUFFLE_RELATIVE:    u64 = 0x200
+```
+
+## val EXT_SUBGROUP_QUAD
+
+```mach
+pub val EXT_SUBGROUP_QUAD:                u64 = 0x400
+```
+
+## val EXT_SUBGROUP_GRAPHICS_STAGES
+
+```mach
+pub val EXT_SUBGROUP_GRAPHICS_STAGES:     u64 = 0x800
+```
+
 ## val EXT_BUFFER_INT64_ATOMICS
 
 ```mach
-pub val EXT_BUFFER_INT64_ATOMICS:          u64 = 0x40
+pub val EXT_BUFFER_INT64_ATOMICS:          u64 = 0x1000
 ```
 
 the atomic features of VkPhysicalDeviceShaderAtomicInt64Features,
@@ -1298,79 +1598,79 @@ each named for its shaderBuffer* or shaderShared* member: an atomic on a type be
 ## val EXT_SHARED_INT64_ATOMICS
 
 ```mach
-pub val EXT_SHARED_INT64_ATOMICS:          u64 = 0x80
+pub val EXT_SHARED_INT64_ATOMICS:          u64 = 0x2000
 ```
 
 ## val EXT_BUFFER_FLOAT32_ATOMICS
 
 ```mach
-pub val EXT_BUFFER_FLOAT32_ATOMICS:        u64 = 0x100
+pub val EXT_BUFFER_FLOAT32_ATOMICS:        u64 = 0x4000
 ```
 
 ## val EXT_BUFFER_FLOAT32_ATOMIC_ADD
 
 ```mach
-pub val EXT_BUFFER_FLOAT32_ATOMIC_ADD:     u64 = 0x200
+pub val EXT_BUFFER_FLOAT32_ATOMIC_ADD:     u64 = 0x8000
 ```
 
 ## val EXT_BUFFER_FLOAT32_ATOMIC_MIN_MAX
 
 ```mach
-pub val EXT_BUFFER_FLOAT32_ATOMIC_MIN_MAX: u64 = 0x400
+pub val EXT_BUFFER_FLOAT32_ATOMIC_MIN_MAX: u64 = 0x10000
 ```
 
 ## val EXT_BUFFER_FLOAT64_ATOMICS
 
 ```mach
-pub val EXT_BUFFER_FLOAT64_ATOMICS:        u64 = 0x800
+pub val EXT_BUFFER_FLOAT64_ATOMICS:        u64 = 0x20000
 ```
 
 ## val EXT_BUFFER_FLOAT64_ATOMIC_ADD
 
 ```mach
-pub val EXT_BUFFER_FLOAT64_ATOMIC_ADD:     u64 = 0x1000
+pub val EXT_BUFFER_FLOAT64_ATOMIC_ADD:     u64 = 0x40000
 ```
 
 ## val EXT_BUFFER_FLOAT64_ATOMIC_MIN_MAX
 
 ```mach
-pub val EXT_BUFFER_FLOAT64_ATOMIC_MIN_MAX: u64 = 0x2000
+pub val EXT_BUFFER_FLOAT64_ATOMIC_MIN_MAX: u64 = 0x80000
 ```
 
 ## val EXT_SHARED_FLOAT32_ATOMICS
 
 ```mach
-pub val EXT_SHARED_FLOAT32_ATOMICS:        u64 = 0x4000
+pub val EXT_SHARED_FLOAT32_ATOMICS:        u64 = 0x100000
 ```
 
 ## val EXT_SHARED_FLOAT32_ATOMIC_ADD
 
 ```mach
-pub val EXT_SHARED_FLOAT32_ATOMIC_ADD:     u64 = 0x8000
+pub val EXT_SHARED_FLOAT32_ATOMIC_ADD:     u64 = 0x200000
 ```
 
 ## val EXT_SHARED_FLOAT32_ATOMIC_MIN_MAX
 
 ```mach
-pub val EXT_SHARED_FLOAT32_ATOMIC_MIN_MAX: u64 = 0x10000
+pub val EXT_SHARED_FLOAT32_ATOMIC_MIN_MAX: u64 = 0x400000
 ```
 
 ## val EXT_SHARED_FLOAT64_ATOMICS
 
 ```mach
-pub val EXT_SHARED_FLOAT64_ATOMICS:        u64 = 0x20000
+pub val EXT_SHARED_FLOAT64_ATOMICS:        u64 = 0x800000
 ```
 
 ## val EXT_SHARED_FLOAT64_ATOMIC_ADD
 
 ```mach
-pub val EXT_SHARED_FLOAT64_ATOMIC_ADD:     u64 = 0x40000
+pub val EXT_SHARED_FLOAT64_ATOMIC_ADD:     u64 = 0x1000000
 ```
 
 ## val EXT_SHARED_FLOAT64_ATOMIC_MIN_MAX
 
 ```mach
-pub val EXT_SHARED_FLOAT64_ATOMIC_MIN_MAX: u64 = 0x80000
+pub val EXT_SHARED_FLOAT64_ATOMIC_MIN_MAX: u64 = 0x2000000
 ```
 
 ## val EXT_ATOMICS
@@ -1384,7 +1684,7 @@ every atomic feature
 ## val EXTENSION_COUNT
 
 ```mach
-pub val EXTENSION_COUNT: u32 = 20
+pub val EXTENSION_COUNT: u32 = 26
 ```
 
 ## val ONLY_ENVIRONMENT
@@ -1409,7 +1709,9 @@ pub val EXTENSIONS: [EXTENSION_COUNT]extension.Extension = [EXTENSION_COUNT]exte
 
 ```mach
 pub val EXT_OPEN: u64 = EXT_FLOAT16 | EXT_ZERO_INIT_WORKGROUP | EXT_SUBGROUP_ARITHMETIC | EXT_SUBGROUP_CLUSTERED
-| EXT_STORAGE_READ_WITHOUT_FORMAT | EXT_STORAGE_WRITE_WITHOUT_FORMAT | EXT_ATOMICS
+| EXT_STORAGE_READ_WITHOUT_FORMAT | EXT_STORAGE_WRITE_WITHOUT_FORMAT
+| EXT_SUBGROUP_VOTE | EXT_SUBGROUP_BALLOT | EXT_SUBGROUP_SHUFFLE | EXT_SUBGROUP_SHUFFLE_RELATIVE | EXT_SUBGROUP_QUAD
+| EXT_SUBGROUP_GRAPHICS_STAGES | EXT_ATOMICS
 ```
 
 every extension of the vocabulary, which a module naming no environment holds
@@ -1768,6 +2070,30 @@ pub val BUILTIN_VERTEX_INDEX:           u32 = 42
 
 ```mach
 pub val BUILTIN_INSTANCE_INDEX:         u32 = 43
+```
+
+## val BUILTIN_SUBGROUP_SIZE
+
+```mach
+pub val BUILTIN_SUBGROUP_SIZE:                u32 = 36
+```
+
+## val BUILTIN_NUM_SUBGROUPS
+
+```mach
+pub val BUILTIN_NUM_SUBGROUPS:                u32 = 38
+```
+
+## val BUILTIN_SUBGROUP_ID
+
+```mach
+pub val BUILTIN_SUBGROUP_ID:                  u32 = 40
+```
+
+## val BUILTIN_SUBGROUP_LOCAL_INVOCATION_ID
+
+```mach
+pub val BUILTIN_SUBGROUP_LOCAL_INVOCATION_ID: u32 = 41
 ```
 
 ## val DECOR_LINKAGE_ATTRIBUTES

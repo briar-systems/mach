@@ -1363,9 +1363,11 @@ pub def OpOperandKind: u8
 how one operand of an `#[op]` instruction is written: an ordinary value id, an
 id that must be an integer constant by emission, a literal word inline, a
 pointer whose storage class the call site's access chain decides, which the
-instruction only reads through, only stores through, or reads and writes, or a
-handle value whose memory the instruction reads or writes. a handle passed as
-an ordinary value names its descriptor and touches none of its memory
+instruction only reads through, only stores through, or reads and writes, a
+handle value whose memory the instruction reads or writes (a handle passed as
+an ordinary value names its descriptor and touches none of its memory), or a
+truth value the target writes as its boolean type, from an integer argument
+whose nonzero is true
 
 ## val OP_OPERAND_VALUE
 
@@ -1415,10 +1417,16 @@ pub val OP_OPERAND_HANDLE_READ:    OpOperandKind = 6
 pub val OP_OPERAND_HANDLE_WRITE:   OpOperandKind = 7
 ```
 
+## val OP_OPERAND_BOOL
+
+```mach
+pub val OP_OPERAND_BOOL:           OpOperandKind = 8
+```
+
 ## val OP_OPERAND_KIND_COUNT
 
 ```mach
-pub val OP_OPERAND_KIND_COUNT:     OpOperandKind = 8
+pub val OP_OPERAND_KIND_COUNT:     OpOperandKind = 9
 ```
 
 ## def OpResult
@@ -1428,7 +1436,8 @@ pub def OpResult: u8
 ```
 
 whether an `#[op]` instruction has a result id, and whether that result is a
-pointer into the space the row declares
+pointer into the space the row declares, or a truth value of the target's boolean
+type, which the declaration's integer return type receives as 1 or 0
 
 ## val OP_RESULT_VALUE
 
@@ -1446,6 +1455,12 @@ pub val OP_RESULT_NONE:    OpResult = 1
 
 ```mach
 pub val OP_RESULT_POINTER: OpResult = 2
+```
+
+## val OP_RESULT_BOOL
+
+```mach
+pub val OP_RESULT_BOOL:    OpResult = 3
 ```
 
 ## val OP_MAX_OPERANDS
@@ -1630,7 +1645,8 @@ result: OpResult, result_space: u32, signature: str) OpDef;
 a row spelled by its operand signature, one letter per operand in order: `v` a
 value, `c` a constant id, `l` a literal word, `r` a pointer only read through, `w`
 a pointer only stored through, `u` a pointer read and written (read-modify-write),
-`i` a handle whose memory is read, `o` a handle whose memory is written.
+`i` a handle whose memory is read, `o` a handle whose memory is written, `b` a
+truth value.
 the letters after a `|` are the optional tail (`"clv|c"`), present only as far as a
 literal enumerant's value brings them. a letter outside the set is an invalid
 kind, which registration refuses
