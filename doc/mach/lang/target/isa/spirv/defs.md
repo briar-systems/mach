@@ -135,7 +135,7 @@ pub val IMAGE_OP_FORMAT:  u32 = 6
 ## val OP_DEF_COUNT
 
 ```mach
-pub val OP_DEF_COUNT:   usize = 86
+pub val OP_DEF_COUNT:   usize = 101
 ```
 
 ## val TYPE_DEF_COUNT
@@ -178,6 +178,30 @@ pub val ARITHMETIC_GROUP_OPERATION: isa.OpEnum = isa.OpEnum;
 
 ```mach
 pub val BALLOT_GROUP_OPERATION: isa.OpEnum = isa.OpEnum;
+```
+
+## val ATOMIC_INTEGER
+
+```mach
+pub val ATOMIC_INTEGER:       isa.OpTyping = isa.OpTyping;
+```
+
+## val ATOMIC_MEMORY
+
+```mach
+pub val ATOMIC_MEMORY:        isa.OpTyping = isa.OpTyping;
+```
+
+## val ATOMIC_FLOAT_ADD
+
+```mach
+pub val ATOMIC_FLOAT_ADD:     isa.OpTyping = isa.OpTyping;
+```
+
+## val ATOMIC_FLOAT_MIN_MAX
+
+```mach
+pub val ATOMIC_FLOAT_MIN_MAX: isa.OpTyping = isa.OpTyping;
 ```
 
 ## rec DefStorage

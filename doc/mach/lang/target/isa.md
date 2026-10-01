@@ -1502,6 +1502,56 @@ the closed set of values a literal operand takes. a value enumeration admits
 exactly one of its values. a mask admits any union of its single-bit values,
 each set bit bringing its own requirement and operands, and 0 is the empty mask
 
+## def OpDataClass
+
+```mach
+pub def OpDataClass: u8
+```
+
+the class of the data type a typed row operates on: an integer, a float, or anything
+else (a vector, an aggregate, a handle), which no requirement admits
+
+## val OP_DATA_INT
+
+```mach
+pub val OP_DATA_INT:   OpDataClass = 0
+```
+
+## val OP_DATA_FLOAT
+
+```mach
+pub val OP_DATA_FLOAT: OpDataClass = 1
+```
+
+## val OP_DATA_OTHER
+
+```mach
+pub val OP_DATA_OTHER: OpDataClass = 2
+```
+
+## rec OpTypeRequirement
+
+```mach
+pub rec OpTypeRequirement;
+```
+
+one data type a typed row admits in one of the target's address spaces (NO_OP_SPACE
+for every space), and what a use of it there needs: the target's capability word
+(NO_OP_CAPABILITY for none) and the extensions of the isa's vocabulary. `refused`,
+when not nil, is why the target cannot emit the type yet, and the declaration is
+refused with it
+
+## rec OpTyping
+
+```mach
+pub rec OpTyping;
+```
+
+the data types a row operates on, read from its operand `operand` (a pointer's
+pointee), and what each needs in each address space. a type no requirement admits in
+any space is refused at the declaration, and one admitted only in other spaces at the
+call. static data the target owns for the life of the program, like an OpEnum
+
 ## rec OpDef
 
 ```mach
@@ -1616,6 +1666,23 @@ pub fun op_enumerated(d: OpDef, operand: u32, e: *OpEnum) OpDef;
 ```
 
 `d` with its literal operand `operand` held to the values of `e`
+
+## fun op_typed
+
+```mach
+pub fun op_typed(d: OpDef, t: *OpTyping) OpDef;
+```
+
+`d` operating on the data types `t` admits, each with its own requirement
+
+## fun op_type_requirement
+
+```mach
+pub fun op_type_requirement(t: *OpTyping, class: OpDataClass, bits: u32, space: u32) *OpTypeRequirement;
+```
+
+the requirement of `t` admitting a `class` of `bits` in `space`, nil when none does.
+`space` NO_OP_SPACE asks whether any space admits the type
 
 ## fun op_operand_enum
 

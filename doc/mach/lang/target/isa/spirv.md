@@ -698,16 +698,106 @@ pub val OP_ATOMIC_LOAD:               u32 = 227
 pub val OP_ATOMIC_STORE:              u32 = 228
 ```
 
+## val OP_ATOMIC_EXCHANGE
+
+```mach
+pub val OP_ATOMIC_EXCHANGE:           u32 = 229
+```
+
+## val OP_ATOMIC_COMPARE_EXCHANGE
+
+```mach
+pub val OP_ATOMIC_COMPARE_EXCHANGE:   u32 = 230
+```
+
+## val OP_ATOMIC_I_INCREMENT
+
+```mach
+pub val OP_ATOMIC_I_INCREMENT:        u32 = 232
+```
+
+## val OP_ATOMIC_I_DECREMENT
+
+```mach
+pub val OP_ATOMIC_I_DECREMENT:        u32 = 233
+```
+
 ## val OP_ATOMIC_I_ADD
 
 ```mach
 pub val OP_ATOMIC_I_ADD:              u32 = 234
 ```
 
+## val OP_ATOMIC_I_SUB
+
+```mach
+pub val OP_ATOMIC_I_SUB:              u32 = 235
+```
+
+## val OP_ATOMIC_S_MIN
+
+```mach
+pub val OP_ATOMIC_S_MIN:              u32 = 236
+```
+
+## val OP_ATOMIC_U_MIN
+
+```mach
+pub val OP_ATOMIC_U_MIN:              u32 = 237
+```
+
+## val OP_ATOMIC_S_MAX
+
+```mach
+pub val OP_ATOMIC_S_MAX:              u32 = 238
+```
+
+## val OP_ATOMIC_U_MAX
+
+```mach
+pub val OP_ATOMIC_U_MAX:              u32 = 239
+```
+
+## val OP_ATOMIC_AND
+
+```mach
+pub val OP_ATOMIC_AND:                u32 = 240
+```
+
+## val OP_ATOMIC_OR
+
+```mach
+pub val OP_ATOMIC_OR:                 u32 = 241
+```
+
+## val OP_ATOMIC_XOR
+
+```mach
+pub val OP_ATOMIC_XOR:                u32 = 242
+```
+
 ## val OP_GROUP_NON_UNIFORM_I_ADD
 
 ```mach
 pub val OP_GROUP_NON_UNIFORM_I_ADD:   u32 = 349
+```
+
+## val OP_ATOMIC_F_MIN_EXT
+
+```mach
+pub val OP_ATOMIC_F_MIN_EXT:          u32 = 5614
+```
+
+## val OP_ATOMIC_F_MAX_EXT
+
+```mach
+pub val OP_ATOMIC_F_MAX_EXT:          u32 = 5615
+```
+
+## val OP_ATOMIC_F_ADD_EXT
+
+```mach
+pub val OP_ATOMIC_F_ADD_EXT:          u32 = 6035
 ```
 
 ## val OP_PHI
@@ -1114,6 +1204,36 @@ pub val CAP_GROUP_NON_UNIFORM_SHUFFLE_RELATIVE: u32 = 66
 pub val CAP_GROUP_NON_UNIFORM_QUAD:             u32 = 68
 ```
 
+## val CAP_INT64_ATOMICS
+
+```mach
+pub val CAP_INT64_ATOMICS:                      u32 = 12
+```
+
+## val CAP_ATOMIC_FLOAT32_MIN_MAX
+
+```mach
+pub val CAP_ATOMIC_FLOAT32_MIN_MAX:             u32 = 5612
+```
+
+## val CAP_ATOMIC_FLOAT64_MIN_MAX
+
+```mach
+pub val CAP_ATOMIC_FLOAT64_MIN_MAX:             u32 = 5613
+```
+
+## val CAP_ATOMIC_FLOAT32_ADD
+
+```mach
+pub val CAP_ATOMIC_FLOAT32_ADD:                 u32 = 6033
+```
+
+## val CAP_ATOMIC_FLOAT64_ADD
+
+```mach
+pub val CAP_ATOMIC_FLOAT64_ADD:                 u32 = 6034
+```
+
 ## rec Capability
 
 ```mach
@@ -1268,10 +1388,52 @@ pub val NEED_GROUP_NON_UNIFORM_SHUFFLE_RELATIVE: u64 = 0x200000
 pub val NEED_GROUP_NON_UNIFORM_QUAD:             u64 = 0x400000
 ```
 
+## val NEED_INT64_ATOMICS
+
+```mach
+pub val NEED_INT64_ATOMICS:          u64 = 0x800000
+```
+
+## val NEED_ATOMIC_FLOAT32_ADD
+
+```mach
+pub val NEED_ATOMIC_FLOAT32_ADD:     u64 = 0x1000000
+```
+
+## val NEED_ATOMIC_FLOAT64_ADD
+
+```mach
+pub val NEED_ATOMIC_FLOAT64_ADD:     u64 = 0x2000000
+```
+
+## val NEED_ATOMIC_FLOAT32_MIN_MAX
+
+```mach
+pub val NEED_ATOMIC_FLOAT32_MIN_MAX: u64 = 0x4000000
+```
+
+## val NEED_ATOMIC_FLOAT64_MIN_MAX
+
+```mach
+pub val NEED_ATOMIC_FLOAT64_MIN_MAX: u64 = 0x8000000
+```
+
 ## val CAPABILITY_COUNT
 
 ```mach
-pub val CAPABILITY_COUNT: u32 = 23
+pub val CAPABILITY_COUNT: u32 = 28
+```
+
+## val SPV_EXT_ATOMIC_FLOAT_ADD
+
+```mach
+pub val SPV_EXT_ATOMIC_FLOAT_ADD:     str = "SPV_EXT_shader_atomic_float_add"
+```
+
+## val SPV_EXT_ATOMIC_FLOAT_MIN_MAX
+
+```mach
+pub val SPV_EXT_ATOMIC_FLOAT_MIN_MAX: str = "SPV_EXT_shader_atomic_float_min_max"
 ```
 
 ## val CAPABILITIES
@@ -1422,10 +1584,107 @@ pub val EXT_SUBGROUP_QUAD:                u64 = 0x400
 pub val EXT_SUBGROUP_GRAPHICS_STAGES:     u64 = 0x800
 ```
 
+## val EXT_BUFFER_INT64_ATOMICS
+
+```mach
+pub val EXT_BUFFER_INT64_ATOMICS:          u64 = 0x1000
+```
+
+the atomic features of VkPhysicalDeviceShaderAtomicInt64Features,
+VkPhysicalDeviceShaderAtomicFloatFeaturesEXT and VkPhysicalDeviceShaderAtomicFloat2FeaturesEXT,
+each named for its shaderBuffer* or shaderShared* member: an atomic on a type beyond
+32-bit integers needs the one for its storage class, which no Vulkan version guarantees
+
+## val EXT_SHARED_INT64_ATOMICS
+
+```mach
+pub val EXT_SHARED_INT64_ATOMICS:          u64 = 0x2000
+```
+
+## val EXT_BUFFER_FLOAT32_ATOMICS
+
+```mach
+pub val EXT_BUFFER_FLOAT32_ATOMICS:        u64 = 0x4000
+```
+
+## val EXT_BUFFER_FLOAT32_ATOMIC_ADD
+
+```mach
+pub val EXT_BUFFER_FLOAT32_ATOMIC_ADD:     u64 = 0x8000
+```
+
+## val EXT_BUFFER_FLOAT32_ATOMIC_MIN_MAX
+
+```mach
+pub val EXT_BUFFER_FLOAT32_ATOMIC_MIN_MAX: u64 = 0x10000
+```
+
+## val EXT_BUFFER_FLOAT64_ATOMICS
+
+```mach
+pub val EXT_BUFFER_FLOAT64_ATOMICS:        u64 = 0x20000
+```
+
+## val EXT_BUFFER_FLOAT64_ATOMIC_ADD
+
+```mach
+pub val EXT_BUFFER_FLOAT64_ATOMIC_ADD:     u64 = 0x40000
+```
+
+## val EXT_BUFFER_FLOAT64_ATOMIC_MIN_MAX
+
+```mach
+pub val EXT_BUFFER_FLOAT64_ATOMIC_MIN_MAX: u64 = 0x80000
+```
+
+## val EXT_SHARED_FLOAT32_ATOMICS
+
+```mach
+pub val EXT_SHARED_FLOAT32_ATOMICS:        u64 = 0x100000
+```
+
+## val EXT_SHARED_FLOAT32_ATOMIC_ADD
+
+```mach
+pub val EXT_SHARED_FLOAT32_ATOMIC_ADD:     u64 = 0x200000
+```
+
+## val EXT_SHARED_FLOAT32_ATOMIC_MIN_MAX
+
+```mach
+pub val EXT_SHARED_FLOAT32_ATOMIC_MIN_MAX: u64 = 0x400000
+```
+
+## val EXT_SHARED_FLOAT64_ATOMICS
+
+```mach
+pub val EXT_SHARED_FLOAT64_ATOMICS:        u64 = 0x800000
+```
+
+## val EXT_SHARED_FLOAT64_ATOMIC_ADD
+
+```mach
+pub val EXT_SHARED_FLOAT64_ATOMIC_ADD:     u64 = 0x1000000
+```
+
+## val EXT_SHARED_FLOAT64_ATOMIC_MIN_MAX
+
+```mach
+pub val EXT_SHARED_FLOAT64_ATOMIC_MIN_MAX: u64 = 0x2000000
+```
+
+## val EXT_ATOMICS
+
+```mach
+pub val EXT_ATOMICS: u64 = EXT_BUFFER_INT64_ATOMICS | EXT_SHARED_INT64_ATOMICS | EXT_BUFFER_FLOAT32_ATOMICS | EXT_BUFFER_FLOAT32_ATOMIC_ADD | EXT_BUFFER_FLOAT32_ATOMIC_MIN_MAX | EXT_BUFFER_FLOAT64_ATOMICS | EXT_BUFFER_FLOAT64_ATOMIC_ADD | EXT_BUFFER_FLOAT64_ATOMIC_MIN_MAX | EXT_SHARED_FLOAT32_ATOMICS | EXT_SHARED_FLOAT32_ATOMIC_ADD | EXT_SHARED_FLOAT32_ATOMIC_MIN_MAX | EXT_SHARED_FLOAT64_ATOMICS | EXT_SHARED_FLOAT64_ATOMIC_ADD | EXT_SHARED_FLOAT64_ATOMIC_MIN_MAX
+```
+
+every atomic feature
+
 ## val EXTENSION_COUNT
 
 ```mach
-pub val EXTENSION_COUNT: u32 = 12
+pub val EXTENSION_COUNT: u32 = 26
 ```
 
 ## val ONLY_ENVIRONMENT
@@ -1452,7 +1711,7 @@ pub val EXTENSIONS: [EXTENSION_COUNT]extension.Extension = [EXTENSION_COUNT]exte
 pub val EXT_OPEN: u64 = EXT_FLOAT16 | EXT_ZERO_INIT_WORKGROUP | EXT_SUBGROUP_ARITHMETIC | EXT_SUBGROUP_CLUSTERED
 | EXT_STORAGE_READ_WITHOUT_FORMAT | EXT_STORAGE_WRITE_WITHOUT_FORMAT
 | EXT_SUBGROUP_VOTE | EXT_SUBGROUP_BALLOT | EXT_SUBGROUP_SHUFFLE | EXT_SUBGROUP_SHUFFLE_RELATIVE | EXT_SUBGROUP_QUAD
-| EXT_SUBGROUP_GRAPHICS_STAGES
+| EXT_SUBGROUP_GRAPHICS_STAGES | EXT_ATOMICS
 ```
 
 every extension of the vocabulary, which a module naming no environment holds
