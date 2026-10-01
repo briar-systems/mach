@@ -84,6 +84,25 @@ pub val IRT_HANDLE: IrTypeKind = 9
 pub val IRT_TAG:    IrTypeKind = 10
 ```
 
+## val IRT_RECREF
+
+```mach
+pub val IRT_RECREF: IrTypeKind = 11
+```
+
+a record named by its key rather than by its fields: the pointee of a pointer member
+that closes a cycle of records through pointers, on a target that keeps pointee types.
+it is never an object type of its own, and the record it names is the struct whose
+`key` is the same (#4307)
+
+## val REC_KEY_NONE
+
+```mach
+pub val REC_KEY_NONE: u32 = 0
+```
+
+the key of a record no cycle of pointers reaches, and of every non-record type
+
 ## rec IrTypeArray
 
 ```mach
@@ -413,6 +432,22 @@ pub fun intern_ptr(t: *IrTypeTable) res[IrTypeId, fail.Fail];
 pub fun intern_reference(t: *IrTypeTable, pointee: IrTypeId) res[IrTypeId, fail.Fail];
 ```
 
+## fun intern_recref
+
+```mach
+pub fun intern_recref(t: *IrTypeTable, key: u32) res[IrTypeId, fail.Fail];
+```
+
+the record whose struct carries `key`, as a pointer member's pointee
+
+## fun keyed_struct
+
+```mach
+pub fun keyed_struct(t: *IrTypeTable, key: u32) IrTypeId;
+```
+
+the struct of the record that `intern_recref(key)` names, IRT_NIL when the table holds none
+
 ## fun intern_array
 
 ```mach
@@ -442,6 +477,15 @@ pub fun intern_struct(t: *IrTypeTable, fields: *IrTypeId, field_count: u32, alig
 ```mach
 pub fun intern_union(t: *IrTypeTable, fields: *IrTypeId, field_count: u32, align: u32, packed: bool) res[IrTypeId, fail.Fail];
 ```
+
+## fun intern_record
+
+```mach
+pub fun intern_record(t: *IrTypeTable, kind: IrTypeKind, fields: *IrTypeId, field_count: u32, align: u32,
+packed: bool, key: u32) res[IrTypeId, fail.Fail];
+```
+
+a struct or union carrying the key a record reference names it by
 
 ## fun intern_fn
 

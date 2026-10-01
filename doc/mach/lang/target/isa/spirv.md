@@ -320,6 +320,30 @@ pub val OP_IMAGE_TEXEL_POINTER:       u32 = 60
 pub val OP_ACCESS_CHAIN:              u32 = 65
 ```
 
+## val OP_PTR_ACCESS_CHAIN
+
+```mach
+pub val OP_PTR_ACCESS_CHAIN:          u32 = 67
+```
+
+## val OP_TYPE_FORWARD_POINTER
+
+```mach
+pub val OP_TYPE_FORWARD_POINTER:      u32 = 39
+```
+
+## val OP_CONVERT_PTR_TO_U
+
+```mach
+pub val OP_CONVERT_PTR_TO_U:          u32 = 117
+```
+
+## val OP_CONVERT_U_TO_PTR
+
+```mach
+pub val OP_CONVERT_U_TO_PTR:          u32 = 120
+```
+
 ## val OP_DECORATE
 
 ```mach
@@ -1282,6 +1306,12 @@ pub val CAP_VULKAN_MEMORY_MODEL:                u32 = 5345
 pub val CAP_VULKAN_MEMORY_MODEL_DEVICE_SCOPE:   u32 = 5346
 ```
 
+## val CAP_PHYSICAL_STORAGE_BUFFER_ADDRESSES
+
+```mach
+pub val CAP_PHYSICAL_STORAGE_BUFFER_ADDRESSES:  u32 = 5347
+```
+
 ## rec Capability
 
 ```mach
@@ -1508,10 +1538,16 @@ pub val NEED_VULKAN_MEMORY_MODEL:              u64 = 0x200000000
 pub val NEED_VULKAN_MEMORY_MODEL_DEVICE_SCOPE: u64 = 0x400000000
 ```
 
+## val NEED_PHYSICAL_STORAGE_BUFFER
+
+```mach
+pub val NEED_PHYSICAL_STORAGE_BUFFER:          u64 = 0x800000000
+```
+
 ## val CAPABILITY_COUNT
 
 ```mach
-pub val CAPABILITY_COUNT: u32 = 35
+pub val CAPABILITY_COUNT: u32 = 36
 ```
 
 ## val SPV_EXT_ATOMIC_FLOAT_ADD
@@ -1541,6 +1577,15 @@ pub val SPV_KHR_VULKAN_MEMORY_MODEL: str = "SPV_KHR_vulkan_memory_model"
 the extension defining the Vulkan memory model below SPIR-V 1.5, where it is core.
 the module declares it with the model rather than with a capability, since it
 covers both of the model's capabilities
+
+## val SPV_KHR_PHYSICAL_STORAGE_BUFFER
+
+```mach
+pub val SPV_KHR_PHYSICAL_STORAGE_BUFFER: str = "SPV_KHR_physical_storage_buffer"
+```
+
+the extension defining physical pointers below SPIR-V 1.5, where they are core. the
+module declares it with the PhysicalStorageBuffer64 addressing model it brings
 
 ## val CAPABILITIES
 
@@ -1635,7 +1680,9 @@ vulkan_memory_model is the vulkanMemoryModel feature, and holding it selects the
 Vulkan memory model in place of GLSL450. vulkan_memory_model_device_scope is
 vulkanMemoryModelDeviceScope, which the Device scope needs under that model (#4308).
 int8 and int16 are the Int8 and Int16 capabilities, so an integer of that width
-is computed at its own width rather than carried in a wider one (#4302)
+is computed at its own width rather than carried in a wider one (#4302).
+buffer_device_address is the bufferDeviceAddress feature, under which a pointer held in
+memory is a physical pointer into a buffer the host passes by address (#4307)
 
 ## val EXT_ZERO_INIT_WORKGROUP
 
@@ -1866,6 +1913,12 @@ pub val EXT_INT8:                             u64 = 0x1000000000
 pub val EXT_INT16:                            u64 = 0x2000000000
 ```
 
+## val EXT_BUFFER_DEVICE_ADDRESS
+
+```mach
+pub val EXT_BUFFER_DEVICE_ADDRESS:            u64 = 0x4000000000
+```
+
 ## val EXT_ATOMICS
 
 ```mach
@@ -1878,7 +1931,7 @@ every atomic feature
 ## val EXTENSION_COUNT
 
 ```mach
-pub val EXTENSION_COUNT: u32 = 38
+pub val EXTENSION_COUNT: u32 = 39
 ```
 
 ## val ONLY_ENVIRONMENT
@@ -1907,7 +1960,7 @@ pub val EXT_OPEN: u64 = EXT_FLOAT16 | EXT_ZERO_INIT_WORKGROUP | EXT_SUBGROUP_ARI
 | EXT_SUBGROUP_VOTE | EXT_SUBGROUP_BALLOT | EXT_SUBGROUP_SHUFFLE | EXT_SUBGROUP_SHUFFLE_RELATIVE | EXT_SUBGROUP_QUAD
 | EXT_SUBGROUP_GRAPHICS_STAGES | EXT_ATOMICS | EXT_STORAGE_IMAGE_MULTISAMPLE | EXT_RESOURCE_MIN_LOD
 | EXT_IMAGE_GATHER_EXTENDED | EXT_MAINTENANCE8 | EXT_VULKAN_MEMORY_MODEL | EXT_VULKAN_MEMORY_MODEL_DEVICE_SCOPE
-| EXT_INT8 | EXT_INT16
+| EXT_INT8 | EXT_INT16 | EXT_BUFFER_DEVICE_ADDRESS
 ```
 
 every extension of the vocabulary, which a module naming no environment holds
@@ -1921,7 +1974,8 @@ pub fun env_extensions(id: u32) u64;
 the extensions an environment guarantees: float16, int8 and int16 where its
 ceiling holds Float16, Int8 and Int16, and from vulkan1.3 zero_init_workgroup, where the feature is core, the
 two without-format features, whose capabilities it accepts with none enabled, and
-the two memory model features, which vulkan1.3 requires of every device
+the two memory model features and buffer device address, which vulkan1.3 requires of
+every device
 
 ## fun env_profile
 
@@ -1988,7 +2042,13 @@ pub val EXEC_MODE_LOCAL_SIZE_ID:     u32 = 38
 ## val ADDRESSING_LOGICAL
 
 ```mach
-pub val ADDRESSING_LOGICAL: u32 = 0
+pub val ADDRESSING_LOGICAL:                    u32 = 0
+```
+
+## val ADDRESSING_PHYSICAL_STORAGE_BUFFER_64
+
+```mach
+pub val ADDRESSING_PHYSICAL_STORAGE_BUFFER_64: u32 = 5348
 ```
 
 ## val DIM_1D
@@ -2175,6 +2235,12 @@ pub val STORAGE_IMAGE: u32 = 11
 pub val STORAGE_UNIFORM_CONSTANT: u32 = 0
 ```
 
+## val STORAGE_PHYSICAL_STORAGE_BUFFER
+
+```mach
+pub val STORAGE_PHYSICAL_STORAGE_BUFFER: u32 = 5349
+```
+
 ## val DECOR_BLOCK
 
 ```mach
@@ -2239,6 +2305,18 @@ pub val DECOR_NON_WRITABLE: u32 = 24
 
 ```mach
 pub val DECOR_NON_READABLE: u32 = 25
+```
+
+## val DECOR_ALIASED
+
+```mach
+pub val DECOR_ALIASED:         u32 = 20
+```
+
+## val DECOR_ALIASED_POINTER
+
+```mach
+pub val DECOR_ALIASED_POINTER: u32 = 5356
 ```
 
 ## val DECOR_FLAT
@@ -2441,8 +2519,15 @@ the semantics bits only the Vulkan memory model defines
 pub val MEMORY_ACCESS_VOLATILE:               u32 = 0x1
 ```
 
-the Memory Operands of OpLoad and OpStore. the availability and visibility bits are
-followed by their scope id, and each needs NonPrivatePointer beside it
+the Memory Operands of OpLoad and OpStore. Aligned is followed by its literal, the
+availability and visibility bits by their scope id, each needing NonPrivatePointer beside
+it, and the operands follow the bits in their order
+
+## val MEMORY_ACCESS_ALIGNED
+
+```mach
+pub val MEMORY_ACCESS_ALIGNED:                u32 = 0x2
+```
 
 ## val MEMORY_ACCESS_MAKE_POINTER_AVAILABLE
 
