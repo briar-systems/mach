@@ -20,13 +20,40 @@ pub rec TypeTable;
 
 `storage_only` is set while a type is built for host-shared memory, where an 8- or
 16-bit scalar is declared under its storage access capability: a request then raises
-no Int8, Int16 or Float16, which every other request of the width does (#4299)
+no Int8, Int16 or Float16, which every other request of the width does (#4299).
+`use_loc` is the source use the emitter is building types for, and `need_loc` the
+first located use of each Builder.caps_needed bit, by bit position, which a refusal
+of the capability points at (#4334)
 
 ## fun types_init
 
 ```mach
 pub fun types_init(b: *spirv.Builder) TypeTable;
 ```
+
+## fun raise
+
+```mach
+pub fun raise(tt: *TypeTable, need: u64);
+```
+
+raises `need` for the use types are being built for
+
+## fun raise_at
+
+```mach
+pub fun raise_at(tt: *TypeTable, need: u64, loc: source.SrcLoc);
+```
+
+raises `need` for the use at `loc`, which locates each bit no earlier use located
+
+## fun need_loc
+
+```mach
+pub fun need_loc(tt: *TypeTable, need: u64) source.SrcLoc;
+```
+
+the first located use of the lowest bit of `need`, nil where no use was located
 
 ## fun types_dnit
 
