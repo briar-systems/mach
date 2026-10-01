@@ -365,7 +365,7 @@ promises no fields and no storage, which is exactly what a handle is. There is n
 body because the target supplies the definition.
 
 The spirv `image` constructor takes the seven operands of `OpTypeImage` in its
-order: the texel scalar, `Dim`, `Depth`, `Arrayed`, `MS`, `Sampled` and the
+order: the texel scalar (`0` `f32`, `1` `i32`, `2` `u32`, `3` `i64`, `4` `u64`), `Dim`, `Depth`, `Arrayed`, `MS`, `Sampled` and the
 `Image Format`. The format is required, and `0` (`Unknown`) is the usual choice for
 a sampled image. `Sampled` `1` is an image read through a sampler and `2` a storage
 image, read and written directly and bound through `#[storage]` (see
@@ -378,7 +378,9 @@ which `vulkan1.3` accepts and an earlier `env` accepts only with the
 `storage_read_without_format` and `storage_write_without_format` extensions (see
 [manifest.md](manifest.md#instruction-set-extensions)). A format must match the
 texel scalar: a float or normalized format is read as `f32`, a signed integer
-format as `i32` and an unsigned one as `u32`.
+format as `i32` and an unsigned one as `u32`. `R64ui` and `R64i` hold 64-bit texels,
+the texel scalar `u64` or `i64`, and declare `Int64ImageEXT`, which needs the
+`image_int64_atomics` extension.
 
 The operands are ordinary comptime constants. One position is not: a constructor
 that composes over another handle takes a **type name**, so `Sampler2D` names the

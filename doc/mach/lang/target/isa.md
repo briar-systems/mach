@@ -1593,6 +1593,15 @@ pub def TypeComposeFn: fun(u32, *u32, u32) str
 why a composing constructor refuses the handle named as its operand `index`, from
 that handle's own operands, nil when it composes over it
 
+## def TypeElementFn
+
+```mach
+pub def TypeElementFn: fun(*u32, u32, OpDataClass, u32, bool) str
+```
+
+why a pointer an instruction derives into a handle's memory cannot address a scalar of
+`class`, `bits` and signedness, from the handle's operands, nil when it can
+
 ## val HANDLE_BIND_SAMPLER
 
 ```mach
@@ -1752,6 +1761,15 @@ pub fun type_def_binding(td: *TypeDef, ops: *u32, n: u32) u32;
 ```
 
 the role a handle of constructor `td` with operands `ops` binds through
+
+## fun type_def_element
+
+```mach
+pub fun type_def_element(td: *TypeDef, ops: *u32, n: u32, class: OpDataClass, bits: u32, signed: bool) str;
+```
+
+why a pointer into a handle of constructor `td` with operands `ops` cannot address a
+`class` of `bits`, nil when it can
 
 ## fun target_defs
 

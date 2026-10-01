@@ -84,6 +84,18 @@ pub val TEXEL_I32: u32 = 1
 pub val TEXEL_U32: u32 = 2
 ```
 
+## val TEXEL_I64
+
+```mach
+pub val TEXEL_I64: u32 = 3
+```
+
+## val TEXEL_U64
+
+```mach
+pub val TEXEL_U64: u32 = 4
+```
+
 ## val IMAGE_ARITY
 
 ```mach
