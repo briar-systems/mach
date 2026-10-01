@@ -135,7 +135,7 @@ pub val IMAGE_OP_FORMAT:  u32 = 6
 ## val OP_DEF_COUNT
 
 ```mach
-pub val OP_DEF_COUNT:   usize = 101
+pub val OP_DEF_COUNT:   usize = 102
 ```
 
 ## val TYPE_DEF_COUNT
@@ -174,17 +174,55 @@ pub val GROUP_OPERATION_CLUSTERED_REDUCE: u32 = 3
 pub val ARITHMETIC_GROUP_OPERATION: isa.OpEnum = isa.OpEnum;
 ```
 
+## val IMAGE_OPERANDS_BIAS
+
+```mach
+pub val IMAGE_OPERANDS_BIAS:         u32 = 0x1
+```
+
 ## val IMAGE_OPERANDS_LOD
 
 ```mach
-pub val IMAGE_OPERANDS_LOD:    u32 = 0x2
+pub val IMAGE_OPERANDS_LOD:          u32 = 0x2
+```
+
+## val IMAGE_OPERANDS_GRAD
+
+```mach
+pub val IMAGE_OPERANDS_GRAD:         u32 = 0x4
+```
+
+## val IMAGE_OPERANDS_CONST_OFFSET
+
+```mach
+pub val IMAGE_OPERANDS_CONST_OFFSET: u32 = 0x8
+```
+
+## val IMAGE_OPERANDS_OFFSET
+
+```mach
+pub val IMAGE_OPERANDS_OFFSET:       u32 = 0x10
 ```
 
 ## val IMAGE_OPERANDS_SAMPLE
 
 ```mach
-pub val IMAGE_OPERANDS_SAMPLE: u32 = 0x40
+pub val IMAGE_OPERANDS_SAMPLE:       u32 = 0x40
 ```
+
+## val IMAGE_OPERANDS_MIN_LOD
+
+```mach
+pub val IMAGE_OPERANDS_MIN_LOD:      u32 = 0x80
+```
+
+## val IMAGE_OPERANDS_OFFSETS
+
+```mach
+pub val IMAGE_OPERANDS_OFFSETS: u32 = IMAGE_OPERANDS_CONST_OFFSET | IMAGE_OPERANDS_OFFSET
+```
+
+the bits that offset a coordinate, of which an instruction takes one
 
 ## val IMAGE_OPERANDS_MAKE_TEXEL_AVAILABLE
 
@@ -193,8 +231,7 @@ pub val IMAGE_OPERANDS_MAKE_TEXEL_AVAILABLE: u32 = 0x100
 ```
 
 the Image Operands the emitter adds to a coherent storage image's access under the
-Vulkan memory model. no row admits them from a call: a call's bits name operands of
-their own kinds, which the row's tail does not yet type per bit (#4303)
+Vulkan memory model. no row admits them from a call yet
 
 ## val IMAGE_OPERANDS_MAKE_TEXEL_VISIBLE
 
@@ -208,22 +245,34 @@ pub val IMAGE_OPERANDS_MAKE_TEXEL_VISIBLE:   u32 = 0x200
 pub val IMAGE_OPERANDS_NON_PRIVATE_TEXEL:    u32 = 0x400
 ```
 
+## val IMPLICIT_LOD_OPERANDS
+
+```mach
+pub val IMPLICIT_LOD_OPERANDS: isa.OpEnum = isa.OpEnum;
+```
+
 ## val SAMPLE_LOD_OPERANDS
 
 ```mach
-pub val SAMPLE_LOD_OPERANDS: isa.OpEnum = isa.OpEnum;
+pub val SAMPLE_LOD_OPERANDS:   isa.OpEnum = isa.OpEnum;
 ```
 
 ## val FETCH_OPERANDS
 
 ```mach
-pub val FETCH_OPERANDS:      isa.OpEnum = isa.OpEnum;
+pub val FETCH_OPERANDS:        isa.OpEnum = isa.OpEnum;
+```
+
+## val GATHER_OPERANDS
+
+```mach
+pub val GATHER_OPERANDS:       isa.OpEnum = isa.OpEnum;
 ```
 
 ## val STORAGE_OPERANDS
 
 ```mach
-pub val STORAGE_OPERANDS:    isa.OpEnum = isa.OpEnum;
+pub val STORAGE_OPERANDS:      isa.OpEnum = isa.OpEnum;
 ```
 
 ## val BALLOT_GROUP_OPERATION
@@ -303,6 +352,35 @@ pub fun is_image_operands(en: *isa.OpEnum) bool;
 
 whether `en` is an instruction's view of the Image Operands mask
 
+## fun image_coordinate_components
+
+```mach
+pub fun image_coordinate_components(dim: u32) u32;
+```
+
+how many components an image of `dim` is addressed by, besides an array layer: what
+an offset added to its coordinate, and each derivative of it, has
+
+## fun image_operand_shape_refusal
+
+```mach
+pub fun image_operand_shape_refusal(bit: u32, dim: u32, float: bool, components: u32) str;
+```
+
+why the operands the Image Operands bit `bit` brings do not fit an image of `dim`, nil
+when they do: each is a `float` (else integer) scalar or vector of `components`
+components. an offset or a derivative has one component per dimension of the image's
+coordinate, and a least level of detail is one float
+
+## val NO_IMAGE_DIM
+
+```mach
+pub val NO_IMAGE_DIM: u32 = 0xFFFFFFFF
+```
+
+the dimensionality of an instruction's first operand when it is neither an image nor
+a sampled image of one
+
 ## fun image_use_refusal
 
 ```mach
@@ -311,7 +389,8 @@ pub fun image_use_refusal(opcode: u32, image: bool, ms: bool, storage: bool, dim
 
 why an image instruction's use is invalid, nil when it is valid: `image` says whether
 its first operand is an image, `ms` whether that image is multisampled, `storage`
-whether it is a storage image and `dim` its dimensionality, and `mask` is the Image
+whether it is a storage image and `dim` the dimensionality of the image it is or
+samples (NO_IMAGE_DIM for neither), and `mask` is the Image
 Operands mask it passes, 0 when it passes none. a multisampled image's texel is named
 by its sample, and only a multisampled image has samples
 
