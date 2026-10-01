@@ -1154,6 +1154,30 @@ names a descriptor rather than an object with storage, so one with no descriptor
 address is reachable from no stage. A handle cannot sit behind a pointer, inside an
 array, or in a local binding, and each of those is a compile error naming why.
 
+A **storage image** is the exception: an `image` handle whose `Sampled` operand is
+`2` is read and written directly rather than sampled, which is Vulkan's
+`STORAGE_IMAGE` descriptor, so it binds through `storage` and not `sampler`. The
+`"readonly"`, `"writeonly"` and `"coherent"` qualifiers apply to it exactly as they
+do to a buffer, checked against the instructions that read and write its texels. A
+storage texel buffer, an image of `Dim` `Buffer` with `Sampled` `2`, binds the same
+way, and a uniform texel buffer (`Sampled` `1`) keeps `sampler`. Binding a storage
+image through `sampler`, or any other handle through `storage`, is a compile error.
+A storage image is read and written by `OpImageRead` and `OpImageWrite`, a uniform
+texel buffer or a sampled image is fetched texel by texel by `OpImageFetch`, and
+`OpImageQuerySize`, `OpImageQuerySizeLod`, `OpImageQueryLevels` and
+`OpImageQuerySamples` read an image's descriptor under the `ImageQuery` capability,
+which every Vulkan version accepts.
+
+```mach fragment
+#[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, STORAGE, FORMAT_RGBA8)]
+pub def Target2D;
+
+#[op("spirv", "core", "OpImageWrite")]
+fun image_write(img: Target2D, at: i32x2, texel: f32x4);
+
+#[storage(0, 6, "writeonly")] var target: Target2D;
+```
+
 `push` binds a **push-constant block**, a small `rec` the host supplies with the
 command that records a dispatch or draw rather than through a descriptor, so it
 takes no arguments: there is no set or binding to name. Like `uniform` and
@@ -1330,7 +1354,7 @@ A bodyless `def` carrying this directive declares a type whose representation is
 **not the program's**: the owning target mints it and the pipeline binds it.
 
 ```mach fragment
-#[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED)]
+#[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED, FORMAT_UNKNOWN)]
 pub def Texture2D;
 
 #[handle("spirv", "sampled_image", Texture2D)]
@@ -1428,6 +1452,8 @@ selected the declaration's types are checked against both:
 | pointer read    | the argument's address, only read through                   | a pointer      |
 | pointer write   | the argument's address, only stored through                 | a pointer      |
 | pointer update  | the argument's address, read and written (read-modify-write) | a pointer     |
+| handle read     | a handle whose memory the instruction reads, such as a storage image's texels | a handle |
+| handle write    | a handle whose memory the instruction writes                | a handle       |
 
 A **pointer operand takes its storage class from the call site**: the argument's
 own access chain decides whether it points into a storage buffer, workgroup memory,
@@ -1437,7 +1463,10 @@ member or element as well as a whole object. The kinds are also what the
 `"readonly"` and `"writeonly"` qualifiers of a `storage` binding are checked
 against: an atomic load through a `readonly` binding is accepted and an atomic add
 on it is refused, and an atomic store into a `writeonly` binding is accepted and an
-atomic load from it is refused.
+atomic load from it is refused. A handle passed as an ordinary value names its
+descriptor and touches none of its memory, and a handle read or write is checked the
+same way, so `OpImageWrite` into a `"readonly"` storage image and `OpImageRead` from a
+`"writeonly"` one are refused.
 
 A non-constant argument to a constant id or a literal is refused at the call,
 naming the operand. A row **without a result** is declared with no return type,

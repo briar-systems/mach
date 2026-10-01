@@ -132,7 +132,7 @@ a struct or array: something an access chain descends into
 
 ```mach
 pub fun type_image(tt: *TypeTable, sampled: u32, dim: u32, depth: u32, arrayed: u32,
-ms: u32, sampled_op: u32) u32;
+ms: u32, sampled_op: u32, format: u32) u32;
 ```
 
 ## fun type_sampled_image
