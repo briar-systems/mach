@@ -884,6 +884,14 @@ pub fun handle_pointer_pointer(ti: *TypeInterner, tid: TypeId) bool;
 a pointer to a pointer to a handle, through any secret: the innermost double indirection
 of every deeper one, so a chain of pointers over a handle matches at exactly one level
 
+## fun has_handle_pointer_pointer
+
+```mach
+pub fun has_handle_pointer_pointer(ti: *TypeInterner, tid: TypeId) bool;
+```
+
+a pointer to a pointer to a handle anywhere under the pointers, arrays and secrets of a type
+
 ## fun intern_abi_type
 
 ```mach
