@@ -344,8 +344,8 @@ pub val FIRST_OPERAND:         isa.OpTyping = isa.OpTyping;
 ```
 
 the operand an untyped row's relations are stated against: the first for an image's
-handle, holding its type to nothing, and the first for a math instruction and the value for
-a subgroup operation, each a scalar or vector of integers or floats
+handle, holding its type to nothing, the first for a math instruction, a scalar or vector
+of floats, and the value for a subgroup operation, a scalar or vector of integers or floats
 
 ## val MATH_OPERAND
 

@@ -1671,6 +1671,67 @@ call. a typing with no requirements admits every type and needs nothing: it only
 the operand the row's relations are stated against. static data the target owns for
 the life of the program, like an OpEnum
 
+## def OpNumeric
+
+```mach
+pub def OpNumeric: u8
+```
+
+the numbers a typed row's data type is a scalar or vector of: any type at all, integers or
+floats, floats only, or integers of one signedness. a truth value is an unsigned integer
+
+## val OP_NUMERIC_NONE
+
+```mach
+pub val OP_NUMERIC_NONE:     OpNumeric = 0
+```
+
+## val OP_NUMERIC_ANY
+
+```mach
+pub val OP_NUMERIC_ANY:      OpNumeric = 1
+```
+
+## val OP_NUMERIC_FLOAT
+
+```mach
+pub val OP_NUMERIC_FLOAT:    OpNumeric = 2
+```
+
+## val OP_NUMERIC_SIGNED
+
+```mach
+pub val OP_NUMERIC_SIGNED:   OpNumeric = 3
+```
+
+## val OP_NUMERIC_UNSIGNED
+
+```mach
+pub val OP_NUMERIC_UNSIGNED: OpNumeric = 4
+```
+
+## val OP_NUMERIC_COUNT
+
+```mach
+pub val OP_NUMERIC_COUNT:    OpNumeric = 5
+```
+
+## fun op_numeric_admits
+
+```mach
+pub fun op_numeric_admits(n: OpNumeric, class: OpDataClass, signed: bool) bool;
+```
+
+whether a scalar of `class`, signed when `signed`, is a number `n` admits
+
+## fun op_numeric_name
+
+```mach
+pub fun op_numeric_name(n: OpNumeric) str;
+```
+
+the numbers `n` admits, as a refusal names them
+
 ## def OpRelation
 
 ```mach
