@@ -1705,8 +1705,10 @@ at the declaration rather than as an invalid module.
 | `OpDot` | the second vector is the first's type |
 
 A declaration that returns a handle is refused with `op.signature` unless its row
-states how the result relates to its operands or which operand it derives from,
-since a handle holds a binding's descriptor and an unrelated result names none.
+names the operand its result derives from, since a handle holds a binding's
+descriptor and only that operand says whose. The math rows and the subgroup rows
+operate on a scalar or vector of integers or floats, so a handle, a pointer or an
+aggregate as their data operand is refused with `op.signature` too.
 
 Each image row names the rule its texel's component count comes from, and the
 refusal quotes it: the 4-vector read result is Vulkan's `VUID-StandaloneSpirv-Result-04780`,
