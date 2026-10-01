@@ -1361,9 +1361,11 @@ pub def OpOperandKind: u8
 ```
 
 how one operand of an `#[op]` instruction is written: an ordinary value id, an
-id that must be an integer constant by emission, a literal word inline, or a
+id that must be an integer constant by emission, a literal word inline, a
 pointer whose storage class the call site's access chain decides, which the
-instruction only reads through, only stores through, or reads and writes
+instruction only reads through, only stores through, or reads and writes, or a
+handle value whose memory the instruction reads or writes. a handle passed as
+an ordinary value names its descriptor and touches none of its memory
 
 ## val OP_OPERAND_VALUE
 
@@ -1401,10 +1403,22 @@ pub val OP_OPERAND_POINTER_WRITE:  OpOperandKind = 4
 pub val OP_OPERAND_POINTER_UPDATE: OpOperandKind = 5
 ```
 
+## val OP_OPERAND_HANDLE_READ
+
+```mach
+pub val OP_OPERAND_HANDLE_READ:    OpOperandKind = 6
+```
+
+## val OP_OPERAND_HANDLE_WRITE
+
+```mach
+pub val OP_OPERAND_HANDLE_WRITE:   OpOperandKind = 7
+```
+
 ## val OP_OPERAND_KIND_COUNT
 
 ```mach
-pub val OP_OPERAND_KIND_COUNT:     OpOperandKind = 6
+pub val OP_OPERAND_KIND_COUNT:     OpOperandKind = 8
 ```
 
 ## def OpResult
@@ -1497,6 +1511,39 @@ pub val NO_TYPE_CTOR: u32 = 0xFFFFFFFF
 pub def TypeRefuseFn: fun(*u32, u32) str
 ```
 
+## def TypeBindFn
+
+```mach
+pub def TypeBindFn: fun(*u32, u32) u32
+```
+
+the descriptor role a handle binds through, from its operands
+
+## def TypeComposeFn
+
+```mach
+pub def TypeComposeFn: fun(u32, *u32, u32) str
+```
+
+why a composing constructor refuses the handle named as its operand `index`, from
+that handle's own operands, nil when it composes over it
+
+## val HANDLE_BIND_SAMPLER
+
+```mach
+pub val HANDLE_BIND_SAMPLER: u32 = 0
+```
+
+a handle bound as a sampled descriptor, `#[sampler(set, binding)]`
+
+## val HANDLE_BIND_STORAGE
+
+```mach
+pub val HANDLE_BIND_STORAGE: u32 = 1
+```
+
+a handle bound as a storage descriptor, `#[storage(set, binding, ...)]`
+
 ## rec TypeDef
 
 ```mach
@@ -1532,7 +1579,8 @@ result: OpResult, result_space: u32, signature: str) OpDef;
 
 a row spelled by its operand signature, one letter per operand in order: `v` a
 value, `c` a constant id, `l` a literal word, `r` a pointer only read through, `w`
-a pointer only stored through, `u` a pointer read and written (read-modify-write).
+a pointer only stored through, `u` a pointer read and written (read-modify-write),
+`i` a handle whose memory is read, `o` a handle whose memory is written.
 the letters after a `|` are the optional tail (`"clv|c"`), present only as far as a
 literal enumerant's value brings them. a letter outside the set is an invalid
 kind, which registration refuses
@@ -1588,6 +1636,12 @@ pub fun op_operand_kind(d: *OpDef, i: u32) OpOperandKind;
 pub fun op_kind_is_pointer(k: OpOperandKind) bool;
 ```
 
+## fun op_kind_is_handle
+
+```mach
+pub fun op_kind_is_handle(k: OpOperandKind) bool;
+```
+
 ## fun op_def_shape_refusal
 
 ```mach
@@ -1607,6 +1661,14 @@ pub fun op_def_by_code(defs: *TargetDefs, set_tag: u32, opcode: u32) *OpDef;
 ```mach
 pub fun type_def(name: str, tag: u32, operands: *u32, arity: u32, refuse: TypeRefuseFn) TypeDef;
 ```
+
+## fun type_def_binding
+
+```mach
+pub fun type_def_binding(td: *TypeDef, ops: *u32, n: u32) u32;
+```
+
+the role a handle of constructor `td` with operands `ops` binds through
 
 ## fun target_defs
 

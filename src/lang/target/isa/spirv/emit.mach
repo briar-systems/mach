@@ -707,6 +707,14 @@ fun mach_callee(e: *Emit, fx: u32, mi: *mir.MirInstr) u32 {
     ret gx;
 }
 
+fun param_is_handle(e: *Emit, fx: u32, k: u32) bool {
+    val fn: *ir.Function = fn_ir(e, fx);
+    if (k >= fn.param_count) { ret false; }
+    val t: opt[*type.IrType] = type.get(?fn_mod(e, fx).types, fn.params[k].ty);
+    if (sel t.none) { ret false; }
+    ret t.some.kind == type.IRT_HANDLE;
+}
+
 fun param_is_pointer(e: *Emit, fx: u32, k: u32) bool {
     val fn: *ir.Function = fn_ir(e, fx);
     if (k >= fn.param_count) { ret false; }
@@ -1186,17 +1194,53 @@ fun build_gl_access(e: *Emit) err[fail.Fail] {
 }
 
 fun scan_fn_access(e: *Emit, fx: u32, mf: *mir.MirFunction) err[fail.Fail] {
-    val n:      u32  = mf.vreg_count;
-    var origin: *u32 = nil;
+    val n:       u32  = mf.vreg_count;
+    var origin:  *u32 = nil;
+    var horigin: *u32 = nil;
     if (n > 0) {
         val ro: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
         if (sel ro.err) { ret err[fail.Fail].err{fail.refused(ro.err)}; }
         origin = ro.ok;
+        val rh: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+        if (sel rh.err) {
+            A.deallocate[u32](e.alloc, origin, n::usize);
+            ret err[fail.Fail].err{fail.refused(rh.err)};
+        }
+        horigin = rh.ok;
         var v: u32 = 0;
         for (v < n) {
-            origin[v] = GL_NONE;
-            v         = v + 1;
+            origin[v]  = GL_NONE;
+            horigin[v] = GL_NONE;
+            v          = v + 1;
         }
+    }
+    val r: err[fail.Fail] = scan_fn_access_in(e, fx, mf, n, origin, horigin);
+    if (origin != nil)  { A.deallocate[u32](e.alloc, origin, n::usize); }
+    if (horigin != nil) { A.deallocate[u32](e.alloc, horigin, n::usize); }
+    ret r;
+}
+
+# `origin` is the global a pointer register points into, `horigin` the handle
+# global a register holds the descriptor of
+fun scan_fn_access_in(e: *Emit, fx: u32, mf: *mir.MirFunction, n: u32, origin: *u32, horigin: *u32) err[fail.Fail] {
+    var hb: u32 = 0;
+    for (hb < mf.block_count) {
+        val blk: *mir.MirBlock = ?mf.blocks[hb];
+        var ii:  u32           = 0;
+        for (ii < blk.instr_count) {
+            val g: u32             = descriptor_load(e, ?blk.instrs[ii]);
+            val d: *mir.MirOperand = ?blk.instrs[ii].operands[0];
+            if (g != GL_NONE && horigin != nil && d.kind == mir.MIR_OP_VREG && d.vreg.n < n) { horigin[d.vreg.n] = g; }
+            # a handle parameter holds the descriptor the caller passes
+            val pm: *mir.MirInstr = ?blk.instrs[ii];
+            if (pm.opcode == mir.MIR_VALUE_PARAM && pm.operand_count == 2 && horigin != nil
+                && d.kind == mir.MIR_OP_VREG && d.vreg.n < n && pm.operands[1].kind == mir.MIR_OP_IMM
+                && pm.operands[1].imm >= 0 && param_is_handle(e, fx, pm.operands[1].imm::u32)) {
+                horigin[d.vreg.n] = ORIGIN_PARAM | pm.operands[1].imm::u32;
+            }
+            ii = ii + 1;
+        }
+        hb = hb + 1;
     }
 
     var changed: bool = true;
@@ -1231,15 +1275,9 @@ fun scan_fn_access(e: *Emit, fx: u32, mf: *mir.MirFunction) err[fail.Fail] {
                 if (g == GL_NONE || origin[dst] == g) { cnt; }
                 if (origin[dst] != GL_NONE) {
                     val ra: err[fail.Fail] = mark_origin(e, fx, mi, origin[dst], ACCESS_WRITE | ACCESS_READ);
-                    if (sel ra.err) {
-                        A.deallocate[u32](e.alloc, origin, n::usize);
-                        ret ra;
-                    }
+                    if (sel ra.err) { ret ra; }
                     val rb: err[fail.Fail] = mark_origin(e, fx, mi, g, ACCESS_WRITE | ACCESS_READ);
-                    if (sel rb.err) {
-                        A.deallocate[u32](e.alloc, origin, n::usize);
-                        ret rb;
-                    }
+                    if (sel rb.err) { ret rb; }
                     cnt;
                 }
                 origin[dst] = g;
@@ -1256,8 +1294,37 @@ fun scan_fn_access(e: *Emit, fx: u32, mf: *mir.MirFunction) err[fail.Fail] {
         for (ii < blk.instr_count) {
             val mi:  *mir.MirInstr = ?blk.instrs[ii];
             val row: *isa.OpDef    = call_op_row(e, fx, mi);
-            var oi:  u32           = 0;
+            # loading a handle reads its descriptor, not the memory it names
+            val loads_handle: bool = descriptor_load(e, mi) != GL_NONE;
+            var oi:           u32  = 0;
             for (oi < mi.operand_count) {
+                if (loads_handle) {
+                    oi = oi + 1;
+                    cnt;
+                }
+                # a handle operand's memory is touched only as its row's kind says
+                if (row != nil && oi >= 2 && isa.op_kind_is_handle(isa.op_operand_kind(row, oi - 2))) {
+                    val hg: u32 = operand_origin(e, horigin, n, ?mi.operands[oi]);
+                    var hw: u8  = ACCESS_READ;
+                    if (isa.op_operand_kind(row, oi - 2) == isa.OP_OPERAND_HANDLE_WRITE) { hw = ACCESS_WRITE; }
+                    if (hg != GL_NONE) {
+                        val rh: err[fail.Fail] = mark_origin(e, fx, mi, hg, hw);
+                        if (sel rh.err) { ret rh; }
+                    }
+                    oi = oi + 1;
+                    cnt;
+                }
+                # a handle handed to a function has its memory touched as the callee touches it
+                # through that parameter, and read and written where no summary says how
+                if (row == nil && mi.opcode == mir.MIR_VALUE_CALL && oi >= 2 && mi.operands[oi].kind == mir.MIR_OP_VREG) {
+                    val cg: u32 = operand_origin(e, horigin, n, ?mi.operands[oi]);
+                    if (cg != GL_NONE) {
+                        var ch: u8 = ACCESS_WRITE | ACCESS_READ;
+                        if (!call_param_access(e, fx, mi, oi, ?ch)) { ch = ACCESS_WRITE | ACCESS_READ; }
+                        val rc: err[fail.Fail] = mark_origin(e, fx, mi, cg, ch);
+                        if (sel rc.err) { ret rc; }
+                    }
+                }
                 val g: u32 = operand_origin(e, origin, n, ?mi.operands[oi]);
                 if (g == GL_NONE) {
                     oi = oi + 1;
@@ -1270,18 +1337,23 @@ fun scan_fn_access(e: *Emit, fx: u32, mf: *mir.MirFunction) err[fail.Fail] {
                     if (!operand_never_reads(mi, oi)) { how = how | ACCESS_READ; }
                 }
                 val rm: err[fail.Fail] = mark_origin(e, fx, mi, g, how);
-                if (sel rm.err) {
-                    if (origin != nil) { A.deallocate[u32](e.alloc, origin, n::usize); }
-                    ret rm;
-                }
+                if (sel rm.err) { ret rm; }
                 oi = oi + 1;
             }
             ii = ii + 1;
         }
         bi2 = bi2 + 1;
     }
-    if (origin != nil) { A.deallocate[u32](e.alloc, origin, n::usize); }
     ret err[fail.Fail].ok{};
+}
+
+# the handle global a load reads the descriptor of, GL_NONE for any other instruction
+fun descriptor_load(e: *Emit, mi: *mir.MirInstr) u32 {
+    if (mi.opcode != mir.MIR_LOAD || mi.operand_count != 2)                   { ret GL_NONE; }
+    if (mi.operands[1].kind != mir.MIR_OP_SYM || mi.operands[1].sym_off != 0) { ret GL_NONE; }
+    val g: u32 = gl_lookup(e, mi.operands[1].sym);
+    if (g == GL_NONE || !is_image_type(e, gl_types(e, g), gl_ir(e, g).ty)) { ret GL_NONE; }
+    ret g;
 }
 
 # the instruction row an `op` call assembles, nil for any other instruction
@@ -1321,19 +1393,23 @@ fun derived_pointer(e: *Emit, fx: u32, mi: *mir.MirInstr, out_dst: *u32, out_bas
 fun op_operand_access(row: *isa.OpDef, oi: u32) u8 {
     if (oi < 2) { ret 0; }
     val kind: isa.OpOperandKind = isa.op_operand_kind(row, oi - 2);
+    # a pointer result's base is touched by the result's own uses, never by deriving it
+    val base: bool = row.result == isa.OP_RESULT_POINTER && isa.op_kind_is_pointer(kind) && first_pointer_operand(row) == oi - 2;
+    if (base)                                  { ret 0; }
     if (kind == isa.OP_OPERAND_POINTER_WRITE)  { ret ACCESS_WRITE; }
     if (kind == isa.OP_OPERAND_POINTER_UPDATE) { ret ACCESS_WRITE | ACCESS_READ; }
     ret ACCESS_READ;
 }
 
-# how a call touches what a pointer argument names: as the callee does through that
-# parameter; false for an operand that is no pointer argument of an emitted callee
+# how a call touches what a pointer or handle argument names: as the callee does through
+# that parameter; false for an operand that is no such argument of an emitted callee
 fun call_param_access(e: *Emit, fx: u32, mi: *mir.MirInstr, oi: u32, out: *u8) bool {
     if (oi < 2 || e.pacc == nil) { ret false; }
     val kind: mir.MirOperandKind = mi.operands[oi].kind;
     if (kind != mir.MIR_OP_VREG && kind != mir.MIR_OP_SYM) { ret false; }
     val gx: u32 = mach_callee(e, fx, mi);
-    if (gx == FN_NONE || !param_is_pointer(e, gx, oi - 2)) { ret false; }
+    if (gx == FN_NONE)                                                       { ret false; }
+    if (!param_is_pointer(e, gx, oi - 2) && !param_is_handle(e, gx, oi - 2)) { ret false; }
     @out = e.pacc[e.pbase[gx] + oi - 2];
     ret true;
 }
@@ -1348,6 +1424,15 @@ fun mark_origin(e: *Emit, fx: u32, mi: *mir.MirInstr, o: u32, how: u8) err[fail.
         e.pacc_grew = true;
     }
     ret err[fail.Fail].ok{};
+}
+
+fun first_pointer_operand(row: *isa.OpDef) u32 {
+    var i: u32 = 0;
+    for (i < row.arity) {
+        if (isa.op_kind_is_pointer(isa.op_operand_kind(row, i))) { ret i; }
+        i = i + 1;
+    }
+    ret row.arity;
 }
 
 fun operand_only_reads(mi: *mir.MirInstr, oi: u32) bool {
@@ -1413,9 +1498,7 @@ fun mark_access(e: *Emit, mi: *mir.MirInstr, gix: u32, how: u8) err[fail.Fail] {
         }
         ret err[fail.Fail].err{reject_at(e, dkind.SPIRV_READONLY_STORE, mir.refusal_loc(e.cur_fn, mi), r.ok)};
     }
-    # loading a handle reads the descriptor, not the memory it names
-    if ((fresh & ACCESS_READ) != 0 && (g.iface_flags & ir.IFACE_FLAG_WRITEONLY) != 0
-        && !is_image_type(e, gl_types(e, gix), g.ty)) {
+    if ((fresh & ACCESS_READ) != 0 && (g.iface_flags & ir.IFACE_FLAG_WRITEONLY) != 0) {
         val r: res[str, format.FormatError] = format.sprint(e.alloc,
             "a load reaches the `#[storage({}, {}, \"writeonly\")]` binding{}: the qualifier declares that nothing reads it, which is what lets this module mark the descriptor `NonReadable`. drop the `\"writeonly\"` qualifier to read it",
             g.iface_a, g.iface_b, gl_mod_prefix(e, gix));
@@ -1548,7 +1631,8 @@ fun declare_interface(e: *Emit) err[fail.Fail] {
             if (br != nil) { ret err[fail.Fail].err{reject_module(e, dkind.SPIRV_INTERFACE, br)}; }
         }
 
-        var storage: u32 = spirv.STORAGE_INPUT;
+        val handle:  bool = is_image_type(e, gt, g.ty);
+        var storage: u32  = spirv.STORAGE_INPUT;
         if (g.iface == ir.IFACE_OUTPUT)  { storage = spirv.STORAGE_OUTPUT; }
         or (g.iface == ir.IFACE_UNIFORM) { storage = spirv.STORAGE_UNIFORM; }
         or (g.iface == ir.IFACE_STORAGE) { storage = spirv.storage_buffer_class(e.b.version); }
@@ -1556,17 +1640,18 @@ fun declare_interface(e: *Emit) err[fail.Fail] {
         or (g.iface == ir.IFACE_PUSH)    { storage = spirv.STORAGE_PUSH_CONSTANT; }
         or (g.iface == ir.IFACE_BUILTIN) { storage = builtin_storage(g.iface_a); }
         or (g.iface == ir.IFACE_SHARED)  { storage = spirv.STORAGE_WORKGROUP; }
+        # every handle variable lives in UniformConstant, a storage image's included
+        if (handle) { storage = spirv.STORAGE_UNIFORM_CONSTANT; }
 
-        val handle: bool = is_image_type(e, gt, g.ty);
-        if (handle && g.iface != ir.IFACE_SAMPLER) {
-            ret err[fail.Fail].err{reject_module(e, dkind.SPIRV_INTERFACE, "an image handle carries an interface role other than `#[sampler(set, binding)]`; a handle is bound as a descriptor and reaches no other storage class")};
+        if (handle && g.iface != handle_role(e, gt, g.ty)) {
+            ret err[fail.Fail].err{reject_module(e, dkind.SPIRV_INTERFACE, "an image handle carries an interface role other than the descriptor it binds as: a storage image is `#[storage(set, binding)]`, every other handle `#[sampler(set, binding)]`, and a handle reaches no other storage class")};
         }
         if (!handle && g.iface == ir.IFACE_SAMPLER) {
             ret err[fail.Fail].err{reject_module(e, dkind.SPIRV_INTERFACE, "a `#[sampler(set, binding)]` binding is not of an image handle type; a descriptor-bound block or buffer of an ordinary type is `#[uniform]` or `#[storage]`")};
         }
 
         var value_ty: u32 = 0;
-        if (is_block_iface(g.iface)) {
+        if (is_block_iface(g.iface) && !handle) {
             val ur: res[u32, fail.Fail] = block_type(e, gt, g.ty, g.iface);
             if (sel ur.err) { ret err[fail.Fail].err{ur.err}; }
             value_ty = ur.ok;
@@ -1599,7 +1684,7 @@ fun declare_interface(e: *Emit) err[fail.Fail] {
         e.gtype_ids[i] = value_ty;
         e.gstorage[i]  = storage;
         dbgm.name_shown(?e.dbg, var_id, g.disp, g.name);
-        if (is_block_iface(g.iface)) { dbgm.record(?e.dbg, value_ty, g.ty_sem); }
+        if (is_block_iface(g.iface) && !handle) { dbgm.record(?e.dbg, value_ty, g.ty_sem); }
 
         if (g.iface == ir.IFACE_INPUT || g.iface == ir.IFACE_OUTPUT) {
             decorate(e, var_id, spirv.DECOR_LOCATION, g.iface_a);
@@ -4267,7 +4352,8 @@ fun handle_spv_type(e: *Emit, tys: *type.IrTypeTable, t: *type.IrType) u32 {
             t.data.handle_.operands[defs.IMAGE_OP_DEPTH]::u32,
             t.data.handle_.operands[defs.IMAGE_OP_ARRAYED]::u32,
             t.data.handle_.operands[defs.IMAGE_OP_MS]::u32,
-            t.data.handle_.operands[defs.IMAGE_OP_SAMPLED]::u32);
+            t.data.handle_.operands[defs.IMAGE_OP_SAMPLED]::u32,
+            t.data.handle_.operands[defs.IMAGE_OP_FORMAT]::u32);
     }
 
     ret 0;
@@ -4337,6 +4423,17 @@ fun is_image_type(e: *Emit, gt: *type.IrTypeTable, id: type.IrTypeId) bool {
     val opt_: opt[*type.IrType] = type.get(gt, id);
     if (sel opt_.none) { ret false; }
     ret opt_.some.kind == type.IRT_HANDLE;
+}
+
+# the interface role a handle type binds through: a storage image `#[storage]`, any other handle `#[sampler]`
+fun handle_role(e: *Emit, gt: *type.IrTypeTable, id: type.IrTypeId) u8 {
+    val opt_: opt[*type.IrType] = type.get(gt, id);
+    if (!sel opt_.some) { ret ir.IFACE_SAMPLER; }
+    val t: *type.IrType = opt_.some;
+    if (t.kind != type.IRT_HANDLE) { ret ir.IFACE_SAMPLER; }
+    if (t.data.handle_.ctor == defs.SPV_CTOR_IMAGE && t.data.handle_.count == defs.IMAGE_ARITY
+        && t.data.handle_.operands[defs.IMAGE_OP_SAMPLED]::u32 == spirv.IMAGE_SAMPLED_STORAGE) { ret ir.IFACE_STORAGE; }
+    ret ir.IFACE_SAMPLER;
 }
 
 fun memory_load(e: *Emit, ty: u32, result: u32, ptr: u32, flags: u8) {
@@ -5179,6 +5276,8 @@ fun emit_spirv_op(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, mi: *mir.MirInstr,
 
     var i: u32 = 0;
     for (i < argc) {
+        val hr: err[fail.Fail] = require_handle_access(e, mf, row, isa.op_operand_kind(row, i), sig.data.fn.params[i]);
+        if (sel hr.err) { ret hr; }
         val word: res[u32, fail.Fail] = op_operand(e, mf, vm, mi, row, i, sig.data.fn.params[i]);
         if (sel word.err) { ret emit_inner(e, word.err); }
         ops[base + i] = word.ok;
@@ -5300,6 +5399,27 @@ fun op_use_text(e: *Emit, row: *isa.OpDef, value: str) str {
     or                { r = format.sprint(e.alloc, "`{}` with `{}`", row.name, value); }
     if (sel r.err)    { ret row.name; }
     ret r.ok;
+}
+
+# a storage image of Unknown format is read or written only under the capability
+# for doing so without a format, and the device feature that permits it
+fun require_handle_access(e: *Emit, mf: *mir.MirFunction, row: *isa.OpDef, kind: isa.OpOperandKind,
+    param: type.IrTypeId) err[fail.Fail] {
+    if (!isa.op_kind_is_handle(kind)) { ret err[fail.Fail].ok{}; }
+    val opt_: opt[*type.IrType] = type.get(?e.ir.types, param);
+    if (!sel opt_.some) { ret err[fail.Fail].ok{}; }
+    val t: *type.IrType = opt_.some;
+    if (t.kind != type.IRT_HANDLE || t.data.handle_.ctor != defs.SPV_CTOR_IMAGE
+        || t.data.handle_.count != defs.IMAGE_ARITY) { ret err[fail.Fail].ok{}; }
+    if (t.data.handle_.operands[defs.IMAGE_OP_SAMPLED]::u32 != spirv.IMAGE_SAMPLED_STORAGE
+        || t.data.handle_.operands[defs.IMAGE_OP_FORMAT]::u32 != spirv.IMAGE_FORMAT_UNKNOWN) { ret err[fail.Fail].ok{}; }
+    var what: str                          = row.name;
+    val r:    res[str, format.FormatError] = format.sprint(e.alloc, "`{}` on a storage image of `Unknown` format", row.name);
+    if (sel r.ok) { what = r.ok; }
+    if (kind == isa.OP_OPERAND_HANDLE_WRITE) {
+        ret require(e, mf, spirv.CAP_STORAGE_IMAGE_WRITE_NO_FORMAT, spirv.EXT_STORAGE_WRITE_WITHOUT_FORMAT, what);
+    }
+    ret require(e, mf, spirv.CAP_STORAGE_IMAGE_READ_NO_FORMAT, spirv.EXT_STORAGE_READ_WITHOUT_FORMAT, what);
 }
 
 # the word operand `i` of an `op` call contributes, written as its row's kind says

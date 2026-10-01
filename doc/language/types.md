@@ -350,7 +350,7 @@ The language knows only the machinery. A handle is a **bodyless `def`** carrying
 operands each takes, and what an operand means all belong to the named target:
 
 ```mach fragment
-#[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED)]
+#[handle("spirv", "image", TEXEL_F32, DIM_2D, NO_DEPTH, NONARRAYED, SINGLE_SAMPLED, SAMPLED, FORMAT_UNKNOWN)]
 pub def Texture2D;
 
 #[handle("spirv", "sampled_image", Texture2D)]
@@ -363,6 +363,22 @@ pub def Sampler;
 `def` is the carrier because it already means "this name denotes a type" and
 promises no fields and no storage, which is exactly what a handle is. There is no
 body because the target supplies the definition.
+
+The spirv `image` constructor takes the seven operands of `OpTypeImage` in its
+order: the texel scalar, `Dim`, `Depth`, `Arrayed`, `MS`, `Sampled` and the
+`Image Format`. The format is required, and `0` (`Unknown`) is the usual choice for
+a sampled image. `Sampled` `1` is an image read through a sampler and `2` a storage
+image, read and written directly and bound through `#[storage]` (see
+[decorators.md](decorators.md)). A storage image of a known format needs no device
+feature to read or write, and a format other than `Rgba32f`, `Rgba16f`, `R32f`,
+`Rgba8`, `Rgba8Snorm` and the `Rgba32`, `Rgba16`, `Rgba8` and `R32` integer forms
+declares `StorageImageExtendedFormats`. An `Unknown` storage image is read and
+written under `StorageImageReadWithoutFormat` and `StorageImageWriteWithoutFormat`,
+which `vulkan1.3` accepts and an earlier `env` accepts only with the
+`storage_read_without_format` and `storage_write_without_format` extensions (see
+[manifest.md](manifest.md#instruction-set-extensions)). A format must match the
+texel scalar: a float or normalized format is read as `f32`, a signed integer
+format as `i32` and an unsigned one as `u32`.
 
 The operands are ordinary comptime constants. One position is not: a constructor
 that composes over another handle takes a **type name**, so `Sampler2D` names the
