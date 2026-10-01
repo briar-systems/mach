@@ -209,6 +209,15 @@ pub val TYPE_F16: TypeKind = 27
 
 IEEE binary16, appended like the 128-bit integers (#3798)
 
+## val TYPE_KIND_COUNT
+
+```mach
+pub val TYPE_KIND_COUNT: u32 = 28
+```
+
+one past the last kind: a kind is appended and bumps it, so a walker over
+0..TYPE_KIND_COUNT meets every kind
+
 ## def PrimClass
 
 ```mach
@@ -312,6 +321,14 @@ pub rec TypeAbi;
 ```mach
 pub val ABI_TYPE_VA_LIST: u32 = 0
 ```
+
+## fun abi_type_c_name
+
+```mach
+pub fun abi_type_c_name(tag: u32) opt[str];
+```
+
+the C type an ABI type tag stands for, absent for a tag outside the catalog
 
 ## rec VecShape
 
