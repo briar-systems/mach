@@ -87,6 +87,15 @@ pub fun infer_expr(sc: *context.SemaContext, eid: id.ExprId) type.TypeId;
 pub fun is_field_type_operand(sc: *context.SemaContext, eid: id.ExprId) bool;
 ```
 
+## fun refuse_confined_flow
+
+```mach
+pub fun refuse_confined_flow(sc: *context.SemaContext, eid: id.ExprId, route: str);
+```
+
+refuses `eid` when it is a call to an `op` instruction whose result is confined to the
+operands of another `op` in its block, reached here where it would be `route`
+
 ## fun field_seq_owner
 
 ```mach

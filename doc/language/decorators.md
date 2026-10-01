@@ -1288,8 +1288,12 @@ fun frag_sep() { out_colour = sample(combine(base_tex, base_smp), in_uv); }
 ```
 
 The combined value is handed straight to the sample rather than named: SPIR-V
-requires an `OpSampledImage` result be consumed in the block that produced it,
-which is the same rule that makes a handle-typed local a compile error.
+requires an `OpSampledImage` result be consumed by an image instruction in the block
+that produced it, which is the same rule that makes a handle-typed local a compile
+error. Returning one, or passing one to a function, is refused with
+`op.result_flow`, and so is a sample whose later operand branches, as `&&` and `||`
+do, since its sampled image would then be consumed in another block. Compute such an
+operand into a binding before the call.
 
 `shared` declares **workgroup memory**: one instance per workgroup of a compute
 stage, which every invocation of that workgroup reads and writes. It applies to a
@@ -1696,9 +1700,16 @@ at the declaration rather than as an invalid module.
 | `OpImageRead`, `OpImageFetch`, `OpImageSample*Lod`, `OpImageGather` | the result is a 4-vector of the image's texel scalar, a sampled image's being its image's |
 | `OpImageWrite` | the texel is a scalar or vector of the image's texel scalar, with at least as many components as the image's format stores (any for `Unknown`) |
 | `OpImageTexelPointer` | the result points to the image's texel scalar, into a storage image of `R32ui`, `R32i`, `R32f`, `R64ui` or `R64i` format |
+| `OpSampledImage` | the result is a sampled image composed over the image operand's own type, and the second operand is a `sampler` |
 | `OpGroupNonUniformBroadcast*`, `Shuffle*`, `Quad*` and the arithmetic rows | the result is the value operand's type |
 | the GLSL.std.450 math rows | the result and every operand are the first operand's type, except `Refract`'s `eta`, and `Length` and `Distance`, whose result is a scalar |
 | `OpDot` | the second vector is the first's type |
+
+A declaration that returns a handle is refused with `op.signature` unless its row
+names the operand its result derives from, since a handle holds a binding's
+descriptor and only that operand says whose. The math rows and the subgroup rows
+operate on a scalar or vector of integers or floats, so a handle, a pointer or an
+aggregate as their data operand is refused with `op.signature` too.
 
 Each image row names the rule its texel's component count comes from, and the
 refusal quotes it: the 4-vector read result is Vulkan's `VUID-StandaloneSpirv-Result-04780`,
