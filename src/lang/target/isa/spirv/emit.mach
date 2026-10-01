@@ -2041,7 +2041,7 @@ fun declare_interface(e: *Emit) err[fail.Fail] {
             vop[3] = types.const_null(e.tt, value_ty);
             vn     = 4;
         }
-        or (storage == spirv.STORAGE_OUTPUT) {
+        or (storage == spirv.STORAGE_OUTPUT && !output_zeroed_by_stage(e, gt, g, value_ty)) {
             vop[3] = output_initializer(e, gt, g, value_ty);
             vn     = 4;
             if (vop[3] == 0) {
@@ -2169,6 +2169,106 @@ fun output_initializer(e: *Emit, gt: *type.IrTypeTable, g: *ir.Global, value_ty:
         ret image_constant(e, gt, g.ty, value_ty, v.data.bytes.ptr, v.data.bytes.len, 0);
     }
     ret 0;
+}
+
+# an output starting at zero whose OpConstantNull would need the arithmetic capability of a
+# narrow leaf the selection lacks carries no initializer, and each stage reaching it stores
+# a zero built from wider constants first (#4353), which needs only the storage access
+# capability the output holds anyway. one starting elsewhere keeps its constant
+fun output_zeroed_by_stage(e: *Emit, gt: *type.IrTypeTable, g: *ir.Global, value_ty: u32) bool {
+    if (g.iface != ir.IFACE_OUTPUT || !holds_unconstant_narrow(e, value_ty)) { ret false; }
+    val v: *value.Value = ?g.init;
+    if (v.kind == value.VAL_CONST_NULL)                                   { ret true; }
+    if (v.kind == value.VAL_CONST_INT || v.kind == value.VAL_CONST_FLOAT) { ret v.data.int_lit == 0; }
+    if (v.kind == value.VAL_CONST_AGG && v.data.agg.reloc_count == 0)     { ret bytes_zero(v.data.agg.bytes, v.data.agg.len); }
+    if (v.kind == value.VAL_CONST_BYTES)                                  { ret bytes_zero(v.data.bytes.ptr, v.data.bytes.len); }
+    ret false;
+}
+
+fun bytes_zero(bytes: *u8, len: u32) bool {
+    var k: u32 = 0;
+    for (k < len) {
+        if (bytes[k] != 0) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# a type holding a narrow leaf whose constant needs an arithmetic capability the selection
+# lacks: a 16-bit integer without int16, an f16 without float16, an 8-bit integer without int8
+fun holds_unconstant_narrow(e: *Emit, ty: u32) bool {
+    if (ty == 0) { ret false; }
+    var n:    u32 = 0;
+    val lane: u32 = types.vector_shape(e.tt, ty, ?n);
+    if (lane != 0) { ret holds_unconstant_narrow(e, lane); }
+    if (types.is_composite(e.tt, ty)) {
+        val count: u32 = types.composite_count(e.tt, ty);
+        var i:     u32 = 0;
+        for (i < count) {
+            if (holds_unconstant_narrow(e, types.composite_member(e.tt, ty, i))) { ret true; }
+            i = i + 1;
+        }
+        ret false;
+    }
+    if (types.type_is_bool(e.tt, ty)) { ret false; }
+    val bits: u32 = types.type_bits(e.tt, ty);
+    if (bits != 8 && bits != 16)       { ret false; }
+    if (types.type_is_float(e.tt, ty)) { ret !half_memory(e); }
+    ret carrier_bits(e, bits) != bits;
+}
+
+# the zero of `ty` with no constant of a narrow type holds_unconstant_narrow names: each such
+# scalar or vector converted from the zero of its 32-bit counterpart, and a composite built
+# from its members' zeros
+fun narrow_free_zero(e: *Emit, ty: u32) u32 {
+    if (!holds_unconstant_narrow(e, ty)) { ret types.const_null(e.tt, ty); }
+    var n:    u32 = 0;
+    val lane: u32 = types.vector_shape(e.tt, ty, ?n);
+    if (lane == 0 && types.is_composite(e.tt, ty)) {
+        val count: u32 = types.composite_count(e.tt, ty);
+        if (count == 0 || !types.instruction_operands_fit(2, count)) { ret 0; }
+        val ar: res[*u32, A.Error] = A.allocate[u32](e.alloc, count::usize);
+        if (sel ar.err) { ret 0; }
+        val parts: *u32 = ar.ok;
+        fin { A.deallocate[u32](e.alloc, parts, count::usize); }
+        var i: u32 = 0;
+        for (i < count) {
+            parts[i] = narrow_free_zero(e, types.composite_member(e.tt, ty, i));
+            if (parts[i] == 0) { ret 0; }
+            i = i + 1;
+        }
+        ret emit_construct(e, ty, parts, count);
+    }
+    var leaf: u32 = ty;
+    if (lane != 0) { leaf = lane; }
+    val float: bool = types.type_is_float(e.tt, leaf);
+    var wide:  u32  = types.type_int(e.tt, 32);
+    var op:    u32  = spirv.OP_U_CONVERT;
+    if (float) {
+        wide = types.type_float(e.tt, 32);
+        op   = spirv.OP_F_CONVERT;
+    }
+    if (lane != 0) { wide = types.type_vector(e.tt, wide, n); }
+    ret half_inst(e, op, ty, types.const_null(e.tt, wide), 0, 0, 1);
+}
+
+# the zero each output output_zeroed_by_stage names starts at, stored by a stage that reaches it
+fun emit_output_zeroing(e: *Emit, fx: u32) err[fail.Fail] {
+    var gx: u32 = 0;
+    for (gx < e.gl_len) {
+        val g: *ir.Global = gl_ir(e, gx);
+        if (g.iface != ir.IFACE_OUTPUT || e.gslot[gx] == 0 || e.gvar_ids[gx] == 0 || !uses_iface(e, fx, e.gslot[gx] - 1)
+            || !output_zeroed_by_stage(e, gl_types(e, gx), g, e.gtype_ids[gx])) {
+            gx = gx + 1;
+            cnt;
+        }
+        val zero: u32 = narrow_free_zero(e, e.gtype_ids[gx]);
+        if (zero == 0) { ret emit_fail(e, "spirv.emit: could not build an output's zero"); }
+        memory_store(e, e.gvar_ids[gx], zero, 0);
+        gx = gx + 1;
+    }
+    if (e.b.err) { ret err[fail.Fail].err{fail.message("spirv.emit: module builder hit an allocation error")}; }
+    ret err[fail.Fail].ok{};
 }
 
 # the constant of `spv_ty` that the byte image of ir type `id` at `off` spells, laid out
@@ -4460,7 +4560,10 @@ fun emit_function(e: *Emit, cx: u32) err[fail.Fail] {
     e.cur_pslot  = pslot;
     e.cur_params = param_ids;
     var body: err[fail.Fail] = err[fail.Fail].ok{};
-    if (zeroing) { body = emit_shared_zeroing(e, fx, irfn, lb[0], labels[st.order[0]]); }
+    if (irfn.stage != ir.STAGE_NONE) { body = emit_output_zeroing(e, fx); }
+    var opened: bool = true;
+    if (sel body.err)      { opened = false; }
+    if (zeroing && opened) { body = emit_shared_zeroing(e, fx, irfn, lb[0], labels[st.order[0]]); }
     var oi: u32 = 0;
     if (sel body.err) { oi = st.count; }
     for (oi < st.count) {

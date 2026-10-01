@@ -720,9 +720,12 @@ the version that took it into the core.
 | `#[push]` | `storage_push_constant16` (`StoragePushConstant16`) | `storage_push_constant8` (`StoragePushConstant8`) |
 | `#[input(n)]`, `#[output(n)]` | `storage_input_output16` (`StorageInputOutput16`) | refused |
 
-A stage output starts at a zero constant, and a constant of an 8- or 16-bit type
-needs the type's own feature, `int8`, `int16` or `float16`, so an output holding
-one needs that as well as `storage_input_output16`. The 16-bit capabilities need
+A stage output starts at its initializer, and at zero without one. A constant of a
+16-bit type needs the type's own feature, `int16` or `float16`, so an output holding a
+16-bit scalar without it carries no zero constant: each stage that reaches it stores
+the zero first, converted from a 32-bit one, and the output needs
+`storage_input_output16` alone. One initialized to anything but zero starts at that
+constant, which needs the type's feature as well. The 16-bit capabilities need
 `SPV_KHR_16bit_storage` below SPIR-V 1.3 and the 8-bit ones `SPV_KHR_8bit_storage`
 below SPIR-V 1.5. Vulkan defines no 8-bit stage input or
 output, so one is refused, and an 8-bit member of a `#[storage(...)]` buffer is
