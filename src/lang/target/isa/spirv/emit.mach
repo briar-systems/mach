@@ -87,6 +87,8 @@ rec Emit {
     gspec: *u32;
     # the module sizes its compute stages through one WorkgroupSize built-in
     wg_builtin: bool;
+    # a stage input or output's type is being built, where an f16 is OpTypeFloat 16
+    half_interface: bool;
     # the module declares the Vulkan memory model, where an access is private unless it
     # says otherwise: `pscope` is the scope each pointer id's accesses are made available
     # and visible at, by its id, 0 for a private access. a coherent storage image is
@@ -307,6 +309,7 @@ pub fun emit_module(out_alloc: *A.Allocator, tgt: *isa.BackendTarget, u: *unit.U
     e.cur_params      = nil;
     e.gspec           = nil;
     e.wg_builtin      = false;
+    e.half_interface  = false;
     e.vulkan_mm       = spirv.vulkan_memory_model(tgt.model.extensions);
     e.pscope          = vector.init[u8](out_alloc);
     e.coherent_images = false;
@@ -2017,7 +2020,7 @@ fun declare_interface(e: *Emit) err[fail.Fail] {
             value_ty = ur.ok;
         }
         or (g.iface == ir.IFACE_INPUT || g.iface == ir.IFACE_OUTPUT) {
-            value_ty = host_shared_type(e, gt, g.ty);
+            value_ty = interface_type(e, gt, g.ty);
             val nr: err[fail.Fail] = require_interface_access(e, value_ty, i);
             if (sel nr.err) { ret nr; }
         }
@@ -2357,6 +2360,18 @@ fun host_shared_type(e: *Emit, gt: *type.IrTypeTable, id: type.IrTypeId) u32 {
     ret ty;
 }
 
+# the type a stage input or output of the ir type `id` is declared with: as host-shared
+# memory, with an f16 the OpTypeFloat 16 it is under every selection, since a pipeline
+# interpolates a float and matches stages by type, and without float16 a function carries
+# its bits (#4344)
+fun interface_type(e: *Emit, gt: *type.IrTypeTable, id: type.IrTypeId) u32 {
+    val prior: bool = e.half_interface;
+    e.half_interface = true;
+    val ty: u32 = host_shared_type(e, gt, id);
+    e.half_interface = prior;
+    ret ty;
+}
+
 # the widths of 8- and 16-bit scalars a type holds anywhere inside it, 8 | 16 as bits
 fun narrow_widths(e: *Emit, ty: u32) u32 {
     if (ty == 0) { ret 0; }
@@ -2470,6 +2485,129 @@ fun memory_bridged(e: *Emit, a: u32, b: u32) bool {
     val ab: u32 = types.type_bits(e.tt, a);
     val bb: u32 = types.type_bits(e.tt, b);
     ret ab != 0 && bb != 0 && ab != bb;
+}
+
+# an OpTypeFloat 16 of a stage interface and the 16- or 32-bit integer bits, or a vector
+# of them lane for lane, a function carries an f16 in without float16 (#4344)
+fun half_bits_bridged(e: *Emit, a: u32, b: u32) bool {
+    if (a == 0 || b == 0 || a == b) { ret false; }
+    var na: u32 = 1;
+    var nb: u32 = 1;
+    val la: u32 = lane_of(e, a, ?na);
+    val lb: u32 = lane_of(e, b, ?nb);
+    if (na != nb) { ret false; }
+    val ha: bool = is_half_type(e, la);
+    if (ha == is_half_type(e, lb)) { ret false; }
+    var held: u32 = la;
+    if (ha)                                                                { held = lb; }
+    if (types.type_is_float(e.tt, held) || types.type_is_bool(e.tt, held)) { ret false; }
+    val w: u32 = types.type_bits(e.tt, held);
+    ret w == 16 || w == 32;
+}
+
+# the integer bits a function carries an f16 of a stage interface in without float16: a
+# scalar at the carrier of its width, a vector as its 16-bit lanes. any other type as it is
+fun half_bits_type(e: *Emit, ty: u32) u32 {
+    if (ty == 0 || half_memory(e)) { ret ty; }
+    var n:    u32 = 1;
+    val lane: u32 = lane_of(e, ty, ?n);
+    if (!is_half_type(e, lane)) { ret ty; }
+    if (n == 1)                 { ret types.type_int(e.tt, carrier_bits(e, 16)); }
+    ret types.type_vector_value(e.tt, types.type_int(e.tt, 16), n);
+}
+
+fun is_half_type(e: *Emit, ty: u32) bool {
+    ret types.type_is_float(e.tt, ty) && types.type_bits(e.tt, ty) == 16;
+}
+
+# a vector type's lane type and count, and a scalar as one lane of itself
+fun lane_of(e: *Emit, ty: u32, out_count: *u32) u32 {
+    var n:    u32 = 0;
+    val lane: u32 = types.vector_shape(e.tt, ty, ?n);
+    if (lane != 0) {
+        @out_count = n;
+        ret lane;
+    }
+    @out_count = 1;
+    ret ty;
+}
+
+# an f16 moved across half_bits_bridged, lane by lane through binary32: without Float16
+# no instruction but a width conversion takes an OpTypeFloat 16, so its bits are not
+# bitcast but packed and unpacked, and an f16 is exact in binary32 both ways
+fun half_bits_as(e: *Emit, value: u32, from_ty: u32, to_ty: u32) u32 {
+    var n:  u32 = 1;
+    var m:  u32 = 1;
+    val fl: u32 = lane_of(e, from_ty, ?n);
+    val tl: u32 = lane_of(e, to_ty, ?m);
+    if (value == 0 || n == 0 || n > 16 || n != m) { ret 0; }
+    val glsl: u32 = ext_set_id(e, defs.SPV_SET_GLSL450::u32);
+    val f32t: u32 = types.type_float(e.tt, 32);
+    val u32t: u32 = types.type_int(e.tt, 32);
+    val pair: u32 = types.type_vector_value(e.tt, f32t, 2);
+    var wide: u32 = f32t;
+    if (n > 1) { wide = types.type_vector_value(e.tt, f32t, n); }
+    var lanes: [16]u32;
+    var i:     u32 = 0;
+    if (is_half_type(e, fl)) {
+        val zero: u32 = types.const_scalar(e.tt, f32t, 0, 0);
+        val w:    u32 = half_inst(e, spirv.OP_F_CONVERT, wide, value, 0, 0, 1);
+        for (i < n) {
+            var f: u32 = w;
+            if (n > 1) { f = half_inst(e, spirv.OP_COMPOSITE_EXTRACT, f32t, w, i, 0, 2); }
+            val v:    u32 = half_inst(e, spirv.OP_COMPOSITE_CONSTRUCT, pair, f, zero, 0, 2);
+            val bits: u32 = half_inst(e, spirv.OP_EXT_INST, u32t, glsl, defs.GLSL450_PACK_HALF_2X16, v, 3);
+            lanes[i] = lane_width_as(e, bits, u32t, tl);
+            i        = i + 1;
+        }
+        if (n == 1) { ret lanes[0]; }
+        ret emit_construct(e, to_ty, ?lanes[0], n);
+    }
+    for (i < n) {
+        var c: u32 = value;
+        if (n > 1) { c = half_inst(e, spirv.OP_COMPOSITE_EXTRACT, fl, value, i, 0, 2); }
+        val bits: u32 = lane_width_as(e, c, fl, u32t);
+        val v:    u32 = half_inst(e, spirv.OP_EXT_INST, pair, glsl, defs.GLSL450_UNPACK_HALF_2X16, bits, 3);
+        lanes[i] = half_inst(e, spirv.OP_COMPOSITE_EXTRACT, f32t, v, 0, 0, 2);
+        i        = i + 1;
+    }
+    var w: u32 = lanes[0];
+    if (n > 1) { w = emit_construct(e, wide, ?lanes[0], n); }
+    ret half_inst(e, spirv.OP_F_CONVERT, to_ty, w, 0, 0, 1);
+}
+
+# an instruction of half_bits_as: a result of `ty` from `argc` operand words
+fun half_inst(e: *Emit, opcode: u32, ty: u32, a: u32, b: u32, c: u32, argc: u32) u32 {
+    val result: u32 = spirv.alloc_id(e.b);
+    var words:  [5]u32;
+    words[0] = ty;
+    words[1] = result;
+    words[2] = a;
+    words[3] = b;
+    words[4] = c;
+    spirv.inst(e.b, ?e.b.functions, opcode, ?words[0], 2 + argc);
+    ret result;
+}
+
+# an OpCompositeConstruct of `ty` from its `n` parts
+fun emit_construct(e: *Emit, ty: u32, parts: *u32, n: u32) u32 {
+    val ar: res[*u32, A.Error] = A.allocate[u32](e.alloc, (n + 2)::usize);
+    if (sel ar.err) {
+        e.b.err = true;
+        ret 0;
+    }
+    val words: *u32 = ar.ok;
+    fin { A.deallocate[u32](e.alloc, words, (n + 2)::usize); }
+    val result: u32 = spirv.alloc_id(e.b);
+    words[0] = ty;
+    words[1] = result;
+    var i: u32 = 0;
+    for (i < n) {
+        words[2 + i] = parts[i];
+        i            = i + 1;
+    }
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_COMPOSITE_CONSTRUCT, words, 2 + n);
+    ret result;
 }
 
 fun emit_bitcast(e: *Emit, to_ty: u32, value: u32) u32 {
@@ -3620,9 +3758,11 @@ fun ir_scalar_shape(tt: *type.IrTypeTable, id: type.IrTypeId, out_lanes: *u32,
         @out_is_float = true;
         ret true;
     }
+    # an f16 is carried in the ir as a binary16 integer, and is the float it stands for
     if (t.kind == type.IRT_INT) {
-        @out_lanes = 1;
-        @out_bits  = t.data.bits;
+        @out_lanes    = 1;
+        @out_bits     = t.data.bits;
+        @out_is_float = type.int_form(tt, id) == type.INT_FORM_BINARY16;
         ret true;
     }
     if (t.kind != type.IRT_VECTOR) { ret false; }
@@ -3632,7 +3772,7 @@ fun ir_scalar_shape(tt: *type.IrTypeTable, id: type.IrTypeId, out_lanes: *u32,
     if (et.kind != type.IRT_FLOAT && et.kind != type.IRT_INT) { ret false; }
     @out_lanes    = t.data.vector_.lanes;
     @out_bits     = et.data.bits;
-    @out_is_float = et.kind == type.IRT_FLOAT;
+    @out_is_float = et.kind == type.IRT_FLOAT || type.int_form(tt, t.data.vector_.element) == type.INT_FORM_BINARY16;
     ret true;
 }
 
@@ -3641,15 +3781,6 @@ fun ir_type_spelling(tt: *type.IrTypeTable, alloc: *A.Allocator, id: type.IrType
     var bits:     u32  = 0;
     var is_float: bool = false;
     val shaped:   bool = ir_scalar_shape(tt, id, ?lanes, ?bits, ?is_float);
-    # an f16 is carried in the ir as a binary16 integer, and is spelled as the f16 it is
-    if (shaped && !is_float && bits == 16) {
-        var lane: type.IrTypeId     = id;
-        val o:    opt[*type.IrType] = type.get(tt, id);
-        if (sel o.some) {
-            if (o.some.kind == type.IRT_VECTOR) { lane = o.some.data.vector_.element; }
-        }
-        is_float = type.int_form(tt, lane) == type.INT_FORM_BINARY16;
-    }
     if (!shaped) {
         val opt_: opt[*type.IrType] = type.get(tt, id);
         if (sel opt_.none) { ret "an unresolved type"; }
@@ -5541,7 +5672,8 @@ fun read_narrow(e: *Emit, vm: *VMaps, op: *mir.MirOperand, ty: u32, bits: u32, s
 
 # the spirv type of an ir type. an f16, carried in the ir as a 16-bit integer whose form
 # is binary16, is the OpTypeFloat 16 it stands for wherever half_memory holds, in memory
-# and in a function alike (#4339), and its 16-bit integer bits otherwise
+# and in a function alike (#4339), in a stage interface always (#4344), and its 16-bit
+# integer bits otherwise
 fun spv_type_of(e: *Emit, tys: *type.IrTypeTable, id: type.IrTypeId) u32 {
     val opt_: opt[*type.IrType] = type.get(tys, id);
     if (sel opt_.none) { ret 0; }
@@ -5552,7 +5684,8 @@ fun spv_type_of(e: *Emit, tys: *type.IrTypeTable, id: type.IrTypeId) u32 {
         if (pointee == 0) { ret 0; }
         ret types.type_ptr(e.tt, spirv.STORAGE_FUNCTION, pointee);
     }
-    if (t.kind == type.IRT_INT && half_memory(e) && t.data.bits == 16 && type.int_form(tys, id) == type.INT_FORM_BINARY16) {
+    if (t.kind == type.IRT_INT && (half_memory(e) || e.half_interface) && t.data.bits == 16
+        && type.int_form(tys, id) == type.INT_FORM_BINARY16) {
         ret types.type_float(e.tt, 16);
     }
     if (t.kind == type.IRT_INT)   { ret types.type_int(e.tt, t.data.bits); }
@@ -5901,6 +6034,11 @@ fun emit_global_load(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, mi: *mir.MirIns
             var_id = leaf_ptr;
         }
     }
+    if (half_bits_bridged(e, chain_ty, vm.type_id[dst])) {
+        val loaded: u32 = spirv.alloc_id(e.b);
+        memory_load(e, chain_ty, loaded, var_id, mi.memory_flags);
+        ret store_vreg(e, vm, dst, half_bits_as(e, loaded, chain_ty, vm.type_id[dst]));
+    }
     if (memory_bridged(e, chain_ty, vm.type_id[dst])) {
         val loaded: u32 = spirv.alloc_id(e.b);
         memory_load(e, chain_ty, loaded, var_id, mi.memory_flags);
@@ -5949,9 +6087,10 @@ fun emit_global_store(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, mi: *mir.MirIn
     or (op.kind == mir.MIR_OP_IMM && value_ty != 0 && !types.type_is_float(e.tt, value_ty) && types.type_bits(e.tt, value_ty) != 0) {
         held_ty = types.type_int(e.tt, carrier_bits(e, types.type_bits(e.tt, value_ty)));
     }
-    if (memory_bridged(e, held_ty, value_ty)) { value = lane_width_as(e, read_operand(e, vm, op, held_ty), held_ty, value_ty); }
-    or                                        { value = read_operand(e, vm, op, value_ty); }
-    if (e.b.err || value == 0)                { ret emit_fail(e, "spirv.emit: unreadable value in an interface store"); }
+    if (half_bits_bridged(e, held_ty, value_ty)) { value = half_bits_as(e, read_operand(e, vm, op, held_ty), held_ty, value_ty); }
+    or (memory_bridged(e, held_ty, value_ty))    { value = lane_width_as(e, read_operand(e, vm, op, held_ty), held_ty, value_ty); }
+    or                                           { value = read_operand(e, vm, op, value_ty); }
+    if (e.b.err || value == 0)                   { ret emit_fail(e, "spirv.emit: unreadable value in an interface store"); }
     memory_store(e, var_id, value, mi.memory_flags);
     ret err[fail.Fail].ok{};
 }
@@ -5974,15 +6113,66 @@ fun interface_value_type(e: *Emit, op: *mir.MirOperand) u32 {
 }
 
 # the type a function carries a value of the memory type `ty` in: a scalar integer at
-# its carrier (#4302), and any other type as it is
-fun carried_value_type(e: *Emit, ty: u32) u32 {
-    if (ty == 0) { ret 0; }
+# its carrier (#4302), an interface f16 as its bits (half_bits_type), and any other type
+# as it is
+fun carried_value_type(e: *Emit, mem_ty: u32) u32 {
+    if (mem_ty == 0) { ret 0; }
+    val ty:    u32 = half_bits_type(e, mem_ty);
     var lanes: u32 = 0;
     if (types.vector_shape(e.tt, ty, ?lanes) != 0)                     { ret ty; }
     if (types.type_is_bool(e.tt, ty) || types.type_is_float(e.tt, ty)) { ret ty; }
     val bits: u32 = types.type_bits(e.tt, ty);
     if (bits == 0) { ret ty; }
     ret types.type_int(e.tt, carrier_bits(e, bits));
+}
+
+# a whole object of the memory type `mem_ty` at `ptr`, read as one of `to_ty`
+# (whole_value_as). one holding an f16 of a stage interface without float16 is read leaf
+# by leaf, since a 16-bit type of no arithmetic capability is loaded only as a scalar or
+# vector (#4344). an object read as its own type is loaded whole, since a function holds
+# no bare OpTypeFloat 16. 0 when the types do not match
+fun load_whole_as(e: *Emit, mem_ty: u32, ptr: u32, storage: u32, to_ty: u32, flags: u8) u32 {
+    if (mem_ty == to_ty || !types.is_composite(e.tt, mem_ty) || !holds_bare_half(e, mem_ty)) {
+        val loaded: u32 = spirv.alloc_id(e.b);
+        memory_load(e, mem_ty, loaded, ptr, flags);
+        ret whole_value_as(e, loaded, mem_ty, to_ty);
+    }
+    val n: u32 = types.composite_count(e.tt, mem_ty);
+    if (n == 0 || !types.is_composite(e.tt, to_ty) || n != types.composite_count(e.tt, to_ty)) { ret 0; }
+    val ar: res[*u32, A.Error] = A.allocate[u32](e.alloc, n::usize);
+    if (sel ar.err) {
+        e.b.err = true;
+        ret 0;
+    }
+    val parts: *u32 = ar.ok;
+    fin { A.deallocate[u32](e.alloc, parts, n::usize); }
+    var i: u32 = 0;
+    for (i < n) {
+        val member: u32 = types.composite_member(e.tt, mem_ty, i);
+        val chain:  u32 = emit_pair(e, spirv.OP_ACCESS_CHAIN, types.type_ptr(e.tt, storage, member), ptr, types.const_int(e.tt, 32, i::i64));
+        chain_memory_scope(e, chain, ptr);
+        parts[i] = load_whole_as(e, member, chain, storage, types.composite_member(e.tt, to_ty, i), flags);
+        if (parts[i] == 0) { ret 0; }
+        i = i + 1;
+    }
+    ret emit_construct(e, to_ty, parts, n);
+}
+
+# a type holding an OpTypeFloat 16 where the selection lacks float16, which only a stage
+# interface declares
+fun holds_bare_half(e: *Emit, ty: u32) bool {
+    if (ty == 0 || half_memory(e)) { ret false; }
+    var n:    u32 = 0;
+    val lane: u32 = types.vector_shape(e.tt, ty, ?n);
+    if (lane != 0)                     { ret is_half_type(e, lane); }
+    if (!types.is_composite(e.tt, ty)) { ret is_half_type(e, ty); }
+    val count: u32 = types.composite_count(e.tt, ty);
+    var i:     u32 = 0;
+    for (i < count) {
+        if (holds_bare_half(e, types.composite_member(e.tt, ty, i))) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # a whole object moved between two declarations of its type: OpCopyLogical where they
@@ -6001,6 +6191,7 @@ fun whole_value_as(e: *Emit, value: u32, from_ty: u32, to_ty: u32) u32 {
         spirv.inst(e.b, ?e.b.functions, spirv.OP_COPY_LOGICAL, ?ops[0], 3);
         ret res_;
     }
+    if (half_bits_bridged(e, from_ty, to_ty))                                   { ret half_bits_as(e, value, from_ty, to_ty); }
     if (memory_bridged(e, from_ty, to_ty))                                      { ret lane_width_as(e, value, from_ty, to_ty); }
     if (!types.is_composite(e.tt, from_ty) || !types.is_composite(e.tt, to_ty)) { ret 0; }
     val n: u32 = types.composite_count(e.tt, from_ty);
@@ -6264,10 +6455,7 @@ fun emit_memcpy(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, mi: *mir.MirInstr) e
     }
     if (src == 0 || src_ty == 0) { ret unsupported(e, addressed_memory_refusal(e, mf, ?mi.operands[1])); }
 
-    val value: u32 = spirv.alloc_id(e.b);
-    memory_load(e, src_ty, value, src, mi.memory_flags);
-
-    val stored: u32 = whole_value_as(e, value, src_ty, dst_ty);
+    val stored: u32 = load_whole_as(e, src_ty, src, access_storage_at(e, vm, ?mi.operands[1], src_sc), dst_ty, mi.memory_flags);
     if (stored == 0) {
         ret unsupported(e, "copying between two objects of different types is not supported by the SPIR-V target: logical addressing carries an object as a value of its own type, so a copy that reinterprets one type as another has no pointer to perform it through");
     }
@@ -6287,9 +6475,7 @@ fun read_value(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, op: *mir.MirOperand,
             ty  = interface_value_type(e, op);
         }
         if (src == 0 || ty == 0) { ret res[u32, fail.Fail].err{reject_at(e, dkind.SPIRV_UNSUPPORTED, mir.refusal_loc(mf, e.cur_instr), addressed_memory_refusal(e, mf, op))}; }
-        val loaded: u32 = spirv.alloc_id(e.b);
-        memory_load(e, ty, loaded, src, flags);
-        val converted: u32 = whole_value_as(e, loaded, ty, want_ty);
+        val converted: u32 = load_whole_as(e, ty, src, access_storage_at(e, vm, op, sc), want_ty, flags);
         if (converted == 0) { ret res[u32, fail.Fail].err{fail.message("spirv.emit: logical argument object does not match its declared type")}; }
         ret res[u32, fail.Fail].ok{converted};
     }
@@ -8699,6 +8885,14 @@ test needs_flat__integer_and_double_elements {
 
     if (needs_flat(?tt, f32t)) { ret 1; }
     if (needs_flat(?tt, v4f))  { ret 1; }
+
+    # an f16 is interpolated as the float its binary16 carrier stands for (#4344)
+    val h_r: res[type.IrTypeId, fail.Fail] = type.intern_int_form(?tt, 16, type.INT_FORM_BINARY16);
+    if (sel h_r.err) { ret 1; }
+    val v4h_r: res[type.IrTypeId, fail.Fail] = type.intern_vector(?tt, h_r.ok, 4);
+    if (sel v4h_r.err)             { ret 1; }
+    if (needs_flat(?tt, h_r.ok))   { ret 1; }
+    if (needs_flat(?tt, v4h_r.ok)) { ret 1; }
 
     if (needs_flat(?tt, arr)) { ret 1; }
 
