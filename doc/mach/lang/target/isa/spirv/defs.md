@@ -236,6 +236,27 @@ pub val IMAGE_OPERANDS_OFFSETS: u32 = IMAGE_OPERANDS_CONST_OFFSET | IMAGE_OPERAN
 
 the bits that offset a coordinate, of which an instruction takes one
 
+## val IMAGE_OPERANDS_MAKE_TEXEL_AVAILABLE
+
+```mach
+pub val IMAGE_OPERANDS_MAKE_TEXEL_AVAILABLE: u32 = 0x100
+```
+
+the Image Operands the emitter adds to a coherent storage image's access under the
+Vulkan memory model. no row admits them from a call yet
+
+## val IMAGE_OPERANDS_MAKE_TEXEL_VISIBLE
+
+```mach
+pub val IMAGE_OPERANDS_MAKE_TEXEL_VISIBLE:   u32 = 0x200
+```
+
+## val IMAGE_OPERANDS_NON_PRIVATE_TEXEL
+
+```mach
+pub val IMAGE_OPERANDS_NON_PRIVATE_TEXEL:    u32 = 0x400
+```
+
 ## val IMPLICIT_LOD_OPERANDS
 
 ```mach
