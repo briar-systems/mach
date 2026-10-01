@@ -1596,7 +1596,9 @@ sample may name the least level of detail it reads. image_gather_extended is the
 shaderImageGatherExtended feature, which enables ImageGatherExtended, so a gather
 may take an offset computed at run time. maintenance8 is the
 maintenance8 feature, under which a fetch or a sample takes a run-time offset too
-(VUID-RuntimeSpirv-Offset-10213) (#4303)
+(VUID-RuntimeSpirv-Offset-10213) (#4303).
+int8 and int16 are the Int8 and Int16 capabilities, so an integer of that width
+is computed at its own width rather than carried in a wider one (#4302)
 
 ## val EXT_ZERO_INIT_WORKGROUP
 
@@ -1803,6 +1805,18 @@ pub val EXT_IMAGE_FLOAT32_ATOMIC_ADD:      u64 = 0x100000000
 pub val EXT_IMAGE_FLOAT32_ATOMIC_MIN_MAX:  u64 = 0x200000000
 ```
 
+## val EXT_INT8
+
+```mach
+pub val EXT_INT8:                          u64 = 0x400000000
+```
+
+## val EXT_INT16
+
+```mach
+pub val EXT_INT16:                         u64 = 0x800000000
+```
+
 ## val EXT_ATOMICS
 
 ```mach
@@ -1815,7 +1829,7 @@ every atomic feature
 ## val EXTENSION_COUNT
 
 ```mach
-pub val EXTENSION_COUNT: u32 = 34
+pub val EXTENSION_COUNT: u32 = 36
 ```
 
 ## val ONLY_ENVIRONMENT
@@ -1844,6 +1858,7 @@ pub val EXT_OPEN: u64 = EXT_FLOAT16 | EXT_ZERO_INIT_WORKGROUP | EXT_SUBGROUP_ARI
 | EXT_SUBGROUP_VOTE | EXT_SUBGROUP_BALLOT | EXT_SUBGROUP_SHUFFLE | EXT_SUBGROUP_SHUFFLE_RELATIVE | EXT_SUBGROUP_QUAD
 | EXT_SUBGROUP_GRAPHICS_STAGES | EXT_ATOMICS | EXT_STORAGE_IMAGE_MULTISAMPLE | EXT_RESOURCE_MIN_LOD
 | EXT_IMAGE_GATHER_EXTENDED | EXT_MAINTENANCE8
+| EXT_INT8 | EXT_INT16
 ```
 
 every extension of the vocabulary, which a module naming no environment holds
@@ -1854,8 +1869,8 @@ every extension of the vocabulary, which a module naming no environment holds
 pub fun env_extensions(id: u32) u64;
 ```
 
-the extensions an environment guarantees: float16 where its ceiling holds
-Float16, and from vulkan1.3 zero_init_workgroup, where the feature is core, and
+the extensions an environment guarantees: float16, int8 and int16 where its
+ceiling holds Float16, Int8 and Int16, and from vulkan1.3 zero_init_workgroup, where the feature is core, and
 the two without-format features, whose capabilities it accepts with none enabled
 
 ## fun env_profile
