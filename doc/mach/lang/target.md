@@ -200,7 +200,7 @@ pub fun resolve(reg: *TargetRegistry, req: *TargetRequest) res[resolved.Target, 
 ## val TARGET_FINGERPRINT_VERSION
 
 ```mach
-pub val TARGET_FINGERPRINT_VERSION: u8 = 13
+pub val TARGET_FINGERPRINT_VERSION: u8 = 14
 ```
 
 version 9: the image domain carries how the convention passes an f16 (#3800).
@@ -209,6 +209,8 @@ version 11: the model domain carries the NaN conversion rule (#4125).
 version 12: the half rows each isa declares, the spirv environment's
 extensions and whether the float units return the first NaN operand (#3801)
 version 13: the model domain carries the vector compute-width rows (#4128)
+version 14: the model domain carries the gated alu width rows in place of
+the alu floor and ceiling (#4302)
 
 ## fun fingerprint
 
