@@ -1578,10 +1578,11 @@ pub def OpRelation: u8
 ```
 
 how an operand's or the result's type relates to the row's data type, the type of its
-typing's operand (a pointer operand's pointee): unrelated, that same type, a vector
-whose component is the sampled type of the handle the typing's operand is, or, for a
-pointer result only, a pointer to that sampled type, into the memory of the handle the
-typing's pointer operand addresses
+typing's operand (a pointer operand's pointee): unrelated, that same type, a texel, a
+scalar or vector whose component is the sampled type of the handle the typing's operand
+is, with as many components as the row's texel count states, or, for a pointer result
+only, a pointer to that sampled type, into the memory of the handle the typing's pointer
+operand addresses
 
 ## val OP_RELATION_NONE
 
@@ -1612,6 +1613,43 @@ pub val OP_RELATION_POINTEE: OpRelation = 3
 ```mach
 pub val OP_RELATION_COUNT:   OpRelation = 4
 ```
+
+## def OpCountKind
+
+```mach
+pub def OpCountKind: u8
+```
+
+how a row's texel count is stated: exactly a number of components, or at least as many
+as the handle's format stores, any number when its format is unknown
+
+## val OP_COUNT_EXACT
+
+```mach
+pub val OP_COUNT_EXACT:      OpCountKind = 0
+```
+
+## val OP_COUNT_FORMAT
+
+```mach
+pub val OP_COUNT_FORMAT:     OpCountKind = 1
+```
+
+## val OP_COUNT_KIND_COUNT
+
+```mach
+pub val OP_COUNT_KIND_COUNT: OpCountKind = 2
+```
+
+## rec OpTexelCount
+
+```mach
+pub rec OpTexelCount;
+```
+
+the number of components a row's texel has, a scalar being one: `components` exactly,
+or as `kind` says. `rule` names the rule a refusal cites. static data the target owns
+for the life of the program, like an OpTyping
 
 ## rec OpScalar
 
@@ -1670,6 +1708,23 @@ pub def TypeSampledFn: fun(*u32, u32) OpScalar
 
 the scalar a handle's texels are read and written as, from its operands, class
 OP_DATA_OTHER when it has none
+
+## def TypeComponentsFn
+
+```mach
+pub def TypeComponentsFn: fun(*u32, u32) u32
+```
+
+the number of components a handle's format stores each texel in, from its operands, 0
+when its format is unknown
+
+## val NO_TEXEL_OPERAND
+
+```mach
+pub val NO_TEXEL_OPERAND: u32 = 0xFFFFFFFF
+```
+
+a constructor whose handles state their own texels, or have none
 
 ## def TypeAddressFn
 
@@ -1772,9 +1827,26 @@ pub fun op_related(d: OpDef, result: OpRelation, operands: str) OpDef;
 ```
 
 `d` with its result's type related to its data type by `result`, and each operand's by
-one letter of `operands` in order: `-` unrelated, `=` the data type itself, `t` a vector
-of the sampled type of the handle the typing's operand is. a letter outside the set is
-an invalid relation, which registration refuses
+one letter of `operands` in order: `-` unrelated, `=` the data type itself, `t` a texel
+of the handle the typing's operand is. a letter outside the set is an invalid relation,
+which registration refuses
+
+## fun op_texel_counted
+
+```mach
+pub fun op_texel_counted(d: OpDef, count: *OpTexelCount) OpDef;
+```
+
+`d` with the texel it relates holding `count` components
+
+## fun op_texel_count_admits
+
+```mach
+pub fun op_texel_count_admits(count: *OpTexelCount, n: u32, stored: u32) bool;
+```
+
+whether `n` components meet `count`, against a handle whose format stores `stored`, 0
+when its format is unknown
 
 ## fun op_operand_relation
 
@@ -1950,6 +2022,15 @@ pub fun type_def_sampled(td: *TypeDef, ops: *u32, n: u32) OpScalar;
 
 the scalar texels of a handle of constructor `td` with operands `ops` are, class
 OP_DATA_OTHER when the constructor declares none
+
+## fun type_def_components
+
+```mach
+pub fun type_def_components(td: *TypeDef, ops: *u32, n: u32) u32;
+```
+
+the number of components a handle of constructor `td` with operands `ops` stores each
+texel in, 0 when its format is unknown or the constructor declares none
 
 ## fun type_def_address
 

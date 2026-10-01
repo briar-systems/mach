@@ -344,6 +344,41 @@ pub val SUBGROUP_VALUE:        isa.OpTyping = isa.OpTyping;
 pub val GROUP_OPERATION_VALUE: isa.OpTyping = isa.OpTyping;
 ```
 
+## val READ_TEXEL_COUNT
+
+```mach
+pub val READ_TEXEL_COUNT:   isa.OpTexelCount = isa.OpTexelCount;
+```
+
+how many components each image instruction's texel has. a read's result is a 4-vector in
+Vulkan, a fetch's, a sample's and a gather's in every environment, and a write's texel needs at
+least the components its image's format stores, which spirv-val cannot see: the format
+is matched to a VkFormat only when the descriptor is bound
+
+## val FETCH_TEXEL_COUNT
+
+```mach
+pub val FETCH_TEXEL_COUNT:  isa.OpTexelCount = isa.OpTexelCount;
+```
+
+## val SAMPLE_TEXEL_COUNT
+
+```mach
+pub val SAMPLE_TEXEL_COUNT: isa.OpTexelCount = isa.OpTexelCount;
+```
+
+## val GATHER_TEXEL_COUNT
+
+```mach
+pub val GATHER_TEXEL_COUNT: isa.OpTexelCount = isa.OpTexelCount;
+```
+
+## val WRITE_TEXEL_COUNT
+
+```mach
+pub val WRITE_TEXEL_COUNT:  isa.OpTexelCount = isa.OpTexelCount;
+```
+
 ## rec DefStorage
 
 ```mach
