@@ -1142,10 +1142,21 @@ address is refused as well, with the same caution as `"readonly"`: anything the
 compiler cannot follow counts as a read. `"readonly"` and `"writeonly"` together
 are refused, since that binding would be neither read nor written.
 
-`"coherent"` decorates the buffer `Coherent`, so a write one invocation makes is
-visible to invocations in other workgroups under the GLSL450 memory model, which
-is what atomics and flags shared across workgroups rely on. It combines with
-either of the other two.
+`"coherent"` makes a write one invocation makes visible to invocations in other
+workgroups, which is what atomics and flags shared across workgroups rely on. It
+combines with either of the other two. How depends on the memory model the target
+selects (see [manifest.md](manifest.md#finished-module-targets)):
+
+- Under the GLSL450 model the buffer is decorated `Coherent`.
+- Under the Vulkan model, which has no such decoration, each access through the buffer
+  carries its own availability or visibility: a store `MakePointerAvailable`, a load
+  `MakePointerVisible`, each with `NonPrivatePointer`, at the `QueueFamily` scope,
+  every invocation of the dispatch and of later work on that queue family. That is
+  glslang's reading of `coherent`, and it needs no device-scope feature. A storage
+  image's `OpImageRead` and `OpImageWrite` carry `MakeTexelVisible` or
+  `MakeTexelAvailable` with `NonPrivateTexel` the same way. A storage image handed to
+  a function as a parameter carries no qualifier into it, so every image read and
+  write in such a function is coherent in a module that binds a coherent image.
 
 ```mach
 rec Counters { done: u32; }
@@ -1296,6 +1307,14 @@ variable is, on every environment. How depends on the environment:
 
 Because the value on entry is always zero, a `#[shared]` variable cannot have an
 initializer. Assign it inside the stage.
+
+Workgroup memory is **coherent** among the invocations of a workgroup under either
+memory model. Under GLSL450 it is so by definition. Under the Vulkan model an access
+is private unless it says otherwise, and a barrier orders no private access between
+invocations, so each load and store of a `#[shared]` variable carries
+`MakePointerVisible` or `MakePointerAvailable` with `NonPrivatePointer` at the
+`Workgroup` scope, the compiler's own zeroing stores included. A workgroup barrier
+with acquire-release semantics then orders them as it does under GLSL450.
 
 Whether a variable may carry an **initializer** is settled by its role, since the
 role says who puts the first value in it:
@@ -1527,7 +1546,13 @@ deleted, and the optimizer treats it as reading and writing all memory. No
 load or store is moved across a barrier or an atomic, at any optimization
 level. `OpControlBarrier` takes an execution scope, a memory scope and memory
 semantics, and `OpMemoryBarrier` a memory scope and semantics, each an integer
-constant.
+constant. A memory scope and memory semantics are held to the module's memory model:
+under the Vulkan model the `Device` scope needs the `vulkan_memory_model_device_scope`
+extension, and under GLSL450 the `QueueFamily` scope and the `MakeAvailable`,
+`MakeVisible` and `Volatile` semantics need `vulkan_memory_model` (see
+[manifest.md](manifest.md#finished-module-targets)). An atomic's scope and semantics
+are held the same way. The execution scope is not, since a Vulkan barrier executes
+at `Workgroup` or `Subgroup` only.
 
 A control barrier must be reached in **uniform control flow**: every
 invocation of its execution scope executes it, or none does. That is the

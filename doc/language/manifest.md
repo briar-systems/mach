@@ -276,7 +276,7 @@ comptime member, `$mach.build.extensions.<name>` (see [`$mach`](comptime-mach.md
 | `x86_64` | SSE2 | `ssse3`, `sse41`, `sse42`, `sha`, `fsgsbase`, `popcnt`, `lzcnt`, `bmi1`, `bmi2`, `cx16`, `avx`, `avx2`, `fma`, `movbe`, `f16c`, `avx512f`, `avx512bw`, `avx512cd`, `avx512dq`, `avx512vl`, `aes`, `pclmul` |
 | `aarch64` | AdvSIMD | `sha2`, `sb`, `aes`, `pmull`, `fp16` |
 | `riscv64`, `riscv32` | the isa string's selection | `i`, `m`, `a`, `f`, `d`, `c`, `zicond`, `zicsr`, `zifencei`, `zfhmin`, `zfh`, `zkt` |
-| `spirv` | | `float16`, which `env` selects; `zero_init_workgroup`, `storage_read_without_format` and `storage_write_without_format`, which `vulkan1.3` selects; the subgroup device features `subgroup_arithmetic`, `subgroup_clustered`, `subgroup_vote`, `subgroup_ballot`, `subgroup_shuffle`, `subgroup_shuffle_relative`, `subgroup_quad` and `subgroup_graphics_stages`; the atomic device features `buffer_int64_atomics`, `shared_int64_atomics`, `buffer_float32_atomics`, `buffer_float32_atomic_add`, `buffer_float32_atomic_min_max`, `buffer_float64_atomics`, `buffer_float64_atomic_add`, `buffer_float64_atomic_min_max`, `shared_float32_atomics`, `shared_float32_atomic_add`, `shared_float32_atomic_min_max`, `shared_float64_atomics`, `shared_float64_atomic_add` and `shared_float64_atomic_min_max` ([decorators.md](decorators.md#optarget-set-name--a-function-that-is-a-target-instruction)); the image device feature `storage_image_multisample` ([types.md](types.md#handles)) |
+| `spirv` | | `float16`, which `env` selects; `zero_init_workgroup`, `storage_read_without_format`, `storage_write_without_format`, `vulkan_memory_model` and `vulkan_memory_model_device_scope`, which `vulkan1.3` selects; the subgroup device features `subgroup_arithmetic`, `subgroup_clustered`, `subgroup_vote`, `subgroup_ballot`, `subgroup_shuffle`, `subgroup_shuffle_relative`, `subgroup_quad` and `subgroup_graphics_stages`; the atomic device features `buffer_int64_atomics`, `shared_int64_atomics`, `buffer_float32_atomics`, `buffer_float32_atomic_add`, `buffer_float32_atomic_min_max`, `buffer_float64_atomics`, `buffer_float64_atomic_add`, `buffer_float64_atomic_min_max`, `shared_float32_atomics`, `shared_float32_atomic_add`, `shared_float32_atomic_min_max`, `shared_float64_atomics`, `shared_float64_atomic_add` and `shared_float64_atomic_min_max` ([decorators.md](decorators.md#optarget-set-name--a-function-that-is-a-target-instruction)); the image device feature `storage_image_multisample` ([types.md](types.md#handles)) |
 
 A name the selected isa does not hold is refused when the target resolves, with the
 names it does hold:
@@ -356,7 +356,9 @@ that zero-initializes the workgroup memory of every
 variable in the module, and spirv `storage_read_without_format` and
 `storage_write_without_format`, the device features that let a storage image of
 `Unknown` format be read and written, and spirv `storage_image_multisample`, the
-device feature that lets a storage image be multisampled. Every x86_64 and aarch64 row, and riscv `m`, `a`,
+device feature that lets a storage image be multisampled, and spirv `vulkan_memory_model`
+and `vulkan_memory_model_device_scope`, the device features that select the Vulkan
+memory model for the whole module and let it use the `Device` scope. Every x86_64 and aarch64 row, and riscv `m`, `a`,
 `zicond`, `zicsr`, `zifencei`, `zfhmin` and `zfh`, may be.
 
 Selecting an extension is a promise about **every** machine the binary runs on. The
@@ -617,6 +619,23 @@ or writing a storage image of `Unknown` format for an earlier version is refused
 unless the target selects the matching extension, which it does when its consumer
 enables `shaderStorageImageReadWithoutFormat` or
 `shaderStorageImageWriteWithoutFormat`.
+
+The memory model follows the same selection. A module is written under the GLSL450
+memory model unless its target selects `vulkan_memory_model`, Vulkan's
+`vulkanMemoryModel` feature, and then under the Vulkan memory model, declaring the
+`VulkanMemoryModel` capability and, below SPIR-V 1.5, the
+`SPV_KHR_vulkan_memory_model` extension. `vulkan1.3` requires the feature of every
+device, so it selects the extension, and a module without `env` has it too. A target
+for `vulkan1.1` or `vulkan1.2` selects it with `extensions` when its consumer enables
+the feature, and one for `vulkan1.0` is refused, since the model needs SPIR-V 1.3.
+Under the Vulkan model a memory scope of `Device` needs
+`vulkanMemoryModelDeviceScope` as well, which `vulkan1.3` also requires: an
+instruction taking that scope is refused unless the target selects
+`vulkan_memory_model_device_scope`, which brings `vulkan_memory_model` with it. Under
+GLSL450 the `QueueFamily` scope and the `MakeAvailable`, `MakeVisible` and `Volatile`
+memory semantics, which only the Vulkan model defines, are refused. What
+`"coherent"` and `#[shared]` mean under each model is in
+[decorators.md](decorators.md#inputn--outputn--builtinstr--uniformset-binding--storageset-binding--samplerset-binding--push--specid--shared--shader-interface).
 
 No environment selects `storage_image_multisample`, Vulkan's
 `shaderStorageImageMultisample`, which every version leaves optional. A module
