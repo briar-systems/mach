@@ -4264,7 +4264,7 @@ fun emit_terminator(e: *Emit, mf: *mir.MirFunction, st: *cfg.Structure, ix: u32,
         ret err[fail.Fail].ok{};
     }
     if (term.opcode == mir.MIR_CBR) {
-        val cond: u32 = read_condition(e, vm, ?term.operands[0]);
+        val cond: u32 = read_condition(e, vm, ?term.operands[0], term.width::u32 * 8);
         if (cond == 0) { ret emit_fail(e, "spirv.emit: unreadable branch condition"); }
         emit_merge(e, st, ix, labels);
         var bc: [3]u32;
@@ -4304,7 +4304,8 @@ fun emit_terminator(e: *Emit, mf: *mir.MirFunction, st: *cfg.Structure, ix: u32,
     ret unsupported(e, "instruction is not yet supported by the SPIR-V target");
 }
 
-fun read_condition(e: *Emit, vm: *VMaps, op: *mir.MirOperand) u32 {
+# a value tested for truth at `bits`, 0 for its whole type
+fun read_condition(e: *Emit, vm: *VMaps, op: *mir.MirOperand, bits: u32) u32 {
     if (op.kind != mir.MIR_OP_VREG) {
         e.b.err = true;
         ret 0;
@@ -4315,9 +4316,10 @@ fun read_condition(e: *Emit, vm: *VMaps, op: *mir.MirOperand) u32 {
         ret 0;
     }
     val ty:  u32 = vm.type_id[v];
-    val raw: u32 = read_operand(e, vm, op, ty);
+    var raw: u32 = read_operand(e, vm, op, ty);
     if (e.b.err || raw == 0) { ret 0; }
     if (vm.is_bool[v])       { ret raw; }
+    raw = narrow_extend(e, raw, ty, bits, false);
 
     var cmp_ty: u32 = ty;
     if (cmp_ty == 0) { cmp_ty = types.type_int(e.tt, e.tgt.model.gpr_width * 8); }
@@ -5233,7 +5235,7 @@ fun vector_type_of(e: *Emit, lane: u32, as_int: bool) u32 {
 
 fun value_type_for(e: *Emit, mf: *mir.MirFunction, mi: *mir.MirInstr, vreg: u32, width: u8) u32 {
     if (mir.vec_lane_is_vector(mi.vec_lane)) {
-        if (mi.opcode == mir.MIR_VEC_EXTRACT) { ret lane_type_of(e, mi.vec_lane); }
+        if (mi.opcode == mir.MIR_VEC_EXTRACT) { ret carried_lane_type(e, lane_type_of(e, mi.vec_lane)); }
         val as_int: bool = mir.is_cmp_opcode(mi.opcode) || mi.opcode == mir.MIR_FCMP;
         ret vector_type_of(e, mi.vec_lane, as_int);
     }
@@ -5254,8 +5256,75 @@ fun value_type_for(e: *Emit, mf: *mir.MirFunction, mi: *mir.MirInstr, vreg: u32,
         if (bits == 16 || bits == 32 || bits == 64) { ret types.type_float(e.tt, bits); }
         ret 0;
     }
-    if (bits == 8 || bits == 16 || bits == 32 || bits == 64) { ret types.type_int(e.tt, bits); }
+    if (bits == 8 || bits == 16 || bits == 32 || bits == 64) { ret types.type_int(e.tt, carrier_bits(e, bits)); }
     ret 0;
+}
+
+# the width an integer of `bits` is carried at outside host-shared memory: its
+# own where the environment has its capability, otherwise the narrowest wider
+# width the model's alu computes at under every environment (#4302)
+fun carrier_bits(e: *Emit, bits: u32) u32 {
+    if (bits == 0 || bits % 8 != 0 || bits > 64) { ret bits; }
+    ret isa.clamp_alu_width(?e.tgt.model, (bits / 8)::u8)::u32 * 8;
+}
+
+# the spirv type a value of an ir type has in a function: a scalar integer at
+# its carrier, a pointer to one pointing at the carrier, and every other type
+# as declared, since a composite member keeps its width wherever it lives
+fun value_spv_type(e: *Emit, tys: *type.IrTypeTable, id: type.IrTypeId) u32 {
+    val opt_: opt[*type.IrType] = type.get(tys, id);
+    if (sel opt_.none) { ret 0; }
+    val t: *type.IrType = opt_.some;
+    if (t.kind == type.IRT_INT && type.int_form(tys, id) != type.INT_FORM_BINARY16) {
+        ret types.type_int(e.tt, carrier_bits(e, t.data.bits));
+    }
+    if (t.kind == type.IRT_PTR && t.data.pointee != type.IRT_NIL) {
+        val pointee: u32 = value_spv_type(e, tys, t.data.pointee);
+        if (pointee == 0) { ret 0; }
+        ret types.type_ptr(e.tt, spirv.STORAGE_FUNCTION, pointee);
+    }
+    ret spv_type_of(e, tys, id);
+}
+
+# a carried integer read as one of `bits`: the arithmetic leaves the carrier's
+# upper bits unspecified, so the value is zero- or sign-extended from `bits`
+# wherever they would be observed. a value at its own width is as it is
+fun narrow_extend(e: *Emit, value: u32, ty: u32, bits: u32, signed: bool) u32 {
+    if (value == 0 || bits == 0 || types.type_is_bool(e.tt, ty) || types.type_is_float(e.tt, ty)) { ret value; }
+    val cb: u32 = types.type_bits(e.tt, ty);
+    if (cb == 0 || bits >= cb) { ret value; }
+    val result: u32 = spirv.alloc_id(e.b);
+    var words:  [4]u32;
+    words[0] = ty;
+    if (!signed) {
+        words[1] = result;
+        words[2] = value;
+        words[3] = immediate(e, ty, ((1::u64 << bits::u64) - 1):~i64);
+        spirv.inst(e.b, ?e.b.functions, spirv.OP_BITWISE_AND, ?words[0], 4);
+        ret result;
+    }
+    val count:   u32 = immediate(e, ty, (cb - bits)::i64);
+    val shifted: u32 = spirv.alloc_id(e.b);
+    words[1] = shifted;
+    words[2] = value;
+    words[3] = count;
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_SHIFT_LEFT_LOGICAL, ?words[0], 4);
+    words[1] = result;
+    words[2] = shifted;
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_SHIFT_RIGHT_ARITHMETIC, ?words[0], 4);
+    ret result;
+}
+
+# an integer operand read at `bits`, in the carrier of that width
+fun read_narrow(e: *Emit, vm: *VMaps, op: *mir.MirOperand, ty: u32, bits: u32, signed: bool) u32 {
+    if (op.kind == mir.MIR_OP_IMM && bits > 0 && bits < 64) {
+        # a constant is extended from `bits` as the value it is compared with is
+        val low: u64 = op.imm::u64 & ((1::u64 << bits::u64) - 1);
+        var v:   i64 = low:~i64;
+        if (signed && (low >> (bits - 1)::u64) != 0) { v = (low | ~((1::u64 << bits::u64) - 1)):~i64; }
+        ret immediate(e, ty, v);
+    }
+    ret narrow_extend(e, read_operand(e, vm, op, ty), ty, bits, signed);
 }
 
 fun spv_type_of(e: *Emit, tys: *type.IrTypeTable, id: type.IrTypeId) u32 {
@@ -5339,7 +5408,7 @@ fun tag_spv_type(e: *Emit, tys: *type.IrTypeTable, id: type.IrTypeId) u32 {
 }
 
 fun ir_value_spv_type(e: *Emit, id: type.IrTypeId) u32 {
-    ret spv_type_of(e, ?e.ir.types, id);
+    ret value_spv_type(e, ?e.ir.types, id);
 }
 
 fun global_spv_type(e: *Emit, gt: *type.IrTypeTable, id: type.IrTypeId) u32 {
@@ -7073,7 +7142,7 @@ fun op_operand(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, mi: *mir.MirInstr, ro
     if (isa.op_kind_is_pointer(kind)) { ret op_pointer_operand(e, mf, vm, row, i, op, param); }
     if (kind == isa.OP_OPERAND_BOOL) {
         if (op.kind == mir.MIR_OP_IMM) { ret res[u32, fail.Fail].ok{types.const_bool(e.tt, op.imm != 0)}; }
-        val c: u32 = read_condition(e, vm, op);
+        val c: u32 = read_condition(e, vm, op, type.byte_size_for_machine(?e.ir.types, param, e.layout) * 8);
         if (c == 0) { ret res[u32, fail.Fail].err{fail.message("spirv.emit: an `op` truth operand has no value to test")}; }
         ret res[u32, fail.Fail].ok{c};
     }
@@ -7759,11 +7828,11 @@ fun emit_compare(e: *Emit, vm: *VMaps, mi: *mir.MirInstr, op_code: u32) err[fail
     }
     var cbits: u32 = mi.width::u32 * 8;
     if (cbits == 0) { cbits = e.tgt.model.gpr_width * 8; }
-    val cmp_ty: u32 = types.type_int(e.tt, cbits);
+    val cmp_ty: u32 = types.type_int(e.tt, carrier_bits(e, cbits));
     if (cmp_ty == 0) {
         ret unsupported(e, "unsupported comparison width in the SPIR-V target");
     }
-    ret emit_compare_typed(e, vm, mi, op_code, cmp_ty);
+    ret emit_compare_typed(e, vm, mi, op_code, cmp_ty, cbits);
 }
 
 fun emit_vector_compare(e: *Emit, vm: *VMaps, mi: *mir.MirInstr, op_code: u32) err[fail.Fail] {
@@ -7840,14 +7909,47 @@ fun emit_vec_extract(e: *Emit, vm: *VMaps, mi: *mir.MirInstr) err[fail.Fail] {
     val src: u32 = read_operand(e, vm, ?mi.operands[1], vec_ty);
     if (e.b.err) { ret emit_fail(e, "spirv.emit: unreadable operand in vector extract"); }
 
+    var lanes:   u32 = 0;
+    var lane_ty: u32 = types.vector_value_shape(e.tt, vec_ty, ?lanes);
+    if (lane_ty == 0) { lane_ty = vm.type_id[dst]; }
     val result: u32 = spirv.alloc_id(e.b);
     var ops:    [4]u32;
-    ops[0] = vm.type_id[dst];
+    ops[0] = lane_ty;
     ops[1] = result;
     ops[2] = src;
     ops[3] = mi.operands[2].imm::u32;
     spirv.inst(e.b, ?e.b.functions, spirv.OP_COMPOSITE_EXTRACT, ?ops[0], 4);
-    ret store_vreg(e, vm, dst, result);
+    ret store_vreg(e, vm, dst, lane_width_as(e, result, lane_ty, vm.type_id[dst]));
+}
+
+# the scalar a vector lane of `lane_ty` is held in once extracted: an integer
+# lane at its carrier, since a lane keeps its declared width as a composite
+# member does (#4302)
+fun carried_lane_type(e: *Emit, lane_ty: u32) u32 {
+    if (lane_ty == 0 || types.type_is_float(e.tt, lane_ty) || types.type_is_bool(e.tt, lane_ty)) { ret lane_ty; }
+    ret types.type_int(e.tt, carrier_bits(e, types.type_bits(e.tt, lane_ty)));
+}
+
+# an integer moved between a lane's width and its carrier's: OpUConvert where
+# the two differ. a narrowing keeps the low bits, which hold the value
+fun lane_width_as(e: *Emit, value: u32, from_ty: u32, to_ty: u32) u32 {
+    if (value == 0 || from_ty == to_ty || from_ty == 0 || to_ty == 0) { ret value; }
+    if (types.type_is_float(e.tt, from_ty) || types.type_is_float(e.tt, to_ty)
+        || types.type_bits(e.tt, from_ty) == 0 || types.type_bits(e.tt, to_ty) == 0) { ret value; }
+    val result: u32 = spirv.alloc_id(e.b);
+    var ops:    [3]u32;
+    ops[0] = to_ty;
+    ops[1] = result;
+    ops[2] = value;
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_U_CONVERT, ?ops[0], 3);
+    ret result;
+}
+
+# a scalar operand read as a vector lane of `lane_ty`
+fun read_lane(e: *Emit, vm: *VMaps, op: *mir.MirOperand, lane_ty: u32) u32 {
+    if (!operand_carries_type(vm, op)) { ret read_operand(e, vm, op, lane_ty); }
+    val own: u32 = vm.type_id[op.vreg.n];
+    ret lane_width_as(e, read_operand(e, vm, op, own), own, lane_ty);
 }
 
 fun emit_vec_insert(e: *Emit, vm: *VMaps, mi: *mir.MirInstr) err[fail.Fail] {
@@ -7866,7 +7968,7 @@ fun emit_vec_insert(e: *Emit, vm: *VMaps, mi: *mir.MirInstr) err[fail.Fail] {
     if (lane_ty == 0) { ret unsupported(e, unsupported_value_type(e, mi)); }
 
     val src:  u32 = read_operand(e, vm, ?mi.operands[1], vec_ty);
-    val lane: u32 = read_operand(e, vm, ?mi.operands[3], lane_ty);
+    val lane: u32 = read_lane(e, vm, ?mi.operands[3], lane_ty);
     if (e.b.err) { ret emit_fail(e, "spirv.emit: unreadable operand in vector insert"); }
 
     val result: u32 = spirv.alloc_id(e.b);
@@ -7904,7 +8006,7 @@ fun emit_vec_build(e: *Emit, vm: *VMaps, mi: *mir.MirInstr) err[fail.Fail] {
     ops[1] = result;
     var i: u32 = 0;
     for (i < given) {
-        ops[2 + i] = read_operand(e, vm, ?mi.operands[1 + i], lane_ty);
+        ops[2 + i] = read_lane(e, vm, ?mi.operands[1 + i], lane_ty);
         i          = i + 1;
     }
     if (e.b.err) {
@@ -7932,11 +8034,11 @@ fun emit_float_compare(e: *Emit, vm: *VMaps, mi: *mir.MirInstr) err[fail.Fail] {
     }
     val op_code: u32 = ops.float_compare(mi.src_width);
     if (op_code == 0) { ret unsupported(e, "unknown float comparison condition in the SPIR-V target"); }
-    ret emit_compare_typed(e, vm, mi, op_code, types.type_float(e.tt, fbits));
+    ret emit_compare_typed(e, vm, mi, op_code, types.type_float(e.tt, fbits), 0);
 }
 
 fun emit_compare_typed(e: *Emit, vm: *VMaps, mi: *mir.MirInstr,
-    op_code: u32, operand_ty: u32) err[fail.Fail] {
+    op_code: u32, operand_ty: u32, bits: u32) err[fail.Fail] {
     if (mi.operand_count != 3 || mi.operands[0].kind != mir.MIR_OP_VREG) {
         ret emit_fail(e, "spirv.emit: malformed comparison instruction");
     }
@@ -7946,8 +8048,9 @@ fun emit_compare_typed(e: *Emit, vm: *VMaps, mi: *mir.MirInstr,
         || !operand_matches_type(vm, ?mi.operands[2], operand_ty)) {
         ret emit_fail(e, "spirv.emit: comparison mixes operand types");
     }
-    val a: u32 = read_operand(e, vm, ?mi.operands[1], operand_ty);
-    val b: u32 = read_operand(e, vm, ?mi.operands[2], operand_ty);
+    val signed: bool = signed_compare(op_code);
+    val a:      u32  = read_narrow(e, vm, ?mi.operands[1], operand_ty, bits, signed);
+    val b:      u32  = read_narrow(e, vm, ?mi.operands[2], operand_ty, bits, signed);
     if (e.b.err) { ret emit_fail(e, "spirv.emit: unreadable operand in comparison"); }
     val row: *ops.CoreOp = ops.core(op_code);
     if (row.arity != 2) { ret emit_fail(e, "spirv.emit: a comparison was mapped to an opcode whose row is not two operands"); }
@@ -7960,6 +8063,10 @@ fun emit_compare_typed(e: *Emit, vm: *VMaps, mi: *mir.MirInstr,
     words[3] = b;
     spirv.inst(e.b, ?e.b.functions, op_code, ?words[0], ops.operand_words(row));
     ret store_vreg(e, vm, dst, result);
+}
+
+fun signed_compare(op_code: u32) bool {
+    ret op_code == spirv.OP_S_LESS_THAN || op_code == spirv.OP_S_LESS_THAN_EQUAL;
 }
 
 # a select is OpSelect on a boolean: the folded compare's, a boolean
@@ -7983,7 +8090,7 @@ fun emit_select(e: *Emit, vm: *VMaps, mi: *mir.MirInstr) err[fail.Fail] {
 
     var cbits: u32 = mi.src_width::u32 * 8;
     if (cbits == 0) { cbits = e.tgt.model.gpr_width * 8; }
-    val cmp_ty: u32 = types.type_int(e.tt, cbits);
+    val cmp_ty: u32 = types.type_int(e.tt, carrier_bits(e, cbits));
     if (cmp_ty == 0) { ret unsupported(e, "unsupported select condition width in the SPIR-V target"); }
 
     var cond: u32 = 0;
@@ -7991,8 +8098,9 @@ fun emit_select(e: *Emit, vm: *VMaps, mi: *mir.MirInstr) err[fail.Fail] {
     if (fused) {
         val m: *ops.MirMap = ops.map_of(mi.operands[5].imm::mir.MirOpcode);
         if (m == nil || m.shape != ops.SH_COMPARE) { ret emit_fail(e, "spirv.emit: a select names no integer compare"); }
-        cw[2] = read_operand(e, vm, ?mi.operands[1], cmp_ty);
-        cw[3] = read_operand(e, vm, ?mi.operands[2], cmp_ty);
+        val signed: bool = signed_compare(ops.select(m, false));
+        cw[2] = read_narrow(e, vm, ?mi.operands[1], cmp_ty, cbits, signed);
+        cw[3] = read_narrow(e, vm, ?mi.operands[2], cmp_ty, cbits, signed);
         cond  = spirv.alloc_id(e.b);
         cw[0] = bool_ty;
         cw[1] = cond;
@@ -8002,7 +8110,7 @@ fun emit_select(e: *Emit, vm: *VMaps, mi: *mir.MirInstr) err[fail.Fail] {
         cond = read_operand(e, vm, ?mi.operands[1], bool_ty);
     }
     or {
-        cw[2] = read_operand(e, vm, ?mi.operands[1], cmp_ty);
+        cw[2] = read_narrow(e, vm, ?mi.operands[1], cmp_ty, cbits, false);
         cw[3] = immediate(e, cmp_ty, 0);
         cond  = spirv.alloc_id(e.b);
         cw[0] = bool_ty;
@@ -8032,13 +8140,13 @@ fun emit_compare_mask(e: *Emit, vm: *VMaps, mi: *mir.MirInstr) err[fail.Fail] {
     if (dst >= vm.n) { ret emit_fail(e, "spirv.emit: compare-to-mask result vreg out of range"); }
     var cbits: u32 = mi.src_width::u32 * 8;
     if (cbits == 0) { cbits = e.tgt.model.gpr_width * 8; }
-    val cmp_ty:  u32 = types.type_int(e.tt, cbits);
+    val cmp_ty:  u32 = types.type_int(e.tt, carrier_bits(e, cbits));
     val mask_ty: u32 = vm.type_id[dst];
     if (cmp_ty == 0 || mask_ty == 0) {
         ret unsupported(e, "unsupported compare-to-mask width in the SPIR-V target");
     }
-    val a: u32 = read_operand(e, vm, ?mi.operands[1], cmp_ty);
-    val b: u32 = read_operand(e, vm, ?mi.operands[2], cmp_ty);
+    val a: u32 = read_narrow(e, vm, ?mi.operands[1], cmp_ty, cbits, false);
+    val b: u32 = read_narrow(e, vm, ?mi.operands[2], cmp_ty, cbits, false);
     if (e.b.err) { ret emit_fail(e, "spirv.emit: unreadable operand in compare-to-mask"); }
     val below: u32 = spirv.alloc_id(e.b);
     var cw:    [4]u32;
@@ -8077,13 +8185,31 @@ fun emit_convert(e: *Emit, vm: *VMaps, mi: *mir.MirInstr,
         var sbits: u32 = mi.src_width::u32 * 8;
         if (sbits == 0)   { sbits = e.tgt.model.gpr_width * 8; }
         if (src_is_float) { src_ty = types.type_float(e.tt, sbits); }
-        or                { src_ty = types.type_int(e.tt, sbits); }
+        or                { src_ty = types.type_int(e.tt, carrier_bits(e, sbits)); }
         if (src_ty == 0) {
             ret unsupported(e, "unsupported conversion source width in the SPIR-V target");
         }
     }
-    val a: u32 = read_operand(e, vm, ?mi.operands[1], src_ty);
+    var a: u32 = read_operand(e, vm, ?mi.operands[1], src_ty);
     if (e.b.err) { ret emit_fail(e, "spirv.emit: unreadable operand in conversion"); }
+    # the type the source was read in: its own, or the one a truth value or a
+    # constant was widened to
+    var a_ty: u32 = src_ty;
+    if (a_ty == 0 && mi.operands[1].kind == mir.MIR_OP_VREG && mi.operands[1].vreg.n < vm.n) {
+        a_ty = vm.type_id[mi.operands[1].vreg.n];
+    }
+    # an extension reads its source at the source width, which a carrier holds
+    # with unspecified bits above it (#4302)
+    val zext: bool = mi.opcode == mir.MIR_ZEXT || mi.opcode == mir.MIR_UI_TO_FP;
+    val sext: bool = mi.opcode == mir.MIR_SEXT || mi.opcode == mir.MIR_SI_TO_FP;
+    if ((zext || sext) && mi.operands[1].kind == mir.MIR_OP_VREG) {
+        a = narrow_extend(e, a, a_ty, mi.src_width::u32 * 8, sext);
+    }
+    # an integer width change within one carrier is no instruction: OpUConvert
+    # and OpSConvert need two widths
+    if ((op_code == spirv.OP_U_CONVERT || op_code == spirv.OP_S_CONVERT) && a_ty != 0 && a_ty == vm.type_id[dst]) {
+        ret store_vreg(e, vm, dst, a);
+    }
     val row: *ops.CoreOp = ops.core(op_code);
     if (row.arity != 1) { ret emit_fail(e, "spirv.emit: a conversion was mapped to an opcode whose row is not one operand"); }
     val result: u32 = spirv.alloc_id(e.b);

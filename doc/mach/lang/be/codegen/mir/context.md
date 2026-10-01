@@ -248,12 +248,6 @@ type is not one: the width refusal's one predicate
 pub fun mem_width_of(ctx: *LowerCtx, ty: ir_type.IrTypeId) u8;
 ```
 
-## fun clamp_alu_width
-
-```mach
-pub fun clamp_alu_width(alu_min_width: u32, w: u8) u8;
-```
-
 ## fun stack_slot_bytes
 
 ```mach
