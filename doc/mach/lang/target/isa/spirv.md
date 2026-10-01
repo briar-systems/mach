@@ -884,6 +884,26 @@ pub val OP_RETURN_VALUE:              u32 = 254
 pub val OP_UNREACHABLE:               u32 = 255
 ```
 
+## val OP_IMAGE_SAMPLE_DREF_IMPLICIT_LOD
+
+```mach
+pub val OP_IMAGE_SAMPLE_DREF_IMPLICIT_LOD: u32 = 89
+```
+
+the depth-comparison image instructions beside OpImageSampleImplicitLod
+
+## val OP_IMAGE_SAMPLE_DREF_EXPLICIT_LOD
+
+```mach
+pub val OP_IMAGE_SAMPLE_DREF_EXPLICIT_LOD: u32 = 90
+```
+
+## val OP_IMAGE_DREF_GATHER
+
+```mach
+pub val OP_IMAGE_DREF_GATHER:              u32 = 97
+```
+
 ## val OP_GROUP_NON_UNIFORM_ELECT
 
 ```mach
