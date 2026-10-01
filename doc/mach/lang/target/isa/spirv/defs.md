@@ -174,6 +174,36 @@ pub val GROUP_OPERATION_CLUSTERED_REDUCE: u32 = 3
 pub val ARITHMETIC_GROUP_OPERATION: isa.OpEnum = isa.OpEnum;
 ```
 
+## val IMAGE_OPERANDS_LOD
+
+```mach
+pub val IMAGE_OPERANDS_LOD:    u32 = 0x2
+```
+
+## val IMAGE_OPERANDS_SAMPLE
+
+```mach
+pub val IMAGE_OPERANDS_SAMPLE: u32 = 0x40
+```
+
+## val SAMPLE_LOD_OPERANDS
+
+```mach
+pub val SAMPLE_LOD_OPERANDS: isa.OpEnum = isa.OpEnum;
+```
+
+## val FETCH_OPERANDS
+
+```mach
+pub val FETCH_OPERANDS:      isa.OpEnum = isa.OpEnum;
+```
+
+## val STORAGE_OPERANDS
+
+```mach
+pub val STORAGE_OPERANDS:    isa.OpEnum = isa.OpEnum;
+```
+
 ## val BALLOT_GROUP_OPERATION
 
 ```mach
@@ -197,4 +227,23 @@ pub fun set_import_name(set: u8) str;
 ```mach
 pub fun register_defs(storage: *DefStorage) *isa.TargetDefs;
 ```
+
+## fun is_image_operands
+
+```mach
+pub fun is_image_operands(en: *isa.OpEnum) bool;
+```
+
+whether `en` is an instruction's view of the Image Operands mask
+
+## fun image_use_refusal
+
+```mach
+pub fun image_use_refusal(opcode: u32, image: bool, ms: bool, mask: u32) str;
+```
+
+why an image instruction's use is invalid, nil when it is valid: `image` says whether
+its first operand is an image, `ms` whether that image is multisampled, and `mask`
+is the Image Operands mask it passes, 0 when it passes none. a multisampled image's
+texel is named by its sample, and only a multisampled image has samples
 
