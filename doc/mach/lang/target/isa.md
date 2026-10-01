@@ -1671,6 +1671,67 @@ call. a typing with no requirements admits every type and needs nothing: it only
 the operand the row's relations are stated against. static data the target owns for
 the life of the program, like an OpEnum
 
+## def OpNumeric
+
+```mach
+pub def OpNumeric: u8
+```
+
+the numbers a typed row's data type is a scalar or vector of: any type at all, integers or
+floats, floats only, or integers of one signedness. a truth value is an unsigned integer
+
+## val OP_NUMERIC_NONE
+
+```mach
+pub val OP_NUMERIC_NONE:     OpNumeric = 0
+```
+
+## val OP_NUMERIC_ANY
+
+```mach
+pub val OP_NUMERIC_ANY:      OpNumeric = 1
+```
+
+## val OP_NUMERIC_FLOAT
+
+```mach
+pub val OP_NUMERIC_FLOAT:    OpNumeric = 2
+```
+
+## val OP_NUMERIC_SIGNED
+
+```mach
+pub val OP_NUMERIC_SIGNED:   OpNumeric = 3
+```
+
+## val OP_NUMERIC_UNSIGNED
+
+```mach
+pub val OP_NUMERIC_UNSIGNED: OpNumeric = 4
+```
+
+## val OP_NUMERIC_COUNT
+
+```mach
+pub val OP_NUMERIC_COUNT:    OpNumeric = 5
+```
+
+## fun op_numeric_admits
+
+```mach
+pub fun op_numeric_admits(n: OpNumeric, class: OpDataClass, signed: bool) bool;
+```
+
+whether a scalar of `class`, signed when `signed`, is a number `n` admits
+
+## fun op_numeric_name
+
+```mach
+pub fun op_numeric_name(n: OpNumeric) str;
+```
+
+the numbers `n` admits, as a refusal names them
+
 ## def OpRelation
 
 ```mach
@@ -1685,7 +1746,10 @@ only, a pointer to that sampled type, into the memory of the handle the typing's
 operand addresses, or, for a value result only, a handle whose constructor composes over
 the handle the typing's operand is, taking its texels from it as a sampled image does
 from its image. an operand may also be a sampler, a handle whose constructor states how
-texels are sampled, whatever the data type
+texels are sampled, whatever the data type, or shaped like the data type: a scalar or
+vector of the scalar the row fixes for it, with as many components as the data type has.
+a pointer operand's relation holds its pointee, the type the instruction stores or reads
+through it
 
 ## val OP_RELATION_NONE
 
@@ -1723,10 +1787,16 @@ pub val OP_RELATION_COMPOSED: OpRelation = 4
 pub val OP_RELATION_SAMPLER:  OpRelation = 5
 ```
 
+## val OP_RELATION_SHAPED
+
+```mach
+pub val OP_RELATION_SHAPED:   OpRelation = 6
+```
+
 ## val OP_RELATION_COUNT
 
 ```mach
-pub val OP_RELATION_COUNT:    OpRelation = 6
+pub val OP_RELATION_COUNT:    OpRelation = 7
 ```
 
 ## def OpCountKind
@@ -1953,7 +2023,8 @@ pub fun op_related(d: OpDef, result: OpRelation, operands: str) OpDef;
 
 `d` with its result's type related to its data type by `result`, and each operand's by
 one letter of `operands` in order: `-` unrelated, `=` the data type itself, `t` a texel
-of the handle the typing's operand is, `s` a sampler. a letter outside the set is an invalid relation,
+of the handle the typing's operand is, `s` a sampler, `n` shaped like the data type in the
+scalar `op_scalar_operand` fixes. a letter outside the set is an invalid relation,
 which registration refuses
 
 ## fun op_confined
