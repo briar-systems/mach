@@ -1591,6 +1591,12 @@ pub val NO_OP_SPACE: u32 = 0xFFFFFFFF
 pub val NO_OP_CAPABILITY: u32 = 0xFFFFFFFF
 ```
 
+## val NO_OP_SOURCE
+
+```mach
+pub val NO_OP_SOURCE: u32 = 0xFFFFFFFF
+```
+
 ## rec OpEnumerant
 
 ```mach
@@ -1926,6 +1932,16 @@ pub fun op_related(d: OpDef, result: OpRelation, operands: str) OpDef;
 one letter of `operands` in order: `-` unrelated, `=` the data type itself, `t` a texel
 of the handle the typing's operand is. a letter outside the set is an invalid relation,
 which registration refuses
+
+## fun op_derived
+
+```mach
+pub fun op_derived(d: OpDef, operand: u32) OpDef;
+```
+
+`d` with its pointer or handle result derived from its operand `operand`: a pointer
+result points into what that pointer operand addresses, a handle result holds the
+descriptor that operand holds
 
 ## fun op_texel_counted
 
