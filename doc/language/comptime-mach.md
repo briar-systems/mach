@@ -100,9 +100,14 @@ The names are the selected isa's vocabulary and nothing else:
 - `riscv64` and `riscv32`: `i`, `m`, `a`, `f`, `d`, `c`, `zicond`, `zicsr`, `zifencei`,
   `zfhmin`, `zfh`, `zkt`;
 - `spirv`: `float16`, `zero_init_workgroup`, `storage_read_without_format`,
-  `storage_write_without_format`, and the atomic device features
-  `buffer_int64_atomics`, `shared_int64_atomics` and `{buffer,shared}_float{32,64}_atomics`,
-  `_atomic_add` and `_atomic_min_max`.
+  `storage_write_without_format`, `subgroup_arithmetic`, `subgroup_clustered`,
+  `subgroup_vote`, `subgroup_ballot`, `subgroup_shuffle`, `subgroup_shuffle_relative`,
+  `subgroup_quad`, `subgroup_graphics_stages`, `buffer_int64_atomics`,
+  `shared_int64_atomics`, `buffer_float32_atomics`, `buffer_float32_atomic_add`,
+  `buffer_float32_atomic_min_max`, `buffer_float64_atomics`, `buffer_float64_atomic_add`,
+  `buffer_float64_atomic_min_max`, `shared_float32_atomics`, `shared_float32_atomic_add`,
+  `shared_float32_atomic_min_max`, `shared_float64_atomics`, `shared_float64_atomic_add`,
+  `shared_float64_atomic_min_max`.
 
 A name the selected isa does not declare is a compile error, never a silent 0, as
 `$mach.arch.*` refuses an unknown architecture:
