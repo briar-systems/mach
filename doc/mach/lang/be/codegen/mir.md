@@ -1662,7 +1662,7 @@ pub fun opcode_name(op: MirOpcode) str;
 ## fun instr_refusal
 
 ```mach
-pub fun instr_refusal(alloc: *std_allocator.Allocator, srcmap: *lang_source.SourceMap,
+pub fun instr_refusal(alloc: *A.Allocator, srcmap: *lang_source.SourceMap,
 fn_name: str, mi: *MirInstr, what: str) str;
 ```
 
@@ -1865,13 +1865,13 @@ pub fun push_function(mm: *MirModule, mf: MirFunction) err[fail.Fail];
 ## fun instr_attach_dbg
 
 ```mach
-pub fun instr_attach_dbg(a: *std_allocator.Allocator, mi: *MirInstr, iid: u32, vreg: u32) err[fail.Fail];
+pub fun instr_attach_dbg(a: *A.Allocator, mi: *MirInstr, iid: u32, vreg: u32) err[fail.Fail];
 ```
 
 ## fun instr_attach_dbg_end
 
 ```mach
-pub fun instr_attach_dbg_end(a: *std_allocator.Allocator, mi: *MirInstr, iid: u32, vreg: u32) err[fail.Fail];
+pub fun instr_attach_dbg_end(a: *A.Allocator, mi: *MirInstr, iid: u32, vreg: u32) err[fail.Fail];
 ```
 
 the binding is published where `mi`'s def exists: at its end
@@ -1879,7 +1879,7 @@ the binding is published where `mi`'s def exists: at its end
 ## fun instr_attach_dbg_piece
 
 ```mach
-pub fun instr_attach_dbg_piece(a: *std_allocator.Allocator, mi: *MirInstr, iid: u32, vreg: u32,
+pub fun instr_attach_dbg_piece(a: *A.Allocator, mi: *MirInstr, iid: u32, vreg: u32,
 lane: u8, lanes: u8, lane_bytes: u8, last_bytes: u8, at_end: bool) err[fail.Fail];
 ```
 
@@ -1890,7 +1890,7 @@ a binding of one piece of a value held in several registers: `vreg` is its
 ## fun instr_pass_dbg
 
 ```mach
-pub fun instr_pass_dbg(a: *std_allocator.Allocator, from: *MirInstr, to: *MirInstr) err[fail.Fail];
+pub fun instr_pass_dbg(a: *A.Allocator, from: *MirInstr, to: *MirInstr) err[fail.Fail];
 ```
 
 the bindings of `from` move ahead of those of `to`: a deleted instruction's
@@ -1899,7 +1899,7 @@ program point is the instruction that follows it, so its end is `to`'s start
 ## fun instr_spread_dbg
 
 ```mach
-pub fun instr_spread_dbg(a: *std_allocator.Allocator, from: *MirInstr, first: *MirInstr, last: *MirInstr) err[fail.Fail];
+pub fun instr_spread_dbg(a: *A.Allocator, from: *MirInstr, first: *MirInstr, last: *MirInstr) err[fail.Fail];
 ```
 
 `from` is replaced by the pieces `first` through `last`: its start is the
@@ -1908,7 +1908,7 @@ first piece's start and its end the last piece's end
 ## fun instr_move_end_dbg
 
 ```mach
-pub fun instr_move_end_dbg(a: *std_allocator.Allocator, from: *MirInstr, to: *MirInstr) err[fail.Fail];
+pub fun instr_move_end_dbg(a: *A.Allocator, from: *MirInstr, to: *MirInstr) err[fail.Fail];
 ```
 
 the value `from` defines reaches its home only at the end of `to`, a later
@@ -1923,12 +1923,12 @@ pub fun dnit_module(mm: *MirModule);
 ## fun dnit_function
 
 ```mach
-pub fun dnit_function(a: *std_allocator.Allocator, mf: *MirFunction);
+pub fun dnit_function(a: *A.Allocator, mf: *MirFunction);
 ```
 
 ## fun dnit_block
 
 ```mach
-pub fun dnit_block(a: *std_allocator.Allocator, mb: *MirBlock);
+pub fun dnit_block(a: *A.Allocator, mb: *MirBlock);
 ```
 

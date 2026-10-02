@@ -42,7 +42,7 @@ pub fun free_scope(p: *driver.Project, sc: *TestScope);
 
 ```mach
 pub fun record_tests(p: *driver.Project, sc: *TestScope, exe: *u8, target: str, profile: str,
-bo: *outcome.BuildOutcome, oa: *std_allocator.Allocator) err[outcome.Fail];
+bo: *outcome.BuildOutcome, oa: *A.Allocator) err[outcome.Fail];
 ```
 
 ## rec DispatchInputs

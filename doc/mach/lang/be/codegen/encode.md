@@ -327,7 +327,7 @@ pub fun sink_set_mir(buf: *ByteBuf, mi: *codegen_mir.MirInstr);
 ## fun buf_init
 
 ```mach
-pub fun buf_init(alloc: *std_allocator.Allocator) ByteBuf;
+pub fun buf_init(alloc: *A.Allocator) ByteBuf;
 ```
 
 ## fun buf_refuse
@@ -439,13 +439,13 @@ pub fun module_has_oblivious(m: *codegen_mir.MirModule) bool;
 ## fun encode_module
 
 ```mach
-pub fun encode_module(alloc: *std_allocator.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule, hooks: *EncodeHooks) res[EncoderOutput, fail.Fail];
+pub fun encode_module(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule, hooks: *EncodeHooks) res[EncoderOutput, fail.Fail];
 ```
 
 ## fun encode_module_asm
 
 ```mach
-pub fun encode_module_asm(alloc: *std_allocator.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule,
+pub fun encode_module_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule,
 hooks: *EncodeHooks, asm_out: *io_writer.Writer) res[EncoderOutput, fail.Fail];
 ```
 
@@ -628,13 +628,13 @@ locations its def clobbered are ended
 ## fun state_blank
 
 ```mach
-pub fun state_blank(st: *EncodeState, alloc: *std_allocator.Allocator, model: *isa.MachineModel);
+pub fun state_blank(st: *EncodeState, alloc: *A.Allocator, model: *isa.MachineModel);
 ```
 
 ## fun consts_free
 
 ```mach
-pub fun consts_free(alloc: *std_allocator.Allocator, c: *ConstEntry, count: u32, cap: u32);
+pub fun consts_free(alloc: *A.Allocator, c: *ConstEntry, count: u32, cap: u32);
 ```
 
 ## fun block_offset

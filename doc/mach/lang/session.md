@@ -59,7 +59,7 @@ pub rec Session;
 ## fun init
 
 ```mach
-pub fun init(alloc: *std_allocator.Allocator) res[Session, fail.Fail];
+pub fun init(alloc: *A.Allocator) res[Session, fail.Fail];
 ```
 
 ## fun drop_query_failure

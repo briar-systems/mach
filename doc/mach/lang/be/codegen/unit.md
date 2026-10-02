@@ -63,12 +63,12 @@ pub fun mir_index(u: *Unit, mi: u32, name: intern.StrId) u32;
 ## fun init
 
 ```mach
-pub fun init(a: *std_allocator.Allocator, n: u32, u: *Unit) err[fail.Fail];
+pub fun init(a: *A.Allocator, n: u32, u: *Unit) err[fail.Fail];
 ```
 
 ## fun dnit
 
 ```mach
-pub fun dnit(a: *std_allocator.Allocator, u: *Unit);
+pub fun dnit(a: *A.Allocator, u: *Unit);
 ```
 

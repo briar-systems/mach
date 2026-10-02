@@ -10,7 +10,7 @@ sym_locs: *map.Map[intern.StrId, SymbolLoc], surface: *ExportSurface, count: *u3
 ## fun collect_exception_sections
 
 ```mach
-pub fun collect_exception_sections(alloc: *std_allocator.Allocator, out_img: *target_of.ObjectImage,
+pub fun collect_exception_sections(alloc: *A.Allocator, out_img: *target_of.ObjectImage,
 count: *u32) res[*target_of.Section, fail.Fail];
 ```
 
@@ -24,20 +24,20 @@ sym_locs: *map.Map[intern.StrId, SymbolLoc]) res[u64, fail.Fail];
 ## fun build_load_segments
 
 ```mach
-pub fun build_load_segments(alloc: *std_allocator.Allocator, out_img: *target_of.ObjectImage, merged: *MergedSection,
+pub fun build_load_segments(alloc: *A.Allocator, out_img: *target_of.ObjectImage, merged: *MergedSection,
 groups: *SectionGroups, seg_count: *u32) res[*target_of.LoadSegment, fail.Fail];
 ```
 
 ## fun free_load_segments
 
 ```mach
-pub fun free_load_segments(alloc: *std_allocator.Allocator, segs: *target_of.LoadSegment, count: u32);
+pub fun free_load_segments(alloc: *A.Allocator, segs: *target_of.LoadSegment, count: u32);
 ```
 
 ## fun build_exec_functions
 
 ```mach
-pub fun build_exec_functions(alloc: *std_allocator.Allocator, out_img: *target_of.ObjectImage,
+pub fun build_exec_functions(alloc: *A.Allocator, out_img: *target_of.ObjectImage,
 segs: *target_of.LoadSegment, seg_count: u32, natives: *target_of.NativeUnwind, native_count: u32,
 func_count: *u32) res[*target_of.ExecFunction, fail.Fail];
 ```
@@ -48,7 +48,7 @@ foreign functions an object's unwind index describes, merged by address
 ## fun build_symtab_entries
 
 ```mach
-pub fun build_symtab_entries(alloc: *std_allocator.Allocator, out_img: *target_of.ObjectImage,
+pub fun build_symtab_entries(alloc: *A.Allocator, out_img: *target_of.ObjectImage,
 segs: *target_of.LoadSegment, seg_count: u32, surface: *ExportSurface,
 entry_count: *u32) res[*target_of.SymtabEntry, fail.Fail];
 ```

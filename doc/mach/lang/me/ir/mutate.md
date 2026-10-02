@@ -9,13 +9,13 @@ pub rec Rewrite;
 ## fun rewrite_init
 
 ```mach
-pub fun rewrite_init(rw: *Rewrite, a: *std_allocator.Allocator, len: u32) err[fail.Fail];
+pub fun rewrite_init(rw: *Rewrite, a: *A.Allocator, len: u32) err[fail.Fail];
 ```
 
 ## fun rewrite_dnit
 
 ```mach
-pub fun rewrite_dnit(rw: *Rewrite, a: *std_allocator.Allocator);
+pub fun rewrite_dnit(rw: *Rewrite, a: *A.Allocator);
 ```
 
 ## fun replace_value
@@ -60,7 +60,7 @@ pub fun replace_uses(fn: *me_ir.Function, old_id: ir_id.InstructionId, replaceme
 ## fun erase_marked
 
 ```mach
-pub fun erase_marked[T](m: *me_ir.Module, fn: *me_ir.Function, alloc: *std_allocator.Allocator, ctx: *T,
+pub fun erase_marked[T](m: *me_ir.Module, fn: *me_ir.Function, alloc: *A.Allocator, ctx: *T,
 test: fun(*T, ir_id.InstructionId) bool) res[bool, fail.Fail];
 ```
 

@@ -33,19 +33,19 @@ pub rec Record;
 ## fun facts_dnit
 
 ```mach
-pub fun facts_dnit(alloc: *std_allocator.Allocator, f: *Facts);
+pub fun facts_dnit(alloc: *A.Allocator, f: *Facts);
 ```
 
 ## fun record_dnit
 
 ```mach
-pub fun record_dnit(alloc: *std_allocator.Allocator, r: *Record);
+pub fun record_dnit(alloc: *A.Allocator, r: *Record);
 ```
 
 ## fun encode
 
 ```mach
-pub fun encode(alloc: *std_allocator.Allocator, itn: *intern.Interner, key: *[32]u8, facts: *Facts,
+pub fun encode(alloc: *A.Allocator, itn: *intern.Interner, key: *[32]u8, facts: *Facts,
 image: *target_of.ObjectImage, out_bytes: **u8, out_len: *u32) err[fail.Fail];
 ```
 
@@ -55,7 +55,7 @@ and generated `image`; the caller owns the bytes, allocated in alloc
 ## fun decode
 
 ```mach
-pub fun decode(alloc: *std_allocator.Allocator, itn: *intern.Interner, bytes: *u8, len: usize) res[opt[Record], fail.Fail];
+pub fun decode(alloc: *A.Allocator, itn: *intern.Interner, bytes: *u8, len: usize) res[opt[Record], fail.Fail];
 ```
 
 the record in `bytes`, or none when it is missing, truncated or malformed:

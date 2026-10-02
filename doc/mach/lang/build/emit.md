@@ -27,7 +27,7 @@ pub rec LoadedImageOptions;
 ## fun dnit_image_options
 
 ```mach
-pub fun dnit_image_options(a: *std_allocator.Allocator, loaded: *LoadedImageOptions);
+pub fun dnit_image_options(a: *A.Allocator, loaded: *LoadedImageOptions);
 ```
 
 ## fun load_image_options
@@ -105,7 +105,7 @@ the unit's static link inputs, each the user's (RELOC_INPUT), appended to
 ## fun free_dynlibs
 
 ```mach
-pub fun free_dynlibs(a: *std_allocator.Allocator, dynlibs: *target_of.DynLib, dynlib_len: u32);
+pub fun free_dynlibs(a: *A.Allocator, dynlibs: *target_of.DynLib, dynlib_len: u32);
 ```
 
 ## fun write_objects
@@ -131,6 +131,6 @@ destinations: per emitted module, its test object's path, nil for a module witho
 ## fun free_inputs
 
 ```mach
-pub fun free_inputs(a: *std_allocator.Allocator, inputs: *target_of.ObjectInput, n: u32, cap: u32);
+pub fun free_inputs(a: *A.Allocator, inputs: *target_of.ObjectInput, n: u32, cap: u32);
 ```
 

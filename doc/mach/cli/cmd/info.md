@@ -19,7 +19,7 @@ ret: exit.OK, exit.USER for a usage error, or the code `exit.of` maps a target r
 ## fun render_host
 
 ```mach
-pub fun render_host(a: *std_allocator.Allocator, reg: *lang_target.TargetRegistry) res[str, fail.Fail];
+pub fun render_host(a: *A.Allocator, reg: *lang_target.TargetRegistry) res[str, fail.Fail];
 ```
 
 the `mach info` page: the version and the resolved host target, one dimension
@@ -28,7 +28,7 @@ per line, every value taken from the target the host request resolves to
 ## fun render_targets
 
 ```mach
-pub fun render_targets(a: *std_allocator.Allocator, reg: *lang_target.TargetRegistry) res[str, fail.Fail];
+pub fun render_targets(a: *A.Allocator, reg: *lang_target.TargetRegistry) res[str, fail.Fail];
 ```
 
 the `mach info targets` listing: one line per accepted cell, the `<os>-<isa>`

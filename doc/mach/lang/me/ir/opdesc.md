@@ -859,7 +859,7 @@ pub fun describe(k: ir_instruction.InstrKind) res[*IrOpDescriptor, fail.Fail];
 ## fun unknown_kind
 
 ```mach
-pub fun unknown_kind(a: *std_allocator.Allocator, k: ir_instruction.InstrKind, where: str) fail.Fail;
+pub fun unknown_kind(a: *A.Allocator, k: ir_instruction.InstrKind, where: str) fail.Fail;
 ```
 
 the middle end's catalog adapter: an opcode a pass dispatch reaches that no

@@ -165,7 +165,7 @@ pub fun opts(tgt: *resolved.Target, full: bool, repr: bool) VerifyOpts;
 ## fun verify_module_ext
 
 ```mach
-pub fun verify_module_ext(m: *me_ir.Module, alloc: *std_allocator.Allocator, o: VerifyOpts) res[VerifyReport, fail.Fail];
+pub fun verify_module_ext(m: *me_ir.Module, alloc: *A.Allocator, o: VerifyOpts) res[VerifyReport, fail.Fail];
 ```
 
 ## fun dnit_report
@@ -192,7 +192,7 @@ pub fun violation_loc(m: *me_ir.Module, v: *Violation) lang_source.SrcLoc;
 
 ```mach
 pub fun describe_located(m: *me_ir.Module, v: *Violation, itn: *intern.Interner,
-srcmap: *lang_source.SourceMap, alloc: *std_allocator.Allocator) res[str, fail.Fail];
+srcmap: *lang_source.SourceMap, alloc: *A.Allocator) res[str, fail.Fail];
 ```
 
 successful text is caller-owned, and allocation failures never produce partial descriptions

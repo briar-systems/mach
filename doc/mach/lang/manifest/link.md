@@ -19,13 +19,13 @@ include_referenced: copied from the link
 ## fun parse_links
 
 ```mach
-pub fun parse_links(alloc: *std_allocator.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, as_root: bool) err[outcome.Fail];
+pub fun parse_links(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, as_root: bool) err[outcome.Fail];
 ```
 
 ## fun free_link_claims
 
 ```mach
-pub fun free_link_claims(alloc: *std_allocator.Allocator, items: *LinkRequirement, count: u32);
+pub fun free_link_claims(alloc: *A.Allocator, items: *LinkRequirement, count: u32);
 ```
 
 free the symbol arrays of `count` requirements and nil them. the `items` array
@@ -38,7 +38,7 @@ count: how many entries to release
 ## fun finish_link_requirements
 
 ```mach
-pub fun finish_link_requirements(alloc: *std_allocator.Allocator, items: *LinkRequirement,
+pub fun finish_link_requirements(alloc: *A.Allocator, items: *LinkRequirement,
 capacity: u32, count: u32,
 out_items: **LinkRequirement,
 out_count: *u32) err[outcome.Fail];
@@ -59,7 +59,7 @@ ret: ok; when `count` is 0 the buffer is freed. on a failed shrink the filled
 ## fun merge_link_claims
 
 ```mach
-pub fun merge_link_claims(alloc: *std_allocator.Allocator, dst: *LinkRequirement,
+pub fun merge_link_claims(alloc: *A.Allocator, dst: *LinkRequirement,
 src: *LinkRequirement) err[outcome.Fail];
 ```
 
@@ -89,7 +89,7 @@ ret: true when all three axes admit `t`
 ## fun link_requirement
 
 ```mach
-pub fun link_requirement(alloc: *std_allocator.Allocator, itn: *intern.Interner, l: *LinkDef,
+pub fun link_requirement(alloc: *A.Allocator, itn: *intern.Interner, l: *LinkDef,
 proj_out: str, v: *TmplVars) res[LinkRequirement, outcome.Fail];
 ```
 
@@ -107,7 +107,7 @@ ret: the requirement; on error nothing is left allocated
 ## fun expand_local_path
 
 ```mach
-pub fun expand_local_path(alloc: *std_allocator.Allocator, itn: *intern.Interner, l: *LinkDef,
+pub fun expand_local_path(alloc: *A.Allocator, itn: *intern.Interner, l: *LinkDef,
 proj_out: str, v: *TmplVars) res[str, outcome.Fail];
 ```
 

@@ -39,7 +39,7 @@ the j-type immediate: imm[20] at 31, imm[10:1] at 30:21, imm[11] at 20, imm[19:1
 ## fun resolve_riscv_pcrel_pairs
 
 ```mach
-pub fun resolve_riscv_pcrel_pairs(alloc: *std_allocator.Allocator,
+pub fun resolve_riscv_pcrel_pairs(alloc: *A.Allocator,
 img: *target_of.ObjectImage) err[fail.Fail];
 ```
 

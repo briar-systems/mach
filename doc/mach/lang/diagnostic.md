@@ -218,7 +218,7 @@ pub rec DiagnosticBuilder;
 ## fun store_init
 
 ```mach
-pub fun store_init(a: *std_allocator.Allocator) DiagnosticStore;
+pub fun store_init(a: *A.Allocator) DiagnosticStore;
 ```
 
 ## fun set_origin
@@ -310,7 +310,7 @@ pub val UNKEYED_TEXT: str = "a diagnostic names no live kind of the registry"
 ## fun builder_init
 
 ```mach
-pub fun builder_init(a: *std_allocator.Allocator, k: diagnostic_kind.Kind, file_id: lang_source.FileId, span: token.Span, message: str) res[DiagnosticBuilder, fail.Fail];
+pub fun builder_init(a: *A.Allocator, k: diagnostic_kind.Kind, file_id: lang_source.FileId, span: token.Span, message: str) res[DiagnosticBuilder, fail.Fail];
 ```
 
 a builder for a diagnostic of kind `k`, raised at the severity its row
@@ -540,13 +540,13 @@ fallback: str) res[bool, fail.Fail];
 ## fun suggestion_build
 
 ```mach
-pub fun suggestion_build(a: *std_allocator.Allocator, name: str) res[str, fail.Fail];
+pub fun suggestion_build(a: *A.Allocator, name: str) res[str, fail.Fail];
 ```
 
 ## fun fix_label_replace
 
 ```mach
-pub fun fix_label_replace(a: *std_allocator.Allocator, name: str) res[str, fail.Fail];
+pub fun fix_label_replace(a: *A.Allocator, name: str) res[str, fail.Fail];
 ```
 
 ## fun content_equal
@@ -560,7 +560,7 @@ compare observable diagnostic content without allocation or store identity
 ## fun snapshot_from
 
 ```mach
-pub fun snapshot_from(src: *DiagnosticStore, from: usize, a: *std_allocator.Allocator) res[*DiagnosticStore, fail.Fail];
+pub fun snapshot_from(src: *DiagnosticStore, from: usize, a: *A.Allocator) res[*DiagnosticStore, fail.Fail];
 ```
 
 ## fun replay_into

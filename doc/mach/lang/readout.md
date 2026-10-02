@@ -158,7 +158,7 @@ pub rec Progress;
 ## fun init
 
 ```mach
-pub fun init(pr: *Progress, alloc: *std_allocator.Allocator, level: u8);
+pub fun init(pr: *Progress, alloc: *A.Allocator, level: u8);
 ```
 
 ## fun dnit

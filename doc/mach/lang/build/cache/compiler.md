@@ -48,7 +48,7 @@ pub fun identity_clear(id: *Identity);
 ## fun identity
 
 ```mach
-pub fun identity(alloc: *std_allocator.Allocator, out: *Identity) err[Error];
+pub fun identity(alloc: *A.Allocator, out: *Identity) err[Error];
 ```
 
 identifies the current executable, never argv[0], once per process: the

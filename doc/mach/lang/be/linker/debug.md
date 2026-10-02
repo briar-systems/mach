@@ -9,7 +9,7 @@ pub rec StrMerge;
 ## fun collect_debug_sections
 
 ```mach
-pub fun collect_debug_sections(alloc: *std_allocator.Allocator, out_img: *target_of.ObjectImage, count: *u32) res[*target_of.Section, fail.Fail];
+pub fun collect_debug_sections(alloc: *A.Allocator, out_img: *target_of.ObjectImage, count: *u32) res[*target_of.Section, fail.Fail];
 ```
 
 ## fun debug_abbrev_tables_equal
@@ -35,7 +35,7 @@ record that a module's debug info is left out of the link, into the store the ca
 ## fun discover_debug_names
 
 ```mach
-pub fun discover_debug_names(alloc: *std_allocator.Allocator, modules: *target_of.ObjectImage, module_count: u32,
+pub fun discover_debug_names(alloc: *A.Allocator, modules: *target_of.ObjectImage, module_count: u32,
 out_names: **intern.StrId, out_count: *u32) err[fail.Fail];
 ```
 

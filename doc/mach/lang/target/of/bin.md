@@ -89,7 +89,7 @@ pub fun resolve_name(itn: *intern.Interner, id: intern.StrId) str;
 ## fun name_message
 
 ```mach
-pub fun name_message(itn: *intern.Interner, a: *std_allocator.Allocator, prefix: str, name: str, generic: str) str;
+pub fun name_message(itn: *intern.Interner, a: *A.Allocator, prefix: str, name: str, generic: str) str;
 ```
 
 ## fun reloc_sym_index
@@ -110,12 +110,12 @@ pub fun validate_reloc_symbols(img: *target_of.ObjectImage, prefix: str, generic
 ## fun number_message
 
 ```mach
-pub fun number_message(itn: *intern.Interner, a: *std_allocator.Allocator, prefix: str, value: u64, generic: str) str;
+pub fun number_message(itn: *intern.Interner, a: *A.Allocator, prefix: str, value: u64, generic: str) str;
 ```
 
 ## fun reloc_counts
 
 ```mach
-pub fun reloc_counts(a: *std_allocator.Allocator, img: *target_of.ObjectImage) res[*u32, fail.Fail];
+pub fun reloc_counts(a: *A.Allocator, img: *target_of.ObjectImage) res[*u32, fail.Fail];
 ```
 

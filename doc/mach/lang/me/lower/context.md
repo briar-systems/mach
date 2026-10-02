@@ -159,7 +159,7 @@ pub fun origin_scope(lc: *LowerContext, origin: session.ModuleId) res[ModuleScop
 pub fun request(
 s: *session.Session,
 tgt: *resolved.Target,
-malloc: *std_allocator.Allocator,
+malloc: *A.Allocator,
 a: *ast.Ast,
 fqn: intern.StrId,
 own_module: session.ModuleId,

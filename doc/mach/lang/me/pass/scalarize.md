@@ -13,7 +13,7 @@ and from_bits is the operand lane width, which a conversion changes
 ## fun sites
 
 ```mach
-pub fun sites(m: *me_ir.Module, tgt: *lang_target.Target, out: *Vector[ScalarizeSite]) err[std_allocator.Error];
+pub fun sites(m: *me_ir.Module, tgt: *lang_target.Target, out: *Vector[ScalarizeSite]) err[A.Error];
 ```
 
 every operator the target scalarizes, one site per operation, in function

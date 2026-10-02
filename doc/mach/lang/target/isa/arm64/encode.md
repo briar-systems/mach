@@ -13,13 +13,13 @@ a logical immediate, the rule the middle end hoists a loop's constants by
 ## fun encode_arm64
 
 ```mach
-pub fun encode_arm64(alloc: *std_allocator.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule) res[codegen_encode.EncoderOutput, fail.Fail];
+pub fun encode_arm64(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule) res[codegen_encode.EncoderOutput, fail.Fail];
 ```
 
 ## fun encode_arm64_asm
 
 ```mach
-pub fun encode_arm64_asm(alloc: *std_allocator.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule,
+pub fun encode_arm64_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule,
 out: *io_writer.Writer) res[codegen_encode.EncoderOutput, fail.Fail];
 ```
 
@@ -61,6 +61,6 @@ src3 as to_inst lays them out) and the implicit effects
 
 ```mach
 pub fun asm_ct_scan(body: str, secrets: *ct.AsmSecret, n_secret: u32,
-mul: ct.CtMulMask, trust_shift: bool, alloc: *std_allocator.Allocator) err[ct.AsmRefusal];
+mul: ct.CtMulMask, trust_shift: bool, alloc: *A.Allocator) err[ct.AsmRefusal];
 ```
 

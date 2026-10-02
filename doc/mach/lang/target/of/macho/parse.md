@@ -9,6 +9,6 @@ pub fun macho_kind_from(flags: u32, is_text: bool, is_data_const: bool, is_rodat
 ## fun parse_object
 
 ```mach
-pub fun parse_object(alloc: *std_allocator.Allocator, itn: *intern.Interner, buf: *u8, buf_size: usize, out: *target_of.ObjectImage) err[fail.Fail];
+pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_size: usize, out: *target_of.ObjectImage) err[fail.Fail];
 ```
 

@@ -144,7 +144,7 @@ the canonical name of a declared kind, absent for a member outside the catalog
 ## fun section_kind_rejection
 
 ```mach
-pub fun section_kind_rejection(itn: *intern.Interner, alloc: *std_allocator.Allocator, kind: SectionKind) str;
+pub fun section_kind_rejection(itn: *intern.Interner, alloc: *A.Allocator, kind: SectionKind) str;
 ```
 
 a section kind outside the catalog reached a consumer that validated its
@@ -397,7 +397,7 @@ the display name of a declared kind, absent for a member outside the catalog
 ## fun reloc_kind_rejection
 
 ```mach
-pub fun reloc_kind_rejection(itn: *intern.Interner, alloc: *std_allocator.Allocator, kind: RelocKind, by: str) str;
+pub fun reloc_kind_rejection(itn: *intern.Interner, alloc: *A.Allocator, kind: RelocKind, by: str) str;
 ```
 
 a declared kind a format or target does not honor is unsupported by `by`; a
@@ -856,7 +856,7 @@ pub rec ObjectImage;
 ## fun object_image_init
 
 ```mach
-pub fun object_image_init(alloc: *std_allocator.Allocator, itn: *intern.Interner,
+pub fun object_image_init(alloc: *A.Allocator, itn: *intern.Interner,
 name: intern.StrId) ObjectImage;
 ```
 
@@ -1289,7 +1289,7 @@ pub def MachineFlagsFn:        fun(u32, bool) u32
 ## def NormalizeImageFn
 
 ```mach
-pub def NormalizeImageFn:      fun(*std_allocator.Allocator, *ObjectImage) err[fail.Fail]
+pub def NormalizeImageFn:      fun(*A.Allocator, *ObjectImage) err[fail.Fail]
 ```
 
 ## def ResolveRelocOperandFn
@@ -1301,7 +1301,7 @@ pub def ResolveRelocOperandFn: fun(*ObjectImage, u32) res[RelocOperand, fail.Fai
 ## def BuildAttributesFn
 
 ```mach
-pub def BuildAttributesFn: fun(*std_allocator.Allocator, u32, u64, u32, bool, *u32) res[*u8, fail.Fail]
+pub def BuildAttributesFn: fun(*A.Allocator, u32, u64, u32, bool, *u32) res[*u8, fail.Fail]
 ```
 
 build: (alloc, xlen_bits, selected extension bits, float_arg_bits, has_compressed, out_len)
@@ -1309,7 +1309,7 @@ build: (alloc, xlen_bits, selected extension bits, float_arg_bits, has_compresse
 ## def MergeAttributesFn
 
 ```mach
-pub def MergeAttributesFn: fun(*std_allocator.Allocator, *u8, u32, *u8, u32, *u32) res[*u8, fail.Fail]
+pub def MergeAttributesFn: fun(*A.Allocator, *u8, u32, *u8, u32, *u32) res[*u8, fail.Fail]
 ```
 
 ## def ValidateAttributesFn
@@ -1398,13 +1398,13 @@ pub def WriterFn: fun(*ObjectTarget, *ObjectImage, str) err[fail.Fail]
 ## def ParserFn
 
 ```mach
-pub def ParserFn: fun(*std_allocator.Allocator, *intern.Interner, *u8, usize, *ObjectImage) err[fail.Fail]
+pub def ParserFn: fun(*A.Allocator, *intern.Interner, *u8, usize, *ObjectImage) err[fail.Fail]
 ```
 
 ## def ExecFn
 
 ```mach
-pub def ExecFn: fun(*std_allocator.Allocator, *intern.Interner, *ObjectTarget, *LoadSegment, u32, u64, u64, u64,
+pub def ExecFn: fun(*A.Allocator, *intern.Interner, *ObjectTarget, *LoadSegment, u32, u64, u64, u64,
 *ExecFunction, u32, *Section, u32, *Section, u32,
 *SymtabEntry, u32,
 str, *u8, ImageOptions) err[fail.Fail]
@@ -1413,7 +1413,7 @@ str, *u8, ImageOptions) err[fail.Fail]
 ## def DynExecFn
 
 ```mach
-pub def DynExecFn: fun(*std_allocator.Allocator, *intern.Interner, *ObjectTarget, *LoadSegment, u32, u64, u64, u64,
+pub def DynExecFn: fun(*A.Allocator, *intern.Interner, *ObjectTarget, *LoadSegment, u32, u64, u64, u64,
 *ExecFunction, u32, *DynamicInfo, *PltFixup, u32,
 *Section, u32, *Section, u32,
 *SymtabEntry, u32,
@@ -1423,7 +1423,7 @@ str, *u8, ImageOptions) err[fail.Fail]
 ## def SharedFn
 
 ```mach
-pub def SharedFn: fun(*std_allocator.Allocator, *intern.Interner, *ObjectTarget, *LoadSegment, u32, u64,
+pub def SharedFn: fun(*A.Allocator, *intern.Interner, *ObjectTarget, *LoadSegment, u32, u64,
 *ExecFunction, u32, *ExportSym, u32, *DynamicInfo, *Section, u32,
 *SymtabEntry, u32, str, ImageOptions) err[fail.Fail]
 ```
@@ -1455,7 +1455,7 @@ pub def HeaderSpanFn: fun(*HeaderShape, u64) u64
 ## def ExecImageFn
 
 ```mach
-pub def ExecImageFn: fun(*std_allocator.Allocator, *LoadSegment, u32, u64, *u64, *usize) res[*u8, fail.Fail]
+pub def ExecImageFn: fun(*A.Allocator, *LoadSegment, u32, u64, *u64, *usize) res[*u8, fail.Fail]
 ```
 
 ## rec OfVTable
@@ -1550,7 +1550,7 @@ pub rec OfRegistry;
 ## fun registry_init_with_allocator
 
 ```mach
-pub fun registry_init_with_allocator(alloc: *std_allocator.Allocator) OfRegistry;
+pub fun registry_init_with_allocator(alloc: *A.Allocator) OfRegistry;
 ```
 
 ## fun registry_init
@@ -1699,7 +1699,7 @@ pub rec DebugRegistry;
 ## fun debug_registry_init_with_allocator
 
 ```mach
-pub fun debug_registry_init_with_allocator(alloc: *std_allocator.Allocator) DebugRegistry;
+pub fun debug_registry_init_with_allocator(alloc: *A.Allocator) DebugRegistry;
 ```
 
 ## fun debug_registry_init

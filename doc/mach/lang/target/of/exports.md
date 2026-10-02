@@ -23,7 +23,7 @@ pub val VERSION:      u32 = 1
 ## fun encode
 
 ```mach
-pub fun encode(alloc: *std_allocator.Allocator, img: *target_of.ObjectImage, out_bytes: **u8, out_len: *u32) err[fail.Fail];
+pub fun encode(alloc: *A.Allocator, img: *target_of.ObjectImage, out_bytes: **u8, out_len: *u32) err[fail.Fail];
 ```
 
 the section blob for an image's request list, or a nil blob when the list is
@@ -32,7 +32,7 @@ empty. the caller owns the bytes
 ## fun decode
 
 ```mach
-pub fun decode(alloc: *std_allocator.Allocator, itn: *intern.Interner, img: *target_of.ObjectImage, index: u32) err[fail.Fail];
+pub fun decode(alloc: *A.Allocator, itn: *intern.Interner, img: *target_of.ObjectImage, index: u32) err[fail.Fail];
 ```
 
 reads the request list out of section `index` into the image and consumes
@@ -51,7 +51,7 @@ the index of the section named `name`, or none
 ## fun with_section
 
 ```mach
-pub fun with_section(alloc: *std_allocator.Allocator, img: *target_of.ObjectImage, name: intern.StrId,
+pub fun with_section(alloc: *A.Allocator, img: *target_of.ObjectImage, name: intern.StrId,
 template: target_of.Section, bytes: *u8, len: u32, out: *target_of.ObjectImage) err[fail.Fail];
 ```
 
@@ -63,6 +63,6 @@ shared with the input, so only the sections array is freed by `release`
 ## fun release
 
 ```mach
-pub fun release(alloc: *std_allocator.Allocator, view: *target_of.ObjectImage);
+pub fun release(alloc: *A.Allocator, view: *target_of.ObjectImage);
 ```
 

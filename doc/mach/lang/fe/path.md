@@ -23,6 +23,6 @@ pub fun prefix(source: str, path: token.Span) token.Span;
 ## fun intern_path
 
 ```mach
-pub fun intern_path(itn: *intern.Interner, source: str, path: token.Span) res[intern.StrId, std_allocator.Error];
+pub fun intern_path(itn: *intern.Interner, source: str, path: token.Span) res[intern.StrId, A.Error];
 ```
 

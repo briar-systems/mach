@@ -9,7 +9,7 @@ pub rec Ast;
 ## fun init
 
 ```mach
-pub fun init(a: *std_allocator.Allocator, file_id: lang_source.FileId) Ast;
+pub fun init(a: *A.Allocator, file_id: lang_source.FileId) Ast;
 ```
 
 ## fun dnit

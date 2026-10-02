@@ -36,7 +36,7 @@ that key over the first `indexed` of them (#3472)
 ## fun module_sema_init
 
 ```mach
-pub fun module_sema_init(a: *std_allocator.Allocator, path: intern.StrId, module: session.ModuleId) ModuleSema;
+pub fun module_sema_init(a: *A.Allocator, path: intern.StrId, module: session.ModuleId) ModuleSema;
 ```
 
 ## fun module_sema_dnit
@@ -91,7 +91,7 @@ pub rec DefinitionReader;
 
 ```mach
 pub fun reader_init(ctx: ptr, read: fun(ptr, session.ModuleId, DefinitionPhase) res[Definition, fail.Fail],
-a: *std_allocator.Allocator) DefinitionReader;
+a: *A.Allocator) DefinitionReader;
 ```
 
 a reader lives for one computation, which acquires the same current definition once per origin
@@ -355,7 +355,7 @@ bare: intern.StrId, site: token.Span) res[u8, fail.Fail];
 ## fun inst_worklist_new
 
 ```mach
-pub fun inst_worklist_new(alloc: *std_allocator.Allocator) res[*InstWorklist, fail.Fail];
+pub fun inst_worklist_new(alloc: *A.Allocator) res[*InstWorklist, fail.Fail];
 ```
 
 ## fun inst_worklist_free

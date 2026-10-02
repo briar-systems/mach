@@ -47,7 +47,7 @@ params: *ir_type.IrTypeId, count: u32) res[Helper, fail.Fail];
 ## fun name_width
 
 ```mach
-pub fun name_width(alloc: *std_allocator.Allocator, stem: str, bits: u32) res[str, fail.Fail];
+pub fun name_width(alloc: *A.Allocator, stem: str, bits: u32) res[str, fail.Fail];
 ```
 
 `__mach_<stem><bits>`, the name of a helper over one integer width
@@ -55,7 +55,7 @@ pub fun name_width(alloc: *std_allocator.Allocator, stem: str, bits: u32) res[st
 ## fun name_conv
 
 ```mach
-pub fun name_conv(alloc: *std_allocator.Allocator, from: str, from_bits: u32, to: str, to_bits: u32) res[str, fail.Fail];
+pub fun name_conv(alloc: *A.Allocator, from: str, from_bits: u32, to: str, to_bits: u32) res[str, fail.Fail];
 ```
 
 `__mach_<from>_to_<to>`, the name of a conversion helper between two types

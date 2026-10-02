@@ -128,7 +128,7 @@ project: the root manifest's `[project].id`
 ## fun plan
 
 ```mach
-pub fun plan(a: *std_allocator.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry,
+pub fun plan(a: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry,
 m: *manifest.Manifest, owned_req: request.BuildRequest) res[BuildPlan, outcome.Fail];
 ```
 
@@ -147,7 +147,7 @@ ret: the plan; err from request validation, selection or planning
 ## fun plan_cells
 
 ```mach
-pub fun plan_cells(a: *std_allocator.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry,
+pub fun plan_cells(a: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry,
 m: *manifest.Manifest, owned_req: request.BuildRequest, cells: *Vector[manifest.Cell]) res[BuildPlan, outcome.Fail];
 ```
 
@@ -206,7 +206,7 @@ ret: ok; err from closure realization, a dependency cell's planning, or an
 ## fun check_plan_outputs
 
 ```mach
-pub fun check_plan_outputs(a: *std_allocator.Allocator, plans: *Vector[BuildPlan]) err[outcome.Fail];
+pub fun check_plan_outputs(a: *A.Allocator, plans: *Vector[BuildPlan]) err[outcome.Fail];
 ```
 
 refuse two plans of one selection, one per profile, that would write one
@@ -220,7 +220,7 @@ ret: ok; err naming the two cells and the path
 ## fun replan_unit
 
 ```mach
-pub fun replan_unit(a: *std_allocator.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry,
+pub fun replan_unit(a: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry,
 s: *manifest.Scope, req: *request.BuildRequest,
 prior: *BuildUnit) res[BuildUnit, outcome.Fail];
 ```
@@ -234,14 +234,14 @@ pub fun finished_modules(tgt: *lang_target.Target) bool;
 ## fun resolve_token
 
 ```mach
-pub fun resolve_token(a: *std_allocator.Allocator, tgt: *lang_target.Target, dirs: *Vector[str],
+pub fun resolve_token(a: *A.Allocator, tgt: *lang_target.Target, dirs: *Vector[str],
 root: str, tok: *u8) res[LinkInput, outcome.Fail];
 ```
 
 ## fun resolve_requirement
 
 ```mach
-pub fun resolve_requirement(a: *std_allocator.Allocator, itn: *intern.Interner, tgt: *lang_target.Target,
+pub fun resolve_requirement(a: *A.Allocator, itn: *intern.Interner, tgt: *lang_target.Target,
 dirs: *Vector[str], root: str,
 req: *manifest.LinkRequirement) res[LinkInput, outcome.Fail];
 ```
@@ -249,13 +249,13 @@ req: *manifest.LinkRequirement) res[LinkInput, outcome.Fail];
 ## fun join_msg
 
 ```mach
-pub fun join_msg(al: *std_allocator.Allocator, va: ...) str;
+pub fun join_msg(al: *A.Allocator, va: ...) str;
 ```
 
 ## fun render
 
 ```mach
-pub fun render(a: *std_allocator.Allocator, w: *io_writer.Writer, p: *BuildPlan, itn: *intern.Interner) err[outcome.Fail];
+pub fun render(a: *A.Allocator, w: *io_writer.Writer, p: *BuildPlan, itn: *intern.Interner) err[outcome.Fail];
 ```
 
 render the effective plan: one block per selected cell, naming the project,
@@ -271,7 +271,7 @@ itn: resolves interned names
 ## fun explain
 
 ```mach
-pub fun explain(a: *std_allocator.Allocator, p: *BuildPlan, itn: *intern.Interner) err[outcome.Fail];
+pub fun explain(a: *A.Allocator, p: *BuildPlan, itn: *intern.Interner) err[outcome.Fail];
 ```
 
 ## fun phase_name
@@ -294,7 +294,7 @@ build's, a test build's test objects are generated code
 ## fun unknown_phase
 
 ```mach
-pub fun unknown_phase(a: *std_allocator.Allocator, k: PhaseKind) outcome.Fail;
+pub fun unknown_phase(a: *A.Allocator, k: PhaseKind) outcome.Fail;
 ```
 
 an internal catalog failure with a caller-owned message

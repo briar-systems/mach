@@ -74,7 +74,7 @@ without a generation check on that revision
 ## fun init
 
 ```mach
-pub fun init(a: *std_allocator.Allocator) SourceMap;
+pub fun init(a: *A.Allocator) SourceMap;
 ```
 
 ## fun dnit
@@ -166,19 +166,19 @@ whether the payload behind it changed
 ## fun copy_file
 
 ```mach
-pub fun copy_file(file: *SourceFile, a: *std_allocator.Allocator) res[SourceFile, fail.Fail];
+pub fun copy_file(file: *SourceFile, a: *A.Allocator) res[SourceFile, fail.Fail];
 ```
 
 ## fun dnit_file
 
 ```mach
-pub fun dnit_file(file: *SourceFile, a: *std_allocator.Allocator);
+pub fun dnit_file(file: *SourceFile, a: *A.Allocator);
 ```
 
 ## fun snapshot_from
 
 ```mach
-pub fun snapshot_from(src: *SourceMap, a: *std_allocator.Allocator) res[*SourceMap, fail.Fail];
+pub fun snapshot_from(src: *SourceMap, a: *A.Allocator) res[*SourceMap, fail.Fail];
 ```
 
 ## fun position

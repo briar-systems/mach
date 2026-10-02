@@ -16,7 +16,7 @@ pub val SECTION_NAME: str = ".mach.cache"
 ## fun with_record
 
 ```mach
-pub fun with_record(alloc: *std_allocator.Allocator, img: *target_of.ObjectImage, name: str, template: target_of.Section,
+pub fun with_record(alloc: *A.Allocator, img: *target_of.ObjectImage, name: str, template: target_of.Section,
 out: *target_of.ObjectImage) err[fail.Fail];
 ```
 

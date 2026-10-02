@@ -24,13 +24,13 @@ on over the rest; an internal failure ends the pass where it met it
 ## fun q_resolve_compute
 
 ```mach
-pub fun q_resolve_compute(p: *project.Project, key: u64, alloc: *std_allocator.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
+pub fun q_resolve_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
 ```
 
 ## fun q_resolve_finalize
 
 ```mach
-pub fun q_resolve_finalize(value: *u8, value_len: u32, alloc: *std_allocator.Allocator);
+pub fun q_resolve_finalize(value: *u8, value_len: u32, alloc: *A.Allocator);
 ```
 
 ## fun prepare_sema_pass
@@ -57,19 +57,19 @@ pub fun acquire_sema(p: *project.Project, mid: session.ModuleId) res[*fe_sema.Se
 ## fun q_sema_compute
 
 ```mach
-pub fun q_sema_compute(p: *project.Project, key: u64, alloc: *std_allocator.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
+pub fun q_sema_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
 ```
 
 ## fun q_sema_finalize
 
 ```mach
-pub fun q_sema_finalize(value: *u8, value_len: u32, alloc: *std_allocator.Allocator);
+pub fun q_sema_finalize(value: *u8, value_len: u32, alloc: *A.Allocator);
 ```
 
 ## fun read_typed_surface
 
 ```mach
-pub fun read_typed_surface(p: *project.Project, mid: session.ModuleId, a: *std_allocator.Allocator) res[sema_context.ModuleSema, fail.Fail];
+pub fun read_typed_surface(p: *project.Project, mid: session.ModuleId, a: *A.Allocator) res[sema_context.ModuleSema, fail.Fail];
 ```
 
 ## fun retain_modules
@@ -85,7 +85,7 @@ open across builds, and then whatever no retainer holds is retired
 ## fun q_typed_exports_compute
 
 ```mach
-pub fun q_typed_exports_compute(p: *project.Project, key: u64, alloc: *std_allocator.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
+pub fun q_typed_exports_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
 ```
 
 ## fun back_half_key
@@ -182,25 +182,25 @@ pub fun frontend_status(p: *project.Project) fail.PhaseStatus;
 ## fun q_lowered_surface_compute
 
 ```mach
-pub fun q_lowered_surface_compute(p: *project.Project, key: u64, alloc: *std_allocator.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
+pub fun q_lowered_surface_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
 ```
 
 ## fun q_inline_bodies_compute
 
 ```mach
-pub fun q_inline_bodies_compute(p: *project.Project, key: u64, alloc: *std_allocator.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
+pub fun q_inline_bodies_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
 ```
 
 ## fun q_lower_compute
 
 ```mach
-pub fun q_lower_compute(p: *project.Project, key: u64, alloc: *std_allocator.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
+pub fun q_lower_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
 ```
 
 ## fun q_lower_finalize
 
 ```mach
-pub fun q_lower_finalize(value: *u8, value_len: u32, alloc: *std_allocator.Allocator);
+pub fun q_lower_finalize(value: *u8, value_len: u32, alloc: *A.Allocator);
 ```
 
 ## fun prepare_codegen_pass
@@ -243,7 +243,7 @@ pub fun run_codegen_pass(p: *project.Project) err[outcome.Fail];
 ## fun code_sources
 
 ```mach
-pub fun code_sources(p: *project.Project, mid: session.ModuleId, seed: *me_ir.Module, a: *std_allocator.Allocator) res[CodeSources, fail.Fail];
+pub fun code_sources(p: *project.Project, mid: session.ModuleId, seed: *me_ir.Module, a: *A.Allocator) res[CodeSources, fail.Fail];
 ```
 
 the other modules' lowered ir a whole-module backend reads to generate `seed`, module mid's ir
@@ -263,7 +263,7 @@ pub fun sources_empty() CodeSources;
 ## fun sources_dnit
 
 ```mach
-pub fun sources_dnit(a: *std_allocator.Allocator, cs: *CodeSources);
+pub fun sources_dnit(a: *A.Allocator, cs: *CodeSources);
 ```
 
 ## fun run_test_object_one
@@ -293,13 +293,13 @@ the test object's codegen product is current or cached, so no worker generates i
 ## fun q_codegen_compute
 
 ```mach
-pub fun q_codegen_compute(p: *project.Project, key: u64, alloc: *std_allocator.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
+pub fun q_codegen_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
 ```
 
 ## fun q_codegen_finalize
 
 ```mach
-pub fun q_codegen_finalize(value: *u8, value_len: u32, alloc: *std_allocator.Allocator);
+pub fun q_codegen_finalize(value: *u8, value_len: u32, alloc: *A.Allocator);
 ```
 
 ## fun prepare_link_pass
@@ -317,19 +317,19 @@ pub fun run_link_pass(p: *project.Project) res[bool, outcome.Fail];
 ## fun q_link_compute
 
 ```mach
-pub fun q_link_compute(p: *project.Project, key: u64, alloc: *std_allocator.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
+pub fun q_link_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
 ```
 
 ## fun capture_build_config
 
 ```mach
-pub fun capture_build_config(p: *project.Project, alloc: *std_allocator.Allocator) res[query.QueryOutput, fail.Fail];
+pub fun capture_build_config(p: *project.Project, alloc: *A.Allocator) res[query.QueryOutput, fail.Fail];
 ```
 
 ## fun capture_configuration_identity
 
 ```mach
-pub fun capture_configuration_identity(p: *project.Project, alloc: *std_allocator.Allocator) res[query.QueryOutput, fail.Fail];
+pub fun capture_configuration_identity(p: *project.Project, alloc: *A.Allocator) res[query.QueryOutput, fail.Fail];
 ```
 
 the build identity without the request: the persistent key hashes the request

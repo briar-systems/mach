@@ -3,7 +3,7 @@
 ## fun image_init
 
 ```mach
-pub fun image_init(a: *std_allocator.Allocator, interner: *intern.Interner, name: intern.StrId) res[target_of.ObjectImage, fail.Fail];
+pub fun image_init(a: *A.Allocator, interner: *intern.Interner, name: intern.StrId) res[target_of.ObjectImage, fail.Fail];
 ```
 
 ## fun dnit
@@ -33,7 +33,7 @@ pub rec DeferredRelocs;
 ## fun deferred_init
 
 ```mach
-pub fun deferred_init(a: *std_allocator.Allocator) DeferredRelocs;
+pub fun deferred_init(a: *A.Allocator) DeferredRelocs;
 ```
 
 ## fun deferred_dnit
@@ -65,7 +65,7 @@ pub fun flush_deferred(o: *target_of.ObjectImage, d: *DeferredRelocs) err[fail.F
 ## fun rehome
 
 ```mach
-pub fun rehome(dst_alloc: *std_allocator.Allocator, dst_interner: *intern.Interner,
+pub fun rehome(dst_alloc: *A.Allocator, dst_interner: *intern.Interner,
 src: *target_of.ObjectImage, remap: intern.ReinternMap) res[target_of.ObjectImage, fail.Fail];
 ```
 

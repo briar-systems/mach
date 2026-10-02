@@ -39,7 +39,7 @@ pub rec RangeAnalysis;
 
 ```mach
 pub fun init(ra: *RangeAnalysis, fn: *me_ir.Function, types: *ir_type.IrTypeTable,
-la: *loops.LoopAnalysis, alloc: *std_allocator.Allocator) err[fail.Fail];
+la: *loops.LoopAnalysis, alloc: *A.Allocator) err[fail.Fail];
 ```
 
 the analysis reads the loop analysis of the same function and owns nothing

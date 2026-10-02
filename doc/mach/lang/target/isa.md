@@ -1312,7 +1312,7 @@ whether an asm body may write the stack pointer; true for a body it cannot parse
 ## def AsmCtScanFn
 
 ```mach
-pub def AsmCtScanFn: fun(str, *ct.AsmSecret, u32, ct.CtMulMask, bool, *std_allocator.Allocator) err[ct.AsmRefusal]
+pub def AsmCtScanFn: fun(str, *ct.AsmSecret, u32, ct.CtMulMask, bool, *A.Allocator) err[ct.AsmRefusal]
 ```
 
 the constant-time scan of an asm body: the tracked bindings (`ct.AsmSecret`, by the name
@@ -1400,26 +1400,26 @@ pub rec BackendTarget;
 ## def SelectFn
 
 ```mach
-pub def SelectFn: fun(*std_allocator.Allocator, *BackendTarget, *codegen_mir.MirFunction) err[fail.Fail]
+pub def SelectFn: fun(*A.Allocator, *BackendTarget, *codegen_mir.MirFunction) err[fail.Fail]
 ```
 
 ## def EncodeFn
 
 ```mach
-pub def EncodeFn: fun(*std_allocator.Allocator, *BackendTarget, *codegen_mir.MirModule) res[encoding.EncoderOutput, fail.Fail]
+pub def EncodeFn: fun(*A.Allocator, *BackendTarget, *codegen_mir.MirModule) res[encoding.EncoderOutput, fail.Fail]
 ```
 
 ## def EmitAsmFn
 
 ```mach
-pub def EmitAsmFn: fun(*std_allocator.Allocator, *BackendTarget, *codegen_mir.MirModule,
+pub def EmitAsmFn: fun(*A.Allocator, *BackendTarget, *codegen_mir.MirModule,
 *io_writer.Writer) res[encoding.EncoderOutput, fail.Fail]
 ```
 
 ## def EmitModuleFn
 
 ```mach
-pub def EmitModuleFn: fun(*std_allocator.Allocator, *BackendTarget, *unit_input.Unit, *debug_input.ModuleDebug, *target_of.ObjectImage) err[fail.Fail]
+pub def EmitModuleFn: fun(*A.Allocator, *BackendTarget, *unit_input.Unit, *debug_input.ModuleDebug, *target_of.ObjectImage) err[fail.Fail]
 ```
 
 a whole-module emitter fills the object image codegen initialized: its sections,
@@ -2521,7 +2521,7 @@ pub fun declares_attributes(tgt_isa: *IsaVTable) bool;
 ## fun build_attributes
 
 ```mach
-pub fun build_attributes(tgt_isa: *IsaVTable, model: *MachineModel, alloc: *std_allocator.Allocator, float_arg_bits: u32,
+pub fun build_attributes(tgt_isa: *IsaVTable, model: *MachineModel, alloc: *A.Allocator, float_arg_bits: u32,
 has_compressed: bool, out_len: *u32) res[*u8, fail.Fail];
 ```
 
@@ -2535,7 +2535,7 @@ bytes: *u8, len: u32, flags: u32) err[fail.Fail];
 ## fun merge_attributes
 
 ```mach
-pub fun merge_attributes(tgt_isa: *IsaVTable, alloc: *std_allocator.Allocator, acc: *u8, acc_len: u32,
+pub fun merge_attributes(tgt_isa: *IsaVTable, alloc: *A.Allocator, acc: *u8, acc_len: u32,
 add: *u8, add_len: u32, out_len: *u32) res[*u8, fail.Fail];
 ```
 
@@ -2732,7 +2732,7 @@ pub fun make_sym(sym_id: u32, size: u8) Operand;
 ## fun registry_init_with_allocator
 
 ```mach
-pub fun registry_init_with_allocator(alloc: *std_allocator.Allocator) IsaRegistry;
+pub fun registry_init_with_allocator(alloc: *A.Allocator) IsaRegistry;
 ```
 
 ## fun registry_init

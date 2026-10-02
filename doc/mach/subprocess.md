@@ -92,7 +92,7 @@ pub fun request_of(reason: sync_cancel.Reason) Request;
 
 ```mach
 pub tag Cause: u8 {
-    alloc:  std_allocator.Error;
+    alloc:  A.Error;
     exec:   exec.Error;
     io:     io_error.Error;
     native: i64;
@@ -140,7 +140,7 @@ pub fun cause_text(c: Cause) str;
 ## fun text
 
 ```mach
-pub fun text(a: *std_allocator.Allocator, e: Error) str;
+pub fun text(a: *A.Allocator, e: Error) str;
 ```
 
 "identity: cause", owned by `a` (released with str_free); the static
@@ -203,39 +203,39 @@ pub fun expired(p: *OwnedSubprocess) bool;
 ## fun dnit
 
 ```mach
-pub fun dnit(a: *std_allocator.Allocator, p: *OwnedSubprocess);
+pub fun dnit(a: *A.Allocator, p: *OwnedSubprocess);
 ```
 
 ## fun spawn
 
 ```mach
-pub fun spawn(a: *std_allocator.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8) err[Error];
+pub fun spawn(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8) err[Error];
 ```
 
 ## fun spawn_captured_input
 
 ```mach
-pub fun spawn_captured_input(a: *std_allocator.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
+pub fun spawn_captured_input(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
 stdin_fd: usize, capture_stderr: bool, identity: str, limit: usize) err[Error];
 ```
 
 ## fun spawn_grouped
 
 ```mach
-pub fun spawn_grouped(a: *std_allocator.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8) err[Error];
+pub fun spawn_grouped(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8) err[Error];
 ```
 
 ## fun spawn_in_grouped
 
 ```mach
-pub fun spawn_in_grouped(a: *std_allocator.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
+pub fun spawn_in_grouped(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
 cwd: str) err[Error];
 ```
 
 ## fun spawn_captured_grouped
 
 ```mach
-pub fun spawn_captured_grouped(a: *std_allocator.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
+pub fun spawn_captured_grouped(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
 identity: str, limit: usize) err[Error];
 ```
 
@@ -248,19 +248,19 @@ pub fun running(p: *OwnedSubprocess) bool;
 ## fun wait
 
 ```mach
-pub fun wait(a: *std_allocator.Allocator, p: *OwnedSubprocess) res[SubprocessTerminal, Error];
+pub fun wait(a: *A.Allocator, p: *OwnedSubprocess) res[SubprocessTerminal, Error];
 ```
 
 ## fun wait_any
 
 ```mach
-pub fun wait_any(a: *std_allocator.Allocator, owners: *OwnedSubprocess, count: u32, scope: *sync_cancel.Scope, source: *events.Source) res[*OwnedSubprocess, Error];
+pub fun wait_any(a: *A.Allocator, owners: *OwnedSubprocess, count: u32, scope: *sync_cancel.Scope, source: *events.Source) res[*OwnedSubprocess, Error];
 ```
 
 ## fun finish_capture
 
 ```mach
-pub fun finish_capture(a: *std_allocator.Allocator, p: *OwnedSubprocess, retain: bool) res[CaptureIoResult, Error];
+pub fun finish_capture(a: *A.Allocator, p: *OwnedSubprocess, retain: bool) res[CaptureIoResult, Error];
 ```
 
 ## fun abandon_capture
@@ -278,18 +278,18 @@ pub fun capture_bytes(p: *OwnedSubprocess, len: *usize) *u8;
 ## fun release_capture
 
 ```mach
-pub fun release_capture(a: *std_allocator.Allocator, p: *OwnedSubprocess) err[Error];
+pub fun release_capture(a: *A.Allocator, p: *OwnedSubprocess) err[Error];
 ```
 
 ## fun timeout
 
 ```mach
-pub fun timeout(a: *std_allocator.Allocator, p: *OwnedSubprocess, grace: chrono_duration.Duration) res[SubprocessTerminal, Error];
+pub fun timeout(a: *A.Allocator, p: *OwnedSubprocess, grace: chrono_duration.Duration) res[SubprocessTerminal, Error];
 ```
 
 ## fun cancel
 
 ```mach
-pub fun cancel(a: *std_allocator.Allocator, p: *OwnedSubprocess, grace: chrono_duration.Duration) res[SubprocessTerminal, Error];
+pub fun cancel(a: *A.Allocator, p: *OwnedSubprocess, grace: chrono_duration.Duration) res[SubprocessTerminal, Error];
 ```
 

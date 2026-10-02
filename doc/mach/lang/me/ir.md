@@ -388,7 +388,7 @@ pub rec Module;
 ## fun init
 
 ```mach
-pub fun init(a: *std_allocator.Allocator, name: intern.StrId) res[Module, fail.Fail];
+pub fun init(a: *A.Allocator, name: intern.StrId) res[Module, fail.Fail];
 ```
 
 ## fun dnit
@@ -406,7 +406,7 @@ pub fun function_dnit(m: *Module, fn: *Function);
 ## fun function_new
 
 ```mach
-pub fun function_new(alloc: *std_allocator.Allocator, name: intern.StrId, sig: ir_type.IrTypeId, flags: u32) Function;
+pub fun function_new(alloc: *A.Allocator, name: intern.StrId, sig: ir_type.IrTypeId, flags: u32) Function;
 ```
 
 ## fun function_add

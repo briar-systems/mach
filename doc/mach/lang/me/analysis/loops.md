@@ -36,7 +36,7 @@ a dominance query is an interval test rather than a walk up the idom chain
 ## fun analyze
 
 ```mach
-pub fun analyze(fn: *me_ir.Function, types: *ir_type.IrTypeTable, alloc: *std_allocator.Allocator) res[LoopAnalysis, fail.Fail];
+pub fun analyze(fn: *me_ir.Function, types: *ir_type.IrTypeTable, alloc: *A.Allocator) res[LoopAnalysis, fail.Fail];
 ```
 
 the type table reads a counted loop's induction variable at its width

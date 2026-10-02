@@ -123,7 +123,7 @@ pub fun clone_region(m: *me_ir.Module, fn: *me_ir.Function, body: *ir_id.BlockId
 ## fun version_result_dnit
 
 ```mach
-pub fun version_result_dnit(vr: *VersionResult, alloc: *std_allocator.Allocator);
+pub fun version_result_dnit(vr: *VersionResult, alloc: *A.Allocator);
 ```
 
 ## fun clone_one

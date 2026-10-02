@@ -255,7 +255,7 @@ pub rec OsRegistry;
 ## fun registry_init_with_allocator
 
 ```mach
-pub fun registry_init_with_allocator(alloc: *std_allocator.Allocator) OsRegistry;
+pub fun registry_init_with_allocator(alloc: *A.Allocator) OsRegistry;
 ```
 
 ## fun registry_init

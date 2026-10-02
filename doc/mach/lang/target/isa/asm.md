@@ -434,7 +434,7 @@ pub fun region_i64(s: str, lo: usize, hi: usize) opt[i64];
 ## fun named_message
 
 ```mach
-pub fun named_message(alloc: *std_allocator.Allocator, interner: *intern.Interner, prefix: str, name: str,
+pub fun named_message(alloc: *A.Allocator, interner: *intern.Interner, prefix: str, name: str,
 suffix: str, fallback: str) str;
 ```
 
@@ -447,7 +447,7 @@ pub fun span_message(c: *Cursor, prefix: str, lo: usize, hi: usize, suffix: str,
 ## fun cursor_init
 
 ```mach
-pub fun cursor_init(c: *Cursor, g: *Grammar, body: str, alloc: *std_allocator.Allocator,
+pub fun cursor_init(c: *Cursor, g: *Grammar, body: str, alloc: *A.Allocator,
 interner: *intern.Interner, f: *codegen_mir.MirFunction, pl: *codegen_mir.MirAsm);
 ```
 
@@ -561,7 +561,7 @@ pub rec Labels;
 ## fun labels_init
 
 ```mach
-pub fun labels_init(l: *Labels, alloc: *std_allocator.Allocator);
+pub fun labels_init(l: *Labels, alloc: *A.Allocator);
 ```
 
 ## fun labels_dnit

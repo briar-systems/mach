@@ -15,13 +15,13 @@ pub rec SegmentRows;
 ## fun segment_rows_free
 
 ```mach
-pub fun segment_rows_free(alloc: *std_allocator.Allocator, s: *SegmentRows, seg_count: u32);
+pub fun segment_rows_free(alloc: *A.Allocator, s: *SegmentRows, seg_count: u32);
 ```
 
 ## fun place_segments
 
 ```mach
-pub fun place_segments(alloc: *std_allocator.Allocator, fp: *of_plan.FilePlan, segs: *target_of.LoadSegment, seg_count: u32,
+pub fun place_segments(alloc: *A.Allocator, fp: *of_plan.FilePlan, segs: *target_of.LoadSegment, seg_count: u32,
 hdr_span: usize, page: usize, first_at_span: bool) res[SegmentRows, fail.Fail];
 ```
 
@@ -82,7 +82,7 @@ pub fun data_const_seg_count(dyn: *target_of.DynamicInfo, segs: *target_of.LoadS
 ## fun data_const_conflict_message
 
 ```mach
-pub fun data_const_conflict_message(itn: *intern.Interner, alloc: *std_allocator.Allocator, dyn: *target_of.DynamicInfo,
+pub fun data_const_conflict_message(itn: *intern.Interner, alloc: *A.Allocator, dyn: *target_of.DynamicInfo,
 segs: *target_of.LoadSegment, seg_count: u32) str;
 ```
 

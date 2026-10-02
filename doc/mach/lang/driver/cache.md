@@ -15,7 +15,7 @@ digest memo in the cell's `.cache` directory (build/cache/memo)
 ## fun configuration
 
 ```mach
-pub fun configuration(scratch: *std_allocator.Allocator, p: *project.Project, config: *u8, config_len: usize,
+pub fun configuration(scratch: *A.Allocator, p: *project.Project, config: *u8, config_len: usize,
 compiler_id: *compiler.Identity, digest: *[32]u8) err[fail.Fail];
 ```
 
@@ -41,7 +41,7 @@ pub fun identity_available(p: *project.Project) bool;
 ## fun object_path
 
 ```mach
-pub fun object_path(p: *project.Project, m: *project.ModuleEntry, a: *std_allocator.Allocator) res[str, fail.Fail];
+pub fun object_path(p: *project.Project, m: *project.ModuleEntry, a: *A.Allocator) res[str, fail.Fail];
 ```
 
 where the build writes module m's object: `obj/<project>/<module path>.<ext>`
@@ -49,7 +49,7 @@ where the build writes module m's object: `obj/<project>/<module path>.<ext>`
 ## fun test_object_path
 
 ```mach
-pub fun test_object_path(p: *project.Project, m: *project.ModuleEntry, a: *std_allocator.Allocator) res[str, fail.Fail];
+pub fun test_object_path(p: *project.Project, m: *project.ModuleEntry, a: *A.Allocator) res[str, fail.Fail];
 ```
 
 where the build writes module m's test object: `obj/<project>/<module path>.test.<ext>`

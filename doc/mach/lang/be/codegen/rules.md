@@ -87,7 +87,7 @@ pub fun capture_operand_banks(f: *codegen_mir.MirFunction, mi: *codegen_mir.MirI
 ## fun select_function
 
 ```mach
-pub fun select_function(pack: *RulePack, a: *std_allocator.Allocator, tgt: *isa.BackendTarget, f: *codegen_mir.MirFunction) err[fail.Fail];
+pub fun select_function(pack: *RulePack, a: *A.Allocator, tgt: *isa.BackendTarget, f: *codegen_mir.MirFunction) err[fail.Fail];
 ```
 
 ## fun is_reg_move

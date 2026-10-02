@@ -39,7 +39,7 @@ pub fun live_instructions(fn: *me_ir.Function) u32;
 ## fun own_constant
 
 ```mach
-pub fun own_constant(a: *std_allocator.Allocator, original: value.Value) res[value.Value, fail.Fail];
+pub fun own_constant(a: *A.Allocator, original: value.Value) res[value.Value, fail.Fail];
 ```
 
 constant payloads belong to the destination module arena
@@ -47,7 +47,7 @@ constant payloads belong to the destination module arena
 ## fun extract
 
 ```mach
-pub fun extract(dst: *me_ir.Module, src: *me_ir.Module, tgt: *lang_target.Target, scratch: *std_allocator.Allocator, recursive: *bool) err[fail.Fail];
+pub fun extract(dst: *me_ir.Module, src: *me_ir.Module, tgt: *lang_target.Target, scratch: *A.Allocator, recursive: *bool) err[fail.Fail];
 ```
 
 ## rec Slot
@@ -102,7 +102,7 @@ pub fun contains(a: *Available, ix: u32) bool;
 ## fun acquire
 
 ```mach
-pub fun acquire(a: *Available, dst: *me_ir.Module, provider: *me_ir.Module, name: intern.StrId, tgt: *lang_target.Target, scratch: *std_allocator.Allocator) err[fail.Fail];
+pub fun acquire(a: *Available, dst: *me_ir.Module, provider: *me_ir.Module, name: intern.StrId, tgt: *lang_target.Target, scratch: *A.Allocator) err[fail.Fail];
 ```
 
 ## fun growth_cost

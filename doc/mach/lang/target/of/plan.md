@@ -39,7 +39,7 @@ pub fun limit_64() usize;
 ## fun init
 
 ```mach
-pub fun init(alloc: *std_allocator.Allocator, itn: *intern.Interner, format: str, limit: usize) res[FilePlan, fail.Fail];
+pub fun init(alloc: *A.Allocator, itn: *intern.Interner, format: str, limit: usize) res[FilePlan, fail.Fail];
 ```
 
 ## fun dnit

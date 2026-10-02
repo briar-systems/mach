@@ -21,7 +21,7 @@ pub rec Strings;
 ## fun init
 
 ```mach
-pub fun init(a: *std_allocator.Allocator) Environment;
+pub fun init(a: *A.Allocator) Environment;
 ```
 
 ## fun dnit
@@ -47,7 +47,7 @@ pub fun put_entry(values: *Environment, entry: str, replace: bool) err[outcome.F
 ## fun capture
 
 ```mach
-pub fun capture(a: *std_allocator.Allocator, inherited: **u8) res[Environment, outcome.Fail];
+pub fun capture(a: *A.Allocator, inherited: **u8) res[Environment, outcome.Fail];
 ```
 
 inherited duplicate names retain the first value, matching native lookup
@@ -61,7 +61,7 @@ pub fun canonicalize(values: *Environment) err[outcome.Fail];
 ## fun strings_free
 
 ```mach
-pub fun strings_free(a: *std_allocator.Allocator, strings: *Strings);
+pub fun strings_free(a: *A.Allocator, strings: *Strings);
 ```
 
 ## fun to_strings

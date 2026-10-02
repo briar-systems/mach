@@ -3,7 +3,7 @@
 ## fun format_source
 
 ```mach
-pub fun format_source(a: *std_allocator.Allocator, text: str, file_id: lang_source.FileId, diags: *diagnostic.DiagnosticStore) res[str, fail.Fail];
+pub fun format_source(a: *A.Allocator, text: str, file_id: lang_source.FileId, diags: *diagnostic.DiagnosticStore) res[str, fail.Fail];
 ```
 
 format one source file. success transfers one nul-terminated string to the
@@ -15,7 +15,7 @@ surfaces as an internal failure and never as a rewritten file
 ## fun same_meaning
 
 ```mach
-pub fun same_meaning(a: *std_allocator.Allocator, before: str, after: str) res[bool, fail.Fail];
+pub fun same_meaning(a: *A.Allocator, before: str, after: str) res[bool, fail.Fail];
 ```
 
 whether `after` means what `before` means: both parse, to the same atoms in

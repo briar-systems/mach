@@ -21,7 +21,7 @@ pub fun entry_module_fqn(p: *project.Project, t: *project.TargetEntry) res[inter
 ## fun compose_module_fqn
 
 ```mach
-pub fun compose_module_fqn(alloc: *std_allocator.Allocator, itn: *intern.Interner, id_text: str, rel_text: str) res[intern.StrId, fail.Fail];
+pub fun compose_module_fqn(alloc: *A.Allocator, itn: *intern.Interner, id_text: str, rel_text: str) res[intern.StrId, fail.Fail];
 ```
 
 ## fun fqn_in_root_project
@@ -49,7 +49,7 @@ pub fun diag_join_named(s: *session.Session, prefix: str, name_id: intern.StrId,
 ## fun join_path
 
 ```mach
-pub fun join_path(alloc: *std_allocator.Allocator, a: str, b: str) res[str, fail.Fail];
+pub fun join_path(alloc: *A.Allocator, a: str, b: str) res[str, fail.Fail];
 ```
 
 ## fun parse_root
@@ -86,7 +86,7 @@ ret: ok(true) when the surface is unchanged; ok(false) when the caller must relo
 ## fun target_context
 
 ```mach
-pub fun target_context(alloc: *std_allocator.Allocator, t: *lang_target.Target, req: *request.BuildRequest,
+pub fun target_context(alloc: *A.Allocator, t: *lang_target.Target, req: *request.BuildRequest,
 compiler_name: intern.StrId, compiler_ver: intern.StrId) comptime.ComptimeCtx;
 ```
 
@@ -103,19 +103,19 @@ pub fun parsed_definition(ctx: ptr, mid: session.ModuleId) res[resolve.ParsedDef
 ## fun q_parse_compute
 
 ```mach
-pub fun q_parse_compute(p: *project.Project, key: u64, alloc: *std_allocator.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
+pub fun q_parse_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
 ```
 
 ## fun q_parse_finalize
 
 ```mach
-pub fun q_parse_finalize(value: *u8, value_len: u32, alloc: *std_allocator.Allocator);
+pub fun q_parse_finalize(value: *u8, value_len: u32, alloc: *A.Allocator);
 ```
 
 ## fun q_exports_compute
 
 ```mach
-pub fun q_exports_compute(p: *project.Project, key: u64, alloc: *std_allocator.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
+pub fun q_exports_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
 ```
 
 ## rec UseTarget

@@ -3,7 +3,7 @@
 ## fun execute
 
 ```mach
-pub fun execute(bp: *build_plan.BuildPlan, backing: *std_allocator.Allocator, oa: *std_allocator.Allocator,
+pub fun execute(bp: *build_plan.BuildPlan, backing: *A.Allocator, oa: *A.Allocator,
 ev: *readout.Progress) res[outcome.BuildOutcome, outcome.Fail];
 ```
 
@@ -24,7 +24,7 @@ ret: the outcome, released with outcome.outcome_dnit, or an engine failure whose
 ## fun execute_warm
 
 ```mach
-pub fun execute_warm(bp: *build_plan.BuildPlan, unit_index: usize, s: *session.Session, oa: *std_allocator.Allocator,
+pub fun execute_warm(bp: *build_plan.BuildPlan, unit_index: usize, s: *session.Session, oa: *A.Allocator,
 ev: *readout.Progress) res[outcome.BuildOutcome, outcome.Fail];
 ```
 

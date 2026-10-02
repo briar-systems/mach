@@ -182,7 +182,7 @@ lose and take them with it; at the top they go to the sink, in order.
 ## fun diag_dnit
 
 ```mach
-pub fun diag_dnit(p: *Parser, alloc: *std_allocator.Allocator);
+pub fun diag_dnit(p: *Parser, alloc: *A.Allocator);
 ```
 
 ## fun error_at_current
@@ -235,7 +235,7 @@ pub fun fatal_ice_at(p: *Parser, span: token.Span, message: str);
 ## fun probed_init
 
 ```mach
-pub fun probed_init(p: *Parser, alloc: *std_allocator.Allocator);
+pub fun probed_init(p: *Parser, alloc: *A.Allocator);
 ```
 
 a token position where the index reading of `name[` has already been tried
@@ -246,7 +246,7 @@ every level and doubles with depth.
 ## fun probed_dnit
 
 ```mach
-pub fun probed_dnit(p: *Parser, alloc: *std_allocator.Allocator);
+pub fun probed_dnit(p: *Parser, alloc: *A.Allocator);
 ```
 
 ## fun index_reading_failed_here

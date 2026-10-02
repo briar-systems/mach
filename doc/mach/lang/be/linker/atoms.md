@@ -15,7 +15,7 @@ pub val ATOM_OWNS: u32 = 0xFFFFFFFF
 ## fun plan_atom_coalescing
 
 ```mach
-pub fun plan_atom_coalescing(alloc: *std_allocator.Allocator, modules: *target_of.ObjectImage, module_count: u32,
+pub fun plan_atom_coalescing(alloc: *A.Allocator, modules: *target_of.ObjectImage, module_count: u32,
 sec_base: *u32, sec_total: u32,
 atoms: *AtomPlan) res[*u32, fail.Fail];
 ```
@@ -29,7 +29,7 @@ pub fun init_atom_plan(plan: *AtomPlan);
 ## fun free_atom_plan
 
 ```mach
-pub fun free_atom_plan(alloc: *std_allocator.Allocator, plan: *AtomPlan);
+pub fun free_atom_plan(alloc: *A.Allocator, plan: *AtomPlan);
 ```
 
 ## fun atom_offset_dead
@@ -68,7 +68,7 @@ byte at input offset `offset`, or after the last when offset is the length
 ## fun atom_plan_open_gaps
 
 ```mach
-pub fun atom_plan_open_gaps(alloc: *std_allocator.Allocator, modules: *target_of.ObjectImage, module_count: u32,
+pub fun atom_plan_open_gaps(alloc: *A.Allocator, modules: *target_of.ObjectImage, module_count: u32,
 sec_total: u32, plan: *AtomPlan, gaps: *AtomGap, gap_count: u32) err[fail.Fail];
 ```
 

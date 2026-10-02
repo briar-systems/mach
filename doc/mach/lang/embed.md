@@ -58,7 +58,7 @@ entry in place, so a holder reads the current status, bytes and digest
 ## fun init
 
 ```mach
-pub fun init(alloc: *std_allocator.Allocator) EmbedCache;
+pub fun init(alloc: *A.Allocator) EmbedCache;
 ```
 
 ## fun set_path_env
@@ -99,7 +99,7 @@ that reads other files, and reads the entry's current state
 ## fun resolve_arg
 
 ```mach
-pub fun resolve_arg(alloc: *std_allocator.Allocator, c: *EmbedCache, itn: *intern.Interner, module_fqn: intern.StrId,
+pub fun resolve_arg(alloc: *A.Allocator, c: *EmbedCache, itn: *intern.Interner, module_fqn: intern.StrId,
 decl_file: str, arg: str) res[str, manifest.TemplateError];
 ```
 
@@ -117,13 +117,13 @@ ret: the resolved path; err as `manifest.expand_artifact_path`
 ## fun escapes_root
 
 ```mach
-pub fun escapes_root(alloc: *std_allocator.Allocator, c: *EmbedCache, resolved: str) res[bool, fail.Fail];
+pub fun escapes_root(alloc: *A.Allocator, c: *EmbedCache, resolved: str) res[bool, fail.Fail];
 ```
 
 ## fun resolve_path
 
 ```mach
-pub fun resolve_path(alloc: *std_allocator.Allocator, decl_file: str, arg: str) res[str, fail.Fail];
+pub fun resolve_path(alloc: *A.Allocator, decl_file: str, arg: str) res[str, fail.Fail];
 ```
 
 ## fun refresh

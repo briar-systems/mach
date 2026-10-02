@@ -3,13 +3,13 @@
 ## fun encode_riscv64
 
 ```mach
-pub fun encode_riscv64(alloc: *std_allocator.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule) res[codegen_encode.EncoderOutput, fail.Fail];
+pub fun encode_riscv64(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule) res[codegen_encode.EncoderOutput, fail.Fail];
 ```
 
 ## fun encode_riscv64_asm
 
 ```mach
-pub fun encode_riscv64_asm(alloc: *std_allocator.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule,
+pub fun encode_riscv64_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule,
 out: *io_writer.Writer) res[codegen_encode.EncoderOutput, fail.Fail];
 ```
 
@@ -51,6 +51,6 @@ implicit effects. x0 is never written; the walk holds it constant
 
 ```mach
 pub fun asm_ct_scan(body: str, secrets: *ct.AsmSecret, n_secret: u32,
-mul: ct.CtMulMask, trust_shift: bool, alloc: *std_allocator.Allocator) err[ct.AsmRefusal];
+mul: ct.CtMulMask, trust_shift: bool, alloc: *A.Allocator) err[ct.AsmRefusal];
 ```
 

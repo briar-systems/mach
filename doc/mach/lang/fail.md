@@ -74,7 +74,7 @@ diagnostics carry their own
 ## fun refused
 
 ```mach
-pub fun refused(e: std_allocator.Error) Fail;
+pub fun refused(e: A.Error) Fail;
 ```
 
 ## fun write_refused
@@ -106,7 +106,7 @@ a refused read met by the compiler (an object or archive it was handed)
 ## fun fs_refused
 
 ```mach
-pub fun fs_refused(e: std_filesystem.FsError) Fail;
+pub fun fs_refused(e: fs.FsError) Fail;
 ```
 
 a refused filesystem operation met by the compiler: the step that refused
@@ -115,7 +115,7 @@ names its own cause
 ## fun fs_environment
 
 ```mach
-pub fun fs_environment(k: diagnostic_kind.Kind, e: std_filesystem.FsError) Fail;
+pub fun fs_environment(k: diagnostic_kind.Kind, e: fs.FsError) Fail;
 ```
 
 a filesystem operation on a file the build was handed (an object, an
@@ -335,7 +335,7 @@ pub fun is_internal_member(c: Catalog) bool;
 ## fun catalog_text
 
 ```mach
-pub fun catalog_text(a: *std_allocator.Allocator, c: Catalog) res[str, std_format.FormatError];
+pub fun catalog_text(a: *A.Allocator, c: Catalog) res[str, std_format.FormatError];
 ```
 
 the message, owned by the caller's allocator (extent str_len + 1, released
@@ -344,7 +344,7 @@ with str_free); the only failure a literal format can meet is the allocator's
 ## fun catalog_interned
 
 ```mach
-pub fun catalog_interned(itn: *intern.Interner, a: *std_allocator.Allocator, c: Catalog) res[str, Fail];
+pub fun catalog_interned(itn: *intern.Interner, a: *A.Allocator, c: Catalog) res[str, Fail];
 ```
 
 the message, owned by the interner so it outlives temporary phase storage
@@ -352,7 +352,7 @@ the message, owned by the interner so it outlives temporary phase storage
 ## fun catalog_message
 
 ```mach
-pub fun catalog_message(itn: *intern.Interner, a: *std_allocator.Allocator, c: Catalog) str;
+pub fun catalog_message(itn: *intern.Interner, a: *A.Allocator, c: Catalog) str;
 ```
 
 the interned message as plain text: an allocation refusal yields its own text,
@@ -361,7 +361,7 @@ which is still a failure message and never a valid-looking member
 ## fun catalog_message_or
 
 ```mach
-pub fun catalog_message_or(itn: *intern.Interner, a: *std_allocator.Allocator, c: Catalog, generic: str) str;
+pub fun catalog_message_or(itn: *intern.Interner, a: *A.Allocator, c: Catalog, generic: str) str;
 ```
 
 the interned message when the site owns an interner and an allocator, else

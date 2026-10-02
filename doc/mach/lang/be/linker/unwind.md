@@ -18,7 +18,7 @@ pub fun init_unwind_plan(plan: *UnwindPlan);
 ## fun free_unwind_plan
 
 ```mach
-pub fun free_unwind_plan(alloc: *std_allocator.Allocator, plan: *UnwindPlan);
+pub fun free_unwind_plan(alloc: *A.Allocator, plan: *UnwindPlan);
 ```
 
 ## fun claim_unwind_inputs

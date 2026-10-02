@@ -4,7 +4,7 @@
 
 ```mach
 pub tag Error: u8 {
-    alloc: std_allocator.Error;
+    alloc: A.Error;
     overflow;
     failed;
 }
@@ -28,7 +28,7 @@ pub rec TextBuilder;
 ## fun tb_init
 
 ```mach
-pub fun tb_init(a: *std_allocator.Allocator) TextBuilder;
+pub fun tb_init(a: *A.Allocator) TextBuilder;
 ```
 
 ## fun tb_append

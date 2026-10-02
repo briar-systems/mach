@@ -26,7 +26,7 @@ pub fun init_thunk_plan(plan: *ThunkPlan);
 ## fun free_thunk_plan
 
 ```mach
-pub fun free_thunk_plan(alloc: *std_allocator.Allocator, plan: *ThunkPlan);
+pub fun free_thunk_plan(alloc: *A.Allocator, plan: *ThunkPlan);
 ```
 
 ## fun thunks_placed

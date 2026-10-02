@@ -79,7 +79,7 @@ pub fun init_local_got_plan(plan: *LocalGotPlan);
 ## fun free_local_got_plan
 
 ```mach
-pub fun free_local_got_plan(alloc: *std_allocator.Allocator, plan: *LocalGotPlan);
+pub fun free_local_got_plan(alloc: *A.Allocator, plan: *LocalGotPlan);
 ```
 
 ## fun build_local_got_plan

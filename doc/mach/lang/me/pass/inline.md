@@ -20,7 +20,7 @@ module's
 ## fun mark_recursive
 
 ```mach
-pub fun mark_recursive(m: *me_ir.Module, recursive: *bool, scratch_alloc: *std_allocator.Allocator) err[fail.Fail];
+pub fun mark_recursive(m: *me_ir.Module, recursive: *bool, scratch_alloc: *A.Allocator) err[fail.Fail];
 ```
 
 the visit state is `scratch`; `recursive` is the caller's

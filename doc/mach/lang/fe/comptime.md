@@ -687,7 +687,7 @@ pub fun environment(c: *ComptimeCtx) ComptimeEnv;
 
 ```mach
 pub fun init(
-alloc: *std_allocator.Allocator,
+alloc: *A.Allocator,
 target_os_id: u32,
 target_arch_id: u32,
 target_abi_id: u32,

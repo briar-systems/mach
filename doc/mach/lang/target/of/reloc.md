@@ -129,7 +129,7 @@ sym_va: u64, addend: i64, patch_va: u64) res[bool, RelocError];
 ## fun normalize_image
 
 ```mach
-pub fun normalize_image(tgt_isa: *isa.IsaVTable, alloc: *std_allocator.Allocator,
+pub fun normalize_image(tgt_isa: *isa.IsaVTable, alloc: *A.Allocator,
 img: *target_of.ObjectImage) err[fail.Fail];
 ```
 

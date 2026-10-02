@@ -45,7 +45,7 @@ pub val PACK: codegen_rules.RulePack = codegen_rules.RulePack;
 ## fun select
 
 ```mach
-pub fun select(a: *std_allocator.Allocator, tgt: *isa.BackendTarget, f: *codegen_mir.MirFunction) err[fail.Fail];
+pub fun select(a: *A.Allocator, tgt: *isa.BackendTarget, f: *codegen_mir.MirFunction) err[fail.Fail];
 ```
 
 ## fun is_reg_move

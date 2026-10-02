@@ -25,7 +25,7 @@ pub rec StrArr;
 ## fun sfmt
 
 ```mach
-pub fun sfmt(alloc: *std_allocator.Allocator, fmt: str, va: ...) str;
+pub fun sfmt(alloc: *A.Allocator, fmt: str, va: ...) str;
 ```
 
 an sfmt result is owned and freed by its receiver; a formatting oom has nothing owned to hand back
@@ -84,20 +84,20 @@ pub fun intern_opt_unwrap(itn: *intern.Interner, text: str) intern.StrId;
 ## fun parse_str_array
 
 ```mach
-pub fun parse_str_array(alloc: *std_allocator.Allocator, itn: *intern.Interner, arr: *toml.Array,
+pub fun parse_str_array(alloc: *A.Allocator, itn: *intern.Interner, arr: *toml.Array,
 label: str, key: str, allow_scalar: bool) res[StrArr, outcome.Fail];
 ```
 
 ## fun opt_value_text
 
 ```mach
-pub fun opt_value_text(alloc: *std_allocator.Allocator, v: *toml.Value) str;
+pub fun opt_value_text(alloc: *A.Allocator, v: *toml.Value) str;
 ```
 
 ## fun parse_default_flag
 
 ```mach
-pub fun parse_default_flag(alloc: *std_allocator.Allocator, table: str, name: str, sub: *toml.Table) res[bool, outcome.Fail];
+pub fun parse_default_flag(alloc: *A.Allocator, table: str, name: str, sub: *toml.Table) res[bool, outcome.Fail];
 ```
 
 ## rec DefaultTables
@@ -115,25 +115,25 @@ pub fun default_tables_init() DefaultTables;
 ## fun default_tables_note
 
 ```mach
-pub fun default_tables_note(alloc: *std_allocator.Allocator, d: *DefaultTables, label: str);
+pub fun default_tables_note(alloc: *A.Allocator, d: *DefaultTables, label: str);
 ```
 
 ## fun default_tables_dnit
 
 ```mach
-pub fun default_tables_dnit(alloc: *std_allocator.Allocator, d: *DefaultTables);
+pub fun default_tables_dnit(alloc: *A.Allocator, d: *DefaultTables);
 ```
 
 ## fun duplicate_default_err
 
 ```mach
-pub fun duplicate_default_err(alloc: *std_allocator.Allocator, kind: str, d: *DefaultTables) str;
+pub fun duplicate_default_err(alloc: *A.Allocator, kind: str, d: *DefaultTables) str;
 ```
 
 ## fun check_keys
 
 ```mach
-pub fun check_keys(alloc: *std_allocator.Allocator, tab: *toml.Table, label: str, known: fun(str) bool) err[outcome.Fail];
+pub fun check_keys(alloc: *A.Allocator, tab: *toml.Table, label: str, known: fun(str) bool) err[outcome.Fail];
 ```
 
 refuse the first key of a table that its section's `known` predicate does
@@ -180,7 +180,7 @@ ret: true when every rule holds
 ## fun check_path
 
 ```mach
-pub fun check_path(alloc: *std_allocator.Allocator, value: str, field: str, sp: toml.Span) err[outcome.Fail];
+pub fun check_path(alloc: *A.Allocator, value: str, field: str, sp: toml.Span) err[outcome.Fail];
 ```
 
 refuse a path that `is_project_path` does not admit, pointing at `sp`, the
@@ -189,7 +189,7 @@ value as written
 ## fun free_strarr
 
 ```mach
-pub fun free_strarr(alloc: *std_allocator.Allocator, items: *intern.StrId, count: u32);
+pub fun free_strarr(alloc: *A.Allocator, items: *intern.StrId, count: u32);
 ```
 
 ## fun span_site
@@ -205,7 +205,7 @@ parser did not write
 ## fun element_sites
 
 ```mach
-pub fun element_sites(alloc: *std_allocator.Allocator, arr: *toml.Array) res[*outcome.Place, outcome.Fail];
+pub fun element_sites(alloc: *A.Allocator, arr: *toml.Array) res[*outcome.Place, outcome.Fail];
 ```
 
 where each element of `arr` is written, in order, as `span_site` places it;
@@ -222,7 +222,7 @@ the place `i` of a model's per-entry places, the zero place when none were recor
 ## fun free_sites
 
 ```mach
-pub fun free_sites(alloc: *std_allocator.Allocator, sites: *outcome.Place, count: u32);
+pub fun free_sites(alloc: *A.Allocator, sites: *outcome.Place, count: u32);
 ```
 
 ## rec Sites
@@ -240,7 +240,7 @@ refused: the allocator refused to hold one, which the refusal becomes
 ## fun sites_init
 
 ```mach
-pub fun sites_init(alloc: *std_allocator.Allocator) Sites;
+pub fun sites_init(alloc: *A.Allocator) Sites;
 ```
 
 ## fun sites_add
@@ -252,7 +252,7 @@ pub fun sites_add(s: *Sites, p: outcome.Place);
 ## fun sites_fail
 
 ```mach
-pub fun sites_fail(alloc: *std_allocator.Allocator, s: *Sites, f: outcome.Fail) outcome.Fail;
+pub fun sites_fail(alloc: *A.Allocator, s: *Sites, f: outcome.Fail) outcome.Fail;
 ```
 
 `f` pointing at the first place gathered, naming the others as related; the
@@ -261,7 +261,7 @@ gathered places are released
 ## fun at_sites
 
 ```mach
-pub fun at_sites(alloc: *std_allocator.Allocator, f: outcome.Fail, sites: *outcome.Place, n: usize) outcome.Fail;
+pub fun at_sites(alloc: *A.Allocator, f: outcome.Fail, sites: *outcome.Place, n: usize) outcome.Fail;
 ```
 
 `f` pointing at the first spanned place of the `n` at `sites`, naming the

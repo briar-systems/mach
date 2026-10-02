@@ -21,6 +21,6 @@ whose relocations are theirs and whose defects are the input's
 ## fun free_modules
 
 ```mach
-pub fun free_modules(alloc: *std_allocator.Allocator, modules: *target_of.ObjectImage, module_count: u32);
+pub fun free_modules(alloc: *A.Allocator, modules: *target_of.ObjectImage, module_count: u32);
 ```
 

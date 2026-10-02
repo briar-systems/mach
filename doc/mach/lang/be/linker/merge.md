@@ -51,7 +51,7 @@ pub fun init_section_groups(g: *SectionGroups);
 ## fun free_section_groups
 
 ```mach
-pub fun free_section_groups(alloc: *std_allocator.Allocator, g: *SectionGroups);
+pub fun free_section_groups(alloc: *A.Allocator, g: *SectionGroups);
 ```
 
 ## fun section_group_index
@@ -63,7 +63,7 @@ pub fun section_group_index(g: *SectionGroups, slot: u32, name: intern.StrId, fl
 ## fun section_group_add
 
 ```mach
-pub fun section_group_add(alloc: *std_allocator.Allocator, g: *SectionGroups, slot: u32,
+pub fun section_group_add(alloc: *A.Allocator, g: *SectionGroups, slot: u32,
 name: intern.StrId, flags: u32) res[u32, fail.Fail];
 ```
 
@@ -171,6 +171,6 @@ pub fun os_page_size(tgt: *lang_target.Target) u64;
 ## fun free_placements
 
 ```mach
-pub fun free_placements(alloc: *std_allocator.Allocator, placements: *Placement, sec_total: u32);
+pub fun free_placements(alloc: *A.Allocator, placements: *Placement, sec_total: u32);
 ```
 

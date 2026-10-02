@@ -168,7 +168,7 @@ the table fills `len` bytes of its room, which is what its section header says
 ## fun unwind_functions
 
 ```mach
-pub fun unwind_functions(alloc: *std_allocator.Allocator, segs: *target_of.LoadSegment, seg_count: u32,
+pub fun unwind_functions(alloc: *A.Allocator, segs: *target_of.LoadSegment, seg_count: u32,
 funcs: *target_of.ExecFunction, func_count: u32, count: *u32) res[*UnwindFn, fail.Fail];
 ```
 
@@ -255,7 +255,7 @@ a function a carried frame description covers, and where that fde lies
 ## fun eh_frame_scan
 
 ```mach
-pub fun eh_frame_scan(alloc: *std_allocator.Allocator, buf: *u8, cap: usize, vaddr: u64, ptr_size: u32,
+pub fun eh_frame_scan(alloc: *A.Allocator, buf: *u8, cap: usize, vaddr: u64, ptr_size: u32,
 fns: **EhFn, count: *u32) res[usize, fail.Fail];
 ```
 

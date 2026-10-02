@@ -594,7 +594,7 @@ pub rec TypeInterner;
 ## fun init
 
 ```mach
-pub fun init(ti: *TypeInterner, a: *std_allocator.Allocator) err[fail.Fail];
+pub fun init(ti: *TypeInterner, a: *A.Allocator) err[fail.Fail];
 ```
 
 ## fun dnit

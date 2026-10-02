@@ -33,7 +33,7 @@ pub rec DepInfo;
 ## fun analyze_dependence
 
 ```mach
-pub fun analyze_dependence(fn: *me_ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, types: *ir_type.IrTypeTable, alloc: *std_allocator.Allocator) res[DepInfo, fail.Fail];
+pub fun analyze_dependence(fn: *me_ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, types: *ir_type.IrTypeTable, alloc: *A.Allocator) res[DepInfo, fail.Fail];
 ```
 
 ## fun equal
@@ -81,6 +81,6 @@ pub fun reduction_dnit(ri: *ReductionInfo);
 ## fun analyze_reduction
 
 ```mach
-pub fun analyze_reduction(fn: *me_ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, types: *ir_type.IrTypeTable, alloc: *std_allocator.Allocator, float_reassoc: bool) res[ReductionInfo, fail.Fail];
+pub fun analyze_reduction(fn: *me_ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, types: *ir_type.IrTypeTable, alloc: *A.Allocator, float_reassoc: bool) res[ReductionInfo, fail.Fail];
 ```
 

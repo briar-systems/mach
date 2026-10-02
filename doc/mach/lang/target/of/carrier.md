@@ -66,7 +66,7 @@ where a described section lies in the image the parser reads back
 ## fun encode
 
 ```mach
-pub fun encode(alloc: *std_allocator.Allocator, img: *target_of.ObjectImage, described: u32, hosts: *Host,
+pub fun encode(alloc: *A.Allocator, img: *target_of.ObjectImage, described: u32, hosts: *Host,
 tables: u32, out_bytes: **u8, out_len: *u32) err[fail.Fail];
 ```
 
@@ -103,7 +103,7 @@ applies the carrier the section named `name` holds, when the object has one
 ## fun with_carrier
 
 ```mach
-pub fun with_carrier(alloc: *std_allocator.Allocator, img: *target_of.ObjectImage, name: str, template: target_of.Section,
+pub fun with_carrier(alloc: *A.Allocator, img: *target_of.ObjectImage, name: str, template: target_of.Section,
 bytes: *u8, len: u32, out: *target_of.ObjectImage) err[fail.Fail];
 ```
 

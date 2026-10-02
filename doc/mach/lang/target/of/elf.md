@@ -287,6 +287,6 @@ pub fun register(reg: *target_of.OfRegistry) err[fail.Fail];
 ## fun parse_object
 
 ```mach
-pub fun parse_object(alloc: *std_allocator.Allocator, itn: *intern.Interner, buf: *u8, buf_size: usize, out: *target_of.ObjectImage) err[fail.Fail];
+pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_size: usize, out: *target_of.ObjectImage) err[fail.Fail];
 ```
 

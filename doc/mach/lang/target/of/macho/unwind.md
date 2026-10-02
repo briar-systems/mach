@@ -22,7 +22,7 @@ counted twice at most
 ## fun fill_unwind
 
 ```mach
-pub fun fill_unwind(alloc: *std_allocator.Allocator, arch_id: u32, segs: *target_of.LoadSegment, seg_count: u32,
+pub fun fill_unwind(alloc: *A.Allocator, arch_id: u32, segs: *target_of.LoadSegment, seg_count: u32,
 funcs: *target_of.ExecFunction, func_count: u32, mh_addr: u64, dyn: *target_of.DynamicInfo) err[fail.Fail];
 ```
 

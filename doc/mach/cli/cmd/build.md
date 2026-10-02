@@ -15,7 +15,7 @@ plans: one plan per profile; each plans that profile's cells
 ## fun plan_invocation
 
 ```mach
-pub fun plan_invocation(a: *std_allocator.Allocator, root: str, cli: *args.CliArgs, goal: request.BuildGoal,
+pub fun plan_invocation(a: *A.Allocator, root: str, cli: *args.CliArgs, goal: request.BuildGoal,
 mode: manifest.ArtifactDefault, configure_deps: bool, ps: *session.Session) res[Planned, outcome.Fail];
 ```
 

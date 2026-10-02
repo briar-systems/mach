@@ -91,7 +91,7 @@ ret: the route; HELP_ROUTE_NONE when argv is not a help request
 ## fun render_overview_at
 
 ```mach
-pub fun render_overview_at(a: *std_allocator.Allocator, out: *io_writer.Writer, requested_width: usize) err[outcome.Fail];
+pub fun render_overview_at(a: *A.Allocator, out: *io_writer.Writer, requested_width: usize) err[outcome.Fail];
 ```
 
 write the command overview wrapped to a width
@@ -105,7 +105,7 @@ ret: ok, or an error when the command schema is invalid, the buffer could not be
 ## fun render_overview
 
 ```mach
-pub fun render_overview(a: *std_allocator.Allocator, out: *io_writer.Writer) err[outcome.Fail];
+pub fun render_overview(a: *A.Allocator, out: *io_writer.Writer) err[outcome.Fail];
 ```
 
 write the command overview at the terminal width read from COLUMNS, 100 when unset or
@@ -118,7 +118,7 @@ ret: as render_overview_at
 ## fun render_command_page_at
 
 ```mach
-pub fun render_command_page_at(a: *std_allocator.Allocator, out: *io_writer.Writer, id: args.CommandId,
+pub fun render_command_page_at(a: *A.Allocator, out: *io_writer.Writer, id: args.CommandId,
 requested_width: usize) err[outcome.Fail];
 ```
 
@@ -134,7 +134,7 @@ ret: ok, or an error when the command schema is invalid, the command is unknown,
 ## fun render_command_page
 
 ```mach
-pub fun render_command_page(a: *std_allocator.Allocator, out: *io_writer.Writer, id: args.CommandId) err[outcome.Fail];
+pub fun render_command_page(a: *A.Allocator, out: *io_writer.Writer, id: args.CommandId) err[outcome.Fail];
 ```
 
 write one command's help page at the terminal width read from COLUMNS, 100 when unset or
@@ -148,7 +148,7 @@ ret: as render_command_page_at
 ## fun render_action_page_at
 
 ```mach
-pub fun render_action_page_at(a: *std_allocator.Allocator, out: *io_writer.Writer, action: args.DepAction,
+pub fun render_action_page_at(a: *A.Allocator, out: *io_writer.Writer, action: args.DepAction,
 requested_width: usize) err[outcome.Fail];
 ```
 
@@ -164,7 +164,7 @@ ret: ok, or an error when the schema is invalid, the action is unknown, the buff
 ## fun render_route
 
 ```mach
-pub fun render_route(a: *std_allocator.Allocator, out: *io_writer.Writer, fault: *io_writer.Writer, route: *HelpRoute) i64;
+pub fun render_route(a: *A.Allocator, out: *io_writer.Writer, fault: *io_writer.Writer, route: *HelpRoute) i64;
 ```
 
 render a resolved help route

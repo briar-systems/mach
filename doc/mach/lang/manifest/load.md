@@ -3,7 +3,7 @@
 ## fun parse
 
 ```mach
-pub fun parse(alloc: *std_allocator.Allocator, itn: *intern.Interner, doc: *Doc, as_root: bool) res[Manifest, outcome.Fail];
+pub fun parse(alloc: *A.Allocator, itn: *intern.Interner, doc: *Doc, as_root: bool) res[Manifest, outcome.Fail];
 ```
 
 build a `Manifest` from a parsed TOML document. accepted root tables are
@@ -47,7 +47,7 @@ that names a key points into `text` at `path`
 ## fun doc_parse
 
 ```mach
-pub fun doc_parse(alloc: *std_allocator.Allocator, path: str, text: str) res[Doc, outcome.Fail];
+pub fun doc_parse(alloc: *A.Allocator, path: str, text: str) res[Doc, outcome.Fail];
 ```
 
 `text`, the manifest at `path`, as a doc: bytes a manifest refuses and a
@@ -57,7 +57,7 @@ keeps its own copies of both
 ## fun doc_read
 
 ```mach
-pub fun doc_read(alloc: *std_allocator.Allocator, path: str) res[Doc, outcome.Fail];
+pub fun doc_read(alloc: *A.Allocator, path: str) res[Doc, outcome.Fail];
 ```
 
 the manifest file at `path` read and parsed as `doc_parse` parses it; a file
@@ -66,7 +66,7 @@ that cannot be read is the environment's
 ## fun doc_dnit
 
 ```mach
-pub fun doc_dnit(alloc: *std_allocator.Allocator, d: *Doc);
+pub fun doc_dnit(alloc: *A.Allocator, d: *Doc);
 ```
 
 release a doc and everything it owns

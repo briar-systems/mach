@@ -15,7 +15,7 @@ pub fun init_dynstate(dyn: *DynState);
 ## fun free_dynstate
 
 ```mach
-pub fun free_dynstate(alloc: *std_allocator.Allocator, dyn: *DynState);
+pub fun free_dynstate(alloc: *A.Allocator, dyn: *DynState);
 ```
 
 ## fun reserve_call_stubs
