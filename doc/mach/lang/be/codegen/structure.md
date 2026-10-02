@@ -142,7 +142,7 @@ successor k of node x, for k below its nsucc
 ## fun analyze
 
 ```mach
-pub fun analyze(mf: *mir.MirFunction, alloc: *A.Allocator) res[Structure, fail.Fail];
+pub fun analyze(mf: *codegen_mir.MirFunction, alloc: *A.Allocator) res[Structure, fail.Fail];
 ```
 
 ## fun dnit
@@ -154,7 +154,7 @@ pub fun dnit(st: *Structure);
 ## fun analyze_module
 
 ```mach
-pub fun analyze_module(m: *mir.MirModule, alloc: *A.Allocator) res[*Structure, fail.Fail];
+pub fun analyze_module(m: *codegen_mir.MirModule, alloc: *A.Allocator) res[*Structure, fail.Fail];
 ```
 
 the structure of every function of a MIR module, in function order. a
@@ -172,7 +172,7 @@ releases the first n structures of an analyze_module result and the array
 ## fun refusal_text
 
 ```mach
-pub fun refusal_text(alloc: *A.Allocator, name: str, status: u8, target: str) res[str, format.FormatError];
+pub fun refusal_text(alloc: *A.Allocator, name: str, status: u8, target: str) res[str, std_format.FormatError];
 ```
 
 the refusal a function with this status is rejected by, prefixed with its name

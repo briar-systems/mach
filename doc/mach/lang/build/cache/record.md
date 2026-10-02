@@ -46,7 +46,7 @@ pub fun record_dnit(alloc: *A.Allocator, r: *Record);
 
 ```mach
 pub fun encode(alloc: *A.Allocator, itn: *intern.Interner, key: *[32]u8, facts: *Facts,
-image: *of.ObjectImage, out_bytes: **u8, out_len: *u32) err[fail.Fail];
+image: *target_of.ObjectImage, out_bytes: **u8, out_len: *u32) err[fail.Fail];
 ```
 
 the record for an object built under `key` whose module lowered to `facts`

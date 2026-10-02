@@ -3,6 +3,6 @@
 ## fun parse
 
 ```mach
-pub fun parse(tokens: *lexer.TokenStream, out: *ast.Ast, diags: *diagnostic.DiagnosticStore) res[fail.PhaseStatus, state.ParseFail];
+pub fun parse(tokens: *fe_lexer.TokenStream, out: *ast.Ast, diags: *diagnostic.DiagnosticStore) res[fail.PhaseStatus, state.ParseFail];
 ```
 

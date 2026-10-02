@@ -128,11 +128,7 @@ The types are `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `style`,
 `feat(#139)!: brief description`. A change with no issue uses `chore: ...` with
 no scope, and a release commit is `chore(release): <version>`.
 
-If no related issue exists, just supply a type without the scope, e.g:
-
-```
-chore: update dependencies
-```
+For example, `chore: update dependencies`.
 
 
 ## Pull requests
@@ -153,12 +149,12 @@ chore: update dependencies
 
 ## Issues
 
-File issues through the templates. Issues use an orthogonal, faceted tagging system across five sets:
+File issues through the templates. Issues use an orthogonal, faceted tagging system across six sets:
 
 - SemVer magnitude: `patch`, `minor`, `major`
 - Kind of work: `feature`, `fix`, `removal`, `chore`, `performance`
 - Where (domain or location): `testing`, `tooling`, `doc` (omitted when touching core compiler code)
-- Severity and state: `critical`, `blocked`, `security`
+- Severity and state: `critical`, `blocked`, `parked`, `security`
 - Discussion: `discussion` (design proposals, RFCs, and open debates)
 
 Tags mix and match across sets (for example, `patch`, `fix`, `tooling`). When opening an issue, select the applicable tags in the sidebar. There are no milestones. Work in flight is an open draft pull request, `parked` marks an issue deliberately set aside until something changes, and every other open issue is backlog. `blocked` is a tag that records state. Themes are epic issues with native sub-issues. SemVer impact comes from the `major`, `minor` and `patch` tags, never from a milestone.

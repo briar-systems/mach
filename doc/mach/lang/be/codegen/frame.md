@@ -9,13 +9,13 @@ pub val DEFAULT_STACK_ALIGN: u32 = 16
 ## fun run
 
 ```mach
-pub fun run(tgt: *target.Target, m: *mir.MirModule) err[fail.Fail];
+pub fun run(tgt: *resolved.Target, m: *codegen_mir.MirModule) err[fail.Fail];
 ```
 
 ## fun prune
 
 ```mach
-pub fun prune(m: *mir.MirModule) err[fail.Fail];
+pub fun prune(m: *codegen_mir.MirModule) err[fail.Fail];
 ```
 
 before selection, a frame slot address no instruction reads is dropped and a
@@ -26,13 +26,13 @@ or an asm block names stays, since the debugger or the block reads it
 ## fun omits_frame
 
 ```mach
-pub fun omits_frame(func: *mir.MirFunction, fp: mir.PRegId, sp: mir.PRegId) bool;
+pub fun omits_frame(func: *codegen_mir.MirFunction, fp: codegen_mir.PRegId, sp: codegen_mir.PRegId) bool;
 ```
 
 ## fun body_writes_sp
 
 ```mach
-pub fun body_writes_sp(m: *isa.RegMachine, func: *mir.MirFunction, sp: mir.PRegId) bool;
+pub fun body_writes_sp(m: *isa.RegMachine, func: *codegen_mir.MirFunction, sp: codegen_mir.PRegId) bool;
 ```
 
 whether the body may move the stack pointer. the encoders write sp only in
@@ -43,7 +43,7 @@ block that writes sp and an instruction naming sp as a register operand
 ## fun sp_fixed
 
 ```mach
-pub fun sp_fixed(frame: *mir.MirFrame) bool;
+pub fun sp_fixed(frame: *codegen_mir.MirFrame) bool;
 ```
 
 the declared frame property: sp == fp - base_dist for the whole body
@@ -51,25 +51,25 @@ the declared frame property: sp == fp - base_dist for the whole body
 ## fun slot_offset
 
 ```mach
-pub fun slot_offset(frame: *mir.MirFrame, v: u32) opt[i64];
+pub fun slot_offset(frame: *codegen_mir.MirFrame, v: u32) opt[i64];
 ```
 
 ## fun slot_sp_offset
 
 ```mach
-pub fun slot_sp_offset(frame: *mir.MirFrame, v: u32) opt[i64];
+pub fun slot_sp_offset(frame: *codegen_mir.MirFrame, v: u32) opt[i64];
 ```
 
 ## fun slots_from_sp
 
 ```mach
-pub fun slots_from_sp(frame: *mir.MirFrame) bool;
+pub fun slots_from_sp(frame: *codegen_mir.MirFrame) bool;
 ```
 
 ## fun slot_extent
 
 ```mach
-pub fun slot_extent(frame: *mir.MirFrame, v: u32, disp: *i64, size: *u32) bool;
+pub fun slot_extent(frame: *codegen_mir.MirFrame, v: u32, disp: *i64, size: *u32) bool;
 ```
 
 the byte extent an encoder addresses a slot at: the displacement from the

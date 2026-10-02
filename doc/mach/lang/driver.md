@@ -176,18 +176,18 @@ fwd load.entry_module_fqn
 
 forwards [`mach.lang.driver.load.entry_module_fqn`](driver/load.md#fun-entry_module_fqn)
 
-## fwd dcfg.resolve_run_artifact
+## fwd config.resolve_run_artifact
 
 ```mach
-fwd dcfg.resolve_run_artifact
+fwd config.resolve_run_artifact
 ```
 
 forwards [`mach.lang.driver.config.resolve_run_artifact`](driver/config.md#fun-resolve_run_artifact)
 
-## fwd dcfg.RunArtifact
+## fwd config.RunArtifact
 
 ```mach
-fwd dcfg.RunArtifact
+fwd config.RunArtifact
 ```
 
 forwards [`mach.lang.driver.config.RunArtifact`](driver/config.md#rec-runartifact)
@@ -242,7 +242,7 @@ pub fun build_project(s: *session.Session, project_root: str, pick: *manifest.Se
 
 ```mach
 pub fun verify_dependencies(s: *session.Session, project_root: str, release: bool,
-overrides: *Vector[ddep.RootOverride]) err[outcome.Fail];
+overrides: *Vector[driver_deps.RootOverride]) err[outcome.Fail];
 ```
 
 check a project's realized dependency closure without changing it

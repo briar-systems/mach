@@ -21,7 +21,7 @@ pub fun free_dynstate(alloc: *A.Allocator, dyn: *DynState);
 ## fun reserve_call_stubs
 
 ```mach
-pub fun reserve_call_stubs(s: *session.Session, tgt: *target.Target, dyn: *DynState,
+pub fun reserve_call_stubs(s: *session.Session, tgt: *lang_target.Target, dyn: *DynState,
 merged: *MergedSection, groups: *SectionGroups) err[fail.Fail];
 ```
 
@@ -39,7 +39,7 @@ pub fun place_call_stubs(dyn: *DynState, merged: *MergedSection);
 ## fun reserve_import_got
 
 ```mach
-pub fun reserve_import_got(s: *session.Session, tgt: *target.Target, dyn: *DynState,
+pub fun reserve_import_got(s: *session.Session, tgt: *lang_target.Target, dyn: *DynState,
 merged: *MergedSection, groups: *SectionGroups) err[fail.Fail];
 ```
 
@@ -59,10 +59,10 @@ pub fun place_import_got(dyn: *DynState, merged: *MergedSection);
 ## fun build_dynamic_info
 
 ```mach
-pub fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
-modules: *of.ObjectImage, module_count: u32,
+pub fun build_dynamic_info(s: *session.Session, tgt: *lang_target.Target, dyn: *DynState,
+modules: *target_of.ObjectImage, module_count: u32,
 sym_locs: *map.Map[intern.StrId, SymbolLoc],
-dynlibs: *of.DynLib, dynlib_count: u32,
+dynlibs: *target_of.DynLib, dynlib_count: u32,
 sec_base: *u32, atoms: *AtomPlan) err[fail.Fail];
 ```
 
@@ -70,7 +70,7 @@ sec_base: *u32, atoms: *AtomPlan) err[fail.Fail];
 
 ```mach
 pub fun has_unresolved_declared_imports(
-modules: *of.ObjectImage, module_count: u32,
+modules: *target_of.ObjectImage, module_count: u32,
 sym_locs: *map.Map[intern.StrId, SymbolLoc],
 sec_base: *u32, atoms: *AtomPlan) bool;
 ```
@@ -80,8 +80,8 @@ whether a declared import the image still references resolves nowhere in it
 ## fun has_unresolved_attributed_imports
 
 ```mach
-pub fun has_unresolved_attributed_imports(s: *session.Session, modules: *of.ObjectImage,
-module_count: u32, dynlibs: *of.DynLib, dynlib_count: u32,
+pub fun has_unresolved_attributed_imports(s: *session.Session, modules: *target_of.ObjectImage,
+module_count: u32, dynlibs: *target_of.DynLib, dynlib_count: u32,
 sym_locs: *map.Map[intern.StrId, SymbolLoc], prefix: str,
 sec_base: *u32, atoms: *AtomPlan) res[bool, fail.Fail];
 ```
@@ -103,9 +103,9 @@ name: intern.StrId) res[ImportName, fail.Fail];
 
 ```mach
 pub fun synthesize_local_imports(s: *session.Session, prefix: str,
-modules: *of.ObjectImage, module_count: u32,
+modules: *target_of.ObjectImage, module_count: u32,
 mode: LinkMode, sec_base: *u32, atoms: *AtomPlan,
-out: *of.ObjectImage) res[bool, fail.Fail];
+out: *target_of.ObjectImage) res[bool, fail.Fail];
 ```
 
 ## fun dynstate_import_index
@@ -124,7 +124,7 @@ pub fun dynstate_import_is_func(dyn: *DynState, idx: u32) bool;
 
 ```mach
 pub fun dynstate_add_fixup(s: *session.Session, dyn: *DynState, seg_index: u32, seg_offset: u32,
-import_index: u32, patch_vaddr: u64, kind: of.RelocKind, addend: i64) err[fail.Fail];
+import_index: u32, patch_vaddr: u64, kind: target_of.RelocKind, addend: i64) err[fail.Fail];
 ```
 
 ## fun dynstate_add_import_addr_fixup
@@ -133,7 +133,7 @@ import_index: u32, patch_vaddr: u64, kind: of.RelocKind, addend: i64) err[fail.F
 pub fun dynstate_add_import_addr_fixup(s: *session.Session, dyn: *DynState,
 seg_index: u32, seg_offset: u32,
 import_index: u32, patch_vaddr: u64,
-kind: of.RelocKind, addend: i64, origin: of.RelocOrigin) err[fail.Fail];
+kind: target_of.RelocKind, addend: i64, origin: target_of.RelocOrigin) err[fail.Fail];
 ```
 
 ## fun dynstate_add_base_reloc
@@ -146,13 +146,13 @@ seg_offset: u32, target: u64) err[fail.Fail];
 ## fun target_requires_pie
 
 ```mach
-pub fun target_requires_pie(tgt: *target.Target) bool;
+pub fun target_requires_pie(tgt: *lang_target.Target) bool;
 ```
 
 ## fun loaderless_request_message
 
 ```mach
-pub fun loaderless_request_message(s: *session.Session, tgt: *target.Target, mode: LinkMode,
+pub fun loaderless_request_message(s: *session.Session, tgt: *lang_target.Target, mode: LinkMode,
 pie: bool, dynamic: bool) str;
 ```
 

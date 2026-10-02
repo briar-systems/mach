@@ -41,7 +41,7 @@ whether the link placed any thunk, so the code's layout moved
 
 ```mach
 pub fun plan_thunks(s: *session.Session, arch: *isa.IsaVTable, plan: *ThunkPlan,
-modules: *of.ObjectImage, module_count: u32, sec_total: u32,
+modules: *target_of.ObjectImage, module_count: u32, sec_total: u32,
 merged: *MergedSection, placements: *Placement, sec_base: *u32,
 atoms: *AtomPlan, groups: *SectionGroups,
 sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState) err[fail.Fail];
@@ -64,7 +64,7 @@ branches straight to its target
 ## fun write_thunks
 
 ```mach
-pub fun write_thunks(s: *session.Session, plan: *ThunkPlan, out_img: *of.ObjectImage,
+pub fun write_thunks(s: *session.Session, plan: *ThunkPlan, out_img: *target_of.ObjectImage,
 merged: *MergedSection, merged_to_out: *u32, dyn: *DynState,
 arch: *isa.IsaVTable, image_base: u64) err[fail.Fail];
 ```

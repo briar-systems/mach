@@ -27,7 +27,7 @@ pub fun fp_u16(b: *FpBuf, v: u16) err[fail.Fail];
 ## fun fp_domain_u8
 
 ```mach
-pub fun fp_domain_u8(b: *FpBuf, domain: fingerprint.Domain, schema_version: u8, value: u8) err[fail.Fail];
+pub fun fp_domain_u8(b: *FpBuf, domain: build_fingerprint.Domain, schema_version: u8, value: u8) err[fail.Fail];
 ```
 
 ## fun fp_bytes
@@ -122,13 +122,13 @@ definition_revision: query.Revision) err[fail.Fail];
 ## fun typed_surface_encode
 
 ```mach
-pub fun typed_surface_encode(fb: *FpBuf, surface: *scx.ModuleSema) err[fail.Fail];
+pub fun typed_surface_encode(fb: *FpBuf, surface: *sema_context.ModuleSema) err[fail.Fail];
 ```
 
 ## fun typed_surface_decode
 
 ```mach
 pub fun typed_surface_decode(itn: *intern.Interner, a: *A.Allocator, bytes: *u8, len: u32,
-path: intern.StrId, mid: session.ModuleId) res[scx.ModuleSema, fail.Fail];
+path: intern.StrId, mid: session.ModuleId) res[sema_context.ModuleSema, fail.Fail];
 ```
 

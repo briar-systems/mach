@@ -1413,7 +1413,7 @@ pub fun invocation_value(cmd: CommandId, inv: *ParsedInvocation, argv: **u8, fla
 ## fun diagnostics_format
 
 ```mach
-pub fun diagnostics_format(cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[cli_diag.Format, outcome.Fail];
+pub fun diagnostics_format(cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[cli_diagnostic.Format, outcome.Fail];
 ```
 
 the diagnostics format `--diagnostics=<human|json>` selects for a command
@@ -1427,7 +1427,7 @@ ret: the format, or a user failure for a bare `--diagnostics` or any other value
 ## fun readout_allowed
 
 ```mach
-pub fun readout_allowed(c: *request.CliArgs, format: cli_diag.Format) err[outcome.Fail];
+pub fun readout_allowed(c: *request.CliArgs, format: cli_diagnostic.Format) err[outcome.Fail];
 ```
 
 `-v` and `-vv` render the phase readout to stderr as text, which a json run

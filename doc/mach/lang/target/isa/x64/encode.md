@@ -3,20 +3,20 @@
 ## fun encode_x64
 
 ```mach
-pub fun encode_x64(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.MirModule) res[enc.EncoderOutput, fail.Fail];
+pub fun encode_x64(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule) res[codegen_encode.EncoderOutput, fail.Fail];
 ```
 
 ## fun encode_x64_asm
 
 ```mach
-pub fun encode_x64_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.MirModule,
-out: *writer.Writer) res[enc.EncoderOutput, fail.Fail];
+pub fun encode_x64_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule,
+out: *io_writer.Writer) res[codegen_encode.EncoderOutput, fail.Fail];
 ```
 
 ## fun reads_const_operand
 
 ```mach
-pub fun reads_const_operand(mi: *mir.MirInstr, index: u32) bool;
+pub fun reads_const_operand(mi: *codegen_mir.MirInstr, index: u32) bool;
 ```
 
 the scalar float arithmetic and compare read their second source, a

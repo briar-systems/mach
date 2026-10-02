@@ -9,7 +9,7 @@ pub rec LowerCtx;
 ## fun reject
 
 ```mach
-pub fun reject(ctx: *LowerCtx, k: dkind.Kind, text: str) fail.Fail;
+pub fun reject(ctx: *LowerCtx, k: diagnostic_kind.Kind, text: str) fail.Fail;
 ```
 
 lowering rejects the program at the instruction under translation, or at
@@ -18,19 +18,19 @@ the function when no instruction is
 ## fun ctx_setup
 
 ```mach
-pub fun ctx_setup(ctx: *LowerCtx, tgt: *target.Target, fn: *ir.Function) err[fail.Fail];
+pub fun ctx_setup(ctx: *LowerCtx, tgt: *resolved.Target, fn: *me_ir.Function) err[fail.Fail];
 ```
 
 ## fun count_mask_folds
 
 ```mach
-pub fun count_mask_folds(ctx: *LowerCtx, iid: id.InstructionId) bool;
+pub fun count_mask_folds(ctx: *LowerCtx, iid: ir_id.InstructionId) bool;
 ```
 
 ## fun count_mask_source
 
 ```mach
-pub fun count_mask_source(ctx: *LowerCtx, inst: *instruction.Instruction) opt[u32];
+pub fun count_mask_source(ctx: *LowerCtx, inst: *ir_instruction.Instruction) opt[u32];
 ```
 
 the operand of a count mask that is not its mask constant, or none when
@@ -39,7 +39,7 @@ the operand of a count mask that is not its mask constant, or none when
 ## fun mark_foldable_count_masks
 
 ```mach
-pub fun mark_foldable_count_masks(ctx: *LowerCtx, fn: *ir.Function);
+pub fun mark_foldable_count_masks(ctx: *LowerCtx, fn: *me_ir.Function);
 ```
 
 a count mask folds when every use of it is a shift count that
@@ -48,19 +48,19 @@ count_mask_use_folds admits; any other use needs the masked value itself
 ## fun cmp_folds_into_select
 
 ```mach
-pub fun cmp_folds_into_select(ctx: *LowerCtx, iid: id.InstructionId) bool;
+pub fun cmp_folds_into_select(ctx: *LowerCtx, iid: ir_id.InstructionId) bool;
 ```
 
 ## fun gep_folds
 
 ```mach
-pub fun gep_folds(ctx: *LowerCtx, iid: id.InstructionId) bool;
+pub fun gep_folds(ctx: *LowerCtx, iid: ir_id.InstructionId) bool;
 ```
 
 ## fun seed_gep_mems
 
 ```mach
-pub fun seed_gep_mems(ctx: *LowerCtx, fn: *ir.Function, pure: fun(*LowerCtx, *instruction.Instruction) opt[mir.MirOperand]);
+pub fun seed_gep_mems(ctx: *LowerCtx, fn: *me_ir.Function, pure: fun(*LowerCtx, *ir_instruction.Instruction) opt[codegen_mir.MirOperand]);
 ```
 
 the folded addresses are computed after the use check, from the IR alone;
@@ -89,7 +89,7 @@ a pending binding of one piece of a value held in several registers (#3589)
 ## fun drain_pending_dbg
 
 ```mach
-pub fun drain_pending_dbg(ctx: *LowerCtx, mi: *mir.MirInstr) err[fail.Fail];
+pub fun drain_pending_dbg(ctx: *LowerCtx, mi: *codegen_mir.MirInstr) err[fail.Fail];
 ```
 
 ## fun values_convention
@@ -103,13 +103,13 @@ the convention declares how values cross a call: a values convention has no bank
 ## fun new_vreg
 
 ```mach
-pub fun new_vreg(ctx: *LowerCtx, reg_class: u32) res[mir.VRegId, fail.Fail];
+pub fun new_vreg(ctx: *LowerCtx, reg_class: u32) res[codegen_mir.VRegId, fail.Fail];
 ```
 
 ## fun new_vreg_vec
 
 ```mach
-pub fun new_vreg_vec(ctx: *LowerCtx, reg_class: u32, vec_bytes: u8) res[mir.VRegId, fail.Fail];
+pub fun new_vreg_vec(ctx: *LowerCtx, reg_class: u32, vec_bytes: u8) res[codegen_mir.VRegId, fail.Fail];
 ```
 
 ## fun vec_bytes_of
@@ -124,13 +124,13 @@ for any other value
 ## fun instr_vreg
 
 ```mach
-pub fun instr_vreg(ctx: *LowerCtx, iid: id.InstructionId) mir.VRegId;
+pub fun instr_vreg(ctx: *LowerCtx, iid: ir_id.InstructionId) codegen_mir.VRegId;
 ```
 
 ## fun slot_key_vreg
 
 ```mach
-pub fun slot_key_vreg(ctx: *LowerCtx, iid: id.InstructionId) mir.VRegId;
+pub fun slot_key_vreg(ctx: *LowerCtx, iid: ir_id.InstructionId) codegen_mir.VRegId;
 ```
 
 ## fun value_is_float
@@ -160,7 +160,7 @@ pub fun vec_lane_for_type(ctx: *LowerCtx, ty: ir_type.IrTypeId) u32;
 ## fun compute_vec_lane
 
 ```mach
-pub fun compute_vec_lane(ctx: *LowerCtx, inst: *instruction.Instruction) u32;
+pub fun compute_vec_lane(ctx: *LowerCtx, inst: *ir_instruction.Instruction) u32;
 ```
 
 ## fun vector_image
@@ -204,7 +204,7 @@ the return type of a signature, IRT_NIL for a type that is not a function's
 ## fun is_result_image
 
 ```mach
-pub fun is_result_image(ctx: *LowerCtx, iid: id.InstructionId) bool;
+pub fun is_result_image(ctx: *LowerCtx, iid: ir_id.InstructionId) bool;
 ```
 
 the alloca `iid` is the result storage the caller passed (#4120)
@@ -251,13 +251,13 @@ pub fun mem_width_of(ctx: *LowerCtx, ty: ir_type.IrTypeId) u8;
 ## fun stack_slot_bytes
 
 ```mach
-pub fun stack_slot_bytes(tgt: *target.Target, size: u64) i64;
+pub fun stack_slot_bytes(tgt: *resolved.Target, size: u64) i64;
 ```
 
 ## fun lower_value
 
 ```mach
-pub fun lower_value(ctx: *LowerCtx, v: value.Value) res[mir.MirOperand, fail.Fail];
+pub fun lower_value(ctx: *LowerCtx, v: value.Value) res[codegen_mir.MirOperand, fail.Fail];
 ```
 
 the MIR operand of an IR value. a byte or aggregate constant is a declared
@@ -268,7 +268,7 @@ tag; both were panics behind the verifier
 ## fun lower_callee
 
 ```mach
-pub fun lower_callee(ctx: *LowerCtx, v: value.Value) res[mir.MirOperand, fail.Fail];
+pub fun lower_callee(ctx: *LowerCtx, v: value.Value) res[codegen_mir.MirOperand, fail.Fail];
 ```
 
 the target of a call. a direct call reaches an import through its call stub,
@@ -277,19 +277,19 @@ so the callee is the bare symbol, never its GOT slot
 ## fun lower_operand
 
 ```mach
-pub fun lower_operand(ctx: *LowerCtx, inst: *instruction.Instruction, idx: u32) res[mir.MirOperand, fail.Fail];
+pub fun lower_operand(ctx: *LowerCtx, inst: *ir_instruction.Instruction, idx: u32) res[codegen_mir.MirOperand, fail.Fail];
 ```
 
 ## fun mem_operand_of
 
 ```mach
-pub fun mem_operand_of(ctx: *LowerCtx, v: value.Value) res[mir.MirOperand, fail.Fail];
+pub fun mem_operand_of(ctx: *LowerCtx, v: value.Value) res[codegen_mir.MirOperand, fail.Fail];
 ```
 
 ## fun mem_operand_of_plain
 
 ```mach
-pub fun mem_operand_of_plain(ctx: *LowerCtx, v: value.Value) res[mir.MirOperand, fail.Fail];
+pub fun mem_operand_of_plain(ctx: *LowerCtx, v: value.Value) res[codegen_mir.MirOperand, fail.Fail];
 ```
 
 the memory operand of a pointer value as lowered, with no folded address
@@ -297,95 +297,95 @@ the memory operand of a pointer value as lowered, with no folded address
 ## fun push_instr
 
 ```mach
-pub fun push_instr(ctx: *LowerCtx, mb: *mir.MirBlock, mi: mir.MirInstr) err[fail.Fail];
+pub fun push_instr(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, mi: codegen_mir.MirInstr) err[fail.Fail];
 ```
 
 ## fun grow_instr
 
 ```mach
-pub fun grow_instr(ctx: *LowerCtx, mb: *mir.MirBlock) err[fail.Fail];
+pub fun grow_instr(ctx: *LowerCtx, mb: *codegen_mir.MirBlock) err[fail.Fail];
 ```
 
 ## fun emit_mov
 
 ```mach
-pub fun emit_mov(ctx: *LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, src: mir.MirOperand) err[fail.Fail];
+pub fun emit_mov(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, dst: codegen_mir.MirOperand, src: codegen_mir.MirOperand) err[fail.Fail];
 ```
 
 ## fun emit_mov_w
 
 ```mach
-pub fun emit_mov_w(ctx: *LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, src: mir.MirOperand, w: u8) err[fail.Fail];
+pub fun emit_mov_w(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, dst: codegen_mir.MirOperand, src: codegen_mir.MirOperand, w: u8) err[fail.Fail];
 ```
 
 ## fun emit_promote
 
 ```mach
-pub fun emit_promote(ctx: *LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, src: mir.MirOperand,
+pub fun emit_promote(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, dst: codegen_mir.MirOperand, src: codegen_mir.MirOperand,
 dst_w: u8, src_w: u8, signed: bool) err[fail.Fail];
 ```
 
 ## fun emit_declassify
 
 ```mach
-pub fun emit_declassify(ctx: *LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, src: mir.MirOperand, w: u8) err[fail.Fail];
+pub fun emit_declassify(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, dst: codegen_mir.MirOperand, src: codegen_mir.MirOperand, w: u8) err[fail.Fail];
 ```
 
 ## fun emit_fmov
 
 ```mach
-pub fun emit_fmov(ctx: *LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, src: mir.MirOperand, w: u8) err[fail.Fail];
+pub fun emit_fmov(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, dst: codegen_mir.MirOperand, src: codegen_mir.MirOperand, w: u8) err[fail.Fail];
 ```
 
 ## fun emit_store_to
 
 ```mach
-pub fun emit_store_to(ctx: *LowerCtx, mb: *mir.MirBlock, mem: mir.MirOperand, src: mir.MirOperand) err[fail.Fail];
+pub fun emit_store_to(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, mem: codegen_mir.MirOperand, src: codegen_mir.MirOperand) err[fail.Fail];
 ```
 
 ## fun emit_store_to_w
 
 ```mach
-pub fun emit_store_to_w(ctx: *LowerCtx, mb: *mir.MirBlock, mem: mir.MirOperand, src: mir.MirOperand, width: u8) err[fail.Fail];
+pub fun emit_store_to_w(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, mem: codegen_mir.MirOperand, src: codegen_mir.MirOperand, width: u8) err[fail.Fail];
 ```
 
 ## fun emit_load_from_w
 
 ```mach
-pub fun emit_load_from_w(ctx: *LowerCtx, mb: *mir.MirBlock, dst: mir.VRegId, mem: mir.MirOperand, width: u8) err[fail.Fail];
+pub fun emit_load_from_w(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, dst: codegen_mir.VRegId, mem: codegen_mir.MirOperand, width: u8) err[fail.Fail];
 ```
 
 ## fun push_store_chunk
 
 ```mach
-pub fun push_store_chunk(ctx: *LowerCtx, mb: *mir.MirBlock, mem: mir.MirOperand, src: mir.MirOperand, w: u8) err[fail.Fail];
+pub fun push_store_chunk(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, mem: codegen_mir.MirOperand, src: codegen_mir.MirOperand, w: u8) err[fail.Fail];
 ```
 
 ## fun store_vector_register
 
 ```mach
-pub fun store_vector_register(ctx: *LowerCtx, mb: *mir.MirBlock, dest: mir.MirOperand,
-value: mir.MirOperand, ty: ir_type.IrTypeId) err[fail.Fail];
+pub fun store_vector_register(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, dest: codegen_mir.MirOperand,
+value: codegen_mir.MirOperand, ty: ir_type.IrTypeId) err[fail.Fail];
 ```
 
 ## fun mem_at
 
 ```mach
-pub fun mem_at(m: mir.MirOperand, off: i64) mir.MirOperand;
+pub fun mem_at(m: codegen_mir.MirOperand, off: i64) codegen_mir.MirOperand;
 ```
 
 ## fun store_subwidth_vector
 
 ```mach
-pub fun store_subwidth_vector(ctx: *LowerCtx, mb: *mir.MirBlock, dest: mir.MirOperand,
-value: mir.MirOperand, ty: ir_type.IrTypeId) err[fail.Fail];
+pub fun store_subwidth_vector(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, dest: codegen_mir.MirOperand,
+value: codegen_mir.MirOperand, ty: ir_type.IrTypeId) err[fail.Fail];
 ```
 
 ## fun load_subwidth_vector
 
 ```mach
-pub fun load_subwidth_vector(ctx: *LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand,
-src: mir.MirOperand, ty: ir_type.IrTypeId) err[fail.Fail];
+pub fun load_subwidth_vector(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, dst: codegen_mir.MirOperand,
+src: codegen_mir.MirOperand, ty: ir_type.IrTypeId) err[fail.Fail];
 ```
 
 ## fun subwidth_vector_memory
@@ -397,43 +397,43 @@ pub fun subwidth_vector_memory(ctx: *LowerCtx, ty: ir_type.IrTypeId) bool;
 ## fun copy_chunk_width
 
 ```mach
-pub fun copy_chunk_width(tgt: *target.Target, remaining: u64) u8;
+pub fun copy_chunk_width(tgt: *resolved.Target, remaining: u64) u8;
 ```
 
 ## fun emit_bin
 
 ```mach
-pub fun emit_bin(ctx: *LowerCtx, mb: *mir.MirBlock, op: mir.MirOpcode, dst: mir.VRegId, a: mir.MirOperand, b: mir.MirOperand) err[fail.Fail];
+pub fun emit_bin(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, op: codegen_mir.MirOpcode, dst: codegen_mir.VRegId, a: codegen_mir.MirOperand, b: codegen_mir.MirOperand) err[fail.Fail];
 ```
 
 ## fun emit_lea_preg
 
 ```mach
-pub fun emit_lea_preg(ctx: *LowerCtx, mb: *mir.MirBlock, dst: mir.VRegId, base_preg: mir.PRegId, disp: i64) err[fail.Fail];
+pub fun emit_lea_preg(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, dst: codegen_mir.VRegId, base_preg: codegen_mir.PRegId, disp: i64) err[fail.Fail];
 ```
 
 ## fun emit_lea_slot
 
 ```mach
-pub fun emit_lea_slot(ctx: *LowerCtx, mb: *mir.MirBlock, mem: mir.MirOperand, out: *mir.VRegId) err[fail.Fail];
+pub fun emit_lea_slot(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, mem: codegen_mir.MirOperand, out: *codegen_mir.VRegId) err[fail.Fail];
 ```
 
 ## fun addr_to_vreg
 
 ```mach
-pub fun addr_to_vreg(ctx: *LowerCtx, mb: *mir.MirBlock, argop: mir.MirOperand, out_vreg: *mir.VRegId) err[fail.Fail];
+pub fun addr_to_vreg(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, argop: codegen_mir.MirOperand, out_vreg: *codegen_mir.VRegId) err[fail.Fail];
 ```
 
 ## fun copy_aggregate
 
 ```mach
-pub fun copy_aggregate(ctx: *LowerCtx, mb: *mir.MirBlock, dst_mem: mir.MirOperand, src: mir.MirOperand, size: u64) err[fail.Fail];
+pub fun copy_aggregate(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, dst_mem: codegen_mir.MirOperand, src: codegen_mir.MirOperand, size: u64) err[fail.Fail];
 ```
 
 ## fun alloc_object_storage
 
 ```mach
-pub fun alloc_object_storage(ctx: *LowerCtx, mb: *mir.MirBlock, dst: mir.VRegId, ty: ir_type.IrTypeId) err[fail.Fail];
+pub fun alloc_object_storage(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, dst: codegen_mir.VRegId, ty: ir_type.IrTypeId) err[fail.Fail];
 ```
 
 ## fun add_alloca_slot
@@ -453,7 +453,7 @@ record the ir alloca behind the slot just added for `value_id`
 ## fun alloc_result_storage
 
 ```mach
-pub fun alloc_result_storage(ctx: *LowerCtx, mb: *mir.MirBlock, dst: mir.VRegId, size: u64, align: u32) err[fail.Fail];
+pub fun alloc_result_storage(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, dst: codegen_mir.VRegId, size: u64, align: u32) err[fail.Fail];
 ```
 
 storage of a given extent, addressed through `dst`: a call's returned object, and the

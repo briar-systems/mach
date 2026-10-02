@@ -85,7 +85,7 @@ pub val REQUEST_INVALID:   Request = 4
 ## fun request_of
 
 ```mach
-pub fun request_of(reason: cnc.Reason) Request;
+pub fun request_of(reason: sync_cancel.Reason) Request;
 ```
 
 ## tag Cause
@@ -179,19 +179,19 @@ pub fun init(p: *OwnedSubprocess);
 ## fun set_deadline
 
 ```mach
-pub fun set_deadline(p: *OwnedSubprocess, deadline: tm.Instant) bool;
+pub fun set_deadline(p: *OwnedSubprocess, deadline: time.Instant) bool;
 ```
 
 ## fun bound
 
 ```mach
-pub fun bound(p: *OwnedSubprocess, timeout: duration.Duration) bool;
+pub fun bound(p: *OwnedSubprocess, timeout: chrono_duration.Duration) bool;
 ```
 
 ## fun deadline_reached
 
 ```mach
-pub fun deadline_reached(p: *OwnedSubprocess, now: tm.Instant) bool;
+pub fun deadline_reached(p: *OwnedSubprocess, now: time.Instant) bool;
 ```
 
 ## fun expired
@@ -254,7 +254,7 @@ pub fun wait(a: *A.Allocator, p: *OwnedSubprocess) res[SubprocessTerminal, Error
 ## fun wait_any
 
 ```mach
-pub fun wait_any(a: *A.Allocator, owners: *OwnedSubprocess, count: u32, scope: *cnc.Scope, source: *events.Source) res[*OwnedSubprocess, Error];
+pub fun wait_any(a: *A.Allocator, owners: *OwnedSubprocess, count: u32, scope: *sync_cancel.Scope, source: *events.Source) res[*OwnedSubprocess, Error];
 ```
 
 ## fun finish_capture
@@ -284,12 +284,12 @@ pub fun release_capture(a: *A.Allocator, p: *OwnedSubprocess) err[Error];
 ## fun timeout
 
 ```mach
-pub fun timeout(a: *A.Allocator, p: *OwnedSubprocess, grace: duration.Duration) res[SubprocessTerminal, Error];
+pub fun timeout(a: *A.Allocator, p: *OwnedSubprocess, grace: chrono_duration.Duration) res[SubprocessTerminal, Error];
 ```
 
 ## fun cancel
 
 ```mach
-pub fun cancel(a: *A.Allocator, p: *OwnedSubprocess, grace: duration.Duration) res[SubprocessTerminal, Error];
+pub fun cancel(a: *A.Allocator, p: *OwnedSubprocess, grace: chrono_duration.Duration) res[SubprocessTerminal, Error];
 ```
 

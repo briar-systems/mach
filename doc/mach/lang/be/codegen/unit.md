@@ -33,25 +33,25 @@ pub fun ir_set_empty() IrSet;
 ## fun root_ir
 
 ```mach
-pub fun root_ir(u: *Unit) *ir.Module;
+pub fun root_ir(u: *Unit) *me_ir.Module;
 ```
 
 ## fun root_mir
 
 ```mach
-pub fun root_mir(u: *Unit) *mir.MirModule;
+pub fun root_mir(u: *Unit) *codegen_mir.MirModule;
 ```
 
 ## fun defined_index
 
 ```mach
-pub fun defined_index(m: *ir.Module, name: intern.StrId) u32;
+pub fun defined_index(m: *me_ir.Module, name: intern.StrId) u32;
 ```
 
 ## fun defined_global_index
 
 ```mach
-pub fun defined_global_index(m: *ir.Module, name: intern.StrId) u32;
+pub fun defined_global_index(m: *me_ir.Module, name: intern.StrId) u32;
 ```
 
 ## fun mir_index

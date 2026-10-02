@@ -15,7 +15,7 @@ pub val ATOM_OWNS: u32 = 0xFFFFFFFF
 ## fun plan_atom_coalescing
 
 ```mach
-pub fun plan_atom_coalescing(alloc: *A.Allocator, modules: *of.ObjectImage, module_count: u32,
+pub fun plan_atom_coalescing(alloc: *A.Allocator, modules: *target_of.ObjectImage, module_count: u32,
 sec_base: *u32, sec_total: u32,
 atoms: *AtomPlan) res[*u32, fail.Fail];
 ```
@@ -68,7 +68,7 @@ byte at input offset `offset`, or after the last when offset is the length
 ## fun atom_plan_open_gaps
 
 ```mach
-pub fun atom_plan_open_gaps(alloc: *A.Allocator, modules: *of.ObjectImage, module_count: u32,
+pub fun atom_plan_open_gaps(alloc: *A.Allocator, modules: *target_of.ObjectImage, module_count: u32,
 sec_total: u32, plan: *AtomPlan, gaps: *AtomGap, gap_count: u32) err[fail.Fail];
 ```
 
@@ -80,7 +80,7 @@ offsets, each a multiple of its section's alignment so no drop's padding moves
 ## fun build_atom_plan
 
 ```mach
-pub fun build_atom_plan(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
+pub fun build_atom_plan(s: *session.Session, modules: *target_of.ObjectImage, module_count: u32,
 sec_base: *u32, sec_total: u32, enabled: bool,
 roots: *LinkRoots, arch: *isa.IsaVTable, plan: *AtomPlan) err[fail.Fail];
 ```
@@ -91,13 +91,13 @@ root reaches become drops
 ## fun symbol_is_defined
 
 ```mach
-pub fun symbol_is_defined(modules: *of.ObjectImage, m: u32, sy: u32) bool;
+pub fun symbol_is_defined(modules: *target_of.ObjectImage, m: u32, sy: u32) bool;
 ```
 
 ## fun definition_ref_is_dead
 
 ```mach
-pub fun definition_ref_is_dead(modules: *of.ObjectImage, m: u32, sy: u32,
+pub fun definition_ref_is_dead(modules: *target_of.ObjectImage, m: u32, sy: u32,
 addend: i64, sec_base: *u32, atoms: *AtomPlan) bool;
 ```
 
@@ -107,14 +107,14 @@ addresses were dropped from the image
 ## fun reloc_source_live
 
 ```mach
-pub fun reloc_source_live(modules: *of.ObjectImage, m: u32, r: *of.Relocation,
+pub fun reloc_source_live(modules: *target_of.ObjectImage, m: u32, r: *target_of.Relocation,
 sec_base: *u32, atoms: *AtomPlan) bool;
 ```
 
 ## fun import_symbol_live
 
 ```mach
-pub fun import_symbol_live(modules: *of.ObjectImage, module_count: u32,
+pub fun import_symbol_live(modules: *target_of.ObjectImage, module_count: u32,
 symbol_name: intern.StrId, sec_base: *u32,
 atoms: *AtomPlan) bool;
 ```
@@ -126,7 +126,7 @@ counts, except an unwind entry's personality, which the unwinder calls
 ## fun symbol_reference_live
 
 ```mach
-pub fun symbol_reference_live(modules: *of.ObjectImage, module_count: u32,
+pub fun symbol_reference_live(modules: *target_of.ObjectImage, module_count: u32,
 symbol_name: intern.StrId, sec_base: *u32,
 atoms: *AtomPlan) bool;
 ```
@@ -137,7 +137,7 @@ counting as unreferenced
 ## fun has_function_branch_reloc
 
 ```mach
-pub fun has_function_branch_reloc(modules: *of.ObjectImage, module_count: u32,
+pub fun has_function_branch_reloc(modules: *target_of.ObjectImage, module_count: u32,
 symbol_name: intern.StrId, sec_base: *u32,
 atoms: *AtomPlan) bool;
 ```
@@ -145,7 +145,7 @@ atoms: *AtomPlan) bool;
 ## fun has_got_reloc
 
 ```mach
-pub fun has_got_reloc(modules: *of.ObjectImage, module_count: u32,
+pub fun has_got_reloc(modules: *target_of.ObjectImage, module_count: u32,
 symbol_name: intern.StrId, sec_base: *u32,
 atoms: *AtomPlan) bool;
 ```

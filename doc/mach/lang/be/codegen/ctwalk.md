@@ -62,7 +62,7 @@ in order, the first one's width
 ## fun walk
 
 ```mach
-pub fun walk(f: *mir.MirFunction, ns: *notes.AsmNote, count: u32, eff: *IsaEffects,
+pub fun walk(f: *codegen_mir.MirFunction, ns: *notes.AsmNote, count: u32, eff: *IsaEffects,
 tgt: *isa.BackendTarget, alloc: *A.Allocator) err[Refusal];
 ```
 

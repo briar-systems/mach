@@ -3,7 +3,7 @@
 ## fun validate_indirects
 
 ```mach
-pub fun validate_indirects(img: *of.ObjectImage) err[fail.Fail];
+pub fun validate_indirects(img: *target_of.ObjectImage) err[fail.Fail];
 ```
 
 ## val EXPORTS_SEGNAME
@@ -43,6 +43,6 @@ like the request list so no link loads it
 ## fun emit_object
 
 ```mach
-pub fun emit_object(isa_vt: *of.ObjectTarget, img: *of.ObjectImage, destination: str) err[fail.Fail];
+pub fun emit_object(isa_vt: *target_of.ObjectTarget, img: *target_of.ObjectImage, destination: str) err[fail.Fail];
 ```
 

@@ -9,13 +9,13 @@ pub rec MachoDynLayout;
 ## fun func_import_count
 
 ```mach
-pub fun func_import_count(dyn: *of.DynamicInfo) u32;
+pub fun func_import_count(dyn: *target_of.DynamicInfo) u32;
 ```
 
 ## fun import_needs_got
 
 ```mach
-pub fun import_needs_got(dyn: *of.DynamicInfo, import_index: u32) bool;
+pub fun import_needs_got(dyn: *target_of.DynamicInfo, import_index: u32) bool;
 ```
 
 a function's stub loads it from a slot, and a GOT-kind relocation reads one
@@ -23,7 +23,7 @@ a function's stub loads it from a slot, and a GOT-kind relocation reads one
 ## fun got_import_count
 
 ```mach
-pub fun got_import_count(dyn: *of.DynamicInfo) u32;
+pub fun got_import_count(dyn: *target_of.DynamicInfo) u32;
 ```
 
 ## fun macho_stub_size
@@ -35,7 +35,7 @@ pub fun macho_stub_size(arch_id: u32) usize;
 ## fun macho_stub_shape
 
 ```mach
-pub fun macho_stub_shape(arch_id: u32, count: u32) res[of.TableShape, fail.Fail];
+pub fun macho_stub_shape(arch_id: u32, count: u32) res[target_of.TableShape, fail.Fail];
 ```
 
 the __TEXT,__stubs table the linker reserves at the end of the code, so a
@@ -44,7 +44,7 @@ call site's branch reaches its stub whatever data the image carries
 ## fun macho_got_shape
 
 ```mach
-pub fun macho_got_shape(arch_id: u32, dyn: *of.DynamicInfo) res[of.TableShape, fail.Fail];
+pub fun macho_got_shape(arch_id: u32, dyn: *target_of.DynamicInfo) res[target_of.TableShape, fail.Fail];
 ```
 
 the __DATA_CONST,__got table the linker reserves ahead of the zero-fill, so a
@@ -59,70 +59,70 @@ pub fun write_macho_stub(buf: *u8, arch_id: u32, stub_off: usize, stub_va: u64, 
 ## fun dylib_ordinal_for
 
 ```mach
-pub fun dylib_ordinal_for(dyn: *of.DynamicInfo, import_index: u32) u32;
+pub fun dylib_ordinal_for(dyn: *target_of.DynamicInfo, import_index: u32) u32;
 ```
 
 ## fun measure_bind_info
 
 ```mach
-pub fun measure_bind_info(itn: *intern.Interner, dyn: *of.DynamicInfo,
-segs: *of.LoadSegment, text_va: u64, pz: u32, got_seg_offset: u64) usize;
+pub fun measure_bind_info(itn: *intern.Interner, dyn: *target_of.DynamicInfo,
+segs: *target_of.LoadSegment, text_va: u64, pz: u32, got_seg_offset: u64) usize;
 ```
 
 ## fun write_bind_info
 
 ```mach
-pub fun write_bind_info(buf: *u8, off: usize, itn: *intern.Interner, dyn: *of.DynamicInfo,
-segs: *of.LoadSegment, text_va: u64, pz: u32, got_seg_index: u32, got_seg_offset: u64) usize;
+pub fun write_bind_info(buf: *u8, off: usize, itn: *intern.Interner, dyn: *target_of.DynamicInfo,
+segs: *target_of.LoadSegment, text_va: u64, pz: u32, got_seg_index: u32, got_seg_offset: u64) usize;
 ```
 
 ## fun base_reloc_cmp
 
 ```mach
-pub fun base_reloc_cmp(a: *of.BaseReloc, b: *of.BaseReloc) i64;
+pub fun base_reloc_cmp(a: *target_of.BaseReloc, b: *target_of.BaseReloc) i64;
 ```
 
 ## fun seg_offset_loc
 
 ```mach
-pub fun seg_offset_loc(dyn: *of.DynamicInfo, ls: u32, seg_offset: u32,
-segs: *of.LoadSegment, text_va: u64, pz: u32,
+pub fun seg_offset_loc(dyn: *target_of.DynamicInfo, ls: u32, seg_offset: u32,
+segs: *target_of.LoadSegment, text_va: u64, pz: u32,
 out_seg: *u32, out_off: *u64);
 ```
 
 ## fun measure_rebase_info
 
 ```mach
-pub fun measure_rebase_info(dyn: *of.DynamicInfo, segs: *of.LoadSegment, text_va: u64, pz: u32) usize;
+pub fun measure_rebase_info(dyn: *target_of.DynamicInfo, segs: *target_of.LoadSegment, text_va: u64, pz: u32) usize;
 ```
 
 ## fun write_rebase_info
 
 ```mach
-pub fun write_rebase_info(buf: *u8, off: usize, dyn: *of.DynamicInfo, segs: *of.LoadSegment,
+pub fun write_rebase_info(buf: *u8, off: usize, dyn: *target_of.DynamicInfo, segs: *target_of.LoadSegment,
 text_va: u64, pz: u32) usize;
 ```
 
 ## fun patch_macho_fixups
 
 ```mach
-pub fun patch_macho_fixups(buf: *u8, arch_id: u32, lay: *MachoDynLayout, dyn: *of.DynamicInfo,
-fixups: *of.PltFixup, fixup_count: u32, seg_offsets: *usize,
-segs: *of.LoadSegment, seg_count: u32, nimp: u32) err[fail.Fail];
+pub fun patch_macho_fixups(buf: *u8, arch_id: u32, lay: *MachoDynLayout, dyn: *target_of.DynamicInfo,
+fixups: *target_of.PltFixup, fixup_count: u32, seg_offsets: *usize,
+segs: *target_of.LoadSegment, seg_count: u32, nimp: u32) err[fail.Fail];
 ```
 
 ## fun patch_macho_import_addr_fixups
 
 ```mach
 pub fun patch_macho_import_addr_fixups(buf: *u8, lay: *MachoDynLayout,
-dyn: *of.DynamicInfo, seg_offsets: *usize,
-segs: *of.LoadSegment,
+dyn: *target_of.DynamicInfo, seg_offsets: *usize,
+segs: *target_of.LoadSegment,
 seg_count: u32) err[fail.Fail];
 ```
 
 ## fun macho_got_ordinal
 
 ```mach
-pub fun macho_got_ordinal(dyn: *of.DynamicInfo, import_index: u32) u32;
+pub fun macho_got_ordinal(dyn: *target_of.DynamicInfo, import_index: u32) u32;
 ```
 

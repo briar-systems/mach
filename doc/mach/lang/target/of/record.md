@@ -16,8 +16,8 @@ pub val SECTION_NAME: str = ".mach.cache"
 ## fun with_record
 
 ```mach
-pub fun with_record(alloc: *A.Allocator, img: *of.ObjectImage, name: str, template: of.Section,
-out: *of.ObjectImage) err[fail.Fail];
+pub fun with_record(alloc: *A.Allocator, img: *target_of.ObjectImage, name: str, template: target_of.Section,
+out: *target_of.ObjectImage) err[fail.Fail];
 ```
 
 a view of `img` whose sections carry the record in a section named `name`
@@ -27,7 +27,7 @@ record bytes stay the image's
 ## fun take
 
 ```mach
-pub fun take(img: *of.ObjectImage, index: u32) err[fail.Fail];
+pub fun take(img: *target_of.ObjectImage, index: u32) err[fail.Fail];
 ```
 
 moves the record out of section `index` into the image and leaves the husk.
@@ -36,7 +36,7 @@ a husk reads as no record
 ## fun consume
 
 ```mach
-pub fun consume(itn: *intern.Interner, img: *of.ObjectImage, name: str) err[fail.Fail];
+pub fun consume(itn: *intern.Interner, img: *target_of.ObjectImage, name: str) err[fail.Fail];
 ```
 
 the section named `name`, when the object has one, moved into the image

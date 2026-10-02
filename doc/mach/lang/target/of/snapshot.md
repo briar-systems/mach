@@ -12,7 +12,7 @@ nil name the length 0xFFFFFFFF, and every number is little-endian
 ## fun encode
 
 ```mach
-pub fun encode(alloc: *A.Allocator, img: *of.ObjectImage, out_bytes: **u8, out_len: *usize) err[fail.Fail];
+pub fun encode(alloc: *A.Allocator, img: *target_of.ObjectImage, out_bytes: **u8, out_len: *usize) err[fail.Fail];
 ```
 
 the snapshot of img; the caller owns the bytes, allocated in alloc
@@ -21,7 +21,7 @@ the snapshot of img; the caller owns the bytes, allocated in alloc
 
 ```mach
 pub fun decode(alloc: *A.Allocator, itn: *intern.Interner, bytes: *u8, len: usize,
-out: *of.ObjectImage) res[bool, fail.Fail];
+out: *target_of.ObjectImage) res[bool, fail.Fail];
 ```
 
 the image a snapshot holds, owned in alloc with its names in itn: false when

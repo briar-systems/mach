@@ -3,6 +3,6 @@
 ## fun register
 
 ```mach
-pub fun register(reg: *of.OfRegistry) err[fail.Fail];
+pub fun register(reg: *target_of.OfRegistry) err[fail.Fail];
 ```
 

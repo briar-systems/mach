@@ -432,54 +432,54 @@ no phase capability: an expression reads literals and the constants its context 
 ## fun loading_capabilities
 
 ```mach
-pub fun loading_capabilities[T](member: fun(*T, id.ExprId) res[opt[CTValue], EvalFail],
-cast: fun(*T, id.ExprId, CTValue) res[CTValue, EvalFail]) res[PhaseCapabilities[T], fail.Fail];
+pub fun loading_capabilities[T](member: fun(*T, ast_id.ExprId) res[opt[CTValue], EvalFail],
+cast: fun(*T, ast_id.ExprId, CTValue) res[CTValue, EvalFail]) res[PhaseCapabilities[T], fail.Fail];
 ```
 
 ## fun resolution_capabilities
 
 ```mach
-pub fun resolution_capabilities[T](ident: fun(*T, id.ExprId) bool,
-expression: fun(*T, *ast.Ast, id.ExprId) res[expr.Expr, EvalFail]) res[PhaseCapabilities[T], fail.Fail];
+pub fun resolution_capabilities[T](ident: fun(*T, ast_id.ExprId) bool,
+expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, EvalFail]) res[PhaseCapabilities[T], fail.Fail];
 ```
 
 ## fun semantic_name_capabilities
 
 ```mach
 pub fun semantic_name_capabilities[T](
-member: fun(*T, id.ExprId) res[opt[CTValue], EvalFail],
-ident: fun(*T, id.ExprId) bool,
-expression: fun(*T, *ast.Ast, id.ExprId) res[expr.Expr, EvalFail]) res[PhaseCapabilities[T], fail.Fail];
+member: fun(*T, ast_id.ExprId) res[opt[CTValue], EvalFail],
+ident: fun(*T, ast_id.ExprId) bool,
+expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, EvalFail]) res[PhaseCapabilities[T], fail.Fail];
 ```
 
 ## fun semantic_type_capabilities
 
 ```mach
 pub fun semantic_type_capabilities[T](
-member: fun(*T, id.ExprId) res[opt[CTValue], EvalFail],
-type_: fun(*T, id.ExprId) res[opt[u32], EvalFail],
+member: fun(*T, ast_id.ExprId) res[opt[CTValue], EvalFail],
+type_: fun(*T, ast_id.ExprId) res[opt[u32], EvalFail],
 field: fun(*T, u32, u32, u8) res[opt[CTValue], EvalFail],
 query: fun(*T, u32, u8) res[opt[CTValue], EvalFail],
 layout: fun(*T, u32) res[opt[CTValue], EvalFail],
-cast: fun(*T, id.ExprId, CTValue) res[CTValue, EvalFail],
-scalar: fun(*T, id.ExprId, CTValue) res[CTValue, EvalFail],
-ident: fun(*T, id.ExprId) bool,
-expression: fun(*T, *ast.Ast, id.ExprId) res[expr.Expr, EvalFail]) res[PhaseCapabilities[T], fail.Fail];
+cast: fun(*T, ast_id.ExprId, CTValue) res[CTValue, EvalFail],
+scalar: fun(*T, ast_id.ExprId, CTValue) res[CTValue, EvalFail],
+ident: fun(*T, ast_id.ExprId) bool,
+expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, EvalFail]) res[PhaseCapabilities[T], fail.Fail];
 ```
 
 ## fun lowering_capabilities
 
 ```mach
 pub fun lowering_capabilities[T](
-member: fun(*T, id.ExprId) res[opt[CTValue], EvalFail],
-type_: fun(*T, id.ExprId) res[opt[u32], EvalFail],
+member: fun(*T, ast_id.ExprId) res[opt[CTValue], EvalFail],
+type_: fun(*T, ast_id.ExprId) res[opt[u32], EvalFail],
 field: fun(*T, u32, u32, u8) res[opt[CTValue], EvalFail],
 query: fun(*T, u32, u8) res[opt[CTValue], EvalFail],
 layout: fun(*T, u32) res[opt[CTValue], EvalFail],
-cast: fun(*T, id.ExprId, CTValue) res[CTValue, EvalFail],
-scalar: fun(*T, id.ExprId, CTValue) res[CTValue, EvalFail],
-ident: fun(*T, id.ExprId) bool,
-expression: fun(*T, *ast.Ast, id.ExprId) res[expr.Expr, EvalFail]) res[PhaseCapabilities[T], fail.Fail];
+cast: fun(*T, ast_id.ExprId, CTValue) res[CTValue, EvalFail],
+scalar: fun(*T, ast_id.ExprId, CTValue) res[CTValue, EvalFail],
+ident: fun(*T, ast_id.ExprId) bool,
+expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, EvalFail]) res[PhaseCapabilities[T], fail.Fail];
 ```
 
 ## val COMPTIME_TYPE_QUERY_NO_RESOLVER_MSG
@@ -609,7 +609,7 @@ diag: the diagnostic kind the failure is reported as, where it reaches the user
 ## fun eval_error
 
 ```mach
-pub fun eval_error(kind: EvalFailKind, diag: dkind.Kind, message: str) EvalFail;
+pub fun eval_error(kind: EvalFailKind, diag: diagnostic_kind.Kind, message: str) EvalFail;
 ```
 
 ## fun eval_internal
@@ -623,7 +623,7 @@ an internal failure of the evaluator, a compiler defect wherever it surfaces
 ## fun eval_from_fail
 
 ```mach
-pub fun eval_from_fail(f: fail.Fail, diag: dkind.Kind, rejected_message: str) EvalFail;
+pub fun eval_from_fail(f: fail.Fail, diag: diagnostic_kind.Kind, rejected_message: str) EvalFail;
 ```
 
 ## fun gate_eval_failure_is_transient
@@ -780,25 +780,25 @@ pub fun prepare_gates(c: *ComptimeCtx, expr_count: u32, decl_count: u32) err[fai
 ## fun gate_state
 
 ```mach
-pub fun gate_state(c: *ComptimeCtx, eid: id.ExprId) GateState;
+pub fun gate_state(c: *ComptimeCtx, eid: ast_id.ExprId) GateState;
 ```
 
 ## fun set_gate_state
 
 ```mach
-pub fun set_gate_state(c: *ComptimeCtx, eid: id.ExprId, state: GateState);
+pub fun set_gate_state(c: *ComptimeCtx, eid: ast_id.ExprId, state: GateState);
 ```
 
 ## fun load_walked
 
 ```mach
-pub fun load_walked(c: *ComptimeCtx, did: id.DeclId) bool;
+pub fun load_walked(c: *ComptimeCtx, did: ast_id.DeclId) bool;
 ```
 
 ## fun mark_load_walked
 
 ```mach
-pub fun mark_load_walked(c: *ComptimeCtx, did: id.DeclId);
+pub fun mark_load_walked(c: *ComptimeCtx, did: ast_id.DeclId);
 ```
 
 an unbound mark is the stronger fact and survives the walk's own mark
@@ -806,13 +806,13 @@ an unbound mark is the stronger fact and survives the walk's own mark
 ## fun use_unbound
 
 ```mach
-pub fun use_unbound(c: *ComptimeCtx, did: id.DeclId) bool;
+pub fun use_unbound(c: *ComptimeCtx, did: ast_id.DeclId) bool;
 ```
 
 ## fun mark_use_unbound
 
 ```mach
-pub fun mark_use_unbound(c: *ComptimeCtx, did: id.DeclId);
+pub fun mark_use_unbound(c: *ComptimeCtx, did: ast_id.DeclId);
 ```
 
 ## fun defer_float_width
@@ -872,7 +872,7 @@ cap_ctx: *T,
 caps: PhaseCapabilities[T],
 a: *ast.Ast,
 source: str,
-e: id.ExprId,
+e: ast_id.ExprId,
 interner: *intern.Interner) res[CTValue, EvalFail];
 ```
 
@@ -885,7 +885,7 @@ cap_ctx: *T,
 caps: PhaseCapabilities[T],
 a: *ast.Ast,
 source: str,
-e: id.ExprId,
+e: ast_id.ExprId,
 interner: *intern.Interner,
 fw: float.FloatWidth) res[CTValue, EvalFail];
 ```
@@ -977,25 +977,25 @@ pub fun intrinsic_takes_type_operand(source: str, full: token.Span) bool;
 ## fun is_type_of_call
 
 ```mach
-pub fun is_type_of_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
+pub fun is_type_of_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
 ```
 
 ## fun type_of_arg
 
 ```mach
-pub fun type_of_arg(a: *ast.Ast, eid: id.ExprId) id.ExprId;
+pub fun type_of_arg(a: *ast.Ast, eid: ast_id.ExprId) ast_id.ExprId;
 ```
 
 ## fun is_fields_call
 
 ```mach
-pub fun is_fields_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
+pub fun is_fields_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
 ```
 
 ## fun is_cases_call
 
 ```mach
-pub fun is_cases_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
+pub fun is_cases_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
 ```
 
 ## fun is_descriptor
@@ -1106,27 +1106,27 @@ pub rec GateProbes[T];
 
 ```mach
 pub fun gate_probes[T](
-comptime_param: fun(*T, id.ExprId) bool,
-each_loopvar: fun(*T, id.ExprId) bool,
-field_loopvar: fun(*T, id.ExprId) bool,
-field_type_operand: fun(*T, id.ExprId) bool,
-expression: fun(*T, *ast.Ast, id.ExprId) res[expr.Expr, EvalFail]) GateProbes[T];
+comptime_param: fun(*T, ast_id.ExprId) bool,
+each_loopvar: fun(*T, ast_id.ExprId) bool,
+field_loopvar: fun(*T, ast_id.ExprId) bool,
+field_type_operand: fun(*T, ast_id.ExprId) bool,
+expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, EvalFail]) GateProbes[T];
 ```
 
 ## fun gate_node_action_probes
 
 ```mach
-pub fun gate_node_action_probes[T](action: fun(*T, id.ExprId, *expr.Expr) GateNodeVerdict,
-expression: fun(*T, *ast.Ast, id.ExprId) res[expr.Expr, EvalFail]) GateProbes[T];
+pub fun gate_node_action_probes[T](action: fun(*T, ast_id.ExprId, *ast_expr.Expr) GateNodeVerdict,
+expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, EvalFail]) GateProbes[T];
 ```
 
 ## fun gate_walk
 
 ```mach
 pub fun gate_walk[T](a: *ast.Ast, source: str, obs: *T,
-action: fun(*T, id.ExprId, *expr.Expr) GateNodeVerdict,
-expression: fun(*T, *ast.Ast, id.ExprId) res[expr.Expr, EvalFail],
-eid: id.ExprId) res[bool, fail.Fail];
+action: fun(*T, ast_id.ExprId, *ast_expr.Expr) GateNodeVerdict,
+expression: fun(*T, *ast.Ast, ast_id.ExprId) res[ast_expr.Expr, EvalFail],
+eid: ast_id.ExprId) res[bool, fail.Fail];
 ```
 
 ## fun gate_chain_depends_on
@@ -1186,7 +1186,7 @@ pub rec GateVerdict;
 
 ```mach
 pub fun gate_unresolved_dependency[T](c: *ComptimeCtx, cap_ctx: *T, caps: PhaseCapabilities[T],
-a: *ast.Ast, source: str, interner: *intern.Interner, cond: id.ExprId) res[intern.StrId, fail.Fail];
+a: *ast.Ast, source: str, interner: *intern.Interner, cond: ast_id.ExprId) res[intern.StrId, fail.Fail];
 ```
 
 ## fun evaluate_gate
@@ -1198,7 +1198,7 @@ cap_ctx: *T,
 caps: PhaseCapabilities[T],
 a: *ast.Ast,
 source: str,
-cond: id.ExprId,
+cond: ast_id.ExprId,
 interner: *intern.Interner,
 scope: GateScope,
 cache: bool) res[GateVerdict, fail.Fail];
@@ -1216,55 +1216,55 @@ branches_start: u32, branches_len: u32) res[bool, fail.Fail];
 
 ```mach
 pub fun gate_depends_on[T](
-a: *ast.Ast, source: str, obs: *T, probes: GateProbes[T], probe: GateProbe, eid: id.ExprId) res[bool, fail.Fail];
+a: *ast.Ast, source: str, obs: *T, probes: GateProbes[T], probe: GateProbe, eid: ast_id.ExprId) res[bool, fail.Fail];
 ```
 
 ## fun is_layout_intrinsic_call
 
 ```mach
-pub fun is_layout_intrinsic_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
+pub fun is_layout_intrinsic_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
 ```
 
 ## fun is_type_id_call
 
 ```mach
-pub fun is_type_id_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
+pub fun is_type_id_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
 ```
 
 ## fun is_length_of_call
 
 ```mach
-pub fun is_length_of_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
+pub fun is_length_of_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
 ```
 
 ## fun is_offset_of_call
 
 ```mach
-pub fun is_offset_of_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
+pub fun is_offset_of_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
 ```
 
 ## fun is_size_of_call
 
 ```mach
-pub fun is_size_of_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
+pub fun is_size_of_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
 ```
 
 ## fun is_align_of_call
 
 ```mach
-pub fun is_align_of_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
+pub fun is_align_of_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
 ```
 
 ## fun layout_intrinsic_type_arg
 
 ```mach
-pub fun layout_intrinsic_type_arg(a: *ast.Ast, eid: id.ExprId) id.ExprId;
+pub fun layout_intrinsic_type_arg(a: *ast.Ast, eid: ast_id.ExprId) ast_id.ExprId;
 ```
 
 ## fun fields_type_arg
 
 ```mach
-pub fun fields_type_arg(a: *ast.Ast, eid: id.ExprId) id.ExprId;
+pub fun fields_type_arg(a: *ast.Ast, eid: ast_id.ExprId) ast_id.ExprId;
 ```
 
 ## rec ArrayLitInfo
@@ -1276,13 +1276,13 @@ pub rec ArrayLitInfo;
 ## fun declared_float_width
 
 ```mach
-pub fun declared_float_width(a: *ast.Ast, source: str, t: id.TypeId) float.FloatWidth;
+pub fun declared_float_width(a: *ast.Ast, source: str, t: ast_id.TypeId) float.FloatWidth;
 ```
 
 ## fun apply_declared_int_type
 
 ```mach
-pub fun apply_declared_int_type(a: *ast.Ast, source: str, t: id.TypeId, value: CTValue) CTValue;
+pub fun apply_declared_int_type(a: *ast.Ast, source: str, t: ast_id.TypeId, value: CTValue) CTValue;
 ```
 
 ## fun cast_to_int
@@ -1309,13 +1309,13 @@ pub fun float_width_unread(v: CTValue) bool;
 ## fun decl_array_lit
 
 ```mach
-pub fun decl_array_lit(a: *ast.Ast, decl_id: id.DeclId) opt[ArrayLitInfo];
+pub fun decl_array_lit(a: *ast.Ast, decl_id: ast_id.DeclId) opt[ArrayLitInfo];
 ```
 
 ## fun is_error_call
 
 ```mach
-pub fun is_error_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
+pub fun is_error_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
 ```
 
 ## fun error_message
@@ -1327,51 +1327,51 @@ cap_ctx: *T,
 caps: PhaseCapabilities[T],
 a: *ast.Ast,
 source: str,
-eid: id.ExprId,
+eid: ast_id.ExprId,
 interner: *intern.Interner) res[str, EvalFail];
 ```
 
 ## fun type_operand_value
 
 ```mach
-pub fun type_operand_value(a: *ast.Ast, source: str, operand: id.ExprId) id.ExprId;
+pub fun type_operand_value(a: *ast.Ast, source: str, operand: ast_id.ExprId) ast_id.ExprId;
 ```
 
 ## fun is_type_comparison
 
 ```mach
-pub fun is_type_comparison(a: *ast.Ast, source: str, bin: *expr.ExprBinary) bool;
+pub fun is_type_comparison(a: *ast.Ast, source: str, bin: *ast_expr.ExprBinary) bool;
 ```
 
 ## fun is_type_comparison_binary
 
 ```mach
-pub fun is_type_comparison_binary(a: *ast.Ast, source: str, bin: *expr.ExprBinary,
+pub fun is_type_comparison_binary(a: *ast.Ast, source: str, bin: *ast_expr.ExprBinary,
 lhs_is_field_type: bool, rhs_is_field_type: bool) bool;
 ```
 
 ## fun is_field_type_member
 
 ```mach
-pub fun is_field_type_member(a: *ast.Ast, source: str, eid: id.ExprId) bool;
+pub fun is_field_type_member(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
 ```
 
 ## fun is_field_descriptor_member
 
 ```mach
-pub fun is_field_descriptor_member(a: *ast.Ast, source: str, eid: id.ExprId) bool;
+pub fun is_field_descriptor_member(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
 ```
 
 ## fun is_type_query_call
 
 ```mach
-pub fun is_type_query_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
+pub fun is_type_query_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
 ```
 
 ## fun is_type_question_call
 
 ```mach
-pub fun is_type_question_call(a: *ast.Ast, source: str, eid: id.ExprId) bool;
+pub fun is_type_question_call(a: *ast.Ast, source: str, eid: ast_id.ExprId) bool;
 ```
 
 a call that asks about a type: its layout, its identity, or a predicate over it
@@ -1379,7 +1379,7 @@ a call that asks about a type: its layout, its identity, or a predicate over it
 ## fun type_question
 
 ```mach
-pub fun type_question(a: *ast.Ast, source: str, eid: id.ExprId) res[id.ExprId, fail.Fail];
+pub fun type_question(a: *ast.Ast, source: str, eid: ast_id.ExprId) res[ast_id.ExprId, fail.Fail];
 ```
 
 the first call in an expression that asks a type question, EXPR_NIL when none does
@@ -1387,7 +1387,7 @@ the first call in an expression that asks a type question, EXPR_NIL when none do
 ## fun type_question_message
 
 ```mach
-pub fun type_question_message(interner: *intern.Interner, a: *ast.Ast, source: str, call: id.ExprId, through: str) res[intern.StrId, fail.Fail];
+pub fun type_question_message(interner: *intern.Interner, a: *ast.Ast, source: str, call: ast_id.ExprId, through: str) res[intern.StrId, fail.Fail];
 ```
 
 a declaring gate may not ask a type question; `through` names the constants it asks it through,
@@ -1396,7 +1396,7 @@ as ` through `T` -> `S``, or is empty when the gate asks it itself
 ## fun comptime_callee_span
 
 ```mach
-pub fun comptime_callee_span(a: *ast.Ast, eid: id.ExprId) token.Span;
+pub fun comptime_callee_span(a: *ast.Ast, eid: ast_id.ExprId) token.Span;
 ```
 
 the spelling of the intrinsic a comptime call names, `$size_of` for `$size_of(T)`
@@ -1432,7 +1432,7 @@ pub fun non_integer(message: intern.StrId) CTValue;
 ## fun is_case_literal
 
 ```mach
-pub fun is_case_literal(a: *ast.Ast, eid: id.ExprId) bool;
+pub fun is_case_literal(a: *ast.Ast, eid: ast_id.ExprId) bool;
 ```
 
 a literal is a case literal when its head names a tag case, `T.c{...}` or `T.[c]{...}`; the
@@ -1442,7 +1442,7 @@ others, so the answer is complete once the literal's head has been bound
 ## fun is_path_call
 
 ```mach
-pub fun is_path_call(a: *ast.Ast, e: id.ExprId) bool;
+pub fun is_path_call(a: *ast.Ast, e: ast_id.ExprId) bool;
 ```
 
 a call whose callee is a rooted comptime path: `$mach.build.ct_mul(low, 64)`
@@ -1450,7 +1450,7 @@ a call whose callee is a rooted comptime path: `$mach.build.ct_mul(low, 64)`
 ## fun is_comptime_value
 
 ```mach
-pub fun is_comptime_value(a: *ast.Ast, e: id.ExprId) bool;
+pub fun is_comptime_value(a: *ast.Ast, e: ast_id.ExprId) bool;
 ```
 
 a rooted comptime path, or a call on one: both fold to a constant
@@ -1458,7 +1458,7 @@ a rooted comptime path, or a call on one: both fold to a constant
 ## fun is_comptime_path
 
 ```mach
-pub fun is_comptime_path(a: *ast.Ast, e: id.ExprId) bool;
+pub fun is_comptime_path(a: *ast.Ast, e: ast_id.ExprId) bool;
 ```
 
 ## fun comptime_ident_name
