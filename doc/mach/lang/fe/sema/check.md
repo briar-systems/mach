@@ -157,7 +157,7 @@ pub fun report_no_field(sc: *sema_context.SemaContext, span: token.Span, name: i
 ## fun report_named
 
 ```mach
-pub fun report_named(sc: *sema_context.SemaContext, k: dkind.Kind, span: token.Span, prefix: str, name: intern.StrId, suffix: str, fallback: str);
+pub fun report_named(sc: *sema_context.SemaContext, k: diagnostic_kind.Kind, span: token.Span, prefix: str, name: intern.StrId, suffix: str, fallback: str);
 ```
 
 ## fun report_missing_type_args
@@ -169,13 +169,13 @@ pub fun report_missing_type_args(sc: *sema_context.SemaContext, span: token.Span
 ## fun report_typed
 
 ```mach
-pub fun report_typed(sc: *sema_context.SemaContext, k: dkind.Kind, span: token.Span, prefix: str, t: type.TypeId, suffix: str, fallback: str);
+pub fun report_typed(sc: *sema_context.SemaContext, k: diagnostic_kind.Kind, span: token.Span, prefix: str, t: type.TypeId, suffix: str, fallback: str);
 ```
 
 ## fun report_typed2
 
 ```mach
-pub fun report_typed2(sc: *sema_context.SemaContext, k: dkind.Kind, span: token.Span, prefix: str, a: type.TypeId, mid: str, b: type.TypeId, suffix: str, fallback: str);
+pub fun report_typed2(sc: *sema_context.SemaContext, k: diagnostic_kind.Kind, span: token.Span, prefix: str, a: type.TypeId, mid: str, b: type.TypeId, suffix: str, fallback: str);
 ```
 
 ## fun expr_span_of

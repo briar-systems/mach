@@ -219,7 +219,7 @@ pub fun gated_lower_member_const_message(lc: *LowerContext, name: intern.StrId, 
 ## fun report_gate
 
 ```mach
-pub fun report_gate(lc: *LowerContext, k: dkind.Kind, span: token.Span, message: str) fail.Fail;
+pub fun report_gate(lc: *LowerContext, k: diagnostic_kind.Kind, span: token.Span, message: str) fail.Fail;
 ```
 
 ## fun record_eval_result

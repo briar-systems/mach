@@ -609,7 +609,7 @@ diag: the diagnostic kind the failure is reported as, where it reaches the user
 ## fun eval_error
 
 ```mach
-pub fun eval_error(kind: EvalFailKind, diag: dkind.Kind, message: str) EvalFail;
+pub fun eval_error(kind: EvalFailKind, diag: diagnostic_kind.Kind, message: str) EvalFail;
 ```
 
 ## fun eval_internal
@@ -623,7 +623,7 @@ an internal failure of the evaluator, a compiler defect wherever it surfaces
 ## fun eval_from_fail
 
 ```mach
-pub fun eval_from_fail(f: fail.Fail, diag: dkind.Kind, rejected_message: str) EvalFail;
+pub fun eval_from_fail(f: fail.Fail, diag: diagnostic_kind.Kind, rejected_message: str) EvalFail;
 ```
 
 ## fun gate_eval_failure_is_transient

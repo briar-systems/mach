@@ -85,7 +85,7 @@ pub val REQUEST_INVALID:   Request = 4
 ## fun request_of
 
 ```mach
-pub fun request_of(reason: cnc.Reason) Request;
+pub fun request_of(reason: sync_cancel.Reason) Request;
 ```
 
 ## tag Cause
@@ -254,7 +254,7 @@ pub fun wait(a: *std_allocator.Allocator, p: *OwnedSubprocess) res[SubprocessTer
 ## fun wait_any
 
 ```mach
-pub fun wait_any(a: *std_allocator.Allocator, owners: *OwnedSubprocess, count: u32, scope: *cnc.Scope, source: *events.Source) res[*OwnedSubprocess, Error];
+pub fun wait_any(a: *std_allocator.Allocator, owners: *OwnedSubprocess, count: u32, scope: *sync_cancel.Scope, source: *events.Source) res[*OwnedSubprocess, Error];
 ```
 
 ## fun finish_capture

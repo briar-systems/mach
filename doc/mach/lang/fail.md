@@ -48,7 +48,7 @@ an internal failure: a compiler defect, reported as `compiler.internal`
 ## fun user
 
 ```mach
-pub fun user(k: dkind.Kind, text: str) Fail;
+pub fun user(k: diagnostic_kind.Kind, text: str) Fail;
 ```
 
 the input is wrong or unsupported; a kind no live row declares makes it
@@ -57,7 +57,7 @@ the compiler defect it is
 ## fun environment
 
 ```mach
-pub fun environment(k: dkind.Kind, text: str) Fail;
+pub fun environment(k: diagnostic_kind.Kind, text: str) Fail;
 ```
 
 the machine refused: a file could not be read or written
@@ -65,7 +65,7 @@ the machine refused: a file could not be read or written
 ## fun kind_of
 
 ```mach
-pub fun kind_of(f: Fail) dkind.Kind;
+pub fun kind_of(f: Fail) diagnostic_kind.Kind;
 ```
 
 the kind the failure is reported as, NONE for a reported one, whose
@@ -115,7 +115,7 @@ names its own cause
 ## fun fs_environment
 
 ```mach
-pub fun fs_environment(k: dkind.Kind, e: std_filesystem.FsError) Fail;
+pub fun fs_environment(k: diagnostic_kind.Kind, e: std_filesystem.FsError) Fail;
 ```
 
 a filesystem operation on a file the build was handed (an object, an
@@ -125,7 +125,7 @@ save an allocation refusal, which stays internal
 ## fun read_environment
 
 ```mach
-pub fun read_environment(k: dkind.Kind, e: reader.ReadError) Fail;
+pub fun read_environment(k: diagnostic_kind.Kind, e: reader.ReadError) Fail;
 ```
 
 a read of a file the build was handed that the machine refused, as
@@ -134,7 +134,7 @@ a read of a file the build was handed that the machine refused, as
 ## fun write_environment
 
 ```mach
-pub fun write_environment(k: dkind.Kind, e: io_writer.WriteError) Fail;
+pub fun write_environment(k: diagnostic_kind.Kind, e: io_writer.WriteError) Fail;
 ```
 
 a write of a file the build produces that the machine refused

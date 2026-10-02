@@ -76,7 +76,7 @@ pub fun reported() Fail;
 ## fun user
 
 ```mach
-pub fun user(k: dkind.Kind, message: str) Fail;
+pub fun user(k: diagnostic_kind.Kind, message: str) Fail;
 ```
 
 a failure names a live row of the registry: one that names none, or a
@@ -210,13 +210,13 @@ where the failure points, when it points at a file
 ## fun environment
 
 ```mach
-pub fun environment(k: dkind.Kind, message: str) Fail;
+pub fun environment(k: diagnostic_kind.Kind, message: str) Fail;
 ```
 
 ## fun kind_of
 
 ```mach
-pub fun kind_of(f: Fail) dkind.Kind;
+pub fun kind_of(f: Fail) diagnostic_kind.Kind;
 ```
 
 the kind the failure is reported as, NONE for a reported one, whose
@@ -434,7 +434,7 @@ and the kind are kept
 ## fun user_fail
 
 ```mach
-pub fun user_fail(k: dkind.Kind, f: fail.Fail) Fail;
+pub fun user_fail(k: diagnostic_kind.Kind, f: fail.Fail) Fail;
 ```
 
 a phase failure the user caused (target selection, source loading, import

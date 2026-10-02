@@ -83,7 +83,7 @@ named wins, so a url with no checkout yet is refused by offline_dir and not by g
 ## fun git_candidate_source
 
 ```mach
-pub fun git_candidate_source(c: *GitCandidates) cand.CandidateSource;
+pub fun git_candidate_source(c: *GitCandidates) candidates.CandidateSource;
 ```
 
 ## fun release_for_commit
@@ -99,7 +99,7 @@ gitlink is a commit, and resolution deals in releases (#3689)
 ## fun release_needs
 
 ```mach
-pub fun release_needs(ctx: ptr, id: str, url: str, rel: *cand.Release, out: *resolver.ReleaseNeeds) err[outcome.Fail];
+pub fun release_needs(ctx: ptr, id: str, url: str, rel: *candidates.Release, out: *resolver.ReleaseNeeds) err[outcome.Fail];
 ```
 
 a release's requirements as the resolver reads them: its compiler range and its dependencies

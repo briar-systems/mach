@@ -27,7 +27,7 @@ list: the diagnostics, rendered in order; nothing is written when it is empty
 ## fun headline_lead
 
 ```mach
-pub fun headline_lead(k: dkind.Kind);
+pub fun headline_lead(k: diagnostic_kind.Kind);
 ```
 
 write the lead of an error of kind `k` to stderr, `error[<key>]: `, for a

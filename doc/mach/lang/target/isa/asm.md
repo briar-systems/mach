@@ -258,7 +258,7 @@ cursor over text with no block (a scan, a test) has neither
 ## fun reject
 
 ```mach
-pub fun reject(c: *Cursor, k: dkind.Kind, text: str) fail.Fail;
+pub fun reject(c: *Cursor, k: diagnostic_kind.Kind, text: str) fail.Fail;
 ```
 
 the inline-asm parser rejects the user's text: an error located at the asm

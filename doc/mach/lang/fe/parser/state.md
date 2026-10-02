@@ -188,25 +188,25 @@ pub fun diag_dnit(p: *Parser, alloc: *std_allocator.Allocator);
 ## fun error_at_current
 
 ```mach
-pub fun error_at_current(p: *Parser, k: dkind.Kind, message: str);
+pub fun error_at_current(p: *Parser, k: diagnostic_kind.Kind, message: str);
 ```
 
 ## fun error_recover_advance
 
 ```mach
-pub fun error_recover_advance(p: *Parser, k: dkind.Kind, message: str);
+pub fun error_recover_advance(p: *Parser, k: diagnostic_kind.Kind, message: str);
 ```
 
 ## fun error_at
 
 ```mach
-pub fun error_at(p: *Parser, k: dkind.Kind, span: token.Span, message: str);
+pub fun error_at(p: *Parser, k: diagnostic_kind.Kind, span: token.Span, message: str);
 ```
 
 ## fun error_naming
 
 ```mach
-pub fun error_naming(p: *Parser, k: dkind.Kind, span: token.Span, fmt: str, name: token.Span);
+pub fun error_naming(p: *Parser, k: diagnostic_kind.Kind, span: token.Span, fmt: str, name: token.Span);
 ```
 
 an error at `span` whose text fills the one `{}` of `fmt` with the source

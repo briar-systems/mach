@@ -804,7 +804,7 @@ pub val RELOC_INPUT:   RelocOrigin = 2
 ## fun reloc_refusal
 
 ```mach
-pub fun reloc_refusal(origin: RelocOrigin, k: dkind.Kind, text: str) fail.Fail;
+pub fun reloc_refusal(origin: RelocOrigin, k: diagnostic_kind.Kind, text: str) fail.Fail;
 ```
 
 a relocation the link or the object writer refuses is the user's when their

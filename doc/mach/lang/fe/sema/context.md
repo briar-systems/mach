@@ -293,7 +293,7 @@ pub rec SemaContext;
 ## fun report_deferred_name
 
 ```mach
-pub fun report_deferred_name(sc: *SemaContext, k: dkind.Kind, span: token.Span, prefix: str);
+pub fun report_deferred_name(sc: *SemaContext, k: diagnostic_kind.Kind, span: token.Span, prefix: str);
 ```
 
 a name resolve left for the arm sema selects (#3485), reported once at the name itself
@@ -421,7 +421,7 @@ pub val TEMPLATE_TRAIL_LABEL: str = "in this generic body, checked against this 
 ## fun report
 
 ```mach
-pub fun report(sc: *SemaContext, k: dkind.Kind, span: token.Span, message: str);
+pub fun report(sc: *SemaContext, k: diagnostic_kind.Kind, span: token.Span, message: str);
 ```
 
 ## fun check_handle_in_array
@@ -457,13 +457,13 @@ pub fun reported_since(sc: *SemaContext, mark: u64) bool;
 ## fun report_note
 
 ```mach
-pub fun report_note(sc: *SemaContext, k: dkind.Kind, span: token.Span, message: str, note: str);
+pub fun report_note(sc: *SemaContext, k: diagnostic_kind.Kind, span: token.Span, message: str, note: str);
 ```
 
 ## fun report_numbered
 
 ```mach
-pub fun report_numbered(sc: *SemaContext, k: dkind.Kind, span: token.Span, prefix: str, n: usize, suffix: str, fallback: str);
+pub fun report_numbered(sc: *SemaContext, k: diagnostic_kind.Kind, span: token.Span, prefix: str, n: usize, suffix: str, fallback: str);
 ```
 
 ## fun field_table_stage
@@ -589,7 +589,7 @@ pub fun record_eval_result(sc: *SemaContext, r: res[comptime.CTValue, comptime.E
 ## fun attr_string_arg
 
 ```mach
-pub fun attr_string_arg(sc: *SemaContext, dec: *ast_decl.Decorator, ord: u32, kind: dkind.Kind, kind_msg: str) opt[str];
+pub fun attr_string_arg(sc: *SemaContext, dec: *ast_decl.Decorator, ord: u32, kind: diagnostic_kind.Kind, kind_msg: str) opt[str];
 ```
 
 the string argument `ord` of an attribute evaluates to (#4022). one that is
