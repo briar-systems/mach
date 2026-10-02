@@ -947,6 +947,12 @@ pub fun intern_case_selector(ti: *TypeInterner, tag_type: TypeId, case_name: int
 pub fun is_case_selector(ti: *TypeInterner, tid: TypeId) bool;
 ```
 
+## fun is_pack
+
+```mach
+pub fun is_pack(ti: *TypeInterner, tid: TypeId) bool;
+```
+
 ## fun case_selector_tag_type
 
 ```mach
