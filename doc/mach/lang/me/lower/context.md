@@ -141,10 +141,10 @@ s: *session.Session,
 own_module: session.ModuleId,
 a: *ast.Ast,
 fqn: intern.StrId,
-sema_result: *sema.SemaResult,
+sema_result: *fe_sema.SemaResult,
 rr: *resolve.ResolveResult,
 ctx: *comptime.ComptimeCtx,
-definitions: *scx.DefinitionReader) res[ModuleScope, fail.Fail];
+definitions: *sema_context.DefinitionReader) res[ModuleScope, fail.Fail];
 ```
 
 ## fun origin_scope
@@ -158,12 +158,12 @@ pub fun origin_scope(lc: *LowerContext, origin: session.ModuleId) res[ModuleScop
 ```mach
 pub fun request(
 s: *session.Session,
-tgt: *target.Target,
-malloc: *A.Allocator,
+tgt: *resolved.Target,
+malloc: *std_allocator.Allocator,
 a: *ast.Ast,
 fqn: intern.StrId,
 own_module: session.ModuleId,
-sema_result: *sema.SemaResult,
+sema_result: *fe_sema.SemaResult,
 rr: *resolve.ResolveResult,
 ctx: *comptime.ComptimeCtx,
 normal_object: *NormalObject,
@@ -171,7 +171,7 @@ shared_artifact: bool,
 debug: bool,
 checks: bool,
 diags: *diagnostic.DiagnosticStore,
-deps: *sema.SemaDeps) res[LowerRequest, fail.Fail];
+deps: *fe_sema.SemaDeps) res[LowerRequest, fail.Fail];
 ```
 
 ## fun scope_enter
@@ -189,7 +189,7 @@ pub fun scope_leave(lc: *LowerContext, mark: ScopeMark) err[fail.Fail];
 ## fun init_context
 
 ```mach
-pub fun init_context(lc: *LowerContext, req: *LowerRequest, m: *ir.Module) err[fail.Fail];
+pub fun init_context(lc: *LowerContext, req: *LowerRequest, m: *me_ir.Module) err[fail.Fail];
 ```
 
 ## fun dnit_context
@@ -201,7 +201,7 @@ pub fun dnit_context(lc: *LowerContext);
 ## fun symbol_definition
 
 ```mach
-pub fun symbol_definition(lc: *LowerContext, sym: *resolve.Symbol) res[scx.DefinedSymbol, fail.Fail];
+pub fun symbol_definition(lc: *LowerContext, sym: *resolve.Symbol) res[sema_context.DefinedSymbol, fail.Fail];
 ```
 
 ## fun declaring_comptime_ctx
@@ -231,25 +231,25 @@ pub fun record_eval_result(lc: *LowerContext, r: res[comptime.CTValue, comptime.
 ## fun expression
 
 ```mach
-pub fun expression(lc: *LowerContext, eid: id.ExprId) res[aexpr.Expr, fail.Fail];
+pub fun expression(lc: *LowerContext, eid: ast_id.ExprId) res[ast_expr.Expr, fail.Fail];
 ```
 
 ## fun resolve_module_member_const
 
 ```mach
-pub fun resolve_module_member_const(lc: *LowerContext, eid: id.ExprId) res[opt[comptime.CTValue], comptime.EvalFail];
+pub fun resolve_module_member_const(lc: *LowerContext, eid: ast_id.ExprId) res[opt[comptime.CTValue], comptime.EvalFail];
 ```
 
 ## fun comptime_ident_is_runtime
 
 ```mach
-pub fun comptime_ident_is_runtime(lc: *LowerContext, eid: id.ExprId) bool;
+pub fun comptime_ident_is_runtime(lc: *LowerContext, eid: ast_id.ExprId) bool;
 ```
 
 ## fun resolve_type_comparison_operand
 
 ```mach
-pub fun resolve_type_comparison_operand(lc: *LowerContext, eid: id.ExprId) res[opt[u32], comptime.EvalFail];
+pub fun resolve_type_comparison_operand(lc: *LowerContext, eid: ast_id.ExprId) res[opt[u32], comptime.EvalFail];
 ```
 
 ## fun resolve_type_query
@@ -303,7 +303,7 @@ pub fun lookup_local(lc: *LowerContext, sym: resolve.SymbolId) opt[value.Value];
 ## fun push_loop
 
 ```mach
-pub fun push_loop(lc: *LowerContext, header: ir.BlockId, exit: ir.BlockId) err[fail.Fail];
+pub fun push_loop(lc: *LowerContext, header: me_ir.BlockId, exit: me_ir.BlockId) err[fail.Fail];
 ```
 
 ## fun pop_loop
@@ -321,7 +321,7 @@ pub fun current_loop(lc: *LowerContext) *LoopFrame;
 ## fun enqueue_instance
 
 ```mach
-pub fun enqueue_instance(lc: *LowerContext, decl: id.DeclId, origin: session.ModuleId,
+pub fun enqueue_instance(lc: *LowerContext, decl: ast_id.DeclId, origin: session.ModuleId,
 args: *type.TypeId, arg_len: u32, name: intern.StrId,
 bare: intern.StrId) err[fail.Fail];
 ```
@@ -329,7 +329,7 @@ bare: intern.StrId) err[fail.Fail];
 ## fun enqueue_value_instance
 
 ```mach
-pub fun enqueue_value_instance(lc: *LowerContext, decl: id.DeclId, origin: session.ModuleId,
+pub fun enqueue_value_instance(lc: *LowerContext, decl: ast_id.DeclId, origin: session.ModuleId,
 vals: *comptime.CTValue, names: *intern.StrId, val_len: u32,
 name: intern.StrId) err[fail.Fail];
 ```
@@ -337,7 +337,7 @@ name: intern.StrId) err[fail.Fail];
 ## fun enqueue_pack_instance
 
 ```mach
-pub fun enqueue_pack_instance(lc: *LowerContext, decl: id.DeclId, origin: session.ModuleId,
+pub fun enqueue_pack_instance(lc: *LowerContext, decl: ast_id.DeclId, origin: session.ModuleId,
 args: *type.TypeId, arg_len: u32,
 types: *type.TypeId, type_len: u32, name: intern.StrId) err[fail.Fail];
 ```
@@ -345,7 +345,7 @@ types: *type.TypeId, type_len: u32, name: intern.StrId) err[fail.Fail];
 ## fun push_fin
 
 ```mach
-pub fun push_fin(lc: *LowerContext, body: id.StmtId) err[fail.Fail];
+pub fun push_fin(lc: *LowerContext, body: ast_id.StmtId) err[fail.Fail];
 ```
 
 ## fun fin_count
@@ -357,7 +357,7 @@ pub fun fin_count(lc: *LowerContext) u32;
 ## fun fin_at
 
 ```mach
-pub fun fin_at(lc: *LowerContext, i: u32) id.StmtId;
+pub fun fin_at(lc: *LowerContext, i: u32) ast_id.StmtId;
 ```
 
 ## fun pop_fins_to
@@ -375,7 +375,7 @@ pub fun lower_type(lc: *LowerContext, tid: type.TypeId) res[ir_type.IrTypeId, fa
 ## fun gate_is_active
 
 ```mach
-pub fun gate_is_active(lc: *LowerContext, source: str, cond: id.ExprId,
+pub fun gate_is_active(lc: *LowerContext, source: str, cond: ast_id.ExprId,
 scope: comptime.GateScope, cache: bool) res[bool, fail.Fail];
 ```
 
@@ -394,7 +394,7 @@ pub fun is_void_ir(lc: *LowerContext, tid: ir_type.IrTypeId) bool;
 ## fun expr_type_of
 
 ```mach
-pub fun expr_type_of(lc: *LowerContext, eid: id.ExprId) type.TypeId;
+pub fun expr_type_of(lc: *LowerContext, eid: ast_id.ExprId) type.TypeId;
 ```
 
 an expression's type inside an instance's scope is the instance's, never the template's:
@@ -403,7 +403,7 @@ sema records the template's and every type decision here is made against this in
 ## fun expr_float_width
 
 ```mach
-pub fun expr_float_width(lc: *LowerContext, eid: id.ExprId) float.FloatWidth;
+pub fun expr_float_width(lc: *LowerContext, eid: ast_id.ExprId) float.FloatWidth;
 ```
 
 ## fun float_width_of_type
@@ -415,7 +415,7 @@ pub fun float_width_of_type(lc: *LowerContext, tid: type.TypeId) float.FloatWidt
 ## fun expr_is_secret
 
 ```mach
-pub fun expr_is_secret(lc: *LowerContext, eid: id.ExprId) bool;
+pub fun expr_is_secret(lc: *LowerContext, eid: ast_id.ExprId) bool;
 ```
 
 ## fun type_is_secret
@@ -455,25 +455,25 @@ pub fun substitute_type(lc: *LowerContext, tid: type.TypeId) type.TypeId;
 ## fun type_resolved_of
 
 ```mach
-pub fun type_resolved_of(lc: *LowerContext, tid: id.TypeId) type.TypeId;
+pub fun type_resolved_of(lc: *LowerContext, tid: ast_id.TypeId) type.TypeId;
 ```
 
 ## fun decl_type_of
 
 ```mach
-pub fun decl_type_of(lc: *LowerContext, did: id.DeclId) type.TypeId;
+pub fun decl_type_of(lc: *LowerContext, did: ast_id.DeclId) type.TypeId;
 ```
 
 ## fun decl_ret_sem
 
 ```mach
-pub fun decl_ret_sem(lc: *LowerContext, did: id.DeclId) type.TypeId;
+pub fun decl_ret_sem(lc: *LowerContext, did: ast_id.DeclId) type.TypeId;
 ```
 
 ## fun function_return_ir
 
 ```mach
-pub fun function_return_ir(lc: *LowerContext, did: id.DeclId) res[ir_type.IrTypeId, fail.Fail];
+pub fun function_return_ir(lc: *LowerContext, did: ast_id.DeclId) res[ir_type.IrTypeId, fail.Fail];
 ```
 
 ## rec FnSig
@@ -488,7 +488,7 @@ signless signature does not carry (#3927)
 ## fun lower_fn_sig
 
 ```mach
-pub fun lower_fn_sig(lc: *LowerContext, did: id.DeclId) res[FnSig, fail.Fail];
+pub fun lower_fn_sig(lc: *LowerContext, did: ast_id.DeclId) res[FnSig, fail.Fail];
 ```
 
 the signature of the semantic type `tid` and, when it is a function type,
@@ -506,21 +506,21 @@ EXT_LIST_NONE for any other type
 ## fun pack_instance_sig
 
 ```mach
-pub fun pack_instance_sig(lc: *LowerContext, d: *adecl.Decl, fixed_count: u32,
+pub fun pack_instance_sig(lc: *LowerContext, d: *ast_decl.Decl, fixed_count: u32,
 types: *type.TypeId, type_len: u32, ret_ir: ir_type.IrTypeId) res[FnSig, fail.Fail];
 ```
 
 ## fun instance_ref_sig
 
 ```mach
-pub fun instance_ref_sig(lc: *LowerContext, decl_id: id.DeclId, origin: session.ModuleId,
+pub fun instance_ref_sig(lc: *LowerContext, decl_id: ast_id.DeclId, origin: session.ModuleId,
 args: *type.TypeId, arg_len: u32) res[FnSig, fail.Fail];
 ```
 
 ## fun pack_instance_ref_sig
 
 ```mach
-pub fun pack_instance_ref_sig(lc: *LowerContext, decl_id: id.DeclId, origin: session.ModuleId,
+pub fun pack_instance_ref_sig(lc: *LowerContext, decl_id: ast_id.DeclId, origin: session.ModuleId,
 args: *type.TypeId, arg_len: u32,
 types: *type.TypeId, type_len: u32) res[FnSig, fail.Fail];
 ```
@@ -528,7 +528,7 @@ types: *type.TypeId, type_len: u32) res[FnSig, fail.Fail];
 ## fun expr_symbol_of
 
 ```mach
-pub fun expr_symbol_of(lc: *LowerContext, eid: id.ExprId) resolve.SymbolId;
+pub fun expr_symbol_of(lc: *LowerContext, eid: ast_id.ExprId) resolve.SymbolId;
 ```
 
 ## fun module_source
@@ -546,7 +546,7 @@ pub fun ast_source(lc: *LowerContext, a: *ast.Ast) str;
 ## fun decl_target_op
 
 ```mach
-pub fun decl_target_op(s: *session.Session, mid: session.ModuleId, a: *ast.Ast, src: str, d: *adecl.Decl, defs: *isa.TargetDefs, out_op: *u32) u32;
+pub fun decl_target_op(s: *session.Session, mid: session.ModuleId, a: *ast.Ast, src: str, d: *ast_decl.Decl, defs: *isa.TargetDefs, out_op: *u32) u32;
 ```
 
 ## fun emit_dbg_birth

@@ -294,7 +294,7 @@ ret: the empty manifest
 ## fun dnit
 
 ```mach
-pub fun dnit(m: *Manifest, alloc: *A.Allocator);
+pub fun dnit(m: *Manifest, alloc: *std_allocator.Allocator);
 ```
 
 free every array a parsed manifest owns and zero the counts. safe on the
@@ -306,7 +306,7 @@ alloc: the allocator `parse` was given
 ## fun step_dnit
 
 ```mach
-pub fun step_dnit(alloc: *A.Allocator, s: *StepDef);
+pub fun step_dnit(alloc: *std_allocator.Allocator, s: *StepDef);
 ```
 
 free every array a step owns, its entries and the places they are written at;

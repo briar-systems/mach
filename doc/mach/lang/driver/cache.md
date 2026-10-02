@@ -15,7 +15,7 @@ digest memo in the cell's `.cache` directory (build/cache/memo)
 ## fun configuration
 
 ```mach
-pub fun configuration(scratch: *A.Allocator, p: *project.Project, config: *u8, config_len: usize,
+pub fun configuration(scratch: *std_allocator.Allocator, p: *project.Project, config: *u8, config_len: usize,
 compiler_id: *compiler.Identity, digest: *[32]u8) err[fail.Fail];
 ```
 
@@ -41,7 +41,7 @@ pub fun identity_available(p: *project.Project) bool;
 ## fun object_path
 
 ```mach
-pub fun object_path(p: *project.Project, m: *project.ModuleEntry, a: *A.Allocator) res[str, fail.Fail];
+pub fun object_path(p: *project.Project, m: *project.ModuleEntry, a: *std_allocator.Allocator) res[str, fail.Fail];
 ```
 
 where the build writes module m's object: `obj/<project>/<module path>.<ext>`
@@ -49,7 +49,7 @@ where the build writes module m's object: `obj/<project>/<module path>.<ext>`
 ## fun test_object_path
 
 ```mach
-pub fun test_object_path(p: *project.Project, m: *project.ModuleEntry, a: *A.Allocator) res[str, fail.Fail];
+pub fun test_object_path(p: *project.Project, m: *project.ModuleEntry, a: *std_allocator.Allocator) res[str, fail.Fail];
 ```
 
 where the build writes module m's test object: `obj/<project>/<module path>.test.<ext>`
@@ -216,7 +216,7 @@ configuration identity. its items are reported under the readout phase ph
 ## fun take_staged
 
 ```mach
-pub fun take_staged(p: *project.Project, m: *project.ModuleEntry) *of.ObjectImage;
+pub fun take_staged(p: *project.Project, m: *project.ModuleEntry) *target_of.ObjectImage;
 ```
 
 hand the staged image to the query that publishes it; the facts stay with the module
@@ -224,7 +224,7 @@ hand the staged image to the query that publishes it; the facts stay with the mo
 ## fun take_staged_test
 
 ```mach
-pub fun take_staged_test(p: *project.Project, m: *project.ModuleEntry) *of.ObjectImage;
+pub fun take_staged_test(p: *project.Project, m: *project.ModuleEntry) *target_of.ObjectImage;
 ```
 
 ## fun collect_tests
@@ -238,7 +238,7 @@ a module's tests, from its lowered test ir or from the facts its restored test o
 ## fun publish
 
 ```mach
-pub fun publish(p: *project.Project, m: *project.ModuleEntry, image: *of.ObjectImage, back_key: u64) err[fail.Fail];
+pub fun publish(p: *project.Project, m: *project.ModuleEntry, image: *target_of.ObjectImage, back_key: u64) err[fail.Fail];
 ```
 
 a generated image carries its record into `obj/`: the key it was built
@@ -247,7 +247,7 @@ under, the facts its lowered ir holds, and the image itself
 ## fun publish_test
 
 ```mach
-pub fun publish_test(p: *project.Project, m: *project.ModuleEntry, image: *of.ObjectImage, back_key: u64) err[fail.Fail];
+pub fun publish_test(p: *project.Project, m: *project.ModuleEntry, image: *target_of.ObjectImage, back_key: u64) err[fail.Fail];
 ```
 
 the same for the module's test object, which records only its own back half's

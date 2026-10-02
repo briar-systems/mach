@@ -45,7 +45,7 @@ a binary16, so a calling convention can place it as the float it is (#3800)
 ## fun init
 
 ```mach
-pub fun init(b: *builder.Builder, tgt: *target.Target) res[Half, fail.Fail];
+pub fun init(b: *builder.Builder, tgt: *lang_target.Target) res[Half, fail.Fail];
 ```
 
 tgt is the target: its machine model's half rows, packed rows and NaN rule
@@ -95,7 +95,7 @@ that negates an f16 itself does so on the f16, where it may hold no 16-bit integ
 ## fun arith
 
 ```mach
-pub fun arith(h: *Half, k: instruction.InstrKind, a: value.Value, b: value.Value) value.Value;
+pub fun arith(h: *Half, k: ir_instruction.InstrKind, a: value.Value, b: value.Value) value.Value;
 ```
 
 `a k b` on carried bits, k one of OP_ADD, OP_SUB, OP_MUL and OP_DIV_U, the
@@ -152,7 +152,7 @@ wide format does, the rule every float width follows
 ## fun vec_arith
 
 ```mach
-pub fun vec_arith(h: *Half, k: instruction.InstrKind, a: value.Value, b: value.Value) value.Value;
+pub fun vec_arith(h: *Half, k: ir_instruction.InstrKind, a: value.Value, b: value.Value) value.Value;
 ```
 
 the lanes `a k b` of two f16 vectors, k one of OP_ADD, OP_SUB, OP_MUL and
@@ -161,7 +161,7 @@ OP_DIV_U, the float division
 ## fun vec_compare
 
 ```mach
-pub fun vec_compare(h: *Half, k: instruction.InstrKind, a: value.Value, b: value.Value, mask_ty: ir_type.IrTypeId) value.Value;
+pub fun vec_compare(h: *Half, k: ir_instruction.InstrKind, a: value.Value, b: value.Value, mask_ty: ir_type.IrTypeId) value.Value;
 ```
 
 the lane mask of `a k b` over two f16 vectors, k one of OP_CMP_EQ, OP_CMP_NE,

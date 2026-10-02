@@ -3,7 +3,7 @@
 ## fun parse_deps
 
 ```mach
-pub fun parse_deps(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, as_root: bool) err[outcome.Fail];
+pub fun parse_deps(alloc: *std_allocator.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, as_root: bool) err[outcome.Fail];
 ```
 
 ## def DepSource
@@ -47,7 +47,7 @@ version: the `version` range; written only for a git source, only when set, and 
 ## fun toml_escape_value
 
 ```mach
-pub fun toml_escape_value(alloc: *A.Allocator, s: str) res[str, outcome.Fail];
+pub fun toml_escape_value(alloc: *std_allocator.Allocator, s: str) res[str, outcome.Fail];
 ```
 
 the body of a TOML basic string for a value: backslash, quote and control
@@ -60,7 +60,7 @@ ret: the escaped body, without the surrounding quotes
 ## fun manifest_add_dep_table
 
 ```mach
-pub fun manifest_add_dep_table(alloc: *A.Allocator, source_text: str, spec: *DepTableSpec) res[str, outcome.Fail];
+pub fun manifest_add_dep_table(alloc: *std_allocator.Allocator, source_text: str, spec: *DepTableSpec) res[str, outcome.Fail];
 ```
 
 append a `[dep.<name>]` table to manifest text, leaving every existing byte in
@@ -77,7 +77,7 @@ ret: the new text; err when the name is not an identifier, the source is not
 ## fun manifest_remove_dep_table
 
 ```mach
-pub fun manifest_remove_dep_table(alloc: *A.Allocator, source_text: str, name: str) res[str, outcome.Fail];
+pub fun manifest_remove_dep_table(alloc: *std_allocator.Allocator, source_text: str, name: str) res[str, outcome.Fail];
 ```
 
 cut a `[dep.<name>]` table out of manifest text, from its header line to the

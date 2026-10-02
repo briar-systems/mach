@@ -63,7 +63,7 @@ pub val NONE_U32: u32 = 0xFFFFFFFF
 ## fun emit_alias_guard
 
 ```mach
-pub fun emit_alias_guard(b: *builder.Builder, fn: *ir.Function, d: *dep.DepInfo, init: value.Value, bound_ex: value.Value) res[value.Value, fail.Fail];
+pub fun emit_alias_guard(b: *builder.Builder, fn: *me_ir.Function, d: *dependence.DepInfo, init: value.Value, bound_ex: value.Value) res[value.Value, fail.Fail];
 ```
 
 ## fun emit_exclusive_bound
@@ -75,19 +75,19 @@ pub fun emit_exclusive_bound(b: *builder.Builder, counted: *loops.CountedInfo) r
 ## fun pred_is_unsigned
 
 ```mach
-pub fun pred_is_unsigned(pred: instruction.InstrKind) bool;
+pub fun pred_is_unsigned(pred: ir_instruction.InstrKind) bool;
 ```
 
 ## fun magnitude_safe
 
 ```mach
-pub fun magnitude_safe(b: *builder.Builder, fn: *ir.Function, la: *loops.LoopAnalysis, v: value.Value, is_unsigned: bool) res[value.Value, fail.Fail];
+pub fun magnitude_safe(b: *builder.Builder, fn: *me_ir.Function, la: *loops.LoopAnalysis, v: value.Value, is_unsigned: bool) res[value.Value, fail.Fail];
 ```
 
 ## fun offset_safe
 
 ```mach
-pub fun offset_safe(b: *builder.Builder, fn: *ir.Function, la: *loops.LoopAnalysis, off: value.Value) res[value.Value, fail.Fail];
+pub fun offset_safe(b: *builder.Builder, fn: *me_ir.Function, la: *loops.LoopAnalysis, off: value.Value) res[value.Value, fail.Fail];
 ```
 
 ## fun const_magnitude_safe
@@ -105,54 +105,54 @@ pub fun const_offset_safe(off: value.Value) opt[bool];
 ## fun version_loop
 
 ```mach
-pub fun version_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, d: *dep.DepInfo) res[VersionResult, fail.Fail];
+pub fun version_loop(m: *me_ir.Module, fn: *me_ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, d: *dependence.DepInfo) res[VersionResult, fail.Fail];
 ```
 
 ## fun region_index
 
 ```mach
-pub fun region_index(blocks: *id.BlockId, len: u32, blk: id.BlockId) u32;
+pub fun region_index(blocks: *ir_id.BlockId, len: u32, blk: ir_id.BlockId) u32;
 ```
 
 ## fun clone_region
 
 ```mach
-pub fun clone_region(m: *ir.Module, fn: *ir.Function, body: *id.BlockId, body_len: u32, out_clones: *id.BlockId) err[fail.Fail];
+pub fun clone_region(m: *me_ir.Module, fn: *me_ir.Function, body: *ir_id.BlockId, body_len: u32, out_clones: *ir_id.BlockId) err[fail.Fail];
 ```
 
 ## fun version_result_dnit
 
 ```mach
-pub fun version_result_dnit(vr: *VersionResult, alloc: *A.Allocator);
+pub fun version_result_dnit(vr: *VersionResult, alloc: *std_allocator.Allocator);
 ```
 
 ## fun clone_one
 
 ```mach
-pub fun clone_one(m: *ir.Module, fn: *ir.Function, src_id: id.InstructionId, instr_map: *u32, map_len: u32) err[fail.Fail];
+pub fun clone_one(m: *me_ir.Module, fn: *me_ir.Function, src_id: ir_id.InstructionId, instr_map: *u32, map_len: u32) err[fail.Fail];
 ```
 
 ## fun remap_operands
 
 ```mach
-pub fun remap_operands(fn: *ir.Function, block_map: *u32, n_blocks: u32, instr_map: *u32, n_instrs: u32);
+pub fun remap_operands(fn: *me_ir.Function, block_map: *u32, n_blocks: u32, instr_map: *u32, n_instrs: u32);
 ```
 
 ## fun redirect_terminator
 
 ```mach
-pub fun redirect_terminator(fn: *ir.Function, blk: id.BlockId, from: id.BlockId, to: id.BlockId);
+pub fun redirect_terminator(fn: *me_ir.Function, blk: ir_id.BlockId, from: ir_id.BlockId, to: ir_id.BlockId);
 ```
 
 ## fun relabel_phi_pred
 
 ```mach
-pub fun relabel_phi_pred(fn: *ir.Function, blk: id.BlockId, from: id.BlockId, to: id.BlockId);
+pub fun relabel_phi_pred(fn: *me_ir.Function, blk: ir_id.BlockId, from: ir_id.BlockId, to: ir_id.BlockId);
 ```
 
 ## fun operand_is_block
 
 ```mach
-pub fun operand_is_block(k: instruction.InstrKind, o: u32) bool;
+pub fun operand_is_block(k: ir_instruction.InstrKind, o: u32) bool;
 ```
 

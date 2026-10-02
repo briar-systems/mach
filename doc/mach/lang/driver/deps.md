@@ -41,7 +41,7 @@ the note `mach dep verify` prints for one override
 ## fun override_note
 
 ```mach
-pub fun override_note(a: *A.Allocator, name: str, declared: str, chain: str, requested: str) res[str, outcome.Fail];
+pub fun override_note(a: *std_allocator.Allocator, name: str, declared: str, chain: str, requested: str) res[str, outcome.Fail];
 ```
 
 the note naming one requirement a root declaration overrode, as `mach dep pull`, `update`,
@@ -119,7 +119,7 @@ the first release that reads `[project].mach`; an earlier compiler refuses the k
 ## fun mach_range_floor
 
 ```mach
-pub fun mach_range_floor(a: *A.Allocator, running: str) res[str, format.FormatError];
+pub fun mach_range_floor(a: *std_allocator.Allocator, running: str) res[str, std_format.FormatError];
 ```
 
 the compiler range a project is told to declare when `running` is the compiler: the oldest
@@ -129,7 +129,7 @@ the running major, so two authors on one project write the same range (#3572). o
 ## fun running_mach_range_floor
 
 ```mach
-pub fun running_mach_range_floor(a: *A.Allocator) res[str, format.FormatError];
+pub fun running_mach_range_floor(a: *std_allocator.Allocator) res[str, std_format.FormatError];
 ```
 
 mach_range_floor for this compiler
@@ -285,13 +285,13 @@ pub fun realization_mode(s: *session.Session, root: str) res[u8, outcome.Fail];
 ## fun dep_rel_of
 
 ```mach
-pub fun dep_rel_of(alloc: *A.Allocator, id: str) res[str, outcome.Fail];
+pub fun dep_rel_of(alloc: *std_allocator.Allocator, id: str) res[str, outcome.Fail];
 ```
 
 ## fun dep_full_of
 
 ```mach
-pub fun dep_full_of(alloc: *A.Allocator, root: str, id: str) res[str, outcome.Fail];
+pub fun dep_full_of(alloc: *std_allocator.Allocator, root: str, id: str) res[str, outcome.Fail];
 ```
 
 ## fun staged_gitlink
@@ -303,7 +303,7 @@ pub fun staged_gitlink(s: *session.Session, root: str, id: str) res[opt[str], ou
 ## fun own_work_tree
 
 ```mach
-pub fun own_work_tree(alloc: *A.Allocator, dep_full: str) bool;
+pub fun own_work_tree(alloc: *std_allocator.Allocator, dep_full: str) bool;
 ```
 
 ## fun checkout_head
@@ -326,7 +326,7 @@ revision the checkout lacks is fetched, which `offline` refuses; the caller free
 ## fun manifest_at
 
 ```mach
-pub fun manifest_at(alloc: *A.Allocator, dir: str, rev: str) res[manifest.Doc, outcome.Fail];
+pub fun manifest_at(alloc: *std_allocator.Allocator, dir: str, rev: str) res[manifest.Doc, outcome.Fail];
 ```
 
 the manifest the commit `rev` of the repository at `dir` holds, allocated from `alloc`
@@ -470,7 +470,7 @@ pub val REALIZED_CLONED:      u8 = 5
 ## fun git_slot_dnit
 
 ```mach
-pub fun git_slot_dnit(alloc: *A.Allocator, slot: *GitSlot);
+pub fun git_slot_dnit(alloc: *std_allocator.Allocator, slot: *GitSlot);
 ```
 
 ## fun git_slot_recorded
@@ -528,7 +528,7 @@ ret: true when the copy was refreshed, false when it already matched its source 
 ## fun realized_ids
 
 ```mach
-pub fun realized_ids(alloc: *A.Allocator, root: str) res[Vector[str], outcome.Fail];
+pub fun realized_ids(alloc: *std_allocator.Allocator, root: str) res[Vector[str], outcome.Fail];
 ```
 
 a dependency slot is a directory under dep/ named by a valid project id

@@ -282,25 +282,25 @@ pub def ParseFn: fun(*Cursor, *Stmt, *Item) err[fail.Fail]
 ## def EmitFn
 
 ```mach
-pub def EmitFn: fun(*encode.EncodeState, *Cursor, *Labels, *Item) err[fail.Fail]
+pub def EmitFn: fun(*codegen_encode.EncodeState, *Cursor, *Labels, *Item) err[fail.Fail]
 ```
 
 ## def PatchFn
 
 ```mach
-pub def PatchFn: fun(*encode.EncodeState, u32, u32) err[fail.Fail]
+pub def PatchFn: fun(*codegen_encode.EncodeState, u32, u32) err[fail.Fail]
 ```
 
 ## def SlotFn
 
 ```mach
-pub def SlotFn: fun(*mir.MirFunction, u32) opt[i64]
+pub def SlotFn: fun(*codegen_mir.MirFunction, u32) opt[i64]
 ```
 
 ## def SlotBaseFn
 
 ```mach
-pub def SlotBaseFn: fun(*mir.MirFunction) bool
+pub def SlotBaseFn: fun(*codegen_mir.MirFunction) bool
 ```
 
 ## def WritesSpFn
@@ -324,7 +324,7 @@ pub def CtClassFn: fun(u32, u16) ct.AsmClass
 ## def NoteBytesFn
 
 ```mach
-pub def NoteBytesFn: fun(*encode.EncodeState, *u8, usize, usize) err[fail.Fail]
+pub def NoteBytesFn: fun(*codegen_encode.EncodeState, *u8, usize, usize) err[fail.Fail]
 ```
 
 ## def DeclRegFn
@@ -336,7 +336,7 @@ pub def DeclRegFn: fun(str, *u8, *u32) bool
 ## def NoteLabelFn
 
 ```mach
-pub def NoteLabelFn: fun(*encode.EncodeState, u32) err[fail.Fail]
+pub def NoteLabelFn: fun(*codegen_encode.EncodeState, u32) err[fail.Fail]
 ```
 
 the listing's definition of a numbered local label, at the current offset
@@ -434,7 +434,7 @@ pub fun region_i64(s: str, lo: usize, hi: usize) opt[i64];
 ## fun named_message
 
 ```mach
-pub fun named_message(alloc: *A.Allocator, interner: *intern.Interner, prefix: str, name: str,
+pub fun named_message(alloc: *std_allocator.Allocator, interner: *intern.Interner, prefix: str, name: str,
 suffix: str, fallback: str) str;
 ```
 
@@ -447,14 +447,14 @@ pub fun span_message(c: *Cursor, prefix: str, lo: usize, hi: usize, suffix: str,
 ## fun cursor_init
 
 ```mach
-pub fun cursor_init(c: *Cursor, g: *Grammar, body: str, alloc: *A.Allocator,
-interner: *intern.Interner, f: *mir.MirFunction, pl: *mir.MirAsm);
+pub fun cursor_init(c: *Cursor, g: *Grammar, body: str, alloc: *std_allocator.Allocator,
+interner: *intern.Interner, f: *codegen_mir.MirFunction, pl: *codegen_mir.MirAsm);
 ```
 
 ## fun cursor_locate
 
 ```mach
-pub fun cursor_locate(c: *Cursor, st: *encode.EncodeState, mi: *mir.MirInstr);
+pub fun cursor_locate(c: *Cursor, st: *codegen_encode.EncodeState, mi: *codegen_mir.MirInstr);
 ```
 
 binds the cursor to the block it parses, so a refusal is located there
@@ -561,7 +561,7 @@ pub rec Labels;
 ## fun labels_init
 
 ```mach
-pub fun labels_init(l: *Labels, alloc: *A.Allocator);
+pub fun labels_init(l: *Labels, alloc: *std_allocator.Allocator);
 ```
 
 ## fun labels_dnit
@@ -585,32 +585,32 @@ pub fun label_push_fixup(l: *Labels, patch_pos: u32, number: u32) err[fail.Fail]
 ## fun label_record_def
 
 ```mach
-pub fun label_record_def(st: *encode.EncodeState, g: *Grammar, l: *Labels, number: u32, off: u32) err[fail.Fail];
+pub fun label_record_def(st: *codegen_encode.EncodeState, g: *Grammar, l: *Labels, number: u32, off: u32) err[fail.Fail];
 ```
 
 ## fun resolve_local
 
 ```mach
-pub fun resolve_local(st: *encode.EncodeState, c: *Cursor, l: *Labels, patch_pos: u32,
+pub fun resolve_local(st: *codegen_encode.EncodeState, c: *Cursor, l: *Labels, patch_pos: u32,
 number: u32, fwd: bool) err[fail.Fail];
 ```
 
 ## fun encode_block
 
 ```mach
-pub fun encode_block(st: *encode.EncodeState, g: *Grammar, f: *mir.MirFunction, mi: *mir.MirInstr) err[fail.Fail];
+pub fun encode_block(st: *codegen_encode.EncodeState, g: *Grammar, f: *codegen_mir.MirFunction, mi: *codegen_mir.MirInstr) err[fail.Fail];
 ```
 
 ## fun run
 
 ```mach
-pub fun run(st: *encode.EncodeState, g: *Grammar, c: *Cursor, l: *Labels) err[fail.Fail];
+pub fun run(st: *codegen_encode.EncodeState, g: *Grammar, c: *Cursor, l: *Labels) err[fail.Fail];
 ```
 
 ## fun admitted_extensions
 
 ```mach
-pub fun admitted_extensions(st: *encode.EncodeState, c: *Cursor) u64;
+pub fun admitted_extensions(st: *codegen_encode.EncodeState, c: *Cursor) u64;
 ```
 
 the extensions an instruction in this body may use: the target's selection,

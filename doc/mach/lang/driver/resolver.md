@@ -56,7 +56,7 @@ pub rec Choice;
 ## fun resolve
 
 ```mach
-pub fun resolve(a: *A.Allocator, src: *cand.CandidateSource, needs: NeedsFn, needs_ctx: ptr,
+pub fun resolve(a: *std_allocator.Allocator, src: *cand.CandidateSource, needs: NeedsFn, needs_ctx: ptr,
 problem: *Problem) res[Vector[Choice], outcome.Fail];
 ```
 

@@ -1,33 +1,33 @@
 # mach.lang.me.ir
 
-## fwd id.BlockId
+## fwd ir_id.BlockId
 
 ```mach
-fwd id.BlockId
+fwd ir_id.BlockId
 ```
 
 forwards [`mach.lang.me.ir.id.BlockId`](ir/id.md#def-blockid)
 
-## fwd id.InstructionId
+## fwd ir_id.InstructionId
 
 ```mach
-fwd id.InstructionId
+fwd ir_id.InstructionId
 ```
 
 forwards [`mach.lang.me.ir.id.InstructionId`](ir/id.md#def-instructionid)
 
-## fwd id.BLOCK_NIL
+## fwd ir_id.BLOCK_NIL
 
 ```mach
-fwd id.BLOCK_NIL
+fwd ir_id.BLOCK_NIL
 ```
 
 forwards [`mach.lang.me.ir.id.BLOCK_NIL`](ir/id.md#val-block_nil)
 
-## fwd id.INSTR_NIL
+## fwd ir_id.INSTR_NIL
 
 ```mach
-fwd id.INSTR_NIL
+fwd ir_id.INSTR_NIL
 ```
 
 forwards [`mach.lang.me.ir.id.INSTR_NIL`](ir/id.md#val-instr_nil)
@@ -388,7 +388,7 @@ pub rec Module;
 ## fun init
 
 ```mach
-pub fun init(a: *A.Allocator, name: intern.StrId) res[Module, fail.Fail];
+pub fun init(a: *std_allocator.Allocator, name: intern.StrId) res[Module, fail.Fail];
 ```
 
 ## fun dnit
@@ -406,13 +406,13 @@ pub fun function_dnit(m: *Module, fn: *Function);
 ## fun function_new
 
 ```mach
-pub fun function_new(alloc: *A.Allocator, name: intern.StrId, sig: type.IrTypeId, flags: u32) Function;
+pub fun function_new(alloc: *std_allocator.Allocator, name: intern.StrId, sig: ir_type.IrTypeId, flags: u32) Function;
 ```
 
 ## fun function_add
 
 ```mach
-pub fun function_add(m: *Module, name: intern.StrId, sig: type.IrTypeId, flags: u32) res[u32, fail.Fail];
+pub fun function_add(m: *Module, name: intern.StrId, sig: ir_type.IrTypeId, flags: u32) res[u32, fail.Fail];
 ```
 
 ## fun export_request_add
@@ -452,7 +452,7 @@ pub fun global_lookup(m: *Module, name: intern.StrId) opt[u32];
 ## fun instruction_get
 
 ```mach
-pub fun instruction_get(fn: *Function, i: id.InstructionId) opt[*instruction.Instruction];
+pub fun instruction_get(fn: *Function, i: ir_id.InstructionId) opt[*ir_instruction.Instruction];
 ```
 
 ## fun constant_behind
@@ -469,7 +469,7 @@ folds and compares as the constant it holds
 ## fun instruction_add
 
 ```mach
-pub fun instruction_add(m: *Module, fn: *Function, inst: instruction.Instruction) res[id.InstructionId, fail.Fail];
+pub fun instruction_add(m: *Module, fn: *Function, inst: ir_instruction.Instruction) res[ir_id.InstructionId, fail.Fail];
 ```
 
 ## rec OperandArray
@@ -487,49 +487,49 @@ pub fun operands_alloc(m: *Module, n: u32) res[OperandArray, fail.Fail];
 ## fun instr_replace_operands
 
 ```mach
-pub fun instr_replace_operands(m: *Module, ins: *instruction.Instruction, arr: OperandArray);
+pub fun instr_replace_operands(m: *Module, ins: *ir_instruction.Instruction, arr: OperandArray);
 ```
 
 ## fun phi_append_incoming
 
 ```mach
-pub fun phi_append_incoming(m: *Module, phi: *instruction.Instruction, pred: id.BlockId, incoming: value.Value) err[fail.Fail];
+pub fun phi_append_incoming(m: *Module, phi: *ir_instruction.Instruction, pred: ir_id.BlockId, incoming: value.Value) err[fail.Fail];
 ```
 
 ## fun dbg_var_get
 
 ```mach
-pub fun dbg_var_get(fn: *Function, iid: id.InstructionId) opt[*DbgVar];
+pub fun dbg_var_get(fn: *Function, iid: ir_id.InstructionId) opt[*DbgVar];
 ```
 
 ## fun record_alloca_dbg_var
 
 ```mach
-pub fun record_alloca_dbg_var(fn: *Function, alloca_id: id.InstructionId, dv: DbgVar) err[fail.Fail];
+pub fun record_alloca_dbg_var(fn: *Function, alloca_id: ir_id.InstructionId, dv: DbgVar) err[fail.Fail];
 ```
 
 ## fun alloca_dbg_var_get
 
 ```mach
-pub fun alloca_dbg_var_get(fn: *Function, alloca_id: id.InstructionId) opt[*DbgVar];
+pub fun alloca_dbg_var_get(fn: *Function, alloca_id: ir_id.InstructionId) opt[*DbgVar];
 ```
 
 ## fun clone_alloca_dbg_var
 
 ```mach
-pub fun clone_alloca_dbg_var(src_fn: *Function, dst_fn: *Function, src_iid: id.InstructionId, dst_iid: id.InstructionId) err[fail.Fail];
+pub fun clone_alloca_dbg_var(src_fn: *Function, dst_fn: *Function, src_iid: ir_id.InstructionId, dst_iid: ir_id.InstructionId) err[fail.Fail];
 ```
 
 ## fun dbg_value_const
 
 ```mach
-pub fun dbg_value_const(fn: *Function, iid: id.InstructionId) opt[i64];
+pub fun dbg_value_const(fn: *Function, iid: ir_id.InstructionId) opt[i64];
 ```
 
 ## fun dbg_expr_id
 
 ```mach
-pub fun dbg_expr_id(fn: *Function, iid: id.InstructionId) DbgExprId;
+pub fun dbg_expr_id(fn: *Function, iid: ir_id.InstructionId) DbgExprId;
 ```
 
 ## fun dbg_expr_get
@@ -541,7 +541,7 @@ pub fun dbg_expr_get(fn: *Function, eid: DbgExprId) opt[*DbgExpr];
 ## fun dbg_expr_new
 
 ```mach
-pub fun dbg_expr_new(m: *Module, fn: *Function, iid: id.InstructionId) res[DbgExprId, fail.Fail];
+pub fun dbg_expr_new(m: *Module, fn: *Function, iid: ir_id.InstructionId) res[DbgExprId, fail.Fail];
 ```
 
 ## fun dbg_expr_prepend_op
@@ -553,87 +553,87 @@ pub fun dbg_expr_prepend_op(m: *Module, fn: *Function, eid: DbgExprId, op: DbgOp
 ## fun inline_site_add
 
 ```mach
-pub fun inline_site_add(m: *Module, fn: *Function, callee: intern.StrId, call_loc: source.SrcLoc, parent: u32) res[u32, fail.Fail];
+pub fun inline_site_add(m: *Module, fn: *Function, callee: intern.StrId, call_loc: lang_source.SrcLoc, parent: u32) res[u32, fail.Fail];
 ```
 
 ## fun instr_inline_site_set
 
 ```mach
-pub fun instr_inline_site_set(fn: *Function, iid: id.InstructionId, site: u32) err[fail.Fail];
+pub fun instr_inline_site_set(fn: *Function, iid: ir_id.InstructionId, site: u32) err[fail.Fail];
 ```
 
 ## fun instr_inline_site_of
 
 ```mach
-pub fun instr_inline_site_of(fn: *Function, iid: id.InstructionId) u32;
+pub fun instr_inline_site_of(fn: *Function, iid: ir_id.InstructionId) u32;
 ```
 
 ## fun clone_instr_inline_site
 
 ```mach
-pub fun clone_instr_inline_site(src_fn: *Function, dst_fn: *Function, src_iid: id.InstructionId, dst_iid: id.InstructionId) err[fail.Fail];
+pub fun clone_instr_inline_site(src_fn: *Function, dst_fn: *Function, src_iid: ir_id.InstructionId, dst_iid: ir_id.InstructionId) err[fail.Fail];
 ```
 
 ## fun clone_dbg_metadata
 
 ```mach
-pub fun clone_dbg_metadata(m: *Module, src_fn: *Function, dst_fn: *Function, src_iid: id.InstructionId, dst_iid: id.InstructionId) err[fail.Fail];
+pub fun clone_dbg_metadata(m: *Module, src_fn: *Function, dst_fn: *Function, src_iid: ir_id.InstructionId, dst_iid: ir_id.InstructionId) err[fail.Fail];
 ```
 
 ## fun clone_asm_payload
 
 ```mach
 pub fun clone_asm_payload(m: *Module, src_fn: *Function, dst_fn: *Function,
-src_iid: id.InstructionId, dst_iid: id.InstructionId,
+src_iid: ir_id.InstructionId, dst_iid: ir_id.InstructionId,
 instr_map: *u32, map_len: u32) err[fail.Fail];
 ```
 
 ## fun block_add
 
 ```mach
-pub fun block_add(m: *Module, fn: *Function) res[id.BlockId, fail.Fail];
+pub fun block_add(m: *Module, fn: *Function) res[ir_id.BlockId, fail.Fail];
 ```
 
 ## fun block_append_instr
 
 ```mach
-pub fun block_append_instr(m: *Module, blk: *Block, i: id.InstructionId) err[fail.Fail];
+pub fun block_append_instr(m: *Module, blk: *Block, i: ir_id.InstructionId) err[fail.Fail];
 ```
 
 ## fun block_prepend_instr
 
 ```mach
-pub fun block_prepend_instr(m: *Module, blk: *Block, i: id.InstructionId) err[fail.Fail];
+pub fun block_prepend_instr(m: *Module, blk: *Block, i: ir_id.InstructionId) err[fail.Fail];
 ```
 
 ## fun block_append_phi
 
 ```mach
-pub fun block_append_phi(m: *Module, blk: *Block, i: id.InstructionId) err[fail.Fail];
+pub fun block_append_phi(m: *Module, blk: *Block, i: ir_id.InstructionId) err[fail.Fail];
 ```
 
 ## fun block_append_pred
 
 ```mach
-pub fun block_append_pred(m: *Module, blk: *Block, pred: id.BlockId) err[fail.Fail];
+pub fun block_append_pred(m: *Module, blk: *Block, pred: ir_id.BlockId) err[fail.Fail];
 ```
 
 ## fun block_target_make
 
 ```mach
-pub fun block_target_make(m: *Module, block: id.BlockId) res[value.Value, fail.Fail];
+pub fun block_target_make(m: *Module, block: ir_id.BlockId) res[value.Value, fail.Fail];
 ```
 
 ## fun block_target
 
 ```mach
-pub fun block_target(v: value.Value) id.BlockId;
+pub fun block_target(v: value.Value) ir_id.BlockId;
 ```
 
 ## fun block_successors
 
 ```mach
-pub fun block_successors(fn: *Function, blk: *Block, out0: *id.BlockId, out1: *id.BlockId) u32;
+pub fun block_successors(fn: *Function, blk: *Block, out0: *ir_id.BlockId, out1: *ir_id.BlockId) u32;
 ```
 
 ## fun preds_rebuild

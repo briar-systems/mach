@@ -89,13 +89,13 @@ pub fun resolve_name(itn: *intern.Interner, id: intern.StrId) str;
 ## fun name_message
 
 ```mach
-pub fun name_message(itn: *intern.Interner, a: *A.Allocator, prefix: str, name: str, generic: str) str;
+pub fun name_message(itn: *intern.Interner, a: *std_allocator.Allocator, prefix: str, name: str, generic: str) str;
 ```
 
 ## fun reloc_sym_index
 
 ```mach
-pub fun reloc_sym_index(img: *of.ObjectImage, r: *of.Relocation, prefix: str, generic: str) res[u32, fail.Fail];
+pub fun reloc_sym_index(img: *target_of.ObjectImage, r: *target_of.Relocation, prefix: str, generic: str) res[u32, fail.Fail];
 ```
 
 the symbol a relocation names, refused as `prefix` and the symbol's name, or
@@ -104,18 +104,18 @@ as `generic` when it has none, when that symbol did not resolve
 ## fun validate_reloc_symbols
 
 ```mach
-pub fun validate_reloc_symbols(img: *of.ObjectImage, prefix: str, generic: str) err[fail.Fail];
+pub fun validate_reloc_symbols(img: *target_of.ObjectImage, prefix: str, generic: str) err[fail.Fail];
 ```
 
 ## fun number_message
 
 ```mach
-pub fun number_message(itn: *intern.Interner, a: *A.Allocator, prefix: str, value: u64, generic: str) str;
+pub fun number_message(itn: *intern.Interner, a: *std_allocator.Allocator, prefix: str, value: u64, generic: str) str;
 ```
 
 ## fun reloc_counts
 
 ```mach
-pub fun reloc_counts(a: *A.Allocator, img: *of.ObjectImage) res[*u32, fail.Fail];
+pub fun reloc_counts(a: *std_allocator.Allocator, img: *target_of.ObjectImage) res[*u32, fail.Fail];
 ```
 

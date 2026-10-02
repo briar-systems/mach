@@ -117,8 +117,8 @@ pub def ConstEntry: encoding.ConstEntry
 ## fun run
 
 ```mach
-pub fun run(tgt: *target.Target, m: *mir.MirModule,
-asm_out: *writer.Writer) res[EncoderOutput, fail.Fail];
+pub fun run(tgt: *resolved.Target, m: *codegen_mir.MirModule,
+asm_out: *io_writer.Writer) res[EncoderOutput, fail.Fail];
 ```
 
 ## rec ByteBuf
@@ -193,7 +193,7 @@ pub val NOTE_NO_LANDING: u32 = notes.NOTE_NO_LANDING
 ## fun sink_init
 
 ```mach
-pub fun sink_init(out: *writer.Writer, interner: *intern.Interner) AsmSink;
+pub fun sink_init(out: *io_writer.Writer, interner: *intern.Interner) AsmSink;
 ```
 
 ## fun note_blank
@@ -211,7 +211,7 @@ pub fun note_push(buf: *ByteBuf, n: *AsmNote) err[fail.Fail];
 ## fun note_barrier
 
 ```mach
-pub fun note_barrier(buf: *ByteBuf, mi: *mir.MirInstr) err[fail.Fail];
+pub fun note_barrier(buf: *ByteBuf, mi: *codegen_mir.MirInstr) err[fail.Fail];
 ```
 
 the barrier reaches the stream whether or not the move it selected to emitted
@@ -297,7 +297,7 @@ pub fun sink_claim(buf: *ByteBuf, start: usize);
 ## fun render_bytes_text
 
 ```mach
-pub fun render_bytes_text(out: *writer.Writer, bytes: *u8, n: usize) err[fail.Fail];
+pub fun render_bytes_text(out: *io_writer.Writer, bytes: *u8, n: usize) err[fail.Fail];
 ```
 
 ## fun render_bytes_directive
@@ -321,13 +321,13 @@ pub fun sink_unaccounted(buf: *ByteBuf) usize;
 ## fun sink_set_mir
 
 ```mach
-pub fun sink_set_mir(buf: *ByteBuf, mi: *mir.MirInstr);
+pub fun sink_set_mir(buf: *ByteBuf, mi: *codegen_mir.MirInstr);
 ```
 
 ## fun buf_init
 
 ```mach
-pub fun buf_init(alloc: *A.Allocator) ByteBuf;
+pub fun buf_init(alloc: *std_allocator.Allocator) ByteBuf;
 ```
 
 ## fun buf_refuse
@@ -409,7 +409,7 @@ the instruction start it was published at
 ## def EncodeFunctionFn
 
 ```mach
-pub def EncodeFunctionFn: fun(*EncodeState, *mir.MirFunction) err[fail.Fail]
+pub def EncodeFunctionFn: fun(*EncodeState, *codegen_mir.MirFunction) err[fail.Fail]
 ```
 
 ## def PatchBranchFn
@@ -433,20 +433,20 @@ pub fun hooks_blank() EncodeHooks;
 ## fun module_has_oblivious
 
 ```mach
-pub fun module_has_oblivious(m: *mir.MirModule) bool;
+pub fun module_has_oblivious(m: *codegen_mir.MirModule) bool;
 ```
 
 ## fun encode_module
 
 ```mach
-pub fun encode_module(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.MirModule, hooks: *EncodeHooks) res[EncoderOutput, fail.Fail];
+pub fun encode_module(alloc: *std_allocator.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule, hooks: *EncodeHooks) res[EncoderOutput, fail.Fail];
 ```
 
 ## fun encode_module_asm
 
 ```mach
-pub fun encode_module_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.MirModule,
-hooks: *EncodeHooks, asm_out: *writer.Writer) res[EncoderOutput, fail.Fail];
+pub fun encode_module_asm(alloc: *std_allocator.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule,
+hooks: *EncodeHooks, asm_out: *io_writer.Writer) res[EncoderOutput, fail.Fail];
 ```
 
 ## fun entry_align
@@ -461,7 +461,7 @@ whichever is larger
 ## fun classify_refs
 
 ```mach
-pub fun classify_refs(mi: *mir.MirInstr, target_block: *u32, has_block: *bool,
+pub fun classify_refs(mi: *codegen_mir.MirInstr, target_block: *u32, has_block: *bool,
 sym: *intern.StrId, has_sym: *bool, sym_addend: *i64);
 ```
 
@@ -486,13 +486,13 @@ pub fun push_frame_step(st: *EncodeState, kind: u8, reg: u8, end_off: u32, value
 ## fun push_reloc
 
 ```mach
-pub fun push_reloc(st: *EncodeState, offset: u32, kind: of.RelocKind, sym: intern.StrId, addend: i64) err[fail.Fail];
+pub fun push_reloc(st: *EncodeState, offset: u32, kind: target_of.RelocKind, sym: intern.StrId, addend: i64) err[fail.Fail];
 ```
 
 ## fun push_inst_reloc
 
 ```mach
-pub fun push_inst_reloc(st: *EncodeState, offset: u32, kind: of.RelocKind, sym: intern.StrId, addend: i64,
+pub fun push_inst_reloc(st: *EncodeState, offset: u32, kind: target_of.RelocKind, sym: intern.StrId, addend: i64,
 inst_end: u8) err[fail.Fail];
 ```
 
@@ -507,14 +507,14 @@ pub fun bind_reloc_pair(st: *EncodeState, low_index: u32, high_index: u32) err[f
 ## fun bind_reloc_pair_site
 
 ```mach
-pub fun bind_reloc_pair_site(st: *EncodeState, high_kind: of.RelocKind,
+pub fun bind_reloc_pair_site(st: *EncodeState, high_kind: target_of.RelocKind,
 sym: intern.StrId, reloc_index: u32) err[fail.Fail];
 ```
 
 ## fun reloc_pair_site
 
 ```mach
-pub fun reloc_pair_site(st: *EncodeState, high_kind: of.RelocKind,
+pub fun reloc_pair_site(st: *EncodeState, high_kind: target_of.RelocKind,
 sym: intern.StrId) res[*RelocPairSite, fail.Fail];
 ```
 
@@ -557,7 +557,7 @@ pub fun push_block(st: *EncodeState, fn_text_base: u32, block_id: u32, offset: u
 ## fun set_fallthrough
 
 ```mach
-pub fun set_fallthrough(st: *EncodeState, f: *mir.MirFunction, bi: u32);
+pub fun set_fallthrough(st: *EncodeState, f: *codegen_mir.MirFunction, bi: u32);
 ```
 
 ## fun branch_falls_through
@@ -578,13 +578,13 @@ not jumps to the else arm on the inverse condition and falls into the then arm
 ## fun push_row
 
 ```mach
-pub fun push_row(st: *EncodeState, text_offset: u32, loc: source.SrcLoc) err[fail.Fail];
+pub fun push_row(st: *EncodeState, text_offset: u32, loc: lang_source.SrcLoc) err[fail.Fail];
 ```
 
 ## fun push_varloc
 
 ```mach
-pub fun push_varloc(st: *EncodeState, text_offset: u32, fn: *mir.MirFunction, vreg: u32, iid: u32) err[fail.Fail];
+pub fun push_varloc(st: *EncodeState, text_offset: u32, fn: *codegen_mir.MirFunction, vreg: u32, iid: u32) err[fail.Fail];
 ```
 
 ## fun push_const_varloc
@@ -598,7 +598,7 @@ a variable whose value is the constant `value` from here, held in no storage (#4
 ## fun push_cmp_varloc
 
 ```mach
-pub fun push_cmp_varloc(st: *EncodeState, text_offset: u32, fn: *mir.MirFunction, bind: *mir.MirDbgBinding) err[fail.Fail];
+pub fun push_cmp_varloc(st: *EncodeState, text_offset: u32, fn: *codegen_mir.MirFunction, bind: *codegen_mir.MirDbgBinding) err[fail.Fail];
 ```
 
 ## fun close_cmp_varlocs
@@ -618,7 +618,7 @@ a function's locations start closed and with no def outstanding
 ## fun emit_var_bindings
 
 ```mach
-pub fun emit_var_bindings(st: *EncodeState, fn: *mir.MirFunction, mi: *mir.MirInstr) err[fail.Fail];
+pub fun emit_var_bindings(st: *EncodeState, fn: *codegen_mir.MirFunction, mi: *codegen_mir.MirInstr) err[fail.Fail];
 ```
 
 the bindings of an instruction open at its start, and the ones it publishes
@@ -628,13 +628,13 @@ locations its def clobbered are ended
 ## fun state_blank
 
 ```mach
-pub fun state_blank(st: *EncodeState, alloc: *A.Allocator, model: *isa.MachineModel);
+pub fun state_blank(st: *EncodeState, alloc: *std_allocator.Allocator, model: *isa.MachineModel);
 ```
 
 ## fun consts_free
 
 ```mach
-pub fun consts_free(alloc: *A.Allocator, c: *ConstEntry, count: u32, cap: u32);
+pub fun consts_free(alloc: *std_allocator.Allocator, c: *ConstEntry, count: u32, cap: u32);
 ```
 
 ## fun block_offset
@@ -658,7 +658,7 @@ pub fun push_inline_pc(st: *EncodeState, text_offset: u32, inline_site: u32) err
 ## fun opcode_failure
 
 ```mach
-pub fun opcode_failure(st: *EncodeState, f: *mir.MirFunction, architecture: str, opcode: u32) err[fail.Fail];
+pub fun opcode_failure(st: *EncodeState, f: *codegen_mir.MirFunction, architecture: str, opcode: u32) err[fail.Fail];
 ```
 
 an opcode no encoder arm names is a member the selector produced outside the
@@ -667,6 +667,6 @@ native catalog: internal, named with the function it was found in
 ## fun asm_located_message
 
 ```mach
-pub fun asm_located_message(st: *EncodeState, loc: source.SrcLoc, msg: str) str;
+pub fun asm_located_message(st: *EncodeState, loc: lang_source.SrcLoc, msg: str) str;
 ```
 

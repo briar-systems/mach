@@ -99,13 +99,13 @@ pub fun merge_attrs(a: *Attrs, b: *Attrs) err[fail.Fail];
 ## fun serialize
 
 ```mach
-pub fun serialize(alloc: *A.Allocator, at: *Attrs, out_len: *u32) res[*u8, fail.Fail];
+pub fun serialize(alloc: *std_allocator.Allocator, at: *Attrs, out_len: *u32) res[*u8, fail.Fail];
 ```
 
 ## fun riscv64_build_attributes
 
 ```mach
-pub fun riscv64_build_attributes(alloc: *A.Allocator, xlen_bits: u32, extension_bits: u64, float_arg_bits: u32,
+pub fun riscv64_build_attributes(alloc: *std_allocator.Allocator, xlen_bits: u32, extension_bits: u64, float_arg_bits: u32,
 has_compressed: bool, out_len: *u32) res[*u8, fail.Fail];
 ```
 
@@ -124,7 +124,7 @@ the float ABI in the flags is checked where every input's flags are merged
 ## fun riscv64_merge_attributes
 
 ```mach
-pub fun riscv64_merge_attributes(alloc: *A.Allocator, a: *u8, a_len: u32,
+pub fun riscv64_merge_attributes(alloc: *std_allocator.Allocator, a: *u8, a_len: u32,
 b: *u8, b_len: u32, out_len: *u32) res[*u8, fail.Fail];
 ```
 

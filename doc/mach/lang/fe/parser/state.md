@@ -76,7 +76,7 @@ pub rec ListBuf[T];
 ## fun make
 
 ```mach
-pub fun make(tokens: *lexer.TokenStream, out: *ast.Ast, diags: *diagnostic.DiagnosticStore) Parser;
+pub fun make(tokens: *fe_lexer.TokenStream, out: *ast.Ast, diags: *diagnostic.DiagnosticStore) Parser;
 ```
 
 ## fun current
@@ -182,7 +182,7 @@ lose and take them with it; at the top they go to the sink, in order.
 ## fun diag_dnit
 
 ```mach
-pub fun diag_dnit(p: *Parser, alloc: *A.Allocator);
+pub fun diag_dnit(p: *Parser, alloc: *std_allocator.Allocator);
 ```
 
 ## fun error_at_current
@@ -235,7 +235,7 @@ pub fun fatal_ice_at(p: *Parser, span: token.Span, message: str);
 ## fun probed_init
 
 ```mach
-pub fun probed_init(p: *Parser, alloc: *A.Allocator);
+pub fun probed_init(p: *Parser, alloc: *std_allocator.Allocator);
 ```
 
 a token position where the index reading of `name[` has already been tried
@@ -246,7 +246,7 @@ every level and doubles with depth.
 ## fun probed_dnit
 
 ```mach
-pub fun probed_dnit(p: *Parser, alloc: *A.Allocator);
+pub fun probed_dnit(p: *Parser, alloc: *std_allocator.Allocator);
 ```
 
 ## fun index_reading_failed_here
@@ -312,55 +312,55 @@ pub fun span_of(start: token.Span, end: token.Span) token.Span;
 ## fun push_expr
 
 ```mach
-pub fun push_expr(p: *Parser, e: expr.Expr) id.ExprId;
+pub fun push_expr(p: *Parser, e: ast_expr.Expr) ast_id.ExprId;
 ```
 
 ## fun push_stmt
 
 ```mach
-pub fun push_stmt(p: *Parser, s: stmt.Stmt) id.StmtId;
+pub fun push_stmt(p: *Parser, s: ast_stmt.Stmt) ast_id.StmtId;
 ```
 
 ## fun push_decl
 
 ```mach
-pub fun push_decl(p: *Parser, d: decl.Decl) id.DeclId;
+pub fun push_decl(p: *Parser, d: ast_decl.Decl) ast_id.DeclId;
 ```
 
 ## fun push_type
 
 ```mach
-pub fun push_type(p: *Parser, t: type.Type) id.TypeId;
+pub fun push_type(p: *Parser, t: ast_type.Type) ast_id.TypeId;
 ```
 
 ## fun push_module
 
 ```mach
-pub fun push_module(p: *Parser, m: module.Module) id.ModuleNodeId;
+pub fun push_module(p: *Parser, m: ast_module.Module) ast_id.ModuleNodeId;
 ```
 
 ## fun push_decl_id
 
 ```mach
-pub fun push_decl_id(p: *Parser, id_: id.DeclId) u32;
+pub fun push_decl_id(p: *Parser, id_: ast_id.DeclId) u32;
 ```
 
 ## fun push_stmt_id
 
 ```mach
-pub fun push_stmt_id(p: *Parser, id_: id.StmtId) u32;
+pub fun push_stmt_id(p: *Parser, id_: ast_id.StmtId) u32;
 ```
 
 ## fun push_expr_id
 
 ```mach
-pub fun push_expr_id(p: *Parser, id_: id.ExprId) u32;
+pub fun push_expr_id(p: *Parser, id_: ast_id.ExprId) u32;
 ```
 
 ## fun push_type_id
 
 ```mach
-pub fun push_type_id(p: *Parser, id_: id.TypeId) u32;
+pub fun push_type_id(p: *Parser, id_: ast_id.TypeId) u32;
 ```
 
 ## fun list_buf_init
@@ -384,48 +384,48 @@ pub fun list_buf_free[T](p: *Parser, b: *ListBuf[T]);
 ## fun decl_id_buf_flush
 
 ```mach
-pub fun decl_id_buf_flush(p: *Parser, b: *ListBuf[id.DeclId], out_len: *u32) u32;
+pub fun decl_id_buf_flush(p: *Parser, b: *ListBuf[ast_id.DeclId], out_len: *u32) u32;
 ```
 
 ## fun stmt_id_buf_flush
 
 ```mach
-pub fun stmt_id_buf_flush(p: *Parser, b: *ListBuf[id.StmtId], out_len: *u32) u32;
+pub fun stmt_id_buf_flush(p: *Parser, b: *ListBuf[ast_id.StmtId], out_len: *u32) u32;
 ```
 
 ## fun expr_id_buf_flush
 
 ```mach
-pub fun expr_id_buf_flush(p: *Parser, b: *ListBuf[id.ExprId], out_len: *u32) u32;
+pub fun expr_id_buf_flush(p: *Parser, b: *ListBuf[ast_id.ExprId], out_len: *u32) u32;
 ```
 
 ## fun type_id_buf_flush
 
 ```mach
-pub fun type_id_buf_flush(p: *Parser, b: *ListBuf[id.TypeId], out_len: *u32) u32;
+pub fun type_id_buf_flush(p: *Parser, b: *ListBuf[ast_id.TypeId], out_len: *u32) u32;
 ```
 
 ## fun field_init_buf_flush
 
 ```mach
-pub fun field_init_buf_flush(p: *Parser, b: *ListBuf[expr.FieldInit], out_len: *u32) u32;
+pub fun field_init_buf_flush(p: *Parser, b: *ListBuf[ast_expr.FieldInit], out_len: *u32) u32;
 ```
 
 ## fun typed_name_buf_flush
 
 ```mach
-pub fun typed_name_buf_flush(p: *Parser, b: *ListBuf[decl.TypedName], out_len: *u32) u32;
+pub fun typed_name_buf_flush(p: *Parser, b: *ListBuf[ast_decl.TypedName], out_len: *u32) u32;
 ```
 
 ## fun tag_case_buf_flush
 
 ```mach
-pub fun tag_case_buf_flush(p: *Parser, b: *ListBuf[decl.TagCase], out_len: *u32) u32;
+pub fun tag_case_buf_flush(p: *Parser, b: *ListBuf[ast_decl.TagCase], out_len: *u32) u32;
 ```
 
 ## fun comptime_branch_buf_flush
 
 ```mach
-pub fun comptime_branch_buf_flush(p: *Parser, b: *ListBuf[decl.ComptimeBranch], out_len: *u32) u32;
+pub fun comptime_branch_buf_flush(p: *Parser, b: *ListBuf[ast_decl.ComptimeBranch], out_len: *u32) u32;
 ```
 

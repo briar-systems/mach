@@ -9,25 +9,25 @@ pub rec Rewrite;
 ## fun rewrite_init
 
 ```mach
-pub fun rewrite_init(rw: *Rewrite, a: *A.Allocator, len: u32) err[fail.Fail];
+pub fun rewrite_init(rw: *Rewrite, a: *std_allocator.Allocator, len: u32) err[fail.Fail];
 ```
 
 ## fun rewrite_dnit
 
 ```mach
-pub fun rewrite_dnit(rw: *Rewrite, a: *A.Allocator);
+pub fun rewrite_dnit(rw: *Rewrite, a: *std_allocator.Allocator);
 ```
 
 ## fun replace_value
 
 ```mach
-pub fun replace_value(rw: *Rewrite, iid: id.InstructionId, v: value.Value);
+pub fun replace_value(rw: *Rewrite, iid: ir_id.InstructionId, v: value.Value);
 ```
 
 ## fun rewrite_has
 
 ```mach
-pub fun rewrite_has(rw: *Rewrite, iid: id.InstructionId) bool;
+pub fun rewrite_has(rw: *Rewrite, iid: ir_id.InstructionId) bool;
 ```
 
 ## fun rewrite_resolve
@@ -45,7 +45,7 @@ pub fun substitute_for_use(sub: value.Value, use: value.Value) value.Value;
 ## fun rewrite_apply
 
 ```mach
-pub fun rewrite_apply(fn: *ir.Function, rw: *Rewrite) bool;
+pub fun rewrite_apply(fn: *me_ir.Function, rw: *Rewrite) bool;
 ```
 
 rewrites every operand that reads a replaced instruction and answers whether
@@ -54,14 +54,14 @@ any did: a replacement nothing reads leaves the function as it was
 ## fun replace_uses
 
 ```mach
-pub fun replace_uses(fn: *ir.Function, old_id: id.InstructionId, replacement: value.Value);
+pub fun replace_uses(fn: *me_ir.Function, old_id: ir_id.InstructionId, replacement: value.Value);
 ```
 
 ## fun erase_marked
 
 ```mach
-pub fun erase_marked[T](m: *ir.Module, fn: *ir.Function, alloc: *A.Allocator, ctx: *T,
-test: fun(*T, id.InstructionId) bool) res[bool, fail.Fail];
+pub fun erase_marked[T](m: *me_ir.Module, fn: *me_ir.Function, alloc: *std_allocator.Allocator, ctx: *T,
+test: fun(*T, ir_id.InstructionId) bool) res[bool, fail.Fail];
 ```
 
 every allocation the erasure needs happens in the salvage phase, before a
@@ -73,12 +73,12 @@ holds the salvage's own scratch (the set of listed, erased instructions)
 ## fun clone_instruction
 
 ```mach
-pub fun clone_instruction(m: *ir.Module, dst_fn: *ir.Function, src: *instruction.Instruction) res[id.InstructionId, fail.Fail];
+pub fun clone_instruction(m: *me_ir.Module, dst_fn: *me_ir.Function, src: *ir_instruction.Instruction) res[ir_id.InstructionId, fail.Fail];
 ```
 
 ## fun clone_instruction_complete
 
 ```mach
-pub fun clone_instruction_complete(m: *ir.Module, src_fn: *ir.Function, dst_fn: *ir.Function, src_iid: id.InstructionId, instr_map: *u32, map_len: u32) res[id.InstructionId, fail.Fail];
+pub fun clone_instruction_complete(m: *me_ir.Module, src_fn: *me_ir.Function, dst_fn: *me_ir.Function, src_iid: ir_id.InstructionId, instr_map: *u32, map_len: u32) res[ir_id.InstructionId, fail.Fail];
 ```
 

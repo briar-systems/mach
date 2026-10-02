@@ -101,7 +101,7 @@ place, the innermost site knowing best, and one with no kind points nowhere
 ## fun placed
 
 ```mach
-pub fun placed(a: *A.Allocator, f: Fail, path: str, text: str) Fail;
+pub fun placed(a: *std_allocator.Allocator, f: Fail, path: str, text: str) Fail;
 ```
 
 the same failure with its ranges resolved in `text`, the file at `path`, as
@@ -111,7 +111,7 @@ failure without a range, or one already resolved, is returned as it is
 ## fun placed_bytes
 
 ```mach
-pub fun placed_bytes(a: *A.Allocator, f: Fail, path: str, data: *u8, n: usize) Fail;
+pub fun placed_bytes(a: *std_allocator.Allocator, f: Fail, path: str, data: *u8, n: usize) Fail;
 ```
 
 `placed` over the `n` bytes at `data`, for a file that may hold a NUL
@@ -119,7 +119,7 @@ pub fun placed_bytes(a: *A.Allocator, f: Fail, path: str, data: *u8, n: usize) F
 ## fun at
 
 ```mach
-pub fun at(a: *A.Allocator, f: Fail, p: Place) Fail;
+pub fun at(a: *std_allocator.Allocator, f: Fail, p: Place) Fail;
 ```
 
 the same failure pointing at `p`, a place a model recorded: one without a
@@ -129,7 +129,7 @@ copies it. a failure that already points somewhere keeps its place
 ## fun with_related
 
 ```mach
-pub fun with_related(a: *A.Allocator, f: Fail, ps: *Place, n: usize) Fail;
+pub fun with_related(a: *std_allocator.Allocator, f: Fail, ps: *Place, n: usize) Fail;
 ```
 
 the same failure naming the `n` places at `ps` as its related places, in
@@ -148,7 +148,7 @@ the related places a failure names, none for one that names no other
 ## fun located
 
 ```mach
-pub fun located(a: *A.Allocator, f: Fail, at: Place) Fail;
+pub fun located(a: *std_allocator.Allocator, f: Fail, at: Place) Fail;
 ```
 
 the same failure pointing at `at`, its path copied through `a` so the failure
@@ -180,7 +180,7 @@ starts: the offset of each line's first byte, the first line's 0
 ## fun lines_of
 
 ```mach
-pub fun lines_of(a: *A.Allocator, path: str, data: *u8, n: usize) res[Lines, A.Error];
+pub fun lines_of(a: *std_allocator.Allocator, path: str, data: *u8, n: usize) res[Lines, std_allocator.Error];
 ```
 
 the lines of the `n` bytes at `data`, the file at `path`; released with `lines_dnit`
@@ -225,7 +225,7 @@ diagnostics carry their own
 ## fun refused
 
 ```mach
-pub fun refused(e: A.Error) Fail;
+pub fun refused(e: std_allocator.Error) Fail;
 ```
 
 an allocation refusal stays an internal failure (exit 2), as it always has;
@@ -234,7 +234,7 @@ reclassifying it as environmental changes exit codes and is the CLI lane's
 ## fun alloc_text
 
 ```mach
-pub fun alloc_text(e: A.Error) str;
+pub fun alloc_text(e: std_allocator.Error) str;
 ```
 
 the text a std refusal renders as when a driver operation reports it: the
@@ -256,25 +256,25 @@ pub fun read_text(e: reader.ReadError) str;
 ## fun write_text
 
 ```mach
-pub fun write_text(e: writer.WriteError) str;
+pub fun write_text(e: io_writer.WriteError) str;
 ```
 
 ## fun fs_text
 
 ```mach
-pub fun fs_text(e: fs.FsError) str;
+pub fun fs_text(e: std_filesystem.FsError) str;
 ```
 
 ## fun str_text
 
 ```mach
-pub fun str_text(e: string.StrError) str;
+pub fun str_text(e: types_string.StrError) str;
 ```
 
 ## fun format_text
 
 ```mach
-pub fun format_text(e: format.FormatError) str;
+pub fun format_text(e: std_format.FormatError) str;
 ```
 
 ## fun toml_text
@@ -347,7 +347,7 @@ kept, the text replaced (a caller that copies the message into storage it owns)
 ## fun retain
 
 ```mach
-pub fun retain(a: *A.Allocator, f: Fail) res[Fail, A.Error];
+pub fun retain(a: *std_allocator.Allocator, f: Fail) res[Fail, std_allocator.Error];
 ```
 
 a copy of the failure that owns its text and its places through `a`, for a
@@ -357,7 +357,7 @@ failure that outlives the storage its message was made in; released with
 ## fun release
 
 ```mach
-pub fun release(a: *A.Allocator, f: Fail);
+pub fun release(a: *std_allocator.Allocator, f: Fail);
 ```
 
 release what a retained failure owns through `a`: its text and its places
@@ -365,7 +365,7 @@ release what a retained failure owns through `a`: its text and its places
 ## fun retain_places
 
 ```mach
-pub fun retain_places(a: *A.Allocator, f: Fail) res[Fail, A.Error];
+pub fun retain_places(a: *std_allocator.Allocator, f: Fail) res[Fail, std_allocator.Error];
 ```
 
 a copy of the failure whose places, its own path and every related place,
@@ -375,7 +375,7 @@ text apart. released with `release_places`
 ## fun release_places
 
 ```mach
-pub fun release_places(a: *A.Allocator, f: Fail);
+pub fun release_places(a: *std_allocator.Allocator, f: Fail);
 ```
 
 release the places a failure owns through `a`, as `retain_places` made them
@@ -401,7 +401,7 @@ same related array, as a holder that copied them once sees its own copy
 ## fun catalog
 
 ```mach
-pub fun catalog(a: *A.Allocator, c: fail.Catalog) Fail;
+pub fun catalog(a: *std_allocator.Allocator, c: fail.Catalog) Fail;
 ```
 
 the closed-catalog policy lifted into the driver's kind: an input or
@@ -411,7 +411,7 @@ message belongs to the caller's allocator
 ## fun unknown_catalog
 
 ```mach
-pub fun unknown_catalog(a: *A.Allocator, catalog_name: str, tag: u32) Fail;
+pub fun unknown_catalog(a: *std_allocator.Allocator, catalog_name: str, tag: u32) Fail;
 ```
 
 ## fun from_fail
@@ -578,7 +578,7 @@ events: everything recorded, in order
 ## fun outcome_init
 
 ```mach
-pub fun outcome_init(oa: *A.Allocator) BuildOutcome;
+pub fun outcome_init(oa: *std_allocator.Allocator) BuildOutcome;
 ```
 
 an empty outcome whose records `oa` will own
@@ -594,7 +594,7 @@ release an outcome and everything it recorded; nil is a no-op
 ## fun record_artifact
 
 ```mach
-pub fun record_artifact(bo: *BuildOutcome, kind: ArtifactKind, path: str) err[A.Error];
+pub fun record_artifact(bo: *BuildOutcome, kind: ArtifactKind, path: str) err[std_allocator.Error];
 ```
 
 every record_* copies what it stores into the outcome's allocator; a refused
@@ -604,7 +604,7 @@ made before the refusal
 ## fun record_test
 
 ```mach
-pub fun record_test(bo: *BuildOutcome, t: TestArtifact) err[A.Error];
+pub fun record_test(bo: *BuildOutcome, t: TestArtifact) err[std_allocator.Error];
 ```
 
 t's text is borrowed; the outcome keeps its own copy. a nil text stays nil
@@ -612,13 +612,13 @@ t's text is borrowed; the outcome keeps its own copy. a nil text stays nil
 ## fun record_unit
 
 ```mach
-pub fun record_unit(bo: *BuildOutcome, artifact: str, target: str, verb: str, has_artifact: bool) err[A.Error];
+pub fun record_unit(bo: *BuildOutcome, artifact: str, target: str, verb: str, has_artifact: bool) err[std_allocator.Error];
 ```
 
 ## fun record_fail
 
 ```mach
-pub fun record_fail(bo: *BuildOutcome, f: *Fail, origin: diagnostic.Origin) err[A.Error];
+pub fun record_fail(bo: *BuildOutcome, f: *Fail, origin: diagnostic.Origin) err[std_allocator.Error];
 ```
 
 the failure is copied whole: its text into the outcome's allocator
@@ -628,7 +628,7 @@ origin: the phase the failure is reported under
 ## fun record_diagnostics
 
 ```mach
-pub fun record_diagnostics(bo: *BuildOutcome, sources: *source.SourceMap, diags: *diagnostic.DiagnosticStore) err[Fail];
+pub fun record_diagnostics(bo: *BuildOutcome, sources: *lang_source.SourceMap, diags: *diagnostic.DiagnosticStore) err[Fail];
 ```
 
 the batch is a composite of two subsystems' snapshots, so its refusal is
@@ -652,7 +652,7 @@ a reported or user failure is the user's; the severity never regresses
 ## fun merge
 
 ```mach
-pub fun merge(agg: *BuildOutcome, unit: *BuildOutcome) err[A.Error];
+pub fun merge(agg: *BuildOutcome, unit: *BuildOutcome) err[std_allocator.Error];
 ```
 
 capacity is reserved for all three transfers before any element moves, so
@@ -667,12 +667,12 @@ pub rec GateTally;
 ## fun gate_tally_init
 
 ```mach
-pub fun gate_tally_init(a: *A.Allocator) GateTally;
+pub fun gate_tally_init(a: *std_allocator.Allocator) GateTally;
 ```
 
 ## fun record_gate
 
 ```mach
-pub fun record_gate(gt: *GateTally, a: *A.Allocator, r: validation.ValidationGateResult) err[A.Error];
+pub fun record_gate(gt: *GateTally, a: *std_allocator.Allocator, r: validation.ValidationGateResult) err[std_allocator.Error];
 ```
 

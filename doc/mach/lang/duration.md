@@ -11,7 +11,7 @@ the accepted forms of a duration, for error messages
 ## fun parse
 
 ```mach
-pub fun parse(s: *u8) opt[du.Duration];
+pub fun parse(s: *u8) opt[chrono_duration.Duration];
 ```
 
 parse a duration: a positive decimal integer followed by one of the
@@ -33,7 +33,7 @@ unit: "h", "m", "s" or "ms"; "ns" when d is not a whole number of milliseconds
 ## fun text
 
 ```mach
-pub fun text(d: du.Duration) Text;
+pub fun text(d: chrono_duration.Duration) Text;
 ```
 
 render d in the form parse reads back

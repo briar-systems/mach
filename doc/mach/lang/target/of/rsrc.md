@@ -39,7 +39,7 @@ pub rec RsrcImage;
 ## fun build
 
 ```mach
-pub fun build(alloc: *A.Allocator, icon: *u8, icon_len: usize, manifest: *u8, manifest_len: usize,
+pub fun build(alloc: *std_allocator.Allocator, icon: *u8, icon_len: usize, manifest: *u8, manifest_len: usize,
 version: str, internal_name: str, original_filename: str,
 product_name: str) res[RsrcImage, fail.Fail];
 ```
@@ -59,6 +59,6 @@ pub fun emit(img: *RsrcImage, buf: *u8, off: usize, base_rva: u64) res[usize, fa
 ## fun dnit
 
 ```mach
-pub fun dnit(alloc: *A.Allocator, img: *RsrcImage);
+pub fun dnit(alloc: *std_allocator.Allocator, img: *RsrcImage);
 ```
 

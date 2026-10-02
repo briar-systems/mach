@@ -2824,7 +2824,7 @@ pub rec Vec;
 ## fun builder_init
 
 ```mach
-pub fun builder_init(alloc: *A.Allocator) Builder;
+pub fun builder_init(alloc: *std_allocator.Allocator) Builder;
 ```
 
 ## fun builder_dnit

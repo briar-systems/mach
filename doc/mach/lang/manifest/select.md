@@ -70,7 +70,7 @@ native: the target's `os` and `isa` are the host's, so its programs run here
 ## fun selectors_init
 
 ```mach
-pub fun selectors_init(alloc: *A.Allocator) Selectors;
+pub fun selectors_init(alloc: *std_allocator.Allocator) Selectors;
 ```
 
 empty selectors: every axis takes the manifest's default
@@ -80,7 +80,7 @@ alloc: backs the three pattern vectors
 ## fun host_label
 
 ```mach
-pub fun host_label(alloc: *A.Allocator) str;
+pub fun host_label(alloc: *std_allocator.Allocator) str;
 ```
 
 the host as `mach info` names it, `<os>-<isa>`, which a cell is native to when
@@ -89,7 +89,7 @@ its target's os and isa are these
 ## fun cell_label
 
 ```mach
-pub fun cell_label(alloc: *A.Allocator, c: *Cell) str;
+pub fun cell_label(alloc: *std_allocator.Allocator, c: *Cell) str;
 ```
 
 the cell as a person names it: `<artifact> on <target> (<profile>)`
@@ -97,7 +97,7 @@ the cell as a person names it: `<artifact> on <target> (<profile>)`
 ## fun cell_labels
 
 ```mach
-pub fun cell_labels(alloc: *A.Allocator, cells: *Vector[Cell]) str;
+pub fun cell_labels(alloc: *std_allocator.Allocator, cells: *Vector[Cell]) str;
 ```
 
 every cell's label, comma separated, for a refusal that names the selection
@@ -105,7 +105,7 @@ every cell's label, comma separated, for a refusal that names the selection
 ## fun single_selection_msg
 
 ```mach
-pub fun single_selection_msg(alloc: *A.Allocator, what: str, cells: *Vector[Cell]) str;
+pub fun single_selection_msg(alloc: *std_allocator.Allocator, what: str, cells: *Vector[Cell]) str;
 ```
 
 the refusal of an option or command that needs one (artifact, target, profile)
@@ -118,7 +118,7 @@ cells: the resolved cells
 ## fun resolve_cells
 
 ```mach
-pub fun resolve_cells(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, s: *Selectors,
+pub fun resolve_cells(alloc: *std_allocator.Allocator, itn: *intern.Interner, m: *Manifest, s: *Selectors,
 mode: ArtifactDefault) res[Vector[Cell], outcome.Fail];
 ```
 

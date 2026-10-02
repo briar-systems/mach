@@ -17,6 +17,6 @@ outlives its proof, and a count this pass saturated proves on a later run
 ## fun run_in
 
 ```mach
-pub fun run_in(m: *ir.Module, workspace: *scratch.Workspace) res[bool, fail.Fail];
+pub fun run_in(m: *me_ir.Module, workspace: *scratch.Workspace) res[bool, fail.Fail];
 ```
 

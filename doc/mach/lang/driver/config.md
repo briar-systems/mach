@@ -9,7 +9,7 @@ pub rec RunArtifact;
 ## fun resolve_run_artifact
 
 ```mach
-pub fun resolve_run_artifact(alloc: *A.Allocator, project_root: str, selectors: *manifest.Selectors,
+pub fun resolve_run_artifact(alloc: *std_allocator.Allocator, project_root: str, selectors: *manifest.Selectors,
 output_override: str) res[RunArtifact, outcome.Fail];
 ```
 
@@ -66,7 +66,7 @@ pub fun wildcard_match(pat: str, name: str) bool;
 ## fun validate_contained_ancestors
 
 ```mach
-pub fun validate_contained_ancestors(alloc: *A.Allocator, root: str, rel: str, label: str) err[outcome.Fail];
+pub fun validate_contained_ancestors(alloc: *std_allocator.Allocator, root: str, rel: str, label: str) err[outcome.Fail];
 ```
 
 ## fun glob_shape_ok
@@ -78,7 +78,7 @@ pub fun glob_shape_ok(pattern: str) bool;
 ## fun execute_steps
 
 ```mach
-pub fun execute_steps(a: *A.Allocator, p: *project.Project) err[outcome.Fail];
+pub fun execute_steps(a: *std_allocator.Allocator, p: *project.Project) err[outcome.Fail];
 ```
 
 run the declaring project's prerequisite steps for the configured cell, in its
@@ -88,7 +88,7 @@ in the root's output tree through an absolute `{project.out}`
 ## fun dep_out_home
 
 ```mach
-pub fun dep_out_home(alloc: *A.Allocator, project_root: str, root_out: str) res[str, outcome.Fail];
+pub fun dep_out_home(alloc: *std_allocator.Allocator, project_root: str, root_out: str) res[str, outcome.Fail];
 ```
 
 ## rec DependencyStep

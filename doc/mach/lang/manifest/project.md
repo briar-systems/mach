@@ -15,7 +15,7 @@ pub fun host_os_name() str;
 ## fun host_tuple
 
 ```mach
-pub fun host_tuple(alloc: *A.Allocator) str;
+pub fun host_tuple(alloc: *std_allocator.Allocator) str;
 ```
 
 the host as "<isa>-<os>", e.g. "x86_64-linux"
@@ -27,19 +27,19 @@ ret: the formatted tuple; on allocation failure the literal "out of memory",
 ## fun parse_project
 
 ```mach
-pub fun parse_project(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[outcome.Fail];
+pub fun parse_project(alloc: *std_allocator.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[outcome.Fail];
 ```
 
 ## fun parse_targets
 
 ```mach
-pub fun parse_targets(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[outcome.Fail];
+pub fun parse_targets(alloc: *std_allocator.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[outcome.Fail];
 ```
 
 ## fun duplicate_profiles
 
 ```mach
-pub fun duplicate_profiles(alloc: *A.Allocator, m: *Manifest, message: str) outcome.Fail;
+pub fun duplicate_profiles(alloc: *std_allocator.Allocator, m: *Manifest, message: str) outcome.Fail;
 ```
 
 a refusal of more than one `default = true` profile, pointing at the first
@@ -54,7 +54,7 @@ pub val MISSING_PROFILE_MESSAGE: str = "mach.toml: no [profile.<name>] table is 
 ## fun parse_profiles
 
 ```mach
-pub fun parse_profiles(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, as_root: bool) err[outcome.Fail];
+pub fun parse_profiles(alloc: *std_allocator.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, as_root: bool) err[outcome.Fail];
 ```
 
 the `[profile.*]` tables. a root manifest declares at least one; a dependency
@@ -101,6 +101,6 @@ is only ever selected by name
 ## fun make_native_target
 
 ```mach
-pub fun make_native_target(alloc: *A.Allocator, itn: *intern.Interner) res[*TargetDef, outcome.Fail];
+pub fun make_native_target(alloc: *std_allocator.Allocator, itn: *intern.Interner) res[*TargetDef, outcome.Fail];
 ```
 

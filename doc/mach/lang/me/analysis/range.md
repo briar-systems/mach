@@ -38,8 +38,8 @@ pub rec RangeAnalysis;
 ## fun init
 
 ```mach
-pub fun init(ra: *RangeAnalysis, fn: *ir.Function, types: *ir_type.IrTypeTable,
-la: *loops.LoopAnalysis, alloc: *A.Allocator) err[fail.Fail];
+pub fun init(ra: *RangeAnalysis, fn: *me_ir.Function, types: *ir_type.IrTypeTable,
+la: *loops.LoopAnalysis, alloc: *std_allocator.Allocator) err[fail.Fail];
 ```
 
 the analysis reads the loop analysis of the same function and owns nothing
@@ -54,7 +54,7 @@ pub fun dnit(ra: *RangeAnalysis);
 ## fun range_at
 
 ```mach
-pub fun range_at(ra: *RangeAnalysis, v: value.Value, at: id.BlockId) Range;
+pub fun range_at(ra: *RangeAnalysis, v: value.Value, at: ir_id.BlockId) Range;
 ```
 
 the values `v` holds wherever block `at` reads it
@@ -62,7 +62,7 @@ the values `v` holds wherever block `at` reads it
 ## fun below
 
 ```mach
-pub fun below(ra: *RangeAnalysis, v: value.Value, at: id.BlockId, limit: u64) bool;
+pub fun below(ra: *RangeAnalysis, v: value.Value, at: ir_id.BlockId, limit: u64) bool;
 ```
 
 whether `v` is below `limit` wherever `at` reads it

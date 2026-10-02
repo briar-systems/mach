@@ -33,12 +33,12 @@ pub val LINUX_RISCV64_DYNAMIC_LINKER: str = "/lib/ld-linux-riscv64-lp64d.so.1"
 ## fun linux_va_list
 
 ```mach
-pub fun linux_va_list(arch_id: u32) opt[os.VaList];
+pub fun linux_va_list(arch_id: u32) opt[lang_target_os.VaList];
 ```
 
 ## fun register_linux
 
 ```mach
-pub fun register_linux(reg: *os.OsRegistry) err[fail.Fail];
+pub fun register_linux(reg: *lang_target_os.OsRegistry) err[fail.Fail];
 ```
 

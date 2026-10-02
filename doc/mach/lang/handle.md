@@ -4,7 +4,7 @@
 
 ```mach
 pub tag Error: u8 {
-    alloc: A.Error;
+    alloc: std_allocator.Error;
     absent;
     foreign;
     stale;
@@ -38,7 +38,7 @@ pub rec ChunkEditor[T];
 ## fun chunk_init
 
 ```mach
-pub fun chunk_init[T](a: *A.Allocator) StableChunks[T];
+pub fun chunk_init[T](a: *std_allocator.Allocator) StableChunks[T];
 ```
 
 ## fun chunk_dnit
@@ -112,7 +112,7 @@ pub rec HandleEditor[T, Domain];
 ## fun table_init
 
 ```mach
-pub fun table_init[T, Domain](a: *A.Allocator) res[HandleTable[T, Domain], Error];
+pub fun table_init[T, Domain](a: *std_allocator.Allocator) res[HandleTable[T, Domain], Error];
 ```
 
 ## fun table_dnit

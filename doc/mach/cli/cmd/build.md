@@ -15,7 +15,7 @@ plans: one plan per profile; each plans that profile's cells
 ## fun plan_invocation
 
 ```mach
-pub fun plan_invocation(a: *A.Allocator, root: str, cli: *args.CliArgs, goal: request.BuildGoal,
+pub fun plan_invocation(a: *std_allocator.Allocator, root: str, cli: *args.CliArgs, goal: request.BuildGoal,
 mode: manifest.ArtifactDefault, configure_deps: bool, ps: *session.Session) res[Planned, outcome.Fail];
 ```
 
@@ -40,7 +40,7 @@ ret: the plans, or a Fail: internal for session or registry setup, user for mani
 ## fun announce_profile
 
 ```mach
-pub fun announce_profile(r: *cli_diag.Report, planned: *Planned, bp: *plan.BuildPlan, quiet: bool);
+pub fun announce_profile(r: *cli_diag.Report, planned: *Planned, bp: *build_plan.BuildPlan, quiet: bool);
 ```
 
 name the profile a plan builds before its progress lines, when a selection

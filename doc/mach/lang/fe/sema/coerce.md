@@ -39,13 +39,13 @@ pub fun out_of_range(to: type.TypeId, value: wide.Wide, negated: bool, bounds: t
 ## fun try_coerce_literal
 
 ```mach
-pub fun try_coerce_literal(sc: *context.SemaContext, eid: id.ExprId, to: type.TypeId) CoerceResult;
+pub fun try_coerce_literal(sc: *sema_context.SemaContext, eid: ast_id.ExprId, to: type.TypeId) CoerceResult;
 ```
 
 ## fun probe_literal_range
 
 ```mach
-pub fun probe_literal_range(sc: *context.SemaContext, eid: id.ExprId, to: type.TypeId) CoerceResult;
+pub fun probe_literal_range(sc: *sema_context.SemaContext, eid: ast_id.ExprId, to: type.TypeId) CoerceResult;
 ```
 
 ask whether a literal-shaped expression fits the integer range of `to` without
@@ -60,7 +60,7 @@ ret: the probe result; never commits an expression type
 ## fun is_untyped_int_literal
 
 ```mach
-pub fun is_untyped_int_literal(sc: *context.SemaContext, eid: id.ExprId) bool;
+pub fun is_untyped_int_literal(sc: *sema_context.SemaContext, eid: ast_id.ExprId) bool;
 ```
 
 whether an expression is built only from unsuffixed integer literals under the
@@ -73,13 +73,13 @@ ret: true when every leaf is an unsuffixed integer literal
 ## fun int_bounds_of
 
 ```mach
-pub fun int_bounds_of(sc: *context.SemaContext, to: type.TypeId) opt[type.IntRange];
+pub fun int_bounds_of(sc: *sema_context.SemaContext, to: type.TypeId) opt[type.IntRange];
 ```
 
 ## fun check_float_literal
 
 ```mach
-pub fun check_float_literal(sc: *context.SemaContext, eid: id.ExprId, ty: type.TypeId);
+pub fun check_float_literal(sc: *sema_context.SemaContext, eid: ast_id.ExprId, ty: type.TypeId);
 ```
 
 the float literal rule, applied once the literal's type is final. the literal rounds to
@@ -94,6 +94,6 @@ ty: its final type; anything but a float type is left alone
 ## fun is_assignable
 
 ```mach
-pub fun is_assignable(sc: *context.SemaContext, from: type.TypeId, to: type.TypeId) bool;
+pub fun is_assignable(sc: *sema_context.SemaContext, from: type.TypeId, to: type.TypeId) bool;
 ```
 

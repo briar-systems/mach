@@ -39,7 +39,7 @@ pub rec Graph;
 ## fun init
 
 ```mach
-pub fun init(a: *A.Allocator) Graph;
+pub fun init(a: *std_allocator.Allocator) Graph;
 ```
 
 ## fun dnit
@@ -51,7 +51,7 @@ pub fun dnit(graph: *Graph);
 ## fun capture
 
 ```mach
-pub fun capture[T](s: *session.Session, a: *A.Allocator, roots: *Roots, count: usize, mode: CaptureMode, defs: *isa.TargetDefs, ctx: *T,
+pub fun capture[T](s: *session.Session, a: *std_allocator.Allocator, roots: *Roots, count: usize, mode: CaptureMode, defs: *isa.TargetDefs, ctx: *T,
 prepare: fun(*T, type.TypeId) err[fail.Fail]) res[Graph, fail.Fail];
 ```
 

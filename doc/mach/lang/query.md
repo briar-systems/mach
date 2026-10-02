@@ -221,7 +221,7 @@ pub val SHARD_METADATA: ShardRole = 2
 ## def FinalizeFn
 
 ```mach
-pub def FinalizeFn: fun(*u8, u32, *A.Allocator)
+pub def FinalizeFn: fun(*u8, u32, *std_allocator.Allocator)
 ```
 
 ## rec MetadataRevision
@@ -341,7 +341,7 @@ pub rec QueryRuntime[T];
 ## fun init
 
 ```mach
-pub fun init(a: *A.Allocator) res[QueryDb, fail.Fail];
+pub fun init(a: *std_allocator.Allocator) res[QueryDb, fail.Fail];
 ```
 
 a database over a caller-owned allocator; register every kind before the first begin
@@ -386,7 +386,7 @@ equal: fun(*u8, u32, *u8, u32) bool) err[fail.Fail];
 ## fun runtime
 
 ```mach
-pub fun runtime[T](db: *QueryDb, compute: fun(*T, QueryKind, u64, *A.Allocator, *diagnostic.DiagnosticStore) res[QueryOutput, fail.Fail]) res[QueryRuntime[T], fail.Fail];
+pub fun runtime[T](db: *QueryDb, compute: fun(*T, QueryKind, u64, *std_allocator.Allocator, *diagnostic.DiagnosticStore) res[QueryOutput, fail.Fail]) res[QueryRuntime[T], fail.Fail];
 ```
 
 ## fun begin
@@ -444,7 +444,7 @@ operation: the ended operation's handle
 
 ```mach
 pub fun collect(db: *QueryDb, operation: Operation, roots: *QueryKey, count: usize,
-a: *A.Allocator) res[*Presentation, fail.Fail];
+a: *std_allocator.Allocator) res[*Presentation, fail.Fail];
 ```
 
 collect the ended operation's presentation: the diagnostics of every product reachable
@@ -550,7 +550,7 @@ validation may refresh dependencies but never computes the requested product
 
 ```mach
 pub fun prepare[T](rt: *QueryRuntime[T], ctx: *T, kind: QueryKind, key: u64,
-compute: fun(*T, QueryKind, u64, *A.Allocator, *diagnostic.DiagnosticStore) res[QueryOutput, fail.Fail]) res[PreparedQuery, fail.Fail];
+compute: fun(*T, QueryKind, u64, *std_allocator.Allocator, *diagnostic.DiagnosticStore) res[QueryOutput, fail.Fail]) res[PreparedQuery, fail.Fail];
 ```
 
 ## fun prepared_view

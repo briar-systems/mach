@@ -3,23 +3,23 @@
 ## fun is_local_got_kind
 
 ```mach
-pub fun is_local_got_kind(kind: of.RelocKind) bool;
+pub fun is_local_got_kind(kind: target_of.RelocKind) bool;
 ```
 
 ## fun reloc_traits
 
 ```mach
-pub fun reloc_traits(kind: of.RelocKind,
-section_kind: of.SectionKind,
-codegen_image: bool) res[rel.RelocTraits, rel.RelocError];
+pub fun reloc_traits(kind: target_of.RelocKind,
+section_kind: target_of.SectionKind,
+codegen_image: bool) res[of_reloc.RelocTraits, of_reloc.RelocError];
 ```
 
 ## fun apply_reloc
 
 ```mach
-pub fun apply_reloc(kind: of.RelocKind, dst: *u8, patch_off: u32, sec_len: u32,
-target: rel.RelocTarget, addend: i64, patch_va: u64,
-image_base: u64) res[bool, rel.RelocError];
+pub fun apply_reloc(kind: target_of.RelocKind, dst: *u8, patch_off: u32, sec_len: u32,
+target: of_reloc.RelocTarget, addend: i64, patch_va: u64,
+image_base: u64) res[bool, of_reloc.RelocError];
 ```
 
 ## fun jal20_ok
@@ -39,14 +39,14 @@ the j-type immediate: imm[20] at 31, imm[10:1] at 30:21, imm[11] at 20, imm[19:1
 ## fun resolve_riscv_pcrel_pairs
 
 ```mach
-pub fun resolve_riscv_pcrel_pairs(alloc: *A.Allocator,
-img: *of.ObjectImage) err[fail.Fail];
+pub fun resolve_riscv_pcrel_pairs(alloc: *std_allocator.Allocator,
+img: *target_of.ObjectImage) err[fail.Fail];
 ```
 
 ## fun resolve_riscv_reloc_operand
 
 ```mach
-pub fun resolve_riscv_reloc_operand(img: *of.ObjectImage,
-reloc_index: u32) res[of.RelocOperand, fail.Fail];
+pub fun resolve_riscv_reloc_operand(img: *target_of.ObjectImage,
+reloc_index: u32) res[target_of.RelocOperand, fail.Fail];
 ```
 

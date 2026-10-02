@@ -3,7 +3,7 @@
 ## fun run
 
 ```mach
-pub fun run(m: *ir.Module, workspace: *scratch.Workspace) res[bool, fail.Fail];
+pub fun run(m: *me_ir.Module, workspace: *scratch.Workspace) res[bool, fail.Fail];
 ```
 
 rewrites a vector shift whose count is a literal with the same value in

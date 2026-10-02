@@ -847,19 +847,19 @@ pub val IR_OP_DESCRIPTOR_COUNT: usize = 64
 ## fun is_known
 
 ```mach
-pub fun is_known(k: instruction.InstrKind) bool;
+pub fun is_known(k: ir_instruction.InstrKind) bool;
 ```
 
 ## fun describe
 
 ```mach
-pub fun describe(k: instruction.InstrKind) res[*IrOpDescriptor, fail.Fail];
+pub fun describe(k: ir_instruction.InstrKind) res[*IrOpDescriptor, fail.Fail];
 ```
 
 ## fun unknown_kind
 
 ```mach
-pub fun unknown_kind(a: *A.Allocator, k: instruction.InstrKind, where: str) fail.Fail;
+pub fun unknown_kind(a: *std_allocator.Allocator, k: ir_instruction.InstrKind, where: str) fail.Fail;
 ```
 
 the middle end's catalog adapter: an opcode a pass dispatch reaches that no
@@ -869,96 +869,96 @@ the text lives in the module allocator, which outlives the pass
 ## fun desc
 
 ```mach
-pub fun desc(k: instruction.InstrKind) *IrOpDescriptor;
+pub fun desc(k: ir_instruction.InstrKind) *IrOpDescriptor;
 ```
 
 ## fun has
 
 ```mach
-pub fun has(k: instruction.InstrKind, mask: IrEffects) bool;
+pub fun has(k: ir_instruction.InstrKind, mask: IrEffects) bool;
 ```
 
 ## fun name
 
 ```mach
-pub fun name(k: instruction.InstrKind) str;
+pub fun name(k: ir_instruction.InstrKind) str;
 ```
 
 ## fun class_name
 
 ```mach
-pub fun class_name(k: instruction.InstrKind) str;
+pub fun class_name(k: ir_instruction.InstrKind) str;
 ```
 
 ## fun vec_op
 
 ```mach
-pub fun vec_op(k: instruction.InstrKind) IrVecOp;
+pub fun vec_op(k: ir_instruction.InstrKind) IrVecOp;
 ```
 
 ## fun vec_class
 
 ```mach
-pub fun vec_class(k: instruction.InstrKind) VecClass;
+pub fun vec_class(k: ir_instruction.InstrKind) VecClass;
 ```
 
 ## fun ct_class
 
 ```mach
-pub fun ct_class(k: instruction.InstrKind) CtClass;
+pub fun ct_class(k: ir_instruction.InstrKind) CtClass;
 ```
 
 ## fun lower_route
 
 ```mach
-pub fun lower_route(k: instruction.InstrKind) LowerRoute;
+pub fun lower_route(k: ir_instruction.InstrKind) LowerRoute;
 ```
 
 ## fun result_typing
 
 ```mach
-pub fun result_typing(k: instruction.InstrKind) ResultTyping;
+pub fun result_typing(k: ir_instruction.InstrKind) ResultTyping;
 ```
 
 ## fun operand_role
 
 ```mach
-pub fun operand_role(k: instruction.InstrKind, index: u32) OperandRole;
+pub fun operand_role(k: ir_instruction.InstrKind, index: u32) OperandRole;
 ```
 
 ## fun is_terminator
 
 ```mach
-pub fun is_terminator(k: instruction.InstrKind) bool;
+pub fun is_terminator(k: ir_instruction.InstrKind) bool;
 ```
 
 ## fun may_trap
 
 ```mach
-pub fun may_trap(k: instruction.InstrKind) bool;
+pub fun may_trap(k: ir_instruction.InstrKind) bool;
 ```
 
 ## fun transfers_secrecy
 
 ```mach
-pub fun transfers_secrecy(k: instruction.InstrKind) bool;
+pub fun transfers_secrecy(k: ir_instruction.InstrKind) bool;
 ```
 
 ## fun produces_value
 
 ```mach
-pub fun produces_value(k: instruction.InstrKind) bool;
+pub fun produces_value(k: ir_instruction.InstrKind) bool;
 ```
 
 ## fun accepts_volatile
 
 ```mach
-pub fun accepts_volatile(k: instruction.InstrKind) bool;
+pub fun accepts_volatile(k: ir_instruction.InstrKind) bool;
 ```
 
 ## fun arity_ok
 
 ```mach
-pub fun arity_ok(k: instruction.InstrKind, operand_count: u32) bool;
+pub fun arity_ok(k: ir_instruction.InstrKind, operand_count: u32) bool;
 ```
 

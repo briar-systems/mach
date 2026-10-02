@@ -21,13 +21,13 @@ pub rec Interner;
 ## fun init
 
 ```mach
-pub fun init(a: *A.Allocator) Interner;
+pub fun init(a: *std_allocator.Allocator) Interner;
 ```
 
 ## fun make_child
 
 ```mach
-pub fun make_child(base: *Interner, a: *A.Allocator) Interner;
+pub fun make_child(base: *Interner, a: *std_allocator.Allocator) Interner;
 ```
 
 ## fun dnit
@@ -45,19 +45,19 @@ pub fun lookup(itn: *Interner, id: StrId) opt[str];
 ## fun intern
 
 ```mach
-pub fun intern(itn: *Interner, text: str) res[StrId, A.Error];
+pub fun intern(itn: *Interner, text: str) res[StrId, std_allocator.Error];
 ```
 
 ## fun intern_span
 
 ```mach
-pub fun intern_span(itn: *Interner, source: str, span: token.Span) res[StrId, A.Error];
+pub fun intern_span(itn: *Interner, source: str, span: token.Span) res[StrId, std_allocator.Error];
 ```
 
 ## fun intern_bytes
 
 ```mach
-pub fun intern_bytes(itn: *Interner, data: str, len: usize) res[StrId, A.Error];
+pub fun intern_bytes(itn: *Interner, data: str, len: usize) res[StrId, std_allocator.Error];
 ```
 
 ## rec ReinternMap
@@ -69,13 +69,13 @@ pub rec ReinternMap;
 ## fun reintern_map_dnit
 
 ```mach
-pub fun reintern_map_dnit(alloc: *A.Allocator, remap: *ReinternMap);
+pub fun reintern_map_dnit(alloc: *std_allocator.Allocator, remap: *ReinternMap);
 ```
 
 ## fun reintern_child
 
 ```mach
-pub fun reintern_child(child: *Interner, alloc_: *A.Allocator) res[ReinternMap, A.Error];
+pub fun reintern_child(child: *Interner, alloc_: *std_allocator.Allocator) res[ReinternMap, std_allocator.Error];
 ```
 
 a non-child interner is a contract violation of the receiver, reported as

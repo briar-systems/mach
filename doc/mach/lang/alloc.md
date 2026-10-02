@@ -6,50 +6,50 @@ compiler recovers from at the site that met it; it is reported through the
 failure domains (fail.refused, outcome.refused) and the build stops. the
 text is presentation only and no site branches on it.
 
-## fwd A.Allocator
+## fwd std_allocator.Allocator
 
 ```mach
-fwd A.Allocator
+fwd std_allocator.Allocator
 ```
 
 forwards `std.allocator.Allocator`
 
-## fwd A.Error
+## fwd std_allocator.Error
 
 ```mach
-fwd A.Error
+fwd std_allocator.Error
 ```
 
 forwards `std.allocator.Error`
 
-## fwd A.allocate
+## fwd std_allocator.allocate
 
 ```mach
-fwd A.allocate
+fwd std_allocator.allocate
 ```
 
 forwards `std.allocator.allocate`
 
-## fwd A.zallocate
+## fwd std_allocator.zallocate
 
 ```mach
-fwd A.zallocate
+fwd std_allocator.zallocate
 ```
 
 forwards `std.allocator.zallocate`
 
-## fwd A.reallocate
+## fwd std_allocator.reallocate
 
 ```mach
-fwd A.reallocate
+fwd std_allocator.reallocate
 ```
 
 forwards `std.allocator.reallocate`
 
-## fwd A.deallocate
+## fwd std_allocator.deallocate
 
 ```mach
-fwd A.deallocate
+fwd std_allocator.deallocate
 ```
 
 forwards `std.allocator.deallocate`
@@ -57,7 +57,7 @@ forwards `std.allocator.deallocate`
 ## fun text
 
 ```mach
-pub fun text(e: A.Error) str;
+pub fun text(e: std_allocator.Error) str;
 ```
 
 the refusal as text: `exhausted` is the message the compiler has always

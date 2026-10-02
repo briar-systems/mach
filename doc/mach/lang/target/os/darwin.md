@@ -15,12 +15,12 @@ pub val DARWIN_PAGE_SIZE: u64 = 4096
 ## fun darwin_va_list
 
 ```mach
-pub fun darwin_va_list(arch_id: u32) opt[os.VaList];
+pub fun darwin_va_list(arch_id: u32) opt[lang_target_os.VaList];
 ```
 
 ## fun register_darwin
 
 ```mach
-pub fun register_darwin(reg: *os.OsRegistry) err[fail.Fail];
+pub fun register_darwin(reg: *lang_target_os.OsRegistry) err[fail.Fail];
 ```
 

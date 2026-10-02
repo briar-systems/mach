@@ -15,6 +15,6 @@ pub fun looks_like_dll(buf: *u8, buf_size: usize, expect_machine: u16) bool;
 ## fun register_coff
 
 ```mach
-pub fun register_coff(reg: *of.OfRegistry) err[fail.Fail];
+pub fun register_coff(reg: *target_of.OfRegistry) err[fail.Fail];
 ```
 

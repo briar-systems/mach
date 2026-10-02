@@ -47,7 +47,7 @@ kind: the diagnostic kind the refusal is reported as
 ## fun refusal_free
 
 ```mach
-pub fun refusal_free(alloc: *A.Allocator, r: *Refusal);
+pub fun refusal_free(alloc: *std_allocator.Allocator, r: *Refusal);
 ```
 
 ## fun emitted_mul_cell
@@ -62,8 +62,8 @@ in order, the first one's width
 ## fun walk
 
 ```mach
-pub fun walk(f: *mir.MirFunction, ns: *notes.AsmNote, count: u32, eff: *IsaEffects,
-tgt: *isa.BackendTarget, alloc: *A.Allocator) err[Refusal];
+pub fun walk(f: *codegen_mir.MirFunction, ns: *notes.AsmNote, count: u32, eff: *IsaEffects,
+tgt: *isa.BackendTarget, alloc: *std_allocator.Allocator) err[Refusal];
 ```
 
 validates one oblivious function's notification stream. a non-oblivious

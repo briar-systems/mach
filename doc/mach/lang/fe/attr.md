@@ -11,7 +11,7 @@ type checking, lowering and the link all read one value (#4022)
 ## fun takes_string
 
 ```mach
-pub fun takes_string(source: str, dec: *decl.Decorator, ord: u32) bool;
+pub fun takes_string(source: str, dec: *ast_decl.Decorator, ord: u32) bool;
 ```
 
 whether argument `ord` of `dec` takes a string
@@ -19,7 +19,7 @@ whether argument `ord` of `dec` takes a string
 ## fun string_id
 
 ```mach
-pub fun string_id(s: *session.Session, mid: session.ModuleId, a: *ast.Ast, dec: *decl.Decorator, ord: u32) opt[intern.StrId];
+pub fun string_id(s: *session.Session, mid: session.ModuleId, a: *ast.Ast, dec: *ast_decl.Decorator, ord: u32) opt[intern.StrId];
 ```
 
 the string argument `ord` of `dec` evaluated to; none when it is not a constant string
@@ -27,7 +27,7 @@ the string argument `ord` of `dec` evaluated to; none when it is not a constant 
 ## fun string_of
 
 ```mach
-pub fun string_of(s: *session.Session, mid: session.ModuleId, a: *ast.Ast, dec: *decl.Decorator, ord: u32) opt[str];
+pub fun string_of(s: *session.Session, mid: session.ModuleId, a: *ast.Ast, dec: *ast_decl.Decorator, ord: u32) opt[str];
 ```
 
 the text of `string_id`

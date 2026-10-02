@@ -27,7 +27,7 @@ pub fun dnit(work: *Workspace);
 ## fun run
 
 ```mach
-pub fun run[C, T](work: *Workspace, owner: *A.Allocator, context: *C, action: fun(*C, *A.Allocator) res[T, fail.Fail]) res[T, fail.Fail];
+pub fun run[C, T](work: *Workspace, owner: *std_allocator.Allocator, context: *C, action: fun(*C, *std_allocator.Allocator) res[T, fail.Fail]) res[T, fail.Fail];
 ```
 
 successful results must not borrow workspace storage
@@ -35,7 +35,7 @@ successful results must not borrow workspace storage
 ## fun run_unit
 
 ```mach
-pub fun run_unit[C](work: *Workspace, owner: *A.Allocator, context: *C, action: fun(*C, *A.Allocator) err[fail.Fail]) err[fail.Fail];
+pub fun run_unit[C](work: *Workspace, owner: *std_allocator.Allocator, context: *C, action: fun(*C, *std_allocator.Allocator) err[fail.Fail]) err[fail.Fail];
 ```
 
 the same for an action with no value

@@ -242,7 +242,7 @@ pub fun build_project(s: *session.Session, project_root: str, pick: *manifest.Se
 
 ```mach
 pub fun verify_dependencies(s: *session.Session, project_root: str, release: bool,
-overrides: *Vector[ddep.RootOverride]) err[outcome.Fail];
+overrides: *Vector[driver_deps.RootOverride]) err[outcome.Fail];
 ```
 
 check a project's realized dependency closure without changing it

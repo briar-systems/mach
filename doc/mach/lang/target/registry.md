@@ -58,7 +58,7 @@ an in-place registry over the sub-registries' own page allocators
 ## fun registry_new
 
 ```mach
-pub fun registry_new(alloc: *A.Allocator) res[*TargetRegistry, fail.Fail];
+pub fun registry_new(alloc: *std_allocator.Allocator) res[*TargetRegistry, fail.Fail];
 ```
 
 a heap registry whose block and every entry come from `alloc`

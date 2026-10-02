@@ -39,7 +39,7 @@ pub fun limit_64() usize;
 ## fun init
 
 ```mach
-pub fun init(alloc: *A.Allocator, itn: *intern.Interner, format: str, limit: usize) res[FilePlan, fail.Fail];
+pub fun init(alloc: *std_allocator.Allocator, itn: *intern.Interner, format: str, limit: usize) res[FilePlan, fail.Fail];
 ```
 
 ## fun dnit
@@ -51,7 +51,7 @@ pub fun dnit(p: *FilePlan);
 ## fun place
 
 ```mach
-pub fun place(p: *FilePlan, label: str, section: of.SectionId, align: usize, size: usize) res[u32, fail.Fail];
+pub fun place(p: *FilePlan, label: str, section: target_of.SectionId, align: usize, size: usize) res[u32, fail.Fail];
 ```
 
 place a region at the next offset that satisfies `align`
@@ -59,7 +59,7 @@ place a region at the next offset that satisfies `align`
 ## fun place_at
 
 ```mach
-pub fun place_at(p: *FilePlan, label: str, section: of.SectionId, offset: usize, size: usize) res[u32, fail.Fail];
+pub fun place_at(p: *FilePlan, label: str, section: target_of.SectionId, offset: usize, size: usize) res[u32, fail.Fail];
 ```
 
 place a region whose offset is dictated; it must not overlap what came before

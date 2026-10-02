@@ -36,7 +36,7 @@ a dominance query is an interval test rather than a walk up the idom chain
 ## fun analyze
 
 ```mach
-pub fun analyze(fn: *ir.Function, types: *ir_type.IrTypeTable, alloc: *A.Allocator) res[LoopAnalysis, fail.Fail];
+pub fun analyze(fn: *me_ir.Function, types: *ir_type.IrTypeTable, alloc: *std_allocator.Allocator) res[LoopAnalysis, fail.Fail];
 ```
 
 the type table reads a counted loop's induction variable at its width
@@ -50,13 +50,13 @@ pub fun dnit(la: *LoopAnalysis);
 ## fun dominates
 
 ```mach
-pub fun dominates(la: *LoopAnalysis, a: id.BlockId, b: id.BlockId) bool;
+pub fun dominates(la: *LoopAnalysis, a: ir_id.BlockId, b: ir_id.BlockId) bool;
 ```
 
 ## fun loop_contains
 
 ```mach
-pub fun loop_contains(la: *LoopAnalysis, loop_ix: u32, b: id.BlockId) bool;
+pub fun loop_contains(la: *LoopAnalysis, loop_ix: u32, b: ir_id.BlockId) bool;
 ```
 
 ## fun is_invariant
@@ -68,13 +68,13 @@ pub fun is_invariant(la: *LoopAnalysis, loop_ix: u32, v: value.Value) bool;
 ## fun set_instr_block
 
 ```mach
-pub fun set_instr_block(la: *LoopAnalysis, iid: id.InstructionId, b: id.BlockId) err[fail.Fail];
+pub fun set_instr_block(la: *LoopAnalysis, iid: ir_id.InstructionId, b: ir_id.BlockId) err[fail.Fail];
 ```
 
 ## fun induction
 
 ```mach
-pub fun induction(la: *LoopAnalysis, fn: *ir.Function, loop_ix: u32, phi_id: id.InstructionId, out: *InductionVar) bool;
+pub fun induction(la: *LoopAnalysis, fn: *me_ir.Function, loop_ix: u32, phi_id: ir_id.InstructionId, out: *InductionVar) bool;
 ```
 
 whether a header phi is an induction, entered as `init` from the preheader

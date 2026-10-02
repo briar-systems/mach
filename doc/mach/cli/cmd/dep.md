@@ -67,7 +67,7 @@ ret: exit.OK when verified, exit.USER for a directory outside the closure, other
 ## fun pin_command
 
 ```mach
-pub fun pin_command(a: *A.Allocator, root: str, id: str) str;
+pub fun pin_command(a: *std_allocator.Allocator, root: str, id: str) str;
 ```
 
 the command that pins and realizes a version-selected dependency with no checkout yet;
@@ -76,7 +76,7 @@ pull's refusal and init's --no-deps hint both name it
 ## fun unpinned_refusal
 
 ```mach
-pub fun unpinned_refusal(a: *A.Allocator, root: str, id: str, version: str) str;
+pub fun unpinned_refusal(a: *std_allocator.Allocator, root: str, id: str, version: str) str;
 ```
 
 ## fun dep_outdated

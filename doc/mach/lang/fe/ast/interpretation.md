@@ -39,6 +39,6 @@ pub val REJECTED:    Choice = 4
 ## fun get
 
 ```mach
-pub fun get(a: *ast.Ast, choices: *Choice, count: usize, eid: id.ExprId) res[expr.Expr, fail.Fail];
+pub fun get(a: *ast.Ast, choices: *Choice, count: usize, eid: ast_id.ExprId) res[ast_expr.Expr, fail.Fail];
 ```
 

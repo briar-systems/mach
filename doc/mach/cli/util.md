@@ -98,7 +98,7 @@ class: OPERAND_DIRECTORY or OPERAND_MANIFEST
 ## fun dnit_project_location
 
 ```mach
-pub fun dnit_project_location(a: *A.Allocator, loc: *ProjectLocation);
+pub fun dnit_project_location(a: *std_allocator.Allocator, loc: *ProjectLocation);
 ```
 
 free the three strings of a location; nil strings are skipped
@@ -109,7 +109,7 @@ loc: the location
 ## fun resolve_project_location
 
 ```mach
-pub fun resolve_project_location(a: *A.Allocator, arg: str) res[ProjectLocation, outcome.Fail];
+pub fun resolve_project_location(a: *std_allocator.Allocator, arg: str) res[ProjectLocation, outcome.Fail];
 ```
 
 turn a project operand into a root directory and a manifest path
@@ -123,7 +123,7 @@ ret: the location, freed with dnit_project_location, or a message naming what wa
 ## fun ensure_parents
 
 ```mach
-pub fun ensure_parents(a: *A.Allocator, p: str) err[outcome.Fail];
+pub fun ensure_parents(a: *std_allocator.Allocator, p: str) err[outcome.Fail];
 ```
 
 create every missing ancestor of a path with mode 0755; the path itself is not created
@@ -135,7 +135,7 @@ ret: none on success, or the parent computation or creation error
 ## fun resolve_cmd
 
 ```mach
-pub fun resolve_cmd(a: *A.Allocator, name: str) res[str, outcome.Fail];
+pub fun resolve_cmd(a: *std_allocator.Allocator, name: str) res[str, outcome.Fail];
 ```
 
 locate an executable the way a shell would: a name with a path separator is used directly
@@ -149,7 +149,7 @@ ret: the resolved path, owned by the caller; "PATH unset", "not found on PATH", 
 ## fun resolve_cmd_in
 
 ```mach
-pub fun resolve_cmd_in(a: *A.Allocator, name: str, search: str) res[str, outcome.Fail];
+pub fun resolve_cmd_in(a: *std_allocator.Allocator, name: str, search: str) res[str, outcome.Fail];
 ```
 
 locate an executable through an explicit search list

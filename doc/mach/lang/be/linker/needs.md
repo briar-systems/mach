@@ -14,7 +14,7 @@ no cell, and its DIT rows are refused before any mark can exist
 ## fun inputs_need_dit
 
 ```mach
-pub fun inputs_need_dit(s: *session.Session, modules: *of.ObjectImage, module_count: u32) bool;
+pub fun inputs_need_dit(s: *session.Session, modules: *target_of.ObjectImage, module_count: u32) bool;
 ```
 
 whether any input carries the DIT mark: the per-module fact, unioned
@@ -22,7 +22,7 @@ whether any input carries the DIT mark: the per-module fact, unioned
 ## fun defines_dit_cell
 
 ```mach
-pub fun defines_dit_cell(tgt: *target.Target, mode: LinkMode) bool;
+pub fun defines_dit_cell(tgt: *lang_target.Target, mode: LinkMode) bool;
 ```
 
 whether a link of this mode on this target defines the cell: an executable on
@@ -32,9 +32,9 @@ library runs no start code of its own and records nothing
 ## fun synthesize_runtime_needs
 
 ```mach
-pub fun synthesize_runtime_needs(s: *session.Session, tgt: *target.Target,
-modules: *of.ObjectImage, module_count: u32, mode: LinkMode,
-out: *of.ObjectImage) res[bool, fail.Fail];
+pub fun synthesize_runtime_needs(s: *session.Session, tgt: *lang_target.Target,
+modules: *target_of.ObjectImage, module_count: u32, mode: LinkMode,
+out: *target_of.ObjectImage) res[bool, fail.Fail];
 ```
 
 the synthetic input carrying the cell; false when this link defines none

@@ -23,7 +23,7 @@ pub fun collected_init() Collected;
 ## fun collect_module
 
 ```mach
-pub fun collect_module(s: *session.Session, c: *Collected, mod: *ir.Module, mod_idx: u32) err[fail.Fail];
+pub fun collect_module(s: *session.Session, c: *Collected, mod: *me_ir.Module, mod_idx: u32) err[fail.Fail];
 ```
 
 the test declarations of one lowered module, in function order
@@ -67,7 +67,7 @@ truncated, and it can never read as a pass
 ## fun synthesize_dispatcher
 
 ```mach
-pub fun synthesize_dispatcher(s: *session.Session, tests: *Test, count: u32) res[ir.Module, fail.Fail];
+pub fun synthesize_dispatcher(s: *session.Session, tests: *Test, count: u32) res[me_ir.Module, fail.Fail];
 ```
 
 synthesize the test dispatcher module: a `main(argc, argv)` that parses argv[1]

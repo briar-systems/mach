@@ -76,7 +76,7 @@ pub val DW_EH_PE_DATAREL_SDATA4: u8 = 0x3B
 ## fun frame_state
 
 ```mach
-pub fun frame_state(fi: *FrameIsa, steps: *of.FrameStep, count: u32, st: *FrameState) err[fail.Fail];
+pub fun frame_state(fi: *FrameIsa, steps: *target_of.FrameStep, count: u32, st: *FrameState) err[fail.Fail];
 ```
 
 the frame a function's steps leave once its prologue has run
@@ -90,7 +90,7 @@ pub fun cie_size(fi: *FrameIsa) usize;
 ## fun fde_size
 
 ```mach
-pub fun fde_size(fi: *FrameIsa, steps: *of.FrameStep, count: u32) res[usize, fail.Fail];
+pub fun fde_size(fi: *FrameIsa, steps: *target_of.FrameStep, count: u32) res[usize, fail.Fail];
 ```
 
 ## rec UnwindFn
@@ -114,7 +114,7 @@ the zero terminator. `fde_offs`, when given, receives each fde's offset
 ## fun eh_frame_bound
 
 ```mach
-pub fun eh_frame_bound(fi: *FrameIsa, frames: *of.FrameUnwind, count: u32) res[usize, fail.Fail];
+pub fun eh_frame_bound(fi: *FrameIsa, frames: *target_of.FrameUnwind, count: u32) res[usize, fail.Fail];
 ```
 
 the most `.eh_frame` bytes the given frames can take: a function the link
@@ -154,13 +154,13 @@ the room the linker reserved for one unwind table, found by its section flag
 ## fun unwind_room
 
 ```mach
-pub fun unwind_room(segs: *of.LoadSegment, seg_count: u32, flag: u32) UnwindRoom;
+pub fun unwind_room(segs: *target_of.LoadSegment, seg_count: u32, flag: u32) UnwindRoom;
 ```
 
 ## fun unwind_room_trim
 
 ```mach
-pub fun unwind_room_trim(segs: *of.LoadSegment, room: *UnwindRoom, len: usize);
+pub fun unwind_room_trim(segs: *target_of.LoadSegment, room: *UnwindRoom, len: usize);
 ```
 
 the table fills `len` bytes of its room, which is what its section header says
@@ -168,8 +168,8 @@ the table fills `len` bytes of its room, which is what its section header says
 ## fun unwind_functions
 
 ```mach
-pub fun unwind_functions(alloc: *A.Allocator, segs: *of.LoadSegment, seg_count: u32,
-funcs: *of.ExecFunction, func_count: u32, count: *u32) res[*UnwindFn, fail.Fail];
+pub fun unwind_functions(alloc: *std_allocator.Allocator, segs: *target_of.LoadSegment, seg_count: u32,
+funcs: *target_of.ExecFunction, func_count: u32, count: *u32) res[*UnwindFn, fail.Fail];
 ```
 
 the functions with frame records at their final addresses, in address order
@@ -255,7 +255,7 @@ a function a carried frame description covers, and where that fde lies
 ## fun eh_frame_scan
 
 ```mach
-pub fun eh_frame_scan(alloc: *A.Allocator, buf: *u8, cap: usize, vaddr: u64, ptr_size: u32,
+pub fun eh_frame_scan(alloc: *std_allocator.Allocator, buf: *u8, cap: usize, vaddr: u64, ptr_size: u32,
 fns: **EhFn, count: *u32) res[usize, fail.Fail];
 ```
 

@@ -38,7 +38,7 @@ pub rec Memo;
 ## fun init
 
 ```mach
-pub fun init(a: *A.Allocator, compiler: *[32]u8) Memo;
+pub fun init(a: *std_allocator.Allocator, compiler: *[32]u8) Memo;
 ```
 
 ## fun dnit
@@ -66,7 +66,7 @@ the digests remembered for `p` when the file still looks as it did
 ## fun record
 
 ```mach
-pub fun record(m: *Memo, p: str, s: *Stamp, d: *Digests, now: time.Time) err[A.Error];
+pub fun record(m: *Memo, p: str, s: *Stamp, d: *Digests, now: time.Time) err[std_allocator.Error];
 ```
 
 remember the digests of `p` as stamped, unless it was modified so recently
@@ -75,7 +75,7 @@ remember the digests of `p` as stamped, unless it was modified so recently
 ## fun decode
 
 ```mach
-pub fun decode(a: *A.Allocator, compiler: *[32]u8, bytes: *u8, len: usize) res[Memo, A.Error];
+pub fun decode(a: *std_allocator.Allocator, compiler: *[32]u8, bytes: *u8, len: usize) res[Memo, std_allocator.Error];
 ```
 
 the memo `bytes` hold for `compiler`: every entry, or none at all when the
@@ -84,7 +84,7 @@ bytes are not a complete memo of that compiler. err only when allocation fails
 ## fun encode
 
 ```mach
-pub fun encode(m: *Memo, a: *A.Allocator, out_len: *usize) res[*u8, A.Error];
+pub fun encode(m: *Memo, a: *std_allocator.Allocator, out_len: *usize) res[*u8, std_allocator.Error];
 ```
 
 the memo as bytes, allocated in a and owned by the caller
@@ -92,7 +92,7 @@ the memo as bytes, allocated in a and owned by the caller
 ## fun load
 
 ```mach
-pub fun load(a: *A.Allocator, compiler: *[32]u8, file: str) res[Memo, A.Error];
+pub fun load(a: *std_allocator.Allocator, compiler: *[32]u8, file: str) res[Memo, std_allocator.Error];
 ```
 
 the memo stored at `file`, empty when there is none or it cannot be read

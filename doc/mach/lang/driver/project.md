@@ -295,13 +295,13 @@ release a module's union tuple frames, which only the load reads
 ## fun free_dep_entries
 
 ```mach
-pub fun free_dep_entries(alloc: *A.Allocator, deps: *DepEntry, count: u32, capacity: usize);
+pub fun free_dep_entries(alloc: *std_allocator.Allocator, deps: *DepEntry, count: u32, capacity: usize);
 ```
 
 ## fun free_dep_entries_in_place
 
 ```mach
-pub fun free_dep_entries_in_place(alloc: *A.Allocator, deps: *DepEntry, count: u32);
+pub fun free_dep_entries_in_place(alloc: *std_allocator.Allocator, deps: *DepEntry, count: u32);
 ```
 
 release what each entry owns, leaving the entries' own storage to the caller
@@ -309,7 +309,7 @@ release what each entry owns, leaving the entries' own storage to the caller
 ## fun free_artifact_reqs
 
 ```mach
-pub fun free_artifact_reqs(alloc: *A.Allocator, reqs: *manifest.ArtifactReq, count: u32);
+pub fun free_artifact_reqs(alloc: *std_allocator.Allocator, reqs: *manifest.ArtifactReq, count: u32);
 ```
 
 ## fun map_opt
@@ -378,7 +378,7 @@ nested load and read the same entry afterwards
 ## fun module_by_file
 
 ```mach
-pub fun module_by_file(p: *Project, fid: src.FileId) opt[session.ModuleId];
+pub fun module_by_file(p: *Project, fid: lang_source.FileId) opt[session.ModuleId];
 ```
 
 the loaded module a source file backs, by a scan of the module table: editor edits
@@ -391,6 +391,6 @@ ret: the module's id, or none when no loaded module reads that file
 ## fun drop_surface
 
 ```mach
-pub fun drop_surface(a: *A.Allocator, slot: **sema.ModuleSema);
+pub fun drop_surface(a: *std_allocator.Allocator, slot: **fe_sema.ModuleSema);
 ```
 

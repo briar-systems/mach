@@ -3,7 +3,7 @@
 ## fun execute
 
 ```mach
-pub fun execute(bp: *plan.BuildPlan, backing: *A.Allocator, oa: *A.Allocator,
+pub fun execute(bp: *build_plan.BuildPlan, backing: *std_allocator.Allocator, oa: *std_allocator.Allocator,
 ev: *readout.Progress) res[outcome.BuildOutcome, outcome.Fail];
 ```
 
@@ -24,7 +24,7 @@ ret: the outcome, released with outcome.outcome_dnit, or an engine failure whose
 ## fun execute_warm
 
 ```mach
-pub fun execute_warm(bp: *plan.BuildPlan, unit_index: usize, s: *session.Session, oa: *A.Allocator,
+pub fun execute_warm(bp: *build_plan.BuildPlan, unit_index: usize, s: *session.Session, oa: *std_allocator.Allocator,
 ev: *readout.Progress) res[outcome.BuildOutcome, outcome.Fail];
 ```
 
@@ -45,9 +45,9 @@ ret: the outcome of that one unit, released with outcome.outcome_dnit, or an eng
 
 ```mach
 pub fun set_link_config_input(p: *driver.Project, out_path: *u8, product: *u8, out_kind: u32,
-ext: *of.ObjectInput, ext_count: u32,
-dynlibs: *of.DynLib, dynlib_count: u32,
-image: *emit.LoadedImageOptions) err[outcome.Fail];
+ext: *target_of.ObjectInput, ext_count: u32,
+dynlibs: *target_of.DynLib, dynlib_count: u32,
+image: *build_emit.LoadedImageOptions) err[outcome.Fail];
 ```
 
 publish the link configuration of a project as the Q_LINK_CONFIG query input: the

@@ -263,7 +263,7 @@ pub fun elf32_layout() ElfLayout;
 ## fun layout_for
 
 ```mach
-pub fun layout_for(tgt_isa: *of.ObjectTarget) ElfLayout;
+pub fun layout_for(tgt_isa: *target_of.ObjectTarget) ElfLayout;
 ```
 
 ## fun layout_from_class
@@ -275,18 +275,18 @@ pub fun layout_from_class(cls: u8, out: *ElfLayout) bool;
 ## def BuildAttributes
 
 ```mach
-pub def BuildAttributes: of.ElfAttributes
+pub def BuildAttributes: target_of.ElfAttributes
 ```
 
 ## fun register
 
 ```mach
-pub fun register(reg: *of.OfRegistry) err[fail.Fail];
+pub fun register(reg: *target_of.OfRegistry) err[fail.Fail];
 ```
 
 ## fun parse_object
 
 ```mach
-pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_size: usize, out: *of.ObjectImage) err[fail.Fail];
+pub fun parse_object(alloc: *std_allocator.Allocator, itn: *intern.Interner, buf: *u8, buf_size: usize, out: *target_of.ObjectImage) err[fail.Fail];
 ```
 

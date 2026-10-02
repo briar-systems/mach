@@ -93,7 +93,7 @@ pub fun file_sha256(path: str, digest: *u8) err[outcome.Fail];
 ## fun held_file_sha256
 
 ```mach
-pub fun held_file_sha256(f: fs.File, digest: *u8) err[outcome.Fail];
+pub fun held_file_sha256(f: std_filesystem.File, digest: *u8) err[outcome.Fail];
 ```
 
 borrows the file and exclusive seek/read access, rewinds first and leaves it at eof

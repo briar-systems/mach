@@ -3,19 +3,19 @@
 ## fun note_function
 
 ```mach
-pub fun note_function(buf: *enc.ByteBuf, interner: *intern.Interner, f: *mir.MirFunction) err[fail.Fail];
+pub fun note_function(buf: *codegen_encode.ByteBuf, interner: *intern.Interner, f: *codegen_mir.MirFunction) err[fail.Fail];
 ```
 
 ## fun note_block
 
 ```mach
-pub fun note_block(buf: *enc.ByteBuf, id: u32) err[fail.Fail];
+pub fun note_block(buf: *codegen_encode.ByteBuf, id: u32) err[fail.Fail];
 ```
 
 ## fun note_local_label
 
 ```mach
-pub fun note_local_label(buf: *enc.ByteBuf, number: u32) err[fail.Fail];
+pub fun note_local_label(buf: *codegen_encode.ByteBuf, number: u32) err[fail.Fail];
 ```
 
 an asm block's numbered label, spelled as the block spells it: GNU as and
@@ -24,7 +24,7 @@ the block both resolve `1f` to the next `1:` and `1b` to the last one
 ## fun note_inst
 
 ```mach
-pub fun note_inst(buf: *enc.ByteBuf, mi: *isa.Inst);
+pub fun note_inst(buf: *codegen_encode.ByteBuf, mi: *isa.Inst);
 ```
 
 the notification carries the instruction the encoder assembled, already

@@ -35,12 +35,12 @@ pub rec CandidateSource;
 ## fun release_free
 
 ```mach
-pub fun release_free(a: *A.Allocator, r: *Release);
+pub fun release_free(a: *std_allocator.Allocator, r: *Release);
 ```
 
 ## fun releases_free
 
 ```mach
-pub fun releases_free(a: *A.Allocator, list: *Vector[Release]);
+pub fun releases_free(a: *std_allocator.Allocator, list: *Vector[Release]);
 ```
 

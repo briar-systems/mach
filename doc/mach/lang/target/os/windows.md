@@ -15,12 +15,12 @@ pub val WINDOWS_PAGE_SIZE: u64 = 4096
 ## fun windows_va_list
 
 ```mach
-pub fun windows_va_list(arch_id: u32) opt[os.VaList];
+pub fun windows_va_list(arch_id: u32) opt[lang_target_os.VaList];
 ```
 
 ## fun register_windows
 
 ```mach
-pub fun register_windows(reg: *os.OsRegistry) err[fail.Fail];
+pub fun register_windows(reg: *lang_target_os.OsRegistry) err[fail.Fail];
 ```
 

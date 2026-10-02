@@ -59,7 +59,7 @@ pub rec Session;
 ## fun init
 
 ```mach
-pub fun init(alloc: *A.Allocator) res[Session, fail.Fail];
+pub fun init(alloc: *std_allocator.Allocator) res[Session, fail.Fail];
 ```
 
 ## fun drop_query_failure
@@ -371,7 +371,7 @@ pub fun next_parse_incarnation(s: *Session) res[u64, fail.Fail];
 ## fun load_source
 
 ```mach
-pub fun load_source(s: *Session, path: str, text: str) res[source.FileId, fail.Fail];
+pub fun load_source(s: *Session, path: str, text: str) res[lang_source.FileId, fail.Fail];
 ```
 
 ## rec PreparedOverlay

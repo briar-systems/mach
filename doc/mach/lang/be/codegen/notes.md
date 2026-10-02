@@ -91,7 +91,7 @@ pub fun note_seeds_clear(out: *NoteSeeds);
 ## fun note_seeds
 
 ```mach
-pub fun note_seeds(f: *mir.MirFunction, n: *AsmNote, out: *NoteSeeds);
+pub fun note_seeds(f: *codegen_mir.MirFunction, n: *AsmNote, out: *NoteSeeds);
 ```
 
 every seed the walk needs at one notification. a note without a MirInstr

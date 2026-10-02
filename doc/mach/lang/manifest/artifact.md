@@ -48,13 +48,13 @@ req_count: length of `reqs`
 ## fun parse_artifacts
 
 ```mach
-pub fun parse_artifacts(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, as_root: bool) err[outcome.Fail];
+pub fun parse_artifacts(alloc: *std_allocator.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, as_root: bool) err[outcome.Fail];
 ```
 
 ## fun artifact_template_id
 
 ```mach
-pub fun artifact_template_id(alloc: *A.Allocator, tmpl: str) opt[str];
+pub fun artifact_template_id(alloc: *std_allocator.Allocator, tmpl: str) opt[str];
 ```
 
 the artifact id the first `{artifact.<id>.out}` group in `tmpl` names, allocated
@@ -99,13 +99,13 @@ pub fun template_internal(message: str) TemplateError;
 ## fun template_error_dnit
 
 ```mach
-pub fun template_error_dnit(alloc: *A.Allocator, e: TemplateError);
+pub fun template_error_dnit(alloc: *std_allocator.Allocator, e: TemplateError);
 ```
 
 ## fun template_rejection
 
 ```mach
-pub fun template_rejection(alloc: *A.Allocator, field: str, tmpl: str, reason: str) TemplateError;
+pub fun template_rejection(alloc: *std_allocator.Allocator, field: str, tmpl: str, reason: str) TemplateError;
 ```
 
 ## fun template_text
@@ -119,7 +119,7 @@ the message either case carries
 ## fun expand_artifact_path
 
 ```mach
-pub fun expand_artifact_path(alloc: *A.Allocator, tmpl: str, reqs: *ArtifactReq, req_count: u32,
+pub fun expand_artifact_path(alloc: *std_allocator.Allocator, tmpl: str, reqs: *ArtifactReq, req_count: u32,
 dependency: str, field: str) res[str, TemplateError];
 ```
 
@@ -156,7 +156,7 @@ ret: the variables
 ## fun expand
 
 ```mach
-pub fun expand(alloc: *A.Allocator, tmpl: str, project_out: str,
+pub fun expand(alloc: *std_allocator.Allocator, tmpl: str, project_out: str,
 v: *TmplVars) res[str, outcome.Fail];
 ```
 
@@ -175,7 +175,7 @@ ret: the expanded string; err on an unterminated '{', an unknown placeholder,
 ## fun expand_step_value
 
 ```mach
-pub fun expand_step_value(alloc: *A.Allocator, tmpl: str, project_out: str,
+pub fun expand_step_value(alloc: *std_allocator.Allocator, tmpl: str, project_out: str,
 v: *TmplVars) res[str, outcome.Fail];
 ```
 
@@ -193,7 +193,7 @@ ret: the expanded string; err for an unknown or unterminated reserved
 ## fun expand_project_path
 
 ```mach
-pub fun expand_project_path(alloc: *A.Allocator, tmpl: str, project_out: str,
+pub fun expand_project_path(alloc: *std_allocator.Allocator, tmpl: str, project_out: str,
 v: *TmplVars, field: str) res[str, outcome.Fail];
 ```
 
@@ -235,7 +235,7 @@ pub fun artifact_needs_artifact(itn: *intern.Interner, a: *ArtifactDef, other: *
 ## fun expand_project_out
 
 ```mach
-pub fun expand_project_out(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, v: *TmplVars) res[str, outcome.Fail];
+pub fun expand_project_out(alloc: *std_allocator.Allocator, itn: *intern.Interner, m: *Manifest, v: *TmplVars) res[str, outcome.Fail];
 ```
 
 expand `m`'s `[project].out` with `v`; a refusal points at the `out` value
@@ -243,7 +243,7 @@ expand `m`'s `[project].out` with `v`; a refusal points at the `out` value
 ## fun expand_artifact_output
 
 ```mach
-pub fun expand_artifact_output(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt.TargetRegistry,
+pub fun expand_artifact_output(alloc: *std_allocator.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry,
 a: *ArtifactDef, project_out: str, vars: *TmplVars) res[str, outcome.Fail];
 ```
 
@@ -252,7 +252,7 @@ expand an artifact's `out` for the target `vars` names; a refusal points at the 
 ## fun validate_need_cycles
 
 ```mach
-pub fun validate_need_cycles(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest) err[outcome.Fail];
+pub fun validate_need_cycles(alloc: *std_allocator.Allocator, itn: *intern.Interner, m: *Manifest) err[outcome.Fail];
 ```
 
 ## fun artifact_supports_target

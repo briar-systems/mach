@@ -93,7 +93,7 @@ sources: the owned source versions every diagnostic location refers to; analysis
 ## fun analysis_request
 
 ```mach
-pub fun analysis_request(file: source.FileId, phase: AnalysisPhase) AnalysisRequest;
+pub fun analysis_request(file: lang_source.FileId, phase: AnalysisPhase) AnalysisRequest;
 ```
 
 a request for one buffer at one phase with the default build selection
@@ -113,7 +113,7 @@ result: the envelope; zeroed on return so a second call is a no-op
 ## fun analysis_source
 
 ```mach
-pub fun analysis_source(result: *AnalysisResult, file: source.FileId) opt[*source.SourceFile];
+pub fun analysis_source(result: *AnalysisResult, file: lang_source.FileId) opt[*lang_source.SourceFile];
 ```
 
 the owned source version a diagnostic location refers to; use source.position on it
@@ -154,7 +154,7 @@ ret: the borrowed product, or the expiry or phase failure
 ## fun sema_of
 
 ```mach
-pub fun sema_of(result: *AnalysisResult) res[*context.SemaResult, fail.Fail];
+pub fun sema_of(result: *AnalysisResult) res[*sema_context.SemaResult, fail.Fail];
 ```
 
 the sema product, under ast_of's view rules; the phase must be PHASE_SEMA
@@ -193,7 +193,7 @@ s: the Session and its allocator, both owned by the caller
 ## fun open
 
 ```mach
-pub fun open(es: *EditorSession, path: str, text: str) res[source.FileId, fail.Fail];
+pub fun open(es: *EditorSession, path: str, text: str) res[lang_source.FileId, fail.Fail];
 ```
 
 register a buffer's text under a path and return its FileId
@@ -208,7 +208,7 @@ ret: the FileId every other entry takes, or the SourceMap, slot, or overlay erro
 ## fun update
 
 ```mach
-pub fun update(es: *EditorSession, fid: source.FileId, text: str) res[bool, fail.Fail];
+pub fun update(es: *EditorSession, fid: lang_source.FileId, text: str) res[bool, fail.Fail];
 ```
 
 replace an open buffer's text and drop its cached analysis

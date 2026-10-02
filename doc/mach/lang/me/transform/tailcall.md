@@ -29,12 +29,12 @@ variable reads as optimized out there; -g annotates and never decides
 ## fun recurse_in
 
 ```mach
-pub fun recurse_in(m: *ir.Module, workspace: *scratch.Workspace) res[bool, fail.Fail];
+pub fun recurse_in(m: *me_ir.Module, workspace: *scratch.Workspace) res[bool, fail.Fail];
 ```
 
 ## fun mark_in
 
 ```mach
-pub fun mark_in(m: *ir.Module, workspace: *scratch.Workspace) res[bool, fail.Fail];
+pub fun mark_in(m: *me_ir.Module, workspace: *scratch.Workspace) res[bool, fail.Fail];
 ```
 

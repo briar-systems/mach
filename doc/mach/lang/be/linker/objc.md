@@ -12,7 +12,7 @@ import is attributed the way a plain `objc_msgSend` call is
 ## fun makes_objc_stubs
 
 ```mach
-pub fun makes_objc_stubs(tgt: *target.Target, mode: LinkMode) bool;
+pub fun makes_objc_stubs(tgt: *lang_target.Target, mode: LinkMode) bool;
 ```
 
 whether this link makes selector stubs at all: a Mach-O executable or shared
@@ -21,9 +21,9 @@ image for an instruction set the stubs are written for
 ## fun synthesize_objc_stubs
 
 ```mach
-pub fun synthesize_objc_stubs(s: *session.Session, tgt: *target.Target,
-modules: *of.ObjectImage, module_count: u32, mode: LinkMode,
-out: *of.ObjectImage) res[bool, fail.Fail];
+pub fun synthesize_objc_stubs(s: *session.Session, tgt: *lang_target.Target,
+modules: *target_of.ObjectImage, module_count: u32, mode: LinkMode,
+out: *target_of.ObjectImage) res[bool, fail.Fail];
 ```
 
 the synthetic input carrying the stubs; false when the inputs leave none undefined

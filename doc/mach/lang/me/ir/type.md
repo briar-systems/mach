@@ -227,7 +227,7 @@ pub rec IrTypeTable;
 ## fun init
 
 ```mach
-pub fun init(t: *IrTypeTable, a: *A.Allocator) err[fail.Fail];
+pub fun init(t: *IrTypeTable, a: *std_allocator.Allocator) err[fail.Fail];
 ```
 
 ## fun dnit
