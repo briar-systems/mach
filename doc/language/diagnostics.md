@@ -80,6 +80,7 @@ disappears, moves or changes severity.
 | `secret` | the secrecy rules, in the source and in the constant-time validation of emitted code (`secret.not_oblivious`) |
 | `vector` | vector types and operations, including the scalar fallback (`vector.scalarize`) |
 | `asm` | inline assembly: syntax, instructions, operands, extensions, labels and locals |
+| `read` | reads the target forbids, such as a load from write-only storage (`read.writeonly_storage`) |
 | `target`, `layout`, `stack`, `alloca`, `spirv` | what a target cannot realize: widths, operations, frame sizes, SPIR-V rules |
 | `import.unused`, `decl.deprecated`, `doc.lint`, `float.inexact`, `fwd.instances`, `debug.dropped`, `target.skipped`, `target.default_deprecated`, `expect.unfulfilled` | the warnings, listed with what raises them under [Silencing warnings](manifest.md#silencing-warnings) |
 | `manifest`, `toml`, `allow`, `selection`, `need`, `template`, `version` | `mach.toml`: its keys and values, profile `allow` lists, target, profile and artifact selection, `need` entries, path templates and version ranges |

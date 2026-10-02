@@ -106,7 +106,7 @@ fun check(mac: ^u64, want: ^u64) bool {
 ```
 
 ```
-error: secret value used as a branch condition
+error[secret.branch]: secret value used as a branch condition
   --> ./src/mac.mach:3:5
 ```
 
@@ -168,10 +168,10 @@ $or {
 
 | field | values |
 |---|---|
-| **isa** | x86_64, aarch64, riscv64, riscv32, rv32imc, rv64imafd, …, spirv, wasm32 |
-| **os** | linux, darwin, windows, freestanding, wasi |
+| **isa** | x86_64, aarch64, riscv64, riscv32, a canonical RISC-V extension string such as rv32imc or rv64imafd, spirv |
+| **os** | linux, darwin, windows, freestanding |
 | **abi** | sysv64, win64, aapcs64, lp64, lp64f, lp64d, ilp32, ilp32f, ilp32d, spirv |
-| **format** | elf, coff, macho, raw, spv, wasm |
+| **of** | elf, coff, macho, raw, spv |
 | **spir-v env** | vulkan1.0, vulkan1.1, vulkan1.2, vulkan1.3 |
 
 x86_64 linux is the primary host. aarch64 linux runs natively in CI, riscv64 linux self-hosts under qemu, darwin self-hosts on both architectures, and windows is a cross-compilation target. `mach info targets` lists every tuple your binary can build.

@@ -10,6 +10,7 @@ test/
   cases/<group>/<case>.mach     one codegen case, target-independent
   ref/<group>/<case>.c          its C reference
   cases/ONLY.<target>           the cases that column serves, when not all of them
+  cases/EXACT.<target>          cases with no C reference, held to a named column
   cases/SKIPS.<target>          cases that target cannot build, one per line
   cases/NORUN.<target>          cases it builds but whose differential disagrees today
   lib/fold.mach, lib/corpus.h   the checksum fold both sides use
@@ -18,6 +19,8 @@ test/
   lib/elf_loadable.py           re-lays a freestanding ELF so qemu-user can map it
   link/cases/<name>/            one link case: a project, case.conf, expect*.txt
   f16proof/                     the exhaustive f16 proof: its subject project and check.c
+  link/cc.sh                    the C compiler a link case's [step] runs
+  link/objc-probe.py            the Objective-C probe the darwin link cases cite
   link/check/                   the shared image readers
   fuzz/corpus/                  inputs replayed by the unit suite (see fuzz/README.md)
   out/                          build products, gitignored

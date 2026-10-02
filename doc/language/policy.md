@@ -13,7 +13,7 @@ Things that need to feel like the language:
   blocks.
 - **SIMD operators on primitive vector types.** Lane-wise arithmetic,
   bitwise, comparison-to-mask, lane indexing, and full-arity vector
-  literals over the seeded 128-bit vector types (the honest per-operator
+  literals over the primitive vector types (the honest per-operator
   table is in [operators.md](operators.md)). On a target with the hardware
   (SSE2 on x86_64, NEON on aarch64) the compiler emits one instruction per
   operator; on a target without it the compiler emits a **defined unrolled
