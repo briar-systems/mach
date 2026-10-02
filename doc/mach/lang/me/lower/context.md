@@ -488,7 +488,7 @@ signless signature does not carry (#3927)
 ## fun lower_fn_sig
 
 ```mach
-pub fun lower_fn_sig(lc: *LowerContext, tid: type.TypeId) res[FnSig, fail.Fail];
+pub fun lower_fn_sig(lc: *LowerContext, did: id.DeclId) res[FnSig, fail.Fail];
 ```
 
 the signature of the semantic type `tid` and, when it is a function type,

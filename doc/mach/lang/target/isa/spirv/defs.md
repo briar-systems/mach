@@ -161,7 +161,7 @@ pub val IMAGE_OP_FORMAT:  u32 = 6
 ## val OP_DEF_COUNT
 
 ```mach
-pub val OP_DEF_COUNT:   usize = 105
+pub val OP_DEF_COUNT:   usize = 118
 ```
 
 ## val TYPE_DEF_COUNT
@@ -344,13 +344,32 @@ pub val FIRST_OPERAND:         isa.OpTyping = isa.OpTyping;
 ```
 
 the operand an untyped row's relations are stated against: the first for an image's
-handle, holding its type to nothing, and the first for a math instruction and the value for
-a subgroup operation, each a scalar or vector of integers or floats
+handle, holding its type to nothing, the first for a math instruction, a scalar or vector
+of floats, or for an integer one of signed, unsigned or either integers, and the value for
+a subgroup operation, a scalar or vector of integers or floats
 
 ## val MATH_OPERAND
 
 ```mach
 pub val MATH_OPERAND:          isa.OpTyping = isa.OpTyping;
+```
+
+## val SIGNED_OPERAND
+
+```mach
+pub val SIGNED_OPERAND:        isa.OpTyping = isa.OpTyping;
+```
+
+## val UNSIGNED_OPERAND
+
+```mach
+pub val UNSIGNED_OPERAND:      isa.OpTyping = isa.OpTyping;
+```
+
+## val INTEGER_OPERAND
+
+```mach
+pub val INTEGER_OPERAND:       isa.OpTyping = isa.OpTyping;
 ```
 
 ## val SUBGROUP_VALUE
@@ -414,6 +433,14 @@ pub val DREF_REFERENCE: isa.OpOperandScalar = isa.OpOperandScalar;
 
 the reference a depth comparison compares each texel against, a 32-bit float whatever the
 image's sampled type
+
+## val FREXP_EXPONENT
+
+```mach
+pub val FREXP_EXPONENT: isa.OpOperandScalar = isa.OpOperandScalar;
+```
+
+the exponent `Frexp` stores through its out-pointer, shaped like the value it splits
 
 ## rec DefStorage
 

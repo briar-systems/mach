@@ -24,6 +24,7 @@ use mach.lang.fe.ast;
 use adecl: mach.lang.fe.ast.decl;
 use aexpr: mach.lang.fe.ast.expr;
 use mach.lang.fe.ast.id;
+use atype: mach.lang.fe.ast.type;
 use mach.lang.fe.attr;
 use mach.lang.fe.comptime;
 use mach.lang.fe.resolve;
@@ -167,20 +168,25 @@ rec LogicalTypePath {
 
 pub rec LowerContext {
     logical_type_path: *LogicalTypePath;
-    deps:              *sema.SemaDeps;
-    diags:             *diagnostic.DiagnosticStore;
-    status:            fail.PhaseStatus;
-    s:                 *session.Session;
-    tgt:               *target.Target;
-    scope:             ModuleScope;
-    scopes:            *ModuleScope;
-    scope_len:         u32;
-    scope_cap:         u32;
-    scope_generation:  u64;
-    scope_top:         u64;
-    caps:              comptime.PhaseCapabilities[LowerContext];
-    shared_artifact:   bool;
-    debug:             bool;
+    # the function whose signature lower_fn_sig lowers, and the annotation in it
+    # being lowered, which a refusal raised outside any body points at
+    sig_decl:         id.DeclId;
+    sig_site:         token.Span;
+    sig_site_set:     bool;
+    deps:             *sema.SemaDeps;
+    diags:            *diagnostic.DiagnosticStore;
+    status:           fail.PhaseStatus;
+    s:                *session.Session;
+    tgt:              *target.Target;
+    scope:            ModuleScope;
+    scopes:           *ModuleScope;
+    scope_len:        u32;
+    scope_cap:        u32;
+    scope_generation: u64;
+    scope_top:        u64;
+    caps:             comptime.PhaseCapabilities[LowerContext];
+    shared_artifact:  bool;
+    debug:            bool;
     # debug-profile runtime checks: the release pipeline emits none
     checks:      bool;
     m:           *ir.Module;
@@ -381,6 +387,8 @@ pub fun init_context(lc: *LowerContext, req: *LowerRequest, m: *ir.Module) err[f
     val s: *session.Session = req.s;
     lc.status            = fail.accepted();
     lc.logical_type_path = nil;
+    lc.sig_decl          = id.DECL_NIL;
+    lc.sig_site_set      = false;
     lc.s                 = s;
     lc.deps              = req.deps;
     lc.diags             = req.diags;
@@ -1263,6 +1271,35 @@ pub fun pop_fins_to(lc: *LowerContext, mark: u32) {
     if (mark < lc.fin_len) { lc.fin_len = mark; }
 }
 
+# where a refusal of a type points: the signature annotation being lowered, or
+# else the code being lowered
+fun type_gate_span(lc: *LowerContext) token.Span {
+    if (lc.sig_site_set) { ret lc.sig_site; }
+    var span: token.Span;
+    span.offset = lc.builder.loc.offset;
+    span.len    = 0;
+    ret span;
+}
+
+# the annotation of `lc.sig_decl` a signature component is spelled by: the
+# return type for `param` RET_SITE, else that parameter's type
+fun claim_sig_site(lc: *LowerContext, did: id.DeclId, param: u32) {
+    val d: opt[*adecl.Decl] = ast.get_decl(lc.scope.a, did);
+    if (sel d.none)                         { ret; }
+    if (d.some.kind != adecl.DECL_KIND_FUN) { ret; }
+    val f:  *adecl.DeclFun = ?d.some.data.fun_;
+    var at: id.TypeId      = id.TYPE_NIL;
+    if (param == RET_SITE)    { at = f.return_type; }
+    or (param < f.params_len) { at = lc.scope.a.typed_names[f.params_start + param].ty; }
+    lc.sig_site     = f.name;
+    lc.sig_site_set = true;
+    if (at == id.TYPE_NIL) { ret; }
+    val t: opt[*atype.Type] = ast.get_type(lc.scope.a, at);
+    if (sel t.some) { lc.sig_site = t.some.span; }
+}
+
+val RET_SITE: u32 = 0xFFFFFFFF;
+
 pub fun lower_type(lc: *LowerContext, tid: type.TypeId) res[ir_type.IrTypeId, fail.Fail] {
     if (tid == type.TYPE_NIL) {
         ret ir_type.intern_void(?lc.m.types);
@@ -1287,10 +1324,7 @@ pub fun lower_type(lc: *LowerContext, tid: type.TypeId) res[ir_type.IrTypeId, fa
         var active: *LogicalTypePath = previous;
         for (active != nil) {
             if (active.ty == rtid) {
-                var span: token.Span;
-                span.offset = lc.builder.loc.offset;
-                span.len    = 0;
-                ret res[ir_type.IrTypeId, fail.Fail].err{report_gate(lc, dkind.SPIRV_RECURSIVE_TYPE, span,
+                ret res[ir_type.IrTypeId, fail.Fail].err{report_gate(lc, dkind.SPIRV_RECURSIVE_TYPE, type_gate_span(lc),
                     "recursive reference types require pointer capabilities absent from the Logical Shader environment")};
             }
             active = active.previous;
@@ -1324,6 +1358,14 @@ pub fun lower_type(lc: *LowerContext, tid: type.TypeId) res[ir_type.IrTypeId, fa
     if (d.class == type.PRIM_CLASS_PTR) { ret ir_type.intern_ptr(?lc.m.types); }
     if (k == type.TYPE_POINTER) {
         if (lc.tgt.model.flat_addressing) { ret ir_type.intern_ptr(?lc.m.types); }
+        # each instance of such a generic references a fresh one, so the reference
+        # types never close
+        val unbounded: res[bool, fail.Fail] = generics.holds_expansive_instance(lc.s, t.data.pointer.base);
+        if (sel unbounded.err) { ret res[ir_type.IrTypeId, fail.Fail].err{unbounded.err}; }
+        if (unbounded.ok) {
+            ret res[ir_type.IrTypeId, fail.Fail].err{report_gate(lc, dkind.SPIRV_RECURSIVE_TYPE, type_gate_span(lc),
+                "a reference into a generic whose argument grows through a pointer has unboundedly many types, which the Logical Shader environment cannot declare")};
+        }
         val base: res[ir_type.IrTypeId, fail.Fail] = lower_type(lc, t.data.pointer.base);
         if (sel base.err) { ret base; }
         ret ir_type.intern_reference(?lc.m.types, base.ok);
@@ -1590,6 +1632,10 @@ fun on_cycle(lc: *LowerContext, tid: type.TypeId) bool {
 }
 
 fun lower_function_type(lc: *LowerContext, t: *type.Type) res[ir_type.IrTypeId, fail.Fail] {
+    # only the signature itself is claimed, never a function type inside it
+    val claim: id.DeclId = lc.sig_decl;
+    lc.sig_decl = id.DECL_NIL;
+    if (claim != id.DECL_NIL) { claim_sig_site(lc, claim, RET_SITE); }
     val res_ret: res[ir_type.IrTypeId, fail.Fail] = lower_type(lc, t.data.fn.ret_type);
     if (sel res_ret.err) { ret res_ret; }
     val ir_ret: ir_type.IrTypeId = res_ret.ok;
@@ -1610,7 +1656,8 @@ fun lower_function_type(lc: *LowerContext, t: *type.Type) res[ir_type.IrTypeId, 
     for (i < params_len) {
         val po:    opt[type.TypeId] = type.get_param(?lc.s.types, t.data.fn.params_start + i);
         var p_sem: type.TypeId      = type.TYPE_NIL;
-        if (sel po.some) { p_sem = po.some; }
+        if (sel po.some)          { p_sem = po.some; }
+        if (claim != id.DECL_NIL) { claim_sig_site(lc, claim, i); }
         val res_param: res[ir_type.IrTypeId, fail.Fail] = lower_type(lc, p_sem);
         if (sel res_param.err) {
             A.deallocate[ir_type.IrTypeId](lc.s.alloc, buf, params_len::usize);
@@ -1764,8 +1811,16 @@ pub rec FnSig {
 
 # the signature of the semantic type `tid` and, when it is a function type,
 # its parameters' extensions
-pub fun lower_fn_sig(lc: *LowerContext, tid: type.TypeId) res[FnSig, fail.Fail] {
+pub fun lower_fn_sig(lc: *LowerContext, did: id.DeclId) res[FnSig, fail.Fail] {
+    val tid:       type.TypeId = decl_type_of(lc, did);
+    val prev_decl: id.DeclId   = lc.sig_decl;
+    val prev_site: token.Span  = lc.sig_site;
+    val prev_set:  bool        = lc.sig_site_set;
+    lc.sig_decl = did;
     val res_sig: res[ir_type.IrTypeId, fail.Fail] = lower_type(lc, tid);
+    lc.sig_decl     = prev_decl;
+    lc.sig_site     = prev_site;
+    lc.sig_site_set = prev_set;
     if (sel res_sig.err) { ret res[FnSig, fail.Fail].err{res_sig.err}; }
     val res_ext: res[ir_type.ExtListId, fail.Fail] = fun_type_ext(lc, tid);
     if (sel res_ext.err) { ret res[FnSig, fail.Fail].err{res_ext.err}; }
@@ -1882,7 +1937,7 @@ pub fun instance_ref_sig(lc: *LowerContext, decl_id: id.DeclId, origin: session.
         ret res[FnSig, fail.Fail].err{mark_r.err};
     }
 
-    val res_sig: res[FnSig, fail.Fail] = lower_fn_sig(lc, decl_type_of(lc, decl_id));
+    val res_sig: res[FnSig, fail.Fail] = lower_fn_sig(lc, decl_id);
 
     val leave: err[fail.Fail] = scope_leave(lc, mark_r.ok);
     if (sel leave.err) { ret res[FnSig, fail.Fail].err{leave.err}; }

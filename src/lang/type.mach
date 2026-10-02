@@ -85,6 +85,11 @@ pub val TYPE_I128: TypeKind = 26;
 # IEEE binary16, appended like the 128-bit integers (#3798)
 pub val TYPE_F16: TypeKind = 27;
 
+# one past the last kind, so an appended kind takes over this reference. the
+# type table refuses a kind at or past it, so a walker over 0..TYPE_KIND_COUNT
+# meets every kind a type can carry
+pub val TYPE_KIND_COUNT: u32 = TYPE_F16::u32 + 1;
+
 pub def PrimClass: u8;
 
 pub val PRIM_CLASS_NONE:  PrimClass = 0;
@@ -198,6 +203,12 @@ pub rec TypeAbi {
 }
 
 pub val ABI_TYPE_VA_LIST: u32 = 0;
+
+# the C type an ABI type tag stands for, absent for a tag outside the catalog
+pub fun abi_type_c_name(tag: u32) opt[str] {
+    if (tag == ABI_TYPE_VA_LIST) { ret opt[str].some{"va_list"}; }
+    ret opt[str].none{};
+}
 
 pub rec VecShape {
     name:    str;
@@ -615,6 +626,13 @@ pub rec TypeInterner {
     gparam:       *u8;
     gparam_cap:   u32;
     gparam_epoch: u32;
+
+    # whether each decided generic nominal lies on an instantiation cycle that
+    # grows an argument (generics.mark_expansive), how many do, and the projection
+    # a sweep of the whole program decided them for, plus one so zero is never
+    expansive:       map.Map[TypeId, bool];
+    expansive_count: u32;
+    expansive_swept: u64;
 }
 
 val INITIAL_PARAMS_CAP:   u32 = 32;
@@ -688,11 +706,14 @@ pub fun init(ti: *TypeInterner, a: *A.Allocator) err[fail.Fail] {
     ti.gparam_cap   = 0;
     ti.gparam_epoch = 0;
 
-    ti.dedup          = map.init_by[Type, TypeId](a, hash_type, eq_type);
-    ti.fun_index      = map.init[u64, TypeId](a);
-    ti.instance_index = map.init[u64, TypeId](a);
-    ti.field_index    = map.init[TypeId, u32](a);
-    ti.disc_index     = map.init[TypeId, TypeId](a);
+    ti.dedup           = map.init_by[Type, TypeId](a, hash_type, eq_type);
+    ti.fun_index       = map.init[u64, TypeId](a);
+    ti.instance_index  = map.init[u64, TypeId](a);
+    ti.field_index     = map.init[TypeId, u32](a);
+    ti.disc_index      = map.init[TypeId, TypeId](a);
+    ti.expansive       = map.init[TypeId, bool](a);
+    ti.expansive_count = 0;
+    ti.expansive_swept = 0;
 
     val res_params: res[*TypeId, A.Error] = A.allocate[TypeId](a, INITIAL_PARAMS_CAP::usize);
     if (sel res_params.err) {
@@ -781,6 +802,9 @@ pub fun dnit(ti: *TypeInterner) {
     map.dnit[u64, TypeId](?ti.instance_index);
     map.dnit[TypeId, u32](?ti.field_index);
     map.dnit[TypeId, TypeId](?ti.disc_index);
+    map.dnit[TypeId, bool](?ti.expansive);
+    ti.expansive_count = 0;
+    ti.expansive_swept = 0;
 
     ti.params     = nil;
     ti.params_len = 0;
@@ -1434,6 +1458,27 @@ pub fun handle_in_array(ti: *TypeInterner, tid: TypeId) bool {
     ret false;
 }
 
+# a pointer to a pointer to a handle, through any secret: the innermost double indirection
+# of every deeper one, so a chain of pointers over a handle matches at exactly one level
+pub fun handle_pointer_pointer(ti: *TypeInterner, tid: TypeId) bool {
+    if (!is_pointer(ti, tid)) { ret false; }
+    val inner: TypeId = deref_one(ti, tid);
+    if (!is_pointer(ti, inner)) { ret false; }
+    ret is_handle(ti, strip_secret(ti, deref_one(ti, inner)));
+}
+
+# a pointer to a pointer to a handle anywhere under the pointers, arrays and secrets of a type
+pub fun has_handle_pointer_pointer(ti: *TypeInterner, tid: TypeId) bool {
+    if (handle_pointer_pointer(ti, tid)) { ret true; }
+    val opt_type: opt[*Type] = get(ti, tid);
+    if (!sel opt_type.some) { ret false; }
+    val t: *Type = opt_type.some;
+    if (t.kind == TYPE_SECRET)  { ret has_handle_pointer_pointer(ti, t.data.secret.base); }
+    if (t.kind == TYPE_POINTER) { ret has_handle_pointer_pointer(ti, t.data.pointer.base); }
+    if (t.kind == TYPE_ARRAY)   { ret has_handle_pointer_pointer(ti, t.data.array.base); }
+    ret false;
+}
+
 pub fun intern_abi_type(ti: *TypeInterner, name: intern.StrId, tag: u32, size: u32,
     align: u32) res[TypeId, fail.Fail] {
     var t: Type;
@@ -1757,10 +1802,54 @@ pub fun field_projection_reset(ti: *TypeInterner) {
     ti.field_pool   = handle.chunk_init[FieldEntry](ti.a);
     map.clear[TypeId, u32](?ti.field_index);
     map.clear[TypeId, TypeId](?ti.disc_index);
+    map.clear[TypeId, bool](?ti.expansive);
+    ti.expansive_count       = 0;
+    ti.expansive_swept       = 0;
     ti.field_epoch           = 0;
     ti.gparam_epoch          = 0;
     ti.projection_generation = ti.projection_generation + 1;
     if (ti.gparam != nil && ti.gparam_cap != 0) { memory.zero[u8](ti.gparam, ti.gparam_cap::usize); }
+}
+
+# the decision for generic nominal `nominal`, none while undecided
+pub fun expansive_decided(ti: *TypeInterner, nominal: TypeId) opt[bool] {
+    val hit: opt[*bool] = map.get[TypeId, bool](?ti.expansive, ?nominal);
+    if (sel hit.some) { ret opt[bool].some{@hit.some}; }
+    ret opt[bool].none{};
+}
+
+pub fun expansive_decide(ti: *TypeInterner, nominal: TypeId, expansive: bool) err[fail.Fail] {
+    val prior: opt[bool] = expansive_decided(ti, nominal);
+    if (sel prior.some) { ret err[fail.Fail].ok{}; }
+    val put: res[bool, A.Error] = map.insert[TypeId, bool](?ti.expansive, nominal, expansive);
+    if (sel put.err) { ret err[fail.Fail].err{fail.refused(put.err)}; }
+    if (expansive)   { ti.expansive_count = ti.expansive_count + 1; }
+    ret err[fail.Fail].ok{};
+}
+
+# records that every generic the program instantiates is decided
+pub fun expansive_sweep_done(ti: *TypeInterner) {
+    ti.expansive_swept = ti.projection_generation + 1;
+}
+
+pub fun expansive_current(ti: *TypeInterner) bool {
+    ret ti.expansive_swept == ti.projection_generation + 1;
+}
+
+pub fun expansive_any(ti: *TypeInterner) bool {
+    ret ti.expansive_count > 0;
+}
+
+# whether `tid` is an instance of a generic on an instantiation cycle that grows
+# an argument, so its instances are unbounded
+pub fun instance_is_expansive(ti: *TypeInterner, tid: TypeId) bool {
+    if (ti.expansive_count == 0) { ret false; }
+    val t: opt[*Type] = get(ti, tid);
+    if (!sel t.some)                  { ret false; }
+    if (t.some.kind != TYPE_INSTANCE) { ret false; }
+    val decided: opt[bool] = expansive_decided(ti, t.some.data.instance.nominal);
+    if (sel decided.some) { ret decided.some; }
+    ret false;
 }
 
 #[testing]
@@ -1973,6 +2062,7 @@ fun intern_dedup(ti: *TypeInterner, t: Type) res[TypeId, fail.Fail] {
 }
 
 fun append_type(ti: *TypeInterner, t: Type) res[TypeId, fail.Fail] {
+    if (t.kind::u32 >= TYPE_KIND_COUNT) { ret res[TypeId, fail.Fail].err{fail.message("type: kind is past TYPE_KIND_COUNT")}; }
     val count: usize = handle.chunk_count[Type](?ti.types);
     if (count >= TYPE_ERROR::usize) { ret res[TypeId, fail.Fail].err{fail.message("type identities are exhausted")}; }
     val tid: TypeId = count::TypeId;
@@ -2184,6 +2274,26 @@ fun eq_type(a: *Type, b: *Type) bool {
     }
 
     ret true;
+}
+
+# a kind appended without moving TYPE_KIND_COUNT cannot reach the table, so the
+# first test or build that makes one fails
+test append_type__refuses_a_kind_past_the_count {
+    var alloc: A.Allocator;
+    val made:  err[A.Error] = page.make(?alloc);
+    if (sel made.err) { ret 1; }
+    var ti:     TypeInterner;
+    val inited: err[fail.Fail] = init(?ti, ?alloc);
+    if (sel inited.err) { ret 1; }
+
+    var owner: TypeOwner;
+    val ok_r:  res[TypeId, fail.Fail] = intern_nominal(?ti, intern.STR_NIL, owner, TYPE_REC);
+    if (sel ok_r.err) { ret 2; }
+    val past_r: res[TypeId, fail.Fail] = intern_nominal(?ti, intern.STR_NIL, owner, TYPE_KIND_COUNT::TypeKind);
+    if (sel past_r.ok) { ret 3; }
+    val top_r: res[TypeId, fail.Fail] = intern_nominal(?ti, intern.STR_NIL, owner, 255::TypeKind);
+    if (sel top_r.ok) { ret 4; }
+    ret 0;
 }
 
 test intern_function__dedup_and_signature_equality {
