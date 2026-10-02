@@ -1342,7 +1342,7 @@ whether one instruction materializes the integer `value`, read at `bits`
 ## def ReadsConstFn
 
 ```mach
-pub def ReadsConstFn: fun(*mir.MirInstr, u32) bool
+pub def ReadsConstFn: fun(*codegen_mir.MirInstr, u32) bool
 ```
 
 whether the selected instruction reads operand `index` as a constant in
@@ -1370,7 +1370,7 @@ pub def RegFileFn: fun(*Register) i32
 ## def FrameDistFn
 
 ```mach
-pub def FrameDistFn: fun(*MachineModel, *mir.MirFunction, *u32, *u32)
+pub def FrameDistFn: fun(*MachineModel, *codegen_mir.MirFunction, *u32, *u32)
 ```
 
 ## rec BackendIdentity
@@ -1400,26 +1400,26 @@ pub rec BackendTarget;
 ## def SelectFn
 
 ```mach
-pub def SelectFn: fun(*A.Allocator, *BackendTarget, *mir.MirFunction) err[fail.Fail]
+pub def SelectFn: fun(*A.Allocator, *BackendTarget, *codegen_mir.MirFunction) err[fail.Fail]
 ```
 
 ## def EncodeFn
 
 ```mach
-pub def EncodeFn: fun(*A.Allocator, *BackendTarget, *mir.MirModule) res[encoding.EncoderOutput, fail.Fail]
+pub def EncodeFn: fun(*A.Allocator, *BackendTarget, *codegen_mir.MirModule) res[encoding.EncoderOutput, fail.Fail]
 ```
 
 ## def EmitAsmFn
 
 ```mach
-pub def EmitAsmFn: fun(*A.Allocator, *BackendTarget, *mir.MirModule,
-*writer.Writer) res[encoding.EncoderOutput, fail.Fail]
+pub def EmitAsmFn: fun(*A.Allocator, *BackendTarget, *codegen_mir.MirModule,
+*io_writer.Writer) res[encoding.EncoderOutput, fail.Fail]
 ```
 
 ## def EmitModuleFn
 
 ```mach
-pub def EmitModuleFn: fun(*A.Allocator, *BackendTarget, *unit_input.Unit, *debug_input.ModuleDebug, *of.ObjectImage) err[fail.Fail]
+pub def EmitModuleFn: fun(*A.Allocator, *BackendTarget, *unit_input.Unit, *debug_input.ModuleDebug, *target_of.ObjectImage) err[fail.Fail]
 ```
 
 a whole-module emitter fills the object image codegen initialized: its sections,
@@ -1447,7 +1447,7 @@ pub rec ModuleEmitter;
 ## def RelocSeam
 
 ```mach
-pub def RelocSeam: of.RelocationCapabilities
+pub def RelocSeam: target_of.RelocationCapabilities
 ```
 
 ## def OpOperandKind
@@ -2426,20 +2426,20 @@ pub fun with_const_operand_rule(m: *RegMachine, f: ReadsConstFn);
 ## fun reloc_seam
 
 ```mach
-pub fun reloc_seam(apply_reloc: of.ApplyRelocFn, reloc_traits: of.RelocTraitsFn,
-elf_reloc_type: of.ElfRelocTypeFn) RelocSeam;
+pub fun reloc_seam(apply_reloc: target_of.ApplyRelocFn, reloc_traits: target_of.RelocTraitsFn,
+elf_reloc_type: target_of.ElfRelocTypeFn) RelocSeam;
 ```
 
 ## fun with_elf_attributes
 
 ```mach
-pub fun with_elf_attributes(s: *RelocSeam, attributes: *of.ElfAttributes);
+pub fun with_elf_attributes(s: *RelocSeam, attributes: *target_of.ElfAttributes);
 ```
 
 ## fun with_local_got_kinds
 
 ```mach
-pub fun with_local_got_kinds(s: *RelocSeam, f: of.LocalGotKindFn);
+pub fun with_local_got_kinds(s: *RelocSeam, f: target_of.LocalGotKindFn);
 ```
 
 ## fun declares_local_got
@@ -2451,13 +2451,13 @@ pub fun declares_local_got(tgt_isa: *IsaVTable) bool;
 ## fun local_got_kind
 
 ```mach
-pub fun local_got_kind(tgt_isa: *IsaVTable, kind: of.RelocKind) bool;
+pub fun local_got_kind(tgt_isa: *IsaVTable, kind: target_of.RelocKind) bool;
 ```
 
 ## fun with_branch_thunks
 
 ```mach
-pub fun with_branch_thunks(s: *RelocSeam, reach: of.BranchReachFn, thunk: of.BranchThunkFn);
+pub fun with_branch_thunks(s: *RelocSeam, reach: target_of.BranchReachFn, thunk: target_of.BranchThunkFn);
 ```
 
 ## fun declares_branch_thunks
@@ -2469,7 +2469,7 @@ pub fun declares_branch_thunks(tgt_isa: *IsaVTable) bool;
 ## fun branch_reach
 
 ```mach
-pub fun branch_reach(tgt_isa: *IsaVTable, kind: of.RelocKind) opt[of.BranchReach];
+pub fun branch_reach(tgt_isa: *IsaVTable, kind: target_of.RelocKind) opt[target_of.BranchReach];
 ```
 
 the reach of a direct branch a thunk can extend, none for any other kind or
@@ -2478,7 +2478,7 @@ an instruction set that places no thunks
 ## fun with_machine_flags
 
 ```mach
-pub fun with_machine_flags(s: *RelocSeam, f: of.MachineFlagsFn);
+pub fun with_machine_flags(s: *RelocSeam, f: target_of.MachineFlagsFn);
 ```
 
 ## fun declares_machine_flags
@@ -2497,19 +2497,19 @@ has_compressed: bool) u32;
 ## fun with_normalize_image
 
 ```mach
-pub fun with_normalize_image(s: *RelocSeam, f: of.NormalizeImageFn);
+pub fun with_normalize_image(s: *RelocSeam, f: target_of.NormalizeImageFn);
 ```
 
 ## fun with_resolve_reloc_operand
 
 ```mach
-pub fun with_resolve_reloc_operand(s: *RelocSeam, f: of.ResolveRelocOperandFn);
+pub fun with_resolve_reloc_operand(s: *RelocSeam, f: target_of.ResolveRelocOperandFn);
 ```
 
 ## fun with_attributes
 
 ```mach
-pub fun with_attributes(s: *RelocSeam, build: of.BuildAttributesFn, merge: of.MergeAttributesFn, validate: of.ValidateAttributesFn);
+pub fun with_attributes(s: *RelocSeam, build: target_of.BuildAttributesFn, merge: target_of.MergeAttributesFn, validate: target_of.ValidateAttributesFn);
 ```
 
 ## fun declares_attributes
@@ -2542,7 +2542,7 @@ add: *u8, add_len: u32, out_len: *u32) res[*u8, fail.Fail];
 ## fun object_target
 
 ```mach
-pub fun object_target(vt: *IsaVTable, out: *of.ObjectTarget);
+pub fun object_target(vt: *IsaVTable, out: *target_of.ObjectTarget);
 ```
 
 ## fun machine_isa

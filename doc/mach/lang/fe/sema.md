@@ -1,153 +1,153 @@
 # mach.lang.fe.sema
 
-## fwd context.SemaResult
+## fwd sema_context.SemaResult
 
 ```mach
-fwd context.SemaResult
+fwd sema_context.SemaResult
 ```
 
 forwards [`mach.lang.fe.sema.context.SemaResult`](sema/context.md#rec-semaresult)
 
-## fwd context.ModuleSema
+## fwd sema_context.ModuleSema
 
 ```mach
-fwd context.ModuleSema
+fwd sema_context.ModuleSema
 ```
 
 forwards [`mach.lang.fe.sema.context.ModuleSema`](sema/context.md#rec-modulesema)
 
-## fwd context.SemaDeps
+## fwd sema_context.SemaDeps
 
 ```mach
-fwd context.SemaDeps
+fwd sema_context.SemaDeps
 ```
 
 forwards [`mach.lang.fe.sema.context.SemaDeps`](sema/context.md#rec-semadeps)
 
-## fwd context.FieldEntry
+## fwd sema_context.FieldEntry
 
 ```mach
-fwd context.FieldEntry
+fwd sema_context.FieldEntry
 ```
 
 forwards [`mach.lang.type.FieldEntry`](../type.md#rec-fieldentry)
 
-## fwd context.FieldTable
+## fwd sema_context.FieldTable
 
 ```mach
-fwd context.FieldTable
+fwd sema_context.FieldTable
 ```
 
 forwards [`mach.lang.type.FieldTable`](../type.md#rec-fieldtable)
 
-## fwd context.SemaContext
+## fwd sema_context.SemaContext
 
 ```mach
-fwd context.SemaContext
+fwd sema_context.SemaContext
 ```
 
 forwards [`mach.lang.fe.sema.context.SemaContext`](sema/context.md#rec-semacontext)
 
-## fwd context.InstWorklist
+## fwd sema_context.InstWorklist
 
 ```mach
-fwd context.InstWorklist
+fwd sema_context.InstWorklist
 ```
 
 forwards [`mach.lang.fe.sema.context.InstWorklist`](sema/context.md#rec-instworklist)
 
-## fwd context.inst_worklist_new
+## fwd sema_context.inst_worklist_new
 
 ```mach
-fwd context.inst_worklist_new
+fwd sema_context.inst_worklist_new
 ```
 
 forwards [`mach.lang.fe.sema.context.inst_worklist_new`](sema/context.md#fun-inst_worklist_new)
 
-## fwd context.inst_worklist_free
+## fwd sema_context.inst_worklist_free
 
 ```mach
-fwd context.inst_worklist_free
+fwd sema_context.inst_worklist_free
 ```
 
 forwards [`mach.lang.fe.sema.context.inst_worklist_free`](sema/context.md#fun-inst_worklist_free)
 
-## fwd context.resolved_type_of
+## fwd sema_context.resolved_type_of
 
 ```mach
-fwd context.resolved_type_of
+fwd sema_context.resolved_type_of
 ```
 
 forwards [`mach.lang.fe.sema.context.resolved_type_of`](sema/context.md#fun-resolved_type_of)
 
-## fwd context.decl_type_for
+## fwd sema_context.decl_type_for
 
 ```mach
-fwd context.decl_type_for
+fwd sema_context.decl_type_for
 ```
 
 forwards [`mach.lang.fe.sema.context.decl_type_for`](sema/context.md#fun-decl_type_for)
 
-## fwd context.symbol_for_expr
+## fwd sema_context.symbol_for_expr
 
 ```mach
-fwd context.symbol_for_expr
+fwd sema_context.symbol_for_expr
 ```
 
 forwards [`mach.lang.fe.sema.context.symbol_for_expr`](sema/context.md#fun-symbol_for_expr)
 
-## fwd context.symbol_for_type
+## fwd sema_context.symbol_for_type
 
 ```mach
-fwd context.symbol_for_type
+fwd sema_context.symbol_for_type
 ```
 
 forwards [`mach.lang.fe.sema.context.symbol_for_type`](sema/context.md#fun-symbol_for_type)
 
-## fwd context.symbol_by_id
+## fwd sema_context.symbol_by_id
 
 ```mach
-fwd context.symbol_by_id
+fwd sema_context.symbol_by_id
 ```
 
 forwards [`mach.lang.fe.sema.context.symbol_by_id`](sema/context.md#fun-symbol_by_id)
 
-## fwd context.report
+## fwd sema_context.report
 
 ```mach
-fwd context.report
+fwd sema_context.report
 ```
 
 forwards [`mach.lang.fe.sema.context.report`](sema/context.md#fun-report)
 
-## fwd context.field_table_stage
+## fwd sema_context.field_table_stage
 
 ```mach
-fwd context.field_table_stage
+fwd sema_context.field_table_stage
 ```
 
 forwards [`mach.lang.fe.sema.context.field_table_stage`](sema/context.md#fun-field_table_stage)
 
-## fwd context.field_table_publish
+## fwd sema_context.field_table_publish
 
 ```mach
-fwd context.field_table_publish
+fwd sema_context.field_table_publish
 ```
 
 forwards [`mach.lang.fe.sema.context.field_table_publish`](sema/context.md#fun-field_table_publish)
 
-## fwd context.field_table_for
+## fwd sema_context.field_table_for
 
 ```mach
-fwd context.field_table_for
+fwd sema_context.field_table_for
 ```
 
 forwards [`mach.lang.fe.sema.context.field_table_for`](sema/context.md#fun-field_table_for)
 
-## fwd context.field_lookup
+## fwd sema_context.field_lookup
 
 ```mach
-fwd context.field_lookup
+fwd sema_context.field_lookup
 ```
 
 forwards [`mach.lang.fe.sema.context.field_lookup`](sema/context.md#fun-field_lookup)
@@ -159,10 +159,10 @@ pub fun sema(
 s: *session.Session,
 a: *ast.Ast,
 rr: *resolve.ResolveResult,
-deps: *context.SemaDeps,
+deps: *sema_context.SemaDeps,
 ctx: *comptime.ComptimeCtx,
 own_module: session.ModuleId,
-diags: *diagnostic.DiagnosticStore) res[context.SemaResult, fail.Fail];
+diags: *diagnostic.DiagnosticStore) res[sema_context.SemaResult, fail.Fail];
 ```
 
 ## fun reinfer_pack_each_body
@@ -172,17 +172,17 @@ pub fun reinfer_pack_each_body(
 s: *session.Session,
 a: *ast.Ast,
 rr: *resolve.ResolveResult,
-deps: *context.SemaDeps,
+deps: *sema_context.SemaDeps,
 ctx: *comptime.ComptimeCtx,
 own_module: session.ModuleId,
-sema_result: *context.SemaResult,
+sema_result: *sema_context.SemaResult,
 fn_ret: type.TypeId,
 body_start: u32,
 body_len: u32,
 subst_owner: type.GenericOwner,
 subst: *type.TypeId,
 subst_len: u32,
-insts: *context.InstWorklist,
+insts: *sema_context.InstWorklist,
 diags: *diagnostic.DiagnosticStore) err[fail.Fail];
 ```
 
@@ -193,12 +193,12 @@ pub fun reinfer_instance_body(
 s: *session.Session,
 a: *ast.Ast,
 rr: *resolve.ResolveResult,
-deps: *context.SemaDeps,
+deps: *sema_context.SemaDeps,
 ctx: *comptime.ComptimeCtx,
 own_module: session.ModuleId,
-sema_result: *context.SemaResult,
+sema_result: *sema_context.SemaResult,
 fn_ret: type.TypeId,
-body: id.StmtId,
+body: ast_id.StmtId,
 subst_owner: type.GenericOwner,
 subst: *type.TypeId,
 subst_len: u32,
@@ -208,6 +208,6 @@ diags: *diagnostic.DiagnosticStore) err[fail.Fail];
 ## fun dnit_result
 
 ```mach
-pub fun dnit_result(r: *context.SemaResult);
+pub fun dnit_result(r: *sema_context.SemaResult);
 ```
 

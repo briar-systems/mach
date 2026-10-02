@@ -24,7 +24,7 @@ pub fun free_unwind_plan(alloc: *A.Allocator, plan: *UnwindPlan);
 ## fun claim_unwind_inputs
 
 ```mach
-pub fun claim_unwind_inputs(tgt: *target.Target, builds_tables: bool, modules: *of.ObjectImage, module_count: u32,
+pub fun claim_unwind_inputs(tgt: *lang_target.Target, builds_tables: bool, modules: *target_of.ObjectImage, module_count: u32,
 sec_base: *u32, placements: *Placement);
 ```
 
@@ -36,8 +36,8 @@ places those sections as the merge would
 ## fun reserve_unwind_tables
 
 ```mach
-pub fun reserve_unwind_tables(s: *session.Session, tgt: *target.Target,
-modules: *of.ObjectImage, module_count: u32, sec_base: *u32, atoms: *AtomPlan,
+pub fun reserve_unwind_tables(s: *session.Session, tgt: *lang_target.Target,
+modules: *target_of.ObjectImage, module_count: u32, sec_base: *u32, atoms: *AtomPlan,
 merged: *MergedSection, groups: *SectionGroups, placements: *Placement, plan: *UnwindPlan) res[bool, fail.Fail];
 ```
 
@@ -52,10 +52,10 @@ after the code
 ## fun resolve_native_unwind
 
 ```mach
-pub fun resolve_native_unwind(s: *session.Session, plan: *UnwindPlan, modules: *of.ObjectImage,
-placements: *Placement, sec_base: *u32, merged_to_out: *u32, out_img: *of.ObjectImage,
+pub fun resolve_native_unwind(s: *session.Session, plan: *UnwindPlan, modules: *target_of.ObjectImage,
+placements: *Placement, sec_base: *u32, merged_to_out: *u32, out_img: *target_of.ObjectImage,
 sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState, local_got: *LocalGotPlan,
-format: *of.OfVTable, arch: *isa.IsaVTable, image_base: u64, atoms: *AtomPlan, count: *u32) res[*of.NativeUnwind, fail.Fail];
+format: *target_of.OfVTable, arch: *isa.IsaVTable, image_base: u64, atoms: *AtomPlan, count: *u32) res[*target_of.NativeUnwind, fail.Fail];
 ```
 
 the functions the foreign unwind indexes describe, at their final addresses,

@@ -378,7 +378,7 @@ nested load and read the same entry afterwards
 ## fun module_by_file
 
 ```mach
-pub fun module_by_file(p: *Project, fid: src.FileId) opt[session.ModuleId];
+pub fun module_by_file(p: *Project, fid: lang_source.FileId) opt[session.ModuleId];
 ```
 
 the loaded module a source file backs, by a scan of the module table: editor edits
@@ -391,6 +391,6 @@ ret: the module's id, or none when no loaded module reads that file
 ## fun drop_surface
 
 ```mach
-pub fun drop_surface(a: *A.Allocator, slot: **sema.ModuleSema);
+pub fun drop_surface(a: *A.Allocator, slot: **fe_sema.ModuleSema);
 ```
 

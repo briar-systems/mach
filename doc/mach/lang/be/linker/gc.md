@@ -48,7 +48,7 @@ pub fun reloc_ref_lower(refs: *AtomRelocRef, count: u32, section: u32) u32;
 ## fun add_fallback_winners
 
 ```mach
-pub fun add_fallback_winners(modules: *of.ObjectImage, module_count: u32,
+pub fun add_fallback_winners(modules: *target_of.ObjectImage, module_count: u32,
 winners: *map.Map[intern.StrId, AtomWinner]) err[fail.Fail];
 ```
 
@@ -59,7 +59,7 @@ external stands as the name's winner
 ## fun resolve_reference
 
 ```mach
-pub fun resolve_reference(modules: *of.ObjectImage, m: u32, sy: u32,
+pub fun resolve_reference(modules: *target_of.ObjectImage, m: u32, sy: u32,
 winners: *map.Map[intern.StrId, AtomWinner], out: *AtomWinner) bool;
 ```
 
@@ -70,7 +70,7 @@ unresolved COFF weak external, in whichever object it stands, to its fallback
 ## fun build_reloc_refs
 
 ```mach
-pub fun build_reloc_refs(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
+pub fun build_reloc_refs(s: *session.Session, modules: *target_of.ObjectImage, module_count: u32,
 sec_base: *u32,
 winners: *map.Map[intern.StrId, AtomWinner],
 arch: *isa.IsaVTable, out_total: *u32) res[*AtomRelocRef, fail.Fail];
@@ -82,7 +82,7 @@ sorted by the flattened section it lands in
 ## fun collect_dead_atoms
 
 ```mach
-pub fun collect_dead_atoms(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
+pub fun collect_dead_atoms(s: *session.Session, modules: *target_of.ObjectImage, module_count: u32,
 sec_base: *u32, sec_total: u32,
 winners: *map.Map[intern.StrId, AtomWinner],
 refs: *AtomRelocRef, ref_total: u32, arch: *isa.IsaVTable,

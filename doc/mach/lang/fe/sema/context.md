@@ -293,7 +293,7 @@ pub rec SemaContext;
 ## fun report_deferred_name
 
 ```mach
-pub fun report_deferred_name(sc: *SemaContext, k: dkind.Kind, span: token.Span, prefix: str);
+pub fun report_deferred_name(sc: *SemaContext, k: diagnostic_kind.Kind, span: token.Span, prefix: str);
 ```
 
 a name resolve left for the arm sema selects (#3485), reported once at the name itself
@@ -302,25 +302,25 @@ whichever instantiation walks it, and never for an arm sema discards
 ## fun report_deferred_type
 
 ```mach
-pub fun report_deferred_type(sc: *SemaContext, ast_tid: id.TypeId);
+pub fun report_deferred_type(sc: *SemaContext, ast_tid: ast_id.TypeId);
 ```
 
 ## fun resolved_type_of
 
 ```mach
-pub fun resolved_type_of(sc: *SemaContext, ast_tid: id.TypeId) type.TypeId;
+pub fun resolved_type_of(sc: *SemaContext, ast_tid: ast_id.TypeId) type.TypeId;
 ```
 
 ## fun expression
 
 ```mach
-pub fun expression(sc: *SemaContext, eid: id.ExprId) res[expr.Expr, fail.Fail];
+pub fun expression(sc: *SemaContext, eid: ast_id.ExprId) res[ast_expr.Expr, fail.Fail];
 ```
 
 ## fun comptime_expression
 
 ```mach
-pub fun comptime_expression(sc: *SemaContext, a: *ast.Ast, eid: id.ExprId) res[expr.Expr, comptime.EvalFail];
+pub fun comptime_expression(sc: *SemaContext, a: *ast.Ast, eid: ast_id.ExprId) res[ast_expr.Expr, comptime.EvalFail];
 ```
 
 ## fun apply_subst
@@ -341,13 +341,13 @@ for it, and every question about it waits for an instantiation
 ## fun decl_body_spreads_pack_to_c_variadic
 
 ```mach
-pub fun decl_body_spreads_pack_to_c_variadic(sc: *SemaContext, origin: session.ModuleId, did: id.DeclId) bool;
+pub fun decl_body_spreads_pack_to_c_variadic(sc: *SemaContext, origin: session.ModuleId, did: ast_id.DeclId) bool;
 ```
 
 ## fun record_instance
 
 ```mach
-pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.DeclId,
+pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: ast_id.DeclId,
 args: *type.TypeId, arg_len: u32, sig: type.TypeId,
 bare: intern.StrId, site: token.Span) res[u8, fail.Fail];
 ```
@@ -385,19 +385,19 @@ pub fun decl_type_for(sc: *SemaContext, sym: *resolve.Symbol) type.TypeId;
 ## fun symbol_for_expr
 
 ```mach
-pub fun symbol_for_expr(sc: *SemaContext, eid: id.ExprId) opt[*resolve.Symbol];
+pub fun symbol_for_expr(sc: *SemaContext, eid: ast_id.ExprId) opt[*resolve.Symbol];
 ```
 
 ## fun comptime_ident_is_runtime
 
 ```mach
-pub fun comptime_ident_is_runtime(sc: *SemaContext, eid: id.ExprId) bool;
+pub fun comptime_ident_is_runtime(sc: *SemaContext, eid: ast_id.ExprId) bool;
 ```
 
 ## fun symbol_for_type
 
 ```mach
-pub fun symbol_for_type(sc: *SemaContext, tid: id.TypeId) opt[*resolve.Symbol];
+pub fun symbol_for_type(sc: *SemaContext, tid: ast_id.TypeId) opt[*resolve.Symbol];
 ```
 
 ## fun symbol_by_id
@@ -421,7 +421,7 @@ pub val TEMPLATE_TRAIL_LABEL: str = "in this generic body, checked against this 
 ## fun report
 
 ```mach
-pub fun report(sc: *SemaContext, k: dkind.Kind, span: token.Span, message: str);
+pub fun report(sc: *SemaContext, k: diagnostic_kind.Kind, span: token.Span, message: str);
 ```
 
 ## fun check_handle_in_array
@@ -457,13 +457,13 @@ pub fun reported_since(sc: *SemaContext, mark: u64) bool;
 ## fun report_note
 
 ```mach
-pub fun report_note(sc: *SemaContext, k: dkind.Kind, span: token.Span, message: str, note: str);
+pub fun report_note(sc: *SemaContext, k: diagnostic_kind.Kind, span: token.Span, message: str, note: str);
 ```
 
 ## fun report_numbered
 
 ```mach
-pub fun report_numbered(sc: *SemaContext, k: dkind.Kind, span: token.Span, prefix: str, n: usize, suffix: str, fallback: str);
+pub fun report_numbered(sc: *SemaContext, k: diagnostic_kind.Kind, span: token.Span, prefix: str, n: usize, suffix: str, fallback: str);
 ```
 
 ## fun field_table_stage
@@ -513,19 +513,19 @@ the declared type of a field or case payload named on an owner; none for an unkn
 ## fun resolve_type_comparison_operand
 
 ```mach
-pub fun resolve_type_comparison_operand(sc: *SemaContext, eid: id.ExprId) res[opt[u32], comptime.EvalFail];
+pub fun resolve_type_comparison_operand(sc: *SemaContext, eid: ast_id.ExprId) res[opt[u32], comptime.EvalFail];
 ```
 
 ## fun resolve_module_member_const
 
 ```mach
-pub fun resolve_module_member_const(sc: *SemaContext, eid: id.ExprId) res[opt[comptime.CTValue], comptime.EvalFail];
+pub fun resolve_module_member_const(sc: *SemaContext, eid: ast_id.ExprId) res[opt[comptime.CTValue], comptime.EvalFail];
 ```
 
 ## fun own_nominal_declaration
 
 ```mach
-pub fun own_nominal_declaration(sc: *SemaContext, nominal: *type.Type) res[id.DeclId, fail.Fail];
+pub fun own_nominal_declaration(sc: *SemaContext, nominal: *type.Type) res[ast_id.DeclId, fail.Fail];
 ```
 
 ## fun definition_ast
@@ -538,7 +538,7 @@ pub fun definition_ast(sc: *SemaContext, origin: session.ModuleId) *ast.Ast;
 
 ```mach
 pub fun generic_owner_of_decl(s: *session.Session, a: *ast.Ast, origin: session.ModuleId,
-decl_id: id.DeclId) res[type.GenericOwner, fail.Fail];
+decl_id: ast_id.DeclId) res[type.GenericOwner, fail.Fail];
 ```
 
 the identity a declaration's type parameters carry (type.TypeGenericParam owner
@@ -553,13 +553,13 @@ pub fun generic_param_type_for(sc: *SemaContext, sym: *resolve.Symbol) type.Type
 ## fun embed_len_of
 
 ```mach
-pub fun embed_len_of(sc: *SemaContext, tid: id.TypeId) u64;
+pub fun embed_len_of(sc: *SemaContext, tid: ast_id.TypeId) u64;
 ```
 
 ## fun set_embed_len
 
 ```mach
-pub fun set_embed_len(sc: *SemaContext, tid: id.TypeId, len: u64);
+pub fun set_embed_len(sc: *SemaContext, tid: ast_id.TypeId, len: u64);
 ```
 
 ## fun record_embed_path
@@ -589,7 +589,7 @@ pub fun record_eval_result(sc: *SemaContext, r: res[comptime.CTValue, comptime.E
 ## fun attr_string_arg
 
 ```mach
-pub fun attr_string_arg(sc: *SemaContext, dec: *decl.Decorator, ord: u32, kind: dkind.Kind, kind_msg: str) opt[str];
+pub fun attr_string_arg(sc: *SemaContext, dec: *ast_decl.Decorator, ord: u32, kind: diagnostic_kind.Kind, kind_msg: str) opt[str];
 ```
 
 the string argument `ord` of an attribute evaluates to (#4022). one that is
@@ -599,7 +599,7 @@ the attribute, and a constant that is no string with `kind` and `kind_msg`
 ## fun require_constant_arg
 
 ```mach
-pub fun require_constant_arg(sc: *SemaContext, dec: *decl.Decorator, ord: u32);
+pub fun require_constant_arg(sc: *SemaContext, dec: *ast_decl.Decorator, ord: u32);
 ```
 
 an integer argument that is not a constant expression is refused as one;

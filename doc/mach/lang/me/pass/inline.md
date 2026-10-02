@@ -9,7 +9,7 @@ pub rec InlineBudget;
 ## fun run_in
 
 ```mach
-pub fun run_in(m: *ir.Module, tgt: *target.Target, available: *body.Available, out_report: *InlineBudget, workspace: *scratch.Workspace) res[bool, fail.Fail];
+pub fun run_in(m: *me_ir.Module, tgt: *lang_target.Target, available: *body.Available, out_report: *InlineBudget, workspace: *scratch.Workspace) res[bool, fail.Fail];
 ```
 
 the analysis (recursion marks, call counts, address-taken facts, duplication
@@ -20,7 +20,7 @@ module's
 ## fun mark_recursive
 
 ```mach
-pub fun mark_recursive(m: *ir.Module, recursive: *bool, scratch_alloc: *A.Allocator) err[fail.Fail];
+pub fun mark_recursive(m: *me_ir.Module, recursive: *bool, scratch_alloc: *A.Allocator) err[fail.Fail];
 ```
 
 the visit state is `scratch`; `recursive` is the caller's

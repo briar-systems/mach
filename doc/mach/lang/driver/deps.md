@@ -83,7 +83,7 @@ named wins, so a url with no checkout yet is refused by offline_dir and not by g
 ## fun git_candidate_source
 
 ```mach
-pub fun git_candidate_source(c: *GitCandidates) cand.CandidateSource;
+pub fun git_candidate_source(c: *GitCandidates) candidates.CandidateSource;
 ```
 
 ## fun release_for_commit
@@ -99,7 +99,7 @@ gitlink is a commit, and resolution deals in releases (#3689)
 ## fun release_needs
 
 ```mach
-pub fun release_needs(ctx: ptr, id: str, url: str, rel: *cand.Release, out: *resolver.ReleaseNeeds) err[outcome.Fail];
+pub fun release_needs(ctx: ptr, id: str, url: str, rel: *candidates.Release, out: *resolver.ReleaseNeeds) err[outcome.Fail];
 ```
 
 a release's requirements as the resolver reads them: its compiler range and its dependencies
@@ -119,7 +119,7 @@ the first release that reads `[project].mach`; an earlier compiler refuses the k
 ## fun mach_range_floor
 
 ```mach
-pub fun mach_range_floor(a: *A.Allocator, running: str) res[str, format.FormatError];
+pub fun mach_range_floor(a: *A.Allocator, running: str) res[str, std_format.FormatError];
 ```
 
 the compiler range a project is told to declare when `running` is the compiler: the oldest
@@ -129,7 +129,7 @@ the running major, so two authors on one project write the same range (#3572). o
 ## fun running_mach_range_floor
 
 ```mach
-pub fun running_mach_range_floor(a: *A.Allocator) res[str, format.FormatError];
+pub fun running_mach_range_floor(a: *A.Allocator) res[str, std_format.FormatError];
 ```
 
 mach_range_floor for this compiler

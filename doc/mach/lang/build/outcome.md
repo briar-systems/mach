@@ -76,7 +76,7 @@ pub fun reported() Fail;
 ## fun user
 
 ```mach
-pub fun user(k: dkind.Kind, message: str) Fail;
+pub fun user(k: diagnostic_kind.Kind, message: str) Fail;
 ```
 
 a failure names a live row of the registry: one that names none, or a
@@ -210,13 +210,13 @@ where the failure points, when it points at a file
 ## fun environment
 
 ```mach
-pub fun environment(k: dkind.Kind, message: str) Fail;
+pub fun environment(k: diagnostic_kind.Kind, message: str) Fail;
 ```
 
 ## fun kind_of
 
 ```mach
-pub fun kind_of(f: Fail) dkind.Kind;
+pub fun kind_of(f: Fail) diagnostic_kind.Kind;
 ```
 
 the kind the failure is reported as, NONE for a reported one, whose
@@ -256,7 +256,7 @@ pub fun read_text(e: reader.ReadError) str;
 ## fun write_text
 
 ```mach
-pub fun write_text(e: writer.WriteError) str;
+pub fun write_text(e: io_writer.WriteError) str;
 ```
 
 ## fun fs_text
@@ -268,13 +268,13 @@ pub fun fs_text(e: fs.FsError) str;
 ## fun str_text
 
 ```mach
-pub fun str_text(e: string.StrError) str;
+pub fun str_text(e: types_string.StrError) str;
 ```
 
 ## fun format_text
 
 ```mach
-pub fun format_text(e: format.FormatError) str;
+pub fun format_text(e: std_format.FormatError) str;
 ```
 
 ## fun toml_text
@@ -434,7 +434,7 @@ and the kind are kept
 ## fun user_fail
 
 ```mach
-pub fun user_fail(k: dkind.Kind, f: fail.Fail) Fail;
+pub fun user_fail(k: diagnostic_kind.Kind, f: fail.Fail) Fail;
 ```
 
 a phase failure the user caused (target selection, source loading, import
@@ -628,7 +628,7 @@ origin: the phase the failure is reported under
 ## fun record_diagnostics
 
 ```mach
-pub fun record_diagnostics(bo: *BuildOutcome, sources: *source.SourceMap, diags: *diagnostic.DiagnosticStore) err[Fail];
+pub fun record_diagnostics(bo: *BuildOutcome, sources: *lang_source.SourceMap, diags: *diagnostic.DiagnosticStore) err[Fail];
 ```
 
 the batch is a composite of two subsystems' snapshots, so its refusal is

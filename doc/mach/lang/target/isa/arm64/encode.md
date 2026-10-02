@@ -13,14 +13,14 @@ a logical immediate, the rule the middle end hoists a loop's constants by
 ## fun encode_arm64
 
 ```mach
-pub fun encode_arm64(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.MirModule) res[encode.EncoderOutput, fail.Fail];
+pub fun encode_arm64(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule) res[codegen_encode.EncoderOutput, fail.Fail];
 ```
 
 ## fun encode_arm64_asm
 
 ```mach
-pub fun encode_arm64_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *mir.MirModule,
-out: *writer.Writer) res[encode.EncoderOutput, fail.Fail];
+pub fun encode_arm64_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule,
+out: *io_writer.Writer) res[codegen_encode.EncoderOutput, fail.Fail];
 ```
 
 ## fun asm_returns

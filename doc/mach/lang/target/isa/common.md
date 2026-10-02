@@ -7,19 +7,19 @@ may leave unset
 ## fun is_mir_compare
 
 ```mach
-pub fun is_mir_compare(op: mir.MirOpcode) bool;
+pub fun is_mir_compare(op: codegen_mir.MirOpcode) bool;
 ```
 
 ## fun is_mir_divide
 
 ```mach
-pub fun is_mir_divide(op: mir.MirOpcode) bool;
+pub fun is_mir_divide(op: codegen_mir.MirOpcode) bool;
 ```
 
 ## fun is_mir_float_conv
 
 ```mach
-pub fun is_mir_float_conv(op: mir.MirOpcode) bool;
+pub fun is_mir_float_conv(op: codegen_mir.MirOpcode) bool;
 ```
 
 ## fun is_float_width

@@ -34,12 +34,12 @@ pub rec LocalGotPlan;
 ## fun patch_relocations
 
 ```mach
-pub fun patch_relocations(s: *session.Session, out_img: *of.ObjectImage,
-modules: *of.ObjectImage, module_count: u32,
+pub fun patch_relocations(s: *session.Session, out_img: *target_of.ObjectImage,
+modules: *target_of.ObjectImage, module_count: u32,
 placements: *Placement, sec_base: *u32, merged_to_out: *u32,
 sym_locs: *map.Map[intern.StrId, SymbolLoc],
 dyn: *DynState, local_got: *LocalGotPlan,
-strm: *StrMerge, format: *of.OfVTable,
+strm: *StrMerge, format: *target_of.OfVTable,
 arch: *isa.IsaVTable,
 image_base: u64, atoms: *AtomPlan, thunks: *ThunkPlan) err[fail.Fail];
 ```
@@ -47,9 +47,9 @@ image_base: u64, atoms: *AtomPlan, thunks: *ThunkPlan) err[fail.Fail];
 ## fun relocation_target_vaddr
 
 ```mach
-pub fun relocation_target_vaddr(s: *session.Session, modules: *of.ObjectImage, m: u32, ri: u32,
-placements: *Placement, sec_base: *u32, merged_to_out: *u32, out_img: *of.ObjectImage,
-sym_locs: *map.Map[intern.StrId, SymbolLoc], format: *of.OfVTable, arch: *isa.IsaVTable,
+pub fun relocation_target_vaddr(s: *session.Session, modules: *target_of.ObjectImage, m: u32, ri: u32,
+placements: *Placement, sec_base: *u32, merged_to_out: *u32, out_img: *target_of.ObjectImage,
+sym_locs: *map.Map[intern.StrId, SymbolLoc], format: *target_of.OfVTable, arch: *isa.IsaVTable,
 image_base: u64, atoms: *AtomPlan) res[opt[u64], fail.Fail];
 ```
 
@@ -60,10 +60,10 @@ defines no such symbol
 ## fun personality_slot
 
 ```mach
-pub fun personality_slot(s: *session.Session, modules: *of.ObjectImage, m: u32, ri: u32,
-placements: *Placement, sec_base: *u32, merged_to_out: *u32, out_img: *of.ObjectImage,
+pub fun personality_slot(s: *session.Session, modules: *target_of.ObjectImage, m: u32, ri: u32,
+placements: *Placement, sec_base: *u32, merged_to_out: *u32, out_img: *target_of.ObjectImage,
 sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState, local_got: *LocalGotPlan,
-format: *of.OfVTable, arch: *isa.IsaVTable, image_base: u64, atoms: *AtomPlan) res[of.UnwindPersonality, fail.Fail];
+format: *target_of.OfVTable, arch: *isa.IsaVTable, image_base: u64, atoms: *AtomPlan) res[target_of.UnwindPersonality, fail.Fail];
 ```
 
 the pointer slot relocation `ri` of module `m` reaches a personality through:
@@ -86,7 +86,7 @@ pub fun free_local_got_plan(alloc: *A.Allocator, plan: *LocalGotPlan);
 
 ```mach
 pub fun build_local_got_plan(s: *session.Session, arch: *isa.IsaVTable,
-modules: *of.ObjectImage,
+modules: *target_of.ObjectImage,
 module_count: u32, sym_locs: *map.Map[intern.StrId, SymbolLoc],
 sec_base: *u32, atoms: *AtomPlan,
 merged: *MergedSection, groups: *SectionGroups,
@@ -96,7 +96,7 @@ plan: *LocalGotPlan) err[fail.Fail];
 ## fun fill_local_got_slot
 
 ```mach
-pub fun fill_local_got_slot(s: *session.Session, out_img: *of.ObjectImage, merged_to_out: *u32, dyn: *DynState,
+pub fun fill_local_got_slot(s: *session.Session, out_img: *target_of.ObjectImage, merged_to_out: *u32, dyn: *DynState,
 plan: *LocalGotPlan, arch: *isa.IsaVTable, module: u32, symbol: u32, name: intern.StrId, local: bool,
 vaddr: u64, absolute: bool) res[u32, fail.Fail];
 ```

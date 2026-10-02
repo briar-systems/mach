@@ -21,7 +21,7 @@ pub fun segment_rows_free(alloc: *A.Allocator, s: *SegmentRows, seg_count: u32);
 ## fun place_segments
 
 ```mach
-pub fun place_segments(alloc: *A.Allocator, fp: *plan.FilePlan, segs: *of.LoadSegment, seg_count: u32,
+pub fun place_segments(alloc: *A.Allocator, fp: *of_plan.FilePlan, segs: *target_of.LoadSegment, seg_count: u32,
 hdr_span: usize, page: usize, first_at_span: bool) res[SegmentRows, fail.Fail];
 ```
 
@@ -32,13 +32,13 @@ same mapping), otherwise on the next page; the rest start on a page
 ## fun write_segment_bytes
 
 ```mach
-pub fun write_segment_bytes(buf: *u8, segs: *of.LoadSegment, seg_count: u32, seg_offsets: *usize);
+pub fun write_segment_bytes(buf: *u8, segs: *target_of.LoadSegment, seg_count: u32, seg_offsets: *usize);
 ```
 
 ## fun seg_is_data_const
 
 ```mach
-pub fun seg_is_data_const(dyn: *of.DynamicInfo, segs: *of.LoadSegment, ls: u32) bool;
+pub fun seg_is_data_const(dyn: *target_of.DynamicInfo, segs: *target_of.LoadSegment, ls: u32) bool;
 ```
 
 a read-only segment dyld writes into before it maps it read-only
@@ -46,43 +46,43 @@ a read-only segment dyld writes into before it maps it read-only
 ## fun seg_vm_prot
 
 ```mach
-pub fun seg_vm_prot(dyn: *of.DynamicInfo, segs: *of.LoadSegment, ls: u32) u32;
+pub fun seg_vm_prot(dyn: *target_of.DynamicInfo, segs: *target_of.LoadSegment, ls: u32) u32;
 ```
 
 ## fun seg_group_of
 
 ```mach
-pub fun seg_group_of(dyn: *of.DynamicInfo, segs: *of.LoadSegment, ls: u32) u32;
+pub fun seg_group_of(dyn: *target_of.DynamicInfo, segs: *target_of.LoadSegment, ls: u32) u32;
 ```
 
 ## fun seg_group_first
 
 ```mach
-pub fun seg_group_first(dyn: *of.DynamicInfo, segs: *of.LoadSegment, ls: u32) u32;
+pub fun seg_group_first(dyn: *target_of.DynamicInfo, segs: *target_of.LoadSegment, ls: u32) u32;
 ```
 
 ## fun seg_group_last
 
 ```mach
-pub fun seg_group_last(dyn: *of.DynamicInfo, segs: *of.LoadSegment, seg_count: u32, first: u32) u32;
+pub fun seg_group_last(dyn: *target_of.DynamicInfo, segs: *target_of.LoadSegment, seg_count: u32, first: u32) u32;
 ```
 
 ## fun seg_group_count
 
 ```mach
-pub fun seg_group_count(dyn: *of.DynamicInfo, segs: *of.LoadSegment, seg_count: u32) u32;
+pub fun seg_group_count(dyn: *target_of.DynamicInfo, segs: *target_of.LoadSegment, seg_count: u32) u32;
 ```
 
 ## fun data_const_seg_count
 
 ```mach
-pub fun data_const_seg_count(dyn: *of.DynamicInfo, segs: *of.LoadSegment, seg_count: u32) u32;
+pub fun data_const_seg_count(dyn: *target_of.DynamicInfo, segs: *target_of.LoadSegment, seg_count: u32) u32;
 ```
 
 ## fun data_const_conflict_message
 
 ```mach
-pub fun data_const_conflict_message(itn: *intern.Interner, alloc: *A.Allocator, dyn: *of.DynamicInfo,
-segs: *of.LoadSegment, seg_count: u32) str;
+pub fun data_const_conflict_message(itn: *intern.Interner, alloc: *A.Allocator, dyn: *target_of.DynamicInfo,
+segs: *target_of.LoadSegment, seg_count: u32) str;
 ```
 

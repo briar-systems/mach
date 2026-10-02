@@ -9,6 +9,6 @@ pub val REG_CLASS_GP: u32 = 0
 ## fun run
 
 ```mach
-pub fun run(tgt: *target.Target, m: *mir.MirModule) err[fail.Fail];
+pub fun run(tgt: *lang_target.Target, m: *codegen_mir.MirModule) err[fail.Fail];
 ```
 

@@ -15,7 +15,7 @@ pub fun validate(buf: *u8, len: usize) res[SpvSummary, fail.Fail];
 ## fun debug_model
 
 ```mach
-pub fun debug_model() of.DebugVTable;
+pub fun debug_model() target_of.DebugVTable;
 ```
 
 the spirv model is written into the module by the emitter: names, sources and line markers
@@ -23,6 +23,6 @@ the spirv model is written into the module by the emitter: names, sources and li
 ## fun register
 
 ```mach
-pub fun register(reg: *of.OfRegistry) err[fail.Fail];
+pub fun register(reg: *target_of.OfRegistry) err[fail.Fail];
 ```
 

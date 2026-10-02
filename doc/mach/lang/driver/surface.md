@@ -27,7 +27,7 @@ the test declarations of `a`, whole, in source order
 ## fun write
 
 ```mach
-pub fun write(fb: *dq.FpBuf, text: str, spans: *Vector[token.Span]) err[fail.Fail];
+pub fun write(fb: *driver_query.FpBuf, text: str, spans: *Vector[token.Span]) err[fail.Fail];
 ```
 
 the surface's bytes: the text with every omitted span removed

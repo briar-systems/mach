@@ -3,7 +3,7 @@
 ## fun flush
 
 ```mach
-pub fun flush(out: *writer.Writer, s: *session.Session, list: *diagnostic.DiagnosticStore);
+pub fun flush(out: *io_writer.Writer, s: *session.Session, list: *diagnostic.DiagnosticStore);
 ```
 
 render every diagnostic of a store to a writer, then an "N errors / M warnings" line
@@ -15,7 +15,7 @@ list: the diagnostics, rendered in order; nothing is written when it is empty
 ## fun flush_sources
 
 ```mach
-pub fun flush_sources(out: *writer.Writer, sources: *source.SourceMap, list: *diagnostic.DiagnosticStore);
+pub fun flush_sources(out: *io_writer.Writer, sources: *lang_source.SourceMap, list: *diagnostic.DiagnosticStore);
 ```
 
 render every diagnostic of a store to a writer, then an "N errors / M warnings" line
@@ -27,7 +27,7 @@ list: the diagnostics, rendered in order; nothing is written when it is empty
 ## fun headline_lead
 
 ```mach
-pub fun headline_lead(k: dkind.Kind);
+pub fun headline_lead(k: diagnostic_kind.Kind);
 ```
 
 write the lead of an error of kind `k` to stderr, `error[<key>]: `, for a
@@ -61,7 +61,7 @@ ret: the exit code `exit.of` maps the failure to
 ## fun outcome_code_w
 
 ```mach
-pub fun outcome_code_w(w: *writer.Writer, bo: *outcome.BuildOutcome) i64;
+pub fun outcome_code_w(w: *io_writer.Writer, bo: *outcome.BuildOutcome) i64;
 ```
 
 map a build outcome's severity to the process exit code

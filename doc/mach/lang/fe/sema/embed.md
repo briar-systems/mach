@@ -13,7 +13,7 @@ diagnostic that names why
 ## fun resolve_one
 
 ```mach
-pub fun resolve_one(sc: *context.SemaContext, did: id.DeclId, d: *decl.Decl,
-dec: *decl.Decorator) err[fail.Fail];
+pub fun resolve_one(sc: *sema_context.SemaContext, did: ast_id.DeclId, d: *ast_decl.Decl,
+dec: *ast_decl.Decorator) err[fail.Fail];
 ```
 

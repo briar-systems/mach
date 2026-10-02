@@ -3,14 +3,14 @@
 ## fun lower_module
 
 ```mach
-pub fun lower_module(tgt: *target.Target, m: *ir.Module, alloc: *A.Allocator, interner: *intern.Interner, srcmap: *source.SourceMap,
-diags: *diagnostic.DiagnosticStore) res[mir.MirModule, fail.Fail];
+pub fun lower_module(tgt: *resolved.Target, m: *me_ir.Module, alloc: *A.Allocator, interner: *intern.Interner, srcmap: *lang_source.SourceMap,
+diags: *diagnostic.DiagnosticStore) res[codegen_mir.MirModule, fail.Fail];
 ```
 
 ## fun pure_gep_mem
 
 ```mach
-pub fun pure_gep_mem(ctx: *lctx.LowerCtx, inst: *instr.Instruction) opt[mir.MirOperand];
+pub fun pure_gep_mem(ctx: *mir_context.LowerCtx, inst: *ir_instruction.Instruction) opt[codegen_mir.MirOperand];
 ```
 
 the memory operand of an element address that needs no instruction of its

@@ -243,7 +243,7 @@ expand `m`'s `[project].out` with `v`; a refusal points at the `out` value
 ## fun expand_artifact_output
 
 ```mach
-pub fun expand_artifact_output(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt.TargetRegistry,
+pub fun expand_artifact_output(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry,
 a: *ArtifactDef, project_out: str, vars: *TmplVars) res[str, outcome.Fail];
 ```
 

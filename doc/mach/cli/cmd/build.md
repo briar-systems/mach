@@ -40,7 +40,7 @@ ret: the plans, or a Fail: internal for session or registry setup, user for mani
 ## fun announce_profile
 
 ```mach
-pub fun announce_profile(r: *cli_diag.Report, planned: *Planned, bp: *plan.BuildPlan, quiet: bool);
+pub fun announce_profile(r: *cli_diagnostic.Report, planned: *Planned, bp: *build_plan.BuildPlan, quiet: bool);
 ```
 
 name the profile a plan builds before its progress lines, when a selection

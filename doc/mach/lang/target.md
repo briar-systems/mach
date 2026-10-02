@@ -56,42 +56,42 @@ fwd resolved.dit_mode_guaranteed
 
 forwards [`mach.lang.target.resolved.dit_mode_guaranteed`](target/resolved.md#fun-dit_mode_guaranteed)
 
-## fwd treg.TargetRegistry
+## fwd target_registry.TargetRegistry
 
 ```mach
-fwd treg.TargetRegistry
+fwd target_registry.TargetRegistry
 ```
 
 forwards [`mach.lang.target.registry.TargetRegistry`](target/registry.md#rec-targetregistry)
 
-## fwd treg.registry_init
+## fwd target_registry.registry_init
 
 ```mach
-fwd treg.registry_init
+fwd target_registry.registry_init
 ```
 
 forwards [`mach.lang.target.registry.registry_init`](target/registry.md#fun-registry_init)
 
-## fwd treg.registry_new
+## fwd target_registry.registry_new
 
 ```mach
-fwd treg.registry_new
+fwd target_registry.registry_new
 ```
 
 forwards [`mach.lang.target.registry.registry_new`](target/registry.md#fun-registry_new)
 
-## fwd treg.registry_dnit
+## fwd target_registry.registry_dnit
 
 ```mach
-fwd treg.registry_dnit
+fwd target_registry.registry_dnit
 ```
 
 forwards [`mach.lang.target.registry.registry_dnit`](target/registry.md#fun-registry_dnit)
 
-## fwd treg.registry_published
+## fwd target_registry.registry_published
 
 ```mach
-fwd treg.registry_published
+fwd target_registry.registry_published
 ```
 
 forwards [`mach.lang.target.registry.registry_published`](target/registry.md#fun-registry_published)
@@ -117,7 +117,7 @@ pub fun host_pointer_width() u32;
 ## fun host_va_list
 
 ```mach
-pub fun host_va_list() opt[os.VaList];
+pub fun host_va_list() opt[lang_target_os.VaList];
 ```
 
 ## fun host_abi_id
@@ -129,7 +129,7 @@ pub fun host_abi_id() u32;
 ## def DebugDescriptorProvider
 
 ```mach
-pub def DebugDescriptorProvider: fun() res[of.DebugVTable, fail.Fail]
+pub def DebugDescriptorProvider: fun() res[target_of.DebugVTable, fail.Fail]
 ```
 
 ## fun register_all
@@ -183,7 +183,7 @@ pub fun select_of(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: s
 ## fun tuple_page_size
 
 ```mach
-pub fun tuple_page_size(os_vt: *os.OsVTable, arch_vt: *isa.IsaVTable, of_vt: *of.OfVTable) res[u64, fail.Fail];
+pub fun tuple_page_size(os_vt: *lang_target_os.OsVTable, arch_vt: *isa.IsaVTable, of_vt: *target_of.OfVTable) res[u64, fail.Fail];
 ```
 
 the granularity the image is laid out at: a format a loader maps by page puts
@@ -232,7 +232,7 @@ vtable's model pointer and must outlive it
 ## fun registered_tuple_capability
 
 ```mach
-pub fun registered_tuple_capability(os_vt: *os.OsVTable, arch_vt: *isa.IsaVTable, abi_vt: *abi.AbiVTable, of_vt: *of.OfVTable) u32;
+pub fun registered_tuple_capability(os_vt: *lang_target_os.OsVTable, arch_vt: *isa.IsaVTable, abi_vt: *abi.AbiVTable, of_vt: *target_of.OfVTable) u32;
 ```
 
 the capability of one cell of the target matrix as a [target.*] table naming
@@ -270,7 +270,7 @@ pub fun select(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: str)
 ## fun artifact_naming
 
 ```mach
-pub fun artifact_naming(tgt: *resolved.Target, kind: of.ArtifactOutputKind) res[of.ArtifactName, fail.Fail];
+pub fun artifact_naming(tgt: *resolved.Target, kind: target_of.ArtifactOutputKind) res[target_of.ArtifactName, fail.Fail];
 ```
 
 ## val TUPLE_OK
@@ -336,6 +336,6 @@ pub val TUPLE_OS_ABI:          u32 = 9
 ## fun tuple_capability
 
 ```mach
-pub fun tuple_capability(os_vt: *os.OsVTable, isa_vt: *isa.IsaVTable, abi_vt: *abi.AbiVTable, of_vt: *of.OfVTable) u32;
+pub fun tuple_capability(os_vt: *lang_target_os.OsVTable, isa_vt: *isa.IsaVTable, abi_vt: *abi.AbiVTable, of_vt: *target_of.OfVTable) u32;
 ```
 

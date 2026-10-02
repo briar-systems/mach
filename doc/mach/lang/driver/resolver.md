@@ -25,7 +25,7 @@ read the release at all is the NeedsFn's err and stops resolution
 ## def NeedsFn
 
 ```mach
-pub def NeedsFn: fun(ptr, str, str, *cand.Release, *ReleaseNeeds) err[outcome.Fail]
+pub def NeedsFn: fun(ptr, str, str, *candidates.Release, *ReleaseNeeds) err[outcome.Fail]
 ```
 
 fills `out` (initialized by the caller over the solve's allocator) for one release
@@ -56,7 +56,7 @@ pub rec Choice;
 ## fun resolve
 
 ```mach
-pub fun resolve(a: *A.Allocator, src: *cand.CandidateSource, needs: NeedsFn, needs_ctx: ptr,
+pub fun resolve(a: *A.Allocator, src: *candidates.CandidateSource, needs: NeedsFn, needs_ctx: ptr,
 problem: *Problem) res[Vector[Choice], outcome.Fail];
 ```
 

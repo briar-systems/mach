@@ -3,7 +3,7 @@
 ## fun render_notes
 
 ```mach
-pub fun render_notes(buf: *enc.ByteBuf) err[fail.Fail];
+pub fun render_notes(buf: *codegen_encode.ByteBuf) err[fail.Fail];
 ```
 
 ## fun gp_name

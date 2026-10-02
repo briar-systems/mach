@@ -87,7 +87,7 @@ pub rec Value;
 ## fun instr
 
 ```mach
-pub fun instr(instr: id.InstructionId, ty: ir_type.IrTypeId) Value;
+pub fun instr(instr: ir_id.InstructionId, ty: ir_type.IrTypeId) Value;
 ```
 
 ## fun param

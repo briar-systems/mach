@@ -21,7 +21,7 @@ pub val FUSED_CC_COUNT: usize = 6
 ## fun select
 
 ```mach
-pub fun select(a: *A.Allocator, tgt: *isa.BackendTarget, f: *mir.MirFunction) err[fail.Fail];
+pub fun select(a: *A.Allocator, tgt: *isa.BackendTarget, f: *codegen_mir.MirFunction) err[fail.Fail];
 ```
 
 ## fun is_reg_move
@@ -39,7 +39,7 @@ pub fun is_trap_terminator(opcode: u32) bool;
 ## val RULES
 
 ```mach
-pub val RULES: [RULE_COUNT]rules.Rule = [RULE_COUNT]rules.Rule;
+pub val RULES: [RULE_COUNT]codegen_rules.Rule = [RULE_COUNT]codegen_rules.Rule;
 ```
 
 ## val COPY_OPCODES
@@ -57,6 +57,6 @@ pub val FUSED_CCS: [FUSED_CC_COUNT]u32 = [FUSED_CC_COUNT]u32;
 ## val PACK
 
 ```mach
-pub val PACK: rules.RulePack = rules.RulePack;
+pub val PACK: codegen_rules.RulePack = codegen_rules.RulePack;
 ```
 

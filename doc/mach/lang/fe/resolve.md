@@ -219,13 +219,13 @@ pub rec ResolveResult;
 ## fun param_symbol
 
 ```mach
-pub fun param_symbol(r: *ResolveResult, decl: id.DeclId, slot: u32) SymbolId;
+pub fun param_symbol(r: *ResolveResult, decl: ast_id.DeclId, slot: u32) SymbolId;
 ```
 
 ## fun type_owner
 
 ```mach
-pub fun type_owner(s: *session.Session, mid: session.ModuleId, file: src.FileId) type.TypeOwner;
+pub fun type_owner(s: *session.Session, mid: session.ModuleId, file: lang_source.FileId) type.TypeOwner;
 ```
 
 ## fun remap_result
@@ -255,7 +255,7 @@ diags: *diagnostic.DiagnosticStore) res[ResolveResult, fail.Fail];
 ## fun declaration_deprecation
 
 ```mach
-pub fun declaration_deprecation(s: *session.Session, mid: session.ModuleId, a: *ast.Ast, source: str, did: id.DeclId) res[deprecation.Deprecation, fail.Fail];
+pub fun declaration_deprecation(s: *session.Session, mid: session.ModuleId, a: *ast.Ast, source: str, did: ast_id.DeclId) res[deprecation.Deprecation, fail.Fail];
 ```
 
 the notice a declaration's own `#[deprecated]` decorator records; a malformed decorator is
@@ -273,7 +273,7 @@ constant string is reported by type checking and leaves the notice bare
 ## fun declaration_testing
 
 ```mach
-pub fun declaration_testing(a: *ast.Ast, source: str, did: id.DeclId) bool;
+pub fun declaration_testing(a: *ast.Ast, source: str, did: ast_id.DeclId) bool;
 ```
 
 whether a declaration carries `#[testing]`, which confines every reference to it to test code
@@ -311,7 +311,7 @@ pub fun symbol_is_runtime(sym: *Symbol) bool;
 ## fun expression
 
 ```mach
-pub fun expression(rr: *ResolveResult, a: *ast.Ast, eid: id.ExprId) res[expr.Expr, fail.Fail];
+pub fun expression(rr: *ResolveResult, a: *ast.Ast, eid: ast_id.ExprId) res[ast_expr.Expr, fail.Fail];
 ```
 
 ## fun unknown_catalog
