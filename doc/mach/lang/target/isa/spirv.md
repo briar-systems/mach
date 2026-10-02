@@ -14,12 +14,6 @@ pub val SPV_MODULE_SECTION: str = ".spirv"
 
 the one section a SPIR-V object image carries: the finished module
 
-## val SPV_VERSION_1_0
-
-```mach
-pub val SPV_VERSION_1_0: u32 = 0x00010000
-```
-
 ## val SPV_VERSION_1_2
 
 ```mach
@@ -30,12 +24,6 @@ pub val SPV_VERSION_1_2: u32 = 0x00010200
 
 ```mach
 pub val SPV_VERSION_1_3: u32 = 0x00010300
-```
-
-## val SPV_VERSION_1_4
-
-```mach
-pub val SPV_VERSION_1_4: u32 = 0x00010400
 ```
 
 ## val SPV_VERSION_1_5
@@ -108,12 +96,6 @@ pub val OP_NO_LINE:                   u32 = 317
 
 ```mach
 pub val OP_EXTENSION:                 u32 = 10
-```
-
-## val OP_EXT_INST_IMPORT
-
-```mach
-pub val OP_EXT_INST_IMPORT:           u32 = 11
 ```
 
 ## val OP_EXT_INST
@@ -1164,34 +1146,10 @@ pub val CAP_IMAGE_GATHER_EXTENDED:          u32 = 25
 pub val CAP_STORAGE_IMAGE_MULTISAMPLE:      u32 = 27
 ```
 
-## val CAP_IMAGE_CUBE_ARRAY
-
-```mach
-pub val CAP_IMAGE_CUBE_ARRAY:               u32 = 34
-```
-
 ## val CAP_MIN_LOD
 
 ```mach
 pub val CAP_MIN_LOD:                        u32 = 42
-```
-
-## val CAP_SAMPLED_1D
-
-```mach
-pub val CAP_SAMPLED_1D:                     u32 = 43
-```
-
-## val CAP_IMAGE_1D
-
-```mach
-pub val CAP_IMAGE_1D:                       u32 = 44
-```
-
-## val CAP_SAMPLED_CUBE_ARRAY
-
-```mach
-pub val CAP_SAMPLED_CUBE_ARRAY:             u32 = 45
 ```
 
 ## val CAP_SAMPLED_BUFFER
@@ -1318,12 +1276,6 @@ pub val CAP_ATOMIC_FLOAT64_ADD:                 u32 = 6034
 
 ```mach
 pub val CAP_INT64_IMAGE:                        u32 = 5016
-```
-
-## val CAP_VULKAN_MEMORY_MODEL
-
-```mach
-pub val CAP_VULKAN_MEMORY_MODEL:                u32 = 5345
 ```
 
 ## val CAP_VULKAN_MEMORY_MODEL_DEVICE_SCOPE
@@ -1453,24 +1405,6 @@ pub val NEED_SAMPLED_1D:                         u64 = 0x020
 pub val NEED_SAMPLED_CUBE_ARRAY:                 u64 = 0x040
 ```
 
-## val NEED_GROUP_NON_UNIFORM
-
-```mach
-pub val NEED_GROUP_NON_UNIFORM:                  u64 = 0x080
-```
-
-## val NEED_GROUP_NON_UNIFORM_ARITHMETIC
-
-```mach
-pub val NEED_GROUP_NON_UNIFORM_ARITHMETIC:       u64 = 0x100
-```
-
-## val NEED_GROUP_NON_UNIFORM_CLUSTERED
-
-```mach
-pub val NEED_GROUP_NON_UNIFORM_CLUSTERED:        u64 = 0x200
-```
-
 ## val NEED_IMAGE_1D
 
 ```mach
@@ -1501,124 +1435,10 @@ pub val NEED_IMAGE_BUFFER:                       u64 = 0x2000
 pub val NEED_STORAGE_EXTENDED_FORMATS:           u64 = 0x4000
 ```
 
-## val NEED_IMAGE_QUERY
-
-```mach
-pub val NEED_IMAGE_QUERY:                        u64 = 0x8000
-```
-
-## val NEED_READ_WITHOUT_FORMAT
-
-```mach
-pub val NEED_READ_WITHOUT_FORMAT:                u64 = 0x10000
-```
-
-## val NEED_WRITE_WITHOUT_FORMAT
-
-```mach
-pub val NEED_WRITE_WITHOUT_FORMAT:               u64 = 0x20000
-```
-
-## val NEED_GROUP_NON_UNIFORM_VOTE
-
-```mach
-pub val NEED_GROUP_NON_UNIFORM_VOTE:             u64 = 0x40000
-```
-
-## val NEED_GROUP_NON_UNIFORM_BALLOT
-
-```mach
-pub val NEED_GROUP_NON_UNIFORM_BALLOT:           u64 = 0x80000
-```
-
-## val NEED_GROUP_NON_UNIFORM_SHUFFLE
-
-```mach
-pub val NEED_GROUP_NON_UNIFORM_SHUFFLE:          u64 = 0x100000
-```
-
-## val NEED_GROUP_NON_UNIFORM_SHUFFLE_RELATIVE
-
-```mach
-pub val NEED_GROUP_NON_UNIFORM_SHUFFLE_RELATIVE: u64 = 0x200000
-```
-
-## val NEED_GROUP_NON_UNIFORM_QUAD
-
-```mach
-pub val NEED_GROUP_NON_UNIFORM_QUAD:             u64 = 0x400000
-```
-
-## val NEED_INT64_ATOMICS
-
-```mach
-pub val NEED_INT64_ATOMICS:             u64 = 0x800000
-```
-
-## val NEED_ATOMIC_FLOAT32_ADD
-
-```mach
-pub val NEED_ATOMIC_FLOAT32_ADD:        u64 = 0x1000000
-```
-
-## val NEED_ATOMIC_FLOAT64_ADD
-
-```mach
-pub val NEED_ATOMIC_FLOAT64_ADD:        u64 = 0x2000000
-```
-
-## val NEED_ATOMIC_FLOAT32_MIN_MAX
-
-```mach
-pub val NEED_ATOMIC_FLOAT32_MIN_MAX:    u64 = 0x4000000
-```
-
-## val NEED_ATOMIC_FLOAT64_MIN_MAX
-
-```mach
-pub val NEED_ATOMIC_FLOAT64_MIN_MAX:    u64 = 0x8000000
-```
-
-## val NEED_STORAGE_IMAGE_MULTISAMPLE
-
-```mach
-pub val NEED_STORAGE_IMAGE_MULTISAMPLE: u64 = 0x10000000
-```
-
-## val NEED_IMAGE_MS_ARRAY
-
-```mach
-pub val NEED_IMAGE_MS_ARRAY:            u64 = 0x20000000
-```
-
-## val NEED_MIN_LOD
-
-```mach
-pub val NEED_MIN_LOD:                   u64 = 0x40000000
-```
-
-## val NEED_IMAGE_GATHER_EXTENDED
-
-```mach
-pub val NEED_IMAGE_GATHER_EXTENDED:     u64 = 0x80000000
-```
-
-## val NEED_INT64_IMAGE
-
-```mach
-pub val NEED_INT64_IMAGE:               u64 = 0x100000000
-```
-
 ## val NEED_VULKAN_MEMORY_MODEL
 
 ```mach
 pub val NEED_VULKAN_MEMORY_MODEL:              u64 = 0x200000000
-```
-
-## val NEED_VULKAN_MEMORY_MODEL_DEVICE_SCOPE
-
-```mach
-pub val NEED_VULKAN_MEMORY_MODEL_DEVICE_SCOPE: u64 = 0x400000000
 ```
 
 ## val NEED_PHYSICAL_STORAGE_BUFFER
@@ -1627,103 +1447,10 @@ pub val NEED_VULKAN_MEMORY_MODEL_DEVICE_SCOPE: u64 = 0x400000000
 pub val NEED_PHYSICAL_STORAGE_BUFFER:          u64 = 0x800000000
 ```
 
-## val NEED_ATOMIC_FLOAT16_ADD
-
-```mach
-pub val NEED_ATOMIC_FLOAT16_ADD:     u64 = 0x1000000000
-```
-
-## val NEED_ATOMIC_FLOAT16_MIN_MAX
-
-```mach
-pub val NEED_ATOMIC_FLOAT16_MIN_MAX: u64 = 0x2000000000
-```
-
-## val NEED_STORAGE_BUFFER_16BIT_ACCESS
-
-```mach
-pub val NEED_STORAGE_BUFFER_16BIT_ACCESS:             u64 = 0x4000000000
-```
-
-## val NEED_UNIFORM_AND_STORAGE_BUFFER_16BIT_ACCESS
-
-```mach
-pub val NEED_UNIFORM_AND_STORAGE_BUFFER_16BIT_ACCESS: u64 = 0x8000000000
-```
-
-## val NEED_STORAGE_PUSH_CONSTANT16
-
-```mach
-pub val NEED_STORAGE_PUSH_CONSTANT16:                 u64 = 0x10000000000
-```
-
-## val NEED_STORAGE_INPUT_OUTPUT16
-
-```mach
-pub val NEED_STORAGE_INPUT_OUTPUT16:                  u64 = 0x20000000000
-```
-
-## val NEED_STORAGE_BUFFER_8BIT_ACCESS
-
-```mach
-pub val NEED_STORAGE_BUFFER_8BIT_ACCESS:              u64 = 0x40000000000
-```
-
-## val NEED_UNIFORM_AND_STORAGE_BUFFER_8BIT_ACCESS
-
-```mach
-pub val NEED_UNIFORM_AND_STORAGE_BUFFER_8BIT_ACCESS:  u64 = 0x80000000000
-```
-
-## val NEED_STORAGE_PUSH_CONSTANT8
-
-```mach
-pub val NEED_STORAGE_PUSH_CONSTANT8:                  u64 = 0x100000000000
-```
-
 ## val CAPABILITY_COUNT
 
 ```mach
 pub val CAPABILITY_COUNT: u32 = 45
-```
-
-## val SPV_EXT_ATOMIC_FLOAT_ADD
-
-```mach
-pub val SPV_EXT_ATOMIC_FLOAT_ADD:     str = "SPV_EXT_shader_atomic_float_add"
-```
-
-## val SPV_EXT_ATOMIC_FLOAT_MIN_MAX
-
-```mach
-pub val SPV_EXT_ATOMIC_FLOAT_MIN_MAX: str = "SPV_EXT_shader_atomic_float_min_max"
-```
-
-## val SPV_EXT_IMAGE_INT64
-
-```mach
-pub val SPV_EXT_IMAGE_INT64:          str = "SPV_EXT_shader_image_int64"
-```
-
-## val SPV_EXT_ATOMIC_FLOAT16_ADD
-
-```mach
-pub val SPV_EXT_ATOMIC_FLOAT16_ADD:   str = "SPV_EXT_shader_atomic_float16_add"
-```
-
-## val SPV_KHR_16BIT_STORAGE
-
-```mach
-pub val SPV_KHR_16BIT_STORAGE: str = "SPV_KHR_16bit_storage"
-```
-
-the extensions defining the 16- and 8-bit storage access capabilities, core from
-SPIR-V 1.3 and 1.5
-
-## val SPV_KHR_8BIT_STORAGE
-
-```mach
-pub val SPV_KHR_8BIT_STORAGE:  str = "SPV_KHR_8bit_storage"
 ```
 
 ## val SPV_KHR_VULKAN_MEMORY_MODEL
@@ -1912,12 +1639,6 @@ pub val EXT_SUBGROUP_SHUFFLE_RELATIVE:    u64 = 0x200
 pub val EXT_SUBGROUP_QUAD:                u64 = 0x400
 ```
 
-## val EXT_SUBGROUP_GRAPHICS_STAGES
-
-```mach
-pub val EXT_SUBGROUP_GRAPHICS_STAGES:     u64 = 0x800
-```
-
 ## val EXT_BUFFER_INT64_ATOMICS
 
 ```mach
@@ -2087,18 +1808,6 @@ pub val EXT_INT16:                            u64 = 0x2000000000
 pub val EXT_BUFFER_DEVICE_ADDRESS:            u64 = 0x4000000000
 ```
 
-## val EXT_INT64
-
-```mach
-pub val EXT_INT64:                            u64 = 0x8000000000
-```
-
-## val EXT_FLOAT64
-
-```mach
-pub val EXT_FLOAT64:                          u64 = 0x10000000000
-```
-
 ## val EXT_BUFFER_FLOAT16_ATOMICS
 
 ```mach
@@ -2177,35 +1886,10 @@ pub val EXT_UNIFORM_AND_STORAGE_BUFFER_8BIT_ACCESS:  u64 = 0x10000000000000
 pub val EXT_STORAGE_PUSH_CONSTANT8:                  u64 = 0x20000000000000
 ```
 
-## val EXT_STORAGE_ACCESS
-
-```mach
-pub val EXT_STORAGE_ACCESS: u64 = EXT_STORAGE_BUFFER_16BIT_ACCESS | EXT_UNIFORM_AND_STORAGE_BUFFER_16BIT_ACCESS | EXT_STORAGE_PUSH_CONSTANT16
-| EXT_STORAGE_INPUT_OUTPUT16 | EXT_STORAGE_BUFFER_8BIT_ACCESS | EXT_UNIFORM_AND_STORAGE_BUFFER_8BIT_ACCESS | EXT_STORAGE_PUSH_CONSTANT8
-```
-
-every storage feature
-
-## val EXT_ATOMICS
-
-```mach
-pub val EXT_ATOMICS: u64 = EXT_BUFFER_INT64_ATOMICS | EXT_SHARED_INT64_ATOMICS | EXT_BUFFER_FLOAT32_ATOMICS | EXT_BUFFER_FLOAT32_ATOMIC_ADD | EXT_BUFFER_FLOAT32_ATOMIC_MIN_MAX | EXT_BUFFER_FLOAT64_ATOMICS | EXT_BUFFER_FLOAT64_ATOMIC_ADD | EXT_BUFFER_FLOAT64_ATOMIC_MIN_MAX | EXT_SHARED_FLOAT32_ATOMICS | EXT_SHARED_FLOAT32_ATOMIC_ADD | EXT_SHARED_FLOAT32_ATOMIC_MIN_MAX | EXT_SHARED_FLOAT64_ATOMICS | EXT_SHARED_FLOAT64_ATOMIC_ADD | EXT_SHARED_FLOAT64_ATOMIC_MIN_MAX
-| EXT_IMAGE_INT64_ATOMICS | EXT_IMAGE_FLOAT32_ATOMICS | EXT_IMAGE_FLOAT32_ATOMIC_ADD | EXT_IMAGE_FLOAT32_ATOMIC_MIN_MAX
-| EXT_BUFFER_FLOAT16_ATOMICS | EXT_BUFFER_FLOAT16_ATOMIC_ADD | EXT_BUFFER_FLOAT16_ATOMIC_MIN_MAX | EXT_SHARED_FLOAT16_ATOMICS | EXT_SHARED_FLOAT16_ATOMIC_ADD | EXT_SHARED_FLOAT16_ATOMIC_MIN_MAX
-```
-
-every atomic feature
-
 ## val EXTENSION_COUNT
 
 ```mach
 pub val EXTENSION_COUNT: u32 = 54
-```
-
-## val ONLY_DEVICE
-
-```mach
-pub val ONLY_DEVICE: str = "it is a device feature the consumer enables for the whole module"
 ```
 
 ## val EXTENSIONS
@@ -2509,12 +2193,6 @@ pub val STORAGE_PHYSICAL_STORAGE_BUFFER: u32 = 5349
 pub val DECOR_BLOCK:          u32 = 2
 ```
 
-## val DECOR_BUFFER_BLOCK
-
-```mach
-pub val DECOR_BUFFER_BLOCK:   u32 = 3
-```
-
 ## val DECOR_BUILTIN
 
 ```mach
@@ -2749,24 +2427,6 @@ pub val SEMANTICS_SEQ_CST:          u32 = 0x10
 pub val SEMANTICS_WORKGROUP_MEMORY: u32 = 0x100
 ```
 
-## val SEMANTICS_MAKE_AVAILABLE
-
-```mach
-pub val SEMANTICS_MAKE_AVAILABLE:   u32 = 0x2000
-```
-
-## val SEMANTICS_MAKE_VISIBLE
-
-```mach
-pub val SEMANTICS_MAKE_VISIBLE:     u32 = 0x4000
-```
-
-## val SEMANTICS_VOLATILE
-
-```mach
-pub val SEMANTICS_VOLATILE:         u32 = 0x8000
-```
-
 ## val SEMANTICS_VULKAN_ONLY
 
 ```mach
@@ -2813,12 +2473,6 @@ pub val MEMORY_ACCESS_NON_PRIVATE_POINTER:    u32 = 0x20
 
 ```mach
 pub rec Builder;
-```
-
-## rec Vec
-
-```mach
-pub rec Vec;
 ```
 
 ## fun builder_init

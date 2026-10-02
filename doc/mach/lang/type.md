@@ -156,12 +156,6 @@ pub val TYPE_SECRET: TypeKind = 19
 pub val TYPE_VECTOR: TypeKind = 20
 ```
 
-## val VEC_COUNT
-
-```mach
-pub val VEC_COUNT: u32 = 10
-```
-
 ## val TYPE_HANDLE
 
 ```mach
@@ -264,15 +258,6 @@ pub fun is_prim(kind: TypeKind) bool;
 the primitive predicate: a kind is primitive exactly when the catalog names
 it, never because of where it sits in the TypeKind numbering
 
-## fun prim_index
-
-```mach
-pub fun prim_index(kind: TypeKind) opt[u32];
-```
-
-the catalog position of a primitive kind, the index of every table sized by
-PRIM_COUNT
-
 ## fun prim_kind_at
 
 ```mach
@@ -287,34 +272,16 @@ the kind at a catalog position, for walkers over 0..PRIM_COUNT
 pub fun prim_desc(kind: TypeKind) PrimDesc;
 ```
 
-## rec TypePointer
-
-```mach
-pub rec TypePointer;
-```
-
 ## rec TypeSecret
 
 ```mach
 pub rec TypeSecret;
 ```
 
-## rec TypeVector
-
-```mach
-pub rec TypeVector;
-```
-
 ## rec TypeHandle
 
 ```mach
 pub rec TypeHandle;
-```
-
-## rec TypeAbi
-
-```mach
-pub rec TypeAbi;
 ```
 
 ## val ABI_TYPE_VA_LIST
@@ -330,18 +297,6 @@ pub fun abi_type_c_name(tag: u32) opt[str];
 ```
 
 the C type an ABI type tag stands for, absent for a tag outside the catalog
-
-## rec VecShape
-
-```mach
-pub rec VecShape;
-```
-
-## fun vec_shape
-
-```mach
-pub fun vec_shape(index: u32) VecShape;
-```
 
 ## fun prim_name
 
@@ -413,12 +368,6 @@ pub fun float_kind_of(w: float.FloatWidth) TypeKind;
 
 the float kind of a width, f64 for FLOAT_W_NONE, the unsuffixed default
 
-## def VecFormStatus
-
-```mach
-pub def VecFormStatus: u8
-```
-
 ## val MAX_VEC_LANES
 
 ```mach
@@ -443,12 +392,6 @@ pub val VEC_FORM_OK:        VecFormStatus = 1
 pub val VEC_FORM_TOO_WIDE:  VecFormStatus = 2
 ```
 
-## val VEC_FORM_BAD_LANES
-
-```mach
-pub val VEC_FORM_BAD_LANES: VecFormStatus = 3
-```
-
 ## val VEC_FORM_BAD_ELEMENT
 
 ```mach
@@ -468,15 +411,6 @@ pub val VEC_LANE_MIN_BITS: u32 = 8
 ```mach
 pub val VEC_LANE_MAX_BITS: u32 = 64
 ```
-
-## fun vec_lane_kind_ok
-
-```mach
-pub fun vec_lane_kind_ok(kind: TypeKind) bool;
-```
-
-whether a primitive is a legal vector lane: a declared set, never "every
-primitive but ptr". a 128-bit lane has no packed form on any ISA (#3511)
 
 ## rec VecForm
 
@@ -522,12 +456,6 @@ persistent source identity, independent of the current module registry
 pub rec TypeNominal;
 ```
 
-## rec TypeGenericParam
-
-```mach
-pub rec TypeGenericParam;
-```
-
 ## rec GenericOwner
 
 ```mach
@@ -553,18 +481,6 @@ pub fun param_owner(p: *TypeGenericParam) GenericOwner;
 
 ```mach
 pub fun param_owned_by(p: *TypeGenericParam, who: *GenericOwner) bool;
-```
-
-## rec TypeInstance
-
-```mach
-pub rec TypeInstance;
-```
-
-## rec TypeCaseSelector
-
-```mach
-pub rec TypeCaseSelector;
 ```
 
 ## rec Type
@@ -808,12 +724,6 @@ pub fun pair_scan_mark(ti: *TypeInterner, scan: *PairScan, a: TypeId, b: TypeId)
 
 ```mach
 pub def GParamMemo: u8
-```
-
-## val GPARAM_UNKNOWN
-
-```mach
-pub val GPARAM_UNKNOWN: GParamMemo = 0
 ```
 
 ## val GPARAM_NO

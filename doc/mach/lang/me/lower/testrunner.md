@@ -54,16 +54,6 @@ declaration, in any comptime branch
 a: the module's parsed tree
 text: the module's source text, which decorator names are spans of
 
-## val TEST_STATUS_WIDE
-
-```mach
-pub val TEST_STATUS_WIDE: u64 = 255
-```
-
-the status a test result outside 0..255 exits with: the process exit code is
-eight bits on posix, so a wider result is folded to this value rather than
-truncated, and it can never read as a pass
-
 ## fun synthesize_dispatcher
 
 ```mach

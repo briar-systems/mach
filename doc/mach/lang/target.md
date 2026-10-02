@@ -108,28 +108,10 @@ pub fun host_os_id() u32;
 pub fun host_arch_id() u32;
 ```
 
-## fun host_pointer_width
-
-```mach
-pub fun host_pointer_width() u32;
-```
-
-## fun host_va_list
-
-```mach
-pub fun host_va_list() opt[lang_target_os.VaList];
-```
-
 ## fun host_abi_id
 
 ```mach
 pub fun host_abi_id() u32;
-```
-
-## def DebugDescriptorProvider
-
-```mach
-pub def DebugDescriptorProvider: fun() res[target_of.DebugVTable, fail.Fail]
 ```
 
 ## fun register_all
@@ -180,37 +162,11 @@ pub fun with_image(req: *TargetRequest, base: u64, stack_reserve: u64, stack_com
 pub fun select_of(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: str, of_name: str) res[resolved.Target, fail.Fail];
 ```
 
-## fun tuple_page_size
-
-```mach
-pub fun tuple_page_size(os_vt: *lang_target_os.OsVTable, arch_vt: *isa.IsaVTable, of_vt: *target_of.OfVTable) res[u64, fail.Fail];
-```
-
-the granularity the image is laid out at: a format a loader maps by page puts
-each segment on a page of its own, the operating system's page where it
-declares one (the largest a kernel of that system may use) and the isa's
-hardware page otherwise; a flat image has no page and is laid out byte-tight
-
 ## fun resolve
 
 ```mach
 pub fun resolve(reg: *TargetRegistry, req: *TargetRequest) res[resolved.Target, fail.Fail];
 ```
-
-## val TARGET_FINGERPRINT_VERSION
-
-```mach
-pub val TARGET_FINGERPRINT_VERSION: u8 = 14
-```
-
-version 9: the image domain carries how the convention passes an f16 (#3800).
-version 10: the model domain carries the vector register-width rows (#3751)
-version 11: the model domain carries the NaN conversion rule (#4125).
-version 12: the half rows each isa declares, the spirv environment's
-extensions and whether the float units return the first NaN operand (#3801)
-version 13: the model domain carries the vector compute-width rows (#4128)
-version 14: the model domain carries the gated alu width rows in place of
-the alu floor and ceiling (#4302)
 
 ## fun fingerprint
 
@@ -277,65 +233,5 @@ pub fun artifact_naming(tgt: *resolved.Target, kind: target_of.ArtifactOutputKin
 
 ```mach
 pub val TUPLE_OK:              u32 = 0
-```
-
-## val TUPLE_NO_CODEGEN
-
-```mach
-pub val TUPLE_NO_CODEGEN:      u32 = 1
-```
-
-## val TUPLE_ABI_MISMATCH
-
-```mach
-pub val TUPLE_ABI_MISMATCH:    u32 = 2
-```
-
-## val TUPLE_OS_NO_OF
-
-```mach
-pub val TUPLE_OS_NO_OF:        u32 = 3
-```
-
-## val TUPLE_OF_UNCOVERED
-
-```mach
-pub val TUPLE_OF_UNCOVERED:    u32 = 4
-```
-
-## val TUPLE_OF_SHAPE
-
-```mach
-pub val TUPLE_OF_SHAPE:        u32 = 5
-```
-
-## val TUPLE_OS_NO_ISA
-
-```mach
-pub val TUPLE_OS_NO_ISA:       u32 = 6
-```
-
-## val TUPLE_ABI_NEEDS_FLOAT
-
-```mach
-pub val TUPLE_ABI_NEEDS_FLOAT: u32 = 7
-```
-
-## val TUPLE_ABI_TRANSPORT
-
-```mach
-pub val TUPLE_ABI_TRANSPORT:   u32 = 8
-```
-
-## val TUPLE_OS_ABI
-
-```mach
-pub val TUPLE_OS_ABI:          u32 = 9
-```
-
-## fun tuple_capability
-
-```mach
-pub fun tuple_capability(os_vt: *lang_target_os.OsVTable, isa_vt: *isa.IsaVTable, abi_vt: *abi.AbiVTable, of_vt: *target_of.OfVTable) u32;
 ```
 

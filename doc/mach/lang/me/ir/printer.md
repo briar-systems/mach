@@ -18,21 +18,6 @@ the ir-debug dump: every instruction carries its whole record, so no two
 distinct instructions print the same. It is the compiler's debugging form and
 its text is not a contract
 
-## val IR_FORM_LISTING
-
-```mach
-pub val IR_FORM_LISTING: IrForm = 1
-```
-
-a readable listing: language type spellings, elided state, and positions as
-line and column. It is the form tooling reads
-
-## val IR_FORM_N
-
-```mach
-pub val IR_FORM_N: usize                 = 2
-```
-
 ## val IR_FORM_HELP
 
 ```mach
@@ -92,40 +77,4 @@ pub fun write_ir(d: *IrWriter) err[fail.Fail];
 ```
 
 render the module in the writer's form; a new row of IR_FORMS lands here
-
-## fun print_global
-
-```mach
-pub fun print_global(out: *io_writer.Writer, m: *me_ir.Module, g: *me_ir.Global, interner: *intern.Interner) err[fail.Fail];
-```
-
-## fun print_function
-
-```mach
-pub fun print_function(out: *io_writer.Writer, m: *me_ir.Module, fn: *me_ir.Function, interner: *intern.Interner) err[fail.Fail];
-```
-
-## fun print_block
-
-```mach
-pub fun print_block(out: *io_writer.Writer, m: *me_ir.Module, fn: *me_ir.Function, blk: *me_ir.Block, interner: *intern.Interner) err[fail.Fail];
-```
-
-## fun print_instruction
-
-```mach
-pub fun print_instruction(out: *io_writer.Writer, m: *me_ir.Module, fn: *me_ir.Function, ins: *ir_instruction.Instruction, iid: ir_id.InstructionId, interner: *intern.Interner) err[fail.Fail];
-```
-
-## fun print_value
-
-```mach
-pub fun print_value(out: *io_writer.Writer, m: *me_ir.Module, v: *value.Value, interner: *intern.Interner) err[fail.Fail];
-```
-
-## fun print_type
-
-```mach
-pub fun print_type(out: *io_writer.Writer, m: *me_ir.Module, tid: ir_type.IrTypeId) err[fail.Fail];
-```
 

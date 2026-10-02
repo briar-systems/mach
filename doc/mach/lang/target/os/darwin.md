@@ -6,18 +6,6 @@
 pub val DARWIN_BASE_ADDR: u64 = 0x100000000
 ```
 
-## val DARWIN_PAGE_SIZE
-
-```mach
-pub val DARWIN_PAGE_SIZE: u64 = 4096
-```
-
-## fun darwin_va_list
-
-```mach
-pub fun darwin_va_list(arch_id: u32) opt[lang_target_os.VaList];
-```
-
 ## fun register_darwin
 
 ```mach

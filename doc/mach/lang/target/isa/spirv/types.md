@@ -31,14 +31,6 @@ of the capability points at (#4334)
 pub fun types_init(b: *isa_spirv.Builder) TypeTable;
 ```
 
-## fun raise
-
-```mach
-pub fun raise(tt: *TypeTable, need: u64);
-```
-
-raises `need` for the use types are being built for
-
 ## fun raise_at
 
 ```mach

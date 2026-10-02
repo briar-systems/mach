@@ -96,12 +96,6 @@ pub def SymbolMark:   encoding.SymbolMark
 pub val CONST_F32: u8 = encoding.CONST_F32
 ```
 
-## val CONST_F64
-
-```mach
-pub val CONST_F64: u8 = encoding.CONST_F64
-```
-
 ## val CONST_VEC
 
 ```mach
@@ -397,27 +391,6 @@ target has, so no guard a target keeps is narrower than it
 pub rec EncodeState;
 ```
 
-## rec OpenReg
-
-```mach
-pub rec OpenReg;
-```
-
-a variable location published as a register: the binding it describes and
-the instruction start it was published at
-
-## def EncodeFunctionFn
-
-```mach
-pub def EncodeFunctionFn: fun(*EncodeState, *codegen_mir.MirFunction) err[fail.Fail]
-```
-
-## def PatchBranchFn
-
-```mach
-pub def PatchBranchFn: fun(*EncodeState, *BranchFixup, u32) err[fail.Fail]
-```
-
 ## rec EncodeHooks
 
 ```mach
@@ -428,12 +401,6 @@ pub rec EncodeHooks;
 
 ```mach
 pub fun hooks_blank() EncodeHooks;
-```
-
-## fun module_has_oblivious
-
-```mach
-pub fun module_has_oblivious(m: *codegen_mir.MirModule) bool;
 ```
 
 ## fun encode_module
@@ -518,12 +485,6 @@ pub fun reloc_pair_site(st: *EncodeState, high_kind: target_of.RelocKind,
 sym: intern.StrId) res[*RelocPairSite, fail.Fail];
 ```
 
-## fun const_align
-
-```mach
-pub fun const_align(kind: u8, len: u32) u32;
-```
-
 ## fun intern_const
 
 ```mach
@@ -581,39 +542,11 @@ not jumps to the else arm on the inverse condition and falls into the then arm
 pub fun push_row(st: *EncodeState, text_offset: u32, loc: lang_source.SrcLoc) err[fail.Fail];
 ```
 
-## fun push_varloc
-
-```mach
-pub fun push_varloc(st: *EncodeState, text_offset: u32, fn: *codegen_mir.MirFunction, vreg: u32, iid: u32) err[fail.Fail];
-```
-
-## fun push_const_varloc
-
-```mach
-pub fun push_const_varloc(st: *EncodeState, text_offset: u32, value: i64, iid: u32) err[fail.Fail];
-```
-
-a variable whose value is the constant `value` from here, held in no storage (#4185)
-
-## fun push_cmp_varloc
-
-```mach
-pub fun push_cmp_varloc(st: *EncodeState, text_offset: u32, fn: *codegen_mir.MirFunction, bind: *codegen_mir.MirDbgBinding) err[fail.Fail];
-```
-
 ## fun close_cmp_varlocs
 
 ```mach
 pub fun close_cmp_varlocs(st: *EncodeState, instr_start: u32, instr_end: u32);
 ```
-
-## fun begin_function_locations
-
-```mach
-pub fun begin_function_locations(st: *EncodeState);
-```
-
-a function's locations start closed and with no def outstanding
 
 ## fun emit_var_bindings
 

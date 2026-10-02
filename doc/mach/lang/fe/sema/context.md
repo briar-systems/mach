@@ -51,12 +51,6 @@ pub fun module_sema_dnit(module: *ModuleSema);
 pub def DefinitionPhase: u8
 ```
 
-## val DEFINITION_PARSED
-
-```mach
-pub val DEFINITION_PARSED:   DefinitionPhase = 0
-```
-
 ## val DEFINITION_RESOLVED
 
 ```mach
@@ -73,12 +67,6 @@ pub val DEFINITION_TYPED:    DefinitionPhase = 2
 
 ```mach
 pub rec Definition;
-```
-
-## rec AcquiredDefinition
-
-```mach
-pub rec AcquiredDefinition;
 ```
 
 ## rec DefinitionReader
@@ -173,18 +161,6 @@ pub rec InstReq;
 pub val INST_NONE: u32 = 4294967295
 ```
 
-## val MAX_CT_INSTANCE_DEPTH
-
-```mach
-pub val MAX_CT_INSTANCE_DEPTH: u32 = 32
-```
-
-## val MAX_CT_INSTANCES
-
-```mach
-pub val MAX_CT_INSTANCES: u32 = 8192
-```
-
 ## val RECORD_OK
 
 ```mach
@@ -195,12 +171,6 @@ pub val RECORD_OK:          u8 = 0
 
 ```mach
 pub val RECORD_LIMIT_DEPTH: u8 = 1
-```
-
-## val RECORD_LIMIT_COUNT
-
-```mach
-pub val RECORD_LIMIT_COUNT: u8 = 2
 ```
 
 ## rec InstWorklist
@@ -370,12 +340,6 @@ pub fun inst_worklist_free(wl: *InstWorklist);
 pub fun inst_worklist_dnit(sc: *SemaContext);
 ```
 
-## fun public_type_for
-
-```mach
-pub fun public_type_for(sc: *SemaContext, sym: *resolve.Symbol) opt[TypeExport];
-```
-
 ## fun decl_type_for
 
 ```mach
@@ -412,12 +376,6 @@ pub fun symbol_by_id(sc: *SemaContext, sid: resolve.SymbolId) opt[*resolve.Symbo
 pub fun machine_of(sc: *SemaContext) layout.Machine;
 ```
 
-## val TEMPLATE_TRAIL_LABEL
-
-```mach
-pub val TEMPLATE_TRAIL_LABEL: str = "in this generic body, checked against this instance's type arguments"
-```
-
 ## fun report
 
 ```mach
@@ -434,12 +392,6 @@ pub fun check_handle_in_array(sc: *SemaContext, ty: type.TypeId, span: token.Spa
 
 ```mach
 pub fun report_internal(sc: *SemaContext, span: token.Span, message: str);
-```
-
-## fun type_result
-
-```mach
-pub fun type_result(sc: *SemaContext, r: res[type.TypeId, fail.Fail]) type.TypeId;
 ```
 
 ## fun diag_mark

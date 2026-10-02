@@ -1,29 +1,5 @@
 # mach.lang.me.ir.opdesc
 
-## def IrEffects
-
-```mach
-pub def IrEffects: u32
-```
-
-## val EFF_TERMINATOR
-
-```mach
-pub val EFF_TERMINATOR:     IrEffects = 0x00000001
-```
-
-## val EFF_HAS_RESULT
-
-```mach
-pub val EFF_HAS_RESULT:     IrEffects = 0x00000002
-```
-
-## val EFF_READS_MEMORY
-
-```mach
-pub val EFF_READS_MEMORY:   IrEffects = 0x00000004
-```
-
 ## val EFF_WRITES_MEMORY
 
 ```mach
@@ -40,18 +16,6 @@ pub val EFF_MAY_CALL:       IrEffects = 0x00000010
 
 ```mach
 pub val EFF_MAY_TRAP:       IrEffects = 0x00000020
-```
-
-## val EFF_VOLATILE_OK
-
-```mach
-pub val EFF_VOLATILE_OK:    IrEffects = 0x00000040
-```
-
-## val EFF_ORDERED
-
-```mach
-pub val EFF_ORDERED:        IrEffects = 0x00000080
 ```
 
 ## val EFF_DISCARDABLE
@@ -76,12 +40,6 @@ pub val EFF_MOVABLE:        IrEffects = 0x00000400
 
 ```mach
 pub val EFF_CSE_SAFE:       IrEffects = 0x00000800
-```
-
-## val EFF_SECRET_MOVE
-
-```mach
-pub val EFF_SECRET_MOVE:    IrEffects = 0x00001000
 ```
 
 ## val EFF_OPERANDS_AGREE
@@ -198,48 +156,6 @@ pub def OperandRole: u8
 pub val ROLE_NONE:      OperandRole = 0
 ```
 
-## val ROLE_VALUE
-
-```mach
-pub val ROLE_VALUE:     OperandRole = 1
-```
-
-## val ROLE_ADDRESS
-
-```mach
-pub val ROLE_ADDRESS:   OperandRole = 2
-```
-
-## val ROLE_STORED
-
-```mach
-pub val ROLE_STORED:    OperandRole = 3
-```
-
-## val ROLE_SIZE
-
-```mach
-pub val ROLE_SIZE:      OperandRole = 4
-```
-
-## val ROLE_INDEX
-
-```mach
-pub val ROLE_INDEX:     OperandRole = 5
-```
-
-## val ROLE_LANE
-
-```mach
-pub val ROLE_LANE:      OperandRole = 6
-```
-
-## val ROLE_CONDITION
-
-```mach
-pub val ROLE_CONDITION: OperandRole = 7
-```
-
 ## val ROLE_CFG_EDGE
 
 ```mach
@@ -258,94 +174,16 @@ pub val ROLE_PHI_EDGE:  OperandRole = 9
 pub val ROLE_PHI_VALUE: OperandRole = 10
 ```
 
-## val ROLE_CALLEE
-
-```mach
-pub val ROLE_CALLEE:    OperandRole = 11
-```
-
-## val ROLE_CALL_ARG
-
-```mach
-pub val ROLE_CALL_ARG:  OperandRole = 12
-```
-
-## val ROLE_ASM_BIND
-
-```mach
-pub val ROLE_ASM_BIND:  OperandRole = 13
-```
-
 ## val ROLE_DEBUG
 
 ```mach
 pub val ROLE_DEBUG:     OperandRole = 14
 ```
 
-## def ArityKind
-
-```mach
-pub def ArityKind: u8
-```
-
-## val ARITY_EXACT
-
-```mach
-pub val ARITY_EXACT:    ArityKind = 0
-```
-
-## val ARITY_AT_LEAST
-
-```mach
-pub val ARITY_AT_LEAST: ArityKind = 1
-```
-
-## val ARITY_AT_MOST
-
-```mach
-pub val ARITY_AT_MOST:  ArityKind = 2
-```
-
-## val ARITY_PAIRS
-
-```mach
-pub val ARITY_PAIRS:    ArityKind = 3
-```
-
-## val ARITY_ANY
-
-```mach
-pub val ARITY_ANY:      ArityKind = 4
-```
-
-## def ResultTyping
-
-```mach
-pub def ResultTyping: u8
-```
-
-## val RESULT_NONE
-
-```mach
-pub val RESULT_NONE:     ResultTyping = 0
-```
-
-## val RESULT_DECLARED
-
-```mach
-pub val RESULT_DECLARED: ResultTyping = 1
-```
-
 ## val RESULT_MASK
 
 ```mach
 pub val RESULT_MASK:     ResultTyping = 2
-```
-
-## val RESULT_ADDRESS
-
-```mach
-pub val RESULT_ADDRESS:  ResultTyping = 3
 ```
 
 ## def IrVecOp
@@ -564,12 +402,6 @@ pub val IVEC_SIGN_MASK:   IrVecOp = 33
 pub def VecClass: u8
 ```
 
-## val VCLASS_NONE
-
-```mach
-pub val VCLASS_NONE:       VecClass = 0
-```
-
 ## val VCLASS_BINARY
 
 ```mach
@@ -650,12 +482,6 @@ the operand lanes it covers
 
 ```mach
 pub def CtClass: u8
-```
-
-## val CTC_NONE
-
-```mach
-pub val CTC_NONE:      CtClass = 0
 ```
 
 ## val CTC_INT_MUL
@@ -826,12 +652,6 @@ pub val LOWER_SELECT:      LowerRoute = 22
 pub val LOWER_CONST:       LowerRoute = 23
 ```
 
-## val OP_MAX_FIXED_OPERANDS
-
-```mach
-pub val OP_MAX_FIXED_OPERANDS: usize = 3
-```
-
 ## rec IrOpDescriptor
 
 ```mach
@@ -842,12 +662,6 @@ pub rec IrOpDescriptor;
 
 ```mach
 pub val IR_OP_DESCRIPTOR_COUNT: usize = 64
-```
-
-## fun is_known
-
-```mach
-pub fun is_known(k: ir_instruction.InstrKind) bool;
 ```
 
 ## fun describe
@@ -865,12 +679,6 @@ pub fun unknown_kind(a: *A.Allocator, k: ir_instruction.InstrKind, where: str) f
 the middle end's catalog adapter: an opcode a pass dispatch reaches that no
 arm names is an internal failure naming the catalog, the tag and the pass.
 the text lives in the module allocator, which outlives the pass
-
-## fun desc
-
-```mach
-pub fun desc(k: ir_instruction.InstrKind) *IrOpDescriptor;
-```
 
 ## fun has
 

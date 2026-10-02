@@ -31,12 +31,6 @@ the notification carries the instruction the encoder assembled, already
 spelled as an assembler reads it back; rendering is a separate step that
 needs a writer
 
-## fun fmov_imm8_exponent
-
-```mach
-pub fun fmov_imm8_exponent(imm8: u32) i32;
-```
-
 ## fun reg_name
 
 ```mach

@@ -6,9 +6,3 @@
 pub fun lower_stmt(ctx: *lower_context.LowerContext, sid: ast_id.StmtId) err[fail.Fail];
 ```
 
-## fun lower_stmt_list
-
-```mach
-pub fun lower_stmt_list(ctx: *lower_context.LowerContext, start: u32, len: u32) err[fail.Fail];
-```
-

@@ -66,15 +66,6 @@ pub val SH_COMPARE: Shape = 3
 
 <bool> <result> a b, operands at the comparison width
 
-## val SH_CONVERT
-
-```mach
-pub val SH_CONVERT: Shape = 4
-```
-
-<type> <result> a, the source typed from `src_float` when its operand
-carries no type of its own
-
 ## val SH_SHIFT
 
 ```mach

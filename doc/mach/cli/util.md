@@ -58,30 +58,6 @@ argc: number of entries
 argv: the arguments
 ret: the index, or argc when there is none
 
-## def OperandClass
-
-```mach
-pub def OperandClass: u8
-```
-
-how the project operand was given
-
-## val OPERAND_DIRECTORY
-
-```mach
-pub val OPERAND_DIRECTORY: OperandClass = 0
-```
-
-a directory containing mach.toml
-
-## val OPERAND_MANIFEST
-
-```mach
-pub val OPERAND_MANIFEST: OperandClass = 1
-```
-
-the path of the mach.toml itself
-
 ## rec ProjectLocation
 
 ```mach
@@ -92,8 +68,6 @@ a resolved project operand; every string is owned and freed by dnit_project_loca
 
 root: the project directory
 manifest: the path of its mach.toml
-display: the operand as the user typed it
-class: OPERAND_DIRECTORY or OPERAND_MANIFEST
 
 ## fun dnit_project_location
 
@@ -101,7 +75,7 @@ class: OPERAND_DIRECTORY or OPERAND_MANIFEST
 pub fun dnit_project_location(a: *A.Allocator, loc: *ProjectLocation);
 ```
 
-free the three strings of a location; nil strings are skipped
+free the two strings of a location; nil strings are skipped
 
 a: the allocator resolve_project_location was given
 loc: the location
@@ -145,21 +119,4 @@ a: allocator for the returned path
 name: the program name or path
 ret: the resolved path, owned by the caller; "PATH unset", "not found on PATH", or the
       direct-path error
-
-## fun resolve_cmd_in
-
-```mach
-pub fun resolve_cmd_in(a: *A.Allocator, name: str, search: str) res[str, outcome.Fail];
-```
-
-locate an executable through an explicit search list
-on windows the list separator is ';' and a name without a '.' is tried with each PATHEXT
-extension (default .COM;.EXE;.BAT;.CMD); elsewhere the separator is ':' and the name is
-tried as given. a name with a path separator is used directly, as in resolve_cmd
-
-a: allocator for the returned path
-name: the program name or path
-search: the separator-joined directories; empty segments are skipped
-ret: the first existing executable candidate, owned by the caller; "empty program name",
-        "not found on PATH", or the direct-path error
 

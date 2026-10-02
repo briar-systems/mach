@@ -112,15 +112,6 @@ pub fun new_vreg(ctx: *LowerCtx, reg_class: u32) res[codegen_mir.VRegId, fail.Fa
 pub fun new_vreg_vec(ctx: *LowerCtx, reg_class: u32, vec_bytes: u8) res[codegen_mir.VRegId, fail.Fail];
 ```
 
-## fun vec_bytes_of
-
-```mach
-pub fun vec_bytes_of(ctx: *LowerCtx, ty: ir_type.IrTypeId) u8;
-```
-
-the register bytes a value of `ty` is realized in when it is a vector, 0
-for any other value
-
 ## fun instr_vreg
 
 ```mach
@@ -192,14 +183,6 @@ that is not a function's
 ```mach
 pub fun fn_return_type(ctx: *LowerCtx) ir_type.IrTypeId;
 ```
-
-## fun sig_return_type
-
-```mach
-pub fun sig_return_type(ctx: *LowerCtx, sig: ir_type.IrTypeId) ir_type.IrTypeId;
-```
-
-the return type of a signature, IRT_NIL for a type that is not a function's
 
 ## fun is_result_image
 
@@ -359,13 +342,6 @@ pub fun emit_load_from_w(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, dst: codegen
 
 ```mach
 pub fun push_store_chunk(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, mem: codegen_mir.MirOperand, src: codegen_mir.MirOperand, w: u8) err[fail.Fail];
-```
-
-## fun store_vector_register
-
-```mach
-pub fun store_vector_register(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, dest: codegen_mir.MirOperand,
-value: codegen_mir.MirOperand, ty: ir_type.IrTypeId) err[fail.Fail];
 ```
 
 ## fun mem_at

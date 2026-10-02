@@ -12,12 +12,6 @@ pub rec Node;
 pub rec Roots;
 ```
 
-## def CaptureMode
-
-```mach
-pub def CaptureMode: u8
-```
-
 ## val RECIPES
 
 ```mach

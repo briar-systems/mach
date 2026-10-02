@@ -45,28 +45,10 @@ answers every member that needs no layout and rejects storage questions about a 
 pub fun resolve_layout_intrinsic(sc: *sema_context.SemaContext, eid: u32) res[opt[comptime.CTValue], comptime.EvalFail];
 ```
 
-## val LAYOUT_REPORTED_MSG
-
-```mach
-pub val LAYOUT_REPORTED_MSG: str = "this layout intrinsic could not be measured
-```
-
-## val REACHES_DEPTH_MSG
-
-```mach
-pub val REACHES_DEPTH_MSG: str = "this type nests deeper than the recursive-type checker can walk, so it cannot be proven to have a finite size
-```
-
 ## fun check_occurs_all
 
 ```mach
 pub fun check_occurs_all(sc: *sema_context.SemaContext) err[fail.Fail];
-```
-
-## val RECURSIVE_SCRATCH_MSG
-
-```mach
-pub val RECURSIVE_SCRATCH_MSG: str = "internal: out of memory allocating the recursive-type checker's scratch table
 ```
 
 ## fun check_uni_secrecy_all
@@ -121,11 +103,5 @@ pub fun type_is_generic_param(sc: *sema_context.SemaContext, ty: type.TypeId) bo
 
 ```mach
 pub fun resolve_type_ref(sc: *sema_context.SemaContext, tid: ast_id.TypeId) type.TypeId;
-```
-
-## fun type_is_per_iteration
-
-```mach
-pub fun type_is_per_iteration(sc: *sema_context.SemaContext, tid: ast_id.TypeId) bool;
 ```
 

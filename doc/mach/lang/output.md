@@ -10,22 +10,10 @@ interrupted write leaves the original intact. the build owns its output
 layout: `directory` and `reserve` replace a stale entry of the wrong kind,
 and every failure names the path and the operation
 
-## val DIR_MODE
-
-```mach
-pub val DIR_MODE: i32 = 0o755
-```
-
 ## fun intern_message
 
 ```mach
 pub fun intern_message(itn: *intern.Interner, a: *A.Allocator, buf: *u8, total: usize, generic: str) str;
-```
-
-## fun io_message
-
-```mach
-pub fun io_message(itn: *intern.Interner, a: *A.Allocator, op: str, path: str, os_error: str, generic: str) str;
 ```
 
 ## fun directory

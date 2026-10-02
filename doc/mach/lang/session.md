@@ -32,22 +32,10 @@ fwd module.STABLE_MODULE_NIL
 
 forwards [`mach.lang.module.STABLE_MODULE_NIL`](module.md#val-stable_module_nil)
 
-## rec Overlay
-
-```mach
-pub rec Overlay;
-```
-
 ## rec LinkProvider
 
 ```mach
 pub rec LinkProvider;
-```
-
-## rec LinkPublication
-
-```mach
-pub rec LinkPublication;
 ```
 
 ## rec Session
@@ -76,14 +64,6 @@ release the text and the places of the last query failure the session holds
 pub fun dnit(s: *Session);
 ```
 
-## fun expire_views
-
-```mach
-pub fun expire_views(s: *Session);
-```
-
-exhaustion permanently refuses new borrowed views while teardown remains infallible
-
 ## fun reset_module_registry
 
 ```mach
@@ -100,12 +80,6 @@ pub fun register_module_ast(s: *Session, mid: module.ModuleId, a: *ast.Ast) err[
 
 ```mach
 pub fun module_count(s: *Session) u32;
-```
-
-## fun register_module_fqn
-
-```mach
-pub fun register_module_fqn(s: *Session, mid: module.ModuleId, fqn: intern.StrId) err[fail.Fail];
 ```
 
 ## fun register_module_root_project
@@ -316,30 +290,6 @@ pub fun record_link_publication(s: *Session, path: str, revision: query.Revision
 
 ```mach
 pub fun lookup_link_publication(s: *Session, path: str, revision: query.Revision, out: *[32]u8) bool;
-```
-
-## fun reset_link_publications
-
-```mach
-pub fun reset_link_publications(s: *Session);
-```
-
-## fun register_module_sema
-
-```mach
-pub fun register_module_sema(s: *Session, mid: module.ModuleId, p: ptr) err[fail.Fail];
-```
-
-## fun register_module_resolve
-
-```mach
-pub fun register_module_resolve(s: *Session, mid: module.ModuleId, p: ptr) err[fail.Fail];
-```
-
-## fun register_module_comptime
-
-```mach
-pub fun register_module_comptime(s: *Session, mid: module.ModuleId, p: ptr) err[fail.Fail];
 ```
 
 ## fun register_module_phase

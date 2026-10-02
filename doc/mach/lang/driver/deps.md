@@ -108,24 +108,6 @@ selected by version range, or by an exact release tag. a release selecting anyth
 unless the root declares that identity and so selects it itself (#3553). a release whose
 manifest does not load or names another version is no candidate, which `out.excluded` says
 
-## val MACH_KEY_SINCE
-
-```mach
-pub val MACH_KEY_SINCE: str = "5.3.0"
-```
-
-the first release that reads `[project].mach`; an earlier compiler refuses the key as unknown
-
-## fun mach_range_floor
-
-```mach
-pub fun mach_range_floor(a: *A.Allocator, running: str) res[str, std_format.FormatError];
-```
-
-the compiler range a project is told to declare when `running` is the compiler: the oldest
-release of its major that reads the key, since a caret cannot span majors. it depends only on
-the running major, so two authors on one project write the same range (#3572). owned by `a`
-
 ## fun running_mach_range_floor
 
 ```mach
@@ -258,12 +240,6 @@ root owns the flat closure and a dependency's own dep/ is never realized.
 an empty directory git materializes for a consumed dependency's gitlink is not
 a realization and passes
 
-## fun verify_dep_manifest_id
-
-```mach
-pub fun verify_dep_manifest_id(s: *session.Session, dep_full: str, id: str) err[outcome.Fail];
-```
-
 ## val REALIZE_REPO_ROOT
 
 ```mach
@@ -280,12 +256,6 @@ pub val REALIZE_NESTED:    u8 = 1
 
 ```mach
 pub fun realization_mode(s: *session.Session, root: str) res[u8, outcome.Fail];
-```
-
-## fun dep_rel_of
-
-```mach
-pub fun dep_rel_of(alloc: *A.Allocator, id: str) res[str, outcome.Fail];
 ```
 
 ## fun dep_full_of
@@ -377,42 +347,10 @@ pub fun pinned_at_release(s: *session.Session, root: str, id: str, dep_full: str
 whether dep/<id> is pinned at the release `version` and its checkout is at that pin; a
 checkout drifted from its gitlink is not, whatever release it holds
 
-## val SLOT_ABSENT
-
-```mach
-pub val SLOT_ABSENT:   u8 = 0
-```
-
-what occupies dep/<id>
-
-## val SLOT_EMPTY
-
-```mach
-pub val SLOT_EMPTY:    u8 = 1
-```
-
 ## val SLOT_CHECKOUT
 
 ```mach
 pub val SLOT_CHECKOUT: u8 = 2
-```
-
-## val SLOT_OCCUPIED
-
-```mach
-pub val SLOT_OCCUPIED: u8 = 3
-```
-
-## val SLOT_SYMLINK
-
-```mach
-pub val SLOT_SYMLINK:  u8 = 4
-```
-
-## val SLOT_ENTRY
-
-```mach
-pub val SLOT_ENTRY:    u8 = 5
 ```
 
 ## rec GitSlot
@@ -472,15 +410,6 @@ pub val REALIZED_CLONED:      u8 = 5
 ```mach
 pub fun git_slot_dnit(alloc: *A.Allocator, slot: *GitSlot);
 ```
-
-## fun git_slot_recorded
-
-```mach
-pub fun git_slot_recorded(slot: *GitSlot) bool;
-```
-
-whether the slot has a record to read or write: the project root is a
-repository root, or a subdirectory of one
 
 ## fun observe_git_slot
 

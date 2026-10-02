@@ -68,12 +68,6 @@ a test build's test objects, lowered and generated
 pub val LEVEL_ITEMS:  u8 = 2
 ```
 
-## fun phase_valid
-
-```mach
-pub fun phase_valid(ph: u8) bool;
-```
-
 ## def Instant
 
 ```mach
@@ -101,12 +95,6 @@ pub fun elapsed(start: Instant) chrono_duration.Duration;
 pub rec PhaseMetrics;
 ```
 
-## def ProgressEventKind
-
-```mach
-pub def ProgressEventKind: u8
-```
-
 ## val PROGRESS_EVENT_PHASE
 
 ```mach
@@ -117,30 +105,6 @@ pub val PROGRESS_EVENT_PHASE:   ProgressEventKind = 0
 
 ```mach
 pub val PROGRESS_EVENT_ITEM:    ProgressEventKind = 1
-```
-
-## val PROGRESS_EVENT_SUMMARY
-
-```mach
-pub val PROGRESS_EVENT_SUMMARY: ProgressEventKind = 2
-```
-
-## rec PhaseEvent
-
-```mach
-pub rec PhaseEvent;
-```
-
-## rec ItemEvent
-
-```mach
-pub rec ItemEvent;
-```
-
-## rec SummaryEvent
-
-```mach
-pub rec SummaryEvent;
 ```
 
 ## rec ProgressEvent
@@ -165,12 +129,6 @@ pub fun init(pr: *Progress, alloc: *A.Allocator, level: u8);
 
 ```mach
 pub fun dnit(pr: *Progress);
-```
-
-## fun progress_valid
-
-```mach
-pub fun progress_valid(pr: *Progress) bool;
 ```
 
 ## fun unit_begin

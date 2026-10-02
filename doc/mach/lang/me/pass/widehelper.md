@@ -8,17 +8,6 @@ module's copy coalesces at link, as a generic instantiation does, and never
 inlined so a program pays for the code once. this module holds what the two
 passes share: the width test and the function synthesis (#3511)
 
-## val INLINE_BITS
-
-```mach
-pub val INLINE_BITS: u32 = 64
-```
-
-the widest integer the legalizer expands in place: a 64-bit value on a 32-bit
-ALU (rv32's i64) divides and converts inline, as it always has. an integer
-wider than this goes to a helper on every machine: its inline expansion is
-prohibitive, and the helpers' lanes are 64-bit (#3511, ruling Q5)
-
 ## fun wide_bits
 
 ```mach

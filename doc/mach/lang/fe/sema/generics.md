@@ -75,13 +75,6 @@ directly or through a pointer, array or secret: the instance is the declaration 
 arguments spell, and the same declaration written out is refused for that field. a
 pointer to a pointer to a handle is refused at the annotation that spells or forms it
 
-## fun check_type_uni_secrecy
-
-```mach
-pub fun check_type_uni_secrecy(sc: *sema_context.SemaContext, tid: type.TypeId, who: *type.GenericOwner,
-args: *type.TypeId, arg_len: u32, span: token.Span);
-```
-
 ## fun substitute
 
 ```mach

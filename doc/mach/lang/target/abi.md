@@ -232,18 +232,6 @@ double-word to an even register, C.11 and C.13 give the remaining general
 registers to nothing once an argument that wanted them goes to the stack, and
 C.3 does the same for the vector registers after an HFA or HVA) (#3511, #3928)
 
-## fun gp_piece_count
-
-```mach
-pub fun gp_piece_count(s: *ParamSlot) i32;
-```
-
-## fun fp_piece_count
-
-```mach
-pub fun fp_piece_count(s: *ParamSlot) i32;
-```
-
 ## val EB_SSE_LO
 
 ```mach
@@ -304,32 +292,6 @@ pub def RetPassingFn: fun(u64, u64, bool, u8, bool, bool, u8, u8, AggLayout, u64
 pub def RegFileFn: isa.RegFileFn
 ```
 
-## def VaModelFn
-
-```mach
-pub def VaModelFn: fun() VaModel
-```
-
-## def HalfRule
-
-```mach
-pub def HalfRule: u8
-```
-
-how a binary16 crosses a call, a row of each convention's table (#3800).
-HALF_INTEGER passes its bits in the integer slot a u16 takes. the float rows
-classify it as a float of two bytes, so it takes the float registers, float
-eightbytes and homogeneous-aggregate members a float does, and in a float
-register it is the low 16 bits: HALF_FLOAT leaves the rest unspecified, and
-HALF_FLOAT_NANBOX sets them, as the RISC-V psABI boxes a float narrower than
-its register
-
-## val HALF_INTEGER
-
-```mach
-pub val HALF_INTEGER:      HalfRule = 0
-```
-
 ## val HALF_FLOAT
 
 ```mach
@@ -367,12 +329,6 @@ pub fun piece_is_half(p: *ParamPiece) bool;
 
 a piece of a float register two bytes wide carries a binary16: no other
 float or vector a convention places is that narrow
-
-## def PassingModel
-
-```mach
-pub def PassingModel: u8
-```
 
 ## val PASSING_CARRIERS
 

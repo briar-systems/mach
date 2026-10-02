@@ -1027,21 +1027,6 @@ pub val FCVT_H_LU: MachOp = 167
 pub val MOP_LAST: MachOp = FCVT_H_LU
 ```
 
-## val ROW_COUNT
-
-```mach
-pub val ROW_COUNT: usize = 168
-```
-
-ROW_COUNT is MOP_LAST + 1 spelled as a literal so the array length is
-comptime; the catalog test holds the two together
-
-## val XL32
-
-```mach
-pub val XL32:   u8 = 0x01
-```
-
 ## val XL64
 
 ```mach
@@ -1052,12 +1037,6 @@ pub val XL64:   u8 = 0x02
 
 ```mach
 pub val XL_ANY: u8 = 0x03
-```
-
-## fun xlen_bit
-
-```mach
-pub fun xlen_bit(xlen_bytes: u8) u8;
 ```
 
 ## val OPC_LOAD
@@ -1072,12 +1051,6 @@ base opcodes, bits 6:0 of every word
 
 ```mach
 pub val OPC_LOAD_FP:   u32 = 0x07
-```
-
-## val OPC_MISC_MEM
-
-```mach
-pub val OPC_MISC_MEM:  u32 = 0x0F
 ```
 
 ## val OPC_OP_IMM
@@ -1238,50 +1211,6 @@ pub val F3_REM:  u32 = 0x6
 pub val F3_REMU: u32 = 0x7
 ```
 
-## val F3_MEM_B
-
-```mach
-pub val F3_MEM_B:  u32 = 0x0
-```
-
-funct3 of the memory forms: the access width, unsigned loads at bit 2
-
-## val F3_MEM_H
-
-```mach
-pub val F3_MEM_H:  u32 = 0x1
-```
-
-## val F3_MEM_W
-
-```mach
-pub val F3_MEM_W:  u32 = 0x2
-```
-
-## val F3_MEM_D
-
-```mach
-pub val F3_MEM_D:  u32 = 0x3
-```
-
-## val F3_MEM_BU
-
-```mach
-pub val F3_MEM_BU: u32 = 0x4
-```
-
-## val F3_MEM_HU
-
-```mach
-pub val F3_MEM_HU: u32 = 0x5
-```
-
-## val F3_MEM_WU
-
-```mach
-pub val F3_MEM_WU: u32 = 0x6
-```
-
 ## val F3_BEQ
 
 ```mach
@@ -1316,74 +1245,6 @@ pub val F3_BLTU: u32 = 0x6
 
 ```mach
 pub val F3_BGEU: u32 = 0x7
-```
-
-## val F3_CSRRW
-
-```mach
-pub val F3_CSRRW:  u32 = 0x1
-```
-
-## val F3_CSRRS
-
-```mach
-pub val F3_CSRRS:  u32 = 0x2
-```
-
-## val F3_CSRRC
-
-```mach
-pub val F3_CSRRC:  u32 = 0x3
-```
-
-## val F3_CSRRWI
-
-```mach
-pub val F3_CSRRWI: u32 = 0x5
-```
-
-## val F3_CSRRSI
-
-```mach
-pub val F3_CSRRSI: u32 = 0x6
-```
-
-## val F3_CSRRCI
-
-```mach
-pub val F3_CSRRCI: u32 = 0x7
-```
-
-## val F3_AMO_W
-
-```mach
-pub val F3_AMO_W: u32 = 0x2
-```
-
-## val F3_AMO_D
-
-```mach
-pub val F3_AMO_D: u32 = 0x3
-```
-
-## val F3_FSGNJ
-
-```mach
-pub val F3_FSGNJ:  u32 = 0x0
-```
-
-funct3 of the sign-injection and compare forms
-
-## val F3_FSGNJN
-
-```mach
-pub val F3_FSGNJN: u32 = 0x1
-```
-
-## val F3_FSGNJX
-
-```mach
-pub val F3_FSGNJX: u32 = 0x2
 ```
 
 ## val F3_FLE
@@ -1572,138 +1433,6 @@ pub val FCVT_L:  u32 = 0x2
 pub val FCVT_LU: u32 = 0x3
 ```
 
-## val A5_AMOADD
-
-```mach
-pub val A5_AMOADD:  u32 = 0x00
-```
-
-funct5 (funct7 bits 6:2) of the A forms; bits 1:0 carry aq and rl
-
-## val A5_AMOSWAP
-
-```mach
-pub val A5_AMOSWAP: u32 = 0x01
-```
-
-## val A5_LR
-
-```mach
-pub val A5_LR:      u32 = 0x02
-```
-
-## val A5_SC
-
-```mach
-pub val A5_SC:      u32 = 0x03
-```
-
-## val A5_AMOXOR
-
-```mach
-pub val A5_AMOXOR:  u32 = 0x04
-```
-
-## val A5_AMOOR
-
-```mach
-pub val A5_AMOOR:   u32 = 0x08
-```
-
-## val A5_AMOAND
-
-```mach
-pub val A5_AMOAND:  u32 = 0x0C
-```
-
-## val A5_AMOMIN
-
-```mach
-pub val A5_AMOMIN:  u32 = 0x10
-```
-
-## val A5_AMOMAX
-
-```mach
-pub val A5_AMOMAX:  u32 = 0x14
-```
-
-## val A5_AMOMINU
-
-```mach
-pub val A5_AMOMINU: u32 = 0x18
-```
-
-## val A5_AMOMAXU
-
-```mach
-pub val A5_AMOMAXU: u32 = 0x1C
-```
-
-## val IMM_ECALL
-
-```mach
-pub val IMM_ECALL:      u32 = 0x000
-```
-
-the fixed imm12 of the system and fence forms
-
-## val IMM_EBREAK
-
-```mach
-pub val IMM_EBREAK:     u32 = 0x001
-```
-
-## val IMM_FENCE_IORW
-
-```mach
-pub val IMM_FENCE_IORW: u32 = 0x0FF
-```
-
-## val IMM_PAUSE
-
-```mach
-pub val IMM_PAUSE:      u32 = 0x010
-```
-
-## val FMT_R
-
-```mach
-pub val FMT_R: u8 = 0
-```
-
-the instruction format: how the fields pack into the word
-
-## val FMT_I
-
-```mach
-pub val FMT_I: u8 = 1
-```
-
-## val FMT_S
-
-```mach
-pub val FMT_S: u8 = 2
-```
-
-## val FMT_B
-
-```mach
-pub val FMT_B: u8 = 3
-```
-
-## val FMT_U
-
-```mach
-pub val FMT_U: u8 = 4
-```
-
-## val FMT_J
-
-```mach
-pub val FMT_J: u8 = 5
-```
-
 ## val SH_NONE
 
 ```mach
@@ -1829,71 +1558,11 @@ pub val MEM_NONE:   u8 = 0
 
 the memory role of an instruction
 
-## val MEM_LOAD
-
-```mach
-pub val MEM_LOAD:   u8 = 1
-```
-
 ## val MEM_STORE
 
 ```mach
 pub val MEM_STORE:  u8 = 2
 ```
-
-## val MEM_ATOMIC
-
-```mach
-pub val MEM_ATOMIC: u8 = 3
-```
-
-## val KEY_F3
-
-```mach
-pub val KEY_F3: u8 = 0x01
-```
-
-which fields beyond the base opcode name the instruction when a word is
-classified; a field a row does not key on is free (a rounding mode, a
-shift amount, an ordering bit)
-
-## val KEY_F7
-
-```mach
-pub val KEY_F7: u8 = 0x02
-```
-
-## val KEY_F7_HI6
-
-```mach
-pub val KEY_F7_HI6: u8 = 0x04
-```
-
-funct7 bits 6:1; bit 0 is shamt[5] on rv64 (the shift immediates)
-
-## val KEY_F5
-
-```mach
-pub val KEY_F5: u8 = 0x08
-```
-
-funct7 bits 6:2 (the A forms)
-
-## val KEY_RS2
-
-```mach
-pub val KEY_RS2: u8 = 0x10
-```
-
-rs2 == sel (the conversions)
-
-## val KEY_IMM12
-
-```mach
-pub val KEY_IMM12: u8 = 0x20
-```
-
-imm12 == sel (the system and fence forms)
 
 ## rec Row
 

@@ -22,12 +22,6 @@ pub fun placement_allowed(k: ast_decl.DeclKind) bool;
 the declaration kinds an `#[expect]` may stand on; a module has no
 declaration of its own, so a module-wide silence is a profile's `allow`
 
-## fun is_expect
-
-```mach
-pub fun is_expect(source: str, dec: *ast_decl.Decorator) bool;
-```
-
 ## fun key_of
 
 ```mach

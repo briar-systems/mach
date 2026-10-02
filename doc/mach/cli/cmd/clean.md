@@ -1,40 +1,5 @@
 # mach.cli.cmd.clean
 
-## def EntryKind
-
-```mach
-pub def EntryKind: u8
-```
-
-what a clean entry names
-
-## val ENTRY_DIR
-
-```mach
-pub val ENTRY_DIR: EntryKind = 0
-```
-
-a directory tree
-
-## val ENTRY_FILE
-
-```mach
-pub val ENTRY_FILE: EntryKind = 1
-```
-
-a single file
-
-## rec CleanEntry
-
-```mach
-pub rec CleanEntry;
-```
-
-one path `mach clean` removes
-
-rel: the path relative to the project root, as the manifest templates expand it
-kind: ENTRY_DIR or ENTRY_FILE
-
 ## fun run
 
 ```mach

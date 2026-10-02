@@ -1,27 +1,9 @@
 # mach.lang.target.isa.asm
 
-## val MAX_OPS
-
-```mach
-pub val MAX_OPS: usize = 4
-```
-
 ## val STMT_MAX
 
 ```mach
 pub val STMT_MAX: usize = 512
-```
-
-## val BYTES_MAX
-
-```mach
-pub val BYTES_MAX: usize = STMT_MAX / 2
-```
-
-## val AOP_NONE
-
-```mach
-pub val AOP_NONE: u8 = 0
 ```
 
 ## val AOP_REG
@@ -161,12 +143,6 @@ pub val AW_WB_BASE: u8 = 0x04
 pub rec Mnemonic;
 ```
 
-## rec Directive
-
-```mach
-pub rec Directive;
-```
-
 ## val DIRECTIVE_COUNT
 
 ```mach
@@ -201,12 +177,6 @@ pub val AI_LABEL: u8 = 1
 
 ```mach
 pub val AI_BYTES: u8 = 2
-```
-
-## val AR_NONE
-
-```mach
-pub val AR_NONE:  u8 = 0
 ```
 
 ## val AR_SYM
@@ -267,80 +237,6 @@ the front-end parser reports. the statement text rides in the message,
 since a body is comment-stripped and interned and no longer maps to source
 offsets of its own
 
-## def DecodeFn
-
-```mach
-pub def DecodeFn: fun(str, usize, usize, *Mnemonic, *usize) bool
-```
-
-## def ParseFn
-
-```mach
-pub def ParseFn: fun(*Cursor, *Stmt, *Item) err[fail.Fail]
-```
-
-## def EmitFn
-
-```mach
-pub def EmitFn: fun(*codegen_encode.EncodeState, *Cursor, *Labels, *Item) err[fail.Fail]
-```
-
-## def PatchFn
-
-```mach
-pub def PatchFn: fun(*codegen_encode.EncodeState, u32, u32) err[fail.Fail]
-```
-
-## def SlotFn
-
-```mach
-pub def SlotFn: fun(*codegen_mir.MirFunction, u32) opt[i64]
-```
-
-## def SlotBaseFn
-
-```mach
-pub def SlotBaseFn: fun(*codegen_mir.MirFunction) bool
-```
-
-## def WritesSpFn
-
-```mach
-pub def WritesSpFn: fun(*Item) bool
-```
-
-## def NoFallThroughFn
-
-```mach
-pub def NoFallThroughFn: fun(*Item) bool
-```
-
-## def CtClassFn
-
-```mach
-pub def CtClassFn: fun(u32, u16) ct.AsmClass
-```
-
-## def NoteBytesFn
-
-```mach
-pub def NoteBytesFn: fun(*codegen_encode.EncodeState, *u8, usize, usize) err[fail.Fail]
-```
-
-## def DeclRegFn
-
-```mach
-pub def DeclRegFn: fun(str, *u8, *u32) bool
-```
-
-## def NoteLabelFn
-
-```mach
-pub def NoteLabelFn: fun(*codegen_encode.EncodeState, u32) err[fail.Fail]
-```
-
-the listing's definition of a numbered local label, at the current offset
-
 ## rec Grammar
 
 ```mach
@@ -395,22 +291,10 @@ pub fun op_sym(name_off: usize, name_len: usize, mod: isa.SymModifier, size: u8)
 pub fun is_space(c: char) bool;
 ```
 
-## fun is_skip
-
-```mach
-pub fun is_skip(c: char) bool;
-```
-
 ## fun is_digit
 
 ```mach
 pub fun is_digit(c: char) bool;
-```
-
-## fun is_sym_char
-
-```mach
-pub fun is_sym_char(c: char) bool;
 ```
 
 ## fun is_sym_region
@@ -451,39 +335,10 @@ pub fun cursor_init(c: *Cursor, g: *Grammar, body: str, alloc: *A.Allocator,
 interner: *intern.Interner, f: *codegen_mir.MirFunction, pl: *codegen_mir.MirAsm);
 ```
 
-## fun cursor_locate
-
-```mach
-pub fun cursor_locate(c: *Cursor, st: *codegen_encode.EncodeState, mi: *codegen_mir.MirInstr);
-```
-
-binds the cursor to the block it parses, so a refusal is located there
-
 ## fun claim
 
 ```mach
 pub fun claim(c: *Cursor, off: usize, len: usize) err[fail.Fail];
-```
-
-## val LABEL_NUMBER_MAX
-
-```mach
-pub val LABEL_NUMBER_MAX: u64 = 0xFFFFFFFF
-```
-
-the largest numbered local label: the branch operand and the listing carry it
-as a u32, and a longer number is refused rather than cut short
-
-## fun label_def_span
-
-```mach
-pub fun label_def_span(body: str, lo: usize, hi: usize, num_out: *u64) usize;
-```
-
-## fun label_ref_span
-
-```mach
-pub fun label_ref_span(body: str, lo: usize, hi: usize, num_out: *u64, fwd_out: *bool) bool;
 ```
 
 ## fun local_ref
@@ -507,12 +362,6 @@ pub fun next(c: *Cursor, item: *Item) res[bool, fail.Fail];
 pub fun bind_offset(c: *Cursor, lo: usize, hi: usize, off: *i64) res[bool, fail.Fail];
 ```
 
-## fun fold_clobbers
-
-```mach
-pub fun fold_clobbers(g: *Grammar, item: *Item, gp: *u32, fp: *u32);
-```
-
 ## fun clobbers
 
 ```mach
@@ -531,27 +380,6 @@ pub fun writes_sp(g: *Grammar, body: str) bool;
 pub fun returns(g: *Grammar, body: str) bool;
 ```
 
-## rec LabelDef
-
-```mach
-pub rec LabelDef;
-```
-
-## rec LabelFixup
-
-```mach
-pub rec LabelFixup;
-```
-
-## rec LabelSite
-
-```mach
-pub rec LabelSite;
-```
-
-a local branch the block resolved: a position inside its bytes and the
-offset its label lands on, which the block hands to the branch's note
-
 ## rec Labels
 
 ```mach
@@ -568,18 +396,6 @@ pub fun labels_init(l: *Labels, alloc: *A.Allocator);
 
 ```mach
 pub fun labels_dnit(l: *Labels);
-```
-
-## fun label_lookup
-
-```mach
-pub fun label_lookup(l: *Labels, number: u32) opt[u32];
-```
-
-## fun label_push_fixup
-
-```mach
-pub fun label_push_fixup(l: *Labels, patch_pos: u32, number: u32) err[fail.Fail];
 ```
 
 ## fun label_record_def

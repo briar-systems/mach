@@ -23,29 +23,6 @@ what every module's key shares: the compiler identity, the configuration
 bytes the driver captured (target, platform, project identity), the request,
 the step outputs, the realized dependency closure and the link providers
 
-## fun identify
-
-```mach
-pub fun identify(p: *project.Project, ph: u8) err[fail.Fail];
-```
-
-the compiler identity is a process constant: read once per project, reported
-under the readout phase ph that asked for it
-
-## fun identity_available
-
-```mach
-pub fun identity_available(p: *project.Project) bool;
-```
-
-## fun object_path
-
-```mach
-pub fun object_path(p: *project.Project, m: *project.ModuleEntry, a: *A.Allocator) res[str, fail.Fail];
-```
-
-where the build writes module m's object: `obj/<project>/<module path>.<ext>`
-
 ## fun test_object_path
 
 ```mach
@@ -147,15 +124,6 @@ pub fun forget(p: *project.Project);
 every key and skip decision of the previous load is dropped: the next load
 keys again, and a project that is not keyed processes every module
 
-## rec Cached
-
-```mach
-pub rec Cached;
-```
-
-the image an `obj/` object's record carries, which is the image codegen
-produced, with the facts beside it
-
 ## fun read
 
 ```mach
@@ -168,23 +136,6 @@ unreadable, carries no record or a damaged one, or was built under another
 key is rebuilt, never reused. the object is parsed only to find its record,
 since what a format spells is not always what the link reads. err only when
 allocation fails
-
-## fun object_key
-
-```mach
-pub fun object_key(p: *project.Project, m: *project.ModuleEntry, out: *[32]u8) err[fail.Fail];
-```
-
-the object key of a module: its module key and its name. a module's other
-objects (a test object) key off this one
-
-## fun test_object_key
-
-```mach
-pub fun test_object_key(p: *project.Project, m: *project.ModuleEntry, out: *[32]u8) err[fail.Fail];
-```
-
-the key of module m's test object: its normal object's key and its whole source
 
 ## val TEST_KEY_BIT
 

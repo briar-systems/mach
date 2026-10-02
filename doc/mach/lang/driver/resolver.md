@@ -22,14 +22,6 @@ why the release is not one (its manifest does not load, or names another version
 release is set aside and the reason explains a failure it takes part in, while a failure to
 read the release at all is the NeedsFn's err and stops resolution
 
-## def NeedsFn
-
-```mach
-pub def NeedsFn: fun(ptr, str, str, *candidates.Release, *ReleaseNeeds) err[outcome.Fail]
-```
-
-fills `out` (initialized by the caller over the solve's allocator) for one release
-
 ## rec Lock
 
 ```mach

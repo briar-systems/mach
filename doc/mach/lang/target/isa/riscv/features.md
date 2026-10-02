@@ -121,30 +121,6 @@ file and the calling convention's float registers, so none of the four is a
 function's to admit alone. zkt is a timing promise about the whole machine
 the constant-time rows read, so it is the target's too
 
-## val ONLY_BASELINE
-
-```mach
-pub val ONLY_BASELINE: str = "it is the baseline every selection holds"
-```
-
-## val ONLY_CODESIZE
-
-```mach
-pub val ONLY_CODESIZE: str = "it is a code-size selection of the whole target
-```
-
-## val ONLY_FLOAT
-
-```mach
-pub val ONLY_FLOAT:    str = "it selects the float register file and the calling convention's float registers for the whole target"
-```
-
-## val ONLY_TIMING
-
-```mach
-pub val ONLY_TIMING:   str = "it is a promise about the machine's execution timing that the constant-time rows read, not a set of instructions"
-```
-
 ## val NAMES
 
 ```mach

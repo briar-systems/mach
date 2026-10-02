@@ -258,28 +258,10 @@ pub val MIR_STORE:       MirOpcode = 33
 pub val MIR_GEP:         MirOpcode = 34
 ```
 
-## val MIR_EXTRACT
-
-```mach
-pub val MIR_EXTRACT:     MirOpcode = 35
-```
-
-## val MIR_INSERT
-
-```mach
-pub val MIR_INSERT:      MirOpcode = 36
-```
-
 ## val MIR_PHI
 
 ```mach
 pub val MIR_PHI:         MirOpcode = 37
-```
-
-## val MIR_CALL_IR
-
-```mach
-pub val MIR_CALL_IR:     MirOpcode = 38
 ```
 
 ## val MIR_BR
@@ -856,42 +838,6 @@ destination and logical parameter index, without physical carriers
 pub val MIR_OP_NONE: MirOpcode = 0xFFFF
 ```
 
-## def MirFlags
-
-```mach
-pub def MirFlags: u32
-```
-
-## val MIRF_NONE
-
-```mach
-pub val MIRF_NONE: MirFlags = 0x00000000
-```
-
-## val MIRF_TERMINATOR
-
-```mach
-pub val MIRF_TERMINATOR:       MirFlags = 0x00000001
-```
-
-## val MIRF_COMPARE
-
-```mach
-pub val MIRF_COMPARE:          MirFlags = 0x00000002
-```
-
-## val MIRF_FUSED_CBR
-
-```mach
-pub val MIRF_FUSED_CBR:        MirFlags = 0x00000004
-```
-
-## val MIRF_SIGNED_CMP
-
-```mach
-pub val MIRF_SIGNED_CMP:       MirFlags = 0x00000008
-```
-
 ## val MIRF_TWO_ADDRESS
 
 ```mach
@@ -964,22 +910,10 @@ pub val MIRF_CONV_TO_FLOAT:    MirFlags = 0x00004000
 pub val MIRF_CONV_FROM_FLOAT:  MirFlags = 0x00008000
 ```
 
-## val MIRF_NO_SHAPE
-
-```mach
-pub val MIRF_NO_SHAPE:         MirFlags = 0x00010000
-```
-
 ## val MIRF_MEMORY
 
 ```mach
 pub val MIRF_MEMORY:           MirFlags = 0x00020000
-```
-
-## val MIRF_SEL_DIVIDE
-
-```mach
-pub val MIRF_SEL_DIVIDE:       MirFlags = 0x00040000
 ```
 
 ## val MIRF_SEL_SHIFT
@@ -1031,42 +965,6 @@ the instruction reads and writes the target's fixed accumulator pair
 (div_reg, div_hi_reg), which the allocator closes at the instruction to any
 value live across it or read by it, and after it until the pair is read back
 
-## def MirCtClass
-
-```mach
-pub def MirCtClass: u8
-```
-
-## val MCT_NONE
-
-```mach
-pub val MCT_NONE:       MirCtClass = 0
-```
-
-## val MCT_INT_MUL
-
-```mach
-pub val MCT_INT_MUL:    MirCtClass = 1
-```
-
-## val MCT_INT_DIVMOD
-
-```mach
-pub val MCT_INT_DIVMOD: MirCtClass = 2
-```
-
-## val MCT_VAR_SHIFT
-
-```mach
-pub val MCT_VAR_SHIFT:  MirCtClass = 3
-```
-
-## val MCT_FLOAT
-
-```mach
-pub val MCT_FLOAT:      MirCtClass = 4
-```
-
 ## fun lowered_opcode
 
 ```mach
@@ -1105,22 +1003,6 @@ pub val BANK_FP:      OperandBank = 2
 pub val BANK_EITHER:  OperandBank = 3
 ```
 
-## val BANK_NONE
-
-```mach
-pub val BANK_NONE:    OperandBank = 4
-```
-
-## fun validate_bank_pattern
-
-```mach
-pub fun validate_bank_pattern(pattern: str) err[fail.Fail];
-```
-
-g/f require a bank, v is gp scalar or fp vector, a is typed transport, n forbids registers,
-c is a shift count: gp beside a scalar, and beside a vector either one uniform gp count
-or the vector's own lane counts (#3740). a final star repeats the preceding operand contract
-
 ## fun check_operand_banks
 
 ```mach
@@ -1139,12 +1021,6 @@ pub fun operand_bank(op: MirOpcode, index: u32, vector: bool) res[OperandBank, f
 pub fun describe(op: MirOpcode) res[*MirOpDescriptor, fail.Fail];
 ```
 
-## fun desc
-
-```mach
-pub fun desc(op: MirOpcode) *MirOpDescriptor;
-```
-
 ## fun has
 
 ```mach
@@ -1156,15 +1032,6 @@ pub fun has(op: MirOpcode, mask: MirFlags) bool;
 ```mach
 pub fun ct_op(op: MirOpcode) res[ct.CtOp, fail.Fail];
 ```
-
-## fun ct_mul_op
-
-```mach
-pub fun ct_mul_op(op: MirOpcode) ct.CtMulOp;
-```
-
-the multiply an INT_MUL opcode realizes, NONE for every other opcode; the
-width is the operand's
 
 ## fun ct_mul_cell
 
@@ -1289,19 +1156,6 @@ pub fun preg_is_nil(p: PRegId) bool;
 pub fun preg_same(a: PRegId, b: PRegId) bool;
 ```
 
-## tag MirIndex
-
-```mach
-pub tag MirIndex: u8 {
-    none;
-    vreg: VRegId;
-    preg: PRegId;
-}
-```
-
-the index register of a memory operand: absent, a vreg before allocation
-or a preg after it. a case, not a flag beside a number
-
 ## fun index_none
 
 ```mach
@@ -1392,14 +1246,6 @@ a dropped declassify self-copy becomes a zero-byte use that keeps the
 barrier and names the vreg it downgraded; its carrier is read through
 MirVReg.assigned and spill_slot
 
-## val ISA_USE_OPCODE
-
-```mach
-pub val ISA_USE_OPCODE: MirOpcode = 0xFFFB
-```
-
-isa.ISA_USE, spelled here because mir sits below isa in the import graph
-
 ## fun instr_like
 
 ```mach
@@ -1422,12 +1268,6 @@ pub val VEC_LANE_FLOAT: u8  = 1
 
 ```mach
 pub val VEC_LANE_INT:   u8  = 2
-```
-
-## val VEC_LANE_MAX_LANES
-
-```mach
-pub val VEC_LANE_MAX_LANES: u32 = 0xFFFF
 ```
 
 ## fun vec_lane_make

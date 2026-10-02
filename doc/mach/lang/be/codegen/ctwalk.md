@@ -1,25 +1,5 @@
 # mach.lang.be.codegen.ctwalk
 
-## def DescribeFn
-
-```mach
-pub def DescribeFn: fun(*isa.Inst, *ct.InstEffects)
-```
-
-## def MnemonicFn
-
-```mach
-pub def MnemonicFn: fun(u16) opt[str]
-```
-
-absent for an opcode the ISA does not spell, which the render names by tag
-
-## def RegNameFn
-
-```mach
-pub def RegNameFn:  fun(i32, u8) str
-```
-
 ## rec IsaEffects
 
 ```mach

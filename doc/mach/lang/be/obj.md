@@ -12,12 +12,6 @@ pub fun image_init(a: *A.Allocator, interner: *intern.Interner, name: intern.Str
 pub fun dnit(o: *target_of.ObjectImage);
 ```
 
-## fun symbol_index
-
-```mach
-pub fun symbol_index(o: *target_of.ObjectImage, name: intern.StrId) u32;
-```
-
 ## rec DeferredReloc
 
 ```mach
@@ -40,12 +34,6 @@ pub fun deferred_init(a: *A.Allocator) DeferredRelocs;
 
 ```mach
 pub fun deferred_dnit(d: *DeferredRelocs);
-```
-
-## fun defer_relocation
-
-```mach
-pub fun defer_relocation(d: *DeferredRelocs, rec: DeferredReloc) err[fail.Fail];
 ```
 
 ## fun defer_relocation_for_target

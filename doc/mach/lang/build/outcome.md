@@ -21,18 +21,6 @@ is declared first so a zero outcome is a failure that invents no text. a
 user or environment failure names the diagnostic kind it is reported as; an
 internal one is always `compiler.internal`
 
-## rec Keyed
-
-```mach
-pub rec Keyed;
-```
-
-kind: the row of the diagnostic kind table the failure is reported as
-text: the message
-at:   where in the file that caused it the failure points, the zero place
-      when it points nowhere
-also: the other places the failure names, none when it names no other
-
 ## rec Related
 
 ```mach
@@ -245,12 +233,6 @@ names the cause once through these. `alloc.text` is the allocator's
 
 ```mach
 pub fun io_text(e: io_error.Error) str;
-```
-
-## fun read_text
-
-```mach
-pub fun read_text(e: reader.ReadError) str;
 ```
 
 ## fun write_text
@@ -477,12 +459,6 @@ pub val ART_SHARED:  ArtifactKind = 3
 pub val ART_TESTS:   ArtifactKind = 4
 ```
 
-## rec Artifact
-
-```mach
-pub rec Artifact;
-```
-
 ## rec TestArtifact
 
 ```mach
@@ -492,21 +468,6 @@ pub rec TestArtifact;
 a collected test: its qualified name, where it is declared, the test object
 that holds it, the dispatcher that runs it as `<exe> <idx>`, and the target and
 profile that dispatcher was built for
-
-## rec BuildUnitEvent
-
-```mach
-pub rec BuildUnitEvent;
-```
-
-verb: what the unit's goal calls working on it, borrowed from the goal catalog
-rather than owned, since every spelling there is a static string
-
-## rec DiagnosticBatch
-
-```mach
-pub rec DiagnosticBatch;
-```
 
 ## tag BuildEvent
 
@@ -521,14 +482,6 @@ pub tag BuildEvent: u8 {
 what a build recorded, in order: a unit finished, a failure, or a batch of
 diagnostics with the sources they refer to. every payload is owned by the
 outcome's allocator
-
-## rec FailEvent
-
-```mach
-pub rec FailEvent;
-```
-
-a failure recorded outside a diagnostic store, and the phase it is reported under
 
 ## def BuildSeverity
 

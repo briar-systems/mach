@@ -22,18 +22,6 @@ address column and the frame a call leaves
 pub fun frame_isa(arch: u32) opt[FrameIsa];
 ```
 
-## fun dwarf_gp
-
-```mach
-pub fun dwarf_gp(fi: *FrameIsa, reg: u8) u32;
-```
-
-## fun dwarf_vec
-
-```mach
-pub fun dwarf_vec(fi: *FrameIsa, reg: u8) u32;
-```
-
 ## rec FrameSave
 
 ```mach
@@ -52,26 +40,6 @@ pub rec FrameState;
 
 the frame a function's prologue leaves: the call frame address as a register
 plus an offset, and every register the prologue saved
-
-## val DW_EH_PE_PCREL_SDATA4
-
-```mach
-pub val DW_EH_PE_PCREL_SDATA4:   u8 = 0x1B
-```
-
-pc-relative, signed four-byte pointers
-
-## val DW_EH_PE_UDATA4
-
-```mach
-pub val DW_EH_PE_UDATA4:         u8 = 0x03
-```
-
-## val DW_EH_PE_DATAREL_SDATA4
-
-```mach
-pub val DW_EH_PE_DATAREL_SDATA4: u8 = 0x3B
-```
 
 ## fun frame_state
 
@@ -175,12 +143,6 @@ funcs: *target_of.ExecFunction, func_count: u32, count: *u32) res[*UnwindFn, fai
 the functions with frame records at their final addresses, in address order
 with an alias of an earlier start dropped; `count` entries the caller frees
 
-## val DW_EH_PE_OMIT
-
-```mach
-pub val DW_EH_PE_OMIT: u8 = 0xFF
-```
-
 ## rec EhEntry
 
 ```mach
@@ -235,14 +197,6 @@ pub fun eh_read(buf: *u8, field: usize, size: usize, form: u8) i64;
 ```
 
 a field's value as its encoding's form reads it, sign-extended for a signed form
-
-## fun eh_pointer
-
-```mach
-pub fun eh_pointer(raw: i64, enc: u8, field_vaddr: u64) res[u64, fail.Fail];
-```
-
-the address an encoded pointer names, the field lying at `field_vaddr`
 
 ## rec EhFn
 

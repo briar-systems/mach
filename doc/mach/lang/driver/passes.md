@@ -1,11 +1,5 @@
 # mach.lang.driver.passes
 
-## fun read_definition
-
-```mach
-pub fun read_definition(raw: ptr, mid: session.ModuleId, phase: sema_context.DefinitionPhase) res[sema_context.Definition, fail.Fail];
-```
-
 ## fun prepare_resolve_pass
 
 ```mach
@@ -27,12 +21,6 @@ on over the rest; an internal failure ends the pass where it met it
 pub fun q_resolve_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
 ```
 
-## fun q_resolve_finalize
-
-```mach
-pub fun q_resolve_finalize(value: *u8, value_len: u32, alloc: *A.Allocator);
-```
-
 ## fun prepare_sema_pass
 
 ```mach
@@ -48,28 +36,10 @@ pub fun run_sema_pass(p: *project.Project) err[outcome.Fail];
 a rejected module is one module's answer, so the pass folds it and carries
 on over the rest; an internal failure ends the pass where it met it
 
-## fun acquire_sema
-
-```mach
-pub fun acquire_sema(p: *project.Project, mid: session.ModuleId) res[*fe_sema.SemaResult, fail.Fail];
-```
-
 ## fun q_sema_compute
 
 ```mach
 pub fun q_sema_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
-```
-
-## fun q_sema_finalize
-
-```mach
-pub fun q_sema_finalize(value: *u8, value_len: u32, alloc: *A.Allocator);
-```
-
-## fun read_typed_surface
-
-```mach
-pub fun read_typed_surface(p: *project.Project, mid: session.ModuleId, a: *A.Allocator) res[sema_context.ModuleSema, fail.Fail];
 ```
 
 ## fun retain_modules
@@ -138,15 +108,6 @@ pub fun codegen_reusable(p: *project.Project, mid: session.ModuleId) res[bool, f
 pub fun test_build(p: *project.Project) bool;
 ```
 
-## fun shared_artifact_build
-
-```mach
-pub fun shared_artifact_build(p: *project.Project) bool;
-```
-
-the artifact this build links is a shared library. a test build compiles the
-library's own objects, so it lowers them the way the library's build does
-
 ## fun debug_info_of
 
 ```mach
@@ -195,12 +156,6 @@ pub fun q_inline_bodies_compute(p: *project.Project, key: u64, alloc: *A.Allocat
 
 ```mach
 pub fun q_lower_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
-```
-
-## fun q_lower_finalize
-
-```mach
-pub fun q_lower_finalize(value: *u8, value_len: u32, alloc: *A.Allocator);
 ```
 
 ## fun prepare_codegen_pass
@@ -254,33 +209,11 @@ the other modules' lowered ir a whole-module backend reads to generate `seed`, m
 pub rec CodeSources;
 ```
 
-## fun sources_empty
-
-```mach
-pub fun sources_empty() CodeSources;
-```
-
 ## fun sources_dnit
 
 ```mach
 pub fun sources_dnit(a: *A.Allocator, cs: *CodeSources);
 ```
-
-## fun run_test_object_one
-
-```mach
-pub fun run_test_object_one(p: *project.Project, mid: session.ModuleId) err[fail.Fail];
-```
-
-the module's test object, lowered against its normal object and generated
-
-## fun run_test_lower_one
-
-```mach
-pub fun run_test_lower_one(p: *project.Project, mid: session.ModuleId) err[fail.Fail];
-```
-
-the module's test ir, which test codegen workers read before the query publishes the object
 
 ## fun test_codegen_reusable
 
@@ -294,12 +227,6 @@ the test object's codegen product is current or cached, so no worker generates i
 
 ```mach
 pub fun q_codegen_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
-```
-
-## fun q_codegen_finalize
-
-```mach
-pub fun q_codegen_finalize(value: *u8, value_len: u32, alloc: *A.Allocator);
 ```
 
 ## fun prepare_link_pass
@@ -325,15 +252,6 @@ pub fun q_link_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags
 ```mach
 pub fun capture_build_config(p: *project.Project, alloc: *A.Allocator) res[query.QueryOutput, fail.Fail];
 ```
-
-## fun capture_configuration_identity
-
-```mach
-pub fun capture_configuration_identity(p: *project.Project, alloc: *A.Allocator) res[query.QueryOutput, fail.Fail];
-```
-
-the build identity without the request: the persistent key hashes the request
-itself, with the project root in canonical form, so the spelled root stays out
 
 ## fun prepare_object_cache
 

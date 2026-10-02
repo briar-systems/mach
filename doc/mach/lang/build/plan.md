@@ -62,12 +62,6 @@ pub val PH_TEST: PhaseKind = 8
 
 a test build's test objects, after the normal objects they are lowered against
 
-## def LinkInputKind
-
-```mach
-pub def LinkInputKind: u8
-```
-
 ## val LINK_STATIC
 
 ```mach
@@ -229,13 +223,6 @@ prior: *BuildUnit) res[BuildUnit, outcome.Fail];
 
 ```mach
 pub fun finished_modules(tgt: *lang_target.Target) bool;
-```
-
-## fun resolve_token
-
-```mach
-pub fun resolve_token(a: *A.Allocator, tgt: *lang_target.Target, dirs: *Vector[str],
-root: str, tok: *u8) res[LinkInput, outcome.Fail];
 ```
 
 ## fun resolve_requirement

@@ -48,18 +48,6 @@ pub val R_X86_64_32S:      u32 = 11
 pub val R_X86_64_PC64:     u32 = 24
 ```
 
-## val R_X86_64_GOTPCRELX
-
-```mach
-pub val R_X86_64_GOTPCRELX:     u32 = 41
-```
-
-## val R_X86_64_REX_GOTPCRELX
-
-```mach
-pub val R_X86_64_REX_GOTPCRELX: u32 = 42
-```
-
 ## val R_AARCH64_ABS64
 
 ```mach
@@ -241,36 +229,6 @@ pub val EF_RISCV_RVE: u32 = 0x8
 ```
 
 the RV32E/RV64E register file and calling convention
-
-## rec ElfLayout
-
-```mach
-pub rec ElfLayout;
-```
-
-## fun elf64_layout
-
-```mach
-pub fun elf64_layout() ElfLayout;
-```
-
-## fun elf32_layout
-
-```mach
-pub fun elf32_layout() ElfLayout;
-```
-
-## fun layout_for
-
-```mach
-pub fun layout_for(tgt_isa: *target_of.ObjectTarget) ElfLayout;
-```
-
-## fun layout_from_class
-
-```mach
-pub fun layout_from_class(cls: u8, out: *ElfLayout) bool;
-```
 
 ## def BuildAttributes
 

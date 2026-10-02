@@ -18,12 +18,6 @@ pub fun fp_u8(b: *FpBuf, v: u8) err[fail.Fail];
 pub fun fp_u32(b: *FpBuf, v: u32) err[fail.Fail];
 ```
 
-## fun fp_u16
-
-```mach
-pub fun fp_u16(b: *FpBuf, v: u16) err[fail.Fail];
-```
-
 ## fun fp_domain_u8
 
 ```mach
@@ -94,13 +88,6 @@ pub fun fp_input_len(fb: *FpBuf) res[u32, fail.Fail];
 
 ```mach
 pub fun fp_take(fb: *FpBuf) res[query.QueryOutput, fail.Fail];
-```
-
-## fun fp_constant
-
-```mach
-pub fun fp_constant(fb: *FpBuf, item: *resolve.ExportConstant, origin: session.StableModuleId,
-definition_revision: query.Revision) err[fail.Fail];
 ```
 
 ## fun fp_ct_value

@@ -1,11 +1,5 @@
 # mach.subprocess
 
-## def SubprocessState
-
-```mach
-pub def SubprocessState: u8
-```
-
 ## val STATE_UNSTARTED
 
 ```mach
@@ -82,43 +76,6 @@ pub val REQUEST_DESTROYED: Request = 3
 pub val REQUEST_INVALID:   Request = 4
 ```
 
-## fun request_of
-
-```mach
-pub fun request_of(reason: sync_cancel.Reason) Request;
-```
-
-## tag Cause
-
-```mach
-pub tag Cause: u8 {
-    alloc:  A.Error;
-    exec:   exec.Error;
-    io:     io_error.Error;
-    native: i64;
-    attempted;
-    idle;
-    not_running;
-    invalid_status;
-    transition;
-    request;
-    incomplete;
-    capture_released;
-    capture_running;
-    capture_unfinished;
-    capture_release;
-    termination;
-    reap;
-    grace_negative;
-    grace_large;
-}
-```
-
-a supervised process's refusal, named with the identity the supervisor
-knows it by (its pathname, or "subprocess" before one is recorded): the
-allocator's, the process layer's, a capture file's, or a lifecycle the
-caller drove out of order
-
 ## rec Error
 
 ```mach
@@ -129,12 +86,6 @@ pub rec Error;
 
 ```mach
 pub fun failure(identity: str, cause: Cause) Error;
-```
-
-## fun cause_text
-
-```mach
-pub fun cause_text(c: Cause) str;
 ```
 
 ## fun text
@@ -158,12 +109,6 @@ pub rec SubprocessTerminal;
 pub rec CaptureIoResult;
 ```
 
-## rec OwnedCapture
-
-```mach
-pub rec OwnedCapture;
-```
-
 ## rec OwnedSubprocess
 
 ```mach
@@ -176,22 +121,10 @@ pub rec OwnedSubprocess;
 pub fun init(p: *OwnedSubprocess);
 ```
 
-## fun set_deadline
-
-```mach
-pub fun set_deadline(p: *OwnedSubprocess, deadline: time.Instant) bool;
-```
-
 ## fun bound
 
 ```mach
 pub fun bound(p: *OwnedSubprocess, timeout: chrono_duration.Duration) bool;
-```
-
-## fun deadline_reached
-
-```mach
-pub fun deadline_reached(p: *OwnedSubprocess, now: time.Instant) bool;
 ```
 
 ## fun expired
@@ -237,12 +170,6 @@ cwd: str) err[Error];
 ```mach
 pub fun spawn_captured_grouped(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
 identity: str, limit: usize) err[Error];
-```
-
-## fun running
-
-```mach
-pub fun running(p: *OwnedSubprocess) bool;
 ```
 
 ## fun wait

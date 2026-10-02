@@ -42,17 +42,6 @@ pub rec ParseFail;
 pub rec Parser;
 ```
 
-## rec PendingDiag
-
-```mach
-pub rec PendingDiag;
-```
-
-what a deciding walk said. the walk that decides between the two readings of
-`name[` cannot speak as it goes: if its reading loses, nothing it said was
-ever true. it records here, and whichever reading becomes the parse says what
-it recorded, in order.
-
 ## val MAX_NEST_DEPTH
 
 ```mach
@@ -220,12 +209,6 @@ never buffered: a caller reads outside every deciding walk
 pub fun fatal_oom_at(p: *Parser, span: token.Span);
 ```
 
-## fun fatal_oom
-
-```mach
-pub fun fatal_oom(p: *Parser);
-```
-
 ## fun fatal_ice_at
 
 ```mach
@@ -337,30 +320,6 @@ pub fun push_type(p: *Parser, t: ast_type.Type) ast_id.TypeId;
 
 ```mach
 pub fun push_module(p: *Parser, m: ast_module.Module) ast_id.ModuleNodeId;
-```
-
-## fun push_decl_id
-
-```mach
-pub fun push_decl_id(p: *Parser, id_: ast_id.DeclId) u32;
-```
-
-## fun push_stmt_id
-
-```mach
-pub fun push_stmt_id(p: *Parser, id_: ast_id.StmtId) u32;
-```
-
-## fun push_expr_id
-
-```mach
-pub fun push_expr_id(p: *Parser, id_: ast_id.ExprId) u32;
-```
-
-## fun push_type_id
-
-```mach
-pub fun push_type_id(p: *Parser, id_: ast_id.TypeId) u32;
 ```
 
 ## fun list_buf_init

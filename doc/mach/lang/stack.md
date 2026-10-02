@@ -10,15 +10,6 @@ the host has threads the driver runs on a thread whose stack it sizes itself
 reserve or ulimit -s. a threadless host runs on the calling thread and the
 margin alone holds the bound.
 
-## val MARGIN
-
-```mach
-pub val MARGIN: usize = 262144
-```
-
-the stack a reader keeps in hand when it refuses. it covers the deepest
-frames a reader's refusal and its diagnostic still need
-
 ## val WORKER_RESERVE
 
 ```mach

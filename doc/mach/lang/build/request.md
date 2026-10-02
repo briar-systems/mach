@@ -22,28 +22,10 @@ pub fun is_object_path(tok: *u8) bool;
 pub def SubsystemFlag: u8
 ```
 
-## val SUBSYSTEM_FLAG_NONE
-
-```mach
-pub val SUBSYSTEM_FLAG_NONE:    SubsystemFlag = 0
-```
-
 ## val SUBSYSTEM_FLAG_CONSOLE
 
 ```mach
 pub val SUBSYSTEM_FLAG_CONSOLE: SubsystemFlag = 1
-```
-
-## val SUBSYSTEM_FLAG_GUI
-
-```mach
-pub val SUBSYSTEM_FLAG_GUI:     SubsystemFlag = 2
-```
-
-## fun subsystem_flag_from_name
-
-```mach
-pub fun subsystem_flag_from_name(name: str) opt[SubsystemFlag];
 ```
 
 ## fun subsystem_from_flag

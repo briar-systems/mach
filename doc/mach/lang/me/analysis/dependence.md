@@ -6,22 +6,10 @@
 pub rec MemAccess;
 ```
 
-## def DepVerdict
-
-```mach
-pub def DepVerdict: u8
-```
-
 ## val DEP_INDEPENDENT
 
 ```mach
 pub val DEP_INDEPENDENT: DepVerdict = 0
-```
-
-## val DEP_DEPENDENT
-
-```mach
-pub val DEP_DEPENDENT:   DepVerdict = 1
 ```
 
 ## rec DepInfo
@@ -46,12 +34,6 @@ pub fun equal(a: value.Value, b: value.Value) bool;
 
 ```mach
 pub fun dep_dnit(d: *DepInfo);
-```
-
-## fun ivs_only_recurrence
-
-```mach
-pub fun ivs_only_recurrence(fn: *me_ir.Function, la: *loops.LoopAnalysis, loop_ix: u32) bool;
 ```
 
 ## rec ReductionInfo

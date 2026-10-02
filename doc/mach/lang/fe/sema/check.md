@@ -1,11 +1,5 @@
 # mach.lang.fe.sema.check
 
-## fun check_assignable
-
-```mach
-pub fun check_assignable(sc: *sema_context.SemaContext, expected: type.TypeId, actual: type.TypeId, span: token.Span) bool;
-```
-
 ## fun check_coercible
 
 ```mach

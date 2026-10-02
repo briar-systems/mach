@@ -1,39 +1,15 @@
 # mach.lang.embed
 
-## def EmbedStatus
-
-```mach
-pub def EmbedStatus: u8
-```
-
 ## val EMBED_OK
 
 ```mach
 pub val EMBED_OK:         EmbedStatus = 0
 ```
 
-## val EMBED_MISSING
-
-```mach
-pub val EMBED_MISSING:    EmbedStatus = 1
-```
-
-## val EMBED_IS_DIR
-
-```mach
-pub val EMBED_IS_DIR:     EmbedStatus = 2
-```
-
 ## val EMBED_UNREADABLE
 
 ```mach
 pub val EMBED_UNREADABLE: EmbedStatus = 3
-```
-
-## val EMBED_TOO_LARGE
-
-```mach
-pub val EMBED_TOO_LARGE:  EmbedStatus = 4
 ```
 
 ## rec EmbedFile
@@ -118,12 +94,6 @@ ret: the resolved path; err as `manifest.expand_artifact_path`
 
 ```mach
 pub fun escapes_root(alloc: *A.Allocator, c: *EmbedCache, resolved: str) res[bool, fail.Fail];
-```
-
-## fun resolve_path
-
-```mach
-pub fun resolve_path(alloc: *A.Allocator, decl_file: str, arg: str) res[str, fail.Fail];
 ```
 
 ## fun refresh

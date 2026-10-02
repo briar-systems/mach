@@ -1,11 +1,5 @@
 # mach.lang.be.codegen.rules
 
-## def RuleKind
-
-```mach
-pub def RuleKind: u8
-```
-
 ## val RULE_RETAG
 
 ```mach
@@ -22,12 +16,6 @@ pub val RULE_PASS:   RuleKind = 1
 
 ```mach
 pub val RULE_EXPAND: RuleKind = 2
-```
-
-## def RuleGate
-
-```mach
-pub def RuleGate: u8
 ```
 
 ## val GATE_ANY
@@ -48,22 +36,10 @@ pub val GATE_SCALAR: RuleGate = 1
 pub val GATE_VECTOR: RuleGate = 2
 ```
 
-## def GuardFn
-
-```mach
-pub def GuardFn: fun(*isa.BackendTarget, *codegen_mir.MirFunction, *codegen_mir.MirInstr) bool
-```
-
 ## rec ExpansionBuilder
 
 ```mach
 pub rec ExpansionBuilder;
-```
-
-## def ExpandFn
-
-```mach
-pub def ExpandFn: fun(*ExpansionBuilder) err[fail.Fail]
 ```
 
 ## rec Rule
@@ -106,12 +82,6 @@ pub fun find_rule(pack: *RulePack, tgt: *isa.BackendTarget, f: *codegen_mir.MirF
 
 ```mach
 pub fun emit_instr(builder: *ExpansionBuilder, opcode: u32, operands: *codegen_mir.MirOperand, operand_count: u32) res[*codegen_mir.MirInstr, fail.Fail];
-```
-
-## fun operand_rides_fp_bank
-
-```mach
-pub fun operand_rides_fp_bank(f: *codegen_mir.MirFunction, op: *codegen_mir.MirOperand) bool;
 ```
 
 ## fun guard_fp_bank_move

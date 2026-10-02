@@ -31,12 +31,6 @@ pub def Level: u8
 pub val LEVEL_WARNING: Level = 0
 ```
 
-## val LEVEL_ERROR
-
-```mach
-pub val LEVEL_ERROR:   Level = 1
-```
-
 ## val NONE
 
 ```mach
@@ -79,12 +73,6 @@ pub val DEBUG_DROPPED:                    Kind = 5
 
 ```mach
 pub val TARGET_SKIPPED:                   Kind = 6
-```
-
-## val TARGET_NATIVE_FALLBACK
-
-```mach
-pub val TARGET_NATIVE_FALLBACK:           Kind = 7
 ```
 
 ## val SECRET_NOT_OBLIVIOUS
@@ -2397,12 +2385,6 @@ pub val MANIFEST_TOO_MANY_ENTRIES:        Kind = 391
 pub val MANIFEST_UNKNOWN_KEY:             Kind = 392
 ```
 
-## val MANIFEST_UNREADABLE
-
-```mach
-pub val MANIFEST_UNREADABLE:              Kind = 393
-```
-
 ## val MANIFEST_VALUE_TYPE
 
 ```mach
@@ -2763,12 +2745,6 @@ pub val TARGET_INVALID:                   Kind = 452
 pub val TARGET_NO_ARTIFACTS:              Kind = 453
 ```
 
-## val TARGET_NONE_DECLARED
-
-```mach
-pub val TARGET_NONE_DECLARED:             Kind = 454
-```
-
 ## val TARGET_NOT_RUNNABLE
 
 ```mach
@@ -3003,12 +2979,6 @@ pub val RESOURCE_METADATA_INVALID:        Kind = 492
 pub val RESOURCE_SIZE_LIMIT:              Kind = 493
 ```
 
-## val TARGET_FLOAT_WIDTH
-
-```mach
-pub val TARGET_FLOAT_WIDTH:               Kind = 494
-```
-
 ## val NAME_BUILTIN_TYPE
 
 ```mach
@@ -3129,14 +3099,6 @@ pub fun named(key: str) opt[Kind];
 
 the kind whose key is exactly `key`, retired or not
 
-## val SET_WORDS
-
-```mach
-pub val SET_WORDS: usize = COUNT / 64 + 1
-```
-
-a set of kinds, one bit for every kind the table declares
-
 ## rec KindSet
 
 ```mach
@@ -3149,14 +3111,6 @@ pub rec KindSet;
 pub fun set_empty() KindSet;
 ```
 
-## fun set_add
-
-```mach
-pub fun set_add(s: *KindSet, k: Kind);
-```
-
-a kind no row declares is never a member
-
 ## fun set_has
 
 ```mach
@@ -3167,12 +3121,6 @@ pub fun set_has(s: *KindSet, k: Kind) bool;
 
 ```mach
 pub fun set_union(s: *KindSet, other: *KindSet);
-```
-
-## fun set_is_empty
-
-```mach
-pub fun set_is_empty(s: *KindSet) bool;
 ```
 
 ## rec Selection

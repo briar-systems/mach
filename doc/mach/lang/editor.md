@@ -1,13 +1,5 @@
 # mach.lang.editor
 
-## rec Buffer
-
-```mach
-pub rec Buffer;
-```
-
-one reusable slot for a currently open file
-
 ## rec EditorSession
 
 ```mach
@@ -56,18 +48,6 @@ standalone_target: for a file under no manifest, a borrowed resolved target whos
                    registry-owned definitions outlive the Session; nil selects the registered host target.
                    a project's target selection is never replaced by it
 
-## rec AnalysisTarget
-
-```mach
-pub rec AnalysisTarget;
-```
-
-## rec AnalysisSource
-
-```mach
-pub rec AnalysisSource;
-```
-
 ## rec AnalysisResult
 
 ```mach
@@ -109,20 +89,6 @@ also ends the lifetime of every raw product borrowed from it, and a token stream
 tokenize must be freed before it because its bytes borrow the result's source
 
 result: the envelope; zeroed on return so a second call is a no-op
-
-## fun analysis_source
-
-```mach
-pub fun analysis_source(result: *AnalysisResult, file: lang_source.FileId) opt[*lang_source.SourceFile];
-```
-
-the owned source version a diagnostic location refers to; use source.position on it
-rather than the Session's current text, which may have moved on
-
-result: the envelope
-file: the FileId from a diagnostic location
-ret: the owned SourceFile, valid until analysis_dnit; none when the result carries no
-        version of that file
 
 ## fun ast_of
 

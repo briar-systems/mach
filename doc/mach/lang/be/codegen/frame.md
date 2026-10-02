@@ -1,11 +1,5 @@
 # mach.lang.be.codegen.frame
 
-## val DEFAULT_STACK_ALIGN
-
-```mach
-pub val DEFAULT_STACK_ALIGN: u32 = 16
-```
-
 ## fun run
 
 ```mach
@@ -22,12 +16,6 @@ before selection, a frame slot address no instruction reads is dropped and a
 slot nothing names any more leaves the frame, so a dead address costs
 neither an instruction nor stack (#4121). an address or slot a debug binding
 or an asm block names stays, since the debugger or the block reads it
-
-## fun omits_frame
-
-```mach
-pub fun omits_frame(func: *codegen_mir.MirFunction, fp: codegen_mir.PRegId, sp: codegen_mir.PRegId) bool;
-```
 
 ## fun body_writes_sp
 

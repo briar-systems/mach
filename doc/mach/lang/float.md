@@ -181,14 +181,6 @@ pub rec Format;
 a binary interchange format: its significand precision, the hidden bit counted, and the
 width of its exponent field. every width a float type can take has one row in format_of
 
-## fun format_of
-
-```mach
-pub fun format_of(w: FloatWidth) Format;
-```
-
-the format a width names; FLOAT_W_NONE is the unsuffixed default, binary64
-
 ## def Fit
 
 ```mach
@@ -228,35 +220,6 @@ pub rec Rounded;
 a decimal rounded to one format: the value, carried exactly in an f64, and how it fit.
 an overflow carries +inf and an underflow of a nonzero decimal carries +0
 
-## fun narrow_bits
-
-```mach
-pub fun narrow_bits(d: u64, f: Format, rule: NanRule) u64;
-```
-
-binary64 bits `d` rounded to nearest with ties to even into the encoding of `f`, a format
-narrower than binary64: a value past the largest finite overflows to infinity, one below
-the smallest normal rounds into the subnormals, and a NaN is made by `rule`
-
-d: the binary64 encoding to narrow
-f: the format to round into
-rule: what the conversion makes of a NaN
-ret: the encoding in `f`, in the low bits
-
-## fun widen_bits
-
-```mach
-pub fun widen_bits(b: u64, f: Format, rule: NanRule) u64;
-```
-
-an encoding of `f`, a format narrower than binary64, as binary64 bits: exact, a subnormal
-normalised and a NaN made by `rule`
-
-b: the encoding in `f`, in the low bits
-f: the format it is encoded in
-rule: what the conversion makes of a NaN
-ret: the same value as binary64 bits
-
 ## fun round_decimal
 
 ```mach
@@ -272,12 +235,6 @@ exp10: the decimal exponent of mant's last digit
 trunc: a nonzero digit was dropped past mant
 w: the width to round to
 ret: the rounded value and whether it was exact, inexact, or left the format's range
-
-## val SHORTEST_DIGITS
-
-```mach
-pub val SHORTEST_DIGITS: usize = 20
-```
 
 ## rec Shortest
 

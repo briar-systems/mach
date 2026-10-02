@@ -27,13 +27,15 @@ pub val RISCV64: u32 = 3
 ## val SPIRV
 
 ```mach
-pub val SPIRV:             u32 = 5
+pub val SPIRV:   u32 = 5
 ```
+
+4 was the withdrawn MOS 6502 target (#3226, #3112); no catalog row carries it
 
 ## val RISCV32
 
 ```mach
-pub val RISCV32:           u32 = 6
+pub val RISCV32: u32 = 6
 ```
 
 ## def DwarfRegFn

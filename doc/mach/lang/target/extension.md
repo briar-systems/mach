@@ -103,16 +103,6 @@ pub fun is_name(name: str, len: usize) bool;
 an extension name is spelled by the lexer's own rules: one identifier token,
 never a keyword, so every surface that names it parses it the same way
 
-## fun is_level_spelling
-
-```mach
-pub fun is_level_spelling(name: str, len: usize) bool;
-```
-
-a level spelling is an identifier with `-` admitted inside it (`x86-64-v2`),
-so a manifest can carry a level where it carries a name and the resolver
-tells them apart by table, never by shape
-
 ## fun is_spelling
 
 ```mach

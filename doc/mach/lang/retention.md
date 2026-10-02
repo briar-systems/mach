@@ -20,12 +20,6 @@ pub val RETAINER_SESSION: RetainerId = 0
 
 the retainer a session records under until a caller names another
 
-## rec Held
-
-```mach
-pub rec Held;
-```
-
 ## rec Retention
 
 ```mach

@@ -80,12 +80,6 @@ pub val CT_CAP_ALWAYS:    CtCap = 1
 pub val CT_CAP_MUL:       CtCap = 2
 ```
 
-## val CT_CAP_VAR_SHIFT
-
-```mach
-pub val CT_CAP_VAR_SHIFT: CtCap = 3
-```
-
 ## fun ct_cap
 
 ```mach
@@ -186,12 +180,6 @@ pub val CT_MUL_DIT_MODE:  CtMulCond = 1
 pub val CT_MUL_EXTENSION: CtMulCond = 2
 ```
 
-## val CT_MUL_COND_COUNT
-
-```mach
-pub val CT_MUL_COND_COUNT: u32 = 3
-```
-
 ## val DIT_NEED_MARKER
 
 ```mach
@@ -258,12 +246,6 @@ pub fun mul_cell(op: CtMulOp, width: u8, vector: bool) CtMulCell;
 pub fun mul_mask_none() CtMulMask;
 ```
 
-## fun mul_op_valid
-
-```mach
-pub fun mul_op_valid(op: CtMulOp) bool;
-```
-
 ## fun mul_width_valid
 
 ```mach
@@ -280,12 +262,6 @@ pub fun mul_cell_width_valid(width: u8) bool;
 
 the operand widths a cell may have: a 128-bit cell is never declared, it is
 admitted through the cells that realize it (#3511)
-
-## fun mul_cond_valid
-
-```mach
-pub fun mul_cond_valid(cond: CtMulCond) bool;
-```
 
 ## fun mul_op_name
 
@@ -316,15 +292,6 @@ pub fun mul_mask_has(mask: CtMulMask, cell: CtMulCell) bool;
 ```
 
 whether the admitted cells cover this multiply; an unknown cell never is
-
-## fun mul_form_refusal
-
-```mach
-pub fun mul_form_refusal(form: *CtMulForm, ext_domain: u64) opt[str];
-```
-
-why a declared row is malformed, absent for a well-formed one; `ext_domain`
-is every extension bit the ISA models
 
 ## fun mul_forms_refusal
 
@@ -602,18 +569,6 @@ pub val XFER_RET:  Transfer = 4
 
 ```mach
 pub val XFER_TRAP: Transfer = 5
-```
-
-## def TargetKind
-
-```mach
-pub def TargetKind: u8
-```
-
-## val TARGET_NONE
-
-```mach
-pub val TARGET_NONE: TargetKind = 0
 ```
 
 ## val TARGET_BLOCK

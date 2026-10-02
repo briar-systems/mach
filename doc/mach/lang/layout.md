@@ -12,42 +12,6 @@ pub def CheckCause: u8
 pub val CHECK_ADD_OVERFLOW:        CheckCause = 1
 ```
 
-## val CHECK_MUL_OVERFLOW
-
-```mach
-pub val CHECK_MUL_OVERFLOW:        CheckCause = 3
-```
-
-## val CHECK_INVALID_ALIGNMENT
-
-```mach
-pub val CHECK_INVALID_ALIGNMENT:   CheckCause = 4
-```
-
-## val CHECK_NON_POWER_ALIGNMENT
-
-```mach
-pub val CHECK_NON_POWER_ALIGNMENT: CheckCause = 5
-```
-
-## val CHECK_INVALID_RANGE
-
-```mach
-pub val CHECK_INVALID_RANGE:       CheckCause = 6
-```
-
-## val CHECK_NARROWING
-
-```mach
-pub val CHECK_NARROWING:           CheckCause = 7
-```
-
-## val CHECK_ID_RANGE
-
-```mach
-pub val CHECK_ID_RANGE:            CheckCause = 8
-```
-
 ## rec ByteUnit
 
 ```mach
@@ -76,12 +40,6 @@ pub rec CheckedOffset[Unit];
 
 ```mach
 pub rec CheckedAddress[Space];
-```
-
-## rec CheckedRange
-
-```mach
-pub rec CheckedRange[Unit];
 ```
 
 ## rec CheckedAlignment
@@ -167,20 +125,6 @@ pub fun address_add[Space](base: CheckedAddress[Space], amount: CheckedCount[Byt
 res[CheckedAddress[Space], CheckCause];
 ```
 
-## fun checked_range
-
-```mach
-pub fun checked_range[Unit](start: CheckedOffset[Unit], end: CheckedOffset[Unit])
-res[CheckedRange[Unit], CheckCause];
-```
-
-## fun range_from_count
-
-```mach
-pub fun range_from_count[Unit](start: CheckedOffset[Unit], length: CheckedCount[Unit])
-res[CheckedRange[Unit], CheckCause];
-```
-
 ## fun range_fits
 
 ```mach
@@ -251,12 +195,6 @@ pub fun u64_to_u32(value: u64) res[u32, CheckCause];
 
 ```mach
 pub fun usize_to_i32(value: usize) res[i32, CheckCause];
-```
-
-## def NodeKind
-
-```mach
-pub def NodeKind: u8
 ```
 
 ## val NODE_UNKNOWN
@@ -341,34 +279,10 @@ pub rec Node;
 pub def ExtentCause: u8
 ```
 
-## val EXTENT_OK
-
-```mach
-pub val EXTENT_OK:             ExtentCause = 0
-```
-
 ## val EXTENT_UNKNOWN_NODE
 
 ```mach
 pub val EXTENT_UNKNOWN_NODE:   ExtentCause = 1
-```
-
-## val EXTENT_DEPTH
-
-```mach
-pub val EXTENT_DEPTH:          ExtentCause = 2
-```
-
-## val EXTENT_ARRAY_OVERFLOW
-
-```mach
-pub val EXTENT_ARRAY_OVERFLOW: ExtentCause = 3
-```
-
-## val EXTENT_NOT_AGGREGATE
-
-```mach
-pub val EXTENT_NOT_AGGREGATE:  ExtentCause = 4
 ```
 
 ## val EXTENT_FIELD_RANGE
@@ -381,24 +295,6 @@ pub val EXTENT_FIELD_RANGE:    ExtentCause = 5
 
 ```mach
 pub val EXTENT_SIZE_OVERFLOW:  ExtentCause = 6
-```
-
-## val EXTENT_INVALID_ALIGN
-
-```mach
-pub val EXTENT_INVALID_ALIGN:  ExtentCause = 7
-```
-
-## val EXTENT_INVALID_GRAPH
-
-```mach
-pub val EXTENT_INVALID_GRAPH:  ExtentCause = 8
-```
-
-## val EXTENT_EMPTY_TAG
-
-```mach
-pub val EXTENT_EMPTY_TAG:      ExtentCause = 9
 ```
 
 ## rec Extent

@@ -1,33 +1,9 @@
 # mach.lang.target.of.rsrc
 
-## val RT_ICON
-
-```mach
-pub val RT_ICON:       u32 = 3
-```
-
-## val RT_GROUP_ICON
-
-```mach
-pub val RT_GROUP_ICON: u32 = 14
-```
-
-## val RT_VERSION
-
-```mach
-pub val RT_VERSION:    u32 = 16
-```
-
 ## val RT_MANIFEST
 
 ```mach
 pub val RT_MANIFEST:   u32 = 24
-```
-
-## rec ResEntry
-
-```mach
-pub rec ResEntry;
 ```
 
 ## rec RsrcImage

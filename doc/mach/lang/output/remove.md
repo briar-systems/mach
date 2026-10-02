@@ -2,12 +2,6 @@
 
 descriptor-relative removal beneath a project root: every component is
 
-## val MAX_DEPTH
-
-```mach
-pub val MAX_DEPTH: usize = 64
-```
-
 ## rec Removal
 
 ```mach

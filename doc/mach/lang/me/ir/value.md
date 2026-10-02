@@ -60,12 +60,6 @@ pub val VAL_FN:          ValueKind = 7
 pub val VAL_CONST_AGG:   ValueKind = 8
 ```
 
-## rec ValueBytes
-
-```mach
-pub rec ValueBytes;
-```
-
 ## rec AggReloc
 
 ```mach

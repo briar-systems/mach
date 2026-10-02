@@ -20,20 +20,6 @@ pub val DIGEST_LEN: usize = 32
 pub val UUID_LEN:   usize = 16
 ```
 
-## val ELF_NOTE_NAMESZ
-
-```mach
-pub val ELF_NOTE_NAMESZ:  u32   = 4
-```
-
-elf: `.note.gnu.build-id`, namesz / descsz / type / "GNU\0" / descriptor
-
-## val ELF_NOTE_TYPE
-
-```mach
-pub val ELF_NOTE_TYPE:    u32   = 3
-```
-
 ## val ELF_NOTE_HEADER
 
 ```mach
