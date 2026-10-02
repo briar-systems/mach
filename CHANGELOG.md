@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [6.10.1] - 2026-10-02
+
+### Fixed
+- A spirv module that holds, loads or stores through a physical pointer (`buffer_device_address`) no longer declares a 64-bit integer type and the `Int64` capability that nothing in it uses. Such a module was refused under an explicit `env` unless the target named `int64`, which made the device need `shaderInt64`. `Int64` is now declared only where the shader computes on a 64-bit value, such as comparing or casting a physical pointer (#4401).
+- An `#[op]` row that admits vectors checks a vector operand's element type against the row's width and data class. A vector argument was read as an unknown data class, so no typed row could accept one. Atomic rows take scalars only and refuse a vector pointee with a message that says so, and the `FindILsb`, `FindSMsb` and `FindUMsb` rows state GLSL.std.450's 32-bit component limit (#4392).
+- Passing a case selector or an unspread pack to a `...` parameter, such as `cnt(opt[i64].some)` or `inner(va)` inside a pack function, is refused with `tag.selector_value` or `pack.spread` at the argument. It was misreported as `secret.variadic`, which now fires only for a secret value (#4381).
+
 ## [6.10.0] - 2026-10-02
 
 ### Changed
