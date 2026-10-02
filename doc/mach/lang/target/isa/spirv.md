@@ -866,6 +866,12 @@ pub val OP_BRANCH:                    u32 = 249
 pub val OP_BRANCH_CONDITIONAL:        u32 = 250
 ```
 
+## val OP_SWITCH
+
+```mach
+pub val OP_SWITCH:                    u32 = 251
+```
+
 ## val OP_RETURN
 
 ```mach
