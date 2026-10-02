@@ -252,7 +252,7 @@ to whichever *declared* target matches the host.
 | `platform` | no  | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
 | `stack_reserve` | no | Thread stack reserve in bytes. See [Image stack size](#image-stack-size). |
 | `stack_commit` | no | Thread stack commit in bytes. See [Image stack size](#image-stack-size). |
-| `default` | no | Deprecated and ignored. It once marked the target `native` fell back to when none matched the host. The key is still accepted, so a published dependency keeps building, and warns as `target.default_deprecated`; it will be removed in a later major release. See [`native` target resolution](#native-target-resolution). |
+| `default` | no | Deprecated and ignored. It once marked the target `native` fell back to when none matched the host. The key is still accepted, so a published dependency keeps building, and warns as `target.default_deprecated`. See [`native` target resolution](#native-target-resolution). |
 | `extensions` | no | Array of instruction-set extension names the target may assume, such as `["sha", "ssse3"]`. Each name must be in the isa's vocabulary. See [Instruction-set extensions](#instruction-set-extensions). |
 | `env` | no | Consumer environment (string). The values are owned by the target's isa: an `env` the isa does not define is a manifest error naming the target and the known values, and an isa that defines none refuses the key outright. Today only `spirv` defines any; see [Finished-module targets](#finished-module-targets). |
 
@@ -2238,8 +2238,7 @@ artifact is settled before its target: `mach build` and `mach check` with
 editor analysis. A plain `mach build` or `mach check` resolves `native` first and never
 reaches it. A manifest with no `[target.*]` table has the synthesized host
 target. `[target.*] default = true` no longer means anything: it is accepted and
-ignored, with a `target.default_deprecated` warning, and will be removed in a later
-major release. Migrate by deleting the key and declaring a target for each host the
+ignored, with a `target.default_deprecated` warning. Migrate by deleting the key and declaring a target for each host the
 project builds on, or passing `-t`.
 
 The same rule applies to `[profile.*]` and to `[artifact.*]` when a command
@@ -2436,77 +2435,7 @@ need = []
 
 ## The compiler's own manifest
 
-Mach builds itself from a manifest that declares six targets, two explicit
-profiles, two binary artifacts with literal output paths, and one dependency,
-`std`:
-
-```toml
-[project]
-id = "mach"
-version = "5.0.0"
-mach = "^5.3"
-src = "src"
-out = "out/{target.name}/{profile.name}"
-
-[target.linux-x86_64]
-isa = "x86_64"
-os  = "linux"
-abi = "sysv64"
-
-[target.windows-x86_64]
-isa  = "x86_64"
-os   = "windows"
-abi  = "win64"
-stack_reserve = 0x800000
-
-[profile.debug]
-default = true
-opt = 0
-debug = false
-simd = "scalarize"
-vectorize = true
-float_reassoc = false
-
-[profile.release]
-opt = 2
-debug = false
-simd = "scalarize"
-vectorize = true
-float_reassoc = false
-
-[artifact.mach]
-kind = "bin"
-entry = "bin/main.mach"
-out = "bin/mach"
-targets = ["linux-x86_64", "linux-arm64", "linux-riscv64", "darwin-x86_64", "darwin-aarch64"]
-link = []
-need = []
-
-[artifact.mach-windows]
-kind = "bin"
-entry = "bin/main.mach"
-out = "bin/mach.exe"
-targets = ["windows-x86_64"]
-link = []
-need = []
-
-[dep.std]
-git = "https://github.com/briar-systems/mach-std"
-ref = "commit/e6fc41251e442eb736d4d15de677903a4ba52461"
-```
-
-(The full manifest declares all six targets; `version` is whatever the tree's
-current release is, and the `std` selector is the exact std 2.0.0 commit the
-tree builds against until the tag is cut.) `mach build .` selects the host-matching target via
-`native`, compiles `src/bin/main.mach` and its transitive imports — including
-modules from `std` at `dep/std/` — and links `out/<target>/<profile>/bin/mach`.
-The two artifacts keep literal outputs rather than one
-`bin/mach{artifact.suffix}` because the published seed compiler that
-bootstraps this tree predates the template; a manifest the seed must parse
-stays within what the seed accepts.
-`dep/std` is a git submodule whose gitlink is the pin; the build resolves it
-purely by that directory and verifies the gitlink from the repository's index,
-fetching nothing.
+The compiler builds itself from the `mach.toml` at the root of its repository, which is the one current example of a multi-target, multi-artifact manifest with a dependency.
 
 ## See also
 

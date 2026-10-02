@@ -14,7 +14,7 @@ import re
 import subprocess
 import sys
 
-MARKER = re.compile(r"\b(phase \d+|not yet|(?:later|future|upcoming) releases?|(?<!not )planned)\b", re.I)
+MARKER = re.compile(r"\b(phase \d+|not yet|(?:later|future|upcoming)(?: \w+)? releases?|(?<!not )planned)\b", re.I)
 CITE = re.compile(r"(?<![\w/])#(\d+)\b")
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z`*(\[])")
 

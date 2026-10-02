@@ -177,8 +177,7 @@ same table, #2472) for one lowered as ordinary runtime code. The recognized
 escapes are:
 
 ```
-char escapes:   \n  \t  \r  \\  \'  \0  \xHH
-string escapes: (char escapes) + \"
+escapes:  \n  \t  \r  \\  \'  \"  \0  \xHH
 ```
 
 A string literal is single-line (see [literals.md](literals.md)): the lexer
