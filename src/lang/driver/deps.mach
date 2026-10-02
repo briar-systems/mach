@@ -939,7 +939,15 @@ fun intern_formatted(s: *session.Session, r: res[str, std_format.FormatError]) r
     ret res[intern.StrId, outcome.Fail].ok{id.ok};
 }
 
-fun resolve_dep_edge(p: *project.Project, gi: *GitInspector, root_m: *manifest.Manifest, current_root: str, d: *manifest.DepDef,
+# what `mach dep verify` holds the located closure to beyond what a build reads: each
+# checkout against its pin and selectors, the identity, the flat layout and the release
+# rule. a build locates the closure with no check, so it never spawns git (ruling c)
+rec ClosureCheck {
+    gi:      GitInspector;
+    content: *intern.StrId;
+}
+
+fun resolve_dep_edge(p: *project.Project, check: *ClosureCheck, root_m: *manifest.Manifest, current_root: str, d: *manifest.DepDef,
     deps: *project.DepEntry, active: *bool, dep_count_ptr: *u32, max_deps: usize,
     dir_dep: str, requirer_chain: str) res[u32, outcome.Fail] {
     val alias_opt: opt[str] = intern.lookup(?p.s.interner, d.name);
@@ -952,12 +960,22 @@ fun resolve_dep_edge(p: *project.Project, gi: *GitInspector, root_m: *manifest.M
     val root_dep: *manifest.DepDef = root_dependency(root_m, d.name);
     var selected: *manifest.DepDef = d;
     if (root_dep != nil) { selected = root_dep; }
-    val rd: res[project.DepEntry, outcome.Fail] = resolve_dep(p.s, gi, alias, current_root, dir_dep, selected);
+    val rd: res[project.DepEntry, outcome.Fail] = resolve_dep(p.s, alias, current_root, dir_dep, selected);
     if (sel rd.err) {
         str_free(p.alloc, chain_here);
         ret res[u32, outcome.Fail].err{rd.err};
     }
-    var entry:      project.DepEntry           = rd.ok;
+    var entry:   project.DepEntry = rd.ok;
+    var content: intern.StrId     = intern.STR_NIL;
+    if (check != nil) {
+        val checked_r: res[intern.StrId, outcome.Fail] = realization_check(p.s, check, alias, current_root, dir_dep, selected, ?entry);
+        if (sel checked_r.err) {
+            discard_dep_entry(p.alloc, ?entry);
+            str_free(p.alloc, chain_here);
+            ret res[u32, outcome.Fail].err{checked_r.err};
+        }
+        content = checked_r.ok;
+    }
     val chain_id_r: res[intern.StrId, A.Error] = intern.intern(?p.s.interner, chain_here);
     if (sel chain_id_r.err) {
         discard_dep_entry(p.alloc, ?entry);
@@ -970,17 +988,19 @@ fun resolve_dep_edge(p: *project.Project, gi: *GitInspector, root_m: *manifest.M
     val overridden: bool = root_dep != nil && root_dep.version == intern.STR_NIL;
     val checked:    bool = !overridden || selected == d;
     entry.root_declared = root_dep != nil;
-    val release_r: err[outcome.Fail] = edge_release_rule(p.s, chain_here, selected, ?entry.manifest, root_m);
-    if (sel release_r.err) {
-        discard_dep_entry(p.alloc, ?entry);
-        str_free(p.alloc, chain_here);
-        ret res[u32, outcome.Fail].err{release_r.err};
+    if (check != nil) {
+        val release_r: err[outcome.Fail] = edge_release_rule(p.s, chain_here, selected, ?entry.manifest, root_m);
+        if (sel release_r.err) {
+            discard_dep_entry(p.alloc, ?entry);
+            str_free(p.alloc, chain_here);
+            ret res[u32, outcome.Fail].err{release_r.err};
+        }
     }
     var j: u32 = 0;
     for (j < dep_count_ptr[0]) {
         if (deps[j].project_id == entry.project_id) {
-            if (checked) {
-                val esel_r: err[outcome.Fail] = requirer_selector_satisfied(p.s, gi, alias, chain_here, current_root, dir_dep, d, deps[j].content, root_dep == d);
+            if (check != nil && checked) {
+                val esel_r: err[outcome.Fail] = requirer_selector_satisfied(p.s, ?check.gi, alias, chain_here, current_root, dir_dep, d, check.content[j], root_dep == d);
                 if (sel esel_r.err) {
                     discard_dep_entry(p.alloc, ?entry);
                     str_free(p.alloc, chain_here);
@@ -1008,15 +1028,18 @@ fun resolve_dep_edge(p: *project.Project, gi: *GitInspector, root_m: *manifest.M
         str_free(p.alloc, chain_here);
         ret res[u32, outcome.Fail].err{outcome.user(diagnostic_kind.DEP_LIMIT, "exceeded maximum dependency limit of 128")};
     }
-    if (checked) {
-        val add_sel_r: err[outcome.Fail] = requirer_selector_satisfied(p.s, gi, alias, chain_here, current_root, dir_dep, d, entry.content, root_dep == d);
-        if (sel add_sel_r.err) {
-            discard_dep_entry(p.alloc, ?entry);
-            str_free(p.alloc, chain_here);
-            ret res[u32, outcome.Fail].err{add_sel_r.err};
-        }
-    }
     val idx: u32 = dep_count_ptr[0];
+    if (check != nil) {
+        if (checked) {
+            val add_sel_r: err[outcome.Fail] = requirer_selector_satisfied(p.s, ?check.gi, alias, chain_here, current_root, dir_dep, d, content, root_dep == d);
+            if (sel add_sel_r.err) {
+                discard_dep_entry(p.alloc, ?entry);
+                str_free(p.alloc, chain_here);
+                ret res[u32, outcome.Fail].err{add_sel_r.err};
+            }
+        }
+        check.content[idx] = content;
+    }
     deps[idx]        = entry;
     active[idx]      = true;
     dep_count_ptr[0] = dep_count_ptr[0] + 1;
@@ -1032,7 +1055,7 @@ fun resolve_dep_edge(p: *project.Project, gi: *GitInspector, root_m: *manifest.M
         deps[idx].direct_count = child_count;
         var k: u32 = 0;
         for (k < child_count) {
-            val child_r: res[u32, outcome.Fail] = resolve_dep_edge(p, gi, root_m, current_root,
+            val child_r: res[u32, outcome.Fail] = resolve_dep_edge(p, check, root_m, current_root,
                 ?deps[idx].manifest.deps[k], deps, active, dep_count_ptr, max_deps, dir_dep, chain_here);
             if (sel child_r.err) {
                 str_free(p.alloc, chain_here);
@@ -1646,7 +1669,41 @@ pub fun check_dep_root(project_root: str) res[bool, outcome.Fail] {
     ret res[bool, outcome.Fail].ok{true};
 }
 
-pub fun resolve_deps(p: *project.Project, m: *manifest.Manifest, project_root: str) err[outcome.Fail] {
+val CLOSURE_MAX: usize = 128;
+
+# locate a root manifest's dependency closure into `p.config.deps`, as a build reads it:
+# every dependency is the directory its key names under dep/, read through its manifest.
+# nothing is checked against git, a pin, a selector or the identity rule; `mach dep pull`
+# realizes what is missing and `mach dep verify` checks what exists (ruling c)
+# ---
+# p:            the project receiving the closure
+# m:            the root manifest
+# project_root: the root project's directory
+# ret:          err naming a missing dependency, an unreadable manifest, a cycle or an
+#               unaccepted compiler range
+pub fun closure_locate(p: *project.Project, m: *manifest.Manifest, project_root: str) err[outcome.Fail] {
+    ret closure_walk(p, m, project_root, nil);
+}
+
+# locate the closure as `closure_locate` does and hold every edge of it to what `mach dep
+# verify` checks: each checkout against its pin and every exact selector, its project id
+# against its key, no nested realization, and the release rule
+# ---
+# p:            the project receiving the closure
+# m:            the root manifest
+# project_root: the root project's directory
+# ret:          err naming the first dependency that does not locate or does not verify
+pub fun closure_verify(p: *project.Project, m: *manifest.Manifest, project_root: str) err[outcome.Fail] {
+    val cr: res[*intern.StrId, A.Error] = A.allocate[intern.StrId](p.alloc, CLOSURE_MAX);
+    if (sel cr.err) { ret err[outcome.Fail].err{outcome.refused(cr.err)}; }
+    var check: ClosureCheck      = ClosureCheck{gi: GitInspector{program: nil}, content: cr.ok};
+    val r:     err[outcome.Fail] = closure_walk(p, m, project_root, ?check);
+    git_inspector_dnit(p.alloc, ?check.gi);
+    A.deallocate[intern.StrId](p.alloc, check.content, CLOSURE_MAX);
+    ret r;
+}
+
+fun closure_walk(p: *project.Project, m: *manifest.Manifest, project_root: str, check: *ClosureCheck) err[outcome.Fail] {
     val root_r: res[bool, outcome.Fail] = check_dep_root(project_root);
     if (sel root_r.err) { ret err[outcome.Fail].err{root_r.err}; }
     if (m.dep_count == 0) {
@@ -1658,7 +1715,7 @@ pub fun resolve_deps(p: *project.Project, m: *manifest.Manifest, project_root: s
         ret check_compiler_requirements(p, m, nil, 0, root_label(p, m));
     }
 
-    val max_deps: usize                           = 128;
+    val max_deps: usize                           = CLOSURE_MAX;
     val r:        res[*project.DepEntry, A.Error] = A.allocate[project.DepEntry](p.alloc, max_deps);
     if (sel r.err) { ret err[outcome.Fail].err{outcome.refused(r.err)}; }
     val deps:      *project.DepEntry = r.ok;
@@ -1681,20 +1738,17 @@ pub fun resolve_deps(p: *project.Project, m: *manifest.Manifest, project_root: s
 
     val root_name: str = root_label(p, m);
 
-    var gi:     GitInspector = GitInspector{program: nil};
-    var root_i: u32          = 0;
+    var root_i: u32 = 0;
     for (root_i < m.dep_count) {
-        val edge_r: res[u32, outcome.Fail] = resolve_dep_edge(p, ?gi, m, project_root, ?m.deps[root_i],
+        val edge_r: res[u32, outcome.Fail] = resolve_dep_edge(p, check, m, project_root, ?m.deps[root_i],
             deps, active, ?dep_count, max_deps, dir_dep, root_name);
         if (sel edge_r.err) {
-            git_inspector_dnit(p.alloc, ?gi);
             A.deallocate[bool](p.alloc, active, max_deps);
             project.free_dep_entries(p.alloc, deps, dep_count, max_deps);
             ret err[outcome.Fail].err{edge_r.err};
         }
         root_i = root_i + 1;
     }
-    git_inspector_dnit(p.alloc, ?gi);
     A.deallocate[bool](p.alloc, active, max_deps);
 
     val needs: err[outcome.Fail] = check_compiler_requirements(p, m, deps, dep_count, root_name);
@@ -2028,20 +2082,11 @@ fun requirement_index(arr: *manifest.LinkRequirement, count: u32,
     ret -1;
 }
 
-# a build and `mach dep verify` only read dep/; realizing is `mach dep pull`'s, and pinning a
-# range that has no pin yet is `mach dep update`'s
-fun unrealized_text(s: *session.Session, alias: str, dep_dir: str, root: str, d: *manifest.DepDef) str {
-    var r: res[str, std_format.FormatError];
-    if (d.version != intern.STR_NIL) {
-        r = std_format.sprint(s.build_alloc,
-            "dependency '{}' is not realized (nothing checked out at '{}'); run `mach dep pull <path>` for project '{}', or `mach dep update <path> {}` when it has no pin yet",
-            alias, dep_dir, root, alias);
-    }
-    or {
-        r = std_format.sprint(s.build_alloc,
-            "dependency '{}' is not realized (nothing checked out at '{}'); run `mach dep pull <path>` for project '{}'", alias, dep_dir, root);
-    }
-    if (sel r.err) { ret "a dependency is not realized; run `mach dep pull <path>`"; }
+# a build only reads dep/; realizing a missing dependency is `mach dep pull`'s
+fun missing_text(s: *session.Session, alias: str, dep_dir: str, root: str) str {
+    val r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+        "dependency '{}' is missing: nothing is checked out at '{}'; run `mach dep pull {}`", alias, dep_dir, root);
+    if (sel r.err) { ret "a dependency is missing; run `mach dep pull`"; }
     ret r.ok;
 }
 
@@ -2742,7 +2787,24 @@ fun realized_content(s: *session.Session, gi: *GitInspector, alias: str, parent_
     ret verify_git_checkout(s, gi, alias, parent_root, dep_dir, dir_dep, d, authority);
 }
 
-fun resolve_dep(s: *session.Session, gi: *GitInspector, alias: str, project_root: str,
+# what `mach dep verify` checks of one located dependency: its checkout against its pin
+# (git) or its contained tree (path), its project id against its key, and no nested
+# realization under it
+# ---
+# ret: the realized content the closure's exact selectors are checked against
+fun realization_check(s: *session.Session, check: *ClosureCheck, alias: str, parent_root: str,
+    dir_dep: str, d: *manifest.DepDef, entry: *project.DepEntry) res[intern.StrId, outcome.Fail] {
+    val dep_dir:   str                             = intern_text(s, entry.vendor_root);
+    val content_r: res[intern.StrId, outcome.Fail] = realized_content(s, ?check.gi, alias, parent_root, dep_dir, dir_dep, d);
+    if (sel content_r.err) { ret content_r; }
+    val identity: err[outcome.Fail] = check_dep_identity(s, alias, intern_text(s, entry.project_id));
+    if (sel identity.err) { ret res[intern.StrId, outcome.Fail].err{identity.err}; }
+    val nested: err[outcome.Fail] = refuse_nested_realization(s, alias, dep_dir);
+    if (sel nested.err) { ret res[intern.StrId, outcome.Fail].err{nested.err}; }
+    ret content_r;
+}
+
+fun resolve_dep(s: *session.Session, alias: str, project_root: str,
     dir_dep: str, d: *manifest.DepDef) res[project.DepEntry, outcome.Fail] {
     val dep_dir_r: res[str, outcome.Fail] = build_dep_root(s.build_alloc, project_root, dir_dep, alias);
     if (sel dep_dir_r.err) { ret res[project.DepEntry, outcome.Fail].err{dep_dir_r.err}; }
@@ -2755,7 +2817,7 @@ fun resolve_dep(s: *session.Session, gi: *GitInspector, alias: str, project_root
         ret res[project.DepEntry, outcome.Fail].err{slot_r.err};
     }
     if (slot_r.ok == SLOT_ABSENT || slot_r.ok == SLOT_EMPTY) {
-        val msg: str = unrealized_text(s, alias, dep_dir, project_root, d);
+        val msg: str = missing_text(s, alias, dep_dir, project_root);
         str_free(s.build_alloc, dep_dir);
         ret res[project.DepEntry, outcome.Fail].err{outcome.user(diagnostic_kind.DEP_UNREALIZED, msg)};
     }
@@ -2764,12 +2826,6 @@ fun resolve_dep(s: *session.Session, gi: *GitInspector, alias: str, project_root
     if ((sel is_symlink_r.ok && is_symlink_r.ok) || !(sel is_dir_r.ok && is_dir_r.ok)) {
         str_free(s.build_alloc, dep_dir);
         ret res[project.DepEntry, outcome.Fail].err{outcome.user(diagnostic_kind.DEP_NOT_DIRECTORY, "dependency realization must be a physical directory, not a symlink or other entry")};
-    }
-
-    val content_r: res[intern.StrId, outcome.Fail] = realized_content(s, gi, alias, project_root, dep_dir, dir_dep, d);
-    if (sel content_r.err) {
-        str_free(s.build_alloc, dep_dir);
-        ret res[project.DepEntry, outcome.Fail].err{content_r.err};
     }
 
     val toml_path_r: res[str, fail.Fail] = load.join_path(s.build_alloc, dep_dir, manifest.MANIFEST_FILE);
@@ -2805,19 +2861,6 @@ fun resolve_dep(s: *session.Session, gi: *GitInspector, alias: str, project_root
         manifest.dnit(?parsed, s.build_alloc);
         ret res[project.DepEntry, outcome.Fail].err{outcome.user(diagnostic_kind.DEP_NO_PROJECT_ID, "dependency manifest declares no readable project id")};
     }
-    val identity: err[outcome.Fail] = check_dep_identity(s, alias, declared_opt.some);
-    if (sel identity.err) {
-        str_free(s.build_alloc, dep_dir);
-        manifest.dnit(?parsed, s.build_alloc);
-        ret res[project.DepEntry, outcome.Fail].err{identity.err};
-    }
-    val nested: err[outcome.Fail] = refuse_nested_realization(s, alias, dep_dir);
-    if (sel nested.err) {
-        str_free(s.build_alloc, dep_dir);
-        manifest.dnit(?parsed, s.build_alloc);
-        ret res[project.DepEntry, outcome.Fail].err{nested.err};
-    }
-
     var entry: project.DepEntry;
     entry.direct          = nil;
     entry.direct_count    = 0;
@@ -2826,7 +2869,6 @@ fun resolve_dep(s: *session.Session, gi: *GitInspector, alias: str, project_root
     entry.project_id      = parsed.id;
     entry.project_dir_src = parsed.src;
     entry.ref             = d.ref;
-    entry.content         = content_r.ok;
 
     val ra: res[intern.StrId, A.Error] = intern.intern(?s.interner, alias);
     if (sel ra.err) {
@@ -3916,7 +3958,7 @@ pub fun refuse_git_slot(s: *session.Session, root: str, id: str, mode: u8, slot:
     ret err[outcome.Fail].err{outcome.user(diagnostic_kind.DEP_DIRTY, msg_r.ok)};
 }
 
-# bring a slot `refuse_git_slot` accepted to the realization a build verifies. a pin its
+# bring a slot `refuse_git_slot` accepted to the realization `mach dep verify` checks. a pin its
 # checkout does not hold is fetched, or refused when `offline`. offline, an uninitialized gitlink
 # is initialized only from a module store that holds its pin, a subproject's dependency is never
 # cloned, and a dependency with no gitlink is added only over a checkout or store holding its selector

@@ -134,11 +134,37 @@ pub fun check_dep_root(project_root: str) res[bool, outcome.Fail];
 
 whether the dependency root exists; err when it is anything but a physical directory
 
-## fun resolve_deps
+## fun closure_locate
 
 ```mach
-pub fun resolve_deps(p: *project.Project, m: *manifest.Manifest, project_root: str) err[outcome.Fail];
+pub fun closure_locate(p: *project.Project, m: *manifest.Manifest, project_root: str) err[outcome.Fail];
 ```
+
+locate a root manifest's dependency closure into `p.config.deps`, as a build reads it:
+every dependency is the directory its key names under dep/, read through its manifest.
+nothing is checked against git, a pin, a selector or the identity rule; `mach dep pull`
+realizes what is missing and `mach dep verify` checks what exists (ruling c)
+
+p: the project receiving the closure
+m: the root manifest
+project_root: the root project's directory
+ret: err naming a missing dependency, an unreadable manifest, a cycle or an
+              unaccepted compiler range
+
+## fun closure_verify
+
+```mach
+pub fun closure_verify(p: *project.Project, m: *manifest.Manifest, project_root: str) err[outcome.Fail];
+```
+
+locate the closure as `closure_locate` does and hold every edge of it to what `mach dep
+verify` checks: each checkout against its pin and every exact selector, its project id
+against its key, no nested realization, and the release rule
+
+p: the project receiving the closure
+m: the root manifest
+project_root: the root project's directory
+ret: err naming the first dependency that does not locate or does not verify
 
 ## fun scope_closure_to_dependency
 
@@ -432,7 +458,7 @@ pub fun realize_git_slot(s: *session.Session, root: str, id: str, url: str, ref:
 slot: *GitSlot, offline: bool) res[u8, outcome.Fail];
 ```
 
-bring a slot `refuse_git_slot` accepted to the realization a build verifies. a pin its
+bring a slot `refuse_git_slot` accepted to the realization `mach dep verify` checks. a pin its
 checkout does not hold is fetched, or refused when `offline`. offline, an uninitialized gitlink
 is initialized only from a module store that holds its pin, a subproject's dependency is never
 cloned, and a dependency with no gitlink is added only over a checkout or store holding its selector

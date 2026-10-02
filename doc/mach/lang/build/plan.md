@@ -183,8 +183,8 @@ pub fun plan_dependency_requirements(s: *session.Session, m: *manifest.Manifest,
 ```
 
 add the cells a dependency's default library artifacts require to a plan made
-from the root manifest. the root's closure is realized and verified exactly as
-a build does; every cell compiled against a closure that holds a dependency
+from the root manifest. the root's closure is located exactly as a build
+locates it; every cell compiled against a closure that holds a dependency
 waits on that dependency's requirement cells, which are planned before it with
 the root's profile, for every target they name in the dependency's manifest,
 and against the dependency's own closure in turn. a requirement reached through
