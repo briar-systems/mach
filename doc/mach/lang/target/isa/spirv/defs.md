@@ -345,7 +345,7 @@ pub val FIRST_OPERAND:         isa.OpTyping = isa.OpTyping;
 
 the operand an untyped row's relations are stated against: the first for an image's
 handle, holding its type to nothing, the first for a math instruction, a scalar or vector
-of floats, or for an integer one of signed, unsigned or either integers, and the value for
+of floats, or for an integer one of signed or unsigned integers, and the value for
 a subgroup operation, a scalar or vector of integers or floats
 
 ## val MATH_OPERAND
@@ -366,12 +366,6 @@ pub val SIGNED_OPERAND:        isa.OpTyping = isa.OpTyping;
 pub val UNSIGNED_OPERAND:      isa.OpTyping = isa.OpTyping;
 ```
 
-## val INTEGER_OPERAND
-
-```mach
-pub val INTEGER_OPERAND:       isa.OpTyping = isa.OpTyping;
-```
-
 ## val SUBGROUP_VALUE
 
 ```mach
@@ -382,6 +376,28 @@ pub val SUBGROUP_VALUE:        isa.OpTyping = isa.OpTyping;
 
 ```mach
 pub val GROUP_OPERATION_VALUE: isa.OpTyping = isa.OpTyping;
+```
+
+## val BIT_SEARCH_OPERAND
+
+```mach
+pub val BIT_SEARCH_OPERAND:          isa.OpTyping = isa.OpTyping;
+```
+
+the operand of a bit search, a scalar or vector of 32-bit integers, of either signedness
+for `FindILsb`, signed for `FindSMsb` and unsigned for `FindUMsb`: GLSL.std.450 limits
+each to 32-bit width components
+
+## val SIGNED_BIT_SEARCH_OPERAND
+
+```mach
+pub val SIGNED_BIT_SEARCH_OPERAND:   isa.OpTyping = isa.OpTyping;
+```
+
+## val UNSIGNED_BIT_SEARCH_OPERAND
+
+```mach
+pub val UNSIGNED_BIT_SEARCH_OPERAND: isa.OpTyping = isa.OpTyping;
 ```
 
 ## val READ_TEXEL_COUNT
