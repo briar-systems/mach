@@ -1678,7 +1678,8 @@ pub def OpNumeric: u8
 ```
 
 the numbers a typed row's data type is a scalar or vector of: any type at all, integers or
-floats, floats only, or integers of one signedness. a truth value is an unsigned integer
+floats, floats only, integers of either signedness, or integers of one signedness. a truth
+value is an unsigned integer
 
 ## val OP_NUMERIC_NONE
 
@@ -1710,10 +1711,16 @@ pub val OP_NUMERIC_SIGNED:   OpNumeric = 3
 pub val OP_NUMERIC_UNSIGNED: OpNumeric = 4
 ```
 
+## val OP_NUMERIC_INTEGER
+
+```mach
+pub val OP_NUMERIC_INTEGER:  OpNumeric = 5
+```
+
 ## val OP_NUMERIC_COUNT
 
 ```mach
-pub val OP_NUMERIC_COUNT:    OpNumeric = 5
+pub val OP_NUMERIC_COUNT:    OpNumeric = 6
 ```
 
 ## fun op_numeric_admits
