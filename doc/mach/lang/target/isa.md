@@ -1627,8 +1627,9 @@ ascending bit order, and 0 is the empty mask
 pub def OpDataClass: u8
 ```
 
-the class of the data type a typed row operates on: an integer, a float, or anything
-else (a vector, an aggregate, a handle), which no requirement admits
+the class of the data type a typed row operates on, a vector's element when the typing
+admits vectors: an integer, a float, or anything else (an aggregate, a handle), which no
+requirement admits
 
 ## val OP_DATA_INT
 
