@@ -1531,8 +1531,10 @@ key 'name' in [project]`, or `... its [project].version does not match the
 tag`), so the error never reads as one in the project's own `mach.toml`.
 
 Resolution runs in exactly three places: `mach dep add`, `mach dep update` and
-`mach dep outdated`. **Builds never resolve.** They verify, offline (see
-[What a build verifies](#what-a-build-verifies)). For every identity in the
+`mach dep outdated`. **Builds never resolve and never verify.** They read
+what `dep/` holds (see [What a build reads](#what-a-build-reads)), and `mach
+dep verify` checks it (see [What `mach dep verify`
+checks](#what-mach-dep-verify-checks)). For every identity in the
 closure that some manifest selects by `version`, resolution picks one release
 such that:
 
@@ -1674,7 +1676,7 @@ The rule follows how a manifest was reached, not where it sits:
   development, and its manifest may use any selector.
 
 A release that breaks the rule is refused wherever it is reached. Resolution
-stops when it reaches one, and verification (and so every build) refuses it,
+stops when it reaches one, and `mach dep verify` refuses it,
 naming the chain and the offending line:
 
 ```
@@ -1758,23 +1760,33 @@ first declaring path's; verification compares commits, never URLs. A realized
 checkout whose remote points somewhere else (a `.git` suffix, another host, a
 local mirror) verifies by its commit alone.
 
-### What a build verifies
+### What a build reads
 
-Builds never fetch and never write under `dep/`. Every build (and `mach dep
-verify` as a command) checks, offline, that:
+A build locates each dependency as the directory its key names under `dep/`
+and reads its manifest. That is the whole of its dealing with dependencies: it
+never fetches, never writes under `dep/`, runs no Git process, and checks no
+pin, selector, identity or checkout state. It builds what exists, so a stale
+or drifted dependency surfaces as a build error, and `mach dep pull` brings it
+back to its pin. A dependency with nothing checked out, whether `dep/<id>` is
+absent or is the empty directory Git leaves for an uninitialized gitlink on a
+fresh clone, is refused naming that command (`dependency 'std' is missing:
+nothing is checked out at 'dep/std'; run `mach dep pull <root>``). A build
+also refuses a cycle in the manifests it reads, and a compiler outside any
+manifest's `[project].mach` (see [Compiler range](#compiler-range)).
+
+### What `mach dep verify` checks
+
+`mach dep verify` locates the closure as a build does and checks, offline,
+that:
 
 1. every Git dependency is a clean checkout at its applicable pin
    (`dependency 'std': checkout is dirty:  M mach.toml`), and every path
    dependency is a contained filesystem tree without repository metadata;
 2. its project id equals the directory name;
 3. the closure computed from the realized manifests equals the set of
-   directories under `dep/`: nothing missing, nothing extra. A dependency with
-   nothing checked out, whether `dep/<id>` is absent or is the empty directory
-   Git leaves for an uninitialized gitlink on a fresh clone, is refused naming
-   the command that realizes it (`dependency 'std' is not realized (nothing
-   checked out at 'dep/std'); run `mach dep pull <path>` for project '<root>'`,
-   and for a `version` selection also `or `mach dep update <path> std` when it
-   has no pin yet`);
+   directories under `dep/`: nothing missing, nothing extra, and no
+   dependency's own `dep/` realized. A missing dependency is refused as a build
+   refuses it;
 4. there are no cycles (reported as the chain);
 5. every realized manifest's `[project].mach` accepts the running compiler (see
    [Compiler range](#compiler-range));
@@ -1828,8 +1840,8 @@ dependency is verifiable before it is committed.
 
 `mach dep pull` reads what a Git dependency's `dep/<id>` holds together with
 its record (the staged gitlink, its `.gitmodules` entry, and any module
-directory Git retained) and takes the one step that brings it to what a build
-verifies:
+directory Git retained) and takes the one step that brings it to what `mach
+dep verify` checks:
 
 - a staged gitlink with nothing checked out, as on a fresh clone or after the
   directory was deleted, is initialized in place (`realized std @ …
