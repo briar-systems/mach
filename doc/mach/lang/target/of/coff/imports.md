@@ -15,12 +15,12 @@ pub fun dnit(out: *Expanded);
 ## fun expand
 
 ```mach
-pub fun expand(input: *of.ObjectImage, out: *Expanded) err[fail.Fail];
+pub fun expand(input: *target_of.ObjectImage, out: *Expanded) err[fail.Fail];
 ```
 
 ## fun normalize
 
 ```mach
-pub fun normalize(img: *of.ObjectImage) err[fail.Fail];
+pub fun normalize(img: *target_of.ObjectImage) err[fail.Fail];
 ```
 

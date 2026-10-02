@@ -64,7 +64,7 @@ write `buf` to `path`, whose parent exists
 
 ```mach
 pub fun writer[W](itn: *intern.Interner, a: *A.Allocator, path: str, ctx: *W,
-write_cb: fun(*W, *mwriter.Writer) err[mwriter.WriteError], mode: i32,
+write_cb: fun(*W, *io_writer.Writer) err[io_writer.WriteError], mode: i32,
 op: str, generic: str) err[outcome.Fail];
 ```
 

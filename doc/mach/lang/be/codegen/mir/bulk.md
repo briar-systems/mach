@@ -3,6 +3,6 @@
 ## fun expand
 
 ```mach
-pub fun expand(ctx: *context.LowerCtx) err[fail.Fail];
+pub fun expand(ctx: *mir_context.LowerCtx) err[fail.Fail];
 ```
 

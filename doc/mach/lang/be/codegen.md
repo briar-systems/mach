@@ -15,10 +15,10 @@ pub fun no_debug() DebugInfo;
 ## fun codegen_unit
 
 ```mach
-pub fun codegen_unit(s: *session.Session, tgt: *target.Target,
-irmod: *ir.Module, deps: unit.IrSet, asm_out: *writer.Writer,
+pub fun codegen_unit(s: *session.Session, tgt: *lang_target.Target,
+irmod: *me_ir.Module, deps: be_codegen_unit.IrSet, asm_out: *io_writer.Writer,
 placement_policy: u32, dbg: DebugInfo,
-diags: *diagnostic.DiagnosticStore) res[of.ObjectImage, fail.Fail];
+diags: *diagnostic.DiagnosticStore) res[target_of.ObjectImage, fail.Fail];
 ```
 
 the back half of one module. a rejection of the program by any pass is an

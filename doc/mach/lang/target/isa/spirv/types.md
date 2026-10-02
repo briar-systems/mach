@@ -28,7 +28,7 @@ of the capability points at (#4334)
 ## fun types_init
 
 ```mach
-pub fun types_init(b: *spirv.Builder) TypeTable;
+pub fun types_init(b: *isa_spirv.Builder) TypeTable;
 ```
 
 ## fun raise
@@ -42,7 +42,7 @@ raises `need` for the use types are being built for
 ## fun raise_at
 
 ```mach
-pub fun raise_at(tt: *TypeTable, need: u64, loc: source.SrcLoc);
+pub fun raise_at(tt: *TypeTable, need: u64, loc: lang_source.SrcLoc);
 ```
 
 raises `need` for the use at `loc`, which locates each bit no earlier use located
@@ -50,7 +50,7 @@ raises `need` for the use at `loc`, which locates each bit no earlier use locate
 ## fun need_loc
 
 ```mach
-pub fun need_loc(tt: *TypeTable, need: u64) source.SrcLoc;
+pub fun need_loc(tt: *TypeTable, need: u64) lang_source.SrcLoc;
 ```
 
 the first located use of the lowest bit of `need`, nil where no use was located

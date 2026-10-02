@@ -77,7 +77,7 @@ pub fun phase_valid(ph: u8) bool;
 ## def Instant
 
 ```mach
-pub def Instant: opt[ctime.Instant]
+pub def Instant: opt[time.Instant]
 ```
 
 an instant a readout measures from: absent when the platform clock refused
@@ -92,7 +92,7 @@ pub fun sample() Instant;
 ## fun elapsed
 
 ```mach
-pub fun elapsed(start: Instant) cdur.Duration;
+pub fun elapsed(start: Instant) chrono_duration.Duration;
 ```
 
 ## rec PhaseMetrics
@@ -230,7 +230,7 @@ pub fun item(pr: *Progress, ph: u8, name: str, start: Instant);
 ## fun item_dur
 
 ```mach
-pub fun item_dur(pr: *Progress, ph: u8, name: str, d: cdur.Duration);
+pub fun item_dur(pr: *Progress, ph: u8, name: str, d: chrono_duration.Duration);
 ```
 
 ## fun phase_end

@@ -9,13 +9,13 @@ pub rec MachoReloc;
 ## fun macho_reloc_for
 
 ```mach
-pub fun macho_reloc_for(itn: *intern.Interner, alloc: *A.Allocator, arch_id: u32, kind: of.RelocKind, origin: of.RelocOrigin) res[MachoReloc, fail.Fail];
+pub fun macho_reloc_for(itn: *intern.Interner, alloc: *A.Allocator, arch_id: u32, kind: target_of.RelocKind, origin: target_of.RelocOrigin) res[MachoReloc, fail.Fail];
 ```
 
 ## fun reloc_kind_for
 
 ```mach
-pub fun reloc_kind_for(itn: *intern.Interner, alloc: *A.Allocator, cputype: u32, r_type: u32, r_length: u32, insn: u32) res[of.RelocKind, fail.Fail];
+pub fun reloc_kind_for(itn: *intern.Interner, alloc: *A.Allocator, cputype: u32, r_type: u32, r_length: u32, insn: u32) res[target_of.RelocKind, fail.Fail];
 ```
 
 ## fun x64_is_signed

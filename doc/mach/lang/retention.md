@@ -61,7 +61,7 @@ a new retainer holding nothing, in a free slot when one exists
 ## fun record
 
 ```mach
-pub fun record(t: *Retention, id: RetainerId, stable: module.StableModuleId, file: source.FileId, rejected: bool) err[fail.Fail];
+pub fun record(t: *Retention, id: RetainerId, stable: module.StableModuleId, file: lang_source.FileId, rejected: bool) err[fail.Fail];
 ```
 
 a module the open round loaded; held from now on, so nothing retires it under the build

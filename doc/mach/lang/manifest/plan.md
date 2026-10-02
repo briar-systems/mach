@@ -284,7 +284,7 @@ ret: true when a default library artifact needs it
 ## fun resolve_artifact_reqs
 
 ```mach
-pub fun resolve_artifact_reqs(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt.TargetRegistry, s: *Scope,
+pub fun resolve_artifact_reqs(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, s: *Scope,
 consumer: *ArtifactDef, consumer_target: intern.StrId, profile: str,
 whole_project: bool,
 out_items: **ArtifactReq, out_count: *u32) err[outcome.Fail];
@@ -307,7 +307,7 @@ ret: ok; err from the output path expansion, with the array freed
 ## fun resolve_default_library_reqs
 
 ```mach
-pub fun resolve_default_library_reqs(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt.TargetRegistry,
+pub fun resolve_default_library_reqs(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry,
 s: *Scope, profile: str, out_items: **ArtifactReq, out_count: *u32) err[outcome.Fail];
 ```
 
@@ -444,7 +444,7 @@ ret: ok unless the artifact name cannot be looked up
 ## fun resolve_build_unit
 
 ```mach
-pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt.TargetRegistry, m: *Manifest, pick: Selection) res[BuildUnit, outcome.Fail];
+pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, m: *Manifest, pick: Selection) res[BuildUnit, outcome.Fail];
 ```
 
 resolve a selection into one `BuildUnit`. with no target named, an artifact
@@ -465,7 +465,7 @@ ret: the unit; err from target, profile or artifact resolution, when the
 ## fun resolve_scoped_build_unit
 
 ```mach
-pub fun resolve_scoped_build_unit(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt.TargetRegistry, s: *Scope, pick: Selection) res[BuildUnit, outcome.Fail];
+pub fun resolve_scoped_build_unit(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, s: *Scope, pick: Selection) res[BuildUnit, outcome.Fail];
 ```
 
 `resolve_build_unit` for a cell of `s`: target, artifact and links resolve in
@@ -481,7 +481,7 @@ ret: as `resolve_build_unit`
 ## fun check_collisions
 
 ```mach
-pub fun check_collisions(alloc: *A.Allocator, itn: *intern.Interner, reg: *tgt.TargetRegistry, m: *Manifest,
+pub fun check_collisions(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, m: *Manifest,
 v: *TmplVars) err[outcome.Fail];
 ```
 

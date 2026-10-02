@@ -66,7 +66,7 @@ where a described section lies in the image the parser reads back
 ## fun encode
 
 ```mach
-pub fun encode(alloc: *A.Allocator, img: *of.ObjectImage, described: u32, hosts: *Host,
+pub fun encode(alloc: *A.Allocator, img: *target_of.ObjectImage, described: u32, hosts: *Host,
 tables: u32, out_bytes: **u8, out_len: *u32) err[fail.Fail];
 ```
 
@@ -77,7 +77,7 @@ the caller owns the bytes
 ## fun apply
 
 ```mach
-pub fun apply(img: *of.ObjectImage, bytes: *u8, len: usize) err[fail.Fail];
+pub fun apply(img: *target_of.ObjectImage, bytes: *u8, len: usize) err[fail.Fail];
 ```
 
 applies a carrier to the image its object parsed into, which becomes a
@@ -86,7 +86,7 @@ codegen image
 ## fun take
 
 ```mach
-pub fun take(img: *of.ObjectImage, index: u32) err[fail.Fail];
+pub fun take(img: *target_of.ObjectImage, index: u32) err[fail.Fail];
 ```
 
 applies the carrier in section `index` and leaves its zero-length husk, which
@@ -95,7 +95,7 @@ reads as no carrier
 ## fun consume
 
 ```mach
-pub fun consume(itn: *intern.Interner, img: *of.ObjectImage, name: str) err[fail.Fail];
+pub fun consume(itn: *intern.Interner, img: *target_of.ObjectImage, name: str) err[fail.Fail];
 ```
 
 applies the carrier the section named `name` holds, when the object has one
@@ -103,8 +103,8 @@ applies the carrier the section named `name` holds, when the object has one
 ## fun with_carrier
 
 ```mach
-pub fun with_carrier(alloc: *A.Allocator, img: *of.ObjectImage, name: str, template: of.Section,
-bytes: *u8, len: u32, out: *of.ObjectImage) err[fail.Fail];
+pub fun with_carrier(alloc: *A.Allocator, img: *target_of.ObjectImage, name: str, template: target_of.Section,
+bytes: *u8, len: u32, out: *target_of.ObjectImage) err[fail.Fail];
 ```
 
 a view of img carrying the carrier bytes in a section named `name` shaped by

@@ -4,7 +4,7 @@
 
 ```mach
 pub fun instantiate(
-sc: *sema.SemaContext,
+sc: *sema_context.SemaContext,
 sym: *resolve.Symbol,
 args: *type.TypeId,
 arg_count: u32,
@@ -15,7 +15,7 @@ span: token.Span) res[type.TypeId, fail.Fail];
 
 ```mach
 pub fun check_arity(
-sc: *sema.SemaContext,
+sc: *sema_context.SemaContext,
 sym: *resolve.Symbol,
 arg_count: u32,
 span: token.Span) bool;
@@ -52,13 +52,13 @@ pub val UNDECIDABLE: Agreement = 2
 ## fun check_annotation_uni_secrecy
 
 ```mach
-pub fun check_annotation_uni_secrecy(sc: *sema.SemaContext, ast_tid: id.TypeId);
+pub fun check_annotation_uni_secrecy(sc: *sema_context.SemaContext, ast_tid: ast_id.TypeId);
 ```
 
 ## fun check_annotation
 
 ```mach
-pub fun check_annotation(sc: *sema.SemaContext, ast_tid: id.TypeId);
+pub fun check_annotation(sc: *sema_context.SemaContext, ast_tid: ast_id.TypeId);
 ```
 
 the checks an instance owes each type annotation it resolves, which no check of the
@@ -67,7 +67,7 @@ generic declaration can answer before its parameters are known
 ## fun check_annotation_handles
 
 ```mach
-pub fun check_annotation_handles(sc: *sema.SemaContext, ast_tid: id.TypeId);
+pub fun check_annotation_handles(sc: *sema_context.SemaContext, ast_tid: ast_id.TypeId);
 ```
 
 a generic record, union or tag instantiated so that a field or payload holds a handle,
@@ -78,7 +78,7 @@ pointer to a pointer to a handle is refused at the annotation that spells or for
 ## fun check_type_uni_secrecy
 
 ```mach
-pub fun check_type_uni_secrecy(sc: *sema.SemaContext, tid: type.TypeId, who: *type.GenericOwner,
+pub fun check_type_uni_secrecy(sc: *sema_context.SemaContext, tid: type.TypeId, who: *type.GenericOwner,
 args: *type.TypeId, arg_len: u32, span: token.Span);
 ```
 

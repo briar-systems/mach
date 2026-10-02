@@ -49,7 +49,7 @@ pub fun subsystem_flag_from_name(name: str) opt[SubsystemFlag];
 ## fun subsystem_from_flag
 
 ```mach
-pub fun subsystem_from_flag(f: SubsystemFlag) opt[of.Subsystem];
+pub fun subsystem_from_flag(f: SubsystemFlag) opt[target_of.Subsystem];
 ```
 
 ## def BuildGoal
@@ -175,7 +175,7 @@ pick: *manifest.Selection) res[BuildRequest, outcome.Fail];
 
 ```mach
 pub fun for_cell(base: *BuildRequest, owner: str, target: str, artifact: str, want_lib: bool,
-subsystem: of.Subsystem, goal: BuildGoal) BuildRequest;
+subsystem: target_of.Subsystem, goal: BuildGoal) BuildRequest;
 ```
 
 ## val HASH_SIZE

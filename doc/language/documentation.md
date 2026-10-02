@@ -53,7 +53,7 @@ a description, and appear in declaration order (generics, then parameters,
 fields, or cases, then `ret` for functions). Each violation is a warning naming the line:
 
 ```
-documented component matches no parameter, field, case, generic, or `ret` of this declaration
+documented component matches no parameter, field, generic, or `ret` of this declaration
 documented component has no description
 documented components are out of declaration order
 ```

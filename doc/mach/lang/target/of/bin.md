@@ -95,7 +95,7 @@ pub fun name_message(itn: *intern.Interner, a: *A.Allocator, prefix: str, name: 
 ## fun reloc_sym_index
 
 ```mach
-pub fun reloc_sym_index(img: *of.ObjectImage, r: *of.Relocation, prefix: str, generic: str) res[u32, fail.Fail];
+pub fun reloc_sym_index(img: *target_of.ObjectImage, r: *target_of.Relocation, prefix: str, generic: str) res[u32, fail.Fail];
 ```
 
 the symbol a relocation names, refused as `prefix` and the symbol's name, or
@@ -104,7 +104,7 @@ as `generic` when it has none, when that symbol did not resolve
 ## fun validate_reloc_symbols
 
 ```mach
-pub fun validate_reloc_symbols(img: *of.ObjectImage, prefix: str, generic: str) err[fail.Fail];
+pub fun validate_reloc_symbols(img: *target_of.ObjectImage, prefix: str, generic: str) err[fail.Fail];
 ```
 
 ## fun number_message
@@ -116,6 +116,6 @@ pub fun number_message(itn: *intern.Interner, a: *A.Allocator, prefix: str, valu
 ## fun reloc_counts
 
 ```mach
-pub fun reloc_counts(a: *A.Allocator, img: *of.ObjectImage) res[*u32, fail.Fail];
+pub fun reloc_counts(a: *A.Allocator, img: *target_of.ObjectImage) res[*u32, fail.Fail];
 ```
 

@@ -51,7 +51,7 @@ pub rec TokenStream;
 ## fun tokenize
 
 ```mach
-pub fun tokenize(source: str, alloc: *A.Allocator, file_id: src.FileId) res[TokenStream, fail.Fail];
+pub fun tokenize(source: str, alloc: *A.Allocator, file_id: lang_source.FileId) res[TokenStream, fail.Fail];
 ```
 
 ## fun dnit

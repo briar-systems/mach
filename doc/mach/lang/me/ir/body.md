@@ -33,7 +33,7 @@ pub fun charge(b: *Budget, instructions: u32, bytes: usize) bool;
 ## fun live_instructions
 
 ```mach
-pub fun live_instructions(fn: *ir.Function) u32;
+pub fun live_instructions(fn: *me_ir.Function) u32;
 ```
 
 ## fun own_constant
@@ -47,7 +47,7 @@ constant payloads belong to the destination module arena
 ## fun extract
 
 ```mach
-pub fun extract(dst: *ir.Module, src: *ir.Module, tgt: *target.Target, scratch: *A.Allocator, recursive: *bool) err[fail.Fail];
+pub fun extract(dst: *me_ir.Module, src: *me_ir.Module, tgt: *lang_target.Target, scratch: *A.Allocator, recursive: *bool) err[fail.Fail];
 ```
 
 ## rec Slot
@@ -78,19 +78,19 @@ pub fun available_init(a: *Available, name: intern.StrId) err[fail.Fail];
 ## fun detach
 
 ```mach
-pub fun detach(a: *Available, dst: *ir.Module);
+pub fun detach(a: *Available, dst: *me_ir.Module);
 ```
 
 ## fun available_dnit
 
 ```mach
-pub fun available_dnit(a: *Available, dst: *ir.Module);
+pub fun available_dnit(a: *Available, dst: *me_ir.Module);
 ```
 
 ## fun attach
 
 ```mach
-pub fun attach(a: *Available, dst: *ir.Module) err[fail.Fail];
+pub fun attach(a: *Available, dst: *me_ir.Module) err[fail.Fail];
 ```
 
 ## fun contains
@@ -102,12 +102,12 @@ pub fun contains(a: *Available, ix: u32) bool;
 ## fun acquire
 
 ```mach
-pub fun acquire(a: *Available, dst: *ir.Module, provider: *ir.Module, name: intern.StrId, tgt: *target.Target, scratch: *A.Allocator) err[fail.Fail];
+pub fun acquire(a: *Available, dst: *me_ir.Module, provider: *me_ir.Module, name: intern.StrId, tgt: *lang_target.Target, scratch: *A.Allocator) err[fail.Fail];
 ```
 
 ## fun growth_cost
 
 ```mach
-pub fun growth_cost(fn: *ir.Function, out: *Budget) bool;
+pub fun growth_cost(fn: *me_ir.Function, out: *Budget) bool;
 ```
 

@@ -1070,7 +1070,7 @@ pub val MCT_FLOAT:      MirCtClass = 4
 ## fun lowered_opcode
 
 ```mach
-pub fun lowered_opcode(k: ir_instr.InstrKind) MirOpcode;
+pub fun lowered_opcode(k: ir_instruction.InstrKind) MirOpcode;
 ```
 
 the MIR opcode an IR kind lowers to; MIR_OP_NONE for a kind with no row
@@ -1662,7 +1662,7 @@ pub fun opcode_name(op: MirOpcode) str;
 ## fun instr_refusal
 
 ```mach
-pub fun instr_refusal(alloc: *A.Allocator, srcmap: *source.SourceMap,
+pub fun instr_refusal(alloc: *A.Allocator, srcmap: *lang_source.SourceMap,
 fn_name: str, mi: *MirInstr, what: str) str;
 ```
 
@@ -1678,7 +1678,7 @@ same store the front-end passes of the module wrote; owned by the caller
 ## fun reject
 
 ```mach
-pub fun reject(diags: *diagnostic.DiagnosticStore, k: dkind.Kind, loc: source.SrcLoc, text: str) fail.Fail;
+pub fun reject(diags: *diagnostic.DiagnosticStore, k: diagnostic_kind.Kind, loc: lang_source.SrcLoc, text: str) fail.Fail;
 ```
 
 a backend pass rejects the program through the shared located refusal
@@ -1686,7 +1686,7 @@ a backend pass rejects the program through the shared located refusal
 ## fun refusal_loc
 
 ```mach
-pub fun refusal_loc(f: *MirFunction, mi: *MirInstr) source.SrcLoc;
+pub fun refusal_loc(f: *MirFunction, mi: *MirInstr) lang_source.SrcLoc;
 ```
 
 the location a refusal of `mi` in `f` reports: the instruction's own when it
@@ -1695,19 +1695,19 @@ has one, else the function's declaration
 ## fun reject_instr
 
 ```mach
-pub fun reject_instr(m: *MirModule, k: dkind.Kind, f: *MirFunction, mi: *MirInstr, text: str) fail.Fail;
+pub fun reject_instr(m: *MirModule, k: diagnostic_kind.Kind, f: *MirFunction, mi: *MirInstr, text: str) fail.Fail;
 ```
 
 ## fun reject_instr_at
 
 ```mach
-pub fun reject_instr_at(diags: *diagnostic.DiagnosticStore, k: dkind.Kind, f: *MirFunction, mi: *MirInstr, text: str) fail.Fail;
+pub fun reject_instr_at(diags: *diagnostic.DiagnosticStore, k: diagnostic_kind.Kind, f: *MirFunction, mi: *MirInstr, text: str) fail.Fail;
 ```
 
 ## fun reject_function
 
 ```mach
-pub fun reject_function(m: *MirModule, k: dkind.Kind, f: *MirFunction, text: str) fail.Fail;
+pub fun reject_function(m: *MirModule, k: diagnostic_kind.Kind, f: *MirFunction, text: str) fail.Fail;
 ```
 
 ## fun catalog_failure

@@ -3,7 +3,7 @@
 ## fun read_definition
 
 ```mach
-pub fun read_definition(raw: ptr, mid: session.ModuleId, phase: scx.DefinitionPhase) res[scx.Definition, fail.Fail];
+pub fun read_definition(raw: ptr, mid: session.ModuleId, phase: sema_context.DefinitionPhase) res[sema_context.Definition, fail.Fail];
 ```
 
 ## fun prepare_resolve_pass
@@ -51,7 +51,7 @@ on over the rest; an internal failure ends the pass where it met it
 ## fun acquire_sema
 
 ```mach
-pub fun acquire_sema(p: *project.Project, mid: session.ModuleId) res[*sema.SemaResult, fail.Fail];
+pub fun acquire_sema(p: *project.Project, mid: session.ModuleId) res[*fe_sema.SemaResult, fail.Fail];
 ```
 
 ## fun q_sema_compute
@@ -69,7 +69,7 @@ pub fun q_sema_finalize(value: *u8, value_len: u32, alloc: *A.Allocator);
 ## fun read_typed_surface
 
 ```mach
-pub fun read_typed_surface(p: *project.Project, mid: session.ModuleId, a: *A.Allocator) res[scx.ModuleSema, fail.Fail];
+pub fun read_typed_surface(p: *project.Project, mid: session.ModuleId, a: *A.Allocator) res[sema_context.ModuleSema, fail.Fail];
 ```
 
 ## fun retain_modules
@@ -243,7 +243,7 @@ pub fun run_codegen_pass(p: *project.Project) err[outcome.Fail];
 ## fun code_sources
 
 ```mach
-pub fun code_sources(p: *project.Project, mid: session.ModuleId, seed: *ir.Module, a: *A.Allocator) res[CodeSources, fail.Fail];
+pub fun code_sources(p: *project.Project, mid: session.ModuleId, seed: *me_ir.Module, a: *A.Allocator) res[CodeSources, fail.Fail];
 ```
 
 the other modules' lowered ir a whole-module backend reads to generate `seed`, module mid's ir

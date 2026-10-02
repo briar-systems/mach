@@ -3,55 +3,55 @@
 ## def RelocError
 
 ```mach
-pub def RelocError: of.RelocError
+pub def RelocError: target_of.RelocError
 ```
 
 ## val RELOC_OVERFLOW
 
 ```mach
-pub val RELOC_OVERFLOW: RelocError = of.RELOC_OVERFLOW
+pub val RELOC_OVERFLOW: RelocError = target_of.RELOC_OVERFLOW
 ```
 
 ## val RELOC_UNSUPPORTED
 
 ```mach
-pub val RELOC_UNSUPPORTED: RelocError = of.RELOC_UNSUPPORTED
+pub val RELOC_UNSUPPORTED: RelocError = target_of.RELOC_UNSUPPORTED
 ```
 
 ## val RELOC_INVALID_INSTRUCTION
 
 ```mach
-pub val RELOC_INVALID_INSTRUCTION: RelocError = of.RELOC_INVALID_INSTRUCTION
+pub val RELOC_INVALID_INSTRUCTION: RelocError = target_of.RELOC_INVALID_INSTRUCTION
 ```
 
 ## def RelocAddendMode
 
 ```mach
-pub def RelocAddendMode: of.RelocAddendMode
+pub def RelocAddendMode: target_of.RelocAddendMode
 ```
 
 ## val RELOC_ADDEND_SYMBOL
 
 ```mach
-pub val RELOC_ADDEND_SYMBOL: RelocAddendMode = of.RELOC_ADDEND_SYMBOL
+pub val RELOC_ADDEND_SYMBOL: RelocAddendMode = target_of.RELOC_ADDEND_SYMBOL
 ```
 
 ## val RELOC_ADDEND_FIELD_BIAS
 
 ```mach
-pub val RELOC_ADDEND_FIELD_BIAS: RelocAddendMode = of.RELOC_ADDEND_FIELD_BIAS
+pub val RELOC_ADDEND_FIELD_BIAS: RelocAddendMode = target_of.RELOC_ADDEND_FIELD_BIAS
 ```
 
 ## val RELOC_ADDEND_IGNORED
 
 ```mach
-pub val RELOC_ADDEND_IGNORED: RelocAddendMode = of.RELOC_ADDEND_IGNORED
+pub val RELOC_ADDEND_IGNORED: RelocAddendMode = target_of.RELOC_ADDEND_IGNORED
 ```
 
 ## def RelocTraits
 
 ```mach
-pub def RelocTraits: of.RelocTraits
+pub def RelocTraits: target_of.RelocTraits
 ```
 
 ## fun traits
@@ -64,7 +64,7 @@ text_bias_min: i32, text_bias_max: i32) RelocTraits;
 ## def RelocTarget
 
 ```mach
-pub def RelocTarget: of.RelocTarget
+pub def RelocTarget: target_of.RelocTarget
 ```
 
 ## fun target
@@ -130,13 +130,13 @@ sym_va: u64, addend: i64, patch_va: u64) res[bool, RelocError];
 
 ```mach
 pub fun normalize_image(tgt_isa: *isa.IsaVTable, alloc: *A.Allocator,
-img: *of.ObjectImage) err[fail.Fail];
+img: *target_of.ObjectImage) err[fail.Fail];
 ```
 
 ## fun resolve_operand
 
 ```mach
-pub fun resolve_operand(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage,
-reloc_index: u32) res[of.RelocOperand, fail.Fail];
+pub fun resolve_operand(tgt_isa: *isa.IsaVTable, img: *target_of.ObjectImage,
+reloc_index: u32) res[target_of.RelocOperand, fail.Fail];
 ```
 

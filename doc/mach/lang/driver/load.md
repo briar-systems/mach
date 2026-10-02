@@ -3,7 +3,7 @@
 ## val MACH_VERSION
 
 ```mach
-pub val MACH_VERSION: str = version.MACH_VERSION
+pub val MACH_VERSION: str = lang_version.MACH_VERSION
 ```
 
 ## val INITIAL_MODULE_CAP
@@ -86,7 +86,7 @@ ret: ok(true) when the surface is unchanged; ok(false) when the caller must relo
 ## fun target_context
 
 ```mach
-pub fun target_context(alloc: *A.Allocator, t: *target.Target, req: *request.BuildRequest,
+pub fun target_context(alloc: *A.Allocator, t: *lang_target.Target, req: *request.BuildRequest,
 compiler_name: intern.StrId, compiler_ver: intern.StrId) comptime.ComptimeCtx;
 ```
 
@@ -146,7 +146,7 @@ pub fun eval_for_load(
 p: *project.Project,
 mid: session.ModuleId,
 source: str,
-e: id.ExprId,
+e: ast_id.ExprId,
 fw: float.FloatWidth) res[comptime.CTValue, comptime.EvalFail];
 ```
 

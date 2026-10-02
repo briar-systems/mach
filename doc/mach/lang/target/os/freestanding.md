@@ -18,12 +18,12 @@ flat image has no page (#3360)
 ## fun freestanding_va_list
 
 ```mach
-pub fun freestanding_va_list(arch_id: u32) opt[os.VaList];
+pub fun freestanding_va_list(arch_id: u32) opt[lang_target_os.VaList];
 ```
 
 ## fun register_freestanding
 
 ```mach
-pub fun register_freestanding(reg: *os.OsRegistry) err[fail.Fail];
+pub fun register_freestanding(reg: *lang_target_os.OsRegistry) err[fail.Fail];
 ```
 

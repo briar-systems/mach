@@ -3,7 +3,7 @@
 ## fun format_source
 
 ```mach
-pub fun format_source(a: *A.Allocator, text: str, file_id: source.FileId, diags: *diagnostic.DiagnosticStore) res[str, fail.Fail];
+pub fun format_source(a: *A.Allocator, text: str, file_id: lang_source.FileId, diags: *diagnostic.DiagnosticStore) res[str, fail.Fail];
 ```
 
 format one source file. success transfers one nul-terminated string to the

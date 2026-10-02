@@ -3,37 +3,37 @@
 ## fun lower_rvalue
 
 ```mach
-pub fun lower_rvalue(ctx: *context.LowerContext, eid: id.ExprId) res[value.Value, fail.Fail];
+pub fun lower_rvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) res[value.Value, fail.Fail];
 ```
 
 ## fun lower_lvalue
 
 ```mach
-pub fun lower_lvalue(ctx: *context.LowerContext, eid: id.ExprId) res[value.Value, fail.Fail];
+pub fun lower_lvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) res[value.Value, fail.Fail];
 ```
 
 ## fun lower_lit_str
 
 ```mach
-pub fun lower_lit_str(ctx: *context.LowerContext, e: *expr.Expr) res[value.Value, fail.Fail];
+pub fun lower_lit_str(ctx: *lower_context.LowerContext, e: *ast_expr.Expr) res[value.Value, fail.Fail];
 ```
 
 ## fun symbol_linkage_name
 
 ```mach
-pub fun symbol_linkage_name(ctx: *context.LowerContext, eid: id.ExprId) opt[intern.StrId];
+pub fun symbol_linkage_name(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) opt[intern.StrId];
 ```
 
 ## fun references_function
 
 ```mach
-pub fun references_function(ctx: *context.LowerContext, eid: id.ExprId) bool;
+pub fun references_function(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) bool;
 ```
 
 ## fun constant_literal_expr
 
 ```mach
-pub fun constant_literal_expr(ctx: *context.LowerContext, eid: id.ExprId) opt[id.ExprId];
+pub fun constant_literal_expr(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) opt[ast_id.ExprId];
 ```
 
 the literal a constant-valued expression stands for, when it stands for one: a `$each` element or
@@ -45,19 +45,19 @@ over such a name folds the literal it names
 ## fun try_lower_comptime_intrinsic
 
 ```mach
-pub fun try_lower_comptime_intrinsic(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) opt[res[value.Value, fail.Fail]];
+pub fun try_lower_comptime_intrinsic(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr) opt[res[value.Value, fail.Fail]];
 ```
 
 ## fun try_lower_comptime_cast
 
 ```mach
-pub fun try_lower_comptime_cast(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) opt[res[value.Value, fail.Fail]];
+pub fun try_lower_comptime_cast(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, e: *ast_expr.Expr) opt[res[value.Value, fail.Fail]];
 ```
 
 ## fun lower_stored_rvalue
 
 ```mach
-pub fun lower_stored_rvalue(ctx: *context.LowerContext, eid: id.ExprId, in_place: bool, borrowed: *bool) res[value.Value, fail.Fail];
+pub fun lower_stored_rvalue(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, in_place: bool, borrowed: *bool) res[value.Value, fail.Fail];
 ```
 
 the value a store consumes. when `in_place` holds, nothing writes memory between this read
@@ -67,13 +67,13 @@ the aggregate copy is overlap-safe, so no snapshot sits between them (#4235, #42
 ## fun condition_value
 
 ```mach
-pub fun condition_value(ctx: *context.LowerContext, eid: id.ExprId, v: value.Value) res[value.Value, fail.Fail];
+pub fun condition_value(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, v: value.Value) res[value.Value, fail.Fail];
 ```
 
 ## fun case_descriptor_index
 
 ```mach
-pub fun case_descriptor_index(ctx: *context.LowerContext, desc_eid: id.ExprId) res[u32, fail.Fail];
+pub fun case_descriptor_index(ctx: *lower_context.LowerContext, desc_eid: ast_id.ExprId) res[u32, fail.Fail];
 ```
 
 the case ordinal a comptime case descriptor names; type checking already tied it to this tag
@@ -81,19 +81,19 @@ the case ordinal a comptime case descriptor names; type checking already tied it
 ## fun literal_head_case
 
 ```mach
-pub fun literal_head_case(ctx: *context.LowerContext, tid: id.TypeId) token.Span;
+pub fun literal_head_case(ctx: *lower_context.LowerContext, tid: ast_id.TypeId) token.Span;
 ```
 
 ## fun literal_head_case_desc
 
 ```mach
-pub fun literal_head_case_desc(ctx: *context.LowerContext, tid: id.TypeId) id.ExprId;
+pub fun literal_head_case_desc(ctx: *lower_context.LowerContext, tid: ast_id.TypeId) ast_id.ExprId;
 ```
 
 ## fun literal_head_case_index
 
 ```mach
-pub fun literal_head_case_index(ctx: *context.LowerContext, tid: id.TypeId, tag_ty: type.TypeId) res[opt[u32], fail.Fail];
+pub fun literal_head_case_index(ctx: *lower_context.LowerContext, tid: ast_id.TypeId, tag_ty: type.TypeId) res[opt[u32], fail.Fail];
 ```
 
 the case a literal head selects, by name or through a descriptor; none when the head names a plain type
@@ -101,25 +101,25 @@ the case a literal head selects, by name or through a descriptor; none when the 
 ## fun const_value_of
 
 ```mach
-pub fun const_value_of(ctx: *context.LowerContext, eid: id.ExprId, v: comptime.CTValue) res[value.Value, fail.Fail];
+pub fun const_value_of(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, v: comptime.CTValue) res[value.Value, fail.Fail];
 ```
 
 ## fun const_value_of_init
 
 ```mach
-pub fun const_value_of_init(ctx: *context.LowerContext, eid: id.ExprId, v: comptime.CTValue) res[value.Value, fail.Fail];
+pub fun const_value_of_init(ctx: *lower_context.LowerContext, eid: ast_id.ExprId, v: comptime.CTValue) res[value.Value, fail.Fail];
 ```
 
 ## fun type_is_volatile_record
 
 ```mach
-pub fun type_is_volatile_record(ctx: *context.LowerContext, sem_ty: type.TypeId) bool;
+pub fun type_is_volatile_record(ctx: *lower_context.LowerContext, sem_ty: type.TypeId) bool;
 ```
 
 ## fun access_is_volatile
 
 ```mach
-pub fun access_is_volatile(ctx: *context.LowerContext, eid: id.ExprId) bool;
+pub fun access_is_volatile(ctx: *lower_context.LowerContext, eid: ast_id.ExprId) bool;
 ```
 
 volatility is a property of the storage an access is rooted in. the chain of
@@ -132,6 +132,6 @@ volatile. one predicate for every access form, load and store alike
 ## fun field_index_in_type
 
 ```mach
-pub fun field_index_in_type(ctx: *context.LowerContext, rec_ty: type.TypeId, name: token.Span) u32;
+pub fun field_index_in_type(ctx: *lower_context.LowerContext, rec_ty: type.TypeId, name: token.Span) u32;
 ```
 

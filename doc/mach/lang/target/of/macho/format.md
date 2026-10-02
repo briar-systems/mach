@@ -799,19 +799,19 @@ lookups below refuse it
 ## fun macho_section
 
 ```mach
-pub fun macho_section(kind: of.SectionKind) opt[*MachoSectionDesc];
+pub fun macho_section(kind: target_of.SectionKind) opt[*MachoSectionDesc];
 ```
 
 ## fun macho_sectname
 
 ```mach
-pub fun macho_sectname(kind: of.SectionKind) opt[str];
+pub fun macho_sectname(kind: target_of.SectionKind) opt[str];
 ```
 
 ## fun macho_section_flags
 
 ```mach
-pub fun macho_section_flags(kind: of.SectionKind) opt[u32];
+pub fun macho_section_flags(kind: target_of.SectionKind) opt[u32];
 ```
 
 ## fun align_log2
@@ -847,6 +847,6 @@ pub fun canonical_sectname(raw: str, out: *u8) str;
 ## fun indirect_slots
 
 ```mach
-pub fun indirect_slots(section: *of.Section) res[u32, fail.Fail];
+pub fun indirect_slots(section: *target_of.Section) res[u32, fail.Fail];
 ```
 
