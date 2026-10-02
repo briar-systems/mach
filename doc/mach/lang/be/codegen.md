@@ -44,3 +44,9 @@ pub fun resolve_placement_policy(requested: u32) u32;
 pub fun prepare_debug(s: *session.Session) err[fail.Fail];
 ```
 
+the debug view holds a field table for every instance the producer reaches:
+every instance of the program and what those reach. An expansive generic has
+unboundedly many instances (`rec L[T] { next: *L[*T]; }`), so one minted here
+is prepared only when held by value, and the producer describes a pointer to an
+unprepared one untyped
+

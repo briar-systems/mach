@@ -999,6 +999,49 @@ pub fun type_equals_signatures(ti: *TypeInterner, a: TypeId, b: TypeId) bool;
 pub fun field_projection_reset(ti: *TypeInterner);
 ```
 
+## fun expansive_decided
+
+```mach
+pub fun expansive_decided(ti: *TypeInterner, nominal: TypeId) opt[bool];
+```
+
+the decision for generic nominal `nominal`, none while undecided
+
+## fun expansive_decide
+
+```mach
+pub fun expansive_decide(ti: *TypeInterner, nominal: TypeId, expansive: bool) err[fail.Fail];
+```
+
+## fun expansive_sweep_done
+
+```mach
+pub fun expansive_sweep_done(ti: *TypeInterner);
+```
+
+records that every generic the program instantiates is decided
+
+## fun expansive_current
+
+```mach
+pub fun expansive_current(ti: *TypeInterner) bool;
+```
+
+## fun expansive_any
+
+```mach
+pub fun expansive_any(ti: *TypeInterner) bool;
+```
+
+## fun instance_is_expansive
+
+```mach
+pub fun instance_is_expansive(ti: *TypeInterner, tid: TypeId) bool;
+```
+
+whether `tid` is an instance of a generic on an instantiation cycle that grows
+an argument, so its instances are unbounded
+
 ## fun field_epoch
 
 ```mach
