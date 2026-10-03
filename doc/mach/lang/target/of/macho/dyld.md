@@ -48,7 +48,7 @@ pub fun macho_got_shape(arch_id: u32, dyn: *target_of.DynamicInfo) res[target_of
 ```
 
 the __DATA_CONST,__got table the linker reserves ahead of the zero-fill, so a
-stub or a GOT load reaches its slot whatever zero-fill the image carries (#3903)
+stub or a GOT load reaches its slot whatever zero-fill the image carries
 
 ## fun write_macho_stub
 

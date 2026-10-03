@@ -151,7 +151,7 @@ pub rec CTValue;
 
 an integer value is 128 bits in data.w; data.i is its low limb, and a signed
 value sign-fills the high limb so every reader of a value that fits 64 bits
-sees the same i64 it always did (#3511)
+sees the same i64 it always did
 
 ## rec NamedConst
 

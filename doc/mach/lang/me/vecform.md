@@ -68,7 +68,7 @@ pub fun extends_directly(tgt: *lang_target.Target) bool;
 ```
 
 a lane-wise integer extension over more than one doubling is one
-instruction on the target, rather than a chain of doublings (#4161)
+instruction on the target, rather than a chain of doublings
 
 ## fun packed_lanes
 
@@ -92,7 +92,7 @@ pub fun piece_lanes(tgt: *lang_target.Target, is_float: bool, lane_bits: u32) u3
 ```
 
 the lanes of one register-width piece a vector of `lane_bits` lanes wider
-than the register is split into (#3589): the target's declared vector width
+than the register is split into: the target's declared vector width
 over the lane's kind and width, capped by its lane count. 0 where a vector
 is not split: no vector register, or a target whose vectors are values
 rather than registers (spir-v), which realizes a vector of any declared
@@ -142,7 +142,7 @@ pub fun widening_half_packs(m: *me_ir.Module, tgt: *lang_target.Target, kind: ir
 ```
 
 whether the widening multiply of one half of two `from_ty` vectors into the
-`ty` of half their lanes is a cell the target packs (#3589)
+`ty` of half their lanes is a cell the target packs
 
 ## fun high_of
 
@@ -161,7 +161,7 @@ pub fun widening_pair_packs(m: *me_ir.Module, tgt: *lang_target.Target, kind: ir
 
 whether the target realizes the half `ty` of a widening multiply `kind` of
 two `from_ty` vectors as the plain and the high multiply of the operands,
-interleaved: every piece of the pair is a cell it packs (#4119). both halves
+interleaved: every piece of the pair is a cell it packs. both halves
 of one product then read the same pair
 
 ## fun sign_interleave_packs
@@ -174,7 +174,7 @@ whether the target realizes the signed lane-halving extension of a
 `from_ty` vector into the `ty` of half its lanes as the vector interleaved
 with its sign mask: both are cells it packs, and an extension is not one
 instruction of its own there. both halves of one extension then read the
-same mask (#4198)
+same mask
 
 ## fun zero_interleave_packs
 
@@ -185,7 +185,7 @@ pub fun zero_interleave_packs(m: *me_ir.Module, tgt: *lang_target.Target, ty: ir
 whether the target realizes the unsigned lane-halving extension of a
 `from_ty` vector into the `ty` of half its lanes as the vector interleaved
 with zero: the interleave is a cell it packs, and an extension is not one
-instruction of its own there. every such half then reads one zero (#4198)
+instruction of its own there. every such half then reads one zero
 
 ## fun concat_packs
 
@@ -193,7 +193,7 @@ instruction of its own there. every such half then reads one zero (#4198)
 pub fun concat_packs(m: *me_ir.Module, tgt: *lang_target.Target, ty: ir_type.IrTypeId) bool;
 ```
 
-whether a lane join into `ty` is a cell the target packs (#3589)
+whether a lane join into `ty` is a cell the target packs
 
 ## fun widen_half_packs
 
@@ -229,7 +229,7 @@ pub fun widen_sum_packs(m: *me_ir.Module, tgt: *lang_target.Target, ty: ir_type.
 ```
 
 whether the widening group sum of a `from_ty` vector into `ty` is a cell
-the target packs, both sides whole in one register (#4161)
+the target packs, both sides whole in one register
 
 ## fun range_packs
 

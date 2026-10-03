@@ -1612,7 +1612,7 @@ pub fun addend_fits_field(addend: i64, width: usize, pc_relative: bool) bool;
 an addend a format stores in the relocated field itself fits that field of
 `width` bytes: signed for a pc-relative field, signed or unsigned for an
 absolute one. a writer refuses one that does not rather than keep its low
-bits (#3907)
+bits
 
 ## fun is_pointer_abs_kind
 

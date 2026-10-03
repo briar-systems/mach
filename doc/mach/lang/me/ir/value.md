@@ -102,7 +102,7 @@ pub fun const_int(bits: u64, ty: ir_type.IrTypeId) Value;
 pub fun const_int_wide(bits: wide.Wide, ty: ir_type.IrTypeId) Value;
 ```
 
-a 128-bit integer constant; a narrower type reads its low limb (#3511)
+a 128-bit integer constant; a narrower type reads its low limb
 
 ## fun int_of
 

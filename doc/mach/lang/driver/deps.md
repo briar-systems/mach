@@ -94,7 +94,7 @@ pub fun release_for_commit(c: *GitCandidates, url: str, commit: str) res[str, fa
 
 the release of `url` whose commit is `commit`, as its version text owned by the
 caller, or an owned "" when no release tag names that commit: a dependency's committed
-gitlink is a commit, and resolution deals in releases (#3689)
+gitlink is a commit, and resolution deals in releases
 
 ## fun release_needs
 
@@ -104,8 +104,8 @@ pub fun release_needs(ctx: ptr, id: str, url: str, rel: *candidates.Release, out
 
 a release's requirements as the resolver reads them: its compiler range and its dependencies
 selected by version range, or by an exact release tag. a release selecting anything else
-(a branch, a commit, a path) is not reproducible from its tag and is refused (#3496 §7),
-unless the root declares that identity and so selects it itself (#3553). a release whose
+(a branch, a commit, a path) is not reproducible from its tag and is refused,
+unless the root declares that identity and so selects it itself. a release whose
 manifest does not load or names another version is no candidate, which `out.excluded` says
 
 ## fun running_mach_range_floor
@@ -124,7 +124,7 @@ pub val DEP_ROOT_REFUSED: str = "dependency root 'dep' must be a physical direct
 
 `dep` is the project's reserved dependency root: absent, or a physical directory. a
 symlink there would resolve the closure from another tree, so every command that reads
-or realizes the closure refuses it through this one check (#3478)
+or realizes the closure refuses it through this one check
 
 ## fun check_dep_root
 
@@ -143,7 +143,7 @@ pub fun closure_locate(p: *project.Project, m: *manifest.Manifest, project_root:
 locate a root manifest's dependency closure into `p.config.deps`, as a build reads it:
 every dependency is the directory its key names under dep/, read through its manifest.
 nothing is checked against git, a pin, a selector or the identity rule; `mach dep pull`
-realizes what is missing and `mach dep verify` checks what exists (ruling c)
+realizes what is missing and `mach dep verify` checks what exists
 
 p: the project receiving the closure
 m: the root manifest
@@ -210,7 +210,7 @@ root: *manifest.Manifest) err[fail.Fail];
 ```
 
 a manifest reached through a release (a version range or a `tag/`) may itself select only
-releases, so the release is reproducible from its tag all the way down (#3496 §7)
+releases, so the release is reproducible from its tag all the way down
 
 s: the session
 chain: the requirer chain that reached `m`, or the root's name
@@ -343,7 +343,7 @@ pub fun release_at_pin(s: *session.Session, root: str, id: str, dep_full: str, f
 
 the release version dep/<id>'s pin is tagged with, read from its checkout's refs (an owned ""
 when no release tag points at it); the highest wins, and the caller frees the result. with
-`fetch`, a checkout no release tag of which names the pin fetches its tags first (#4073)
+`fetch`, a checkout no release tag of which names the pin fetches its tags first
 
 ## fun checkout_has_tags
 
@@ -505,7 +505,7 @@ pub fun gitlink_recorded(s: *session.Session, root: str, id: str, mode: u8) res[
 
 whether a moved checkout of dep/<id> is to be staged: always in a repository
 root, where the gitlink is the pin, and in a subproject exactly when the
-enclosing repository already records a gitlink for it (#3686)
+enclosing repository already records a gitlink for it
 
 ## fun stage_dependency
 

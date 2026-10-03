@@ -115,7 +115,7 @@ pub fun record_attribute_strings(p: *project.Project, mid: session.ModuleId) err
 ```
 
 records the strings the module's attribute arguments evaluate to, read in the
-build target's frame the load walk bound (#4022)
+build target's frame the load walk bound
 
 ## fun rebuild_topo
 

@@ -186,7 +186,7 @@ pub val CT_MUL_EXTENSION: CtMulCond = 2
 pub val DIT_NEED_MARKER:   str = "__mach_needs_dit"
 ```
 
-the DIT runtime contract between the compiler and the std start code (#3508).
+the DIT runtime contract between the compiler and the std start code.
 a module that multiplies a secret in a DIT_MODE cell carries the marker: a
 local absolute symbol, value 1, that names the need and reaches no linked
 image. on a target whose os declares the mode guaranteed, the linker defines
@@ -261,7 +261,7 @@ pub fun mul_cell_width_valid(width: u8) bool;
 ```
 
 the operand widths a cell may have: a 128-bit cell is never declared, it is
-admitted through the cells that realize it (#3511)
+admitted through the cells that realize it
 
 ## fun mul_op_name
 
