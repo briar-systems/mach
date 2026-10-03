@@ -1,11 +1,5 @@
 # mach.lang.fe.sema.handle
 
-## val DIRECTIVE
-
-```mach
-pub val DIRECTIVE:  str = "handle"
-```
-
 ## def ReadStatus
 
 ```mach

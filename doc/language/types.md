@@ -410,7 +410,7 @@ that composes over another handle takes a **type name**, so `Sampler2D` names th
 image it wraps rather than restating that image's operands and cannot disagree with
 it. That is the only place a decorator argument is read as a type.
 
-Every rule a handle carries follows from the one fact the directive states, and the
+Every rule a handle carries follows from the one fact the decorator states, and the
 set is fixed and closed rather than varied per declaration:
 
 - no fields, no indexing, no construction

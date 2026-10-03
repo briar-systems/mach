@@ -14,7 +14,7 @@ this channel.
 | `$sym(args)` | Comptime function call (intrinsic) | call |
 | `$if`, `$or` | Comptime control flow | structural |
 
-> Per-declaration codegen attributes (symbol rename, library pin, inline,
+> Per-declaration codegen properties (symbol rename, library pin, inline,
 > align, section) are written as **`#[...]` decorators**, not `$`-comptime
 > shapes — see [decorators.md](decorators.md). A comptime directive takes no
 > `=`; a stray one is a parse error at the directive's terminator.
