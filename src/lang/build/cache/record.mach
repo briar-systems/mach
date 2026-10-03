@@ -13,8 +13,8 @@
 use mach.lang.fail;
 use mach.lang.intern;
 use target_of: mach.lang.target.of;
-use mach.lang.target.of.bin;
 use mach.lang.target.of.snapshot;
+use mach.lang.wire;
 use A: std.allocator;
 use std.allocator.page;
 use std.memory;
@@ -76,11 +76,25 @@ fun name_text(itn: *intern.Interner, id: intern.StrId) opt[str] {
     ret intern.lookup(itn, id);
 }
 
-fun put_name(buf: *u8, pos: usize, text: str) usize {
-    val len: usize = str_len(text);
-    bin.write_u32_le(buf, pos, len::u32);
-    memory.raw_copy((buf::usize + pos + 4)::ptr, text::ptr, len);
-    ret pos + 4 + len;
+fun put_record(w: *wire.Sink, itn: *intern.Interner, key: *[32]u8, facts: *Facts, snap: *u8, snap_len: usize) {
+    wire.put_u32(w, MAGIC);
+    wire.put_bytes(w, ?(@key)[0], 32);
+    wire.put_bytes(w, ?facts.source[0], 32);
+    wire.put_u32(w, facts.test_count);
+    var i: u32 = 0;
+    for (i < facts.test_count) {
+        val t:    *TestFact = ?facts.tests[i];
+        val text: opt[str]  = name_text(itn, t.name);
+        if (sel text.none) {
+            wire.refuse(w, fail.message("cache record test has no name"));
+            ret;
+        }
+        wire.put_sized(w, text.some::*u8, str_len(text.some));
+        wire.put_u32(w, t.line);
+        i = i + 1;
+    }
+    wire.put_sized(w, facts.warnings, facts.warnings_len::usize);
+    wire.put_sized(w, snap, snap_len);
 }
 
 # the record for an object built under `key` whose module lowered to `facts`
@@ -96,82 +110,44 @@ pub fun encode(alloc: *A.Allocator, itn: *intern.Interner, key: *[32]u8, facts: 
     fin {
         if (snap != nil) { A.deallocate[u8](alloc, snap, snap_len); }
     }
-    var total: usize = FIXED::usize;
-    var i:     u32   = 0;
+    var i: u32 = 0;
     for (i < facts.test_count) {
         val text: opt[str] = name_text(itn, facts.tests[i].name);
         if (sel text.none) { ret err[fail.Fail].err{fail.message("cache record test has no name")}; }
-        total = total + 8 + str_len(text.some);
-        i     = i + 1;
+        i = i + 1;
     }
-    total = total + 4 + facts.warnings_len::usize + 4 + snap_len;
-    if (total > 0xFFFFFFFF) { ret err[fail.Fail].err{fail.message("cache record exceeds the section size field")}; }
-    val allocated: res[*u8, A.Error] = A.allocate[u8](alloc, total);
+    var measure: wire.Sink = wire.measure();
+    put_record(?measure, itn, key, facts, snap, snap_len);
+    if (measure.failed || measure.len > 0xFFFFFFFF) { ret err[fail.Fail].err{fail.message("cache record exceeds the section size field")}; }
+    val allocated: res[*u8, A.Error] = A.allocate[u8](alloc, measure.len);
     if (sel allocated.err) { ret err[fail.Fail].err{fail.refused(allocated.err)}; }
-    val buf: *u8 = allocated.ok;
-    bin.write_u32_le(buf, 0, MAGIC);
-    memory.raw_copy((buf::usize + 4)::ptr, (?(@key)[0])::ptr, 32);
-    memory.raw_copy((buf::usize + 36)::ptr, (?facts.source[0])::ptr, 32);
-    bin.write_u32_le(buf, 68, facts.test_count);
-    var pos: usize = FIXED::usize;
-    i = 0;
-    for (i < facts.test_count) {
-        val t:    *TestFact = ?facts.tests[i];
-        val text: opt[str]  = name_text(itn, t.name);
-        if (sel text.none) { ret err[fail.Fail].err{fail.message("cache record test has no name")}; }
-        pos = put_name(buf, pos, text.some);
-        bin.write_u32_le(buf, pos, t.line);
-        pos = pos + 4;
-        i   = i + 1;
-    }
-    bin.write_u32_le(buf, pos, facts.warnings_len);
-    if (facts.warnings_len != 0) { memory.raw_copy((buf::usize + pos + 4)::ptr, facts.warnings::ptr, facts.warnings_len::usize); }
-    pos = pos + 4 + facts.warnings_len::usize;
-    bin.write_u32_le(buf, pos, snap_len::u32);
-    if (snap_len != 0) { memory.raw_copy((buf::usize + pos + 4)::ptr, snap::ptr, snap_len); }
-    @out_bytes = buf;
-    @out_len   = total::u32;
+    var w: wire.Sink = wire.fixed(allocated.ok, measure.len);
+    put_record(?w, itn, key, facts, snap, snap_len);
+    @out_bytes = allocated.ok;
+    @out_len   = measure.len::u32;
     ret err[fail.Fail].ok{};
 }
 
-rec Reader {
-    data: *u8;
-    len:  usize;
-    pos:  usize;
-    bad:  bool;
-}
-
-fun get(r: *Reader) u32 {
-    if (r.bad || r.len - r.pos < 4) {
-        r.bad = true;
-        ret 0;
-    }
-    val value: u32 = bin.read_u32_le(r.data, r.pos);
-    r.pos = r.pos + 4;
-    ret value;
-}
-
-fun name(r: *Reader, itn: *intern.Interner, oom: *bool) intern.StrId {
-    val len: u32 = get(r);
-    if (r.bad) { ret intern.STR_NIL; }
-    if (len == 0 || len::usize > r.len - r.pos) {
-        r.bad = true;
+# a test's name: nonempty and free of nul bytes, interned
+fun take_test_name(r: *wire.Source, itn: *intern.Interner, oom: *bool) intern.StrId {
+    var len:   usize = 0;
+    val bytes: *u8   = wire.take_sized(r, ?len);
+    if (bytes == nil || len == 0) {
+        wire.reject(r);
         ret intern.STR_NIL;
     }
-    val bytes: *u8 = (r.data::usize + r.pos)::*u8;
-    var i:     u32 = 0;
+    var i: usize = 0;
     for (i < len) {
         if (bytes[i] == 0) {
-            r.bad = true;
+            wire.reject(r);
             ret intern.STR_NIL;
         }
         i = i + 1;
     }
-    r.pos = r.pos + len::usize;
-    val id: res[intern.StrId, A.Error] = intern.intern_bytes(itn, bytes, len::usize);
+    val id: res[intern.StrId, A.Error] = intern.intern_bytes(itn, bytes, len);
     if (sel id.err) {
-        @oom  = true;
-        r.bad = true;
+        @oom = true;
+        wire.reject(r);
         ret intern.STR_NIL;
     }
     ret id.ok;
@@ -182,15 +158,14 @@ fun name(r: *Reader, itn: *intern.Interner, oom: *bool) intern.StrId {
 # allocation fails
 pub fun decode(alloc: *A.Allocator, itn: *intern.Interner, bytes: *u8, len: usize) res[opt[Record], fail.Fail] {
     if (bytes == nil || len < FIXED::usize) { ret res[opt[Record], fail.Fail].ok{opt[Record].none{}}; }
-    var r: Reader = Reader{data: bytes, len: len, pos: 0};
-    if (get(?r) != MAGIC) { ret res[opt[Record], fail.Fail].ok{opt[Record].none{}}; }
+    var r: wire.Source = wire.source(bytes, len);
+    if (wire.take_u32(?r) != MAGIC) { ret res[opt[Record], fail.Fail].ok{opt[Record].none{}}; }
     var out: Record = Record{};
-    memory.raw_copy((?out.key[0])::ptr, (bytes::usize + 4)::ptr, 32);
-    memory.raw_copy((?out.facts.source[0])::ptr, (bytes::usize + 36)::ptr, 32);
-    r.pos = 68;
-    val tests: u32 = get(?r);
+    wire.take_into(?r, ?out.key[0], 32);
+    wire.take_into(?r, ?out.facts.source[0], 32);
     # every test takes at least its name length and its line
-    if (tests::usize > (len - r.pos) / 8) { ret res[opt[Record], fail.Fail].ok{opt[Record].none{}}; }
+    val tests: u32 = wire.take_count(?r, 8);
+    if (r.bad) { ret res[opt[Record], fail.Fail].ok{opt[Record].none{}}; }
     if (tests > 0) {
         val allocated: res[*TestFact, A.Error] = A.allocate[TestFact](alloc, tests::usize);
         if (sel allocated.err) { ret res[opt[Record], fail.Fail].err{fail.refused(allocated.err)}; }
@@ -200,35 +175,33 @@ pub fun decode(alloc: *A.Allocator, itn: *intern.Interner, bytes: *u8, len: usiz
     var oom: bool = false;
     var i:   u32  = 0;
     for (i < tests && !r.bad) {
-        val nm:   intern.StrId = name(?r, itn, ?oom);
-        val line: u32          = get(?r);
-        if (nm == intern.STR_NIL) { r.bad = true; }
+        val nm:   intern.StrId = take_test_name(?r, itn, ?oom);
+        val line: u32          = wire.take_u32(?r);
         out.facts.tests[i] = TestFact{name: nm, line: line};
         i                  = i + 1;
     }
-    val warnings_len: u32 = get(?r);
-    if (!r.bad && warnings_len::usize > r.len - r.pos) { r.bad = true; }
+    var warnings_len: usize = 0;
+    val warnings:     *u8   = wire.take_sized(?r, ?warnings_len);
     if (!r.bad && warnings_len != 0) {
-        val kept: res[*u8, A.Error] = A.allocate[u8](alloc, warnings_len::usize);
+        val kept: res[*u8, A.Error] = A.allocate[u8](alloc, warnings_len);
         if (sel kept.err) {
             facts_dnit(alloc, ?out.facts);
             ret res[opt[Record], fail.Fail].err{fail.refused(kept.err)};
         }
-        memory.raw_copy(kept.ok::ptr, (bytes::usize + r.pos)::ptr, warnings_len::usize);
+        memory.raw_copy(kept.ok::ptr, warnings::ptr, warnings_len);
         out.facts.warnings     = kept.ok;
-        out.facts.warnings_len = warnings_len;
-        r.pos                  = r.pos + warnings_len::usize;
+        out.facts.warnings_len = warnings_len::u32;
     }
-    val snap_len: u32 = get(?r);
-    if (!r.bad && snap_len::usize != r.len - r.pos) { r.bad = true; }
+    var snap_len: usize = 0;
+    val snap:     *u8   = wire.take_sized(?r, ?snap_len);
+    if (!wire.done(?r)) { wire.reject(?r); }
     if (!r.bad) {
-        val restored: res[bool, fail.Fail] = snapshot.decode(alloc, itn, (bytes::usize + r.pos)::*u8, snap_len::usize, ?out.image);
+        val restored: res[bool, fail.Fail] = snapshot.decode(alloc, itn, snap, snap_len, ?out.image);
         if (sel restored.err) {
             facts_dnit(alloc, ?out.facts);
             ret res[opt[Record], fail.Fail].err{restored.err};
         }
-        if (!restored.ok) { r.bad = true; }
-        or                { r.pos = r.len; }
+        if (!restored.ok) { wire.reject(?r); }
     }
     if (r.bad) {
         facts_dnit(alloc, ?out.facts);

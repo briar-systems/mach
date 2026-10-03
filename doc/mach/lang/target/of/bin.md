@@ -6,6 +6,8 @@
 pub fun write_u16_le(buf: *u8, offset: usize, value: u16);
 ```
 
+fixed-width numbers at a byte offset, laid out by std binary
+
 ## fun write_u32_le
 
 ```mach
