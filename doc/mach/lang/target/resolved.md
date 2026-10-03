@@ -24,6 +24,9 @@ a target resolved from a registry that has since been released is refused
 pub fun layout_machine(tgt: *Target) layout.Machine;
 ```
 
+the layout machine of a resolved target. total over what resolve produces,
+which always selects an instruction set: a nil target is a caller defect
+
 ## fun dit_mode_guaranteed
 
 ```mach
@@ -56,6 +59,8 @@ nothing
 ## fun backend_target
 
 ```mach
-pub fun backend_target(tgt: *Target) isa.BackendTarget;
+pub fun backend_target(tgt: *Target) res[isa.BackendTarget, fail.Fail];
 ```
+
+the view a backend reads, refused for a target that is no longer live
 

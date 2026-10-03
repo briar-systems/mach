@@ -158,8 +158,8 @@ pub fun align_bounded(value: usize, align: usize) usize;
 ```
 
 `align_bytes` for a value its writer has already bounded far below the file
-limit, as a name or a step count is: a round-up that fails is a compiler
-defect
+limit, as a name or a step count is. total over such a value: one whose
+round-up overflows usize is a caller defect
 
 ## fun align_up
 

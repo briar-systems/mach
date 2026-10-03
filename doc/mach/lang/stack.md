@@ -42,5 +42,6 @@ pub fun run_reserved(f: fun(*u8), arg: *u8, reserve: usize);
 ```
 
 run f(arg) to completion on a thread with reserve bytes of stack, or on the
-calling thread where the host has no threads or refuses one
+calling thread where the host has no threads or refuses one. total: a thread
+it spawned is always joinable, so a refused join stops the compiler
 
