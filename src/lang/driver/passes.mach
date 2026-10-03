@@ -77,7 +77,9 @@ fun read_definition(raw: ptr, mid: session.ModuleId, phase: sema_context.Definit
     val p:      *project.Project                         = raw::*project.Project;
     val parsed: res[resolve.ParsedDefinition, fail.Fail] = driver_load.parsed_definition(raw, mid);
     if (sel parsed.err) { ret res[sema_context.Definition, fail.Fail].err{parsed.err}; }
-    var result: sema_context.Definition = sema_context.Definition{parsed: parsed.ok, origin: mid};
+    var result: sema_context.Definition = sema_context.Definition{
+        parsed: parsed.ok, origin: mid, attributes: ?project.module_at(p, mid::u32).load.ctx
+    };
     if (phase >= sema_context.DEFINITION_RESOLVED) {
         val viewed: err[fail.Fail] = depend_load_view(p, project.module_at(p, mid::u32));
         if (sel viewed.err) { ret res[sema_context.Definition, fail.Fail].err{viewed.err}; }
@@ -91,10 +93,53 @@ fun read_definition(raw: ptr, mid: session.ModuleId, phase: sema_context.Definit
     if (phase == sema_context.DEFINITION_TYPED) {
         val acquired: res[*fe_sema.SemaResult, fail.Fail] = acquire_sema(p, mid);
         if (sel acquired.err) { ret res[sema_context.Definition, fail.Fail].err{acquired.err}; }
-        result.sr  = acquired.ok;
-        result.ctx = ?project.module_at(p, mid::u32).load.ctx;
+        result.sr = acquired.ok;
+        val scoped: res[*comptime.ComptimeCtx, fail.Fail] = lower_scope_for(p, project.module_at(p, mid::u32));
+        if (sel scoped.err) { ret res[sema_context.Definition, fail.Fail].err{scoped.err}; }
+        result.ctx = scoped.ok;
     }
     ret res[sema_context.Definition, fail.Fail].ok{result};
+}
+
+# the lowering scope of a module as a definition read sees it: made or brought up to date on a
+# serial path, and only read while lowering workers run
+fun lower_scope_for(p: *project.Project, m: *project.ModuleEntry) res[*comptime.ComptimeCtx, fail.Fail] {
+    if (p.lowering_workers) { ret lower_scope_of(m); }
+    val prepared: err[fail.Fail] = lower_scope_prepare(m);
+    if (sel prepared.err) { ret res[*comptime.ComptimeCtx, fail.Fail].err{prepared.err}; }
+    ret res[*comptime.ComptimeCtx, fail.Fail].ok{?m.lower_scope};
+}
+
+# the scope lowering binds a module's constants in, over what the load, resolve and sema bound
+# over it, made on the first call and kept for as long as the module's syntax stands; each call
+# sets the layers to the module's current products, so it runs only where nothing else reads them
+pub fun lower_scope_prepare(m: *project.ModuleEntry) err[fail.Fail] {
+    if (!m.lower_scoped) {
+        m.lower_scope = comptime.stage_init(?m.load.ctx, comptime.STAGE_LOWER, m.load.ctx.own.alloc);
+        if (m.a != nil) {
+            val prepared: err[fail.Fail] = comptime.prepare_gates(?m.lower_scope, m.a.expr_len::u32);
+            if (sel prepared.err) {
+                comptime.dnit(?m.lower_scope);
+                ret prepared;
+            }
+        }
+        m.lower_scoped = true;
+    }
+    comptime.layer_set(?m.lower_scope, comptime.STAGE_LOAD, ?m.load.ctx.own);
+    if (m.resolve_result != nil) { comptime.layer_set(?m.lower_scope, comptime.STAGE_RESOLVE, ?m.resolve_result.constants); }
+    if (m.sema_result != nil)    { comptime.layer_set(?m.lower_scope, comptime.STAGE_SEMA, ?m.sema_result.constants); }
+    ret err[fail.Fail].ok{};
+}
+
+# the lowering scope `lower_scope_prepare` made, read without writing it: a scope that was never
+# made, or whose layers are not the module's current products, is a defect of the caller
+pub fun lower_scope_of(m: *project.ModuleEntry) res[*comptime.ComptimeCtx, fail.Fail] {
+    if (!m.lower_scoped) { ret res[*comptime.ComptimeCtx, fail.Fail].err{fail.message("lower: a module's lowering scope was read before it was prepared")}; }
+    var current: bool = comptime.layer_at(?m.lower_scope, comptime.STAGE_LOAD) == ?m.load.ctx.own;
+    if (m.resolve_result != nil) { current = current && comptime.layer_at(?m.lower_scope, comptime.STAGE_RESOLVE) == ?m.resolve_result.constants; }
+    if (m.sema_result != nil)    { current = current && comptime.layer_at(?m.lower_scope, comptime.STAGE_SEMA) == ?m.sema_result.constants; }
+    if (!current)                { ret res[*comptime.ComptimeCtx, fail.Fail].err{fail.message("lower: a module's lowering scope does not read its current products")}; }
+    ret res[*comptime.ComptimeCtx, fail.Fail].ok{?m.lower_scope};
 }
 
 pub fun prepare_resolve_pass(p: *project.Project) err[fail.Fail] {
@@ -309,8 +354,7 @@ fun run_sema_one(p: *project.Project, mid: session.ModuleId) err[fail.Fail] {
     # acquire_sema put the product on the entry; it is registered with the
     # session before the typed export query can reject it, so a module that
     # typed with errors still exposes what it typed
-    val rp: err[fail.Fail] = session.register_module_phase(p.s, mid, sr::ptr,
-        current.rr::ptr, current.ctx::ptr);
+    val rp: err[fail.Fail] = session.register_module_phase(p.s, mid, sr::ptr, current.rr::ptr);
     if (sel rp.err) { ret rp; }
 
     val tx_r: res[query.QueryView, fail.Fail] = query.get[project.Project](?p.queries, p, query.Q_TYPED_EXPORTS, module.stable_index(m.stable_id)::u64);
@@ -534,25 +578,26 @@ fun fold_load_view(p: *project.Project, m: *project.ModuleEntry, fb: *wire.Sink)
         wire.put_u32(fb, module.stable_index(m.load.deps.data[i::usize]));
         i = i + 1;
     }
-    wire.put_u32(fb, m.load.ctx.gate_count);
+    val made: *comptime.Bindings = ?m.load.ctx.own;
+    wire.put_u32(fb, made.gate_count);
     i = 0;
-    for (i < m.load.ctx.gate_count) {
-        wire.put_u8(fb, m.load.ctx.gate_states[i]::u8);
+    for (i < made.gate_count) {
+        wire.put_u8(fb, made.gate_states[i]::u8);
         i = i + 1;
     }
     var elements: bool = false;
-    wire.put_u32(fb, m.load.ctx.entries_len);
+    wire.put_u32(fb, made.entries_len);
     i = 0;
-    for (i < m.load.ctx.entries_len) {
-        if (m.load.ctx.entries[i].value.kind == comptime.CT_KIND_CONST_ELEM) { elements = true; }
-        val bound: err[fail.Fail] = fold_bound_const(p, m, ?m.load.ctx.entries[i], fb);
+    for (i < made.entries_len) {
+        if (made.entries[i].value.kind == comptime.CT_KIND_CONST_ELEM) { elements = true; }
+        val bound: err[fail.Fail] = fold_bound_const(p, m, ?made.entries[i], fb);
         if (sel bound.err) { ret bound; }
         i = i + 1;
     }
-    wire.put_u32(fb, m.load.ctx.deferred_len);
+    wire.put_u32(fb, made.deferred_len);
     i = 0;
-    for (i < m.load.ctx.deferred_len) {
-        wire.put_u32(fb, m.load.ctx.deferred[i]::u32);
+    for (i < made.deferred_len) {
+        wire.put_u32(fb, made.deferred[i]::u32);
         i = i + 1;
     }
     wire.put_u32(fb, m.load.bindings.len::u32);
@@ -815,6 +860,9 @@ fun acquire_frontend_inputs(p: *project.Project) err[fail.Fail] {
         }
         val acquired: res[sema_context.Definition, fail.Fail] = read_definition(p::ptr, p.topo[i], sema_context.DEFINITION_TYPED);
         if (sel acquired.err) { ret err[fail.Fail].err{acquired.err}; }
+        # every lowering scope is made here, before any worker reads one
+        val scoped: err[fail.Fail] = lower_scope_prepare(project.module_at(p, p.topo[i]::u32));
+        if (sel scoped.err) { ret scoped; }
         i = i + 1;
     }
     ret err[fail.Fail].ok{};
@@ -1189,8 +1237,10 @@ fun lower_raw(p: *project.Project, mid: session.ModuleId, home: *me_ir.ModuleHom
     if (sel captured.err) { ret res[*me_ir.Module, fail.Fail].err{captured.err}; }
     var deps: fe_sema.SemaDeps = captured.ok;
     fin { free_sema_deps_query(p.s.alloc, ?deps); }
+    val scoped: res[*comptime.ComptimeCtx, fail.Fail] = lower_scope_for(p, m);
+    if (sel scoped.err) { ret res[*me_ir.Module, fail.Fail].err{scoped.err}; }
     val req_r: res[me_lower.LowerRequest, fail.Fail] = me_lower.request(s, ?p.target.target, ?home.alloc, m.a, m.fqn, mid,
-        m.sema_result, m.resolve_result, ?m.load.ctx, normal, shared_artifact_build(p), p.req.debug, p.req.opt != pipeline.OPT_RELEASE, diags, ?deps);
+        m.sema_result, m.resolve_result, scoped.ok, normal, shared_artifact_build(p), p.req.debug, p.req.opt != pipeline.OPT_RELEASE, diags, ?deps);
     if (sel req_r.err) { ret res[*me_ir.Module, fail.Fail].err{req_r.err}; }
     var req: me_lower.LowerRequest = req_r.ok;
 
@@ -1255,8 +1305,8 @@ fun bind_constants_of(p: *project.Project, mid: session.ModuleId, testing: bool,
 fun sweep_constants(p: *project.Project, mid: session.ModuleId, sweep: me_lower.BindSweep, diags: *diagnostic.DiagnosticStore) err[fail.Fail] {
     val m:          *project.ModuleEntry                    = project.module_at(p, mid::u32);
     val definition: res[sema_context.Definition, fail.Fail] = read_definition(p::ptr, mid, sema_context.DEFINITION_TYPED);
-    if (sel definition.err)                                        { ret err[fail.Fail].err{definition.err}; }
-    if (!me_lower.constants_pending(p.s, m.a, ?m.load.ctx, sweep)) { ret err[fail.Fail].ok{}; }
+    if (sel definition.err)                                              { ret err[fail.Fail].err{definition.err}; }
+    if (!me_lower.constants_pending(p.s, m.a, definition.ok.ctx, sweep)) { ret err[fail.Fail].ok{}; }
 
     val captured: res[fe_sema.SemaDeps, fail.Fail] = build_sema_deps_query(p, m);
     if (sel captured.err) { ret err[fail.Fail].err{captured.err}; }
@@ -1267,7 +1317,7 @@ fun sweep_constants(p: *project.Project, mid: session.ModuleId, sweep: me_lower.
     val home: *me_ir.ModuleHome = hr.ok;
     fin { ir_release(p.s.alloc, home); }
     val req_r: res[me_lower.LowerRequest, fail.Fail] = me_lower.request(p.s, ?p.target.target, ?home.alloc, m.a, m.fqn, mid,
-        m.sema_result, m.resolve_result, ?m.load.ctx, nil, shared_artifact_build(p), p.req.debug, p.req.opt != pipeline.OPT_RELEASE, diags, ?deps);
+        m.sema_result, m.resolve_result, definition.ok.ctx, nil, shared_artifact_build(p), p.req.debug, p.req.opt != pipeline.OPT_RELEASE, diags, ?deps);
     if (sel req_r.err) { ret err[fail.Fail].err{req_r.err}; }
     var req: me_lower.LowerRequest = req_r.ok;
     ret me_lower.bind_constants(?req, sweep);
@@ -1520,6 +1570,8 @@ fun run_lower_batch(p: *project.Project, slots: *PlwSlot, emit_len: u32) err[fai
     val t_opt:   readout.Instant     = readout.span_begin(p.progress);
     var threads: *sync_thread.Thread = nil;
     val extra:   u32                 = nworkers - 1;
+    p.lowering_workers = true;
+    fin { p.lowering_workers = false; }
     if (extra > 0) {
         val rt: res[*sync_thread.Thread, A.Error] = A.allocate[sync_thread.Thread](p.alloc, extra::usize);
         if (sel rt.err) {
@@ -2115,8 +2167,9 @@ pub fun q_link_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags
     ret driver_query.output(?fb);
 }
 
+# a module's own export, with the constant type checking left it bound to
 fun own_type_export(p: *project.Project, mid: session.ModuleId, symbol: *resolve.Symbol,
-    sr: *fe_sema.SemaResult, ctx: *comptime.ComptimeCtx) res[sema_context.TypeExport, fail.Fail] {
+    rr: *resolve.ResolveResult, sr: *fe_sema.SemaResult) res[sema_context.TypeExport, fail.Fail] {
     var row: sema_context.TypeExport = sema_context.TypeExport{
         origin:   project.module_at(p, mid::u32).stable_id, canon: symbol.canon, ty: type.TYPE_NIL,
         constant: resolve.ExportConstant{name: symbol.canon}
@@ -2127,7 +2180,11 @@ fun own_type_export(p: *project.Project, mid: session.ModuleId, symbol: *resolve
     }
     row.ty = sr.decl_type[ast_id.decl_index(symbol.decl)];
     if (symbol.definition_kind == resolve.SYM_VAL) {
-        val found: opt[comptime.NamedConst] = comptime.lookup(ctx, symbol.canon);
+        var typed: comptime.ComptimeCtx = comptime.stage_init(?project.module_at(p, mid::u32).load.ctx, comptime.STAGE_LOWER, p.s.alloc);
+        fin { comptime.dnit(?typed); }
+        comptime.layer_set(?typed, comptime.STAGE_RESOLVE, ?rr.constants);
+        comptime.layer_set(?typed, comptime.STAGE_SEMA, ?sr.constants);
+        val found: opt[comptime.NamedConst] = comptime.lookup(?typed, symbol.canon);
         if (sel found.some) {
             val constant: comptime.NamedConst = found.some;
             row.constant.present = true;
@@ -2200,7 +2257,7 @@ fun build_type_surface(p: *project.Project, mid: session.ModuleId, rr: *resolve.
     for (i < rr.pub_count) {
         val symbol:   *resolve.Symbol = ?rr.symbols[i];
         var captured: res[sema_context.TypeExport, fail.Fail];
-        if (module.same(symbol.origin, mid)) { captured = own_type_export(p, mid, symbol, sr, ?project.module_at(p, mid::u32).load.ctx); }
+        if (module.same(symbol.origin, mid)) { captured = own_type_export(p, mid, symbol, rr, sr); }
         or                                   { captured = imported_type_export(p, symbol, ?decoded); }
         if (sel captured.err)                { ret res[sema_context.ModuleSema, fail.Fail].err{captured.err}; }
         val added: res[usize, A.Error] = collections_vector.push[sema_context.TypeExport](?surface.exports, captured.ok);

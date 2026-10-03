@@ -269,15 +269,18 @@ pub fun resolve(
 s: *session.Session,
 a: *ast.Ast,
 deps: *ResolveDeps,
-ctx: *comptime.ComptimeCtx,
+load: *comptime.ComptimeCtx,
 own_module: session.ModuleId,
 diags: *diagnostic.DiagnosticStore) res[ResolveResult, fail.Fail];
 ```
 
+resolve a module's names in a scope over the load's, `load`, whose constants and gate decisions
+resolve reads and never writes; what resolve binds is its result's
+
 ## fun decorators_deprecation
 
 ```mach
-pub fun decorators_deprecation(s: *session.Session, mid: session.ModuleId, a: *ast.Ast, source: str, start: u32, len: u32) res[deprecation.Deprecation, fail.Fail];
+pub fun decorators_deprecation(c: *comptime.ComptimeCtx, a: *ast.Ast, source: str, start: u32, len: u32) res[deprecation.Deprecation, fail.Fail];
 ```
 
 the message is the string the argument evaluates to; one that is not a
