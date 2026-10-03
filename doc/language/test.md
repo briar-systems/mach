@@ -200,8 +200,8 @@ app.parser#rejects_trailing_comma ./out/linux-x86_64/debug/obj/app/parser.test.o
 `--filter <substr>` selects before the dispatcher links, so the dispatcher
 holds only the selected tests and what they reach, and changing the filter
 relinks without recompiling. `--emit` is rejected under `mach test`
-(`--emit is not applicable to 'test'; test always builds its internal test
-dispatcher`).
+(`option '--emit' is not applicable to 'test'; test always builds its internal
+test dispatcher`).
 
 ### Timeouts
 
