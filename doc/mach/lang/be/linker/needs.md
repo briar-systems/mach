@@ -15,7 +15,7 @@ no cell, and its DIT rows are refused before any mark can exist
 
 ```mach
 pub fun synthesize_runtime_needs(s: *session.Session, tgt: *lang_target.Binding,
-modules: *target_of.ObjectImage, module_count: u32, mode: LinkMode,
+modules: *target_of.ObjectImage, module_count: u32, mode: catalog_artifact.Kind,
 out: *target_of.ObjectImage) res[bool, fail.Fail];
 ```
 

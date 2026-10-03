@@ -10,7 +10,7 @@ pub rec SymbolLoc;
 
 ```mach
 pub fun synthesize_common_storage(s: *session.Session, modules: *target_of.ObjectImage,
-module_count: u32, mode: LinkMode,
+module_count: u32, mode: catalog_artifact.Kind,
 out: *target_of.ObjectImage) res[bool, fail.Fail];
 ```
 

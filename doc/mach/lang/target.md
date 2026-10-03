@@ -226,7 +226,7 @@ pub fun select(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: str)
 ## fun artifact_naming
 
 ```mach
-pub fun artifact_naming(tgt: *binding.Binding, kind: target_of.ArtifactOutputKind) res[target_of.ArtifactName, fail.Fail];
+pub fun artifact_naming(tgt: *binding.Binding, kind: catalog_artifact.Kind) res[target_of.ArtifactName, fail.Fail];
 ```
 
 ## val TUPLE_OK

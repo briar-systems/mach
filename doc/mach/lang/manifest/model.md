@@ -84,7 +84,7 @@ one `[artifact.<name>]` table as parsed. the three arrays are owned by the
 manifest and freed by `dnit`
 
 name: the table key; a portable identifier
-kind: the required `kind` key, one of "bin", "static", "shared"
+kind: the required `kind` key, decoded through the artifact kind catalog
 entry: the required `entry` key, a project-relative path under `[project].src`
 out: the required `out` key, an unexpanded path template relative to the
               project root; `{project.out}` places the output under the build output
@@ -94,7 +94,6 @@ link: the `link` array of `[link.<name>]` names; nil when absent or empty
 link_count: length of `link`
 need: category-qualified step and artifact names or globs; nil when absent or empty
 need_count: length of `need`
-is_lib: true unless `kind = "bin"`
 is_default: `default = true`: the artifact is in the default selection; false
               when the key is absent
 is_export: `export = true`: the library a bare `use <id>;` binds and whose

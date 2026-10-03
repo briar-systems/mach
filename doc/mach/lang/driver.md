@@ -24,14 +24,6 @@ fwd project.TargetEntry
 
 forwards [`mach.lang.driver.project.TargetEntry`](driver/project.md#rec-targetentry)
 
-## fwd project.MODE_LIBRARY
-
-```mach
-fwd project.MODE_LIBRARY
-```
-
-forwards [`mach.lang.driver.project.MODE_LIBRARY`](driver/project.md#val-mode_library)
-
 ## fwd project.TARGET_OPT_RELEASE
 
 ```mach

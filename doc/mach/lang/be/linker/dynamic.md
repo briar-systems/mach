@@ -104,7 +104,7 @@ name: intern.StrId) res[ImportName, fail.Fail];
 ```mach
 pub fun synthesize_local_imports(s: *session.Session, prefix: str,
 modules: *target_of.ObjectImage, module_count: u32,
-mode: LinkMode, sec_base: *u32, atoms: *AtomPlan,
+mode: catalog_artifact.Kind, sec_base: *u32, atoms: *AtomPlan,
 out: *target_of.ObjectImage) res[bool, fail.Fail];
 ```
 
@@ -152,7 +152,7 @@ pub fun target_requires_pie(tgt: *lang_target.Binding) bool;
 ## fun loader_check
 
 ```mach
-pub fun loader_check(s: *session.Session, tgt: *lang_target.Binding, mode: LinkMode,
+pub fun loader_check(s: *session.Session, tgt: *lang_target.Binding, mode: catalog_artifact.Kind,
 pie: bool, dynamic: bool) err[fail.Fail];
 ```
 

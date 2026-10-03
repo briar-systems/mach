@@ -18,18 +18,6 @@ pub val ROOT_ARTIFACT: RootSet = 0
 pub val ROOT_UNION: RootSet = 1
 ```
 
-## val MODE_EXECUTABLE
-
-```mach
-pub val MODE_EXECUTABLE: BuildMode = 0
-```
-
-## val MODE_LIBRARY
-
-```mach
-pub val MODE_LIBRARY: BuildMode = 1
-```
-
 ## def TargetOpt
 
 ```mach
