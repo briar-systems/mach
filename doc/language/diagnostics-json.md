@@ -218,7 +218,7 @@ A **phase** record is a phase row:
 
 | Member | Type | Meaning |
 |---|---|---|
-| `name` | string | the row's label: `load`, `resolve`, `sema`, `lower`, `optimize`, `codegen`, `emit`, `link`, `cache`, `test lower`, `test codegen`, or `other` for the time no row accounts for |
+| `name` | string | the row's label: `steps`, `load`, `resolve`, `sema`, `lower`, `optimize`, `codegen`, `emit`, `link`, `cache`, `test lower`, `test codegen`, or `other` for the time no row accounts for |
 | `count` | integer | what the phase processed; absent for `other` |
 | `unit` | string | the noun the count is in, singular for a count of one: `"modules"`, `"objects"` |
 | `time_us` | integer | the phase's time |
