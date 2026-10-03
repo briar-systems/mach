@@ -1,79 +1,5 @@
 # mach.lang.target.os
 
-## val OS_UNKNOWN
-
-```mach
-pub val OS_UNKNOWN:      u32 = 0
-```
-
-## val OS_LINUX
-
-```mach
-pub val OS_LINUX:        u32 = 1
-```
-
-## val OS_DARWIN
-
-```mach
-pub val OS_DARWIN:       u32 = 2
-```
-
-## val OS_WINDOWS
-
-```mach
-pub val OS_WINDOWS:      u32 = 3
-```
-
-## val OS_FREESTANDING
-
-```mach
-pub val OS_FREESTANDING: u32 = 4
-```
-
-## val OS_CATALOG_VERSION
-
-```mach
-pub val OS_CATALOG_VERSION: u8 = 1
-```
-
-## fun os_id_for
-
-```mach
-pub fun os_id_for(name: str) u32;
-```
-
-## fun os_name_for
-
-```mach
-pub fun os_name_for(id: u32) str;
-```
-
-## fun os_is_hosted
-
-```mach
-pub fun os_is_hosted(id: u32) bool;
-```
-
-whether the os can be a build host; false for an unknown id
-
-## fun os_catalog_len
-
-```mach
-pub fun os_catalog_len() usize;
-```
-
-## fun os_catalog_name
-
-```mach
-pub fun os_catalog_name(index: usize) str;
-```
-
-## fun os_fingerprint_tag
-
-```mach
-pub fun os_fingerprint_tag(id: u32) u8;
-```
-
 ## rec AbiSet
 
 ```mach
@@ -124,12 +50,6 @@ pub rec VaList;
 
 ```mach
 pub fun va_list(size: u32, align: u32) VaList;
-```
-
-## rec FsPolicy
-
-```mach
-pub rec FsPolicy;
 ```
 
 ## rec OsVTable
@@ -305,6 +225,6 @@ res[opt[VaList], fail.Fail];
 
 ```mach
 pub fun fs_policy_checked_for(vt: *OsVTable, arch_id: u32)
-res[opt[FsPolicy], fail.Fail];
+res[opt[catalog_os.FsPolicy], fail.Fail];
 ```
 

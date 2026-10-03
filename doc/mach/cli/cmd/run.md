@@ -1,5 +1,13 @@
 # mach.cli.cmd.run
 
+## val COMMAND
+
+```mach
+pub val COMMAND: args.CommandSpec = args.CommandSpec;
+```
+
+`mach run`
+
 ## fun run
 
 ```mach
@@ -7,7 +15,7 @@ pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64;
 ```
 
 `mach run`: execute the project's already-built binary, forwarding the arguments after
-`--` to it. `--emit` and build-only options are refused; `--runner <cmd>` executes
+`--` to it; `--runner <cmd>` executes
 `<cmd> <binary> <args>` instead, which is required when the target is not runnable on
 this host; `--timeout <duration>` runs the program in its own process group and
 terminates it after the duration

@@ -1,36 +1,36 @@
 # mach.lang.target
 
-## fwd isa.ENDIAN_LITTLE
+## fwd target_model.ENDIAN_LITTLE
 
 ```mach
-fwd isa.ENDIAN_LITTLE
+fwd target_model.ENDIAN_LITTLE
 ```
 
-forwards [`mach.lang.target.isa.ENDIAN_LITTLE`](target/isa.md#val-endian_little)
+forwards [`mach.lang.target.model.ENDIAN_LITTLE`](target/model.md#val-endian_little)
 
-## fwd isa.ENDIAN_BIG
+## fwd target_model.ENDIAN_BIG
 
 ```mach
-fwd isa.ENDIAN_BIG
+fwd target_model.ENDIAN_BIG
 ```
 
-forwards [`mach.lang.target.isa.ENDIAN_BIG`](target/isa.md#val-endian_big)
+forwards [`mach.lang.target.model.ENDIAN_BIG`](target/model.md#val-endian_big)
 
-## fwd resolved.Target
+## fwd binding.Binding
 
 ```mach
-fwd resolved.Target
+fwd binding.Binding
 ```
 
-forwards [`mach.lang.target.resolved.Target`](target/resolved.md#rec-target)
+forwards [`mach.lang.target.binding.Binding`](target/binding.md#rec-binding)
 
-## fwd resolved.live
+## fwd binding.live
 
 ```mach
-fwd resolved.live
+fwd binding.live
 ```
 
-forwards [`mach.lang.target.resolved.live`](target/resolved.md#fun-live)
+forwards [`mach.lang.target.binding.live`](target/binding.md#fun-live)
 
 ## fwd resolved.ct_mul_admitted
 
@@ -159,25 +159,25 @@ pub fun with_image(req: *TargetRequest, base: u64, stack_reserve: u64, stack_com
 ## fun select_of
 
 ```mach
-pub fun select_of(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: str, of_name: str) res[resolved.Target, fail.Fail];
+pub fun select_of(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: str, of_name: str) res[binding.Binding, fail.Fail];
 ```
 
 ## fun resolve
 
 ```mach
-pub fun resolve(reg: *TargetRegistry, req: *TargetRequest) res[resolved.Target, fail.Fail];
+pub fun resolve(reg: *TargetRegistry, req: *TargetRequest) res[binding.Binding, fail.Fail];
 ```
 
 ## fun fingerprint
 
 ```mach
-pub fun fingerprint(t: *resolved.Target, s: *wire.Sink);
+pub fun fingerprint(t: *binding.Binding, s: *wire.Sink);
 ```
 
 ## fun registered_selection
 
 ```mach
-pub fun registered_selection(arch_vt: *isa.IsaVTable, model: *isa.MachineModel) isa.IsaVTable;
+pub fun registered_selection(arch_vt: *isa.IsaVTable, model: *target_model.Machine) isa.IsaVTable;
 ```
 
 the instruction set a [target.*] table selects by naming a registered isa: a
@@ -199,7 +199,7 @@ an abi passes in
 ## fun selection_spelling
 
 ```mach
-pub fun selection_spelling(isa_vt: *isa.IsaVTable, model: *isa.MachineModel, buf: *u8, cap: usize) str;
+pub fun selection_spelling(isa_vt: *isa.IsaVTable, model: *target_model.Machine, buf: *u8, cap: usize) str;
 ```
 
 the canonical selection string for an instruction set and the model selected
@@ -220,13 +220,13 @@ registered names, the object format left to the os default
 ## fun select
 
 ```mach
-pub fun select(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: str) res[resolved.Target, fail.Fail];
+pub fun select(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: str) res[binding.Binding, fail.Fail];
 ```
 
 ## fun artifact_naming
 
 ```mach
-pub fun artifact_naming(tgt: *resolved.Target, kind: target_of.ArtifactOutputKind) res[target_of.ArtifactName, fail.Fail];
+pub fun artifact_naming(tgt: *binding.Binding, kind: target_of.ArtifactOutputKind) res[target_of.ArtifactName, fail.Fail];
 ```
 
 ## val TUPLE_OK

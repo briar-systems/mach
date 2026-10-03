@@ -1,4 +1,4 @@
-# mach.lang.target.isa.riscv.features
+# mach.lang.target.extension.riscv
 
 ## val I
 

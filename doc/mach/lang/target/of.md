@@ -1063,48 +1063,6 @@ pub rec SymtabEntry;
 pub rec ExportSym;
 ```
 
-## def Subsystem
-
-```mach
-pub def Subsystem: u8
-```
-
-## val SUBSYSTEM_CONSOLE
-
-```mach
-pub val SUBSYSTEM_CONSOLE: Subsystem = 0
-```
-
-## val SUBSYSTEM_GUI
-
-```mach
-pub val SUBSYSTEM_GUI:     Subsystem = 1
-```
-
-## val SUBSYSTEM_CATALOG_VERSION
-
-```mach
-pub val SUBSYSTEM_CATALOG_VERSION: u8 = 1
-```
-
-## fun subsystem_from_name
-
-```mach
-pub fun subsystem_from_name(name: str) opt[Subsystem];
-```
-
-## fun subsystem_name
-
-```mach
-pub fun subsystem_name(s: Subsystem) str;
-```
-
-## fun subsystem_fingerprint_tag
-
-```mach
-pub fun subsystem_fingerprint_tag(s: Subsystem) u8;
-```
-
 ## rec ResourceInfo
 
 ```mach
@@ -1120,7 +1078,7 @@ pub rec ImageOptions;
 ## fun image_options_default
 
 ```mach
-pub fun image_options_default(subsystem: Subsystem) ImageOptions;
+pub fun image_options_default(subsystem: catalog_subsystem.Subsystem) ImageOptions;
 ```
 
 ## fun effective_stack_reserve
