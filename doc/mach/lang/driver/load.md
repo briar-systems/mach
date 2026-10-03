@@ -6,12 +6,6 @@
 pub val MACH_VERSION: str = lang_version.MACH_VERSION
 ```
 
-## val INITIAL_MODULE_CAP
-
-```mach
-pub val INITIAL_MODULE_CAP: u32 = 16
-```
-
 ## fun entry_module_fqn
 
 ```mach
