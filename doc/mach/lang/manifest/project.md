@@ -18,11 +18,23 @@ pub fun host_os_name() str;
 pub fun host_tuple(alloc: *A.Allocator) str;
 ```
 
-the host as "<isa>-<os>", e.g. "x86_64-linux"
+the host as `mach info` names it, by `tuple_of`
 
 alloc: owns the returned string
-ret: the formatted tuple; on allocation failure the literal "out of memory",
-       which must not be freed
+ret: the formatted tuple
+
+## fun tuple_of
+
+```mach
+pub fun tuple_of(alloc: *A.Allocator, os_name: str, isa_name: str) str;
+```
+
+the one spelling of an (os, isa) pair, "<os>-<isa>", e.g. "linux-x86_64"
+
+alloc: owns the returned string
+os_name: the os name
+isa_name: the isa name
+ret: the formatted tuple
 
 ## fun parse_project
 

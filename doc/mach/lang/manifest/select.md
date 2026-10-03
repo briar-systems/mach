@@ -77,14 +77,20 @@ empty selectors: every axis takes the manifest's default
 
 alloc: backs the three pattern vectors
 
-## fun host_label
+## fun selectors_of
 
 ```mach
-pub fun host_label(alloc: *A.Allocator) str;
+pub fun selectors_of(alloc: *A.Allocator, artifact: str, target: str, profile: str) res[Selectors, outcome.Fail];
 ```
 
-the host as `mach info` names it, `<os>-<isa>`, which a cell is native to when
-its target's os and isa are these
+selectors naming at most one pattern per axis: each non-empty value is its
+axis's one pattern, and an empty value leaves the axis to the manifest's default
+
+alloc: backs the three pattern vectors
+artifact: the `-a` pattern, or empty
+target: the `-t` pattern, or empty
+profile: the `-p` pattern, or empty
+ret: the selectors; err when a vector cannot grow
 
 ## fun cell_label
 

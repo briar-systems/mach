@@ -480,6 +480,14 @@ fwd mach.lang.manifest.project.host_tuple
 
 forwards [`mach.lang.manifest.project.host_tuple`](manifest/project.md#fun-host_tuple)
 
+## fwd mach.lang.manifest.project.tuple_of
+
+```mach
+fwd mach.lang.manifest.project.tuple_of
+```
+
+forwards [`mach.lang.manifest.project.tuple_of`](manifest/project.md#fun-tuple_of)
+
 ## fwd mach.lang.manifest.project.parse_project
 
 ```mach
@@ -856,6 +864,14 @@ fwd mach.lang.manifest.select.selectors_init
 
 forwards [`mach.lang.manifest.select.selectors_init`](manifest/select.md#fun-selectors_init)
 
+## fwd mach.lang.manifest.select.selectors_of
+
+```mach
+fwd mach.lang.manifest.select.selectors_of
+```
+
+forwards [`mach.lang.manifest.select.selectors_of`](manifest/select.md#fun-selectors_of)
+
 ## fwd mach.lang.manifest.select.cell_label
 
 ```mach
@@ -879,14 +895,6 @@ fwd mach.lang.manifest.select.single_selection_msg
 ```
 
 forwards [`mach.lang.manifest.select.single_selection_msg`](manifest/select.md#fun-single_selection_msg)
-
-## fwd mach.lang.manifest.select.host_label
-
-```mach
-fwd mach.lang.manifest.select.host_label
-```
-
-forwards [`mach.lang.manifest.select.host_label`](manifest/select.md#fun-host_label)
 
 ## fwd mach.lang.manifest.select.resolve_cells
 
