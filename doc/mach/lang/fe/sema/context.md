@@ -69,6 +69,11 @@ pub val DEFINITION_TYPED:    DefinitionPhase = 2
 pub rec Definition;
 ```
 
+a module's definition as far as a phase acquired it
+
+ctx: the scope its constants are read in, once typed
+attributes: a scope that reads the load's records of its attributes, at every phase
+
 ## rec DefinitionReader
 
 ```mach
