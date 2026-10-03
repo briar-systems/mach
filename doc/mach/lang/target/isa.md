@@ -45,12 +45,6 @@ pub def DwarfRegFn: catalog_arch.DwarfRegFn
 pub def CvRegFn: catalog_arch.CvRegFn
 ```
 
-## def RegFileFn
-
-```mach
-pub def RegFileFn: fun(*target_model.Register) i32
-```
-
 ## rec BackendTarget
 
 ```mach
@@ -210,6 +204,32 @@ pub val ENV_NONE: u32 = 0xFFFFFFFF
 ```mach
 pub rec IsaVTable;
 ```
+
+## def PrepareFn
+
+```mach
+pub def PrepareFn: fun()
+```
+
+## def ExtensionsSelectFn
+
+```mach
+pub def ExtensionsSelectFn: fun(*target_model.Machine, u64)
+```
+
+narrow a copy of an instruction set's model to the selected extension bits
+
+## fun extensions_select
+
+```mach
+pub fun extensions_select(isa_vt: *IsaVTable, model: *target_model.Machine, bits: u64);
+```
+
+narrow a copy of the template model to the selected extension bits
+
+isa_vt: the template
+model: the copy, which the template's model has been copied into
+bits: the selected extensions, closed over what they imply
 
 ## fun declares_local_got
 

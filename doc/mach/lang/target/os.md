@@ -1,5 +1,11 @@
 # mach.lang.target.os
 
+## val ABI_MAX
+
+```mach
+pub val ABI_MAX: u32 = 4
+```
+
 ## rec AbiSet
 
 ```mach
@@ -19,38 +25,21 @@ that instruction set
 pub fun abi_set_none() AbiSet;
 ```
 
-## fun abi_set_one
-
-```mach
-pub fun abi_set_one(native: str) AbiSet;
-```
-
-## fun abi_set_add
-
-```mach
-pub fun abi_set_add(s: *AbiSet, name: str);
-```
-
-a further accepted convention. total over the set's declared capacity, which
-every port's list fits: a set past OS_ABI_MAX is a defect of the descriptor
-
-## fun abi_set_unconstrained
-
-```mach
-pub fun abi_set_unconstrained(native: str) AbiSet;
-```
-
 ## rec VaList
 
 ```mach
 pub rec VaList;
 ```
 
-## fun va_list
+## rec IsaRow
 
 ```mach
-pub fun va_list(size: u32, align: u32) VaList;
+pub rec IsaRow;
 ```
+
+what an os declares about one instruction set it runs on. a field left zero
+declares nothing: the os default page, no va_list layout, no file-system
+policy, and none of the per-isa calling-convention adjustments
 
 ## rec OsVTable
 
@@ -58,14 +47,22 @@ pub fun va_list(size: u32, align: u32) VaList;
 pub rec OsVTable;
 ```
 
+## fun row_for
+
+```mach
+pub fun row_for(vt: *OsVTable, arch_id: u32) *IsaRow;
+```
+
+the row the os declares for an instruction set, nil when it does not run on it
+
 ## fun validate
 
 ```mach
 pub fun validate(a: *A.Allocator, vt: *OsVTable) err[fail.Fail];
 ```
 
-why a descriptor is malformed, read once when a registry adds it: its
-lists, and the answers its callbacks give for every isa it names
+why a descriptor is malformed, read once when a registry adds it: its lists,
+and the rows of every isa it names
 
 a: formats the refusal
 vt: the descriptor
@@ -101,7 +98,7 @@ pub fun accepted_abis(vt: *OsVTable, arch_id: u32) AbiSet;
 ```
 
 the accepted abi set the os declares for an instruction set; an os with no
-declaration accepts nothing
+row for it accepts nothing
 
 ## fun accepts_abi
 
@@ -125,6 +122,12 @@ resolution and `mach init` use; "" when the os has no port to the isa
 
 ```mach
 pub fun page_size_checked_for(vt: *OsVTable, arch_id: u32) res[u64, fail.Fail];
+```
+
+## fun pie_exec_for
+
+```mach
+pub fun pie_exec_for(vt: *OsVTable, arch_id: u32) bool;
 ```
 
 ## fun variadic_stack_for

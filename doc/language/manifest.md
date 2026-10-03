@@ -266,7 +266,7 @@ to whichever *declared* target matches the host.
 | `platform` | absent: no platform | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
 | `stack_reserve` | absent: the format's default | Thread stack reserve in bytes. See [Image stack size](#image-stack-size). |
 | `stack_commit` | absent: the format's default | Thread stack commit in bytes. See [Image stack size](#image-stack-size). |
-| `default` | removed | Refused as a removed key. A target has no default: with no `-t` a command takes the declared target matching the host. See [`native` target resolution](#native-target-resolution). |
+| `default` | removed | Refused as a removed key. A target has no default: with no `-t` a command takes the declared target matching the host. See [`native` target resolution](build.md#native-target-resolution). |
 | `extensions` | absent: none selected | Array of instruction-set extension names the target may assume, such as `["sha", "ssse3"]`. Each name must be in the isa's vocabulary. See [Instruction-set extensions](#instruction-set-extensions). |
 | `env` | absent: the isa's default | Consumer environment (string). The values are owned by the target's isa: an `env` the isa does not define is a manifest error naming the target and the known values, and an isa that defines none refuses the key outright. Today only `spirv` defines any; see [Finished-module targets](#finished-module-targets). |
 
@@ -290,7 +290,14 @@ comptime member, `$mach.build.extensions.<name>` (see [`$mach`](comptime-mach.md
 | `x86_64` | SSE2 | `ssse3`, `sse41`, `sse42`, `sha`, `fsgsbase`, `popcnt`, `lzcnt`, `bmi1`, `bmi2`, `cx16`, `avx`, `avx2`, `fma`, `movbe`, `f16c`, `avx512f`, `avx512bw`, `avx512cd`, `avx512dq`, `avx512vl`, `aes`, `pclmul` |
 | `aarch64` | AdvSIMD | `sha2`, `sb`, `aes`, `pmull`, `fp16` |
 | `riscv64`, `riscv32` | the isa string's selection | `i`, `m`, `a`, `f`, `d`, `c`, `zicond`, `zicsr`, `zifencei`, `zfhmin`, `zfh`, `zkt` |
-| `spirv` | | the type device features `float16`, `int8`, `int16`, `int64` and `float64`; `zero_init_workgroup`, `storage_read_without_format`, `storage_write_without_format`, `vulkan_memory_model`, `vulkan_memory_model_device_scope` and `buffer_device_address`, which `vulkan1.3` selects; the subgroup device features `subgroup_arithmetic`, `subgroup_clustered`, `subgroup_vote`, `subgroup_ballot`, `subgroup_shuffle`, `subgroup_shuffle_relative`, `subgroup_quad` and `subgroup_graphics_stages`; the atomic device features `buffer_int64_atomics`, `shared_int64_atomics`, `buffer_float32_atomics`, `buffer_float32_atomic_add`, `buffer_float32_atomic_min_max`, `buffer_float64_atomics`, `buffer_float64_atomic_add`, `buffer_float64_atomic_min_max`, `shared_float32_atomics`, `shared_float32_atomic_add`, `shared_float32_atomic_min_max`, `shared_float64_atomics`, `shared_float64_atomic_add` `shared_float64_atomic_min_max`, `buffer_float16_atomics`, `buffer_float16_atomic_add`, `buffer_float16_atomic_min_max`, `shared_float16_atomics`, `shared_float16_atomic_add`, `shared_float16_atomic_min_max`, `image_int64_atomics`, `image_float32_atomics`, `image_float32_atomic_add` and `image_float32_atomic_min_max` ([decorators.md](decorators.md#optarget-set-name--a-function-that-is-a-target-instruction)); the image device features `storage_image_multisample` ([types.md](types.md#handles)) and the sampling device features `resource_min_lod`, `image_gather_extended` and `maintenance8` ([decorators.md](decorators.md#optarget-set-name--a-function-that-is-a-target-instruction)); the storage device features `storage_buffer_16bit_access`, `uniform_and_storage_buffer_16bit_access`, `storage_push_constant16`, `storage_input_output16`, `storage_buffer_8bit_access`, `uniform_and_storage_buffer_8bit_access` and `storage_push_constant8` |
+| `spirv` | | `float16`, `int8`, `int16`, `int64`, `float64`, `zero_init_workgroup`, `storage_read_without_format`, `storage_write_without_format`, `vulkan_memory_model`, `vulkan_memory_model_device_scope`, `buffer_device_address`, `subgroup_arithmetic`, `subgroup_clustered`, `subgroup_vote`, `subgroup_ballot`, `subgroup_shuffle`, `subgroup_shuffle_relative`, `subgroup_quad`, `subgroup_graphics_stages`, `buffer_int64_atomics`, `shared_int64_atomics`, `buffer_float32_atomics`, `buffer_float32_atomic_add`, `buffer_float32_atomic_min_max`, `buffer_float64_atomics`, `buffer_float64_atomic_add`, `buffer_float64_atomic_min_max`, `shared_float32_atomics`, `shared_float32_atomic_add`, `shared_float32_atomic_min_max`, `shared_float64_atomics`, `shared_float64_atomic_add`, `shared_float64_atomic_min_max`, `buffer_float16_atomics`, `buffer_float16_atomic_add`, `buffer_float16_atomic_min_max`, `shared_float16_atomics`, `shared_float16_atomic_add`, `shared_float16_atomic_min_max`, `image_int64_atomics`, `image_float32_atomics`, `image_float32_atomic_add`, `image_float32_atomic_min_max`, `storage_image_multisample`, `resource_min_lod`, `image_gather_extended`, `maintenance8`, `storage_buffer_16bit_access`, `uniform_and_storage_buffer_16bit_access`, `storage_push_constant16`, `storage_input_output16`, `storage_buffer_8bit_access`, `uniform_and_storage_buffer_8bit_access`, `storage_push_constant8` |
+
+On `spirv` each name is a device feature a module may require.
+`vulkan1.3` selects `zero_init_workgroup`, `storage_read_without_format`,
+`storage_write_without_format`, `vulkan_memory_model`,
+`vulkan_memory_model_device_scope` and `buffer_device_address`. The atomic and
+sampling features are described with [`op`](gpu.md#optarget-set-name--a-function-that-is-a-target-instruction),
+and the image features with [handles](types.md#handles).
 
 A name the selected isa does not hold is refused when the target resolves, with the
 names it does hold:
@@ -367,7 +374,7 @@ refusal says why. So are spirv `float16`, `int8`, `int16`, `int64` and `float64`
 the device features that let the whole module use a type of that width, and spirv
 `zero_init_workgroup`, the device feature
 that zero-initializes the workgroup memory of every
-[`#[shared]`](decorators.md#inputn--outputn--builtinstr--uniformset-binding--storageset-binding--samplerset-binding--push--specid--shared--shader-interface)
+[`#[shared]`](gpu.md#inputn--outputn--builtinstr--uniformset-binding--storageset-binding--samplerset-binding--push--specid--shared--shader-interface)
 variable in the module, and spirv `storage_read_without_format` and
 `storage_write_without_format`, the device features that let a storage image of
 `Unknown` format be read and written, spirv `storage_image_multisample`, the
@@ -472,9 +479,14 @@ such an image is refused at link rather than silently dropped.
 
 | Axis  | Values |
 |-------|--------|
-| `isa` | `x86_64`, `aarch64`, `riscv64`, `riscv32`, a canonical RISC-V extension string such as `rv32imc`, `spirv` |
+| `isa` | `x86_64`, `aarch64`, `riscv64`, `riscv32`, `spirv` |
 | `os`  | `linux`, `windows`, `darwin`, `freestanding` |
 | `abi` | `sysv64`, `win64`, `aapcs64`, `lp64`, `lp64f`, `lp64d`, `ilp32`, `ilp32f`, `ilp32d`, `spirv` |
+| `of`  | `elf`, `macho`, `coff`, `raw`, `spv` |
+| `env` | `vulkan1.0`, `vulkan1.1`, `vulkan1.2`, `vulkan1.3` |
+
+`isa` also takes a canonical RISC-V extension string such as `rv32imc`, described
+below. `env` is defined only by `spirv`.
 
 A `[target.*]` naming an `isa`, `os` or `abi` outside these lists is refused
 through the registry's own lookup (`no isa implementation registered for
@@ -658,7 +670,7 @@ instruction taking that scope is refused unless the target selects
 GLSL450 the `QueueFamily` scope and the `MakeAvailable`, `MakeVisible` and `Volatile`
 memory semantics, which only the Vulkan model defines, are refused. What
 `"coherent"` and `#[shared]` mean under each model is in
-[decorators.md](decorators.md#inputn--outputn--builtinstr--uniformset-binding--storageset-binding--samplerset-binding--push--specid--shared--shader-interface).
+[gpu.md](gpu.md#inputn--outputn--builtinstr--uniformset-binding--storageset-binding--samplerset-binding--push--specid--shared--shader-interface).
 
 Physical pointers follow it too. A module holding one, a pointer stored in memory or
 made from an address ([types.md](types.md#pointers-on-spir-v)), is refused unless the
@@ -1065,7 +1077,7 @@ reads the selected artifact's name.
 | `subsystem` | absent: `"console"` | `"console"` or `"gui"` — the environment a windows executable declares it runs under; refused on a target whose image format has no subsystem (see below). |
 | `icon` | absent: no icon | Project-root-relative `.ico` path embedded in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
 | `manifest` | absent: no application manifest | Project-root-relative application-manifest path embedded byte-for-byte in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
-| `default` | absent: not marked | Selection only. `true` puts the artifact in the [default selection](#selection-and-the-build-matrix): with no `-a`, `mach build` and `mach check` take the marked artifacts among those supporting the selected target (every one of them when none is marked), and a command that needs one artifact (`mach test`, `mach run`, the editor's union build) takes the marked one. A command that needs one artifact refuses two marked candidates; an explicit `-a` always wins, and a sole candidate needs no marker. |
+| `default` | absent: not marked | Selection only. `true` puts the artifact in the [default selection](build.md#selection-and-the-build-matrix): with no `-a`, `mach build` and `mach check` take the marked artifacts among those supporting the selected target (every one of them when none is marked), and a command that needs one artifact (`mach test`, `mach run`, the editor's union build) takes the marked one. A command that needs one artifact refuses two marked candidates; an explicit `-a` always wins, and a sole candidate needs no marker. |
 | `export` | absent: not exported | `true` marks the library a bare `use <id>;` binds and whose requirements travel to consumers (see [Dependency requirements travel](#dependency-requirements-travel)). It applies to `static` and `shared` artifacts only, and a project exports at most one. |
 
 `entry` is the build cell's source root. The build follows its active `use` and
@@ -1264,6 +1276,7 @@ the same entries, so nothing behaves differently as a dependency.
 | `abi`     | yes | Filter axis over `abi`, same forms. |
 | `export`  | absent: not exported | `true` cascades this entry to consumers; `false` keeps it to this project's own builds. |
 | `include` | absent: `"always"` | `"always"` names the dynamic library in the linked image whether or not anything imports from it; `"referenced"` names it only when a live import references it, so an unused provider leaves no load command behind. Any other value is a manifest error (`[link.k].include must be "always" or "referenced"`). |
+| `library` | removed | Refused as a removed key. The table key is the library's identity, and `#[library]` names the entry by that key. |
 
 The `os`/`isa`/`abi` axes select the build cells an entry applies to. Each is an
 array, like an artifact's `targets`: canonical values, `"*"` for any, and `[]`
@@ -1369,6 +1382,8 @@ plain identifier — it keys the step's stamp file.
 | `out`  | yes | Declared output file list. Concrete paths only — a glob here is an error, since the demand match and cache key expand `out` verbatim. |
 | `need` | absent: needs nothing | Array of `step.<name>` requirements or `step.<pattern>` globs this step must run after. Steps may require only steps. Cycles are manifest errors. |
 | `timeout` | absent: no limit | Duration string (`"30ms"`, `"30s"`, `"5m"`, `"1h"`) after which the step's process group is terminated and the build fails. Omit for an unbounded step. |
+| `cmd` | removed | Refused as a removed key. Write the command as a nonempty `argv` array. |
+| `shell` | removed | Refused as a removed key. Put the shell executable and its arguments in `argv`. |
 
 Steps carry **no filters** and **never run automatically**. A step runs only when
 **demanded**:
@@ -1521,7 +1536,7 @@ others:
 |--------|---------|
 | `git`  | Git URL. The dependency is a git **submodule** at `dep/<id>/`, pinned by the gitlink the root repository commits. Requires `ref` or `version`. |
 | `ref`  | Selector for `git`: `branch/<name>`, `tag/<name>`, or `commit/<full-object-id>`. Any other spelling is rejected (`[dep.std].ref must be branch/<name>, tag/<name>, or commit/<full-object-id>`). |
-| `version` | A [version range](#version-ranges) over the dependency's releases (see [Releases and resolution](#releases-and-resolution)). Valid only with `git`; a path dependency has no releases. |
+| `version` | A [version range](#version-ranges) over the dependency's releases (see [Releases and resolution](dependencies.md#releases-and-resolution)). Valid only with `git`; a path dependency has no releases. |
 | `path` | Local project tree, never fetched. A relative `path` is resolved relative to this manifest's directory. `mach dep add <path> <id> --path` copies its files into `dep/<id>/` without the source's own `dep/` or Git metadata. No repository or index is required for a path dependency, and copied files are not automatically staged. Forbids `ref` and `version`. |
 
 `git` and `path` are mutually exclusive and exactly one is required. A `git`
@@ -1531,417 +1546,9 @@ dependency also names exactly one selector, `ref` or `version`.
 'version'; keep one`). `ref` selects one exact commit or tag, or follows a
 branch. `version` selects among releases.
 
-### Releases and resolution
-
-A **release** of a git dependency is a tag `vX.Y.Z` (optionally
-`vX.Y.Z-pre`) together with the `mach.toml` at that tag. A tag whose manifest
-does not load, as an old tag's written for an earlier manifest schema, or whose
-`[project].version` differs from the tag name is not a candidate. Resolution
-sets it aside and keeps looking. When nothing fits, the error lists it among the
-requirements (`gl 0.1.0 is not a candidate: its mach.toml does not load: unknown
-key 'name' in [project]`, or `... its [project].version does not match the
-tag`), so the error never reads as one in the project's own `mach.toml`.
-
-Resolution runs in exactly three places: `mach dep add`, `mach dep update` and
-`mach dep outdated`. **Builds never resolve and never verify.** They read
-what `dep/` holds (see [What a build reads](#what-a-build-reads)), and `mach
-dep verify` checks it (see [What `mach dep verify`
-checks](#what-mach-dep-verify-checks)). For every identity in the
-closure that some manifest selects by `version`, resolution picks one release
-such that:
-
-1. every requirer's range contains it;
-2. its own `[project].mach` contains the running compiler;
-3. the closure its own manifest implies also resolves.
-
-A requirer is the root, a release resolution chose, or a dependency the root
-reaches by `ref` or `path`. The last declares its range in the closure directly,
-so two such dependencies naming one identity by range are two requirements of
-the same problem, and the error names each by its chain (`root -> c requires b
-<1.2`).
-
-Among the choices that satisfy all three, it takes the highest release of each
-identity. The result is written as gitlinks, like any other pin; there is
-still no lock file. `mach dep update <path> <name>` keeps every other
-identity at its pinned release (the release its recorded gitlink carries) while
-that release still fits, so an update moves as little as it can. `--all`
-resolves from scratch. A pin the range no longer admits, as after the range is
-raised past it, is re-pinned to the release resolution picks; `update` never
-keeps it. The recorded gitlink is the pin, not whatever the checkout holds: a
-checkout that drifted from its gitlink is moved to the chosen release and the
-gitlink staged in the same run, even when the drifted checkout already sits at
-that release.
-
-When nothing fits, the error lists every requirement that took part and names
-the identity the root can settle:
-
-```
-error[dep.unsatisfiable]: no set of releases satisfies every requirement:
-    root requires b ^1.2
-    a 1.0.0 requires b ^2.0
-  the root decides by declaring the identity itself, for example:
-    [dep.b]
-    version = "<a range the root can use>"
-```
-
-A release that needs a newer compiler appears as one of those lines (`b 2.0.0
-requires mach ^6, and this is mach 5.2.1`). Resolution never silently settles
-for a lower release than the ranges allow.
-
-What `mach dep add` writes:
-
-- with `--git <url>` alone, `version = "^X.Y.Z"`, where `X.Y.Z` is the
-  release resolution picked. The lower bound is the release actually tested
-  when the dependency was added, and the caret follows the pre-1.0 rule;
-- with `--range <range>`, that range;
-- with `--ref <selector>`, that selector, as before.
-
-`mach init` adds std the same way, so a new project names the std release that
-works with the compiler that created it. std is an ordinary dependency, with
-no std-specific command. `mach init --no-deps` still resolves and writes the
-range and skips only the checkout, so it needs the network too. Offline it
-fails and writes no `[dep.std]` table. A tool that needs the std for a given
-compiler runs `mach init` and `mach dep pull` in a scratch project and takes
-what resolution chose.
-
-**`--offline`.** `add`, `update` and `outdated` read candidates from each
-dependency's repository: one `git ls-remote --tags` per URL, and the manifest
-at a release through a shallow fetch of its tag. With `--offline` they use only
-the tags already present in the realized checkouts, and they say so
-(`resolving from releases already fetched (--offline)`). A resolution that
-needs a candidate it doesn't have fails, naming the identity. Realizing a
-checkout fetches nothing either. A missing checkout is initialized from the
-submodule store Git kept for it, and a pin that no local checkout or store
-holds fails, naming the dependency and the commit. A dependency added over a
-retained checkout or store is checked out at its selector as held there, and
-one with neither is not cloned. A selector nothing local holds fails, naming
-the dependency and the selector.
-
-**`--lowest`.** `mach dep update <path> --all --lowest` picks the lowest
-release every range accepts. A library's CI runs it in a scratch checkout and
-then builds and tests, which proves the lower bounds it declares are honest.
-Without that check, `^3.2.0` can quietly depend on something only 3.4 has. It
-belongs in a release or manually dispatched job, never a scheduled one.
-
-**`mach dep outdated <path>`** prints, for each version-selected identity, the
-pinned release, the highest release resolution would pick now, and the highest
-release published. A newer release held back by a range or by the compiler is
-marked as such.
-
-**No yanking.** A bad release that is otherwise compatible is fixed forward
-with a new release. Nothing marks a published version as withdrawn. A
-consumer that must avoid one raises its range's lower bound (`^3.2.1`).
-
-**Forks.** Identity is the project id, not the URL. A root that declares a
-fork's URL makes that fork the candidate source, so its `vX.Y.Z` tags compete
-under the same ranges. A fork that wants to stay distinguishable tags
-pre-releases (`v1.4.3-fork.1`), and a consumer opts in by naming the
-pre-release in its range.
-
-### Root declarations: narrowing and overriding
-
-A root `version` for an identity **narrows**: it is intersected with every
-requirer's range, and resolution and verification hold the pin to all of them.
-A root `ref` or `path` **overrides**: the requirers' ranges and selectors for
-that identity no longer apply. A range is therefore never widened silently, and
-the escape hatch is one visible line in the root manifest.
-
-An override is always reported. `mach dep pull`, `mach dep update` and `mach
-dep add` print one note on stderr for each requirement a root declaration
-replaced, whatever `--quiet` says, naming the identity, the root's winning
-selection, the requirer chain and what that chain asked for:
-
-```
-note: dependency 'std': the root declares ref = "tag/v2.0.0", overriding
-hedgeacme -> hedge -> std which requires ref = "tag/v2.1.0"; nothing checks that
-'std' supports the root's selection
-```
-
-A requirement that asks for exactly the root's selection is no override and is
-not noted. `mach dep list` shows each root declaration's winning selection
-(`ref=`, `version=` or `path=`, and the recorded `pin=`), its state
-(`realized`, `missing`, or, for a `version` selection whose range excludes the
-pinned release, `out of range (the pinned release 7.0.2 is outside ^8.0)`) and,
-under it, every requirement it overrides (`overrides hedgeacme -> hedge -> std, which requires
-ref = "tag/v2.1.0"`). `mach dep outdated` names the requirements of a chosen
-release that a root or a fixed dependency overrides (`root declares b by ref
-"branch/main", overriding root -> a 1.0.0 requires b ^1.2`).
-
-An override is not checked against the requirers. Because the closure is flat,
-a requirer's `use b.*` binds to whatever the root selected, even a major that
-requirer was never built or tested against. Nothing proves the requirer supports
-it: a passing build only shows that the code the build reached compiled, so it is
-evidence and not a guarantee. `mach dep verify` prints a note for every edge an
-override replaced, without failing (`note: dependency 'b': the root declares ref =
-"tag/v2.0.0", overriding root -> a -> b which requires version = "^1.2"; nothing
-checks that 'b' supports the root's selection`). Treat each note as a claim to
-confirm, by testing the requirer at that selection or by checking its own range.
-
-### A release selects only releases
-
-The rule follows how a manifest was reached, not where it sits:
-
-- A dependency reached through a **release** (a `version` range or an exact
-  `tag/`) may itself select dependencies only by `version` or `tag/`. A release
-  is then reproducible from its tag, all the way down.
-- A dependency reached through a `branch/` or `commit/` selection is in
-  development, and its manifest may use any selector.
-
-A release that breaks the rule is refused wherever it is reached. Resolution
-stops when it reaches one, and `mach dep verify` refuses it,
-naming the chain and the offending line:
-
-```
-error[dep.release_selector]: root -> a is a release (ref = "tag/v1.1.0"), and its manifest selects
-[dep.b] by ref = "branch/main"; a release may select its dependencies only by
-`version` or an exact `tag/`, so it cannot be reproduced from its tag
-```
-
-`mach dep verify <path> --release` holds the project itself to the same rule,
-so a library's release workflow catches the mistake before it tags the
-release, not when its first consumer resolves it.
-
-### Pins are gitlinks; there is no lock file
-
-The record of which commit a dependency is at is the **gitlink** committed in
-the root repository, generated into `.gitmodules` by `mach dep`. Nothing else
-records a pin: there is no `mach.lock`, and a file of that name in the project
-root is an unrelated file no command reads.
-
-A project does not need its own Git repository. In a repository root, Git
-dependencies use the staged gitlinks as their pins. A subproject, a project in a
-subdirectory of a repository, uses the gitlink the enclosing repository commits
-under its prefix (`test/consumer/dep/std` for a subproject at `test/consumer`)
-the same way: `pull` realizes that gitlink's commit and `update` moves it and
-stages it. Without such a gitlink, and in a filesystem project, Git dependencies
-are plain clones whose own checkout commits are verified. Local path dependencies
-are verified from their filesystem realizations, independently of any Git index.
-
-A version range is resolved for the whole closure, not for the root's own
-declarations alone: a range a dependency declares, whether that dependency was
-reached by a range, a `ref` or a `path`, is pinned under the root's `dep/` by
-`mach dep add` and `mach dep update`. When the root has no checkout of the
-identity yet, resolution starts from the declaring dependency's own committed
-gitlink for it, so a dependency brings the pin it was tested with; `update
---all` moves every range to the highest release all of them admit; and a root
-declaration of the same identity by `ref` or `path` overrides the range, noted
-as above. `pull` refuses a range with
-neither a gitlink nor a checkout under the root and names `mach dep update <root>
-<id>`, which pins it wherever in the closure it is declared.
-
-### The root owns the flat closure
-
-The root's `dep/` holds every identity in its **transitive** closure, one
-directory each, one level deep. The root manifest declares only what the root
-uses directly (plus any override, below); a dependency's own dependencies reach
-the root's `dep/` through closure computation and never need a declaration in
-the consumer. A consumed dependency's own `dep/` is never initialized. A
-package cloned on its own is a root and realizes its own flat `dep/`.
-
-So with a root that declares `a`, and `a` that declares `b`, the layout is
-`dep/a/` and `dep/b/`, and `a`'s `use b.*` resolves against the root's
-`dep/b/`. Git materializes `a`'s own gitlink as an empty `dep/a/dep/b/`
-directory; that entry is neither realized, verified, nor descended into.
-
-### One identity, one commit
-
-Identity is the project id, not the key and not the URL. One identity resolves
-to exactly one commit per build, with no exception for majors: two majors of one
-identity in one closure is a **clash**, not a case the build accommodates. The
-diagnostic prints both requiring chains and the exact root declaration that
-would resolve it:
-
-```
-error[dep.conflict]: dependency conflict: project id 'b' is reached with two different selections:
-    root -> a -> b requires git <url> @ tag/v1.0.0
-    root -> c -> b requires git <url> @ tag/v2.0.0
-  the root decides by declaring the identity itself, for example:
-    [dep.b]
-    git = "<url>"
-    ref = "tag/v2.0.0"
-```
-
-(`<url>` stands for the repository URL as declared.)
-
-The root resolves by declaring the identity with a `ref`, which may point at
-upstream or at a fork carrying the same id. A fork slots in without any
-consumer source or manifest change, because identity is not the URL. Two
-unrelated packages claiming one id is a collision and is rejected. URL
-disagreement is a mirror, not a conflict: the root's declared URL wins, else the
-first declaring path's; verification compares commits, never URLs. A realized
-checkout whose remote points somewhere else (a `.git` suffix, another host, a
-local mirror) verifies by its commit alone.
-
-### What a build reads
-
-A build locates each dependency as the directory its key names under `dep/`
-and reads its manifest. That is the whole of its dealing with dependencies: it
-never fetches, never writes under `dep/`, runs no Git process, and checks no
-pin, selector, identity or checkout state. It builds what exists, so a stale
-or drifted dependency surfaces as a build error, and `mach dep pull` brings it
-back to its pin. A dependency with nothing checked out, whether `dep/<id>` is
-absent or is the empty directory Git leaves for an uninitialized gitlink on a
-fresh clone, is refused naming that command (`dependency 'std' is missing:
-nothing is checked out at 'dep/std'; run `mach dep pull <root>``). A build
-also refuses a cycle in the manifests it reads, and a compiler outside any
-manifest's `[project].mach` (see [Compiler range](#compiler-range)).
-
-### What `mach dep verify` checks
-
-`mach dep verify` locates the closure as a build does and checks, offline,
-that:
-
-1. every Git dependency is a clean checkout at its applicable pin
-   (`dependency 'std': checkout is dirty:  M mach.toml`), and every path
-   dependency is a contained filesystem tree without repository metadata;
-2. its project id equals the directory name;
-3. the closure computed from the realized manifests equals the set of
-   directories under `dep/`: nothing missing, nothing extra, and no
-   dependency's own `dep/` realized. A missing dependency is refused as a build
-   refuses it;
-4. there are no cycles (reported as the chain);
-5. every realized manifest's `[project].mach` accepts the running compiler (see
-   [Compiler range](#compiler-range));
-6. for every identity selected by `version`, the pinned commit carries a
-   release tag, read from the checkout's own refs, and that release is inside
-   every requirer's range, the root's included; and every release in the
-   closure selects only releases (see [A release selects only
-   releases](#a-release-selects-only-releases)).
-
-A pin outside a range names the requirer chain, the range, the pinned release
-and a runnable remedy (`dependency 'vb': root -> vb requires version '^1.2' but
-the pinned release is 1.1.0; run `mach dep update <path> vb` for project
-'<root>' to re-pin it, or declare the identity at the root to override`). A
-pin no tag in the checkout names reads `... but no release tag in its checkout
-names the pinned commit '<commit>'`, and names `mach dep pull` beside `mach dep
-update`. A checkout that holds no tags at all, as a shallow clone (`git
-submodule update --depth 1`) does, cannot say which release its pin is, and
-the refusal says so rather than claim the pin is outside the range (`... but
-the release of the pinned commit '<commit>' cannot be read: its checkout at
-<dir> holds no tags (a shallow clone fetches none); run `mach dep pull <path>`
-for project '<root>' to fetch them`).
-
-The recorded gitlink is the pin, and two kinds of drift from it are refused,
-each naming the identity and the command that fixes it:
-
-- a `dep/<id>` checkout at another commit than its gitlink (`dependency 'b':
-  the checkout is at '<commit>' but the recorded gitlink is '<other>'; run
-  `mach dep pull <path>` for project '<root>' to restore the recorded pin, or
-  `mach dep update <path> b` to re-pin it to the manifest's selection`);
-- a gitlink outside the manifest's selection. The root's own `tag/` or
-  `commit/` must be satisfied by the pin (`dependency 'b': exact ref
-  'tag/v1.0.0' required by root -> b resolves to '<commit>' but the realized
-  commit is '<other>'; run `mach dep update <path> b` for project '<root>' to
-  re-pin it to the root's selection`; a root `commit/` that does not match
-  reads `exact commit ref 'commit/<id>' is not satisfied by the realized commit
-  '<other>'`), and so must every range the root declares (item 6). `pull`
-  realizes the gitlink as it is, so it never cures this; `update` moves the
-  gitlink to the selection.
-
-A root `ref` or `path` is the override for its identity, so the requirers'
-selectors are not checked against its pin (the override notes above name them).
-For an identity the root does **not** declare, every requirer's exact selector
-(`tag/`, resolved through the checkout's own refs, or `commit/`) must be
-satisfied by the realized commit; a mismatch names both commits and the two
-remedies (`dependency 'b': exact ref 'tag/v1.0.0' required by root -> a -> b
-resolves to '<commit>' but the realized commit is '<other>'; run `mach dep
-update <path> b` for project '<root>' to re-pin it, or declare the identity at
-the root to override`). A `branch/` selector is an input to `update`, never a
-verify fact. The verifier reads the git **index**, so a freshly realized
-dependency is verifiable before it is committed.
-
-`mach dep pull` reads what a Git dependency's `dep/<id>` holds together with
-its record (the staged gitlink, its `.gitmodules` entry, and any module
-directory Git retained) and takes the one step that brings it to what `mach
-dep verify` checks:
-
-- a staged gitlink with nothing checked out, as on a fresh clone or after the
-  directory was deleted, is initialized in place (`realized std @ …
-  (initialized the committed gitlink)`), first restoring its `.gitmodules`
-  entry from the manifest if that entry is gone;
-- a checkout at another commit than its gitlink is checked out at the gitlink;
-- a clean checkout of its own with no gitlink is registered, moved to the
-  declared selector from the declared source, and staged (`(registered the
-  existing checkout)`);
-- with neither, the submodule is added at the selector, reusing a module
-  directory Git retained from an earlier removal.
-
-Then, when the checkout lacks the tag its selection is read by (the tag a
-`tag/` names, or a release tag naming a `version` selection's pin), pull
-fetches its tags (`fetched the tags of std`). `update` and `outdated` fetch
-them the same way to read a pin's release, unless `--offline`.
-
-A symlink, a file, a directory that is not a checkout of its own, and a dirty
-checkout that would be registered are refused and left as they are. `mach dep
-add` takes the same step for its Git source, so re-adding a dependency whose
-checkout `remove` retained registers that checkout, and it refuses a dirty one.
-No gitlink command ever runs against a path that is not a checkout of its own.
-
-A path dependency has no pin, so `mach dep pull` syncs its `dep/<id>` with the
-declared `path` every time, and `mach dep update` does the same, once per
-command. Unless `--quiet`, each says whether the copy was refreshed or reused (`realized hedge
-from ../.. (copy refreshed from its source)`, or `(copy reused: it already
-matched its source)`), so a copy left from another checkout cannot pass
-unnoticed. A build reads the copy as it is and never syncs it. A changed
-`path` realizes the new source. A file the source no longer has is removed and
-named, and a file whose content differs from the source is overwritten and named
-(`replaced 'src/lib.mach' with its source's content`), so local edits to the
-copy do not survive a pull. A `dep/<id>` that is a symlink is refused and left
-as it is.
-
-A project root is identified by its own `mach.toml`, not by an enclosing git
-repository; `dep/<id>` is resolved relative to the project root. A project
-nested inside an unrelated repository or without any repository builds. Git
-dependencies in these projects are verified from their own plain checkouts.
-
-### Selection on `update`
-
-`mach dep update` is the only command that moves a pin. It advances every
-`branch/` selector to its current remote tip and re-stages the gitlink, and it
-moves an exact selector to the commit it names, so an identity realized at a
-dependency's selection lands on the root's declaration once the root declares
-one (`b: 0564… -> e508… (pinned to the exact selector)`, or `(exact selector,
-already pinned)` when nothing moves). `<name>` is looked up in the whole
-dependency closure, so `mach dep update <path> b` for an identity the root does
-not declare moves its checkout to the selector its requirers declare, and
-`--all` moves every selector in the closure. Resolution reads a dependency
-selected by `ref` at the commit its selector names, never from its checkout, so
-a requirer that has just moved its selector is resolved against the manifest it
-now selects. A
-name outside the closure is refused (`dependency 'x' is not in the dependency
-closure`). For an identity reached by
-more than one path, one rule decides: the root's selector wins if the root
-declares the identity; otherwise agreement among the requirers is taken;
-otherwise the command stops, prints both chains, and names the root
-declaration that would decide (the diagnostic above). A consumed
-dependency's own gitlink records a tested commit, readable without initializing
-that dependency's `dep/`. It is not a compatibility floor. Compatibility is
-stated by ranges, and `update` resolves every version-selected identity as
-described in [Releases and resolution](#releases-and-resolution).
-
-### Removed forms
-
-Two shapes of a realized closure are refused by `pull`, `verify` and every
-build:
-
-- a **key that is not the project id**, a `[dep.<key>]` whose realized project
-  declares a different id:
-  `[dep.foo] realizes project 'std': the manifest key, the directory under
-  dep/, and the project id are one name, so rename the table to [dep.std] and
-  the directory to dep/std`;
-- a **nested realization**, a `dep/<id>/dep/<x>/mach.toml`: `dependency 'a':
-  dep/a/dep/b is a nested realization: the root's dep/ owns the flat closure
-  and a dependency's own dep/ is never realized, so delete dep/a/dep`. The
-  empty directory git materializes for a consumed dependency's own gitlink is
-  not a realization and passes.
-
-Command-line usage (`pull`, `verify`, `add`, `update`, `remove`, `list`) is
-documented by `mach help dep`.
-
-A dependency's export surface — all a consumer sees — is its source module tree
-(addressed by the dep's id), the module a bare `use <id>;` binds, its
-`export = true` link entries and library artifact, and the steps and artifacts
-those demand. Nothing else in a dependency's manifest applies to consumers.
+How a `version` is resolved to a release, how pins are recorded, and what
+`mach dep verify` and `update` check is described in
+[dependencies.md](dependencies.md).
 
 ## Path templates
 
@@ -2132,152 +1739,10 @@ Nothing here makes an `#[embed]` an edge in the build graph: a missing embedded
 file is still a compile error and still triggers nothing. What runs is
 the requirement the dependency declared.
 
-## Selection and the build matrix
+## Selection
 
-A build cell is one artifact × one target × one profile.
-
-Every command that builds, checks, tests, runs or documents cells selects them
-with three options, one per axis:
-
-- `-a, --artifact <pattern>` selects `[artifact.<name>]` entries;
-- `-t, --target <pattern>` selects `[target.<name>]` entries;
-- `-p, --profile <pattern>` selects `[profile.<name>]` entries.
-
-A pattern is an exact name, which must be declared, or a glob in which `*`
-matches any run of characters and `?` any one character, which must match at
-least one entry. Each option repeats, and the axis takes every entry any of its
-patterns names, in declaration order. Artifact names are unique table keys, so
-an artifact's kind never needs naming. `-t native` names the declared target
-matching the host, as an unnamed target axis does. Quote a glob so the shell
-leaves it alone: `-a '*'`. When a value names no entry but does name a file or
-directory in the working directory, the command line reports it as the shell's
-expansion of an unquoted wildcard, with a hint to quote it.
-
-`--all` fills every axis no option names with `*`: `mach build . --all` builds
-every artifact on every target it supports in every profile, and
-`mach test . --all -p debug` does the same in `debug` only.
-
-An axis no option names, without `--all`, takes the manifest's default:
-
-- the target is the [`native` target](#native-target-resolution), or the one a
-  named artifact settles (see [below](#a-named-artifact-can-settle-the-target));
-- the profile is the sole declared one, or the one marked `default = true`;
-- the artifacts are the **default selection** for each selected target: of the
-  artifacts whose `targets` includes it, those marked `default = true` when any is
-  marked, and every one of them when none is. `mach build` and `mach check` take the
-  whole default selection. `mach test` and `mach doc` need one artifact and take the
-  default selection when it holds one; several with none marked are refused.
-  `mach run` takes the sole `bin` the target builds.
-
-No default is chosen by table order: several candidates with none marked are
-refused, naming them.
-
-- `mach build <path>` and `mach check <path>` build and check every selected cell.
-  A selection that spans several profiles plans and runs one profile after another.
-- `mach test <path>` builds a test dispatcher for every selected cell as
-  `mach build` would build the cell, its closure, its `link` entries, its `need` and
-  exported dependency entries, and links the dispatcher in place of its entry. Tests
-  then run once per (target, profile): the tests every selected artifact reaches
-  there are combined, each qualified name running once. Only a target whose `os` and
-  `isa` are the host's runs; every other (target, profile) is built, reported on a
-  `skip` line, and not run, whatever emulation the host has. `--runner <cmd>` runs a
-  foreign target's tests through a command and needs the selection to resolve to one
-  cell. A run in which nothing was runnable exits `1`, so a green run always ran
-  something.
-- `mach run <path>` and `mach doc <path>` consume exactly one cell and refuse a
-  selection that resolves to several, naming them. `mach run` takes no `--all`, and
-  `mach doc` selects with `-a` and `-t` only.
-
-### Enumerated cells are filtered; named ones are not
-
-A cell whose artifact does not list the cell's target is a cell the manifest never
-declared, so a selection that reaches it through a glob skips it. Naming both halves
-of that pair exactly is a different act: `-a kernel -t linux-x86_64` is refused by
-name, because you asked for a cell that does not exist. `-a kernel -t '*'` globs
-the target axis and so filters back to the targets `kernel` declares.
-
-If a selection is well-formed but holds no cell — a `-t` no artifact lists, or
-globs that only pair unsupported cells — it fails naming what it selected, rather
-than succeeding with an empty plan.
-
-### A named artifact can settle the target
-
-`-a <name>` with no `-t` lets the artifact decide, since its `targets` list may
-already leave only one answer:
-
-- exactly one declared target: that target is used, and `-t` would only
-  repeat what the manifest already said. A hosted target that does not match the
-  host is refused instead (see [`native` target resolution](#native-target-resolution))
-- several, one of which matches the host: the host target, as before
-- several, none matching the host: refused, naming the targets the artifact does
-  declare so the choice is visible without opening `mach.toml`
-
-An explicit `-t` always wins, including when it names a target the artifact
-does not list — that pair is still refused by name. This only applies to a named
-artifact: an artifact axis left to the default keeps the target fixed for the whole
-matrix, so a bare `mach build <path>` never widens into a target it was not asked
-for.
-
-### `-o` names one output
-
-`-o` is accepted exactly when the selection resolves to a single (artifact, target,
-profile), and refused otherwise, naming the cells it resolved to. Two artifacts
-collide on one output path the same way two targets or two profiles do: each would
-link over the previous, leaving only the last with no warning. Narrow with `-a`, `-t`
-and `-p`.
-
-`-o` names a canonical path inside the project root, as an artifact's `out` does:
-relative, `/`-separated, with no `.` or `..` component and no empty one.
-`-o ../mach`, `-o ./mach` and `-o /tmp/mach` are refused with `-o must name a
-canonical path inside the project root`, so a build never writes outside the
-tree it was asked to build.
-
-### When one cell fails
-
-Every cell is attempted; a failure does not abandon the ones after it. Each cell's
-diagnostics are reported under its own heading as it happens, and every cell that
-succeeded leaves its artifact on disk at its own path — nothing is rolled back. The
-exit code is `0` when all cells succeeded, and otherwise the code of the worst failure
-among them: `2` when any cell failed internally, else `3` when any failed for the
-environment, and `1` otherwise.
-
-Artifacts cannot share an output path: a manifest whose expanded `out` templates
-collide is rejected before the build starts, and so is a selection spanning
-profiles whose `[project].out` has no `{profile.name}` to keep them apart.
-
-### `native` target resolution
-
-`native` resolves the host's `(isa, os)` against the **declared** targets only —
-never a synthesized tuple, and never a target the host cannot run. Exactly one host
-match is chosen; several matching tuples is an ambiguity error naming the candidates.
-With no match `native` is an error, however many targets are declared and however
-they are marked, and it is raised before any step runs. A declared target that does
-not match the host is built only when `-t` names it:
-
-```
-error[selection.no_host_target]: mach.toml: 'native' matches no declared target: the host is linux-aarch64 and the declared targets are linux-x86_64 (linux-x86_64), windows-x86_64 (windows-x86_64); declare a [target.<name>] for the host or select one with -t
-```
-
-A cross-only project whose targets are hosted (`linux`, `darwin`, `windows`)
-selects its target with `-t`.
-
-With no `-t`, [an artifact can settle the target](#a-named-artifact-can-settle-the-target)
-when its `targets` list leaves one answer. The same rule holds there. An artifact whose
-only target is hosted and does not match the host is refused with
-`selection.no_host_target`, naming the artifact, because building it would be the same
-fallback. An artifact whose only target no host runs as `native` (a `freestanding`
-target, including a finished-module target such as `spirv`) is still pinned to it:
-such a target is never `native`, so naming the artifact selects it explicitly, and a
-host artifact that `need`s it builds it on any host. This path is taken whenever an
-artifact is settled before its target: `mach build` and `mach check` with
-`-a`, `mach run` and `mach test` (which also settle on a sole artifact), and
-editor analysis. A plain `mach build` or `mach check` resolves `native` first and never
-reaches it. A manifest with no `[target.*]` table has the synthesized host
-target. `[target.*] default` is a removed key and is refused: declare a target
-for each host the project builds on, or pass `-t`.
-
-The same rule applies to `[profile.*]` and to `[artifact.*]` when a command
-needs one artifact.
+Which targets, profiles and artifacts a command builds, and how it names its
+outputs, is described in [build.md](build.md).
 
 ## Worked example: a consumer of C bindings and vendored C
 

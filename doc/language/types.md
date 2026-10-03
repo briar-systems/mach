@@ -14,7 +14,7 @@ are stdlib `def`s.
 | Float | `f16`, `f32`, `f64` |
 | Untyped pointer | `ptr` |
 
-These fourteen names are the complete set of compiler-seeded primitive types.
+These names are the complete set of compiler-seeded primitive types.
 
 A **type** may not take one of these names. `rec`, `uni`, `tag`, `def` and a
 generic parameter named after a primitive are refused with `name.builtin_type`,
