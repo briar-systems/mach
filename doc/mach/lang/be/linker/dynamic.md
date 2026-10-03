@@ -72,7 +72,7 @@ sec_base: *u32, atoms: *AtomPlan) err[fail.Fail];
 pub fun has_unresolved_declared_imports(
 modules: *target_of.ObjectImage, module_count: u32,
 sym_locs: *map.Map[intern.StrId, SymbolLoc],
-sec_base: *u32, atoms: *AtomPlan) bool;
+sec_base: *u32, atoms: *AtomPlan) res[bool, fail.Fail];
 ```
 
 whether a declared import the image still references resolves nowhere in it
@@ -149,20 +149,19 @@ seg_offset: u32, target: u64) err[fail.Fail];
 pub fun target_requires_pie(tgt: *lang_target.Target) bool;
 ```
 
-## fun loaderless_request_message
+## fun loader_check
 
 ```mach
-pub fun loaderless_request_message(s: *session.Session, tgt: *lang_target.Target, mode: LinkMode,
-pie: bool, dynamic: bool) str;
+pub fun loader_check(s: *session.Session, tgt: *lang_target.Target, mode: LinkMode,
+pie: bool, dynamic: bool) err[fail.Fail];
 ```
 
-the refusal for a link that needs a loader on an os that maps none, empty
-when the link needs none
+refused when the link needs a loader and the os maps none
 
 ## fun pinned_attribution_message
 
 ```mach
 pub fun pinned_attribution_message(s: *session.Session, sym_name: intern.StrId,
-lib: intern.StrId) str;
+lib: intern.StrId) res[str, fail.Fail];
 ```
 

@@ -202,7 +202,8 @@ pub fun commit_load(prepared: *PreparedLoad) FileId;
 ```
 
 an existing file takes the staged payload in place; a new one lands in the
-slot prepare_load reserved. neither moves any other file
+slot prepare_load reserved. neither moves any other file. total: the staged
+file is the map's own, so its loss stops the compiler
 
 ## fun prepare_release
 

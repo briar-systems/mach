@@ -42,8 +42,10 @@ leaves them for the final link; absent for a mode outside the catalog
 ## fun unknown_link_mode
 
 ```mach
-pub fun unknown_link_mode(s: *session.Session, mode: LinkMode) str;
+pub fun unknown_link_mode(s: *session.Session, mode: LinkMode) fail.Fail;
 ```
+
+the internal failure for a link mode outside the catalog
 
 ## fun mode_needs_loader
 

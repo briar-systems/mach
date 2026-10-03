@@ -154,39 +154,40 @@ pub fun is_personality_reloc(img: *target_of.ObjectImage, r: *target_of.Relocati
 a relocation naming an unwind index entry's personality, which the image
 reaches through a pointer slot as a GOT-kind relocation would
 
+## fun name_intern
+
+```mach
+pub fun name_intern(s: *session.Session, name: str) res[intern.StrId, fail.Fail];
+```
+
+`name` interned in the session's interner, or the refusal that stopped it
+
 ## fun named_message
 
 ```mach
-pub fun named_message(s: *session.Session, prefix: str, name_id: intern.StrId, suffix: str, fallback: str) str;
+pub fun named_message(s: *session.Session, prefix: str, name_id: intern.StrId, suffix: str, unnamed: str) res[str, fail.Fail];
 ```
+
+`prefix`, the name `name_id` reads as, then `suffix`, interned; `unnamed` is
+the text for an input that carries no name
+
+## fun name_text
+
+```mach
+pub fun name_text(s: *session.Session, id: intern.StrId, unnamed: str) str;
+```
+
+the text the name `id` reads as; `unnamed` for an input that carries no name
 
 ## fun oor_section_message
 
 ```mach
-pub fun oor_section_message(s: *session.Session, sym_name: intern.StrId, obj_name: intern.StrId) str;
+pub fun oor_section_message(s: *session.Session, sym_name: intern.StrId, obj_name: intern.StrId) res[str, fail.Fail];
 ```
 
 ## fun dup_message
 
 ```mach
-pub fun dup_message(s: *session.Session, name: intern.StrId) str;
-```
-
-## fun join2
-
-```mach
-pub fun join2(s: *session.Session, a: str, b: str, prefix: str) str;
-```
-
-## fun join3
-
-```mach
-pub fun join3(s: *session.Session, a: str, b: str, c: str, prefix: str) str;
-```
-
-## fun lt_name
-
-```mach
-pub fun lt_name(s: *session.Session, name: str) intern.StrId;
+pub fun dup_message(s: *session.Session, name: intern.StrId) res[str, fail.Fail];
 ```
 

@@ -51,7 +51,7 @@ ret: exit.OK when realized, otherwise the code `exit.of` maps the printed failur
 ## fun pin_command
 
 ```mach
-pub fun pin_command(a: *A.Allocator, root: str, id: str) str;
+pub fun pin_command(a: *A.Allocator, root: str, id: str) res[str, fail.Fail];
 ```
 
 the command that pins and realizes a version-selected dependency with no checkout yet;
@@ -60,7 +60,7 @@ pull's refusal and init's --no-deps hint both name it
 ## fun unpinned_refusal
 
 ```mach
-pub fun unpinned_refusal(a: *A.Allocator, root: str, id: str, version: str) str;
+pub fun unpinned_refusal(a: *A.Allocator, root: str, id: str, version: str) res[str, fail.Fail];
 ```
 
 ## fun add_release

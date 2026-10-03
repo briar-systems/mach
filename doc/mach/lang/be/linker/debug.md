@@ -27,7 +27,7 @@ pub fun module_debug_is_linkable(modules: *target_of.ObjectImage, m: u32) bool;
 ## fun warn_debug_dropped
 
 ```mach
-pub fun warn_debug_dropped(s: *session.Session, diags: *diagnostic.DiagnosticStore, name: intern.StrId);
+pub fun warn_debug_dropped(s: *session.Session, diags: *diagnostic.DiagnosticStore, name: intern.StrId) err[fail.Fail];
 ```
 
 record that a module's debug info is left out of the link, into the store the caller gathers

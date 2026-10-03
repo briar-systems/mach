@@ -198,7 +198,7 @@ ret: ok with `p.config.req_scopes` set; err from output expansion
 ## fun resolve_cascade_libs
 
 ```mach
-pub fun resolve_cascade_libs(p: *project.Project, isa: str, os: str, abi: str,
+pub fun resolve_cascade_libs(p: *project.Project, isa: intern.StrId, os: intern.StrId, abi: intern.StrId,
 own_libs: *manifest.LinkRequirement, own_count: u32) err[fail.Fail];
 ```
 
@@ -299,8 +299,10 @@ pub fun staged_gitlink(s: *session.Session, root: str, id: str) res[opt[str], fa
 ## fun own_work_tree
 
 ```mach
-pub fun own_work_tree(alloc: *A.Allocator, dep_full: str) bool;
+pub fun own_work_tree(alloc: *A.Allocator, dep_full: str) res[bool, fail.Fail];
 ```
+
+whether `dep_full` is a checkout of its own, holding its own `.git`
 
 ## fun checkout_head
 
@@ -367,11 +369,13 @@ fetch the tags of dep/<id>'s checkout when it lacks the one its selection reads:
 ## fun pinned_at_release
 
 ```mach
-pub fun pinned_at_release(s: *session.Session, root: str, id: str, dep_full: str, version: str) bool;
+pub fun pinned_at_release(s: *session.Session, root: str, id: str, dep_full: str, version: str) res[bool, fail.Fail];
 ```
 
 whether dep/<id> is pinned at the release `version` and its checkout is at that pin; a
 checkout drifted from its gitlink is not, whatever release it holds
+whether the checkout at `dep_full` sits at its recorded pin and that pin is the
+release `version`; a directory that is no checkout of its own is not
 
 ## val SLOT_CHECKOUT
 
