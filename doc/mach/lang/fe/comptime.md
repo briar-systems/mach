@@ -581,20 +581,6 @@ pub fun load_walked(c: *ComptimeCtx, did: ast_id.DeclId) bool;
 pub fun mark_load_walked(c: *ComptimeCtx, did: ast_id.DeclId);
 ```
 
-an unbound mark is the stronger fact and survives the walk's own mark
-
-## fun use_unbound
-
-```mach
-pub fun use_unbound(c: *ComptimeCtx, did: ast_id.DeclId) bool;
-```
-
-## fun mark_use_unbound
-
-```mach
-pub fun mark_use_unbound(c: *ComptimeCtx, did: ast_id.DeclId);
-```
-
 ## fun defer_float_width
 
 ```mach
