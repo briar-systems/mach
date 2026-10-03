@@ -601,6 +601,14 @@ pub fun layer_set(c: *ComptimeCtx, stage: Stage, b: *Bindings);
 
 read the bindings `b` an earlier stage made, beneath the scope's own
 
+## fun layer_at
+
+```mach
+pub fun layer_at(c: *ComptimeCtx, stage: Stage) *Bindings;
+```
+
+the bindings of the earlier stage `stage` the scope reads, nil where it reads none
+
 ## fun reader_init
 
 ```mach

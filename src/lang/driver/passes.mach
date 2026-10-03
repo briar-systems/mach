@@ -94,23 +94,33 @@ fun read_definition(raw: ptr, mid: session.ModuleId, phase: sema_context.Definit
         val acquired: res[*fe_sema.SemaResult, fail.Fail] = acquire_sema(p, mid);
         if (sel acquired.err) { ret res[sema_context.Definition, fail.Fail].err{acquired.err}; }
         result.sr = acquired.ok;
-        val scoped: res[*comptime.ComptimeCtx, fail.Fail] = lower_scope_of(project.module_at(p, mid::u32));
+        val scoped: res[*comptime.ComptimeCtx, fail.Fail] = lower_scope_for(p, project.module_at(p, mid::u32));
         if (sel scoped.err) { ret res[sema_context.Definition, fail.Fail].err{scoped.err}; }
         result.ctx = scoped.ok;
     }
     ret res[sema_context.Definition, fail.Fail].ok{result};
 }
 
+# the lowering scope of a module as a definition read sees it: made or brought up to date on a
+# serial path, and only read while lowering workers run
+fun lower_scope_for(p: *project.Project, m: *project.ModuleEntry) res[*comptime.ComptimeCtx, fail.Fail] {
+    if (p.lowering_workers) { ret lower_scope_of(m); }
+    val prepared: err[fail.Fail] = lower_scope_prepare(m);
+    if (sel prepared.err) { ret res[*comptime.ComptimeCtx, fail.Fail].err{prepared.err}; }
+    ret res[*comptime.ComptimeCtx, fail.Fail].ok{?m.lower_scope};
+}
+
 # the scope lowering binds a module's constants in, over what the load, resolve and sema bound
-# over it; made on first use, it keeps what lowering bound for as long as the module's syntax stands
-pub fun lower_scope_of(m: *project.ModuleEntry) res[*comptime.ComptimeCtx, fail.Fail] {
+# over it, made on the first call and kept for as long as the module's syntax stands; each call
+# sets the layers to the module's current products, so it runs only where nothing else reads them
+pub fun lower_scope_prepare(m: *project.ModuleEntry) err[fail.Fail] {
     if (!m.lower_scoped) {
         m.lower_scope = comptime.stage_init(?m.load.ctx, comptime.STAGE_LOWER, m.load.ctx.own.alloc);
         if (m.a != nil) {
             val prepared: err[fail.Fail] = comptime.prepare_gates(?m.lower_scope, m.a.expr_len::u32);
             if (sel prepared.err) {
                 comptime.dnit(?m.lower_scope);
-                ret res[*comptime.ComptimeCtx, fail.Fail].err{prepared.err};
+                ret prepared;
             }
         }
         m.lower_scoped = true;
@@ -118,6 +128,17 @@ pub fun lower_scope_of(m: *project.ModuleEntry) res[*comptime.ComptimeCtx, fail.
     comptime.layer_set(?m.lower_scope, comptime.STAGE_LOAD, ?m.load.ctx.own);
     if (m.resolve_result != nil) { comptime.layer_set(?m.lower_scope, comptime.STAGE_RESOLVE, ?m.resolve_result.constants); }
     if (m.sema_result != nil)    { comptime.layer_set(?m.lower_scope, comptime.STAGE_SEMA, ?m.sema_result.constants); }
+    ret err[fail.Fail].ok{};
+}
+
+# the lowering scope `lower_scope_prepare` made, read without writing it: a scope that was never
+# made, or whose layers are not the module's current products, is a defect of the caller
+pub fun lower_scope_of(m: *project.ModuleEntry) res[*comptime.ComptimeCtx, fail.Fail] {
+    if (!m.lower_scoped) { ret res[*comptime.ComptimeCtx, fail.Fail].err{fail.message("lower: a module's lowering scope was read before it was prepared")}; }
+    var current: bool = comptime.layer_at(?m.lower_scope, comptime.STAGE_LOAD) == ?m.load.ctx.own;
+    if (m.resolve_result != nil) { current = current && comptime.layer_at(?m.lower_scope, comptime.STAGE_RESOLVE) == ?m.resolve_result.constants; }
+    if (m.sema_result != nil)    { current = current && comptime.layer_at(?m.lower_scope, comptime.STAGE_SEMA) == ?m.sema_result.constants; }
+    if (!current)                { ret res[*comptime.ComptimeCtx, fail.Fail].err{fail.message("lower: a module's lowering scope does not read its current products")}; }
     ret res[*comptime.ComptimeCtx, fail.Fail].ok{?m.lower_scope};
 }
 
@@ -839,6 +860,9 @@ fun acquire_frontend_inputs(p: *project.Project) err[fail.Fail] {
         }
         val acquired: res[sema_context.Definition, fail.Fail] = read_definition(p::ptr, p.topo[i], sema_context.DEFINITION_TYPED);
         if (sel acquired.err) { ret err[fail.Fail].err{acquired.err}; }
+        # every lowering scope is made here, before any worker reads one
+        val scoped: err[fail.Fail] = lower_scope_prepare(project.module_at(p, p.topo[i]::u32));
+        if (sel scoped.err) { ret scoped; }
         i = i + 1;
     }
     ret err[fail.Fail].ok{};
@@ -1213,7 +1237,7 @@ fun lower_raw(p: *project.Project, mid: session.ModuleId, home: *me_ir.ModuleHom
     if (sel captured.err) { ret res[*me_ir.Module, fail.Fail].err{captured.err}; }
     var deps: fe_sema.SemaDeps = captured.ok;
     fin { free_sema_deps_query(p.s.alloc, ?deps); }
-    val scoped: res[*comptime.ComptimeCtx, fail.Fail] = lower_scope_of(m);
+    val scoped: res[*comptime.ComptimeCtx, fail.Fail] = lower_scope_for(p, m);
     if (sel scoped.err) { ret res[*me_ir.Module, fail.Fail].err{scoped.err}; }
     val req_r: res[me_lower.LowerRequest, fail.Fail] = me_lower.request(s, ?p.target.target, ?home.alloc, m.a, m.fqn, mid,
         m.sema_result, m.resolve_result, scoped.ok, normal, shared_artifact_build(p), p.req.debug, p.req.opt != pipeline.OPT_RELEASE, diags, ?deps);
@@ -1546,6 +1570,8 @@ fun run_lower_batch(p: *project.Project, slots: *PlwSlot, emit_len: u32) err[fai
     val t_opt:   readout.Instant     = readout.span_begin(p.progress);
     var threads: *sync_thread.Thread = nil;
     val extra:   u32                 = nworkers - 1;
+    p.lowering_workers = true;
+    fin { p.lowering_workers = false; }
     if (extra > 0) {
         val rt: res[*sync_thread.Thread, A.Error] = A.allocate[sync_thread.Thread](p.alloc, extra::usize);
         if (sel rt.err) {
