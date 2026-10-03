@@ -21,13 +21,13 @@ pub fun dnit(stream: *TokenStream, alloc: *A.Allocator);
 ## fun doc_run_above
 
 ```mach
-pub fun doc_run_above(stream: *TokenStream, decl_offset: usize) token.Span;
+pub fun doc_run_above(stream: *TokenStream, decl_offset: usize) lang_source.Span;
 ```
 
 ## fun leading_run
 
 ```mach
-pub fun leading_run(stream: *TokenStream) token.Span;
+pub fun leading_run(stream: *TokenStream) lang_source.Span;
 ```
 
 the comment run that opens the file, when nothing but layout comes before it
@@ -37,24 +37,4 @@ the comment run that opens the file, when nothing but layout comes before it
 ```mach
 pub fun emit_diagnostics(stream: *TokenStream, diags: *diagnostic.DiagnosticStore) err[fail.Fail];
 ```
-
-## fun is_ident_start
-
-```mach
-pub fun is_ident_start(c: u8) bool;
-```
-
-## fun is_ident_char
-
-```mach
-pub fun is_ident_char(c: u8) bool;
-```
-
-## fun is_identifier
-
-```mach
-pub fun is_identifier(text: str, len: usize) bool;
-```
-
-`text[0..len]` lexes as exactly one identifier token; keywords lex as identifiers too
 

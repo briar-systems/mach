@@ -1517,7 +1517,7 @@ same store the front-end passes of the module wrote; owned by the caller
 ## fun reject
 
 ```mach
-pub fun reject(diags: *diagnostic.DiagnosticStore, k: diagnostic_kind.Kind, loc: lang_source.SrcLoc, text: str) fail.Fail;
+pub fun reject(diags: *diagnostic.DiagnosticStore, k: diagnostic_kind.Kind, loc: lang_source.Location, text: str) fail.Fail;
 ```
 
 a backend pass rejects the program through the shared located refusal
@@ -1525,7 +1525,7 @@ a backend pass rejects the program through the shared located refusal
 ## fun refusal_loc
 
 ```mach
-pub fun refusal_loc(f: *MirFunction, mi: *MirInstr) lang_source.SrcLoc;
+pub fun refusal_loc(f: *MirFunction, mi: *MirInstr) lang_source.Location;
 ```
 
 the location a refusal of `mi` in `f` reports: the instruction's own when it
