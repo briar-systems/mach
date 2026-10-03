@@ -14,9 +14,17 @@ a count the loop does not change is loop-invariant and licm hoists it with
 the and. the mark is recomputed from scratch on each run, so it never
 outlives its proof, and a count this pass saturated proves on a later run
 
+## val PASS
+
+```mach
+pub val PASS: pass.Pass = pass.Pass;
+```
+
+the pass the pipeline schedules
+
 ## fun run_in
 
 ```mach
-pub fun run_in(m: *me_ir.Module, workspace: *scratch.Workspace) res[bool, fail.Fail];
+pub fun run_in(ctx: *pass.Context) res[bool, fail.Fail];
 ```
 

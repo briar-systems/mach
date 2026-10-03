@@ -26,15 +26,31 @@ lets the callee take over the caller's frame.
 a debug annotation of a call's result is dropped with the call, so the
 variable reads as optimized out there; -g annotates and never decides
 
+## val RECURSE
+
+```mach
+pub val RECURSE: pass.Pass = pass.Pass;
+```
+
+self tail recursion becoming a loop, as the pipeline schedules it
+
+## val MARK
+
+```mach
+pub val MARK: pass.Pass = pass.Pass;
+```
+
+the flagging of calls in tail position, as the pipeline schedules it
+
 ## fun recurse_in
 
 ```mach
-pub fun recurse_in(m: *me_ir.Module, workspace: *scratch.Workspace) res[bool, fail.Fail];
+pub fun recurse_in(ctx: *pass.Context) res[bool, fail.Fail];
 ```
 
 ## fun mark_in
 
 ```mach
-pub fun mark_in(m: *me_ir.Module, workspace: *scratch.Workspace) res[bool, fail.Fail];
+pub fun mark_in(ctx: *pass.Context) res[bool, fail.Fail];
 ```
 

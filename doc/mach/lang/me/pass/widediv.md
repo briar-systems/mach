@@ -13,9 +13,17 @@ generic instantiation does. a divisor of zero yields an all-ones quotient
 and the dividend as remainder, the RISC-V convention, rather than a trap:
 a helper cannot raise the target's divide fault
 
-## fun run
+## val PASS
 
 ```mach
-pub fun run(m: *me_ir.Module, tgt: *lang_target.Target, itn: *intern.Interner) res[bool, fail.Fail];
+pub val PASS: pass.Pass = pass.Pass;
+```
+
+the pass the pipeline schedules
+
+## fun run_in
+
+```mach
+pub fun run_in(ctx: *pass.Context) res[bool, fail.Fail];
 ```
 

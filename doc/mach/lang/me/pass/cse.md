@@ -1,8 +1,16 @@
 # mach.lang.me.pass.cse
 
+## val PASS
+
+```mach
+pub val PASS: pass.Pass = pass.Pass;
+```
+
+the pass the pipeline schedules
+
 ## fun run_in
 
 ```mach
-pub fun run_in(m: *me_ir.Module, workspace: *scratch.Workspace) res[bool, fail.Fail];
+pub fun run_in(ctx: *pass.Context) res[bool, fail.Fail];
 ```
 
