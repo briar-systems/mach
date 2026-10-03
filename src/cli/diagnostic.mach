@@ -38,12 +38,14 @@ use mach.lang.diagnostic;
 use diagnostic_kind: mach.lang.diagnostic.kind;
 use mach.lang.driver;
 use mach.lang.driver.project;
+use mach.lang.duration;
 use mach.lang.manifest;
 use package_report: mach.lang.package.report;
 use mach.lang.readout;
 use mach.lang.session;
 use lang_source: mach.lang.source;
 use target_of:   mach.lang.target.of;
+use mach.lang.validation;
 
 val MAX_SPAN_LINES: usize = 10;
 
@@ -986,24 +988,46 @@ fun summary_w(w: *io_writer.Writer, ev: *readout.Summary) {
     }
 }
 
-# a build's events rendered to the report's stream the moment each arrives.
-# human text renders unit banners, phase rows, items, the unit summary,
-# failures and diagnostics, and readout_close writes the closing tally; json
-# renders each diagnostic and each failure as one record
+# every command's events rendered the moment each arrives: the renderer of the
+# readout contract (doc/language/readout.md). the report's stream, stderr,
+# carries the build: human text renders unit banners, phase rows, items, the
+# unit summary, failures and diagnostics, and readout_close writes the closing
+# tally; json renders each diagnostic and failure as a record, and under -v
+# each unit, phase row, item and unit summary as unit, phase and phase_item
+# records. the run's stream, stdout, carries a test run: human text
+# renders each test as it finishes, a module's roll-up once its last test has,
+# and the closing summary; json renders the events of `mach test --format json`.
+# under json diagnostics each finished test is also a record on the report's
+# stream
 # ---
-# sink:  what the engine is given; its ctx is this record, which must not move
-# units: the plan's unit count; a banner prints only when it is more than one
-# quiet: `--quiet`, which suppresses the banners
-# tally: the human tally, counted as the events pass
+# sink:   what the engine and the test runner are given; its ctx is this record, which must not move
+# r:      the command's report
+# units:  the plan's unit count; a banner prints only when it is more than one
+# quiet:  `--quiet`, which suppresses the banners
+# tally:  the human tally, counted as the events pass
+# stream: how a test run renders on out
+# out:    where a test run renders, stdout
+# run:    the running test run's results, from its run_start to its run_end
+# count:  how many results run holds
+# runner: the command each test is launched through, or nil
+# mod_w:  the module column's width
+# name_w: the test column's width
 pub rec Readout {
-    sink:  readout.Sink;
-    r:     *Report;
-    units: usize;
-    quiet: bool;
-    tally: Tally;
+    sink:   readout.Sink;
+    r:      *Report;
+    units:  usize;
+    quiet:  bool;
+    tally:  Tally;
+    stream: Format;
+    out:    io_writer.Writer;
+    run:    *readout.TestResult;
+    count:  u32;
+    runner: str;
+    mod_w:  usize;
+    name_w: usize;
 }
 
-# start rendering a plan's events to r
+# start rendering a command's events to r, a test run in human text to stdout
 # ---
 # rd:    the renderer, initialised in place since its sink points at it
 # r:     the command's report
@@ -1018,25 +1042,42 @@ pub fun readout_init(rd: *Readout, r: *Report, units: usize, quiet: bool, level:
     rd.units         = units;
     rd.quiet         = quiet;
     rd.tally         = Tally{errors: 0, warnings: 0, rendered: 0};
+    rd.stream        = FORMAT_HUMAN;
+    rd.out           = fs.writer(fs.STDOUT);
+    rd.run           = nil;
+    rd.count         = 0;
+    rd.runner        = nil;
+    rd.mod_w         = 0;
+    rd.name_w        = 0;
 }
 
 fun readout_on_event(ctx: ptr, ev: *readout.Event) {
     val rd: *Readout = ctx::*Readout;
-    val r:  *Report  = rd.r;
-    if (r.format == FORMAT_JSON) {
-        if (sel ev.failure) { report_failure(r, ev.failure.fail, ev.failure.origin); }
-        or (sel ev.diagnostics) {
-            val pb: *PathBase = report_paths(r);
-            if (pb == nil) {
-                var oom: fail.Fail = fail.message("out of memory");
-                report_failure(r, ?oom, diagnostic.ORIGIN_NONE);
-                ret;
-            }
-            render_store_json(r, ev.diagnostics.sources, ev.diagnostics.diags, pb);
-        }
+    if (sel ev.run_start) {
+        run_begin(rd, ?ev.run_start);
+        if (rd.stream == FORMAT_JSON) { event_run_start(?rd.out, ?ev.run_start); }
         ret;
     }
-    val w: *io_writer.Writer = ?r.w;
+    if (sel ev.test_end) {
+        val t: *readout.TestResult = ?ev.test_end.tests[ev.test_end.at];
+        if (rd.stream == FORMAT_JSON) { event_test(?rd.out, t); }
+        or                            { test_human(rd, ev.test_end.at); }
+        report_test(rd.r, t.art, result_name(?t.result)::str, t.code::i64);
+        ret;
+    }
+    if (sel ev.run_end) {
+        if (rd.stream == FORMAT_JSON) { event_run_end(?rd.out, ?ev.run_end); }
+        or                            { run_summary_w(?rd.out, ?ev.run_end); }
+        rd.run   = nil;
+        rd.count = 0;
+        ret;
+    }
+    if (rd.r.format == FORMAT_JSON) { readout_json(rd, ev); }
+    or                              { readout_human(rd, ev); }
+}
+
+fun readout_human(rd: *Readout, ev: *readout.Event) {
+    val w: *io_writer.Writer = ?rd.r.w;
     if (sel ev.unit) {
         if (!rd.quiet && rd.units > 1) { unit_banner_w(w, ?ev.unit); }
     }
@@ -1055,6 +1096,30 @@ fun readout_on_event(ctx: ptr, ev: *readout.Event) {
     }
 }
 
+# the json member: a record for each event the human text renders a line for,
+# each written as its event arrives. under -v every unit opens with a unit
+# record naming its artifact, target and profile, which the text shows only as
+# a banner for several units and a header for several profiles
+fun readout_json(rd: *Readout, ev: *readout.Event) {
+    val r: *Report = rd.r;
+    if (sel ev.failure) { report_failure(r, ev.failure.fail, ev.failure.origin); }
+    or (sel ev.diagnostics) {
+        val pb: *PathBase = report_paths(r);
+        if (pb == nil) {
+            var oom: fail.Fail = fail.message("out of memory");
+            report_failure(r, ?oom, diagnostic.ORIGIN_NONE);
+            ret;
+        }
+        render_store_json(r, ev.diagnostics.sources, ev.diagnostics.diags, pb);
+    }
+    or (sel ev.unit) {
+        if (rd.sink.level >= readout.LEVEL_PHASES) { unit_record(?r.w, ?ev.unit); }
+    }
+    or (sel ev.phase)   { phase_record(?r.w, ?ev.phase); }
+    or (sel ev.item)    { item_record(?r.w, ?ev.item); }
+    or (sel ev.summary) { summary_record(r, ?ev.summary); }
+}
+
 # close a plan's rendering: one summary line under human text closes every
 # failure and diagnostic the plan rendered, a failure record printed as its own
 # `error:` line (an encoder or rules refusal that reached no store) counted in it
@@ -1064,6 +1129,357 @@ pub fun readout_close(rd: *Readout) {
     if (rd.r.format == FORMAT_JSON || rd.tally.rendered == 0) { ret; }
     std_format.write_str(?rd.r.w, "\n");
     emit_summary(?rd.r.w, rd.tally.errors, rd.tally.warnings);
+}
+
+# a duration as the integer microseconds a record carries
+fun micros(d: chrono_duration.Duration) i64 {
+    ret chrono_duration.duration_nsec(d) / 1000;
+}
+
+fun unit_record(w: *io_writer.Writer, ev: *readout.Unit) {
+    var o: json.Object;
+    json.object_begin(w, ?o);
+    json.field_i64(?o, "schema", SCHEMA_VERSION);
+    json.field_str(?o, "record", "unit");
+    json.field_str(?o, "verb", ev.verb);
+    if (ev.has_artifact)        { json.field_str(?o, "artifact", ev.artifact); }
+    or                          { json.field_null(?o, "artifact"); }
+    if (!str_empty(ev.target))  { json.field_str(?o, "target", ev.target); }
+    if (!str_empty(ev.profile)) { json.field_str(?o, "profile", ev.profile); }
+    json.object_end(?o);
+}
+
+fun phase_record(w: *io_writer.Writer, ev: *readout.PhaseEnd) {
+    var noun: str = ev.noun_many;
+    if (ev.count == 1) { noun = ev.noun_one; }
+    var o: json.Object;
+    json.object_begin(w, ?o);
+    json.field_i64(?o, "schema", SCHEMA_VERSION);
+    json.field_str(?o, "record", "phase");
+    json.field_str(?o, "name", readout.label_of(ev.phase));
+    json.field_i64(?o, "count", ev.count::i64);
+    json.field_str(?o, "unit", noun);
+    json.field_i64(?o, "time_us", micros(ev.elapsed));
+    if (ev.workers > 1) { json.field_i64(?o, "threads", ev.workers::i64); }
+    if (ev.dropped > 0) { json.field_i64(?o, "dropped", ev.dropped::i64); }
+    if (ev.slowest != nil) {
+        json.field_str(?o, "slowest", ev.slowest);
+        json.field_i64(?o, "slowest_us", micros(ev.slowest_elapsed));
+    }
+    json.object_end(?o);
+}
+
+fun item_record(w: *io_writer.Writer, ev: *readout.Item) {
+    var o: json.Object;
+    json.object_begin(w, ?o);
+    json.field_i64(?o, "schema", SCHEMA_VERSION);
+    json.field_str(?o, "record", "phase_item");
+    json.field_str(?o, "phase", readout.label_of(ev.phase));
+    json.field_str(?o, "name", ev.name);
+    json.field_i64(?o, "time_us", micros(ev.elapsed));
+    json.object_end(?o);
+}
+
+# a unit's summary: its `other` row as a phase record without a count, and its
+# `built` line kept for the closing summary record
+fun summary_record(r: *Report, ev: *readout.Summary) {
+    var o: json.Object;
+    json.object_begin(?r.w, ?o);
+    json.field_i64(?o, "schema", SCHEMA_VERSION);
+    json.field_str(?o, "record", "phase");
+    json.field_str(?o, "name", "other");
+    json.field_i64(?o, "time_us", micros(ev.other));
+    json.object_end(?o);
+    report_built(r, ev);
+}
+
+# the column widths of a run's human rendering, from its tests' names
+fun run_begin(rd: *Readout, ev: *readout.RunStart) {
+    rd.run    = ev.tests;
+    rd.count  = ev.count;
+    rd.runner = ev.runner;
+    rd.mod_w  = 0;
+    rd.name_w = 0;
+    var i: u32 = 0;
+    for (i < ev.count) {
+        val ml: usize = str_len(ev.tests[i].art.module);
+        val nl: usize = str_len(ev.tests[i].art.name);
+        if (ml > rd.mod_w)  { rd.mod_w = ml; }
+        if (nl > rd.name_w) { rd.name_w = nl; }
+        i = i + 1;
+    }
+    rd.mod_w  = clamp_width(rd.mod_w, 16, 48);
+    rd.name_w = clamp_width(rd.name_w, 24, 72);
+}
+
+fun clamp_width(w: usize, least: usize, most: usize) usize {
+    var c: usize = w;
+    if (c < least) { c = least; }
+    if (c > most)  { c = most; }
+    ret c + 2;
+}
+
+# a finished test in human text, in the order the tests finish: under -v its own
+# line, otherwise its module's roll-up once every test of the module's run has
+# finished, so a slow test holds back only its own module
+fun test_human(rd: *Readout, at: u32) {
+    val w: *io_writer.Writer   = ?rd.out;
+    val t: *readout.TestResult = ?rd.run[at];
+    if (rd.sink.level >= readout.LEVEL_PHASES) {
+        test_line_w(w, t, rd.name_w, rd.runner);
+        ret;
+    }
+    val mod_name: str = t.art.module;
+    var first:    u32 = at;
+    for (first > 0 && str_equals(rd.run[first - 1].art.module, mod_name)) { first = first - 1; }
+    var last: u32 = at;
+    for (last + 1 < rd.count && str_equals(rd.run[last + 1].art.module, mod_name)) { last = last + 1; }
+    var j: u32 = first;
+    for (j <= last) {
+        if (!rd.run[j].done) { ret; }
+        j = j + 1;
+    }
+    module_run_w(w, rd.run, first, last, rd.mod_w, rd.runner);
+}
+
+fun module_run_w(w: *io_writer.Writer, tests: *readout.TestResult, first: u32, last: u32, mod_w: usize, runner: str) {
+    var ok:      u32                      = 0;
+    var failed:  u32                      = 0;
+    var elapsed: chrono_duration.Duration = 0;
+    var j:       u32                      = first;
+    for (j <= last) {
+        if (tests[j].result.kind == validation.RESULT_PASS) { ok = ok + 1; }
+        or                                                  { failed = failed + 1; }
+        elapsed = elapsed + tests[j].elapsed;
+        j       = j + 1;
+    }
+    col_w(w, tests[first].art.module, mod_w);
+    if (failed > 0) { std_format.format(w, "{:4} ok  {:4} FAIL", ok::i64, failed::i64); }
+    or              { std_format.format(w, "{:4} ok", ok::i64); }
+    dur_w(w, elapsed);
+    std_format.write_str(w, "\n");
+    if (failed == 0) { ret; }
+    j = first;
+    for (j <= last) {
+        val t: *readout.TestResult = ?tests[j];
+        if (t.result.kind != validation.RESULT_PASS) {
+            std_format.format(w, "  FAIL  {}  {}:{}  ", t.art.name, t.art.file, t.art.line::i64);
+            reason_w(w, t);
+            std_format.write_str(w, "\n");
+            captured_w(w, t);
+            pointers_w(w, t, runner);
+        }
+        j = j + 1;
+    }
+}
+
+fun test_line_w(w: *io_writer.Writer, t: *readout.TestResult, name_w: usize, runner: str) {
+    if (t.result.kind == validation.RESULT_PASS) {
+        std_format.write_str(w, "ok    ");
+        col_w(w, t.art.name, name_w);
+        dur_w(w, t.elapsed);
+        std_format.write_str(w, "\n");
+        captured_w(w, t);
+        ret;
+    }
+    std_format.write_str(w, "FAIL  ");
+    col_w(w, t.art.name, name_w);
+    dur_w(w, t.elapsed);
+    std_format.write_str(w, "  ");
+    reason_w(w, t);
+    std_format.format(w, "  {}:{}\n", t.art.file, t.art.line::i64);
+    captured_w(w, t);
+    pointers_w(w, t, runner);
+}
+
+# where a failed test's full output is and how to rerun it alone
+fun pointers_w(w: *io_writer.Writer, t: *readout.TestResult, runner: str) {
+    if (t.truncated && t.log != nil) { std_format.format(w, "    full output: {}\n", t.log); }
+    std_format.write_str(w, "    rerun: ");
+    if (runner != nil) {
+        std_format.write_str(w, runner);
+        std_format.write_str(w, " ");
+    }
+    std_format.format(w, "{} {}\n", t.art.exe::str, t.art.idx::i64);
+}
+
+fun col_w(w: *io_writer.Writer, s: str, width: usize) {
+    std_format.write_str(w, s);
+    var pad: usize = 2;
+    val l:   usize = str_len(s);
+    if (l + 2 < width) { pad = width - l; }
+    emit_spaces(w, pad);
+}
+
+fun dur_w(w: *io_writer.Writer, elapsed: chrono_duration.Duration) {
+    var dbuf: [DUR_CAP]u8;
+    val ds:   str   = chrono_duration.format_duration(elapsed, ?dbuf[0], DUR_CAP);
+    val l:    usize = str_len(ds);
+    std_format.write_str(w, "  ");
+    if (l < 7) { emit_spaces(w, 7 - l); }
+    std_format.write_str(w, ds);
+}
+
+fun reason_w(w: *io_writer.Writer, t: *readout.TestResult) {
+    val r: *validation.ValidationGateResult = ?t.result;
+    if (r.kind == validation.RESULT_RESOURCE_EXHAUSTION && r.cause == validation.CAUSE_ORACLE_TIMEOUT) {
+        val d: duration.Text = duration.text(t.bound);
+        std_format.format(w, "(timed out after {}{})", d.n, d.unit);
+    }
+    or (r.kind == validation.RESULT_SEMANTIC_MISMATCH && r.cause == validation.CAUSE_ORACLE_EXIT) {
+        std_format.format(w, "(exit {})", t.code::i64);
+    }
+    or (r.kind == validation.RESULT_SEMANTIC_MISMATCH && r.cause == validation.CAUSE_ORACLE_SIGNAL) {
+        std_format.format(w, "(signal {})", t.code::i64);
+    }
+    or (r.kind == validation.RESULT_INFRASTRUCTURE_FAILURE && r.cause == validation.CAUSE_ORACLE_SPAWN_FAILURE) {
+        std_format.write_str(w, "(spawn failed)");
+    }
+    or (r.kind == validation.RESULT_INFRASTRUCTURE_FAILURE && r.cause == validation.CAUSE_ORACLE_CAPTURE) {
+        std_format.write_str(w, "(capture failed)");
+    }
+    or (r.kind == validation.RESULT_INFRASTRUCTURE_FAILURE && r.cause == validation.CAUSE_INVALID_TERMINAL) {
+        std_format.write_str(w, "(runner failed)");
+    }
+    or { std_format.write_str(w, "(failed)"); }
+}
+
+# a test's captured output, each line indented under it
+fun captured_w(w: *io_writer.Writer, t: *readout.TestResult) {
+    if (t.out == nil || t.out_len == 0) {
+        if (t.truncated) { std_format.write_str(w, "    ... (output truncated)\n"); }
+        ret;
+    }
+    var i:   usize = 0;
+    var seg: usize = 0;
+    for (i < t.out_len) {
+        if (t.out[i] == '\n') {
+            std_format.write_str(w, "    ");
+            std_format.write_bytes(w, (t.out::usize + seg)::*u8, i - seg + 1);
+            seg = i + 1;
+        }
+        i = i + 1;
+    }
+    if (seg < t.out_len) {
+        std_format.write_str(w, "    ");
+        std_format.write_bytes(w, (t.out::usize + seg)::*u8, t.out_len - seg);
+        std_format.write_newline(w);
+    }
+    if (t.truncated) { std_format.write_str(w, "    ... (output truncated)\n"); }
+}
+
+# the closing summary: every failure re-listed in collection order, whatever
+# order the tests finished in, then the counts
+fun run_summary_w(w: *io_writer.Writer, ev: *readout.RunEnd) {
+    if (ev.count > 0) { std_format.write_str(w, "\n"); }
+    if (ev.failed > 0) {
+        std_format.write_str(w, "failures:\n");
+        var i: u32 = 0;
+        for (i < ev.count) {
+            val t: *readout.TestResult = ?ev.tests[i];
+            if (t.result.kind != validation.RESULT_PASS) {
+                std_format.format(w, "  {}  {}:{}  ", t.art.name, t.art.file, t.art.line::i64);
+                reason_w(w, t);
+                std_format.write_str(w, "\n");
+            }
+            i = i + 1;
+        }
+        std_format.write_str(w, "\n");
+    }
+    var dbuf: [DUR_CAP]u8;
+    val ds:   str = chrono_duration.format_duration(ev.wall, ?dbuf[0], DUR_CAP);
+    if (ev.timed_out > 0) {
+        std_format.format(w, "{} passed, {} failed ({} timed out), {} total  ({})\n",
+            ev.passed::i64, ev.failed::i64, ev.timed_out::i64, ev.count::i64, ds);
+    }
+    or {
+        std_format.format(w, "{} passed, {} failed, {} total  ({})\n", ev.passed::i64, ev.failed::i64, ev.count::i64, ds);
+    }
+    val tally:       *outcome.GateTally = ev.tally;
+    val extra_infra: u32                = tally.unsupported_input + tally.tool_unavailable
+        + tally.resource_exhaustion + tally.invalid_injection;
+    if (extra_infra > 0) {
+        std_format.format(w, "  unsupported {}, target unavailable {}, resource exhaustion {}, invalid injection {}\n",
+            tally.unsupported_input::i64, tally.tool_unavailable::i64,
+            tally.resource_exhaustion::i64, tally.invalid_injection::i64);
+    }
+}
+
+# the version every event of `mach test --format json` carries in `schema`
+val EVENT_SCHEMA_VERSION: i64 = 2;
+
+# open one event of `mach test --format json` on w
+# ---
+# w:     the run's stream
+# o:     the event's object
+# event: the event's name
+pub fun event_begin(w: *io_writer.Writer, o: *json.Object, event: *u8) {
+    json.object_begin(w, o);
+    json.field_i64(o, "schema", EVENT_SCHEMA_VERSION);
+    json.field_str(o, "event", event);
+}
+
+fun event_run_start(w: *io_writer.Writer, ev: *readout.RunStart) {
+    var o: json.Object;
+    event_begin(w, ?o, "run_start");
+    json.field_i64(?o, "tests", ev.count::i64);
+    json.object_end(?o);
+}
+
+fun event_test(w: *io_writer.Writer, t: *readout.TestResult) {
+    val art: *outcome.TestArtifact = t.art;
+    var o:   json.Object;
+    event_begin(w, ?o, "test");
+    json.field_str(?o, "name", art.name);
+    json.field_str(?o, "module", art.module);
+    json.field_str(?o, "file", art.file);
+    json.field_i64(?o, "line", art.line::i64);
+    json.field_str(?o, "kind", result_name(?t.result));
+    json.field_i64(?o, "code", t.code::i64);
+    json.field_i64(?o, "timeout_ns", chrono_duration.duration_nsec(t.bound));
+    json.field_i64(?o, "duration_ns", chrono_duration.duration_nsec(t.elapsed));
+    json.field_i64(?o, "index", art.idx::i64);
+    json.field_str(?o, "exe", art.exe);
+    json.field_str_or_null(?o, "target", art.target);
+    json.field_str_or_null(?o, "profile", art.profile);
+    if (has_capture(?t.result)) { json.field_str_or_null(?o, "output", t.log); }
+    or                          { json.field_null(?o, "output"); }
+    json.object_end(?o);
+}
+
+fun event_run_end(w: *io_writer.Writer, ev: *readout.RunEnd) {
+    var o: json.Object;
+    event_begin(w, ?o, "summary");
+    json.field_i64(?o, "passed", ev.passed::i64);
+    json.field_i64(?o, "failed", ev.failed::i64);
+    json.field_i64(?o, "total", ev.count::i64);
+    json.field_i64(?o, "duration_ns", chrono_duration.duration_nsec(ev.wall));
+    json.field_i64(?o, "mismatch", ev.tally.semantic_mismatch::i64);
+    json.field_i64(?o, "unsupported", ev.tally.unsupported_input::i64);
+    json.field_i64(?o, "target_unavailable", ev.tally.tool_unavailable::i64);
+    json.field_i64(?o, "infrastructure_failure", ev.tally.infrastructure_failure::i64);
+    json.field_i64(?o, "resource_exhaustion", ev.tally.resource_exhaustion::i64);
+    json.field_i64(?o, "timed_out", ev.timed_out::i64);
+    json.field_i64(?o, "invalid_injection", ev.tally.invalid_injection::i64);
+    json.object_end(?o);
+}
+
+# the outcome a test record and event name: `pass`, `exit`, `signal`, `spawn`,
+# `timeout`, or `other`
+pub fun result_name(r: *validation.ValidationGateResult) *u8 {
+    if (r.kind == validation.RESULT_PASS)                                                                       { ret "pass"; }
+    if (r.kind == validation.RESULT_SEMANTIC_MISMATCH && r.cause == validation.CAUSE_ORACLE_EXIT)               { ret "exit"; }
+    if (r.kind == validation.RESULT_SEMANTIC_MISMATCH && r.cause == validation.CAUSE_ORACLE_SIGNAL)             { ret "signal"; }
+    if (r.kind == validation.RESULT_INFRASTRUCTURE_FAILURE && r.cause == validation.CAUSE_ORACLE_SPAWN_FAILURE) { ret "spawn"; }
+    if (r.kind == validation.RESULT_RESOURCE_EXHAUSTION && r.cause == validation.CAUSE_ORACLE_TIMEOUT)          { ret "timeout"; }
+    ret "other";
+}
+
+# whether a result kept output worth pointing at
+pub fun has_capture(r: *validation.ValidationGateResult) bool {
+    if (r.kind == validation.RESULT_SEMANTIC_MISMATCH)   { ret true; }
+    if (r.kind == validation.RESULT_RESOURCE_EXHAUSTION) { ret true; }
+    ret r.kind == validation.RESULT_INFRASTRUCTURE_FAILURE && r.cause != validation.CAUSE_ORACLE_SPAWN_FAILURE;
 }
 
 # how a command writes its diagnostics to stderr: `--diagnostics=human`, the
@@ -1096,6 +1512,7 @@ pub fun format_named(name: str) opt[Format] {
 # notes:    the note records written
 # made:     whether the arena record paths are built in, and the base they are
 #           measured from, have been made; they are on first use
+# built:    under json, each unit's `built` line, which the summary record carries
 pub rec Report {
     format:   Format;
     w:        io_writer.Writer;
@@ -1108,6 +1525,17 @@ pub rec Report {
     ar:       arena.Arena;
     a:        A.Allocator;
     pb:       PathBase;
+    built:    Vector[Built];
+}
+
+# a unit's `built` line as the summary record keeps it: the output, its modules,
+# its size when it is one file, and the unit's wall time
+rec Built {
+    out:      str;
+    modules:  u32;
+    bytes:    usize;
+    has_size: bool;
+    total:    chrono_duration.Duration;
 }
 
 # start a report in place; it holds its own arena, so it stays where it was made
@@ -1123,6 +1551,7 @@ pub fun report_init(r: *Report, format: Format) {
     r.warnings = 0;
     r.notes    = 0;
     r.made     = false;
+    r.built    = collections_vector.init[Built](nil);
 }
 
 # the base record paths are measured from, over the report's arena; nil when
@@ -1143,6 +1572,16 @@ fun report_paths(r: *Report) *PathBase {
     if (root == nil) { root = "."; }
     r.pb = path_base(?r.a, root);
     ret ?r.pb;
+}
+
+# keep a unit's `built` line for the summary record; the output path is copied
+# into the report's arena, and a line the arena refuses is dropped
+fun report_built(r: *Report, ev: *readout.Summary) {
+    if (report_paths(r) == nil) { ret; }
+    if (r.built.a == nil)       { r.built = collections_vector.init[Built](?r.a); }
+    val out: res[str, A.Error] = str_dup(?r.a, ev.out);
+    if (sel out.err) { ret; }
+    collections_vector.push[Built](?r.built, Built{out: out.ok, modules: ev.modules, bytes: ev.bytes, has_size: ev.has_size, total: ev.total});
 }
 
 fun count_record(r: *Report, severity: diagnostic.Severity) {
@@ -1218,13 +1657,43 @@ pub fun report_close(r: *Report, code: i64) i64 {
         if (code == exit.OK) { json.field_str(?o, "outcome", "success"); }
         or                   { json.field_str(?o, "outcome", "failure"); }
         json.field_i64(?o, "exit_code", code);
+        if (r.built.len > 0) { summary_built(?o, r); }
         json.object_end(?o);
     }
     if (r.made) {
         arena.dnit(?r.ar);
-        r.made = false;
+        r.made  = false;
+        r.built = collections_vector.init[Built](nil);
     }
     ret code;
+}
+
+# the summary record's `built` lines: `time_us`, every unit's wall time added,
+# and `built`, one object per line with its `out`, `modules`, `bytes` when the
+# line shows a size, and `time_us`
+fun summary_built(o: *json.Object, r: *Report) {
+    var total: chrono_duration.Duration = 0;
+    var i:     usize                    = 0;
+    for (i < r.built.len) {
+        total = total + r.built.data[i].total;
+        i     = i + 1;
+    }
+    json.field_i64(o, "time_us", micros(total));
+    var arr: json.Array;
+    json.field_array_begin(o, "built", ?arr);
+    i = 0;
+    for (i < r.built.len) {
+        val b:  *Built = ?r.built.data[i];
+        var bo: json.Object;
+        json.array_object_begin(?arr, ?bo);
+        json.field_str(?bo, "out", b.out);
+        json.field_i64(?bo, "modules", b.modules::i64);
+        if (b.has_size) { json.field_i64(?bo, "bytes", b.bytes::i64); }
+        json.field_i64(?bo, "time_us", micros(b.total));
+        json.object_end_value(?bo);
+        i = i + 1;
+    }
+    json.array_end(?arr);
 }
 
 # the version every json record carries in `schema`. adding a field, a record
@@ -1584,16 +2053,16 @@ test readout__a_unit_banner_shows_only_for_many_units_and_never_when_quiet {
     var rd:   Readout;
     t_human(?rep, ?rd, ?sink, 1, false);
     fin { mem_sink_dnit(?sink); }
-    readout.unit(?rd.sink, "app", "linux", "building", true);
+    readout.unit(?rd.sink, "app", "linux", "debug", "building", true);
     if (sink.len != 0) { ret 1; }
     t_human(?rep, ?rd, ?sink, 2, true);
-    readout.unit(?rd.sink, "app", "linux", "building", true);
+    readout.unit(?rd.sink, "app", "linux", "debug", "building", true);
     if (sink.len != 0) { ret 1; }
 
     t_human(?rep, ?rd, ?sink, 2, false);
-    readout.unit(?rd.sink, "app", "linux", "building", true);
+    readout.unit(?rd.sink, "app", "linux", "debug", "building", true);
     if (!sink_contains(?sink, "building app (linux)\n")) { ret 2; }
-    readout.unit(?rd.sink, "app", "", "building", false);
+    readout.unit(?rd.sink, "app", "", "debug", "building", false);
     if (!sink_contains(?sink, "building project\n")) { ret 3; }
     ret 0;
 }
@@ -1606,11 +2075,11 @@ test readout__renders_each_event_as_it_arrives {
     fin { mem_sink_dnit(?sink); }
     var f: fail.Fail = fail.user(diagnostic_kind.TOML_MALFORMED, "bad input");
 
-    readout.unit(?rd.sink, "app", "linux", "building", true);
+    readout.unit(?rd.sink, "app", "linux", "debug", "building", true);
     if (!sink_contains(?sink, "building app (linux)\n")) { ret 1; }
     readout.failure(?rd.sink, ?f, diagnostic.ORIGIN_BUILD);
     if (!sink_contains(?sink, "error[toml.malformed]: bad input\n")) { ret 2; }
-    readout.unit(?rd.sink, "lib", "", "building", true);
+    readout.unit(?rd.sink, "lib", "", "debug", "building", true);
     if (!sink_contains(?sink, "building lib\n")) { ret 3; }
     if (sink_contains(?sink, "1 error"))         { ret 4; }
     readout_close(?rd);
@@ -1637,6 +2106,241 @@ test readout__phase_rows_items_and_the_summary {
     rd.sink.on_event(rd.sink.ctx, ?ev);
     if (!sink_contains(?sink, "built out/app  1 module  2 KiB  in ")) { ret 5; }
     ret 0;
+}
+
+# where want first occurs in a memory sink, or its length when it does not
+#[testing]
+fun sink_index(s: *MemSink, want: str) usize {
+    val wl: usize = str_len(want);
+    var i:  usize = 0;
+    for (i + wl <= s.len) {
+        if (sink_match_at(s, i, want, wl)) { ret i; }
+        i = i + 1;
+    }
+    ret s.len;
+}
+
+# how often want occurs in a memory sink, for the commands' own tests
+#[testing]
+pub fun t_sink_count(s: *MemSink, want: str) usize {
+    ret sink_count(s, want);
+}
+
+# a finished test's result, art already set
+#[testing]
+fun t_finish(t: *readout.TestResult, kind: validation.ValidationGateResultKind, cause: validation.ValidationCause, code: i32) {
+    t.done      = true;
+    t.result    = validation.gate_result(kind, cause, nil);
+    t.code      = code;
+    t.elapsed   = 1000000;
+    t.bound     = 0;
+    t.out       = nil;
+    t.out_len   = 0;
+    t.truncated = false;
+    t.log       = nil;
+}
+
+# three tests over two modules, none finished: a#slow and a#fails in module a,
+# b#fails in module b
+#[testing]
+fun t_run_arts(arts: *outcome.TestArtifact, run: *readout.TestResult) {
+    var i: usize = 0;
+    for (i < 3) {
+        arts[i].file    = "f.mach";
+        arts[i].line    = (i + 1)::u32;
+        arts[i].exe     = "dispatcher";
+        arts[i].idx     = i::u32;
+        arts[i].object  = nil;
+        arts[i].target  = nil;
+        arts[i].profile = nil;
+        run[i].art      = ?arts[i];
+        run[i].done     = false;
+        run[i].log      = nil;
+        i               = i + 1;
+    }
+    arts[0].module = "a";
+    arts[0].name   = "a#slow";
+    arts[1].module = "a";
+    arts[1].name   = "a#fails";
+    arts[2].module = "b";
+    arts[2].name   = "b#fails";
+}
+
+# a finished test prints when it finishes: module b's roll-up comes out while
+# module a still waits on its slow test, a's once that test is done, and the
+# closing summary re-lists the failures in collection order whatever order they
+# finished in
+test readout__a_slow_test_holds_back_only_its_own_module {
+    var sink:  MemSink;
+    var rep:   Report;
+    var rd:    Readout;
+    var nsink: MemSink;
+    t_human(?rep, ?rd, ?nsink, 1, false);
+    fin { mem_sink_dnit(?nsink); }
+    mem_writer(?rd.out, ?sink);
+    fin { mem_sink_dnit(?sink); }
+
+    var arts: [3]outcome.TestArtifact;
+    var run:  [3]readout.TestResult;
+    t_run_arts(?arts[0], ?run[0]);
+    readout.run_start(?rd.sink, ?run[0], 3, nil);
+
+    t_finish(?run[2], validation.RESULT_SEMANTIC_MISMATCH, validation.CAUSE_ORACLE_EXIT, 3);
+    readout.test_end(?rd.sink, ?run[0], 2);
+    if (!sink_contains(?sink, "b                    0 ok     1 FAIL")) { ret 1; }
+    if (!sink_contains(?sink, "  FAIL  b#fails  f.mach:3  (exit 3)"))  { ret 2; }
+    if (sink_contains(?sink, "a  "))                                   { ret 3; }
+
+    t_finish(?run[1], validation.RESULT_SEMANTIC_MISMATCH, validation.CAUSE_ORACLE_EXIT, 4);
+    readout.test_end(?rd.sink, ?run[0], 1);
+    if (sink_contains(?sink, "a  ")) { ret 4; }
+    t_finish(?run[0], validation.RESULT_PASS, validation.CAUSE_PASS, 0);
+    readout.test_end(?rd.sink, ?run[0], 0);
+    if (!sink_contains(?sink, "a                    1 ok     1 FAIL")) { ret 5; }
+
+    var a: A.Allocator;
+    page.make(?a);
+    var tally: outcome.GateTally = outcome.gate_tally_init(?a);
+    readout.run_end(?rd.sink, readout.RunEnd{tests: ?run[0], count: 3, passed: 1, failed: 2, timed_out: 0, wall: 0, tally: ?tally});
+    val listed: usize = sink_index(?sink, "failures:\n");
+    val first:  usize = sink_index(?sink, "\n  a#fails  f.mach:2  (exit 4)\n");
+    val second: usize = sink_index(?sink, "\n  b#fails  f.mach:3  (exit 3)\n");
+    if (listed >= sink.len || first < listed || second < first || second >= sink.len) { ret 6; }
+    if (!sink_contains(?sink, "1 passed, 2 failed, 3 total"))                         { ret 7; }
+    outcome.gate_tally_dnit(?tally);
+    ret 0;
+}
+
+# under -v each test is its own line the moment it finishes
+test readout__under_v_each_test_prints_as_it_finishes {
+    var sink:  MemSink;
+    var rep:   Report;
+    var rd:    Readout;
+    var nsink: MemSink;
+    t_human(?rep, ?rd, ?nsink, 1, false);
+    fin { mem_sink_dnit(?nsink); }
+    rd.sink.level = readout.LEVEL_PHASES;
+    mem_writer(?rd.out, ?sink);
+    fin { mem_sink_dnit(?sink); }
+
+    var arts: [3]outcome.TestArtifact;
+    var run:  [3]readout.TestResult;
+    t_run_arts(?arts[0], ?run[0]);
+    readout.run_start(?rd.sink, ?run[0], 3, "qemu");
+    t_finish(?run[1], validation.RESULT_SEMANTIC_MISMATCH, validation.CAUSE_ORACLE_SIGNAL, 9);
+    readout.test_end(?rd.sink, ?run[0], 1);
+    if (!sink_contains(?sink, "FAIL  a#fails "))                 { ret 1; }
+    if (!sink_contains(?sink, "(signal 9)  f.mach:2\n"))         { ret 2; }
+    if (!sink_contains(?sink, "    rerun: qemu dispatcher 1\n")) { ret 3; }
+    t_finish(?run[0], validation.RESULT_PASS, validation.CAUSE_PASS, 0);
+    readout.test_end(?rd.sink, ?run[0], 0);
+    if (!sink_contains(?sink, "ok    a#slow ")) { ret 4; }
+    if (sink_contains(?sink, "b#fails"))        { ret 5; }
+    ret 0;
+}
+
+# under json diagnostics a finished test is also a record on the report's
+# stream, naming the test, its outcome and its exit code as the run's json
+# event does, from origin `test`
+test readout__a_finished_test_is_a_record_beside_its_event {
+    var esink: MemSink;
+    var rsink: MemSink;
+    var rep:   Report;
+    var rd:    Readout;
+    report_init(?rep, FORMAT_JSON);
+    mem_writer(?rep.w, ?rsink);
+    fin { mem_sink_dnit(?rsink); }
+    readout_init(?rd, ?rep, 1, false, readout.LEVEL_RESULTS);
+    rd.stream = FORMAT_JSON;
+    mem_writer(?rd.out, ?esink);
+    fin { mem_sink_dnit(?esink); }
+
+    var arts: [3]outcome.TestArtifact;
+    var run:  [3]readout.TestResult;
+    t_run_arts(?arts[0], ?run[0]);
+    readout.run_start(?rd.sink, ?run[0], 3, nil);
+    t_finish(?run[2], validation.RESULT_SEMANTIC_MISMATCH, validation.CAUSE_ORACLE_EXIT, 3);
+    run[2].log = "logs/2.log";
+    readout.test_end(?rd.sink, ?run[0], 2);
+    report_close(?rep, 1);
+    val event:  str = sink_text(?esink);
+    val record: str = sink_text(?rsink);
+    if (!str_contains(event, "{\"schema\":2,\"event\":\"run_start\",\"tests\":3}\n"))                                                                                                           { ret 1; }
+    if (!str_contains(event, "\"name\":\"b#fails\",\"module\":\"b\",\"file\":\"f.mach\",\"line\":3,\"kind\":\"exit\",\"code\":3,"))                                                             { ret 2; }
+    if (!str_contains(event, "\"output\":\"logs/2.log\"}"))                                                                                                                                     { ret 3; }
+    if (!str_contains(record, "{\"schema\":1,\"record\":\"test\",\"name\":\"b#fails\",\"module\":\"b\",\"file\":\"f.mach\",\"line\":3,\"outcome\":\"exit\",\"code\":3,\"origin\":\"test\"}\n")) { ret 4; }
+    ret 0;
+}
+
+# the build readout under json is records that match the human rows of the
+# same events: a unit record naming the profile for every unit, even the only
+# one, a phase record per row with its name, count, noun, threads and
+# slowest item, a phase_item record per item, the unit's other row as a phase
+# record without a count, and its built line as members of the summary record
+test readout__phase_records_match_the_human_rows {
+    var hsink: MemSink;
+    var hrep:  Report;
+    var hrd:   Readout;
+    t_human(?hrep, ?hrd, ?hsink, 2, false);
+    fin { mem_sink_dnit(?hsink); }
+    hrd.sink.level = readout.LEVEL_ITEMS;
+    var jsink: MemSink;
+    var jrep:  Report;
+    var jrd:   Readout;
+    report_init(?jrep, FORMAT_JSON);
+    mem_writer(?jrep.w, ?jsink);
+    fin { mem_sink_dnit(?jsink); }
+    readout_init(?jrd, ?jrep, 1, false, readout.LEVEL_ITEMS);
+
+    var evs: [5]readout.Event;
+    evs[0] = readout.Event.unit{readout.Unit{artifact: "app", target: "linux", profile: "release", verb: "building", has_artifact: true}};
+    evs[1] = readout.Event.item{readout.Item{phase: readout.CODEGEN, name: "app.main", elapsed: 2000000}};
+    evs[2] = readout.Event.phase{readout.PhaseEnd{phase: readout.CODEGEN, count: 2, noun_one: "module", noun_many: "modules",
+        elapsed: 3000000, workers: 4, dropped: 0, slowest: "app.main", slowest_elapsed: 2000000}};
+    evs[3] = readout.Event.phase{readout.PhaseEnd{phase: readout.LINK, count: 1, noun_one: "module", noun_many: "modules",
+        elapsed: 1500, workers: 1, dropped: 0, slowest: nil, slowest_elapsed: 0}};
+    evs[4] = readout.Event.summary{readout.Summary{out: "out/app", modules: 2, bytes: 2048, has_size: true, other: 7000, total: 5000000}};
+    var i: usize = 0;
+    for (i < 5) {
+        hrd.sink.on_event(hrd.sink.ctx, ?evs[i]);
+        jrd.sink.on_event(jrd.sink.ctx, ?evs[i]);
+        i = i + 1;
+    }
+    report_close(?jrep, 0);
+
+    if (!sink_contains(?hsink, "building app (linux)\n"))                                                                                                                                                  { ret 1; }
+    if (!sink_contains(?jsink, "{\"schema\":1,\"record\":\"unit\",\"verb\":\"building\",\"artifact\":\"app\",\"target\":\"linux\",\"profile\":\"release\"}\n"))                                            { ret 2; }
+    if (!sink_contains(?hsink, "  codegen      app.main"))                                                                                                                                                 { ret 3; }
+    if (!sink_contains(?jsink, "{\"schema\":1,\"record\":\"phase_item\",\"phase\":\"codegen\",\"name\":\"app.main\",\"time_us\":2000}\n"))                                                                 { ret 4; }
+    if (!sink_contains(?hsink, "codegen        2 modules") || !sink_contains(?hsink, "(4 threads)  (slowest app.main 2ms)"))                                                                               { ret 5; }
+    if (!sink_contains(?jsink, "{\"schema\":1,\"record\":\"phase\",\"name\":\"codegen\",\"count\":2,\"unit\":\"modules\",\"time_us\":3000,\"threads\":4,\"slowest\":\"app.main\",\"slowest_us\":2000}\n")) { ret 6; }
+    if (!sink_contains(?hsink, "link           1 module "))                                                                                                                                                { ret 7; }
+    if (!sink_contains(?jsink, "{\"schema\":1,\"record\":\"phase\",\"name\":\"link\",\"count\":1,\"unit\":\"module\",\"time_us\":1}\n"))                                                                   { ret 8; }
+    if (!sink_contains(?hsink, "other        -"))                                                                                                                                                          { ret 9; }
+    if (!sink_contains(?jsink, "{\"schema\":1,\"record\":\"phase\",\"name\":\"other\",\"time_us\":7}\n"))                                                                                                  { ret 10; }
+    if (!sink_contains(?hsink, "built out/app  2 modules  2 KiB  in "))                                                                                                                                    { ret 11; }
+    if (!sink_contains(?jsink, "\"exit_code\":0,\"time_us\":5000,\"built\":[{\"out\":\"out/app\",\"modules\":2,\"bytes\":2048,\"time_us\":5000}]}\n"))                                                     { ret 12; }
+    if (t_json_run(?jsink, 0, nil, nil, nil) != 0)                                                                                                                                                         { ret 13; }
+    ret 0;
+}
+
+test result_name_and_has_capture__cover_every_classified_shape {
+    var bad: i32                             = 0;
+    var r:   validation.ValidationGateResult = validation.gate_result(validation.RESULT_PASS, validation.CAUSE_PASS, nil);
+    if (!str_equals(result_name(?r), "pass") || has_capture(?r)) { bad = 1; }
+    r = validation.gate_result(validation.RESULT_SEMANTIC_MISMATCH, validation.CAUSE_ORACLE_EXIT, nil);
+    if (!str_equals(result_name(?r), "exit") || !has_capture(?r)) { bad = 2; }
+    r = validation.gate_result(validation.RESULT_SEMANTIC_MISMATCH, validation.CAUSE_ORACLE_SIGNAL, nil);
+    if (!str_equals(result_name(?r), "signal") || !has_capture(?r)) { bad = 3; }
+    r = validation.gate_result(validation.RESULT_INFRASTRUCTURE_FAILURE, validation.CAUSE_ORACLE_SPAWN_FAILURE, nil);
+    if (!str_equals(result_name(?r), "spawn") || has_capture(?r)) { bad = 4; }
+    r = validation.gate_result(validation.RESULT_INFRASTRUCTURE_FAILURE, validation.CAUSE_ORACLE_CAPTURE, nil);
+    if (!str_equals(result_name(?r), "other") || !has_capture(?r)) { bad = 5; }
+    r = validation.gate_result(validation.RESULT_INFRASTRUCTURE_FAILURE, validation.CAUSE_INVALID_TERMINAL, nil);
+    if (!str_equals(result_name(?r), "other") || !has_capture(?r)) { bad = 6; }
+    r = validation.gate_result(validation.RESULT_RESOURCE_EXHAUSTION, validation.CAUSE_ORACLE_TIMEOUT, nil);
+    if (!str_equals(result_name(?r), "timeout") || !has_capture(?r)) { bad = 7; }
+    ret bad;
 }
 
 test size_split__binary_thresholds_and_rounding {
@@ -2272,6 +2976,20 @@ fun t_valid_record(r: *json.Value) bool {
     ret true;
 }
 
+# a readout record as the schema documents it: a phase with its name and time,
+# and a count with its unit for every phase but `other`; a phase_item with its
+# phase, name and time; a unit with its verb
+#[testing]
+fun t_valid_progress(r: *json.Value, kind: str) bool {
+    if (str_equals(kind, "unit"))                                    { ret t_is_string(r, "verb"); }
+    if (!t_int_at_least(r, "time_us", 0) || !t_is_string(r, "name")) { ret false; }
+    if (str_equals(kind, "phase_item"))                              { ret t_is_string(r, "phase"); }
+    var buf:  [64]u8;
+    val name: str = t_text(t_member(r, "name"), ?buf[0], 64);
+    if (name != nil && str_equals(name, "other")) { ret t_member(r, "count") == nil; }
+    ret t_int_at_least(r, "count", 0) && t_is_string(r, "unit");
+}
+
 # one line of a rendering: its bytes and where the next line starts
 #[testing]
 rec TLine {
@@ -2646,6 +3364,9 @@ pub fun t_json_run(s: *MemSink, code: i64, kind: str, key: str, origin: str) i32
         if (str_equals(rk, "summary")) {
             if (!t_valid_summary(?r, errors, warns, code)) { ret 4; }
             summed = true;
+        }
+        or (str_equals(rk, "phase") || str_equals(rk, "phase_item") || str_equals(rk, "unit")) {
+            if (!t_valid_progress(?r, rk)) { ret 8; }
         }
         or (!str_equals(rk, "test")) {
             if (!t_valid_record(?r)) { ret 5; }
