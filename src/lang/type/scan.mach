@@ -1,0 +1,325 @@
+use std.collections.map;
+use std.memory;
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+use T: std.allocator.testing;
+
+use lang_checked: mach.lang.checked;
+use mach.lang.fail;
+use mach.lang.type.kind.TypeId;
+
+rec VisitSet {
+    stamp: *u32;
+    cap:   u32;
+    epoch: u32;
+}
+
+rec PairSet {
+    seen:  map.Map[u64, u32];
+    epoch: u32;
+}
+
+# the visited sets of every scan over the type table, one per nesting level,
+# reused from scan to scan by bumping the level's epoch
+pub rec Sets {
+    a: *A.Allocator;
+
+    visits:     *VisitSet;
+    visits_len: u32;
+    visits_cap: u32;
+
+    pairs:     *PairSet;
+    pairs_len: u32;
+    pairs_cap: u32;
+}
+
+# a scan over types, open from begin to end
+pub rec Scan {
+    level: u32;
+}
+
+# a scan over pairs of types, open from pair_begin to pair_end
+pub rec Pair {
+    level: u32;
+}
+
+val SCAN_NONE: u32 = 0xFFFFFFFF;
+
+val INITIAL_VISIT_CAP:   u32 = 64;
+val INITIAL_VISIT_DEPTH: u32 = 4;
+
+pub def Mark: u8;
+
+pub val VISIT_FRESH: Mark = 0;
+pub val VISIT_SEEN:  Mark = 1;
+
+pub fun sets_init(a: *A.Allocator) Sets {
+    var sets: Sets;
+    sets.a          = a;
+    sets.visits     = nil;
+    sets.visits_len = 0;
+    sets.visits_cap = 0;
+    sets.pairs      = nil;
+    sets.pairs_len  = 0;
+    sets.pairs_cap  = 0;
+    ret sets;
+}
+
+pub fun sets_dnit(sets: *Sets) {
+    if (sets.visits != nil && sets.visits_cap > 0) {
+        var vi: u32 = 0;
+        for (vi < sets.visits_cap) {
+            if (sets.visits[vi].stamp != nil && sets.visits[vi].cap > 0) {
+                A.deallocate[u32](sets.a, sets.visits[vi].stamp, sets.visits[vi].cap::usize);
+            }
+            vi = vi + 1;
+        }
+        A.deallocate[VisitSet](sets.a, sets.visits, sets.visits_cap::usize);
+    }
+    if (sets.pairs != nil && sets.pairs_cap > 0) {
+        var pi: u32 = 0;
+        for (pi < sets.pairs_cap) {
+            map.dnit[u64, u32](?sets.pairs[pi].seen);
+            pi = pi + 1;
+        }
+        A.deallocate[PairSet](sets.a, sets.pairs, sets.pairs_cap::usize);
+    }
+
+    sets.visits     = nil;
+    sets.visits_len = 0;
+    sets.visits_cap = 0;
+    sets.pairs      = nil;
+    sets.pairs_len  = 0;
+    sets.pairs_cap  = 0;
+}
+
+pub fun begin(sets: *Sets, scan: *Scan) err[fail.Fail] {
+    val r: err[fail.Fail] = visits_reserve(sets);
+    if (sel r.err) {
+        scan.level = SCAN_NONE;
+        ret err[fail.Fail].err{r.err};
+    }
+
+    val level: u32 = sets.visits_len;
+    sets.visits_len = sets.visits_len + 1;
+
+    if (sets.visits[level].epoch == 0xFFFFFFFF) {
+        if (sets.visits[level].stamp != nil && sets.visits[level].cap > 0) {
+            memory.zero[u32](sets.visits[level].stamp, sets.visits[level].cap::usize);
+        }
+        sets.visits[level].epoch = 1;
+    }
+    or {
+        sets.visits[level].epoch = sets.visits[level].epoch + 1;
+    }
+
+    scan.level = level;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun end(sets: *Sets, scan: *Scan) {
+    if (scan.level == SCAN_NONE) { ret; }
+    sets.visits_len = scan.level;
+    scan.level      = SCAN_NONE;
+}
+
+pub fun mark(sets: *Sets, scan: *Scan, tid: TypeId) res[Mark, fail.Fail] {
+    if (scan.level == SCAN_NONE) { ret res[Mark, fail.Fail].err{fail.message("type traversal has no active visited set")}; }
+
+    if (tid >= sets.visits[scan.level].cap) {
+        val r: err[fail.Fail] = visit_reserve(sets, scan.level, tid);
+        if (sel r.err) { ret res[Mark, fail.Fail].err{r.err}; }
+    }
+
+    val set: *VisitSet = ?sets.visits[scan.level];
+    if (set.stamp[tid] == set.epoch) { ret res[Mark, fail.Fail].ok{VISIT_SEEN}; }
+    set.stamp[tid] = set.epoch;
+    ret res[Mark, fail.Fail].ok{VISIT_FRESH};
+}
+
+fun visits_reserve(sets: *Sets) err[fail.Fail] {
+    if (sets.visits_len < sets.visits_cap) { ret err[fail.Fail].ok{}; }
+
+    val old_cap: u32          = sets.visits_cap;
+    val grown:   err[A.Error] = grow_cap[VisitSet](sets.a, ?sets.visits, ?sets.visits_cap, INITIAL_VISIT_DEPTH);
+    if (sel grown.err) { ret err[fail.Fail].err{fail.refused(grown.err)}; }
+
+    var i: u32 = old_cap;
+    for (i < sets.visits_cap) {
+        sets.visits[i].stamp = nil;
+        sets.visits[i].cap   = 0;
+        sets.visits[i].epoch = 0;
+        i                    = i + 1;
+    }
+
+    ret err[fail.Fail].ok{};
+}
+
+fun visit_reserve(sets: *Sets, level: u32, tid: TypeId) err[fail.Fail] {
+    val set: *VisitSet = ?sets.visits[level];
+
+    var base_cap: u32 = set.cap;
+    if (base_cap == 0) { base_cap = INITIAL_VISIT_CAP; }
+
+    val required_r: res[lang_checked.Count[u32], lang_checked.Cause] =
+        lang_checked.count_add[u32](lang_checked.count[u32](tid::usize), lang_checked.count[u32](1::usize));
+    if (sel required_r.err) {
+        ret err[fail.Fail].err{fail.message("type: visit-set requirement overflow")};
+    }
+    val required: lang_checked.Count[u32]                          = required_r.ok;
+    val grown_r:  res[lang_checked.Count[u32], lang_checked.Cause] =
+        lang_checked.count_grow[u32](lang_checked.count[u32](base_cap::usize), required);
+    if (sel grown_r.err) {
+        ret err[fail.Fail].err{fail.message("type: visit-set growth count overflow")};
+    }
+    val new_cap_fits: res[u32, lang_checked.Cause] = lang_checked.usize_to_u32(
+        grown_r.ok.value);
+    if (sel new_cap_fits.err) {
+        ret err[fail.Fail].err{fail.message("type: visit-set capacity exceeds the u32 limit")};
+    }
+    val new_cap: u32 = new_cap_fits.ok;
+
+    if (set.stamp == nil) {
+        val res_alloc: res[*u32, A.Error] = A.allocate[u32](sets.a, new_cap::usize);
+        if (sel res_alloc.err) {
+            ret err[fail.Fail].err{fail.refused(res_alloc.err)};
+        }
+        set.stamp = res_alloc.ok;
+    }
+    or {
+        val res_realloc: res[*u32, A.Error] = A.reallocate[u32](sets.a, set.stamp, set.cap::usize, new_cap::usize);
+        if (sel res_realloc.err) {
+            ret err[fail.Fail].err{fail.refused(res_realloc.err)};
+        }
+        set.stamp = res_realloc.ok;
+    }
+
+    memory.zero[u32](?set.stamp[set.cap], (new_cap - set.cap)::usize);
+    set.cap = new_cap;
+
+    ret err[fail.Fail].ok{};
+}
+
+pub fun pair_begin(sets: *Sets, scan: *Pair) err[fail.Fail] {
+    val r: err[fail.Fail] = pairs_reserve(sets);
+    if (sel r.err) {
+        scan.level = SCAN_NONE;
+        ret err[fail.Fail].err{r.err};
+    }
+
+    val level: u32 = sets.pairs_len;
+    sets.pairs_len = sets.pairs_len + 1;
+
+    if (sets.pairs[level].epoch == 0xFFFFFFFF) {
+        map.clear[u64, u32](?sets.pairs[level].seen);
+        sets.pairs[level].epoch = 1;
+    }
+    or {
+        sets.pairs[level].epoch = sets.pairs[level].epoch + 1;
+    }
+
+    scan.level = level;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun pair_end(sets: *Sets, scan: *Pair) {
+    if (scan.level == SCAN_NONE) { ret; }
+    sets.pairs_len = scan.level;
+    scan.level     = SCAN_NONE;
+}
+
+pub fun pair_mark(sets: *Sets, scan: *Pair, a: TypeId, b: TypeId) res[Mark, fail.Fail] {
+    if (scan.level == SCAN_NONE) { ret res[Mark, fail.Fail].err{fail.message("pair traversal has no active visited set")}; }
+
+    val set: *PairSet = ?sets.pairs[scan.level];
+    var key: u64      = (a::u64 << 32) | b::u64;
+
+    val got: opt[*u32] = map.get[u64, u32](?set.seen, ?key);
+    if (sel got.some) {
+        val slot: *u32 = got.some;
+        if (slot[0] == set.epoch) { ret res[Mark, fail.Fail].ok{VISIT_SEEN}; }
+        slot[0] = set.epoch;
+        ret res[Mark, fail.Fail].ok{VISIT_FRESH};
+    }
+
+    val r: res[bool, A.Error] = map.insert[u64, u32](?set.seen, key, set.epoch);
+    if (sel r.err) { ret res[Mark, fail.Fail].err{fail.refused(r.err)}; }
+    ret res[Mark, fail.Fail].ok{VISIT_FRESH};
+}
+
+fun pairs_reserve(sets: *Sets) err[fail.Fail] {
+    if (sets.pairs_len < sets.pairs_cap) { ret err[fail.Fail].ok{}; }
+
+    val old_cap: u32          = sets.pairs_cap;
+    val grown:   err[A.Error] = grow_cap[PairSet](sets.a, ?sets.pairs, ?sets.pairs_cap, INITIAL_VISIT_DEPTH);
+    if (sel grown.err) { ret err[fail.Fail].err{fail.refused(grown.err)}; }
+
+    var i: u32 = old_cap;
+    for (i < sets.pairs_cap) {
+        sets.pairs[i].seen  = map.init[u64, u32](sets.a);
+        sets.pairs[i].epoch = 0;
+        i                   = i + 1;
+    }
+
+    ret err[fail.Fail].ok{};
+}
+
+fun grow_cap[T](alloc: *A.Allocator, data: **T, cap: *u32, initial: u32) err[A.Error] {
+    if (@data == nil) {
+        val res_alloc: res[*T, A.Error] = A.allocate[T](alloc, initial::usize);
+        if (sel res_alloc.err) { ret err[A.Error].err{res_alloc.err}; }
+        @data = res_alloc.ok;
+        @cap  = initial;
+        ret err[A.Error].ok{};
+    }
+    val current:    lang_checked.Count[T]                          = lang_checked.count[T]((@cap)::usize);
+    val required_r: res[lang_checked.Count[T], lang_checked.Cause] =
+        lang_checked.count_add[T](current, lang_checked.count[T](1::usize));
+    if (sel required_r.err) {
+        ret err[A.Error].err{A.Error.overflow{}};
+    }
+    val required: lang_checked.Count[T]                          = required_r.ok;
+    val grown_r:  res[lang_checked.Count[T], lang_checked.Cause] = lang_checked.count_grow[T](current, required);
+    if (sel grown_r.err) {
+        ret err[A.Error].err{A.Error.overflow{}};
+    }
+    val new_cap_fits: res[u32, lang_checked.Cause] = lang_checked.usize_to_u32(
+        grown_r.ok.value);
+    if (sel new_cap_fits.err) {
+        ret err[A.Error].err{A.Error.overflow{}};
+    }
+    val new_cap:     u32              = new_cap_fits.ok;
+    val res_realloc: res[*T, A.Error] = A.reallocate[T](alloc, @data, (@cap)::usize, new_cap::usize);
+    if (sel res_realloc.err) { ret err[A.Error].err{res_realloc.err}; }
+    @data = res_realloc.ok;
+    @cap  = new_cap;
+    ret err[A.Error].ok{};
+}
+
+# a visit set at half the u32 range refuses to double before it reaches the allocator
+test visit_reserve__refuses_a_u32_wrap_without_reallocating {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 1; }
+    fin { T.dnit(?t); }
+    var sets:     Sets           = sets_init(T.allocator_of(?t));
+    val reserved: err[fail.Fail] = visits_reserve(?sets);
+    if (sel reserved.err) { ret 2; }
+
+    sets.visits[0].stamp = nil;
+    sets.visits[0].cap   = 0x80000000;
+    val attempts: usize          = T.attempt_count(?t);
+    val visit:    err[fail.Fail] = visit_reserve(?sets, 0, 0x80000000::TypeId);
+    var bad:      i32            = 0;
+    if (sel visit.ok)                    { bad = 3; }
+    if (T.attempt_count(?t) != attempts) { bad = 4; }
+    sets.visits[0].cap = 0;
+    sets_dnit(?sets);
+    if (T.leaked(?t) || T.double_free_count(?t) != 0) { bad = 5; }
+    ret bad;
+}
