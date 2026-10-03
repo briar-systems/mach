@@ -1,0 +1,973 @@
+# verify: what `mach dep verify` holds a git dependency to. the enclosing repository must
+# stage its gitlink and register it in .gitmodules with the declared source; the checkout
+# must be a repository root at that gitlink, match its committed tree, keep every symlink
+# inside itself, and satisfy every exact selector and version range the closure declares
+use std.allocator.page;
+use std.collections.sort;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use fs:         std.filesystem;
+use std_format: std.format;
+use io_error:   std.io.error;
+use std.print;
+use std.process.env;
+use std.process.exec;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use types_path: std.types.path;
+use std.types.result.res;
+use std.types.size.usize;
+use types_string: std.types.string;
+use std.types.string.str;
+use std.types.string.str_contains;
+use std.types.string.str_copy_slice;
+use std.types.string.str_empty;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+
+use A: std.allocator;
+
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.driver.load;
+use mach.lang.driver.project;
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.manifest;
+use manifest_version: mach.lang.manifest.version;
+use mach.lang.session;
+
+use driver_closure: mach.lang.driver.closure;
+use mach.lang.package;
+use mach.lang.package.git;
+use git_checkout: mach.lang.package.git.checkout;
+
+fun symlink_seen(links: *Vector[str], rel: str) bool {
+    var i: usize = 0;
+    for (i < links.len) {
+        if (str_equals(links.data[i], rel)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun symlink_target(s: *session.Session, gi: *git.Inspector, alias: str, git_dir: str,
+    git_prefix: str, rel: str) res[str, fail.Fail] {
+    val spec_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "HEAD:{}{}", git_prefix, rel);
+    if (sel spec_r.err) { ret res[str, fail.Fail].err{fail.message(fail.format_text(spec_r.err))}; }
+    val spec: str = spec_r.ok;
+    var args: [3]str;
+    args[0] = "cat-file";
+    args[1] = "-p";
+    args[2] = spec;
+    val raw_r: res[str, fail.Fail] = git.query_raw(s.build_alloc, gi, git_dir, ?args[0], 3);
+    str_free(s.build_alloc, spec);
+    if (sel raw_r.ok) { ret raw_r; }
+    val msg_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+        "dependency '{}': cannot verify tracked symlink target: {}", alias, fail.describe(raw_r.err));
+    if (sel msg_r.err) { ret res[str, fail.Fail].err{raw_r.err}; }
+    ret res[str, fail.Fail].err{fail.with_text(raw_r.err, msg_r.ok)};
+}
+
+fun symlink_tracked(s: *session.Session, gi: *git.Inspector, alias: str, git_dir: str,
+    git_prefix: str, rel: str) res[bool, fail.Fail] {
+    val mode_r: res[str, fail.Fail] = git.path_mode(s, gi, alias, git_dir, git_prefix, rel);
+    if (sel mode_r.err) { ret res[bool, fail.Fail].err{mode_r.err}; }
+    val mode:    str  = mode_r.ok;
+    val tracked: bool = str_equals(mode, "120000");
+    str_free(s.build_alloc, mode);
+    ret res[bool, fail.Fail].ok{tracked};
+}
+
+fun symlink_target_rel(s: *session.Session, rel: str, target: str) res[str, fail.Fail] {
+    if (str_empty(target) || target[0] == '/' || target[0] == '\\'
+        || (str_len(target) > 1 && target[1] == ':')) {
+        ret res[str, fail.Fail].err{fail.user(diagnostic_kind.DEP_SYMLINK, "tracked symlink target must be relative")};
+    }
+    var base_len: usize = str_len(rel);
+    for (base_len > 0 && rel[base_len - 1] != '/') { base_len = base_len - 1; }
+    val base_r: res[str, types_string.StrError] = str_copy_slice(s.build_alloc, rel, 0, base_len);
+    if (sel base_r.err) { ret res[str, fail.Fail].err{fail.message(fail.str_text(base_r.err))}; }
+    val base:     str                              = base_r.ok;
+    val joined_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "{}{}", base, target);
+    str_free(s.build_alloc, base);
+    if (sel joined_r.err) { ret res[str, fail.Fail].err{fail.message(fail.format_text(joined_r.err))}; }
+    val joined:  str                           = joined_r.ok;
+    val clean_r: res[types_path.Path, A.Error] = types_path.clean(s.build_alloc, joined);
+    str_free(s.build_alloc, joined);
+    if (sel clean_r.err) { ret res[str, fail.Fail].err{fail.refused(clean_r.err)}; }
+    val clean:   str  = clean_r.ok;
+    val escaped: bool = str_equals(clean, "..")
+        || (str_len(clean) > 2 && clean[0] == '.' && clean[1] == '.' && types_path.is_separator(clean[2]));
+    if (escaped) {
+        str_free(s.build_alloc, clean);
+        ret res[str, fail.Fail].err{fail.user(diagnostic_kind.DEP_SYMLINK, "tracked symlink target escapes dependency package")};
+    }
+    $if ($mach.build.os == $mach.os.windows) {
+        var i: usize = 0;
+        for (clean[i] != 0) {
+            if (types_path.is_separator(clean[i])) { clean[i] = '/'; }
+            i = i + 1;
+        }
+    }
+    ret res[str, fail.Fail].ok{clean};
+}
+
+fun symlink_chain(s: *session.Session, gi: *git.Inspector, alias: str,
+    git_dir: str, git_prefix: str, root: str, rel: str,
+    links: *Vector[str]) err[fail.Fail] {
+    if (symlink_seen(links, rel)) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_SYMLINK, "tracked symlink cycle in dependency package")}; }
+    val copied_r: res[str, types_string.StrError] = str_copy_slice(s.build_alloc, rel, 0, str_len(rel));
+    if (sel copied_r.err) { ret err[fail.Fail].err{fail.message(fail.str_text(copied_r.err))}; }
+    val pushed_r: res[usize, A.Error] = collections_vector.push[str](links, copied_r.ok);
+    if (sel pushed_r.err) {
+        str_free(s.build_alloc, copied_r.ok);
+        ret err[fail.Fail].err{fail.refused(pushed_r.err)};
+    }
+
+    val target_r: res[str, fail.Fail] = symlink_target(s, gi, alias, git_dir, git_prefix, rel);
+    if (sel target_r.err) { ret err[fail.Fail].err{target_r.err}; }
+    val target: str                 = target_r.ok;
+    val next_r: res[str, fail.Fail] = symlink_target_rel(s, rel, target);
+    str_free(s.build_alloc, target);
+    if (sel next_r.err) { ret err[fail.Fail].err{next_r.err}; }
+    val next: str = next_r.ok;
+    fin { str_free(s.build_alloc, next); }
+    val resolved_r: res[str, fail.Fail] = load.join_path(s.build_alloc, root, next);
+    if (sel resolved_r.err) { ret err[fail.Fail].err{resolved_r.err}; }
+    val resolved: str = resolved_r.ok;
+    fin { str_free(s.build_alloc, resolved); }
+    val meta_r: res[fs.Metadata, io_error.Error] = fs.metadata_link(resolved);
+    if (sel meta_r.err) { ret err[fail.Fail].ok{}; }
+    val meta: fs.Metadata = meta_r.ok;
+    if (!fs.meta_is_symlink(?meta)) { ret err[fail.Fail].ok{}; }
+    val next_tracked_r: res[bool, fail.Fail] = symlink_tracked(s, gi, alias, git_dir, git_prefix, next);
+    if (sel next_tracked_r.err) { ret err[fail.Fail].err{next_tracked_r.err}; }
+    if (!next_tracked_r.ok)     { ret err[fail.Fail].ok{}; }
+    ret symlink_chain(s, gi, alias, git_dir, git_prefix, root, next, links);
+}
+
+fun realization_symlinks_walk(s: *session.Session, gi: *git.Inspector, alias: str,
+    git_dir: str, git_prefix: str, root: str, rel: str) err[fail.Fail] {
+    val at_r: res[str, fail.Fail] = load.join_path(s.build_alloc, root, rel);
+    if (sel at_r.err) { ret err[fail.Fail].err{at_r.err}; }
+    val at:      str                          = at_r.ok;
+    val names_r: res[Vector[str], fs.FsError] = fs.read_dir(s.build_alloc, at);
+    str_free(s.build_alloc, at);
+    if (sel names_r.err) { ret err[fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, fail.fs_text(names_r.err))}; }
+    var names: Vector[str] = names_r.ok;
+    sort.sort[str](names.data, names.len);
+    var i: usize = 0;
+    for (i < names.len) {
+        val child_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "{}{}", rel, names.data[i]);
+        if (sel child_r.err) {
+            package.free_name_vector(s.build_alloc, ?names);
+            ret err[fail.Fail].err{fail.message(fail.format_text(child_r.err))};
+        }
+        val child:  str                 = child_r.ok;
+        val path_r: res[str, fail.Fail] = load.join_path(s.build_alloc, root, child);
+        if (sel path_r.err) {
+            str_free(s.build_alloc, child);
+            package.free_name_vector(s.build_alloc, ?names);
+            ret err[fail.Fail].err{path_r.err};
+        }
+        val child_path: str                              = path_r.ok;
+        val meta_r:     res[fs.Metadata, io_error.Error] = fs.metadata_link(child_path);
+        if (sel meta_r.err) {
+            str_free(s.build_alloc, child_path);
+            str_free(s.build_alloc, child);
+            package.free_name_vector(s.build_alloc, ?names);
+            ret err[fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, fail.io_text(meta_r.err))};
+        }
+        val meta: fs.Metadata = meta_r.ok;
+        if (fs.meta_is_dir(?meta)) {
+            val mode_r: res[str, fail.Fail] = git.path_mode(s, gi, alias, git_dir, git_prefix, child);
+            if (sel mode_r.err) {
+                str_free(s.build_alloc, child_path);
+                str_free(s.build_alloc, child);
+                package.free_name_vector(s.build_alloc, ?names);
+                ret err[fail.Fail].err{mode_r.err};
+            }
+            val mode: str = mode_r.ok;
+            if (str_empty(mode) || str_equals(mode, "160000")) {
+                str_free(s.build_alloc, mode);
+                str_free(s.build_alloc, child_path);
+                str_free(s.build_alloc, child);
+                i = i + 1;
+                cnt;
+            }
+            if (!str_equals(mode, "040000")) {
+                str_free(s.build_alloc, mode);
+                str_free(s.build_alloc, child_path);
+                str_free(s.build_alloc, child);
+                package.free_name_vector(s.build_alloc, ?names);
+                ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_TREE_MISMATCH, "dependency directory does not match its committed tree")};
+            }
+            str_free(s.build_alloc, mode);
+            str_free(s.build_alloc, child_path);
+            val nested_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "{}/", child);
+            str_free(s.build_alloc, child);
+            if (sel nested_r.err) {
+                package.free_name_vector(s.build_alloc, ?names);
+                ret err[fail.Fail].err{fail.message(fail.format_text(nested_r.err))};
+            }
+            val nested: str            = nested_r.ok;
+            val walk_r: err[fail.Fail] = realization_symlinks_walk(s, gi, alias, git_dir, git_prefix, root, nested);
+            str_free(s.build_alloc, nested);
+            if (sel walk_r.err) {
+                package.free_name_vector(s.build_alloc, ?names);
+                ret walk_r;
+            }
+        }
+        or (fs.meta_is_symlink(?meta)) {
+            var links:     Vector[str]          = collections_vector.init[str](s.build_alloc);
+            var verify_r:  err[fail.Fail]       = err[fail.Fail].ok{};
+            val tracked_r: res[bool, fail.Fail] = symlink_tracked(s, gi, alias, git_dir, git_prefix, child);
+            if (sel tracked_r.err) { verify_r = err[fail.Fail].err{tracked_r.err}; }
+            or (sel tracked_r.ok) {
+                if (tracked_r.ok) {
+                    verify_r = symlink_chain(s, gi, alias, git_dir, git_prefix, root, child, ?links);
+                }
+            }
+            package.free_name_vector(s.build_alloc, ?links);
+            str_free(s.build_alloc, child_path);
+            str_free(s.build_alloc, child);
+            if (sel verify_r.err) {
+                package.free_name_vector(s.build_alloc, ?names);
+                ret verify_r;
+            }
+        }
+        or {
+            str_free(s.build_alloc, child_path);
+            str_free(s.build_alloc, child);
+        }
+        i = i + 1;
+    }
+    package.free_name_vector(s.build_alloc, ?names);
+    ret err[fail.Fail].ok{};
+}
+
+fun realization_symlinks(s: *session.Session, gi: *git.Inspector, alias: str,
+    git_dir: str, git_prefix: str, root: str) err[fail.Fail] {
+    ret realization_symlinks_walk(s, gi, alias, git_dir, git_prefix, root, "");
+}
+
+fun declaring_manifest(s: *session.Session, gi: *git.Inspector, alias: str,
+    parent_root: str) err[fail.Fail] {
+    ret git.require_root(s, gi, alias, parent_root, "declaring package identity");
+}
+
+fun parent_gitlink(s: *session.Session, gi: *git.Inspector, alias: str,
+    parent_root: str, dir_dep: str, d: *manifest.DepDef) res[intern.StrId, fail.Fail] {
+    val manifest_r: err[fail.Fail] = declaring_manifest(s, gi, alias, parent_root);
+    if (sel manifest_r.err) { ret res[intern.StrId, fail.Fail].err{manifest_r.err}; }
+
+    val gm_tracked: err[fail.Fail] = git.require_tracked(s, gi, alias, parent_root, ".gitmodules", "staged dependency metadata");
+    if (sel gm_tracked.err) { ret res[intern.StrId, fail.Fail].err{gm_tracked.err}; }
+    val gm_clean: err[fail.Fail] = git.require_matches_index(s, gi, alias, parent_root, ".gitmodules", "staged dependency metadata");
+    if (sel gm_clean.err) { ret res[intern.StrId, fail.Fail].err{gm_clean.err}; }
+
+    val rel_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "{}/{}", dir_dep, alias);
+    if (sel rel_r.err) { ret res[intern.StrId, fail.Fail].err{fail.message(fail.format_text(rel_r.err))}; }
+    val rel: str = rel_r.ok;
+
+    val gm_sha_r: res[str, fail.Fail] = git.index_entry_field(s, gi, alias, parent_root, ".gitmodules", 1, "staged dependency metadata");
+    if (sel gm_sha_r.err) {
+        str_free(s.build_alloc, rel);
+        ret res[intern.StrId, fail.Fail].err{gm_sha_r.err};
+    }
+    val gm_sha:         str                              = gm_sha_r.ok;
+    val modules_spec_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "--blob={}", gm_sha);
+    str_free(s.build_alloc, gm_sha);
+    if (sel modules_spec_r.err) {
+        str_free(s.build_alloc, rel);
+        ret res[intern.StrId, fail.Fail].err{fail.message(fail.format_text(modules_spec_r.err))};
+    }
+    val modules_spec: str = modules_spec_r.ok;
+
+    val path_key_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "submodule.{}.path", rel);
+    if (sel path_key_r.err) {
+        str_free(s.build_alloc, modules_spec);
+        str_free(s.build_alloc, rel);
+        ret res[intern.StrId, fail.Fail].err{fail.message(fail.format_text(path_key_r.err))};
+    }
+    val path_key:    str = path_key_r.ok;
+    var config_args: [4]str;
+    config_args[0] = "config";
+    config_args[1] = modules_spec;
+    config_args[2] = "--get-all";
+    config_args[3] = path_key;
+    val path_r: res[str, fail.Fail] = git.query_named(s, gi, alias, parent_root, ?config_args[0], 4, ".gitmodules path");
+    str_free(s.build_alloc, path_key);
+    if (sel path_r.err) {
+        str_free(s.build_alloc, modules_spec);
+        str_free(s.build_alloc, rel);
+        ret res[intern.StrId, fail.Fail].err{path_r.err};
+    }
+    val observed_path: str = path_r.ok;
+    if (!str_equals(observed_path, rel)) {
+        str_free(s.build_alloc, observed_path);
+        str_free(s.build_alloc, modules_spec);
+        str_free(s.build_alloc, rel);
+        ret res[intern.StrId, fail.Fail].err{fail.user(diagnostic_kind.DEP_GITMODULES_MISMATCH, "dependency .gitmodules path does not match its package-owned realization")};
+    }
+    str_free(s.build_alloc, observed_path);
+
+    val url_key_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "submodule.{}.url", rel);
+    if (sel url_key_r.err) {
+        str_free(s.build_alloc, modules_spec);
+        str_free(s.build_alloc, rel);
+        ret res[intern.StrId, fail.Fail].err{fail.message(fail.format_text(url_key_r.err))};
+    }
+    val url_key: str = url_key_r.ok;
+    config_args[3] = url_key;
+    val url_r: res[str, fail.Fail] = git.query_named(s, gi, alias, parent_root, ?config_args[0], 4, ".gitmodules URL");
+    str_free(s.build_alloc, url_key);
+    str_free(s.build_alloc, modules_spec);
+    if (sel url_r.err) {
+        str_free(s.build_alloc, rel);
+        ret res[intern.StrId, fail.Fail].err{url_r.err};
+    }
+    val observed_url: str      = url_r.ok;
+    val source_opt:   opt[str] = intern.lookup(?s.interner, d.git);
+    if (sel source_opt.none) {
+        str_free(s.build_alloc, observed_url);
+        str_free(s.build_alloc, rel);
+        ret res[intern.StrId, fail.Fail].err{fail.message("dependency Git source is not interned")};
+    }
+    if (!str_equals(observed_url, source_opt.some)) {
+        str_free(s.build_alloc, observed_url);
+        str_free(s.build_alloc, rel);
+        ret res[intern.StrId, fail.Fail].err{fail.user(diagnostic_kind.DEP_GITMODULES_MISMATCH, "dependency .gitmodules URL does not match manifest source")};
+    }
+    str_free(s.build_alloc, observed_url);
+
+    val mode_r: res[str, fail.Fail] = git.index_entry_field(s, gi, alias, parent_root, rel, 0, "staged gitlink");
+    if (sel mode_r.err) {
+        str_free(s.build_alloc, rel);
+        ret res[intern.StrId, fail.Fail].err{mode_r.err};
+    }
+    val mode_text:  str  = mode_r.ok;
+    val is_gitlink: bool = str_equals(mode_text, "160000");
+    str_free(s.build_alloc, mode_text);
+    if (!is_gitlink) {
+        str_free(s.build_alloc, rel);
+        ret res[intern.StrId, fail.Fail].err{fail.user(diagnostic_kind.DEP_NOT_GITLINK, "dependency path is not a staged gitlink")};
+    }
+    val sha_r: res[str, fail.Fail] = git.index_entry_field(s, gi, alias, parent_root, rel, 1, "staged gitlink");
+    str_free(s.build_alloc, rel);
+    if (sel sha_r.err) { ret res[intern.StrId, fail.Fail].err{sha_r.err}; }
+    val gitlink: str = sha_r.ok;
+    if (!git.object_id_valid(gitlink)) {
+        str_free(s.build_alloc, gitlink);
+        ret res[intern.StrId, fail.Fail].err{fail.user(diagnostic_kind.DEP_NOT_GITLINK, "dependency path is not a staged gitlink")};
+    }
+    val content_r: res[intern.StrId, A.Error] = intern.intern(?s.interner, gitlink);
+    str_free(s.build_alloc, gitlink);
+    if (sel content_r.err) { ret res[intern.StrId, fail.Fail].err{fail.refused(content_r.err)}; }
+    ret res[intern.StrId, fail.Fail].ok{content_r.ok};
+}
+
+# the way out of a pin outside a selection: re-pin it, and for a requirer's selection also
+# the root override; the root's own selection has nothing above it to override it
+fun repin_remedy(s: *session.Session, alias: str, project_root: str, root_own: bool) res[str, fail.Fail] {
+    var r: res[str, std_format.FormatError];
+    if (root_own) {
+        r = std_format.sprint(s.build_alloc, "run `mach dep update <path> {}` for project '{}' to re-pin it to the root's selection", alias, project_root);
+    }
+    or {
+        r = std_format.sprint(s.build_alloc, "run `mach dep update <path> {}` for project '{}' to re-pin it, or declare the identity at the root to override", alias, project_root);
+    }
+    if (sel r.err) { ret res[str, fail.Fail].err{fail.message(fail.format_text(r.err))}; }
+    ret res[str, fail.Fail].ok{r.ok};
+}
+
+fun selector_satisfied(s: *session.Session, gi: *git.Inspector, alias: str, chain: str, project_root: str, dep_dir: str, ref: str, pin: str,
+    root_own: bool) err[fail.Fail] {
+    if (str_empty(ref) || str_starts_with(ref, "branch/")) { ret err[fail.Fail].ok{}; }
+    var want:  str  = "";
+    var owned: bool = false;
+    if (str_starts_with(ref, "commit/")) { want = (?ref[7])::str; }
+    or (str_starts_with(ref, "tag/")) {
+        val spec_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "refs/tags/{}^{{commit}}", (?ref[4])::str);
+        if (sel spec_r.err) { ret err[fail.Fail].err{fail.message(fail.format_text(spec_r.err))}; }
+        val spec: str = spec_r.ok;
+        var args: [4]str;
+        args[0] = "rev-parse";
+        args[1] = "--verify";
+        args[2] = "--quiet";
+        args[3] = spec;
+        val r: res[str, fail.Fail] = git.query(s.build_alloc, gi, dep_dir, ?args[0], 4);
+        str_free(s.build_alloc, spec);
+        if (sel r.err) {
+            val mr: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+                "dependency '{}': exact ref '{}' required by {} names a tag the checkout does not have; run `mach dep update <path> {}` or `mach dep pull <path>` for project '{}'", alias, ref, chain, alias, project_root);
+            if (sel mr.err) { ret err[fail.Fail].err{fail.format_refused(mr.err)}; }
+            ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_REF_MISMATCH, mr.ok)};
+        }
+        want  = r.ok;
+        owned = true;
+    }
+    or { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_REF_INVALID, "dependency ref kind is invalid")}; }
+    val ok: bool = str_equals(want, pin);
+    if (ok) {
+        if (owned) { str_free(s.build_alloc, want); }
+        ret err[fail.Fail].ok{};
+    }
+    val remedy: res[str, fail.Fail] = repin_remedy(s, alias, project_root, root_own);
+    if (sel remedy.err) {
+        if (owned) { str_free(s.build_alloc, want); }
+        ret err[fail.Fail].err{remedy.err};
+    }
+    val mr: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+        "dependency '{}': exact ref '{}' required by {} resolves to '{}' but the realized commit is '{}'; {}",
+        alias, ref, chain, want, pin, remedy.ok);
+    str_free(s.build_alloc, remedy.ok);
+    if (owned)      { str_free(s.build_alloc, want); }
+    if (sel mr.err) { ret err[fail.Fail].err{fail.format_refused(mr.err)}; }
+    ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_REF_MISMATCH, mr.ok)};
+}
+
+pub fun requirer_selector_satisfied(s: *session.Session, gi: *git.Inspector, alias: str, chain: str, project_root: str,
+    dir_dep: str, d: *manifest.DepDef, content: intern.StrId, root_own: bool) err[fail.Fail] {
+    if (d.git == intern.STR_NIL)   { ret err[fail.Fail].ok{}; }
+    if (content == intern.STR_NIL) { ret err[fail.Fail].ok{}; }
+    val content_text: str = intern.text(?s.interner, content);
+    if (!str_starts_with(content_text, "git/")) { ret err[fail.Fail].ok{}; }
+    val pin:       str                 = (?content_text[4])::str;
+    val dep_dir_r: res[str, fail.Fail] = driver_closure.build_dep_root(s.build_alloc, project_root, dir_dep, alias);
+    if (sel dep_dir_r.err) { ret err[fail.Fail].err{dep_dir_r.err}; }
+    val dep_dir: str = dep_dir_r.ok;
+    fin { str_free(s.build_alloc, dep_dir); }
+    if (d.version != intern.STR_NIL) {
+        ret range_satisfied(s, gi, alias, chain, project_root, dep_dir, intern.text(?s.interner, d.version), pin, root_own);
+    }
+    if (d.ref == intern.STR_NIL) { ret err[fail.Fail].ok{}; }
+    ret selector_satisfied(s, gi, alias, chain, project_root, dep_dir, intern.text(?s.interner, d.ref), pin, root_own);
+}
+
+# a version selection holds when the pinned commit carries a release tag, read offline
+# from the checkout's refs, whose version the requirer's range contains
+fun range_satisfied(s: *session.Session, gi: *git.Inspector, alias: str, chain: str, project_root: str,
+    dep_dir: str, want: str, pin: str, root_own: bool) err[fail.Fail] {
+    val a:   *A.Allocator        = s.build_alloc;
+    val rel: res[str, fail.Fail] = git_checkout.release_at(a, gi, dep_dir, pin);
+    if (sel rel.err) { ret err[fail.Fail].err{rel.err}; }
+    val have: str = rel.ok;
+    fin { str_free(a, have); }
+    var mr: res[str, std_format.FormatError];
+    if (str_empty(have)) {
+        val tagged: res[bool, fail.Fail] = git_checkout.has_tags(a, gi, dep_dir);
+        if (sel tagged.err) { ret err[fail.Fail].err{tagged.err}; }
+        if (!tagged.ok) {
+            mr = std_format.sprint(a,
+                "dependency '{}': {} requires version '{}' but the release of the pinned commit '{}' cannot be read: its checkout at {} holds no tags (a shallow clone fetches none); run `mach dep pull <path>` for project '{}' to fetch them",
+                alias, chain, want, pin, dep_dir, project_root);
+        }
+        or {
+            mr = std_format.sprint(a,
+                "dependency '{}': {} requires version '{}' but no release tag in its checkout names the pinned commit '{}'; run `mach dep pull <path>` for project '{}' to fetch its tags, or `mach dep update <path> {}` to pin a release",
+                alias, chain, want, pin, project_root, alias);
+        }
+    }
+    or {
+        val rr: res[manifest_version.Range, manifest_version.RangeError] = manifest_version.parse_range(want);
+        if (sel rr.err) { ret err[fail.Fail].err{fail.user(diagnostic_kind.VERSION_INVALID_RANGE, rr.err.reason)}; }
+        val vr: res[manifest_version.Version, str] = manifest_version.parse_version(have);
+        if (sel vr.err) { ret err[fail.Fail].err{fail.user(diagnostic_kind.VERSION_INVALID, vr.err)}; }
+        var r: manifest_version.Range   = rr.ok;
+        var v: manifest_version.Version = vr.ok;
+        if (manifest_version.satisfies(?r, ?v)) { ret err[fail.Fail].ok{}; }
+        val remedy: res[str, fail.Fail] = repin_remedy(s, alias, project_root, root_own);
+        if (sel remedy.err) { ret err[fail.Fail].err{remedy.err}; }
+        mr = std_format.sprint(a, "dependency '{}': {} requires version '{}' but the pinned release is {}; {}", alias, chain, want, have, remedy.ok);
+        str_free(a, remedy.ok);
+    }
+    if (sel mr.err) { ret err[fail.Fail].err{fail.format_refused(mr.err)}; }
+    ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_VERSION_UNMET, mr.ok)};
+}
+
+fun checkout(s: *session.Session, gi: *git.Inspector, alias: str,
+    parent_root: str, dep_dir: str, dir_dep: str,
+    d: *manifest.DepDef, authority: u8) res[intern.StrId, fail.Fail] {
+    var gitlink: str = "";
+    if (authority == git.AUTHORITY_REPO) {
+        val gitlink_r: res[intern.StrId, fail.Fail] = parent_gitlink(s, gi, alias, parent_root, dir_dep, d);
+        if (sel gitlink_r.err) { ret res[intern.StrId, fail.Fail].err{gitlink_r.err}; }
+        val gitlink_id:  intern.StrId = gitlink_r.ok;
+        val gitlink_opt: opt[str]     = intern.lookup(?s.interner, gitlink_id);
+        if (sel gitlink_opt.none) { ret res[intern.StrId, fail.Fail].err{fail.message("dependency gitlink is not interned")}; }
+        gitlink = gitlink_opt.some;
+    }
+
+    val child_root_r: err[fail.Fail] = git.require_root(s, gi, alias, dep_dir, "checkout identity");
+    if (sel child_root_r.err) { ret res[intern.StrId, fail.Fail].err{child_root_r.err}; }
+    val child_prefix_r: res[str, fail.Fail] = git.declaring_prefix(s, gi, alias, dep_dir);
+    if (sel child_prefix_r.err) { ret res[intern.StrId, fail.Fail].err{child_prefix_r.err}; }
+    val child_prefix: str = child_prefix_r.ok;
+    if (!str_empty(child_prefix)) {
+        str_free(s.build_alloc, child_prefix);
+        ret res[intern.StrId, fail.Fail].err{fail.user(diagnostic_kind.DEP_NOT_REPOSITORY_ROOT, "dependency checkout must be the repository root")};
+    }
+    str_free(s.build_alloc, child_prefix);
+
+    var head_args: [2]str;
+    head_args[0] = "rev-parse";
+    head_args[1] = "HEAD";
+    val head_r: res[str, fail.Fail] = git.query_named(s, gi, alias, dep_dir, ?head_args[0], 2, "checkout HEAD");
+    if (sel head_r.err) { ret res[intern.StrId, fail.Fail].err{head_r.err}; }
+    val head: str = head_r.ok;
+    if (!str_empty(gitlink) && !str_equals(head, gitlink)) {
+        val mr: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+            "dependency '{}': the checkout is at '{}' but the recorded gitlink is '{}'; run `mach dep pull <path>` for project '{}' to restore the recorded pin, or `mach dep update <path> {}` to re-pin it to the manifest's selection",
+            alias, head, gitlink, parent_root, alias);
+        str_free(s.build_alloc, head);
+        if (sel mr.err) { ret res[intern.StrId, fail.Fail].err{fail.format_refused(mr.err)}; }
+        ret res[intern.StrId, fail.Fail].err{fail.user(diagnostic_kind.DEP_REF_MISMATCH, mr.ok)};
+    }
+    var pin: str = gitlink;
+    if (str_empty(pin)) { pin = head; }
+
+    # a version range selects releases; whether the pin is one the range accepts is checked with the closure's ranges
+    var ref: str = "tag/";
+    if (d.version == intern.STR_NIL) {
+        val ref_opt: opt[str] = intern.lookup(?s.interner, d.ref);
+        if (sel ref_opt.none) {
+            str_free(s.build_alloc, head);
+            ret res[intern.StrId, fail.Fail].err{fail.message("dependency Git ref is not interned")};
+        }
+        ref = ref_opt.some;
+    }
+    if (str_starts_with(ref, "commit/")) {
+        if (!str_equals((?ref[7])::str, pin)) {
+            val mr: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+                "dependency '{}': exact commit ref '{}' is not satisfied by the realized commit '{}'",
+                alias, ref, pin);
+            str_free(s.build_alloc, head);
+            if (sel mr.err) { ret res[intern.StrId, fail.Fail].err{fail.format_refused(mr.err)}; }
+            ret res[intern.StrId, fail.Fail].err{fail.user(diagnostic_kind.DEP_REF_MISMATCH, mr.ok)};
+        }
+    }
+    or (str_starts_with(ref, "tag/") || str_starts_with(ref, "branch/")) {}
+    or {
+        str_free(s.build_alloc, head);
+        ret res[intern.StrId, fail.Fail].err{fail.user(diagnostic_kind.DEP_REF_INVALID, "dependency ref kind is invalid")};
+    }
+
+    var status_args: [3]str;
+    status_args[0] = "status";
+    status_args[1] = "--porcelain=v1";
+    status_args[2] = "--untracked-files=all";
+    val status_r: res[str, fail.Fail] = git.query_named(s, gi, alias, dep_dir, ?status_args[0], 3, "checkout cleanliness");
+    if (sel status_r.err) {
+        str_free(s.build_alloc, head);
+        ret res[intern.StrId, fail.Fail].err{status_r.err};
+    }
+    val status: str = status_r.ok;
+    if (!str_empty(status)) {
+        val mr: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+            "dependency '{}': checkout is dirty: {}", alias, status);
+        str_free(s.build_alloc, status);
+        str_free(s.build_alloc, head);
+        if (sel mr.err) { ret res[intern.StrId, fail.Fail].err{fail.format_refused(mr.err)}; }
+        ret res[intern.StrId, fail.Fail].err{fail.user(diagnostic_kind.DEP_DIRTY, mr.ok)};
+    }
+    str_free(s.build_alloc, status);
+    val links_r: err[fail.Fail] = realization_symlinks(s, gi, alias, dep_dir, "", dep_dir);
+    if (sel links_r.err) {
+        str_free(s.build_alloc, head);
+        ret res[intern.StrId, fail.Fail].err{links_r.err};
+    }
+    val content_text_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "git/{}", pin);
+    str_free(s.build_alloc, head);
+    if (sel content_text_r.err) { ret res[intern.StrId, fail.Fail].err{fail.message(fail.format_text(content_text_r.err))}; }
+    val content_text: str                        = content_text_r.ok;
+    val content_r:    res[intern.StrId, A.Error] = intern.intern(?s.interner, content_text);
+    str_free(s.build_alloc, content_text);
+    if (sel content_r.err) { ret res[intern.StrId, fail.Fail].err{fail.refused(content_r.err)}; }
+    ret res[intern.StrId, fail.Fail].ok{content_r.ok};
+}
+
+pub fun realized(s: *session.Session, gi: *git.Inspector, alias: str, parent_root: str,
+    dep_dir: str, dir_dep: str, d: *manifest.DepDef) res[intern.StrId, fail.Fail] {
+    val er: err[fail.Fail] = git.inspector_require(s.build_alloc, gi);
+    if (sel er.err) { ret res[intern.StrId, fail.Fail].err{er.err}; }
+    val auth_r: res[u8, fail.Fail] = git.project_root_authority(s, gi, alias, parent_root);
+    if (sel auth_r.err) { ret res[intern.StrId, fail.Fail].err{auth_r.err}; }
+    val authority: u8 = auth_r.ok;
+    ret checkout(s, gi, alias, parent_root, dep_dir, dir_dep, d, authority);
+}
+
+test realized_content__nested_project_verifies_checkout {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val gi_r: res[git.Inspector, fail.Fail] = git.inspector_init(?alloc);
+    if (sel gi_r.err) { ret 1; }
+    var gi: git.Inspector = gi_r.ok;
+
+    val fixture_r: res[str, fail.Fail] = git.t_make_fixture_repo(?alloc, ?gi, "std");
+    if (sel fixture_r.err) {
+        git.inspector_dnit(?alloc, ?gi);
+        ret 1;
+    }
+    val fixture: str = fixture_r.ok;
+
+    val outer_r: res[str, fail.Fail] = git.t_make_fixture_repo(?alloc, ?gi, "outer");
+    if (sel outer_r.err) {
+        git.inspector_dnit(?alloc, ?gi);
+        ret 1;
+    }
+    val outer: str = outer_r.ok;
+
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) {
+        git.inspector_dnit(?alloc, ?gi);
+        ret 1;
+    }
+    var s: session.Session = sr.ok;
+
+    var bad:    i32                 = 0;
+    val proj_r: res[str, fail.Fail] = git.t_mkdirs(?alloc, outer, "cases/one");
+    if (sel proj_r.err) { ret 99; }
+    if (bad == 0) {
+        val proj:     str                 = proj_r.ok;
+        val depdir_r: res[str, fail.Fail] = git.t_mkdirs(?alloc, proj, "dep");
+        if (sel depdir_r.err) { bad = 1; }
+        if (sel depdir_r.ok) {
+            val depdir:     str = depdir_r.ok;
+            var clone_args: [3]str;
+            clone_args[0] = "clone";
+            clone_args[1] = fixture;
+            clone_args[2] = "std";
+            var env: [4]*u8;
+            git.t_env_allow_file_protocol(?env[0]);
+            val clone_r: res[str, fail.Fail] = git.op(?alloc, ?gi, depdir, ?clone_args[0], 3, ?env[0]);
+            if (sel clone_r.err) { bad = 1; }
+            if (sel clone_r.ok)  { str_free(?alloc, clone_r.ok); }
+            str_free(?alloc, depdir);
+        }
+
+        if (bad == 0) {
+            var d: manifest.DepDef;
+            d.path    = intern.STR_NIL;
+            d.version = intern.STR_NIL;
+            val nr: res[intern.StrId, A.Error] = intern.intern(?s.interner, "std");
+            val ur: res[intern.StrId, A.Error] = intern.intern(?s.interner, fixture);
+            val rr: res[intern.StrId, A.Error] = intern.intern(?s.interner, "branch/main");
+            if (sel nr.err) { ret 99; }
+            if (sel ur.err) { ret 99; }
+            if (sel rr.ok) {
+                d.name = nr.ok;
+                d.git  = ur.ok;
+                d.ref  = rr.ok;
+                val dep_full_r: res[str, A.Error] = types_path.join(?alloc, proj, "dep/std");
+                if (sel dep_full_r.err) { ret 99; }
+                val dep_full:  str                          = dep_full_r.ok;
+                var gi2:       git.Inspector                = git.Inspector{program: nil};
+                val content_r: res[intern.StrId, fail.Fail] = realized(?s, ?gi2, "std", proj, dep_full, "dep", ?d);
+                git.inspector_dnit(?alloc, ?gi2);
+                if (sel content_r.err) { bad = 1; }
+                if (sel content_r.ok) {
+                    val text_o: opt[str] = intern.lookup(?s.interner, content_r.ok);
+                    if (sel text_o.none)                       { ret 99; }
+                    if (!str_starts_with(text_o.some, "git/")) { bad = 1; }
+                }
+                str_free(?alloc, dep_full);
+            }
+        }
+        str_free(?alloc, proj);
+    }
+
+    session.dnit(?s);
+    fs.remove_all(?alloc, outer);
+    fs.remove_all(?alloc, fixture);
+    str_free(?alloc, outer);
+    str_free(?alloc, fixture);
+    git.inspector_dnit(?alloc, ?gi);
+    ret bad;
+}
+
+test git_environment__clean_crlf_checkout_verifies_and_real_edit_is_refused {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val gi_r: res[git.Inspector, fail.Fail] = git.inspector_init(?alloc);
+    if (sel gi_r.err) { ret 2; }
+    var gi: git.Inspector = gi_r.ok;
+    fin { git.inspector_dnit(?alloc, ?gi); }
+    val fixture_r: res[str, fail.Fail] = git.t_make_fixture_repo(?alloc, ?gi, "std");
+    if (sel fixture_r.err) { ret 3; }
+    val fixture: str = fixture_r.ok;
+    fin {
+        fs.remove_all(?alloc, fixture);
+        str_free(?alloc, fixture);
+    }
+    val root_r: res[str, fail.Fail] = git.t_scratch_dir(?alloc, "mach_git_config");
+    if (sel root_r.err) { ret 4; }
+    val root: str = root_r.ok;
+    fin {
+        fs.remove_all(?alloc, root);
+        str_free(?alloc, root);
+    }
+    val t_write_file_r: err[fail.Fail] = git.t_write_file(?alloc, root, "global",
+        "[core]\n\tautocrlf = true\n");
+    if (sel t_write_file_r.err) { ret 5; }
+    val config_r: res[str, std_format.FormatError] = std_format.sprint(?alloc, "GIT_CONFIG_GLOBAL={}/global", root);
+    if (sel config_r.err) { ret 6; }
+    val config: str = config_r.ok;
+    fin { str_free(?alloc, config); }
+    val ambient_n: usize              = git.count_nil_terminated(gi.inherited_env);
+    val env_r:     res[**u8, A.Error] = A.allocate[*u8](?alloc, ambient_n + 7);
+    if (sel env_r.err) { ret 7; }
+    val inherited: **u8 = env_r.ok;
+    fin { A.deallocate[*u8](?alloc, inherited, ambient_n + 7); }
+    var count: usize = 0;
+    var i:     usize = 0;
+    for (i < ambient_n) {
+        val reserved: res[bool, fail.Fail] = git.env_prefix(?alloc, gi.inherited_env[i], "GIT_");
+        if (sel reserved.err) { ret 41; }
+        if (!reserved.ok) {
+            inherited[count] = gi.inherited_env[i];
+            count            = count + 1;
+        }
+        i = i + 1;
+    }
+    inherited[count]     = config::*u8;
+    inherited[count + 1] = "GIT_CONFIG_NOSYSTEM=1";
+    inherited[count + 2] = nil;
+    var ordinary_args: [7]*u8;
+    ordinary_args[0] = gi.program::*u8;
+    ordinary_args[1] = "-C";
+    ordinary_args[2] = root::*u8;
+    ordinary_args[3] = "clone";
+    ordinary_args[4] = fixture::*u8;
+    ordinary_args[5] = "std";
+    ordinary_args[6] = nil;
+    val cloned: res[exec.ExitStatus, exec.Error] = exec.run(gi.program, ?ordinary_args[0], inherited);
+    if (sel cloned.err) { ret 8; }
+    val clone_status: exec.ExitStatus = cloned.ok;
+    if (!exec.exited(clone_status) || exec.code(clone_status) != 0) { ret 8; }
+    val clone_r: res[str, A.Error] = types_path.join(?alloc, root, "std");
+    if (sel clone_r.err) { ret 9; }
+    val clone: str = clone_r.ok;
+    fin { str_free(?alloc, clone); }
+    ordinary_args[2] = clone::*u8;
+    ordinary_args[3] = "diff";
+    ordinary_args[4] = "--exit-code";
+    ordinary_args[5] = "--quiet";
+    val ordinary_clean: res[exec.ExitStatus, exec.Error] = exec.run(gi.program, ?ordinary_args[0], inherited);
+    if (sel ordinary_clean.err) { ret 22; }
+    val ordinary_status: exec.ExitStatus = ordinary_clean.ok;
+    if (!exec.exited(ordinary_status) || exec.code(ordinary_status) != 0) { ret 22; }
+    val toml_r: res[str, A.Error] = types_path.join(?alloc, clone, "mach.toml");
+    if (sel toml_r.err) { ret 10; }
+    val toml_path: str = toml_r.ok;
+    fin { str_free(?alloc, toml_path); }
+    val text_r: res[str, fs.FsError] = fs.read_string(?alloc, toml_path);
+    if (sel text_r.err) { ret 11; }
+    val text: str = text_r.ok;
+    fin { str_free(?alloc, text); }
+    if (!str_contains(text, "\r\n")) { ret 12; }
+    val t_write_file_r2: err[fail.Fail] = git.t_write_file(?alloc, root, "global",
+        "[core]\n\tautocrlf = true\n\tfsmonitor = missing-mach-test-monitor\n\tuntrackedCache = true\n");
+    if (sel t_write_file_r2.err) { ret 23; }
+    inherited[count + 2] = "GIT_DIR=/missing-mach-test-repository";
+    inherited[count + 3] = "GIT_WORK_TREE=/missing-mach-test-worktree";
+    inherited[count + 4] = "GIT_INDEX_FILE=/missing-mach-test-index";
+    inherited[count + 5] = "MACH_ENV_PROBE=inherited";
+    inherited[count + 6] = nil;
+    gi.inherited_env     = inherited;
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 13; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+    var d: manifest.DepDef;
+    d.version = intern.STR_NIL;
+    val branch: res[intern.StrId, A.Error] = intern.intern(?s.interner, "branch/main");
+    if (sel branch.err) { ret 13; }
+    d.ref = branch.ok;
+    val clean: res[intern.StrId, fail.Fail] = checkout(?s, ?gi, "std", root, clone, "dep", ?d, git.AUTHORITY_NESTED);
+    if (sel clean.err) { ret 14; }
+    var config_args: [3]str;
+    config_args[0] = "config";
+    config_args[1] = "--get";
+    config_args[2] = "core.fsmonitor";
+    val monitor_r: res[str, fail.Fail] = git.query(?alloc, ?gi, clone, ?config_args[0], 3);
+    if (sel monitor_r.err) { ret 18; }
+    val monitor:          str  = monitor_r.ok;
+    val monitor_disabled: bool = str_equals(monitor, "false");
+    str_free(?alloc, monitor);
+    if (!monitor_disabled) { ret 19; }
+    config_args[2] = "core.untrackedCache";
+    val cache_r: res[str, fail.Fail] = git.query(?alloc, ?gi, clone, ?config_args[0], 3);
+    if (sel cache_r.err) { ret 20; }
+    val cache:          str  = cache_r.ok;
+    val cache_disabled: bool = str_equals(cache, "false");
+    str_free(?alloc, cache);
+    if (!cache_disabled) { ret 21; }
+    val t_write_file_r3: err[fail.Fail] = git.t_write_file(?alloc, clone, "mach.toml", "edited\r\n");
+    if (sel t_write_file_r3.err) { ret 15; }
+    val dirty: res[intern.StrId, fail.Fail] = checkout(?s, ?gi, "std", root, clone, "dep", ?d, git.AUTHORITY_NESTED);
+    if (sel dirty.ok) { ret 16; }
+    val error: str  = fail.describe(dirty.err);
+    val named: bool = str_contains(error, "checkout is dirty:") && str_contains(error, "mach.toml");
+    str_free(?alloc, error);
+    if (!named) { ret 17; }
+    val t_write_file_r4: err[fail.Fail] = git.t_write_file(?alloc, root, "override", "[mach]\n\torigin = explicit\n");
+    if (sel t_write_file_r4.err) { ret 24; }
+    val override_r: res[str, std_format.FormatError] = std_format.sprint(?alloc, "GIT_CONFIG_GLOBAL={}/override", root);
+    if (sel override_r.err) { ret 25; }
+    val override: str = override_r.ok;
+    fin { str_free(?alloc, override); }
+    var extras: [9]*u8;
+    extras[0] = override::*u8;
+    extras[1] = "GIT_OPTIONAL_LOCKS=1";
+    extras[2] = "GIT_TERMINAL_PROMPT=1";
+    extras[3] = "GIT_DIR=/missing-mach-test-repository";
+    extras[4] = "GIT_WORK_TREE=/missing-mach-test-worktree";
+    extras[5] = "GIT_INDEX_FILE=/missing-mach-test-index";
+    extras[6] = "MACH_ENV_PROBE=first";
+    extras[7] = "MACH_ENV_PROBE=explicit";
+    extras[8] = nil;
+    var probe_args: [3]str;
+    probe_args[0] = "-c";
+    probe_args[1] = "alias.mach-env=!test \"$GIT_OPTIONAL_LOCKS\" = 0 && test \"$GIT_TERMINAL_PROMPT\" = 0 && test \"$MACH_ENV_PROBE\" = explicit && git config --get mach.origin";
+    probe_args[2] = "mach-env";
+    val probe_r: res[str, fail.Fail] = git.op(?alloc, ?gi, clone, ?probe_args[0], 3, ?extras[0]);
+    if (sel probe_r.err) { ret 26; }
+    val probe:         str  = probe_r.ok;
+    val override_seen: bool = str_equals(probe, "explicit");
+    str_free(?alloc, probe);
+    if (!override_seen) { ret 27; }
+    ret 0;
+}
+
+#[testing]
+fun t_symlink_rel_is(s: *session.Session, rel: str, target: str, expected: str) bool {
+    val r: res[str, fail.Fail] = symlink_target_rel(s, rel, target);
+    if (sel r.err) { ret false; }
+    val actual: str = r.ok;
+    fin { str_free(s.build_alloc, actual); }
+    ret str_equals(actual, expected);
+}
+
+test symlink_target_rel__canonical_git_names_preserve_native_components {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+    if (!t_symlink_rel_is(?s, "src/link", "lib.mach", "src/lib.mach"))           { ret 2; }
+    if (!t_symlink_rel_is(?s, "src/nested/link", "../lib.mach", "src/lib.mach")) { ret 3; }
+    if (!t_symlink_rel_is(?s, "src/link", "..", "."))                            { ret 4; }
+    if (!t_symlink_rel_is(?s, "src/link", "./a/../lib.mach", "src/lib.mach"))    { ret 5; }
+    if (!t_symlink_rel_is(?s, "src/link", "../..hidden", "..hidden"))            { ret 6; }
+    $if ($mach.build.os == $mach.os.windows) {
+        if (!t_symlink_rel_is(?s, "src/link", "nested\\..\\lib.mach", "src/lib.mach")) { ret 7; }
+    }
+    $or {
+        if (!t_symlink_rel_is(?s, "src/link", "nested\\leaf", "src/nested\\leaf")) { ret 7; }
+    }
+    ret 0;
+}
+
+test symlink_target_rel__rejects_parent_escapes_and_absolute_anchors {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+    var targets: [3]str = [3]str{"../../outside", "../..", "../../package-sibling/file"};
+    var i:       usize  = 0;
+    for (i < 3) {
+        val r: res[str, fail.Fail] = symlink_target_rel(?s, "src/link", targets[i]);
+        if (sel r.ok) {
+            str_free(s.build_alloc, r.ok);
+            ret 2;
+        }
+        if (!str_equals(fail.describe(r.err), "tracked symlink target escapes dependency package")) { ret 3; }
+        i = i + 1;
+    }
+    var absolute: [6]str = [6]str{"", "/outside", "C:relative", "C:/outside", "\\outside", "\\\\server\\share\\outside"};
+    i = 0;
+    for (i < 6) {
+        val r: res[str, fail.Fail] = symlink_target_rel(?s, "src/link", absolute[i]);
+        if (sel r.ok) {
+            str_free(s.build_alloc, r.ok);
+            ret 4;
+        }
+        if (!str_equals(fail.describe(r.err), "tracked symlink target must be relative")) { ret 5; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test verify_symlinks__contained_chain_uses_git_names_and_rejects_cycles_and_escapes {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val gr: res[git.Inspector, fail.Fail] = git.inspector_init(?alloc);
+    if (sel gr.err) { ret 1; }
+    var gi: git.Inspector = gr.ok;
+    fin { git.inspector_dnit(?alloc, ?gi); }
+    val root_r: res[str, fail.Fail] = git.t_make_fixture_repo(?alloc, ?gi, "symlinkcase");
+    if (sel root_r.err) { ret 1; }
+    val root: str = root_r.ok;
+    fin {
+        fs.remove_all(?alloc, root);
+        str_free(?alloc, root);
+    }
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) { ret 1; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+    val dr: res[str, fail.Fail] = git.t_mkdirs(?alloc, root, "src/deep");
+    if (sel dr.err) { ret 1; }
+    str_free(?alloc, dr.ok);
+    val t_write_file_r: err[fail.Fail] = git.t_write_file(?alloc, root, "src/value.mach", "pub fun value() i32 { ret 0; }\n");
+    if (sel t_write_file_r.err) { ret 1; }
+    val first_r: res[types_path.Path, A.Error] = types_path.join(?alloc, root, "src/start.mach");
+    if (sel first_r.err) { ret 1; }
+    val first: str = first_r.ok;
+    fin { str_free(?alloc, first); }
+    val next_r: res[types_path.Path, A.Error] = types_path.join(?alloc, root, "src/deep/next.mach");
+    if (sel next_r.err) { ret 1; }
+    val next: str = next_r.ok;
+    fin { str_free(?alloc, next); }
+    val symlink_r2: err[io_error.Error] = fs.symlink("deep/next.mach", first);
+    if (sel symlink_r2.err) { ret 2; }
+    val symlink_r: err[io_error.Error] = fs.symlink("../value.mach", next);
+    if (sel symlink_r.err)                                           { ret 2; }
+    if (!git.t_symlink_commit(?alloc, ?gi, root, "contained chain")) { ret 2; }
+    val contained: err[fail.Fail] = realization_symlinks(?s, ?gi, "symlinkcase", root, "", root);
+    if (sel contained.err) {
+        print.eprintln(fail.describe(contained.err));
+        ret 3;
+    }
+    val remove_file_r: err[io_error.Error] = fs.remove_file(next);
+    if (sel remove_file_r.err) { ret 4; }
+    val symlink_r3: err[io_error.Error] = fs.symlink("../../src/start.mach", next);
+    if (sel symlink_r3.err)                                { ret 4; }
+    if (!git.t_symlink_commit(?alloc, ?gi, root, "cycle")) { ret 4; }
+    val cycle: err[fail.Fail] = realization_symlinks(?s, ?gi, "symlinkcase", root, "", root);
+    if (sel cycle.ok)                                                                         { ret 5; }
+    if (!str_equals(fail.describe(cycle.err), "tracked symlink cycle in dependency package")) { ret 5; }
+    val remove_file_r2: err[io_error.Error] = fs.remove_file(next);
+    if (sel remove_file_r2.err) { ret 6; }
+    val symlink_r4: err[io_error.Error] = fs.symlink("../../../outside", next);
+    if (sel symlink_r4.err)                                 { ret 6; }
+    if (!git.t_symlink_commit(?alloc, ?gi, root, "escape")) { ret 6; }
+    val escape: err[fail.Fail] = realization_symlinks(?s, ?gi, "symlinkcase", root, "", root);
+    if (sel escape.ok)                                                                               { ret 7; }
+    if (!str_equals(fail.describe(escape.err), "tracked symlink target escapes dependency package")) { ret 7; }
+    ret 0;
+}

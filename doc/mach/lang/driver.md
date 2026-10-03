@@ -230,22 +230,6 @@ pub fun run_link_pass(p: *project.Project) res[bool, fail.Fail];
 pub fun build_project(s: *session.Session, project_root: str, pick: *manifest.Selection) res[project.Project, fail.Fail];
 ```
 
-## fun verify_dependencies
-
-```mach
-pub fun verify_dependencies(s: *session.Session, project_root: str, release: bool,
-overrides: *Vector[driver_deps.RootOverride]) err[fail.Fail];
-```
-
-check a project's realized dependency closure without changing it
-
-s: the session
-project_root: the root project's directory
-release: also hold the root to the release rule: every dependency selected by
-              `version` or an exact `tag/`, as a release about to be tagged must be
-overrides: when not nil, receives every requirer selector a root override replaced
-ret: err naming the first mismatch
-
 ## fun closure_locate
 
 ```mach
@@ -261,6 +245,23 @@ m: the root manifest
 project_root: the root project's directory
 ret: the project holding the closure, released with `project.dnit_project`;
               err from locating the closure, its diagnostics published
+
+## fun closure_checked
+
+```mach
+pub fun closure_checked(s: *session.Session, m: *manifest.Manifest, project_root: str,
+check: *driver_closure.Check) res[project.Project, fail.Fail];
+```
+
+locate a root manifest's dependency closure as `closure_locate` does, holding every edge
+to `check` as it is located, as `mach dep verify` does
+
+s: the session
+m: the root manifest
+project_root: the root project's directory
+check: what each located edge is held to
+ret: the project holding the closure, released with `project.dnit_project`;
+              err naming the first edge that does not locate or does not hold
 
 ## fun begin_build
 
