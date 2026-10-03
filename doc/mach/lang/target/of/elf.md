@@ -1,11 +1,5 @@
 # mach.lang.target.of.elf
 
-## val SHT_RISCV_ATTRIBUTES
-
-```mach
-pub val SHT_RISCV_ATTRIBUTES: u32 = 0x70000003
-```
-
 ## val R_X86_64_64
 
 ```mach
@@ -198,43 +192,7 @@ pub val R_RISCV_32_PCREL:     u32 = 57
 pub fun machine_for_arch(arch_id: u32) u16;
 ```
 
-## val EF_RISCV_RVC
-
-```mach
-pub val EF_RISCV_RVC:              u32 = 0x1
-```
-
-## val EF_RISCV_FLOAT_ABI_SOFT
-
-```mach
-pub val EF_RISCV_FLOAT_ABI_SOFT:   u32 = 0x0
-```
-
-## val EF_RISCV_FLOAT_ABI_SINGLE
-
-```mach
-pub val EF_RISCV_FLOAT_ABI_SINGLE: u32 = 0x2
-```
-
-## val EF_RISCV_FLOAT_ABI_DOUBLE
-
-```mach
-pub val EF_RISCV_FLOAT_ABI_DOUBLE: u32 = 0x4
-```
-
-## val EF_RISCV_RVE
-
-```mach
-pub val EF_RISCV_RVE: u32 = 0x8
-```
-
-the RV32E/RV64E register file and calling convention
-
-## def BuildAttributes
-
-```mach
-pub def BuildAttributes: target_of.ElfAttributes
-```
+the e_machine of an instruction set, 0 for one ELF does not cover
 
 ## val VTABLE
 
