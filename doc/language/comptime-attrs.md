@@ -9,7 +9,7 @@ arguments. See [decorators.md](decorators.md) for the full reference.
 #[symbol("main")]
 fun entry(argc: i64, argv: **u8) i64 { ... }
 
-#[library("ws2_32.dll")] #[symbol("WSAStartup")]
+#[library("ws2_32")] #[symbol("WSAStartup")]
 ext fun wsa_startup(ver: u16, data: *u8) i32;
 
 #[align(64)]
