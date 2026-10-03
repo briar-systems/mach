@@ -441,7 +441,7 @@ pub fun fun_type_ext(lc: *LowerContext, tid: type.TypeId) res[ir_type.ExtListId,
 ```
 
 the extensions the parameters of the semantic function type `tid` declare,
-EXT_LIST_NONE for any other type
+EXT_LIST_EMPTY for any other type
 
 ## fun pack_instance_sig
 
