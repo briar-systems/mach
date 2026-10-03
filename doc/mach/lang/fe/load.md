@@ -314,19 +314,19 @@ pub fun binding_for(m: *Module, decl: ast_id.DeclId) opt[*Binding];
 
 the record of what the import declaration `decl` binds, none when the load recorded none
 
-## fun attributes_record
+## fun decorators_record
 
 ```mach
-pub fun attributes_record(l: *Loader, mid: session.ModuleId) err[fail.Fail];
+pub fun decorators_record(l: *Loader, mid: session.ModuleId) err[fail.Fail];
 ```
 
-records the load's reading of the module's attribute arguments, in the build target's frame the
+records the load's reading of the module's decorator arguments, in the build target's frame the
 walk bound: the string each argument that takes one evaluates to, and what each `embed` argument names
 
 ## fun embeds_record
 
 ```mach
-pub fun embeds_record(s: *session.Session, c: *comptime.ComptimeCtx, a: *ast.Ast, source: str, fqn: intern.StrId,
+pub fun embeds_record(s: *session.Session, c: *comptime.ComptimeCtx, a: *ast.Ast, fqn: intern.StrId,
 reached: *bool) err[fail.Fail];
 ```
 
