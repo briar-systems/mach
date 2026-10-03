@@ -86,6 +86,15 @@ every seed the walk needs at one notification. a note without a MirInstr
 (prologue, epilogue, relaxation) carries no seed. operands past
 NOTE_SEED_MAX are not described; no MIR instruction has that many.
 
+## rec TextStream
+
+```mach
+pub rec TextStream;
+```
+
+one output text section's bytes. stream 0 is the module's default text and
+stream n its text section n, so a record's stream is its section
+
 ## rec EncoderOutput
 
 ```mach
@@ -102,6 +111,12 @@ pub rec PendingReloc;
 
 ```mach
 pub rec SymbolMark;
+```
+
+## val MARK_NO_FUNCTION
+
+```mach
+pub val MARK_NO_FUNCTION: u32 = 0xFFFFFFFF
 ```
 
 ## val CONST_F32
@@ -537,6 +552,48 @@ pub fun consts_free(alloc: *A.Allocator, c: *ConstEntry, count: u32, cap: u32);
 pub fun scratch_release(st: *EncodeState);
 ```
 
+## fun streams_open
+
+```mach
+pub fun streams_open(st: *EncodeState, names: *intern.StrId, count: u32) err[fail.Fail];
+```
+
+one stream per output text section: the module's default text, then each of
+`names` in order. the default text holds the buffer first
+
+## fun stream_select
+
+```mach
+pub fun stream_select(st: *EncodeState, index: u32) err[fail.Fail];
+```
+
+hands the buffer to stream `index`, parking the one that held it
+
+## fun stream_align
+
+```mach
+pub fun stream_align(st: *EncodeState, align: u32);
+```
+
+the current stream's alignment covers an entry aligned to `align`
+
+## fun streams_unaccounted
+
+```mach
+pub fun streams_unaccounted(st: *EncodeState) usize;
+```
+
+the bytes no instruction notification claimed, across every stream
+
+## fun streams_close
+
+```mach
+pub fun streams_close(st: *EncodeState) res[*TextStream, fail.Fail];
+```
+
+the streams as the encoder hands them off, each holding exactly its bytes;
+the buffer and the parked streams are left empty
+
 ## fun tables_fit
 
 ```mach
@@ -550,6 +607,9 @@ give each table the encoder hands off exactly its count
 ```mach
 pub fun patch_branches(st: *EncodeState, hooks: *EncodeHooks) err[fail.Fail];
 ```
+
+patches the branches of the function just encoded, whose blocks all lie in
+the current stream, then forgets its blocks for the next function
 
 ## fun block_offset
 
