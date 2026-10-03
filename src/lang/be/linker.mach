@@ -13,7 +13,6 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.error.err;
-use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use types_string: std.types.string;
@@ -62,11 +61,10 @@ use mach.lang.be.linker.common.export_surface_build;
 use mach.lang.be.linker.common.export_surface_free;
 use mach.lang.be.linker.common.fill_section_bases;
 use mach.lang.be.linker.common.fill_symbol_bases;
-use mach.lang.be.linker.common.join2;
-use mach.lang.be.linker.common.join3;
 use mach.lang.be.linker.common.lt_image;
 use mach.lang.be.linker.common.lt_name;
 use mach.lang.be.linker.common.lt_retain;
+use mach.lang.be.linker.common.name_text;
 use mach.lang.be.linker.common.total_sections;
 use mach.lang.be.linker.common.total_symbols;
 use mach.lang.be.linker.debug.StrMerge;
@@ -82,7 +80,7 @@ use mach.lang.be.linker.dynamic.free_dynstate;
 use mach.lang.be.linker.dynamic.has_unresolved_attributed_imports;
 use mach.lang.be.linker.dynamic.has_unresolved_declared_imports;
 use mach.lang.be.linker.dynamic.init_dynstate;
-use mach.lang.be.linker.dynamic.loaderless_request_message;
+use mach.lang.be.linker.dynamic.loader_check;
 use mach.lang.be.linker.dynamic.place_call_stubs;
 use mach.lang.be.linker.dynamic.place_import_got;
 use mach.lang.be.linker.dynamic.reserve_call_stubs;
@@ -425,7 +423,7 @@ fun image_machine_flags(s: *session.Session, tgt: *lang_target.Target,
     for (i < module_count) {
         val got: u32 = modules[i].machine_flags;
         if ((got & abi_mask) != abi_bits) {
-            ret res[u32, fail.Fail].err{fail.user(diagnostic_kind.LINK_ABI_MISMATCH, machine_flags_mismatch_message(s, tgt, ?modules[i],
+            ret res[u32, fail.Fail].err{fail.user_of(diagnostic_kind.LINK_ABI_MISMATCH, machine_flags_mismatch_message(s, tgt, ?modules[i],
                 got & abi_mask, abi_bits))};
         }
         feature_bits = feature_bits | (got & ~abi_mask);
@@ -591,10 +589,9 @@ fun link_modules_surface(s: *session.Session, diags: *diagnostic.DiagnosticStore
     # would leave it an image with nothing in it. refused here, before the plan,
     # so the diagnostic names the rule and not the empty image that follows
     if (mode == LINK_SHARED && !any_exported_symbol(modules, module_count, ?surface)) {
-        ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_NO_EXPORTS, join3(s,
-            "shared library '", shared_product_name(name),
-            "' exports nothing: a shared library needs at least one `pub` declaration in the project, or a `fwd` re-export of one",
-            "a shared library needs at least one `pub` declaration in the project, or a `fwd` re-export of one"))};
+        ret err[fail.Fail].err{fail.user_of(diagnostic_kind.LINK_NO_EXPORTS, fail.format_intern(?s.interner, s.alloc,
+            "shared library '{}' exports nothing: a shared library needs at least one `pub` declaration in the project, or a `fwd` re-export of one",
+            shared_product_name(name)))};
     }
     if (mode == LINK_EXE) {
         val er: res[intern.StrId, A.Error] = intern.intern(?s.interner, tgt.os.entry_symbol);
@@ -817,7 +814,13 @@ fun link_modules_core(s: *session.Session, diags: *diagnostic.DiagnosticStore, t
 
     var dm: u32 = 0;
     for (dm < module_count) {
-        if (!module_debug_is_linkable(modules, dm)) { warn_debug_dropped(s, diags, modules[dm].name); }
+        if (!module_debug_is_linkable(modules, dm)) {
+            val warned: err[fail.Fail] = warn_debug_dropped(s, diags, modules[dm].name);
+            if (sel warned.err) {
+                if (debug_names != nil && debug_count > 0) { A.deallocate[intern.StrId](alloc, debug_names, debug_count::usize); }
+                ret warned;
+            }
+        }
         dm = dm + 1;
     }
 
@@ -953,7 +956,12 @@ fun link_modules_core(s: *session.Session, diags: *diagnostic.DiagnosticStore, t
     val assign_vaddrs:  bool = (mode == LINK_EXE) || shared;
     var header_reserve: u64  = 0;
     if (assign_vaddrs) {
-        header_reserve = header_reserve_bytes(tgt, position_independent, nil::*target_of.HeaderShape);
+        val reserve_r: res[u64, fail.Fail] = header_reserve_bytes(tgt, position_independent, nil::*target_of.HeaderShape);
+        if (sel reserve_r.err) {
+            free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, sym_base, sym_out, sym_total, ?strm, ?atoms, ?groups);
+            ret err[fail.Fail].err{reserve_r.err};
+        }
+        header_reserve = reserve_r.ok;
         val vaddr_r: err[fail.Fail] =
             assign_section_vaddrs(tgt, merged, header_reserve);
         if (sel vaddr_r.err) {
@@ -1025,10 +1033,18 @@ fun link_modules_core(s: *session.Session, diags: *diagnostic.DiagnosticStore, t
         }
     }
 
-    var dynamic: bool = (mode == LINK_EXE)
-        && (dynlib_count > 0 || pie
-        || has_unresolved_declared_imports(
-        modules, module_count, ?sym_locs, sec_base, ?atoms));
+    var dynamic: bool = (mode == LINK_EXE) && (dynlib_count > 0 || pie);
+    if (mode == LINK_EXE && !dynamic) {
+        val declared_r: res[bool, fail.Fail] = has_unresolved_declared_imports(
+            modules, module_count, ?sym_locs, sec_base, ?atoms);
+        if (sel declared_r.err) {
+            free_local_got_plan(alloc, ?local_got);
+            map.dnit[intern.StrId, SymbolLoc](?sym_locs);
+            free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, sym_base, sym_out, sym_total, ?strm, ?atoms, ?groups);
+            ret err[fail.Fail].err{declared_r.err};
+        }
+        dynamic = declared_r.ok;
+    }
     if (!dynamic && mode == LINK_EXE) {
         val unresolved_r: res[bool, fail.Fail] = has_unresolved_attributed_imports(
             s, modules, module_count, dynlibs, dynlib_count, ?sym_locs,
@@ -1042,12 +1058,12 @@ fun link_modules_core(s: *session.Session, diags: *diagnostic.DiagnosticStore, t
         dynamic = unresolved_r.ok;
     }
 
-    val no_loader: str = loaderless_request_message(s, tgt, mode, pie, dynamic);
-    if (!str_empty(no_loader)) {
+    val loader_r: err[fail.Fail] = loader_check(s, tgt, mode, pie, dynamic);
+    if (sel loader_r.err) {
         free_local_got_plan(alloc, ?local_got);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
         free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, sym_base, sym_out, sym_total, ?strm, ?atoms, ?groups);
-        ret err[fail.Fail].err{fail.user(diagnostic_kind.LINK_NO_LOADER, no_loader)};
+        ret loader_r;
     }
 
     # the dynamic imports are known before the image is built, so a format's
@@ -1167,7 +1183,16 @@ fun link_modules_core(s: *session.Session, diags: *diagnostic.DiagnosticStore, t
     if (assign_vaddrs) {
         var shape: target_of.HeaderShape;
         measure_header_shape(s, ?out_img, merged, ?groups, ?dyn, position_independent, ?shape);
-        val want: u64 = header_reserve_bytes(tgt, position_independent, ?shape);
+        val want_r: res[u64, fail.Fail] = header_reserve_bytes(tgt, position_independent, ?shape);
+        if (sel want_r.err) {
+            free_dynstate(alloc, ?dyn);
+            obj.dnit(?out_img);
+            free_local_got_plan(alloc, ?local_got);
+            map.dnit[intern.StrId, SymbolLoc](?sym_locs);
+            free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, sym_base, sym_out, sym_total, ?strm, ?atoms, ?groups);
+            ret err[fail.Fail].err{want_r.err};
+        }
+        val want: u64 = want_r.ok;
         # a grown header, or a reserved table that moved everything after it
         if (want > header_reserve || dyn.info.stubs.size > 0 || dyn.info.got.size > 0 || unwind_reserved
             || thunks_placed(?thunks)) {
@@ -1483,29 +1508,19 @@ fun float_abi_phrase(tgt: *lang_target.Target, abi_bits: u32) str {
     ret "an unrecognized float";
 }
 
-fun module_display_name(s: *session.Session, img: *target_of.ObjectImage) str {
-    val nm: opt[str] = intern.lookup(?s.interner, img.name);
-    if (sel nm.some) { ret nm.some; }
-    ret "<input>";
-}
-
 # a keyed refusal of one input, its text a predicate on the object, named for the user.
 # an unkeyed failure is the linker's own and passes through as it is
 fun input_refusal(s: *session.Session, img: *target_of.ObjectImage, f: fail.Fail) fail.Fail {
     if (!(sel f.user)) { ret f; }
-    val head: str = join3(s, "object '", module_display_name(s, img), "' ", "an input object ");
-    ret fail.user(f.user.kind, join2(s, head, f.user.text, f.user.text));
+    ret fail.user_of(f.user.kind, fail.format_intern(?s.interner, s.alloc, "object '{}' {}",
+        name_text(s, img.name, "<input>"), f.user.text));
 }
 
 fun machine_flags_mismatch_message(s: *session.Session, tgt: *lang_target.Target,
-    img: *target_of.ObjectImage, got: u32, expected: u32) str {
-    val tail: str = join3(s, " ABI, but this link targets '", tgt.abi.name,
-        "', so every float argument crossing that boundary would read back as garbage",
-        " ABI the target does not use");
-    val head: str = join3(s, "object '", module_display_name(s, img), "' was built for a ",
-        "an input object was built for a ");
-    ret join3(s, head, float_abi_phrase(tgt, got), tail,
-        "input object float ABI does not match the target convention");
+    img: *target_of.ObjectImage, got: u32, expected: u32) res[str, fail.Fail] {
+    ret fail.format_intern(?s.interner, s.alloc,
+        "object '{}' was built for a {} ABI, but this link targets '{}', so every float argument crossing that boundary would read back as garbage",
+        name_text(s, img.name, "<input>"), float_abi_phrase(tgt, got), tgt.abi.name);
 }
 
 fun free_scratch(alloc: *A.Allocator, placements: *Placement, sec_total: u32,

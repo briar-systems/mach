@@ -1057,7 +1057,7 @@ pub fun ct_is_negative(v: CTValue) bool;
 ## fun ct_int_u64
 
 ```mach
-pub fun ct_int_u64(v: CTValue, out: *u64) bool;
+pub fun ct_int_u64(v: CTValue) opt[u64];
 ```
 
 an integer value that is neither negative nor above u64, read as a u64

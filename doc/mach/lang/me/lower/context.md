@@ -159,7 +159,7 @@ pub fun declaring_comptime_ctx(lc: *LowerContext, sym: *resolve.Symbol) *comptim
 ## fun gated_lower_member_const_message
 
 ```mach
-pub fun gated_lower_member_const_message(lc: *LowerContext, name: intern.StrId, dep_fqn: intern.StrId) str;
+pub fun gated_lower_member_const_message(lc: *LowerContext, name: intern.StrId, dep_fqn: intern.StrId) res[str, fail.Fail];
 ```
 
 ## fun report_gate
@@ -477,11 +477,15 @@ pub fun expr_symbol_of(lc: *LowerContext, eid: ast_id.ExprId) resolve.SymbolId;
 pub fun module_source(lc: *LowerContext) str;
 ```
 
+the source of the module in scope, read when the scope was made
+
 ## fun ast_source
 
 ```mach
-pub fun ast_source(lc: *LowerContext, a: *ast.Ast) str;
+pub fun ast_source(s: *session.Session, a: *ast.Ast) res[str, fail.Fail];
 ```
+
+the source text `a` was parsed from
 
 ## fun decl_target_op
 

@@ -162,7 +162,7 @@ ret: err naming the first failure
 ## fun pin_command
 
 ```mach
-pub fun pin_command(a: *A.Allocator, root: str, id: str) str;
+pub fun pin_command(a: *A.Allocator, root: str, id: str) res[str, fail.Fail];
 ```
 
 the command that pins and realizes a version-selected dependency with no checkout yet;
@@ -171,7 +171,7 @@ pull's refusal and init's --no-deps hint both name it
 ## fun unpinned_refusal
 
 ```mach
-pub fun unpinned_refusal(a: *A.Allocator, root: str, id: str, version: str) str;
+pub fun unpinned_refusal(a: *A.Allocator, root: str, id: str, version: str) res[str, fail.Fail];
 ```
 
 ## fun acquire
@@ -184,12 +184,6 @@ pinned_only: bool, effect: *u8) err[fail.Fail];
 acquire a git dependency's slot through the source and report what changed; `accept` is
 add taking an existing checkout, and `pinned_only` a range with no selector, which only a
 pin or an existing checkout realizes
-
-## fun head_text
-
-```mach
-pub fun head_text(op: *Operation, dep_full: str) str;
-```
 
 ## fun index
 
@@ -214,7 +208,7 @@ the root's own declarations in the manifest table `mt`, appended to `reqs`
 ## fun conflict_text
 
 ```mach
-pub fun conflict_text(a: *A.Allocator, subject: *Request, x: *Request, y: *Request) str;
+pub fun conflict_text(a: *A.Allocator, subject: *Request, x: *Request, y: *Request) res[str, fail.Fail];
 ```
 
 the example table is valid TOML as printed: values are escaped as the
