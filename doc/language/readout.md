@@ -49,9 +49,17 @@ the slowest of them. A unit whose project or dependencies declare build steps
 opens with a `steps` row, and under `-vv` each step that ran prints by name;
 a step its stamp shows is current is counted but prints no line.
 
+Under `-v` a growing cycle of instances (see
+[fun.md](fun.md#instantiation-ends-or-is-refused)) prints a line each time its
+instance count doubles, so an expansion that does not stop shows while it runs:
+
+```
+  instantiate  growing cycle peel in app.main: 32 instances so far
+```
+
 Under `--diagnostics json` every one of these lines is a record, written when
 the line would be: a `phase` record for a row, a `phase_item` record for an
-item, a `phase` record named `other` without a count, and each `built` line as
+item, a `growth` record for a growing cycle's line, a `phase` record named `other` without a count, and each `built` line as
 a member of the closing `summary` record. Every unit opens with a `unit` record
 naming its artifact, target and profile, even when the text prints no banner or
 `profile` header, so a tool can tell apart the rows of several units and of

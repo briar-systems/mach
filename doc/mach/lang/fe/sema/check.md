@@ -201,10 +201,3 @@ pub fun report_default_out_of_range(sc: *sema_context.SemaContext, span: lang_so
 
 the range refusal of a literal no context typed, which took the i64 default
 
-## fun report_instantiation_limit
-
-```mach
-pub fun report_instantiation_limit(sc: *sema_context.SemaContext, span: lang_source.Span, outcome: u8,
-bare: intern.StrId, args: *type.TypeId, arg_len: u32);
-```
-

@@ -31,6 +31,7 @@ use mach.lang.fe.comptime;
 use mach.lang.fe.decorator;
 use mach.lang.fe.resolve;
 use mach.lang.fe.sema.fields;
+use sema_growth:   mach.lang.fe.sema.growth;
 use sema_instance: mach.lang.fe.sema.instance;
 use mach.lang.growth;
 use mach.lang.intern;
@@ -57,6 +58,8 @@ pub rec SemaResult {
     constants: comptime.Bindings;
     # every instance the module's typing asks for, with the typing of each
     instances: sema_instance.Set;
+    # the growing cycles among the module's templates
+    growth: sema_growth.Analysis;
 }
 
 pub val EMBED_LEN_NONE: u64 = 0xFFFFFFFFFFFFFFFF;
@@ -271,6 +274,15 @@ pub rec SemaDeps {
     definitions: DefinitionReader;
     entries:     **ModuleSema;
     count:       u32;
+    watch:       GrowthWatch;
+}
+
+# who hears of a growing cycle's expansion: the module that declares it, the templates on
+# it, and how many instances of it the module being typed has made so far; a nil
+# `expanded` hears nothing
+pub rec GrowthWatch {
+    ctx:      ptr;
+    expanded: fun(ptr, intern.StrId, intern.StrId, u32);
 }
 
 fwd type.FieldEntry;
@@ -278,21 +290,14 @@ fwd type.FieldTable;
 
 pub val INST_NONE: u32 = sema_instance.NONE;
 
-val MAX_CT_INSTANCE_DEPTH: u32 = 32;
-
-val MAX_CT_INSTANCES: u32 = 8192;
-
-pub val RECORD_OK:          u8 = 0;
-pub val RECORD_LIMIT_DEPTH: u8 = 1;
-val     RECORD_LIMIT_COUNT: u8 = 2;
-
 # the instances a module's typing asks for, typed in the order they were first asked for;
 # the set is the module's product, published with its result
 pub rec InstWorklist {
     set:     sema_instance.Set;
     drained: u32;
     alloc:   *A.Allocator;
-    limited: bool;
+    # how many instances of each growing cycle, keyed by module and cycle, this module expanded
+    expansions: map.Map[u64, u32];
 }
 
 pub val TYPE_MEMO_NONE:     u8 = 0;
@@ -354,6 +359,8 @@ pub rec SemaContext {
     source:     str;
 
     insts: *InstWorklist;
+    # the growing cycles among the own module's templates
+    growth: *sema_growth.Analysis;
 
     collect_insts: bool;
 
@@ -812,42 +819,72 @@ fun stmt_calls_c_variadic(sc: *SemaContext, a: *ast.Ast, rr: *resolve.ResolveRes
 # settled until the caller is itself instantiated, and that caller's walk asks for the
 # closed instance. `item` carries the kind, the declaration, its arguments, name,
 # signature and site; the rest is the set's
-pub fun record_instance(sc: *SemaContext, item: sema_instance.Instance, eid: ast_id.ExprId) res[u8, fail.Fail] {
-    if (!sc.collect_insts || sc.insts == nil)                                                { ret res[u8, fail.Fail].ok{RECORD_OK}; }
-    if (item.kind == sema_instance.KIND_TYPE && item.arg_len == 0)                           { ret res[u8, fail.Fail].ok{RECORD_OK}; }
-    if (types_open(sc, item.args, item.arg_len) || types_open(sc, item.pack, item.pack_len)) { ret res[u8, fail.Fail].ok{RECORD_OK}; }
+pub fun record_instance(sc: *SemaContext, item: sema_instance.Instance, eid: ast_id.ExprId) err[fail.Fail] {
+    if (!sc.collect_insts || sc.insts == nil)                                                { ret err[fail.Fail].ok{}; }
+    if (item.kind == sema_instance.KIND_TYPE && item.arg_len == 0)                           { ret err[fail.Fail].ok{}; }
+    if (types_open(sc, item.args, item.arg_len) || types_open(sc, item.pack, item.pack_len)) { ret err[fail.Fail].ok{}; }
 
-    val wl: *InstWorklist = sc.insts;
-    if (wl.limited) { ret res[u8, fail.Fail].ok{RECORD_OK}; }
+    # a refused cycle is reported where the analysis found it, and none of it is expanded
+    val cycle: GrowthCycle = growth_cycle_of(sc, item.origin, item.decl);
+    if (cycle.refused) { ret err[fail.Fail].ok{}; }
 
+    val wl:  *InstWorklist          = sc.insts;
     var req: sema_instance.Instance = item;
     req.parent    = sc.inst_parent;
     req.depth     = sc.inst_depth;
     req.site_file = sc.a.file_id;
-    val found: opt[u32] = sema_instance.find(?wl.set, ?req);
-    val known: bool     = sel found.some;
-    if (!known && sc.inst_depth > MAX_CT_INSTANCE_DEPTH) {
-        wl.limited = true;
-        ret res[u8, fail.Fail].ok{RECORD_LIMIT_DEPTH};
-    }
-    if (!known && sema_instance.count(?wl.set) >= MAX_CT_INSTANCES) {
-        wl.limited = true;
-        ret res[u8, fail.Fail].ok{RECORD_LIMIT_COUNT};
-    }
-
     val added: res[sema_instance.Added, fail.Fail] = sema_instance.add(?wl.set, req);
     if (sel added.err) {
         fail.internal(?sc.status, fail.describe(added.err));
-        ret res[u8, fail.Fail].err{added.err};
+        ret err[fail.Fail].err{added.err};
     }
+    if (added.ok.fresh && cycle.id != sema_growth.NONE) { expansion_note(sc, item.origin, cycle); }
     # an instance asked for at no call is checked and never emitted
-    if (ast_id.expr_is_nil(eid)) { ret res[u8, fail.Fail].ok{RECORD_OK}; }
+    if (ast_id.expr_is_nil(eid)) { ret err[fail.Fail].ok{}; }
     val id:    u32            = added.ok.id;
     val noted: err[fail.Fail] = sema_instance.call_record(?wl.set, sc.frame, eid, id);
-    if (sel noted.err) { ret res[u8, fail.Fail].err{noted.err}; }
-    val edged: err[fail.Fail] = sema_instance.edge_add(?wl.set, sc.requester, id);
-    if (sel edged.err) { ret res[u8, fail.Fail].err{edged.err}; }
-    ret res[u8, fail.Fail].ok{RECORD_OK};
+    if (sel noted.err) { ret noted; }
+    ret sema_instance.edge_add(?wl.set, sc.requester, id);
+}
+
+# the growing cycle a declaration lies on, as its own module's analysis decided it
+rec GrowthCycle {
+    id:      u32;
+    refused: bool;
+    members: intern.StrId;
+}
+
+fun growth_cycle_of(sc: *SemaContext, origin: session.ModuleId, decl: ast_id.DeclId) GrowthCycle {
+    var none: GrowthCycle           = GrowthCycle{id: sema_growth.NONE, refused: false, members: intern.STR_NIL};
+    var an:   *sema_growth.Analysis = nil;
+    if (sc.growth != nil && module.same(origin, sc.growth.module)) { an = sc.growth; }
+    or (sc.deps != nil) {
+        val acquired: res[Definition, fail.Fail] = acquire_definition(?sc.deps.definitions, origin, DEFINITION_TYPED);
+        if (sel acquired.err)      { ret none; }
+        if (acquired.ok.sr != nil) { an = ?acquired.ok.sr.growth; }
+    }
+    val id: opt[u32] = sema_growth.cycle_of(an, decl);
+    if (sel id.none) { ret none; }
+    val c: *sema_growth.Cycle = sema_growth.cycle_at(an, id.some);
+    ret GrowthCycle{id: id.some, refused: c.refused, members: c.members};
+}
+
+# one more instance of a growing cycle: the watch hears of it each time the count doubles,
+# so a runaway expansion is visible while it runs
+fun expansion_note(sc: *SemaContext, origin: session.ModuleId, cycle: GrowthCycle) {
+    val wl:  *InstWorklist = sc.insts;
+    var key: u64           = (module.index(origin)::u64 << 32) | cycle.id::u64;
+    var n:   u32           = 1;
+    val had: opt[*u32]     = map.get[u64, u32](?wl.expansions, ?key);
+    if (sel had.some) { n = @had.some + 1; }
+    val put: res[bool, A.Error] = map.insert[u64, u32](?wl.expansions, key, n);
+    if (sel put.err) {
+        fail.internal(?sc.status, lang_alloc.text(put.err));
+        ret;
+    }
+    if ((n & (n - 1)) != 0)                              { ret; }
+    if (sc.deps == nil || sc.deps.watch.expanded == nil) { ret; }
+    sc.deps.watch.expanded(sc.deps.watch.ctx, session.module_fqn(sc.s, origin), cycle.members, n);
 }
 
 fun types_open(sc: *SemaContext, p: *type.TypeId, len: u32) bool {
@@ -868,16 +905,17 @@ pub fun inst_worklist_new(alloc: *A.Allocator) res[*InstWorklist, fail.Fail] {
         ret res[*InstWorklist, fail.Fail].err{set.err};
     }
     val wl: *InstWorklist = wr.ok;
-    wl.set     = set.ok;
-    wl.drained = 0;
-    wl.alloc   = alloc;
-    wl.limited = false;
+    wl.set        = set.ok;
+    wl.drained    = 0;
+    wl.alloc      = alloc;
+    wl.expansions = map.init[u64, u32](alloc);
     ret res[*InstWorklist, fail.Fail].ok{wl};
 }
 
 pub fun inst_worklist_free(wl: *InstWorklist) {
     if (wl == nil) { ret; }
     sema_instance.dnit(?wl.set);
+    map.dnit[u64, u32](?wl.expansions);
     A.deallocate[InstWorklist](wl.alloc, wl, 1::usize);
 }
 

@@ -24,6 +24,14 @@ fwd sema_context.SemaDeps
 
 forwards [`mach.lang.fe.sema.context.SemaDeps`](sema/context.md#rec-semadeps)
 
+## fwd sema_context.GrowthWatch
+
+```mach
+fwd sema_context.GrowthWatch
+```
+
+forwards [`mach.lang.fe.sema.context.GrowthWatch`](sema/context.md#rec-growthwatch)
+
 ## fwd sema_context.FieldEntry
 
 ```mach
