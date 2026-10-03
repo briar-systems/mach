@@ -1,0 +1,392 @@
+# resolve: version resolution over a project's closure. every identity the closure reaches
+# through a version range resolves together against the releases its source publishes
+# (resolver.mach); an identity the root or a fixed edge selects by ref or path is fixed, and a
+# requirement on it is overridden
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use std_format: std.format;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_empty;
+use std.types.string.str_equals;
+use std.types.string.str_starts_with;
+
+use A: std.allocator;
+
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use driver_closure:  mach.lang.driver.closure;
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.manifest;
+use manifest_version: mach.lang.manifest.version;
+use mach.lang.session;
+use lang_version: mach.lang.version;
+
+use mach.lang.package;
+use package_closure: mach.lang.package.closure;
+use git_member:      mach.lang.package.git.member;
+use mach.lang.package.resolver;
+use package_source: mach.lang.package.source;
+
+# notes are the lines a command prints unless --quiet: an --offline resolution, and each
+# requirement a root `ref` or `path` overrides
+pub rec Resolution {
+    picks:  Vector[resolver.Choice];
+    ranged: bool;
+    notes:  Vector[str];
+}
+
+# what reading a release's requirements works through: the releases table, the root
+# manifest (an identity it declares is the root's to select, not a release's), and the
+# project whose dep/<id> checkouts serve offline listings of transitive identities
+rec Needs {
+    s:          *session.Session;
+    releases:   *package_source.Releases;
+    root:       *manifest.Manifest;
+    local_root: str;
+}
+
+pub fun pick_index(picks: *Vector[resolver.Choice], id: str) i64 {
+    var i: usize = 0;
+    for (i < picks.len) {
+        if (str_equals(picks.data[i].id, id)) { ret i::i64; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+fun str_listed(list: *Vector[str], id: str) bool {
+    var i: usize = 0;
+    for (i < list.len) {
+        if (str_equals(list.data[i], id)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# keep an owned release version as a lock, freeing it when it names no release or is not kept
+fun lock_push(a: *A.Allocator, locks: *Vector[resolver.Lock], id: str, version: str) {
+    if (str_empty(version)) {
+        str_free(a, version);
+        ret;
+    }
+    val pushed: res[usize, A.Error] = collections_vector.push[resolver.Lock](locks, resolver.Lock{id: id, version: version});
+    if (sel pushed.err) { str_free(a, version); }
+}
+
+fun locks_free(a: *A.Allocator, locks: *Vector[resolver.Lock]) {
+    var i: usize = 0;
+    for (i < locks.len) {
+        str_free(a, locks.data[i].version);
+        i = i + 1;
+    }
+    collections_vector.dnit[resolver.Lock](locks);
+}
+
+fun lock_listed(locks: *Vector[resolver.Lock], id: str) bool {
+    var i: usize = 0;
+    for (i < locks.len) {
+        if (str_equals(locks.data[i].id, id)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# resolve every identity the closure reaches through a version range: the root's
+# own ranges and every range a dependency reached by a ref or a path declares,
+# read from the same closure walk `pull` realizes. an identity the root or such a
+# dependency selects by ref or path is fixed, and a requirement on it is
+# overridden. locks keep each realized version-selected checkout where it is
+# unless `unlocked` names it or `lock` is false; an identity with no checkout yet
+# is seeded by the pin of the dependency declaring it, when one exists and the range
+# admits it, so a dependency pulls its own tested pin in
+#
+# `root_notes` names the root's own overrides of a chosen release's requirements too; a
+# command that pulls the closure afterwards leaves them to the pull, which names every
+# requirement the root overrides
+pub fun versions(op: *package_closure.Operation, doc: *manifest.Doc, lowest: bool, lock: bool, unlocked: str,
+    root_notes: bool, walk: *package_closure.Walk) res[Resolution, fail.Fail] {
+    val s:       *session.Session                  = op.s;
+    val a:       *A.Allocator                      = op.a;
+    val offline: bool                              = walk.offline;
+    var out:     Resolution                        = Resolution{picks: collections_vector.init[resolver.Choice](a), ranged: false, notes: collections_vector.init[str](a)};
+    val parsed:  res[manifest.Manifest, fail.Fail] = manifest.parse(a, ?s.interner, doc, false);
+    if (sel parsed.err) { ret res[Resolution, fail.Fail].err{parsed.err}; }
+    var m: manifest.Manifest = parsed.ok;
+    fin { manifest.dnit(?m, a); }
+    var needs_of:  Vector[resolver.Need] = collections_vector.init[resolver.Need](a);
+    var fixed:     Vector[str]           = collections_vector.init[str](a);
+    var fixed_by:  Vector[str]           = collections_vector.init[str](a);
+    var fixed_who: Vector[str]           = collections_vector.init[str](a);
+    var fixed_own: Vector[bool]          = collections_vector.init[bool](a);
+    var locks:     Vector[resolver.Lock] = collections_vector.init[resolver.Lock](a);
+    fin { locks_free(s.build_alloc, ?locks); }
+    val opened: res[package_source.Releases, fail.Fail] = git_member.releases(s, offline, "");
+    if (sel opened.err) { ret res[Resolution, fail.Fail].err{opened.err}; }
+    var releases: package_source.Releases = opened.ok;
+    fin { releases.close(releases.ctx); }
+    var nd:      Needs = Needs{s: s, releases: ?releases, root: ?m, local_root: op.root};
+    var root_id: str   = package_closure.key_text(?doc.table, "project.id");
+    if (str_empty(root_id)) { root_id = "(project)"; }
+
+    var closure: Vector[package_closure.Request] = collections_vector.init[package_closure.Request](a);
+    fin { package_closure.free_requests(a, ?closure); }
+    val walked: err[fail.Fail] = package_closure.preflight(op, doc, ?closure, true, walk);
+    if (sel walked.err) { ret res[Resolution, fail.Fail].err{walked.err}; }
+
+    # fixed identities first: a range on one of them is overridden
+    var i: usize = 0;
+    for (i < closure.len) {
+        val r: *package_closure.Request = ?closure.data[i];
+        i = i + 1;
+        if (r.via_release || package_closure.selects_release(r)) { cnt; }
+        collections_vector.push[str](?fixed, r.id);
+        var by: res[str, std_format.FormatError];
+        if (!r.is_git)  { by = std_format.sprint(a, "path \"{}\"", r.src_path); }
+        or              { by = std_format.sprint(a, "ref \"{}\"", r.ref); }
+        if (sel by.err) { ret res[Resolution, fail.Fail].err{fail.message(fail.format_text(by.err))}; }
+        collections_vector.push[str](?fixed_by, by.ok);
+        var who: str = root_id;
+        if (!r.root_decl) { who = r.chain; }
+        collections_vector.push[str](?fixed_who, who);
+        collections_vector.push[bool](?fixed_own, r.root_decl);
+    }
+    i = 0;
+    for (i < closure.len) {
+        val r: *package_closure.Request = ?closure.data[i];
+        i = i + 1;
+        if (!package_closure.selects_release(r)) { cnt; }
+        if (str_listed(?fixed, r.id))            { cnt; }
+        # a range read through a release is the release's own need, which the
+        # resolver reads from its manifest; the ranges declared beside it are not
+        if (!r.via_release) {
+            var who: str = "";
+            if (!r.root_decl) { who = r.requirer; }
+            collections_vector.push[resolver.Need](?needs_of, resolver.Need{id: r.id, url: r.url, range: r.version, who: who});
+        }
+        var k: usize = 0;
+        for (k < r.also.len) {
+            collections_vector.push[resolver.Need](?needs_of, resolver.Need{id: r.id, url: r.url, range: r.also.data[k].range, who: r.also.data[k].requirer});
+            k = k + 1;
+        }
+        val full: res[str, fail.Fail] = package.dep_full_of(a, op.root, r.id);
+        if (sel full.ok) {
+            val noted: err[fail.Fail] = releases.remember(releases.ctx, r.url, full.ok);
+            if (sel noted.err) { ret res[Resolution, fail.Fail].err{noted.err}; }
+        }
+    }
+    if (needs_of.len == 0) { ret res[Resolution, fail.Fail].ok{out}; }
+    out.ranged = true;
+    if (offline) { collections_vector.push[str](?out.notes, "resolving from releases already fetched (--offline)"); }
+    if (lock) {
+        val ids: res[Vector[str], fail.Fail] = package.realized_ids(a, op.root);
+        if (sel ids.ok) {
+            var j: usize = 0;
+            for (j < ids.ok.len) {
+                val id: str = ids.ok.data[j];
+                j = j + 1;
+                if (unlocked != nil && str_equals(id, unlocked)) { cnt; }
+                val full: res[str, fail.Fail] = package.dep_full_of(a, op.root, id);
+                if (sel full.err) { cnt; }
+                val at: res[str, fail.Fail] = op.checkouts.release_at(op.checkouts.ctx, op.root, id, full.ok, !offline);
+                if (sel at.ok) { lock_push(s.build_alloc, ?locks, id, at.ok); }
+            }
+        }
+        # a range with no checkout yet starts at the declaring dependency's own pin
+        i = 0;
+        for (i < closure.len) {
+            val r: *package_closure.Request = ?closure.data[i];
+            i = i + 1;
+            if (r.seed == nil || str_empty(r.seed))            { cnt; }
+            if (unlocked != nil && str_equals(r.id, unlocked)) { cnt; }
+            if (lock_listed(?locks, r.id))                     { cnt; }
+            val at: res[str, fail.Fail] = releases.release_of(releases.ctx, r.url, r.seed);
+            if (sel at.err) { ret res[Resolution, fail.Fail].err{at.err}; }
+            lock_push(s.build_alloc, ?locks, r.id, at.ok);
+        }
+    }
+    var problem: resolver.Problem = resolver.Problem{root: root_id, needs: needs_of.data, need_count: needs_of.len::u32,
+        fixed: fixed.data, fixed_count: fixed.len::u32, compiler: lang_version.MACH_VERSION, lowest: lowest,
+        locks: locks.data, lock_count: locks.len::u32};
+    val solved: res[Vector[resolver.Choice], fail.Fail] = resolver.resolve(a, ?releases, needs, (?nd)::ptr, ?problem);
+    if (sel solved.err) { ret res[Resolution, fail.Fail].err{solved.err}; }
+    out.picks = solved.ok;
+    if (fixed.len > 0) {
+        val noted: err[fail.Fail] = note_overrides(a, ?nd, root_id, ?out.picks, ?fixed, ?fixed_by, ?fixed_who, ?fixed_own, root_notes, ?out.notes);
+        if (sel noted.err) { ret res[Resolution, fail.Fail].err{noted.err}; }
+    }
+    ret res[Resolution, fail.Fail].ok{out};
+}
+
+# name every requirement of a chosen release that a `ref` or `path` declaration overrides,
+# the root's or one along the closure's fixed edges
+fun note_overrides(a: *A.Allocator, nd: *Needs, root_id: str, picks: *Vector[resolver.Choice],
+    fixed: *Vector[str], fixed_by: *Vector[str], fixed_who: *Vector[str], fixed_own: *Vector[bool], root_notes: bool,
+    notes: *Vector[str]) err[fail.Fail] {
+    var i: usize = 0;
+    for (i < picks.len) {
+        val pick: *resolver.Choice = ?picks.data[i];
+        i = i + 1;
+        val v: res[manifest_version.Version, str] = manifest_version.parse_version(pick.version);
+        if (sel v.err) { ret err[fail.Fail].err{fail.user(diagnostic_kind.VERSION_INVALID, v.err)}; }
+        var rel: package_source.Release = package_source.Release{version: v.ok, text: pick.version, tag: pick.tag, commit: pick.commit};
+        var rn:  resolver.ReleaseNeeds  = resolver.ReleaseNeeds{mach: "", needs: collections_vector.init[resolver.Need](a), excluded: ""};
+        val got: err[fail.Fail]         = needs(nd::ptr, pick.id, pick.url, ?rel, ?rn);
+        if (sel got.err) { ret got; }
+        var k: usize = 0;
+        for (k < rn.needs.len) {
+            val need: *resolver.Need = ?rn.needs.data[k];
+            k = k + 1;
+            var f: usize = 0;
+            for (f < fixed.len) {
+                if (str_equals(fixed.data[f], need.id) && (root_notes || !fixed_own.data[f])) {
+                    val line: res[str, std_format.FormatError] = std_format.sprint(a, "{} declares {} by {}, overriding {} -> {} {} requires {} {}",
+                        fixed_who.data[f], need.id, fixed_by.data[f], root_id, pick.id, pick.version, need.id, need.range);
+                    if (sel line.err) { ret err[fail.Fail].err{fail.message(fail.format_text(line.err))}; }
+                    collections_vector.push[str](notes, line.ok);
+                }
+                f = f + 1;
+            }
+        }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a release's requirements as the resolver reads them: its compiler range and its dependencies
+# selected by version range, or by an exact release tag. a release selecting anything else
+# (a branch, a commit, a path) is not reproducible from its tag and is refused,
+# unless the root declares that identity and so selects it itself. a release whose
+# manifest does not load or names another version is no candidate, which `out.excluded` says
+fun needs(ctx: ptr, id: str, url: str, rel: *package_source.Release, out: *resolver.ReleaseNeeds) err[fail.Fail] {
+    val nd: *Needs                                 = ctx::*Needs;
+    val s:  *session.Session                       = nd.s;
+    val a:  *A.Allocator                           = s.build_alloc;
+    val mr: res[package_source.Shipped, fail.Fail] = nd.releases.shipped(nd.releases.ctx, url, rel);
+    if (sel mr.err) { ret err[fail.Fail].err{mr.err}; }
+    if (!str_empty(mr.ok.excluded)) {
+        out.excluded = mr.ok.excluded;
+        ret err[fail.Fail].ok{};
+    }
+    var m: manifest.Manifest = mr.ok.manifest;
+    fin { manifest.dnit(?m, a); }
+    if (m.mach != intern.STR_NIL) {
+        val mach: opt[str] = intern.lookup(?s.interner, m.mach);
+        if (sel mach.some) { out.mach = mach.some; }
+    }
+    var i: u32 = 0;
+    for (i < m.dep_count) {
+        val d:    *manifest.DepDef = ?m.deps[i];
+        val name: str              = package.intern_text(s, d.name);
+        i = i + 1;
+        # an unreproducible selector the root overrides is not a requirement: the root's own selector is
+        val overridden: bool = nd.root != nil && driver_closure.root_dependency(nd.root, d.name) != nil;
+        if (d.git == intern.STR_NIL) {
+            if (overridden) { cnt; }
+            ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_UNREPRODUCIBLE, unreproducible(a, id, rel, name, "a path"))};
+        }
+        val dep_url: str = package.intern_text(s, d.git);
+        var want:    str = "";
+        if (d.version != intern.STR_NIL) { want = package.intern_text(s, d.version); }
+        or {
+            val ref: str = package.intern_text(s, d.ref);
+            if (!str_starts_with(ref, "tag/v")) {
+                if (overridden) { cnt; }
+                ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_UNREPRODUCIBLE, unreproducible(a, id, rel, name, ref))};
+            }
+            val exact: res[str, std_format.FormatError] = std_format.sprint(a, "={}", (?ref[5])::str);
+            if (sel exact.err) { ret err[fail.Fail].err{fail.message(fail.format_text(exact.err))}; }
+            want = exact.ok;
+        }
+        val pushed: res[usize, A.Error] = collections_vector.push[resolver.Need](?out.needs, resolver.Need{id: name, url: dep_url, range: want, who: ""});
+        if (sel pushed.err)           { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        if (str_empty(nd.local_root)) { cnt; }
+        val local_r: res[str, fail.Fail] = package.dep_full_of(a, nd.local_root, name);
+        if (sel local_r.ok) {
+            val noted: err[fail.Fail] = nd.releases.remember(nd.releases.ctx, dep_url, local_r.ok);
+            if (sel noted.err) { ret noted; }
+        }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun unreproducible(a: *A.Allocator, id: str, rel: *package_source.Release, name: str, selector: str) str {
+    val r: res[str, std_format.FormatError] = std_format.sprint(a,
+        "release {} of {} selects dependency '{}' by {}; a release may select its dependencies only by `version` or an exact `tag/`, so it cannot be reproduced from its tag. declare [dep.{}] in your root manifest to select it yourself, or have {} cut a release that selects it by `version` or an exact `tag/`",
+        rel.tag, id, name, selector, name, id);
+    if (sel r.err) { ret "a release selects a dependency by something other than a version or a tag"; }
+    ret r.ok;
+}
+
+# one version-selected identity as `mach dep outdated` shows it: the release its pin is ("-"
+# for none), the highest this compiler and every range accept, and the highest published
+pub rec OutdatedRow {
+    id:         str;
+    pinned:     str;
+    compatible: str;
+    latest:     str;
+}
+
+# what `mach dep outdated` shows: the resolution's notes, whether any identity selects
+# releases by version, and a row for each that does
+pub rec Outdated {
+    notes:  Vector[str];
+    ranged: bool;
+    rows:   Vector[OutdatedRow];
+}
+
+# each version-selected identity's pinned release, the highest this compiler and every range
+# accept, and the highest release published
+pub fun outdated(op: *package_closure.Operation, doc: *manifest.Doc, offline: bool) res[Outdated, fail.Fail] {
+    val s:        *session.Session           = op.s;
+    val a:        *A.Allocator               = op.a;
+    var walk:     package_closure.Walk       = package_closure.Walk{offline: offline, all: false, name: nil};
+    val resolved: res[Resolution, fail.Fail] = versions(op, doc, false, false, nil, true, ?walk);
+    if (sel resolved.err) { ret res[Outdated, fail.Fail].err{resolved.err}; }
+    var out: Outdated = Outdated{notes: resolved.ok.notes, ranged: resolved.ok.ranged, rows: collections_vector.init[OutdatedRow](a)};
+    if (!resolved.ok.ranged) { ret res[Outdated, fail.Fail].ok{out}; }
+    var picks:  Vector[resolver.Choice]                 = resolved.ok.picks;
+    val opened: res[package_source.Releases, fail.Fail] = git_member.releases(s, offline, "");
+    if (sel opened.err) { ret res[Outdated, fail.Fail].err{opened.err}; }
+    var releases: package_source.Releases = opened.ok;
+    fin { releases.close(releases.ctx); }
+    var i: usize = 0;
+    for (i < picks.len) {
+        val pick: *resolver.Choice = ?picks.data[i];
+        i = i + 1;
+        var pinned: str                 = "-";
+        val full:   res[str, fail.Fail] = package.dep_full_of(a, op.root, pick.id);
+        if (sel full.ok) {
+            if (offline) { releases.remember(releases.ctx, pick.url, full.ok); }
+            val at: res[str, fail.Fail] = op.checkouts.release_at(op.checkouts.ctx, op.root, pick.id, full.ok, !offline);
+            if (sel at.ok) {
+                if (!str_empty(at.ok)) { pinned = at.ok; }
+            }
+        }
+        var list:   Vector[package_source.Release] = collections_vector.init[package_source.Release](a);
+        var latest: str                            = pick.version;
+        val listed: err[fail.Fail]                 = releases.list(releases.ctx, pick.url, ?list);
+        if (sel listed.ok) {
+            var best: manifest_version.Version = list.data[0].version;
+            var k:    usize                    = 0;
+            for (k < list.len) {
+                val v: *manifest_version.Version = ?list.data[k].version;
+                if (v.pre_len == 0 && (str_equals(latest, pick.version) || manifest_version.compare(v, ?best) > 0)) {
+                    if (manifest_version.compare(v, ?best) >= 0 || k == 0) {
+                        best   = @v;
+                        latest = list.data[k].text;
+                    }
+                }
+                k = k + 1;
+            }
+        }
+        collections_vector.push[OutdatedRow](?out.rows, OutdatedRow{id: pick.id, pinned: pinned, compatible: pick.version, latest: latest});
+    }
+    ret res[Outdated, fail.Fail].ok{out};
+}
