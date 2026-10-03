@@ -1,11 +1,5 @@
 # mach.lang.target.isa.arm64.register
 
-## val MODEL
-
-```mach
-pub val MODEL: target_model.Machine = target_model.Machine;
-```
-
 ## val MACHINE
 
 ```mach
