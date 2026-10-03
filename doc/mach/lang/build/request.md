@@ -11,12 +11,6 @@ the typed options of a build-shaped command
 selectors: the `-a`, `-t` and `-p` patterns and `--all`
 jobs: the `--jobs` count, 0 when absent
 
-## fun is_object_path
-
-```mach
-pub fun is_object_path(tok: *u8) bool;
-```
-
 ## def SubsystemFlag
 
 ```mach

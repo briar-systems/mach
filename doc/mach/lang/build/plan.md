@@ -62,24 +62,6 @@ pub val PH_TEST: PhaseKind = 8
 
 a test build's test objects, after the normal objects they are lowered against
 
-## val LINK_STATIC
-
-```mach
-pub val LINK_STATIC: LinkInputKind = 0
-```
-
-## val LINK_DYNAMIC
-
-```mach
-pub val LINK_DYNAMIC: LinkInputKind = 1
-```
-
-## rec LinkInput
-
-```mach
-pub rec LinkInput;
-```
-
 ## rec BuildUnit
 
 ```mach
@@ -230,7 +212,7 @@ pub fun finished_modules(tgt: *lang_target.Binding) bool;
 ```mach
 pub fun resolve_requirement(a: *A.Allocator, itn: *intern.Interner, tgt: *lang_target.Binding,
 dirs: *Vector[str], root: str,
-req: *manifest.LinkRequirement) res[LinkInput, fail.Fail];
+req: *manifest.LinkRequirement) res[input.Input, fail.Fail];
 ```
 
 ## fun join_msg
