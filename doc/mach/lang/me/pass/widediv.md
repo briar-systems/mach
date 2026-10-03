@@ -16,6 +16,6 @@ a helper cannot raise the target's divide fault
 ## fun run
 
 ```mach
-pub fun run(m: *me_ir.Module, tgt: *lang_target.Target, itn: *intern.Interner) res[bool, fail.Fail];
+pub fun run(m: *me_ir.Module, tgt: *resolved.Target, itn: *intern.Interner) res[bool, fail.Fail];
 ```
 

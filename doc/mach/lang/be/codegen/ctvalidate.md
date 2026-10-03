@@ -16,6 +16,6 @@ emitted instruction stream after every late expansion
 ## fun validate
 
 ```mach
-pub fun validate(tgt: *resolved.Target, m: *codegen_mir.MirModule) err[fail.Fail];
+pub fun validate(tgt: *binding.Binding, m: *codegen_mir.MirModule) err[fail.Fail];
 ```
 

@@ -170,13 +170,13 @@ pub fun set_import_name(set: u8) str;
 ## fun register_defs
 
 ```mach
-pub fun register_defs(storage: *DefStorage) *isa.TargetDefs;
+pub fun register_defs(storage: *DefStorage) *target_definition.Table;
 ```
 
 ## fun is_image_operands
 
 ```mach
-pub fun is_image_operands(en: *isa.OpEnum) bool;
+pub fun is_image_operands(en: *target_definition.OpEnum) bool;
 ```
 
 whether `en` is an instruction's view of the Image Operands mask

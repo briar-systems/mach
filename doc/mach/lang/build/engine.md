@@ -36,7 +36,7 @@ call is expired by it
 
 bp: the plan, read only
 unit_index: the cell to run; out of range is an internal failure
-s: the warm session; its registry, sources and queries carry over between calls
+s: the warm session; its sources and queries carry over between calls
 oa: owns the returned outcome
 sink: where the unit's failures, diagnostics and phase rows are sent as they happen; nil for none
 ret: the outcome of that one unit, released with outcome.outcome_dnit, or an engine failure

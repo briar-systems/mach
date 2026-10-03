@@ -147,3 +147,43 @@ pub fun names_append(b: *textbuild.TextBuilder, table: *Extension, count: u32) e
 
 the table's names, `, `-separated, appended to `b`
 
+## val VOCABULARY_CAP
+
+```mach
+pub val VOCABULARY_CAP: u32 = 8
+```
+
+the most vocabularies a description carries: one per registered instruction set
+
+## rec Vocabulary
+
+```mach
+pub rec Vocabulary;
+```
+
+every extension vocabulary the registered instruction sets declare, each table
+once in registration order: what a name in `#[extensions(...)]` may mean beside
+the selected instruction set's own table
+
+## fun vocabulary_empty
+
+```mach
+pub fun vocabulary_empty() Vocabulary;
+```
+
+## fun vocabulary_add
+
+```mach
+pub fun vocabulary_add(v: *Vocabulary, table: *Extension, count: u32) bool;
+```
+
+`table` joins `v` unless it is empty or already there; false when `v` is full
+
+## fun vocabulary_append
+
+```mach
+pub fun vocabulary_append(b: *textbuild.TextBuilder, v: *Vocabulary) err[textbuild.Error];
+```
+
+the names of every table of `v`, `, `-separated
+

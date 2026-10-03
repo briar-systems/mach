@@ -192,6 +192,14 @@ fwd mach.lang.driver.registry.setup_registry
 
 forwards [`mach.lang.driver.registry.setup_registry`](driver/registry.md#fun-setup_registry)
 
+## fwd mach.lang.driver.registry.registry
+
+```mach
+fwd mach.lang.driver.registry.registry
+```
+
+forwards [`mach.lang.driver.registry.registry`](driver/registry.md#fun-registry)
+
 ## fun append_frontend_roots
 
 ```mach

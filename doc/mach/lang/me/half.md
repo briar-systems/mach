@@ -45,7 +45,7 @@ a binary16, so a calling convention can place it as the float it is
 ## fun init
 
 ```mach
-pub fun init(b: *builder.Builder, tgt: *lang_target.Target) res[Half, fail.Fail];
+pub fun init(b: *builder.Builder, tgt: *resolved.Target) res[Half, fail.Fail];
 ```
 
 tgt is the target: its machine model's half rows, packed rows and NaN rule

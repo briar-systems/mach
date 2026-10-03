@@ -3,7 +3,7 @@
 ## fun run
 
 ```mach
-pub fun run(m: *me_ir.Module, tgt: *lang_target.Target) res[bool, fail.Fail];
+pub fun run(m: *me_ir.Module, tgt: *resolved.Target) res[bool, fail.Fail];
 ```
 
 rewrites a multiply of two same-kind extensions of one type into the

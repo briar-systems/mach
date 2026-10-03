@@ -9,7 +9,7 @@ pub fun validate_link_inputs(images: *target_of.ObjectImage, count: u32) err[fai
 ## fun read_objects
 
 ```mach
-pub fun read_objects(s: *session.Session, tgt: *lang_target.Target, inputs: *target_of.ObjectInput,
+pub fun read_objects(s: *session.Session, tgt: *lang_target.Binding, inputs: *target_of.ObjectInput,
 input_count: u32, seed: *target_of.ObjectImage, seed_count: u32,
 required: intern.StrId,
 module_count: *u32) res[*target_of.ObjectImage, fail.Fail];

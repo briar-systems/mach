@@ -1,107 +1,5 @@
 # mach.lang.target.abi
 
-## val ABI_UNKNOWN
-
-```mach
-pub val ABI_UNKNOWN: u32 = 0
-```
-
-## val ABI_SYSV
-
-```mach
-pub val ABI_SYSV:    u32 = 1
-```
-
-## val ABI_WIN64
-
-```mach
-pub val ABI_WIN64:   u32 = 2
-```
-
-## val ABI_AAPCS64
-
-```mach
-pub val ABI_AAPCS64: u32 = 3
-```
-
-## val ABI_LP64
-
-```mach
-pub val ABI_LP64:    u32 = 4
-```
-
-## val ABI_LP64F
-
-```mach
-pub val ABI_LP64F:   u32 = 5
-```
-
-## val ABI_LP64D
-
-```mach
-pub val ABI_LP64D:   u32 = 6
-```
-
-## val ABI_ILP32
-
-```mach
-pub val ABI_ILP32:  u32 = 7
-```
-
-## val ABI_ILP32F
-
-```mach
-pub val ABI_ILP32F: u32 = 8
-```
-
-## val ABI_ILP32D
-
-```mach
-pub val ABI_ILP32D: u32 = 9
-```
-
-## val ABI_SPIRV
-
-```mach
-pub val ABI_SPIRV:  u32 = 10
-```
-
-## val ABI_CATALOG_VERSION
-
-```mach
-pub val ABI_CATALOG_VERSION: u8 = 1
-```
-
-## fun abi_id_for
-
-```mach
-pub fun abi_id_for(name: str) u32;
-```
-
-## fun abi_name_for
-
-```mach
-pub fun abi_name_for(id: u32) str;
-```
-
-## fun abi_catalog_len
-
-```mach
-pub fun abi_catalog_len() usize;
-```
-
-## fun abi_catalog_name
-
-```mach
-pub fun abi_catalog_name(index: usize) str;
-```
-
-## fun abi_fingerprint_tag
-
-```mach
-pub fun abi_fingerprint_tag(id: u32) u8;
-```
-
 ## def ParamClass
 
 ```mach
@@ -329,18 +227,6 @@ pub fun piece_is_half(p: *ParamPiece) bool;
 
 a piece of a float register two bytes wide carries a binary16: no other
 float or vector a convention places is that narrow
-
-## val PASSING_CARRIERS
-
-```mach
-pub val PASSING_CARRIERS: PassingModel = 0
-```
-
-## val PASSING_VALUES
-
-```mach
-pub val PASSING_VALUES:   PassingModel = 1
-```
 
 ## rec AbiVTable
 

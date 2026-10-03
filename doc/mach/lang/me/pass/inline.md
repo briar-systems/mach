@@ -3,7 +3,7 @@
 ## fun run_in
 
 ```mach
-pub fun run_in(m: *me_ir.Module, tgt: *lang_target.Target, available: *body.Available, workspace: *scratch.Workspace) res[bool, fail.Fail];
+pub fun run_in(m: *me_ir.Module, tgt: *resolved.Target, available: *body.Available, workspace: *scratch.Workspace) res[bool, fail.Fail];
 ```
 
 the analysis (recursion marks, call counts, address-taken facts, duplication
