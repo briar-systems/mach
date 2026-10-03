@@ -28,7 +28,7 @@ in order, the first one's width
 ## fun walk
 
 ```mach
-pub fun walk(f: *lang_mir.MirFunction, ns: *isa_encode.AsmNote, count: u32, eff: *isa_effect.Hooks,
+pub fun walk(f: *lang_mir.MirFunction, ns: *isa_encode.AsmNote, count: u32, arch: *isa.RegMachine,
 tgt: *isa.BackendTarget, alloc: *A.Allocator) err[Refusal];
 ```
 

@@ -581,12 +581,6 @@ pub rec AluWidth;
 one width the alu computes an integer at, in bytes, legal while the model
 holds every extension in `ext` (0 when it always is)
 
-## val ALU_WIDTH_CAP
-
-```mach
-pub val ALU_WIDTH_CAP: u32 = 5
-```
-
 ## rec Machine
 
 ```mach
@@ -1097,16 +1091,9 @@ pub fun moves_cross_bank(m: *Machine, bytes: u32) bool;
 pub fun declare_alu_widths(m: *Machine, widths: u32);
 ```
 
-declares the alu widths `widths` (encoded like int_widths), each one legal
-under every extension set, in place of any declared before
-
-## fun gate_alu_width
-
-```mach
-pub fun gate_alu_width(m: *Machine, bytes: u32, ext: u64);
-```
-
-declares the alu width `bytes`, legal only while the model holds `ext`
+declares the alu widths `widths` (encoded like int_widths, a run of adjacent
+widths), each one legal under every extension set, in place of any declared
+before
 
 ## fun alu_min_width
 
