@@ -254,6 +254,15 @@ pub rec Guard;
 one lexical payload guard: the tag place and the case it is known to hold; frames live on the
 walker's stack and chain through `prev`
 
+## rec Offer
+
+```mach
+pub rec Offer;
+```
+
+a fix an error offers: `close` at `tail`, and with `open` set, `open` at
+`head` too, as one fix labelled `label`
+
 ## rec SemaContext
 
 ```mach

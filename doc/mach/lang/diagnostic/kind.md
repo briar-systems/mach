@@ -2001,12 +2001,6 @@ pub val DEP_REF_INVALID:                  Kind = 327
 pub val DEP_REF_MISMATCH:                 Kind = 328
 ```
 
-## val DEP_RELEASE_EXCLUDED
-
-```mach
-pub val DEP_RELEASE_EXCLUDED:             Kind = 329
-```
-
 ## val DEP_RELEASE_SELECTOR
 
 ```mach
@@ -3074,6 +3068,15 @@ pub fun spec(k: Kind) *Spec;
 ```
 
 the row of `k`, nil for NONE or a kind no row declares
+
+## fun is_error
+
+```mach
+pub fun is_error(k: Kind) bool;
+```
+
+a diagnostic of kind `k` is an error: severity is the row's level, and a kind
+no row declares is a defect, raised as an error if at all
 
 ## fun live
 
