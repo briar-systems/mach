@@ -21,7 +21,7 @@ pub fun emit_exclusive_bound(b: *builder.Builder, counted: *loops.CountedInfo) r
 ## fun version_loop
 
 ```mach
-pub fun version_loop(m: *me_ir.Module, fn: *me_ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, d: *dependence.DepInfo) res[VersionResult, fail.Fail];
+pub fun version_loop(m: *me_ir.Module, fn: *me_ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, d: *dependence.DepInfo, alloc: *A.Allocator) res[VersionResult, fail.Fail];
 ```
 
 ## fun version_result_dnit

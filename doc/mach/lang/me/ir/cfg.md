@@ -32,12 +32,13 @@ the position of `blk` in `blocks`, 0 when it is absent
 ## fun region_clone
 
 ```mach
-pub fun region_clone(m: *me_ir.Module, fn: *me_ir.Function, body: *ir_id.BlockId, len: u32, out_clones: *ir_id.BlockId) err[fail.Fail];
+pub fun region_clone(m: *me_ir.Module, fn: *me_ir.Function, body: *ir_id.BlockId, len: u32, out_clones: *ir_id.BlockId, alloc: *A.Allocator) err[fail.Fail];
 ```
 
 the `len` blocks at `body` copied within `fn` as new blocks, each clone at the
 same position of `out_clones`: their phis, instructions and terminators,
-with every edge and value inside the region pointing at the copies
+with every edge and value inside the region pointing at the copies; the
+clone maps are drawn from `alloc`
 
 ## fun clones_list
 
