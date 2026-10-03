@@ -724,6 +724,17 @@ pub fun block_target_set(v: *value.Value, b: ir_id.BlockId);
 
 the block operand `v` made to name block `b`
 
+## fun placement_fill
+
+```mach
+pub fun placement_fill(fn: *Function, blocks: *ir_id.BlockId, ords: *u32, len: u32);
+```
+
+where each of the first `len` instructions sits: `blocks[i]` is the block
+listing instruction i, BLOCK_NIL for one no block lists, and `ords[i]`, when
+`ords` is not nil, its position in that block counting phis, then
+instructions, then the terminator
+
 ## fun block_successors
 
 ```mach

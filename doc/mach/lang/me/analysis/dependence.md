@@ -24,12 +24,6 @@ pub rec DepInfo;
 pub fun analyze_dependence(fn: *me_ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, types: *ir_type.IrTypeTable, alloc: *A.Allocator) res[DepInfo, fail.Fail];
 ```
 
-## fun equal
-
-```mach
-pub fun equal(a: value.Value, b: value.Value) bool;
-```
-
 ## fun dep_dnit
 
 ```mach
