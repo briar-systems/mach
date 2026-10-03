@@ -58,6 +58,15 @@ sc: the semantic context
 eid: the expression to ask about
 ret: true when every leaf is an unsuffixed integer literal
 
+## fun fit_ct_int
+
+```mach
+pub fun fit_ct_int(sc: *sema_context.SemaContext, ctval: comptime.CTValue, to: type.TypeId) CoerceResult;
+```
+
+whether a comptime integer value fits integer type `to`, retyping nothing:
+not applicable unless both are integers
+
 ## fun int_bounds_of
 
 ```mach
