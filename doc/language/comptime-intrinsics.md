@@ -1,7 +1,7 @@
 # Intrinsics
 
 Intrinsics are compiler-shipped comptime functions. They have the same
-syntactic shape as user-defined function calls (`$name(args)`), but their
+syntactic shape as user-defined function calls (`$<name>(args)`), but their
 names are reserved and their implementations are built into the compiler.
 
 The set is closed; adding a new intrinsic requires a compiler change.
@@ -172,8 +172,8 @@ $is_record(T)           # T is a record (or an instance of one)
 $is_union(T)            # T is a union  (or an instance of one)
 $is_tag(T)              # T is a tagged value (or an instance of one)
 $is_pointer(T)          # T is a reference: the raw `ptr` or a typed `*U`
-$is_integer(T)          # T is an integer: i8..i64, u8..u64
-$is_float(T)            # T is a float: f32 or f64
+$is_integer(T)          # T is an integer primitive, signed or unsigned, of any width
+$is_float(T)            # T is a float primitive, f16, f32 or f64
 $is_secret(T)           # T is `^`-qualified at the outermost level
 $holds_secret(T)        # any byte of T is secret
 ```

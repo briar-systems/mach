@@ -279,7 +279,7 @@ in collection order regardless of completion order.
 ## Which tests run
 
 `mach test` selects its cells with `-a`, `-t` and `-p` as every command does (see
-[manifest.md](manifest.md#selection-and-the-build-matrix)): each takes an exact
+[build.md](build.md#selection-and-the-build-matrix)): each takes an exact
 name or a glob and repeats, and `--all` fills every axis no option names with
 `*`. With no `-a`, the sole artifact the selected target builds is chosen, or
 among several the one marked `default = true` (see

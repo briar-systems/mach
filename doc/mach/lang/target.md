@@ -163,10 +163,10 @@ pub fun fingerprint(t: *binding.Binding, s: *wire.Sink);
 pub fun registered_selection(arch_vt: *isa.IsaVTable, model: *target_model.Machine) isa.IsaVTable;
 ```
 
-the instruction set a [target.*] table selects by naming a registered isa: a
-riscv template narrowed to the default extension set its registered name
-parses to, every other template as registered. model backs the returned
-vtable's model pointer and must outlive it
+the instruction set a [target.*] table selects by naming a registered isa:
+the template narrowed to the selection its registered name spells when its
+names carry a selection, every other template as registered. model backs the
+returned vtable's model pointer and must outlive it
 
 ## fun registered_tuple_capability
 
@@ -176,8 +176,8 @@ pub fun registered_tuple_capability(os_vt: *lang_target_os.OsVTable, arch_vt: *i
 
 the capability of one cell of the target matrix as a [target.*] table naming
 these four registered spellings composes it: the registered template alone
-overstates a riscv isa, whose default selection may lack the float registers
-an abi passes in
+overstates an isa whose default selection may lack the float registers an
+abi passes in
 
 ## fun selection_spelling
 
@@ -187,8 +187,8 @@ pub fun selection_spelling(isa_vt: *isa.IsaVTable, model: *target_model.Machine,
 
 the canonical selection string for an instruction set and the model selected
 on it (a resolved target's `model`, or the one registered_selection filled),
-written into buf: a riscv isa spells the extensions the model holds, every
-other isa its name
+written into buf: an isa whose names carry a selection spells the extensions
+the model holds, every other isa its name
 
 ## fun host_request
 

@@ -3,9 +3,8 @@
 Per-element reference docs. Each file covers one language component;
 read the index below or follow `see also` links to navigate.
 
-This directory is the authoritative reference for the Mach 5 dialect. Each
-file is a focused doc with grammar, examples, and neighboring links; start
-from the index below.
+This directory is the reference for the Mach language. Each file is a focused
+doc with grammar, examples, and neighboring links. Start from the index below.
 
 ## Files and structure
 
@@ -17,7 +16,8 @@ from the index below.
 ## Declarations
 
 - [visibility.md](visibility.md) — `pub` and `ext` modifiers
-- [decorators.md](decorators.md) — codegen decorators, `#[name]` (`symbol`, `library`, `inline`, `align`, `section`, `embed`)
+- [decorators.md](decorators.md) — decorators, `#[<name>]`, and where each one applies
+- [gpu.md](gpu.md) — the GPU decorators: pipeline stages, the shader interface, target handles and instructions
 - [def.md](def.md) — type alias
 - [rec.md](rec.md) - record
 - [uni.md](uni.md) - raw union
@@ -44,8 +44,7 @@ from the index below.
 
 - [comptime.md](comptime.md) - channel overview
 - [comptime-mach.md](comptime-mach.md) - $mach.* compiler-owned namespace
-- [decorators.md](decorators.md) - codegen decorators, #[name] (replaces the removed $sym.attr setters)
-- [comptime-intrinsics.md](comptime-intrinsics.md) - $size_of, $length_of, $align_of, $offset_of, $type_of, $fields, $cases, $is_tag, $discriminant_of, $pointee_of, $is_record, $is_union, $is_pointer, $is_integer, $is_float, $is_secret, $holds_secret, $type_name, $each, $error
+- [comptime-intrinsics.md](comptime-intrinsics.md) - the `$<name>(...)` intrinsics and `$each`
 - [comptime-control.md](comptime-control.md) - $if / $or
 
 ## Low-level
@@ -78,6 +77,8 @@ from the index below.
 ## Build system
 
 - [manifest.md](manifest.md) — the `mach.toml` manifest reference
+- [dependencies.md](dependencies.md) — how dependencies are resolved, pinned and verified
+- [build.md](build.md) — which targets, profiles and artifacts a command builds
 - [ir-output.md](ir-output.md) — `--emit-ir` and its two forms, and which one is stable for tooling
 - `mach --help` and `mach help <command>` — the command-line reference
 
