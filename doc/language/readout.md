@@ -46,7 +46,9 @@ built out/app  48 modules  1 MiB  in 358ms
 `(N target-gated, not carried forward)` when it dropped modules gated to
 another target. Under `-vv` each module or file prints as an indented line
 under the phase that processed it, in the order they finish, and the row names
-the slowest of them.
+the slowest of them. A unit whose project or dependencies declare build steps
+opens with a `steps` row, and under `-vv` each step that ran prints by name;
+a step its stamp shows is current is counted but prints no line.
 
 Under `--diagnostics=json` every one of these lines is a record, written when
 the line would be: a `phase` record for a row, a `phase_item` record for an
