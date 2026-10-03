@@ -283,10 +283,10 @@ the memory operand of a pointer value as lowered, with no folded address
 pub fun push_instr(ctx: *LowerCtx, mb: *codegen_mir.MirBlock, mi: codegen_mir.MirInstr) err[fail.Fail];
 ```
 
-## fun grow_instr
+## fun instr_reserve
 
 ```mach
-pub fun grow_instr(ctx: *LowerCtx, mb: *codegen_mir.MirBlock) err[fail.Fail];
+pub fun instr_reserve(ctx: *LowerCtx, mb: *codegen_mir.MirBlock) err[fail.Fail];
 ```
 
 ## fun emit_mov

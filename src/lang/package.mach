@@ -1,0 +1,229 @@
+# package: the dependency manager behind `mach dep` and `mach init`. it reads a project's
+# dependency closure from its manifests, resolves version ranges against the releases a
+# source publishes, realizes every dependency flat under dep/ and records its pin, and
+# checks a realized closure against all of it. a build never reaches it: the driver only
+# locates what dep/ holds (driver/closure.mach).
+#
+# the closure engine (closure, resolve, edit, list, verify) works through three contracts,
+# so a new source is a new member and not a new engine:
+#
+# - source.mach: where a dependency's releases and content come from
+# - pin.mach: where a project records the revision each dependency is held at
+# - report.mach: where progress, notes and failures go while it works
+#
+# git, under package/git, is the member of the first two and the one outside tool mach
+# runs; path.mach realizes a dependency declared by a local path. this module holds what
+# every part shares: the slot layout under dep/ and the identity rule
+use std.collections.sort;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use fs:         std.filesystem;
+use std_format: std.format;
+use io_error:   std.io.error;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use types_string: std.types.string;
+use std.types.string.str;
+use std.types.string.str_copy_slice;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use driver_closure:  mach.lang.driver.closure;
+use mach.lang.driver.load;
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.manifest;
+use mach.lang.session;
+
+pub fun free_name_vector(alloc: *A.Allocator, names: *Vector[str]) {
+    var i: usize = 0;
+    for (i < names.len) {
+        str_free(alloc, names.data[i]);
+        i = i + 1;
+    }
+    collections_vector.dnit[str](names);
+}
+
+# the note naming one requirement a root declaration overrode, as `mach dep pull`, `update`,
+# `add` and `verify` print it
+# ---
+# a:         allocates the note
+# name:      the dependency identity
+# declared:  the root's winning selector, as its manifest line spells it
+# chain:     the requiring chain, ending at the dependency
+# requested: the selector the chain asked for, in the same form
+pub fun override_note(a: *A.Allocator, name: str, declared: str, chain: str, requested: str) res[str, fail.Fail] {
+    val r: res[str, std_format.FormatError] = std_format.sprint(a,
+        "note: dependency '{}': the root declares {}, overriding {} which requires {}; nothing checks that '{}' supports the root's selection",
+        name, declared, chain, requested, name);
+    if (sel r.err) { ret res[str, fail.Fail].err{fail.message(fail.format_text(r.err))}; }
+    ret res[str, fail.Fail].ok{r.ok};
+}
+
+pub fun intern_text(s: *session.Session, id: intern.StrId) str {
+    val t: opt[str] = intern.lookup(?s.interner, id);
+    if (sel t.some) { ret t.some; }
+    ret "";
+}
+
+# the manifest key, the directory under dep/ and the project id are one name
+pub fun check_dep_identity(s: *session.Session, key: str, declared: str) err[fail.Fail] {
+    if (str_equals(key, declared)) { ret err[fail.Fail].ok{}; }
+    val msg_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+        "[dep.{}] realizes project '{}': the manifest key, the directory under dep/, and the project id are one name, so rename the table to [dep.{}] and the directory to dep/{}",
+        key, declared, declared, declared);
+    if (sel msg_r.err) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_ID_MISMATCH, "dependency manifest id does not match its declared identity")}; }
+    ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_ID_MISMATCH, msg_r.ok)};
+}
+
+# a realized nested dependency (`dep/<id>/dep/<x>/mach.toml`) is refused: the
+# root owns the flat closure and a dependency's own dep/ is never realized.
+# an empty directory git materializes for a consumed dependency's gitlink is not
+# a realization and passes
+pub fun refuse_nested_realization(s: *session.Session, alias: str, dep_dir: str) err[fail.Fail] {
+    val nested_r: res[str, fail.Fail] = load.join_path(s.build_alloc, dep_dir, driver_closure.DEP_DIR);
+    if (sel nested_r.err) { ret err[fail.Fail].err{nested_r.err}; }
+    val nested: str = nested_r.ok;
+    fin { str_free(s.build_alloc, nested); }
+    val is_dir_r: res[bool, io_error.Error] = fs.is_dir(nested);
+    if (!(sel is_dir_r.ok && is_dir_r.ok)) { ret err[fail.Fail].ok{}; }
+    val names_r: res[Vector[str], fs.FsError] = fs.read_dir(s.build_alloc, nested);
+    if (sel names_r.err) { ret err[fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, fail.fs_text(names_r.err))}; }
+    var names: Vector[str] = names_r.ok;
+    fin { free_name_vector(s.build_alloc, ?names); }
+    var i: usize = 0;
+    for (i < names.len) {
+        val child_r: res[str, fail.Fail] = load.join_path(s.build_alloc, nested, names.data[i]);
+        if (sel child_r.err) { ret err[fail.Fail].err{child_r.err}; }
+        val child: str                 = child_r.ok;
+        val mf_r:  res[str, fail.Fail] = load.join_path(s.build_alloc, child, manifest.MANIFEST_FILE);
+        str_free(s.build_alloc, child);
+        if (sel mf_r.err) { ret err[fail.Fail].err{mf_r.err}; }
+        val mf:       str                       = mf_r.ok;
+        val exists_r: res[bool, io_error.Error] = fs.exists(mf);
+        str_free(s.build_alloc, mf);
+        if (sel exists_r.ok && exists_r.ok) {
+            val msg_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+                "dependency '{}': {}/{}/{}/{} is a nested realization: the root's dep/ owns the flat closure and a dependency's own dep/ is never realized, so delete {}/{}/{}",
+                alias, driver_closure.DEP_DIR, alias, driver_closure.DEP_DIR, names.data[i], driver_closure.DEP_DIR, alias, driver_closure.DEP_DIR);
+            if (sel msg_r.err) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_NESTED, "nested dependency realization is refused")}; }
+            ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_NESTED, msg_r.ok)};
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+#[testing]
+pub fun declared_dep_id(s: *session.Session, dep_full: str) res[str, fail.Fail] {
+    val toml_path_r: res[str, fail.Fail] = load.join_path(s.build_alloc, dep_full, manifest.MANIFEST_FILE);
+    if (sel toml_path_r.err) { ret res[str, fail.Fail].err{toml_path_r.err}; }
+    val toml_path: str                          = toml_path_r.ok;
+    val tr:        res[manifest.Doc, fail.Fail] = manifest.doc_read(s.build_alloc, toml_path);
+    str_free(s.build_alloc, toml_path);
+    if (sel tr.err) { ret res[str, fail.Fail].err{tr.err}; }
+    var doc: manifest.Doc                      = tr.ok;
+    val mr:  res[manifest.Manifest, fail.Fail] = manifest.parse(s.build_alloc, ?s.interner, ?doc);
+    manifest.doc_dnit(s.build_alloc, ?doc);
+    if (sel mr.err) { ret res[str, fail.Fail].err{mr.err}; }
+    var parsed: manifest.Manifest = mr.ok;
+    val id_opt: opt[str]          = intern.lookup(?s.interner, parsed.id);
+    if (sel id_opt.none) {
+        manifest.dnit(?parsed, s.build_alloc);
+        ret res[str, fail.Fail].err{fail.user(diagnostic_kind.DEP_NO_PROJECT_ID, "dependency manifest declares no readable project id")};
+    }
+    val copy_r: res[str, types_string.StrError] = str_copy_slice(s.build_alloc, id_opt.some, 0, str_len(id_opt.some));
+    manifest.dnit(?parsed, s.build_alloc);
+    if (sel copy_r.err) { ret res[str, fail.Fail].err{fail.message(fail.str_text(copy_r.err))}; }
+    ret res[str, fail.Fail].ok{copy_r.ok};
+}
+
+pub fun verify_dep_manifest_id(s: *session.Session, dep_full: str, id: str) err[fail.Fail] {
+    val toml_path_r: res[str, fail.Fail] = load.join_path(s.build_alloc, dep_full, manifest.MANIFEST_FILE);
+    if (sel toml_path_r.err) { ret err[fail.Fail].err{toml_path_r.err}; }
+    val toml_path: str                          = toml_path_r.ok;
+    val tr:        res[manifest.Doc, fail.Fail] = manifest.doc_read(s.build_alloc, toml_path);
+    str_free(s.build_alloc, toml_path);
+    if (sel tr.err) { ret err[fail.Fail].err{tr.err}; }
+    var doc: manifest.Doc                      = tr.ok;
+    val mr:  res[manifest.Manifest, fail.Fail] = manifest.parse(s.build_alloc, ?s.interner, ?doc);
+    manifest.doc_dnit(s.build_alloc, ?doc);
+    if (sel mr.err) { ret err[fail.Fail].err{mr.err}; }
+    var parsed: manifest.Manifest = mr.ok;
+    val id_opt: opt[str]          = intern.lookup(?s.interner, parsed.id);
+    if (sel id_opt.none) {
+        manifest.dnit(?parsed, s.build_alloc);
+        ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_NO_PROJECT_ID, "dependency manifest declares no readable project id")};
+    }
+    val declared: str            = id_opt.some;
+    val check:    err[fail.Fail] = check_dep_identity(s, id, declared);
+    manifest.dnit(?parsed, s.build_alloc);
+    ret check;
+}
+
+pub fun dep_rel_of(alloc: *A.Allocator, id: str) res[str, fail.Fail] {
+    val sprint_r: res[str, std_format.FormatError] = std_format.sprint(alloc, "{}/{}", driver_closure.DEP_DIR, id);
+    if (sel sprint_r.err) { ret res[str, fail.Fail].err{fail.message(fail.format_text(sprint_r.err))}; }
+    ret res[str, fail.Fail].ok{sprint_r.ok};
+}
+
+pub fun dep_full_of(alloc: *A.Allocator, root: str, id: str) res[str, fail.Fail] {
+    val rel_r: res[str, fail.Fail] = dep_rel_of(alloc, id);
+    if (sel rel_r.err) { ret res[str, fail.Fail].err{rel_r.err}; }
+    val rel:    str                 = rel_r.ok;
+    val full_r: res[str, fail.Fail] = load.join_path(alloc, root, rel);
+    str_free(alloc, rel);
+    if (sel full_r.err) { ret res[str, fail.Fail].err{full_r.err}; }
+    ret res[str, fail.Fail].ok{full_r.ok};
+}
+
+# a dependency slot is a directory under dep/ named by a valid project id
+pub fun realized_ids(alloc: *A.Allocator, root: str) res[Vector[str], fail.Fail] {
+    val dep_root_r: res[str, fail.Fail] = load.join_path(alloc, root, driver_closure.DEP_DIR);
+    if (sel dep_root_r.err) { ret res[Vector[str], fail.Fail].err{dep_root_r.err}; }
+    val dep_root: str = dep_root_r.ok;
+    fin { str_free(alloc, dep_root); }
+    val is_dir_r: res[bool, io_error.Error] = fs.is_dir(dep_root);
+    if (!(sel is_dir_r.ok && is_dir_r.ok)) { ret res[Vector[str], fail.Fail].ok{collections_vector.init[str](alloc)}; }
+    val names_r: res[Vector[str], fs.FsError] = fs.read_dir(alloc, dep_root);
+    if (sel names_r.err) { ret res[Vector[str], fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, fail.fs_text(names_r.err))}; }
+    var names: Vector[str] = names_r.ok;
+    val total: usize       = names.len;
+    var kept:  usize       = 0;
+    var i:     usize       = 0;
+    for (i < total) {
+        val name: str  = names.data[i];
+        var slot: bool = manifest.is_valid_id(name);
+        if (slot) {
+            val full_r: res[str, fail.Fail] = load.join_path(alloc, dep_root, name);
+            if (sel full_r.err) {
+                names.len = kept;
+                for (i < total) {
+                    str_free(alloc, names.data[i]);
+                    i = i + 1;
+                }
+                free_name_vector(alloc, ?names);
+                ret res[Vector[str], fail.Fail].err{full_r.err};
+            }
+            val entry_r: res[bool, io_error.Error] = fs.is_dir(full_r.ok);
+            str_free(alloc, full_r.ok);
+            slot = (sel entry_r.ok && entry_r.ok);
+        }
+        if (slot) {
+            names.data[kept] = name;
+            kept             = kept + 1;
+        }
+        or { str_free(alloc, name); }
+        i = i + 1;
+    }
+    names.len = kept;
+    sort.sort[str](names.data, names.len);
+    ret res[Vector[str], fail.Fail].ok{names};
+}

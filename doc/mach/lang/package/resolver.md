@@ -1,4 +1,4 @@
-# mach.lang.driver.resolver
+# mach.lang.package.resolver
 
 ## rec Need
 
@@ -48,7 +48,7 @@ pub rec Choice;
 ## fun resolve
 
 ```mach
-pub fun resolve(a: *A.Allocator, src: *candidates.CandidateSource, needs: NeedsFn, needs_ctx: ptr,
+pub fun resolve(a: *A.Allocator, src: *package_source.Releases, needs: NeedsFn, needs_ctx: ptr,
 problem: *Problem) res[Vector[Choice], fail.Fail];
 ```
 
