@@ -254,21 +254,21 @@ release: also hold the root to the release rule: every dependency selected by
 overrides: when not nil, receives every requirer selector a root override replaced
 ret: err naming the first mismatch
 
-## fun realize_closure
+## fun closure_locate
 
 ```mach
-pub fun realize_closure(s: *session.Session, m: *manifest.Manifest, project_root: str) res[project.Project, outcome.Fail];
+pub fun closure_locate(s: *session.Session, m: *manifest.Manifest, project_root: str) res[project.Project, outcome.Fail];
 ```
 
-resolve and verify a root manifest's dependency closure with no build cell
-configured: `p.config.deps` holds every realized dependency, its manifest and
-its direct edges, exactly as a build configures them
+locate a root manifest's dependency closure with no build cell configured, as a
+build locates it: `p.config.deps` holds every dependency under dep/, its manifest
+and its direct edges, and nothing is checked against git or the pins
 
 s: the session
 m: the root manifest
 project_root: the root project's directory
 ret: the project holding the closure, released with `project.dnit_project`;
-              err from dependency resolution, its diagnostics published
+              err from locating the closure, its diagnostics published
 
 ## fun begin_build
 
