@@ -39,13 +39,13 @@ pub val OPK_SYM:   OperandKind = 5
 ## val REG_CLASS_ID_GP
 
 ```mach
-pub val REG_CLASS_ID_GP:  i32 = 0
+pub val REG_CLASS_ID_GP: i32 = 0
 ```
 
-## val REG_CLASS_ID_XMM
+## val REG_CLASS_ID_FP
 
 ```mach
-pub val REG_CLASS_ID_XMM: i32 = 1
+pub val REG_CLASS_ID_FP: i32 = 1
 ```
 
 ## def SymModifier

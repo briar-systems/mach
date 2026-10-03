@@ -63,11 +63,87 @@ pub rec BackendTarget;
 pub rec AssemblyCapabilities;
 ```
 
+## val REG_NONE
+
+```mach
+pub val REG_NONE: i32 = -1
+```
+
+no register: the place a register fact holds when the instruction set has
+none for it
+
+## def FixedPlace
+
+```mach
+pub def FixedPlace: u8
+```
+
+a place in an operation the instruction set fixes to one register rather
+than leaving to the allocator
+
+## val FIXED_PAIR_LO
+
+```mach
+pub val FIXED_PAIR_LO: FixedPlace = 0
+```
+
+the accumulator a divide, a remainder and a fixed-pair widening multiply
+read their first operand from and leave the quotient or low half in
+
+## val FIXED_PAIR_HI
+
+```mach
+pub val FIXED_PAIR_HI: FixedPlace = 1
+```
+
+where those operations leave the remainder or high half; declared together
+with FIXED_PAIR_LO
+
+## val FIXED_SHIFT_COUNT
+
+```mach
+pub val FIXED_SHIFT_COUNT: FixedPlace = 2
+```
+
+the register a variable shift reads its count from
+
+## val FIXED_PLACE_COUNT
+
+```mach
+pub val FIXED_PLACE_COUNT: u32 = 3
+```
+
+## rec FixedOperand
+
+```mach
+pub rec FixedOperand;
+```
+
+one fixed place and the register the instruction set fixes it to
+
 ## rec RegMachine
 
 ```mach
 pub rec RegMachine;
 ```
+
+## fun fixed_reg
+
+```mach
+pub fun fixed_reg(m: *RegMachine, place: FixedPlace) i32;
+```
+
+the register `m` fixes `place` to, REG_NONE where it fixes none. a member
+with no register machine fixes nothing
+
+## fun has_fixed_pair
+
+```mach
+pub fun has_fixed_pair(m: *RegMachine) bool;
+```
+
+whether `m` fixes the accumulator pair a divide and a fixed-pair widening
+multiply run on
 
 ## fun body_writes_sp
 
