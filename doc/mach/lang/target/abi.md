@@ -165,29 +165,40 @@ pub val EB_EMPTY_HI:  u8 = 8
 pub val EB_UNALIGNED: u8 = 16
 ```
 
+## rec ArgQuery
+
+```mach
+pub rec ArgQuery;
+```
+
+one argument a convention places. align is the alignment the register
+assignment honors: the type's own, capped where the platform relaxes it
+(darwin aarch64 starts a 16-byte value in any x register). vec_bytes is the
+widest vector one register of the target carries under its selected
+extensions (isa.vector_register_bytes), which a convention that places a
+vector by its register width reads (System V's ymm under avx)
+
+## rec RetQuery
+
+```mach
+pub rec RetQuery;
+```
+
+the result a convention places, described as an argument is
+
 ## def ArgPassingFn
 
 ```mach
-pub def ArgPassingFn: fun(i32, u64, u64, bool, u8, bool, bool, i32, i32, u8, u8, AggLayout, u64) ParamSlot
+pub def ArgPassingFn: fun(*AbiVTable, *ArgQuery) ParamSlot
 ```
 
-the arguments are index, size, align, is_float, eightbytes, is_aggregate, is_vector, gp_used, fp_used,
-hfa_members, hfa_elem, the aggregate layout and the vector register bytes. align is the alignment the
-register assignment honors: the type's own, capped where the platform relaxes it (darwin aarch64 starts a
-16-byte value in any x register). the vector register bytes are the widest vector one register of the
-target carries under its selected extensions (isa.vector_register_bytes), which a convention that places
-a vector by its register width reads (System V's ymm under avx)
+a classifier reads the descriptor it is called through, so one classifier
+serves every member of a family, each member's parameters in `family`
 
 ## def RetPassingFn
 
 ```mach
-pub def RetPassingFn: fun(u64, u64, bool, u8, bool, bool, u8, u8, AggLayout, u64) ParamSlot
-```
-
-## def RegFileFn
-
-```mach
-pub def RegFileFn: isa.RegFileFn
+pub def RetPassingFn: fun(*AbiVTable, *RetQuery) ParamSlot
 ```
 
 ## val HALF_FLOAT

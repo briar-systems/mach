@@ -42,6 +42,18 @@ pub val OF_FORMAT_CATALOG_VERSION: u8 = 1
 pub fun of_name_for(id: u32) str;
 ```
 
+## fun of_count
+
+```mach
+pub fun of_count() usize;
+```
+
+## fun of_name_at
+
+```mach
+pub fun of_name_at(index: usize) str;
+```
+
 ## fun of_fingerprint_tag
 
 ```mach

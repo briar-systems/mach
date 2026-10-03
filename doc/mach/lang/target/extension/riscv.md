@@ -201,15 +201,6 @@ pub fun valid(bits: u64) bool;
 pub fun is_name(name: str) bool;
 ```
 
-## rec Span
-
-```mach
-pub rec Span;
-```
-
-the token a refusal is about: its offset and length in the selection string,
-zero-length when the refusal is about the string as a whole
-
 ## fun parse
 
 ```mach
@@ -219,7 +210,7 @@ pub fun parse(name: str) res[Selection, fail.Fail];
 ## fun parse_at
 
 ```mach
-pub fun parse_at(name: str, bad: *Span) res[Selection, fail.Fail];
+pub fun parse_at(name: str, bad: *extension.Span) res[Selection, fail.Fail];
 ```
 
 ## fun letters
@@ -248,4 +239,12 @@ pub fun spell(width: u32, bits: u64, buf: *u8, cap: usize) str;
 the canonical selection string for a mask: the shortest string parse maps back
 to it, G abbreviating its seven members and Zicsr left implied by F. width is
 the register width in bytes as Selection carries it
+
+## val SYNTAX
+
+```mach
+pub val SYNTAX: extension.SelectionSyntax = extension.SelectionSyntax;
+```
+
+the rv32 and rv64 selection strings, which riscv32 and riscv64 read
 

@@ -28,6 +28,14 @@ pub val ENDIAN_BIG:    Endian = 1
 pub rec Register;
 ```
 
+## rec RegFile
+
+```mach
+pub rec RegFile;
+```
+
+a register file a calling convention declares, its registers in order
+
 ## def RegClassKind
 
 ```mach
