@@ -430,11 +430,11 @@ the walk cannot model, it refuses:
 | **a flags-conditioned branch on a secret** (x86-64 `jcc`, aarch64 `b.<cond>`) | the flags it reads were filled from a secret |
 
 That last row is a per-target asymmetry worth stating precisely, because getting it
-wrong was a real hole (#2477). A branch whose condition is a **register operand** is
+wrong was a real hole. A branch whose condition is a **register operand** is
 visible to the walk and is checked: aarch64's `cbz`/`cbnz`, and every riscv64 branch,
 which compares two registers — RISC-V has no flags register at all. A branch whose
 condition rides the **flags register** is checked against a separate flags-taint
-state (#2460): a `cmp` of a secret marks the flags secret-derived, and a later `jcc`
+state: a `cmp` of a secret marks the flags secret-derived, and a later `jcc`
 reading them is refused, while a compare-and-branch over public data is accepted.
 x86-64's `jcc` family is flags-conditioned, and so is **aarch64's `b.<cond>`** —
 which is easy to miss, because `b.<cond>` does not appear in aarch64's mnemonic table
@@ -472,8 +472,8 @@ whose behaviour stops matching it is a silent divergence. Re-establishing it is 
 job for a unit test that runs the probe on the host it is running on, not for a
 cross-compilation suite: the experiment only means anything on the ISA it executes.
 
-**Memory is the third taint domain**, beside the register set and the flags bit
-(#2706). A secret spilled to the stack and reloaded comes back **secret**:
+**Memory is the third taint domain**, beside the register set and the flags bit.
+A secret spilled to the stack and reloaded comes back **secret**:
 
 ```
 mov rax, {r}
@@ -582,7 +582,7 @@ Adding `#[oblivious]` does not change this — the wipe is outside the memory-ad
 leakage model rather than an exception within it. To wipe reliably, write through a
 pointer whose target is memory the compiler cannot promote away, which is what the
 standard library's `zeroize` does. Settled: the wipe guarantee is memory-scoped; secret register lifetimes are outside
-it (#2456).
+it.
 
 **Today the guarantee holds trivially.** mach has no dead-store elimination, so
 nothing removes a store: an entirely dead fill of a *public* local also survives at
@@ -670,7 +670,7 @@ same way the gate does, so on aarch64 they need DIT like the 64-bit high half.
 **Why each row holds.** Every row cites its source beside the declaration in the
 instruction set's registration, and the kind of each claim is marked:
 
-- **x86-64, always, Intel and AMD (#3508).** On Intel it is a vendor guarantee:
+- **x86-64, always, Intel and AMD.** On Intel it is a vendor guarantee:
   the "Data Operand Independent Timing" guidance states that processors which
   do not enumerate DOITM may be assumed to behave as if it were enabled for the
   listed instructions, and `mul` (F6, F7), `imul` (69, 6B, 0F AF, F6, F7) and
@@ -705,8 +705,8 @@ instruction set's registration, and the kind of each claim is marked:
 **DOITM is not a multiply condition.** Intel's Data Operand Independent Timing
 Mode (`IA32_UARCH_MISC_CTL[0]`) hardens the data dependent prefetcher and the
 fast store forwarding predictor, memory-side predictors keyed on data values;
-it does not touch the multiplier, which is why the x86-64 rows hold without it
-(#3623). It is a model-specific register the kernel owns, user space cannot set
+it does not touch the multiplier, which is why the x86-64 rows hold without it.
+It is a model-specific register the kernel owns, user space cannot set
 it, and Linux does not enable it by default, so mach neither declares it nor
 offers a manifest key for it. A program that wants that hardening asks the
 operator for the kernel control, the same class as SMT and other side-channel
@@ -810,7 +810,7 @@ counts and prints its table. It asserts the harness's structure: every batch it
 was asked for is timed in both classes, and every statistic it reports is a
 finite, non-negative number. It asserts **nothing about the numbers** - not a
 threshold, not positivity - because even "a mean is positive" proved to be a
-property of the host's clock resolution rather than of the harness (#3092). **No
+property of the host's clock resolution rather than of the harness. **No
 property of a measured time gates anything**, here or anywhere else in the suite.
 
 That is deliberate and it is not a gap. A dudect score is a statistic over
@@ -819,7 +819,7 @@ false-failure rate that belongs to the machine rather than to the code. A requir
 check that can fail nondeterministically is worse than no check: it teaches a
 reader to re-run a red constant-time result until it turns green. An earlier form
 of this harness did assert on such thresholds, and failed a release gate on
-`x86_64-darwin` and then passed a re-run of the identical commit (#3070).
+`x86_64-darwin` and then passed a re-run of the identical commit.
 
 **So the claims below are measurements, taken deliberately, not properties this
 suite enforces.** Raising the counts in `mach.lang.ct.probe` and reading the
@@ -861,7 +861,7 @@ declines the probe by name, and an extension row runs only on a host whose cpuid
 reports the extension.
 
 **What a timing harness can and cannot assure.** The leakage model has three
-channels and no single sampling regime covers them (briar-systems/mach#2363):
+channels and no single sampling regime covers them:
 
 | channel | assured by |
 |---|---|

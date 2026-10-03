@@ -173,7 +173,7 @@ escape that consumes the next character (so an escaped quote does not
 terminate the literal). Escape decoding happens later — in
 `comptime.eval_lit_char` / `comptime.eval_lit_str` for a comptime-evaluated
 literal, and in `me/lower/expr.lit_decode_escape` (an intentional mirror of the
-same table, #2472) for one lowered as ordinary runtime code. The recognized
+same table) for one lowered as ordinary runtime code. The recognized
 escapes are:
 
 ```
@@ -450,21 +450,21 @@ anon-field-block ::= "{" { IDENT ":" type ";" } "}"
 ```
 
 Notes:
-- `^T` marks `T` as carrying secret data for the constant-time guarantee
-  (#1643). It is a prefix qualifier binding to the type immediately to its
+- `^T` marks `T` as carrying secret data for the constant-time guarantee.
+  It is a prefix qualifier binding to the type immediately to its
   right, so it nests with `*` and `[N]` in any order (`*^u8`, `^*u8`,
   `[N]^u8`). The grammar accepts it in every type position. Its flow-typing
   semantics - the secrecy lattice and join, the leakage-model gates, and the
-  welded-storage pointer rules - are enforced by sema (#1645) and documented in
+  welded-storage pointer rules - are enforced by sema and documented in
   [secrecy.md](secrecy.md).
 - `*T` is a pointer; the untyped pointer type is the primitive name `ptr`
   (an ordinary `named-type`, not its own syntax).
-- `$pointee_of(T)` is the type a typed reference `*U` refers to (#2693). It is a
+- `$pointee_of(T)` is the type a typed reference `*U` refers to. It is a
   type **constructor** rather than an intrinsic call, which is what lets it nest
   inside another intrinsic's operand and inside a generic argument list. `ptr`,
   `^*U`, and any non-reference operand are refused by sema, each with its own
   cause — see [comptime-intrinsics.md](comptime-intrinsics.md).
-- `f.type` is a field descriptor's own type inside a `$each` body (#2691), and is
+- `f.type` is a field descriptor's own type inside a `$each` body, and is
   a type spelling in its own right so a constructor can take one
   (`$pointee_of(f.type)`). `type` is contextual, not a keyword: a module or record
   member genuinely named `type` still reads as a path (`mod.type.T`, `mod.type[A]`).
@@ -472,7 +472,7 @@ Notes:
   constant), including `$size_of(T)` / `$align_of(T)` — see
   [comptime-intrinsics.md](comptime-intrinsics.md). Nesting (`[N][M]T`) falls out
   of the recursion.
-- `[_]T` is an inferred array length (#2507): the length is not written but taken
+- `[_]T` is an inferred array length: the length is not written but taken
   from elsewhere. It is legal **only** on a `val` carrying `#[embed(...)]`, where
   the length comes from the embedded file's byte count; written anywhere else it
   is rejected — "an inferred array length `[_]` is only valid on an
@@ -562,7 +562,7 @@ cast         ::= ( "::" | ":~" ) type
 `::` is a value conversion and `:~` a same-size bit reinterpret; see
 [operators.md](operators.md#cast). Neither `::` nor `:~` may add or drop the
 `^` secret qualifier. `:>` is the only downgrade: it strips `^` from the
-operand's type, producing a new public value (#1643, [secrecy.md](secrecy.md)).
+operand's type, producing a new public value ([secrecy.md](secrecy.md)).
 Its target type is required and names the operand's stripped public type; a bare
 `:>` is a parse error, and `:>` never reinterprets storage.
 

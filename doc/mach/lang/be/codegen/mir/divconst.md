@@ -5,7 +5,7 @@ power of two of either sign, and a multiply by the divisor's reciprocal
 (Granlund and Montgomery) for any other divisor on a target that declares a
 high multiply. a plan is data: the lowering emits its steps as MIR, and
 `eval` runs the same steps, which is how every sequence is proven against
-the division it replaces (#3350)
+the division it replaces
 
 ## val OPERAND_IMM
 

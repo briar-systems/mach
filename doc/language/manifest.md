@@ -468,7 +468,7 @@ through the registry's own lookup (`no isa implementation registered for
 
 `x86_64`/`linux`/`sysv64` is the primary host and target. `aarch64`-linux builds
 and runs natively in CI on every PR; `riscv64`-linux runs under qemu and
-self-hosts (#1852). `windows` is a supported cross-compilation target (PE/COFF,
+self-hosts. `windows` is a supported cross-compilation target (PE/COFF,
 Win64 ABI). `darwin` is validated end-to-end on both architectures: each
 self-hosts to a three-generation fixpoint on a native macOS runner and ships a
 release archive. `freestanding` targets a raw flat image with no OS runtime; a
@@ -814,7 +814,7 @@ may use SSE. BareMetal's own `crt0.c` does exactly this.
 
 Zero-initialized data needs no such step. A flat image spans its whole memory
 extent, so `.bss` is stored as the zero bytes it is and arrives zeroed with the
-rest of the image (#2402) — an image costs its bss size in file bytes, and nothing
+rest of the image — an image costs its bss size in file bytes, and nothing
 has to zero anything at startup.
 
 ## `[profile.<name>]`
@@ -1072,7 +1072,7 @@ any of them (see [test.md](test.md#which-tests-run)).
   target such as `spirv` it is the entry module, written there unlinked.
 - **`static`** materialises a real `ar` archive at the resolved `out` path — the
   per-module objects with an archive symbol index, the deliverable a consumer links
-  as a `.a` (#1997).
+  as a `.a`.
 - **`shared`** links a dynamic library at the resolved `out`. Only ELF targets
   write one today: `linux` on `x86_64`, `aarch64` and `riscv64` produce a `.so`
   whose `SONAME` is its file name. The Mach-O `.dylib` and PE `.dll` writers are
@@ -2106,7 +2106,7 @@ The rules:
   consumer, alongside the steps its `export = true` link entries demand.
 
 Nothing here makes an `#[embed]` an edge in the build graph: a missing embedded
-file is still a compile error and still triggers nothing (#2887). What runs is
+file is still a compile error and still triggers nothing. What runs is
 the requirement the dependency declared.
 
 ## Selection and the build matrix

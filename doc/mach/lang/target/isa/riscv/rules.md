@@ -20,7 +20,7 @@ pub fun int_imm_fits(value: u64, bits: u32) bool;
 
 one addi builds a 12-bit signed value and one lui a 32-bit one whose low 12
 bits are zero; any other takes lui and addi or more, the rule the middle end
-hoists a loop's constants by (#3807). the value is read sign-extended from
+hoists a loop's constants by. the value is read sign-extended from
 its width, as the materialization reads it
 
 ## fun is_trap_terminator

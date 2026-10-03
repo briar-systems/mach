@@ -68,7 +68,7 @@ pub fun check_shift_count(sc: *sema_context.SemaContext, span: token.Span, lt: t
 
 a shift whose count is a comptime constant must keep the count below the
 left operand's width: at or above it the runtime answer is the saturated
-value (0, or the sign fill), which a constant program never means (#3756)
+value (0, or the sign fill), which a constant program never means
 
 ## fun check_secret_address
 

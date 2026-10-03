@@ -357,7 +357,7 @@ pub val VEC_CMHS: Opcode = 0x10d
 pub val VEC_SHL:   Opcode = 0x10e
 ```
 
-the lane-wise shifts, by an immediate or by a uniform or per-lane count (#3852)
+the lane-wise shifts, by an immediate or by a uniform or per-lane count
 
 ## val VEC_SHR_U
 
