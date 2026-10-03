@@ -30,7 +30,7 @@ forwards [`mach.lang.fe.sema.context.SemaDeps`](sema/context.md#rec-semadeps)
 fwd sema_context.FieldEntry
 ```
 
-forwards [`mach.lang.type.FieldEntry`](../type.md#rec-fieldentry)
+forwards [`mach.lang.type.field.Entry`](../type/field.md#rec-entry)
 
 ## fwd sema_context.FieldTable
 
@@ -38,7 +38,7 @@ forwards [`mach.lang.type.FieldEntry`](../type.md#rec-fieldentry)
 fwd sema_context.FieldTable
 ```
 
-forwards [`mach.lang.type.FieldTable`](../type.md#rec-fieldtable)
+forwards [`mach.lang.type.field.Table`](../type/field.md#rec-table)
 
 ## fwd sema_context.SemaContext
 
