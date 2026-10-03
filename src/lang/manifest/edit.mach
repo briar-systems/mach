@@ -1,0 +1,528 @@
+# editing a manifest's text in place: adding and removing a `[dep.<name>]`
+# table, leaving every other byte as it was written
+use mach.lang.fail;
+use std.allocator.arena;
+use std.data.toml;
+use std_format: std.format;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use types_string: std.types.string;
+use std.types.string.str;
+use std.types.string.str_contains;
+use std.types.string.str_copy_slice;
+use std.types.string.str_empty;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_region_equals;
+use std.types.string.str_starts_with;
+
+use A: std.allocator;
+
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.intern;
+
+use mach.lang.manifest.model.tinit;
+use mach.lang.manifest.refusal.refuse;
+use mach.lang.manifest.refusal.sfmt;
+use mach.lang.manifest.schema.is_valid_id;
+use mach.lang.manifest.schema.key_text;
+
+# the source key a `mach dep add` writes
+pub def DepSource: u8;
+
+# a `git = "<url>"` dependency, with an optional `ref`
+pub val DEP_SOURCE_GIT: DepSource = 1;
+# a `path = "<dir>"` dependency
+pub val DEP_SOURCE_PATH: DepSource = 2;
+
+# a `[dep.<name>]` table to append to a manifest's text
+# ---
+# name:    the dependency name; must satisfy `is_valid_id`
+# source:  which key `value` is written under
+# value:   the git URL or the path; escaped as a TOML basic string
+# ref:     the `ref` value; written only for a git source and only when non-empty
+# version: the `version` range; written only for a git source, only when set, and never with a ref
+pub rec DepTableSpec {
+    name:    str;
+    source:  DepSource;
+    value:   str;
+    ref:     str;
+    version: str;
+}
+
+val DEP_LOOKUP_ABSENT:    u8 = 0;
+val DEP_LOOKUP_TABLE:     u8 = 1;
+val DEP_LOOKUP_NON_TABLE: u8 = 2;
+
+fun source_uses_crlf(source: str) bool {
+    val n: usize = str_len(source);
+    var i: usize = 0;
+    for (i < n) {
+        if (source[i] == '\n'::u8) { ret i > 0 && source[i - 1] == '\r'::u8; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun source_ends_with_newline(source: str) bool {
+    val n: usize = str_len(source);
+    ret n > 0 && source[n - 1] == '\n'::u8;
+}
+
+fun dep_entry_kind(alloc: *A.Allocator, source_text: str, name: str) res[u8, fail.Fail] {
+    val parse_r: res[toml.Table, toml.TomlError] = toml.parse(alloc, source_text);
+    if (sel parse_r.err) { ret res[u8, fail.Fail].err{fail.toml_refused(parse_r.err)}; }
+    var tbl:    toml.Table       = parse_r.ok;
+    val deps_o: opt[*toml.Table] = toml.get_table(?tbl, "dep");
+    var kind:   u8               = DEP_LOOKUP_ABSENT;
+    if (sel deps_o.some) {
+        val deps: *toml.Table = deps_o.some;
+        val len:  usize       = toml.table_len(deps);
+        var i:    usize       = 0;
+        for (i < len) {
+            val key_o: opt[str] = toml.table_key(deps, i);
+            if (sel key_o.none) { brk; }
+            if (str_equals(key_o.some, name)) {
+                val v_o: opt[*toml.Value] = toml.table_value(deps, i);
+                if (sel v_o.none)                    { brk; }
+                if (v_o.some.tag == toml.TYPE_TABLE) { kind = DEP_LOOKUP_TABLE; }
+                or                                   { kind = DEP_LOOKUP_NON_TABLE; }
+            }
+            i = i + 1;
+        }
+    }
+    toml.dnit(alloc, ?tbl);
+    ret res[u8, fail.Fail].ok{kind};
+}
+
+rec HeaderSpan {
+    found:     bool;
+    ambiguous: bool;
+    start:     usize;
+    body_end:  usize;
+}
+
+fun find_top_level_table(source: str, header: str) HeaderSpan {
+    var hs:            HeaderSpan;
+    val n:             usize = str_len(source);
+    var pending_start: usize = 0;
+    var in_target:     bool  = false;
+    var i:             usize = 0;
+    for (i <= n) {
+        val at_end: bool = i == n;
+        val at_nl:  bool = !at_end && source[i] == '\n'::u8;
+        if (at_end || at_nl) {
+            val line_start: usize = pending_start;
+            var line_end:   usize = i;
+            if (line_end > line_start && source[line_end - 1] == '\r'::u8) { line_end = line_end - 1; }
+            val is_header: bool = line_end > line_start && source[line_start] == '['::u8;
+            if (is_header) {
+                val matches: bool = str_region_equals(source, line_start, line_end - line_start, header);
+                if (in_target) {
+                    hs.body_end = line_start;
+                    in_target   = false;
+                }
+                if (matches) {
+                    if (hs.found) { hs.ambiguous = true; }
+                    hs.found  = true;
+                    hs.start  = line_start;
+                    in_target = true;
+                }
+            }
+            pending_start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (in_target) { hs.body_end = n; }
+    ret hs;
+}
+
+# the manifest key a dependency source is written under; absent for a tag
+# outside the catalog
+fun dep_key_name(source: DepSource) opt[str] {
+    if (source == DEP_SOURCE_GIT)  { ret opt[str].some{"git"}; }
+    if (source == DEP_SOURCE_PATH) { ret opt[str].some{"path"}; }
+    ret opt[str].none{};
+}
+
+fun build_dep_block(alloc: *A.Allocator, nl: str, spec: *DepTableSpec) res[str, fail.Fail] {
+    val esc_value_r: res[str, A.Error] = toml.escape(alloc, spec.value);
+    if (sel esc_value_r.err) { ret res[str, fail.Fail].err{fail.refused(esc_value_r.err)}; }
+    val esc_value: str = esc_value_r.ok;
+
+    val has_version: bool = spec.source == DEP_SOURCE_GIT && spec.version != nil && !str_empty(spec.version);
+    val has_ref:     bool = spec.source == DEP_SOURCE_GIT && (has_version || !str_empty(spec.ref));
+    var esc_ref:     str  = "";
+    if (has_ref) {
+        var selector: str = spec.ref;
+        if (has_version) { selector = spec.version; }
+        val esc_ref_r: res[str, A.Error] = toml.escape(alloc, selector);
+        if (sel esc_ref_r.err) {
+            str_free(alloc, esc_value);
+            ret res[str, fail.Fail].err{fail.refused(esc_ref_r.err)};
+        }
+        esc_ref = esc_ref_r.ok;
+    }
+
+    val key_o: opt[str] = dep_key_name(spec.source);
+    if (sel key_o.none) {
+        str_free(alloc, esc_value);
+        if (has_ref) { str_free(alloc, esc_ref); }
+        ret res[str, fail.Fail].err{fail.unknown_catalog(alloc, "DepSource", spec.source::u32)};
+    }
+    val key:     str = key_o.some;
+    var block_r: res[str, std_format.FormatError];
+    if (has_ref) {
+        var selector_key: str = "ref";
+        if (has_version) { selector_key = "version"; }
+        block_r = std_format.sprint(alloc, "[dep.{}]{}{} = \"{}\"{}{} = \"{}\"{}", spec.name, nl, key, esc_value, nl, selector_key, esc_ref, nl);
+    }
+    or {
+        block_r = std_format.sprint(alloc, "[dep.{}]{}{} = \"{}\"{}", spec.name, nl, key, esc_value, nl);
+    }
+    str_free(alloc, esc_value);
+    if (has_ref)         { str_free(alloc, esc_ref); }
+    if (sel block_r.err) { ret res[str, fail.Fail].err{fail.format_refused(block_r.err)}; }
+    ret res[str, fail.Fail].ok{block_r.ok};
+}
+
+# append a `[dep.<name>]` table to manifest text, leaving every existing byte in
+# place. the block uses the file's line ending and is separated by one blank
+# line (two when the text lacks a trailing newline)
+# ---
+# alloc:       owns the returned text
+# source_text: the current `mach.toml`
+# spec:        the table to add
+# ret:         the new text; err when the name is not an identifier, the source is not
+#              git or path, the text is not valid TOML, the dependency is already declared
+#              in any form, or the result does not reparse with the table present
+pub fun dep_table_add(alloc: *A.Allocator, source_text: str, spec: *DepTableSpec) res[str, fail.Fail] {
+    if (!is_valid_id(spec.name))                                         { ret res[str, fail.Fail].err{fail.user(diagnostic_kind.MANIFEST_INVALID_NAME, "dependency name must be a portable identifier (letters, digits, '_', '-')")}; }
+    if (spec.source != DEP_SOURCE_GIT && spec.source != DEP_SOURCE_PATH) { ret res[str, fail.Fail].err{fail.message("unrecognized dependency source")}; }
+
+    val kind_r: res[u8, fail.Fail] = dep_entry_kind(alloc, source_text, spec.name);
+    if (sel kind_r.err) { ret res[str, fail.Fail].err{not_toml(alloc, kind_r.err)}; }
+    if (kind_r.ok != DEP_LOOKUP_ABSENT) {
+        ret res[str, fail.Fail].err{refuse(alloc, diagnostic_kind.DEP_ALREADY_DECLARED, "dependency '{}' is already declared in mach.toml", spec.name)};
+    }
+
+    val nl:      str                 = if_crlf(source_text);
+    val block_r: res[str, fail.Fail] = build_dep_block(alloc, nl, spec);
+    if (sel block_r.err) { ret block_r; }
+    val block: str = block_r.ok;
+
+    var sep: str = nl;
+    if (!source_ends_with_newline(source_text)) {
+        val doubled: res[str, fail.Fail] = sfmt(alloc, "{}{}", nl, nl);
+        if (sel doubled.err) {
+            str_free(alloc, block);
+            ret doubled;
+        }
+        sep = doubled.ok;
+    }
+
+    val candidate_r: res[str, std_format.FormatError] = std_format.sprint(alloc, "{}{}{}", source_text, sep, block);
+    str_free(alloc, block);
+    if (sep != nl)           { str_free(alloc, sep); }
+    if (sel candidate_r.err) { ret res[str, fail.Fail].err{fail.format_refused(candidate_r.err)}; }
+    val candidate: str = candidate_r.ok;
+
+    val verify_r: res[u8, fail.Fail] = dep_entry_kind(alloc, candidate, spec.name);
+    if (sel verify_r.err) {
+        str_free(alloc, candidate);
+        ret res[str, fail.Fail].err{fail.message("internal: added dependency table did not verify after reparse")};
+    }
+    if (verify_r.ok != DEP_LOOKUP_TABLE) {
+        str_free(alloc, candidate);
+        ret res[str, fail.Fail].err{fail.message("internal: added dependency table did not verify after reparse")};
+    }
+    ret res[str, fail.Fail].ok{candidate};
+}
+
+# cut a `[dep.<name>]` table out of manifest text, from its header line to the
+# next header, leaving everything else byte for byte
+# ---
+# alloc:       owns the returned text
+# source_text: the current `mach.toml`
+# name:        the dependency name
+# ret:         the new text; err when the name is not an identifier, the text is not
+#              valid TOML, the dependency is absent, is declared but not as a table, is
+#              declared more than once, or its header is not spelled exactly `[dep.<name>]`
+#              at the start of a line
+pub fun dep_table_remove(alloc: *A.Allocator, source_text: str, name: str) res[str, fail.Fail] {
+    if (!is_valid_id(name)) { ret res[str, fail.Fail].err{fail.user(diagnostic_kind.MANIFEST_INVALID_NAME, "dependency name must be a portable identifier (letters, digits, '_', '-')")}; }
+
+    val kind_r: res[u8, fail.Fail] = dep_entry_kind(alloc, source_text, name);
+    if (sel kind_r.err) { ret res[str, fail.Fail].err{not_toml(alloc, kind_r.err)}; }
+    val kind: u8 = kind_r.ok;
+    if (kind == DEP_LOOKUP_ABSENT)    { ret res[str, fail.Fail].err{refuse(alloc, diagnostic_kind.DEP_NOT_DECLARED, "dependency '{}' is not declared in mach.toml", name)}; }
+    if (kind == DEP_LOOKUP_NON_TABLE) { ret res[str, fail.Fail].err{refuse(alloc, diagnostic_kind.DEP_MANUAL_EDIT, "dependency '{}' exists in mach.toml but is not a table; edit it by hand", name)}; }
+
+    val header: res[str, fail.Fail] = sfmt(alloc, "[dep.{}]", name);
+    if (sel header.err) { ret header; }
+    val hs: HeaderSpan = find_top_level_table(source_text, header.ok);
+    str_free(alloc, header.ok);
+    if (hs.ambiguous) { ret res[str, fail.Fail].err{refuse(alloc, diagnostic_kind.DEP_MANUAL_EDIT, "dependency '{}' is declared more than once in mach.toml; edit it by hand", name)}; }
+    if (!hs.found)    { ret res[str, fail.Fail].err{refuse(alloc, diagnostic_kind.DEP_MANUAL_EDIT, "'[dep.{}]' was found by the parser but not by exact-header scan; edit it by hand", name)}; }
+
+    val before_r: res[str, types_string.StrError] = str_copy_slice(alloc, source_text, 0, hs.start);
+    if (sel before_r.err) { ret res[str, fail.Fail].err{fail.str_refused(before_r.err)}; }
+    val before:  str                             = before_r.ok;
+    val after_r: res[str, types_string.StrError] = str_copy_slice(alloc, source_text, hs.body_end, str_len(source_text) - hs.body_end);
+    if (sel after_r.err) {
+        str_free(alloc, before);
+        ret res[str, fail.Fail].err{fail.str_refused(after_r.err)};
+    }
+    val after: str = after_r.ok;
+
+    val candidate_r: res[str, std_format.FormatError] = std_format.sprint(alloc, "{}{}", before, after);
+    str_free(alloc, before);
+    str_free(alloc, after);
+    if (sel candidate_r.err) { ret res[str, fail.Fail].err{fail.format_refused(candidate_r.err)}; }
+    val candidate: str = candidate_r.ok;
+
+    val verify_r: res[u8, fail.Fail] = dep_entry_kind(alloc, candidate, name);
+    if (sel verify_r.err) {
+        str_free(alloc, candidate);
+        ret res[str, fail.Fail].err{fail.message("internal: removed dependency table still verifies after reparse")};
+    }
+    if (verify_r.ok != DEP_LOOKUP_ABSENT) {
+        str_free(alloc, candidate);
+        ret res[str, fail.Fail].err{fail.message("internal: removed dependency table still verifies after reparse")};
+    }
+    ret res[str, fail.Fail].ok{candidate};
+}
+
+fun if_crlf(source: str) str {
+    if (source_uses_crlf(source)) { ret "\r\n"; }
+    ret "\n";
+}
+
+# the refusal of manifest text that is not TOML; a refused allocation stays itself
+fun not_toml(alloc: *A.Allocator, f: fail.Fail) fail.Fail {
+    if (fail.is_message(f)) { ret f; }
+    ret refuse(alloc, diagnostic_kind.TOML_MALFORMED, "mach.toml is not valid TOML: {}", fail.describe(f));
+}
+
+#[testing]
+fun ut_messy_manifest() str {
+    ret "# top of file comment, must survive\n[project]\nid   =   \"messy\"   \nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"o\"\n\n# a hand-written dependency, with its own comment above it\n[dep.other]\ngit = \"https://example.com/other.git\"\nref = \"branch/main\"\n\n[target.linux]\nisa = \"x86_64\"\nos  = \"linux\"\nabi = \"sysv64\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+}
+
+test dep_table_add__appends_and_leaves_the_messy_source_byte_identical {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val original: str = ut_messy_manifest();
+    var spec:     DepTableSpec;
+    spec.name   = "newlib";
+    spec.source = DEP_SOURCE_GIT;
+    spec.value  = "https://example.com/newlib.git";
+    spec.ref    = "branch/main";
+
+    val r: res[str, fail.Fail] = dep_table_add(?alloc, original, ?spec);
+    if (sel r.err) { code = 1; }
+    if (sel r.ok) {
+        val out: str = r.ok;
+        if (!str_starts_with(out, original))                                { code = 1; }
+        if (!str_contains(out, "[dep.newlib]"))                             { code = 1; }
+        if (!str_contains(out, "git = \"https://example.com/newlib.git\"")) { code = 1; }
+        if (!str_contains(out, "ref = \"branch/main\""))                    { code = 1; }
+
+        val tbl_r: res[toml.Table, toml.TomlError] = toml.parse(?alloc, out);
+        if (sel tbl_r.err) { code = 1; }
+        if (sel tbl_r.ok) {
+            var tbl: toml.Table = tbl_r.ok;
+            if (!str_equals(key_text(?tbl, "dep.other.git"), "https://example.com/other.git"))   { code = 1; }
+            if (!str_equals(key_text(?tbl, "dep.other.ref"), "branch/main"))                     { code = 1; }
+            if (!str_equals(key_text(?tbl, "dep.newlib.git"), "https://example.com/newlib.git")) { code = 1; }
+            toml.dnit(?alloc, ?tbl);
+        }
+    }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test dep_table_add__refuses_a_name_already_declared {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    var spec: DepTableSpec;
+    spec.name   = "other";
+    spec.source = DEP_SOURCE_PATH;
+    spec.value  = "../other";
+    spec.ref    = "";
+
+    val r: res[str, fail.Fail] = dep_table_add(?alloc, ut_messy_manifest(), ?spec);
+    if (!(sel r.err && str_contains(fail.describe(r.err), "already declared"))) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test dep_table_add__escapes_backslashes_and_quotes_round_trip {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    var spec: DepTableSpec;
+    spec.name   = "winlib";
+    spec.source = DEP_SOURCE_PATH;
+    spec.value  = "C:\\Users\\me\\\"weird\"\\lib";
+    spec.ref    = "";
+
+    val r: res[str, fail.Fail] = dep_table_add(?alloc, ut_messy_manifest(), ?spec);
+    if (sel r.err) { code = 1; }
+    if (sel r.ok) {
+        val out:   str                             = r.ok;
+        val tbl_r: res[toml.Table, toml.TomlError] = toml.parse(?alloc, out);
+        if (sel tbl_r.err) { code = 1; }
+        if (sel tbl_r.ok) {
+            var tbl: toml.Table = tbl_r.ok;
+            if (!str_equals(key_text(?tbl, "dep.winlib.path"), spec.value)) { code = 1; }
+            toml.dnit(?alloc, ?tbl);
+        }
+    }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test dep_table_add__matches_crlf_when_the_file_uses_it {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val crlf_source: str = "[project]\r\nid = \"p\"\r\nversion = \"0.1.0\"\r\nsrc = \"src\"\r\nout = \"o\"\r\n";
+    var spec:        DepTableSpec;
+    spec.name   = "newlib";
+    spec.source = DEP_SOURCE_PATH;
+    spec.value  = "../newlib";
+    spec.ref    = "";
+
+    val r: res[str, fail.Fail] = dep_table_add(?alloc, crlf_source, ?spec);
+    if (sel r.err) { code = 1; }
+    if (sel r.ok) {
+        val out: str = r.ok;
+        if (!str_starts_with(out, crlf_source)) { code = 1; }
+        val added_r: res[str, types_string.StrError] = str_copy_slice(?alloc, out, str_len(crlf_source), str_len(out) - str_len(crlf_source));
+        if (sel added_r.err) { code = 1; }
+        if (sel added_r.ok) {
+            val added: str   = added_r.ok;
+            var i:     usize = 0;
+            var n:     usize = str_len(added);
+            for (i < n) {
+                if (added[i] == '\n'::u8 && (i == 0 || added[i - 1] != '\r'::u8)) { code = 1; }
+                i = i + 1;
+            }
+            str_free(?alloc, added);
+        }
+    }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test dep_table_add__inserts_a_blank_line_separator_when_the_source_has_no_trailing_newline {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val no_trailing: str = "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"o\"\n[profile.debug]\ndefault = true\nopt = 0\ndebug = true\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n[profile.release]\nopt = 2\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n";
+    var spec:        DepTableSpec;
+    spec.name   = "newlib";
+    spec.source = DEP_SOURCE_PATH;
+    spec.value  = "../newlib";
+    spec.ref    = "";
+
+    val r: res[str, fail.Fail] = dep_table_add(?alloc, no_trailing, ?spec);
+    if (sel r.err) { code = 1; }
+    if (sel r.ok) {
+        val out: str = r.ok;
+        if (!str_starts_with(out, no_trailing))     { code = 1; }
+        if (!str_contains(out, "\n\n[dep.newlib]")) { code = 1; }
+    }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test dep_table_remove__removes_the_table_keeps_the_preceding_comment_and_sibling_bytes {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val r: res[str, fail.Fail] = dep_table_remove(?alloc, ut_messy_manifest(), "other");
+    if (sel r.err) { code = 1; }
+    if (sel r.ok) {
+        val out: str = r.ok;
+        if (str_contains(out, "[dep.other]"))                                                 { code = 1; }
+        if (str_contains(out, "git = \"https://example.com/other.git\""))                     { code = 1; }
+        if (!str_contains(out, "# a hand-written dependency, with its own comment above it")) { code = 1; }
+        if (!str_contains(out, "# top of file comment, must survive"))                        { code = 1; }
+        if (!str_contains(out, "[target.linux]"))                                             { code = 1; }
+        if (!str_contains(out, "isa = \"x86_64\""))                                           { code = 1; }
+
+        val tbl_r: res[toml.Table, toml.TomlError] = toml.parse(?alloc, out);
+        if (sel tbl_r.err) { code = 1; }
+        if (sel tbl_r.ok) {
+            var tbl:   toml.Table       = tbl_r.ok;
+            val dep_o: opt[*toml.Table] = toml.get_table(?tbl, "dep");
+            if (sel dep_o.some && toml.table_len(dep_o.some) != 0) { code = 1; }
+            toml.dnit(?alloc, ?tbl);
+        }
+    }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test dep_table_remove__refuses_a_table_it_cannot_remove_exactly {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    fin { arena.dnit(?ar); }
+    var sources: [4]str = [4]str{
+        ut_messy_manifest(),
+        "[dep.foo]\ngit = \"https://example.com/a.git\"\n\n[dep.foo]\ngit = \"https://example.com/b.git\"\n",
+        "[dep]\nfoo = \"oops\"\n",
+        "[dep.\"foo\"]\ngit = \"https://example.com/a.git\"\n"
+    };
+    var names: [4]str = [4]str{"nosuch", "foo", "foo", "foo"};
+    var wants: [4]str = [4]str{"not declared", "more than once", "not a table", "was found by the parser but not by exact-header scan"};
+    var i:     usize  = 0;
+    for (i < 4) {
+        val r: res[str, fail.Fail] = dep_table_remove(?alloc, sources[i], names[i]);
+        if (!(sel r.err && str_contains(fail.describe(r.err), wants[i]))) { ret 2 + i::i32; }
+        i = i + 1;
+    }
+    ret 0;
+}
