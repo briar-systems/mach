@@ -6,6 +6,9 @@
 pub rec Builder;
 ```
 
+a cache key: the sha-256 of a domain then each input, every number a u64
+and every byte run its length then its bytes
+
 ## fun begin
 
 ```mach

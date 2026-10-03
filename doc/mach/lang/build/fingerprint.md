@@ -99,33 +99,67 @@ pub fun held_file_sha256(f: fs.File, digest: *u8) err[fail.Fail];
 borrows the file and exclusive seek/read access, rewinds first and leaves it at eof
 failure does not publish a digest, the caller retains close ownership
 
-## fun write_domain_u8
+## fun put_domain_u8
 
 ```mach
-pub fun write_domain_u8(e: *binary.Encoder, domain: Domain, schema_version: u8, value: u8) bool;
+pub fun put_domain_u8(s: *wire.Sink, domain: Domain, schema_version: u8, value: u8);
 ```
 
-## fun write_domain_u32
+## fun put_domain_u32
 
 ```mach
-pub fun write_domain_u32(e: *binary.Encoder, domain: Domain, schema_version: u8, value: u32) bool;
+pub fun put_domain_u32(s: *wire.Sink, domain: Domain, schema_version: u8, value: u32);
 ```
 
-## fun write_domain_u64
+## fun put_domain_u64
 
 ```mach
-pub fun write_domain_u64(e: *binary.Encoder, domain: Domain, schema_version: u8, value: u64) bool;
+pub fun put_domain_u64(s: *wire.Sink, domain: Domain, schema_version: u8, value: u64);
 ```
 
-## fun write_domain_bytes
+## fun put_domain_bytes
 
 ```mach
-pub fun write_domain_bytes(e: *binary.Encoder, domain: Domain, schema_version: u8, p: *u8, len: usize) bool;
+pub fun put_domain_bytes(s: *wire.Sink, domain: Domain, schema_version: u8, p: *u8, len: usize);
 ```
 
-## fun write_domain_str
+## fun put_domain_str
 
 ```mach
-pub fun write_domain_str(e: *binary.Encoder, domain: Domain, schema_version: u8, s: str) bool;
+pub fun put_domain_str(s: *wire.Sink, domain: Domain, schema_version: u8, text: str);
 ```
+
+## fun put_text
+
+```mach
+pub fun put_text(s: *wire.Sink, text: str);
+```
+
+a text as its u32 length then its bytes; nil and empty both put the length 0
+
+## fun put_name
+
+```mach
+pub fun put_name(s: *wire.Sink, itn: *intern.Interner, name: intern.StrId);
+```
+
+an interned name by its spelling, so fingerprints agree across interners:
+a u8 1 then its text, or a u8 0 for no name
+
+## fun put_content
+
+```mach
+pub fun put_content(s: *wire.Sink, bytes: *u8, len: usize);
+```
+
+bytes by their sha-256 digest, a u32 32 then the digest, or the u32 0 when
+there are none
+
+## fun put_file
+
+```mach
+pub fun put_file(s: *wire.Sink, path: str);
+```
+
+a file by the digest of its contents, as put_content puts bytes
 
