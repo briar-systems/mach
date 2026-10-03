@@ -467,6 +467,9 @@ declaration) and collapses here
 pub fun function_register(m: *Module, name: intern.StrId, idx: u32) err[fail.Fail];
 ```
 
+a name answers its definition once the module has one: a declaration
+registered after a definition of the same name leaves the definition named
+
 ## fun function_lookup
 
 ```mach

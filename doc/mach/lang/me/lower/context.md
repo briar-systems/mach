@@ -90,7 +90,7 @@ fqn: intern.StrId,
 sema_result: *fe_sema.SemaResult,
 rr: *resolve.ResolveResult,
 ctx: *comptime.ComptimeCtx,
-definitions: *sema_context.DefinitionReader) res[ModuleScope, fail.Fail];
+definitions: *fe_sema.DefinitionReader) res[ModuleScope, fail.Fail];
 ```
 
 ## fun origin_scope
@@ -147,7 +147,7 @@ pub fun dnit_context(lc: *LowerContext);
 ## fun symbol_definition
 
 ```mach
-pub fun symbol_definition(lc: *LowerContext, sym: *resolve.Symbol) res[sema_context.DefinedSymbol, fail.Fail];
+pub fun symbol_definition(lc: *LowerContext, sym: *resolve.Symbol) res[fe_sema.DefinedSymbol, fail.Fail];
 ```
 
 ## fun declaring_comptime_ctx
@@ -385,7 +385,7 @@ pub fun decl_type_of(lc: *LowerContext, did: ast_id.DeclId) type.TypeId;
 ## fun instance_of_call
 
 ```mach
-pub fun instance_of_call(lc: *LowerContext, eid: ast_id.ExprId) res[*sema_instance.Instance, fail.Fail];
+pub fun instance_of_call(lc: *LowerContext, eid: ast_id.ExprId) res[*fe_sema.instance.Instance, fail.Fail];
 ```
 
 the instance sema decided the call or generic reference `eid` names, in the frame the
@@ -394,7 +394,7 @@ code is read through
 ## fun instance_link_name
 
 ```mach
-pub fun instance_link_name(lc: *LowerContext, item: *sema_instance.Instance) res[intern.StrId, fail.Fail];
+pub fun instance_link_name(lc: *LowerContext, item: *fe_sema.instance.Instance) res[intern.StrId, fail.Fail];
 ```
 
 the symbol an instance is emitted and referenced under

@@ -1,0 +1,309 @@
+# what sema publishes for a module, and how one module reads another's
+use std.allocator.page;
+use std.collections.map;
+use collections_vector: std.collections.vector;
+use std.types.bool.bool;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+use mach.lang.fail;
+use ast_id: mach.lang.fe.ast.id;
+use mach.lang.fe.comptime;
+use mach.lang.fe.resolve;
+use mach.lang.fe.sema.fields;
+use sema_growth:   mach.lang.fe.sema.growth;
+use sema_instance: mach.lang.fe.sema.instance;
+use mach.lang.intern;
+use mach.lang.module;
+use mach.lang.session;
+use lang_source: mach.lang.source;
+use mach.lang.type;
+
+pub rec SemaResult {
+    field_graph:      fields.Graph;
+    status:           fail.PhaseStatus;
+    alloc:            *A.Allocator;
+    expr_type:        *type.TypeId;
+    type_resolved_ty: *type.TypeId;
+    decl_type:        *type.TypeId;
+    expr_count:       u32;
+    type_count:       u32;
+    decl_count:       u32;
+    embed_paths:      *intern.StrId;
+    embed_path_count: u32;
+    embed_path_cap:   u32;
+    # the constants sema bound and the gates it decided, over the load's and resolve's
+    constants: comptime.Bindings;
+    # every instance the module's typing asks for, with the typing of each
+    instances: sema_instance.Set;
+    # the growing cycles among the module's templates
+    growth: sema_growth.Analysis;
+}
+
+pub fun result_dnit(r: *SemaResult) {
+    if (r == nil) { ret; }
+    fields.dnit(?r.field_graph);
+    if (r.expr_type != nil && r.expr_count > 0) {
+        A.deallocate[type.TypeId](r.alloc, r.expr_type, r.expr_count::usize);
+    }
+    if (r.type_resolved_ty != nil && r.type_count > 0) {
+        A.deallocate[type.TypeId](r.alloc, r.type_resolved_ty, r.type_count::usize);
+    }
+    if (r.decl_type != nil && r.decl_count > 0) {
+        A.deallocate[type.TypeId](r.alloc, r.decl_type, r.decl_count::usize);
+    }
+    if (r.embed_paths != nil && r.embed_path_cap > 0) {
+        A.deallocate[intern.StrId](r.alloc, r.embed_paths, r.embed_path_cap::usize);
+    }
+    comptime.bindings_dnit(?r.constants);
+    sema_instance.dnit(?r.instances);
+    sema_growth.dnit(?r.growth);
+    r.embed_paths      = nil;
+    r.embed_path_count = 0;
+    r.embed_path_cap   = 0;
+    r.expr_type        = nil;
+    r.type_resolved_ty = nil;
+    r.decl_type        = nil;
+    r.expr_count       = 0;
+    r.type_count       = 0;
+    r.decl_count       = 0;
+}
+
+pub val EMBED_LEN_NONE: u64 = 0xFFFFFFFFFFFFFFFF;
+
+pub val EMBED_LEN_FAILED: u64 = 0xFFFFFFFFFFFFFFFE;
+
+pub rec TypeExport {
+    origin:                 session.StableModuleId;
+    canon:                  intern.StrId;
+    ty:                     type.TypeId;
+    constant:               resolve.ExportConstant;
+    definition_incarnation: u64;
+}
+
+# exports are append-only, and `index` maps (origin, canon) to the first export with
+# that key over the first `indexed` of them
+pub rec ModuleSema {
+    path:    intern.StrId;
+    module:  session.ModuleId;
+    exports: collections_vector.Vector[TypeExport];
+    graph:   fields.Graph;
+    index:   map.Map[u64, u32];
+    indexed: usize;
+}
+
+pub fun module_sema_init(a: *A.Allocator, path: intern.StrId, module: session.ModuleId) ModuleSema {
+    ret ModuleSema{path: path, module: module, exports: collections_vector.init[TypeExport](a), graph: fields.init(a),
+        index: map.init[u64, u32](a), indexed: 0};
+}
+
+pub fun module_sema_dnit(module: *ModuleSema) {
+    collections_vector.dnit[TypeExport](?module.exports);
+    fields.dnit(?module.graph);
+    map.dnit[u64, u32](?module.index);
+    module.indexed = 0;
+}
+
+fun export_key(origin: session.StableModuleId, canon: intern.StrId) u64 {
+    ret (module.stable_index(origin)::u64 << 32) | intern.str_index(canon)::u64;
+}
+
+# the export of `module` keyed (origin, canon), bringing the index up to the current exports
+pub fun module_export_for(module: *ModuleSema, origin: session.StableModuleId, canon: intern.StrId) res[opt[TypeExport], A.Error] {
+    for (module.indexed < module.exports.len) {
+        val item: *TypeExport = ?module.exports.data[module.indexed];
+        var key:  u64         = export_key(item.origin, item.canon);
+        val seen: opt[*u32]   = map.get[u64, u32](?module.index, ?key);
+        if (sel seen.none) {
+            val added: res[bool, A.Error] = map.insert[u64, u32](?module.index, key, module.indexed::u32);
+            if (sel added.err) { ret res[opt[TypeExport], A.Error].err{added.err}; }
+        }
+        module.indexed = module.indexed + 1;
+    }
+    var want:  u64       = export_key(origin, canon);
+    val found: opt[*u32] = map.get[u64, u32](?module.index, ?want);
+    if (sel found.none) { ret res[opt[TypeExport], A.Error].ok{opt[TypeExport].none{}}; }
+    ret res[opt[TypeExport], A.Error].ok{opt[TypeExport].some{module.exports.data[@found.some]}};
+}
+
+pub def DefinitionPhase: u8;
+pub val DEFINITION_PARSED:   DefinitionPhase = 0;
+pub val DEFINITION_RESOLVED: DefinitionPhase = 1;
+pub val DEFINITION_TYPED:    DefinitionPhase = 2;
+
+# a module's definition as far as a phase acquired it
+# ---
+# ctx:        the scope its constants are read in, once typed
+# decorators: a scope that reads the load's records of its decorators, at every phase
+pub rec Definition {
+    parsed:     resolve.ParsedDefinition;
+    origin:     session.ModuleId;
+    rr:         *resolve.ResolveResult;
+    sr:         *SemaResult;
+    ctx:        *comptime.ComptimeCtx;
+    decorators: *comptime.ComptimeCtx;
+}
+
+rec AcquiredDefinition {
+    phase:      DefinitionPhase;
+    definition: Definition;
+}
+
+pub rec DefinitionReader {
+    ctx:      ptr;
+    read:     fun(ptr, session.ModuleId, DefinitionPhase) res[Definition, fail.Fail];
+    acquired: collections_vector.Vector[AcquiredDefinition];
+}
+
+# a reader lives for one computation, which acquires the same current definition once per origin
+pub fun reader_init(ctx: ptr, read: fun(ptr, session.ModuleId, DefinitionPhase) res[Definition, fail.Fail],
+    a: *A.Allocator) DefinitionReader {
+    ret DefinitionReader{ctx: ctx, read: read, acquired: collections_vector.init[AcquiredDefinition](a)};
+}
+
+pub fun reader_dnit(reader: *DefinitionReader) {
+    if (reader == nil) { ret; }
+    collections_vector.dnit[AcquiredDefinition](?reader.acquired);
+}
+
+pub rec DefinedSymbol {
+    definition: Definition;
+    symbol:     resolve.Symbol;
+}
+
+pub fun acquire_definition(reader: *DefinitionReader, origin: session.ModuleId,
+    phase: DefinitionPhase) res[Definition, fail.Fail] {
+    if (reader == nil || reader.ctx == nil || reader.read == nil || phase > DEFINITION_TYPED) {
+        ret res[Definition, fail.Fail].err{fail.message("current definition acquisition requires an active phase capability")};
+    }
+    var slot: usize = reader.acquired.len;
+    var ai:   usize = 0;
+    for (ai < reader.acquired.len) {
+        val entry: *AcquiredDefinition = ?reader.acquired.data[ai];
+        if (module.same(entry.definition.origin, origin)) {
+            if (entry.phase >= phase) { ret res[Definition, fail.Fail].ok{entry.definition}; }
+            slot = ai;
+            brk;
+        }
+        ai = ai + 1;
+    }
+    val acquired: res[Definition, fail.Fail] = reader.read(reader.ctx, origin, phase);
+    if (sel acquired.err) { ret res[Definition, fail.Fail].err{acquired.err}; }
+    val current: Definition = acquired.ok;
+    if (!module.same(current.origin, origin) || current.parsed.a == nil || current.parsed.incarnation == 0
+        || current.parsed.incarnation != current.parsed.a.incarnation
+        || !lang_source.file_same(current.parsed.owner.file, current.parsed.a.file_id)) {
+        ret res[Definition, fail.Fail].err{fail.message("current definition has inconsistent parsed ownership")};
+    }
+    if (phase >= DEFINITION_RESOLVED && current.rr == nil) {
+        ret res[Definition, fail.Fail].err{fail.message("current definition has no acquired resolution product")};
+    }
+    if (phase == DEFINITION_TYPED && (current.sr == nil || current.ctx == nil)) {
+        ret res[Definition, fail.Fail].err{fail.message("current definition has no acquired semantic product")};
+    }
+    if (phase >= DEFINITION_RESOLVED && !sel current.rr.status.kind.accepted) {
+        ret res[Definition, fail.Fail].err{fail.phase_failure(current.rr.status)};
+    }
+    if (phase == DEFINITION_TYPED && !sel current.sr.status.kind.accepted) {
+        ret res[Definition, fail.Fail].err{fail.phase_failure(current.sr.status)};
+    }
+    val entry: AcquiredDefinition = AcquiredDefinition{phase: phase, definition: current};
+    if (slot < reader.acquired.len) { reader.acquired.data[slot] = entry; }
+    or {
+        val added: res[usize, A.Error] = collections_vector.push[AcquiredDefinition](?reader.acquired, entry);
+        if (sel added.err) { ret res[Definition, fail.Fail].err{fail.refused(added.err)}; }
+    }
+    ret res[Definition, fail.Fail].ok{current};
+}
+
+pub fun acquire_symbol(reader: *DefinitionReader, requested: *resolve.Symbol,
+    phase: DefinitionPhase) res[DefinedSymbol, fail.Fail] {
+    if (requested == nil || phase < DEFINITION_RESOLVED) {
+        ret res[DefinedSymbol, fail.Fail].err{fail.message("symbol definition requires resolved acquisition")};
+    }
+    val acquired: res[Definition, fail.Fail] = acquire_definition(reader, requested.origin, phase);
+    if (sel acquired.err) { ret res[DefinedSymbol, fail.Fail].err{acquired.err}; }
+    val current: Definition       = acquired.ok;
+    var found:   resolve.SymbolId = resolve.SYMBOL_NIL;
+    var i:       u32              = 0;
+    for (i < current.rr.symbol_count) {
+        val symbol: *resolve.Symbol = ?current.rr.symbols[i];
+        if (module.same(symbol.origin, requested.origin) && symbol.kind == requested.definition_kind
+            && intern.str_same(symbol.canon, requested.canon) && !ast_id.decl_is_nil(symbol.decl)) {
+            if (!resolve.symbol_is_nil(found) && !ast_id.decl_same(current.rr.symbols[resolve.symbol_index(found)].decl, symbol.decl)) {
+                ret res[DefinedSymbol, fail.Fail].err{fail.message("current canonical definition is ambiguous")};
+            }
+            found = resolve.symbol_id(i);
+        }
+        i = i + 1;
+    }
+    if (resolve.symbol_is_nil(found) || ast_id.decl_index(current.rr.symbols[resolve.symbol_index(found)].decl) >= current.parsed.a.decl_len::u32) {
+        ret res[DefinedSymbol, fail.Fail].err{fail.message("current canonical definition is absent from its resolved owner")};
+    }
+    ret res[DefinedSymbol, fail.Fail].ok{DefinedSymbol{definition: current, symbol: current.rr.symbols[resolve.symbol_index(found)]}};
+}
+
+# the imported surfaces are borrowed: the driver owns each one and shares it
+# between every importer in a pass
+pub rec SemaDeps {
+    definitions: DefinitionReader;
+    entries:     **ModuleSema;
+    count:       u32;
+    watch:       GrowthWatch;
+}
+
+# who hears of a growing cycle's expansion: the module that declares it, the templates on
+# it, and how many instances of it the module being typed has made so far; a nil
+# `expanded` hears nothing
+pub rec GrowthWatch {
+    ctx:      ptr;
+    expanded: fun(ptr, intern.StrId, intern.StrId, u32);
+}
+
+#[testing]
+fun t_export(origin: session.StableModuleId, canon: intern.StrId, ty: type.TypeId) TypeExport {
+    var e: TypeExport = TypeExport{};
+    e.origin = origin;
+    e.canon  = canon;
+    e.ty     = ty;
+    ret e;
+}
+
+#[testing]
+fun t_push(m: *ModuleSema, e: TypeExport) bool {
+    val r: res[usize, A.Error] = collections_vector.push[TypeExport](?m.exports, e);
+    ret sel r.ok;
+}
+
+#[testing]
+fun t_export_ty(m: *ModuleSema, origin: session.StableModuleId, canon: intern.StrId) type.TypeId {
+    val r: res[opt[TypeExport], A.Error] = module_export_for(m, origin, canon);
+    if (sel r.err)     { ret type.id(0xFFFFFFFE); }
+    if (sel r.ok.none) { ret type.id(0xFFFFFFFF); }
+    ret r.ok.some.ty;
+}
+
+# the index answers what the scan it replaced answered: the first export with the key,
+# a miss as none, and exports appended after a lookup
+test module_export_for__indexes_first_match_and_follows_appends {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var m: ModuleSema = module_sema_init(?alloc, intern.str_id(1), module.id(1));
+    fin { module_sema_dnit(?m); }
+    if (!t_push(?m, t_export(module.stable_id(7), intern.str_id(10), type.id(100))))              { ret 2; }
+    if (!t_push(?m, t_export(module.stable_id(7), intern.str_id(10), type.id(101))))              { ret 2; }
+    if (!t_push(?m, t_export(module.stable_id(8), intern.str_id(10), type.id(102))))              { ret 2; }
+    if (!type.same(t_export_ty(?m, module.stable_id(7), intern.str_id(10)), type.id(100)))        { ret 3; }
+    if (!type.same(t_export_ty(?m, module.stable_id(8), intern.str_id(10)), type.id(102)))        { ret 4; }
+    if (!type.same(t_export_ty(?m, module.stable_id(7), intern.str_id(11)), type.id(0xFFFFFFFF))) { ret 5; }
+    if (!type.same(t_export_ty(?m, module.stable_id(10), intern.str_id(7)), type.id(0xFFFFFFFF))) { ret 6; }
+    if (!t_push(?m, t_export(module.stable_id(7), intern.str_id(11), type.id(103))))              { ret 7; }
+    if (!type.same(t_export_ty(?m, module.stable_id(7), intern.str_id(11)), type.id(103)))        { ret 8; }
+    if (m.indexed != 4)                                                                           { ret 9; }
+    ret 0;
+}

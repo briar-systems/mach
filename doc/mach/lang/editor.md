@@ -120,7 +120,7 @@ ret: the borrowed product, or the expiry or phase failure
 ## fun sema_of
 
 ```mach
-pub fun sema_of(result: *AnalysisResult) res[*sema_context.SemaResult, fail.Fail];
+pub fun sema_of(result: *AnalysisResult) res[*fe_sema.SemaResult, fail.Fail];
 ```
 
 the sema product, under ast_of's view rules; the phase must be PHASE_SEMA
