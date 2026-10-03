@@ -18,7 +18,7 @@ interner: *intern.Interner, srcmap: *lang_source.SourceMap) Debug;
 ## fun source_of
 
 ```mach
-pub fun source_of(d: *Debug, loc: lang_source.SrcLoc);
+pub fun source_of(d: *Debug, loc: lang_source.Location);
 ```
 
 OpSource for the file the module's root function is declared in, once per module
@@ -34,7 +34,7 @@ a label starts a block, and no line carries across one
 ## fun line
 
 ```mach
-pub fun line(d: *Debug, loc: lang_source.SrcLoc);
+pub fun line(d: *Debug, loc: lang_source.Location);
 ```
 
 attribute the instructions that follow to `loc`, or to no source when it has none

@@ -47,7 +47,7 @@ the text of a check; absent for a tag outside the catalog
 ## fun violation_loc
 
 ```mach
-pub fun violation_loc(m: *me_ir.Module, v: *Violation) lang_source.SrcLoc;
+pub fun violation_loc(m: *me_ir.Module, v: *Violation) lang_source.Location;
 ```
 
 ## fun describe_located
