@@ -3,13 +3,13 @@
 ## val UNAVAILABLE
 
 ```mach
-pub val UNAVAILABLE: u8 = 1
+pub val UNAVAILABLE: u8 = host.FAULT_UNAVAILABLE
 ```
 
 ## val INTERNAL
 
 ```mach
-pub val INTERNAL:    u8 = 2
+pub val INTERNAL:    u8 = host.FAULT_INTERNAL
 ```
 
 ## rec Error
