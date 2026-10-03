@@ -130,6 +130,8 @@ outcome: the outcome of its module-scope gates
 ctx: its build target's frame, which every later phase reads
 frame: the frame the walk is in: FRAME_BUILD or a union tuple
 frames: its frame under each union tuple, which only the load reads
+walked: the declarations the walk reached in its build target's frame, by declaration
+frame_walked: the declarations the walk reached under each union tuple, `decl_count` per tuple
 reached: the union tuples a walk reached it under
 deps: the modules it imports
 consts: the public constants it exports to its importers' gates
@@ -280,6 +282,14 @@ mid: the module whose text changed
 ret: ok(true) when the surface is unchanged; ok(false) when the caller must reload; or the
      parse or walk failure
 
+## fun walked
+
+```mach
+pub fun walked(m: *Module, did: ast_id.DeclId) bool;
+```
+
+whether the walk reached a declaration in the module's build target's frame
+
 ## fun gated_imports_check
 
 ```mach
@@ -310,6 +320,17 @@ the record of what the import declaration `decl` binds, none when the load recor
 pub fun attributes_record(l: *Loader, mid: session.ModuleId) err[fail.Fail];
 ```
 
-records the strings the module's attribute arguments evaluate to, read in the build target's
-frame the load walk bound
+records the load's reading of the module's attribute arguments, in the build target's frame the
+walk bound: the string each argument that takes one evaluates to, and what each `embed` argument names
+
+## fun embeds_record
+
+```mach
+pub fun embeds_record(s: *session.Session, c: *comptime.ComptimeCtx, a: *ast.Ast, source: str, fqn: intern.StrId,
+reached: *bool) err[fail.Fail];
+```
+
+records into the load scope `c` what each `embed` argument of a module names, reading the string
+`c` holds for it: a declaration `reached` does not mark is left out, where it marks any, and so
+is an argument with no string, which type checking reports
 

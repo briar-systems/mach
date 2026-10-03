@@ -162,6 +162,23 @@ pub fun release_staged_test(p: *Project, m: *ModuleEntry);
 pub fun release_all_staged(p: *Project);
 ```
 
+## fun typed_scope
+
+```mach
+pub fun typed_scope(m: *ModuleEntry) comptime.ComptimeCtx;
+```
+
+what the front end bound over a module, to read: the load's bindings, and resolve's and sema's
+where they ran
+
+## fun lower_scope_drop
+
+```mach
+pub fun lower_scope_drop(m: *ModuleEntry);
+```
+
+release the scope lowering bound a module's constants in
+
 ## fun dnit_project
 
 ```mach
