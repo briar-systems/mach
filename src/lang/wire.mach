@@ -1,0 +1,397 @@
+# the compiler's one binary codec. a Sink puts little-endian numbers, LEB128
+# numbers and byte runs, and a Source takes them back. the formats the
+# compiler writes and reads (the link carrier, object snapshots, cache records,
+# the digest memo, recorded warnings, query fingerprints and cache keys) are
+# each a sequence of these. both fail sticky: once an operation fails every
+# later one does nothing, so a format writes or reads a whole record and
+# checks once at the end.
+#
+# a sink measures, writing nothing, fills storage its caller sized (usually
+# by measuring first), grows storage it owns, or feeds a sha-256 digest, and
+# a format writes the same sequence to each. a source reads a bounded span and
+# never reads past it.
+
+use mach.lang.fail;
+use std.allocator.page;
+use std.crypto.hash.sha256;
+use std.encoding.binary;
+use std.encoding.leb128;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+# where a sink's bytes go
+pub def Destination: u8;
+
+pub val MEASURE: Destination = 0;
+pub val FIXED:   Destination = 1;
+pub val GROWN:   Destination = 2;
+pub val DIGEST:  Destination = 3;
+
+pub rec Sink {
+    to:      Destination;
+    storage: *u8;
+    cap:     usize;
+    grown:   binary.Encoder;
+    state:   sha256.State;
+    # the bytes put so far
+    len:     usize;
+    failed:  bool;
+    failure: fail.Fail;
+}
+
+# a sink that counts the bytes a sequence takes and writes none
+pub fun measure() Sink {
+    ret Sink{to: MEASURE};
+}
+
+# a sink that writes into `cap` bytes at `storage`; a sequence longer than
+# that fails the sink
+pub fun fixed(storage: *u8, cap: usize) Sink {
+    ret Sink{to: FIXED, storage: storage, cap: cap};
+}
+
+# a sink that writes into storage it grows in `a`, released by dnit or
+# handed off by release
+pub fun grown(a: *A.Allocator) Sink {
+    ret Sink{to: GROWN, grown: binary.encoder(a, binary.LITTLE)};
+}
+
+# a sink that feeds a sha-256 digest, read by digest_final
+pub fun digest() Sink {
+    ret Sink{to: DIGEST, state: sha256.init()};
+}
+
+pub fun dnit(s: *Sink) {
+    if (s.to == GROWN) { binary.encoder_dnit(?s.grown); }
+    s.len = 0;
+}
+
+# fail the sink with `f` unless it already failed
+pub fun refuse(s: *Sink, f: fail.Fail) {
+    if (s.failed) { ret; }
+    s.failed  = true;
+    s.failure = f;
+}
+
+pub fun failure(s: *Sink) opt[fail.Fail] {
+    if (s.failed) { ret opt[fail.Fail].some{s.failure}; }
+    ret opt[fail.Fail].none{};
+}
+
+# the bytes a fixed or grown sink holds
+pub fun bytes(s: *Sink) *u8 {
+    if (s.to == GROWN) { ret s.grown.data; }
+    ret s.storage;
+}
+
+pub fun put_bytes(s: *Sink, data: *u8, len: usize) {
+    if (s.failed || len == 0) { ret; }
+    if (data == nil) {
+        refuse(s, fail.message("wire: a nonempty byte run has no bytes"));
+        ret;
+    }
+    if (len > ~(0::usize) - s.len) {
+        refuse(s, fail.message("wire: a record overflows its length"));
+        ret;
+    }
+    if (s.to == FIXED) {
+        if (len > s.cap - s.len) {
+            refuse(s, fail.message("wire: a record outgrew its measured size"));
+            ret;
+        }
+        memory.raw_copy((s.storage::usize + s.len)::ptr, data::ptr, len);
+    }
+    or (s.to == GROWN) {
+        val wrote: res[usize, binary.EncodeError] = binary.write_bytes(?s.grown, data, len);
+        if (sel wrote.err) {
+            if (sel wrote.err.alloc) { refuse(s, fail.refused(wrote.err.alloc)); }
+            or                       { refuse(s, fail.message("wire: a record overflows its length")); }
+            ret;
+        }
+    }
+    or (s.to == DIGEST) { sha256.update(?s.state, data, len); }
+    s.len = s.len + len;
+}
+
+fun put_uint(s: *Sink, v: u64, width: usize) {
+    var field: [8]u8;
+    binary.put_uint(?field[0], v, width, binary.LITTLE);
+    put_bytes(s, ?field[0], width);
+}
+
+pub fun put_u8(s: *Sink, v: u8) {
+    put_uint(s, v::u64, 1);
+}
+
+pub fun put_u16(s: *Sink, v: u16) {
+    put_uint(s, v::u64, 2);
+}
+
+pub fun put_u32(s: *Sink, v: u32) {
+    put_uint(s, v::u64, 4);
+}
+
+pub fun put_u64(s: *Sink, v: u64) {
+    put_uint(s, v, 8);
+}
+
+pub fun put_unsigned(s: *Sink, v: u64) {
+    var field: [leb128.MAX_BYTES]u8;
+    put_bytes(s, ?field[0], leb128.put_unsigned(?field[0], v));
+}
+
+pub fun put_signed(s: *Sink, v: i64) {
+    var field: [leb128.MAX_BYTES]u8;
+    put_bytes(s, ?field[0], leb128.put_signed(?field[0], v));
+}
+
+# overwrite the u32 at `at`, already put, as a format fills a length it only
+# knows once the rest is put; a measuring sink has nothing to overwrite
+pub fun patch_u32(s: *Sink, at: usize, v: u32) {
+    if (s.failed || s.to == MEASURE) { ret; }
+    if (s.to == DIGEST || at > s.len || s.len - at < 4) {
+        refuse(s, fail.message("wire: a patch lies outside the bytes put"));
+        ret;
+    }
+    binary.put_uint((bytes(s)::usize + at)::*u8, v::u64, 4, binary.LITTLE);
+}
+
+# a byte run's u32 length, then its bytes
+pub fun put_sized(s: *Sink, data: *u8, len: usize) {
+    if (len > 0xFFFFFFFF) {
+        refuse(s, fail.message("wire: a byte run exceeds its 32-bit length"));
+        ret;
+    }
+    put_u32(s, len::u32);
+    put_bytes(s, data, len);
+}
+
+# hand off a grown sink's bytes, exactly its length, owned by the caller in
+# the sink's allocator; nil when it holds none. the sink is left empty
+pub fun release(s: *Sink) res[*u8, fail.Fail] {
+    if (s.failed) {
+        dnit(s);
+        ret res[*u8, fail.Fail].err{s.failure};
+    }
+    if (s.to != GROWN) { ret res[*u8, fail.Fail].err{fail.message("wire: only a grown sink hands off its bytes")}; }
+    if (s.len == 0) {
+        dnit(s);
+        ret res[*u8, fail.Fail].ok{nil};
+    }
+    if (s.grown.cap > s.len) {
+        val shrunk: res[*u8, A.Error] = A.reallocate[u8](s.grown.alloc, s.grown.data, s.grown.cap, s.len);
+        if (sel shrunk.err) {
+            dnit(s);
+            ret res[*u8, fail.Fail].err{fail.refused(shrunk.err)};
+        }
+        s.grown.data = shrunk.ok;
+        s.grown.cap  = s.len;
+    }
+    val out: *u8 = s.grown.data;
+    s.grown.data = nil;
+    s.grown.len  = 0;
+    s.grown.cap  = 0;
+    s.len        = 0;
+    ret res[*u8, fail.Fail].ok{out};
+}
+
+# the digest of everything a digest sink was fed
+pub fun digest_final(s: *Sink, out: *[32]u8) {
+    sha256.final(?s.state, ?(@out)[0]);
+}
+
+pub rec Source {
+    data: *u8;
+    len:  usize;
+    pos:  usize;
+    bad:  bool;
+}
+
+pub fun source(data: *u8, len: usize) Source {
+    ret Source{data: data, len: len};
+}
+
+# fail the source: what it read does not form a record
+pub fun reject(r: *Source) {
+    r.bad = true;
+}
+
+pub fun remaining(r: *Source) usize {
+    if (r.bad) { ret 0; }
+    ret r.len - r.pos;
+}
+
+# whether every read succeeded and consumed the whole span
+pub fun done(r: *Source) bool {
+    ret !r.bad && r.pos == r.len;
+}
+
+# the next `n` bytes in place, nil when fewer remain
+pub fun take_bytes(r: *Source, n: usize) *u8 {
+    if (r.bad || r.len - r.pos < n) {
+        r.bad = true;
+        ret nil;
+    }
+    val at: *u8 = (r.data::usize + r.pos)::*u8;
+    r.pos = r.pos + n;
+    ret at;
+}
+
+# copy the next `n` bytes into dst
+pub fun take_into(r: *Source, dst: *u8, n: usize) {
+    val at: *u8 = take_bytes(r, n);
+    if (at != nil && n > 0) { memory.raw_copy(dst::ptr, at::ptr, n); }
+}
+
+fun take_uint(r: *Source, width: usize) u64 {
+    val at: *u8 = take_bytes(r, width);
+    if (at == nil) { ret 0; }
+    ret binary.get_uint(at, width, binary.LITTLE);
+}
+
+pub fun take_u8(r: *Source) u8 {
+    ret take_uint(r, 1)::u8;
+}
+
+pub fun take_u16(r: *Source) u16 {
+    ret take_uint(r, 2)::u16;
+}
+
+pub fun take_u32(r: *Source) u32 {
+    ret take_uint(r, 4)::u32;
+}
+
+pub fun take_u64(r: *Source) u64 {
+    ret take_uint(r, 8);
+}
+
+pub fun take_unsigned(r: *Source) u64 {
+    if (r.bad) { ret 0; }
+    val got: res[leb128.Unsigned, leb128.Error] = leb128.get_unsigned((r.data::usize + r.pos)::*u8, r.len - r.pos);
+    if (sel got.err) {
+        r.bad = true;
+        ret 0;
+    }
+    r.pos = r.pos + got.ok.size;
+    ret got.ok.value;
+}
+
+pub fun take_signed(r: *Source) i64 {
+    if (r.bad) { ret 0; }
+    val got: res[leb128.Signed, leb128.Error] = leb128.get_signed((r.data::usize + r.pos)::*u8, r.len - r.pos);
+    if (sel got.err) {
+        r.bad = true;
+        ret 0;
+    }
+    r.pos = r.pos + got.ok.size;
+    ret got.ok.value;
+}
+
+# a u32 count whose entries, at least `min` bytes each, fit in what remains
+pub fun take_count(r: *Source, min: usize) u32 {
+    val n: u32 = take_u32(r);
+    if (!r.bad && n::usize > (r.len - r.pos) / min) { r.bad = true; }
+    if (r.bad)                                      { ret 0; }
+    ret n;
+}
+
+# a byte run's u32 length then its bytes in place; the length in `out_len`
+pub fun take_sized(r: *Source, out_len: *usize) *u8 {
+    val n: u32 = take_u32(r);
+    @out_len = 0;
+    if (r.bad) { ret nil; }
+    val at: *u8 = take_bytes(r, n::usize);
+    if (at != nil) { @out_len = n::usize; }
+    ret at;
+}
+
+#[testing]
+fun t_put_record(s: *Sink) {
+    put_u8(s, 0xAB);
+    put_u16(s, 0x1234);
+    put_u32(s, 0xDEADBEEF);
+    put_u64(s, 0x0102030405060708);
+    put_unsigned(s, 624485);
+    put_signed(s, -123456);
+    put_sized(s, "mach"::*u8, 4);
+}
+
+#[testing]
+val T_RECORD: [29]u8 = [29]u8{
+    0xAB, 0x34, 0x12, 0xEF, 0xBE, 0xAD, 0xDE,
+    0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+    0xE5, 0x8E, 0x26, 0xC0, 0xBB, 0x78,
+    4, 0, 0, 0, 'm', 'a', 'c', 'h',
+};
+
+test sink__every_destination_sees_the_same_bytes {
+    var a:    A.Allocator;
+    val made: err[A.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var m: Sink = measure();
+    t_put_record(?m);
+    if (m.failed || m.len != 29) { ret 2; }
+
+    var storage: [29]u8;
+    var f:       Sink = fixed(?storage[0], 29);
+    t_put_record(?f);
+    if (f.failed || !memory.raw_equal((?storage[0])::ptr, (?T_RECORD[0])::ptr, 29)) { ret 3; }
+
+    var g: Sink = grown(?a);
+    t_put_record(?g);
+    val kept: res[*u8, fail.Fail] = release(?g);
+    if (sel kept.err) { ret 4; }
+    fin { A.deallocate[u8](?a, kept.ok, 29); }
+    if (!memory.raw_equal(kept.ok::ptr, (?T_RECORD[0])::ptr, 29)) { ret 5; }
+
+    var d: Sink = digest();
+    t_put_record(?d);
+    var fed:  [32]u8;
+    var want: [32]u8;
+    digest_final(?d, ?fed);
+    sha256.hash(?T_RECORD[0], 29, ?want[0]);
+    if (!memory.raw_equal((?fed[0])::ptr, (?want[0])::ptr, 32)) { ret 6; }
+
+    # one byte short of the measured size fails, and the failure sticks
+    var short: Sink = fixed(?storage[0], 28);
+    t_put_record(?short);
+    if (!short.failed || short.len != 25) { ret 7; }
+    ret 0;
+}
+
+test source__reads_back_and_fails_sticky {
+    var r: Source = source(?T_RECORD[0], 29);
+    if (take_u8(?r) != 0xAB || take_u16(?r) != 0x1234 || take_u32(?r) != 0xDEADBEEF) { ret 1; }
+    if (take_u64(?r) != 0x0102030405060708)                                          { ret 2; }
+    if (take_unsigned(?r) != 624485 || take_signed(?r) != -123456)                   { ret 3; }
+    var n:    usize = 0;
+    val name: *u8   = take_sized(?r, ?n);
+    if (name == nil || n != 4 || name[0] != 'm' || name[3] != 'h') { ret 4; }
+    if (!done(?r))                                                 { ret 5; }
+
+    # every truncation fails, and a failed source reads nothing more
+    var cut: usize = 0;
+    for (cut < 29) {
+        var t: Source = source(?T_RECORD[0], cut);
+        take_u8(?t);
+        take_u16(?t);
+        take_u32(?t);
+        take_u64(?t);
+        take_unsigned(?t);
+        take_signed(?t);
+        take_sized(?t, ?n);
+        if (!t.bad || done(?t)) { ret 6; }
+        cut = cut + 1;
+    }
+    var counted: Source = source(?T_RECORD[0], 29);
+    # the leading u32 counts far more 1-byte entries than 25 bytes hold
+    if (take_count(?counted, 1) != 0 || !counted.bad) { ret 7; }
+    ret 0;
+}

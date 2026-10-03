@@ -82,6 +82,6 @@ modules: the build's current images: normal and test objects in topological orde
 ## fun fingerprint_scope
 
 ```mach
-pub fun fingerprint_scope(fb: *driver_query.FpBuf, p: *driver.Project, sc: *TestScope) err[fail.Fail];
+pub fun fingerprint_scope(s: *wire.Sink, p: *driver.Project, sc: *TestScope);
 ```
 
