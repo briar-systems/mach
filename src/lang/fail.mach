@@ -1,6 +1,8 @@
+use std.text.string.str_dup;
 use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
@@ -10,30 +12,39 @@ use std.types.string.str;
 use std.types.string.str_equals;
 use std.types.string.str_len;
 
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+
 use A: std.allocator;
 use std.allocator.page;
-use T:  std.allocator.testing;
+use T: std.allocator.testing;
+use std.data.toml;
+use std.encoding.binary;
 use fs: std.filesystem;
 use std.filesystem.removal;
 use std_format: std.format;
+use io_error:   std.io.error;
 use std.io.reader;
 use io_writer: std.io.writer;
+use std.process.env;
 use system_os: std.system.os;
 
 use lang_alloc:      mach.lang.alloc;
 use diagnostic_kind: mach.lang.diagnostic.kind;
 use mach.lang.intern;
 
-# the language layer's failure: the phase already recorded it as a diagnostic
-# on the session and there is nothing further to say; an internal failure
-# whose text must be preserved; or a failure a pass with no diagnostic store
-# of its own meets (the linker, an object reader), which is the user's (the
-# input is wrong or unsupported) or the environment's (a file could not be
-# read or written) and names the diagnostic kind it is reported as.
-# `reported` is declared first so a zero outcome is a failure that reports
-# nothing new, never one that invents text. an allocation refusal is an
-# internal failure; the compiler recovers from none of them at the site that
-# met them
+# the compiler's failure, one type for every pass, the linker, the query
+# engine, the session and the build. the phase already recorded it as a
+# diagnostic and there is nothing further to say; an invariant the compiler
+# owns was broken, whose text must be preserved; the input was wrong or
+# unsupported; or the machine refused rather than the input (a file that could
+# not be read or written, a tool that could not be spawned). a user or
+# environment failure names the diagnostic kind it is reported as and may
+# point at a place; an internal one is always `compiler.internal`. the exit
+# code derives from the case: 1 for user, 2 for internal, 3 where a command
+# distinguishes the environment. `reported` is declared first so a zero
+# failure is one that invents no text. an allocation refusal is internal; the
+# compiler recovers from none of them at the site that met them
 pub tag Fail: u8 {
     reported;
     message:     str;
@@ -43,9 +54,50 @@ pub tag Fail: u8 {
 
 # kind: the row of the diagnostic kind table the failure is reported as
 # text: the message
+# at:   where in the file that caused it the failure points, the zero place
+#       when it points nowhere
+# also: the other places the failure names, none when it names no other
 rec Keyed {
     kind: diagnostic_kind.Kind;
     text: str;
+    at:   Place;
+    also: Related;
+}
+
+# the other places a failure names, in order, each in its own file: the other
+# edges of a cycle, the other claims a collision is between. the array and
+# each resolved place's path share the failure's lifetime as `at`'s path does
+# ---
+# items: the places, nil when there are none
+# count: how many
+pub rec Related {
+    items: *Place;
+    count: usize;
+}
+
+# where a failure points: the bytes [start, end) of the file at `path`, and the
+# line and column of `start` and of `end`, each from 1 with columns counted in
+# UTF-8 bytes. a place whose range is known before its file is `spanned` with a
+# nil path until `placed` names the file. the path shares the message's
+# lifetime: a copy of the failure that outlives its message copies both
+# ---
+# path:     the file, nil until the place is resolved
+# spanned:  whether a range is known; false with a nil path is no place
+# start:    the byte offset of the first byte
+# end:      the byte offset just past the last byte
+# line:     the line of `start`
+# col:      the column of `start`
+# end_line: the line of `end`
+# end_col:  the column of `end`
+pub rec Place {
+    path:     str;
+    spanned:  bool;
+    start:    usize;
+    end:      usize;
+    line:     usize;
+    col:      usize;
+    end_line: usize;
+    end_col:  usize;
 }
 
 pub fun reported() Fail {
@@ -57,17 +109,297 @@ pub fun message(text: str) Fail {
     ret Fail.message{text};
 }
 
-# the input is wrong or unsupported; a kind no live row declares makes it
-# the compiler defect it is
+# the input is wrong or unsupported. a failure names a live row of the
+# registry: one that names none, or a retired one, is a compiler defect and
+# becomes an internal failure
 pub fun user(k: diagnostic_kind.Kind, text: str) Fail {
     if (!diagnostic_kind.live(k)) { ret Fail.message{text}; }
     ret Fail.user{Keyed{kind: k, text: text}};
 }
 
-# the machine refused: a file could not be read or written
+# the machine refused: a file could not be read or written, a tool could not
+# be spawned
 pub fun environment(k: diagnostic_kind.Kind, text: str) Fail {
     if (!diagnostic_kind.live(k)) { ret Fail.message{text}; }
     ret Fail.environment{Keyed{kind: k, text: text}};
+}
+
+# a failure the user caused met by a phase that cannot classify it (target
+# selection, source loading, import libraries): an internal text becomes the
+# user class under `k`, a keyed failure keeps its own class and kind, a
+# reported failure stays reported
+pub fun as_user(k: diagnostic_kind.Kind, f: Fail) Fail {
+    if (sel f.message) { ret user(k, f.message); }
+    ret f;
+}
+
+# a failure met on input the compiler produced itself (an object it wrote, a
+# module it emitted): whatever the check says of the input, it is the
+# compiler's defect, an internal failure keeping the text. a reported failure
+# stays reported
+pub fun as_internal(f: Fail) Fail {
+    if (sel f.reported) { ret f; }
+    ret Fail.message{describe(f)};
+}
+
+# the same failure pointing at the bytes [start, end) of the file that caused
+# it, which `placed` names. a failure that already points somewhere keeps its
+# place, the innermost site knowing best, and one with no kind points nowhere
+pub fun spanned(f: Fail, start: usize, end: usize) Fail {
+    var out: Fail = f;
+    if (sel out.user) {
+        if (!out.user.at.spanned) { out.user.at = span_only(start, end); }
+    }
+    or (sel out.environment) {
+        if (!out.environment.at.spanned) { out.environment.at = span_only(start, end); }
+    }
+    ret out;
+}
+
+fun span_only(start: usize, end: usize) Place {
+    var p: Place;
+    p.spanned = true;
+    p.start   = start;
+    p.end     = end;
+    ret p;
+}
+
+# the same failure with its ranges resolved in `text`, the file at `path`, as
+# `located` places them: its own and each related one still without a file. a
+# failure without a range, or one already resolved, is returned as it is
+pub fun placed(a: *A.Allocator, f: Fail, path: str, text: str) Fail {
+    ret placed_bytes(a, f, path, text::*u8, str_len(text));
+}
+
+# `placed` over the `n` bytes at `data`, for a file that may hold a NUL
+pub fun placed_bytes(a: *A.Allocator, f: Fail, path: str, data: *u8, n: usize) Fail {
+    val k_o: opt[Keyed] = keyed(f);
+    if (sel k_o.none) { ret f; }
+    val k: Keyed = k_o.some;
+    var i: usize = 0;
+    for (i < k.also.count) {
+        val r: *Place = ?k.also.items[i];
+        if (r.spanned && r.path == nil) {
+            val path_r: res[str, A.Error] = str_dup(a, path);
+            if (sel path_r.err) { ret refused(path_r.err); }
+            @r = place(path_r.ok, data, n, r.start, r.end);
+        }
+        i = i + 1;
+    }
+    if (!k.at.spanned || k.at.path != nil) { ret f; }
+    ret located(a, f, place(path, data, n, k.at.start, k.at.end));
+}
+
+# the same failure pointing at `p`, a place a model recorded: one without a
+# file is a range `placed` resolves, one with a file is copied as `located`
+# copies it. a failure that already points somewhere keeps its place
+pub fun at(a: *A.Allocator, f: Fail, p: Place) Fail {
+    val k_o: opt[Keyed] = keyed(f);
+    if (sel k_o.none)        { ret f; }
+    if (k_o.some.at.spanned) { ret f; }
+    if (!p.spanned)          { ret f; }
+    if (p.path == nil)       { ret spanned(f, p.start, p.end); }
+    ret located(a, f, p);
+}
+
+# the same failure naming the `n` places at `ps` as its related places, in
+# order, each copied through `a` as `at` copies a place; an unspanned place is
+# skipped. a failure that already names related places keeps them, and one
+# whose copy is refused is that refusal
+pub fun with_related(a: *A.Allocator, f: Fail, ps: *Place, n: usize) Fail {
+    val k_o: opt[Keyed] = keyed(f);
+    if (sel k_o.none)             { ret f; }
+    if (k_o.some.also.count != 0) { ret f; }
+    var count: usize = 0;
+    var i:     usize = 0;
+    for (i < n) {
+        if (ps[i].spanned) { count = count + 1; }
+        i = i + 1;
+    }
+    if (count == 0) { ret f; }
+    val items_r: res[*Place, A.Error] = A.allocate[Place](a, count);
+    if (sel items_r.err) { ret refused(items_r.err); }
+    var also: Related = Related{items: items_r.ok, count: 0};
+    i = 0;
+    for (i < n) {
+        if (ps[i].spanned) {
+            var p: Place = ps[i];
+            if (p.path != nil) {
+                val path_r: res[str, A.Error] = str_dup(a, p.path);
+                if (sel path_r.err) {
+                    related_dnit(a, also, count);
+                    ret refused(path_r.err);
+                }
+                p.path = path_r.ok;
+            }
+            also.items[also.count] = p;
+            also.count             = also.count + 1;
+        }
+        i = i + 1;
+    }
+    var k: Keyed = k_o.some;
+    k.also = also;
+    ret rekeyed(f, k);
+}
+
+# the related places a failure names, none for one that names no other
+pub fun related_of(f: Fail) Related {
+    val k_o: opt[Keyed] = keyed(f);
+    if (sel k_o.some) { ret k_o.some.also; }
+    ret Related{items: nil, count: 0};
+}
+
+fun keyed(f: Fail) opt[Keyed] {
+    if (sel f.user)        { ret opt[Keyed].some{f.user}; }
+    or (sel f.environment) { ret opt[Keyed].some{f.environment}; }
+    ret opt[Keyed].none{};
+}
+
+fun rekeyed(f: Fail, k: Keyed) Fail {
+    if (sel f.user)        { ret Fail.user{k}; }
+    or (sel f.environment) { ret Fail.environment{k}; }
+    ret f;
+}
+
+# free the paths of `also`'s places and its array, allocated `cap` places long
+fun related_dnit(a: *A.Allocator, also: Related, cap: usize) {
+    if (also.items == nil) { ret; }
+    var i: usize = 0;
+    for (i < also.count) {
+        if (also.items[i].path != nil) { str_free(a, also.items[i].path); }
+        i = i + 1;
+    }
+    A.deallocate[Place](a, also.items, cap);
+}
+
+# the same failure pointing at `at`, its path copied through `a` so the failure
+# owns it as it owns its text. a failure with no kind points nowhere, and one
+# whose copy is refused is that refusal
+pub fun located(a: *A.Allocator, f: Fail, at: Place) Fail {
+    if (!sel f.user && !sel f.environment) { ret f; }
+    if (at.path == nil)                    { ret f; }
+    val path_r: res[str, A.Error] = str_dup(a, at.path);
+    if (sel path_r.err) { ret refused(path_r.err); }
+    var owned: Place = at;
+    owned.path = path_r.ok;
+    var out: Fail = f;
+    if (sel out.user)        { out.user.at = owned; }
+    or (sel out.environment) { out.environment.at = owned; }
+    ret out;
+}
+
+# the bytes [start, end) of the `n` bytes at `data`, the file at `path`, as a
+# place; a range past the end is clamped to it
+pub fun place(path: str, data: *u8, n: usize, start: usize, end: usize) Place {
+    var s: usize = start;
+    if (s > n) { s = n; }
+    var e: usize = end;
+    if (e > n) { e = n; }
+    if (e < s) { e = s; }
+    var p: Place;
+    p.path    = path;
+    p.spanned = true;
+    p.start   = s;
+    p.end     = e;
+    var lines:   usize = 0;
+    var line_at: usize = 0;
+    var i:       usize = 0;
+    for (i < e) {
+        if (i == s) {
+            p.line = lines + 1;
+            p.col  = s - line_at + 1;
+        }
+        if (data[i] == '\n') {
+            lines   = lines + 1;
+            line_at = i + 1;
+        }
+        i = i + 1;
+    }
+    if (s == e) {
+        p.line = lines + 1;
+        p.col  = s - line_at + 1;
+    }
+    p.end_line = lines + 1;
+    p.end_col  = e - line_at + 1;
+    ret p;
+}
+
+# the offsets the lines of one file start at, for resolving many places in it
+# as `place` resolves one, each in time logarithmic in the file's lines
+# ---
+# path:   the file, which every place resolved here names
+# n:      the file's length in bytes
+# starts: the offset of each line's first byte, the first line's 0
+pub rec Lines {
+    path:   str;
+    n:      usize;
+    starts: Vector[usize];
+}
+
+# the lines of the `n` bytes at `data`, the file at `path`; released with `lines_dnit`
+pub fun lines_init(a: *A.Allocator, path: str, data: *u8, n: usize) res[Lines, A.Error] {
+    var l:     Lines               = Lines{path: path, n: n, starts: collections_vector.init[usize](a)};
+    val first: res[usize, A.Error] = collections_vector.push[usize](?l.starts, 0);
+    if (sel first.err) { ret res[Lines, A.Error].err{first.err}; }
+    var i: usize = 0;
+    for (i < n) {
+        if (data[i] == '\n') {
+            val pushed: res[usize, A.Error] = collections_vector.push[usize](?l.starts, i + 1);
+            if (sel pushed.err) {
+                collections_vector.dnit[usize](?l.starts);
+                ret res[Lines, A.Error].err{pushed.err};
+            }
+        }
+        i = i + 1;
+    }
+    ret res[Lines, A.Error].ok{l};
+}
+
+pub fun lines_dnit(l: *Lines) {
+    collections_vector.dnit[usize](?l.starts);
+}
+
+# the bytes [start, end) of the file `l` indexes as a place, as `place` makes it
+pub fun lines_place(l: *Lines, start: usize, end: usize) Place {
+    var s: usize = start;
+    if (s > l.n) { s = l.n; }
+    var e: usize = end;
+    if (e > l.n) { e = l.n; }
+    if (e < s)   { e = s; }
+    var p: Place;
+    p.path    = l.path;
+    p.spanned = true;
+    p.start   = s;
+    p.end     = e;
+    val sl: usize = line_index(l, s);
+    p.line = sl + 1;
+    p.col  = s - l.starts.data[sl] + 1;
+    val el: usize = line_index(l, e);
+    p.end_line = el + 1;
+    p.end_col  = e - l.starts.data[el] + 1;
+    ret p;
+}
+
+# the index of the line holding offset `at`: the last line starting at or before it
+fun line_index(l: *Lines, at: usize) usize {
+    var lo: usize = 0;
+    var hi: usize = l.starts.len;
+    for (hi - lo > 1) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (l.starts.data[mid] <= at) { lo = mid; }
+        or                            { hi = mid; }
+    }
+    ret lo;
+}
+
+# where the failure points, when it points at a file
+pub fun place_of(f: Fail) opt[Place] {
+    var at: Place;
+    if (sel f.user)        { at = f.user.at; }
+    or (sel f.environment) { at = f.environment.at; }
+    or                     { ret opt[Place].none{}; }
+    if (at.path == nil)    { ret opt[Place].none{}; }
+    ret opt[Place].some{at};
 }
 
 # the kind the failure is reported as, NONE for a reported one, whose
@@ -79,65 +411,13 @@ pub fun kind_of(f: Fail) diagnostic_kind.Kind {
     ret diagnostic_kind.NONE;
 }
 
-pub fun refused(e: A.Error) Fail {
-    ret Fail.message{lang_alloc.text(e)};
-}
-
-# a refused write met by the compiler (an assembly or diagnostic sink): the
-# compiler recovers from none of them either, the text names the cause once
-pub fun write_refused(e: io_writer.WriteError) Fail {
-    if (sel e.stalled)     { ret Fail.message{"short write"}; }
-    or (sel e.would_block) { ret Fail.message{"write would block"}; }
-    ret Fail.message{system_os.message(e.native.error)};
-}
-
-# a refused string operation: the allocator's refusal or a slice outside its
-# string, which is a compiler defect
-pub fun str_refused(e: StrError) Fail {
-    if (sel e.alloc) { ret refused(e.alloc); }
-    ret Fail.message{"string slice out of bounds"};
-}
-
-# a refused read met by the compiler (an object or archive it was handed)
-fun read_refused(e: reader.ReadError) Fail {
-    if (sel e.eof)         { ret Fail.message{"unexpected end of input"}; }
-    or (sel e.would_block) { ret Fail.message{"read would block"}; }
-    or (sel e.native)      { ret Fail.message{system_os.message(e.native.error)}; }
-    ret refused(e.alloc);
-}
-
-# a refused filesystem operation met by the compiler: the step that refused
-# names its own cause
-pub fun fs_refused(e: fs.FsError) Fail {
-    if (sel e.io)        { ret Fail.message{system_os.message(e.io)}; }
-    or (sel e.alloc)     { ret refused(e.alloc); }
-    or (sel e.read)      { ret read_refused(e.read); }
-    or (sel e.write)     { ret write_refused(e.write); }
-    or (sel e.removal)   { ret Fail.message{removal.message(e.removal)}; }
-    or (sel e.exhausted) { ret Fail.message{"temp file: max attempts exceeded"}; }
-    ret Fail.message{system_os.message(e.published)};
-}
-
-# a filesystem operation on a file the build was handed (an object, an
-# archive, a library) that the machine refused: the environment's under `k`,
-# save an allocation refusal, which stays internal
-pub fun fs_environment(k: diagnostic_kind.Kind, e: fs.FsError) Fail {
-    if (sel e.alloc) { ret refused(e.alloc); }
-    ret environment(k, describe(fs_refused(e)));
-}
-
-# a refused format: a malformed literal is a compiler defect, the rest is the
-# sink's or the allocator's refusal
-pub fun format_refused(e: std_format.FormatError) Fail {
-    if (sel e.syntax)     { ret Fail.message{"format: malformed format string"}; }
-    or (sel e.few_holes)  { ret Fail.message{"format: too few arguments"}; }
-    or (sel e.many_holes) { ret Fail.message{"format: too many arguments"}; }
-    or (sel e.write)      { ret write_refused(e.write); }
-    ret refused(e.alloc);
-}
-
 pub fun is_reported(f: Fail) bool {
     ret sel f.reported;
+}
+
+#[testing]
+pub fun is_user(f: Fail) bool {
+    ret sel f.user;
 }
 
 pub fun is_message(f: Fail) bool {
@@ -145,7 +425,6 @@ pub fun is_message(f: Fail) bool {
 }
 
 # the text a failure carries, absent for a reported one
-#[testing]
 pub fun text(f: Fail) opt[str] {
     if (sel f.message)     { ret opt[str].some{f.message}; }
     or (sel f.user)        { ret opt[str].some{f.user.text}; }
@@ -157,19 +436,238 @@ pub fun text(f: Fail) opt[str] {
 # text of its own and is named as such, never as an empty message
 pub val REPORTED_TEXT: str = "failure was reported through diagnostics";
 
-# the same failure carrying `text` instead: the class and the kind are kept
-pub fun with_text(f: Fail, text: str) Fail {
-    if (sel f.user)        { ret user(f.user.kind, text); }
-    or (sel f.environment) { ret environment(f.environment.kind, text); }
-    or (sel f.message)     { ret message(text); }
-    ret f;
-}
-
 pub fun describe(f: Fail) str {
     if (sel f.message)     { ret f.message; }
     or (sel f.user)        { ret f.user.text; }
     or (sel f.environment) { ret f.environment.text; }
     ret REPORTED_TEXT;
+}
+
+# the same failure carrying `text` instead: the class, the kind and the places
+# are kept (a caller that copies the message into storage it owns)
+pub fun with_text(f: Fail, text: str) Fail {
+    var out: Fail = f;
+    if (sel out.user)        { out.user.text = text; }
+    or (sel out.message)     { ret Fail.message{text}; }
+    or (sel out.environment) { out.environment.text = text; }
+    or                       { ret Fail.reported{}; }
+    ret out;
+}
+
+# release the text a failure owns through `a`; a reported failure owns nothing
+fun text_free(a: *A.Allocator, f: Fail) {
+    val carried: opt[str] = text(f);
+    if (sel carried.some) {
+        if (carried.some != nil) { str_free(a, carried.some); }
+    }
+}
+
+# a copy of the failure that owns its text and its places through `a`, for a
+# failure that outlives the storage its message was made in; released with
+# `dnit`
+pub fun retain(a: *A.Allocator, f: Fail) res[Fail, A.Error] {
+    var out:     Fail     = f;
+    val carried: opt[str] = text(f);
+    if (sel carried.some) {
+        if (carried.some != nil) {
+            val dup_r: res[str, A.Error] = str_dup(a, carried.some);
+            if (sel dup_r.err) { ret res[Fail, A.Error].err{dup_r.err}; }
+            out = with_text(out, dup_r.ok);
+        }
+    }
+    val placed_r: res[Fail, A.Error] = places_retain(a, out);
+    if (sel placed_r.err) { text_free(a, out); }
+    ret placed_r;
+}
+
+# release what a retained failure owns through `a`: its text and its places
+pub fun dnit(a: *A.Allocator, f: Fail) {
+    text_free(a, f);
+    places_dnit(a, f);
+}
+
+# a copy of the failure whose places, its own path and every related place,
+# are owned through `a`, its text left as it is; for a holder that keeps the
+# text apart. released with `places_dnit`
+pub fun places_retain(a: *A.Allocator, f: Fail) res[Fail, A.Error] {
+    val k_o: opt[Keyed] = keyed(f);
+    if (sel k_o.none) { ret res[Fail, A.Error].ok{f}; }
+    var k: Keyed = k_o.some;
+    if (k.at.path != nil) {
+        val path_r: res[str, A.Error] = str_dup(a, k.at.path);
+        if (sel path_r.err) { ret res[Fail, A.Error].err{path_r.err}; }
+        k.at.path = path_r.ok;
+    }
+    if (k.also.count > 0) {
+        val items_r: res[*Place, A.Error] = A.allocate[Place](a, k.also.count);
+        if (sel items_r.err) {
+            if (k.at.path != nil) { str_free(a, k.at.path); }
+            ret res[Fail, A.Error].err{items_r.err};
+        }
+        var also: Related = Related{items: items_r.ok, count: 0};
+        var i:    usize   = 0;
+        for (i < k.also.count) {
+            var p: Place = k.also.items[i];
+            if (p.path != nil) {
+                val path_r: res[str, A.Error] = str_dup(a, p.path);
+                if (sel path_r.err) {
+                    related_dnit(a, also, k.also.count);
+                    if (k.at.path != nil) { str_free(a, k.at.path); }
+                    ret res[Fail, A.Error].err{path_r.err};
+                }
+                p.path = path_r.ok;
+            }
+            also.items[i] = p;
+            also.count    = i + 1;
+            i             = i + 1;
+        }
+        k.also = also;
+    }
+    ret res[Fail, A.Error].ok{rekeyed(f, k)};
+}
+
+# release the places a failure owns through `a`, as `places_retain` made them
+pub fun places_dnit(a: *A.Allocator, f: Fail) {
+    val k_o: opt[Keyed] = keyed(f);
+    if (sel k_o.none)            { ret; }
+    if (k_o.some.at.path != nil) { str_free(a, k_o.some.at.path); }
+    related_dnit(a, k_o.some.also, k_o.some.also.count);
+}
+
+# the same failure pointing nowhere and naming no related place, for a holder
+# whose places were released or never copied
+pub fun without_places(f: Fail) Fail {
+    val k_o: opt[Keyed] = keyed(f);
+    if (sel k_o.none) { ret f; }
+    var k: Keyed = k_o.some;
+    k.at   = Place{};
+    k.also = Related{items: nil, count: 0};
+    ret rekeyed(f, k);
+}
+
+# whether two failures hold the same places: the same path storage and the
+# same related array, as a holder that copied them once sees its own copy
+pub fun same_places(x: Fail, y: Fail) bool {
+    val kx: opt[Keyed] = keyed(x);
+    val ky: opt[Keyed] = keyed(y);
+    if (sel kx.none) { ret sel ky.none; }
+    if (sel ky.none) { ret false; }
+    ret kx.some.at.path == ky.some.at.path && kx.some.also.items == ky.some.also.items;
+}
+
+# the unit outcome of an operation whose value is not needed
+pub fun unit[V](r: res[V, Fail]) err[Fail] {
+    if (sel r.err) { ret err[Fail].err{r.err}; }
+    ret err[Fail].ok{};
+}
+
+# the text each std refusal renders as, one copy each. an operation that meets
+# one keeps its own classification (user, internal, environment) and names the
+# cause once through these; the allocator's is `alloc.text`
+pub fun io_text(e: io_error.Error) str {
+    ret system_os.message(e);
+}
+
+fun read_text(e: reader.ReadError) str {
+    if (sel e.eof)         { ret "unexpected end of input"; }
+    or (sel e.would_block) { ret "read would block"; }
+    or (sel e.native)      { ret system_os.message(e.native.error); }
+    ret lang_alloc.text(e.alloc);
+}
+
+pub fun write_text(e: io_writer.WriteError) str {
+    if (sel e.stalled)     { ret "short write"; }
+    or (sel e.would_block) { ret "write would block"; }
+    ret system_os.message(e.native.error);
+}
+
+pub fun fs_text(e: fs.FsError) str {
+    if (sel e.io)        { ret system_os.message(e.io); }
+    or (sel e.alloc)     { ret lang_alloc.text(e.alloc); }
+    or (sel e.read)      { ret read_text(e.read); }
+    or (sel e.write)     { ret write_text(e.write); }
+    or (sel e.removal)   { ret removal.message(e.removal); }
+    or (sel e.exhausted) { ret "temp file: max attempts exceeded"; }
+    ret system_os.message(e.published);
+}
+
+pub fun str_text(e: StrError) str {
+    if (sel e.alloc) { ret lang_alloc.text(e.alloc); }
+    ret "string slice out of bounds";
+}
+
+pub fun format_text(e: std_format.FormatError) str {
+    if (sel e.syntax)     { ret "format: malformed format string"; }
+    or (sel e.few_holes)  { ret "format: too few arguments"; }
+    or (sel e.many_holes) { ret "format: too many arguments"; }
+    or (sel e.write)      { ret write_text(e.write); }
+    ret lang_alloc.text(e.alloc);
+}
+
+#[testing]
+pub fun decode_text(e: binary.DecodeError) str {
+    if (sel e.short)     { ret "decoder: unexpected end of input"; }
+    or (sel e.invalid)   { ret "decoder: invalid cursor"; }
+    or (sel e.alignment) { ret "decoder: alignment is not a power of two"; }
+    or (sel e.bounds)    { ret "decoder: checkpoint out of bounds"; }
+    ret "decoder: unterminated string";
+}
+
+pub fun toml_text(e: toml.TomlError) str {
+    if (sel e.syntax)   { ret "toml: syntax error"; }
+    or (sel e.overflow) { ret "toml: integer overflow"; }
+    or (sel e.depth)    { ret "toml: nesting too deep"; }
+    or (sel e.conflict) { ret "toml: key conflicts with an existing value"; }
+    ret lang_alloc.text(e.alloc);
+}
+
+pub fun env_text(e: env.EnvError) str {
+    if (sel e.native) { ret system_os.error_message(e.native); }
+    or (sel e.alloc)  { ret lang_alloc.text(e.alloc); }
+    ret "environment changed during the read";
+}
+
+# the refusals the compiler recovers from at no site, each an internal failure
+# carrying its text: the allocator's, a write to a sink of its own, a string
+# operation, a filesystem step and a format
+pub fun refused(e: A.Error) Fail {
+    ret Fail.message{lang_alloc.text(e)};
+}
+
+pub fun write_refused(e: io_writer.WriteError) Fail {
+    ret Fail.message{write_text(e)};
+}
+
+pub fun str_refused(e: StrError) Fail {
+    ret Fail.message{str_text(e)};
+}
+
+pub fun fs_refused(e: fs.FsError) Fail {
+    ret Fail.message{fs_text(e)};
+}
+
+pub fun format_refused(e: std_format.FormatError) Fail {
+    ret Fail.message{format_text(e)};
+}
+
+# a filesystem operation on a file the build was handed (an object, an
+# archive, a library) that the machine refused: the environment's under `k`,
+# save an allocation refusal, which stays internal
+pub fun fs_environment(k: diagnostic_kind.Kind, e: fs.FsError) Fail {
+    if (sel e.alloc) { ret refused(e.alloc); }
+    ret environment(k, fs_text(e));
+}
+
+# a document that does not parse is the user's, pointing at the byte the parser
+# refused; one the allocator refused is internal
+pub fun toml_refused(e: toml.TomlError) Fail {
+    if (sel e.alloc) { ret refused(e.alloc); }
+    var at: usize = 0;
+    if (sel e.syntax)   { at = e.syntax; }
+    or (sel e.overflow) { at = e.overflow; }
+    or (sel e.depth)    { at = e.depth; }
+    or (sel e.conflict) { at = e.conflict; }
+    ret spanned(user(diagnostic_kind.TOML_MALFORMED, toml_text(e)), at, at);
 }
 
 # phase status is independent of diagnostic storage and rendering: accepted,
@@ -362,6 +860,24 @@ fun catalog_status(s: *PhaseStatus, c: Catalog, message: str) {
     reject(s);
 }
 
+# the closed-catalog policy as a failure: an input or capability fault is the
+# user's, a compiler-produced member is internal. the message belongs to the
+# caller's allocator
+pub fun catalog(a: *A.Allocator, c: Catalog) Fail {
+    val formatted: res[str, std_format.FormatError] = catalog_text(a, c);
+    if (sel formatted.err) {
+        if (sel formatted.err.alloc) { ret refused(formatted.err.alloc); }
+        ret message("catalog diagnostic could not be formatted");
+    }
+    if (sel c.internal)    { ret message(formatted.ok); }
+    if (sel c.unsupported) { ret user(diagnostic_kind.CATALOG_UNSUPPORTED, formatted.ok); }
+    ret user(diagnostic_kind.CATALOG_MALFORMED, formatted.ok);
+}
+
+pub fun unknown_catalog(a: *A.Allocator, catalog_name: str, tag: u32) Fail {
+    ret catalog(a, unknown_member(catalog_name, tag));
+}
+
 test fail__cases_text_and_the_zero_value {
     val r: Fail = reported();
     if (!sel r.reported) { ret 1; }
@@ -395,6 +911,91 @@ test fail__keyed_classes_keep_their_kind {
     val unkeyed: Fail = user(diagnostic_kind.NONE, "no kind");
     if (!sel unkeyed.message || kind_of(unkeyed) != diagnostic_kind.COMPILER_INTERNAL) { ret 4; }
     if (kind_of(reported()) != diagnostic_kind.NONE)                                   { ret 5; }
+    ret 0;
+}
+
+# the three closed-catalog classes land on distinct failures: a member from
+# input or a cross-module product and a declared member a target cannot honor
+# are the user's (exit 1), a member the compiler produced is internal (exit
+# 2); each message names the catalog and the member
+#[testing]
+fun t_user_with(f: Fail, want: str) bool {
+    if (!sel f.user) { ret false; }
+    ret str_equals(f.user.text, want);
+}
+
+#[testing]
+fun t_message_with(f: Fail, want: str) bool {
+    if (!sel f.message) { ret false; }
+    ret str_equals(f.message, want);
+}
+
+#[testing]
+fun t_text_free(a: *A.Allocator, f: Fail) {
+    val carried: opt[str] = text(f);
+    if (sel carried.some) { str_free(a, carried.some); }
+}
+
+test catalog__three_classes_land_on_distinct_kinds_naming_the_member {
+    var a:    A.Allocator;
+    val made: err[A.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    val malformed: Fail = catalog(?a, malformed_member("SectionKind", 200));
+    fin { t_text_free(?a, malformed); }
+    if (!t_user_with(malformed, "malformed SectionKind tag 200")) { ret 2; }
+    val unsupported: Fail = catalog(?a, unsupported_member("Subsystem", "gui", "x86_64-linux"));
+    fin { t_text_free(?a, unsupported); }
+    if (!t_user_with(unsupported, "Subsystem gui is unsupported by x86_64-linux")) { ret 3; }
+    val internal_fail: Fail = unknown_catalog(?a, "PhaseKind", 255);
+    fin { t_text_free(?a, internal_fail); }
+    if (!t_message_with(internal_fail, "unknown PhaseKind tag 255")) { ret 4; }
+    if (sel malformed.message || sel unsupported.message)            { ret 5; }
+    ret 0;
+}
+
+# a range resolves to the line and column of each end, a related range with
+# it, and the places survive a text swap and a retained copy, which owns its
+# own paths
+test place__a_located_failure_keeps_its_places_through_copies {
+    var tracking: T.Testing;
+    val made:     err[A.Error] = T.make(?tracking);
+    if (sel made.err) { ret 1; }
+    fin { T.dnit(?tracking); }
+    val a:    *A.Allocator = T.allocator_of(?tracking);
+    val text: str          = "[project]\nmach = \"^x\"\n";
+    var also: Place;
+    also.spanned = true;
+    also.start   = 0;
+    also.end     = 9;
+    val keyed: Fail       = with_related(a, spanned(user(diagnostic_kind.VERSION_INVALID_RANGE, "bad range"), 17, 21), ?also, 1);
+    val f:     Fail       = placed(a, keyed, "mach.toml", text);
+    val at:    opt[Place] = place_of(f);
+    if (sel at.none) { ret 2; }
+    val p: Place = at.some;
+    if (!str_equals(p.path, "mach.toml") || p.start != 17 || p.end != 21) { ret 3; }
+    if (p.line != 2 || p.col != 8 || p.end_line != 2 || p.end_col != 12)  { ret 4; }
+    val rel: Related = related_of(f);
+    if (rel.count != 1 || !str_equals(rel.items[0].path, "mach.toml"))                                               { ret 9; }
+    if (rel.items[0].line != 1 || rel.items[0].col != 1 || rel.items[0].end_line != 1 || rel.items[0].end_col != 10) { ret 9; }
+    val renamed: opt[Place] = place_of(with_text(f, "renamed"));
+    if (sel renamed.none)            { ret 5; }
+    if (renamed.some.path != p.path) { ret 5; }
+
+    val kept_r: res[Fail, A.Error] = retain(a, f);
+    if (sel kept_r.err) { ret 6; }
+    val kept:      opt[Place] = place_of(kept_r.ok);
+    val kept_also: Related    = related_of(kept_r.ok);
+    var bad:       i32        = 0;
+    if (sel kept.some) {
+        if (kept.some.path == p.path || !str_equals(kept.some.path, "mach.toml") || kept.some.start != 17) { bad = 7; }
+    }
+    or { bad = 7; }
+    if (kept_also.count != 1 || kept_also.items == rel.items || kept_also.items[0].path == rel.items[0].path
+        || kept_also.items[0].end != 9) { bad = 10; }
+    dnit(a, kept_r.ok);
+    places_dnit(a, f);
+    if (bad != 0)                                                                                      { ret bad; }
+    if (T.tracking_exhausted(?tracking) || T.leaked(?tracking) || T.double_free_count(?tracking) != 0) { ret 8; }
     ret 0;
 }
 
@@ -514,6 +1115,3 @@ test catalog__allocation_refusal_keeps_its_owner {
     }
     ret 0;
 }
-
-# renderers and lifts the middle end and the target layer need beyond the
-# shared set above (#3226, C3a); the same style, one line each
