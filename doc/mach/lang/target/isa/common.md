@@ -39,9 +39,10 @@ pub fun popcount32(m: u32) u32;
 ## fun frame_align_up
 
 ```mach
-pub fun frame_align_up(n: u32, align: u32) res[u32, fail.Fail];
+pub fun frame_align_up(n: u64, align: u32) res[u32, fail.Fail];
 ```
 
-a frame extent rounded up to `align`, a power of two or 0 for none; a
-round-up past 4 GiB is refused
+a frame extent rounded up to `align`, a power of two or 0 for none. the
+extent is summed in 64 bits by the caller, so no part of it wraps, and an
+extent past 4 GiB is refused
 
