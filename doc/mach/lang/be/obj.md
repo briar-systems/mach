@@ -54,7 +54,7 @@ pub fun flush_deferred(o: *target_of.ObjectImage, d: *DeferredRelocs) err[fail.F
 
 ```mach
 pub fun rehome(dst_alloc: *A.Allocator, dst_interner: *intern.Interner,
-src: *target_of.ObjectImage, remap: intern.ReinternMap) res[target_of.ObjectImage, fail.Fail];
+src: *target_of.ObjectImage, remap: intern.Remap) res[target_of.ObjectImage, fail.Fail];
 ```
 
 ## fun emit_image
