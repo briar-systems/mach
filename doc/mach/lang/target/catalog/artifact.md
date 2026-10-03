@@ -52,6 +52,23 @@ pub fun name_for(k: Kind) str;
 
 the manifest spelling of a kind; empty for one a manifest cannot declare
 
+## fun declarable_count
+
+```mach
+pub fun declarable_count() usize;
+```
+
+how many kinds a manifest can declare
+
+## fun declarable_at
+
+```mach
+pub fun declarable_at(index: usize) str;
+```
+
+the manifest spelling of the declarable kind at `index`, in catalog order;
+empty past the last
+
 ## fun label_for
 
 ```mach
