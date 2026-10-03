@@ -1,3 +1,14 @@
+# supervised child processes
+#
+# an OwnedSubprocess owns one child from spawn to reap. it moves through
+# STATE_UNSTARTED, then STATE_RUNNING or STATE_SPAWN_FAILURE, then
+# STATE_EXITED or STATE_SIGNALED as the terminal is observed, and ends in
+# STATE_REAPED. each step happens at most once: an owner spawns once, observes
+# one terminal and reaps once, so a child is never waited on twice and a pid
+# is never reused under a stale owner. wait, wait_any, timeout and cancel are
+# the ways to reach the terminal. a capture, when the spawn asked for one, is
+# a file the child writes and the owner reads back after the child is done.
+
 use A: std.allocator;
 use std.allocator.page;
 use chrono_duration: std.chrono.duration;
@@ -20,6 +31,7 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_contains;
+use std.types.string.str_empty;
 use std.types.string.str_equals;
 
 use lang_alloc: mach.lang.alloc;
@@ -36,25 +48,46 @@ $or ($mach.build.os == $mach.os.windows) {
     use system_os_windows: std.system.os.windows;
 }
 
+# where an owner is in its lifecycle
 def SubprocessState: u8;
 
-pub val STATE_UNSTARTED:     SubprocessState = 0;
+# fresh from init, nothing spawned
+pub val STATE_UNSTARTED: SubprocessState = 0;
+
+# the one spawn attempt started no child
 pub val STATE_SPAWN_FAILURE: SubprocessState = 1;
-pub val STATE_RUNNING:       SubprocessState = 2;
-pub val STATE_EXITED:        SubprocessState = 3;
-pub val STATE_SIGNALED:      SubprocessState = 4;
-pub val STATE_REAPED:        SubprocessState = 7;
+
+# a child is running and not yet reaped
+pub val STATE_RUNNING: SubprocessState = 2;
+
+# the child exited with a code, and as a terminal kind, ended that way
+pub val STATE_EXITED: SubprocessState = 3;
+
+# the child was ended by a signal, and as a terminal kind, ended that way
+pub val STATE_SIGNALED: SubprocessState = 4;
+
+# the terminal was observed and the child reaped, so the owner is done
+pub val STATE_REAPED: SubprocessState = 7;
 
 # the termination a supervisor asked for, mirrored from the cancellation
 # scope's reason: the oracle in mach.lang.validation records this kind, so
 # the codes are the scope's 1.x reason codes and never change
 pub def Request: u8;
 
-pub val REQUEST_ACTIVE:    Request = 0;
+# no termination was asked for
+pub val REQUEST_ACTIVE: Request = 0;
+
+# the supervisor cancelled the child
 pub val REQUEST_CANCELLED: Request = 1;
+
+# the child outlived its deadline
 pub val REQUEST_TIMED_OUT: Request = 2;
+
+# the cancellation scope was destroyed
 pub val REQUEST_DESTROYED: Request = 3;
-pub val REQUEST_INVALID:   Request = 4;
+
+# the scope reported a reason this module does not know
+pub val REQUEST_INVALID: Request = 4;
 
 fun request_of(reason: sync_cancel.Reason) Request {
     if (sel reason.active)    { ret REQUEST_ACTIVE; }
@@ -90,11 +123,17 @@ tag Cause: u8 {
     grace_large;
 }
 
+# a refusal of this module
+# ---
+# identity: the pathname of the child, or "subprocess" before one is known,
+#           borrowed from the owner or the caller
+# cause:    what refused
 pub rec Error {
     identity: str;
     cause:    Cause;
 }
 
+# the refusal `cause`, named by `identity`
 pub fun failure(identity: str, cause: Cause) Error {
     ret Error{identity: identity, cause: cause};
 }
@@ -129,11 +168,25 @@ pub fun text(a: *A.Allocator, e: Error) str {
     ret r.ok;
 }
 
+# how a child ended
+# ---
+# kind: STATE_EXITED or STATE_SIGNALED once observed, else the owner's state
+# code: the exit code, or the signal number
 pub rec SubprocessTerminal {
     kind: SubprocessState;
     code: i32;
 }
 
+# what happened to a capture file
+# ---
+# bytes:        captured bytes read back and kept
+# truncated:    the child wrote more than the capture limit
+# short_read:   the read back ended before the bytes the file held
+# read_failed:  the read back failed, or the capture was abandoned
+# write_failed: the capture file could not be opened
+# close_failed: closing the capture file failed
+# closed:       the capture file is closed
+# owned:        the owner still holds the captured bytes
 pub rec CaptureIoResult {
     bytes:        usize;
     truncated:    bool;
@@ -156,6 +209,20 @@ rec OwnedCapture {
     released: bool;
 }
 
+# the owner of one supervised child, made by init and released by dnit
+# ---
+# child:           the child's handle while it runs
+# state:           where the owner is in its lifecycle (see STATE_UNSTARTED)
+# terminal:        how the child ended, once observed
+# requested:       the termination a supervisor asked for
+# capture:         the capture file and what was read back from it
+# has_capture:     the spawn asked for a capture
+# spawn_attempted: spawn has run, so it cannot run again
+# reap_count:      times the child was reaped, never more than one
+# pathname:        the owned copy of the child's pathname, naming its errors
+# has_deadline:    bound set a deadline
+# deadline:        the instant wait_any times the child out
+# timeout:         the bound the deadline came from
 pub rec OwnedSubprocess {
     child:           exec.Child;
     state:           SubprocessState;
@@ -282,6 +349,7 @@ fun empty_capture(limit: usize) OwnedCapture {
     };
 }
 
+# make `p` a fresh owner with nothing spawned
 pub fun init(p: *OwnedSubprocess) {
     p.child.pid       = 0;
     p.state           = STATE_UNSTARTED;
@@ -305,6 +373,10 @@ fun set_deadline(p: *OwnedSubprocess, deadline: time.Instant) bool {
     ret true;
 }
 
+# give `p` a deadline `timeout` from now, which wait_any enforces
+# ---
+# ret: false when the timeout is not positive, the clock fails, or the owner
+#      is done
 pub fun bound(p: *OwnedSubprocess, timeout: chrono_duration.Duration) bool {
     if (timeout < 1) { ret false; }
     val now: time.InstantClock = time.instant();
@@ -319,10 +391,13 @@ fun deadline_reached(p: *OwnedSubprocess, now: time.Instant) bool {
     ret !time.instant_before(now, p.deadline);
 }
 
+# whether the child was terminated for outliving its deadline
 pub fun expired(p: *OwnedSubprocess) bool {
     ret p.requested == REQUEST_TIMED_OUT;
 }
 
+# release what `p` owns: its pathname, and its capture file and identity. a
+# second call releases nothing. it does not reap a running child
 pub fun dnit(a: *A.Allocator, p: *OwnedSubprocess) {
     free_cstr(a, p.pathname);
     p.pathname = nil;
@@ -391,42 +466,46 @@ fun observe_status(p: *OwnedSubprocess, st: exec.ExitStatus) bool {
     ret observe_terminal(p, kind, code) && mark_reaped(p);
 }
 
-pub fun spawn(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8) err[Error] {
-    if (!begin_spawn(p)) { ret err[Error].err{failure(owner_identity(p), Cause.attempted{})}; }
-    val cr: res[SpawnCopy, Error] = prepare_spawn_copy(a, pathname, argv, envp);
-    if (sel cr.err) {
-        observe_spawn_failure(p);
-        ret err[Error].err{cr.err};
-    }
-    var c:  SpawnCopy                   = cr.ok;
-    val sr: res[exec.Child, exec.Error] = exec.spawn(c.pathname::str, c.argv, c.envp);
-    spawn_copy_free_request(a, ?c);
-    if (sel sr.err) {
-        val msg: Error = failure(pathname, Cause.exec{sr.err});
-        free_cstr(a, c.pathname);
-        observe_spawn_failure(p);
-        ret err[Error].err{msg};
-    }
-    p.pathname = c.pathname;
-    observe_spawn(p, sr.ok);
-    ret err[Error].ok{};
+# how spawn starts a child, spawn_options giving the defaults
+# ---
+# cwd:            directory the child starts in, or empty to inherit this
+#                 process's
+# stdin:          handle for the child's stdin, or system_os.INVALID_HANDLE to
+#                 inherit
+# grouped:        place the child as the leader of its own process group, so a
+#                 termination reaches every descendant that stays in it
+# capture:        path of a file, created or truncated, that receives the
+#                 child's stdout, or empty to inherit stdout
+# capture_stderr: send the child's stderr to the capture file too
+# capture_limit:  the most captured bytes finish_capture keeps, and wait_any
+#                 cancels a child whose capture grows past it
+pub rec SpawnOptions {
+    cwd:            str;
+    stdin:          usize;
+    grouped:        bool;
+    capture:        str;
+    capture_stderr: bool;
+    capture_limit:  usize;
 }
 
-#[testing]
-pub fun spawn_captured(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
-    identity: str, limit: usize) err[Error] {
-    ret spawn_captured_input(a, p, pathname, argv, envp, system_os.INVALID_HANDLE, true, identity, limit);
+# the options of a plain spawn: this process's directory, its streams and its
+# group, with nothing captured
+pub fun spawn_options() SpawnOptions {
+    ret SpawnOptions{
+        cwd:            "",
+        stdin:          system_os.INVALID_HANDLE,
+        grouped:        false,
+        capture:        "",
+        capture_stderr: false,
+        capture_limit:  0,
+    };
 }
 
-pub fun spawn_captured_input(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
-    stdin_fd: usize, capture_stderr: bool, identity: str, limit: usize) err[Error] {
-    if (!begin_spawn(p)) { ret err[Error].err{failure(owner_identity(p), Cause.attempted{})}; }
-    val idr: res[*u8, Error] = dup_cstr(a, identity::*u8);
-    if (sel idr.err) {
-        observe_spawn_failure(p);
-        ret err[Error].err{idr.err};
-    }
-    p.capture          = empty_capture(limit);
+# take ownership of the capture file the child's output goes to
+fun capture_open(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, options: SpawnOptions) err[Error] {
+    val idr: res[*u8, Error] = dup_cstr(a, options.capture::*u8);
+    if (sel idr.err) { ret err[Error].err{idr.err}; }
+    p.capture          = empty_capture(options.capture_limit);
     p.capture.identity = idr.ok;
     p.has_capture      = true;
 
@@ -435,125 +514,57 @@ pub fun spawn_captured_input(a: *A.Allocator, p: *OwnedSubprocess, pathname: str
         system_os.O_CREAT | system_os.O_TRUNC | system_os.O_RDWR, 420, ?capture);
     if (opened < 0) {
         p.capture.result.write_failed = true;
-        val msg: Error = failure(pathname, Cause.native{opened});
-        observe_spawn_failure(p);
-        dnit(a, p);
-        ret err[Error].err{msg};
+        ret err[Error].err{failure(pathname, Cause.native{opened})};
     }
     p.capture.file          = fs.File{handle: io_handle.FileHandle{value: capture}};
     p.capture.result.closed = false;
-
-    val cr: res[SpawnCopy, Error] = prepare_spawn_copy(a, pathname, argv, envp);
-    if (sel cr.err) {
-        val msg: Error = cr.err;
-        observe_spawn_failure(p);
-        dnit(a, p);
-        ret err[Error].err{msg};
-    }
-    var c:         SpawnCopy = cr.ok;
-    var stderr_fd: usize     = system_os.INVALID_HANDLE;
-    if (capture_stderr) { stderr_fd = p.capture.file.handle.value; }
-    val sr: res[exec.Child, exec.Error] = exec.spawn_redirected_in(
-        c.pathname::str, c.argv, c.envp, "", stdin_fd, p.capture.file.handle.value, stderr_fd);
-    spawn_copy_free_request(a, ?c);
-    if (sel sr.err) {
-        val msg: Error = failure(pathname, Cause.exec{sr.err});
-        free_cstr(a, c.pathname);
-        observe_spawn_failure(p);
-        dnit(a, p);
-        ret err[Error].err{msg};
-    }
-    p.pathname = c.pathname;
-    observe_spawn(p, sr.ok);
     ret err[Error].ok{};
 }
 
-pub fun spawn_grouped(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8) err[Error] {
-    if (!begin_spawn(p)) { ret err[Error].err{failure(owner_identity(p), Cause.attempted{})}; }
-    val cr: res[SpawnCopy, Error] = prepare_spawn_copy(a, pathname, argv, envp);
-    if (sel cr.err) {
-        observe_spawn_failure(p);
-        ret err[Error].err{cr.err};
-    }
-    var c:  SpawnCopy                   = cr.ok;
-    val sr: res[exec.Child, exec.Error] = exec.spawn_grouped(c.pathname::str, c.argv, c.envp);
-    spawn_copy_free_request(a, ?c);
-    if (sel sr.err) {
-        val msg: Error = failure(pathname, Cause.exec{sr.err});
-        free_cstr(a, c.pathname);
-        observe_spawn_failure(p);
-        ret err[Error].err{msg};
-    }
-    p.pathname = c.pathname;
-    observe_spawn(p, sr.ok);
-    ret err[Error].ok{};
+# a spawn that started no child: the owner keeps no child and releases what it
+# took, and its one spawn attempt is spent
+fun spawn_refused(a: *A.Allocator, p: *OwnedSubprocess, e: Error) err[Error] {
+    observe_spawn_failure(p);
+    dnit(a, p);
+    ret err[Error].err{e};
 }
 
-pub fun spawn_in_grouped(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
-    cwd: str) err[Error] {
+# start a child under `p`, which must be fresh from init: an owner spawns at
+# most once, even when the spawn fails
+#
+# the pathname, argv and envp are copied, so the caller's buffers may change
+# as soon as this returns. the owner keeps the pathname to name the child in
+# its errors. on failure the owner is in STATE_SPAWN_FAILURE and owns nothing.
+# ---
+# a:        allocator for the owner's copies, which dnit releases
+# p:        the owner, from init
+# pathname: path to the executable
+# argv:     null-terminated argument array
+# envp:     null-terminated environment array
+# options:  directory, stdin, grouping and capture (see SpawnOptions)
+# ret:      nothing, or the refusal named by the pathname
+pub fun spawn(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
+    options: SpawnOptions) err[Error] {
     if (!begin_spawn(p)) { ret err[Error].err{failure(owner_identity(p), Cause.attempted{})}; }
-    val cr: res[SpawnCopy, Error] = prepare_spawn_copy(a, pathname, argv, envp);
-    if (sel cr.err) {
-        observe_spawn_failure(p);
-        ret err[Error].err{cr.err};
+    var redirect: exec.SpawnOptions = exec.spawn_options();
+    redirect.cwd     = options.cwd;
+    redirect.stdin   = options.stdin;
+    redirect.grouped = options.grouped;
+    if (!str_empty(options.capture)) {
+        val opened: err[Error] = capture_open(a, p, pathname, options);
+        if (sel opened.err) { ret spawn_refused(a, p, opened.err); }
+        redirect.stdout = p.capture.file.handle.value;
+        if (options.capture_stderr) { redirect.stderr = redirect.stdout; }
     }
-    var c:  SpawnCopy                   = cr.ok;
-    val sr: res[exec.Child, exec.Error] = exec.spawn_redirected_in_grouped(
-        c.pathname::str, c.argv, c.envp, cwd, system_os.INVALID_HANDLE, system_os.INVALID_HANDLE, system_os.INVALID_HANDLE);
-    spawn_copy_free_request(a, ?c);
-    if (sel sr.err) {
-        val msg: Error = failure(pathname, Cause.exec{sr.err});
-        free_cstr(a, c.pathname);
-        observe_spawn_failure(p);
-        ret err[Error].err{msg};
-    }
-    p.pathname = c.pathname;
-    observe_spawn(p, sr.ok);
-    ret err[Error].ok{};
-}
-
-pub fun spawn_captured_grouped(a: *A.Allocator, p: *OwnedSubprocess, pathname: str, argv: **u8, envp: **u8,
-    identity: str, limit: usize) err[Error] {
-    if (!begin_spawn(p)) { ret err[Error].err{failure(owner_identity(p), Cause.attempted{})}; }
-    val idr: res[*u8, Error] = dup_cstr(a, identity::*u8);
-    if (sel idr.err) {
-        observe_spawn_failure(p);
-        ret err[Error].err{idr.err};
-    }
-    p.capture          = empty_capture(limit);
-    p.capture.identity = idr.ok;
-    p.has_capture      = true;
-
-    var capture: usize = system_os.INVALID_HANDLE;
-    val opened:  i64   = system_os.open(system_os.working_dir(), p.capture.identity::str,
-        system_os.O_CREAT | system_os.O_TRUNC | system_os.O_RDWR, 420, ?capture);
-    if (opened < 0) {
-        p.capture.result.write_failed = true;
-        val msg: Error = failure(pathname, Cause.native{opened});
-        observe_spawn_failure(p);
-        dnit(a, p);
-        ret err[Error].err{msg};
-    }
-    p.capture.file          = fs.File{handle: io_handle.FileHandle{value: capture}};
-    p.capture.result.closed = false;
 
     val cr: res[SpawnCopy, Error] = prepare_spawn_copy(a, pathname, argv, envp);
-    if (sel cr.err) {
-        val msg: Error = cr.err;
-        observe_spawn_failure(p);
-        dnit(a, p);
-        ret err[Error].err{msg};
-    }
+    if (sel cr.err) { ret spawn_refused(a, p, cr.err); }
     var c:  SpawnCopy                   = cr.ok;
-    val sr: res[exec.Child, exec.Error] = exec.spawn_redirected_grouped(
-        c.pathname::str, c.argv, c.envp, p.capture.file.handle.value, p.capture.file.handle.value);
+    val sr: res[exec.Child, exec.Error] = exec.spawn_with_options(c.pathname::str, c.argv, c.envp, redirect);
     spawn_copy_free_request(a, ?c);
     if (sel sr.err) {
-        val msg: Error = failure(pathname, Cause.exec{sr.err});
         free_cstr(a, c.pathname);
-        observe_spawn_failure(p);
-        dnit(a, p);
-        ret err[Error].err{msg};
+        ret spawn_refused(a, p, failure(pathname, Cause.exec{sr.err}));
     }
     p.pathname = c.pathname;
     observe_spawn(p, sr.ok);
@@ -564,6 +575,9 @@ fun running(p: *OwnedSubprocess) bool {
     ret p.state == STATE_RUNNING;
 }
 
+# block until the running child of `p` ends, and reap it
+# ---
+# ret: how the child ended, or the refusal when no child is running
 pub fun wait(a: *A.Allocator, p: *OwnedSubprocess) res[SubprocessTerminal, Error] {
     if (!running(p)) {
         ret res[SubprocessTerminal, Error].err{failure(owner_identity(p), Cause.not_running{})};
@@ -585,6 +599,20 @@ fun capture_over_limit(p: *OwnedSubprocess) bool {
     ret mr.ok.size > p.capture.limit;
 }
 
+# supervise `count` owners until one of them reaches its terminal, and return
+# that one reaped
+#
+# each pass polls the scope, then every running owner: a cancelled or expired
+# scope cancels or times out the first running owner, an owner past its own
+# deadline is timed out, and one whose capture outgrew its limit is
+# cancelled. a terminate, interrupt, console-close or service-stop event from
+# `source` cancels the scope.
+# ---
+# owners: array of `count` owners, some of which may not be running
+# scope:  cancellation scope over all of them, or nil
+# source: process events that cancel the scope, or nil
+# ret:    the owner that reached its terminal, or the refusal when none is
+#         running
 pub fun wait_any(a: *A.Allocator, owners: *OwnedSubprocess, count: u32, scope: *sync_cancel.Scope, source: *events.Source) res[*OwnedSubprocess, Error] {
     for (true) {
         val clock: time.InstantClock = time.instant();
@@ -706,6 +734,11 @@ fun finalize_capture_file(a: *A.Allocator, c: *OwnedCapture, keep: bool) {
     }
 }
 
+# read the capture of a finished child back and close it, once
+# ---
+# retain: keep the captured bytes for capture_bytes, else only count them
+# ret:    what happened to the capture, or the refusal while the child runs or
+#         after release_capture
 pub fun finish_capture(a: *A.Allocator, p: *OwnedSubprocess, retain: bool) res[CaptureIoResult, Error] {
     if (!p.has_capture) { ret res[CaptureIoResult, Error].ok{p.capture.result}; }
     if (p.capture.released) {
@@ -722,6 +755,7 @@ pub fun finish_capture(a: *A.Allocator, p: *OwnedSubprocess, retain: bool) res[C
     ret res[CaptureIoResult, Error].ok{p.capture.result};
 }
 
+# close the capture without reading it back, marking it failed
 pub fun abandon_capture(p: *OwnedSubprocess) {
     if (!p.has_capture) { ret; }
     close_capture(?p.capture);
@@ -729,6 +763,10 @@ pub fun abandon_capture(p: *OwnedSubprocess) {
     p.capture.result.read_failed = true;
 }
 
+# the captured bytes retained by finish_capture, borrowed from `p`
+# ---
+# len: receives the byte count, 0 when nothing is retained
+# ret: the bytes, or nil when nothing is retained
 pub fun capture_bytes(p: *OwnedSubprocess, len: *usize) *u8 {
     @len = 0;
     if (!p.has_capture || !p.capture.result.owned || !p.capture.finished) { ret nil; }
@@ -736,6 +774,7 @@ pub fun capture_bytes(p: *OwnedSubprocess, len: *usize) *u8 {
     ret p.capture.buffer;
 }
 
+# free the captured bytes and the capture identity of a finished capture, once
 pub fun release_capture(a: *A.Allocator, p: *OwnedSubprocess) err[Error] {
     if (!p.has_capture) { ret err[Error].ok{}; }
     if (p.capture.released) {
@@ -809,7 +848,7 @@ fun actual_terminate(a: *A.Allocator, child: exec.Child, hard: bool) bool {
 
     var helper: OwnedSubprocess;
     init(?helper);
-    val sr: err[Error] = spawn(a, ?helper, pathname, ?argv[0], env.environ());
+    val sr: err[Error] = spawn(a, ?helper, pathname, ?argv[0], env.environ(), spawn_options());
     if (sel sr.err) {
         dnit(a, ?helper);
         ret false;
@@ -927,10 +966,19 @@ fun request(p: *OwnedSubprocess, a: *A.Allocator, state: Request,
         actual_sleep);
 }
 
+# terminate the running child for outliving its deadline and reap it
+#
+# the child is asked to stop, its whole group when it has one, and given
+# `grace` to end before it is killed.
+# ---
+# grace: how long the child has to stop, rounded up to a millisecond
+# ret:   how the child ended, or the refusal. a refused termination keeps the
+#        child running and owned, so the request can be retried
 pub fun timeout(a: *A.Allocator, p: *OwnedSubprocess, grace: chrono_duration.Duration) res[SubprocessTerminal, Error] {
     ret request(p, a, REQUEST_TIMED_OUT, grace);
 }
 
+# terminate the running child as cancelled and reap it, as timeout does
 pub fun cancel(a: *A.Allocator, p: *OwnedSubprocess, grace: chrono_duration.Duration) res[SubprocessTerminal, Error] {
     ret request(p, a, REQUEST_CANCELLED, grace);
 }
@@ -1001,6 +1049,23 @@ fun fake_request(p: *OwnedSubprocess, a: *A.Allocator, request: Request, attempt
 }
 
 #[testing]
+fun grouped_options() SpawnOptions {
+    var options: SpawnOptions = spawn_options();
+    options.grouped = true;
+    ret options;
+}
+
+#[testing]
+fun captured(identity: str, limit: usize, grouped: bool) SpawnOptions {
+    var options: SpawnOptions = spawn_options();
+    options.capture        = identity;
+    options.capture_stderr = true;
+    options.capture_limit  = limit;
+    options.grouped        = grouped;
+    ret options;
+}
+
+#[testing]
 rec CaptureProbe {
     backing: A.Allocator;
     live:    i64;
@@ -1048,7 +1113,7 @@ fun capture_probe_make(p: *CaptureProbe, alloc: *A.Allocator, fail_at: u32) bool
     ret true;
 }
 
-test spawn_captured__an_open_failure_owns_no_child_leaks_nothing_and_cannot_retry {
+test spawn__a_capture_open_failure_owns_no_child_leaks_nothing_and_cannot_retry {
     var identity: *u8;
     $if ($mach.build.os == $mach.os.windows) { identity = "Z:\\mach-no-parent\\capture-probe-open"; }
     $or                                      { identity = "/mach-no-parent/capture-probe-open"; }
@@ -1062,21 +1127,21 @@ test spawn_captured__an_open_failure_owns_no_child_leaks_nothing_and_cannot_retr
     init(?p);
     if (p.state != STATE_UNSTARTED || p.terminal.kind != STATE_UNSTARTED) { ret 2; }
     if (running(?p) || p.spawn_attempted)                                 { ret 2; }
-    val sr: err[Error] = spawn_captured(?alloc, ?p, identity, ?argv[0], env.environ(), identity, 8);
+    val sr: err[Error] = spawn(?alloc, ?p, identity, ?argv[0], env.environ(), captured(identity, 8, false));
     if (sel sr.ok)                                                                { ret 3; }
     if (probe.live != 0)                                                          { ret 4; }
     if (p.state != STATE_SPAWN_FAILURE || p.terminal.kind != STATE_SPAWN_FAILURE) { ret 5; }
     if (running(?p) || p.child.pid != 0 || !p.has_capture)                        { ret 6; }
     if (!p.capture.result.write_failed || !p.capture.result.closed)               { ret 7; }
     if (!str_equals(sr.err.identity, identity::str))                              { ret 8; }
-    val retry: err[Error] = spawn_captured(?alloc, ?p, identity, ?argv[0], env.environ(), identity, 8);
+    val retry: err[Error] = spawn(?alloc, ?p, identity, ?argv[0], env.environ(), captured(identity, 8, false));
     if (sel retry.ok) { ret 9; }
     dnit(?alloc, ?p);
     if (probe.live != 0) { ret 10; }
     ret 0;
 }
 
-test spawn_captured__a_prepare_failure_leaks_nothing {
+test spawn__a_prepare_failure_leaks_nothing {
     $if ($mach.build.os == $mach.os.windows) { ret 0; }
     var plain:  A.Allocator;
     val make_r: err[A.Error] = page.make(?plain);
@@ -1098,7 +1163,7 @@ test spawn_captured__a_prepare_failure_leaks_nothing {
     if (!capture_probe_make(?probe, ?alloc, 2)) { ret 1; }
     var p: OwnedSubprocess;
     init(?p);
-    val sr:  err[Error] = spawn_captured(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), identity, 64);
+    val sr:  err[Error] = spawn(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), captured(identity, 64, false));
     var bad: bool       = false;
     if (sel sr.ok)       { bad = true; }
     if (probe.live != 0) { bad = true; }
@@ -1107,7 +1172,7 @@ test spawn_captured__a_prepare_failure_leaks_nothing {
     ret 0;
 }
 
-test capture__reads_back_and_a_second_dnit_frees_nothing {
+test capture__reads_back_the_child_run_in_its_directory_and_a_second_dnit_frees_nothing {
     $if ($mach.build.os == $mach.os.windows) { ret 0; }
     var plain:  A.Allocator;
     val make_r: err[A.Error] = page.make(?plain);
@@ -1121,7 +1186,7 @@ test capture__reads_back_and_a_second_dnit_frees_nothing {
     var argv: [4]*u8;
     argv[0] = "/bin/sh";
     argv[1] = "-c";
-    argv[2] = "printf hi";
+    argv[2] = "printf %s \"$(pwd)\"";
     argv[3] = nil;
 
     var probe: CaptureProbe;
@@ -1129,7 +1194,9 @@ test capture__reads_back_and_a_second_dnit_frees_nothing {
     if (!capture_probe_make(?probe, ?alloc, 0)) { ret 1; }
     var p: OwnedSubprocess;
     init(?p);
-    val sr:  err[Error] = spawn_captured(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), identity, 64);
+    var options: SpawnOptions = captured(identity, 64, false);
+    options.cwd = "/";
+    val sr:  err[Error] = spawn(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), options);
     var bad: bool       = false;
     if (sel sr.err) { bad = true; }
     if (sel sr.ok) {
@@ -1140,10 +1207,10 @@ test capture__reads_back_and_a_second_dnit_frees_nothing {
             if (sel cr.err) { bad = true; }
             if (sel cr.ok) {
                 val capture: CaptureIoResult = cr.ok;
-                if (capture.bytes != 2 || capture.truncated || capture.read_failed) { bad = true; }
+                if (capture.bytes != 1 || capture.truncated || capture.read_failed) { bad = true; }
                 var n:     usize = 0;
                 val bytes: *u8   = capture_bytes(?p, ?n);
-                if (bytes == nil || n != 2 || bytes[0] != 'h' || bytes[1] != 'i') { bad = true; }
+                if (bytes == nil || n != 1 || bytes[0] != '/') { bad = true; }
                 val rel: err[Error] = release_capture(?alloc, ?p);
                 if (sel rel.err) { bad = true; }
                 if (sel rel.ok) {
@@ -1194,9 +1261,9 @@ test wait_any__reaps_the_child_that_exits {
     var owners: [2]OwnedSubprocess;
     init(?owners[0]);
     init(?owners[1]);
-    val fast_r: err[Error] = spawn(?alloc, ?owners[0], "/bin/sh", ?fast_argv[0], env.environ());
+    val fast_r: err[Error] = spawn(?alloc, ?owners[0], "/bin/sh", ?fast_argv[0], env.environ(), spawn_options());
     if (sel fast_r.err) { ret 1; }
-    val slow_r: err[Error] = spawn(?alloc, ?owners[1], "/bin/sh", ?slow_argv[0], env.environ());
+    val slow_r: err[Error] = spawn(?alloc, ?owners[1], "/bin/sh", ?slow_argv[0], env.environ(), spawn_options());
     if (sel slow_r.err) {
         dnit(?alloc, ?owners[0]);
         ret 1;
@@ -1242,7 +1309,7 @@ test regression__spawn_copies_the_pathname_and_argv {
 
     var p: OwnedSubprocess;
     init(?p);
-    val sr: err[Error] = spawn(?alloc, ?p, (?pathname_buf[0])::str, ?argv[0], env.environ());
+    val sr: err[Error] = spawn(?alloc, ?p, (?pathname_buf[0])::str, ?argv[0], env.environ(), spawn_options());
     if (sel sr.err) { ret 1; }
 
     var j: usize = 0;
@@ -1268,7 +1335,7 @@ test regression__spawn_copies_the_pathname_and_argv {
     ret 0;
 }
 
-test regression__spawn_captured_copies_the_identity {
+test regression__spawn_copies_the_capture_identity {
     $if ($mach.build.os == $mach.os.windows) { ret 0; }
     var alloc:  A.Allocator;
     val make_r: err[A.Error] = page.make(?alloc);
@@ -1297,7 +1364,7 @@ test regression__spawn_captured_copies_the_identity {
     argv[3] = nil;
     var p: OwnedSubprocess;
     init(?p);
-    val sr:  err[Error] = spawn_captured(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), (?identity_buf[0])::str, 64);
+    val sr:  err[Error] = spawn(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), captured((?identity_buf[0])::str, 64, false));
     var bad: bool       = false;
     if (sel sr.err) { bad = true; }
     if (sel sr.ok) {
@@ -1344,7 +1411,7 @@ test wait_any__bounds_a_runaway_capture {
     argv[3] = nil;
     var p: OwnedSubprocess;
     init(?p);
-    val sr:  err[Error] = spawn_captured(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), identity, 64);
+    val sr:  err[Error] = spawn(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), captured(identity, 64, false));
     var bad: bool       = false;
     if (sel sr.err) { bad = true; }
     if (sel sr.ok) {
@@ -1507,7 +1574,7 @@ test capture__finish_and_release_refuse_the_wrong_order {
     ret 0;
 }
 
-test spawn_captured_grouped__a_failure_leaks_nothing {
+test spawn__a_grouped_capture_failure_leaks_nothing {
     var identity: *u8;
     $if ($mach.build.os == $mach.os.windows) { identity = "Z:\\mach-no-parent\\capture-grouped"; }
     $or                                      { identity = "/mach-no-parent/capture-grouped"; }
@@ -1519,7 +1586,7 @@ test spawn_captured_grouped__a_failure_leaks_nothing {
     if (!capture_probe_make(?probe, ?alloc, 0)) { ret 1; }
     var p: OwnedSubprocess;
     init(?p);
-    val sr: err[Error] = spawn_captured_grouped(?alloc, ?p, identity, ?argv[0], env.environ(), identity, 8);
+    val sr: err[Error] = spawn(?alloc, ?p, identity, ?argv[0], env.environ(), captured(identity, 8, true));
     if (sel sr.ok)                                           { ret 1; }
     if (probe.live != 0)                                     { ret 1; }
     if (p.state != STATE_SPAWN_FAILURE || p.child.pgid != 0) { ret 1; }
@@ -1569,7 +1636,7 @@ test wait_any__a_scope_deadline_times_out_a_running_child {
     argv[3] = nil;
     var p: OwnedSubprocess;
     init(?p);
-    val sr:  err[Error] = spawn_captured(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), identity, 64);
+    val sr:  err[Error] = spawn(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), captured(identity, 64, false));
     var bad: bool       = false;
     if (sel sr.err) { bad = true; }
     if (sel sr.ok) {
@@ -1607,7 +1674,7 @@ test wait_any__a_cancelled_scope_races_a_fast_exit {
     argv[3] = nil;
     var p: OwnedSubprocess;
     init(?p);
-    val sr:  err[Error] = spawn(?alloc, ?p, "/bin/sh", ?argv[0], env.environ());
+    val sr:  err[Error] = spawn(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), spawn_options());
     var bad: bool       = false;
     if (sel sr.err) { bad = true; }
     if (sel sr.ok) {
@@ -1647,7 +1714,7 @@ test wait_any__an_owner_deadline_terminates_the_group_and_reaps_the_grandchild {
     argv[3] = nil;
     var p: OwnedSubprocess;
     init(?p);
-    val sr:  err[Error] = spawn_captured_grouped(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), identity, 32);
+    val sr:  err[Error] = spawn(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), captured(identity, 32, true));
     var bad: i32        = 0;
     if (sel sr.err) { bad = 1; }
     if (sel sr.ok) {
@@ -1715,7 +1782,7 @@ test wait_any__an_unbounded_owner_runs_to_its_own_exit {
     argv[3] = nil;
     var p: OwnedSubprocess;
     init(?p);
-    val sr:  err[Error] = spawn_grouped(?alloc, ?p, "/bin/sh", ?argv[0], env.environ());
+    val sr:  err[Error] = spawn(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), grouped_options());
     var bad: i32        = 0;
     if (sel sr.err) { bad = 1; }
     if (sel sr.ok) {
@@ -1743,7 +1810,7 @@ test wait_any__a_child_that_beats_its_deadline_is_not_timed_out {
     argv[3] = nil;
     var p: OwnedSubprocess;
     init(?p);
-    val sr:  err[Error] = spawn_grouped(?alloc, ?p, "/bin/sh", ?argv[0], env.environ());
+    val sr:  err[Error] = spawn(?alloc, ?p, "/bin/sh", ?argv[0], env.environ(), grouped_options());
     var bad: i32        = 0;
     if (sel sr.err) { bad = 1; }
     if (sel sr.ok) {
