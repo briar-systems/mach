@@ -100,9 +100,10 @@ the row label of phase ph
 pub val LEVEL_RESULTS: u8 = 0
 ```
 
-what a sink asks to receive. every level receives the unit, failure and
-diagnostics events; phases adds the phase rows and the unit summary, items
-adds one event per module or file a phase processed
+what a sink asks to receive. every level receives the unit, failure,
+diagnostics and test run events; phases adds the phase rows and the unit
+summary, items adds one event per module or file a phase processed. a test
+renderer reads the level for how much of each test it shows
 
 ## val LEVEL_PHASES
 
@@ -168,6 +169,44 @@ pub rec Diagnostics;
 
 a unit's diagnostics with the sources they point into
 
+## rec TestResult
+
+```mach
+pub rec TestResult;
+```
+
+one test's result, filled in place when the test finishes. log is the file its
+captured output is kept in, nil when none could be named
+
+## rec RunStart
+
+```mach
+pub rec RunStart;
+```
+
+a test run starts over count tests in collection order, each with its art set
+and none done, launched through runner when it is not nil. tests stays valid
+and in place until the run's run_end, so a renderer may read every result as
+it finishes
+
+## rec TestEnd
+
+```mach
+pub rec TestEnd;
+```
+
+the test at position at of the run finished, whatever its outcome
+
+## rec RunEnd
+
+```mach
+pub rec RunEnd;
+```
+
+a test run ended: its results in collection order, the counts of passed,
+failed and timed-out tests, the run's wall time, and the gate tally over every
+result
+
 ## tag Event
 
 ```mach
@@ -178,10 +217,14 @@ pub tag Event: u8 {
     summary:     Summary;
     failure:     Failure;
     diagnostics: Diagnostics;
+    run_start:   RunStart;
+    test_end:    TestEnd;
+    run_end:     RunEnd;
 }
 ```
 
-one event of a build, in the order it happened
+one event of a command, in the order it happened. a new kind is a new member
+here and a new arm in each renderer, which skips a member it does not render
 
 ## rec Sink
 
@@ -217,6 +260,31 @@ pub fun diagnostics(sink: *Sink, sources: *lang_source.SourceMap, diags: *diagno
 
 a unit's diagnostics, sent when it has any; a nil sink is a no-op
 
+## fun run_start
+
+```mach
+pub fun run_start(sink: *Sink, tests: *TestResult, count: u32, runner: str);
+```
+
+a test run starts; a nil sink is a no-op
+
+## fun test_end
+
+```mach
+pub fun test_end(sink: *Sink, tests: *TestResult, at: u32);
+```
+
+the test at position at finished, its result filled and marked done; a nil
+sink is a no-op
+
+## fun run_end
+
+```mach
+pub fun run_end(sink: *Sink, end: RunEnd);
+```
+
+a test run ended; a nil sink is a no-op
+
 ## def Instant
 
 ```mach
@@ -232,11 +300,15 @@ the sample, so a duration measured from it is zero rather than invented
 pub fun sample() Instant;
 ```
 
+the instant now, or none when the clock refused
+
 ## fun elapsed
 
 ```mach
 pub fun elapsed(start: Instant) chrono_duration.Duration;
 ```
+
+the time since start, zero when either sample is absent
 
 ## rec Progress
 
@@ -266,6 +338,8 @@ ret: pr, or nil when the sink takes no phase rows, which every phase call reads 
 pub fun phase_begin(pr: *Progress, ph: Phase);
 ```
 
+phase ph's row opens now; its time runs to phase_end, less what is carved out of it
+
 ## fun phase_carved
 
 ```mach
@@ -280,17 +354,23 @@ phase ph runs inside another phase and is timed by the spans moved into it
 pub fun phase_workers(pr: *Progress, ph: Phase, n: u32);
 ```
 
+phase ph ran on n workers
+
 ## fun phase_dropped
 
 ```mach
 pub fun phase_dropped(pr: *Progress, ph: Phase, n: u32);
 ```
 
+phase ph dropped n modules as target-gated
+
 ## fun span_begin
 
 ```mach
 pub fun span_begin(pr: *Progress) Instant;
 ```
+
+the start of a span that span_end moves into a hosted phase
 
 ## fun span_end
 
@@ -305,6 +385,8 @@ the span from start belongs to ph, and leaves the phase host that ran it
 ```mach
 pub fun item_begin(pr: *Progress) Instant;
 ```
+
+the start of an item, sampled only when the sink takes items
 
 ## fun item
 

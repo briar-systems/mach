@@ -78,15 +78,30 @@ split a byte count into the binary magnitude it reads best in and its unit
 pub rec Readout;
 ```
 
-a build's events rendered to the report's stream the moment each arrives.
-human text renders unit banners, phase rows, items, the unit summary,
-failures and diagnostics, and readout_close writes the closing tally; json
-renders each diagnostic and each failure as one record
+every command's events rendered the moment each arrives: the renderer of the
+readout contract (doc/language/readout.md). the report's stream, stderr,
+carries the build: human text renders unit banners, phase rows, items, the
+unit summary, failures and diagnostics, and readout_close writes the closing
+tally; json renders each diagnostic and failure as a record, and under -v the
+unit banners, phase rows, items and unit summaries as unit, phase and
+phase_item records. the run's stream, stdout, carries a test run: human text
+renders each test as it finishes, a module's roll-up once its last test has,
+and the closing summary; json renders the events of `mach test --format json`.
+under json diagnostics each finished test is also a record on the report's
+stream
 
-sink: what the engine is given; its ctx is this record, which must not move
+sink: what the engine and the test runner are given; its ctx is this record, which must not move
+r: the command's report
 units: the plan's unit count; a banner prints only when it is more than one
 quiet: `--quiet`, which suppresses the banners
 tally: the human tally, counted as the events pass
+stream: how a test run renders on out
+out: where a test run renders, stdout
+run: the running test run's results, from its run_start to its run_end
+count: how many results run holds
+runner: the command each test is launched through, or nil
+mod_w: the module column's width
+name_w: the test column's width
 
 ## fun readout_init
 
@@ -94,7 +109,7 @@ tally: the human tally, counted as the events pass
 pub fun readout_init(rd: *Readout, r: *Report, units: usize, quiet: bool, level: u8);
 ```
 
-start rendering a plan's events to r
+start rendering a command's events to r, a test run in human text to stdout
 
 rd: the renderer, initialised in place since its sink points at it
 r: the command's report
@@ -113,6 +128,35 @@ failure and diagnostic the plan rendered, a failure record printed as its own
 `error:` line (an encoder or rules refusal that reached no store) counted in it
 beside every store's diagnostics, so the tally never reads `0 errors` above a
 nonzero exit. json closes in report_close
+
+## fun event_begin
+
+```mach
+pub fun event_begin(w: *io_writer.Writer, o: *json.Object, event: *u8);
+```
+
+open one event of `mach test --format json` on w
+
+w: the run's stream
+o: the event's object
+event: the event's name
+
+## fun result_name
+
+```mach
+pub fun result_name(r: *validation.ValidationGateResult) *u8;
+```
+
+the outcome a test record and event name: `pass`, `exit`, `signal`, `spawn`,
+`timeout`, or `other`
+
+## fun has_capture
+
+```mach
+pub fun has_capture(r: *validation.ValidationGateResult) bool;
+```
+
+whether a result kept output worth pointing at
 
 ## def Format
 
@@ -165,6 +209,7 @@ warnings: the warning records written
 notes: the note records written
 made: whether the arena record paths are built in, and the base they are
           measured from, have been made; they are on first use
+built: under json, each unit's `built` line, which the summary record carries
 
 ## fun report_init
 
