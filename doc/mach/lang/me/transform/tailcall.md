@@ -1,6 +1,6 @@
 # mach.lang.me.transform.tailcall
 
-tail calls (#3417)
+tail calls
 
 a call is in tail position when its block returns the call's result, or
 returns nothing after a call that returns nothing, with only debug

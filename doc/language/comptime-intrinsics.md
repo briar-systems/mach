@@ -469,7 +469,7 @@ $each f in $fields(T) {
 ```
 
 The same form is valid in a **generic argument list**, which is what makes a walk
-recursive rather than merely descending (#2691):
+recursive rather than merely descending:
 
 ```mach fragment
 fun eq[T](a: *T, b: *T) bool {

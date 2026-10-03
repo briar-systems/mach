@@ -7,7 +7,7 @@ pub fun run_in(m: *me_ir.Module, tgt: *lang_target.Target, workspace: *scratch.W
 ```
 
 the constants a loop rebuilds on every iteration, materialized once in its
-preheader instead (#3807): a float other than +0.0, which is a constant-pool
+preheader instead: a float other than +0.0, which is a constant-pool
 load or a register built from its bits, and an integer the instruction set
 cannot build in one instruction, by its own rule. each loop, innermost first,
 gives the constants its body reads a `const` in its own preheader, so an

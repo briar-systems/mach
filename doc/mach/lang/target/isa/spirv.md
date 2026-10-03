@@ -1360,7 +1360,7 @@ then declares with OpExtension below `ext_core`, the version that made it core (
 an extension no version took in). `graphics` is the extension a use from a vertex or
 fragment stage needs beyond what the use itself names, 0 when every stage has the
 capability alike. `feature` is the device feature a type's capability needs under an
-environment, whose ceiling only admits it (#4318), 0 for a capability raised by a use,
+environment, whose ceiling only admits it, 0 for a capability raised by a use,
 which names its own
 
 ## val NEED_INT8
@@ -1542,42 +1542,42 @@ pub val EXT_FLOAT16:                      u64 = 0x1
 the spirv extension vocabulary: capabilities and device features an
 environment guarantees beyond the core, or a consumer enables, which the
 catalog's rows, the instruction rows and the emitter read. float16 is the
-Float16 capability, so f16 is the native OpTypeFloat 16 (#3801).
+Float16 capability, so f16 is the native OpTypeFloat 16.
 zero_init_workgroup is the shaderZeroInitializeWorkgroupMemory feature, so a
 `#[shared]` variable takes an OpConstantNull initializer instead of the zeroing
-the compiler inserts (#4270). the subgroup_ family are the VOTE, ARITHMETIC,
+the compiler inserts. the subgroup_ family are the VOTE, ARITHMETIC,
 BALLOT, SHUFFLE, SHUFFLE_RELATIVE, CLUSTERED and QUAD bits of Vulkan's
 subgroupSupportedOperations, which no Vulkan version guarantees, and
 subgroup_graphics_stages is subgroupSupportedStages reaching the vertex and
 fragment stages, where Vulkan guarantees only compute. storage_read_without_format and
 storage_write_without_format are the shaderStorageImageReadWithoutFormat and
 shaderStorageImageWriteWithoutFormat features, so a storage image of Unknown
-format may be read or written (#4272). storage_image_multisample is the
+format may be read or written. storage_image_multisample is the
 shaderStorageImageMultisample feature, which enables both StorageImageMultisample
-and ImageMSArray, so a storage image may be multisampled, arrayed or not (#4298).
+and ImageMSArray, so a storage image may be multisampled, arrayed or not.
 resource_min_lod is the shaderResourceMinLod feature, which enables MinLod, so a
 sample may name the least level of detail it reads. image_gather_extended is the
 shaderImageGatherExtended feature, which enables ImageGatherExtended, so a gather
 may take an offset computed at run time. maintenance8 is the
 maintenance8 feature, under which a fetch or a sample takes a run-time offset too
-(VUID-RuntimeSpirv-Offset-10213) (#4303).
+(VUID-RuntimeSpirv-Offset-10213).
 vulkan_memory_model is the vulkanMemoryModel feature, and holding it selects the
 Vulkan memory model in place of GLSL450. vulkan_memory_model_device_scope is
-vulkanMemoryModelDeviceScope, which the Device scope needs under that model (#4308).
+vulkanMemoryModelDeviceScope, which the Device scope needs under that model.
 int8, int16, int64, float16 and float64 are the shaderInt8, shaderInt16, shaderInt64,
 shaderFloat16 and shaderFloat64 features, which no Vulkan version guarantees: an
-environment's ceiling only admits their capabilities (#4318). under int8 and int16 an
+environment's ceiling only admits their capabilities. under int8 and int16 an
 integer of that width is computed at its own width rather than carried in a wider
-one (#4302), and under float16 an f16 is the native OpTypeFloat 16 (#3801).
+one, and under float16 an f16 is the native OpTypeFloat 16.
 buffer_device_address is the bufferDeviceAddress feature, under which a pointer held in
-memory is a physical pointer into a buffer the host passes by address (#4307).
+memory is a physical pointer into a buffer the host passes by address.
 the storage features are Vulkan's 16- and 8-bit storage features, each the one
 capability of its name: storage_buffer_16bit_access is storageBuffer16BitAccess,
 so a storage buffer, or a buffer reached through a physical pointer, may hold a
 16-bit member, uniform_and_storage_buffer_16bit_access
 a uniform block, storage_push_constant16 a push block and storage_input_output16 a
 stage interface, and the 8-bit three the same for an 8-bit member. no Vulkan version
-guarantees one, and Vulkan has no 8-bit stage interface (#4299)
+guarantees one, and Vulkan has no 8-bit stage interface
 
 ## val EXT_ZERO_INIT_WORKGROUP
 

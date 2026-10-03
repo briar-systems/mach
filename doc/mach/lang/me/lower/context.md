@@ -423,7 +423,7 @@ pub rec FnSig;
 ```
 
 a function's signature and the extension each parameter declares, which the
-signless signature does not carry (#3927)
+signless signature does not carry
 
 ## fun lower_fn_sig
 

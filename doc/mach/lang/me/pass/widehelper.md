@@ -6,7 +6,7 @@ division and remainder (widediv) and the float conversions (wideconv). a
 helper is an ordinary function of the module that needs it, weak so every
 module's copy coalesces at link, as a generic instantiation does, and never
 inlined so a program pays for the code once. this module holds what the two
-passes share: the width test and the function synthesis (#3511)
+passes share: the width test and the function synthesis
 
 ## fun wide_bits
 

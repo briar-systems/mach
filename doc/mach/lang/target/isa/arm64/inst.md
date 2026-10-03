@@ -852,7 +852,7 @@ pub val DSB: MachOp = 135
 ```
 
 the data synchronization and instruction synchronization barriers and the
-FEAT_SB speculation barrier, reached only from inline asm (#3508)
+FEAT_SB speculation barrier, reached only from inline asm
 
 ## val ISB
 
@@ -902,7 +902,7 @@ pub val CSETM: MachOp = 142
 ```
 
 all ones when the condition holds, zero otherwise: csinv rd, zr, zr of the
-inverted condition, the mask a saturating shift keeps its result by (#3885)
+inverted condition, the mask a saturating shift keeps its result by
 
 ## val AESE
 
@@ -911,7 +911,7 @@ pub val AESE:   MachOp = 143
 ```
 
 the aes rounds and mix-columns steps under aes, and the 64x64 carry-less
-multiply under pmull, reached only from inline asm (#3835)
+multiply under pmull, reached only from inline asm
 
 ## val AESD
 
@@ -950,7 +950,7 @@ pub val V_SMULL2: MachOp = 149
 ```
 
 the long multiplies of the upper halves, and the byte extract across two
-registers a lane range and a lane join are made of (#3589)
+registers a lane range and a lane join are made of
 
 ## val V_UMULL2
 
@@ -971,7 +971,7 @@ pub val CSEL: MachOp = 152
 ```
 
 the first source when the condition holds, else the second: the
-branch-free select (#3346)
+branch-free select
 
 ## val V_USHL
 
@@ -979,7 +979,7 @@ branch-free select (#3346)
 pub val V_USHL:  MachOp = 153
 ```
 
-the lane-wise shifts (#3852): ushl and sshl by a count per lane, whose low
+the lane-wise shifts: ushl and sshl by a count per lane, whose low
 byte is read as signed and shifts right when negative; the vector negate
 that turns a right shift's count into that; shl, ushr and sshr by an
 immediate; uqshl by an immediate, the saturating shift a count is clamped
@@ -1035,7 +1035,7 @@ pub val REV:     MachOp = 161
 
 the byte reversal of a general register, the byte reversal within each
 doubleword of a vector, and the vector broadcast of one lane, reached only
-from inline asm (#3915)
+from inline asm
 
 ## val V_REV64
 
@@ -1068,8 +1068,8 @@ pub def Layout: u8
 ```
 
 the operand layout of a member: what its operands are, how they pack into
-the word and how the printer lays the line out. this is the form byte the
-printer-private record used to carry, now a column of the member's row
+the word and how the printer lays the line out. this is a column of the member's
+row
 
 ## val L_ALU3
 

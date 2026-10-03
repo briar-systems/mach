@@ -1,6 +1,6 @@
 # mach.lang.me.transform.ifconv
 
-if-conversion of small diamonds (#3346)
+if-conversion of small diamonds
 
 a block ending in a conditional branch whose arms are blocks entered only
 from it and leaving straight to one join (a diamond), or whose one arm does

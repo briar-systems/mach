@@ -378,7 +378,7 @@ pub val AMBIGUOUS_PROFILE_MSG:  str = "mach.toml: several profiles are declared 
 ```
 
 a selection several candidates could satisfy is refused where a command
-must pick one; table order carries no meaning (#3222, #3226)
+must pick one; table order carries no meaning
 
 ## val AMBIGUOUS_ARTIFACT_MSG
 

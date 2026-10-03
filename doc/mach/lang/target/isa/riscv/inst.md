@@ -859,7 +859,7 @@ pub val CZERO_EQZ: MachOp = 141
 ```
 
 zero when the condition register is zero (eqz) or nonzero (nez), else the
-first source: the Zicond halves of a branch-free select (#3346)
+first source: the Zicond halves of a branch-free select
 
 ## val CZERO_NEZ
 
@@ -873,7 +873,7 @@ pub val CZERO_NEZ: MachOp = 142
 pub val FLH:       MachOp = 143
 ```
 
-the half-precision forms (#3801): Zfhmin's loads, stores, moves and
+the half-precision forms: Zfhmin's loads, stores, moves and
 conversions between formats, and Zfh's arithmetic, sign injection,
 comparisons and integer conversions
 

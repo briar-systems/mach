@@ -125,7 +125,7 @@ path above makes the one the target's native half instruction would.
 x86-64's native rows under AVX-512 FP16 are #4159.
 
 That is proven, not assumed: the exhaustive proof `test/run.sh --f16proof`
-(#3804) checks every pair of `f16` operands for each operator, and every input of
+checks every pair of `f16` operands for each operator, and every input of
 the `f16` conversions, against a reference computed in integers. On x86-64 with
 and without `x86-64-v3`, aarch64 with and without `fp16`, and riscv64 with and
 without `zfh` (under qemu-user), every result is bit-identical to it, NaNs by the
@@ -644,7 +644,7 @@ hardware compare yields. There is no vector-bool type. The mask element is the
 unsigned integer of the input's lane width: `f32x4` / `i32x4` / `u32x4` → `u32x4`;
 `f64x2` / `i64x2` → `u64x2`; `f16x8` / `i16x8` → `u16x8`; `i8x16` → `u8x16`. Select/blend is
 not an operator; it is the library idiom `(mask & a) | (~mask & b)` over matching
-integer lanes (the tier-3 simd library, #2021).
+integer lanes (the tier-3 simd library).
 
 ```mach fragment
 val a: f32x4 = f32x4{1.0, 2.0, 3.0, 4.0};

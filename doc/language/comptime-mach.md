@@ -74,7 +74,7 @@ $or {
   / `wide_s` at every width on every OS. aarch64 declares `low` at every width,
   `high_u` and `high_s` at 64 and `wide_u` / `wide_s` at 32 under PSTATE.DIT,
   which linux and darwin declare they guarantee, so the query folds to 1 there
-  and to 0 on aarch64-windows and freestanding aarch64 (#3508, see
+  and to 0 on aarch64-windows and freestanding aarch64 (see
   [secrecy.md](secrecy.md#pstatedit-at-run-time)). Every other target folds to
   0. Lane multiplies are not part of the query.
 - The result is a `u8`, like `$mach.build.pie`. An unknown `op` or `width`, a

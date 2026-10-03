@@ -84,7 +84,7 @@ pub fun push_pending_dbg(ctx: *LowerCtx, iid: u32, vreg: u32) err[fail.Fail];
 pub fun push_pending_dbg_piece(ctx: *LowerCtx, iid: u32, vreg: u32, lane: u8, lanes: u8, lane_bytes: u8, last_bytes: u8) err[fail.Fail];
 ```
 
-a pending binding of one piece of a value held in several registers (#3589)
+a pending binding of one piece of a value held in several registers
 
 ## fun drain_pending_dbg
 
@@ -190,7 +190,7 @@ pub fun fn_return_type(ctx: *LowerCtx) ir_type.IrTypeId;
 pub fun is_result_image(ctx: *LowerCtx, iid: ir_id.InstructionId) bool;
 ```
 
-the alloca `iid` is the result storage the caller passed (#4120)
+the alloca `iid` is the result storage the caller passed
 
 ## fun names_tail_call
 
