@@ -1,5 +1,15 @@
 # mach.lang.fe.sema
 
+sema: types a module, and what it publishes for the phases after it
+
+## fwd sema_module.sema
+
+```mach
+fwd sema_module.sema
+```
+
+forwards [`mach.lang.fe.sema.module.sema`](sema/module.md#fun-sema)
+
 ## fwd sema_product.SemaResult
 
 ```mach
@@ -175,20 +185,4 @@ fwd mach.lang.fe.sema.instance
 ```
 
 forwards [`mach.lang.fe.sema.instance`](sema/instance.md)
-
-## fun sema
-
-```mach
-pub fun sema(
-s: *session.Session,
-a: *ast.Ast,
-rr: *resolve.ResolveResult,
-deps: *sema_product.SemaDeps,
-load: *comptime.ComptimeCtx,
-own_module: session.ModuleId,
-diags: *diagnostic.DiagnosticStore) res[sema_product.SemaResult, fail.Fail];
-```
-
-type a module in a scope over the load's, `load`, and resolve's bindings in `rr`, which sema
-reads and never writes; what sema binds is its result's
 
