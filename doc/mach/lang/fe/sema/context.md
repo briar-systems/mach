@@ -72,7 +72,7 @@ pub rec Definition;
 a module's definition as far as a phase acquired it
 
 ctx: the scope its constants are read in, once typed
-attributes: a scope that reads the load's records of its attributes, at every phase
+decorators: a scope that reads the load's records of its decorators, at every phase
 
 ## rec DefinitionReader
 
@@ -552,15 +552,15 @@ pub fun record_result(sc: *SemaContext, r: err[fail.Fail]);
 pub fun record_eval_result(sc: *SemaContext, r: res[comptime.CTValue, comptime.EvalFail]);
 ```
 
-## fun attr_string_arg
+## fun decorator_string_arg
 
 ```mach
-pub fun attr_string_arg(sc: *SemaContext, dec: *ast_decl.Decorator, ord: u32, kind: diagnostic_kind.Kind, kind_msg: str) opt[str];
+pub fun decorator_string_arg(sc: *SemaContext, dec: *ast_decl.Decorator, ord: u32, kind: diagnostic_kind.Kind, kind_msg: str) opt[str];
 ```
 
-the string argument `ord` of an attribute evaluates to. one that is
+the string argument `ord` of a decorator evaluates to. one that is
 not a constant expression is refused with `decorator.not_constant`, naming
-the attribute, and a constant that is no string with `kind` and `kind_msg`
+the decorator, and a constant that is no string with `kind` and `kind_msg`
 
 ## fun require_constant_arg
 
