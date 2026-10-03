@@ -35,7 +35,7 @@ revision the checkout lacks is fetched, which `offline` refuses; the caller free
 ## fun manifest_at
 
 ```mach
-pub fun manifest_at(alloc: *A.Allocator, dir: str, rev: str) res[manifest.Doc, fail.Fail];
+pub fun manifest_at(s: *session.Session, alloc: *A.Allocator, dir: str, rev: str) res[manifest.Doc, fail.Fail];
 ```
 
 the manifest the commit `rev` of the repository at `dir` holds, allocated from `alloc`

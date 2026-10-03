@@ -8,14 +8,13 @@ pub tag Error: u8 {
     absent;
     foreign;
     stale;
-    outdated;
     busy;
 }
 ```
 
 a store's refusal: the allocator's, a store or editor that is not live, an
 identifier that belongs to another store, one whose slot was reused since
-it was issued, a view outdated by a mutation, or a second exclusive editor
+it was issued, or a second exclusive editor
 
 ## fun text
 
