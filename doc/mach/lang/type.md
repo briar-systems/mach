@@ -1,276 +1,564 @@
 # mach.lang.type
 
-## def TypeId
+## fwd type_kind.TypeId
 
 ```mach
-pub def TypeId: u32
+fwd type_kind.TypeId
 ```
 
-## val TYPE_NIL
+forwards [`mach.lang.type.kind.TypeId`](type/kind.md#def-typeid)
+
+## fwd type_kind.TYPE_NIL
 
 ```mach
-pub val TYPE_NIL:   TypeId = 0xFFFFFFFF
+fwd type_kind.TYPE_NIL
 ```
 
-## val TYPE_ERROR
+forwards [`mach.lang.type.kind.TYPE_NIL`](type/kind.md#val-type_nil)
+
+## fwd type_kind.TYPE_ERROR
 
 ```mach
-pub val TYPE_ERROR: TypeId = 0xFFFFFFFE
+fwd type_kind.TYPE_ERROR
 ```
 
-## def TypeKind
+forwards [`mach.lang.type.kind.TYPE_ERROR`](type/kind.md#val-type_error)
+
+## fwd type_kind.TypeKind
 
 ```mach
-pub def TypeKind: u8
+fwd type_kind.TypeKind
 ```
 
-## val TYPE_U8
+forwards [`mach.lang.type.kind.TypeKind`](type/kind.md#def-typekind)
+
+## fwd type_kind.TYPE_U8
 
 ```mach
-pub val TYPE_U8:    TypeKind = 0
+fwd type_kind.TYPE_U8
 ```
 
-## val TYPE_U16
+forwards [`mach.lang.type.kind.TYPE_U8`](type/kind.md#val-type_u8)
+
+## fwd type_kind.TYPE_U16
 
 ```mach
-pub val TYPE_U16:   TypeKind = 1
+fwd type_kind.TYPE_U16
 ```
 
-## val TYPE_U32
+forwards [`mach.lang.type.kind.TYPE_U16`](type/kind.md#val-type_u16)
+
+## fwd type_kind.TYPE_U32
 
 ```mach
-pub val TYPE_U32:   TypeKind = 2
+fwd type_kind.TYPE_U32
 ```
 
-## val TYPE_U64
+forwards [`mach.lang.type.kind.TYPE_U32`](type/kind.md#val-type_u32)
+
+## fwd type_kind.TYPE_U64
 
 ```mach
-pub val TYPE_U64:   TypeKind = 3
+fwd type_kind.TYPE_U64
 ```
 
-## val TYPE_I8
+forwards [`mach.lang.type.kind.TYPE_U64`](type/kind.md#val-type_u64)
+
+## fwd type_kind.TYPE_I8
 
 ```mach
-pub val TYPE_I8:    TypeKind = 4
+fwd type_kind.TYPE_I8
 ```
 
-## val TYPE_I16
+forwards [`mach.lang.type.kind.TYPE_I8`](type/kind.md#val-type_i8)
+
+## fwd type_kind.TYPE_I16
 
 ```mach
-pub val TYPE_I16:   TypeKind = 5
+fwd type_kind.TYPE_I16
 ```
 
-## val TYPE_I32
+forwards [`mach.lang.type.kind.TYPE_I16`](type/kind.md#val-type_i16)
+
+## fwd type_kind.TYPE_I32
 
 ```mach
-pub val TYPE_I32:   TypeKind = 6
+fwd type_kind.TYPE_I32
 ```
 
-## val TYPE_I64
+forwards [`mach.lang.type.kind.TYPE_I32`](type/kind.md#val-type_i32)
+
+## fwd type_kind.TYPE_I64
 
 ```mach
-pub val TYPE_I64:   TypeKind = 7
+fwd type_kind.TYPE_I64
 ```
 
-## val TYPE_F32
+forwards [`mach.lang.type.kind.TYPE_I64`](type/kind.md#val-type_i64)
+
+## fwd type_kind.TYPE_F32
 
 ```mach
-pub val TYPE_F32:   TypeKind = 8
+fwd type_kind.TYPE_F32
 ```
 
-## val TYPE_F64
+forwards [`mach.lang.type.kind.TYPE_F32`](type/kind.md#val-type_f32)
+
+## fwd type_kind.TYPE_F64
 
 ```mach
-pub val TYPE_F64:   TypeKind = 9
+fwd type_kind.TYPE_F64
 ```
 
-## val TYPE_PTR
+forwards [`mach.lang.type.kind.TYPE_F64`](type/kind.md#val-type_f64)
+
+## fwd type_kind.TYPE_PTR
 
 ```mach
-pub val TYPE_PTR:   TypeKind = 10
+fwd type_kind.TYPE_PTR
 ```
 
-## val PRIM_COUNT
+forwards [`mach.lang.type.kind.TYPE_PTR`](type/kind.md#val-type_ptr)
+
+## fwd type_kind.TYPE_POINTER
 
 ```mach
-pub val PRIM_COUNT: u32      = 14
+fwd type_kind.TYPE_POINTER
 ```
 
-## val TYPE_POINTER
+forwards [`mach.lang.type.kind.TYPE_POINTER`](type/kind.md#val-type_pointer)
+
+## fwd type_kind.TYPE_ARRAY
 
 ```mach
-pub val TYPE_POINTER:       TypeKind = 11
+fwd type_kind.TYPE_ARRAY
 ```
 
-## val TYPE_ARRAY
+forwards [`mach.lang.type.kind.TYPE_ARRAY`](type/kind.md#val-type_array)
+
+## fwd type_kind.TYPE_FUN
 
 ```mach
-pub val TYPE_ARRAY:         TypeKind = 12
+fwd type_kind.TYPE_FUN
 ```
 
-## val TYPE_FUN
+forwards [`mach.lang.type.kind.TYPE_FUN`](type/kind.md#val-type_fun)
+
+## fwd type_kind.TYPE_REC
 
 ```mach
-pub val TYPE_FUN:           TypeKind = 13
+fwd type_kind.TYPE_REC
 ```
 
-## val TYPE_REC
+forwards [`mach.lang.type.kind.TYPE_REC`](type/kind.md#val-type_rec)
+
+## fwd type_kind.TYPE_UNI
 
 ```mach
-pub val TYPE_REC:           TypeKind = 14
+fwd type_kind.TYPE_UNI
 ```
 
-## val TYPE_UNI
+forwards [`mach.lang.type.kind.TYPE_UNI`](type/kind.md#val-type_uni)
+
+## fwd type_kind.TYPE_GENERIC_PARAM
 
 ```mach
-pub val TYPE_UNI:           TypeKind = 15
+fwd type_kind.TYPE_GENERIC_PARAM
 ```
 
-## val TYPE_GENERIC_PARAM
+forwards [`mach.lang.type.kind.TYPE_GENERIC_PARAM`](type/kind.md#val-type_generic_param)
+
+## fwd type_kind.TYPE_INSTANCE
 
 ```mach
-pub val TYPE_GENERIC_PARAM: TypeKind = 16
+fwd type_kind.TYPE_INSTANCE
 ```
 
-## val TYPE_INSTANCE
+forwards [`mach.lang.type.kind.TYPE_INSTANCE`](type/kind.md#val-type_instance)
+
+## fwd type_kind.TYPE_PACK
 
 ```mach
-pub val TYPE_INSTANCE:      TypeKind = 17
+fwd type_kind.TYPE_PACK
 ```
 
-## val TYPE_PACK
+forwards [`mach.lang.type.kind.TYPE_PACK`](type/kind.md#val-type_pack)
+
+## fwd type_kind.TYPE_SECRET
 
 ```mach
-pub val TYPE_PACK: TypeKind = 18
+fwd type_kind.TYPE_SECRET
 ```
 
-## val TYPE_SECRET
+forwards [`mach.lang.type.kind.TYPE_SECRET`](type/kind.md#val-type_secret)
+
+## fwd type_kind.TYPE_VECTOR
 
 ```mach
-pub val TYPE_SECRET: TypeKind = 19
+fwd type_kind.TYPE_VECTOR
 ```
 
-## val TYPE_VECTOR
+forwards [`mach.lang.type.kind.TYPE_VECTOR`](type/kind.md#val-type_vector)
+
+## fwd type_kind.TYPE_HANDLE
 
 ```mach
-pub val TYPE_VECTOR: TypeKind = 20
+fwd type_kind.TYPE_HANDLE
 ```
 
-## val TYPE_HANDLE
+forwards [`mach.lang.type.kind.TYPE_HANDLE`](type/kind.md#val-type_handle)
+
+## fwd type_kind.TYPE_ABI
 
 ```mach
-pub val TYPE_HANDLE: TypeKind = 21
+fwd type_kind.TYPE_ABI
 ```
 
-## val TYPE_ABI
+forwards [`mach.lang.type.kind.TYPE_ABI`](type/kind.md#val-type_abi)
+
+## fwd type_kind.TYPE_TAG
 
 ```mach
-pub val TYPE_ABI: TypeKind = 22
+fwd type_kind.TYPE_TAG
 ```
 
-## val TYPE_TAG
+forwards [`mach.lang.type.kind.TYPE_TAG`](type/kind.md#val-type_tag)
+
+## fwd type_kind.TYPE_CASE_SELECTOR
 
 ```mach
-pub val TYPE_TAG: TypeKind = 23
+fwd type_kind.TYPE_CASE_SELECTOR
 ```
 
-## val TYPE_CASE_SELECTOR
+forwards [`mach.lang.type.kind.TYPE_CASE_SELECTOR`](type/kind.md#val-type_case_selector)
+
+## fwd type_kind.TYPE_U128
 
 ```mach
-pub val TYPE_CASE_SELECTOR: TypeKind = 24
+fwd type_kind.TYPE_U128
 ```
 
-## val TYPE_U128
+forwards [`mach.lang.type.kind.TYPE_U128`](type/kind.md#val-type_u128)
+
+## fwd type_kind.TYPE_I128
 
 ```mach
-pub val TYPE_U128: TypeKind = 25
+fwd type_kind.TYPE_I128
 ```
 
-the 128-bit integers are appended kinds: the catalog, never the
-numbering, decides what is primitive
+forwards [`mach.lang.type.kind.TYPE_I128`](type/kind.md#val-type_i128)
 
-## val TYPE_I128
+## fwd type_kind.TYPE_F16
 
 ```mach
-pub val TYPE_I128: TypeKind = 26
+fwd type_kind.TYPE_F16
 ```
 
-## val TYPE_F16
+forwards [`mach.lang.type.kind.TYPE_F16`](type/kind.md#val-type_f16)
+
+## fwd type_kind.TYPE_KIND_COUNT
 
 ```mach
-pub val TYPE_F16: TypeKind = 27
+fwd type_kind.TYPE_KIND_COUNT
 ```
 
-IEEE binary16, appended like the 128-bit integers
+forwards [`mach.lang.type.kind.TYPE_KIND_COUNT`](type/kind.md#val-type_kind_count)
 
-## val TYPE_KIND_COUNT
+## fwd type_prim.PRIM_COUNT
 
 ```mach
-pub val TYPE_KIND_COUNT: u32 = TYPE_F16::u32 + 1
+fwd type_prim.PRIM_COUNT
 ```
 
-one past the last kind, so an appended kind takes over this reference. the
-type table refuses a kind at or past it, so a walker over 0..TYPE_KIND_COUNT
-meets every kind a type can carry
+forwards [`mach.lang.type.prim.PRIM_COUNT`](type/prim.md#val-prim_count)
 
-## def PrimClass
+## fwd type_prim.PrimClass
 
 ```mach
-pub def PrimClass: u8
+fwd type_prim.PrimClass
 ```
 
-## val PRIM_CLASS_NONE
+forwards [`mach.lang.type.prim.PrimClass`](type/prim.md#def-primclass)
+
+## fwd type_prim.PRIM_CLASS_NONE
 
 ```mach
-pub val PRIM_CLASS_NONE:  PrimClass = 0
+fwd type_prim.PRIM_CLASS_NONE
 ```
 
-## val PRIM_CLASS_INT
+forwards [`mach.lang.type.prim.PRIM_CLASS_NONE`](type/prim.md#val-prim_class_none)
+
+## fwd type_prim.PRIM_CLASS_INT
 
 ```mach
-pub val PRIM_CLASS_INT:   PrimClass = 1
+fwd type_prim.PRIM_CLASS_INT
 ```
 
-## val PRIM_CLASS_FLOAT
+forwards [`mach.lang.type.prim.PRIM_CLASS_INT`](type/prim.md#val-prim_class_int)
+
+## fwd type_prim.PRIM_CLASS_FLOAT
 
 ```mach
-pub val PRIM_CLASS_FLOAT: PrimClass = 2
+fwd type_prim.PRIM_CLASS_FLOAT
 ```
 
-## val PRIM_CLASS_PTR
+forwards [`mach.lang.type.prim.PRIM_CLASS_FLOAT`](type/prim.md#val-prim_class_float)
+
+## fwd type_prim.PRIM_CLASS_PTR
 
 ```mach
-pub val PRIM_CLASS_PTR:   PrimClass = 3
+fwd type_prim.PRIM_CLASS_PTR
 ```
 
-## rec PrimDesc
+forwards [`mach.lang.type.prim.PRIM_CLASS_PTR`](type/prim.md#val-prim_class_ptr)
+
+## fwd type_prim.PrimDesc
 
 ```mach
-pub rec PrimDesc;
+fwd type_prim.PrimDesc
 ```
 
-## fun is_prim
+forwards [`mach.lang.type.prim.PrimDesc`](type/prim.md#rec-primdesc)
+
+## fwd type_prim.is_prim
 
 ```mach
-pub fun is_prim(kind: TypeKind) bool;
+fwd type_prim.is_prim
 ```
 
-the primitive predicate: a kind is primitive exactly when the catalog names
-it, never because of where it sits in the TypeKind numbering
+forwards [`mach.lang.type.prim.is_prim`](type/prim.md#fun-is_prim)
 
-## fun prim_kind_at
+## fwd type_prim.prim_kind_at
 
 ```mach
-pub fun prim_kind_at(index: u32) TypeKind;
+fwd type_prim.prim_kind_at
 ```
 
-the kind at a catalog position, for walkers over 0..PRIM_COUNT
+forwards [`mach.lang.type.prim.prim_kind_at`](type/prim.md#fun-prim_kind_at)
 
-## fun prim_desc
+## fwd type_prim.prim_desc
 
 ```mach
-pub fun prim_desc(kind: TypeKind) PrimDesc;
+fwd type_prim.prim_desc
 ```
+
+forwards [`mach.lang.type.prim.prim_desc`](type/prim.md#fun-prim_desc)
+
+## fwd type_prim.prim_name
+
+```mach
+fwd type_prim.prim_name
+```
+
+forwards [`mach.lang.type.prim.prim_name`](type/prim.md#fun-prim_name)
+
+## fwd type_prim.prim_spelling_len
+
+```mach
+fwd type_prim.prim_spelling_len
+```
+
+forwards [`mach.lang.type.prim.prim_spelling_len`](type/prim.md#fun-prim_spelling_len)
+
+## fwd type_prim.int_kind_for
+
+```mach
+fwd type_prim.int_kind_for
+```
+
+forwards [`mach.lang.type.prim.int_kind_for`](type/prim.md#fun-int_kind_for)
+
+## fwd type_prim.prim_from_view
+
+```mach
+fwd type_prim.prim_from_view
+```
+
+forwards [`mach.lang.type.prim.prim_from_view`](type/prim.md#fun-prim_from_view)
+
+## fwd type_prim.IntRange
+
+```mach
+fwd type_prim.IntRange
+```
+
+forwards [`mach.lang.type.prim.IntRange`](type/prim.md#rec-intrange)
+
+## fwd type_prim.int_range
+
+```mach
+fwd type_prim.int_range
+```
+
+forwards [`mach.lang.type.prim.int_range`](type/prim.md#fun-int_range)
+
+## fwd type_prim.int_fits
+
+```mach
+fwd type_prim.int_fits
+```
+
+forwards [`mach.lang.type.prim.int_fits`](type/prim.md#fun-int_fits)
+
+## fwd type_prim.int_fits_either_sign
+
+```mach
+fwd type_prim.int_fits_either_sign
+```
+
+forwards [`mach.lang.type.prim.int_fits_either_sign`](type/prim.md#fun-int_fits_either_sign)
+
+## fwd type_prim.float_width_of
+
+```mach
+fwd type_prim.float_width_of
+```
+
+forwards [`mach.lang.type.prim.float_width_of`](type/prim.md#fun-float_width_of)
+
+## fwd type_prim.float_kind_of
+
+```mach
+fwd type_prim.float_kind_of
+```
+
+forwards [`mach.lang.type.prim.float_kind_of`](type/prim.md#fun-float_kind_of)
+
+## fwd type_prim.MAX_VEC_LANES
+
+```mach
+fwd type_prim.MAX_VEC_LANES
+```
+
+forwards [`mach.lang.type.prim.MAX_VEC_LANES`](type/prim.md#val-max_vec_lanes)
+
+## fwd type_prim.VEC_FORM_NONE
+
+```mach
+fwd type_prim.VEC_FORM_NONE
+```
+
+forwards [`mach.lang.type.prim.VEC_FORM_NONE`](type/prim.md#val-vec_form_none)
+
+## fwd type_prim.VEC_FORM_OK
+
+```mach
+fwd type_prim.VEC_FORM_OK
+```
+
+forwards [`mach.lang.type.prim.VEC_FORM_OK`](type/prim.md#val-vec_form_ok)
+
+## fwd type_prim.VEC_FORM_TOO_WIDE
+
+```mach
+fwd type_prim.VEC_FORM_TOO_WIDE
+```
+
+forwards [`mach.lang.type.prim.VEC_FORM_TOO_WIDE`](type/prim.md#val-vec_form_too_wide)
+
+## fwd type_prim.VEC_FORM_BAD_ELEMENT
+
+```mach
+fwd type_prim.VEC_FORM_BAD_ELEMENT
+```
+
+forwards [`mach.lang.type.prim.VEC_FORM_BAD_ELEMENT`](type/prim.md#val-vec_form_bad_element)
+
+## fwd type_prim.VEC_LANE_MIN_BITS
+
+```mach
+fwd type_prim.VEC_LANE_MIN_BITS
+```
+
+forwards [`mach.lang.type.prim.VEC_LANE_MIN_BITS`](type/prim.md#val-vec_lane_min_bits)
+
+## fwd type_prim.VEC_LANE_MAX_BITS
+
+```mach
+fwd type_prim.VEC_LANE_MAX_BITS
+```
+
+forwards [`mach.lang.type.prim.VEC_LANE_MAX_BITS`](type/prim.md#val-vec_lane_max_bits)
+
+## fwd type_prim.VecForm
+
+```mach
+fwd type_prim.VecForm
+```
+
+forwards [`mach.lang.type.prim.VecForm`](type/prim.md#rec-vecform)
+
+## fwd type_prim.is_vector_spelling
+
+```mach
+fwd type_prim.is_vector_spelling
+```
+
+forwards [`mach.lang.type.prim.is_vector_spelling`](type/prim.md#fun-is_vector_spelling)
+
+## fwd type_prim.vector_form
+
+```mach
+fwd type_prim.vector_form
+```
+
+forwards [`mach.lang.type.prim.vector_form`](type/prim.md#fun-vector_form)
+
+## fwd TypeScan
+
+```mach
+fwd TypeScan:  type_scan.Scan
+```
+
+forwards [`mach.lang.type.scan.Scan`](type/scan.md#rec-scan)
+
+## fwd PairScan
+
+```mach
+fwd PairScan:  type_scan.Pair
+```
+
+forwards [`mach.lang.type.scan.Pair`](type/scan.md#rec-pair)
+
+## fwd VisitMark
+
+```mach
+fwd VisitMark: type_scan.Mark
+```
+
+forwards [`mach.lang.type.scan.Mark`](type/scan.md#def-mark)
+
+## fwd type_scan.VISIT_FRESH
+
+```mach
+fwd type_scan.VISIT_FRESH
+```
+
+forwards [`mach.lang.type.scan.VISIT_FRESH`](type/scan.md#val-visit_fresh)
+
+## fwd type_scan.VISIT_SEEN
+
+```mach
+fwd type_scan.VISIT_SEEN
+```
+
+forwards [`mach.lang.type.scan.VISIT_SEEN`](type/scan.md#val-visit_seen)
+
+## fwd FieldEntry
+
+```mach
+fwd FieldEntry: type_field.Entry
+```
+
+forwards [`mach.lang.type.field.Entry`](type/field.md#rec-entry)
+
+## fwd FieldTable
+
+```mach
+fwd FieldTable: type_field.Table
+```
+
+forwards [`mach.lang.type.field.Table`](type/field.md#rec-table)
 
 ## rec TypeSecret
 
@@ -297,138 +585,6 @@ pub fun abi_type_c_name(tag: u32) opt[str];
 ```
 
 the C type an ABI type tag stands for, absent for a tag outside the catalog
-
-## fun prim_name
-
-```mach
-pub fun prim_name(kind: TypeKind) str;
-```
-
-## fun prim_spelling_len
-
-```mach
-pub fun prim_spelling_len(kind: TypeKind) usize;
-```
-
-## fun int_kind_for
-
-```mach
-pub fun int_kind_for(bits: u32, signed: bool) opt[TypeKind];
-```
-
-the integer primitive of a width and signedness, absent when the catalog has
-no such row; the one lookup every width-driven typing goes through
-
-## fun prim_from_view
-
-```mach
-pub fun prim_from_view(name: View) opt[TypeKind];
-```
-
-## rec IntRange
-
-```mach
-pub rec IntRange;
-```
-
-the magnitudes an integer kind admits: min_mag is the largest negated value
-(the signed minimum), max_mag the largest positive one, both exact to 128 bits
-
-## fun int_range
-
-```mach
-pub fun int_range(kind: TypeKind) opt[IntRange];
-```
-
-## fun int_fits
-
-```mach
-pub fun int_fits(value: wide.Wide, negated: bool, r: IntRange) bool;
-```
-
-## fun int_fits_either_sign
-
-```mach
-pub fun int_fits_either_sign(value: wide.Wide, kind: TypeKind) bool;
-```
-
-## fun float_width_of
-
-```mach
-pub fun float_width_of(kind: TypeKind) float.FloatWidth;
-```
-
-the width of a float kind; FLOAT_W_NONE for every other kind
-
-## fun float_kind_of
-
-```mach
-pub fun float_kind_of(w: float.FloatWidth) TypeKind;
-```
-
-the float kind of a width, f64 for FLOAT_W_NONE, the unsuffixed default
-
-## val MAX_VEC_LANES
-
-```mach
-pub val MAX_VEC_LANES: u32 = 65535
-```
-
-## val VEC_FORM_NONE
-
-```mach
-pub val VEC_FORM_NONE:      VecFormStatus = 0
-```
-
-## val VEC_FORM_OK
-
-```mach
-pub val VEC_FORM_OK:        VecFormStatus = 1
-```
-
-## val VEC_FORM_TOO_WIDE
-
-```mach
-pub val VEC_FORM_TOO_WIDE:  VecFormStatus = 2
-```
-
-## val VEC_FORM_BAD_ELEMENT
-
-```mach
-pub val VEC_FORM_BAD_ELEMENT: VecFormStatus = 4
-```
-
-the element is a primitive no vector packs: a lane is 8 to 64 bits wide
-
-## val VEC_LANE_MIN_BITS
-
-```mach
-pub val VEC_LANE_MIN_BITS: u32 = 8
-```
-
-## val VEC_LANE_MAX_BITS
-
-```mach
-pub val VEC_LANE_MAX_BITS: u32 = 64
-```
-
-## rec VecForm
-
-```mach
-pub rec VecForm;
-```
-
-## fun is_vector_spelling
-
-```mach
-pub fun is_vector_spelling(name: str) bool;
-```
-
-## fun vector_form
-
-```mach
-pub fun vector_form(name: str) VecForm;
-```
 
 ## rec TypeArray
 
@@ -487,18 +643,6 @@ pub fun param_owned_by(p: *TypeGenericParam, who: *GenericOwner) bool;
 
 ```mach
 pub rec Type;
-```
-
-## rec FieldEntry
-
-```mach
-pub rec FieldEntry;
-```
-
-## rec FieldTable
-
-```mach
-pub rec FieldTable;
 ```
 
 ## rec TypeInterner
@@ -654,30 +798,6 @@ pub fun contains_secret(ti: *TypeInterner, tid: TypeId) bool;
 true when any byte of a value of this type may be secret: the type itself, an element, a field or a case
 payload; a pointer's pointee is not the object's storage and does not count
 
-## rec TypeScan
-
-```mach
-pub rec TypeScan;
-```
-
-## def VisitMark
-
-```mach
-pub def VisitMark: u8
-```
-
-## val VISIT_FRESH
-
-```mach
-pub val VISIT_FRESH: VisitMark = 0
-```
-
-## val VISIT_SEEN
-
-```mach
-pub val VISIT_SEEN:  VisitMark = 1
-```
-
 ## fun type_scan_begin
 
 ```mach
@@ -696,12 +816,6 @@ pub fun type_scan_end(ti: *TypeInterner, scan: *TypeScan);
 pub fun type_scan_mark(ti: *TypeInterner, scan: *TypeScan, tid: TypeId) res[VisitMark, fail.Fail];
 ```
 
-## rec PairScan
-
-```mach
-pub rec PairScan;
-```
-
 ## fun pair_scan_begin
 
 ```mach
@@ -718,36 +832,6 @@ pub fun pair_scan_end(ti: *TypeInterner, scan: *PairScan);
 
 ```mach
 pub fun pair_scan_mark(ti: *TypeInterner, scan: *PairScan, a: TypeId, b: TypeId) res[VisitMark, fail.Fail];
-```
-
-## def GParamMemo
-
-```mach
-pub def GParamMemo: u8
-```
-
-## val GPARAM_NO
-
-```mach
-pub val GPARAM_NO:      GParamMemo = 1
-```
-
-## val GPARAM_YES
-
-```mach
-pub val GPARAM_YES:     GParamMemo = 2
-```
-
-## fun gparam_memo_get
-
-```mach
-pub fun gparam_memo_get(ti: *TypeInterner, tid: TypeId) GParamMemo;
-```
-
-## fun gparam_memo_set
-
-```mach
-pub fun gparam_memo_set(ti: *TypeInterner, tid: TypeId, mentions: bool);
 ```
 
 ## fun intern_pointer
