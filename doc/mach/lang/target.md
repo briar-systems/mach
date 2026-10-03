@@ -151,12 +151,6 @@ pub fun select_of(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: s
 pub fun resolve(reg: *TargetRegistry, req: *TargetRequest) res[binding.Binding, fail.Fail];
 ```
 
-## fun fingerprint
-
-```mach
-pub fun fingerprint(t: *binding.Binding, s: *wire.Sink);
-```
-
 ## fun registered_selection
 
 ```mach
@@ -210,11 +204,5 @@ pub fun select(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: str)
 
 ```mach
 pub fun artifact_naming(tgt: *binding.Binding, kind: catalog_artifact.Kind) res[target_of.ArtifactName, fail.Fail];
-```
-
-## val TUPLE_OK
-
-```mach
-pub val TUPLE_OK:              u32 = 0
 ```
 
