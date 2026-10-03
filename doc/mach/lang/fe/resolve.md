@@ -242,10 +242,10 @@ pub fun type_owner(s: *session.Session, mid: session.ModuleId, file: lang_source
 pub fun remap_result(r: *ResolveResult, s: *session.Session);
 ```
 
-## fun dnit_result
+## fun result_dnit
 
 ```mach
-pub fun dnit_result(r: *ResolveResult);
+pub fun result_dnit(r: *ResolveResult);
 ```
 
 ## fun resolve

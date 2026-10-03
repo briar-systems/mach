@@ -1,5 +1,119 @@
 # mach.lang.build.outcome
 
+## def GateResultKind
+
+```mach
+pub def GateResultKind: u8
+```
+
+how a test ran: passed, disagreed with what it checks, or could not be judged
+
+## val RESULT_PASS
+
+```mach
+pub val RESULT_PASS:                   GateResultKind = 0
+```
+
+## val RESULT_SEMANTIC_MISMATCH
+
+```mach
+pub val RESULT_SEMANTIC_MISMATCH:      GateResultKind = 1
+```
+
+## val RESULT_UNSUPPORTED_INPUT
+
+```mach
+pub val RESULT_UNSUPPORTED_INPUT:      GateResultKind = 2
+```
+
+## val RESULT_TOOL_UNAVAILABLE
+
+```mach
+pub val RESULT_TOOL_UNAVAILABLE:       GateResultKind = 3
+```
+
+## val RESULT_INFRASTRUCTURE_FAILURE
+
+```mach
+pub val RESULT_INFRASTRUCTURE_FAILURE: GateResultKind = 4
+```
+
+## val RESULT_RESOURCE_EXHAUSTION
+
+```mach
+pub val RESULT_RESOURCE_EXHAUSTION:    GateResultKind = 5
+```
+
+## val RESULT_INVALID_INJECTION
+
+```mach
+pub val RESULT_INVALID_INJECTION:      GateResultKind = 6
+```
+
+## def GateCause
+
+```mach
+pub def GateCause: u8
+```
+
+what decided a result's kind
+
+## val CAUSE_PASS
+
+```mach
+pub val CAUSE_PASS:                 GateCause = 0
+```
+
+## val CAUSE_ORACLE_TIMEOUT
+
+```mach
+pub val CAUSE_ORACLE_TIMEOUT:       GateCause = 4
+```
+
+## val CAUSE_ORACLE_SPAWN_FAILURE
+
+```mach
+pub val CAUSE_ORACLE_SPAWN_FAILURE: GateCause = 6
+```
+
+## val CAUSE_ORACLE_CAPTURE
+
+```mach
+pub val CAUSE_ORACLE_CAPTURE:       GateCause = 7
+```
+
+## val CAUSE_ORACLE_SIGNAL
+
+```mach
+pub val CAUSE_ORACLE_SIGNAL:        GateCause = 8
+```
+
+## val CAUSE_ORACLE_EXIT
+
+```mach
+pub val CAUSE_ORACLE_EXIT:          GateCause = 9
+```
+
+## val CAUSE_INVALID_TERMINAL
+
+```mach
+pub val CAUSE_INVALID_TERMINAL:     GateCause = 10
+```
+
+## rec GateResult
+
+```mach
+pub rec GateResult;
+```
+
+one test's result; the tally owns a recorded result's detail
+
+## fun gate_result
+
+```mach
+pub fun gate_result(kind: GateResultKind, cause: GateCause, detail_identity: str) GateResult;
+```
+
 ## rec TestArtifact
 
 ```mach
@@ -127,6 +241,6 @@ pub fun gate_tally_init(a: *A.Allocator) GateTally;
 ## fun record_gate
 
 ```mach
-pub fun record_gate(gt: *GateTally, a: *A.Allocator, r: validation.ValidationGateResult) err[A.Error];
+pub fun record_gate(gt: *GateTally, a: *A.Allocator, r: GateResult) err[A.Error];
 ```
 
