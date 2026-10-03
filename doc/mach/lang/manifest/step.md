@@ -3,7 +3,7 @@
 ## fun parse_steps
 
 ```mach
-pub fun parse_steps(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, as_root: bool) err[fail.Fail];
+pub fun parse_steps(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[fail.Fail];
 ```
 
 ## fun plan_visit

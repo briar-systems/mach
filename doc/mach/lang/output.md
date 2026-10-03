@@ -10,12 +10,6 @@ interrupted write leaves the original intact. the build owns its output
 layout: `directory` and `reserve` replace a stale entry of the wrong kind,
 and every failure names the path and the operation
 
-## fun intern_message
-
-```mach
-pub fun intern_message(itn: *intern.Interner, a: *A.Allocator, buf: *u8, total: usize, generic: str) str;
-```
-
 ## fun directory
 
 ```mach

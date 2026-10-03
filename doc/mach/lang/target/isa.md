@@ -2409,12 +2409,6 @@ pub fun make_sym(sym_id: u32, size: u8) Operand;
 pub fun registry_init_with_allocator(alloc: *A.Allocator) IsaRegistry;
 ```
 
-## fun registry_init
-
-```mach
-pub fun registry_init() IsaRegistry;
-```
-
 ## fun registry_dnit
 
 ```mach

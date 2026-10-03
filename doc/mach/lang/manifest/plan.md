@@ -190,11 +190,9 @@ otherwise `native`
 pub fun resolve_profile(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, pick: str) res[ResolvedProfile, fail.Fail];
 ```
 
-choose the profile a selection names. a named profile must be declared, except
-that a dependency manifest with no profiles at all answers "debug" and
-"release" with the synthesized ones. an empty name takes the sole declared
-profile, else the one with `default = true`, else the synthesized debug
-profile of a dependency manifest. several declared profiles with none marked
+choose the profile a selection names. a named profile must be declared. an
+empty name takes the sole declared profile, else the one with `default = true`,
+of which parse admits at most one. several declared profiles with none marked
 default are refused: no profile is ever selected by table order
 
 alloc: owns error text
@@ -202,7 +200,7 @@ itn: interns the name
 m: the manifest
 pick: the profile name, or "" for the default
 ret: the profile; err "mach.toml: no profile named '<pick>'" or, with an empty
-       name, an error when more than one profile is marked default
+       name, an error when several profiles are declared and none is the default
 
 ## fun resolve_artifact
 

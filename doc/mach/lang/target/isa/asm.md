@@ -291,12 +291,6 @@ pub fun op_sym(name_off: usize, name_len: usize, mod: isa.SymModifier, size: u8)
 pub fun is_space(c: char) bool;
 ```
 
-## fun is_digit
-
-```mach
-pub fun is_digit(c: char) bool;
-```
-
 ## fun is_sym_region
 
 ```mach

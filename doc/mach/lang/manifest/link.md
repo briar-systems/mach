@@ -19,7 +19,7 @@ include_referenced: copied from the link
 ## fun parse_links
 
 ```mach
-pub fun parse_links(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, as_root: bool) err[fail.Fail];
+pub fun parse_links(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[fail.Fail];
 ```
 
 ## fun free_link_claims
@@ -78,8 +78,8 @@ ret: ok, without allocating, when nothing is new; err on a symbol count
 pub fun link_matches_target(itn: *intern.Interner, l: *LinkDef, t: *TargetDef) bool;
 ```
 
-whether a link's `os`, `isa` and `abi` filters all admit a target. an absent
-axis admits everything, an empty one nothing, "*" everything
+whether a link's `os`, `isa` and `abi` filters all admit a target. an empty
+axis admits nothing, "*" everything
 
 itn: interns "*"
 l: the link

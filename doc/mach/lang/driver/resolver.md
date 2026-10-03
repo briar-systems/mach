@@ -52,5 +52,6 @@ pub fun resolve(a: *A.Allocator, src: *candidates.CandidateSource, needs: NeedsF
 problem: *Problem) res[Vector[Choice], fail.Fail];
 ```
 
-the selected release of every identity the root reaches, allocated in `a`
+the selected release of every identity the root reaches, allocated in `a`;
+the solver's scratch arena grows from `a` and returns to it
 
