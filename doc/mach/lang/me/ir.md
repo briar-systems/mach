@@ -553,7 +553,7 @@ pub fun dbg_expr_prepend_op(m: *Module, fn: *Function, eid: DbgExprId, op: DbgOp
 ## fun inline_site_add
 
 ```mach
-pub fun inline_site_add(m: *Module, fn: *Function, callee: intern.StrId, call_loc: lang_source.SrcLoc, parent: u32) res[u32, fail.Fail];
+pub fun inline_site_add(m: *Module, fn: *Function, callee: intern.StrId, call_loc: lang_source.Location, parent: u32) res[u32, fail.Fail];
 ```
 
 ## fun instr_inline_site_set

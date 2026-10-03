@@ -123,12 +123,6 @@ pub val CHILD_NOTE: ChildKind = 0
 pub val CHILD_HELP: ChildKind = 1
 ```
 
-## rec Location
-
-```mach
-pub rec Location;
-```
-
 ## rec Child
 
 ```mach
@@ -280,7 +274,7 @@ pub fun error_count(store: *DiagnosticStore) usize;
 ## fun builder_init
 
 ```mach
-pub fun builder_init(a: *A.Allocator, k: diagnostic_kind.Kind, file_id: lang_source.FileId, span: token.Span, message: str) res[DiagnosticBuilder, fail.Fail];
+pub fun builder_init(a: *A.Allocator, k: diagnostic_kind.Kind, file_id: lang_source.FileId, span: lang_source.Span, message: str) res[DiagnosticBuilder, fail.Fail];
 ```
 
 a builder for a diagnostic of kind `k`, raised at the severity its row
@@ -307,25 +301,25 @@ pub fun attach_help(b: *DiagnosticBuilder, text: str) err[fail.Fail];
 ## fun attach_related
 
 ```mach
-pub fun attach_related(b: *DiagnosticBuilder, file_id: lang_source.FileId, span: token.Span, label: str) err[fail.Fail];
+pub fun attach_related(b: *DiagnosticBuilder, file_id: lang_source.FileId, span: lang_source.Span, label: str) err[fail.Fail];
 ```
 
 ## fun attach_related_committed
 
 ```mach
-pub fun attach_related_committed(store: *DiagnosticStore, id: DiagnosticId, file_id: lang_source.FileId, span: token.Span, label: str) err[fail.Fail];
+pub fun attach_related_committed(store: *DiagnosticStore, id: DiagnosticId, file_id: lang_source.FileId, span: lang_source.Span, label: str) err[fail.Fail];
 ```
 
 ## fun attach_fix
 
 ```mach
-pub fun attach_fix(b: *DiagnosticBuilder, label: str, file_id: lang_source.FileId, span: token.Span, replacement: str) res[FixId, fail.Fail];
+pub fun attach_fix(b: *DiagnosticBuilder, label: str, file_id: lang_source.FileId, span: lang_source.Span, replacement: str) res[FixId, fail.Fail];
 ```
 
 ## fun attach_fix_edit
 
 ```mach
-pub fun attach_fix_edit(b: *DiagnosticBuilder, fix: FixId, file_id: lang_source.FileId, span: token.Span, replacement: str) err[fail.Fail];
+pub fun attach_fix_edit(b: *DiagnosticBuilder, fix: FixId, file_id: lang_source.FileId, span: lang_source.Span, replacement: str) err[fail.Fail];
 ```
 
 ## fun last_id
@@ -337,13 +331,13 @@ pub fun last_id(store: *DiagnosticStore) opt[DiagnosticId];
 ## fun attach_fix_committed
 
 ```mach
-pub fun attach_fix_committed(store: *DiagnosticStore, id: DiagnosticId, label: str, file_id: lang_source.FileId, span: token.Span, replacement: str) res[FixId, fail.Fail];
+pub fun attach_fix_committed(store: *DiagnosticStore, id: DiagnosticId, label: str, file_id: lang_source.FileId, span: lang_source.Span, replacement: str) res[FixId, fail.Fail];
 ```
 
 ## fun attach_fix_edit_committed
 
 ```mach
-pub fun attach_fix_edit_committed(store: *DiagnosticStore, id: DiagnosticId, fix: FixId, file_id: lang_source.FileId, span: token.Span, replacement: str) err[fail.Fail];
+pub fun attach_fix_edit_committed(store: *DiagnosticStore, id: DiagnosticId, fix: FixId, file_id: lang_source.FileId, span: lang_source.Span, replacement: str) err[fail.Fail];
 ```
 
 ## fun remove_fix_committed
@@ -372,7 +366,7 @@ absent when the store is nil or the id no longer names a live diagnostic
 ## fun error
 
 ```mach
-pub fun error(store: *DiagnosticStore, k: diagnostic_kind.Kind, file_id: lang_source.FileId, span: token.Span, message: str) err[fail.Fail];
+pub fun error(store: *DiagnosticStore, k: diagnostic_kind.Kind, file_id: lang_source.FileId, span: lang_source.Span, message: str) err[fail.Fail];
 ```
 
 an error of kind `k`
@@ -380,7 +374,7 @@ an error of kind `k`
 ## fun reject
 
 ```mach
-pub fun reject(store: *DiagnosticStore, k: diagnostic_kind.Kind, loc: lang_source.SrcLoc, text: str) fail.Fail;
+pub fun reject(store: *DiagnosticStore, k: diagnostic_kind.Kind, loc: lang_source.Location, text: str) fail.Fail;
 ```
 
 a pass past the front end rejects the program: the refusal is an error
@@ -393,7 +387,7 @@ rather than vanishing
 ## fun record_warning_at
 
 ```mach
-pub fun record_warning_at(store: *DiagnosticStore, k: diagnostic_kind.Kind, loc: lang_source.SrcLoc, message: str);
+pub fun record_warning_at(store: *DiagnosticStore, k: diagnostic_kind.Kind, loc: lang_source.Location, message: str);
 ```
 
 a warning of kind `k` located at `loc`, as `reject` locates an error
@@ -401,7 +395,7 @@ a warning of kind `k` located at `loc`, as `reject` locates an error
 ## fun warning
 
 ```mach
-pub fun warning(store: *DiagnosticStore, k: diagnostic_kind.Kind, file_id: lang_source.FileId, span: token.Span, message: str) err[fail.Fail];
+pub fun warning(store: *DiagnosticStore, k: diagnostic_kind.Kind, file_id: lang_source.FileId, span: lang_source.Span, message: str) err[fail.Fail];
 ```
 
 a warning of kind `k`
@@ -409,13 +403,13 @@ a warning of kind `k`
 ## fun record_error
 
 ```mach
-pub fun record_error(store: *DiagnosticStore, k: diagnostic_kind.Kind, file_id: lang_source.FileId, span: token.Span, message: str);
+pub fun record_error(store: *DiagnosticStore, k: diagnostic_kind.Kind, file_id: lang_source.FileId, span: lang_source.Span, message: str);
 ```
 
 ## fun record_warning
 
 ```mach
-pub fun record_warning(store: *DiagnosticStore, k: diagnostic_kind.Kind, file_id: lang_source.FileId, span: token.Span, message: str);
+pub fun record_warning(store: *DiagnosticStore, k: diagnostic_kind.Kind, file_id: lang_source.FileId, span: lang_source.Span, message: str);
 ```
 
 ## fun record_unlocated_warning
@@ -441,13 +435,13 @@ pub fun record_help_committed(store: *DiagnosticStore, id: DiagnosticId, text: s
 ## fun record_related_committed
 
 ```mach
-pub fun record_related_committed(store: *DiagnosticStore, id: DiagnosticId, file_id: lang_source.FileId, span: token.Span, label: str);
+pub fun record_related_committed(store: *DiagnosticStore, id: DiagnosticId, file_id: lang_source.FileId, span: lang_source.Span, label: str);
 ```
 
 ## fun record_fix_committed
 
 ```mach
-pub fun record_fix_committed(store: *DiagnosticStore, id: DiagnosticId, label: str, file_id: lang_source.FileId, span: token.Span, replacement: str);
+pub fun record_fix_committed(store: *DiagnosticStore, id: DiagnosticId, label: str, file_id: lang_source.FileId, span: lang_source.Span, replacement: str);
 ```
 
 ## fun note_lost
@@ -470,7 +464,7 @@ store: *DiagnosticStore,
 itn: *intern.Interner,
 k: diagnostic_kind.Kind,
 file_id: lang_source.FileId,
-span: token.Span,
+span: lang_source.Span,
 name_id: intern.StrId,
 fallback: str) res[bool, fail.Fail];
 ```
@@ -524,7 +518,7 @@ store: *DiagnosticStore,
 itn: *intern.Interner,
 k: diagnostic_kind.Kind,
 file_id: lang_source.FileId,
-span: token.Span,
+span: lang_source.Span,
 message: str) res[bool, fail.Fail];
 ```
 

@@ -21,13 +21,13 @@ pub fun set_function(b: *Builder, fn: *me_ir.Function);
 ## fun set_loc
 
 ```mach
-pub fun set_loc(b: *Builder, loc: lang_source.SrcLoc);
+pub fun set_loc(b: *Builder, loc: lang_source.Location);
 ```
 
 ## fun current_loc
 
 ```mach
-pub fun current_loc(b: *Builder) lang_source.SrcLoc;
+pub fun current_loc(b: *Builder) lang_source.Location;
 ```
 
 ## fun set_block
