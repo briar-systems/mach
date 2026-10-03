@@ -27,7 +27,6 @@ pub rec Retention;
 ```
 
 active:  the retainer a build records under
-rounds:  each load is its own round; false while a caller keeps one round open across builds
 modules: how many retainers hold each module
 files:   how many held modules each file backs
 pending: modules released since the last retirement, possibly held again since
