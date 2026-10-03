@@ -1538,19 +1538,19 @@ pub fun gp_id(n: u32) i32;
 ## fun gp
 
 ```mach
-pub fun gp(n: u32, bytes: u8) isa.Operand;
+pub fun gp(n: u32, bytes: u8) isa_inst.Operand;
 ```
 
 ## fun vec
 
 ```mach
-pub fun vec(n: u32, bytes: u8) isa.Operand;
+pub fun vec(n: u32, bytes: u8) isa_inst.Operand;
 ```
 
 ## fun is_vec
 
 ```mach
-pub fun is_vec(op: *isa.Operand) bool;
+pub fun is_vec(op: *isa_inst.Operand) bool;
 ```
 
 ## fun logical_imm
@@ -1566,13 +1566,13 @@ value no element spells, all zeros and all ones among them
 ## fun assemble
 
 ```mach
-pub fun assemble(mi: *isa.Inst) u32;
+pub fun assemble(mi: *isa_inst.Inst) u32;
 ```
 
 ## fun spell
 
 ```mach
-pub fun spell(mi: *isa.Inst);
+pub fun spell(mi: *isa_inst.Inst);
 ```
 
 the spelling an assembler reads back for an encoded member: the alias the

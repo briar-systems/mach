@@ -10,18 +10,13 @@ whether one instruction builds the integer: one movz or movn, or one orr of
 a logical immediate, the rule the middle end hoists a loop's constants by
 . a value narrower than 64 bits is built at 32
 
-## fun encode_arm64
+## fun hooks
 
 ```mach
-pub fun encode_arm64(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule) res[codegen_encode.EncoderOutput, fail.Fail];
+pub fun hooks() isa_encode.EncodeHooks;
 ```
 
-## fun encode_arm64_asm
-
-```mach
-pub fun encode_arm64_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule,
-out: *io_writer.Writer) res[codegen_encode.EncoderOutput, fail.Fail];
-```
+the hooks the shared encode driver runs this encoder through
 
 ## fun asm_returns
 

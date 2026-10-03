@@ -85,7 +85,7 @@ pub rec MirMap;
 ## fun map_of
 
 ```mach
-pub fun map_of(op: codegen_mir.MirOpcode) *MirMap;
+pub fun map_of(op: lang_mir.MirOpcode) *MirMap;
 ```
 
 the mapping row of a MIR opcode, nil when the value emitter has none (the

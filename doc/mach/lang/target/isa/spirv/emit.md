@@ -3,7 +3,7 @@
 ## fun emit_module
 
 ```mach
-pub fun emit_module(out_alloc: *A.Allocator, tgt: *isa.BackendTarget, u: *be_codegen_unit.Unit,
-dbg: *debug_input.ModuleDebug, image: *target_of.ObjectImage) err[fail.Fail];
+pub fun emit_module(out_alloc: *A.Allocator, tgt: *isa.BackendTarget, u: *mir_unit.Unit,
+dbg: *mir_debug.ModuleDebug, image: *target_of.ObjectImage) err[fail.Fail];
 ```
 

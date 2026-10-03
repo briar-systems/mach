@@ -12,7 +12,7 @@ pub def OperandRole: u8
 ```
 
 the role an emitted instruction gives one of its operand positions
-(isa.Inst dst, src1, src2, src3), the part of the effect description that
+(isa_inst.Inst dst, src1, src2, src3), the part of the effect description that
 ct_class does not carry: which registers a notification defines and which
 it only reads, and whether a memory operand is loaded, stored, or only its
 address computed
@@ -162,5 +162,19 @@ pub fun inst_effects_unknown() InstEffects;
 
 ```mach
 pub fun reg_bit(index: i32) u64;
+```
+
+## rec Hooks
+
+```mach
+pub rec Hooks;
+```
+
+the per-ISA half of the effect description, declared beside the encoder
+
+## fun hooks_none
+
+```mach
+pub fun hooks_none() Hooks;
 ```
 
