@@ -258,46 +258,6 @@ pub fun branch_reach(tgt_isa: *IsaVTable, kind: target_of.RelocKind) opt[target_
 the reach of a direct branch a thunk can extend, none for any other kind or
 an instruction set that places no thunks
 
-## fun declares_machine_flags
-
-```mach
-pub fun declares_machine_flags(tgt_isa: *IsaVTable) bool;
-```
-
-## fun machine_flags
-
-```mach
-pub fun machine_flags(tgt_isa: *IsaVTable, float_arg_bits: u32,
-has_compressed: bool) u32;
-```
-
-## fun declares_attributes
-
-```mach
-pub fun declares_attributes(tgt_isa: *IsaVTable) bool;
-```
-
-## fun build_attributes
-
-```mach
-pub fun build_attributes(tgt_isa: *IsaVTable, model: *target_model.Machine, alloc: *A.Allocator, float_arg_bits: u32,
-has_compressed: bool, out_len: *u32) res[*u8, fail.Fail];
-```
-
-## fun validate_attributes
-
-```mach
-pub fun validate_attributes(tgt_isa: *IsaVTable, model: *target_model.Machine,
-bytes: *u8, len: u32, flags: u32) err[fail.Fail];
-```
-
-## fun merge_attributes
-
-```mach
-pub fun merge_attributes(tgt_isa: *IsaVTable, alloc: *A.Allocator, acc: *u8, acc_len: u32,
-add: *u8, add_len: u32, out_len: *u32) res[*u8, fail.Fail];
-```
-
 ## fun object_target
 
 ```mach
