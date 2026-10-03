@@ -307,7 +307,7 @@ whose entry `use`s each of them, tested by name.
 kind    = "bin"
 default = true
 entry   = "main.mach"
-out     = "bin/app"
+out     = "{project.out}/bin/app"
 targets = ["*"]
 link    = []
 need    = []
@@ -316,7 +316,7 @@ need    = []
 [artifact.tests]
 kind    = "static"
 entry   = "test/all.mach"
-out     = "lib/tests"
+out     = "{project.out}/lib/tests"
 targets = ["*"]
 link    = []
 need    = []

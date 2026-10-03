@@ -78,10 +78,10 @@ What a consumer *uses* from a dependency's manifest is its export surface: the
 project id, the module a bare `use <id>;` binds (see
 [modules.md](modules.md#bare-project-id-imports)), its
 `export = true` link entries, the steps those entries demand, and what its
-`default = true` library artifact requires — the artifacts and steps named in
+`export = true` library artifact requires — the artifacts and steps named in
 that artifact's `need` (see
 [Dependency requirements travel](#dependency-requirements-travel)). Nothing else
-travels: a `bin` artifact's `need`, a non-default library's, and every other
+travels: a `bin` artifact's `need`, any other library's, and every other
 requirement of the dependency stay its own.
 
 A dependency declares its `[profile.*]` tables like any project, since it also
@@ -117,7 +117,7 @@ float_reassoc = false                  # float reassociation permission
 [artifact.demo]                        # a produced artifact
 kind    = "bin"                        # "bin" | "static" | "shared"
 entry   = "main.mach"                  # entry source, relative to src
-out     = "bin/demo{artifact.suffix}"  # output path, relative to the project out
+out     = "{project.out}/bin/demo{artifact.suffix}"  # output path, under the project out
 targets = ["*"]                        # which declared targets build it ("*" = all)
 # link  = ["kernel32"]                 # optional: [link.X] names this artifact links
 # need  = ["step.generate"]            # optional: step.X / artifact.X requirements
@@ -266,7 +266,7 @@ to whichever *declared* target matches the host.
 | `platform` | absent: no platform | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
 | `stack_reserve` | absent: the format's default | Thread stack reserve in bytes. See [Image stack size](#image-stack-size). |
 | `stack_commit` | absent: the format's default | Thread stack commit in bytes. See [Image stack size](#image-stack-size). |
-| `default` | absent: nothing, it is ignored | Deprecated and ignored. It once marked the target `native` fell back to when none matched the host. The key is still accepted, so a published dependency keeps building, and warns as `target.default_deprecated`. See [`native` target resolution](#native-target-resolution). |
+| `default` | removed | Refused as a removed key. A target has no default: with no `-t` a command takes the declared target matching the host. See [`native` target resolution](#native-target-resolution). |
 | `extensions` | absent: none selected | Array of instruction-set extension names the target may assume, such as `["sha", "ssse3"]`. Each name must be in the isa's vocabulary. See [Instruction-set extensions](#instruction-set-extensions). |
 | `env` | absent: the isa's default | Consumer environment (string). The values are owned by the target's isa: an `env` the isa does not define is a manifest error naming the target and the known values, and an isa that defines none refuses the key outright. Today only `spirv` defines any; see [Finished-module targets](#finished-module-targets). |
 
@@ -937,7 +937,7 @@ allow = ["import.unused", "target"]
 ```
 
 A key's leading components name a family: `"target"` covers
-`target.skipped` and `target.default_deprecated`, and `"vector"` covers
+`target.skipped`, and `"vector"` covers
 `vector.scalarize`. A family covers whole components only, so `"vec"` is not a
 key. To acknowledge one warning where it is raised instead of across the whole
 build, put [`#[expect]`](decorators.md#expectkey--acknowledge-a-warning) on the
@@ -959,7 +959,6 @@ reused for a different kind: see [the registry](diagnostics.md#the-registry).
 | `fwd.instances` | a shared library `fwd`s a generic, comptime-parameter or pack declaration, which exports no symbol | no |
 | `debug.dropped` | the linker leaves out an object's debug info that it cannot merge | no |
 | `target.skipped` | multi-target analysis skips a declared target this build does not support | no |
-| `target.default_deprecated` | a `[target.*]` table carries the deprecated `default = true`, which selects nothing | no |
 | `vector.scalarize` | a vector operation falls back to scalar code on the target (see `simd`); portable code silences it | no |
 | `expect.unfulfilled` | an `#[expect]` names a key decided by source and no such warning is raised inside its declaration | no |
 
@@ -1060,14 +1059,15 @@ reads the selected artifact's name.
 |-----------|----------|---------|
 | `kind`    | yes | `"bin"`, `"static"`, or `"shared"` (see below). |
 | `entry`   | yes | Entry source, relative to the project `src` dir (e.g. `main.mach` for `src/main.mach`). The entry module's FQN is `<id>.<entry without .mach>`, `/` turned into `.`. |
-| `out`     | yes | This artifact's output path, **relative to the expanded project `out`** and rooted there automatically — write `bin/demo`, not `{project.out}/bin/demo`. Use `{artifact.suffix}` for the target extension, or write a literal filename. See [Artifact filenames and identity](#artifact-filenames-and-identity). |
+| `out`     | yes | This artifact's output path, relative to the project root like every other path. Write `{project.out}/bin/demo` to place it under the build output, or any other project path to place it there. Use `{artifact.suffix}` for the target extension, or write a literal filename. See [Artifact filenames and identity](#artifact-filenames-and-identity). |
 | `targets` | yes | Array of declared target names this artifact builds for; `["*"]` means every declared target. |
 | `link`    | absent: links nothing | Array of `[link.X]` names this artifact links (see below). A name with no table is a manifest error naming the artifact and the declared tables (`[artifact.p1].link names no [link.*] table: 'nosuch' (declared: [link.kernel32])`). |
 | `need`    | absent: needs nothing | Array of category-qualified requirements such as `step.generate`, `artifact.support`, and `artifact.shader-*`. Each glob matches only its named category. See [Artifact requirements](#artifact-requirements). |
 | `subsystem` | absent: `"console"` | `"console"` or `"gui"` — the environment a windows executable declares it runs under; refused on a target whose image format has no subsystem (see below). |
 | `icon` | absent: no icon | Project-root-relative `.ico` path embedded in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
 | `manifest` | absent: no application manifest | Project-root-relative application-manifest path embedded byte-for-byte in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
-| `default` | absent: not marked | `true` puts the artifact in the [default selection](#selection-and-the-build-matrix): with no `-a`, `mach build` and `mach check` take the marked artifacts among those supporting the selected target (every one of them when none is marked), and a command that needs one artifact (`mach test`, `mach run`, the editor's union build) takes the marked one. A command that needs one artifact refuses two marked candidates; an explicit `-a` always wins, and a sole candidate needs no marker. |
+| `default` | absent: not marked | Selection only. `true` puts the artifact in the [default selection](#selection-and-the-build-matrix): with no `-a`, `mach build` and `mach check` take the marked artifacts among those supporting the selected target (every one of them when none is marked), and a command that needs one artifact (`mach test`, `mach run`, the editor's union build) takes the marked one. A command that needs one artifact refuses two marked candidates; an explicit `-a` always wins, and a sole candidate needs no marker. |
+| `export` | absent: not exported | `true` marks the library a bare `use <id>;` binds and whose requirements travel to consumers (see [Dependency requirements travel](#dependency-requirements-travel)). It applies to `static` and `shared` artifacts only, and a project exports at most one. |
 
 `entry` is the build cell's source root. The build follows its active `use` and
 `fwd` edges transitively and compiles that reachable module set; another file under
@@ -1136,7 +1136,7 @@ spell its desired `lib` prefix directly.
 [artifact.app]
 kind = "bin"
 entry = "main.mach"
-out = "bin/app{artifact.suffix}"
+out = "{project.out}/bin/app{artifact.suffix}"
 targets = ["*"]
 link = []
 need = []
@@ -1172,7 +1172,7 @@ target. An explicit literal such as `bin/app.exe` can therefore collide with
 [artifact.game]
 kind = "bin"
 entry = "main.mach"
-out = "bin/game.exe"
+out = "{project.out}/bin/game.exe"
 targets = ["*"]
 link = []
 need = []
@@ -1209,7 +1209,7 @@ the same way on a target whose format has no subsystem (`mach help build`).
 [artifact.game]
 kind = "bin"
 entry = "main.mach"
-out = "bin/game.exe"
+out = "{project.out}/bin/game.exe"
 targets = ["*"]
 link = []
 need = []
@@ -1260,16 +1260,15 @@ the same entries, so nothing behaves differently as a dependency.
 | `name`    | shape | Library/framework name — required for `source = "system"`/`"framework"`, forbidden for `"local"`. |
 | `path`    | shape | File path — required for `source = "local"`, forbidden otherwise. A template (see below). |
 | `symbols` | absent: none claimed | Array of symbol names this dependency provides, attributing imports that have no `ext` declaration to decorate (see below). Written as **source-level** names; the target's C symbol prefix is applied by Mach. |
-| `os`      | yes | Filter axis: a canonical `os` value, `"*"` (any), an array of values, or `[]` (none). |
+| `os`      | yes | Filter axis: an array of canonical `os` values or `"*"` (any); `[]` matches none. |
 | `isa`     | yes | Filter axis over `isa`, same forms. |
 | `abi`     | yes | Filter axis over `abi`, same forms. |
 | `export`  | absent: not exported | `true` cascades this entry to consumers; `false` keeps it to this project's own builds. |
 | `include` | absent: `"always"` | `"always"` names the dynamic library in the linked image whether or not anything imports from it; `"referenced"` names it only when a live import references it, so an unused provider leaves no load command behind. Any other value is a manifest error (`[link.k].include must be "always" or "referenced"`). |
 
-The `os`/`isa`/`abi` axes select the build cells an entry applies to. Each takes a
-single canonical value, `"*"` for any, or an array — `os = "linux"` and
-`os = ["linux"]` filter identically. `[]` matches nothing (an entry deliberately
-switched off). The three axes are required: an axis left out would mean every
+The `os`/`isa`/`abi` axes select the build cells an entry applies to. Each is an
+array, like an artifact's `targets`: canonical values, `"*"` for any, and `[]`
+matching nothing (an entry deliberately switched off). A bare string is refused. The three axes are required: an axis left out would mean every
 target, which is an assumption to state, so a `kernel32` entry with no `os` is
 refused rather than linked on Linux. A non-canonical spelling is a manifest
 error. An entry applies
@@ -1319,9 +1318,9 @@ with no declaration to decorate, so the entry that provides them claims them:
 source  = "system"
 name    = "kernel32.dll"
 symbols = ["Sleep", "CreateFileW", "CloseHandle"]
-os      = "windows"
-isa     = "*"
-abi     = "*"
+os      = ["windows"]
+isa     = ["*"]
+abi     = ["*"]
 export  = true
 ```
 
@@ -1379,7 +1378,7 @@ Steps carry **no filters** and **never run automatically**. A step runs only whe
 - by another step's `need`;
 - by an artifact's `need` (for outputs that are not link inputs), by name or
   through a glob;
-- in a dependency, by the `need` of its `default = true` library artifact, which
+- in a dependency, by the `need` of its `export = true` library artifact, which
   travels to every consumer (see
   [Dependency requirements travel](#dependency-requirements-travel)).
 
@@ -1942,15 +1941,16 @@ documented by `mach help dep`.
 
 A dependency's export surface — all a consumer sees — is its source module tree
 (addressed by the dep's id), the module a bare `use <id>;` binds, its
-`export = true` link entries, and the steps those entries demand. Nothing else
-in a dependency's manifest applies to consumers.
+`export = true` link entries and library artifact, and the steps and artifacts
+those demand. Nothing else in a dependency's manifest applies to consumers.
 
 ## Path templates
 
 Paths and step `argv` entries expand over a closed, final set of eight variables:
 
 - `{project.out}` — the **root** project's expanded `[project].out`, in every
-  manifest of the closure.
+  manifest of the closure. In a dependency's artifact `out` it is that
+  dependency's home under it, `dep/<id>`.
 - `{target.name}` — the resolved target name (never the literal `native`).
 - `{target.isa}` — the resolved target's `isa` (e.g. `x86_64`).
 - `{target.os}` — the resolved target's `os` (e.g. `linux`).
@@ -1962,17 +1962,18 @@ Paths and step `argv` entries expand over a closed, final set of eight variables
   [Artifact filenames and identity](#artifact-filenames-and-identity).
 - `{artifact.<id>.out}` — the output path of a required artifact, relative to the
   root project's directory exactly as `{project.out}` is. In a dependency's module
-  it names a requirement of that dependency's default library artifact, homed under
+  it names a requirement of that dependency's export library artifact, homed under
   `dep/<id>`. See [Artifact requirements](#artifact-requirements).
 
 The three `{target.*}` tuple keys are also exported to every step process as
 `MACH_TARGET_ISA`/`MACH_TARGET_OS`/`MACH_TARGET_ABI` (see [build steps](#stepname--build-steps)).
 
-An artifact's `out` is relative to the expanded project `out` and is rooted there
-automatically — write `bin/demo`, not `{project.out}/bin/demo`. Step `out` lists
-and local link `path`s are **not** auto-rooted: they name `{project.out}`
-explicitly, which is what homes a dependency's build products into the *consumer's*
-output tree rather than the dependency's checkout.
+Every output path is explicit and none is rooted for you: an artifact's `out`, a
+step's `out` list and a local link's `path` are relative to the project root and
+name `{project.out}` where they mean the build output, so an artifact may be
+placed anywhere in the project. Naming `{project.out}` is what homes a
+dependency's build products into the *consumer's* output tree rather than the
+dependency's checkout, and a dependency's artifact `out` must begin with it.
 
 There are no `{name}`/`{ext}` or bare `{target}`/`{profile}` aliases. Where a
 template is written decides what it may name, and every template is checked when
@@ -2008,7 +2009,7 @@ builds for several targets here and therefore has no single output.
 [artifact.shader-blur]
 kind    = "bin"
 entry   = "shaders/blur.mach"
-out     = "shaders/blur.spv"
+out     = "{project.out}/shaders/blur.spv"
 targets = ["vulkan"]
 link    = []
 need    = []
@@ -2016,7 +2017,7 @@ need    = []
 [artifact.app]
 kind    = "bin"
 entry   = "main.mach"
-out     = "bin/app"
+out     = "{project.out}/bin/app"
 targets = ["linux-x86_64"]
 link    = []
 need    = ["artifact.shader-*"]
@@ -2064,20 +2065,20 @@ pipeline that checks before it builds should build first.
 
 A library that embeds what it builds cannot be consumed if its requirements stop
 at its own manifest, and a consumer has no way to declare them. So a dependency's
-**`default = true` library artifact** carries its requirements as part of its
+**`export = true` library artifact** carries its requirements as part of its
 export surface: the artifacts and steps its `need` names are built for any project
 whose dependency closure holds that dependency, before the cells that compile
-against the closure. Only that artifact's `need` travels. Several library artifacts
-may share the `default` marker and the public entry; their requirements travel
-together.
+against the closure. Only that artifact's `need` travels, and a project exports
+at most one library. `default` plays no part here: it only selects what a
+command builds when no `-a` names an artifact.
 
 ```toml
 # the dependency's mach.toml
 [artifact.shlib]
-default = true
+export  = true
 kind    = "static"
 entry   = "lib.mach"
-out     = "lib/shlib{artifact.suffix}"
+out     = "{project.out}/lib/shlib{artifact.suffix}"
 targets = ["linux-x86_64"]
 link    = []
 need    = ["artifact.shader-frag"]
@@ -2085,7 +2086,7 @@ need    = ["artifact.shader-frag"]
 [artifact.shader-frag]
 kind    = "bin"
 entry   = "shaders/frag.mach"
-out     = "spv/frag{artifact.suffix}"
+out     = "{project.out}/spv/frag{artifact.suffix}"
 targets = ["spirv"]
 link    = []
 need    = []
@@ -2105,25 +2106,27 @@ The rules:
   because target names of two manifests are unrelated; a requirement naming
   several targets has no single `{artifact.<id>.out}`, exactly as within one
   manifest.
-- **Homed in the consumer, namespaced by id.** The output is
-  `<expanded root [project].out>/dep/<dependency id>/<the artifact's own out>`, so
-  two dependencies that both declare `shader-quad` produce two files and neither
-  writes into its own checkout. `{project.out}` keeps meaning the root's out in
-  every manifest of the closure, as it does for a dependency's steps, and the
-  cell's objects sit in the root's `obj/` beside every other module's. `mach clean`
+- **Homed in the consumer, namespaced by id.** In a dependency's artifact `out`,
+  `{project.out}` is `<expanded root [project].out>/dep/<dependency id>`, so two
+  dependencies that both declare `shader-quad` produce two files and neither
+  writes into its own checkout. A dependency's artifact `out` must begin with
+  `{project.out}`; one placed anywhere else is refused, since it would write into
+  the consumer's tree. In a dependency's steps `{project.out}` keeps meaning the
+  root's out, and the cell's objects sit in the root's `obj/` beside every other
+  module's. `mach clean`
   removes that home and those objects with the rest of the output, reading the
   realized dependency manifests for the target names the root never declares.
 - **Scope follows the module.** `{artifact.<id>.out}` in a module the dependency
-  owns is read in that dependency's manifest and checked against its default
+  owns is read in that dependency's manifest and checked against its export
   library artifact; the root's modules keep reading the root's manifest and the
   requirements of the artifact being built. Naming anything else is the ordinary
   refusal, located at the scope it was read in.
 - **Its own closure, recursively.** A travelling requirement compiles against the
   dependency's own transitive closure, realized in the root's flat `dep/`, and
-  the requirements of *those* dependencies' default library artifacts travel to
+  the requirements of *those* dependencies' export library artifacts travel to
   it in turn. A requirement reached through several consumers is built once, and
   a failure names the dependency chain (`dependency app -> boom -> shader: ...`).
-- **Steps too.** A step the default library artifact's `need` names runs for the
+- **Steps too.** A step the export library artifact's `need` names runs for the
   consumer, alongside the steps its `export = true` link entries demand.
 
 Nothing here makes an `#[embed]` an edge in the build graph: a missing embedded
@@ -2145,10 +2148,11 @@ A pattern is an exact name, which must be declared, or a glob in which `*`
 matches any run of characters and `?` any one character, which must match at
 least one entry. Each option repeats, and the axis takes every entry any of its
 patterns names, in declaration order. Artifact names are unique table keys, so
-an artifact's kind never needs naming. Quote a glob so the shell leaves it alone:
-`-a '*'`. A value that names no entry but does name a file or directory in the
-working directory is refused as the shell's expansion of an unquoted wildcard,
-with a hint to quote it.
+an artifact's kind never needs naming. `-t native` names the declared target
+matching the host, as an unnamed target axis does. Quote a glob so the shell
+leaves it alone: `-a '*'`. When a value names no entry but does name a file or
+directory in the working directory, the command line reports it as the shell's
+expansion of an unquoted wildcard, with a hint to quote it.
 
 `--all` fills every axis no option names with `*`: `mach build . --all` builds
 every artifact on every target it supports in every profile, and
@@ -2270,9 +2274,8 @@ artifact is settled before its target: `mach build` and `mach check` with
 `-a`, `mach run` and `mach test` (which also settle on a sole artifact), and
 editor analysis. A plain `mach build` or `mach check` resolves `native` first and never
 reaches it. A manifest with no `[target.*]` table has the synthesized host
-target. `[target.*] default = true` no longer means anything: it is accepted and
-ignored, with a `target.default_deprecated` warning. Migrate by deleting the key and declaring a target for each host the
-project builds on, or passing `-t`.
+target. `[target.*] default` is a removed key and is refused: declare a target
+for each host the project builds on, or pass `-t`.
 
 The same rule applies to `[profile.*]` and to `[artifact.*]` when a command
 needs one artifact.
@@ -2308,39 +2311,39 @@ ref = "tag/v1.0.3"
 [link.shim]
 source = "local"
 path   = "{project.out}/obj/platform/shim.o"
-os     = "*"
-isa    = "*"
-abi    = "*"
+os     = ["*"]
+isa    = ["*"]
+abi    = ["*"]
 export = false
 
 [link.shim-x11]
 source = "local"
 path   = "{project.out}/obj/platform/x11.o"
-os     = "linux"
-isa    = "*"
-abi    = "*"
+os     = ["linux"]
+isa    = ["*"]
+abi    = ["*"]
 export = false
 
 [link.shim-win32]
 source = "local"
 path   = "{project.out}/obj/platform/win32.o"
-os     = "windows"
-isa    = "*"
-abi    = "*"
+os     = ["windows"]
+isa    = ["*"]
+abi    = ["*"]
 export = false
 
 [link.gl]
 source = "system"
 name   = "GL"
-os     = "linux"
-isa    = "*"
-abi    = "*"
+os     = ["linux"]
+isa    = ["*"]
+abi    = ["*"]
 export = false
 
 [artifact.demo]
 kind    = "bin"
 entry   = "main.mach"
-out     = "bin/demo"
+out     = "{project.out}/bin/demo"
 targets = ["linux", "windows"]
 link    = ["shim", "shim-x11", "shim-win32", "gl"]
 need    = []
@@ -2407,24 +2410,24 @@ out     = "out/{target.name}/{profile.name}"
 source = "system"
 name   = "glfw"
 os     = ["linux", "darwin"]
-isa    = "*"
-abi    = "*"
+isa    = ["*"]
+abi    = ["*"]
 export = true
 
 [link.glfw-win]
 source = "system"
 name   = "glfw3.dll"
 os     = ["windows"]
-isa    = "*"
-abi    = "*"
+isa    = ["*"]
+abi    = ["*"]
 export = true
 
 [link.Cocoa]
 source = "framework"
 name   = "Cocoa"
 os     = ["darwin"]
-isa    = "*"
-abi    = "*"
+isa    = ["*"]
+abi    = ["*"]
 export = true
 ```
 
@@ -2461,9 +2464,9 @@ out     = "out/{target.name}/{profile.name}"
 [link.miniz]
 source = "local"
 path   = "{project.out}/obj/miniz/miniz.o"
-os     = "*"
-isa    = "*"
-abi    = "*"
+os     = ["*"]
+isa    = ["*"]
+abi    = ["*"]
 export = true
 
 [step.miniz]
