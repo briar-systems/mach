@@ -327,16 +327,17 @@ Pins an `ext` import to a specific dependency in the link set. Applies to
 `ext` functions only.
 
 ```mach
-#[library("ws2_32.dll")]
+#[library("ws2_32")]
 #[symbol("WSAStartup")]
 ext fun wsa_startup(ver: u16, data: *u8) i32;
 ```
 
-- The value normally names a `[link.X]` requirement's stable logical identity:
-  its `library` value, or `X` when that key is omitted. A bare command-line
-  `-l name` also exposes `name`. Exact canonical loader names remain accepted.
-  Pinning to an absent dependency is a link error, never a silent fallback. A
-  logical identity may not equal a different dependency's loader name.
+- The value names a `[link.X]` requirement by its table key, `X`. A bare
+  command-line `-l name` exposes `name`. A loader name such as `ws2_32.dll`
+  does not bind, and an import attributed to one is refused with a message
+  naming the entry whose key to write. Pinning to an absent dependency is a
+  link error, never a silent fallback. A key may not equal a different
+  dependency's loader name.
 - PE and Mach-O use two-level namespaces, so every dynamic import on those
   targets needs a `library` attribution.
 - On ELF (Linux) the loader resolves imports by global search, so `library`
