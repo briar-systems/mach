@@ -1,5 +1,13 @@
 # mach.cli.cmd.dep
 
+## val COMMAND
+
+```mach
+pub val COMMAND: args.CommandSpec = args.CommandSpec;
+```
+
+`mach dep`
+
 ## fun run
 
 ```mach
@@ -10,7 +18,7 @@ pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64;
 command over the dependency manager (mach.lang.package) that renders what it reports
 
 argv: the full process arguments
-inv: the parsed invocation for this command
+inv: the parsed invocation for this command, its action read and its operands counted
 ret: exit.OK, exit.USER for a malformed invocation, or the code `exit.of` maps the
       action's printed failure to
 
