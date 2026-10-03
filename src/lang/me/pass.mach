@@ -1,18 +1,23 @@
-# the contract every middle-end pass fills. a pass is one function over a
-# context, true when it changed the module, beside the predicate that says
-# whether it applies to a run at all. each pass declares itself once in its own
+# the contract every middle-end pass fills. most passes are a visit to one
+# function, true when it changed it, beside the functions it skips; the driver
+# here walks the module once for them. a pass whose unit is the whole module
+# runs over the context instead. each pass declares itself once in its own
 # module; the pipeline's schedule decides when it runs, which passes follow it
 # and how the module is verified after it
 use mach.lang.fail;
 use std.types.bool.bool;
 use std.types.bool.false;
+use std.types.bool.true;
 use std.types.error.err;
 use std.types.result.res;
+
+use A: std.allocator;
 
 use mach.lang.diagnostic;
 use mach.lang.intern;
 use me_ir: mach.lang.me.ir;
 use mach.lang.me.ir.body;
+use ir_effect: mach.lang.me.ir.effect;
 use mach.lang.me.scratch;
 use lang_target: mach.lang.target;
 
@@ -36,17 +41,51 @@ pub rec Context {
     float_reassoc: bool;
 }
 
-# a pass over `ctx.module`, true when it changed it
+# the one function a visit is given
+pub rec Function {
+    context: *Context;
+    module:  *me_ir.Module;
+    target:  *lang_target.Target;
+    body:    *me_ir.Function;
+    # the body's place in the module's function table; a visit that appends a
+    # function re-reads its body through it, since the table may move
+    index: u32;
+}
+
+# a pass over `ctx.module` as a whole, true when it changed it
 pub def Run: fun(*Context) res[bool, fail.Fail];
+
+# a pass over one function, true when it changed it; `alloc` is the workspace,
+# reclaimed after every visit
+pub def Visit: fun(*Function, *A.Allocator) res[bool, fail.Fail];
 
 # whether a pass applies to a run
 pub def Gate: fun(*Context) bool;
 
-# a member of the contract
+# whether a pass visits a function its skip flags leave in
+pub def Filter: fun(*Function) bool;
+
+# the functions a visiting pass skips, as flags
+pub val SKIP_EXTERN:    u32 = 0x01;
+pub val SKIP_EMPTY:     u32 = 0x02;
+pub val SKIP_NO_INSTRS: u32 = 0x04;
+pub val SKIP_VOLATILE:  u32 = 0x08;
+pub val SKIP_SCALAR:    u32 = 0x10;
+pub val SKIP_OBLIVIOUS: u32 = 0x20;
+
+# a member of the contract: `visit` with its eligibility, or `run`
 pub rec Pass {
+    # nil for a pass that visits functions
     run: Run;
     # nil applies to every run
     applies: Gate;
+    # nil for a pass over the whole module
+    visit: Visit;
+    skips: u32;
+    # nil visits every function the skip flags leave in
+    eligible: Filter;
+    # the most visits one function gets while each changes it, at least one
+    rounds: u32;
 }
 
 # a context over `m` for `tgt` sharing `workspace`, offering nothing else, with
@@ -73,16 +112,63 @@ pub fun applies(p: *Pass, ctx: *Context) bool {
 # `p` over `ctx` when it applies; false when it does not
 pub fun run(p: *Pass, ctx: *Context) res[bool, fail.Fail] {
     if (!applies(p, ctx)) { ret res[bool, fail.Fail].ok{false}; }
-    ret p.run(ctx);
+    if (p.visit == nil)   { ret p.run(ctx); }
+    ret each_function(p, ctx);
+}
+
+# whether `p` visits the function `f` names
+fun visits(p: *Pass, f: *Function) bool {
+    val fn: *me_ir.Function = f.body;
+    if ((p.skips & SKIP_EXTERN) != 0 && (fn.flags & me_ir.FN_FLAG_EXTERN) != 0)       { ret false; }
+    if ((p.skips & SKIP_EMPTY) != 0 && fn.block_count == 0)                           { ret false; }
+    if ((p.skips & SKIP_NO_INSTRS) != 0 && fn.instr_len == 0)                         { ret false; }
+    if ((p.skips & SKIP_SCALAR) != 0 && (fn.flags & me_ir.FN_FLAG_SCALAR) != 0)       { ret false; }
+    if ((p.skips & SKIP_OBLIVIOUS) != 0 && (fn.flags & me_ir.FN_FLAG_OBLIVIOUS) != 0) { ret false; }
+    if ((p.skips & SKIP_VOLATILE) != 0 && ir_effect.function_has_volatile(fn))        { ret false; }
+    ret p.eligible == nil || p.eligible(f);
+}
+
+# every function `p` visits, each in its own window of the workspace; the
+# functions a visit appends are never visited
+fun each_function(p: *Pass, ctx: *Context) res[bool, fail.Fail] {
+    val m:       *me_ir.Module = ctx.module;
+    val count:   u32           = m.function_len;
+    var changed: bool          = false;
+    var fi:      u32           = 0;
+    for (fi < count) {
+        var f: Function = Function{context: ctx, module: m, target: ctx.target, body: ?m.functions[fi], index: fi};
+        if (visits(p, ?f)) {
+            var round: u32  = 0;
+            var more:  bool = true;
+            for (more && round < p.rounds) {
+                val r: res[bool, fail.Fail] = scratch.run[Function, bool](ctx.workspace, m.alloc, ?f, p.visit);
+                if (sel r.err) { ret r; }
+                more = r.ok;
+                if (more) { changed = true; }
+                round = round + 1;
+            }
+        }
+        fi = fi + 1;
+    }
+    ret res[bool, fail.Fail].ok{changed};
 }
 
 # `p` alone over `m` for `tgt`, in a workspace of its own
 #[testing]
 pub fun run_alone(p: *Pass, m: *me_ir.Module, tgt: *lang_target.Target) res[bool, fail.Fail] {
+    var ctx: Context = context(m, tgt, nil);
+    ret run_owned(p, ?ctx);
+}
+
+# `p` over `ctx` in a workspace of its own
+#[testing]
+pub fun run_owned(p: *Pass, ctx: *Context) res[bool, fail.Fail] {
     var workspace:   scratch.Workspace;
-    val initialized: err[fail.Fail] = scratch.init(?workspace, m.backing);
+    val initialized: err[fail.Fail] = scratch.init(?workspace, ctx.module.backing);
     if (sel initialized.err) { ret res[bool, fail.Fail].err{initialized.err}; }
     fin { scratch.dnit(?workspace); }
-    var ctx: Context = context(m, tgt, ?workspace);
-    ret run(p, ?ctx);
+    val previous: *scratch.Workspace = ctx.workspace;
+    ctx.workspace = ?workspace;
+    fin { ctx.workspace = previous; }
+    ret run(p, ctx);
 }
