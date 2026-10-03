@@ -555,7 +555,7 @@ pub fun fast_calc(x: i64) i64 {
 - `#[packed]`: removes alignment padding from a record, union, or tag.
 - `#[section(".name")]`: places a function or global variable into a specific object file section.
 - `#[embed("path")]`: embeds the raw bytes of an external file at compile time into an uninitialized `val name: [_]u8;` array.
-- `#[library("name")]`: specifies the dynamic library name required for an external import.
+- `#[library("key")]`: names the `[link.<key>]` entry an external import comes from, by its table key (never a loader name such as `kernel32.dll`).
 - `#[deprecated]` or `#[deprecated("message")]`: emits a compile warning whenever the decorated symbol is used.
 - `#[scalar]`: opts a function out of automatic vectorization.
 - `#[naked]`: emits a function without prologue or epilogue code, intended for functions written entirely with inline assembly.
