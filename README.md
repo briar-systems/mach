@@ -32,7 +32,7 @@
 - **No hidden control flow.** No exceptions, no destructors, no overloaded operators. Execution goes where the code says and nowhere else.
 - **No hidden allocation.** No garbage collector and no runtime quietly reaching for the heap. Memory moves when you move it.
 - **Types on the page.** Nothing is inferred. Every binding states its type, so a reader never has to reconstruct what the compiler decided.
-- **One toolchain.** A single binary builds, links, tests, formats, vendors dependencies and cross-compiles. Nothing else to install. It cooks and cleans if you ask nicely.
+- **One toolchain.** A single binary builds, links, tests, formats, vendors dependencies and cross-compiles. The one outside tool it runs is Git, which `mach dep` uses to fetch and pin dependencies; a build never runs it. Nothing else to install. It cooks and cleans if you ask nicely.
 
 Batteries are not included, there is rarely more than one way to do a thing, and the language will not stop you from doing something dangerous. Safety is a decision the programmer makes, not a restriction imposed on them.
 

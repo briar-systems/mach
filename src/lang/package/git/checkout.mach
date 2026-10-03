@@ -1,0 +1,1293 @@
+# checkout: the git half of the source contract that realizes dep/<id>. a dependency is
+# a submodule: its slot is observed (what dep/<id> holds and what the enclosing repository
+# records for it), refused where realizing it would replace work mach did not make, and
+# brought to its pin or selector by initializing, checking out, adopting or adding it. a
+# selector is a `ref` (`branch/`, `tag/` or `commit/`), and a release is read from the
+# `v`-prefixed tags a checkout holds
+use std.allocator.page;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use fs:         std.filesystem;
+use std_format: std.format;
+use io_error:   std.io.error;
+use std.process.env;
+use std.text.string.str_dup;
+use std.text.string.str_dup_range;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use types_path: std.types.path;
+use std.types.result.res;
+use std.types.size.usize;
+use types_string: std.types.string;
+use std.types.string.str;
+use std.types.string.str_contains;
+use std.types.string.str_copy_slice;
+use std.types.string.str_empty;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_starts_with;
+
+use A: std.allocator;
+
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.driver.load;
+use mach.lang.fail;
+use mach.lang.manifest;
+use manifest_version: mach.lang.manifest.version;
+use mach.lang.session;
+
+use driver_closure: mach.lang.driver.closure;
+use mach.lang.package;
+use mach.lang.package.git;
+use git_gitlink: mach.lang.package.git.gitlink;
+use package_pin: mach.lang.package.pin;
+use mach.lang.package.report;
+use package_source: mach.lang.package.source;
+
+fun realize_checkout_target(alloc: *A.Allocator, ref: str) res[str, fail.Fail] {
+    if (str_starts_with(ref, "branch/")) {
+        val name: str = (?ref[7])::str;
+        if (str_empty(name)) { ret res[str, fail.Fail].err{fail.user(diagnostic_kind.DEP_REF_INVALID, "empty branch selector")}; }
+        val sprint_r: res[str, std_format.FormatError] = std_format.sprint(alloc, "origin/{}", name);
+        if (sel sprint_r.err) { ret res[str, fail.Fail].err{fail.message(fail.format_text(sprint_r.err))}; }
+        ret res[str, fail.Fail].ok{sprint_r.ok};
+    }
+    if (str_starts_with(ref, "tag/")) {
+        val name: str = (?ref[4])::str;
+        if (str_empty(name)) { ret res[str, fail.Fail].err{fail.user(diagnostic_kind.DEP_REF_INVALID, "empty tag selector")}; }
+        val sprint_r2: res[str, std_format.FormatError] = std_format.sprint(alloc, "refs/tags/{}", name);
+        if (sel sprint_r2.err) { ret res[str, fail.Fail].err{fail.message(fail.format_text(sprint_r2.err))}; }
+        ret res[str, fail.Fail].ok{sprint_r2.ok};
+    }
+    if (str_starts_with(ref, "commit/")) {
+        val name: str = (?ref[7])::str;
+        if (str_empty(name)) { ret res[str, fail.Fail].err{fail.user(diagnostic_kind.DEP_REF_INVALID, "empty commit selector")}; }
+        val str_copy_slice_r: res[str, types_string.StrError] = str_copy_slice(alloc, name, 0, str_len(name));
+        if (sel str_copy_slice_r.err) { ret res[str, fail.Fail].err{fail.message(fail.str_text(str_copy_slice_r.err))}; }
+        ret res[str, fail.Fail].ok{str_copy_slice_r.ok};
+    }
+    ret res[str, fail.Fail].err{fail.user(diagnostic_kind.DEP_REF_INVALID, "dependency ref must be 'branch/<name>', 'tag/<name>', or 'commit/<id>'")};
+}
+
+fun realize_selector_ref(alloc: *A.Allocator, gi: *git.Inspector, dep_dir: str, ref: str, extra_env: **u8) err[fail.Fail] {
+    val target_r: res[str, fail.Fail] = realize_checkout_target(alloc, ref);
+    if (sel target_r.err) { ret err[fail.Fail].err{target_r.err}; }
+    val target: str                 = target_r.ok;
+    var args:   [3]str              = [3]str{"checkout", "--detach", target};
+    val r:      res[str, fail.Fail] = git.op(alloc, gi, dep_dir, ?args[0], 3, extra_env);
+    str_free(alloc, target);
+    if (sel r.err) { ret err[fail.Fail].err{r.err}; }
+    str_free(alloc, r.ok);
+    ret err[fail.Fail].ok{};
+}
+
+# add dep/<id> as a submodule at the declared selector, refreshing a reused store or checkout from the
+# declared source. `offline` fetches nothing, so the selector is read from what the store or checkout holds
+fun add_submodule(s: *session.Session, gi: *git.Inspector, root: str, id: str, rel: str, dep_full: str,
+    url: str, ref: str, reuse_store: bool, refresh: bool, offline: bool, extra_env: **u8, rep: *report.Report) err[fail.Fail] {
+    if (!git.is_work_tree(s.build_alloc, gi, root)) {
+        ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_NO_REPOSITORY, "dependency registration requires an existing Git repository; create it explicitly with mach init or git init")};
+    }
+    val metadata: err[fail.Fail] = git.require_matches_index(s, gi, id, root, ".gitmodules", "dependency metadata before registration");
+    if (sel metadata.err) { ret metadata; }
+
+    var add_args: [5]str = [5]str{"submodule", "add", url, rel, ""};
+    var add_n:    usize  = 4;
+    if (reuse_store) {
+        add_args = [5]str{"submodule", "add", "--force", url, rel};
+        add_n    = 5;
+    }
+    val add_r: res[str, fail.Fail] = git.op(s.build_alloc, gi, root, ?add_args[0], add_n, extra_env);
+    if (sel add_r.err) {
+        report.notef(rep, s.build_alloc, "note: git submodule add dep/{} failed; inspect native Git state before retrying", id);
+        ret err[fail.Fail].err{add_r.err};
+    }
+    str_free(s.build_alloc, add_r.ok);
+
+    if (refresh) {
+        var sync_args: [4]str              = [4]str{"submodule", "sync", "--", rel};
+        val sync_r:    res[str, fail.Fail] = git.op(s.build_alloc, gi, root, ?sync_args[0], 4, extra_env);
+        if (sel sync_r.err) {
+            report.notef(rep, s.build_alloc, "note: dep/{} was registered; pointing it at the declared source failed; checkout and Git changes retained", id);
+            ret err[fail.Fail].err{sync_r.err};
+        }
+        str_free(s.build_alloc, sync_r.ok);
+    }
+    if (refresh && !offline) {
+        var fetch_args: [4]str              = [4]str{"fetch", "--tags", "origin", "+refs/heads/*:refs/remotes/origin/*"};
+        val fetch_r:    res[str, fail.Fail] = git.op(s.build_alloc, gi, dep_full, ?fetch_args[0], 4, extra_env);
+        if (sel fetch_r.err) {
+            report.notef(rep, s.build_alloc, "note: dep/{} was registered; fetching the declared source failed; checkout and Git changes retained", id);
+            ret err[fail.Fail].err{fetch_r.err};
+        }
+        str_free(s.build_alloc, fetch_r.ok);
+    }
+
+    val sel_r: err[fail.Fail] = realize_selector_ref(s.build_alloc, gi, dep_full, ref, extra_env);
+    if (sel sel_r.err) {
+        report.notef(rep, s.build_alloc, "note: dep/{} was registered; selector checkout failed; checkout and Git changes retained", id);
+        val msg_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "checkout of '{}': {}", ref, fail.describe(sel_r.err));
+        if (sel msg_r.err) { ret err[fail.Fail].err{fail.with_text(sel_r.err, "dependency checkout failed")}; }
+        ret err[fail.Fail].err{fail.with_text(sel_r.err, msg_r.ok)};
+    }
+
+    val id_r: err[fail.Fail] = package.verify_dep_manifest_id(s, dep_full, id);
+    if (sel id_r.err) {
+        report.notef(rep, s.build_alloc, "note: dep/{} was registered and checked out; manifest validation failed; checkout and Git changes retained", id);
+        ret id_r;
+    }
+
+    var stage_args: [3]str              = [3]str{"add", "--", rel};
+    val stage_r:    res[str, fail.Fail] = git.op(s.build_alloc, gi, root, ?stage_args[0], 3, extra_env);
+    if (sel stage_r.err) {
+        report.notef(rep, s.build_alloc, "note: dep/{} was registered and checked out; staging its selected gitlink failed; native state retained", id);
+        val msg_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "staging dependency gitlink: {}", fail.describe(stage_r.err));
+        if (sel msg_r.err) { ret err[fail.Fail].err{fail.with_text(stage_r.err, "staging dependency gitlink failed")}; }
+        ret err[fail.Fail].err{fail.with_text(stage_r.err, msg_r.ok)};
+    }
+    str_free(s.build_alloc, stage_r.ok);
+    ret err[fail.Fail].ok{};
+}
+
+pub fun own_work_tree(alloc: *A.Allocator, dep_full: str) bool {
+    val marker_r: res[str, fail.Fail] = load.join_path(alloc, dep_full, ".git");
+    if (sel marker_r.err) { ret false; }
+    val marker:   str                       = marker_r.ok;
+    val exists_r: res[bool, io_error.Error] = fs.exists(marker);
+    val present:  bool                      = (sel exists_r.ok && exists_r.ok);
+    str_free(alloc, marker);
+    ret present;
+}
+
+fun require_own_work_tree(s: *session.Session, dep_full: str) err[fail.Fail] {
+    if (own_work_tree(s.build_alloc, dep_full)) { ret err[fail.Fail].ok{}; }
+    val msg_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+        "dependency at '{}' is an uninitialized gitlink, not a checkout of its own; run `mach dep pull <path>` on its owning project to realize it", dep_full);
+    if (sel msg_r.err) { ret err[fail.Fail].err{fail.environment(diagnostic_kind.DEP_UNREALIZED, "dependency path is an uninitialized gitlink, not a checkout")}; }
+    ret err[fail.Fail].err{fail.environment(diagnostic_kind.DEP_UNREALIZED, msg_r.ok)};
+}
+
+pub fun revision(s: *session.Session, dep_full: str) res[str, fail.Fail] {
+    val own: err[fail.Fail] = require_own_work_tree(s, dep_full);
+    if (sel own.err) { ret res[str, fail.Fail].err{own.err}; }
+    var gi: git.Inspector  = git.Inspector{program: nil};
+    val er: err[fail.Fail] = git.inspector_require(s.build_alloc, ?gi);
+    if (sel er.err) { ret res[str, fail.Fail].err{er.err}; }
+    var args: [2]str;
+    args[0] = "rev-parse";
+    args[1] = "HEAD";
+    val r: res[str, fail.Fail] = git.query(s.build_alloc, ?gi, dep_full, ?args[0], 2);
+    git.inspector_dnit(s.build_alloc, ?gi);
+    ret r;
+}
+
+# the release version a checkout's HEAD is tagged with (an owned "" when no `v`-prefixed
+# semver tag points at it); the highest wins when several do, and the caller frees the result
+#[testing]
+pub fun release_at_head(s: *session.Session, dep_full: str) res[str, fail.Fail] {
+    val own: err[fail.Fail] = require_own_work_tree(s, dep_full);
+    if (sel own.err) { ret res[str, fail.Fail].err{own.err}; }
+    var gi: git.Inspector = git.Inspector{program: nil};
+    fin { git.inspector_dnit(s.build_alloc, ?gi); }
+    ret release_at(s.build_alloc, ?gi, dep_full, "HEAD");
+}
+
+# the commit dep/<id> is pinned at: the gitlink the index records for it when the root is in a
+# work tree that records one, and the checkout's HEAD otherwise; the caller frees the result
+fun pinned_commit(s: *session.Session, root: str, id: str, dep_full: str) res[str, fail.Fail] {
+    val in_tree: res[bool, fail.Fail] = git_gitlink.tracked(s, root);
+    if (sel in_tree.err) { ret res[str, fail.Fail].err{in_tree.err}; }
+    if (in_tree.ok) {
+        val link: res[opt[str], fail.Fail] = git_gitlink.read(s, root, id);
+        if (sel link.err) { ret res[str, fail.Fail].err{link.err}; }
+        val recorded: opt[str] = link.ok;
+        if (sel recorded.some) { ret res[str, fail.Fail].ok{recorded.some}; }
+    }
+    ret revision(s, dep_full);
+}
+
+# the commit the fixed selector `ref` picks in the checkout at dep_full: a commit or a tag as
+# named, and a branch at dep/<id>'s pin unless `advance` moves it, then at its fetched tip. a
+# revision the checkout lacks is fetched, which `offline` refuses; the caller frees the result
+pub fun selection_commit(s: *session.Session, root: str, id: str, dep_full: str, ref: str,
+    advance: bool, offline: bool) res[str, fail.Fail] {
+    val own: err[fail.Fail] = require_own_work_tree(s, dep_full);
+    if (sel own.err) { ret res[str, fail.Fail].err{own.err}; }
+    val branch: bool = str_starts_with(ref, "branch/");
+    if (branch && !advance) { ret pinned_commit(s, root, id, dep_full); }
+    val a:        *A.Allocator        = s.build_alloc;
+    val target_r: res[str, fail.Fail] = realize_checkout_target(a, ref);
+    if (sel target_r.err) { ret target_r; }
+    val spec_r: res[str, std_format.FormatError] = std_format.sprint(a, "{}{}", target_r.ok, "^{commit}");
+    str_free(a, target_r.ok);
+    if (sel spec_r.err) { ret res[str, fail.Fail].err{fail.message(fail.format_text(spec_r.err))}; }
+    fin { str_free(a, spec_r.ok); }
+    var gi: git.Inspector  = git.Inspector{program: nil};
+    val er: err[fail.Fail] = git.inspector_require(a, ?gi);
+    if (sel er.err) { ret res[str, fail.Fail].err{er.err}; }
+    fin { git.inspector_dnit(a, ?gi); }
+    var args: [4]str = [4]str{"rev-parse", "--verify", "--quiet", spec_r.ok};
+    # a branch the update moves is read at the tip a fetch finds, not the one last fetched
+    if (!branch || offline) {
+        val held: res[str, fail.Fail] = git.query(a, ?gi, dep_full, ?args[0], 4);
+        if (sel held.ok) { ret held; }
+        if (offline)     { ret res[str, fail.Fail].err{offline_ref_missing(a, id, ref, dep_full)}; }
+    }
+    var fetch: [3]str              = [3]str{"fetch", "--all", "--tags"};
+    val f:     res[str, fail.Fail] = git.op(a, ?gi, dep_full, ?fetch[0], 3, nil);
+    if (sel f.err) { ret f; }
+    str_free(a, f.ok);
+    ret git.query(a, ?gi, dep_full, ?args[0], 4);
+}
+
+# the refusal of dep/<id>'s selector `ref`, which the checkout or module store at `dir` does not hold
+# and --offline does not fetch
+fun offline_ref_missing(a: *A.Allocator, id: str, ref: str, dir: str) fail.Fail {
+    val msg: res[str, std_format.FormatError] = std_format.sprint(a,
+        "dependency '{}' selects `ref = \"{}\"`, which {} does not hold, and --offline fetches nothing", id, ref, dir);
+    if (sel msg.err) { ret fail.user(diagnostic_kind.DEP_OFFLINE, "a dependency selects a revision no local checkout or module store holds"); }
+    ret fail.user(diagnostic_kind.DEP_OFFLINE, msg.ok);
+}
+
+# the refusal of dep/<id>, which has neither a checkout nor a module store and --offline does not clone
+fun offline_clone_refused(a: *A.Allocator, id: str, url: str) fail.Fail {
+    val msg: res[str, std_format.FormatError] = std_format.sprint(a,
+        "dependency '{}' has no checkout or module store, and --offline clones nothing from {}", id, url);
+    if (sel msg.err) { ret fail.user(diagnostic_kind.DEP_OFFLINE, "a dependency has no local checkout or module store"); }
+    ret fail.user(diagnostic_kind.DEP_OFFLINE, msg.ok);
+}
+
+# whether the checkout or module store at `dir` holds the commit the selector `ref` names
+fun holds_selector(a: *A.Allocator, gi: *git.Inspector, dir: str, ref: str) res[bool, fail.Fail] {
+    val target_r: res[str, fail.Fail] = realize_checkout_target(a, ref);
+    if (sel target_r.err) { ret res[bool, fail.Fail].err{target_r.err}; }
+    fin { str_free(a, target_r.ok); }
+    ret holds_commit(a, gi, dir, target_r.ok);
+}
+
+# the manifest the commit `rev` of the repository at `dir` holds, allocated from `alloc`
+pub fun manifest_at(alloc: *A.Allocator, dir: str, rev: str) res[manifest.Doc, fail.Fail] {
+    val spec_r: res[str, std_format.FormatError] = std_format.sprint(alloc, "{}:{}", rev, manifest.MANIFEST_FILE);
+    if (sel spec_r.err) { ret res[manifest.Doc, fail.Fail].err{fail.message(fail.format_text(spec_r.err))}; }
+    fin { str_free(alloc, spec_r.ok); }
+    var gi: git.Inspector  = git.Inspector{program: nil};
+    val er: err[fail.Fail] = git.inspector_require(alloc, ?gi);
+    if (sel er.err) { ret res[manifest.Doc, fail.Fail].err{er.err}; }
+    fin { git.inspector_dnit(alloc, ?gi); }
+    var show:  [2]str              = [2]str{"show", spec_r.ok};
+    val shown: res[str, fail.Fail] = git.query_raw(alloc, ?gi, dir, ?show[0], 2);
+    if (sel shown.err) { ret res[manifest.Doc, fail.Fail].err{shown.err}; }
+    val text: str = shown.ok;
+    fin { str_free(alloc, text); }
+    val parsed: res[manifest.Doc, fail.Fail] = manifest.doc_parse(alloc, spec_r.ok, text);
+    if (sel parsed.err) {
+        if (fail.kind_of(parsed.err) != diagnostic_kind.TOML_MALFORMED) { ret parsed; }
+        val msg: res[str, std_format.FormatError] = std_format.sprint(alloc, "{} at {}: {}", dir, spec_r.ok, fail.describe(parsed.err));
+        if (sel msg.err) { ret parsed; }
+        ret res[manifest.Doc, fail.Fail].err{fail.with_text(parsed.err, msg.ok)};
+    }
+    ret parsed;
+}
+
+# the release version dep/<id>'s pin is tagged with, read from its checkout's refs (an owned ""
+# when no release tag points at it); the highest wins, and the caller frees the result. with
+# `fetch`, a checkout no release tag of which names the pin fetches its tags first
+pub fun release_at_pin(s: *session.Session, root: str, id: str, dep_full: str, fetch: bool) res[str, fail.Fail] {
+    val own: err[fail.Fail] = require_own_work_tree(s, dep_full);
+    if (sel own.err) { ret res[str, fail.Fail].err{own.err}; }
+    val pin: res[str, fail.Fail] = pinned_commit(s, root, id, dep_full);
+    if (sel pin.err) { ret pin; }
+    fin { str_free(s.build_alloc, pin.ok); }
+    var gi: git.Inspector = git.Inspector{program: nil};
+    fin { git.inspector_dnit(s.build_alloc, ?gi); }
+    val held: res[str, fail.Fail] = release_at(s.build_alloc, ?gi, dep_full, pin.ok);
+    if (sel held.err)                  { ret held; }
+    if (!fetch || !str_empty(held.ok)) { ret held; }
+    str_free(s.build_alloc, held.ok);
+    val fetched: err[fail.Fail] = fetch_tags(s.build_alloc, ?gi, dep_full);
+    if (sel fetched.err) { ret res[str, fail.Fail].err{fetched.err}; }
+    ret release_at(s.build_alloc, ?gi, dep_full, pin.ok);
+}
+
+# whether the checkout at `dir` holds any tag: one that holds none, as a shallow clone
+# (`git submodule update --depth 1`) does, cannot say which release a commit is
+pub fun has_tags(a: *A.Allocator, gi: *git.Inspector, dir: str) res[bool, fail.Fail] {
+    val er: err[fail.Fail] = git.inspector_require(a, gi);
+    if (sel er.err) { ret res[bool, fail.Fail].err{er.err}; }
+    var args: [3]str              = [3]str{"for-each-ref", "--count=1", "refs/tags"};
+    val r:    res[str, fail.Fail] = git.query(a, gi, dir, ?args[0], 3);
+    if (sel r.err) { ret res[bool, fail.Fail].err{r.err}; }
+    val any: bool = !str_empty(r.ok);
+    str_free(a, r.ok);
+    ret res[bool, fail.Fail].ok{any};
+}
+
+# whether the checkout at dep_full holds any tag, which a shallow clone may not
+pub fun holds_tags(s: *session.Session, dep_full: str) res[bool, fail.Fail] {
+    var gi: git.Inspector = git.Inspector{program: nil};
+    fin { git.inspector_dnit(s.build_alloc, ?gi); }
+    ret has_tags(s.build_alloc, ?gi, dep_full);
+}
+
+fun fetch_tags(a: *A.Allocator, gi: *git.Inspector, dir: str) err[fail.Fail] {
+    val er: err[fail.Fail] = git.inspector_require(a, gi);
+    if (sel er.err) { ret er; }
+    var args: [2]str              = [2]str{"fetch", "--tags"};
+    val f:    res[str, fail.Fail] = git.op(a, gi, dir, ?args[0], 2, nil);
+    if (sel f.err) { ret err[fail.Fail].err{f.err}; }
+    str_free(a, f.ok);
+    ret err[fail.Fail].ok{};
+}
+
+# fetch the tags of dep/<id>'s checkout when it lacks the one its selection reads: the tag a
+# `tag/` ref names, or a release tag naming the pin of a version range; whether it fetched.
+# `offline` fetches nothing
+pub fun fetch_selection_tags(s: *session.Session, root: str, id: str, dep_full: str, ref: str,
+    ranged: bool, offline: bool) res[bool, fail.Fail] {
+    val a: *A.Allocator = s.build_alloc;
+    if (offline) { ret res[bool, fail.Fail].ok{false}; }
+    if (ranged) {
+        val held: res[str, fail.Fail] = release_at_pin(s, root, id, dep_full, false);
+        if (sel held.err) { ret res[bool, fail.Fail].err{held.err}; }
+        val tagged: bool = !str_empty(held.ok);
+        str_free(a, held.ok);
+        if (tagged) { ret res[bool, fail.Fail].ok{false}; }
+    }
+    or (str_starts_with(ref, "tag/")) {
+        val own: err[fail.Fail] = require_own_work_tree(s, dep_full);
+        if (sel own.err) { ret res[bool, fail.Fail].err{own.err}; }
+        val spec_r: res[str, std_format.FormatError] = std_format.sprint(a, "refs/tags/{}^{{commit}}", (?ref[4])::str);
+        if (sel spec_r.err) { ret res[bool, fail.Fail].err{fail.message(fail.format_text(spec_r.err))}; }
+        var args: [4]str         = [4]str{"rev-parse", "--verify", "--quiet", spec_r.ok};
+        var gi:   git.Inspector  = git.Inspector{program: nil};
+        val er:   err[fail.Fail] = git.inspector_require(a, ?gi);
+        if (sel er.err) {
+            str_free(a, spec_r.ok);
+            ret res[bool, fail.Fail].err{er.err};
+        }
+        val held: res[str, fail.Fail] = git.query(a, ?gi, dep_full, ?args[0], 4);
+        git.inspector_dnit(a, ?gi);
+        str_free(a, spec_r.ok);
+        if (sel held.ok) {
+            str_free(a, held.ok);
+            ret res[bool, fail.Fail].ok{false};
+        }
+    }
+    or { ret res[bool, fail.Fail].ok{false}; }
+    var gi: git.Inspector = git.Inspector{program: nil};
+    fin { git.inspector_dnit(a, ?gi); }
+    val fetched: err[fail.Fail] = fetch_tags(a, ?gi, dep_full);
+    if (sel fetched.err) { ret res[bool, fail.Fail].err{fetched.err}; }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# whether dep/<id> is pinned at the release `version` and its checkout is at that pin; a
+# checkout drifted from its gitlink is not, whatever release it holds
+pub fun pinned_at_release(s: *session.Session, root: str, id: str, dep_full: str, version: str) bool {
+    val own: err[fail.Fail] = require_own_work_tree(s, dep_full);
+    if (sel own.err) { ret false; }
+    val pin: res[str, fail.Fail] = pinned_commit(s, root, id, dep_full);
+    if (sel pin.err) { ret false; }
+    fin { str_free(s.build_alloc, pin.ok); }
+    val head: res[str, fail.Fail] = revision(s, dep_full);
+    if (sel head.err) { ret false; }
+    val at_pin: bool = str_equals(head.ok, pin.ok);
+    str_free(s.build_alloc, head.ok);
+    if (!at_pin) { ret false; }
+    var gi: git.Inspector = git.Inspector{program: nil};
+    fin { git.inspector_dnit(s.build_alloc, ?gi); }
+    val rel: res[str, fail.Fail] = release_at(s.build_alloc, ?gi, dep_full, pin.ok);
+    if (sel rel.err) { ret false; }
+    val same: bool = str_equals(rel.ok, version);
+    str_free(s.build_alloc, rel.ok);
+    ret same;
+}
+
+# the release version the commit `rev` of the repository at `dir` is tagged with, read from
+# its local refs (an owned "" when no `v`-prefixed semver tag points at it); the highest
+# wins, and the caller frees the result on every path
+pub fun release_at(a: *A.Allocator, gi: *git.Inspector, dir: str, rev: str) res[str, fail.Fail] {
+    val er: err[fail.Fail] = git.inspector_require(a, gi);
+    if (sel er.err) { ret res[str, fail.Fail].err{er.err}; }
+    var args: [3]str;
+    args[0] = "tag";
+    args[1] = "--points-at";
+    args[2] = rev;
+    val r: res[str, fail.Fail] = git.query_raw(a, gi, dir, ?args[0], 3);
+    if (sel r.err) { ret r; }
+    val text: str   = r.ok;
+    val n:    usize = str_len(text);
+    var best: str   = nil;
+    var bv:   manifest_version.Version;
+    var at:   usize = 0;
+    for (at < n) {
+        var end: usize = at;
+        for (end < n && text[end] != '\n') { end = end + 1; }
+        if (end - at > 1 && text[at] == 'v') {
+            val cut: res[str, A.Error] = str_dup_range(a, text, at + 1, end - at - 1);
+            if (sel cut.err) {
+                str_free(a, text);
+                str_free(a, best);
+                ret res[str, fail.Fail].err{fail.refused(cut.err)};
+            }
+            var kept: bool                               = false;
+            val v:    res[manifest_version.Version, str] = manifest_version.parse_version(cut.ok);
+            if (sel v.ok) {
+                var cand_v: manifest_version.Version = v.ok;
+                if (best == nil || manifest_version.compare(?cand_v, ?bv) > 0) {
+                    str_free(a, best);
+                    best = cut.ok;
+                    bv   = cand_v;
+                    kept = true;
+                }
+            }
+            if (!kept) { str_free(a, cut.ok); }
+        }
+        at = end + 1;
+    }
+    str_free(a, text);
+    if (best == nil) {
+        val none: res[str, A.Error] = str_dup(a, "");
+        if (sel none.err) { ret res[str, fail.Fail].err{fail.refused(none.err)}; }
+        best = none.ok;
+    }
+    ret res[str, fail.Fail].ok{best};
+}
+
+fun clone_env(s: *session.Session, root: str, id: str, url: str, ref: str,
+    extra_env: **u8, rep: *report.Report) err[fail.Fail] {
+    val gi_r: res[git.Inspector, fail.Fail] = git.inspector_init(s.build_alloc);
+    if (sel gi_r.err) { ret err[fail.Fail].err{gi_r.err}; }
+    var gi: git.Inspector = gi_r.ok;
+
+    val dep_full_r: res[str, fail.Fail] = package.dep_full_of(s.build_alloc, root, id);
+    if (sel dep_full_r.err) {
+        git.inspector_dnit(s.build_alloc, ?gi);
+        ret err[fail.Fail].err{dep_full_r.err};
+    }
+    val dep_full:   str                 = dep_full_r.ok;
+    val dep_root_r: res[str, fail.Fail] = load.join_path(s.build_alloc, root, driver_closure.DEP_DIR);
+    if (sel dep_root_r.err) {
+        str_free(s.build_alloc, dep_full);
+        git.inspector_dnit(s.build_alloc, ?gi);
+        ret err[fail.Fail].err{dep_root_r.err};
+    }
+    val dep_root:         str             = dep_root_r.ok;
+    val create_dir_all_r: err[fs.FsError] = fs.create_dir_all(s.build_alloc, dep_root, 0o755);
+    if (sel create_dir_all_r.err) {
+        str_free(s.build_alloc, dep_root);
+        str_free(s.build_alloc, dep_full);
+        git.inspector_dnit(s.build_alloc, ?gi);
+        ret err[fail.Fail].err{fail.environment(diagnostic_kind.FS_WRITE, "cannot create the dependency directory")};
+    }
+
+    var clone_args: [3]str;
+    clone_args[0] = "clone";
+    clone_args[1] = url;
+    clone_args[2] = id;
+    val clone_r: res[str, fail.Fail] = git.op(s.build_alloc, ?gi, dep_root, ?clone_args[0], 3, extra_env);
+    str_free(s.build_alloc, dep_root);
+    if (sel clone_r.err) {
+        report.notef(rep, s.build_alloc, "note: cloning dep/{} failed; existing and partial checkouts retained", id);
+        str_free(s.build_alloc, dep_full);
+        git.inspector_dnit(s.build_alloc, ?gi);
+        ret err[fail.Fail].err{clone_r.err};
+    }
+    str_free(s.build_alloc, clone_r.ok);
+
+    val sel_r: err[fail.Fail] = realize_selector_ref(s.build_alloc, ?gi, dep_full, ref, extra_env);
+    if (sel sel_r.err) {
+        report.notef(rep, s.build_alloc, "note: dep/{} was cloned; selector checkout failed; clone retained", id);
+        val fault: str                              = fail.describe(sel_r.err);
+        val msg_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "checkout of '{}': {}", ref, fault);
+        str_free(s.build_alloc, dep_full);
+        git.inspector_dnit(s.build_alloc, ?gi);
+        if (sel msg_r.err) { ret err[fail.Fail].err{fail.with_text(sel_r.err, "dependency checkout failed")}; }
+        ret err[fail.Fail].err{fail.with_text(sel_r.err, msg_r.ok)};
+    }
+
+    val id_r: err[fail.Fail] = package.verify_dep_manifest_id(s, dep_full, id);
+    if (sel id_r.err) {
+        report.notef(rep, s.build_alloc, "note: dep/{} was cloned and checked out; manifest validation failed; clone retained", id);
+        val fault: str = fail.describe(id_r.err);
+        str_free(s.build_alloc, dep_full);
+        git.inspector_dnit(s.build_alloc, ?gi);
+        ret err[fail.Fail].err{fail.with_text(id_r.err, fault)};
+    }
+
+    str_free(s.build_alloc, dep_full);
+    git.inspector_dnit(s.build_alloc, ?gi);
+    ret err[fail.Fail].ok{};
+}
+
+# what occupies dep/<id>
+val SLOT_ABSENT:   u8 = 0;
+val SLOT_EMPTY:    u8 = 1;
+val SLOT_CHECKOUT: u8 = 2;
+val SLOT_OCCUPIED: u8 = 3;
+val SLOT_SYMLINK:  u8 = 4;
+val SLOT_ENTRY:    u8 = 5;
+
+# a git dependency's slot: what dep/<id> holds, and its record in the enclosing
+# repository. the record lives at `top`, the repository's top level where
+# .gitmodules is, under the path `record`: dep/<id> when the project root is the
+# repository root, and the project's prefix ahead of it when the project is a
+# subdirectory of a repository, so a committed gitlink under a subproject is
+# its pin exactly as the root's is. `top` is empty when the root is in no work
+# tree, and then there is no record to read
+pub rec Slot {
+    tree:       u8;
+    top:        str;
+    record:     str;
+    gitlink:    opt[str];
+    registered: bool;
+    store:      bool;
+}
+
+pub fun slot_dnit(alloc: *A.Allocator, slot: *Slot) {
+    val gitlink: opt[str] = slot.gitlink;
+    if (sel gitlink.some) { str_free(alloc, gitlink.some); }
+    slot.gitlink = opt[str].none{};
+    if (!str_empty(slot.top))    { str_free(alloc, slot.top); }
+    if (!str_empty(slot.record)) { str_free(alloc, slot.record); }
+    slot.top    = "";
+    slot.record = "";
+}
+
+# whether the slot has a record to read or write: the project root is a
+# repository root, or a subdirectory of one
+fun slot_recorded(slot: *Slot) bool {
+    ret !str_empty(slot.top);
+}
+
+# where dep/<id>'s record lives: the repository root records at dep/<id>
+# itself; a subproject records at the repository's top level under its prefix.
+# `top` and `record` come back empty for a root in no work tree
+fun slot_record_place(s: *session.Session, gi: *git.Inspector, root: str, rel: str, mode: u8,
+    top: *str, record: *str) err[fail.Fail] {
+    @top    = "";
+    @record = "";
+    if (mode == package_pin.REPOSITORY_ROOT) {
+        val top_r: res[str, types_string.StrError] = types_string.str_copy(s.build_alloc, root);
+        if (sel top_r.err) { ret err[fail.Fail].err{fail.message(fail.str_text(top_r.err))}; }
+        val rec_r: res[str, types_string.StrError] = types_string.str_copy(s.build_alloc, rel);
+        if (sel rec_r.err) {
+            str_free(s.build_alloc, top_r.ok);
+            ret err[fail.Fail].err{fail.message(fail.str_text(rec_r.err))};
+        }
+        @top    = top_r.ok;
+        @record = rec_r.ok;
+        ret err[fail.Fail].ok{};
+    }
+    if (!git.is_work_tree(s.build_alloc, gi, root)) { ret err[fail.Fail].ok{}; }
+    var top_args: [2]str              = [2]str{"rev-parse", "--show-toplevel"};
+    val top_r:    res[str, fail.Fail] = git.query(s.build_alloc, gi, root, ?top_args[0], 2);
+    if (sel top_r.err) { ret err[fail.Fail].err{top_r.err}; }
+    val prefix_r: res[str, fail.Fail] = git.declaring_prefix(s, gi, "project", root);
+    if (sel prefix_r.err) {
+        str_free(s.build_alloc, top_r.ok);
+        ret err[fail.Fail].err{prefix_r.err};
+    }
+    val record_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "{}{}", prefix_r.ok, rel);
+    str_free(s.build_alloc, prefix_r.ok);
+    if (sel record_r.err) {
+        str_free(s.build_alloc, top_r.ok);
+        ret err[fail.Fail].err{fail.message(fail.format_text(record_r.err))};
+    }
+    @top    = top_r.ok;
+    @record = record_r.ok;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun slot_tree(alloc: *A.Allocator, dep_full: str) res[u8, fail.Fail] {
+    val link_r: res[bool, io_error.Error] = fs.is_symlink(dep_full);
+    if ((sel link_r.ok && link_r.ok)) { ret res[u8, fail.Fail].ok{SLOT_SYMLINK}; }
+    val exists_r: res[bool, io_error.Error] = fs.exists(dep_full);
+    if (sel exists_r.err) { ret res[u8, fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, fail.io_text(exists_r.err))}; }
+    if (!exists_r.ok)     { ret res[u8, fail.Fail].ok{SLOT_ABSENT}; }
+    val dir_r: res[bool, io_error.Error] = fs.is_dir(dep_full);
+    if (!(sel dir_r.ok && dir_r.ok))    { ret res[u8, fail.Fail].ok{SLOT_ENTRY}; }
+    if (own_work_tree(alloc, dep_full)) { ret res[u8, fail.Fail].ok{SLOT_CHECKOUT}; }
+    val names_r: res[Vector[str], fs.FsError] = fs.read_dir(alloc, dep_full);
+    if (sel names_r.err) { ret res[u8, fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, fail.fs_text(names_r.err))}; }
+    var names: Vector[str] = names_r.ok;
+    val empty: bool        = names.len == 0;
+    package.free_name_vector(alloc, ?names);
+    if (empty) { ret res[u8, fail.Fail].ok{SLOT_EMPTY}; }
+    ret res[u8, fail.Fail].ok{SLOT_OCCUPIED};
+}
+
+# the absolute path of the git directory git keeps a recorded slot's submodule in,
+# whether or not it exists; the caller frees it
+fun module_store_of(s: *session.Session, gi: *git.Inspector, slot: *Slot) res[str, fail.Fail] {
+    val module_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "modules/{}", slot.record);
+    if (sel module_r.err) { ret res[str, fail.Fail].err{fail.message(fail.format_text(module_r.err))}; }
+    fin { str_free(s.build_alloc, module_r.ok); }
+    var store_args: [3]str              = [3]str{"rev-parse", "--git-path", module_r.ok};
+    val store_r:    res[str, fail.Fail] = git.query(s.build_alloc, gi, slot.top, ?store_args[0], 3);
+    if (sel store_r.err)               { ret store_r; }
+    if (types_path.is_abs(store_r.ok)) { ret store_r; }
+    val joined: res[str, fail.Fail] = load.join_path(s.build_alloc, slot.top, store_r.ok);
+    str_free(s.build_alloc, store_r.ok);
+    if (sel joined.err) { ret res[str, fail.Fail].err{joined.err}; }
+    ret res[str, fail.Fail].ok{joined.ok};
+}
+
+pub fun observe_slot(s: *session.Session, root: str, id: str, mode: u8) res[Slot, fail.Fail] {
+    var slot:       Slot                = Slot{tree: SLOT_ABSENT, top: "", record: "", gitlink: opt[str].none{}, registered: false, store: false};
+    val dep_full_r: res[str, fail.Fail] = package.dep_full_of(s.build_alloc, root, id);
+    if (sel dep_full_r.err) { ret res[Slot, fail.Fail].err{dep_full_r.err}; }
+    val dep_full: str = dep_full_r.ok;
+    fin { str_free(s.build_alloc, dep_full); }
+    val tree_r: res[u8, fail.Fail] = slot_tree(s.build_alloc, dep_full);
+    if (sel tree_r.err) { ret res[Slot, fail.Fail].err{tree_r.err}; }
+    slot.tree = tree_r.ok;
+
+    val rel_r: res[str, fail.Fail] = package.dep_rel_of(s.build_alloc, id);
+    if (sel rel_r.err) { ret res[Slot, fail.Fail].err{rel_r.err}; }
+    val rel: str = rel_r.ok;
+    fin { str_free(s.build_alloc, rel); }
+    var gi:       git.Inspector  = git.Inspector{program: nil};
+    val required: err[fail.Fail] = git.inspector_require(s.build_alloc, ?gi);
+    if (sel required.err) { ret res[Slot, fail.Fail].err{required.err}; }
+    fin { git.inspector_dnit(s.build_alloc, ?gi); }
+    val placed: err[fail.Fail] = slot_record_place(s, ?gi, root, rel, mode, ?slot.top, ?slot.record);
+    if (sel placed.err)        { ret res[Slot, fail.Fail].err{placed.err}; }
+    if (!slot_recorded(?slot)) { ret res[Slot, fail.Fail].ok{slot}; }
+    var placed_slot: bool = false;
+    fin {
+        if (!placed_slot) { slot_dnit(s.build_alloc, ?slot); }
+    }
+
+    val key_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "submodule.{}.path", slot.record);
+    if (sel key_r.err) { ret res[Slot, fail.Fail].err{fail.message(fail.format_text(key_r.err))}; }
+    fin { str_free(s.build_alloc, key_r.ok); }
+    var config_args: [7]str              = [7]str{"config", "-f", ".gitmodules", "--default", "", "--get", key_r.ok};
+    val config_r:    res[str, fail.Fail] = git.query(s.build_alloc, ?gi, slot.top, ?config_args[0], 7);
+    if (sel config_r.err) { ret res[Slot, fail.Fail].err{config_r.err}; }
+    slot.registered = str_equals(config_r.ok, slot.record);
+    str_free(s.build_alloc, config_r.ok);
+
+    val store_r: res[str, fail.Fail] = module_store_of(s, ?gi, ?slot);
+    if (sel store_r.err) { ret res[Slot, fail.Fail].err{store_r.err}; }
+    val store_dir: res[bool, io_error.Error] = fs.is_dir(store_r.ok);
+    str_free(s.build_alloc, store_r.ok);
+    slot.store = (sel store_dir.ok && store_dir.ok);
+
+    val link_r: res[opt[str], fail.Fail] = git_gitlink.read(s, root, id);
+    if (sel link_r.err) { ret res[Slot, fail.Fail].err{link_r.err}; }
+    slot.gitlink = link_r.ok;
+    placed_slot  = true;
+    ret res[Slot, fail.Fail].ok{slot};
+}
+
+# refuse a slot whose realization would replace or record work mach did not make
+pub fun refuse_slot(s: *session.Session, root: str, id: str, mode: u8, slot: *Slot, accept: bool) err[fail.Fail] {
+    if (slot.tree == SLOT_SYMLINK) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_NOT_DIRECTORY, "dependency checkout is a symlink; existing entry retained")}; }
+    if (slot.tree == SLOT_ENTRY) {
+        val msg_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "dep/{} is not a directory; existing entry retained", id);
+        if (sel msg_r.err) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_NOT_DIRECTORY, "dependency path is not a directory; existing entry retained")}; }
+        ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_NOT_DIRECTORY, msg_r.ok)};
+    }
+    if (slot.tree == SLOT_OCCUPIED) {
+        val msg_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+            "dep/{} exists but is neither a checkout of its own nor an empty gitlink placeholder; move it aside and run `mach dep pull <path>` for project '{}'", id, root);
+        if (sel msg_r.err) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_SLOT_OCCUPIED, "dependency directory is neither a checkout nor an empty placeholder")}; }
+        ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_SLOT_OCCUPIED, msg_r.ok)};
+    }
+    if (slot.tree != SLOT_CHECKOUT) { ret err[fail.Fail].ok{}; }
+    val pinned:   opt[str] = slot.gitlink;
+    val adopting: bool     = mode == package_pin.REPOSITORY_ROOT && (sel pinned.none);
+    if (!accept && !adopting) { ret err[fail.Fail].ok{}; }
+
+    val dep_full_r: res[str, fail.Fail] = package.dep_full_of(s.build_alloc, root, id);
+    if (sel dep_full_r.err) { ret err[fail.Fail].err{dep_full_r.err}; }
+    fin { str_free(s.build_alloc, dep_full_r.ok); }
+    var gi:       git.Inspector  = git.Inspector{program: nil};
+    val required: err[fail.Fail] = git.inspector_require(s.build_alloc, ?gi);
+    if (sel required.err) { ret required; }
+    fin { git.inspector_dnit(s.build_alloc, ?gi); }
+    var status_args: [3]str              = [3]str{"status", "--porcelain=v1", "--untracked-files=all"};
+    val status_r:    res[str, fail.Fail] = git.query_named(s, ?gi, id, dep_full_r.ok, ?status_args[0], 3, "checkout cleanliness");
+    if (sel status_r.err) { ret err[fail.Fail].err{status_r.err}; }
+    val status: str = status_r.ok;
+    if (str_empty(status)) {
+        str_free(s.build_alloc, status);
+        ret err[fail.Fail].ok{};
+    }
+    val msg_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc,
+        "dependency '{}': checkout is dirty; commit or discard its changes, existing checkout retained:\n{}", id, status);
+    str_free(s.build_alloc, status);
+    if (sel msg_r.err) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_DIRTY, "dependency checkout is dirty; existing checkout retained")}; }
+    ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_DIRTY, msg_r.ok)};
+}
+
+# bring a slot `refuse_slot` accepted to the realization `mach dep verify` checks. a pin its
+# checkout does not hold is fetched, or refused when `offline`. offline, an uninitialized gitlink
+# is initialized only from a module store that holds its pin, a subproject's dependency is never
+# cloned, and a dependency with no gitlink is added only over a checkout or store holding its selector
+pub fun realize_slot(s: *session.Session, root: str, id: str, url: str, ref: str, mode: u8,
+    slot: *Slot, offline: bool, rep: *report.Report) res[u8, fail.Fail] {
+    ret realize_slot_env(s, root, id, url, ref, mode, slot, offline, nil, rep);
+}
+
+# whether the checkout or module store at `dir` holds the commit `rev`. `dir` stands in
+# as the work tree, since a store's recorded one is missing while its checkout is
+fun holds_commit(a: *A.Allocator, gi: *git.Inspector, dir: str, rev: str) res[bool, fail.Fail] {
+    val spec_r: res[str, std_format.FormatError] = std_format.sprint(a, "{}^{{commit}}", rev);
+    if (sel spec_r.err) { ret res[bool, fail.Fail].err{fail.message(fail.format_text(spec_r.err))}; }
+    fin { str_free(a, spec_r.ok); }
+    var args: [5]str              = [5]str{"--work-tree=.", "rev-parse", "--verify", "--quiet", spec_r.ok};
+    val r:    res[str, fail.Fail] = git.query(a, gi, dir, ?args[0], 5);
+    if (sel r.err) { ret res[bool, fail.Fail].ok{false}; }
+    str_free(a, r.ok);
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# bring the commit `pin` into dep/<id>'s checkout when it lacks it, as a moved gitlink needs:
+# fetched by commit, or with every ref when the remote refuses a fetch by commit. offline
+# fetches nothing, so a missing pin is refused
+fun hold_commit(s: *session.Session, gi: *git.Inspector, id: str, dep_full: str, pin: str,
+    offline: bool, extra_env: **u8) err[fail.Fail] {
+    val a:    *A.Allocator         = s.build_alloc;
+    val held: res[bool, fail.Fail] = holds_commit(a, gi, dep_full, pin);
+    if (sel held.err) { ret err[fail.Fail].err{held.err}; }
+    if (held.ok)      { ret err[fail.Fail].ok{}; }
+    if (offline) {
+        val msg: res[str, std_format.FormatError] = std_format.sprint(a,
+            "dependency '{}' is pinned at commit {}, which its checkout at {} does not hold, and --offline fetches nothing", id, pin, dep_full);
+        if (sel msg.err) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_OFFLINE, "a dependency is pinned at a commit its checkout does not hold")}; }
+        ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_OFFLINE, msg.ok)};
+    }
+    var by_commit: [3]str              = [3]str{"fetch", "origin", pin};
+    val fc:        res[str, fail.Fail] = git.op(a, gi, dep_full, ?by_commit[0], 3, extra_env);
+    if (sel fc.ok) { str_free(a, fc.ok); }
+    or {
+        var every: [3]str              = [3]str{"fetch", "--all", "--tags"};
+        val fa:    res[str, fail.Fail] = git.op(a, gi, dep_full, ?every[0], 3, extra_env);
+        if (sel fa.err) { ret err[fail.Fail].err{fa.err}; }
+        str_free(a, fa.ok);
+    }
+    val fetched: res[bool, fail.Fail] = holds_commit(a, gi, dep_full, pin);
+    if (sel fetched.err) { ret err[fail.Fail].err{fetched.err}; }
+    if (fetched.ok)      { ret err[fail.Fail].ok{}; }
+    val msg: res[str, std_format.FormatError] = std_format.sprint(a,
+        "dependency '{}' is pinned at commit {}, which its remote does not serve; checkout at {} retained", id, pin, dep_full);
+    if (sel msg.err) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_FETCH, "a dependency is pinned at a commit its remote does not serve")}; }
+    ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_FETCH, msg.ok)};
+}
+
+# offline, an uninitialized gitlink is initialized only from the module store git kept
+# for it, and only when that store holds the pin; anything else would fetch, so it is refused
+fun offline_init_source(s: *session.Session, gi: *git.Inspector, id: str, slot: *Slot, pin: str) err[fail.Fail] {
+    val a:       *A.Allocator        = s.build_alloc;
+    val store_r: res[str, fail.Fail] = module_store_of(s, gi, slot);
+    if (sel store_r.err) { ret err[fail.Fail].err{store_r.err}; }
+    val store: str = store_r.ok;
+    fin { str_free(a, store); }
+    var held: bool = false;
+    if (slot.store) {
+        val held_r: res[bool, fail.Fail] = holds_commit(a, gi, store, pin);
+        if (sel held_r.err) { ret err[fail.Fail].err{held_r.err}; }
+        held = held_r.ok;
+    }
+    if (held) { ret err[fail.Fail].ok{}; }
+    val msg: res[str, std_format.FormatError] = std_format.sprint(a,
+        "dependency '{}' has no checkout, and its pin {} is not in a local module store at {}; --offline fetches nothing", id, pin, store);
+    if (sel msg.err) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_OFFLINE, "a dependency is pinned at a commit no local checkout or module store holds")}; }
+    ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_OFFLINE, msg.ok)};
+}
+
+# offline, a dependency with no gitlink is added only over the checkout it adopts or the module
+# store git kept for it, and only when that holds its selector; anything else would fetch or clone
+fun offline_add_source(s: *session.Session, gi: *git.Inspector, id: str, url: str, ref: str, slot: *Slot,
+    dep_full: str, adopting: bool) err[fail.Fail] {
+    val a: *A.Allocator = s.build_alloc;
+    if (adopting) {
+        val held: res[bool, fail.Fail] = holds_selector(a, gi, dep_full, ref);
+        if (sel held.err) { ret err[fail.Fail].err{held.err}; }
+        if (!held.ok)     { ret err[fail.Fail].err{offline_ref_missing(a, id, ref, dep_full)}; }
+        ret err[fail.Fail].ok{};
+    }
+    if (!slot.store) { ret err[fail.Fail].err{offline_clone_refused(a, id, url)}; }
+    val store_r: res[str, fail.Fail] = module_store_of(s, gi, slot);
+    if (sel store_r.err) { ret err[fail.Fail].err{store_r.err}; }
+    val store: str = store_r.ok;
+    fin { str_free(a, store); }
+    val held: res[bool, fail.Fail] = holds_selector(a, gi, store, ref);
+    if (sel held.err) { ret err[fail.Fail].err{held.err}; }
+    if (!held.ok)     { ret err[fail.Fail].err{offline_ref_missing(a, id, ref, store)}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun realize_slot_env(s: *session.Session, root: str, id: str, url: str, ref: str, mode: u8,
+    slot: *Slot, offline: bool, extra_env: **u8, rep: *report.Report) res[u8, fail.Fail] {
+    # a subproject's dependency is a plain clone unless the enclosing repository
+    # commits a gitlink for it, and then that gitlink is its pin like the root's
+    val recorded_pin: opt[str] = slot.gitlink;
+    if (mode != package_pin.REPOSITORY_ROOT && (sel recorded_pin.none)) {
+        if (slot.tree == SLOT_CHECKOUT) { ret res[u8, fail.Fail].ok{package_source.REALIZED_NOTHING}; }
+        if (offline)                    { ret res[u8, fail.Fail].err{offline_clone_refused(s.build_alloc, id, url)}; }
+        val cloned: err[fail.Fail] = clone_env(s, root, id, url, ref, extra_env, rep);
+        if (sel cloned.err) { ret res[u8, fail.Fail].err{cloned.err}; }
+        ret res[u8, fail.Fail].ok{package_source.REALIZED_CLONED};
+    }
+
+    var gi:       git.Inspector  = git.Inspector{program: nil};
+    val required: err[fail.Fail] = git.inspector_require(s.build_alloc, ?gi);
+    if (sel required.err) { ret res[u8, fail.Fail].err{required.err}; }
+    fin { git.inspector_dnit(s.build_alloc, ?gi); }
+    val rel_r: res[str, fail.Fail] = package.dep_rel_of(s.build_alloc, id);
+    if (sel rel_r.err) { ret res[u8, fail.Fail].err{rel_r.err}; }
+    val rel: str = rel_r.ok;
+    fin { str_free(s.build_alloc, rel); }
+    val dep_full_r: res[str, fail.Fail] = package.dep_full_of(s.build_alloc, root, id);
+    if (sel dep_full_r.err) { ret res[u8, fail.Fail].err{dep_full_r.err}; }
+    val dep_full: str = dep_full_r.ok;
+    fin { str_free(s.build_alloc, dep_full); }
+
+    val pinned: opt[str] = slot.gitlink;
+    if (sel pinned.some) {
+        var effect: u8 = package_source.REALIZED_NOTHING;
+        if (!slot.registered) {
+            val registered: err[fail.Fail] = git_gitlink.register(s, ?gi, slot.top, id, slot.record, url, extra_env, rep);
+            if (sel registered.err) { ret res[u8, fail.Fail].err{registered.err}; }
+            effect = package_source.REALIZED_REGISTERED;
+        }
+        if (slot.tree != SLOT_CHECKOUT) {
+            var init_args: [6]str = [6]str{"submodule", "update", "--init", "--", rel, ""};
+            var init_n:    usize  = 5;
+            if (offline) {
+                val local: err[fail.Fail] = offline_init_source(s, ?gi, id, slot, pinned.some);
+                if (sel local.err) { ret res[u8, fail.Fail].err{local.err}; }
+                init_args = [6]str{"submodule", "update", "--init", "--no-fetch", "--", rel};
+                init_n    = 6;
+            }
+            val init_r: res[str, fail.Fail] = git.op(s.build_alloc, ?gi, root, ?init_args[0], init_n, extra_env);
+            if (sel init_r.err) { ret res[u8, fail.Fail].err{init_r.err}; }
+            str_free(s.build_alloc, init_r.ok);
+            ret res[u8, fail.Fail].ok{package_source.REALIZED_INITIALIZED};
+        }
+        var head_args: [2]str              = [2]str{"rev-parse", "HEAD"};
+        val head_r:    res[str, fail.Fail] = git.query(s.build_alloc, ?gi, dep_full, ?head_args[0], 2);
+        if (sel head_r.err) { ret res[u8, fail.Fail].err{head_r.err}; }
+        val at_pin: bool = str_equals(head_r.ok, pinned.some);
+        str_free(s.build_alloc, head_r.ok);
+        if (at_pin) { ret res[u8, fail.Fail].ok{effect}; }
+        val held: err[fail.Fail] = hold_commit(s, ?gi, id, dep_full, pinned.some, offline, extra_env);
+        if (sel held.err) { ret res[u8, fail.Fail].err{held.err}; }
+        var checkout_args: [3]str              = [3]str{"checkout", "--detach", pinned.some};
+        val checkout_r:    res[str, fail.Fail] = git.op(s.build_alloc, ?gi, dep_full, ?checkout_args[0], 3, extra_env);
+        if (sel checkout_r.err) { ret res[u8, fail.Fail].err{checkout_r.err}; }
+        str_free(s.build_alloc, checkout_r.ok);
+        ret res[u8, fail.Fail].ok{package_source.REALIZED_PINNED};
+    }
+
+    val adopting: bool = slot.tree == SLOT_CHECKOUT;
+    if (offline) {
+        val local: err[fail.Fail] = offline_add_source(s, ?gi, id, url, ref, slot, dep_full, adopting);
+        if (sel local.err) { ret res[u8, fail.Fail].err{local.err}; }
+    }
+    # git adds a submodule only where nothing is, so an empty placeholder goes first
+    if (slot.tree == SLOT_EMPTY) {
+        val cleared: err[io_error.Error] = fs.remove_dir(dep_full);
+        if (sel cleared.err) { ret res[u8, fail.Fail].err{fail.environment(diagnostic_kind.FS_REMOVE, fail.io_text(cleared.err))}; }
+    }
+    val added: err[fail.Fail] = add_submodule(s, ?gi, root, id, rel, dep_full, url, ref,
+        slot.store && !adopting, slot.store || adopting, offline, extra_env, rep);
+    if (sel added.err) { ret res[u8, fail.Fail].err{added.err}; }
+    if (adopting)      { ret res[u8, fail.Fail].ok{package_source.REALIZED_ADOPTED}; }
+    ret res[u8, fail.Fail].ok{package_source.REALIZED_CLONED};
+}
+
+# bring dep/<id> to an acquisition: its slot is observed, refused where realizing it would
+# replace or record work mach did not make, and realized
+# ---
+# s:   the session
+# q:   the acquisition
+# rep: receives the notes naming what a failure left behind
+# ret: what changed, a source.mach REALIZED_* value
+pub fun acquire(s: *session.Session, q: *package_source.Acquisition, rep: *report.Report) res[u8, fail.Fail] {
+    val observed: res[Slot, fail.Fail] = observe_slot(s, q.root, q.id, q.mode);
+    if (sel observed.err) { ret res[u8, fail.Fail].err{observed.err}; }
+    var slot: Slot = observed.ok;
+    fin { slot_dnit(s.build_alloc, ?slot); }
+    # a range has no selector of its own: its pin is the recorded gitlink, or the
+    # checkout already there; with neither there is nothing to realize
+    val pinned: opt[str] = slot.gitlink;
+    if (q.pinned_only && (sel pinned.none) && slot.tree != SLOT_CHECKOUT) { ret res[u8, fail.Fail].ok{package_source.REALIZED_UNPINNED}; }
+    val refused: err[fail.Fail] = refuse_slot(s, q.root, q.id, q.mode, ?slot, q.accept);
+    if (sel refused.err) { ret res[u8, fail.Fail].err{refused.err}; }
+    ret realize_slot(s, q.root, q.id, q.url, q.selector, q.mode, ?slot, q.offline, rep);
+}
+
+#[testing]
+fun realize_env(s: *session.Session, root: str, id: str, url: str, ref: str, mode: u8,
+    accept: bool, extra_env: **u8) res[u8, fail.Fail] {
+    var quiet: report.Report = report.discard(s.build_alloc);
+    fin { report.dnit(?quiet); }
+    val observed: res[Slot, fail.Fail] = observe_slot(s, root, id, mode);
+    if (sel observed.err) { ret res[u8, fail.Fail].err{observed.err}; }
+    var slot: Slot = observed.ok;
+    fin { slot_dnit(s.build_alloc, ?slot); }
+    val refused: err[fail.Fail] = refuse_slot(s, root, id, mode, ?slot, accept);
+    if (sel refused.err) { ret res[u8, fail.Fail].err{refused.err}; }
+    ret realize_slot_env(s, root, id, url, ref, mode, ?slot, false, extra_env, ?quiet);
+}
+
+# check dep/<id>'s checkout out at the selector `ref` after fetching every ref; `offline` fetches
+# nothing, so a selector the checkout does not hold is refused
+pub fun fetch_and_checkout(s: *session.Session, id: str, dep_full: str, ref: str, offline: bool, rep: *report.Report) err[fail.Fail] {
+    val own: err[fail.Fail] = require_own_work_tree(s, dep_full);
+    if (sel own.err) { ret err[fail.Fail].err{own.err}; }
+    var gi: git.Inspector  = git.Inspector{program: nil};
+    val er: err[fail.Fail] = git.inspector_require(s.build_alloc, ?gi);
+    if (sel er.err) { ret err[fail.Fail].err{er.err}; }
+    if (offline) {
+        val held: res[bool, fail.Fail] = holds_selector(s.build_alloc, ?gi, dep_full, ref);
+        if (sel held.err) {
+            git.inspector_dnit(s.build_alloc, ?gi);
+            ret err[fail.Fail].err{held.err};
+        }
+        if (!held.ok) {
+            git.inspector_dnit(s.build_alloc, ?gi);
+            ret err[fail.Fail].err{offline_ref_missing(s.build_alloc, id, ref, dep_full)};
+        }
+        val out: err[fail.Fail] = realize_selector_ref(s.build_alloc, ?gi, dep_full, ref, nil);
+        git.inspector_dnit(s.build_alloc, ?gi);
+        ret out;
+    }
+    var fetch_args: [3]str;
+    fetch_args[0] = "fetch";
+    fetch_args[1] = "--all";
+    fetch_args[2] = "--tags";
+    val f: res[str, fail.Fail] = git.op(s.build_alloc, ?gi, dep_full, ?fetch_args[0], 3, nil);
+    if (sel f.err) {
+        git.inspector_dnit(s.build_alloc, ?gi);
+        ret err[fail.Fail].err{f.err};
+    }
+    str_free(s.build_alloc, f.ok);
+    val r: err[fail.Fail] = realize_selector_ref(s.build_alloc, ?gi, dep_full, ref, nil);
+    git.inspector_dnit(s.build_alloc, ?gi);
+    if (sel r.err) { report.notef(rep, s.build_alloc, "note: fetched {}; selector checkout failed; fetched objects and existing checkout retained", dep_full); }
+    ret r;
+}
+
+# whether a moved checkout of dep/<id> is to be staged: always in a repository
+# root, where the gitlink is the pin, and in a subproject exactly when the
+# enclosing repository already records a gitlink for it
+pub fun gitlink_recorded(s: *session.Session, root: str, id: str, mode: u8) res[bool, fail.Fail] {
+    if (mode == package_pin.REPOSITORY_ROOT) { ret res[bool, fail.Fail].ok{true}; }
+    val observed: res[Slot, fail.Fail] = observe_slot(s, root, id, mode);
+    if (sel observed.err) { ret res[bool, fail.Fail].err{observed.err}; }
+    var slot: Slot = observed.ok;
+    fin { slot_dnit(s.build_alloc, ?slot); }
+    val pinned: opt[str] = slot.gitlink;
+    ret res[bool, fail.Fail].ok{sel pinned.some};
+}
+
+test realize_git_dependency__succeeds_and_stages_gitlink {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val gi_r: res[git.Inspector, fail.Fail] = git.inspector_init(?alloc);
+    if (sel gi_r.err) { ret 1; }
+    var gi: git.Inspector = gi_r.ok;
+
+    val fixture_r: res[str, fail.Fail] = git.t_make_fixture_repo(?alloc, ?gi, "std");
+    if (sel fixture_r.err) {
+        git.inspector_dnit(?alloc, ?gi);
+        ret 1;
+    }
+    val fixture: str = fixture_r.ok;
+
+    val root_r: res[str, fail.Fail] = git.t_scratch_dir(?alloc, "mach_dep_realize_root");
+    if (sel root_r.err) {
+        git.inspector_dnit(?alloc, ?gi);
+        ret 1;
+    }
+    val root: str = root_r.ok;
+
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) {
+        git.inspector_dnit(?alloc, ?gi);
+        ret 1;
+    }
+    var s: session.Session = sr.ok;
+
+    val initialize_repository_r: err[fail.Fail] = git_gitlink.begin(?s, root);
+    if (sel initialize_repository_r.err) { ret 1; }
+    var env: [4]*u8;
+    git.t_env_allow_file_protocol(?env[0]);
+    val real_r: res[u8, fail.Fail] = realize_env(?s, root, "std", fixture, "branch/main", package_pin.REPOSITORY_ROOT, false, ?env[0]);
+    var bad:    i32                = 0;
+    if (sel real_r.err) { bad = 1; }
+
+    if (bad == 0) {
+        val dep_full_r: res[str, A.Error] = types_path.join(?alloc, root, "dep/std");
+        if (sel dep_full_r.err) { ret 99; }
+        val dep_full: str                       = dep_full_r.ok;
+        val is_dir_r: res[bool, io_error.Error] = fs.is_dir(dep_full);
+        if (sel is_dir_r.err)                  { ret 99; }
+        if (!(sel is_dir_r.ok && is_dir_r.ok)) { bad = 1; }
+        val dep_toml_r: res[str, A.Error] = types_path.join(?alloc, dep_full, "mach.toml");
+        if (sel dep_toml_r.err) { ret 99; }
+        val dep_toml: str                       = dep_toml_r.ok;
+        val exists_r: res[bool, io_error.Error] = fs.exists(dep_toml);
+        if (sel exists_r.err)                  { ret 99; }
+        if (!(sel exists_r.ok && exists_r.ok)) { bad = 1; }
+        str_free(?alloc, dep_toml);
+        str_free(?alloc, dep_full);
+
+        var link_args: [4]str;
+        link_args[0] = "ls-files";
+        link_args[1] = "--stage";
+        link_args[2] = "--";
+        link_args[3] = "dep/std";
+        val link_r: res[str, fail.Fail] = git.query(?alloc, ?gi, root, ?link_args[0], 4);
+        if (sel link_r.err) { bad = 1; }
+        if (sel link_r.ok) {
+            val link: str = link_r.ok;
+            if (!str_starts_with(link, "160000")) { bad = 1; }
+            str_free(?alloc, link);
+        }
+
+        var gm_args: [4]str;
+        gm_args[0] = "ls-files";
+        gm_args[1] = "--stage";
+        gm_args[2] = "--";
+        gm_args[3] = ".gitmodules";
+        val gm_r: res[str, fail.Fail] = git.query(?alloc, ?gi, root, ?gm_args[0], 4);
+        if (sel gm_r.err) { bad = 1; }
+        if (sel gm_r.ok) {
+            val gm: str = gm_r.ok;
+            if (str_empty(gm)) { bad = 1; }
+            str_free(?alloc, gm);
+        }
+    }
+
+    session.dnit(?s);
+    fs.remove_all(?alloc, root);
+    fs.remove_all(?alloc, fixture);
+    str_free(?alloc, root);
+    str_free(?alloc, fixture);
+    git.inspector_dnit(?alloc, ?gi);
+    ret bad;
+}
+
+# realizing a fixture whose id differs from its key is refused after checkout,
+# naming the one-name rule
+test realize_git_dependency__alias_key_is_refused_after_checkout {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val gi_r: res[git.Inspector, fail.Fail] = git.inspector_init(?alloc);
+    if (sel gi_r.err) { ret 1; }
+    var gi: git.Inspector = gi_r.ok;
+
+    val fixture_r: res[str, fail.Fail] = git.t_make_fixture_repo(?alloc, ?gi, "other");
+    if (sel fixture_r.err) {
+        git.inspector_dnit(?alloc, ?gi);
+        ret 1;
+    }
+    val fixture: str = fixture_r.ok;
+
+    val root_r: res[str, fail.Fail] = git.t_scratch_dir(?alloc, "mach_dep_mismatch_root");
+    if (sel root_r.err) {
+        git.inspector_dnit(?alloc, ?gi);
+        ret 1;
+    }
+    val root: str = root_r.ok;
+
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) {
+        git.inspector_dnit(?alloc, ?gi);
+        ret 1;
+    }
+    var s: session.Session = sr.ok;
+
+    val initialize_repository_r: err[fail.Fail] = git_gitlink.begin(?s, root);
+    if (sel initialize_repository_r.err) { ret 1; }
+    var env: [4]*u8;
+    git.t_env_allow_file_protocol(?env[0]);
+    val real_r: res[u8, fail.Fail] = realize_env(?s, root, "std", fixture, "branch/main", package_pin.REPOSITORY_ROOT, false, ?env[0]);
+    var bad:    i32                = 0;
+    if (sel real_r.ok) { bad = 1; }
+    if (sel real_r.err) {
+        val text: str = fail.describe(real_r.err);
+        if (!str_contains(text, "[dep.std] realizes project 'other': the manifest key, the directory under dep/, and the project id are one name")) { bad = 2; }
+        if (!str_contains(text, "rename the table to [dep.other] and the directory to dep/other"))                                                  { bad = 3; }
+    }
+
+    # the checkout is retained for the user to rename, and its manifest still says `other`
+    val dep_full_r: res[str, A.Error] = types_path.join(?alloc, root, "dep/std");
+    if (sel dep_full_r.err) { ret 99; }
+    val dep_full:   str                 = dep_full_r.ok;
+    val declared_r: res[str, fail.Fail] = package.declared_dep_id(?s, dep_full);
+    if (sel declared_r.err)                                         { ret 99; }
+    if (!(sel declared_r.ok && str_equals(declared_r.ok, "other"))) { bad = 4; }
+    str_free(?alloc, dep_full);
+
+    val check_dep_identity_r: err[fail.Fail] = package.check_dep_identity(?s, "std", "std");
+    if (sel check_dep_identity_r.err) { bad = 5; }
+    val check_dep_identity_r2: err[fail.Fail] = package.check_dep_identity(?s, "mach-std", "std");
+    if (sel check_dep_identity_r2.ok) { bad = 6; }
+
+    session.dnit(?s);
+    fs.remove_all(?alloc, root);
+    fs.remove_all(?alloc, fixture);
+    str_free(?alloc, root);
+    str_free(?alloc, fixture);
+    git.inspector_dnit(?alloc, ?gi);
+    ret bad;
+}
+
+test realize_git_dependency__failing_clone_leaves_scaffold_intact_and_dep_clean {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    val gi_r: res[git.Inspector, fail.Fail] = git.inspector_init(?alloc);
+    if (sel gi_r.err) { ret 1; }
+    var gi: git.Inspector = gi_r.ok;
+
+    val root_r: res[str, fail.Fail] = git.t_scratch_dir(?alloc, "mach_dep_failclone_root");
+    if (sel root_r.err) {
+        git.inspector_dnit(?alloc, ?gi);
+        ret 1;
+    }
+    val root: str = root_r.ok;
+
+    val scaffold_text: str            = "[project]\nmach = \">=5\"\nid = \"proj\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out\"\n[profile.debug]\ndefault = true\nopt = 0\ndebug = true\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n[profile.release]\nopt = 2\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n";
+    val write_err:     err[fail.Fail] = git.t_write_file(?alloc, root, "mach.toml", scaffold_text);
+    var bad:           i32            = 0;
+    if (sel write_err.err) { bad = 1; }
+
+    val bogus_r: res[str, A.Error] = types_path.join(?alloc, root, "does-not-exist");
+    if (sel bogus_r.err) { ret 99; }
+    val bogus: str = bogus_r.ok;
+
+    val sr: res[session.Session, fail.Fail] = session.init(?alloc);
+    if (sel sr.err) {
+        git.inspector_dnit(?alloc, ?gi);
+        ret 1;
+    }
+    var s: session.Session = sr.ok;
+
+    val initialize_repository_r: err[fail.Fail] = git_gitlink.begin(?s, root);
+    if (sel initialize_repository_r.err) { ret 1; }
+    var env: [4]*u8;
+    git.t_env_allow_file_protocol(?env[0]);
+    val real_r: res[u8, fail.Fail] = realize_env(?s, root, "std", bogus, "branch/main", package_pin.REPOSITORY_ROOT, false, ?env[0]);
+    if (sel real_r.ok) { bad = 1; }
+    if (sel real_r.err) {
+        val text: str = fail.describe(real_r.err);
+        if (!str_starts_with(text, "`git submodule add ")) { bad = 2; }
+        if (!str_contains(text, "` exited with status "))  { bad = 3; }
+        # git's output order varies by platform, so only its presence is asserted
+        if (!str_contains(text, "fatal: ")) { bad = 4; }
+    }
+
+    val dep_full_r: res[str, A.Error] = types_path.join(?alloc, root, "dep/std");
+    if (sel dep_full_r.err) { ret 99; }
+    val dep_full: str                       = dep_full_r.ok;
+    val exists_r: res[bool, io_error.Error] = fs.exists(dep_full);
+    if (sel exists_r.err)                 { ret 99; }
+    if ((sel exists_r.ok && exists_r.ok)) { bad = 1; }
+    str_free(?alloc, dep_full);
+
+    val manifest_path_r: res[str, A.Error] = types_path.join(?alloc, root, "mach.toml");
+    if (sel manifest_path_r.err) { ret 99; }
+    val manifest_path: str                         = manifest_path_r.ok;
+    val read_r:        res[Vector[u8], fs.FsError] = fs.read_bytes(?alloc, manifest_path);
+    if (sel read_r.err) { bad = 1; }
+    if (sel read_r.ok) {
+        var v: Vector[u8] = read_r.ok;
+        if (v.len != str_len(scaffold_text)) { bad = 1; }
+        collections_vector.dnit[u8](?v);
+    }
+    str_free(?alloc, manifest_path);
+
+    session.dnit(?s);
+    fs.remove_all(?alloc, root);
+    str_free(?alloc, root);
+    str_free(?alloc, bogus);
+    git.inspector_dnit(?alloc, ?gi);
+    ret bad;
+}
+
+test metadata__registration_refuses_unstaged_edits_and_pin_staging_leaves_them_unstaged {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val sr: res[session.Session, fail.Fail] = session.init(?a);
+    if (sel sr.err) { ret 2; }
+    var s: session.Session = sr.ok;
+    fin { session.dnit(?s); }
+    val gr: res[git.Inspector, fail.Fail] = git.inspector_init(?a);
+    if (sel gr.err) { ret 3; }
+    var gi: git.Inspector = gr.ok;
+    fin { git.inspector_dnit(?a, ?gi); }
+    val fr: res[str, fail.Fail] = git.t_make_fixture_repo(?a, ?gi, "std");
+    if (sel fr.err) { ret 4; }
+    val fixture: str = fr.ok;
+    fin {
+        fs.remove_all(?a, fixture);
+        str_free(?a, fixture);
+    }
+    val rr: res[str, fail.Fail] = git.t_make_fixture_repo(?a, ?gi, "root");
+    if (sel rr.err) { ret 5; }
+    val root: str = rr.ok;
+    fin {
+        fs.remove_all(?a, root);
+        str_free(?a, root);
+    }
+    val original:       str            = "# staged metadata\n";
+    val edited:         str            = "# unstaged user metadata\n";
+    val t_write_file_r: err[fail.Fail] = git.t_write_file(?a, root, ".gitmodules", original);
+    if (sel t_write_file_r.err) { ret 6; }
+    var add:   [3]str              = [3]str{"add", "--", ".gitmodules"};
+    val added: res[str, fail.Fail] = git.op(?a, ?gi, root, ?add[0], 3, nil);
+    if (sel added.err) { ret 7; }
+    str_free(?a, added.ok);
+    val t_write_file_r2: err[fail.Fail] = git.t_write_file(?a, root, ".gitmodules", edited);
+    if (sel t_write_file_r2.err) { ret 8; }
+    var env: [4]*u8;
+    git.t_env_allow_file_protocol(?env[0]);
+    val refused: res[u8, fail.Fail] = realize_env(?s, root, "std", fixture, "branch/main", package_pin.REPOSITORY_ROOT, false, ?env[0]);
+    if (sel refused.ok) { ret 9; }
+    val dr: res[str, fail.Fail] = package.dep_full_of(?a, root, "std");
+    if (sel dr.err) { ret 10; }
+    val dep: str = dr.ok;
+    fin { str_free(?a, dep); }
+    val exists_r: res[bool, io_error.Error] = fs.exists(dep);
+    if (sel exists_r.err)                 { ret 99; }
+    if ((sel exists_r.ok && exists_r.ok)) { ret 11; }
+    var show:      [2]str              = [2]str{"show", ":.gitmodules"};
+    val unchanged: res[str, fail.Fail] = git.query_raw(?a, ?gi, root, ?show[0], 2);
+    if (sel unchanged.err) { ret 12; }
+    val before: str = unchanged.ok;
+    fin { str_free(?a, before); }
+    if (!str_equals(before, original)) { ret 13; }
+    val t_write_file_r3: err[fail.Fail] = git.t_write_file(?a, root, ".gitmodules", original);
+    if (sel t_write_file_r3.err) { ret 14; }
+    val realized: res[u8, fail.Fail] = realize_env(?s, root, "std", fixture, "branch/main", package_pin.REPOSITORY_ROOT, false, ?env[0]);
+    if (sel realized.err) { ret 15; }
+    val staged: res[str, fail.Fail] = git.query_raw(?a, ?gi, root, ?show[0], 2);
+    if (sel staged.err) { ret 16; }
+    val baseline: str = staged.ok;
+    fin { str_free(?a, baseline); }
+    val t_write_file_r4: err[fail.Fail] = git.t_write_file(?a, root, ".gitmodules", edited);
+    if (sel t_write_file_r4.err) { ret 17; }
+    val stage_dependency_r: err[fail.Fail] = git_gitlink.record(?s, root, "std");
+    if (sel stage_dependency_r.err) { ret 18; }
+    val final: res[str, fail.Fail] = git.query_raw(?a, ?gi, root, ?show[0], 2);
+    if (sel final.err) { ret 19; }
+    val actual: str = final.ok;
+    fin { str_free(?a, actual); }
+    if (!str_equals(actual, baseline)) { ret 20; }
+    ret 0;
+}

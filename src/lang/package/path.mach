@@ -1,0 +1,1051 @@
+# path: the member that realizes a dependency declared by a local `path`. it has no
+# releases and no pin: every pull syncs dep/<id> with its source, copying what the source's
+# git keeps when the source is in a work tree, and leaving behind the build output and the
+# realized dependencies of every project inside it
+use std.allocator.page;
+use std.collections.sort;
+use collections_vector: std.collections.vector;
+use std.collections.vector.Vector;
+use std.data.toml;
+use fs:         std.filesystem;
+use std_format: std.format;
+use io_error:   std.io.error;
+use std.memory;
+use system_os: std.system.os;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use types_path: std.types.path;
+use std.types.result.res;
+use std.types.size.usize;
+use types_string: std.types.string;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_copy_slice;
+use std.types.string.str_empty;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.driver.load;
+use mach.lang.driver.project;
+use mach.lang.fail;
+use mach.lang.intern;
+use mach.lang.manifest;
+use mach.lang.session;
+
+use driver_closure: mach.lang.driver.closure;
+use mach.lang.package;
+use mach.lang.package.git;
+use mach.lang.package.report;
+
+fun contained_tree_walk(alloc: *A.Allocator, root: str, rel: str) err[fail.Fail] {
+    val at_r: res[str, fail.Fail] = load.join_path(alloc, root, rel);
+    if (sel at_r.err) { ret err[fail.Fail].err{at_r.err}; }
+    val at:      str                          = at_r.ok;
+    val names_r: res[Vector[str], fs.FsError] = fs.read_dir(alloc, at);
+    str_free(alloc, at);
+    if (sel names_r.err) { ret err[fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, fail.fs_text(names_r.err))}; }
+    var names: Vector[str] = names_r.ok;
+    sort.sort[str](names.data, names.len);
+    var i: usize = 0;
+    for (i < names.len) {
+        val child_r: res[str, std_format.FormatError] = std_format.sprint(alloc, "{}{}", rel, names.data[i]);
+        if (sel child_r.err) {
+            package.free_name_vector(alloc, ?names);
+            ret err[fail.Fail].err{fail.message(fail.format_text(child_r.err))};
+        }
+        val child:  str                 = child_r.ok;
+        val full_r: res[str, fail.Fail] = load.join_path(alloc, root, child);
+        if (sel full_r.err) {
+            str_free(alloc, child);
+            package.free_name_vector(alloc, ?names);
+            ret err[fail.Fail].err{full_r.err};
+        }
+        val full:   str                              = full_r.ok;
+        val meta_r: res[fs.Metadata, io_error.Error] = fs.metadata_link(full);
+        if (sel meta_r.err) {
+            str_free(alloc, full);
+            str_free(alloc, child);
+            package.free_name_vector(alloc, ?names);
+            ret err[fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, fail.io_text(meta_r.err))};
+        }
+        val meta: fs.Metadata = meta_r.ok;
+        if (fs.meta_is_symlink(?meta)) {
+            str_free(alloc, full);
+            str_free(alloc, child);
+            package.free_name_vector(alloc, ?names);
+            ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_SYMLINK, "path dependency realization must contain no symlinks")};
+        }
+        if (fs.meta_is_dir(?meta)) {
+            str_free(alloc, full);
+            val nested_r: res[str, std_format.FormatError] = std_format.sprint(alloc, "{}/", child);
+            str_free(alloc, child);
+            if (sel nested_r.err) {
+                package.free_name_vector(alloc, ?names);
+                ret err[fail.Fail].err{fail.message(fail.format_text(nested_r.err))};
+            }
+            val nested: str            = nested_r.ok;
+            val walk_r: err[fail.Fail] = contained_tree_walk(alloc, root, nested);
+            str_free(alloc, nested);
+            if (sel walk_r.err) {
+                package.free_name_vector(alloc, ?names);
+                ret walk_r;
+            }
+        }
+        or {
+            str_free(alloc, full);
+            str_free(alloc, child);
+        }
+        i = i + 1;
+    }
+    package.free_name_vector(alloc, ?names);
+    ret err[fail.Fail].ok{};
+}
+
+# what `mach dep verify` checks of a path dependency's copy: no repository metadata and no
+# symlink anywhere in it
+# ---
+# ret: the realized content an exact selector is checked against
+pub fun verify(s: *session.Session, alias: str, dep_dir: str) res[intern.StrId, fail.Fail] {
+    val meta_r: res[str, fail.Fail] = load.join_path(s.build_alloc, dep_dir, ".git");
+    if (sel meta_r.err) { ret res[intern.StrId, fail.Fail].err{meta_r.err}; }
+    val meta:     str                       = meta_r.ok;
+    val exists_r: res[bool, io_error.Error] = fs.exists(meta);
+    val has_meta: bool                      = (sel exists_r.ok && exists_r.ok);
+    str_free(s.build_alloc, meta);
+    if (has_meta) { ret res[intern.StrId, fail.Fail].err{fail.user(diagnostic_kind.DEP_REPOSITORY_METADATA, "path dependency realization contains forbidden repository metadata")}; }
+    val walk_r: err[fail.Fail] = contained_tree_walk(s.build_alloc, dep_dir, "");
+    if (sel walk_r.err) { ret res[intern.StrId, fail.Fail].err{walk_r.err}; }
+    val content_text_r: res[str, std_format.FormatError] = std_format.sprint(s.build_alloc, "path/{}", alias);
+    if (sel content_text_r.err) { ret res[intern.StrId, fail.Fail].err{fail.message(fail.format_text(content_text_r.err))}; }
+    val content_text: str                        = content_text_r.ok;
+    val content_r:    res[intern.StrId, A.Error] = intern.add(?s.interner, content_text);
+    str_free(s.build_alloc, content_text);
+    if (sel content_r.err) { ret res[intern.StrId, fail.Fail].err{fail.refused(content_r.err)}; }
+    ret res[intern.StrId, fail.Fail].ok{content_r.ok};
+}
+
+rec CopyEntry {
+    rel:       str;
+    directory: bool;
+    mode:      i32;
+}
+
+fun cmp_copy_entry(a: *CopyEntry, b: *CopyEntry) i64 {
+    ret str_compare(a.rel, b.rel);
+}
+
+fun copy_entries_free(alloc: *A.Allocator, entries: *Vector[CopyEntry]) {
+    var i: usize = 0;
+    for (i < entries.len) {
+        str_free(alloc, entries.data[i].rel);
+        i = i + 1;
+    }
+    collections_vector.dnit[CopyEntry](entries);
+}
+
+# the directory a project's `[project].out` names, which is the template's leading
+# segment: `out/{target.name}/{profile.name}` is written under `out`. a template that
+# opens with a variable names no directory this can exclude, and falls back to the
+# conventional name
+fun out_dir_segment(alloc: *A.Allocator, template: str, out: *str, owned: *bool) {
+    @out   = "out";
+    @owned = false;
+    val n: usize = str_len(template);
+    var i: usize = 0;
+    for (i < n && template[i] != '/' && template[i] != '\\' && template[i] != '{') { i = i + 1; }
+    if (i == 0)                      { ret; }
+    if (i < n && template[i] == '{') { ret; }
+    val copied: res[str, types_string.StrError] = str_copy_slice(alloc, template, 0::usize, i);
+    if (sel copied.err) { ret; }
+    @out   = copied.ok;
+    @owned = true;
+}
+
+# the build output of a project directory: its manifest's `out`, or the
+# conventional name when there is no readable manifest. a directory without
+# a manifest is not a project and excludes nothing
+fun project_out_name(alloc: *A.Allocator, dir: str, out: *str, owned: *bool) bool {
+    val mf_r: res[str, fail.Fail] = load.join_path(alloc, dir, manifest.MANIFEST_FILE);
+    if (sel mf_r.err) { ret false; }
+    val mf: str = mf_r.ok;
+    fin { str_free(alloc, mf); }
+    val present: res[bool, io_error.Error] = fs.is_file(mf);
+    if (sel present.err) { ret false; }
+    if (!present.ok)     { ret false; }
+    @out   = "out";
+    @owned = false;
+    val doc_r: res[manifest.Doc, fail.Fail] = manifest.doc_read(alloc, mf);
+    if (sel doc_r.err) { ret true; }
+    var doc: manifest.Doc = doc_r.ok;
+    fin { manifest.doc_dnit(alloc, ?doc); }
+    val declared: opt[str] = toml.get_str(?doc.table, "project.out");
+    if (sel declared.some) {
+        if (!str_empty(declared.some)) { out_dir_segment(alloc, declared.some, out, owned); }
+    }
+    ret true;
+}
+
+# what git considers part of a path dependency's source: its tracked files and the
+# untracked ones its ignore rules keep, listed once. inactive outside a work tree,
+# and for a source the enclosing repository ignores, which that repository does not hold
+rec PathFilter {
+    active: bool;
+    paths:  Vector[str];
+    top:    str;
+}
+
+val FILTER_SKIP:  u8 = 0;
+val FILTER_WALK:  u8 = 1;
+val FILTER_WHOLE: u8 = 2;
+
+# a path order that reads `\` as `/`, so a joined path compares with git's
+fun cmp_rel(a: str, b: str) i64 {
+    var i: usize = 0;
+    for (true) {
+        var ca: u8 = a[i];
+        var cb: u8 = b[i];
+        if (ca == '\\') { ca = '/'; }
+        if (cb == '\\') { cb = '/'; }
+        if (ca != cb)   { ret ca::i64 - cb::i64; }
+        if (ca == 0)    { ret 0; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+fun cmp_rel_ptr(a: *str, b: *str) i64 {
+    ret cmp_rel(@a, @b);
+}
+
+fun path_filter_free(alloc: *A.Allocator, f: *PathFilter) {
+    if (f.active)     { package.free_name_vector(alloc, ?f.paths); }
+    if (f.top != nil) { str_free(alloc, f.top); }
+    f.active = false;
+    f.top    = nil;
+}
+
+# whether `git status` from a subdirectory reports it, or a directory holding it, as ignored.
+# entries are relative to the work tree top, as `prefix` is, and an ignored directory ends in `/`
+fun status_ignores_prefix(bytes: *git.Bytes, prefix: str) bool {
+    val n:  usize = str_len(prefix);
+    var at: usize = 0;
+    for (at < bytes.len) {
+        var end: usize = at;
+        for (end < bytes.len && bytes.data[end] != 0) { end = end + 1; }
+        val len: usize = end - at;
+        if (len > 3 && len - 3 <= n && bytes.data[at] == '!' && bytes.data[at + 1] == '!' && bytes.data[end - 1] == '/') {
+            var k: usize = 0;
+            for (k < len - 3 && bytes.data[at + 3 + k] == prefix[k]) { k = k + 1; }
+            if (k == len - 3) { ret true; }
+        }
+        at = end + 1;
+    }
+    ret false;
+}
+
+fun path_filter_refusal(alloc: *A.Allocator, what: str, src: str, top: str, cause: fail.Fail) fail.Fail {
+    val mr: res[str, std_format.FormatError] = std_format.sprint(alloc,
+        "path dependency '{}': cannot {} the git repository at '{}': {}", src, what, top, fail.describe(cause));
+    if (sel mr.err) { ret cause; }
+    ret fail.with_text(cause, mr.ok);
+}
+
+# the kept listing of a source, from the repository that holds it. an empty listing below the
+# top of a work tree is the one case where the source may be ignored rather than empty, and only
+# then is the ignore state asked for, so a source costs two git processes, or three in that case
+fun path_filter_load(alloc: *A.Allocator, src: str) res[PathFilter, fail.Fail] {
+    var f:    PathFilter                    = PathFilter{active: false, top: nil};
+    val gi_r: res[git.Inspector, fail.Fail] = git.inspector_init(alloc);
+    if (sel gi_r.err) { ret res[PathFilter, fail.Fail].ok{f}; }
+    var gi: git.Inspector = gi_r.ok;
+    fin { git.inspector_dnit(alloc, ?gi); }
+    var where_args: [4]str;
+    where_args[0] = "rev-parse";
+    where_args[1] = "--is-inside-work-tree";
+    where_args[2] = "--show-prefix";
+    where_args[3] = "--show-toplevel";
+    # a source outside any repository is an expected answer, so git's complaint about it is captured, not shown
+    val where_r: res[git.Bytes, fail.Fail] = git.query_capture(alloc, ?gi, src, ?where_args[0], 4, false, nil, system_os.INVALID_HANDLE, true);
+    if (sel where_r.err) { ret res[PathFilter, fail.Fail].ok{f}; }
+    var where: git.Bytes = where_r.ok;
+    fin { git.bytes_free(alloc, ?where); }
+    var first: usize = 0;
+    for (first < where.len && where.data[first] != '\n') { first = first + 1; }
+    if (first >= where.len) { ret res[PathFilter, fail.Fail].ok{f}; }
+    where.data[first] = 0;
+    if (!str_equals(where.data::str, "true")) { ret res[PathFilter, fail.Fail].ok{f}; }
+    val prefix_at: usize = first + 1;
+    var second:    usize = prefix_at;
+    for (second < where.len && where.data[second] != '\n') { second = second + 1; }
+    if (second >= where.len) { ret res[PathFilter, fail.Fail].ok{f}; }
+    where.data[second] = 0;
+    val prefix:  str   = (?where.data[prefix_at])::str;
+    var top_end: usize = where.len;
+    for (top_end > second + 1 && (where.data[top_end - 1] == '\n' || where.data[top_end - 1] == '\r')) { top_end = top_end - 1; }
+    val top_r: res[str, types_string.StrError] = str_copy_slice(alloc, (?where.data[second + 1])::str, 0, top_end - second - 1);
+    if (sel top_r.err) { ret res[PathFilter, fail.Fail].err{fail.message(fail.str_text(top_r.err))}; }
+    f.top = top_r.ok;
+    var list_args: [5]str;
+    list_args[0] = "ls-files";
+    list_args[1] = "--cached";
+    list_args[2] = "--others";
+    list_args[3] = "--exclude-standard";
+    list_args[4] = "-z";
+    val listed: res[git.Bytes, fail.Fail] = git.query_capture(alloc, ?gi, src, ?list_args[0], 5, false, nil, system_os.INVALID_HANDLE, true);
+    if (sel listed.err) {
+        val refusal: fail.Fail = path_filter_refusal(alloc, "list the files kept by", src, f.top, listed.err);
+        path_filter_free(alloc, ?f);
+        ret res[PathFilter, fail.Fail].err{refusal};
+    }
+    var bytes: git.Bytes = listed.ok;
+    fin { git.bytes_free(alloc, ?bytes); }
+    if (bytes.len == 0 && !str_empty(prefix)) {
+        var status_args: [6]str;
+        status_args[0] = "status";
+        status_args[1] = "--porcelain=v1";
+        status_args[2] = "-z";
+        status_args[3] = "--ignored=matching";
+        status_args[4] = "--";
+        status_args[5] = ".";
+        val status_r: res[git.Bytes, fail.Fail] = git.query_capture(alloc, ?gi, src, ?status_args[0], 6, false, nil, system_os.INVALID_HANDLE, true);
+        if (sel status_r.err) {
+            val refusal: fail.Fail = path_filter_refusal(alloc, "read the ignore state from", src, f.top, status_r.err);
+            path_filter_free(alloc, ?f);
+            ret res[PathFilter, fail.Fail].err{refusal};
+        }
+        var status:  git.Bytes = status_r.ok;
+        val ignored: bool      = status_ignores_prefix(?status, prefix);
+        git.bytes_free(alloc, ?status);
+        if (ignored) {
+            path_filter_free(alloc, ?f);
+            ret res[PathFilter, fail.Fail].ok{f};
+        }
+    }
+    f.paths  = collections_vector.init[str](alloc);
+    f.active = true;
+    var at: usize = 0;
+    for (at < bytes.len) {
+        var end: usize = at;
+        for (end < bytes.len && bytes.data[end] != 0) { end = end + 1; }
+        if (end > at) {
+            val one: res[str, types_string.StrError] = str_copy_slice(alloc, (?bytes.data[at])::str, 0, end - at);
+            if (sel one.err) {
+                path_filter_free(alloc, ?f);
+                ret res[PathFilter, fail.Fail].err{fail.message(fail.str_text(one.err))};
+            }
+            val pushed: res[usize, A.Error] = collections_vector.push[str](?f.paths, one.ok);
+            if (sel pushed.err) {
+                str_free(alloc, one.ok);
+                path_filter_free(alloc, ?f);
+                ret res[PathFilter, fail.Fail].err{fail.refused(pushed.err)};
+            }
+        }
+        at = end + 1;
+    }
+    sort.sort_by[str](f.paths.data, f.paths.len, cmp_rel_ptr);
+    ret res[PathFilter, fail.Fail].ok{f};
+}
+
+# `path` against `rel` followed by a separator, in cmp_rel's order
+fun cmp_rel_below(path: str, rel: str) i64 {
+    var i: usize = 0;
+    for (rel[i] != 0) {
+        var ca: u8 = path[i];
+        var cb: u8 = rel[i];
+        if (ca == '\\') { ca = '/'; }
+        if (cb == '\\') { cb = '/'; }
+        if (ca != cb)   { ret ca::i64 - cb::i64; }
+        i = i + 1;
+    }
+    var ca: u8 = path[i];
+    if (ca == '\\') { ca = '/'; }
+    ret ca::i64 - '/'::i64;
+}
+
+# a listed path is kept, and a directory is walked when a listed path lies beneath it; a listed
+# directory is a submodule gitlink, whose content git does not list, so it is kept whole
+fun filter_decides(f: *PathFilter, rel: str) u8 {
+    var lo: usize = 0;
+    var hi: usize = f.paths.len;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (cmp_rel(f.paths.data[mid], rel) < 0) { lo = mid + 1; }
+        or                                       { hi = mid; }
+    }
+    if (lo < f.paths.len && cmp_rel(f.paths.data[lo], rel) == 0) { ret FILTER_WHOLE; }
+    # the first listed path at or after `rel/`, which lies beneath `rel` exactly when it starts so
+    lo = 0;
+    hi = f.paths.len;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        if (cmp_rel_below(f.paths.data[mid], rel) < 0) { lo = mid + 1; }
+        or                                             { hi = mid; }
+    }
+    if (lo >= f.paths.len) { ret FILTER_SKIP; }
+    val n: usize = str_len(rel);
+    if (str_len(f.paths.data[lo]) <= n) { ret FILTER_SKIP; }
+    var k: usize = 0;
+    for (k < n) {
+        var ca: u8 = f.paths.data[lo][k];
+        var cb: u8 = rel[k];
+        if (ca == '\\') { ca = '/'; }
+        if (cb == '\\') { cb = '/'; }
+        if (ca != cb)   { ret FILTER_SKIP; }
+        k = k + 1;
+    }
+    val sep: u8 = f.paths.data[lo][n];
+    if (sep == '/' || sep == '\\') { ret FILTER_WALK; }
+    ret FILTER_SKIP;
+}
+
+# the inventory of a path dependency is its source: at every project
+# boundary (a directory holding a manifest) the realized dependencies and
+# the build output are left behind, so a re-pull copies what the first did.
+# `keep`, when active, narrows it to what git keeps
+fun copy_inventory(alloc: *A.Allocator, root: str, rel: str, source: bool,
+    excluded: *fs.Identity, entries: *Vector[CopyEntry], keep: *PathFilter) err[fail.Fail] {
+    val dir_r: res[str, fail.Fail] = load.join_path(alloc, root, rel);
+    if (sel dir_r.err) { ret err[fail.Fail].err{dir_r.err}; }
+    val dir: str = dir_r.ok;
+    fin { str_free(alloc, dir); }
+    var out:     str  = nil;
+    var owned:   bool = false;
+    var project: bool = false;
+    if (source) { project = project_out_name(alloc, dir, ?out, ?owned); }
+    fin {
+        if (owned) { str_free(alloc, out); }
+    }
+    val names_r: res[Vector[str], fs.FsError] = fs.read_dir(alloc, dir);
+    if (sel names_r.err) { ret err[fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, fail.fs_text(names_r.err))}; }
+    var names: Vector[str] = names_r.ok;
+    fin { package.free_name_vector(alloc, ?names); }
+    sort.sort[str](names.data, names.len);
+    var i: usize = 0;
+    for (i < names.len) {
+        val name: str = names.data[i];
+        i = i + 1;
+        if (source && str_equals(name, ".git"))                                                             { cnt; }
+        if (project && (str_equals(name, driver_closure.DEP_DIR) || (out != nil && str_equals(name, out)))) { cnt; }
+        val child_r: res[str, fail.Fail] = load.join_path(alloc, rel, name);
+        if (sel child_r.err) { ret err[fail.Fail].err{child_r.err}; }
+        val child:       str  = child_r.ok;
+        var transferred: bool = false;
+        fin {
+            if (!transferred) { str_free(alloc, child); }
+        }
+        var decision: u8 = FILTER_WHOLE;
+        if (keep != nil && keep.active) { decision = filter_decides(keep, child); }
+        if (decision == FILTER_SKIP)    { cnt; }
+        val full_r: res[str, fail.Fail] = load.join_path(alloc, root, child);
+        if (sel full_r.err) { ret err[fail.Fail].err{full_r.err}; }
+        val full: str = full_r.ok;
+        fin { str_free(alloc, full); }
+        val mr: res[fs.Metadata, io_error.Error] = fs.metadata_link(full);
+        if (sel mr.err) { ret err[fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, fail.io_text(mr.err))}; }
+        val meta:      fs.Metadata = mr.ok;
+        val directory: bool        = fs.meta_is_dir(?meta);
+        if (!directory && !fs.meta_is_file(?meta)) {
+            ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_SYMLINK, "path dependency inventory contains a symlink or non-regular entry; existing files retained")};
+        }
+        if (directory && excluded != nil) {
+            var identity: fs.Identity;
+            if (system_os.identity_at(system_os.working_dir(), full::*u8, ?identity) < 0) { ret err[fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, "cannot observe path dependency source directory identity")}; }
+            if (fs.identity_equal(identity, excluded[0]))                                 { cnt; }
+        }
+        val pushed: res[usize, A.Error] = collections_vector.push[CopyEntry](entries, CopyEntry{rel: child, directory: directory, mode: (meta.mode & 0o777)::i32});
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        transferred = true;
+        if (directory) {
+            var nested_keep: *PathFilter = keep;
+            if (decision == FILTER_WHOLE) { nested_keep = nil; }
+            val nested: err[fail.Fail] = copy_inventory(alloc, root, child, source, excluded, entries, nested_keep);
+            if (sel nested.err) { ret err[fail.Fail].err{nested.err}; }
+        }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the entry of a sorted inventory at `rel`, or nil
+fun inventory_find(entries: *Vector[CopyEntry], rel: str) *CopyEntry {
+    var lo: usize = 0;
+    var hi: usize = entries.len;
+    for (lo < hi) {
+        val mid: usize = lo + (hi - lo) / 2;
+        val cmp: i64   = str_compare(entries.data[mid].rel, rel);
+        if (cmp == 0) { ret ?entries.data[mid]; }
+        if (cmp < 0)  { lo = mid + 1; }
+        or            { hi = mid; }
+    }
+    ret nil;
+}
+
+# whether the source inventory holds `prior` with the same kind
+fun source_has(entries: *Vector[CopyEntry], prior: *CopyEntry) bool {
+    val found: *CopyEntry = inventory_find(entries, prior.rel);
+    ret found != nil && found.directory == prior.directory;
+}
+
+fun bytes_equal(a: *Vector[u8], b: *Vector[u8]) bool {
+    ret a.len == b.len && memory.equal[u8](a.data, b.data, a.len);
+}
+
+# a source's inventory is never silently empty, and a project source keeps its manifest,
+# since an empty or manifest-less copy fails later with a cause that points elsewhere
+fun inventory_keeps_source(alloc: *A.Allocator, src: str, entries: *Vector[CopyEntry], keep: *PathFilter) err[fail.Fail] {
+    var wanted: CopyEntry = CopyEntry{rel: manifest.MANIFEST_FILE, directory: false, mode: 0};
+    var holds:  bool      = entries.len != 0;
+    if (holds) {
+        val mf_r: res[str, fail.Fail] = load.join_path(alloc, src, manifest.MANIFEST_FILE);
+        if (sel mf_r.err) { ret err[fail.Fail].err{mf_r.err}; }
+        val present: res[bool, io_error.Error] = fs.is_file(mf_r.ok);
+        str_free(alloc, mf_r.ok);
+        if (sel present.ok && present.ok) { holds = source_has(entries, ?wanted); }
+    }
+    if (holds) { ret err[fail.Fail].ok{}; }
+    var mr: res[str, std_format.FormatError];
+    if (keep.active) {
+        mr = std_format.sprint(alloc,
+            "path dependency source '{}' keeps no {} under the rules of the git repository at '{}', which ignores it; un-ignore or track it there, or make the source its own repository",
+            src, manifest.MANIFEST_FILE, keep.top);
+    }
+    or              { mr = std_format.sprint(alloc, "path dependency source '{}' has nothing to copy", src); }
+    if (sel mr.err) { ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_PATH_EMPTY, "path dependency source has nothing to copy")}; }
+    ret err[fail.Fail].err{fail.user(diagnostic_kind.DEP_PATH_EMPTY, mr.ok)};
+}
+
+# sync `dst` with `src` and report whether anything in it changed: false when the copy
+# already matched its source and was reused as it stood
+fun copy_tree(alloc: *A.Allocator, src: str, dst: str, rep: *report.Report) res[bool, fail.Fail] {
+    val sm: res[fs.Metadata, io_error.Error] = fs.metadata_link(src);
+    if (sel sm.err) { ret res[bool, fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, fail.io_text(sm.err))}; }
+    val source_meta: fs.Metadata = sm.ok;
+    if (!fs.meta_is_dir(?source_meta)) { ret res[bool, fail.Fail].err{fail.user(diagnostic_kind.DEP_NOT_DIRECTORY, "path dependency source must be a physical directory")}; }
+    var destination_identity: fs.Identity;
+    val observed:             i64 = system_os.identity_at(system_os.working_dir(), dst::*u8, ?destination_identity);
+    if (observed < 0 && system_os.error_kind(observed) != io_error.NOT_FOUND) { ret res[bool, fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, "cannot inspect the path dependency destination")}; }
+    var excluded: *fs.Identity = nil;
+    if (observed == 0) {
+        val dm: res[fs.Metadata, io_error.Error] = fs.metadata_link(dst);
+        if (sel dm.err) { ret res[bool, fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, fail.io_text(dm.err))}; }
+        val destination_meta: fs.Metadata = dm.ok;
+        if (!fs.meta_is_dir(?destination_meta)) { ret res[bool, fail.Fail].err{fail.user(diagnostic_kind.DEP_NOT_DIRECTORY, "path dependency destination must be a physical directory")}; }
+        var source_identity: fs.Identity;
+        if (system_os.identity_at(system_os.working_dir(), src::*u8, ?source_identity) < 0) { ret res[bool, fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, "cannot inspect the path dependency source identity")}; }
+        if (fs.identity_equal(source_identity, destination_identity))                       { ret res[bool, fail.Fail].err{fail.user(diagnostic_kind.DEP_PATH_SAME, "path dependency source and destination are the same directory")}; }
+        excluded = ?destination_identity;
+    }
+    var entries: Vector[CopyEntry] = collections_vector.init[CopyEntry](alloc);
+    fin { copy_entries_free(alloc, ?entries); }
+    val filter_r: res[PathFilter, fail.Fail] = path_filter_load(alloc, src);
+    if (sel filter_r.err) { ret res[bool, fail.Fail].err{filter_r.err}; }
+    var keep: PathFilter = filter_r.ok;
+    fin { path_filter_free(alloc, ?keep); }
+    val collected: err[fail.Fail] = copy_inventory(alloc, src, "", true, excluded, ?entries, ?keep);
+    if (sel collected.err) { ret res[bool, fail.Fail].err{collected.err}; }
+    sort.sort_by[CopyEntry](entries.data, entries.len, cmp_copy_entry);
+    val kept: err[fail.Fail] = inventory_keeps_source(alloc, src, ?entries, ?keep);
+    if (sel kept.err) { ret res[bool, fail.Fail].err{kept.err}; }
+    var existing: Vector[CopyEntry] = collections_vector.init[CopyEntry](alloc);
+    fin { copy_entries_free(alloc, ?existing); }
+    if (observed == 0) {
+        val collected_dst: err[fail.Fail] = copy_inventory(alloc, dst, "", false, nil, ?existing, nil);
+        if (sel collected_dst.err) { ret res[bool, fail.Fail].err{collected_dst.err}; }
+    }
+    sort.sort_by[CopyEntry](existing.data, existing.len, cmp_copy_entry);
+    var changed: bool = observed != 0;
+    # the realization is its source: an entry the source no longer has is removed rather
+    # than kept, and every removal is named, since the destination is mach's own copy
+    var i: usize = existing.len;
+    for (i > 0) {
+        i = i - 1;
+        val prior: CopyEntry = existing.data[i];
+        if (source_has(?entries, ?prior)) { cnt; }
+        val full_r: res[str, fail.Fail] = load.join_path(alloc, dst, prior.rel);
+        if (sel full_r.err) { ret res[bool, fail.Fail].err{full_r.err}; }
+        val full: str = full_r.ok;
+        fin { str_free(alloc, full); }
+        var why: str = nil;
+        if (prior.directory) {
+            val pruned: err[fs.FsError] = fs.remove_all(alloc, full);
+            if (sel pruned.err) { why = fail.fs_text(pruned.err); }
+        }
+        or {
+            val unlinked: err[io_error.Error] = fs.remove_file(full);
+            if (sel unlinked.err) { why = fail.io_text(unlinked.err); }
+        }
+        if (why != nil) {
+            val msg: res[str, std_format.FormatError] = std_format.sprint(alloc,
+                "path dependency destination '{}' holds '{}', which the source no longer has, and it could not be removed: {}", dst, prior.rel, why);
+            if (sel msg.err) { ret res[bool, fail.Fail].err{fail.environment(diagnostic_kind.FS_REMOVE, "path dependency destination holds an entry the source no longer has, and it could not be removed")}; }
+            ret res[bool, fail.Fail].err{fail.environment(diagnostic_kind.FS_REMOVE, msg.ok)};
+        }
+        report.notef(rep, alloc, "note: path dependency '{}': removed '{}', which its source no longer has", dst, prior.rel);
+        changed = true;
+    }
+    val create_dir_all_r: err[fs.FsError] = fs.create_dir_all(alloc, dst, 0o755);
+    if (sel create_dir_all_r.err) { ret res[bool, fail.Fail].err{fail.environment(diagnostic_kind.FS_WRITE, "cannot create the copy destination")}; }
+    i = 0;
+    var complete: bool = false;
+    fin {
+        if (!complete) { report.notef(rep, alloc, "note: path dependency copy stopped after {} entries; destination '{}' retained for inspection", i, dst); }
+    }
+    for (i < entries.len) {
+        val entry:  CopyEntry           = entries.data[i];
+        val from_r: res[str, fail.Fail] = load.join_path(alloc, src, entry.rel);
+        if (sel from_r.err) { ret res[bool, fail.Fail].err{from_r.err}; }
+        val from: str = from_r.ok;
+        fin { str_free(alloc, from); }
+        val to_r: res[str, fail.Fail] = load.join_path(alloc, dst, entry.rel);
+        if (sel to_r.err) { ret res[bool, fail.Fail].err{to_r.err}; }
+        val to: str = to_r.ok;
+        fin { str_free(alloc, to); }
+        if (entry.directory) {
+            if (inventory_find(?existing, entry.rel) == nil) { changed = true; }
+            val made: err[fs.FsError] = fs.create_dir_all(alloc, to, 0o755);
+            if (sel made.err) { ret res[bool, fail.Fail].err{fail.environment(diagnostic_kind.FS_WRITE, fail.fs_text(made.err))}; }
+        }
+        or {
+            val bytes_r: res[Vector[u8], fs.FsError] = fs.read_bytes(alloc, from);
+            if (sel bytes_r.err) { ret res[bool, fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, fail.fs_text(bytes_r.err))}; }
+            var bytes: Vector[u8] = bytes_r.ok;
+            fin { collections_vector.dnit[u8](?bytes); }
+            # a file the copy already holds is left alone when it matches, and named when replaced,
+            # since a re-pull overwrites whatever the copy was edited to
+            val prior:    *CopyEntry = inventory_find(?existing, entry.rel);
+            var replaced: bool       = false;
+            if (prior != nil && !prior.directory) {
+                val held_r: res[Vector[u8], fs.FsError] = fs.read_bytes(alloc, to);
+                if (sel held_r.err) { ret res[bool, fail.Fail].err{fail.environment(diagnostic_kind.FS_READ, fail.fs_text(held_r.err))}; }
+                var held: Vector[u8] = held_r.ok;
+                val same: bool       = bytes_equal(?held, ?bytes);
+                collections_vector.dnit[u8](?held);
+                if (same && prior.mode == entry.mode) {
+                    i = i + 1;
+                    cnt;
+                }
+                replaced = !same;
+            }
+            changed = true;
+            val written: err[fs.FsError] = fs.write_bytes(to, bytes.data, bytes.len, entry.mode);
+            if (sel written.err) { ret res[bool, fail.Fail].err{fail.environment(diagnostic_kind.FS_WRITE, fail.fs_text(written.err))}; }
+            if (replaced)        { report.notef(rep, alloc, "note: path dependency '{}': replaced '{}' with its source's content", dst, entry.rel); }
+        }
+        i = i + 1;
+    }
+    complete = true;
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+# sync dep/<id> with a path dependency's source
+# ---
+# ret: true when the copy was refreshed, false when it already matched its source and was reused
+pub fun realize(s: *session.Session, root: str, id: str, src_dir: str, rep: *report.Report) res[bool, fail.Fail] {
+    val id_r: err[fail.Fail] = package.verify_dep_manifest_id(s, src_dir, id);
+    if (sel id_r.err) { ret res[bool, fail.Fail].err{id_r.err}; }
+    val dep_full_r: res[str, fail.Fail] = package.dep_full_of(s.build_alloc, root, id);
+    if (sel dep_full_r.err) { ret res[bool, fail.Fail].err{dep_full_r.err}; }
+    val dep_full: str = dep_full_r.ok;
+    fin { str_free(s.build_alloc, dep_full); }
+    ret copy_tree(s.build_alloc, src_dir, dep_full, rep);
+}
+
+#[testing]
+fun t_copy(a: *A.Allocator, src: str, dst: str) res[bool, fail.Fail] {
+    var quiet: report.Report = report.discard(a);
+    fin { report.dnit(?quiet); }
+    ret copy_tree(a, src, dst, ?quiet);
+}
+
+# a path dependency inside a git work tree copies what git keeps: tracked files and untracked
+# ones its ignore rules keep, never an ignored file, directory or symlink
+test path_copy__a_git_source_copies_what_git_keeps {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val gi_r: res[git.Inspector, fail.Fail] = git.inspector_init(?a);
+    if (sel gi_r.err) { ret 2; }
+    var gi: git.Inspector = gi_r.ok;
+    fin { git.inspector_dnit(?a, ?gi); }
+    val repo_r: res[str, fail.Fail] = git.t_make_fixture_repo(?a, ?gi, "kept");
+    if (sel repo_r.err) { ret 3; }
+    val repo: str = repo_r.ok;
+    fin {
+        fs.remove_all(?a, repo);
+        str_free(?a, repo);
+    }
+    if (!git.t_put(?a, repo, ".gitignore", "scratch/\n*.swp\nlink\n")) { ret 4; }
+    if (!git.t_put(?a, repo, "tracked.txt", "tracked\n"))              { ret 4; }
+    # a file sorting between a directory's name and its contents (`data.mach` < `data/`)
+    val data_r: res[str, fail.Fail] = git.t_mkdirs(?a, repo, "src/data");
+    if (sel data_r.err) { ret 4; }
+    str_free(?a, data_r.ok);
+    if (!git.t_put(?a, repo, "src/data.mach", ""))       { ret 4; }
+    if (!git.t_put(?a, repo, "src/data/toml.mach", ""))  { ret 4; }
+    if (!git.t_commit_all(?a, ?gi, repo, "tracked"))     { ret 5; }
+    if (!git.t_put(?a, repo, "untracked.txt", "kept\n")) { ret 6; }
+    if (!git.t_put(?a, repo, "editor.swp", "junk\n"))    { ret 6; }
+    val scratch_r: res[str, fail.Fail] = git.t_mkdirs(?a, repo, "scratch/deep");
+    if (sel scratch_r.err) { ret 6; }
+    str_free(?a, scratch_r.ok);
+    if (!git.t_put(?a, repo, "scratch/deep/big.bin", "junk\n")) { ret 6; }
+    $if ($mach.build.os != $mach.os.windows) {
+        val link_r: res[str, A.Error] = types_path.join(?a, repo, "link");
+        if (sel link_r.err) { ret 7; }
+        val linked: err[io_error.Error] = fs.symlink("nowhere", link_r.ok);
+        str_free(?a, link_r.ok);
+        if (sel linked.err) { ret 7; }
+    }
+    val dst_r: res[str, fail.Fail] = git.t_scratch_dir(?a, "mach_dep_kept_copy");
+    if (sel dst_r.err) { ret 8; }
+    val dst_root: str = dst_r.ok;
+    fin {
+        fs.remove_all(?a, dst_root);
+        str_free(?a, dst_root);
+    }
+    val dst_j: res[str, A.Error] = types_path.join(?a, dst_root, "kept");
+    if (sel dst_j.err) { ret 8; }
+    val dst: str = dst_j.ok;
+    fin { str_free(?a, dst); }
+
+    val copied: res[bool, fail.Fail] = t_copy(?a, repo, dst);
+    if (sel copied.err) { ret 9; }
+    var bad: i32 = 0;
+    if (!git.t_exists(?a, dst, "mach.toml"))          { bad = bad | 1; }
+    if (!git.t_exists(?a, dst, "tracked.txt"))        { bad = bad | 2; }
+    if (!git.t_exists(?a, dst, "untracked.txt"))      { bad = bad | 4; }
+    if (!git.t_exists(?a, dst, ".gitignore"))         { bad = bad | 8; }
+    if (git.t_exists(?a, dst, "editor.swp"))          { bad = bad | 16; }
+    if (git.t_exists(?a, dst, "scratch"))             { bad = bad | 32; }
+    if (git.t_exists(?a, dst, "link"))                { bad = bad | 64; }
+    if (git.t_exists(?a, dst, ".git"))                { bad = bad | 128; }
+    if (!git.t_exists(?a, dst, "src/data.mach"))      { bad = bad | 1024; }
+    if (!git.t_exists(?a, dst, "src/data/toml.mach")) { bad = bad | 2048; }
+
+    # a re-pull after a file stops being kept removes it from the copy
+    if (!git.t_put(?a, repo, ".gitignore", "scratch/\n*.swp\nlink\nuntracked.txt\n")) { ret 10; }
+    val again: res[bool, fail.Fail] = t_copy(?a, repo, dst);
+    if (sel again.err)                          { ret 11; }
+    if (git.t_exists(?a, dst, "untracked.txt")) { bad = bad | 256; }
+    if (!git.t_exists(?a, dst, "tracked.txt"))  { bad = bad | 512; }
+    ret bad;
+}
+
+# a path dependency below an enclosing repository copies by the rules of the repository it
+# belongs to: a source that repository ignores is walked, a tracked one is filtered, and an
+# inventory that keeps no manifest is refused rather than realized empty
+test path_copy__a_source_under_an_enclosing_repository {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val gi_r: res[git.Inspector, fail.Fail] = git.inspector_init(?a);
+    if (sel gi_r.err) { ret 2; }
+    var gi: git.Inspector = gi_r.ok;
+    fin { git.inspector_dnit(?a, ?gi); }
+    val repo_r: res[str, fail.Fail] = git.t_make_fixture_repo(?a, ?gi, "outer");
+    if (sel repo_r.err) { ret 3; }
+    val repo: str = repo_r.ok;
+    fin {
+        fs.remove_all(?a, repo);
+        str_free(?a, repo);
+    }
+    val project: str = "[project]\nid = \"inner\"\nversion = \"0.1.0\"\nsrc = \"src\"\n";
+    if (!git.t_put(?a, repo, ".gitignore", "ign/\n*.swp\ndrop/mach.toml\n")) { ret 4; }
+    val dirs: [5]str = [5]str{"ign/base/src", "ign/deep/proj/src", "sub/src", "drop/src", "none"};
+    var d:    usize  = 0;
+    for (d < 5) {
+        val made: res[str, fail.Fail] = git.t_mkdirs(?a, repo, dirs[d]);
+        if (sel made.err) { ret 4; }
+        str_free(?a, made.ok);
+        d = d + 1;
+    }
+    if (!git.t_put(?a, repo, "sub/mach.toml", project))      { ret 4; }
+    if (!git.t_put(?a, repo, "sub/src/lib.mach", ""))        { ret 4; }
+    if (!git.t_commit_all(?a, ?gi, repo, "tracked"))         { ret 5; }
+    if (!git.t_put(?a, repo, "sub/junk.swp", "junk\n"))      { ret 6; }
+    if (!git.t_put(?a, repo, "ign/base/mach.toml", project)) { ret 6; }
+    if (!git.t_put(?a, repo, "ign/base/src/lib.mach", ""))   { ret 6; }
+    # a source below an ignored directory rather than the ignored directory itself
+    if (!git.t_put(?a, repo, "ign/deep/proj/mach.toml", project)) { ret 6; }
+    if (!git.t_put(?a, repo, "ign/deep/proj/src/lib.mach", ""))   { ret 6; }
+    if (!git.t_put(?a, repo, "drop/mach.toml", project))          { ret 6; }
+    if (!git.t_put(?a, repo, "drop/src/lib.mach", ""))            { ret 6; }
+    if (!git.t_put(?a, repo, "none/only.swp", "junk\n"))          { ret 6; }
+    val dst_r: res[str, fail.Fail] = git.t_scratch_dir(?a, "mach_dep_enclosed_copy");
+    if (sel dst_r.err) { ret 7; }
+    val dst_root: str = dst_r.ok;
+    fin {
+        fs.remove_all(?a, dst_root);
+        str_free(?a, dst_root);
+    }
+    val sources: [5]str = [5]str{"ign/base", "ign/deep/proj", "sub", "drop", "none"};
+    var i:       usize  = 0;
+    for (i < 5) {
+        val src_j: res[str, A.Error] = types_path.join(?a, repo, sources[i]);
+        if (sel src_j.err) { ret 8; }
+        val src: str = src_j.ok;
+        fin { str_free(?a, src); }
+        val dst_j: res[str, A.Error] = types_path.join(?a, dst_root, sources[i]);
+        if (sel dst_j.err) { ret 8; }
+        val dst: str = dst_j.ok;
+        fin { str_free(?a, dst); }
+        val copied: res[bool, fail.Fail] = t_copy(?a, src, dst);
+        var flags:  i32                  = 0;
+        if (i < 3) {
+            if (sel copied.err)                         { flags = flags | 1; }
+            if (!git.t_exists(?a, dst, "mach.toml"))    { flags = flags | 2; }
+            if (!git.t_exists(?a, dst, "src/lib.mach")) { flags = flags | 4; }
+            if (git.t_exists(?a, dst, "junk.swp"))      { flags = flags | 8; }
+        }
+        or (sel copied.ok) { flags = 1; }
+        if (flags != 0)    { ret 16 * (i::i32 + 1) + flags; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# a path dependency's inventory is its source: the source's build output and
+# the realized dependencies and output of every nested project are left
+# behind, so a re-pull is identical to the first and a symlink under a
+# skipped directory never reaches the copy
+test path_copy__project_boundaries_leave_out_and_nested_dep_behind {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val rr: res[str, fail.Fail] = git.t_scratch_dir(?a, "mach_dep_boundaries");
+    if (sel rr.err) { ret 2; }
+    val source: str = rr.ok;
+    fin {
+        fs.remove_all(?a, source);
+        str_free(?a, source);
+    }
+    val manifest_text: str = "[project]\nid = \"crypto\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n";
+    if (!git.t_put(?a, source, "mach.toml", manifest_text)) { ret 3; }
+    val src_r: res[str, fail.Fail] = git.t_mkdirs(?a, source, "src");
+    if (sel src_r.err) { ret 3; }
+    str_free(?a, src_r.ok);
+    if (!git.t_put(?a, source, "src/lib.mach", "")) { ret 3; }
+    # the source's own build output, declared as `build`, holding a symlink
+    val build_r: res[str, fail.Fail] = git.t_mkdirs(?a, source, "build/assurance");
+    if (sel build_r.err) { ret 4; }
+    val build: str = build_r.ok;
+    fin { str_free(?a, build); }
+    $if ($mach.build.os != $mach.os.windows) {
+        val link_r: res[str, A.Error] = types_path.join(?a, build, "current");
+        if (sel link_r.err) { ret 4; }
+        val linked: err[io_error.Error] = fs.symlink("nowhere", link_r.ok);
+        str_free(?a, link_r.ok);
+        if (sel linked.err) { ret 4; }
+    }
+    # a nested test project with its own realized dependency and output
+    val nested_r: res[str, fail.Fail] = git.t_mkdirs(?a, source, "test/aead");
+    if (sel nested_r.err) { ret 5; }
+    val nested: str = nested_r.ok;
+    fin { str_free(?a, nested); }
+    if (!git.t_put(?a, nested, "mach.toml", "[project]\nid = \"aead\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out\"\n")) { ret 5; }
+    val nested_dep_r: res[str, fail.Fail] = git.t_mkdirs(?a, nested, "dep/other");
+    if (sel nested_dep_r.err) { ret 5; }
+    str_free(?a, nested_dep_r.ok);
+    val nested_out_r: res[str, fail.Fail] = git.t_mkdirs(?a, nested, "out/x");
+    if (sel nested_out_r.err) { ret 5; }
+    str_free(?a, nested_out_r.ok);
+    if (!git.t_put(?a, nested, "dep/other/stale", "copied last time")) { ret 5; }
+    if (!git.t_put(?a, nested, "out/x/artifact", "built"))             { ret 5; }
+    if (!git.t_put(?a, nested, "keep.txt", "source"))                  { ret 5; }
+    # a plain directory named out beneath a non-project directory is source
+    val plain_r: res[str, fail.Fail] = git.t_mkdirs(?a, source, "src/out");
+    if (sel plain_r.err) { ret 6; }
+    str_free(?a, plain_r.ok);
+    if (!git.t_put(?a, source, "src/out/data.mach", "")) { ret 6; }
+
+    val dr: res[str, fail.Fail] = package.dep_full_of(?a, nested, "crypto");
+    if (sel dr.err) { ret 7; }
+    val dst: str = dr.ok;
+    fin { str_free(?a, dst); }
+    val first: res[bool, fail.Fail] = t_copy(?a, source, dst);
+    if (sel first.err) { ret 8; }
+    val second: res[bool, fail.Fail] = t_copy(?a, source, dst);
+    if (sel second.err) { ret 9; }
+    val present: [4]str = [4]str{"mach.toml", "src/lib.mach", "src/out/data.mach", "test/aead/keep.txt"};
+    val absent:  [4]str = [4]str{"build", "test/aead/dep", "test/aead/out", "test/aead/dep/other/stale"};
+    var i:       usize  = 0;
+    for (i < 4) {
+        val p: res[str, A.Error] = types_path.join(?a, dst, present[i]);
+        if (sel p.err) { ret 10; }
+        val p_exists: res[bool, io_error.Error] = fs.exists(p.ok);
+        str_free(?a, p.ok);
+        if (!(sel p_exists.ok && p_exists.ok)) { ret 11; }
+        val q: res[str, A.Error] = types_path.join(?a, dst, absent[i]);
+        if (sel q.err) { ret 10; }
+        val q_exists: res[bool, io_error.Error] = fs.exists(q.ok);
+        str_free(?a, q.ok);
+        if (sel q_exists.ok && q_exists.ok) { ret 12; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test path_copy__ancestor_source_uses_finite_inventory_and_excludes_its_destination {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val rr: res[str, fail.Fail] = git.t_scratch_dir(?a, "mach_dep_ancestor");
+    if (sel rr.err) { ret 2; }
+    val source: str = rr.ok;
+    fin {
+        fs.remove_all(?a, source);
+        str_free(?a, source);
+    }
+    val nested_r: res[str, fail.Fail] = git.t_mkdirs(?a, source, "test/err");
+    if (sel nested_r.err) { ret 3; }
+    val nested: str = nested_r.ok;
+    fin { str_free(?a, nested); }
+    val dr: res[str, fail.Fail] = package.dep_full_of(?a, nested, "std");
+    if (sel dr.err) { ret 4; }
+    val dst: str = dr.ok;
+    fin { str_free(?a, dst); }
+    val t_write_file_r2: err[fail.Fail] = git.t_write_file(?a, source, "payload", "original");
+    if (sel t_write_file_r2.err) { ret 5; }
+    val copy_tree_r: res[bool, fail.Fail] = t_copy(?a, source, dst);
+    if (sel copy_tree_r.err) { ret 6; }
+    val loop_r: res[str, A.Error] = types_path.join(?a, dst, "test/err/dep/std");
+    if (sel loop_r.err) { ret 7; }
+    val loop: str = loop_r.ok;
+    fin { str_free(?a, loop); }
+    val exists_r: res[bool, io_error.Error] = fs.exists(loop);
+    if (sel exists_r.err)                 { ret 99; }
+    if ((sel exists_r.ok && exists_r.ok)) { ret 8; }
+    val t_write_file_r3: err[fail.Fail] = git.t_write_file(?a, source, "payload", "updated");
+    if (sel t_write_file_r3.err) { ret 11; }
+    val copy_tree_r2: res[bool, fail.Fail] = t_copy(?a, source, dst);
+    if (sel copy_tree_r2.err) { ret 12; }
+    val exists_r3: res[bool, io_error.Error] = fs.exists(loop);
+    if (sel exists_r3.err)                  { ret 99; }
+    if ((sel exists_r3.ok && exists_r3.ok)) { ret 13; }
+    val payload_r: res[str, A.Error] = types_path.join(?a, dst, "payload");
+    if (sel payload_r.err) { ret 14; }
+    val payload: str = payload_r.ok;
+    fin { str_free(?a, payload); }
+    val read: res[str, fs.FsError] = fs.read_string(?a, payload);
+    if (sel read.err) { ret 15; }
+    val text: str = read.ok;
+    fin { str_free(?a, text); }
+    if (!str_equals(text, "updated")) { ret 16; }
+    ret 0;
+}
+
+# the realization is its source: an entry the source no longer has is removed, so a
+# dependency refreshed after an upstream delete keeps nothing the source dropped
+test path_copy__a_destination_entry_the_source_dropped_is_removed {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val sr: res[str, fail.Fail] = git.t_scratch_dir(?a, "mach_dep_copy_source");
+    if (sel sr.err) { ret 2; }
+    val source: str = sr.ok;
+    fin {
+        fs.remove_all(?a, source);
+        str_free(?a, source);
+    }
+    val dr: res[str, fail.Fail] = git.t_scratch_dir(?a, "mach_dep_copy_destination");
+    if (sel dr.err) { ret 3; }
+    val dst: str = dr.ok;
+    fin {
+        fs.remove_all(?a, dst);
+        str_free(?a, dst);
+    }
+    val w1: err[fail.Fail] = git.t_write_file(?a, source, "selected", "new");
+    if (sel w1.err) { ret 4; }
+    val w2: err[fail.Fail] = git.t_write_file(?a, dst, "selected", "old");
+    if (sel w2.err) { ret 4; }
+    val w3: err[fail.Fail] = git.t_write_file(?a, dst, "stale", "dropped upstream");
+    if (sel w3.err) { ret 4; }
+    val nested_r: res[str, fail.Fail] = git.t_mkdirs(?a, dst, "gone/deeper");
+    if (sel nested_r.err) { ret 4; }
+    str_free(?a, nested_r.ok);
+    val w4: err[fail.Fail] = git.t_write_file(?a, dst, "gone/deeper/leaf", "also dropped");
+    if (sel w4.err) { ret 4; }
+
+    val copied: res[bool, fail.Fail] = t_copy(?a, source, dst);
+    if (sel copied.err) { ret 5; }
+
+    val selected_r: res[str, A.Error] = types_path.join(?a, dst, "selected");
+    if (sel selected_r.err) { ret 6; }
+    val selected: str = selected_r.ok;
+    fin { str_free(?a, selected); }
+    val new_r: res[str, fs.FsError] = fs.read_string(?a, selected);
+    if (sel new_r.err) { ret 7; }
+    val updated: str = new_r.ok;
+    fin { str_free(?a, updated); }
+    if (!str_equals(updated, "new")) { ret 8; }
+
+    val absent: [2]str = [2]str{"stale", "gone"};
+    var i:      usize  = 0;
+    for (i < 2) {
+        val q: res[str, A.Error] = types_path.join(?a, dst, absent[i]);
+        if (sel q.err) { ret 9; }
+        val q_exists: res[bool, io_error.Error] = fs.exists(q.ok);
+        str_free(?a, q.ok);
+        if (sel q_exists.ok && q_exists.ok) { ret 10; }
+        i = i + 1;
+    }
+
+    val again: res[bool, fail.Fail] = t_copy(?a, source, dst);
+    if (sel again.err) { ret 11; }
+    val same_source: res[bool, fail.Fail] = t_copy(?a, source, source);
+    if (sel same_source.ok) { ret 12; }
+    ret 0;
+}
+
+# `[project].out` is a template, and the directory it leaves behind is the template's
+# leading segment rather than the template text
+test path_copy__a_templated_out_directory_is_left_behind {
+    var a:      A.Allocator;
+    val make_r: err[A.Error] = page.make(?a);
+    if (sel make_r.err) { ret 1; }
+    val rr: res[str, fail.Fail] = git.t_scratch_dir(?a, "mach_dep_out_template");
+    if (sel rr.err) { ret 2; }
+    val source: str = rr.ok;
+    fin {
+        fs.remove_all(?a, source);
+        str_free(?a, source);
+    }
+    if (!git.t_put(?a, source, "mach.toml", "[project]\nid = \"tmpl\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n")) { ret 3; }
+    val src_r: res[str, fail.Fail] = git.t_mkdirs(?a, source, "src");
+    if (sel src_r.err) { ret 3; }
+    str_free(?a, src_r.ok);
+    if (!git.t_put(?a, source, "src/lib.mach", "")) { ret 3; }
+    val out_r: res[str, fail.Fail] = git.t_mkdirs(?a, source, "out/host/debug");
+    if (sel out_r.err) { ret 4; }
+    str_free(?a, out_r.ok);
+    if (!git.t_put(?a, source, "out/host/debug/artifact", "built")) { ret 4; }
+
+    val dr: res[str, fail.Fail] = git.t_scratch_dir(?a, "mach_dep_out_destination");
+    if (sel dr.err) { ret 5; }
+    val dst: str = dr.ok;
+    fin {
+        fs.remove_all(?a, dst);
+        str_free(?a, dst);
+    }
+    val copied: res[bool, fail.Fail] = t_copy(?a, source, dst);
+    if (sel copied.err) { ret 6; }
+
+    val kept_r: res[str, A.Error] = types_path.join(?a, dst, "src/lib.mach");
+    if (sel kept_r.err) { ret 7; }
+    val kept_exists: res[bool, io_error.Error] = fs.exists(kept_r.ok);
+    str_free(?a, kept_r.ok);
+    if (!(sel kept_exists.ok && kept_exists.ok)) { ret 8; }
+
+    val out_q: res[str, A.Error] = types_path.join(?a, dst, "out");
+    if (sel out_q.err) { ret 7; }
+    val out_exists: res[bool, io_error.Error] = fs.exists(out_q.ok);
+    str_free(?a, out_q.ok);
+    if (sel out_exists.ok && out_exists.ok) { ret 9; }
+    ret 0;
+}
