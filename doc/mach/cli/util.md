@@ -8,32 +8,6 @@ pub val PROJECT_CONFIG_NAME: str = manifest.MANIFEST_FILE
 
 the manifest file name, "mach.toml"
 
-## fun flag_exists
-
-```mach
-pub fun flag_exists(argc: usize, argv: *str, flag: str) bool;
-```
-
-whether a flag occurs anywhere in argv
-
-argc: number of entries
-argv: the arguments
-flag: the exact spelling to find
-ret: true on an exact match
-
-## fun flag_value
-
-```mach
-pub fun flag_value(argc: usize, argv: *str, flag: str) opt[str];
-```
-
-the value following the first occurrence of a flag
-
-argc: number of entries
-argv: the arguments
-flag: the exact spelling to find
-ret: the argument after the first match; none when the flag is absent or is the last argument
-
 ## fun arg_is_flag
 
 ```mach
