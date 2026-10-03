@@ -38,7 +38,7 @@ which cases remain; when exactly one remains the rest of the block is guarded fo
 ## fun check_assign
 
 ```mach
-pub fun check_assign(sc: *sema_context.SemaContext, lhs: ast_id.ExprId, span: token.Span);
+pub fun check_assign(sc: *sema_context.SemaContext, lhs: ast_id.ExprId, span: lang_source.Span);
 ```
 
 whole-value assignment to a guarded place, or to an object it is reached through, replaces the case
@@ -46,7 +46,7 @@ whole-value assignment to a guarded place, or to an object it is reached through
 ## fun check_stable
 
 ```mach
-pub fun check_stable(sc: *sema_context.SemaContext, place: ast_id.ExprId, span: token.Span) bool;
+pub fun check_stable(sc: *sema_context.SemaContext, place: ast_id.ExprId, span: lang_source.Span) bool;
 ```
 
 the spelling rule `place_equal` implements, enforced where a guard place is written so an
@@ -55,6 +55,6 @@ unmatchable place is rejected at the `sel` rather than at every read inside the 
 ## fun span_text_equal
 
 ```mach
-pub fun span_text_equal(sc: *sema_context.SemaContext, a: token.Span, b: token.Span) bool;
+pub fun span_text_equal(sc: *sema_context.SemaContext, a: lang_source.Span, b: lang_source.Span) bool;
 ```
 

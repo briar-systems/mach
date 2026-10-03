@@ -81,13 +81,13 @@ operands of another `op` in its block, reached here where it would be `route`
 ## fun field_seq_owner
 
 ```mach
-pub fun field_seq_owner(sc: *sema_context.SemaContext, seq_eid: ast_id.ExprId, span: token.Span) type.TypeId;
+pub fun field_seq_owner(sc: *sema_context.SemaContext, seq_eid: ast_id.ExprId, span: lang_source.Span) type.TypeId;
 ```
 
 ## fun case_seq_owner
 
 ```mach
-pub fun case_seq_owner(sc: *sema_context.SemaContext, seq_eid: ast_id.ExprId, span: token.Span) type.TypeId;
+pub fun case_seq_owner(sc: *sema_context.SemaContext, seq_eid: ast_id.ExprId, span: lang_source.Span) type.TypeId;
 ```
 
 `$cases(T)` enumerates the cases of one public tag; a secret shape is refused because outer

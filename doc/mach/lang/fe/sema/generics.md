@@ -8,7 +8,7 @@ sc: *sema_context.SemaContext,
 sym: *resolve.Symbol,
 args: *type.TypeId,
 arg_count: u32,
-span: token.Span) res[type.TypeId, fail.Fail];
+span: lang_source.Span) res[type.TypeId, fail.Fail];
 ```
 
 ## fun check_arity
@@ -18,7 +18,7 @@ pub fun check_arity(
 sc: *sema_context.SemaContext,
 sym: *resolve.Symbol,
 arg_count: u32,
-span: token.Span) bool;
+span: lang_source.Span) bool;
 ```
 
 ## def Agreement
