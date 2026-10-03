@@ -51,7 +51,11 @@ fun main(argc: i64, argv: **u8) i64 {
 ```
 
 Because each element has its own concrete type at monomorphization, the body
-can handle heterogeneous packs:
+can handle heterogeneous packs. The `$each` body is checked once per element of
+each instance, as part of checking the program, so `mach check` reports a body
+that does not type for some element. The error points at the call that asked for
+the instance, with the body line as the related site, labelled `in this body,
+checked against this instance's pack element types`:
 
 ```mach
 use std.print;
@@ -183,15 +187,15 @@ stable-ABI symbol** — it cannot be the target of `ext fun` or a function
 pointer shared across compilation units. It is source-level only.
 
 A `^` secret may not be passed to a pack, including a secret nested inside an
-aggregate argument. A pack instance is re-inferred per call site and commonly
+aggregate argument. A pack instance is typed per call site and commonly
 feeds formatting or logging, so admitting one would launder a secret straight to
 an observable sink — see [secrecy.md](secrecy.md).
 
 ## Cross-module packs
 
 Pack-tailed functions may call functions in other modules from inside the
-`$each` body. The compiler re-infers the body per monomorphization instance
-against the full module set.
+`$each` body. The compiler types the body per element of each instance against
+the full module set.
 
 ```mach fragment
 fun sumdbl(va: ...) i64 {

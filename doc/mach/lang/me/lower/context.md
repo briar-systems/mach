@@ -264,30 +264,6 @@ pub fun pop_loop(lc: *LowerContext);
 pub fun current_loop(lc: *LowerContext) *LoopFrame;
 ```
 
-## fun enqueue_instance
-
-```mach
-pub fun enqueue_instance(lc: *LowerContext, decl: ast_id.DeclId, origin: session.ModuleId,
-args: *type.TypeId, arg_len: u32, name: intern.StrId,
-bare: intern.StrId) err[fail.Fail];
-```
-
-## fun enqueue_value_instance
-
-```mach
-pub fun enqueue_value_instance(lc: *LowerContext, decl: ast_id.DeclId, origin: session.ModuleId,
-vals: *comptime.CTValue, names: *intern.StrId, val_len: u32,
-name: intern.StrId) err[fail.Fail];
-```
-
-## fun enqueue_pack_instance
-
-```mach
-pub fun enqueue_pack_instance(lc: *LowerContext, decl: ast_id.DeclId, origin: session.ModuleId,
-args: *type.TypeId, arg_len: u32,
-types: *type.TypeId, type_len: u32, name: intern.StrId) err[fail.Fail];
-```
-
 ## fun push_fin
 
 ```mach
@@ -345,6 +321,8 @@ pub fun expr_type_of(lc: *LowerContext, eid: ast_id.ExprId) type.TypeId;
 
 an expression's type inside an instance's scope is the instance's, never the template's:
 sema records the template's and every type decision here is made against this instance
+an expression's type as the frame the code is read through decided it, else the template's
+under the instance's substitution
 
 ## fun expr_float_width
 
@@ -403,6 +381,39 @@ pub fun type_resolved_of(lc: *LowerContext, tid: ast_id.TypeId) type.TypeId;
 ```mach
 pub fun decl_type_of(lc: *LowerContext, did: ast_id.DeclId) type.TypeId;
 ```
+
+## fun instance_of_call
+
+```mach
+pub fun instance_of_call(lc: *LowerContext, eid: ast_id.ExprId) res[*sema_instance.Instance, fail.Fail];
+```
+
+the instance sema decided the call or generic reference `eid` names, in the frame the
+code is read through
+
+## fun instance_link_name
+
+```mach
+pub fun instance_link_name(lc: *LowerContext, item: *sema_instance.Instance) res[intern.StrId, fail.Fail];
+```
+
+the symbol an instance is emitted and referenced under
+
+## fun gate_of
+
+```mach
+pub fun gate_of(lc: *LowerContext, cond: ast_id.ExprId) opt[bool];
+```
+
+the verdict sema gave a statement gate in the frame the code is read through
+
+## fun iteration_frame
+
+```mach
+pub fun iteration_frame(lc: *LowerContext, stmt: ast_id.StmtId, index: u32) res[u32, fail.Fail];
+```
+
+the frame of iteration `index` of the `$each` at `stmt` under the current frame
 
 ## fun decl_ret_sem
 

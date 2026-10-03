@@ -137,7 +137,10 @@ pub fun pick_op($mode: Mode, a: i64, b: i64) i64 {
 The argument is held to the parameter's type the way a runtime argument is. A
 value the type cannot represent is refused as `comptime.overflow` at the
 argument, never truncated: `narrow(300)` against `fun narrow($n: u8)` reports
-`comptime argument 300 is out of range for u8 (0..255)`.
+`comptime argument 300 is out of range for u8 (0..255)`. An argument that names
+an enclosing comptime parameter, as `narrow(m + 200)` inside `fun wide($m: u8)`,
+is held to the type at each instance of the enclosing function, where `m` has a
+value.
 
 Comptime value parameters apply to function parameters only — not record
 fields, not other contexts.

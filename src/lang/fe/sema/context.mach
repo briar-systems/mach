@@ -31,6 +31,7 @@ use mach.lang.fe.comptime;
 use mach.lang.fe.decorator;
 use mach.lang.fe.resolve;
 use mach.lang.fe.sema.fields;
+use sema_instance: mach.lang.fe.sema.instance;
 use mach.lang.growth;
 use mach.lang.intern;
 use mach.lang.layout;
@@ -54,6 +55,8 @@ pub rec SemaResult {
     embed_path_cap:   u32;
     # the constants sema bound and the gates it decided, over the load's and resolve's
     constants: comptime.Bindings;
+    # every instance the module's typing asks for, with the typing of each
+    instances: sema_instance.Set;
 }
 
 pub val EMBED_LEN_NONE: u64 = 0xFFFFFFFFFFFFFFFF;
@@ -273,22 +276,7 @@ pub rec SemaDeps {
 fwd type.FieldEntry;
 fwd type.FieldTable;
 
-pub rec InstReq {
-    origin:  session.ModuleId;
-    decl:    ast_id.DeclId;
-    sig:     type.TypeId;
-    args:    *type.TypeId;
-    arg_len: u32;
-    bare:    intern.StrId;
-    depth:   u32;
-    parent:  u32;
-    site:    lang_source.Span;
-    # the instantiating module's file, so a refusal points at the caller and not at an
-    # offset in the template's own file
-    site_file: lang_source.FileId;
-}
-
-pub val INST_NONE: u32 = 4294967295;
+pub val INST_NONE: u32 = sema_instance.NONE;
 
 val MAX_CT_INSTANCE_DEPTH: u32 = 32;
 
@@ -298,23 +286,14 @@ pub val RECORD_OK:          u8 = 0;
 pub val RECORD_LIMIT_DEPTH: u8 = 1;
 val     RECORD_LIMIT_COUNT: u8 = 2;
 
+# the instances a module's typing asks for, typed in the order they were first asked for;
+# the set is the module's product, published with its result
 pub rec InstWorklist {
-    items:   *InstReq;
-    len:     u32;
-    cap:     u32;
+    set:     sema_instance.Set;
     drained: u32;
     alloc:   *A.Allocator;
     limited: bool;
-    dedup:   map.Map[u64, u32];
-
-    uni_reports:    UniReports;
-    handle_reports: UniReports;
-    secret_state:   u8;
 }
-
-pub val SECRET_UNKNOWN: u8 = 0;
-pub val SECRET_ABSENT:  u8 = 1;
-pub val SECRET_PRESENT: u8 = 2;
 
 pub val TYPE_MEMO_NONE:     u8 = 0;
 pub val TYPE_MEMO_RESOLVED: u8 = 1;
@@ -379,8 +358,19 @@ pub rec SemaContext {
     collect_insts: bool;
 
     inst_depth: u32;
-
+    # the instance being typed, INST_NONE outside one
     inst_parent: u32;
+    # the typing frame the walk records into (see sema_instance.Frame), and who asks for
+    # an instance from it (sema_instance.FROM_* or an instance id)
+    frame:     u32;
+    requester: u32;
+    # the element types of the pack the instance being typed binds; nil outside a pack instance
+    pack_types: *type.TypeId;
+    pack_len:   u32;
+    # a value or non-generic pack instance retypes what its template already checked, so it
+    # reports only what the template could not decide: its comptime arguments, and the
+    # bodies of an `$each` over its pack
+    instance_quiet: bool;
 
     silent: bool;
     # resolving every type node up front, before any arm is selected
@@ -816,152 +806,131 @@ fun stmt_calls_c_variadic(sc: *SemaContext, a: *ast.Ast, rr: *resolve.ResolveRes
     ret false;
 }
 
-fun args_equal(a: *type.TypeId, b: *type.TypeId, n: u32) bool {
-    var i: u32 = 0;
-    for (i < n) {
-        if (!type.same(a[i], b[i])) { ret false; }
-        i = i + 1;
-    }
-    ret true;
-}
+# an instance the walk asks for at `eid`: added to the module's set when new, and noted as
+# what `eid` names in the walk's frame. an instance whose type arguments or pack still
+# mention a type parameter is the template under other names: nothing in its body is
+# settled until the caller is itself instantiated, and that caller's walk asks for the
+# closed instance. `item` carries the kind, the declaration, its arguments, name,
+# signature and site; the rest is the set's
+pub fun record_instance(sc: *SemaContext, item: sema_instance.Instance, eid: ast_id.ExprId) res[u8, fail.Fail] {
+    if (!sc.collect_insts || sc.insts == nil)                                                { ret res[u8, fail.Fail].ok{RECORD_OK}; }
+    if (item.kind == sema_instance.KIND_TYPE && item.arg_len == 0)                           { ret res[u8, fail.Fail].ok{RECORD_OK}; }
+    if (types_open(sc, item.args, item.arg_len) || types_open(sc, item.pack, item.pack_len)) { ret res[u8, fail.Fail].ok{RECORD_OK}; }
 
-pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: ast_id.DeclId,
-    args: *type.TypeId, arg_len: u32, sig: type.TypeId,
-    bare: intern.StrId, site: lang_source.Span) res[u8, fail.Fail] {
-    if (!sc.collect_insts) { ret res[u8, fail.Fail].ok{RECORD_OK}; }
-    if (arg_len == 0)      { ret res[u8, fail.Fail].ok{RECORD_OK}; }
-
-    # an instance whose arguments still mention a type parameter is the template
-    # under other names: nothing in its body is settled until the caller is itself
-    # instantiated, and that caller's episode records the closed instance. every
-    # closed instance is checked, against its own arguments
-    var i: u32 = 0;
-    for (i < arg_len) {
-        if (type.mentions_generic_param(?sc.s.types, args[i])) { ret res[u8, fail.Fail].ok{RECORD_OK}; }
-        i = i + 1;
-    }
-
-    if (sc.insts == nil) {
-        val wr: res[*InstWorklist, fail.Fail] = inst_worklist_new(sc.s.alloc);
-        if (sel wr.err) {
-            fail.internal(?sc.status, fail.describe(wr.err));
-            ret res[u8, fail.Fail].err{wr.err};
-        }
-        sc.insts = wr.ok;
-    }
     val wl: *InstWorklist = sc.insts;
-
-    val h:       u64       = hash_inst_req(origin, decl, args, arg_len);
-    val res_get: opt[*u32] = map.get[u64, u32](?wl.dedup, ?h);
-    if (sel res_get.some) {
-        val existing_idx: u32      = @res_get.some;
-        val existing:     *InstReq = ?wl.items[existing_idx];
-        if (module.same(existing.origin, origin) && ast_id.decl_same(existing.decl, decl) && existing.arg_len == arg_len
-            && args_equal(existing.args, args, arg_len)) {
-            ret res[u8, fail.Fail].ok{RECORD_OK};
-        }
-    }
-
     if (wl.limited) { ret res[u8, fail.Fail].ok{RECORD_OK}; }
 
-    if (sc.inst_depth > MAX_CT_INSTANCE_DEPTH) {
+    var req: sema_instance.Instance = item;
+    req.parent    = sc.inst_parent;
+    req.depth     = sc.inst_depth;
+    req.site_file = sc.a.file_id;
+    val found: opt[u32] = sema_instance.find(?wl.set, ?req);
+    val known: bool     = sel found.some;
+    if (!known && sc.inst_depth > MAX_CT_INSTANCE_DEPTH) {
         wl.limited = true;
         ret res[u8, fail.Fail].ok{RECORD_LIMIT_DEPTH};
     }
-    if (wl.len >= MAX_CT_INSTANCES) {
+    if (!known && sema_instance.count(?wl.set) >= MAX_CT_INSTANCES) {
         wl.limited = true;
         ret res[u8, fail.Fail].ok{RECORD_LIMIT_COUNT};
     }
 
-    val grown: err[A.Error] = growth.reserve[InstReq](wl.alloc, ?wl.items, ?wl.cap, wl.len::usize + 1);
-    if (sel grown.err) {
-        fail.internal(?sc.status, lang_alloc.text(grown.err));
-        ret res[u8, fail.Fail].err{fail.message("internal: out of memory growing the constant-time re-validation worklist")};
+    val added: res[sema_instance.Added, fail.Fail] = sema_instance.add(?wl.set, req);
+    if (sel added.err) {
+        fail.internal(?sc.status, fail.describe(added.err));
+        ret res[u8, fail.Fail].err{added.err};
     }
-
-    val cr: res[*type.TypeId, A.Error] = A.allocate[type.TypeId](wl.alloc, arg_len::usize);
-    if (sel cr.err) {
-        fail.internal(?sc.status, lang_alloc.text(cr.err));
-        ret res[u8, fail.Fail].err{fail.message("internal: out of memory copying a generic instance's type arguments")};
-    }
-    val owned: *type.TypeId = cr.ok;
-    var k:     u32          = 0;
-    for (k < arg_len) {
-        owned[k] = args[k];
-        k        = k + 1;
-    }
-
-    val new_idx: u32      = wl.len;
-    val slot:    *InstReq = ?wl.items[new_idx];
-    slot.origin    = origin;
-    slot.decl      = decl;
-    slot.sig       = sig;
-    slot.args      = owned;
-    slot.arg_len   = arg_len;
-    slot.bare      = bare;
-    slot.depth     = sc.inst_depth;
-    slot.parent    = sc.inst_parent;
-    slot.site      = site;
-    slot.site_file = sc.a.file_id;
-    wl.len         = wl.len + 1;
-
-    val res_insert: res[bool, A.Error] = map.insert[u64, u32](?wl.dedup, h, new_idx);
-    if (sel res_insert.err) { ret res[u8, fail.Fail].err{fail.refused(res_insert.err)}; }
-
+    # an instance asked for at no call is checked and never emitted
+    if (ast_id.expr_is_nil(eid)) { ret res[u8, fail.Fail].ok{RECORD_OK}; }
+    val id:    u32            = added.ok.id;
+    val noted: err[fail.Fail] = sema_instance.call_record(?wl.set, sc.frame, eid, id);
+    if (sel noted.err) { ret res[u8, fail.Fail].err{noted.err}; }
+    val edged: err[fail.Fail] = sema_instance.edge_add(?wl.set, sc.requester, id);
+    if (sel edged.err) { ret res[u8, fail.Fail].err{edged.err}; }
     ret res[u8, fail.Fail].ok{RECORD_OK};
 }
 
-fun hash_inst_req(origin: session.ModuleId, decl: ast_id.DeclId, args: *type.TypeId, arg_len: u32) u64 {
-    var h: u64 = fnv1a.FNV_INIT;
-    h = fnv1a.step_u32(h, origin::u32);
-    h = fnv1a.step_u32(h, decl::u32);
-    h = fnv1a.step_u32(h, arg_len);
-
+fun types_open(sc: *SemaContext, p: *type.TypeId, len: u32) bool {
     var i: u32 = 0;
-    for (i < arg_len) {
-        h = fnv1a.step_u32(h, args[i]::u32);
+    for (i < len) {
+        if (type.mentions_generic_param(?sc.s.types, p[i])) { ret true; }
         i = i + 1;
     }
-    ret h;
+    ret false;
 }
 
 pub fun inst_worklist_new(alloc: *A.Allocator) res[*InstWorklist, fail.Fail] {
     val wr: res[*InstWorklist, A.Error] = A.allocate[InstWorklist](alloc, 1::usize);
-    if (sel wr.err) { ret res[*InstWorklist, fail.Fail].err{fail.message("internal: out of memory allocating the constant-time re-validation worklist")}; }
+    if (sel wr.err) { ret res[*InstWorklist, fail.Fail].err{fail.message("internal: out of memory allocating the instance worklist")}; }
+    val set: res[sema_instance.Set, fail.Fail] = sema_instance.init(alloc);
+    if (sel set.err) {
+        A.deallocate[InstWorklist](alloc, wr.ok, 1::usize);
+        ret res[*InstWorklist, fail.Fail].err{set.err};
+    }
     val wl: *InstWorklist = wr.ok;
-    wl.items              = nil;
-    wl.len                = 0;
-    wl.cap                = 0;
-    wl.drained            = 0;
-    wl.alloc              = alloc;
-    wl.uni_reports.len    = 0;
-    wl.handle_reports.len = 0;
-    wl.secret_state       = SECRET_UNKNOWN;
-    wl.limited            = false;
-    wl.dedup              = map.init[u64, u32](alloc);
+    wl.set     = set.ok;
+    wl.drained = 0;
+    wl.alloc   = alloc;
+    wl.limited = false;
     ret res[*InstWorklist, fail.Fail].ok{wl};
 }
 
 pub fun inst_worklist_free(wl: *InstWorklist) {
     if (wl == nil) { ret; }
-    var i: u32 = 0;
-    for (i < wl.len) {
-        val e: *InstReq = ?wl.items[i];
-        if (e.args != nil && e.arg_len > 0) {
-            A.deallocate[type.TypeId](wl.alloc, e.args, e.arg_len::usize);
-        }
-        i = i + 1;
-    }
-    if (wl.items != nil && wl.cap > 0) {
-        A.deallocate[InstReq](wl.alloc, wl.items, wl.cap::usize);
-    }
-    map.dnit[u64, u32](?wl.dedup);
+    sema_instance.dnit(?wl.set);
     A.deallocate[InstWorklist](wl.alloc, wl, 1::usize);
 }
 
 pub fun inst_worklist_dnit(sc: *SemaContext) {
     inst_worklist_free(sc.insts);
     sc.insts = nil;
+}
+
+# the type the walk gives expression `eid`, recorded in its frame when the frame is not
+# the module's own typing
+pub fun expr_type_set(sc: *SemaContext, eid: ast_id.ExprId, ty: type.TypeId) {
+    if (sc.expr_type == nil || ast_id.expr_index(eid)::usize >= sc.a.expr_len) { ret; }
+    sc.expr_type[ast_id.expr_index(eid)] = ty;
+    if (!frame_records_typing(sc)) { ret; }
+    val put: err[fail.Fail] = sema_instance.expr_record(?sc.insts.set, sc.frame, eid, ty);
+    if (sel put.err) { fail.internal(?sc.status, fail.describe(put.err)); }
+}
+
+pub fun decl_type_set(sc: *SemaContext, did: ast_id.DeclId, ty: type.TypeId) {
+    if (sc.decl_type == nil || ast_id.decl_index(did)::usize >= sc.a.decl_len) { ret; }
+    sc.decl_type[ast_id.decl_index(did)] = ty;
+    if (!frame_records_typing(sc)) { ret; }
+    val put: err[fail.Fail] = sema_instance.decl_record(?sc.insts.set, sc.frame, did, ty);
+    if (sel put.err) { fail.internal(?sc.status, fail.describe(put.err)); }
+}
+
+# the walk is typing a value instance, so the comptime parameters of the function it
+# instantiates are bound
+pub fun walk_binds_values(sc: *SemaContext) bool {
+    if (sc.insts == nil || sc.inst_parent == INST_NONE) { ret false; }
+    ret sema_instance.at(?sc.insts.set, sc.inst_parent).kind == sema_instance.KIND_VALUE;
+}
+
+# the walk is typing a pack instance, so the pack's element types are bound
+pub fun walk_binds_pack(sc: *SemaContext) bool {
+    if (sc.insts == nil || sc.inst_parent == INST_NONE) { ret false; }
+    ret sema_instance.at(?sc.insts.set, sc.inst_parent).kind == sema_instance.KIND_PACK;
+}
+
+# an instance with no type arguments is typed by its template, except in the iterations
+# its frames hold
+fun frame_records_typing(sc: *SemaContext) bool {
+    if (sc.insts == nil || sc.frame == sema_instance.FRAME_TEMPLATE) { ret false; }
+    if (sema_instance.frame_is_iteration(?sc.insts.set, sc.frame))   { ret true; }
+    if (sc.inst_parent == INST_NONE)                                 { ret true; }
+    ret sema_instance.at(?sc.insts.set, sc.inst_parent).arg_len > 0;
+}
+
+# the verdict the walk gives a comptime gate in its frame
+pub fun gate_set(sc: *SemaContext, cond: ast_id.ExprId, active: bool) {
+    if (sc.insts == nil || ast_id.expr_is_nil(cond)) { ret; }
+    val put: err[fail.Fail] = sema_instance.gate_record(?sc.insts.set, sc.frame, cond, active);
+    if (sel put.err) { fail.internal(?sc.status, fail.describe(put.err)); }
 }
 
 fun public_type_for(sc: *SemaContext, sym: *resolve.Symbol) opt[TypeExport] {
@@ -1028,6 +997,16 @@ pub fun machine_of(sc: *SemaContext) layout.Machine {
 }
 
 val TEMPLATE_TRAIL_LABEL: str = "in this generic body, checked against this instance's type arguments";
+val PACK_TRAIL_LABEL:     str = "in this body, checked against this instance's pack element types";
+val VALUE_TRAIL_LABEL:    str = "in this body, checked against this instance's comptime arguments";
+
+fun trail_label(sc: *SemaContext) str {
+    if (sc.insts == nil || sc.inst_parent == INST_NONE) { ret TEMPLATE_TRAIL_LABEL; }
+    val kind: sema_instance.Kind = sema_instance.at(?sc.insts.set, sc.inst_parent).kind;
+    if (kind == sema_instance.KIND_PACK)  { ret PACK_TRAIL_LABEL; }
+    if (kind == sema_instance.KIND_VALUE) { ret VALUE_TRAIL_LABEL; }
+    ret TEMPLATE_TRAIL_LABEL;
+}
 
 # a rejection raised while checking an instance body is the instantiation's, not the
 # template's: it points at the call that asked for this instance and carries the
@@ -1056,7 +1035,7 @@ fun emit_error(sc: *SemaContext, k: diagnostic_kind.Kind, span: lang_source.Span
         }
     }
     if (sc.inst_site_set) {
-        val rr: err[fail.Fail] = diagnostic.attach_related(?b, sc.a.file_id, span, TEMPLATE_TRAIL_LABEL);
+        val rr: err[fail.Fail] = diagnostic.attach_related(?b, sc.a.file_id, span, trail_label(sc));
         if (sel rr.err) {
             diagnostic.builder_dnit(?b);
             fail.internal(?sc.status, fail.describe(rr.err));
