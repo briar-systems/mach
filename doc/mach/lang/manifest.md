@@ -488,21 +488,13 @@ fwd mach.lang.manifest.project.tuple_of
 
 forwards [`mach.lang.manifest.project.tuple_of`](manifest/project.md#fun-tuple_of)
 
-## fwd mach.lang.manifest.project.parse_project
+## fwd mach.lang.manifest.load.project_parse
 
 ```mach
-fwd mach.lang.manifest.project.parse_project
+fwd mach.lang.manifest.load.project_parse
 ```
 
-forwards [`mach.lang.manifest.project.parse_project`](manifest/project.md#fun-parse_project)
-
-## fwd mach.lang.manifest.project.MISSING_PROFILE_MESSAGE
-
-```mach
-fwd mach.lang.manifest.project.MISSING_PROFILE_MESSAGE
-```
-
-forwards [`mach.lang.manifest.project.MISSING_PROFILE_MESSAGE`](manifest/project.md#val-missing_profile_message)
+forwards [`mach.lang.manifest.load.project_parse`](manifest/load.md#fun-project_parse)
 
 ## fwd mach.lang.manifest.project.target_matches_host
 

@@ -95,7 +95,8 @@ the memo as bytes, allocated in a and owned by the caller
 pub fun load(a: *A.Allocator, compiler: *[32]u8, file: str) res[Memo, A.Error];
 ```
 
-the memo stored at `file`, empty when there is none or it cannot be read
+the memo stored at `file`, empty when there is none or it cannot be read;
+the file's bytes pass through `a` and are released before return
 
 ## fun store
 
@@ -103,5 +104,6 @@ the memo stored at `file`, empty when there is none or it cannot be read
 pub fun store(m: *Memo, out_dir: str, file: str) err[fail.Fail];
 ```
 
-write the memo to `file` through a sibling temporary when it changed
+write the memo to `file` through a sibling temporary when it changed; the
+encoding passes through the memo's allocator
 

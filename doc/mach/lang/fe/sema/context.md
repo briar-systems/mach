@@ -139,7 +139,7 @@ between every importer in a pass
 fwd type.FieldEntry
 ```
 
-forwards [`mach.lang.type.FieldEntry`](../../type.md#rec-fieldentry)
+forwards [`mach.lang.type.field.Entry`](../../type/field.md#rec-entry)
 
 ## fwd type.FieldTable
 
@@ -147,7 +147,7 @@ forwards [`mach.lang.type.FieldEntry`](../../type.md#rec-fieldentry)
 fwd type.FieldTable
 ```
 
-forwards [`mach.lang.type.FieldTable`](../../type.md#rec-fieldtable)
+forwards [`mach.lang.type.field.Table`](../../type/field.md#rec-table)
 
 ## rec InstReq
 

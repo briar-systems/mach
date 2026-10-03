@@ -7,9 +7,11 @@ released once by `registry_dnit`; release is terminal, so a registry is
 never re-initialized under a target that borrowed from it (a publication
 that fails part way rolls back to fresh, nothing has borrowed yet).
 `registry_new` is the heap form the session owns and every worker borrows
-by pointer; `registry_init` is the in-place form a fixture owns on its own
-stack. a `resolved.Target` borrows the registry it was resolved against and
-`resolved.live` refuses the borrow once the registry is released.
+by pointer; `registry_init_with_allocator` is the in-place form a caller
+owns on its own stack, and `registry_init` the same over a page allocator of
+its own for a test fixture. a `resolved.Target` borrows the registry it was
+resolved against and `resolved.live` refuses the borrow once the registry is
+released.
 
 ## rec TargetRegistry
 
@@ -47,13 +49,13 @@ pub val REGISTRY_RELEASED: u8  = 3
 pub val REGISTRY_VERSION:  u32 = 1
 ```
 
-## fun registry_init
+## fun registry_init_with_allocator
 
 ```mach
-pub fun registry_init() TargetRegistry;
+pub fun registry_init_with_allocator(alloc: *A.Allocator) TargetRegistry;
 ```
 
-an in-place registry over the sub-registries' own page allocators
+an in-place registry whose entries and resolution refusals come from `alloc`
 
 ## fun registry_new
 

@@ -49,20 +49,6 @@ a collected test: its qualified name, where it is declared, the test object
 that holds it, the dispatcher that runs it as `<exe> <idx>`, and the target and
 profile that dispatcher was built for
 
-## tag BuildEvent
-
-```mach
-pub tag BuildEvent: u8 {
-    unit:        BuildUnitEvent;
-    fail:        FailEvent;
-    diagnostics: DiagnosticBatch;
-}
-```
-
-what a build recorded, in order: a unit finished, a failure, or a batch of
-diagnostics with the sources they refer to. every payload is owned by the
-outcome's allocator
-
 ## def BuildSeverity
 
 ```mach
@@ -99,14 +85,14 @@ pub val BUILD_INTERNAL:    BuildSeverity = 3
 pub rec BuildOutcome;
 ```
 
-what a build produced and recorded. owned by the allocator outcome_init was given:
-every artifact path, test artifact, event payload and failure text in it is released
-together by outcome_dnit, and a refused record_* leaves the outcome exactly as it was
+what a build produced. owned by the allocator outcome_init was given: every
+artifact path and test artifact in it is released together by outcome_dnit, and
+a refused record_* leaves the outcome exactly as it was. what happened along the
+way, failures and diagnostics included, went to the build's readout sink
 
 severity: the worst standing recorded, BUILD_OK to BUILD_INTERNAL; ordered, compared with >
 artifacts: the outputs written, in build order
 tests: the test dispatchers built, for the runner
-events: everything recorded, in order
 
 ## fun outcome_init
 
@@ -142,31 +128,6 @@ pub fun record_test(bo: *BuildOutcome, t: TestArtifact) err[A.Error];
 
 t's text is borrowed; the outcome keeps its own copy. a nil text stays nil
 
-## fun record_unit
-
-```mach
-pub fun record_unit(bo: *BuildOutcome, artifact: str, target: str, verb: str, has_artifact: bool) err[A.Error];
-```
-
-## fun record_fail
-
-```mach
-pub fun record_fail(bo: *BuildOutcome, f: *fail.Fail, origin: diagnostic.Origin) err[A.Error];
-```
-
-the failure is copied whole: its text into the outcome's allocator
-
-origin: the phase the failure is reported under
-
-## fun record_diagnostics
-
-```mach
-pub fun record_diagnostics(bo: *BuildOutcome, sources: *lang_source.SourceMap, diags: *diagnostic.DiagnosticStore) err[fail.Fail];
-```
-
-the batch is a composite of two subsystems' snapshots, so its refusal is the
-snapshot's own failure or the allocation refusal of the push
-
 ## fun severity_of
 
 ```mach
@@ -187,7 +148,7 @@ a reported or user failure is the user's; the severity never regresses
 pub fun merge(agg: *BuildOutcome, unit: *BuildOutcome) err[A.Error];
 ```
 
-capacity is reserved for all three transfers before any element moves, so
+capacity is reserved for both transfers before any element moves, so
 a refused reservation leaves both outcomes exactly as they were
 
 ## rec GateTally

@@ -48,7 +48,7 @@ req_count: length of `reqs`
 ## fun parse_artifacts
 
 ```mach
-pub fun parse_artifacts(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, as_root: bool) err[fail.Fail];
+pub fun parse_artifacts(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[fail.Fail];
 ```
 
 ## fun artifact_template_id
