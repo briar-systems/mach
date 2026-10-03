@@ -312,15 +312,28 @@ pub fun region_i64(s: str, lo: usize, hi: usize) opt[i64];
 ## fun named_message
 
 ```mach
-pub fun named_message(alloc: *A.Allocator, interner: *intern.Interner, prefix: str, name: str,
-suffix: str, fallback: str) str;
+pub fun named_message(alloc: *A.Allocator, interner: *intern.Interner, prefix: str, name: str, suffix: str) res[str, fail.Fail];
 ```
+
+`prefix`, `name` and `suffix` joined, interned when there is an interner so
+the text outlives the encoder's storage, else owned by `alloc`
 
 ## fun span_message
 
 ```mach
-pub fun span_message(c: *Cursor, prefix: str, lo: usize, hi: usize, suffix: str, fallback: str) str;
+pub fun span_message(c: *Cursor, prefix: str, lo: usize, hi: usize, suffix: str) res[str, fail.Fail];
 ```
+
+`prefix`, the body's bytes `lo..hi` with the surrounding space trimmed, and
+`suffix`, joined as named_message joins them
+
+## fun reject_made
+
+```mach
+pub fun reject_made(c: *Cursor, k: diagnostic_kind.Kind, made: res[str, fail.Fail]) fail.Fail;
+```
+
+the rejection carrying a made text, or the failure that refused to make it
 
 ## fun cursor_init
 

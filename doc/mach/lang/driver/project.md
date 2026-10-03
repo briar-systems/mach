@@ -297,12 +297,6 @@ pub fun map_opt(o: manifest.MOpt) opt[TargetOpt];
 the pipeline level a manifest profile level selects; absent for a tag
 outside the catalog, which the caller reports through the catalog policy
 
-## fun fqn_name
-
-```mach
-pub fun fqn_name(p: *Project, fqn: intern.StrId) str;
-```
-
 ## fun module_count
 
 ```mach
@@ -321,7 +315,8 @@ the entry behind a ModuleId the project has issued
 
 the store is a handle.StableChunks: an entry is written once into a fixed
 chunk and never moves, so the pointer stays valid until dnit_project however
-many modules load after it
+many modules load after it. total: an id the project never issued stops the
+compiler
 
 ## fun module_reserve
 
@@ -337,7 +332,8 @@ make room for one more entry so the next module_append cannot fail
 pub fun module_append(p: *Project, m: ModuleEntry) session.ModuleId;
 ```
 
-publish an entry under the next ModuleId into the slot module_reserve made
+publish an entry under the next ModuleId into the slot module_reserve made.
+total: a caller that reserved nothing first stops the compiler
 
 ## fun module_by_fqn
 

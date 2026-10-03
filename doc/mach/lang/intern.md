@@ -65,11 +65,23 @@ pub fun child_init(base: *Interner, a: *A.Allocator) Interner;
 pub fun dnit(itn: *Interner);
 ```
 
+## fun text
+
+```mach
+pub fun text(itn: *Interner, id: StrId) str;
+```
+
+the text of `id`. an interner answers every id it or its base issued for as
+long as it lives, so the read is total: an id it never issued, STR_NIL among
+them, is a broken precondition of the caller, and it stops the compiler
+
 ## fun get
 
 ```mach
 pub fun get(itn: *Interner, id: StrId) opt[str];
 ```
+
+the text of `id`, or none for an id the interner never issued
 
 ## fun add
 

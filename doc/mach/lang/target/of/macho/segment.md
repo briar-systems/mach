@@ -83,6 +83,6 @@ pub fun data_const_seg_count(dyn: *target_of.DynamicInfo, segs: *target_of.LoadS
 
 ```mach
 pub fun data_const_conflict_message(itn: *intern.Interner, alloc: *A.Allocator, dyn: *target_of.DynamicInfo,
-segs: *target_of.LoadSegment, seg_count: u32) str;
+segs: *target_of.LoadSegment, seg_count: u32) res[str, fail.Fail];
 ```
 

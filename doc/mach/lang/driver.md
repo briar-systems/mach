@@ -48,14 +48,6 @@ fwd project.dnit_project
 
 forwards [`mach.lang.driver.project.dnit_project`](driver/project.md#fun-dnit_project)
 
-## fwd project.fqn_name
-
-```mach
-fwd project.fqn_name
-```
-
-forwards [`mach.lang.driver.project.fqn_name`](driver/project.md#fun-fqn_name)
-
 ## fwd project.module_by_fqn
 
 ```mach
