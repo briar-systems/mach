@@ -156,7 +156,7 @@ the query key of a module's test object products and its object key input
 ## fun prepare
 
 ```mach
-pub fun prepare(p: *project.Project, config: *u8, config_len: usize, ph: u8) err[fail.Fail];
+pub fun prepare(p: *project.Project, config: *u8, config_len: usize, ph: readout.Phase) err[fail.Fail];
 ```
 
 once per load, after the load walk and the embedded inputs, before anything
