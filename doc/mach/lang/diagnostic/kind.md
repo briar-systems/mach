@@ -2301,12 +2301,6 @@ pub val LINK_SYMBOL_CLAIM_CONFLICT:       Kind = 378
 pub val LINK_UNKNOWN_TABLE:               Kind = 379
 ```
 
-## val MACH_RANGE_MISSING
-
-```mach
-pub val MACH_RANGE_MISSING:               Kind = 380
-```
-
 ## val MACH_VERSION_UNACCEPTED
 
 ```mach
