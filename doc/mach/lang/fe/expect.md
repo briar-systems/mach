@@ -33,7 +33,7 @@ the key an argument evaluates to; none when the argument is not a constant strin
 ## fun arg_span
 
 ```mach
-pub fun arg_span(a: *ast.Ast, eid: ast_id.ExprId, fallback: token.Span) token.Span;
+pub fun arg_span(a: *ast.Ast, eid: ast_id.ExprId, fallback: lang_source.Span) lang_source.Span;
 ```
 
 the span an argument occupies, where a refused or unfulfilled key is reported

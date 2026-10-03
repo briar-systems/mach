@@ -11,7 +11,7 @@ object compiles, so its normal object is keyed without them
 ## fun omitted
 
 ```mach
-pub fun omitted(a: *ast.Ast, text: str, out: *Vector[token.Span]) err[fail.Fail];
+pub fun omitted(a: *ast.Ast, text: str, out: *Vector[lang_source.Span]) err[fail.Fail];
 ```
 
 the omitted bodies of `a`, in source order
@@ -19,7 +19,7 @@ the omitted bodies of `a`, in source order
 ## fun tests
 
 ```mach
-pub fun tests(a: *ast.Ast, text: str, out: *Vector[token.Span]) err[fail.Fail];
+pub fun tests(a: *ast.Ast, text: str, out: *Vector[lang_source.Span]) err[fail.Fail];
 ```
 
 the test declarations of `a`, whole, in source order
@@ -27,7 +27,7 @@ the test declarations of `a`, whole, in source order
 ## fun write
 
 ```mach
-pub fun write(fb: *driver_query.FpBuf, text: str, spans: *Vector[token.Span]) err[fail.Fail];
+pub fun write(fb: *driver_query.FpBuf, text: str, spans: *Vector[lang_source.Span]) err[fail.Fail];
 ```
 
 the surface's bytes: the text with every omitted span removed
@@ -35,7 +35,7 @@ the surface's bytes: the text with every omitted span removed
 ## fun digest
 
 ```mach
-pub fun digest(text: str, spans: *Vector[token.Span], placed: bool, out: *[32]u8);
+pub fun digest(text: str, spans: *Vector[lang_source.Span], placed: bool, out: *[32]u8);
 ```
 
 the digest of the surface. `placed` also takes each omitted span's line

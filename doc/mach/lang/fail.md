@@ -43,20 +43,17 @@ count: how many
 pub rec Place;
 ```
 
-where a failure points: the bytes [start, end) of the file at `path`, and the
-line and column of `start` and of `end`, each from 1 with columns counted in
-UTF-8 bytes. a place whose range is known before its file is `spanned` with a
-nil path until `placed` names the file. the path shares the message's
-lifetime: a copy of the failure that outlives its message copies both
+where a failure points: a span of the file at `path`, and the line and
+column its first byte and the byte just past it fall on. a place whose span
+is known before its file is `spanned` with a nil path until `placed` names
+the file. the path shares the message's lifetime: a copy of the failure that
+outlives its message copies both
 
 path: the file, nil until the place is resolved
-spanned: whether a range is known; false with a nil path is no place
-start: the byte offset of the first byte
-end: the byte offset just past the last byte
-line: the line of `start`
-col: the column of `start`
-end_line: the line of `end`
-end_col: the column of `end`
+spanned: whether a span is known; false with a nil path is no place
+span: the bytes the failure points at
+start: the position of the span's first byte
+end: the position just past the span's last byte
 
 ## fun reported
 
@@ -116,12 +113,20 @@ stays reported
 ## fun spanned
 
 ```mach
-pub fun spanned(f: Fail, start: usize, end: usize) Fail;
+pub fun spanned(f: Fail, s: lang_source.Span) Fail;
 ```
 
-the same failure pointing at the bytes [start, end) of the file that caused
-it, which `placed` names. a failure that already points somewhere keeps its
-place, the innermost site knowing best, and one with no kind points nowhere
+the same failure pointing at the span `s` of the file that caused it, which
+`placed` names. a failure that already points somewhere keeps its place, the
+innermost site knowing best, and one with no kind points nowhere
+
+## fun span_only
+
+```mach
+pub fun span_only(s: lang_source.Span) Place;
+```
+
+a place whose span is known and whose file is not yet
 
 ## fun placed
 
@@ -183,46 +188,11 @@ whose copy is refused is that refusal
 ## fun place
 
 ```mach
-pub fun place(path: str, data: *u8, n: usize, start: usize, end: usize) Place;
+pub fun place(path: str, lines: *lang_source.Lines, s: lang_source.Span) Place;
 ```
 
-the bytes [start, end) of the `n` bytes at `data`, the file at `path`, as a
-place; a range past the end is clamped to it
-
-## rec Lines
-
-```mach
-pub rec Lines;
-```
-
-the offsets the lines of one file start at, for resolving many places in it
-as `place` resolves one, each in time logarithmic in the file's lines
-
-path: the file, which every place resolved here names
-n: the file's length in bytes
-starts: the offset of each line's first byte, the first line's 0
-
-## fun lines_init
-
-```mach
-pub fun lines_init(a: *A.Allocator, path: str, data: *u8, n: usize) res[Lines, A.Error];
-```
-
-the lines of the `n` bytes at `data`, the file at `path`; released with `lines_dnit`
-
-## fun lines_dnit
-
-```mach
-pub fun lines_dnit(l: *Lines);
-```
-
-## fun lines_place
-
-```mach
-pub fun lines_place(l: *Lines, start: usize, end: usize) Place;
-```
-
-the bytes [start, end) of the file `l` indexes as a place, as `place` makes it
+the span `s` of the file at `path` whose line index is `lines`, as a place;
+a span past the end is clamped to it
 
 ## fun place_of
 
@@ -425,6 +395,12 @@ pub fun fs_refused(e: fs.FsError) Fail;
 
 ```mach
 pub fun format_refused(e: std_format.FormatError) Fail;
+```
+
+## fun source_refused
+
+```mach
+pub fun source_refused(e: lang_source.Error) Fail;
 ```
 
 ## fun fs_environment

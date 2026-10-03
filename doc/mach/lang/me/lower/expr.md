@@ -93,6 +93,6 @@ pub fun type_is_volatile_record(ctx: *lower_context.LowerContext, sem_ty: type.T
 ## fun field_index_in_type
 
 ```mach
-pub fun field_index_in_type(ctx: *lower_context.LowerContext, rec_ty: type.TypeId, name: token.Span) u32;
+pub fun field_index_in_type(ctx: *lower_context.LowerContext, rec_ty: type.TypeId, name: lang_source.Span) u32;
 ```
 

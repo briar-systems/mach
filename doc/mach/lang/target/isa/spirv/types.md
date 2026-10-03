@@ -34,7 +34,7 @@ pub fun types_init(b: *isa_spirv.Builder) TypeTable;
 ## fun raise_at
 
 ```mach
-pub fun raise_at(tt: *TypeTable, need: u64, loc: lang_source.SrcLoc);
+pub fun raise_at(tt: *TypeTable, need: u64, loc: lang_source.Location);
 ```
 
 raises `need` for the use at `loc`, which locates each bit no earlier use located
@@ -42,7 +42,7 @@ raises `need` for the use at `loc`, which locates each bit no earlier use locate
 ## fun need_loc
 
 ```mach
-pub fun need_loc(tt: *TypeTable, need: u64) lang_source.SrcLoc;
+pub fun need_loc(tt: *TypeTable, need: u64) lang_source.Location;
 ```
 
 the first located use of the lowest bit of `need`, nil where no use was located

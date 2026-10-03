@@ -75,7 +75,7 @@ pub fun get_decl(a: *Ast, id_: ast_id.DeclId) opt[*ast_decl.Decl];
 ## fun decl_name_span
 
 ```mach
-pub fun decl_name_span(a: *Ast, id_: ast_id.DeclId) token.Span;
+pub fun decl_name_span(a: *Ast, id_: ast_id.DeclId) lang_source.Span;
 ```
 
 ## fun add_type
@@ -111,7 +111,7 @@ pub fun add_field_init(a: *Ast, fi: ast_expr.FieldInit) res[u32, fail.Fail];
 ## fun add_generic_name
 
 ```mach
-pub fun add_generic_name(a: *Ast, name: token.Span) res[u32, fail.Fail];
+pub fun add_generic_name(a: *Ast, name: lang_source.Span) res[u32, fail.Fail];
 ```
 
 ## fun add_comptime_branch
@@ -171,7 +171,7 @@ pub fun rollback(a: *Ast, m: AstMark) bool;
 ## fun span_contains
 
 ```mach
-pub fun span_contains(span: token.Span, offset: usize) bool;
+pub fun span_contains(span: lang_source.Span, offset: usize) bool;
 ```
 
 ## fun offset_to_expr

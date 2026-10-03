@@ -14,28 +14,67 @@ pub val FILE_NIL: FileId = 0
 
 no source: an unlocated diagnostic, or a node the build synthesized
 
-## rec SrcLoc
+## rec Span
 
 ```mach
-pub rec SrcLoc;
+pub rec Span;
 ```
 
-## fun loc
+the bytes [offset, offset + len) of one text
+
+## rec Location
 
 ```mach
-pub fun loc(file: FileId, offset: usize) SrcLoc;
+pub rec Location;
 ```
 
-## fun loc_nil
+where in the compilation something is: a span of the file `file`, or
+nowhere when `file` is FILE_NIL
+
+## fun span
 
 ```mach
-pub fun loc_nil() SrcLoc;
+pub fun span(offset: usize, len: usize) Span;
 ```
 
-## fun loc_is_valid
+## fun span_between
 
 ```mach
-pub fun loc_is_valid(l: SrcLoc) bool;
+pub fun span_between(offset: usize, end: usize) Span;
+```
+
+the bytes [offset, end) as a span; an end before the offset is empty
+
+## fun span_end
+
+```mach
+pub fun span_end(s: Span) usize;
+```
+
+the offset just past the span's last byte
+
+## fun location
+
+```mach
+pub fun location(file: FileId, s: Span) Location;
+```
+
+## fun location_nil
+
+```mach
+pub fun location_nil() Location;
+```
+
+## fun location_is_valid
+
+```mach
+pub fun location_is_valid(l: Location) bool;
+```
+
+## fun location_equals
+
+```mach
+pub fun location_equals(x: Location, y: Location) bool;
 ```
 
 ## rec Position
@@ -44,10 +83,45 @@ pub fun loc_is_valid(l: SrcLoc) bool;
 pub rec Position;
 ```
 
-## rec LineSpan
+a line and a column, each from 1, the column counted in UTF-8 bytes
+
+## rec Lines
 
 ```mach
-pub rec LineSpan;
+pub rec Lines;
+```
+
+the line index of one text: where each line starts, for mapping an offset
+to its line and column in time logarithmic in the text's lines. a line ends
+at a newline byte
+
+starts: the offset of each line's first byte, the first line's 0
+len: how many lines, at least 1 once built
+n: the text's length in bytes
+
+## tag Error
+
+```mach
+pub tag Error: u8 {
+    alloc: A.Error;
+    store: handle.Error;
+    exhausted;
+    revision;
+    absent;
+    unindexed;
+    unsupplied;
+}
+```
+
+a refusal of the source map: the allocator's or the file store's, every
+file identity issued, a file revised as often as its revision counts, an
+identity the map never issued, a path indexed without its file, or a
+snapshot asked of no map or allocator
+
+## fun text
+
+```mach
+pub fun text(e: Error) str;
 ```
 
 ## rec SourceFile
@@ -94,7 +168,7 @@ the slot count including the FILE_NIL sentinel; the next FileId to be issued
 ## fun add
 
 ```mach
-pub fun add(m: *SourceMap, path: str, text: str) res[FileId, fail.Fail];
+pub fun add(m: *SourceMap, path: str, text: str) res[FileId, Error];
 ```
 
 ## rec PreparedLoad
@@ -109,7 +183,7 @@ reserved slot of a new entry until commit or discard
 ## fun prepare_load
 
 ```mach
-pub fun prepare_load(m: *SourceMap, interner: *intern.Interner, path: str, text: str) res[PreparedLoad, fail.Fail];
+pub fun prepare_load(m: *SourceMap, interner: *intern.Interner, path: str, text: str) res[PreparedLoad, Error];
 ```
 
 the caller exclusively borrows the map until commit or discard; a new entry
@@ -133,7 +207,7 @@ slot prepare_load reserved. neither moves any other file
 ## fun prepare_release
 
 ```mach
-pub fun prepare_release(m: *SourceMap, id: FileId) err[fail.Fail];
+pub fun prepare_release(m: *SourceMap, id: FileId) err[Error];
 ```
 
 preflight completes before query and editor owners are retired
@@ -166,7 +240,7 @@ whether the payload behind it changed
 ## fun copy_file
 
 ```mach
-pub fun copy_file(file: *SourceFile, a: *A.Allocator) res[SourceFile, fail.Fail];
+pub fun copy_file(file: *SourceFile, a: *A.Allocator) res[SourceFile, Error];
 ```
 
 ## fun dnit_file
@@ -178,7 +252,7 @@ pub fun dnit_file(file: *SourceFile, a: *A.Allocator);
 ## fun snapshot_from
 
 ```mach
-pub fun snapshot_from(src: *SourceMap, a: *A.Allocator) res[*SourceMap, fail.Fail];
+pub fun snapshot_from(src: *SourceMap, a: *A.Allocator) res[*SourceMap, Error];
 ```
 
 ## fun position
@@ -187,17 +261,44 @@ pub fun snapshot_from(src: *SourceMap, a: *A.Allocator) res[*SourceMap, fail.Fai
 pub fun position(file: *SourceFile, offset: usize) Position;
 ```
 
+the line and column of `offset` in the file; an offset past the end is
+placed at the end
+
 ## fun line_start
 
 ```mach
 pub fun line_start(file: *SourceFile, line: usize) opt[usize];
 ```
 
-reached only by mach-lsp
+the offset line `line` (from 1) starts at; reached only by mach-lsp
 
 ## fun line_bounds
 
 ```mach
-pub fun line_bounds(file: *SourceFile, line: usize) opt[LineSpan];
+pub fun line_bounds(file: *SourceFile, line: usize) opt[Span];
 ```
+
+the bytes of line `line` (from 1) without its line ending
+
+## fun lines_init
+
+```mach
+pub fun lines_init(a: *A.Allocator, data: *u8, n: usize) res[Lines, A.Error];
+```
+
+the line index of the `n` bytes at `data`; released with `lines_dnit`
+
+## fun lines_dnit
+
+```mach
+pub fun lines_dnit(a: *A.Allocator, l: *Lines);
+```
+
+## fun lines_position
+
+```mach
+pub fun lines_position(l: *Lines, offset: usize) Position;
+```
+
+the line and column of `offset`, clamped to the text's end
 
