@@ -221,13 +221,13 @@ ret: err naming the first dependency selected by a branch, a commit or a path
 ## fun cell_tmpl_vars
 
 ```mach
-pub fun cell_tmpl_vars(p: *project.Project) manifest.TmplVars;
+pub fun cell_tmpl_vars(p: *project.Project) template.Values;
 ```
 
 ## fun owner_tmpl_vars
 
 ```mach
-pub fun owner_tmpl_vars(p: *project.Project, owner: str) manifest.TmplVars;
+pub fun owner_tmpl_vars(p: *project.Project, owner: str) template.Values;
 ```
 
 `cell_tmpl_vars` whose `{artifact.<id>.out}` resolves in the requirement scope

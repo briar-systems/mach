@@ -106,6 +106,7 @@ at: where the table's key is written
 default_at: where its `default` value is written, the zero place when absent
 out_at: where its `out` value is written
 targets_at: where its `targets` value is written
+link_at: where each `link` entry is written, parallel to `link`
 need_at: where each `need` entry is written, parallel to `need`
 
 ## rec ProfileDef
@@ -256,7 +257,6 @@ version: the required `[project].version`, carried verbatim
 src: the required `[project].src`, a project-relative path
 out_tmpl: the required `[project].out`, an unexpanded path template
 out_at: where `[project].out` is written
-default_target: always the interned string "native"
 targets: the `[target.*]` tables, nil when none
 target_count: length of `targets`
 native_target: the owned synthesized host definition when no targets are declared
@@ -302,4 +302,53 @@ pub fun step_dnit(alloc: *A.Allocator, s: *StepDef);
 
 free every array a step owns, its entries and the places they are written at;
 the step itself is its owner's
+
+## fun free_strarr
+
+```mach
+pub fun free_strarr(alloc: *A.Allocator, items: *intern.StrId, count: u32);
+```
+
+## fun free_sites
+
+```mach
+pub fun free_sites(alloc: *A.Allocator, sites: *fail.Place, count: u32);
+```
+
+## fun site_of
+
+```mach
+pub fun site_of(sites: *fail.Place, i: u32) fail.Place;
+```
+
+the place `i` of a model's per-entry places, the zero place when none were recorded
+
+## fun text_of
+
+```mach
+pub fun text_of(itn: *intern.Interner, id: intern.StrId) str;
+```
+
+the text of an id the model holds. total: every id in a manifest was minted
+by the interner that parsed it, so a miss is a compiler defect and ends the
+process
+
+itn: the interner the manifest was parsed with
+id: an id the model holds, never STR_NIL
+
+## fun id_of
+
+```mach
+pub fun id_of(itn: *intern.Interner, text: str) res[intern.StrId, fail.Fail];
+```
+
+the id of `text`, interned in `itn`; a refused allocation is the failure
+
+## fun optional_id_of
+
+```mach
+pub fun optional_id_of(itn: *intern.Interner, text: str) res[intern.StrId, fail.Fail];
+```
+
+`id_of` for an optional key's value: STR_NIL for the empty text an absent key reads as
 

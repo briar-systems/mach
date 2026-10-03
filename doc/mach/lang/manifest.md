@@ -1,52 +1,36 @@
 # mach.lang.manifest
 
-## fwd mach.lang.manifest.parse.validate_source_bytes
+## fwd mach.lang.manifest.schema.is_valid_id
 
 ```mach
-fwd mach.lang.manifest.parse.validate_source_bytes
+fwd mach.lang.manifest.schema.is_valid_id
 ```
 
-forwards [`mach.lang.manifest.parse.validate_source_bytes`](manifest/parse.md#fun-validate_source_bytes)
+forwards [`mach.lang.manifest.schema.is_valid_id`](manifest/schema.md#fun-is_valid_id)
 
-## fwd mach.lang.manifest.parse.is_valid_id
+## fwd mach.lang.manifest.schema.is_project_path
 
 ```mach
-fwd mach.lang.manifest.parse.is_valid_id
+fwd mach.lang.manifest.schema.is_project_path
 ```
 
-forwards [`mach.lang.manifest.parse.is_valid_id`](manifest/parse.md#fun-is_valid_id)
+forwards [`mach.lang.manifest.schema.is_project_path`](manifest/schema.md#fun-is_project_path)
 
-## fwd mach.lang.manifest.parse.is_project_path
+## fwd mach.lang.manifest.refusal.at_sites
 
 ```mach
-fwd mach.lang.manifest.parse.is_project_path
+fwd mach.lang.manifest.refusal.at_sites
 ```
 
-forwards [`mach.lang.manifest.parse.is_project_path`](manifest/parse.md#fun-is_project_path)
+forwards [`mach.lang.manifest.refusal.at_sites`](manifest/refusal.md#fun-at_sites)
 
-## fwd mach.lang.manifest.parse.at_sites
+## fwd mach.lang.manifest.model.site_of
 
 ```mach
-fwd mach.lang.manifest.parse.at_sites
+fwd mach.lang.manifest.model.site_of
 ```
 
-forwards [`mach.lang.manifest.parse.at_sites`](manifest/parse.md#fun-at_sites)
-
-## fwd mach.lang.manifest.parse.site_of
-
-```mach
-fwd mach.lang.manifest.parse.site_of
-```
-
-forwards [`mach.lang.manifest.parse.site_of`](manifest/parse.md#fun-site_of)
-
-## fwd mach.lang.manifest.parse.free_sites
-
-```mach
-fwd mach.lang.manifest.parse.free_sites
-```
-
-forwards [`mach.lang.manifest.parse.free_sites`](manifest/parse.md#fun-free_sites)
+forwards [`mach.lang.manifest.model.site_of`](manifest/model.md#fun-site_of)
 
 ## fwd mach.lang.manifest.model.MOpt
 
@@ -208,134 +192,6 @@ fwd mach.lang.manifest.model.step_dnit
 
 forwards [`mach.lang.manifest.model.step_dnit`](manifest/model.md#fun-step_dnit)
 
-## fwd mach.lang.manifest.artifact.TmplVars
-
-```mach
-fwd mach.lang.manifest.artifact.TmplVars
-```
-
-forwards [`mach.lang.manifest.artifact.TmplVars`](manifest/artifact.md#rec-tmplvars)
-
-## fwd mach.lang.manifest.artifact.ArtifactReq
-
-```mach
-fwd mach.lang.manifest.artifact.ArtifactReq
-```
-
-forwards [`mach.lang.manifest.artifact.ArtifactReq`](manifest/artifact.md#rec-artifactreq)
-
-## fwd mach.lang.manifest.artifact.RequirementScope
-
-```mach
-fwd mach.lang.manifest.artifact.RequirementScope
-```
-
-forwards [`mach.lang.manifest.artifact.RequirementScope`](manifest/artifact.md#rec-requirementscope)
-
-## fwd mach.lang.manifest.artifact.tmpl_vars_of
-
-```mach
-fwd mach.lang.manifest.artifact.tmpl_vars_of
-```
-
-forwards [`mach.lang.manifest.artifact.tmpl_vars_of`](manifest/artifact.md#fun-tmpl_vars_of)
-
-## fwd mach.lang.manifest.artifact.TemplateError
-
-```mach
-fwd mach.lang.manifest.artifact.TemplateError
-```
-
-forwards [`mach.lang.manifest.artifact.TemplateError`](manifest/artifact.md#tag-templateerror)
-
-## fwd mach.lang.manifest.artifact.template_internal
-
-```mach
-fwd mach.lang.manifest.artifact.template_internal
-```
-
-forwards [`mach.lang.manifest.artifact.template_internal`](manifest/artifact.md#fun-template_internal)
-
-## fwd mach.lang.manifest.artifact.template_error_dnit
-
-```mach
-fwd mach.lang.manifest.artifact.template_error_dnit
-```
-
-forwards [`mach.lang.manifest.artifact.template_error_dnit`](manifest/artifact.md#fun-template_error_dnit)
-
-## fwd mach.lang.manifest.artifact.template_rejection
-
-```mach
-fwd mach.lang.manifest.artifact.template_rejection
-```
-
-forwards [`mach.lang.manifest.artifact.template_rejection`](manifest/artifact.md#fun-template_rejection)
-
-## fwd mach.lang.manifest.artifact.template_text
-
-```mach
-fwd mach.lang.manifest.artifact.template_text
-```
-
-forwards [`mach.lang.manifest.artifact.template_text`](manifest/artifact.md#fun-template_text)
-
-## fwd mach.lang.manifest.artifact.expand_artifact_path
-
-```mach
-fwd mach.lang.manifest.artifact.expand_artifact_path
-```
-
-forwards [`mach.lang.manifest.artifact.expand_artifact_path`](manifest/artifact.md#fun-expand_artifact_path)
-
-## fwd mach.lang.manifest.artifact.artifact_template_id
-
-```mach
-fwd mach.lang.manifest.artifact.artifact_template_id
-```
-
-forwards [`mach.lang.manifest.artifact.artifact_template_id`](manifest/artifact.md#fun-artifact_template_id)
-
-## fwd mach.lang.manifest.artifact.tmpl_vars_with_reqs
-
-```mach
-fwd mach.lang.manifest.artifact.tmpl_vars_with_reqs
-```
-
-forwards [`mach.lang.manifest.artifact.tmpl_vars_with_reqs`](manifest/artifact.md#fun-tmpl_vars_with_reqs)
-
-## fwd mach.lang.manifest.artifact.expand
-
-```mach
-fwd mach.lang.manifest.artifact.expand
-```
-
-forwards [`mach.lang.manifest.artifact.expand`](manifest/artifact.md#fun-expand)
-
-## fwd mach.lang.manifest.artifact.expand_step_value
-
-```mach
-fwd mach.lang.manifest.artifact.expand_step_value
-```
-
-forwards [`mach.lang.manifest.artifact.expand_step_value`](manifest/artifact.md#fun-expand_step_value)
-
-## fwd mach.lang.manifest.artifact.expand_project_path
-
-```mach
-fwd mach.lang.manifest.artifact.expand_project_path
-```
-
-forwards [`mach.lang.manifest.artifact.expand_project_path`](manifest/artifact.md#fun-expand_project_path)
-
-## fwd mach.lang.manifest.artifact.expand_project_out
-
-```mach
-fwd mach.lang.manifest.artifact.expand_project_out
-```
-
-forwards [`mach.lang.manifest.artifact.expand_project_out`](manifest/artifact.md#fun-expand_project_out)
-
 ## fwd mach.lang.manifest.artifact.find_artifact
 
 ```mach
@@ -359,6 +215,14 @@ fwd mach.lang.manifest.artifact.artifact_supports_target
 ```
 
 forwards [`mach.lang.manifest.artifact.artifact_supports_target`](manifest/artifact.md#fun-artifact_supports_target)
+
+## fwd mach.lang.manifest.project.expand_project_out
+
+```mach
+fwd mach.lang.manifest.project.expand_project_out
+```
+
+forwards [`mach.lang.manifest.project.expand_project_out`](manifest/project.md#fun-expand_project_out)
 
 ## fwd mach.lang.manifest.link.LinkRequirement
 
@@ -416,77 +280,69 @@ fwd mach.lang.manifest.link.expand_local_path
 
 forwards [`mach.lang.manifest.link.expand_local_path`](manifest/link.md#fun-expand_local_path)
 
-## fwd mach.lang.manifest.dep.DepSource
+## fwd mach.lang.manifest.edit.DepSource
 
 ```mach
-fwd mach.lang.manifest.dep.DepSource
+fwd mach.lang.manifest.edit.DepSource
 ```
 
-forwards [`mach.lang.manifest.dep.DepSource`](manifest/dep.md#def-depsource)
+forwards [`mach.lang.manifest.edit.DepSource`](manifest/edit.md#def-depsource)
 
-## fwd mach.lang.manifest.dep.DEP_SOURCE_GIT
+## fwd mach.lang.manifest.edit.DEP_SOURCE_GIT
 
 ```mach
-fwd mach.lang.manifest.dep.DEP_SOURCE_GIT
+fwd mach.lang.manifest.edit.DEP_SOURCE_GIT
 ```
 
-forwards [`mach.lang.manifest.dep.DEP_SOURCE_GIT`](manifest/dep.md#val-dep_source_git)
+forwards [`mach.lang.manifest.edit.DEP_SOURCE_GIT`](manifest/edit.md#val-dep_source_git)
 
-## fwd mach.lang.manifest.dep.DEP_SOURCE_PATH
+## fwd mach.lang.manifest.edit.DEP_SOURCE_PATH
 
 ```mach
-fwd mach.lang.manifest.dep.DEP_SOURCE_PATH
+fwd mach.lang.manifest.edit.DEP_SOURCE_PATH
 ```
 
-forwards [`mach.lang.manifest.dep.DEP_SOURCE_PATH`](manifest/dep.md#val-dep_source_path)
+forwards [`mach.lang.manifest.edit.DEP_SOURCE_PATH`](manifest/edit.md#val-dep_source_path)
 
-## fwd mach.lang.manifest.dep.DepTableSpec
+## fwd mach.lang.manifest.edit.DepTableSpec
 
 ```mach
-fwd mach.lang.manifest.dep.DepTableSpec
+fwd mach.lang.manifest.edit.DepTableSpec
 ```
 
-forwards [`mach.lang.manifest.dep.DepTableSpec`](manifest/dep.md#rec-deptablespec)
+forwards [`mach.lang.manifest.edit.DepTableSpec`](manifest/edit.md#rec-deptablespec)
 
-## fwd mach.lang.manifest.dep.toml_escape_value
+## fwd mach.lang.manifest.edit.dep_table_add
 
 ```mach
-fwd mach.lang.manifest.dep.toml_escape_value
+fwd mach.lang.manifest.edit.dep_table_add
 ```
 
-forwards [`mach.lang.manifest.dep.toml_escape_value`](manifest/dep.md#fun-toml_escape_value)
+forwards [`mach.lang.manifest.edit.dep_table_add`](manifest/edit.md#fun-dep_table_add)
 
-## fwd mach.lang.manifest.dep.manifest_add_dep_table
+## fwd mach.lang.manifest.edit.dep_table_remove
 
 ```mach
-fwd mach.lang.manifest.dep.manifest_add_dep_table
+fwd mach.lang.manifest.edit.dep_table_remove
 ```
 
-forwards [`mach.lang.manifest.dep.manifest_add_dep_table`](manifest/dep.md#fun-manifest_add_dep_table)
+forwards [`mach.lang.manifest.edit.dep_table_remove`](manifest/edit.md#fun-dep_table_remove)
 
-## fwd mach.lang.manifest.dep.manifest_remove_dep_table
+## fwd mach.lang.manifest.target.host_tuple
 
 ```mach
-fwd mach.lang.manifest.dep.manifest_remove_dep_table
+fwd mach.lang.manifest.target.host_tuple
 ```
 
-forwards [`mach.lang.manifest.dep.manifest_remove_dep_table`](manifest/dep.md#fun-manifest_remove_dep_table)
+forwards [`mach.lang.manifest.target.host_tuple`](manifest/target.md#fun-host_tuple)
 
-## fwd mach.lang.manifest.project.host_tuple
+## fwd mach.lang.manifest.target.target_matches_host
 
 ```mach
-fwd mach.lang.manifest.project.host_tuple
+fwd mach.lang.manifest.target.target_matches_host
 ```
 
-forwards [`mach.lang.manifest.project.host_tuple`](manifest/project.md#fun-host_tuple)
-
-## fwd mach.lang.manifest.project.tuple_of
-
-```mach
-fwd mach.lang.manifest.project.tuple_of
-```
-
-forwards [`mach.lang.manifest.project.tuple_of`](manifest/project.md#fun-tuple_of)
+forwards [`mach.lang.manifest.target.target_matches_host`](manifest/target.md#fun-target_matches_host)
 
 ## fwd mach.lang.manifest.load.project_parse
 
@@ -495,14 +351,6 @@ fwd mach.lang.manifest.load.project_parse
 ```
 
 forwards [`mach.lang.manifest.load.project_parse`](manifest/load.md#fun-project_parse)
-
-## fwd mach.lang.manifest.project.target_matches_host
-
-```mach
-fwd mach.lang.manifest.project.target_matches_host
-```
-
-forwards [`mach.lang.manifest.project.target_matches_host`](manifest/project.md#fun-target_matches_host)
 
 ## fwd mach.lang.manifest.load.parse
 
@@ -527,6 +375,14 @@ fwd mach.lang.manifest.load.doc_parse
 ```
 
 forwards [`mach.lang.manifest.load.doc_parse`](manifest/load.md#fun-doc_parse)
+
+## fwd mach.lang.manifest.load.doc_parse_bytes
+
+```mach
+fwd mach.lang.manifest.load.doc_parse_bytes
+```
+
+forwards [`mach.lang.manifest.load.doc_parse_bytes`](manifest/load.md#fun-doc_parse_bytes)
 
 ## fwd mach.lang.manifest.load.doc_read
 
@@ -672,14 +528,6 @@ fwd mach.lang.manifest.plan.resolve_profile
 
 forwards [`mach.lang.manifest.plan.resolve_profile`](manifest/plan.md#fun-resolve_profile)
 
-## fwd mach.lang.manifest.plan.resolve_artifact
-
-```mach
-fwd mach.lang.manifest.plan.resolve_artifact
-```
-
-forwards [`mach.lang.manifest.plan.resolve_artifact`](manifest/plan.md#fun-resolve_artifact)
-
 ## fwd mach.lang.manifest.plan.local_path_demanded_by_step
 
 ```mach
@@ -695,14 +543,6 @@ fwd mach.lang.manifest.plan.required_artifact_uses_target
 ```
 
 forwards [`mach.lang.manifest.plan.required_artifact_uses_target`](manifest/plan.md#fun-required_artifact_uses_target)
-
-## fwd mach.lang.manifest.plan.artifact_required_by_any
-
-```mach
-fwd mach.lang.manifest.plan.artifact_required_by_any
-```
-
-forwards [`mach.lang.manifest.plan.artifact_required_by_any`](manifest/plan.md#fun-artifact_required_by_any)
 
 ## fwd mach.lang.manifest.plan.resolve_artifact_reqs
 
@@ -744,22 +584,6 @@ fwd mach.lang.manifest.plan.plan_export_steps
 
 forwards [`mach.lang.manifest.plan.plan_export_steps`](manifest/plan.md#fun-plan_export_steps)
 
-## fwd mach.lang.manifest.plan.AMBIGUOUS_PROFILE_MSG
-
-```mach
-fwd mach.lang.manifest.plan.AMBIGUOUS_PROFILE_MSG
-```
-
-forwards [`mach.lang.manifest.plan.AMBIGUOUS_PROFILE_MSG`](manifest/plan.md#val-ambiguous_profile_msg)
-
-## fwd mach.lang.manifest.plan.AMBIGUOUS_ARTIFACT_MSG
-
-```mach
-fwd mach.lang.manifest.plan.AMBIGUOUS_ARTIFACT_MSG
-```
-
-forwards [`mach.lang.manifest.plan.AMBIGUOUS_ARTIFACT_MSG`](manifest/plan.md#val-ambiguous_artifact_msg)
-
 ## fwd mach.lang.manifest.plan.select_primary_artifact
 
 ```mach
@@ -767,14 +591,6 @@ fwd mach.lang.manifest.plan.select_primary_artifact
 ```
 
 forwards [`mach.lang.manifest.plan.select_primary_artifact`](manifest/plan.md#fun-select_primary_artifact)
-
-## fwd mach.lang.manifest.plan.select_sole_executable_artifact
-
-```mach
-fwd mach.lang.manifest.plan.select_sole_executable_artifact
-```
-
-forwards [`mach.lang.manifest.plan.select_sole_executable_artifact`](manifest/plan.md#fun-select_sole_executable_artifact)
 
 ## fwd mach.lang.manifest.plan.resolve_build_unit
 
@@ -864,29 +680,13 @@ fwd mach.lang.manifest.select.selectors_of
 
 forwards [`mach.lang.manifest.select.selectors_of`](manifest/select.md#fun-selectors_of)
 
-## fwd mach.lang.manifest.select.cell_label
+## fwd mach.lang.manifest.select.single_selection_fail
 
 ```mach
-fwd mach.lang.manifest.select.cell_label
+fwd mach.lang.manifest.select.single_selection_fail
 ```
 
-forwards [`mach.lang.manifest.select.cell_label`](manifest/select.md#fun-cell_label)
-
-## fwd mach.lang.manifest.select.cell_labels
-
-```mach
-fwd mach.lang.manifest.select.cell_labels
-```
-
-forwards [`mach.lang.manifest.select.cell_labels`](manifest/select.md#fun-cell_labels)
-
-## fwd mach.lang.manifest.select.single_selection_msg
-
-```mach
-fwd mach.lang.manifest.select.single_selection_msg
-```
-
-forwards [`mach.lang.manifest.select.single_selection_msg`](manifest/select.md#fun-single_selection_msg)
+forwards [`mach.lang.manifest.select.single_selection_fail`](manifest/select.md#fun-single_selection_fail)
 
 ## fwd mach.lang.manifest.select.resolve_cells
 
