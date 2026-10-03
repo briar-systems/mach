@@ -5,8 +5,8 @@
 `json` writes everything the command reports as JSON objects, one per line of
 stderr (NDJSON), for editors, CI and other tools: each diagnostic, each failure
 raised outside the compiler's diagnostics (a manifest, dependency, build-step,
-link or command-line refusal), each test result under `mach test`, and a
-closing summary. The records are the contract: the human text may change from
+link or command-line refusal), each test result under `mach test`, the build
+readout under `-v` and `-vv`, and a closing summary. The records are the contract: the human text may change from
 release to release, and a record changes only under the
 [stability rule](#stability). The flag changes no exit code.
 
@@ -16,8 +16,7 @@ mach check . --diagnostics=json
 
 A bare `--diagnostics` or any other value is refused with
 `error[cli.flag_value]`, in human text since no format has been chosen. `-v`
-and `-vv`, whose phase readout is text on stderr, are refused beside `json`
-with a `cli.flag_conflict` failure record.
+and `-vv` write the [readout](readout.md) as [readout records](#readout-records).
 
 ## The stream
 
@@ -30,8 +29,9 @@ with a `cli.flag_conflict` failure record.
 - The text is ASCII. A non-ASCII character in a message, a label or a path is
   written as a `\u` escape, and a byte that is not valid UTF-8 as `�`, so
   every line is valid UTF-8 and valid JSON.
-- Under `json` the human tally (`N errors / M warnings`) and the
-  `building <artifact>` banners are not written.
+- Under `json` the human tally (`N errors / M warnings`) is not written, and
+  the `building <artifact>` banners and `profile <name>:` headers are not
+  written; under `-v` a `unit` record opens every unit instead.
 
 ## A record
 
@@ -190,6 +190,62 @@ finish:
 A test record carries no `severity` and counts in no summary total; the
 summary's `outcome` and `exit_code` say whether a test failed.
 
+## Readout records
+
+Under `-v` every line of the [readout](readout.md) the human text writes to
+stderr is a record, written when the line would be and in the same order. Times
+are integer microseconds.
+
+```json
+{"schema":1,"record":"unit","verb":"building","artifact":"app","target":"linux","profile":"debug"}
+{"schema":1,"record":"phase","name":"load","count":48,"unit":"modules","time_us":77012}
+{"schema":1,"record":"phase","name":"codegen","count":48,"unit":"modules","time_us":75012,"threads":16,"slowest":"std.filesystem","slowest_us":9104}
+{"schema":1,"record":"phase","name":"other","time_us":32007}
+```
+
+A **unit** record opens each unit, before its rows. It is written for every
+unit, where the text shows a `building <artifact>` banner only when the plan has
+several units and a `profile <name>:` header only when it has several profiles:
+
+| Member | Type | Meaning |
+|---|---|---|
+| `verb` | string | what the unit does, `"building"` or `"checking"` |
+| `artifact` | string or `null` | the artifact, or `null` for the whole project |
+| `target` | string | the target, absent when the unit names none |
+| `profile` | string | the profile, absent when the unit names none |
+
+A **phase** record is a phase row:
+
+| Member | Type | Meaning |
+|---|---|---|
+| `name` | string | the row's label: `load`, `resolve`, `sema`, `lower`, `optimize`, `codegen`, `emit`, `link`, `cache`, `test lower`, `test codegen`, or `other` for the time no row accounts for |
+| `count` | integer | what the phase processed; absent for `other` |
+| `unit` | string | the noun the count is in, singular for a count of one: `"modules"`, `"objects"` |
+| `time_us` | integer | the phase's time |
+| `threads` | integer | the workers it ran on, present only when more than one |
+| `dropped` | integer | the modules it dropped as target-gated, present only when any |
+| `slowest` | string | under `-vv`, the slowest of its items, present when it had two or more |
+| `slowest_us` | integer | that item's time, present with `slowest` |
+
+The slowest item is on the phase record rather than on an item, since it is
+only known when the phase closes.
+
+Under `-vv` a **phase_item** record is each module or file a phase processed,
+written as it finishes, before its phase's record:
+
+```json
+{"schema":1,"record":"phase_item","phase":"load","name":"std.filesystem","time_us":2013}
+```
+
+| Member | Type | Meaning |
+|---|---|---|
+| `phase` | string | the label of the phase that processed it |
+| `name` | string | the module or file |
+| `time_us` | integer | its time |
+
+A unit's `built` line is not a record of its own: it is carried by the
+[summary record](#the-summary-record).
+
 ## The summary record
 
 Every run ends with one summary record, the last line on stderr:
@@ -205,6 +261,15 @@ Every run ends with one summary record, the last line on stderr:
 | `notes` | integer | those with severity `"note"` |
 | `outcome` | string | `"success"` when the command exits 0, otherwise `"failure"` |
 | `exit_code` | integer | the command's exit code |
+| `time_us` | integer | under `-v`, the wall time of every unit that built, added up; absent when none did |
+| `built` | array | under `-v`, one object per `built` line, in order; absent when none was written |
+
+A `built` object has the unit's `out` (string), `modules` (integer), `bytes`
+(integer, present when the line shows a size) and `time_us` (integer).
+
+```json
+{"schema":1,"record":"summary","errors":0,"warnings":0,"notes":0,"outcome":"success","exit_code":0,"time_us":358120,"built":[{"out":"out/linux/debug/bin/app","modules":48,"bytes":1048576,"time_us":358120}]}
+```
 
 ## Stability
 
@@ -221,4 +286,5 @@ Every run ends with one summary record, the last line on stderr:
 ## See also
 
 - [diagnostics.md](diagnostics.md) — keys, the registry and its never-reused rule
+- [readout.md](readout.md) — what `-v` and `-vv` show, on which stream, and when
 - [test.md](test.md#json-output) — `mach test --format json`, the test runner's event stream on stdout
