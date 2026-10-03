@@ -30,7 +30,7 @@ pub val RISCV64: u32 = 3
 pub val SPIRV:   u32 = 5
 ```
 
-4 was the withdrawn MOS 6502 target (#3226, #3112); no catalog row carries it
+4 was the withdrawn MOS 6502 target; no catalog row carries it
 
 ## val RISCV32
 

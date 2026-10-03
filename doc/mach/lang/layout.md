@@ -259,7 +259,7 @@ pub rec Machine;
 
 `vector_bits` is the narrowest vector register and `register_bits` the
 widest the selected extensions give, each a power of two times the one
-before: 128 and 256 on x86-64 with avx (#4128)
+before: 128 and 256 on x86-64 with avx
 
 ## fun machine
 

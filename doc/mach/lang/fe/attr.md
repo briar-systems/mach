@@ -6,7 +6,7 @@ an argument is a constant expression evaluated in its module's comptime
 context: a literal, a `val`, a gated `val`, or an imported constant. the load
 evaluates each once, after its walk has bound every constant, and records the
 string in the session; every later reader takes it from there, so resolution,
-type checking, lowering and the link all read one value (#4022)
+type checking, lowering and the link all read one value
 
 ## fun string_id
 

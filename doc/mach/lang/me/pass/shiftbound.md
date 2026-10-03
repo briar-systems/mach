@@ -1,6 +1,6 @@
 # mach.lang.me.pass.shiftbound
 
-the one home of the shift saturation (#3756, #3885, #3887). every scalar
+the one home of the shift saturation. every scalar
 shift leaves this pass marked count-bounded, its count below its operand's
 width: a count the range analysis proves keeps the bare shift, and any other
 count is saturated here in the ir, branch-free, around the mask

@@ -11,7 +11,7 @@ take magnitudes, call the unsigned helper and fix the sign. each module that
 needs a helper synthesizes it weak, so every copy coalesces at link, as a
 generic instantiation does. a divisor of zero yields an all-ones quotient
 and the dividend as remainder, the RISC-V convention, rather than a trap:
-a helper cannot raise the target's divide fault (#3511, ruling Q5)
+a helper cannot raise the target's divide fault
 
 ## fun run
 

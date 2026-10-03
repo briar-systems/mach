@@ -230,7 +230,7 @@ to the pieces it rides in each bank; a classifier raises them where its ABI
 skips or exhausts registers without using them (AAPCS64 C.10 rounds a
 double-word to an even register, C.11 and C.13 give the remaining general
 registers to nothing once an argument that wanted them goes to the stack, and
-C.3 does the same for the vector registers after an HFA or HVA) (#3511, #3928)
+C.3 does the same for the vector registers after an HFA or HVA)
 
 ## val EB_SSE_LO
 
@@ -278,7 +278,7 @@ hfa_members, hfa_elem, the aggregate layout and the vector register bytes. align
 register assignment honors: the type's own, capped where the platform relaxes it (darwin aarch64 starts a
 16-byte value in any x register). the vector register bytes are the widest vector one register of the
 target carries under its selected extensions (isa.vector_register_bytes), which a convention that places
-a vector by its register width reads (System V's ymm under avx, #3751)
+a vector by its register width reads (System V's ymm under avx)
 
 ## def RetPassingFn
 
