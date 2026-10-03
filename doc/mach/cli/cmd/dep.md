@@ -17,12 +17,13 @@ ret: exit.OK, exit.USER for a malformed invocation, or the code `exit.of` maps t
 ## fun pull_project
 
 ```mach
-pub fun pull_project(root: str, quiet: bool) i64;
+pub fun pull_project(root: str, quiet: bool, environ: **u8) i64;
 ```
 
 `mach dep pull`: realize the dependency closure of a project (package_closure.pull)
 
 root: the project root directory
 quiet: suppress progress lines
+environ: the environment git runs in
 ret: exit.OK when realized, otherwise the code `exit.of` maps the printed failure to
 

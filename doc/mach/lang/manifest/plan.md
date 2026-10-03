@@ -196,43 +196,20 @@ of which parse admits at most one. several declared profiles with none marked
 default are refused: no profile is ever selected by table order
 
 alloc: owns error text
-itn: interns the name
+itn: resolves the names
 m: the manifest
 pick: the profile name, or "" for the default
 ret: the profile; err "mach.toml: no profile named '<pick>'" or, with an empty
        name, an error when several profiles are declared and none is the default
 
-## fun resolve_artifact
-
-```mach
-pub fun resolve_artifact(itn: *intern.Interner, m: *Manifest, pick: Selection) *ArtifactDef;
-```
-
-the artifact a selection names: with `has_artifact`, the one whose name and
-`is_lib` both match `pick`; otherwise the sole declared artifact
-
-itn: interns the name
-m: the manifest
-pick: the selection
-ret: the artifact, or nil when none is declared, the name has no match of
-      the requested shape, or several artifacts are declared and none was named
-
 ## fun local_path_demanded_by_step
 
 ```mach
 pub fun local_path_demanded_by_step(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
-expanded_path: str, proj_out: str, v: *TmplVars) bool;
+expanded_path: str, proj_out: str, v: *template.Values) res[bool, fail.Fail];
 ```
 
 whether some build step produces a path; `step_producing_out` as a bool
-
-alloc: owns temporary expansions
-itn: resolves step strings
-m: the manifest
-expanded_path: the path to match, already expanded
-proj_out: the expanded `[project].out`
-v: the template values
-ret: true when a step lists the path in `out`
 
 ## fun required_artifact_uses_target
 
@@ -245,25 +222,12 @@ whether a required artifact is built for a target when its consumer builds for
 `consumer_target`: only that target when `req` supports it, otherwise every
 target `req` supports
 
-itn: interns "*"
+itn: resolves the names
 req: the required artifact
 consumer_target: the consumer's target name, or STR_NIL for a consumer outside
                  `req`'s manifest, which admits every target `req` supports
 t: the target asked about
 ret: true when `req` is built for `t` on behalf of that consumer
-
-## fun artifact_required_by_any
-
-```mach
-pub fun artifact_required_by_any(itn: *intern.Interner, m: *Manifest, ra: *ArtifactDef) bool;
-```
-
-whether any artifact's `need` selects `ra`
-
-itn: resolves the names
-m: the manifest
-ra: the candidate requirement
-ret: true when some other artifact needs it
 
 ## fun default_library_requires
 
@@ -285,7 +249,7 @@ ret: true when a default library artifact needs it
 pub fun resolve_artifact_reqs(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, s: *Scope,
 consumer: *ArtifactDef, consumer_target: intern.StrId, profile: str,
 whole_project: bool,
-out_items: **ArtifactReq, out_count: *u32) err[fail.Fail];
+out_items: **template.Requirement, out_count: *u32) err[fail.Fail];
 ```
 
 list the artifacts a consumer requires, each with its output path when that
@@ -306,7 +270,7 @@ ret: ok; err from the output path expansion, with the array freed
 
 ```mach
 pub fun resolve_default_library_reqs(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry,
-s: *Scope, profile: str, out_items: **ArtifactReq, out_count: *u32) err[fail.Fail];
+s: *Scope, profile: str, out_items: **template.Requirement, out_count: *u32) err[fail.Fail];
 ```
 
 list the artifacts a dependency's default library artifacts require, the scope
@@ -326,7 +290,7 @@ ret: ok; err from the output path expansion, with the array freed
 ```mach
 pub fun plan_steps(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
 art_names: *intern.StrId, art_count: u32, t: *TargetDef,
-proj_out: str, v: *TmplVars,
+proj_out: str, v: *template.Values,
 out_order: **u32, out_count: *u32) err[fail.Fail];
 ```
 
@@ -344,14 +308,13 @@ proj_out: the expanded `[project].out`
 v: the template values
 out_order: receives the step indices in run order, sized exactly; nil when none
 out_count: receives the length
-ret: ok; err on a step `need` cycle, a step `need` naming an unknown step, or
-           a local link path that fails to expand
+ret: ok; err on a step `need` cycle or a local link path that fails to expand
 
 ## fun plan_export_steps
 
 ```mach
 pub fun plan_export_steps(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
-t: *TargetDef, proj_out: str, v: *TmplVars,
+t: *TargetDef, proj_out: str, v: *template.Values,
 out_order: **u32, out_count: *u32) err[fail.Fail];
 ```
 
@@ -368,21 +331,6 @@ v: the template values
 out_order: receives the step indices in run order, sized exactly; nil when none
 out_count: receives the length
 ret: ok; the `plan_steps` errors
-
-## val AMBIGUOUS_PROFILE_MSG
-
-```mach
-pub val AMBIGUOUS_PROFILE_MSG:  str = "mach.toml: several profiles are declared and none is marked `default = true`
-```
-
-a selection several candidates could satisfy is refused where a command
-must pick one; table order carries no meaning
-
-## val AMBIGUOUS_ARTIFACT_MSG
-
-```mach
-pub val AMBIGUOUS_ARTIFACT_MSG: str = "mach.toml: several artifacts support the selected target and none is marked `default = true`
-```
 
 ## fun default_selection_includes
 
@@ -450,7 +398,7 @@ that supports exactly one declared target, or exactly one host-matching
 target, pins it, except that a sole hosted target the host cannot run is refused
 as `native` refuses it; otherwise `native` resolution applies. the profile comes
 from `resolve_profile`, the artifact from `resolve_artifact`, and every path
-is expanded with `expand_project_path`
+is expanded through the template engine
 
 alloc: owns `libs` and temporary strings
 itn: interns the expanded paths
@@ -480,7 +428,7 @@ ret: as `resolve_build_unit`
 
 ```mach
 pub fun check_collisions(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, m: *Manifest,
-v: *TmplVars) err[fail.Fail];
+v: *template.Values) err[fail.Fail];
 ```
 
 reject two artifacts whose `out` expands to the same path under one set of

@@ -159,7 +159,7 @@ primary's. A target or profile named on the command line that the manifest does
 not declare is caused by no entry in it, so its refusal has no `primary`.
 
 ```json
-{"schema":1,"record":"failure","severity":"error","code":"need.cycle","message":"mach.toml: build step 'a' is part of a 'need' cycle","origin":"build","primary":{"file":"mach.toml","line":12,"column":9,"end_line":12,"end_column":17,"byte_start":141,"byte_end":149},"related":[{"file":"mach.toml","line":18,"column":9,"end_line":18,"end_column":17,"byte_start":216,"byte_end":224,"label":null}],"notes":[],"help":[],"fixes":[]}
+{"schema":1,"record":"failure","severity":"error","code":"need.cycle","message":"mach.toml: 'need' cycle: step.a -> step.b -> step.a","origin":"build","primary":{"file":"mach.toml","line":12,"column":9,"end_line":12,"end_column":17,"byte_start":141,"byte_end":149},"related":[{"file":"mach.toml","line":18,"column":9,"end_line":18,"end_column":17,"byte_start":216,"byte_end":224,"label":null}],"notes":[],"help":[],"fixes":[]}
 ```
 
 `origin` names the phase the failure came from: `build` for the manifest,

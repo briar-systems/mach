@@ -7,7 +7,7 @@ pub fun linkage_name(
 s: *session.Session,
 fqn: intern.StrId,
 bare: intern.StrId,
-export: opt[intern.StrId]) res[intern.StrId, fail.Fail];
+export: intern.StrId) res[intern.StrId, fail.Fail];
 ```
 
 ## fun test_name

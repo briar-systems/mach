@@ -11,10 +11,11 @@ check holds the document to the rows of `mach.lang.manifest.schema`: a key no
 row names, a value of the wrong shape, a missing required key and a removed key
 are refused where they are written. decoding then reads each table into the
 model and refuses a value its key does not accept. validation last checks the
-rules that span entries: `need` entries and their cycles, `link` names, and at
-most one `default = true` profile. one rule holds for every key whoever reads
-the manifest, so a dependency's manifest is held to exactly the rules of the
-project being built. on any error every array allocated so far is freed
+rules that span entries and values: `need` entries and their cycles, `link`
+names, at most one `default = true` profile, and every template against what
+its place admits. one rule holds for every key whoever reads the manifest, so
+a dependency's manifest is held to exactly the rules of the project being
+built. on any error every array allocated so far is freed
 
 alloc: owns the manifest's arrays
 itn: receives every string of the manifest
@@ -57,6 +58,15 @@ pub fun doc_parse(alloc: *A.Allocator, path: str, text: str) res[Doc, fail.Fail]
 `text`, the manifest at `path`, as a doc: bytes a manifest refuses and a
 document that is not TOML are failures pointing at the byte refused. the doc
 keeps its own copies of both
+
+## fun doc_parse_bytes
+
+```mach
+pub fun doc_parse_bytes(alloc: *A.Allocator, path: str, data: *u8, n: usize) res[Doc, fail.Fail];
+```
+
+`doc_parse` over the `n` bytes at `data`, which need not end in a NUL and may
+hold one, which is refused where it is written
 
 ## fun doc_read
 
