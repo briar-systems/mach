@@ -39,7 +39,8 @@ the option stands alone
 pub val ARITY_VALUE: OptionArity = 1
 ```
 
-the option consumes the next argv token as its value
+the option consumes the next argv token as its value; a long option (`--name`) also takes it
+attached to its own token after `=`
 
 ## val ARITY_ATTACHED
 
@@ -383,9 +384,7 @@ pub val CACHE: [CACHE_N]*FlagSpec = [CACHE_N]*FlagSpec;
 pub val DIAGNOSTICS: FlagSpec = FlagSpec;
 ```
 
-`--diagnostics=<human|json>`: how diagnostics reach stderr. the value is
-attached, so a bare `--diagnostics` carries none and is refused by
-diagnostics_format
+`--diagnostics <human|json>`: how diagnostics, failures and a test run's results reach stderr
 
 ## val DIAG_N
 
@@ -402,6 +401,56 @@ pub val DIAG: [DIAG_N]*FlagSpec = [DIAG_N]*FlagSpec;
 ```
 
 `--diagnostics`, consumed by build, check and test
+
+## val PLAN
+
+```mach
+pub val PLAN: FlagSpec = FlagSpec;
+```
+
+`--plan`
+
+## val PLANS_N
+
+```mach
+pub val PLANS_N: usize = 1
+```
+
+row count of PLANS
+
+## val PLANS
+
+```mach
+pub val PLANS: [PLANS_N]*FlagSpec = [PLANS_N]*FlagSpec;
+```
+
+`--plan`, consumed by build and refused by run
+
+## val HELP
+
+```mach
+pub val HELP: FlagSpec = FlagSpec;
+```
+
+`--help`: the invocation asks for its command's page, or its action's, instead of running it.
+every schema accepts it without declaring it, and it takes precedence over every refusal
+but an unknown action
+
+## val HELPS_N
+
+```mach
+pub val HELPS_N: usize = 2
+```
+
+row count of HELPS
+
+## val HELPS
+
+```mach
+pub val HELPS: [HELPS_N]*FlagSpec = [HELPS_N]*FlagSpec;
+```
+
+`--help` and `-h`
 
 ## val RUNNER
 
@@ -551,6 +600,14 @@ pub val RELATIONS: [RELATIONS_N]Relation = [RELATIONS_N]Relation;
 
 the relations among the shared rows, in force in every schema that accepts both rows
 
+## val OUTPUT_CONSTRAINT
+
+```mach
+pub val OUTPUT_CONSTRAINT: str = "-o must name a canonical path inside the project root: relative, with no . or .. component"
+```
+
+the rule `-o` keeps wherever it names an output, which each command taking it prints and refuses by
+
 ## val SELECTOR_CONSTRAINT
 
 ```mach
@@ -627,8 +684,35 @@ actions: the actions argv[2] names; nil when action_n is 0, and then argv[2] is 
 action_n: length of actions
 examples: example lines for help; nil when example_n is 0
 example_n: length of examples
-run: the handler dispatch calls with the full argv and the parsed invocation; its
-                 return is the process exit code
+run: the handler dispatch calls once argv keeps the schema; its ok is the process
+                 exit code, and its err the failure dispatch reports in the code `exit.of` maps it to
+
+## rec Call
+
+```mach
+pub rec Call;
+```
+
+what dispatch hands a command's handler; dispatch owns every member and outlives the call
+
+a: an arena dispatch releases once the handler returns, for what lives as long as the command
+backing: the page allocator under a, for what the command frees itself before it returns
+argv: the full process arguments
+inv: the parsed invocation
+report: where the command reports a failure it goes on past or that carries an origin, in the
+         format `--diagnostics` selected
+
+## rec Global
+
+```mach
+pub rec Global;
+```
+
+an option given in place of a command word, read as that option given to the command that
+answers it: `mach --version` is `mach info --version`
+
+row: the option's canonical row
+command: the command it is given to, whose schema accepts row and which takes no actions
 
 ## rec CommandSet
 
@@ -640,6 +724,22 @@ the commands a command line is read against, in help order
 
 specs: first entry of the command list
 n: length of specs
+help: the command that answers a `--help` request, given the invocation that asked; nil
+          when the set answers none, and `--help` then runs the command
+globals: the options argv[1] may give in place of a command word; nil when global_n is 0
+global_n: length of globals
+
+## fun command_set
+
+```mach
+pub fun command_set(specs: **CommandSpec, n: usize) CommandSet;
+```
+
+a set of commands that answers no help request and takes no global options
+
+specs: first entry of the command list
+n: length of specs
+ret: the set
 
 ## fun command_for
 
@@ -727,8 +827,10 @@ zero exactly when its pointer is nil; every option row has a name, a doc in its 
 value placeholder exactly when it takes a value; command names and aliases are unique across the
 set and action names within their command; every spelling occurs once in each schema, with the
 command's tables joined to each action's; every alias names an accepted canonical row; every
-declared relation joins two canonical rows of its schema; and no refused row is also accepted.
-help refuses to render when this is false
+declared relation joins two canonical rows of its schema; no refused row is also accepted; one
+canonical row stands behind each spelling across the whole set, `--help` and `-h` included, so a
+flag of one name means one thing in every command; and the help command and global options keep
+to globals_valid. help refuses to render when this is false
 
 set: the commands
 ret: true when every check passes
@@ -787,6 +889,19 @@ free the arrays parse_invocation allocated; nil arrays are skipped
 a: the allocator parse_invocation was given
 inv: the invocation
 
+## fun action_list
+
+```mach
+pub fun action_list(a: *A.Allocator, command: *CommandSpec) str;
+```
+
+a command's action names, comma separated, as a refusal naming a missing or unknown action lists
+them
+
+a: owns the text
+command: the command
+ret: the names; what was listed before an allocation failed
+
 ## fun parse_command
 
 ```mach
@@ -796,9 +911,11 @@ pub fun parse_command(a: *A.Allocator, command: *CommandSpec, argc: usize, argv:
 read argv against one command: the action at argv[2] when the command has actions, then every
 token from the first after the command or action word to the end, or to the first `--` when the
 command truncates there. A recognized option is recorded under its canonical row, and a value
-option claims the next token as its value. Every other token starting with `-` is unknown, or
-inapplicable when the command refuses it; the rest are positionals. The first breach of the
-schema becomes the invocation's refusal, and the scan still runs to the end
+option claims the next token as its value, or the text after `=` in its own token. Every other
+token starting with `-` is unknown, or inapplicable when the command refuses it; the rest are
+positionals. The first breach of the schema becomes the invocation's refusal, and the scan still
+runs to the end. `--help` withdraws every refusal but an unknown action, since the invocation
+then asks for a page rather than a run
 
 a: allocator for the invocation's three arrays and its refusal text
 command: the command argv[1] named
@@ -812,14 +929,26 @@ ret: the invocation; err only on allocation failure
 pub fun parse_invocation(a: *A.Allocator, commands: CommandSet, argc: usize, argv: **u8) res[ParsedInvocation, fail.Fail];
 ```
 
-read argv against the command argv[1] names in a set, as parse_command does
+read argv against the command argv[1] names in a set, as parse_command does. a global option of
+the set at argv[1] reads as that option given to the command it stands in for
 
 a: allocator for the invocation
 commands: the commands to look argv[1] up in
 argc: length of argv
 argv: the argument vector, program name at argv[0]
-ret: the invocation, whose command is nil when argc is below 2 or argv[1] names no command;
-          err only on allocation failure
+ret: the invocation, whose command is nil when argc is below 2 or argv[1] names neither a
+          command nor a global option; err only on allocation failure
+
+## fun help_requested
+
+```mach
+pub fun help_requested(inv: *ParsedInvocation) bool;
+```
+
+whether the invocation asks for a page rather than a run: `--help` or `-h` occurred
+
+inv: the parsed invocation
+ret: true when it did
 
 ## fun occurred
 
@@ -878,25 +1007,12 @@ ret: the values; err when the vector cannot grow
 pub fun diagnostics_format(inv: *ParsedInvocation, argv: **u8) res[cli_diagnostic.Format, fail.Fail];
 ```
 
-the diagnostics format `--diagnostics=<human|json>` selects; human when the command does not take
+the diagnostics format `--diagnostics <human|json>` selects; human when the command does not take
 the option or it is absent
 
 inv: the parsed invocation
 argv: the argument vector inv was parsed from
-ret: the format, or a user failure for a bare `--diagnostics` or any other value
-
-## fun refuse
-
-```mach
-pub fun refuse(inv: *ParsedInvocation, argv: **u8) i64;
-```
-
-report the invocation's refusal in the format the command writes its diagnostics in, human when
-that format is itself malformed
-
-inv: the parsed invocation
-argv: the argument vector inv was parsed from
-ret: the exit code the refusal maps to; exit.OK when there is none
+ret: the format, or a user failure for any value but `human` and `json`
 
 ## fun run
 
@@ -904,11 +1020,42 @@ ret: the exit code the refusal maps to; exit.OK when there is none
 pub fun run(inv: *ParsedInvocation, argv: **u8) i64;
 ```
 
-run a parsed invocation: report its refusal when argv broke the schema, otherwise call the
-command's handler
+run a parsed invocation and report how it ended through one report, in the format
+`--diagnostics` selects, human when that format is itself malformed: the refusal when argv broke
+the schema; otherwise the handler of the command, or of the set's help command when the
+invocation asks for a page, given an arena this call owns. a failure the handler returns is
+reported here
 
 inv: the parsed invocation; its command is not nil
 argv: the argument vector inv was parsed from
+ret: the exit code
+
+## fun run_to
+
+```mach
+pub fun run_to(inv: *ParsedInvocation, argv: **u8, w: io_writer.Writer) i64;
+```
+
+run with the report written to w in place of stderr
+
+inv: the parsed invocation; its command is not nil
+argv: the argument vector inv was parsed from
+w: where the report is written
+ret: the exit code
+
+## fun run_as
+
+```mach
+pub fun run_as(inv: *ParsedInvocation, argv: **u8, w: io_writer.Writer, handler: fun(*Call) res[i64, fail.Fail]) i64;
+```
+
+run_to through a handler of the caller's in place of the command's own, for a test that
+substitutes what the command depends on
+
+inv: the parsed invocation, which keeps its schema
+argv: the argument vector inv was parsed from
+w: where the report is written
+handler: what runs in place of the command's handler
 ret: the exit code
 
 ## fun invoke
@@ -945,14 +1092,15 @@ pub fun build_cli_invocation(a: *A.Allocator, inv: *ParsedInvocation, argv: **u8
 ```
 
 the typed request.CliArgs of a build-shaped command: verbosity 0, 1, or 2 from `-v` and `-vv`,
-quiet, the CGEN flags, the selectors, `-o` and `--jobs` as raw argv pointers or nil, opt_set and
+quiet, the CGEN flags, the selectors, `-o` as a raw argv pointer or nil, `--jobs` as a count or 0
+when absent, opt_set and
 opt_release from `-O0` and `-O2` with `-O0` winning when both occur. include_deps is false for
 the command to set, and link_tokens and lib_dirs are left empty for collect_link_inputs
 
 a: backs the selector patterns
 inv: the parsed invocation
 argv: the argument vector inv was parsed from
-ret: the arguments; err when a vector cannot grow
+ret: the arguments; err when a vector cannot grow or `--jobs` is no count
 
 ## fun collect_link_inputs
 
