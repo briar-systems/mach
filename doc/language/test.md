@@ -28,7 +28,7 @@ A test's **qualified name** is its module path, `#`, and its name:
 `std.types.string#str_len__empty`. `#` appears in no identifier or module path,
 so a qualified name never collides with another symbol. It is the test's symbol
 (hidden, like every other symbol that is not exported), and it is the name
-`--list`, `--filter`, the readout and `--format json` show. A debugger takes it
+`--list`, `--filter`, the readout and the test records show. A debugger takes it
 unquoted: `break std.types.string#str_len__empty` in gdb.
 
 Related tests group under a common subject as `subject__case`
@@ -158,7 +158,7 @@ run are:
 --filter <substr>        select only tests whose qualified name contains the substring
 --include-deps           also run tests declared in dependency modules
 --list                   list the collected tests and exit
---format <human|json>    the live readout, or an NDJSON event stream
+--diagnostics <human|json>  write failures and the run's records to stderr as text or NDJSON
 --runner <cmd>           launch each test through a host-side command
 --timeout <duration>     terminate a test and its process group after the duration
 ```
@@ -226,15 +226,15 @@ the flag leaves every test unbounded.
 
 ### JSON output
 
-`--format json` replaces the readout with one JSON object per line on stdout
-(`run_start`, one `test` per result, `summary`; `case` under `--list`), with
-build diagnostics kept on stderr, where `--diagnostics=json` writes them, a
-`test` record per result and a closing `summary` as the records of
-[diagnostics-json.md](diagnostics-json.md). A `test` or `case` event names its test by
-qualified name in `name`, beside its `module`, `file`, `line`, test `object`
-and dispatcher `index`. A timed-out test reports `"kind":"timeout"` with its
-bound in nanoseconds in `timeout_ns`. The schema is versioned (`"schema":2` on
-every event) and its writer is `mach.cli.cmd.testing`.
+`--diagnostics json` writes the run as records on stderr beside the build's
+diagnostics: a `run_start`, one `test` per result as it finishes and a
+`run_end` for each (target, profile) that runs, a `skip` for one that is built
+and not run, a `case` per test under `--list`, and the closing `summary`, as
+[diagnostics-json.md](diagnostics-json.md#test-records) describes. A `test` or
+`case` record names its test by qualified name in `name`, beside its `module`,
+`file`, `line` and dispatcher `index`. A timed-out test reports
+`"outcome":"timeout"` with its bound in nanoseconds in `timeout_ns`. The human
+readout stays on stdout.
 
 ## The runner
 

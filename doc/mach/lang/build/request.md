@@ -9,6 +9,7 @@ pub rec CliArgs;
 the typed options of a build-shaped command
 
 selectors: the `-a`, `-t` and `-p` patterns and `--all`
+jobs: the `--jobs` count, 0 when absent
 
 ## fun is_object_path
 
@@ -158,6 +159,17 @@ cli: *CliArgs, root: str, goal: BuildGoal, profile: str) res[BuildRequest, fail.
 pub fun for_cell(base: *BuildRequest, owner: str, target: str, artifact: str,
 subsystem: catalog_subsystem.Subsystem, goal: BuildGoal) BuildRequest;
 ```
+
+## fun workers
+
+```mach
+pub fun workers(asked: u32) u32;
+```
+
+the workers a run uses: the `--jobs` count, or the host's processor count when none was given
+
+asked: the count, 0 when none was given
+ret: at least 1
 
 ## val HASH_SIZE
 

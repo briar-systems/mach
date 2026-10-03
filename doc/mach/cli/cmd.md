@@ -6,7 +6,7 @@
 pub val COMMANDS_N: usize = 11
 ```
 
-length of COMMANDS
+length of COMMANDS; the compiler refuses a COMMANDS literal of any other length
 
 ## val COMMANDS
 
@@ -25,7 +25,7 @@ pub fun commands() args.CommandSet;
 
 the command set argv is read against
 
-ret: COMMANDS as a set
+ret: COMMANDS as a set, which help answers and GLOBALS extends
 
 ## fun dispatch
 
@@ -33,10 +33,9 @@ ret: COMMANDS as a set
 pub fun dispatch(argc: usize, argv: **u8) i64;
 ```
 
-the `mach` entry point: route argv to one command and return its exit code
-help requests are rendered first; with no arguments the overview prints and the code is 1;
-an unknown command prints an error and the overview; an invocation that breaks its command's
-schema is refused; otherwise the command's handler runs
+the `mach` entry point: route argv to one command and return its exit code. with no arguments
+the overview prints and the code is 1; an unknown command is refused and the overview prints;
+otherwise args.run reports a refusal, renders the page `--help` asks for, or runs the command
 
 argc: process argument count
 argv: process arguments, argv[0] the program

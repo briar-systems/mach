@@ -24,15 +24,6 @@ out: the destination
 sources: the SourceMap that locates each diagnostic
 list: the diagnostics, rendered in order; nothing is written when it is empty
 
-## fun headline_lead
-
-```mach
-pub fun headline_lead(k: diagnostic_kind.Kind);
-```
-
-write the lead of an error of kind `k` to stderr, `error[<key>]: `, for a
-command that prints the rest of the message itself
-
 ## fun render_fail
 
 ```mach
@@ -109,18 +100,16 @@ carries the build: human text renders unit banners, phase rows, items, the
 unit summary, failures and diagnostics, and readout_close writes the closing
 tally; json renders each diagnostic and failure as a record, and under -v
 each unit, phase row, item and unit summary as unit, phase and phase_item
-records. the run's stream, stdout, carries a test run: human text
-renders each test as it finishes, a module's roll-up once its last test has,
-and the closing summary; json renders the events of `mach test --format json`.
-under json diagnostics each finished test is also a record on the report's
-stream
+records. stdout carries a test run in human text: each test as it finishes, a
+module's roll-up once its last test has, and the closing summary. under json the
+run is also records on the report's stream: run_start, a test record per
+finished test, and run_end
 
 sink: what the engine and the test runner are given; its ctx is this record, which must not move
 r: the command's report
 units: the plan's unit count; a banner prints only when it is more than one
 quiet: `--quiet`, which suppresses the banners
 tally: the human tally, counted as the events pass
-stream: how a test run renders on out
 out: where a test run renders, stdout
 run: the running test run's results, from its run_start to its run_end
 count: how many results run holds
@@ -154,25 +143,13 @@ failure and diagnostic the plan rendered, a failure record printed as its own
 beside every store's diagnostics, so the tally never reads `0 errors` above a
 nonzero exit. json closes in report_close
 
-## fun event_begin
-
-```mach
-pub fun event_begin(w: *io_writer.Writer, o: *json.Object, event: *u8);
-```
-
-open one event of `mach test --format json` on w
-
-w: the run's stream
-o: the event's object
-event: the event's name
-
 ## fun result_name
 
 ```mach
 pub fun result_name(r: *validation.ValidationGateResult) *u8;
 ```
 
-the outcome a test record and event name: `pass`, `exit`, `signal`, `spawn`,
+the outcome a test record names: `pass`, `exit`, `signal`, `spawn`,
 `timeout`, or `other`
 
 ## fun has_capture
@@ -265,16 +242,40 @@ ret: the exit code `exit.of` maps the failure to
 ## fun report_test
 
 ```mach
-pub fun report_test(r: *Report, art: *outcome.TestArtifact, result: str, code: i64);
+pub fun report_test(r: *Report, t: *readout.TestResult);
 ```
 
 one test's result as a record under json; human text writes nothing here,
 the runner's own readout carrying it
 
 r: the command's report
+t: the finished test
+
+## fun report_case
+
+```mach
+pub fun report_case(r: *Report, art: *outcome.TestArtifact);
+```
+
+one collected test as a record under json, as `mach test --list` lists it; human text
+writes nothing here
+
+r: the command's report
 art: the test
-result: its outcome, a kind `mach test --format json` reports
-code: its exit code
+
+## fun report_skip
+
+```mach
+pub fun report_skip(r: *Report, target: str, profile: str, reason: str);
+```
+
+a (target, profile) whose tests were built and not run, as a record under json; human text
+writes nothing here
+
+r: the command's report
+target: the declared target name
+profile: the profile name
+reason: why its tests did not run
 
 ## fun report_close
 

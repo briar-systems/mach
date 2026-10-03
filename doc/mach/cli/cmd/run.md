@@ -11,7 +11,7 @@ pub val COMMAND: args.CommandSpec = args.CommandSpec;
 ## fun run
 
 ```mach
-pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64;
+pub fun run(cx: *args.Call) res[i64, fail.Fail];
 ```
 
 `mach run`: execute the project's already-built binary, forwarding the arguments after
@@ -20,11 +20,10 @@ pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64;
 this host; `--timeout <duration>` runs the program in its own process group and
 terminates it after the duration
 
-argv: the full process arguments
-inv: the parsed invocation for this command
+cx: the call
 ret: the program's exit code; 128 plus the signal number when it was killed by a signal;
-      exit.TIMEOUT when the timeout expired; otherwise the shared code of mach's own failure:
-      exit.USER for a usage error or an artifact that is missing or that the system refuses
-      to execute (a malformed image fails the spawn on windows), exit.ENVIRONMENT for a wait
-      failure, exit.INTERNAL out of memory
+     exit.TIMEOUT when the timeout expired; otherwise mach's own failure: a user failure for a
+     usage error or an artifact that is missing or that the system refuses to execute (a
+     malformed image fails the spawn on windows), an environment failure for a wait, an
+     internal one out of memory
 

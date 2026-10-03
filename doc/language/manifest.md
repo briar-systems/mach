@@ -50,7 +50,7 @@ error[manifest.value_type]: mach.toml: [target.windows-x86_64].stack_reserve mus
 A manifest refusal points at what it refuses, on the line after the message:
 the value it rejects, the key token of a name or key it rejects, or the table a
 required key is missing from, in the manifest that states it, a dependency's
-own included. [`--diagnostics=json`](diagnostics-json.md#failure-records)
+own included. [`--diagnostics json`](diagnostics-json.md#failure-records)
 carries the same place as the failure's `primary` span.
 
 ```
@@ -1593,7 +1593,7 @@ What `mach dep add` writes:
 - with `--git <url>` alone, `version = "^X.Y.Z"`, where `X.Y.Z` is the
   release resolution picked. The lower bound is the release actually tested
   when the dependency was added, and the caret follows the pre-1.0 rule;
-- with `--version <range>`, that range;
+- with `--range <range>`, that range;
 - with `--ref <selector>`, that selector, as before.
 
 `mach init` adds std the same way, so a new project names the std release that
