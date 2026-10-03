@@ -6,9 +6,9 @@
 pub fun machine_for_arch(arch_id: u32) u32;
 ```
 
-## fun register_macho
+## val VTABLE
 
 ```mach
-pub fun register_macho(reg: *target_of.OfRegistry) err[fail.Fail];
+pub val VTABLE: target_of.OfVTable = target_of.OfVTable;
 ```
 

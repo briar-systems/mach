@@ -1,52 +1,62 @@
 # mach.lang.target.registry
 
-the target registry as one owned object
+the target registry: one container holding every axis of the catalog by
+pointer. a member is static data its own module declares, so adding one
+checks it once and keeps the pointer: the registry copies nothing, owns
+nothing and is never released. a registry is published once the catalog it
+holds is checked whole, and publication is the proof every later read
+relies on
 
-a registry is born fresh, published once by `target.register_all`, and
-released once by `registry_dnit`; release is terminal, so a registry is
-never re-initialized under a target that borrowed from it (a publication
-that fails part way rolls back to fresh, nothing has borrowed yet).
-`registry_new` is the heap form the session owns and every worker borrows
-by pointer; `registry_init_with_allocator` is the in-place form a caller
-owns on its own stack, and `registry_init` the same over a page allocator of
-its own for a test fixture. a `resolved.Target` borrows the registry it was
-resolved against and `resolved.live` refuses the borrow once the registry is
-released.
+## val AXIS_CAP
+
+```mach
+pub val AXIS_CAP: u32 = 16
+```
+
+## rec Axis
+
+```mach
+pub rec Axis[T];
+```
+
+the members of one axis, read by name or position; the accessors and the
+validator are the axis's own, so the container never reads a member
+
+## fun axis
+
+```mach
+pub fun axis[T](noun: str, name_of: fun(*T) str, id_of: fun(*T) u32, validate: fun(*A.Allocator, *T) err[fail.Fail]) Axis[T];
+```
+
+## fun add
+
+```mach
+pub fun add[T](ax: *Axis[T], a: *A.Allocator, m: *T) err[fail.Fail];
+```
+
+add a member: refused when it is malformed, when its name or its catalog id
+is already held, or when the axis is full. an id of 0 is outside the catalog
+and may repeat
+
+a: formats the refusal
+m: the member, static data that outlives the registry
+
+## fun find
+
+```mach
+pub fun find[T](ax: *Axis[T], name: str) opt[*T];
+```
+
+## fun at
+
+```mach
+pub fun at[T](ax: *Axis[T], idx: u32) opt[*T];
+```
 
 ## rec TargetRegistry
 
 ```mach
 pub rec TargetRegistry;
-```
-
-## val REGISTRY_FRESH
-
-```mach
-pub val REGISTRY_FRESH:    u8  = 0
-```
-
-## val REGISTRY_BUILDING
-
-```mach
-pub val REGISTRY_BUILDING: u8  = 1
-```
-
-## val REGISTRY_READY
-
-```mach
-pub val REGISTRY_READY:    u8  = 2
-```
-
-## val REGISTRY_RELEASED
-
-```mach
-pub val REGISTRY_RELEASED: u8  = 3
-```
-
-## val REGISTRY_VERSION
-
-```mach
-pub val REGISTRY_VERSION:  u32 = 1
 ```
 
 ## fun registry_init_with_allocator
@@ -55,34 +65,7 @@ pub val REGISTRY_VERSION:  u32 = 1
 pub fun registry_init_with_allocator(alloc: *A.Allocator) TargetRegistry;
 ```
 
-an in-place registry whose entries and resolution refusals come from `alloc`
-
-## fun registry_new
-
-```mach
-pub fun registry_new(alloc: *A.Allocator) res[*TargetRegistry, fail.Fail];
-```
-
-a heap registry whose block and every entry come from `alloc`
-
-## fun registry_rollback
-
-```mach
-pub fun registry_rollback(reg: *TargetRegistry);
-```
-
-a publication that failed part way releases what it registered and hands
-back a fresh registry; nothing borrowed from it yet, so a retry is sound
-
-## fun registry_dnit
-
-```mach
-pub fun registry_dnit(reg: *TargetRegistry);
-```
-
-release the entries and, for a heap registry, return the block to its
-owner; release is terminal, a second call on an in-place registry is a
-no-op, and a second call on a heap registry is a call on a dead pointer
+an empty registry whose refusals are formatted from `alloc`
 
 ## fun registry_published
 

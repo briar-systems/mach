@@ -1,9 +1,9 @@
 # mach.lang.target.isa.riscv.encode
 
-## fun hooks
+## val HOOKS
 
 ```mach
-pub fun hooks() isa_encode.EncodeHooks;
+pub val HOOKS: isa_encode.EncodeHooks = isa_encode.EncodeHooks;
 ```
 
 the hooks the shared encode driver runs this encoder through

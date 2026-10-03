@@ -1,8 +1,8 @@
 # mach.lang.target.of.raw
 
-## fun register
+## val VTABLE
 
 ```mach
-pub fun register(reg: *target_of.OfRegistry) err[fail.Fail];
+pub val VTABLE: target_of.OfVTable = target_of.OfVTable;
 ```
 
