@@ -1,7 +1,7 @@
 # mach.lang.target.isa.common
 
 the target-independent helpers every isa backend reads: predicates over the
-selected MIR, bit and decimal arithmetic, and the relocation type a backend
+selected MIR, bit arithmetic, and the relocation type a backend
 may leave unset
 
 ## fun is_mir_compare
@@ -35,12 +35,4 @@ the byte widths a scalar float takes
 ```mach
 pub fun popcount32(m: u32) u32;
 ```
-
-## fun u64_to_dec
-
-```mach
-pub fun u64_to_dec(n: u64, dst: *u8) usize;
-```
-
-writes n in decimal at dst, which holds at least 20 bytes, and returns the length
 

@@ -171,7 +171,7 @@ pub fun resolve(reg: *TargetRegistry, req: *TargetRequest) res[resolved.Target, 
 ## fun fingerprint
 
 ```mach
-pub fun fingerprint(t: *resolved.Target, e: *binary.Encoder) bool;
+pub fun fingerprint(t: *resolved.Target, s: *wire.Sink);
 ```
 
 ## fun registered_selection
