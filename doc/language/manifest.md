@@ -97,7 +97,7 @@ targets the dependency declares for them. No other `[target.*]` entry is read.
 [project]
 id      = "demo"                       # required: identifier; root of every module path
 version = "0.1.0"                      # required
-mach    = "^5.3"                       # the compiler range; the project being built states it
+mach    = "^5.3"                       # required: the compiler range
 src     = "src"                        # required: source dir, project-root-relative
 out     = "out/{target.name}/{profile.name}"  # required: output-path template root
 
@@ -140,7 +140,7 @@ ref = "branch/main"
 | `version` | string | Project version. Read by `$project.version` and `$project.version.{major,minor,patch}`, and stamped into a Windows executable's version resource. |
 | `src`     | string | Source root, project-root-relative. Module paths resolve under it. |
 | `out`     | string | The output-path template root, referenced as `{project.out}` by artifact `out`, step `argv`, `in` and `out`, and local link paths. Expanded over `{target.name}`/`{target.isa}`/`{target.os}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). |
-| `mach`    | string | The compiler versions this project builds with, as a [version range](#version-ranges) (`"^5.3"`). The project being built must state it; a dependency that leaves it out states no constraint. See [Compiler range](#compiler-range). |
+| `mach`    | string | The compiler versions this project builds with, as a [version range](#version-ranges) (`"^5.3"`). Required in every manifest, a dependency's included. See [Compiler range](#compiler-range). |
 
 `[project]` is exactly these five keys, and `id`, `version`, `src` and `out` are
 required. Any other key, `name` and `description` included, is an unknown-key
@@ -191,10 +191,9 @@ error[mach.version_unaccepted]: this is mach 5.2.1, and the dependency closure d
  --> mach.toml:2:11
 ```
 
-A root manifest must state `mach`. One without it is refused with the line to
-add (`mach.toml: [project] states no compiler range; add mach = "^5.3", the
-oldest release that reads the key, and raise it when the project uses a later
-feature`), pointing at its `[project]` header. A dependency without it states no constraint. `mach init` writes the same range. It is the oldest
+Every manifest must state `mach`, a dependency's included. One without it is
+refused like any missing required key (`mach.toml: [project] is missing required
+key 'mach'`), and for a dependency the build fails naming it. `mach init` writes the same range. It is the oldest
 release of the running compiler's major that reads the key: `^5.3` for every
 5.x compiler, since 5.3.0 is the first release that accepts `mach`, and `^N.0`
 for a later major N, since a caret cannot span majors. The range depends only on
