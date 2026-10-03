@@ -733,10 +733,11 @@ link_cell() {
             elif [ "$case_run" = exec ] && [ "$case_goal" = test ]; then
                 # the dispatcher runs one test per invocation, `<exe> <index>`; the
                 # observable is every collected test's stdout in collection order
-                if ! (cd "$dir" && $buildcc test . --target "$build_target" --profile "$profile" $case_build_flags --list --format json) >"$tmp/list.json" 2>"$tmp/err.txt"; then
+                if ! (cd "$dir" && $buildcc test . --target "$build_target" --profile "$profile" $case_build_flags --list) >"$tmp/list.txt" 2>"$tmp/err.txt"; then
                     fail "$label test --list: $(first_error "$tmp/err.txt")"; rm -rf "$tmp"; return
                 fi
-                n=$(grep -c '"event":"case"' "$tmp/list.json")
+                # one line per collected test, its qualified name and its object
+                n=$(grep -c '#' "$tmp/list.txt")
                 [ "$n" -gt 0 ] || { fail "$label collected no tests"; rm -rf "$tmp"; return; }
                 : >"$tmp/out.txt"; i=0
                 while [ "$i" -lt "$n" ]; do
