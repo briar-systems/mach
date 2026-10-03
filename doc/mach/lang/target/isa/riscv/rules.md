@@ -3,7 +3,7 @@
 ## fun select
 
 ```mach
-pub fun select(a: *A.Allocator, tgt: *isa.BackendTarget, f: *codegen_mir.MirFunction) err[fail.Fail];
+pub fun select(a: *A.Allocator, tgt: *isa.BackendTarget, f: *lang_mir.MirFunction) err[fail.Fail];
 ```
 
 ## fun is_reg_move

@@ -1,4 +1,4 @@
-# mach.lang.be.codegen.debug_input
+# mach.lang.mir.debug
 
 ## def DwarfRegFn
 
@@ -53,4 +53,58 @@ pub rec VarLoc;
 piece: the lane of a legalized value this location describes, of `pieces`
 lanes each `piece_bytes` wide but the last, `piece_last_bytes` wide when that
 is not 0; `pieces` is 0 for a whole value
+
+## val VARLOC_NONE
+
+```mach
+pub val VARLOC_NONE:  u8 = 0
+```
+
+## val VARLOC_REG
+
+```mach
+pub val VARLOC_REG:   u8 = 1
+```
+
+## val VARLOC_FRAME
+
+```mach
+pub val VARLOC_FRAME: u8 = 2
+```
+
+## val VARLOC_CMP
+
+```mach
+pub val VARLOC_CMP:   u8 = 3
+```
+
+## val VARLOC_IMM
+
+```mach
+pub val VARLOC_IMM:   u8 = 4
+```
+
+## val CMPREL_EQ
+
+```mach
+pub val CMPREL_EQ: u8 = 0
+```
+
+## val CMPREL_NE
+
+```mach
+pub val CMPREL_NE: u8 = 1
+```
+
+## val CMPREL_LT
+
+```mach
+pub val CMPREL_LT: u8 = 2
+```
+
+## val CMPREL_LE
+
+```mach
+pub val CMPREL_LE: u8 = 3
+```
 

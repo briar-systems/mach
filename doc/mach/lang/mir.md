@@ -1,4 +1,4 @@
-# mach.lang.be.codegen.mir
+# mach.lang.mir
 
 ## def MirOperandKind
 
@@ -1422,6 +1422,42 @@ pub val SLOT_ORIGIN_NIL: u32 = 0xFFFFFFFF
 ```mach
 pub rec MirFrame;
 ```
+
+## fun sp_fixed
+
+```mach
+pub fun sp_fixed(frame: *MirFrame) bool;
+```
+
+the declared frame property: sp == fp - base_dist for the whole body
+
+## fun slot_offset
+
+```mach
+pub fun slot_offset(frame: *MirFrame, v: u32) opt[i64];
+```
+
+## fun slot_sp_offset
+
+```mach
+pub fun slot_sp_offset(frame: *MirFrame, v: u32) opt[i64];
+```
+
+## fun slots_from_sp
+
+```mach
+pub fun slots_from_sp(frame: *MirFrame) bool;
+```
+
+## fun slot_extent
+
+```mach
+pub fun slot_extent(frame: *MirFrame, v: u32, disp: *i64, size: *u32) bool;
+```
+
+the byte extent an encoder addresses a slot at: the displacement from the
+slot base register (the stack pointer when slots_from_sp, else the frame
+pointer) and the slot's size. false when v owns no slot
 
 ## val ABI_INPUT_REGISTER
 

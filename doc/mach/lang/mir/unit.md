@@ -1,4 +1,10 @@
-# mach.lang.be.codegen.unit
+# mach.lang.mir.unit
+
+## rec UnitModule
+
+```mach
+pub rec UnitModule;
+```
 
 ## val UNIT_NONE
 
@@ -6,10 +12,10 @@
 pub val UNIT_NONE: u32 = 0xFFFFFFFF
 ```
 
-## def Unit
+## rec Unit
 
 ```mach
-pub def Unit: unit_input.Unit
+pub rec Unit;
 ```
 
 ## rec IrSet
@@ -33,7 +39,7 @@ pub fun root_ir(u: *Unit) *me_ir.Module;
 ## fun root_mir
 
 ```mach
-pub fun root_mir(u: *Unit) *codegen_mir.MirModule;
+pub fun root_mir(u: *Unit) *lang_mir.MirModule;
 ```
 
 ## fun defined_index
