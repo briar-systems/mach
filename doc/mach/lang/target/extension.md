@@ -131,19 +131,19 @@ pub fun table_valid(table: *Extension, count: u32) bool;
 a table is well formed: every name an identifier, every bit a single nonzero
 bit, no name or bit repeated, and every implied bit another row of the table
 
-## fun spell_levels
+## fun levels_append
 
 ```mach
-pub fun spell_levels(levels: *Level, count: u32, buf: *u8, cap: usize, off: usize) usize;
+pub fun levels_append(b: *textbuild.TextBuilder, levels: *Level, count: u32) err[textbuild.Error];
 ```
 
-the level table's spellings, `, `-separated, appended at `off`; returns the new end
+the level table's spellings, `, `-separated, appended to `b`
 
-## fun spell_names
+## fun names_append
 
 ```mach
-pub fun spell_names(table: *Extension, count: u32, buf: *u8, cap: usize, off: usize) usize;
+pub fun names_append(b: *textbuild.TextBuilder, table: *Extension, count: u32) err[textbuild.Error];
 ```
 
-the table's names, `, `-separated, appended at `off`; returns the new end
+the table's names, `, `-separated, appended to `b`
 

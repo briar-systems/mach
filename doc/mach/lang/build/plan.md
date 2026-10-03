@@ -236,7 +236,7 @@ req: *manifest.LinkRequirement) res[LinkInput, fail.Fail];
 ## fun join_msg
 
 ```mach
-pub fun join_msg(al: *A.Allocator, va: ...) str;
+pub fun join_msg(al: *A.Allocator, va: ...) res[str, fail.Fail];
 ```
 
 ## fun render

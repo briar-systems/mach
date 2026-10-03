@@ -36,3 +36,6 @@ pub fun instance_spelling(s: *session.Session, name: intern.StrId, args: *type.T
 pub fun name_str(s: *session.Session, name: intern.StrId) str;
 ```
 
+the spelling of a type's name; an anonymous type, whose name is absent or
+empty, is spelled `<anon>`
+

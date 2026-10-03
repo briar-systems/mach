@@ -38,11 +38,13 @@ declared: the root's winning selector, as its manifest line spells it
 chain: the requiring chain, ending at the dependency
 requested: the selector the chain asked for, in the same form
 
-## fun intern_text
+## fun ref_of
 
 ```mach
-pub fun intern_text(s: *session.Session, id: intern.StrId) str;
+pub fun ref_of(s: *session.Session, d: *manifest.DepDef) str;
 ```
+
+the ref a git line names, empty when it names none
 
 ## fun check_dep_identity
 

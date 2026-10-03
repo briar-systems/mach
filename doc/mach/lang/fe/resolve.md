@@ -266,8 +266,9 @@ pub fun expression(rr: *ResolveResult, a: *ast.Ast, eid: ast_id.ExprId) res[ast_
 ## fun unknown_catalog
 
 ```mach
-pub fun unknown_catalog(s: *session.Session, catalog: str, tag: u32) str;
+pub fun unknown_catalog(s: *session.Session, catalog: str, tag: u32) fail.Fail;
 ```
 
-the diagnostic text belongs to the session interner, not a resolver candidate
+the internal failure naming a member its catalog lacks; the text belongs to
+the session interner, not a resolver candidate
 

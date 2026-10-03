@@ -99,7 +99,7 @@ step: index into that dependency manifest's `steps`
 ## fun plan_dep_steps
 
 ```mach
-pub fun plan_dep_steps(p: *project.Project, isa: str, os: str, abi: str) res[Vector[DependencyStep], fail.Fail];
+pub fun plan_dep_steps(p: *project.Project, isa: intern.StrId, os: intern.StrId, abi: intern.StrId) res[Vector[DependencyStep], fail.Fail];
 ```
 
 the exported dependency steps a cell runs, in execution order: each realized
@@ -113,6 +113,6 @@ ret: the ordered steps, owned by the caller; err from the export plan
 ## fun execute_dep_steps
 
 ```mach
-pub fun execute_dep_steps(p: *project.Project, isa: str, os: str, abi: str) err[fail.Fail];
+pub fun execute_dep_steps(p: *project.Project, isa: intern.StrId, os: intern.StrId, abi: intern.StrId) err[fail.Fail];
 ```
 

@@ -465,12 +465,18 @@ pub fun covers_isa(vt: *AbiVTable, arch_id: u32) bool;
 pub fun make_slot(class: ParamClass, reg: i32, offset: i64, size: u64, carrier_width: u8) ParamSlot;
 ```
 
+a slot of a direct class. total over the classes a classifier names: an
+indirect vector class needs make_slot_indirect, and passing one is a caller defect
+
 ## fun make_slot_indirect
 
 ```mach
 pub fun make_slot_indirect(class: ParamClass, reg: i32, offset: i64, size: u64,
 indirect_size: u64, indirect_align: u32) ParamSlot;
 ```
+
+a slot of an indirect vector class with its storage geometry. total over a
+declared geometry: a size, and an alignment that is a power of two
 
 ## fun make_slot_value
 
@@ -491,6 +497,9 @@ word: u32) ParamSlot;
 pub fun make_slot_hfa(base_reg: i32, count: u8, elem: u8, size: u64) ParamSlot;
 ```
 
+a homogeneous float aggregate in `count` consecutive float registers. total
+over the slot's fixed piece storage: more than PARAM_MAX_PIECES is a caller defect
+
 ## fun make_piece
 
 ```mach
@@ -502,6 +511,9 @@ pub fun make_piece(kind: PieceKind, reg: i32, src_off: i64, stk_off: i64, width:
 ```mach
 pub fun make_slot_pieces(class: ParamClass, pieces: *ParamPiece, count: u32, size: u64) ParamSlot;
 ```
+
+a slot carried in `count` pieces. total over the slot's fixed piece storage:
+more than PARAM_MAX_PIECES is a caller defect
 
 ## fun piece_memory_width
 
