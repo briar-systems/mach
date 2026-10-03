@@ -115,6 +115,29 @@ ret a + a; }` compiles, because there is no type to decide `+` against and no
 site to report at. The way to check a generic is to instantiate it, so a library
 instantiates its own generics in its own tests.
 
+### Instantiation ends or is refused
+
+An instance asks for the instances its body calls, and those ask for theirs. A
+call whose arguments derive from its caller's parameters without being them
+(`f[*T]` from `T`, `f(n + 1)` from `n`, `f(x, va...)` from a pack) grows them, and
+a cycle of calls through such an argument asks for a new instance at every step.
+
+- **A cycle no comptime gate stops is refused** before any of it is expanded, as
+  `generic.growing_cycle` at the growing call, naming the templates on the cycle.
+  A gate is a comptime `$if` arm or an `$each`; a runtime `if` is not, since every
+  instance of the caller compiles both of its branches.
+- **A cycle with a gate on it runs** as far as the gate lets it. There is no step
+  or count limit: `$if ($is_pointer(T)) { ret peel[$pointee_of(T)](x); }` peels any
+  number of pointers. A gate that never closes runs until memory is refused, and
+  under `-v` the readout shows each growing cycle as it expands, with the
+  templates on it and its instance count so far.
+- **Everything else is finite**: an instantiation outside a growing cycle can
+  only reach the finitely many instances its arguments name.
+
+```
+error[generic.growing_cycle]: `g` instantiates `f` here at an argument that grows, on a cycle of instances no comptime gate can stop (f, g), so its instances never end
+```
+
 ## Comptime value parameters
 
 A parameter marked with `$name: T` must be supplied with a value the
@@ -137,7 +160,10 @@ pub fun pick_op($mode: Mode, a: i64, b: i64) i64 {
 The argument is held to the parameter's type the way a runtime argument is. A
 value the type cannot represent is refused as `comptime.overflow` at the
 argument, never truncated: `narrow(300)` against `fun narrow($n: u8)` reports
-`comptime argument 300 is out of range for u8 (0..255)`.
+`comptime argument 300 is out of range for u8 (0..255)`. An argument that names
+an enclosing comptime parameter, as `narrow(m + 200)` inside `fun wide($m: u8)`,
+is held to the type at each instance of the enclosing function, where `m` has a
+value.
 
 Comptime value parameters apply to function parameters only — not record
 fields, not other contexts.

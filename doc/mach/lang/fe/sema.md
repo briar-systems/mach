@@ -24,6 +24,14 @@ fwd sema_context.SemaDeps
 
 forwards [`mach.lang.fe.sema.context.SemaDeps`](sema/context.md#rec-semadeps)
 
+## fwd sema_context.GrowthWatch
+
+```mach
+fwd sema_context.GrowthWatch
+```
+
+forwards [`mach.lang.fe.sema.context.GrowthWatch`](sema/context.md#rec-growthwatch)
+
 ## fwd sema_context.FieldEntry
 
 ```mach
@@ -167,46 +175,6 @@ diags: *diagnostic.DiagnosticStore) res[sema_context.SemaResult, fail.Fail];
 
 type a module in a scope over the load's, `load`, and resolve's bindings in `rr`, which sema
 reads and never writes; what sema binds is its result's
-
-## fun reinfer_pack_each_body
-
-```mach
-pub fun reinfer_pack_each_body(
-s: *session.Session,
-a: *ast.Ast,
-rr: *resolve.ResolveResult,
-deps: *sema_context.SemaDeps,
-ctx: *comptime.ComptimeCtx,
-own_module: session.ModuleId,
-sema_result: *sema_context.SemaResult,
-fn_ret: type.TypeId,
-body_start: u32,
-body_len: u32,
-subst_owner: type.GenericOwner,
-subst: *type.TypeId,
-subst_len: u32,
-insts: *sema_context.InstWorklist,
-diags: *diagnostic.DiagnosticStore) err[fail.Fail];
-```
-
-## fun reinfer_instance_body
-
-```mach
-pub fun reinfer_instance_body(
-s: *session.Session,
-a: *ast.Ast,
-rr: *resolve.ResolveResult,
-deps: *sema_context.SemaDeps,
-ctx: *comptime.ComptimeCtx,
-own_module: session.ModuleId,
-sema_result: *sema_context.SemaResult,
-fn_ret: type.TypeId,
-body: ast_id.StmtId,
-subst_owner: type.GenericOwner,
-subst: *type.TypeId,
-subst_len: u32,
-diags: *diagnostic.DiagnosticStore) err[fail.Fail];
-```
 
 ## fun dnit_result
 

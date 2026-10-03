@@ -215,6 +215,15 @@ a test run ended: its results in collection order, the counts of passed,
 failed and timed-out tests, the run's wall time, and the gate tally over every
 result
 
+## rec Growth
+
+```mach
+pub rec Growth;
+```
+
+a growing cycle of instances being expanded: the module that declares its templates,
+the templates on it, and how many instances of it the module being typed has made
+
 ## tag Event
 
 ```mach
@@ -228,6 +237,7 @@ pub tag Event: u8 {
     run_start:   RunStart;
     test_end:    TestEnd;
     run_end:     RunEnd;
+    growth:      Growth;
 }
 ```
 
@@ -267,6 +277,15 @@ pub fun diagnostics(sink: *Sink, sources: *lang_source.SourceMap, diags: *diagno
 ```
 
 a unit's diagnostics, sent when it has any; a nil sink is a no-op
+
+## fun growth
+
+```mach
+pub fun growth(sink: *Sink, module: str, members: str, instances: u32);
+```
+
+a growing cycle expanded to `instances` instances, sent under the phase readout; a nil
+sink is a no-op
 
 ## fun run_start
 
