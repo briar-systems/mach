@@ -1,44 +1,5 @@
 # mach.lang.build.outcome
 
-## def ArtifactKind
-
-```mach
-pub def ArtifactKind: u8
-```
-
-the build engine's bookkeeping: what a build produced and recorded, and the
-validation gate tally. failures are `fail.Fail`
-
-## val ART_BINARY
-
-```mach
-pub val ART_BINARY:  ArtifactKind = 0
-```
-
-## val ART_OBJECTS
-
-```mach
-pub val ART_OBJECTS: ArtifactKind = 1
-```
-
-## val ART_ARCHIVE
-
-```mach
-pub val ART_ARCHIVE: ArtifactKind = 2
-```
-
-## val ART_SHARED
-
-```mach
-pub val ART_SHARED:  ArtifactKind = 3
-```
-
-## val ART_TESTS
-
-```mach
-pub val ART_TESTS:   ArtifactKind = 4
-```
-
 ## rec TestArtifact
 
 ```mach
@@ -113,7 +74,7 @@ release an outcome and everything it recorded; nil is a no-op
 ## fun record_artifact
 
 ```mach
-pub fun record_artifact(bo: *BuildOutcome, kind: ArtifactKind, path: str) err[A.Error];
+pub fun record_artifact(bo: *BuildOutcome, kind: catalog_artifact.Kind, path: str) err[A.Error];
 ```
 
 every record_* copies what it stores into the outcome's allocator; a refused

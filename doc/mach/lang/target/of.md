@@ -1336,36 +1336,6 @@ pub fun with_dynamic_exec(vt: *OfVTable, emit: DynExecFn);
 pub fun with_shared_output(vt: *OfVTable, emit: SharedFn);
 ```
 
-## def ArtifactOutputKind
-
-```mach
-pub def ArtifactOutputKind: u8
-```
-
-## val ARTIFACT_EXECUTABLE
-
-```mach
-pub val ARTIFACT_EXECUTABLE: ArtifactOutputKind = 0
-```
-
-## val ARTIFACT_STATIC_LIB
-
-```mach
-pub val ARTIFACT_STATIC_LIB: ArtifactOutputKind = 1
-```
-
-## val ARTIFACT_SHARED_LIB
-
-```mach
-pub val ARTIFACT_SHARED_LIB: ArtifactOutputKind = 2
-```
-
-## val ARTIFACT_OBJECT
-
-```mach
-pub val ARTIFACT_OBJECT:     ArtifactOutputKind = 3
-```
-
 ## rec ArtifactName
 
 ```mach
@@ -1375,7 +1345,7 @@ pub rec ArtifactName;
 ## fun artifact_naming
 
 ```mach
-pub fun artifact_naming(vt: *OfVTable, os_name: str, kind: ArtifactOutputKind) res[ArtifactName, fail.Fail];
+pub fun artifact_naming(vt: *OfVTable, os_name: str, kind: catalog_artifact.Kind) res[ArtifactName, fail.Fail];
 ```
 
 ## rec OfRegistry

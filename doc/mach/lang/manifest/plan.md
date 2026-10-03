@@ -1,29 +1,5 @@
 # mach.lang.manifest.plan
 
-## def LibKind
-
-```mach
-pub def LibKind: u8
-```
-
-the library shape of a build unit, decoded from `[artifact.<name>].kind`
-
-## val LIBKIND_STATIC
-
-```mach
-pub val LIBKIND_STATIC: LibKind = 0
-```
-
-`kind = "static"`; also the value a `bin` unit carries, so check `is_lib` first
-
-## val LIBKIND_SHARED
-
-```mach
-pub val LIBKIND_SHARED: LibKind = 1
-```
-
-`kind = "shared"`
-
 ## rec BuildUnit
 
 ```mach
@@ -54,8 +30,6 @@ debug: from the resolved profile
 simd: from the resolved profile
 vectorize: from the resolved profile
 float_reassoc: from the resolved profile
-is_lib: the artifact's `is_lib`
-kind: LIBKIND_SHARED for `kind = "shared"`, LIBKIND_STATIC otherwise, including for a `bin`
 libs: the artifact's `link` entries that match the target, resolved in `link`
                order and sized exactly; a `link` name matching no `[link.*]` table is skipped
 lib_count: length of `libs`
