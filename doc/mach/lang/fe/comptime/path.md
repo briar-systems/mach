@@ -221,6 +221,14 @@ arg: what `read` needs beyond the path, a version component
 call: the path is called with arguments, `$mach.build.ct_mul(op, width)`
 note: the refusal READ_REFUSED and READ_RESERVED report
 
+## fun at
+
+```mach
+pub fun at(i: usize) *Row;
+```
+
+the row at `i` in declaration order, nil past the end
+
 ## fun lookup
 
 ```mach
