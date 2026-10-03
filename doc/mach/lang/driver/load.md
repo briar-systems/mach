@@ -32,37 +32,6 @@ pub fun diag_join_named(s: *session.Session, prefix: str, name_id: intern.StrId,
 pub fun join_path(alloc: *A.Allocator, a: str, b: str) res[str, fail.Fail];
 ```
 
-## fun parse_root
-
-```mach
-pub fun parse_root(p: *project.Project, fqn: intern.StrId) res[session.ModuleId, fail.Fail];
-```
-
-## fun dfs_load
-
-```mach
-pub fun dfs_load(p: *project.Project, fqn: intern.StrId) res[session.ModuleId, fail.Fail];
-```
-
-## fun reload_module
-
-```mach
-pub fun reload_module(p: *project.Project, mid: session.ModuleId) res[bool, fail.Fail];
-```
-
-reparse and re-walk one loaded module in place, after its text changed, and say
-whether its load surface survived: the modules it reaches, the public constants it
-declares to importers' gates, its own gate outcome and its target gating. a surface
-that survived leaves the project's module set, topo and every other entry as they
-are, so the caller can rerun the query phases over the kept project; one that did
-not needs a full load. the entry's walk state is rebuilt from a fresh comptime
-context, since gate states and load marks are keyed by the old syntax tree's ids
-
-p: the loaded project
-mid: the module whose text changed
-ret: ok(true) when the surface is unchanged; ok(false) when the caller must reload;
-     or the parse or walk failure
-
 ## fun target_context
 
 ```mach
@@ -73,6 +42,57 @@ compiler_name: intern.StrId, compiler_ver: intern.StrId) comptime.ComptimeCtx;
 the comptime context of a build for `t` under `req`: every fact comptime reads from
 the target and the build options, and nothing of a project, so the build and the
 editor fold the same program the same way
+
+## fun loader_of
+
+```mach
+pub fun loader_of(p: *project.Project) res[*fe_load.Loader, fail.Fail];
+```
+
+the project's loader, pointed at the project where it is now: the project is a value its
+callers move, so what the loader holds of it is bound again before each use
+
+## fun module_load
+
+```mach
+pub fun module_load(p: *project.Project, fqn: intern.StrId) res[session.ModuleId, fail.Fail];
+```
+
+load the module `fqn` names and everything it reaches
+
+## fun module_open
+
+```mach
+pub fun module_open(p: *project.Project, fqn: intern.StrId) res[session.ModuleId, fail.Fail];
+```
+
+parse the module `fqn` names as a root, without walking it
+
+## fun module_reload
+
+```mach
+pub fun module_reload(p: *project.Project, mid: session.ModuleId) res[bool, fail.Fail];
+```
+
+reparse and re-walk one loaded module after its text changed, and say whether its load surface
+survived, so the project's other modules stand as they are; every product the project holds of
+the module is dropped, since each is keyed by the old syntax tree
+
+## fun gated_imports_check
+
+```mach
+pub fun gated_imports_check(p: *project.Project) err[fail.Fail];
+```
+
+refuse each imported constant a union build cannot read one value of
+
+## fun attributes_record
+
+```mach
+pub fun attributes_record(p: *project.Project, mid: session.ModuleId) err[fail.Fail];
+```
+
+record the strings a module's attribute arguments evaluate to
 
 ## fun parsed_definition
 
@@ -97,21 +117,6 @@ pub fun q_parse_finalize(value: *u8, value_len: u32, alloc: *A.Allocator);
 ```mach
 pub fun q_exports_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diags: *diagnostic.DiagnosticStore) res[query.QueryOutput, fail.Fail];
 ```
-
-## fun check_gated_const_imports
-
-```mach
-pub fun check_gated_const_imports(p: *project.Project) err[fail.Fail];
-```
-
-## fun record_attribute_strings
-
-```mach
-pub fun record_attribute_strings(p: *project.Project, mid: session.ModuleId) err[fail.Fail];
-```
-
-records the strings the module's attribute arguments evaluate to, read in the
-build target's frame the load walk bound
 
 ## fun rebuild_topo
 
