@@ -166,13 +166,7 @@ $or {
 }
 ```
 
-| field | values |
-|---|---|
-| **isa** | x86_64, aarch64, riscv64, riscv32, a canonical RISC-V extension string such as rv32imc or rv64imafd, spirv |
-| **os** | linux, darwin, windows, freestanding |
-| **abi** | sysv64, win64, aapcs64, lp64, lp64f, lp64d, ilp32, ilp32f, ilp32d, spirv |
-| **of** | elf, coff, macho, raw, spv |
-| **spir-v env** | vulkan1.0, vulkan1.1, vulkan1.2, vulkan1.3 |
+A target names an `isa`, an `os`, an `abi` and optionally an object format `of`, and a spirv target an `env`. The values each axis accepts are listed in [the manifest reference](doc/language/manifest.md#accepted-tuple-values).
 
 x86_64 linux is the primary host. aarch64 linux runs natively in CI, riscv64 linux self-hosts under qemu, darwin self-hosts on both architectures, and windows is a cross-compilation target. `mach info targets` lists every tuple your binary can build.
 
