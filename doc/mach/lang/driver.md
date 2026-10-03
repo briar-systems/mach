@@ -160,10 +160,10 @@ fwd passes.frontend_status
 
 forwards [`mach.lang.driver.passes.frontend_status`](driver/passes.md#fun-frontend_status)
 
-## fwd load.entry_module_fqn
+## fwd driver_load.entry_module_fqn
 
 ```mach
-fwd load.entry_module_fqn
+fwd driver_load.entry_module_fqn
 ```
 
 forwards [`mach.lang.driver.load.entry_module_fqn`](driver/load.md#fun-entry_module_fqn)
@@ -348,7 +348,7 @@ pub fun refresh_frontend(p: *project.Project, mid: session.ModuleId, phase: Fron
 
 re-derive a loaded project's frontend after one module's text changed, without
 reloading its closure. the module is reparsed and re-walked in place; when its load
-surface survived (load.reload_module), the module set and topo are as loaded and
+surface survived (driver_load.module_reload), the module set and topo are as loaded and
 the query phases rerun over them, so every unchanged module's resolve and sema are
 hits and only the edited module and its dependents recompute. a surface that did
 not survive is reported as ok(false): the caller reloads

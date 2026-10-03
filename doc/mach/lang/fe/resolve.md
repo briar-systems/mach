@@ -224,6 +224,14 @@ pub rec ParsedDefinition;
 pub rec ResolveDeps;
 ```
 
+what a module's resolve reads of the modules it imports
+
+entries: the public surface of each module it may name
+bindings: the load's record of each of its import declarations, which resolve binds
+               from rather than reading their paths; a declaration with none is bound by
+               its path
+binding_count: how many records `bindings` holds
+
 ## rec ResolveResult
 
 ```mach
