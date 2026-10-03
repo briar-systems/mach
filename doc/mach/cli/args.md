@@ -57,8 +57,9 @@ row count of RDO
 pub val RDO: [RDO_N]FlagSpec = [RDO_N]FlagSpec;
 ```
 
-the readout options `-v`, `-vv`, `--quiet`, `-q`, consumed by build, test,
-and doc; doc hides `-v` and `-vv`. `-q` is the alias of `--quiet`
+the readout options `-v`, `-vv`, `--quiet`, `-q`, consumed by build, check
+and doc; doc hides `-v` and `-vv`. `-q` is the alias of `--quiet`. what each
+level shows is the readout contract, doc/language/readout.md
 
 ## val CGEN_N
 
@@ -551,19 +552,6 @@ cmd: the command
 inv: the parsed invocation
 argv: the argument vector inv was parsed from
 ret: the format, or a user failure for a bare `--diagnostics` or any other value
-
-## fun readout_allowed
-
-```mach
-pub fun readout_allowed(c: *request.CliArgs, format: cli_diagnostic.Format) err[fail.Fail];
-```
-
-`-v` and `-vv` render the phase readout to stderr as text, which a json run
-keeps to records
-
-c: the command's arguments
-format: the diagnostics format
-ret: ok, or a user failure when a readout is asked for under json
 
 ## fun collect_selectors
 
