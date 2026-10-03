@@ -11,7 +11,7 @@ the symbol array is owned; release it with `free_link_claims`
 
 source: copied from the link
 text: for a local source, the `path` expanded and interned; otherwise the link's `name`
-library: the link's logical `library` name
+key: the link's table key, its identity
 symbols: an owned copy of the link's `symbols`, or nil when it has none
 symbol_count: length of `symbols`
 include_referenced: copied from the link
