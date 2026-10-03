@@ -33,7 +33,7 @@ pub fun dnit(values: *Environment);
 ## fun put
 
 ```mach
-pub fun put(values: *Environment, name: str, value: str, replace: bool) err[outcome.Fail];
+pub fun put(values: *Environment, name: str, value: str, replace: bool) err[fail.Fail];
 ```
 
 entries own both strings and use host identity before any overlay is applied
@@ -41,13 +41,13 @@ entries own both strings and use host identity before any overlay is applied
 ## fun put_entry
 
 ```mach
-pub fun put_entry(values: *Environment, entry: str, replace: bool) err[outcome.Fail];
+pub fun put_entry(values: *Environment, entry: str, replace: bool) err[fail.Fail];
 ```
 
 ## fun capture
 
 ```mach
-pub fun capture(a: *A.Allocator, inherited: **u8) res[Environment, outcome.Fail];
+pub fun capture(a: *A.Allocator, inherited: **u8) res[Environment, fail.Fail];
 ```
 
 inherited duplicate names retain the first value, matching native lookup
@@ -61,6 +61,6 @@ pub fun strings_free(a: *A.Allocator, strings: *Strings);
 ## fun to_strings
 
 ```mach
-pub fun to_strings(values: *Environment) res[Strings, outcome.Fail];
+pub fun to_strings(values: *Environment) res[Strings, fail.Fail];
 ```
 

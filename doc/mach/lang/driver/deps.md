@@ -19,7 +19,7 @@ declared: the root's selector, in the same form
 
 ```mach
 pub fun root_overrides(s: *session.Session, root_m: *manifest.Manifest, deps: *project.DepEntry, dep_count: u32,
-out: *Vector[RootOverride]) err[outcome.Fail];
+out: *Vector[RootOverride]) err[fail.Fail];
 ```
 
 every edge of a realized closure whose selector a root override replaced, in closure order
@@ -33,7 +33,7 @@ out: receives one RootOverride per replaced edge
 ## fun root_override_text
 
 ```mach
-pub fun root_override_text(s: *session.Session, o: *RootOverride) res[str, outcome.Fail];
+pub fun root_override_text(s: *session.Session, o: *RootOverride) res[str, fail.Fail];
 ```
 
 the note `mach dep verify` prints for one override
@@ -41,7 +41,7 @@ the note `mach dep verify` prints for one override
 ## fun override_note
 
 ```mach
-pub fun override_note(a: *A.Allocator, name: str, declared: str, chain: str, requested: str) res[str, outcome.Fail];
+pub fun override_note(a: *A.Allocator, name: str, declared: str, chain: str, requested: str) res[str, fail.Fail];
 ```
 
 the note naming one requirement a root declaration overrode, as `mach dep pull`, `update`,
@@ -62,7 +62,7 @@ pub rec GitCandidates;
 ## fun git_candidates_init
 
 ```mach
-pub fun git_candidates_init(s: *session.Session, offline: bool, local: str) res[GitCandidates, outcome.Fail];
+pub fun git_candidates_init(s: *session.Session, offline: bool, local: str) res[GitCandidates, fail.Fail];
 ```
 
 ## fun git_candidates_dnit
@@ -74,7 +74,7 @@ pub fun git_candidates_dnit(c: *GitCandidates);
 ## fun git_candidates_add_local
 
 ```mach
-pub fun git_candidates_add_local(c: *GitCandidates, url: str, dir: str) err[outcome.Fail];
+pub fun git_candidates_add_local(c: *GitCandidates, url: str, dir: str) err[fail.Fail];
 ```
 
 the local repository offline resolution reads `url`'s releases from; the first existing one
@@ -89,7 +89,7 @@ pub fun git_candidate_source(c: *GitCandidates) candidates.CandidateSource;
 ## fun release_for_commit
 
 ```mach
-pub fun release_for_commit(c: *GitCandidates, url: str, commit: str) res[str, outcome.Fail];
+pub fun release_for_commit(c: *GitCandidates, url: str, commit: str) res[str, fail.Fail];
 ```
 
 the release of `url` whose commit is `commit`, as its version text owned by the
@@ -99,7 +99,7 @@ gitlink is a commit, and resolution deals in releases (#3689)
 ## fun release_needs
 
 ```mach
-pub fun release_needs(ctx: ptr, id: str, url: str, rel: *candidates.Release, out: *resolver.ReleaseNeeds) err[outcome.Fail];
+pub fun release_needs(ctx: ptr, id: str, url: str, rel: *candidates.Release, out: *resolver.ReleaseNeeds) err[fail.Fail];
 ```
 
 a release's requirements as the resolver reads them: its compiler range and its dependencies
@@ -129,7 +129,7 @@ or realizes the closure refuses it through this one check (#3478)
 ## fun check_dep_root
 
 ```mach
-pub fun check_dep_root(project_root: str) res[bool, outcome.Fail];
+pub fun check_dep_root(project_root: str) res[bool, fail.Fail];
 ```
 
 whether the dependency root exists; err when it is anything but a physical directory
@@ -137,7 +137,7 @@ whether the dependency root exists; err when it is anything but a physical direc
 ## fun closure_locate
 
 ```mach
-pub fun closure_locate(p: *project.Project, m: *manifest.Manifest, project_root: str) err[outcome.Fail];
+pub fun closure_locate(p: *project.Project, m: *manifest.Manifest, project_root: str) err[fail.Fail];
 ```
 
 locate a root manifest's dependency closure into `p.config.deps`, as a build reads it:
@@ -154,7 +154,7 @@ ret: err naming a missing dependency, an unreadable manifest, a cycle or an
 ## fun closure_verify
 
 ```mach
-pub fun closure_verify(p: *project.Project, m: *manifest.Manifest, project_root: str) err[outcome.Fail];
+pub fun closure_verify(p: *project.Project, m: *manifest.Manifest, project_root: str) err[fail.Fail];
 ```
 
 locate the closure as `closure_locate` does and hold every edge of it to what `mach dep
@@ -169,7 +169,7 @@ ret: err naming the first dependency that does not locate or does not verify
 ## fun scope_closure_to_dependency
 
 ```mach
-pub fun scope_closure_to_dependency(p: *project.Project, owner: str) err[outcome.Fail];
+pub fun scope_closure_to_dependency(p: *project.Project, owner: str) err[fail.Fail];
 ```
 
 make a resolved closure the closure of one of its dependencies: the dependency's
@@ -183,7 +183,7 @@ ret: ok; err when the closure holds no such dependency
 ## fun resolve_requirement_scopes
 
 ```mach
-pub fun resolve_requirement_scopes(p: *project.Project, root: *manifest.Manifest, profile: str) err[outcome.Fail];
+pub fun resolve_requirement_scopes(p: *project.Project, root: *manifest.Manifest, profile: str) err[fail.Fail];
 ```
 
 the requirement scope of each project a configured cell compiles: the declaring
@@ -199,14 +199,14 @@ ret: ok with `p.config.req_scopes` set; err from output expansion
 
 ```mach
 pub fun resolve_cascade_libs(p: *project.Project, isa: str, os: str, abi: str,
-own_libs: *manifest.LinkRequirement, own_count: u32) err[outcome.Fail];
+own_libs: *manifest.LinkRequirement, own_count: u32) err[fail.Fail];
 ```
 
 ## fun release_selects_releases
 
 ```mach
 pub fun release_selects_releases(s: *session.Session, chain: str, what: str, m: *manifest.Manifest,
-root: *manifest.Manifest) err[outcome.Fail];
+root: *manifest.Manifest) err[fail.Fail];
 ```
 
 a manifest reached through a release (a version range or a `tag/`) may itself select only
@@ -236,7 +236,7 @@ of the project `owner` names, empty when the cell binds no scope for it
 ## fun inside_work_tree
 
 ```mach
-pub fun inside_work_tree(s: *session.Session, dir: str) res[bool, outcome.Fail];
+pub fun inside_work_tree(s: *session.Session, dir: str) res[bool, fail.Fail];
 ```
 
 whether `dir` lies inside a Git work tree; false for a plain directory
@@ -244,13 +244,13 @@ whether `dir` lies inside a Git work tree; false for a plain directory
 ## fun initialize_repository
 
 ```mach
-pub fun initialize_repository(s: *session.Session, root: str) err[outcome.Fail];
+pub fun initialize_repository(s: *session.Session, root: str) err[fail.Fail];
 ```
 
 ## fun check_dep_identity
 
 ```mach
-pub fun check_dep_identity(s: *session.Session, key: str, declared: str) err[outcome.Fail];
+pub fun check_dep_identity(s: *session.Session, key: str, declared: str) err[fail.Fail];
 ```
 
 the manifest key, the directory under dep/ and the project id are one name
@@ -258,7 +258,7 @@ the manifest key, the directory under dep/ and the project id are one name
 ## fun refuse_nested_realization
 
 ```mach
-pub fun refuse_nested_realization(s: *session.Session, alias: str, dep_dir: str) err[outcome.Fail];
+pub fun refuse_nested_realization(s: *session.Session, alias: str, dep_dir: str) err[fail.Fail];
 ```
 
 a realized nested dependency (`dep/<id>/dep/<x>/mach.toml`) is refused: the
@@ -281,19 +281,19 @@ pub val REALIZE_NESTED:    u8 = 1
 ## fun realization_mode
 
 ```mach
-pub fun realization_mode(s: *session.Session, root: str) res[u8, outcome.Fail];
+pub fun realization_mode(s: *session.Session, root: str) res[u8, fail.Fail];
 ```
 
 ## fun dep_full_of
 
 ```mach
-pub fun dep_full_of(alloc: *A.Allocator, root: str, id: str) res[str, outcome.Fail];
+pub fun dep_full_of(alloc: *A.Allocator, root: str, id: str) res[str, fail.Fail];
 ```
 
 ## fun staged_gitlink
 
 ```mach
-pub fun staged_gitlink(s: *session.Session, root: str, id: str) res[opt[str], outcome.Fail];
+pub fun staged_gitlink(s: *session.Session, root: str, id: str) res[opt[str], fail.Fail];
 ```
 
 ## fun own_work_tree
@@ -305,14 +305,14 @@ pub fun own_work_tree(alloc: *A.Allocator, dep_full: str) bool;
 ## fun checkout_head
 
 ```mach
-pub fun checkout_head(s: *session.Session, dep_full: str) res[str, outcome.Fail];
+pub fun checkout_head(s: *session.Session, dep_full: str) res[str, fail.Fail];
 ```
 
 ## fun selection_commit
 
 ```mach
 pub fun selection_commit(s: *session.Session, root: str, id: str, dep_full: str, ref: str,
-advance: bool, offline: bool) res[str, outcome.Fail];
+advance: bool, offline: bool) res[str, fail.Fail];
 ```
 
 the commit the fixed selector `ref` picks in the checkout at dep_full: a commit or a tag as
@@ -322,7 +322,7 @@ revision the checkout lacks is fetched, which `offline` refuses; the caller free
 ## fun manifest_at
 
 ```mach
-pub fun manifest_at(alloc: *A.Allocator, dir: str, rev: str) res[manifest.Doc, outcome.Fail];
+pub fun manifest_at(alloc: *A.Allocator, dir: str, rev: str) res[manifest.Doc, fail.Fail];
 ```
 
 the manifest the commit `rev` of the repository at `dir` holds, allocated from `alloc`
@@ -330,7 +330,7 @@ the manifest the commit `rev` of the repository at `dir` holds, allocated from `
 ## fun gitlink_at
 
 ```mach
-pub fun gitlink_at(s: *session.Session, dir: str, rev: str, id: str) res[opt[str], outcome.Fail];
+pub fun gitlink_at(s: *session.Session, dir: str, rev: str, id: str) res[opt[str], fail.Fail];
 ```
 
 the gitlink the tree of the commit `rev` in the repository at `dir` records for dep/<id>
@@ -338,7 +338,7 @@ the gitlink the tree of the commit `rev` in the repository at `dir` records for 
 ## fun release_at_pin
 
 ```mach
-pub fun release_at_pin(s: *session.Session, root: str, id: str, dep_full: str, fetch: bool) res[str, outcome.Fail];
+pub fun release_at_pin(s: *session.Session, root: str, id: str, dep_full: str, fetch: bool) res[str, fail.Fail];
 ```
 
 the release version dep/<id>'s pin is tagged with, read from its checkout's refs (an owned ""
@@ -348,7 +348,7 @@ when no release tag points at it); the highest wins, and the caller frees the re
 ## fun checkout_has_tags
 
 ```mach
-pub fun checkout_has_tags(s: *session.Session, dep_full: str) res[bool, outcome.Fail];
+pub fun checkout_has_tags(s: *session.Session, dep_full: str) res[bool, fail.Fail];
 ```
 
 whether the checkout at dep_full holds any tag, which a shallow clone may not
@@ -357,7 +357,7 @@ whether the checkout at dep_full holds any tag, which a shallow clone may not
 
 ```mach
 pub fun fetch_selection_tags(s: *session.Session, root: str, id: str, dep_full: str, ref: str,
-ranged: bool, offline: bool) res[bool, outcome.Fail];
+ranged: bool, offline: bool) res[bool, fail.Fail];
 ```
 
 fetch the tags of dep/<id>'s checkout when it lacks the one its selection reads: the tag a
@@ -440,13 +440,13 @@ pub fun git_slot_dnit(alloc: *A.Allocator, slot: *GitSlot);
 ## fun observe_git_slot
 
 ```mach
-pub fun observe_git_slot(s: *session.Session, root: str, id: str, mode: u8) res[GitSlot, outcome.Fail];
+pub fun observe_git_slot(s: *session.Session, root: str, id: str, mode: u8) res[GitSlot, fail.Fail];
 ```
 
 ## fun refuse_git_slot
 
 ```mach
-pub fun refuse_git_slot(s: *session.Session, root: str, id: str, mode: u8, slot: *GitSlot, accept: bool) err[outcome.Fail];
+pub fun refuse_git_slot(s: *session.Session, root: str, id: str, mode: u8, slot: *GitSlot, accept: bool) err[fail.Fail];
 ```
 
 refuse a slot whose realization would replace or record work mach did not make
@@ -455,7 +455,7 @@ refuse a slot whose realization would replace or record work mach did not make
 
 ```mach
 pub fun realize_git_slot(s: *session.Session, root: str, id: str, url: str, ref: str, mode: u8,
-slot: *GitSlot, offline: bool) res[u8, outcome.Fail];
+slot: *GitSlot, offline: bool) res[u8, fail.Fail];
 ```
 
 bring a slot `refuse_git_slot` accepted to the realization `mach dep verify` checks. a pin its
@@ -466,14 +466,14 @@ cloned, and a dependency with no gitlink is added only over a checkout or store 
 ## fun remove_dependency_index
 
 ```mach
-pub fun remove_dependency_index(s: *session.Session, root: str, id: str, mode: u8) err[outcome.Fail];
+pub fun remove_dependency_index(s: *session.Session, root: str, id: str, mode: u8) err[fail.Fail];
 ```
 
 ## fun realize_path_dependency
 
 ```mach
 pub fun realize_path_dependency(s: *session.Session, root: str, id: str, src_dir: str,
-mode: u8) res[bool, outcome.Fail];
+mode: u8) res[bool, fail.Fail];
 ```
 
 sync dep/<id> with a path dependency's source
@@ -483,7 +483,7 @@ ret: true when the copy was refreshed, false when it already matched its source 
 ## fun realized_ids
 
 ```mach
-pub fun realized_ids(alloc: *A.Allocator, root: str) res[Vector[str], outcome.Fail];
+pub fun realized_ids(alloc: *A.Allocator, root: str) res[Vector[str], fail.Fail];
 ```
 
 a dependency slot is a directory under dep/ named by a valid project id
@@ -491,7 +491,7 @@ a dependency slot is a directory under dep/ named by a valid project id
 ## fun fetch_and_checkout
 
 ```mach
-pub fun fetch_and_checkout(s: *session.Session, id: str, dep_full: str, ref: str, offline: bool) err[outcome.Fail];
+pub fun fetch_and_checkout(s: *session.Session, id: str, dep_full: str, ref: str, offline: bool) err[fail.Fail];
 ```
 
 check dep/<id>'s checkout out at the selector `ref` after fetching every ref; `offline` fetches
@@ -500,7 +500,7 @@ nothing, so a selector the checkout does not hold is refused
 ## fun gitlink_recorded
 
 ```mach
-pub fun gitlink_recorded(s: *session.Session, root: str, id: str, mode: u8) res[bool, outcome.Fail];
+pub fun gitlink_recorded(s: *session.Session, root: str, id: str, mode: u8) res[bool, fail.Fail];
 ```
 
 whether a moved checkout of dep/<id> is to be staged: always in a repository
@@ -510,6 +510,6 @@ enclosing repository already records a gitlink for it (#3686)
 ## fun stage_dependency
 
 ```mach
-pub fun stage_dependency(s: *session.Session, root: str, id: str) err[outcome.Fail];
+pub fun stage_dependency(s: *session.Session, root: str, id: str) err[fail.Fail];
 ```
 

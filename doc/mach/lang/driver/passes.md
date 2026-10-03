@@ -24,13 +24,13 @@ pub fun q_resolve_compute(p: *project.Project, key: u64, alloc: *A.Allocator, di
 ## fun prepare_sema_pass
 
 ```mach
-pub fun prepare_sema_pass(p: *project.Project) err[outcome.Fail];
+pub fun prepare_sema_pass(p: *project.Project) err[fail.Fail];
 ```
 
 ## fun run_sema_pass
 
 ```mach
-pub fun run_sema_pass(p: *project.Project) err[outcome.Fail];
+pub fun run_sema_pass(p: *project.Project) err[fail.Fail];
 ```
 
 a rejected module is one module's answer, so the pass folds it and carries
@@ -117,13 +117,13 @@ pub fun debug_info_of(p: *project.Project) res[codegen.DebugInfo, fail.Fail];
 ## fun run_lower_pass
 
 ```mach
-pub fun run_lower_pass(p: *project.Project) err[outcome.Fail];
+pub fun run_lower_pass(p: *project.Project) err[fail.Fail];
 ```
 
 ## fun prepare_lower_pass
 
 ```mach
-pub fun prepare_lower_pass(p: *project.Project) err[outcome.Fail];
+pub fun prepare_lower_pass(p: *project.Project) err[fail.Fail];
 ```
 
 ## fun load_status
@@ -161,13 +161,13 @@ pub fun q_lower_compute(p: *project.Project, key: u64, alloc: *A.Allocator, diag
 ## fun prepare_codegen_pass
 
 ```mach
-pub fun prepare_codegen_pass(p: *project.Project) err[outcome.Fail];
+pub fun prepare_codegen_pass(p: *project.Project) err[fail.Fail];
 ```
 
 ## fun acquire_codegen_inputs
 
 ```mach
-pub fun acquire_codegen_inputs(p: *project.Project) err[outcome.Fail];
+pub fun acquire_codegen_inputs(p: *project.Project) err[fail.Fail];
 ```
 
 the modules that still lower here are those without a product restored under
@@ -177,7 +177,7 @@ staged product when the snapshot is unchanged and lowers now if it changed
 ## fun acquire_test_inputs
 
 ```mach
-pub fun acquire_test_inputs(p: *project.Project) err[outcome.Fail];
+pub fun acquire_test_inputs(p: *project.Project) err[fail.Fail];
 ```
 
 the test operation's inputs: the typed definitions and each test object's
@@ -186,13 +186,13 @@ lowered ir, unless the load restored its object from `obj/`
 ## fun run_test_object_pass
 
 ```mach
-pub fun run_test_object_pass(p: *project.Project) err[outcome.Fail];
+pub fun run_test_object_pass(p: *project.Project) err[fail.Fail];
 ```
 
 ## fun run_codegen_pass
 
 ```mach
-pub fun run_codegen_pass(p: *project.Project) err[outcome.Fail];
+pub fun run_codegen_pass(p: *project.Project) err[fail.Fail];
 ```
 
 ## fun code_sources
@@ -232,13 +232,13 @@ pub fun q_codegen_compute(p: *project.Project, key: u64, alloc: *A.Allocator, di
 ## fun prepare_link_pass
 
 ```mach
-pub fun prepare_link_pass(p: *project.Project) err[outcome.Fail];
+pub fun prepare_link_pass(p: *project.Project) err[fail.Fail];
 ```
 
 ## fun run_link_pass
 
 ```mach
-pub fun run_link_pass(p: *project.Project) res[bool, outcome.Fail];
+pub fun run_link_pass(p: *project.Project) res[bool, fail.Fail];
 ```
 
 ## fun q_link_compute

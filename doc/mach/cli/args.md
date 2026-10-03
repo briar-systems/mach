@@ -504,7 +504,7 @@ inv: the invocation
 ## fun parse_invocation
 
 ```mach
-pub fun parse_invocation(a: *A.Allocator, argc: usize, argv: **u8) res[ParsedInvocation, outcome.Fail];
+pub fun parse_invocation(a: *A.Allocator, argc: usize, argv: **u8) res[ParsedInvocation, fail.Fail];
 ```
 
 classify argv against the command schema: recognize the command at argv[1]
@@ -541,7 +541,7 @@ pub fun invocation_value(cmd: CommandId, inv: *ParsedInvocation, argv: **u8, fla
 ## fun diagnostics_format
 
 ```mach
-pub fun diagnostics_format(cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[cli_diagnostic.Format, outcome.Fail];
+pub fun diagnostics_format(cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[cli_diagnostic.Format, fail.Fail];
 ```
 
 the diagnostics format `--diagnostics=<human|json>` selects for a command
@@ -555,7 +555,7 @@ ret: the format, or a user failure for a bare `--diagnostics` or any other value
 ## fun readout_allowed
 
 ```mach
-pub fun readout_allowed(c: *request.CliArgs, format: cli_diagnostic.Format) err[outcome.Fail];
+pub fun readout_allowed(c: *request.CliArgs, format: cli_diagnostic.Format) err[fail.Fail];
 ```
 
 `-v` and `-vv` render the phase readout to stderr as text, which a json run
@@ -568,7 +568,7 @@ ret: ok, or a user failure when a readout is asked for under json
 ## fun collect_selectors
 
 ```mach
-pub fun collect_selectors(a: *A.Allocator, cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[manifest.Selectors, outcome.Fail];
+pub fun collect_selectors(a: *A.Allocator, cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[manifest.Selectors, fail.Fail];
 ```
 
 the `-a`, `-t` and `-p` patterns and `--all` a command was given
@@ -582,7 +582,7 @@ ret: the selectors; err when a selector has no value
 ## fun build_cli_invocation
 
 ```mach
-pub fun build_cli_invocation(a: *A.Allocator, cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[request.CliArgs, outcome.Fail];
+pub fun build_cli_invocation(a: *A.Allocator, cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[request.CliArgs, fail.Fail];
 ```
 
 the typed request.CliArgs of a build-shaped command: verbosity 0, 1, or 2
@@ -601,7 +601,7 @@ ret: the arguments, or err when `-v` or `-vv` is combined with `--quiet` or `-q`
 ## fun collect_link_inputs
 
 ```mach
-pub fun collect_link_inputs(a: *A.Allocator, c: *request.CliArgs, cmd: CommandId, inv: *ParsedInvocation, argv: **u8) err[outcome.Fail];
+pub fun collect_link_inputs(a: *A.Allocator, c: *request.CliArgs, cmd: CommandId, inv: *ParsedInvocation, argv: **u8) err[fail.Fail];
 ```
 
 fill c.link_tokens and c.lib_dirs in command-line order: every `-l` value and
@@ -649,7 +649,7 @@ ret: the arguments
 ## fun unknown_flag
 
 ```mach
-pub fun unknown_flag(a: *A.Allocator, inv: *ParsedInvocation, argv: **u8, cmd: str) opt[outcome.Fail];
+pub fun unknown_flag(a: *A.Allocator, inv: *ParsedInvocation, argv: **u8, cmd: str) opt[fail.Fail];
 ```
 
 the refusal of the first unrecognized flag-shaped token: `cli.flag_unknown`, or

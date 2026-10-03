@@ -90,7 +90,7 @@ whether `code` is one of SHARED
 ## fun of
 
 ```mach
-pub fun of(f: outcome.Fail) i64;
+pub fun of(f: fail.Fail) i64;
 ```
 
 the exit code a failure maps to

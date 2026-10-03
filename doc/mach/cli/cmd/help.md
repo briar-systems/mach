@@ -43,7 +43,7 @@ ret: the route; HELP_ROUTE_NONE when argv is not a help request
 ## fun render_overview
 
 ```mach
-pub fun render_overview(a: *A.Allocator, out: *io_writer.Writer) err[outcome.Fail];
+pub fun render_overview(a: *A.Allocator, out: *io_writer.Writer) err[fail.Fail];
 ```
 
 write the command overview at the terminal width read from COLUMNS, 100 when unset or

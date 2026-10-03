@@ -123,7 +123,7 @@ project: the root manifest's `[project].id`
 
 ```mach
 pub fun plan(a: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry,
-m: *manifest.Manifest, owned_req: request.BuildRequest) res[BuildPlan, outcome.Fail];
+m: *manifest.Manifest, owned_req: request.BuildRequest) res[BuildPlan, fail.Fail];
 ```
 
 plan the request's own selection: `req.artifact` on `req.target`, each an
@@ -142,7 +142,7 @@ ret: the plan; err from request validation, selection or planning
 
 ```mach
 pub fun plan_cells(a: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry,
-m: *manifest.Manifest, owned_req: request.BuildRequest, cells: *Vector[manifest.Cell]) res[BuildPlan, outcome.Fail];
+m: *manifest.Manifest, owned_req: request.BuildRequest, cells: *Vector[manifest.Cell]) res[BuildPlan, fail.Fail];
 ```
 
 plan resolved cells for one profile: each cell's artifact on its target, and
@@ -161,7 +161,7 @@ ret: the plan; err from validation or a cell's planning, or when `-o`
 ## fun configure
 
 ```mach
-pub fun configure(s: *session.Session, m: *manifest.Manifest, bp: *BuildPlan) err[outcome.Fail];
+pub fun configure(s: *session.Session, m: *manifest.Manifest, bp: *BuildPlan) err[fail.Fail];
 ```
 
 resolve every planned cell against the realized dependency closure, filling in
@@ -179,7 +179,7 @@ ret: ok; the configuration failure of the first cell that has one
 ## fun plan_dependency_requirements
 
 ```mach
-pub fun plan_dependency_requirements(s: *session.Session, m: *manifest.Manifest, bp: *BuildPlan) err[outcome.Fail];
+pub fun plan_dependency_requirements(s: *session.Session, m: *manifest.Manifest, bp: *BuildPlan) err[fail.Fail];
 ```
 
 add the cells a dependency's default library artifacts require to a plan made
@@ -200,7 +200,7 @@ ret: ok; err from closure realization, a dependency cell's planning, or an
 ## fun check_plan_outputs
 
 ```mach
-pub fun check_plan_outputs(a: *A.Allocator, plans: *Vector[BuildPlan]) err[outcome.Fail];
+pub fun check_plan_outputs(a: *A.Allocator, plans: *Vector[BuildPlan]) err[fail.Fail];
 ```
 
 refuse two plans of one selection, one per profile, that would write one
@@ -216,7 +216,7 @@ ret: ok; err naming the two cells and the path
 ```mach
 pub fun replan_unit(a: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry,
 s: *manifest.Scope, req: *request.BuildRequest,
-prior: *BuildUnit) res[BuildUnit, outcome.Fail];
+prior: *BuildUnit) res[BuildUnit, fail.Fail];
 ```
 
 ## fun finished_modules
@@ -230,7 +230,7 @@ pub fun finished_modules(tgt: *lang_target.Target) bool;
 ```mach
 pub fun resolve_requirement(a: *A.Allocator, itn: *intern.Interner, tgt: *lang_target.Target,
 dirs: *Vector[str], root: str,
-req: *manifest.LinkRequirement) res[LinkInput, outcome.Fail];
+req: *manifest.LinkRequirement) res[LinkInput, fail.Fail];
 ```
 
 ## fun join_msg
@@ -242,7 +242,7 @@ pub fun join_msg(al: *A.Allocator, va: ...) str;
 ## fun render
 
 ```mach
-pub fun render(a: *A.Allocator, w: *io_writer.Writer, p: *BuildPlan, itn: *intern.Interner) err[outcome.Fail];
+pub fun render(a: *A.Allocator, w: *io_writer.Writer, p: *BuildPlan, itn: *intern.Interner) err[fail.Fail];
 ```
 
 render the effective plan: one block per selected cell, naming the project,
@@ -258,7 +258,7 @@ itn: resolves interned names
 ## fun explain
 
 ```mach
-pub fun explain(a: *A.Allocator, p: *BuildPlan, itn: *intern.Interner) err[outcome.Fail];
+pub fun explain(a: *A.Allocator, p: *BuildPlan, itn: *intern.Interner) err[fail.Fail];
 ```
 
 ## fun phase_name
@@ -281,7 +281,7 @@ build's, a test build's test objects are generated code
 ## fun unknown_phase
 
 ```mach
-pub fun unknown_phase(a: *A.Allocator, k: PhaseKind) outcome.Fail;
+pub fun unknown_phase(a: *A.Allocator, k: PhaseKind) fail.Fail;
 ```
 
 an internal catalog failure with a caller-owned message

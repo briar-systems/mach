@@ -80,7 +80,7 @@ alloc: backs the three pattern vectors
 ## fun selectors_of
 
 ```mach
-pub fun selectors_of(alloc: *A.Allocator, artifact: str, target: str, profile: str) res[Selectors, outcome.Fail];
+pub fun selectors_of(alloc: *A.Allocator, artifact: str, target: str, profile: str) res[Selectors, fail.Fail];
 ```
 
 selectors naming at most one pattern per axis: each non-empty value is its
@@ -125,7 +125,7 @@ cells: the resolved cells
 
 ```mach
 pub fun resolve_cells(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, s: *Selectors,
-mode: ArtifactDefault) res[Vector[Cell], outcome.Fail];
+mode: ArtifactDefault) res[Vector[Cell], fail.Fail];
 ```
 
 resolve selectors against a manifest into the cells they cover, profiles

@@ -83,7 +83,7 @@ loc: the location
 ## fun resolve_project_location
 
 ```mach
-pub fun resolve_project_location(a: *A.Allocator, arg: str) res[ProjectLocation, outcome.Fail];
+pub fun resolve_project_location(a: *A.Allocator, arg: str) res[ProjectLocation, fail.Fail];
 ```
 
 turn a project operand into a root directory and a manifest path
@@ -97,7 +97,7 @@ ret: the location, freed with dnit_project_location, or a message naming what wa
 ## fun ensure_parents
 
 ```mach
-pub fun ensure_parents(a: *A.Allocator, p: str) err[outcome.Fail];
+pub fun ensure_parents(a: *A.Allocator, p: str) err[fail.Fail];
 ```
 
 create every missing ancestor of a path with mode 0755; the path itself is not created
@@ -109,7 +109,7 @@ ret: none on success, or the parent computation or creation error
 ## fun resolve_cmd
 
 ```mach
-pub fun resolve_cmd(a: *A.Allocator, name: str) res[str, outcome.Fail];
+pub fun resolve_cmd(a: *A.Allocator, name: str) res[str, fail.Fail];
 ```
 
 locate an executable the way a shell would: a name with a path separator is used directly
