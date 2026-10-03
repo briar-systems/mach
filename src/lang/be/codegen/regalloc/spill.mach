@@ -1,0 +1,860 @@
+# what a spilled value costs and how it is carried: rematerialization of
+# constants, pieces that reload a run of reads once, values spilled across
+# calls, and the frame slots the spills take
+use lang_checked: mach.lang.checked;
+use mach.lang.fail;
+use mach.lang.growth;
+use lang_mir:    mach.lang.mir;
+use lang_target: mach.lang.target;
+use mach.lang.target.isa;
+use isa_inst:  mach.lang.target.isa.inst;
+use isa_rules: mach.lang.target.isa.rules;
+use mach.lang.target.isa.x64;
+use A: std.allocator;
+use std.allocator.page;
+use T: std.allocator.testing;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use mach.lang.be.codegen.regalloc.coalesce;
+use regalloc_context: mach.lang.be.codegen.regalloc.context;
+use mach.lang.be.codegen.regalloc.liveness;
+use mach.lang.be.codegen.regalloc.rewrite;
+
+pub fun slots_allocate(ctx: *regalloc_context.Context) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < ctx.spill_order_count) {
+        val v: u32 = ctx.spill_order[i];
+        if (ctx.spilled[v] && ctx.f.vregs[v].spill_slot < 0) {
+            val size: u32                 = class_width(ctx, ?ctx.ranges[v]);
+            val sr:   res[i32, fail.Fail] = add_spill_slot(ctx, v, size);
+            if (sel sr.err) { ret err[fail.Fail].err{sr.err}; }
+            ctx.f.vregs[v].spill_slot = sr.ok;
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a spilled value its one definition builds from a constant is built again
+# where it is read instead of kept in a slot: the definition goes, a
+# copy that reads it copies the constant, and every other reader reads a
+# fresh value defined by a copy of the definition just before it, which the
+# next round allocates as an interval of its own. no store, no slot, no
+# reload, so a constant hoisted out of a loop costs the loop, at worst, the
+# materialization it would have had in place. a value is offered this once,
+# and the fresh values never, so the rounds end
+pub fun plan_remat(tgt: *lang_target.Binding, ctx: *regalloc_context.Context) res[bool, fail.Fail] {
+    val f:       *lang_mir.MirFunction = ctx.f;
+    var changed: bool                  = false;
+    val nv:      u32                   = f.vreg_count;
+    var v:       u32                   = 0;
+    for (v < nv) {
+        if (ctx.spilled[v] && !ctx.no_remat[v]) {
+            ctx.no_remat[v] = true;
+            var db: u32 = 0;
+            var di: u32 = 0;
+            if (remat_def(tgt, ctx, v, ?db, ?di)) {
+                val rr: err[fail.Fail] = rematerialize(tgt, ctx, v, db, di);
+                if (sel rr.err) { ret res[bool, fail.Fail].err{rr.err}; }
+                changed = true;
+            }
+        }
+        v = v + 1;
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+# a value built again where it is read costs no store and no slot when it is
+# spilled, so it weighs half as much to keep in a register as one that would
+# be reloaded: of two values read as often, the one that can be rebuilt is the
+# one the scan gives up. the test is remat_def's, made for every value
+# in one pass
+pub fun discount_remat(tgt: *lang_target.Binding, ctx: *regalloc_context.Context) err[fail.Fail] {
+    val f:  *lang_mir.MirFunction = ctx.f;
+    val nv: u32                   = f.vreg_count;
+    if (nv == 0) { ret err[fail.Fail].ok{}; }
+    val rd: res[*u32, A.Error] = A.zallocate[u32](ctx.alloc, nv::usize);
+    if (sel rd.err) { ret err[fail.Fail].err{fail.refused(rd.err)}; }
+    val defs: *u32 = rd.ok;
+    fin { A.deallocate[u32](ctx.alloc, defs, nv::usize); }
+    val rb: res[*bool, A.Error] = A.zallocate[bool](ctx.alloc, nv::usize);
+    if (sel rb.err) { ret err[fail.Fail].err{fail.refused(rb.err)}; }
+    val bad: *bool = rb.ok;
+    fin { A.deallocate[bool](ctx.alloc, bad, nv::usize); }
+
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *lang_mir.MirBlock = ?f.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+            if (liveness.instr_defines(mi) && mi.operands[0].vreg.n < nv) {
+                val d: u32 = mi.operands[0].vreg.n;
+                defs[d] = defs[d] + 1;
+                if (!coalesce.instr_is_reg_copy(tgt, mi) || mi.operands[1].kind != lang_mir.MIR_OP_IMM || lang_mir.instr_declassifies(mi)) {
+                    bad[d] = true;
+                }
+            }
+            if (mi.asm_block != nil) {
+                var k: u32 = 0;
+                for (k < mi.operand_count) {
+                    if (mi.operands[k].kind == lang_mir.MIR_OP_VREG && mi.operands[k].vreg.n < nv) { bad[mi.operands[k].vreg.n] = true; }
+                    k = k + 1;
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    var v: u32 = 0;
+    for (v < nv) {
+        if (defs[v] == 1 && !bad[v] && !ctx.no_remat[v] && remat_shape(ctx, v)) {
+            ctx.ranges[v].use_weight = ctx.ranges[v].use_weight / 2;
+        }
+        v = v + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a plain scalar whose storage no slot, piece or secret marks
+fun remat_shape(ctx: *regalloc_context.Context, v: u32) bool {
+    val f: *lang_mir.MirFunction = ctx.f;
+    if (f.vregs[v].vec_bytes != 0 || f.vregs[v].secret)           { ret false; }
+    if (regalloc_context.vreg_has_slot(ctx, lang_mir.vreg_id(v))) { ret false; }
+    if (ctx.piece_of[v] != lang_mir.MIR_VREG_NIL.n)               { ret false; }
+    ret f.vregs[v].home_key == lang_mir.MIR_VREG_NIL.n;
+}
+
+# the one instruction that defines v, when it is a register move of a
+# constant and nothing else stands in the way of building it again: no
+# inline assembly reads v, and v has the shape remat_shape reads
+fun remat_def(tgt: *lang_target.Binding, ctx: *regalloc_context.Context, v: u32, out_block: *u32, out_instr: *u32) bool {
+    val f: *lang_mir.MirFunction = ctx.f;
+    if (!remat_shape(ctx, v)) { ret false; }
+
+    var defs: u32 = 0;
+    var bi:   u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *lang_mir.MirBlock = ?f.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+            if (instr_writes_vreg(mi, v)) {
+                defs = defs + 1;
+                if (defs > 1)                                   { ret false; }
+                if (!coalesce.instr_is_reg_copy(tgt, mi))       { ret false; }
+                if (mi.operands[1].kind != lang_mir.MIR_OP_IMM) { ret false; }
+                if (lang_mir.instr_declassifies(mi))            { ret false; }
+                @out_block = bi;
+                @out_instr = ii;
+            }
+            or (mi.asm_block != nil && liveness.instr_reads_vreg(mi, lang_mir.vreg_id(v))) { ret false; }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret defs == 1;
+}
+
+# the debug bindings that name v once it is built at its reads: a compare's
+# operand and a binding of v itself become the constant v always held, so the
+# variable reads that value where v has no storage. the decision to
+# rebuild never reads a binding, so -g moves none
+fun rebind_remat(f: *lang_mir.MirFunction, v: u32, c: lang_mir.MirOperand) {
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *lang_mir.MirBlock = ?f.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+            var k:  u32                = 0;
+            for (k < mi.dbg_binding_count) {
+                val bind: *lang_mir.MirDbgBinding = ?mi.dbg_bindings[k];
+                if (bind.cmp_op != 0) {
+                    if (!bind.lhs_is_imm && bind.vreg == v) {
+                        bind.lhs_is_imm = true;
+                        bind.vreg       = lang_mir.MIR_VREG_NIL.n;
+                        bind.imm        = c.imm;
+                    }
+                    if (!bind.rhs_is_imm && bind.vreg2 == v) {
+                        bind.rhs_is_imm = true;
+                        bind.vreg2      = lang_mir.MIR_VREG_NIL.n;
+                        bind.imm2       = c.imm;
+                    }
+                }
+                or (bind.vreg == v) {
+                    bind.lhs_is_imm = true;
+                    bind.vreg       = lang_mir.MIR_VREG_NIL.n;
+                    bind.imm        = c.imm;
+                }
+                k = k + 1;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+}
+
+# each operand of mi that reads v where the target reads a constant in place
+# becomes the constant c: x86-64's scalar float arithmetic takes it as a pool
+# operand, so a rebuilt float constant costs its reader no load of its own
+fun fold_const_reads(tgt: *lang_target.Binding, mi: *lang_mir.MirInstr, v: u32, c: lang_mir.MirOperand) {
+    if (tgt.arch == nil || tgt.arch.reads_const == nil || mi.asm_block != nil) { ret; }
+    val has_def: bool = liveness.instr_defines(mi);
+    var k:       u32  = 0;
+    for (k < mi.operand_count) {
+        val op: *lang_mir.MirOperand = ?mi.operands[k];
+        if (op.kind == lang_mir.MIR_OP_VREG && op.vreg.n == v && !(has_def && k == 0) && tgt.arch.reads_const(mi, k)) {
+            val bank: lang_mir.OperandBank = op.required_bank;
+            @op              = c;
+            op.required_bank = bank;
+        }
+        k = k + 1;
+    }
+}
+
+fun rematerialize(tgt: *lang_target.Binding, ctx: *regalloc_context.Context, v: u32, db: u32, di: u32) err[fail.Fail] {
+    val f:   *lang_mir.MirFunction = ctx.f;
+    val def: lang_mir.MirInstr     = f.blocks[db].instrs[di];
+
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *lang_mir.MirBlock = ?f.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+            if (!liveness.instr_reads_vreg(mi, lang_mir.vreg_id(v))) {
+                ii = ii + 1;
+                cnt;
+            }
+            # a copy of v is a copy of the constant
+            if (coalesce.instr_is_reg_copy(tgt, mi) && mi.operands[1].kind == lang_mir.MIR_OP_VREG && mi.operands[1].vreg.n == v
+                && mi.width == def.width) {
+                val bank: lang_mir.OperandBank = mi.operands[1].required_bank;
+                mi.operands[1]               = def.operands[1];
+                mi.operands[1].required_bank = bank;
+                ii                           = ii + 1;
+                cnt;
+            }
+            # a reader that takes the constant in place reads it there
+            fold_const_reads(tgt, mi, v, def.operands[1]);
+            if (!liveness.instr_reads_vreg(mi, lang_mir.vreg_id(v))) {
+                ii = ii + 1;
+                cnt;
+            }
+            val pr: res[u32, fail.Fail] = lang_mir.vreg_add_like(ctx.alloc, f, v);
+            if (sel pr.err) { ret err[fail.Fail].err{pr.err}; }
+            val p:  u32            = pr.ok;
+            val gt: err[fail.Fail] = regalloc_context.vreg_tables_reserve(ctx, f.vreg_count);
+            if (sel gt.err) { ret gt; }
+            ctx.no_pieces[p] = true;
+            ctx.no_remat[p]  = true;
+            rename_reads(mi, v, p);
+
+            val ro: res[*lang_mir.MirOperand, A.Error] = A.allocate[lang_mir.MirOperand](ctx.alloc, 2::usize);
+            if (sel ro.err) { ret err[fail.Fail].err{fail.refused(ro.err)}; }
+            val ops: *lang_mir.MirOperand = ro.ok;
+            ops[0]      = def.operands[0];
+            ops[0].vreg = lang_mir.vreg_id(p);
+            ops[1]      = def.operands[1];
+            var mv: lang_mir.MirInstr = lang_mir.instr_like(?def, ops, 2);
+            mv.loc               = mi.loc;
+            mv.inline_site       = mi.inline_site;
+            mv.dbg_bindings      = nil;
+            mv.dbg_binding_count = 0;
+            val ri: err[fail.Fail] = lang_mir.instr_add_at(ctx.alloc, blk, ii, mv);
+            if (sel ri.err) {
+                A.deallocate[lang_mir.MirOperand](ctx.alloc, ops, 2::usize);
+                ret ri;
+            }
+            ii = ii + 2;
+        }
+        bi = bi + 1;
+    }
+
+    rebind_remat(f, v, def.operands[1]);
+
+    # the definition goes; v is read and written nowhere now. one that
+    # published bindings leaves a zero-byte use in its place that keeps them
+    val home: *lang_mir.MirBlock = ?f.blocks[db];
+    var ii:   u32                = 0;
+    for (ii < home.instr_count) {
+        val mi: *lang_mir.MirInstr = ?home.instrs[ii];
+        if (instr_writes_vreg(mi, v)) {
+            if (mi.operands != nil && mi.operand_count > 0) {
+                A.deallocate[lang_mir.MirOperand](ctx.alloc, mi.operands, mi.operand_count::usize);
+            }
+            if (mi.dbg_binding_count > 0) {
+                mi.opcode        = isa.ISA_USE::lang_mir.MirOpcode;
+                mi.operands      = nil;
+                mi.operand_count = 0;
+            }
+            or { lang_mir.instr_del(home, ii); }
+            brk;
+        }
+        ii = ii + 1;
+    }
+    ctx.spilled[v] = false;
+    ret err[fail.Fail].ok{};
+}
+
+# second chance for a spilled value: its reads inside one block, between
+# the calls and the writes of the value, form runs, and a run of two or more
+# reads that would each reload is carried by a piece, a fresh value loaded
+# once before the first read. the next round scans the piece as an interval
+# of its own, so it takes a register only where one is free; a piece the
+# next round spills gives its reads back to the value and that value earns
+# no further pieces. every value is offered pieces once, so the rounds end
+pub fun plan_pieces(tgt: *lang_target.Binding, ctx: *regalloc_context.Context) res[bool, fail.Fail] {
+    val f:       *lang_mir.MirFunction = ctx.f;
+    var changed: bool                  = false;
+
+    var v: u32 = 0;
+    for (v < f.vreg_count) {
+        if (ctx.piece_of[v] != lang_mir.MIR_VREG_NIL.n && ctx.spilled[v]) {
+            val dp: err[fail.Fail] = discard_piece(ctx, v);
+            if (sel dp.err) { ret res[bool, fail.Fail].err{dp.err}; }
+            changed = true;
+        }
+        v = v + 1;
+    }
+
+    val nv: u32 = f.vreg_count;
+    v = 0;
+    for (v < nv) {
+        if (ctx.spilled[v] && !ctx.no_pieces[v] && f.vregs[v].class == regalloc_context.REG_CLASS_GP && f.vregs[v].vec_bytes == 0) {
+            ctx.no_pieces[v] = true;
+            var bi: u32 = 0;
+            for (bi < f.block_count) {
+                val made: res[bool, fail.Fail] = make_pieces_in_block(tgt, ctx, ?f.blocks[bi], v);
+                if (sel made.err) { ret made; }
+                if (made.ok)      { changed = true; }
+                bi = bi + 1;
+            }
+        }
+        v = v + 1;
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+# a call ends a run; so does an instruction reading a physical register,
+# since the value it reads (a call's result) is held by nothing the scan
+# can see and a load placed before it would take that register
+fun instr_ends_run(mi: *lang_mir.MirInstr) bool {
+    if (mi.opcode == lang_mir.MIR_CALL || mi.asm_block != nil) { ret true; }
+    var k: u32 = 0;
+    for (k < mi.operand_count) {
+        val op: *lang_mir.MirOperand = ?mi.operands[k];
+        if (op.kind == lang_mir.MIR_OP_PREG && !(k == 0 && lang_mir.instr_defines_shape(mi))) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+fun instr_writes_vreg(mi: *lang_mir.MirInstr, v: u32) bool {
+    if (!liveness.instr_defines(mi)) { ret false; }
+    ret mi.operands[0].vreg.n == v;
+}
+
+# whether the instruction reads v, counting the reads that would reload:
+# the one a memory operand can take straight from the slot costs nothing
+fun reload_reads_of(tgt: *lang_target.Binding, ctx: *regalloc_context.Context, mi: *lang_mir.MirInstr, v: u32, counted: *u32) bool {
+    val has_def: bool = liveness.instr_defines(mi);
+    val slot_k:  u32  = rewrite.slot_source_index(tgt, ctx, mi, has_def);
+    var any:     bool = false;
+    var k:       u32  = 0;
+    for (k < mi.operand_count) {
+        val op: *lang_mir.MirOperand = ?mi.operands[k];
+        if (op.kind == lang_mir.MIR_OP_VREG && op.vreg.n == v && !(has_def && k == 0)) {
+            any = true;
+            if (k != slot_k) { @counted = @counted + 1; }
+        }
+        or (op.kind == lang_mir.MIR_OP_MEM && op.vreg.n == v) {
+            any      = true;
+            @counted = @counted + 1;
+        }
+        if (sel op.index.vreg) {
+            if (op.index.vreg.n == v) {
+                any      = true;
+                @counted = @counted + 1;
+            }
+        }
+        k = k + 1;
+    }
+    ret any;
+}
+
+fun rename_reads(mi: *lang_mir.MirInstr, v: u32, p: u32) {
+    val has_def: bool = liveness.instr_defines(mi);
+    var k:       u32  = 0;
+    for (k < mi.operand_count) {
+        val op: *lang_mir.MirOperand = ?mi.operands[k];
+        if (op.kind == lang_mir.MIR_OP_VREG && op.vreg.n == v && !(has_def && k == 0)) {
+            op.vreg = lang_mir.vreg_id(p);
+        }
+        or (op.kind == lang_mir.MIR_OP_MEM && op.vreg.n == v) {
+            op.vreg = lang_mir.vreg_id(p);
+        }
+        var index_is_v: bool = false;
+        if (sel op.index.vreg) { index_is_v = op.index.vreg.n == v; }
+        if (index_is_v)        { op.index = lang_mir.index_vreg(lang_mir.vreg_id(p)); }
+        k = k + 1;
+    }
+}
+
+# the block is walked from its end so an inserted load shifts only
+# instructions already placed; a run closes at a call, at a write of the
+# value (whose own reads see the older value and open the next run) and at
+# the block's start
+fun make_pieces_in_block(tgt: *lang_target.Binding, ctx: *regalloc_context.Context, blk: *lang_mir.MirBlock, v: u32) res[bool, fail.Fail] {
+    var made:    bool = false;
+    var head:    u32  = regalloc_context.RANGE_NIL;
+    var last:    u32  = regalloc_context.RANGE_NIL;
+    var counted: u32  = 0;
+    var ii:      u32  = blk.instr_count;
+    for (ii > 0) {
+        ii = ii - 1;
+        val mi:     *lang_mir.MirInstr = ?blk.instrs[ii];
+        val ends:   bool               = instr_ends_run(mi);
+        val writes: bool               = instr_writes_vreg(mi, v);
+        var here:   u32                = 0;
+        var reads:  bool               = false;
+        if (!ends) { reads = reload_reads_of(tgt, ctx, mi, v, ?here); }
+        if (reads && !writes) {
+            counted = counted + here;
+            head    = ii;
+            if (last == regalloc_context.RANGE_NIL) { last = ii; }
+        }
+        if (ends || writes || ii == 0) {
+            if (head != regalloc_context.RANGE_NIL && counted >= 2) {
+                val mp: err[fail.Fail] = make_piece(ctx, blk, v, head, last);
+                if (sel mp.err) { ret res[bool, fail.Fail].err{mp.err}; }
+                made = true;
+            }
+            head    = regalloc_context.RANGE_NIL;
+            last    = regalloc_context.RANGE_NIL;
+            counted = 0;
+            if (writes && reads) {
+                counted = here;
+                head    = ii;
+                last    = ii;
+                if (ii == 0 && counted >= 2) {
+                    val mp0: err[fail.Fail] = make_piece(ctx, blk, v, 0, 0);
+                    if (sel mp0.err) { ret res[bool, fail.Fail].err{mp0.err}; }
+                    made = true;
+                }
+            }
+        }
+    }
+    ret res[bool, fail.Fail].ok{made};
+}
+
+fun make_piece(ctx: *regalloc_context.Context, blk: *lang_mir.MirBlock, v: u32, first: u32, last: u32) err[fail.Fail] {
+    val f:  *lang_mir.MirFunction = ctx.f;
+    val pr: res[u32, fail.Fail]   = lang_mir.vreg_add_like(ctx.alloc, f, v);
+    if (sel pr.err) { ret err[fail.Fail].err{pr.err}; }
+    val p:  u32            = pr.ok;
+    val gt: err[fail.Fail] = regalloc_context.vreg_tables_reserve(ctx, f.vreg_count);
+    if (sel gt.err) { ret gt; }
+    ctx.piece_of[p]  = v;
+    ctx.no_pieces[p] = true;
+
+    var ii: u32 = first;
+    for (ii <= last) {
+        rename_reads(?blk.instrs[ii], v, p);
+        ii = ii + 1;
+    }
+
+    val ro: res[*lang_mir.MirOperand, A.Error] = A.allocate[lang_mir.MirOperand](ctx.alloc, 2::usize);
+    if (sel ro.err) { ret err[fail.Fail].err{fail.refused(ro.err)}; }
+    val ops: *lang_mir.MirOperand = ro.ok;
+    ops[0] = lang_mir.op_vreg(lang_mir.vreg_id(p));
+    ops[1] = lang_mir.op_vreg(lang_mir.vreg_id(v));
+    val at: *lang_mir.MirInstr = ?blk.instrs[first];
+    var mv: lang_mir.MirInstr  = lang_mir.instr(lang_mir.MIR_MOV, ops, 2, ctx.spill_width, ctx.spill_width);
+    mv.loc         = at.loc;
+    mv.inline_site = at.inline_site;
+    val cb: err[fail.Fail] = isa_rules.capture_operand_banks(f, ?mv);
+    if (sel cb.err) {
+        A.deallocate[lang_mir.MirOperand](ctx.alloc, ops, 2::usize);
+        ret cb;
+    }
+    ret lang_mir.instr_add_at(ctx.alloc, blk, first, mv);
+}
+
+# the piece's reads go back to the value it carried and its load goes away;
+# the vreg stays, unused, since ids are positions
+fun discard_piece(ctx: *regalloc_context.Context, p: u32) err[fail.Fail] {
+    val f: *lang_mir.MirFunction = ctx.f;
+    val v: u32                   = ctx.piece_of[p];
+    ctx.piece_of[p]  = lang_mir.MIR_VREG_NIL.n;
+    ctx.spilled[p]   = false;
+    ctx.no_pieces[v] = true;
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *lang_mir.MirBlock = ?f.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+            if (mi.opcode == lang_mir.MIR_MOV && mi.operand_count == 2 && mi.asm_block == nil
+                && mi.operands[0].kind == lang_mir.MIR_OP_VREG && mi.operands[0].vreg.n == p
+                && mi.operands[1].kind == lang_mir.MIR_OP_VREG && mi.operands[1].vreg.n == v) {
+                A.deallocate[lang_mir.MirOperand](ctx.alloc, mi.operands, 2::usize);
+                lang_mir.instr_del(blk, ii);
+                cnt;
+            }
+            rename_reads(mi, p, v);
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun class_width(ctx: *regalloc_context.Context, lr: *regalloc_context.LiveRange) u32 {
+    if (lr.reg_class != regalloc_context.REG_CLASS_GP) {
+        if (lr.vreg < ctx.f.vreg_count && ctx.f.vregs[lr.vreg].vec_bytes > 16) { ret ctx.f.vregs[lr.vreg].vec_bytes::u32; }
+        ret 16;
+    }
+    ret ctx.spill_width::u32;
+}
+
+fun spill_slot_align(ctx: *regalloc_context.Context, value_id: u32) u32 {
+    if (value_id < ctx.f.vreg_count && ctx.f.vregs[value_id].vec_bytes != 0) { ret ctx.f.vregs[value_id].vec_bytes::u32; }
+    ret ctx.spill_width::u32;
+}
+
+fun add_spill_slot(ctx: *regalloc_context.Context, value_id: u32, size: u32) res[i32, fail.Fail] {
+    val frame: *lang_mir.MirFrame = ?ctx.f.frame;
+    if (frame.slot_count >= frame.slot_cap) {
+        val r: err[A.Error] = growth.reserve[lang_mir.MirSlot](ctx.alloc, ?frame.slots, ?frame.slot_cap, frame.slot_count::usize + 1);
+        if (sel r.err) { ret res[i32, fail.Fail].err{fail.refused(r.err)}; }
+    }
+    val si:      u32                          = frame.slot_count;
+    val si_fits: res[i32, lang_checked.Cause] = lang_checked.usize_to_i32(si::usize);
+    if (sel si_fits.err) {
+        ret res[i32, fail.Fail].err{fail.message("regalloc: spill slot index exceeds the i32 limit")};
+    }
+    frame.slots[si].value  = value_id;
+    frame.slots[si].kind   = lang_mir.SLOT_SPILL;
+    frame.slots[si].offset = 0;
+    frame.slots[si].size   = size;
+    frame.slots[si].align  = spill_slot_align(ctx, value_id);
+    frame.slot_count       = frame.slot_count + 1;
+    ret res[i32, fail.Fail].ok{si_fits.ok};
+}
+
+pub fun across_calls(tgt: *lang_target.Binding, ctx: *regalloc_context.Context) err[fail.Fail] {
+    var pos: u32 = 0;
+    for (pos < ctx.flat_count) {
+        if (!ctx.flat[pos].is_call) {
+            pos = pos + 1;
+            cnt;
+        }
+        var asm_gp: u32  = 0;
+        var asm_fp: u32  = 0;
+        val is_asm: bool = rewrite.asm_clobbers_at(tgt, ctx, pos, ?asm_gp, ?asm_fp);
+        var v:      u32  = 0;
+        for (v < ctx.f.vreg_count) {
+            val mv: *lang_mir.MirVReg = ?ctx.f.vregs[v];
+            if (lang_mir.preg_is_nil(mv.assigned)) {
+                v = v + 1;
+                cnt;
+            }
+            if (ctx.spilled[v]) {
+                v = v + 1;
+                cnt;
+            }
+            val lr: *regalloc_context.LiveRange = ?ctx.ranges[v];
+            if (!liveness.seg_interior(ctx, lr, pos::i64)) {
+                v = v + 1;
+                cnt;
+            }
+
+            var must_spill: bool = false;
+            if (lr.reg_class != regalloc_context.REG_CLASS_GP) {
+                val xidx: u32 = isa_inst.regid_index(lang_mir.preg_regid(mv.assigned))::u32;
+                if (xidx >= ctx.fp_count || !ctx.fp_callee_saved[xidx]) {
+                    must_spill = true;
+                }
+                or (mv.vec_bytes::u32 > tgt.abi.fp_callee_saved_bytes) {
+                    must_spill = true;
+                }
+                or (is_asm && (asm_fp & (1::u32 << xidx)) != 0) {
+                    must_spill = true;
+                }
+            }
+            or (isa_inst.regid_index(lang_mir.preg_regid(mv.assigned))::u32 < ctx.gp_count
+                && !ctx.callee_saved[isa_inst.regid_index(lang_mir.preg_regid(mv.assigned))::u32]) {
+                must_spill = true;
+            }
+            or (is_asm && isa_inst.regid_index(lang_mir.preg_regid(mv.assigned))::u32 < ctx.gp_count
+                && (asm_gp & (1::u32 << isa_inst.regid_index(lang_mir.preg_regid(mv.assigned))::u32)) != 0) {
+                must_spill = true;
+            }
+            if (must_spill) {
+                val sr: err[fail.Fail] = regalloc_context.spill_vreg(ctx, lang_mir.vreg_id(v));
+                if (sel sr.err) { ret sr; }
+            }
+            v = v + 1;
+        }
+        pos = pos + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# growth past the u32 capacity is refused before any allocation, and an index
+# past the i32 limit is refused
+test add_spill_slot__refuses_counts_past_the_limits {
+    var t:    T.Testing;
+    val made: err[A.Error] = T.make(?t);
+    if (sel made.err) { ret 4; }
+    fin { T.dnit(?t); }
+    T.fail_from_ordinal(?t, 1);
+    var f: lang_mir.MirFunction;
+    f.frame.slots      = nil;
+    f.frame.slot_count = 0xFFFFFFFF;
+    f.frame.slot_cap   = 0xFFFFFFFF;
+    var ctx: regalloc_context.Context;
+    ctx.alloc = T.allocator_of(?t);
+    ctx.f     = ?f;
+    val grown: res[i32, fail.Fail] = add_spill_slot(?ctx, 0, 8);
+    if (!sel grown.err)           { ret 1; }
+    if (T.attempt_count(?t) != 0) { ret 2; }
+    f.frame.slot_count = 0x80000000;
+    f.frame.slot_cap   = 0x80000001;
+    val indexed: res[i32, fail.Fail] = add_spill_slot(?ctx, 0, 8);
+    if (!sel indexed.err) { ret 3; }
+    ret 0;
+}
+
+test make_pieces_in_block__a_run_of_reads_is_carried_by_one_load {
+    var reg: lang_target.TargetRegistry;
+    var tgt: lang_target.Binding;
+    if (!regalloc_context.t_target(?reg, ?tgt)) { ret 1; }
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var f:     lang_mir.MirFunction;
+    var b:     lang_mir.MirBlock;
+    var ctx:   regalloc_context.Context;
+    var slots: [8]bool;
+    var i:     u32 = 0;
+    for (i < 8) {
+        slots[i] = false;
+        i        = i + 1;
+    }
+    val tc: err[fail.Fail] = regalloc_context.t_piece_block(?alloc, ?f, ?b, ?ctx, ?slots[0]);
+    if (sel tc.err) { ret 2; }
+    fin { regalloc_context.tables_dnit(?ctx); }
+
+    val made: res[bool, fail.Fail] = make_pieces_in_block(?tgt, ?ctx, ?b, 0);
+    if (sel made.err)         { ret 3; }
+    if (!made.ok)             { ret 4; }
+    if (f.vreg_count != 7)    { ret 5; }
+    if (b.instr_count != 7)   { ret 6; }
+    if (ctx.piece_of[6] != 0) { ret 7; }
+    if (!ctx.no_pieces[6])    { ret 8; }
+    # the load sits before the first read and reads the spilled value
+    val ld: *lang_mir.MirInstr = ?b.instrs[0];
+    if (ld.opcode != lang_mir.MIR_MOV || ld.operand_count != 2)                    { ret 9; }
+    if (ld.operands[0].kind != lang_mir.MIR_OP_VREG || ld.operands[0].vreg.n != 6) { ret 10; }
+    if (ld.operands[1].kind != lang_mir.MIR_OP_VREG || ld.operands[1].vreg.n != 0) { ret 11; }
+    if (ld.width != ctx.spill_width)                                               { ret 12; }
+    # the run's reads name the piece, the read past the call keeps the value
+    if (!regalloc_context.t_reads_base(?b.instrs[1], 6))                            { ret 13; }
+    if (!regalloc_context.t_reads_base(?b.instrs[2], 6))                            { ret 14; }
+    if (b.instrs[3].opcode != lang_mir.MIR_CALL)                                    { ret 15; }
+    if (!regalloc_context.t_reads_base(?b.instrs[4], 0))                            { ret 16; }
+    if (b.instrs[5].operands[0].vreg.n != 0 || b.instrs[6].operands[1].vreg.n != 0) { ret 17; }
+    # a piece the next round spills is discarded: reads return, the load goes
+    ctx.spilled[6] = true;
+    val dp: err[fail.Fail] = discard_piece(?ctx, 6);
+    if (sel dp.err)                                      { ret 18; }
+    if (b.instr_count != 6)                              { ret 19; }
+    if (!regalloc_context.t_reads_base(?b.instrs[0], 0)) { ret 20; }
+    if (!regalloc_context.t_reads_base(?b.instrs[1], 0)) { ret 21; }
+    if (b.instrs[2].opcode != lang_mir.MIR_CALL)         { ret 22; }
+    if (ctx.spilled[6] || !ctx.no_pieces[0])             { ret 23; }
+    if (ctx.piece_of[6] != lang_mir.MIR_VREG_NIL.n)      { ret 24; }
+    ret 0;
+}
+
+# a constant built once and spilled is built again at each read: its
+# definition goes, a copy of it copies the constant, and every other read
+# reads a fresh value defined by a copy of the definition just before it, on
+# either side of a call. debug bindings move no decision: a compare binding
+# that reads the constant reads it as an immediate, and a binding of the
+# value itself closes there
+#[testing]
+fun t_remat_case(bound: bool) i32 {
+    var reg: lang_target.TargetRegistry;
+    var tgt: lang_target.Binding;
+    if (!regalloc_context.t_target(?reg, ?tgt)) { ret 1; }
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var f:     lang_mir.MirFunction;
+    var b:     lang_mir.MirBlock;
+    var ctx:   regalloc_context.Context;
+    var slots: [8]bool;
+    var i:     u32 = 0;
+    for (i < 8) {
+        slots[i] = false;
+        i        = i + 1;
+    }
+    lang_mir.vregs_gp(?alloc, ?f, 4);
+    var h: u32 = 0;
+    for (h < 4) {
+        f.vregs[h].home_key = lang_mir.MIR_VREG_NIL.n;
+        h                   = h + 1;
+    }
+    lang_mir.instrs_blank(?alloc, ?b, 6);
+    val c: lang_mir.MirOperand = lang_mir.op_imm(0x123456789A);
+    regalloc_context.t_mov(?alloc, ?b, 0, lang_mir.op_vreg(lang_mir.vreg_id(0)), c);
+    regalloc_context.t_mov(?alloc, ?b, 1, lang_mir.op_vreg(lang_mir.vreg_id(1)), lang_mir.op_mem_value(lang_mir.vreg_id(2), 0));
+    regalloc_context.t_op(?alloc, ?b, 2, lang_mir.MIR_ADD, lang_mir.op_vreg(lang_mir.vreg_id(1)), lang_mir.op_vreg(lang_mir.vreg_id(1)), lang_mir.op_vreg(lang_mir.vreg_id(0)), 3);
+    regalloc_context.t_mov(?alloc, ?b, 3, lang_mir.op_vreg(lang_mir.vreg_id(3)), lang_mir.op_vreg(lang_mir.vreg_id(0)));
+    b.instrs[0].opcode        = x64.MOV::u32;
+    b.instrs[3].opcode        = x64.MOV::u32;
+    b.instrs[4].opcode        = lang_mir.MIR_CALL;
+    b.instrs[4].operand_count = 0;
+    b.instrs[4].operands      = nil;
+    regalloc_context.t_op(?alloc, ?b, 5, lang_mir.MIR_ADD, lang_mir.op_vreg(lang_mir.vreg_id(1)), lang_mir.op_vreg(lang_mir.vreg_id(1)), lang_mir.op_vreg(lang_mir.vreg_id(0)), 3);
+    var bindings: [2]lang_mir.MirDbgBinding;
+    bindings[0].cmp_op     = 0;
+    bindings[0].lhs_is_imm = false;
+    bindings[0].vreg       = 0;
+    bindings[0].vreg2      = lang_mir.MIR_VREG_NIL.n;
+    bindings[1].cmp_op     = lang_mir.MIR_SEL_CBR_LT_U;
+    bindings[1].lhs_is_imm = false;
+    bindings[1].vreg       = 1;
+    bindings[1].rhs_is_imm = false;
+    bindings[1].vreg2      = 0;
+    if (bound) {
+        b.instrs[1].dbg_bindings      = ?bindings[0];
+        b.instrs[1].dbg_binding_count = 2;
+    }
+    f.blocks      = ?b;
+    f.block_count = 1;
+    f.block_cap   = 1;
+    regalloc_context.t_ctx(?ctx, ?alloc, ?f, ?slots[0]);
+    val gt: err[fail.Fail] = regalloc_context.vreg_tables_reserve(?ctx, 4);
+    if (sel gt.err) { ret 2; }
+    fin { regalloc_context.tables_dnit(?ctx); }
+    ctx.spilled[0] = true;
+
+    val rm: res[bool, fail.Fail] = plan_remat(?tgt, ?ctx);
+    if (sel rm.err)               { ret 3; }
+    if (!rm.ok || ctx.spilled[0]) { ret 5; }
+    if (bound) {
+        if (!bindings[0].lhs_is_imm || bindings[0].imm != c.imm || bindings[0].vreg != lang_mir.MIR_VREG_NIL.n) { ret 14; }
+        if (!bindings[1].rhs_is_imm || bindings[1].imm2 != c.imm || bindings[1].vreg != 1)                      { ret 15; }
+    }
+    if (b.instr_count != 7 || f.vreg_count != 6) { ret 6; }
+    # the load, then the add reading the first fresh value
+    if (b.instrs[0].operands[1].kind != lang_mir.MIR_OP_MEM)                          { ret 7; }
+    if (b.instrs[1].operands[0].vreg.n != 4 || b.instrs[1].operands[1].imm != c.imm)  { ret 8; }
+    if (b.instrs[2].operands[2].vreg.n != 4 || !ctx.no_remat[4] || !ctx.no_pieces[4]) { ret 9; }
+    # the copy copies the constant
+    if (b.instrs[3].operands[1].kind != lang_mir.MIR_OP_IMM || b.instrs[3].operands[1].imm != c.imm) { ret 10; }
+    if (b.instrs[4].opcode != lang_mir.MIR_CALL)                                                     { ret 11; }
+    if (b.instrs[5].operands[0].vreg.n != 5 || b.instrs[6].operands[2].vreg.n != 5)                  { ret 12; }
+    var k: u32 = 0;
+    for (k < b.instr_count) {
+        if (liveness.instr_reads_vreg(?b.instrs[k], lang_mir.vreg_id(0)) || instr_writes_vreg(?b.instrs[k], 0)) { ret 13; }
+        k = k + 1;
+    }
+    ret 0;
+}
+
+test plan_remat__a_spilled_constant_is_built_at_each_read {
+    if (t_remat_case(false) != 0) { ret 1; }
+    if (t_remat_case(true) != 0)  { ret 2; }
+    ret 0;
+}
+
+# a float constant x86-64 reads in place is folded into its reader rather
+# than built into a fresh value: the multiply's second source takes the pool
+# operand, and the subtract's first source, which it does not, reads a fresh
+# value
+test plan_remat__a_float_constant_folds_where_the_reader_takes_it {
+    var reg: lang_target.TargetRegistry;
+    var tgt: lang_target.Binding;
+    if (!regalloc_context.t_target(?reg, ?tgt)) { ret 1; }
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var f:     lang_mir.MirFunction;
+    var b:     lang_mir.MirBlock;
+    var ctx:   regalloc_context.Context;
+    var slots: [8]bool;
+    var i:     u32 = 0;
+    for (i < 8) {
+        slots[i] = false;
+        i        = i + 1;
+    }
+    lang_mir.vregs_gp(?alloc, ?f, 3);
+    var h: u32 = 0;
+    for (h < 3) {
+        f.vregs[h].home_key = lang_mir.MIR_VREG_NIL.n;
+        h                   = h + 1;
+    }
+    lang_mir.instrs_blank(?alloc, ?b, 3);
+    val c: lang_mir.MirOperand = lang_mir.op_imm(0x3FF8000000000000);
+    regalloc_context.t_mov(?alloc, ?b, 0, lang_mir.op_vreg(lang_mir.vreg_id(0)), c);
+    b.instrs[0].opcode = x64.MOV::u32;
+    regalloc_context.t_op(?alloc, ?b, 1, lang_mir.MIR_FMUL, lang_mir.op_vreg(lang_mir.vreg_id(1)), lang_mir.op_vreg(lang_mir.vreg_id(2)), lang_mir.op_vreg(lang_mir.vreg_id(0)), 3);
+    regalloc_context.t_op(?alloc, ?b, 2, lang_mir.MIR_FSUB, lang_mir.op_vreg(lang_mir.vreg_id(1)), lang_mir.op_vreg(lang_mir.vreg_id(0)), lang_mir.op_vreg(lang_mir.vreg_id(1)), 3);
+    f.blocks      = ?b;
+    f.block_count = 1;
+    f.block_cap   = 1;
+    regalloc_context.t_ctx(?ctx, ?alloc, ?f, ?slots[0]);
+    val gt: err[fail.Fail] = regalloc_context.vreg_tables_reserve(?ctx, 3);
+    if (sel gt.err) { ret 2; }
+    fin { regalloc_context.tables_dnit(?ctx); }
+    ctx.spilled[0] = true;
+
+    val rm: res[bool, fail.Fail] = plan_remat(?tgt, ?ctx);
+    if (sel rm.err) { ret 3; }
+    if (!rm.ok)     { ret 3; }
+    # the multiply, then the fresh value and the subtract reading it
+    if (b.instr_count != 3 || f.vreg_count != 4) { ret 4; }
+    if (b.instrs[0].opcode != lang_mir.MIR_FMUL || b.instrs[0].operands[2].kind != lang_mir.MIR_OP_IMM
+        || b.instrs[0].operands[2].imm != c.imm) { ret 5; }
+    if (b.instrs[1].operands[0].vreg.n != 3 || b.instrs[1].operands[1].imm != c.imm)    { ret 6; }
+    if (b.instrs[2].opcode != lang_mir.MIR_FSUB || b.instrs[2].operands[1].vreg.n != 3) { ret 7; }
+    ret 0;
+}
+
+# a single read, a read the instruction takes from the slot as a memory
+# operand, and a value the pieces already served earn no piece
+test make_pieces_in_block__one_read_earns_no_piece {
+    var reg: lang_target.TargetRegistry;
+    var tgt: lang_target.Binding;
+    if (!regalloc_context.t_target(?reg, ?tgt)) { ret 1; }
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var f:     lang_mir.MirFunction;
+    var b:     lang_mir.MirBlock;
+    var ctx:   regalloc_context.Context;
+    var slots: [8]bool;
+    var i:     u32 = 0;
+    for (i < 8) {
+        slots[i] = false;
+        i        = i + 1;
+    }
+    val tc: err[fail.Fail] = regalloc_context.t_piece_block(?alloc, ?f, ?b, ?ctx, ?slots[0]);
+    if (sel tc.err) { ret 2; }
+    fin { regalloc_context.tables_dnit(?ctx); }
+    # value 3 is read once by a copy the rewrite loads straight from its slot
+    ctx.spilled[3] = true;
+    val made: res[bool, fail.Fail] = make_pieces_in_block(?tgt, ?ctx, ?b, 3);
+    if (sel made.err)       { ret 3; }
+    if (made.ok)            { ret 4; }
+    if (b.instr_count != 6) { ret 5; }
+    ret 0;
+}

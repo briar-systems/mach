@@ -1067,12 +1067,6 @@ the compute width
 pub fun reads_slot_operand(m: *Machine, bytes: u32) bool;
 ```
 
-## fun models_lifetime_holes
-
-```mach
-pub fun models_lifetime_holes(m: *Machine) bool;
-```
-
 ## fun shift_count_mod_width
 
 ```mach
