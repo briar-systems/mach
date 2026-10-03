@@ -189,9 +189,8 @@ pub rec LinkDef;
 one `[link.<name>]` table as parsed. the four arrays are owned by the manifest
 and freed by `dnit`
 
-name: the table key; a portable identifier
+name: the table key: the entry's identity, which a `#[library]` attribution names
 source: the required `source` key
-library: the `library` key; defaults to `name` when absent. an empty string is an error
 lib_name: the `name` key, required for system and framework sources and rejected
                     for local; STR_NIL for local
 path: the `path` key, required for a local source and rejected otherwise; a
