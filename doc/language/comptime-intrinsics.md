@@ -1,7 +1,7 @@
 # Intrinsics
 
 Intrinsics are compiler-shipped comptime functions. They have the same
-syntactic shape as user-defined function calls (`$name(args)`), but their
+syntactic shape as user-defined function calls (`$<name>(args)`), but their
 names are reserved and their implementations are built into the compiler.
 
 The set is closed; adding a new intrinsic requires a compiler change.
@@ -172,8 +172,8 @@ $is_record(T)           # T is a record (or an instance of one)
 $is_union(T)            # T is a union  (or an instance of one)
 $is_tag(T)              # T is a tagged value (or an instance of one)
 $is_pointer(T)          # T is a reference: the raw `ptr` or a typed `*U`
-$is_integer(T)          # T is an integer: i8..i64, u8..u64
-$is_float(T)            # T is a float: f32 or f64
+$is_integer(T)          # T is an integer primitive, signed or unsigned, of any width
+$is_float(T)            # T is a float primitive, f16, f32 or f64
 $is_secret(T)           # T is `^`-qualified at the outermost level
 $holds_secret(T)        # any byte of T is secret
 ```
@@ -355,10 +355,10 @@ supports does: a record cannot contain itself by value, so descending on `$is_re
 reaches a finite set of types. A reference graph has no such property —
 `rec Grow[T] { p: *Grow[*T]; n: i64; }` is legal and has unboundedly many distinct
 instances, and a walk that follows `p` generates `Grow[i64]`, `Grow[*i64]`,
-`Grow[**i64]` without end. The compiler's generic-instantiation guard turns that into
-a diagnostic naming the derivation chain rather than a hang, but that is a backstop,
-not a termination story. A library that walks references owes its callers one of its
-own, which is why `std.derive` refuses reference fields by default and offers
+`Grow[**i64]` without end. Such a walk is a growing cycle of instances behind a comptime
+gate, and instantiation has no step limit (see [fun.md](fun.md#instantiation-ends-or-is-refused)),
+so it runs until memory is refused, shown under `-v` as it grows. A library that walks
+references owes its callers a termination story of its own, which is why `std.derive` refuses reference fields by default and offers
 following as a separately named member.
 
 ## `$type_name(T)` — a type's spelling

@@ -11,10 +11,10 @@ this channel.
 | Shape | Meaning | Direction |
 |---|---|---|
 | `$mach.*` / `$project.*` / `$bin.*` | Rooted compiler-owned read | compiler → developer |
-| `$sym(args)` | Comptime function call (intrinsic) | call |
+| `$<name>(args)` | Comptime function call (intrinsic) | call |
 | `$if`, `$or` | Comptime control flow | structural |
 
-> Per-declaration codegen attributes (symbol rename, library pin, inline,
+> Per-declaration codegen properties (symbol rename, library pin, inline,
 > align, section) are written as **`#[...]` decorators**, not `$`-comptime
 > shapes — see [decorators.md](decorators.md). A comptime directive takes no
 > `=`; a stray one is a parse error at the directive's terminator.
@@ -24,7 +24,7 @@ The parser distinguishes these by structure:
 - `$<root>.<path>`, where `<root>` is one of the reserved roots `mach`,
   `project`, `bin` — a read into a compiler-owned tree. The roots are reserved
   at the top of `$`; user symbols cannot collide with them.
-- `$ident(args)` — comptime call; the closed compiler-intrinsic set lives
+- `$<name>(args)` — comptime call; the closed compiler-intrinsic set lives
   here.
 - `$if` / `$or` — comptime branches, structurally distinct from runtime
   `if` / `or`.

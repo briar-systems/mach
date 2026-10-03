@@ -9,7 +9,7 @@ pub fun run(tgt: *binding.Binding, m: *lang_mir.MirModule) err[fail.Fail];
 ## fun prune
 
 ```mach
-pub fun prune(m: *lang_mir.MirModule) err[fail.Fail];
+pub fun prune(tgt: *binding.Binding, m: *lang_mir.MirModule) err[fail.Fail];
 ```
 
 before selection, a frame slot address no instruction reads is dropped and a

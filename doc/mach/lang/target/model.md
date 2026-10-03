@@ -28,6 +28,14 @@ pub val ENDIAN_BIG:    Endian = 1
 pub rec Register;
 ```
 
+## rec RegFile
+
+```mach
+pub rec RegFile;
+```
+
+a register file a calling convention declares, its registers in order
+
 ## def RegClassKind
 
 ```mach
@@ -1065,12 +1073,6 @@ the compute width
 
 ```mach
 pub fun reads_slot_operand(m: *Machine, bytes: u32) bool;
-```
-
-## fun models_lifetime_holes
-
-```mach
-pub fun models_lifetime_holes(m: *Machine) bool;
 ```
 
 ## fun shift_count_mod_width

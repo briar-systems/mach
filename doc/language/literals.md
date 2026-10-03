@@ -21,9 +21,10 @@ such as `10000000000000000000::f64`, is refused, and a suffix
 
 ### Typed suffixes
 
-A suffix is the spelling of the primitive type the literal has: `u8`,
-`u16`, `u32`, `u64`, `u128`, `i8`, `i16`, `i32`, `i64`, `i128` on an
-integer literal, and `f16`, `f32` or `f64` on a float literal. It works with every radix
+A suffix is the spelling of the primitive type the literal has: an integer
+primitive on an integer literal and a float primitive on a float literal (see
+[types.md](types.md#primitive-scalars), and the `int-suffix` and `float-suffix`
+productions of [grammar.md](grammar.md#integer-literals)). It works with every radix
 and with digit separators (`0xFFu8`, `0b1010u16`, `1_000_000u32`, `1.5e2f32`, `0.25f16`).
 
 A suffixed literal *is* that type, in the same way a variable of that type

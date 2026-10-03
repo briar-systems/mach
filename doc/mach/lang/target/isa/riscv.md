@@ -1,16 +1,12 @@
 # mach.lang.target.isa.riscv
 
-## val HAS_FLOAT
-
-```mach
-pub val HAS_FLOAT: bool = true
-```
-
 ## val X0
 
 ```mach
 pub val X0:  i32 = 0
 ```
+
+hardware register numbers; a register id is regid_make of one
 
 ## val X1
 
@@ -112,18 +108,6 @@ pub val F30: i32 = 30
 
 ```mach
 pub val F31: i32 = 31
-```
-
-## val GPR_COUNT
-
-```mach
-pub val GPR_COUNT: i32 = 32
-```
-
-## val FPR_COUNT
-
-```mach
-pub val FPR_COUNT: i32 = 30
 ```
 
 ## def Opcode

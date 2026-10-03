@@ -1,142 +1,18 @@
 # mach.lang.fe.sema.context
 
-## rec SemaResult
-
-```mach
-pub rec SemaResult;
-```
-
-## val EMBED_LEN_NONE
-
-```mach
-pub val EMBED_LEN_NONE: u64 = 0xFFFFFFFFFFFFFFFF
-```
-
-## val EMBED_LEN_FAILED
-
-```mach
-pub val EMBED_LEN_FAILED: u64 = 0xFFFFFFFFFFFFFFFE
-```
-
-## rec TypeExport
-
-```mach
-pub rec TypeExport;
-```
-
-## rec ModuleSema
-
-```mach
-pub rec ModuleSema;
-```
-
-exports are append-only, and `index` maps (origin, canon) to the first export with
-that key over the first `indexed` of them
-
-## fun module_sema_init
-
-```mach
-pub fun module_sema_init(a: *A.Allocator, path: intern.StrId, module: session.ModuleId) ModuleSema;
-```
-
-## fun module_sema_dnit
-
-```mach
-pub fun module_sema_dnit(module: *ModuleSema);
-```
-
-## def DefinitionPhase
-
-```mach
-pub def DefinitionPhase: u8
-```
-
-## val DEFINITION_RESOLVED
-
-```mach
-pub val DEFINITION_RESOLVED: DefinitionPhase = 1
-```
-
-## val DEFINITION_TYPED
-
-```mach
-pub val DEFINITION_TYPED:    DefinitionPhase = 2
-```
-
-## rec Definition
-
-```mach
-pub rec Definition;
-```
-
-a module's definition as far as a phase acquired it
-
-ctx: the scope its constants are read in, once typed
-attributes: a scope that reads the load's records of its attributes, at every phase
-
-## rec DefinitionReader
-
-```mach
-pub rec DefinitionReader;
-```
-
-## fun reader_init
-
-```mach
-pub fun reader_init(ctx: ptr, read: fun(ptr, session.ModuleId, DefinitionPhase) res[Definition, fail.Fail],
-a: *A.Allocator) DefinitionReader;
-```
-
-a reader lives for one computation, which acquires the same current definition once per origin
-
-## fun reader_dnit
-
-```mach
-pub fun reader_dnit(reader: *DefinitionReader);
-```
-
-## rec DefinedSymbol
-
-```mach
-pub rec DefinedSymbol;
-```
-
-## fun acquire_definition
-
-```mach
-pub fun acquire_definition(reader: *DefinitionReader, origin: session.ModuleId,
-phase: DefinitionPhase) res[Definition, fail.Fail];
-```
-
-## fun acquire_symbol
-
-```mach
-pub fun acquire_symbol(reader: *DefinitionReader, requested: *resolve.Symbol,
-phase: DefinitionPhase) res[DefinedSymbol, fail.Fail];
-```
-
 ## fun imported_definition
 
 ```mach
 pub fun imported_definition(sc: *SemaContext, sym: *resolve.Symbol,
-phase: DefinitionPhase) res[DefinedSymbol, fail.Fail];
+phase: sema_product.DefinitionPhase) res[sema_product.DefinedSymbol, fail.Fail];
 ```
 
 ## fun symbol_definition
 
 ```mach
 pub fun symbol_definition(sc: *SemaContext, sym: *resolve.Symbol,
-phase: DefinitionPhase) res[DefinedSymbol, fail.Fail];
+phase: sema_product.DefinitionPhase) res[sema_product.DefinedSymbol, fail.Fail];
 ```
-
-## rec SemaDeps
-
-```mach
-pub rec SemaDeps;
-```
-
-the imported surfaces are borrowed: the driver owns each one and shares it
-between every importer in a pass
 
 ## fwd type.FieldEntry
 
@@ -154,28 +30,10 @@ fwd type.FieldTable
 
 forwards [`mach.lang.type.field.Table`](../../type/field.md#rec-table)
 
-## rec InstReq
-
-```mach
-pub rec InstReq;
-```
-
 ## val INST_NONE
 
 ```mach
-pub val INST_NONE: u32 = 4294967295
-```
-
-## val RECORD_OK
-
-```mach
-pub val RECORD_OK:          u8 = 0
-```
-
-## val RECORD_LIMIT_DEPTH
-
-```mach
-pub val RECORD_LIMIT_DEPTH: u8 = 1
+pub val INST_NONE: u32 = sema_instance.NONE
 ```
 
 ## rec InstWorklist
@@ -184,23 +42,8 @@ pub val RECORD_LIMIT_DEPTH: u8 = 1
 pub rec InstWorklist;
 ```
 
-## val SECRET_UNKNOWN
-
-```mach
-pub val SECRET_UNKNOWN: u8 = 0
-```
-
-## val SECRET_ABSENT
-
-```mach
-pub val SECRET_ABSENT:  u8 = 1
-```
-
-## val SECRET_PRESENT
-
-```mach
-pub val SECRET_PRESENT: u8 = 2
-```
+the instances a module's typing asks for, typed in the order they were first asked for;
+the set is the module's product, published with its result
 
 ## val TYPE_MEMO_NONE
 
@@ -268,11 +111,110 @@ pub rec Offer;
 a fix an error offers: `close` at `tail`, and with `open` set, `open` at
 `head` too, as one fix labelled `label`
 
+## rec Typing
+
+```mach
+pub rec Typing;
+```
+
+the typing of one module that every walk of it shares: the instances it asks for, its
+growing cycles, and the reports each instance would otherwise repeat
+
+collect_insts: whether the walk records the instances it asks for
+subst_fn: substitutes an instance's type arguments into a type
+annotation_check_fn: the per-instance checks over one type annotation, run as each is resolved
+
+## rec ModuleView
+
+```mach
+pub rec ModuleView;
+```
+
+the module a walk reads and the typing tables it writes: the module being typed, or the
+declaring module of an instance or of an imported `$each` sequence
+
+## rec Instance
+
+```mach
+pub rec Instance;
+```
+
+the instance a walk types, or none
+
+depth: how deep the chain of instances that asked for this one runs
+parent: the instance being typed, INST_NONE outside one
+frame: the typing frame the walk records into (see sema_instance.Frame)
+requester: who asks for an instance from the frame (sema_instance.FROM_* or an instance id)
+pack_types: the element types of the pack the instance binds, `pack_len` of them; nil
+            outside a pack instance
+quiet: a value or non-generic pack instance retypes what its template already
+            checked, so it reports only what the template could not decide: its comptime
+            arguments, and the bodies of an `$each` over its pack
+site: where the instance was asked for, while `site_set`
+subst: the type arguments that replace the parameters of `subst_owner`, position
+            for position; a parameter of any other declaration is left alone
+
+## rec Walk
+
+```mach
+pub rec Walk;
+```
+
+the state of one walk over syntax, fresh at each body and scoped to the construct that
+sets it
+
+type_prepass: resolving every type node up front, before any arm is selected
+deferred_hits: how many deferred names type resolution has met, so a consumer can tell a
+               type that failed on one from a type that failed on its own
+offer: a fix the next error raised offers, set by a check that knows one and
+               cleared by it once the check is done; nil offers none
+write_place: the place under a store or an address-of, whose root is written or
+               addressed rather than read
+in_test: inside a `test` body, where a `ret` value is a status in 0..255
+
 ## rec SemaContext
 
 ```mach
 pub rec SemaContext;
 ```
+
+## fun init
+
+```mach
+pub fun init(s: *session.Session, diags: *diagnostic.DiagnosticStore, typing: Typing, view: ModuleView,
+instance: Instance) SemaContext;
+```
+
+the one way a walk is made: over `view`, typing `instance`, sharing `typing`, with a fresh walk
+
+## fun walk_init
+
+```mach
+pub fun walk_init() Walk;
+```
+
+## fun walk_open
+
+```mach
+pub fun walk_open(sc: *SemaContext) Walk;
+```
+
+a construct that sets walk state opens the walk and closes it on the way out, which
+undoes everything the construct set; the count of deferred names met carries out
+
+## fun walk_close
+
+```mach
+pub fun walk_close(sc: *SemaContext, outer: Walk);
+```
+
+## fun instance_none
+
+```mach
+pub fun instance_none() Instance;
+```
+
+outside any instance: typing the template, recording into its frame
 
 ## fun report_deferred_name
 
@@ -331,10 +273,15 @@ pub fun decl_body_spreads_pack_to_c_variadic(sc: *SemaContext, origin: session.M
 ## fun record_instance
 
 ```mach
-pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: ast_id.DeclId,
-args: *type.TypeId, arg_len: u32, sig: type.TypeId,
-bare: intern.StrId, site: lang_source.Span) res[u8, fail.Fail];
+pub fun record_instance(sc: *SemaContext, item: sema_instance.Instance, eid: ast_id.ExprId) err[fail.Fail];
 ```
+
+an instance the walk asks for at `eid`: added to the module's set when new, and noted as
+what `eid` names in the walk's frame. an instance whose type arguments or pack still
+mention a type parameter is the template under other names: nothing in its body is
+settled until the caller is itself instantiated, and that caller's walk asks for the
+closed instance. `item` carries the kind, the declaration, its arguments, name,
+signature and site; the rest is the set's
 
 ## fun inst_worklist_new
 
@@ -353,6 +300,46 @@ pub fun inst_worklist_free(wl: *InstWorklist);
 ```mach
 pub fun inst_worklist_dnit(sc: *SemaContext);
 ```
+
+## fun expr_type_set
+
+```mach
+pub fun expr_type_set(sc: *SemaContext, eid: ast_id.ExprId, ty: type.TypeId);
+```
+
+the type the walk gives expression `eid`, recorded in its frame when the frame is not
+the module's own typing
+
+## fun decl_type_set
+
+```mach
+pub fun decl_type_set(sc: *SemaContext, did: ast_id.DeclId, ty: type.TypeId);
+```
+
+## fun walk_binds_values
+
+```mach
+pub fun walk_binds_values(sc: *SemaContext) bool;
+```
+
+the walk is typing a value instance, so the comptime parameters of the function it
+instantiates are bound
+
+## fun walk_binds_pack
+
+```mach
+pub fun walk_binds_pack(sc: *SemaContext) bool;
+```
+
+the walk is typing a pack instance, so the pack's element types are bound
+
+## fun gate_set
+
+```mach
+pub fun gate_set(sc: *SemaContext, cond: ast_id.ExprId, active: bool);
+```
+
+the verdict the walk gives a comptime gate in its frame
 
 ## fun decl_type_for
 
@@ -552,15 +539,15 @@ pub fun record_result(sc: *SemaContext, r: err[fail.Fail]);
 pub fun record_eval_result(sc: *SemaContext, r: res[comptime.CTValue, comptime.EvalFail]);
 ```
 
-## fun attr_string_arg
+## fun decorator_string_arg
 
 ```mach
-pub fun attr_string_arg(sc: *SemaContext, dec: *ast_decl.Decorator, ord: u32, kind: diagnostic_kind.Kind, kind_msg: str) opt[str];
+pub fun decorator_string_arg(sc: *SemaContext, dec: *ast_decl.Decorator, ord: u32, kind: diagnostic_kind.Kind, kind_msg: str) opt[str];
 ```
 
-the string argument `ord` of an attribute evaluates to. one that is
+the string argument `ord` of a decorator evaluates to. one that is
 not a constant expression is refused with `decorator.not_constant`, naming
-the attribute, and a constant that is no string with `kind` and `kind_msg`
+the decorator, and a constant that is no string with `kind` and `kind_msg`
 
 ## fun require_constant_arg
 

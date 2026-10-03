@@ -532,7 +532,7 @@ what one stage binds over one module, which that stage alone writes and every la
 entries: its constants, innermost last
 deferred: the names whose float width only type checking can read
 gate_states: the gates it decided, by condition
-strings: the string each attribute argument evaluates to, by argument; only the load records them
+strings: the string each decorator argument evaluates to, by argument; only the load records them
 embeds: what each `embed` argument names, by argument; only the load records them
 
 ## fun bindings_init
@@ -764,55 +764,55 @@ pub fun lookup(c: *ComptimeCtx, name: intern.StrId) opt[NamedConst];
 
 the constant `name` is bound to: the scope's own latest binding, else the latest stage's below it
 
-## fun attribute_string_set
+## fun decorator_string_set
 
 ```mach
-pub fun attribute_string_set(c: *ComptimeCtx, arg: ast_id.ExprId, value: intern.StrId) err[fail.Fail];
+pub fun decorator_string_set(c: *ComptimeCtx, arg: ast_id.ExprId, value: intern.StrId) err[fail.Fail];
 ```
 
-record the string the attribute argument `arg` evaluates to
+record the string the decorator argument `arg` evaluates to
 
-## fun attribute_string_at
+## fun decorator_string_at
 
 ```mach
-pub fun attribute_string_at(c: *ComptimeCtx, arg: ast_id.ExprId) intern.StrId;
+pub fun decorator_string_at(c: *ComptimeCtx, arg: ast_id.ExprId) intern.StrId;
 ```
 
-the string the attribute argument `arg` evaluates to, as the load recorded it; STR_NIL when it is
+the string the decorator argument `arg` evaluates to, as the load recorded it; STR_NIL when it is
 not a constant string
 
-## fun attribute_embed_set
+## fun decorator_embed_set
 
 ```mach
-pub fun attribute_embed_set(c: *ComptimeCtx, arg: ast_id.ExprId, path: EmbedPath) err[fail.Fail];
+pub fun decorator_embed_set(c: *ComptimeCtx, arg: ast_id.ExprId, path: EmbedPath) err[fail.Fail];
 ```
 
 record what the `embed` argument `arg` names
 
-## fun attribute_embed_at
+## fun decorator_embed_at
 
 ```mach
-pub fun attribute_embed_at(c: *ComptimeCtx, arg: ast_id.ExprId) opt[EmbedPath];
+pub fun decorator_embed_at(c: *ComptimeCtx, arg: ast_id.ExprId) opt[EmbedPath];
 ```
 
 what the `embed` argument `arg` names, as the load recorded it; none when it recorded nothing
 
-## fun attribute_embed_file
+## fun decorator_embed_file
 
 ```mach
-pub fun attribute_embed_file(c: *ComptimeCtx, arg: ast_id.ExprId) intern.StrId;
+pub fun decorator_embed_file(c: *ComptimeCtx, arg: ast_id.ExprId) intern.StrId;
 ```
 
 the file the `embed` argument `arg` names, as the load resolved it; STR_NIL when it names none
 the build reads
 
-## fun attributes_clear
+## fun decorators_clear
 
 ```mach
-pub fun attributes_clear(c: *ComptimeCtx);
+pub fun decorators_clear(c: *ComptimeCtx);
 ```
 
-drop every attribute record of the scope's own, before they are recorded again
+drop every decorator record of the scope's own, before they are recorded again
 
 ## fun field_type_of_binding
 
@@ -912,6 +912,22 @@ from_ty: type.TypeId, to_ty: type.TypeId, reinterpret: bool) res[CTValue, EvalFa
 
 a float converted to another float width folds by `nan_rule`, the target's, so the
 folded conversion is the one the target makes at run time
+
+## fun call_intrinsic
+
+```mach
+pub fun call_intrinsic(a: *ast.Ast, source: str, eid: ast_id.ExprId) intrinsic.Id;
+```
+
+the intrinsic a comptime call `$name(...)` names; NONE for any other expression
+
+## fun ident_intrinsic
+
+```mach
+pub fun ident_intrinsic(source: str, full: lang_source.Span) intrinsic.Id;
+```
+
+the intrinsic a `$name` token spells
 
 ## fun intrinsic_takes_type_operand
 

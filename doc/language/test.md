@@ -279,7 +279,7 @@ in collection order regardless of completion order.
 ## Which tests run
 
 `mach test` selects its cells with `-a`, `-t` and `-p` as every command does (see
-[manifest.md](manifest.md#selection-and-the-build-matrix)): each takes an exact
+[build.md](build.md#selection-and-the-build-matrix)): each takes an exact
 name or a glob and repeats, and `--all` fills every axis no option names with
 `*`. With no `-a`, the sole artifact the selected target builds is chosen, or
 among several the one marked `default = true` (see
@@ -358,6 +358,13 @@ Inline tests are small and sit in their module for convenience or because they
 need private access. A test lives outside the module it covers to declutter it,
 because the test is significant, or, most often, because it exercises several
 modules together (see [Which tests run](#which-tests-run)).
+
+A fixture lives at the layer of what it builds, in the module that owns the
+type it makes. A test reaches its fixtures through the imports its module
+already makes, or through a `#[testing] use` of a module at its own layer or
+below. An import only tests make never reaches above its module's layer: the
+mark is no cycle escape, so such an edge would push the module up the graph.
+The compiler holds its own tree to this with a test.
 
 Regression tests are a separate kind, and rare: they are kept only for
 regressions that are easy to reintroduce, and are named `regression__*`. They

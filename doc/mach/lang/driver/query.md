@@ -40,13 +40,13 @@ definition_revision: query.Revision) err[fail.Fail];
 ## fun typed_surface_encode
 
 ```mach
-pub fun typed_surface_encode(s: *wire.Sink, surface: *sema_context.ModuleSema) err[fail.Fail];
+pub fun typed_surface_encode(s: *wire.Sink, surface: *fe_sema.ModuleSema) err[fail.Fail];
 ```
 
 ## fun typed_surface_decode
 
 ```mach
 pub fun typed_surface_decode(itn: *intern.Interner, a: *A.Allocator, bytes: *u8, len: u32,
-path: intern.StrId, mid: session.ModuleId) res[sema_context.ModuleSema, fail.Fail];
+path: intern.StrId, mid: session.ModuleId) res[fe_sema.ModuleSema, fail.Fail];
 ```
 

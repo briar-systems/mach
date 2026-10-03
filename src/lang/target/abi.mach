@@ -19,6 +19,7 @@ use catalog_arch: mach.lang.target.catalog.arch;
 use mach.lang.target.isa;
 use isa_inst:     mach.lang.target.isa.inst;
 use target_model: mach.lang.target.model;
+use target_of:    mach.lang.target.of;
 
 pub def ParamClass: u8;
 
@@ -48,6 +49,8 @@ pub rec ParamPiece {
     width: u8;
 }
 
+# a small aggregate's scalar leaves, as a convention that passes one field by
+# field reads them
 pub rec AggField  { is_float: bool; offset: u32; width: u8; }
 pub rec AggLayout { field_count: u8; fields: [2]AggField; }
 
@@ -55,6 +58,159 @@ pub fun agg_none() AggLayout {
     var a: AggLayout;
     a.field_count = 0;
     ret a;
+}
+
+# what a type is, as every convention reads it. a convention derives its own
+# aggregate facts (eightbyte classes, homogeneous members, leaves) by walking
+# a type through a TypeView; the code generator only describes the type
+pub def TypeShape: u8;
+
+# a type the view cannot describe, which no walk descends into
+pub val SHAPE_NONE: TypeShape = 0;
+# an integer or pointer scalar
+pub val SHAPE_INT:   TypeShape = 1;
+pub val SHAPE_FLOAT: TypeShape = 2;
+# an integer carrying a binary16, which the convention's half rule places
+pub val SHAPE_HALF:   TypeShape = 3;
+pub val SHAPE_VECTOR: TypeShape = 4;
+# members at their own offsets
+pub val SHAPE_RECORD: TypeShape = 5;
+# `count` elements of one type
+pub val SHAPE_ARRAY: TypeShape = 6;
+# members all at offset 0
+pub val SHAPE_UNION: TypeShape = 7;
+# a discriminator of `disc_bytes` at offset 0, then `count` cases at one payload offset
+pub val SHAPE_TAG: TypeShape = 8;
+
+pub rec TypeFacts {
+    shape:      TypeShape;
+    size:       u64;
+    align:      u64;
+    count:      u32;
+    disc_bytes: u64;
+}
+
+# member `i` of a type and its offset from the type's start
+pub rec TypeMember {
+    ty:     u32;
+    offset: u64;
+}
+
+# a read-only view of the program's types, handed to a classifier with the
+# type it places; `state` is the describer's own
+pub rec TypeView {
+    state:  ptr;
+    facts:  fun(ptr, u32) TypeFacts;
+    member: fun(ptr, u32, u32) TypeMember;
+}
+
+pub fun type_facts(view: *TypeView, ty: u32) TypeFacts {
+    ret view.facts(view.state, ty);
+}
+
+pub fun type_member(view: *TypeView, ty: u32, i: u32) TypeMember {
+    ret view.member(view.state, ty, i);
+}
+
+# a type the convention places as a float: a float, or a binary16 where the
+# convention's half row takes the float bank
+pub fun shape_is_float(vt: *AbiVTable, shape: TypeShape) bool {
+    if (shape == SHAPE_FLOAT) { ret true; }
+    ret shape == SHAPE_HALF && half_is_float(vt.half);
+}
+
+# an argument the convention places as a float. an unnamed one is a float
+# only where the variadic save model carries a float of its width
+pub fun arg_is_float(vt: *AbiVTable, q: *ArgQuery) bool {
+    val shape: TypeShape = type_facts(q.types, q.ty).shape;
+    if (q.variadic) {
+        ret shape == SHAPE_FLOAT && vt.va_model != nil && variadic_float_in_fp_bank(vt.va_model, q.size);
+    }
+    ret shape_is_float(vt, shape);
+}
+
+pub fun ret_is_float(vt: *AbiVTable, q: *RetQuery) bool {
+    ret shape_is_float(vt, type_facts(q.types, q.ty).shape);
+}
+
+# a named aggregate argument is placed by its members; an unnamed one by its
+# size alone
+pub fun arg_members_read(q: *ArgQuery) bool {
+    ret q.is_aggregate && !q.variadic;
+}
+
+# whether `ty` is a homogeneous aggregate of one float width: the width and
+# the member count, an array counting its elements and a union its widest
+# member. a vector or integer member makes it none
+fun homogeneous_walk(vt: *AbiVTable, view: *TypeView, ty: u32, out_elem: *u32, out_count: *u32) bool {
+    val f: TypeFacts = type_facts(view, ty);
+    if (f.shape == SHAPE_NONE) { ret false; }
+    if (shape_is_float(vt, f.shape)) {
+        @out_elem  = f.size::u32;
+        @out_count = 1;
+        ret true;
+    }
+    if (f.shape == SHAPE_ARRAY) {
+        var ee: u32 = 0;
+        var ec: u32 = 0;
+        if (!homogeneous_walk(vt, view, type_member(view, ty, 0).ty, ?ee, ?ec)) { ret false; }
+        @out_elem  = ee;
+        @out_count = ec * f.count;
+        ret true;
+    }
+    if (f.shape == SHAPE_RECORD) {
+        var elem:  u32 = 0;
+        var total: u32 = 0;
+        var i:     u32 = 0;
+        for (i < f.count) {
+            var fe: u32 = 0;
+            var fc: u32 = 0;
+            if (!homogeneous_walk(vt, view, type_member(view, ty, i).ty, ?fe, ?fc)) { ret false; }
+            if (elem == 0)                                                          { elem = fe; }
+            or (elem != fe)                                                         { ret false; }
+            total = total + fc;
+            i     = i + 1;
+        }
+        if (total == 0) { ret false; }
+        @out_elem  = elem;
+        @out_count = total;
+        ret true;
+    }
+    if (f.shape == SHAPE_UNION) {
+        var elem: u32 = 0;
+        var maxc: u32 = 0;
+        var i:    u32 = 0;
+        for (i < f.count) {
+            var me: u32 = 0;
+            var mc: u32 = 0;
+            if (!homogeneous_walk(vt, view, type_member(view, ty, i).ty, ?me, ?mc)) { ret false; }
+            if (elem == 0)                                                          { elem = me; }
+            or (elem != me)                                                         { ret false; }
+            if (mc > maxc)                                                          { maxc = mc; }
+            i = i + 1;
+        }
+        if (elem == 0) { ret false; }
+        @out_elem  = elem;
+        @out_count = maxc;
+        ret true;
+    }
+    ret false;
+}
+
+# a homogeneous float aggregate of one to four members of two, four or eight
+# bytes: its member count and width, both 0 for any other type
+pub fun homogeneous_float(vt: *AbiVTable, view: *TypeView, ty: u32, out_members: *u8, out_elem: *u8) {
+    @out_members = 0;
+    @out_elem    = 0;
+    val shape: TypeShape = type_facts(view, ty).shape;
+    if (shape != SHAPE_RECORD && shape != SHAPE_ARRAY && shape != SHAPE_UNION && shape != SHAPE_TAG) { ret; }
+    var elem:  u32 = 0;
+    var count: u32 = 0;
+    if (!homogeneous_walk(vt, view, ty, ?elem, ?count)) { ret; }
+    if (count < 1 || count > 4)                         { ret; }
+    if (elem != 2 && elem != 4 && elem != 8)            { ret; }
+    @out_members = count::u8;
+    @out_elem    = elem::u8;
 }
 
 # reg is the physical register the slot rides, MIR_PREG_NIL for a stack slot;
@@ -77,6 +233,10 @@ pub rec ParamSlot {
     # above its type's own (a System V vector wider than the vector registers,
     # at its C alignment), 0 for the type's own
     stack_align: u32;
+    # the argument takes a word-aligned stack slot rounded up to a word even
+    # where fixed arguments are otherwise placed at their natural size and
+    # alignment (a composite that is no HFA or HVA, as Apple's arm64 places one)
+    word_stack:  bool;
     pieces:      [PARAM_MAX_PIECES]ParamPiece;
     piece_count: u32;
     gp_consumed: i32;
@@ -101,29 +261,45 @@ fun kind_piece_count(s: *ParamSlot, kind: PieceKind) i32 {
     ret n;
 }
 
-# eightbyte class mask handed to a classifier: bit 0 and bit 1 mark eightbyte 0 and 1 as SSE, bit 2 and
-# bit 3 mark them as holding no leaf at all (padding only), and an unmarked eightbyte inside the object is INTEGER;
-# bit 4 marks an aggregate holding a field at an offset that is not a multiple of the field's own alignment
-# (a packed record), which System V classifies as MEMORY regardless of what its eightbytes hold
-pub val EB_SSE_LO:    u8 = 1;
-pub val EB_SSE_HI:    u8 = 2;
-pub val EB_EMPTY_LO:  u8 = 4;
-pub val EB_EMPTY_HI:  u8 = 8;
-pub val EB_UNALIGNED: u8 = 16;
+# one argument a convention places. align is the alignment the register
+# assignment honors: the type's own, capped where the platform relaxes it
+# (darwin aarch64 starts a 16-byte value in any x register). vec_bytes is the
+# widest vector one register of the target carries under its selected
+# extensions (isa.vector_register_bytes), which a convention that places a
+# vector by its register width reads (System V's ymm under avx)
+pub rec ArgQuery {
+    index:        i32;
+    size:         u64;
+    align:        u64;
+    is_aggregate: bool;
+    is_vector:    bool;
+    # an argument past the named parameters of a variadic callee
+    variadic: bool;
+    # the registers of each bank the arguments before this one took
+    gp_used:   i32;
+    fp_used:   i32;
+    vec_bytes: u64;
+    # the argument's type and the view that describes it
+    types: *TypeView;
+    ty:    u32;
+}
 
-# the arguments are index, size, align, is_float, eightbytes, is_aggregate, is_vector, gp_used, fp_used,
-# hfa_members, hfa_elem, the aggregate layout and the vector register bytes. align is the alignment the
-# register assignment honors: the type's own, capped where the platform relaxes it (darwin aarch64 starts a
-# 16-byte value in any x register). the vector register bytes are the widest vector one register of the
-# target carries under its selected extensions (isa.vector_register_bytes), which a convention that places
-# a vector by its register width reads (System V's ymm under avx)
-pub def ArgPassingFn: fun(i32, u64, u64, bool, u8, bool, bool, i32, i32, u8, u8, AggLayout, u64) ParamSlot;
+# the result a convention places, described as an argument is
+pub rec RetQuery {
+    size:         u64;
+    align:        u64;
+    is_aggregate: bool;
+    is_vector:    bool;
+    vec_bytes:    u64;
+    types:        *TypeView;
+    ty:           u32;
+}
 
-pub def RetPassingFn: fun(u64, u64, bool, u8, bool, bool, u8, u8, AggLayout, u64) ParamSlot;
+# a classifier reads the descriptor it is called through, so one classifier
+# serves every member of a family, each member's parameters in `family`
+pub def ArgPassingFn: fun(*AbiVTable, *ArgQuery) ParamSlot;
 
-pub def RegFileFn: isa.RegFileFn;
-
-def VaModelFn: fun() VaModel;
+pub def RetPassingFn: fun(*AbiVTable, *RetQuery) ParamSlot;
 
 # how a binary16 crosses a call, a row of each convention's table.
 # HALF_INTEGER passes its bits in the integer slot a u16 takes. the float rows
@@ -156,26 +332,30 @@ pub fun piece_is_half(p: *ParamPiece) bool {
 }
 
 pub rec AbiVTable {
-    passing:                    catalog_abi.Passing;
-    id:                         u32;
-    name:                       str;
-    arch_id:                    u32;
-    arg_passing:                ArgPassingFn;
-    ret_passing:                RetPassingFn;
-    gp_arg_regs:                RegFileFn;
-    callee_saved:               RegFileFn;
+    passing:     catalog_abi.Passing;
+    id:          u32;
+    name:        str;
+    arch_id:     u32;
+    arg_passing: ArgPassingFn;
+    ret_passing: RetPassingFn;
+    # the parameters a family's classifier reads, nil for a convention that is
+    # no family's member
+    family:                     ptr;
+    gp_arg_regs:                target_model.RegFile;
+    callee_saved:               target_model.RegFile;
     stack_align:                u32;
     red_zone:                   u32;
     shadow_space:               u32;
     indirect_result_reg:        i32;
     indirect_result_in_argfile: bool;
-    consumes_agg_layout:        bool;
     # the low bytes of a vector register a callee-saved float register keeps
     # across a call: a value wider lives in one only between calls
     fp_callee_saved_bytes: u32;
     float_arg_bits:        u32;
     arg_slot_granularity:  u32;
-    va_model:              VaModelFn;
+    # how a variadic callee finds its unnamed arguments, nil when the
+    # convention has no variadic save model
+    va_model: *VaModel;
     # an aggregate argument is placed by the alignment its members give it, not
     # one its own #[align] raises (AAPCS64 C.12 to C.16)
     agg_natural_align: bool;
@@ -187,27 +367,185 @@ pub rec AbiVTable {
 }
 
 #[testing]
-fun t_arg(index: i32, size: u64, align: u64, is_float: bool, fp_eightbytes: u8,
+fun t_arg(vt: *AbiVTable, q: *ArgQuery) ParamSlot {
+    ret make_slot(CLASS_GP, isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, q.index), 0, q.size, 8);
+}
+
+#[testing]
+fun t_ret(vt: *AbiVTable, q: *RetQuery) ParamSlot {
+    ret make_slot(CLASS_GP, isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, 0), 0, q.size, 8);
+}
+
+#[testing]
+val T_REGS: [1]target_model.Register = [1]target_model.Register{target_model.Register{id: isa_inst.REG_GP_BASE, size: 8}};
+
+#[testing]
+val T_VA_MODEL: VaModel = VaModel{kind: VA_MODEL_REG_SAVE, float_dup_gp: false, vector_count_reg: isa_inst.REG_NONE, variadic_float_bits: 0};
+
+# the types a test's queries describe, built from the facts a test names
+#[testing]
+val T_TYPE_CAP:   u32 = 1024;
+#[testing]
+val T_MEMBER_CAP: u32 = 4096;
+#[testing]
+var t_type_facts: [1024]TypeFacts;
+#[testing]
+var t_type_first: [1024]u32;
+#[testing]
+var t_members:    [4096]TypeMember;
+#[testing]
+var t_type_len:   u32;
+#[testing]
+var t_member_len: u32;
+
+#[testing]
+fun t_view_facts(state: ptr, ty: u32) TypeFacts {
+    ret t_type_facts[ty];
+}
+
+#[testing]
+fun t_view_member(state: ptr, ty: u32, i: u32) TypeMember {
+    ret t_members[t_type_first[ty] + i];
+}
+
+#[testing]
+var t_view: TypeView = TypeView{state: nil, facts: t_view_facts, member: t_view_member};
+
+# a type of `shape` with no members; a test that outgrows the table starts it over
+#[testing]
+fun t_type(shape: TypeShape, size: u64, align: u64) u32 {
+    if (t_type_len >= T_TYPE_CAP || t_member_len + 8 > T_MEMBER_CAP) {
+        t_type_len   = 0;
+        t_member_len = 0;
+    }
+    val ty: u32 = t_type_len;
+    t_type_facts[ty] = TypeFacts{shape: shape, size: size, align: align, count: 0, disc_bytes: 0};
+    t_type_first[ty] = t_member_len;
+    t_type_len       = t_type_len + 1;
+    ret ty;
+}
+
+#[testing]
+fun t_member_add(owner: u32, ty: u32, offset: u64) {
+    t_members[t_member_len]   = TypeMember{ty: ty, offset: offset};
+    t_member_len              = t_member_len + 1;
+    t_type_facts[owner].count = t_type_facts[owner].count + 1;
+}
+
+#[testing]
+fun t_scalar(is_float: bool, size: u64) u32 {
+    if (is_float) { ret t_type(SHAPE_FLOAT, size, size); }
+    ret t_type(SHAPE_INT, size, size);
+}
+
+# an aggregate whose walks give the facts named: `hfa_members` floats of
+# `hfa_elem` bytes, else the leaves of `agg`, else the eightbyte classes of
+# System V's mask (bit 0 and 1 a float eightbyte, bit 2 and 3 an empty one,
+# bit 4 a misaligned member), else one opaque integer member
+#[testing]
+fun t_aggregate(size: u64, align: u64, eightbytes: u8, hfa_members: u8, hfa_elem: u8, agg: AggLayout) u32 {
+    if (hfa_members > 0) {
+        val elem: u32 = t_scalar(true, hfa_elem::u64);
+        val rec_: u32 = t_type(SHAPE_RECORD, size, align);
+        var i:    u32 = 0;
+        for (i < hfa_members::u32) {
+            t_member_add(rec_, elem, i::u64 * hfa_elem::u64);
+            i = i + 1;
+        }
+        ret rec_;
+    }
+    if (agg.field_count > 0) {
+        var leaves: [2]u32;
+        var i:      u32 = 0;
+        for (i < agg.field_count::u32) {
+            leaves[i] = t_scalar(agg.fields[i].is_float, agg.fields[i].width::u64);
+            i         = i + 1;
+        }
+        val rec_: u32 = t_type(SHAPE_RECORD, size, align);
+        i = 0;
+        for (i < agg.field_count::u32) {
+            t_member_add(rec_, leaves[i], agg.fields[i].offset::u64);
+            i = i + 1;
+        }
+        ret rec_;
+    }
+    if ((eightbytes & 16) != 0) {
+        val word: u32 = t_scalar(false, 4);
+        val rec_: u32 = t_type(SHAPE_RECORD, size, 1);
+        t_member_add(rec_, word, 1);
+        ret rec_;
+    }
+    if (eightbytes != 0 && size > 0) {
+        var parts: [2]u32;
+        var used:  [2]bool;
+        var k:     u32 = 0;
+        for (k < 2) {
+            used[k] = false;
+            val start: u64 = k::u64 * 8;
+            if (start < size && (eightbytes & (4 << k)::u8) == 0) {
+                var width: u64 = size - start;
+                if (width > 8) { width = 8; }
+                parts[k] = t_scalar((eightbytes & (1 << k)::u8) != 0, width);
+                used[k]  = true;
+            }
+            k = k + 1;
+        }
+        val rec_: u32 = t_type(SHAPE_RECORD, size, align);
+        k = 0;
+        for (k < 2) {
+            if (used[k]) { t_member_add(rec_, parts[k], k::u64 * 8); }
+            k = k + 1;
+        }
+        ret rec_;
+    }
+    val opaque: u32 = t_type(SHAPE_INT, size, align);
+    val union_: u32 = t_type(SHAPE_UNION, size, align);
+    if (size > 0) { t_member_add(union_, opaque, 0); }
+    ret union_;
+}
+
+#[testing]
+fun t_query_type(size: u64, align: u64, is_float: bool, eightbytes: u8, is_aggregate: bool, is_vector: bool,
+    hfa_members: u8, hfa_elem: u8, agg: AggLayout) u32 {
+    if (is_vector)    { ret t_type(SHAPE_VECTOR, size, align); }
+    if (is_aggregate) { ret t_aggregate(size, align, eightbytes, hfa_members, hfa_elem, agg); }
+    if (is_float)     { ret t_type(SHAPE_FLOAT, size, align); }
+    ret t_type(SHAPE_INT, size, align);
+}
+
+# an argument described by the facts a convention derives, for a test that
+# classifies one: its type is one whose walks give those facts
+#[testing]
+pub fun arg_query(index: i32, size: u64, align: u64, is_float: bool, eightbytes: u8,
     is_aggregate: bool, is_vector: bool, gp_used: i32, fp_used: i32,
-    hfa_members: u8, hfa_elem: u8, agg: AggLayout, vec_bytes: u64) ParamSlot {
-    ret make_slot(CLASS_GP, index, 0, size, 8);
+    hfa_members: u8, hfa_elem: u8, agg: AggLayout, vec_bytes: u64) ArgQuery {
+    val ty: u32 = t_query_type(size, align, is_float, eightbytes, is_aggregate, is_vector, hfa_members, hfa_elem, agg);
+    ret ArgQuery{index: index, size: size, align: align, is_aggregate: is_aggregate, is_vector: is_vector,
+        variadic: false, gp_used: gp_used, fp_used: fp_used, vec_bytes: vec_bytes, types: ?t_view, ty: ty};
 }
 
+# a result described as arg_query describes an argument
 #[testing]
-fun t_ret(size: u64, align: u64, is_float: bool, fp_eightbytes: u8,
+pub fun ret_query(size: u64, align: u64, is_float: bool, eightbytes: u8,
     is_aggregate: bool, is_vector: bool, hfa_members: u8,
-    hfa_elem: u8, agg: AggLayout, vec_bytes: u64) ParamSlot {
-    ret make_slot(CLASS_GP, 0, 0, size, 8);
+    hfa_elem: u8, agg: AggLayout, vec_bytes: u64) RetQuery {
+    val ty: u32 = t_query_type(size, align, is_float, eightbytes, is_aggregate, is_vector, hfa_members, hfa_elem, agg);
+    ret RetQuery{size: size, align: align, is_aggregate: is_aggregate, is_vector: is_vector,
+        vec_bytes: vec_bytes, types: ?t_view, ty: ty};
 }
 
+# the slot a convention gives an argument, for a test that classifies one
 #[testing]
-fun t_regs(out: *target_model.Register) i32 {
-    ret 0;
+pub fun arg_slot_for(vt: *AbiVTable, q: ArgQuery) ParamSlot {
+    var arg: ArgQuery = q;
+    ret vt.arg_passing(vt, ?arg);
 }
 
+# the slot a convention gives a result, for a test that classifies one
 #[testing]
-fun t_va_model() VaModel {
-    ret va_model_make(VA_MODEL_REG_SAVE, false, -1, 0);
+pub fun ret_slot_for(vt: *AbiVTable, q: RetQuery) ParamSlot {
+    var result: RetQuery = q;
+    ret vt.ret_passing(vt, ?result);
 }
 
 pub rec SigLayout {
@@ -265,10 +603,10 @@ pub fun validate(a: *A.Allocator, vt: *AbiVTable) err[fail.Fail] {
         ret err[fail.Fail].err{fail.formatted(a, "mach.lang.target.abi: calling convention '{}' declares no rule for an f16", vt.name)};
     }
     if (vt.passing == catalog_abi.PASSING_VALUES) {
-        if (vt.gp_arg_regs != nil || vt.callee_saved != nil || vt.va_model != nil
+        if (vt.gp_arg_regs.count != 0 || vt.callee_saved.count != 0 || vt.va_model != nil
             || vt.arg_slot_granularity != 0 || vt.stack_align != 0
-            || vt.red_zone != 0 || vt.shadow_space != 0 || vt.indirect_result_reg != -1
-            || vt.indirect_result_in_argfile || vt.consumes_agg_layout) {
+            || vt.red_zone != 0 || vt.shadow_space != 0 || vt.indirect_result_reg != isa_inst.REG_NONE
+            || vt.indirect_result_in_argfile) {
             ret err[fail.Fail].err{fail.formatted(a, "mach.lang.target.abi: calling convention '{}' passes values but declares a carrier transport", vt.name)};
         }
         ret err[fail.Fail].ok{};
@@ -276,7 +614,7 @@ pub fun validate(a: *A.Allocator, vt: *AbiVTable) err[fail.Fail] {
     if (vt.passing != catalog_abi.PASSING_CARRIERS) {
         ret err[fail.Fail].err{fail.formatted(a, "mach.lang.target.abi: calling convention '{}' declares an unknown passing model", vt.name)};
     }
-    if (vt.gp_arg_regs == nil || vt.callee_saved == nil) {
+    if (vt.gp_arg_regs.regs == nil || vt.gp_arg_regs.count <= 0 || vt.callee_saved.regs == nil || vt.callee_saved.count <= 0) {
         ret err[fail.Fail].err{fail.formatted(a, "mach.lang.target.abi: calling convention '{}' is missing `gp_arg_regs` or `callee_saved`", vt.name)};
     }
     if (vt.va_model == nil) {
@@ -284,6 +622,12 @@ pub fun validate(a: *A.Allocator, vt: *AbiVTable) err[fail.Fail] {
     }
     if (vt.arg_slot_granularity == 0) {
         ret err[fail.Fail].err{fail.formatted(a, "mach.lang.target.abi: calling convention '{}' declares an `arg_slot_granularity` of 0", vt.name)};
+    }
+    if (vt.stack_align == 0 || (vt.stack_align & (vt.stack_align - 1)) != 0) {
+        ret err[fail.Fail].err{fail.formatted(a, "mach.lang.target.abi: calling convention '{}' declares a `stack_align` that is not a power of two", vt.name)};
+    }
+    if (vt.callee_saved.count::u32 + target_of.FRAME_FIXED_STEPS > target_of.FRAME_STEP_CAP) {
+        ret err[fail.Fail].err{fail.formatted(a, "mach.lang.target.abi: calling convention '{}' saves more callee-saved registers than a frame record can describe", vt.name)};
     }
     ret err[fail.Fail].ok{};
 }
@@ -316,7 +660,7 @@ fun make_slot_base(class: ParamClass, reg: i32, offset: i64, size: u64, carrier_
     s.indirect_align = 0;
     s.stack_align    = 0;
     s.piece_count    = 0;
-    if (reg >= 0) {
+    if (reg != isa_inst.REG_NONE) {
         s.pieces[0]   = piece_for_reg(reg, 0, carrier_width::u32);
         s.piece_count = 1;
     }
@@ -369,11 +713,11 @@ pub fun make_slot_pair(class: ParamClass, reg: i32, reg2: i32, offset: i64, size
     s.indirect_align = 0;
     s.stack_align    = 0;
     s.piece_count    = 0;
-    if (reg >= 0) {
+    if (reg != isa_inst.REG_NONE) {
         s.pieces[0]   = piece_for_reg(reg, 0, word);
         s.piece_count = 1;
     }
-    if (reg2 >= 0) {
+    if (reg2 != isa_inst.REG_NONE) {
         s.pieces[1]   = piece_for_reg(reg2, word::i64, word);
         s.piece_count = 2;
     }
@@ -447,15 +791,15 @@ pub fun make_slot_pieces(class: ParamClass, pieces: *ParamPiece, count: u32, siz
 # the constructors declare the registers their pieces ride in each bank; a
 # classifier may raise the counts for registers its ABI skips
 test paramslot__consumed_follows_the_pieces_of_each_bank {
-    val gp: ParamSlot = make_slot(CLASS_GP, 3, 0, 8, 8);
+    val gp: ParamSlot = make_slot(CLASS_GP, isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, 3), 0, 8, 8);
     if (gp.gp_consumed != 1 || gp.fp_consumed != 0) { ret 1; }
-    val st: ParamSlot = make_slot(CLASS_STACK, -1, 0, 8, 0);
+    val st: ParamSlot = make_slot(CLASS_STACK, isa_inst.REG_NONE, 0, 8, 0);
     if (st.gp_consumed != 0 || st.fp_consumed != 0) { ret 2; }
     val fp: ParamSlot = make_slot(CLASS_FP, isa_inst.regid_make(isa_inst.REG_CLASS_ID_FP, 0), 0, 8, 8);
     if (fp.gp_consumed != 0 || fp.fp_consumed != 1) { ret 3; }
-    val pr: ParamSlot = make_slot_pair(CLASS_GP, 0, 1, 0, 16, 8);
+    val pr: ParamSlot = make_slot_pair(CLASS_GP, isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, 0), isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, 1), 0, 16, 8);
     if (pr.gp_consumed != 2 || pr.fp_consumed != 0) { ret 4; }
-    val mixed: ParamSlot = make_slot_pair(CLASS_GP, 0, isa_inst.regid_make(isa_inst.REG_CLASS_ID_FP, 0), 0, 16, 8);
+    val mixed: ParamSlot = make_slot_pair(CLASS_GP, isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, 0), isa_inst.regid_make(isa_inst.REG_CLASS_ID_FP, 0), 0, 16, 8);
     if (mixed.gp_consumed != 1 || mixed.fp_consumed != 1) { ret 5; }
     val hfa: ParamSlot = make_slot_hfa(isa_inst.regid_make(isa_inst.REG_CLASS_ID_FP, 0), 2, 8, 16);
     if (hfa.gp_consumed != 0 || hfa.fp_consumed != 2) { ret 6; }
@@ -465,24 +809,24 @@ test paramslot__consumed_follows_the_pieces_of_each_bank {
 }
 
 test make_slot_pair__geometry_is_the_conventions_word {
-    val p4: ParamSlot = make_slot_pair(CLASS_GP, 10, 11, 0, 8, 4);
-    if (p4.piece_count != 2)                         { ret 1; }
-    if (p4.pieces[0].src_off != 0)                   { ret 1; }
-    if (p4.pieces[0].width != 4)                     { ret 1; }
-    if (lang_mir.preg_regid(p4.pieces[1].reg) != 11) { ret 1; }
-    if (p4.pieces[1].src_off != 4)                   { ret 1; }
-    if (p4.pieces[1].width != 4)                     { ret 1; }
+    val p4: ParamSlot = make_slot_pair(CLASS_GP, isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, 10), isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, 11), 0, 8, 4);
+    if (p4.piece_count != 2)                                                                        { ret 1; }
+    if (p4.pieces[0].src_off != 0)                                                                  { ret 1; }
+    if (p4.pieces[0].width != 4)                                                                    { ret 1; }
+    if (lang_mir.preg_regid(p4.pieces[1].reg) != isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, 11)) { ret 1; }
+    if (p4.pieces[1].src_off != 4)                                                                  { ret 1; }
+    if (p4.pieces[1].width != 4)                                                                    { ret 1; }
 
-    val p2: ParamSlot = make_slot_pair(CLASS_GP, 10, 11, 0, 4, 2);
+    val p2: ParamSlot = make_slot_pair(CLASS_GP, isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, 10), isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, 11), 0, 4, 2);
     if (p2.pieces[1].src_off != 2) { ret 1; }
     if (p2.pieces[1].width != 2)   { ret 1; }
 
-    val p8: ParamSlot = make_slot_pair(CLASS_GP, 10, 11, 0, 16, 8);
+    val p8: ParamSlot = make_slot_pair(CLASS_GP, isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, 10), isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, 11), 0, 16, 8);
     if (p8.pieces[0].src_off != 0) { ret 1; }
     if (p8.pieces[1].src_off != 8) { ret 1; }
     if (p8.pieces[1].width != 8)   { ret 1; }
 
-    val one: ParamSlot = make_slot(CLASS_GP, 10, 0, 8, 8);
+    val one: ParamSlot = make_slot(CLASS_GP, isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, 10), 0, 8, 8);
     if (one.piece_count != 1)       { ret 1; }
     if (one.pieces[0].src_off != 0) { ret 1; }
     ret 0;
@@ -497,14 +841,14 @@ fun t_vtable(id: u32, name: str, arch_id: u32) AbiVTable {
         arch_id:               arch_id,
         arg_passing:           t_arg,
         ret_passing:           t_ret,
-        gp_arg_regs:           t_regs,
-        callee_saved:          t_regs,
+        gp_arg_regs:           target_model.RegFile{regs: ?T_REGS[0], count: 1},
+        callee_saved:          target_model.RegFile{regs: ?T_REGS[0], count: 1},
         stack_align:           16,
-        indirect_result_reg:   -1,
+        indirect_result_reg:   isa_inst.REG_NONE,
         fp_callee_saved_bytes: 8,
         float_arg_bits:        64,
         arg_slot_granularity:  8,
-        va_model:              t_va_model,
+        va_model:              ?T_VA_MODEL,
     };
 }
 
@@ -533,7 +877,7 @@ test validate__rejects_malformed_descriptors {
     if (!refused(?no_arg)) { ret 5; }
 
     var no_regfiles: AbiVTable = t_vtable(catalog_abi.SYSV, "no_regfiles", catalog_arch.X86_64);
-    no_regfiles.callee_saved = nil;
+    no_regfiles.callee_saved.count = 0;
     if (!refused(?no_regfiles)) { ret 6; }
 
     var no_granularity: AbiVTable = t_vtable(catalog_abi.SYSV, "no_granularity", catalog_arch.X86_64);
@@ -543,6 +887,18 @@ test validate__rejects_malformed_descriptors {
     var no_va_model: AbiVTable = t_vtable(catalog_abi.SYSV, "no_va_model", catalog_arch.X86_64);
     no_va_model.va_model = nil;
     if (!refused(?no_va_model)) { ret 8; }
+
+    var no_stack_align: AbiVTable = t_vtable(catalog_abi.SYSV, "no_stack_align", catalog_arch.X86_64);
+    no_stack_align.stack_align = 0;
+    if (!refused(?no_stack_align)) { ret 10; }
+    no_stack_align.stack_align = 24;
+    if (!refused(?no_stack_align)) { ret 11; }
+
+    var many_saved: AbiVTable = t_vtable(catalog_abi.SYSV, "many_saved", catalog_arch.X86_64);
+    many_saved.callee_saved.count = (target_of.FRAME_STEP_CAP - target_of.FRAME_FIXED_STEPS)::i32;
+    if (refused(?many_saved)) { ret 12; }
+    many_saved.callee_saved.count = many_saved.callee_saved.count + 1;
+    if (!refused(?many_saved)) { ret 13; }
 
     var values: AbiVTable = t_vtable(catalog_abi.SPIRV, "values", catalog_arch.SPIRV);
     values.passing = catalog_abi.PASSING_VALUES;
@@ -607,7 +963,7 @@ test carrier_storage_extent__preserves_logical_tail {
     for (width <= 16) {
         var size: u64 = 0;
         for (size <= width::u64 * 2) {
-            var slot: ParamSlot = make_slot_pair(CLASS_GP, 0, 1, 0, size, width::u32);
+            var slot: ParamSlot = make_slot_pair(CLASS_GP, isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, 0), isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, 1), 0, size, width::u32);
             if (size < width::u64) { slot.piece_count = 1; }
             val extent: res[u64, fail.Fail] = carrier_storage_extent(?slot);
             if (sel extent.err)                                  { ret 1; }
@@ -629,7 +985,7 @@ test carrier_storage_extent__preserves_logical_tail {
 }
 
 test carrier_storage_extent__rejects_malformed_pieces {
-    var slot: ParamSlot = make_slot(CLASS_GP, 0, 0, 4, 8);
+    var slot: ParamSlot = make_slot(CLASS_GP, isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, 0), 0, 4, 8);
     slot.pieces[0].src_off = -1;
     val r_986: res[u64, fail.Fail] = carrier_storage_extent(?slot);
     if (!sel r_986.err) { ret 1; }
@@ -660,7 +1016,7 @@ test carrier_storage_extent__rejects_malformed_pieces {
 }
 
 test carrier_storage_alignment__register_width_and_malformed_pieces {
-    var slot: ParamSlot = make_slot_pair(CLASS_GP, 0, 1, 0, 12, 8);
+    var slot: ParamSlot = make_slot_pair(CLASS_GP, isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, 0), isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, 1), 0, 12, 8);
     slot.pieces[0].width   = 4;
     slot.pieces[1].kind    = PIECE_FP;
     slot.pieces[1].src_off = 4;

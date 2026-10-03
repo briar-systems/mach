@@ -30,13 +30,13 @@ pub fun register_export_names(p: *project.Project) err[fail.Fail];
 pub fun register_import_libraries(p: *project.Project) err[fail.Fail];
 ```
 
-## fun register_attribute_strings
+## fun decorator_strings_register
 
 ```mach
-pub fun register_attribute_strings(p: *project.Project) err[fail.Fail];
+pub fun decorator_strings_register(p: *project.Project) err[fail.Fail];
 ```
 
-the string every attribute argument that takes one evaluates to, recorded for
+the string every decorator argument that takes one evaluates to, recorded for
 each later phase to read. it runs once the load walk has bound every constant
 a live declaration can name; an argument that is not a constant string is
 left out, and type checking reports it where it stands

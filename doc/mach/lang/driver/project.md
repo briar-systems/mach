@@ -130,12 +130,6 @@ roots: *query.QueryKey, count: usize,
 result: err[fail.Fail]) err[fail.Fail];
 ```
 
-## fun span_eq_str
-
-```mach
-pub fun span_eq_str(source: str, span: lang_source.Span, s: str) bool;
-```
-
 ## fun link_name_for
 
 ```mach

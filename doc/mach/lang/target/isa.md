@@ -1,38 +1,5 @@
 # mach.lang.target.isa
 
-## val ISA_LABEL
-
-```mach
-pub val ISA_LABEL:       u16 = 0xFFFF
-```
-
-## val ISA_PCOPY
-
-```mach
-pub val ISA_PCOPY:       u16 = 0xFFFD
-```
-
-## val ISA_PCOPY_FENCE
-
-```mach
-pub val ISA_PCOPY_FENCE: u16 = 0xFFFC
-```
-
-## val ISA_USE
-
-```mach
-pub val ISA_USE:         u16 = 0xFFFB
-```
-
-## def AsmCtScanFn
-
-```mach
-pub def AsmCtScanFn: fun(str, *ct.AsmSecret, u32, ct.CtMulMask, bool, *A.Allocator) err[ct.AsmRefusal]
-```
-
-the constant-time scan of an asm body: the tracked bindings (`ct.AsmSecret`, by the name
-their `{name}` operand spells), the target's multiply admission and shift trust
-
 ## def DwarfRegFn
 
 ```mach
@@ -43,12 +10,6 @@ pub def DwarfRegFn: catalog_arch.DwarfRegFn
 
 ```mach
 pub def CvRegFn: catalog_arch.CvRegFn
-```
-
-## def RegFileFn
-
-```mach
-pub def RegFileFn: fun(*target_model.Register) i32
 ```
 
 ## rec BackendTarget
@@ -62,15 +23,6 @@ pub rec BackendTarget;
 ```mach
 pub rec AssemblyCapabilities;
 ```
-
-## val REG_NONE
-
-```mach
-pub val REG_NONE: i32 = -1
-```
-
-no register: the place a register fact holds when the instruction set has
-none for it
 
 ## def FixedPlace
 
@@ -211,6 +163,32 @@ pub val ENV_NONE: u32 = 0xFFFFFFFF
 pub rec IsaVTable;
 ```
 
+## def PrepareFn
+
+```mach
+pub def PrepareFn: fun()
+```
+
+## def ExtensionsSelectFn
+
+```mach
+pub def ExtensionsSelectFn: fun(*target_model.Machine, u64)
+```
+
+narrow a copy of an instruction set's model to the selected extension bits
+
+## fun extensions_select
+
+```mach
+pub fun extensions_select(isa_vt: *IsaVTable, model: *target_model.Machine, bits: u64);
+```
+
+narrow a copy of the template model to the selected extension bits
+
+isa_vt: the template
+model: the copy, which the template's model has been copied into
+bits: the selected extensions, closed over what they imply
+
 ## fun declares_local_got
 
 ```mach
@@ -237,46 +215,6 @@ pub fun branch_reach(tgt_isa: *IsaVTable, kind: target_of.RelocKind) opt[target_
 
 the reach of a direct branch a thunk can extend, none for any other kind or
 an instruction set that places no thunks
-
-## fun declares_machine_flags
-
-```mach
-pub fun declares_machine_flags(tgt_isa: *IsaVTable) bool;
-```
-
-## fun machine_flags
-
-```mach
-pub fun machine_flags(tgt_isa: *IsaVTable, float_arg_bits: u32,
-has_compressed: bool) u32;
-```
-
-## fun declares_attributes
-
-```mach
-pub fun declares_attributes(tgt_isa: *IsaVTable) bool;
-```
-
-## fun build_attributes
-
-```mach
-pub fun build_attributes(tgt_isa: *IsaVTable, model: *target_model.Machine, alloc: *A.Allocator, float_arg_bits: u32,
-has_compressed: bool, out_len: *u32) res[*u8, fail.Fail];
-```
-
-## fun validate_attributes
-
-```mach
-pub fun validate_attributes(tgt_isa: *IsaVTable, model: *target_model.Machine,
-bytes: *u8, len: u32, flags: u32) err[fail.Fail];
-```
-
-## fun merge_attributes
-
-```mach
-pub fun merge_attributes(tgt_isa: *IsaVTable, alloc: *A.Allocator, acc: *u8, acc_len: u32,
-add: *u8, add_len: u32, out_len: *u32) res[*u8, fail.Fail];
-```
 
 ## fun object_target
 

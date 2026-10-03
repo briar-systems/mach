@@ -316,8 +316,8 @@ A test is named with an identifier in its module's own test namespace, so it nev
 
 ### Built-in Types
 
-- **Integers**: `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64`.
-- **Floating point**: `f32`, `f64`.
+- **Integers**: `u8`, `u16`, `u32`, `u64`, `u128`, `i8`, `i16`, `i32`, `i64`, `i128`.
+- **Floating point**: `f16`, `f32`, `f64`.
 - **Untyped pointer**: `ptr`.
 - **Typed pointers**: `*T`. Pointers support array indexing `p[i]` and dereferencing `@p`. Member access on a pointer auto-dereferences once, so accessing a field through a pointer is written `p.x`.
 - **Arrays**: `[N]T` where `N` is a compile-time constant expression, such as `[4]u32`. Array literals are written as `[4]u32{1, 2, 3, 4}`. Fixed arrays are value types copied on assignment and function calls. To pass array data without copying, pass a pointer `*[N]T` or pass pointer and length pairs. The standard library also defines `std.types.view.View` as one common slice record representation. The inferred array syntax `[_]u8` is permitted only on `val` bindings annotated with `#[embed("path")]`.
@@ -534,12 +534,16 @@ pub fun print_all(va: ...) {
 - `$type_of(expr)`: compile-time type value for comparison inside `$if` conditions.
 - `$fields(T)`: sequence of record or union field descriptors, consumed with `$each f in $fields(T) { val field_val = instance.[f]; }`.
 - `$cases(T)`: sequence of tag case descriptors, consumed with `$each c in $cases(T)`.
-- `$is_tag(T)`, `$is_record(T)`, `$is_union(T)`, `$is_pointer(T)`, `$is_secret(T)`, `$holds_secret(T)`: type reflection predicates. `$is_secret` asks whether `T` is outermost `^`, `$holds_secret` whether any byte of `T` is secret.
+- `$is_tag(T)`, `$is_record(T)`, `$is_union(T)`, `$is_pointer(T)`, `$is_integer(T)`, `$is_float(T)`, `$is_secret(T)`, `$holds_secret(T)`: type reflection predicates. `$is_secret` asks whether `T` is outermost `^`, `$holds_secret` whether any byte of `T` is secret.
+- `$type_name(T)`, `$type_id(T)`: the spelling of type `T`, and an integer that identifies it.
+- `$pointee_of(T)`, `$discriminant_of(T)`: the type a typed reference refers to, and a tag's discriminator type, written where a type is expected.
 - `$error("message")`: produces a compile error when encountered in an active branch.
+
+Every intrinsic is described in `doc/language/comptime-intrinsics.md`.
 
 ## Decorators
 
-Decorators attach compiler metadata to declarations. Each directive is written in its own `#[name]` or `#[name(arg)]` clause. Multiple decorators can be stacked across several lines immediately preceding the declaration or written space-separated on one line:
+Decorators attach compiler metadata to declarations. Each directive is written in its own `#[<name>]` or `#[<name>(arg)]` clause. Multiple decorators can be stacked across several lines immediately preceding the declaration or written space-separated on one line:
 
 ```mach
 #[inline]
@@ -551,15 +555,17 @@ pub fun fast_calc(x: i64) i64 {
 
 - `#[symbol("name")]`: overrides the exported or imported linker symbol name.
 - `#[inline]`: forces the compiler to inline a function.
-- `#[align(N)]`: overrides alignment on a type, record field, or variable.
+- `#[align(N)]`: raises the alignment of a record, union, tag, global or function.
 - `#[packed]`: removes alignment padding from a record, union, or tag.
 - `#[section(".name")]`: places a function or global variable into a specific object file section.
 - `#[embed("path")]`: embeds the raw bytes of an external file at compile time into an uninitialized `val name: [_]u8;` array.
 - `#[library("name")]`: specifies the dynamic library name required for an external import.
-- `#[deprecated]` or `#[deprecated("message")]`: emits a compile warning whenever the decorated symbol is used.
+- `#[deprecated]` or `#[deprecated("message")]`: emits a compile warning wherever another module uses the decorated symbol.
 - `#[scalar]`: opts a function out of automatic vectorization.
 - `#[naked]`: emits a function without prologue or epilogue code, intended for functions written entirely with inline assembly.
 - `#[oblivious]`: marks a function as constant-time, verifying that no secret-dependent branches or variable-latency operations are emitted.
+
+Every decorator, and where each one applies, is listed in `doc/language/decorators.md`.
 
 ## Inline Assembly
 
@@ -586,7 +592,7 @@ pub fun pause() {
 ```
 
 Rules for inline assembly:
-- The architecture tag (`x86_64`, `aarch64`, `riscv64`) is mandatory.
+- The architecture tag is mandatory: one of `x86_64`, `aarch64`, `riscv64`, `riscv32`.
 - Operands reference local variables via `{name}` substitution. The compiler resolves substitutions to registers or stack slots based on instruction semantics.
 - Never write double indirections like `[{ptr}]`. Always load the address into a register first, then dereference the register.
 - The compiler automatically infers clobber sets and assumes a memory clobber. Manual clobber lists do not exist.

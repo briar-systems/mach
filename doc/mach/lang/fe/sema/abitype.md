@@ -1,11 +1,5 @@
 # mach.lang.fe.sema.abitype
 
-## val DIRECTIVE
-
-```mach
-pub val DIRECTIVE: str = "abi_type"
-```
-
 ## def ReadStatus
 
 ```mach

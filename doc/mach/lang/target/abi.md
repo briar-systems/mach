@@ -102,6 +102,9 @@ pub rec ParamPiece;
 pub rec AggField;
 ```
 
+a small aggregate's scalar leaves, as a convention that passes one field by
+field reads them
+
 ## rec AggLayout
 
 ```mach
@@ -113,6 +116,161 @@ pub rec AggLayout;
 ```mach
 pub fun agg_none() AggLayout;
 ```
+
+## def TypeShape
+
+```mach
+pub def TypeShape: u8
+```
+
+what a type is, as every convention reads it. a convention derives its own
+aggregate facts (eightbyte classes, homogeneous members, leaves) by walking
+a type through a TypeView; the code generator only describes the type
+
+## val SHAPE_NONE
+
+```mach
+pub val SHAPE_NONE: TypeShape = 0
+```
+
+a type the view cannot describe, which no walk descends into
+
+## val SHAPE_INT
+
+```mach
+pub val SHAPE_INT:   TypeShape = 1
+```
+
+an integer or pointer scalar
+
+## val SHAPE_FLOAT
+
+```mach
+pub val SHAPE_FLOAT: TypeShape = 2
+```
+
+## val SHAPE_HALF
+
+```mach
+pub val SHAPE_HALF:   TypeShape = 3
+```
+
+an integer carrying a binary16, which the convention's half rule places
+
+## val SHAPE_VECTOR
+
+```mach
+pub val SHAPE_VECTOR: TypeShape = 4
+```
+
+## val SHAPE_RECORD
+
+```mach
+pub val SHAPE_RECORD: TypeShape = 5
+```
+
+members at their own offsets
+
+## val SHAPE_ARRAY
+
+```mach
+pub val SHAPE_ARRAY: TypeShape = 6
+```
+
+`count` elements of one type
+
+## val SHAPE_UNION
+
+```mach
+pub val SHAPE_UNION: TypeShape = 7
+```
+
+members all at offset 0
+
+## val SHAPE_TAG
+
+```mach
+pub val SHAPE_TAG: TypeShape = 8
+```
+
+a discriminator of `disc_bytes` at offset 0, then `count` cases at one payload offset
+
+## rec TypeFacts
+
+```mach
+pub rec TypeFacts;
+```
+
+## rec TypeMember
+
+```mach
+pub rec TypeMember;
+```
+
+member `i` of a type and its offset from the type's start
+
+## rec TypeView
+
+```mach
+pub rec TypeView;
+```
+
+a read-only view of the program's types, handed to a classifier with the
+type it places; `state` is the describer's own
+
+## fun type_facts
+
+```mach
+pub fun type_facts(view: *TypeView, ty: u32) TypeFacts;
+```
+
+## fun type_member
+
+```mach
+pub fun type_member(view: *TypeView, ty: u32, i: u32) TypeMember;
+```
+
+## fun shape_is_float
+
+```mach
+pub fun shape_is_float(vt: *AbiVTable, shape: TypeShape) bool;
+```
+
+a type the convention places as a float: a float, or a binary16 where the
+convention's half row takes the float bank
+
+## fun arg_is_float
+
+```mach
+pub fun arg_is_float(vt: *AbiVTable, q: *ArgQuery) bool;
+```
+
+an argument the convention places as a float. an unnamed one is a float
+only where the variadic save model carries a float of its width
+
+## fun ret_is_float
+
+```mach
+pub fun ret_is_float(vt: *AbiVTable, q: *RetQuery) bool;
+```
+
+## fun arg_members_read
+
+```mach
+pub fun arg_members_read(q: *ArgQuery) bool;
+```
+
+a named aggregate argument is placed by its members; an unnamed one by its
+size alone
+
+## fun homogeneous_float
+
+```mach
+pub fun homogeneous_float(vt: *AbiVTable, view: *TypeView, ty: u32, out_members: *u8, out_elem: *u8);
+```
+
+a homogeneous float aggregate of one to four members of two, four or eight
+bytes: its member count and width, both 0 for any other type
 
 ## rec ParamSlot
 
@@ -130,64 +288,40 @@ double-word to an even register, C.11 and C.13 give the remaining general
 registers to nothing once an argument that wanted them goes to the stack, and
 C.3 does the same for the vector registers after an HFA or HVA)
 
-## val EB_SSE_LO
+## rec ArgQuery
 
 ```mach
-pub val EB_SSE_LO:    u8 = 1
+pub rec ArgQuery;
 ```
 
-eightbyte class mask handed to a classifier: bit 0 and bit 1 mark eightbyte 0 and 1 as SSE, bit 2 and
-bit 3 mark them as holding no leaf at all (padding only), and an unmarked eightbyte inside the object is INTEGER;
-bit 4 marks an aggregate holding a field at an offset that is not a multiple of the field's own alignment
-(a packed record), which System V classifies as MEMORY regardless of what its eightbytes hold
+one argument a convention places. align is the alignment the register
+assignment honors: the type's own, capped where the platform relaxes it
+(darwin aarch64 starts a 16-byte value in any x register). vec_bytes is the
+widest vector one register of the target carries under its selected
+extensions (isa.vector_register_bytes), which a convention that places a
+vector by its register width reads (System V's ymm under avx)
 
-## val EB_SSE_HI
+## rec RetQuery
 
 ```mach
-pub val EB_SSE_HI:    u8 = 2
+pub rec RetQuery;
 ```
 
-## val EB_EMPTY_LO
-
-```mach
-pub val EB_EMPTY_LO:  u8 = 4
-```
-
-## val EB_EMPTY_HI
-
-```mach
-pub val EB_EMPTY_HI:  u8 = 8
-```
-
-## val EB_UNALIGNED
-
-```mach
-pub val EB_UNALIGNED: u8 = 16
-```
+the result a convention places, described as an argument is
 
 ## def ArgPassingFn
 
 ```mach
-pub def ArgPassingFn: fun(i32, u64, u64, bool, u8, bool, bool, i32, i32, u8, u8, AggLayout, u64) ParamSlot
+pub def ArgPassingFn: fun(*AbiVTable, *ArgQuery) ParamSlot
 ```
 
-the arguments are index, size, align, is_float, eightbytes, is_aggregate, is_vector, gp_used, fp_used,
-hfa_members, hfa_elem, the aggregate layout and the vector register bytes. align is the alignment the
-register assignment honors: the type's own, capped where the platform relaxes it (darwin aarch64 starts a
-16-byte value in any x register). the vector register bytes are the widest vector one register of the
-target carries under its selected extensions (isa.vector_register_bytes), which a convention that places
-a vector by its register width reads (System V's ymm under avx)
+a classifier reads the descriptor it is called through, so one classifier
+serves every member of a family, each member's parameters in `family`
 
 ## def RetPassingFn
 
 ```mach
-pub def RetPassingFn: fun(u64, u64, bool, u8, bool, bool, u8, u8, AggLayout, u64) ParamSlot
-```
-
-## def RegFileFn
-
-```mach
-pub def RegFileFn: isa.RegFileFn
+pub def RetPassingFn: fun(*AbiVTable, *RetQuery) ParamSlot
 ```
 
 ## val HALF_FLOAT

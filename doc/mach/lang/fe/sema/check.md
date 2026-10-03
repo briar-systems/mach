@@ -15,8 +15,17 @@ pub fun check_call(sc: *sema_context.SemaContext, callee_sig: type.TypeId, args_
 ## fun check_comptime_call
 
 ```mach
-pub fun check_comptime_call(sc: *sema_context.SemaContext, callee_sig: type.TypeId, callee: ast_id.ExprId, f: *ast_decl.DeclFun, args_start: u32, args_len: u32, span: lang_source.Span) bool;
+pub fun check_comptime_call(sc: *sema_context.SemaContext, eid: ast_id.ExprId, callee_sig: type.TypeId, callee: ast_id.ExprId, f: *ast_decl.DeclFun, args_start: u32, args_len: u32, span: lang_source.Span) bool;
 ```
+
+## fun check_comptime_arg_fits
+
+```mach
+pub fun check_comptime_arg_fits(sc: *sema_context.SemaContext, value: comptime.CTValue, param_ty: type.TypeId, span: lang_source.Span) bool;
+```
+
+a comptime argument's value is held to its parameter's type the way a runtime
+argument is, so one its type cannot represent is refused as an overflow
 
 ## fun imported_module_const_sym
 
@@ -191,11 +200,4 @@ pub fun report_default_out_of_range(sc: *sema_context.SemaContext, span: lang_so
 ```
 
 the range refusal of a literal no context typed, which took the i64 default
-
-## fun report_instantiation_limit
-
-```mach
-pub fun report_instantiation_limit(sc: *sema_context.SemaContext, span: lang_source.Span, outcome: u8,
-bare: intern.StrId, args: *type.TypeId, arg_len: u32);
-```
 

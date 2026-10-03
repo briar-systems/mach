@@ -64,20 +64,6 @@ pub val SYMBOL_DEFERRED_TYPE: SymbolId = SymbolId;
 pub fun symbol_deferred(sid: SymbolId) bool;
 ```
 
-## val TESTING_DIRECTIVE
-
-```mach
-pub val TESTING_DIRECTIVE: str = "testing"
-```
-
-## val EXTENSIONS_DIRECTIVE
-
-```mach
-pub val EXTENSIONS_DIRECTIVE: str = "extensions"
-```
-
-`#[extensions(name, ...)]` takes bare extension names, which bind to nothing
-
 ## def SymKind
 
 ```mach
@@ -256,10 +242,10 @@ pub fun type_owner(s: *session.Session, mid: session.ModuleId, file: lang_source
 pub fun remap_result(r: *ResolveResult, s: *session.Session);
 ```
 
-## fun dnit_result
+## fun result_dnit
 
 ```mach
-pub fun dnit_result(r: *ResolveResult);
+pub fun result_dnit(r: *ResolveResult);
 ```
 
 ## fun resolve
@@ -280,7 +266,7 @@ resolve reads and never writes; what resolve binds is its result's
 ## fun decorators_deprecation
 
 ```mach
-pub fun decorators_deprecation(c: *comptime.ComptimeCtx, a: *ast.Ast, source: str, start: u32, len: u32) res[deprecation.Deprecation, fail.Fail];
+pub fun decorators_deprecation(c: *comptime.ComptimeCtx, a: *ast.Ast, start: u32, len: u32) res[deprecation.Deprecation, fail.Fail];
 ```
 
 the message is the string the argument evaluates to; one that is not a
@@ -289,7 +275,7 @@ constant string is reported by type checking and leaves the notice bare
 ## fun declaration_testing
 
 ```mach
-pub fun declaration_testing(a: *ast.Ast, source: str, did: ast_id.DeclId) bool;
+pub fun declaration_testing(a: *ast.Ast, did: ast_id.DeclId) bool;
 ```
 
 whether a declaration carries `#[testing]`, which confines every reference to it to test code

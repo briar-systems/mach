@@ -269,6 +269,19 @@ written as it finishes, before its phase's record:
 | `name` | string | the module or file |
 | `time_us` | integer | its time |
 
+Under `-v` a **growth** record is a growing cycle of instances, written each time its
+instance count doubles:
+
+```json
+{"schema":1,"record":"growth","module":"app.main","members":"peel","instances":32}
+```
+
+| Member | Type | Meaning |
+|---|---|---|
+| `module` | string | the module that declares the templates on the cycle |
+| `members` | string | the templates on the cycle, comma separated |
+| `instances` | integer | the instances of the cycle the module being checked has made so far |
+
 A unit's `built` line is not a record of its own: it is carried by the
 [summary record](#the-summary-record).
 

@@ -14,7 +14,7 @@ are stdlib `def`s.
 | Float | `f16`, `f32`, `f64` |
 | Untyped pointer | `ptr` |
 
-These fourteen names are the complete set of compiler-seeded primitive types.
+These names are the complete set of compiler-seeded primitive types.
 
 A **type** may not take one of these names. `rec`, `uni`, `tag`, `def` and a
 generic parameter named after a primitive are refused with `name.builtin_type`,
@@ -410,7 +410,7 @@ that composes over another handle takes a **type name**, so `Sampler2D` names th
 image it wraps rather than restating that image's operands and cannot disagree with
 it. That is the only place a decorator argument is read as a type.
 
-Every rule a handle carries follows from the one fact the directive states, and the
+Every rule a handle carries follows from the one fact the decorator states, and the
 set is fixed and closed rather than varied per declaration:
 
 - no fields, no indexing, no construction

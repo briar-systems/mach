@@ -1,71 +1,12 @@
 # mach.lang.target.isa.arm64
 
-## val HAS_FLOAT
-
-```mach
-pub val HAS_FLOAT: bool = true
-```
-
-## val EXT_SHA2
-
-```mach
-pub val EXT_SHA2: u64 = 0x1
-```
-
-the aarch64 extension vocabulary over the AdvSIMD baseline
-
-## val EXT_SB
-
-```mach
-pub val EXT_SB: u64 = 0x2
-```
-
-FEAT_SB, the speculation barrier `sb` (Armv8.0 optional, Armv8.5 mandatory)
-
-## val EXT_AES
-
-```mach
-pub val EXT_AES: u64 = 0x4
-```
-
-FEAT_AES, the aese, aesd, aesmc and aesimc rounds
-
-## val EXT_PMULL
-
-```mach
-pub val EXT_PMULL: u64 = 0x8
-```
-
-FEAT_PMULL, the 64x64 carry-less pmull and pmull2. the architecture reports
-it as a higher value of the one ID_AA64ISAR0_EL1.AES field, so it brings aes
-
-## val EXT_FP16
-
-```mach
-pub val EXT_FP16: u64 = 0x10
-```
-
-FEAT_FP16, half-precision arithmetic, comparison and integer conversion on
-the h registers (Armv8.2 optional). converting between half and single or
-double precision is the base FP and needs no extension
-
-## val EXTENSION_COUNT
-
-```mach
-pub val EXTENSION_COUNT: u32 = 5
-```
-
-## val EXTENSIONS
-
-```mach
-pub val EXTENSIONS: [EXTENSION_COUNT]extension.Extension = [EXTENSION_COUNT]extension.Extension;
-```
-
 ## val X0
 
 ```mach
 pub val X0:  i32 = 0
 ```
+
+hardware register numbers; a register id is regid_make of one
 
 ## val X9
 
@@ -131,18 +72,6 @@ pub val V30: i32 = 30
 
 ```mach
 pub val V31: i32 = 31
-```
-
-## val GPR_COUNT
-
-```mach
-pub val GPR_COUNT: i32 = 31
-```
-
-## val VECTOR_COUNT
-
-```mach
-pub val VECTOR_COUNT: i32 = 30
 ```
 
 ## def Opcode

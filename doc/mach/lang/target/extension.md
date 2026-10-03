@@ -16,6 +16,34 @@ crosses between them
 pub rec Extension;
 ```
 
+## rec Span
+
+```mach
+pub rec Span;
+```
+
+the token a refusal of a selection is about: its offset and length in the
+name, zero-length when the refusal is about the name as a whole
+
+## rec Selection
+
+```mach
+pub rec Selection;
+```
+
+what a name spelled in a selection syntax selects: the registered
+instruction set it narrows, by its catalog spelling, and the extension bits
+it names
+
+## rec SelectionSyntax
+
+```mach
+pub rec SelectionSyntax;
+```
+
+how an instruction set whose names carry a selection reads and writes them.
+an instruction set without one is named only by its registered name
+
 ## val MAX_SELECTED
 
 ```mach

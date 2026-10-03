@@ -1,0 +1,858 @@
+# which of a module's templates can instantiate themselves without end
+#
+# the graph is over declarations: a node is one parameter of one template of the module, a
+# type parameter, a comptime value parameter or the pack, and an edge says that parameter
+# flows into an argument of a template a call in the body names. an edge grows when the
+# argument derives from the parameter without being it: `f[*T]` from `T`, `f(n + 1)` from
+# `n`, a pack forwarded with more elements than it had, or an element derived from one of
+# the pack's. a cycle with a growing edge mints a fresh instance at every trip around it, so
+# only a comptime gate on it can stop it. a call inside a comptime arm or an `$each` is gated;
+# one outside both is reached by every instance of its caller. a cycle all of whose edges are
+# ungated and one of which grows never stops, and is refused before any of it is expanded.
+# every other instantiation is finite: outside a growing cycle by construction, and inside
+# one only as far as its gates let it run, which is as far as the program asks. a call to
+# another module's template cannot come back, since modules do not import each other in a
+# cycle
+use std.collections.map;
+use collections_vector: std.collections.vector;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+
+use mach.lang.fail;
+use mach.lang.fe.ast;
+use ast_decl: mach.lang.fe.ast.decl;
+use ast_expr: mach.lang.fe.ast.expr;
+use ast_id:   mach.lang.fe.ast.id;
+use ast_stmt: mach.lang.fe.ast.stmt;
+use ast_type: mach.lang.fe.ast.type;
+use mach.lang.fe.resolve;
+use mach.lang.intern;
+use mach.lang.module;
+use mach.lang.session;
+use lang_source: mach.lang.source;
+use mach.lang.textbuild;
+
+pub val NONE: u32 = 0xFFFFFFFF;
+
+# a value or pack parameter's slot is its position in the parameter list past this base;
+# a type parameter's is its position among the type parameters
+val PARAM_BASE: u32 = 0x10000;
+
+# a growing cycle: the templates on it, and whether it is refused, at the growing call of
+# its ungated part and the templates that call joins
+pub rec Cycle {
+    members: intern.StrId;
+    refused: bool;
+    site:    lang_source.Span;
+    caller:  intern.StrId;
+    callee:  intern.StrId;
+}
+
+pub rec Analysis {
+    alloc:    *A.Allocator;
+    module:   session.ModuleId;
+    cycle_of: map.Map[u32, u32];
+    cycles:   collections_vector.Vector[Cycle];
+}
+
+pub rec Arc {
+    from: u32;
+    to:   u32;
+}
+
+rec Edge {
+    grows:  bool;
+    gated:  bool;
+    site:   lang_source.Span;
+    caller: u32;
+    callee: u32;
+}
+
+rec Walk {
+    s:       *session.Session;
+    a:       *ast.Ast;
+    rr:      *resolve.ResolveResult;
+    source:  str;
+    own:     session.ModuleId;
+    status:  *fail.PhaseStatus;
+    nodes:   map.Map[u64, u32];
+    decl_of: collections_vector.Vector[u32];
+    arcs:    collections_vector.Vector[Arc];
+    edges:   collections_vector.Vector[Edge];
+    # the template whose body is walked, how deep the walk is in comptime arms and eaches,
+    # and the names `$each` binds over its pack
+    caller:    u32;
+    gated:     u32;
+    each_vars: collections_vector.Vector[intern.StrId];
+}
+
+pub fun init(alloc: *A.Allocator) Analysis {
+    var an: Analysis;
+    an.alloc    = alloc;
+    an.cycle_of = map.init[u32, u32](alloc);
+    an.cycles   = collections_vector.init[Cycle](alloc);
+    ret an;
+}
+
+pub fun dnit(an: *Analysis) {
+    if (an == nil || an.alloc == nil) { ret; }
+    map.dnit[u32, u32](?an.cycle_of);
+    collections_vector.dnit[Cycle](?an.cycles);
+    an.alloc = nil;
+}
+
+# the growing cycle declaration `decl` lies on, if any
+pub fun cycle_of(an: *Analysis, decl: ast_id.DeclId) opt[u32] {
+    if (an == nil || an.alloc == nil) { ret opt[u32].none{}; }
+    var key: u32       = ast_id.decl_index(decl);
+    val got: opt[*u32] = map.get[u32, u32](?an.cycle_of, ?key);
+    if (sel got.none) { ret opt[u32].none{}; }
+    ret opt[u32].some{@got.some};
+}
+
+pub fun cycle_at(an: *Analysis, id: u32) *Cycle {
+    ret ?an.cycles.data[id];
+}
+
+# a generic, a function with a comptime value parameter, or one with a pack: emitted only
+# as its instances
+pub fun fun_is_template(a: *ast.Ast, d: *ast_decl.Decl) bool {
+    if (d.kind != ast_decl.DECL_KIND_FUN) { ret false; }
+    if (d.data.fun_.generics_len > 0)     { ret true; }
+    var i: u32 = 0;
+    for (i < d.data.fun_.params_len) {
+        if (a.typed_names[d.data.fun_.params_start + i].comptime) { ret true; }
+        i = i + 1;
+    }
+    ret fun_pack_slot(a, d) != NONE;
+}
+
+fun fun_pack_slot(a: *ast.Ast, d: *ast_decl.Decl) u32 {
+    if (d.kind != ast_decl.DECL_KIND_FUN || d.data.fun_.params_len == 0) { ret NONE; }
+    val last: u32                 = d.data.fun_.params_len - 1;
+    val t:    opt[*ast_type.Type] = ast.get_type(a, a.typed_names[d.data.fun_.params_start + last].ty);
+    if (sel t.none)                             { ret NONE; }
+    if (t.some.kind != ast_type.TYPE_KIND_PACK) { ret NONE; }
+    ret PARAM_BASE + last;
+}
+
+# the growing cycles of module `own`, parsed as `a` and resolved as `rr`
+pub fun analyze(s: *session.Session, a: *ast.Ast, rr: *resolve.ResolveResult, source: str, own: session.ModuleId,
+    alloc: *A.Allocator) res[Analysis, fail.Fail] {
+    var status: fail.PhaseStatus = fail.accepted();
+    var w:      Walk;
+    w.s         = s;
+    w.a         = a;
+    w.rr        = rr;
+    w.source    = source;
+    w.own       = own;
+    w.status    = ?status;
+    w.nodes     = map.init[u64, u32](alloc);
+    w.decl_of   = collections_vector.init[u32](alloc);
+    w.arcs      = collections_vector.init[Arc](alloc);
+    w.edges     = collections_vector.init[Edge](alloc);
+    w.caller    = NONE;
+    w.gated     = 0;
+    w.each_vars = collections_vector.init[intern.StrId](alloc);
+    fin {
+        map.dnit[u64, u32](?w.nodes);
+        collections_vector.dnit[u32](?w.decl_of);
+        collections_vector.dnit[Arc](?w.arcs);
+        collections_vector.dnit[Edge](?w.edges);
+        collections_vector.dnit[intern.StrId](?w.each_vars);
+    }
+
+    var an: Analysis = init(alloc);
+    an.module = own;
+    if (a == nil || rr == nil) { ret res[Analysis, fail.Fail].ok{an}; }
+    var di: u32 = 0;
+    for (di < a.decl_len::u32) {
+        val d: opt[*ast_decl.Decl] = ast.get_decl(a, ast_id.decl(di));
+        if (sel d.some) {
+            if (fun_is_template(a, d.some) && !ast_id.stmt_is_nil(d.some.data.fun_.body)) {
+                w.caller = di;
+                w.gated  = 0;
+                collections_vector.clear[intern.StrId](?w.each_vars);
+                stmt_walk(?w, d.some.data.fun_.body);
+            }
+        }
+        if (!sel status.kind.accepted) { brk; }
+        di = di + 1;
+    }
+    if (sel status.kind.internal) {
+        dnit(?an);
+        ret res[Analysis, fail.Fail].err{fail.phase_failure(status)};
+    }
+    val settled: err[fail.Fail] = cycles_settle(?w, ?an);
+    if (sel settled.err) {
+        dnit(?an);
+        ret res[Analysis, fail.Fail].err{settled.err};
+    }
+    ret res[Analysis, fail.Fail].ok{an};
+}
+
+fun refuse(w: *Walk, e: A.Error) {
+    fail.internal(w.status, fail.describe(fail.refused(e)));
+}
+
+fun node(w: *Walk, decl: u32, slot: u32) u32 {
+    val key:  u64       = (decl::u64 << 32) | slot::u64;
+    val have: opt[*u32] = map.get[u64, u32](?w.nodes, ?key);
+    if (sel have.some) { ret @have.some; }
+    val id:     u32                 = w.decl_of.len::u32;
+    val pushed: res[usize, A.Error] = collections_vector.push[u32](?w.decl_of, decl);
+    if (sel pushed.err) {
+        refuse(w, pushed.err);
+        ret NONE;
+    }
+    val put: res[bool, A.Error] = map.insert[u64, u32](?w.nodes, key, id);
+    if (sel put.err) {
+        refuse(w, put.err);
+        ret NONE;
+    }
+    ret id;
+}
+
+fun edge_add(w: *Walk, from_slot: u32, callee: u32, to_slot: u32, grows: bool, site: lang_source.Span) {
+    val from: u32 = node(w, w.caller, from_slot);
+    val to:   u32 = node(w, callee, to_slot);
+    if (from == NONE || to == NONE) { ret; }
+    val arc: res[usize, A.Error] = collections_vector.push[Arc](?w.arcs, Arc{from: from, to: to});
+    if (sel arc.err) {
+        refuse(w, arc.err);
+        ret;
+    }
+    val edge: res[usize, A.Error] = collections_vector.push[Edge](?w.edges,
+        Edge{grows: grows, gated: w.gated > 0, site: site, caller: w.caller, callee: callee});
+    if (sel edge.err) { refuse(w, edge.err); }
+}
+
+fun stmt_list_walk(w: *Walk, start: u32, len: u32) {
+    var i: u32 = 0;
+    for (i < len) {
+        stmt_walk(w, w.a.stmt_ids[start + i]);
+        i = i + 1;
+    }
+}
+
+fun stmt_walk(w: *Walk, sid: ast_id.StmtId) {
+    if (ast_id.stmt_is_nil(sid)) { ret; }
+    val so: opt[*ast_stmt.Stmt] = ast.get_stmt(w.a, sid);
+    if (sel so.none) { ret; }
+    val st: *ast_stmt.Stmt    = so.some;
+    val k:  ast_stmt.StmtKind = st.kind;
+    if (k == ast_stmt.STMT_KIND_EXPR)  { expr_walk(w, st.data.expr.expr); }
+    or (k == ast_stmt.STMT_KIND_BLOCK) { stmt_list_walk(w, st.data.block.stmts_start, st.data.block.stmts_len); }
+    or (k == ast_stmt.STMT_KIND_IF) {
+        expr_walk(w, st.data.if_.cond);
+        stmt_walk(w, st.data.if_.then_block);
+        stmt_walk(w, st.data.if_.else_block);
+    }
+    or (k == ast_stmt.STMT_KIND_FOR) {
+        expr_walk(w, st.data.for_.cond);
+        stmt_walk(w, st.data.for_.body);
+    }
+    or (k == ast_stmt.STMT_KIND_RET) { expr_walk(w, st.data.ret_.value); }
+    or (k == ast_stmt.STMT_KIND_FIN) { stmt_walk(w, st.data.fin_.body); }
+    or (k == ast_stmt.STMT_KIND_DECL) {
+        val d: opt[*ast_decl.Decl] = ast.get_decl(w.a, st.data.decl.decl);
+        if (sel d.some) {
+            if (d.some.kind == ast_decl.DECL_KIND_VAL || d.some.kind == ast_decl.DECL_KIND_VAR) { expr_walk(w, d.some.data.bind.init); }
+        }
+    }
+    or (k == ast_stmt.STMT_KIND_COMPTIME_IF) {
+        w.gated = w.gated + 1;
+        var b: u32 = 0;
+        for (b < st.data.comptime_if.branches_len) {
+            val br: *ast_decl.ComptimeBranch = ?w.a.comptime_branches[st.data.comptime_if.branches_start + b];
+            stmt_list_walk(w, br.body_start, br.body_len);
+            b = b + 1;
+        }
+        w.gated = w.gated - 1;
+    }
+    or (k == ast_stmt.STMT_KIND_COMPTIME_EACH) { each_walk(w, ?st.data.comptime_each); }
+}
+
+# an `$each` runs its body once per element of its sequence, so a sequence that empties
+# stops it; over the caller's pack it binds a name whose element feeds the calls inside
+fun each_walk(w: *Walk, ce: *ast_stmt.StmtComptimeEach) {
+    var bound: bool = false;
+    if (ident_param_slot(w, ce.seq) != NONE && ident_param_slot(w, ce.seq) == caller_pack_slot(w)) {
+        val name: res[intern.StrId, A.Error] = intern.range_add(?w.s.interner, w.source, ce.var_name.offset, ce.var_name.len);
+        if (sel name.err) {
+            refuse(w, name.err);
+            ret;
+        }
+        val pushed: res[usize, A.Error] = collections_vector.push[intern.StrId](?w.each_vars, name.ok);
+        if (sel pushed.err) {
+            refuse(w, pushed.err);
+            ret;
+        }
+        bound = true;
+    }
+    w.gated = w.gated + 1;
+    stmt_list_walk(w, ce.body_start, ce.body_len);
+    w.gated = w.gated - 1;
+    if (bound) { w.each_vars.len = w.each_vars.len - 1; }
+}
+
+fun expr_list_walk(w: *Walk, start: u32, len: u32) {
+    var i: u32 = 0;
+    for (i < len) {
+        expr_walk(w, w.a.expr_ids[start + i]);
+        i = i + 1;
+    }
+}
+
+fun expr_walk(w: *Walk, eid: ast_id.ExprId) {
+    if (ast_id.expr_is_nil(eid)) { ret; }
+    val eo: opt[*ast_expr.Expr] = ast.get_expr(w.a, eid);
+    if (sel eo.none) { ret; }
+    val e: *ast_expr.Expr    = eo.some;
+    val k: ast_expr.ExprKind = e.kind;
+    if (k == ast_expr.EXPR_KIND_CALL || k == ast_expr.EXPR_KIND_GENERIC_INSTANCE) {
+        call_visit(w, ?e.data.call, e.span);
+        expr_walk(w, e.data.call.callee);
+        expr_list_walk(w, e.data.call.args_start, e.data.call.args_len);
+    }
+    or (k == ast_expr.EXPR_KIND_BINARY) {
+        expr_walk(w, e.data.binary.lhs);
+        expr_walk(w, e.data.binary.rhs);
+    }
+    or (k == ast_expr.EXPR_KIND_UNARY) { expr_walk(w, e.data.unary.operand); }
+    or (k == ast_expr.EXPR_KIND_INDEX) {
+        expr_walk(w, e.data.index.object);
+        expr_walk(w, e.data.index.index);
+        expr_walk(w, e.data.index.count);
+    }
+    or (k == ast_expr.EXPR_KIND_MEMBER) { expr_walk(w, e.data.member.object); }
+    or (k == ast_expr.EXPR_KIND_PROJECT) {
+        expr_walk(w, e.data.project.object);
+        expr_walk(w, e.data.project.field);
+    }
+    or (k == ast_expr.EXPR_KIND_CAST)       { expr_walk(w, e.data.cast.value); }
+    or (k == ast_expr.EXPR_KIND_STRIP)      { expr_walk(w, e.data.strip.value); }
+    or (k == ast_expr.EXPR_KIND_SPREAD)     { expr_walk(w, e.data.spread.inner); }
+    or (k == ast_expr.EXPR_KIND_ARRAY_LIT)  { expr_list_walk(w, e.data.array_lit.elems_start, e.data.array_lit.elems_len); }
+    or (k == ast_expr.EXPR_KIND_VECTOR_LIT) { expr_list_walk(w, e.data.vector_lit.elems_start, e.data.vector_lit.elems_len); }
+    or (k == ast_expr.EXPR_KIND_STRUCT_LIT) {
+        expr_list_walk(w, e.data.struct_lit.elems_start, e.data.struct_lit.elems_len);
+        var f: u32 = 0;
+        for (f < e.data.struct_lit.fields_len) {
+            expr_walk(w, w.a.field_inits[e.data.struct_lit.fields_start + f].value);
+            f = f + 1;
+        }
+    }
+    or (k == ast_expr.EXPR_KIND_SEL) {
+        expr_walk(w, e.data.sel.place);
+        expr_walk(w, e.data.sel.case_desc);
+    }
+}
+
+fun symbol_of_expr(w: *Walk, eid: ast_id.ExprId) opt[*resolve.Symbol] {
+    if (ast_id.expr_is_nil(eid) || w.rr.expr_resolved == nil || ast_id.expr_index(eid) >= w.rr.expr_count) { ret opt[*resolve.Symbol].none{}; }
+    ret symbol_at(w, w.rr.expr_resolved[ast_id.expr_index(eid)]);
+}
+
+fun symbol_of_type(w: *Walk, tid: ast_id.TypeId) opt[*resolve.Symbol] {
+    if (ast_id.type_is_nil(tid) || w.rr.type_resolved == nil || ast_id.type_index(tid) >= w.rr.type_count) { ret opt[*resolve.Symbol].none{}; }
+    ret symbol_at(w, w.rr.type_resolved[ast_id.type_index(tid)]);
+}
+
+fun symbol_at(w: *Walk, sid: resolve.SymbolId) opt[*resolve.Symbol] {
+    if (resolve.symbol_is_nil(sid) || w.rr.symbols == nil || resolve.symbol_index(sid) >= w.rr.symbol_count) { ret opt[*resolve.Symbol].none{}; }
+    ret opt[*resolve.Symbol].some{?w.rr.symbols[resolve.symbol_index(sid)]};
+}
+
+fun caller_decl(w: *Walk) *ast_decl.Decl {
+    val d: opt[*ast_decl.Decl] = ast.get_decl(w.a, ast_id.decl(w.caller));
+    if (sel d.none) { ret nil; }
+    ret d.some;
+}
+
+fun caller_pack_slot(w: *Walk) u32 {
+    val d: *ast_decl.Decl = caller_decl(w);
+    if (d == nil) { ret NONE; }
+    ret fun_pack_slot(w.a, d);
+}
+
+fun owned_by_caller(w: *Walk, sym: *resolve.Symbol) bool {
+    ret module.same(sym.origin, w.own) && ast_id.decl_index(sym.decl) == w.caller;
+}
+
+# the slot of the caller's value or pack parameter `eid` names exactly, or NONE
+fun ident_param_slot(w: *Walk, eid: ast_id.ExprId) u32 {
+    val eo: opt[*ast_expr.Expr] = ast.get_expr(w.a, eid);
+    if (sel eo.none)                              { ret NONE; }
+    if (eo.some.kind != ast_expr.EXPR_KIND_IDENT) { ret NONE; }
+    val so: opt[*resolve.Symbol] = symbol_of_expr(w, eid);
+    if (sel so.none)                                                       { ret NONE; }
+    if (so.some.kind != resolve.SYM_PARAM || !owned_by_caller(w, so.some)) { ret NONE; }
+    ret PARAM_BASE + so.some.slot;
+}
+
+# the slot of the caller's comptime value parameter `eid` names exactly, or NONE
+fun ident_value_slot(w: *Walk, eid: ast_id.ExprId) u32 {
+    val so: opt[*resolve.Symbol] = symbol_of_expr(w, eid);
+    if (sel so.none)                                      { ret NONE; }
+    if ((so.some.flags & resolve.SYM_FLAG_COMPTIME) == 0) { ret NONE; }
+    ret ident_param_slot(w, eid);
+}
+
+# whether `eid` is exactly one name an `$each` binds over the caller's pack
+fun ident_each_var(w: *Walk, eid: ast_id.ExprId) bool {
+    val eo: opt[*ast_expr.Expr] = ast.get_expr(w.a, eid);
+    if (sel eo.none)                              { ret false; }
+    if (eo.some.kind != ast_expr.EXPR_KIND_IDENT) { ret false; }
+    val so: opt[*resolve.Symbol] = symbol_of_expr(w, eid);
+    if (sel so.none) { ret false; }
+    var i: usize = 0;
+    for (i < w.each_vars.len) {
+        if (intern.str_same(so.some.name, w.each_vars.data[i])) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# what of the caller an expression reads: the comptime value parameter slots, appended to
+# `slots`, and whether it reads a name an `$each` binds over its pack
+rec Reads {
+    slots: collections_vector.Vector[u32];
+    each:  bool;
+}
+
+fun reads_of(w: *Walk, eid: ast_id.ExprId, r: *Reads) {
+    if (ast_id.expr_is_nil(eid)) { ret; }
+    val eo: opt[*ast_expr.Expr] = ast.get_expr(w.a, eid);
+    if (sel eo.none) { ret; }
+    val e: *ast_expr.Expr    = eo.some;
+    val k: ast_expr.ExprKind = e.kind;
+    if (k == ast_expr.EXPR_KIND_IDENT) {
+        val slot: u32 = ident_value_slot(w, eid);
+        if (slot != NONE) {
+            val pushed: res[usize, A.Error] = collections_vector.push[u32](?r.slots, slot);
+            if (sel pushed.err) { refuse(w, pushed.err); }
+        }
+        if (ident_each_var(w, eid)) { r.each = true; }
+    }
+    or (k == ast_expr.EXPR_KIND_BINARY) {
+        reads_of(w, e.data.binary.lhs, r);
+        reads_of(w, e.data.binary.rhs, r);
+    }
+    or (k == ast_expr.EXPR_KIND_UNARY) { reads_of(w, e.data.unary.operand, r); }
+    or (k == ast_expr.EXPR_KIND_CAST)  { reads_of(w, e.data.cast.value, r); }
+    or (k == ast_expr.EXPR_KIND_STRIP) { reads_of(w, e.data.strip.value, r); }
+    or (k == ast_expr.EXPR_KIND_INDEX) {
+        reads_of(w, e.data.index.object, r);
+        reads_of(w, e.data.index.index, r);
+    }
+    or (k == ast_expr.EXPR_KIND_MEMBER)  { reads_of(w, e.data.member.object, r); }
+    or (k == ast_expr.EXPR_KIND_PROJECT) { reads_of(w, e.data.project.object, r); }
+    or (k == ast_expr.EXPR_KIND_CALL) {
+        var i: u32 = 0;
+        for (i < e.data.call.args_len) {
+            reads_of(w, w.a.expr_ids[e.data.call.args_start + i], r);
+            i = i + 1;
+        }
+    }
+}
+
+# the caller's type parameters type node `tid` mentions, appended to `slots`
+fun type_reads(w: *Walk, tid: ast_id.TypeId, slots: *collections_vector.Vector[u32]) {
+    if (ast_id.type_is_nil(tid)) { ret; }
+    val to: opt[*ast_type.Type] = ast.get_type(w.a, tid);
+    if (sel to.none) { ret; }
+    val t: *ast_type.Type    = to.some;
+    val k: ast_type.TypeKind = t.kind;
+    if (k == ast_type.TYPE_KIND_NAMED) {
+        val slot: u32 = type_param_slot(w, tid);
+        if (slot != NONE) {
+            val pushed: res[usize, A.Error] = collections_vector.push[u32](slots, slot);
+            if (sel pushed.err) { refuse(w, pushed.err); }
+        }
+        var i: u32 = 0;
+        for (i < t.data.named.args_len) {
+            type_reads(w, w.a.type_ids[t.data.named.args_start + i], slots);
+            i = i + 1;
+        }
+    }
+    or (k == ast_type.TYPE_KIND_PTR)             { type_reads(w, t.data.ptr.pointee, slots); }
+    or (k == ast_type.TYPE_KIND_SECRET)          { type_reads(w, t.data.secret.inner, slots); }
+    or (k == ast_type.TYPE_KIND_ARRAY)           { type_reads(w, t.data.array.element, slots); }
+    or (k == ast_type.TYPE_KIND_POINTEE_OF)      { type_reads(w, t.data.pointee_of.inner, slots); }
+    or (k == ast_type.TYPE_KIND_DISCRIMINANT_OF) { type_reads(w, t.data.discriminant_of.inner, slots); }
+    or (k == ast_type.TYPE_KIND_FUN) {
+        var i: u32 = 0;
+        for (i < t.data.fun_.params_len) {
+            type_reads(w, w.a.typed_names[t.data.fun_.params_start + i].ty, slots);
+            i = i + 1;
+        }
+        type_reads(w, t.data.fun_.ret_type, slots);
+    }
+}
+
+# the slot of the caller's type parameter a bare named type node is, or NONE
+fun type_param_slot(w: *Walk, tid: ast_id.TypeId) u32 {
+    val to: opt[*ast_type.Type] = ast.get_type(w.a, tid);
+    if (sel to.none)                              { ret NONE; }
+    if (to.some.kind != ast_type.TYPE_KIND_NAMED) { ret NONE; }
+    if (to.some.data.named.args_len > 0)          { ret NONE; }
+    val so: opt[*resolve.Symbol] = symbol_of_type(w, tid);
+    if (sel so.none)                                                         { ret NONE; }
+    if (so.some.kind != resolve.SYM_GENERIC || !owned_by_caller(w, so.some)) { ret NONE; }
+    ret so.some.slot;
+}
+
+# the type parameter a type argument is exactly, a `^` around it included since `^` is
+# idempotent; NONE when it is anything else
+fun type_exact_slot(w: *Walk, tid: ast_id.TypeId) u32 {
+    val to: opt[*ast_type.Type] = ast.get_type(w.a, tid);
+    if (sel to.none)                               { ret NONE; }
+    if (to.some.kind == ast_type.TYPE_KIND_SECRET) { ret type_param_slot(w, to.some.data.secret.inner); }
+    ret type_param_slot(w, tid);
+}
+
+fun call_visit(w: *Walk, c: *ast_expr.ExprCall, site: lang_source.Span) {
+    val so: opt[*resolve.Symbol] = symbol_of_expr(w, c.callee);
+    if (sel so.none) { ret; }
+    val sym: *resolve.Symbol = so.some;
+    if (sym.kind != resolve.SYM_FUN || !module.same(sym.origin, w.own)) { ret; }
+    val go: opt[*ast_decl.Decl] = ast.get_decl(w.a, sym.decl);
+    if (sel go.none)                    { ret; }
+    if (!fun_is_template(w.a, go.some)) { ret; }
+    val g:      *ast_decl.Decl = go.some;
+    val callee: u32            = ast_id.decl_index(sym.decl);
+
+    var slots: collections_vector.Vector[u32] = collections_vector.init[u32](w.s.alloc);
+    fin { collections_vector.dnit[u32](?slots); }
+
+    var j: u32 = 0;
+    for (j < c.type_args_len) {
+        val tid: ast_id.TypeId = w.a.type_ids[c.type_args_start + j];
+        collections_vector.clear[u32](?slots);
+        type_reads(w, tid, ?slots);
+        val exact: u32   = type_exact_slot(w, tid);
+        var k:     usize = 0;
+        for (k < slots.len) {
+            edge_add(w, slots.data[k], callee, j, exact != slots.data[k], site);
+            k = k + 1;
+        }
+        j = j + 1;
+    }
+
+    val pack: u32 = fun_pack_slot(w.a, g);
+    var i:    u32 = 0;
+    for (i < g.data.fun_.params_len && i < c.args_len) {
+        if (PARAM_BASE + i == pack) { brk; }
+        if (w.a.typed_names[g.data.fun_.params_start + i].comptime) {
+            val arg: ast_id.ExprId = w.a.expr_ids[c.args_start + i];
+            var r:   Reads         = Reads{slots: collections_vector.init[u32](w.s.alloc), each: false};
+            reads_of(w, arg, ?r);
+            val exact: u32   = ident_value_slot(w, arg);
+            var k:     usize = 0;
+            for (k < r.slots.len) {
+                edge_add(w, r.slots.data[k], callee, PARAM_BASE + i, exact != r.slots.data[k], site);
+                k = k + 1;
+            }
+            collections_vector.dnit[u32](?r.slots);
+        }
+        i = i + 1;
+    }
+    if (pack != NONE) { pack_visit(w, c, callee, pack, site); }
+}
+
+# the pack a call hands on: a forwarded pack with more beside it grows, and an element that
+# reads a name an `$each` binds over the caller's pack grows unless it is that name
+fun pack_visit(w: *Walk, c: *ast_expr.ExprCall, callee: u32, pack: u32, site: lang_source.Span) {
+    val own_pack: u32 = caller_pack_slot(w);
+    if (own_pack == NONE) { ret; }
+    val fixed:  u32  = pack - PARAM_BASE;
+    var spread: bool = false;
+    var i:      u32  = fixed;
+    for (i < c.args_len) {
+        val eo: opt[*ast_expr.Expr] = ast.get_expr(w.a, w.a.expr_ids[c.args_start + i]);
+        if (sel eo.some) {
+            if (eo.some.kind == ast_expr.EXPR_KIND_SPREAD) { spread = true; }
+        }
+        i = i + 1;
+    }
+    if (spread) {
+        edge_add(w, own_pack, callee, pack, c.args_len > fixed + 1, site);
+        ret;
+    }
+    i = fixed;
+    for (i < c.args_len) {
+        val arg: ast_id.ExprId = w.a.expr_ids[c.args_start + i];
+        var r:   Reads         = Reads{slots: collections_vector.init[u32](w.s.alloc), each: false};
+        reads_of(w, arg, ?r);
+        if (r.each) { edge_add(w, own_pack, callee, pack, !ident_each_var(w, arg), site); }
+        collections_vector.dnit[u32](?r.slots);
+        i = i + 1;
+    }
+}
+
+# decides the cycles: a component of the whole graph holding a growing edge is a growing
+# cycle, and a component of its ungated edges holding an ungated growing one is refused
+fun cycles_settle(w: *Walk, an: *Analysis) err[fail.Fail] {
+    val n: u32 = w.decl_of.len::u32;
+    if (n == 0) { ret err[fail.Fail].ok{}; }
+
+    var all:     collections_vector.Vector[u32] = collections_vector.init[u32](w.s.alloc);
+    var ungated: collections_vector.Vector[u32] = collections_vector.init[u32](w.s.alloc);
+    var arcs_u:  collections_vector.Vector[Arc] = collections_vector.init[Arc](w.s.alloc);
+    var cyc:     collections_vector.Vector[u32] = collections_vector.init[u32](w.s.alloc);
+    fin {
+        collections_vector.dnit[u32](?all);
+        collections_vector.dnit[u32](?ungated);
+        collections_vector.dnit[Arc](?arcs_u);
+        collections_vector.dnit[u32](?cyc);
+    }
+    var i: usize = 0;
+    for (i < w.arcs.len) {
+        if (!w.edges.data[i].gated) {
+            val pushed: res[usize, A.Error] = collections_vector.push[Arc](?arcs_u, w.arcs.data[i]);
+            if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        }
+        i = i + 1;
+    }
+    val filled: err[fail.Fail] = fill(?all, n);
+    if (sel filled.err) { ret filled; }
+    val filled_u: err[fail.Fail] = fill(?ungated, n);
+    if (sel filled_u.err) { ret filled_u; }
+    val c_all: res[u32, fail.Fail] = components(w.s.alloc, n, w.arcs.data, w.arcs.len::u32, all.data);
+    if (sel c_all.err) { ret err[fail.Fail].err{c_all.err}; }
+    val c_ung: res[u32, fail.Fail] = components(w.s.alloc, n, arcs_u.data, arcs_u.len::u32, ungated.data);
+    if (sel c_ung.err) { ret err[fail.Fail].err{c_ung.err}; }
+
+    # the cycle each component of the whole graph becomes, NONE while it has no growing edge
+    val filled_c: err[fail.Fail] = fill(?cyc, c_all.ok);
+    if (sel filled_c.err) { ret filled_c; }
+    i = 0;
+    for (i < w.arcs.len) {
+        val arc:  Arc = w.arcs.data[i];
+        val comp: u32 = all.data[arc.from];
+        if (w.edges.data[i].grows && comp == all.data[arc.to] && cyc.data[comp] == NONE) {
+            val made: res[u32, fail.Fail] = cycle_make(w, an, all.data, comp);
+            if (sel made.err) { ret err[fail.Fail].err{made.err}; }
+            cyc.data[comp] = made.ok;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < w.arcs.len) {
+        val arc: Arc  = w.arcs.data[i];
+        val e:   Edge = w.edges.data[i];
+        if (e.grows && !e.gated && ungated.data[arc.from] == ungated.data[arc.to]) {
+            val id: u32    = cyc.data[all.data[arc.from]];
+            val cy: *Cycle = ?an.cycles.data[id];
+            if (!cy.refused) {
+                cy.refused = true;
+                cy.site    = e.site;
+                cy.caller  = decl_name(w, e.caller);
+                cy.callee  = decl_name(w, e.callee);
+            }
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun fill(v: *collections_vector.Vector[u32], n: u32) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i < n) {
+        val pushed: res[usize, A.Error] = collections_vector.push[u32](v, NONE);
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun decl_name(w: *Walk, decl: u32) intern.StrId {
+    val d: opt[*ast_decl.Decl] = ast.get_decl(w.a, ast_id.decl(decl));
+    if (sel d.none) { ret intern.STR_NIL; }
+    val name: res[intern.StrId, A.Error] = intern.range_add(?w.s.interner, w.source, d.some.data.fun_.name.offset, d.some.data.fun_.name.len);
+    if (sel name.err) {
+        refuse(w, name.err);
+        ret intern.STR_NIL;
+    }
+    ret name.ok;
+}
+
+# a growing cycle over the declarations of component `comp`, named in declaration order
+fun cycle_make(w: *Walk, an: *Analysis, comp_of: *u32, comp: u32) res[u32, fail.Fail] {
+    val id: u32                   = an.cycles.len::u32;
+    var b:  textbuild.TextBuilder = textbuild.tb_init(w.s.alloc);
+    fin { textbuild.tb_dnit(?b); }
+    var first: bool = true;
+    var d:     u32  = 0;
+    for (d < w.a.decl_len::u32) {
+        var on: bool = false;
+        var v:  u32  = 0;
+        for (v < w.decl_of.len::u32) {
+            if (w.decl_of.data[v] == d && comp_of[v] == comp) { on = true; }
+            v = v + 1;
+        }
+        if (on) {
+            var key: u32 = d;
+            if (!map.contains[u32, u32](?an.cycle_of, ?key)) {
+                val put: res[bool, A.Error] = map.insert[u32, u32](?an.cycle_of, d, id);
+                if (sel put.err) { ret res[u32, fail.Fail].err{fail.refused(put.err)}; }
+            }
+            if (!first) { textbuild.tb_append(?b, ", "); }
+            textbuild.tb_append(?b, intern.text(?w.s.interner, decl_name(w, d)));
+            first = false;
+        }
+        d = d + 1;
+    }
+    val text: res[str, textbuild.Error] = textbuild.tb_finish(?b);
+    if (sel text.err) { ret res[u32, fail.Fail].err{fail.message(textbuild.text(text.err))}; }
+    val members: res[intern.StrId, A.Error] = intern.add(?w.s.interner, text.ok);
+    str_free(w.s.alloc, text.ok);
+    if (sel members.err) { ret res[u32, fail.Fail].err{fail.refused(members.err)}; }
+    val pushed: res[usize, A.Error] = collections_vector.push[Cycle](?an.cycles,
+        Cycle{members: members.ok, refused: false, site: lang_source.span(0, 0), caller: intern.STR_NIL, callee: intern.STR_NIL});
+    if (sel pushed.err) { ret res[u32, fail.Fail].err{fail.refused(pushed.err)}; }
+    ret res[u32, fail.Fail].ok{id};
+}
+
+# Tarjan's strongly connected components over `n` nodes and `e` arcs, iteratively; `comp`
+# gets each node's component and the result is the component count
+pub fun components(alloc: *A.Allocator, n: u32, arcs: *Arc, e: u32, comp: *u32) res[u32, fail.Fail] {
+    var start: collections_vector.Vector[u32]  = collections_vector.init[u32](alloc);
+    var adj:   collections_vector.Vector[u32]  = collections_vector.init[u32](alloc);
+    var order: collections_vector.Vector[u32]  = collections_vector.init[u32](alloc);
+    var low:   collections_vector.Vector[u32]  = collections_vector.init[u32](alloc);
+    var stack: collections_vector.Vector[u32]  = collections_vector.init[u32](alloc);
+    var calls: collections_vector.Vector[u32]  = collections_vector.init[u32](alloc);
+    var curs:  collections_vector.Vector[u32]  = collections_vector.init[u32](alloc);
+    var on:    collections_vector.Vector[bool] = collections_vector.init[bool](alloc);
+    fin {
+        collections_vector.dnit[u32](?start);
+        collections_vector.dnit[u32](?adj);
+        collections_vector.dnit[u32](?order);
+        collections_vector.dnit[u32](?low);
+        collections_vector.dnit[u32](?stack);
+        collections_vector.dnit[u32](?calls);
+        collections_vector.dnit[u32](?curs);
+        collections_vector.dnit[bool](?on);
+    }
+    val reserved: err[fail.Fail] = components_reserve(n, e, ?start, ?adj, ?order, ?low, ?curs, ?on);
+    if (sel reserved.err) { ret res[u32, fail.Fail].err{reserved.err}; }
+
+    var i: u32 = 0;
+    for (i < e) {
+        start.data[arcs[i].from + 1] = start.data[arcs[i].from + 1] + 1;
+        i                            = i + 1;
+    }
+    i = 0;
+    for (i < n) {
+        start.data[i + 1] = start.data[i + 1] + start.data[i];
+        comp[i]           = NONE;
+        i                 = i + 1;
+    }
+    i = 0;
+    for (i < e) {
+        val from: u32 = arcs[i].from;
+        adj.data[start.data[from] + curs.data[from]] = arcs[i].to;
+        curs.data[from]                              = curs.data[from] + 1;
+        i                                            = i + 1;
+    }
+
+    var counter: u32 = 0;
+    var comps:   u32 = 0;
+    var root:    u32 = 0;
+    for (root < n) {
+        if (order.data[root] != NONE) {
+            root = root + 1;
+            cnt;
+        }
+        order.data[root] = counter;
+        low.data[root]   = counter;
+        counter          = counter + 1;
+        curs.data[root]  = start.data[root];
+        on.data[root]    = true;
+        val p_root: res[usize, A.Error] = collections_vector.push[u32](?stack, root);
+        if (sel p_root.err) { ret res[u32, fail.Fail].err{fail.refused(p_root.err)}; }
+        val c_root: res[usize, A.Error] = collections_vector.push[u32](?calls, root);
+        if (sel c_root.err) { ret res[u32, fail.Fail].err{fail.refused(c_root.err)}; }
+
+        for (calls.len > 0) {
+            val v: u32 = calls.data[calls.len - 1];
+            if (curs.data[v] < start.data[v + 1]) {
+                val t: u32 = adj.data[curs.data[v]];
+                curs.data[v] = curs.data[v] + 1;
+                if (order.data[t] == NONE) {
+                    order.data[t] = counter;
+                    low.data[t]   = counter;
+                    counter       = counter + 1;
+                    curs.data[t]  = start.data[t];
+                    on.data[t]    = true;
+                    val p_t: res[usize, A.Error] = collections_vector.push[u32](?stack, t);
+                    if (sel p_t.err) { ret res[u32, fail.Fail].err{fail.refused(p_t.err)}; }
+                    val c_t: res[usize, A.Error] = collections_vector.push[u32](?calls, t);
+                    if (sel c_t.err) { ret res[u32, fail.Fail].err{fail.refused(c_t.err)}; }
+                }
+                or (on.data[t] && order.data[t] < low.data[v]) {
+                    low.data[v] = order.data[t];
+                }
+                cnt;
+            }
+            calls.len = calls.len - 1;
+            if (calls.len > 0) {
+                val p: u32 = calls.data[calls.len - 1];
+                if (low.data[v] < low.data[p]) { low.data[p] = low.data[v]; }
+            }
+            if (low.data[v] == order.data[v]) {
+                for (true) {
+                    stack.len = stack.len - 1;
+                    val m: u32 = stack.data[stack.len];
+                    on.data[m] = false;
+                    comp[m]    = comps;
+                    if (m == v) { brk; }
+                }
+                comps = comps + 1;
+            }
+        }
+        root = root + 1;
+    }
+    ret res[u32, fail.Fail].ok{comps};
+}
+
+fun components_reserve(n: u32, e: u32, start: *collections_vector.Vector[u32], adj: *collections_vector.Vector[u32],
+    order: *collections_vector.Vector[u32], low: *collections_vector.Vector[u32], curs: *collections_vector.Vector[u32],
+    on: *collections_vector.Vector[bool]) err[fail.Fail] {
+    var i: u32 = 0;
+    for (i <= n) {
+        val pushed: res[usize, A.Error] = collections_vector.push[u32](start, 0);
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < e) {
+        val pushed: res[usize, A.Error] = collections_vector.push[u32](adj, 0);
+        if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < n) {
+        val po: res[usize, A.Error] = collections_vector.push[u32](order, NONE);
+        if (sel po.err) { ret err[fail.Fail].err{fail.refused(po.err)}; }
+        val pl: res[usize, A.Error] = collections_vector.push[u32](low, 0);
+        if (sel pl.err) { ret err[fail.Fail].err{fail.refused(pl.err)}; }
+        val pc: res[usize, A.Error] = collections_vector.push[u32](curs, 0);
+        if (sel pc.err) { ret err[fail.Fail].err{fail.refused(pc.err)}; }
+        val pn: res[usize, A.Error] = collections_vector.push[bool](on, false);
+        if (sel pn.err) { ret err[fail.Fail].err{fail.refused(pn.err)}; }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}

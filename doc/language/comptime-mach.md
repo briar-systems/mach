@@ -33,6 +33,15 @@ $mach.build.ct_mul(op, width)   # live; 1 when a secret multiply of that cell is
 $mach.build.extensions.<name>   # live; 1 when the target selects that instruction-set extension, else 0
 ```
 
+`$mach.build.arch` answers the target's `isa` key: the manifest calls the axis
+`isa` and both comptime roots call it `arch`, and the tags are the isa catalog's
+spellings. A riscv isa string such as `rv32imc` answers `$mach.arch.riscv32`.
+
+`$mach.build.mode` answers which pipeline the build runs, whatever the profile is
+named: `$mach.mode.release` when the selected profile's `opt` is 1 or 2, and
+`$mach.mode.debug` when it is 0. A `-O0` or `-O2` on the command line overrides
+the profile's `opt` and the mode with it.
+
 The members above are the whole subtree, and no manifest key adds one. The
 `extensions` members are the selected isa's own vocabulary, not the manifest's. A
 `$mach.build.<name>` that names none of them is a compile error at the use site
@@ -91,32 +100,9 @@ each one implies (see
 `extensions = ["sse41"]` answers 1 for `ssse3` too. On spirv the target's `env`
 selects them.
 
-The names are the selected isa's vocabulary and nothing else:
-
-- `x86_64`: `ssse3`, `sse41`, `sha`, `fsgsbase`, `popcnt`, `lzcnt`, `bmi1`, `sse42`,
-  `cx16`, `avx`, `avx2`, `bmi2`, `fma`, `movbe`, `f16c`, `avx512f`, `avx512bw`,
-  `avx512cd`, `avx512dq`, `avx512vl`, `aes`, `pclmul`;
-- `aarch64`: `sha2`, `sb`, `aes`, `pmull`, `fp16`;
-- `riscv64` and `riscv32`: `i`, `m`, `a`, `f`, `d`, `c`, `zicond`, `zicsr`, `zifencei`,
-  `zfhmin`, `zfh`, `zkt`;
-- `spirv`: `float16`, `zero_init_workgroup`, `storage_read_without_format`,
-  `storage_write_without_format`, `subgroup_arithmetic`, `subgroup_clustered`,
-  `subgroup_vote`, `subgroup_ballot`, `subgroup_shuffle`, `subgroup_shuffle_relative`,
-  `subgroup_quad`, `subgroup_graphics_stages`, `buffer_int64_atomics`,
-  `shared_int64_atomics`, `buffer_float32_atomics`, `buffer_float32_atomic_add`,
-  `buffer_float32_atomic_min_max`, `buffer_float64_atomics`, `buffer_float64_atomic_add`,
-  `buffer_float64_atomic_min_max`, `shared_float32_atomics`, `shared_float32_atomic_add`,
-  `shared_float32_atomic_min_max`, `shared_float64_atomics`, `shared_float64_atomic_add`,
-  `shared_float64_atomic_min_max`, `storage_image_multisample`, `resource_min_lod`,
-  `image_gather_extended`, `maintenance8`, `image_int64_atomics`, `image_float32_atomics`,
-  `image_float32_atomic_add`, `image_float32_atomic_min_max`, `vulkan_memory_model`,
-  `vulkan_memory_model_device_scope`, `int8`, `int16`, `buffer_device_address`, `int64`,
-  `float64`, `buffer_float16_atomics`, `buffer_float16_atomic_add`,
-  `buffer_float16_atomic_min_max`, `shared_float16_atomics`, `shared_float16_atomic_add`,
-  `shared_float16_atomic_min_max`, `storage_buffer_16bit_access`,
-  `uniform_and_storage_buffer_16bit_access`, `storage_push_constant16`,
-  `storage_input_output16`, `storage_buffer_8bit_access`,
-  `uniform_and_storage_buffer_8bit_access`, `storage_push_constant8`.
+The names are the selected isa's vocabulary and nothing else. Each isa's
+vocabulary is listed under
+[Instruction-set extensions](manifest.md#instruction-set-extensions).
 
 A name the selected isa does not declare is a compile error, never a silent 0, as
 `$mach.arch.*` refuses an unknown architecture:
@@ -250,6 +236,7 @@ $mach.abi.lp64d
 $mach.abi.ilp32
 $mach.abi.ilp32f
 $mach.abi.ilp32d
+$mach.abi.spirv
 $mach.mode.debug
 $mach.mode.release
 ```

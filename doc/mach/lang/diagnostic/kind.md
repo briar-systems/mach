@@ -3027,6 +3027,12 @@ pub val OP_OPERAND_VALUE:                 Kind = 503
 pub val OP_RESULT_FLOW:                   Kind = 504
 ```
 
+## val GENERIC_GROWING_CYCLE
+
+```mach
+pub val GENERIC_GROWING_CYCLE:            Kind = 505
+```
+
 ## rec Spec
 
 ```mach
@@ -3044,7 +3050,7 @@ retired: nothing raises the kind any more; the row stays so its key is
 ## val COUNT
 
 ```mach
-pub val COUNT: usize       = 504
+pub val COUNT: usize       = 505
 ```
 
 ## fun at

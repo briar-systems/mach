@@ -8,7 +8,8 @@ directory pairs with a row of the registry in `src/lang/fuzz.mach`, which names
 the function that answers it.
 
 Every file here is replayed by `mach test .` in both profiles
-(`mach.lang.fuzz.corpus:every_retained_input_is_answered`): an answer is a parsed
+(`mach.lang.fuzz:corpus__every_retained_input_is_answered`, reached through the
+driver, which composes every boundary): an answer is a parsed
 value or a typed rejection, and a crash, a hang or an allocation past its cap is
 a finding. To retain a new input, put the file in its boundary's directory. A
 single candidate can be answered on its own with `MACH_FUZZ_INPUT` and
