@@ -146,10 +146,12 @@ artifact's objects exactly as `mach build` does, adds a test object beside each
 module that declares tests, links one test **dispatcher** executable covering
 the selected tests, then runs each of them as its own process
 (`<exe> <index>`), captures its output, times
-it, and renders a per-module readout — collapsing all-passing modules to a
-single roll-up line and expanding any module with a failure to show the
-failing test's captured output and location. The full flag reference is
-`mach help test`; the options that select and shape a run are:
+it, and renders a per-module readout as the tests finish — collapsing
+all-passing modules to a single roll-up line and expanding any module with a
+failure to show the failing test's captured output and location. What `-v` and
+`-vv` add, and the order lines come out in, is the [readout](readout.md). The
+full flag reference is `mach help test`; the options that select and shape a
+run are:
 
 ```
 --jobs <n>               run up to n test processes at once (default: host CPUs)
@@ -161,11 +163,12 @@ failing test's captured output and location. The full flag reference is
 --timeout <duration>     terminate a test and its process group after the duration
 ```
 
-A roll-up is `<module>  <ok> ok[  <fail> FAIL]  <duration>`. Each expanded
-failure shows `file:line`, the exit code (`(exit N)`), signal (`(signal N)`)
-or `(timed out after <duration>)`, the child's captured output indented beneath, and
-the exact `rerun:` command; a passing test stays quiet. The run closes with a
-summary that re-lists every failure:
+A roll-up is `<module>  <ok> ok[  <fail> FAIL]  <duration>`, written once the
+module's last test finishes, so roll-ups come out in the order modules finish.
+Each expanded failure shows `file:line`, the exit code (`(exit N)`), signal
+(`(signal N)`) or `(timed out after <duration>)`, the child's captured output
+indented beneath, and the exact `rerun:` command; a passing test stays quiet.
+The run closes with a summary that re-lists every failure in collection order:
 
 ```
 failures:
@@ -373,3 +376,4 @@ disk.
   statements a test body uses
 - [files.md](files.md) — project layout the build (and `mach test`)
   discovers
+- [readout.md](readout.md) — what `mach test` writes, at each level, and when
