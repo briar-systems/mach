@@ -29,6 +29,7 @@ use mach.lang.me.ir.opdesc;
 use ir_type: mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.me.ir.verify;
+use mach.lang.me.pass;
 use mach.lang.me.pass.algebraic;
 use mach.lang.me.pass.constfold;
 use mach.lang.me.pass.cse;
@@ -92,305 +93,201 @@ pub fun run(req: *PipelineRequest) res[bool, fail.Fail] {
     if (req.module == nil)   { ret res[bool, fail.Fail].err{fail.message("pipeline request: module is required")}; }
     if (req.target == nil)   { ret res[bool, fail.Fail].err{fail.message("pipeline request: target is required")}; }
     if (req.interner == nil) { ret res[bool, fail.Fail].err{fail.message("pipeline request: interner is required")}; }
-
-    ret run_impl(req.module, req.target, req.level, req.vectorize_enabled.v,
-        req.simd_require.v, req.float_reassoc.v, req.interner, req.source_map, req.available, req.diags);
+    ret run_impl(req);
 }
 
-fun run_impl(m: *me_ir.Module, tgt: *lang_target.Target, level: OptLevel, vectorize_enabled: bool, simd_require: bool, float_reassoc: bool, itn: *intern.Interner, srcmap: *lang_source.SourceMap, available: *body.Available, diags: *diagnostic.DiagnosticStore) res[bool, fail.Fail] {
-    var vc: VerifyCtx;
-    vc.tgt    = tgt;
-    vc.itn    = itn;
-    vc.srcmap = srcmap;
+# the check a row runs after its pass and follow-ups
+def Verify: u8;
 
-    var changed: bool = false;
+val VERIFY_NONE: Verify = 0;
+# the structure every pass keeps: definitions, operands, predecessors and phis,
+# where a block may be unreachable
+val VERIFY_STRUCTURE: Verify = 1;
+# the structure, with every block reachable and every use dominated by its
+# definition
+val VERIFY_FULL: Verify = 2;
 
-    # one bounded workspace for every per-function pass in this run
-    var workspace:   scratch.Workspace;
-    val initialized: err[fail.Fail] = scratch.init(?workspace, m.backing);
-    if (sel initialized.err) { ret res[bool, fail.Fail].err{initialized.err}; }
-    fin { scratch.dnit(?workspace); }
-    val ws: *scratch.Workspace = ?workspace;
+# one step of a schedule
+rec Row {
+    pass: *pass.Pass;
+    # the lowest level the row runs at: OPT_DEBUG for the legalization every
+    # level needs, OPT_RELEASE for an optimization
+    level:  OptLevel;
+    verify: Verify;
+    # whether the check runs when the pass changed nothing
+    verify_unchanged: bool;
+    # the rows run when the pass changed the module, before its check
+    after:   *Row;
+    after_n: usize;
+}
 
-    val res_verify_in: err[fail.Fail] = verify_in(m, false, true, ?vc, ws);
-    if (sel res_verify_in.err) { ret res[bool, fail.Fail].err{res_verify_in.err}; }
+# a join every predecessor threaded past, an arm a diamond emptied, or a value
+# a rewrite replaced is unreachable or unread now
+val AFTER_CLEAN_N: usize = 1;
+val AFTER_CLEAN: [AFTER_CLEAN_N]Row = [AFTER_CLEAN_N]Row{
+    Row{pass: ?dce.PASS, level: OPT_DEBUG, verify: VERIFY_NONE, verify_unchanged: false, after: nil, after_n: 0},
+};
 
-    val mem2reg_changed_r: res[bool, fail.Fail] = mem2reg.run_in(m, ws);
-    if (sel mem2reg_changed_r.err) { ret mem2reg_changed_r; }
-    if (mem2reg_changed_r.ok)      { changed = true; }
-    val res_verify_mem2reg: err[fail.Fail] = verify_stage(m, false, ?vc, ws);
-    if (sel res_verify_mem2reg.err) { ret res[bool, fail.Fail].err{res_verify_mem2reg.err}; }
+# a split aggregate's scalar slots are promotable
+val AFTER_SROA_N: usize = 1;
+val AFTER_SROA: [AFTER_SROA_N]Row = [AFTER_SROA_N]Row{
+    Row{pass: ?mem2reg.PASS, level: OPT_RELEASE, verify: VERIFY_NONE, verify_unchanged: false, after: nil, after_n: 0},
+};
 
-    val constfold_changed_r: res[bool, fail.Fail] = constfold.run_in(m, ws);
-    if (sel constfold_changed_r.err) { ret constfold_changed_r; }
-    if (constfold_changed_r.ok)      { changed = true; }
-    val res_verify_constfold: err[fail.Fail] = verify_stage(m, false, ?vc, ws);
-    if (sel res_verify_constfold.err) { ret res[bool, fail.Fail].err{res_verify_constfold.err}; }
+# a guard proven at compile time is a constant branch, and the loop version it
+# skips is unreachable from then on; a vector body reads one address as often
+# as its scalar arms did, now in one block where one load serves
+val AFTER_VECTORIZE_N: usize = 3;
+val AFTER_VECTORIZE: [AFTER_VECTORIZE_N]Row = [AFTER_VECTORIZE_N]Row{
+    Row{pass: ?constfold.PASS, level: OPT_RELEASE, verify: VERIFY_NONE, verify_unchanged: false, after: nil, after_n: 0},
+    Row{pass: ?cse.PASS, level: OPT_RELEASE, verify: VERIFY_NONE, verify_unchanged: false, after: nil, after_n: 0},
+    Row{pass: ?dce.PASS, level: OPT_RELEASE, verify: VERIFY_NONE, verify_unchanged: false, after: nil, after_n: 0},
+};
 
-    val dce_changed_r: res[bool, fail.Fail] = dce.run_in(m, ws);
-    if (sel dce_changed_r.err) { ret dce_changed_r; }
-    if (dce_changed_r.ok)      { changed = true; }
-    val res_verify_dce: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
-    if (sel res_verify_dce.err) { ret res[bool, fail.Fail].err{res_verify_dce.err}; }
+# the pieces of different operations can compute the same value, such as the
+# product pair both halves of a widening multiply read; dce drops the pieces
+# and joins nothing reads
+val AFTER_SPLIT_N: usize = 2;
+val AFTER_SPLIT: [AFTER_SPLIT_N]Row = [AFTER_SPLIT_N]Row{
+    Row{pass: ?cse.PASS, level: OPT_RELEASE, verify: VERIFY_NONE, verify_unchanged: false, after: nil, after_n: 0},
+    Row{pass: ?dce.PASS, level: OPT_DEBUG, verify: VERIFY_NONE, verify_unchanged: false, after: nil, after_n: 0},
+};
 
-    if (level == OPT_RELEASE) {
-        # self tail recursion is a loop before inlining, so recursion peeling
-        # meets the loop rather than the call
-        val recurse_changed_r: res[bool, fail.Fail] = tailcall.recurse_in(m, ws);
-        if (sel recurse_changed_r.err) { ret recurse_changed_r; }
-        if (recurse_changed_r.ok) {
-            changed = true;
-            val res_verify_recurse: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
-            if (sel res_verify_recurse.err) { ret res[bool, fail.Fail].err{res_verify_recurse.err}; }
-        }
+# the vector checks, as passes that change nothing
+val DECLARED: pass.Pass = pass.Pass{run: declared_run, applies: nil};
+val FALLBACK: pass.Pass = pass.Pass{run: fallback_run, applies: nil};
 
-        val inline_changed_r: res[bool, fail.Fail] = inline_available(m, tgt, available, ws);
-        if (sel inline_changed_r.err) { ret inline_changed_r; }
-        if (inline_changed_r.ok)      { changed = true; }
-        val res_verify_inline: err[fail.Fail] = verify_stage(m, false, ?vc, ws);
-        if (sel res_verify_inline.err) { ret res[bool, fail.Fail].err{res_verify_inline.err}; }
-
-        val mem2reg2_changed_r: res[bool, fail.Fail] = mem2reg.run_in(m, ws);
-        if (sel mem2reg2_changed_r.err) { ret mem2reg2_changed_r; }
-        if (mem2reg2_changed_r.ok)      { changed = true; }
-        val res_verify_mem2reg2: err[fail.Fail] = verify_stage(m, false, ?vc, ws);
-        if (sel res_verify_mem2reg2.err) { ret res[bool, fail.Fail].err{res_verify_mem2reg2.err}; }
-
-        val constfold2_changed_r: res[bool, fail.Fail] = constfold.run_in(m, ws);
-        if (sel constfold2_changed_r.err) { ret constfold2_changed_r; }
-        if (constfold2_changed_r.ok)      { changed = true; }
-        val res_verify_constfold2: err[fail.Fail] = verify_stage(m, false, ?vc, ws);
-        if (sel res_verify_constfold2.err) { ret res[bool, fail.Fail].err{res_verify_constfold2.err}; }
-
-        val dce_pre_changed_r: res[bool, fail.Fail] = dce.run_in(m, ws);
-        if (sel dce_pre_changed_r.err) { ret dce_pre_changed_r; }
-        if (dce_pre_changed_r.ok)      { changed = true; }
-        val res_verify_dce_pre: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
-        if (sel res_verify_dce_pre.err) { ret res[bool, fail.Fail].err{res_verify_dce_pre.err}; }
-
-        val sroa_changed_r: res[bool, fail.Fail] = sroa.run_in(m, tgt, ws);
-        if (sel sroa_changed_r.err) { ret sroa_changed_r; }
-        if (sroa_changed_r.ok) {
-            changed = true;
-            val res_verify_sroa: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
-            if (sel res_verify_sroa.err) { ret res[bool, fail.Fail].err{res_verify_sroa.err}; }
-
-            val mem2reg3_changed_r: res[bool, fail.Fail] = mem2reg.run_in(m, ws);
-            if (sel mem2reg3_changed_r.err) { ret mem2reg3_changed_r; }
-            if (mem2reg3_changed_r.ok)      { changed = true; }
-            val res_verify_mem2reg3: err[fail.Fail] = verify_stage(m, false, ?vc, ws);
-            if (sel res_verify_mem2reg3.err) { ret res[bool, fail.Fail].err{res_verify_mem2reg3.err}; }
-        }
-
-        val algebraic_changed_r: res[bool, fail.Fail] = algebraic.run_in(m, ws);
-        if (sel algebraic_changed_r.err) { ret algebraic_changed_r; }
-        if (algebraic_changed_r.ok)      { changed = true; }
-        val res_verify_algebraic: err[fail.Fail] = verify_stage(m, false, ?vc, ws);
-        if (sel res_verify_algebraic.err) { ret res[bool, fail.Fail].err{res_verify_algebraic.err}; }
-
-        val cse_changed_r: res[bool, fail.Fail] = cse.run_in(m, ws);
-        if (sel cse_changed_r.err) { ret cse_changed_r; }
-        if (cse_changed_r.ok)      { changed = true; }
-        val res_verify_cse: err[fail.Fail] = verify_stage(m, false, ?vc, ws);
-        if (sel res_verify_cse.err) { ret res[bool, fail.Fail].err{res_verify_cse.err}; }
-
-        var thread_changed_r: res[bool, fail.Fail] = res[bool, fail.Fail].ok{false};
-        if (!tgt.model.structured_control_flow) { thread_changed_r = transform_thread.run_in(m, ws); }
-        if (sel thread_changed_r.err)           { ret thread_changed_r; }
-        if (thread_changed_r.ok) {
-            changed = true;
-            # a join every predecessor threaded past is unreachable now
-            val dce_thread_changed_r: res[bool, fail.Fail] = dce.run_in(m, ws);
-            if (sel dce_thread_changed_r.err) { ret dce_thread_changed_r; }
-            val res_verify_thread: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
-            if (sel res_verify_thread.err) { ret res[bool, fail.Fail].err{res_verify_thread.err}; }
-        }
-
-        # a small diamond becomes one block of selects once threading has
-        # settled the branches, so licm and the vectorizer see a single block
-        #; its emptied arms are unreachable
-        var ifconv_changed_r: res[bool, fail.Fail] = res[bool, fail.Fail].ok{false};
-        if (!tgt.model.structured_control_flow) { ifconv_changed_r = ifconv.run_in(m, tgt, ws); }
-        if (sel ifconv_changed_r.err)           { ret ifconv_changed_r; }
-        if (ifconv_changed_r.ok) {
-            changed = true;
-            val dce_ifconv_changed_r: res[bool, fail.Fail] = dce.run_in(m, ws);
-            if (sel dce_ifconv_changed_r.err) { ret dce_ifconv_changed_r; }
-            val res_verify_ifconv: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
-            if (sel res_verify_ifconv.err) { ret res[bool, fail.Fail].err{res_verify_ifconv.err}; }
-        }
-
-        val constfold3_changed_r: res[bool, fail.Fail] = constfold.run_in(m, ws);
-        if (sel constfold3_changed_r.err) { ret constfold3_changed_r; }
-        if (constfold3_changed_r.ok)      { changed = true; }
-        val res_verify_constfold3: err[fail.Fail] = verify_stage(m, false, ?vc, ws);
-        if (sel res_verify_constfold3.err) { ret res[bool, fail.Fail].err{res_verify_constfold3.err}; }
-
-        val dce2_changed_r: res[bool, fail.Fail] = dce.run_in(m, ws);
-        if (sel dce2_changed_r.err) { ret dce2_changed_r; }
-        if (dce2_changed_r.ok)      { changed = true; }
-        val res_verify_dce2: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
-        if (sel res_verify_dce2.err) { ret res[bool, fail.Fail].err{res_verify_dce2.err}; }
-
-        # the saturation of a shift by an unproven count is ir from here, so
-        # licm hoists the mask of a count the loop does not change
-        val bound_early_r: res[bool, fail.Fail] = shiftbound.run_in(m, ws);
-        if (sel bound_early_r.err) { ret bound_early_r; }
-        if (bound_early_r.ok) {
-            changed = true;
-            val res_verify_bound: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
-            if (sel res_verify_bound.err) { ret res[bool, fail.Fail].err{res_verify_bound.err}; }
-        }
-
-        val licm_changed_r: res[bool, fail.Fail] = licm.run_in(m, tgt, ws);
-        if (sel licm_changed_r.err) { ret licm_changed_r; }
-        if (licm_changed_r.ok)      { changed = true; }
-        val res_verify_licm: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
-        if (sel res_verify_licm.err) { ret res[bool, fail.Fail].err{res_verify_licm.err}; }
-
-        if (tgt.model.has_v128 && vectorize_enabled) {
-            val vec_changed_r: res[bool, fail.Fail] = vectorize.run(m, tgt, float_reassoc, itn);
-            if (sel vec_changed_r.err) { ret vec_changed_r; }
-            if (vec_changed_r.ok) {
-                changed = true;
-                # a guard proven at compile time is a constant branch, and the
-                # loop version it skips is unreachable from then on
-                val constfold_vec_changed_r: res[bool, fail.Fail] = constfold.run_in(m, ws);
-                if (sel constfold_vec_changed_r.err) { ret constfold_vec_changed_r; }
-                # a vector body reads one address as often as its scalar
-                # arms did, now in one block where one load serves
-                val cse_vec_changed_r: res[bool, fail.Fail] = cse.run_in(m, ws);
-                if (sel cse_vec_changed_r.err) { ret cse_vec_changed_r; }
-                val dce_vec_changed_r: res[bool, fail.Fail] = dce.run_in(m, ws);
-                if (sel dce_vec_changed_r.err) { ret dce_vec_changed_r; }
-                val res_verify_vec: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
-                if (sel res_verify_vec.err) { ret res[bool, fail.Fail].err{res_verify_vec.err}; }
-            }
-        }
-
-        # after the vectorizer, which reads its accesses as an iv times a size;
-        # the recomputation a reduced value replaced goes with dce
-        val strength_changed_r: res[bool, fail.Fail] = strength.run_in(m, tgt, ws);
-        if (sel strength_changed_r.err) { ret strength_changed_r; }
-        if (strength_changed_r.ok) {
-            changed = true;
-            val dce_strength_changed_r: res[bool, fail.Fail] = dce.run_in(m, ws);
-            if (sel dce_strength_changed_r.err) { ret dce_strength_changed_r; }
-            val res_verify_strength: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
-            if (sel res_verify_strength.err) { ret res[bool, fail.Fail].err{res_verify_strength.err}; }
-        }
-
-        # last of the loop passes, so every constant a loop still rebuilds is
-        # one it keeps: each is built once in the preheader
-        val hoist_changed_r: res[bool, fail.Fail] = hoistconst.run_in(m, tgt, ws);
-        if (sel hoist_changed_r.err) { ret hoist_changed_r; }
-        if (hoist_changed_r.ok) {
-            changed = true;
-            val res_verify_hoist: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
-            if (sel res_verify_hoist.err) { ret res[bool, fail.Fail].err{res_verify_hoist.err}; }
-        }
-    }
-
+# the middle end, in order. a row's comment says why its pass sits where it
+# does
+val SCHEDULE_N: usize = 32;
+val SCHEDULE: [SCHEDULE_N]Row = [SCHEDULE_N]Row{
+    Row{pass: ?mem2reg.PASS, level: OPT_DEBUG, verify: VERIFY_STRUCTURE, verify_unchanged: true, after: nil, after_n: 0},
+    Row{pass: ?constfold.PASS, level: OPT_DEBUG, verify: VERIFY_STRUCTURE, verify_unchanged: true, after: nil, after_n: 0},
+    Row{pass: ?dce.PASS, level: OPT_DEBUG, verify: VERIFY_FULL, verify_unchanged: true, after: nil, after_n: 0},
+    # self tail recursion is a loop before inlining, so recursion peeling meets
+    # the loop rather than the call
+    Row{pass: ?tailcall.RECURSE, level: OPT_RELEASE, verify: VERIFY_FULL, verify_unchanged: false, after: nil, after_n: 0},
+    Row{pass: ?inline.PASS, level: OPT_RELEASE, verify: VERIFY_STRUCTURE, verify_unchanged: true, after: nil, after_n: 0},
+    Row{pass: ?mem2reg.PASS, level: OPT_RELEASE, verify: VERIFY_STRUCTURE, verify_unchanged: true, after: nil, after_n: 0},
+    Row{pass: ?constfold.PASS, level: OPT_RELEASE, verify: VERIFY_STRUCTURE, verify_unchanged: true, after: nil, after_n: 0},
+    Row{pass: ?dce.PASS, level: OPT_RELEASE, verify: VERIFY_FULL, verify_unchanged: true, after: nil, after_n: 0},
+    Row{pass: ?sroa.PASS, level: OPT_RELEASE, verify: VERIFY_FULL, verify_unchanged: false, after: ?AFTER_SROA[0], after_n: AFTER_SROA_N},
+    Row{pass: ?algebraic.PASS, level: OPT_RELEASE, verify: VERIFY_STRUCTURE, verify_unchanged: true, after: nil, after_n: 0},
+    Row{pass: ?cse.PASS, level: OPT_RELEASE, verify: VERIFY_STRUCTURE, verify_unchanged: true, after: nil, after_n: 0},
+    Row{pass: ?transform_thread.PASS, level: OPT_RELEASE, verify: VERIFY_FULL, verify_unchanged: false, after: ?AFTER_CLEAN[0], after_n: AFTER_CLEAN_N},
+    # a small diamond becomes one block of selects once threading has settled
+    # the branches, so licm and the vectorizer see a single block
+    Row{pass: ?ifconv.PASS, level: OPT_RELEASE, verify: VERIFY_FULL, verify_unchanged: false, after: ?AFTER_CLEAN[0], after_n: AFTER_CLEAN_N},
+    Row{pass: ?constfold.PASS, level: OPT_RELEASE, verify: VERIFY_STRUCTURE, verify_unchanged: true, after: nil, after_n: 0},
+    Row{pass: ?dce.PASS, level: OPT_RELEASE, verify: VERIFY_FULL, verify_unchanged: true, after: nil, after_n: 0},
+    # the saturation of a shift by an unproven count is ir from here, so licm
+    # hoists the mask of a count the loop does not change
+    Row{pass: ?shiftbound.PASS, level: OPT_RELEASE, verify: VERIFY_FULL, verify_unchanged: false, after: nil, after_n: 0},
+    Row{pass: ?licm.PASS, level: OPT_RELEASE, verify: VERIFY_FULL, verify_unchanged: true, after: nil, after_n: 0},
+    Row{pass: ?vectorize.PASS, level: OPT_RELEASE, verify: VERIFY_FULL, verify_unchanged: false, after: ?AFTER_VECTORIZE[0], after_n: AFTER_VECTORIZE_N},
+    # after the vectorizer, which reads its accesses as an iv times a size
+    Row{pass: ?strength.PASS, level: OPT_RELEASE, verify: VERIFY_FULL, verify_unchanged: false, after: ?AFTER_CLEAN[0], after_n: AFTER_CLEAN_N},
+    # last of the loop passes, so every constant a loop still rebuilds is one it
+    # keeps: each is built once in the preheader
+    Row{pass: ?hoistconst.PASS, level: OPT_RELEASE, verify: VERIFY_FULL, verify_unchanged: false, after: nil, after_n: 0},
     # a vector shift whose count is the same value in every lane of a literal
-    # shifts by that one scalar, the uniform form placement reads as its own
-    # cell; the literal goes when nothing else reads it
-    val vecsplat_changed_r: res[bool, fail.Fail] = vecsplat.run(m, ws);
-    if (sel vecsplat_changed_r.err) { ret vecsplat_changed_r; }
-    if (vecsplat_changed_r.ok) {
-        changed = true;
-        val res_verify_vecsplat: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
-        if (sel res_verify_vecsplat.err) { ret res[bool, fail.Fail].err{res_verify_vecsplat.err}; }
-    }
-
+    # shifts by that one scalar, the uniform form placement reads as its own cell
+    Row{pass: ?vecsplat.PASS, level: OPT_DEBUG, verify: VERIFY_FULL, verify_unchanged: false, after: nil, after_n: 0},
     # a widening multiply is selected at every level, before placement reads
-    # each operator's declared form; an extension it leaves unread goes with dce
-    val widen_changed_r: res[bool, fail.Fail] = widenmul.run(m, tgt);
-    if (sel widen_changed_r.err) { ret widen_changed_r; }
-    if (widen_changed_r.ok) {
-        changed = true;
-        val dce_widen_changed_r: res[bool, fail.Fail] = dce.run_in(m, ws);
-        if (sel dce_widen_changed_r.err) { ret dce_widen_changed_r; }
-        val res_verify_widen: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
-        if (sel res_verify_widen.err) { ret res[bool, fail.Fail].err{res_verify_widen.err}; }
-    }
-
+    # each operator's declared form
+    Row{pass: ?widenmul.PASS, level: OPT_DEBUG, verify: VERIFY_FULL, verify_unchanged: false, after: ?AFTER_CLEAN[0], after_n: AFTER_CLEAN_N},
     # a division or a float conversion wider than the machine's alu becomes a
     # call to the helper the compiler provides with the program, one per
     # operation, synthesized once
-    val widediv_changed_r: res[bool, fail.Fail] = widediv.run(m, tgt, itn);
-    if (sel widediv_changed_r.err) { ret widediv_changed_r; }
-    val wideconv_changed_r: res[bool, fail.Fail] = wideconv.run(m, tgt, itn);
-    if (sel wideconv_changed_r.err) { ret wideconv_changed_r; }
-    if (widediv_changed_r.ok || wideconv_changed_r.ok) {
-        changed = true;
-        val res_verify_widecall: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
-        if (sel res_verify_widecall.err) { ret res[bool, fail.Fail].err{res_verify_widecall.err}; }
-    }
-
-    val res_declared: err[fail.Fail] = declared_check(m, tgt, itn, diags);
-    if (sel res_declared.err) { ret res[bool, fail.Fail].err{res_declared.err}; }
-
-    val res_fallback: err[fail.Fail] = fallback_check(m, tgt, itn, diags, simd_require);
-    if (sel res_fallback.err) { ret res[bool, fail.Fail].err{res_fallback.err}; }
-
+    Row{pass: ?widediv.PASS, level: OPT_DEBUG, verify: VERIFY_FULL, verify_unchanged: false, after: nil, after_n: 0},
+    Row{pass: ?wideconv.PASS, level: OPT_DEBUG, verify: VERIFY_FULL, verify_unchanged: false, after: nil, after_n: 0},
+    Row{pass: ?DECLARED, level: OPT_DEBUG, verify: VERIFY_NONE, verify_unchanged: false, after: nil, after_n: 0},
+    Row{pass: ?FALLBACK, level: OPT_DEBUG, verify: VERIFY_NONE, verify_unchanged: false, after: nil, after_n: 0},
     # type legalization: a vector wider than the target's register becomes its
     # register-width pieces, after the checks above have judged each operation
-    # whole; dce drops the pieces and joins nothing reads
-    val split_changed_r: res[bool, fail.Fail] = vecsplit.run_in(m, tgt, ws);
-    if (sel split_changed_r.err) { ret split_changed_r; }
-    if (split_changed_r.ok) {
-        changed = true;
-        # the pieces of different operations can compute the same value, such
-        # as the product pair both halves of a widening multiply read
-        if (level == OPT_RELEASE) {
-            val cse_split_changed_r: res[bool, fail.Fail] = cse.run_in(m, ws);
-            if (sel cse_split_changed_r.err) { ret cse_split_changed_r; }
-        }
-        val dce_split_changed_r: res[bool, fail.Fail] = dce.run_in(m, ws);
-        if (sel dce_split_changed_r.err) { ret dce_split_changed_r; }
-        val res_verify_split: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
-        if (sel res_verify_split.err) { ret res[bool, fail.Fail].err{res_verify_split.err}; }
-    }
-
-    val place_changed_r: res[bool, fail.Fail] = scalarize.run_in(m, tgt, ws);
-    if (sel place_changed_r.err) { ret place_changed_r; }
-    if (place_changed_r.ok)      { changed = true; }
-    val res_verify_place: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
-    if (sel res_verify_place.err) { ret res[bool, fail.Fail].err{res_verify_place.err}; }
-
-    if (tgt.model.has_v128 && !simd_require) {
-        val gap_changed_r: res[bool, fail.Fail] = scalarize.expand_gap_ops_in(m, tgt, ws);
-        if (sel gap_changed_r.err) { ret gap_changed_r; }
-        if (gap_changed_r.ok)      { changed = true; }
-        val res_verify_gap: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
-        if (sel res_verify_gap.err) { ret res[bool, fail.Fail].err{res_verify_gap.err}; }
-    }
-
-    val lanes_changed_r: res[bool, fail.Fail] = scalarize.expand_lane_ops_in(m, tgt, ws);
-    if (sel lanes_changed_r.err) { ret lanes_changed_r; }
-    if (lanes_changed_r.ok)      { changed = true; }
-    if (!tgt.model.has_lane_ops && tgt.model.has_v128) {
-        val res_verify_lanes: err[fail.Fail] = verify_stage(m, true, ?vc, ws);
-        if (sel res_verify_lanes.err) { ret res[bool, fail.Fail].err{res_verify_lanes.err}; }
-    }
-
-    # last, so no pass after it can move a shift away from the facts that
-    # bound its count, and every scalar shift a later pass formed is saturated
-    val bound_changed_r: res[bool, fail.Fail] = shiftbound.run_in(m, ws);
-    if (sel bound_changed_r.err) { ret bound_changed_r; }
-    if (bound_changed_r.ok)      { changed = true; }
-
+    # whole
+    Row{pass: ?vecsplit.PASS, level: OPT_DEBUG, verify: VERIFY_FULL, verify_unchanged: false, after: ?AFTER_SPLIT[0], after_n: AFTER_SPLIT_N},
+    Row{pass: ?scalarize.PASS, level: OPT_DEBUG, verify: VERIFY_FULL, verify_unchanged: true, after: nil, after_n: 0},
+    Row{pass: ?scalarize.GAPS, level: OPT_DEBUG, verify: VERIFY_FULL, verify_unchanged: true, after: nil, after_n: 0},
+    Row{pass: ?scalarize.LANES, level: OPT_DEBUG, verify: VERIFY_FULL, verify_unchanged: true, after: nil, after_n: 0},
+    # last, so no pass after it can move a shift away from the facts that bound
+    # its count, and every scalar shift a later pass formed is saturated
+    Row{pass: ?shiftbound.PASS, level: OPT_DEBUG, verify: VERIFY_NONE, verify_unchanged: false, after: nil, after_n: 0},
     # last, so nothing moves between a call flagged in tail position and its
     # return
-    if (level == OPT_RELEASE) {
-        val mark_changed_r: res[bool, fail.Fail] = tailcall.mark_in(m, ws);
-        if (sel mark_changed_r.err) { ret mark_changed_r; }
-        if (mark_changed_r.ok)      { changed = true; }
-    }
+    Row{pass: ?tailcall.MARK, level: OPT_RELEASE, verify: VERIFY_NONE, verify_unchanged: false, after: nil, after_n: 0},
+};
 
-    val res_verify_out: err[fail.Fail] = verify_in(m, true, true, ?vc, ws);
+fun run_impl(req: *PipelineRequest) res[bool, fail.Fail] {
+    var vc: VerifyCtx;
+    vc.tgt    = req.target;
+    vc.itn    = req.interner;
+    vc.srcmap = req.source_map;
+
+    # one bounded workspace for every per-function pass in this run
+    var workspace:   scratch.Workspace;
+    val initialized: err[fail.Fail] = scratch.init(?workspace, req.module.backing);
+    if (sel initialized.err) { ret res[bool, fail.Fail].err{initialized.err}; }
+    fin { scratch.dnit(?workspace); }
+
+    var ctx: pass.Context = pass.context(req.module, req.target, ?workspace);
+    ctx.interner      = req.interner;
+    ctx.available     = req.available;
+    ctx.diags         = req.diags;
+    ctx.vectorize     = req.vectorize_enabled.v;
+    ctx.simd_require  = req.simd_require.v;
+    ctx.float_reassoc = req.float_reassoc.v;
+
+    val res_verify_in: err[fail.Fail] = verify_in(req.module, false, true, ?vc, ?workspace);
+    if (sel res_verify_in.err) { ret res[bool, fail.Fail].err{res_verify_in.err}; }
+    val changed: res[bool, fail.Fail] = rows_run(?ctx, req.level, ?SCHEDULE[0], SCHEDULE_N, ?vc);
+    if (sel changed.err) { ret changed; }
+    val res_verify_out: err[fail.Fail] = verify_in(req.module, true, true, ?vc, ?workspace);
     if (sel res_verify_out.err) { ret res[bool, fail.Fail].err{res_verify_out.err}; }
+    ret changed;
+}
+
+# the `n` rows from `rows` in order at `level`, true when any pass changed the
+# module
+fun rows_run(ctx: *pass.Context, level: OptLevel, rows: *Row, n: usize, vc: *VerifyCtx) res[bool, fail.Fail] {
+    var changed: bool  = false;
+    var i:       usize = 0;
+    for (i < n) {
+        val ran: res[bool, fail.Fail] = row_run(ctx, level, ?rows[i], vc);
+        if (sel ran.err) { ret ran; }
+        if (ran.ok)      { changed = true; }
+        i = i + 1;
+    }
     ret res[bool, fail.Fail].ok{changed};
+}
+
+# a row skipped by its level or its pass's gate runs nothing and checks nothing
+fun row_run(ctx: *pass.Context, level: OptLevel, row: *Row, vc: *VerifyCtx) res[bool, fail.Fail] {
+    if (level < row.level)              { ret res[bool, fail.Fail].ok{false}; }
+    if (!pass.applies(row.pass, ctx))   { ret res[bool, fail.Fail].ok{false}; }
+    val ran: res[bool, fail.Fail] = row.pass.run(ctx);
+    if (sel ran.err) { ret ran; }
+    if (ran.ok && row.after_n > 0) {
+        val followed: res[bool, fail.Fail] = rows_run(ctx, level, row.after, row.after_n, vc);
+        if (sel followed.err) { ret followed; }
+    }
+    if (row.verify != VERIFY_NONE && (ran.ok || row.verify_unchanged)) {
+        val checked: err[fail.Fail] = verify_in(ctx.module, row.verify == VERIFY_FULL, true, vc, ctx.workspace);
+        if (sel checked.err) { ret res[bool, fail.Fail].err{checked.err}; }
+    }
+    ret ran;
+}
+
+fun declared_run(ctx: *pass.Context) res[bool, fail.Fail] {
+    val checked: err[fail.Fail] = declared_check(ctx.module, ctx.target, ctx.interner, ctx.diags);
+    if (sel checked.err) { ret res[bool, fail.Fail].err{checked.err}; }
+    ret res[bool, fail.Fail].ok{false};
+}
+
+fun fallback_run(ctx: *pass.Context) res[bool, fail.Fail] {
+    val checked: err[fail.Fail] = fallback_check(ctx.module, ctx.target, ctx.interner, ctx.diags, ctx.simd_require);
+    if (sel checked.err) { ret res[bool, fail.Fail].err{checked.err}; }
+    ret res[bool, fail.Fail].ok{false};
 }
 
 # a vector operator whose shape the target's catalog does not name is refused in
@@ -530,10 +427,6 @@ rec VerifyCtx {
     tgt:    *lang_target.Target;
     itn:    *intern.Interner;
     srcmap: *lang_source.SourceMap;
-}
-
-fun verify_stage(m: *me_ir.Module, full: bool, vc: *VerifyCtx, workspace: *scratch.Workspace) err[fail.Fail] {
-    ret verify_in(m, full, true, vc, workspace);
 }
 
 rec VerifyWork {
@@ -1643,13 +1536,6 @@ test passes__do_not_retain_function_work_in_ir {
         repeat = repeat + 1;
     }
     ret 0;
-}
-
-fun inline_available(m: *me_ir.Module, tgt: *lang_target.Target, available: *body.Available, workspace: *scratch.Workspace) res[bool, fail.Fail] {
-    val attached: err[fail.Fail] = body.attach(available, m);
-    if (sel attached.err) { ret res[bool, fail.Fail].err{attached.err}; }
-    fin { body.detach(available, m); }
-    ret inline.run_in(m, tgt, available, nil, workspace);
 }
 
 # the fail-at-N fixture for the whole pipeline: a slot stored in both arms
