@@ -1565,6 +1565,15 @@ pub rec MirModule;
 diags: the store a backend pass appends to when it rejects the program, the
 same store the front-end passes of the module wrote; owned by the caller
 
+## fun text_section_of
+
+```mach
+pub fun text_section_of(mm: *MirModule, name: intern.StrId) res[u32, fail.Fail];
+```
+
+the text section of `mm` named `name`, declared on first use: 0 is the
+default text, which a nil name means
+
 ## fun reject
 
 ```mach
