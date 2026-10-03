@@ -1168,34 +1168,19 @@ pub rec RelocOperand;
 ## def RelocTraitsFn
 
 ```mach
-pub def RelocTraitsFn: fun(RelocKind, SectionKind, bool) res[RelocTraits, RelocError]
+pub def RelocTraitsFn:         fun(RelocKind, SectionKind, bool) res[RelocTraits, RelocError]
 ```
 
 ## def ApplyRelocFn
 
 ```mach
-pub def ApplyRelocFn:  fun(RelocKind, *u8, u32, u32, RelocTarget, i64, u64, u64) res[bool, RelocError]
+pub def ApplyRelocFn:          fun(RelocKind, *u8, u32, u32, RelocTarget, i64, u64, u64) res[bool, RelocError]
 ```
-
-## def ElfRelocTypeFn
-
-```mach
-pub def ElfRelocTypeFn:        fun(RelocKind) opt[u32]
-```
-
-the ELF relocation type an instruction set gives a kind, absent when the
-instruction set declares no ELF encoding for that kind (unsupported)
 
 ## def LocalGotKindFn
 
 ```mach
 pub def LocalGotKindFn:        fun(RelocKind) bool
-```
-
-## def MachineFlagsFn
-
-```mach
-pub def MachineFlagsFn:        fun(u32, bool) u32
 ```
 
 ## def NormalizeImageFn
@@ -1209,6 +1194,14 @@ pub def NormalizeImageFn:      fun(*A.Allocator, *ObjectImage) err[fail.Fail]
 ```mach
 pub def ResolveRelocOperandFn: fun(*ObjectImage, u32) res[RelocOperand, fail.Fail]
 ```
+
+## def MachineFlagsFn
+
+```mach
+pub def MachineFlagsFn: fun(u32, bool) u32
+```
+
+(float_arg_bits, has_compressed): the processor flags word a header records
 
 ## def BuildAttributesFn
 
@@ -1233,17 +1226,25 @@ pub def ValidateAttributesFn: fun(*u8, u32, u32, u32) err[fail.Fail]
 validate: (bytes, len, xlen_bits, object machine flags), an input's section and flags
 against what the target can link at all, never against the extensions it selects
 
-## rec ElfAttributes
+## rec IsaRecord
 
 ```mach
-pub rec ElfAttributes;
+pub rec IsaRecord;
 ```
 
-## rec ElfRelocationCapabilities
+what a format records of one instruction set it covers beyond numbering its
+relocations: the processor flags word its headers carry and the attribute
+section describing what an object needs of the processor. a hook is nil when
+the format records nothing of that kind for the instruction set, and the three
+attribute hooks are declared together
+
+## def IsaRecordFn
 
 ```mach
-pub rec ElfRelocationCapabilities;
+pub def IsaRecordFn: fun(u32) *IsaRecord
 ```
+
+the record a format keeps for an instruction set, nil when it keeps none
 
 ## rec BranchReach
 
@@ -1444,6 +1445,59 @@ pub fun debug_id_of(vt: *DebugVTable) u32;
 
 ```mach
 pub fun covers_isa(vt: *OfVTable, arch_id: u32) bool;
+```
+
+## fun isa_record_for
+
+```mach
+pub fun isa_record_for(vt: *OfVTable, arch_id: u32) *IsaRecord;
+```
+
+the record `vt` keeps for the instruction set `arch_id`, nil when it keeps none
+
+## fun declares_machine_flags
+
+```mach
+pub fun declares_machine_flags(vt: *OfVTable, arch_id: u32) bool;
+```
+
+## fun machine_flags
+
+```mach
+pub fun machine_flags(vt: *OfVTable, arch_id: u32, float_arg_bits: u32, has_compressed: bool) u32;
+```
+
+the processor flags word `vt` records for `arch_id` under an abi passing floats
+in `float_arg_bits`-wide registers; 0 when it records none
+
+## fun declares_attributes
+
+```mach
+pub fun declares_attributes(vt: *OfVTable, arch_id: u32) bool;
+```
+
+## fun attributes_build
+
+```mach
+pub fun attributes_build(vt: *OfVTable, arch_id: u32, alloc: *A.Allocator, xlen_bits: u32, extensions: u64,
+float_arg_bits: u32, has_compressed: bool, out_len: *u32) res[*u8, fail.Fail];
+```
+
+the attribute section body an object for `arch_id` carries, nil when the
+format carries none
+
+## fun attributes_validate
+
+```mach
+pub fun attributes_validate(vt: *OfVTable, arch_id: u32, xlen_bits: u32,
+bytes: *u8, len: u32, flags: u32) err[fail.Fail];
+```
+
+## fun attributes_merge
+
+```mach
+pub fun attributes_merge(vt: *OfVTable, arch_id: u32, alloc: *A.Allocator, acc: *u8, acc_len: u32,
+add: *u8, add_len: u32, out_len: *u32) res[*u8, fail.Fail];
 ```
 
 ## fun abs_kind_for_pointer_width
