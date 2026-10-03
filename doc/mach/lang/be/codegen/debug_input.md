@@ -3,7 +3,7 @@
 ## def DwarfRegFn
 
 ```mach
-pub def DwarfRegFn: arch.DwarfRegFn
+pub def DwarfRegFn: catalog_arch.DwarfRegFn
 ```
 
 ## rec DebugTarget

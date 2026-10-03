@@ -18,7 +18,7 @@ the function when no instruction is
 ## fun ctx_setup
 
 ```mach
-pub fun ctx_setup(ctx: *LowerCtx, tgt: *resolved.Target, fn: *me_ir.Function) err[fail.Fail];
+pub fun ctx_setup(ctx: *LowerCtx, tgt: *binding.Binding, fn: *me_ir.Function) err[fail.Fail];
 ```
 
 ## fun count_mask_folds
@@ -234,7 +234,7 @@ pub fun mem_width_of(ctx: *LowerCtx, ty: ir_type.IrTypeId) u8;
 ## fun stack_slot_bytes
 
 ```mach
-pub fun stack_slot_bytes(tgt: *resolved.Target, size: u64) i64;
+pub fun stack_slot_bytes(tgt: *binding.Binding, size: u64) i64;
 ```
 
 ## fun lower_value
@@ -373,7 +373,7 @@ pub fun subwidth_vector_memory(ctx: *LowerCtx, ty: ir_type.IrTypeId) bool;
 ## fun copy_chunk_width
 
 ```mach
-pub fun copy_chunk_width(tgt: *resolved.Target, remaining: u64) u8;
+pub fun copy_chunk_width(tgt: *binding.Binding, remaining: u64) u8;
 ```
 
 ## fun emit_bin

@@ -66,7 +66,7 @@ ret: ok(true) when the surface is unchanged; ok(false) when the caller must relo
 ## fun target_context
 
 ```mach
-pub fun target_context(alloc: *A.Allocator, t: *lang_target.Target, req: *request.BuildRequest,
+pub fun target_context(alloc: *A.Allocator, t: *lang_target.Binding, req: *request.BuildRequest,
 compiler_name: intern.StrId, compiler_ver: intern.StrId) comptime.ComptimeCtx;
 ```
 
