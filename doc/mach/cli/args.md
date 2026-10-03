@@ -118,10 +118,10 @@ table: first row of the FlagSpec table
 n: row count of table
 ret: true when a row's name equals tok
 
-## def CommandId
+## def CommandKind
 
 ```mach
-pub def CommandId: u8
+pub def CommandKind: u8
 ```
 
 which command argv[1] named; the CMD_* constants
@@ -129,7 +129,7 @@ which command argv[1] named; the CMD_* constants
 ## val CMD_BUILD
 
 ```mach
-pub val CMD_BUILD: CommandId = 0
+pub val CMD_BUILD: CommandKind = 0
 ```
 
 `mach build`
@@ -137,7 +137,7 @@ pub val CMD_BUILD: CommandId = 0
 ## val CMD_RUN
 
 ```mach
-pub val CMD_RUN: CommandId = 1
+pub val CMD_RUN: CommandKind = 1
 ```
 
 `mach run`
@@ -145,7 +145,7 @@ pub val CMD_RUN: CommandId = 1
 ## val CMD_TEST
 
 ```mach
-pub val CMD_TEST: CommandId = 2
+pub val CMD_TEST: CommandKind = 2
 ```
 
 `mach test`
@@ -153,7 +153,7 @@ pub val CMD_TEST: CommandId = 2
 ## val CMD_CLEAN
 
 ```mach
-pub val CMD_CLEAN: CommandId = 3
+pub val CMD_CLEAN: CommandKind = 3
 ```
 
 `mach clean`
@@ -161,7 +161,7 @@ pub val CMD_CLEAN: CommandId = 3
 ## val CMD_DEP
 
 ```mach
-pub val CMD_DEP: CommandId = 4
+pub val CMD_DEP: CommandKind = 4
 ```
 
 `mach dep`, the one command with actions
@@ -169,7 +169,7 @@ pub val CMD_DEP: CommandId = 4
 ## val CMD_INIT
 
 ```mach
-pub val CMD_INIT: CommandId = 5
+pub val CMD_INIT: CommandKind = 5
 ```
 
 `mach init`
@@ -177,7 +177,7 @@ pub val CMD_INIT: CommandId = 5
 ## val CMD_DOC
 
 ```mach
-pub val CMD_DOC: CommandId = 6
+pub val CMD_DOC: CommandKind = 6
 ```
 
 `mach doc`
@@ -185,7 +185,7 @@ pub val CMD_DOC: CommandId = 6
 ## val CMD_INFO
 
 ```mach
-pub val CMD_INFO: CommandId = 7
+pub val CMD_INFO: CommandKind = 7
 ```
 
 `mach info`
@@ -193,7 +193,7 @@ pub val CMD_INFO: CommandId = 7
 ## val CMD_HELP
 
 ```mach
-pub val CMD_HELP: CommandId = 8
+pub val CMD_HELP: CommandKind = 8
 ```
 
 `mach help`
@@ -201,7 +201,7 @@ pub val CMD_HELP: CommandId = 8
 ## val CMD_CHECK
 
 ```mach
-pub val CMD_CHECK: CommandId = 9
+pub val CMD_CHECK: CommandKind = 9
 ```
 
 `mach check`
@@ -209,7 +209,7 @@ pub val CMD_CHECK: CommandId = 9
 ## val CMD_FMT
 
 ```mach
-pub val CMD_FMT: CommandId = 10
+pub val CMD_FMT: CommandKind = 10
 ```
 
 `mach fmt`
@@ -225,7 +225,7 @@ number of commands, the length of COMMANDS
 ## val CMD_NONE
 
 ```mach
-pub val CMD_NONE: CommandId = 255
+pub val CMD_NONE: CommandKind = 255
 ```
 
 no command recognized; the value of ParsedInvocation.command when has_command is false
@@ -364,7 +364,7 @@ pos_start, truncate_at_sep, has_action, and tables, help renders the rest
 name: the command word at argv[1]
 aliases: alternative command words; nil when alias_n is 0
 alias_n: length of aliases
-id: the CommandId value
+id: the CommandKind value
 grammar: the argument grammar help appends after the name, leading space included
 summary: one-line description for the overview
 effect: one-sentence description for the command page
@@ -388,15 +388,15 @@ pub val COMMANDS: [CMD_N]CommandSpec = [CMD_N]CommandSpec;
 ```
 
 the ten command records in help order: build, check, run, test, clean, dep,
-init, doc, info, help. Indexed by search, not by CommandId
+init, doc, info, help. Indexed by search, not by CommandKind
 
 ## fun command_lookup
 
 ```mach
-pub fun command_lookup(name: str) opt[CommandId];
+pub fun command_lookup(name: str) opt[CommandKind];
 ```
 
-the CommandId whose record has name as its name or one of its aliases
+the CommandKind whose record has name as its name or one of its aliases
 
 name: a command word
 ret: some id, or none when no record matches
@@ -404,12 +404,12 @@ ret: some id, or none when no record matches
 ## fun command_spec
 
 ```mach
-pub fun command_spec(id: CommandId) *CommandSpec;
+pub fun command_spec(id: CommandKind) *CommandSpec;
 ```
 
 the COMMANDS record carrying id
 
-id: a CommandId
+id: a CommandKind
 ret: the record, or nil when no record carries id (CMD_NONE always)
 
 ## fun dep_action_lookup
@@ -454,7 +454,7 @@ ret: true when every check passes
 ## fun schema_lookup
 
 ```mach
-pub fun schema_lookup(id: CommandId, action: DepAction, tok: str) SchemaHit;
+pub fun schema_lookup(id: CommandKind, action: DepAction, tok: str) SchemaHit;
 ```
 
 look tok up in the tables of id and action, the command's own tables before
@@ -523,7 +523,7 @@ ret: the invocation. argc below 2, an unrecognized command word, or an unrecogni
 ## fun invocation_flag
 
 ```mach
-pub fun invocation_flag(cmd: CommandId, inv: *ParsedInvocation, flag: str) bool;
+pub fun invocation_flag(cmd: CommandKind, inv: *ParsedInvocation, flag: str) bool;
 ```
 
 whether flag occurred, looked up in cmd's own tables only, never an action's
@@ -536,13 +536,13 @@ ret: true when some occurrence carries the flag's key
 ## fun invocation_value
 
 ```mach
-pub fun invocation_value(cmd: CommandId, inv: *ParsedInvocation, argv: **u8, flag: str) opt[*u8];
+pub fun invocation_value(cmd: CommandKind, inv: *ParsedInvocation, argv: **u8, flag: str) opt[*u8];
 ```
 
 ## fun diagnostics_format
 
 ```mach
-pub fun diagnostics_format(cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[cli_diagnostic.Format, fail.Fail];
+pub fun diagnostics_format(cmd: CommandKind, inv: *ParsedInvocation, argv: **u8) res[cli_diagnostic.Format, fail.Fail];
 ```
 
 the diagnostics format `--diagnostics=<human|json>` selects for a command
@@ -556,7 +556,7 @@ ret: the format, or a user failure for a bare `--diagnostics` or any other value
 ## fun collect_selectors
 
 ```mach
-pub fun collect_selectors(a: *A.Allocator, cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[manifest.Selectors, fail.Fail];
+pub fun collect_selectors(a: *A.Allocator, cmd: CommandKind, inv: *ParsedInvocation, argv: **u8) res[manifest.Selectors, fail.Fail];
 ```
 
 the `-a`, `-t` and `-p` patterns and `--all` a command was given
@@ -570,7 +570,7 @@ ret: the selectors; err when a selector has no value
 ## fun build_cli_invocation
 
 ```mach
-pub fun build_cli_invocation(a: *A.Allocator, cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[request.CliArgs, fail.Fail];
+pub fun build_cli_invocation(a: *A.Allocator, cmd: CommandKind, inv: *ParsedInvocation, argv: **u8) res[request.CliArgs, fail.Fail];
 ```
 
 the typed request.CliArgs of a build-shaped command: verbosity 0, 1, or 2
@@ -589,7 +589,7 @@ ret: the arguments, or err when `-v` or `-vv` is combined with `--quiet` or `-q`
 ## fun collect_link_inputs
 
 ```mach
-pub fun collect_link_inputs(a: *A.Allocator, c: *request.CliArgs, cmd: CommandId, inv: *ParsedInvocation, argv: **u8) err[fail.Fail];
+pub fun collect_link_inputs(a: *A.Allocator, c: *request.CliArgs, cmd: CommandKind, inv: *ParsedInvocation, argv: **u8) err[fail.Fail];
 ```
 
 fill c.link_tokens and c.lib_dirs in command-line order: every `-l` value and
