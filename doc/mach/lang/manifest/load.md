@@ -3,36 +3,40 @@
 ## fun parse
 
 ```mach
-pub fun parse(alloc: *A.Allocator, itn: *intern.Interner, doc: *Doc, as_root: bool) res[Manifest, fail.Fail];
+pub fun parse(alloc: *A.Allocator, itn: *intern.Interner, doc: *Doc) res[Manifest, fail.Fail];
 ```
 
-build a `Manifest` from a parsed TOML document. accepted root tables are
-`[project]`, `[target.*]`, `[artifact.*]`, `[profile.*]`, `[dep.*]`,
-`[link.*]` and `[step.*]`; any other root key, and any key a table does not
-define, is an error naming it. on any error every array allocated so far is
-freed before returning
+build a `Manifest` from a parsed TOML document, in three stages. the schema
+check holds the document to the rows of `mach.lang.manifest.schema`: a key no
+row names, a value of the wrong shape, a missing required key and a removed key
+are refused where they are written. decoding then reads each table into the
+model and refuses a value its key does not accept. validation last checks the
+rules that span entries: `need` entries and their cycles, `link` names, and at
+most one `default = true` profile. one rule holds for every key whoever reads
+the manifest, so a dependency's manifest is held to exactly the rules of the
+project being built. on any error every array allocated so far is freed
 
 alloc: owns the manifest's arrays
 itn: receives every string of the manifest
 doc: the manifest's text and its TOML document
-as_root: true for the project being built, false for a dependency's manifest.
-         the root form requires at least one `[profile.*]` table, `[artifact].link`
-         and `need`, `[link].os`, `isa`, `abi` and `export`, `[step].need`, requires
-         link filter values to be canonical or "*", and rejects more than one
-         `default = true` profile. the dependency form treats each of those keys as
-         optional. a declared `[profile.*]` table requires `opt`, `debug`, `simd`,
-         `vectorize` and `float_reassoc` in both forms. the key set is closed for
-         both forms: a key is read or refused as unknown
-ret: the manifest, or the first error as a "mach.toml: ..." message. the
-         `[project]` table and its `id`, `version`, `src` and `out` are always
-         required; `src`, `out`, artifact `entry` and `out`, local link `path` and
-         step `in` and `out` entries must satisfy `is_project_path`; every table name
-         must satisfy `is_valid_id`; `[target.native]` and `[dep.<x>].version` are
-         reserved; a `[step]` with `cmd` or `shell` is rejected by name; `need`
-         entries are checked by `validate_needs`. `[profile.*]` absent or empty is
-         an error at the root and synthesizes `debug` and `release` in a dependency.
-         a failure that names a key points at it in `doc`, and the manifest records
-         where each field a later refusal names is written, resolved in `doc`
+ret: the manifest, or the first error as a "mach.toml: ..." message pointing at
+       the key or value in `doc` it concerns. the manifest records where each
+       field a later refusal names is written, resolved in `doc`
+
+## fun project_parse
+
+```mach
+pub fun project_parse(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[fail.Fail];
+```
+
+the `[project]` table of a parsed TOML document alone, held to its rows as
+`parse` holds it, for a reader such as `mach fmt` that needs nothing else
+
+alloc: owns the refusal's text
+itn: receives the table's strings
+t: the document root
+m: receives the project fields
+ret: ok, or the first refusal
 
 ## rec Doc
 

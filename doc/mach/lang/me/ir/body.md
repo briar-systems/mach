@@ -57,7 +57,7 @@ owns the module home that allocator comes from
 ## fun available_init
 
 ```mach
-pub fun available_init(a: *Available, name: intern.StrId) err[fail.Fail];
+pub fun available_init(a: *Available, name: intern.StrId, backing: *A.Allocator) err[fail.Fail];
 ```
 
 ## fun detach

@@ -23,17 +23,29 @@ error[project.no_manifest]: no mach.toml in the project directory
 Nothing is inferred from the directory layout. `mach init` writes a complete
 manifest so a new project never starts from that error (`mach help init`).
 
-A table you *declare*, you declare completely. Every field of a declared table is
-required; a missing field is a strict-parse error, not a silent default. This is
-the manifest twin of Mach's explicitness: there are no field defaults to memorize,
-because "any" and "none" are said out loud —
+Every key has one rule, the same in every manifest, whoever reads it. A key may
+be left out only when leaving it out safely means that it does not apply: no
+entries, nothing exported, no limit, no extensions selected. Every other key is
+required, and a missing one is refused, never replaced by a silent default. A
+target must name its operating system, since nothing can be assumed in its
+place, but it need not name extensions. An artifact need not list what it links
+or needs. The explicit forms remain for when they are meant:
 
 - `"*"` is the explicit any-token for a filter axis or `targets` entry;
 - `[]` is the explicit empty list ("none").
 
-The sole exception is **shape-dependence**: a field whose presence follows another
-value in the same table. A dependency is `git` *or* `path`; a `[link.X]` names a
-`name` *or* a `path` according to its `source`. Nothing else defaults.
+One further case is allowed: a key whose presence is decided by another value of
+the same table. A dependency is `git` *or* `path`; a `[link.X]` names a `name`
+*or* a `path` according to its `source`.
+
+The tables below mark each key **yes** (required), **shape** (decided by another
+value of the table) or with what leaving it out means. Every key also has one
+type. A value of the wrong type is refused where it is written, naming the type
+the key takes, and a string key never takes the empty string:
+
+```
+error[manifest.value_type]: mach.toml: [target.windows-x86_64].stack_reserve must be an integer
+```
 
 A manifest refusal points at what it refuses, on the line after the message:
 the value it rejects, the key token of a name or key it rejects, or the table a
@@ -51,13 +63,15 @@ Unknown sections and unknown keys are always errors. A path value is always
 manifest is portable and is normalized to the host separator at the filesystem
 boundary.
 
-### Root vs. dependency strictness
+### Dependency manifests
 
-A dependency's `mach.toml` is read by the same closed schema, once, and an
-unknown or removed key in it fails the consumer's build naming the dependency:
+A dependency's `mach.toml` is held to exactly the rules of the project being
+built. It is read once, and an unknown, removed, mistyped or missing key in it
+fails the consumer's build naming the dependency:
 
 ```
 error[manifest.unknown_key]: dep 'std': mach.toml: unknown key 'bogus' in [project]
+error[manifest.missing_required]: dep 'gfx': mach.toml: missing [profile] table; a build needs an explicit [profile.<name>] declaring opt, debug, simd, vectorize and float_reassoc
 ```
 
 What a consumer *uses* from a dependency's manifest is its export surface: the
@@ -70,8 +84,9 @@ that artifact's `need` (see
 travels: a `bin` artifact's `need`, a non-default library's, and every other
 requirement of the dependency stay its own.
 
-A dependency's `[profile.*]` tables are never read to build the consumer, which
-resolves its own profile and builds everything with it. A dependency's
+A dependency declares its `[profile.*]` tables like any project, since it also
+builds on its own, but they are never read to build the consumer, which resolves
+its own profile and builds everything with it. A dependency's
 `[target.*]` tables are read for exactly one purpose: the targets its travelling
 requirements name, `env` included, since those artifacts are built for the
 targets the dependency declares for them. No other `[target.*]` entry is read.
@@ -82,7 +97,7 @@ targets the dependency declares for them. No other `[target.*]` entry is read.
 [project]
 id      = "demo"                       # required: identifier; root of every module path
 version = "0.1.0"                      # required
-mach    = "^5.3"                       # required in a root manifest: the compiler range
+mach    = "^5.3"                       # the compiler range; the project being built states it
 src     = "src"                        # required: source dir, project-root-relative
 out     = "out/{target.name}/{profile.name}"  # required: output-path template root
 
@@ -91,7 +106,7 @@ isa = "x86_64"
 os  = "linux"
 abi = "sysv64"
 
-[profile.debug]                        # a build variant; at least one is required
+[profile.debug]                        # a build variant; every manifest declares at least one
 opt   = 0                              # 0 (debug pipeline) | 1 | 2 (release pipeline)
 debug = true                           # emit debug info for this profile
 simd  = "scalarize"                    # SIMD lever: "scalarize" | "require"
@@ -104,8 +119,8 @@ kind    = "bin"                        # "bin" | "static" | "shared"
 entry   = "main.mach"                  # entry source, relative to src
 out     = "bin/demo{artifact.suffix}"  # output path, relative to the project out
 targets = ["*"]                        # which declared targets build it ("*" = all)
-link    = []                           # [link.X] names this artifact links
-need    = []                           # step.X / artifact.X requirements
+# link  = ["kernel32"]                 # optional: [link.X] names this artifact links
+# need  = ["step.generate"]            # optional: step.X / artifact.X requirements
 # subsystem = "gui"                    # optional: windows console/GUI selector
 # icon = "assets/demo.ico"             # optional: PE executable icon
 # manifest = "assets/demo.manifest"    # optional: PE application manifest
@@ -124,12 +139,12 @@ ref = "branch/main"
 | `id`      | string | Root segment of every module path the project exposes: a file at `<src>/foo/bar.mach` is reachable as `<id>.foo.bar`. Must be a plain identifier — letters, digits, `_`, `-` — since it names the dependency store and keys step stamp files. Read by `$project.id`. |
 | `version` | string | Project version. Read by `$project.version` and `$project.version.{major,minor,patch}`, and stamped into a Windows executable's version resource. |
 | `src`     | string | Source root, project-root-relative. Module paths resolve under it. |
-| `out`     | string | The output-path template root, referenced as `{project.out}` by artifact `out`, step paths, and `cmd`s. Expanded over `{target.name}`/`{target.isa}`/`{target.os}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). |
-| `mach`    | string | The compiler versions this project builds with, as a [version range](#version-ranges) (`"^5.3"`). Required in a root manifest. See [Compiler range](#compiler-range). |
+| `out`     | string | The output-path template root, referenced as `{project.out}` by artifact `out`, step `argv`, `in` and `out`, and local link paths. Expanded over `{target.name}`/`{target.isa}`/`{target.os}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). |
+| `mach`    | string | The compiler versions this project builds with, as a [version range](#version-ranges) (`"^5.3"`). The project being built must state it; a dependency that leaves it out states no constraint. See [Compiler range](#compiler-range). |
 
-`[project]` is exactly these five keys. Any other key, `name` and `description`
-included, is an unknown-key error (`mach.toml: unknown key 'name' in
-[project]`), in a root manifest and a dependency's alike. `[profile.<name>]`
+`[project]` is exactly these five keys, and `id`, `version`, `src` and `out` are
+required. Any other key, `name` and `description` included, is an unknown-key
+error (`mach.toml: unknown key 'name' in [project]`). `[profile.<name>]`
 likewise carries no `emit_ir` or `emit_asm`: emission is `--emit-ir`/`--emit-asm`
 on the command line.
 
@@ -247,14 +262,14 @@ to whichever *declared* target matches the host.
 | `isa` | yes      | Instruction-set architecture. Read by `$project.target.arch`. |
 | `os`  | yes      | Operating system. Read by `$project.target.os`. |
 | `abi` | yes      | Application binary interface. Read by `$project.target.abi`. |
-| `of`  | no       | Object-format override; defers to the os's format when omitted. See [Object-format override](#object-format-override). |
-| `base` | no      | Load-address override (integer). Overrides the os's default base virtual address; defers to it (`0` for `freestanding`) when omitted. |
-| `platform` | no  | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
-| `stack_reserve` | no | Thread stack reserve in bytes. See [Image stack size](#image-stack-size). |
-| `stack_commit` | no | Thread stack commit in bytes. See [Image stack size](#image-stack-size). |
-| `default` | no | Deprecated and ignored. It once marked the target `native` fell back to when none matched the host. The key is still accepted, so a published dependency keeps building, and warns as `target.default_deprecated`. See [`native` target resolution](#native-target-resolution). |
-| `extensions` | no | Array of instruction-set extension names the target may assume, such as `["sha", "ssse3"]`. Each name must be in the isa's vocabulary. See [Instruction-set extensions](#instruction-set-extensions). |
-| `env` | no | Consumer environment (string). The values are owned by the target's isa: an `env` the isa does not define is a manifest error naming the target and the known values, and an isa that defines none refuses the key outright. Today only `spirv` defines any; see [Finished-module targets](#finished-module-targets). |
+| `of`  | absent: the os's format | Object-format override; defers to the os's format when omitted. See [Object-format override](#object-format-override). |
+| `base` | absent: the os's base | Load-address override (integer). Overrides the os's default base virtual address; defers to it (`0` for `freestanding`) when omitted. |
+| `platform` | absent: no platform | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
+| `stack_reserve` | absent: the format's default | Thread stack reserve in bytes. See [Image stack size](#image-stack-size). |
+| `stack_commit` | absent: the format's default | Thread stack commit in bytes. See [Image stack size](#image-stack-size). |
+| `default` | absent: nothing, it is ignored | Deprecated and ignored. It once marked the target `native` fell back to when none matched the host. The key is still accepted, so a published dependency keeps building, and warns as `target.default_deprecated`. See [`native` target resolution](#native-target-resolution). |
+| `extensions` | absent: none selected | Array of instruction-set extension names the target may assume, such as `["sha", "ssse3"]`. Each name must be in the isa's vocabulary. See [Instruction-set extensions](#instruction-set-extensions). |
+| `env` | absent: the isa's default | Consumer environment (string). The values are owned by the target's isa: an `env` the isa does not define is a manifest error naming the target and the known values, and an isa that defines none refuses the key outright. Today only `spirv` defines any; see [Finished-module targets](#finished-module-targets). |
 
 ### Instruction-set extensions
 
@@ -536,8 +551,8 @@ derived from the same declarations composition reads, so it never advertises a
 tuple that would fail to resolve. `mach info` alone prints the tuple the host
 resolves to.
 
-A value outside its axis's set is a strict-parse error, so a typo is caught rather
-than silently never matching.
+A value outside its axis's set is refused when the target resolves, so a typo is
+caught rather than silently never matching.
 
 ### Object-format override
 
@@ -821,7 +836,7 @@ has to zero anything at startup.
 
 A profile is one explicit compilation policy: a build variant. The optimization
 level, the debug-emission toggle and the three SIMD levers live here because
-they are variant concerns, and every one of them is stated. A root manifest
+they are variant concerns, and every one of them is stated. Every manifest
 declares at least one profile; nothing is synthesized. Values that are
 *derived* rather than declared live elsewhere: a target's object format and
 naming come from `[target.*]` facts, and an absent optional feature such as a
@@ -838,8 +853,8 @@ naming come from `[target.*]` facts, and an absent optional feature such as a
 | `allow` | array of strings | **Optional.** The warnings this profile silences, each entry a key or a family of keys from the [warning key table](#silencing-warnings), named once. An unknown key, an entry that covers only errors, a repeated entry or a non-string entry is a manifest error. Absent, nothing is silenced. |
 
 Five keys (`opt`, `debug`, `simd`, `vectorize`, `float_reassoc`) are required
-in a declared profile, in a root and in a dependency manifest alike; only
-`default` and `allow` are optional. A missing key is a manifest error naming the table and
+in every profile; only `default` (absent: not the default) and `allow` (absent:
+nothing silenced) are optional. A missing key is a manifest error naming the table and
 the key:
 
 ```
@@ -848,21 +863,17 @@ error[manifest.missing_required]: mach.toml: [profile.debug] is missing required
 
 ### Profile requirement and selection
 
-A root manifest declares at least one `[profile.*]` table. A root that
-declares none does not build:
+Every manifest declares at least one `[profile.*]` table, a dependency's
+included. One that declares none is refused:
 
 ```
-error[manifest.missing_required]: mach.toml: no [profile.<name>] table is declared; a build needs an explicit profile declaring opt, debug, simd, vectorize and float_reassoc
+error[manifest.missing_required]: mach.toml: missing [profile] table; a build needs an explicit [profile.<name>] declaring opt, debug, simd, vectorize and float_reassoc
 ```
 
 `mach init` writes `debug` (`opt = 0`, `debug = true`, `default = true`) and
 `release` (`opt = 2`, `vectorize = true`) in full, so a scaffold never starts
-from that error. A dependency manifest that declares no profile is still read
-(its profiles are never used to build the consumer, see
-[Root vs. dependency strictness](#root-vs-dependency-strictness)); it gets the
-two built-in profiles `debug` and `release` for its own `{profile.name}`
-templates. That synthesis is a dependency-only convenience and applies to no
-root.
+from that error. More than one profile marked `default = true` is refused in
+every manifest.
 
 Which profile a build uses follows one rule, the same one that selects a
 target and an artifact:
@@ -896,7 +907,7 @@ does nothing else; `vectorize = false` switches the pass off wholesale and so ov
 it.
 
 The `simd`, `vectorize` and `float_reassoc` levers are always the **consumer's**.
-Consistent with the root-vs-dependency strictness above, a dependency's `[profile.*]`
+As [Dependency manifests](#dependency-manifests) sets out, a dependency's `[profile.*]`
 is parsed by the same schema and never read to build the consumer, so a library's
 values are inert — the effective levers come from the consumer's resolved profile.
 Libraries set nothing SIMD-specific and inherit the consumer's choice; there is no
@@ -1052,12 +1063,12 @@ reads the selected artifact's name.
 | `entry`   | yes | Entry source, relative to the project `src` dir (e.g. `main.mach` for `src/main.mach`). The entry module's FQN is `<id>.<entry without .mach>`, `/` turned into `.`. |
 | `out`     | yes | This artifact's output path, **relative to the expanded project `out`** and rooted there automatically — write `bin/demo`, not `{project.out}/bin/demo`. Use `{artifact.suffix}` for the target extension, or write a literal filename. See [Artifact filenames and identity](#artifact-filenames-and-identity). |
 | `targets` | yes | Array of declared target names this artifact builds for; `["*"]` means every declared target. |
-| `link`    | yes | Array of `[link.X]` names this artifact links (see below). `[]` for none. A name with no table is a manifest error naming the artifact and the declared tables (`[artifact.p1].link names no [link.*] table: 'nosuch' (declared: [link.kernel32])`). |
-| `need`    | yes | Array of category-qualified requirements such as `step.generate`, `artifact.support`, and `artifact.shader-*`. Each glob matches only its named category. `[]` for none. See [Artifact requirements](#artifact-requirements). |
-| `subsystem` | no | `"console"` (default) or `"gui"` — the environment a windows executable declares it runs under; refused on a target whose image format has no subsystem (see below). |
-| `icon` | no | Project-root-relative `.ico` path embedded in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
-| `manifest` | no | Project-root-relative application-manifest path embedded byte-for-byte in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
-| `default` | no | `true` puts the artifact in the [default selection](#selection-and-the-build-matrix): with no `-a`, `mach build` and `mach check` take the marked artifacts among those supporting the selected target (every one of them when none is marked), and a command that needs one artifact (`mach test`, `mach run`, the editor's union build) takes the marked one. A command that needs one artifact refuses two marked candidates; an explicit `-a` always wins, and a sole candidate needs no marker. |
+| `link`    | absent: links nothing | Array of `[link.X]` names this artifact links (see below). A name with no table is a manifest error naming the artifact and the declared tables (`[artifact.p1].link names no [link.*] table: 'nosuch' (declared: [link.kernel32])`). |
+| `need`    | absent: needs nothing | Array of category-qualified requirements such as `step.generate`, `artifact.support`, and `artifact.shader-*`. Each glob matches only its named category. See [Artifact requirements](#artifact-requirements). |
+| `subsystem` | absent: `"console"` | `"console"` or `"gui"` — the environment a windows executable declares it runs under; refused on a target whose image format has no subsystem (see below). |
+| `icon` | absent: no icon | Project-root-relative `.ico` path embedded in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
+| `manifest` | absent: no application manifest | Project-root-relative application-manifest path embedded byte-for-byte in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
+| `default` | absent: not marked | `true` puts the artifact in the [default selection](#selection-and-the-build-matrix): with no `-a`, `mach build` and `mach check` take the marked artifacts among those supporting the selected target (every one of them when none is marked), and a command that needs one artifact (`mach test`, `mach run`, the editor's union build) takes the marked one. A command that needs one artifact refuses two marked candidates; an explicit `-a` always wins, and a sole candidate needs no marker. |
 
 `entry` is the build cell's source root. The build follows its active `use` and
 `fwd` edges transitively and compiles that reachable module set; another file under
@@ -1249,18 +1260,21 @@ the same entries, so nothing behaves differently as a dependency.
 | `source`  | yes | `"system"` (a system library resolved by name), `"framework"` (a macOS framework), or `"local"` (a file on disk). |
 | `name`    | shape | Library/framework name — required for `source = "system"`/`"framework"`, forbidden for `"local"`. |
 | `path`    | shape | File path — required for `source = "local"`, forbidden otherwise. A template (see below). |
-| `library` | no | Stable logical name used by `#[library("...")]`; defaults to the `[link.<name>]` table name. |
-| `symbols` | no | Array of symbol names this dependency provides, attributing imports that have no `ext` declaration to decorate (see below). Written as **source-level** names; the target's C symbol prefix is applied by Mach. Omit for none. |
+| `library` | absent: the table name | Stable logical name used by `#[library("...")]`. |
+| `symbols` | absent: none claimed | Array of symbol names this dependency provides, attributing imports that have no `ext` declaration to decorate (see below). Written as **source-level** names; the target's C symbol prefix is applied by Mach. |
 | `os`      | yes | Filter axis: a canonical `os` value, `"*"` (any), an array of values, or `[]` (none). |
 | `isa`     | yes | Filter axis over `isa`, same forms. |
 | `abi`     | yes | Filter axis over `abi`, same forms. |
-| `export`  | yes | `true` cascades this entry to consumers; `false` keeps it to this project's own builds. |
-| `include` | no | `"always"` (the default) names the dynamic library in the linked image whether or not anything imports from it; `"referenced"` names it only when a live import references it, so an unused provider leaves no load command behind. Any other value is a manifest error (`[link.k].include must be "always" or "referenced"`). |
+| `export`  | absent: not exported | `true` cascades this entry to consumers; `false` keeps it to this project's own builds. |
+| `include` | absent: `"always"` | `"always"` names the dynamic library in the linked image whether or not anything imports from it; `"referenced"` names it only when a live import references it, so an unused provider leaves no load command behind. Any other value is a manifest error (`[link.k].include must be "always" or "referenced"`). |
 
 The `os`/`isa`/`abi` axes select the build cells an entry applies to. Each takes a
 single canonical value, `"*"` for any, or an array — `os = "linux"` and
 `os = ["linux"]` filter identically. `[]` matches nothing (an entry deliberately
-switched off). A non-canonical spelling is a strict-parse error. An entry applies
+switched off). The three axes are required: an axis left out would mean every
+target, which is an assumption to state, so a `kernel32` entry with no `os` is
+refused rather than linked on Linux. A non-canonical spelling is a manifest
+error. An entry applies
 to a cell when all three axes match.
 
 A `local` entry's `path` must, at build time, either match a `[step.X]`'s `out`
@@ -1353,11 +1367,11 @@ plain identifier — it keys the step's stamp file.
 | Key    | Required | Meaning |
 |--------|----------|---------|
 | `argv` | yes | Nonempty array of strings, spawned directly with no shell. `argv[0]` names the executable, by path or resolved on the planner `PATH`. Templates expand in every element. To use a shell, spell it: `["sh", "-c", "…"]`. |
-| `env`  | no  | Table of string values added to the step process's environment. |
+| `env`  | absent: nothing added | Table of string values added to the step process's environment. |
 | `in`   | yes | Declared input file list. Accepts globs (`*`, `**`), expanded sorted for a stable fingerprint; a glob that matches nothing is a hard error. |
 | `out`  | yes | Declared output file list. Concrete paths only — a glob here is an error, since the demand match and cache key expand `out` verbatim. |
-| `need` | yes | Array of `step.<name>` requirements or `step.<pattern>` globs this step must run after. Steps may require only steps. Cycles are manifest errors. `[]` for none. |
-| `timeout` | no | Duration string (`"30ms"`, `"30s"`, `"5m"`, `"1h"`) after which the step's process group is terminated and the build fails. Omit for an unbounded step. |
+| `need` | absent: needs nothing | Array of `step.<name>` requirements or `step.<pattern>` globs this step must run after. Steps may require only steps. Cycles are manifest errors. |
+| `timeout` | absent: no limit | Duration string (`"30ms"`, `"30s"`, `"5m"`, `"1h"`) after which the step's process group is terminated and the build fails. Omit for an unbounded step. |
 
 Steps carry **no filters** and **never run automatically**. A step runs only when
 **demanded**:
@@ -1503,7 +1517,8 @@ git = "https://github.com/briar-systems/mach-std"
 version = "^7.4"
 ```
 
-A stanza declares exactly one source:
+A stanza declares exactly one source. Every key's presence is decided by the
+others:
 
 | Key    | Meaning |
 |--------|---------|
@@ -1933,7 +1948,7 @@ in a dependency's manifest applies to consumers.
 
 ## Path templates
 
-Paths and `cmd`s expand over a closed, final set of eight variables:
+Paths and step `argv` entries expand over a closed, final set of eight variables:
 
 - `{project.out}` — the **root** project's expanded `[project].out`, in every
   manifest of the closure.
@@ -1961,7 +1976,8 @@ explicitly, which is what homes a dependency's build products into the *consumer
 output tree rather than the dependency's checkout.
 
 There are no `{name}`/`{ext}` or bare `{target}`/`{profile}` aliases. An
-unresolvable `{...}` reference, or an unterminated `{`, is a strict-parse error.
+unresolvable `{...}` reference, or an unterminated `{`, is refused when the
+template is expanded for a build cell.
 `{project.out}` is not available inside `[project].out` itself (it would be
 self-referential), and `{artifact.<id>.out}` is not available inside an artifact's
 own `out` for the same reason. `{artifact.suffix}` is available nowhere but an

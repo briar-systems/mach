@@ -33,7 +33,7 @@ pub fun refusal_free(alloc: *A.Allocator, r: *Refusal);
 ## fun emitted_mul_cell
 
 ```mach
-pub fun emitted_mul_cell(mi: *isa.Inst, e: *ct.InstEffects) ct.CtMulCell;
+pub fun emitted_mul_cell(mi: *isa.Inst, e: *isa_effect.InstEffects) ct.CtMulCell;
 ```
 
 the multiply cell an emitted instruction realizes: its explicit operands

@@ -147,12 +147,6 @@ pub rec OsRegistry;
 pub fun registry_init_with_allocator(alloc: *A.Allocator) OsRegistry;
 ```
 
-## fun registry_init
-
-```mach
-pub fun registry_init() OsRegistry;
-```
-
 ## fun registry_dnit
 
 ```mach

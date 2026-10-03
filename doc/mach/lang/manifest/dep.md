@@ -3,7 +3,7 @@
 ## fun parse_deps
 
 ```mach
-pub fun parse_deps(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, as_root: bool) err[fail.Fail];
+pub fun parse_deps(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[fail.Fail];
 ```
 
 ## def DepSource

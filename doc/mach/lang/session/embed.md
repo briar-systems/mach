@@ -1,4 +1,4 @@
-# mach.lang.embed
+# mach.lang.session.embed
 
 ## val EMBED_OK
 

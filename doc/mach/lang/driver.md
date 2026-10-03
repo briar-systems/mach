@@ -274,7 +274,7 @@ ret: the project holding the closure, released with `project.dnit_project`;
 ## fun begin_build
 
 ```mach
-pub fun begin_build(s: *session.Session, m: *manifest.Manifest, req: *request.BuildRequest, ev: *readout.Progress) res[project.Project, fail.Fail];
+pub fun begin_build(s: *session.Session, m: *manifest.Manifest, req: *request.BuildRequest, progress: *readout.Progress) res[project.Project, fail.Fail];
 ```
 
 begin the build the request names: every goal, a test goal included, loads the

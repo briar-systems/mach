@@ -57,10 +57,10 @@ quiet: `--quiet`
 pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64;
 ```
 
-`mach build`: plan and execute a build of the project operand, rendering diagnostics and
-the outcome to stderr. `-O1` is refused before parsing; `--plan` prints the effective
-plan and stops without running a generator, a compiler or a linker; `-v` and `-vv`
-render the phase readout after the build
+`mach build`: plan and execute a build of the project operand, rendering diagnostics to
+stderr as each unit reports them. `-O1` is refused before parsing; `--plan` prints the
+effective plan and stops without running a generator, a compiler or a linker; `-v` adds
+each phase row as the phase finishes, and `-vv` each module or file as it finishes
 
 argv: the full process arguments
 inv: the parsed invocation for this command
