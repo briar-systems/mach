@@ -359,6 +359,13 @@ need private access. A test lives outside the module it covers to declutter it,
 because the test is significant, or, most often, because it exercises several
 modules together (see [Which tests run](#which-tests-run)).
 
+A fixture lives at the layer of what it builds, in the module that owns the
+type it makes. A test reaches its fixtures through the imports its module
+already makes, or through a `#[testing] use` of a module at its own layer or
+below. An import only tests make never reaches above its module's layer: the
+mark is no cycle escape, so such an edge would push the module up the graph.
+The compiler holds its own tree to this with a test.
+
 Regression tests are a separate kind, and rare: they are kept only for
 regressions that are easy to reintroduce, and are named `regression__*`. They
 may sit next to unit tests. The name is a convention, not a mechanism.

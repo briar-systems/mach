@@ -1,11 +1,5 @@
 # mach.lang.target.isa.spirv.types
 
-## val MAX_VECTOR_COMPONENTS
-
-```mach
-pub val MAX_VECTOR_COMPONENTS: u32 = 4
-```
-
 ## val MAX_STRUCT_MEMBERS
 
 ```mach

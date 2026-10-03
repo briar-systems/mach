@@ -1,11 +1,5 @@
 # mach.lang.target.isa.spirv.register
 
-## val MODEL
-
-```mach
-pub val MODEL: target_model.Machine = target_model.Machine;
-```
-
 ## val EMITTER
 
 ```mach
