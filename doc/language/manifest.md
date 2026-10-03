@@ -2231,7 +2231,7 @@ they are marked, and it is raised before any step runs. A declared target that d
 not match the host is built only when `-t` names it:
 
 ```
-error[selection.no_host_target]: mach.toml: 'native' matches no declared target: the host is aarch64-linux and the declared targets are linux-x86_64 (x86_64-linux), windows-x86_64 (x86_64-windows); declare a [target.<name>] for the host or select one with -t
+error[selection.no_host_target]: mach.toml: 'native' matches no declared target: the host is linux-aarch64 and the declared targets are linux-x86_64 (linux-x86_64), windows-x86_64 (windows-x86_64); declare a [target.<name>] for the host or select one with -t
 ```
 
 A cross-only project whose targets are hosted (`linux`, `darwin`, `windows`)
