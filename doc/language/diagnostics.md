@@ -36,10 +36,21 @@ or the constant-time validator sees it in the emitted instructions.
 A failure the compiler does not blame on the program, a defect in mach itself,
 is `compiler.internal`.
 
+## Messages
+
+A message is a sentence about the subject: what is wrong with it, in words a
+reader of the program can act on. The key, the location and the origin say
+where the diagnostic came from, so a message never starts with the part of the
+compiler that raised it: `error[link.size_limit]: range-extension thunks take
+the code past the maximum section size`, not `linker: range-extension ...`. A
+format, a target or a flag is named where it is the subject, as in `COFF
+object too small`.
+
 ## The registry
 
 The keys are rows of one table in the compiler,
-`src/lang/diagnostic/kind.mach`. Each row gives the key and its severity, and
+`src/lang/diagnostic/kind.mach`. Each row gives the key and its severity, the
+only place a diagnostic's severity is decided, and
 every site that raises a diagnostic names its row. A diagnostic that names no
 row is refused before it is recorded, so every diagnostic the compiler can
 print has a key. The same rows are what a profile's
@@ -60,6 +71,10 @@ The table is append-only:
 
 A test in the compiler holds the table to these rules: it fails when a key
 disappears, moves or changes severity.
+
+A diagnostic is reported once. The same kind at the same place with the same
+message, notes, related places and fixes is one report, however many phases,
+modules or generic instances raise it.
 
 ## Families
 

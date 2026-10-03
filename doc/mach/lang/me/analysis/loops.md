@@ -53,6 +53,8 @@ pub fun dnit(la: *LoopAnalysis);
 pub fun dominates(la: *LoopAnalysis, a: ir_id.BlockId, b: ir_id.BlockId) bool;
 ```
 
+total over an analysis `analyze` built, which numbers the dominator tree
+
 ## fun loop_contains
 
 ```mach

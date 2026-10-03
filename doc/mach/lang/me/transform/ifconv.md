@@ -27,9 +27,17 @@ a dbg_value in an arm binds its variable to a value the untaken path never
 computed, so it loses its location there; the join's own bindings, now of
 the selects, restore the variable after the flattened arms.
 
+## val PASS
+
+```mach
+pub val PASS: pass.Pass = pass.Pass;
+```
+
+the pass the pipeline schedules
+
 ## fun run_in
 
 ```mach
-pub fun run_in(m: *me_ir.Module, tgt: *lang_target.Target, workspace: *scratch.Workspace) res[bool, fail.Fail];
+pub fun run_in(ctx: *pass.Context) res[bool, fail.Fail];
 ```
 

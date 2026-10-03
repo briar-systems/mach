@@ -55,7 +55,7 @@ pub fun symbol_is_rejected(id: SymbolId) bool;
 ## val SYMBOL_DEFERRED_TYPE
 
 ```mach
-pub val SYMBOL_DEFERRED_TYPE: SymbolId = symbol_id(0xFFFFFFFC)
+pub val SYMBOL_DEFERRED_TYPE: SymbolId = SymbolId;
 ```
 
 ## fun symbol_deferred

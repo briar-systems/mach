@@ -860,6 +860,16 @@ pub val GATE_SCOPE_INSTANCE: GateScope = 1
 pub rec GateVerdict;
 ```
 
+## fun never_decided_message
+
+```mach
+pub fun never_decided_message(a: *A.Allocator, itn: *intern.Interner, depends: intern.StrId) opt[str];
+```
+
+what a failed gate says when the name it waits on is a constant nowhere the
+module can see: the name's own message, which the caller frees, or none when
+the name cannot be read, where the verdict's message stands
+
 ## fun evaluate_gate
 
 ```mach

@@ -143,7 +143,7 @@ pub val UNBOUNDED_VARIANTS_MSG: str = "union variants: cannot prove that overlap
 ## val UNBOUNDED_CAST_MSG
 
 ```mach
-pub val UNBOUNDED_CAST_MSG:     str = "cast: cannot prove that the two types agree on secrecy - they point into a generic whose argument grows through a pointer, which has unboundedly many instances, so the storage below the pointers cannot be compared"
+pub val UNBOUNDED_CAST_MSG:     str = "cannot prove that the two types agree on secrecy - they point into a generic whose argument grows through a pointer, which has unboundedly many instances, so the storage below the pointers cannot be compared"
 ```
 
 ## fun module_reaches_secret
