@@ -144,12 +144,6 @@ out_img: *target_of.ObjectImage, out_ix: u32,
 content_vaddr: u64) target_of.ExecutableSectionLocation;
 ```
 
-## fun intern_or_nil
-
-```mach
-pub fun intern_or_nil(s: *session.Session, name: str) intern.StrId;
-```
-
 ## fun os_base_addr
 
 ```mach

@@ -323,19 +323,6 @@ pub fun site_of(sites: *fail.Place, i: u32) fail.Place;
 
 the place `i` of a model's per-entry places, the zero place when none were recorded
 
-## fun text_of
-
-```mach
-pub fun text_of(itn: *intern.Interner, id: intern.StrId) str;
-```
-
-the text of an id the model holds. total: every id in a manifest was minted
-by the interner that parsed it, so a miss is a compiler defect and ends the
-process
-
-itn: the interner the manifest was parsed with
-id: an id the model holds, never STR_NIL
-
 ## fun id_of
 
 ```mach

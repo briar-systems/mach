@@ -56,8 +56,12 @@ entry_count: *u32) res[*target_of.SymtabEntry, fail.Fail];
 ## fun header_reserve_bytes
 
 ```mach
-pub fun header_reserve_bytes(tgt: *lang_target.Target, pie: bool, shape: *target_of.HeaderShape) u64;
+pub fun header_reserve_bytes(tgt: *lang_target.Target, pie: bool, shape: *target_of.HeaderShape) res[u64, fail.Fail];
 ```
+
+the bytes reserved ahead of the first segment for the image headers: none
+when the format puts them nowhere, a page, or the header span rounded up to
+pages; a span whose round-up overflows is refused
 
 ## fun measure_header_shape
 

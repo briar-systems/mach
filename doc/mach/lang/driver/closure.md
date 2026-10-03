@@ -101,7 +101,7 @@ ret: ok with `p.config.req_scopes` set; err from output expansion
 ## fun resolve_cascade_libs
 
 ```mach
-pub fun resolve_cascade_libs(p: *project.Project, isa: str, os: str, abi: str,
+pub fun resolve_cascade_libs(p: *project.Project, isa: intern.StrId, os: intern.StrId, abi: intern.StrId,
 own_libs: *manifest.LinkRequirement, own_count: u32) err[fail.Fail];
 ```
 
