@@ -572,6 +572,15 @@ pub val MULW_THREE_ADDRESS: MulWideForm = 1
 pub val MULW_FIXED_PAIR:    MulWideForm = 2
 ```
 
+## rec AluWidth
+
+```mach
+pub rec AluWidth;
+```
+
+one width the alu computes an integer at, in bytes, legal while the model
+holds every extension in `ext` (0 when it always is)
+
 ## val ALU_WIDTH_CAP
 
 ```mach
@@ -794,14 +803,13 @@ pub val SCALAR_PERMUTES:    ScalarFamily = 8
 pub val SCALAR_HALF_LANES:  ScalarFamily = 16
 ```
 
-## fun scalar_family_rows
+## fun scalar_family_has
 
 ```mach
-pub fun scalar_family_rows(m: *Machine, rows: *ScalarForm, at: u32, families: ScalarFamily) u32;
+pub fun scalar_family_has(families: ScalarFamily, cell: *ScalarForm) bool;
 ```
 
-the rows of `families` the packed table leaves, written from `at` unless
-`rows` is nil; how many
+whether `cell` is in one of `families`
 
 ## fun is_widening_cell
 

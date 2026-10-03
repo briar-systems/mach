@@ -1,41 +1,5 @@
 # mach.lang.target.isa
 
-## val ARCH_UNKNOWN
-
-```mach
-pub val ARCH_UNKNOWN: u32 = catalog_arch.UNKNOWN
-```
-
-## val ARCH_X86_64
-
-```mach
-pub val ARCH_X86_64:  u32 = catalog_arch.X86_64
-```
-
-## val ARCH_AARCH64
-
-```mach
-pub val ARCH_AARCH64: u32 = catalog_arch.AARCH64
-```
-
-## val ARCH_RISCV64
-
-```mach
-pub val ARCH_RISCV64: u32 = catalog_arch.RISCV64
-```
-
-## val ARCH_SPIRV
-
-```mach
-pub val ARCH_SPIRV:   u32 = catalog_arch.SPIRV
-```
-
-## val ARCH_RISCV32
-
-```mach
-pub val ARCH_RISCV32: u32 = catalog_arch.RISCV32
-```
-
 ## val ISA_LABEL
 
 ```mach
@@ -59,39 +23,6 @@ pub val ISA_PCOPY_FENCE: u16 = 0xFFFC
 ```mach
 pub val ISA_USE:         u16 = 0xFFFB
 ```
-
-## fun declare_scalar_rows
-
-```mach
-pub fun declare_scalar_rows(reg: *IsaRegistry, m: *target_model.Machine, explicit: *target_model.ScalarForm, explicit_len: u32, families: target_model.ScalarFamily) err[fail.Fail];
-```
-
-declare the model's scalar table: `explicit`, then every cell of `families`
-its packed table leaves, family by family, in storage from the registry's
-allocator sized to exactly those rows. the caller releases it with
-release_scalar_rows once the model is registered, which copies it
-
-reg: the registry whose allocator backs the rows
-m: the model; its packed table is final, its scalar table is set
-explicit: the rows the model names itself
-explicit_len: how many
-families: the families whose unclaimed cells are scalar rows
-
-## fun release_scalar_rows
-
-```mach
-pub fun release_scalar_rows(reg: *IsaRegistry, m: *target_model.Machine);
-```
-
-free the table declare_scalar_rows gave the model
-
-## fun vocabulary
-
-```mach
-pub fun vocabulary(reg: *IsaRegistry) res[extension.Vocabulary, fail.Fail];
-```
-
-every extension vocabulary the registry's instruction sets declare, each table once
 
 ## def AsmCtScanFn
 
@@ -126,6 +57,12 @@ pub def RegFileFn: fun(*target_model.Register) i32
 pub rec BackendTarget;
 ```
 
+## rec AssemblyCapabilities
+
+```mach
+pub rec AssemblyCapabilities;
+```
+
 ## rec RegMachine
 
 ```mach
@@ -154,27 +91,6 @@ pub rec ModuleEmitter;
 ```mach
 pub def RelocSeam: target_of.RelocationCapabilities
 ```
-
-## fun with_defs
-
-```mach
-pub fun with_defs(vt: *IsaVTable, d: *target_definition.Table);
-```
-
-## fun with_page_size
-
-```mach
-pub fun with_page_size(vt: *IsaVTable, page_size: u64);
-```
-
-## fun with_environments
-
-```mach
-pub fun with_environments(vt: *IsaVTable, envs: *Environment, count: u32, open: u64);
-```
-
-`open` is what a target naming no environment is granted: with no ceiling
-over it, every extension an environment could guarantee
 
 ## fun environment_lookup
 
@@ -219,74 +135,6 @@ pub val ENV_NONE: u32 = 0xFFFFFFFF
 pub rec IsaVTable;
 ```
 
-## fun reg_machine
-
-```mach
-pub fun reg_machine(select: SelectFn, encode: isa_encode.EncodeHooks,
-is_reg_move: IsRegMoveFn, is_trap_terminator: IsTrapTerminatorFn,
-reserved_regs: *target_model.Register, reserved_reg_count: i32,
-reload_scratch_regs: *target_model.Register, reload_scratch_count: i32,
-scratch_reg: i32, scratch_reg2: i32,
-frame_ptr_reg: i32, stack_ptr_reg: i32, incoming_arg_base: i64,
-div_reg: i32, div_hi_reg: i32, shift_count_reg: i32) RegMachine;
-```
-
-## fun with_assembly
-
-```mach
-pub fun with_assembly(m: *RegMachine, header: AsmHeaderFn, clobbers: AsmClobbersFn,
-returns: resolved.AsmReturnsFn, ct_scan: AsmCtScanFn, writes_sp: AsmWritesSpFn);
-```
-
-## fun with_dwarf_regs
-
-```mach
-pub fun with_dwarf_regs(m: *RegMachine, f: DwarfRegFn);
-```
-
-## fun with_codeview_regs
-
-```mach
-pub fun with_codeview_regs(m: *RegMachine, f: CvRegFn);
-```
-
-## fun with_frame_dist
-
-```mach
-pub fun with_frame_dist(m: *RegMachine, f: FrameDistFn);
-```
-
-## fun with_int_imm_rule
-
-```mach
-pub fun with_int_imm_rule(m: *RegMachine, f: resolved.IntImmFitsFn);
-```
-
-## fun with_const_operand_rule
-
-```mach
-pub fun with_const_operand_rule(m: *RegMachine, f: ReadsConstFn);
-```
-
-## fun reloc_seam
-
-```mach
-pub fun reloc_seam(apply_reloc: target_of.ApplyRelocFn, reloc_traits: target_of.RelocTraitsFn,
-elf_reloc_type: target_of.ElfRelocTypeFn) RelocSeam;
-```
-
-## fun with_elf_attributes
-
-```mach
-pub fun with_elf_attributes(s: *RelocSeam, attributes: *target_of.ElfAttributes);
-```
-
-## fun with_local_got_kinds
-
-```mach
-pub fun with_local_got_kinds(s: *RelocSeam, f: target_of.LocalGotKindFn);
-```
-
 ## fun declares_local_got
 
 ```mach
@@ -297,12 +145,6 @@ pub fun declares_local_got(tgt_isa: *IsaVTable) bool;
 
 ```mach
 pub fun local_got_kind(tgt_isa: *IsaVTable, kind: target_of.RelocKind) bool;
-```
-
-## fun with_branch_thunks
-
-```mach
-pub fun with_branch_thunks(s: *RelocSeam, reach: target_of.BranchReachFn, thunk: target_of.BranchThunkFn);
 ```
 
 ## fun declares_branch_thunks
@@ -320,12 +162,6 @@ pub fun branch_reach(tgt_isa: *IsaVTable, kind: target_of.RelocKind) opt[target_
 the reach of a direct branch a thunk can extend, none for any other kind or
 an instruction set that places no thunks
 
-## fun with_machine_flags
-
-```mach
-pub fun with_machine_flags(s: *RelocSeam, f: target_of.MachineFlagsFn);
-```
-
 ## fun declares_machine_flags
 
 ```mach
@@ -337,24 +173,6 @@ pub fun declares_machine_flags(tgt_isa: *IsaVTable) bool;
 ```mach
 pub fun machine_flags(tgt_isa: *IsaVTable, float_arg_bits: u32,
 has_compressed: bool) u32;
-```
-
-## fun with_normalize_image
-
-```mach
-pub fun with_normalize_image(s: *RelocSeam, f: target_of.NormalizeImageFn);
-```
-
-## fun with_resolve_reloc_operand
-
-```mach
-pub fun with_resolve_reloc_operand(s: *RelocSeam, f: target_of.ResolveRelocOperandFn);
-```
-
-## fun with_attributes
-
-```mach
-pub fun with_attributes(s: *RelocSeam, build: target_of.BuildAttributesFn, merge: target_of.MergeAttributesFn, validate: target_of.ValidateAttributesFn);
 ```
 
 ## fun declares_attributes
@@ -390,73 +208,28 @@ add: *u8, add_len: u32, out_len: *u32) res[*u8, fail.Fail];
 pub fun object_target(vt: *IsaVTable, out: *target_of.ObjectTarget);
 ```
 
-## fun machine_isa
+## fun validate
 
 ```mach
-pub fun machine_isa(id: u32, name: str, elf_machine: u32, pointer_width: u32,
-model: *target_model.Machine, machine: *RegMachine,
-reloc: *RelocSeam) IsaVTable;
+pub fun validate(a: *A.Allocator, vt: *IsaVTable) err[fail.Fail];
 ```
 
-## fun emitter_isa
+why a descriptor is malformed, read once when a registry adds it; a refusal
+names the instruction set and the rule it breaks
+
+a: formats the refusal
+vt: the descriptor
+
+## fun name_of
 
 ```mach
-pub fun emitter_isa(id: u32, name: str, pointer_width: u32,
-model: *target_model.Machine, emitter: *ModuleEmitter) IsaVTable;
+pub fun name_of(vt: *IsaVTable) str;
 ```
 
-## fun module_emitter
+## fun id_of
 
 ```mach
-pub fun module_emitter(emit_module: EmitModuleFn, has_assembly: bool) ModuleEmitter;
-```
-
-## rec IsaRegistry
-
-```mach
-pub rec IsaRegistry;
-```
-
-## fun registry_init_with_allocator
-
-```mach
-pub fun registry_init_with_allocator(alloc: *A.Allocator) IsaRegistry;
-```
-
-## fun registry_dnit
-
-```mach
-pub fun registry_dnit(reg: *IsaRegistry);
-```
-
-## fun registry_validate
-
-```mach
-pub fun registry_validate(reg: *IsaRegistry) err[fail.Fail];
-```
-
-## fun register
-
-```mach
-pub fun register(reg: *IsaRegistry, vt: *IsaVTable) err[fail.Fail];
-```
-
-## fun lookup
-
-```mach
-pub fun lookup(reg: *IsaRegistry, name: str) opt[*IsaVTable];
-```
-
-## fun registered_count
-
-```mach
-pub fun registered_count(reg: *IsaRegistry) u32;
-```
-
-## fun registered
-
-```mach
-pub fun registered(reg: *IsaRegistry, idx: u32) opt[*IsaVTable];
+pub fun id_of(vt: *IsaVTable) u32;
 ```
 
 ## fun has_codegen

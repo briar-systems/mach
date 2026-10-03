@@ -10,10 +10,10 @@ whether one instruction builds the integer: one movz or movn, or one orr of
 a logical immediate, the rule the middle end hoists a loop's constants by
 . a value narrower than 64 bits is built at 32
 
-## fun hooks
+## val HOOKS
 
 ```mach
-pub fun hooks() isa_encode.EncodeHooks;
+pub val HOOKS: isa_encode.EncodeHooks = isa_encode.EncodeHooks;
 ```
 
 the hooks the shared encode driver runs this encoder through

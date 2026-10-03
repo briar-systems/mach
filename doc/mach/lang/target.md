@@ -24,14 +24,6 @@ fwd binding.Binding
 
 forwards [`mach.lang.target.binding.Binding`](target/binding.md#rec-binding)
 
-## fwd binding.live
-
-```mach
-fwd binding.live
-```
-
-forwards [`mach.lang.target.binding.live`](target/binding.md#fun-live)
-
 ## fwd resolved.ct_mul_admitted
 
 ```mach
@@ -72,22 +64,6 @@ fwd target_registry.registry_init_with_allocator
 
 forwards [`mach.lang.target.registry.registry_init_with_allocator`](target/registry.md#fun-registry_init_with_allocator)
 
-## fwd target_registry.registry_new
-
-```mach
-fwd target_registry.registry_new
-```
-
-forwards [`mach.lang.target.registry.registry_new`](target/registry.md#fun-registry_new)
-
-## fwd target_registry.registry_dnit
-
-```mach
-fwd target_registry.registry_dnit
-```
-
-forwards [`mach.lang.target.registry.registry_dnit`](target/registry.md#fun-registry_dnit)
-
 ## fwd target_registry.registry_published
 
 ```mach
@@ -117,8 +93,15 @@ pub fun host_abi_id() u32;
 ## fun register_all
 
 ```mach
-pub fun register_all(reg: *TargetRegistry, debug_provider: DebugDescriptorProvider) err[fail.Fail];
+pub fun register_all(reg: *TargetRegistry, debug: *target_of.DebugVTable) err[fail.Fail];
 ```
+
+fill an empty registry with the catalog and publish it; a published registry
+is left as it is. a registry refused part way holds nothing that needs
+undoing, and is dropped
+
+reg: the registry
+debug: the dwarf debug model, which the backend declares
 
 ## rec TargetRequest
 

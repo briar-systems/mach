@@ -246,3 +246,18 @@ pub val MULHU:  Opcode = 17
 pub val MULH:   Opcode = 18
 ```
 
+## val GP_NAMES
+
+```mach
+pub val GP_NAMES: [32]str = [32]str;
+```
+
+the ABI name of each integer and float register, by index: the one table the
+listing prints from and the inline assembly grammar reads
+
+## val FP_NAMES
+
+```mach
+pub val FP_NAMES: [32]str = [32]str;
+```
+

@@ -1,133 +1,217 @@
-# the target registry as one owned object
-#
-# a registry is born fresh, published once by `target.register_all`, and
-# released once by `registry_dnit`; release is terminal, so a registry is
-# never re-initialized under a target that borrowed from it (a publication
-# that fails part way rolls back to fresh, nothing has borrowed yet).
-# `registry_new` is the heap form the session owns and every worker borrows
-# by pointer; `registry_init_with_allocator` is the in-place form a caller
-# owns on its own stack, and `registry_init` the same over a page allocator of
-# its own for a test fixture. a `resolved.Target` borrows the registry it was
-# resolved against and `resolved.live` refuses the borrow once the registry is
-# released.
-use std.types.result.res;
+# the target registry: one container holding every axis of the catalog by
+# pointer. a member is static data its own module declares, so adding one
+# checks it once and keeps the pointer: the registry copies nothing, owns
+# nothing and is never released. a registry is published once the catalog it
+# holds is checked whole, and publication is the proof every later read
+# relies on
 use std.types.bool.bool;
+use std.types.bool.false;
 use std.types.error.err;
-use std.types.size.usize;
+use std.types.option.opt;
+use std.types.string.str;
+use std.types.string.str_equals;
 
 use A: std.allocator;
 use std.allocator.page;
 
 use mach.lang.fail;
 use mach.lang.target.abi;
+use catalog_abi:  mach.lang.target.catalog.abi;
+use catalog_arch: mach.lang.target.catalog.arch;
 use mach.lang.target.isa;
 use target_of:      mach.lang.target.of;
 use lang_target_os: mach.lang.target.os;
 
+pub val AXIS_CAP: u32 = 16;
+
+# the members of one axis, read by name or position; the accessors and the
+# validator are the axis's own, so the container never reads a member
+pub rec Axis[T] {
+    members: [AXIS_CAP]*T;
+    count:   u32;
+    # what a member is called in a refusal: "isa", "object-format"
+    noun:     str;
+    name_of:  fun(*T) str;
+    id_of:    fun(*T) u32;
+    validate: fun(*A.Allocator, *T) err[fail.Fail];
+}
+
+pub fun axis[T](noun: str, name_of: fun(*T) str, id_of: fun(*T) u32, validate: fun(*A.Allocator, *T) err[fail.Fail]) Axis[T] {
+    var a: Axis[T];
+    a.count    = 0;
+    a.noun     = noun;
+    a.name_of  = name_of;
+    a.id_of    = id_of;
+    a.validate = validate;
+    ret a;
+}
+
+# add a member: refused when it is malformed, when its name or its catalog id
+# is already held, or when the axis is full. an id of 0 is outside the catalog
+# and may repeat
+# ---
+# a: formats the refusal
+# m: the member, static data that outlives the registry
+pub fun add[T](ax: *Axis[T], a: *A.Allocator, m: *T) err[fail.Fail] {
+    val valid: err[fail.Fail] = ax.validate(a, m);
+    if (sel valid.err) { ret valid; }
+    val name: str = ax.name_of(m);
+    val id:   u32 = ax.id_of(m);
+    var i:    u32 = 0;
+    for (i < ax.count) {
+        if (str_equals(ax.name_of(ax.members[i]), name)) {
+            ret err[fail.Fail].err{fail.formatted(a, "mach.lang.target.registry: {} '{}' is already registered", ax.noun, name)};
+        }
+        if (id != 0 && ax.id_of(ax.members[i]) == id) {
+            ret err[fail.Fail].err{fail.formatted(a, "mach.lang.target.registry: {} id {} is already registered (wanted to register '{}')", ax.noun, id, name)};
+        }
+        i = i + 1;
+    }
+    if (ax.count >= AXIS_CAP) {
+        ret err[fail.Fail].err{fail.formatted(a, "mach.lang.target.registry: the {} axis is at capacity; raise AXIS_CAP to register '{}'", ax.noun, name)};
+    }
+    ax.members[ax.count] = m;
+    ax.count             = ax.count + 1;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun find[T](ax: *Axis[T], name: str) opt[*T] {
+    var i: u32 = 0;
+    for (i < ax.count) {
+        if (str_equals(ax.name_of(ax.members[i]), name)) { ret opt[*T].some{ax.members[i]}; }
+        i = i + 1;
+    }
+    ret opt[*T].none{};
+}
+
+pub fun at[T](ax: *Axis[T], idx: u32) opt[*T] {
+    if (idx >= ax.count) { ret opt[*T].none{}; }
+    ret opt[*T].some{ax.members[idx]};
+}
+
 pub rec TargetRegistry {
-    isa:     isa.IsaRegistry;
-    os:      lang_target_os.OsRegistry;
-    abi:     abi.AbiRegistry;
-    of:      target_of.OfRegistry;
-    debug:   target_of.DebugRegistry;
-    state:   u8;
-    version: u32;
-    # the allocator that owns this object's block, nil for an in-place registry
-    owner: *A.Allocator;
-    # the caller's allocator the entries and every refusal resolution formats
-    # come from; it outlives the registry
+    isa:   Axis[isa.IsaVTable];
+    os:    Axis[lang_target_os.OsVTable];
+    abi:   Axis[abi.AbiVTable];
+    of:    Axis[target_of.OfVTable];
+    debug: Axis[target_of.DebugVTable];
+    # set once the catalog the axes hold is checked whole
+    published: bool;
+    # the caller's allocator every refusal a resolution formats comes from; it
+    # outlives the registry
     alloc: A.Allocator;
 }
 
-pub val REGISTRY_FRESH:    u8  = 0;
-pub val REGISTRY_BUILDING: u8  = 1;
-pub val REGISTRY_READY:    u8  = 2;
-pub val REGISTRY_RELEASED: u8  = 3;
-pub val REGISTRY_VERSION:  u32 = 1;
-
-fun fill(reg: *TargetRegistry) {
-    reg.state   = REGISTRY_FRESH;
-    reg.version = 0;
-    reg.owner   = nil;
-}
-
-# an in-place registry whose entries and resolution refusals come from `alloc`
+# an empty registry whose refusals are formatted from `alloc`
 pub fun registry_init_with_allocator(alloc: *A.Allocator) TargetRegistry {
     var reg: TargetRegistry;
-    reg.isa   = isa.registry_init_with_allocator(alloc);
-    reg.os    = lang_target_os.registry_init_with_allocator(alloc);
-    reg.abi   = abi.registry_init_with_allocator(alloc);
-    reg.of    = target_of.registry_init_with_allocator(alloc);
-    reg.debug = target_of.debug_registry_init_with_allocator(alloc);
-    fill(?reg);
+    reg.isa       = axis[isa.IsaVTable]("isa", isa.name_of, isa.id_of, isa.validate);
+    reg.os        = axis[lang_target_os.OsVTable]("os", lang_target_os.name_of, lang_target_os.id_of, lang_target_os.validate);
+    reg.abi       = axis[abi.AbiVTable]("abi", abi.name_of, abi.id_of, abi.validate);
+    reg.of        = axis[target_of.OfVTable]("object-format", target_of.name_of, target_of.id_of, target_of.validate);
+    reg.debug     = axis[target_of.DebugVTable]("debug", target_of.debug_name_of, target_of.debug_id_of, target_of.debug_validate);
+    reg.published = false;
     if (alloc != nil) { reg.alloc = @alloc; }
     ret reg;
 }
 
-# a test fixture: an in-place registry over a page allocator of its own
+# a test fixture: an empty registry over a page allocator of its own
 #[testing]
 pub fun registry_init() TargetRegistry {
     var alloc: A.Allocator;
-    val made:  err[A.Error] = page.make(?alloc);
-    if (sel made.err) { ret registry_init_with_allocator(nil); }
+    page.make(?alloc);
     ret registry_init_with_allocator(?alloc);
 }
 
-# a heap registry whose block and every entry come from `alloc`
-pub fun registry_new(alloc: *A.Allocator) res[*TargetRegistry, fail.Fail] {
-    if (alloc == nil) {
-        ret res[*TargetRegistry, fail.Fail].err{fail.message("target: registry_new requires an allocator")};
-    }
-    val block: res[*TargetRegistry, A.Error] = A.allocate[TargetRegistry](alloc, 1::usize);
-    if (sel block.err) { ret res[*TargetRegistry, fail.Fail].err{fail.refused(block.err)}; }
-    val reg: *TargetRegistry = block.ok;
-    reg.isa   = isa.registry_init_with_allocator(alloc);
-    reg.os    = lang_target_os.registry_init_with_allocator(alloc);
-    reg.abi   = abi.registry_init_with_allocator(alloc);
-    reg.of    = target_of.registry_init_with_allocator(alloc);
-    reg.debug = target_of.debug_registry_init_with_allocator(alloc);
-    fill(reg);
-    reg.owner = alloc;
-    reg.alloc = @alloc;
-    ret res[*TargetRegistry, fail.Fail].ok{reg};
-}
-
-fun release_entries(reg: *TargetRegistry) {
-    isa.registry_dnit(?reg.isa);
-    lang_target_os.registry_dnit(?reg.os);
-    abi.registry_dnit(?reg.abi);
-    target_of.registry_dnit(?reg.of);
-    target_of.debug_registry_dnit(?reg.debug);
-    reg.version = 0;
-}
-
-# a publication that failed part way releases what it registered and hands
-# back a fresh registry; nothing borrowed from it yet, so a retry is sound
-pub fun registry_rollback(reg: *TargetRegistry) {
-    if (reg == nil || reg.state != REGISTRY_BUILDING) { ret; }
-    release_entries(reg);
-    reg.state = REGISTRY_FRESH;
-}
-
-# release the entries and, for a heap registry, return the block to its
-# owner; release is terminal, a second call on an in-place registry is a
-# no-op, and a second call on a heap registry is a call on a dead pointer
-pub fun registry_dnit(reg: *TargetRegistry) {
-    if (reg == nil) { ret; }
-    release_entries(reg);
-    reg.state = REGISTRY_RELEASED;
-    val owner: *A.Allocator = reg.owner;
-    if (owner != nil) {
-        reg.owner = nil;
-        A.deallocate[TargetRegistry](owner, reg, 1::usize);
-    }
-}
-
 pub fun registry_published(reg: *TargetRegistry) bool {
-    ret reg != nil && reg.state == REGISTRY_READY && reg.version == REGISTRY_VERSION;
+    ret reg != nil && reg.published;
 }
 
 pub fun registry_empty(reg: *TargetRegistry) bool {
     ret reg != nil && reg.isa.count == 0 && reg.os.count == 0 && reg.abi.count == 0
         && reg.of.count == 0 && reg.debug.count == 0;
+}
+
+#[testing]
+fun t_abi(id: u32, name: str) abi.AbiVTable {
+    ret abi.AbiVTable{
+        passing:             catalog_abi.PASSING_CARRIERS,
+        id:                  id,
+        name:                name,
+        arch_id:             catalog_arch.X86_64,
+        indirect_result_reg: -1,
+    };
+}
+
+#[testing]
+fun t_name(vt: *abi.AbiVTable) str {
+    ret vt.name;
+}
+
+#[testing]
+fun t_id(vt: *abi.AbiVTable) u32 {
+    ret vt.id;
+}
+
+#[testing]
+fun t_accept(a: *A.Allocator, vt: *abi.AbiVTable) err[fail.Fail] {
+    ret err[fail.Fail].ok{};
+}
+
+#[testing]
+fun t_refuse(a: *A.Allocator, vt: *abi.AbiVTable) err[fail.Fail] {
+    ret err[fail.Fail].err{fail.message("refused")};
+}
+
+# a member is held by its pointer, a name or a catalog id is held once, an id
+# of 0 repeats, and a full axis refuses the next member
+test add__holds_members_by_pointer_once_each {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var ax:  Axis[abi.AbiVTable] = axis[abi.AbiVTable]("convention", t_name, t_id, t_accept);
+    var a:   abi.AbiVTable       = t_abi(1, "a");
+    val r_a: err[fail.Fail]      = add[abi.AbiVTable](?ax, ?alloc, ?a);
+    if (sel r_a.err) { ret 1; }
+    val found: opt[*abi.AbiVTable] = find[abi.AbiVTable](?ax, "a");
+    if (sel found.none)   { ret 2; }
+    if (found.some != ?a) { ret 3; }
+    var same_name: abi.AbiVTable  = t_abi(2, "a");
+    val r_name:    err[fail.Fail] = add[abi.AbiVTable](?ax, ?alloc, ?same_name);
+    if (!sel r_name.err) { ret 4; }
+    var same_id: abi.AbiVTable  = t_abi(1, "b");
+    val r_id:    err[fail.Fail] = add[abi.AbiVTable](?ax, ?alloc, ?same_id);
+    if (!sel r_id.err) { ret 5; }
+    var names:   [AXIS_CAP][2]u8;
+    var members: [AXIS_CAP]abi.AbiVTable;
+    var i:       u32 = 1;
+    for (i < AXIS_CAP) {
+        names[i][0] = 'c'::u8 + i::u8;
+        names[i][1] = 0;
+        members[i]  = t_abi(0, (?names[i][0])::str);
+        val r: err[fail.Fail] = add[abi.AbiVTable](?ax, ?alloc, ?members[i]);
+        if (sel r.err) { ret 6; }
+        i = i + 1;
+    }
+    if (ax.count != AXIS_CAP) { ret 7; }
+    var overflow: abi.AbiVTable  = t_abi(0, "overflow");
+    val r_full:   err[fail.Fail] = add[abi.AbiVTable](?ax, ?alloc, ?overflow);
+    if (!sel r_full.err) { ret 8; }
+    val last: opt[*abi.AbiVTable] = at[abi.AbiVTable](?ax, AXIS_CAP - 1);
+    if (sel last.none)                       { ret 9; }
+    if (last.some != ?members[AXIS_CAP - 1]) { ret 9; }
+    val past: opt[*abi.AbiVTable] = at[abi.AbiVTable](?ax, AXIS_CAP);
+    if (sel past.some) { ret 10; }
+    ret 0;
+}
+
+# the axis validator runs on every add, and a refused member is not held
+test add__runs_the_axis_validator {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var ax: Axis[abi.AbiVTable] = axis[abi.AbiVTable]("convention", t_name, t_id, t_refuse);
+    var a:  abi.AbiVTable       = t_abi(1, "a");
+    val r:  err[fail.Fail]      = add[abi.AbiVTable](?ax, ?alloc, ?a);
+    if (!sel r.err)    { ret 1; }
+    if (ax.count != 0) { ret 2; }
+    ret 0;
 }

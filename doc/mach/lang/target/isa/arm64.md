@@ -371,3 +371,44 @@ pub val VEC_SHR_U: Opcode = 0x10f
 pub val VEC_SHR_S: Opcode = 0x110
 ```
 
+## rec SysReg
+
+```mach
+pub rec SysReg;
+```
+
+a system register the inline assembly names, by its encoding fields
+
+## val SYSREG_COUNT
+
+```mach
+pub val SYSREG_COUNT: u32 = 44
+```
+
+## val SYSREGS
+
+```mach
+pub val SYSREGS: [SYSREG_COUNT]SysReg = [SYSREG_COUNT]SysReg;
+```
+
+## rec PstateField
+
+```mach
+pub rec PstateField;
+```
+
+a PSTATE field msr writes by immediate, by its op1 and op2: the one table the
+listing prints from and the inline assembly grammar reads
+
+## val PSTATE_FIELD_COUNT
+
+```mach
+pub val PSTATE_FIELD_COUNT: u32 = 8
+```
+
+## val PSTATE_FIELDS
+
+```mach
+pub val PSTATE_FIELDS: [PSTATE_FIELD_COUNT]PstateField = [PSTATE_FIELD_COUNT]PstateField;
+```
+
