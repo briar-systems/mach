@@ -82,9 +82,9 @@ every command's events rendered the moment each arrives: the renderer of the
 readout contract (doc/language/readout.md). the report's stream, stderr,
 carries the build: human text renders unit banners, phase rows, items, the
 unit summary, failures and diagnostics, and readout_close writes the closing
-tally; json renders each diagnostic and failure as a record, and under -v the
-unit banners, phase rows, items and unit summaries as unit, phase and
-phase_item records. the run's stream, stdout, carries a test run: human text
+tally; json renders each diagnostic and failure as a record, and under -v
+each unit, phase row, item and unit summary as unit, phase and phase_item
+records. the run's stream, stdout, carries a test run: human text
 renders each test as it finishes, a module's roll-up once its last test has,
 and the closing summary; json renders the events of `mach test --format json`.
 under json diagnostics each finished test is also a record on the report's

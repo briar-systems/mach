@@ -49,9 +49,12 @@ under the phase that processed it, in the order they finish, and the row names
 the slowest of them.
 
 Under `--diagnostics=json` every one of these lines is a record, written when
-the line would be: a `unit` record for a banner, a `phase` record for a row, a
-`phase_item` record for an item, a `phase` record named `other` without a count,
-and each `built` line as a member of the closing `summary` record.
+the line would be: a `phase` record for a row, a `phase_item` record for an
+item, a `phase` record named `other` without a count, and each `built` line as
+a member of the closing `summary` record. Every unit opens with a `unit` record
+naming its artifact, target and profile, even when the text prints no banner or
+`profile` header, so a tool can tell apart the rows of several units and of
+several profiles.
 [diagnostics-json.md](diagnostics-json.md#readout-records) has the schema.
 
 ## The test readout

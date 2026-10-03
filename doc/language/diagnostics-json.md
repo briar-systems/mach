@@ -29,8 +29,9 @@ and `-vv` write the [readout](readout.md) as [readout records](#readout-records)
 - The text is ASCII. A non-ASCII character in a message, a label or a path is
   written as a `\u` escape, and a byte that is not valid UTF-8 as `�`, so
   every line is valid UTF-8 and valid JSON.
-- Under `json` the human tally (`N errors / M warnings`) is not written, and a
-  `building <artifact>` banner is a `unit` record, written only under `-v`.
+- Under `json` the human tally (`N errors / M warnings`) is not written, and
+  the `building <artifact>` banners and `profile <name>:` headers are not
+  written; under `-v` a `unit` record opens every unit instead.
 
 ## A record
 
@@ -199,20 +200,22 @@ stderr is a record, written when the line would be and in the same order. Times
 are integer microseconds.
 
 ```json
-{"schema":1,"record":"unit","verb":"building","artifact":"app","target":"linux"}
+{"schema":1,"record":"unit","verb":"building","artifact":"app","target":"linux","profile":"debug"}
 {"schema":1,"record":"phase","name":"load","count":48,"unit":"modules","time_us":77012}
 {"schema":1,"record":"phase","name":"codegen","count":48,"unit":"modules","time_us":75012,"threads":16,"slowest":"std.filesystem","slowest_us":9104}
 {"schema":1,"record":"phase","name":"other","time_us":32007}
 ```
 
-A **unit** record is the `building <artifact>` banner, written when the plan has
-several units:
+A **unit** record opens each unit, before its rows. It is written for every
+unit, where the text shows a `building <artifact>` banner only when the plan has
+several units and a `profile <name>:` header only when it has several profiles:
 
 | Member | Type | Meaning |
 |---|---|---|
 | `verb` | string | what the unit does, `"building"` or `"checking"` |
 | `artifact` | string or `null` | the artifact, or `null` for the whole project |
-| `target` | string | the target, absent when the banner names none |
+| `target` | string | the target, absent when the unit names none |
+| `profile` | string | the profile, absent when the unit names none |
 
 A **phase** record is a phase row:
 
