@@ -8,14 +8,6 @@ fwd request.CliArgs
 
 forwards [`mach.lang.build.request.CliArgs`](../lang/build/request.md#rec-cliargs)
 
-## fwd request.is_object_path
-
-```mach
-fwd request.is_object_path
-```
-
-forwards [`mach.lang.build.request.is_object_path`](../lang/build/request.md#fun-is_object_path)
-
 ## def OptionArity
 
 ```mach
@@ -1123,7 +1115,7 @@ pub fun collect_link_inputs(a: *A.Allocator, c: *request.CliArgs, inv: *ParsedIn
 ```
 
 fill c.link_tokens and c.lib_dirs in command-line order: every `-l` value and every bare
-positional after the first that request.is_object_path accepts go to link_tokens, every `-L`
+positional after the first that input.token_is_path accepts go to link_tokens, every `-L`
 value to lib_dirs. Both vectors are reinitialised with a first
 
 a: allocator for the two vectors

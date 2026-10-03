@@ -146,7 +146,7 @@ nonzero exit. json closes in report_close
 ## fun result_name
 
 ```mach
-pub fun result_name(r: *validation.ValidationGateResult) *u8;
+pub fun result_name(r: *outcome.GateResult) *u8;
 ```
 
 the outcome a test record names: `pass`, `exit`, `signal`, `spawn`,
@@ -155,7 +155,7 @@ the outcome a test record names: `pass`, `exit`, `signal`, `spawn`,
 ## fun has_capture
 
 ```mach
-pub fun has_capture(r: *validation.ValidationGateResult) bool;
+pub fun has_capture(r: *outcome.GateResult) bool;
 ```
 
 whether a result kept output worth pointing at

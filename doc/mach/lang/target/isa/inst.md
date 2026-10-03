@@ -48,6 +48,29 @@ pub val REG_CLASS_ID_GP: i32 = 0
 pub val REG_CLASS_ID_FP: i32 = 1
 ```
 
+## val REG_NONE
+
+```mach
+pub val REG_NONE:    i32 = 0
+```
+
+a register id carries its class plus one in its second byte and its hardware
+number in its low byte, so no register is 0 and a zeroed operand names none.
+each base is a class's id for hardware number 0, for tables that cannot call
+regid_make
+
+## val REG_GP_BASE
+
+```mach
+pub val REG_GP_BASE: i32 = 0x100
+```
+
+## val REG_FP_BASE
+
+```mach
+pub val REG_FP_BASE: i32 = 0x200
+```
+
 ## def SymModifier
 
 ```mach
@@ -116,11 +139,24 @@ pub fun regid_make(class_id: i32, index: i32) i32;
 pub fun regid_class(regid: i32) i32;
 ```
 
+the class of `regid`, -1 for REG_NONE
+
+## fun regid_names
+
+```mach
+pub fun regid_names(regid: i32) bool;
+```
+
+whether `regid` names a register: neither REG_NONE nor a negative operand
+sentinel an instruction set keeps for itself
+
 ## fun regid_index
 
 ```mach
 pub fun regid_index(regid: i32) i32;
 ```
+
+the hardware number of `regid` within its class
 
 ## fun make_none
 

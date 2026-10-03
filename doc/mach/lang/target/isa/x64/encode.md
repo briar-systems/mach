@@ -19,28 +19,17 @@ constant there included, as the r/m operand: a constant is one pool
 reference inside the instruction. a compare's second source is its
 right operand, or its left where the condition swaps them
 
-## fun asm_returns
+## fun returns
 
 ```mach
-pub fun asm_returns(body: str) bool;
+pub fun returns(body: str) bool;
 ```
 
-## fun asm_writes_sp
+whether an asm body returns, for the middle end, which reads no grammar
+
+## fun grammar
 
 ```mach
-pub fun asm_writes_sp(body: str) bool;
-```
-
-## fun asm_clobbers
-
-```mach
-pub fun asm_clobbers(body: str, gp_out: *u32, fp_out: *u32);
-```
-
-## fun asm_ct_scan
-
-```mach
-pub fun asm_ct_scan(body: str, secrets: *ct.AsmSecret, n_secret: u32,
-mul: ct.CtMulMask, trust_shift: bool, alloc: *A.Allocator) err[ct.AsmRefusal];
+pub fun grammar() isa_asm.Grammar;
 ```
 

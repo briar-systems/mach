@@ -48,6 +48,33 @@ pub val MIR_OP_BLOCK: MirOperandKind = 5
 pub def MirOpcode: u32
 ```
 
+## val ISA_LABEL
+
+```mach
+pub val ISA_LABEL:       MirOpcode = 0xFFFF
+```
+
+the pseudo-instructions every instruction set's selection space shares, at the
+top of the 16-bit opcode range: none emits bytes
+
+## val ISA_PCOPY
+
+```mach
+pub val ISA_PCOPY:       MirOpcode = 0xFFFD
+```
+
+## val ISA_PCOPY_FENCE
+
+```mach
+pub val ISA_PCOPY_FENCE: MirOpcode = 0xFFFC
+```
+
+## val ISA_USE
+
+```mach
+pub val ISA_USE:         MirOpcode = 0xFFFB
+```
+
 ## val MIR_ADD
 
 ```mach
@@ -1091,7 +1118,8 @@ pub rec VRegId;
 
 register identities are records, not `def` aliases: a vreg number cannot be
 handed where a physical register is meant, and neither indexes a table
-without naming the unwrap. a PRegId carries the class-tagged isa regid.
+without naming the unwrap. a PRegId carries the class-tagged isa regid, whose
+0 is no register
 
 ## rec PRegId
 
@@ -1381,11 +1409,7 @@ a block named `id` holding nothing
 pub rec MirVReg;
 ```
 
-## val VREG_TY_NIL
-
-```mach
-pub val VREG_TY_NIL: u32 = 0xFFFFFFFF
-```
+a zeroed vreg is blank: no spill slot, no register, no type and no home
 
 ## fun vreg
 
@@ -1460,6 +1484,15 @@ pub fun slot_sp_offset(frame: *MirFrame, v: u32) opt[i64];
 ```mach
 pub fun slots_from_sp(frame: *MirFrame) bool;
 ```
+
+## fun slot_base_offset
+
+```mach
+pub fun slot_base_offset(frame: *MirFrame, v: u32) opt[i64];
+```
+
+the displacement of v's slot from the slot base register: the stack pointer
+when slots_from_sp, else the frame pointer. none when v owns no slot
 
 ## fun slot_extent
 
@@ -1564,6 +1597,15 @@ pub rec MirModule;
 
 diags: the store a backend pass appends to when it rejects the program, the
 same store the front-end passes of the module wrote; owned by the caller
+
+## fun text_section_of
+
+```mach
+pub fun text_section_of(mm: *MirModule, name: intern.StrId) res[u32, fail.Fail];
+```
+
+the text section of `mm` named `name`, declared on first use: 0 is the
+default text, which a nil name means
 
 ## fun reject
 
