@@ -30,6 +30,12 @@ pub val MH_OBJECT:  u32 = 1
 pub val MH_EXECUTE: u32 = 2
 ```
 
+## val MH_DYLIB
+
+```mach
+pub val MH_DYLIB:   u32 = 6
+```
+
 ## val MH_NOUNDEFS
 
 ```mach
@@ -76,6 +82,12 @@ pub val LC_UNIXTHREAD:     u32 = 0x5
 
 ```mach
 pub val LC_LOAD_DYLIB:     u32 = 0xC
+```
+
+## val LC_ID_DYLIB
+
+```mach
+pub val LC_ID_DYLIB:       u32 = 0xD
 ```
 
 ## val LC_LOAD_DYLINKER
@@ -767,6 +779,24 @@ pub val CODE_SIG_ALIGN:         usize = 16
 ```mach
 pub fun arch_is_arm64(arch_id: u32) bool;
 ```
+
+## rec IsaRow
+
+```mach
+pub rec IsaRow;
+```
+
+what mach-o records of one instruction set it covers: the cpu its headers
+name, the page its segments map at, and the objective-c selector stub its
+linker makes
+
+## fun row_for
+
+```mach
+pub fun row_for(arch_id: u32) *IsaRow;
+```
+
+the row of an instruction set mach-o covers, nil for any other
 
 ## fun macho_page_size
 
