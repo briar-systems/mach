@@ -6,7 +6,7 @@
 fwd type_kind.TypeId
 ```
 
-forwards [`mach.lang.type.kind.TypeId`](type/kind.md#def-typeid)
+forwards [`mach.lang.type.kind.TypeId`](type/kind.md#rec-typeid)
 
 ## fwd type_kind.TYPE_NIL
 
@@ -23,6 +23,46 @@ fwd type_kind.TYPE_ERROR
 ```
 
 forwards [`mach.lang.type.kind.TYPE_ERROR`](type/kind.md#val-type_error)
+
+## fwd type_kind.id
+
+```mach
+fwd type_kind.id
+```
+
+forwards [`mach.lang.type.kind.id`](type/kind.md#fun-id)
+
+## fwd type_kind.index
+
+```mach
+fwd type_kind.index
+```
+
+forwards [`mach.lang.type.kind.index`](type/kind.md#fun-index)
+
+## fwd type_kind.same
+
+```mach
+fwd type_kind.same
+```
+
+forwards [`mach.lang.type.kind.same`](type/kind.md#fun-same)
+
+## fwd type_kind.is_nil
+
+```mach
+fwd type_kind.is_nil
+```
+
+forwards [`mach.lang.type.kind.is_nil`](type/kind.md#fun-is_nil)
+
+## fwd type_kind.is_error
+
+```mach
+fwd type_kind.is_error
+```
+
+forwards [`mach.lang.type.kind.is_error`](type/kind.md#fun-is_error)
 
 ## fwd type_kind.TypeKind
 

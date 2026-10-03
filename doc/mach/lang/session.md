@@ -6,7 +6,7 @@
 fwd module.ModuleId
 ```
 
-forwards [`mach.lang.module.ModuleId`](module.md#def-moduleid)
+forwards [`mach.lang.module.ModuleId`](module.md#rec-moduleid)
 
 ## fwd module.MODULE_NIL
 
@@ -22,7 +22,7 @@ forwards [`mach.lang.module.MODULE_NIL`](module.md#val-module_nil)
 fwd module.StableModuleId
 ```
 
-forwards [`mach.lang.module.StableModuleId`](module.md#def-stablemoduleid)
+forwards [`mach.lang.module.StableModuleId`](module.md#rec-stablemoduleid)
 
 ## fwd module.STABLE_MODULE_NIL
 
