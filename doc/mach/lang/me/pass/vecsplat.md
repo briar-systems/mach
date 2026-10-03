@@ -1,9 +1,17 @@
 # mach.lang.me.pass.vecsplat
 
-## fun run
+## val PASS
 
 ```mach
-pub fun run(m: *me_ir.Module, workspace: *scratch.Workspace) res[bool, fail.Fail];
+pub val PASS: pass.Pass = pass.Pass;
+```
+
+the pass the pipeline schedules
+
+## fun run_in
+
+```mach
+pub fun run_in(ctx: *pass.Context) res[bool, fail.Fail];
 ```
 
 rewrites a vector shift whose count is a literal with the same value in

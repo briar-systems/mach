@@ -27,21 +27,45 @@ pub fun detect_undeclared(m: *me_ir.Module, tgt: *lang_target.Target, first: *Sc
 
 operators whose lane shape the target's catalog names neither packed nor scalar
 
+## val LANES
+
+```mach
+pub val LANES: pass.Pass = pass.Pass;
+```
+
+the lane-operation expansion the pipeline schedules
+
 ## fun expand_lane_ops_in
 
 ```mach
-pub fun expand_lane_ops_in(m: *me_ir.Module, tgt: *lang_target.Target, workspace: *scratch.Workspace) res[bool, fail.Fail];
+pub fun expand_lane_ops_in(ctx: *pass.Context) res[bool, fail.Fail];
 ```
+
+## val GAPS
+
+```mach
+pub val GAPS: pass.Pass = pass.Pass;
+```
+
+the gap expansion the pipeline schedules
 
 ## fun expand_gap_ops_in
 
 ```mach
-pub fun expand_gap_ops_in(m: *me_ir.Module, tgt: *lang_target.Target, workspace: *scratch.Workspace) res[bool, fail.Fail];
+pub fun expand_gap_ops_in(ctx: *pass.Context) res[bool, fail.Fail];
 ```
+
+## val PASS
+
+```mach
+pub val PASS: pass.Pass = pass.Pass;
+```
+
+the pass the pipeline schedules
 
 ## fun run_in
 
 ```mach
-pub fun run_in(m: *me_ir.Module, tgt: *lang_target.Target, workspace: *scratch.Workspace) res[bool, fail.Fail];
+pub fun run_in(ctx: *pass.Context) res[bool, fail.Fail];
 ```
 

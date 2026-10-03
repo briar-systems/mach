@@ -10,9 +10,17 @@ reaches the join with an unconditional branch is redirected to the branch's
 target directly, or branches on its own compare, and the join keeps only the
 predecessors that could not be threaded.
 
+## val PASS
+
+```mach
+pub val PASS: pass.Pass = pass.Pass;
+```
+
+the pass the pipeline schedules
+
 ## fun run_in
 
 ```mach
-pub fun run_in(m: *me_ir.Module, workspace: *scratch.Workspace) res[bool, fail.Fail];
+pub fun run_in(ctx: *pass.Context) res[bool, fail.Fail];
 ```
 
