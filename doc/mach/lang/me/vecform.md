@@ -3,7 +3,7 @@
 ## fun vec_op_of
 
 ```mach
-pub fun vec_op_of(k: ir_instruction.InstrKind, uniform_count: bool) opt[isa.VecOp];
+pub fun vec_op_of(k: ir_instruction.InstrKind, uniform_count: bool) opt[target_model.VecOp];
 ```
 
 the target-layer vector operation an instruction kind maps to, VEC_OP_NONE
@@ -45,7 +45,7 @@ pub fun scalar_bits(m: *me_ir.Module, ty: ir_type.IrTypeId) u32;
 ## fun packs
 
 ```mach
-pub fun packs(tgt: *lang_target.Target, k: ir_instruction.InstrKind, is_float: bool, lane_bits: u32, uniform_count: bool) bool;
+pub fun packs(tgt: *resolved.Target, k: ir_instruction.InstrKind, is_float: bool, lane_bits: u32, uniform_count: bool) bool;
 ```
 
 whether the target packs `k` over lanes of `lane_bits`; a shift is the cell
@@ -55,7 +55,7 @@ count per lane otherwise
 ## fun extends
 
 ```mach
-pub fun extends(tgt: *lang_target.Target, k: ir_instruction.InstrKind, lane_bits: u32, from_bits: u32) bool;
+pub fun extends(tgt: *resolved.Target, k: ir_instruction.InstrKind, lane_bits: u32, from_bits: u32) bool;
 ```
 
 a loop's lane-wise integer extension `k` from `from_bits` lanes to
@@ -64,7 +64,7 @@ a loop's lane-wise integer extension `k` from `from_bits` lanes to
 ## fun extends_directly
 
 ```mach
-pub fun extends_directly(tgt: *lang_target.Target) bool;
+pub fun extends_directly(tgt: *resolved.Target) bool;
 ```
 
 a lane-wise integer extension over more than one doubling is one
@@ -73,13 +73,13 @@ instruction on the target, rather than a chain of doublings
 ## fun packed_lanes
 
 ```mach
-pub fun packed_lanes(tgt: *lang_target.Target, is_float: bool, lane_bits: u32) u32;
+pub fun packed_lanes(tgt: *resolved.Target, is_float: bool, lane_bits: u32) u32;
 ```
 
 ## fun decide
 
 ```mach
-pub fun decide(m: *me_ir.Module, tgt: *lang_target.Target, inst: *ir_instruction.Instruction) isa.VectorForm;
+pub fun decide(m: *me_ir.Module, tgt: *resolved.Target, inst: *ir_instruction.Instruction) target_model.VectorForm;
 ```
 
 the target's declared outcome for one vector operator: packed, the scalar
@@ -88,7 +88,7 @@ expansion, or undeclared when the catalog names neither for its lane shape
 ## fun piece_lanes
 
 ```mach
-pub fun piece_lanes(tgt: *lang_target.Target, is_float: bool, lane_bits: u32) u32;
+pub fun piece_lanes(tgt: *resolved.Target, is_float: bool, lane_bits: u32) u32;
 ```
 
 the lanes of one register-width piece a vector of `lane_bits` lanes wider
@@ -101,7 +101,7 @@ width whole
 ## fun splits
 
 ```mach
-pub fun splits(m: *me_ir.Module, tgt: *lang_target.Target, ty: ir_type.IrTypeId) bool;
+pub fun splits(m: *me_ir.Module, tgt: *resolved.Target, ty: ir_type.IrTypeId) bool;
 ```
 
 a vector the target splits at type legalization: wider than one register, of
@@ -110,7 +110,7 @@ a lane shape the vocabulary retains, on a target that splits
 ## fun realizes_packed
 
 ```mach
-pub fun realizes_packed(m: *me_ir.Module, tgt: *lang_target.Target, inst: *ir_instruction.Instruction) bool;
+pub fun realizes_packed(m: *me_ir.Module, tgt: *resolved.Target, inst: *ir_instruction.Instruction) bool;
 ```
 
 packed where the catalog packs the cell and both sides are realized in
@@ -129,7 +129,7 @@ kind fuses into; absent for any other extension
 ## fun widening_packs
 
 ```mach
-pub fun widening_packs(m: *me_ir.Module, tgt: *lang_target.Target, kind: ir_instruction.InstrKind, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
+pub fun widening_packs(m: *me_ir.Module, tgt: *resolved.Target, kind: ir_instruction.InstrKind, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
 ```
 
 whether a widening multiply of two `from_ty` vectors into `ty` is a cell the
@@ -138,7 +138,7 @@ target packs at these lanes; the catalog is the only judge
 ## fun widening_half_packs
 
 ```mach
-pub fun widening_half_packs(m: *me_ir.Module, tgt: *lang_target.Target, kind: ir_instruction.InstrKind, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
+pub fun widening_half_packs(m: *me_ir.Module, tgt: *resolved.Target, kind: ir_instruction.InstrKind, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
 ```
 
 whether the widening multiply of one half of two `from_ty` vectors into the
@@ -156,7 +156,7 @@ multiply `kind`; absent for any other kind
 ## fun widening_pair_packs
 
 ```mach
-pub fun widening_pair_packs(m: *me_ir.Module, tgt: *lang_target.Target, kind: ir_instruction.InstrKind, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
+pub fun widening_pair_packs(m: *me_ir.Module, tgt: *resolved.Target, kind: ir_instruction.InstrKind, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
 ```
 
 whether the target realizes the half `ty` of a widening multiply `kind` of
@@ -167,7 +167,7 @@ of one product then read the same pair
 ## fun sign_interleave_packs
 
 ```mach
-pub fun sign_interleave_packs(m: *me_ir.Module, tgt: *lang_target.Target, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
+pub fun sign_interleave_packs(m: *me_ir.Module, tgt: *resolved.Target, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
 ```
 
 whether the target realizes the signed lane-halving extension of a
@@ -179,7 +179,7 @@ same mask
 ## fun zero_interleave_packs
 
 ```mach
-pub fun zero_interleave_packs(m: *me_ir.Module, tgt: *lang_target.Target, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
+pub fun zero_interleave_packs(m: *me_ir.Module, tgt: *resolved.Target, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
 ```
 
 whether the target realizes the unsigned lane-halving extension of a
@@ -190,7 +190,7 @@ instruction of its own there. every such half then reads one zero
 ## fun concat_packs
 
 ```mach
-pub fun concat_packs(m: *me_ir.Module, tgt: *lang_target.Target, ty: ir_type.IrTypeId) bool;
+pub fun concat_packs(m: *me_ir.Module, tgt: *resolved.Target, ty: ir_type.IrTypeId) bool;
 ```
 
 whether a lane join into `ty` is a cell the target packs
@@ -198,7 +198,7 @@ whether a lane join into `ty` is a cell the target packs
 ## fun widen_half_packs
 
 ```mach
-pub fun widen_half_packs(m: *me_ir.Module, tgt: *lang_target.Target, kind: ir_instruction.InstrKind, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
+pub fun widen_half_packs(m: *me_ir.Module, tgt: *resolved.Target, kind: ir_instruction.InstrKind, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
 ```
 
 whether a lane-halving extension of a `from_ty` vector into `ty` is a cell
@@ -207,7 +207,7 @@ the target packs at these lanes; the catalog is the only judge
 ## fun conversion_packs
 
 ```mach
-pub fun conversion_packs(m: *me_ir.Module, tgt: *lang_target.Target, kind: ir_instruction.InstrKind, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
+pub fun conversion_packs(m: *me_ir.Module, tgt: *resolved.Target, kind: ir_instruction.InstrKind, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
 ```
 
 whether the lane-wise conversion `kind` of a `from_ty` vector into `ty` is a
@@ -216,7 +216,7 @@ cell the target packs at these lanes; the catalog is the only judge
 ## fun operation_packs
 
 ```mach
-pub fun operation_packs(m: *me_ir.Module, tgt: *lang_target.Target, kind: ir_instruction.InstrKind, ty: ir_type.IrTypeId, operand_ty: ir_type.IrTypeId, n: u32) bool;
+pub fun operation_packs(m: *me_ir.Module, tgt: *resolved.Target, kind: ir_instruction.InstrKind, ty: ir_type.IrTypeId, operand_ty: ir_type.IrTypeId, n: u32) bool;
 ```
 
 whether `kind` over `n` operands of `operand_ty` (one or two) into `ty` is a
@@ -225,7 +225,7 @@ cell the target packs at these lanes; the catalog is the only judge
 ## fun widen_sum_packs
 
 ```mach
-pub fun widen_sum_packs(m: *me_ir.Module, tgt: *lang_target.Target, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
+pub fun widen_sum_packs(m: *me_ir.Module, tgt: *resolved.Target, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
 ```
 
 whether the widening group sum of a `from_ty` vector into `ty` is a cell
@@ -234,7 +234,7 @@ the target packs, both sides whole in one register
 ## fun range_packs
 
 ```mach
-pub fun range_packs(m: *me_ir.Module, tgt: *lang_target.Target, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
+pub fun range_packs(m: *me_ir.Module, tgt: *resolved.Target, ty: ir_type.IrTypeId, from_ty: ir_type.IrTypeId) bool;
 ```
 
 whether a lane range of a `from_ty` vector into `ty` is a cell the target
@@ -243,13 +243,13 @@ packs at these lanes; the catalog is the only judge
 ## fun holds_in_register
 
 ```mach
-pub fun holds_in_register(m: *me_ir.Module, tgt: *lang_target.Target, ty: ir_type.IrTypeId) bool;
+pub fun holds_in_register(m: *me_ir.Module, tgt: *resolved.Target, ty: ir_type.IrTypeId) bool;
 ```
 
 ## fun vec_op_name
 
 ```mach
-pub fun vec_op_name(op: isa.VecOp) opt[str];
+pub fun vec_op_name(op: target_model.VecOp) opt[str];
 ```
 
 the spelling of a vector operation in a diagnostic; absent for a tag

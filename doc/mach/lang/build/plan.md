@@ -222,13 +222,13 @@ prior: *BuildUnit) res[BuildUnit, fail.Fail];
 ## fun finished_modules
 
 ```mach
-pub fun finished_modules(tgt: *lang_target.Target) bool;
+pub fun finished_modules(tgt: *lang_target.Binding) bool;
 ```
 
 ## fun resolve_requirement
 
 ```mach
-pub fun resolve_requirement(a: *A.Allocator, itn: *intern.Interner, tgt: *lang_target.Target,
+pub fun resolve_requirement(a: *A.Allocator, itn: *intern.Interner, tgt: *lang_target.Binding,
 dirs: *Vector[str], root: str,
 req: *manifest.LinkRequirement) res[LinkInput, fail.Fail];
 ```

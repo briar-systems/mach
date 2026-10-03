@@ -42,7 +42,7 @@ a member of the contract
 ## fun context
 
 ```mach
-pub fun context(m: *me_ir.Module, tgt: *lang_target.Target, workspace: *scratch.Workspace) Context;
+pub fun context(m: *me_ir.Module, tgt: *resolved.Target, workspace: *scratch.Workspace) Context;
 ```
 
 a context over `m` for `tgt` sharing `workspace`, offering nothing else, with

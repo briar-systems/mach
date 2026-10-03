@@ -11,7 +11,7 @@ passes share: the width test and the function synthesis
 ## fun wide_bits
 
 ```mach
-pub fun wide_bits(m: *me_ir.Module, tgt: *lang_target.Target, ty: ir_type.IrTypeId) u32;
+pub fun wide_bits(m: *me_ir.Module, tgt: *resolved.Target, ty: ir_type.IrTypeId) u32;
 ```
 
 the bit width of a scalar integer wider than both the target's ALU and the

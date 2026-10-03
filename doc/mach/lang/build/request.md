@@ -31,7 +31,7 @@ pub val SUBSYSTEM_FLAG_CONSOLE: SubsystemFlag = 1
 ## fun subsystem_from_flag
 
 ```mach
-pub fun subsystem_from_flag(f: SubsystemFlag) opt[target_of.Subsystem];
+pub fun subsystem_from_flag(f: SubsystemFlag) opt[catalog_subsystem.Subsystem];
 ```
 
 ## def BuildGoal
@@ -156,7 +156,7 @@ cli: *CliArgs, root: str, goal: BuildGoal, profile: str) res[BuildRequest, fail.
 
 ```mach
 pub fun for_cell(base: *BuildRequest, owner: str, target: str, artifact: str,
-subsystem: target_of.Subsystem, goal: BuildGoal) BuildRequest;
+subsystem: catalog_subsystem.Subsystem, goal: BuildGoal) BuildRequest;
 ```
 
 ## val HASH_SIZE

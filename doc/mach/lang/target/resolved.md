@@ -1,22 +1,32 @@
 # mach.lang.target.resolved
 
+the description of a resolved target: plain facts the front end, the
+middle end and every backend read, importing nothing from the backend. the
+member vtables the description was resolved from stay with the backend's
+binding (target.binding)
+
+## def AsmReturnsFn
+
+```mach
+pub def AsmReturnsFn: fun(str) bool
+```
+
+whether an asm body returns from the function that holds it
+
+## def IntImmFitsFn
+
+```mach
+pub def IntImmFitsFn: fun(u64, u32) bool
+```
+
+whether one instruction materializes the integer `value`, read at `bits`
+(at most 64): the rule the middle end hoists a loop's constants by
+
 ## rec Target
 
 ```mach
 pub rec Target;
 ```
-
-a resolved target borrows every vtable from the registry it was resolved
-against; the borrow is live exactly while that registry stays published
-
-## fun live
-
-```mach
-pub fun live(tgt: *Target) err[fail.Fail];
-```
-
-the borrow check every backend entry runs before following a vtable:
-a target resolved from a registry that has since been released is refused
 
 ## fun layout_machine
 
@@ -51,16 +61,8 @@ lowering gate, the oblivious validators and `$mach.build.ct_mul` all read
 pub fun ct_mul_dit_cells(tgt: *Target) ct.CtMulMask;
 ```
 
-the cells the instruction set declares only under PSTATE.DIT, whether or not
-the os guarantees the mode: a secret multiply in one of them is what makes a
-program need DIT at start, and what the refusal names when the os declares
-nothing
-
-## fun backend_target
-
-```mach
-pub fun backend_target(tgt: *Target) res[isa.BackendTarget, fail.Fail];
-```
-
-the view a backend reads, refused for a target that is no longer live
+the cells the instruction set declares only under its data-independent-timing
+mode, whether or not the os guarantees the mode: a secret multiply in one of
+them is what makes a program need the mode at start, and what the refusal
+names when the os declares nothing
 

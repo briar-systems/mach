@@ -45,7 +45,7 @@ pub fun dnit(graph: *Graph);
 ## fun capture
 
 ```mach
-pub fun capture[T](s: *session.Session, a: *A.Allocator, roots: *Roots, count: usize, mode: CaptureMode, defs: *isa.TargetDefs, ctx: *T,
+pub fun capture[T](s: *session.Session, a: *A.Allocator, roots: *Roots, count: usize, mode: CaptureMode, defs: *target_definition.Table, ctx: *T,
 prepare: fun(*T, type.TypeId) err[fail.Fail]) res[Graph, fail.Fail];
 ```
 

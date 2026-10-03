@@ -110,7 +110,7 @@ atoms: *AtomPlan, entry_name: intern.StrId) err[fail.Fail];
 ## fun assign_section_vaddrs
 
 ```mach
-pub fun assign_section_vaddrs(tgt: *lang_target.Target, merged: *MergedSection,
+pub fun assign_section_vaddrs(tgt: *lang_target.Binding, merged: *MergedSection,
 reserve: u64) err[fail.Fail];
 ```
 
@@ -147,13 +147,13 @@ content_vaddr: u64) target_of.ExecutableSectionLocation;
 ## fun os_base_addr
 
 ```mach
-pub fun os_base_addr(tgt: *lang_target.Target) u64;
+pub fun os_base_addr(tgt: *lang_target.Binding) u64;
 ```
 
 ## fun os_page_size
 
 ```mach
-pub fun os_page_size(tgt: *lang_target.Target) u64;
+pub fun os_page_size(tgt: *lang_target.Binding) u64;
 ```
 
 ## fun free_placements
