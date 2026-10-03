@@ -35,12 +35,6 @@ pub val LANES: pass.Pass = pass.Pass;
 
 the lane-operation expansion the pipeline schedules
 
-## fun expand_lane_ops_in
-
-```mach
-pub fun expand_lane_ops_in(ctx: *pass.Context) res[bool, fail.Fail];
-```
-
 ## val GAPS
 
 ```mach
@@ -49,12 +43,6 @@ pub val GAPS: pass.Pass = pass.Pass;
 
 the gap expansion the pipeline schedules
 
-## fun expand_gap_ops_in
-
-```mach
-pub fun expand_gap_ops_in(ctx: *pass.Context) res[bool, fail.Fail];
-```
-
 ## val PASS
 
 ```mach
@@ -62,10 +50,4 @@ pub val PASS: pass.Pass = pass.Pass;
 ```
 
 the pass the pipeline schedules
-
-## fun run_in
-
-```mach
-pub fun run_in(ctx: *pass.Context) res[bool, fail.Fail];
-```
 

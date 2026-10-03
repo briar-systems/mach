@@ -42,15 +42,3 @@ pub val MARK: pass.Pass = pass.Pass;
 
 the flagging of calls in tail position, as the pipeline schedules it
 
-## fun recurse_in
-
-```mach
-pub fun recurse_in(ctx: *pass.Context) res[bool, fail.Fail];
-```
-
-## fun mark_in
-
-```mach
-pub fun mark_in(ctx: *pass.Context) res[bool, fail.Fail];
-```
-
