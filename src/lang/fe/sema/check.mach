@@ -25,7 +25,9 @@ use mach.lang.fe.sema.abitype;
 use mach.lang.fe.sema.coerce;
 use sema_context: mach.lang.fe.sema.context;
 use mach.lang.fe.sema.generics;
+use sema_instance: mach.lang.fe.sema.instance;
 use mach.lang.fe.sema.typename;
+use mach.lang.float;
 use mach.lang.intern;
 use mach.lang.layout;
 use mach.lang.module;
@@ -252,7 +254,7 @@ pub fun check_call(sc: *sema_context.SemaContext, callee_sig: type.TypeId, args_
     ret all_ok;
 }
 
-pub fun check_comptime_call(sc: *sema_context.SemaContext, callee_sig: type.TypeId, callee: ast_id.ExprId, f: *ast_decl.DeclFun, args_start: u32, args_len: u32, span: lang_source.Span) bool {
+pub fun check_comptime_call(sc: *sema_context.SemaContext, eid: ast_id.ExprId, callee_sig: type.TypeId, callee: ast_id.ExprId, f: *ast_decl.DeclFun, args_start: u32, args_len: u32, span: lang_source.Span) bool {
     val params_ast: *ast.Ast = callee_origin_ast(sc, callee);
     if (params_ast == nil) { ret true; }
 
@@ -268,6 +270,9 @@ pub fun check_comptime_call(sc: *sema_context.SemaContext, callee_sig: type.Type
     val rt_start: u32        = sig.data.fn.params_start;
     val rt_len:   u32        = sig.data.fn.params_len;
 
+    var values: ComptimeArgs = comptime_args_init(sc, f, params_ast);
+    fin { comptime_args_dnit(sc, ?values); }
+
     var all_ok:  bool = true;
     var i:       u32  = 0;
     var rt_seen: u32  = 0;
@@ -277,17 +282,7 @@ pub fun check_comptime_call(sc: *sema_context.SemaContext, callee_sig: type.Type
         val arg_span: lang_source.Span    = expr_span_of(sc, arg_eid, span);
 
         if (tn.comptime) {
-            if (!arg_references_comptime_param(sc, arg_eid, arg_span) && !arg_names_module_constant(sc, arg_eid)) {
-                val res_eval: res[comptime.CTValue, comptime.EvalFail] = comptime.evaluate[sema_context.SemaContext](sc.ctx, sc, sc.caps, sc.a, sc.source, arg_eid, ?sc.s.interner);
-                sema_context.record_eval_result(sc, res_eval);
-                if (sel res_eval.err) {
-                    report_note(sc, diagnostic_kind.COMPTIME_ARGUMENT_NOT_CONSTANT, arg_span, "comptime argument is not a compile-time constant", res_eval.err.message);
-                    all_ok = false;
-                }
-                or (sel res_eval.ok) {
-                    if (!check_comptime_arg_fits(sc, res_eval.ok, comptime_param_type(sc, callee, params_ast, tn.ty), arg_span)) { all_ok = false; }
-                }
-            }
+            if (!comptime_arg_value(sc, ?values, callee, params_ast, tn, arg_eid, arg_span)) { all_ok = false; }
             i = i + 1;
             cnt;
         }
@@ -303,7 +298,152 @@ pub fun check_comptime_call(sc: *sema_context.SemaContext, callee_sig: type.Type
         }
         i = i + 1;
     }
+    if (all_ok && values.complete) { record_value_instance(sc, eid, callee, callee_sig, ?values, span); }
     ret all_ok;
+}
+
+# the comptime arguments of one call, in parameter order, with the parameters they bind;
+# incomplete while any is decided only at an instance of the caller
+rec ComptimeArgs {
+    values:   *comptime.CTValue;
+    names:    *intern.StrId;
+    len:      u32;
+    cap:      u32;
+    complete: bool;
+}
+
+fun comptime_args_init(sc: *sema_context.SemaContext, f: *ast_decl.DeclFun, params_ast: *ast.Ast) ComptimeArgs {
+    var out: ComptimeArgs;
+    out.values   = nil;
+    out.names    = nil;
+    out.len      = 0;
+    out.cap      = 0;
+    out.complete = true;
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < f.params_len) {
+        if (params_ast.typed_names[f.params_start + i].comptime) { n = n + 1; }
+        i = i + 1;
+    }
+    if (n == 0) { ret out; }
+    val vr: res[*comptime.CTValue, A.Error] = A.allocate[comptime.CTValue](sc.s.alloc, n::usize);
+    if (sel vr.err) {
+        fail.internal(?sc.status, "out of memory holding a call's comptime arguments");
+        out.complete = false;
+        ret out;
+    }
+    val nr: res[*intern.StrId, A.Error] = A.allocate[intern.StrId](sc.s.alloc, n::usize);
+    if (sel nr.err) {
+        A.deallocate[comptime.CTValue](sc.s.alloc, vr.ok, n::usize);
+        fail.internal(?sc.status, "out of memory holding a call's comptime arguments");
+        out.complete = false;
+        ret out;
+    }
+    out.values = vr.ok;
+    out.names  = nr.ok;
+    out.cap    = n;
+    ret out;
+}
+
+fun comptime_args_dnit(sc: *sema_context.SemaContext, values: *ComptimeArgs) {
+    if (values.cap == 0) { ret; }
+    A.deallocate[comptime.CTValue](sc.s.alloc, values.values, values.cap::usize);
+    A.deallocate[intern.StrId](sc.s.alloc, values.names, values.cap::usize);
+    values.cap = 0;
+}
+
+# evaluates one comptime argument and holds it to its parameter's type. one that names a
+# comptime parameter of the enclosing function is decided at each instance of it, where
+# the walk binds that parameter, and an instance's walk reports what its template could not
+fun comptime_arg_value(sc: *sema_context.SemaContext, values: *ComptimeArgs, callee: ast_id.ExprId, params_ast: *ast.Ast,
+    tn: *ast_decl.TypedName, arg_eid: ast_id.ExprId, arg_span: lang_source.Span) bool {
+    val per_instance: bool = arg_references_comptime_param(sc, arg_eid, arg_span);
+    if (per_instance && !sema_context.walk_binds_values(sc)) {
+        values.complete = false;
+        ret true;
+    }
+    val saved_silent: bool = sc.silent;
+    if (per_instance) { sc.silent = false; }
+    val ok: bool = comptime_arg_evaluate(sc, values, callee, params_ast, tn, arg_eid, arg_span);
+    sc.silent = saved_silent;
+    ret ok;
+}
+
+fun comptime_arg_evaluate(sc: *sema_context.SemaContext, values: *ComptimeArgs, callee: ast_id.ExprId, params_ast: *ast.Ast,
+    tn: *ast_decl.TypedName, arg_eid: ast_id.ExprId, arg_span: lang_source.Span) bool {
+    val res_eval: res[comptime.CTValue, comptime.EvalFail] = comptime.evaluate_at_float_width[sema_context.SemaContext](sc.ctx, sc, sc.caps, sc.a, sc.source,
+        arg_eid, ?sc.s.interner, expr_float_width(sc, arg_eid));
+    sema_context.record_eval_result(sc, res_eval);
+    if (sel res_eval.err) {
+        values.complete = false;
+        # an imported constant this phase cannot read yet is left to the instance that reads it
+        if (arg_names_module_constant(sc, arg_eid)) { ret true; }
+        report_note(sc, diagnostic_kind.COMPTIME_ARGUMENT_NOT_CONSTANT, arg_span, "comptime argument is not a compile-time constant", res_eval.err.message);
+        ret false;
+    }
+    if (!check_comptime_arg_fits(sc, res_eval.ok, comptime_param_type(sc, callee, params_ast, tn.ty), arg_span)) {
+        values.complete = false;
+        ret false;
+    }
+    if (values.len >= values.cap) {
+        values.complete = false;
+        ret true;
+    }
+    val text: opt[*lang_source.SourceFile] = lang_source.get(?sc.s.sources, params_ast.file_id);
+    if (sel text.none) {
+        fail.internal(?sc.status, "a comptime parameter's module has no source");
+        values.complete = false;
+        ret true;
+    }
+    val name: res[intern.StrId, A.Error] = intern.range_add(?sc.s.interner, text.some.text, tn.name.offset, tn.name.len);
+    if (sel name.err) {
+        fail.internal(?sc.status, "out of memory naming a comptime parameter");
+        values.complete = false;
+        ret true;
+    }
+    values.values[values.len] = res_eval.ok;
+    values.names[values.len]  = name.ok;
+    values.len                = values.len + 1;
+    ret true;
+}
+
+fun expr_float_width(sc: *sema_context.SemaContext, eid: ast_id.ExprId) float.FloatWidth {
+    val tid: type.TypeId = expr_type_of(sc, eid);
+    if (type.is_nil(tid) || type.is_error(tid)) { ret float.FLOAT_W_NONE; }
+    val ct:    type.TypeId     = type.strip_secret(?sc.s.types, sema_context.apply_subst(sc, tid));
+    val opt_t: opt[*type.Type] = type.get(?sc.s.types, ct);
+    if (!sel opt_t.some) { ret float.FLOAT_W_NONE; }
+    ret type.float_width_of(opt_t.some.kind);
+}
+
+fun record_value_instance(sc: *sema_context.SemaContext, eid: ast_id.ExprId, callee: ast_id.ExprId, callee_sig: type.TypeId,
+    values: *ComptimeArgs, span: lang_source.Span) {
+    val opt_sym: opt[*resolve.Symbol] = sema_context.symbol_for_expr(sc, callee);
+    if (!sel opt_sym.some) { ret; }
+    val sym:      *resolve.Symbol                            = opt_sym.some;
+    val acquired: res[sema_context.DefinedSymbol, fail.Fail] = sema_context.symbol_definition(sc, sym, sema_context.DEFINITION_RESOLVED);
+    if (sel acquired.err) { ret; }
+    var item: sema_instance.Instance;
+    item.kind      = sema_instance.KIND_VALUE;
+    item.origin    = sym.origin;
+    item.decl      = acquired.ok.symbol.decl;
+    item.args      = nil;
+    item.arg_len   = 0;
+    item.values    = values.values;
+    item.names     = values.names;
+    item.value_len = values.len;
+    item.pack      = nil;
+    item.pack_len  = 0;
+    item.bare      = sym.name;
+    item.canon     = sym.canon;
+    item.sig       = callee_sig;
+    item.site      = span;
+    val recorded: res[u8, fail.Fail] = sema_context.record_instance(sc, item, eid);
+    if (sel recorded.err) {
+        report(sc, diagnostic_kind.COMPILER_INTERNAL, span, fail.describe(recorded.err));
+        ret;
+    }
+    if (recorded.ok != sema_context.RECORD_OK) { report_instantiation_limit(sc, span, recorded.ok, sym.name, nil, 0); }
 }
 
 # the declared type of a comptime parameter of `callee`, read from the module that
@@ -1407,20 +1547,20 @@ pub fun report_instantiation_limit(sc: *sema_context.SemaContext, span: lang_sou
 
 fun instantiation_chain(sc: *sema_context.SemaContext, headline: str, bare: intern.StrId,
     args: *type.TypeId, arg_len: u32) str {
-    val wl: *sema_context.InstWorklist = sc.insts;
-    if (wl == nil) { ret headline; }
+    if (sc.insts == nil) { ret headline; }
+    val set: *sema_instance.Set = ?sc.insts.set;
 
     var shown: [CHAIN_LINKS]u32;
     var count: u32 = 0;
     var total: u32 = 0;
     var walk:  u32 = sc.inst_parent;
-    for (walk != sema_context.INST_NONE && walk < wl.len) {
+    for (walk != sema_context.INST_NONE && walk < sema_instance.count(set)) {
         if (count < CHAIN_LINKS) {
             shown[count] = walk;
             count        = count + 1;
         }
         total = total + 1;
-        walk  = wl.items[walk].parent;
+        walk  = sema_instance.at(set, walk).parent;
     }
 
     val head_r: res[str, std_format.FormatError] = std_format.sprint(sc.s.alloc, "{}; chain: ", headline);
@@ -1443,7 +1583,7 @@ fun instantiation_chain(sc: *sema_context.SemaContext, headline: str, bare: inte
     var i: u32 = count;
     for (i > 0) {
         i = i - 1;
-        val e: *sema_context.InstReq = ?wl.items[shown[i]];
+        val e: *sema_instance.Instance = sema_instance.at(set, shown[i]);
         msg = chain_link(sc, msg, e.bare, e.args, e.arg_len);
         msg = typename.text_join(sc.s, msg, " -> ", false);
     }
