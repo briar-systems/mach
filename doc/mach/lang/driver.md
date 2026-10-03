@@ -184,22 +184,6 @@ fwd config.RunArtifact
 
 forwards [`mach.lang.driver.config.RunArtifact`](driver/config.md#rec-runartifact)
 
-## fwd mach.lang.driver.registry.setup_registry
-
-```mach
-fwd mach.lang.driver.registry.setup_registry
-```
-
-forwards [`mach.lang.driver.registry.setup_registry`](driver/registry.md#fun-setup_registry)
-
-## fwd mach.lang.driver.registry.registry
-
-```mach
-fwd mach.lang.driver.registry.registry
-```
-
-forwards [`mach.lang.driver.registry.registry`](driver/registry.md#fun-registry)
-
 ## fun append_frontend_roots
 
 ```mach
@@ -213,6 +197,24 @@ pub fun append_test_roots(p: *project.Project, roots: *Vector[query.QueryKey]) e
 ```
 
 the backend's roots and each test object's lowering and codegen
+
+## fun phase_finish
+
+```mach
+pub fun phase_finish(p: *project.Project,
+result: err[fail.Fail]) err[fail.Fail];
+```
+
+a phase the query engine does not run is published as one it does: the
+project's diagnostics are refreshed beside its result
+
+## fun project_failure
+
+```mach
+pub fun project_failure(p: *project.Project, failure: fail.Fail) res[project.Project, fail.Fail];
+```
+
+a project that failed is released, its failure kept where the session presents it
 
 ## fun run_sema_pass
 
@@ -331,18 +333,6 @@ extra_roots: module fqns loaded beside the root set's entries, nil with count 0
 extra_root_count: how many extra roots
 phase: the last frontend phase to run
 ret: the project, released by the caller with project.dnit_project
-
-## fun run_steps_phase
-
-```mach
-pub fun run_steps_phase(p: *project.Project) err[fail.Fail];
-```
-
-## fun run_dep_steps_phase
-
-```mach
-pub fun run_dep_steps_phase(p: *project.Project) err[fail.Fail];
-```
 
 ## fun run_load_phase
 
