@@ -1,17 +1,17 @@
 # mach.lang.me.half
 
-scalar f16 as ordinary ir, written once and shared by every target (#3799).
+scalar f16 as ordinary ir, written once and shared by every target.
 an f16 value is carried as its 16 bits in an i16. an operation the target
 declares in its half rows (isa.half_native) is its own instruction on those
 bits; every other one is the expansion here, which calls nothing, so no
 runtime symbol appears for a freestanding link to provide.
 
 arithmetic widens both operands exactly to the wide format, binary64 or
-binary32 where the model says (#4332), computes there and narrows once. both
+binary32 where the model says, computes there and narrows once. both
 carry at least twice binary16's precision plus two bits, binary32 exactly
 that much, so that one rounding is the correctly rounded binary16 result, the
 rule comptime folds by. a target whose rows convert f16 to and from binary32
-computes in binary32 through them (#3801). an arithmetic operand widens with
+computes in binary32 through them. an arithmetic operand widens with
 a NaN kept as it is, signaling or quiet, so the wide unit picks and quiets
 the NaN as the target's half unit would. a conversion goes through the wide
 format the same way, and a comparison compares the widened values. widening
@@ -40,7 +40,7 @@ pub fun carrier(types: *ir_type.IrTypeTable) res[ir_type.IrTypeId, fail.Fail];
 ```
 
 the ir type an f16 value is carried in: an i16 whose form says its bits are
-a binary16, so a calling convention can place it as the float it is (#3800)
+a binary16, so a calling convention can place it as the float it is
 
 ## fun init
 

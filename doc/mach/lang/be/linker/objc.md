@@ -1,6 +1,6 @@
 # mach.lang.be.linker.objc
 
-objc_msgSend selector stubs (#4256). clang on arm64 compiles a message send to
+objc_msgSend selector stubs. clang on arm64 compiles a message send to
 a call of `_objc_msgSend$<selector>`, a stub the linker is expected to make:
 it loads the selector reference from __objc_selrefs and jumps to objc_msgSend.
 the link appends one synthetic input that defines a stub for every such name

@@ -9,7 +9,7 @@ pub fun run(m: *me_ir.Module, workspace: *scratch.Workspace) res[bool, fail.Fail
 rewrites a vector shift whose count is a literal with the same value in
 every lane into the shift by that one scalar: `v >> u32x4{k, k, k, k}`
 becomes `v >> k`, the uniform count every baseline set shifts by in one
-instruction (#3740). the source has no vector-by-scalar shift, so this is
+instruction. the source has no vector-by-scalar shift, so this is
 the only producer of the uniform form. a lane is the same when every lane
 stores one ssa value or equal constants. a machine target lowers a vector
 literal to a stack slot written lane by lane and read back whole, so the

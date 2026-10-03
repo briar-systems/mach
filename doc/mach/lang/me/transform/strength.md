@@ -6,7 +6,7 @@
 pub fun run_in(m: *me_ir.Module, tgt: *lang_target.Target, workspace: *scratch.Workspace) res[bool, fail.Fail];
 ```
 
-induction-variable strength reduction (#3347). a value that is an affine
+induction-variable strength reduction. a value that is an affine
 function `a * iv + b` of a loop's induction variable, with a constant `a` and
 a loop-invariant `b`, is stepped by `a * step` each iteration instead of
 recomputed. every operation involved is a wrapping add or multiply at the
