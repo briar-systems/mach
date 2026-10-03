@@ -11,17 +11,16 @@ pub val COMMAND: args.CommandSpec = args.CommandSpec;
 ## fun run
 
 ```mach
-pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64;
+pub fun run(cx: *args.Call) res[i64, fail.Fail];
 ```
 
 `mach doc`: build the project's module graph and write one Markdown page per module plus
-an index. pages go to `<root>/doc/<module path>.md`, or under `--out <dir>` relative
-to the root, with a README.md index. a page opens with the module docstring, and every
-`pub` declaration and `fwd` is rendered, documented or not, a `fwd` with what it
-forwards. a summary line prints unless `--quiet`
+an index. pages go to `<root>/doc/<module path>.md`, or under `-o <dir>` inside the project
+root, with a README.md index. a page opens with the module docstring, and every `pub`
+declaration and `fwd` is rendered, documented or not, a `fwd` with what it forwards. a summary
+line prints unless `--quiet`
 
-argv: the full process arguments
-inv: the parsed invocation for this command
-ret: exit.OK, or the shared code of the failure: exit.USER for a project or manifest error,
-      exit.INTERNAL for an allocator, session or registry failure, exit.ENVIRONMENT for a write failure
+cx: the call
+ret: exit.OK, or the failure: a user one for a project, manifest or output path error, an
+     internal one for an allocator, session or registry failure, an environment one for a write
 

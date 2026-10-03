@@ -59,6 +59,15 @@ pub fun is_hosted(id: u32) bool;
 
 whether the os can be a build host; false for an unknown id
 
+## fun system_library
+
+```mach
+pub fun system_library(id: u32) str;
+```
+
+the system library a hosted program of the os links for the runtime it calls; empty when it
+needs none or the id is unknown
+
 ## fun count
 
 ```mach
