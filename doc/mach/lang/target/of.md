@@ -1424,12 +1424,6 @@ pub rec OfRegistry;
 pub fun registry_init_with_allocator(alloc: *A.Allocator) OfRegistry;
 ```
 
-## fun registry_init
-
-```mach
-pub fun registry_init() OfRegistry;
-```
-
 ## fun registry_dnit
 
 ```mach
@@ -1535,12 +1529,6 @@ pub rec DebugRegistry;
 
 ```mach
 pub fun debug_registry_init_with_allocator(alloc: *A.Allocator) DebugRegistry;
-```
-
-## fun debug_registry_init
-
-```mach
-pub fun debug_registry_init() DebugRegistry;
 ```
 
 ## fun debug_registry_dnit

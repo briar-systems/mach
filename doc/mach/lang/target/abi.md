@@ -417,12 +417,6 @@ pub fun variadic_float_in_fp_bank(m: *VaModel, width: u64) bool;
 pub fun registry_init_with_allocator(alloc: *A.Allocator) AbiRegistry;
 ```
 
-## fun registry_init
-
-```mach
-pub fun registry_init() AbiRegistry;
-```
-
 ## fun registry_dnit
 
 ```mach

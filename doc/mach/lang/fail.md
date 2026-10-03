@@ -393,6 +393,51 @@ pub fun toml_text(e: toml.TomlError) str;
 pub fun env_text(e: env.EnvError) str;
 ```
 
+## fun formatted
+
+```mach
+pub fun formatted(a: *A.Allocator, fmt: str, va: ...) Fail;
+```
+
+an internal failure whose text is `fmt` formatted with `va` into `a`, which
+owns the text; a refusal to format is the failure instead
+
+## fun text_retain
+
+```mach
+pub fun text_retain(itn: *intern.Interner, text: str) res[str, Fail];
+```
+
+the interner's copy of a borrowed `text`, which outlives the storage `text`
+came from
+
+## fun text_intern
+
+```mach
+pub fun text_intern(itn: *intern.Interner, a: *A.Allocator, text: str) res[str, Fail];
+```
+
+`text`, owned by `a`, moved into the interner: the interned copy outlives
+`a`'s storage, and `text` is released either way
+
+## fun format_intern
+
+```mach
+pub fun format_intern(itn: *intern.Interner, a: *A.Allocator, fmt: str, va: ...) res[str, Fail];
+```
+
+`fmt` formatted with `va` through `a` as scratch and interned, so the text
+outlives `a`'s storage
+
+## fun format_intern_or
+
+```mach
+pub fun format_intern_or(itn: *intern.Interner, a: *A.Allocator, fallback: str, fmt: str, va: ...) str;
+```
+
+the interned text of `format_intern`, or the static `fallback` when it
+cannot be made
+
 ## fun refused
 
 ```mach

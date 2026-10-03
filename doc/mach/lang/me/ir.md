@@ -370,7 +370,7 @@ pub rec ModuleHome;
 ## fun home_init
 
 ```mach
-pub fun home_init(h: *ModuleHome) err[fail.Fail];
+pub fun home_init(h: *ModuleHome, backing: *A.Allocator) err[fail.Fail];
 ```
 
 ## fun home_dnit

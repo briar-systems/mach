@@ -64,13 +64,13 @@ fwd target_registry.TargetRegistry
 
 forwards [`mach.lang.target.registry.TargetRegistry`](target/registry.md#rec-targetregistry)
 
-## fwd target_registry.registry_init
+## fwd target_registry.registry_init_with_allocator
 
 ```mach
-fwd target_registry.registry_init
+fwd target_registry.registry_init_with_allocator
 ```
 
-forwards [`mach.lang.target.registry.registry_init`](target/registry.md#fun-registry_init)
+forwards [`mach.lang.target.registry.registry_init_with_allocator`](target/registry.md#fun-registry_init_with_allocator)
 
 ## fwd target_registry.registry_new
 
@@ -147,7 +147,7 @@ pub fun with_of(req: *TargetRequest, of_name: str);
 ## fun with_env
 
 ```mach
-pub fun with_env(req: *TargetRequest, env_name: str, label: str);
+pub fun with_env(req: *TargetRequest, env_name: str, origin: str);
 ```
 
 ## fun with_image

@@ -44,3 +44,12 @@ pub fun u64_to_dec(n: u64, dst: *u8) usize;
 
 writes n in decimal at dst, which holds at least 20 bytes, and returns the length
 
+## fun frame_align_up
+
+```mach
+pub fun frame_align_up(n: u32, align: u32) u32;
+```
+
+a frame extent rounded up to `align`, a power of two or 0 for none; a frame
+is bounded far below 4 GiB, so a round-up past it is a compiler defect
+
