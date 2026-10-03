@@ -21,7 +21,7 @@ pub fun free_dynstate(alloc: *A.Allocator, dyn: *DynState);
 ## fun reserve_call_stubs
 
 ```mach
-pub fun reserve_call_stubs(s: *session.Session, tgt: *lang_target.Target, dyn: *DynState,
+pub fun reserve_call_stubs(s: *session.Session, tgt: *lang_target.Binding, dyn: *DynState,
 merged: *MergedSection, groups: *SectionGroups) err[fail.Fail];
 ```
 
@@ -39,7 +39,7 @@ pub fun place_call_stubs(dyn: *DynState, merged: *MergedSection);
 ## fun reserve_import_got
 
 ```mach
-pub fun reserve_import_got(s: *session.Session, tgt: *lang_target.Target, dyn: *DynState,
+pub fun reserve_import_got(s: *session.Session, tgt: *lang_target.Binding, dyn: *DynState,
 merged: *MergedSection, groups: *SectionGroups) err[fail.Fail];
 ```
 
@@ -59,7 +59,7 @@ pub fun place_import_got(dyn: *DynState, merged: *MergedSection);
 ## fun build_dynamic_info
 
 ```mach
-pub fun build_dynamic_info(s: *session.Session, tgt: *lang_target.Target, dyn: *DynState,
+pub fun build_dynamic_info(s: *session.Session, tgt: *lang_target.Binding, dyn: *DynState,
 modules: *target_of.ObjectImage, module_count: u32,
 sym_locs: *map.Map[intern.StrId, SymbolLoc],
 dynlibs: *target_of.DynLib, dynlib_count: u32,
@@ -104,7 +104,7 @@ name: intern.StrId) res[ImportName, fail.Fail];
 ```mach
 pub fun synthesize_local_imports(s: *session.Session, prefix: str,
 modules: *target_of.ObjectImage, module_count: u32,
-mode: LinkMode, sec_base: *u32, atoms: *AtomPlan,
+mode: catalog_artifact.Kind, sec_base: *u32, atoms: *AtomPlan,
 out: *target_of.ObjectImage) res[bool, fail.Fail];
 ```
 
@@ -146,13 +146,13 @@ seg_offset: u32, target: u64) err[fail.Fail];
 ## fun target_requires_pie
 
 ```mach
-pub fun target_requires_pie(tgt: *lang_target.Target) bool;
+pub fun target_requires_pie(tgt: *lang_target.Binding) bool;
 ```
 
 ## fun loader_check
 
 ```mach
-pub fun loader_check(s: *session.Session, tgt: *lang_target.Target, mode: LinkMode,
+pub fun loader_check(s: *session.Session, tgt: *lang_target.Binding, mode: catalog_artifact.Kind,
 pie: bool, dynamic: bool) err[fail.Fail];
 ```
 

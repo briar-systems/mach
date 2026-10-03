@@ -23,9 +23,8 @@ banners and the `profile <name>:` headers.
 
 The build's readout goes to stderr: banners, phase rows, items, `built` lines,
 diagnostics, failures and the tally. A test run goes to stdout: the roll-ups or
-per-test lines and the closing summary. `--diagnostics=json` turns stderr into
-records, and `mach test --format json` turns stdout into the test runner's
-events. The two are independent.
+per-test lines and the closing summary. `--diagnostics json` turns stderr into
+records, a test run's among them, and leaves stdout as it is.
 
 ## The build readout
 
@@ -46,9 +45,11 @@ built out/app  48 modules  1 MiB  in 358ms
 `(N target-gated, not carried forward)` when it dropped modules gated to
 another target. Under `-vv` each module or file prints as an indented line
 under the phase that processed it, in the order they finish, and the row names
-the slowest of them.
+the slowest of them. A unit whose project or dependencies declare build steps
+opens with a `steps` row, and under `-vv` each step that ran prints by name;
+a step its stamp shows is current is counted but prints no line.
 
-Under `--diagnostics=json` every one of these lines is a record, written when
+Under `--diagnostics json` every one of these lines is a record, written when
 the line would be: a `phase` record for a row, a `phase_item` record for an
 item, a `phase` record named `other` without a count, and each `built` line as
 a member of the closing `summary` record. Every unit opens with a `unit` record
@@ -90,10 +91,9 @@ failures:
 13 passed, 1 failed, 14 total  (61ms)
 ```
 
-Under `--format json` each test is a `test` event on stdout as it finishes,
-between a `run_start` and a closing `summary`, as [test.md](test.md#json-output)
-describes. Under `--diagnostics=json` each finished test is also a `test` record
-on stderr.
+Under `--diagnostics json` each test is also a `test` record on stderr as it
+finishes, between a `run_start` and a `run_end` record, as
+[diagnostics-json.md](diagnostics-json.md#test-records) describes.
 
 ## See also
 

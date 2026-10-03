@@ -12,8 +12,8 @@ import is attributed the way a plain `objc_msgSend` call is
 ## fun synthesize_objc_stubs
 
 ```mach
-pub fun synthesize_objc_stubs(s: *session.Session, tgt: *lang_target.Target,
-modules: *target_of.ObjectImage, module_count: u32, mode: LinkMode,
+pub fun synthesize_objc_stubs(s: *session.Session, tgt: *lang_target.Binding,
+modules: *target_of.ObjectImage, module_count: u32, mode: catalog_artifact.Kind,
 out: *target_of.ObjectImage) res[bool, fail.Fail];
 ```
 

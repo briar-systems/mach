@@ -490,7 +490,7 @@ the source text `a` was parsed from
 ## fun decl_target_op
 
 ```mach
-pub fun decl_target_op(s: *session.Session, mid: session.ModuleId, a: *ast.Ast, src: str, d: *ast_decl.Decl, defs: *isa.TargetDefs, out_op: *u32) u32;
+pub fun decl_target_op(itn: *intern.Interner, c: *comptime.ComptimeCtx, a: *ast.Ast, src: str, d: *ast_decl.Decl, defs: *target_definition.Table, out_op: *u32) u32;
 ```
 
 ## fun emit_dbg_birth

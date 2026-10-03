@@ -11,7 +11,7 @@ pub rec Debug;
 ## fun init
 
 ```mach
-pub fun init(req: *debug_input.ModuleDebug, b: *isa_spirv.Builder, alloc: *A.Allocator,
+pub fun init(req: *mir_debug.ModuleDebug, b: *isa_spirv.Builder, alloc: *A.Allocator,
 interner: *intern.Interner, srcmap: *lang_source.SourceMap) Debug;
 ```
 

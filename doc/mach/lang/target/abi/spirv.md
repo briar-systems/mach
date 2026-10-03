@@ -1,8 +1,8 @@
 # mach.lang.target.abi.spirv
 
-## fun register
+## val VTABLE
 
 ```mach
-pub fun register(reg: *abi.AbiRegistry) err[fail.Fail];
+pub val VTABLE: abi.AbiVTable = abi.AbiVTable;
 ```
 

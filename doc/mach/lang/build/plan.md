@@ -98,7 +98,7 @@ export_links: the dependency closure's exported link requirements for this
 configured: `configure` ran, so `dep_steps` and `export_links` are effective
 requires: the declaring manifest's artifacts this cell requires, by name
 owner: "" for a cell of the root manifest, or the id of the dependency
-              whose default library artifacts require the cell
+              whose export library requires the cell
 owner_chain: the dependency chain that reaches `owner`, "" for the root
 label: the unit's artifact as requirements name it: `<artifact>` for the
               root, `<owner>.<artifact>` for a dependency
@@ -182,7 +182,7 @@ ret: ok; the configuration failure of the first cell that has one
 pub fun plan_dependency_requirements(s: *session.Session, m: *manifest.Manifest, bp: *BuildPlan) err[fail.Fail];
 ```
 
-add the cells a dependency's default library artifacts require to a plan made
+add the cells a dependency's export library requires to a plan made
 from the root manifest. the root's closure is located exactly as a build
 locates it; every cell compiled against a closure that holds a dependency
 waits on that dependency's requirement cells, which are planned before it with
@@ -222,13 +222,13 @@ prior: *BuildUnit) res[BuildUnit, fail.Fail];
 ## fun finished_modules
 
 ```mach
-pub fun finished_modules(tgt: *lang_target.Target) bool;
+pub fun finished_modules(tgt: *lang_target.Binding) bool;
 ```
 
 ## fun resolve_requirement
 
 ```mach
-pub fun resolve_requirement(a: *A.Allocator, itn: *intern.Interner, tgt: *lang_target.Target,
+pub fun resolve_requirement(a: *A.Allocator, itn: *intern.Interner, tgt: *lang_target.Binding,
 dirs: *Vector[str], root: str,
 req: *manifest.LinkRequirement) res[LinkInput, fail.Fail];
 ```

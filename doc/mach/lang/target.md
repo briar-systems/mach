@@ -1,36 +1,28 @@
 # mach.lang.target
 
-## fwd isa.ENDIAN_LITTLE
+## fwd target_model.ENDIAN_LITTLE
 
 ```mach
-fwd isa.ENDIAN_LITTLE
+fwd target_model.ENDIAN_LITTLE
 ```
 
-forwards [`mach.lang.target.isa.ENDIAN_LITTLE`](target/isa.md#val-endian_little)
+forwards [`mach.lang.target.model.ENDIAN_LITTLE`](target/model.md#val-endian_little)
 
-## fwd isa.ENDIAN_BIG
+## fwd target_model.ENDIAN_BIG
 
 ```mach
-fwd isa.ENDIAN_BIG
+fwd target_model.ENDIAN_BIG
 ```
 
-forwards [`mach.lang.target.isa.ENDIAN_BIG`](target/isa.md#val-endian_big)
+forwards [`mach.lang.target.model.ENDIAN_BIG`](target/model.md#val-endian_big)
 
-## fwd resolved.Target
+## fwd binding.Binding
 
 ```mach
-fwd resolved.Target
+fwd binding.Binding
 ```
 
-forwards [`mach.lang.target.resolved.Target`](target/resolved.md#rec-target)
-
-## fwd resolved.live
-
-```mach
-fwd resolved.live
-```
-
-forwards [`mach.lang.target.resolved.live`](target/resolved.md#fun-live)
+forwards [`mach.lang.target.binding.Binding`](target/binding.md#rec-binding)
 
 ## fwd resolved.ct_mul_admitted
 
@@ -72,22 +64,6 @@ fwd target_registry.registry_init_with_allocator
 
 forwards [`mach.lang.target.registry.registry_init_with_allocator`](target/registry.md#fun-registry_init_with_allocator)
 
-## fwd target_registry.registry_new
-
-```mach
-fwd target_registry.registry_new
-```
-
-forwards [`mach.lang.target.registry.registry_new`](target/registry.md#fun-registry_new)
-
-## fwd target_registry.registry_dnit
-
-```mach
-fwd target_registry.registry_dnit
-```
-
-forwards [`mach.lang.target.registry.registry_dnit`](target/registry.md#fun-registry_dnit)
-
 ## fwd target_registry.registry_published
 
 ```mach
@@ -117,8 +93,15 @@ pub fun host_abi_id() u32;
 ## fun register_all
 
 ```mach
-pub fun register_all(reg: *TargetRegistry, debug_provider: DebugDescriptorProvider) err[fail.Fail];
+pub fun register_all(reg: *TargetRegistry, debug: *target_of.DebugVTable) err[fail.Fail];
 ```
+
+fill an empty registry with the catalog and publish it; a published registry
+is left as it is. a registry refused part way holds nothing that needs
+undoing, and is dropped
+
+reg: the registry
+debug: the dwarf debug model, which the backend declares
 
 ## rec TargetRequest
 
@@ -159,25 +142,25 @@ pub fun with_image(req: *TargetRequest, base: u64, stack_reserve: u64, stack_com
 ## fun select_of
 
 ```mach
-pub fun select_of(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: str, of_name: str) res[resolved.Target, fail.Fail];
+pub fun select_of(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: str, of_name: str) res[binding.Binding, fail.Fail];
 ```
 
 ## fun resolve
 
 ```mach
-pub fun resolve(reg: *TargetRegistry, req: *TargetRequest) res[resolved.Target, fail.Fail];
+pub fun resolve(reg: *TargetRegistry, req: *TargetRequest) res[binding.Binding, fail.Fail];
 ```
 
 ## fun fingerprint
 
 ```mach
-pub fun fingerprint(t: *resolved.Target, s: *wire.Sink);
+pub fun fingerprint(t: *binding.Binding, s: *wire.Sink);
 ```
 
 ## fun registered_selection
 
 ```mach
-pub fun registered_selection(arch_vt: *isa.IsaVTable, model: *isa.MachineModel) isa.IsaVTable;
+pub fun registered_selection(arch_vt: *isa.IsaVTable, model: *target_model.Machine) isa.IsaVTable;
 ```
 
 the instruction set a [target.*] table selects by naming a registered isa: a
@@ -199,7 +182,7 @@ an abi passes in
 ## fun selection_spelling
 
 ```mach
-pub fun selection_spelling(isa_vt: *isa.IsaVTable, model: *isa.MachineModel, buf: *u8, cap: usize) str;
+pub fun selection_spelling(isa_vt: *isa.IsaVTable, model: *target_model.Machine, buf: *u8, cap: usize) str;
 ```
 
 the canonical selection string for an instruction set and the model selected
@@ -220,13 +203,13 @@ registered names, the object format left to the os default
 ## fun select
 
 ```mach
-pub fun select(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: str) res[resolved.Target, fail.Fail];
+pub fun select(reg: *TargetRegistry, isa_name: str, os_name: str, abi_name: str) res[binding.Binding, fail.Fail];
 ```
 
 ## fun artifact_naming
 
 ```mach
-pub fun artifact_naming(tgt: *resolved.Target, kind: target_of.ArtifactOutputKind) res[target_of.ArtifactName, fail.Fail];
+pub fun artifact_naming(tgt: *binding.Binding, kind: catalog_artifact.Kind) res[target_of.ArtifactName, fail.Fail];
 ```
 
 ## val TUPLE_OK

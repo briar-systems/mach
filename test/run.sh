@@ -337,21 +337,21 @@ manifest() {
         a=$(art "$c")
         if [ "$shape" = hosted ]; then
             echo "[artifact.$a]"; echo 'kind = "bin"'; echo "entry = \"entry/$a.mach\""
-            echo "out = \"bin/$a\""
+            echo "out = \"{project.out}/bin/$a\""
             echo "targets = [$(printf '%s\n' "$targets_all" | awk '$7 == "hosted" { printf "%s\"%s\"", (n++ ? ", " : ""), $1 }')]"
             echo 'link = []'; echo 'need = []'; echo
         else
             # one artifact per kind, built for every direct target of that kind
             for kind in $(printf '%s\n' "$targets_all" | awk '$7 == "direct" && !s[$6]++ { print $6 }'); do
                 echo "[artifact.${a}_$kind]"; echo "kind = \"$kind\""; echo "entry = \"cases/$c.mach\""
-                if [ "$kind" = static ]; then echo "out = \"lib/$a.a\""; else echo "out = \"bin/$a\""; fi
+                if [ "$kind" = static ]; then echo "out = \"{project.out}/lib/$a.a\""; else echo "out = \"{project.out}/bin/$a\""; fi
                 echo "targets = [$(printf '%s\n' "$targets_all" | awk -v k="$kind" '$7 == "direct" && $6 == k { printf "%s\"%s\"", (n++ ? ", " : ""), $1 }')]"
                 echo 'link = []'; echo 'need = []'; echo
             done
             printf '%s\n' "$targets_all" | while read -r name isa os abi of kind entry q env ext; do
                 [ -n "$name" ] && [ "$entry" = direct ] && [ "$q" != - ] || continue
                 echo "[artifact.${a}_run_$name]"; echo 'kind = "bin"'; echo "entry = \"run/$name/$a.mach\""
-                echo "out = \"run/$a\""
+                echo "out = \"{project.out}/run/$a\""
                 echo "targets = [\"$name\"]"; echo 'link = []'; echo 'need = []'; echo
             done
         fi
@@ -733,10 +733,11 @@ link_cell() {
             elif [ "$case_run" = exec ] && [ "$case_goal" = test ]; then
                 # the dispatcher runs one test per invocation, `<exe> <index>`; the
                 # observable is every collected test's stdout in collection order
-                if ! (cd "$dir" && $buildcc test . --target "$build_target" --profile "$profile" $case_build_flags --list --format json) >"$tmp/list.json" 2>"$tmp/err.txt"; then
+                if ! (cd "$dir" && $buildcc test . --target "$build_target" --profile "$profile" $case_build_flags --list) >"$tmp/list.txt" 2>"$tmp/err.txt"; then
                     fail "$label test --list: $(first_error "$tmp/err.txt")"; rm -rf "$tmp"; return
                 fi
-                n=$(grep -c '"event":"case"' "$tmp/list.json")
+                # one line per collected test, its qualified name and its object
+                n=$(grep -c '#' "$tmp/list.txt")
                 [ "$n" -gt 0 ] || { fail "$label collected no tests"; rm -rf "$tmp"; return; }
                 : >"$tmp/out.txt"; i=0
                 while [ "$i" -lt "$n" ]; do
@@ -875,7 +876,7 @@ float_reassoc = false
 [artifact.inc]
 kind = "static"
 entry = "main.mach"
-out = "lib/inc"
+out = "{project.out}/lib/inc"
 targets = ["*"]
 link = []
 need = []
@@ -1034,8 +1035,8 @@ doc_cell() {
     if [ "$annot" = error ] && [ -z "$expect" ]; then
         echo "FAIL $label an error block names the diagnostic it expects: \`\`\`mach error <text>" >"$b/result"; return
     fi
-    kind=static; art_out=lib/block.a
-    if grep -rqF '#[symbol("main")]' "$b/src"; then kind=bin; art_out=bin/block; fi
+    kind=static; art_out={project.out}/lib/block.a
+    if grep -rqF '#[symbol("main")]' "$b/src"; then kind=bin; art_out={project.out}/bin/block; fi
     mkdir -p "$b/dep/std"
     cp -R "$docs_std/src" "$b/dep/std/src"
     cp "$docs_std/mach.toml" "$b/dep/std/"

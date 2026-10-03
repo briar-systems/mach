@@ -11,23 +11,27 @@ use std.types.size.usize;
 use A: std.allocator;
 
 use mach.lang.intern;
+use mach.lang.me.analysis;
 use mach.lang.me.analysis.loops;
 use me_ir: mach.lang.me.ir;
 use mach.lang.me.ir.body;
 use mach.lang.me.ir.builder;
+use mach.lang.me.ir.cfg;
 use mach.lang.me.ir.equal;
 use ir_id:          mach.lang.me.ir.id;
 use ir_instruction: mach.lang.me.ir.instruction;
 use mach.lang.me.ir.mutate;
-use mach.lang.me.ir.refs;
 use ir_type: mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.me.pass;
 use mach.lang.me.scratch;
 use me_testing:  mach.lang.me.testing;
 use lang_source: mach.lang.source;
+#[testing]
 use lang_target: mach.lang.target;
 use mach.lang.target.extension;
+use mach.lang.target.resolved;
+#[testing]
 use target_testing: mach.lang.target.testing;
 
 val INLINE_INSTR_THRESHOLD: u32 = body.SMALL_INSTRUCTIONS;
@@ -136,26 +140,27 @@ fun build_inline_facts(m: *me_ir.Module, scratch: *A.Allocator) res[InlineFacts,
 
 # the x86_64 linux target the tests inline against, selected from `reg`
 #[testing]
-fun t_target(reg: *lang_target.TargetRegistry) res[lang_target.Target, fail.Fail] {
-    val registered: err[fail.Fail] = lang_target.register_all(reg, target_testing.debug_descriptor);
-    if (sel registered.err) { ret res[lang_target.Target, fail.Fail].err{registered.err}; }
-    ret lang_target.select(reg, "x86_64", "linux", "sysv64");
+fun t_target(reg: *lang_target.TargetRegistry) res[resolved.Target, fail.Fail] {
+    val registered: err[fail.Fail] = lang_target.register_all(reg, ?target_testing.DEBUG);
+    if (sel registered.err) { ret res[resolved.Target, fail.Fail].err{registered.err}; }
+    val selected: res[lang_target.Binding, fail.Fail] = lang_target.select(reg, "x86_64", "linux", "sysv64");
+    if (sel selected.err) { ret res[resolved.Target, fail.Fail].err{selected.err}; }
+    ret res[resolved.Target, fail.Fail].ok{selected.ok.target};
 }
 
 # a run over a module against the tests' target; the pipeline runs `run_in` over one
 #[testing]
 fun run(m: *me_ir.Module) res[bool, fail.Fail] {
-    var reg: lang_target.TargetRegistry = lang_target.registry_init();
-    fin { lang_target.registry_dnit(?reg); }
-    val selected: res[lang_target.Target, fail.Fail] = t_target(?reg);
+    var reg:      lang_target.TargetRegistry      = lang_target.registry_init();
+    val selected: res[resolved.Target, fail.Fail] = t_target(?reg);
     if (sel selected.err) { ret res[bool, fail.Fail].err{selected.err}; }
-    var tgt: lang_target.Target = selected.ok;
+    var tgt: resolved.Target = selected.ok;
     ret run_on(m, ?tgt);
 }
 
 # a run against `tgt` that owns its workspace
 #[testing]
-pub fun run_on(m: *me_ir.Module, tgt: *lang_target.Target) res[bool, fail.Fail] {
+pub fun run_on(m: *me_ir.Module, tgt: *resolved.Target) res[bool, fail.Fail] {
     var workspace:   scratch.Workspace;
     val initialized: err[fail.Fail] = scratch.init(?workspace, m.backing);
     if (sel initialized.err) { ret res[bool, fail.Fail].err{initialized.err}; }
@@ -165,12 +170,13 @@ pub fun run_on(m: *me_ir.Module, tgt: *lang_target.Target) res[bool, fail.Fail] 
 
 rec InlineWork {
     module:    *me_ir.Module;
-    target:    *lang_target.Target;
+    target:    *resolved.Target;
     available: *body.Available;
+    analyses:  *analysis.Cache;
 }
 
 # the pass the pipeline schedules
-pub val PASS: pass.Pass = pass.Pass{run: run_in, applies: nil};
+pub val PASS: pass.Pass = pass.Pass{run: run_in, applies: nil, preserves: analysis.NONE};
 
 # the bodies `ctx.available` offers are attached to the module for the run
 pub fun run_in(ctx: *pass.Context) res[bool, fail.Fail] {
@@ -184,9 +190,9 @@ pub fun run_in(ctx: *pass.Context) res[bool, fail.Fail] {
 # counts, the per-call remap tables and the peel frontier) is scratch for the
 # whole module; the clone itself, its metadata and the peel snapshot are the
 # module's
-fun run_with(m: *me_ir.Module, tgt: *lang_target.Target, available: *body.Available, workspace: *scratch.Workspace) res[bool, fail.Fail] {
+fun run_with(m: *me_ir.Module, tgt: *resolved.Target, available: *body.Available, workspace: *scratch.Workspace) res[bool, fail.Fail] {
     if (m.function_len == 0) { ret res[bool, fail.Fail].ok{false}; }
-    var work: InlineWork = InlineWork{module: m, target: tgt, available: available};
+    var work: InlineWork = InlineWork{module: m, target: tgt, available: available, analyses: ?workspace.analyses};
     ret scratch.run[InlineWork, bool](workspace, m.alloc, ?work, inline_module);
 }
 
@@ -267,7 +273,9 @@ fun inline_module(work: *InlineWork, scratch_alloc: *A.Allocator) res[bool, fail
     A.deallocate[u32](scratch_alloc, counts, m.function_len::usize);
     A.deallocate[bool](scratch_alloc, recursive, m.function_len::usize);
 
-    val peeled_r: res[bool, fail.Fail] = peel_all(m, scratch_alloc);
+    # peeling asks about bodies the inlining above may have changed
+    if (any_inlined) { analysis.keep(work.analyses, analysis.NONE); }
+    val peeled_r: res[bool, fail.Fail] = peel_all(m, work.analyses, scratch_alloc);
     if (sel peeled_r.err) { ret peeled_r; }
     ret res[bool, fail.Fail].ok{any_inlined || peeled_r.ok};
 }
@@ -652,7 +660,7 @@ fun harvest_self_calls(cx: *InlineCtx, self_ix: u32, out: *u32, cap: u32, count:
     }
 }
 
-fun peel_all(m: *me_ir.Module, scratch_alloc: *A.Allocator) res[bool, fail.Fail] {
+fun peel_all(m: *me_ir.Module, analyses: *analysis.Cache, scratch_alloc: *A.Allocator) res[bool, fail.Fail] {
     var changed: bool = false;
     var f_ix:    u32  = 0;
     for (f_ix < m.function_len) {
@@ -660,7 +668,7 @@ fun peel_all(m: *me_ir.Module, scratch_alloc: *A.Allocator) res[bool, fail.Fail]
         if ((fn.flags & me_ir.FN_FLAG_EXTERN) == 0 && peel_eligible(fn, f_ix)) {
             # a body with a loop, such as the one tail recursion became, is
             # not peeled: each level would copy the loop
-            val looped: res[bool, fail.Fail] = has_loop(m, fn, scratch_alloc);
+            val looped: res[bool, fail.Fail] = has_loop(analyses, m, fn);
             if (sel looped.err) { ret looped; }
             if (looped.ok) {
                 f_ix = f_ix + 1;
@@ -671,19 +679,17 @@ fun peel_all(m: *me_ir.Module, scratch_alloc: *A.Allocator) res[bool, fail.Fail]
             val peeled_r:  res[bool, fail.Fail] = peel_function(m, scratch_alloc, f_ix, fn, ?budget, ?exhausted);
             if (sel peeled_r.err) { ret peeled_r; }
             if (peeled_r.ok)      { changed = true; }
+            analysis.del(analyses, m, fn);
         }
         f_ix = f_ix + 1;
     }
     ret res[bool, fail.Fail].ok{changed};
 }
 
-fun has_loop(m: *me_ir.Module, fn: *me_ir.Function, scratch_alloc: *A.Allocator) res[bool, fail.Fail] {
-    val ra: res[loops.LoopAnalysis, fail.Fail] = loops.analyze(fn, ?m.types, scratch_alloc);
+fun has_loop(analyses: *analysis.Cache, m: *me_ir.Module, fn: *me_ir.Function) res[bool, fail.Fail] {
+    val ra: res[*loops.LoopAnalysis, fail.Fail] = analysis.loops_of(analyses, m, fn);
     if (sel ra.err) { ret res[bool, fail.Fail].err{ra.err}; }
-    var la:  loops.LoopAnalysis = ra.ok;
-    val any: bool               = la.loop_len > 0;
-    loops.dnit(?la);
-    ret res[bool, fail.Fail].ok{any};
+    ret res[bool, fail.Fail].ok{ra.ok.loop_len > 0};
 }
 
 fun peel_eligible(fn: *me_ir.Function, f_ix: u32) bool {
@@ -1013,80 +1019,33 @@ fun clone_instructions(cx: *InlineCtx) err[fail.Fail] {
     ret err[fail.Fail].ok{};
 }
 
-fun populate_blocks(cx: *InlineCtx) err[fail.Fail] {
-    val m:      *me_ir.Module   = cx.m;
-    val callee: *me_ir.Function = cx.callee;
-    var i:      u32             = 0;
-    for (i < callee.block_count) {
-        val src:    *me_ir.Block  = ?callee.blocks[i];
-        val dst_id: ir_id.BlockId = cx.block_map[i]::ir_id.BlockId;
-        val dst:    *me_ir.Block  = ?cx.caller.blocks[dst_id::u32];
+# the clone map of the callee into the caller
+fun clone_map(cx: *InlineCtx) cfg.CloneMap {
+    ret cfg.CloneMap{block_map: cx.block_map, n_blocks: cx.callee.block_count, instr_map: cx.instr_map, n_instrs: cx.callee.instr_len};
+}
 
-        var ii: u32 = 0;
-        for (ii < src.phi_count) {
-            val new_iid: ir_id.InstructionId = cx.instr_map[src.phis[ii]::u32]::ir_id.InstructionId;
-            val res_phi: err[fail.Fail]      = me_ir.block_append_phi(m, dst, new_iid);
-            if (sel res_phi.err) { ret res_phi; }
-            ii = ii + 1;
-        }
-        ii = 0;
-        for (ii < src.instr_count) {
-            val new_iid:   ir_id.InstructionId = cx.instr_map[src.instructions[ii]::u32]::ir_id.InstructionId;
-            val res_instr: err[fail.Fail]      = me_ir.block_append_instr(m, dst, new_iid);
-            if (sel res_instr.err) { ret res_instr; }
-            ii = ii + 1;
-        }
-        if (!ir_id.instruction_is_nil(src.terminator)) {
-            val new_term: ir_id.InstructionId = cx.instr_map[src.terminator::u32]::ir_id.InstructionId;
-            dst.terminator = new_term;
-        }
+fun populate_blocks(cx: *InlineCtx) err[fail.Fail] {
+    var map: cfg.CloneMap = clone_map(cx);
+    var i:   u32          = 0;
+    for (i < cx.callee.block_count) {
+        val listed: err[fail.Fail] = cfg.clones_list(cx.m, cx.callee, cx.caller, ?map, ir_id.block(i));
+        if (sel listed.err) { ret listed; }
         i = i + 1;
     }
     ret err[fail.Fail].ok{};
 }
 
-fun remap_clone_operands(cx: *InlineCtx) {
-    val callee: *me_ir.Function = cx.callee;
-    var i:      u32             = 0;
-    for (i < callee.instr_len) {
-        val clone_id:  ir_id.InstructionId              = cx.instr_map[i]::ir_id.InstructionId;
-        val opt_clone: opt[*ir_instruction.Instruction] = me_ir.instruction_get(cx.caller, clone_id);
-        if (sel opt_clone.none) {
-            i = i + 1;
-            cnt;
-        }
-        val clone: *ir_instruction.Instruction = opt_clone.some;
-        var ii:    u32                         = 0;
-        for (ii < clone.operand_count) {
-            if (operand_is_block(clone.kind, ii)) {
-                val callee_bid: u32 = clone.operands[ii].data.int_lit::u32;
-                if (callee_bid < callee.block_count) {
-                    clone.operands[ii].data.int_lit = cx.block_map[callee_bid]::u64;
-                }
-            }
-            or {
-                val op: value.Value = clone.operands[ii];
-                if (op.kind == value.VAL_PARAM) {
-                    val param_ix: u32 = op.data.param_ix;
-                    if (param_ix < cx.arg_count) {
-                        clone.operands[ii] = mutate.substitute_for_use(cx.args[param_ix], op);
-                    }
-                }
-                or (op.kind == value.VAL_INSTR) {
-                    val callee_iid: u32 = op.data.instr::u32;
-                    if (callee_iid < callee.instr_len) {
-                        clone.operands[ii].data.instr = cx.instr_map[callee_iid]::ir_id.InstructionId;
-                    }
-                }
-            }
-            ii = ii + 1;
-        }
-        i = i + 1;
+# a parameter of the callee read in its body is the call's argument
+fun argument_for(cx: *InlineCtx, op: value.Value) value.Value {
+    if (op.kind == value.VAL_PARAM && op.data.param_ix < cx.arg_count) {
+        ret mutate.substitute_for_use(cx.args[op.data.param_ix], op);
     }
+    ret op;
 }
 
-fun operand_is_block(k: ir_instruction.InstrKind, o: u32) bool {
-    ret refs.operand_is_block(k, o);
+fun remap_clone_operands(cx: *InlineCtx) {
+    var map: cfg.CloneMap = clone_map(cx);
+    cfg.clones_remap[InlineCtx](cx.caller, ?map, cx, argument_for);
 }
 
 fun split_call_block(cx: *InlineCtx, call_bi: u32, call_ii: u32) err[fail.Fail] {
@@ -1162,27 +1121,14 @@ fun privatize_borrowed_args(cx: *InlineCtx, call_id: ir_id.InstructionId) err[fa
 fun add_priv_instr(cx: *InlineCtx, kind: ir_instruction.InstrKind, ty: ir_type.IrTypeId, a: value.Value, b: value.Value,
     count: u32, aux: ir_type.IrTypeId, secret: bool, loc: lang_source.Location) res[ir_id.InstructionId, fail.Fail] {
     if (cx.priv_len >= cx.priv_cap) { ret res[ir_id.InstructionId, fail.Fail].err{fail.message("inline: private argument copies exceed their reservation")}; }
-    val m:       *me_ir.Module              = cx.m;
-    val res_ops: res[*value.Value, A.Error] = A.allocate[value.Value](m.alloc, count::usize);
-    if (sel res_ops.err) { ret res[ir_id.InstructionId, fail.Fail].err{fail.refused(res_ops.err)}; }
-    val ops: *value.Value = res_ops.ok;
+    var ops: [2]value.Value;
     ops[0] = a;
-    if (count > 1) { ops[1] = b; }
-    var ins: ir_instruction.Instruction;
-    ins.kind          = kind;
-    ins.ty            = ty;
-    ins.operands      = ops;
-    ins.operand_count = count;
-    ins.operand_cap   = count;
-    ins.flags         = 0;
-    ins.aux_ty        = aux;
-    ins.loc           = loc;
-    ins.secret        = secret;
-    val res_id: res[ir_id.InstructionId, fail.Fail] = me_ir.instruction_add(m, cx.caller, ins);
-    if (sel res_id.err) {
-        A.deallocate[value.Value](m.alloc, ops, count::usize);
-        ret res_id;
-    }
+    ops[1] = b;
+    var bld: builder.Builder = builder.on(cx.m, cx.caller);
+    builder.set_loc(?bld, loc);
+    builder.set_secret(?bld, secret);
+    val res_id: res[ir_id.InstructionId, fail.Fail] = builder.emit_instr(?bld, kind, ty, aux, ?ops[0], count);
+    if (sel res_id.err) { ret res_id; }
     cx.priv_ids[cx.priv_len] = res_id.ok;
     cx.priv_len              = cx.priv_len + 1;
     ret res_id;
@@ -1192,65 +1138,23 @@ fun rekey_successor_phis(caller: *me_ir.Function, cont: *me_ir.Block, old_blk: i
     var s0: ir_id.BlockId = ir_id.BLOCK_NIL;
     var s1: ir_id.BlockId = ir_id.BLOCK_NIL;
     val sn: u32           = me_ir.block_successors(caller, cont, ?s0, ?s1);
-    if (sn >= 1)                              { rekey_block_phis(caller, s0, old_blk, new_blk); }
-    if (sn >= 2 && !ir_id.block_same(s1, s0)) { rekey_block_phis(caller, s1, old_blk, new_blk); }
-}
-
-fun rekey_block_phis(caller: *me_ir.Function, bid: ir_id.BlockId, old_blk: ir_id.BlockId, new_blk: ir_id.BlockId) {
-    if (bid::u32 >= caller.block_count) { ret; }
-    val blk: *me_ir.Block = ?caller.blocks[bid::u32];
-    var i:   u32          = 0;
-    for (i < blk.phi_count) {
-        val opt_phi: opt[*ir_instruction.Instruction] = me_ir.instruction_get(caller, blk.phis[i]);
-        if (sel opt_phi.some) {
-            val phi: *ir_instruction.Instruction = opt_phi.some;
-            if (phi.kind == ir_instruction.OP_PHI) {
-                var ii: u32 = 0;
-                for (ii + 1 < phi.operand_count) {
-                    if (ir_id.block_same(me_ir.block_target(phi.operands[ii]), old_blk)) {
-                        phi.operands[ii].data.int_lit = ir_id.block_index(new_blk)::u64;
-                    }
-                    ii = ii + 2;
-                }
-            }
-        }
-        i = i + 1;
-    }
+    if (sn >= 1)                              { cfg.phi_pred_relabel(caller, s0, old_blk, new_blk); }
+    if (sn >= 2 && !ir_id.block_same(s1, s0)) { cfg.phi_pred_relabel(caller, s1, old_blk, new_blk); }
 }
 
 fun emit_br(cx: *InlineCtx, target_blk: ir_id.BlockId) res[ir_id.InstructionId, fail.Fail] {
-    val m:          *me_ir.Module               = cx.m;
-    val res_target: res[value.Value, fail.Fail] = me_ir.block_target_make(m, target_blk);
+    val res_target: res[value.Value, fail.Fail] = me_ir.block_target_make(cx.m, target_blk);
     if (sel res_target.err) {
         ret res[ir_id.InstructionId, fail.Fail].err{res_target.err};
     }
-    val res_ops: res[*value.Value, A.Error] = A.allocate[value.Value](m.alloc, 1::usize);
-    if (sel res_ops.err) {
-        ret res[ir_id.InstructionId, fail.Fail].err{fail.refused(res_ops.err)};
-    }
-    val ops: *value.Value = res_ops.ok;
-    ops[0] = res_target.ok;
-    val res_void: res[ir_type.IrTypeId, fail.Fail] = void_ty(m);
+    val res_void: res[ir_type.IrTypeId, fail.Fail] = void_ty(cx.m);
     if (sel res_void.err) {
-        A.deallocate[value.Value](m.alloc, ops, 1::usize);
         ret res[ir_id.InstructionId, fail.Fail].err{res_void.err};
     }
-    var br: ir_instruction.Instruction;
-    br.kind          = ir_instruction.OP_BR;
-    br.ty            = res_void.ok;
-    br.operands      = ops;
-    br.operand_count = 1;
-    br.operand_cap   = 1;
-    br.flags         = 0;
-    br.aux_ty        = ir_type.IRT_NIL;
-    br.loc           = lang_source.location_nil();
-    br.secret        = false;
-    val res_id: res[ir_id.InstructionId, fail.Fail] = me_ir.instruction_add(m, cx.caller, br);
-    if (sel res_id.err) {
-        A.deallocate[value.Value](m.alloc, ops, 1::usize);
-        ret res_id;
-    }
-    ret res_id;
+    var ops: [1]value.Value;
+    ops[0] = res_target.ok;
+    var bld: builder.Builder = builder.on(cx.m, cx.caller);
+    ret builder.emit_instr(?bld, ir_instruction.OP_BR, res_void.ok, ir_type.IRT_NIL, ?ops[0], 1);
 }
 
 fun finish_returns(cx: *InlineCtx, call_id: ir_id.InstructionId) err[fail.Fail] {
@@ -1266,20 +1170,12 @@ fun finish_returns(cx: *InlineCtx, call_id: ir_id.InstructionId) err[fail.Fail] 
     val value_rets: u32                 = count_value_returns(cx, returns_value);
     var phi_id:     ir_id.InstructionId = ir_id.INSTR_NIL;
     if (returns_value && value_rets >= 2) {
-        var phi: ir_instruction.Instruction;
-        phi.kind          = ir_instruction.OP_PHI;
-        phi.ty            = cx.ret_type;
-        phi.operands      = nil;
-        phi.operand_count = 0;
-        phi.flags         = 0;
-        phi.aux_ty        = ir_type.IRT_NIL;
-        phi.loc           = lang_source.location_nil();
-        phi.secret        = false;
-        val res_phi: res[ir_id.InstructionId, fail.Fail] = me_ir.instruction_add(m, caller, phi);
+        var bld:     builder.Builder             = builder.on(m, caller);
+        val res_phi: res[value.Value, fail.Fail] = builder.emit_phi(?bld, cx.ret_type);
         if (sel res_phi.err) {
             ret err[fail.Fail].err{res_phi.err};
         }
-        phi_id = res_phi.ok;
+        phi_id = res_phi.ok.data.instr;
     }
 
     var single_val:  value.Value;
@@ -3346,11 +3242,10 @@ test run_in__refusal_at_every_ordinal_leaves_the_input_or_the_callee_untouched {
     var owner: A.Allocator;
     val made:  err[A.Error] = page.make(?owner);
     if (sel made.err) { ret 1; }
-    var reg: lang_target.TargetRegistry = lang_target.registry_init();
-    fin { lang_target.registry_dnit(?reg); }
-    val selected: res[lang_target.Target, fail.Fail] = t_target(?reg);
+    var reg:      lang_target.TargetRegistry      = lang_target.registry_init();
+    val selected: res[resolved.Target, fail.Fail] = t_target(?reg);
     if (sel selected.err) { ret 3; }
-    var tgt: lang_target.Target = selected.ok;
+    var tgt: resolved.Target    = selected.ok;
     var a:   me_testing.Attempt = me_testing.Attempt{build: probe_build, transform: probe_transform,
         contract: probe_contract, target: ?tgt, control: nil, context: nil};
     var control: me_ir.Module;
@@ -3453,11 +3348,10 @@ test run_in__cross_module_body_refusal_at_every_ordinal_leaves_the_importer_or_i
     if (sel doubled.err) { ret 7; }
     val r_ret: err[fail.Fail] = builder.emit_ret(?bld, doubled.ok);
     if (sel r_ret.err) { ret 8; }
-    var reg: lang_target.TargetRegistry = lang_target.registry_init();
-    fin { lang_target.registry_dnit(?reg); }
-    val selected: res[lang_target.Target, fail.Fail] = t_target(?reg);
+    var reg:      lang_target.TargetRegistry      = lang_target.registry_init();
+    val selected: res[resolved.Target, fail.Fail] = t_target(?reg);
     if (sel selected.err) { ret 10; }
-    var tgt:   lang_target.Target = selected.ok;
+    var tgt:   resolved.Target    = selected.ok;
     var cross: CrossModule        = CrossModule{provider: ?provider};
     var a:     me_testing.Attempt = me_testing.Attempt{build: cross_build, transform: cross_transform,
         contract: cross_contract, target: ?tgt, control: nil, context: (?cross)::ptr};

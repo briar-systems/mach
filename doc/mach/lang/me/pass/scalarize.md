@@ -13,7 +13,7 @@ and from_bits is the operand lane width, which a conversion changes
 ## fun sites
 
 ```mach
-pub fun sites(m: *me_ir.Module, tgt: *lang_target.Target, out: *Vector[ScalarizeSite]) err[A.Error];
+pub fun sites(m: *me_ir.Module, tgt: *resolved.Target, out: *Vector[ScalarizeSite]) err[A.Error];
 ```
 
 every operator the target scalarizes, one site per operation, in function
@@ -22,7 +22,7 @@ and block order: the sites `simd = "require"` refuses and the default warns at
 ## fun detect_undeclared
 
 ```mach
-pub fun detect_undeclared(m: *me_ir.Module, tgt: *lang_target.Target, first: *ScalarizeSite) u32;
+pub fun detect_undeclared(m: *me_ir.Module, tgt: *resolved.Target, first: *ScalarizeSite) u32;
 ```
 
 operators whose lane shape the target's catalog names neither packed nor scalar

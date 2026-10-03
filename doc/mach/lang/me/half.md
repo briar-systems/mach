@@ -2,7 +2,7 @@
 
 scalar f16 as ordinary ir, written once and shared by every target.
 an f16 value is carried as its 16 bits in an i16. an operation the target
-declares in its half rows (isa.half_native) is its own instruction on those
+declares in its half rows (target_model.half_native) is its own instruction on those
 bits; every other one is the expansion here, which calls nothing, so no
 runtime symbol appears for a freestanding link to provide.
 
@@ -29,9 +29,9 @@ is branch-free, a select being a mask
 pub rec Half;
 ```
 
-an emitter over the caller's builder that remembers the first failure, so
-the algorithms read as their arithmetic. a value emitted after a failure is
-the nil value and is never used: the caller reads `done` before its result
+the expansion over the caller's builder in its sticky mode, so the
+algorithms read as their arithmetic: the caller reads `done` before its
+result
 
 ## fun carrier
 
@@ -45,7 +45,7 @@ a binary16, so a calling convention can place it as the float it is
 ## fun init
 
 ```mach
-pub fun init(b: *builder.Builder, tgt: *lang_target.Target) res[Half, fail.Fail];
+pub fun init(b: *builder.Builder, tgt: *resolved.Target) res[Half, fail.Fail];
 ```
 
 tgt is the target: its machine model's half rows, packed rows and NaN rule

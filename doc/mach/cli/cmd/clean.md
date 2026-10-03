@@ -1,9 +1,17 @@
 # mach.cli.cmd.clean
 
+## val COMMAND
+
+```mach
+pub val COMMAND: args.CommandSpec = args.CommandSpec;
+```
+
+`mach clean`
+
 ## fun run
 
 ```mach
-pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64;
+pub fun run(cx: *args.Call) res[i64, fail.Fail];
 ```
 
 `mach clean`: remove every output path the manifest can produce for every declared target
@@ -13,8 +21,8 @@ are collected, sorted, collapsed under their ancestors, and removed inside the p
 root; a path that escapes the root or crosses a symlink is refused. a missing path is
 not an error; "nothing to clean" prints when nothing was removed
 
-argv: the full process arguments
-inv: the parsed invocation for this command
+cx: the call
 ret: exit.OK, or the shared code of the failure: exit.USER for a manifest error or an escaping
-      target, exit.INTERNAL for an allocator failure, exit.ENVIRONMENT for a read or removal failure
+     target, exit.INTERNAL for an allocator failure, exit.ENVIRONMENT for a read or removal
+     failure; a removal that fails is reported and the rest are still attempted
 

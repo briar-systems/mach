@@ -1,0 +1,264 @@
+# the analyses a pass reads about a function, built on request and kept for
+# the passes after it. an analysis is served for the function as it stands; a
+# pass that changes a function and then asks about it again drops what it
+# changed with `del` first. every pass declares the kinds it preserves, and
+# the schedule drops the rest with `keep` after the pass runs, so the next
+# pass is served an analysis only where nothing since has made it stale
+use mach.lang.fail;
+use mach.lang.growth;
+use mach.lang.intern;
+use std.allocator.arena;
+use std.allocator.page;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use std.system.panic.panic;
+
+use A: std.allocator;
+
+use mach.lang.me.analysis.dominance;
+use mach.lang.me.analysis.loops;
+use me_ir: mach.lang.me.ir;
+use mach.lang.me.ir.builder;
+use ir_id:   mach.lang.me.ir.id;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+
+# a set of analysis kinds
+pub def KindSet: u8;
+
+pub val NONE: KindSet = 0;
+# the dominator tree, its order and its frontiers: read from the edges alone,
+# so a pass that adds, removes or redirects no edge and no block preserves it
+pub val DOMINANCE: KindSet = 1;
+# the loops over the dominator tree: read from instructions too, so only a
+# pass that changes nothing preserves it, and it never outlives its tree
+pub val LOOPS: KindSet = 2;
+pub val ALL:   KindSet = 3;
+
+# one function's analyses, nil until requested
+rec Slot {
+    dom:   *dominance.Dominance;
+    loops: *loops.LoopAnalysis;
+}
+
+# each kind lives in a region of its own, so dropping a kind releases its
+# storage at once. a dropped analysis stays readable until the next `keep`,
+# so a pass may finish reading one it asked `del` to drop
+pub rec Cache {
+    backing:    *A.Allocator;
+    slots:      *Slot;
+    slot_count: u32;
+
+    dom_region:   arena.Arena;
+    dom_alloc:    A.Allocator;
+    loops_region: arena.Arena;
+    loops_alloc:  A.Allocator;
+}
+
+# an empty cache whose regions grow from `backing`; it must not move once
+# initialized
+pub fun init(c: *Cache, backing: *A.Allocator) err[fail.Fail] {
+    c.backing    = backing;
+    c.slots      = nil;
+    c.slot_count = 0;
+    val dom_init: err[A.Error] = arena.init(?c.dom_region, backing, 0);
+    if (sel dom_init.err) { ret err[fail.Fail].err{fail.refused(dom_init.err)}; }
+    val dom_made: err[A.Error] = arena.make(?c.dom_alloc, ?c.dom_region);
+    if (sel dom_made.err) { ret err[fail.Fail].err{fail.refused(dom_made.err)}; }
+    val loops_init: err[A.Error] = arena.init(?c.loops_region, backing, 0);
+    if (sel loops_init.err) { ret err[fail.Fail].err{fail.refused(loops_init.err)}; }
+    val loops_made: err[A.Error] = arena.make(?c.loops_alloc, ?c.loops_region);
+    if (sel loops_made.err) { ret err[fail.Fail].err{fail.refused(loops_made.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# releases in the reverse of the order a first request takes storage, so a
+# backing that reclaims only its last allocation reclaims all of it
+pub fun dnit(c: *Cache) {
+    arena.dnit(?c.loops_region);
+    arena.dnit(?c.dom_region);
+    if (c.slots != nil) { A.deallocate[Slot](c.backing, c.slots, c.slot_count::usize); }
+    c.slots      = nil;
+    c.slot_count = 0;
+}
+
+# the dominator tree of `fn`, a function of `m`
+pub fun dominance_of(c: *Cache, m: *me_ir.Module, fn: *me_ir.Function) res[*dominance.Dominance, fail.Fail] {
+    val found: res[*Slot, fail.Fail] = slot_of(c, m, fn);
+    if (sel found.err) { ret res[*dominance.Dominance, fail.Fail].err{found.err}; }
+    val s: *Slot = found.ok;
+    if (s.dom != nil) { ret res[*dominance.Dominance, fail.Fail].ok{s.dom}; }
+
+    val rd: res[*dominance.Dominance, A.Error] = A.allocate[dominance.Dominance](?c.dom_alloc, 1);
+    if (sel rd.err) { ret res[*dominance.Dominance, fail.Fail].err{fail.refused(rd.err)}; }
+    val built: res[dominance.Dominance, fail.Fail] = dominance.init(fn, ?c.dom_alloc);
+    if (sel built.err) { ret res[*dominance.Dominance, fail.Fail].err{built.err}; }
+    rd.ok[0] = built.ok;
+    s.dom    = rd.ok;
+    ret res[*dominance.Dominance, fail.Fail].ok{s.dom};
+}
+
+# the dominator tree of `fn` with its dominance frontiers
+pub fun frontiers_of(c: *Cache, m: *me_ir.Module, fn: *me_ir.Function) res[*dominance.Dominance, fail.Fail] {
+    val found: res[*dominance.Dominance, fail.Fail] = dominance_of(c, m, fn);
+    if (sel found.err) { ret found; }
+    val built: err[fail.Fail] = dominance.frontiers_build(found.ok);
+    if (sel built.err) { ret res[*dominance.Dominance, fail.Fail].err{built.err}; }
+    ret found;
+}
+
+# the loops of `fn`, a function of `m`. a pass may update the analysis as it
+# moves instructions, which the loops kind's declaration already accounts for
+pub fun loops_of(c: *Cache, m: *me_ir.Module, fn: *me_ir.Function) res[*loops.LoopAnalysis, fail.Fail] {
+    val found: res[*Slot, fail.Fail] = slot_of(c, m, fn);
+    if (sel found.err) { ret res[*loops.LoopAnalysis, fail.Fail].err{found.err}; }
+    val s: *Slot = found.ok;
+    if (s.loops != nil) { ret res[*loops.LoopAnalysis, fail.Fail].ok{s.loops}; }
+
+    val tree: res[*dominance.Dominance, fail.Fail] = dominance_of(c, m, fn);
+    if (sel tree.err) { ret res[*loops.LoopAnalysis, fail.Fail].err{tree.err}; }
+    val rl: res[*loops.LoopAnalysis, A.Error] = A.allocate[loops.LoopAnalysis](?c.loops_alloc, 1);
+    if (sel rl.err) { ret res[*loops.LoopAnalysis, fail.Fail].err{fail.refused(rl.err)}; }
+    val built: res[loops.LoopAnalysis, fail.Fail] = loops.analyze_on(tree.ok, fn, ?m.types, ?c.loops_alloc);
+    if (sel built.err) { ret res[*loops.LoopAnalysis, fail.Fail].err{built.err}; }
+    rl.ok[0] = built.ok;
+    s.loops  = rl.ok;
+    ret res[*loops.LoopAnalysis, fail.Fail].ok{s.loops};
+}
+
+# drops every analysis of `fn`, which the calling pass changed
+pub fun del(c: *Cache, m: *me_ir.Module, fn: *me_ir.Function) {
+    val i: u32 = index_of(m, fn);
+    if (i >= c.slot_count) { ret; }
+    c.slots[i].dom   = nil;
+    c.slots[i].loops = nil;
+}
+
+# drops every analysis of a kind outside `preserved`, for every function
+pub fun keep(c: *Cache, preserved: KindSet) {
+    val keep_dom:   bool = (preserved & DOMINANCE) != 0;
+    val keep_loops: bool = keep_dom && (preserved & LOOPS) != 0;
+    var i:          u32  = 0;
+    for (i < c.slot_count) {
+        if (!keep_dom)   { c.slots[i].dom = nil; }
+        if (!keep_loops) { c.slots[i].loops = nil; }
+        i = i + 1;
+    }
+    if (!keep_loops) { arena.reset(?c.loops_region); }
+    if (!keep_dom)   { arena.reset(?c.dom_region); }
+}
+
+# whether the cache holds every kind in `kinds` for `fn`
+#[testing]
+pub fun has(c: *Cache, m: *me_ir.Module, fn: *me_ir.Function, kinds: KindSet) bool {
+    val i: u32 = index_of(m, fn);
+    if (i >= c.slot_count)                                 { ret kinds == NONE; }
+    if ((kinds & DOMINANCE) != 0 && c.slots[i].dom == nil) { ret false; }
+    if ((kinds & LOOPS) != 0 && c.slots[i].loops == nil)   { ret false; }
+    ret true;
+}
+
+# `per_loop` run on each loop of `fn` deepest first, against the loops the
+# cache serves for it; whether any run changed the function
+pub fun each_innermost_first[T](c: *Cache, m: *me_ir.Module, fn: *me_ir.Function, alloc: *A.Allocator, ctx: *T,
+    per_loop: fun(*T, *loops.LoopAnalysis, u32, *A.Allocator) res[bool, fail.Fail]) res[bool, fail.Fail] {
+    val ral: res[*loops.LoopAnalysis, fail.Fail] = loops_of(c, m, fn);
+    if (sel ral.err) { ret res[bool, fail.Fail].err{ral.err}; }
+    val la: *loops.LoopAnalysis = ral.ok;
+    if (la.loop_len == 0) { ret res[bool, fail.Fail].ok{false}; }
+
+    val n:  u32                = la.loop_len;
+    val ro: res[*u32, A.Error] = A.allocate[u32](alloc, n::usize);
+    if (sel ro.err) { ret res[bool, fail.Fail].err{fail.refused(ro.err)}; }
+    val order: *u32 = ro.ok;
+    fin { A.deallocate[u32](alloc, order, n::usize); }
+    loops.innermost_first(la, order);
+
+    var changed: bool = false;
+    var oi:      u32  = 0;
+    for (oi < n) {
+        val lr: res[bool, fail.Fail] = per_loop(ctx, la, order[oi], alloc);
+        if (sel lr.err) { ret lr; }
+        if (lr.ok)      { changed = true; }
+        oi = oi + 1;
+    }
+    ret res[bool, fail.Fail].ok{changed};
+}
+
+# the slot of `fn`, grown to cover every function `m` now has
+fun slot_of(c: *Cache, m: *me_ir.Module, fn: *me_ir.Function) res[*Slot, fail.Fail] {
+    val i: u32 = index_of(m, fn);
+    if (i >= c.slot_count) {
+        var old: u32          = c.slot_count;
+        val rg:  err[A.Error] = growth.resize[Slot](c.backing, ?c.slots, ?c.slot_count, m.function_len::usize);
+        if (sel rg.err) { ret res[*Slot, fail.Fail].err{fail.refused(rg.err)}; }
+        for (old < c.slot_count) {
+            c.slots[old].dom   = nil;
+            c.slots[old].loops = nil;
+            old                = old + 1;
+        }
+    }
+    ret res[*Slot, fail.Fail].ok{?c.slots[i]};
+}
+
+# the position of `fn` in `m`'s functions, which is its key in the cache
+fun index_of(m: *me_ir.Module, fn: *me_ir.Function) u32 {
+    val base: usize = m.functions::usize;
+    val at:   usize = fn::usize;
+    val size: usize = $size_of(me_ir.Function);
+    if (at < base || (at - base) % size != 0 || (at - base) / size >= m.function_len::usize) {
+        panic("mach.lang.me.analysis: an analysis was requested for a function outside its module\n");
+    }
+    ret ((at - base) / size)::u32;
+}
+
+test keep__drops_each_kind_a_pass_does_not_preserve {
+    var backing: A.Allocator;
+    val made:    err[A.Error] = page.make(?backing);
+    if (sel made.err) { ret 1; }
+    val initialized: res[me_ir.Module, fail.Fail] = me_ir.init(?backing, intern.STR_NIL);
+    if (sel initialized.err) { ret 1; }
+    var m: me_ir.Module = initialized.ok;
+    fin { me_ir.dnit(?m); }
+    val typed: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_int(?m.types, 64);
+    if (sel typed.err) { ret 1; }
+    val added: res[u32, fail.Fail] = me_ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (sel added.err) { ret 1; }
+    val fn:    *me_ir.Function = ?m.functions[added.ok];
+    var build: builder.Builder = builder.init(?m);
+    builder.set_function(?build, fn);
+    val block: res[ir_id.BlockId, fail.Fail] = builder.new_block(?build);
+    if (sel block.err) { ret 1; }
+    builder.set_block(?build, block.ok);
+    val returned: err[fail.Fail] = builder.emit_ret(?build, value.const_int(0, typed.ok));
+    if (sel returned.err) { ret 1; }
+
+    var c:      Cache;
+    val opened: err[fail.Fail] = init(?c, ?backing);
+    if (sel opened.err) { ret 1; }
+    fin { dnit(?c); }
+    val la: res[*loops.LoopAnalysis, fail.Fail] = loops_of(?c, ?m, fn);
+    if (sel la.err) { ret 2; }
+    val tree: res[*dominance.Dominance, fail.Fail] = dominance_of(?c, ?m, fn);
+    if (sel tree.err)          { ret 2; }
+    if (la.ok.dom != tree.ok)  { ret 3; }
+    if (!has(?c, ?m, fn, ALL)) { ret 4; }
+
+    keep(?c, DOMINANCE);
+    if (!has(?c, ?m, fn, DOMINANCE) || has(?c, ?m, fn, LOOPS)) { ret 5; }
+    keep(?c, NONE);
+    if (has(?c, ?m, fn, DOMINANCE)) { ret 6; }
+
+    val again: res[*loops.LoopAnalysis, fail.Fail] = loops_of(?c, ?m, fn);
+    if (sel again.err) { ret 2; }
+    keep(?c, ALL);
+    if (!has(?c, ?m, fn, ALL)) { ret 7; }
+    del(?c, ?m, fn);
+    if (has(?c, ?m, fn, DOMINANCE) || has(?c, ?m, fn, LOOPS)) { ret 8; }
+    ret 0;
+}

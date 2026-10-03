@@ -1,5 +1,21 @@
 # mach.cli.cmd.build
 
+## val COMMAND
+
+```mach
+pub val COMMAND: args.CommandSpec = args.CommandSpec;
+```
+
+`mach build`
+
+## val CHECK
+
+```mach
+pub val CHECK: args.CommandSpec = args.CommandSpec;
+```
+
+`mach check`
+
 ## rec Planned
 
 ```mach
@@ -54,22 +70,22 @@ quiet: `--quiet`
 ## fun run
 
 ```mach
-pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64;
+pub fun run(cx: *args.Call) res[i64, fail.Fail];
 ```
 
 `mach build`: plan and execute a build of the project operand, rendering diagnostics to
-stderr as each unit reports them. `-O1` is refused before parsing; `--plan` prints the
+stderr as each unit reports them. `--plan` prints the
 effective plan and stops without running a generator, a compiler or a linker; `-v` adds
 each phase row as the phase finishes, and `-vv` each module or file as it finishes
 
-argv: the full process arguments
-inv: the parsed invocation for this command
-ret: 0 success, 1 user error, 2 internal failure, 3 environment failure
+cx: the call
+ret: 0 success, 1 user error, 2 internal failure, 3 environment failure; every failure is
+     reported on the call's report with the phase it came from
 
 ## fun check
 
 ```mach
-pub fun check(argv: **u8, inv: *args.ParsedInvocation) i64;
+pub fun check(cx: *args.Call) res[i64, fail.Fail];
 ```
 
 `mach check`: plan the same cells `mach build` would and run each through the
@@ -78,7 +94,6 @@ same classification. no build step runs, nothing is generated, compiled, linked
 or written, and a generated or embedded input that does not exist yet is an
 error naming it rather than a reason to run the step
 
-argv: the full process arguments
-inv: the parsed invocation for this command
+cx: the call
 ret: 0 accepted, 1 rejected or user error, 2 internal failure, 3 environment failure
 

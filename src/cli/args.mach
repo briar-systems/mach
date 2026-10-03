@@ -1,8 +1,12 @@
 use cli_diagnostic: mach.cli.diagnostic;
 use mach.lang.fail;
+use std.allocator.arena;
 use std.allocator.page;
 use collections_vector: std.collections.vector;
 use std.collections.vector.Vector;
+use fs:        std.filesystem;
+use io_error:  std.io.error;
+use io_writer: std.io.writer;
 use std.process.env;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -12,8 +16,10 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_contains;
 use std.types.string.str_equals;
 use std.types.string.str_len;
+use std.types.string.str_starts_with;
 
 use A:          std.allocator;
 use std_format: std.format;
@@ -21,6 +27,7 @@ use std_format: std.format;
 use mach.cli.exit;
 use mach.cli.util;
 use mach.lang.build.request;
+use mach.lang.diagnostic;
 use diagnostic_kind: mach.lang.diagnostic.kind;
 use mach.lang.manifest;
 use ir_printer: mach.lang.me.ir.printer;
@@ -30,26 +37,27 @@ fwd request.is_object_path;
 
 # whether an option is a bare flag, takes the next argv token, or takes a value
 # attached to its own token after `=`
-def OptionArity: u8;
+pub def OptionArity: u8;
 # the option stands alone
-val ARITY_FLAG: OptionArity = 0;
-# the option consumes the next argv token as its value
-val ARITY_VALUE: OptionArity = 1;
+pub val ARITY_FLAG: OptionArity = 0;
+# the option consumes the next argv token as its value; a long option (`--name`) also takes it
+# attached to its own token after `=`
+pub val ARITY_VALUE: OptionArity = 1;
 # the option carries an optional value in its own token after `=`; it never
 # consumes the next one, so `--emit-ir` and `--emit-ir=listing` both parse
 pub val ARITY_ATTACHED: OptionArity = 2;
 
-# one command-line option as the schema tables declare it
+# one command-line option. a row is its own identity: the parser records the
+# row an option matched, and a consumer asks for it by address
 # ---
 # name:       the spelling matched against an argv token, such as `--target` or `-o`
 # value:      help placeholder for the option's value; empty for ARITY_FLAG
 # arity:      how the option takes its value; the ARITY_* constants
 # doc:        one-line help text; schema_valid rejects an empty one
 # default:    help text for what applies when the option is absent; empty prints nothing
-# repeatable: rendered as `repeatable` by help; parse_invocation records every occurrence either way
-# conflicts:  help text naming what this option cannot be combined with; nothing in this module enforces it
-# implies:    help text naming the option this one also switches on
-# alias_of:   the canonical spelling this option is an alias of, which must occur exactly once in the same schema; empty for a canonical option
+# repeatable: the option may occur more than once; a second occurrence of any other is refused
+# alias_of:   the canonical row this spelling stands for, which the parser records in its
+#             place; nil for a canonical row
 pub rec FlagSpec {
     name:       str;
     value:      str;
@@ -57,611 +65,267 @@ pub rec FlagSpec {
     doc:        str;
     default:    str;
     repeatable: bool;
-    conflicts:  str;
-    implies:    str;
-    alias_of:   str;
+    alias_of:   *FlagSpec;
 }
 
+# `--artifact <pattern>`, a selector
+pub val ARTIFACT: FlagSpec = FlagSpec{name: "--artifact", value: "pattern", arity: ARITY_VALUE, doc: "select [artifact.<name>] entries by name or glob", default: "the default selection", repeatable: true, alias_of: nil};
+# `-a`, the alias of `--artifact`
+val ARTIFACT_SHORT: FlagSpec = FlagSpec{name: "-a", value: "pattern", arity: ARITY_VALUE, doc: "select [artifact.<name>] entries by name or glob", default: "", repeatable: true, alias_of: ?ARTIFACT};
+# `--target <pattern>`, a selector
+pub val TARGET: FlagSpec = FlagSpec{name: "--target", value: "pattern", arity: ARITY_VALUE, doc: "select [target.<name>] entries by name or glob", default: "the default target", repeatable: true, alias_of: nil};
+# `-t`, the alias of `--target`
+val TARGET_SHORT: FlagSpec = FlagSpec{name: "-t", value: "pattern", arity: ARITY_VALUE, doc: "select [target.<name>] entries by name or glob", default: "", repeatable: true, alias_of: ?TARGET};
+# `--profile <pattern>`, a selector
+pub val PROFILE: FlagSpec = FlagSpec{name: "--profile", value: "pattern", arity: ARITY_VALUE, doc: "select [profile.<name>] entries by name or glob", default: "the sole or default profile", repeatable: true, alias_of: nil};
+# `-p`, the alias of `--profile`
+val PROFILE_SHORT: FlagSpec = FlagSpec{name: "-p", value: "pattern", arity: ARITY_VALUE, doc: "select [profile.<name>] entries by name or glob", default: "", repeatable: true, alias_of: ?PROFILE};
+# `--all`, which fills every selector not given with `*`
+pub val ALL: FlagSpec = FlagSpec{name: "--all", value: "", arity: ARITY_FLAG, doc: "select every artifact, target and profile that no -a, -t or -p narrows", default: "", repeatable: false, alias_of: nil};
+# `-o <path>`, the linked-binary path
+pub val OUTPUT: FlagSpec = FlagSpec{name: "-o", value: "path", arity: ARITY_VALUE, doc: "override the linked-binary path", default: "", repeatable: false, alias_of: nil};
+
 # row count of SEL
-val SEL_N: usize = 8;
-# the selection options `--artifact`, `--target`, `--profile` with their short
-# forms `-a`, `-t`, `-p`, then `--all` and `-o`, consumed by build, check, run,
-# test and doc. each selector takes an exact name or a glob and repeats; `--all`
-# fills every selector not given with `*`. check hides `-o`, run hides `--all`,
-# and doc accepts only `--artifact` and `--target`
-val SEL: [SEL_N]FlagSpec = [SEL_N]FlagSpec{
-    FlagSpec{name: "--artifact", value: "pattern", arity: ARITY_VALUE, doc: "select [artifact.<name>] entries by name or glob", default: "the default selection", repeatable: true, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "-a", value: "pattern", arity: ARITY_VALUE, doc: "select [artifact.<name>] entries by name or glob", default: "", repeatable: true, conflicts: "", implies: "", alias_of: "--artifact"},
-    FlagSpec{name: "--target", value: "pattern", arity: ARITY_VALUE, doc: "select [target.<name>] entries by name or glob", default: "the default target", repeatable: true, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "-t", value: "pattern", arity: ARITY_VALUE, doc: "select [target.<name>] entries by name or glob", default: "", repeatable: true, conflicts: "", implies: "", alias_of: "--target"},
-    FlagSpec{name: "--profile", value: "pattern", arity: ARITY_VALUE, doc: "select [profile.<name>] entries by name or glob", default: "the sole or default profile", repeatable: true, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "-p", value: "pattern", arity: ARITY_VALUE, doc: "select [profile.<name>] entries by name or glob", default: "", repeatable: true, conflicts: "", implies: "", alias_of: "--profile"},
-    FlagSpec{name: "--all", value: "", arity: ARITY_FLAG, doc: "select every artifact, target and profile that no -a, -t or -p narrows", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "-o", value: "path", arity: ARITY_VALUE, doc: "override the linked-binary path", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-};
+pub val SEL_N: usize = 8;
+# the selection options, consumed by build, check, run, test and doc. each
+# selector takes an exact name or a glob and repeats. check hides `-o`, run
+# hides `--all`, and doc accepts only `--artifact` and `--target`
+pub val SEL: [SEL_N]*FlagSpec = [SEL_N]*FlagSpec{?ARTIFACT, ?ARTIFACT_SHORT, ?TARGET, ?TARGET_SHORT, ?PROFILE, ?PROFILE_SHORT, ?ALL, ?OUTPUT};
 
-# row count of RDO
-pub val RDO_N: usize = 4;
-# the readout options `-v`, `-vv`, `--quiet`, `-q`, consumed by build, check
-# and doc; doc hides `-v` and `-vv`. `-q` is the alias of `--quiet`. what each
-# level shows is the readout contract, doc/language/readout.md
-pub val RDO: [RDO_N]FlagSpec = [RDO_N]FlagSpec{
-    FlagSpec{name: "-v", value: "", arity: ARITY_FLAG, doc: "show each build phase's row as the phase closes", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "-vv", value: "", arity: ARITY_FLAG, doc: "also show each module or file a phase processed", default: "", repeatable: false, conflicts: "", implies: "-v", alias_of: ""},
-    FlagSpec{name: "--quiet", value: "", arity: ARITY_FLAG, doc: "suppress non-error output", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "-q", value: "", arity: ARITY_FLAG, doc: "suppress non-error output", default: "", repeatable: false, conflicts: "", implies: "", alias_of: "--quiet"},
-};
+# `-v`; what each readout level shows is the readout contract, doc/language/readout.md
+pub val VERBOSE: FlagSpec = FlagSpec{name: "-v", value: "", arity: ARITY_FLAG, doc: "show each build phase's row as the phase closes", default: "", repeatable: false, alias_of: nil};
+# `-vv`, which implies `-v`
+pub val VERBOSE_FULL: FlagSpec = FlagSpec{name: "-vv", value: "", arity: ARITY_FLAG, doc: "also show each module or file a phase processed", default: "", repeatable: false, alias_of: nil};
 
-# the readout options of mach test: RDO's rows, with what `-v` and `-vv` add to a
-# test run
-val TEST_RDO: [RDO_N]FlagSpec = [RDO_N]FlagSpec{
-    FlagSpec{name: "-v", value: "", arity: ARITY_FLAG, doc: "show the build's phase rows, and each test's own line as it finishes", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "-vv", value: "", arity: ARITY_FLAG, doc: "also show each module or file a phase processed, and a passing test's output", default: "", repeatable: false, conflicts: "", implies: "-v", alias_of: ""},
-    FlagSpec{name: "--quiet", value: "", arity: ARITY_FLAG, doc: "suppress non-error output", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "-q", value: "", arity: ARITY_FLAG, doc: "suppress non-error output", default: "", repeatable: false, conflicts: "", implies: "", alias_of: "--quiet"},
-};
+# row count of VERBOSITY
+pub val VERBOSITY_N: usize = 2;
+# the readout levels `-v` and `-vv`, consumed by build, check and test
+pub val VERBOSITY: [VERBOSITY_N]*FlagSpec = [VERBOSITY_N]*FlagSpec{?VERBOSE, ?VERBOSE_FULL};
+
+# `--quiet`
+pub val QUIET: FlagSpec = FlagSpec{name: "--quiet", value: "", arity: ARITY_FLAG, doc: "suppress non-error output", default: "", repeatable: false, alias_of: nil};
+# `-q`, the alias of `--quiet`
+val QUIET_SHORT: FlagSpec = FlagSpec{name: "-q", value: "", arity: ARITY_FLAG, doc: "suppress non-error output", default: "", repeatable: false, alias_of: ?QUIET};
+
+# row count of QUIETNESS
+pub val QUIETNESS_N: usize = 2;
+# `--quiet` and `-q`, consumed by build, check, test, doc, init and every dep action
+pub val QUIETNESS: [QUIETNESS_N]*FlagSpec = [QUIETNESS_N]*FlagSpec{?QUIET, ?QUIET_SHORT};
+
+# `--pie`
+pub val PIE: FlagSpec = FlagSpec{name: "--pie", value: "", arity: ARITY_FLAG, doc: "emit a position-independent ET_DYN executable", default: "", repeatable: false, alias_of: nil};
+# `--subsystem <console|gui>`
+pub val SUBSYSTEM: FlagSpec = FlagSpec{name: "--subsystem", value: "console|gui", arity: ARITY_VALUE, doc: "set the environment declared by a Windows executable", default: "artifact subsystem key; inert off Windows", repeatable: false, alias_of: nil};
+# `-g`
+pub val DEBUG_INFO: FlagSpec = FlagSpec{name: "-g", value: "", arity: ARITY_FLAG, doc: "emit debug information for this build", default: "profile debug key", repeatable: false, alias_of: nil};
+# `--emit-asm`
+pub val EMIT_ASM: FlagSpec = FlagSpec{name: "--emit-asm", value: "", arity: ARITY_FLAG, doc: "emit per-module .s assembly beside each object", default: "", repeatable: false, alias_of: nil};
+# `--emit-ir[=form]`, the one attached-value row: bare it writes the ir-debug
+# dump, `--emit-ir=<form>` selects a row of printer.IR_FORMS
+pub val EMIT_IR: FlagSpec = FlagSpec{name: "--emit-ir", value: "form", arity: ARITY_ATTACHED, doc: ir_printer.IR_FORM_HELP, default: "", repeatable: false, alias_of: nil};
 
 # row count of CGEN
 pub val CGEN_N: usize = 5;
-# the codegen options `--pie`, `--subsystem`, `-g`,
-# `--emit-asm`, `--emit-ir`, consumed by build and test; doc parses them with
-# every row hidden. `--emit-ir` is the one attached-value row: bare it writes
-# the ir-debug dump, `--emit-ir=<form>` selects a row of printer.IR_FORMS
-pub val CGEN: [CGEN_N]FlagSpec = [CGEN_N]FlagSpec{
-    FlagSpec{name: "--pie", value: "", arity: ARITY_FLAG, doc: "emit a position-independent ET_DYN executable", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "--subsystem", value: "console|gui", arity: ARITY_VALUE, doc: "set the environment declared by a Windows executable", default: "artifact subsystem key; inert off Windows", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "-g", value: "", arity: ARITY_FLAG, doc: "emit debug information for this build", default: "profile debug key", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "--emit-asm", value: "", arity: ARITY_FLAG, doc: "emit per-module .s assembly beside each object", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "--emit-ir", value: "form", arity: ARITY_ATTACHED, doc: ir_printer.IR_FORM_HELP, default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-};
+# the codegen options, consumed by build and test
+pub val CGEN: [CGEN_N]*FlagSpec = [CGEN_N]*FlagSpec{?PIE, ?SUBSYSTEM, ?DEBUG_INFO, ?EMIT_ASM, ?EMIT_IR};
+
+# `-O0`
+pub val OPT_DEBUG: FlagSpec = FlagSpec{name: "-O0", value: "", arity: ARITY_FLAG, doc: "force the debug pipeline", default: "profile optimization", repeatable: false, alias_of: nil};
+# `-O2`
+pub val OPT_RELEASE: FlagSpec = FlagSpec{name: "-O2", value: "", arity: ARITY_FLAG, doc: "select the release pipeline", default: "profile optimization", repeatable: false, alias_of: nil};
 
 # row count of OPT
 pub val OPT_N: usize = 2;
-# the pipeline overrides `-O0` and `-O2`, consumed by build and test; there is
-# no `-O1` row
-pub val OPT: [OPT_N]FlagSpec = [OPT_N]FlagSpec{
-    FlagSpec{name: "-O0", value: "", arity: ARITY_FLAG, doc: "force the debug pipeline", default: "profile optimization", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "-O2", value: "", arity: ARITY_FLAG, doc: "select the release pipeline", default: "profile optimization", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-};
+# the pipeline overrides `-O0` and `-O2`, consumed by build and test
+pub val OPT: [OPT_N]*FlagSpec = [OPT_N]*FlagSpec{?OPT_DEBUG, ?OPT_RELEASE};
 
-# the user error mach build prints when argv contains `-O1`, which no schema
-# table lists and which therefore parses as an unknown flag otherwise
-val OPT_O1_REMOVED_ERROR: str = "-O1 is not an optimization level; use -O0 or -O2";
+# `--emit <kind>`; its help text is request.EMIT_HELP
+pub val EMIT: FlagSpec = FlagSpec{name: "--emit", value: "kind", arity: ARITY_VALUE, doc: request.EMIT_HELP, default: "", repeatable: false, alias_of: nil};
 
-# row count of EMIT
-val EMIT_N: usize = 1;
-# the `--emit <kind>` option, build only; its help text is request.EMIT_HELP
-val EMIT: [EMIT_N]FlagSpec = [EMIT_N]FlagSpec{
-    FlagSpec{name: "--emit", value: "kind", arity: ARITY_VALUE, doc: request.EMIT_HELP, default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-};
+# row count of EMITS
+pub val EMITS_N: usize = 1;
+# `--emit`, consumed by build
+pub val EMITS: [EMITS_N]*FlagSpec = [EMITS_N]*FlagSpec{?EMIT};
 
-# row count of JOBS
-val JOBS_N: usize = 1;
-# the `--jobs <n>` option for build; test declares its own `--jobs` row in TEST_OWN
-val JOBS: [JOBS_N]FlagSpec = [JOBS_N]FlagSpec{
-    FlagSpec{name: "--jobs", value: "n", arity: ARITY_VALUE, doc: "set codegen worker threads; 1 serialises", default: "host CPUs", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-};
+# `--jobs <n>`
+pub val JOBS: FlagSpec = FlagSpec{name: "--jobs", value: "n", arity: ARITY_VALUE, doc: "set codegen worker threads; 1 serialises", default: "host CPUs", repeatable: false, alias_of: nil};
+
+# row count of WORKERS
+pub val WORKERS_N: usize = 1;
+# `--jobs`, consumed by build and test
+pub val WORKERS: [WORKERS_N]*FlagSpec = [WORKERS_N]*FlagSpec{?JOBS};
+
+# `-L <dir>`
+pub val LIB_DIR: FlagSpec = FlagSpec{name: "-L", value: "dir", arity: ARITY_VALUE, doc: "add a search directory for -l inputs", default: "", repeatable: true, alias_of: nil};
+# `-l <name>`
+pub val LIB: FlagSpec = FlagSpec{name: "-l", value: "name", arity: ARITY_VALUE, doc: "link a named object, archive, or shared library", default: "", repeatable: true, alias_of: nil};
 
 # row count of LINKIN
-val LINKIN_N: usize = 2;
-# the repeatable link-input options `-L <dir>` and `-l <name>`, consumed by build and test
-val LINKIN: [LINKIN_N]FlagSpec = [LINKIN_N]FlagSpec{
-    FlagSpec{name: "-L", value: "dir", arity: ARITY_VALUE, doc: "add a search directory for -l inputs", default: "", repeatable: true, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "-l", value: "name", arity: ARITY_VALUE, doc: "link a named object, archive, or shared library", default: "", repeatable: true, conflicts: "", implies: "", alias_of: ""},
-};
+pub val LINKIN_N: usize = 2;
+# the repeatable link inputs `-L` and `-l`, consumed by build and test
+pub val LINKIN: [LINKIN_N]*FlagSpec = [LINKIN_N]*FlagSpec{?LIB_DIR, ?LIB};
 
-# row count of BUILD_OWN
-val BUILD_OWN_N: usize = 2;
-# the `--no-cache` and `--plan` options, build only. a build reads `obj/` as
-# the object cache by default: a module whose object there carries the build's
-# key is reused instead of lowered and generated. `--no-cache` forces an
-# uncached build
-val BUILD_OWN: [BUILD_OWN_N]FlagSpec = [BUILD_OWN_N]FlagSpec{
-    FlagSpec{name: "--no-cache", value: "", arity: ARITY_FLAG, doc: "force an uncached build: no obj/ reuse and no build-step reuse", default: "object cache on", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "--plan", value: "", arity: ARITY_FLAG, doc: "print the effective build plan and exit without building", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-};
+# `--no-cache`. a build reads `obj/` as the object cache by default: a module
+# whose object there carries the build's key is reused instead of lowered and
+# generated
+pub val NO_CACHE: FlagSpec = FlagSpec{name: "--no-cache", value: "", arity: ARITY_FLAG, doc: "force an uncached build: no obj/ reuse and no build-step reuse", default: "object cache on", repeatable: false, alias_of: nil};
+
+# row count of CACHE
+pub val CACHE_N: usize = 1;
+# `--no-cache`, consumed by build and test
+pub val CACHE: [CACHE_N]*FlagSpec = [CACHE_N]*FlagSpec{?NO_CACHE};
+
+# `--diagnostics <human|json>`: how diagnostics, failures and a test run's results reach stderr
+pub val DIAGNOSTICS: FlagSpec = FlagSpec{name: "--diagnostics", value: "human|json", arity: ARITY_VALUE, doc: "write diagnostics to stderr as human text or as NDJSON records", default: "human", repeatable: false, alias_of: nil};
 
 # row count of DIAG
-val DIAG_N: usize = 1;
-# the `--diagnostics=<human|json>` option, consumed by build, check and test: how
-# the diagnostics reach stderr. the value is attached, so a bare
-# `--diagnostics` carries none and is refused by diagnostics_format
-val DIAG: [DIAG_N]FlagSpec = [DIAG_N]FlagSpec{
-    FlagSpec{name: "--diagnostics", value: "human|json", arity: ARITY_ATTACHED, doc: "write diagnostics to stderr as human text or as NDJSON records", default: "human", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-};
+pub val DIAG_N: usize = 1;
+# `--diagnostics`, consumed by build, check and test
+pub val DIAG: [DIAG_N]*FlagSpec = [DIAG_N]*FlagSpec{?DIAGNOSTICS};
 
-# row count of RUN_OWN
-val RUN_OWN_N: usize = 2;
-# the `--runner <cmd>` and `--timeout <duration>` options, run only
-val RUN_OWN: [RUN_OWN_N]FlagSpec = [RUN_OWN_N]FlagSpec{
-    FlagSpec{name: "--runner", value: "cmd", arity: ARITY_VALUE, doc: "execute through a command name or path resolved on PATH", default: "direct execution", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "--timeout", value: "duration", arity: ARITY_VALUE, doc: "terminate the run and its process group after the duration (30ms, 30s, 5m, 1h)", default: "unbounded", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-};
+# `--plan`
+pub val PLAN: FlagSpec = FlagSpec{name: "--plan", value: "", arity: ARITY_FLAG, doc: "print the effective build plan and exit without building", default: "", repeatable: false, alias_of: nil};
 
-# row count of TEST_OWN
-val TEST_OWN_N: usize = 8;
-# the test-only options `--no-cache`, `--jobs`, `--filter`,
-# `--include-deps`, `--list`, `--format`, `--runner`, `--timeout`.
-# a test build reads `obj/` as the object cache by default, as a build does,
-# and `--no-cache` forces an uncached one
-val TEST_OWN: [TEST_OWN_N]FlagSpec = [TEST_OWN_N]FlagSpec{
-    FlagSpec{name: "--no-cache", value: "", arity: ARITY_FLAG, doc: "force an uncached build: no obj/ reuse and no build-step reuse", default: "object cache on", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "--jobs", value: "n", arity: ARITY_VALUE, doc: "set concurrent test processes and codegen workers; 1 serialises", default: "host CPUs", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "--filter", value: "substr", arity: ARITY_VALUE, doc: "run only tests whose qualified name contains the substring", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "--include-deps", value: "", arity: ARITY_FLAG, doc: "also run tests declared in dependency modules", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "--list", value: "", arity: ARITY_FLAG, doc: "list the collected tests and exit", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "--format", value: "human|json", arity: ARITY_VALUE, doc: "select human output or an NDJSON event stream", default: "human", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "--runner", value: "cmd", arity: ARITY_VALUE, doc: "launch each test through a command name or path resolved on PATH", default: "direct execution", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "--timeout", value: "duration", arity: ARITY_VALUE, doc: "terminate a test process and its process group after the duration (30ms, 30s, 5m, 1h)", default: "unbounded", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-};
+# row count of PLANS
+pub val PLANS_N: usize = 1;
+# `--plan`, consumed by build and refused by run
+pub val PLANS: [PLANS_N]*FlagSpec = [PLANS_N]*FlagSpec{?PLAN};
 
-# row count of DOC_OWN
-val DOC_OWN_N: usize = 1;
-# the `--out <dir>` option, doc only
-val DOC_OWN: [DOC_OWN_N]FlagSpec = [DOC_OWN_N]FlagSpec{
-    FlagSpec{name: "--out", value: "dir", arity: ARITY_VALUE, doc: "set the project-rooted output directory", default: "doc", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-};
+# `--help`: the invocation asks for its command's page, or its action's, instead of running it.
+# every schema accepts it without declaring it, and it takes precedence over every refusal
+# but an unknown action
+pub val HELP: FlagSpec = FlagSpec{name: "--help", value: "", arity: ARITY_FLAG, doc: "show the overview, or a command's page in place of running it", default: "", repeatable: true, alias_of: nil};
+# `-h`, the alias of `--help`
+val HELP_SHORT: FlagSpec = FlagSpec{name: "-h", value: "", arity: ARITY_FLAG, doc: "show the overview, or a command's page in place of running it", default: "", repeatable: true, alias_of: ?HELP};
 
-# row count of INIT
-val INIT_N: usize = 7;
-# the init options `--name`, `--force`, `--lib`, `--no-deps`, `--no-git`, `--quiet`, `-q`;
-# init does not use RDO, so its quiet rows are declared here
-val INIT: [INIT_N]FlagSpec = [INIT_N]FlagSpec{
-    FlagSpec{name: "--name", value: "id", arity: ARITY_VALUE, doc: "set the project identifier", default: "directory name", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "--force", value: "", arity: ARITY_FLAG, doc: "scaffold even when mach.toml or src already exists", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "--lib", value: "", arity: ARITY_FLAG, doc: "use the library project layout", default: "binary project layout", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "--no-deps", value: "", arity: ARITY_FLAG, doc: "resolve and declare the dependencies without checking them out (resolving still needs the network)", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "--no-git", value: "", arity: ARITY_FLAG, doc: "skip Git initialization and realize dependencies as plain checkouts", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "--quiet", value: "", arity: ARITY_FLAG, doc: "suppress non-error output", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "-q", value: "", arity: ARITY_FLAG, doc: "suppress non-error output", default: "", repeatable: false, conflicts: "", implies: "", alias_of: "--quiet"},
-};
+# row count of HELPS
+pub val HELPS_N: usize = 2;
+# `--help` and `-h`
+pub val HELPS: [HELPS_N]*FlagSpec = [HELPS_N]*FlagSpec{?HELP, ?HELP_SHORT};
+# the table every schema accepts before its own
+val HELP_TABLE: TableRef = TableRef{rows: ?HELPS[0], n: HELPS_N, accepted: nil, docs: nil};
 
-# row count of INFO
-val INFO_N: usize = 1;
-# the `--version` option, info only
-val INFO: [INFO_N]FlagSpec = [INFO_N]FlagSpec{
-    FlagSpec{name: "--version", value: "", arity: ARITY_FLAG, doc: "print the version string alone on one line", default: "", repeatable: false, conflicts: "targets", implies: "", alias_of: ""},
-};
+# `--runner <cmd>`
+pub val RUNNER: FlagSpec = FlagSpec{name: "--runner", value: "cmd", arity: ARITY_VALUE, doc: "execute through a command name or path resolved on PATH", default: "direct execution", repeatable: false, alias_of: nil};
 
-# row count of QUIET
-val QUIET_N: usize = 2;
-# the `--quiet` and `-q` options accepted by every dep action, through DEP_SCHEMA
-val QUIET: [QUIET_N]FlagSpec = [QUIET_N]FlagSpec{
-    FlagSpec{name: "--quiet", value: "", arity: ARITY_FLAG, doc: "suppress routine output", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "-q", value: "", arity: ARITY_FLAG, doc: "suppress routine output", default: "", repeatable: false, conflicts: "", implies: "", alias_of: "--quiet"},
-};
+# row count of RUNNERS
+pub val RUNNERS_N: usize = 1;
+# `--runner`, consumed by run and test
+pub val RUNNERS: [RUNNERS_N]*FlagSpec = [RUNNERS_N]*FlagSpec{?RUNNER};
 
-# row count of DEP_ADD
-val DEP_ADD_N: usize = 5;
-# the dep add options `--git <url>`, `--path <dir>`, `--ref <ref>`, `--version <range>`, `--offline`
-pub val DEP_ADD: [DEP_ADD_N]FlagSpec = [DEP_ADD_N]FlagSpec{
-    FlagSpec{name: "--git", value: "url", arity: ARITY_VALUE, doc: "use a Git URL source", default: "", repeatable: false, conflicts: "--path", implies: "", alias_of: ""},
-    FlagSpec{name: "--path", value: "dir", arity: ARITY_VALUE, doc: "use a local path source", default: "", repeatable: false, conflicts: "--git, --ref", implies: "", alias_of: ""},
-    FlagSpec{name: "--ref", value: "branch/<n>|tag/<n>|commit/<n>", arity: ARITY_VALUE, doc: "select a Git reference", default: "", repeatable: false, conflicts: "--path, --version", implies: "--git", alias_of: ""},
-    FlagSpec{name: "--version", value: "range", arity: ARITY_VALUE, doc: "select releases in a version range", default: "^ of the highest compatible release", repeatable: false, conflicts: "--path, --ref", implies: "--git", alias_of: ""},
-    FlagSpec{name: "--offline", value: "", arity: ARITY_FLAG, doc: "resolve from releases already fetched", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-};
+# `--timeout <duration>`
+pub val TIMEOUT: FlagSpec = FlagSpec{name: "--timeout", value: "duration", arity: ARITY_VALUE, doc: "terminate the run and its process group after the duration (30ms, 30s, 5m, 1h)", default: "unbounded", repeatable: false, alias_of: nil};
 
-# row count of DEP_REMOVE
-val DEP_REMOVE_N: usize = 1;
-# the `--purge` option, dep remove only
-val DEP_REMOVE: [DEP_REMOVE_N]FlagSpec = [DEP_REMOVE_N]FlagSpec{
-    FlagSpec{name: "--purge", value: "", arity: ARITY_FLAG, doc: "also delete the dependency directory", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-};
+# row count of TIMEOUTS
+pub val TIMEOUTS_N: usize = 1;
+# `--timeout`, consumed by run and test
+pub val TIMEOUTS: [TIMEOUTS_N]*FlagSpec = [TIMEOUTS_N]*FlagSpec{?TIMEOUT};
 
-# row count of DEP_UPDATE
-val DEP_UPDATE_N: usize = 3;
-# the dep update options `--all`, `--lowest`, `--offline`
-val DEP_UPDATE: [DEP_UPDATE_N]FlagSpec = [DEP_UPDATE_N]FlagSpec{
-    FlagSpec{name: "--all", value: "", arity: ARITY_FLAG, doc: "update every declared dependency", default: "", repeatable: false, conflicts: "name", implies: "", alias_of: ""},
-    FlagSpec{name: "--lowest", value: "", arity: ARITY_FLAG, doc: "select the lowest release every range accepts", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-    FlagSpec{name: "--offline", value: "", arity: ARITY_FLAG, doc: "resolve from releases already fetched", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-};
+# `--offline`
+pub val OFFLINE: FlagSpec = FlagSpec{name: "--offline", value: "", arity: ARITY_FLAG, doc: "resolve from releases already fetched", default: "", repeatable: false, alias_of: nil};
 
-# row count of DEP_OUTDATED
-val DEP_OUTDATED_N: usize = 1;
-# row count of DEP_VERIFY
-val DEP_VERIFY_N: usize = 1;
-# the `--release` option of dep verify
-val DEP_VERIFY: [DEP_VERIFY_N]FlagSpec = [DEP_VERIFY_N]FlagSpec{
-    FlagSpec{name: "--release", value: "", arity: ARITY_FLAG, doc: "also require every dependency of the project itself to be selected by `version` or an exact `tag/`", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-};
+# row count of OFFLINES
+pub val OFFLINES_N: usize = 1;
+# `--offline`, consumed by the dep actions that resolve releases
+pub val OFFLINES: [OFFLINES_N]*FlagSpec = [OFFLINES_N]*FlagSpec{?OFFLINE};
 
-# the `--offline` option of dep outdated
-val DEP_OUTDATED: [DEP_OUTDATED_N]FlagSpec = [DEP_OUTDATED_N]FlagSpec{
-    FlagSpec{name: "--offline", value: "", arity: ARITY_FLAG, doc: "report from releases already fetched", default: "", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-};
-
-# set marks at every argv position occupied by an option from one table:
-# a bare flag marks its own token, a value option marks its token and the
-# one after it. Called only by tests; the command census bans it from the
-# command files
+# one option table as a command or action schema composes it
 # ---
-# marks: one bool per argv entry, written true where an option or its value sits
-# argc:  length of argv
-# argv:  the argument vector
-# table: first row of the FlagSpec table to match
-# n:     row count of table
-
-# whether tok is the name of some row in table
-# ---
-# tok:   an argv token; nil is never in a table
-# table: first row of the FlagSpec table
-# n:     row count of table
-# ret:   true when a row's name equals tok
-pub fun flag_in_table(tok: *u8, table: *FlagSpec, n: usize) bool {
-    if (tok == nil) { ret false; }
-    var i: usize = 0;
-    for (i < n) {
-        if (str_equals(tok::str, table[i].name)) { ret true; }
-        i = i + 1;
-    }
-    ret false;
-}
-
-# identity of one schema row across a command's tables: the command id times
-# 1000, plus the table's index within the schema times 100, plus the row's
-# index, plus 500 when the table belongs to a dep action rather than the
-# command. Two occurrences of the same option compare equal by key
-def SemanticKey: u32;
-
-# which command argv[1] named; the CMD_* constants
-pub def CommandId: u8;
-# `mach build`
-pub val CMD_BUILD: CommandId = 0;
-# `mach run`
-pub val CMD_RUN: CommandId = 1;
-# `mach test`
-pub val CMD_TEST: CommandId = 2;
-# `mach clean`
-pub val CMD_CLEAN: CommandId = 3;
-# `mach dep`, the one command with actions
-pub val CMD_DEP: CommandId = 4;
-# `mach init`
-pub val CMD_INIT: CommandId = 5;
-# `mach doc`
-pub val CMD_DOC: CommandId = 6;
-# `mach info`
-pub val CMD_INFO: CommandId = 7;
-# `mach help`
-pub val CMD_HELP: CommandId = 8;
-# `mach check`
-pub val CMD_CHECK: CommandId = 9;
-# `mach fmt`
-pub val CMD_FMT: CommandId = 10;
-# number of commands, the length of COMMANDS
-pub val CMD_N: usize = 11;
-# no command recognized; the value of ParsedInvocation.command when has_command is false
-pub val CMD_NONE: CommandId = 255;
-
-# which dep action argv[2] named; the DEPACT_* constants
-pub def DepAction: u8;
-# `mach dep list`
-pub val DEPACT_LIST: DepAction = 0;
-# `mach dep add`
-pub val DEPACT_ADD: DepAction = 1;
-# `mach dep remove`
-pub val DEPACT_REMOVE: DepAction = 2;
-# `mach dep update`
-pub val DEPACT_UPDATE: DepAction = 3;
-# `mach dep pull`
-pub val DEPACT_PULL: DepAction = 4;
-# `mach dep verify`
-pub val DEPACT_VERIFY: DepAction = 5;
-# `mach dep outdated`
-pub val DEPACT_OUTDATED: DepAction = 6;
-# number of dep actions, the length of DEP_ACTIONS
-pub val DEPACT_N: usize = 7;
-# no action recognized, and the value passed to schema_lookup to search a command's own tables only
-pub val DEPACT_NONE: DepAction = 255;
-
-# one option table as a command or action schema references it
-# ---
-# table:    first row of the FlagSpec table
-# n:        row count of table
-# accepted: per-row acceptance parallel to table, or nil to accept every row; an unaccepted row is unknown to the parser and absent from help
+# rows:     first entry of the table's row list
+# n:        row count of rows
+# accepted: per-row acceptance parallel to rows, or nil to accept every row; an unaccepted row is
+#           unknown to the parser and absent from help
+# docs:     per-row help text parallel to rows that replaces the row's own doc in this schema, or
+#           nil; an empty entry keeps the row's doc
 pub rec TableRef {
-    table:    *FlagSpec;
+    rows:     **FlagSpec;
     n:        usize;
     accepted: *bool;
+    docs:     *str;
 }
 
-# length of BUILD_SCHEMA
-val BUILD_SCHEMA_N: usize = 9;
-# the option tables mach build accepts: SEL, RDO, CGEN, OPT, EMIT, JOBS, LINKIN, BUILD_OWN, DIAG, all fully visible
-val BUILD_SCHEMA: [BUILD_SCHEMA_N]TableRef = [BUILD_SCHEMA_N]TableRef{
-    TableRef{table: ?SEL[0], n: SEL_N, accepted: nil},
-    TableRef{table: ?RDO[0], n: RDO_N, accepted: nil},
-    TableRef{table: ?CGEN[0], n: CGEN_N, accepted: nil},
-    TableRef{table: ?OPT[0], n: OPT_N, accepted: nil},
-    TableRef{table: ?EMIT[0], n: EMIT_N, accepted: nil},
-    TableRef{table: ?JOBS[0], n: JOBS_N, accepted: nil},
-    TableRef{table: ?LINKIN[0], n: LINKIN_N, accepted: nil},
-    TableRef{table: ?BUILD_OWN[0], n: BUILD_OWN_N, accepted: nil},
-    TableRef{table: ?DIAG[0], n: DIAG_N, accepted: nil},
-};
+# how a relation binds its two rows; the RELATION_* constants
+pub def RelationKind: u8;
+# the two rows cannot both be given
+pub val RELATION_CONFLICTS: RelationKind = 0;
+# `row` is valid only when `other` is given too
+pub val RELATION_REQUIRES: RelationKind = 1;
+# giving `row` also gives `other`
+pub val RELATION_IMPLIES: RelationKind = 2;
 
-# SEL rows check accepts: every row but `-o`, since nothing is written
-val CHECK_SEL_ACCEPTED: [SEL_N]bool = [SEL_N]bool{true, true, true, true, true, true, true, false};
-
-# length of CHECK_SCHEMA
-val CHECK_SCHEMA_N: usize = 3;
-# the option tables mach check accepts: SEL masked by CHECK_SEL_ACCEPTED, RDO and DIAG
-val CHECK_SCHEMA: [CHECK_SCHEMA_N]TableRef = [CHECK_SCHEMA_N]TableRef{
-    TableRef{table: ?SEL[0], n: SEL_N, accepted: ?CHECK_SEL_ACCEPTED[0]},
-    TableRef{table: ?RDO[0], n: RDO_N, accepted: nil},
-    TableRef{table: ?DIAG[0], n: DIAG_N, accepted: nil},
-};
-
-# length of FMT_OWN
-val FMT_OWN_N: usize = 1;
-# the options only mach fmt accepts
-val FMT_OWN: [FMT_OWN_N]FlagSpec = [FMT_OWN_N]FlagSpec{
-    FlagSpec{name: "--check", value: "", arity: ARITY_FLAG, doc: "name the inputs whose layout differs and write no source", default: "rewrite each source file in place, or write the stream operand's canonical text to stdout", repeatable: false, conflicts: "", implies: "", alias_of: ""},
-};
-# length of FMT_SCHEMA
-val FMT_SCHEMA_N: usize = 1;
-# the option tables mach fmt accepts: FMT_OWN alone
-val FMT_SCHEMA: [FMT_SCHEMA_N]TableRef = [FMT_SCHEMA_N]TableRef{
-    TableRef{table: ?FMT_OWN[0], n: FMT_OWN_N, accepted: nil},
-};
-
-# SEL rows run accepts: every row but `--all`, since run executes one artifact
-val RUN_SEL_ACCEPTED: [SEL_N]bool = [SEL_N]bool{true, true, true, true, true, true, false, true};
-
-# length of RUN_SCHEMA
-val RUN_SCHEMA_N: usize = 2;
-# the option tables mach run accepts: SEL masked by RUN_SEL_ACCEPTED, and RUN_OWN
-val RUN_SCHEMA: [RUN_SCHEMA_N]TableRef = [RUN_SCHEMA_N]TableRef{
-    TableRef{table: ?SEL[0], n: SEL_N, accepted: ?RUN_SEL_ACCEPTED[0]},
-    TableRef{table: ?RUN_OWN[0], n: RUN_OWN_N, accepted: nil},
-};
-
-# length of TEST_SCHEMA
-val TEST_SCHEMA_N: usize = 7;
-# the option tables mach test accepts: SEL, TEST_RDO, CGEN, OPT, LINKIN, TEST_OWN, DIAG, all fully visible
-val TEST_SCHEMA: [TEST_SCHEMA_N]TableRef = [TEST_SCHEMA_N]TableRef{
-    TableRef{table: ?SEL[0], n: SEL_N, accepted: nil},
-    TableRef{table: ?TEST_RDO[0], n: RDO_N, accepted: nil},
-    TableRef{table: ?CGEN[0], n: CGEN_N, accepted: nil},
-    TableRef{table: ?OPT[0], n: OPT_N, accepted: nil},
-    TableRef{table: ?LINKIN[0], n: LINKIN_N, accepted: nil},
-    TableRef{table: ?TEST_OWN[0], n: TEST_OWN_N, accepted: nil},
-    TableRef{table: ?DIAG[0], n: DIAG_N, accepted: nil},
-};
-
-# SEL rows doc accepts: `--artifact`, `-a`, `--target`, `-t`, since doc renders one artifact
-val DOC_SEL_ACCEPTED: [SEL_N]bool = [SEL_N]bool{true, true, true, true, false, false, false, false};
-# RDO rows doc accepts: `--quiet` and `-q` only
-val DOC_RDO_ACCEPTED: [RDO_N]bool = [RDO_N]bool{false, false, true, true};
-# CGEN rows doc accepts: none
-val DOC_CGEN_ACCEPTED: [CGEN_N]bool = [CGEN_N]bool{false, false, false, false, false};
-
-# length of DOC_SCHEMA
-val DOC_SCHEMA_N: usize = 4;
-# the option tables mach doc accepts: SEL, RDO, CGEN under the DOC_*_ACCEPTED masks, and DOC_OWN
-val DOC_SCHEMA: [DOC_SCHEMA_N]TableRef = [DOC_SCHEMA_N]TableRef{
-    TableRef{table: ?SEL[0], n: SEL_N, accepted: ?DOC_SEL_ACCEPTED[0]},
-    TableRef{table: ?RDO[0], n: RDO_N, accepted: ?DOC_RDO_ACCEPTED[0]},
-    TableRef{table: ?CGEN[0], n: CGEN_N, accepted: ?DOC_CGEN_ACCEPTED[0]},
-    TableRef{table: ?DOC_OWN[0], n: DOC_OWN_N, accepted: nil},
-};
-
-# length of INFO_SCHEMA
-val INFO_SCHEMA_N: usize = 1;
-# the option tables mach info accepts: INFO
-val INFO_SCHEMA: [INFO_SCHEMA_N]TableRef = [INFO_SCHEMA_N]TableRef{
-    TableRef{table: ?INFO[0], n: INFO_N, accepted: nil},
-};
-
-# length of INIT_SCHEMA
-val INIT_SCHEMA_N: usize = 1;
-# the option tables mach init accepts: INIT
-val INIT_SCHEMA: [INIT_SCHEMA_N]TableRef = [INIT_SCHEMA_N]TableRef{
-    TableRef{table: ?INIT[0], n: INIT_N, accepted: nil},
-};
-
-# length of DEP_SCHEMA
-val DEP_SCHEMA_N: usize = 1;
-# the option tables every mach dep action accepts: QUIET; an action's own tables come from DEP_ACTIONS
-val DEP_SCHEMA: [DEP_SCHEMA_N]TableRef = [DEP_SCHEMA_N]TableRef{
-    TableRef{table: ?QUIET[0], n: QUIET_N, accepted: nil},
-};
-
-# length of DEP_ADD_SCHEMA
-val DEP_ADD_SCHEMA_N: usize = 1;
-# the option tables specific to dep add: DEP_ADD
-val DEP_ADD_SCHEMA: [DEP_ADD_SCHEMA_N]TableRef = [DEP_ADD_SCHEMA_N]TableRef{
-    TableRef{table: ?DEP_ADD[0], n: DEP_ADD_N, accepted: nil},
-};
-
-# length of DEP_REMOVE_SCHEMA
-val DEP_REMOVE_SCHEMA_N: usize = 1;
-# the option tables specific to dep remove: DEP_REMOVE
-val DEP_REMOVE_SCHEMA: [DEP_REMOVE_SCHEMA_N]TableRef = [DEP_REMOVE_SCHEMA_N]TableRef{
-    TableRef{table: ?DEP_REMOVE[0], n: DEP_REMOVE_N, accepted: nil},
-};
-
-# length of DEP_UPDATE_SCHEMA
-val DEP_UPDATE_SCHEMA_N: usize = 1;
-# the option tables specific to dep update: DEP_UPDATE
-val DEP_UPDATE_SCHEMA: [DEP_UPDATE_SCHEMA_N]TableRef = [DEP_UPDATE_SCHEMA_N]TableRef{
-    TableRef{table: ?DEP_UPDATE[0], n: DEP_UPDATE_N, accepted: nil},
-};
-
-# length of DEP_VERIFY_SCHEMA
-val DEP_VERIFY_SCHEMA_N: usize = 1;
-# the option tables specific to dep verify: DEP_VERIFY
-val DEP_VERIFY_SCHEMA: [DEP_VERIFY_SCHEMA_N]TableRef = [DEP_VERIFY_SCHEMA_N]TableRef{
-    TableRef{table: ?DEP_VERIFY[0], n: DEP_VERIFY_N, accepted: nil},
-};
-
-# length of DEP_OUTDATED_SCHEMA
-val DEP_OUTDATED_SCHEMA_N: usize = 1;
-# the option tables specific to dep outdated: DEP_OUTDATED
-val DEP_OUTDATED_SCHEMA: [DEP_OUTDATED_SCHEMA_N]TableRef = [DEP_OUTDATED_SCHEMA_N]TableRef{
-    TableRef{table: ?DEP_OUTDATED[0], n: DEP_OUTDATED_N, accepted: nil},
-};
-
-# length of DEP_ADD_CONSTRAINT
-val DEP_ADD_CONSTRAINT_N: usize = 3;
-# the constraint sentences help prints for dep add; the dep command enforces them, this module does not
-val DEP_ADD_CONSTRAINT: [DEP_ADD_CONSTRAINT_N]str = [DEP_ADD_CONSTRAINT_N]str{
-    "exactly one of --git or --path is required",
-    "--ref is valid only with --git",
-    "--ref and --version cannot be combined",
-};
-
-# length of DEP_UPDATE_CONSTRAINT
-val DEP_UPDATE_CONSTRAINT_N: usize = 1;
-# the constraint sentence help prints for dep update; the dep command enforces it, this module does not
-val DEP_UPDATE_CONSTRAINT: [DEP_UPDATE_CONSTRAINT_N]str = [DEP_UPDATE_CONSTRAINT_N]str{
-    "a dependency name and --all cannot be combined",
-};
-
-# length of CHECK_EXIT
-val CHECK_EXIT_N: usize = 1;
-# the exit codes check documents beside exit.SHARED
-val CHECK_EXIT: [CHECK_EXIT_N]exit.Note = [CHECK_EXIT_N]exit.Note{
-    exit.Note{code: exit.USER, meaning: "rejected source"},
-};
-
-# length of RUN_EXIT
-val RUN_EXIT_N: usize = 2;
-# the exit codes run documents beside exit.SHARED
-val RUN_EXIT: [RUN_EXIT_N]exit.Note = [RUN_EXIT_N]exit.Note{
-    exit.Note{code: exit.PASSTHROUGH, meaning: "the program's own exit code, or 128 plus the signal number when a signal ended it"},
-    exit.Note{code: exit.TIMEOUT, meaning: "the program exceeded --timeout and its process group was terminated"},
-};
-
-# length of TEST_EXIT
-val TEST_EXIT_N: usize = 1;
-# the exit codes test documents beside exit.SHARED
-val TEST_EXIT: [TEST_EXIT_N]exit.Note = [TEST_EXIT_N]exit.Note{
-    exit.Note{code: exit.USER, meaning: "a test that failed, was killed by a signal, or timed out"},
-};
-
-# length of FMT_EXIT
-val FMT_EXIT_N: usize = 1;
-# the exit codes fmt documents beside exit.SHARED
-val FMT_EXIT: [FMT_EXIT_N]exit.Note = [FMT_EXIT_N]exit.Note{
-    exit.Note{code: exit.USER, meaning: "a malformed input, or in check mode an input whose layout differs"},
-};
-
-# length of DEP_VERIFY_EXIT
-val DEP_VERIFY_EXIT_N: usize = 1;
-# the exit codes dep verify documents beside exit.SHARED
-val DEP_VERIFY_EXIT: [DEP_VERIFY_EXIT_N]exit.Note = [DEP_VERIFY_EXIT_N]exit.Note{
-    exit.Note{code: exit.USER, meaning: "a realized closure that does not match the manifest"},
-};
-
-# one dep action record as DEP_ACTIONS declares it; help renders every field
+# one constraint between two option rows. the parser enforces it and help
+# renders it, from relation_text, so the refusal and the help line are one text
 # ---
-# name:         the action word after `dep`
-# id:           the DepAction value
+# kind:  the RELATION_* value
+# row:   the canonical row the relation is declared on
+# other: the canonical row it names
+pub rec Relation {
+    kind:  RelationKind;
+    row:   *FlagSpec;
+    other: *FlagSpec;
+}
+
+# length of RELATIONS
+pub val RELATIONS_N: usize = 3;
+# the relations among the shared rows, in force in every schema that accepts both rows
+pub val RELATIONS: [RELATIONS_N]Relation = [RELATIONS_N]Relation{
+    Relation{kind: RELATION_IMPLIES, row: ?VERBOSE_FULL, other: ?VERBOSE},
+    Relation{kind: RELATION_CONFLICTS, row: ?VERBOSE, other: ?QUIET},
+    Relation{kind: RELATION_CONFLICTS, row: ?VERBOSE_FULL, other: ?QUIET},
+};
+
+# the rule `-o` keeps wherever it names an output, which each command taking it prints and refuses by
+pub val OUTPUT_CONSTRAINT: str = "-o must name a canonical path inside the project root: relative, with no . or .. component";
+
+# the rule every selector keeps, which the help of each command with selectors prints
+pub val SELECTOR_CONSTRAINT: str = "-a, -t and -p take an exact name, which must be declared, or a glob with * and ?, which must match; an artifact pairs only with the targets its `targets` list supports";
+
+# the operand_max of a command or action that takes any number of operands
+pub val OPERANDS_ANY: usize = 0xffffffff;
+
+# one action of a command, the word after the command's own; help renders every field
+# ---
+# name:         the action word
+# id:           a value the owning command tells its actions apart by; the model does not read it
 # grammar:      the argument grammar help appends after the action name, leading space included
 # effect:       one-sentence description
 # exits:        the action's own exit notes beside exit.SHARED; nil when exit_n is 0
 # exit_n:       length of exits
-# tables:       the action's own option tables, searched after DEP_SCHEMA; nil when table_n is 0
+# tables:       the action's own option tables, searched after the command's; nil when table_n is 0
 # table_n:      length of tables
-# constraints:  constraint sentences for help; nil when constraint_n is 0
+# relations:    relations among the action's rows; nil when relation_n is 0
+# relation_n:   length of relations
+# constraints:  constraint sentences for help beyond the relations; nil when constraint_n is 0
 # constraint_n: length of constraints
+# operand_min:  fewest operands the action takes
+# operand_max:  most operands the action takes; OPERANDS_ANY for no bound
 # examples:     example lines for help; nil when example_n is 0
 # example_n:    length of examples
-pub rec DepActionSpec {
+pub rec ActionSpec {
     name:         str;
-    id:           DepAction;
+    id:           u8;
     grammar:      str;
     effect:       str;
     exits:        *exit.Note;
     exit_n:       usize;
     tables:       *TableRef;
     table_n:      usize;
+    relations:    *Relation;
+    relation_n:   usize;
     constraints:  *str;
     constraint_n: usize;
+    operand_min:  usize;
+    operand_max:  usize;
     examples:     *str;
     example_n:    usize;
 }
 
-# the seven dep action records: list, add, remove, update, outdated, pull, verify.
-# Indexed by search, not by DepAction
-pub val DEP_ACTIONS: [DEPACT_N]DepActionSpec = [DEPACT_N]DepActionSpec{
-    DepActionSpec{name: "list", id: DEPACT_LIST, grammar: " <path>", effect: "list declared dependencies and their state", exits: nil, exit_n: 0, tables: nil, table_n: 0, constraints: nil, constraint_n: 0, examples: nil, example_n: 0},
-    DepActionSpec{name: "add", id: DEPACT_ADD, grammar: " <path> <name> (--git <url> [--ref <ref> | --version <range>] | --path <dir>) [--offline]", effect: "declare a dependency and realize the dependency tree", exits: nil, exit_n: 0, tables: ?DEP_ADD_SCHEMA[0], table_n: DEP_ADD_SCHEMA_N, constraints: ?DEP_ADD_CONSTRAINT[0], constraint_n: DEP_ADD_CONSTRAINT_N, examples: nil, example_n: 0},
-    DepActionSpec{name: "remove", id: DEPACT_REMOVE, grammar: " <path> <name> [--purge]", effect: "remove a dependency declaration and optionally its directory", exits: nil, exit_n: 0, tables: ?DEP_REMOVE_SCHEMA[0], table_n: DEP_REMOVE_SCHEMA_N, constraints: nil, constraint_n: 0, examples: nil, example_n: 0},
-    DepActionSpec{name: "update", id: DEPACT_UPDATE, grammar: " <path> (<name> | --all) [--lowest] [--offline]", effect: "recopy path dependencies from their sources (as pull does, since a path dependency has no pin to move), advance branch references, and resolve version ranges to the releases they select", exits: nil, exit_n: 0, tables: ?DEP_UPDATE_SCHEMA[0], table_n: DEP_UPDATE_SCHEMA_N, constraints: ?DEP_UPDATE_CONSTRAINT[0], constraint_n: DEP_UPDATE_CONSTRAINT_N, examples: nil, example_n: 0},
-    DepActionSpec{name: "pull", id: DEPACT_PULL, grammar: " <path>", effect: "realize declared dependencies without advancing revisions; a path dependency is recopied from its source, overwriting local edits under dep/, as update does", exits: nil, exit_n: 0, tables: nil, table_n: 0, constraints: nil, constraint_n: 0, examples: nil, example_n: 0},
-    DepActionSpec{name: "outdated", id: DEPACT_OUTDATED, grammar: " <path> [--offline]", effect: "report each version-selected dependency's pinned, highest compatible and latest release", exits: nil, exit_n: 0, tables: ?DEP_OUTDATED_SCHEMA[0], table_n: DEP_OUTDATED_SCHEMA_N, constraints: nil, constraint_n: 0, examples: nil, example_n: 0},
-    DepActionSpec{name: "verify", id: DEPACT_VERIFY, grammar: " <path> [--release]", effect: "check the realized dependency closure against the manifest without changing anything", exits: ?DEP_VERIFY_EXIT[0], exit_n: DEP_VERIFY_EXIT_N, tables: ?DEP_VERIFY_SCHEMA[0], table_n: DEP_VERIFY_SCHEMA_N, constraints: nil, constraint_n: 0, examples: nil, example_n: 0},
-};
-
-# length of BUILD_CONSTRAINT
-val BUILD_CONSTRAINT_N: usize = 5;
-# the constraint sentences help prints for build and check; the first is
-# enforced by build_cli_invocation, the second by manifest.resolve_cells, the
-# third and fourth by the build command, the fifth by the build plan's output
-# path
-val BUILD_CONSTRAINT: [BUILD_CONSTRAINT_N]str = [BUILD_CONSTRAINT_N]str{
-    "-v and -vv cannot be combined with --quiet or -q",
-    SELECTOR_CONSTRAINT,
-    "-o requires the selection to resolve to exactly one (artifact, target, profile)",
-    "--plan cannot be combined with --quiet or -q",
-    "-o must name a canonical path inside the project root: relative, with no . or .. component",
-};
-
-# the rule every selector keeps, shared by the constraint tables
-val SELECTOR_CONSTRAINT: str = "-a, -t and -p take an exact name, which must be declared, or a glob with * and ?, which must match; an artifact pairs only with the targets its `targets` list supports";
-
-# length of TEST_CONSTRAINT
-val TEST_CONSTRAINT_N: usize = 4;
-# the constraint sentences help prints for test; enforced by
-# build_cli_invocation, manifest.resolve_cells and the test command
-val TEST_CONSTRAINT: [TEST_CONSTRAINT_N]str = [TEST_CONSTRAINT_N]str{
-    "-v and -vv cannot be combined with --quiet or -q",
-    SELECTOR_CONSTRAINT,
-    "-o and --runner require the selection to resolve to exactly one (artifact, target, profile)",
-    "every selected combination is built; its tests run only when the target's os and isa are the host's or --runner is given, and a run that executes none exits 1",
-};
-
-# length of CHECK_CONSTRAINT
-val CHECK_CONSTRAINT_N: usize = 2;
-# the constraint sentences help prints for check
-val CHECK_CONSTRAINT: [CHECK_CONSTRAINT_N]str = [CHECK_CONSTRAINT_N]str{
-    "-v and -vv cannot be combined with --quiet or -q",
-    SELECTOR_CONSTRAINT,
-};
-
-# length of RUN_CONSTRAINT
-val RUN_CONSTRAINT_N: usize = 2;
-# the constraint sentences help prints for run; the second is enforced by the run command
-val RUN_CONSTRAINT: [RUN_CONSTRAINT_N]str = [RUN_CONSTRAINT_N]str{
-    SELECTOR_CONSTRAINT,
-    "the selection must resolve to exactly one (artifact, target, profile)",
-};
-
-# length of DOC_CONSTRAINT
-val DOC_CONSTRAINT_N: usize = 2;
-# the constraint sentences help prints for doc; the second is enforced by the doc command
-val DOC_CONSTRAINT: [DOC_CONSTRAINT_N]str = [DOC_CONSTRAINT_N]str{
-    SELECTOR_CONSTRAINT,
-    "the selection must resolve to exactly one (artifact, target)",
-};
-
-# length of INFO_CONSTRAINT
-val INFO_CONSTRAINT_N: usize = 1;
-# the constraint sentence help prints for info; the info command enforces it, this module does not
-val INFO_CONSTRAINT: [INFO_CONSTRAINT_N]str = [INFO_CONSTRAINT_N]str{
-    "--version and targets cannot be combined",
-};
-
-# one command record as COMMANDS declares it; parse_invocation reads
-# pos_start, truncate_at_sep, has_action, and tables, help renders the rest
+# one command, as its own file declares it: the whole registration of the
+# command, read by the parser, by help and by dispatch
 # ---
 # name:            the command word at argv[1]
 # aliases:         alternative command words; nil when alias_n is 0
 # alias_n:         length of aliases
-# id:              the CommandId value
 # grammar:         the argument grammar help appends after the name, leading space included
 # summary:         one-line description for the overview
 # effect:          one-sentence description for the command page
@@ -670,18 +334,27 @@ val INFO_CONSTRAINT: [INFO_CONSTRAINT_N]str = [INFO_CONSTRAINT_N]str{
 # terminator:      help text for what follows `--`; empty when the command has none
 # tables:          the option tables the command accepts; nil when table_n is 0
 # table_n:         length of tables
-# constraints:     constraint sentences for help; nil when constraint_n is 0
+# refused:         option tables the command recognizes only to refuse as inapplicable; nil when
+#                  refused_n is 0
+# refused_n:       length of refused
+# refusal:         why a refused option does not apply, ending the refusal; empty when refused_n is 0
+# relations:       relations among the command's own rows; nil when relation_n is 0
+# relation_n:      length of relations
+# constraints:     constraint sentences for help beyond the relations; nil when constraint_n is 0
 # constraint_n:    length of constraints
-# pos_start:       first argv index parse_invocation scans: 2 after the command word, 3 after a dep action word
-# truncate_at_sep: stop scanning at the first `--`, so later tokens are neither options nor positionals
-# has_action:      argv[2] names a DepAction
+# operand_min:     fewest operands the command takes; an action's own bounds apply instead
+# operand_max:     most operands the command takes; OPERANDS_ANY for no bound
+# truncate_at_sep: stop scanning at the first `--`, so later tokens are neither options nor operands
+# actions:         the actions argv[2] names; nil when action_n is 0, and then argv[2] is an argument
+# action_n:        length of actions
 # examples:        example lines for help; nil when example_n is 0
 # example_n:       length of examples
+# run:             the handler dispatch calls once argv keeps the schema; its ok is the process
+#                  exit code, and its err the failure dispatch reports in the code `exit.of` maps it to
 pub rec CommandSpec {
     name:            str;
     aliases:         *str;
     alias_n:         usize;
-    id:              CommandId;
     grammar:         str;
     summary:         str;
     effect:          str;
@@ -690,152 +363,176 @@ pub rec CommandSpec {
     terminator:      str;
     tables:          *TableRef;
     table_n:         usize;
+    refused:         *TableRef;
+    refused_n:       usize;
+    refusal:         str;
+    relations:       *Relation;
+    relation_n:      usize;
     constraints:     *str;
     constraint_n:    usize;
-    pos_start:       usize;
+    operand_min:     usize;
+    operand_max:     usize;
     truncate_at_sep: bool;
-    has_action:      bool;
+    actions:         *ActionSpec;
+    action_n:        usize;
     examples:        *str;
     example_n:       usize;
+    run:             fun(*Call) res[i64, fail.Fail];
 }
 
-# the ten command records in help order: build, check, run, test, clean, dep,
-# init, doc, info, help. Indexed by search, not by CommandId
-pub val COMMANDS: [CMD_N]CommandSpec = [CMD_N]CommandSpec{
-    CommandSpec{name: "build", aliases: nil, alias_n: 0, id: CMD_BUILD, grammar: " <path> [options] [inputs...]", summary: "compile a project", effect: "compile selected project artifacts and produce the requested object or linked outputs", exits: nil, exit_n: 0, terminator: "", tables: ?BUILD_SCHEMA[0], table_n: BUILD_SCHEMA_N, constraints: ?BUILD_CONSTRAINT[0], constraint_n: BUILD_CONSTRAINT_N, pos_start: 2, truncate_at_sep: false, has_action: false, examples: nil, example_n: 0},
-    CommandSpec{name: "check", aliases: nil, alias_n: 0, id: CMD_CHECK, grammar: " <path> [options]", summary: "check project source without building", effect: "parse, resolve and type-check the source reachable from the selected artifacts through the frontend; no build step runs and nothing is generated, compiled, linked or written", exits: ?CHECK_EXIT[0], exit_n: CHECK_EXIT_N, terminator: "", tables: ?CHECK_SCHEMA[0], table_n: CHECK_SCHEMA_N, constraints: ?CHECK_CONSTRAINT[0], constraint_n: CHECK_CONSTRAINT_N, pos_start: 2, truncate_at_sep: false, has_action: false, examples: nil, example_n: 0},
-    CommandSpec{name: "run", aliases: nil, alias_n: 0, id: CMD_RUN, grammar: " <path> [options] [-- args...]", summary: "execute a built project artifact", effect: "resolve an existing built executable and run it without rebuilding", exits: ?RUN_EXIT[0], exit_n: RUN_EXIT_N, terminator: "arguments after -- are forwarded to the program", tables: ?RUN_SCHEMA[0], table_n: RUN_SCHEMA_N, constraints: ?RUN_CONSTRAINT[0], constraint_n: RUN_CONSTRAINT_N, pos_start: 2, truncate_at_sep: true, has_action: false, examples: nil, example_n: 0},
-    CommandSpec{name: "test", aliases: nil, alias_n: 0, id: CMD_TEST, grammar: " <path> [options]", summary: "build and run project tests", effect: "build a test dispatcher for every selected (artifact, target, profile) and run each collected test once per (target, profile), in its own process", exits: ?TEST_EXIT[0], exit_n: TEST_EXIT_N, terminator: "", tables: ?TEST_SCHEMA[0], table_n: TEST_SCHEMA_N, constraints: ?TEST_CONSTRAINT[0], constraint_n: TEST_CONSTRAINT_N, pos_start: 2, truncate_at_sep: false, has_action: false, examples: nil, example_n: 0},
-    CommandSpec{name: "fmt", aliases: nil, alias_n: 0, id: CMD_FMT, grammar: " <path>|<file>|- [--check]", summary: "format source in the canonical layout", effect: "a directory or mach.toml operand rewrites that project's own source files in the one canonical layout, reading only [project].src so no build profile is needed; any other file operand rewrites that one file with no manifest read; '-' reads source from stdin and writes its canonical layout to stdout. with --check nothing is written and every input whose layout differs is named on stdout. dependencies are never visited or fetched", exits: ?FMT_EXIT[0], exit_n: FMT_EXIT_N, terminator: "", tables: ?FMT_SCHEMA[0], table_n: FMT_SCHEMA_N, constraints: nil, constraint_n: 0, pos_start: 2, truncate_at_sep: false, has_action: false, examples: nil, example_n: 0},
-    CommandSpec{name: "clean", aliases: nil, alias_n: 0, id: CMD_CLEAN, grammar: " <path>", summary: "remove project build output", effect: "remove the output, object, IR, assembly, test, cache, and staging trees declared by the manifest", exits: nil, exit_n: 0, terminator: "", tables: nil, table_n: 0, constraints: nil, constraint_n: 0, pos_start: 2, truncate_at_sep: false, has_action: false, examples: nil, example_n: 0},
-    CommandSpec{name: "dep", aliases: nil, alias_n: 0, id: CMD_DEP, grammar: " <action> [args] [options]", summary: "manage project dependencies", effect: "inspect or mutate the project dependency tree according to the selected action", exits: nil, exit_n: 0, terminator: "", tables: ?DEP_SCHEMA[0], table_n: DEP_SCHEMA_N, constraints: nil, constraint_n: 0, pos_start: 3, truncate_at_sep: false, has_action: true, examples: nil, example_n: 0},
-    CommandSpec{name: "init", aliases: nil, alias_n: 0, id: CMD_INIT, grammar: " [dir] [options]", summary: "scaffold a new project", effect: "create a binary or library project in the selected directory and add std at the caret range of the newest release that admits this compiler", exits: nil, exit_n: 0, terminator: "", tables: ?INIT_SCHEMA[0], table_n: INIT_SCHEMA_N, constraints: nil, constraint_n: 0, pos_start: 2, truncate_at_sep: false, has_action: false, examples: nil, example_n: 0},
-    CommandSpec{name: "doc", aliases: nil, alias_n: 0, id: CMD_DOC, grammar: " <path> [options]", summary: "generate reference documentation", effect: "write one Markdown page per module and an index under the selected output directory", exits: nil, exit_n: 0, terminator: "", tables: ?DOC_SCHEMA[0], table_n: DOC_SCHEMA_N, constraints: ?DOC_CONSTRAINT[0], constraint_n: DOC_CONSTRAINT_N, pos_start: 2, truncate_at_sep: false, has_action: false, examples: nil, example_n: 0},
-    CommandSpec{name: "info", aliases: nil, alias_n: 0, id: CMD_INFO, grammar: " [--version | targets]", summary: "show the compiler version and host target, or every supported target", effect: "print the version and the resolved host target one dimension per line, or with targets every supported (os, isa, abi, object) tuple one full line each", exits: nil, exit_n: 0, terminator: "", tables: ?INFO_SCHEMA[0], table_n: INFO_SCHEMA_N, constraints: ?INFO_CONSTRAINT[0], constraint_n: INFO_CONSTRAINT_N, pos_start: 2, truncate_at_sep: false, has_action: false, examples: nil, example_n: 0},
-    CommandSpec{name: "help", aliases: nil, alias_n: 0, id: CMD_HELP, grammar: " [command]", summary: "show command help", effect: "render the overview or one canonical command page without product effects", exits: nil, exit_n: 0, terminator: "", tables: nil, table_n: 0, constraints: nil, constraint_n: 0, pos_start: 2, truncate_at_sep: false, has_action: false, examples: nil, example_n: 0},
-};
-
-# the CommandId whose record has name as its name or one of its aliases
+# what dispatch hands a command's handler; dispatch owns every member and outlives the call
 # ---
+# a:       an arena dispatch releases once the handler returns, for what lives as long as the command
+# backing: the page allocator under a, for what the command frees itself before it returns
+# argv:    the full process arguments
+# inv:     the parsed invocation
+# report:  where the command reports a failure it goes on past or that carries an origin, in the
+#          format `--diagnostics` selected
+pub rec Call {
+    a:       *A.Allocator;
+    backing: *A.Allocator;
+    argv:    **u8;
+    inv:     *ParsedInvocation;
+    report:  *cli_diagnostic.Report;
+}
+
+# an option given in place of a command word, read as that option given to the command that
+# answers it: `mach --version` is `mach info --version`
+# ---
+# row:     the option's canonical row
+# command: the command it is given to, whose schema accepts row and which takes no actions
+pub rec Global {
+    row:     *FlagSpec;
+    command: *CommandSpec;
+}
+
+# the commands a command line is read against, in help order
+# ---
+# specs:    first entry of the command list
+# n:        length of specs
+# help:     the command that answers a `--help` request, given the invocation that asked; nil
+#           when the set answers none, and `--help` then runs the command
+# globals:  the options argv[1] may give in place of a command word; nil when global_n is 0
+# global_n: length of globals
+pub rec CommandSet {
+    specs:    **CommandSpec;
+    n:        usize;
+    help:     *CommandSpec;
+    globals:  *Global;
+    global_n: usize;
+}
+
+# a set of commands that answers no help request and takes no global options
+# ---
+# specs: first entry of the command list
+# n:     length of specs
+# ret:   the set
+pub fun command_set(specs: **CommandSpec, n: usize) CommandSet {
+    ret CommandSet{specs: specs, n: n, help: nil, globals: nil, global_n: 0};
+}
+
+# the command whose name or one of whose aliases is name
+# ---
+# set:  the commands
 # name: a command word
-# ret:  some id, or none when no record matches
-pub fun command_lookup(name: str) opt[CommandId] {
+# ret:  the command, or nil when none matches
+pub fun command_for(set: CommandSet, name: str) *CommandSpec {
     var i: usize = 0;
-    for (i < CMD_N) {
-        if (str_equals(COMMANDS[i].name, name)) { ret opt[CommandId].some{COMMANDS[i].id}; }
+    for (i < set.n) {
+        val command: *CommandSpec = set.specs[i];
+        if (str_equals(command.name, name)) { ret command; }
         var j: usize = 0;
-        for (j < COMMANDS[i].alias_n) {
-            if (str_equals(COMMANDS[i].aliases[j], name)) { ret opt[CommandId].some{COMMANDS[i].id}; }
+        for (j < command.alias_n) {
+            if (str_equals(command.aliases[j], name)) { ret command; }
             j = j + 1;
         }
         i = i + 1;
     }
-    ret opt[CommandId].none{};
+    ret nil;
 }
 
-# the COMMANDS record carrying id
+# the action of command named name
 # ---
-# id:  a CommandId
-# ret: the record, or nil when no record carries id (CMD_NONE always)
-pub fun command_spec(id: CommandId) *CommandSpec {
+# command: the command
+# name:    an action word
+# ret:     the action, or nil when the command has none of that name
+pub fun action_for(command: *CommandSpec, name: str) *ActionSpec {
     var i: usize = 0;
-    for (i < CMD_N) {
-        if (COMMANDS[i].id == id) { ret ?COMMANDS[i]; }
+    for (i < command.action_n) {
+        if (str_equals(command.actions[i].name, name)) { ret ?command.actions[i]; }
         i = i + 1;
     }
     ret nil;
 }
 
-# the DepAction whose record has name as its name; aliases are separate records with their own name
+# the help text of the row at j of a table in its schema: the schema's override, or the row's own
 # ---
-# name: an action word
-# ret:  some action, or none when no record matches
-pub fun dep_action_lookup(name: str) opt[DepAction] {
-    var i: usize = 0;
-    for (i < DEPACT_N) {
-        if (str_equals(DEP_ACTIONS[i].name, name)) { ret opt[DepAction].some{DEP_ACTIONS[i].id}; }
-        i = i + 1;
-    }
-    ret opt[DepAction].none{};
-}
-
-# the DEP_ACTIONS record carrying id
-# ---
-# id:  a DepAction
-# ret: the record, or nil when no record carries id (DEPACT_NONE always)
-pub fun dep_action_spec(id: DepAction) *DepActionSpec {
-    var i: usize = 0;
-    for (i < DEPACT_N) {
-        if (DEP_ACTIONS[i].id == id) { ret ?DEP_ACTIONS[i]; }
-        i = i + 1;
-    }
-    ret nil;
-}
-
-# the option tables a command and action accept. All four outputs are zeroed
-# first; an unknown id leaves them zeroed, and extra is filled only when the
-# command has actions, action is not DEPACT_NONE, and action has a record
-# ---
-# id:      the command
-# action:  the dep action, or DEPACT_NONE
-# out:     receives the command's tables
-# out_n:   receives the length of out
-# extra:   receives the action's own tables
-# extra_n: receives the length of extra
-fun schema_for(id: CommandId, action: DepAction, out: **TableRef, out_n: *usize, extra: **TableRef, extra_n: *usize) {
-    @out     = nil;
-    @out_n   = 0;
-    @extra   = nil;
-    @extra_n = 0;
-    val command: *CommandSpec = command_spec(id);
-    if (command == nil) { ret; }
-    @out   = command.tables;
-    @out_n = command.table_n;
-    if (command.has_action && action != DEPACT_NONE) {
-        val action_spec: *DepActionSpec = dep_action_spec(action);
-        if (action_spec == nil) { ret; }
-        @extra   = action_spec.tables;
-        @extra_n = action_spec.table_n;
-    }
+# t:   the table
+# j:   the row index
+# ret: the text
+pub fun row_doc(t: *TableRef, j: usize) str {
+    if (t.docs != nil && str_len(t.docs[j]) > 0) { ret t.docs[j]; }
+    ret t.rows[j].doc;
 }
 
 fun table_accepts(t: *TableRef, j: usize) bool {
     ret t.accepted == nil || t.accepted[j];
 }
 
-fun table_set_valid(tables: *TableRef, table_n: usize) bool {
-    if (table_n == 0)  { ret tables == nil; }
-    if (tables == nil) { ret false; }
+fun tables_accept(tables: *TableRef, table_n: usize, row: *FlagSpec) bool {
     var i: usize = 0;
     for (i < table_n) {
-        val table: TableRef = tables[i];
-        if (table.table == nil || table.n == 0) { ret false; }
         var j: usize = 0;
-        for (j < table.n) {
-            if (str_len(table.table[j].name) == 0 || str_len(table.table[j].doc) == 0) { ret false; }
+        for (j < tables[i].n) {
+            if (tables[i].rows[j] == row && table_accepts(?tables[i], j)) { ret true; }
             j = j + 1;
         }
         i = i + 1;
     }
-    ret true;
+    ret false;
 }
 
-fun spelling_count(tables: *TableRef, table_n: usize, extra: *TableRef, extra_n: usize, name: str) usize {
+# whether row is an option of the schema of command and action
+# ---
+# command: the command
+# action:  its action, or nil for the command's own tables alone
+# row:     the row
+# ret:     true when an accepted table entry is row
+pub fun schema_accepts(command: *CommandSpec, action: *ActionSpec, row: *FlagSpec) bool {
+    if (tables_accept(command.tables, command.table_n, row)) { ret true; }
+    ret action != nil && tables_accept(action.tables, action.table_n, row);
+}
+
+# whether one of the shared RELATIONS is in force in the schema of command and action
+# ---
+# command: the command
+# action:  its action, or nil
+# rel:     an entry of RELATIONS
+# ret:     true when the schema accepts both its rows
+pub fun relation_active(command: *CommandSpec, action: *ActionSpec, rel: *Relation) bool {
+    ret schema_accepts(command, action, rel.row) && schema_accepts(command, action, rel.other);
+}
+
+# the sentence a relation reads as, both in help and in the refusal of an invocation that breaks it
+# ---
+# a:   owns the text
+# rel: the relation
+# ret: the text, empty for RELATION_IMPLIES, which nothing breaks
+pub fun relation_text(a: *A.Allocator, rel: *Relation) res[str, fail.Fail] {
+    var said: res[str, std_format.FormatError] = res[str, std_format.FormatError].ok{""};
+    if (rel.kind == RELATION_CONFLICTS) { said = std_format.sprint(a, "{} and {} cannot be combined", rel.row.name, rel.other.name); }
+    or (rel.kind == RELATION_REQUIRES)  { said = std_format.sprint(a, "{} is valid only with {}", rel.row.name, rel.other.name); }
+    if (sel said.err)                   { ret res[str, fail.Fail].err{fail.message("out of memory")}; }
+    ret res[str, fail.Fail].ok{said.ok};
+}
+
+fun spelling_count(tables: *TableRef, table_n: usize, name: str) usize {
     var count: usize = 0;
     var i:     usize = 0;
     for (i < table_n) {
         var j: usize = 0;
         for (j < tables[i].n) {
-            if (table_accepts(?tables[i], j) && str_equals(tables[i].table[j].name, name)) { count = count + 1; }
-            j = j + 1;
-        }
-        i = i + 1;
-    }
-    i = 0;
-    for (i < extra_n) {
-        var j: usize = 0;
-        for (j < extra[i].n) {
-            if (table_accepts(?extra[i], j) && str_equals(extra[i].table[j].name, name)) { count = count + 1; }
+            if (table_accepts(?tables[i], j) && str_equals(tables[i].rows[j].name, name)) { count = count + 1; }
             j = j + 1;
         }
         i = i + 1;
@@ -843,14 +540,37 @@ fun spelling_count(tables: *TableRef, table_n: usize, extra: *TableRef, extra_n:
     ret count;
 }
 
-fun flag_aliases_valid(tables: *TableRef, table_n: usize, extra: *TableRef, extra_n: usize) bool {
+fun table_set_valid(tables: *TableRef, table_n: usize) bool {
+    if (table_n == 0)  { ret tables == nil; }
+    if (tables == nil) { ret false; }
+    var i: usize = 0;
+    for (i < table_n) {
+        val table: *TableRef = ?tables[i];
+        if (table.rows == nil || table.n == 0) { ret false; }
+        var j: usize = 0;
+        for (j < table.n) {
+            val row: *FlagSpec = table.rows[j];
+            if (row == nil || str_len(row.name) == 0 || str_len(row_doc(table, j)) == 0) { ret false; }
+            if ((row.arity == ARITY_FLAG) != (str_len(row.value) == 0))                  { ret false; }
+            if (row.alias_of != nil && row.alias_of.alias_of != nil)                     { ret false; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# every accepted spelling of the schema occurs once across the command's and the action's tables,
+# and every alias names a row the schema accepts
+fun schema_unambiguous(command: *CommandSpec, action: *ActionSpec) bool {
     var group: usize = 0;
     for (group < 2) {
-        var current:   *TableRef = tables;
-        var current_n: usize     = table_n;
+        var current:   *TableRef = command.tables;
+        var current_n: usize     = command.table_n;
         if (group == 1) {
-            current   = extra;
-            current_n = extra_n;
+            if (action == nil) { ret true; }
+            current   = action.tables;
+            current_n = action.table_n;
         }
         var i: usize = 0;
         for (i < current_n) {
@@ -860,10 +580,11 @@ fun flag_aliases_valid(tables: *TableRef, table_n: usize, extra: *TableRef, extr
                     j = j + 1;
                     cnt;
                 }
-                val flag: *FlagSpec = ?current[i].table[j];
-                if (spelling_count(tables, table_n, extra, extra_n, flag.name) != 1) { ret false; }
-                if (str_len(flag.alias_of) > 0
-                    && spelling_count(tables, table_n, extra, extra_n, flag.alias_of) != 1) { ret false; }
+                val row:   *FlagSpec = current[i].rows[j];
+                var count: usize     = spelling_count(command.tables, command.table_n, row.name);
+                if (action != nil)                                                         { count = count + spelling_count(action.tables, action.table_n, row.name); }
+                if (count != 1)                                                            { ret false; }
+                if (row.alias_of != nil && !schema_accepts(command, action, row.alias_of)) { ret false; }
                 j = j + 1;
             }
             i = i + 1;
@@ -873,101 +594,202 @@ fun flag_aliases_valid(tables: *TableRef, table_n: usize, extra: *TableRef, extr
     ret true;
 }
 
-fun command_record_valid(command: *CommandSpec) bool {
-    if (str_len(command.name) == 0 || str_len(command.summary) == 0
-        || str_len(command.effect) == 0) { ret false; }
-    if (!exit.notes_valid(command.exits, command.exit_n))            { ret false; }
-    if ((command.alias_n == 0) != (command.aliases == nil))          { ret false; }
-    if ((command.table_n == 0) != (command.tables == nil))           { ret false; }
-    if ((command.constraint_n == 0) != (command.constraints == nil)) { ret false; }
-    if ((command.example_n == 0) != (command.examples == nil))       { ret false; }
-    ret table_set_valid(command.tables, command.table_n);
-}
-
-fun action_record_valid(action: *DepActionSpec) bool {
-    if (str_len(action.name) == 0 || str_len(action.effect) == 0)  { ret false; }
-    if (!exit.notes_valid(action.exits, action.exit_n))            { ret false; }
-    if ((action.table_n == 0) != (action.tables == nil))           { ret false; }
-    if ((action.constraint_n == 0) != (action.constraints == nil)) { ret false; }
-    if ((action.example_n == 0) != (action.examples == nil))       { ret false; }
-    ret table_set_valid(action.tables, action.table_n);
-}
-
-# whether COMMANDS and DEP_ACTIONS are well formed: every record has a name,
-# summary or effect, and exit notes that keep to exit.notes_valid; each count
-# field is zero exactly when its pointer is nil; every option row has a name
-# and doc; ids and names are unique; every alias resolves to its own record
-# and collides with no name or other alias; every option spelling and every
-# alias_of target occurs exactly once across a command's tables, and across
-# the dep tables joined with each action's tables; the dep record has has_action. help refuses to
-# render when this is false
-# ---
-# ret: true when every check passes
-pub fun schema_valid() bool {
+fun relations_valid(command: *CommandSpec, action: *ActionSpec, rels: *Relation, rel_n: usize) bool {
+    if ((rel_n == 0) != (rels == nil)) { ret false; }
     var i: usize = 0;
-    for (i < CMD_N) {
-        val command: *CommandSpec = ?COMMANDS[i];
-        if (!command_record_valid(command)) { ret false; }
-        val lookup: opt[CommandId] = command_lookup(command.name);
-        if (sel lookup.none)           { ret false; }
-        if (lookup.some != command.id) { ret false; }
-        var j: usize = i + 1;
-        for (j < CMD_N) {
-            if (command.id == COMMANDS[j].id || str_equals(command.name, COMMANDS[j].name)) { ret false; }
-            j = j + 1;
-        }
-        var ai: usize = 0;
-        for (ai < command.alias_n) {
-            if (str_len(command.aliases[ai]) == 0) { ret false; }
-            val alias_lookup: opt[CommandId] = command_lookup(command.aliases[ai]);
-            if (sel alias_lookup.none)           { ret false; }
-            if (alias_lookup.some != command.id) { ret false; }
-            var ci: usize = 0;
-            for (ci < CMD_N) {
-                if (str_equals(command.aliases[ai], COMMANDS[ci].name)) { ret false; }
-                var aj: usize = 0;
-                for (aj < COMMANDS[ci].alias_n) {
-                    if ((ci != i || aj != ai) && str_equals(command.aliases[ai], COMMANDS[ci].aliases[aj])) { ret false; }
-                    aj = aj + 1;
-                }
-                ci = ci + 1;
-            }
-            ai = ai + 1;
-        }
-        if (!flag_aliases_valid(command.tables, command.table_n, nil, 0)) { ret false; }
-        i = i + 1;
-    }
-
-    val dep_command: *CommandSpec = command_spec(CMD_DEP);
-    if (dep_command == nil || !dep_command.has_action) { ret false; }
-    i = 0;
-    for (i < DEPACT_N) {
-        val action: *DepActionSpec = ?DEP_ACTIONS[i];
-        if (!action_record_valid(action)) { ret false; }
-        val lookup: opt[DepAction] = dep_action_lookup(action.name);
-        if (sel lookup.none)          { ret false; }
-        if (lookup.some != action.id) { ret false; }
-        var j: usize = i + 1;
-        for (j < DEPACT_N) {
-            if (action.id == DEP_ACTIONS[j].id || str_equals(action.name, DEP_ACTIONS[j].name)) { ret false; }
-            j = j + 1;
-        }
-        if (!flag_aliases_valid(dep_command.tables, dep_command.table_n, action.tables, action.table_n)) { ret false; }
+    for (i < rel_n) {
+        val rel: *Relation = ?rels[i];
+        if (rel.row == rel.other || rel.row.alias_of != nil || rel.other.alias_of != nil)             { ret false; }
+        if (!schema_accepts(command, action, rel.row) || !schema_accepts(command, action, rel.other)) { ret false; }
         i = i + 1;
     }
     ret true;
 }
 
+fun command_record_valid(command: *CommandSpec) bool {
+    if (str_len(command.name) == 0 || str_len(command.summary) == 0
+        || str_len(command.effect) == 0) { ret false; }
+    if (!exit.notes_valid(command.exits, command.exit_n))                      { ret false; }
+    if ((command.alias_n == 0) != (command.aliases == nil))                    { ret false; }
+    if ((command.constraint_n == 0) != (command.constraints == nil))           { ret false; }
+    if ((command.example_n == 0) != (command.examples == nil))                 { ret false; }
+    if ((command.action_n == 0) != (command.actions == nil))                   { ret false; }
+    if ((command.refused_n == 0) != (str_len(command.refusal) == 0))           { ret false; }
+    if (command.operand_min > command.operand_max)                             { ret false; }
+    if (!table_set_valid(command.tables, command.table_n))                     { ret false; }
+    if (!table_set_valid(command.refused, command.refused_n))                  { ret false; }
+    if (!schema_unambiguous(command, nil))                                     { ret false; }
+    if (!relations_valid(command, nil, command.relations, command.relation_n)) { ret false; }
+    var i: usize = 0;
+    for (i < command.refused_n) {
+        var j: usize = 0;
+        for (j < command.refused[i].n) {
+            if (spelling_count(command.tables, command.table_n, command.refused[i].rows[j].name) != 0) { ret false; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun action_record_valid(command: *CommandSpec, action: *ActionSpec) bool {
+    if (str_len(action.name) == 0 || str_len(action.effect) == 0)  { ret false; }
+    if (!exit.notes_valid(action.exits, action.exit_n))            { ret false; }
+    if ((action.constraint_n == 0) != (action.constraints == nil)) { ret false; }
+    if ((action.example_n == 0) != (action.examples == nil))       { ret false; }
+    if (action.operand_min > action.operand_max)                   { ret false; }
+    if (!table_set_valid(action.tables, action.table_n))           { ret false; }
+    if (!schema_unambiguous(command, action))                      { ret false; }
+    ret relations_valid(command, action, action.relations, action.relation_n);
+}
+
+fun canonical(row: *FlagSpec) *FlagSpec {
+    if (row.alias_of != nil) { ret row.alias_of; }
+    ret row;
+}
+
+fun tables_row_named(tables: *TableRef, table_n: usize, name: str) *FlagSpec {
+    var i: usize = 0;
+    for (i < table_n) {
+        var j: usize = 0;
+        for (j < tables[i].n) {
+            if (str_equals(tables[i].rows[j].name, name)) { ret canonical(tables[i].rows[j]); }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the canonical row the first table of the set spelling name gives it, `--help` before any
+# command's; nil when no table spells it
+fun set_row_named(set: CommandSet, name: str) *FlagSpec {
+    var found: *FlagSpec = tables_row_named(?HELP_TABLE, 1, name);
+    var i:     usize     = 0;
+    for (found == nil && i < set.n) {
+        val command: *CommandSpec = set.specs[i];
+        i = i + 1;
+        if (command == nil) { cnt; }
+        found = tables_row_named(command.tables, command.table_n, name);
+        if (found == nil) { found = tables_row_named(command.refused, command.refused_n, name); }
+        var k: usize = 0;
+        for (found == nil && k < command.action_n) {
+            found = tables_row_named(command.actions[k].tables, command.actions[k].table_n, name);
+            k     = k + 1;
+        }
+    }
+    ret found;
+}
+
+# every row of the tables means what every other row of its spelling across the set means: one
+# canonical row stands behind each spelling
+fun tables_one_meaning(set: CommandSet, tables: *TableRef, table_n: usize) bool {
+    var i: usize = 0;
+    for (i < table_n) {
+        var j: usize = 0;
+        for (j < tables[i].n) {
+            val row: *FlagSpec = tables[i].rows[j];
+            if (set_row_named(set, row.name) != canonical(row)) { ret false; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun command_one_meaning(set: CommandSet, command: *CommandSpec) bool {
+    if (!tables_one_meaning(set, command.tables, command.table_n))    { ret false; }
+    if (!tables_one_meaning(set, command.refused, command.refused_n)) { ret false; }
+    var k: usize = 0;
+    for (k < command.action_n) {
+        if (!tables_one_meaning(set, command.actions[k].tables, command.actions[k].table_n)) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+fun member_of(set: CommandSet, command: *CommandSpec) bool {
+    var i: usize = 0;
+    for (i < set.n) {
+        if (set.specs[i] == command) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the help command is a member, and each global option is a canonical row its command, a member
+# without actions, accepts, spelled by no command word
+fun globals_valid(set: CommandSet) bool {
+    if (set.help != nil && !member_of(set, set.help)) { ret false; }
+    if ((set.global_n == 0) != (set.globals == nil))  { ret false; }
+    var i: usize = 0;
+    for (i < set.global_n) {
+        val g: *Global = ?set.globals[i];
+        if (g.row == nil || g.command == nil || g.row.alias_of != nil) { ret false; }
+        if (!member_of(set, g.command) || g.command.action_n > 0)      { ret false; }
+        if (g.row != ?HELP && !schema_accepts(g.command, nil, g.row))  { ret false; }
+        if (command_for(set, g.row.name) != nil)                       { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# whether a command set is well formed: every command and action has a name and a summary or
+# effect, exit notes that keep to exit.notes_valid, and operand bounds in order; each count field is
+# zero exactly when its pointer is nil; every option row has a name, a doc in its schema and a
+# value placeholder exactly when it takes a value; command names and aliases are unique across the
+# set and action names within their command; every spelling occurs once in each schema, with the
+# command's tables joined to each action's; every alias names an accepted canonical row; every
+# declared relation joins two canonical rows of its schema; no refused row is also accepted; one
+# canonical row stands behind each spelling across the whole set, `--help` and `-h` included, so a
+# flag of one name means one thing in every command; and the help command and global options keep
+# to globals_valid. help refuses to render when this is false
+# ---
+# set: the commands
+# ret: true when every check passes
+pub fun schema_valid(set: CommandSet) bool {
+    var i: usize = 0;
+    for (i < set.n) {
+        val command: *CommandSpec = set.specs[i];
+        if (command == nil || !command_record_valid(command)) { ret false; }
+        if (!command_one_meaning(set, command))               { ret false; }
+        if (command_for(set, command.name) != command)        { ret false; }
+        var ai: usize = 0;
+        for (ai < command.alias_n) {
+            if (str_len(command.aliases[ai]) == 0)                { ret false; }
+            if (command_for(set, command.aliases[ai]) != command) { ret false; }
+            var j: usize = 0;
+            for (j < set.n) {
+                if (set.specs[j] != command && str_equals(set.specs[j].name, command.aliases[ai])) { ret false; }
+                j = j + 1;
+            }
+            ai = ai + 1;
+        }
+        var j: usize = i + 1;
+        for (j < set.n) {
+            if (set.specs[j] == command || str_equals(command.name, set.specs[j].name)) { ret false; }
+            j = j + 1;
+        }
+        var k: usize = 0;
+        for (k < command.action_n) {
+            val action: *ActionSpec = ?command.actions[k];
+            if (!action_record_valid(command, action))      { ret false; }
+            if (action_for(command, action.name) != action) { ret false; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret globals_valid(set);
+}
+
 # the result of looking one argv token up in a schema
 # ---
-# found:     the token names an option of the schema
-# arity:     the matched row's arity; ARITY_FLAG when not found
-# key:       the row's SemanticKey; 0 when not found
+# row:       the canonical row the token names; nil when it names none
+# spelled:   the row whose spelling matched, which is row unless an alias matched
 # value_off: byte offset of the attached value inside the token; 0 when the token carried none
 rec SchemaHit {
-    found:     bool;
-    arity:     OptionArity;
-    key:       SemanticKey;
+    row:       *FlagSpec;
+    spelled:   *FlagSpec;
     value_off: usize;
 }
 
@@ -986,23 +808,30 @@ fun attached_value_offset(name: str, tok: str) usize {
     ret n + 1;
 }
 
-fun scan_tables(tabs: *TableRef, tabn: usize, key_base: u32, tok: str, hit: *SchemaHit) bool {
+# whether a row takes its value after `=` in its own token: an attached row, and a long value row
+fun takes_attached(row: *FlagSpec) bool {
+    if (row.arity == ARITY_ATTACHED) { ret true; }
+    ret row.arity == ARITY_VALUE && str_starts_with(row.name, "--");
+}
+
+fun scan_tables(tables: *TableRef, table_n: usize, tok: str, hit: *SchemaHit) bool {
     var i: usize = 0;
-    for (i < tabn) {
-        val tr: TableRef = tabs[i];
-        var j:  usize    = 0;
+    for (i < table_n) {
+        val tr: *TableRef = ?tables[i];
+        var j:  usize     = 0;
         for (j < tr.n) {
-            if (!table_accepts(?tr, j)) {
+            if (!table_accepts(tr, j)) {
                 j = j + 1;
                 cnt;
             }
-            var off: usize = 0;
-            if (tr.table[j].arity == ARITY_ATTACHED) { off = attached_value_offset(tr.table[j].name, tok); }
-            if (str_equals(tr.table[j].name, tok) || off > 0) {
-                hit.found     = true;
-                hit.arity     = tr.table[j].arity;
-                hit.key       = key_base + (i::u32 * 100) + j::u32;
+            val row: *FlagSpec = tr.rows[j];
+            var off: usize     = 0;
+            if (takes_attached(row)) { off = attached_value_offset(row.name, tok); }
+            if (str_equals(row.name, tok) || off > 0) {
+                hit.spelled   = row;
+                hit.row       = row;
                 hit.value_off = off;
+                if (row.alias_of != nil) { hit.row = row.alias_of; }
                 ret true;
             }
             j = j + 1;
@@ -1012,72 +841,59 @@ fun scan_tables(tabs: *TableRef, tabn: usize, key_base: u32, tok: str, hit: *Sch
     ret false;
 }
 
-# look tok up in the tables of id and action, the command's own tables before
-# the action's
-# ---
-# id:     the command
-# action: the dep action, or DEPACT_NONE to search the command's tables only
-# tok:    an argv token
-# ret:    the hit; found false with arity ARITY_FLAG and key 0 when tok is not an option there
-pub fun schema_lookup(id: CommandId, action: DepAction, tok: str) SchemaHit {
+fun schema_lookup(command: *CommandSpec, action: *ActionSpec, tok: str) SchemaHit {
     var hit: SchemaHit;
-    hit.found     = false;
-    hit.arity     = ARITY_FLAG;
-    hit.key       = 0::SemanticKey;
+    hit.row       = nil;
+    hit.spelled   = nil;
     hit.value_off = 0;
-
-    var tabs: *TableRef = nil;
-    var tabn: usize     = 0;
-    var ext:  *TableRef = nil;
-    var extn: usize     = 0;
-    schema_for(id, action, ?tabs, ?tabn, ?ext, ?extn);
-
-    val base: u32 = id::u32 * 1000;
-    if (scan_tables(tabs, tabn, base, tok, ?hit)) { ret hit; }
-    scan_tables(ext, extn, base + 500, tok, ?hit);
+    if (scan_tables(?HELP_TABLE, 1, tok, ?hit))                  { ret hit; }
+    if (scan_tables(command.tables, command.table_n, tok, ?hit)) { ret hit; }
+    if (action != nil)                                           { scan_tables(action.tables, action.table_n, tok, ?hit); }
     ret hit;
 }
 
 # one recognized option in argv
 # ---
-# key:       the row's SemanticKey
+# row:       the canonical row the option names, whichever spelling was given
 # idx:       argv index of the option token
 # has_value: a value token followed within the scanned range, or an ARITY_ATTACHED option carried one after `=`
 # value_idx: argv index of the value token, or idx when has_value is false
 # value_off: byte offset of the value inside argv[value_idx]; non-zero only for an ARITY_ATTACHED option
-rec Occurrence {
-    key:       SemanticKey;
+pub rec Occurrence {
+    row:       *FlagSpec;
     idx:       usize;
     has_value: bool;
     value_idx: usize;
     value_off: usize;
 }
 
-# argv classified against the command schema by parse_invocation. The three
-# arrays are argc long and owned by the invocation; dnit_invocation frees
-# them
+# argv read against one command's schema. The three arrays are argc long and owned by the
+# invocation; dnit_invocation frees them
 # ---
 # argc:             length of argv
-# command:          the recognized command, or CMD_NONE
-# has_command:      argv[1] named a command
-# action:           the recognized dep action, or DEPACT_NONE
-# has_action:       argv[2] named a dep action
+# commands:         the set the command was looked up in; empty when the command was given directly
+# command:          the command argv[1] named, or nil when it named none
+# action:           the action argv[2] named, or nil
 # sep_idx:          index of the first `--` when the command truncates there, else argc
-# marks:            true at every recognized option token and its value token; nil when parsing stopped before scanning
-# occ:              recognized options in argv order; nil when parsing stopped before scanning
+# marks:            true at every recognized option token and its value token; nil when reading
+#                   stopped before scanning
+# occ:              recognized options in argv order; nil when reading stopped before scanning
 # occ_len:          length of occ in use
 # positional_idx:   argv index of the first positional, or argc when none
 # positional_count: number of positionals
-# positional_idxs:  argv indices of the positionals in order; nil when parsing stopped before scanning
+# positional_idxs:  argv indices of the positionals in order; nil when reading stopped before scanning
 # has_positional:   at least one positional
-# unknown_idx:      argv index of the first unrecognized token that starts with `-`, or argc when none
-# has_unknown:      at least one unrecognized flag-shaped token
+# refusal:          the first way argv breaks the schema, in argv order: a missing or unknown
+#                   action, a value option without its value, a repeated option, an unknown or
+#                   inapplicable flag, then a broken relation, then an operand count outside the
+#                   bounds; none when argv keeps it. dispatch reports it in place of running the
+#                   command
+# environ:          the environment the command runs in, which the processes it starts inherit
 pub rec ParsedInvocation {
     argc:             usize;
-    command:          CommandId;
-    has_command:      bool;
-    action:           DepAction;
-    has_action:       bool;
+    commands:         CommandSet;
+    command:          *CommandSpec;
+    action:           *ActionSpec;
     sep_idx:          usize;
     marks:            *bool;
     occ:              *Occurrence;
@@ -1086,10 +902,8 @@ pub rec ParsedInvocation {
     positional_count: usize;
     positional_idxs:  *usize;
     has_positional:   bool;
-    unknown_idx:      usize;
-    has_unknown:      bool;
-    # the environment the command runs in, which the processes it starts inherit
-    environ: **u8;
+    refusal:          opt[fail.Fail];
+    environ:          **u8;
 }
 
 # free the arrays parse_invocation allocated; nil arrays are skipped
@@ -1102,24 +916,13 @@ pub fun dnit_invocation(a: *A.Allocator, inv: *ParsedInvocation) {
     if (inv.positional_idxs != nil) { A.deallocate[usize](a, inv.positional_idxs, inv.argc); }
 }
 
-# classify argv against the command schema: recognize the command at argv[1]
-# and, for dep, the action at argv[2], then scan from the command's pos_start
-# to the end or to the first `--` when the command truncates there. A
-# recognized value option claims the next token as its value when one is
-# in range. Every other token starting with `-` is unknown; the rest are
-# positionals. `-O1` is not in any table and so parses as unknown
-# ---
-# a:    allocator for the invocation's three arrays
-# argc: length of argv
-# argv: the argument vector, program name at argv[0]
-# ret:  the invocation. argc below 2, an unrecognized command word, or an unrecognized dep action word return early with has_command or has_action false and every array nil. err on allocation failure, or when the command has no record
-pub fun parse_invocation(a: *A.Allocator, argc: usize, argv: **u8) res[ParsedInvocation, fail.Fail] {
+fun invocation_init(argc: usize) ParsedInvocation {
     var inv: ParsedInvocation;
     inv.argc             = argc;
-    inv.command          = CMD_NONE;
-    inv.has_command      = false;
-    inv.action           = DEPACT_NONE;
-    inv.has_action       = false;
+    inv.commands.specs   = nil;
+    inv.commands.n       = 0;
+    inv.command          = nil;
+    inv.action           = nil;
     inv.sep_idx          = argc;
     inv.marks            = nil;
     inv.occ              = nil;
@@ -1128,31 +931,113 @@ pub fun parse_invocation(a: *A.Allocator, argc: usize, argv: **u8) res[ParsedInv
     inv.positional_count = 0;
     inv.positional_idxs  = nil;
     inv.has_positional   = false;
-    inv.unknown_idx      = argc;
-    inv.has_unknown      = false;
+    inv.refusal          = opt[fail.Fail].none{};
     inv.environ          = env.environ();
+    ret inv;
+}
 
-    if (argc < 2) { ret res[ParsedInvocation, fail.Fail].ok{inv}; }
+# `mach <command>`, or `mach <command> <action>` once an action is read, as messages name it
+fun usage_name(a: *A.Allocator, inv: *ParsedInvocation) str {
+    var said: res[str, std_format.FormatError] = std_format.sprint(a, "mach {}", inv.command.name);
+    if (inv.action != nil) { said = std_format.sprint(a, "mach {} {}", inv.command.name, inv.action.name); }
+    if (sel said.err)      { ret "mach"; }
+    ret said.ok;
+}
 
-    val cmd_o: opt[CommandId] = command_lookup(argv[1]::str);
-    if (sel cmd_o.none) { ret res[ParsedInvocation, fail.Fail].ok{inv}; }
-    inv.command     = cmd_o.some;
-    inv.has_command = true;
+fun refuse_once(inv: *ParsedInvocation, f: fail.Fail) {
+    val first: bool = sel inv.refusal.none;
+    if (first) { inv.refusal = opt[fail.Fail].some{f}; }
+}
 
-    val spec: *CommandSpec = command_spec(inv.command);
-    if (spec == nil) { ret res[ParsedInvocation, fail.Fail].err{fail.message("cli schema: unreachable command spec")}; }
+fun refuse_said(inv: *ParsedInvocation, k: diagnostic_kind.Kind, said: res[str, std_format.FormatError]) {
+    if (sel said.err) {
+        refuse_once(inv, fail.message("out of memory"));
+        ret;
+    }
+    refuse_once(inv, fail.user(k, said.ok));
+}
 
-    val scan_start: usize = spec.pos_start;
-    if (spec.has_action) {
-        if (argc < 3) { ret res[ParsedInvocation, fail.Fail].ok{inv}; }
-        val act_o: opt[DepAction] = dep_action_lookup(argv[2]::str);
-        if (sel act_o.none) { ret res[ParsedInvocation, fail.Fail].ok{inv}; }
-        inv.action     = act_o.some;
-        inv.has_action = true;
+# a command's action names, comma separated, as a refusal naming a missing or unknown action lists
+# them
+# ---
+# a:       owns the text
+# command: the command
+# ret:     the names; what was listed before an allocation failed
+pub fun action_list(a: *A.Allocator, command: *CommandSpec) str {
+    var text: str   = "";
+    var i:    usize = 0;
+    for (i < command.action_n) {
+        var said: res[str, std_format.FormatError] = std_format.sprint(a, "{}, {}", text, command.actions[i].name);
+        if (i == 0)       { said = std_format.sprint(a, "{}", command.actions[i].name); }
+        if (sel said.err) { ret text; }
+        text = said.ok;
+        i    = i + 1;
+    }
+    ret text;
+}
+
+fun refuse_relations(a: *A.Allocator, inv: *ParsedInvocation, rels: *Relation, rel_n: usize, shared: bool) {
+    var i: usize = 0;
+    for (i < rel_n) {
+        val rel: *Relation = ?rels[i];
+        if (rel.kind == RELATION_IMPLIES || (shared && !relation_active(inv.command, inv.action, rel))) {
+            i = i + 1;
+            cnt;
+        }
+        val both:   bool = occurred(inv, rel.row) && occurred(inv, rel.other);
+        val orphan: bool = occurred(inv, rel.row) && !given(inv, rel.other);
+        if ((rel.kind == RELATION_CONFLICTS && both) || (rel.kind == RELATION_REQUIRES && orphan)) {
+            var k: diagnostic_kind.Kind = diagnostic_kind.CLI_FLAG_CONFLICT;
+            if (rel.kind == RELATION_REQUIRES) { k = diagnostic_kind.CLI_FLAG_INAPPLICABLE; }
+            val text: res[str, fail.Fail] = relation_text(a, rel);
+            if (sel text.ok) { refuse_once(inv, fail.user(k, text.ok)); }
+            or               { refuse_once(inv, fail.message("out of memory")); }
+            ret;
+        }
+        i = i + 1;
+    }
+}
+
+# read argv against one command: the action at argv[2] when the command has actions, then every
+# token from the first after the command or action word to the end, or to the first `--` when the
+# command truncates there. A recognized option is recorded under its canonical row, and a value
+# option claims the next token as its value, or the text after `=` in its own token. Every other
+# token starting with `-` is unknown, or inapplicable when the command refuses it; the rest are
+# positionals. The first breach of the schema becomes the invocation's refusal, and the scan still
+# runs to the end. `--help` withdraws every refusal but an unknown action, since the invocation
+# then asks for a page rather than a run
+# ---
+# a:       allocator for the invocation's three arrays and its refusal text
+# command: the command argv[1] named
+# argc:    length of argv
+# argv:    the argument vector, program name at argv[0]
+# ret:     the invocation; err only on allocation failure
+pub fun parse_command(a: *A.Allocator, command: *CommandSpec, argc: usize, argv: **u8) res[ParsedInvocation, fail.Fail] {
+    ret parse_from(a, command, 2, argc, argv);
+}
+
+# parse_command with the command's own arguments starting at argv[first]: 2 after a command word,
+# 1 for a global option that stands in for one
+fun parse_from(a: *A.Allocator, command: *CommandSpec, first: usize, argc: usize, argv: **u8) res[ParsedInvocation, fail.Fail] {
+    var inv: ParsedInvocation = invocation_init(argc);
+    inv.command = command;
+
+    var scan_start:     usize = first;
+    var action_missing: bool  = false;
+    if (command.action_n > 0) {
+        if (first >= argc || util.arg_is_flag(argv[first]::str)) { action_missing = true; }
+        or {
+            inv.action = action_for(command, argv[first]::str);
+            if (inv.action == nil) {
+                refuse_said(?inv, diagnostic_kind.CLI_UNKNOWN_ACTION, std_format.sprint(a, "unknown {} action '{}'; the actions are {}", command.name, argv[first]::str, action_list(a, command)));
+                ret res[ParsedInvocation, fail.Fail].ok{inv};
+            }
+            scan_start = first + 1;
+        }
     }
 
     var bound: usize = argc;
-    if (spec.truncate_at_sep) { bound = util.arg_separator_index(argc, argv); }
+    if (command.truncate_at_sep) { bound = util.arg_separator_index(argc, argv); }
     inv.sep_idx = bound;
 
     val rm: res[*bool, A.Error] = A.allocate[bool](a, argc);
@@ -1167,8 +1052,7 @@ pub fun parse_invocation(a: *A.Allocator, argc: usize, argv: **u8) res[ParsedInv
 
     val ro: res[*Occurrence, A.Error] = A.allocate[Occurrence](a, argc);
     if (sel ro.err) {
-        A.deallocate[bool](a, marks, argc);
-        inv.marks = nil;
+        dnit_invocation(a, ?inv);
         ret res[ParsedInvocation, fail.Fail].err{fail.refused(ro.err)};
     }
     val occ: *Occurrence = ro.ok;
@@ -1176,264 +1060,441 @@ pub fun parse_invocation(a: *A.Allocator, argc: usize, argv: **u8) res[ParsedInv
 
     val rp: res[*usize, A.Error] = A.allocate[usize](a, argc);
     if (sel rp.err) {
-        A.deallocate[Occurrence](a, occ, argc);
-        A.deallocate[bool](a, marks, argc);
-        inv.occ   = nil;
-        inv.marks = nil;
+        dnit_invocation(a, ?inv);
         ret res[ParsedInvocation, fail.Fail].err{fail.refused(rp.err)};
     }
     inv.positional_idxs = rp.ok;
 
     var i: usize = scan_start;
     for (i < bound) {
-        val hit: SchemaHit = schema_lookup(inv.command, inv.action, argv[i]::str);
-        if (!hit.found) {
+        val tok: str       = argv[i]::str;
+        val hit: SchemaHit = schema_lookup(command, inv.action, tok);
+        if (hit.row == nil) {
+            if (util.arg_is_flag(tok)) {
+                var refused: SchemaHit;
+                refused.row = nil;
+                if (scan_tables(command.refused, command.refused_n, tok, ?refused)) {
+                    refuse_said(?inv, diagnostic_kind.CLI_FLAG_INAPPLICABLE, std_format.sprint(a, "option '{}' is not applicable to '{}'; {}", tok, command.name, command.refusal));
+                }
+                or {
+                    refuse_said(?inv, diagnostic_kind.CLI_FLAG_UNKNOWN, std_format.sprint(a, "unknown flag '{}' for '{}'", tok, usage_name(a, ?inv)));
+                }
+            }
+            or {
+                inv.positional_idxs[inv.positional_count] = i;
+                if (!inv.has_positional) {
+                    inv.positional_idx = i;
+                    inv.has_positional = true;
+                }
+                inv.positional_count = inv.positional_count + 1;
+            }
             i = i + 1;
             cnt;
         }
 
-        marks[i]                   = true;
-        occ[inv.occ_len].key       = hit.key;
-        occ[inv.occ_len].idx       = i;
-        occ[inv.occ_len].has_value = false;
-        occ[inv.occ_len].value_idx = i;
-        occ[inv.occ_len].value_off = 0;
-        if (hit.arity == ARITY_ATTACHED) {
-            if (hit.value_off > 0) {
-                occ[inv.occ_len].has_value = true;
-                occ[inv.occ_len].value_off = hit.value_off;
-            }
-            inv.occ_len = inv.occ_len + 1;
-            i           = i + 1;
-            cnt;
+        if (!hit.row.repeatable && occurred(?inv, hit.row)) {
+            refuse_said(?inv, diagnostic_kind.CLI_FLAG_REPEATED, std_format.sprint(a, "option '{}' for '{}' cannot be repeated", tok, usage_name(a, ?inv)));
         }
-        if (hit.arity == ARITY_VALUE && i + 1 < bound) {
-            marks[i + 1]               = true;
-            occ[inv.occ_len].has_value = true;
-            occ[inv.occ_len].value_idx = i + 1;
-            inv.occ_len                = inv.occ_len + 1;
-            i                          = i + 2;
-            cnt;
-        }
+        marks[i] = true;
+        val o: *Occurrence = ?occ[inv.occ_len];
+        o.row       = hit.row;
+        o.idx       = i;
+        o.has_value = false;
+        o.value_idx = i;
+        o.value_off = 0;
         inv.occ_len = inv.occ_len + 1;
         i           = i + 1;
-    }
-
-    i = scan_start;
-    for (i < bound) {
-        if (marks[i]) {
-            i = i + 1;
+        if (hit.value_off > 0) {
+            o.has_value = true;
+            o.value_off = hit.value_off;
             cnt;
         }
-        if (util.arg_is_flag(argv[i]::str)) {
-            if (!inv.has_unknown) {
-                inv.unknown_idx = i;
-                inv.has_unknown = true;
+        if (hit.spelled.arity == ARITY_VALUE) {
+            if (i < bound) {
+                marks[i]    = true;
+                o.has_value = true;
+                o.value_idx = i;
+                i           = i + 1;
+            }
+            or {
+                refuse_said(?inv, diagnostic_kind.CLI_FLAG_VALUE, std_format.sprint(a, "option '{}' for '{}' requires a value", tok, usage_name(a, ?inv)));
             }
         }
-        or {
-            inv.positional_idxs[inv.positional_count] = i;
-            if (!inv.has_positional) {
-                inv.positional_idx = i;
-                inv.has_positional = true;
-            }
-            inv.positional_count = inv.positional_count + 1;
-        }
-        i = i + 1;
     }
 
+    if (help_requested(?inv)) {
+        inv.refusal = opt[fail.Fail].none{};
+        ret res[ParsedInvocation, fail.Fail].ok{inv};
+    }
+    if (action_missing) {
+        inv.refusal = opt[fail.Fail].none{};
+        refuse_said(?inv, diagnostic_kind.CLI_OPERAND, std_format.sprint(a, "missing {} action; the actions are {}", command.name, action_list(a, command)));
+        ret res[ParsedInvocation, fail.Fail].ok{inv};
+    }
+    if (sel inv.refusal.some) { ret res[ParsedInvocation, fail.Fail].ok{inv}; }
+
+    refuse_relations(a, ?inv, ?RELATIONS[0], RELATIONS_N, true);
+    refuse_relations(a, ?inv, command.relations, command.relation_n, false);
+    if (inv.action != nil)    { refuse_relations(a, ?inv, inv.action.relations, inv.action.relation_n, false); }
+    if (sel inv.refusal.some) { ret res[ParsedInvocation, fail.Fail].ok{inv}; }
+
+    var operand_min: usize = command.operand_min;
+    var operand_max: usize = command.operand_max;
+    var grammar:     str   = command.grammar;
+    if (inv.action != nil) {
+        operand_min = inv.action.operand_min;
+        operand_max = inv.action.operand_max;
+        grammar     = inv.action.grammar;
+    }
+    if (inv.positional_count < operand_min || inv.positional_count > operand_max) {
+        refuse_said(?inv, diagnostic_kind.CLI_OPERAND, std_format.sprint(a, "usage: {}{}", usage_name(a, ?inv), grammar));
+    }
     ret res[ParsedInvocation, fail.Fail].ok{inv};
 }
 
-fun occ_flag_hit(inv: *ParsedInvocation, hit: SchemaHit) bool {
-    if (!hit.found) { ret false; }
+# read argv against the command argv[1] names in a set, as parse_command does. a global option of
+# the set at argv[1] reads as that option given to the command it stands in for
+# ---
+# a:        allocator for the invocation
+# commands: the commands to look argv[1] up in
+# argc:     length of argv
+# argv:     the argument vector, program name at argv[0]
+# ret:      the invocation, whose command is nil when argc is below 2 or argv[1] names neither a
+#           command nor a global option; err only on allocation failure
+pub fun parse_invocation(a: *A.Allocator, commands: CommandSet, argc: usize, argv: **u8) res[ParsedInvocation, fail.Fail] {
+    var command: *CommandSpec = nil;
+    var first:   usize        = 2;
+    if (argc >= 2) { command = command_for(commands, argv[1]::str); }
+    if (argc >= 2 && command == nil) {
+        command = global_for(commands, argv[1]::str);
+        first   = 1;
+    }
+    if (command == nil) {
+        var none: ParsedInvocation = invocation_init(argc);
+        none.commands = commands;
+        ret res[ParsedInvocation, fail.Fail].ok{none};
+    }
+    val parsed: res[ParsedInvocation, fail.Fail] = parse_from(a, command, first, argc, argv);
+    if (sel parsed.err) { ret parsed; }
+    var inv: ParsedInvocation = parsed.ok;
+    inv.commands = commands;
+    ret res[ParsedInvocation, fail.Fail].ok{inv};
+}
+
+# the command a global option of the set spelled tok stands in for, or nil when tok spells none
+fun global_for(commands: CommandSet, tok: str) *CommandSpec {
+    var i: usize = 0;
+    for (i < commands.global_n) {
+        val g: *Global = ?commands.globals[i];
+        if (schema_lookup(g.command, nil, tok).row == g.row) { ret g.command; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# whether the invocation asks for a page rather than a run: `--help` or `-h` occurred
+# ---
+# inv: the parsed invocation
+# ret: true when it did
+pub fun help_requested(inv: *ParsedInvocation) bool {
+    ret occurred(inv, ?HELP);
+}
+
+# whether row itself occurred in argv, under any of its spellings
+# ---
+# inv: the parsed invocation
+# row: a canonical row
+# ret: true when some occurrence records row
+pub fun occurred(inv: *ParsedInvocation, row: *FlagSpec) bool {
     var i: usize = 0;
     for (i < inv.occ_len) {
-        if (inv.occ[i].key == hit.key) { ret true; }
+        if (inv.occ[i].row == row) { ret true; }
         i = i + 1;
     }
     ret false;
 }
 
-fun occ_value_hit(inv: *ParsedInvocation, argv: **u8, hit: SchemaHit) opt[*u8] {
-    if (!hit.found) { ret opt[*u8].none{}; }
+fun implied_by(inv: *ParsedInvocation, rels: *Relation, rel_n: usize, row: *FlagSpec, shared: bool) bool {
+    var i: usize = 0;
+    for (i < rel_n) {
+        val rel: *Relation = ?rels[i];
+        if (rel.kind == RELATION_IMPLIES && rel.other == row && occurred(inv, rel.row)
+            && (!shared || relation_active(inv.command, inv.action, rel))) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether row was given: it occurred, or a row that implies it did
+# ---
+# inv: the parsed invocation
+# row: a canonical row
+# ret: true when given
+pub fun given(inv: *ParsedInvocation, row: *FlagSpec) bool {
+    if (occurred(inv, row))                                                         { ret true; }
+    if (inv.command == nil)                                                         { ret false; }
+    if (implied_by(inv, ?RELATIONS[0], RELATIONS_N, row, true))                     { ret true; }
+    if (implied_by(inv, inv.command.relations, inv.command.relation_n, row, false)) { ret true; }
+    ret inv.action != nil && implied_by(inv, inv.action.relations, inv.action.relation_n, row, false);
+}
+
+# the value row was given; a row that does not repeat has at most one
+# ---
+# inv:  the parsed invocation
+# argv: the argument vector inv was parsed from
+# row:  a canonical row
+# ret:  the value, or none when row did not occur or occurred without one
+pub fun value(inv: *ParsedInvocation, argv: **u8, row: *FlagSpec) opt[*u8] {
     var i: usize = 0;
     for (i < inv.occ_len) {
-        if (inv.occ[i].key == hit.key && inv.occ[i].has_value) {
-            val tok: *u8 = argv[inv.occ[i].value_idx];
-            ret opt[*u8].some{?tok[inv.occ[i].value_off]};
-        }
+        val o: *Occurrence = ?inv.occ[i];
+        if (o.row == row && o.has_value) { ret opt[*u8].some{?argv[o.value_idx][o.value_off]}; }
         i = i + 1;
     }
     ret opt[*u8].none{};
 }
 
-# whether flag occurred, looked up in cmd's own tables only, never an action's
-# ---
-# cmd:  the command
-# inv:  the parsed invocation
-# flag: the option spelling
-# ret:  true when some occurrence carries the flag's key
-pub fun invocation_flag(cmd: CommandId, inv: *ParsedInvocation, flag: str) bool {
-    ret occ_flag_hit(inv, schema_lookup(cmd, DEPACT_NONE, flag));
-}
-
-# the value of the first occurrence of flag that carried one, looked up in cmd's own tables only
-# ---
-# cmd:  the command
-# inv:  the parsed invocation
-# argv: the argument vector inv was parsed from
-# flag: the option spelling
-# ret:  the value token, or none when the flag is unknown to cmd, absent, or occurred without a value
-# the value token, or nil when the option was not given: the CliArgs fields
-# are nullable tokens
-fun token_or_nil(cmd: CommandId, inv: *ParsedInvocation, argv: **u8, flag: str) *u8 {
-    val v: opt[*u8] = invocation_value(cmd, inv, argv, flag);
+fun value_or_nil(inv: *ParsedInvocation, argv: **u8, row: *FlagSpec) *u8 {
+    val v: opt[*u8] = value(inv, argv, row);
     if (sel v.some) { ret v.some; }
     ret nil;
 }
 
-pub fun invocation_value(cmd: CommandId, inv: *ParsedInvocation, argv: **u8, flag: str) opt[*u8] {
-    ret occ_value_hit(inv, argv, schema_lookup(cmd, DEPACT_NONE, flag));
-}
-
-# the diagnostics format `--diagnostics=<human|json>` selects for a command
-# that takes the DIAG table; human when the option is absent
-# ---
-# cmd:  the command
-# inv:  the parsed invocation
-# argv: the argument vector inv was parsed from
-# ret:  the format, or a user failure for a bare `--diagnostics` or any other value
-pub fun diagnostics_format(cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[cli_diagnostic.Format, fail.Fail] {
-    if (!invocation_flag(cmd, inv, "--diagnostics")) { ret res[cli_diagnostic.Format, fail.Fail].ok{cli_diagnostic.FORMAT_HUMAN}; }
-    val v: opt[*u8] = invocation_value(cmd, inv, argv, "--diagnostics");
-    if (sel v.some) {
-        val named: opt[cli_diagnostic.Format] = cli_diagnostic.format_named(v.some::str);
-        if (sel named.some) { ret res[cli_diagnostic.Format, fail.Fail].ok{named.some}; }
-    }
-    ret res[cli_diagnostic.Format, fail.Fail].err{fail.user(diagnostic_kind.CLI_FLAG_VALUE, "--diagnostics expects `--diagnostics=human` or `--diagnostics=json`")};
-}
-
-# the row of cmd's own tables spelled tok, or nil
-fun row_spelled(cmd: CommandId, tok: str) *FlagSpec {
-    var tabs: *TableRef = nil;
-    var tabn: usize     = 0;
-    var ext:  *TableRef = nil;
-    var extn: usize     = 0;
-    schema_for(cmd, DEPACT_NONE, ?tabs, ?tabn, ?ext, ?extn);
-    var i: usize = 0;
-    for (i < tabn) {
-        var j: usize = 0;
-        for (j < tabs[i].n) {
-            if (table_accepts(?tabs[i], j) && str_equals(tabs[i].table[j].name, tok)) { ret ?tabs[i].table[j]; }
-            j = j + 1;
-        }
-        i = i + 1;
-    }
-    ret nil;
-}
-
-# every value given to flag or to an alias of it, in argv order
+# every value row was given, in argv order
 # ---
 # a:    backs the vector
-# cmd:  the command
 # inv:  the parsed invocation
 # argv: the argument vector inv was parsed from
-# flag: the canonical spelling
-# ret:  the values; err when an occurrence has no value
-fun invocation_values(a: *A.Allocator, cmd: CommandId, inv: *ParsedInvocation, argv: **u8, flag: str) res[Vector[str], fail.Fail] {
-    var values: Vector[str] = collections_vector.init[str](a);
-    var i:      usize       = 0;
+# row:  a canonical row
+# ret:  the values; err when the vector cannot grow
+pub fun values(a: *A.Allocator, inv: *ParsedInvocation, argv: **u8, row: *FlagSpec) res[Vector[str], fail.Fail] {
+    var found: Vector[str] = collections_vector.init[str](a);
+    var i:     usize       = 0;
     for (i < inv.occ_len) {
-        val o:   Occurrence = inv.occ[i];
-        val row: *FlagSpec  = row_spelled(cmd, argv[o.idx]::str);
-        if (row != nil && (str_equals(row.name, flag) || str_equals(row.alias_of, flag))) {
-            if (!o.has_value) {
-                val said: res[str, std_format.FormatError] = std_format.sprint(a, "{} requires a value", argv[o.idx]::str);
-                if (sel said.err) { ret res[Vector[str], fail.Fail].err{fail.message("out of memory")}; }
-                ret res[Vector[str], fail.Fail].err{fail.user(diagnostic_kind.CLI_FLAG_VALUE, said.ok)};
-            }
-            val pushed: res[usize, A.Error] = collections_vector.push[str](?values, (?argv[o.value_idx][o.value_off])::str);
+        val o: *Occurrence = ?inv.occ[i];
+        if (o.row == row && o.has_value) {
+            val pushed: res[usize, A.Error] = collections_vector.push[str](?found, (?argv[o.value_idx][o.value_off])::str);
             if (sel pushed.err) { ret res[Vector[str], fail.Fail].err{fail.refused(pushed.err)}; }
         }
         i = i + 1;
     }
-    ret res[Vector[str], fail.Fail].ok{values};
+    ret res[Vector[str], fail.Fail].ok{found};
 }
 
-# the `-a`, `-t` and `-p` patterns and `--all` a command was given
+# the diagnostics format `--diagnostics <human|json>` selects; human when the command does not take
+# the option or it is absent
 # ---
-# a:    backs the pattern vectors
-# cmd:  the command
 # inv:  the parsed invocation
 # argv: the argument vector inv was parsed from
-# ret:  the selectors; err when a selector has no value
-pub fun collect_selectors(a: *A.Allocator, cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[manifest.Selectors, fail.Fail] {
+# ret:  the format, or a user failure for any value but `human` and `json`
+pub fun diagnostics_format(inv: *ParsedInvocation, argv: **u8) res[cli_diagnostic.Format, fail.Fail] {
+    if (!occurred(inv, ?DIAGNOSTICS)) { ret res[cli_diagnostic.Format, fail.Fail].ok{cli_diagnostic.FORMAT_HUMAN}; }
+    val v: opt[*u8] = value(inv, argv, ?DIAGNOSTICS);
+    if (sel v.some) {
+        val named: opt[cli_diagnostic.Format] = cli_diagnostic.format_named(v.some::str);
+        if (sel named.some) { ret res[cli_diagnostic.Format, fail.Fail].ok{named.some}; }
+    }
+    ret res[cli_diagnostic.Format, fail.Fail].err{fail.user(diagnostic_kind.CLI_FLAG_VALUE, "--diagnostics expects `human` or `json`")};
+}
+
+# run a parsed invocation and report how it ended through one report, in the format
+# `--diagnostics` selects, human when that format is itself malformed: the refusal when argv broke
+# the schema; otherwise the handler of the command, or of the set's help command when the
+# invocation asks for a page, given an arena this call owns. a failure the handler returns is
+# reported here
+# ---
+# inv:  the parsed invocation; its command is not nil
+# argv: the argument vector inv was parsed from
+# ret:  the exit code
+pub fun run(inv: *ParsedInvocation, argv: **u8) i64 {
+    ret run_to(inv, argv, fs.writer(fs.STDERR));
+}
+
+# run with the report written to w in place of stderr
+# ---
+# inv:  the parsed invocation; its command is not nil
+# argv: the argument vector inv was parsed from
+# w:    where the report is written
+# ret:  the exit code
+pub fun run_to(inv: *ParsedInvocation, argv: **u8, w: io_writer.Writer) i64 {
+    var format: cli_diagnostic.Format                 = cli_diagnostic.FORMAT_HUMAN;
+    val chosen: res[cli_diagnostic.Format, fail.Fail] = diagnostics_format(inv, argv);
+    if (sel chosen.ok) { format = chosen.ok; }
+    var r: cli_diagnostic.Report;
+    cli_diagnostic.report_init(?r, format);
+    r.w = w;
+    if (sel inv.refusal.some) { ret cli_diagnostic.report_close(?r, cli_diagnostic.report_fail(?r, inv.refusal.some, diagnostic.ORIGIN_NONE)); }
+    if (sel chosen.err)       { ret cli_diagnostic.report_close(?r, cli_diagnostic.report_fail(?r, chosen.err, diagnostic.ORIGIN_NONE)); }
+    var handler: fun(*Call) res[i64, fail.Fail] = inv.command.run;
+    if (help_requested(inv) && inv.commands.help != nil) { handler = inv.commands.help.run; }
+    ret cli_diagnostic.report_close(?r, call(inv, argv, ?r, handler));
+}
+
+# run_to through a handler of the caller's in place of the command's own, for a test that
+# substitutes what the command depends on
+# ---
+# inv:     the parsed invocation, which keeps its schema
+# argv:    the argument vector inv was parsed from
+# w:       where the report is written
+# handler: what runs in place of the command's handler
+# ret:     the exit code
+pub fun run_as(inv: *ParsedInvocation, argv: **u8, w: io_writer.Writer, handler: fun(*Call) res[i64, fail.Fail]) i64 {
+    var r: cli_diagnostic.Report;
+    cli_diagnostic.report_init(?r, cli_diagnostic.FORMAT_HUMAN);
+    r.w = w;
+    ret cli_diagnostic.report_close(?r, call(inv, argv, ?r, handler));
+}
+
+fun call(inv: *ParsedInvocation, argv: **u8, r: *cli_diagnostic.Report, handler: fun(*Call) res[i64, fail.Fail]) i64 {
+    var backing: A.Allocator;
+    val made:    err[A.Error] = page.make(?backing);
+    if (sel made.err) { ret cli_diagnostic.report_fail(r, fail.refused(made.err), diagnostic.ORIGIN_NONE); }
+    var ar:     arena.Arena;
+    val opened: err[A.Error] = arena.init(?ar, ?backing, 0);
+    if (sel opened.err) { ret cli_diagnostic.report_fail(r, fail.refused(opened.err), diagnostic.ORIGIN_NONE); }
+    fin { arena.dnit(?ar); }
+    var a:     A.Allocator;
+    val armed: err[A.Error] = arena.make(?a, ?ar);
+    if (sel armed.err) { ret cli_diagnostic.report_fail(r, fail.refused(armed.err), diagnostic.ORIGIN_NONE); }
+    var cx:  Call                = Call{a: ?a, backing: ?backing, argv: argv, inv: inv, report: r};
+    val ran: res[i64, fail.Fail] = handler(?cx);
+    if (sel ran.err) { ret cli_diagnostic.report_fail(r, ran.err, diagnostic.ORIGIN_NONE); }
+    ret ran.ok;
+}
+
+# read argv against one command and run it, as dispatch does once argv[1] has named the command
+# ---
+# a:       allocator for the invocation
+# command: the command
+# argc:    length of argv
+# argv:    the argument vector, program name at argv[0]
+# ret:     the exit code
+pub fun invoke(a: *A.Allocator, command: *CommandSpec, argc: usize, argv: **u8) i64 {
+    val parsed: res[ParsedInvocation, fail.Fail] = parse_command(a, command, argc, argv);
+    if (sel parsed.err) { ret cli_diagnostic.refuse(parsed.err); }
+    var inv: ParsedInvocation = parsed.ok;
+    fin { dnit_invocation(a, ?inv); }
+    ret run(?inv, argv);
+}
+
+# the `-a`, `-t` and `-p` patterns and `--all` an invocation was given
+# ---
+# a:    backs the pattern vectors
+# inv:  the parsed invocation
+# argv: the argument vector inv was parsed from
+# ret:  the selectors; err when a vector cannot grow
+pub fun collect_selectors(a: *A.Allocator, inv: *ParsedInvocation, argv: **u8) res[manifest.Selectors, fail.Fail] {
     var s:         manifest.Selectors          = manifest.selectors_init(a);
-    val artifacts: res[Vector[str], fail.Fail] = invocation_values(a, cmd, inv, argv, "--artifact");
+    val artifacts: res[Vector[str], fail.Fail] = values(a, inv, argv, ?ARTIFACT);
     if (sel artifacts.err) { ret res[manifest.Selectors, fail.Fail].err{artifacts.err}; }
     s.artifacts = artifacts.ok;
-    val targets: res[Vector[str], fail.Fail] = invocation_values(a, cmd, inv, argv, "--target");
+    val targets: res[Vector[str], fail.Fail] = values(a, inv, argv, ?TARGET);
     if (sel targets.err) { ret res[manifest.Selectors, fail.Fail].err{targets.err}; }
     s.targets = targets.ok;
-    val profiles: res[Vector[str], fail.Fail] = invocation_values(a, cmd, inv, argv, "--profile");
+    val profiles: res[Vector[str], fail.Fail] = values(a, inv, argv, ?PROFILE);
     if (sel profiles.err) { ret res[manifest.Selectors, fail.Fail].err{profiles.err}; }
     s.profiles = profiles.ok;
-    s.all      = invocation_flag(cmd, inv, "--all");
+    s.all      = given(inv, ?ALL);
     ret res[manifest.Selectors, fail.Fail].ok{s};
 }
 
-# the typed request.CliArgs of a build-shaped command: verbosity 0, 1, or 2
-# from `-v` and `-vv`, quiet from `--quiet` or `-q`, the CGEN flags, the
-# selectors, `-o` and `--jobs` as raw argv pointers or nil, opt_set and
-# opt_release from `-O0` and `-O2` with `-O0` winning when both occur,
-# include_deps. link_tokens and lib_dirs are left empty for collect_link_inputs
+# the decimal worker count of a `--jobs` value, from 1 to 65536
+fun worker_count(text: str) opt[u32] {
+    if (str_len(text) == 0) { ret opt[u32].none{}; }
+    var v: u32   = 0;
+    var i: usize = 0;
+    for (text[i] != 0) {
+        if (text[i] < '0' || text[i] > '9') { ret opt[u32].none{}; }
+        v = v * 10 + (text[i] - '0')::u32;
+        if (v > 65536) { ret opt[u32].none{}; }
+        i = i + 1;
+    }
+    if (v == 0) { ret opt[u32].none{}; }
+    ret opt[u32].some{v};
+}
+
+# a selection refusal whose unknown value names a path in the working directory,
+# restated as the shell's expansion of an unquoted wildcard it almost always is;
+# any other failure is returned as given
+# ---
+# a:         owns the restated message
+# selectors: the patterns the command was given
+# f:         the failure resolving them
+pub fun selection_hint(a: *A.Allocator, selectors: *manifest.Selectors, f: fail.Fail) fail.Fail {
+    if (fail.kind_of(f) != diagnostic_kind.SELECTION_UNKNOWN) { ret f; }
+    val artifact: fail.Fail = axis_hint(a, "-a", ?selectors.artifacts, f);
+    if (fail.kind_of(artifact) != diagnostic_kind.SELECTION_UNKNOWN) { ret artifact; }
+    val target: fail.Fail = axis_hint(a, "-t", ?selectors.targets, f);
+    if (fail.kind_of(target) != diagnostic_kind.SELECTION_UNKNOWN) { ret target; }
+    ret axis_hint(a, "-p", ?selectors.profiles, f);
+}
+
+# `selection_hint` over one axis's values
+fun axis_hint(a: *A.Allocator, flag: str, values: *Vector[str], f: fail.Fail) fail.Fail {
+    val text: str   = fail.describe(f);
+    var i:    usize = 0;
+    for (i < values.len) {
+        val value:  str                 = values.data[i];
+        val quoted: res[str, fail.Fail] = fail.format(a, "'{}'", value);
+        if (sel quoted.err) { ret quoted.err; }
+        if (str_contains(text, quoted.ok)) {
+            val exists: res[bool, io_error.Error] = fs.exists(value);
+            if (sel exists.ok && exists.ok) {
+                ret fail.formatted_user(a, diagnostic_kind.CLI_FLAG_VALUE,
+                    "{} '{}' names a path in the current directory: the shell probably expanded an unquoted wildcard; quote the pattern, as in {} '*' ({})",
+                    flag, value, flag, text);
+            }
+        }
+        i = i + 1;
+    }
+    ret f;
+}
+
+# the typed request.CliArgs of a build-shaped command: verbosity 0, 1, or 2 from `-v` and `-vv`,
+# quiet, the CGEN flags, the selectors, `-o` as a raw argv pointer or nil, `--jobs` as a count or 0
+# when absent, opt_set and
+# opt_release from `-O0` and `-O2` with `-O0` winning when both occur. include_deps is false for
+# the command to set, and link_tokens and lib_dirs are left empty for collect_link_inputs
 # ---
 # a:    backs the selector patterns
-# cmd:  the command
 # inv:  the parsed invocation
 # argv: the argument vector inv was parsed from
-# ret:  the arguments, or err when `-v` or `-vv` is combined with `--quiet` or `-q`
-#       or a selector has no value
-pub fun build_cli_invocation(a: *A.Allocator, cmd: CommandId, inv: *ParsedInvocation, argv: **u8) res[request.CliArgs, fail.Fail] {
+# ret:  the arguments; err when a vector cannot grow or `--jobs` is no count
+pub fun build_cli_invocation(a: *A.Allocator, inv: *ParsedInvocation, argv: **u8) res[request.CliArgs, fail.Fail] {
     var c: request.CliArgs;
 
-    var verbosity: u8 = 0;
-    if (invocation_flag(cmd, inv, "-v"))  { verbosity = 1; }
-    if (invocation_flag(cmd, inv, "-vv")) { verbosity = 2; }
-    val quiet: bool = invocation_flag(cmd, inv, "--quiet") || invocation_flag(cmd, inv, "-q");
-    if (verbosity > 0 && quiet) {
-        ret res[request.CliArgs, fail.Fail].err{fail.user(diagnostic_kind.CLI_FLAG_CONFLICT, "`-v`/`-vv` and `--quiet`/`-q` cannot be combined")};
-    }
-
-    c.verbosity    = verbosity;
-    c.quiet        = quiet;
-    c.emit_asm     = invocation_flag(cmd, inv, "--emit-asm");
-    c.emit_ir      = invocation_flag(cmd, inv, "--emit-ir");
-    c.emit_ir_form = token_or_nil(cmd, inv, argv, "--emit-ir");
-    c.pie          = invocation_flag(cmd, inv, "--pie");
-    c.g            = invocation_flag(cmd, inv, "-g");
-
-    c.subsystem = token_or_nil(cmd, inv, argv, "--subsystem");
-    c.output    = token_or_nil(cmd, inv, argv, "-o");
-    val selectors: res[manifest.Selectors, fail.Fail] = collect_selectors(a, cmd, inv, argv);
+    c.verbosity = 0;
+    if (given(inv, ?VERBOSE))      { c.verbosity = 1; }
+    if (given(inv, ?VERBOSE_FULL)) { c.verbosity = 2; }
+    c.quiet        = given(inv, ?QUIET);
+    c.emit_asm     = given(inv, ?EMIT_ASM);
+    c.emit_ir      = given(inv, ?EMIT_IR);
+    c.emit_ir_form = value_or_nil(inv, argv, ?EMIT_IR);
+    c.pie          = given(inv, ?PIE);
+    c.g            = given(inv, ?DEBUG_INFO);
+    c.subsystem    = value_or_nil(inv, argv, ?SUBSYSTEM);
+    c.output       = value_or_nil(inv, argv, ?OUTPUT);
+    val selectors: res[manifest.Selectors, fail.Fail] = collect_selectors(a, inv, argv);
     if (sel selectors.err) { ret res[request.CliArgs, fail.Fail].err{selectors.err}; }
     c.selectors = selectors.ok;
 
     c.opt_set     = false;
     c.opt_release = false;
-    if (invocation_flag(cmd, inv, "-O0")) {
-        c.opt_set     = true;
-        c.opt_release = false;
-    }
-    or (invocation_flag(cmd, inv, "-O2")) {
+    if (given(inv, ?OPT_DEBUG)) { c.opt_set = true; }
+    or (given(inv, ?OPT_RELEASE)) {
         c.opt_set     = true;
         c.opt_release = true;
     }
 
-    c.jobs         = token_or_nil(cmd, inv, argv, "--jobs");
-    c.include_deps = invocation_flag(cmd, inv, "--include-deps");
-    c.no_cache     = invocation_flag(cmd, inv, "--no-cache");
+    c.jobs = 0;
+    val jobs: opt[*u8] = value(inv, argv, ?JOBS);
+    if (sel jobs.some) {
+        val counted: opt[u32] = worker_count(jobs.some::str);
+        if (sel counted.none) { ret res[request.CliArgs, fail.Fail].err{fail.user(diagnostic_kind.CLI_FLAG_VALUE, "--jobs expects a positive integer")}; }
+        c.jobs = counted.some;
+    }
+    c.include_deps = false;
+    c.no_cache     = given(inv, ?NO_CACHE);
 
     c.link_tokens.a    = nil;
     c.link_tokens.data = nil;
@@ -1447,31 +1508,26 @@ pub fun build_cli_invocation(a: *A.Allocator, cmd: CommandId, inv: *ParsedInvoca
     ret res[request.CliArgs, fail.Fail].ok{c};
 }
 
-# fill c.link_tokens and c.lib_dirs in command-line order: every `-l` value and
-# every bare positional after the first that request.is_object_path accepts go
-# to link_tokens, every `-L` value to lib_dirs. Both vectors are reinitialised
-# with a first
+# fill c.link_tokens and c.lib_dirs in command-line order: every `-l` value and every bare
+# positional after the first that request.is_object_path accepts go to link_tokens, every `-L`
+# value to lib_dirs. Both vectors are reinitialised with a first
 # ---
 # a:    allocator for the two vectors
 # c:    the arguments to fill
-# cmd:  the command
 # inv:  the parsed invocation
 # argv: the argument vector inv was parsed from
 # ret:  ok, or err when a push fails
-pub fun collect_link_inputs(a: *A.Allocator, c: *request.CliArgs, cmd: CommandId, inv: *ParsedInvocation, argv: **u8) err[fail.Fail] {
+pub fun collect_link_inputs(a: *A.Allocator, c: *request.CliArgs, inv: *ParsedInvocation, argv: **u8) err[fail.Fail] {
     c.link_tokens = collections_vector.init[*u8](a);
     c.lib_dirs    = collections_vector.init[*u8](a);
-
-    val l_hit: SchemaHit = schema_lookup(cmd, DEPACT_NONE, "-l");
-    val L_hit: SchemaHit = schema_lookup(cmd, DEPACT_NONE, "-L");
 
     var oi: usize = 0;
     var pi: usize = 1;
     for (oi < inv.occ_len || pi < inv.positional_count) {
         if (oi < inv.occ_len) {
             val o:           Occurrence = inv.occ[oi];
-            val is_lib_dir:  bool       = L_hit.found && o.key == L_hit.key;
-            val is_link_tok: bool       = l_hit.found && o.key == l_hit.key;
+            val is_lib_dir:  bool       = o.row == ?LIB_DIR;
+            val is_link_tok: bool       = o.row == ?LIB;
             if (!is_lib_dir && !is_link_tok) {
                 oi = oi + 1;
                 cnt;
@@ -1509,722 +1565,247 @@ pub fun collect_link_inputs(a: *A.Allocator, c: *request.CliArgs, cmd: CommandId
 }
 
 #[testing]
-fun ut_alloc() A.Allocator {
-    var backing: A.Allocator;
-    page.make(?backing);
-    ret backing;
+fun t_run(cx: *Call) res[i64, fail.Fail] {
+    ret res[i64, fail.Fail].ok{0};
 }
 
 #[testing]
-fun ut_build_cli(cmd: CommandId, argc: usize, argv: **u8) opt[request.CliArgs] {
-    var backing: A.Allocator;
-    val make_r:  err[A.Error] = page.make(?backing);
-    if (sel make_r.err) { ret opt[request.CliArgs].none{}; }
-    val ir: res[ParsedInvocation, fail.Fail] = parse_invocation(?backing, argc, argv);
-    if (sel ir.err) { ret opt[request.CliArgs].none{}; }
-    var inv: ParsedInvocation                = ir.ok;
-    val cr:  res[request.CliArgs, fail.Fail] = build_cli_invocation(?backing, cmd, ?inv, argv);
-    if (sel cr.err) { ret opt[request.CliArgs].none{}; }
-    ret opt[request.CliArgs].some{cr.ok};
-}
-
-test build_cli_invocation__emit_ir_takes_an_attached_form_and_never_the_next_token {
-    var bare: [4]*u8;
-    bare[0] = "mach";
-    bare[1] = "build";
-    bare[2] = "--emit-ir";
-    bare[3] = ".";
-    val rb: opt[request.CliArgs] = ut_build_cli(CMD_BUILD, 4, ?bare[0]);
-    if (sel rb.none)                 { ret 1; }
-    if (!rb.some.emit_ir)            { ret 1; }
-    if (rb.some.emit_ir_form != nil) { ret 1; }
-
-    var attached: [4]*u8;
-    attached[0] = "mach";
-    attached[1] = "build";
-    attached[2] = "--emit-ir=listing";
-    attached[3] = ".";
-    val ra: opt[request.CliArgs] = ut_build_cli(CMD_BUILD, 4, ?attached[0]);
-    if (sel ra.none)                                       { ret 1; }
-    if (!ra.some.emit_ir)                                  { ret 1; }
-    if (ra.some.emit_ir_form == nil)                       { ret 1; }
-    if (!str_equals(ra.some.emit_ir_form::str, "listing")) { ret 1; }
-
-    # the bare form must leave the following token a positional, not eat it
-    var backing: A.Allocator                      = ut_alloc();
-    val ir:      res[ParsedInvocation, fail.Fail] = parse_invocation(?backing, 4, ?bare[0]);
-    if (sel ir.err) { ret 1; }
-    var inv: ParsedInvocation = ir.ok;
-    if (!inv.has_positional)     { ret 1; }
-    if (inv.positional_idx != 3) { ret 1; }
-    if (inv.has_unknown)         { ret 1; }
-
-    val ia: res[ParsedInvocation, fail.Fail] = parse_invocation(?backing, 4, ?attached[0]);
-    if (sel ia.err) { ret 1; }
-    var inva: ParsedInvocation = ia.ok;
-    if (!inva.has_positional)     { ret 1; }
-    if (inva.positional_idx != 3) { ret 1; }
-    if (inva.has_unknown)         { ret 1; }
-    ret 0;
-}
-
-test flagspec__arity_matches_its_placeholder {
-    var ci: usize = 0;
-    for (ci < CMD_N) {
-        val command: *CommandSpec = ?COMMANDS[ci];
-        var ti:      usize        = 0;
-        for (ti < command.table_n) {
-            val tr: *TableRef = ?command.tables[ti];
-            var j:  usize     = 0;
-            for (j < tr.n) {
-                val row: *FlagSpec = ?tr.table[j];
-                if (row.arity == ARITY_FLAG && str_len(row.value) > 0)  { ret 1; }
-                if (row.arity != ARITY_FLAG && str_len(row.value) == 0) { ret 1; }
-                j = j + 1;
-            }
-            ti = ti + 1;
-        }
-        ci = ci + 1;
-    }
-    ret 0;
-}
-
-test build_cli_invocation__o0_and_o2_set_the_release_boolean {
-    var a0: [4]*u8;
-    a0[0] = "mach";
-    a0[1] = "build";
-    a0[2] = "-O0";
-    a0[3] = ".";
-    val r0: opt[request.CliArgs] = ut_build_cli(CMD_BUILD, 4, ?a0[0]);
-    if (sel r0.none) { ret 1; }
-    val c0: request.CliArgs = r0.some;
-    if (!c0.opt_set)    { ret 1; }
-    if (c0.opt_release) { ret 1; }
-
-    var a2: [4]*u8;
-    a2[0] = "mach";
-    a2[1] = "build";
-    a2[2] = "-O2";
-    a2[3] = ".";
-    val r2: opt[request.CliArgs] = ut_build_cli(CMD_BUILD, 4, ?a2[0]);
-    if (sel r2.none) { ret 1; }
-    val c2: request.CliArgs = r2.some;
-    if (!c2.opt_set)     { ret 1; }
-    if (!c2.opt_release) { ret 1; }
-
-    var an: [3]*u8;
-    an[0] = "mach";
-    an[1] = "build";
-    an[2] = ".";
-    val rn: opt[request.CliArgs] = ut_build_cli(CMD_BUILD, 3, ?an[0]);
-    if (sel rn.none)     { ret 1; }
-    if (rn.some.opt_set) { ret 1; }
-    ret 0;
-}
-
-test collect_link_inputs__preserves_command_line_order_across_flags_and_bare_paths {
-    var backing: A.Allocator;
-    val make_r:  err[A.Error] = page.make(?backing);
-    if (sel make_r.err) { ret 1; }
-
-    var a: [8]*u8;
-    a[0] = "mach";
-    a[1] = "build";
-    a[2] = ".";
-    a[3] = "one.o";
-    a[4] = "-l";
-    a[5] = "two";
-    a[6] = "-L";
-    a[7] = "dir";
-    val n: usize = 8;
-
-    val ir: res[ParsedInvocation, fail.Fail] = parse_invocation(?backing, n, ?a[0]);
-    if (sel ir.err) { ret 1; }
-    var inv: ParsedInvocation = ir.ok;
-
-    var c:                     request.CliArgs;
-    val collect_link_inputs_r: err[fail.Fail] = collect_link_inputs(?backing, ?c, CMD_BUILD, ?inv, ?a[0]);
-    if (sel collect_link_inputs_r.err) { ret 1; }
-
-    if (c.link_tokens.len != 2)                           { ret 1; }
-    if (!str_equals(c.link_tokens.data[0]::str, "one.o")) { ret 1; }
-    if (!str_equals(c.link_tokens.data[1]::str, "two"))   { ret 1; }
-    if (c.lib_dirs.len != 1)                              { ret 1; }
-    if (!str_equals(c.lib_dirs.data[0]::str, "dir"))      { ret 1; }
-    ret 0;
-}
-
-test build_cli_invocation__quiet_is_refused_with_verbose {
-    var q:  [3]*u8               = [3]*u8{"mach", "test", "-q"};
-    val rq: opt[request.CliArgs] = ut_build_cli(CMD_TEST, 3, ?q[0]);
-    if (sel rq.none)    { ret 1; }
-    if (!rq.some.quiet) { ret 2; }
-
-    var qv:  [4]*u8               = [4]*u8{"mach", "test", "--quiet", "-v"};
-    val rqv: opt[request.CliArgs] = ut_build_cli(CMD_TEST, 4, ?qv[0]);
-    if (sel rqv.some) { ret 3; }
-    ret 0;
-}
-
-# the typed arguments of mach init
-# ---
-# has_dir:  a positional directory was given
-# dir_idx:  argv index of that directory
-# has_name: `--name` occurred with a value
-# name_idx: argv index of the name value
-# force:    `--force`
-# is_lib:   `--lib`
-# no_deps:  `--no-deps`
-# no_git:   `--no-git`
-# quiet:    `--quiet` or `-q`
-pub rec InitInvocation {
-    has_dir:  bool;
-    dir_idx:  usize;
-    has_name: bool;
-    name_idx: usize;
-    force:    bool;
-    is_lib:   bool;
-    no_deps:  bool;
-    no_git:   bool;
-    quiet:    bool;
-}
-
-# read the init arguments out of a parsed invocation; the directory is the
-# first positional
-# ---
-# inv: the parsed invocation
-# ret: the arguments
-pub fun build_init_invocation(inv: *ParsedInvocation) InitInvocation {
-    var r: InitInvocation;
-    r.has_dir  = inv.has_positional;
-    r.dir_idx  = inv.positional_idx;
-    r.has_name = false;
-    r.name_idx = 0;
-    r.force    = invocation_flag(CMD_INIT, inv, "--force");
-    r.is_lib   = invocation_flag(CMD_INIT, inv, "--lib");
-    r.no_deps  = invocation_flag(CMD_INIT, inv, "--no-deps");
-    r.no_git   = invocation_flag(CMD_INIT, inv, "--no-git");
-    r.quiet    = invocation_flag(CMD_INIT, inv, "--quiet") || invocation_flag(CMD_INIT, inv, "-q");
-
-    val name_hit: SchemaHit = schema_lookup(CMD_INIT, DEPACT_NONE, "--name");
-    var i:        usize     = 0;
-    for (i < inv.occ_len) {
-        val o: Occurrence = inv.occ[i];
-        if (o.key == name_hit.key && o.has_value) {
-            r.has_name = true;
-            r.name_idx = o.value_idx;
-        }
-        i = i + 1;
-    }
-    ret r;
-}
-
+val T_NAME:       FlagSpec     = FlagSpec{name: "--name", value: "id", arity: ARITY_VALUE, doc: "name", default: "", repeatable: false, alias_of: nil};
 #[testing]
-fun ut_new_marks(argc: usize, argv: **u8) res[*bool, fail.Fail] {
-    var backing: A.Allocator;
-    val make_r:  err[A.Error] = page.make(?backing);
-    if (sel make_r.err) { ret res[*bool, fail.Fail].err{fail.message("alloc")}; }
-    val ir: res[ParsedInvocation, fail.Fail] = parse_invocation(?backing, argc, argv);
-    if (sel ir.err) { ret res[*bool, fail.Fail].err{ir.err}; }
-    val inv: ParsedInvocation = ir.ok;
-    ret res[*bool, fail.Fail].ok{inv.marks};
+val T_NAME_SHORT: FlagSpec     = FlagSpec{name: "-n", value: "id", arity: ARITY_VALUE, doc: "name", default: "", repeatable: false, alias_of: ?T_NAME};
+#[testing]
+val T_MANY:       FlagSpec     = FlagSpec{name: "--many", value: "x", arity: ARITY_VALUE, doc: "many", default: "", repeatable: true, alias_of: nil};
+#[testing]
+val T_FLAG:       FlagSpec     = FlagSpec{name: "--flag", value: "", arity: ARITY_FLAG, doc: "flag", default: "", repeatable: false, alias_of: nil};
+#[testing]
+val T_OTHER:      FlagSpec     = FlagSpec{name: "--other", value: "", arity: ARITY_FLAG, doc: "other", default: "", repeatable: false, alias_of: nil};
+#[testing]
+val T_NEED:       FlagSpec     = FlagSpec{name: "--need", value: "", arity: ARITY_FLAG, doc: "need", default: "", repeatable: false, alias_of: nil};
+#[testing]
+val T_OWN:        [6]*FlagSpec = [6]*FlagSpec{?T_NAME, ?T_NAME_SHORT, ?T_MANY, ?T_FLAG, ?T_OTHER, ?T_NEED};
+#[testing]
+val T_TABLES:     [3]TableRef  = [3]TableRef{
+    TableRef{rows: ?VERBOSITY[0], n: VERBOSITY_N, accepted: nil, docs: nil},
+    TableRef{rows: ?QUIETNESS[0], n: QUIETNESS_N, accepted: nil, docs: nil},
+    TableRef{rows: ?T_OWN[0], n: 6, accepted: nil, docs: nil},
+};
+#[testing]
+val T_REFUSED:   [1]TableRef = [1]TableRef{TableRef{rows: ?CGEN[0], n: CGEN_N, accepted: nil, docs: nil}};
+#[testing]
+val T_RELATIONS: [2]Relation = [2]Relation{
+    Relation{kind: RELATION_REQUIRES, row: ?T_NEED, other: ?T_FLAG},
+    Relation{kind: RELATION_CONFLICTS, row: ?T_FLAG, other: ?T_OTHER},
+};
+#[testing]
+val T_PROBE:      CommandSpec   = CommandSpec{name: "probe", aliases: nil, alias_n: 0, grammar: " <path> [<path>]", summary: "probe", effect: "probe", exits: nil, exit_n: 0, terminator: "", tables: ?T_TABLES[0], table_n: 3, refused: ?T_REFUSED[0], refused_n: 1, refusal: "probe runs nothing", relations: ?T_RELATIONS[0], relation_n: 2, constraints: nil, constraint_n: 0, operand_min: 1, operand_max: 2, truncate_at_sep: false, actions: nil, action_n: 0, examples: nil, example_n: 0, run: t_run};
+#[testing]
+val T_ONE_OWN:    [1]*FlagSpec  = [1]*FlagSpec{?T_FLAG};
+#[testing]
+val T_ONE_TABLES: [1]TableRef   = [1]TableRef{TableRef{rows: ?T_ONE_OWN[0], n: 1, accepted: nil, docs: nil}};
+#[testing]
+val T_ACTIONS:    [1]ActionSpec = [1]ActionSpec{
+    ActionSpec{name: "one", id: 0, grammar: " <path>", effect: "one", exits: nil, exit_n: 0, tables: ?T_ONE_TABLES[0], table_n: 1, relations: nil, relation_n: 0, constraints: nil, constraint_n: 0, operand_min: 1, operand_max: 1, examples: nil, example_n: 0},
+};
+#[testing]
+val T_ACTED:          CommandSpec     = CommandSpec{name: "acted", aliases: nil, alias_n: 0, grammar: " <action>", summary: "acted", effect: "acted", exits: nil, exit_n: 0, terminator: "", tables: ?T_TABLES[0], table_n: 1, refused: nil, refused_n: 0, refusal: "", relations: nil, relation_n: 0, constraints: nil, constraint_n: 0, operand_min: 0, operand_max: OPERANDS_ANY, truncate_at_sep: false, actions: ?T_ACTIONS[0], action_n: 1, examples: nil, example_n: 0, run: t_run};
+#[testing]
+val T_SPECS:          [2]*CommandSpec = [2]*CommandSpec{?T_PROBE, ?T_ACTED};
+#[testing]
+val T_GLOBALS:        [1]Global       = [1]Global{Global{row: ?T_FLAG, command: ?T_PROBE}};
+#[testing]
+val T_SET:            CommandSet      = CommandSet{specs: ?T_SPECS[0], n: 2, help: ?T_ACTED, globals: ?T_GLOBALS[0], global_n: 1};
+#[testing]
+val T_RENAMED:        FlagSpec        = FlagSpec{name: "--name", value: "id", arity: ARITY_VALUE, doc: "another name", default: "", repeatable: false, alias_of: nil};
+#[testing]
+val T_RENAMED_OWN:    [1]*FlagSpec    = [1]*FlagSpec{?T_RENAMED};
+#[testing]
+val T_RENAMED_TABLES: [1]TableRef     = [1]TableRef{TableRef{rows: ?T_RENAMED_OWN[0], n: 1, accepted: nil, docs: nil}};
+#[testing]
+val T_RENAMING:       CommandSpec     = CommandSpec{name: "renaming", aliases: nil, alias_n: 0, grammar: "", summary: "renaming", effect: "renaming", exits: nil, exit_n: 0, terminator: "", tables: ?T_RENAMED_TABLES[0], table_n: 1, refused: nil, refused_n: 0, refusal: "", relations: nil, relation_n: 0, constraints: nil, constraint_n: 0, operand_min: 0, operand_max: 0, truncate_at_sep: false, actions: nil, action_n: 0, examples: nil, example_n: 0, run: t_run};
+#[testing]
+val T_HELPING:        FlagSpec        = FlagSpec{name: "-h", value: "", arity: ARITY_FLAG, doc: "a help of its own", default: "", repeatable: false, alias_of: nil};
+#[testing]
+val T_HELPING_OWN:    [1]*FlagSpec    = [1]*FlagSpec{?T_HELPING};
+#[testing]
+val T_HELPING_TABLES: [1]TableRef     = [1]TableRef{TableRef{rows: ?T_HELPING_OWN[0], n: 1, accepted: nil, docs: nil}};
+#[testing]
+val T_HELPFUL:        CommandSpec     = CommandSpec{name: "helpful", aliases: nil, alias_n: 0, grammar: "", summary: "helpful", effect: "helpful", exits: nil, exit_n: 0, terminator: "", tables: ?T_HELPING_TABLES[0], table_n: 1, refused: nil, refused_n: 0, refusal: "", relations: nil, relation_n: 0, constraints: nil, constraint_n: 0, operand_min: 0, operand_max: 0, truncate_at_sep: false, actions: nil, action_n: 0, examples: nil, example_n: 0, run: t_run};
+#[testing]
+val T_CLASHING:       [2]*CommandSpec = [2]*CommandSpec{?T_PROBE, ?T_RENAMING};
+#[testing]
+val T_SHADOWING:      [1]*CommandSpec = [1]*CommandSpec{?T_HELPFUL};
+
+# the invocation argv reads as against the probe commands
+#[testing]
+fun t_parse(argc: usize, argv: **u8) ParsedInvocation {
+    var a: A.Allocator;
+    page.make(?a);
+    val parsed: res[ParsedInvocation, fail.Fail] = parse_invocation(?a, T_SET, argc, argv);
+    if (sel parsed.err) { ret invocation_init(0); }
+    ret parsed.ok;
 }
 
-# the removal message for an option the cli no longer offers, so every command refuses it the same way
-# ---
-# tok: the flag-shaped token
-# ret: the message when `tok` names a removed option
-fun removed_option_message(tok: str) opt[str] {
-    if (str_equals(tok, "-O1")) { ret opt[str].some{OPT_O1_REMOVED_ERROR}; }
-    ret opt[str].none{};
-}
-
-# the refusal of the first unrecognized flag-shaped token: `cli.flag_unknown`, or
-# `cli.flag_removed` with the removal message when the token names a removed option
-# ---
-# a:    owns the message
-# inv:  the parsed invocation
-# argv: the argument vector inv was parsed from
-# cmd:  the command name the message names
-# ret:  the refusal, or none when every token was recognized
-pub fun unknown_flag(a: *A.Allocator, inv: *ParsedInvocation, argv: **u8, cmd: str) opt[fail.Fail] {
-    if (!inv.has_unknown) { ret opt[fail.Fail].none{}; }
-    val tok:     str      = argv[inv.unknown_idx]::str;
-    val removed: opt[str] = removed_option_message(tok);
-    if (sel removed.some) { ret opt[fail.Fail].some{fail.user(diagnostic_kind.CLI_FLAG_REMOVED, removed.some)}; }
-    val said: res[str, std_format.FormatError] = std_format.sprint(a, "unknown flag '{}' for '{}'", tok, cmd);
-    if (sel said.err) { ret opt[fail.Fail].some{fail.message("out of memory")}; }
-    ret opt[fail.Fail].some{fail.user(diagnostic_kind.CLI_FLAG_UNKNOWN, said.ok)};
-}
-
-# print the refusal `unknown_flag` names for the first unrecognized flag-shaped token
-# ---
-# inv:  the parsed invocation
-# argv: the argument vector inv was parsed from
-# cmd:  the command name printed in the message
-# ret:  true when an unknown token was reported, false when there was none
-pub fun reject_unknown_from_invocation(inv: *ParsedInvocation, argv: **u8, cmd: str) bool {
-    if (!inv.has_unknown) { ret false; }
+# the kind of the refusal parsing argv against the probe commands records; NONE when there is none
+#[testing]
+fun t_refusal(argc: usize, argv: **u8) diagnostic_kind.Kind {
     var a:    A.Allocator;
     val made: err[A.Error] = page.make(?a);
-    if (sel made.err) {
-        cli_diagnostic.refuse(fail.refused(made.err));
-        ret true;
-    }
-    val refused: opt[fail.Fail] = unknown_flag(?a, inv, argv, cmd);
-    if (sel refused.some) { cli_diagnostic.refuse(refused.some); }
-    ret true;
+    if (sel made.err) { ret diagnostic_kind.CLI_UNKNOWN_COMMAND; }
+    val parsed: res[ParsedInvocation, fail.Fail] = parse_invocation(?a, T_SET, argc, argv);
+    if (sel parsed.err) { ret diagnostic_kind.CLI_UNKNOWN_COMMAND; }
+    var inv: ParsedInvocation = parsed.ok;
+    fin { dnit_invocation(?a, ?inv); }
+    if (sel inv.refusal.some) { ret fail.kind_of(inv.refusal.some); }
+    ret diagnostic_kind.NONE;
 }
 
-# the typed arguments of mach info
-# ---
-# show_version: `--version` occurred
-# show_targets: the sole positional was `targets`
-# invalid_verb: a positional other than `targets` was given, or more than one positional
-pub rec InfoInvocation {
-    show_version: bool;
-    show_targets: bool;
-    invalid_verb: bool;
-}
-
-# read the info arguments out of a parsed invocation
-# ---
-# inv:  the parsed invocation
-# argv: the argument vector inv was parsed from
-# ret:  the arguments; `--version` together with `targets` sets both flags and is left for the command to refuse
-pub fun build_info_invocation(inv: *ParsedInvocation, argv: **u8) InfoInvocation {
-    var r: InfoInvocation;
-    r.show_version = false;
-    r.show_targets = false;
-    r.invalid_verb = false;
-
-    val version_hit: SchemaHit = schema_lookup(CMD_INFO, DEPACT_NONE, "--version");
-    var i:           usize     = 0;
-    for (i < inv.occ_len) {
-        if (inv.occ[i].key == version_hit.key) { r.show_version = true; }
-        i = i + 1;
-    }
-    if (inv.has_positional) {
-        if (str_equals(argv[inv.positional_idx]::str, "targets")) { r.show_targets = true; }
-        or                                                        { r.invalid_verb = true; }
-    }
-    if (inv.positional_count > 1) { r.invalid_verb = true; }
-    ret r;
-}
-
-# the typed arguments of mach clean
-# ---
-# has_project: a positional project path was given
-# project_idx: argv index of that path
-pub rec CleanInvocation {
-    has_project: bool;
-    project_idx: usize;
-}
-
-# read the clean arguments out of a parsed invocation; the project is the first positional
-# ---
-# inv: the parsed invocation
-# ret: the arguments
-pub fun build_clean_invocation(inv: *ParsedInvocation) CleanInvocation {
-    var r: CleanInvocation;
-    r.has_project = inv.has_positional;
-    r.project_idx = inv.positional_idx;
-    ret r;
-}
-
-# the typed arguments of mach doc
-# ---
-# has_out:     `--out` occurred with a value
-# out_idx:     argv index of the out value
-# quiet:       `--quiet` or `-q`
-# has_project: a positional project path was given
-# project_idx: argv index of that path
-pub rec DocInvocation {
-    has_out:     bool;
-    out_idx:     usize;
-    quiet:       bool;
-    has_project: bool;
-    project_idx: usize;
-}
-
-# read the doc arguments out of a parsed invocation; the project is the first
-# positional, and the last occurrence of a value option wins
-# ---
-# inv: the parsed invocation
-# ret: the arguments
-pub fun build_doc_invocation(inv: *ParsedInvocation) DocInvocation {
-    var r: DocInvocation;
-    r.has_out     = false;
-    r.out_idx     = 0;
-    r.quiet       = false;
-    r.has_project = inv.has_positional;
-    r.project_idx = inv.positional_idx;
-
-    val out_hit:   SchemaHit = schema_lookup(CMD_DOC, DEPACT_NONE, "--out");
-    val quiet_hit: SchemaHit = schema_lookup(CMD_DOC, DEPACT_NONE, "--quiet");
-    val q_hit:     SchemaHit = schema_lookup(CMD_DOC, DEPACT_NONE, "-q");
-
-    var i: usize = 0;
-    for (i < inv.occ_len) {
-        val o: Occurrence = inv.occ[i];
-        if (o.key == out_hit.key && o.has_value) {
-            r.has_out = true;
-            r.out_idx = o.value_idx;
-        }
-        or (o.key == quiet_hit.key) { r.quiet = true; }
-        or (o.key == q_hit.key)     { r.quiet = true; }
-        i = i + 1;
-    }
-    ret r;
-}
-
-# argv-backed dependency operands and options from the shared parser.
-pub rec DepInvocation {
-    has_action:          bool;
-    action:              DepAction;
-    quiet:               bool;
-    all:                 bool;
-    purge:               bool;
-    project_idx:         usize;
-    name_idx:            usize;
-    operand_count:       usize;
-    missing_value_idx:   usize;
-    duplicate_value_idx: usize;
-    git:                 opt[*u8];
-    path:                opt[*u8];
-    ref:                 opt[*u8];
-    version:             opt[*u8];
-    lowest:              bool;
-    offline:             bool;
-    release:             bool;
-}
-
-pub fun build_dep_invocation(inv: *ParsedInvocation, argv: **u8) DepInvocation {
-    var r: DepInvocation;
-    r.has_action          = inv.has_action;
-    r.action              = inv.action;
-    r.project_idx         = inv.positional_idx;
-    r.name_idx            = inv.argc;
-    r.operand_count       = inv.positional_count;
-    r.missing_value_idx   = inv.argc;
-    r.duplicate_value_idx = inv.argc;
-    r.git                 = opt[*u8].none{};
-    r.path                = opt[*u8].none{};
-    r.ref                 = opt[*u8].none{};
-    r.version             = opt[*u8].none{};
-    if (inv.positional_count > 1) { r.name_idx = inv.positional_idxs[1]; }
-
-    var i: usize = 0;
-    for (i < inv.occ_len) {
-        val o:        Occurrence = inv.occ[i];
-        val spelling: str        = argv[o.idx]::str;
-        val hit:      SchemaHit  = schema_lookup(CMD_DEP, inv.action, spelling);
-        if (hit.arity == ARITY_VALUE && !o.has_value) {
-            if (r.missing_value_idx == inv.argc) { r.missing_value_idx = o.idx; }
-        }
-        or (str_equals(spelling, "--quiet") || str_equals(spelling, "-q")) { r.quiet = true; }
-        or (str_equals(spelling, "--all"))                                 { r.all = true; }
-        or (str_equals(spelling, "--purge"))                               { r.purge = true; }
-        or (str_equals(spelling, "--lowest"))                              { r.lowest = true; }
-        or (str_equals(spelling, "--offline"))                             { r.offline = true; }
-        or (str_equals(spelling, "--release"))                             { r.release = true; }
-        or (str_equals(spelling, "--version") && o.has_value) {
-            if (sel r.version.some) { r.duplicate_value_idx = o.idx; }
-            or                      { r.version = opt[*u8].some{argv[o.value_idx]}; }
-        }
-        or (str_equals(spelling, "--git") && o.has_value) {
-            if (sel r.git.some) { r.duplicate_value_idx = o.idx; }
-            or                  { r.git = opt[*u8].some{argv[o.value_idx]}; }
-        }
-        or (str_equals(spelling, "--path") && o.has_value) {
-            if (sel r.path.some) { r.duplicate_value_idx = o.idx; }
-            or                   { r.path = opt[*u8].some{argv[o.value_idx]}; }
-        }
-        or (str_equals(spelling, "--ref") && o.has_value) {
-            if (sel r.ref.some) { r.duplicate_value_idx = o.idx; }
-            or                  { r.ref = opt[*u8].some{argv[o.value_idx]}; }
-        }
-        i = i + 1;
-    }
-    ret r;
-}
-
-# the typed arguments of mach run beside its selectors; each value option is an index into argv
-# ---
-# has_output:  `-o` occurred with a value
-# output_idx:  argv index of the output value
-# output_seen: `-o` occurred at all, with or without a value
-# has_runner:  `--runner` occurred with a value
-# runner_idx:  argv index of the runner value
-# has_timeout: `--timeout` occurred with a value
-# timeout_idx: argv index of the timeout value
-pub rec RunInvocation {
-    has_output:  bool;
-    output_idx:  usize;
-    output_seen: bool;
-    has_runner:  bool;
-    runner_idx:  usize;
-    has_timeout: bool;
-    timeout_idx: usize;
-}
-
-# read the run arguments out of a parsed invocation; the last occurrence of a
-# value option wins, and a trailing `-o` without a value sets output_seen only
-# ---
-# inv: the parsed invocation
-# ret: the arguments
-pub fun build_run_invocation(inv: *ParsedInvocation) RunInvocation {
-    var r: RunInvocation;
-    r.has_output  = false;
-    r.output_idx  = 0;
-    r.output_seen = false;
-    r.has_runner  = false;
-    r.runner_idx  = 0;
-    r.has_timeout = false;
-    r.timeout_idx = 0;
-
-    val output_hit:  SchemaHit = schema_lookup(CMD_RUN, DEPACT_NONE, "-o");
-    val runner_hit:  SchemaHit = schema_lookup(CMD_RUN, DEPACT_NONE, "--runner");
-    val timeout_hit: SchemaHit = schema_lookup(CMD_RUN, DEPACT_NONE, "--timeout");
-
-    var i: usize = 0;
-    for (i < inv.occ_len) {
-        val o: Occurrence = inv.occ[i];
-        if (o.key == output_hit.key) {
-            r.output_seen = true;
-            if (o.has_value) {
-                r.has_output = true;
-                r.output_idx = o.value_idx;
-            }
-        }
-        if (!o.has_value) {
-            i = i + 1;
-            cnt;
-        }
-        if (o.key == runner_hit.key) {
-            r.has_runner = true;
-            r.runner_idx = o.value_idx;
-        }
-        or (o.key == timeout_hit.key) {
-            r.has_timeout = true;
-            r.timeout_idx = o.value_idx;
-        }
-        i = i + 1;
-    }
-    ret r;
-}
-
-#[testing]
-fun ut_unknown_at(argc: usize, argv: **u8, idx: usize) bool {
-    var backing: A.Allocator;
-    val make_r:  err[A.Error] = page.make(?backing);
-    if (sel make_r.err) { ret false; }
-    val ir: res[ParsedInvocation, fail.Fail] = parse_invocation(?backing, argc, argv);
-    if (sel ir.err) { ret false; }
-    val inv: ParsedInvocation = ir.ok;
-    if (idx == argc) { ret !inv.has_unknown; }
-    ret inv.has_unknown && inv.unknown_idx == idx;
-}
-
-test parse_invocation__an_option_the_command_does_not_accept_is_unknown_by_name {
-    var a: [5]*u8;
-    a[0] = "mach";
-    a[1] = "doc";
-    a[2] = ".";
-    a[3] = "-o";
-    a[4] = "x";
-    if (!ut_unknown_at(5, ?a[0], 3)) { ret 1; }
-    a[3] = "--profile";
-    a[4] = "nonesuch";
-    if (!ut_unknown_at(5, ?a[0], 3)) { ret 2; }
-    a[3] = "--emit-ir";
-    if (!ut_unknown_at(4, ?a[0], 3)) { ret 3; }
-    a[3] = "-v";
-    if (!ut_unknown_at(4, ?a[0], 3)) { ret 4; }
-    a[3] = "-a";
-    a[4] = "b";
-    if (!ut_unknown_at(5, ?a[0], 5)) { ret 5; }
-    a[1] = "run";
-    a[3] = "--all";
-    if (!ut_unknown_at(4, ?a[0], 3)) { ret 6; }
-    a[3] = "-t";
-    a[4] = "x";
-    if (!ut_unknown_at(5, ?a[0], 5)) { ret 7; }
-    a[1] = "build";
-    a[3] = "-o";
-    a[4] = "x";
-    if (!ut_unknown_at(5, ?a[0], 5))                                                                           { ret 8; }
-    if (schema_lookup(CMD_DOC, DEPACT_NONE, "-o").found || !schema_lookup(CMD_BUILD, DEPACT_NONE, "-o").found) { ret 9; }
+test schema_valid__the_probe_commands_are_well_formed {
+    if (!schema_valid(T_SET)) { ret 1; }
     ret 0;
 }
 
-test reject_unknown__a_removed_option_is_unknown_to_every_command_and_carries_its_removal_message {
-    var a: [4]*u8;
-    a[0] = "mach";
-    a[1] = "build";
-    a[2] = "-O1";
-    a[3] = ".";
-    if (!ut_unknown_at(4, ?a[0], 2)) { ret 1; }
-    a[1] = "test";
-    if (!ut_unknown_at(4, ?a[0], 2)) { ret 2; }
-    a[1] = "run";
-    if (!ut_unknown_at(4, ?a[0], 2)) { ret 3; }
-    val msg: opt[str] = removed_option_message("-O1");
-    if (sel msg.none)                                { ret 4; }
-    if (!str_equals(msg.some, OPT_O1_REMOVED_ERROR)) { ret 4; }
-    val removed_option_message_r: opt[str] = removed_option_message("-O2");
-    if (sel removed_option_message_r.some) { ret 5; }
-    ret 0;
-}
-
-test schema__records_are_total_unique_and_unambiguous {
-    if (!schema_valid()) { ret 1; }
-    ret 0;
-}
-
-test parse_invocation__build_repeated_link_options_mark_every_occurrence {
-    var a: [8]*u8;
-    a[0] = "mach";
-    a[1] = "build";
-    a[2] = "-l";
-    a[3] = "one";
-    a[4] = "-l";
-    a[5] = "two";
-    a[6] = "-L";
-    a[7] = "dir";
-    val n: usize = 8;
-
-    val nr: res[*bool, fail.Fail] = ut_new_marks(n, ?a[0]);
-    if (sel nr.err) { ret 1; }
-    val nw: *bool = nr.ok;
-    var i:  usize = 2;
-    for (i < n) {
-        if (!nw[i]) { ret 1; }
-        i = i + 1;
-    }
-    if (nw[0] || nw[1]) { ret 1; }
-    ret 0;
-}
-
-test parse_invocation__run_truncates_at_separator_and_forwards_the_rest {
-    var a: [7]*u8;
-    a[0] = "mach";
-    a[1] = "run";
-    a[2] = "--target";
-    a[3] = "linux";
-    a[4] = "--";
-    a[5] = "--runner";
-    a[6] = "wine";
-    val n: usize = 7;
-
-    val nr: res[*bool, fail.Fail] = ut_new_marks(n, ?a[0]);
-    if (sel nr.err) { ret 1; }
-    val nw: *bool = nr.ok;
-    if (!nw[2] || !nw[3])        { ret 1; }
-    if (nw[4] || nw[5] || nw[6]) { ret 1; }
-    ret 0;
-}
-
-test parse_invocation__a_command_without_options_marks_nothing {
-    var a: [4]*u8 = [4]*u8{"mach", "clean", "--bogus", "."};
-    var c: usize  = 0;
-    for (c < 2) {
-        if (c == 1) {
-            a[1] = "help";
-            a[3] = "build";
-        }
-        val nr: res[*bool, fail.Fail] = ut_new_marks(4, ?a[0]);
-        if (sel nr.err) { ret 1; }
-        val nw: *bool = nr.ok;
-        if (nw[2] || nw[3]) { ret 2; }
-        c = c + 1;
-    }
-    ret 0;
-}
-
-test parse_invocation__doc_marks_its_own_options_and_leaves_a_build_only_flag_unknown {
-    var a: [6]*u8;
-    a[0] = "mach";
-    a[1] = "doc";
-    a[2] = "--out";
-    a[3] = "docs";
-    a[4] = "--pie";
-    a[5] = ".";
-    val n: usize = 6;
-
-    val nr: res[*bool, fail.Fail] = ut_new_marks(n, ?a[0]);
-    if (sel nr.err) { ret 1; }
-    val nw: *bool = nr.ok;
-    if (!nw[2] || !nw[3] || nw[4] || nw[5]) { ret 1; }
-    if (!ut_unknown_at(n, ?a[0], 4))        { ret 1; }
-    ret 0;
-}
-
-test parse_invocation__unknown_command_and_unknown_dep_action_leave_command_unset {
-    var a: [3]*u8;
-    a[0] = "mach";
-    a[1] = "bogus";
-    a[2] = "x";
-    var backing: A.Allocator;
-    val make_r:  err[A.Error] = page.make(?backing);
-    if (sel make_r.err) { ret 1; }
-    val r: res[ParsedInvocation, fail.Fail] = parse_invocation(?backing, 3, ?a[0]);
-    if (sel r.err)        { ret 1; }
-    if (r.ok.has_command) { ret 1; }
-
-    var b: [3]*u8;
-    b[0] = "mach";
-    b[1] = "dep";
-    b[2] = "bogus";
-    val r2: res[ParsedInvocation, fail.Fail] = parse_invocation(?backing, 3, ?b[0]);
-    if (sel r2.err) { ret 1; }
-    val inv2: ParsedInvocation = r2.ok;
-    if (!inv2.has_command || inv2.has_action) { ret 1; }
-    ret 0;
-}
-
-# `--no-cache` is the one cache option: `--cache` is unknown everywhere
-test cache__no_cache_is_the_one_cache_option {
-    var a:      A.Allocator;
-    val make_r: err[A.Error] = page.make(?a);
-    if (sel make_r.err) { ret 1; }
-    var argv: [4]*u8 = [4]*u8{"mach", "build", "project", "--no-cache"};
-    var i:    u32    = 0;
-    for (i < 2) {
-        if (i == 1) { argv[1] = "test"; }
-        val parsed: res[ParsedInvocation, fail.Fail] = parse_invocation(?a, 4, ?argv[0]);
-        if (sel parsed.err) { ret 2; }
-        var inv: ParsedInvocation = parsed.ok;
-        fin { dnit_invocation(?a, ?inv); }
-        if (inv.has_unknown || inv.positional_count != 1 || inv.positional_idx != 2) { ret 3; }
-        val configured: res[CliArgs, fail.Fail] = build_cli_invocation(?a, inv.command, ?inv, ?argv[0]);
-        if (sel configured.err) { ret 4; }
-        val c: CliArgs = configured.ok;
-        if (!c.no_cache) { ret 5; }
-        i = i + 1;
-    }
-    argv[3] = "--cache";
-    var commands: [3]*u8 = [3]*u8{"build", "test", "run"};
-    i = 0;
-    for (i < 3) {
-        argv[1] = commands[i];
-        if (!ut_unknown_at(4, ?argv[0], 3)) { ret 6 + i::i32; }
-        i = i + 1;
-    }
-    ret 0;
-}
-
-test parse_invocation__a_lone_dash_is_a_positional_not_an_unknown_flag {
-    var a:      A.Allocator;
-    val make_r: err[A.Error] = page.make(?a);
-    if (sel make_r.err) { ret 1; }
-    var argv:   [4]*u8                           = [4]*u8{"mach", "fmt", "-", "--check"};
-    val parsed: res[ParsedInvocation, fail.Fail] = parse_invocation(?a, 4, ?argv[0]);
+test parse_invocation__an_alias_is_recorded_as_its_canonical_row {
+    var a:    A.Allocator;
+    val made: err[A.Error] = page.make(?a);
+    if (sel made.err) { ret 1; }
+    var argv:   [4]*u8                           = [4]*u8{"mach", "probe", "-n", "x"};
+    var argv2:  [5]*u8                           = [5]*u8{"mach", "probe", "-n", "x", "."};
+    val parsed: res[ParsedInvocation, fail.Fail] = parse_command(?a, ?T_PROBE, 5, ?argv2[0]);
     if (sel parsed.err) { ret 2; }
     var inv: ParsedInvocation = parsed.ok;
     fin { dnit_invocation(?a, ?inv); }
-    if (inv.command != CMD_FMT || inv.positional_count != 1 || inv.positional_idx != 2
-        || inv.has_unknown || !invocation_flag(CMD_FMT, ?inv, "--check")) { ret 3; }
-    if (util.arg_is_flag("-") || !util.arg_is_flag("--") || !util.arg_is_flag("-o")) { ret 4; }
+    if (sel inv.refusal.some)                                { ret 3; }
+    if (inv.occ_len != 1 || inv.occ[0].row != ?T_NAME)       { ret 4; }
+    if (!given(?inv, ?T_NAME) || given(?inv, ?T_NAME_SHORT)) { ret 5; }
+    val got: opt[*u8] = value(?inv, ?argv2[0], ?T_NAME);
+    if (sel got.none)                                          { ret 6; }
+    if (!str_equals(got.some::str, "x"))                       { ret 7; }
+    if (t_refusal(4, ?argv[0]) != diagnostic_kind.CLI_OPERAND) { ret 8; }
+    ret 0;
+}
+
+test parse_invocation__a_repeat_or_a_missing_value_is_refused_once_per_row {
+    var twice: [7]*u8 = [7]*u8{"mach", "probe", ".", "--name", "a", "-n", "b"};
+    if (t_refusal(7, ?twice[0]) != diagnostic_kind.CLI_FLAG_REPEATED) { ret 1; }
+    var many: [7]*u8 = [7]*u8{"mach", "probe", ".", "--many", "a", "--many", "b"};
+    if (t_refusal(7, ?many[0]) != diagnostic_kind.NONE) { ret 2; }
+    var bare: [4]*u8 = [4]*u8{"mach", "probe", ".", "--name"};
+    if (t_refusal(4, ?bare[0]) != diagnostic_kind.CLI_FLAG_VALUE) { ret 3; }
+    var quiet: [5]*u8 = [5]*u8{"mach", "probe", ".", "--quiet", "-q"};
+    if (t_refusal(5, ?quiet[0]) != diagnostic_kind.CLI_FLAG_REPEATED) { ret 4; }
+    ret 0;
+}
+
+test parse_invocation__an_unknown_flag_and_a_refused_one_are_told_apart {
+    var argv: [4]*u8 = [4]*u8{"mach", "probe", ".", "--bogus"};
+    if (t_refusal(4, ?argv[0]) != diagnostic_kind.CLI_FLAG_UNKNOWN) { ret 1; }
+    argv[3] = "--pie";
+    if (t_refusal(4, ?argv[0]) != diagnostic_kind.CLI_FLAG_INAPPLICABLE) { ret 2; }
+    argv[3] = "-";
+    if (t_refusal(4, ?argv[0]) != diagnostic_kind.NONE) { ret 3; }
+    ret 0;
+}
+
+test parse_invocation__relations_are_enforced_and_implied_rows_are_given {
+    var need: [4]*u8 = [4]*u8{"mach", "probe", ".", "--need"};
+    if (t_refusal(4, ?need[0]) != diagnostic_kind.CLI_FLAG_INAPPLICABLE) { ret 1; }
+    var met: [5]*u8 = [5]*u8{"mach", "probe", ".", "--need", "--flag"};
+    if (t_refusal(5, ?met[0]) != diagnostic_kind.NONE) { ret 2; }
+    var both: [5]*u8 = [5]*u8{"mach", "probe", ".", "--other", "--flag"};
+    if (t_refusal(5, ?both[0]) != diagnostic_kind.CLI_FLAG_CONFLICT) { ret 3; }
+    var loud: [5]*u8 = [5]*u8{"mach", "probe", ".", "-vv", "-q"};
+    if (t_refusal(5, ?loud[0]) != diagnostic_kind.CLI_FLAG_CONFLICT) { ret 4; }
+
+    var a:    A.Allocator;
+    val made: err[A.Error] = page.make(?a);
+    if (sel made.err) { ret 5; }
+    val parsed: res[ParsedInvocation, fail.Fail] = parse_command(?a, ?T_PROBE, 4, ?loud[0]);
+    if (sel parsed.err) { ret 6; }
+    var inv: ParsedInvocation = parsed.ok;
+    fin { dnit_invocation(?a, ?inv); }
+    if (!given(?inv, ?VERBOSE) || occurred(?inv, ?VERBOSE)) { ret 7; }
+    ret 0;
+}
+
+test parse_invocation__operand_counts_keep_the_command_or_action_bounds {
+    var none: [2]*u8 = [2]*u8{"mach", "probe"};
+    if (t_refusal(2, ?none[0]) != diagnostic_kind.CLI_OPERAND) { ret 1; }
+    var three: [5]*u8 = [5]*u8{"mach", "probe", "a", "b", "c"};
+    if (t_refusal(5, ?three[0]) != diagnostic_kind.CLI_OPERAND) { ret 2; }
+    var two: [4]*u8 = [4]*u8{"mach", "probe", "a", "b"};
+    if (t_refusal(4, ?two[0]) != diagnostic_kind.NONE) { ret 3; }
+
+    var bare: [2]*u8 = [2]*u8{"mach", "acted"};
+    if (t_refusal(2, ?bare[0]) != diagnostic_kind.CLI_OPERAND) { ret 4; }
+    var bogus: [4]*u8 = [4]*u8{"mach", "acted", "bogus", "."};
+    if (t_refusal(4, ?bogus[0]) != diagnostic_kind.CLI_UNKNOWN_ACTION) { ret 5; }
+    var one: [5]*u8 = [5]*u8{"mach", "acted", "one", ".", "--flag"};
+    if (t_refusal(5, ?one[0]) != diagnostic_kind.NONE)        { ret 6; }
+    if (t_refusal(3, ?one[0]) != diagnostic_kind.CLI_OPERAND) { ret 7; }
+    ret 0;
+}
+
+test schema_valid__a_spelling_means_one_row_across_the_set {
+    if (schema_valid(command_set(?T_CLASHING[0], 2)))  { ret 1; }
+    if (schema_valid(command_set(?T_SHADOWING[0], 1))) { ret 2; }
+    if (!schema_valid(command_set(?T_CLASHING[0], 1))) { ret 3; }
+    ret 0;
+}
+
+test parse_invocation__help_withdraws_every_refusal_but_an_unknown_action {
+    var flagged: [4]*u8 = [4]*u8{"mach", "probe", "--bogus", "-h"};
+    if (t_refusal(4, ?flagged[0]) != diagnostic_kind.NONE) { ret 1; }
+    var inv: ParsedInvocation = t_parse(4, ?flagged[0]);
+    if (!help_requested(?inv)) { ret 2; }
+    var bare: [3]*u8 = [3]*u8{"mach", "acted", "--help"};
+    if (t_refusal(3, ?bare[0]) != diagnostic_kind.NONE) { ret 3; }
+    var acted: ParsedInvocation = t_parse(3, ?bare[0]);
+    if (acted.action != nil || !help_requested(?acted)) { ret 4; }
+    var bogus: [4]*u8 = [4]*u8{"mach", "acted", "bogus", "-h"};
+    if (t_refusal(4, ?bogus[0]) != diagnostic_kind.CLI_UNKNOWN_ACTION) { ret 5; }
+    var valued: [5]*u8           = [5]*u8{"mach", "probe", ".", "--name", "help"};
+    var named:  ParsedInvocation = t_parse(5, ?valued[0]);
+    if (help_requested(?named) || sel named.refusal.some) { ret 6; }
+    var missing: [3]*u8 = [3]*u8{"mach", "acted", "-q"};
+    if (t_refusal(3, ?missing[0]) != diagnostic_kind.CLI_OPERAND) { ret 7; }
+    ret 0;
+}
+
+test parse_invocation__a_long_value_option_takes_its_value_after_equals {
+    var argv: [4]*u8           = [4]*u8{"mach", "probe", "--name=x", "."};
+    var inv:  ParsedInvocation = t_parse(4, ?argv[0]);
+    if (sel inv.refusal.some || inv.positional_count != 1) { ret 1; }
+    val got: opt[*u8] = value(?inv, ?argv[0], ?T_NAME);
+    if (sel got.none)                    { ret 2; }
+    if (!str_equals(got.some::str, "x")) { ret 2; }
+    argv[2] = "-n=x";
+    if (t_refusal(4, ?argv[0]) != diagnostic_kind.CLI_FLAG_UNKNOWN) { ret 3; }
+    ret 0;
+}
+
+test parse_invocation__a_global_option_reads_as_given_to_its_command {
+    var argv: [3]*u8           = [3]*u8{"mach", "--flag", "."};
+    var inv:  ParsedInvocation = t_parse(3, ?argv[0]);
+    if (inv.command != ?T_PROBE || sel inv.refusal.some)  { ret 1; }
+    if (!given(?inv, ?T_FLAG) || inv.positional_idx != 2) { ret 2; }
+    argv[1] = "--other";
+    var other: ParsedInvocation = t_parse(3, ?argv[0]);
+    if (other.command != nil) { ret 3; }
+    ret 0;
+}
+
+# an unknown selector value naming a path in the working directory is restated as an
+# unquoted wildcard the shell expanded; a value naming no path keeps its refusal
+test selection_hint__a_value_naming_a_path_is_an_unquoted_wildcard {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+    var on_disk: manifest.Selectors = manifest.t_selectors("", "/", "");
+    val unknown: fail.Fail          = fail.user(diagnostic_kind.SELECTION_UNKNOWN, "mach.toml: no target named '/' (declared: lin)");
+    val hinted:  fail.Fail          = selection_hint(?alloc, ?on_disk, unknown);
+    if (fail.kind_of(hinted) != diagnostic_kind.CLI_FLAG_VALUE || !str_contains(fail.describe(hinted), "quote the pattern, as in -t '*'")) { ret 2; }
+    var absent: manifest.Selectors = manifest.t_selectors("", "no-such-path-here", "");
+    val plain:  fail.Fail          = fail.user(diagnostic_kind.SELECTION_UNKNOWN, "mach.toml: no target named 'no-such-path-here' (declared: lin)");
+    if (fail.kind_of(selection_hint(?alloc, ?absent, plain)) != diagnostic_kind.SELECTION_UNKNOWN) { ret 3; }
     ret 0;
 }

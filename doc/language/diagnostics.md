@@ -18,7 +18,7 @@ The key sits between the severity and the message: `error[<key>]` or
 `warning[<key>]`. The message says what went wrong in words, and its wording
 may improve from release to release. The key does not change. A tool reads the
 key, the location and the rest as data with
-[`--diagnostics=json`](diagnostics-json.md) rather than from this text.
+[`--diagnostics json`](diagnostics-json.md) rather than from this text.
 
 ## Keys
 
@@ -97,7 +97,7 @@ modules or generic instances raise it.
 | `asm` | inline assembly: syntax, instructions, operands, extensions, labels and locals |
 | `read` | reads the target forbids, such as a load from write-only storage (`read.writeonly_storage`) |
 | `target`, `layout`, `stack`, `alloca`, `spirv` | what a target cannot realize: widths, operations, frame sizes, SPIR-V rules |
-| `import.unused`, `decl.deprecated`, `doc.lint`, `float.inexact`, `fwd.instances`, `debug.dropped`, `target.skipped`, `target.default_deprecated`, `expect.unfulfilled` | the warnings, listed with what raises them under [Silencing warnings](manifest.md#silencing-warnings) |
+| `import.unused`, `decl.deprecated`, `doc.lint`, `float.inexact`, `fwd.instances`, `debug.dropped`, `target.skipped`, `expect.unfulfilled` | the warnings, listed with what raises them under [Silencing warnings](manifest.md#silencing-warnings) |
 | `manifest`, `toml`, `allow`, `selection`, `need`, `template`, `version` | `mach.toml`: its keys and values, profile `allow` lists, target, profile and artifact selection, `need` entries, path templates and version ranges |
 | `project`, `artifact`, `output`, `source`, `path`, `glob`, `step`, `clean` | the build: finding the project, artifacts and their outputs, build steps, and `mach clean` |
 | `dep`, `mach`, `git` | dependencies: declaration, resolution, realization and pins, the compiler range the closure accepts, and the Git operations behind them |
@@ -112,6 +112,6 @@ The full list is the table itself.
 
 ## See also
 
-- [diagnostics-json.md](diagnostics-json.md) — `--diagnostics=json`, the same diagnostics as versioned NDJSON records
+- [diagnostics-json.md](diagnostics-json.md) — `--diagnostics json`, the same diagnostics as versioned NDJSON records
 - [manifest.md](manifest.md#silencing-warnings) — silencing warnings with `allow`
 - [decorators.md](decorators.md#expectkey--acknowledge-a-warning) — acknowledging a warning with `#[expect]`

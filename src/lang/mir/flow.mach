@@ -1,0 +1,670 @@
+# the control-flow graph of one MIR function, the one place its edges are
+# derived. a block's successors are the block operands of its terminator, its
+# last instruction, in operand order, one edge per operand: a branch that names
+# one block from both arms gives that block two predecessor edges, one per arm,
+# as the IR records them. an operand naming no block of the function is no
+# edge. predecessors list every edge into a block, from reached and unreached
+# blocks alike, ordered by the source block's position and then its operand.
+#
+# init builds the edges and the reverse postorder from the entry. dominators,
+# loop depth and strongly connected components are built when a pass asks for
+# them. a graph describes the function as it stood when it was built: a pass
+# that changes a terminator or the block array builds a new one
+use mach.lang.fail;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+use std.allocator.page;
+
+use lang_mir: mach.lang.mir;
+
+# the absent entry of every table here: no position, no number, no block
+pub val NONE: u32 = 0xFFFFFFFF;
+
+# block positions by block id, ids being unique within a function
+pub rec BlockIndex {
+    at:  *u32;
+    cap: u32;
+}
+
+# every table is indexed by block position in the function's block array
+# ---
+# n:          the number of blocks
+# index:      each block's position by its id
+# succ_start: where each block's successors start in succ, n + 1 entries
+# succ:       the successor positions, edge_count entries
+# pred_start: where each block's predecessors start in pred, n + 1 entries
+# pred:       the predecessor positions, edge_count entries
+# rpo_num:    each block's number in the reverse postorder, NONE when the
+#             entry does not reach it
+# rpo_block:  the reached blocks in reverse postorder, `reached` of them
+# idom:       each block's immediate dominator, NONE for the entry and an
+#             unreached block, nil until dominators_build
+# depth:      how many natural loops hold each block, nil until loops_build
+# component:  the representative of each block's strongly connected
+#             component, nil until components_build
+pub rec Graph {
+    alloc:      *A.Allocator;
+    n:          u32;
+    index:      BlockIndex;
+    succ_start: *u32;
+    succ:       *u32;
+    edge_count: u32;
+    pred_start: *u32;
+    pred:       *u32;
+    rpo_num:    *u32;
+    rpo_block:  *u32;
+    reached:    u32;
+    idom:       *u32;
+    depth:      *u32;
+    component:  *u32;
+}
+
+fun table(alloc: *A.Allocator, n: u32, fill: u32) res[*u32, fail.Fail] {
+    var cap: u32 = n;
+    if (cap == 0) { cap = 1; }
+    val r: res[*u32, A.Error] = A.allocate[u32](alloc, cap::usize);
+    if (sel r.err) { ret res[*u32, fail.Fail].err{fail.refused(r.err)}; }
+    val t: *u32 = r.ok;
+    var i: u32  = 0;
+    for (i < cap) {
+        t[i] = fill;
+        i    = i + 1;
+    }
+    ret res[*u32, fail.Fail].ok{t};
+}
+
+fun table_free(alloc: *A.Allocator, t: *u32, n: u32) {
+    if (t == nil) { ret; }
+    var cap: u32 = n;
+    if (cap == 0) { cap = 1; }
+    A.deallocate[u32](alloc, t, cap::usize);
+}
+
+pub fun index_init(alloc: *A.Allocator, f: *lang_mir.MirFunction) res[BlockIndex, fail.Fail] {
+    var max_id: u32 = 0;
+    var b:      u32 = 0;
+    for (b < f.block_count) {
+        if (f.blocks[b].id > max_id) { max_id = f.blocks[b].id; }
+        b = b + 1;
+    }
+    val r: res[*u32, fail.Fail] = table(alloc, max_id + 1, NONE);
+    if (sel r.err) { ret res[BlockIndex, fail.Fail].err{r.err}; }
+    var ix: BlockIndex;
+    ix.at  = r.ok;
+    ix.cap = max_id + 1;
+    b      = 0;
+    for (b < f.block_count) {
+        ix.at[f.blocks[b].id] = b;
+        b                     = b + 1;
+    }
+    ret res[BlockIndex, fail.Fail].ok{ix};
+}
+
+pub fun index_dnit(alloc: *A.Allocator, ix: *BlockIndex) {
+    table_free(alloc, ix.at, ix.cap);
+    ix.at  = nil;
+    ix.cap = 0;
+}
+
+# the position of the block named `id`, NONE when no block has that id
+pub fun position_of(ix: *BlockIndex, id: i64) u32 {
+    if (id < 0 || id >= ix.cap::i64) { ret NONE; }
+    ret ix.at[id::u32];
+}
+
+fun terminator(f: *lang_mir.MirFunction, b: u32) *lang_mir.MirInstr {
+    val blk: *lang_mir.MirBlock = ?f.blocks[b];
+    if (blk.instr_count == 0) { ret nil; }
+    ret ?blk.instrs[blk.instr_count - 1];
+}
+
+# the position of the block the terminator's operand k names, NONE when the
+# operand names no block of the function
+fun successor_at(ix: *BlockIndex, t: *lang_mir.MirInstr, k: u32) u32 {
+    val op: *lang_mir.MirOperand = ?t.operands[k];
+    if (op.kind != lang_mir.MIR_OP_BLOCK) { ret NONE; }
+    ret position_of(ix, op.imm);
+}
+
+fun blank(alloc: *A.Allocator, n: u32) Graph {
+    var g: Graph;
+    g.alloc      = alloc;
+    g.n          = n;
+    g.index.at   = nil;
+    g.index.cap  = 0;
+    g.succ_start = nil;
+    g.succ       = nil;
+    g.edge_count = 0;
+    g.pred_start = nil;
+    g.pred       = nil;
+    g.rpo_num    = nil;
+    g.rpo_block  = nil;
+    g.reached    = 0;
+    g.idom       = nil;
+    g.depth      = nil;
+    g.component  = nil;
+    ret g;
+}
+
+pub fun init(alloc: *A.Allocator, f: *lang_mir.MirFunction) res[Graph, fail.Fail] {
+    var g:  Graph          = blank(alloc, f.block_count);
+    val rb: err[fail.Fail] = edges_build(?g, f);
+    if (sel rb.err) {
+        dnit(?g);
+        ret res[Graph, fail.Fail].err{rb.err};
+    }
+    val rr: err[fail.Fail] = rpo_build(?g);
+    if (sel rr.err) {
+        dnit(?g);
+        ret res[Graph, fail.Fail].err{rr.err};
+    }
+    ret res[Graph, fail.Fail].ok{g};
+}
+
+pub fun dnit(g: *Graph) {
+    index_dnit(g.alloc, ?g.index);
+    table_free(g.alloc, g.succ_start, g.n + 1);
+    table_free(g.alloc, g.succ, g.edge_count);
+    table_free(g.alloc, g.pred_start, g.n + 1);
+    table_free(g.alloc, g.pred, g.edge_count);
+    table_free(g.alloc, g.rpo_num, g.n);
+    table_free(g.alloc, g.rpo_block, g.n);
+    table_free(g.alloc, g.idom, g.n);
+    table_free(g.alloc, g.depth, g.n);
+    table_free(g.alloc, g.component, g.n);
+    g.succ_start = nil;
+    g.succ       = nil;
+    g.pred_start = nil;
+    g.pred       = nil;
+    g.rpo_num    = nil;
+    g.rpo_block  = nil;
+    g.idom       = nil;
+    g.depth      = nil;
+    g.component  = nil;
+}
+
+fun edges_build(g: *Graph, f: *lang_mir.MirFunction) err[fail.Fail] {
+    val n:  u32                        = g.n;
+    val ri: res[BlockIndex, fail.Fail] = index_init(g.alloc, f);
+    if (sel ri.err) { ret err[fail.Fail].err{ri.err}; }
+    g.index = ri.ok;
+
+    val rs: res[*u32, fail.Fail] = table(g.alloc, n + 1, 0);
+    if (sel rs.err) { ret err[fail.Fail].err{rs.err}; }
+    g.succ_start = rs.ok;
+    val rp: res[*u32, fail.Fail] = table(g.alloc, n + 1, 0);
+    if (sel rp.err) { ret err[fail.Fail].err{rp.err}; }
+    g.pred_start = rp.ok;
+
+    var b: u32 = 0;
+    for (b < n) {
+        g.succ_start[b] = g.edge_count;
+        val t: *lang_mir.MirInstr = terminator(f, b);
+        if (t != nil) {
+            var k: u32 = 0;
+            for (k < t.operand_count) {
+                val s: u32 = successor_at(?g.index, t, k);
+                if (s != NONE) {
+                    g.edge_count        = g.edge_count + 1;
+                    g.pred_start[s + 1] = g.pred_start[s + 1] + 1;
+                }
+                k = k + 1;
+            }
+        }
+        b = b + 1;
+    }
+    g.succ_start[n] = g.edge_count;
+    b               = 0;
+    for (b < n) {
+        g.pred_start[b + 1] = g.pred_start[b + 1] + g.pred_start[b];
+        b                   = b + 1;
+    }
+
+    val re: res[*u32, fail.Fail] = table(g.alloc, g.edge_count, NONE);
+    if (sel re.err) { ret err[fail.Fail].err{re.err}; }
+    g.succ = re.ok;
+    val rq: res[*u32, fail.Fail] = table(g.alloc, g.edge_count, NONE);
+    if (sel rq.err) { ret err[fail.Fail].err{rq.err}; }
+    g.pred = rq.ok;
+    val rf: res[*u32, fail.Fail] = table(g.alloc, n, 0);
+    if (sel rf.err) { ret err[fail.Fail].err{rf.err}; }
+    val fill: *u32 = rf.ok;
+    fin { table_free(g.alloc, fill, n); }
+
+    b = 0;
+    for (b < n) {
+        var e: u32                = g.succ_start[b];
+        val t: *lang_mir.MirInstr = terminator(f, b);
+        if (t != nil) {
+            var k: u32 = 0;
+            for (k < t.operand_count) {
+                val s: u32 = successor_at(?g.index, t, k);
+                if (s != NONE) {
+                    g.succ[e]                         = s;
+                    e                                 = e + 1;
+                    g.pred[g.pred_start[s] + fill[s]] = b;
+                    fill[s]                           = fill[s] + 1;
+                }
+                k = k + 1;
+            }
+        }
+        b = b + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# depth-first from the entry, each block's successors in operand order
+fun rpo_build(g: *Graph) err[fail.Fail] {
+    val n:  u32                  = g.n;
+    val rn: res[*u32, fail.Fail] = table(g.alloc, n, NONE);
+    if (sel rn.err) { ret err[fail.Fail].err{rn.err}; }
+    g.rpo_num = rn.ok;
+    val rb: res[*u32, fail.Fail] = table(g.alloc, n, NONE);
+    if (sel rb.err) { ret err[fail.Fail].err{rb.err}; }
+    g.rpo_block = rb.ok;
+    if (n == 0) { ret err[fail.Fail].ok{}; }
+
+    val rs: res[*u32, fail.Fail] = table(g.alloc, n, 0);
+    if (sel rs.err) { ret err[fail.Fail].err{rs.err}; }
+    val stack: *u32 = rs.ok;
+    fin { table_free(g.alloc, stack, n); }
+    val rc: res[*u32, fail.Fail] = table(g.alloc, n, 0);
+    if (sel rc.err) { ret err[fail.Fail].err{rc.err}; }
+    val cursor: *u32 = rc.ok;
+    fin { table_free(g.alloc, cursor, n); }
+    val rp: res[*u32, fail.Fail] = table(g.alloc, n, 0);
+    if (sel rp.err) { ret err[fail.Fail].err{rp.err}; }
+    val post: *u32 = rp.ok;
+    fin { table_free(g.alloc, post, n); }
+
+    # rpo_num marks a visited block with 0 until the numbering below
+    var pc: u32 = 0;
+    var sp: u32 = 1;
+    stack[0]     = 0;
+    cursor[0]    = g.succ_start[0];
+    g.rpo_num[0] = 0;
+    for (sp > 0) {
+        val b: u32 = stack[sp - 1];
+        if (cursor[sp - 1] < g.succ_start[b + 1]) {
+            val s: u32 = g.succ[cursor[sp - 1]];
+            cursor[sp - 1] = cursor[sp - 1] + 1;
+            if (g.rpo_num[s] == NONE) {
+                g.rpo_num[s] = 0;
+                stack[sp]    = s;
+                cursor[sp]   = g.succ_start[s];
+                sp           = sp + 1;
+            }
+        }
+        or {
+            post[pc] = b;
+            pc       = pc + 1;
+            sp       = sp - 1;
+        }
+    }
+    var k: u32 = 0;
+    for (k < pc) {
+        val b: u32 = post[pc - 1 - k];
+        g.rpo_block[k] = b;
+        g.rpo_num[b]   = k;
+        k              = k + 1;
+    }
+    g.reached = pc;
+    ret err[fail.Fail].ok{};
+}
+
+pub fun block_is_reached(g: *Graph, b: u32) bool {
+    ret g.rpo_num[b] != NONE;
+}
+
+# an edge between reached blocks to a block no later in the reverse postorder
+# closes a loop
+pub fun edge_is_back(g: *Graph, from: u32, to: u32) bool {
+    if (!block_is_reached(g, from) || !block_is_reached(g, to)) { ret false; }
+    ret g.rpo_num[to] <= g.rpo_num[from];
+}
+
+# the order a pass that visits every block scans them in: the reached blocks in
+# reverse postorder, then the unreached ones by position. `out` holds n entries
+pub fun scan_order_fill(g: *Graph, out: *u32) {
+    var k: u32 = 0;
+    for (k < g.reached) {
+        out[k] = g.rpo_block[k];
+        k      = k + 1;
+    }
+    var b: u32 = 0;
+    for (b < g.n) {
+        if (!block_is_reached(g, b)) {
+            out[k] = b;
+            k      = k + 1;
+        }
+        b = b + 1;
+    }
+}
+
+# the immediate dominators of the reached blocks, by the iterative
+# intersection over the reverse postorder
+pub fun dominators_build(g: *Graph) err[fail.Fail] {
+    if (g.idom != nil) { ret err[fail.Fail].ok{}; }
+    val ri: res[*u32, fail.Fail] = table(g.alloc, g.n, NONE);
+    if (sel ri.err) { ret err[fail.Fail].err{ri.err}; }
+    g.idom = ri.ok;
+    if (g.reached == 0) { ret err[fail.Fail].ok{}; }
+
+    val entry: u32 = g.rpo_block[0];
+    g.idom[entry] = entry;
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        var k: u32 = 1;
+        for (k < g.reached) {
+            val b:        u32 = g.rpo_block[k];
+            var new_idom: u32 = NONE;
+            var e:        u32 = g.pred_start[b];
+            for (e < g.pred_start[b + 1]) {
+                val p: u32 = g.pred[e];
+                if (g.idom[p] != NONE) {
+                    if (new_idom == NONE) { new_idom = p; }
+                    or                    { new_idom = intersect(g, p, new_idom); }
+                }
+                e = e + 1;
+            }
+            if (new_idom != NONE && g.idom[b] != new_idom) {
+                g.idom[b] = new_idom;
+                changed   = true;
+            }
+            k = k + 1;
+        }
+    }
+    g.idom[entry] = NONE;
+    ret err[fail.Fail].ok{};
+}
+
+fun intersect(g: *Graph, a: u32, b: u32) u32 {
+    var x: u32 = a;
+    var y: u32 = b;
+    for (x != y) {
+        for (g.rpo_num[x] > g.rpo_num[y]) { x = g.idom[x]; }
+        for (g.rpo_num[y] > g.rpo_num[x]) { y = g.idom[y]; }
+    }
+    ret x;
+}
+
+# whether every path from the entry to b passes through a; needs dominators_build
+pub fun dominates(g: *Graph, a: u32, b: u32) bool {
+    if (a == NONE || b == NONE)  { ret false; }
+    if (!block_is_reached(g, b)) { ret false; }
+    var x: u32 = b;
+    for (x != NONE) {
+        if (x == a) { ret true; }
+        x = g.idom[x];
+    }
+    ret false;
+}
+
+# a block's loop depth counts the natural loops holding it: a header and every
+# block that reaches one of its back edges without passing through it. the
+# walk stays among the reached blocks after the header in reverse postorder,
+# where the body of a loop the header dominates lies
+pub fun loops_build(g: *Graph) err[fail.Fail] {
+    if (g.depth != nil) { ret err[fail.Fail].ok{}; }
+    val n:  u32                  = g.n;
+    val rd: res[*u32, fail.Fail] = table(g.alloc, n, 0);
+    if (sel rd.err) { ret err[fail.Fail].err{rd.err}; }
+    g.depth = rd.ok;
+    val rm: res[*u32, fail.Fail] = table(g.alloc, n, NONE);
+    if (sel rm.err) { ret err[fail.Fail].err{rm.err}; }
+    val mark: *u32 = rm.ok;
+    fin { table_free(g.alloc, mark, n); }
+    val rw: res[*u32, fail.Fail] = table(g.alloc, n, 0);
+    if (sel rw.err) { ret err[fail.Fail].err{rw.err}; }
+    val work: *u32 = rw.ok;
+    fin { table_free(g.alloc, work, n); }
+
+    var h: u32 = 0;
+    for (h < n) {
+        if (block_is_reached(g, h)) {
+            var sp: u32 = 0;
+            var e:  u32 = g.pred_start[h];
+            for (e < g.pred_start[h + 1]) {
+                val p: u32 = g.pred[e];
+                if (edge_is_back(g, p, h)) {
+                    if (mark[h] != h) {
+                        mark[h]    = h;
+                        g.depth[h] = g.depth[h] + 1;
+                    }
+                    if (mark[p] != h) {
+                        mark[p]    = h;
+                        g.depth[p] = g.depth[p] + 1;
+                        work[sp]   = p;
+                        sp         = sp + 1;
+                    }
+                }
+                e = e + 1;
+            }
+            for (sp > 0) {
+                sp = sp - 1;
+                val x:  u32 = work[sp];
+                var pe: u32 = g.pred_start[x];
+                for (pe < g.pred_start[x + 1]) {
+                    val p: u32 = g.pred[pe];
+                    if (mark[p] != h && block_is_reached(g, p) && g.rpo_num[p] >= g.rpo_num[h]) {
+                        mark[p]    = h;
+                        g.depth[p] = g.depth[p] + 1;
+                        work[sp]   = p;
+                        sp         = sp + 1;
+                    }
+                    pe = pe + 1;
+                }
+            }
+        }
+        h = h + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the strongly connected components over every block, reached or not, by an
+# iterative tarjan walk rooted at each unvisited block in position order. a
+# component is named by the block the walk closed it at, and a block on no
+# cycle is its own component
+pub fun components_build(g: *Graph) err[fail.Fail] {
+    if (g.component != nil) { ret err[fail.Fail].ok{}; }
+    val n:  u32                  = g.n;
+    val rc: res[*u32, fail.Fail] = table(g.alloc, n, 0);
+    if (sel rc.err) { ret err[fail.Fail].err{rc.err}; }
+    g.component = rc.ok;
+
+    val rt: res[*u32, fail.Fail] = table(g.alloc, n * 6, 0);
+    if (sel rt.err) { ret err[fail.Fail].err{rt.err}; }
+    val scratch: *u32 = rt.ok;
+    fin { table_free(g.alloc, scratch, n * 6); }
+    val index:       *u32 = scratch;
+    val low:         *u32 = ?scratch[n];
+    val on_stack:    *u32 = ?scratch[n * 2];
+    val stack:       *u32 = ?scratch[n * 3];
+    val frame_block: *u32 = ?scratch[n * 4];
+    val frame_next:  *u32 = ?scratch[n * 5];
+    var i:           u32  = 0;
+    for (i < n) {
+        index[i]       = NONE;
+        on_stack[i]    = 0;
+        g.component[i] = i;
+        i              = i + 1;
+    }
+    var counter: u32 = 0;
+    var sp:      u32 = 0;
+    var root:    u32 = 0;
+    for (root < n) {
+        if (index[root] != NONE) {
+            root = root + 1;
+            cnt;
+        }
+        index[root]    = counter;
+        low[root]      = counter;
+        counter        = counter + 1;
+        stack[sp]      = root;
+        sp             = sp + 1;
+        on_stack[root] = 1;
+        var depth: u32 = 1;
+        frame_block[0] = root;
+        frame_next[0]  = g.succ_start[root];
+        for (depth > 0) {
+            val v: u32 = frame_block[depth - 1];
+            val e: u32 = frame_next[depth - 1];
+            if (e < g.succ_start[v + 1]) {
+                frame_next[depth - 1] = e + 1;
+                val w: u32 = g.succ[e];
+                if (index[w] == NONE) {
+                    index[w]           = counter;
+                    low[w]             = counter;
+                    counter            = counter + 1;
+                    stack[sp]          = w;
+                    sp                 = sp + 1;
+                    on_stack[w]        = 1;
+                    frame_block[depth] = w;
+                    frame_next[depth]  = g.succ_start[w];
+                    depth              = depth + 1;
+                }
+                or (on_stack[w] != 0 && index[w] < low[v]) { low[v] = index[w]; }
+                cnt;
+            }
+            depth = depth - 1;
+            if (low[v] == index[v]) {
+                var member: u32 = NONE;
+                for (member != v) {
+                    sp                  = sp - 1;
+                    member              = stack[sp];
+                    on_stack[member]    = 0;
+                    g.component[member] = v;
+                }
+            }
+            if (depth > 0) {
+                val u: u32 = frame_block[depth - 1];
+                if (low[v] < low[u]) { low[u] = low[v]; }
+            }
+        }
+        root = root + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a block named `id` ending in one terminator: a jump to a (b NONE), a branch
+# on vreg 0 to a or b, or a return when both are NONE
+#[testing]
+fun t_block(alloc: *A.Allocator, id: u32, a: u32, b: u32) lang_mir.MirBlock {
+    var blk: lang_mir.MirBlock                  = lang_mir.block_empty(id);
+    val ro:  res[*lang_mir.MirOperand, A.Error] = A.allocate[lang_mir.MirOperand](alloc, 3::usize);
+    if (sel ro.err) { ret blk; }
+    val ops: *lang_mir.MirOperand = ro.ok;
+    var n:   u32                  = 0;
+    var op:  lang_mir.MirOpcode   = lang_mir.MIR_RET;
+    if (a != NONE && b != NONE) {
+        ops[0] = lang_mir.op_vreg(lang_mir.vreg_id(0));
+        ops[1] = lang_mir.op_block(a);
+        ops[2] = lang_mir.op_block(b);
+        n      = 3;
+        op     = lang_mir.MIR_CBR;
+    }
+    or (a != NONE) {
+        ops[0] = lang_mir.op_block(a);
+        n      = 1;
+        op     = lang_mir.MIR_BR;
+    }
+    val added: err[fail.Fail] = lang_mir.instr_add(alloc, ?blk, lang_mir.instr(op, ops, n, 8, 8));
+    if (sel added.err) { ret blk; }
+    ret blk;
+}
+
+#[testing]
+fun t_fn(blocks: *lang_mir.MirBlock, n: u32) lang_mir.MirFunction {
+    var f: lang_mir.MirFunction;
+    f.blocks      = blocks;
+    f.block_count = n;
+    f.block_cap   = n;
+    ret f;
+}
+
+#[testing]
+fun t_preds_are(g: *Graph, b: u32, want: *u32, n: u32) bool {
+    if (g.pred_start[b + 1] - g.pred_start[b] != n) { ret false; }
+    var i: u32 = 0;
+    for (i < n) {
+        if (g.pred[g.pred_start[b] + i] != want[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# a branch naming one block from both arms gives it one edge per arm, and the
+# predecessors of a block come in source position order, unreached sources too
+test init__one_edge_per_block_operand {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    # ids are not positions: block 7 sits at position 1
+    var blocks: [4]lang_mir.MirBlock;
+    blocks[0] = t_block(?alloc, 0, 7, 7);
+    blocks[1] = t_block(?alloc, 7, 3, NONE);
+    blocks[2] = t_block(?alloc, 2, 7, NONE);
+    blocks[3] = t_block(?alloc, 3, NONE, NONE);
+    var f:  lang_mir.MirFunction  = t_fn(?blocks[0], 4);
+    val rg: res[Graph, fail.Fail] = init(?alloc, ?f);
+    if (sel rg.err) { ret 1; }
+    var g: Graph = rg.ok;
+    fin { dnit(?g); }
+
+    if (g.edge_count != 4) { ret 2; }
+    var into_7: [3]u32;
+    into_7[0] = 0;
+    into_7[1] = 0;
+    into_7[2] = 2;
+    if (!t_preds_are(?g, 1, ?into_7[0], 3)) { ret 3; }
+    if (g.reached != 3)                     { ret 4; }
+    if (block_is_reached(?g, 2))            { ret 5; }
+    var order: [4]u32;
+    scan_order_fill(?g, ?order[0]);
+    if (order[0] != 0 || order[1] != 1 || order[2] != 3 || order[3] != 2) { ret 6; }
+    ret 0;
+}
+
+# a loop entered at its header: the header dominates its body, the body sits
+# one loop deep, and the exit and the unreached block sit in no loop
+test analyses__dominators_loops_and_components {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var blocks: [5]lang_mir.MirBlock;
+    blocks[0] = t_block(?alloc, 0, 1, NONE);
+    blocks[1] = t_block(?alloc, 1, 2, 3);
+    blocks[2] = t_block(?alloc, 2, 1, NONE);
+    blocks[3] = t_block(?alloc, 3, NONE, NONE);
+    blocks[4] = t_block(?alloc, 4, 1, NONE);
+    var f:  lang_mir.MirFunction  = t_fn(?blocks[0], 5);
+    val rg: res[Graph, fail.Fail] = init(?alloc, ?f);
+    if (sel rg.err) { ret 1; }
+    var g: Graph = rg.ok;
+    fin { dnit(?g); }
+
+    val rd: err[fail.Fail] = dominators_build(?g);
+    if (sel rd.err)                                         { ret 2; }
+    if (g.idom[1] != 0 || g.idom[2] != 1 || g.idom[3] != 1) { ret 3; }
+    if (g.idom[0] != NONE || g.idom[4] != NONE)             { ret 4; }
+    if (!dominates(?g, 1, 2) || dominates(?g, 2, 3))        { ret 5; }
+
+    val rl: err[fail.Fail] = loops_build(?g);
+    if (sel rl.err)                                                                                  { ret 6; }
+    if (g.depth[0] != 0 || g.depth[1] != 1 || g.depth[2] != 1 || g.depth[3] != 0 || g.depth[4] != 0) { ret 7; }
+    if (edge_is_back(?g, 4, 1))                                                                      { ret 8; }
+
+    val rc: err[fail.Fail] = components_build(?g);
+    if (sel rc.err)                                                           { ret 9; }
+    if (g.component[1] != g.component[2])                                     { ret 10; }
+    if (g.component[0] == g.component[1] || g.component[3] == g.component[1]) { ret 11; }
+    if (g.component[0] != 0 || g.component[3] != 3 || g.component[4] != 4)    { ret 12; }
+    ret 0;
+}

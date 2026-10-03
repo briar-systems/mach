@@ -1,9 +1,17 @@
 # mach.cli.cmd.init
 
+## val COMMAND
+
+```mach
+pub val COMMAND: args.CommandSpec = args.CommandSpec;
+```
+
+`mach init`
+
 ## fun run
 
 ```mach
-pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64;
+pub fun run(cx: *args.Call) res[i64, fail.Fail];
 ```
 
 `mach init`: scaffold a project. the positional names the directory (default the working
@@ -15,8 +23,7 @@ is then added at the caret range of the release resolution picks and checked out
 `--no-deps`, which still resolves the range (so needs the network) but skips the checkout.
 `--quiet` silences progress
 
-argv: the full process arguments
-inv: the parsed invocation for this command
-ret: exit.OK, exit.USER for an invalid id or a refused overwrite, otherwise the code
-      `exit.of` maps the printed failure to, the std dependency's own when it could not be added
+cx: the call
+ret: exit.OK, or the failure: a user one for an invalid id or a refused overwrite, otherwise the
+     std dependency's own class when it could not be added
 

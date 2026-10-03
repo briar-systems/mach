@@ -1,10 +1,12 @@
 # mach.lang.manifest.select
 
-the selection a command's `-a`, `-t` and `-p` options and `--all` describe,
-resolved against a manifest into the (artifact, target, profile) cells it
-covers. each axis takes exact names and globs (`*` any run, `?` any one
-byte); an axis given no pattern is `*` under `--all` and otherwise the
-manifest's default. no cell is chosen by table order
+the one selection model: the selection a command's `-a`, `-t` and `-p` options
+and `--all` describe, resolved against a manifest into the (artifact, target,
+profile) cells it covers, which the build plan takes. each axis takes exact
+names and globs (`*` any run, `?` any one byte); an axis given no pattern is
+`*` under `--all` and otherwise the manifest's default, which the
+`ArtifactDefault` modes, `resolve_target` and `resolve_profile` decide. no cell
+is chosen by table order
 
 ## def ArtifactDefault
 
@@ -67,6 +69,95 @@ target_name: the declared target the cell resolves to
 profile: the declared profile name
 native: the target's `os` and `isa` are the host's, so its programs run here
 
+## fun cell_of
+
+```mach
+pub fun cell_of(artifact: str, target: str, profile: str) Cell;
+```
+
+a cell named outright, for a caller that already holds exact names: a
+dependency's requirement, or a cell carried from an earlier plan
+
+artifact: the declared artifact name
+target: the declared target name, or "" for the artifact's default target
+profile: the declared profile name, or "" for the default profile
+
+## rec ResolvedTarget
+
+```mach
+pub rec ResolvedTarget;
+```
+
+the outcome of target resolution for a selection
+
+target: the chosen target; points into the manifest unless synthesized for a
+        manifest with no `[target.*]`, in which case it is allocated and never freed by `dnit`
+target borrows its manifest-owned declaration until manifest destruction
+
+## rec ResolvedProfile
+
+```mach
+pub rec ResolvedProfile;
+```
+
+the profile a selection resolves to, copied out of its `ProfileDef`
+
+name: the profile's name
+opt: as `ProfileDef`
+debug: as `ProfileDef`
+simd: as `ProfileDef`
+vectorize: as `ProfileDef`
+float_reassoc: as `ProfileDef`
+allow: as `ProfileDef`
+
+## fun resolve_target
+
+```mach
+pub fun resolve_target(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, selector: str,
+art: *ArtifactDef) res[ResolvedTarget, fail.Fail];
+```
+
+the target a selector names: a declared name, `native` for the declared
+target matching the host, or "" for the artifact's pinned target and
+otherwise `native`
+
+## fun resolve_profile
+
+```mach
+pub fun resolve_profile(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, pick: str) res[ResolvedProfile, fail.Fail];
+```
+
+choose the profile a selection names. a named profile must be declared. an
+empty name takes the sole declared profile, else the one with `default = true`,
+of which parse admits at most one. several declared profiles with none marked
+default are refused: no profile is ever selected by table order
+
+alloc: owns error text
+itn: resolves the names
+m: the manifest
+pick: the profile name, or "" for the default
+ret: the profile; err "mach.toml: no profile named '<pick>'" or, with an empty
+       name, an error when several profiles are declared and none is the default
+
+## fun default_selection_includes
+
+```mach
+pub fun default_selection_includes(itn: *intern.Interner, m: *Manifest, a: *ArtifactDef,
+target: intern.StrId, executables_only: bool) bool;
+```
+
+the default selection: what a command takes for a target when no `-a`
+names an artifact. of the artifacts the target builds, those marked
+`default = true` when any is, otherwise every one. build and check take the whole
+selection, and a command that needs one artifact takes it only when it holds one
+
+itn: resolves names
+m: the manifest
+a: the artifact asked about
+target: the resolved target's name
+executables_only: consider `bin` artifacts only, so a library beside them is never taken
+ret: true when the default selection holds `a`
+
 ## fun selectors_init
 
 ```mach
@@ -76,6 +167,14 @@ pub fun selectors_init(alloc: *A.Allocator) Selectors;
 empty selectors: every axis takes the manifest's default
 
 alloc: backs the three pattern vectors
+
+## fun selectors_dnit
+
+```mach
+pub fun selectors_dnit(s: *Selectors);
+```
+
+release the pattern vectors of selectors; the patterns themselves are borrowed
 
 ## fun selectors_of
 
@@ -126,4 +225,17 @@ s: the selectors
 mode: how an artifact axis given no pattern is filled without `--all`
 ret: the cells, never empty; err for an unknown name, a glob matching
        nothing, an unsupported exact pair, an ambiguous default or an empty selection
+
+## fun resolve_cell
+
+```mach
+pub fun resolve_cell(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, s: *Selectors,
+mode: ArtifactDefault, what: str) res[Cell, fail.Fail];
+```
+
+resolve selectors a command needs one cell of: `resolve_cells`, refused as
+`single_selection_fail` refuses when the selection holds several
+
+what: what needs one cell, such as "mach doc renders one artifact"
+ret: the cell; the `resolve_cells` errors, or the refusal of several cells
 

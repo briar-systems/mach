@@ -6,9 +6,9 @@
 pub fun produce_debug(req: *target_of.DebugProduceRequest) err[fail.Fail];
 ```
 
-## fun debug_descriptor
+## val DEBUG
 
 ```mach
-pub fun debug_descriptor() target_of.DebugVTable;
+pub val DEBUG: target_of.DebugVTable = target_of.DebugVTable;
 ```
 

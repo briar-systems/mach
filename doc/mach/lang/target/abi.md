@@ -1,107 +1,5 @@
 # mach.lang.target.abi
 
-## val ABI_UNKNOWN
-
-```mach
-pub val ABI_UNKNOWN: u32 = 0
-```
-
-## val ABI_SYSV
-
-```mach
-pub val ABI_SYSV:    u32 = 1
-```
-
-## val ABI_WIN64
-
-```mach
-pub val ABI_WIN64:   u32 = 2
-```
-
-## val ABI_AAPCS64
-
-```mach
-pub val ABI_AAPCS64: u32 = 3
-```
-
-## val ABI_LP64
-
-```mach
-pub val ABI_LP64:    u32 = 4
-```
-
-## val ABI_LP64F
-
-```mach
-pub val ABI_LP64F:   u32 = 5
-```
-
-## val ABI_LP64D
-
-```mach
-pub val ABI_LP64D:   u32 = 6
-```
-
-## val ABI_ILP32
-
-```mach
-pub val ABI_ILP32:  u32 = 7
-```
-
-## val ABI_ILP32F
-
-```mach
-pub val ABI_ILP32F: u32 = 8
-```
-
-## val ABI_ILP32D
-
-```mach
-pub val ABI_ILP32D: u32 = 9
-```
-
-## val ABI_SPIRV
-
-```mach
-pub val ABI_SPIRV:  u32 = 10
-```
-
-## val ABI_CATALOG_VERSION
-
-```mach
-pub val ABI_CATALOG_VERSION: u8 = 1
-```
-
-## fun abi_id_for
-
-```mach
-pub fun abi_id_for(name: str) u32;
-```
-
-## fun abi_name_for
-
-```mach
-pub fun abi_name_for(id: u32) str;
-```
-
-## fun abi_catalog_len
-
-```mach
-pub fun abi_catalog_len() usize;
-```
-
-## fun abi_catalog_name
-
-```mach
-pub fun abi_catalog_name(index: usize) str;
-```
-
-## fun abi_fingerprint_tag
-
-```mach
-pub fun abi_fingerprint_tag(id: u32) u8;
-```
-
 ## def ParamClass
 
 ```mach
@@ -330,48 +228,10 @@ pub fun piece_is_half(p: *ParamPiece) bool;
 a piece of a float register two bytes wide carries a binary16: no other
 float or vector a convention places is that narrow
 
-## val PASSING_CARRIERS
-
-```mach
-pub val PASSING_CARRIERS: PassingModel = 0
-```
-
-## val PASSING_VALUES
-
-```mach
-pub val PASSING_VALUES:   PassingModel = 1
-```
-
 ## rec AbiVTable
 
 ```mach
 pub rec AbiVTable;
-```
-
-## fun abi_vtable
-
-```mach
-pub fun abi_vtable(id: u32, name: str, arch_id: u32,
-arg_passing: ArgPassingFn, ret_passing: RetPassingFn,
-gp_arg_regs: RegFileFn, callee_saved: RegFileFn,
-stack_align: u32, red_zone: u32, shadow_space: u32,
-indirect_result_reg: i32, indirect_result_in_argfile: bool,
-consumes_agg_layout: bool, fp_callee_saved_bytes: u32,
-float_arg_bits: u32, arg_slot_granularity: u32,
-va_model: VaModelFn) AbiVTable;
-```
-
-## fun value_abi_vtable
-
-```mach
-pub fun value_abi_vtable(id: u32, name: str, arch_id: u32,
-arg_passing: ArgPassingFn, ret_passing: RetPassingFn) AbiVTable;
-```
-
-## rec AbiRegistry
-
-```mach
-pub rec AbiRegistry;
 ```
 
 ## rec SigLayout
@@ -411,46 +271,27 @@ variadic_float_bits: u32) VaModel;
 pub fun variadic_float_in_fp_bank(m: *VaModel, width: u64) bool;
 ```
 
-## fun registry_init_with_allocator
+## fun validate
 
 ```mach
-pub fun registry_init_with_allocator(alloc: *A.Allocator) AbiRegistry;
+pub fun validate(a: *A.Allocator, vt: *AbiVTable) err[fail.Fail];
 ```
 
-## fun registry_dnit
+why a descriptor is malformed, read once when a registry adds it
+
+a: formats the refusal
+vt: the descriptor
+
+## fun name_of
 
 ```mach
-pub fun registry_dnit(reg: *AbiRegistry);
+pub fun name_of(vt: *AbiVTable) str;
 ```
 
-## fun registry_validate
+## fun id_of
 
 ```mach
-pub fun registry_validate(reg: *AbiRegistry) err[fail.Fail];
-```
-
-## fun register
-
-```mach
-pub fun register(reg: *AbiRegistry, vt: *AbiVTable) err[fail.Fail];
-```
-
-## fun lookup
-
-```mach
-pub fun lookup(reg: *AbiRegistry, name: str) opt[*AbiVTable];
-```
-
-## fun registered_count
-
-```mach
-pub fun registered_count(reg: *AbiRegistry) u32;
-```
-
-## fun registered
-
-```mach
-pub fun registered(reg: *AbiRegistry, idx: u32) opt[*AbiVTable];
+pub fun id_of(vt: *AbiVTable) u32;
 ```
 
 ## fun covers_isa

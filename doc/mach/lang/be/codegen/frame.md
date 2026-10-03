@@ -3,64 +3,17 @@
 ## fun run
 
 ```mach
-pub fun run(tgt: *resolved.Target, m: *codegen_mir.MirModule) err[fail.Fail];
+pub fun run(tgt: *binding.Binding, m: *lang_mir.MirModule) err[fail.Fail];
 ```
 
 ## fun prune
 
 ```mach
-pub fun prune(m: *codegen_mir.MirModule) err[fail.Fail];
+pub fun prune(m: *lang_mir.MirModule) err[fail.Fail];
 ```
 
 before selection, a frame slot address no instruction reads is dropped and a
 slot nothing names any more leaves the frame, so a dead address costs
 neither an instruction nor stack. an address or slot a debug binding
 or an asm block names stays, since the debugger or the block reads it
-
-## fun body_writes_sp
-
-```mach
-pub fun body_writes_sp(m: *isa.RegMachine, func: *codegen_mir.MirFunction, sp: codegen_mir.PRegId) bool;
-```
-
-whether the body may move the stack pointer. the encoders write sp only in
-the prologue and epilogue, outgoing arguments live in the fixed frame, and no
-instruction set allocates stack dynamically, so the writers are an inline-asm
-block that writes sp and an instruction naming sp as a register operand
-
-## fun sp_fixed
-
-```mach
-pub fun sp_fixed(frame: *codegen_mir.MirFrame) bool;
-```
-
-the declared frame property: sp == fp - base_dist for the whole body
-
-## fun slot_offset
-
-```mach
-pub fun slot_offset(frame: *codegen_mir.MirFrame, v: u32) opt[i64];
-```
-
-## fun slot_sp_offset
-
-```mach
-pub fun slot_sp_offset(frame: *codegen_mir.MirFrame, v: u32) opt[i64];
-```
-
-## fun slots_from_sp
-
-```mach
-pub fun slots_from_sp(frame: *codegen_mir.MirFrame) bool;
-```
-
-## fun slot_extent
-
-```mach
-pub fun slot_extent(frame: *codegen_mir.MirFrame, v: u32, disp: *i64, size: *u32) bool;
-```
-
-the byte extent an encoder addresses a slot at: the displacement from the
-slot base register (the stack pointer when slots_from_sp, else the frame
-pointer) and the slot's size. false when v owns no slot
 

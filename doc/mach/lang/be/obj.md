@@ -40,7 +40,7 @@ pub fun deferred_dnit(d: *DeferredRelocs);
 
 ```mach
 pub fun defer_relocation_for_target(d: *DeferredRelocs, rec: DeferredReloc,
-tgt: *lang_target.Target, section_kind: target_of.SectionKind,
+tgt: *lang_target.Binding, section_kind: target_of.SectionKind,
 codegen_image: bool) err[fail.Fail];
 ```
 
@@ -60,6 +60,6 @@ src: *target_of.ObjectImage, remap: intern.Remap) res[target_of.ObjectImage, fai
 ## fun emit_image
 
 ```mach
-pub fun emit_image(o: *target_of.ObjectImage, tgt: *lang_target.Target, destination: str) err[fail.Fail];
+pub fun emit_image(o: *target_of.ObjectImage, tgt: *lang_target.Binding, destination: str) err[fail.Fail];
 ```
 

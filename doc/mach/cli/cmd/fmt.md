@@ -34,16 +34,23 @@ pub fun classify(operand: str) res[Operand, fail.Fail];
 which form the operand takes. `-` is the stream; a directory, or a file named
 mach.toml, is a project; any other existing file is a single source
 
+## val COMMAND
+
+```mach
+pub val COMMAND: args.CommandSpec = args.CommandSpec;
+```
+
+`mach fmt`
+
 ## fun run
 
 ```mach
-pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64;
+pub fun run(cx: *args.Call) res[i64, fail.Fail];
 ```
 
 `mach fmt <path>|<file>|- [--check]`
 
-argv: the full process arguments
-inv: the parsed invocation for this command
+cx: the call
 ret: exit.OK when every input is canonical (or was made so), exit.USER when an input differs
-      under --check or is malformed, otherwise the code `exit.of` maps the printed failure to
+     under --check or is malformed, otherwise the failure
 

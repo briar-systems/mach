@@ -282,7 +282,7 @@ pub fun op_mem(base: i32, disp: i64, index: i32, scale: u8, size: u8) Operand;
 ## fun op_sym
 
 ```mach
-pub fun op_sym(name_off: usize, name_len: usize, mod: isa.SymModifier, size: u8) Operand;
+pub fun op_sym(name_off: usize, name_len: usize, mod: isa_inst.SymModifier, size: u8) Operand;
 ```
 
 ## fun is_space
@@ -339,7 +339,7 @@ the rejection carrying a made text, or the failure that refused to make it
 
 ```mach
 pub fun cursor_init(c: *Cursor, g: *Grammar, body: str, alloc: *A.Allocator,
-interner: *intern.Interner, f: *codegen_mir.MirFunction, pl: *codegen_mir.MirAsm);
+interner: *intern.Interner, f: *lang_mir.MirFunction, pl: *lang_mir.MirAsm);
 ```
 
 ## fun claim
@@ -408,32 +408,32 @@ pub fun labels_dnit(l: *Labels);
 ## fun label_record_def
 
 ```mach
-pub fun label_record_def(st: *codegen_encode.EncodeState, g: *Grammar, l: *Labels, number: u32, off: u32) err[fail.Fail];
+pub fun label_record_def(st: *isa_encode.EncodeState, g: *Grammar, l: *Labels, number: u32, off: u32) err[fail.Fail];
 ```
 
 ## fun resolve_local
 
 ```mach
-pub fun resolve_local(st: *codegen_encode.EncodeState, c: *Cursor, l: *Labels, patch_pos: u32,
+pub fun resolve_local(st: *isa_encode.EncodeState, c: *Cursor, l: *Labels, patch_pos: u32,
 number: u32, fwd: bool) err[fail.Fail];
 ```
 
 ## fun encode_block
 
 ```mach
-pub fun encode_block(st: *codegen_encode.EncodeState, g: *Grammar, f: *codegen_mir.MirFunction, mi: *codegen_mir.MirInstr) err[fail.Fail];
+pub fun encode_block(st: *isa_encode.EncodeState, g: *Grammar, f: *lang_mir.MirFunction, mi: *lang_mir.MirInstr) err[fail.Fail];
 ```
 
 ## fun run
 
 ```mach
-pub fun run(st: *codegen_encode.EncodeState, g: *Grammar, c: *Cursor, l: *Labels) err[fail.Fail];
+pub fun run(st: *isa_encode.EncodeState, g: *Grammar, c: *Cursor, l: *Labels) err[fail.Fail];
 ```
 
 ## fun admitted_extensions
 
 ```mach
-pub fun admitted_extensions(st: *codegen_encode.EncodeState, c: *Cursor) u64;
+pub fun admitted_extensions(st: *isa_encode.EncodeState, c: *Cursor) u64;
 ```
 
 the extensions an instruction in this body may use: the target's selection,

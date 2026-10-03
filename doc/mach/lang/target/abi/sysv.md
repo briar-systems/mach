@@ -3,7 +3,7 @@
 ## fun callee_saved
 
 ```mach
-pub fun callee_saved(out: *isa.Register) i32;
+pub fun callee_saved(out: *target_model.Register) i32;
 ```
 
 ## fun va_model
@@ -12,9 +12,9 @@ pub fun callee_saved(out: *isa.Register) i32;
 pub fun va_model() abi.VaModel;
 ```
 
-## fun register
+## val VTABLE
 
 ```mach
-pub fun register(reg: *abi.AbiRegistry) err[fail.Fail];
+pub val VTABLE: abi.AbiVTable = abi.AbiVTable;
 ```
 

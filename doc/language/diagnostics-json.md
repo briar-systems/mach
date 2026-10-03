@@ -1,6 +1,8 @@
 # Machine-readable diagnostics
 
-`mach build`, `mach check` and `mach test` take `--diagnostics=<human|json>`.
+`mach build`, `mach check` and `mach test` take `--diagnostics <human|json>`,
+or `--diagnostics=json`, as every long option that takes a value accepts it
+after `=` in its own word.
 `human`, the default, is the rendering shown in [diagnostics.md](diagnostics.md).
 `json` writes everything the command reports as JSON objects, one per line of
 stderr (NDJSON), for editors, CI and other tools: each diagnostic, each failure
@@ -11,7 +13,7 @@ release to release, and a record changes only under the
 [stability rule](#stability). The flag changes no exit code.
 
 ```
-mach check . --diagnostics=json
+mach check . --diagnostics json
 ```
 
 A bare `--diagnostics` or any other value is refused with
@@ -21,8 +23,8 @@ and `-vv` write the [readout](readout.md) as [readout records](#readout-records)
 ## The stream
 
 - Records go to stderr, one per line, in the order the human rendering shows
-  the same reports. Stdout keeps what the command writes there, such as the
-  events of `mach test --format json` or a build step's banner.
+  the same reports. Stdout keeps what the command writes there, such as a test
+  run's human readout or a build step's banner.
 - Every line mach writes to stderr is a record, a JSON object on a line of its
   own, and the last one is the [summary](#the-summary-record). Output a build
   step or a test writes itself is not mach's and is not a record.
@@ -170,12 +172,19 @@ that names nothing, has no `origin`.
 
 ## Test records
 
-Under `mach test` each test's result is a record, in the order the tests
-finish:
+Under `mach test` a run is records too, beside the human readout on stdout.
+Each (target, profile) whose tests run opens with a `run_start` record, writes
+a `test` record per test in the order the tests finish, and closes with a
+`run_end` record. A (target, profile) whose tests were built and not run is a
+`skip` record, and under `--list` each collected test is a `case` record.
 
 ```json
-{"schema":1,"record":"test","name":"app.main#parses","module":"app.main","file":"src/main.mach","line":10,"outcome":"exit","code":3,"origin":"test"}
+{"schema":1,"record":"run_start","tests":14}
+{"schema":1,"record":"test","name":"app.main#parses","module":"app.main","file":"src/main.mach","line":10,"index":4,"target":"linux","profile":"debug","outcome":"exit","code":3,"timeout_ns":0,"duration_ns":1204000,"exe":"out/linux/debug/test/app/app","output":"out/linux/debug/test/app/log/4.log","origin":"test"}
+{"schema":1,"record":"run_end","passed":13,"failed":1,"total":14,"duration_ns":61000000,"mismatch":1,"unsupported":0,"target_unavailable":0,"infrastructure_failure":0,"resource_exhaustion":0,"timed_out":0,"invalid_injection":0,"origin":"test"}
 ```
+
+A `test` or `case` record names its test with these members:
 
 | Member | Type | Meaning |
 |---|---|---|
@@ -183,11 +192,28 @@ finish:
 | `module` | string | the module that declares it |
 | `file` | string | the source file, spelled as a span's `file` is |
 | `line` | integer | the line of its declaration, from 1 |
-| `outcome` | string | how it ended, the `kind` `mach test --format json` reports: `"pass"`, `"exit"`, `"signal"`, `"timeout"`, `"spawn"` or `"other"` |
+| `index` | integer | its index in the dispatcher, the argument a rerun passes |
+| `target` | string or `null` | the target it ran for |
+| `profile` | string or `null` | the profile it ran under |
+
+A `test` record adds how it ended:
+
+| Member | Type | Meaning |
+|---|---|---|
+| `outcome` | string | `"pass"`, `"exit"`, `"signal"`, `"timeout"`, `"spawn"` or `"other"` |
 | `code` | integer | its exit code, or `0` when it has none |
+| `timeout_ns` | integer | the `--timeout` bound in nanoseconds, `0` when unbounded |
+| `duration_ns` | integer | how long it ran, in nanoseconds |
+| `exe` | string | the dispatcher that ran it |
+| `output` | string or `null` | the file holding its captured output, kept for a test that failed |
 | `origin` | string | `"test"` |
 
-A test record carries no `severity` and counts in no summary total; the
+A `case` record adds `object`, the test object that holds the test. A `skip`
+record carries `target`, `profile` and `reason`. `run_start` carries `tests`,
+the run's count, and `run_end` the run's totals: `passed`, `failed`, `total`,
+`duration_ns`, `timed_out` and the count of each failure class.
+
+None of these records carries a `severity` or counts in a summary total; the
 summary's `outcome` and `exit_code` say whether a test failed.
 
 ## Readout records
@@ -210,7 +236,7 @@ several units and a `profile <name>:` header only when it has several profiles:
 | Member | Type | Meaning |
 |---|---|---|
 | `verb` | string | what the unit does, `"building"` or `"checking"` |
-| `artifact` | string or `null` | the artifact, or `null` for the whole project |
+| `artifact` | string | the artifact the unit builds |
 | `target` | string | the target, absent when the unit names none |
 | `profile` | string | the profile, absent when the unit names none |
 
@@ -218,7 +244,7 @@ A **phase** record is a phase row:
 
 | Member | Type | Meaning |
 |---|---|---|
-| `name` | string | the row's label: `load`, `resolve`, `sema`, `lower`, `optimize`, `codegen`, `emit`, `link`, `cache`, `test lower`, `test codegen`, or `other` for the time no row accounts for |
+| `name` | string | the row's label: `steps`, `load`, `resolve`, `sema`, `lower`, `optimize`, `codegen`, `emit`, `link`, `cache`, `test lower`, `test codegen`, or `other` for the time no row accounts for |
 | `count` | integer | what the phase processed; absent for `other` |
 | `unit` | string | the noun the count is in, singular for a count of one: `"modules"`, `"objects"` |
 | `time_us` | integer | the phase's time |
@@ -287,4 +313,4 @@ A `built` object has the unit's `out` (string), `modules` (integer), `bytes`
 
 - [diagnostics.md](diagnostics.md) — keys, the registry and its never-reused rule
 - [readout.md](readout.md) — what `-v` and `-vv` show, on which stream, and when
-- [test.md](test.md#json-output) — `mach test --format json`, the test runner's event stream on stdout
+- [test.md](test.md#json-output) — the records of a test run

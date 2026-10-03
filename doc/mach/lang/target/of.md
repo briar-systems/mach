@@ -1063,48 +1063,6 @@ pub rec SymtabEntry;
 pub rec ExportSym;
 ```
 
-## def Subsystem
-
-```mach
-pub def Subsystem: u8
-```
-
-## val SUBSYSTEM_CONSOLE
-
-```mach
-pub val SUBSYSTEM_CONSOLE: Subsystem = 0
-```
-
-## val SUBSYSTEM_GUI
-
-```mach
-pub val SUBSYSTEM_GUI:     Subsystem = 1
-```
-
-## val SUBSYSTEM_CATALOG_VERSION
-
-```mach
-pub val SUBSYSTEM_CATALOG_VERSION: u8 = 1
-```
-
-## fun subsystem_from_name
-
-```mach
-pub fun subsystem_from_name(name: str) opt[Subsystem];
-```
-
-## fun subsystem_name
-
-```mach
-pub fun subsystem_name(s: Subsystem) str;
-```
-
-## fun subsystem_fingerprint_tag
-
-```mach
-pub fun subsystem_fingerprint_tag(s: Subsystem) u8;
-```
-
 ## rec ResourceInfo
 
 ```mach
@@ -1120,7 +1078,7 @@ pub rec ImageOptions;
 ## fun image_options_default
 
 ```mach
-pub fun image_options_default(subsystem: Subsystem) ImageOptions;
+pub fun image_options_default(subsystem: catalog_subsystem.Subsystem) ImageOptions;
 ```
 
 ## fun effective_stack_reserve
@@ -1269,6 +1227,12 @@ against what the target can link at all, never against the extensions it selects
 pub rec ElfAttributes;
 ```
 
+## rec ElfRelocationCapabilities
+
+```mach
+pub rec ElfRelocationCapabilities;
+```
+
 ## rec BranchReach
 
 ```mach
@@ -1343,71 +1307,6 @@ pub rec HeaderShape;
 pub rec OfVTable;
 ```
 
-## fun artifact_vtable
-
-```mach
-pub fun artifact_vtable(id: u32, name: str, object_ext: str,
-emit_object: WriterFn) OfVTable;
-```
-
-## fun linker_vtable
-
-```mach
-pub fun linker_vtable(id: u32, name: str, object_ext: str,
-emit_object: WriterFn, parse_object: ParserFn,
-emit_exec: ExecFn) OfVTable;
-```
-
-## fun direct_image_vtable
-
-```mach
-pub fun direct_image_vtable(id: u32, name: str, object_ext: str,
-emit_object: WriterFn, parse_object: ParserFn,
-emit_exec: ExecFn, emit_exec_image: ExecImageFn) OfVTable;
-```
-
-## fun with_dynamic_exec
-
-```mach
-pub fun with_dynamic_exec(vt: *OfVTable, emit: DynExecFn);
-```
-
-## fun with_shared_output
-
-```mach
-pub fun with_shared_output(vt: *OfVTable, emit: SharedFn);
-```
-
-## def ArtifactOutputKind
-
-```mach
-pub def ArtifactOutputKind: u8
-```
-
-## val ARTIFACT_EXECUTABLE
-
-```mach
-pub val ARTIFACT_EXECUTABLE: ArtifactOutputKind = 0
-```
-
-## val ARTIFACT_STATIC_LIB
-
-```mach
-pub val ARTIFACT_STATIC_LIB: ArtifactOutputKind = 1
-```
-
-## val ARTIFACT_SHARED_LIB
-
-```mach
-pub val ARTIFACT_SHARED_LIB: ArtifactOutputKind = 2
-```
-
-## val ARTIFACT_OBJECT
-
-```mach
-pub val ARTIFACT_OBJECT:     ArtifactOutputKind = 3
-```
-
 ## rec ArtifactName
 
 ```mach
@@ -1417,55 +1316,30 @@ pub rec ArtifactName;
 ## fun artifact_naming
 
 ```mach
-pub fun artifact_naming(vt: *OfVTable, os_name: str, kind: ArtifactOutputKind) res[ArtifactName, fail.Fail];
+pub fun artifact_naming(vt: *OfVTable, os_name: str, kind: catalog_artifact.Kind) res[ArtifactName, fail.Fail];
 ```
 
-## rec OfRegistry
+## fun validate
 
 ```mach
-pub rec OfRegistry;
+pub fun validate(a: *A.Allocator, vt: *OfVTable) err[fail.Fail];
 ```
 
-## fun registry_init_with_allocator
+why a descriptor is malformed, read once when a registry adds it
+
+a: formats the refusal
+vt: the descriptor
+
+## fun name_of
 
 ```mach
-pub fun registry_init_with_allocator(alloc: *A.Allocator) OfRegistry;
+pub fun name_of(vt: *OfVTable) str;
 ```
 
-## fun registry_dnit
+## fun id_of
 
 ```mach
-pub fun registry_dnit(reg: *OfRegistry);
-```
-
-## fun registry_validate
-
-```mach
-pub fun registry_validate(reg: *OfRegistry) err[fail.Fail];
-```
-
-## fun register
-
-```mach
-pub fun register(reg: *OfRegistry, vt: *OfVTable) err[fail.Fail];
-```
-
-## fun lookup
-
-```mach
-pub fun lookup(reg: *OfRegistry, name: str) opt[*OfVTable];
-```
-
-## fun registered_count
-
-```mach
-pub fun registered_count(reg: *OfRegistry) u32;
-```
-
-## fun registered
-
-```mach
-pub fun registered(reg: *OfRegistry, idx: u32) opt[*OfVTable];
+pub fun id_of(vt: *OfVTable) u32;
 ```
 
 ## val DBG_UNKNOWN
@@ -1485,6 +1359,22 @@ pub val DBG_DWARF:    u32 = 1
 ```mach
 pub val DBG_SPIRV:    u32 = 3
 ```
+
+## def DebugShape
+
+```mach
+pub def DebugShape: u8
+```
+
+how a debug model reaches its format
+
+## val DEBUG_SHAPE_SECTIONS
+
+```mach
+pub val DEBUG_SHAPE_SECTIONS: DebugShape = 0
+```
+
+appends its own sections to a finished object image from address-keyed rows, through produce
 
 ## val DEBUG_SHAPE_MODULE
 
@@ -1506,18 +1396,6 @@ pub rec DebugProduceRequest;
 pub rec DebugVTable;
 ```
 
-## fun sections_debug_model
-
-```mach
-pub fun sections_debug_model(id: u32, name: str, produce: DebugProduceFn, supports: DebugSupportsFn) DebugVTable;
-```
-
-## fun module_debug_model
-
-```mach
-pub fun module_debug_model(id: u32, name: str, supports: DebugSupportsFn) DebugVTable;
-```
-
 ## fun debug_shape_for
 
 ```mach
@@ -1527,68 +1405,28 @@ pub fun debug_shape_for(vt: *OfVTable) DebugShape;
 a format whose object is the finished artifact takes its debug model from the emitter that
 builds it, and a format of linkable objects takes one that appends sections
 
-## rec DebugRegistry
+## fun debug_validate
 
 ```mach
-pub rec DebugRegistry;
+pub fun debug_validate(a: *A.Allocator, vt: *DebugVTable) err[fail.Fail];
 ```
 
-## fun debug_registry_init_with_allocator
+why a debug descriptor is malformed, read once when a registry adds it
+
+a: formats the refusal
+vt: the descriptor
+
+## fun debug_name_of
 
 ```mach
-pub fun debug_registry_init_with_allocator(alloc: *A.Allocator) DebugRegistry;
+pub fun debug_name_of(vt: *DebugVTable) str;
 ```
 
-## fun debug_registry_dnit
+## fun debug_id_of
 
 ```mach
-pub fun debug_registry_dnit(reg: *DebugRegistry);
+pub fun debug_id_of(vt: *DebugVTable) u32;
 ```
-
-## fun debug_register
-
-```mach
-pub fun debug_register(reg: *DebugRegistry, vt: *DebugVTable) err[fail.Fail];
-```
-
-## fun debug_registry_validate
-
-```mach
-pub fun debug_registry_validate(reg: *DebugRegistry) err[fail.Fail];
-```
-
-## fun debug_lookup
-
-```mach
-pub fun debug_lookup(reg: *DebugRegistry, name: str) opt[*DebugVTable];
-```
-
-## fun debug_registered_count
-
-```mach
-pub fun debug_registered_count(reg: *DebugRegistry) u32;
-```
-
-## fun debug_hooks_complete
-
-```mach
-pub fun debug_hooks_complete(reg: *DebugRegistry) err[fail.Fail];
-```
-
-## fun debug_registered
-
-```mach
-pub fun debug_registered(reg: *DebugRegistry, idx: u32) opt[*DebugVTable];
-```
-
-## fun cover_isa
-
-```mach
-pub fun cover_isa(vt: *OfVTable, arch_id: u32) err[fail.Fail];
-```
-
-a further covered instruction set; a descriptor naming more than the list
-holds is refused
 
 ## fun covers_isa
 

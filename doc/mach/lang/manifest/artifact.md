@@ -6,6 +6,22 @@
 pub fun parse_artifacts(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) err[fail.Fail];
 ```
 
+## fun export_validate
+
+```mach
+pub fun export_validate(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest) err[fail.Fail];
+```
+
+more than one `export = true` artifact is refused, pointing at each `export` value
+
+## fun export_artifact
+
+```mach
+pub fun export_artifact(m: *Manifest) *ArtifactDef;
+```
+
+the export library: the one artifact marked `export = true`, nil when none is
+
 ## fun find_artifact
 
 ```mach

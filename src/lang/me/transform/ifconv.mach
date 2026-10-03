@@ -36,7 +36,9 @@ use std.types.size.usize;
 
 use A: std.allocator;
 
-use me_ir:          mach.lang.me.ir;
+use mach.lang.me.analysis;
+use me_ir: mach.lang.me.ir;
+use mach.lang.me.ir.builder;
 use ir_effect:      mach.lang.me.ir.effect;
 use ir_id:          mach.lang.me.ir.id;
 use ir_instruction: mach.lang.me.ir.instruction;
@@ -48,6 +50,7 @@ use ir_type: mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.me.pass;
 use lang_source: mach.lang.source;
+#[testing]
 use lang_target: mach.lang.target;
 
 # the cost units a conversion may add to the path that would have run: a
@@ -86,12 +89,12 @@ rec Shape {
 
 # a run that owns its workspace
 #[testing]
-pub fun run(m: *me_ir.Module, tgt: *lang_target.Target) res[bool, fail.Fail] {
+pub fun run(m: *me_ir.Module, tgt: *resolved.Target) res[bool, fail.Fail] {
     ret pass.run_alone(?PASS, m, tgt);
 }
 
 # the pass the pipeline schedules
-pub val PASS: pass.Pass = pass.Pass{run: nil, applies: applies, visit: convert_function, skips: pass.SKIP_EXTERN | pass.SKIP_EMPTY, eligible: nil, rounds: 1};
+pub val PASS: pass.Pass = pass.Pass{run: nil, applies: applies, preserves: analysis.NONE, visit: convert_function, skips: pass.SKIP_EXTERN | pass.SKIP_EMPTY, eligible: nil, rounds: 1};
 
 # a target that keeps structured control flow keeps every diamond it has
 fun applies(ctx: *pass.Context) bool {
@@ -139,7 +142,7 @@ fun terminator_of(fn: *me_ir.Function, bid: ir_id.BlockId) opt[*ir_instruction.I
     ret me_ir.instruction_get(fn, blk.terminator);
 }
 
-fun convert_block(m: *me_ir.Module, fn: *me_ir.Function, tgt: *lang_target.Target, h: ir_id.BlockId) res[bool, fail.Fail] {
+fun convert_block(m: *me_ir.Module, fn: *me_ir.Function, tgt: *resolved.Target, h: ir_id.BlockId) res[bool, fail.Fail] {
     val topt: opt[*ir_instruction.Instruction] = terminator_of(fn, h);
     if (!sel topt.some) { ret res[bool, fail.Fail].ok{false}; }
     val term: *ir_instruction.Instruction = topt.some;
@@ -267,7 +270,7 @@ fun op_cost(m: *me_ir.Module, inst: *ir_instruction.Instruction) u32 {
 
 # every join phi reads one incoming along each outcome; the ones that differ
 # become selects, which must fit a register and the budget
-fun phis_admit(m: *me_ir.Module, fn: *me_ir.Function, tgt: *lang_target.Target, shape: *Shape) bool {
+fun phis_admit(m: *me_ir.Module, fn: *me_ir.Function, tgt: *resolved.Target, shape: *Shape) bool {
     val jb:    *me_ir.Block = ?fn.blocks[shape.join::u32];
     var total: u32          = shape.cost;
     var pi:    u32          = 0;
@@ -280,7 +283,7 @@ fun phis_admit(m: *me_ir.Module, fn: *me_ir.Function, tgt: *lang_target.Target, 
         var vf:  value.Value;
         if (!incoming(phi, shape.from_t, ?vt) || !incoming(phi, shape.from_f, ?vf)) { ret false; }
         if (read_as_aggregate(m, fn, jb.phis[pi - 1]))                              { ret false; }
-        if (same_value(vt, vf))                                                     { cnt; }
+        if (value.is_same_definition(vt, vf))                                       { cnt; }
         if (!selectable(m, tgt, phi.ty))                                            { ret false; }
         total = total + SIMPLE_COST;
     }
@@ -320,13 +323,6 @@ fun incoming(phi: *ir_instruction.Instruction, from: ir_id.BlockId, out: *value.
     ret found;
 }
 
-fun same_value(a: value.Value, b: value.Value) bool {
-    if (a.kind != b.kind)          { ret false; }
-    if (a.kind == value.VAL_INSTR) { ret ir_id.instruction_same(a.data.instr, b.data.instr); }
-    if (a.kind == value.VAL_PARAM) { ret a.data.param_ix == b.data.param_ix; }
-    ret false;
-}
-
 fun flatten(m: *me_ir.Module, fn: *me_ir.Function, h: ir_id.BlockId, term: *ir_instruction.Instruction, cond: value.Value, shape: *Shape) err[fail.Fail] {
     # adding a select can move the instruction array, so nothing holds a pointer into it across one
     val loc:  lang_source.Location = term.loc;
@@ -353,14 +349,14 @@ fun flatten(m: *me_ir.Module, fn: *me_ir.Function, h: ir_id.BlockId, term: *ir_i
             ret err[fail.Fail].err{fail.message("ifconv: a join phi lost an incoming it was admitted with")};
         }
         var chosen: value.Value = vt;
-        if (!same_value(vt, vf)) {
+        if (!value.is_same_definition(vt, vf)) {
             val rs: res[value.Value, fail.Fail] = add_select(m, fn, h, loc, cond, vt, vf, phi_id, site);
             if (sel rs.err) { ret err[fail.Fail].err{rs.err}; }
             chosen = rs.ok;
         }
         val phi: *ir_instruction.Instruction = ?fn.instrs[phi_id::u32];
-        drop_incoming(phi, shape.from_t);
-        drop_incoming(phi, shape.from_f);
+        me_ir.phi_incoming_del(phi, shape.from_t);
+        me_ir.phi_incoming_del(phi, shape.from_f);
         if (phi.operand_count == 0) {
             mutate.replace_uses(fn, phi_id, chosen);
             cnt;
@@ -417,53 +413,21 @@ fun hoist_arm(m: *me_ir.Module, fn: *me_ir.Function, h: ir_id.BlockId, arm: *Arm
 
 fun add_select(m: *me_ir.Module, fn: *me_ir.Function, h: ir_id.BlockId, loc: lang_source.Location, cond: value.Value,
     vt: value.Value, vf: value.Value, phi_id: ir_id.InstructionId, site: u32) res[value.Value, fail.Fail] {
-    val ro: res[me_ir.OperandArray, fail.Fail] = me_ir.operands_alloc(m, 3);
-    if (sel ro.err) { ret res[value.Value, fail.Fail].err{ro.err}; }
-    val ops: *value.Value                = ro.ok.ops;
     val phi: *ir_instruction.Instruction = ?fn.instrs[phi_id::u32];
+    val ty:  ir_type.IrTypeId            = phi.ty;
+    var ops: [3]value.Value;
     ops[0] = cond;
-    ops[1] = value.retype(vt, phi.ty);
-    ops[2] = value.retype(vf, phi.ty);
-
-    var sel_i: ir_instruction.Instruction;
-    sel_i.kind          = ir_instruction.OP_SELECT;
-    sel_i.ty            = phi.ty;
-    sel_i.operands      = ops;
-    sel_i.operand_count = 3;
-    sel_i.operand_cap   = 3;
-    sel_i.flags         = 0;
-    sel_i.aux_ty        = ir_type.IRT_NIL;
-    sel_i.loc           = loc;
-    sel_i.secret        = phi.secret;
-    sel_i.arg_ext       = ir_type.EXT_LIST_EMPTY;
-
-    val ri: res[ir_id.InstructionId, fail.Fail] = me_ir.instruction_add(m, fn, sel_i);
+    ops[1] = value.retype(vt, ty);
+    ops[2] = value.retype(vf, ty);
+    var bld: builder.Builder = builder.init(m);
+    builder.set_function(?bld, fn);
+    builder.set_loc(?bld, loc);
+    builder.set_secret(?bld, phi.secret);
+    builder.set_site(?bld, site);
+    builder.at_end(?bld, h);
+    val ri: res[ir_id.InstructionId, fail.Fail] = builder.emit_instr(?bld, ir_instruction.OP_SELECT, ty, ir_type.IRT_NIL, ?ops[0], 3);
     if (sel ri.err) { ret res[value.Value, fail.Fail].err{ri.err}; }
-    val iid: ir_id.InstructionId = ri.ok;
-    val ra:  err[fail.Fail]      = me_ir.block_append_instr(m, ?fn.blocks[h::u32], iid);
-    if (sel ra.err) { ret res[value.Value, fail.Fail].err{ra.err}; }
-    if (site != 0) {
-        val rs: err[fail.Fail] = me_ir.instr_inline_site_set(fn, iid, site);
-        if (sel rs.err) { ret res[value.Value, fail.Fail].err{rs.err}; }
-    }
-    ret res[value.Value, fail.Fail].ok{value.instr(iid, sel_i.ty)};
-}
-
-fun drop_incoming(phi: *ir_instruction.Instruction, from: ir_id.BlockId) {
-    var o: u32 = 0;
-    for (o + 1 < phi.operand_count) {
-        if (ir_id.block_same(me_ir.block_target(phi.operands[o]), from)) {
-            var k: u32 = o;
-            for (k + 2 < phi.operand_count) {
-                phi.operands[k]     = phi.operands[k + 2];
-                phi.operands[k + 1] = phi.operands[k + 3];
-                k                   = k + 2;
-            }
-            phi.operand_count = phi.operand_count - 2;
-            ret;
-        }
-        o = o + 2;
-    }
+    ret res[value.Value, fail.Fail].ok{value.instr(ri.ok, ty)};
 }
 
 fun type_of(m: *me_ir.Module, ty: ir_type.IrTypeId) opt[*ir_type.IrType] {
@@ -491,7 +455,7 @@ fun scalar(m: *me_ir.Module, ty: ir_type.IrTypeId) bool {
 }
 
 # what a select chooses: an integer no wider than a general register, or a pointer
-fun selectable(m: *me_ir.Module, tgt: *lang_target.Target, ty: ir_type.IrTypeId) bool {
+fun selectable(m: *me_ir.Module, tgt: *resolved.Target, ty: ir_type.IrTypeId) bool {
     val t: opt[*ir_type.IrType] = type_of(m, ty);
     if (!sel t.some)                    { ret false; }
     if (t.some.kind == ir_type.IRT_PTR) { ret true; }
@@ -501,8 +465,8 @@ fun selectable(m: *me_ir.Module, tgt: *lang_target.Target, ty: ir_type.IrTypeId)
 }
 
 use mach.lang.intern;
-use mach.lang.me.ir.builder;
 use mach.lang.target.resolved;
+#[testing]
 use target_testing: mach.lang.target.testing;
 use std.allocator.page;
 
@@ -600,13 +564,12 @@ fun t_diamond(m: *me_ir.Module, i64t: ir_type.IrTypeId, ptrt: ir_type.IrTypeId, 
 test run__flattens_a_diamond_and_keeps_the_branch_it_must {
     var alloc: A.Allocator;
     page.make(?alloc);
-    var reg: lang_target.TargetRegistry = lang_target.registry_init();
-    fin { lang_target.registry_dnit(?reg); }
-    val rreg: err[fail.Fail] = lang_target.register_all(?reg, target_testing.debug_descriptor);
+    var reg:  lang_target.TargetRegistry = lang_target.registry_init();
+    val rreg: err[fail.Fail]             = lang_target.register_all(?reg, ?target_testing.DEBUG);
     if (sel rreg.err) { ret 1; }
-    val rt: res[resolved.Target, fail.Fail] = lang_target.select(?reg, "x86_64", "linux", "sysv64");
+    val rt: res[lang_target.Binding, fail.Fail] = lang_target.select(?reg, "x86_64", "linux", "sysv64");
     if (sel rt.err) { ret 1; }
-    var tgt: resolved.Target = rt.ok;
+    var tgt: resolved.Target = rt.ok.target;
 
     val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
     if (sel rm.err) { ret 1; }

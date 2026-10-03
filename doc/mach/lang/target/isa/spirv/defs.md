@@ -167,16 +167,32 @@ pub rec DefStorage;
 pub fun set_import_name(set: u8) str;
 ```
 
-## fun register_defs
+## var TABLE
 
 ```mach
-pub fun register_defs(storage: *DefStorage) *isa.TargetDefs;
+pub var TABLE: target_definition.Table
+```
+
+the table the instruction set declares; empty until `build` fills it
+
+## fun build
+
+```mach
+pub fun build();
+```
+
+fill TABLE; a second build writes the same rows
+
+## fun table_build
+
+```mach
+pub fun table_build(storage: *DefStorage) *target_definition.Table;
 ```
 
 ## fun is_image_operands
 
 ```mach
-pub fun is_image_operands(en: *isa.OpEnum) bool;
+pub fun is_image_operands(en: *target_definition.OpEnum) bool;
 ```
 
 whether `en` is an instruction's view of the Image Operands mask

@@ -78,6 +78,14 @@ pub val TEST_CODEGEN: Phase = 10
 
 a test build's test objects, generated
 
+## val STEPS
+
+```mach
+pub val STEPS: Phase = 11
+```
+
+the build steps a project and its dependencies declare
+
 ## rec PhaseSpec
 
 ```mach
@@ -124,8 +132,7 @@ pub rec Unit;
 ```
 
 a unit of the plan starts: what its goal calls the work (`building`,
-`checking`), the artifact, or none for the whole project, the target and the
-profile
+`checking`), the artifact, the target and the profile
 
 ## rec PhaseEnd
 
@@ -240,7 +247,7 @@ what the sink asks to receive
 ## fun unit
 
 ```mach
-pub fun unit(sink: *Sink, artifact: str, target: str, profile: str, verb: str, has_artifact: bool);
+pub fun unit(sink: *Sink, artifact: str, target: str, profile: str, verb: str);
 ```
 
 a unit starts; a nil sink is a no-op

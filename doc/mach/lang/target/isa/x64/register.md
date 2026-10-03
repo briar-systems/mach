@@ -1,8 +1,26 @@
 # mach.lang.target.isa.x64.register
 
-## fun register_x64
+## val MODEL
 
 ```mach
-pub fun register_x64(reg: *isa.IsaRegistry) err[fail.Fail];
+pub val MODEL: target_model.Machine = target_model.Machine;
+```
+
+## val MACHINE
+
+```mach
+pub val MACHINE: isa.RegMachine = isa.RegMachine;
+```
+
+## val RELOC
+
+```mach
+pub val RELOC: target_of.RelocationCapabilities = target_of.RelocationCapabilities;
+```
+
+## val VTABLE
+
+```mach
+pub val VTABLE: isa.IsaVTable = isa.IsaVTable;
 ```
 

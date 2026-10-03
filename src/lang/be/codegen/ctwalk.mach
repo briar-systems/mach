@@ -13,13 +13,14 @@ use std.types.string.str_len;
 
 use A: std.allocator;
 
-use mach.lang.be.codegen.frame;
-use codegen_mir: mach.lang.be.codegen.mir;
-use mach.lang.be.codegen.notes;
 use mach.lang.ct;
 use diagnostic_kind: mach.lang.diagnostic.kind;
+use lang_mir:        mach.lang.mir;
 use mach.lang.target.isa;
-use isa_effect: mach.lang.target.isa.effect;
+use isa_effect:   mach.lang.target.isa.effect;
+use isa_encode:   mach.lang.target.isa.encode;
+use isa_inst:     mach.lang.target.isa.inst;
+use target_model: mach.lang.target.model;
 
 # the post-expansion secrecy walk: after allocation,
 # frame insertion, encoding expansion and relaxation, the instruction
@@ -34,30 +35,6 @@ use isa_effect: mach.lang.target.isa.effect;
 # write is a strong update: an instruction's state is the join of every edge
 # that can reach it, so a register a loop redefines from public values is
 # public at the loop's compares whatever it held before
-
-def DescribeFn: fun(*isa.Inst, *isa_effect.InstEffects);
-# absent for an opcode the ISA does not spell, which the render names by tag
-def MnemonicFn: fun(u16) opt[str];
-def RegNameFn:  fun(i32, u8) str;
-
-# the per-ISA half of the effect description, declared beside the encoder
-pub rec IsaEffects {
-    describe: DescribeFn;
-    mnemonic: MnemonicFn;
-    reg_name: RegNameFn;
-    # general-purpose register indexes that never carry a value: the zero
-    # register, and the stack pointer where it shares an index with it
-    const_regs: u64;
-}
-
-pub fun isa_effects_none() IsaEffects {
-    var e: IsaEffects;
-    e.describe   = nil;
-    e.mnemonic   = nil;
-    e.reg_name   = nil;
-    e.const_regs = 0;
-    ret e;
-}
 
 # a refusal names the notification it stopped at; the detail is allocated
 # with the walk's allocator and released by refusal_free
@@ -97,10 +74,10 @@ rec Entry {
 }
 
 rec Walker {
-    f:     *codegen_mir.MirFunction;
-    notes: *notes.AsmNote;
+    f:     *lang_mir.MirFunction;
+    notes: *isa_encode.AsmNote;
     count: u32;
-    eff:   *IsaEffects;
+    eff:   *isa_effect.Hooks;
     tgt:   *isa.BackendTarget;
     alloc: *A.Allocator;
 
@@ -111,6 +88,7 @@ rec Walker {
     callee_fp:   u64;
     fp_reg:      i32;
     sp_reg:      i32;
+    arg_base:    i64;
     const_regs:  u64;
 
     # note index of every block label, by block id
@@ -266,13 +244,13 @@ fun entry_get(w: *Walker, index: u32) res[*Entry, fail.Fail] {
 }
 
 fun reg_index_ok(regid: i32) bool {
-    val cls: i32 = isa.regid_class(regid);
-    ret (cls == isa.REG_CLASS_ID_GP || cls == isa.REG_CLASS_ID_XMM) && isa.regid_index(regid) < 64;
+    val cls: i32 = isa_inst.regid_class(regid);
+    ret (cls == isa_inst.REG_CLASS_ID_GP || cls == isa_inst.REG_CLASS_ID_FP) && isa_inst.regid_index(regid) < 64;
 }
 
 fun reg_secret(w: *Walker, s: *State, regid: i32) bool {
-    val idx: i32 = isa.regid_index(regid);
-    if (isa.regid_class(regid) == isa.REG_CLASS_ID_GP) {
+    val idx: i32 = isa_inst.regid_index(regid);
+    if (isa_inst.regid_class(regid) == isa_inst.REG_CLASS_ID_GP) {
         if ((w.const_regs & isa_effect.reg_bit(idx)) != 0) { ret false; }
         ret (s.gp & isa_effect.reg_bit(idx)) != 0;
     }
@@ -280,9 +258,9 @@ fun reg_secret(w: *Walker, s: *State, regid: i32) bool {
 }
 
 fun set_reg(w: *Walker, s: *State, regid: i32, secret: bool) {
-    val idx: i32 = isa.regid_index(regid);
+    val idx: i32 = isa_inst.regid_index(regid);
     val bit: u64 = isa_effect.reg_bit(idx);
-    if (isa.regid_class(regid) == isa.REG_CLASS_ID_GP) {
+    if (isa_inst.regid_class(regid) == isa_inst.REG_CLASS_ID_GP) {
         if ((w.const_regs & bit) != 0) { ret; }
         if (secret)                    { s.gp = s.gp | bit; }
         or                             { s.gp = s.gp & ~bit; }
@@ -292,7 +270,7 @@ fun set_reg(w: *Walker, s: *State, regid: i32, secret: bool) {
     or          { s.fp = s.fp & ~bit; }
 }
 
-fun operand_at(mi: *isa.Inst, k: u32) *isa.Operand {
+fun operand_at(mi: *isa_inst.Inst, k: u32) *isa_inst.Operand {
     if (k == 0) { ret ?mi.dst; }
     if (k == 1) { ret ?mi.src1; }
     if (k == 2) { ret ?mi.src2; }
@@ -310,13 +288,13 @@ fun role_writes(role: isa_effect.OperandRole) bool {
 # a frame extent: a memory operand whose base is the frame or stack pointer
 # with no index. everything else is an address the IR declared public and
 # whose contents the IR declares through the seeds
-fun slot_operand(w: *Walker, op: *isa.Operand) bool {
-    if (op.kind != isa.OPK_MEM) { ret false; }
-    if (op.index >= 0)          { ret false; }
+fun slot_operand(w: *Walker, op: *isa_inst.Operand) bool {
+    if (op.kind != isa_inst.OPK_MEM) { ret false; }
+    if (op.index >= 0)               { ret false; }
     ret op.base == w.fp_reg || op.base == w.sp_reg;
 }
 
-fun mem_bytes(mi: *isa.Inst, op: *isa.Operand, e: *isa_effect.InstEffects) i64 {
+fun mem_bytes(mi: *isa_inst.Inst, op: *isa_inst.Operand, e: *isa_effect.InstEffects) i64 {
     if (e.mem_bytes != 0) { ret e.mem_bytes::i64; }
     if (op.size != 0)     { ret op.size::i64; }
     if (mi.size != 0)     { ret mi.size::i64; }
@@ -325,13 +303,13 @@ fun mem_bytes(mi: *isa.Inst, op: *isa.Operand, e: *isa_effect.InstEffects) i64 {
 
 # the multiply cell an emitted instruction realizes: its explicit operands
 # in order, the first one's width
-pub fun emitted_mul_cell(mi: *isa.Inst, e: *isa_effect.InstEffects) ct.CtMulCell {
-    var ops: [4]*isa.Operand = [4]*isa.Operand{?mi.dst, ?mi.src1, ?mi.src2, ?mi.src3};
-    var n:   u32             = 0;
-    var w:   u8              = 0;
-    var k:   usize           = 0;
+pub fun emitted_mul_cell(mi: *isa_inst.Inst, e: *isa_effect.InstEffects) ct.CtMulCell {
+    var ops: [4]*isa_inst.Operand = [4]*isa_inst.Operand{?mi.dst, ?mi.src1, ?mi.src2, ?mi.src3};
+    var n:   u32                  = 0;
+    var w:   u8                   = 0;
+    var k:   usize                = 0;
     for (k < 4) {
-        if (ops[k].kind != isa.OPK_NONE) {
+        if (ops[k].kind != isa_inst.OPK_NONE) {
             if (n == 0) { w = ops[k].size; }
             n = n + 1;
         }
@@ -340,21 +318,21 @@ pub fun emitted_mul_cell(mi: *isa.Inst, e: *isa_effect.InstEffects) ct.CtMulCell
     ret ct.asm_mul_cell(e.cls, n, w);
 }
 
-fun instr_defines(mi: *codegen_mir.MirInstr) bool {
+fun instr_defines(mi: *lang_mir.MirInstr) bool {
     if (mi == nil) { ret false; }
-    ret mi.operand_count > 0 && codegen_mir.instr_defines_shape(mi);
+    ret mi.operand_count > 0 && lang_mir.instr_defines_shape(mi);
 }
 
 # the declared secrecy of a register read: a source operand of the MirInstr
 # that was rewritten to this register carries a secret seed
-fun seed_read(seeds: *notes.NoteSeeds, mi: *codegen_mir.MirInstr, regid: i32) bool {
+fun seed_read(seeds: *isa_encode.NoteSeeds, mi: *lang_mir.MirInstr, regid: i32) bool {
     if (mi == nil) { ret false; }
     val defines: bool = instr_defines(mi);
     var k:       u32  = 0;
     for (k < seeds.count && k < mi.operand_count) {
         if (!(k == 0 && defines)) {
-            val op: *codegen_mir.MirOperand = ?mi.operands[k];
-            if (op.kind == codegen_mir.MIR_OP_PREG && codegen_mir.preg_regid(op.preg) == regid && seeds.secret[k]) { ret true; }
+            val op: *lang_mir.MirOperand = ?mi.operands[k];
+            if (op.kind == lang_mir.MIR_OP_PREG && lang_mir.preg_regid(op.preg) == regid && seeds.secret[k]) { ret true; }
         }
         k = k + 1;
     }
@@ -363,56 +341,56 @@ fun seed_read(seeds: *notes.NoteSeeds, mi: *codegen_mir.MirInstr, regid: i32) bo
 
 # the declared secrecy of a register definition: the MirInstr's destination
 # was rewritten to this register and is a secret seed (or a writes_secret load)
-fun seed_write(seeds: *notes.NoteSeeds, mi: *codegen_mir.MirInstr, regid: i32) bool {
+fun seed_write(seeds: *isa_encode.NoteSeeds, mi: *lang_mir.MirInstr, regid: i32) bool {
     if (!instr_defines(mi) || seeds.count == 0) { ret false; }
-    val op: *codegen_mir.MirOperand = ?mi.operands[0];
-    ret op.kind == codegen_mir.MIR_OP_PREG && codegen_mir.preg_regid(op.preg) == regid && seeds.secret[0];
+    val op: *lang_mir.MirOperand = ?mi.operands[0];
+    ret op.kind == lang_mir.MIR_OP_PREG && lang_mir.preg_regid(op.preg) == regid && seeds.secret[0];
 }
 
-fun seed_mem_read(seeds: *notes.NoteSeeds, mi: *codegen_mir.MirInstr) bool {
+fun seed_mem_read(seeds: *isa_encode.NoteSeeds, mi: *lang_mir.MirInstr) bool {
     if (mi == nil) { ret false; }
     val defines: bool = instr_defines(mi);
     var k:       u32  = 0;
     for (k < seeds.count && k < mi.operand_count) {
-        if (!(k == 0 && defines) && mi.operands[k].kind == codegen_mir.MIR_OP_MEM && seeds.secret[k]) { ret true; }
+        if (!(k == 0 && defines) && mi.operands[k].kind == lang_mir.MIR_OP_MEM && seeds.secret[k]) { ret true; }
         k = k + 1;
     }
     ret false;
 }
 
-fun seed_mem_write(seeds: *notes.NoteSeeds, mi: *codegen_mir.MirInstr) bool {
+fun seed_mem_write(seeds: *isa_encode.NoteSeeds, mi: *lang_mir.MirInstr) bool {
     if (!instr_defines(mi) || seeds.count == 0) { ret false; }
-    ret mi.operands[0].kind == codegen_mir.MIR_OP_MEM && seeds.secret[0];
+    ret mi.operands[0].kind == lang_mir.MIR_OP_MEM && seeds.secret[0];
 }
 
-fun clear_vreg_home(w: *Walker, s: *State, v: codegen_mir.VRegId) {
-    if (codegen_mir.vreg_is_nil(v) || v.n >= w.f.vreg_count) { ret; }
-    val vr: *codegen_mir.MirVReg = ?w.f.vregs[v.n];
-    if (!codegen_mir.preg_is_nil(vr.assigned)) { set_reg(w, s, codegen_mir.preg_regid(vr.assigned), false); }
+fun clear_vreg_home(w: *Walker, s: *State, v: lang_mir.VRegId) {
+    if (lang_mir.vreg_is_nil(v) || v.n >= w.f.vreg_count) { ret; }
+    val vr: *lang_mir.MirVReg = ?w.f.vregs[v.n];
+    if (!lang_mir.preg_is_nil(vr.assigned)) { set_reg(w, s, lang_mir.preg_regid(vr.assigned), false); }
     if (vr.spill_slot != -1) {
         var disp: i64 = 0;
         var size: u32 = 0;
-        if (frame.slot_extent(?w.f.frame, v.n, ?disp, ?size)) {
+        if (lang_mir.slot_extent(?w.f.frame, v.n, ?disp, ?size)) {
             var base: i32 = w.fp_reg;
-            if (frame.slots_from_sp(?w.f.frame)) { base = w.sp_reg; }
+            if (lang_mir.slots_from_sp(?w.f.frame)) { base = w.sp_reg; }
             extent_clear(s, base, disp, disp + size::i64);
         }
     }
 }
 
 # the declassify barrier: the named carrier is public from here
-fun apply_barrier(w: *Walker, s: *State, n: *notes.AsmNote) {
-    var seeds: notes.NoteSeeds;
-    notes.note_seeds(w.f, n, ?seeds);
+fun apply_barrier(w: *Walker, s: *State, n: *isa_encode.AsmNote) {
+    var seeds: isa_encode.NoteSeeds;
+    isa_encode.note_seeds(w.f, n, ?seeds);
     if (!seeds.barrier || seeds.count == 0) { ret; }
-    val mi: *codegen_mir.MirInstr = n.mi;
+    val mi: *lang_mir.MirInstr = n.mi;
     if (mi.operand_count > 0) {
-        val op: *codegen_mir.MirOperand = ?mi.operands[0];
-        if (op.kind == codegen_mir.MIR_OP_PREG) {
-            set_reg(w, s, codegen_mir.preg_regid(op.preg), false);
+        val op: *lang_mir.MirOperand = ?mi.operands[0];
+        if (op.kind == lang_mir.MIR_OP_PREG) {
+            set_reg(w, s, lang_mir.preg_regid(op.preg), false);
             ret;
         }
-        if (op.kind == codegen_mir.MIR_OP_MEM) {
+        if (op.kind == lang_mir.MIR_OP_MEM) {
             clear_vreg_home(w, s, op.vreg);
             ret;
         }
@@ -425,19 +403,19 @@ fun apply_barrier(w: *Walker, s: *State, n: *notes.AsmNote) {
 fun initial_state(w: *Walker, s: *State) err[fail.Fail] {
     state_clear(s);
     s.reachable = true;
-    val f: *codegen_mir.MirFunction = w.f;
-    var i: usize                    = 0;
+    val f: *lang_mir.MirFunction = w.f;
+    var i: usize                 = 0;
     for (i < f.abi_input_count) {
-        val in: *codegen_mir.MirAbiInput = ?f.abi_inputs[i];
+        val in: *lang_mir.MirAbiInput = ?f.abi_inputs[i];
         if (!in.secret) {
             i = i + 1;
             cnt;
         }
-        if (in.location == codegen_mir.ABI_INPUT_REGISTER) {
-            if (reg_index_ok(codegen_mir.preg_regid(in.reg))) { set_reg(w, s, codegen_mir.preg_regid(in.reg), true); }
+        if (in.location == lang_mir.ABI_INPUT_REGISTER) {
+            if (reg_index_ok(lang_mir.preg_regid(in.reg))) { set_reg(w, s, lang_mir.preg_regid(in.reg), true); }
         }
-        or (in.location == codegen_mir.ABI_INPUT_ARG_STACK && !f.frame.omit && !f.frame.sp_frame) {
-            val lo: i64                  = w.tgt.model.incoming_arg_base + in.offset;
+        or (in.location == lang_mir.ABI_INPUT_ARG_STACK && !f.frame.omit && !f.frame.sp_frame) {
+            val lo: i64                  = w.arg_base + in.offset;
             val ra: res[bool, fail.Fail] = extent_add(w.alloc, s, w.fp_reg, lo, lo + in.width::i64);
             if (sel ra.err) { ret err[fail.Fail].err{ra.err}; }
         }
@@ -454,18 +432,18 @@ rec Step {
     bad_reg:      bool;
 }
 
-fun read_step(w: *Walker, s: *State, n: *notes.AsmNote, e: *isa_effect.InstEffects, seeds: *notes.NoteSeeds, st: *Step) {
+fun read_step(w: *Walker, s: *State, n: *isa_encode.AsmNote, e: *isa_effect.InstEffects, seeds: *isa_encode.NoteSeeds, st: *Step) {
     st.secret_in    = false;
     st.count_secret = false;
     st.addr_secret  = false;
     st.flags_in     = false;
     st.bad_reg      = false;
-    val mi: *isa.Inst = ?n.inst;
-    var k:  u32       = 0;
+    val mi: *isa_inst.Inst = ?n.inst;
+    var k:  u32            = 0;
     for (k < isa_effect.INST_OPERANDS) {
-        val op:   *isa.Operand           = operand_at(mi, k);
+        val op:   *isa_inst.Operand      = operand_at(mi, k);
         val role: isa_effect.OperandRole = e.roles[k];
-        if (op.kind == isa.OPK_REG && role != isa_effect.ROLE_NONE) {
+        if (op.kind == isa_inst.OPK_REG && role != isa_effect.ROLE_NONE) {
             if (!reg_index_ok(op.reg)) { st.bad_reg = true; }
             or {
                 val t: bool = reg_secret(w, s, op.reg) || seed_read(seeds, n.mi, op.reg);
@@ -475,7 +453,7 @@ fun read_step(w: *Walker, s: *State, n: *notes.AsmNote, e: *isa_effect.InstEffec
                 }
             }
         }
-        if (op.kind == isa.OPK_MEM && role != isa_effect.ROLE_NONE) {
+        if (op.kind == isa_inst.OPK_MEM && role != isa_effect.ROLE_NONE) {
             var at: bool = false;
             if (op.base >= 0) {
                 if (!reg_index_ok(op.base))    { st.bad_reg = true; }
@@ -509,11 +487,11 @@ fun read_step(w: *Walker, s: *State, n: *notes.AsmNote, e: *isa_effect.InstEffec
     if (e.cls.reads_flags && s.flags)                   { st.flags_in = true; }
 }
 
-fun write_step(w: *Walker, s: *State, n: *notes.AsmNote, e: *isa_effect.InstEffects, seeds: *notes.NoteSeeds,
+fun write_step(w: *Walker, s: *State, n: *isa_encode.AsmNote, e: *isa_effect.InstEffects, seeds: *isa_encode.NoteSeeds,
     st: *Step) err[fail.Fail] {
-    val secret_in: bool      = st.secret_in || st.flags_in;
-    val out:       bool      = secret_in && !e.zero_idiom;
-    val mi:        *isa.Inst = ?n.inst;
+    val secret_in: bool           = st.secret_in || st.flags_in;
+    val out:       bool           = secret_in && !e.zero_idiom;
+    val mi:        *isa_inst.Inst = ?n.inst;
 
     if (e.xfer == isa_effect.XFER_CALL) {
         # the callee's registers are a boundary: caller-saved taint dies,
@@ -526,16 +504,16 @@ fun write_step(w: *Walker, s: *State, n: *notes.AsmNote, e: *isa_effect.InstEffe
 
     var k: u32 = 0;
     for (k < isa_effect.INST_OPERANDS) {
-        val op:   *isa.Operand           = operand_at(mi, k);
+        val op:   *isa_inst.Operand      = operand_at(mi, k);
         val role: isa_effect.OperandRole = e.roles[k];
         if (!role_writes(role)) {
             k = k + 1;
             cnt;
         }
-        if (op.kind == isa.OPK_REG) {
+        if (op.kind == isa_inst.OPK_REG) {
             set_reg(w, s, op.reg, out || seed_write(seeds, n.mi, op.reg));
         }
-        or (op.kind == isa.OPK_MEM && slot_operand(w, op)) {
+        or (op.kind == isa_inst.OPK_MEM && slot_operand(w, op)) {
             val lo: i64 = op.disp::i64;
             val hi: i64 = lo + mem_bytes(mi, op, e);
             if (out || seed_mem_write(seeds, n.mi)) {
@@ -550,7 +528,7 @@ fun write_step(w: *Walker, s: *State, n: *notes.AsmNote, e: *isa_effect.InstEffe
     var idx: i32 = 0;
     for (idx < 64) {
         if ((e.implicit_writes & ~e.implicit_addr & isa_effect.reg_bit(idx)) != 0) {
-            set_reg(w, s, isa.regid_make(isa.REG_CLASS_ID_GP, idx), out);
+            set_reg(w, s, isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, idx), out);
         }
         idx = idx + 1;
     }
@@ -582,7 +560,7 @@ fun join_into(w: *Walker, index: u32, s: *State, changed: *bool) err[fail.Fail] 
 fun join_back(w: *Walker, start: u32, at: u32, s: *State, changed: *bool) err[fail.Fail] {
     var j: u32 = start;
     for (j <= at) {
-        if (w.notes[j].kind == notes.ASM_NOTE_INST) {
+        if (w.notes[j].kind == isa_encode.ASM_NOTE_INST) {
             val jr: err[fail.Fail] = join_into(w, j, s, changed);
             if (sel jr.err) { ret jr; }
         }
@@ -618,7 +596,7 @@ fun err_refusal(alloc: *A.Allocator, index: u32, msg: str) res[bool, Refusal] {
     ret res[bool, Refusal].err{make_refusal(alloc, index, msg)};
 }
 
-fun instr_refusal(w: *Walker, k: diagnostic_kind.Kind, index: u32, n: *notes.AsmNote, what: str) res[bool, Refusal] {
+fun instr_refusal(w: *Walker, k: diagnostic_kind.Kind, index: u32, n: *isa_encode.AsmNote, what: str) res[bool, Refusal] {
     var text: [256]u8;
     val len:  usize = render(w, n, ?text[0], 255);
     text[len] = 0;
@@ -669,10 +647,10 @@ fun put_reg(w: *Walker, dst: *u8, cap: usize, at: *usize, regid: i32, size: u8) 
 
 # the instruction as a diagnostic names it: the ISA's mnemonic and the
 # operands the notification carries, in position order
-fun render(w: *Walker, n: *notes.AsmNote, dst: *u8, cap: usize) usize {
-    var at:      usize     = 0;
-    val mi:      *isa.Inst = ?n.inst;
-    var spelled: opt[str]  = opt[str].none{};
+fun render(w: *Walker, n: *isa_encode.AsmNote, dst: *u8, cap: usize) usize {
+    var at:      usize          = 0;
+    val mi:      *isa_inst.Inst = ?n.inst;
+    var spelled: opt[str]       = opt[str].none{};
     if (w.eff.mnemonic != nil) { spelled = w.eff.mnemonic(mi.opcode); }
     if (sel spelled.some)      { put(dst, cap, ?at, spelled.some); }
     or {
@@ -682,8 +660,8 @@ fun render(w: *Walker, n: *notes.AsmNote, dst: *u8, cap: usize) usize {
     var printed: u32 = 0;
     var k:       u32 = 0;
     for (k < isa_effect.INST_OPERANDS) {
-        val op: *isa.Operand = operand_at(mi, k);
-        if (op.kind == isa.OPK_NONE) {
+        val op: *isa_inst.Operand = operand_at(mi, k);
+        if (op.kind == isa_inst.OPK_NONE) {
             k = k + 1;
             cnt;
         }
@@ -691,20 +669,20 @@ fun render(w: *Walker, n: *notes.AsmNote, dst: *u8, cap: usize) usize {
         or                { put(dst, cap, ?at, ", "); }
         printed = printed + 1;
         var size: u8 = op.size;
-        if (size == 0)              { size = mi.size; }
-        if (size == 0)              { size = 8; }
-        if (op.kind == isa.OPK_REG) { put_reg(w, dst, cap, ?at, op.reg, size); }
-        or (op.kind == isa.OPK_IMM) { put_i64(dst, cap, ?at, op.imm); }
-        or (op.kind == isa.OPK_LABEL) {
+        if (size == 0)                   { size = mi.size; }
+        if (size == 0)                   { size = 8; }
+        if (op.kind == isa_inst.OPK_REG) { put_reg(w, dst, cap, ?at, op.reg, size); }
+        or (op.kind == isa_inst.OPK_IMM) { put_i64(dst, cap, ?at, op.imm); }
+        or (op.kind == isa_inst.OPK_LABEL) {
             if (op.label != nil) { put(dst, cap, ?at, op.label); }
-            or (isa.label_is_block(op)) {
+            or (isa_inst.label_is_block(op)) {
                 put(dst, cap, ?at, ".");
                 put_i64(dst, cap, ?at, op.imm);
             }
             or { put(dst, cap, ?at, "<local>"); }
         }
-        or (op.kind == isa.OPK_SYM) { put(dst, cap, ?at, "<symbol>"); }
-        or (op.kind == isa.OPK_MEM) {
+        or (op.kind == isa_inst.OPK_SYM) { put(dst, cap, ?at, "<symbol>"); }
+        or (op.kind == isa_inst.OPK_MEM) {
             put(dst, cap, ?at, "[");
             if (op.base >= 0) { put_reg(w, dst, cap, ?at, op.base, 8); }
             or                { put(dst, cap, ?at, "pc"); }
@@ -741,7 +719,7 @@ val MSG_VARLAT:       str = "performs a variable-latency operation on a secret v
 val MSG_BAD_REG:      str = "names a register outside the walk's catalog, so its secrecy cannot be decided; the machine program is malformed";
 val MSG_CAP:          str = "uses an instruction whose constant-time class is outside the catalog; it cannot be verified, so it is refused";
 
-fun unknown_refusal(w: *Walker, index: u32, n: *notes.AsmNote) res[bool, Refusal] {
+fun unknown_refusal(w: *Walker, index: u32, n: *isa_encode.AsmNote) res[bool, Refusal] {
     var r: Refusal;
     r.index  = index;
     r.kind   = diagnostic_kind.SECRET_UNVERIFIABLE;
@@ -768,24 +746,24 @@ fun pass(w: *Walker, check: bool) res[bool, Refusal] {
     val ir: err[fail.Fail] = initial_state(w, ?state);
     if (sel ir.err) { ret err_refusal(w.alloc, 0, fail.describe(ir.err)); }
 
-    var changed:        bool                  = false;
-    var pending_active: bool                  = false;
-    var region_start:   u32                   = 0;
-    var region_mi:      *codegen_mir.MirInstr = nil;
-    var in_region:      bool                  = false;
-    var last_falls:     bool                  = true;
+    var changed:        bool               = false;
+    var pending_active: bool               = false;
+    var region_start:   u32                = 0;
+    var region_mi:      *lang_mir.MirInstr = nil;
+    var in_region:      bool               = false;
+    var last_falls:     bool               = true;
 
     var i: u32 = 0;
     for (i < w.count) {
-        val n: *notes.AsmNote = ?w.notes[i];
+        val n: *isa_encode.AsmNote = ?w.notes[i];
         # a label definition is a place, not an instruction: the branch that
         # lands on it names the instruction at its offset
-        if (n.kind == notes.ASM_NOTE_FUNC || n.kind == notes.ASM_NOTE_LABEL) {
+        if (n.kind == isa_encode.ASM_NOTE_FUNC || n.kind == isa_encode.ASM_NOTE_LABEL) {
             i = i + 1;
             cnt;
         }
 
-        if (n.kind == notes.ASM_NOTE_BLOCK) {
+        if (n.kind == isa_encode.ASM_NOTE_BLOCK) {
             val er: res[*Entry, fail.Fail] = entry_get(w, i);
             if (sel er.err) { ret err_refusal(w.alloc, i, fail.describe(er.err)); }
             val e: *Entry = er.ok;
@@ -803,13 +781,13 @@ fun pass(w: *Walker, check: bool) res[bool, Refusal] {
             cnt;
         }
 
-        if (n.kind == notes.ASM_NOTE_BYTES) {
+        if (n.kind == isa_encode.ASM_NOTE_BYTES) {
             if (check) { ret err_refusal(w.alloc, i, MSG_DATA); }
             i = i + 1;
             cnt;
         }
 
-        if (n.kind == notes.ASM_NOTE_BARRIER) {
+        if (n.kind == isa_encode.ASM_NOTE_BARRIER) {
             apply_barrier(w, ?state, n);
             i = i + 1;
             cnt;
@@ -845,8 +823,8 @@ fun pass(w: *Walker, check: bool) res[bool, Refusal] {
             i = i + 1;
             cnt;
         }
-        var seeds: notes.NoteSeeds;
-        notes.note_seeds(w.f, n, ?seeds);
+        var seeds: isa_encode.NoteSeeds;
+        isa_encode.note_seeds(w.f, n, ?seeds);
 
         var st: Step;
         read_step(w, ?state, n, ?e, ?seeds, ?st);
@@ -923,12 +901,12 @@ fun pass(w: *Walker, check: bool) res[bool, Refusal] {
 # branch's note, else the displacement its effects carry. NO_NOTE when
 # neither is recorded or when no instruction or block starts there
 fun local_landing(w: *Walker, at: u32, e: *isa_effect.InstEffects) u32 {
-    val n:      *notes.AsmNote = ?w.notes[at];
-    var target: i64            = 0;
-    if (n.landing != notes.NOTE_NO_LANDING) { target = n.landing::i64; }
-    or (e.local_disp != 0)                  { target = n.off::i64 + e.local_disp::i64; }
-    or                                      { ret NO_NOTE; }
-    if (target < 0 || target > 0xFFFFFFFF)  { ret NO_NOTE; }
+    val n:      *isa_encode.AsmNote = ?w.notes[at];
+    var target: i64                 = 0;
+    if (n.landing != isa_encode.NOTE_NO_LANDING) { target = n.landing::i64; }
+    or (e.local_disp != 0)                       { target = n.off::i64 + e.local_disp::i64; }
+    or                                           { ret NO_NOTE; }
+    if (target < 0 || target > 0xFFFFFFFF)       { ret NO_NOTE; }
     ret landing_note(w, at, target::u32);
 }
 
@@ -936,20 +914,20 @@ fun landing_note(w: *Walker, at: u32, target: u32) u32 {
     if (target > w.notes[at].off) {
         var j: u32 = at + 1;
         for (j < w.count) {
-            val n:     *notes.AsmNote = ?w.notes[j];
-            val bytes: bool           = n.kind == notes.ASM_NOTE_INST || n.kind == notes.ASM_NOTE_BYTES;
-            if ((n.kind == notes.ASM_NOTE_INST || n.kind == notes.ASM_NOTE_BLOCK) && n.off == target) { ret j; }
-            if (bytes && n.off > target)                                                              { ret NO_NOTE; }
+            val n:     *isa_encode.AsmNote = ?w.notes[j];
+            val bytes: bool                = n.kind == isa_encode.ASM_NOTE_INST || n.kind == isa_encode.ASM_NOTE_BYTES;
+            if ((n.kind == isa_encode.ASM_NOTE_INST || n.kind == isa_encode.ASM_NOTE_BLOCK) && n.off == target) { ret j; }
+            if (bytes && n.off > target)                                                                        { ret NO_NOTE; }
             j = j + 1;
         }
         ret NO_NOTE;
     }
     var k: u32 = at + 1;
     for (k > 0) {
-        val n:     *notes.AsmNote = ?w.notes[k - 1];
-        val bytes: bool           = n.kind == notes.ASM_NOTE_INST || n.kind == notes.ASM_NOTE_BYTES;
-        if (n.kind == notes.ASM_NOTE_INST && n.off == target) { ret k - 1; }
-        if (bytes && n.off < target)                          { ret NO_NOTE; }
+        val n:     *isa_encode.AsmNote = ?w.notes[k - 1];
+        val bytes: bool                = n.kind == isa_encode.ASM_NOTE_INST || n.kind == isa_encode.ASM_NOTE_BYTES;
+        if (n.kind == isa_encode.ASM_NOTE_INST && n.off == target) { ret k - 1; }
+        if (bytes && n.off < target)                               { ret NO_NOTE; }
         k = k - 1;
     }
     ret NO_NOTE;
@@ -959,23 +937,23 @@ fun fill_callee_saved(w: *Walker) {
     w.callee_gp = 0;
     w.callee_fp = 0;
     if (w.tgt.abi.callee_saved == nil) { ret; }
-    var regs: [64]isa.Register;
+    var regs: [64]target_model.Register;
     val n:    i32 = w.tgt.abi.callee_saved(?regs[0]);
     var i:    i32 = 0;
     for (i < n && i < 64) {
         val id: i32 = regs[i].id;
-        if (isa.regid_class(id) == isa.REG_CLASS_ID_GP) { w.callee_gp = w.callee_gp | isa_effect.reg_bit(isa.regid_index(id)); }
-        or                                              { w.callee_fp = w.callee_fp | isa_effect.reg_bit(isa.regid_index(id)); }
+        if (isa_inst.regid_class(id) == isa_inst.REG_CLASS_ID_GP) { w.callee_gp = w.callee_gp | isa_effect.reg_bit(isa_inst.regid_index(id)); }
+        or                                                        { w.callee_fp = w.callee_fp | isa_effect.reg_bit(isa_inst.regid_index(id)); }
         i = i + 1;
     }
     # the frame and stack pointers are preserved by every callee
-    w.callee_gp = w.callee_gp | isa_effect.reg_bit(isa.regid_index(w.fp_reg)) | isa_effect.reg_bit(isa.regid_index(w.sp_reg));
+    w.callee_gp = w.callee_gp | isa_effect.reg_bit(isa_inst.regid_index(w.fp_reg)) | isa_effect.reg_bit(isa_inst.regid_index(w.sp_reg));
 }
 
-fun declares_flags(m: *isa.MachineModel) bool {
+fun declares_flags(m: *target_model.Machine) bool {
     var i: u32 = 0;
     for (i < m.reg_class_len) {
-        if (m.reg_classes[i].kind == isa.RC_FLAGS) { ret true; }
+        if (m.reg_classes[i].kind == target_model.RC_FLAGS) { ret true; }
         i = i + 1;
     }
     ret false;
@@ -995,9 +973,11 @@ fun walker_free(w: *Walker) {
 # validates one oblivious function's notification stream. a non-oblivious
 # function is accepted without a walk; a stream with no effect description
 # is refused, never walked as public
-pub fun walk(f: *codegen_mir.MirFunction, ns: *notes.AsmNote, count: u32, eff: *IsaEffects,
+pub fun walk(f: *lang_mir.MirFunction, ns: *isa_encode.AsmNote, count: u32, arch: *isa.RegMachine,
     tgt: *isa.BackendTarget, alloc: *A.Allocator) err[Refusal] {
     if (f == nil || !f.oblivious) { ret err[Refusal].ok{}; }
+    var eff: *isa_effect.Hooks = nil;
+    if (arch != nil && arch.encode != nil) { eff = ?arch.encode.effects; }
     if (eff == nil || eff.describe == nil || tgt == nil) {
         ret err[Refusal].err{make_refusal(alloc, 0,
             "cannot be validated after encoding: the target supplied no per-instruction effect description")};
@@ -1014,8 +994,9 @@ pub fun walk(f: *codegen_mir.MirFunction, ns: *notes.AsmNote, count: u32, eff: *
     w.has_flags   = declares_flags(?tgt.model);
     w.mul         = tgt.ct_mul;
     w.trust_shift = tgt.model.ct_trust_var_shift;
-    w.fp_reg      = tgt.model.frame_ptr_reg;
-    w.sp_reg      = tgt.model.stack_ptr_reg;
+    w.fp_reg      = arch.frame_ptr_reg;
+    w.sp_reg      = arch.stack_ptr_reg;
+    w.arg_base    = arch.incoming_arg_base;
     w.const_regs  = eff.const_regs;
     w.entries     = nil;
     w.entry_count = 0;
@@ -1029,7 +1010,7 @@ pub fun walk(f: *codegen_mir.MirFunction, ns: *notes.AsmNote, count: u32, eff: *
     var max_block: u32 = 0;
     var i:         u32 = 0;
     for (i < count) {
-        if (ns[i].kind == notes.ASM_NOTE_BLOCK && ns[i].id + 1 > max_block) { max_block = ns[i].id + 1; }
+        if (ns[i].kind == isa_encode.ASM_NOTE_BLOCK && ns[i].id + 1 > max_block) { max_block = ns[i].id + 1; }
         i = i + 1;
     }
     if (max_block > 0) {
@@ -1046,7 +1027,7 @@ pub fun walk(f: *codegen_mir.MirFunction, ns: *notes.AsmNote, count: u32, eff: *
         }
         i = 0;
         for (i < count) {
-            if (ns[i].kind == notes.ASM_NOTE_BLOCK) { w.block_note[ns[i].id] = i; }
+            if (ns[i].kind == isa_encode.ASM_NOTE_BLOCK) { w.block_note[ns[i].id] = i; }
             i = i + 1;
         }
     }

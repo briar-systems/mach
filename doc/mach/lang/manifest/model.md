@@ -59,8 +59,6 @@ one `[target.<name>]` table as parsed; the string fields hold interned copies of
 the manifest text, unvalidated against the target registry
 
 name: the table key; a portable identifier, never `native`
-is_default: `default = true`; false when the key is absent. deprecated and ignored: `native` never
-                 selects by it, and the driver warns where it is written
 env: the `env` key, or STR_NIL when absent; parse checks only that it is a
                  non-empty string, the isa validates the value later
 isa: the required `isa` key
@@ -75,7 +73,6 @@ extensions: the `extensions` names, each an identifier and listed once; the isa
                  refuses a name its vocabulary does not hold when the target resolves
 extension_count: how many of `extensions` are set
 at: where the table's key is written
-default_at: where its `default` value is written, the zero place when absent
 
 ## rec ArtifactDef
 
@@ -87,23 +84,26 @@ one `[artifact.<name>]` table as parsed. the three arrays are owned by the
 manifest and freed by `dnit`
 
 name: the table key; a portable identifier
-kind: the required `kind` key, one of "bin", "static", "shared"
+kind: the required `kind` key, decoded through the artifact kind catalog
 entry: the required `entry` key, a project-relative path under `[project].src`
 out: the required `out` key, an unexpanded path template relative to the
-              expanded `[project].out`
+              project root; `{project.out}` places the output under the build output
 targets: the required `targets` array of declared target names or "*"; nil when empty
 target_count: length of `targets`
 link: the `link` array of `[link.<name>]` names; nil when absent or empty
 link_count: length of `link`
 need: category-qualified step and artifact names or globs; nil when absent or empty
 need_count: length of `need`
-is_lib: true unless `kind = "bin"`
-is_default: `default = true`; false when the key is absent
+is_default: `default = true`: the artifact is in the default selection; false
+              when the key is absent
+is_export: `export = true`: the library a bare `use <id>;` binds and whose
+              requirements travel to consumers; at most one artifact sets it
 subsystem: the `subsystem` key, console when absent; only "console" and "gui" parse
 icon: the `icon` path, or STR_NIL when absent; `bin` artifacts only
 app_manifest: the `manifest` path, or STR_NIL when absent; `bin` artifacts only
 at: where the table's key is written
 default_at: where its `default` value is written, the zero place when absent
+export_at: where its `export` value is written, the zero place when absent
 out_at: where its `out` value is written
 targets_at: where its `targets` value is written
 link_at: where each `link` entry is written, parallel to `link`

@@ -30,8 +30,8 @@ pub rec Loop;
 pub rec LoopAnalysis;
 ```
 
-dom_pre and dom_post number the dominator tree in one depth-first walk, so
-a dominance query is an interval test rather than a walk up the idom chain
+the loops of a function over its dominator tree, which the analysis owns
+when `analyze` built it and borrows when `analyze_on` was handed it
 
 ## fun analyze
 
@@ -39,21 +39,23 @@ a dominance query is an interval test rather than a walk up the idom chain
 pub fun analyze(fn: *me_ir.Function, types: *ir_type.IrTypeTable, alloc: *A.Allocator) res[LoopAnalysis, fail.Fail];
 ```
 
-the type table reads a counted loop's induction variable at its width
+the loops of `fn` over a dominator tree built for them; the type table reads
+a counted loop's induction variable at its width
+
+## fun analyze_on
+
+```mach
+pub fun analyze_on(dom: *dominance.Dominance, fn: *me_ir.Function, types: *ir_type.IrTypeTable, alloc: *A.Allocator) res[LoopAnalysis, fail.Fail];
+```
+
+the loops of `fn` over `dom`, its dominator tree as it stands, which must
+outlive the analysis
 
 ## fun dnit
 
 ```mach
 pub fun dnit(la: *LoopAnalysis);
 ```
-
-## fun dominates
-
-```mach
-pub fun dominates(la: *LoopAnalysis, a: ir_id.BlockId, b: ir_id.BlockId) bool;
-```
-
-total over an analysis `analyze` built, which numbers the dominator tree
 
 ## fun loop_contains
 

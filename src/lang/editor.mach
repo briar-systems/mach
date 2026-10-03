@@ -36,7 +36,7 @@ use mach.lang.build.request;
 use mach.lang.diagnostic;
 use diagnostic_kind: mach.lang.diagnostic.kind;
 use mach.lang.driver;
-use mach.lang.driver.load;
+use driver_load: mach.lang.driver.load;
 use mach.lang.driver.passes;
 use mach.lang.driver.project;
 use mach.lang.fail;
@@ -48,6 +48,7 @@ use ast_type: mach.lang.fe.ast.type;
 use mach.lang.fe.attr;
 use mach.lang.fe.comptime;
 use fe_lexer:  mach.lang.fe.lexer;
+use fe_load:   mach.lang.fe.load;
 use fe_parser: mach.lang.fe.parser;
 use mach.lang.fe.parser.state;
 use mach.lang.fe.resolve;
@@ -66,8 +67,10 @@ use mach.lang.retention;
 use mach.lang.session;
 use lang_source: mach.lang.source;
 use mach.lang.stack;
-use lang_target: mach.lang.target;
-use target_of:   mach.lang.target.of;
+use mach.lang.step;
+use lang_target:       mach.lang.target;
+use catalog_subsystem: mach.lang.target.catalog.subsystem;
+use mach.lang.toolchain;
 use mach.lang.type;
 
 # one reusable slot for a currently open file
@@ -80,7 +83,10 @@ rec Buffer {
     context_ready: bool;
     rr:            *resolve.ResolveResult;
     sr:            *sema_context.SemaResult;
-    ctx:           comptime.ComptimeCtx;
+    # the buffer's own load scope: a standalone buffer has no load, so it records its attributes here
+    ctx: comptime.ComptimeCtx;
+    # the scope a typed definition of the buffer is read in, over its own and resolve's and sema's
+    view: comptime.ComptimeCtx;
 }
 
 # the request fields a loaded project's frontend depends on. the strings are owned
@@ -97,11 +103,10 @@ rec ProjKey {
     debug:          bool;
     pie:            bool;
     subsystem_flag: request.SubsystemFlag;
-    subsystem:      target_of.Subsystem;
+    subsystem:      catalog_subsystem.Subsystem;
     simd:           manifest.SimdMode;
     vectorize:      bool;
     float_reassoc:  bool;
-    want_lib:       bool;
     include_deps:   bool;
 }
 
@@ -157,7 +162,7 @@ pub rec AnalysisRequest {
     file:              lang_source.FileId;
     phase:             AnalysisPhase;
     build:             request.BuildRequest;
-    standalone_target: *lang_target.Target;
+    standalone_target: *lang_target.Binding;
 }
 
 rec AnalysisTarget {
@@ -398,7 +403,7 @@ fun snapshot_analysis(es: *EditorSession, req: *AnalysisRequest, status: fail.Ph
         var mid: u32 = 0;
         for (mid < project.module_count(?es.proj)) {
             if (lang_source.file_same(project.module_at(?es.proj, mid).file_id, req.file)) {
-                result.target           = target_snapshot(?project.module_at(?es.proj, mid).ctx.env);
+                result.target           = target_snapshot(?project.module_at(?es.proj, mid).load.ctx.env);
                 result.target_available = true;
                 brk;
             }
@@ -1090,7 +1095,7 @@ fun discover_project_root(alloc: *A.Allocator, file_path: str) res[opt[str], fai
     var dir: str = start_r.ok;
     fin { str_free(alloc, dir); }
     for (true) {
-        val mf_r: res[str, fail.Fail] = load.join_path(alloc, dir, manifest.MANIFEST_FILE);
+        val mf_r: res[str, fail.Fail] = driver_load.join_path(alloc, dir, manifest.MANIFEST_FILE);
         if (sel mf_r.err) { ret res[opt[str], fail.Fail].err{mf_r.err}; }
         val mf:     str                          = mf_r.ok;
         val opened: res[fs.File, io_error.Error] = fs.open(mf);
@@ -1127,7 +1132,7 @@ fun discover_project_root(alloc: *A.Allocator, file_path: str) res[opt[str], fai
 }
 
 fun relative_under(alloc: *A.Allocator, file_path: str, root: str, src_text: str) res[opt[str], fail.Fail] {
-    val prefix_r: res[str, fail.Fail] = load.join_path(alloc, root, src_text);
+    val prefix_r: res[str, fail.Fail] = driver_load.join_path(alloc, root, src_text);
     if (sel prefix_r.err) { ret res[opt[str], fail.Fail].err{prefix_r.err}; }
     val prefix: str   = prefix_r.ok;
     val plen:   usize = str_len(prefix);
@@ -1191,7 +1196,7 @@ fun proj_roots_rebuild(es: *EditorSession, root: str, id_text: str, src_text: st
             if (sel relative.err) { ret err[fail.Fail].err{relative.err}; }
             if (sel relative.ok.some) {
                 val rel:  str                          = relative.ok.some;
-                val name: res[intern.StrId, fail.Fail] = load.compose_module_fqn(es.alloc, ?es.s.interner, id_text, rel);
+                val name: res[intern.StrId, fail.Fail] = driver_load.compose_module_fqn(es.alloc, ?es.s.interner, id_text, rel);
                 str_free(es.alloc, rel);
                 if (sel name.err) { ret err[fail.Fail].err{name.err}; }
                 roots[count] = name.ok;
@@ -1271,7 +1276,6 @@ fun proj_key_capture(es: *EditorSession, req: *request.BuildRequest, out: *ProjK
     k.simd           = req.simd;
     k.vectorize      = req.vectorize;
     k.float_reassoc  = req.float_reassoc;
-    k.want_lib       = req.want_lib;
     k.include_deps   = req.include_deps;
     complete         = true;
     @out             = k;
@@ -1293,7 +1297,6 @@ fun proj_key_matches(k: *ProjKey, req: *request.BuildRequest) bool {
     if (k.simd != req.simd)                     { ret false; }
     if (k.vectorize != req.vectorize)           { ret false; }
     if (k.float_reassoc != req.float_reassoc)   { ret false; }
-    if (k.want_lib != req.want_lib)             { ret false; }
     if (k.include_deps != req.include_deps)     { ret false; }
     ret true;
 }
@@ -1507,7 +1510,7 @@ fun proj_ensure(es: *EditorSession, fid: lang_source.FileId) res[opt[*project.Mo
         ret res[opt[*project.ModuleEntry], fail.Fail].err{fail.message("project analysis selects its target through the build request")};
     }
 
-    val fqn_r: res[intern.StrId, fail.Fail] = load.compose_module_fqn(es.alloc, ?es.s.interner, id_text, rel);
+    val fqn_r: res[intern.StrId, fail.Fail] = driver_load.compose_module_fqn(es.alloc, ?es.s.interner, id_text, rel);
     str_free(es.alloc, rel);
     if (sel fqn_r.err) {
         str_free(es.alloc, root);
@@ -1688,12 +1691,16 @@ fun buffer_definition(raw: ptr, origin: session.ModuleId, phase: sema_context.De
     }
     var result: sema_context.Definition = sema_context.Definition{
         parsed: resolve.ParsedDefinition{a: b.a, owner: resolve.type_owner(es.s, origin, b.file_id), incarnation: b.a.incarnation},
-        origin: origin
+        origin: origin, attributes: ?b.ctx
     };
     if (phase >= sema_context.DEFINITION_RESOLVED) { result.rr = b.rr; }
     if (phase == sema_context.DEFINITION_TYPED) {
-        result.sr  = b.sr;
-        result.ctx = ?b.ctx;
+        result.sr = b.sr;
+        comptime.dnit(?b.view);
+        b.view = comptime.stage_init(?b.ctx, comptime.STAGE_LOWER, es.alloc);
+        if (b.rr != nil) { comptime.layer_set(?b.view, comptime.STAGE_RESOLVE, ?b.rr.constants); }
+        if (b.sr != nil) { comptime.layer_set(?b.view, comptime.STAGE_SEMA, ?b.sr.constants); }
+        result.ctx = ?b.view;
     }
     ret res[sema_context.Definition, fail.Fail].ok{result};
 }
@@ -1703,35 +1710,43 @@ fun buffer_resolve(es: *EditorSession, b: *Buffer, deps: *resolve.ResolveDeps) r
     val seeded: err[fail.Fail] = ctx_seed(es, b);
     if (sel seeded.err) { ret res[*resolve.ResolveResult, fail.Fail].err{seeded.err}; }
 
-    attr.forget_strings(es.s, b.file_id::session.ModuleId, b.a.expr_len);
+    comptime.attributes_clear(?b.ctx);
     val res_resolve: res[resolve.ResolveResult, fail.Fail] = resolve.resolve(es.s, b.a, deps, ?b.ctx, b.file_id::session.ModuleId, ?es.s.diags);
     if (sel res_resolve.err) {
         es.operation_failure = opt[fail.Fail].some{res_resolve.err};
         ret res[*resolve.ResolveResult, fail.Fail].err{res_resolve.err};
     }
+    var resolved: resolve.ResolveResult = res_resolve.ok;
     # a standalone buffer has no load: its attribute strings read the constants resolution bound
-    val text: opt[*lang_source.SourceFile] = lang_source.get(?es.s.sources, b.file_id);
-    if (sel text.some) {
-        val recorded: err[fail.Fail] = attr.record_strings[comptime.NoCapabilityContext](es.s, b.file_id::session.ModuleId, b.a,
-            text.some.text, ?b.ctx, nil, comptime.no_capabilities(), false);
-        if (sel recorded.err) {
-            var rr_owned: resolve.ResolveResult = res_resolve.ok;
-            resolve.dnit_result(?rr_owned);
-            ret res[*resolve.ResolveResult, fail.Fail].err{recorded.err};
-        }
+    val recorded: err[fail.Fail] = attributes_record(es, b, ?resolved);
+    if (sel recorded.err) {
+        resolve.dnit_result(?resolved);
+        ret res[*resolve.ResolveResult, fail.Fail].err{recorded.err};
     }
 
     val res_slot: res[*resolve.ResolveResult, A.Error] = A.allocate[resolve.ResolveResult](es.alloc, 1);
     if (sel res_slot.err) {
-        var rr_owned: resolve.ResolveResult = res_resolve.ok;
-        resolve.dnit_result(?rr_owned);
-        if (sel res_slot.err) { ret res[*resolve.ResolveResult, fail.Fail].err{fail.refused(res_slot.err)}; }
-        ret res[*resolve.ResolveResult, fail.Fail].ok{res_slot.ok};
+        resolve.dnit_result(?resolved);
+        ret res[*resolve.ResolveResult, fail.Fail].err{fail.refused(res_slot.err)};
     }
     val rr: *resolve.ResolveResult = res_slot.ok;
-    @rr  = res_resolve.ok;
+    @rr  = resolved;
     b.rr = rr;
     ret res[*resolve.ResolveResult, fail.Fail].ok{rr};
+}
+
+# the buffer's attribute strings, read over the constants resolution bound, and what its `embed`
+# arguments name, recorded in its own load scope
+fun attributes_record(es: *EditorSession, b: *Buffer, rr: *resolve.ResolveResult) err[fail.Fail] {
+    val text: opt[*lang_source.SourceFile] = lang_source.get(?es.s.sources, b.file_id);
+    if (sel text.none) { ret err[fail.Fail].ok{}; }
+    var read: comptime.ComptimeCtx = comptime.stage_init(?b.ctx, comptime.STAGE_SEMA, es.alloc);
+    fin { comptime.dnit(?read); }
+    comptime.layer_set(?read, comptime.STAGE_RESOLVE, ?rr.constants);
+    val strings: err[fail.Fail] = attr.record_strings[comptime.NoCapabilityContext](?es.s.interner, ?b.ctx, b.a,
+        text.some.text, ?read, nil, comptime.no_capabilities(), nil);
+    if (sel strings.err) { ret strings; }
+    ret fe_load.embeds_record(es.s, ?b.ctx, b.a, text.some.text, session.module_fqn(es.s, b.file_id::session.ModuleId), nil);
 }
 
 fun slot_get(es: *EditorSession, fid: lang_source.FileId) *Buffer {
@@ -1795,20 +1810,20 @@ fun ctx_seed(es: *EditorSession, b: *Buffer) err[fail.Fail] {
         if (!caused) { es.operation_failure = opt[fail.Fail].some{fail.user(diagnostic_kind.EDITOR_TARGET_SELECTION, "a standalone buffer requires a resolved target, not a project target name")}; }
         ret err[fail.Fail].err{fail.message("a standalone buffer requires a resolved target, not a project target name")};
     }
-    val registry: err[fail.Fail] = driver.setup_registry(es.s.registry);
+    val registry: res[*lang_target.TargetRegistry, fail.Fail] = toolchain.registry();
     if (sel registry.err) { ret err[fail.Fail].err{registry.err}; }
     var host_request: lang_target.TargetRequest = lang_target.host_request();
-    var host:         lang_target.Target;
-    var selected:     *lang_target.Target       = req.standalone_target;
+    var host:         lang_target.Binding;
+    var selected:     *lang_target.Binding      = req.standalone_target;
     if (selected == nil) {
-        val resolved: res[lang_target.Target, fail.Fail] = lang_target.resolve(es.s.registry, ?host_request);
+        val resolved: res[lang_target.Binding, fail.Fail] = lang_target.resolve(registry.ok, ?host_request);
         if (sel resolved.err) { ret err[fail.Fail].err{resolved.err}; }
         host     = resolved.ok;
         selected = ?host;
     }
     if (selected.isa == nil) { ret err[fail.Fail].err{fail.message("standalone analysis requires a resolved target with an instruction set")}; }
     comptime.dnit(?b.ctx);
-    b.ctx           = load.target_context(es.alloc, selected, ?req.build, intern.STR_NIL, intern.STR_NIL);
+    b.ctx           = driver_load.target_context(es.alloc, selected, ?req.build, intern.STR_NIL, intern.STR_NIL);
     b.context_ready = true;
     ret err[fail.Fail].ok{};
 }
@@ -1842,6 +1857,7 @@ fun analysis_drop(es: *EditorSession, b: *Buffer) {
         b.a = nil;
     }
     comptime.dnit(?b.ctx);
+    comptime.dnit(?b.view);
     b.parse_status  = fail.accepted();
     b.context_ready = false;
     b.owned         = true;
@@ -1861,7 +1877,7 @@ fun t_dnit(es: *EditorSession) {
 #[testing]
 fun t_session(a: *A.Allocator) res[session.Session, fail.Fail] {
     page.make(a);
-    ret session.init(a);
+    ret toolchain.session_init(a);
 }
 
 #[testing]
@@ -2696,7 +2712,7 @@ fun t_linux_targets(alloc: *A.Allocator) str {
 #[testing]
 fun t_scaffold_with(alloc: *A.Allocator, range: str, targets: str, names: *str, texts: *str, n: u32) res[str, fail.Fail] {
     val head: str                             = "[project]\nid = \"edbuild\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n";
-    val tail: str                             = "\n[artifact.edbuild]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/edbuild\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[profile.debug]\ndefault = true\nopt = 0\ndebug = true\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n[profile.release]\nopt = 2\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n";
+    val tail: str                             = "\n[artifact.edbuild]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"{project.out}/bin/edbuild\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[profile.debug]\ndefault = true\nopt = 0\ndebug = true\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n[profile.release]\nopt = 2\ndebug = false\nsimd = \"scalarize\"\nvectorize = true\nfloat_reassoc = false\n";
     val mt_r: res[str, types_string.StrError] = str_join(alloc, head, range, "\n", targets, tail);
     if (sel mt_r.err) { ret res[str, fail.Fail].err{fail.str_refused(mt_r.err)}; }
     ret t_scaffold_manifest(alloc, mt_r.ok, names, texts, n);
@@ -2746,7 +2762,7 @@ fun t_scaffold_manifest(alloc: *A.Allocator, mtext: str, names: *str, texts: *st
 #[testing]
 val LESSONS_TARGET:     str = "linux-x86_64";
 #[testing]
-val T_MANIFEST_LESSONS: str = "[project]\nmach = \">=5\"\nid = \"lessons\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out\"\n\n[target.spirv]\nisa = \"spirv\"\nos = \"freestanding\"\nabi = \"spirv\"\nenv = \"vulkan1.0\"\n\n[target.linux-x86_64]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[profile.debug]\ndefault = true\nopt = 0\ndebug = true\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n\n[artifact.hello]\ndefault = true\nkind = \"bin\"\nentry = \"hello.mach\"\nout = \"bin/hello\"\ntargets = [\"*\"]\nlink = []\nneed = []\n\n[artifact.shaded]\nkind = \"bin\"\nentry = \"shaded.mach\"\nout = \"bin/shaded\"\ntargets = [\"*\"]\nlink = []\nneed = [\"artifact.shader-*\"]\n\n[artifact.shader-vert]\nkind = \"bin\"\nentry = \"shaders/vert.mach\"\nout = \"spv/vert{artifact.suffix}\"\ntargets = [\"spirv\"]\nlink = []\nneed = []\n";
+val T_MANIFEST_LESSONS: str = "[project]\nmach = \">=5\"\nid = \"lessons\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out\"\n\n[target.spirv]\nisa = \"spirv\"\nos = \"freestanding\"\nabi = \"spirv\"\nenv = \"vulkan1.0\"\n\n[target.linux-x86_64]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[profile.debug]\ndefault = true\nopt = 0\ndebug = true\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n\n[artifact.hello]\ndefault = true\nkind = \"bin\"\nentry = \"hello.mach\"\nout = \"{project.out}/bin/hello\"\ntargets = [\"*\"]\nlink = []\nneed = []\n\n[artifact.shaded]\nkind = \"bin\"\nentry = \"shaded.mach\"\nout = \"{project.out}/bin/shaded\"\ntargets = [\"*\"]\nlink = []\nneed = [\"artifact.shader-*\"]\n\n[artifact.shader-vert]\nkind = \"bin\"\nentry = \"shaders/vert.mach\"\nout = \"{project.out}/spv/vert{artifact.suffix}\"\ntargets = [\"spirv\"]\nlink = []\nneed = []\n";
 
 # an editor session is the union of every artifact: an open buffer of a non-default
 # artifact resolves `{artifact.<id>.out}` in its own artifact's `need`, and an
@@ -3762,21 +3778,11 @@ fun t_deep_source(alloc: *A.Allocator, opens: usize) opt[str] {
 
 #[testing]
 fun t_driver_parse_outcome(alloc: *A.Allocator, root: str, diags_out: *diagnostic.DiagnosticStore) opt[fail.Fail] {
-    val sr: res[session.Session, fail.Fail] = session.init(alloc);
+    val sr: res[session.Session, fail.Fail] = toolchain.session_init(alloc);
     if (sel sr.err) { ret opt[fail.Fail].some{fail.message("session")}; }
-    var s:                session.Session = sr.ok;
-    val setup_registry_r: err[fail.Fail]  = driver.setup_registry(s.registry);
-    if (sel setup_registry_r.err) {
-        session.dnit(?s);
-        ret opt[fail.Fail].some{fail.message("registry")};
-    }
-    var pick: manifest.Selection;
-    pick.target       = "";
-    pick.profile      = "";
-    pick.artifact     = "";
-    pick.want_lib     = false;
-    pick.has_artifact = false;
-    val pr:      res[project.Project, fail.Fail] = driver.build_project_sel(?s, root, ?pick);
+    var s:       session.Session                 = sr.ok;
+    var pick:    manifest.Selectors              = manifest.t_selectors("", "", "");
+    val pr:      res[project.Project, fail.Fail] = step.project_build(?s, root, ?pick);
     var failure: opt[fail.Fail]                  = opt[fail.Fail].none{};
     if (sel pr.err) {
         var f:       fail.Fail = pr.err;
@@ -3983,7 +3989,7 @@ test analyze__owned_rejection_snapshot_preserves_allocation_refusal {
     var total: usize = 0;
     var pass:  u8    = 0;
     for (pass < 2) {
-        val sr: res[session.Session, fail.Fail] = session.init(?backing);
+        val sr: res[session.Session, fail.Fail] = toolchain.session_init(?backing);
         if (sel sr.err) { ret 5; }
         var s: session.Session = sr.ok;
         fin { session.dnit(?s); }
@@ -4132,16 +4138,14 @@ test analyze__explicit_target_changes_context_and_expires_previous_view {
     fin { session.dnit(?s); }
     var es: EditorSession = init(?s);
     fin { t_dnit(?es); }
-    val setup_registry_r: err[fail.Fail] = driver.setup_registry(s.registry);
-    if (sel setup_registry_r.err) { ret 99; }
-    var tr32:       lang_target.TargetRequest          = lang_target.target_request("rv32imafdc", "freestanding", "ilp32d");
-    var tr64:       lang_target.TargetRequest          = lang_target.target_request("riscv64", "linux", "lp64d");
-    val selected32: res[lang_target.Target, fail.Fail] = lang_target.resolve(s.registry, ?tr32);
+    var tr32:       lang_target.TargetRequest           = lang_target.target_request("rv32imafdc", "freestanding", "ilp32d");
+    var tr64:       lang_target.TargetRequest           = lang_target.target_request("riscv64", "linux", "lp64d");
+    val selected32: res[lang_target.Binding, fail.Fail] = lang_target.resolve(toolchain.t_registry(), ?tr32);
     if (sel selected32.err) { ret 6; }
-    val selected64: res[lang_target.Target, fail.Fail] = lang_target.resolve(s.registry, ?tr64);
+    val selected64: res[lang_target.Binding, fail.Fail] = lang_target.resolve(toolchain.t_registry(), ?tr64);
     if (sel selected64.err) { ret 7; }
-    var t32:    lang_target.Target                 = selected32.ok;
-    var t64:    lang_target.Target                 = selected64.ok;
+    var t32:    lang_target.Binding                = selected32.ok;
+    var t64:    lang_target.Binding                = selected64.ok;
     val open_r: res[lang_source.FileId, fail.Fail] = open(?es, "/mach-editor-target/file.mach",
         "$if ($mach.build.pointer_width == 4) { val selected: i32 = 32; } $or { val selected: i32 = 64; }");
     if (sel open_r.err) { ret 99; }
@@ -4202,7 +4206,7 @@ test lifecycle__allocation_refusal_preserves_open_buffers_and_retry {
             val made: err[A.Error] = T.make(?t);
             if (sel made.err) { ret 99; }
             fin { T.dnit(?t); }
-            val session_r: res[session.Session, fail.Fail] = session.init(T.allocator_of(?t));
+            val session_r: res[session.Session, fail.Fail] = toolchain.session_init(T.allocator_of(?t));
             if (sel session_r.err) { ret 99; }
             var s:      session.Session                    = session_r.ok;
             var es:     EditorSession                      = init(?s);
@@ -5138,7 +5142,7 @@ test resolve__unused_import_warns_in_the_project_and_not_its_dependency {
     val dep_src: str             = dep_src_r.ok;
     val made:    err[fs.FsError] = fs.create_dir_all(?alloc, dep_src, 493);
     if (sel made.err) { ret 99; }
-    val dep_manifest_r: res[str, types_string.StrError] = str_join(?alloc, "[project]\nmach = \">=5\"\nid = \"leaf\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n", t_manifest_targets(?alloc), "\n[artifact.lib]\nkind = \"static\"\nentry = \"lib.mach\"\nout = \"lib/l\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[profile.debug]\ndefault = true\nopt = 0\ndebug = true\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n");
+    val dep_manifest_r: res[str, types_string.StrError] = str_join(?alloc, "[project]\nmach = \">=5\"\nid = \"leaf\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n", t_manifest_targets(?alloc), "\n[artifact.lib]\nkind = \"static\"\nentry = \"lib.mach\"\nout = \"{project.out}/lib/l\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[profile.debug]\ndefault = true\nopt = 0\ndebug = true\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n");
     if (sel dep_manifest_r.err) { ret 99; }
     val dep_manifest: str                             = dep_manifest_r.ok;
     val dep_lib:      str                             = "use leaf.util.u;\npub fun plain() i32 { ret 0; }\n";

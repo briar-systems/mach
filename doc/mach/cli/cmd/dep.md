@@ -1,29 +1,38 @@
 # mach.cli.cmd.dep
 
+## val COMMAND
+
+```mach
+pub val COMMAND: args.CommandSpec = args.CommandSpec;
+```
+
+`mach dep`
+
 ## fun run
 
 ```mach
-pub fun run(argv: **u8, inv: *args.ParsedInvocation) i64;
+pub fun run(cx: *args.Call) res[i64, fail.Fail];
 ```
 
 `mach dep`: route to one action: list, add, remove, update, pull, verify or outdated, each a
 command over the dependency manager (mach.lang.package) that renders what it reports
 
-argv: the full process arguments
-inv: the parsed invocation for this command
-ret: exit.OK, exit.USER for a malformed invocation, or the code `exit.of` maps the
-      action's printed failure to
+cx: the call, its action read and its operands counted
+ret: exit.OK, the code `exit.of` maps the action's rendered failure to, or the failure that
+     kept the action from starting
 
 ## fun pull_project
 
 ```mach
-pub fun pull_project(root: str, quiet: bool, environ: **u8) i64;
+pub fun pull_project(a: *A.Allocator, root: str, quiet: bool, environ: **u8) res[i64, fail.Fail];
 ```
 
 `mach dep pull`: realize the dependency closure of a project (package_closure.pull)
 
+a: owns what the pull allocates
 root: the project root directory
 quiet: suppress progress lines
 environ: the environment git runs in
-ret: exit.OK when realized, otherwise the code `exit.of` maps the printed failure to
+ret: exit.OK when realized, the code `exit.of` maps the rendered failure to, or the failure
+         that kept the pull from starting
 

@@ -24,14 +24,6 @@ fwd project.TargetEntry
 
 forwards [`mach.lang.driver.project.TargetEntry`](driver/project.md#rec-targetentry)
 
-## fwd project.MODE_LIBRARY
-
-```mach
-fwd project.MODE_LIBRARY
-```
-
-forwards [`mach.lang.driver.project.MODE_LIBRARY`](driver/project.md#val-mode_library)
-
 ## fwd project.TARGET_OPT_RELEASE
 
 ```mach
@@ -160,10 +152,10 @@ fwd passes.frontend_status
 
 forwards [`mach.lang.driver.passes.frontend_status`](driver/passes.md#fun-frontend_status)
 
-## fwd load.entry_module_fqn
+## fwd driver_load.entry_module_fqn
 
 ```mach
-fwd load.entry_module_fqn
+fwd driver_load.entry_module_fqn
 ```
 
 forwards [`mach.lang.driver.load.entry_module_fqn`](driver/load.md#fun-entry_module_fqn)
@@ -184,14 +176,6 @@ fwd config.RunArtifact
 
 forwards [`mach.lang.driver.config.RunArtifact`](driver/config.md#rec-runartifact)
 
-## fwd mach.lang.driver.registry.setup_registry
-
-```mach
-fwd mach.lang.driver.registry.setup_registry
-```
-
-forwards [`mach.lang.driver.registry.setup_registry`](driver/registry.md#fun-setup_registry)
-
 ## fun append_frontend_roots
 
 ```mach
@@ -205,6 +189,24 @@ pub fun append_test_roots(p: *project.Project, roots: *Vector[query.QueryKey]) e
 ```
 
 the backend's roots and each test object's lowering and codegen
+
+## fun phase_finish
+
+```mach
+pub fun phase_finish(p: *project.Project,
+result: err[fail.Fail]) err[fail.Fail];
+```
+
+a phase the query engine does not run is published as one it does: the
+project's diagnostics are refreshed beside its result
+
+## fun project_failure
+
+```mach
+pub fun project_failure(p: *project.Project, failure: fail.Fail) res[project.Project, fail.Fail];
+```
+
+a project that failed is released, its failure kept where the session presents it
 
 ## fun run_sema_pass
 
@@ -227,7 +229,7 @@ pub fun run_link_pass(p: *project.Project) res[bool, fail.Fail];
 ## fun build_project
 
 ```mach
-pub fun build_project(s: *session.Session, project_root: str, pick: *manifest.Selection) res[project.Project, fail.Fail];
+pub fun build_project(s: *session.Session, project_root: str, selectors: *manifest.Selectors) res[project.Project, fail.Fail];
 ```
 
 ## fun closure_locate
@@ -324,18 +326,6 @@ extra_root_count: how many extra roots
 phase: the last frontend phase to run
 ret: the project, released by the caller with project.dnit_project
 
-## fun run_steps_phase
-
-```mach
-pub fun run_steps_phase(p: *project.Project) err[fail.Fail];
-```
-
-## fun run_dep_steps_phase
-
-```mach
-pub fun run_dep_steps_phase(p: *project.Project) err[fail.Fail];
-```
-
 ## fun run_load_phase
 
 ```mach
@@ -350,7 +340,7 @@ pub fun refresh_frontend(p: *project.Project, mid: session.ModuleId, phase: Fron
 
 re-derive a loaded project's frontend after one module's text changed, without
 reloading its closure. the module is reparsed and re-walked in place; when its load
-surface survived (load.reload_module), the module set and topo are as loaded and
+surface survived (driver_load.module_reload), the module set and topo are as loaded and
 the query phases rerun over them, so every unchanged module's resolve and sema are
 hits and only the edited module and its dependents recompute. a surface that did
 not survive is reported as ok(false): the caller reloads

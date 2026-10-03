@@ -18,18 +18,6 @@ pub val ROOT_ARTIFACT: RootSet = 0
 pub val ROOT_UNION: RootSet = 1
 ```
 
-## val MODE_EXECUTABLE
-
-```mach
-pub val MODE_EXECUTABLE: BuildMode = 0
-```
-
-## val MODE_LIBRARY
-
-```mach
-pub val MODE_LIBRARY: BuildMode = 1
-```
-
 ## def TargetOpt
 
 ```mach
@@ -75,47 +63,6 @@ art_reqs: the requirements of the cell's artifact, in its declaring manifest
 req_scopes: one requirement scope per project the cell compiles, the declaring
                   project's first
 
-## rec PubConst
-
-```mach
-pub rec PubConst;
-```
-
-## rec ModRef
-
-```mach
-pub rec ModRef;
-```
-
-a module name or constant a `use` binds
-
-name: the name it binds
-module: the module it names, or whose constant it binds
-span: the imported path, for a constant a union build refuses
-decl: the `use` that binds it, so a walk reads the one the arm its gate selects declares
-
-## val FRAME_BUILD
-
-```mach
-pub val FRAME_BUILD: u32 = 0xFFFFFFFF
-```
-
-the frame the load walk reads and binds in: the build target's, or a union tuple's by index
-
-## rec LoadDemand
-
-```mach
-pub rec LoadDemand;
-```
-
-one declaration or gate the load is deciding, so a demand that reaches it again is a cycle
-
-module: the module it is in
-frame: the frame it is decided in
-decl: the `val` being walked, or DECL_NIL for a gate
-cond: the gate's condition, or EXPR_NIL for a `val`
-name: the `val`'s name
-
 ## rec ArtifactEntry
 
 ```mach
@@ -139,36 +86,6 @@ pub rec TestObject;
 a module's test object, beside its normal object and never changing it: the
 module's tests and what they reach that the normal object does not define. the
 fields mirror the normal object's on ModuleEntry
-
-## def LoadStatus
-
-```mach
-pub def LoadStatus: u8
-```
-
-## val LOAD_NEW
-
-```mach
-pub val LOAD_NEW: LoadStatus = 0
-```
-
-## val LOAD_LOADING
-
-```mach
-pub val LOAD_LOADING: LoadStatus = 1
-```
-
-## val LOAD_DONE
-
-```mach
-pub val LOAD_DONE: LoadStatus = 2
-```
-
-## rec TargetTuple
-
-```mach
-pub rec TargetTuple;
-```
 
 ## rec RawLowerCapture
 
@@ -245,6 +162,23 @@ pub fun release_staged_test(p: *Project, m: *ModuleEntry);
 pub fun release_all_staged(p: *Project);
 ```
 
+## fun typed_scope
+
+```mach
+pub fun typed_scope(m: *ModuleEntry) comptime.ComptimeCtx;
+```
+
+what the front end bound over a module, to read: the load's bindings, and resolve's and sema's
+where they ran
+
+## fun lower_scope_drop
+
+```mach
+pub fun lower_scope_drop(m: *ModuleEntry);
+```
+
+release the scope lowering bound a module's constants in
+
 ## fun dnit_project
 
 ```mach
@@ -265,14 +199,6 @@ phase now running: both the project's store and the session's
 ```mach
 pub fun init_project(p: *Project, s: *session.Session);
 ```
-
-## fun drop_tuple_frames
-
-```mach
-pub fun drop_tuple_frames(p: *Project, m: *ModuleEntry);
-```
-
-release a module's union tuple frames, which only the load reads
 
 ## fun free_dep_entries
 
@@ -334,6 +260,22 @@ pub fun module_append(p: *Project, m: ModuleEntry) session.ModuleId;
 
 publish an entry under the next ModuleId into the slot module_reserve made.
 total: a caller that reserved nothing first stops the compiler
+
+## fun dep_count
+
+```mach
+pub fun dep_count(m: *ModuleEntry) u32;
+```
+
+how many modules a loaded module imports
+
+## fun dep_at
+
+```mach
+pub fun dep_at(p: *Project, m: *ModuleEntry, i: u32) session.ModuleId;
+```
+
+the module a loaded module imports at `i`, as its load record names it
 
 ## fun module_by_fqn
 

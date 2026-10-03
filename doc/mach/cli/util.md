@@ -8,32 +8,6 @@ pub val PROJECT_CONFIG_NAME: str = manifest.MANIFEST_FILE
 
 the manifest file name, "mach.toml"
 
-## fun flag_exists
-
-```mach
-pub fun flag_exists(argc: usize, argv: *str, flag: str) bool;
-```
-
-whether a flag occurs anywhere in argv
-
-argc: number of entries
-argv: the arguments
-flag: the exact spelling to find
-ret: true on an exact match
-
-## fun flag_value
-
-```mach
-pub fun flag_value(argc: usize, argv: *str, flag: str) opt[str];
-```
-
-the value following the first occurrence of a flag
-
-argc: number of entries
-argv: the arguments
-flag: the exact spelling to find
-ret: the argument after the first match; none when the flag is absent or is the last argument
-
 ## fun arg_is_flag
 
 ```mach
@@ -105,18 +79,4 @@ create every missing ancestor of a path with mode 0755; the path itself is not c
 a: allocator for the parent path
 p: the path whose parents are wanted
 ret: none on success, or the parent computation or creation error
-
-## fun resolve_cmd
-
-```mach
-pub fun resolve_cmd(a: *A.Allocator, name: str) res[str, fail.Fail];
-```
-
-locate an executable the way a shell would: a name with a path separator is used directly
-and must be an existing executable file; any other name is searched on PATH
-
-a: allocator for the returned path
-name: the program name or path
-ret: the resolved path, owned by the caller; "PATH unset", "not found on PATH", or the
-      direct-path error
 

@@ -1,5 +1,4 @@
 use mach.lang.fail;
-use mach.lang.growth;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -14,10 +13,12 @@ use std.allocator.page;
 use std_format: std.format;
 
 use mach.lang.intern;
+use mach.lang.me.analysis;
 use mach.lang.me.analysis.dependence;
 use mach.lang.me.analysis.loops;
 use me_ir: mach.lang.me.ir;
 use mach.lang.me.ir.builder;
+use mach.lang.me.ir.cfg;
 use mach.lang.me.ir.equal;
 use ir_id:          mach.lang.me.ir.id;
 use ir_instruction: mach.lang.me.ir.instruction;
@@ -31,9 +32,10 @@ use mach.lang.me.scratch;
 use me_testing: mach.lang.me.testing;
 use mach.lang.me.transform.versioning;
 use mach.lang.me.vecform;
-use lang_source: mach.lang.source;
+#[testing]
 use lang_target: mach.lang.target;
 use mach.lang.target.resolved;
+#[testing]
 use target_testing: mach.lang.target.testing;
 use mach.lang.type;
 
@@ -59,8 +61,11 @@ rec SplatEntry {
     vec: value.Value;
 }
 
+# the index a lookup that finds nothing returns
+val NONE_U32: u32 = 0xFFFFFFFF;
+
 # the pass the pipeline schedules
-pub val PASS: pass.Pass = pass.Pass{run: nil, applies: applies, visit: vectorize_function, skips: pass.SKIP_EMPTY | pass.SKIP_SCALAR | pass.SKIP_OBLIVIOUS | pass.SKIP_VOLATILE, eligible: nil, rounds: 1};
+pub val PASS: pass.Pass = pass.Pass{run: nil, applies: applies, preserves: analysis.NONE, visit: vectorize_function, skips: pass.SKIP_EMPTY | pass.SKIP_SCALAR | pass.SKIP_OBLIVIOUS | pass.SKIP_VOLATILE, eligible: nil, rounds: 1};
 
 # a build that vectorizes, for a target with 128-bit vectors that declares
 # loop vectorization profitable
@@ -70,7 +75,7 @@ fun applies(ctx: *pass.Context) bool {
 
 # a vectorizing run with `float_reassoc` as set, in a workspace of its own
 #[testing]
-pub fun run(m: *me_ir.Module, tgt: *lang_target.Target, float_reassoc: bool, itn: *intern.Interner) res[bool, fail.Fail] {
+pub fun run(m: *me_ir.Module, tgt: *resolved.Target, float_reassoc: bool, itn: *intern.Interner) res[bool, fail.Fail] {
     var workspace:   scratch.Workspace;
     val initialized: err[fail.Fail] = scratch.init(?workspace, m.backing);
     if (sel initialized.err) { ret res[bool, fail.Fail].err{initialized.err}; }
@@ -85,27 +90,26 @@ pub fun run(m: *me_ir.Module, tgt: *lang_target.Target, float_reassoc: bool, itn
 # `interner` names the constant globals a splat of a constant reads from; nil
 # keeps every splat on the stack
 fun vectorize_function(f: *pass.Function, alloc: *A.Allocator) res[bool, fail.Fail] {
-    val m:   *me_ir.Module       = f.module;
-    val tgt: *lang_target.Target = f.target;
-    val fn:  *me_ir.Function     = f.body;
-    val itn: *intern.Interner    = f.context.interner;
+    val m:             *me_ir.Module    = f.module;
+    val tgt:           *resolved.Target = f.target;
+    val fn:            *me_ir.Function  = f.body;
+    val float_reassoc: bool             = f.context.float_reassoc;
+    val itn:           *intern.Interner = f.context.interner;
+    var changed:       bool             = false;
 
-    var changed: bool                               = false;
-    val ral:     res[loops.LoopAnalysis, fail.Fail] = loops.analyze(fn, ?m.types, alloc);
+    val ral: res[*loops.LoopAnalysis, fail.Fail] = analysis.loops_of(f.analyses, m, fn);
     if (sel ral.err) { ret res[bool, fail.Fail].err{ral.err}; }
-    var la: loops.LoopAnalysis = ral.ok;
+    val la: *loops.LoopAnalysis = ral.ok;
 
     val cap: u32                          = la.loop_len + 1;
     val rhh: res[*ir_id.BlockId, A.Error] = A.allocate[ir_id.BlockId](alloc, cap::usize);
     if (sel rhh.err) {
-        loops.dnit(?la);
         ret res[bool, fail.Fail].err{fail.refused(rhh.err)};
     }
     val headers: *ir_id.BlockId                    = rhh.ok;
     val rda:     res[*dependence.DepInfo, A.Error] = A.allocate[dependence.DepInfo](alloc, cap::usize);
     if (sel rda.err) {
         A.deallocate[ir_id.BlockId](alloc, headers, cap::usize);
-        loops.dnit(?la);
         ret res[bool, fail.Fail].err{fail.refused(rda.err)};
     }
     val deps: *dependence.DepInfo = rda.ok;
@@ -114,10 +118,9 @@ fun vectorize_function(f: *pass.Function, alloc: *A.Allocator) res[bool, fail.Fa
     var lx: u32 = 0;
     for (lx < la.loop_len) {
         var d:              dependence.DepInfo;
-        val vectorizable_r: res[bool, fail.Fail] = vectorizable(m, tgt, fn, ?la, lx, ?d, alloc);
+        val vectorizable_r: res[bool, fail.Fail] = vectorizable(m, tgt, fn, la, lx, ?d, alloc);
         if (sel vectorizable_r.err) {
             free_candidates(m, headers, deps, hn, cap, alloc);
-            loops.dnit(?la);
             ret res[bool, fail.Fail].err{vectorizable_r.err};
         }
         if (vectorizable_r.ok) {
@@ -127,32 +130,31 @@ fun vectorize_function(f: *pass.Function, alloc: *A.Allocator) res[bool, fail.Fa
         }
         lx = lx + 1;
     }
-    loops.dnit(?la);
 
     var hi: u32 = 0;
     for (hi < hn) {
-        val ra2: res[loops.LoopAnalysis, fail.Fail] = loops.analyze(fn, ?m.types, alloc);
+        val ra2: res[*loops.LoopAnalysis, fail.Fail] = analysis.loops_of(f.analyses, m, fn);
         if (sel ra2.err) {
             free_candidates(m, headers, deps, hn, cap, alloc);
             ret res[bool, fail.Fail].err{ra2.err};
         }
-        var la2: loops.LoopAnalysis = ra2.ok;
-        val lx2: u32                = find_loop_by_header(?la2, headers[hi]);
-        if (lx2 != versioning.NONE_U32) {
-            val vectorized_r: res[bool, fail.Fail] = vectorize_one(m, tgt, fn, ?la2, lx2, ?deps[hi], itn, alloc);
+        val la2: *loops.LoopAnalysis = ra2.ok;
+        val lx2: u32                 = find_loop_by_header(la2, headers[hi]);
+        if (lx2 != NONE_U32) {
+            val vectorized_r: res[bool, fail.Fail] = vectorize_one(f.analyses, m, tgt, fn, la2, lx2, ?deps[hi], itn, alloc);
             if (sel vectorized_r.err) {
-                loops.dnit(?la2);
                 free_candidates(m, headers, deps, hn, cap, alloc);
                 ret res[bool, fail.Fail].err{vectorized_r.err};
             }
             if (vectorized_r.ok) { changed = true; }
         }
-        loops.dnit(?la2);
+        # a candidate's run can change the function the next one is read from
+        analysis.del(f.analyses, m, fn);
         hi = hi + 1;
     }
     free_candidates(m, headers, deps, hn, cap, alloc);
 
-    val reduced_r: res[bool, fail.Fail] = run_reductions(m, tgt, fn, f.context.float_reassoc, itn, alloc);
+    val reduced_r: res[bool, fail.Fail] = run_reductions(f.analyses, m, tgt, fn, float_reassoc, itn, alloc);
     if (sel reduced_r.err) { ret reduced_r; }
     if (reduced_r.ok)      { changed = true; }
     ret res[bool, fail.Fail].ok{changed};
@@ -174,7 +176,7 @@ fun find_loop_by_header(la: *loops.LoopAnalysis, h: ir_id.BlockId) u32 {
         if (ir_id.block_same(la.loops[i].header, h)) { ret i; }
         i = i + 1;
     }
-    ret versioning.NONE_U32;
+    ret NONE_U32;
 }
 
 rec PredShape {
@@ -344,7 +346,7 @@ fun phi_value_from(fn: *me_ir.Function, pid: ir_id.InstructionId, from: ir_id.Bl
     ret value.const_null(ir_type.IRT_NIL);
 }
 
-fun map_shape(m: *me_ir.Module, tgt: *lang_target.Target, d: *dependence.DepInfo, out: *MapShape) bool {
+fun map_shape(m: *me_ir.Module, tgt: *resolved.Target, d: *dependence.DepInfo, out: *MapShape) bool {
     if (d.access_count == 0) { ret false; }
     val elem_ty:  ir_type.IrTypeId = d.accesses[0].elem_ty;
     val w:        u32              = d.accesses[0].bytes;
@@ -368,7 +370,7 @@ fun map_shape(m: *me_ir.Module, tgt: *lang_target.Target, d: *dependence.DepInfo
     ret true;
 }
 
-fun vectorizable(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32, out_d: *dependence.DepInfo, alloc: *A.Allocator) res[bool, fail.Fail] {
+fun vectorizable(m: *me_ir.Module, tgt: *resolved.Target, fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32, out_d: *dependence.DepInfo, alloc: *A.Allocator) res[bool, fail.Fail] {
     val lp:   *loops.Loop = ?la.loops[lx];
     var pred: PredShape;
     if (!loop_shape_ok(fn, lp, ?pred)) { ret res[bool, fail.Fail].ok{false}; }
@@ -416,7 +418,7 @@ fun vectorizable(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Function
     ret res[bool, fail.Fail].ok{true};
 }
 
-fun stores_are_pure_trees(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32, d: *dependence.DepInfo, shape: *MapShape, pred_ok: bool, mask_cmp: ir_id.InstructionId, alloc: *A.Allocator) res[bool, fail.Fail] {
+fun stores_are_pure_trees(m: *me_ir.Module, tgt: *resolved.Target, fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32, d: *dependence.DepInfo, shape: *MapShape, pred_ok: bool, mask_cmp: ir_id.InstructionId, alloc: *A.Allocator) res[bool, fail.Fail] {
     val rset: res[*bool, A.Error] = A.allocate[bool](alloc, fn.instr_len::usize);
     if (sel rset.err) { ret res[bool, fail.Fail].err{fail.refused(rset.err)}; }
     val vset: *bool = rset.ok;
@@ -461,7 +463,7 @@ fun pred_joins_in_vset(fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32, vs
 # wider type) the target packs whose operands are in the set or splat. a
 # sign or zero extension from the element type to `wide_ty` joins when the
 # target packs it, and the compare `mask_cmp` joins as the lane mask
-fun build_vset(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32, accesses: *dependence.MemAccess, access_count: u32, elem_ty: ir_type.IrTypeId, wide_ty: ir_type.IrTypeId, is_float: bool, allow_splat: bool, admit_joins: bool, mask_cmp: ir_id.InstructionId, vset: *bool) {
+fun build_vset(m: *me_ir.Module, tgt: *resolved.Target, fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32, accesses: *dependence.MemAccess, access_count: u32, elem_ty: ir_type.IrTypeId, wide_ty: ir_type.IrTypeId, is_float: bool, allow_splat: bool, admit_joins: bool, mask_cmp: ir_id.InstructionId, vset: *bool) {
     var i: u32 = 0;
     for (i < fn.instr_len) {
         vset[i] = false;
@@ -526,7 +528,7 @@ fun build_vset(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Function, 
 }
 
 # whether `inst` runs lane-wise at its own type once its operands do
-fun lane_wise(m: *me_ir.Module, tgt: *lang_target.Target, inst: *ir_instruction.Instruction, iid: ir_id.InstructionId, elem_ty: ir_type.IrTypeId, wide_ty: ir_type.IrTypeId, is_float: bool, mask_cmp: ir_id.InstructionId) bool {
+fun lane_wise(m: *me_ir.Module, tgt: *resolved.Target, inst: *ir_instruction.Instruction, iid: ir_id.InstructionId, elem_ty: ir_type.IrTypeId, wide_ty: ir_type.IrTypeId, is_float: bool, mask_cmp: ir_id.InstructionId) bool {
     if (is_mask_compare(inst.kind)) {
         if (!ir_id.instruction_same(iid, mask_cmp) || ir_id.instruction_is_nil(mask_cmp) || inst.operand_count != 2) { ret false; }
         val cmp_ty: ir_type.IrTypeId = inst.operands[0].ty;
@@ -602,7 +604,7 @@ fun pred_mask(p: *PredShape) ir_id.InstructionId {
     ret ir_id.INSTR_NIL;
 }
 
-fun supported_vector_op(tgt: *lang_target.Target, k: ir_instruction.InstrKind, is_float: bool, lane_bits: u32) bool {
+fun supported_vector_op(tgt: *resolved.Target, k: ir_instruction.InstrKind, is_float: bool, lane_bits: u32) bool {
     if (!in_increment_table(k, is_float)) { ret false; }
     ret vecform.packs(tgt, k, is_float, lane_bits, false);
 }
@@ -622,7 +624,7 @@ fun in_vset(fn: *me_ir.Function, vset: *bool, v: value.Value) bool {
 # lane width, else the shift, and the loop with it, stays scalar. either form
 # saturates each lane as the scalar shift does, so the widened loop
 # answers what the scalar one does for every count
-fun shift_lane_wise(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32, inst: *ir_instruction.Instruction, elem_ty: ir_type.IrTypeId, wide_ty: ir_type.IrTypeId, allow_splat: bool, vset: *bool) bool {
+fun shift_lane_wise(m: *me_ir.Module, tgt: *resolved.Target, fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32, inst: *ir_instruction.Instruction, elem_ty: ir_type.IrTypeId, wide_ty: ir_type.IrTypeId, allow_splat: bool, vset: *bool) bool {
     if (inst.operand_count != 2 || (!ir_type.same(inst.ty, elem_ty) && !ir_type.same(inst.ty, wide_ty))) { ret false; }
     if (!in_increment_table(inst.kind, false))                                                           { ret false; }
     val v:     value.Value = inst.operands[0];
@@ -662,7 +664,7 @@ fun in_increment_table(k: ir_instruction.InstrKind, is_float: bool) bool {
     ret opdesc.has(k, opdesc.EFF_VEC_INCR_INT);
 }
 
-fun vectorize_one(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32, d0: *dependence.DepInfo, itn: *intern.Interner, alloc: *A.Allocator) res[bool, fail.Fail] {
+fun vectorize_one(analyses: *analysis.Cache, m: *me_ir.Module, tgt: *resolved.Target, fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32, d0: *dependence.DepInfo, itn: *intern.Interner, alloc: *A.Allocator) res[bool, fail.Fail] {
     val lp0:   *loops.Loop = ?la.loops[lx];
     var pred0: PredShape;
     if (!loop_shape_ok(fn, lp0, ?pred0))          { ret res[bool, fail.Fail].ok{false}; }
@@ -696,20 +698,19 @@ fun vectorize_one(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Functio
     val lane_bound: value.Value    = rlb.ok;
     val r_539:      err[fail.Fail] = builder.emit_br(?b, fast_header);
     if (sel r_539.err) { ret res[bool, fail.Fail].err{r_539.err}; }
-    versioning.redirect_terminator(fn, guard, fast_header, vpre);
-    versioning.relabel_phi_pred(fn, fast_header, guard, vpre);
+    cfg.terminator_redirect(fn, guard, fast_header, vpre);
+    cfg.phi_pred_relabel(fn, fast_header, guard, vpre);
 
-    val ra: res[loops.LoopAnalysis, fail.Fail] = loops.analyze(fn, ?m.types, alloc);
+    analysis.del(analyses, m, fn);
+    val ra: res[*loops.LoopAnalysis, fail.Fail] = analysis.loops_of(analyses, m, fn);
     if (sel ra.err) { ret res[bool, fail.Fail].err{ra.err}; }
-    var fla: loops.LoopAnalysis = ra.ok;
-    val flx: u32                = find_loop_by_header(?fla, fast_header);
-    if (flx == versioning.NONE_U32) {
-        loops.dnit(?fla);
+    val fla: *loops.LoopAnalysis = ra.ok;
+    val flx: u32                 = find_loop_by_header(fla, fast_header);
+    if (flx == NONE_U32) {
         ret res[bool, fail.Fail].err{fail.message("vectorize: a versioned clone lost the loop header its original has")};
     }
-    val rdd: res[dependence.DepInfo, fail.Fail] = dependence.analyze_dependence(fn, ?fla, flx, ?m.types, alloc);
+    val rdd: res[dependence.DepInfo, fail.Fail] = dependence.analyze_dependence(fn, fla, flx, ?m.types, alloc);
     if (sel rdd.err) {
-        loops.dnit(?fla);
         ret res[bool, fail.Fail].err{rdd.err};
     }
     var fd: dependence.DepInfo = rdd.ok;
@@ -723,7 +724,6 @@ fun vectorize_one(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Functio
     if (fast_ok && fpred.ok && shape.is_float)                   { fast_ok = false; }
     if (!fast_ok) {
         dependence.dep_dnit(?fd);
-        loops.dnit(?fla);
         ret res[bool, fail.Fail].err{fail.message("vectorize: a versioned clone failed the shape and dependence proof its original passed")};
     }
 
@@ -735,7 +735,6 @@ fun vectorize_one(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Functio
     val rfb:      res[*ir_id.BlockId, A.Error] = A.allocate[ir_id.BlockId](alloc, body_len::usize);
     if (sel rfb.err) {
         dependence.dep_dnit(?fd);
-        loops.dnit(?fla);
         ret res[bool, fail.Fail].err{fail.refused(rfb.err)};
     }
     val fbody: *ir_id.BlockId = rfb.ok;
@@ -749,19 +748,17 @@ fun vectorize_one(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Functio
     if (sel rrc.err) {
         A.deallocate[ir_id.BlockId](alloc, fbody, body_len::usize);
         dependence.dep_dnit(?fd);
-        loops.dnit(?fla);
         ret res[bool, fail.Fail].err{fail.refused(rrc.err)};
     }
     val rem_blocks: *ir_id.BlockId = rrc.ok;
-    val rcl:        err[fail.Fail] = versioning.clone_region(m, fn, fbody, body_len, rem_blocks, alloc);
+    val rcl:        err[fail.Fail] = cfg.region_clone(m, fn, fbody, body_len, rem_blocks, alloc);
     if (sel rcl.err) {
         A.deallocate[ir_id.BlockId](alloc, fbody, body_len::usize);
         A.deallocate[ir_id.BlockId](alloc, rem_blocks, body_len::usize);
         dependence.dep_dnit(?fd);
-        loops.dnit(?fla);
         ret res[bool, fail.Fail].err{rcl.err};
     }
-    val rem_header: ir_id.BlockId = rem_blocks[versioning.region_index(fbody, body_len, fast_header)];
+    val rem_header: ir_id.BlockId = rem_blocks[cfg.region_index(fbody, body_len, fast_header)];
 
     if (fpred.ok) {
         val rif: err[fail.Fail] = if_convert(m, fn, flp, ?fpred, fshape.elem_ty, alloc);
@@ -769,7 +766,6 @@ fun vectorize_one(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Functio
             A.deallocate[ir_id.BlockId](alloc, fbody, body_len::usize);
             A.deallocate[ir_id.BlockId](alloc, rem_blocks, body_len::usize);
             dependence.dep_dnit(?fd);
-            loops.dnit(?fla);
             ret res[bool, fail.Fail].err{rif.err};
         }
     }
@@ -779,11 +775,10 @@ fun vectorize_one(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Functio
         A.deallocate[ir_id.BlockId](alloc, fbody, body_len::usize);
         A.deallocate[ir_id.BlockId](alloc, rem_blocks, body_len::usize);
         dependence.dep_dnit(?fd);
-        loops.dnit(?fla);
         ret res[bool, fail.Fail].err{fail.refused(rset.err)};
     }
     val vset: *bool = rset.ok;
-    build_vset(m, tgt, fn, ?fla, flx, fd.accesses, fd.access_count, fshape.elem_ty, fshape.elem_ty, fshape.is_float, true, false, pred_mask(?fpred), vset);
+    build_vset(m, tgt, fn, fla, flx, fd.accesses, fd.access_count, fshape.elem_ty, fshape.elem_ty, fshape.is_float, true, false, pred_mask(?fpred), vset);
     val vset_len: u32            = fn.instr_len;
     val rsp:      err[fail.Fail] = retype_then_splat(m, tgt, fn, flp, vset, vpre, fast_header, shape.lanes, itn, alloc);
     A.deallocate[bool](alloc, vset, vset_len::usize);
@@ -791,7 +786,6 @@ fun vectorize_one(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Functio
         A.deallocate[ir_id.BlockId](alloc, fbody, body_len::usize);
         A.deallocate[ir_id.BlockId](alloc, rem_blocks, body_len::usize);
         dependence.dep_dnit(?fd);
-        loops.dnit(?fla);
         ret res[bool, fail.Fail].err{rsp.err};
     }
 
@@ -800,7 +794,6 @@ fun vectorize_one(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Functio
         A.deallocate[ir_id.BlockId](alloc, fbody, body_len::usize);
         A.deallocate[ir_id.BlockId](alloc, rem_blocks, body_len::usize);
         dependence.dep_dnit(?fd);
-        loops.dnit(?fla);
         ret res[bool, fail.Fail].err{rss.err};
     }
 
@@ -809,17 +802,15 @@ fun vectorize_one(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Functio
         A.deallocate[ir_id.BlockId](alloc, fbody, body_len::usize);
         A.deallocate[ir_id.BlockId](alloc, rem_blocks, body_len::usize);
         dependence.dep_dnit(?fd);
-        loops.dnit(?fla);
         ret res[bool, fail.Fail].err{rbt.err};
     }
 
-    versioning.redirect_terminator(fn, fast_header, merge, rem_header);
+    cfg.terminator_redirect(fn, fast_header, merge, rem_header);
     val rer: bool = enter_remainder_from(fn, rem_header, vpre, fast_header);
 
     A.deallocate[ir_id.BlockId](alloc, fbody, body_len::usize);
     A.deallocate[ir_id.BlockId](alloc, rem_blocks, body_len::usize);
     dependence.dep_dnit(?fd);
-    loops.dnit(?fla);
     if (!rer) { ret res[bool, fail.Fail].err{fail.message("vectorize: remainder header phis do not mirror the vector header's")}; }
 
     val rpr: err[fail.Fail] = me_ir.preds_rebuild(m, fn);
@@ -964,26 +955,12 @@ fun emit_binary_prepend(m: *me_ir.Module, fn: *me_ir.Function, blk: ir_id.BlockI
 
 # a two-operand instruction in no block yet, at the source location of `loc_ref`
 fun new_binary(m: *me_ir.Module, fn: *me_ir.Function, kind: ir_instruction.InstrKind, lhs: value.Value, rhs: value.Value, ty: ir_type.IrTypeId, aux_ty: ir_type.IrTypeId, loc_ref: ir_id.InstructionId) res[ir_id.InstructionId, fail.Fail] {
-    val rops: res[me_ir.OperandArray, fail.Fail] = me_ir.operands_alloc(m, 2);
-    if (sel rops.err) { ret res[ir_id.InstructionId, fail.Fail].err{rops.err}; }
-    val arr: me_ir.OperandArray = rops.ok;
-    arr.ops[0] = lhs;
-    arr.ops[1] = rhs;
-
-    var ni: ir_instruction.Instruction;
-    ni.kind          = kind;
-    ni.ty            = ty;
-    ni.operands      = arr.ops;
-    ni.operand_count = 2;
-    ni.operand_cap   = 2;
-    ni.flags         = 0;
-    ni.aux_ty        = aux_ty;
-    ni.loc           = fn.instrs[loc_ref::u32].loc;
-    ni.secret        = false;
-
-    val ri: res[ir_id.InstructionId, fail.Fail] = me_ir.instruction_add(m, fn, ni);
-    if (sel ri.err) { A.deallocate[value.Value](m.alloc, arr.ops, 2::usize); }
-    ret ri;
+    var ops: [2]value.Value;
+    ops[0] = lhs;
+    ops[1] = rhs;
+    var bld: builder.Builder = builder.on(m, fn);
+    builder.set_loc(?bld, fn.instrs[loc_ref::u32].loc);
+    ret builder.emit_instr(?bld, kind, ty, aux_ty, ?ops[0], 2);
 }
 
 # each lane-wise instruction becomes a vector of `lanes` of its own scalar type,
@@ -1021,7 +998,7 @@ fun retype_to_vector(m: *me_ir.Module, fn: *me_ir.Function, lp: *loops.Loop, vse
     ret err[fail.Fail].ok{};
 }
 
-fun retype_then_splat(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Function, lp: *loops.Loop, vset: *bool, vpre: ir_id.BlockId, header: ir_id.BlockId, lanes: u32, itn: *intern.Interner, alloc: *A.Allocator) err[fail.Fail] {
+fun retype_then_splat(m: *me_ir.Module, tgt: *resolved.Target, fn: *me_ir.Function, lp: *loops.Loop, vset: *bool, vpre: ir_id.BlockId, header: ir_id.BlockId, lanes: u32, itn: *intern.Interner, alloc: *A.Allocator) err[fail.Fail] {
     val rrt: err[fail.Fail] = retype_to_vector(m, fn, lp, vset, lanes);
     if (sel rrt.err) { ret rrt; }
     ret splat_invariants(m, tgt, fn, lp, vset, vpre, header, lanes, itn, alloc);
@@ -1047,7 +1024,7 @@ fun body_operand_slots(fn: *me_ir.Function, lp: *loops.Loop) u32 {
 # once in a block ahead of the loop. a shift's invariant count is the uniform
 # form's one scalar instead, converted there to the lane type when it
 # is of another width
-fun splat_invariants(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Function, lp: *loops.Loop, vset: *bool, vpre: ir_id.BlockId, fast_header: ir_id.BlockId, lanes: u32, itn: *intern.Interner, alloc: *A.Allocator) err[fail.Fail] {
+fun splat_invariants(m: *me_ir.Module, tgt: *resolved.Target, fn: *me_ir.Function, lp: *loops.Loop, vset: *bool, vpre: ir_id.BlockId, fast_header: ir_id.BlockId, lanes: u32, itn: *intern.Interner, alloc: *A.Allocator) err[fail.Fail] {
     val cap: u32 = body_operand_slots(fn, lp);
     if (cap == 0) { ret err[fail.Fail].ok{}; }
     val rss: res[*SplatSite, A.Error] = A.allocate[SplatSite](alloc, cap::usize);
@@ -1107,7 +1084,7 @@ fun splat_invariants(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Func
     var cn: u32 = 0;
     var i:  u32 = 0;
     for (i < n) {
-        if (splat_lookup(cache, cn, sites[i].val, sites[i].to) == versioning.NONE_U32) {
+        if (splat_lookup(cache, cn, sites[i].val, sites[i].to) == NONE_U32) {
             var rsv: res[value.Value, fail.Fail] = res[value.Value, fail.Fail].err{fail.message("vectorize: splat site")};
             if (ir_type.is_nil(sites[i].to)) { rsv = emit_lane_splat(?b, sites[i].val, lanes, tgt, itn); }
             or                               { rsv = emit_uniform_count(?b, sites[i].val, sites[i].to); }
@@ -1127,13 +1104,13 @@ fun splat_invariants(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Func
         splat_free(m, sites, cache, cap, alloc);
         ret err[fail.Fail].err{fail.message("vectorize: splat block branch")};
     }
-    versioning.redirect_terminator(fn, vpre, fast_header, spre);
-    versioning.relabel_phi_pred(fn, fast_header, vpre, spre);
+    cfg.terminator_redirect(fn, vpre, fast_header, spre);
+    cfg.phi_pred_relabel(fn, fast_header, vpre, spre);
 
     i = 0;
     for (i < n) {
         val ci: u32 = splat_lookup(cache, cn, sites[i].val, sites[i].to);
-        if (ci != versioning.NONE_U32) {
+        if (ci != NONE_U32) {
             val inst: *ir_instruction.Instruction = ?fn.instrs[sites[i].instr::u32];
             inst.operands[sites[i].slot] = cache[ci].vec;
         }
@@ -1151,10 +1128,10 @@ fun splat_free(m: *me_ir.Module, sites: *SplatSite, cache: *SplatEntry, cap: u32
 fun splat_lookup(cache: *SplatEntry, cn: u32, v: value.Value, to: ir_type.IrTypeId) u32 {
     var i: u32 = 0;
     for (i < cn) {
-        if (ir_type.same(cache[i].to, to) && dependence.equal(cache[i].key, v)) { ret i; }
+        if (ir_type.same(cache[i].to, to) && value.is_same(cache[i].key, v)) { ret i; }
         i = i + 1;
     }
-    ret versioning.NONE_U32;
+    ret NONE_U32;
 }
 
 # the element type of a vector type, IRT_NIL for any other
@@ -1172,7 +1149,7 @@ fun emit_uniform_count(b: *builder.Builder, v: value.Value, to: ir_type.IrTypeId
     ret builder.emit_trunc(b, v, to);
 }
 
-fun emit_lane_splat(b: *builder.Builder, v: value.Value, lanes: u32, tgt: *lang_target.Target, itn: *intern.Interner) res[value.Value, fail.Fail] {
+fun emit_lane_splat(b: *builder.Builder, v: value.Value, lanes: u32, tgt: *resolved.Target, itn: *intern.Interner) res[value.Value, fail.Fail] {
     val rat: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_array(?b.m.types, v.ty, lanes);
     if (sel rat.err) { ret res[value.Value, fail.Fail].err{rat.err}; }
     val rvt: res[ir_type.IrTypeId, fail.Fail] = ir_type.intern_vector(?b.m.types, v.ty, lanes);
@@ -1182,7 +1159,7 @@ fun emit_lane_splat(b: *builder.Builder, v: value.Value, lanes: u32, tgt: *lang_
 
 # a splat of a constant is one load from a read-only global holding the
 # lanes; any other splat is built on the stack
-fun emit_splat(b: *builder.Builder, v: value.Value, arr_ty: ir_type.IrTypeId, vec_ty: ir_type.IrTypeId, lanes: u32, tgt: *lang_target.Target, itn: *intern.Interner) res[value.Value, fail.Fail] {
+fun emit_splat(b: *builder.Builder, v: value.Value, arr_ty: ir_type.IrTypeId, vec_ty: ir_type.IrTypeId, lanes: u32, tgt: *resolved.Target, itn: *intern.Interner) res[value.Value, fail.Fail] {
     if (itn != nil && (v.kind == value.VAL_CONST_INT || v.kind == value.VAL_CONST_FLOAT)) {
         val rc: res[value.Value, fail.Fail] = const_splat_global(b.m, v, arr_ty, lanes, tgt, itn);
         if (sel rc.err) { ret rc; }
@@ -1205,7 +1182,7 @@ fun emit_splat(b: *builder.Builder, v: value.Value, arr_ty: ir_type.IrTypeId, ve
     ret builder.emit_load(b, slot, vec_ty);
 }
 
-fun const_splat_global(m: *me_ir.Module, v: value.Value, arr_ty: ir_type.IrTypeId, lanes: u32, tgt: *lang_target.Target, itn: *intern.Interner) res[value.Value, fail.Fail] {
+fun const_splat_global(m: *me_ir.Module, v: value.Value, arr_ty: ir_type.IrTypeId, lanes: u32, tgt: *resolved.Target, itn: *intern.Interner) res[value.Value, fail.Fail] {
     val elem_bytes: u32 = ir_type.byte_size_for_machine(?m.types, v.ty, resolved.layout_machine(tgt));
     if (elem_bytes == 0 || elem_bytes > 8) { ret res[value.Value, fail.Fail].err{fail.message("vectorize: splat lane width is not a scalar width")}; }
     var bits: u64 = 0;
@@ -1245,30 +1222,12 @@ fun const_splat_global(m: *me_ir.Module, v: value.Value, arr_ty: ir_type.IrTypeI
     val rn: res[intern.StrId, A.Error] = intern.bytes_add(itn, (?name_buf[0])::str, n);
     if (sel rn.err) { ret res[value.Value, fail.Fail].err{fail.refused(rn.err)}; }
 
-    val grown: err[A.Error] = growth.reserve[me_ir.Global](m.alloc, ?m.globals, ?m.global_cap, m.global_len::usize + 1);
-    if (sel grown.err) { ret res[value.Value, fail.Fail].err{fail.refused(grown.err)}; }
-    val gix: u32 = m.global_len;
-    var g:   me_ir.Global;
-    g.name         = rn.ok;
-    g.ty           = arr_ty;
-    g.init         = init;
-    g.is_mut       = false;
-    g.is_pub       = false;
-    g.is_extern    = false;
-    g.is_import    = false;
-    g.is_local     = true;
-    g.is_embed     = false;
-    g.align        = 16;
-    g.section      = intern.STR_NIL;
-    g.iface        = 0;
-    g.iface_a      = 0;
-    g.iface_b      = 0;
-    g.iface_flags  = 0;
-    g.disp         = intern.STR_NIL;
-    g.ty_sem       = type.TYPE_NIL;
-    g.decl_loc     = lang_source.location_nil();
-    m.globals[gix] = g;
-    m.global_len   = gix + 1;
+    var g: me_ir.Global = me_ir.global_init(rn.ok, arr_ty, init);
+    g.is_local = true;
+    g.align    = 16;
+    val added: res[u32, fail.Fail] = me_ir.global_add(m, g);
+    if (sel added.err) { ret res[value.Value, fail.Fail].err{added.err}; }
+    val gix: u32 = added.ok;
     ret res[value.Value, fail.Fail].ok{value.global(gix, rp.ok)};
 }
 
@@ -1324,7 +1283,7 @@ fun enter_remainder_from(fn: *me_ir.Function, rem_header: ir_id.BlockId, from: i
         var o:   u32                         = 0;
         for (o < phi.operand_count) {
             if (refs.operand_is_block(phi.kind, o) && ir_id.block_same(me_ir.block_target(phi.operands[o]), from)) {
-                phi.operands[o].data.int_lit = ir_id.block_index(vec_header)::u64;
+                me_ir.block_target_set(?phi.operands[o], vec_header);
                 if (o + 1 < phi.operand_count) { phi.operands[o + 1] = value.retype(src, phi.operands[o + 1].ty); }
             }
             o = o + 1;
@@ -1334,23 +1293,21 @@ fun enter_remainder_from(fn: *me_ir.Function, rem_header: ir_id.BlockId, from: i
     ret true;
 }
 
-fun run_reductions(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Function, float_reassoc: bool, itn: *intern.Interner, alloc: *A.Allocator) res[bool, fail.Fail] {
-    var changed: bool                               = false;
-    val ral:     res[loops.LoopAnalysis, fail.Fail] = loops.analyze(fn, ?m.types, alloc);
+fun run_reductions(analyses: *analysis.Cache, m: *me_ir.Module, tgt: *resolved.Target, fn: *me_ir.Function, float_reassoc: bool, itn: *intern.Interner, alloc: *A.Allocator) res[bool, fail.Fail] {
+    var changed: bool                                = false;
+    val ral:     res[*loops.LoopAnalysis, fail.Fail] = analysis.loops_of(analyses, m, fn);
     if (sel ral.err) { ret res[bool, fail.Fail].err{ral.err}; }
-    var la: loops.LoopAnalysis = ral.ok;
+    val la: *loops.LoopAnalysis = ral.ok;
 
     val cap: u32                          = la.loop_len + 1;
     val rhh: res[*ir_id.BlockId, A.Error] = A.allocate[ir_id.BlockId](alloc, cap::usize);
     if (sel rhh.err) {
-        loops.dnit(?la);
         ret res[bool, fail.Fail].err{fail.refused(rhh.err)};
     }
     val headers: *ir_id.BlockId                          = rhh.ok;
     val rra:     res[*dependence.ReductionInfo, A.Error] = A.allocate[dependence.ReductionInfo](alloc, cap::usize);
     if (sel rra.err) {
         A.deallocate[ir_id.BlockId](alloc, headers, cap::usize);
-        loops.dnit(?la);
         ret res[bool, fail.Fail].err{fail.refused(rra.err)};
     }
     val reds: *dependence.ReductionInfo = rra.ok;
@@ -1359,10 +1316,9 @@ fun run_reductions(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Functi
     var lx: u32 = 0;
     for (lx < la.loop_len) {
         var ri:          dependence.ReductionInfo;
-        val candidate_r: res[bool, fail.Fail] = reduction_candidate(m, tgt, fn, ?la, lx, float_reassoc, ?ri, alloc);
+        val candidate_r: res[bool, fail.Fail] = reduction_candidate(m, tgt, fn, la, lx, float_reassoc, ?ri, alloc);
         if (sel candidate_r.err) {
             free_reds(m, headers, reds, hn, cap, alloc);
-            loops.dnit(?la);
             ret candidate_r;
         }
         if (candidate_r.ok) {
@@ -1372,27 +1328,25 @@ fun run_reductions(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Functi
         }
         lx = lx + 1;
     }
-    loops.dnit(?la);
 
     var hi: u32 = 0;
     for (hi < hn) {
-        val ra2: res[loops.LoopAnalysis, fail.Fail] = loops.analyze(fn, ?m.types, alloc);
+        val ra2: res[*loops.LoopAnalysis, fail.Fail] = analysis.loops_of(analyses, m, fn);
         if (sel ra2.err) {
             free_reds(m, headers, reds, hn, cap, alloc);
             ret res[bool, fail.Fail].err{ra2.err};
         }
-        var la2: loops.LoopAnalysis = ra2.ok;
-        val lx2: u32                = find_loop_by_header(?la2, headers[hi]);
-        if (lx2 != versioning.NONE_U32) {
-            val vectorized_r: res[bool, fail.Fail] = vectorize_reduction(m, tgt, fn, ?la2, lx2, ?reds[hi], itn, alloc);
+        val la2: *loops.LoopAnalysis = ra2.ok;
+        val lx2: u32                 = find_loop_by_header(la2, headers[hi]);
+        if (lx2 != NONE_U32) {
+            val vectorized_r: res[bool, fail.Fail] = vectorize_reduction(m, tgt, fn, la2, lx2, ?reds[hi], itn, alloc);
             if (sel vectorized_r.err) {
-                loops.dnit(?la2);
                 free_reds(m, headers, reds, hn, cap, alloc);
                 ret vectorized_r;
             }
             if (vectorized_r.ok) { changed = true; }
         }
-        loops.dnit(?la2);
+        analysis.del(analyses, m, fn);
         hi = hi + 1;
     }
     free_reds(m, headers, reds, hn, cap, alloc);
@@ -1409,7 +1363,7 @@ fun free_reds(m: *me_ir.Module, headers: *ir_id.BlockId, reds: *dependence.Reduc
     A.deallocate[dependence.ReductionInfo](alloc, reds, cap::usize);
 }
 
-fun reduction_candidate(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32, float_reassoc: bool, out_ri: *dependence.ReductionInfo, alloc: *A.Allocator) res[bool, fail.Fail] {
+fun reduction_candidate(m: *me_ir.Module, tgt: *resolved.Target, fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32, float_reassoc: bool, out_ri: *dependence.ReductionInfo, alloc: *A.Allocator) res[bool, fail.Fail] {
     val lp: *loops.Loop = ?la.loops[lx];
     if (!reduction_shape_ok(lp)) { ret res[bool, fail.Fail].ok{false}; }
     val rr: res[dependence.ReductionInfo, fail.Fail] = dependence.analyze_reduction(fn, la, lx, ?m.types, alloc, float_reassoc);
@@ -1445,7 +1399,7 @@ fun reduction_shape_ok(lp: *loops.Loop) bool {
 # lane-wise or splat, and the mask operations packed: the extension to the
 # accumulator's width, the `and` with the value, and for an identity other
 # than zero or an update on a failed compare the complement and `or`
-fun reduction_vectorizes(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32, ri: *dependence.ReductionInfo, alloc: *A.Allocator) bool {
+fun reduction_vectorizes(m: *me_ir.Module, tgt: *resolved.Target, fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32, ri: *dependence.ReductionInfo, alloc: *A.Allocator) bool {
     val rset: res[*bool, A.Error] = A.allocate[bool](alloc, fn.instr_len::usize);
     if (sel rset.err) { ret false; }
     val vset: *bool = rset.ok;
@@ -1633,7 +1587,7 @@ rec NarrowCount {
     group:   bool;
 }
 
-fun narrow_count(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Function, ri: *dependence.ReductionInfo, out: *NarrowCount) res[bool, fail.Fail] {
+fun narrow_count(m: *me_ir.Module, tgt: *resolved.Target, fn: *me_ir.Function, ri: *dependence.ReductionInfo, out: *NarrowCount) res[bool, fail.Fail] {
     if (ri.is_float || ri.op != ir_instruction.OP_ADD || ir_id.instruction_is_nil(ri.pred_join)) { ret res[bool, fail.Fail].ok{false}; }
     val rv: value.Value = me_ir.constant_behind(fn, ri.rv);
     if (rv.kind != value.VAL_CONST_INT) { ret res[bool, fail.Fail].ok{false}; }
@@ -1814,7 +1768,7 @@ fun emit_narrow_flush(m: *me_ir.Module, fn: *me_ir.Function, nc: *NarrowCount, h
     ret err[fail.Fail].ok{};
 }
 
-fun vectorize_reduction(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32, ri: *dependence.ReductionInfo, itn: *intern.Interner, alloc: *A.Allocator) res[bool, fail.Fail] {
+fun vectorize_reduction(m: *me_ir.Module, tgt: *resolved.Target, fn: *me_ir.Function, la: *loops.LoopAnalysis, lx: u32, ri: *dependence.ReductionInfo, itn: *intern.Interner, alloc: *A.Allocator) res[bool, fail.Fail] {
     val lp: *loops.Loop = ?la.loops[lx];
     if (!reduction_shape_ok(lp)) { ret res[bool, fail.Fail].ok{false}; }
 
@@ -1876,13 +1830,13 @@ fun vectorize_reduction(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.F
         ret res[bool, fail.Fail].err{fail.refused(rrc.err)};
     }
     val rem: *ir_id.BlockId = rrc.ok;
-    val rcl: err[fail.Fail] = versioning.clone_region(m, fn, fbody, body_len, rem, alloc);
+    val rcl: err[fail.Fail] = cfg.region_clone(m, fn, fbody, body_len, rem, alloc);
     if (sel rcl.err) {
         A.deallocate[ir_id.BlockId](alloc, fbody, body_len::usize);
         A.deallocate[ir_id.BlockId](alloc, rem, body_len::usize);
         ret res[bool, fail.Fail].err{rcl.err};
     }
-    val rem_header: ir_id.BlockId       = rem[versioning.region_index(fbody, body_len, header)];
+    val rem_header: ir_id.BlockId       = rem[cfg.region_index(fbody, body_len, header)];
     val rblk:       *me_ir.Block        = ?fn.blocks[rem_header::u32];
     val sacc:       ir_id.InstructionId = rblk.phis[acc_idx];
     val iv_r:       ir_id.InstructionId = rblk.phis[iv_idx];
@@ -1916,8 +1870,8 @@ fun vectorize_reduction(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.F
     val lane_bound: value.Value    = rlb.ok;
     val r_1137:     err[fail.Fail] = builder.emit_br(?b, header);
     if (sel r_1137.err) { ret res[bool, fail.Fail].err{r_1137.err}; }
-    versioning.redirect_terminator(fn, preheader, header, vpre);
-    versioning.relabel_phi_pred(fn, header, preheader, vpre);
+    cfg.terminator_redirect(fn, preheader, header, vpre);
+    cfg.phi_pred_relabel(fn, header, preheader, vpre);
     set_phi_value(fn, header, vpre, acc_phi, vacc0);
 
     val rrp: err[fail.Fail] = replace_out_of_loop_uses(m, fn, acc_phi, value.instr(sacc, acc_ty), lp.body, lp.body_len, fn.instr_len, alloc);
@@ -1955,8 +1909,8 @@ fun vectorize_reduction(m: *me_ir.Module, tgt: *lang_target.Target, fn: *me_ir.F
     val r_1152: err[fail.Fail] = builder.emit_br(?b, rem_header);
     if (sel r_1152.err) { ret res[bool, fail.Fail].err{r_1152.err}; }
 
-    versioning.redirect_terminator(fn, header, exit, combine);
-    versioning.relabel_phi_pred(fn, rem_header, preheader, combine);
+    cfg.terminator_redirect(fn, header, exit, combine);
+    cfg.phi_pred_relabel(fn, rem_header, preheader, combine);
     set_phi_value(fn, rem_header, combine, sacc, s0);
     set_phi_value(fn, rem_header, combine, iv_r, value.instr(iv_phi, iv_ty));
 
@@ -2033,7 +1987,7 @@ fun emit_ordered_fold(m: *me_ir.Module, fn: *me_ir.Function, ri: *dependence.Red
     var at:       u32                 = 0;
     for (bi < fn.block_count) {
         at = block_index_of(?fn.blocks[bi], upd_id);
-        if (at != versioning.NONE_U32) { brk; }
+        if (at != NONE_U32) { brk; }
         bi = bi + 1;
     }
     if (bi == fn.block_count) { ret err[fail.Fail].err{fail.message("vectorize: an ordered reduction's update is in no block")}; }
@@ -2076,7 +2030,7 @@ fun block_index_of(blk: *me_ir.Block, iid: ir_id.InstructionId) u32 {
         if (ir_id.instruction_same(blk.instructions[i], iid)) { ret i; }
         i = i + 1;
     }
-    ret versioning.NONE_U32;
+    ret NONE_U32;
 }
 
 # `iid` at position `at` of the block's instructions
@@ -2360,13 +2314,12 @@ fun operand1_is_sub(fn: *me_ir.Function, iid: ir_id.InstructionId) bool {
 fun run_axpy_signedness(use_unsigned: bool, want_kind: ir_instruction.InstrKind) i32 {
     var alloc: A.Allocator;
     page.make(?alloc);
-    var reg: lang_target.TargetRegistry = lang_target.registry_init();
-    fin { lang_target.registry_dnit(?reg); }
-    val r_1417: err[fail.Fail] = lang_target.register_all(?reg, target_testing.debug_descriptor);
+    var reg:    lang_target.TargetRegistry = lang_target.registry_init();
+    val r_1417: err[fail.Fail]             = lang_target.register_all(?reg, ?target_testing.DEBUG);
     if (sel r_1417.err) { ret 1; }
-    val rtg: res[lang_target.Target, fail.Fail] = lang_target.select_of(?reg, "x86_64", "linux", "sysv64", "");
+    val rtg: res[lang_target.Binding, fail.Fail] = lang_target.select_of(?reg, "x86_64", "linux", "sysv64", "");
     if (sel rtg.err) { ret 1; }
-    var tgt: lang_target.Target = rtg.ok;
+    var tgt: resolved.Target = rtg.ok.target;
 
     val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
     if (sel rm.err) { ret 1; }
@@ -2451,13 +2404,12 @@ test run__tail_guard_preserves_source_signedness {
 fun run_reduction_signedness(use_unsigned: bool, want_kind: ir_instruction.InstrKind) i32 {
     var alloc: A.Allocator;
     page.make(?alloc);
-    var reg: lang_target.TargetRegistry = lang_target.registry_init();
-    fin { lang_target.registry_dnit(?reg); }
-    val r_1482: err[fail.Fail] = lang_target.register_all(?reg, target_testing.debug_descriptor);
+    var reg:    lang_target.TargetRegistry = lang_target.registry_init();
+    val r_1482: err[fail.Fail]             = lang_target.register_all(?reg, ?target_testing.DEBUG);
     if (sel r_1482.err) { ret 1; }
-    val rtg: res[lang_target.Target, fail.Fail] = lang_target.select_of(?reg, "x86_64", "linux", "sysv64", "");
+    val rtg: res[lang_target.Binding, fail.Fail] = lang_target.select_of(?reg, "x86_64", "linux", "sysv64", "");
     if (sel rtg.err) { ret 1; }
-    var tgt: lang_target.Target = rtg.ok;
+    var tgt: resolved.Target = rtg.ok.target;
 
     val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
     if (sel rm.err) { ret 1; }
@@ -2645,13 +2597,12 @@ test run__reduction_tail_guard_preserves_source_signedness {
 test run__a_decline_leaves_the_function_untouched {
     var alloc: A.Allocator;
     page.make(?alloc);
-    var reg: lang_target.TargetRegistry = lang_target.registry_init();
-    fin { lang_target.registry_dnit(?reg); }
-    val r_1590: err[fail.Fail] = lang_target.register_all(?reg, target_testing.debug_descriptor);
+    var reg:    lang_target.TargetRegistry = lang_target.registry_init();
+    val r_1590: err[fail.Fail]             = lang_target.register_all(?reg, ?target_testing.DEBUG);
     if (sel r_1590.err) { ret 1; }
-    val rtg: res[lang_target.Target, fail.Fail] = lang_target.select_of(?reg, "x86_64", "linux", "sysv64", "");
+    val rtg: res[lang_target.Binding, fail.Fail] = lang_target.select_of(?reg, "x86_64", "linux", "sysv64", "");
     if (sel rtg.err) { ret 1; }
-    var tgt: lang_target.Target = rtg.ok;
+    var tgt: resolved.Target = rtg.ok.target;
 
     val rm: res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
     if (sel rm.err) { ret 1; }
@@ -2882,13 +2833,12 @@ test empty_forwarder__treats_a_debug_only_block_as_empty {
 test run__declines_a_predicated_mixed_join {
     var alloc: A.Allocator;
     page.make(?alloc);
-    var reg: lang_target.TargetRegistry = lang_target.registry_init();
-    fin { lang_target.registry_dnit(?reg); }
-    val r_1721: err[fail.Fail] = lang_target.register_all(?reg, target_testing.debug_descriptor);
+    var reg:    lang_target.TargetRegistry = lang_target.registry_init();
+    val r_1721: err[fail.Fail]             = lang_target.register_all(?reg, ?target_testing.DEBUG);
     if (sel r_1721.err) { ret 1; }
-    val rtg: res[lang_target.Target, fail.Fail] = lang_target.select_of(?reg, "x86_64", "linux", "sysv64", "");
+    val rtg: res[lang_target.Binding, fail.Fail] = lang_target.select_of(?reg, "x86_64", "linux", "sysv64", "");
     if (sel rtg.err) { ret 1; }
-    var tgt: lang_target.Target           = rtg.ok;
+    var tgt: resolved.Target              = rtg.ok.target;
     val rm:  res[me_ir.Module, fail.Fail] = me_ir.init(?alloc, intern.STR_NIL);
     if (sel rm.err) { ret 1; }
     var m: me_ir.Module = rm.ok;
@@ -3122,13 +3072,12 @@ test run__refusal_at_every_ordinal_leaves_the_input_or_a_partial_version {
     var owner: A.Allocator;
     val made:  err[A.Error] = page.make(?owner);
     if (sel made.err) { ret 1; }
-    var reg: lang_target.TargetRegistry = lang_target.registry_init();
-    fin { lang_target.registry_dnit(?reg); }
-    val registered: err[fail.Fail] = lang_target.register_all(?reg, target_testing.debug_descriptor);
+    var reg:        lang_target.TargetRegistry = lang_target.registry_init();
+    val registered: err[fail.Fail]             = lang_target.register_all(?reg, ?target_testing.DEBUG);
     if (sel registered.err) { ret 2; }
-    val rtg: res[lang_target.Target, fail.Fail] = lang_target.select_of(?reg, "x86_64", "linux", "sysv64", "");
+    val rtg: res[lang_target.Binding, fail.Fail] = lang_target.select_of(?reg, "x86_64", "linux", "sysv64", "");
     if (sel rtg.err) { ret 3; }
-    var tgt: lang_target.Target = rtg.ok;
+    var tgt: resolved.Target    = rtg.ok.target;
     var a:   me_testing.Attempt = me_testing.Attempt{build: probe_build, transform: probe_transform,
         contract: probe_contract, target: ?tgt, control: nil, context: nil};
     var control: me_ir.Module;

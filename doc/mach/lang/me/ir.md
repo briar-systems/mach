@@ -431,6 +431,14 @@ pub fun dnit(m: *Module);
 pub fun function_dnit(m: *Module, fn: *Function);
 ```
 
+## fun block_dnit
+
+```mach
+pub fun block_dnit(m: *Module, blk: *Block);
+```
+
+releases the block's instruction, phi and predecessor lists
+
 ## fun function_new
 
 ```mach
@@ -476,6 +484,23 @@ pub fun global_register(m: *Module, name: intern.StrId, idx: u32) err[fail.Fail]
 ```mach
 pub fun global_lookup(m: *Module, name: intern.StrId) opt[u32];
 ```
+
+## fun global_init
+
+```mach
+pub fun global_init(name: intern.StrId, ty: ir_type.IrTypeId, init_value: value.Value) Global;
+```
+
+a global named `name` of type `ty` holding `init`, private, immutable and
+defined here, every other field its empty value
+
+## fun global_add
+
+```mach
+pub fun global_add(m: *Module, g: Global) res[u32, fail.Fail];
+```
+
+`g` appended to the module's globals, its index; the name is not registered
 
 ## fun instruction_get
 
@@ -523,6 +548,31 @@ pub fun instr_replace_operands(m: *Module, ins: *ir_instruction.Instruction, arr
 ```mach
 pub fun phi_append_incoming(m: *Module, phi: *ir_instruction.Instruction, pred: ir_id.BlockId, incoming: value.Value) err[fail.Fail];
 ```
+
+## fun phi_incoming_del
+
+```mach
+pub fun phi_incoming_del(phi: *ir_instruction.Instruction, pred: ir_id.BlockId);
+```
+
+the incoming edge from `pred` dropped from `phi`, the first when several
+
+## fun phi_incoming_del_at
+
+```mach
+pub fun phi_incoming_del_at(phi: *ir_instruction.Instruction, at: u32);
+```
+
+the incoming pair whose block operand is at `at` dropped from `phi`
+
+## fun phi_incoming_keep
+
+```mach
+pub fun phi_incoming_keep[T](phi: *ir_instruction.Instruction, ctx: *T, keep: fun(*T, *value.Value) bool);
+```
+
+the incoming pairs of `phi` that `keep` accepts, in order; `keep` sees each
+pair's block operand and may rewrite it
 
 ## fun dbg_var_get
 
@@ -634,6 +684,14 @@ pub fun block_append_instr(m: *Module, blk: *Block, i: ir_id.InstructionId) err[
 pub fun block_prepend_instr(m: *Module, blk: *Block, i: ir_id.InstructionId) err[fail.Fail];
 ```
 
+## fun block_insert_instr
+
+```mach
+pub fun block_insert_instr(m: *Module, blk: *Block, pos: u32, i: ir_id.InstructionId) err[fail.Fail];
+```
+
+`i` listed at `pos` of the block, or at its end when `pos` is past it
+
 ## fun block_append_phi
 
 ```mach
@@ -657,6 +715,25 @@ pub fun block_target_make(m: *Module, block: ir_id.BlockId) res[value.Value, fai
 ```mach
 pub fun block_target(v: value.Value) ir_id.BlockId;
 ```
+
+## fun block_target_set
+
+```mach
+pub fun block_target_set(v: *value.Value, b: ir_id.BlockId);
+```
+
+the block operand `v` made to name block `b`
+
+## fun placement_fill
+
+```mach
+pub fun placement_fill(fn: *Function, blocks: *ir_id.BlockId, ords: *u32, len: u32);
+```
+
+where each of the first `len` instructions sits: `blocks[i]` is the block
+listing instruction i, BLOCK_NIL for one no block lists, and `ords[i]`, when
+`ords` is not nil, its position in that block counting phis, then
+instructions, then the terminator
 
 ## fun block_successors
 

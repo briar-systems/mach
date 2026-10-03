@@ -1,17 +1,12 @@
 # mach.lang.target.isa.riscv.encode
 
-## fun encode_riscv64
+## val HOOKS
 
 ```mach
-pub fun encode_riscv64(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule) res[codegen_encode.EncoderOutput, fail.Fail];
+pub val HOOKS: isa_encode.EncodeHooks = isa_encode.EncodeHooks;
 ```
 
-## fun encode_riscv64_asm
-
-```mach
-pub fun encode_riscv64_asm(alloc: *A.Allocator, tgt: *isa.BackendTarget, m: *codegen_mir.MirModule,
-out: *io_writer.Writer) res[codegen_encode.EncoderOutput, fail.Fail];
-```
+the hooks the shared encode driver runs this encoder through
 
 ## fun asm_returns
 

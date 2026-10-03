@@ -154,3 +154,23 @@ pub fun const_agg(bytes: *u8, len: u32, relocs: *AggReloc, reloc_count: u32, rel
 pub fun retype(v: Value, ty: ir_type.IrTypeId) Value;
 ```
 
+## fun is_same
+
+```mach
+pub fun is_same(a: Value, b: Value) bool;
+```
+
+whether `a` and `b` are one operand: the same instruction or parameter, or
+constants, globals or functions with the same payload. type and secrecy are
+not compared, so two integer constants of different types with the same bits
+are the same operand; byte and aggregate constants are never the same
+
+## fun is_same_definition
+
+```mach
+pub fun is_same_definition(a: Value, b: Value) bool;
+```
+
+whether `a` and `b` read the same definition, one instruction or one
+parameter; a constant has no definition, so it is never the same as another
+

@@ -15,8 +15,8 @@ pub fun no_debug() DebugInfo;
 ## fun codegen_unit
 
 ```mach
-pub fun codegen_unit(s: *session.Session, tgt: *lang_target.Target,
-irmod: *me_ir.Module, deps: be_codegen_unit.IrSet, asm_out: *io_writer.Writer,
+pub fun codegen_unit(s: *session.Session, tgt: *lang_target.Binding,
+irmod: *me_ir.Module, deps: mir_unit.IrSet, asm_out: *io_writer.Writer,
 dbg: DebugInfo, diags: *diagnostic.DiagnosticStore) res[target_of.ObjectImage, fail.Fail];
 ```
 

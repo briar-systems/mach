@@ -24,7 +24,7 @@ pub fun free_unwind_plan(alloc: *A.Allocator, plan: *UnwindPlan);
 ## fun claim_unwind_inputs
 
 ```mach
-pub fun claim_unwind_inputs(tgt: *lang_target.Target, builds_tables: bool, modules: *target_of.ObjectImage, module_count: u32,
+pub fun claim_unwind_inputs(tgt: *lang_target.Binding, builds_tables: bool, modules: *target_of.ObjectImage, module_count: u32,
 sec_base: *u32, placements: *Placement);
 ```
 
@@ -36,7 +36,7 @@ places those sections as the merge would
 ## fun reserve_unwind_tables
 
 ```mach
-pub fun reserve_unwind_tables(s: *session.Session, tgt: *lang_target.Target,
+pub fun reserve_unwind_tables(s: *session.Session, tgt: *lang_target.Binding,
 modules: *target_of.ObjectImage, module_count: u32, sec_base: *u32, atoms: *AtomPlan,
 merged: *MergedSection, groups: *SectionGroups, placements: *Placement, plan: *UnwindPlan) res[bool, fail.Fail];
 ```
