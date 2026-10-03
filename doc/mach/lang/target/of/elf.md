@@ -236,10 +236,10 @@ the RV32E/RV64E register file and calling convention
 pub def BuildAttributes: target_of.ElfAttributes
 ```
 
-## fun register
+## val VTABLE
 
 ```mach
-pub fun register(reg: *target_of.OfRegistry) err[fail.Fail];
+pub val VTABLE: target_of.OfVTable = target_of.OfVTable;
 ```
 
 ## fun parse_object

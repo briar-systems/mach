@@ -12,9 +12,9 @@ pub fun machine_for_arch(arch_id: u32) u16;
 pub fun looks_like_dll(buf: *u8, buf_size: usize, expect_machine: u16) bool;
 ```
 
-## fun register_coff
+## val VTABLE
 
 ```mach
-pub fun register_coff(reg: *target_of.OfRegistry) err[fail.Fail];
+pub val VTABLE: target_of.OfVTable = target_of.OfVTable;
 ```
 

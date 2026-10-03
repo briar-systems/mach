@@ -6,9 +6,9 @@
 pub val DARWIN_BASE_ADDR: u64 = 0x100000000
 ```
 
-## fun register_darwin
+## val VTABLE
 
 ```mach
-pub fun register_darwin(reg: *lang_target_os.OsRegistry) err[fail.Fail];
+pub val VTABLE: lang_target_os.OsVTable = lang_target_os.OsVTable;
 ```
 

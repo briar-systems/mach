@@ -1,8 +1,8 @@
 # mach.lang.target.os.freestanding
 
-## fun register_freestanding
+## val VTABLE
 
 ```mach
-pub fun register_freestanding(reg: *lang_target_os.OsRegistry) err[fail.Fail];
+pub val VTABLE: lang_target_os.OsVTable = lang_target_os.OsVTable;
 ```
 

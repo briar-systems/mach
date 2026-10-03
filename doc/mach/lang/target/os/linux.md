@@ -12,9 +12,9 @@ pub val LINUX_BASE_ADDR: u64 = 0x400000
 pub val LINUX_PAGE_SIZE: u64 = 4096
 ```
 
-## fun register_linux
+## val VTABLE
 
 ```mach
-pub fun register_linux(reg: *lang_target_os.OsRegistry) err[fail.Fail];
+pub val VTABLE: lang_target_os.OsVTable = lang_target_os.OsVTable;
 ```
 

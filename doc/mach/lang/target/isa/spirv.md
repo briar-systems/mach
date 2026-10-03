@@ -1923,6 +1923,13 @@ with none enabled, and the two memory model features and buffer device address, 
 vulkan1.3 requires of every device. no version guarantees a type's feature, which its
 ceiling only admits
 
+## val ENV_GUARANTEES_1_6
+
+```mach
+pub val ENV_GUARANTEES_1_6: u64 = EXT_ZERO_INIT_WORKGROUP | EXT_STORAGE_READ_WITHOUT_FORMAT | EXT_STORAGE_WRITE_WITHOUT_FORMAT
+| EXT_VULKAN_MEMORY_MODEL | EXT_VULKAN_MEMORY_MODEL_DEVICE_SCOPE | EXT_BUFFER_DEVICE_ADDRESS
+```
+
 ## fun env_profile
 
 ```mach

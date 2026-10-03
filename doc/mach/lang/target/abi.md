@@ -234,32 +234,6 @@ float or vector a convention places is that narrow
 pub rec AbiVTable;
 ```
 
-## fun abi_vtable
-
-```mach
-pub fun abi_vtable(id: u32, name: str, arch_id: u32,
-arg_passing: ArgPassingFn, ret_passing: RetPassingFn,
-gp_arg_regs: RegFileFn, callee_saved: RegFileFn,
-stack_align: u32, red_zone: u32, shadow_space: u32,
-indirect_result_reg: i32, indirect_result_in_argfile: bool,
-consumes_agg_layout: bool, fp_callee_saved_bytes: u32,
-float_arg_bits: u32, arg_slot_granularity: u32,
-va_model: VaModelFn) AbiVTable;
-```
-
-## fun value_abi_vtable
-
-```mach
-pub fun value_abi_vtable(id: u32, name: str, arch_id: u32,
-arg_passing: ArgPassingFn, ret_passing: RetPassingFn) AbiVTable;
-```
-
-## rec AbiRegistry
-
-```mach
-pub rec AbiRegistry;
-```
-
 ## rec SigLayout
 
 ```mach
@@ -297,46 +271,27 @@ variadic_float_bits: u32) VaModel;
 pub fun variadic_float_in_fp_bank(m: *VaModel, width: u64) bool;
 ```
 
-## fun registry_init_with_allocator
+## fun validate
 
 ```mach
-pub fun registry_init_with_allocator(alloc: *A.Allocator) AbiRegistry;
+pub fun validate(a: *A.Allocator, vt: *AbiVTable) err[fail.Fail];
 ```
 
-## fun registry_dnit
+why a descriptor is malformed, read once when a registry adds it
+
+a: formats the refusal
+vt: the descriptor
+
+## fun name_of
 
 ```mach
-pub fun registry_dnit(reg: *AbiRegistry);
+pub fun name_of(vt: *AbiVTable) str;
 ```
 
-## fun registry_validate
+## fun id_of
 
 ```mach
-pub fun registry_validate(reg: *AbiRegistry) err[fail.Fail];
-```
-
-## fun register
-
-```mach
-pub fun register(reg: *AbiRegistry, vt: *AbiVTable) err[fail.Fail];
-```
-
-## fun lookup
-
-```mach
-pub fun lookup(reg: *AbiRegistry, name: str) opt[*AbiVTable];
-```
-
-## fun registered_count
-
-```mach
-pub fun registered_count(reg: *AbiRegistry) u32;
-```
-
-## fun registered
-
-```mach
-pub fun registered(reg: *AbiRegistry, idx: u32) opt[*AbiVTable];
+pub fun id_of(vt: *AbiVTable) u32;
 ```
 
 ## fun covers_isa

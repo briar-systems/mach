@@ -58,77 +58,35 @@ pub fun va_list(size: u32, align: u32) VaList;
 pub rec OsVTable;
 ```
 
-## rec OsRegistry
+## fun validate
 
 ```mach
-pub rec OsRegistry;
+pub fun validate(a: *A.Allocator, vt: *OsVTable) err[fail.Fail];
 ```
 
-## fun registry_init_with_allocator
+why a descriptor is malformed, read once when a registry adds it: its
+lists, and the answers its callbacks give for every isa it names
+
+a: formats the refusal
+vt: the descriptor
+
+## fun name_of
 
 ```mach
-pub fun registry_init_with_allocator(alloc: *A.Allocator) OsRegistry;
+pub fun name_of(vt: *OsVTable) str;
 ```
 
-## fun registry_dnit
+## fun id_of
 
 ```mach
-pub fun registry_dnit(reg: *OsRegistry);
+pub fun id_of(vt: *OsVTable) u32;
 ```
-
-## fun registry_validate
-
-```mach
-pub fun registry_validate(reg: *OsRegistry) err[fail.Fail];
-```
-
-## fun register
-
-```mach
-pub fun register(reg: *OsRegistry, vt: *OsVTable) err[fail.Fail];
-```
-
-## fun lookup
-
-```mach
-pub fun lookup(reg: *OsRegistry, name: str) opt[*OsVTable];
-```
-
-## fun registered_count
-
-```mach
-pub fun registered_count(reg: *OsRegistry) u32;
-```
-
-## fun registered
-
-```mach
-pub fun registered(reg: *OsRegistry, idx: u32) opt[*OsVTable];
-```
-
-## fun support_of
-
-```mach
-pub fun support_of(vt: *OsVTable, of_name: str) err[fail.Fail];
-```
-
-a further supported object format; a descriptor naming more than the list
-holds is refused
 
 ## fun supports_of
 
 ```mach
 pub fun supports_of(vt: *OsVTable, of_name: str) bool;
 ```
-
-## fun support_isa
-
-```mach
-pub fun support_isa(vt: *OsVTable, arch_id: u32) err[fail.Fail];
-```
-
-a further supported instruction set; a descriptor naming more than the list
-holds is refused
 
 ## fun supports_isa
 
