@@ -408,30 +408,6 @@ fwd mach.lang.manifest.load.doc_dnit
 
 forwards [`mach.lang.manifest.load.doc_dnit`](manifest/load.md#fun-doc_dnit)
 
-## fwd mach.lang.manifest.plan.LibKind
-
-```mach
-fwd mach.lang.manifest.plan.LibKind
-```
-
-forwards [`mach.lang.manifest.plan.LibKind`](manifest/plan.md#def-libkind)
-
-## fwd mach.lang.manifest.plan.LIBKIND_STATIC
-
-```mach
-fwd mach.lang.manifest.plan.LIBKIND_STATIC
-```
-
-forwards [`mach.lang.manifest.plan.LIBKIND_STATIC`](manifest/plan.md#val-libkind_static)
-
-## fwd mach.lang.manifest.plan.LIBKIND_SHARED
-
-```mach
-fwd mach.lang.manifest.plan.LIBKIND_SHARED
-```
-
-forwards [`mach.lang.manifest.plan.LIBKIND_SHARED`](manifest/plan.md#val-libkind_shared)
-
 ## fwd mach.lang.manifest.plan.BuildUnit
 
 ```mach

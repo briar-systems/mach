@@ -33,7 +33,7 @@ pub fun dnit_image_options(a: *A.Allocator, loaded: *LoadedImageOptions);
 ## fun load_image_options
 
 ```mach
-pub fun load_image_options(p: *driver.Project, out_kind: linker.LinkMode,
+pub fun load_image_options(p: *driver.Project, out_kind: catalog_artifact.Kind,
 exe_path: *u8) res[LoadedImageOptions, fail.Fail];
 ```
 
