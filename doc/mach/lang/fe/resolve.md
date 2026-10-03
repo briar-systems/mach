@@ -1,29 +1,61 @@
 # mach.lang.fe.resolve
 
-## def SymbolId
+## rec SymbolId
 
 ```mach
-pub def SymbolId: u32
+pub rec SymbolId;
 ```
+
+a symbol's slot in the resolve context's symbol table
 
 ## val SYMBOL_NIL
 
 ```mach
-pub val SYMBOL_NIL: SymbolId = 0xFFFFFFFF
+pub val SYMBOL_NIL: SymbolId = SymbolId;
 ```
 
 ## val SYMBOL_REJECTED
 
 ```mach
-pub val SYMBOL_REJECTED: SymbolId = 0xFFFFFFFE
+pub val SYMBOL_REJECTED: SymbolId = SymbolId;
 ```
 
 an identifier visited and rejected by resolution has no symbol to remap.
 
+## fun symbol_id
+
+```mach
+pub fun symbol_id(index: u32) SymbolId;
+```
+
+## fun symbol_index
+
+```mach
+pub fun symbol_index(id: SymbolId) u32;
+```
+
+## fun symbol_same
+
+```mach
+pub fun symbol_same(left: SymbolId, right: SymbolId) bool;
+```
+
+## fun symbol_is_nil
+
+```mach
+pub fun symbol_is_nil(id: SymbolId) bool;
+```
+
+## fun symbol_is_rejected
+
+```mach
+pub fun symbol_is_rejected(id: SymbolId) bool;
+```
+
 ## val SYMBOL_DEFERRED_TYPE
 
 ```mach
-pub val SYMBOL_DEFERRED_TYPE: SymbolId = 0xFFFFFFFC
+pub val SYMBOL_DEFERRED_TYPE: SymbolId = SymbolId;
 ```
 
 ## fun symbol_deferred
