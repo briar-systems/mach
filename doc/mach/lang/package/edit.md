@@ -60,16 +60,15 @@ ret: err naming the failure
 ## fun update_apply
 
 ```mach
-pub fun update_apply(op: *package_closure.Operation, mode: u8, all: bool, name: str, quiet: bool, fail_after: i32,
-lowest: bool, offline: bool, closure: *Vector[package_closure.Request]) err[fail.Fail];
+pub fun update_apply(op: *package_closure.Operation, mode: u8, all: bool, name: str, quiet: bool, lowest: bool,
+offline: bool, closure: *Vector[package_closure.Request]) err[fail.Fail];
 ```
 
 update: the fixed git selectors move first (a ref is fetched and checked out), so their
 manifests are the closure's when the version ranges resolve; then every chosen release is
 realized and the closure is pulled, which syncs every path copy once and reports it
 
-`closure` receives the closure the final pull realized, which the caller frees;
-`fail_after` stops the update with a failure after that many of its steps, 0 for none
+`closure` receives the closure the final pull realized, which the caller frees
 
 ## fun notes
 
@@ -135,12 +134,11 @@ ret: err naming the failure
 
 ```mach
 pub fun apply(edit: *Edit, op: *package_closure.Operation, mode: u8, spec: *manifest.DepTableSpec, name: str, adding: bool,
-purge: bool, quiet: bool, realize: bool, offline: bool, fail_after: i32) err[fail.Fail];
+purge: bool, quiet: bool, realize: bool, offline: bool) err[fail.Fail];
 ```
 
 add or remove a declaration within an open edit. realize false only declares: the manifest
-gains the table (a git one at its resolved range) and nothing is checked out. `fail_after`
-stops the change with a failure after that many of its steps, 0 for none
+gains the table (a git one at its resolved range) and nothing is checked out
 
 ## fun purge_beneath
 
