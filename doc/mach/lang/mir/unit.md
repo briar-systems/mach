@@ -48,6 +48,8 @@ pub fun root_mir(u: *Unit) *lang_mir.MirModule;
 pub fun defined_index(m: *me_ir.Module, name: intern.StrId) u32;
 ```
 
+the module's name table answers a definition over a declaration
+
 ## fun defined_global_index
 
 ```mach
