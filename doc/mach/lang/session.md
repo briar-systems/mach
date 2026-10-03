@@ -149,7 +149,7 @@ decl_count: the declaration count of the AST they were registered against
 ## fun export_name
 
 ```mach
-pub fun export_name(s: *Session, mid: module.ModuleId, did: u32) opt[intern.StrId];
+pub fun export_name(s: *Session, mid: module.ModuleId, did: u32) intern.StrId;
 ```
 
 ## fun register_export_library
@@ -161,7 +161,7 @@ pub fun register_export_library(s: *Session, mid: module.ModuleId, did: u32, lib
 ## fun export_library
 
 ```mach
-pub fun export_library(s: *Session, mid: module.ModuleId, did: u32) opt[intern.StrId];
+pub fun export_library(s: *Session, mid: module.ModuleId, did: u32) intern.StrId;
 ```
 
 ## fun register_attr_string
@@ -175,10 +175,10 @@ records the string an attribute argument evaluates to
 ## fun attr_string
 
 ```mach
-pub fun attr_string(s: *Session, mid: module.ModuleId, eid: u32) opt[intern.StrId];
+pub fun attr_string(s: *Session, mid: module.ModuleId, eid: u32) intern.StrId;
 ```
 
-the string an attribute argument evaluates to; none when it is not a constant string
+the string an attribute argument evaluates to; STR_NIL when it is not a constant string
 
 ## fun forget_attr_string
 
@@ -247,7 +247,7 @@ pub fun register_import_library(s: *Session, name: intern.StrId, lib: intern.Str
 ## fun import_library
 
 ```mach
-pub fun import_library(s: *Session, name: intern.StrId) opt[intern.StrId];
+pub fun import_library(s: *Session, name: intern.StrId) intern.StrId;
 ```
 
 ## fun register_link_provider

@@ -1,15 +1,44 @@
 # mach.lang.intern
 
-## def StrId
+## rec StrId
 
 ```mach
-pub def StrId: u32
+pub rec StrId;
 ```
+
+the identity of one interned string
+
+a record, not a `def` alias, so a string id cannot be handed where another
+id or a bare integer is meant. absence is `STR_NIL`, never an `opt[StrId]`.
 
 ## val STR_NIL
 
 ```mach
-pub val STR_NIL: StrId = 0xFFFFFFFF
+pub val STR_NIL: StrId = StrId;
+```
+
+## fun str_id
+
+```mach
+pub fun str_id(index: u32) StrId;
+```
+
+## fun str_index
+
+```mach
+pub fun str_index(id: StrId) u32;
+```
+
+## fun str_same
+
+```mach
+pub fun str_same(left: StrId, right: StrId) bool;
+```
+
+## fun str_is_nil
+
+```mach
+pub fun str_is_nil(id: StrId) bool;
 ```
 
 ## rec Interner
@@ -24,10 +53,10 @@ pub rec Interner;
 pub fun init(a: *A.Allocator) Interner;
 ```
 
-## fun make_child
+## fun child_init
 
 ```mach
-pub fun make_child(base: *Interner, a: *A.Allocator) Interner;
+pub fun child_init(base: *Interner, a: *A.Allocator) Interner;
 ```
 
 ## fun dnit
@@ -46,50 +75,50 @@ the text of `id`. an interner answers every id it or its base issued for as
 long as it lives, so the read is total: an id it never issued, STR_NIL among
 them, is a broken precondition of the caller, and it stops the compiler
 
-## fun lookup
+## fun get
 
 ```mach
-pub fun lookup(itn: *Interner, id: StrId) opt[str];
+pub fun get(itn: *Interner, id: StrId) opt[str];
 ```
 
 the text of `id`, or none for an id the interner never issued
 
-## fun intern
+## fun add
 
 ```mach
-pub fun intern(itn: *Interner, text: str) res[StrId, A.Error];
+pub fun add(itn: *Interner, text: str) res[StrId, A.Error];
 ```
 
-## fun intern_bytes
+## fun bytes_add
 
 ```mach
-pub fun intern_bytes(itn: *Interner, data: str, len: usize) res[StrId, A.Error];
+pub fun bytes_add(itn: *Interner, data: str, len: usize) res[StrId, A.Error];
 ```
 
-## fun intern_range
+## fun range_add
 
 ```mach
-pub fun intern_range(itn: *Interner, source: str, offset: usize, len: usize) res[StrId, A.Error];
+pub fun range_add(itn: *Interner, source: str, offset: usize, len: usize) res[StrId, A.Error];
 ```
 
 the `len` bytes of `source` from `offset`, interned
 
-## rec ReinternMap
+## rec Remap
 
 ```mach
-pub rec ReinternMap;
+pub rec Remap;
 ```
 
-## fun reintern_map_dnit
+## fun remap_dnit
 
 ```mach
-pub fun reintern_map_dnit(alloc: *A.Allocator, remap: *ReinternMap);
+pub fun remap_dnit(alloc: *A.Allocator, remap: *Remap);
 ```
 
-## fun reintern_child
+## fun child_reintern
 
 ```mach
-pub fun reintern_child(child: *Interner, alloc_: *A.Allocator) res[ReinternMap, A.Error];
+pub fun child_reintern(child: *Interner, alloc_: *A.Allocator) res[Remap, A.Error];
 ```
 
 a non-child interner is a contract violation of the receiver, reported as
