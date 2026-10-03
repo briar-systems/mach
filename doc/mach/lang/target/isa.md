@@ -1,38 +1,5 @@
 # mach.lang.target.isa
 
-## val ISA_LABEL
-
-```mach
-pub val ISA_LABEL:       u16 = 0xFFFF
-```
-
-## val ISA_PCOPY
-
-```mach
-pub val ISA_PCOPY:       u16 = 0xFFFD
-```
-
-## val ISA_PCOPY_FENCE
-
-```mach
-pub val ISA_PCOPY_FENCE: u16 = 0xFFFC
-```
-
-## val ISA_USE
-
-```mach
-pub val ISA_USE:         u16 = 0xFFFB
-```
-
-## def AsmCtScanFn
-
-```mach
-pub def AsmCtScanFn: fun(str, *ct.AsmSecret, u32, ct.CtMulMask, bool, *A.Allocator) err[ct.AsmRefusal]
-```
-
-the constant-time scan of an asm body: the tracked bindings (`ct.AsmSecret`, by the name
-their `{name}` operand spells), the target's multiply admission and shift trust
-
 ## def DwarfRegFn
 
 ```mach
