@@ -36,8 +36,7 @@ symlink there is left for the write to follow
 ## fun bytes
 
 ```mach
-pub fun bytes(itn: *intern.Interner, a: *A.Allocator, path: str, buf: *u8, len: usize, mode: i32,
-op: str, generic: str) err[fail.Fail];
+pub fun bytes(itn: *intern.Interner, a: *A.Allocator, path: str, buf: *u8, len: usize, mode: i32, op: str) err[fail.Fail];
 ```
 
 write `buf` to `path`, whose parent exists
@@ -46,8 +45,7 @@ write `buf` to `path`, whose parent exists
 
 ```mach
 pub fun writer[W](itn: *intern.Interner, a: *A.Allocator, path: str, ctx: *W,
-write_cb: fun(*W, *io_writer.Writer) err[io_writer.WriteError], mode: i32,
-op: str, generic: str) err[fail.Fail];
+write_cb: fun(*W, *io_writer.Writer) err[io_writer.WriteError], mode: i32, op: str) err[fail.Fail];
 ```
 
 stream `path`, whose parent exists, through `write_cb`

@@ -105,6 +105,9 @@ pub fun abi_set_one(native: str) AbiSet;
 pub fun abi_set_add(s: *AbiSet, name: str);
 ```
 
+a further accepted convention. total over the set's declared capacity, which
+every port's list fits: a set past OS_ABI_MAX is a defect of the descriptor
+
 ## fun abi_set_unconstrained
 
 ```mach
@@ -186,8 +189,11 @@ pub fun registered(reg: *OsRegistry, idx: u32) opt[*OsVTable];
 ## fun support_of
 
 ```mach
-pub fun support_of(vt: *OsVTable, of_name: str);
+pub fun support_of(vt: *OsVTable, of_name: str) err[fail.Fail];
 ```
+
+a further supported object format; a descriptor naming more than the list
+holds is refused
 
 ## fun supports_of
 
@@ -198,8 +204,11 @@ pub fun supports_of(vt: *OsVTable, of_name: str) bool;
 ## fun support_isa
 
 ```mach
-pub fun support_isa(vt: *OsVTable, arch_id: u32);
+pub fun support_isa(vt: *OsVTable, arch_id: u32) err[fail.Fail];
 ```
+
+a further supported instruction set; a descriptor naming more than the list
+holds is refused
 
 ## fun supports_isa
 

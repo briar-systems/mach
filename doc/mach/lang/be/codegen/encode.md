@@ -600,6 +600,9 @@ native catalog: internal, named with the function it was found in
 ## fun asm_located_message
 
 ```mach
-pub fun asm_located_message(st: *EncodeState, loc: lang_source.Location, msg: str) str;
+pub fun asm_located_message(st: *EncodeState, loc: lang_source.Location, msg: str) res[str, fail.Fail];
 ```
+
+`msg` prefixed with the file, line and column of `loc`, interned; `msg` as
+it is where the state carries no source map or `loc` names no place
 

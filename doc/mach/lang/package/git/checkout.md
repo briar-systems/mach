@@ -10,8 +10,10 @@ selector is a `ref` (`branch/`, `tag/` or `commit/`), and a release is read from
 ## fun own_work_tree
 
 ```mach
-pub fun own_work_tree(alloc: *A.Allocator, dep_full: str) bool;
+pub fun own_work_tree(alloc: *A.Allocator, dep_full: str) res[bool, fail.Fail];
 ```
+
+whether `dep_full` is a checkout of its own, holding its own `.git`
 
 ## fun revision
 
@@ -79,11 +81,12 @@ fetch the tags of dep/<id>'s checkout when it lacks the one its selection reads:
 ## fun pinned_at_release
 
 ```mach
-pub fun pinned_at_release(s: *session.Session, root: str, id: str, dep_full: str, version: str) bool;
+pub fun pinned_at_release(s: *session.Session, root: str, id: str, dep_full: str, version: str) res[bool, fail.Fail];
 ```
 
 whether dep/<id> is pinned at the release `version` and its checkout is at that pin; a
-checkout drifted from its gitlink is not, whatever release it holds
+checkout drifted from its gitlink is not, whatever release it holds, and a directory that
+is no checkout of its own is not
 
 ## fun release_at
 

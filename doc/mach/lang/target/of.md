@@ -138,7 +138,7 @@ the canonical name of a declared kind, absent for a member outside the catalog
 ## fun section_kind_rejection
 
 ```mach
-pub fun section_kind_rejection(itn: *intern.Interner, alloc: *A.Allocator, kind: SectionKind) str;
+pub fun section_kind_rejection(itn: *intern.Interner, alloc: *A.Allocator, kind: SectionKind) res[str, fail.Fail];
 ```
 
 a section kind outside the catalog reached a consumer that validated its
@@ -366,7 +366,7 @@ the display name of a declared kind, absent for a member outside the catalog
 ## fun reloc_kind_rejection
 
 ```mach
-pub fun reloc_kind_rejection(itn: *intern.Interner, alloc: *A.Allocator, kind: RelocKind, by: str) str;
+pub fun reloc_kind_rejection(itn: *intern.Interner, alloc: *A.Allocator, kind: RelocKind, by: str) res[str, fail.Fail];
 ```
 
 a declared kind a format or target does not honor is unsupported by `by`; a
@@ -779,6 +779,14 @@ pub fun reloc_refusal(origin: RelocOrigin, k: diagnostic_kind.Kind, text: str) f
 a relocation the link or the object writer refuses is the user's when their
 inline asm or an input object asked for it, and a compiler defect when
 codegen made it
+
+## fun reloc_refusal_made
+
+```mach
+pub fun reloc_refusal_made(origin: RelocOrigin, k: diagnostic_kind.Kind, made: res[str, fail.Fail]) fail.Fail;
+```
+
+the refusal carrying a made text, or the failure that refused to make it
 
 ## rec ObjectInput
 
@@ -1576,8 +1584,11 @@ pub fun debug_registered(reg: *DebugRegistry, idx: u32) opt[*DebugVTable];
 ## fun cover_isa
 
 ```mach
-pub fun cover_isa(vt: *OfVTable, arch_id: u32);
+pub fun cover_isa(vt: *OfVTable, arch_id: u32) err[fail.Fail];
 ```
+
+a further covered instruction set; a descriptor naming more than the list
+holds is refused
 
 ## fun covers_isa
 

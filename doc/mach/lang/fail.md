@@ -67,7 +67,11 @@ pub fun reported() Fail;
 pub fun message(text: str) Fail;
 ```
 
-an internal failure: a compiler defect, reported as `compiler.internal`
+an internal failure: a compiler defect, reported as `compiler.internal`.
+this is the one channel for a defect: a function that meets a broken
+invariant returns it as a message failure, never as a placeholder, a default
+answer or an abort. panic is left to a function documented as total, which
+has no failure to return, when its caller breaks the precondition it states
 
 ## fun user
 
@@ -363,6 +367,15 @@ pub fun toml_text(e: toml.TomlError) str;
 pub fun env_text(e: env.EnvError) str;
 ```
 
+## fun format
+
+```mach
+pub fun format(a: *A.Allocator, fmt: str, va: ...) res[str, Fail];
+```
+
+`fmt` formatted with `va` into `a`, which owns the text; a refusal to format
+is the failure instead
+
 ## fun formatted
 
 ```mach
@@ -371,6 +384,33 @@ pub fun formatted(a: *A.Allocator, fmt: str, va: ...) Fail;
 
 an internal failure whose text is `fmt` formatted with `va` into `a`, which
 owns the text; a refusal to format is the failure instead
+
+## fun formatted_user
+
+```mach
+pub fun formatted_user(a: *A.Allocator, k: diagnostic_kind.Kind, fmt: str, va: ...) Fail;
+```
+
+a user failure under `k` whose text is `fmt` formatted with `va` into `a`,
+which owns the text; a refusal to format is the failure instead
+
+## fun message_of
+
+```mach
+pub fun message_of(made: res[str, Fail]) Fail;
+```
+
+the internal failure carrying a made text, or the failure that refused to
+make it
+
+## fun user_of
+
+```mach
+pub fun user_of(k: diagnostic_kind.Kind, made: res[str, Fail]) Fail;
+```
+
+the user failure under `k` carrying a made text, or the failure that refused
+to make it
 
 ## fun text_retain
 
@@ -398,15 +438,6 @@ pub fun format_intern(itn: *intern.Interner, a: *A.Allocator, fmt: str, va: ...)
 
 `fmt` formatted with `va` through `a` as scratch and interned, so the text
 outlives `a`'s storage
-
-## fun format_intern_or
-
-```mach
-pub fun format_intern_or(itn: *intern.Interner, a: *A.Allocator, fallback: str, fmt: str, va: ...) str;
-```
-
-the interned text of `format_intern`, or the static `fallback` when it
-cannot be made
 
 ## fun refused
 
@@ -605,24 +636,14 @@ pub fun catalog_text(a: *A.Allocator, c: Catalog) res[str, std_format.FormatErro
 the message, owned by the caller's allocator (extent str_len + 1, released
 with str_free); the only failure a literal format can meet is the allocator's
 
-## fun catalog_message
+## fun catalog_interned
 
 ```mach
-pub fun catalog_message(itn: *intern.Interner, a: *A.Allocator, c: Catalog) str;
+pub fun catalog_interned(itn: *intern.Interner, a: *A.Allocator, c: Catalog) res[str, Fail];
 ```
 
-the interned message as plain text: an allocation refusal yields its own text,
-which is still a failure message and never a valid-looking member
-
-## fun catalog_message_or
-
-```mach
-pub fun catalog_message_or(itn: *intern.Interner, a: *A.Allocator, c: Catalog, generic: str) str;
-```
-
-the interned message when the site owns an interner and an allocator, else
-`generic`: a static text the caller writes to still name the catalog. a
-borrowed view or a test fixture has no owner and still refuses the member
+the message, owned by the interner so it outlives temporary phase storage,
+with `a` as scratch
 
 ## fun catalog
 
