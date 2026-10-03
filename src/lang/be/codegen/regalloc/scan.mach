@@ -1,0 +1,1224 @@
+# the linear scan over live segments: argument and definition reservations,
+# hinted and free register choice, and eviction of the least dense value
+# under pressure
+use mach.lang.fail;
+use lang_mir:    mach.lang.mir;
+use lang_target: mach.lang.target;
+use mach.lang.target.isa;
+use isa_inst: mach.lang.target.isa.inst;
+use A:        std.allocator;
+use std.allocator.page;
+use std.collections.sort;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use regalloc_context: mach.lang.be.codegen.regalloc.context;
+use mach.lang.be.codegen.regalloc.liveness;
+
+# whether the current interval may take a register some inactive interval
+# holds: only when the two never meet
+fun inactive_conflict(ctx: *regalloc_context.Context, gp: bool, idx: u32) bool {
+    if (ctx.cur_vreg >= ctx.f.vreg_count) { ret false; }
+    val cur: *regalloc_context.LiveRange = ?ctx.ranges[ctx.cur_vreg];
+    var i:   u32                         = 0;
+    for (i < ctx.inactive_count) {
+        val y:  u32                         = ctx.inactive[i];
+        val yr: *regalloc_context.LiveRange = ?ctx.ranges[y];
+        if ((yr.reg_class == regalloc_context.REG_CLASS_GP) == gp) {
+            val a: lang_mir.PRegId = ctx.f.vregs[y].assigned;
+            if (!lang_mir.preg_is_nil(a) && isa_inst.regid_index(lang_mir.preg_regid(a))::u32 == idx && liveness.intersects(ctx, cur, yr)) {
+                ret true;
+            }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# busy is what the active set holds; it is recomputed at every step so the
+# claims a pick makes before its assign and a hand-off's shared register
+# never drift from the set
+fun recompute_busy(ctx: *regalloc_context.Context) {
+    var r: u32 = 0;
+    for (r < ctx.gp_count) {
+        ctx.gp_busy[r] = false;
+        r              = r + 1;
+    }
+    if (ctx.fp_busy != nil) {
+        var fi: u32 = 0;
+        for (fi < ctx.fp_count) {
+            ctx.fp_busy[fi] = false;
+            fi              = fi + 1;
+        }
+    }
+    var ai: u32 = 0;
+    for (ai < ctx.active_count) {
+        val v: u32             = ctx.active[ai];
+        val a: lang_mir.PRegId = ctx.f.vregs[v].assigned;
+        if (!lang_mir.preg_is_nil(a)) { mark_assigned_id(ctx, ctx.ranges[v].reg_class, a); }
+        ai = ai + 1;
+    }
+}
+
+# the sets at position s: an interval whose hull has passed is dropped, one
+# inside a hole waits in inactive, one inside a segment is active
+fun advance(ctx: *regalloc_context.Context, s: i64) {
+    var write: u32 = 0;
+    var read:  u32 = 0;
+    for (read < ctx.active_count) {
+        val v:  u32                         = ctx.active[read];
+        val lr: *regalloc_context.LiveRange = ?ctx.ranges[v];
+        if (lr.end_pos < s) {}
+        or (liveness.covers(ctx, lr, s)) {
+            ctx.active[write] = v;
+            write             = write + 1;
+        }
+        or {
+            ctx.inactive[ctx.inactive_count] = v;
+            ctx.inactive_count               = ctx.inactive_count + 1;
+        }
+        read = read + 1;
+    }
+    ctx.active_count = write;
+    write            = 0;
+    read             = 0;
+    for (read < ctx.inactive_count) {
+        val v:  u32                         = ctx.inactive[read];
+        val lr: *regalloc_context.LiveRange = ?ctx.ranges[v];
+        if (lr.end_pos < s) {}
+        or (liveness.covers(ctx, lr, s)) {
+            ctx.active[ctx.active_count] = v;
+            ctx.active_count             = ctx.active_count + 1;
+        }
+        or {
+            ctx.inactive[write] = v;
+            write               = write + 1;
+        }
+        read = read + 1;
+    }
+    ctx.inactive_count = write;
+    recompute_busy(ctx);
+}
+
+fun remove_inactive(ctx: *regalloc_context.Context, v: lang_mir.VRegId) {
+    var write: u32 = 0;
+    var read:  u32 = 0;
+    for (read < ctx.inactive_count) {
+        if (ctx.inactive[read] != v.n) {
+            ctx.inactive[write] = ctx.inactive[read];
+            write               = write + 1;
+        }
+        read = read + 1;
+    }
+    ctx.inactive_count = write;
+}
+
+fun seg_overlaps_window(ctx: *regalloc_context.Context, lr: *regalloc_context.LiveRange, from: i64, to: i64) bool {
+    var k: u32 = 0;
+    for (k < lr.seg_count) {
+        val sg: *regalloc_context.Segment = ?ctx.segs[lr.seg_start + k];
+        if (!(sg.to < from || sg.from > to)) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+fun seg_holds_point(ctx: *regalloc_context.Context, lr: *regalloc_context.LiveRange, pos: i64) bool {
+    var k: u32 = 0;
+    for (k < lr.seg_count) {
+        val sg: *regalloc_context.Segment = ?ctx.segs[lr.seg_start + k];
+        if (sg.from <= pos && pos < sg.to) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# a's loop-weighted use density is below b's
+pub fun less_dense(a: *regalloc_context.LiveRange, b: *regalloc_context.LiveRange) bool {
+    ret a.use_weight * b.live_len < b.use_weight * a.live_len;
+}
+
+pub fun run(tgt: *lang_target.Binding, ctx: *regalloc_context.Context) err[fail.Fail] {
+    reserve_param_registers(ctx);
+    val br: err[fail.Fail] = build_arg_reservations(ctx);
+    if (sel br.err) { ret br; }
+
+    val nv: u32                = ctx.f.vreg_count;
+    val ro: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, nv::usize);
+    if (sel ro.err) { ret err[fail.Fail].err{fail.refused(ro.err)}; }
+    val order: *u32 = ro.ok;
+    var i:     u32  = 0;
+    for (i < nv) {
+        order[i] = i;
+        i        = i + 1;
+    }
+    val sb: err[fail.Fail] = sort_by_start(ctx, order, nv);
+    if (sel sb.err) {
+        A.deallocate[u32](ctx.alloc, order, nv::usize);
+        ret sb;
+    }
+
+    var oi: u32 = 0;
+    for (oi < nv) {
+        val v:   u32                         = order[oi];
+        val vid: lang_mir.VRegId             = lang_mir.vreg_id(v);
+        val lr:  *regalloc_context.LiveRange = ?ctx.ranges[v];
+        if (lr.end_pos < 0) {
+            oi = oi + 1;
+            cnt;
+        }
+        if (regalloc_context.vreg_has_slot(ctx, vid) || ctx.spilled[v]) {
+            oi = oi + 1;
+            cnt;
+        }
+
+        advance(ctx, lr.start);
+        release_pins(ctx, lr.start);
+
+        ctx.cur_start = lr.start;
+        ctx.cur_end   = lr.end_pos;
+        ctx.cur_vreg  = v;
+
+        var preg: i32 = -1;
+        if (ctx.hints[v].src_vreg != lang_mir.MIR_VREG_NIL.n || ctx.hints[v].src_preg >= 0) {
+            preg = pick_hint(ctx, vid, lr);
+        }
+        if (preg < 0 && ctx.hints[v].sink_preg >= 0) {
+            preg = pick_sink_hint(ctx, vid, lr);
+        }
+        if (preg < 0 && ctx.hints[v].dst_vreg != lang_mir.MIR_VREG_NIL.n) {
+            # the copy target's register is free across its hole, and this
+            # interval takes it like any other
+            val rr: i32 = pick_target_hint(ctx, vid, lr);
+            if (rr >= 0 && reg_free_for(ctx, lr, rr)) {
+                mark_assigned_id(ctx, lr.reg_class, lang_mir.preg_id(rr));
+                preg = rr;
+            }
+        }
+        if (preg < 0) {
+            if (lr.reg_class == regalloc_context.REG_CLASS_GP) {
+                preg = pick_gp(ctx, lr.crosses_call);
+            }
+            or {
+                preg = pick_fp(ctx, lr.crosses_call);
+            }
+            # a caller-saved register under a call is the whole value spilled
+            # by spill.across_calls; a less dense callee-saved holder gives
+            # way first, as it would under full pressure
+            if (preg >= 0 && lr.call_inside && !saved_across_calls(ctx, lr.reg_class, isa_inst.regid_index(preg)::u32)) {
+                val r: i32 = cheapest_eviction(ctx, lr);
+                if (r >= 0) {
+                    free_assigned_id(ctx, vid, lr.reg_class, lang_mir.preg_id(preg));
+                    val er: err[fail.Fail] = evict_into(ctx, vid, r);
+                    if (sel er.err) {
+                        A.deallocate[u32](ctx.alloc, order, nv::usize);
+                        ret er;
+                    }
+                    oi = oi + 1;
+                    cnt;
+                }
+            }
+        }
+
+        if (preg >= 0) {
+            assign(ctx, vid, lang_mir.preg_id(preg), lr.reg_class);
+        }
+        or {
+            val sr: err[fail.Fail] = spill_on_pressure(ctx, vid);
+            if (sel sr.err) {
+                A.deallocate[u32](ctx.alloc, order, nv::usize);
+                ret sr;
+            }
+        }
+        oi = oi + 1;
+    }
+
+    A.deallocate[u32](ctx.alloc, order, nv::usize);
+    ret err[fail.Fail].ok{};
+}
+
+fun reserve_param_registers(ctx: *regalloc_context.Context) {
+    val f: *lang_mir.MirFunction = ctx.f;
+    if (f.block_count == 0) { ret; }
+    val blk: *lang_mir.MirBlock = ?f.blocks[0];
+    var pos: u32                = 0;
+    var ii:  u32                = 0;
+    for (ii < blk.instr_count) {
+        val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+        if (mi.operand_count == 2) {
+            val d: *lang_mir.MirOperand = ?mi.operands[0];
+            val s: *lang_mir.MirOperand = ?mi.operands[1];
+            if ((d.kind == lang_mir.MIR_OP_VREG || d.kind == lang_mir.MIR_OP_MEM) && s.kind == lang_mir.MIR_OP_PREG) {
+                val r: u32 = s.preg.n;
+                if (isa_inst.regid_class(r::i32) == isa_inst.REG_CLASS_ID_GP) {
+                    if (r < ctx.gp_count && pos::i64 > ctx.pinned_end[r]) {
+                        ctx.pinned_end[r]    = pos::i64;
+                        ctx.param_reg_end[r] = pos::i64;
+                    }
+                }
+                or {
+                    val fi: u32 = isa_inst.regid_index(r::i32)::u32;
+                    if (ctx.fp_pinned_end != nil && fi < ctx.fp_count && pos::i64 > ctx.fp_pinned_end[fi]) {
+                        ctx.fp_pinned_end[fi] = pos::i64;
+                    }
+                }
+            }
+        }
+        pos = pos + 1;
+        ii  = ii + 1;
+    }
+}
+
+# a physical register a call leaves a value in is busy from the position
+# after the call to the instruction that reads it: the window an argument
+# register is busy over before a call, mirrored. the reading instruction's
+# own destination may take the register (a capture `v = a0` lives in a0), so
+# the window ends one position before the read; a value born earlier, such as
+# the capture of the other half of a pair whose copy would sit on this
+# register, may not. no value spans the call itself in a return register, so
+# the window starts after it, and a read right after the call reserves
+# nothing
+fun preg_read_count(ctx: *regalloc_context.Context) u32 {
+    var n:   u32 = 0;
+    var pos: u32 = 0;
+    for (pos < ctx.flat_count) {
+        val mi: *lang_mir.MirInstr = regalloc_context.flat_instr(ctx, pos);
+        var k:  u32                = 0;
+        if (lang_mir.instr_defines_shape(mi)) { k = 1; }
+        for (k < mi.operand_count) {
+            if (mi.operands[k].kind == lang_mir.MIR_OP_PREG) { n = n + 1; }
+            k = k + 1;
+        }
+        pos = pos + 1;
+    }
+    ret n;
+}
+
+fun reserve_return_reads(ctx: *regalloc_context.Context) {
+    var pos: u32 = 0;
+    for (pos < ctx.flat_count) {
+        val mi: *lang_mir.MirInstr = regalloc_context.flat_instr(ctx, pos);
+        var k:  u32                = 0;
+        if (lang_mir.instr_defines_shape(mi)) { k = 1; }
+        for (k < mi.operand_count) {
+            if (mi.operands[k].kind == lang_mir.MIR_OP_PREG && pos > 0) {
+                val r: u32 = mi.operands[k].preg.n;
+                # the nearest call or instruction on the fixed pair that
+                # leaves the register, unless a def of it comes first: that
+                # def's own reservation covers it
+                var c:     u32  = pos;
+                var found: bool = false;
+                var stop:  bool = false;
+                for (c > 0 && !found && !stop) {
+                    c = c - 1;
+                    if (ctx.flat[c].is_call) { found = true; }
+                    or {
+                        val mj: *lang_mir.MirInstr = regalloc_context.flat_instr(ctx, c);
+                        if (instr_on_fixed_pair(ctx, mj) && fixed_pair_reg(ctx, r)) { found = true; }
+                        or (instr_defines_preg(mj) && mj.operands[0].preg.n == r)   { stop = true; }
+                    }
+                }
+                if (found && c + 1 < pos && ctx.arg_res_count < ctx.arg_res_cap) {
+                    ctx.arg_res_reg[ctx.arg_res_count]   = r;
+                    ctx.arg_res_start[ctx.arg_res_count] = (c + 1)::i64;
+                    ctx.arg_res_end[ctx.arg_res_count]   = (pos - 1)::i64;
+                    ctx.arg_res_count                    = ctx.arg_res_count + 1;
+                }
+            }
+            k = k + 1;
+        }
+        pos = pos + 1;
+    }
+}
+
+fun build_arg_reservations(ctx: *regalloc_context.Context) err[fail.Fail] {
+    ctx.arg_res_count = 0;
+    ctx.def_res_count = 0;
+    if (ctx.flat_count == 0) { ret err[fail.Fail].ok{}; }
+
+    # one entry per register-defining instruction plus one per register read
+    ctx.arg_res_cap = ctx.flat_count + preg_read_count(ctx);
+    val rr: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, ctx.arg_res_cap::usize);
+    if (sel rr.err) { ret err[fail.Fail].err{fail.refused(rr.err)}; }
+    ctx.arg_res_reg = rr.ok;
+    val rs: res[*i64, A.Error] = A.allocate[i64](ctx.alloc, ctx.arg_res_cap::usize);
+    if (sel rs.err) { ret err[fail.Fail].err{fail.refused(rs.err)}; }
+    ctx.arg_res_start = rs.ok;
+    val re: res[*i64, A.Error] = A.allocate[i64](ctx.alloc, ctx.arg_res_cap::usize);
+    if (sel re.err) { ret err[fail.Fail].err{fail.refused(re.err)}; }
+    ctx.arg_res_end = re.ok;
+    # one entry per register-defining instruction, two on the fixed pair
+    ctx.def_res_cap = ctx.flat_count + fixed_pair_count(ctx);
+    val dr: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, ctx.def_res_cap::usize);
+    if (sel dr.err) { ret err[fail.Fail].err{fail.refused(dr.err)}; }
+    ctx.def_res_reg = dr.ok;
+    val dp: res[*i64, A.Error] = A.allocate[i64](ctx.alloc, ctx.def_res_cap::usize);
+    if (sel dp.err) { ret err[fail.Fail].err{fail.refused(dp.err)}; }
+    ctx.def_res_pos = dp.ok;
+    val de: res[*bool, A.Error] = A.allocate[bool](ctx.alloc, ctx.def_res_cap::usize);
+    if (sel de.err) { ret err[fail.Fail].err{fail.refused(de.err)}; }
+    ctx.def_res_early = de.ok;
+
+    var pos: u32 = 0;
+    for (pos < ctx.flat_count) {
+        val mi: *lang_mir.MirInstr = regalloc_context.flat_instr(ctx, pos);
+        if (!instr_defines_preg(mi)) {
+            pos = pos + 1;
+            cnt;
+        }
+        # the pair is read back by the moves after the instruction, which
+        # reserve_return_reads covers; it sets up no call
+        if (instr_on_fixed_pair(ctx, mi)) {
+            record_def_reservation(ctx, isa.fixed_reg(ctx.tgt.arch, isa.FIXED_PAIR_LO)::u32, pos, true);
+            record_def_reservation(ctx, isa.fixed_reg(ctx.tgt.arch, isa.FIXED_PAIR_HI)::u32, pos, true);
+            pos = pos + 1;
+            cnt;
+        }
+        val d: *lang_mir.MirOperand = ?mi.operands[0];
+        val r: u32                  = d.preg.n;
+        record_def_reservation(ctx, r, pos, false);
+
+        var c:      u32  = pos + 1;
+        var found:  bool = false;
+        var killed: bool = false;
+        for (c < ctx.flat_count && !found && !killed) {
+            if (ctx.flat[c].is_call) {
+                found = true;
+            }
+            or {
+                val mj: *lang_mir.MirInstr = regalloc_context.flat_instr(ctx, c);
+                if (instr_defines_preg(mj) && mj.operands[0].preg.n == r) { killed = true; }
+                c = c + 1;
+            }
+        }
+        if (found) {
+            ctx.arg_res_reg[ctx.arg_res_count]   = r;
+            ctx.arg_res_start[ctx.arg_res_count] = (pos + 1)::i64;
+            ctx.arg_res_end[ctx.arg_res_count]   = c::i64;
+            ctx.arg_res_count                    = ctx.arg_res_count + 1;
+        }
+        pos = pos + 1;
+    }
+    reserve_return_reads(ctx);
+    ret err[fail.Fail].ok{};
+}
+
+pub fun instr_defines_preg(mi: *lang_mir.MirInstr) bool {
+    if (!lang_mir.instr_defines_shape(mi)) { ret false; }
+    ret mi.operands[0].kind == lang_mir.MIR_OP_PREG;
+}
+
+fun record_def_reservation(ctx: *regalloc_context.Context, r: u32, pos: u32, early: bool) {
+    ctx.def_res_reg[ctx.def_res_count]   = r;
+    ctx.def_res_pos[ctx.def_res_count]   = pos::i64;
+    ctx.def_res_early[ctx.def_res_count] = early;
+    ctx.def_res_count                    = ctx.def_res_count + 1;
+}
+
+# an instruction on the target's fixed accumulator pair (a divide, or the
+# fixed-pair widening multiply), in the form that names the accumulator
+fun instr_on_fixed_pair(ctx: *regalloc_context.Context, mi: *lang_mir.MirInstr) bool {
+    if (!lang_mir.has(mi.opcode, lang_mir.MIRF_FIXED_PAIR)) { ret false; }
+    if (!isa.has_fixed_pair(ctx.tgt.arch))                  { ret false; }
+    ret instr_defines_preg(mi) && mi.operands[0].preg.n == isa.fixed_reg(ctx.tgt.arch, isa.FIXED_PAIR_LO)::u32;
+}
+
+fun fixed_pair_reg(ctx: *regalloc_context.Context, r: u32) bool {
+    ret r == isa.fixed_reg(ctx.tgt.arch, isa.FIXED_PAIR_LO)::u32 || r == isa.fixed_reg(ctx.tgt.arch, isa.FIXED_PAIR_HI)::u32;
+}
+
+fun fixed_pair_count(ctx: *regalloc_context.Context) u32 {
+    var n:   u32 = 0;
+    var pos: u32 = 0;
+    for (pos < ctx.flat_count) {
+        if (instr_on_fixed_pair(ctx, regalloc_context.flat_instr(ctx, pos))) { n = n + 1; }
+        pos = pos + 1;
+    }
+    ret n;
+}
+
+fun arg_reg_reserved(ctx: *regalloc_context.Context, id: u32) bool {
+    var i: u32 = 0;
+    for (i < ctx.arg_res_count) {
+        if (ctx.arg_res_reg[i] == id) {
+            if (ctx.cur_vreg < ctx.f.vreg_count) {
+                if (seg_overlaps_window(ctx, ?ctx.ranges[ctx.cur_vreg], ctx.arg_res_start[i], ctx.arg_res_end[i])) {
+                    ret true;
+                }
+            }
+            or (!(ctx.cur_end < ctx.arg_res_start[i] || ctx.cur_start > ctx.arg_res_end[i])) {
+                ret true;
+            }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+pub fun arg_reg_busy_at(ctx: *regalloc_context.Context, id: u32, pos: u32) bool {
+    var i: u32 = 0;
+    for (i < ctx.arg_res_count) {
+        if (ctx.arg_res_reg[i] == id
+            && pos::i64 >= ctx.arg_res_start[i]
+            && pos::i64 <= ctx.arg_res_end[i]) {
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun release_pins(ctx: *regalloc_context.Context, current_start: i64) {
+    var r: u32 = 0;
+    for (r < ctx.gp_count) {
+        if (ctx.pinned_end[r] >= 0 && ctx.pinned_end[r] < current_start) {
+            ctx.pinned_end[r] = -1;
+        }
+        r = r + 1;
+    }
+    if (ctx.fp_pinned_end != nil) {
+        var fi: u32 = 0;
+        for (fi < ctx.fp_count) {
+            if (ctx.fp_pinned_end[fi] >= 0 && ctx.fp_pinned_end[fi] < current_start) {
+                ctx.fp_pinned_end[fi] = -1;
+            }
+            fi = fi + 1;
+        }
+    }
+}
+
+rec RangeKey {
+    start:   i64;
+    end_pos: i64;
+    idx:     u32;
+}
+
+pub fun sort_by_start(ctx: *regalloc_context.Context, order: *u32, count: u32) err[fail.Fail] {
+    if (count < 2) { ret err[fail.Fail].ok{}; }
+    val keys_r: res[*RangeKey, A.Error] = A.allocate[RangeKey](ctx.alloc, count::usize);
+    if (sel keys_r.err) { ret err[fail.Fail].err{fail.refused(keys_r.err)}; }
+    val keys: *RangeKey = keys_r.ok;
+    var i:    u32       = 0;
+    for (i < count) {
+        keys[i].start   = ctx.ranges[order[i]].start;
+        keys[i].end_pos = ctx.ranges[order[i]].end_pos;
+        keys[i].idx     = order[i];
+        i               = i + 1;
+    }
+    sort.sort[RangeKey](keys, count::usize);
+    i = 0;
+    for (i < count) {
+        order[i] = keys[i].idx;
+        i        = i + 1;
+    }
+    A.deallocate[RangeKey](ctx.alloc, keys, count::usize);
+    ret err[fail.Fail].ok{};
+}
+
+fun pick_hint(ctx: *regalloc_context.Context, v: lang_mir.VRegId, lr: *regalloc_context.LiveRange) i32 {
+    val h: *regalloc_context.CopyHint = ?ctx.hints[v.n];
+
+    var rid: i32 = -1;
+    if (h.src_preg >= 0) {
+        rid = h.src_preg;
+    }
+    or (h.src_vreg != lang_mir.MIR_VREG_NIL.n) {
+        val s: lang_mir.VRegId = lang_mir.vreg_id(h.src_vreg);
+        if (s.n < ctx.f.vreg_count && !regalloc_context.is_spilled(ctx, s) && !regalloc_context.vreg_has_slot(ctx, s)) {
+            val a: lang_mir.PRegId = ctx.f.vregs[s.n].assigned;
+            if (!lang_mir.preg_is_nil(a)) { rid = lang_mir.preg_regid(a); }
+        }
+    }
+    if (rid < 0) { ret -1; }
+
+    val rclass: i32 = isa_inst.regid_class(rid);
+    val idx:    u32 = isa_inst.regid_index(rid)::u32;
+
+    if (lr.reg_class == regalloc_context.REG_CLASS_GP) {
+        if (rclass != isa_inst.REG_CLASS_ID_GP)                          { ret -1; }
+        if (idx >= ctx.gp_count)                                         { ret -1; }
+        if (ctx.reserved[idx])                                           { ret -1; }
+        if (lr.crosses_call && !ctx.callee_saved[idx])                   { ret -1; }
+        if (arg_reg_reserved(ctx, rid::u32))                             { ret -1; }
+        if (def_reg_reserved(ctx, rid::u32))                             { ret -1; }
+        if (ctx.pinned_end[idx] >= 0 && ctx.pinned_end[idx] != lr.start) { ret -1; }
+        if (!ctx.gp_busy[idx] && !inactive_conflict(ctx, true, idx)) {
+            ctx.gp_busy[idx] = true;
+            ret rid;
+        }
+        if (can_transfer(ctx, lr, h) && !inactive_conflict(ctx, true, idx)) {
+            transfer_source_reg(ctx, lang_mir.vreg_id(h.src_vreg), lang_mir.preg_id(rid));
+            ret rid;
+        }
+        ret -1;
+    }
+    or {
+        if (rclass != isa_inst.REG_CLASS_ID_FP)                                                            { ret -1; }
+        if (idx >= ctx.fp_count)                                                                           { ret -1; }
+        if (lr.crosses_call && (ctx.fp_callee_saved == nil || !ctx.fp_callee_saved[idx]))                  { ret -1; }
+        if (arg_reg_reserved(ctx, rid::u32))                                                               { ret -1; }
+        if (def_reg_reserved(ctx, rid::u32))                                                               { ret -1; }
+        if (ctx.fp_pinned_end != nil && ctx.fp_pinned_end[idx] >= 0 && ctx.fp_pinned_end[idx] != lr.start) { ret -1; }
+        if (!ctx.fp_busy[idx] && !inactive_conflict(ctx, false, idx)) {
+            ctx.fp_busy[idx] = true;
+            ret rid;
+        }
+        if (can_transfer(ctx, lr, h) && !inactive_conflict(ctx, false, idx)) {
+            transfer_source_reg(ctx, lang_mir.vreg_id(h.src_vreg), lang_mir.preg_id(rid));
+            ret rid;
+        }
+        ret -1;
+    }
+}
+
+# the source's value dies at the copy and the source's later segments, if
+# any, never meet this interval
+fun can_transfer(ctx: *regalloc_context.Context, lr: *regalloc_context.LiveRange, h: *regalloc_context.CopyHint) bool {
+    if (h.src_vreg == lang_mir.MIR_VREG_NIL.n)                 { ret false; }
+    if (h.copy_pos < 0)                                        { ret false; }
+    if (!liveness.dies_at(ctx, h.src_vreg, h.copy_pos))        { ret false; }
+    if (lr.start != h.copy_pos)                                { ret false; }
+    if (liveness.intersects(ctx, lr, ?ctx.ranges[h.src_vreg])) { ret false; }
+    ret true;
+}
+
+# the source leaves the active set now that its value is dead; a source with
+# a later segment waits in inactive for it
+fun transfer_source_reg(ctx: *regalloc_context.Context, src: lang_mir.VRegId, rid: lang_mir.PRegId) {
+    if (!vreg_in_active(ctx, src) || !lang_mir.preg_same(ctx.f.vregs[src.n].assigned, rid)) {
+        regalloc_context.defect_note(ctx, "regalloc: copy-hint transfer source is not the live owner of its register");
+        ret;
+    }
+    remove_active(ctx, src);
+    if (ctx.ranges[src.n].end_pos > ctx.cur_start) {
+        ctx.inactive[ctx.inactive_count] = src.n;
+        ctx.inactive_count               = ctx.inactive_count + 1;
+    }
+}
+
+# the register a sink hint names is often held by an operand of the very
+# instruction that defines this value (`ret a * b` with a in the return
+# register): that holder dies there and hands the register over when the
+# instruction reads it before writing, the same rule intersects applies
+fun pick_sink_hint(ctx: *regalloc_context.Context, v: lang_mir.VRegId, lr: *regalloc_context.LiveRange) i32 {
+    val rid: i32 = ctx.hints[v.n].sink_preg;
+    if (rid < 0) { ret -1; }
+
+    val rclass: i32 = isa_inst.regid_class(rid);
+    val idx:    u32 = isa_inst.regid_index(rid)::u32;
+
+    if (lr.reg_class == regalloc_context.REG_CLASS_GP) {
+        if (rclass != isa_inst.REG_CLASS_ID_GP)        { ret -1; }
+        if (idx >= ctx.gp_count)                       { ret -1; }
+        if (ctx.reserved[idx])                         { ret -1; }
+        if (lr.crosses_call && !ctx.callee_saved[idx]) { ret -1; }
+        if (gp_available(ctx, idx)) {
+            ctx.gp_busy[idx] = true;
+            ret rid;
+        }
+        if (take_from_dying_holder(ctx, lr, true, idx, rid)) { ret rid; }
+        ret -1;
+    }
+    or {
+        if (rclass != isa_inst.REG_CLASS_ID_FP)                                           { ret -1; }
+        if (idx >= ctx.fp_count)                                                          { ret -1; }
+        if (lr.crosses_call && (ctx.fp_callee_saved == nil || !ctx.fp_callee_saved[idx])) { ret -1; }
+        if (fp_available(ctx, idx)) {
+            ctx.fp_busy[idx] = true;
+            ret rid;
+        }
+        if (take_from_dying_holder(ctx, lr, false, idx, rid)) { ret rid; }
+        ret -1;
+    }
+}
+
+# a register that is busy only because its active holder dies at lr's birth
+# passes to lr when the two never meet; every other constraint on the
+# register must still hold
+fun take_from_dying_holder(ctx: *regalloc_context.Context, lr: *regalloc_context.LiveRange, gp: bool, idx: u32, rid: i32) bool {
+    if (gp) {
+        if (!ctx.gp_busy[idx])                                               { ret false; }
+        if (ctx.pinned_end[idx] >= 0 || arg_reg_reserved(ctx, idx))          { ret false; }
+        if (def_reg_reserved(ctx, idx) || inactive_conflict(ctx, true, idx)) { ret false; }
+    }
+    or {
+        if (!ctx.fp_busy[idx])                                                  { ret false; }
+        if (ctx.fp_pinned_end != nil && ctx.fp_pinned_end[idx] >= 0)            { ret false; }
+        if (arg_reg_reserved(ctx, rid::u32) || def_reg_reserved(ctx, rid::u32)) { ret false; }
+        if (inactive_conflict(ctx, false, idx))                                 { ret false; }
+    }
+    val holder: u32 = active_holder(ctx, gp, idx);
+    if (holder == lang_mir.MIR_VREG_NIL.n)                 { ret false; }
+    if (!liveness.dies_at(ctx, holder, lr.start))          { ret false; }
+    if (liveness.intersects(ctx, lr, ?ctx.ranges[holder])) { ret false; }
+    transfer_source_reg(ctx, lang_mir.vreg_id(holder), lang_mir.preg_id(rid));
+    ret true;
+}
+
+fun active_holder(ctx: *regalloc_context.Context, gp: bool, idx: u32) u32 {
+    var i: u32 = 0;
+    for (i < ctx.active_count) {
+        val y: u32             = ctx.active[i];
+        val a: lang_mir.PRegId = ctx.f.vregs[y].assigned;
+        if ((ctx.ranges[y].reg_class == regalloc_context.REG_CLASS_GP) == gp && !lang_mir.preg_is_nil(a)
+            && isa_inst.regid_index(lang_mir.preg_regid(a))::u32 == idx) {
+            ret y;
+        }
+        i = i + 1;
+    }
+    ret lang_mir.MIR_VREG_NIL.n;
+}
+
+fun pick_target_hint(ctx: *regalloc_context.Context, v: lang_mir.VRegId, lr: *regalloc_context.LiveRange) i32 {
+    val d: lang_mir.VRegId = lang_mir.vreg_id(ctx.hints[v.n].dst_vreg);
+    if (d.n >= ctx.f.vreg_count)                                                       { ret -1; }
+    if (regalloc_context.is_spilled(ctx, d) || regalloc_context.vreg_has_slot(ctx, d)) { ret -1; }
+    val a: lang_mir.PRegId = ctx.f.vregs[d.n].assigned;
+    if (lang_mir.preg_is_nil(a)) { ret -1; }
+
+    val rid:    i32 = lang_mir.preg_regid(a);
+    val rclass: i32 = isa_inst.regid_class(rid);
+    val idx:    u32 = isa_inst.regid_index(rid)::u32;
+    if (lr.reg_class == regalloc_context.REG_CLASS_GP) {
+        if (rclass != isa_inst.REG_CLASS_ID_GP || idx >= ctx.gp_count) { ret -1; }
+    }
+    or {
+        if (rclass != isa_inst.REG_CLASS_ID_FP || idx >= ctx.fp_count) { ret -1; }
+    }
+    ret rid;
+}
+
+fun vreg_in_active(ctx: *regalloc_context.Context, v: lang_mir.VRegId) bool {
+    var i: u32 = 0;
+    for (i < ctx.active_count) {
+        if (ctx.active[i] == v.n) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun pick_gp(ctx: *regalloc_context.Context, crosses_call: bool) i32 {
+    if (crosses_call) {
+        var ci: u32 = 0;
+        for (ci < ctx.gp_count) {
+            if (gp_available(ctx, ci) && ctx.callee_saved[ci] && !ctx.reserved[ci]) {
+                ctx.gp_busy[ci] = true;
+                ret isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, ci::i32);
+            }
+            ci = ci + 1;
+        }
+    }
+    or {
+        var ci: u32 = 0;
+        for (ci < ctx.gp_count) {
+            if (gp_available(ctx, ci) && !ctx.callee_saved[ci] && !ctx.reserved[ci]) {
+                ctx.gp_busy[ci] = true;
+                ret isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, ci::i32);
+            }
+            ci = ci + 1;
+        }
+    }
+    var ci: u32 = 0;
+    for (ci < ctx.gp_count) {
+        if (gp_available(ctx, ci) && !ctx.reserved[ci]) {
+            ctx.gp_busy[ci] = true;
+            ret isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, ci::i32);
+        }
+        ci = ci + 1;
+    }
+    ret -1;
+}
+
+# a register an instruction defines is closed to a value live across it; an
+# early-clobber def (the fixed pair, written before the instruction reads its
+# operands) is closed to one read by it as well
+fun def_reg_reserved(ctx: *regalloc_context.Context, id: u32) bool {
+    var i: u32 = 0;
+    for (i < ctx.def_res_count) {
+        if (ctx.def_res_reg[i] == id) {
+            val p:     i64  = ctx.def_res_pos[i];
+            val early: bool = ctx.def_res_early[i];
+            if (ctx.cur_vreg < ctx.f.vreg_count) {
+                val lr: *regalloc_context.LiveRange = ?ctx.ranges[ctx.cur_vreg];
+                if (seg_holds_point(ctx, lr, p) || (early && seg_overlaps_window(ctx, lr, p, p))) { ret true; }
+            }
+            or (ctx.cur_start <= p && (ctx.cur_end > p || (early && ctx.cur_end == p))) {
+                ret true;
+            }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun gp_available(ctx: *regalloc_context.Context, id: u32) bool {
+    if (ctx.gp_busy[id])                  { ret false; }
+    if (ctx.pinned_end[id] >= 0)          { ret false; }
+    if (arg_reg_reserved(ctx, id))        { ret false; }
+    if (def_reg_reserved(ctx, id))        { ret false; }
+    if (inactive_conflict(ctx, true, id)) { ret false; }
+    ret true;
+}
+
+fun fp_available(ctx: *regalloc_context.Context, fi: u32) bool {
+    if (ctx.fp_busy[fi])                                        { ret false; }
+    if (ctx.fp_pinned_end != nil && ctx.fp_pinned_end[fi] >= 0) { ret false; }
+    val cid: u32 = isa_inst.regid_make(isa_inst.REG_CLASS_ID_FP, fi::i32)::u32;
+    if (arg_reg_reserved(ctx, cid))        { ret false; }
+    if (def_reg_reserved(ctx, cid))        { ret false; }
+    if (inactive_conflict(ctx, false, fi)) { ret false; }
+    ret true;
+}
+
+# every constraint pick_gp and pick_fp apply, for one named register
+fun reg_free_for(ctx: *regalloc_context.Context, lr: *regalloc_context.LiveRange, rid: i32) bool {
+    val rclass: i32 = isa_inst.regid_class(rid);
+    val idx:    u32 = isa_inst.regid_index(rid)::u32;
+    if (lr.reg_class == regalloc_context.REG_CLASS_GP) {
+        if (rclass != isa_inst.REG_CLASS_ID_GP || idx >= ctx.gp_count) { ret false; }
+        if (ctx.reserved[idx])                                         { ret false; }
+        if (lr.crosses_call && !ctx.callee_saved[idx])                 { ret false; }
+        ret gp_available(ctx, idx);
+    }
+    if (rclass != isa_inst.REG_CLASS_ID_FP || idx >= ctx.fp_count)                    { ret false; }
+    if (lr.crosses_call && (ctx.fp_callee_saved == nil || !ctx.fp_callee_saved[idx])) { ret false; }
+    ret fp_available(ctx, idx);
+}
+
+fun pick_fp(ctx: *regalloc_context.Context, crosses_call: bool) i32 {
+    if (crosses_call) {
+        var ci: u32 = 0;
+        for (ci < ctx.fp_count) {
+            if (fp_available(ctx, ci) && ctx.fp_callee_saved[ci]) {
+                ctx.fp_busy[ci] = true;
+                ret isa_inst.regid_make(isa_inst.REG_CLASS_ID_FP, ci::i32);
+            }
+            ci = ci + 1;
+        }
+    }
+    or {
+        var ci: u32 = 0;
+        for (ci < ctx.fp_count) {
+            if (fp_available(ctx, ci) && !ctx.fp_callee_saved[ci]) {
+                ctx.fp_busy[ci] = true;
+                ret isa_inst.regid_make(isa_inst.REG_CLASS_ID_FP, ci::i32);
+            }
+            ci = ci + 1;
+        }
+    }
+    var fi: u32 = 0;
+    for (fi < ctx.fp_count) {
+        if (fp_available(ctx, fi)) {
+            ctx.fp_busy[fi] = true;
+            ret isa_inst.regid_make(isa_inst.REG_CLASS_ID_FP, fi::i32);
+        }
+        fi = fi + 1;
+    }
+    ret -1;
+}
+
+fun assign(ctx: *regalloc_context.Context, v: lang_mir.VRegId, preg: lang_mir.PRegId, reg_class: u32) {
+    val preg_class: i32 = isa_inst.regid_class(lang_mir.preg_regid(preg));
+    if (reg_class == regalloc_context.REG_CLASS_GP && preg_class != isa_inst.REG_CLASS_ID_GP) {
+        regalloc_context.defect_note(ctx, "regalloc: GP vreg assigned a non-GP register");
+        ret;
+    }
+    if (reg_class != regalloc_context.REG_CLASS_GP && preg_class != isa_inst.REG_CLASS_ID_FP) {
+        regalloc_context.defect_note(ctx, "regalloc: float vreg assigned a register outside the float bank");
+        ret;
+    }
+    ctx.f.vregs[v.n].assigned    = preg;
+    ctx.active[ctx.active_count] = v.n;
+    ctx.active_count             = ctx.active_count + 1;
+}
+
+# every register the incoming interval may take is costed by the densest
+# interval it would have to evict, active or inactive, and the cheapest is
+# taken when the incoming is denser than that; otherwise the incoming is the
+# one kept on the stack, so the value read most per position always keeps
+# its register
+fun spill_on_pressure(ctx: *regalloc_context.Context, v: lang_mir.VRegId) err[fail.Fail] {
+    val r: i32 = cheapest_eviction(ctx, ?ctx.ranges[v.n]);
+    if (r < 0) { ret regalloc_context.spill_vreg(ctx, v); }
+    ret evict_into(ctx, v, r);
+}
+
+# the register whose densest occupant the interval may evict, or -1 when no
+# register admits it or the cheapest occupant is at least as dense
+fun cheapest_eviction(ctx: *regalloc_context.Context, lr: *regalloc_context.LiveRange) i32 {
+    val gp:    bool = lr.reg_class == regalloc_context.REG_CLASS_GP;
+    var count: u32  = ctx.fp_count;
+    if (gp) { count = ctx.gp_count; }
+
+    var best_reg:  i32                         = -1;
+    var best_cost: *regalloc_context.LiveRange = nil;
+    var r:         u32                         = 0;
+    for (r < count) {
+        var rid: i32 = isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, r::i32);
+        if (!gp) { rid = isa_inst.regid_make(isa_inst.REG_CLASS_ID_FP, r::i32); }
+        if (!reg_admits(ctx, lr, r)) {
+            r = r + 1;
+            cnt;
+        }
+        var worst: *regalloc_context.LiveRange = nil;
+        occupant_cost(ctx, lr, r, ctx.active, ctx.active_count, ?worst);
+        occupant_cost(ctx, lr, r, ctx.inactive, ctx.inactive_count, ?worst);
+        if (worst != nil) {
+            if (best_reg < 0 || less_dense(worst, best_cost)) {
+                best_reg  = rid;
+                best_cost = worst;
+            }
+        }
+        r = r + 1;
+    }
+    if (best_reg < 0 || !less_dense(best_cost, lr)) { ret -1; }
+    ret best_reg;
+}
+
+# every occupant of best_reg that meets the interval is spilled and the
+# interval takes the register
+fun evict_into(ctx: *regalloc_context.Context, v: lang_mir.VRegId, best_reg: i32) err[fail.Fail] {
+    val lr:  *regalloc_context.LiveRange = ?ctx.ranges[v.n];
+    val idx: u32                         = isa_inst.regid_index(best_reg)::u32;
+    var ai:  u32                         = 0;
+    for (ai < ctx.active_count) {
+        val y: u32 = ctx.active[ai];
+        if (occupies(ctx, y, lr.reg_class, idx) && liveness.intersects(ctx, lr, ?ctx.ranges[y])) {
+            val sr: err[fail.Fail] = regalloc_context.spill_vreg(ctx, lang_mir.vreg_id(y));
+            if (sel sr.err) { ret sr; }
+            remove_active(ctx, lang_mir.vreg_id(y));
+        }
+        or { ai = ai + 1; }
+    }
+    var ii: u32 = 0;
+    for (ii < ctx.inactive_count) {
+        val y: u32 = ctx.inactive[ii];
+        if (occupies(ctx, y, lr.reg_class, idx) && liveness.intersects(ctx, lr, ?ctx.ranges[y])) {
+            val sr: err[fail.Fail] = regalloc_context.spill_vreg(ctx, lang_mir.vreg_id(y));
+            if (sel sr.err) { ret sr; }
+            remove_inactive(ctx, lang_mir.vreg_id(y));
+        }
+        or { ii = ii + 1; }
+    }
+    recompute_busy(ctx);
+    mark_assigned_id(ctx, lr.reg_class, lang_mir.preg_id(best_reg));
+    assign(ctx, v, lang_mir.preg_id(best_reg), lr.reg_class);
+    ret err[fail.Fail].ok{};
+}
+
+fun saved_across_calls(ctx: *regalloc_context.Context, reg_class: u32, idx: u32) bool {
+    if (reg_class == regalloc_context.REG_CLASS_GP) { ret idx < ctx.gp_count && ctx.callee_saved[idx]; }
+    ret idx < ctx.fp_count && ctx.fp_callee_saved != nil && ctx.fp_callee_saved[idx];
+}
+
+# the register's fixed constraints for this interval, everything but who
+# holds it
+fun reg_admits(ctx: *regalloc_context.Context, lr: *regalloc_context.LiveRange, idx: u32) bool {
+    if (lr.reg_class == regalloc_context.REG_CLASS_GP) {
+        if (ctx.reserved[idx])                         { ret false; }
+        if (lr.crosses_call && !ctx.callee_saved[idx]) { ret false; }
+        if (ctx.pinned_end[idx] >= 0)                  { ret false; }
+        if (arg_reg_reserved(ctx, idx))                { ret false; }
+        if (def_reg_reserved(ctx, idx))                { ret false; }
+        ret true;
+    }
+    if (lr.crosses_call && (ctx.fp_callee_saved == nil || !ctx.fp_callee_saved[idx])) { ret false; }
+    if (ctx.fp_pinned_end != nil && ctx.fp_pinned_end[idx] >= 0)                      { ret false; }
+    val cid: u32 = isa_inst.regid_make(isa_inst.REG_CLASS_ID_FP, idx::i32)::u32;
+    if (arg_reg_reserved(ctx, cid)) { ret false; }
+    if (def_reg_reserved(ctx, cid)) { ret false; }
+    ret true;
+}
+
+fun occupies(ctx: *regalloc_context.Context, y: u32, reg_class: u32, idx: u32) bool {
+    if (ctx.ranges[y].reg_class != reg_class) { ret false; }
+    val a: lang_mir.PRegId = ctx.f.vregs[y].assigned;
+    if (lang_mir.preg_is_nil(a)) { ret false; }
+    ret isa_inst.regid_index(lang_mir.preg_regid(a))::u32 == idx;
+}
+
+fun occupant_cost(ctx: *regalloc_context.Context, lr: *regalloc_context.LiveRange, idx: u32, set: *u32, count: u32, worst: **regalloc_context.LiveRange) {
+    var i: u32 = 0;
+    for (i < count) {
+        val y: u32 = set[i];
+        if (occupies(ctx, y, lr.reg_class, idx)) {
+            val yr: *regalloc_context.LiveRange = ?ctx.ranges[y];
+            if (liveness.intersects(ctx, lr, yr) && (@worst == nil || less_dense(@worst, yr))) { @worst = yr; }
+        }
+        i = i + 1;
+    }
+}
+
+fun mark_assigned_id(ctx: *regalloc_context.Context, reg_class: u32, preg: lang_mir.PRegId) {
+    val index: u32 = isa_inst.regid_index(lang_mir.preg_regid(preg))::u32;
+    if (reg_class == regalloc_context.REG_CLASS_GP) {
+        if (index < ctx.gp_count) { ctx.gp_busy[index] = true; }
+    }
+    or {
+        if (index < ctx.fp_count) { ctx.fp_busy[index] = true; }
+    }
+}
+
+fun free_assigned_id(ctx: *regalloc_context.Context, v: lang_mir.VRegId, reg_class: u32, preg: lang_mir.PRegId) {
+    val index: u32 = isa_inst.regid_index(lang_mir.preg_regid(preg))::u32;
+    if (reg_class == regalloc_context.REG_CLASS_GP) {
+        if (index < ctx.gp_count) { ctx.gp_busy[index] = false; }
+    }
+    or {
+        if (index < ctx.fp_count) { ctx.fp_busy[index] = false; }
+    }
+}
+
+fun remove_active(ctx: *regalloc_context.Context, v: lang_mir.VRegId) {
+    var write: u32 = 0;
+    var read:  u32 = 0;
+    for (read < ctx.active_count) {
+        if (ctx.active[read] != v.n) {
+            ctx.active[write] = ctx.active[read];
+            write             = write + 1;
+        }
+        read = read + 1;
+    }
+    ctx.active_count = write;
+}
+
+test sort_by_start__orders_by_start_then_end_then_original_index {
+    var alloc:  A.Allocator;
+    val make_r: err[A.Error] = page.make(?alloc);
+    if (sel make_r.err) { ret 1; }
+
+    var ranges: [5]regalloc_context.LiveRange;
+    ranges[0].start   = 10;
+    ranges[0].end_pos = 20;
+    ranges[1].start   = 5;
+    ranges[1].end_pos = 8;
+    ranges[2].start   = 5;
+    ranges[2].end_pos = 6;
+    ranges[3].start   = 5;
+    ranges[3].end_pos = 6;
+    ranges[4].start   = 0;
+    ranges[4].end_pos = 100;
+
+    var ctx: regalloc_context.Context;
+    ctx.alloc  = ?alloc;
+    ctx.ranges = ?ranges[0];
+
+    var order: [5]u32;
+    var i:     u32 = 0;
+    for (i < 5) {
+        order[i] = i;
+        i        = i + 1;
+    }
+
+    val r: err[fail.Fail] = sort_by_start(?ctx, ?order[0], 5);
+    if (sel r.err) { ret 1; }
+
+    if (order[0] != 4) { ret 1; }
+    if (order[1] != 2) { ret 1; }
+    if (order[2] != 3) { ret 1; }
+    if (order[3] != 1) { ret 1; }
+    if (order[4] != 0) { ret 1; }
+    ret 0;
+}
+
+test can_transfer__only_to_a_destination_born_at_the_copy {
+    var ctx:    regalloc_context.Context;
+    var ranges: [4]regalloc_context.LiveRange;
+    var segs:   [4]regalloc_context.Segment;
+    var f:      lang_mir.MirFunction;
+    f.vreg_count      = 4;
+    ctx.f             = ?f;
+    ctx.ranges        = ?ranges[0];
+    ctx.segs          = ?segs[0];
+    ranges[1].end_pos = 10;
+    regalloc_context.t_hull_segs(?ctx, 4);
+
+    var h: regalloc_context.CopyHint;
+    h.src_vreg = 1;
+    h.src_preg = -1;
+    h.copy_pos = 10;
+
+    var lr_born: regalloc_context.LiveRange;
+    lr_born.start = 10;
+    if (!can_transfer(?ctx, ?lr_born, ?h)) { ret 1; }
+
+    var lr_live_in: regalloc_context.LiveRange;
+    lr_live_in.start = 3;
+    if (can_transfer(?ctx, ?lr_live_in, ?h)) { ret 1; }
+
+    ranges[1].end_pos = 14;
+    regalloc_context.t_hull_segs(?ctx, 4);
+    if (can_transfer(?ctx, ?lr_born, ?h)) { ret 1; }
+    ranges[1].end_pos = 10;
+    regalloc_context.t_hull_segs(?ctx, 4);
+
+    h.src_vreg = lang_mir.MIR_VREG_NIL.n;
+    h.src_preg = 5;
+    if (can_transfer(?ctx, ?lr_born, ?h)) { ret 1; }
+
+    ret 0;
+}
+
+# two registers, reg0 callee-saved and reg1 not; a long value of the given
+# weight holds reg0 across calls when a short dense value that also lives
+# over a call arrives. inside says the short value's call is strictly
+# within its segment
+#[testing]
+fun t_call_evict_case(long_weight: i64, inside: bool) i32 {
+    var t: regalloc_context.TScan;
+    if (!regalloc_context.t_scan_init(?t)) { ret 1; }
+    fin { regalloc_context.t_scan_dnit(?t); }
+    t.ctx.gp_count    = 2;
+    t.callee_saved[0] = true;
+    regalloc_context.t_scan_value(?t, 0, 40, long_weight);
+    t.ranges[0].crosses_call = true;
+    t.ranges[0].call_inside  = true;
+    regalloc_context.t_scan_value(?t, 5, 10, 16);
+    t.ranges[1].crosses_call = true;
+    t.ranges[1].call_inside  = inside;
+    val r: err[fail.Fail] = run(?t.tgt, ?t.ctx);
+    if (sel r.err) { ret 2; }
+    if (regalloc_context.t_scan_holds_reg(?t, 1, 0)) {
+        if (!t.spilled[0]) { ret 3; }
+        ret 10;
+    }
+    if (!regalloc_context.t_scan_holds_reg(?t, 0, 0)) { ret 4; }
+    if (!regalloc_context.t_scan_holds_reg(?t, 1, 1)) { ret 5; }
+    ret 11;
+}
+
+test run__a_call_crossing_value_evicts_a_sparser_callee_saved_holder {
+    # the sparse holder gives way: a caller-saved register would only be
+    # spilled whole by spill.across_calls
+    if (t_call_evict_case(4, true) != 10) { ret 1; }
+    # a denser holder keeps its register and the incoming falls back
+    if (t_call_evict_case(400, true) != 11) { ret 2; }
+    # a call only at the segment's edge leaves a caller-saved register usable
+    if (t_call_evict_case(4, false) != 11) { ret 3; }
+    ret 0;
+}
+
+# a value dead across its hole does not hold its register there: the short
+# value inside the hole takes the same register and nothing spills. a hole is
+# honoured only where the value is dead: a second segment meeting the short
+# value is a real conflict
+test run__holes {
+    var h: regalloc_context.TScan;
+    if (!regalloc_context.t_scan_init(?h)) { ret 1; }
+    fin { regalloc_context.t_scan_dnit(?h); }
+    regalloc_context.t_scan_value(?h, 0, 5, 4);
+    regalloc_context.t_scan_segment(?h, 15, 20);
+    regalloc_context.t_scan_value(?h, 8, 10, 2);
+    val rh: err[fail.Fail] = run(?h.tgt, ?h.ctx);
+    if (sel rh.err)                                 { ret 2; }
+    if (!regalloc_context.t_scan_holds_reg0(?h, 0)) { ret 7; }
+    if (!regalloc_context.t_scan_holds_reg0(?h, 1)) { ret 8; }
+    if (h.ctx.spill_order_count != 0)               { ret 9; }
+
+    var t: regalloc_context.TScan;
+    if (!regalloc_context.t_scan_init(?t)) { ret 3; }
+    fin { regalloc_context.t_scan_dnit(?t); }
+    regalloc_context.t_scan_value(?t, 0, 5, 40);
+    regalloc_context.t_scan_segment(?t, 9, 20);
+    regalloc_context.t_scan_value(?t, 8, 10, 2);
+    val r: err[fail.Fail] = run(?t.tgt, ?t.ctx);
+    if (sel r.err)                                  { ret 4; }
+    if (!regalloc_context.t_scan_holds_reg0(?t, 0)) { ret 5; }
+    if (!t.spilled[1])                              { ret 6; }
+    ret 0;
+}
+
+# under pressure the victim is the value with the lowest loop-weighted use
+# density, whichever side of the decision it is on: a dense newcomer evicts
+# a sparse holder, and a sparse newcomer spills itself before a dense holder
+test run__the_least_dense_value_is_the_victim {
+    var t: regalloc_context.TScan;
+    if (!regalloc_context.t_scan_init(?t)) { ret 1; }
+    fin { regalloc_context.t_scan_dnit(?t); }
+    regalloc_context.t_scan_value(?t, 0, 40, 4);
+    regalloc_context.t_scan_value(?t, 5, 10, 16);
+    val r: err[fail.Fail] = run(?t.tgt, ?t.ctx);
+    if (sel r.err)                                  { ret 2; }
+    if (!t.spilled[0])                              { ret 3; }
+    if (!regalloc_context.t_scan_holds_reg0(?t, 1)) { ret 4; }
+
+    var u: regalloc_context.TScan;
+    if (!regalloc_context.t_scan_init(?u)) { ret 5; }
+    fin { regalloc_context.t_scan_dnit(?u); }
+    regalloc_context.t_scan_value(?u, 0, 40, 400);
+    regalloc_context.t_scan_value(?u, 5, 10, 16);
+    val r2: err[fail.Fail] = run(?u.tgt, ?u.ctx);
+    if (sel r2.err)                                 { ret 6; }
+    if (!regalloc_context.t_scan_holds_reg0(?u, 0)) { ret 7; }
+    if (!u.spilled[1])                              { ret 8; }
+    ret 0;
+}
+
+test spill_on_pressure__a_victim_keeps_a_register_the_incoming_range_cannot_take {
+    var alloc: A.Allocator;
+    val made:  err[A.Error] = page.make(?alloc);
+    if (sel made.err) { ret 1; }
+    var f: lang_mir.MirFunction;
+    regalloc_context.t_vregs(?alloc, ?f, 2);
+    var slots: [4]lang_mir.MirSlot;
+    f.frame.slots      = ?slots[0];
+    f.frame.slot_count = 0;
+    f.frame.slot_cap   = 4;
+    var flags: [2]bool;
+    var ctx:   regalloc_context.Context;
+    regalloc_context.t_ctx(?ctx, ?alloc, ?f, ?flags[0]);
+
+    val reg0:         i32                         = isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, 0);
+    var callee_saved: [1]bool                     = [1]bool{false};
+    var reserved:     [1]bool                     = [1]bool{false};
+    var busy:         [1]bool                     = [1]bool{true};
+    var pinned:       [1]i64                      = [1]i64{-1};
+    var active:       [2]u32                      = [2]u32{0, 0};
+    var ranges:       [2]regalloc_context.LiveRange;
+    var segs:         [2]regalloc_context.Segment = [2]regalloc_context.Segment{regalloc_context.Segment{from: 0, to: 20}, regalloc_context.Segment{from: 5, to: 10}};
+    # the incoming range is the denser, so only the argument window keeps it
+    # out of the holder's register
+    ranges[0]           = regalloc_context.LiveRange{vreg: 0, start: 0, end_pos: 20, use_count: 2, use_weight: 2, reg_class: regalloc_context.REG_CLASS_GP, crosses_call: false, seg_start: 0, seg_count: 1, live_len: 21};
+    ranges[1]           = regalloc_context.LiveRange{vreg: 1, start: 5, end_pos: 10, use_count: 2, use_weight: 2, reg_class: regalloc_context.REG_CLASS_GP, crosses_call: false, seg_start: 1, seg_count: 1, live_len: 6};
+    ctx.ranges          = ?ranges[0];
+    ctx.segs            = ?segs[0];
+    ctx.seg_count       = 2;
+    ctx.cur_vreg        = 1;
+    ctx.gp_count        = 1;
+    ctx.fp_count        = 0;
+    ctx.callee_saved    = ?callee_saved[0];
+    ctx.reserved        = ?reserved[0];
+    ctx.gp_busy         = ?busy[0];
+    ctx.pinned_end      = ?pinned[0];
+    ctx.active          = ?active[0];
+    ctx.active_count    = 1;
+    ctx.def_res_count   = 0;
+    ctx.cur_start       = 5;
+    ctx.cur_end         = 10;
+    f.vregs[0].assigned = lang_mir.preg_id(reg0);
+    var spilled:     [2]bool = [2]bool{false, false};
+    var spill_order: [2]u32  = [2]u32{0, 0};
+    ctx.spilled           = ?spilled[0];
+    ctx.spill_order       = ?spill_order[0];
+    ctx.spill_order_count = 0;
+
+    var arg_reg:   [1]u32 = [1]u32{reg0::u32};
+    var arg_start: [1]i64 = [1]i64{7};
+    var arg_end:   [1]i64 = [1]i64{8};
+    ctx.arg_res_reg   = ?arg_reg[0];
+    ctx.arg_res_start = ?arg_start[0];
+    ctx.arg_res_end   = ?arg_end[0];
+    ctx.arg_res_count = 1;
+
+    val spilled_r: err[fail.Fail] = spill_on_pressure(?ctx, lang_mir.vreg_id(1));
+    if (sel spilled_r.err)                                 { ret 2; }
+    if (!ctx.spilled[1])                                   { ret 3; }
+    if (ctx.spilled[0])                                    { ret 4; }
+    if (f.vregs[0].assigned.n != lang_mir.preg_id(reg0).n) { ret 5; }
+    if (!busy[0] || ctx.active_count != 1)                 { ret 6; }
+    ret 0;
+}

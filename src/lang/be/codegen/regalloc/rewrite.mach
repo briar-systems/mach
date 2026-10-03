@@ -1,0 +1,2011 @@
+# the rewrite of virtual registers onto physical ones: the reload registers
+# it will need are guaranteed first, then each instruction is rewritten with
+# its reloads, stores and two-address form, and the callee-saved registers it
+# used are recorded
+use mach.lang.fail;
+use lang_mir:    mach.lang.mir;
+use lang_source: mach.lang.source;
+use lang_target: mach.lang.target;
+use mach.lang.target.abi;
+use mach.lang.target.isa;
+use isa_inst:     mach.lang.target.isa.inst;
+use isa_rules:    mach.lang.target.isa.rules;
+use target_model: mach.lang.target.model;
+use A:            std.allocator;
+use std.allocator.arena;
+use std.allocator.page;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use mach.lang.be.codegen.regalloc.coalesce;
+use regalloc_context: mach.lang.be.codegen.regalloc.context;
+use mach.lang.be.codegen.regalloc.liveness;
+use regalloc_scan: mach.lang.be.codegen.regalloc.scan;
+
+# a spilled operand is loaded into a reload register: one the target
+# reserves, else a pool register nothing holds at that instruction. an
+# instruction whose reloads the reserved ones cannot all carry is tight, and
+# where too few pool registers are free there, one is freed by spilling what
+# holds it, the least dense holder first as the scan's eviction chooses and
+# never an operand of that instruction. a spill adds reloads where the
+# spilled value is read, so the pass repeats until every instruction is met;
+# the tables of the last pass are what the rewrite borrows from
+pub fun guarantee_reload_registers(tgt: *lang_target.Binding, ctx: *regalloc_context.Context) err[fail.Fail] {
+    var again: bool = true;
+    for (again) {
+        regalloc_context.tight_tables_dnit(ctx);
+        val bt: err[fail.Fail] = build_tight_tables(tgt, ctx);
+        if (sel bt.err) { ret bt; }
+        again = false;
+        var t: u32 = 0;
+        for (t < ctx.tight_count) {
+            val pos:  u32                = ctx.tight_pos[t];
+            val mi:   *lang_mir.MirInstr = regalloc_context.flat_instr(ctx, pos);
+            val need: u32                = reload_demand(tgt, ctx, mi, pos);
+            for (need > scratch_usable_count(ctx, pos) + mask_count(tight_free_mask(ctx, t))) {
+                val r: i32 = cheapest_reload_eviction(ctx, t, mi);
+                if (r < 0) {
+                    ret err[fail.Fail].err{regalloc_context.fail_for(ctx, "regalloc: no register can carry a reload in '", "'", "regalloc: no register can carry a reload")};
+                }
+                val er: err[fail.Fail] = evict_at(ctx, pos, r::u32);
+                if (sel er.err) { ret er; }
+                again = true;
+            }
+            t = t + 1;
+        }
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun build_tight_tables(tgt: *lang_target.Binding, ctx: *regalloc_context.Context) err[fail.Fail] {
+    var n:   u32 = 0;
+    var pos: u32 = 0;
+    for (pos < ctx.flat_count) {
+        if (reload_demand(tgt, ctx, regalloc_context.flat_instr(ctx, pos), pos) > scratch_usable_count(ctx, pos)) { n = n + 1; }
+        pos = pos + 1;
+    }
+    if (n == 0) { ret err[fail.Fail].ok{}; }
+
+    val w:  u32                = regalloc_context.tight_width(ctx);
+    val rp: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, n::usize);
+    if (sel rp.err) { ret err[fail.Fail].err{fail.refused(rp.err)}; }
+    val rh: res[*u32, A.Error] = A.zallocate[u32](ctx.alloc, (n * w)::usize);
+    if (sel rh.err) {
+        A.deallocate[u32](ctx.alloc, rp.ok, n::usize);
+        ret err[fail.Fail].err{fail.refused(rh.err)};
+    }
+    val ru: res[*u32, A.Error] = A.allocate[u32](ctx.alloc, n::usize);
+    if (sel ru.err) {
+        A.deallocate[u32](ctx.alloc, rp.ok, n::usize);
+        A.deallocate[u32](ctx.alloc, rh.ok, (n * w)::usize);
+        ret err[fail.Fail].err{fail.refused(ru.err)};
+    }
+    ctx.tight_pos    = rp.ok;
+    ctx.tight_hold   = rh.ok;
+    ctx.tight_usable = ru.ok;
+    ctx.tight_count  = n;
+
+    var t: u32 = 0;
+    pos = 0;
+    for (pos < ctx.flat_count) {
+        val mi: *lang_mir.MirInstr = regalloc_context.flat_instr(ctx, pos);
+        if (reload_demand(tgt, ctx, mi, pos) > scratch_usable_count(ctx, pos)) {
+            ctx.tight_pos[t] = pos;
+            var mask: u32 = 0;
+            var r:    u32 = 0;
+            for (r < w) {
+                if (borrow_usable(tgt, ctx, r, pos, mi)) { mask = mask | (1::u32 << r); }
+                r = r + 1;
+            }
+            ctx.tight_usable[t] = mask;
+            t                   = t + 1;
+        }
+        pos = pos + 1;
+    }
+
+    var v: u32 = 0;
+    for (v < ctx.f.vreg_count) {
+        if (holds_gp_register(ctx, v)) { add_hold(ctx, v, true); }
+        v = v + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun holds_gp_register(ctx: *regalloc_context.Context, v: u32) bool {
+    if (ctx.ranges[v].reg_class != regalloc_context.REG_CLASS_GP) { ret false; }
+    if (ctx.spilled[v])                                           { ret false; }
+    if (regalloc_context.vreg_has_slot(ctx, lang_mir.vreg_id(v))) { ret false; }
+    if (lang_mir.preg_is_nil(ctx.f.vregs[v].assigned))            { ret false; }
+    ret isa_inst.regid_index(lang_mir.preg_regid(ctx.f.vregs[v].assigned))::u32 < regalloc_context.tight_width(ctx);
+}
+
+# the first tight instruction at or after pos
+fun tight_lower_bound(ctx: *regalloc_context.Context, pos: i64) u32 {
+    var lo: u32 = 0;
+    var hi: u32 = ctx.tight_count;
+    for (lo < hi) {
+        val mid: u32 = lo + (hi - lo) / 2;
+        if (ctx.tight_pos[mid]::i64 < pos) { lo = mid + 1; }
+        or                                 { hi = mid; }
+    }
+    ret lo;
+}
+
+fun tight_index(ctx: *regalloc_context.Context, pos: u32) i64 {
+    val t: u32 = tight_lower_bound(ctx, pos::i64);
+    if (t < ctx.tight_count && ctx.tight_pos[t] == pos) { ret t::i64; }
+    ret -1;
+}
+
+# v's register counts as held at every tight instruction its segments touch
+fun add_hold(ctx: *regalloc_context.Context, v: u32, on: bool) {
+    val w:   u32                         = regalloc_context.tight_width(ctx);
+    val idx: u32                         = isa_inst.regid_index(lang_mir.preg_regid(ctx.f.vregs[v].assigned))::u32;
+    val lr:  *regalloc_context.LiveRange = ?ctx.ranges[v];
+    var k:   u32                         = 0;
+    for (k < lr.seg_count) {
+        val sg: *regalloc_context.Segment = ?ctx.segs[lr.seg_start + k];
+        var t:  u32                       = tight_lower_bound(ctx, sg.from);
+        for (t < ctx.tight_count && ctx.tight_pos[t]::i64 <= sg.to) {
+            if (on) { ctx.tight_hold[t * w + idx] = ctx.tight_hold[t * w + idx] + 1; }
+            or      { ctx.tight_hold[t * w + idx] = ctx.tight_hold[t * w + idx] - 1; }
+            t = t + 1;
+        }
+        k = k + 1;
+    }
+}
+
+fun tight_free_mask(ctx: *regalloc_context.Context, t: u32) u32 {
+    val w:    u32 = regalloc_context.tight_width(ctx);
+    var mask: u32 = 0;
+    var r:    u32 = 0;
+    for (r < w) {
+        if ((ctx.tight_usable[t] & (1::u32 << r)) != 0 && ctx.tight_hold[t * w + r] == 0) {
+            mask = mask | (1::u32 << r);
+        }
+        r = r + 1;
+    }
+    ret mask;
+}
+
+fun mask_count(mask: u32) u32 {
+    var n: u32 = 0;
+    var m: u32 = mask;
+    for (m != 0) {
+        m = m & (m - 1);
+        n = n + 1;
+    }
+    ret n;
+}
+
+fun pos_in_entry(ctx: *regalloc_context.Context, pos: u32) bool {
+    ret ctx.flat[pos].block == 0;
+}
+
+# a reserved reload register the instruction at pos may use: not a parameter
+# register the entry still reads, not an argument register set up for a call
+fun scratch_usable(ctx: *regalloc_context.Context, id: i32, is_entry: bool, pos: u32) bool {
+    if (is_entry && id::u32 < ctx.gp_count
+        && ctx.param_reg_end[id] >= 0 && pos::i64 <= ctx.param_reg_end[id]) {
+        ret false;
+    }
+    if (id::u32 < ctx.gp_count && regalloc_scan.arg_reg_busy_at(ctx, id::u32, pos)) { ret false; }
+    ret true;
+}
+
+fun scratch_usable_count(ctx: *regalloc_context.Context, pos: u32) u32 {
+    var n: u32 = 0;
+    var i: i32 = 0;
+    for (i < ctx.reload_scratch_count) {
+        if (scratch_usable(ctx, ctx.reload_scratch[i].id, pos_in_entry(ctx, pos), pos)) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# a pool register the instruction at pos may borrow when nothing holds it:
+# besides a reserved one's constraints, the instruction neither names it nor
+# writes it on its own nor clobbers it in assembly
+fun borrow_usable(tgt: *lang_target.Binding, ctx: *regalloc_context.Context, r: u32, pos: u32, mi: *lang_mir.MirInstr) bool {
+    if (ctx.reserved[r])                                           { ret false; }
+    if (!scratch_usable(ctx, r::i32, pos_in_entry(ctx, pos), pos)) { ret false; }
+    if (def_reg_at(ctx, r, pos))                                   { ret false; }
+    if (instr_names_preg(mi, r))                                   { ret false; }
+    var agp: u32 = 0;
+    var afp: u32 = 0;
+    if (asm_instr_clobbers(tgt, mi, ?agp, ?afp) && (agp & (1::u32 << r)) != 0) { ret false; }
+    ret true;
+}
+
+fun def_reg_at(ctx: *regalloc_context.Context, r: u32, pos: u32) bool {
+    var i: u32 = 0;
+    for (i < ctx.def_res_count) {
+        if (ctx.def_res_reg[i] == r && ctx.def_res_pos[i] == pos::i64) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun preg_is_gp(p: lang_mir.PRegId, r: u32) bool {
+    if (lang_mir.preg_is_nil(p)) { ret false; }
+    val rid: i32 = lang_mir.preg_regid(p);
+    ret isa_inst.regid_class(rid) == isa_inst.REG_CLASS_ID_GP && isa_inst.regid_index(rid)::u32 == r;
+}
+
+fun instr_names_preg(mi: *lang_mir.MirInstr, r: u32) bool {
+    var k: u32 = 0;
+    for (k < mi.operand_count) {
+        val op: *lang_mir.MirOperand = ?mi.operands[k];
+        if (op.kind == lang_mir.MIR_OP_PREG && preg_is_gp(op.preg, r)) { ret true; }
+        if (op.kind == lang_mir.MIR_OP_MEM) {
+            if (lang_mir.vreg_is_nil(op.vreg) && preg_is_gp(op.preg, r)) { ret true; }
+            if (sel op.index.preg) {
+                if (preg_is_gp(op.index.preg, r)) { ret true; }
+            }
+        }
+        k = k + 1;
+    }
+    ret false;
+}
+
+fun instr_names_vreg(mi: *lang_mir.MirInstr, v: u32) bool {
+    var k: u32 = 0;
+    for (k < mi.operand_count) {
+        val op: *lang_mir.MirOperand = ?mi.operands[k];
+        if ((op.kind == lang_mir.MIR_OP_VREG || op.kind == lang_mir.MIR_OP_MEM) && !lang_mir.vreg_is_nil(op.vreg) && op.vreg.n == v) {
+            ret true;
+        }
+        if (op.kind == lang_mir.MIR_OP_MEM) {
+            if (sel op.index.vreg) {
+                if (op.index.vreg.n == v) { ret true; }
+            }
+        }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# the usable register whose densest holder at the tight instruction is least
+# dense, or -1 when every one is held by an operand of the instruction
+fun cheapest_reload_eviction(ctx: *regalloc_context.Context, t: u32, mi: *lang_mir.MirInstr) i32 {
+    val pos:     i64 = ctx.tight_pos[t]::i64;
+    val w:       u32 = regalloc_context.tight_width(ctx);
+    var worst:   [32]*regalloc_context.LiveRange;
+    var blocked: [32]bool;
+    var r:       u32 = 0;
+    for (r < 32) {
+        worst[r]   = nil;
+        blocked[r] = false;
+        r          = r + 1;
+    }
+    var v: u32 = 0;
+    for (v < ctx.f.vreg_count) {
+        if (holds_gp_register(ctx, v) && liveness.covers(ctx, ?ctx.ranges[v], pos)) {
+            val idx: u32                         = isa_inst.regid_index(lang_mir.preg_regid(ctx.f.vregs[v].assigned))::u32;
+            val lr:  *regalloc_context.LiveRange = ?ctx.ranges[v];
+            if (instr_names_vreg(mi, v))                                       { blocked[idx] = true; }
+            if (worst[idx] == nil || regalloc_scan.less_dense(worst[idx], lr)) { worst[idx] = lr; }
+        }
+        v = v + 1;
+    }
+    var best: i32 = -1;
+    r = 0;
+    for (r < w) {
+        if ((ctx.tight_usable[t] & (1::u32 << r)) != 0 && !blocked[r] && worst[r] != nil) {
+            if (best < 0 || regalloc_scan.less_dense(worst[r], worst[best::u32])) { best = r::i32; }
+        }
+        r = r + 1;
+    }
+    ret best;
+}
+
+# every value holding r at pos goes to the stack
+fun evict_at(ctx: *regalloc_context.Context, pos: u32, r: u32) err[fail.Fail] {
+    var v: u32 = 0;
+    for (v < ctx.f.vreg_count) {
+        if (holds_gp_register(ctx, v)
+            && isa_inst.regid_index(lang_mir.preg_regid(ctx.f.vregs[v].assigned))::u32 == r
+            && liveness.covers(ctx, ?ctx.ranges[v], pos::i64)) {
+            add_hold(ctx, v, false);
+            val sr: err[fail.Fail] = regalloc_context.spill_vreg(ctx, lang_mir.vreg_id(v));
+            if (sel sr.err) { ret sr; }
+        }
+        v = v + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# a pool register free at the tight instruction, caller-saved first so a
+# borrow costs no save; a callee-saved one joins the function's saved set
+fun borrow_reload_register(ctx: *regalloc_context.Context, claimed: *i32, claimed_count: u32, pos: u32) i32 {
+    val ti: i64 = tight_index(ctx, pos);
+    if (ti < 0) { ret -1; }
+    val free: u32 = tight_free_mask(ctx, ti::u32);
+    var pass: u32 = 0;
+    for (pass < 2) {
+        var r: u32 = 0;
+        for (r < regalloc_context.tight_width(ctx)) {
+            val id: i32 = isa_inst.regid_make(isa_inst.REG_CLASS_ID_GP, r::i32);
+            if ((free & (1::u32 << r)) != 0 && ctx.callee_saved[r] == (pass == 1)
+                && !id_claimed(claimed, claimed_count, id)) {
+                if (ctx.callee_saved[r]) { ctx.borrowed_gp = ctx.borrowed_gp | (1::u32 << r); }
+                ret id;
+            }
+            r = r + 1;
+        }
+        pass = pass + 1;
+    }
+    ret -1;
+}
+
+# the reload registers the rewrite claims at the instruction, path for path:
+# a two-address op, a copy with a spilled side, or the general operand walk
+fun reload_demand(tgt: *lang_target.Binding, ctx: *regalloc_context.Context, mi: *lang_mir.MirInstr, pos: u32) u32 {
+    val swapped: bool = commute_wanted(ctx, mi);
+    if (swapped) { swap_operands(mi, 1, 2); }
+    var n: u32 = 0;
+    if (two_address_candidate(ctx, mi)) {
+        n = two_address_demand(tgt, ctx, mi, pos);
+    }
+    or (spilled_copy_candidate(tgt, ctx, mi)) {
+        if (regalloc_context.is_spilled(ctx, mi.operands[0].vreg) && regalloc_context.is_spilled(ctx, mi.operands[1].vreg)) { n = 1; }
+    }
+    or {
+        n = general_demand(tgt, ctx, mi);
+    }
+    if (swapped) { swap_operands(mi, 1, 2); }
+    ret n;
+}
+
+fun two_address_demand(tgt: *lang_target.Binding, ctx: *regalloc_context.Context, mi: *lang_mir.MirInstr, pos: u32) u32 {
+    var swap: bool = false;
+    val work: i32  = two_address_work(ctx, mi, pos, ?swap);
+    var li:   u32  = 1;
+    var ri:   u32  = 2;
+    if (swap) {
+        li = 2;
+        ri = 1;
+    }
+    var n: u32 = 0;
+    if (work < 0) { n = 1; }
+    val l:      *lang_mir.MirOperand = ?mi.operands[li];
+    var absent: lang_mir.MirOperand  = lang_mir.op_imm(0);
+    var r:      *lang_mir.MirOperand = ?absent;
+    if (mi.operand_count == 3) { r = ?mi.operands[ri]; }
+    val l_spilled: bool = l.kind == lang_mir.MIR_OP_VREG && regalloc_context.is_spilled(ctx, l.vreg);
+    if (l_spilled && work >= 0 && operand_register(ctx, r) == work) { n = n + 1; }
+    if (mi.operand_count == 3 && r.kind == lang_mir.MIR_OP_VREG && regalloc_context.is_spilled(ctx, r.vreg)) {
+        if (l_spilled && lang_mir.vreg_same(l.vreg, r.vreg)) {}
+        or (reads_slot_source(tgt, mi))                      {}
+        or                                                   { n = n + 1; }
+    }
+    ret n;
+}
+
+fun general_demand(tgt: *lang_target.Binding, ctx: *regalloc_context.Context, mi: *lang_mir.MirInstr) u32 {
+    val nops:      u32             = mi.operand_count;
+    val has_def:   bool            = instr_defines_ops(mi, mi.operands, nops);
+    val slot_k:    u32             = slot_source_index(tgt, ctx, mi, has_def);
+    var store_dst: lang_mir.VRegId = lang_mir.MIR_VREG_NIL;
+    var n:         u32             = 0;
+    var k:         u32             = 0;
+    for (k < nops) {
+        val op: *lang_mir.MirOperand = ?mi.operands[k];
+        if (op.kind == lang_mir.MIR_OP_VREG) {
+            val v: lang_mir.VRegId = op.vreg;
+            if (has_def && k == 0) {
+                if (regalloc_context.is_spilled(ctx, v) && !regalloc_context.is_fp_vreg(ctx, v)) {
+                    n         = n + 1;
+                    store_dst = v;
+                }
+            }
+            or (regalloc_context.is_fp_vreg(ctx, v) && regalloc_context.is_spilled(ctx, v)) {}
+            or (!lang_mir.vreg_is_nil(store_dst) && lang_mir.vreg_same(v, store_dst))       {}
+            or (k == slot_k)                                                                {}
+            or (regalloc_context.is_spilled(ctx, v))                                        { n = n + 1; }
+        }
+        or (op.kind == lang_mir.MIR_OP_MEM) {
+            if (!lang_mir.vreg_is_nil(op.vreg) && !regalloc_context.is_storage_slot(ctx, op.vreg) && regalloc_context.is_spilled(ctx, op.vreg)) { n = n + 1; }
+            if (sel op.index.vreg) {
+                if (regalloc_context.is_spilled(ctx, op.index.vreg)) { n = n + 1; }
+            }
+        }
+        k = k + 1;
+    }
+    ret n;
+}
+
+fun asm_instr_clobbers(tgt: *lang_target.Binding, mi: *lang_mir.MirInstr, gp: *u32, fp: *u32) bool {
+    if (mi.asm_block == nil) { ret false; }
+    @gp = 0;
+    @fp = 0;
+    if (!tgt.arch.has_assembly) {
+        @gp = 0xFFFFFFFF;
+        @fp = 0xFFFFFFFF;
+        ret true;
+    }
+    tgt.arch.assembly.clobbers(mi.asm_block.body, gp, fp);
+    ret true;
+}
+
+pub fun asm_clobbers_at(tgt: *lang_target.Binding, ctx: *regalloc_context.Context, pos: u32, gp: *u32, fp: *u32) bool {
+    ret asm_instr_clobbers(tgt, regalloc_context.flat_instr(ctx, pos), gp, fp);
+}
+
+fun abi_callee_saved_gp_mask(tgt: *lang_target.Binding) u32 {
+    var regs: [32]target_model.Register;
+    val fill: abi.RegFileFn = tgt.abi.callee_saved;
+    val n:    i32           = fill(?regs[0]);
+    var m:    u32           = 0;
+    var i:    i32           = 0;
+    for (i < n && i < regalloc_context.MAX_REG_FILE) {
+        val id: i32 = regs[i].id;
+        if (isa_inst.regid_class(id) == isa_inst.REG_CLASS_ID_GP && id >= 0 && id < 32) {
+            m = m | (1::u32 << id::u32);
+        }
+        i = i + 1;
+    }
+    ret m;
+}
+
+fun abi_callee_saved_fp_mask(tgt: *lang_target.Binding) u32 {
+    var regs: [32]target_model.Register;
+    val fill: abi.RegFileFn = tgt.abi.callee_saved;
+    val n:    i32           = fill(?regs[0]);
+    var m:    u32           = 0;
+    var i:    i32           = 0;
+    for (i < n && i < regalloc_context.MAX_REG_FILE) {
+        val id: i32 = regs[i].id;
+        if (isa_inst.regid_class(id) == isa_inst.REG_CLASS_ID_FP) {
+            val idx: i32 = isa_inst.regid_index(id);
+            if (idx >= 0 && idx < 32) { m = m | (1::u32 << idx::u32); }
+        }
+        i = i + 1;
+    }
+    ret m;
+}
+
+pub fun fp_scratch_callee_mask(tgt: *lang_target.Binding) u32 {
+    val cs: u32 = abi_callee_saved_fp_mask(tgt);
+    if (cs == 0) { ret 0; }
+    val fpc:        u32 = regalloc_context.bank_count(tgt, regalloc_context.fp_class_index(tgt));
+    var alloc_mask: u32 = 0;
+    var i:          u32 = 0;
+    for (i < fpc && i < 32) {
+        alloc_mask = alloc_mask | (1::u32 << i);
+        i          = i + 1;
+    }
+    ret cs & ~alloc_mask;
+}
+
+pub fun function_uses_fp_scratch(f: *lang_mir.MirFunction) bool {
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *lang_mir.MirBlock = ?f.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+            val o:  lang_mir.MirOpcode = mi.opcode;
+            if (mi.vec_lane != lang_mir.VEC_LANE_NONE)     { ret true; }
+            if (lang_mir.has(o, lang_mir.MIRF_FLOAT_UNIT)) { ret true; }
+            if (o == lang_mir.MIR_MOV) {
+                if (mi.width >= 16) { ret true; }
+                var k: u32 = 0;
+                for (k < mi.operand_count) {
+                    val op: *lang_mir.MirOperand = ?mi.operands[k];
+                    if (op.kind == lang_mir.MIR_OP_VREG && lang_mir.vreg_is_fp(f, op.vreg)) {
+                        ret true;
+                    }
+                    if (op.kind == lang_mir.MIR_OP_PREG &&
+                        isa_inst.regid_class(lang_mir.preg_regid(op.preg)) == isa_inst.REG_CLASS_ID_FP) {
+                        ret true;
+                    }
+                    k = k + 1;
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+pub fun asm_callee_mask(tgt: *lang_target.Binding, f: *lang_mir.MirFunction) u32 {
+    val cs:     u32 = abi_callee_saved_gp_mask(tgt);
+    val result: u32 = tgt.reserved_gp;
+    var mask:   u32 = 0;
+    var bi:     u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *lang_mir.MirBlock = ?f.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            var agp: u32 = 0;
+            var afp: u32 = 0;
+            if (asm_instr_clobbers(tgt, ?blk.instrs[ii], ?agp, ?afp)) {
+                mask = mask | (agp & cs & ~result);
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret mask;
+}
+
+fun asm_callee_mask_fp(tgt: *lang_target.Binding, f: *lang_mir.MirFunction) u32 {
+    val cs:   u32 = abi_callee_saved_fp_mask(tgt);
+    var mask: u32 = 0;
+    var bi:   u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *lang_mir.MirBlock = ?f.blocks[bi];
+        var ii:  u32                = 0;
+        for (ii < blk.instr_count) {
+            var agp: u32 = 0;
+            var afp: u32 = 0;
+            if (asm_instr_clobbers(tgt, ?blk.instrs[ii], ?agp, ?afp)) {
+                mask = mask | (afp & cs);
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret mask;
+}
+
+pub fun operand_bank_matches(op: *lang_mir.MirOperand) bool {
+    val class: i32 = isa_inst.regid_class(lang_mir.preg_regid(op.preg));
+    ret (op.required_bank == lang_mir.BANK_GP && class == isa_inst.REG_CLASS_ID_GP)
+        || (op.required_bank == lang_mir.BANK_FP && class == isa_inst.REG_CLASS_ID_FP);
+}
+
+pub fun record_callee_mask(tgt: *lang_target.Binding, ctx: *regalloc_context.Context) {
+    var mask:    u32 = 0;
+    var fp_mask: u32 = 0;
+    var v:       u32 = 0;
+    for (v < ctx.f.vreg_count) {
+        val mv: *lang_mir.MirVReg = ?ctx.f.vregs[v];
+        if (lang_mir.preg_is_nil(mv.assigned)) {
+            v = v + 1;
+            cnt;
+        }
+        val lr: *regalloc_context.LiveRange = ?ctx.ranges[v];
+        if (lr.reg_class == regalloc_context.REG_CLASS_GP) {
+            val gidx: u32 = isa_inst.regid_index(lang_mir.preg_regid(mv.assigned))::u32;
+            if (gidx < ctx.gp_count && ctx.callee_saved[gidx] && !ctx.reserved[gidx]) {
+                mask = mask | (1::u32 << gidx);
+            }
+        }
+        or {
+            val xidx: u32 = isa_inst.regid_index(lang_mir.preg_regid(mv.assigned))::u32;
+            if (ctx.fp_callee_saved != nil && xidx < ctx.fp_count && ctx.fp_callee_saved[xidx]) {
+                fp_mask = fp_mask | (1::u32 << xidx);
+            }
+        }
+        v = v + 1;
+    }
+
+    mask    = mask | ctx.borrowed_gp | asm_callee_mask(tgt, ctx.f);
+    fp_mask = fp_mask | asm_callee_mask_fp(tgt, ctx.f);
+
+    val fp_scratch: u32 = fp_scratch_callee_mask(tgt);
+    if (fp_scratch != 0 && function_uses_fp_scratch(ctx.f)) {
+        fp_mask = fp_mask | fp_scratch;
+    }
+
+    ctx.f.callee_mask    = mask;
+    ctx.f.callee_mask_fp = fp_mask;
+}
+
+pub fun run(tgt: *lang_target.Binding, ctx: *regalloc_context.Context) err[fail.Fail] {
+    val f:         *lang_mir.MirFunction = ctx.f;
+    var bi:        u32                   = 0;
+    var flat_base: u32                   = 0;
+    for (bi < f.block_count) {
+        val blk:        *lang_mir.MirBlock = ?f.blocks[bi];
+        val orig_count: u32                = blk.instr_count;
+        val rb:         err[fail.Fail]     = rewrite_block(tgt, ctx, blk, bi == 0, flat_base);
+        if (sel rb.err) { ret rb; }
+        flat_base = flat_base + orig_count;
+        bi        = bi + 1;
+    }
+    ret regalloc_context.defect_check(ctx);
+}
+
+fun rewrite_block(tgt: *lang_target.Binding, ctx: *regalloc_context.Context, blk: *lang_mir.MirBlock, is_entry: bool, flat_base: u32) err[fail.Fail] {
+    if (blk.instr_count == 0) { ret err[fail.Fail].ok{}; }
+
+    var total: u32 = 0;
+    var ii:    u32 = 0;
+    for (ii < blk.instr_count) {
+        total = total + 1 + extra_movs(ctx, ?blk.instrs[ii]);
+        ii    = ii + 1;
+    }
+
+    val rn: res[*lang_mir.MirInstr, A.Error] = A.zallocate[lang_mir.MirInstr](ctx.alloc, total::usize);
+    if (sel rn.err) { ret err[fail.Fail].err{fail.refused(rn.err)}; }
+    val dst: *lang_mir.MirInstr = rn.ok;
+    var w:   u32                = 0;
+
+    ii = 0;
+    for (ii < blk.instr_count) {
+        val mi: *lang_mir.MirInstr = ?blk.instrs[ii];
+        val re: err[fail.Fail]     = rewrite_instr(tgt, ctx, mi, dst, ?w, is_entry, flat_base + ii);
+        if (sel re.err) {
+            var d: u32 = 0;
+            for (d < w) {
+                if (dst[d].operands != nil && dst[d].operand_count > 0) {
+                    A.deallocate[lang_mir.MirOperand](ctx.alloc, dst[d].operands, dst[d].operand_count::usize);
+                }
+                d = d + 1;
+            }
+            A.deallocate[lang_mir.MirInstr](ctx.alloc, dst, total::usize);
+            ret re;
+        }
+        ii = ii + 1;
+    }
+
+    if (blk.instrs != nil && blk.instr_cap > 0) {
+        A.deallocate[lang_mir.MirInstr](ctx.alloc, blk.instrs, blk.instr_cap::usize);
+    }
+    blk.instrs      = dst;
+    blk.instr_count = w;
+    blk.instr_cap   = total;
+    ret err[fail.Fail].ok{};
+}
+
+fun extra_movs(ctx: *regalloc_context.Context, mi: *lang_mir.MirInstr) u32 {
+    var n:       u32  = 0;
+    val has_def: bool = liveness.instr_defines(mi);
+    var k:       u32  = 0;
+    for (k < mi.operand_count) {
+        val op: *lang_mir.MirOperand = ?mi.operands[k];
+        if (op.kind == lang_mir.MIR_OP_VREG) {
+            if (regalloc_context.is_spilled(ctx, op.vreg)) { n = n + 1; }
+        }
+        or (op.kind == lang_mir.MIR_OP_MEM && !lang_mir.vreg_is_nil(op.vreg)) {
+            if (regalloc_context.is_spilled(ctx, op.vreg)) { n = n + 1; }
+        }
+        if (sel op.index.vreg) {
+            if (regalloc_context.is_spilled(ctx, op.index.vreg)) { n = n + 1; }
+        }
+        k = k + 1;
+    }
+    ret n;
+}
+
+fun rewrite_instr(tgt: *lang_target.Binding, ctx: *regalloc_context.Context, mi: *lang_mir.MirInstr,
+    dst: *lang_mir.MirInstr, wp: *u32, is_entry: bool, src_pos: u32) err[fail.Fail] {
+    commute_onto_destination(ctx, mi);
+    if (two_address_candidate(ctx, mi)) {
+        ret rewrite_two_address(tgt, ctx, mi, dst, wp, is_entry, src_pos);
+    }
+    if (spilled_copy_candidate(tgt, ctx, mi)) {
+        ret rewrite_spilled_copy(ctx, mi, dst, wp, is_entry, src_pos);
+    }
+
+    val n:   u32                  = mi.operand_count;
+    var ops: *lang_mir.MirOperand = nil;
+    if (n > 0) {
+        val ro: res[*lang_mir.MirOperand, A.Error] = A.allocate[lang_mir.MirOperand](ctx.alloc, n::usize);
+        if (sel ro.err) { ret err[fail.Fail].err{fail.refused(ro.err)}; }
+        ops = ro.ok;
+        var c: u32 = 0;
+        for (c < n) {
+            ops[c] = mi.operands[c];
+            c      = c + 1;
+        }
+    }
+
+    val has_def: bool = instr_defines_ops(mi, ops, n);
+
+    var claimed:       [16]i32;
+    var claimed_count: u32 = 0;
+    var ci:            u32 = 0;
+    for (ci < 16) {
+        claimed[ci] = -1;
+        ci          = ci + 1;
+    }
+
+    var store_dst_vreg:     lang_mir.VRegId = lang_mir.MIR_VREG_NIL;
+    var store_dst_tmp:      i32             = -1;
+    var store_dst_reloaded: bool            = false;
+    val slot_k:             u32             = slot_source_index(tgt, ctx, mi, has_def);
+
+    var k: u32 = 0;
+    for (k < n) {
+        val op: *lang_mir.MirOperand = ?ops[k];
+        if (op.kind == lang_mir.MIR_OP_VREG) {
+            val v: lang_mir.VRegId = op.vreg;
+            if (has_def && k == 0) {
+                if (regalloc_context.is_fp_vreg(ctx, v) && regalloc_context.is_spilled(ctx, v)) {
+                    ops[k] = lang_mir.op_mem_slot(v, 0);
+                }
+                or (regalloc_context.is_spilled(ctx, v)) {
+                    val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, is_entry, src_pos);
+                    if (tmp < 0) {
+                        free_ops(ctx, ops, n);
+                        ret err[fail.Fail].err{regalloc_context.fail_for(ctx, "regalloc: no free register for spilled destination in '", "'", "regalloc: no free register for spilled destination")};
+                    }
+                    claimed[claimed_count] = tmp;
+                    claimed_count          = claimed_count + 1;
+                    ops[k]                 = lang_mir.op_preg_of(lang_mir.preg_id(tmp), v);
+                    store_dst_vreg         = v;
+                    store_dst_tmp          = tmp;
+                }
+                or {
+                    ops[k] = preg_of(ctx, v);
+                }
+            }
+            or {
+                if (regalloc_context.is_fp_vreg(ctx, v) && regalloc_context.is_spilled(ctx, v)) {
+                    ops[k] = lang_mir.op_mem_slot(v, 0);
+                }
+                or (store_dst_tmp >= 0 && lang_mir.vreg_same(v, store_dst_vreg)) {
+                    if (!store_dst_reloaded) {
+                        val er: err[fail.Fail] = emit_reload(ctx, dst, wp, lang_mir.preg_id(store_dst_tmp), v, mi.loc, mi.inline_site);
+                        if (sel er.err) {
+                            free_ops(ctx, ops, n);
+                            ret er;
+                        }
+                        store_dst_reloaded = true;
+                    }
+                    ops[k] = lang_mir.op_preg_of(lang_mir.preg_id(store_dst_tmp), v);
+                }
+                or (k == slot_k) {
+                    ops[k] = lang_mir.op_mem_slot(v, 0);
+                }
+                or (regalloc_context.is_spilled(ctx, v)) {
+                    val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, is_entry, src_pos);
+                    if (tmp < 0) {
+                        free_ops(ctx, ops, n);
+                        ret err[fail.Fail].err{regalloc_context.fail_for(ctx, "regalloc: no free register for spilled source in '", "'", "regalloc: no free register for spilled source")};
+                    }
+                    claimed[claimed_count] = tmp;
+                    claimed_count          = claimed_count + 1;
+                    val er: err[fail.Fail] = emit_reload(ctx, dst, wp, lang_mir.preg_id(tmp), v, mi.loc, mi.inline_site);
+                    if (sel er.err) {
+                        free_ops(ctx, ops, n);
+                        ret er;
+                    }
+                    ops[k] = lang_mir.op_preg_of(lang_mir.preg_id(tmp), v);
+                }
+                or {
+                    ops[k] = preg_of(ctx, v);
+                }
+            }
+        }
+        or (op.kind == lang_mir.MIR_OP_MEM) {
+            if (!lang_mir.vreg_is_nil(op.vreg)) {
+                val v: lang_mir.VRegId = op.vreg;
+                if (regalloc_context.is_storage_slot(ctx, v)) {}
+                or (regalloc_context.is_spilled(ctx, v)) {
+                    val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, is_entry, src_pos);
+                    if (tmp < 0) {
+                        free_ops(ctx, ops, n);
+                        ret err[fail.Fail].err{regalloc_context.fail_for(ctx, "regalloc: no free register for spilled MEM base in '", "'", "regalloc: no free register for spilled MEM base")};
+                    }
+                    claimed[claimed_count] = tmp;
+                    claimed_count          = claimed_count + 1;
+                    val er: err[fail.Fail] = emit_reload(ctx, dst, wp, lang_mir.preg_id(tmp), v, mi.loc, mi.inline_site);
+                    if (sel er.err) {
+                        free_ops(ctx, ops, n);
+                        ret er;
+                    }
+                    ops[k].vreg = lang_mir.MIR_VREG_NIL;
+                    ops[k].preg = lang_mir.preg_id(tmp);
+                }
+                or {
+                    ops[k].vreg = lang_mir.MIR_VREG_NIL;
+                    ops[k].preg = assigned_preg(ctx, v);
+                }
+            }
+            var iv: lang_mir.VRegId = lang_mir.MIR_VREG_NIL;
+            if (sel ops[k].index.vreg) { iv = ops[k].index.vreg; }
+            if (!lang_mir.vreg_is_nil(iv)) {
+                if (regalloc_context.is_spilled(ctx, iv)) {
+                    val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, is_entry, src_pos);
+                    if (tmp < 0) {
+                        free_ops(ctx, ops, n);
+                        ret err[fail.Fail].err{regalloc_context.fail_for(ctx, "regalloc: no free register for spilled MEM index in '", "'", "regalloc: no free register for spilled MEM index")};
+                    }
+                    claimed[claimed_count] = tmp;
+                    claimed_count          = claimed_count + 1;
+                    val er: err[fail.Fail] = emit_reload(ctx, dst, wp, lang_mir.preg_id(tmp), iv, mi.loc, mi.inline_site);
+                    if (sel er.err) {
+                        free_ops(ctx, ops, n);
+                        ret er;
+                    }
+                    ops[k].index = lang_mir.index_preg(lang_mir.preg_id(tmp));
+                }
+                or {
+                    ops[k].index = lang_mir.index_preg(assigned_preg(ctx, iv));
+                }
+            }
+        }
+        ops[k].required_bank = mi.operands[k].required_bank;
+        k                    = k + 1;
+    }
+
+    if (lang_mir.vreg_is_nil(store_dst_vreg)
+        && mi.width >= ctx.spill_width
+        && coalesce.instr_is_reg_copy(tgt, mi)
+        && ops[0].kind == lang_mir.MIR_OP_PREG && ops[1].kind == lang_mir.MIR_OP_PREG
+        && lang_mir.preg_same(ops[0].preg, ops[1].preg)
+        && operand_bank_matches(?ops[0]) && operand_bank_matches(?ops[1])) {
+        # a declassify keeps a zero-byte marker: the barrier must reach the
+        # stream even when the move it selected to is a self-copy
+        if (lang_mir.instr_declassifies(mi)) {
+            dst[@wp] = lang_mir.declassify_marker(mi, ops[0].vreg);
+            @wp      = @wp + 1;
+            free_ops(ctx, ops, n);
+            if (mi.operands != nil && mi.operand_count > 0) {
+                A.deallocate[lang_mir.MirOperand](ctx.alloc, mi.operands, mi.operand_count::usize);
+            }
+            ret err[fail.Fail].ok{};
+        }
+        free_ops(ctx, ops, n);
+        if (mi.dbg_binding_count > 0) {
+            dst[@wp].opcode            = isa.ISA_USE::lang_mir.MirOpcode;
+            dst[@wp].width             = mi.width;
+            dst[@wp].src_width         = mi.src_width;
+            dst[@wp].loc               = mi.loc;
+            dst[@wp].inline_site       = mi.inline_site;
+            dst[@wp].dbg_bindings      = mi.dbg_bindings;
+            dst[@wp].dbg_binding_count = mi.dbg_binding_count;
+            @wp                        = @wp + 1;
+        }
+        if (mi.operands != nil && mi.operand_count > 0) {
+            A.deallocate[lang_mir.MirOperand](ctx.alloc, mi.operands, mi.operand_count::usize);
+        }
+        ret err[fail.Fail].ok{};
+    }
+
+    dst[@wp] = lang_mir.instr_like(mi, ops, n);
+    @wp      = @wp + 1;
+
+    if (mi.operands != nil && mi.operand_count > 0) {
+        A.deallocate[lang_mir.MirOperand](ctx.alloc, mi.operands, mi.operand_count::usize);
+    }
+
+    if (!lang_mir.vreg_is_nil(store_dst_vreg)) {
+        ret emit_def_store(ctx, dst, wp, store_dst_vreg, lang_mir.preg_id(store_dst_tmp));
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the register an operand reads from after rewrite, or -1 when it is not a
+# register the allocator placed (spilled, a slot, an immediate, an address)
+fun operand_register(ctx: *regalloc_context.Context, op: *lang_mir.MirOperand) i32 {
+    if (op.kind == lang_mir.MIR_OP_PREG)                                            { ret lang_mir.preg_regid(op.preg); }
+    if (op.kind != lang_mir.MIR_OP_VREG)                                            { ret -1; }
+    if (op.vreg.n >= ctx.f.vreg_count || regalloc_context.is_spilled(ctx, op.vreg)) { ret -1; }
+    val a: lang_mir.PRegId = ctx.f.vregs[op.vreg.n].assigned;
+    if (lang_mir.preg_is_nil(a)) { ret -1; }
+    ret lang_mir.preg_regid(a);
+}
+
+# the register of an operand whose value dies at `pos`, free for the op to
+# write once it has been read
+fun dying_register(ctx: *regalloc_context.Context, op: *lang_mir.MirOperand, d: lang_mir.VRegId, pos: u32) i32 {
+    if (op.kind != lang_mir.MIR_OP_VREG || lang_mir.vreg_same(op.vreg, d)) { ret -1; }
+    if (op.vreg.n >= ctx.f.vreg_count)                                     { ret -1; }
+    if (!liveness.dies_at(ctx, op.vreg.n, pos::i64))                       { ret -1; }
+    ret operand_register(ctx, op);
+}
+
+fun swap_operands(mi: *lang_mir.MirInstr, a: u32, b: u32) {
+    val t: lang_mir.MirOperand = mi.operands[a];
+    mi.operands[a] = mi.operands[b];
+    mi.operands[b] = t;
+}
+
+# a two-address op writes its destination before it reads the right operand,
+# so a commutative op whose right operand is the destination reads it first
+fun commute_onto_destination(ctx: *regalloc_context.Context, mi: *lang_mir.MirInstr) {
+    if (commute_wanted(ctx, mi)) { swap_operands(mi, 1, 2); }
+}
+
+fun commute_wanted(ctx: *regalloc_context.Context, mi: *lang_mir.MirInstr) bool {
+    if (!liveness.is_two_address_op(mi.opcode) || !lang_mir.has(mi.opcode, lang_mir.MIRF_COMMUTATIVE)) { ret false; }
+    if (mi.operand_count != 3)                                                                         { ret false; }
+    val d: *lang_mir.MirOperand = ?mi.operands[0];
+    val l: *lang_mir.MirOperand = ?mi.operands[1];
+    val r: *lang_mir.MirOperand = ?mi.operands[2];
+    if (d.kind == lang_mir.MIR_OP_VREG && r.kind == lang_mir.MIR_OP_VREG && lang_mir.vreg_same(d.vreg, r.vreg)) {
+        ret !(l.kind == lang_mir.MIR_OP_VREG && lang_mir.vreg_same(d.vreg, l.vreg));
+    }
+    val dr: i32 = operand_register(ctx, d);
+    ret dr >= 0 && operand_register(ctx, r) == dr && operand_register(ctx, l) != dr;
+}
+
+fun scalar_gp_vreg(ctx: *regalloc_context.Context, op: *lang_mir.MirOperand) bool {
+    if (op.kind != lang_mir.MIR_OP_VREG)           { ret false; }
+    if (op.vreg.n >= ctx.f.vreg_count)             { ret false; }
+    if (regalloc_context.is_fp_vreg(ctx, op.vreg)) { ret false; }
+    if (ctx.f.vregs[op.vreg.n].vec_bytes != 0)     { ret false; }
+    ret !regalloc_context.vreg_has_slot(ctx, op.vreg);
+}
+
+fun two_address_candidate(ctx: *regalloc_context.Context, mi: *lang_mir.MirInstr) bool {
+    if (!liveness.is_two_address_op(mi.opcode))                              { ret false; }
+    if (mi.operand_count < 2 || mi.operand_count > 3 || mi.asm_block != nil) { ret false; }
+    if (lang_mir.vec_lane_is_vector(mi.vec_lane))                            { ret false; }
+    if (mi.width > ctx.spill_width)                                          { ret false; }
+    if (!scalar_gp_vreg(ctx, ?mi.operands[0]))                               { ret false; }
+    val l: *lang_mir.MirOperand = ?mi.operands[1];
+    if (l.kind != lang_mir.MIR_OP_IMM && !scalar_gp_vreg(ctx, l)) { ret false; }
+    if (mi.operand_count == 2)                                    { ret true; }
+    val r: *lang_mir.MirOperand = ?mi.operands[2];
+    if (r.kind == lang_mir.MIR_OP_VREG) {
+        if (!scalar_gp_vreg(ctx, r))                         { ret false; }
+        if (lang_mir.vreg_same(r.vreg, mi.operands[0].vreg)) { ret false; }
+    }
+    or (r.kind != lang_mir.MIR_OP_IMM && r.kind != lang_mir.MIR_OP_PREG) { ret false; }
+    ret true;
+}
+
+# `d = l op r` (or `d = op l`) runs as `w = l; w op= r`, so the work register
+# w is chosen first: the destination's own register, or for a spilled
+# destination the register of an operand dying here, and a spilled left
+# operand is reloaded straight into w instead of through a scratch and a copy
+fun rewrite_two_address(tgt: *lang_target.Binding, ctx: *regalloc_context.Context, mi: *lang_mir.MirInstr, dst: *lang_mir.MirInstr, wp: *u32,
+    is_entry: bool, src_pos: u32) err[fail.Fail] {
+    val dv:        lang_mir.VRegId      = mi.operands[0].vreg;
+    val d_spilled: bool                 = regalloc_context.is_spilled(ctx, dv);
+    val n:         u32                  = mi.operand_count;
+    var absent:    lang_mir.MirOperand  = lang_mir.op_imm(0);
+    var right:     *lang_mir.MirOperand = ?absent;
+    if (n == 3) { right = ?mi.operands[2]; }
+
+    var swap: bool = false;
+    var work: i32  = two_address_work(ctx, mi, src_pos, ?swap);
+    if (swap) { swap_operands(mi, 1, 2); }
+
+    var claimed:       [4]i32;
+    var claimed_count: u32 = 0;
+    var ci:            u32 = 0;
+    for (ci < 4) {
+        claimed[ci] = -1;
+        ci          = ci + 1;
+    }
+    if (work < 0) {
+        work = reload_temp(ctx, ?claimed[0], claimed_count, is_entry, src_pos);
+        if (work < 0) {
+            ret err[fail.Fail].err{regalloc_context.fail_for(ctx, "regalloc: no free register for spilled destination in '", "'", "regalloc: no free register for spilled destination")};
+        }
+    }
+    claimed[claimed_count] = work;
+    claimed_count          = claimed_count + 1;
+
+    val ro: res[*lang_mir.MirOperand, A.Error] = A.allocate[lang_mir.MirOperand](ctx.alloc, n::usize);
+    if (sel ro.err) { ret err[fail.Fail].err{fail.refused(ro.err)}; }
+    val ops: *lang_mir.MirOperand = ro.ok;
+    val l:   *lang_mir.MirOperand = ?mi.operands[1];
+    val r:   *lang_mir.MirOperand = right;
+    ops[0] = lang_mir.op_preg_of(lang_mir.preg_id(work), dv);
+
+    var lhs_reg: i32 = -1;
+    if (l.kind == lang_mir.MIR_OP_VREG && regalloc_context.is_spilled(ctx, l.vreg)) {
+        if (operand_register(ctx, r) != work) {
+            lhs_reg = work;
+        }
+        or {
+            lhs_reg = reload_temp(ctx, ?claimed[0], claimed_count, is_entry, src_pos);
+            if (lhs_reg < 0) {
+                free_ops(ctx, ops, n);
+                ret err[fail.Fail].err{regalloc_context.fail_for(ctx, "regalloc: no free register for spilled source in '", "'", "regalloc: no free register for spilled source")};
+            }
+            claimed[claimed_count] = lhs_reg;
+            claimed_count          = claimed_count + 1;
+        }
+        val er: err[fail.Fail] = emit_reload(ctx, dst, wp, lang_mir.preg_id(lhs_reg), l.vreg, mi.loc, mi.inline_site);
+        if (sel er.err) {
+            free_ops(ctx, ops, n);
+            ret er;
+        }
+        ops[1] = lang_mir.op_preg_of(lang_mir.preg_id(lhs_reg), l.vreg);
+    }
+    or (l.kind == lang_mir.MIR_OP_VREG) {
+        ops[1] = preg_of(ctx, l.vreg);
+    }
+    or {
+        ops[1] = @l;
+    }
+
+    if (n == 3) {
+        if (r.kind == lang_mir.MIR_OP_VREG && regalloc_context.is_spilled(ctx, r.vreg)) {
+            if (lhs_reg >= 0 && lang_mir.vreg_same(l.vreg, r.vreg)) {
+                ops[2] = lang_mir.op_preg_of(lang_mir.preg_id(lhs_reg), r.vreg);
+            }
+            or (reads_slot_source(tgt, mi)) {
+                ops[2] = lang_mir.op_mem_slot(r.vreg, 0);
+            }
+            or {
+                val tmp: i32 = reload_temp(ctx, ?claimed[0], claimed_count, is_entry, src_pos);
+                if (tmp < 0) {
+                    free_ops(ctx, ops, n);
+                    ret err[fail.Fail].err{regalloc_context.fail_for(ctx, "regalloc: no free register for spilled source in '", "'", "regalloc: no free register for spilled source")};
+                }
+                claimed[claimed_count] = tmp;
+                claimed_count          = claimed_count + 1;
+                val er: err[fail.Fail] = emit_reload(ctx, dst, wp, lang_mir.preg_id(tmp), r.vreg, mi.loc, mi.inline_site);
+                if (sel er.err) {
+                    free_ops(ctx, ops, n);
+                    ret er;
+                }
+                ops[2] = lang_mir.op_preg_of(lang_mir.preg_id(tmp), r.vreg);
+            }
+        }
+        or (r.kind == lang_mir.MIR_OP_VREG) {
+            ops[2] = preg_of(ctx, r.vreg);
+        }
+        or {
+            ops[2] = @r;
+        }
+    }
+
+    var k: u32 = 0;
+    for (k < n) {
+        ops[k].required_bank = mi.operands[k].required_bank;
+        k                    = k + 1;
+    }
+    dst[@wp] = lang_mir.instr_like(mi, ops, n);
+    @wp      = @wp + 1;
+    A.deallocate[lang_mir.MirOperand](ctx.alloc, mi.operands, mi.operand_count::usize);
+
+    if (d_spilled) {
+        ret emit_def_store(ctx, dst, wp, dv, lang_mir.preg_id(work));
+    }
+    ret err[fail.Fail].ok{};
+}
+
+# the register `d = l op r` computes in without taking a reload register:
+# the destination's own, or for a spilled destination the register of an
+# operand dying here; swap says it is the right operand's, which a
+# commutative op then reads as its left. -1 when a reload register is needed
+fun two_address_work(ctx: *regalloc_context.Context, mi: *lang_mir.MirInstr, pos: u32, swap: *bool) i32 {
+    @swap = false;
+    val dv: lang_mir.VRegId = mi.operands[0].vreg;
+    if (!regalloc_context.is_spilled(ctx, dv)) { ret lang_mir.preg_regid(assigned_preg(ctx, dv)); }
+    var absent: lang_mir.MirOperand  = lang_mir.op_imm(0);
+    var right:  *lang_mir.MirOperand = ?absent;
+    if (mi.operand_count == 3) { right = ?mi.operands[2]; }
+    val lreg: i32 = dying_register(ctx, ?mi.operands[1], dv, pos);
+    val rreg: i32 = dying_register(ctx, right, dv, pos);
+    if (lreg >= 0 && operand_register(ctx, right) != lreg) { ret lreg; }
+    if (lang_mir.has(mi.opcode, lang_mir.MIRF_COMMUTATIVE) && rreg >= 0 && operand_register(ctx, ?mi.operands[1]) != rreg) {
+        @swap = true;
+        ret rreg;
+    }
+    ret -1;
+}
+
+# a selected op reads one spilled source operand straight from its slot when
+# the target reads slots at the op's width
+fun reads_slot_source(tgt: *lang_target.Binding, mi: *lang_mir.MirInstr) bool {
+    if (!lang_mir.has(mi.opcode, lang_mir.MIRF_SLOT_SOURCE)) { ret false; }
+    ret target_model.reads_slot_operand(?tgt.target.model, mi.width::u32);
+}
+
+# the first spilled source operand, read from its slot; the destination is
+# never one, and RANGE_NIL when no source is spilled
+pub fun slot_source_index(tgt: *lang_target.Binding, ctx: *regalloc_context.Context, mi: *lang_mir.MirInstr, has_def: bool) u32 {
+    if (!reads_slot_source(tgt, mi)) { ret regalloc_context.RANGE_NIL; }
+    var k: u32 = 0;
+    for (k < mi.operand_count) {
+        val op: *lang_mir.MirOperand = ?mi.operands[k];
+        if (scalar_gp_vreg(ctx, op) && regalloc_context.is_spilled(ctx, op.vreg)) {
+            if (!(has_def && lang_mir.vreg_same(op.vreg, mi.operands[0].vreg))) { ret k; }
+        }
+        k = k + 1;
+    }
+    ret regalloc_context.RANGE_NIL;
+}
+
+fun spilled_copy_candidate(tgt: *lang_target.Binding, ctx: *regalloc_context.Context, mi: *lang_mir.MirInstr) bool {
+    if (!coalesce.instr_is_reg_copy(tgt, mi)) { ret false; }
+    if (mi.width != ctx.spill_width)          { ret false; }
+    if (lang_mir.instr_declassifies(mi))      { ret false; }
+    val d: *lang_mir.MirOperand = ?mi.operands[0];
+    val s: *lang_mir.MirOperand = ?mi.operands[1];
+    if (!scalar_gp_vreg(ctx, d) || !scalar_gp_vreg(ctx, s)) { ret false; }
+    if (lang_mir.vreg_same(d.vreg, s.vreg))                 { ret false; }
+    ret regalloc_context.is_spilled(ctx, d.vreg) || regalloc_context.is_spilled(ctx, s.vreg);
+}
+
+# a copy with a spilled side is itself the load or the store, and a copy
+# between two spilled values is one load and one store
+fun rewrite_spilled_copy(ctx: *regalloc_context.Context, mi: *lang_mir.MirInstr, dst: *lang_mir.MirInstr, wp: *u32,
+    is_entry: bool, src_pos: u32) err[fail.Fail] {
+    val dv: lang_mir.VRegId = mi.operands[0].vreg;
+    val sv: lang_mir.VRegId = mi.operands[1].vreg;
+
+    var store_tmp: i32 = -1;
+    if (regalloc_context.is_spilled(ctx, dv) && regalloc_context.is_spilled(ctx, sv)) {
+        var none: i32 = -1;
+        store_tmp = reload_temp(ctx, ?none, 0, is_entry, src_pos);
+        if (store_tmp < 0) {
+            ret err[fail.Fail].err{regalloc_context.fail_for(ctx, "regalloc: no free register for spilled destination in '", "'", "regalloc: no free register for spilled destination")};
+        }
+    }
+
+    val ro: res[*lang_mir.MirOperand, A.Error] = A.allocate[lang_mir.MirOperand](ctx.alloc, 2::usize);
+    if (sel ro.err) { ret err[fail.Fail].err{fail.refused(ro.err)}; }
+    val ops: *lang_mir.MirOperand = ro.ok;
+    if (store_tmp >= 0) {
+        ops[0]               = lang_mir.op_preg_of(lang_mir.preg_id(store_tmp), dv);
+        ops[0].required_bank = lang_mir.BANK_GP;
+        ops[1]               = lang_mir.op_mem_slot(sv, 0);
+    }
+    or (regalloc_context.is_spilled(ctx, dv)) {
+        ops[0]               = lang_mir.op_mem_slot(dv, 0);
+        ops[1]               = preg_of(ctx, sv);
+        ops[1].required_bank = mi.operands[1].required_bank;
+    }
+    or {
+        ops[0]               = preg_of(ctx, dv);
+        ops[0].required_bank = mi.operands[0].required_bank;
+        ops[1]               = lang_mir.op_mem_slot(sv, 0);
+    }
+    dst[@wp]        = lang_mir.instr_like(mi, ops, 2);
+    dst[@wp].opcode = lang_mir.MIR_MOV;
+    @wp             = @wp + 1;
+    A.deallocate[lang_mir.MirOperand](ctx.alloc, mi.operands, mi.operand_count::usize);
+
+    if (store_tmp >= 0) {
+        ret emit_def_store(ctx, dst, wp, dv, lang_mir.preg_id(store_tmp));
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun instr_defines_ops(mi: *lang_mir.MirInstr, ops: *lang_mir.MirOperand, n: u32) bool {
+    if (n == 0)                            { ret false; }
+    if (!lang_mir.instr_defines_shape(mi)) { ret false; }
+    ret ops[0].kind == lang_mir.MIR_OP_VREG;
+}
+
+# the rewritten operand keeps its origin vreg as provenance: the seed the
+# physical secrecy walk reads at the instruction the notification names
+fun preg_of(ctx: *regalloc_context.Context, v: lang_mir.VRegId) lang_mir.MirOperand {
+    ret lang_mir.op_preg_of(assigned_preg(ctx, v), v);
+}
+
+fun assigned_preg(ctx: *regalloc_context.Context, v: lang_mir.VRegId) lang_mir.PRegId {
+    if (v.n >= ctx.f.vreg_count) {
+        regalloc_context.defect_note(ctx, "regalloc: operand vreg id out of range during rewrite");
+        ret lang_mir.MIR_PREG_NIL;
+    }
+    val a: lang_mir.PRegId = ctx.f.vregs[v.n].assigned;
+    if (lang_mir.preg_is_nil(a)) { regalloc_context.defect_note(ctx, "regalloc: unassigned vreg reached instruction rewrite"); }
+    ret a;
+}
+
+fun reload_temp(ctx: *regalloc_context.Context, claimed: *i32, claimed_count: u32,
+    is_entry: bool, src_pos: u32) i32 {
+    var i: i32 = 0;
+    for (i < ctx.reload_scratch_count) {
+        val id: i32 = ctx.reload_scratch[i].id;
+        if (!id_claimed(claimed, claimed_count, id) && scratch_usable(ctx, id, is_entry, src_pos)) { ret id; }
+        i = i + 1;
+    }
+    ret borrow_reload_register(ctx, claimed, claimed_count, src_pos);
+}
+
+fun id_claimed(claimed: *i32, count: u32, id: i32) bool {
+    var i: u32 = 0;
+    for (i < count) {
+        if (claimed[i] == id) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun emit_reload(ctx: *regalloc_context.Context, dst: *lang_mir.MirInstr, wp: *u32, tmp: lang_mir.PRegId, v: lang_mir.VRegId, loc: lang_source.Location, inline_site: u32) err[fail.Fail] {
+    if (isa_inst.regid_class(lang_mir.preg_regid(tmp)) != isa_inst.REG_CLASS_ID_GP) {
+        ret err[fail.Fail].err{fail.message("regalloc: spill transport requires a general-bank scratch register")};
+    }
+    val ro: res[*lang_mir.MirOperand, A.Error] = A.allocate[lang_mir.MirOperand](ctx.alloc, 2::usize);
+    if (sel ro.err) { ret err[fail.Fail].err{fail.refused(ro.err)}; }
+    val ops: *lang_mir.MirOperand = ro.ok;
+    ops[0]                 = lang_mir.op_preg_of(tmp, v);
+    ops[0].required_bank   = lang_mir.BANK_GP;
+    ops[1]                 = lang_mir.op_mem_slot(v, 0);
+    dst[@wp].opcode        = lang_mir.MIR_MOV;
+    dst[@wp].operands      = ops;
+    dst[@wp].operand_count = 2;
+    dst[@wp].width         = ctx.spill_width;
+    dst[@wp].src_width     = ctx.spill_width;
+    dst[@wp].loc           = loc;
+    dst[@wp].inline_site   = inline_site;
+    @wp                    = @wp + 1;
+    ret err[fail.Fail].ok{};
+}
+
+# the rewritten def at dst[wp - 1] wrote a spilled value's scratch register;
+# the store after it puts the value in its slot, the value's home, so the
+# bindings the def published at its end are published at the store's end
+fun emit_def_store(ctx: *regalloc_context.Context, dst: *lang_mir.MirInstr, wp: *u32, v: lang_mir.VRegId, tmp: lang_mir.PRegId) err[fail.Fail] {
+    val def: *lang_mir.MirInstr = ?dst[@wp - 1];
+    val sr:  err[fail.Fail]     = emit_store(ctx, dst, wp, v, tmp, def.loc, def.inline_site);
+    if (sel sr.err) { ret sr; }
+    ret lang_mir.instr_move_end_dbg(ctx.alloc, ?dst[@wp - 2], ?dst[@wp - 1]);
+}
+
+fun emit_store(ctx: *regalloc_context.Context, dst: *lang_mir.MirInstr, wp: *u32, v: lang_mir.VRegId, tmp: lang_mir.PRegId, loc: lang_source.Location, inline_site: u32) err[fail.Fail] {
+    if (isa_inst.regid_class(lang_mir.preg_regid(tmp)) != isa_inst.REG_CLASS_ID_GP) {
+        ret err[fail.Fail].err{fail.message("regalloc: spill transport requires a general-bank scratch register")};
+    }
+    val ro: res[*lang_mir.MirOperand, A.Error] = A.allocate[lang_mir.MirOperand](ctx.alloc, 2::usize);
+    if (sel ro.err) { ret err[fail.Fail].err{fail.refused(ro.err)}; }
+    val ops: *lang_mir.MirOperand = ro.ok;
+    ops[0]                 = lang_mir.op_mem_slot(v, 0);
+    ops[1]                 = lang_mir.op_preg_of(tmp, v);
+    ops[1].required_bank   = lang_mir.BANK_GP;
+    dst[@wp].opcode        = lang_mir.MIR_MOV;
+    dst[@wp].operands      = ops;
+    dst[@wp].operand_count = 2;
+    dst[@wp].width         = ctx.spill_width;
+    dst[@wp].src_width     = ctx.spill_width;
+    dst[@wp].loc           = loc;
+    dst[@wp].inline_site   = inline_site;
+    @wp                    = @wp + 1;
+    ret err[fail.Fail].ok{};
+}
+
+fun free_ops(ctx: *regalloc_context.Context, ops: *lang_mir.MirOperand, n: u32) {
+    if (ops != nil && n > 0) {
+        A.deallocate[lang_mir.MirOperand](ctx.alloc, ops, n::usize);
+    }
+}
+
+test instr_defines__a_fused_branch_defines_nothing {
+    var ops: [4]lang_mir.MirOperand;
+    ops[0] = lang_mir.op_vreg(lang_mir.vreg_id(3));
+    ops[1] = lang_mir.op_vreg(lang_mir.vreg_id(4));
+    ops[2] = lang_mir.op_block(1);
+    ops[3] = lang_mir.op_block(2);
+
+    var fused: lang_mir.MirInstr = lang_mir.instr(lang_mir.MIR_SEL_CBR_LT_S, ?ops[0], 4, 0, 0);
+
+    if (liveness.instr_defines(?fused))        { ret 1; }
+    if (instr_defines_ops(?fused, ?ops[0], 4)) { ret 1; }
+    if (lang_mir.instr_defines_shape(?fused))  { ret 1; }
+
+    ops[1] = lang_mir.op_imm(0);
+    if (liveness.instr_defines(?fused)) { ret 1; }
+
+    ops[0] = lang_mir.op_preg(lang_mir.preg_id(7));
+    if (regalloc_scan.instr_defines_preg(?fused)) { ret 1; }
+
+    var cmp_ops: [3]lang_mir.MirOperand;
+    cmp_ops[0] = lang_mir.op_vreg(lang_mir.vreg_id(5));
+    cmp_ops[1] = lang_mir.op_vreg(lang_mir.vreg_id(3));
+    cmp_ops[2] = lang_mir.op_vreg(lang_mir.vreg_id(4));
+    var cmp: lang_mir.MirInstr = lang_mir.instr(lang_mir.MIR_SEL_CMP_LT_S, ?cmp_ops[0], 3, 0, 0);
+    if (!liveness.instr_defines(?cmp)) { ret 1; }
+    ret 0;
+}
+
+# a store addressed through two spilled values needs two reload registers
+# on a machine that reserves one, over a pool of two registers: v2 and v3
+# live across it with the given weights, held flags whether each holds its
+# register, and what is left is checked through the borrow the rewrite takes
+#[testing]
+fun t_reload_guarantee_case(w2: i64, held2: bool, w3: i64) i32 {
+    var t: regalloc_context.TScan;
+    if (!regalloc_context.t_scan_init(?t)) { ret 1; }
+    fin { regalloc_context.t_scan_dnit(?t); }
+    t.ctx.gp_count = 2;
+    regalloc_context.t_scan_value(?t, 0, 0, 1);
+    regalloc_context.t_scan_value(?t, 0, 0, 1);
+    regalloc_context.t_scan_value(?t, 0, 1, w2);
+    regalloc_context.t_scan_value(?t, 0, 1, w3);
+    t.spilled[0] = true;
+    t.spilled[1] = true;
+    if (held2) { t.vregs[2].assigned = lang_mir.preg_id(0); }
+    or         { t.spilled[2] = true; }
+    t.vregs[3].assigned = lang_mir.preg_id(1);
+
+    var ops: [2]lang_mir.MirOperand;
+    ops[0]       = lang_mir.op_mem_value(lang_mir.vreg_id(0), 0);
+    ops[0].index = lang_mir.index_vreg(lang_mir.vreg_id(1));
+    ops[1]       = lang_mir.op_imm(0);
+    var instrs: [2]lang_mir.MirInstr;
+    instrs[0]           = lang_mir.instr(lang_mir.MIR_STORE, ?ops[0], 2, 8, 8);
+    instrs[1]           = lang_mir.instr(lang_mir.MIR_RET, nil, 0, 0, 0);
+    instrs[0].asm_block = nil;
+    instrs[1].asm_block = nil;
+    var blocks: [1]lang_mir.MirBlock;
+    blocks[0].id          = 0;
+    blocks[0].instrs      = ?instrs[0];
+    blocks[0].instr_count = 2;
+    blocks[0].instr_cap   = 2;
+    t.f.blocks            = ?blocks[0];
+    t.f.block_count       = 1;
+    var flat: [2]regalloc_context.FlatInstr;
+    var p:    u32 = 0;
+    for (p < 2) {
+        flat[p].block   = 0;
+        flat[p].instr   = p;
+        flat[p].is_call = false;
+        p               = p + 1;
+    }
+    var scratch: [1]target_model.Register;
+    scratch[0].id              = 2;
+    scratch[0].size            = 8;
+    t.ctx.flat                 = ?flat[0];
+    t.ctx.flat_count           = 2;
+    t.ctx.arg_res_count        = 0;
+    t.ctx.def_res_count        = 0;
+    t.ctx.reload_scratch       = ?scratch[0];
+    t.ctx.reload_scratch_count = 1;
+    t.ctx.spill_order_count    = 0;
+
+    val r: err[fail.Fail] = guarantee_reload_registers(?t.tgt, ?t.ctx);
+    fin { regalloc_context.tight_tables_dnit(?t.ctx); }
+    if (sel r.err)              { ret 2; }
+    if (t.ctx.tight_count != 1) { ret 3; }
+    var claimed: [1]i32 = [1]i32{2};
+    val b:       i32    = borrow_reload_register(?t.ctx, ?claimed[0], 1, 0);
+    if (b < 0)                 { ret 4; }
+    if (t.spilled[3])          { ret 20 + isa_inst.regid_index(b); }
+    if (held2 && t.spilled[2]) { ret 10 + isa_inst.regid_index(b); }
+    ret isa_inst.regid_index(b);
+}
+
+# the reserved register carries one reload and a free pool register the
+# other; with both pool registers held the sparser holder goes to the stack
+# and its register carries the reload
+test guarantee_reload_registers__a_second_reload {
+    if (t_reload_guarantee_case(1, false, 100) != 0) { ret 1; }
+    if (t_reload_guarantee_case(1, true, 100) != 10) { ret 2; }
+    if (t_reload_guarantee_case(100, true, 1) != 21) { ret 3; }
+    ret 0;
+}
+
+#[testing]
+fun t_spilled_update(mode: u32) i32 {
+    var backing: A.Allocator;
+    val make_r:  err[A.Error] = page.make(?backing);
+    if (sel make_r.err) { ret 1; }
+    var scratch_arena: arena.Arena;
+    val init_r:        err[A.Error] = arena.init(?scratch_arena, ?backing, 65536);
+    if (sel init_r.err) { ret 1; }
+    fin { arena.dnit(?scratch_arena); }
+    var alloc:   A.Allocator;
+    val make_r2: err[A.Error] = arena.make(?alloc, ?scratch_arena);
+    if (sel make_r2.err) { ret 1; }
+    var vregs: [1]lang_mir.MirVReg;
+    vregs[0]            = lang_mir.vreg(0, regalloc_context.REG_CLASS_GP, 0, false);
+    vregs[0].spill_slot = 0;
+    var f: lang_mir.MirFunction;
+    f.vregs      = ?vregs[0];
+    f.vreg_count = 1;
+    var scratch: [1]target_model.Register;
+    scratch[0].id = 0;
+    var spilled: [2]bool = [2]bool{true, false};
+    var ctx:     regalloc_context.Context;
+    ctx.alloc                = ?alloc;
+    ctx.f                    = ?f;
+    ctx.spill_width          = 8;
+    ctx.spilled              = ?spilled[0];
+    ctx.reload_scratch       = ?scratch[0];
+    ctx.reload_scratch_count = 1;
+    ctx.tight_count          = 0;
+    ctx.borrowed_gp          = 0;
+    var tgt:   lang_target.Binding;
+    val count: u32                                = 3;
+    val ar:    res[*lang_mir.MirOperand, A.Error] = A.allocate[lang_mir.MirOperand](?alloc, count::usize);
+    if (sel ar.err) { ret 1; }
+    val ops: *lang_mir.MirOperand = ar.ok;
+    ops[0] = lang_mir.op_vreg(lang_mir.vreg_id(0));
+    ops[1] = lang_mir.op_vreg(lang_mir.vreg_id(0));
+    ops[2] = lang_mir.op_imm(8);
+    var mi: lang_mir.MirInstr = lang_mir.instr(lang_mir.MIR_SUB, ops, count, 8, 8);
+    if (mode == 1) {
+        mi.opcode = lang_mir.MIR_ADD;
+        ops[2]    = lang_mir.op_vreg(lang_mir.vreg_id(0));
+    }
+    or (mode == 2) {
+        ops[1] = lang_mir.op_imm(100);
+    }
+    val capture_operand_banks_r: err[fail.Fail] = isa_rules.capture_operand_banks(?f, ?mi);
+    if (sel capture_operand_banks_r.err) { ret 8; }
+    var dst:     [5]lang_mir.MirInstr;
+    var written: u32 = 0;
+    fin {
+        var i: u32 = 0;
+        for (i < written) {
+            free_ops(?ctx, dst[i].operands, dst[i].operand_count);
+            i = i + 1;
+        }
+    }
+    val wrong_scratch: lang_mir.PRegId = lang_mir.preg_id(isa_inst.regid_make(isa_inst.REG_CLASS_ID_FP, 0));
+    val emit_reload_r: err[fail.Fail]  = emit_reload(?ctx, ?dst[0], ?written, wrong_scratch, lang_mir.vreg_id(0), mi.loc, 0);
+    if (sel emit_reload_r.ok) {
+        free_ops(?ctx, ops, count);
+        ret 9;
+    }
+    val emit_store_r: err[fail.Fail] = emit_store(?ctx, ?dst[0], ?written, lang_mir.vreg_id(0), wrong_scratch, mi.loc, 0);
+    if (sel emit_store_r.ok) {
+        free_ops(?ctx, ops, count);
+        ret 9;
+    }
+    if (written != 0) {
+        free_ops(?ctx, ops, count);
+        ret 9;
+    }
+    val rr: err[fail.Fail] = rewrite_instr(?tgt, ?ctx, ?mi, ?dst[0], ?written, false, 0);
+    if (sel rr.err) { ret 2; }
+    var slot:   i64 = 40;
+    var reg:    i64 = 999;
+    var loads:  u32 = 0;
+    var stores: u32 = 0;
+    var i:      u32 = 0;
+    for (i < written) {
+        val ins: *lang_mir.MirInstr = ?dst[i];
+        var oi:  u32                = 0;
+        for (oi < ins.operand_count) {
+            if (ins.operands[oi].kind == lang_mir.MIR_OP_PREG && !operand_bank_matches(?ins.operands[oi])) { ret 8; }
+            oi = oi + 1;
+        }
+        val a: *lang_mir.MirOperand = ?ins.operands[0];
+        val b: *lang_mir.MirOperand = ?ins.operands[1];
+        if (ins.opcode == lang_mir.MIR_MOV) {
+            if (a.kind == lang_mir.MIR_OP_PREG && b.kind == lang_mir.MIR_OP_MEM && b.vreg.n == 0) {
+                reg   = slot;
+                loads = loads + 1;
+            }
+            or (a.kind == lang_mir.MIR_OP_MEM && a.vreg.n == 0 && b.kind == lang_mir.MIR_OP_PREG) {
+                slot   = reg;
+                stores = stores + 1;
+            }
+            or { ret 3; }
+        }
+        or {
+            val c: *lang_mir.MirOperand = ?ins.operands[2];
+            if (a.kind != lang_mir.MIR_OP_PREG || a.preg.n != 0) { ret 3; }
+            var left:  i64 = b.imm;
+            var right: i64 = c.imm;
+            if (b.kind == lang_mir.MIR_OP_PREG) {
+                if (!lang_mir.preg_same(b.preg, a.preg)) { ret 4; }
+                left = reg;
+            }
+            if (c.kind == lang_mir.MIR_OP_PREG) {
+                if (!lang_mir.preg_same(c.preg, a.preg)) { ret 4; }
+                right = reg;
+            }
+            if (ins.opcode == lang_mir.MIR_SUB) { reg = left - right; }
+            or (ins.opcode == lang_mir.MIR_ADD) { reg = left + right; }
+            or                                  { ret 3; }
+        }
+        i = i + 1;
+    }
+    var expected: i64 = 32;
+    if (mode == 1)        { expected = 80; }
+    or (mode == 2)        { expected = 92; }
+    if (slot != expected) { ret 5; }
+    if (stores != 1)      { ret 6; }
+    if (mode == 2) {
+        if (loads != 0 || written != 2) { ret 7; }
+    }
+    or {
+        if (loads != 1 || written != 3) { ret 8; }
+    }
+    ret 0;
+}
+
+# a spilled secret travels through a reload scratch and a slot keyed by its own vreg id; these are the
+# physical facts a post-allocation validator seeds from
+test rewrite_instr__a_spilled_secret_source_keeps_its_origin {
+    var backing: A.Allocator;
+    val make_r:  err[A.Error] = page.make(?backing);
+    if (sel make_r.err) { ret 1; }
+    var scratch_arena: arena.Arena;
+    val init_r:        err[A.Error] = arena.init(?scratch_arena, ?backing, 65536);
+    if (sel init_r.err) { ret 1; }
+    fin { arena.dnit(?scratch_arena); }
+    var alloc:   A.Allocator;
+    val make_r2: err[A.Error] = arena.make(?alloc, ?scratch_arena);
+    if (sel make_r2.err) { ret 1; }
+    var vregs: [2]lang_mir.MirVReg;
+    vregs[0]            = lang_mir.vreg(0, regalloc_context.REG_CLASS_GP, 0, true);
+    vregs[0].spill_slot = 0;
+    vregs[1]            = lang_mir.vreg(1, regalloc_context.REG_CLASS_GP, 0, false);
+    vregs[1].assigned   = lang_mir.preg_id(7);
+    var f: lang_mir.MirFunction;
+    f.vregs      = ?vregs[0];
+    f.vreg_count = 2;
+    var scratch: [1]target_model.Register;
+    scratch[0].id = 9;
+    var spilled: [2]bool = [2]bool{true, false};
+    var ctx:     regalloc_context.Context;
+    ctx.alloc                = ?alloc;
+    ctx.f                    = ?f;
+    ctx.spill_width          = 8;
+    ctx.spilled              = ?spilled[0];
+    ctx.reload_scratch       = ?scratch[0];
+    ctx.reload_scratch_count = 1;
+    ctx.tight_count          = 0;
+    ctx.borrowed_gp          = 0;
+    var tgt: lang_target.Binding;
+    val ar:  res[*lang_mir.MirOperand, A.Error] = A.allocate[lang_mir.MirOperand](?alloc, 3::usize);
+    if (sel ar.err) { ret 1; }
+    val ops: *lang_mir.MirOperand = ar.ok;
+    ops[0] = lang_mir.op_vreg(lang_mir.vreg_id(1));
+    ops[1] = lang_mir.op_vreg(lang_mir.vreg_id(1));
+    ops[2] = lang_mir.op_vreg(lang_mir.vreg_id(0));
+    var mi:                      lang_mir.MirInstr = lang_mir.instr(lang_mir.MIR_ADD, ops, 3, 8, 8);
+    val capture_operand_banks_r: err[fail.Fail]    = isa_rules.capture_operand_banks(?f, ?mi);
+    if (sel capture_operand_banks_r.err) { ret 2; }
+    var dst:     [4]lang_mir.MirInstr;
+    var written: u32 = 0;
+    fin {
+        var i: u32 = 0;
+        for (i < written) {
+            free_ops(?ctx, dst[i].operands, dst[i].operand_count);
+            i = i + 1;
+        }
+    }
+    val rewrite_instr_r: err[fail.Fail] = rewrite_instr(?tgt, ?ctx, ?mi, ?dst[0], ?written, false, 0);
+    if (sel rewrite_instr_r.err) { ret 3; }
+    if (written != 2)            { ret 4; }
+
+    # the reload: the scratch is a physical alias of the secret for one instruction
+    val reload: *lang_mir.MirInstr = ?dst[0];
+    if (reload.opcode != lang_mir.MIR_MOV || reload.operand_count != 2)                    { ret 5; }
+    if (reload.operands[0].kind != lang_mir.MIR_OP_PREG || reload.operands[0].preg.n != 9) { ret 6; }
+    if (reload.operands[1].kind != lang_mir.MIR_OP_MEM || reload.operands[1].vreg.n != 0)  { ret 7; }
+    if (!f.vregs[reload.operands[1].vreg.n].secret)                                        { ret 8; }
+
+    # the use reads the scratch, and the vreg seed survives rewriting untouched
+    val use: *lang_mir.MirInstr = ?dst[1];
+    if (use.opcode != lang_mir.MIR_ADD || use.operands[2].kind != lang_mir.MIR_OP_PREG || use.operands[2].preg.n != 9) { ret 9; }
+    if (!f.vregs[0].secret || f.vregs[1].secret)                                                                       { ret 10; }
+
+    # provenance: the scratch names the secret it aliases at both the reload
+    # and the use, and the assigned register names its public vreg
+    if (lang_mir.operand_origin(?reload.operands[0]).n != 0 || !lang_mir.operand_seed_secret(?f, ?reload.operands[0])) { ret 11; }
+    if (lang_mir.operand_origin(?reload.operands[1]).n != 0 || !lang_mir.operand_seed_secret(?f, ?reload.operands[1])) { ret 12; }
+    if (lang_mir.operand_origin(?use.operands[2]).n != 0 || !lang_mir.operand_seed_secret(?f, ?use.operands[2]))       { ret 13; }
+    if (lang_mir.operand_origin(?use.operands[0]).n != 1 || lang_mir.operand_seed_secret(?f, ?use.operands[0]))        { ret 14; }
+    if (lang_mir.operand_origin(?use.operands[1]).n != 1 || lang_mir.operand_seed_secret(?f, ?use.operands[1]))        { ret 15; }
+    ret 0;
+}
+
+# a spilled destination of an instruction that is not a copy stores through
+# the scratch, and the store names the vreg it homes as provenance on both
+# its register and its slot
+test rewrite_instr__a_spilled_secret_destination_keeps_its_origin {
+    var backing: A.Allocator;
+    val make_r:  err[A.Error] = page.make(?backing);
+    if (sel make_r.err) { ret 1; }
+    var scratch_arena: arena.Arena;
+    val init_r:        err[A.Error] = arena.init(?scratch_arena, ?backing, 65536);
+    if (sel init_r.err) { ret 1; }
+    fin { arena.dnit(?scratch_arena); }
+    var alloc:   A.Allocator;
+    val make_r2: err[A.Error] = arena.make(?alloc, ?scratch_arena);
+    if (sel make_r2.err) { ret 1; }
+    var vregs: [2]lang_mir.MirVReg;
+    vregs[0]            = lang_mir.vreg(0, regalloc_context.REG_CLASS_GP, 0, true);
+    vregs[0].spill_slot = 0;
+    vregs[1]            = lang_mir.vreg(1, regalloc_context.REG_CLASS_GP, 0, false);
+    vregs[1].assigned   = lang_mir.preg_id(7);
+    var f: lang_mir.MirFunction;
+    f.vregs      = ?vregs[0];
+    f.vreg_count = 2;
+    var scratch: [1]target_model.Register;
+    scratch[0].id = 9;
+    var spilled: [2]bool = [2]bool{true, false};
+    var ctx:     regalloc_context.Context;
+    ctx.alloc                = ?alloc;
+    ctx.f                    = ?f;
+    ctx.spill_width          = 8;
+    ctx.spilled              = ?spilled[0];
+    ctx.reload_scratch       = ?scratch[0];
+    ctx.reload_scratch_count = 1;
+    ctx.tight_count          = 0;
+    ctx.borrowed_gp          = 0;
+    var reg: lang_target.TargetRegistry;
+    var tgt: lang_target.Binding;
+    if (!regalloc_context.t_target(?reg, ?tgt)) { ret 1; }
+    val ar: res[*lang_mir.MirOperand, A.Error] = A.allocate[lang_mir.MirOperand](?alloc, 2::usize);
+    if (sel ar.err) { ret 1; }
+    val ops: *lang_mir.MirOperand = ar.ok;
+    ops[0] = lang_mir.op_vreg(lang_mir.vreg_id(0));
+    ops[1] = lang_mir.op_vreg(lang_mir.vreg_id(1));
+    var mi:                      lang_mir.MirInstr = lang_mir.instr(lang_mir.MIR_ZEXT, ops, 2, 8, 4);
+    val capture_operand_banks_r: err[fail.Fail]    = isa_rules.capture_operand_banks(?f, ?mi);
+    if (sel capture_operand_banks_r.err)            { ret 2; }
+    if (!regalloc_context.t_bind_both(?alloc, ?mi)) { ret 2; }
+    var dst:     [4]lang_mir.MirInstr;
+    var written: u32 = 0;
+    fin {
+        var i: u32 = 0;
+        for (i < written) {
+            free_ops(?ctx, dst[i].operands, dst[i].operand_count);
+            i = i + 1;
+        }
+    }
+    val rewrite_instr_r: err[fail.Fail] = rewrite_instr(?tgt, ?ctx, ?mi, ?dst[0], ?written, false, 0);
+    if (sel rewrite_instr_r.err) { ret 3; }
+    if (written != 2)            { ret 4; }
+    val mov: *lang_mir.MirInstr = ?dst[0];
+    if (mov.operands[0].kind != lang_mir.MIR_OP_PREG || mov.operands[0].preg.n != 9)                             { ret 5; }
+    if (lang_mir.operand_origin(?mov.operands[0]).n != 0 || !lang_mir.operand_seed_secret(?f, ?mov.operands[0])) { ret 6; }
+    if (lang_mir.operand_origin(?mov.operands[1]).n != 1 || lang_mir.operand_seed_secret(?f, ?mov.operands[1]))  { ret 7; }
+    val store: *lang_mir.MirInstr = ?dst[1];
+    if (store.opcode != lang_mir.MIR_MOV || store.operands[0].kind != lang_mir.MIR_OP_MEM)                           { ret 8; }
+    if (lang_mir.operand_origin(?store.operands[0]).n != 0 || !lang_mir.operand_seed_secret(?f, ?store.operands[0])) { ret 9; }
+    if (store.operands[1].kind != lang_mir.MIR_OP_PREG || store.operands[1].preg.n != 9)                             { ret 10; }
+    if (lang_mir.operand_origin(?store.operands[1]).n != 0 || !lang_mir.operand_seed_secret(?f, ?store.operands[1])) { ret 11; }
+    if (!regalloc_context.t_end_binding_at_store(mov, store))                                                        { ret 12; }
+    ret 0;
+}
+
+#[testing]
+fun t_rewrite(t: *regalloc_context.TRewrite, opcode: lang_mir.MirOpcode, a: lang_mir.MirOperand, b: lang_mir.MirOperand, c: lang_mir.MirOperand, n: u32) bool {
+    var mi: lang_mir.MirInstr = lang_mir.instr(lang_mir.MIR_MOV, nil, 0, 8, 8);
+    if (!regalloc_context.t_instr(t, opcode, a, b, c, n, ?mi)) { ret false; }
+    regalloc_context.t_hull_segs(?t.ctx, 4);
+    val rr: err[fail.Fail] = rewrite_instr(?t.tgt, ?t.ctx, ?mi, ?t.dst[0], ?t.written, false, 0);
+    if (sel rr.err) { ret false; }
+    ret true;
+}
+
+# t_rewrite of an op that binds its destination at its start (iid 1) and at
+# its end (iid 2), where the value exists
+#[testing]
+fun t_rewrite_bound(t: *regalloc_context.TRewrite, opcode: lang_mir.MirOpcode, a: lang_mir.MirOperand, b: lang_mir.MirOperand, c: lang_mir.MirOperand, n: u32) bool {
+    var mi: lang_mir.MirInstr = lang_mir.instr(lang_mir.MIR_MOV, nil, 0, 8, 8);
+    if (!regalloc_context.t_instr(t, opcode, a, b, c, n, ?mi)) { ret false; }
+    if (!regalloc_context.t_bind_both(?t.alloc, ?mi))          { ret false; }
+    regalloc_context.t_hull_segs(?t.ctx, 4);
+    val rr: err[fail.Fail] = rewrite_instr(?t.tgt, ?t.ctx, ?mi, ?t.dst[0], ?t.written, false, 0);
+    ret sel rr.ok;
+}
+
+# a copy into a spilled value stores its source register straight into the
+# slot, a copy from one is the load, and a copy between two is one of each
+test rewrite_instr__a_spilled_copy_is_the_transport {
+    var t: regalloc_context.TRewrite;
+    if (!regalloc_context.t_rewrite_init(?t)) { ret 1; }
+    fin { regalloc_context.t_rewrite_dnit(?t); }
+    regalloc_context.t_spill(?t, 0);
+    if (!t_rewrite(?t, lang_mir.MIR_MOV, regalloc_context.t_v(0), regalloc_context.t_v(1), regalloc_context.t_v(0), 2)) { ret 2; }
+    if (t.written != 1 || !regalloc_context.t_transport_is(?t.dst[0], false, 1, 0))                                     { ret 3; }
+    if (lang_mir.operand_origin(?t.dst[0].operands[1]).n != 1)                                                          { ret 4; }
+
+    if (!regalloc_context.t_rewrite_again(?t)) { ret 5; }
+    regalloc_context.t_spill(?t, 1);
+    if (!t_rewrite(?t, lang_mir.MIR_MOV, regalloc_context.t_v(0), regalloc_context.t_v(1), regalloc_context.t_v(0), 2)) { ret 6; }
+    if (t.written != 1 || !regalloc_context.t_transport_is(?t.dst[0], true, 0, 1))                                      { ret 7; }
+    if (lang_mir.operand_origin(?t.dst[0].operands[0]).n != 0)                                                          { ret 8; }
+
+    if (!regalloc_context.t_rewrite_again(?t)) { ret 9; }
+    regalloc_context.t_spill(?t, 0);
+    regalloc_context.t_spill(?t, 1);
+    if (!t_rewrite_bound(?t, lang_mir.MIR_MOV, regalloc_context.t_v(0), regalloc_context.t_v(1), regalloc_context.t_v(0), 2)) { ret 10; }
+    if (t.written != 2)                                                                                                       { ret 11; }
+    if (!regalloc_context.t_transport_is(?t.dst[0], true, 8, 1))                                                              { ret 12; }
+    if (!regalloc_context.t_transport_is(?t.dst[1], false, 8, 0))                                                             { ret 13; }
+    if (!regalloc_context.t_end_binding_at_store(?t.dst[0], ?t.dst[1]))                                                       { ret 14; }
+    ret 0;
+}
+
+# a spilled result runs in a left operand dying at the op and is stored from
+# it; a live left operand runs the op in scratch; a commutative op runs in a
+# dying right operand, a subtraction does not
+test rewrite_two_address__a_spilled_result_picks_its_work_register {
+    var t: regalloc_context.TRewrite;
+    if (!regalloc_context.t_rewrite_init(?t)) { ret 1; }
+    fin { regalloc_context.t_rewrite_dnit(?t); }
+    regalloc_context.t_spill(?t, 0);
+    t.ranges[1].end_pos = 0;
+    if (!t_rewrite_bound(?t, lang_mir.MIR_SEL_SUB, regalloc_context.t_v(0), regalloc_context.t_v(1), regalloc_context.t_v(2), 3)) { ret 2; }
+    if (t.written != 2)                                                                                                           { ret 3; }
+    if (!regalloc_context.t_op_is(?t.dst[0], lang_mir.MIR_SEL_SUB, 1, 1, 2))                                                      { ret 4; }
+    if (!regalloc_context.t_transport_is(?t.dst[1], false, 1, 0))                                                                 { ret 5; }
+    if (lang_mir.operand_origin(?t.dst[0].operands[0]).n != 0)                                                                    { ret 6; }
+    if (!regalloc_context.t_end_binding_at_store(?t.dst[0], ?t.dst[1]))                                                           { ret 7; }
+
+    if (!regalloc_context.t_rewrite_again(?t)) { ret 8; }
+    regalloc_context.t_spill(?t, 0);
+    if (!t_rewrite(?t, lang_mir.MIR_SEL_SUB, regalloc_context.t_v(0), regalloc_context.t_v(1), regalloc_context.t_v(2), 3)) { ret 9; }
+    if (t.written != 2 || !regalloc_context.t_op_is(?t.dst[0], lang_mir.MIR_SEL_SUB, 8, 1, 2))                              { ret 10; }
+    if (!regalloc_context.t_transport_is(?t.dst[1], false, 8, 0))                                                           { ret 11; }
+
+    if (!regalloc_context.t_rewrite_again(?t)) { ret 12; }
+    regalloc_context.t_spill(?t, 0);
+    t.ranges[2].end_pos = 0;
+    if (!t_rewrite(?t, lang_mir.MIR_SEL_ADD, regalloc_context.t_v(0), regalloc_context.t_v(1), regalloc_context.t_v(2), 3)) { ret 13; }
+    if (t.written != 2 || !regalloc_context.t_op_is(?t.dst[0], lang_mir.MIR_SEL_ADD, 2, 2, 1))                              { ret 14; }
+    if (!regalloc_context.t_transport_is(?t.dst[1], false, 2, 0))                                                           { ret 15; }
+
+    if (!regalloc_context.t_rewrite_again(?t)) { ret 16; }
+    regalloc_context.t_spill(?t, 0);
+    t.ranges[2].end_pos = 0;
+    if (!t_rewrite(?t, lang_mir.MIR_SEL_SUB, regalloc_context.t_v(0), regalloc_context.t_v(1), regalloc_context.t_v(2), 3)) { ret 17; }
+    if (t.written != 2 || !regalloc_context.t_op_is(?t.dst[0], lang_mir.MIR_SEL_SUB, 8, 1, 2))                              { ret 18; }
+    ret 0;
+}
+
+# a spilled left operand reloads straight into the destination; a repeated
+# one loads once; with no slot read in place both spilled operands reload
+# into distinct registers; a shift count is never read from memory
+test rewrite_two_address__spilled_operands_reload {
+    var t: regalloc_context.TRewrite;
+    if (!regalloc_context.t_rewrite_init(?t)) { ret 1; }
+    fin { regalloc_context.t_rewrite_dnit(?t); }
+    regalloc_context.t_spill(?t, 1);
+    if (!t_rewrite(?t, lang_mir.MIR_SEL_SUB, regalloc_context.t_v(0), regalloc_context.t_v(1), regalloc_context.t_v(2), 3)) { ret 2; }
+    if (t.written != 2 || !regalloc_context.t_transport_is(?t.dst[0], true, 0, 1))                                          { ret 3; }
+    if (!regalloc_context.t_op_is(?t.dst[1], lang_mir.MIR_SEL_SUB, 0, 0, 2))                                                { ret 4; }
+    if (lang_mir.operand_origin(?t.dst[1].operands[1]).n != 1)                                                              { ret 5; }
+
+    if (!regalloc_context.t_rewrite_again(?t)) { ret 6; }
+    regalloc_context.t_spill(?t, 1);
+    if (!t_rewrite(?t, lang_mir.MIR_SEL_ADD, regalloc_context.t_v(0), regalloc_context.t_v(1), regalloc_context.t_v(1), 3)) { ret 7; }
+    if (t.written != 2 || !regalloc_context.t_transport_is(?t.dst[0], true, 0, 1))                                          { ret 8; }
+    if (!regalloc_context.t_op_is(?t.dst[1], lang_mir.MIR_SEL_ADD, 0, 0, 0))                                                { ret 9; }
+
+    if (!regalloc_context.t_rewrite_again(?t)) { ret 10; }
+    t.tgt.target.model.slot_read_widths = target_model.SLOT_READ_NONE;
+    regalloc_context.t_spill(?t, 0);
+    regalloc_context.t_spill(?t, 1);
+    regalloc_context.t_spill(?t, 2);
+    if (!t_rewrite(?t, lang_mir.MIR_SEL_AND, regalloc_context.t_v(0), regalloc_context.t_v(1), regalloc_context.t_v(2), 3)) { ret 11; }
+    if (t.written != 4)                                                                                                     { ret 12; }
+    if (!regalloc_context.t_transport_is(?t.dst[0], true, 8, 1))                                                            { ret 13; }
+    if (!regalloc_context.t_transport_is(?t.dst[1], true, 9, 2))                                                            { ret 14; }
+    if (!regalloc_context.t_op_is(?t.dst[2], lang_mir.MIR_SEL_AND, 8, 8, 9))                                                { ret 15; }
+    if (!regalloc_context.t_transport_is(?t.dst[3], false, 8, 0))                                                           { ret 16; }
+
+    if (!regalloc_context.t_rewrite_again(?t)) { ret 17; }
+    regalloc_context.t_spill(?t, 2);
+    if (!t_rewrite(?t, lang_mir.MIR_SEL_SHL, regalloc_context.t_v(0), regalloc_context.t_v(1), regalloc_context.t_v(2), 3)) { ret 18; }
+    if (t.written != 2 || !regalloc_context.t_transport_is(?t.dst[0], true, 8, 2))                                          { ret 19; }
+    if (!regalloc_context.t_op_is(?t.dst[1], lang_mir.MIR_SEL_SHL, 0, 1, 8))                                                { ret 20; }
+    ret 0;
+}
+
+# a spilled right operand is read from its slot in place, and the slot names
+# the secret value it holds, so the constant-time walk sees a secret read;
+# a live register left operand runs in scratch with the same slot read
+test rewrite_two_address__a_spilled_right_operand_is_read_from_its_slot {
+    var t: regalloc_context.TRewrite;
+    if (!regalloc_context.t_rewrite_init(?t)) { ret 1; }
+    fin { regalloc_context.t_rewrite_dnit(?t); }
+    regalloc_context.t_spill(?t, 0);
+    regalloc_context.t_spill(?t, 1);
+    regalloc_context.t_spill(?t, 2);
+    t.vregs[2].secret = true;
+    if (!t_rewrite(?t, lang_mir.MIR_SEL_AND, regalloc_context.t_v(0), regalloc_context.t_v(1), regalloc_context.t_v(2), 3)) { ret 2; }
+    if (t.written != 3)                                                                                                     { ret 3; }
+    if (!regalloc_context.t_transport_is(?t.dst[0], true, 8, 1))                                                            { ret 4; }
+    val op: *lang_mir.MirInstr = ?t.dst[1];
+    if (op.opcode != lang_mir.MIR_SEL_AND || !regalloc_context.t_is_reg(?op.operands[0], 8) || !regalloc_context.t_is_reg(?op.operands[1], 8)) { ret 5; }
+    if (!regalloc_context.t_is_slot(?op.operands[2], 2))                                                                                       { ret 6; }
+    if (lang_mir.operand_origin(?op.operands[2]).n != 2 || !lang_mir.operand_seed_secret(?t.f, ?op.operands[2]))                               { ret 7; }
+    if (lang_mir.operand_seed_secret(?t.f, ?op.operands[1]))                                                                                   { ret 8; }
+    if (!regalloc_context.t_transport_is(?t.dst[2], false, 8, 0))                                                                              { ret 9; }
+
+    if (!regalloc_context.t_rewrite_again(?t)) { ret 10; }
+    regalloc_context.t_spill(?t, 0);
+    regalloc_context.t_spill(?t, 2);
+    if (!t_rewrite(?t, lang_mir.MIR_SEL_SUB, regalloc_context.t_v(0), regalloc_context.t_v(1), regalloc_context.t_v(2), 3)) { ret 11; }
+    if (t.written != 2)                                                                                                     { ret 12; }
+    val sub: *lang_mir.MirInstr = ?t.dst[0];
+    if (!regalloc_context.t_is_reg(?sub.operands[0], 8) || !regalloc_context.t_is_reg(?sub.operands[1], 1) || !regalloc_context.t_is_slot(?sub.operands[2], 2)) { ret 13; }
+    if (!regalloc_context.t_transport_is(?t.dst[1], false, 8, 0))                                                                                               { ret 14; }
+    ret 0;
+}
+
+# a compare reads one spilled source from its slot and reloads any other: the
+# first spilled source that is neither a vector nor the compare's own
+# spilled destination takes the slot read
+test rewrite_instr__a_compare_reads_one_spilled_source_in_place {
+    var t: regalloc_context.TRewrite;
+    if (!regalloc_context.t_rewrite_init(?t)) { ret 1; }
+    fin { regalloc_context.t_rewrite_dnit(?t); }
+    regalloc_context.t_spill(?t, 2);
+    if (!t_rewrite(?t, lang_mir.MIR_SEL_CMP_NE, regalloc_context.t_v(0), regalloc_context.t_v(1), regalloc_context.t_v(2), 3)) { ret 2; }
+    if (t.written != 1)                                                                                                        { ret 3; }
+    val ne: *lang_mir.MirInstr = ?t.dst[0];
+    if (!regalloc_context.t_is_reg(?ne.operands[0], 0) || !regalloc_context.t_is_reg(?ne.operands[1], 1) || !regalloc_context.t_is_slot(?ne.operands[2], 2)) { ret 4; }
+
+    if (!regalloc_context.t_rewrite_again(?t)) { ret 5; }
+    regalloc_context.t_spill(?t, 1);
+    regalloc_context.t_spill(?t, 2);
+    t.vregs[1].secret = true;
+    if (!t_rewrite(?t, lang_mir.MIR_SEL_CMP_LT_U, regalloc_context.t_v(0), regalloc_context.t_v(1), regalloc_context.t_v(2), 3)) { ret 6; }
+    if (t.written != 2 || !regalloc_context.t_transport_is(?t.dst[0], true, 8, 2))                                               { ret 7; }
+    val lt: *lang_mir.MirInstr = ?t.dst[1];
+    if (lt.opcode != lang_mir.MIR_SEL_CMP_LT_U || !regalloc_context.t_is_reg(?lt.operands[0], 0))                { ret 8; }
+    if (!regalloc_context.t_is_slot(?lt.operands[1], 1) || !regalloc_context.t_is_reg(?lt.operands[2], 8))       { ret 9; }
+    if (lang_mir.operand_origin(?lt.operands[1]).n != 1 || !lang_mir.operand_seed_secret(?t.f, ?lt.operands[1])) { ret 10; }
+
+    if (!regalloc_context.t_rewrite_again(?t)) { ret 11; }
+    t.vregs[1].vec_bytes = 16;
+    regalloc_context.t_spill(?t, 1);
+    regalloc_context.t_spill(?t, 2);
+    if (!t_rewrite(?t, lang_mir.MIR_SEL_CMP_EQ, regalloc_context.t_v(0), regalloc_context.t_v(1), regalloc_context.t_v(2), 3)) { ret 12; }
+    if (t.written != 2 || !regalloc_context.t_transport_is(?t.dst[0], true, 8, 1))                                             { ret 13; }
+    if (!regalloc_context.t_is_reg(?t.dst[1].operands[1], 8) || !regalloc_context.t_is_slot(?t.dst[1].operands[2], 2))         { ret 14; }
+
+    if (!regalloc_context.t_rewrite_again(?t)) { ret 15; }
+    regalloc_context.t_spill(?t, 1);
+    regalloc_context.t_spill(?t, 2);
+    if (!t_rewrite(?t, lang_mir.MIR_SEL_CMP_EQ, regalloc_context.t_v(1), regalloc_context.t_v(1), regalloc_context.t_v(2), 3)) { ret 16; }
+    if (t.written != 3 || !regalloc_context.t_transport_is(?t.dst[0], true, 8, 1))                                             { ret 17; }
+    val eq: *lang_mir.MirInstr = ?t.dst[1];
+    if (!regalloc_context.t_is_reg(?eq.operands[0], 8) || !regalloc_context.t_is_reg(?eq.operands[1], 8) || !regalloc_context.t_is_slot(?eq.operands[2], 2)) { ret 18; }
+    if (!regalloc_context.t_transport_is(?t.dst[2], false, 8, 1))                                                                                            { ret 19; }
+    ret 0;
+}
+
+# a fused compare-and-branch has no destination: its spilled left operand is
+# the slot, and no register is spent on it
+test rewrite_instr__a_fused_branch_compares_a_spilled_value_in_place {
+    var t: regalloc_context.TRewrite;
+    if (!regalloc_context.t_rewrite_init(?t)) { ret 1; }
+    fin { regalloc_context.t_rewrite_dnit(?t); }
+    regalloc_context.t_spill(?t, 1);
+    val ro: res[*lang_mir.MirOperand, A.Error] = A.allocate[lang_mir.MirOperand](?t.alloc, 4::usize);
+    if (sel ro.err) { ret 2; }
+    val ops: *lang_mir.MirOperand = ro.ok;
+    ops[0] = regalloc_context.t_v(1);
+    ops[1] = lang_mir.op_imm(64);
+    ops[2] = lang_mir.op_block(1);
+    ops[3] = lang_mir.op_block(2);
+    var mi: lang_mir.MirInstr = lang_mir.instr(lang_mir.MIR_SEL_CBR_LT_U, ops, 4, 8, 8);
+    val cb: err[fail.Fail]    = isa_rules.capture_operand_banks(?t.f, ?mi);
+    if (sel cb.err) { ret 3; }
+    val rr: err[fail.Fail] = rewrite_instr(?t.tgt, ?t.ctx, ?mi, ?t.dst[0], ?t.written, false, 0);
+    if (sel rr.err)     { ret 4; }
+    if (t.written != 1) { ret 5; }
+    val op: *lang_mir.MirInstr = ?t.dst[0];
+    if (op.opcode != lang_mir.MIR_SEL_CBR_LT_U || !regalloc_context.t_is_slot(?op.operands[0], 1)) { ret 6; }
+    if (op.operands[1].kind != lang_mir.MIR_OP_IMM || op.operands[1].imm != 64)                    { ret 7; }
+
+    # without the target capability the same branch reloads
+    t.tgt.target.model.slot_read_widths = target_model.SLOT_READ_NONE;
+    t.written                           = 0;
+    val ro2: res[*lang_mir.MirOperand, A.Error] = A.allocate[lang_mir.MirOperand](?t.alloc, 4::usize);
+    if (sel ro2.err) { ret 8; }
+    val ops2: *lang_mir.MirOperand = ro2.ok;
+    ops2[0] = regalloc_context.t_v(1);
+    ops2[1] = lang_mir.op_imm(64);
+    ops2[2] = lang_mir.op_block(1);
+    ops2[3] = lang_mir.op_block(2);
+    var mi2: lang_mir.MirInstr = lang_mir.instr(lang_mir.MIR_SEL_CBR_LT_U, ops2, 4, 8, 8);
+    val cb2: err[fail.Fail]    = isa_rules.capture_operand_banks(?t.f, ?mi2);
+    if (sel cb2.err) { ret 9; }
+    val rr2: err[fail.Fail] = rewrite_instr(?t.tgt, ?t.ctx, ?mi2, ?t.dst[0], ?t.written, false, 0);
+    if (sel rr2.err)                                                               { ret 10; }
+    if (t.written != 2 || !regalloc_context.t_transport_is(?t.dst[0], true, 8, 1)) { ret 11; }
+    if (!regalloc_context.t_is_reg(?t.dst[1].operands[0], 8))                      { ret 12; }
+    ret 0;
+}
+
+# a commutative op whose right operand holds the destination register reads
+# it before the copy of the left operand would overwrite it
+test rewrite_instr__a_right_operand_in_the_destination_register_commutes {
+    var t: regalloc_context.TRewrite;
+    if (!regalloc_context.t_rewrite_init(?t)) { ret 1; }
+    fin { regalloc_context.t_rewrite_dnit(?t); }
+    t.vregs[2].assigned = lang_mir.preg_id(0);
+    if (!t_rewrite(?t, lang_mir.MIR_SEL_XOR, regalloc_context.t_v(0), regalloc_context.t_v(1), regalloc_context.t_v(2), 3)) { ret 2; }
+    if (t.written != 1)                                                                                                     { ret 3; }
+    if (!regalloc_context.t_op_is(?t.dst[0], lang_mir.MIR_SEL_XOR, 0, 0, 1))                                                { ret 4; }
+    ret 0;
+}
+
+# a unary op with spilled operands runs in one scratch, and a spilled
+# destination the op also reads is reloaded before it
+test rewrite_two_address__a_unary_op_runs_in_one_scratch {
+    var t: regalloc_context.TRewrite;
+    if (!regalloc_context.t_rewrite_init(?t)) { ret 1; }
+    fin { regalloc_context.t_rewrite_dnit(?t); }
+    regalloc_context.t_spill(?t, 0);
+    regalloc_context.t_spill(?t, 1);
+    if (!t_rewrite(?t, lang_mir.MIR_SEL_NEG, regalloc_context.t_v(0), regalloc_context.t_v(1), regalloc_context.t_v(0), 2)) { ret 2; }
+    if (t.written != 3)                                                                                                     { ret 3; }
+    if (!regalloc_context.t_transport_is(?t.dst[0], true, 8, 1))                                                            { ret 4; }
+    if (!regalloc_context.t_op_is(?t.dst[1], lang_mir.MIR_SEL_NEG, 8, 8, -1))                                               { ret 5; }
+    if (!regalloc_context.t_transport_is(?t.dst[2], false, 8, 0))                                                           { ret 6; }
+
+    if (!regalloc_context.t_rewrite_again(?t)) { ret 7; }
+    regalloc_context.t_spill(?t, 0);
+    if (!t_rewrite(?t, lang_mir.MIR_SEL_NOT, regalloc_context.t_v(0), regalloc_context.t_v(0), regalloc_context.t_v(0), 2)) { ret 8; }
+    if (t.written != 3)                                                                                                     { ret 9; }
+    if (!regalloc_context.t_transport_is(?t.dst[0], true, 8, 0))                                                            { ret 10; }
+    if (!regalloc_context.t_op_is(?t.dst[1], lang_mir.MIR_SEL_NOT, 8, 8, -1))                                               { ret 11; }
+    if (!regalloc_context.t_transport_is(?t.dst[2], false, 8, 0))                                                           { ret 12; }
+    ret 0;
+}
+
+# a packed conversion carries its operand lane in vec_lane; rewriting the
+# instruction onto its registers keeps the operand kind and width
+test rewrite_instr__a_packed_conversion_keeps_its_operand_lane {
+    var backing: A.Allocator;
+    val make_r:  err[A.Error] = page.make(?backing);
+    if (sel make_r.err) { ret 1; }
+    var scratch_arena: arena.Arena;
+    val init_r:        err[A.Error] = arena.init(?scratch_arena, ?backing, 65536);
+    if (sel init_r.err) { ret 1; }
+    fin { arena.dnit(?scratch_arena); }
+    var alloc:   A.Allocator;
+    val make_r2: err[A.Error] = arena.make(?alloc, ?scratch_arena);
+    if (sel make_r2.err) { ret 1; }
+    var vregs: [2]lang_mir.MirVReg;
+    vregs[0]          = lang_mir.vreg(0, regalloc_context.REG_CLASS_GP + 1, 16, false);
+    vregs[0].assigned = lang_mir.preg_id(isa_inst.regid_make(isa_inst.REG_CLASS_ID_FP, 2));
+    vregs[1]          = lang_mir.vreg(1, regalloc_context.REG_CLASS_GP + 1, 16, false);
+    vregs[1].assigned = lang_mir.preg_id(isa_inst.regid_make(isa_inst.REG_CLASS_ID_FP, 3));
+    var f: lang_mir.MirFunction;
+    f.vregs      = ?vregs[0];
+    f.vreg_count = 2;
+    var scratch: [1]target_model.Register;
+    scratch[0].id = isa_inst.regid_make(isa_inst.REG_CLASS_ID_FP, 14);
+    var slot_flags: [2]bool = [2]bool{false, false};
+    var spilled:    [2]bool = [2]bool{false, false};
+    var ctx:        regalloc_context.Context;
+    ctx.vreg_slot_flag       = ?slot_flags[0];
+    ctx.spilled              = ?spilled[0];
+    ctx.alloc                = ?alloc;
+    ctx.f                    = ?f;
+    ctx.spill_width          = 8;
+    ctx.reload_scratch       = ?scratch[0];
+    ctx.reload_scratch_count = 1;
+    ctx.tight_count          = 0;
+    ctx.borrowed_gp          = 0;
+    var reg: lang_target.TargetRegistry;
+    var tgt: lang_target.Binding;
+    if (!regalloc_context.t_target(?reg, ?tgt)) { ret 1; }
+    val ar: res[*lang_mir.MirOperand, A.Error] = A.allocate[lang_mir.MirOperand](?alloc, 2::usize);
+    if (sel ar.err) { ret 1; }
+    val ops: *lang_mir.MirOperand = ar.ok;
+    ops[0] = lang_mir.op_vreg(lang_mir.vreg_id(1));
+    ops[1] = lang_mir.op_vreg(lang_mir.vreg_id(0));
+    val result: u32               = lang_mir.vec_lane_make(lang_mir.VEC_LANE_INT, 2, 8);
+    var mi:     lang_mir.MirInstr = lang_mir.instr(lang_mir.MIR_FP_TO_SI, ops, 2, 16, 16);
+    mi.vec_lane = lang_mir.vec_lane_make_convert(result, lang_mir.VEC_LANE_FLOAT, 4);
+    val capture_operand_banks_r: err[fail.Fail] = isa_rules.capture_operand_banks(?f, ?mi);
+    if (sel capture_operand_banks_r.err) { ret 2; }
+    var dst:     [4]lang_mir.MirInstr;
+    var written: u32 = 0;
+    fin {
+        var i: u32 = 0;
+        for (i < written) {
+            free_ops(?ctx, dst[i].operands, dst[i].operand_count);
+            i = i + 1;
+        }
+    }
+    val rewrite_instr_r: err[fail.Fail] = rewrite_instr(?tgt, ?ctx, ?mi, ?dst[0], ?written, false, 0);
+    if (sel rewrite_instr_r.err) { ret 3; }
+    if (written == 0)            { ret 4; }
+    val conv: *lang_mir.MirInstr = ?dst[written - 1];
+    if (conv.opcode != lang_mir.MIR_FP_TO_SI)                                  { ret 5; }
+    if (!lang_mir.vec_lane_is_convert(conv.vec_lane))                          { ret 6; }
+    if (lang_mir.vec_lane_from_kind(conv.vec_lane) != lang_mir.VEC_LANE_FLOAT) { ret 7; }
+    if (lang_mir.vec_lane_from_bytes(conv.vec_lane) != 4)                      { ret 8; }
+    if (lang_mir.vec_lane_kind(conv.vec_lane) != lang_mir.VEC_LANE_INT)        { ret 9; }
+    if (lang_mir.vec_lane_elem_bytes(conv.vec_lane) != 2)                      { ret 10; }
+    if (lang_mir.vec_lane_count(conv.vec_lane) != 8)                           { ret 11; }
+    ret 0;
+}
+
+test rewrite_instr__a_spilled_update_reloads_its_value_once {
+    val one: i32 = t_spilled_update(0);
+    if (one != 0) { ret one; }
+    val repeated: i32 = t_spilled_update(1);
+    if (repeated != 0) { ret 10 + repeated; }
+    val pure: i32 = t_spilled_update(2);
+    if (pure != 0) { ret 20 + pure; }
+    ret 0;
+}
