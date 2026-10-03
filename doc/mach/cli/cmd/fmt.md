@@ -34,6 +34,14 @@ pub fun classify(operand: str) res[Operand, fail.Fail];
 which form the operand takes. `-` is the stream; a directory, or a file named
 mach.toml, is a project; any other existing file is a single source
 
+## val COMMAND
+
+```mach
+pub val COMMAND: args.CommandSpec = args.CommandSpec;
+```
+
+`mach fmt`
+
 ## fun run
 
 ```mach

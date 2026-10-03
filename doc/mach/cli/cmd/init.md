@@ -1,5 +1,13 @@
 # mach.cli.cmd.init
 
+## val COMMAND
+
+```mach
+pub val COMMAND: args.CommandSpec = args.CommandSpec;
+```
+
+`mach init`
+
 ## fun run
 
 ```mach
