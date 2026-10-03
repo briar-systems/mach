@@ -17,21 +17,20 @@ syntactically uniform regardless of where it appears.
 
 A one-segment `use`/`fwd` path equal to a resolvable project id — a dependency's
 id or the current project's own id — binds that project's **public module**.
-For a dependency that is the `entry` shared by its library artifacts marked
-`default = true`: a library that declares one `static` artifact with
-`default = true` and `entry = "lib/libstd.mach"` gives `use std;` the module
-`std.lib.libstd`. Several default `static`/`shared` artifacts may share that
-entry; a `bin` never publishes one. For the current project it is the selected
-artifact's entry. A dependency with no default library artifact, or whose
-default library artifacts name different entries, has no public module, and a
-bare import of it is an error (`project 'x' has no public module: a bare
-import binds the entry shared by its library artifacts marked `default =
-true`; import a full path, or mark one static or shared [artifact.*] table (or
-several sharing one entry) default = true in its manifest`). Longer paths are
-unaffected: `use std.print;` needs no default artifact. A dependency that
+For a dependency that is the `entry` of its library artifact marked
+`export = true`: a library that declares one `static` artifact with
+`export = true` and `entry = "lib/libstd.mach"` gives `use std;` the module
+`std.lib.libstd`. A project exports at most one library, and a `bin` never
+publishes an entry. `default = true` only selects what a command builds and
+binds nothing. For the current project it is the selected artifact's entry. A
+dependency with no export library has no public module, and a bare import of it
+is an error (`project 'x' has no public module: a bare import binds the entry of
+its library artifact marked `export = true`; import a full path, or mark one
+static or shared [artifact.*] table export = true in its manifest`). Longer
+paths are unaffected: `use std.print;` needs no export. A dependency that
 declares no artifact at all has no public module either, and the refusal says
 so (`project 'x' declares no artifact, so it has no public module: import a
-full path, or declare a static or shared [artifact.*] table marked default =
+full path, or declare a static or shared [artifact.*] table marked export =
 true in its manifest`), so a library declares its artifact.
 
 ## Shadow-module pattern

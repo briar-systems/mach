@@ -567,16 +567,16 @@ library path. Filters select the applicable target:
 source  = "system"
 name    = "foo"
 os      = ["linux", "darwin"]
-isa     = "*"
-abi     = "*"
+isa     = ["*"]
+abi     = ["*"]
 export  = false
 
 [link.foo-win]
 source  = "system"
 name    = "foo.dll"
-os      = "windows"
-isa     = "*"
-abi     = "*"
+os      = ["windows"]
+isa     = ["*"]
+abi     = ["*"]
 export  = false
 ```
 

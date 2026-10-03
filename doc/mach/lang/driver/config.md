@@ -24,17 +24,10 @@ output_override: `-o`, the path to run instead of the artifact's output, or nil
 ret: the executable; err from the manifest or selection, when the selection
                  names several cells or a library, or for an unusable `-o`
 
-## fun load_project_config
-
-```mach
-pub fun load_project_config(p: *project.Project, project_root: str, manifest_path: str, pick: *manifest.Selection,
-owner: str, for_union: bool) err[fail.Fail];
-```
-
 ## fun load_config_manifest
 
 ```mach
-pub fun load_config_manifest(p: *project.Project, project_root: str, m: *manifest.Manifest, pick: *manifest.Selection,
+pub fun load_config_manifest(p: *project.Project, project_root: str, m: *manifest.Manifest, c: *manifest.Cell,
 owner: str, for_union: bool) err[fail.Fail];
 ```
 
@@ -43,10 +36,10 @@ configure a project for one build cell of `m`, or of one of its dependencies
 p: the project being configured
 project_root: the root project's directory
 m: the root manifest
-pick: the cell; with `owner`, a target and artifact of that dependency and
+c: the cell; with `owner`, a target and artifact of that dependency and
               a profile of `m`
-owner: "" for a cell of `m`, or the id of the closure dependency whose default
-              library artifacts require the cell
+owner: "" for a cell of `m`, or the id of the closure dependency whose export
+              library requires the cell
 for_union: configure the editor's union of every artifact: every artifact's
               entry loads, and `{artifact.<id>.out}` resolves over every artifact
               some artifact needs

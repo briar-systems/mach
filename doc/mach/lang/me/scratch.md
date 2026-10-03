@@ -12,6 +12,9 @@ pub rec Function;
 pub rec Workspace;
 ```
 
+what every pass of one run shares: scratch reclaimed after each function, and
+the analyses kept across passes
+
 ## fun init
 
 ```mach

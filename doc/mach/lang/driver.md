@@ -237,7 +237,7 @@ pub fun run_link_pass(p: *project.Project) res[bool, fail.Fail];
 ## fun build_project
 
 ```mach
-pub fun build_project(s: *session.Session, project_root: str, pick: *manifest.Selection) res[project.Project, fail.Fail];
+pub fun build_project(s: *session.Session, project_root: str, selectors: *manifest.Selectors) res[project.Project, fail.Fail];
 ```
 
 ## fun closure_locate

@@ -41,18 +41,10 @@ pub val SHAPE_STRINGS: Shape = 3
 
 an array whose every element is a string
 
-## val SHAPE_FILTER
-
-```mach
-pub val SHAPE_FILTER: Shape = 4
-```
-
-a string, or an array whose every element is a string
-
 ## val SHAPE_TABLE
 
 ```mach
-pub val SHAPE_TABLE: Shape = 5
+pub val SHAPE_TABLE: Shape = 4
 ```
 
 a table whose keys are the author's own, such as a step's `env`
@@ -60,7 +52,7 @@ a table whose keys are the author's own, such as a step's `env`
 ## val SHAPE_SECTION
 
 ```mach
-pub val SHAPE_SECTION: Shape = 6
+pub val SHAPE_SECTION: Shape = 5
 ```
 
 a table checked against the rows of its own key, such as `[project]`
@@ -68,7 +60,7 @@ a table checked against the rows of its own key, such as `[project]`
 ## val SHAPE_ENTRIES
 
 ```mach
-pub val SHAPE_ENTRIES: Shape = 7
+pub val SHAPE_ENTRIES: Shape = 6
 ```
 
 a table of named tables, each checked against the rows of the key, such as `[target.*]`

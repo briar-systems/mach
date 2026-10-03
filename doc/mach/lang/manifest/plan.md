@@ -24,22 +24,6 @@ pub val LIBKIND_SHARED: LibKind = 1
 
 `kind = "shared"`
 
-## rec Selection
-
-```mach
-pub rec Selection;
-```
-
-what the caller asked to build: a target, a profile, and optionally an
-artifact. empty strings mean "not selected"
-
-target: a declared target name, or "" to resolve `native` (or the artifact's pinned target)
-profile: a declared profile name, or "" for the default profile
-artifact: an artifact name, read only when `has_artifact`
-want_lib: with `has_artifact`, whether the named artifact must be a library
-              (true) or a `bin` (false); a name with the wrong shape does not match
-has_artifact: whether `artifact` and `want_lib` are set
-
 ## rec BuildUnit
 
 ```mach
@@ -84,10 +68,10 @@ pub rec Scope;
 
 the manifest that declares a build cell, and the root project the cell is built
 for. a root cell has `owner == root`. a dependency's cell is one of the
-requirements its default library artifacts carry: it resolves its artifact,
-targets and links in `owner`, its profile in `root`, expands the root's
-`[project].out`, and homes its artifact outputs under `dep/<owner id>` of that
-out, so identically named artifacts of two dependencies never share a path
+requirements its export library carries: it resolves its artifact, targets and
+links in `owner`, its profile in `root`, expands the root's `[project].out`, and
+reads `{project.out}` in its artifact outputs as `dep/<owner id>` of that out,
+so identically named artifacts of two dependencies never share a path
 
 root: the manifest of the project being built
 owner: the manifest declaring the cell's artifact; `root` for the root's own
@@ -145,63 +129,6 @@ pub fun dependency_scope(root: *Manifest, owner: *Manifest) Scope;
 pub fun scope_is_dependency(s: *Scope) bool;
 ```
 
-## rec ResolvedTarget
-
-```mach
-pub rec ResolvedTarget;
-```
-
-the outcome of target resolution for a selection
-
-target: the chosen target; points into the manifest unless synthesized for a
-        manifest with no `[target.*]`, in which case it is allocated and never freed by `dnit`
-target borrows its manifest-owned declaration until manifest destruction
-
-## rec ResolvedProfile
-
-```mach
-pub rec ResolvedProfile;
-```
-
-the profile a selection resolves to, copied out of its `ProfileDef`
-
-name: the profile's name
-opt: as `ProfileDef`
-debug: as `ProfileDef`
-simd: as `ProfileDef`
-vectorize: as `ProfileDef`
-float_reassoc: as `ProfileDef`
-allow: as `ProfileDef`
-
-## fun resolve_target
-
-```mach
-pub fun resolve_target(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, selector: str,
-art: *ArtifactDef) res[ResolvedTarget, fail.Fail];
-```
-
-the target a selector names: a declared name, `native` for the declared
-target matching the host, or "" for the artifact's pinned target and
-otherwise `native`
-
-## fun resolve_profile
-
-```mach
-pub fun resolve_profile(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, pick: str) res[ResolvedProfile, fail.Fail];
-```
-
-choose the profile a selection names. a named profile must be declared. an
-empty name takes the sole declared profile, else the one with `default = true`,
-of which parse admits at most one. several declared profiles with none marked
-default are refused: no profile is ever selected by table order
-
-alloc: owns error text
-itn: resolves the names
-m: the manifest
-pick: the profile name, or "" for the default
-ret: the profile; err "mach.toml: no profile named '<pick>'" or, with an empty
-       name, an error when several profiles are declared and none is the default
-
 ## fun local_path_demanded_by_step
 
 ```mach
@@ -229,19 +156,19 @@ consumer_target: the consumer's target name, or STR_NIL for a consumer outside
 t: the target asked about
 ret: true when `req` is built for `t` on behalf of that consumer
 
-## fun default_library_requires
+## fun export_requires
 
 ```mach
-pub fun default_library_requires(itn: *intern.Interner, m: *Manifest, ra: *ArtifactDef) bool;
+pub fun export_requires(itn: *intern.Interner, m: *Manifest, ra: *ArtifactDef) bool;
 ```
 
-whether a library artifact marked `default = true` selects `ra` in its `need`:
-the requirements a dependency's default library carries to every consumer
+whether the export library selects `ra` in its `need`: the requirements a
+dependency's export library carries to every consumer
 
 itn: resolves the names
 m: the manifest
 ra: the candidate requirement
-ret: true when a default library artifact needs it
+ret: true when the artifact marked `export = true` needs it
 
 ## fun resolve_artifact_reqs
 
@@ -266,14 +193,14 @@ out_items: receives the array, or nil when nothing is required
 out_count: receives its length
 ret: ok; err from the output path expansion, with the array freed
 
-## fun resolve_default_library_reqs
+## fun resolve_export_reqs
 
 ```mach
-pub fun resolve_default_library_reqs(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry,
+pub fun resolve_export_reqs(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry,
 s: *Scope, profile: str, out_items: **template.Requirement, out_count: *u32) err[fail.Fail];
 ```
 
-list the artifacts a dependency's default library artifacts require, the scope
+list the artifacts a dependency's export library requires, the scope
 `{artifact.<id>.out}` resolves in for that dependency's modules. each requirement
 builds for every target it names in the dependency's manifest
 
@@ -319,7 +246,7 @@ out_order: **u32, out_count: *u32) err[fail.Fail];
 ```
 
 order the build steps that produce an exported local link path matching the
-target and the steps a default library artifact's `need` names, with their
+target and the steps the export library's `need` names, with their
 transitive step `need`s; the steps a consumer of this manifest must run
 
 alloc: owns the returned order
@@ -332,96 +259,41 @@ out_order: receives the step indices in run order, sized exactly; nil when none
 out_count: receives the length
 ret: ok; the `plan_steps` errors
 
-## fun default_selection_includes
-
-```mach
-pub fun default_selection_includes(itn: *intern.Interner, m: *Manifest, a: *ArtifactDef,
-target: intern.StrId, executables_only: bool) bool;
-```
-
-the default selection: what a command takes for a target when no `-a`
-names an artifact. of the artifacts the target builds, those marked
-`default = true` when any is, otherwise every one. build and check take the whole
-selection, and a command that needs one artifact takes it only when it holds one
-
-itn: resolves names
-m: the manifest
-a: the artifact asked about
-target: the resolved target's name
-executables_only: consider `bin` artifacts only, so a library beside them is never taken
-ret: true when the default selection holds `a`
-
-## fun select_primary_artifact
-
-```mach
-pub fun select_primary_artifact(alloc: *A.Allocator, itn: *intern.Interner,
-m: *Manifest, pick: *Selection) err[fail.Fail];
-```
-
-fill in `pick.artifact` when none was named and several artifacts are declared:
-the default selection when it holds one artifact, the sole artifact supporting
-the selected target or the one marked `default = true`; a selection of several
-is refused, never narrowed by table order
-
-alloc: owns error text
-itn: resolves names
-m: the manifest
-pick: updated in place; untouched when it already names an artifact or fewer
-       than two are declared
-ret: ok; err from target resolution, when no artifact supports the target,
-       when more than one candidate is marked default, or when several are and none is
-
-## fun select_sole_executable_artifact
-
-```mach
-pub fun select_sole_executable_artifact(alloc: *A.Allocator, itn: *intern.Interner,
-m: *Manifest, pick: *Selection) err[fail.Fail];
-```
-
-`select_sole_target_artifact` over `bin` artifacts only, so a bin beside a
-library is chosen for `run` and `test`
-
-alloc: owns error text
-itn: resolves names
-m: the manifest
-pick: updated in place when a choice is clear
-ret: ok unless the artifact name cannot be looked up
-
 ## fun resolve_build_unit
 
 ```mach
-pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, m: *Manifest, pick: Selection) res[BuildUnit, fail.Fail];
+pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, m: *Manifest, c: *Cell) res[BuildUnit, fail.Fail];
 ```
 
-resolve a selection into one `BuildUnit`. with no target named, an artifact
-that supports exactly one declared target, or exactly one host-matching
-target, pins it, except that a sole hosted target the host cannot run is refused
-as `native` refuses it; otherwise `native` resolution applies. the profile comes
-from `resolve_profile`, the artifact from `resolve_artifact`, and every path
-is expanded through the template engine
+resolve one cell into a `BuildUnit`. the cell names its artifact; with no
+target named, an artifact that supports exactly one declared target, or exactly
+one host-matching target, pins it, except that a sole hosted target the host
+cannot run is refused as `native` refuses it; otherwise `native` resolution
+applies. the profile comes from `resolve_profile`, and every path is expanded
+through the template engine
 
 alloc: owns `libs` and temporary strings
 itn: interns the expanded paths
 m: the manifest
-pick: the selection
-ret: the unit; err from target, profile or artifact resolution, when the
-       artifact does not support the target (naming the artifact's targets when
-       none was selected), or from path expansion
+c: the cell, as `resolve_cells` resolves it or as `cell_of` names it
+ret: the unit; err from target or profile resolution, for an artifact the
+       manifest does not declare, when the artifact does not support the target
+       (naming the artifact's targets when none was selected), or from path expansion
 
 ## fun resolve_scoped_build_unit
 
 ```mach
-pub fun resolve_scoped_build_unit(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, s: *Scope, pick: Selection) res[BuildUnit, fail.Fail];
+pub fun resolve_scoped_build_unit(alloc: *A.Allocator, itn: *intern.Interner, reg: *lang_target.TargetRegistry, s: *Scope, c: *Cell) res[BuildUnit, fail.Fail];
 ```
 
 `resolve_build_unit` for a cell of `s`: target, artifact and links resolve in
-`s.owner`, the profile and `[project].out` in `s.root`, and the artifact output
-is homed under the scope's artifact root
+`s.owner`, the profile and `[project].out` in `s.root`, and `{project.out}` in
+the artifact output names the scope's artifact root
 
 alloc: owns `libs` and temporary strings
 itn: interns the expanded paths
 s: the scope
-pick: the selection, naming targets and artifacts of `s.owner` and a profile of `s.root`
+c: the cell, naming a target and an artifact of `s.owner` and a profile of `s.root`
 ret: as `resolve_build_unit`
 
 ## fun check_collisions
