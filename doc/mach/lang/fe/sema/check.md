@@ -15,7 +15,7 @@ pub fun check_call(sc: *sema_context.SemaContext, callee_sig: type.TypeId, args_
 ## fun check_comptime_call
 
 ```mach
-pub fun check_comptime_call(sc: *sema_context.SemaContext, callee_sig: type.TypeId, callee: ast_id.ExprId, f: *ast_decl.DeclFun, args_start: u32, args_len: u32, span: lang_source.Span) bool;
+pub fun check_comptime_call(sc: *sema_context.SemaContext, eid: ast_id.ExprId, callee_sig: type.TypeId, callee: ast_id.ExprId, f: *ast_decl.DeclFun, args_start: u32, args_len: u32, span: lang_source.Span) bool;
 ```
 
 ## fun check_comptime_arg_fits
