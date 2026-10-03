@@ -1,16 +1,18 @@
-# the selection a command's `-a`, `-t` and `-p` options and `--all` describe,
-# resolved against a manifest into the (artifact, target, profile) cells it
-# covers. each axis takes exact names and globs (`*` any run, `?` any one
-# byte); an axis given no pattern is `*` under `--all` and otherwise the
-# manifest's default. no cell is chosen by table order
+# the one selection model: the selection a command's `-a`, `-t` and `-p` options
+# and `--all` describe, resolved against a manifest into the (artifact, target,
+# profile) cells it covers, which the build plan takes. each axis takes exact
+# names and globs (`*` any run, `?` any one byte); an axis given no pattern is
+# `*` under `--all` and otherwise the manifest's default, which the
+# `ArtifactDefault` modes, `resolve_target` and `resolve_profile` decide. no cell
+# is chosen by table order
 use lang_alloc: mach.lang.alloc;
 use mach.lang.fail;
 use std.allocator.arena;
+use std.allocator.page;
+use std.system.panic.panic;
 use T:                  std.allocator.testing;
 use collections_vector: std.collections.vector;
 use std.collections.vector.Vector;
-use fs:       std.filesystem;
-use io_error: std.io.error;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -29,27 +31,35 @@ use mach.lang.intern;
 use lang_target: mach.lang.target;
 
 use mach.lang.manifest.artifact.artifact_supports_target;
-use mach.lang.manifest.artifact.find_artifact;
+use mach.lang.manifest.load.Doc;
+use mach.lang.manifest.load.doc_dnit;
+use mach.lang.manifest.load.doc_parse;
+use mach.lang.manifest.load.parse;
+use mach.lang.manifest.load.t_profiled;
 use mach.lang.manifest.load.tparse;
 use mach.lang.manifest.model.ArtifactDef;
+use mach.lang.manifest.model.MOpt;
 use mach.lang.manifest.model.Manifest;
+use mach.lang.manifest.model.ProfileDef;
+use mach.lang.manifest.model.SimdMode;
 use mach.lang.manifest.model.TargetDef;
+use mach.lang.manifest.model.dnit;
 use mach.lang.manifest.model.tinit;
 use mach.lang.manifest.need.glob_matches;
 use mach.lang.manifest.need.is_glob;
-use mach.lang.manifest.plan.ResolvedProfile;
-use mach.lang.manifest.plan.ResolvedTarget;
-use mach.lang.manifest.plan.Selection;
-use mach.lang.manifest.plan.default_selection_includes;
-use mach.lang.manifest.plan.resolve_profile;
-use mach.lang.manifest.plan.resolve_target;
-use mach.lang.manifest.plan.select_primary_artifact;
-use mach.lang.manifest.plan.select_sole_executable_artifact;
+use mach.lang.manifest.refusal.Sites;
 use mach.lang.manifest.refusal.refuse;
 use mach.lang.manifest.refusal.sfmt;
+use mach.lang.manifest.refusal.sites_add;
+use mach.lang.manifest.refusal.sites_fail;
+use mach.lang.manifest.refusal.sites_init;
 use mach.lang.manifest.refusal.t_fmt;
+use mach.lang.manifest.target.find_target_by_name;
 use mach.lang.manifest.target.host_target_table;
+use mach.lang.manifest.target.host_tuple;
+use mach.lang.manifest.target.target_is_hosted;
 use mach.lang.manifest.target.target_matches_host;
+use mach.lang.manifest.target.tuple_of;
 
 # how an artifact axis given no pattern is filled when `--all` does not fill it
 pub def ArtifactDefault: u8;
@@ -59,6 +69,10 @@ pub val ARTIFACT_DEFAULT_SET: ArtifactDefault = 0;
 pub val ARTIFACT_DEFAULT_ONE: ArtifactDefault = 1;
 # the one `bin` the default selection holds, else the sole declared artifact: run
 pub val ARTIFACT_DEFAULT_EXECUTABLE: ArtifactDefault = 2;
+# every `bin` the default selection holds is a candidate, and a library never is
+fun executables_only(mode: ArtifactDefault) bool {
+    ret mode == ARTIFACT_DEFAULT_EXECUTABLE;
+}
 
 # the selector axes as a command gave them
 # ---
@@ -90,6 +104,279 @@ pub rec Cell {
     native:      bool;
 }
 
+# a cell named outright, for a caller that already holds exact names: a
+# dependency's requirement, or a cell carried from an earlier plan
+# ---
+# artifact: the declared artifact name
+# target:   the declared target name, or "" for the artifact's default target
+# profile:  the declared profile name, or "" for the default profile
+pub fun cell_of(artifact: str, target: str, profile: str) Cell {
+    ret Cell{artifact: artifact, target: target, target_name: target, profile: profile, native: false};
+}
+
+# the outcome of target resolution for a selection
+# ---
+# target: the chosen target; points into the manifest unless synthesized for a
+#         manifest with no `[target.*]`, in which case it is allocated and never freed by `dnit`
+# target borrows its manifest-owned declaration until manifest destruction
+pub rec ResolvedTarget {
+    target: *TargetDef;
+}
+
+# the profile a selection resolves to, copied out of its `ProfileDef`
+# ---
+# name:          the profile's name
+# opt:           as `ProfileDef`
+# debug:         as `ProfileDef`
+# simd:          as `ProfileDef`
+# vectorize:     as `ProfileDef`
+# float_reassoc: as `ProfileDef`
+# allow:         as `ProfileDef`
+pub rec ResolvedProfile {
+    name:          intern.StrId;
+    opt:           MOpt;
+    debug:         bool;
+    simd:          SimdMode;
+    vectorize:     bool;
+    float_reassoc: bool;
+    allow:         diagnostic_kind.KindSet;
+}
+
+fun artifact_pinned_target(itn: *intern.Interner, m: *Manifest, a: *ArtifactDef) *TargetDef {
+    val host_os:   u32 = lang_target.host_os_id();
+    val host_arch: u32 = lang_target.host_arch_id();
+
+    var only:       *TargetDef = nil;
+    var count:      u32        = 0;
+    var host_first: *TargetDef = nil;
+    var host_count: u32        = 0;
+    var i:          u32        = 0;
+    for (i < m.target_count) {
+        if (artifact_supports_target(itn, a, m.targets[i].name)) {
+            if (count == 0) { only = ?m.targets[i]; }
+            count = count + 1;
+            if (target_matches_host(itn, ?m.targets[i], host_os, host_arch)) {
+                if (host_count == 0) { host_first = ?m.targets[i]; }
+                host_count = host_count + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (count == 1)      { ret only; }
+    if (host_count == 1) { ret host_first; }
+    ret nil;
+}
+
+# the target a selector names: a declared name, `native` for the declared
+# target matching the host, or "" for the artifact's pinned target and
+# otherwise `native`
+pub fun resolve_target(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, selector: str,
+    art: *ArtifactDef) res[ResolvedTarget, fail.Fail] {
+    val host_os:   u32 = lang_target.host_os_id();
+    val host_arch: u32 = lang_target.host_arch_id();
+
+    if (str_empty(selector) && art != nil) {
+        val pinned: *TargetDef = artifact_pinned_target(itn, m, art);
+        if (pinned != nil) {
+            # a sole hosted target the host cannot run is the fallback `native` refuses
+            if (target_is_hosted(itn, pinned) && !target_matches_host(itn, pinned, host_os, host_arch)) {
+                ret res[ResolvedTarget, fail.Fail].err{artifact_no_host_target(alloc, itn, art, pinned)};
+            }
+            ret res[ResolvedTarget, fail.Fail].ok{ResolvedTarget{target: pinned}};
+        }
+    }
+
+    if (!str_empty(selector) && !str_equals(selector, "native")) {
+        val d: *TargetDef = find_target_by_name(itn, m, selector);
+        if (d == nil) { ret res[ResolvedTarget, fail.Fail].err{refuse(alloc, diagnostic_kind.SELECTION_UNKNOWN, "mach.toml: no target named '{}'", selector)}; }
+        ret res[ResolvedTarget, fail.Fail].ok{ResolvedTarget{target: d}};
+    }
+
+    var first_match: *TargetDef = nil;
+    var match_count: u32        = 0;
+    var i:           u32        = 0;
+    for (i < m.target_count) {
+        if (target_matches_host(itn, ?m.targets[i], host_os, host_arch)) {
+            if (first_match == nil) { first_match = ?m.targets[i]; }
+            match_count = match_count + 1;
+        }
+        i = i + 1;
+    }
+
+    if (match_count > 1) {
+        var names: str = "";
+        i = 0;
+        for (i < m.target_count) {
+            if (target_matches_host(itn, ?m.targets[i], host_os, host_arch)) {
+                var sep: str = "";
+                if (!str_empty(names)) { sep = ", "; }
+                val longer: res[str, fail.Fail] = sfmt(alloc, "{}{}{}", names, sep, intern.text(itn, m.targets[i].name));
+                if (sel longer.err) { ret res[ResolvedTarget, fail.Fail].err{longer.err}; }
+                names = longer.ok;
+            }
+            i = i + 1;
+        }
+        var matching: Sites = sites_init(alloc);
+        i = 0;
+        for (i < m.target_count) {
+            if (target_matches_host(itn, ?m.targets[i], host_os, host_arch)) { sites_add(?matching, m.targets[i].at); }
+            i = i + 1;
+        }
+        ret res[ResolvedTarget, fail.Fail].err{sites_fail(alloc, ?matching,
+            refuse(alloc, diagnostic_kind.SELECTION_AMBIGUOUS, "mach.toml: 'native' matches multiple targets for the host ({})", names))};
+    }
+    if (match_count == 1) { ret res[ResolvedTarget, fail.Fail].ok{ResolvedTarget{target: first_match}}; }
+    if (m.target_count == 0) {
+        if (m.native_target == nil) { ret res[ResolvedTarget, fail.Fail].err{fail.message("internal: manifest has no native target owner")}; }
+        ret res[ResolvedTarget, fail.Fail].ok{ResolvedTarget{target: m.native_target}};
+    }
+    var declared: Sites = sites_init(alloc);
+    i = 0;
+    for (i < m.target_count) {
+        sites_add(?declared, m.targets[i].at);
+        i = i + 1;
+    }
+    ret res[ResolvedTarget, fail.Fail].err{sites_fail(alloc, ?declared, no_host_target(alloc, itn, m))};
+}
+
+# the refusal of an artifact whose only target is a hosted one the host cannot run,
+# located at the artifact
+fun artifact_no_host_target(alloc: *A.Allocator, itn: *intern.Interner, art: *ArtifactDef, only: *TargetDef) fail.Fail {
+    val host: res[str, fail.Fail] = host_tuple(alloc);
+    if (sel host.err) { ret host.err; }
+    val tuple: res[str, fail.Fail] = tuple_of(alloc, intern.text(itn, only.os), intern.text(itn, only.isa));
+    if (sel tuple.err) { ret tuple.err; }
+    var at: Sites = sites_init(alloc);
+    sites_add(?at, art.at);
+    ret sites_fail(alloc, ?at, refuse(alloc, diagnostic_kind.SELECTION_NO_HOST_TARGET,
+        "mach.toml: artifact '{}' matches no declared target for the host: the host is {} and its only target is {} ({}); declare a [target.<name>] for the host in its targets or select one with -t",
+        intern.text(itn, art.name), host.ok, intern.text(itn, only.name), tuple.ok));
+}
+
+# the refusal of `native` when no declared target matches the host: the host tuple,
+# every declared target with its own tuple, and the two ways out
+fun no_host_target(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest) fail.Fail {
+    var declared: str = "";
+    var i:        u32 = 0;
+    for (i < m.target_count) {
+        val t:     *TargetDef          = ?m.targets[i];
+        val tuple: res[str, fail.Fail] = tuple_of(alloc, intern.text(itn, t.os), intern.text(itn, t.isa));
+        if (sel tuple.err) { ret tuple.err; }
+        var sep: str = "";
+        if (i > 0) { sep = ", "; }
+        val longer: res[str, fail.Fail] = sfmt(alloc, "{}{}{} ({})", declared, sep, intern.text(itn, t.name), tuple.ok);
+        if (sel longer.err) { ret longer.err; }
+        declared = longer.ok;
+        i        = i + 1;
+    }
+    val host: res[str, fail.Fail] = host_tuple(alloc);
+    if (sel host.err) { ret host.err; }
+    ret refuse(alloc, diagnostic_kind.SELECTION_NO_HOST_TARGET,
+        "mach.toml: 'native' matches no declared target: the host is {} and the declared targets are {}; declare a [target.<name>] for the host or select one with -t",
+        host.ok, declared);
+}
+
+fun profile_resolved(pf: *ProfileDef) ResolvedProfile {
+    var rp: ResolvedProfile;
+    rp.name          = pf.name;
+    rp.opt           = pf.opt;
+    rp.debug         = pf.debug;
+    rp.simd          = pf.simd;
+    rp.vectorize     = pf.vectorize;
+    rp.float_reassoc = pf.float_reassoc;
+    rp.allow         = pf.allow;
+    ret rp;
+}
+
+# choose the profile a selection names. a named profile must be declared. an
+# empty name takes the sole declared profile, else the one with `default = true`,
+# of which parse admits at most one. several declared profiles with none marked
+# default are refused: no profile is ever selected by table order
+# ---
+# alloc: owns error text
+# itn:   resolves the names
+# m:     the manifest
+# pick:  the profile name, or "" for the default
+# ret:   the profile; err "mach.toml: no profile named '<pick>'" or, with an empty
+#        name, an error when several profiles are declared and none is the default
+pub fun resolve_profile(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, pick: str) res[ResolvedProfile, fail.Fail] {
+    var i: u32 = 0;
+    if (!str_empty(pick)) {
+        for (i < m.profile_count) {
+            if (str_equals(intern.text(itn, m.profiles[i].name), pick)) { ret res[ResolvedProfile, fail.Fail].ok{profile_resolved(?m.profiles[i])}; }
+            i = i + 1;
+        }
+        ret res[ResolvedProfile, fail.Fail].err{refuse(alloc, diagnostic_kind.SELECTION_UNKNOWN, "mach.toml: no profile named '{}'", pick)};
+    }
+
+    if (m.profile_count == 1) {
+        ret res[ResolvedProfile, fail.Fail].ok{profile_resolved(?m.profiles[0])};
+    }
+    for (i < m.profile_count) {
+        if (m.profiles[i].is_default) { ret res[ResolvedProfile, fail.Fail].ok{profile_resolved(?m.profiles[i])}; }
+        i = i + 1;
+    }
+    var declared: Sites = sites_init(alloc);
+    i = 0;
+    for (i < m.profile_count) {
+        sites_add(?declared, m.profiles[i].at);
+        i = i + 1;
+    }
+    ret res[ResolvedProfile, fail.Fail].err{sites_fail(alloc, ?declared, fail.user(diagnostic_kind.SELECTION_AMBIGUOUS, AMBIGUOUS_PROFILE_MSG))};
+}
+
+# a selection several candidates could satisfy is refused where a command
+# must pick one; table order carries no meaning
+val AMBIGUOUS_PROFILE_MSG:  str = "mach.toml: several profiles are declared and none is marked `default = true`; no profile is selected by table order: mark exactly one [profile.<name>] with `default = true` or select one with -p";
+val AMBIGUOUS_ARTIFACT_MSG: str = "mach.toml: several artifacts support the selected target and none is marked `default = true`; no artifact is selected by table order: mark exactly one [artifact.<name>] with `default = true` or select one with -a";
+
+# the default selection: what a command takes for a target when no `-a`
+# names an artifact. of the artifacts the target builds, those marked
+# `default = true` when any is, otherwise every one. build and check take the whole
+# selection, and a command that needs one artifact takes it only when it holds one
+# ---
+# itn:              resolves names
+# m:                the manifest
+# a:                the artifact asked about
+# target:           the resolved target's name
+# executables_only: consider `bin` artifacts only, so a library beside them is never taken
+# ret:              true when the default selection holds `a`
+pub fun default_selection_includes(itn: *intern.Interner, m: *Manifest, a: *ArtifactDef,
+    target: intern.StrId, executables_only: bool) bool {
+    if (!selection_scope_holds(itn, a, target, executables_only)) { ret false; }
+    if (a.is_default)                                             { ret true; }
+    var i: u32 = 0;
+    for (i < m.artifact_count) {
+        val other: *ArtifactDef = ?m.artifacts[i];
+        if (other.is_default && selection_scope_holds(itn, other, target, executables_only)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun selection_scope_holds(itn: *intern.Interner, a: *ArtifactDef, target: intern.StrId, executables_only: bool) bool {
+    if (executables_only && a.is_lib) { ret false; }
+    ret artifact_supports_target(itn, a, target);
+}
+
+# every declared artifact as `bin <name>` or `lib <name>`, comma separated
+fun artifact_candidates(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest) res[str, fail.Fail] {
+    var s: str = "";
+    var i: u32 = 0;
+    for (i < m.artifact_count) {
+        var sep: str = "";
+        if (i > 0) { sep = ", "; }
+        var kind: str = "bin";
+        if (m.artifacts[i].is_lib) { kind = "lib"; }
+        val longer: res[str, fail.Fail] = sfmt(alloc, "{}{}{} {}", s, sep, kind, intern.text(itn, m.artifacts[i].name));
+        if (sel longer.err) { ret longer; }
+        s = longer.ok;
+        i = i + 1;
+    }
+    ret res[str, fail.Fail].ok{s};
+}
+
+
 # empty selectors: every axis takes the manifest's default
 # ---
 # alloc: backs the three pattern vectors
@@ -98,6 +385,13 @@ pub fun selectors_init(alloc: *A.Allocator) Selectors {
         artifacts: collections_vector.init[str](alloc), targets: collections_vector.init[str](alloc),
         profiles:  collections_vector.init[str](alloc), all: false
     };
+}
+
+# release the pattern vectors of selectors; the patterns themselves are borrowed
+pub fun selectors_dnit(s: *Selectors) {
+    collections_vector.dnit[str](?s.artifacts);
+    collections_vector.dnit[str](?s.targets);
+    collections_vector.dnit[str](?s.profiles);
 }
 
 # selectors naming at most one pattern per axis: each non-empty value is its
@@ -117,6 +411,22 @@ pub fun selectors_of(alloc: *A.Allocator, artifact: str, target: str, profile: s
     val p: err[fail.Fail] = value_add(?s.profiles, profile);
     if (sel p.err) { ret res[Selectors, fail.Fail].err{p.err}; }
     ret res[Selectors, fail.Fail].ok{s};
+}
+
+# the allocator a fixture's selectors live in: the page allocator, which holds
+# no state, so the selectors outlive the call that made them
+#[testing]
+var t_selectors_backing: A.Allocator;
+
+# `selectors_of` for a test's fixture; a refusal ends the test
+#[testing]
+pub fun t_selectors(artifact: str, target: str, profile: str) Selectors {
+    val made: err[A.Error] = page.make(?t_selectors_backing);
+    if (sel made.err) { panic("a test fixture's selectors have no allocator\n"); }
+    val r: res[Selectors, fail.Fail] = selectors_of(?t_selectors_backing, artifact, target, profile);
+    if (sel r.ok) { ret r.ok; }
+    panic("a test fixture's selectors could not be made\n");
+    ret selectors_init(?t_selectors_backing);
 }
 
 # add `value` to `values` unless it is empty
@@ -186,17 +496,10 @@ fun axis_listing(alloc: *A.Allocator, ax: *Axis) res[str, fail.Fail] {
     ret res[str, fail.Fail].ok{s};
 }
 
-# an exact value that names nothing on its axis but a path in the working
-# directory is almost always the shell expanding an unquoted `*`
+# an exact value that names nothing on its axis
 fun unknown_name(alloc: *A.Allocator, ax: *Axis, value: str) fail.Fail {
     val listing: res[str, fail.Fail] = axis_listing(alloc, ax);
     if (sel listing.err) { ret listing.err; }
-    val present: res[bool, io_error.Error] = fs.exists(value);
-    if (sel present.ok && present.ok) {
-        ret refuse(alloc, diagnostic_kind.CLI_FLAG_VALUE,
-            "{} '{}' names no {} but names a path in the current directory: the shell probably expanded an unquoted wildcard; quote the pattern, as in {} '*' ({})",
-            ax.flag, value, ax.noun, ax.flag, listing.ok);
-    }
     ret refuse(alloc, diagnostic_kind.SELECTION_UNKNOWN, "mach.toml: no {} named '{}' ({})", ax.noun, value, listing.ok);
 }
 
@@ -260,6 +563,25 @@ fun axis_patterns(alloc: *A.Allocator, given: *Vector[str], all: bool) res[Vecto
     ret res[Vector[str], fail.Fail].ok{star};
 }
 
+# target patterns with `native`, the reserved name no target may take, replaced by
+# the name of the declared target `resolve_target` takes for it
+fun native_named(alloc: *A.Allocator, tmp: *A.Allocator, itn: *intern.Interner, m: *Manifest, patterns: Vector[str]) res[Vector[str], fail.Fail] {
+    var named: Vector[str] = collections_vector.init[str](tmp);
+    var i:     usize       = 0;
+    for (i < patterns.len) {
+        var p: str = patterns.data[i];
+        if (str_equals(p, "native")) {
+            val rt: res[ResolvedTarget, fail.Fail] = resolve_target(alloc, itn, m, p, nil);
+            if (sel rt.err) { ret res[Vector[str], fail.Fail].err{rt.err}; }
+            p = intern.text(itn, rt.ok.target.name);
+        }
+        val added: err[fail.Fail] = value_add(?named, p);
+        if (sel added.err) { ret res[Vector[str], fail.Fail].err{added.err}; }
+        i = i + 1;
+    }
+    ret res[Vector[str], fail.Fail].ok{named};
+}
+
 # the targets the target axis chooses among: the declared ones, or the host
 # target synthesized for a manifest that declares none
 fun target_def_at(m: *Manifest, i: u32) *TargetDef {
@@ -312,7 +634,57 @@ fun no_artifact_for(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, de
         names = longer.ok;
         i     = i + 1;
     }
-    ret refuse(alloc, diagnostic_kind.TARGET_NO_ARTIFACTS, "mach.toml: no artifact declares target '{}'; declared artifacts: {}", intern.text(itn, def.name), names);
+    var sites: Sites = sites_init(alloc);
+    i = 0;
+    for (i < m.artifact_count) {
+        sites_add(?sites, m.artifacts[i].targets_at);
+        i = i + 1;
+    }
+    ret sites_fail(alloc, ?sites, refuse(alloc, diagnostic_kind.TARGET_NO_ARTIFACTS, "mach.toml: no artifact declares target '{}'; declared artifacts: {}", intern.text(itn, def.name), names));
+}
+
+# the one artifact the default selection holds for a target, under `mode`.
+# `ARTIFACT_DEFAULT_ONE` refuses a selection of several, naming the duplicate
+# defaults or every candidate; `ARTIFACT_DEFAULT_EXECUTABLE` considers `bin`
+# artifacts only and refuses when it does not hold exactly one
+fun default_one(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, mode: ArtifactDefault,
+    def: *TargetDef) res[*ArtifactDef, fail.Fail] {
+    val only:   bool         = executables_only(mode);
+    var count:  u32          = 0;
+    var marked: u32          = 0;
+    var sole:   *ArtifactDef = nil;
+    var i:      u32          = 0;
+    for (i < m.artifact_count) {
+        val a: *ArtifactDef = ?m.artifacts[i];
+        if (a.is_default && selection_scope_holds(itn, a, def.name, only)) { marked = marked + 1; }
+        if (default_selection_includes(itn, m, a, def.name, only)) {
+            sole  = a;
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    if (count == 1) { ret res[*ArtifactDef, fail.Fail].ok{sole}; }
+    if (only) {
+        ret res[*ArtifactDef, fail.Fail].err{refuse(alloc, diagnostic_kind.SELECTION_AMBIGUOUS,
+            "mach.toml: target '{}' has no sole default bin artifact; select one with -a", intern.text(itn, def.name))};
+    }
+    var sites: Sites = sites_init(alloc);
+    i = 0;
+    for (i < m.artifact_count) {
+        val a: *ArtifactDef = ?m.artifacts[i];
+        if (marked > 1) {
+            if (a.is_default && selection_scope_holds(itn, a, def.name, false)) { sites_add(?sites, a.default_at); }
+        }
+        or (default_selection_includes(itn, m, a, def.name, false)) { sites_add(?sites, a.at); }
+        i = i + 1;
+    }
+    if (marked > 1) {
+        ret res[*ArtifactDef, fail.Fail].err{sites_fail(alloc, ?sites, fail.user(diagnostic_kind.SELECTION_DUPLICATE_DEFAULT,
+            "mach.toml: multiple artifacts supporting the selected target have 'default = true'; exactly one is allowed"))};
+    }
+    val listed: res[str, fail.Fail] = artifact_candidates(alloc, itn, m);
+    if (sel listed.err) { ret res[*ArtifactDef, fail.Fail].err{listed.err}; }
+    ret res[*ArtifactDef, fail.Fail].err{sites_fail(alloc, ?sites, refuse(alloc, diagnostic_kind.SELECTION_AMBIGUOUS, "{} ({})", AMBIGUOUS_ARTIFACT_MSG, listed.ok))};
 }
 
 # the artifacts the default selection holds for one target, by `mode`. an
@@ -340,21 +712,12 @@ fun default_pairs(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, mode
         ret err[fail.Fail].ok{};
     }
 
-    var pick: Selection = Selection{target: target, profile: "", artifact: "", want_lib: false, has_artifact: false};
-    if (mode == ARTIFACT_DEFAULT_ONE) {
-        val chosen: err[fail.Fail] = select_primary_artifact(alloc, itn, m, ?pick);
-        if (sel chosen.err) { ret chosen; }
-    }
-    or {
-        val chosen: err[fail.Fail] = select_sole_executable_artifact(alloc, itn, m, ?pick);
-        if (sel chosen.err) { ret chosen; }
-    }
     var a: *ArtifactDef = nil;
-    if (pick.has_artifact)     { a = find_artifact(itn, m, pick.artifact); }
-    or (m.artifact_count == 1) { a = ?m.artifacts[0]; }
-    if (a == nil) {
-        ret err[fail.Fail].err{refuse(alloc, diagnostic_kind.SELECTION_AMBIGUOUS,
-            "mach.toml: several artifacts support target '{}' and none is a sole default; select one with -a", intern.text(itn, def.name))};
+    if (m.artifact_count == 1) { a = ?m.artifacts[0]; }
+    or {
+        val chosen: res[*ArtifactDef, fail.Fail] = default_one(alloc, itn, m, mode, def);
+        if (sel chosen.err) { ret err[fail.Fail].err{chosen.err}; }
+        a = chosen.ok;
     }
     if (!artifact_supports_target(itn, a, def.name)) {
         if (exact) { ret err[fail.Fail].err{no_artifact_for(alloc, itn, m, def)}; }
@@ -383,19 +746,27 @@ fun unsupported(alloc: *A.Allocator, itn: *intern.Interner, a: *ArtifactDef, def
 #        nothing, an unsupported exact pair, an ambiguous default or an empty selection
 pub fun resolve_cells(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, s: *Selectors,
     mode: ArtifactDefault) res[Vector[Cell], fail.Fail] {
-    var profiles:           Vector[str]                 = collections_vector.init[str](alloc);
-    val profile_patterns_r: res[Vector[str], fail.Fail] = axis_patterns(alloc, ?s.profiles, s.all);
+    # every working vector lives in a scratch arena; only the cells and a refusal outlive the call
+    var ar:     arena.Arena;
+    val ar_ok:  err[A.Error] = arena.init(?ar, alloc, 0);
+    if (sel ar_ok.err) { ret res[Vector[Cell], fail.Fail].err{fail.refused(ar_ok.err)}; }
+    fin { arena.dnit(?ar); }
+    var tmp:    A.Allocator;
+    val tmp_ok: err[A.Error] = arena.make(?tmp, ?ar);
+    if (sel tmp_ok.err) { ret res[Vector[Cell], fail.Fail].err{fail.refused(tmp_ok.err)}; }
+    var profiles:           Vector[str]                 = collections_vector.init[str](?tmp);
+    val profile_patterns_r: res[Vector[str], fail.Fail] = axis_patterns(?tmp, ?s.profiles, s.all);
     if (sel profile_patterns_r.err) { ret res[Vector[Cell], fail.Fail].err{profile_patterns_r.err}; }
     val profile_patterns: Vector[str] = profile_patterns_r.ok;
     if (profile_patterns.len > 0) {
-        var ax: Axis = axis_init(alloc, "-p", "profile");
+        var ax: Axis = axis_init(?tmp, "-p", "profile");
         var i:  u32  = 0;
         for (i < m.profile_count) {
             val added: err[fail.Fail] = axis_add(?ax, itn, m.profiles[i].name);
             if (sel added.err) { ret res[Vector[Cell], fail.Fail].err{added.err}; }
             i = i + 1;
         }
-        var picks:  Vector[Pick]   = collections_vector.init[Pick](alloc);
+        var picks:  Vector[Pick]   = collections_vector.init[Pick](?tmp);
         val picked: err[fail.Fail] = pick_axis(alloc, ?ax, ?profile_patterns, ?picks);
         if (sel picked.err) { ret res[Vector[Cell], fail.Fail].err{picked.err}; }
         var k: usize = 0;
@@ -412,13 +783,13 @@ pub fun resolve_cells(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, 
         if (sel added.err) { ret res[Vector[Cell], fail.Fail].err{added.err}; }
     }
 
-    var artifacts:           Vector[Pick]                = collections_vector.init[Pick](alloc);
-    val artifact_patterns_r: res[Vector[str], fail.Fail] = axis_patterns(alloc, ?s.artifacts, s.all);
+    var artifacts:           Vector[Pick]                = collections_vector.init[Pick](?tmp);
+    val artifact_patterns_r: res[Vector[str], fail.Fail] = axis_patterns(?tmp, ?s.artifacts, s.all);
     if (sel artifact_patterns_r.err) { ret res[Vector[Cell], fail.Fail].err{artifact_patterns_r.err}; }
     val artifact_patterns: Vector[str] = artifact_patterns_r.ok;
     val artifacts_given:   bool        = artifact_patterns.len > 0;
     if (artifacts_given) {
-        var ax: Axis = axis_init(alloc, "-a", "artifact");
+        var ax: Axis = axis_init(?tmp, "-a", "artifact");
         var i:  u32  = 0;
         for (i < m.artifact_count) {
             val added: err[fail.Fail] = axis_add(?ax, itn, m.artifacts[i].name);
@@ -429,14 +800,16 @@ pub fun resolve_cells(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, 
         if (sel picked.err) { ret res[Vector[Cell], fail.Fail].err{picked.err}; }
     }
 
-    var pairs:             Vector[Pair]                = collections_vector.init[Pair](alloc);
+    var pairs:             Vector[Pair]                = collections_vector.init[Pair](?tmp);
     var skipped:           bool                        = false;
     var skipped_fail:      fail.Fail;
-    val target_patterns_r: res[Vector[str], fail.Fail] = axis_patterns(alloc, ?s.targets, s.all);
+    val target_patterns_r: res[Vector[str], fail.Fail] = axis_patterns(?tmp, ?s.targets, s.all);
     if (sel target_patterns_r.err) { ret res[Vector[Cell], fail.Fail].err{target_patterns_r.err}; }
-    val target_patterns: Vector[str] = target_patterns_r.ok;
+    val named_r: res[Vector[str], fail.Fail] = native_named(alloc, ?tmp, itn, m, target_patterns_r.ok);
+    if (sel named_r.err) { ret res[Vector[Cell], fail.Fail].err{named_r.err}; }
+    val target_patterns: Vector[str] = named_r.ok;
     if (target_patterns.len > 0) {
-        var ax: Axis = axis_init(alloc, "-t", "target");
+        var ax: Axis = axis_init(?tmp, "-t", "target");
         val n:  u32  = target_candidates(m);
         var i:  u32  = 0;
         for (i < n) {
@@ -444,7 +817,7 @@ pub fun resolve_cells(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, 
             if (sel added.err) { ret res[Vector[Cell], fail.Fail].err{added.err}; }
             i = i + 1;
         }
-        var targets: Vector[Pick]   = collections_vector.init[Pick](alloc);
+        var targets: Vector[Pick]   = collections_vector.init[Pick](?tmp);
         val picked:  err[fail.Fail] = pick_axis(alloc, ?ax, ?target_patterns, ?targets);
         if (sel picked.err) { ret res[Vector[Cell], fail.Fail].err{picked.err}; }
         var ti: usize = 0;
@@ -536,6 +909,26 @@ pub fun resolve_cells(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, 
     ret res[Vector[Cell], fail.Fail].ok{cells};
 }
 
+# resolve selectors a command needs one cell of: `resolve_cells`, refused as
+# `single_selection_fail` refuses when the selection holds several
+# ---
+# what: what needs one cell, such as "mach doc renders one artifact"
+# ret:  the cell; the `resolve_cells` errors, or the refusal of several cells
+pub fun resolve_cell(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, s: *Selectors,
+    mode: ArtifactDefault, what: str) res[Cell, fail.Fail] {
+    val resolved: res[Vector[Cell], fail.Fail] = resolve_cells(alloc, itn, m, s, mode);
+    if (sel resolved.err) { ret res[Cell, fail.Fail].err{resolved.err}; }
+    var cells: Vector[Cell] = resolved.ok;
+    if (cells.len != 1) {
+        val refused: fail.Fail = single_selection_fail(alloc, diagnostic_kind.SELECTION_AMBIGUOUS, what, ?cells);
+        collections_vector.dnit[Cell](?cells);
+        ret res[Cell, fail.Fail].err{refused};
+    }
+    val c: Cell = cells.data[0];
+    collections_vector.dnit[Cell](?cells);
+    ret res[Cell, fail.Fail].ok{c};
+}
+
 #[testing]
 fun ut_cells(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, a: str, t: str, p: str, all: bool,
     mode: ArtifactDefault) res[Vector[Cell], fail.Fail] {
@@ -569,7 +962,7 @@ test resolve_cells__patterns_all_and_filters {
     val src: str = t_fmt(?alloc, "{}{}{}{}",
         "[project]\nmach=\">=5\"\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}/{profile.name}\"\n",
         host_target_table(?alloc, "lin"), away,
-        "[target.fs]\nisa=\"x86_64\"\nos=\"freestanding\"\nabi=\"sysv64\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[profile.release]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n[artifact.app]\nkind=\"bin\"\nentry=\"app.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n[artifact.tool]\nkind=\"bin\"\nentry=\"tool.mach\"\nout=\"bin/tool\"\ntargets=[\"lin\"]\nlink=[]\nneed=[]\n[artifact.lib]\nkind=\"static\"\nentry=\"lib.mach\"\nout=\"lib/lib\"\ntargets=[\"lin\", \"fs\"]\nlink=[]\nneed=[]\n");
+        t_profiled("[target.fs]\nisa=\"x86_64\"\nos=\"freestanding\"\nabi=\"sysv64\"\n", "[artifact.app]\nkind=\"bin\"\nentry=\"app.mach\"\nout=\"{project.out}/bin/app\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n[artifact.tool]\nkind=\"bin\"\nentry=\"tool.mach\"\nout=\"{project.out}/bin/tool\"\ntargets=[\"lin\"]\nlink=[]\nneed=[]\n[artifact.lib]\nkind=\"static\"\nentry=\"lib.mach\"\nout=\"{project.out}/lib/lib\"\ntargets=[\"lin\", \"fs\"]\nlink=[]\nneed=[]\n"));
     val parsed: res[Manifest, fail.Fail] = tparse(?alloc, ?itn, src);
     if (sel parsed.err) { ret 2; }
     var m: Manifest = parsed.ok;
@@ -606,8 +999,12 @@ test resolve_cells__patterns_all_and_filters {
     if (!ut_refused(ut_cells(?alloc, ?itn, ?m, "nope", "", "", false, ARTIFACT_DEFAULT_SET), diagnostic_kind.SELECTION_UNKNOWN, "declared: app, tool, lib"))                    { ret 13; }
     if (!ut_refused(ut_cells(?alloc, ?itn, ?m, "z*", "", "", false, ARTIFACT_DEFAULT_SET), diagnostic_kind.SELECTION_UNKNOWN, "-a 'z*' matches no artifact"))                   { ret 14; }
     if (!ut_refused(ut_cells(?alloc, ?itn, ?m, "", "", "fast", false, ARTIFACT_DEFAULT_SET), diagnostic_kind.SELECTION_UNKNOWN, "no profile named 'fast'"))                     { ret 15; }
-    # a value naming no entry but an existing path is the shell's expansion of an unquoted glob
-    if (!ut_refused(ut_cells(?alloc, ?itn, ?m, "", "/", "", false, ARTIFACT_DEFAULT_SET), diagnostic_kind.CLI_FLAG_VALUE, "quote the pattern, as in -t '*'")) { ret 16; }
+    # `native` names the declared target matching the host
+    val native: res[Vector[Cell], fail.Fail] = ut_cells(?alloc, ?itn, ?m, "tool", "native", "", false, ARTIFACT_DEFAULT_SET);
+    if (sel native.err)                                                     { ret 18; }
+    if (native.ok.len != 1 || !str_equals(native.ok.data[0].target, "lin")) { ret 18; }
+    # a value naming no entry is unknown, whatever the working directory holds
+    if (!ut_refused(ut_cells(?alloc, ?itn, ?m, "", "/", "", false, ARTIFACT_DEFAULT_SET), diagnostic_kind.SELECTION_UNKNOWN, "no target named '/'")) { ret 16; }
     # a command that needs one artifact refuses a default selection of three
     if (!ut_refused(ut_cells(?alloc, ?itn, ?m, "", "lin", "", false, ARTIFACT_DEFAULT_ONE), diagnostic_kind.SELECTION_AMBIGUOUS, "none is marked `default = true`")) { ret 17; }
     ret 0;
@@ -648,7 +1045,7 @@ test resolve_cells__every_refused_allocation_fails_the_selection {
     val src: str = t_fmt(?alloc, "{}{}{}",
         "[project]\nmach=\">=5\"\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}/{profile.name}\"\n",
         host_target_table(?alloc, "lin"),
-        "[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[artifact.app]\nkind=\"bin\"\nentry=\"app.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n");
+        "[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n[artifact.app]\nkind=\"bin\"\nentry=\"app.mach\"\nout=\"{project.out}/bin/app\"\ntargets=[\"*\"]\nlink=[]\nneed=[]\n");
     val parsed: res[Manifest, fail.Fail] = tparse(?alloc, ?itn, src);
     if (sel parsed.err) { ret 2; }
     var m: Manifest = parsed.ok;
@@ -672,6 +1069,274 @@ test resolve_cells__every_refused_allocation_fails_the_selection {
             k = k + 1;
         }
         c = c + 1;
+    }
+    ret 0;
+}
+
+# a mode that needs one artifact takes the default selection only when it holds
+# one: the sole artifact supporting the target, or the one marked `default =
+# true`. several candidates, or several marked, are refused and never narrowed by
+# table order, and `run`'s mode weighs only the `bin` artifacts
+test resolve_cells__default_artifact_modes_never_choose_by_order {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    fin { arena.dnit(?ar); }
+    val head:   str = "[project]\nmach=\">=5\"\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[target.windows]\nisa=\"x86_64\"\nos=\"windows\"\nabi=\"win64\"\n[profile.debug]\ndefault=true\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=false\nfloat_reassoc=false\n";
+    val app:    str = "[artifact.app]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"{project.out}/bin/app\"\ntargets=[\"linux\"]\n";
+    val appwin: str = "[artifact.app-windows]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"{project.out}/bin/app.exe\"\ntargets=[\"windows\"]\n";
+    val lib:    str = "[artifact.applib]\nkind=\"static\"\nentry=\"l.mach\"\nout=\"{project.out}/lib/applib\"\ntargets=[\"linux\"]\n";
+    val second: str = "[artifact.second]\nkind=\"bin\"\nentry=\"b.mach\"\nout=\"{project.out}/bin/second\"\ntargets=[\"linux\"]\n";
+    val marked: str = "default=true\n";
+
+    # the sole artifact supporting a target is taken, and an exact pair it does not support is refused
+    val split: res[Manifest, fail.Fail] = tparse(?alloc, ?itn, t_fmt(?alloc, "{}{}{}", head, app, appwin));
+    if (sel split.err) { ret 2; }
+    var m: Manifest = split.ok;
+    if (!ut_picks(?alloc, ?itn, ?m, "windows", ARTIFACT_DEFAULT_ONE, "app-windows"))        { ret 3; }
+    if (!ut_picks(?alloc, ?itn, ?m, "linux", ARTIFACT_DEFAULT_ONE, "app"))                  { ret 3; }
+    if (!ut_picks(?alloc, ?itn, ?m, "windows", ARTIFACT_DEFAULT_EXECUTABLE, "app-windows")) { ret 3; }
+    if (!ut_refused(ut_cells(?alloc, ?itn, ?m, "app", "windows", "", false, ARTIFACT_DEFAULT_ONE), diagnostic_kind.SELECTION_UNSUPPORTED_TARGET, "does not support target 'windows'")) { ret 4; }
+
+    # run takes the bin beside a library, a command needing one artifact does not
+    val beside: res[Manifest, fail.Fail] = tparse(?alloc, ?itn, t_fmt(?alloc, "{}{}{}", head, app, lib));
+    if (sel beside.err) { ret 5; }
+    m = beside.ok;
+    if (!ut_picks(?alloc, ?itn, ?m, "linux", ARTIFACT_DEFAULT_EXECUTABLE, "app")) { ret 6; }
+    if (!ut_refused(ut_cells(?alloc, ?itn, ?m, "", "linux", "", false, ARTIFACT_DEFAULT_ONE), diagnostic_kind.SELECTION_AMBIGUOUS, "(bin app, lib applib)")) { ret 7; }
+    val bins: res[Manifest, fail.Fail] = tparse(?alloc, ?itn, t_fmt(?alloc, "{}{}{}{}", head, app, lib, second));
+    if (sel bins.err) { ret 8; }
+    m = bins.ok;
+    if (!ut_refused(ut_cells(?alloc, ?itn, ?m, "", "linux", "", false, ARTIFACT_DEFAULT_EXECUTABLE), diagnostic_kind.SELECTION_AMBIGUOUS, "no sole default bin artifact")) { ret 9; }
+
+    # one mark decides every mode, whatever the table order
+    val one: res[Manifest, fail.Fail] = tparse(?alloc, ?itn, t_fmt(?alloc, "{}{}{}{}", head, app, second, marked));
+    if (sel one.err) { ret 10; }
+    m = one.ok;
+    if (!ut_picks(?alloc, ?itn, ?m, "linux", ARTIFACT_DEFAULT_ONE, "second"))        { ret 11; }
+    if (!ut_picks(?alloc, ?itn, ?m, "linux", ARTIFACT_DEFAULT_EXECUTABLE, "second")) { ret 11; }
+    if (!ut_picks(?alloc, ?itn, ?m, "linux", ARTIFACT_DEFAULT_SET, "second"))        { ret 11; }
+
+    val two: res[Manifest, fail.Fail] = tparse(?alloc, ?itn, t_fmt(?alloc, "{}{}{}{}{}", head, app, marked, second, marked));
+    if (sel two.err) { ret 12; }
+    m = two.ok;
+    if (!ut_refused(ut_cells(?alloc, ?itn, ?m, "", "linux", "", false, ARTIFACT_DEFAULT_ONE), diagnostic_kind.SELECTION_DUPLICATE_DEFAULT, "exactly one is allowed")) { ret 13; }
+
+    val bad: res[Manifest, fail.Fail] = tparse(?alloc, ?itn, t_fmt(?alloc, "{}{}default=\"yes\"\n", head, app));
+    if (!(sel bad.err && str_contains(fail.describe(bad.err), "default must be a boolean"))) { ret 14; }
+    ret 0;
+}
+
+# whether the selection of `target` under `mode` is the one cell of `artifact`
+#[testing]
+fun ut_picks(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, target: str, mode: ArtifactDefault,
+    artifact: str) bool {
+    val r: res[Vector[Cell], fail.Fail] = ut_cells(alloc, itn, m, "", target, "", false, mode);
+    if (sel r.err) { ret false; }
+    ret r.ok.len == 1 && str_equals(r.ok.data[0].artifact, artifact);
+}
+
+test resolve_profile__allow_is_read_and_validated {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+    val head: str = "[project]\nmach=\">=5\"\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[profile.p]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n";
+
+    val a: res[Manifest, fail.Fail] = tparse(?alloc, ?itn, t_fmt(?alloc, "{}{}", head, "allow=[\"import.unused\", \"doc\"]\n"));
+    if (sel a.err) { code = 2; }
+    if (sel a.ok) {
+        var ma: Manifest                        = a.ok;
+        val ra: res[ResolvedProfile, fail.Fail] = resolve_profile(?alloc, ?itn, ?ma, "p");
+        if (sel ra.err) { code = 3; }
+        if (sel ra.ok) {
+            var allow: diagnostic_kind.KindSet = ra.ok.allow;
+            if (!diagnostic_kind.set_has(?allow, diagnostic_kind.IMPORT_UNUSED) || !diagnostic_kind.set_has(?allow, diagnostic_kind.DOC_LINT)) { code = 4; }
+            if (diagnostic_kind.set_has(?allow, diagnostic_kind.DECL_DEPRECATED))                                                              { code = 5; }
+        }
+    }
+
+    var bad:  [6]str;
+    var want: [6]str;
+    bad[0]  = "allow=[\"no-such-kind\"]\n";
+    want[0] = "[profile.p].allow entry \"no-such-kind\" is not a warning key; the warning keys are \"import.unused\"";
+    bad[1]  = "allow=[\"secret.not_oblivious\"]\n";
+    want[1] = "[profile.p].allow entry \"secret.not_oblivious\" names an error; only a warning can be silenced";
+    bad[2]  = "allow=[\"decl.deprecated\", \"decl.deprecated\"]\n";
+    want[2] = "[profile.p].allow lists \"decl.deprecated\" twice";
+    bad[3]  = "allow=\"decl.deprecated\"\n";
+    want[3] = "[profile.p].allow must be an array of strings";
+    bad[4]  = "allow=[\"unused-import\"]\n";
+    want[4] = "[profile.p].allow entry \"unused-import\" is not a warning key";
+    bad[5]  = "allow=[\"vec\"]\n";
+    want[5] = "[profile.p].allow entry \"vec\" is not a warning key";
+    var i: usize = 0;
+    for (i < 6) {
+        val r: res[Manifest, fail.Fail] = tparse(?alloc, ?itn, t_fmt(?alloc, "{}{}", head, bad[i]));
+        if (!(sel r.err && str_contains(fail.describe(r.err), want[i]))) { code = 10 + i::i32; }
+        i = i + 1;
+    }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test resolve_profile__float_reassoc_is_read_and_validated {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+    val head: str = "[project]\nmach=\">=5\"\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n";
+
+    val a: res[Manifest, fail.Fail] = tparse(?alloc, ?itn, t_fmt(?alloc, "{}{}", head, "[profile.p]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n"));
+    if (sel a.err) { code = 1; }
+    if (sel a.ok) {
+        var ma: Manifest = a.ok;
+        if (ma.profiles[0].float_reassoc) { code = 1; }
+        val ra: res[ResolvedProfile, fail.Fail] = resolve_profile(?alloc, ?itn, ?ma, "p");
+        if (sel ra.err) { code = 1; }
+        if (sel ra.ok) {
+            if (ra.ok.float_reassoc) { code = 1; }
+        }
+    }
+
+    val b: res[Manifest, fail.Fail] = tparse(?alloc, ?itn, t_fmt(?alloc, "{}{}", head, "[profile.p]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nfloat_reassoc=true\nvectorize=true\n"));
+    if (sel b.err) { code = 1; }
+    if (sel b.ok) {
+        var mb: Manifest = b.ok;
+        if (!mb.profiles[0].float_reassoc) { code = 1; }
+        val rb: res[ResolvedProfile, fail.Fail] = resolve_profile(?alloc, ?itn, ?mb, "p");
+        if (sel rb.err) { code = 1; }
+        if (sel rb.ok) {
+            if (!rb.ok.float_reassoc) { code = 1; }
+        }
+    }
+
+    val d: res[Manifest, fail.Fail] = tparse(?alloc, ?itn, t_fmt(?alloc, "{}{}", head, "[profile.p]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nfloat_reassoc=\"yes\"\nvectorize=true\n"));
+    if (!(sel d.err && str_contains(fail.describe(d.err), "float_reassoc must be a boolean"))) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test resolve_profile__selection_contract {
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    var itn:     intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+    val head: str = "[project]\nmach=\">=5\"\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{profile.name}\"\n";
+
+    # a manifest declares its profiles: none is made up for it
+    val undeclared: res[Manifest, fail.Fail] = tparse(?alloc, ?itn, head);
+    if (sel undeclared.ok) { code = 1; }
+
+    val sole: res[Manifest, fail.Fail] = tparse(?alloc, ?itn, t_fmt(?alloc, "{}{}", head,
+        "[profile.ship]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n"));
+    if (sel sole.err) { code = 1; }
+    if (sel sole.ok) {
+        var m: Manifest = sole.ok;
+        if (m.profile_count != 1 || m.profiles[0].is_default) { code = 1; }
+        val omitted: res[ResolvedProfile, fail.Fail] = resolve_profile(?alloc, ?itn, ?m, "");
+        val builtin: res[ResolvedProfile, fail.Fail] = resolve_profile(?alloc, ?itn, ?m, "debug");
+        if (!(sel omitted.ok && str_equals(intern.text(?itn, omitted.ok.name), "ship"))) { code = 1; }
+        if (sel builtin.ok)                                                              { code = 1; }
+    }
+
+    val selected: res[Manifest, fail.Fail] = tparse(?alloc, ?itn, t_fmt(?alloc, "{}{}", head,
+        "[profile.first]\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n[profile.chosen]\ndefault=true\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n"));
+    if (sel selected.err) { code = 1; }
+    if (sel selected.ok) {
+        var m:        Manifest                        = selected.ok;
+        val omitted:  res[ResolvedProfile, fail.Fail] = resolve_profile(?alloc, ?itn, ?m, "");
+        val explicit: res[ResolvedProfile, fail.Fail] = resolve_profile(?alloc, ?itn, ?m, "first");
+        if (sel omitted.ok) {
+            if (sel explicit.ok) {
+                if (!str_equals(intern.text(?itn, omitted.ok.name), "chosen")) { code = 1; }
+                if (!str_equals(intern.text(?itn, explicit.ok.name), "first")) { code = 1; }
+            }
+            if (sel explicit.err) { code = 1; }
+        }
+        if (sel omitted.err) { code = 1; }
+    }
+
+    val missing: res[Manifest, fail.Fail] = tparse(?alloc, ?itn, t_fmt(?alloc, "{}{}", head,
+        "[profile.a]\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n[profile.b]\nopt=2\ndebug=false\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n"));
+    if (sel missing.err) { code = 1; }
+    if (sel missing.ok) {
+        var mm:          Manifest                        = missing.ok;
+        val omitted_sel: res[ResolvedProfile, fail.Fail] = resolve_profile(?alloc, ?itn, ?mm, "");
+        if (!(sel omitted_sel.err && str_contains(fail.describe(omitted_sel.err), "several profiles are declared and none is marked `default = true`"))) { code = 1; }
+        val explicit_sel: res[ResolvedProfile, fail.Fail] = resolve_profile(?alloc, ?itn, ?mm, "a");
+        if (sel explicit_sel.err) { code = 1; }
+        if (sel explicit_sel.ok) {
+            if (!str_equals(intern.text(?itn, explicit_sel.ok.name), "a")) { code = 1; }
+        }
+    }
+
+    val typed: res[Manifest, fail.Fail] = tparse(?alloc, ?itn, t_fmt(?alloc, "{}{}", head,
+        "[profile.a]\ndefault=\"yes\"\nopt=0\ndebug=true\nsimd=\"scalarize\"\nvectorize=true\nfloat_reassoc=false\n"));
+    if (!(sel typed.err && str_contains(fail.describe(typed.err), "default must be a boolean"))) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+test resolve_target__native_resolution_borrows_one_manifest_definition {
+    # a manifest that declares no target owns only the native one
+    var backing: A.Allocator;
+    val make_r:  err[A.Error] = page.make(?backing);
+    if (sel make_r.err) { ret 1; }
+    var itn: intern.Interner = intern.init(?backing);
+    fin { intern.dnit(?itn); }
+    val doc_r: res[Doc, fail.Fail] = doc_parse(?backing, "mach.toml",
+        "[project]\nmach=\">=5\"\nid=\"owner\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\nvectorize = false\nfloat_reassoc = false\n");
+    if (sel doc_r.err) { ret 2; }
+    var doc: Doc = doc_r.ok;
+    fin { doc_dnit(?backing, ?doc); }
+    var tracking: T.Testing;
+    val make_r2:  err[A.Error] = T.make(?tracking);
+    if (sel make_r2.err) { ret 3; }
+    fin { T.dnit(?tracking); }
+    val parsed: res[Manifest, fail.Fail] = parse(?tracking.a, ?itn, ?doc);
+    if (sel parsed.err) { ret 4; }
+    var m: Manifest = parsed.ok;
+    fin { dnit(?m, ?tracking.a); }
+    if (m.native_target == nil || m.targets != nil || m.target_count != 0) { ret 5; }
+    val attempts: usize = tracking.attempts;
+    tracking.fail_at = attempts + 1;
+    var i: usize = 0;
+    for (i < 32) {
+        val resolved: res[ResolvedTarget, fail.Fail] = resolve_target(?tracking.a, ?itn, ?m, "native", nil);
+        if (sel resolved.err) { ret 6; }
+        val rt: ResolvedTarget = resolved.ok;
+        if (rt.target != m.native_target)                                                                { ret 7; }
+        if (!target_matches_host(?itn, rt.target, lang_target.host_os_id(), lang_target.host_arch_id())) { ret 8; }
+        i = i + 1;
+    }
+    if (tracking.attempts != attempts) { ret 9; }
+    dnit(?m, ?tracking.a);
+    dnit(?m, ?tracking.a);
+    if (tracking.live != 0 || tracking.double_frees != 0 || tracking.exhausted != 0) { ret 10; }
+    var ordinal: usize = 1;
+    for (ordinal <= attempts) {
+        tracking.attempts = 0;
+        tracking.fail_at  = ordinal;
+        val failed: res[Manifest, fail.Fail] = parse(?tracking.a, ?itn, ?doc);
+        if (sel failed.ok) {
+            var unexpected: Manifest = failed.ok;
+            dnit(?unexpected, ?tracking.a);
+            ret 11;
+        }
+        if (tracking.live != 0 || tracking.double_frees != 0 || tracking.exhausted != 0) { ret 12; }
+        ordinal = ordinal + 1;
     }
     ret 0;
 }
