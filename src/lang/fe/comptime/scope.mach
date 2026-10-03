@@ -1,0 +1,737 @@
+# the scope a comptime evaluation runs in: the description of the build, the stages'
+# bindings over a module, its frames and the gates it decided
+use std.allocator.page;
+use mach.lang.ct;
+use mach.lang.fail;
+use ast_expr:            mach.lang.fe.ast.expr;
+use ast_id:              mach.lang.fe.ast.id;
+use comptime_capability: mach.lang.fe.comptime.capability;
+use comptime_failure:    mach.lang.fe.comptime.failure;
+use comptime_value:      mach.lang.fe.comptime.value;
+use mach.lang.float;
+use mach.lang.growth;
+use mach.lang.intern;
+use target_definition: mach.lang.target.definition;
+use mach.lang.target.extension;
+use target_model: mach.lang.target.model;
+use mach.lang.wide;
+use A: std.allocator;
+use T: std.allocator.testing;
+use std.collections.map;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str_equals;
+
+pub def GateState: u8;
+
+pub val GATE_STATE_UNKNOWN:  GateState = 0;
+pub val GATE_STATE_TRUE:     GateState = 1;
+pub val GATE_STATE_FALSE:    GateState = 2;
+pub val GATE_STATE_REJECTED: GateState = 3;
+
+pub rec NamedConst {
+    name:  intern.StrId;
+    value: comptime_value.CTValue;
+    gated: bool;
+}
+
+pub rec FrameMark {
+    owner:        ptr;
+    entries_len:  u32;
+    deferred_len: u32;
+    generation:   u64;
+    parent:       u64;
+}
+
+pub rec ComptimeEnv {
+    alloc:           *A.Allocator;
+    target_os_id:    u32;
+    target_arch_id:  u32;
+    target_abi_id:   u32;
+    build_mode_id:   u32;
+    build_pie:       u32;
+    pointer_width:   u32;
+    target_defs:     *target_definition.Table;
+    vector_bits:     u32;
+    register_bits:   u32;
+    has_float:       bool;
+    va_list_size:    u32;
+    va_list_align:   u32;
+    compiler_name:   intern.StrId;
+    compiler_ver:    intern.StrId;
+    project_id:      intern.StrId;
+    project_ver:     intern.StrId;
+    target_os:       intern.StrId;
+    target_isa:      intern.StrId;
+    target_abi:      intern.StrId;
+    target_platform: intern.StrId;
+    bin_name:        intern.StrId;
+    # the module being compiled: its fqn, its file relative to the root of the
+    # project that owns it, and that project's id and version
+    module_fqn:  intern.StrId;
+    source_file: intern.StrId;
+    owner_id:    intern.StrId;
+    owner_ver:   intern.StrId;
+    union_build: bool;
+    # the constant-time multiply cells the target admits
+    ct_mul: ct.CtMulMask;
+    # the extensions the target selects, and every registered vocabulary, which
+    # decides whether a name another isa holds folds to 0 or is refused
+    extensions: target_model.ExtensionView;
+    # every extension vocabulary the registered instruction sets declare, which
+    # `#[extensions(...)]` names are read against beside the selected one
+    vocabulary: extension.Vocabulary;
+    # what a conversion between float formats makes of a NaN on the target, none
+    # where no target is selected and such a conversion does not fold
+    nan_rule: float.NanRule;
+}
+
+# the stages that bind comptime state over a module, in the order they run; each binds into its
+# own bindings and reads those of the stages before it
+pub def Stage: u8;
+
+pub val STAGE_LOAD:    Stage = 0;
+pub val STAGE_RESOLVE: Stage = 1;
+pub val STAGE_SEMA:    Stage = 2;
+pub val STAGE_LOWER:   Stage = 3;
+val     STAGE_COUNT:   u32   = 4;
+
+# what the load made of an `embed` argument
+# ---
+# EMBED_PATH_RESOLVED:    it names the file at `text`
+# EMBED_PATH_NO_LOCATION: the declaring file has no path on disk to resolve it against
+# EMBED_PATH_REFUSED:     its path template is refused, for the reason `text`
+# EMBED_PATH_ESCAPED:     it names a file outside the project root, which is never read
+pub def EmbedPathKind: u8;
+
+pub val EMBED_PATH_RESOLVED:    EmbedPathKind = 0;
+pub val EMBED_PATH_NO_LOCATION: EmbedPathKind = 1;
+pub val EMBED_PATH_REFUSED:     EmbedPathKind = 2;
+pub val EMBED_PATH_ESCAPED:     EmbedPathKind = 3;
+
+pub rec EmbedPath {
+    kind: EmbedPathKind;
+    text: intern.StrId;
+}
+
+# what one stage binds over one module, which that stage alone writes and every later stage reads
+# ---
+# entries:     its constants, innermost last
+# deferred:    the names whose float width only type checking can read
+# gate_states: the gates it decided, by condition
+# strings:     the string each decorator argument evaluates to, by argument; only the load records them
+# embeds:      what each `embed` argument names, by argument; only the load records them
+pub rec Bindings {
+    alloc:        *A.Allocator;
+    entries:      *NamedConst;
+    entries_len:  u32;
+    entries_cap:  u32;
+    deferred:     *intern.StrId;
+    deferred_len: u32;
+    deferred_cap: u32;
+    gate_states:  *GateState;
+    gate_count:   u32;
+    strings:      map.Map[u32, intern.StrId];
+    embeds:       map.Map[u32, EmbedPath];
+}
+
+pub fun bindings_init(alloc: *A.Allocator) Bindings {
+    ret Bindings{
+        alloc:       alloc, entries: nil, entries_len: 0, entries_cap: 0, deferred: nil, deferred_len: 0, deferred_cap: 0,
+        gate_states: nil, gate_count: 0, strings: map.init[u32, intern.StrId](alloc),
+        embeds:      map.init[u32, EmbedPath](alloc),
+    };
+}
+
+pub fun bindings_dnit(b: *Bindings) {
+    if (b == nil || b.alloc == nil)               { ret; }
+    if (b.entries != nil && b.entries_cap > 0)    { A.deallocate[NamedConst](b.alloc, b.entries, b.entries_cap::usize); }
+    if (b.deferred != nil && b.deferred_cap > 0)  { A.deallocate[intern.StrId](b.alloc, b.deferred, b.deferred_cap::usize); }
+    if (b.gate_states != nil && b.gate_count > 0) { A.deallocate[GateState](b.alloc, b.gate_states, b.gate_count::usize); }
+    map.dnit[u32, intern.StrId](?b.strings);
+    map.dnit[u32, EmbedPath](?b.embeds);
+    b.entries      = nil;
+    b.entries_len  = 0;
+    b.entries_cap  = 0;
+    b.deferred     = nil;
+    b.deferred_len = 0;
+    b.deferred_cap = 0;
+    b.gate_states  = nil;
+    b.gate_count   = 0;
+}
+
+# the scope one stage evaluates a module in: the shared description of the build and the module,
+# the bindings of the stages before it, which it only reads, and its own, which it alone writes
+# ---
+# stage: the stage whose bindings `own` holds
+# below: each earlier stage's bindings by stage, nil where the scope reads none
+pub rec ComptimeCtx {
+    env:              ComptimeEnv;
+    stage:            Stage;
+    own:              Bindings;
+    below:            [STAGE_COUNT]*Bindings;
+    frame_generation: u64;
+    frame_top:        u64;
+}
+
+pub fun environment(c: *ComptimeCtx) ComptimeEnv {
+    ret c.env;
+}
+
+pub fun init(
+    alloc: *A.Allocator,
+    target_os_id: u32,
+    target_arch_id: u32,
+    target_abi_id: u32,
+    build_mode_id: u32,
+    build_pie: u32,
+    pointer_width: u32,
+    vector_bits: u32,
+    register_bits: u32,
+    has_float: bool,
+    compiler_name: intern.StrId,
+    compiler_ver: intern.StrId) ComptimeCtx {
+    var c: ComptimeCtx;
+    c.env.alloc           = alloc;
+    c.env.target_os_id    = target_os_id;
+    c.env.target_arch_id  = target_arch_id;
+    c.env.target_abi_id   = target_abi_id;
+    c.env.build_mode_id   = build_mode_id;
+    c.env.build_pie       = build_pie;
+    c.env.pointer_width   = pointer_width;
+    c.env.target_defs     = nil;
+    c.env.vector_bits     = vector_bits;
+    c.env.register_bits   = register_bits;
+    c.env.has_float       = has_float;
+    c.env.nan_rule        = float.NAN_RULE_NONE;
+    c.env.va_list_size    = 0;
+    c.env.va_list_align   = 0;
+    c.env.compiler_name   = compiler_name;
+    c.env.compiler_ver    = compiler_ver;
+    c.env.project_id      = intern.STR_NIL;
+    c.env.project_ver     = intern.STR_NIL;
+    c.env.target_os       = intern.STR_NIL;
+    c.env.target_isa      = intern.STR_NIL;
+    c.env.target_abi      = intern.STR_NIL;
+    c.env.target_platform = intern.STR_NIL;
+    c.env.bin_name        = intern.STR_NIL;
+    c.env.module_fqn      = intern.STR_NIL;
+    c.env.source_file     = intern.STR_NIL;
+    c.env.owner_id        = intern.STR_NIL;
+    c.env.owner_ver       = intern.STR_NIL;
+    c.env.union_build     = false;
+    c.env.ct_mul          = ct.mul_mask_none();
+    c.env.extensions      = target_model.ExtensionView{selected: 0, table: nil, count: 0};
+    c.env.vocabulary      = extension.vocabulary_empty();
+    ret over(c.env, STAGE_LOAD, alloc);
+}
+
+# a scope for `stage` with the description `env`, nothing below it and nothing of its own yet,
+# which it will bind from `alloc`
+fun over(env: ComptimeEnv, stage: Stage, alloc: *A.Allocator) ComptimeCtx {
+    var c: ComptimeCtx;
+    c.env              = env;
+    c.stage            = stage;
+    c.own              = bindings_init(alloc);
+    c.frame_generation = 0;
+    c.frame_top        = 0;
+    var i: u32 = 0;
+    for (i < STAGE_COUNT) {
+        c.below[i] = nil;
+        i          = i + 1;
+    }
+    ret c;
+}
+
+# the scope `stage` evaluates a module in, over the load's scope of the module: the load's
+# description and bindings, with every stage between them left for `layer_set`. what the stage
+# binds is allocated from `alloc`, which outlives the product the bindings are published to
+pub fun stage_init(load: *ComptimeCtx, stage: Stage, alloc: *A.Allocator) ComptimeCtx {
+    var c: ComptimeCtx = over(load.env, stage, alloc);
+    c.below[STAGE_LOAD::u32] = ?load.own;
+    ret c;
+}
+
+# read the bindings `b` an earlier stage made, beneath the scope's own
+pub fun layer_set(c: *ComptimeCtx, stage: Stage, b: *Bindings) {
+    if (stage >= c.stage) { ret; }
+    c.below[stage::u32] = b;
+}
+
+# the bindings of the earlier stage `stage` the scope reads, nil where it reads none
+pub fun layer_at(c: *ComptimeCtx, stage: Stage) *Bindings {
+    if (stage >= c.stage) { ret nil; }
+    ret c.below[stage::u32];
+}
+
+# a scope that reads everything `c` reads and binds, with nothing of its own, for evaluating in
+# another stage's or another module's scope without writing to it
+pub fun reader_init(c: *ComptimeCtx) ComptimeCtx {
+    var r: ComptimeCtx = over(c.env, STAGE_LOWER, c.own.alloc);
+    var i: u32         = 0;
+    for (i < STAGE_COUNT) {
+        r.below[i] = c.below[i];
+        i          = i + 1;
+    }
+    r.below[c.stage::u32] = ?c.own;
+    ret r;
+}
+
+# hand the bindings the scope's stage made to its product; the scope keeps none
+pub fun publish(c: *ComptimeCtx) Bindings {
+    val made: Bindings = c.own;
+    c.own = bindings_init(made.alloc);
+    ret made;
+}
+
+pub fun set_union_build(c: *ComptimeCtx, v: bool) {
+    c.env.union_build = v;
+}
+
+pub fun set_target_defs(c: *ComptimeCtx, d: *target_definition.Table) {
+    c.env.target_defs = d;
+}
+
+pub fun set_nan_rule(c: *ComptimeCtx, rule: float.NanRule) {
+    c.env.nan_rule = rule;
+}
+
+pub fun set_ct_mul(c: *ComptimeCtx, mask: ct.CtMulMask) {
+    c.env.ct_mul = mask;
+}
+
+pub fun set_extensions(c: *ComptimeCtx, view: target_model.ExtensionView) {
+    c.env.extensions = view;
+}
+
+pub fun set_vocabulary(c: *ComptimeCtx, vocabulary: *extension.Vocabulary) {
+    c.env.vocabulary = @vocabulary;
+}
+
+pub fun set_va_list(c: *ComptimeCtx, size: u32, align: u32) {
+    c.env.va_list_size  = size;
+    c.env.va_list_align = align;
+}
+
+pub fun set_build_context(
+    c: *ComptimeCtx,
+    project_id: intern.StrId,
+    project_ver: intern.StrId,
+    target_os: intern.StrId,
+    target_isa: intern.StrId,
+    target_abi: intern.StrId,
+    target_platform: intern.StrId,
+    bin_name: intern.StrId) {
+    c.env.project_id      = project_id;
+    c.env.project_ver     = project_ver;
+    c.env.target_os       = target_os;
+    c.env.target_isa      = target_isa;
+    c.env.target_abi      = target_abi;
+    c.env.target_platform = target_platform;
+    c.env.bin_name        = bin_name;
+}
+
+# the module a context compiles, what `$mach.source.*` and `$mach.project.*` read
+# ---
+# module:    the module's fully qualified name
+# file:      its file, relative to the root of the project that owns it
+# owner_id:  the owning project's `[project].id`
+# owner_ver: the owning project's `[project].version`
+pub fun set_source_context(c: *ComptimeCtx, module: intern.StrId, file: intern.StrId,
+    owner_id: intern.StrId, owner_ver: intern.StrId) {
+    c.env.module_fqn  = module;
+    c.env.source_file = file;
+    c.env.owner_id    = owner_id;
+    c.env.owner_ver   = owner_ver;
+}
+
+# release the scope's own bindings; what it reads below belongs to the stages that made it
+pub fun dnit(c: *ComptimeCtx) {
+    if (c == nil) { ret; }
+    bindings_dnit(?c.own);
+    c.frame_top = 0;
+}
+
+# size the scope's own gate decisions for a module tree of `expr_count` expressions
+pub fun prepare_gates(c: *ComptimeCtx, expr_count: u32) err[fail.Fail] {
+    val b: *Bindings = ?c.own;
+    if (b.gate_states != nil || expr_count == 0) { ret err[fail.Fail].ok{}; }
+    val sr: res[*GateState, A.Error] = A.allocate[GateState](b.alloc, expr_count::usize);
+    if (sel sr.err) { ret err[fail.Fail].err{fail.refused(sr.err)}; }
+    b.gate_states = sr.ok;
+    b.gate_count  = expr_count;
+    var i: u32 = 0;
+    for (i < expr_count) {
+        b.gate_states[i] = GATE_STATE_UNKNOWN;
+        i                = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun bindings_gate(b: *Bindings, eid: ast_id.ExprId) GateState {
+    if (b == nil || b.gate_states == nil || ast_id.expr_index(eid) >= b.gate_count) { ret GATE_STATE_UNKNOWN; }
+    ret b.gate_states[ast_id.expr_index(eid)];
+}
+
+# the decision on a gate: the scope's own, else the latest stage's below it that made one
+pub fun gate_state(c: *ComptimeCtx, eid: ast_id.ExprId) GateState {
+    if (c == nil || ast_id.expr_is_nil(eid)) { ret GATE_STATE_UNKNOWN; }
+    val mine: GateState = bindings_gate(?c.own, eid);
+    if (mine != GATE_STATE_UNKNOWN) { ret mine; }
+    var i: u32 = STAGE_COUNT;
+    for (i > 0) {
+        i = i - 1;
+        val made: GateState = bindings_gate(c.below[i], eid);
+        if (made != GATE_STATE_UNKNOWN) { ret made; }
+    }
+    ret GATE_STATE_UNKNOWN;
+}
+
+pub fun set_gate_state(c: *ComptimeCtx, eid: ast_id.ExprId, state: GateState) {
+    if (c == nil || c.own.gate_states == nil || ast_id.expr_is_nil(eid) || ast_id.expr_index(eid) >= c.own.gate_count) { ret; }
+    c.own.gate_states[ast_id.expr_index(eid)] = state;
+}
+
+pub fun defer_float_width(c: *ComptimeCtx, name: intern.StrId) err[fail.Fail] {
+    val b:     *Bindings    = ?c.own;
+    val grown: err[A.Error] = growth.reserve[intern.StrId](b.alloc, ?b.deferred, ?b.deferred_cap, b.deferred_len::usize + 1);
+    if (sel grown.err) { ret err[fail.Fail].err{fail.refused(grown.err)}; }
+    b.deferred[b.deferred_len] = name;
+    b.deferred_len             = b.deferred_len + 1;
+    ret err[fail.Fail].ok{};
+}
+
+fun bindings_defer(b: *Bindings, name: intern.StrId) bool {
+    if (b == nil) { ret false; }
+    var i: u32 = 0;
+    for (i < b.deferred_len) {
+        if (intern.str_same(b.deferred[i], name)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+pub fun float_width_deferred(c: *ComptimeCtx, name: intern.StrId) bool {
+    if (bindings_defer(?c.own, name)) { ret true; }
+    var i: u32 = 0;
+    for (i < STAGE_COUNT) {
+        if (bindings_defer(c.below[i], name)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+pub fun bind(c: *ComptimeCtx, name: intern.StrId, value: comptime_value.CTValue) err[fail.Fail] {
+    ret bind_gated(c, name, value, false);
+}
+
+pub fun bind_gated(c: *ComptimeCtx, name: intern.StrId, value: comptime_value.CTValue, gated: bool) err[fail.Fail] {
+    var nc: NamedConst;
+    nc.name  = name;
+    nc.value = value;
+    nc.gated = gated;
+    ret consts_push(c.own.alloc, ?c.own.entries, ?c.own.entries_len, ?c.own.entries_cap, nc);
+}
+
+pub fun frame_open(c: *ComptimeCtx) res[FrameMark, fail.Fail] {
+    if (c == nil) { ret res[FrameMark, fail.Fail].err{fail.message("comptime: frame_open requires a context")}; }
+    if (c.frame_generation == 0xFFFFFFFFFFFFFFFF) {
+        ret res[FrameMark, fail.Fail].err{fail.message("comptime: frame generation exhausted")};
+    }
+    var mark: FrameMark;
+    mark.owner         = c::ptr;
+    mark.entries_len   = c.own.entries_len;
+    mark.deferred_len  = c.own.deferred_len;
+    mark.generation    = c.frame_generation + 1;
+    mark.parent        = c.frame_top;
+    c.frame_generation = mark.generation;
+    c.frame_top        = mark.generation;
+    ret res[FrameMark, fail.Fail].ok{mark};
+}
+
+pub fun frame_close(c: *ComptimeCtx, mark: FrameMark) err[fail.Fail] {
+    if (c == nil || mark.owner != c::ptr) {
+        ret err[fail.Fail].err{fail.message("comptime: frame_close mark belongs to another context")};
+    }
+    if (mark.generation == 0 || mark.generation != c.frame_top) {
+        ret err[fail.Fail].err{fail.message("comptime: frame_close mark is stale or out of order")};
+    }
+    if (mark.entries_len > c.own.entries_len || mark.deferred_len > c.own.deferred_len) {
+        ret err[fail.Fail].err{fail.message("comptime: frame_close mark exceeds current frame state")};
+    }
+    c.own.entries_len  = mark.entries_len;
+    c.own.deferred_len = mark.deferred_len;
+    c.frame_top        = mark.parent;
+    ret err[fail.Fail].ok{};
+}
+
+fun bindings_lookup(b: *Bindings, name: intern.StrId) opt[NamedConst] {
+    if (b == nil) { ret opt[NamedConst].none{}; }
+    var i: u32 = b.entries_len;
+    for (i > 0) {
+        i = i - 1;
+        if (intern.str_same(b.entries[i].name, name)) { ret opt[NamedConst].some{b.entries[i]}; }
+    }
+    ret opt[NamedConst].none{};
+}
+
+# the constant `name` is bound to: the scope's own latest binding, else the latest stage's below it
+pub fun lookup(c: *ComptimeCtx, name: intern.StrId) opt[NamedConst] {
+    val mine: opt[NamedConst] = bindings_lookup(?c.own, name);
+    if (sel mine.some) { ret mine; }
+    var i: u32 = STAGE_COUNT;
+    for (i > 0) {
+        i = i - 1;
+        val made: opt[NamedConst] = bindings_lookup(c.below[i], name);
+        if (sel made.some) { ret made; }
+    }
+    ret opt[NamedConst].none{};
+}
+
+# the bindings that hold the load's records of a module's decorators
+fun decorators_of(c: *ComptimeCtx) *Bindings {
+    if (c.stage == STAGE_LOAD || c.below[STAGE_LOAD::u32] == nil) { ret ?c.own; }
+    ret c.below[STAGE_LOAD::u32];
+}
+
+# record the string the decorator argument `arg` evaluates to
+pub fun decorator_string_set(c: *ComptimeCtx, arg: ast_id.ExprId, value: intern.StrId) err[fail.Fail] {
+    val ins: res[bool, A.Error] = map.insert[u32, intern.StrId](?c.own.strings, ast_id.expr_index(arg), value);
+    if (sel ins.err) { ret err[fail.Fail].err{fail.refused(ins.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# the string the decorator argument `arg` evaluates to, as the load recorded it; STR_NIL when it is
+# not a constant string
+pub fun decorator_string_at(c: *ComptimeCtx, arg: ast_id.ExprId) intern.StrId {
+    if (c == nil || ast_id.expr_is_nil(arg)) { ret intern.STR_NIL; }
+    var key:   u32                = ast_id.expr_index(arg);
+    val found: opt[*intern.StrId] = map.get[u32, intern.StrId](?decorators_of(c).strings, ?key);
+    if (sel found.none) { ret intern.STR_NIL; }
+    ret @found.some;
+}
+
+# record what the `embed` argument `arg` names
+pub fun decorator_embed_set(c: *ComptimeCtx, arg: ast_id.ExprId, path: EmbedPath) err[fail.Fail] {
+    val ins: res[bool, A.Error] = map.insert[u32, EmbedPath](?c.own.embeds, ast_id.expr_index(arg), path);
+    if (sel ins.err) { ret err[fail.Fail].err{fail.refused(ins.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# what the `embed` argument `arg` names, as the load recorded it; none when it recorded nothing
+pub fun decorator_embed_at(c: *ComptimeCtx, arg: ast_id.ExprId) opt[EmbedPath] {
+    if (c == nil || ast_id.expr_is_nil(arg)) { ret opt[EmbedPath].none{}; }
+    var key:   u32             = ast_id.expr_index(arg);
+    val found: opt[*EmbedPath] = map.get[u32, EmbedPath](?decorators_of(c).embeds, ?key);
+    if (sel found.none) { ret opt[EmbedPath].none{}; }
+    ret opt[EmbedPath].some{@found.some};
+}
+
+# the file the `embed` argument `arg` names, as the load resolved it; STR_NIL when it names none
+# the build reads
+pub fun decorator_embed_file(c: *ComptimeCtx, arg: ast_id.ExprId) intern.StrId {
+    val recorded: opt[EmbedPath] = decorator_embed_at(c, arg);
+    if (sel recorded.none) { ret intern.STR_NIL; }
+    val path: EmbedPath = recorded.some;
+    if (path.kind != EMBED_PATH_RESOLVED) { ret intern.STR_NIL; }
+    ret path.text;
+}
+
+# drop every decorator record of the scope's own, before they are recorded again
+pub fun decorators_clear(c: *ComptimeCtx) {
+    map.clear[u32, intern.StrId](?c.own.strings);
+    map.clear[u32, EmbedPath](?c.own.embeds);
+}
+
+pub fun field_type_of_binding[T](c: *ComptimeCtx, cap_ctx: *T, caps: comptime_capability.PhaseCapabilities[T], name: intern.StrId) res[opt[u32], comptime_failure.EvalFail] {
+    val bound: opt[NamedConst] = lookup(c, name);
+    if (sel bound.none) { ret res[opt[u32], comptime_failure.EvalFail].ok{opt[u32].none{}}; }
+    val nc: NamedConst = bound.some;
+    if (!comptime_value.is_descriptor(nc.value)) { ret res[opt[u32], comptime_failure.EvalFail].ok{opt[u32].none{}}; }
+
+    if (!comptime_capability.capabilities_have_types[T](cap_ctx, caps) || caps.field == nil) { ret res[opt[u32], comptime_failure.EvalFail].ok{opt[u32].none{}}; }
+    val r: res[opt[comptime_value.CTValue], comptime_failure.EvalFail] = caps.field(cap_ctx, nc.value.data.fld.owner, nc.value.data.fld.index, comptime_capability.FIELD_SEL_TYPE);
+    if (sel r.err) { ret res[opt[u32], comptime_failure.EvalFail].err{r.err}; }
+    val o: opt[comptime_value.CTValue] = r.ok;
+    if (sel o.none) { ret res[opt[u32], comptime_failure.EvalFail].ok{opt[u32].none{}}; }
+    val v: comptime_value.CTValue = o.some;
+    if (v.kind != comptime_value.CT_KIND_TYPE) { ret res[opt[u32], comptime_failure.EvalFail].ok{opt[u32].none{}}; }
+    ret res[opt[u32], comptime_failure.EvalFail].ok{opt[u32].some{v.data.t}};
+}
+
+fun consts_push(a: *A.Allocator, arr: **NamedConst, len: *u32, cap: *u32, nc: NamedConst) err[fail.Fail] {
+    val grown: err[A.Error] = growth.reserve[NamedConst](a, arr, cap, (@len)::usize + 1);
+    if (sel grown.err) { ret err[fail.Fail].err{fail.refused(grown.err)}; }
+
+    val dst: *NamedConst = @arr;
+    dst[@len] = nc;
+    @len      = @len + 1;
+    ret err[fail.Fail].ok{};
+}
+
+test frame_close__owner_order_and_repeated_close_rejected {
+    var alloc:  A.Allocator;
+    val made_2: err[A.Error] = page.make(?alloc);
+    if (sel made_2.err) { ret 1; }
+    var first:   ComptimeCtx               = init(?alloc, 0, 0, 0, 0, 0, 8, 128, 128, true, intern.STR_NIL, intern.STR_NIL);
+    var second:  ComptimeCtx               = init(?alloc, 0, 0, 0, 0, 0, 8, 128, 128, true, intern.STR_NIL, intern.STR_NIL);
+    val outer_r: res[FrameMark, fail.Fail] = frame_open(?first);
+    val inner_r: res[FrameMark, fail.Fail] = frame_open(?first);
+    if (sel outer_r.err) { ret 1; }
+    if (sel inner_r.err) { ret 1; }
+    val outer:               FrameMark      = outer_r.ok;
+    val inner:               FrameMark      = inner_r.ok;
+    val frame_close_typed_1: err[fail.Fail] = frame_close(?first, outer);
+    if (sel frame_close_typed_1.ok) { ret 1; }
+    val frame_close_typed_2: err[fail.Fail] = frame_close(?second, inner);
+    if (sel frame_close_typed_2.ok) { ret 1; }
+    val frame_close_typed_3: err[fail.Fail] = frame_close(?first, inner);
+    if (sel frame_close_typed_3.err) { ret 1; }
+    val frame_close_typed_4: err[fail.Fail] = frame_close(?first, inner);
+    if (sel frame_close_typed_4.ok) { ret 1; }
+    val frame_close_typed_5: err[fail.Fail] = frame_close(?first, outer);
+    if (sel frame_close_typed_5.err) { ret 1; }
+    val stale_r: res[FrameMark, fail.Fail] = frame_open(?second);
+    if (sel stale_r.err) { ret 1; }
+    val stale: FrameMark = stale_r.ok;
+    dnit(?second);
+    val frame_close_typed_6: err[fail.Fail] = frame_close(?second, stale);
+    if (sel frame_close_typed_6.ok) { ret 1; }
+    dnit(?first);
+    ret 0;
+}
+
+# a typed operand refuses a count at its own width; the untyped literal keeps
+# the 128-bit bound, and a count just below the width still folds
+test apply_int_shift__typed_operand_refuses_count_at_width {
+    val x32_r: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime_value.cast_int(wide.from_u64(1), 32, false);
+    if (sel x32_r.err) { ret 99; }
+    val x32: comptime_value.CTValue                                 = x32_r.ok;
+    val at:  res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime_value.apply_arith(ast_expr.BIN_SHL, x32, comptime_value.ct_u8(32));
+    if (sel at.ok)                                                                                         { ret 1; }
+    if (!str_equals(at.err.message, "comptime shift amount is at least the width of the shifted operand")) { ret 2; }
+    val over: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime_value.apply_arith(ast_expr.BIN_SHR, x32, comptime_value.ct_u8(40));
+    if (sel over.ok) { ret 3; }
+    val below: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime_value.apply_arith(ast_expr.BIN_SHL, x32, comptime_value.ct_u8(31));
+    if (!comptime_value.t_ok_is(below, 1::u64 << 31, 0, false)) { ret 4; }
+    val x8_r: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime_value.cast_int(wide.from_u64(0x80), 8, true);
+    if (sel x8_r.err) { ret 99; }
+    val at8: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime_value.apply_arith(ast_expr.BIN_SHR, x8_r.ok, comptime_value.ct_u8(8));
+    if (sel at8.ok) { ret 5; }
+    val untyped: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime_value.apply_arith(ast_expr.BIN_SHL, comptime_value.t_ct_wide(1, 0, false), comptime_value.t_ct_wide(100, 0, false));
+    if (!comptime_value.t_ok_is(untyped, 0, 1::u64 << 36, false)) { ret 6; }
+    ret 0;
+}
+
+#[testing]
+pub fun t_build_ctx() ComptimeCtx {
+    var c: ComptimeCtx;
+    c.env.project_id  = intern.str_id(10);
+    c.env.project_ver = intern.str_id(11);
+    c.env.target_os   = intern.str_id(20);
+    c.env.target_isa  = intern.str_id(21);
+    c.env.target_abi  = intern.str_id(22);
+    c.env.bin_name    = intern.str_id(30);
+    ret c;
+}
+
+test bind__frame_scoping {
+    var alloc:  A.Allocator;
+    val made_6: err[A.Error] = page.make(?alloc);
+    if (sel made_6.err) { ret 1; }
+    var c: ComptimeCtx = init(?alloc, 0, 0, 0, 0, 0, 8, 128, 128, true, intern.STR_NIL, intern.STR_NIL);
+
+    val name1: intern.StrId = intern.str_id(1);
+    val name2: intern.StrId = intern.str_id(2);
+
+    val int_value_r: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime_value.int_value(10);
+    if (sel int_value_r.err) { ret 99; }
+    val v10:          comptime_value.CTValue                                 = int_value_r.ok;
+    val int_value_r2: res[comptime_value.CTValue, comptime_failure.EvalFail] = comptime_value.int_value(20);
+    if (sel int_value_r2.err) { ret 99; }
+    val v20: comptime_value.CTValue = int_value_r2.ok;
+
+    val b1: err[fail.Fail] = bind(?c, name1, v10);
+    if (sel b1.err) {
+        dnit(?c);
+        ret 1;
+    }
+
+    val mr: res[FrameMark, fail.Fail] = frame_open(?c);
+    if (sel mr.err) {
+        dnit(?c);
+        ret 1;
+    }
+    val m:  FrameMark      = mr.ok;
+    val b2: err[fail.Fail] = bind(?c, name1, v20);
+    if (sel b2.err) {
+        dnit(?c);
+        ret 1;
+    }
+    val df: err[fail.Fail] = defer_float_width(?c, name2);
+    if (sel df.err) {
+        dnit(?c);
+        ret 1;
+    }
+
+    val lk1: opt[NamedConst] = lookup(?c, name1);
+    if (!sel lk1.some) {
+        dnit(?c);
+        ret 1;
+    }
+    if (lk1.some.value.data.i != 20) {
+        dnit(?c);
+        ret 1;
+    }
+
+    val fc: err[fail.Fail] = frame_close(?c, m);
+    if (sel fc.err) {
+        dnit(?c);
+        ret 1;
+    }
+
+    val lk2: opt[NamedConst] = lookup(?c, name1);
+    if (!sel lk2.some) {
+        dnit(?c);
+        ret 1;
+    }
+    if (lk2.some.value.data.i != 10) {
+        dnit(?c);
+        ret 1;
+    }
+
+    val lk3: opt[NamedConst] = lookup(?c, name2);
+    if (sel lk3.some) {
+        dnit(?c);
+        ret 1;
+    }
+    if (float_width_deferred(?c, name2)) {
+        dnit(?c);
+        ret 1;
+    }
+
+    val depth_before: u32                       = c.own.entries_len;
+    val m2r:          res[FrameMark, fail.Fail] = frame_open(?c);
+    if (sel m2r.err) {
+        dnit(?c);
+        ret 1;
+    }
+    val m2:  FrameMark      = m2r.ok;
+    val fc2: err[fail.Fail] = frame_close(?c, m2);
+    if (sel fc2.err) {
+        dnit(?c);
+        ret 1;
+    }
+    if (c.own.entries_len != depth_before) {
+        dnit(?c);
+        ret 1;
+    }
+
+    dnit(?c);
+    ret 0;
+}
