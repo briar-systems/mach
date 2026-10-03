@@ -1535,6 +1535,12 @@ pub fun with_elem_bytes(flags: u16, eb: u8) u16;
 pub fun gp_id(n: u32) i32;
 ```
 
+## fun vec_id
+
+```mach
+pub fun vec_id(n: u32) i32;
+```
+
 ## fun gp
 
 ```mach

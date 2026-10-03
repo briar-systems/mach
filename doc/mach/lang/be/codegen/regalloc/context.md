@@ -135,6 +135,8 @@ pub val MAX_REG_FILE: i32 = 32
 pub fun reserve_reg(ctx: *Context, id: i32);
 ```
 
+keeps general register `id` from allocation
+
 ## fun function_has_reg_shift
 
 ```mach

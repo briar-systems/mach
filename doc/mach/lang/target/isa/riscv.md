@@ -6,6 +6,8 @@
 pub val X0:  i32 = 0
 ```
 
+hardware register numbers; a register id is regid_make of one
+
 ## val X1
 
 ```mach
