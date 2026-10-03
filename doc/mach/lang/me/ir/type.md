@@ -1,15 +1,41 @@
 # mach.lang.me.ir.type
 
-## def IrTypeId
+## rec IrTypeId
 
 ```mach
-pub def IrTypeId: u32
+pub rec IrTypeId;
 ```
+
+an IR type's slot in its type table
 
 ## val IRT_NIL
 
 ```mach
-pub val IRT_NIL: IrTypeId = 0xFFFFFFFF
+pub val IRT_NIL: IrTypeId = IrTypeId;
+```
+
+## fun id
+
+```mach
+pub fun id(index: u32) IrTypeId;
+```
+
+## fun index
+
+```mach
+pub fun index(id: IrTypeId) u32;
+```
+
+## fun same
+
+```mach
+pub fun same(left: IrTypeId, right: IrTypeId) bool;
+```
+
+## fun is_nil
+
+```mach
+pub fun is_nil(id: IrTypeId) bool;
 ```
 
 ## def IrTypeKind
@@ -131,20 +157,47 @@ pub val EXT_ZERO: IntExt = 1
 pub val EXT_SIGN: IntExt = 2
 ```
 
-## def ExtListId
+## rec ExtListId
 
 ```mach
-pub def ExtListId: u32
+pub rec ExtListId;
 ```
 
 an interned list of one IntExt per parameter, carried by a function's
 declaration and by each call rather than by the signless function type.
-trailing EXT_NONE entries are dropped, so a list with none is EXT_LIST_NONE
+trailing EXT_NONE entries are dropped, so a list with none is EXT_LIST_EMPTY
 
-## val EXT_LIST_NONE
+## val EXT_LIST_EMPTY
 
 ```mach
-pub val EXT_LIST_NONE: ExtListId = 0
+pub val EXT_LIST_EMPTY: ExtListId = ExtListId;
+```
+
+the empty list, a real list and not a sentinel: it is slot 0, so a zeroed
+call or declaration carries no extensions
+
+## fun ext_list_id
+
+```mach
+pub fun ext_list_id(index: u32) ExtListId;
+```
+
+## fun ext_list_index
+
+```mach
+pub fun ext_list_index(id: ExtListId) u32;
+```
+
+## fun ext_list_same
+
+```mach
+pub fun ext_list_same(left: ExtListId, right: ExtListId) bool;
+```
+
+## fun ext_list_is_empty
+
+```mach
+pub fun ext_list_is_empty(id: ExtListId) bool;
 ```
 
 ## val INT_FORM_PLAIN

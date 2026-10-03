@@ -6,7 +6,7 @@
 fwd ir_id.BlockId
 ```
 
-forwards [`mach.lang.me.ir.id.BlockId`](ir/id.md#def-blockid)
+forwards [`mach.lang.me.ir.id.BlockId`](ir/id.md#rec-blockid)
 
 ## fwd ir_id.InstructionId
 
@@ -14,7 +14,7 @@ forwards [`mach.lang.me.ir.id.BlockId`](ir/id.md#def-blockid)
 fwd ir_id.InstructionId
 ```
 
-forwards [`mach.lang.me.ir.id.InstructionId`](ir/id.md#def-instructionid)
+forwards [`mach.lang.me.ir.id.InstructionId`](ir/id.md#rec-instructionid)
 
 ## fwd ir_id.BLOCK_NIL
 
@@ -319,16 +319,44 @@ pub val DBG_OP_MINUS_CONST: u8 = 1
 pub rec DbgOp;
 ```
 
+## rec DbgExprId
+
+```mach
+pub rec DbgExprId;
+```
+
+a debug expression's slot in its function's expression table
+
 ## val DBG_EXPR_IDENTITY
 
 ```mach
-pub val DBG_EXPR_IDENTITY: DbgExprId = 0
+pub val DBG_EXPR_IDENTITY: DbgExprId = DbgExprId;
 ```
 
-## def DbgExprId
+the empty expression, slot 0: a variable read as it is
+
+## fun dbg_expr
 
 ```mach
-pub def DbgExprId: u32
+pub fun dbg_expr(index: u32) DbgExprId;
+```
+
+## fun dbg_expr_index
+
+```mach
+pub fun dbg_expr_index(id: DbgExprId) u32;
+```
+
+## fun dbg_expr_same
+
+```mach
+pub fun dbg_expr_same(left: DbgExprId, right: DbgExprId) bool;
+```
+
+## fun dbg_expr_is_identity
+
+```mach
+pub fun dbg_expr_is_identity(id: DbgExprId) bool;
 ```
 
 ## rec DbgExpr
