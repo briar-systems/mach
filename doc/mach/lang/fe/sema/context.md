@@ -138,6 +138,16 @@ pub rec SemaDeps;
 the imported surfaces are borrowed: the driver owns each one and shares it
 between every importer in a pass
 
+## rec GrowthWatch
+
+```mach
+pub rec GrowthWatch;
+```
+
+who hears of a growing cycle's expansion: the module that declares it, the templates on
+it, and how many instances of it the module being typed has made so far; a nil
+`expanded` hears nothing
+
 ## fwd type.FieldEntry
 
 ```mach
@@ -158,18 +168,6 @@ forwards [`mach.lang.type.field.Table`](../../type/field.md#rec-table)
 
 ```mach
 pub val INST_NONE: u32 = sema_instance.NONE
-```
-
-## val RECORD_OK
-
-```mach
-pub val RECORD_OK:          u8 = 0
-```
-
-## val RECORD_LIMIT_DEPTH
-
-```mach
-pub val RECORD_LIMIT_DEPTH: u8 = 1
 ```
 
 ## rec InstWorklist
@@ -310,7 +308,7 @@ pub fun decl_body_spreads_pack_to_c_variadic(sc: *SemaContext, origin: session.M
 ## fun record_instance
 
 ```mach
-pub fun record_instance(sc: *SemaContext, item: sema_instance.Instance, eid: ast_id.ExprId) res[u8, fail.Fail];
+pub fun record_instance(sc: *SemaContext, item: sema_instance.Instance, eid: ast_id.ExprId) err[fail.Fail];
 ```
 
 an instance the walk asks for at `eid`: added to the module's set when new, and noted as
