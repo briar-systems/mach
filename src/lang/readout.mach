@@ -1,8 +1,9 @@
 use std.allocator.page;
-use std.print;
+use std.sync.atomic;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
@@ -19,33 +20,169 @@ use A:               std.allocator;
 use chrono_duration: std.chrono.duration;
 use std.chrono.time;
 
-pub val PH_LOAD:     u8 = 0;
-pub val PH_RESOLVE:  u8 = 1;
-pub val PH_SEMA:     u8 = 2;
-pub val PH_LOWER:    u8 = 3;
-pub val PH_OPTIMIZE: u8 = 4;
-pub val PH_CODEGEN:  u8 = 5;
-pub val PH_EMIT:     u8 = 6;
-pub val PH_LINK:     u8 = 7;
-pub val PH_CACHE:    u8 = 8;
-# a test build's test objects, lowered and generated
-pub val PH_TEST: u8 = 9;
+use mach.lang.diagnostic;
+use mach.lang.fail;
+use lang_source: mach.lang.source;
 
-val PHASE_COUNT: u32 = 10;
+# the build's event stream. the engine reports what happens as it happens, in
+# order, to a sink the command supplies, which renders each event when it
+# arrives. lang does no terminal i/o: every rendering is the sink's. an event's
+# payload is borrowed for the call and is never retained by the stream
+#
+# a phase row is timed from its phase_begin to its phase_end. a phase that runs
+# inside another (optimize inside lower) is carved: phase_carved marks it hosted
+# and span_end moves each measured span out of the host into it, so no time is
+# counted twice. a unit's `other` time is its wall time less every row
 
-#[testing]
-pub val LEVEL_PHASES: u8 = 1;
-pub val LEVEL_ITEMS:  u8 = 2;
+# a readout phase, an index into the phase table
+pub def Phase: u32;
 
-val DUR_CAP: usize = 24;
+pub val LOAD:     Phase = 0;
+pub val RESOLVE:  Phase = 1;
+pub val SEMA:     Phase = 2;
+pub val LOWER:    Phase = 3;
+pub val OPTIMIZE: Phase = 4;
+pub val CODEGEN:  Phase = 5;
+pub val EMIT:     Phase = 6;
+pub val LINK:     Phase = 7;
+pub val CACHE:    Phase = 8;
+# a test build's test objects, lowered against their modules' normal objects
+pub val TEST_LOWER: Phase = 9;
+# a test build's test objects, generated
+pub val TEST_CODEGEN: Phase = 10;
 
-fun phase_valid(ph: u8) bool {
-    ret ph::u32 < PHASE_COUNT;
+val PHASE_COUNT: usize = 11;
+
+# what the readout shows of a phase: its row label
+pub rec PhaseSpec {
+    label: str;
 }
 
-rec PendingItem {
+val PHASES: [PHASE_COUNT]PhaseSpec = [PHASE_COUNT]PhaseSpec{
+    PhaseSpec{label: "load"},
+    PhaseSpec{label: "resolve"},
+    PhaseSpec{label: "sema"},
+    PhaseSpec{label: "lower"},
+    PhaseSpec{label: "optimize"},
+    PhaseSpec{label: "codegen"},
+    PhaseSpec{label: "emit"},
+    PhaseSpec{label: "link"},
+    PhaseSpec{label: "cache"},
+    PhaseSpec{label: "test lower"},
+    PhaseSpec{label: "test codegen"},
+};
+
+# the row label of phase ph
+pub fun label_of(ph: Phase) str {
+    ret PHASES[ph].label;
+}
+
+# what a sink asks to receive. every level receives the unit, failure and
+# diagnostics events; phases adds the phase rows and the unit summary, items
+# adds one event per module or file a phase processed
+pub val LEVEL_RESULTS: u8 = 0;
+pub val LEVEL_PHASES:  u8 = 1;
+pub val LEVEL_ITEMS:   u8 = 2;
+
+# a unit of the plan starts: what its goal calls the work (`building`,
+# `checking`), the artifact, or none for the whole project, and the target
+pub rec Unit {
+    artifact:     str;
+    target:       str;
+    verb:         str;
+    has_artifact: bool;
+}
+
+# a phase row closes: the count it processed, in the noun that counts it, its
+# time, the workers it ran on, the modules it dropped as target-gated, and under
+# LEVEL_ITEMS its slowest item, nil when it had fewer than two
+pub rec PhaseEnd {
+    phase:           Phase;
+    count:           u32;
+    noun_one:        str;
+    noun_many:       str;
+    elapsed:         chrono_duration.Duration;
+    workers:         u32;
+    dropped:         u32;
+    slowest:         str;
+    slowest_elapsed: chrono_duration.Duration;
+}
+
+# one module or file a phase finished, when it finished
+pub rec Item {
+    phase:   Phase;
     name:    str;
     elapsed: chrono_duration.Duration;
+}
+
+# a unit built its output: the path, the modules in it, its size in bytes when
+# the output is one file, the time no row accounts for, and the unit's wall time
+pub rec Summary {
+    out:      str;
+    modules:  u32;
+    bytes:    usize;
+    has_size: bool;
+    other:    chrono_duration.Duration;
+    total:    chrono_duration.Duration;
+}
+
+# a failure that reached no diagnostic store, and the phase it is reported under
+pub rec Failure {
+    fail:   *fail.Fail;
+    origin: diagnostic.Origin;
+}
+
+# a unit's diagnostics with the sources they point into
+pub rec Diagnostics {
+    sources: *lang_source.SourceMap;
+    diags:   *diagnostic.DiagnosticStore;
+}
+
+# one event of a build, in the order it happened
+pub tag Event: u8 {
+    unit:        Unit;
+    phase:       PhaseEnd;
+    item:        Item;
+    summary:     Summary;
+    failure:     Failure;
+    diagnostics: Diagnostics;
+}
+
+# where a build's events go: on_event is called once per event, in order, never
+# from two threads at once, and may be called from a worker thread. level is
+# what the sink asks to receive
+pub rec Sink {
+    ctx:      ptr;
+    on_event: fun(ptr, *Event);
+    level:    u8;
+}
+
+fun wants(sink: *Sink, level: u8) bool {
+    ret sink != nil && sink.level >= level;
+}
+
+fun deliver(sink: *Sink, ev: Event) {
+    var e: Event = ev;
+    sink.on_event(sink.ctx, ?e);
+}
+
+# a unit starts; a nil sink is a no-op
+pub fun unit(sink: *Sink, artifact: str, target: str, verb: str, has_artifact: bool) {
+    if (sink == nil) { ret; }
+    deliver(sink, Event.unit{Unit{artifact: artifact, target: target, verb: verb, has_artifact: has_artifact}});
+}
+
+# a failure reached no store; a nil sink is a no-op
+pub fun failure(sink: *Sink, f: *fail.Fail, origin: diagnostic.Origin) {
+    if (sink == nil) { ret; }
+    deliver(sink, Event.failure{Failure{fail: f, origin: origin}});
+}
+
+# a unit's diagnostics, sent when it has any; a nil sink is a no-op
+pub fun diagnostics(sink: *Sink, sources: *lang_source.SourceMap, diags: *diagnostic.DiagnosticStore) {
+    if (sink == nil)                                                     { ret; }
+    if (diagnostic.len(diags) == 0 && diagnostic.lost_count(diags) == 0) { ret; }
+    deliver(sink, Event.diagnostics{Diagnostics{sources: sources, diags: diags}});
 }
 
 # an instant a readout measures from: absent when the platform clock refused
@@ -66,171 +203,104 @@ pub fun elapsed(start: Instant) chrono_duration.Duration {
 }
 
 rec PhaseState {
-    items:    Vector[PendingItem];
-    started:  Instant;
-    carved:   chrono_duration.Duration;
-    borrowed: chrono_duration.Duration;
-    hosted:   bool;
-    workers:  u32;
-    dropped:  u32;
+    started:         Instant;
+    carved:          chrono_duration.Duration;
+    borrowed:        chrono_duration.Duration;
+    hosted:          bool;
+    workers:         u32;
+    dropped:         u32;
+    items:           u32;
+    slowest:         str;
+    slowest_elapsed: chrono_duration.Duration;
 }
 
-pub rec PhaseMetrics {
-    elapsed:      chrono_duration.Duration;
-    occurrences:  u32;
-    item_elapsed: chrono_duration.Duration;
-    item_count:   u32;
-    workers:      u32;
-    processed:    u32;
-    dropped:      u32;
+# an item a worker thread posted, and whether it is ready to deliver
+rec Posted {
+    item:  Item;
+    ready: i64;
 }
 
-def ProgressEventKind: u8;
-
-pub val PROGRESS_EVENT_PHASE:   ProgressEventKind = 0;
-pub val PROGRESS_EVENT_ITEM:    ProgressEventKind = 1;
-val     PROGRESS_EVENT_SUMMARY: ProgressEventKind = 2;
-
-rec PhaseEvent {
-    phase:     u8;
-    count:     u32;
-    noun_one:  str;
-    noun_many: str;
-    elapsed:   chrono_duration.Duration;
-    workers:   u32;
-    dropped:   u32;
-}
-
-rec ItemEvent {
-    phase:   u8;
-    name:    str;
-    elapsed: chrono_duration.Duration;
-    slow:    bool;
-}
-
-rec SummaryEvent {
-    out:      str;
-    modules:  u32;
-    size:     i64;
-    unit:     str;
-    has_size: bool;
-    other:    chrono_duration.Duration;
-    total:    chrono_duration.Duration;
-}
-
-pub rec ProgressEvent {
-    kind: ProgressEventKind;
-    data: uni {
-        phase: PhaseEvent;
-        item: ItemEvent;
-        summary: SummaryEvent;
-    };
-}
-
+# one unit's phase rows, timed as they run and sent to the sink as each closes.
+# a parallel section's workers post their items to a queue that whichever
+# thread holds the drain delivers, so a worker never waits on the sink
 pub rec Progress {
-    level:      u8;
-    alloc:      *A.Allocator;
+    sink:       *Sink;
     unit_start: Instant;
     unit_rows:  chrono_duration.Duration;
     phases:     [PHASE_COUNT]PhaseState;
-    metrics:    [PHASE_COUNT]PhaseMetrics;
-    events:     Vector[ProgressEvent];
-    other:      chrono_duration.Duration;
-    incomplete: bool;
+    posted:     *Posted;
+    post_cap:   usize;
+    post_tail:  i64;
+    post_head:  usize;
+    draining:   i64;
 }
 
-pub fun init(pr: *Progress, alloc: *A.Allocator, level: u8) {
-    pr.level      = level;
-    pr.alloc      = alloc;
+# start a unit's progress over sink, timed from now
+# ---
+# pr:   the storage, which must outlive every use of the returned pointer
+# sink: the command's sink, or nil
+# ret:  pr, or nil when the sink takes no phase rows, which every phase call reads as none
+pub fun start(pr: *Progress, sink: *Sink) *Progress {
+    if (!wants(sink, LEVEL_PHASES)) { ret nil; }
+    pr.sink       = sink;
     pr.unit_start = sample();
     pr.unit_rows  = 0;
-    pr.events     = collections_vector.init[ProgressEvent](alloc);
-    pr.other      = 0;
-    pr.incomplete = false;
-    var i: u32 = 0;
+    pr.posted     = nil;
+    pr.post_cap   = 0;
+    pr.post_tail  = 0;
+    pr.post_head  = 0;
+    pr.draining   = 0;
+    var i: usize = 0;
     for (i < PHASE_COUNT) {
-        val p: *PhaseState = ?pr.phases[i];
-        p.items    = collections_vector.init[PendingItem](alloc);
-        p.started  = Instant.none{};
-        p.carved   = 0;
-        p.borrowed = 0;
-        p.hosted   = false;
-        p.workers  = 1;
-        p.dropped  = 0;
-        val m: *PhaseMetrics = ?pr.metrics[i];
-        m.elapsed      = 0;
-        m.occurrences  = 0;
-        m.item_elapsed = 0;
-        m.item_count   = 0;
-        m.workers      = 1;
-        m.processed    = 0;
-        m.dropped      = 0;
-        i              = i + 1;
+        phase_reset(?pr.phases[i]);
+        pr.phases[i].started = Instant.none{};
+        i                    = i + 1;
     }
+    ret pr;
 }
 
-pub fun dnit(pr: *Progress) {
-    if (pr == nil || pr.alloc == nil) { ret; }
-    var i: u32 = 0;
-    for (i < PHASE_COUNT) {
-        free_pending(pr, ?pr.phases[i]);
-        collections_vector.dnit[PendingItem](?pr.phases[i].items);
-        i = i + 1;
-    }
-
-    var j: usize = 0;
-    for (j < pr.events.len) {
-        free_event(pr, ?pr.events.data[j]);
-        j = j + 1;
-    }
-    collections_vector.dnit[ProgressEvent](?pr.events);
-    pr.alloc = nil;
+fun phase_reset(p: *PhaseState) {
+    p.carved          = 0;
+    p.borrowed        = 0;
+    p.hosted          = false;
+    p.workers         = 1;
+    p.dropped         = 0;
+    p.items           = 0;
+    p.slowest         = nil;
+    p.slowest_elapsed = 0;
 }
 
-fun progress_valid(pr: *Progress) bool {
-    ret pr != nil && pr.alloc != nil;
-}
-
-pub fun unit_begin(pr: *Progress) {
-    if (!progress_valid(pr)) { ret; }
-    pr.unit_start = sample();
-    pr.unit_rows  = 0;
-}
-
-pub fun phase_begin(pr: *Progress, ph: u8) {
-    if (!progress_valid(pr) || !phase_valid(ph)) { ret; }
+pub fun phase_begin(pr: *Progress, ph: Phase) {
+    if (pr == nil) { ret; }
     val p: *PhaseState = ?pr.phases[ph];
-    free_pending(pr, p);
-    p.carved   = 0;
-    p.borrowed = 0;
-    p.hosted   = false;
-    p.workers  = 1;
-    p.dropped  = 0;
-    p.started  = sample();
+    phase_reset(p);
+    p.started = sample();
 }
 
-pub fun phase_carved(pr: *Progress, ph: u8) {
-    if (!progress_valid(pr) || !phase_valid(ph)) { ret; }
+# phase ph runs inside another phase and is timed by the spans moved into it
+pub fun phase_carved(pr: *Progress, ph: Phase) {
+    if (pr == nil) { ret; }
     pr.phases[ph].hosted = true;
 }
 
-pub fun phase_workers(pr: *Progress, ph: u8, n: u32) {
-    if (!progress_valid(pr) || !phase_valid(ph)) { ret; }
+pub fun phase_workers(pr: *Progress, ph: Phase, n: u32) {
+    if (pr == nil) { ret; }
     pr.phases[ph].workers = n;
 }
 
-pub fun phase_dropped(pr: *Progress, ph: u8, n: u32) {
-    if (!progress_valid(pr) || !phase_valid(ph)) { ret; }
+pub fun phase_dropped(pr: *Progress, ph: Phase, n: u32) {
+    if (pr == nil) { ret; }
     pr.phases[ph].dropped = n;
 }
 
 pub fun span_begin(pr: *Progress) Instant {
-    if (!progress_valid(pr)) { ret Instant.none{}; }
+    if (pr == nil) { ret Instant.none{}; }
     ret sample();
 }
 
-pub fun span_end(pr: *Progress, ph: u8, host: u8, start: Instant) {
-    if (!progress_valid(pr) || !phase_valid(ph) || !phase_valid(host)) { ret; }
+# the span from start belongs to ph, and leaves the phase host that ran it
+pub fun span_end(pr: *Progress, ph: Phase, host: Phase, start: Instant) {
+    if (pr == nil) { ret; }
     val d: chrono_duration.Duration = elapsed(start);
     val c: *PhaseState              = ?pr.phases[ph];
     c.borrowed = c.borrowed + d;
@@ -240,445 +310,389 @@ pub fun span_end(pr: *Progress, ph: u8, host: u8, start: Instant) {
 }
 
 pub fun item_begin(pr: *Progress) Instant {
-    if (!progress_valid(pr)) { ret Instant.none{}; }
+    if (!item_wanted(pr)) { ret Instant.none{}; }
     ret sample();
 }
 
-pub fun item(pr: *Progress, ph: u8, name: str, start: Instant) {
-    if (!progress_valid(pr) || !phase_valid(ph)) { ret; }
-    item_dur(pr, ph, name, elapsed(start));
+fun item_wanted(pr: *Progress) bool {
+    ret pr != nil && pr.sink.level >= LEVEL_ITEMS;
 }
 
-pub fun item_dur(pr: *Progress, ph: u8, name: str, d: chrono_duration.Duration) {
-    if (!progress_valid(pr) || !phase_valid(ph)) { ret; }
-    val m: *PhaseMetrics = ?pr.metrics[ph::u32];
-    m.item_elapsed = m.item_elapsed + d;
-    m.item_count   = m.item_count + 1;
-    if (pr.level < LEVEL_ITEMS) { ret; }
+# name finished phase ph, measured from start
+pub fun item(pr: *Progress, ph: Phase, name: str, start: Instant) {
+    if (!item_wanted(pr)) { ret; }
+    item_send(pr, Item{phase: ph, name: name, elapsed: elapsed(start)});
+}
 
-    val dup_r: res[str, A.Error] = str_dup(pr.alloc, name);
-    if (sel dup_r.err) {
-        pr.incomplete = true;
-        ret;
+fun item_send(pr: *Progress, it: Item) {
+    val p: *PhaseState = ?pr.phases[it.phase];
+    p.items = p.items + 1;
+    if (p.slowest == nil || it.elapsed > p.slowest_elapsed) {
+        p.slowest         = it.name;
+        p.slowest_elapsed = it.elapsed;
     }
-    var it: PendingItem;
-    it.name    = dup_r.ok;
-    it.elapsed = d;
-    val push_r: res[usize, A.Error] = collections_vector.push[PendingItem](?pr.phases[ph].items, it);
-    if (sel push_r.err) {
-        str_free(pr.alloc, it.name);
-        pr.incomplete = true;
+    deliver(pr.sink, Event.item{it});
+}
+
+# open the item queue of a parallel section that posts at most n items. the
+# queue's storage is drawn from a and returned by workers_end
+pub fun workers_begin(pr: *Progress, a: *A.Allocator, n: usize) err[fail.Fail] {
+    if (!item_wanted(pr) || n == 0) { ret err[fail.Fail].ok{}; }
+    val allocated: res[*Posted, A.Error] = A.zallocate[Posted](a, n);
+    if (sel allocated.err) { ret err[fail.Fail].err{fail.refused(allocated.err)}; }
+    pr.posted    = allocated.ok;
+    pr.post_cap  = n;
+    pr.post_tail = 0;
+    pr.post_head = 0;
+    pr.draining  = 0;
+    ret err[fail.Fail].ok{};
+}
+
+# a worker thread's item: queued, then delivered by this thread unless another
+# holds the drain, which then delivers it. name must outlive the section
+pub fun item_post(pr: *Progress, ph: Phase, name: str, d: chrono_duration.Duration) {
+    if (pr == nil || pr.posted == nil) { ret; }
+    val at: i64 = atomic.fetch_add(?pr.post_tail, 1::i64);
+    if (at < 0 || at >= pr.post_cap::i64) { ret; }
+    val slot: *Posted = ?pr.posted[at::usize];
+    slot.item = Item{phase: ph, name: name, elapsed: d};
+    atomic.store(?slot.ready, 1::i64);
+    drain(pr);
+}
+
+# deliver every ready item in post order. a poster that finds the drain held
+# leaves its item to the holder, which looks again after letting go
+fun drain(pr: *Progress) {
+    for (true) {
+        var expected: i64 = 0;
+        if (!atomic.cas(?pr.draining, ?expected, 1::i64)) { ret; }
+        for (pr.post_head < pr.post_cap && atomic.load(?pr.posted[pr.post_head].ready) != 0) {
+            item_send(pr, pr.posted[pr.post_head].item);
+            pr.post_head = pr.post_head + 1;
+        }
+        atomic.store(?pr.draining, 0::i64);
+        if (pr.post_head >= pr.post_cap)                      { ret; }
+        if (atomic.load(?pr.posted[pr.post_head].ready) == 0) { ret; }
     }
 }
 
-pub fun phase_end(pr: *Progress, ph: u8, count: u32, noun_one: str, noun_many: str) {
-    if (!progress_valid(pr) || !phase_valid(ph)) { ret; }
+# close a parallel section of phase ph that ran on n workers, after every worker
+# has joined: every posted item still queued is delivered and the queue's storage
+# returned
+pub fun workers_end(pr: *Progress, a: *A.Allocator, ph: Phase, n: u32) {
+    if (pr == nil) { ret; }
+    pr.phases[ph].workers = n;
+    if (pr.posted == nil) { ret; }
+    # a worker that stopped before posting its claimed slot leaves a gap the drain waits at
+    for (pr.post_head < pr.post_cap) {
+        if (atomic.load(?pr.posted[pr.post_head].ready) != 0) { item_send(pr, pr.posted[pr.post_head].item); }
+        pr.post_head = pr.post_head + 1;
+    }
+    A.deallocate[Posted](a, pr.posted, pr.post_cap);
+    pr.posted   = nil;
+    pr.post_cap = 0;
+}
+
+# close phase ph's row: count is what it processed, named by noun_one or noun_many
+pub fun phase_end(pr: *Progress, ph: Phase, count: u32, noun_one: str, noun_many: str) {
+    if (pr == nil) { ret; }
     val p:     *PhaseState              = ?pr.phases[ph];
     var spent: chrono_duration.Duration = elapsed(p.started) - p.carved;
     if (p.hosted)  { spent = p.borrowed; }
     if (spent < 0) { spent = 0; }
-
-    val m: *PhaseMetrics = ?pr.metrics[ph::u32];
-    m.elapsed     = m.elapsed + spent;
-    m.occurrences = m.occurrences + 1;
-    m.processed   = m.processed + count;
-    m.dropped     = m.dropped + p.dropped;
-    if (p.workers > m.workers) { m.workers = p.workers; }
     pr.unit_rows = pr.unit_rows + spent;
 
-    if (!record_phase(pr, ph, count, noun_one, noun_many, spent, p.workers, p.dropped)) {
-        free_pending(pr, p);
-        ret;
-    }
-
-    val slow: i64   = slowest_index(p);
-    var i:    usize = 0;
-    for (i < p.items.len) {
-        val it: *PendingItem = ?p.items.data[i];
-        record_item(pr, ph, it.name, it.elapsed, i::i64 == slow);
-        it.name = nil;
-        i       = i + 1;
-    }
-    collections_vector.clear[PendingItem](?p.items);
+    var slowest: str = nil;
+    if (p.items >= 2 && p.slowest_elapsed > 0) { slowest = p.slowest; }
+    deliver(pr.sink, Event.phase{PhaseEnd{phase: ph, count: count, noun_one: noun_one, noun_many: noun_many,
+        elapsed: spent, workers: p.workers, dropped: p.dropped, slowest: slowest, slowest_elapsed: p.slowest_elapsed}});
 }
 
-pub fun summary(pr: *Progress, out: str, modules: u32, size: i64, unit: str, has_size: bool) {
-    if (!progress_valid(pr)) { ret; }
+# the unit built out: the time no row accounts for floors at zero
+pub fun summary(pr: *Progress, out: str, modules: u32, bytes: usize, has_size: bool) {
+    if (pr == nil) { ret; }
     val total: chrono_duration.Duration = elapsed(pr.unit_start);
     var other: chrono_duration.Duration = total - pr.unit_rows;
     if (other < 0) { other = 0; }
-    pr.other = other;
-    record_summary(pr, out, modules, size, unit, has_size, other, total);
+    deliver(pr.sink, Event.summary{Summary{out: out, modules: modules, bytes: bytes, has_size: has_size,
+        other: other, total: total}});
 }
 
-pub fun render(pr: *Progress) {
-    if (!progress_valid(pr)) { ret; }
+# what a phase's rows added up to over a recording
+#[testing]
+pub rec Recorded {
+    occurrences: u32;
+    processed:   u32;
+    items:       u32;
+    dropped:     u32;
+    workers:     u32;
+    elapsed:     chrono_duration.Duration;
+}
+
+#[testing]
+pub rec RecordedItem {
+    phase: Phase;
+    name:  str;
+}
+
+# a diagnostic as a recording keeps it: its severity, its text, and the path of
+# the file it points into, nil when it points into none
+#[testing]
+pub rec RecordedDiagnostic {
+    severity: diagnostic.Severity;
+    message:  str;
+    path:     str;
+    located:  bool;
+}
+
+# a sink that keeps what tests ask of a build: the phase rows in order with
+# their totals, the items, the units' verbs, failure texts and diagnostics.
+# every text is copied, so the recording outlives the build that made it
+#[testing]
+pub rec Recording {
+    alloc:       *A.Allocator;
+    sink:        Sink;
+    phases:      [PHASE_COUNT]Recorded;
+    rows:        Vector[Phase];
+    items:       Vector[RecordedItem];
+    verbs:       Vector[str];
+    failures:    Vector[str];
+    diagnostics: Vector[RecordedDiagnostic];
+    other:       chrono_duration.Duration;
+    summaries:   u32;
+}
+
+#[testing]
+pub fun recording_init(rd: *Recording, alloc: *A.Allocator, level: u8) {
+    rd.alloc         = alloc;
+    rd.sink.ctx      = rd::ptr;
+    rd.sink.on_event = recording_on_event;
+    rd.sink.level    = level;
+    rd.rows          = collections_vector.init[Phase](alloc);
+    rd.items         = collections_vector.init[RecordedItem](alloc);
+    rd.verbs         = collections_vector.init[str](alloc);
+    rd.failures      = collections_vector.init[str](alloc);
+    rd.diagnostics   = collections_vector.init[RecordedDiagnostic](alloc);
+    rd.other         = 0;
+    rd.summaries     = 0;
     var i: usize = 0;
-    for (i < pr.events.len) {
-        val ev: *ProgressEvent = ?pr.events.data[i];
-        if (ev.kind == PROGRESS_EVENT_PHASE)   { render_phase(?ev.data.phase); }
-        or (ev.kind == PROGRESS_EVENT_ITEM)    { render_item(?ev.data.item); }
-        or (ev.kind == PROGRESS_EVENT_SUMMARY) { render_summary(?ev.data.summary); }
-        i = i + 1;
-    }
-    if (pr.incomplete) { print.eprintf("progress report incomplete: allocation failed\n"); }
-}
-
-pub fun size_split(bytes: usize, unit: *str) i64 {
-    val ki: usize = 1024;
-    val mi: usize = ki * 1024;
-    val gi: usize = mi * 1024;
-
-    if (bytes < ki) {
-        @unit = "B";
-        ret bytes::i64;
-    }
-    if (bytes < mi) {
-        @unit = "KiB";
-        ret ((bytes + ki / 2) / ki)::i64;
-    }
-    if (bytes < gi) {
-        @unit = "MiB";
-        ret ((bytes + mi / 2) / mi)::i64;
-    }
-    @unit = "GiB";
-    ret ((bytes + gi / 2) / gi)::i64;
-}
-
-fun phase_label(ph: u8) str {
-    if (ph == PH_LOAD)     { ret "load"; }
-    if (ph == PH_RESOLVE)  { ret "resolve"; }
-    if (ph == PH_SEMA)     { ret "sema"; }
-    if (ph == PH_LOWER)    { ret "lower"; }
-    if (ph == PH_OPTIMIZE) { ret "optimize"; }
-    if (ph == PH_CODEGEN)  { ret "codegen"; }
-    if (ph == PH_EMIT)     { ret "emit"; }
-    if (ph == PH_CACHE)    { ret "cache"; }
-    if (ph == PH_TEST)     { ret "test"; }
-    ret "link";
-}
-
-fun render_phase(ev: *PhaseEvent) {
-    var dbuf: [DUR_CAP]u8;
-    val dstr: str = chrono_duration.format_duration(ev.elapsed, ?dbuf[0], DUR_CAP);
-    var noun: str = ev.noun_many;
-    if (ev.count == 1) { noun = ev.noun_one; }
-    if (ev.workers > 1) {
-        print.eprintf("{:<9} {:3} {:<8} {:7}  ({} threads)\n", phase_label(ev.phase), ev.count::i64, noun, dstr, ev.workers::i64);
-    }
-    or (ev.dropped > 0) {
-        print.eprintf("{:<9} {:3} {:<8} {:7}  ({} target-gated, not carried forward)\n",
-            phase_label(ev.phase), ev.count::i64, noun, dstr, ev.dropped::i64);
-    }
-    or {
-        print.eprintf("{:<9} {:3} {:<8} {:7}\n", phase_label(ev.phase), ev.count::i64, noun, dstr);
+    for (i < PHASE_COUNT) {
+        rd.phases[i] = Recorded{occurrences: 0, processed: 0, items: 0, dropped: 0, workers: 1, elapsed: 0};
+        i            = i + 1;
     }
 }
 
-fun render_item(ev: *ItemEvent) {
-    var dbuf: [DUR_CAP]u8;
-    val dstr: str = chrono_duration.format_duration(ev.elapsed, ?dbuf[0], DUR_CAP);
-    if (ev.slow) { print.eprintf("  {:<32} {:7}  (slow)\n", ev.name, dstr); }
-    or           { print.eprintf("  {:<32} {:7}\n", ev.name, dstr); }
-}
-
-fun render_summary(ev: *SummaryEvent) {
-    var obuf: [DUR_CAP]u8;
-    val ostr: str = chrono_duration.format_duration(ev.other, ?obuf[0], DUR_CAP);
-    print.eprintf("{:<9} {:<12} {:7}\n", "other", "-", ostr);
-
-    var dbuf:  [DUR_CAP]u8;
-    val dstr:  str = chrono_duration.format_duration(ev.total, ?dbuf[0], DUR_CAP);
-    var mnoun: str = "modules";
-    if (ev.modules == 1) { mnoun = "module"; }
-    if (ev.has_size) {
-        print.eprintf("built {}  {} {}  {} {}  in {}\n", ev.out, ev.modules::i64, mnoun, ev.size, ev.unit, dstr);
-    }
-    or {
-        print.eprintf("built {}  {} {}  in {}\n", ev.out, ev.modules::i64, mnoun, dstr);
-    }
-}
-
-fun slowest_index(p: *PhaseState) i64 {
-    if (p.items.len < 2) { ret -1; }
-    var best: usize = 0;
-    var i:    usize = 1;
-    for (i < p.items.len) {
-        if (p.items.data[i].elapsed > p.items.data[best].elapsed) { best = i; }
-        i = i + 1;
-    }
-    if (p.items.data[best].elapsed <= 0) { ret -1; }
-    ret best::i64;
-}
-
-fun record_phase(pr: *Progress, ph: u8, count: u32, noun_one: str, noun_many: str,
-    elapsed: chrono_duration.Duration, workers: u32, dropped: u32) bool {
-    val one_r: res[str, A.Error] = str_dup(pr.alloc, noun_one);
-    if (sel one_r.err) {
-        pr.incomplete = true;
-        ret false;
-    }
-    val one: str = one_r.ok;
-
-    val many_r: res[str, A.Error] = str_dup(pr.alloc, noun_many);
-    if (sel many_r.err) {
-        str_free(pr.alloc, one);
-        pr.incomplete = true;
-        ret false;
-    }
-
-    var ev: ProgressEvent;
-    ev.kind                 = PROGRESS_EVENT_PHASE;
-    ev.data.phase.phase     = ph;
-    ev.data.phase.count     = count;
-    ev.data.phase.noun_one  = one;
-    ev.data.phase.noun_many = many_r.ok;
-    ev.data.phase.elapsed   = elapsed;
-    ev.data.phase.workers   = workers;
-    ev.data.phase.dropped   = dropped;
-    val push_r: res[usize, A.Error] = collections_vector.push[ProgressEvent](?pr.events, ev);
-    if (sel push_r.err) {
-        str_free(pr.alloc, ev.data.phase.noun_one);
-        str_free(pr.alloc, ev.data.phase.noun_many);
-        pr.incomplete = true;
-        ret false;
-    }
-    ret true;
-}
-
-fun record_item(pr: *Progress, ph: u8, name: str, elapsed: chrono_duration.Duration, slow: bool) {
-    var ev: ProgressEvent;
-    ev.kind              = PROGRESS_EVENT_ITEM;
-    ev.data.item.phase   = ph;
-    ev.data.item.name    = name;
-    ev.data.item.elapsed = elapsed;
-    ev.data.item.slow    = slow;
-    val push_r: res[usize, A.Error] = collections_vector.push[ProgressEvent](?pr.events, ev);
-    if (sel push_r.err) {
-        str_free(pr.alloc, name);
-        pr.incomplete = true;
-    }
-}
-
-fun record_summary(pr: *Progress, out: str, modules: u32, size: i64, unit: str, has_size: bool,
-    other: chrono_duration.Duration, total: chrono_duration.Duration) {
-    val out_r: res[str, A.Error] = str_dup(pr.alloc, out);
-    if (sel out_r.err) {
-        pr.incomplete = true;
-        ret;
-    }
-    val out_owned: str = out_r.ok;
-
-    val unit_r: res[str, A.Error] = str_dup(pr.alloc, unit);
-    if (sel unit_r.err) {
-        str_free(pr.alloc, out_owned);
-        pr.incomplete = true;
-        ret;
-    }
-
-    var ev: ProgressEvent;
-    ev.kind                  = PROGRESS_EVENT_SUMMARY;
-    ev.data.summary.out      = out_owned;
-    ev.data.summary.modules  = modules;
-    ev.data.summary.size     = size;
-    ev.data.summary.unit     = unit_r.ok;
-    ev.data.summary.has_size = has_size;
-    ev.data.summary.other    = other;
-    ev.data.summary.total    = total;
-    val push_r: res[usize, A.Error] = collections_vector.push[ProgressEvent](?pr.events, ev);
-    if (sel push_r.err) {
-        str_free(pr.alloc, ev.data.summary.out);
-        str_free(pr.alloc, ev.data.summary.unit);
-        pr.incomplete = true;
-    }
-}
-
-fun free_pending(pr: *Progress, p: *PhaseState) {
+#[testing]
+pub fun recording_dnit(rd: *Recording) {
     var i: usize = 0;
-    for (i < p.items.len) {
-        if (p.items.data[i].name != nil) { str_free(pr.alloc, p.items.data[i].name); }
+    for (i < rd.items.len) {
+        str_free(rd.alloc, rd.items.data[i].name);
         i = i + 1;
     }
-    collections_vector.clear[PendingItem](?p.items);
+    i = 0;
+    for (i < rd.failures.len) {
+        str_free(rd.alloc, rd.failures.data[i]);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < rd.diagnostics.len) {
+        str_free(rd.alloc, rd.diagnostics.data[i].message);
+        if (rd.diagnostics.data[i].path != nil) { str_free(rd.alloc, rd.diagnostics.data[i].path); }
+        i = i + 1;
+    }
+    collections_vector.dnit[Phase](?rd.rows);
+    collections_vector.dnit[RecordedItem](?rd.items);
+    collections_vector.dnit[str](?rd.verbs);
+    collections_vector.dnit[str](?rd.failures);
+    collections_vector.dnit[RecordedDiagnostic](?rd.diagnostics);
 }
 
-fun free_event(pr: *Progress, ev: *ProgressEvent) {
-    if (ev.kind == PROGRESS_EVENT_PHASE) {
-        str_free(pr.alloc, ev.data.phase.noun_one);
-        str_free(pr.alloc, ev.data.phase.noun_many);
+#[testing]
+fun recording_copy(rd: *Recording, text: str) str {
+    if (text == nil) { ret nil; }
+    val dup_r: res[str, A.Error] = str_dup(rd.alloc, text);
+    if (sel dup_r.err) { ret nil; }
+    ret dup_r.ok;
+}
+
+#[testing]
+fun recording_on_event(ctx: ptr, ev: *Event) {
+    val rd: *Recording = ctx::*Recording;
+    if (sel ev.unit) { collections_vector.push[str](?rd.verbs, ev.unit.verb); }
+    or (sel ev.phase) {
+        val r: *Recorded = ?rd.phases[ev.phase.phase];
+        r.occurrences = r.occurrences + 1;
+        r.processed   = r.processed + ev.phase.count;
+        r.dropped     = r.dropped + ev.phase.dropped;
+        r.elapsed     = r.elapsed + ev.phase.elapsed;
+        if (ev.phase.workers > r.workers) { r.workers = ev.phase.workers; }
+        collections_vector.push[Phase](?rd.rows, ev.phase.phase);
     }
-    or (ev.kind == PROGRESS_EVENT_ITEM) {
-        str_free(pr.alloc, ev.data.item.name);
+    or (sel ev.item) {
+        val r: *Recorded = ?rd.phases[ev.item.phase];
+        r.items = r.items + 1;
+        collections_vector.push[RecordedItem](?rd.items, RecordedItem{phase: ev.item.phase, name: recording_copy(rd, ev.item.name)});
     }
-    or (ev.kind == PROGRESS_EVENT_SUMMARY) {
-        str_free(pr.alloc, ev.data.summary.out);
-        str_free(pr.alloc, ev.data.summary.unit);
+    or (sel ev.summary) {
+        rd.other     = ev.summary.other;
+        rd.summaries = rd.summaries + 1;
+    }
+    or (sel ev.failure) {
+        collections_vector.push[str](?rd.failures, recording_copy(rd, fail.describe(@ev.failure.fail)));
+    }
+    or (sel ev.diagnostics) {
+        var i: usize = 0;
+        for (i < diagnostic.len(ev.diagnostics.diags)) {
+            val d:    *diagnostic.Diagnostic       = ?ev.diagnostics.diags.items.data[i];
+            val file: opt[*lang_source.SourceFile] = lang_source.get(ev.diagnostics.sources, d.loc.file_id);
+            var path: str                          = nil;
+            if (sel file.some) { path = recording_copy(rd, file.some.path); }
+            val located: bool = d.loc.file_id != lang_source.FILE_NIL && d.loc.span.len > 0;
+            collections_vector.push[RecordedDiagnostic](?rd.diagnostics,
+                RecordedDiagnostic{severity: d.severity, message: recording_copy(rd, d.message), path: path, located: located});
+            i = i + 1;
+        }
     }
 }
 
-test record__an_invalid_phase_or_host_changes_no_owned_state {
+# the ordinal of ph's first row in the recording, or -1 without one
+#[testing]
+pub fun recording_row(rd: *Recording, ph: Phase) i64 {
+    var i: usize = 0;
+    for (i < rd.rows.len) {
+        if (rd.rows.data[i] == ph) { ret i::i64; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# whether name is an item of phase ph in the recording
+#[testing]
+pub fun recording_has_item(rd: *Recording, ph: Phase, name: str) bool {
+    var i: usize = 0;
+    for (i < rd.items.len) {
+        val it: *RecordedItem = ?rd.items.data[i];
+        if (it.phase == ph && it.name != nil && str_equals(it.name, name)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+test phase_table__every_phase_has_a_label {
+    var i: usize = 0;
+    for (i < PHASE_COUNT) {
+        val label: str = PHASES[i].label;
+        if (label == nil || label[0] == 0) { ret 1; }
+        i = i + 1;
+    }
+    if (!str_equals(label_of(LINK), "link"))                 { ret 2; }
+    if (!str_equals(label_of(TEST_CODEGEN), "test codegen")) { ret 3; }
+    ret 0;
+}
+
+test progress__a_sink_below_phases_gets_no_progress {
     var alloc: A.Allocator;
     page.make(?alloc);
+    var rd: Recording;
+    recording_init(?rd, ?alloc, LEVEL_RESULTS);
     var pr: Progress;
-    init(?pr, ?alloc, LEVEL_ITEMS);
-    val past: u8 = PHASE_COUNT::u8;
+    if (start(?pr, ?rd.sink) != nil) { ret 1; }
+    if (start(?pr, nil) != nil)      { ret 2; }
+    recording_dnit(?rd);
+    ret 0;
+}
 
-    phase_begin(?pr, past);
-    phase_carved(?pr, 200);
-    item(?pr, past, "x", Instant.none{});
-    item_dur(?pr, past, "x", 1);
-    phase_end(?pr, past, 1, "a", "as");
-    phase_workers(?pr, past, 1);
-    phase_dropped(?pr, past, 1);
-    span_end(?pr, PH_LOAD, past, Instant.none{});
-    span_end(?pr, past, PH_LOAD, Instant.none{});
+test phase_end__the_row_follows_its_items_and_names_the_slowest {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var rd: Recording;
+    recording_init(?rd, ?alloc, LEVEL_ITEMS);
+    var pr:  Progress;
+    val prp: *Progress = start(?pr, ?rd.sink);
+
+    var slowest: str = nil;
+    phase_begin(prp, LOAD);
+    item_send(prp, Item{phase: LOAD, name: "fast", elapsed: 5});
+    item_send(prp, Item{phase: LOAD, name: "slow", elapsed: 9});
+    item_send(prp, Item{phase: LOAD, name: "mid", elapsed: 7});
+    slowest = pr.phases[LOAD].slowest;
+    phase_end(prp, LOAD, 3, "module", "modules");
+
     var bad: i32 = 0;
-    if (pr.events.len != 0)                        { bad = 1; }
-    if (pr.metrics[PH_LOAD::u32].occurrences != 0) { bad = 1; }
-    if (pr.metrics[PH_LOAD::u32].item_count != 0)  { bad = 1; }
-
-    dnit(?pr);
+    if (rd.items.len != 3 || rd.rows.len != 1)          { bad = 1; }
+    if (rd.phases[LOAD].items != 3)                     { bad = 2; }
+    if (slowest == nil || !str_equals(slowest, "slow")) { bad = 3; }
+    recording_dnit(?rd);
     ret bad;
 }
 
-test aggregation__accumulates_across_units_and_workers_keep_the_peak {
+test item_post__a_parallel_section_delivers_every_posted_item_once {
     var alloc: A.Allocator;
     page.make(?alloc);
-    var pr: Progress;
-    init(?pr, ?alloc, LEVEL_PHASES);
+    var rd: Recording;
+    recording_init(?rd, ?alloc, LEVEL_ITEMS);
+    var pr:  Progress;
+    val prp: *Progress = start(?pr, ?rd.sink);
 
-    unit_begin(?pr);
-    phase_begin(?pr, PH_LOAD);
-    val s1: Instant = item_begin(?pr);
-    item(?pr, PH_LOAD, "m1", s1);
-    phase_end(?pr, PH_LOAD, 1, "module", "modules");
-
-    val sentinel: chrono_duration.Duration = 1000000000;
-    pr.metrics[PH_LOAD::u32].elapsed = sentinel;
-
-    unit_begin(?pr);
-    phase_begin(?pr, PH_LOAD);
-    val s2: Instant = item_begin(?pr);
-    item(?pr, PH_LOAD, "m2", s2);
-    phase_end(?pr, PH_LOAD, 1, "module", "modules");
-
-    # workers keep the run's peak, not the last occurrence's
-    unit_begin(?pr);
-    phase_begin(?pr, PH_CODEGEN);
-    phase_workers(?pr, PH_CODEGEN, 8);
-    phase_end(?pr, PH_CODEGEN, 1, "module", "modules");
-    unit_begin(?pr);
-    phase_begin(?pr, PH_CODEGEN);
-    phase_workers(?pr, PH_CODEGEN, 1);
-    phase_end(?pr, PH_CODEGEN, 1, "module", "modules");
-
+    phase_begin(prp, CODEGEN);
+    val opened: err[fail.Fail] = workers_begin(prp, ?alloc, 3);
+    if (sel opened.err) { ret 1; }
+    # a held drain leaves posts queued until it is let go
+    pr.draining = 1;
+    item_post(prp, CODEGEN, "a", 1);
+    item_post(prp, CODEGEN, "b", 2);
     var bad: i32 = 0;
-    if (pr.metrics[PH_LOAD::u32].occurrences != 2)   { bad = 1; }
-    if (pr.metrics[PH_LOAD::u32].item_count != 2)    { bad = 1; }
-    if (pr.metrics[PH_LOAD::u32].elapsed < sentinel) { bad = 1; }
-    if (pr.metrics[PH_CODEGEN::u32].workers != 8)    { bad = 2; }
-
-    dnit(?pr);
-    ret bad;
-}
-
-test event__owns_item_and_summary_strings {
-    var alloc: A.Allocator;
-    page.make(?alloc);
-    var pr: Progress;
-    init(?pr, ?alloc, LEVEL_ITEMS);
-
-    val name_r: res[str, A.Error] = str_dup(?alloc, "owned-item");
-    if (sel name_r.err) {
-        dnit(?pr);
-        ret 1;
-    }
-    val name: str = name_r.ok;
-    phase_begin(?pr, PH_LOAD);
-    item_dur(?pr, PH_LOAD, name, 7);
-    str_free(?alloc, name);
-    phase_end(?pr, PH_LOAD, 1, "module", "modules");
-
-    val out_r: res[str, A.Error] = str_dup(?alloc, "owned-out");
-    if (sel out_r.err) {
-        dnit(?pr);
-        ret 1;
-    }
-    val out: str = out_r.ok;
-    summary(?pr, out, 1, 0, "B", false);
-    str_free(?alloc, out);
-
-    var bad: i32 = 0;
-    if (pr.events.len != 3) { bad = 1; }
-    or {
-        if (pr.events.data[1].kind != PROGRESS_EVENT_ITEM)                { bad = 1; }
-        or (!str_equals(pr.events.data[1].data.item.name, "owned-item"))  { bad = 1; }
-        if (pr.events.data[2].kind != PROGRESS_EVENT_SUMMARY)             { bad = 1; }
-        or (!str_equals(pr.events.data[2].data.summary.out, "owned-out")) { bad = 1; }
-    }
-
-    dnit(?pr);
+    if (rd.items.len != 0) { bad = 2; }
+    pr.draining = 0;
+    item_post(prp, CODEGEN, "c", 3);
+    if (rd.items.len != 3) { bad = 3; }
+    # a post past the section's capacity is not delivered
+    item_post(prp, CODEGEN, "d", 4);
+    workers_end(prp, ?alloc, CODEGEN, 4);
+    phase_end(prp, CODEGEN, 3, "module", "modules");
+    if (rd.items.len != 3)                       { bad = 4; }
+    if (!str_equals(rd.items.data[0].name, "a")) { bad = 5; }
+    if (rd.phases[CODEGEN].workers != 4)         { bad = 6; }
+    if (recording_row(?rd, CODEGEN) != 0)        { bad = 7; }
+    recording_dnit(?rd);
     ret bad;
 }
 
 test span_end__a_negative_wall_minus_carved_floors_at_zero {
     var alloc: A.Allocator;
     page.make(?alloc);
-    var pr: Progress;
-    init(?pr, ?alloc, LEVEL_PHASES);
+    var rd: Recording;
+    recording_init(?rd, ?alloc, LEVEL_PHASES);
+    var pr:  Progress;
+    val prp: *Progress = start(?pr, ?rd.sink);
 
     val ancient: Instant = Instant.some{time.Instant{sec: 0, nsec: 0}};
-    unit_begin(?pr);
-    phase_begin(?pr, PH_LOAD);
-    phase_begin(?pr, PH_CODEGEN);
-    span_end(?pr, PH_CODEGEN, PH_LOAD, ancient);
-    phase_end(?pr, PH_LOAD, 1, "module", "modules");
+    phase_begin(prp, LOAD);
+    phase_begin(prp, CODEGEN);
+    span_end(prp, CODEGEN, LOAD, ancient);
+    phase_end(prp, LOAD, 1, "module", "modules");
 
     var bad: i32 = 0;
-    if (pr.metrics[PH_LOAD::u32].elapsed < 0) { bad = 1; }
-
-    dnit(?pr);
+    if (rd.phases[LOAD].elapsed < 0) { bad = 1; }
+    recording_dnit(?rd);
     ret bad;
 }
 
 test summary__other_floors_at_zero {
     var alloc: A.Allocator;
     page.make(?alloc);
-    var pr: Progress;
-    init(?pr, ?alloc, LEVEL_PHASES);
+    var rd: Recording;
+    recording_init(?rd, ?alloc, LEVEL_PHASES);
+    var pr:  Progress;
+    val prp: *Progress = start(?pr, ?rd.sink);
 
-    unit_begin(?pr);
-    phase_begin(?pr, PH_LOAD);
-    val ancient: Instant                  = Instant.some{time.Instant{sec: 0, nsec: 0}};
-    val d:       chrono_duration.Duration = elapsed(ancient);
-    item_dur(?pr, PH_LOAD, "huge", d);
-    pr.unit_rows = d;
-    phase_end(?pr, PH_LOAD, 1, "module", "modules");
-    pr.unit_rows = d;
-
-    summary(?pr, "out", 1, 0, "B", false);
+    val ancient: Instant = Instant.some{time.Instant{sec: 0, nsec: 0}};
+    pr.unit_rows = elapsed(ancient);
+    summary(prp, "out", 1, 0, false);
 
     var bad: i32 = 0;
-    if (pr.other < 0) { bad = 1; }
-
-    dnit(?pr);
+    if (rd.summaries != 1) { bad = 1; }
+    if (rd.other < 0)      { bad = 2; }
+    recording_dnit(?rd);
     ret bad;
-}
-
-test size_split__binary_thresholds_and_rounding {
-    var unit: str = nil;
-
-    if (size_split(0, ?unit) != 0 || !str_equals(unit, "B"))       { ret 1; }
-    if (size_split(1023, ?unit) != 1023 || !str_equals(unit, "B")) { ret 2; }
-
-    if (size_split(1024, ?unit) != 1 || !str_equals(unit, "KiB"))               { ret 3; }
-    if (size_split(1024 * 1024 - 1, ?unit) != 1024 || !str_equals(unit, "KiB")) { ret 4; }
-
-    if (size_split(1024 * 1024, ?unit) != 1 || !str_equals(unit, "MiB"))               { ret 5; }
-    if (size_split(1024 * 1024 * 1024 - 1, ?unit) != 1024 || !str_equals(unit, "MiB")) { ret 6; }
-
-    if (size_split(1024::usize * 1024 * 1024, ?unit) != 1 || !str_equals(unit, "GiB"))     { ret 7; }
-    if (size_split(3::usize * 1024 * 1024 * 1024, ?unit) != 3 || !str_equals(unit, "GiB")) { ret 8; }
-
-    ret 0;
 }
