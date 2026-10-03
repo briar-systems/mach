@@ -1,0 +1,2722 @@
+use std.collections.map;
+use collections_vector: std.collections.vector;
+use std_format:         std.format;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.view.view;
+use std.types.view.view_eq_str;
+
+use A: std.allocator;
+
+use lang_alloc: mach.lang.alloc;
+use mach.lang.ct;
+use mach.lang.diagnostic;
+use diagnostic_kind: mach.lang.diagnostic.kind;
+use mach.lang.fail;
+use mach.lang.fe.ast;
+use ast_decl:   mach.lang.fe.ast.decl;
+use ast_expr:   mach.lang.fe.ast.expr;
+use ast_id:     mach.lang.fe.ast.id;
+use ast_module: mach.lang.fe.ast.module;
+use ast_type:   mach.lang.fe.ast.type;
+use mach.lang.fe.attr;
+use mach.lang.fe.comptime;
+use fe_path: mach.lang.fe.path;
+use mach.lang.float;
+use mach.lang.intern;
+use mach.lang.module;
+use mach.lang.session;
+use lang_source: mach.lang.source;
+use mach.lang.source.provider;
+use target_definition: mach.lang.target.definition;
+use mach.lang.target.extension;
+use target_model: mach.lang.target.model;
+use mach.lang.type;
+
+# the frame the load walk reads and binds in: the build target's, or a union tuple's by index
+pub val FRAME_BUILD: u32 = 0xFFFFFFFF;
+
+# how far the load has reached a module
+pub def State: u8;
+
+pub val STATE_NEW:     State = 0;
+pub val STATE_LOADING: State = 1;
+pub val STATE_DONE:    State = 2;
+
+# a public constant a module binds in its build frame, exported to the gates of its importers
+# ---
+# gated: it is bound under a gate, so a union build cannot read one value for every tuple
+pub rec Const {
+    name:  intern.StrId;
+    value: comptime.CTValue;
+    gated: bool;
+}
+
+# what an import declaration binds, as the load decided it
+# ---
+# BINDING_MODULE:  the declaration names a module and binds it under `name`
+# BINDING_MEMBER:  it names the member `name` of a module
+# BINDING_UNBOUND: its path names no module; the load reported it, so resolve says nothing more
+pub def BindingKind: u8;
+
+pub val BINDING_MODULE:  BindingKind = 0;
+pub val BINDING_MEMBER:  BindingKind = 1;
+pub val BINDING_UNBOUND: BindingKind = 2;
+
+# the record of one import declaration, which resolve binds from rather than reading its path
+# ---
+# decl:     the `use` or `fwd`
+# kind:     what it binds
+# name:     the name a module binding binds it under, or the member a member binding names
+# module:   the module it names
+# span:     its path
+# constant: a `use` of a member under the member's own name, so the member's public constant is
+#           bound for the importer's gates
+pub rec Binding {
+    decl:     ast_id.DeclId;
+    kind:     BindingKind;
+    name:     intern.StrId;
+    module:   session.StableModuleId;
+    span:     lang_source.Span;
+    constant: bool;
+}
+
+# one declaration or gate the load is deciding, so a demand that reaches it again is a cycle
+# ---
+# module: the module it is in
+# frame:  the frame it is decided in
+# decl:   the `val` being walked, or DECL_NIL for a gate
+# cond:   the gate's condition, or EXPR_NIL for a `val`
+# name:   the `val`'s name
+pub rec Demand {
+    module: session.ModuleId;
+    frame:  u32;
+    decl:   ast_id.DeclId;
+    cond:   ast_id.ExprId;
+    name:   intern.StrId;
+}
+
+# one target a union build decides every gate under
+pub rec Tuple {
+    os_id:         u32;
+    arch_id:       u32;
+    abi_id:        u32;
+    pointer_width: u32;
+    vector_bits:   u32;
+    register_bits: u32;
+    has_float:     bool;
+    nan_rule:      float.NanRule;
+    target_defs:   *target_definition.Table;
+    va_list_size:  u32;
+    va_list_align: u32;
+    os_name:       intern.StrId;
+    isa_name:      intern.StrId;
+    abi_name:      intern.StrId;
+    platform_name: intern.StrId;
+    ct_mul:        ct.CtMulMask;
+    # the extensions the tuple's target selects, in its isa's vocabulary
+    extensions: target_model.ExtensionView;
+    # every registered vocabulary, the one every tuple of a build shares
+    vocabulary: extension.Vocabulary;
+}
+
+# the load product of one module: the gates it decided and the constants it bound, in its
+# context, the modules it reaches and a record of each import declaration. modules are named by
+# stable id
+# ---
+# status:   the standing of the module's load
+# home:     the package that owns it and its file there
+# artifact: the artifact whose walk first reached it, what `$bin.name` reads
+# gated:    it was first reached from an artifact this target does not build
+# outcome:  the outcome of its module-scope gates
+# ctx:      its build target's frame, which every later phase reads
+# frame:    the frame the walk is in: FRAME_BUILD or a union tuple
+# frames:   its frame under each union tuple, which only the load reads
+# reached:  the union tuples a walk reached it under
+# deps:     the modules it imports
+# consts:   the public constants it exports to its importers' gates
+# bindings: one record per import declaration the walk reached
+pub rec Module {
+    status:      fail.PhaseStatus;
+    home:        provider.Home;
+    artifact:    intern.StrId;
+    gated:       bool;
+    outcome:     comptime.GateOutcome;
+    ctx:         comptime.ComptimeCtx;
+    frame:       u32;
+    frames:      *comptime.ComptimeCtx;
+    frame_count: u32;
+    reached:     *bool;
+    reach_count: u32;
+    deps:        collections_vector.Vector[session.StableModuleId];
+    consts:      collections_vector.Vector[Const];
+    bindings:    collections_vector.Vector[Binding];
+}
+
+# a module as the load's host holds it: its identity, its syntax as parsed, and its load record
+pub rec Row {
+    name:   intern.StrId;
+    stable: session.StableModuleId;
+    file:   lang_source.FileId;
+    syntax: *ast.Ast;
+    load:   *Module;
+}
+
+# what the load asks of the program that runs it, which owns the module table and the parses
+# ---
+# ctx:     the host's own state
+# add:     make a row for a module with this name and stable id, with no file or syntax yet, and
+#          give its id; ids are given in order from zero
+# row:     a module's row; the load record it points at stays where it is
+# parse:   give the module this file and make its syntax current; `reported` says the load
+#          reached it by walking, so a progress readout lists it
+# refresh: make a module's syntax current; a nonzero incarnation is the one it must still have
+# epoch:   a number that changes whenever any module's syntax may have been replaced
+# context: the comptime context of a module of `artifact` under the build target, with nothing
+#          of the module itself
+# done:    a module and everything it imports finished loading
+pub rec Host {
+    ctx:     ptr;
+    add:     fun(ptr, intern.StrId, session.StableModuleId) res[session.ModuleId, fail.Fail];
+    row:     fun(ptr, session.ModuleId) Row;
+    parse:   fun(ptr, session.ModuleId, lang_source.FileId, bool) err[fail.Fail];
+    refresh: fun(ptr, session.ModuleId, u64) err[fail.Fail];
+    epoch:   fun(ptr) u64;
+    context: fun(ptr, intern.StrId) res[comptime.ComptimeCtx, fail.Fail];
+    done:    fun(ptr, session.ModuleId) err[fail.Fail];
+}
+
+# the front end's loading stage: from the modules it is asked for, it finds every module they
+# reach through the source provider, decides each one's declaring gates and binds the constants
+# those gates read, and leaves a load record on each
+# ---
+# host:      what runs the load, bound before each use
+# sources:   the module namespace, bound before each use
+# diags:     where the load reports, bound before each use
+# by_name:   each module's id by its fqn
+# by_stable: each module's id by its stable id
+# states:    how far each module is loaded, by id
+# demands:   the gates and constants the load is deciding, innermost last
+# union:     the build decides every gate under each of `tuples` as well as its own target
+# filter:    the tuples the walk is under now, nil for all of them
+# gated:     the walk is inside a gate's arm, so what it binds is gated
+# foreign:   the walk is under an artifact this target does not build
+# artifact:  the artifact a module reached now is attributed to
+# dirty:     a module reached under a new tuple after it loaded was walked again, which can give
+#            it dependencies the host's order placed after it
+pub rec Loader {
+    s:           *session.Session;
+    alloc:       *A.Allocator;
+    host:        Host;
+    sources:     provider.Provider;
+    diags:       *diagnostic.DiagnosticStore;
+    by_name:     map.Map[intern.StrId, session.ModuleId];
+    by_stable:   map.Map[session.StableModuleId, session.ModuleId];
+    states:      collections_vector.Vector[State];
+    demands:     collections_vector.Vector[Demand];
+    union:       bool;
+    tuples:      *Tuple;
+    tuple_count: u32;
+    tuple_cap:   u32;
+    filter:      *bool;
+    gated:       bool;
+    foreign:     bool;
+    artifact:    intern.StrId;
+    dirty:       bool;
+}
+
+pub fun init(s: *session.Session, a: *A.Allocator) Loader {
+    var l: Loader;
+    l.s           = s;
+    l.alloc       = a;
+    l.host        = Host{};
+    l.sources     = provider.Provider{};
+    l.diags       = nil;
+    l.by_name     = map.init[intern.StrId, session.ModuleId](a);
+    l.by_stable   = map.init[session.StableModuleId, session.ModuleId](a);
+    l.states      = collections_vector.init[State](a);
+    l.demands     = collections_vector.init[Demand](a);
+    l.union       = false;
+    l.tuples      = nil;
+    l.tuple_count = 0;
+    l.tuple_cap   = 0;
+    l.filter      = nil;
+    l.gated       = false;
+    l.foreign     = false;
+    l.artifact    = intern.STR_NIL;
+    l.dirty       = false;
+    ret l;
+}
+
+# release what the loader owns; each module's record is released by its row's owner
+pub fun dnit(l: *Loader) {
+    map.dnit[intern.StrId, session.ModuleId](?l.by_name);
+    map.dnit[session.StableModuleId, session.ModuleId](?l.by_stable);
+    collections_vector.dnit[State](?l.states);
+    collections_vector.dnit[Demand](?l.demands);
+    if (l.tuples != nil && l.tuple_cap > 0) { A.deallocate[Tuple](l.alloc, l.tuples, l.tuple_cap::usize); }
+    l.tuples      = nil;
+    l.tuple_count = 0;
+    l.tuple_cap   = 0;
+}
+
+# point the loader at what runs it, which may have moved since its last use
+pub fun bind(l: *Loader, host: Host, sources: provider.Provider, diags: *diagnostic.DiagnosticStore) {
+    l.host    = host;
+    l.sources = sources;
+    l.diags   = diags;
+}
+
+# make a union build: every gate is decided under each of `count` tuples, which the loader owns
+pub fun tuples_set(l: *Loader, tuples: *Tuple, count: u32, cap: u32) {
+    l.tuples      = tuples;
+    l.tuple_count = count;
+    l.tuple_cap   = cap;
+    l.union       = true;
+}
+
+pub fun module_dnit(a: *A.Allocator, m: *Module) {
+    comptime.dnit(?m.ctx);
+    if (m.frames != nil) {
+        var ti: u32 = 0;
+        for (ti < m.frame_count) {
+            comptime.dnit(?m.frames[ti]);
+            ti = ti + 1;
+        }
+        A.deallocate[comptime.ComptimeCtx](a, m.frames, m.frame_count::usize);
+    }
+    if (m.reached != nil && m.reach_count > 0) { A.deallocate[bool](a, m.reached, m.reach_count::usize); }
+    m.frames      = nil;
+    m.frame_count = 0;
+    m.reached     = nil;
+    m.reach_count = 0;
+    collections_vector.dnit[session.StableModuleId](?m.deps);
+    collections_vector.dnit[Const](?m.consts);
+    collections_vector.dnit[Binding](?m.bindings);
+}
+
+# the id of the module named `fqn`, none when the load has not reached it
+pub fun module_find(l: *Loader, fqn: intern.StrId) opt[session.ModuleId] {
+    val found: opt[*session.ModuleId] = map.get[intern.StrId, session.ModuleId](?l.by_name, ?fqn);
+    if (sel found.none) { ret opt[session.ModuleId].none{}; }
+    ret opt[session.ModuleId].some{@found.some};
+}
+
+# the id of the module a load product names by stable id, MODULE_NIL when the load has not reached it
+pub fun module_of(l: *Loader, sid: session.StableModuleId) session.ModuleId {
+    val found: opt[*session.ModuleId] = map.get[session.StableModuleId, session.ModuleId](?l.by_stable, ?sid);
+    if (sel found.none) { ret session.MODULE_NIL; }
+    ret @found.some;
+}
+
+pub fun module_count(l: *Loader) u32 {
+    ret l.states.len::u32;
+}
+
+fun row(l: *Loader, mid: session.ModuleId) Row {
+    ret l.host.row(l.host.ctx, mid);
+}
+
+fun module_at(l: *Loader, mid: session.ModuleId) *Module {
+    ret row(l, mid).load;
+}
+
+fun syntax_of(l: *Loader, mid: session.ModuleId) *ast.Ast {
+    ret row(l, mid).syntax;
+}
+
+fun file_of(l: *Loader, mid: session.ModuleId) lang_source.FileId {
+    ret row(l, mid).file;
+}
+
+fun fqn_of(l: *Loader, mid: session.ModuleId) intern.StrId {
+    ret row(l, mid).name;
+}
+
+fun stable_of(l: *Loader, mid: session.ModuleId) session.StableModuleId {
+    ret row(l, mid).stable;
+}
+
+fun epoch(l: *Loader) u64 {
+    ret l.host.epoch(l.host.ctx);
+}
+
+fun syntax_refresh(l: *Loader, mid: session.ModuleId, incarnation: u64) err[fail.Fail] {
+    ret l.host.refresh(l.host.ctx, mid, incarnation);
+}
+
+# the comptime context a module's gates and bodies evaluate in, under the build target
+fun module_context(l: *Loader, fqn: intern.StrId, home: *provider.Home, artifact: intern.StrId) res[comptime.ComptimeCtx, fail.Fail] {
+    val made: res[comptime.ComptimeCtx, fail.Fail] = l.host.context(l.host.ctx, artifact);
+    if (sel made.err) { ret made; }
+    var ctx: comptime.ComptimeCtx = made.ok;
+    comptime.set_source_context(?ctx, fqn, home.file, home.package, home.version);
+    ret res[comptime.ComptimeCtx, fail.Fail].ok{ctx};
+}
+
+fun state_set(l: *Loader, mid: session.ModuleId, state: State) {
+    l.states.data[module.index(mid)::usize] = state;
+}
+
+fun state_of(l: *Loader, mid: session.ModuleId) State {
+    ret l.states.data[module.index(mid)::usize];
+}
+
+# read a module's text through the source provider, register it with the session's sources and
+# have the host parse it
+fun module_parse(l: *Loader, mid: session.ModuleId, fqn: intern.StrId, reported: bool) err[fail.Fail] {
+    val located: res[opt[provider.Origin], fail.Fail] = provider.module_locate(?l.sources, l.alloc, fqn);
+    if (sel located.err)     { ret err[fail.Fail].err{located.err}; }
+    if (sel located.ok.none) { ret err[fail.Fail].err{fail.message("no project or dep matches the head segment of the module path")}; }
+    var origin: provider.Origin = located.ok.some;
+    fin { provider.origin_dnit(l.alloc, ?origin); }
+    val text_r: res[provider.Text, fail.Fail] = provider.module_read(?l.sources, l.alloc, origin.path);
+    if (sel text_r.err) { ret err[fail.Fail].err{text_r.err}; }
+    var text: provider.Text                      = text_r.ok;
+    val fid:  res[lang_source.FileId, fail.Fail] = session.load_source(l.s, origin.path, text.data);
+    provider.text_dnit(l.alloc, ?text);
+    if (sel fid.err) { ret err[fail.Fail].err{fid.err}; }
+    ret l.host.parse(l.host.ctx, mid, fid.ok, reported);
+}
+
+# give a module reached for the first time a row and a fresh load record under the artifact the
+# walk is attributing modules to now
+fun module_add(l: *Loader, fqn: intern.StrId) res[session.ModuleId, fail.Fail] {
+    val located: res[opt[provider.Origin], fail.Fail] = provider.module_locate(?l.sources, l.alloc, fqn);
+    if (sel located.err)     { ret res[session.ModuleId, fail.Fail].err{located.err}; }
+    if (sel located.ok.none) { ret res[session.ModuleId, fail.Fail].err{fail.message("no project or dep matches the head segment of the module path")}; }
+    var origin: provider.Origin = located.ok.some;
+    provider.origin_dnit(l.alloc, ?origin);
+
+    val sid_r: res[session.StableModuleId, fail.Fail] = session.stable_module_id(l.s, fqn);
+    if (sel sid_r.err) { ret res[session.ModuleId, fail.Fail].err{sid_r.err}; }
+    val ctx_r: res[comptime.ComptimeCtx, fail.Fail] = module_context(l, fqn, ?origin.home, l.artifact);
+    if (sel ctx_r.err) { ret res[session.ModuleId, fail.Fail].err{ctx_r.err}; }
+    var ctx: comptime.ComptimeCtx = ctx_r.ok;
+
+    val added: res[session.ModuleId, fail.Fail] = l.host.add(l.host.ctx, fqn, sid_r.ok);
+    if (sel added.err) {
+        comptime.dnit(?ctx);
+        ret added;
+    }
+    val mid: session.ModuleId = added.ok;
+    if (module.index(mid)::usize != l.states.len) {
+        comptime.dnit(?ctx);
+        ret res[session.ModuleId, fail.Fail].err{fail.message("the load host numbered a module out of order")};
+    }
+    # a module first reached from an artifact this target does not build belongs to that
+    # artifact's target, not this one
+    val slot: *Module = module_at(l, mid);
+    @slot = Module{
+        status:   fail.accepted(), home: origin.home, artifact: l.artifact, gated: l.foreign, outcome: comptime.GATE_ACTIVE,
+        ctx:      ctx, frame: FRAME_BUILD, frames: nil, frame_count: 0, reached: nil, reach_count: 0,
+        deps:     collections_vector.init[session.StableModuleId](l.alloc), consts: collections_vector.init[Const](l.alloc),
+        bindings: collections_vector.init[Binding](l.alloc)
+    };
+    val pushed: res[usize, A.Error] = collections_vector.push[State](?l.states, STATE_LOADING);
+    if (sel pushed.err) { ret res[session.ModuleId, fail.Fail].err{fail.refused(pushed.err)}; }
+    val named: res[bool, A.Error] = map.insert[intern.StrId, session.ModuleId](?l.by_name, fqn, mid);
+    if (sel named.err) { ret res[session.ModuleId, fail.Fail].err{fail.refused(named.err)}; }
+    val numbered: res[bool, A.Error] = map.insert[session.StableModuleId, session.ModuleId](?l.by_stable, sid_r.ok, mid);
+    if (sel numbered.err) { ret res[session.ModuleId, fail.Fail].err{fail.refused(numbered.err)}; }
+    val rooted: err[fail.Fail] = session.register_module_root_project(l.s, mid, origin.home.root);
+    if (sel rooted.err) { ret res[session.ModuleId, fail.Fail].err{rooted.err}; }
+    ret res[session.ModuleId, fail.Fail].ok{mid};
+}
+
+# mark a module reached under the tuples the union walk is under, and say which of them are new
+# to it: nil when none is, else a filter over the tuples the caller releases
+fun mark_tuple_reachable(l: *Loader, mid: session.ModuleId) res[*bool, fail.Fail] {
+    if (!l.union || l.tuple_count == 0) { ret res[*bool, fail.Fail].ok{nil}; }
+    val m: *Module = module_at(l, mid);
+    if (m.reached == nil) {
+        val ar: res[*bool, A.Error] = A.allocate[bool](l.alloc, l.tuple_count::usize);
+        if (sel ar.err) { ret res[*bool, fail.Fail].err{fail.refused(ar.err)}; }
+        m.reached     = ar.ok;
+        m.reach_count = l.tuple_count;
+        var z: u32 = 0;
+        for (z < m.reach_count) {
+            m.reached[z] = false;
+            z            = z + 1;
+        }
+    }
+    var gained: *bool = nil;
+    var ti:     u32   = 0;
+    for (ti < m.reach_count) {
+        if ((l.filter == nil || l.filter[ti]) && !m.reached[ti]) {
+            if (gained == nil) {
+                val gr: res[*bool, A.Error] = A.allocate[bool](l.alloc, m.reach_count::usize);
+                if (sel gr.err) { ret res[*bool, fail.Fail].err{fail.refused(gr.err)}; }
+                gained = gr.ok;
+                var z: u32 = 0;
+                for (z < m.reach_count) {
+                    gained[z] = false;
+                    z         = z + 1;
+                }
+            }
+            m.reached[ti] = true;
+            gained[ti]    = true;
+        }
+        ti = ti + 1;
+    }
+    ret res[*bool, fail.Fail].ok{gained};
+}
+
+# a loaded module a union walk reaches under tuples new to it is walked again under those tuples
+# alone, so the arms they select load what they import; that can give it dependencies the host
+# already placed after it, so the host reorders once the load is done
+fun rewalk_under_tuples(l: *Loader, mid: session.ModuleId, gained: *bool) err[fail.Fail] {
+    val m: *Module = module_at(l, mid);
+    if (m.gated) { ret err[fail.Fail].ok{}; }
+    val saved_filter:   *bool        = l.filter;
+    val saved_gated:    bool         = l.gated;
+    val saved_artifact: intern.StrId = l.artifact;
+    val saved_frame:    u32          = m.frame;
+    l.filter   = gained;
+    l.gated    = false;
+    l.artifact = m.artifact;
+    m.frame    = FRAME_BUILD;
+    val wr: res[comptime.GateOutcome, fail.Fail] = walk_module_for_load(l, mid);
+    m.frame    = saved_frame;
+    l.artifact = saved_artifact;
+    l.gated    = saved_gated;
+    l.filter   = saved_filter;
+    if (sel wr.err) { ret err[fail.Fail].err{wr.err}; }
+    m.outcome = wr.ok;
+    l.dirty   = true;
+    ret err[fail.Fail].ok{};
+}
+
+# parse the module `fqn` names without walking it, as a root a later phase reads alone
+pub fun module_open(l: *Loader, fqn: intern.StrId) res[session.ModuleId, fail.Fail] {
+    val existing: opt[session.ModuleId] = module_find(l, fqn);
+    if (sel existing.some) { ret res[session.ModuleId, fail.Fail].ok{existing.some}; }
+    val added: res[session.ModuleId, fail.Fail] = module_add(l, fqn);
+    if (sel added.err) { ret added; }
+    val parsed: err[fail.Fail] = module_parse(l, added.ok, fqn, false);
+    if (sel parsed.err) { ret res[session.ModuleId, fail.Fail].err{parsed.err}; }
+    state_set(l, added.ok, STATE_DONE);
+    ret res[session.ModuleId, fail.Fail].ok{added.ok};
+}
+
+# load the module `fqn` names and everything it reaches: each is parsed, its gates decided and
+# its imports loaded first, then handed to the host as done
+pub fun module_load(l: *Loader, fqn: intern.StrId) res[session.ModuleId, fail.Fail] {
+    val existing: opt[session.ModuleId] = module_find(l, fqn);
+    if (sel existing.some) {
+        val mid:      session.ModuleId      = existing.some;
+        val gained_r: res[*bool, fail.Fail] = mark_tuple_reachable(l, mid);
+        if (sel gained_r.err) { ret res[session.ModuleId, fail.Fail].err{gained_r.err}; }
+        val gained: *bool = gained_r.ok;
+        fin {
+            if (gained != nil) { A.deallocate[bool](l.alloc, gained, l.tuple_count::usize); }
+        }
+        if (state_of(l, mid) == STATE_LOADING) {
+            ret res[session.ModuleId, fail.Fail].err{fail.message_of(name_joined(l.s, "circular module dependency: '", fqn, "' is already being loaded"))};
+        }
+        if (gained != nil) {
+            val rewalked: err[fail.Fail] = rewalk_under_tuples(l, mid, gained);
+            if (sel rewalked.err) { ret res[session.ModuleId, fail.Fail].err{rewalked.err}; }
+        }
+        ret res[session.ModuleId, fail.Fail].ok{mid};
+    }
+
+    val added: res[session.ModuleId, fail.Fail] = module_add(l, fqn);
+    if (sel added.err) { ret added; }
+    val mid: session.ModuleId = added.ok;
+
+    val marked_r: res[*bool, fail.Fail] = mark_tuple_reachable(l, mid);
+    if (sel marked_r.err)   { ret res[session.ModuleId, fail.Fail].err{marked_r.err}; }
+    if (marked_r.ok != nil) { A.deallocate[bool](l.alloc, marked_r.ok, l.tuple_count::usize); }
+
+    val parse_r: err[fail.Fail] = module_parse(l, mid, fqn, true);
+    if (sel parse_r.err) { ret res[session.ModuleId, fail.Fail].err{parse_r.err}; }
+    val m:     *Module        = module_at(l, mid);
+    val a:     *ast.Ast       = syntax_of(l, mid);
+    val gates: err[fail.Fail] = comptime.prepare_gates(?m.ctx, a.expr_len::u32, a.decl_len::u32);
+    if (sel gates.err) { ret res[session.ModuleId, fail.Fail].err{gates.err}; }
+
+    val saved_gated: bool = l.gated;
+    l.gated = false;
+    val walk_r: res[comptime.GateOutcome, fail.Fail] = walk_module_for_load(l, mid);
+    l.gated = saved_gated;
+    if (sel walk_r.err) { ret res[session.ModuleId, fail.Fail].err{walk_r.err}; }
+    m.outcome = walk_r.ok;
+    state_set(l, mid, STATE_DONE);
+
+    if (m.gated) { ret res[session.ModuleId, fail.Fail].ok{mid}; }
+    val done: err[fail.Fail] = l.host.done(l.host.ctx, mid);
+    if (sel done.err) { ret res[session.ModuleId, fail.Fail].err{done.err}; }
+    ret res[session.ModuleId, fail.Fail].ok{mid};
+}
+
+# reparse and re-walk one loaded module in place, after its text changed, and say whether its load
+# surface survived: the modules it reaches, the public constants it declares to importers' gates,
+# its own gate outcome and its target gating. a surface that survived leaves every other module as
+# it is; one that did not needs a full load. the record is rebuilt from a fresh comptime context,
+# since gate states and load marks are keyed by the old syntax tree's ids
+# ---
+# l:   the loader that loaded the module
+# mid: the module whose text changed
+# ret: ok(true) when the surface is unchanged; ok(false) when the caller must reload; or the
+#      parse or walk failure
+pub fun module_reload(l: *Loader, mid: session.ModuleId) res[bool, fail.Fail] {
+    val m:           *Module              = module_at(l, mid);
+    val fqn:         intern.StrId         = fqn_of(l, mid);
+    val old_modules: u32                  = module_count(l);
+    val old_outcome: comptime.GateOutcome = m.outcome;
+    val old_gated:   bool                 = m.gated;
+
+    val ctx_r: res[comptime.ComptimeCtx, fail.Fail] = module_context(l, fqn, ?m.home, m.artifact);
+    if (sel ctx_r.err) { ret res[bool, fail.Fail].err{ctx_r.err}; }
+    var old_deps:   collections_vector.Vector[session.StableModuleId] = m.deps;
+    var old_consts: collections_vector.Vector[Const]                  = m.consts;
+    fin {
+        collections_vector.dnit[session.StableModuleId](?old_deps);
+        collections_vector.dnit[Const](?old_consts);
+    }
+    comptime.dnit(?m.ctx);
+    frames_drop(l, m);
+    m.ctx          = ctx_r.ok;
+    m.frame        = FRAME_BUILD;
+    m.deps         = collections_vector.init[session.StableModuleId](l.alloc);
+    m.consts       = collections_vector.init[Const](l.alloc);
+    m.bindings.len = 0;
+    m.status       = fail.accepted();
+    m.outcome      = comptime.GATE_ACTIVE;
+    state_set(l, mid, STATE_LOADING);
+
+    val parse_r: err[fail.Fail] = module_parse(l, mid, fqn, false);
+    if (sel parse_r.err) {
+        state_set(l, mid, STATE_DONE);
+        ret res[bool, fail.Fail].err{parse_r.err};
+    }
+    val a:     *ast.Ast       = syntax_of(l, mid);
+    val gates: err[fail.Fail] = comptime.prepare_gates(?m.ctx, a.expr_len::u32, a.decl_len::u32);
+    if (sel gates.err) {
+        state_set(l, mid, STATE_DONE);
+        ret res[bool, fail.Fail].err{gates.err};
+    }
+    val saved_gated:    bool         = l.gated;
+    val saved_artifact: intern.StrId = l.artifact;
+    l.gated    = false;
+    l.artifact = m.artifact;
+    val walk_r: res[comptime.GateOutcome, fail.Fail] = walk_module_for_load(l, mid);
+    l.artifact = saved_artifact;
+    l.gated    = saved_gated;
+    state_set(l, mid, STATE_DONE);
+    if (sel walk_r.err) { ret res[bool, fail.Fail].err{walk_r.err}; }
+    m.outcome = walk_r.ok;
+
+    if (module_count(l) != old_modules)       { ret res[bool, fail.Fail].ok{false}; }
+    if (m.outcome != old_outcome)             { ret res[bool, fail.Fail].ok{false}; }
+    if (m.gated != old_gated)                 { ret res[bool, fail.Fail].ok{false}; }
+    if (!same_dep_set(?old_deps, ?m.deps))    { ret res[bool, fail.Fail].ok{false}; }
+    if (!same_consts(?old_consts, ?m.consts)) { ret res[bool, fail.Fail].ok{false}; }
+    ret res[bool, fail.Fail].ok{true};
+}
+
+fun same_dep_set(a: *collections_vector.Vector[session.StableModuleId], b: *collections_vector.Vector[session.StableModuleId]) bool {
+    if (a.len != b.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        var found: bool  = false;
+        var j:     usize = 0;
+        for (j < b.len) {
+            if (module.stable_same(b.data[j], a.data[i])) { found = true; }
+            j = j + 1;
+        }
+        if (!found) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun same_ct_value(a: *comptime.CTValue, b: *comptime.CTValue) bool {
+    if (a.kind != b.kind || a.int_unsigned != b.int_unsigned || a.int_width != b.int_width || a.float_width != b.float_width) { ret false; }
+    if (a.kind == comptime.CT_KIND_INT)                                                                                       { ret a.data.w.lo == b.data.w.lo && a.data.w.hi == b.data.w.hi; }
+    if (a.kind == comptime.CT_KIND_FLOAT)                                                                                     { ret a.data.f == b.data.f; }
+    if (a.kind == comptime.CT_KIND_STR)                                                                                       { ret intern.str_same(a.data.s, b.data.s); }
+    if (a.kind == comptime.CT_KIND_NON_INTEGER)                                                                               { ret intern.str_same(a.data.s, b.data.s); }
+    if (a.kind == comptime.CT_KIND_TYPE)                                                                                      { ret a.data.t == b.data.t; }
+    if (a.kind == comptime.CT_KIND_FIELD || a.kind == comptime.CT_KIND_CASE)                                                  { ret a.data.fld.owner == b.data.fld.owner && a.data.fld.index == b.data.fld.index; }
+    if (a.kind == comptime.CT_KIND_PACK_ELEM)                                                                                 { ret a.data.pelem.index == b.data.pelem.index && a.data.pelem.ty == b.data.pelem.ty; }
+    if (a.kind == comptime.CT_KIND_CONST_ELEM)                                                                                { ret a.data.celem.elem == b.data.celem.elem && a.data.celem.ty == b.data.celem.ty; }
+    ret false;
+}
+
+fun same_consts(a: *collections_vector.Vector[Const], b: *collections_vector.Vector[Const]) bool {
+    if (a.len != b.len) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        val x: *Const = ?a.data[i];
+        val y: *Const = ?b.data[i];
+        if (!intern.str_same(x.name, y.name) || x.gated != y.gated || !same_ct_value(?x.value, ?y.value)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun walk_module_for_load(l: *Loader, mid: session.ModuleId) res[comptime.GateOutcome, fail.Fail] {
+    val acquired: err[fail.Fail] = syntax_refresh(l, mid, 0);
+    if (sel acquired.err) { ret res[comptime.GateOutcome, fail.Fail].err{acquired.err}; }
+    val a:     *ast.Ast                = syntax_of(l, mid);
+    val m_opt: opt[*ast_module.Module] = ast.get_module(a, a.root_module);
+    if (sel m_opt.none) { ret res[comptime.GateOutcome, fail.Fail].err{fail.message("module root not set on Ast")}; }
+    val mod_node: *ast_module.Module = m_opt.some;
+    ret walk_decl_list_for_load(l, mid, mod_node.decls_start, mod_node.decls_len);
+}
+
+fun walk_decl_list_for_load(l: *Loader, mid: session.ModuleId, start: u32, len: u32) res[comptime.GateOutcome, fail.Fail] {
+    val refreshed: err[fail.Fail] = syntax_refresh(l, mid, 0);
+    if (sel refreshed.err) { ret res[comptime.GateOutcome, fail.Fail].err{refreshed.err}; }
+    val a:           *ast.Ast = syntax_of(l, mid);
+    val incarnation: u64      = a.incarnation;
+    if (start::usize > a.decl_id_len || len::usize > a.decl_id_len - start::usize) {
+        ret res[comptime.GateOutcome, fail.Fail].err{fail.message("load declaration list exceeds its parsed owner")};
+    }
+    var work: collections_vector.Vector[ast_id.DeclId] = collections_vector.init[ast_id.DeclId](l.alloc);
+    fin { collections_vector.dnit[ast_id.DeclId](?work); }
+    var wi: u32 = 0;
+    for (wi < len) {
+        val saved: res[usize, A.Error] = collections_vector.push[ast_id.DeclId](?work, a.decl_ids[start + wi]);
+        if (sel saved.err) { ret res[comptime.GateOutcome, fail.Fail].err{fail.refused(saved.err)}; }
+        wi = wi + 1;
+    }
+    var sequence: u64 = epoch(l);
+    var i:        u32 = 0;
+    for (i < len) {
+        if (epoch(l) != sequence) {
+            val current: err[fail.Fail] = syntax_refresh(l, mid, incarnation);
+            if (sel current.err) { ret res[comptime.GateOutcome, fail.Fail].err{current.err}; }
+            sequence = epoch(l);
+        }
+        val r: res[comptime.GateOutcome, fail.Fail] = walk_one_decl_for_load(l, mid, work.data[i]);
+        if (sel r.err)                    { ret r; }
+        if (r.ok != comptime.GATE_ACTIVE) { ret r; }
+        i = i + 1;
+    }
+    ret res[comptime.GateOutcome, fail.Fail].ok{comptime.GATE_ACTIVE};
+}
+
+fun walk_one_decl_for_load(l: *Loader, mid: session.ModuleId, did: ast_id.DeclId) res[comptime.GateOutcome, fail.Fail] {
+    val m:     *Module             = module_at(l, mid);
+    val d_opt: opt[*ast_decl.Decl] = ast.get_decl(syntax_of(l, mid), did);
+    if (sel d_opt.none) { ret res[comptime.GateOutcome, fail.Fail].err{fail.message("DeclId out of range during walk")}; }
+    var copied: ast_decl.Decl  = @d_opt.some;
+    val d:      *ast_decl.Decl = ?copied;
+
+    if (d.kind == ast_decl.DECL_KIND_COMPTIME_IF) {
+        ret walk_comptime_if_for_load(l, mid, did, ?d.data.comptime_if);
+    }
+    if (comptime.load_walked(frame_ctx(m), did)
+        && !(l.union && (d.kind == ast_decl.DECL_KIND_USE || d.kind == ast_decl.DECL_KIND_FWD))) {
+        ret res[comptime.GateOutcome, fail.Fail].ok{comptime.GATE_ACTIVE};
+    }
+    if (d.kind == ast_decl.DECL_KIND_USE) {
+        val r: err[fail.Fail] = walk_use_for_load(l, mid, did, ?d.data.use_);
+        ret finish_decl_walk(l, mid, did, r);
+    }
+    if (d.kind == ast_decl.DECL_KIND_FWD) {
+        val r: err[fail.Fail] = walk_fwd_for_load(l, mid, did, ?d.data.fwd_);
+        ret finish_decl_walk(l, mid, did, r);
+    }
+    if (d.kind == ast_decl.DECL_KIND_VAL) {
+        # a verdict matters only to a gate that demanded the constant; the walk goes on
+        val r: res[Verdict, fail.Fail] = walk_val(l, mid, did);
+        if (sel r.err) { ret res[comptime.GateOutcome, fail.Fail].err{r.err}; }
+        ret res[comptime.GateOutcome, fail.Fail].ok{comptime.GATE_ACTIVE};
+    }
+    comptime.mark_load_walked(frame_ctx(m), did);
+    ret res[comptime.GateOutcome, fail.Fail].ok{comptime.GATE_ACTIVE};
+}
+
+fun finish_decl_walk(l: *Loader, mid: session.ModuleId, did: ast_id.DeclId, r: err[fail.Fail]) res[comptime.GateOutcome, fail.Fail] {
+    if (sel r.err) {
+        ret res[comptime.GateOutcome, fail.Fail].err{r.err};
+    }
+    comptime.mark_load_walked(frame_ctx(module_at(l, mid)), did);
+    ret res[comptime.GateOutcome, fail.Fail].ok{comptime.GATE_ACTIVE};
+}
+
+fun walk_comptime_if_for_load(l: *Loader, mid: session.ModuleId, did: ast_id.DeclId, ci: *ast_decl.DeclComptimeIf) res[comptime.GateOutcome, fail.Fail] {
+    val m: *Module = module_at(l, mid);
+    if (!l.union && comptime.load_walked(frame_ctx(m), did)) { ret res[comptime.GateOutcome, fail.Fail].ok{comptime.GATE_ACTIVE}; }
+    val source_r: res[str, fail.Fail] = module_source(l, mid);
+    if (sel source_r.err) { ret res[comptime.GateOutcome, fail.Fail].err{source_r.err}; }
+    val source: str = source_r.ok;
+
+    # a chain whose every arm declares nothing selects no declaration, so type checking decides it
+    if (comptime.comptime_if_declares_nothing(syntax_of(l, mid), ci.branches_start, ci.branches_len)) {
+        comptime.mark_load_walked(frame_ctx(m), did);
+        ret res[comptime.GateOutcome, fail.Fail].ok{comptime.GATE_ACTIVE};
+    }
+
+    if (l.union) { ret walk_comptime_if_union(l, mid, did, ci, source); }
+
+    val choice_r: res[ChainChoice, fail.Fail] = decide_chain(l, mid, ci, source);
+    if (sel choice_r.err) { ret res[comptime.GateOutcome, fail.Fail].err{choice_r.err}; }
+    val choice: ChainChoice = choice_r.ok;
+    if (choice.outcome == comptime.GATE_REJECTED || choice.outcome == comptime.GATE_FAILED) {
+        comptime.mark_load_walked(frame_ctx(m), did);
+        ret res[comptime.GateOutcome, fail.Fail].ok{choice.outcome};
+    }
+    if (choice.branch < ci.branches_len) {
+        val br:          *ast_decl.ComptimeBranch = ?syntax_of(l, mid).comptime_branches[ci.branches_start + choice.branch];
+        val saved_gated: bool                     = l.gated;
+        l.gated = true;
+        val wr: res[comptime.GateOutcome, fail.Fail] = walk_decl_list_for_load(l, mid, br.body_start, br.body_len);
+        l.gated = saved_gated;
+        if (sel wr.err) { ret wr; }
+        comptime.mark_load_walked(frame_ctx(m), did);
+        ret wr;
+    }
+    comptime.mark_load_walked(frame_ctx(m), did);
+    ret res[comptime.GateOutcome, fail.Fail].ok{comptime.GATE_ACTIVE};
+}
+
+# a union walk decides each chain in the frame of every tuple it is under, and in the build
+# target's, which resolve reads, when the walk is in it. each arm taken is walked once under the
+# tuples that took it, in a frame that selects it: the build target's when it does, else the
+# first of those tuples'. so a frame binds only what its own arms declare, and a tuple frame
+# binds the rest of what its gates read on demand
+fun walk_comptime_if_union(l: *Loader, mid: session.ModuleId, did: ast_id.DeclId, ci: *ast_decl.DeclComptimeIf, source: str) res[comptime.GateOutcome, fail.Fail] {
+    val m: *Module = module_at(l, mid);
+    val n: u32     = ci.branches_len;
+    if (n == 0) {
+        comptime.mark_load_walked(frame_ctx(m), did);
+        ret res[comptime.GateOutcome, fail.Fail].ok{comptime.GATE_ACTIVE};
+    }
+
+    # the build target decides a chain only in a walk its own arms led to
+    var built_arm: u32 = n;
+    if (m.frame == FRAME_BUILD) {
+        val built: res[ChainChoice, fail.Fail] = decide_in_frame(l, mid, FRAME_BUILD, ci, source);
+        if (sel built.err)                            { ret res[comptime.GateOutcome, fail.Fail].err{built.err}; }
+        if (built.ok.outcome == comptime.GATE_ACTIVE) { built_arm = built.ok.branch; }
+    }
+
+    val tk_r: res[*bool, A.Error] = A.allocate[bool](l.alloc, n::usize);
+    if (sel tk_r.err) { ret res[comptime.GateOutcome, fail.Fail].err{fail.refused(tk_r.err)}; }
+    val taken: *bool = tk_r.ok;
+    fin { A.deallocate[bool](l.alloc, taken, n::usize); }
+    var z: u32 = 0;
+    for (z < n) {
+        taken[z] = false;
+        z        = z + 1;
+    }
+
+    val branch_count: usize = n::usize;
+    val tuple_count:  usize = l.tuple_count::usize;
+    val usize_max:    usize = ~(0::usize);
+    if (tuple_count != 0 && branch_count > usize_max / tuple_count) {
+        ret res[comptime.GateOutcome, fail.Fail].err{fail.message("union gate coverage size overflow")};
+    }
+    val coverage_len: usize               = branch_count * tuple_count;
+    val cr:           res[*bool, A.Error] = A.allocate[bool](l.alloc, coverage_len);
+    if (sel cr.err) { ret res[comptime.GateOutcome, fail.Fail].err{fail.refused(cr.err)}; }
+    val coverage: *bool = cr.ok;
+    fin { A.deallocate[bool](l.alloc, coverage, coverage_len); }
+    var zi: usize = 0;
+    for (zi < coverage_len) {
+        coverage[zi] = false;
+        zi           = zi + 1;
+    }
+
+    # every tuple decides the chain, so each one's refusal is reported, and a refusal ends the walk
+    var refused: comptime.GateOutcome = comptime.GATE_ACTIVE;
+    var ti:      u32                  = 0;
+    for (ti < l.tuple_count) {
+        if (l.filter != nil && !l.filter[ti]) {
+            ti = ti + 1;
+            cnt;
+        }
+        val framed: err[fail.Fail] = ensure_tuple_frames(l, mid);
+        if (sel framed.err) { ret res[comptime.GateOutcome, fail.Fail].err{framed.err}; }
+        val decided: res[ChainChoice, fail.Fail] = decide_in_frame(l, mid, ti, ci, source);
+        if (sel decided.err) { ret res[comptime.GateOutcome, fail.Fail].err{decided.err}; }
+        val choice: ChainChoice = decided.ok;
+        if (choice.outcome == comptime.GATE_REJECTED || choice.outcome == comptime.GATE_FAILED) {
+            if (refused == comptime.GATE_ACTIVE) { refused = choice.outcome; }
+        }
+        or (choice.branch < n) {
+            taken[choice.branch]                                     = true;
+            coverage[choice.branch::usize * tuple_count + ti::usize] = true;
+        }
+        ti = ti + 1;
+    }
+    if (refused != comptime.GATE_ACTIVE) {
+        comptime.mark_load_walked(frame_ctx(m), did);
+        ret res[comptime.GateOutcome, fail.Fail].ok{refused};
+    }
+
+    val incarnation: u64 = syntax_of(l, mid).incarnation;
+    var sequence:    u64 = epoch(l);
+    var bi:          u32 = 0;
+    for (bi < n) {
+        if (taken[bi] || bi == built_arm) {
+            if (epoch(l) != sequence) {
+                val current: err[fail.Fail] = syntax_refresh(l, mid, incarnation);
+                if (sel current.err) { ret res[comptime.GateOutcome, fail.Fail].err{current.err}; }
+                sequence = epoch(l);
+            }
+            var frame: u32 = FRAME_BUILD;
+            if (bi != built_arm) { frame = first_tuple_of(?coverage[bi::usize * tuple_count], l.tuple_count); }
+            val br:           *ast_decl.ComptimeBranch = ?syntax_of(l, mid).comptime_branches[ci.branches_start + bi];
+            val saved_filter: *bool                    = l.filter;
+            val saved_frame:  u32                      = m.frame;
+            l.filter = ?coverage[bi::usize * tuple_count];
+            m.frame  = frame;
+            val saved_gated: bool = l.gated;
+            l.gated = true;
+            val w: res[comptime.GateOutcome, fail.Fail] = walk_decl_list_for_load(l, mid, br.body_start, br.body_len);
+            l.gated  = saved_gated;
+            m.frame  = saved_frame;
+            l.filter = saved_filter;
+            if (sel w.err) { ret w; }
+            if (w.ok != comptime.GATE_ACTIVE) {
+                comptime.mark_load_walked(frame_ctx(m), did);
+                ret w;
+            }
+        }
+        bi = bi + 1;
+    }
+    comptime.mark_load_walked(frame_ctx(m), did);
+    ret res[comptime.GateOutcome, fail.Fail].ok{comptime.GATE_ACTIVE};
+}
+
+# the first tuple a filter admits; a filter an arm is walked under admits at least one
+fun first_tuple_of(filter: *bool, count: u32) u32 {
+    var ti: u32 = 0;
+    for (ti < count) {
+        if (filter[ti]) { ret ti; }
+        ti = ti + 1;
+    }
+    ret FRAME_BUILD;
+}
+
+# decide a chain in one frame of a union build: the build target's, where a module a demand
+# reaches is reached under no tuple, or one tuple's, where it is reached under that tuple
+fun decide_in_frame(l: *Loader, mid: session.ModuleId, frame: u32, ci: *ast_decl.DeclComptimeIf, source: str) res[ChainChoice, fail.Fail] {
+    val m:  *Module             = module_at(l, mid);
+    val fr: res[*bool, A.Error] = A.allocate[bool](l.alloc, l.tuple_count::usize + 1);
+    if (sel fr.err) { ret res[ChainChoice, fail.Fail].err{fail.refused(fr.err)}; }
+    val filter: *bool = fr.ok;
+    fin { A.deallocate[bool](l.alloc, filter, l.tuple_count::usize + 1); }
+    var i: u32 = 0;
+    for (i < l.tuple_count) {
+        filter[i] = i == frame;
+        i         = i + 1;
+    }
+    val saved_frame:  u32   = m.frame;
+    val saved_filter: *bool = l.filter;
+    m.frame  = frame;
+    l.filter = filter;
+    val r: res[ChainChoice, fail.Fail] = decide_chain(l, mid, ci, source);
+    l.filter = saved_filter;
+    m.frame  = saved_frame;
+    ret r;
+}
+
+# the arm a chain selects, decided in the module's current frame
+# ---
+# outcome: GATE_ACTIVE when an arm is selected, GATE_INACTIVE when none is, or the refusal
+# branch:  the selected arm, or the arm count when none is
+# verdict: a refusal the chain passes down to the demand that owns it, VERDICT_ABSENT otherwise
+rec ChainChoice {
+    outcome: comptime.GateOutcome;
+    branch:  u32;
+    verdict: Verdict;
+}
+
+fun chain_choice(outcome: comptime.GateOutcome, branch: u32, verdict: Verdict) ChainChoice {
+    ret ChainChoice{outcome: outcome, branch: branch, verdict: verdict};
+}
+
+fun decide_chain(l: *Loader, mid: session.ModuleId, ci: *ast_decl.DeclComptimeIf, source: str) res[ChainChoice, fail.Fail] {
+    val n:  u32 = ci.branches_len;
+    var bi: u32 = 0;
+    for (bi < n) {
+        val br: *ast_decl.ComptimeBranch = ?syntax_of(l, mid).comptime_branches[ci.branches_start + bi];
+        if (ast_id.expr_is_nil(br.cond)) { ret res[ChainChoice, fail.Fail].ok{chain_choice(comptime.GATE_ACTIVE, bi, verdict(VERDICT_ABSENT))}; }
+        val decided: res[GateChoice, fail.Fail] = decide_gate(l, mid, br.cond, source);
+        if (sel decided.err) { ret res[ChainChoice, fail.Fail].err{decided.err}; }
+        val g: GateChoice = decided.ok;
+        if (g.verdict.kind == VERDICT_REFUSED)   { ret res[ChainChoice, fail.Fail].ok{chain_choice(comptime.GATE_FAILED, n, g.verdict)}; }
+        if (g.outcome == comptime.GATE_ACTIVE)   { ret res[ChainChoice, fail.Fail].ok{chain_choice(comptime.GATE_ACTIVE, bi, g.verdict)}; }
+        if (g.outcome != comptime.GATE_INACTIVE) { ret res[ChainChoice, fail.Fail].ok{chain_choice(g.outcome, n, g.verdict)}; }
+        bi = bi + 1;
+    }
+    ret res[ChainChoice, fail.Fail].ok{chain_choice(comptime.GATE_INACTIVE, n, verdict(VERDICT_ABSENT))};
+}
+
+rec GateChoice {
+    outcome: comptime.GateOutcome;
+    verdict: Verdict;
+}
+
+fun gate_choice(outcome: comptime.GateOutcome) GateChoice {
+    ret GateChoice{outcome: outcome, verdict: verdict(VERDICT_ABSENT)};
+}
+
+# decide one declaring gate in the module's current frame. every constant it names is demanded
+# first, so it reads a constant declared later in its module as readily as one declared before
+# it; a gate that asks a type question, directly or through a constant it reads, or that its
+# own constants lead back to, is refused here
+fun decide_gate(l: *Loader, mid: session.ModuleId, cond: ast_id.ExprId, source: str) res[GateChoice, fail.Fail] {
+    val m:     *Module               = module_at(l, mid);
+    val ctx:   *comptime.ComptimeCtx = frame_ctx(m);
+    val known: comptime.GateState    = comptime.gate_state(ctx, cond);
+    if (known == comptime.GATE_STATE_TRUE)     { ret res[GateChoice, fail.Fail].ok{gate_choice(comptime.GATE_ACTIVE)}; }
+    if (known == comptime.GATE_STATE_FALSE)    { ret res[GateChoice, fail.Fail].ok{gate_choice(comptime.GATE_INACTIVE)}; }
+    if (known == comptime.GATE_STATE_REJECTED) { ret res[GateChoice, fail.Fail].ok{gate_choice(comptime.GATE_REJECTED)}; }
+
+    val open: opt[u32] = demand_find(l, mid, m.frame, ast_id.DECL_NIL, cond);
+    if (sel open.some) {
+        val cycle: res[Verdict, fail.Fail] = cycle_verdict(l, open.some);
+        if (sel cycle.err) { ret res[GateChoice, fail.Fail].err{cycle.err}; }
+        ret res[GateChoice, fail.Fail].ok{GateChoice{outcome: comptime.GATE_FAILED, verdict: cycle.ok}};
+    }
+
+    val question: res[ast_id.ExprId, fail.Fail] = comptime.type_question(syntax_of(l, mid), source, cond);
+    if (sel question.err) { ret res[GateChoice, fail.Fail].err{question.err}; }
+    if (!ast_id.expr_is_nil(question.ok)) {
+        val text: res[intern.StrId, fail.Fail] = type_question_message(l, mid, question.ok, l.demands.len::u32, l.demands.len::u32);
+        if (sel text.err) { ret res[GateChoice, fail.Fail].err{text.err}; }
+        ret refuse_gate(l, mid, cond, diagnostic_kind.GATE_TYPE_QUESTION, text.ok);
+    }
+
+    val index: res[u32, fail.Fail] = demand_push(l, mid, ast_id.DECL_NIL, cond, intern.STR_NIL);
+    if (sel index.err) { ret res[GateChoice, fail.Fail].err{index.err}; }
+    val demanded: res[Verdict, fail.Fail] = demand_names(l, mid, cond, true);
+    demand_pop(l);
+    if (sel demanded.err) { ret res[GateChoice, fail.Fail].err{demanded.err}; }
+    if (demanded.ok.kind == VERDICT_REFUSED) {
+        if (demanded.ok.head >= index.ok) { ret refuse_gate(l, mid, cond, demanded.ok.diag, demanded.ok.message); }
+        ret res[GateChoice, fail.Fail].ok{GateChoice{outcome: comptime.GATE_FAILED, verdict: demanded.ok}};
+    }
+
+    var lc: LoadMemberCtx;
+    lc.l   = l;
+    lc.mid = mid;
+    val caps_r: res[comptime.PhaseCapabilities[LoadMemberCtx], fail.Fail] = comptime.loading_capabilities[LoadMemberCtx](resolve_module_member_const_load, load_cast);
+    if (sel caps_r.err) { ret res[GateChoice, fail.Fail].err{caps_r.err}; }
+    val vr: res[comptime.GateVerdict, fail.Fail] = comptime.evaluate_gate[LoadMemberCtx](
+        ctx, ?lc, caps_r.ok, syntax_of(l, mid), source, cond, ?l.s.interner, comptime.GATE_SCOPE_DECL, true);
+    if (sel vr.err) { ret res[GateChoice, fail.Fail].err{vr.err}; }
+    val v:       comptime.GateVerdict = vr.ok;
+    val reports: bool                 = frame_reports(l, m);
+
+    if (v.outcome == comptime.GATE_ACTIVE || v.outcome == comptime.GATE_INACTIVE) {
+        ret res[GateChoice, fail.Fail].ok{gate_choice(v.outcome)};
+    }
+    if (v.outcome == comptime.GATE_REJECTED) {
+        if (reports && str_len(v.message) > 0) {
+            fail.reject(?m.status);
+            val committed_r: err[fail.Fail] = diagnostic.report(l.diags, v.diag, file_of(l, mid), v.span, v.message);
+            if (sel committed_r.err) { ret res[GateChoice, fail.Fail].err{committed_r.err}; }
+        }
+        or (reports) { fail.reject(?m.status); }
+        ret res[GateChoice, fail.Fail].ok{gate_choice(comptime.GATE_REJECTED)};
+    }
+    # a gate the load cannot decide is refused here, so no later phase decides it again; an unbound
+    # name is the one it waits on, any other failure says what it cannot evaluate
+    if (v.outcome == comptime.GATE_FAILED) {
+        comptime.set_gate_state(ctx, cond, comptime.GATE_STATE_REJECTED);
+        if (reports) {
+            fail.reject(?m.status);
+            var named: opt[str] = opt[str].none{};
+            if (!intern.str_is_nil(v.depends) && v.fail == comptime.EVAL_FAIL_UNBOUND) {
+                named = comptime.never_decided_message(l.diags.a, ?l.s.interner, v.depends);
+            }
+            var message: str = v.message;
+            if (sel named.some) { message = named.some; }
+            val committed_r: err[fail.Fail] = diagnostic.report(l.diags, v.diag, file_of(l, mid), v.span, message);
+            if (sel named.some)      { str_free(l.diags.a, named.some); }
+            if (sel committed_r.err) { ret res[GateChoice, fail.Fail].err{committed_r.err}; }
+        }
+        ret res[GateChoice, fail.Fail].ok{gate_choice(comptime.GATE_FAILED)};
+    }
+    # what the load cannot evaluate, a comptime cast among them, no later phase decides either:
+    # the declarations this gate selects are fixed before any type exists
+    val reason: res[intern.StrId, A.Error] = intern.add(?l.s.interner, v.message);
+    if (sel reason.err) { ret res[GateChoice, fail.Fail].err{fail.refused(reason.err)}; }
+    ret refuse_gate(l, mid, cond, v.diag, reason.ok);
+}
+
+# the frame a union build's resolve reads is decided without a word, since each tuple's
+# frame reports the same gate in its own terms
+fun frame_reports(l: *Loader, m: *Module) bool {
+    ret !(l.union && m.frame == FRAME_BUILD);
+}
+
+fun refuse_gate(l: *Loader, mid: session.ModuleId, cond: ast_id.ExprId, k: diagnostic_kind.Kind, message: intern.StrId) res[GateChoice, fail.Fail] {
+    val m: *Module = module_at(l, mid);
+    comptime.set_gate_state(frame_ctx(m), cond, comptime.GATE_STATE_REJECTED);
+    if (!frame_reports(l, m)) { ret res[GateChoice, fail.Fail].ok{gate_choice(comptime.GATE_FAILED)}; }
+    val e_opt: opt[*ast_expr.Expr] = ast.get_expr(syntax_of(l, mid), cond);
+    if (sel e_opt.none) { ret res[GateChoice, fail.Fail].err{fail.message("gate condition is out of range")}; }
+    val text: opt[str] = intern.get(?l.s.interner, message);
+    if (sel text.none) { ret res[GateChoice, fail.Fail].err{fail.message("gate refusal is not interned")}; }
+    fail.reject(?m.status);
+    val committed_r: err[fail.Fail] = diagnostic.report(l.diags, k, file_of(l, mid), e_opt.some.span, text.some);
+    if (sel committed_r.err) { ret res[GateChoice, fail.Fail].err{committed_r.err}; }
+    ret res[GateChoice, fail.Fail].ok{gate_choice(comptime.GATE_FAILED)};
+}
+
+# what a demand for a constant found
+# ---
+# VERDICT_BOUND:   the constant is bound in the frame
+# VERDICT_ABSENT:  it is not, for a reason the gate reading it reports itself
+# VERDICT_REFUSED: it is not because it asks a type question or depends on itself; the gate
+#                  at or below `head` on the demand stack is refused with `message`, reported
+#                  as `diag`
+def VerdictKind: u8;
+
+val VERDICT_BOUND:   VerdictKind = 0;
+val VERDICT_ABSENT:  VerdictKind = 1;
+val VERDICT_REFUSED: VerdictKind = 2;
+
+rec Verdict {
+    kind:    VerdictKind;
+    head:    u32;
+    diag:    diagnostic_kind.Kind;
+    message: intern.StrId;
+}
+
+fun verdict(kind: VerdictKind) Verdict {
+    ret Verdict{kind: kind, head: 0, diag: diagnostic_kind.NONE, message: intern.STR_NIL};
+}
+
+fun demand_push(l: *Loader, mid: session.ModuleId, did: ast_id.DeclId, cond: ast_id.ExprId, name: intern.StrId) res[u32, fail.Fail] {
+    val index:  u32                 = l.demands.len::u32;
+    val pushed: res[usize, A.Error] = collections_vector.push[Demand](?l.demands, Demand{
+        module: mid, frame: module_at(l, mid).frame, decl: did, cond: cond, name: name
+    });
+    if (sel pushed.err) { ret res[u32, fail.Fail].err{fail.refused(pushed.err)}; }
+    ret res[u32, fail.Fail].ok{index};
+}
+
+fun demand_pop(l: *Loader) {
+    if (l.demands.len > 0) { l.demands.len = l.demands.len - 1; }
+}
+
+fun demand_find(l: *Loader, mid: session.ModuleId, frame: u32, did: ast_id.DeclId, cond: ast_id.ExprId) opt[u32] {
+    var i: usize = 0;
+    for (i < l.demands.len) {
+        val d: *Demand = ?l.demands.data[i];
+        if (module.same(d.module, mid) && d.frame == frame && ast_id.decl_same(d.decl, did) && ast_id.expr_same(d.cond, cond)) { ret opt[u32].some{i::u32}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# the innermost gate at or below a stack position, which is the one a refusal there belongs to
+fun demand_gate_at_or_below(l: *Loader, index: u32) opt[u32] {
+    var i: u32 = index + 1;
+    if (i::usize > l.demands.len) { i = l.demands.len::u32; }
+    for (i > 0) {
+        i = i - 1;
+        if (!ast_id.expr_is_nil(l.demands.data[i].cond)) { ret opt[u32].some{i}; }
+    }
+    ret opt[u32].none{};
+}
+
+# a demand reached an entry already open on the stack at `head`: the entries from there up lead
+# back to it. only a gate can be refused for it, so without one below it the constants involved
+# are left unbound as any other unreadable constant is. the gate that owns the refusal reports
+# the cycle, and every other gate on it is refused without a word of its own
+fun cycle_verdict(l: *Loader, head: u32) res[Verdict, fail.Fail] {
+    val owner: opt[u32] = demand_gate_at_or_below(l, head);
+    if (sel owner.none) { ret res[Verdict, fail.Fail].ok{verdict(VERDICT_ABSENT)}; }
+    var gi: u32 = head + 1;
+    for (gi::usize < l.demands.len) {
+        val d: Demand = l.demands.data[gi];
+        if (!ast_id.expr_is_nil(d.cond)) {
+            comptime.set_gate_state(frame_ctx_at(module_at(l, d.module), d.frame), d.cond, comptime.GATE_STATE_REJECTED);
+        }
+        gi = gi + 1;
+    }
+    var chain: str = nil;
+    var i:     u32 = head;
+    for (i::usize <= l.demands.len) {
+        var at: u32 = i;
+        if (i::usize == l.demands.len) { at = head; }
+        val step: res[str, fail.Fail] = demand_step_text(l, ?l.demands.data[at]);
+        if (sel step.err) {
+            if (chain != nil) { str_free(l.s.alloc, chain); }
+            ret res[Verdict, fail.Fail].err{step.err};
+        }
+        var next_r: res[str, std_format.FormatError];
+        if (chain == nil) { next_r = std_format.sprint(l.s.alloc, "{}", step.ok); }
+        or                { next_r = std_format.sprint(l.s.alloc, "{} -> {}", chain, step.ok); }
+        str_free(l.s.alloc, step.ok);
+        if (chain != nil)   { str_free(l.s.alloc, chain); }
+        if (sel next_r.err) { ret res[Verdict, fail.Fail].err{fail.format_refused(next_r.err)}; }
+        chain = next_r.ok;
+        i     = i + 1;
+    }
+    val msg_r: res[str, std_format.FormatError] = std_format.sprint(l.s.alloc,
+        "the declaring gates and constants this gate reads depend on each other, so no order decides them: {}", chain);
+    str_free(l.s.alloc, chain);
+    if (sel msg_r.err) { ret res[Verdict, fail.Fail].err{fail.format_refused(msg_r.err)}; }
+    val interned: res[intern.StrId, A.Error] = intern.add(?l.s.interner, msg_r.ok);
+    str_free(l.s.alloc, msg_r.ok);
+    if (sel interned.err) { ret res[Verdict, fail.Fail].err{fail.refused(interned.err)}; }
+    ret res[Verdict, fail.Fail].ok{Verdict{kind: VERDICT_REFUSED, head: head, diag: diagnostic_kind.GATE_CYCLE, message: interned.ok}};
+}
+
+# source text as the interner holds it, so a message can format it
+fun span_text(l: *Loader, source: str, span: lang_source.Span) res[str, fail.Fail] {
+    val id_r: res[intern.StrId, A.Error] = intern.range_add(?l.s.interner, source, span.offset, span.len);
+    if (sel id_r.err) { ret res[str, fail.Fail].err{fail.refused(id_r.err)}; }
+    val text: opt[str] = intern.get(?l.s.interner, id_r.ok);
+    if (sel text.none) { ret res[str, fail.Fail].err{fail.message("interned source text is absent")}; }
+    ret res[str, fail.Fail].ok{text.some};
+}
+
+# a stack entry as a cycle names it: a gate by its condition, a constant by its name
+fun demand_step_text(l: *Loader, d: *Demand) res[str, fail.Fail] {
+    if (ast_id.expr_is_nil(d.cond)) {
+        val name: opt[str] = intern.get(?l.s.interner, d.name);
+        if (sel name.none) { ret res[str, fail.Fail].err{fail.message("demanded constant name is not interned")}; }
+        val r: res[str, std_format.FormatError] = std_format.sprint(l.s.alloc, "`{}`", name.some);
+        if (sel r.err) { ret res[str, fail.Fail].err{fail.format_refused(r.err)}; }
+        ret res[str, fail.Fail].ok{r.ok};
+    }
+    val source_r: res[str, fail.Fail] = module_source(l, d.module);
+    if (sel source_r.err) { ret res[str, fail.Fail].err{source_r.err}; }
+    val e_opt: opt[*ast_expr.Expr] = ast.get_expr(syntax_of(l, d.module), d.cond);
+    if (sel e_opt.none) { ret res[str, fail.Fail].err{fail.message("demanded gate condition is out of range")}; }
+    val text: res[str, fail.Fail] = span_text(l, source_r.ok, e_opt.some.span);
+    if (sel text.err) { ret text; }
+    val r: res[str, std_format.FormatError] = std_format.sprint(l.s.alloc, "`$if ({})`", text.ok);
+    if (sel r.err) { ret res[str, fail.Fail].err{fail.format_refused(r.err)}; }
+    ret res[str, fail.Fail].ok{r.ok};
+}
+
+# the constants on the demand stack from `from` up to `top` are the ones a type question is
+# reached through
+fun type_question_message(l: *Loader, mid: session.ModuleId, call: ast_id.ExprId, from: u32, top: u32) res[intern.StrId, fail.Fail] {
+    val source_r: res[str, fail.Fail] = module_source(l, mid);
+    if (sel source_r.err) { ret res[intern.StrId, fail.Fail].err{source_r.err}; }
+    var via: str = nil;
+    var i:   u32 = from;
+    for (i < top) {
+        val name: opt[str] = intern.get(?l.s.interner, l.demands.data[i].name);
+        if (sel name.none) {
+            if (via != nil) { str_free(l.s.alloc, via); }
+            ret res[intern.StrId, fail.Fail].err{fail.message("demanded constant name is not interned")};
+        }
+        var next_r: res[str, std_format.FormatError];
+        if (via == nil)     { next_r = std_format.sprint(l.s.alloc, " through `{}`", name.some); }
+        or                  { next_r = std_format.sprint(l.s.alloc, "{} -> `{}`", via, name.some); }
+        if (via != nil)     { str_free(l.s.alloc, via); }
+        if (sel next_r.err) { ret res[intern.StrId, fail.Fail].err{fail.format_refused(next_r.err)}; }
+        via = next_r.ok;
+        i   = i + 1;
+    }
+    var through: str = "";
+    if (via != nil) { through = via; }
+    val r: res[intern.StrId, fail.Fail] = comptime.type_question_message(?l.s.interner, syntax_of(l, mid), source_r.ok, call, through);
+    if (via != nil) { str_free(l.s.alloc, via); }
+    ret r;
+}
+
+# a constant an expression names: `name` alone, or `member` of the module `name` imports
+rec NameRef {
+    name:   intern.StrId;
+    member: intern.StrId;
+}
+
+rec NameWalk {
+    l:       *Loader;
+    source:  str;
+    a:       *ast.Ast;
+    out:     *collections_vector.Vector[NameRef];
+    failure: err[fail.Fail];
+}
+
+fun name_walk_node(w: *NameWalk, eid: ast_id.ExprId, e: *ast_expr.Expr) comptime.GateNodeVerdict {
+    val failed: bool = sel w.failure.err;
+    if (failed) { ret comptime.GATE_NODE_PRUNE; }
+    var head:   lang_source.Span = e.span;
+    var member: lang_source.Span = e.span;
+    member.len = 0;
+    if (e.kind == ast_expr.EXPR_KIND_IDENT) { head = e.data.ident.tok; }
+    or (e.kind == ast_expr.EXPR_KIND_MEMBER) {
+        val o_opt: opt[*ast_expr.Expr] = ast.get_expr(w.a, e.data.member.object);
+        if (sel o_opt.none)                              { ret comptime.GATE_NODE_NO; }
+        if (o_opt.some.kind != ast_expr.EXPR_KIND_IDENT) { ret comptime.GATE_NODE_NO; }
+        head   = o_opt.some.data.ident.tok;
+        member = e.data.member.name;
+    }
+    or { ret comptime.GATE_NODE_NO; }
+    val name_r: res[intern.StrId, A.Error] = intern.range_add(?w.l.s.interner, w.source, head.offset, head.len);
+    if (sel name_r.err) {
+        w.failure = err[fail.Fail].err{fail.refused(name_r.err)};
+        ret comptime.GATE_NODE_PRUNE;
+    }
+    var r: NameRef = NameRef{name: name_r.ok, member: intern.STR_NIL};
+    if (member.len > 0) {
+        val member_r: res[intern.StrId, A.Error] = intern.range_add(?w.l.s.interner, w.source, member.offset, member.len);
+        if (sel member_r.err) {
+            w.failure = err[fail.Fail].err{fail.refused(member_r.err)};
+            ret comptime.GATE_NODE_PRUNE;
+        }
+        r.member = member_r.ok;
+    }
+    val pushed: res[usize, A.Error] = collections_vector.push[NameRef](w.out, r);
+    if (sel pushed.err) {
+        w.failure = err[fail.Fail].err{fail.refused(pushed.err)};
+        ret comptime.GATE_NODE_PRUNE;
+    }
+    if (e.kind == ast_expr.EXPR_KIND_MEMBER) { ret comptime.GATE_NODE_PRUNE; }
+    ret comptime.GATE_NODE_NO;
+}
+
+fun name_walk_expression(w: *NameWalk, a: *ast.Ast, eid: ast_id.ExprId) res[ast_expr.Expr, comptime.EvalFail] {
+    val found: opt[*ast_expr.Expr] = ast.get_expr(a, eid);
+    if (sel found.none) { ret res[ast_expr.Expr, comptime.EvalFail].err{comptime.eval_error(comptime.EVAL_FAIL_INTERNAL, diagnostic_kind.COMPILER_INTERNAL, "load: expression identity is out of range")}; }
+    ret res[ast_expr.Expr, comptime.EvalFail].ok{@found.some};
+}
+
+# demand every constant an expression names that its module's frame does not bind yet.
+# `walk` says whether the module is still loading, so a demand may walk its declarations;
+# a loaded module only explains why a constant it never bound is unreadable
+fun demand_names(l: *Loader, mid: session.ModuleId, eid: ast_id.ExprId, walk: bool) res[Verdict, fail.Fail] {
+    val source_r: res[str, fail.Fail] = module_source(l, mid);
+    if (sel source_r.err) { ret res[Verdict, fail.Fail].err{source_r.err}; }
+    var names: collections_vector.Vector[NameRef] = collections_vector.init[NameRef](l.alloc);
+    fin { collections_vector.dnit[NameRef](?names); }
+    var w:      NameWalk             = NameWalk{l: l, source: source_r.ok, a: syntax_of(l, mid), out: ?names, failure: err[fail.Fail].ok{}};
+    val walked: res[bool, fail.Fail] = comptime.gate_walk[NameWalk](w.a, w.source, ?w, name_walk_node, name_walk_expression, eid);
+    if (sel walked.err)    { ret res[Verdict, fail.Fail].err{walked.err}; }
+    if (sel w.failure.err) { ret res[Verdict, fail.Fail].err{w.failure.err}; }
+    var i: usize = 0;
+    for (i < names.len) {
+        val r: NameRef = names.data[i];
+        val m: *Module = module_at(l, mid);
+        i = i + 1;
+        var v:     Verdict                  = verdict(VERDICT_BOUND);
+        val bound: opt[comptime.NamedConst] = comptime.lookup(frame_ctx(m), r.name);
+        if (intern.str_is_nil(r.member)) {
+            if (sel bound.some) { cnt; }
+            val dr: res[Verdict, fail.Fail] = demand_name(l, mid, r.name, walk);
+            if (sel dr.err) { ret dr; }
+            v = dr.ok;
+        }
+        or {
+            if (sel bound.none) {
+                val dr: res[Verdict, fail.Fail] = demand_name(l, mid, r.name, walk);
+                if (sel dr.err) { ret dr; }
+                v = dr.ok;
+            }
+            val dep_r: res[opt[session.ModuleId], fail.Fail] = frame_mod_ref(l, mid, r.name);
+            if (sel dep_r.err) { ret res[Verdict, fail.Fail].err{dep_r.err}; }
+            val dep: opt[session.ModuleId] = dep_r.ok;
+            if (v.kind != VERDICT_REFUSED) {
+                if (sel dep.some) {
+                    val exported: opt[*Const] = const_find(module_at(l, dep.some), r.member);
+                    if (sel exported.none) {
+                        val pr: res[Verdict, fail.Fail] = demand_public(l, dep.some, r.member);
+                        if (sel pr.err) { ret pr; }
+                        v = pr.ok;
+                    }
+                }
+            }
+        }
+        if (v.kind == VERDICT_REFUSED) { ret res[Verdict, fail.Fail].ok{v}; }
+    }
+    ret res[Verdict, fail.Fail].ok{verdict(VERDICT_ABSENT)};
+}
+
+# find what binds `name` at module scope in the module's current frame and bring it in: a `val`
+# is walked, a `use` loads its module and binds the import, and a chain with an arm that binds it
+# is decided first so the demand goes on in the arm it selects
+fun demand_name(l: *Loader, mid: session.ModuleId, name: intern.StrId, walk: bool) res[Verdict, fail.Fail] {
+    val m:     *Module                 = module_at(l, mid);
+    val m_opt: opt[*ast_module.Module] = ast.get_module(syntax_of(l, mid), syntax_of(l, mid).root_module);
+    if (sel m_opt.none) { ret res[Verdict, fail.Fail].err{fail.message("module root not set on Ast")}; }
+    val saved_gated: bool = l.gated;
+    l.gated = false;
+    val r: res[Verdict, fail.Fail] = demand_in_list(l, mid, m_opt.some.decls_start, m_opt.some.decls_len, name, walk);
+    l.gated = saved_gated;
+    ret r;
+}
+
+# why a loaded module never bound a public constant an importer's gate reads
+fun demand_public(l: *Loader, dep: session.ModuleId, name: intern.StrId) res[Verdict, fail.Fail] {
+    val m:           *Module = module_at(l, dep);
+    val saved_frame: u32     = m.frame;
+    m.frame = FRAME_BUILD;
+    val r: res[Verdict, fail.Fail] = demand_name(l, dep, name, false);
+    m.frame = saved_frame;
+    ret r;
+}
+
+fun demand_in_list(l: *Loader, mid: session.ModuleId, start: u32, len: u32, name: intern.StrId, walk: bool) res[Verdict, fail.Fail] {
+    val source_r: res[str, fail.Fail] = module_source(l, mid);
+    if (sel source_r.err) { ret res[Verdict, fail.Fail].err{source_r.err}; }
+    val source: str      = source_r.ok;
+    val text:   opt[str] = intern.get(?l.s.interner, name);
+    if (sel text.none) { ret res[Verdict, fail.Fail].err{fail.message("demanded constant name is not interned")}; }
+    var i: u32 = 0;
+    for (i < len) {
+        val a:     *ast.Ast            = syntax_of(l, mid);
+        val did:   ast_id.DeclId       = a.decl_ids[start + i];
+        val d_opt: opt[*ast_decl.Decl] = ast.get_decl(a, did);
+        if (sel d_opt.none) { ret res[Verdict, fail.Fail].err{fail.message("DeclId out of range during a demand")}; }
+        var copied: ast_decl.Decl = @d_opt.some;
+        i = i + 1;
+        if (copied.kind == ast_decl.DECL_KIND_VAL && spells(source, copied.data.bind.name, text.some)) {
+            ret demand_val(l, mid, did, walk);
+        }
+        if (copied.kind == ast_decl.DECL_KIND_USE && use_binds(source, ?copied.data.use_, text.some)) {
+            if (!walk) { ret res[Verdict, fail.Fail].ok{verdict(VERDICT_ABSENT)}; }
+            ret demand_use(l, mid, did, name);
+        }
+        if (copied.kind == ast_decl.DECL_KIND_COMPTIME_IF
+            && !comptime.comptime_if_declares_nothing(a, copied.data.comptime_if.branches_start, copied.data.comptime_if.branches_len)
+            && chain_binds(a, source, ?copied.data.comptime_if, text.some)) {
+            val arm_r: res[ChainChoice, fail.Fail] = demand_arm(l, mid, ?copied.data.comptime_if, source, walk);
+            if (sel arm_r.err) { ret res[Verdict, fail.Fail].err{arm_r.err}; }
+            val arm: ChainChoice = arm_r.ok;
+            if (arm.verdict.kind == VERDICT_REFUSED) { ret res[Verdict, fail.Fail].ok{arm.verdict}; }
+            if (arm.branch < copied.data.comptime_if.branches_len) {
+                val br:          ast_decl.ComptimeBranch = a.comptime_branches[copied.data.comptime_if.branches_start + arm.branch];
+                val saved_gated: bool                    = l.gated;
+                l.gated = true;
+                val found: res[Verdict, fail.Fail] = demand_in_list(l, mid, br.body_start, br.body_len, name, walk);
+                l.gated = saved_gated;
+                if (sel found.err)                   { ret found; }
+                if (found.ok.kind != VERDICT_ABSENT) { ret found; }
+            }
+        }
+    }
+    ret res[Verdict, fail.Fail].ok{verdict(VERDICT_ABSENT)};
+}
+
+# the arm a chain selects for a demand: decided now in a module still loading, or read from the
+# states its walk left in a loaded one
+fun demand_arm(l: *Loader, mid: session.ModuleId, ci: *ast_decl.DeclComptimeIf, source: str, walk: bool) res[ChainChoice, fail.Fail] {
+    if (walk) { ret decide_chain(l, mid, ci, source); }
+    val m:  *Module = module_at(l, mid);
+    val n:  u32     = ci.branches_len;
+    var bi: u32     = 0;
+    for (bi < n) {
+        val cond: ast_id.ExprId = syntax_of(l, mid).comptime_branches[ci.branches_start + bi].cond;
+        if (ast_id.expr_is_nil(cond)) { ret res[ChainChoice, fail.Fail].ok{chain_choice(comptime.GATE_ACTIVE, bi, verdict(VERDICT_ABSENT))}; }
+        val state: comptime.GateState = comptime.gate_state(frame_ctx(m), cond);
+        if (state == comptime.GATE_STATE_TRUE)  { ret res[ChainChoice, fail.Fail].ok{chain_choice(comptime.GATE_ACTIVE, bi, verdict(VERDICT_ABSENT))}; }
+        if (state != comptime.GATE_STATE_FALSE) { brk; }
+        bi = bi + 1;
+    }
+    ret res[ChainChoice, fail.Fail].ok{chain_choice(comptime.GATE_INACTIVE, n, verdict(VERDICT_ABSENT))};
+}
+
+fun use_binds(source: str, du: *ast_decl.DeclUse, text: str) bool {
+    if (du.path.len == 0) { ret false; }
+    var bound: lang_source.Span = du.alias;
+    if (bound.len == 0) { bound = fe_path.leaf(source, du.path); }
+    ret spells(source, bound, text);
+}
+
+# whether any arm of a chain, at any depth, declares `text` as a constant or imports it
+fun chain_binds(a: *ast.Ast, source: str, ci: *ast_decl.DeclComptimeIf, text: str) bool {
+    var bi: u32 = 0;
+    for (bi < ci.branches_len) {
+        val br: *ast_decl.ComptimeBranch = ?a.comptime_branches[ci.branches_start + bi];
+        if (list_binds(a, source, br.body_start, br.body_len, text)) { ret true; }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+fun list_binds(a: *ast.Ast, source: str, start: u32, len: u32, text: str) bool {
+    var i: u32 = 0;
+    for (i < len) {
+        val d_opt: opt[*ast_decl.Decl] = ast.get_decl(a, a.decl_ids[start + i]);
+        if (sel d_opt.some) {
+            val d: *ast_decl.Decl = d_opt.some;
+            if (d.kind == ast_decl.DECL_KIND_VAL && spells(source, d.data.bind.name, text))                    { ret true; }
+            if (d.kind == ast_decl.DECL_KIND_USE && use_binds(source, ?d.data.use_, text))                     { ret true; }
+            if (d.kind == ast_decl.DECL_KIND_COMPTIME_IF && chain_binds(a, source, ?d.data.comptime_if, text)) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun demand_val(l: *Loader, mid: session.ModuleId, did: ast_id.DeclId, walk: bool) res[Verdict, fail.Fail] {
+    val m:     *Module             = module_at(l, mid);
+    val d_opt: opt[*ast_decl.Decl] = ast.get_decl(syntax_of(l, mid), did);
+    if (sel d_opt.none) { ret res[Verdict, fail.Fail].err{fail.message("DeclId out of range during a demand")}; }
+    val name_span: lang_source.Span    = d_opt.some.data.bind.name;
+    val source_r:  res[str, fail.Fail] = module_source(l, mid);
+    if (sel source_r.err) { ret res[Verdict, fail.Fail].err{source_r.err}; }
+    val name_r: res[intern.StrId, A.Error] = intern.range_add(?l.s.interner, source_r.ok, name_span.offset, name_span.len);
+    if (sel name_r.err) { ret res[Verdict, fail.Fail].err{fail.refused(name_r.err)}; }
+    val bound: opt[comptime.NamedConst] = comptime.lookup(frame_ctx(m), name_r.ok);
+    if (sel bound.some) { ret res[Verdict, fail.Fail].ok{verdict(VERDICT_BOUND)}; }
+    val open: opt[u32] = demand_find(l, mid, m.frame, did, ast_id.EXPR_NIL);
+    if (sel open.some)                           { ret cycle_verdict(l, open.some); }
+    if (comptime.load_walked(frame_ctx(m), did)) { ret val_reason(l, mid, did); }
+    if (!walk)                                   { ret res[Verdict, fail.Fail].ok{verdict(VERDICT_ABSENT)}; }
+    ret walk_val(l, mid, did);
+}
+
+fun demand_use(l: *Loader, mid: session.ModuleId, did: ast_id.DeclId, name: intern.StrId) res[Verdict, fail.Fail] {
+    val m:      *Module                              = module_at(l, mid);
+    val walked: res[comptime.GateOutcome, fail.Fail] = walk_one_decl_for_load(l, mid, did);
+    if (sel walked.err) { ret res[Verdict, fail.Fail].err{walked.err}; }
+    val bound: opt[comptime.NamedConst] = comptime.lookup(frame_ctx(m), name);
+    if (sel bound.some) { ret res[Verdict, fail.Fail].ok{verdict(VERDICT_BOUND)}; }
+    # a module name is no constant; an import that bound none lets its module say why
+    val recorded: opt[*Binding] = binding_for(m, did);
+    if (sel recorded.some && recorded.some.kind == BINDING_MODULE) { ret res[Verdict, fail.Fail].ok{verdict(VERDICT_ABSENT)}; }
+    val d_opt: opt[*ast_decl.Decl] = ast.get_decl(syntax_of(l, mid), did);
+    if (sel d_opt.none) { ret res[Verdict, fail.Fail].err{fail.message("DeclId out of range during a demand")}; }
+    val path:     lang_source.Span    = d_opt.some.data.use_.path;
+    val source_r: res[str, fail.Fail] = module_source(l, mid);
+    if (sel source_r.err) { ret res[Verdict, fail.Fail].err{source_r.err}; }
+    val tgt_r: res[UseTarget, fail.Fail] = use_target(l, source_r.ok, path);
+    if (sel tgt_r.err)         { ret res[Verdict, fail.Fail].ok{verdict(VERDICT_ABSENT)}; }
+    if (tgt_r.ok.binds_module) { ret res[Verdict, fail.Fail].ok{verdict(VERDICT_ABSENT)}; }
+    val entry_r: opt[session.ModuleId] = module_find(l, tgt_r.ok.module_fqn);
+    if (sel entry_r.none) { ret res[Verdict, fail.Fail].ok{verdict(VERDICT_ABSENT)}; }
+    ret demand_public(l, entry_r.some, tgt_r.ok.leaf);
+}
+
+# why a constant the walk reached is unbound: a constant it reads is refused, or its own value
+# asks a type question
+fun val_reason(l: *Loader, mid: session.ModuleId, did: ast_id.DeclId) res[Verdict, fail.Fail] {
+    val m:     *Module             = module_at(l, mid);
+    val d_opt: opt[*ast_decl.Decl] = ast.get_decl(syntax_of(l, mid), did);
+    if (sel d_opt.none) { ret res[Verdict, fail.Fail].err{fail.message("DeclId out of range during a demand")}; }
+    var copied: ast_decl.Decl = @d_opt.some;
+    if (copied.data.bind.name.len == 0 || ast_id.expr_is_nil(copied.data.bind.init)) { ret res[Verdict, fail.Fail].ok{verdict(VERDICT_ABSENT)}; }
+    val source_r: res[str, fail.Fail] = module_source(l, mid);
+    if (sel source_r.err) { ret res[Verdict, fail.Fail].err{source_r.err}; }
+    val name_r: res[intern.StrId, A.Error] = intern.range_add(?l.s.interner, source_r.ok, copied.data.bind.name.offset, copied.data.bind.name.len);
+    if (sel name_r.err) { ret res[Verdict, fail.Fail].err{fail.refused(name_r.err)}; }
+    val index: res[u32, fail.Fail] = demand_push(l, mid, did, ast_id.EXPR_NIL, name_r.ok);
+    if (sel index.err) { ret res[Verdict, fail.Fail].err{index.err}; }
+    val r: res[Verdict, fail.Fail] = unbound_reason(l, mid, ?copied, name_r.ok, false);
+    demand_pop(l);
+    ret r;
+}
+
+# the reason a constant on top of the demand stack is unbound, which only a gate below it reports:
+# a constant it reads is refused, its value asks a type question, or its type is no integer
+fun unbound_reason(l: *Loader, mid: session.ModuleId, d: *ast_decl.Decl, name: intern.StrId, demanded: bool) res[Verdict, fail.Fail] {
+    val init:  ast_id.ExprId = d.data.bind.init;
+    val owner: opt[u32]      = demand_gate_at_or_below(l, l.demands.len::u32 - 1);
+    if (sel owner.none) { ret res[Verdict, fail.Fail].ok{verdict(VERDICT_ABSENT)}; }
+    if (!demanded) {
+        val deps: res[Verdict, fail.Fail] = demand_names(l, mid, init, false);
+        if (sel deps.err)                    { ret deps; }
+        if (deps.ok.kind == VERDICT_REFUSED) { ret deps; }
+    }
+    val source_r: res[str, fail.Fail] = module_source(l, mid);
+    if (sel source_r.err) { ret res[Verdict, fail.Fail].err{source_r.err}; }
+    val question: res[ast_id.ExprId, fail.Fail] = comptime.type_question(syntax_of(l, mid), source_r.ok, init);
+    if (sel question.err) { ret res[Verdict, fail.Fail].err{question.err}; }
+    if (ast_id.expr_is_nil(question.ok)) {
+        if (ast_id.type_is_nil(d.data.bind.ty)) { ret res[Verdict, fail.Fail].ok{verdict(VERDICT_ABSENT)}; }
+        var w: DeclaredWalk;
+        w.l     = l;
+        w.steps = collections_vector.init[intern.StrId](l.alloc);
+        fin { collections_vector.dnit[intern.StrId](?w.steps); }
+        val declared: res[DeclaredInt, fail.Fail] = declared_type(?w, mid, d.data.bind.ty, 0);
+        if (sel declared.err)                      { ret res[Verdict, fail.Fail].err{declared.err}; }
+        if (declared.ok.class != DECLARED_NON_INT) { ret res[Verdict, fail.Fail].ok{verdict(VERDICT_ABSENT)}; }
+        val refusal: res[intern.StrId, fail.Fail] = non_integer_message(l, name, ?w.steps);
+        if (sel refusal.err) { ret res[Verdict, fail.Fail].err{refusal.err}; }
+        ret res[Verdict, fail.Fail].ok{Verdict{kind: VERDICT_REFUSED, head: l.demands.len::u32 - 1, diag: diagnostic_kind.GATE_CONST_NOT_INTEGER, message: refusal.ok}};
+    }
+    val top:  u32                          = l.demands.len::u32;
+    val text: res[intern.StrId, fail.Fail] = type_question_message(l, mid, question.ok, owner.some + 1, top);
+    if (sel text.err) { ret res[Verdict, fail.Fail].err{text.err}; }
+    ret res[Verdict, fail.Fail].ok{Verdict{kind: VERDICT_REFUSED, head: top - 1, diag: diagnostic_kind.GATE_TYPE_QUESTION, message: text.ok}};
+}
+
+# walk a module-scope constant in the module's current frame: every constant its value names is
+# demanded first, then it is evaluated and bound, and a public one in the build target's frame is
+# exported to the gates of its importers
+fun walk_val(l: *Loader, mid: session.ModuleId, did: ast_id.DeclId) res[Verdict, fail.Fail] {
+    val m:     *Module             = module_at(l, mid);
+    val d_opt: opt[*ast_decl.Decl] = ast.get_decl(syntax_of(l, mid), did);
+    if (sel d_opt.none) { ret res[Verdict, fail.Fail].err{fail.message("DeclId out of range during walk")}; }
+    var copied: ast_decl.Decl = @d_opt.some;
+    if (copied.data.bind.name.len == 0 || ast_id.expr_is_nil(copied.data.bind.init)) {
+        comptime.mark_load_walked(frame_ctx(m), did);
+        ret res[Verdict, fail.Fail].ok{verdict(VERDICT_ABSENT)};
+    }
+    val source_r: res[str, fail.Fail] = module_source(l, mid);
+    if (sel source_r.err) { ret res[Verdict, fail.Fail].err{source_r.err}; }
+    val name_r: res[intern.StrId, A.Error] = intern.range_add(?l.s.interner, source_r.ok, copied.data.bind.name.offset, copied.data.bind.name.len);
+    if (sel name_r.err) { ret res[Verdict, fail.Fail].err{fail.refused(name_r.err)}; }
+    val index: res[u32, fail.Fail] = demand_push(l, mid, did, ast_id.EXPR_NIL, name_r.ok);
+    if (sel index.err) { ret res[Verdict, fail.Fail].err{index.err}; }
+    val r: res[Verdict, fail.Fail] = bind_val(l, mid, ?copied, source_r.ok, name_r.ok);
+    demand_pop(l);
+    comptime.mark_load_walked(frame_ctx(module_at(l, mid)), did);
+    ret r;
+}
+
+fun bind_val(l: *Loader, mid: session.ModuleId, d: *ast_decl.Decl, source: str, name: intern.StrId) res[Verdict, fail.Fail] {
+    val deps: res[Verdict, fail.Fail] = demand_names(l, mid, d.data.bind.init, true);
+    if (sel deps.err)                    { ret deps; }
+    if (deps.ok.kind == VERDICT_REFUSED) { ret deps; }
+    val m: *Module = module_at(l, mid);
+    # a constant tag is bound as its own literal, which a gate's `sel` reads; it points into this
+    # module's syntax, so no importer reads it
+    val tag_r: res[bool, fail.Fail] = constant_tag(l, mid, d.data.bind.init, source);
+    if (sel tag_r.err) { ret res[Verdict, fail.Fail].err{tag_r.err}; }
+    if (tag_r.ok) {
+        val tagged: err[fail.Fail] = comptime.bind_gated(frame_ctx(m), name, comptime.const_elem_untyped(d.data.bind.init::u32), l.gated);
+        if (sel tagged.err) { ret res[Verdict, fail.Fail].err{tagged.err}; }
+        ret res[Verdict, fail.Fail].ok{verdict(VERDICT_BOUND)};
+    }
+    val fw:    float.FloatWidth                         = comptime.declared_float_width(syntax_of(l, mid), source, d.data.bind.ty);
+    val r_val: res[comptime.CTValue, comptime.EvalFail] = eval_for_load(l, mid, source, d.data.bind.init, fw);
+    if (sel r_val.err) { ret unbound_reason(l, mid, d, name, true); }
+    val typed_r: res[comptime.CTValue, fail.Fail] = declared_value(l, mid, name, d.data.bind.ty, r_val.ok);
+    if (sel typed_r.err) { ret res[Verdict, fail.Fail].err{typed_r.err}; }
+    val v: comptime.CTValue = typed_r.ok;
+
+    if (comptime.float_width_unread(v)) {
+        val deferred: err[fail.Fail] = comptime.defer_float_width(frame_ctx(m), name);
+        if (sel deferred.err) { ret res[Verdict, fail.Fail].err{deferred.err}; }
+        ret res[Verdict, fail.Fail].ok{verdict(VERDICT_ABSENT)};
+    }
+
+    val rr: err[fail.Fail] = comptime.bind_gated(frame_ctx(m), name, v, l.gated);
+    if (sel rr.err) { ret res[Verdict, fail.Fail].err{rr.err}; }
+
+    if ((d.flags & ast_decl.DECL_FLAG_PUB) != 0 && m.frame == FRAME_BUILD) {
+        val added: err[fail.Fail] = const_add(l, m, name, v);
+        if (sel added.err) { ret res[Verdict, fail.Fail].err{added.err}; }
+    }
+    ret res[Verdict, fail.Fail].ok{verdict(VERDICT_BOUND)};
+}
+
+# whether a constant's value is a case literal of a type declared in its own module, `T.c{...}`:
+# the head is split into type and case as name resolution splits it, so a gate reads the case now
+fun constant_tag(l: *Loader, mid: session.ModuleId, init: ast_id.ExprId, source: str) res[bool, fail.Fail] {
+    val a:     *ast.Ast            = syntax_of(l, mid);
+    val e_opt: opt[*ast_expr.Expr] = ast.get_expr(a, init);
+    if (sel e_opt.none) { ret res[bool, fail.Fail].ok{false}; }
+    val e:   *ast_expr.Expr = e_opt.some;
+    var tid: ast_id.TypeId  = ast_id.TYPE_NIL;
+    if (e.kind == ast_expr.EXPR_KIND_STRUCT_LIT) { tid = e.data.struct_lit.ty; }
+    if (e.kind == ast_expr.EXPR_KIND_VECTOR_LIT) { tid = e.data.vector_lit.ty; }
+    if (ast_id.type_is_nil(tid))                 { ret res[bool, fail.Fail].ok{false}; }
+    val t_opt: opt[*ast_type.Type] = ast.get_type(a, tid);
+    if (sel t_opt.none) { ret res[bool, fail.Fail].ok{false}; }
+    val t: *ast_type.Type = t_opt.some;
+    if (t.kind != ast_type.TYPE_KIND_NAMED)                                             { ret res[bool, fail.Fail].ok{false}; }
+    if (!ast_id.expr_is_nil(t.data.named.case_desc) || t.data.named.case_name.len != 0) { ret res[bool, fail.Fail].ok{comptime.is_case_literal(a, init)}; }
+    val path: lang_source.Span = t.data.named.name;
+    val pre:  lang_source.Span = fe_path.prefix(source, path);
+    if (pre.len == 0 || pre.len >= path.len || fe_path.prefix(source, pre).len != 0) { ret res[bool, fail.Fail].ok{false}; }
+    val leaf: lang_source.Span = fe_path.leaf(source, path);
+    if (leaf.len == 0) { ret res[bool, fail.Fail].ok{false}; }
+    val pre_r: res[intern.StrId, A.Error] = intern.range_add(?l.s.interner, source, pre.offset, pre.len);
+    if (sel pre_r.err) { ret res[bool, fail.Fail].err{fail.refused(pre_r.err)}; }
+    val b_r: res[Meaning, fail.Fail] = module_meaning(l, mid, pre_r.ok, true);
+    if (sel b_r.err)                                                  { ret res[bool, fail.Fail].err{b_r.err}; }
+    if (b_r.ok.kind != MEANING_NOMINAL && b_r.ok.kind != MEANING_DEF) { ret res[bool, fail.Fail].ok{false}; }
+    t.data.named.name      = pre;
+    t.data.named.case_name = leaf;
+    ret res[bool, fail.Fail].ok{true};
+}
+
+# a cast the load can evaluate: to the integer primitive its destination names, directly or through
+# a def chain; any other waits for a type the load does not have
+fun load_cast(lc: *LoadMemberCtx, eid: ast_id.ExprId, value: comptime.CTValue) res[comptime.CTValue, comptime.EvalFail] {
+    val e_opt: opt[*ast_expr.Expr] = ast.get_expr(syntax_of(lc.l, lc.mid), eid);
+    if (sel e_opt.none) { ret res[comptime.CTValue, comptime.EvalFail].err{comptime.eval_error(comptime.EVAL_FAIL_INTERNAL, diagnostic_kind.COMPILER_INTERNAL, "load cast names no expression")}; }
+    val node: *ast_expr.Expr = e_opt.some;
+    if (node.kind != ast_expr.EXPR_KIND_CAST) { ret res[comptime.CTValue, comptime.EvalFail].err{comptime.eval_error(comptime.EVAL_FAIL_INTERNAL, diagnostic_kind.COMPILER_INTERNAL, "load cast capability requires a cast expression")}; }
+    val untyped: comptime.EvalFail = comptime.eval_error(comptime.EVAL_FAIL_NEEDS_TYPES, diagnostic_kind.COMPTIME_CAST_UNTYPED, "a comptime cast requires its resolved source and destination types");
+    if (node.data.cast.reinterpret) { ret res[comptime.CTValue, comptime.EvalFail].err{untyped}; }
+    var w: DeclaredWalk;
+    w.l     = lc.l;
+    w.steps = collections_vector.init[intern.StrId](lc.l.alloc);
+    fin { collections_vector.dnit[intern.StrId](?w.steps); }
+    val declared: res[DeclaredInt, fail.Fail] = declared_type(?w, lc.mid, node.data.cast.ty, 0);
+    if (sel declared.err)                  { ret res[comptime.CTValue, comptime.EvalFail].err{comptime.eval_error(comptime.EVAL_FAIL_INTERNAL, diagnostic_kind.COMPILER_INTERNAL, fail.describe(declared.err))}; }
+    if (declared.ok.class != DECLARED_INT) { ret res[comptime.CTValue, comptime.EvalFail].err{untyped}; }
+    ret comptime.cast_to_int(value, declared.ok.width::u32, !declared.ok.unsigned);
+}
+
+# the context the load walk reads and binds in for a module: its build target's, or the union
+# tuple frame the walk is deciding a chain in
+fun frame_ctx(m: *Module) *comptime.ComptimeCtx {
+    ret frame_ctx_at(m, m.frame);
+}
+
+fun frame_ctx_at(m: *Module, frame: u32) *comptime.ComptimeCtx {
+    if (frame == FRAME_BUILD) { ret ?m.ctx; }
+    ret ?m.frames[frame];
+}
+
+# a module's union tuple frames, made on first use: its context under each tuple's target, with
+# nothing bound and nothing decided
+fun ensure_tuple_frames(l: *Loader, mid: session.ModuleId) err[fail.Fail] {
+    val m: *Module = module_at(l, mid);
+    if (m.frames != nil || l.tuple_count == 0) { ret err[fail.Fail].ok{}; }
+    val ar: res[*comptime.ComptimeCtx, A.Error] = A.allocate[comptime.ComptimeCtx](l.alloc, l.tuple_count::usize);
+    if (sel ar.err) { ret err[fail.Fail].err{fail.refused(ar.err)}; }
+    val frames: *comptime.ComptimeCtx = ar.ok;
+    var made:   u32                   = 0;
+    for (made < l.tuple_count) {
+        val ctx_r: res[comptime.ComptimeCtx, fail.Fail] = module_context(l, fqn_of(l, mid), ?m.home, m.artifact);
+        if (sel ctx_r.err) {
+            var ri: u32 = 0;
+            for (ri < made) {
+                comptime.dnit(?frames[ri]);
+                ri = ri + 1;
+            }
+            A.deallocate[comptime.ComptimeCtx](l.alloc, frames, l.tuple_count::usize);
+            ret err[fail.Fail].err{ctx_r.err};
+        }
+        frames[made] = ctx_r.ok;
+        apply_tuple_target(?frames[made], ?l.tuples[made]);
+        made = made + 1;
+    }
+    m.frames      = frames;
+    m.frame_count = l.tuple_count;
+    val a:  *ast.Ast = syntax_of(l, mid);
+    var ti: u32      = 0;
+    for (ti < m.frame_count) {
+        val prepared: err[fail.Fail] = comptime.prepare_gates(?m.frames[ti], a.expr_len::u32, a.decl_len::u32);
+        if (sel prepared.err) { ret prepared; }
+        ti = ti + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun frames_drop(l: *Loader, m: *Module) {
+    if (m.frames == nil) { ret; }
+    var ti: u32 = 0;
+    for (ti < m.frame_count) {
+        comptime.dnit(?m.frames[ti]);
+        ti = ti + 1;
+    }
+    A.deallocate[comptime.ComptimeCtx](l.alloc, m.frames, m.frame_count::usize);
+    m.frames      = nil;
+    m.frame_count = 0;
+}
+
+fun apply_tuple_target(c: *comptime.ComptimeCtx, t: *Tuple) {
+    c.env.target_os_id    = t.os_id;
+    c.env.target_arch_id  = t.arch_id;
+    c.env.target_abi_id   = t.abi_id;
+    c.env.pointer_width   = t.pointer_width;
+    c.env.vector_bits     = t.vector_bits;
+    c.env.register_bits   = t.register_bits;
+    c.env.has_float       = t.has_float;
+    c.env.nan_rule        = t.nan_rule;
+    c.env.target_defs     = t.target_defs;
+    c.env.va_list_size    = t.va_list_size;
+    c.env.va_list_align   = t.va_list_align;
+    c.env.target_os       = t.os_name;
+    c.env.target_isa      = t.isa_name;
+    c.env.target_abi      = t.abi_name;
+    c.env.target_platform = t.platform_name;
+    c.env.ct_mul          = t.ct_mul;
+    c.env.extensions      = t.extensions;
+    c.env.vocabulary      = t.vocabulary;
+}
+
+# a `use` whose path names no module is reported here, with the dependency remedy the loader
+# alone knows, and binds nothing: the module's load is rejected, the walk goes on so the rest of
+# the module still resolves, and its unbound record tells resolve to say nothing more about it
+fun walk_use_for_load(l: *Loader, mid: session.ModuleId, did: ast_id.DeclId, du: *ast_decl.DeclUse) err[fail.Fail] {
+    if (du.path.len == 0) { ret err[fail.Fail].ok{}; }
+    val m:        *Module             = module_at(l, mid);
+    val source_r: res[str, fail.Fail] = module_source(l, mid);
+    if (sel source_r.err) { ret err[fail.Fail].err{source_r.err}; }
+    val source: str = source_r.ok;
+
+    val tgt_r: res[UseTarget, fail.Fail] = use_target(l, source, du.path);
+    if (sel tgt_r.err) {
+        val error: fail.Fail = tgt_r.err;
+        if (sel error.user) {
+            val reported: err[fail.Fail] = diagnostic.report(l.diags, fail.kind_of(error), file_of(l, mid), du.path, fail.describe(error));
+            if (sel reported.err) {
+                fail.internal(?m.status, fail.describe(reported.err));
+                ret err[fail.Fail].err{fail.as_internal(reported.err)};
+            }
+            fail.reject(?m.status);
+            ret binding_record(l, mid, Binding{
+                decl: did, kind: BINDING_UNBOUND, name: intern.STR_NIL, module: session.STABLE_MODULE_NIL, span: du.path, constant: false
+            });
+        }
+        fail.internal(?m.status, fail.describe(error));
+        ret err[fail.Fail].err{error};
+    }
+    val ut:    UseTarget    = tgt_r.ok;
+    var bound: intern.StrId = ut.leaf;
+    if (ut.binds_module && du.alias.len != 0) {
+        val alias_r: res[intern.StrId, A.Error] = intern.range_add(?l.s.interner, source, du.alias.offset, du.alias.len);
+        if (sel alias_r.err) { ret err[fail.Fail].err{fail.refused(alias_r.err)}; }
+        bound = alias_r.ok;
+    }
+    val aliased: bool = du.alias.len > 0;
+
+    val dep_r: res[session.ModuleId, fail.Fail] = module_load(l, ut.module_fqn);
+    if (sel dep_r.err) { ret err[fail.Fail].err{dep_r.err}; }
+    val dep_mid: session.ModuleId = dep_r.ok;
+
+    val record_r: err[fail.Fail] = dep_record(l, mid, dep_mid);
+    if (sel record_r.err) { ret record_r; }
+
+    var kind: BindingKind = BINDING_MEMBER;
+    if (ut.binds_module) { kind = BINDING_MODULE; }
+    val constant: bool = !ut.binds_module && !aliased;
+    if (ut.direct) {
+        val recorded: err[fail.Fail] = binding_record(l, mid, Binding{
+            decl: did, kind: kind, name: bound, module: stable_of(l, dep_mid), span: du.path, constant: constant
+        });
+        if (sel recorded.err) { ret recorded; }
+    }
+    if (!constant) { ret err[fail.Fail].ok{}; }
+    ret const_merge(l, mid, dep_mid, ut.leaf, du.path);
+}
+
+# what a `fwd` names is recorded as a `use` is; one whose path names no module is left for
+# resolve to report
+fun walk_fwd_for_load(l: *Loader, mid: session.ModuleId, did: ast_id.DeclId, df: *ast_decl.DeclFwd) err[fail.Fail] {
+    if (df.path.len == 0) { ret err[fail.Fail].ok{}; }
+    val m:        *Module             = module_at(l, mid);
+    val source_r: res[str, fail.Fail] = module_source(l, mid);
+    if (sel source_r.err) { ret err[fail.Fail].err{source_r.err}; }
+
+    val tgt_r: res[UseTarget, fail.Fail] = use_target(l, source_r.ok, df.path);
+    if (sel tgt_r.err) {
+        val error: fail.Fail = tgt_r.err;
+        if (sel error.user) { ret err[fail.Fail].ok{}; }
+        fail.internal(?m.status, fail.describe(error));
+        ret err[fail.Fail].err{error};
+    }
+    val ut: UseTarget = tgt_r.ok;
+
+    val dep_r: res[session.ModuleId, fail.Fail] = module_load(l, ut.module_fqn);
+    if (sel dep_r.err) { ret err[fail.Fail].err{dep_r.err}; }
+    val dep_mid: session.ModuleId = dep_r.ok;
+
+    val record_r: err[fail.Fail] = dep_record(l, mid, dep_mid);
+    if (sel record_r.err) { ret record_r; }
+    if (!ut.direct)       { ret err[fail.Fail].ok{}; }
+    var kind: BindingKind = BINDING_MEMBER;
+    if (ut.binds_module) { kind = BINDING_MODULE; }
+    ret binding_record(l, mid, Binding{decl: did, kind: kind, name: ut.leaf, module: stable_of(l, dep_mid), span: df.path, constant: false});
+}
+
+# each import declaration is recorded once; arms a union walk takes under different tuples may
+# bind one name to different modules
+fun binding_record(l: *Loader, mid: session.ModuleId, b: Binding) err[fail.Fail] {
+    val m:        *Module       = module_at(l, mid);
+    val existing: opt[*Binding] = binding_for(m, b.decl);
+    if (sel existing.some) { ret err[fail.Fail].ok{}; }
+    val pushed: res[usize, A.Error] = collections_vector.push[Binding](?m.bindings, b);
+    if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+# what an import path names
+# ---
+# module_fqn:   the module it loads
+# leaf:         its last segment
+# binds_module: the whole path names the module, rather than a member of it
+# direct:       the module is the whole path or the path less its leaf, as resolve reads it
+rec UseTarget {
+    module_fqn:   intern.StrId;
+    leaf:         intern.StrId;
+    binds_module: bool;
+    direct:       bool;
+}
+
+fun use_target(l: *Loader, source: str, path: lang_source.Span) res[UseTarget, fail.Fail] {
+    val full_r: res[intern.StrId, A.Error] = fe_path.intern_path(?l.s.interner, source, path);
+    if (sel full_r.err) { ret res[UseTarget, fail.Fail].err{fail.refused(full_r.err)}; }
+    val full_id: intern.StrId = full_r.ok;
+
+    val leaf_r: res[intern.StrId, fail.Fail] = leaf_name(?l.s.interner, source, path);
+    if (sel leaf_r.err) { ret res[UseTarget, fail.Fail].err{leaf_r.err}; }
+    val leaf: intern.StrId = leaf_r.ok;
+
+    if (fe_path.prefix(source, path).len == 0) {
+        val found: opt[provider.Package] = provider.package_find(?l.sources, full_id);
+        if (sel found.some) {
+            if (intern.str_is_nil(found.some.module)) {
+                if (found.some.artifactless) {
+                    ret res[UseTarget, fail.Fail].err{fail.user_of(diagnostic_kind.USE_NO_PUBLIC_MODULE, name_joined(l.s, "project '", full_id, "' declares no artifact, so it has no public module: import a full path, or declare a static or shared [artifact.*] table marked default = true in its manifest"))};
+                }
+                ret res[UseTarget, fail.Fail].err{fail.user_of(diagnostic_kind.USE_NO_PUBLIC_MODULE, name_joined(l.s, "project '", full_id, "' has no public module: a bare import binds the entry shared by its library artifacts marked `default = true`; import a full path, or mark one static or shared [artifact.*] table (or several sharing one entry) default = true in its manifest"))};
+            }
+            ret res[UseTarget, fail.Fail].ok{UseTarget{module_fqn: found.some.module, leaf: leaf, binds_module: true, direct: true}};
+        }
+    }
+
+    val names_file: res[bool, fail.Fail] = provider.module_exists(?l.sources, l.alloc, full_id);
+    if (sel names_file.err) { ret res[UseTarget, fail.Fail].err{names_file.err}; }
+    if (names_file.ok)      { ret res[UseTarget, fail.Fail].ok{UseTarget{module_fqn: full_id, leaf: leaf, binds_module: true, direct: true}}; }
+
+    var prefix: lang_source.Span = fe_path.prefix(source, path);
+    var direct: bool             = true;
+    for (prefix.len != 0) {
+        val pid_r: res[intern.StrId, A.Error] = fe_path.intern_path(?l.s.interner, source, prefix);
+        if (sel pid_r.err) { ret res[UseTarget, fail.Fail].err{fail.refused(pid_r.err)}; }
+        val pid:               intern.StrId         = pid_r.ok;
+        val prefix_names_file: res[bool, fail.Fail] = provider.module_exists(?l.sources, l.alloc, pid);
+        if (sel prefix_names_file.err) { ret res[UseTarget, fail.Fail].err{prefix_names_file.err}; }
+        if (prefix_names_file.ok)      { ret res[UseTarget, fail.Fail].ok{UseTarget{module_fqn: pid, leaf: leaf, binds_module: false, direct: direct}}; }
+        prefix = fe_path.prefix(source, prefix);
+        direct = false;
+    }
+    ret res[UseTarget, fail.Fail].err{fail.user_of(diagnostic_kind.USE_UNRESOLVED, unresolvable_use_msg(l, source, path, full_id))};
+}
+
+fun unresolvable_use_msg(l: *Loader, source: str, path: lang_source.Span, full_id: intern.StrId) res[str, fail.Fail] {
+    if (fe_path.prefix(source, path).len == 0) { ret name_joined(l.s, "use path '", full_id, "' does not name a module"); }
+    var cursor:    usize                      = path.offset;
+    val root_span: lang_source.Span           = fe_path.next(source, path, ?cursor);
+    val root_r:    res[intern.StrId, A.Error] = intern.range_add(?l.s.interner, source, root_span.offset, root_span.len);
+    if (sel root_r.err) { ret res[str, fail.Fail].err{fail.refused(root_r.err)}; }
+    val root_id: intern.StrId = root_r.ok;
+
+    val known: opt[provider.Package] = provider.package_find(?l.sources, root_id);
+    if (sel known.some) { ret name_joined(l.s, "use path '", full_id, "' does not name a module"); }
+
+    ret fail.format_intern(?l.s.interner, l.s.alloc,
+        "use path '{}': module root '{}' is not this project or a declared dependency; declare it in mach.toml",
+        intern.text(?l.s.interner, full_id), intern.text(?l.s.interner, root_id));
+}
+
+# `prefix`, the text of `name_id`, then `suffix`, interned
+fun name_joined(s: *session.Session, prefix: str, name_id: intern.StrId, suffix: str) res[str, fail.Fail] {
+    ret fail.format_intern(?s.interner, s.alloc, "{}{}{}", prefix, intern.text(?s.interner, name_id), suffix);
+}
+
+fun leaf_name(i: *intern.Interner, source: str, path: lang_source.Span) res[intern.StrId, fail.Fail] {
+    val leaf:          lang_source.Span           = fe_path.leaf(source, path);
+    val intern_span_r: res[intern.StrId, A.Error] = intern.range_add(i, source, leaf.offset, leaf.len);
+    if (sel intern_span_r.err) { ret res[intern.StrId, fail.Fail].err{fail.refused(intern_span_r.err)}; }
+    ret res[intern.StrId, fail.Fail].ok{intern_span_r.ok};
+}
+
+fun dep_record(l: *Loader, mid: session.ModuleId, dep_mid: session.ModuleId) err[fail.Fail] {
+    val m:   *Module                = module_at(l, mid);
+    val sid: session.StableModuleId = stable_of(l, dep_mid);
+    var i:   usize                  = 0;
+    for (i < m.deps.len) {
+        if (module.stable_same(m.deps.data[i], sid)) { ret err[fail.Fail].ok{}; }
+        i = i + 1;
+    }
+    val pushed: res[usize, A.Error] = collections_vector.push[session.StableModuleId](?m.deps, sid);
+    if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+fun gated_const_message(s: *session.Session, name: intern.StrId, dep_fqn: intern.StrId) res[str, fail.Fail] {
+    ret fail.format_intern(?s.interner, s.alloc,
+        "tuple-dependent public constants are not yet supported in union builds: '{}' in module '{}' is bound under a per-target-tuple condition",
+        intern.text(?s.interner, name), intern.text(?s.interner, dep_fqn));
+}
+
+# a union build refuses every imported constant its exporter binds only under some tuples
+pub fun gated_imports_check(l: *Loader) err[fail.Fail] {
+    if (!l.union) { ret err[fail.Fail].ok{}; }
+    var i: usize = 0;
+    for (i < l.states.len) {
+        val mid: session.ModuleId = module.id(i::u32);
+        val m:   *Module          = module_at(l, mid);
+        var j:   usize            = 0;
+        for (j < m.bindings.len) {
+            val b: Binding = m.bindings.data[j];
+            j = j + 1;
+            if (!b.constant) { cnt; }
+            val dep_mid: session.ModuleId = module_of(l, b.module);
+            val v:       opt[*Const]      = const_find(module_at(l, dep_mid), b.name);
+            if (sel v.none) { cnt; }
+            if (v.some.gated) {
+                val msg: res[str, fail.Fail] = gated_const_message(l.s, b.name, fqn_of(l, dep_mid));
+                if (sel msg.err) { ret err[fail.Fail].err{msg.err}; }
+                fail.reject(?m.status);
+                val committed_r: err[fail.Fail] = diagnostic.report(l.diags, diagnostic_kind.CONST_TUPLE_DEPENDENT, file_of(l, mid), b.span, msg.ok);
+                if (sel committed_r.err) { ret err[fail.Fail].err{committed_r.err}; }
+            }
+        }
+        i = i + 1;
+    }
+    ret err[fail.Fail].ok{};
+}
+
+fun const_merge(l: *Loader, mid: session.ModuleId, dep_mid: session.ModuleId, leaf: intern.StrId, span: lang_source.Span) err[fail.Fail] {
+    val m: *Module     = module_at(l, mid);
+    val v: opt[*Const] = const_find(module_at(l, dep_mid), leaf);
+    if (sel v.none) { ret err[fail.Fail].ok{}; }
+    val pc: *Const = v.some;
+    if (pc.gated && l.union) {
+        val msg: res[str, fail.Fail] = gated_const_message(l.s, leaf, fqn_of(l, dep_mid));
+        if (sel msg.err) { ret err[fail.Fail].err{msg.err}; }
+        fail.reject(?m.status);
+        val gated: err[fail.Fail] = diagnostic.report(l.diags, diagnostic_kind.CONST_TUPLE_DEPENDENT, file_of(l, mid), span, msg.ok);
+        if (sel gated.err) { ret err[fail.Fail].err{gated.err}; }
+        ret err[fail.Fail].ok{};
+    }
+    ret comptime.bind(frame_ctx(m), leaf, pc.value);
+}
+
+# the public constant `name` a loaded module exports to the gates of its importers
+pub fun const_find(m: *Module, name: intern.StrId) opt[*Const] {
+    var i: usize = 0;
+    for (i < m.consts.len) {
+        val pc: *Const = ?m.consts.data[i];
+        if (intern.str_same(pc.name, name)) { ret opt[*Const].some{pc}; }
+        i = i + 1;
+    }
+    ret opt[*Const].none{};
+}
+
+# the record of what the import declaration `decl` binds, none when the load recorded none
+pub fun binding_for(m: *Module, decl: ast_id.DeclId) opt[*Binding] {
+    var i: usize = 0;
+    for (i < m.bindings.len) {
+        if (ast_id.decl_same(m.bindings.data[i].decl, decl)) { ret opt[*Binding].some{?m.bindings.data[i]}; }
+        i = i + 1;
+    }
+    ret opt[*Binding].none{};
+}
+
+# the module `name` names in the module's current frame: the one the `use` binding it names, read
+# in the arm each enclosing chain selects there; none when that `use` has not been walked
+fun frame_mod_ref(l: *Loader, mid: session.ModuleId, name: intern.StrId) res[opt[session.ModuleId], fail.Fail] {
+    val a:     *ast.Ast                = syntax_of(l, mid);
+    val m_opt: opt[*ast_module.Module] = ast.get_module(a, a.root_module);
+    if (sel m_opt.none) { ret res[opt[session.ModuleId], fail.Fail].err{fail.message("module root not set on Ast")}; }
+    val source_r: res[str, fail.Fail] = module_source(l, mid);
+    if (sel source_r.err) { ret res[opt[session.ModuleId], fail.Fail].err{source_r.err}; }
+    val text: opt[str] = intern.get(?l.s.interner, name);
+    if (sel text.none) { ret res[opt[session.ModuleId], fail.Fail].err{fail.message("module name is not interned")}; }
+    ret mod_ref_in_list(l, mid, m_opt.some.decls_start, m_opt.some.decls_len, source_r.ok, text.some);
+}
+
+fun mod_ref_in_list(l: *Loader, mid: session.ModuleId, start: u32, len: u32, source: str, text: str) res[opt[session.ModuleId], fail.Fail] {
+    val m: *Module  = module_at(l, mid);
+    val a: *ast.Ast = syntax_of(l, mid);
+    var i: u32      = 0;
+    for (i < len) {
+        val did:   ast_id.DeclId       = a.decl_ids[start + i];
+        val d_opt: opt[*ast_decl.Decl] = ast.get_decl(a, did);
+        if (sel d_opt.none) { ret res[opt[session.ModuleId], fail.Fail].err{fail.message("DeclId out of range during a module lookup")}; }
+        var copied: ast_decl.Decl = @d_opt.some;
+        i = i + 1;
+        if (copied.kind == ast_decl.DECL_KIND_USE && use_binds(source, ?copied.data.use_, text)) {
+            val b: opt[*Binding] = binding_for(m, did);
+            if (sel b.some) {
+                if (b.some.kind == BINDING_MODULE) { ret res[opt[session.ModuleId], fail.Fail].ok{opt[session.ModuleId].some{module_of(l, b.some.module)}}; }
+            }
+            ret res[opt[session.ModuleId], fail.Fail].ok{opt[session.ModuleId].none{}};
+        }
+        if (copied.kind == ast_decl.DECL_KIND_COMPTIME_IF
+            && !comptime.comptime_if_declares_nothing(a, copied.data.comptime_if.branches_start, copied.data.comptime_if.branches_len)
+            && chain_binds(a, source, ?copied.data.comptime_if, text)) {
+            val arm_r: res[ChainChoice, fail.Fail] = demand_arm(l, mid, ?copied.data.comptime_if, source, false);
+            if (sel arm_r.err) { ret res[opt[session.ModuleId], fail.Fail].err{arm_r.err}; }
+            if (arm_r.ok.branch < copied.data.comptime_if.branches_len) {
+                val br:    ast_decl.ComptimeBranch               = a.comptime_branches[copied.data.comptime_if.branches_start + arm_r.ok.branch];
+                val found: res[opt[session.ModuleId], fail.Fail] = mod_ref_in_list(l, mid, br.body_start, br.body_len, source, text);
+                if (sel found.err)     { ret found; }
+                if (sel found.ok.some) { ret found; }
+            }
+        }
+    }
+    ret res[opt[session.ModuleId], fail.Fail].ok{opt[session.ModuleId].none{}};
+}
+
+rec LoadMemberCtx {
+    l:   *Loader;
+    mid: session.ModuleId;
+}
+
+fun resolve_module_member_const_load(lc: *LoadMemberCtx, eid: ast_id.ExprId) res[opt[comptime.CTValue], comptime.EvalFail] {
+    if (lc == nil) { ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}}; }
+    val l:   *Loader          = lc.l;
+    val mid: session.ModuleId = lc.mid;
+    val m:   *Module          = module_at(l, mid);
+    val a:   *ast.Ast         = syntax_of(l, mid);
+    if (a == nil) { ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}}; }
+
+    val e_opt: opt[*ast_expr.Expr] = ast.get_expr(a, eid);
+    if (sel e_opt.none) { ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}}; }
+    val node: *ast_expr.Expr = e_opt.some;
+    if (node.kind != ast_expr.EXPR_KIND_MEMBER) { ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}}; }
+
+    val o_opt: opt[*ast_expr.Expr] = ast.get_expr(a, node.data.member.object);
+    if (sel o_opt.none) { ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}}; }
+    val obj: *ast_expr.Expr = o_opt.some;
+    if (obj.kind != ast_expr.EXPR_KIND_IDENT) { ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}}; }
+
+    val src_opt: opt[*lang_source.SourceFile] = lang_source.get(?l.s.sources, file_of(l, mid));
+    if (sel src_opt.none) { ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}}; }
+    val source: str = src_opt.some.text;
+
+    val obj_r: res[intern.StrId, A.Error] = intern.range_add(?l.s.interner, source, obj.data.ident.tok.offset, obj.data.ident.tok.len);
+    if (sel obj_r.err) { ret res[opt[comptime.CTValue], comptime.EvalFail].err{comptime.eval_error(comptime.EVAL_FAIL_INTERNAL, diagnostic_kind.COMPILER_INTERNAL, lang_alloc.text(obj_r.err))}; }
+    val dep_r: res[opt[session.ModuleId], fail.Fail] = frame_mod_ref(l, mid, obj_r.ok);
+    if (sel dep_r.err) { ret res[opt[comptime.CTValue], comptime.EvalFail].err{comptime.eval_error(comptime.EVAL_FAIL_INTERNAL, diagnostic_kind.COMPILER_INTERNAL, fail.describe(dep_r.err))}; }
+    val dep_opt: opt[session.ModuleId] = dep_r.ok;
+    if (sel dep_opt.none) { ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}}; }
+
+    val name_r: res[intern.StrId, A.Error] = intern.range_add(?l.s.interner, source, node.data.member.name.offset, node.data.member.name.len);
+    if (sel name_r.err) { ret res[opt[comptime.CTValue], comptime.EvalFail].err{comptime.eval_error(comptime.EVAL_FAIL_INTERNAL, diagnostic_kind.COMPILER_INTERNAL, lang_alloc.text(name_r.err))}; }
+
+    val member: intern.StrId = name_r.ok;
+    val v:      opt[*Const]  = const_find(module_at(l, dep_opt.some), member);
+    if (sel v.none) { ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}}; }
+    val pc: *Const = v.some;
+    if (pc.gated && l.union) {
+        val msg: res[str, fail.Fail] = gated_const_message(l.s, member, fqn_of(l, dep_opt.some));
+        if (sel msg.err) { ret res[opt[comptime.CTValue], comptime.EvalFail].err{comptime.eval_error(comptime.EVAL_FAIL_INTERNAL, diagnostic_kind.COMPILER_INTERNAL, fail.describe(msg.err))}; }
+        fail.reject(?m.status);
+        val committed_r: err[fail.Fail] = diagnostic.report(l.diags, diagnostic_kind.CONST_TUPLE_DEPENDENT, file_of(l, mid), node.data.member.name, msg.ok);
+        if (sel committed_r.err) { ret res[opt[comptime.CTValue], comptime.EvalFail].err{comptime.eval_error(comptime.EVAL_FAIL_INTERNAL, diagnostic_kind.COMPILER_INTERNAL, fail.describe(committed_r.err))}; }
+        ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].none{}};
+    }
+    ret res[opt[comptime.CTValue], comptime.EvalFail].ok{opt[comptime.CTValue].some{pc.value}};
+}
+
+# records the strings the module's attribute arguments evaluate to, read in the build target's
+# frame the load walk bound
+pub fun attributes_record(l: *Loader, mid: session.ModuleId) err[fail.Fail] {
+    val m: *Module  = module_at(l, mid);
+    val a: *ast.Ast = syntax_of(l, mid);
+    if (a == nil) { ret err[fail.Fail].ok{}; }
+    val source_r: res[str, fail.Fail] = module_source(l, mid);
+    if (sel source_r.err) { ret err[fail.Fail].err{source_r.err}; }
+    var lc: LoadMemberCtx;
+    lc.l   = l;
+    lc.mid = mid;
+    val caps_r: res[comptime.PhaseCapabilities[LoadMemberCtx], fail.Fail] = comptime.loading_capabilities[LoadMemberCtx](resolve_module_member_const_load, load_cast);
+    if (sel caps_r.err) { ret err[fail.Fail].err{caps_r.err}; }
+    ret attr.record_strings[LoadMemberCtx](l.s, mid, a, source_r.ok, frame_ctx(m), ?lc, caps_r.ok, true);
+}
+
+fun eval_for_load(
+    l: *Loader,
+    mid: session.ModuleId,
+    source: str,
+    e: ast_id.ExprId,
+    fw: float.FloatWidth) res[comptime.CTValue, comptime.EvalFail] {
+    val m:  *Module = module_at(l, mid);
+    var lc: LoadMemberCtx;
+    lc.l   = l;
+    lc.mid = mid;
+    val lcp:    *LoadMemberCtx                                            = ?lc;
+    val caps_r: res[comptime.PhaseCapabilities[LoadMemberCtx], fail.Fail] = comptime.loading_capabilities[LoadMemberCtx](resolve_module_member_const_load, load_cast);
+    if (sel caps_r.err) {
+        var f: comptime.EvalFail;
+        f.kind    = comptime.EVAL_FAIL_INTERNAL;
+        f.diag    = diagnostic_kind.COMPILER_INTERNAL;
+        f.message = fail.describe(caps_r.err);
+        fail.internal(?m.status, f.message);
+        ret res[comptime.CTValue, comptime.EvalFail].err{f};
+    }
+    val caps: comptime.PhaseCapabilities[LoadMemberCtx] =
+        caps_r.ok;
+    val r: res[comptime.CTValue, comptime.EvalFail] = comptime.evaluate_at_float_width[LoadMemberCtx](frame_ctx(m), lcp, caps, syntax_of(l, mid), source, e, ?l.s.interner, fw);
+    if (sel r.err) {
+        val f: comptime.EvalFail = r.err;
+        if (f.kind == comptime.EVAL_FAIL_INTERNAL) { fail.internal(?m.status, f.message); }
+        ret res[comptime.CTValue, comptime.EvalFail].err{f};
+    }
+    ret res[comptime.CTValue, comptime.EvalFail].ok{r.ok};
+}
+
+# what a constant's declared type makes of its integer value: a primitive
+# spelling types it directly, and a name is followed through `def`s across
+# `use` and `fwd` to the primitive the chain ends at, so a gate reading the
+# constant computes with the width and sign the program declared
+def DeclaredClass: u8;
+
+# not readable from syntax (a computed type, or a name the loaded modules do not
+# bind yet): the value stays untyped and type checking decides it
+val DECLARED_UNTYPED: DeclaredClass = 0;
+val DECLARED_INT:     DeclaredClass = 1;
+# the chain ends at a record, pointer, float or other non-integer type
+val DECLARED_NON_INT: DeclaredClass = 2;
+
+# a chain longer than this is a cycle, which type checking reports
+val DECLARED_CHAIN_LIMIT: u32 = 64;
+
+rec DeclaredInt {
+    class:    DeclaredClass;
+    unsigned: bool;
+    width:    u8;
+}
+
+fun declared_int(class: DeclaredClass) DeclaredInt {
+    var r: DeclaredInt;
+    r.class    = class;
+    r.unsigned = false;
+    r.width    = 0;
+    ret r;
+}
+
+rec DeclaredWalk {
+    l: *Loader;
+    # the type spellings the chain passes through, for the refusal that names it
+    steps: collections_vector.Vector[intern.StrId];
+}
+
+def MeaningKind: u8;
+
+val MEANING_NONE:    MeaningKind = 0;
+val MEANING_DEF:     MeaningKind = 1;
+val MEANING_NOMINAL: MeaningKind = 2;
+val MEANING_MODULE:  MeaningKind = 3;
+val MEANING_SYMBOL:  MeaningKind = 4;
+
+# what one module-scope name means, as far as a def chain needs to know
+rec Meaning {
+    kind:   MeaningKind;
+    ty:     ast_id.TypeId;
+    module: session.ModuleId;
+    leaf:   intern.StrId;
+}
+
+fun meaning(kind: MeaningKind) Meaning {
+    var b: Meaning;
+    b.kind   = kind;
+    b.ty     = ast_id.TYPE_NIL;
+    b.module = session.MODULE_NIL;
+    b.leaf   = intern.STR_NIL;
+    ret b;
+}
+
+fun module_source(l: *Loader, mid: session.ModuleId) res[str, fail.Fail] {
+    val src_opt: opt[*lang_source.SourceFile] = lang_source.get(?l.s.sources, file_of(l, mid));
+    if (sel src_opt.none) { ret res[str, fail.Fail].err{fail.message("module file_id not found in SourceMap")}; }
+    ret res[str, fail.Fail].ok{src_opt.some.text};
+}
+
+fun declared_value(l: *Loader, mid: session.ModuleId, name: intern.StrId, ty: ast_id.TypeId, value: comptime.CTValue) res[comptime.CTValue, fail.Fail] {
+    val m:        *Module             = module_at(l, mid);
+    val source_r: res[str, fail.Fail] = module_source(l, mid);
+    if (sel source_r.err) { ret res[comptime.CTValue, fail.Fail].err{source_r.err}; }
+    val source: str = source_r.ok;
+    if (value.kind != comptime.CT_KIND_INT || !names_def_chain(syntax_of(l, mid), source, ty)) {
+        ret res[comptime.CTValue, fail.Fail].ok{comptime.apply_declared_int_type(syntax_of(l, mid), source, ty, value)};
+    }
+
+    var w: DeclaredWalk;
+    w.l     = l;
+    w.steps = collections_vector.init[intern.StrId](l.alloc);
+    fin { collections_vector.dnit[intern.StrId](?w.steps); }
+    val r: res[DeclaredInt, fail.Fail] = declared_type(?w, mid, ty, 0);
+    if (sel r.err) { ret res[comptime.CTValue, fail.Fail].err{r.err}; }
+    val d: DeclaredInt = r.ok;
+    if (d.class == DECLARED_INT) { ret res[comptime.CTValue, fail.Fail].ok{comptime.typed_int(value, d.unsigned, d.width)}; }
+    if (d.class == DECLARED_UNTYPED) {
+        ret res[comptime.CTValue, fail.Fail].ok{comptime.typed_int(value, value.int_unsigned, 0)};
+    }
+    val message_r: res[intern.StrId, fail.Fail] = non_integer_message(l, name, ?w.steps);
+    if (sel message_r.err) { ret res[comptime.CTValue, fail.Fail].err{message_r.err}; }
+    ret res[comptime.CTValue, fail.Fail].ok{comptime.non_integer(message_r.ok)};
+}
+
+# a declared type that is a name no primitive spells, so only its def chain types the value
+fun names_def_chain(a: *ast.Ast, source: str, ty: ast_id.TypeId) bool {
+    if (ast_id.type_is_nil(ty)) { ret false; }
+    val found: opt[*ast_type.Type] = ast.get_type(a, ty);
+    if (sel found.none) { ret false; }
+    val t: *ast_type.Type = found.some;
+    if (t.kind == ast_type.TYPE_KIND_SECRET)                              { ret names_def_chain(a, source, t.data.secret.inner); }
+    if (t.kind != ast_type.TYPE_KIND_NAMED || t.data.named.args_len != 0) { ret false; }
+    val prim: opt[type.TypeKind] = type.prim_from_view(view(?source[t.data.named.name.offset], t.data.named.name.len));
+    ret sel prim.none;
+}
+
+fun declared_type(w: *DeclaredWalk, mid: session.ModuleId, ty: ast_id.TypeId, depth: u32) res[DeclaredInt, fail.Fail] {
+    if (depth > DECLARED_CHAIN_LIMIT || ast_id.type_is_nil(ty)) { ret res[DeclaredInt, fail.Fail].ok{declared_int(DECLARED_UNTYPED)}; }
+    val source_r: res[str, fail.Fail] = module_source(w.l, mid);
+    if (sel source_r.err) { ret res[DeclaredInt, fail.Fail].err{source_r.err}; }
+    val source: str                 = source_r.ok;
+    val found:  opt[*ast_type.Type] = ast.get_type(syntax_of(w.l, mid), ty);
+    if (sel found.none) { ret res[DeclaredInt, fail.Fail].err{fail.message("declared TypeId out of range")}; }
+    var copied: ast_type.Type  = @found.some;
+    val t:      *ast_type.Type = ?copied;
+    if (t.kind == ast_type.TYPE_KIND_SECRET) { ret declared_type(w, mid, t.data.secret.inner, depth); }
+
+    val step_r: res[intern.StrId, A.Error] = intern.range_add(?w.l.s.interner, source, t.span.offset, t.span.len);
+    if (sel step_r.err) { ret res[DeclaredInt, fail.Fail].err{fail.refused(step_r.err)}; }
+    val pushed: res[usize, A.Error] = collections_vector.push[intern.StrId](?w.steps, step_r.ok);
+    if (sel pushed.err) { ret res[DeclaredInt, fail.Fail].err{fail.refused(pushed.err)}; }
+
+    if (t.kind == ast_type.TYPE_KIND_PTR || t.kind == ast_type.TYPE_KIND_ARRAY || t.kind == ast_type.TYPE_KIND_FUN
+        || t.kind == ast_type.TYPE_KIND_REC || t.kind == ast_type.TYPE_KIND_UNI) {
+        ret res[DeclaredInt, fail.Fail].ok{declared_int(DECLARED_NON_INT)};
+    }
+    if (t.kind != ast_type.TYPE_KIND_NAMED) { ret res[DeclaredInt, fail.Fail].ok{declared_int(DECLARED_UNTYPED)}; }
+    # a def is never generic, so a name taking arguments is a record, union or tag
+    if (t.data.named.args_len != 0) { ret res[DeclaredInt, fail.Fail].ok{declared_int(DECLARED_NON_INT)}; }
+
+    val path: lang_source.Span = t.data.named.name;
+    if (fe_path.prefix(source, path).len == 0) {
+        # a vector spelling names a type as a primitive does, and no vector is an integer
+        val spelled: opt[str] = intern.get(?w.l.s.interner, step_r.ok);
+        if (sel spelled.some) {
+            if (type.is_vector_spelling(spelled.some)) { ret res[DeclaredInt, fail.Fail].ok{declared_int(DECLARED_NON_INT)}; }
+        }
+        val prim: opt[type.TypeKind] = type.prim_from_view(view(?source[path.offset], path.len));
+        if (sel prim.some) {
+            val pd: type.PrimDesc = type.prim_desc(prim.some);
+            if (pd.class != type.PRIM_CLASS_INT) { ret res[DeclaredInt, fail.Fail].ok{declared_int(DECLARED_NON_INT)}; }
+            var r: DeclaredInt = declared_int(DECLARED_INT);
+            r.unsigned = !pd.signed;
+            r.width    = pd.bits::u8;
+            ret res[DeclaredInt, fail.Fail].ok{r};
+        }
+    }
+    val owner_r: res[opt[session.ModuleId], fail.Fail] = qualifier_module(w.l, mid, source, fe_path.prefix(source, path));
+    if (sel owner_r.err)     { ret res[DeclaredInt, fail.Fail].err{owner_r.err}; }
+    if (sel owner_r.ok.none) { ret res[DeclaredInt, fail.Fail].ok{declared_int(DECLARED_UNTYPED)}; }
+    val leaf:   lang_source.Span           = fe_path.leaf(source, path);
+    val leaf_r: res[intern.StrId, A.Error] = intern.range_add(?w.l.s.interner, source, leaf.offset, leaf.len);
+    if (sel leaf_r.err) { ret res[DeclaredInt, fail.Fail].err{fail.refused(leaf_r.err)}; }
+    val local: bool = fe_path.prefix(source, path).len == 0;
+    ret declared_name(w, owner_r.ok.some, leaf_r.ok, local, depth);
+}
+
+# the type a name binds in a module: its own scope when `local`, else its public surface
+fun declared_name(w: *DeclaredWalk, mid: session.ModuleId, name: intern.StrId, local: bool, depth: u32) res[DeclaredInt, fail.Fail] {
+    if (depth > DECLARED_CHAIN_LIMIT) { ret res[DeclaredInt, fail.Fail].ok{declared_int(DECLARED_UNTYPED)}; }
+    val b_r: res[Meaning, fail.Fail] = module_meaning(w.l, mid, name, local);
+    if (sel b_r.err) { ret res[DeclaredInt, fail.Fail].err{b_r.err}; }
+    val b: Meaning = b_r.ok;
+    if (b.kind == MEANING_DEF)     { ret declared_type(w, mid, b.ty, depth + 1); }
+    if (b.kind == MEANING_NOMINAL) { ret res[DeclaredInt, fail.Fail].ok{declared_int(DECLARED_NON_INT)}; }
+    if (b.kind == MEANING_SYMBOL)  { ret declared_name(w, b.module, b.leaf, false, depth + 1); }
+    ret res[DeclaredInt, fail.Fail].ok{declared_int(DECLARED_UNTYPED)};
+}
+
+# the module a qualified type's prefix names: its first segment is a module this
+# one imports, and each further segment a module the previous one forwards
+fun qualifier_module(l: *Loader, mid: session.ModuleId, source: str, prefix: lang_source.Span) res[opt[session.ModuleId], fail.Fail] {
+    if (prefix.len == 0) { ret res[opt[session.ModuleId], fail.Fail].ok{opt[session.ModuleId].some{mid}}; }
+    var owner:  session.ModuleId = mid;
+    var local:  bool             = true;
+    var cursor: usize            = prefix.offset;
+    for (cursor < prefix.offset + prefix.len) {
+        val segment: lang_source.Span = fe_path.next(source, prefix, ?cursor);
+        if (segment.len == 0) { brk; }
+        val seg_r: res[intern.StrId, A.Error] = intern.range_add(?l.s.interner, source, segment.offset, segment.len);
+        if (sel seg_r.err) { ret res[opt[session.ModuleId], fail.Fail].err{fail.refused(seg_r.err)}; }
+        val b_r: res[Meaning, fail.Fail] = module_meaning(l, owner, seg_r.ok, local);
+        if (sel b_r.err)                   { ret res[opt[session.ModuleId], fail.Fail].err{b_r.err}; }
+        if (b_r.ok.kind != MEANING_MODULE) { ret res[opt[session.ModuleId], fail.Fail].ok{opt[session.ModuleId].none{}}; }
+        owner = b_r.ok.module;
+        local = false;
+    }
+    ret res[opt[session.ModuleId], fail.Fail].ok{opt[session.ModuleId].some{owner}};
+}
+
+# what `name` binds at module scope in `mid`, read from its syntax so the answer does not depend
+# on how far the walk has reached; a `use` binds only locally. a name declared under `$if` is
+# read in the arm its chain selects: decided now in the module being walked (`local`), or from
+# the states its walk left in a module already loaded, where an undecided chain binds nothing
+fun module_meaning(l: *Loader, mid: session.ModuleId, name: intern.StrId, local: bool) res[Meaning, fail.Fail] {
+    val acquired: err[fail.Fail] = syntax_refresh(l, mid, 0);
+    if (sel acquired.err) { ret res[Meaning, fail.Fail].err{acquired.err}; }
+    val m:        *Module             = module_at(l, mid);
+    val source_r: res[str, fail.Fail] = module_source(l, mid);
+    if (sel source_r.err) { ret res[Meaning, fail.Fail].err{source_r.err}; }
+    val text: opt[str] = intern.get(?l.s.interner, name);
+    if (sel text.none) { ret res[Meaning, fail.Fail].err{fail.message("def chain name is not interned")}; }
+    val m_opt: opt[*ast_module.Module] = ast.get_module(syntax_of(l, mid), syntax_of(l, mid).root_module);
+    if (sel m_opt.none) { ret res[Meaning, fail.Fail].err{fail.message("module root not set on Ast")}; }
+    val saved_frame: u32 = m.frame;
+    if (!local) { m.frame = FRAME_BUILD; }
+    val r: res[Meaning, fail.Fail] = meaning_in_list(l, mid, m_opt.some.decls_start, m_opt.some.decls_len, source_r.ok, text.some, local);
+    m.frame = saved_frame;
+    ret r;
+}
+
+fun meaning_in_list(l: *Loader, mid: session.ModuleId, start: u32, len: u32, source: str, text: str, local: bool) res[Meaning, fail.Fail] {
+    var i: u32 = 0;
+    for (i < len) {
+        val a:     *ast.Ast            = syntax_of(l, mid);
+        val d_opt: opt[*ast_decl.Decl] = ast.get_decl(a, a.decl_ids[start + i]);
+        if (sel d_opt.none) { ret res[Meaning, fail.Fail].err{fail.message("DeclId out of range during def chain lookup")}; }
+        var copied: ast_decl.Decl  = @d_opt.some;
+        val d:      *ast_decl.Decl = ?copied;
+        i = i + 1;
+        if (d.kind == ast_decl.DECL_KIND_DEF && spells(source, d.data.def_.name, text)) {
+            var b: Meaning = meaning(MEANING_DEF);
+            b.ty = d.data.def_.ty;
+            ret res[Meaning, fail.Fail].ok{b};
+        }
+        if (declares_nominal(source, d, text)) { ret res[Meaning, fail.Fail].ok{meaning(MEANING_NOMINAL)}; }
+        if ((d.kind == ast_decl.DECL_KIND_USE && local) || d.kind == ast_decl.DECL_KIND_FWD) {
+            var alias: lang_source.Span = d.data.use_.alias;
+            var path:  lang_source.Span = d.data.use_.path;
+            if (d.kind == ast_decl.DECL_KIND_FWD) {
+                alias = d.data.fwd_.alias;
+                path  = d.data.fwd_.path;
+            }
+            var bound: lang_source.Span = alias;
+            if (bound.len == 0)                               { bound = fe_path.leaf(source, path); }
+            if (path.len != 0 && spells(source, bound, text)) { ret import_meaning(l, source, path); }
+        }
+        if (d.kind == ast_decl.DECL_KIND_COMPTIME_IF
+            && !comptime.comptime_if_declares_nothing(a, d.data.comptime_if.branches_start, d.data.comptime_if.branches_len)
+            && chain_names_type(a, source, ?d.data.comptime_if, text, local)) {
+            val arm_r: res[ChainChoice, fail.Fail] = demand_arm(l, mid, ?d.data.comptime_if, source, local);
+            if (sel arm_r.err) { ret res[Meaning, fail.Fail].err{arm_r.err}; }
+            if (arm_r.ok.verdict.kind != VERDICT_REFUSED && arm_r.ok.branch < d.data.comptime_if.branches_len) {
+                val br:    ast_decl.ComptimeBranch = a.comptime_branches[d.data.comptime_if.branches_start + arm_r.ok.branch];
+                val found: res[Meaning, fail.Fail] = meaning_in_list(l, mid, br.body_start, br.body_len, source, text, local);
+                if (sel found.err)                 { ret found; }
+                if (found.ok.kind != MEANING_NONE) { ret found; }
+            }
+        }
+    }
+    ret res[Meaning, fail.Fail].ok{meaning(MEANING_NONE)};
+}
+
+fun declares_nominal(source: str, d: *ast_decl.Decl, text: str) bool {
+    ret (d.kind == ast_decl.DECL_KIND_REC && spells(source, d.data.rec_.name, text))
+        || (d.kind == ast_decl.DECL_KIND_UNI && spells(source, d.data.uni_.name, text))
+        || (d.kind == ast_decl.DECL_KIND_TAG && spells(source, d.data.tag_.name, text))
+        || (d.kind == ast_decl.DECL_KIND_FUN && spells(source, d.data.fun_.name, text));
+}
+
+# whether any arm of a chain, at any depth, binds `text` as a def chain can read it
+fun chain_names_type(a: *ast.Ast, source: str, ci: *ast_decl.DeclComptimeIf, text: str, local: bool) bool {
+    var bi: u32 = 0;
+    for (bi < ci.branches_len) {
+        val br: *ast_decl.ComptimeBranch = ?a.comptime_branches[ci.branches_start + bi];
+        var i:  u32                      = 0;
+        for (i < br.body_len) {
+            val d_opt: opt[*ast_decl.Decl] = ast.get_decl(a, a.decl_ids[br.body_start + i]);
+            if (sel d_opt.some) {
+                val d: *ast_decl.Decl = d_opt.some;
+                if (d.kind == ast_decl.DECL_KIND_DEF && spells(source, d.data.def_.name, text))         { ret true; }
+                if (declares_nominal(source, d, text))                                                  { ret true; }
+                if (d.kind == ast_decl.DECL_KIND_USE && local && use_binds(source, ?d.data.use_, text)) { ret true; }
+                if (d.kind == ast_decl.DECL_KIND_FWD && d.data.fwd_.path.len != 0) {
+                    var bound: lang_source.Span = d.data.fwd_.alias;
+                    if (bound.len == 0)              { bound = fe_path.leaf(source, d.data.fwd_.path); }
+                    if (spells(source, bound, text)) { ret true; }
+                }
+                if (d.kind == ast_decl.DECL_KIND_COMPTIME_IF && chain_names_type(a, source, ?d.data.comptime_if, text, local)) { ret true; }
+            }
+            i = i + 1;
+        }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+fun import_meaning(l: *Loader, source: str, path: lang_source.Span) res[Meaning, fail.Fail] {
+    # an unresolvable import is reported where the walk reaches it
+    val tgt_r: res[UseTarget, fail.Fail] = use_target(l, source, path);
+    if (sel tgt_r.err) {
+        val error: fail.Fail = tgt_r.err;
+        if (sel error.user) { ret res[Meaning, fail.Fail].ok{meaning(MEANING_NONE)}; }
+        ret res[Meaning, fail.Fail].err{error};
+    }
+    val ut:      UseTarget             = tgt_r.ok;
+    val entry_r: opt[session.ModuleId] = module_find(l, ut.module_fqn);
+    if (sel entry_r.none) { ret res[Meaning, fail.Fail].ok{meaning(MEANING_NONE)}; }
+    val target: session.ModuleId = entry_r.some;
+    if (l.states.data[module.index(target)::usize] == STATE_NEW) { ret res[Meaning, fail.Fail].ok{meaning(MEANING_NONE)}; }
+    var b: Meaning = meaning(MEANING_SYMBOL);
+    if (ut.binds_module) { b.kind = MEANING_MODULE; }
+    b.module = target;
+    b.leaf   = ut.leaf;
+    ret res[Meaning, fail.Fail].ok{b};
+}
+
+fun spells(source: str, span: lang_source.Span, text: str) bool {
+    ret span.len != 0 && view_eq_str(view(?source[span.offset], span.len), text);
+}
+
+fun non_integer_message(l: *Loader, name: intern.StrId, steps: *collections_vector.Vector[intern.StrId]) res[intern.StrId, fail.Fail] {
+    val name_text: opt[str] = intern.get(?l.s.interner, name);
+    if (sel name_text.none) { ret res[intern.StrId, fail.Fail].err{fail.message("constant name is not interned")}; }
+    var chain: str = nil;
+    var i:     u32 = 0;
+    for (i::usize < steps.len) {
+        val step: opt[str] = intern.get(?l.s.interner, steps.data[i]);
+        if (sel step.none) { ret res[intern.StrId, fail.Fail].err{fail.message("def chain step is not interned")}; }
+        var next_r: res[str, std_format.FormatError];
+        if (chain == nil)   { next_r = std_format.sprint(l.s.alloc, "`{}`", step.some); }
+        or                  { next_r = std_format.sprint(l.s.alloc, "{} -> `{}`", chain, step.some); }
+        if (chain != nil)   { str_free(l.s.alloc, chain); }
+        if (sel next_r.err) { ret res[intern.StrId, fail.Fail].err{fail.format_refused(next_r.err)}; }
+        chain = next_r.ok;
+        i     = i + 1;
+    }
+    var msg_r: res[str, std_format.FormatError];
+    if (steps.len == 1) {
+        msg_r = std_format.sprint(l.s.alloc, "`{}` is not an integer constant, so no gate can read it: its type {} is not an integer primitive",
+            name_text.some, chain);
+    }
+    or {
+        msg_r = std_format.sprint(l.s.alloc,
+            "`{}` is not an integer constant, so no gate can read it: its type follows the def chain {}, which ends outside the integer primitives",
+            name_text.some, chain);
+    }
+    if (chain != nil)  { str_free(l.s.alloc, chain); }
+    if (sel msg_r.err) { ret res[intern.StrId, fail.Fail].err{fail.format_refused(msg_r.err)}; }
+    val interned: res[intern.StrId, A.Error] = intern.add(?l.s.interner, msg_r.ok);
+    str_free(l.s.alloc, msg_r.ok);
+    if (sel interned.err) { ret res[intern.StrId, fail.Fail].err{fail.refused(interned.err)}; }
+    ret res[intern.StrId, fail.Fail].ok{interned.ok};
+}
+
+fun const_add(l: *Loader, m: *Module, name: intern.StrId, value: comptime.CTValue) err[fail.Fail] {
+    val pushed: res[usize, A.Error] = collections_vector.push[Const](?m.consts, Const{name: name, value: value, gated: l.gated});
+    if (sel pushed.err) { ret err[fail.Fail].err{fail.refused(pushed.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+use fe_lexer:  mach.lang.fe.lexer;
+use fe_parser: mach.lang.fe.parser;
+use mach.lang.fe.parser.state;
+use mach.lang.source.provider.resident;
+use catalog_arch: mach.lang.target.catalog.arch;
+use catalog_os:   mach.lang.target.catalog.os;
+use std.allocator.page;
+use std.types.string.str_equals;
+
+# a host holding up to eight modules, parsed directly from the session's sources, that records
+# the order modules finish loading in
+#[testing]
+rec Fixture {
+    s:      *session.Session;
+    alloc:  *A.Allocator;
+    diags:  *diagnostic.DiagnosticStore;
+    rows:   [8]Row;
+    loads:  [8]Module;
+    count:  u32;
+    done:   [8]session.ModuleId;
+    closed: u32;
+}
+
+#[testing]
+fun fixture_add(ctx: ptr, fqn: intern.StrId, sid: session.StableModuleId) res[session.ModuleId, fail.Fail] {
+    val f: *Fixture = ctx::*Fixture;
+    if (f.count == 8) { ret res[session.ModuleId, fail.Fail].err{fail.message("fixture holds eight modules")}; }
+    f.rows[f.count] = Row{name: fqn, stable: sid, file: lang_source.FILE_NIL, syntax: nil, load: ?f.loads[f.count]};
+    f.count         = f.count + 1;
+    ret res[session.ModuleId, fail.Fail].ok{module.id(f.count - 1)};
+}
+
+#[testing]
+fun fixture_row(ctx: ptr, mid: session.ModuleId) Row {
+    ret (ctx::*Fixture).rows[module.index(mid)];
+}
+
+#[testing]
+fun fixture_parse(ctx: ptr, mid: session.ModuleId, file: lang_source.FileId, reported: bool) err[fail.Fail] {
+    val f:    *Fixture                     = ctx::*Fixture;
+    val held: opt[*lang_source.SourceFile] = lang_source.get(?f.s.sources, file);
+    if (sel held.none) { ret err[fail.Fail].err{fail.message("fixture file is not registered")}; }
+    val tokens: res[fe_lexer.TokenStream, fail.Fail] = fe_lexer.tokenize(held.some.text, f.alloc, file);
+    if (sel tokens.err) { ret err[fail.Fail].err{tokens.err}; }
+    var stream: fe_lexer.TokenStream = tokens.ok;
+    fin { fe_lexer.dnit(?stream, f.alloc); }
+    val made: res[*ast.Ast, A.Error] = A.allocate[ast.Ast](f.alloc, 1::usize);
+    if (sel made.err) { ret err[fail.Fail].err{fail.refused(made.err)}; }
+    val a: *ast.Ast = made.ok;
+    a[0]                             = ast.init(f.alloc, file);
+    f.rows[module.index(mid)].file   = file;
+    f.rows[module.index(mid)].syntax = a;
+    val incarnation: res[u64, fail.Fail] = session.next_parse_incarnation(f.s);
+    if (sel incarnation.err) { ret err[fail.Fail].err{incarnation.err}; }
+    a.incarnation = incarnation.ok;
+    val parsed: res[fail.PhaseStatus, state.ParseFail] = fe_parser.parse(?stream, a, f.diags);
+    if (sel parsed.err) { ret err[fail.Fail].err{state.failure(parsed.err)}; }
+    ret err[fail.Fail].ok{};
+}
+
+#[testing]
+fun fixture_refresh(ctx: ptr, mid: session.ModuleId, incarnation: u64) err[fail.Fail] {
+    ret err[fail.Fail].ok{};
+}
+
+#[testing]
+fun fixture_epoch(ctx: ptr) u64 {
+    ret 0;
+}
+
+#[testing]
+fun fixture_context(ctx: ptr, artifact: intern.StrId) res[comptime.ComptimeCtx, fail.Fail] {
+    val f: *Fixture = ctx::*Fixture;
+    ret res[comptime.ComptimeCtx, fail.Fail].ok{comptime.init(f.alloc, catalog_os.id_for("linux"), catalog_arch.id_for("x86_64"), 0,
+        comptime.MODE_DEBUG, 0, 64, 128, 128, true, intern.STR_NIL, intern.STR_NIL)};
+}
+
+#[testing]
+fun fixture_done(ctx: ptr, mid: session.ModuleId) err[fail.Fail] {
+    val f: *Fixture = ctx::*Fixture;
+    f.done[f.closed] = mid;
+    f.closed         = f.closed + 1;
+    ret err[fail.Fail].ok{};
+}
+
+#[testing]
+fun fixture_dnit(f: *Fixture) {
+    var i: u32 = 0;
+    for (i < f.count) {
+        module_dnit(f.alloc, ?f.loads[i]);
+        if (f.rows[i].syntax != nil) {
+            ast.dnit(f.rows[i].syntax);
+            A.deallocate[ast.Ast](f.alloc, f.rows[i].syntax, 1::usize);
+        }
+        i = i + 1;
+    }
+}
+
+#[testing]
+fun fixture_host(f: *Fixture) Host {
+    ret Host{
+        ctx:   f::ptr, add: fixture_add, row: fixture_row, parse: fixture_parse, refresh: fixture_refresh,
+        epoch: fixture_epoch, context: fixture_context, done: fixture_done
+    };
+}
+
+#[testing]
+fun stable_named(l: *Loader, fqn: str) session.StableModuleId {
+    val id: res[intern.StrId, A.Error] = intern.add(?l.s.interner, fqn);
+    if (sel id.err) { ret session.STABLE_MODULE_NIL; }
+    ret session.stable_module_id_lookup(l.s, id.ok);
+}
+
+#[testing]
+fun binding_named(l: *Loader, m: *Module, name_text: str) opt[*Binding] {
+    var i: usize = 0;
+    for (i < m.bindings.len) {
+        if (spelled(?l.s.interner, m.bindings.data[i].name, name_text)) { ret opt[*Binding].some{?m.bindings.data[i]}; }
+        i = i + 1;
+    }
+    ret opt[*Binding].none{};
+}
+
+#[testing]
+fun held_set(r: *resident.Resident, fqn: str, text: str) bool {
+    val set: err[fail.Fail] = resident.module_set(r, fqn, text);
+    ret sel set.ok;
+}
+
+#[testing]
+fun spelled(itn: *intern.Interner, id: intern.StrId, text: str) bool {
+    ret !intern.str_is_nil(id) && str_equals(intern.text(itn, id), text);
+}
+
+#[testing]
+fun deps_hold(m: *Module, sid: session.StableModuleId) bool {
+    var i: usize = 0;
+    for (i < m.deps.len) {
+        if (module.stable_same(m.deps.data[i], sid)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+test load__modules_given_as_names_and_text {
+    var a: A.Allocator;
+    page.make(?a);
+    val made: res[session.Session, fail.Fail] = session.init(?a);
+    if (sel made.err) { ret 1; }
+    var s: session.Session = made.ok;
+    fin { session.dnit(?s); }
+    var diags: diagnostic.DiagnosticStore = diagnostic.store_init(?a);
+    fin { diagnostic.store_dnit(?diags); }
+
+    val app: res[intern.StrId, A.Error] = intern.add(?s.interner, "app");
+    if (sel app.err) { ret 1; }
+    var held: resident.Resident = resident.init(?a, ?s.interner, app.ok);
+    fin { resident.dnit(?held); }
+    val main_text: str = "use app.flags;\nuse app.flags.ON;\nuse lib;\nuse app.gone;\n$if (flags.MODE == 2) { use app.extra; }\n$if (ON == 0) { use app.never; }\nfun main() i32 { ret 0; }\n";
+    if (!held_set(?held, "app.main", main_text))                                       { ret 2; }
+    if (!held_set(?held, "app.flags", "pub val MODE: u8 = 2;\npub val ON: u8 = 1;\n")) { ret 2; }
+    if (!held_set(?held, "app.extra", "pub fun x() i32 { ret 1; }\n"))                 { ret 2; }
+    if (!held_set(?held, "app.never", "pub fun y() i32 { ret 2; }\n"))                 { ret 2; }
+    if (!held_set(?held, "lib.core", "pub fun z() i32 { ret 3; }\n"))                  { ret 2; }
+    val bare_set: err[fail.Fail] = resident.package_set(?held, "lib", "lib.core");
+    if (sel bare_set.err) { ret 2; }
+
+    var f: Fixture;
+    f.s      = ?s;
+    f.alloc  = ?a;
+    f.diags  = ?diags;
+    f.count  = 0;
+    f.closed = 0;
+    fin { fixture_dnit(?f); }
+    var l: Loader = init(?s, ?a);
+    fin { dnit(?l); }
+    bind(?l, fixture_host(?f), resident.provider_of(?held), ?diags);
+
+    val main_name: res[intern.StrId, A.Error] = intern.add(?s.interner, "app.main");
+    if (sel main_name.err) { ret 3; }
+    val loaded: res[session.ModuleId, fail.Fail] = module_load(?l, main_name.ok);
+    if (sel loaded.err) { ret 4; }
+    val main: *Module = module_at(?l, loaded.ok);
+
+    # the gate that reads an imported constant took its arm, the one that did not left its module unread
+    if (module_count(?l) != 4)                                { ret 5; }
+    if (!deps_hold(main, stable_named(?l, "app.extra")))      { ret 6; }
+    if (!module.stable_is_nil(stable_named(?l, "app.never"))) { ret 7; }
+    if (!deps_hold(main, stable_named(?l, "lib.core")))       { ret 8; }
+    if (f.closed != 4 || !module.same(f.done[3], loaded.ok))  { ret 9; }
+
+    # each import declaration is recorded by what it binds, its module named by stable id
+    val flags: opt[*Binding] = binding_named(?l, main, "flags");
+    if (sel flags.none) { ret 10; }
+    if (sel flags.some) {
+        if (flags.some.kind != BINDING_MODULE)                                     { ret 10; }
+        if (!module.stable_same(flags.some.module, stable_named(?l, "app.flags"))) { ret 10; }
+    }
+    val on: opt[*Binding] = binding_named(?l, main, "ON");
+    if (sel on.none) { ret 11; }
+    if (sel on.some) {
+        if (on.some.kind != BINDING_MEMBER || !on.some.constant) { ret 11; }
+    }
+    val bare: opt[*Binding] = binding_named(?l, main, "lib");
+    if (sel bare.none) { ret 12; }
+    if (sel bare.some) {
+        if (bare.some.kind != BINDING_MODULE)                                    { ret 12; }
+        if (!module.stable_same(bare.some.module, stable_named(?l, "lib.core"))) { ret 12; }
+    }
+    var unbound: u32   = 0;
+    var bi:      usize = 0;
+    for (bi < main.bindings.len) {
+        if (main.bindings.data[bi].kind == BINDING_UNBOUND) { unbound = unbound + 1; }
+        bi = bi + 1;
+    }
+    if (unbound != 1 || !fail.is_rejected(main.status) || !diagnostic.has_errors(?diags)) { ret 13; }
+
+    # the exporter's public constants are its load product, and the importer's gate read them
+    val exporter: *Module = module_at(?l, module_of(?l, stable_named(?l, "app.flags")));
+    if (exporter.consts.len != 2)                                                       { ret 14; }
+    if (!exporter.home.root || !spelled(?s.interner, exporter.home.file, "flags.mach")) { ret 15; }
+    if (module_at(?l, module_of(?l, stable_named(?l, "lib.core"))).home.root)           { ret 16; }
+    ret 0;
+}
